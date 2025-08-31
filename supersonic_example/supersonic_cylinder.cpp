@@ -1,6 +1,6 @@
-//                                MFEM Example 18 - Parallel Version
+//                                Supersonic Cylinder - Parallel Version
 //
-// Compile with: make ex18p
+// Compile with: make supersonic_cylinder
 //
 // Sample runs:
 //
@@ -137,18 +137,6 @@ int main(int argc, char *argv[])
    ParMesh pmesh = ParMesh(MPI_COMM_WORLD, mesh);
    mesh.Clear();
 
-   // Set up boundary condition markers
-   Array<int> inlet_bdr(pmesh.bdr_attributes.Max());
-   Array<int> outlet_bdr(pmesh.bdr_attributes.Max());  
-   Array<int> slip_wall_bdr(pmesh.bdr_attributes.Max());
-
-   inlet_bdr = 0; inlet_bdr[3] = 1;      // Physical entity 4 = "left" = inlet
-   outlet_bdr = 0; outlet_bdr[1] = 1;    // Physical entity 2 = "right" = outlet  
-   slip_wall_bdr = 0; 
-   slip_wall_bdr[0] = 1;                 // Physical entity 1 = "bottom" = slip wall
-   slip_wall_bdr[2] = 1;                 // Physical entity 3 = "top" = slip wall  
-   slip_wall_bdr[4] = 1;                 // Physical entity 5 = "circle" = slip wall
-
    // Refine the mesh to increase the resolution. In this example we do
    // 'par_ref_levels' of uniform refinement, where 'par_ref_levels' is a
    // command-line parameter.
@@ -193,6 +181,7 @@ int main(int argc, char *argv[])
    ParGridFunction mom(&dfes, sol.GetData() + fes.GetNDofs());
    ParGridFunction density(&fes, sol.GetData());  // Start at beginning, no offset
    ParGridFunction mom_x(&fes, sol.GetData() + 1 * fes.GetNDofs());
+   ParGridFunction mom_y(&fes, sol.GetData() + 2 * fes.GetNDofs());
    // Output the initial solution.
    {
       ostringstream mesh_name;
@@ -222,18 +211,53 @@ int main(int argc, char *argv[])
       preassembleWeakDiv);
 
    // Set up boundary markers and integrators
-   InletBoundaryFlux inlet_flux(flux);
-   SlipWallFlux slip_wall_flux(flux);  
-   OutletBoundaryFlux outlet_flux(flux);
+   // Boundary markers (attributes): 1=bottom, 2=right, 3=top, 4=left, 5=circle
+   // Set up boundary condition markers
+   Array<int> inlet_bdr, outlet_bdr, slip_bdr;
+   MakeMarker(inlet_bdr, pmesh, {4});
+   MakeMarker(outlet_bdr, pmesh, {2});
+   MakeMarker(slip_bdr, pmesh, {1,3,5});
+   // Array<int> inlet_bdr(pmesh.bdr_attributes.Max());
+   // Array<int> outlet_bdr(pmesh.bdr_attributes.Max());  
+   // Array<int> slip_wall_bdr(pmesh.bdr_attributes.Max());
+   // inlet_bdr = 0; inlet_bdr[3] = 1;      // Physical entity 4 = "left" = inlet
+   // outlet_bdr = 0; outlet_bdr[1] = 1;    // Physical entity 2 = "right" = outlet  
+   // slip_wall_bdr = 0; 
+   // slip_wall_bdr[0] = 1;                 // Physical entity 1 = "bottom" = slip wall
+   // slip_wall_bdr[2] = 1;                 // Physical entity 3 = "top" = slip wall  
+   // slip_wall_bdr[4] = 1;                 // Physical entity 5 = "circle" = slip wall
+   // mfem::Array<int> inlet_bdr(pmesh.bdr_attributes.Max());
+   // mfem::Array<int> outlet_bdr(pmesh.bdr_attributes.Max());
+   // mfem::Array<int> slip_bdr(pmesh.bdr_attributes.Max());
+   // inlet_bdr  = 0; inlet_bdr[3] = 1;  // left  (4)
+   // outlet_bdr = 0; outlet_bdr[1] = 1; // right (2)
+   // slip_bdr   = 0; slip_bdr[0] = 1;   // bottom(1)
+   // slip_bdr[2] = 1;                   // top   (3)
+   // slip_bdr[4] = 1;                   // circle(5)
+   // Add boundary face integrators (concise like ex17)
+   mfem::Vector Uin(4);
+   Uin(0) = 1.4;
+   Uin(1) = 1.4 * 3.0;
+   Uin(2) = 0.0;
+   Uin(3) = 8.8;
+   euler.AddBdrFaceIntegrator(
+      new BdrHyperbolicFluxIntegrator(numericalFlux,
+                                    new SupersonicInletState(Uin),
+                                    IntOrderOffset),
+      inlet_bdr);
 
-   HyperbolicFormIntegrator inlet_integrator(inlet_flux, IntOrderOffset);
-   HyperbolicFormIntegrator slip_wall_integrator(slip_wall_flux, IntOrderOffset);
-   HyperbolicFormIntegrator outlet_integrator(outlet_flux, IntOrderOffset);
+   euler.AddBdrFaceIntegrator(
+      new BdrHyperbolicFluxIntegrator(numericalFlux,
+                                    new SupersonicOutletState(),
+                                    IntOrderOffset),
+      outlet_bdr);
 
-   // Add to euler operator
-   euler.AddBdrFaceIntegrator(&inlet_integrator, inlet_bdr);
-   euler.AddBdrFaceIntegrator(&slip_wall_integrator, slip_wall_bdr);
-   euler.AddBdrFaceIntegrator(&outlet_integrator, outlet_bdr);
+   euler.AddBdrFaceIntegrator(
+      new BdrHyperbolicFluxIntegrator(numericalFlux,
+                                    new SlipWallState(dim),
+                                    IntOrderOffset),
+      slip_bdr);
+
 
    // 7. Visualize momentum with its magnitude
    socketstream sout;
@@ -342,6 +366,10 @@ int main(int argc, char *argv[])
             sout << "window_title 'momentum, t = " << t << "'\n";
             sout << "parallel " << numProcs << " " << myRank << "\n";
             sout << "solution\n" << pmesh << mom << flush;
+            // sout << "solution\n" << pmesh << mom_x;
+            // sout << "window_title 'momentum(x), t = 0'\n";
+            // sout << "solution\n" << pmesh << density;
+            // sout << "window_title 'density, t = 0'\n";
          }
       }
    }

@@ -45,6 +45,9 @@ private:
    mutable real_t max_char_speed;
    // auxiliary variable used in Mult
    mutable Vector z;
+   // keep external boundary integrators alive, and keep a copy of markers
+   std::vector<std::unique_ptr<NonlinearFormIntegrator>> ext_bdr_int_;
+   std::vector<std::unique_ptr<Array<int>>>              ext_bdr_markers_;
 
    // Compute element-wise inverse mass matrix
    void ComputeInvMass();
@@ -76,16 +79,17 @@ public:
    real_t GetMaxCharSpeed() { return max_char_speed; }
    void Update();
 
-   // Boundary condition methods
-   void AddBdrFaceIntegrator(NonlinearFormIntegrator *integrator, 
-                            Array<int> &bdr_marker)
+   // Add a boundary-face integrator with a marker, MFEM style.
+   // Ownership: we take the raw pointer, the class owns it.
+   void AddBdrFaceIntegrator(NonlinearFormIntegrator *nfi,
+                             const Array<int> &bdr_marker)
    {
-      nonlinearForm->AddBdrFaceIntegrator(integrator, bdr_marker);
-   }
-
-   void AddBdrFaceIntegrator(NonlinearFormIntegrator *integrator)
-   {
-      nonlinearForm->AddBdrFaceIntegrator(integrator);
+      // 1) Own the integrator so NonlinearForm can UseExternalIntegrators()
+      ext_bdr_int_.emplace_back(nfi);
+      // 2) Make a heap copy of the marker so its address is stable
+      ext_bdr_markers_.emplace_back(std::make_unique<Array<int>>(bdr_marker));
+      // 3) Register with NonlinearForm using the *referenced* stable Array<int>
+      nonlinearForm->AddBdrFaceIntegrator(nfi, *ext_bdr_markers_.back());
    }
 
 };
@@ -211,6 +215,8 @@ void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
             current_xmat.GetRow(j, current_state);
             current_flux.UseExternalData(flux.GetData() + num_equations*dim*j,
                                          num_equations, dof);
+            // current_flux.UseExternalData(flux.GetData() + num_equations*dim*j,
+            //                  num_equations, dim);
             fluxFunction.ComputeFlux(current_state, *Tr, current_flux);
          }
          // Compute weak-divergence and add it to auxiliary result, z
@@ -259,140 +265,170 @@ void DGHyperbolicConservationLaws::Update()
 }
 
 // Boundary condition flux functions for supersonic cylinder
-// Inlet boundary - prescribe inlet state (same as initial condition)
-class InletBoundaryFlux : public NumericalFlux
-{
+class BoundaryState {
 public:
-   InletBoundaryFlux(const FluxFunction &fluxFunc) : NumericalFlux(fluxFunc) {}
-
-   real_t Eval(const Vector &state1, const Vector &state2,
-               const Vector &nor, FaceElementTransformations &Tr,
-               Vector &flux) const override
-   {
-      // Prescribe inlet state directly (same as case 6 initial condition)
-      Vector inlet_vals(4);
-      inlet_vals(0) = 1.4;        // density
-      inlet_vals(1) = 1.4 * 3.0;  // rho * u
-      inlet_vals(2) = 1.4 * 0.0;  // rho * v  
-      inlet_vals(3) = 8.8;        // energy
-      
-      return fluxFunction.ComputeFluxDotN(inlet_vals, nor, Tr, flux);
-   }
+  virtual ~BoundaryState() = default;
+  // Uplus at a face point: given interior Uminus, scaled normal 'nor',
+  // unit normal 'nhat', and the physical face point x_f.
+  virtual void Eval(const mfem::Vector& Uminus,
+                    const mfem::Vector& nor,
+                    const mfem::Vector& nhat,
+                    const mfem::Vector& xf,
+                    mfem::Vector&       Uplus) const = 0;
 };
 
-// Slip wall boundary - reflect normal velocity component  
-class SlipWallFlux : public NumericalFlux
-{
+// Supersonic inlet: U+ = conservative U_in(x)
+class SupersonicInletState : public BoundaryState {
 public:
-   SlipWallFlux(const FluxFunction &fluxFunc) : NumericalFlux(fluxFunc) {}
-
-   real_t Eval(const Vector &state1, const Vector &state2,
-               const Vector &nor, FaceElementTransformations &Tr,
-               Vector &flux) const override
-   {
-      Vector wall_state = state1; // Start with interior state
-      
-      // Get normalized normal vector
-      Vector n = nor;
-      real_t nor_mag = n.Norml2();
-      n /= nor_mag;
-      
-      // Reflect normal momentum component: u_wall = u_interior - 2(u·n)n
-      real_t rho = wall_state(0);
-      real_t u_normal = (wall_state(1)*n(0) + wall_state(2)*n(1)) / rho;
-      
-      wall_state(1) -= 2.0 * rho * u_normal * n(0); // rho * u_x
-      wall_state(2) -= 2.0 * rho * u_normal * n(1); // rho * u_y
-      
-      return fluxFunction.ComputeFluxDotN(wall_state, nor, Tr, flux);
-   }
+  explicit SupersonicInletState(const mfem::Vector &Uin) : Uin_(Uin) {}
+  void Eval(const mfem::Vector&, const mfem::Vector&, const mfem::Vector&,
+            const mfem::Vector&, mfem::Vector& Uplus) const override {
+    Uplus = Uin_;
+  }
+private:
+  mfem::Vector Uin_;
 };
 
-// Outlet boundary - use interior state (free boundary)
-class OutletBoundaryFlux : public NumericalFlux  
-{
+// Supersonic outlet: do-nothing/transmissive → U+ = U-
+class SupersonicOutletState : public BoundaryState {
 public:
-   OutletBoundaryFlux(const FluxFunction &fluxFunc) : NumericalFlux(fluxFunc) {}
-
-   real_t Eval(const Vector &state1, const Vector &state2,
-               const Vector &nor, FaceElementTransformations &Tr,
-               Vector &flux) const override
-   {
-      // Use interior state as-is (zero gradient boundary condition)
-      return fluxFunction.ComputeFluxDotN(state1, nor, Tr, flux);
-   }
+  void Eval(const mfem::Vector& Uminus, const mfem::Vector&, const mfem::Vector&,
+            const mfem::Vector&, mfem::Vector& Uplus) const override {
+    Uplus = Uminus;
+  }
 };
 
-std::function<void(const Vector&, Vector&)> GetMovingVortexInit(
-   const real_t radius, const real_t Minf, const real_t beta,
-   const real_t gas_constant, const real_t specific_heat_ratio)
+// Slip wall (adiabatic): reflect normal velocity, keep rho & E
+class SlipWallState : public BoundaryState {
+public:
+  explicit SlipWallState(int dim) : dim_(dim) {}
+  void Eval(const mfem::Vector& Uminus, const mfem::Vector&,
+            const mfem::Vector& nhat, const mfem::Vector&,
+            mfem::Vector& Uplus) const override {
+    Uplus = Uminus;
+    const double rho = Uminus(0);
+    mfem::Vector u(dim_);
+    for (int d = 0; d < dim_; ++d) u(d) = Uminus(1+d) / rho;
+    const double un = mfem::InnerProduct(u, nhat);
+    for (int d = 0; d < dim_; ++d) {
+      const double uprime_d = u(d) - 2.0 * un * nhat(d);
+      Uplus(1+d) = rho * uprime_d;
+    }
+    // Uplus(0) and Uplus(1+dim_) (E) already copied
+  }
+private:
+  int dim_;
+};
+
+///// Boundary Integrator
+class BdrHyperbolicFluxIntegrator : public mfem::NonlinearFormIntegrator
 {
-   return [specific_heat_ratio,
-           gas_constant, Minf, radius, beta](const Vector &x, Vector &y)
-   {
-      MFEM_ASSERT(x.Size() == 2, "");
+public:
+  BdrHyperbolicFluxIntegrator(const mfem::NumericalFlux& numFlux,
+                              BoundaryState* bc,
+                              int intOrderOffset = 0)
+   : numFlux_(numFlux),
+     fluxFunction_(numFlux.GetFluxFunction()),
+     bc_(bc),
+     intOrderOffset_(intOrderOffset),
+     neq_(fluxFunction_.num_equations),
+     dim_(fluxFunction_.dim) {}
 
-      const real_t xc = 0.0, yc = 0.0;
+  // NOTE: use AssembleFaceVector (this is virtual in MFEM); we'll attach as BDR.
+  void AssembleFaceVector(const mfem::FiniteElement& el1,
+                          const mfem::FiniteElement& /*el2*/,  // unused
+                          mfem::FaceElementTransformations& Tr,
+                          const mfem::Vector& elfun,
+                          mfem::Vector& elvect) override
+  {
+    using namespace mfem;
+    const int nd1 = el1.GetDof();
+    elvect.SetSize(nd1 * neq_);
+    elvect = 0.0;
 
-      // Nice units
-      const real_t vel_inf = 1.;
-      const real_t den_inf = 1.;
+    const int p = el1.GetOrder();
+    const IntegrationRule *ir =
+      IntRule ? IntRule : &IntRules.Get(Tr.FaceGeom, 2*p + intOrderOffset_);
 
-      // Derive remainder of background state from this and Minf
-      const real_t pres_inf = (den_inf / specific_heat_ratio) *
-                              (vel_inf / Minf) * (vel_inf / Minf);
-      const real_t temp_inf = pres_inf / (den_inf * gas_constant);
+    Vector shape1(nd1), Uminus(neq_), Uplus(neq_), fluxN(neq_);
+    Vector nor(dim_), nhat(dim_), xf(dim_);
 
-      real_t r2rad = 0.0;
-      r2rad += (x(0) - xc) * (x(0) - xc);
-      r2rad += (x(1) - yc) * (x(1) - yc);
-      r2rad /= (radius * radius);
+    for (int iq = 0; iq < ir->GetNPoints(); ++iq)
+    {
+      const IntegrationPoint &ip = ir->IntPoint(iq);
 
-      const real_t shrinv1 = 1.0 / (specific_heat_ratio - 1.);
+      // Map face ip to element #1 and eval basis
+      IntegrationPoint eip1; Tr.Loc1.Transform(ip, eip1);
+      el1.CalcShape(eip1, shape1);
 
-      const real_t velX =
-         vel_inf * (1 - beta * (x(1) - yc) / radius * std::exp(-0.5 * r2rad));
-      const real_t velY =
-         vel_inf * beta * (x(0) - xc) / radius * std::exp(-0.5 * r2rad);
-      const real_t vel2 = velX * velX + velY * velY;
+      // Face geometry (boundary path still provides Tr.Face)
+      Tr.Face->SetIntPoint(&ip);
+      CalcOrtho(Tr.Face->Jacobian(), nor);         // scaled normal
+      nhat = nor; const double nrm = nhat.Norml2(); if (nrm > 0.0) nhat /= nrm;
+      Tr.Face->Transform(ip, xf);                  // physical point (optional)
 
-      const real_t specific_heat =
-         gas_constant * specific_heat_ratio * shrinv1;
-      const real_t temp = temp_inf - 0.5 * (vel_inf * beta) *
-                          (vel_inf * beta) / specific_heat *
-                          std::exp(-r2rad);
+      // Reconstruct U-
+      for (int k = 0; k < neq_; ++k)
+      {
+        const int off = k*nd1;
+        double uk = 0.0; for (int i = 0; i < nd1; ++i) uk += shape1(i) * elfun(off+i);
+        Uminus(k) = uk;
+      }
 
-      const real_t den = den_inf * std::pow(temp / temp_inf, shrinv1);
-      const real_t pres = den * gas_constant * temp;
-      const real_t energy = shrinv1 * pres / den + 0.5 * vel2;
+      // Ghost state U+
+      bc_->Eval(Uminus, nor, nhat, xf, Uplus);
 
-      y(0) = den;
-      y(1) = den * velX;
-      y(2) = den * velY;
-      y(3) = den * energy;
-   };
-}
+      // Rusanov from your hyperbolic.hpp
+      numFlux_.Eval(Uminus, Uplus, nor, Tr, fluxN);
+
+      const double w = Tr.Face->Weight() * ip.weight;  // -<Fhat n, v>
+      for (int k = 0; k < neq_; ++k)
+      {
+        const int off = k*nd1; const double fn = fluxN(k);
+        for (int i = 0; i < nd1; ++i) elvect(off+i) -= fn * shape1(i) * w;
+      }
+    }
+  }
+
+private:
+  const mfem::NumericalFlux& numFlux_;
+  const mfem::FluxFunction&  fluxFunction_;
+  std::unique_ptr<BoundaryState> bc_;
+  int intOrderOffset_, neq_, dim_;
+};
+
+
+///// Mesh Utilities
 
 Mesh EulerMesh(const int problem)
 {
    switch (problem)
    {
       case 1:
-      case 2:
-      case 3:
-      case 5:
-         return Mesh("../data/periodic-square.mesh");
-         break;
-      case 4:
-         return Mesh("../data/periodic-segment.mesh");
-         break;
-      case 6:
          return Mesh("../supersonic_cylinder.msh");
          break;
       default:
          MFEM_ABORT("Problem Undefined");
    }
 }
+
+// Helper: make a boundary marker from a set of attribute ids {a1, a2, ...}
+// Example: MakeMarker(pmesh, {4}) creates a marker with only attribute 4 active.
+static void MakeMarker(mfem::Array<int> &marker,
+                       mfem::ParMesh &pmesh,
+                       std::initializer_list<int> attrs)
+{
+   const int nb = pmesh.bdr_attributes.Max();
+   MFEM_VERIFY(nb > 0, "Mesh has no boundary attributes.");
+   marker.SetSize(nb); marker = 0;
+   for (int a : attrs)
+   {
+      MFEM_VERIFY(a >= 1 && a <= nb,
+            "Requested boundary attribute " << a << " but mesh has [1.." << nb << "]");
+      marker[a-1] = 1;
+   }
+}
+
 
 // Initial condition
 VectorFunctionCoefficient EulerInitialCondition(const int problem,
@@ -401,87 +437,7 @@ VectorFunctionCoefficient EulerInitialCondition(const int problem,
 {
    switch (problem)
    {
-      case 1: // fast moving vortex
-         return VectorFunctionCoefficient(
-                   4, GetMovingVortexInit(0.2, 0.5, 1. / 5., gas_constant,
-                                          specific_heat_ratio));
-      case 2: // slow moving vortex
-         return VectorFunctionCoefficient(
-                   4, GetMovingVortexInit(0.2, 0.05, 1. / 50., gas_constant,
-                                          specific_heat_ratio));
-      case 3: // moving sine wave
-         return VectorFunctionCoefficient(4, [](const Vector &x, Vector &y)
-         {
-            MFEM_ASSERT(x.Size() == 2, "");
-            const real_t density = 1.0 + 0.2 * std::sin(M_PI*(x(0) + x(1)));
-            const real_t velocity_x = 0.7;
-            const real_t velocity_y = 0.3;
-            const real_t pressure = 1.0;
-            const real_t energy =
-               pressure / (1.4 - 1.0) +
-               density * 0.5 * (velocity_x * velocity_x + velocity_y * velocity_y);
-
-            y(0) = density;
-            y(1) = density * velocity_x;
-            y(2) = density * velocity_y;
-            y(3) = energy;
-         });
-      case 4:
-         return VectorFunctionCoefficient(3, [](const Vector &x, Vector &y)
-         {
-            MFEM_ASSERT(x.Size() == 1, "");
-            const real_t density = 1.0 + 0.2 * std::sin(M_PI * 2 * x(0));
-            const real_t velocity_x = 1.0;
-            const real_t pressure = 1.0;
-            const real_t energy =
-               pressure / (1.4 - 1.0) + density * 0.5 * (velocity_x * velocity_x);
-
-            y(0) = density;
-            y(1) = density * velocity_x;
-            y(2) = energy;
-         });
-      case 5: // 2D Gaussian pulse in velocity - corrected version
-         return VectorFunctionCoefficient(4, [](const Vector &x, Vector &y)  // 4 components for 2D Euler
-         {
-            MFEM_ASSERT(x.Size() == 2, "Expected 2D coordinates");  // Fix: 2D mesh
-            
-            // Background state - based on other examples in ex18
-            const real_t rho_bg = 1.0;           // standard reference density
-            const real_t p_bg = 1.0;             // standard reference pressure  
-            const real_t u_bg = 0.0;             // start from rest (cleaner than arbitrary 0.1)
-            const real_t v_bg = 0.0;             // start from rest
-            
-            // Gaussian pulse parameters - based on domain and physics
-            const real_t x_center = 0.0;         // center of [0,1] domain (periodic-square.mesh)
-            const real_t y_center = 0.0;         // center of [0,1] domain
-            const real_t sigma = 0.2;            // 10% of domain width - reasonable resolution
-            const real_t u_amplitude = 0.5;      // Start conservative: 50% of sound speed (c ≈ 1.18 for γ=1.4, p=1, ρ=1)
-            
-            // Compute 2D Gaussian pulse centered at (0.5, 0.5)
-            const real_t dx = x(0) - x_center;
-            const real_t dy = x(1) - y_center;
-            const real_t r_squared = dx*dx + dy*dy;
-            const real_t gaussian_factor = std::exp(-r_squared/(2.0*sigma*sigma));
-            
-            // Apply pulse to x-velocity only (creates primarily x-direction shock)
-            const real_t density = rho_bg;
-            const real_t velocity_x = u_bg + u_amplitude * gaussian_factor;
-            const real_t velocity_y = v_bg;  // no y-component initially
-            const real_t pressure = p_bg;
-            
-            // Compute total energy correctly: E = p/(γ-1) + ρ(u²+v²)/2
-            const real_t gamma = 1.4;  // standard air
-            const real_t kinetic_energy = 0.5 * (velocity_x * velocity_x + velocity_y * velocity_y);
-            const real_t internal_energy = pressure / (gamma - 1.0);
-            const real_t total_energy = internal_energy + density * kinetic_energy;
-
-            // Conservative variables for 2D Euler: [ρ, ρu, ρv, E]
-            y(0) = density;                    // density
-            y(1) = density * velocity_x;       // x-momentum  
-            y(2) = density * velocity_y;       // y-momentum
-            y(3) = total_energy;               // total energy
-         });
-      case 6: // Supersonic Farfield
+      case 1: // Supersonic Farfield
          return VectorFunctionCoefficient(4, [](const Vector &x, Vector &y)
          {
             MFEM_ASSERT(x.Size() == 2, "");
