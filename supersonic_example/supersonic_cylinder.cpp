@@ -242,19 +242,19 @@ int main(int argc, char *argv[])
    Uin(3) = 8.8;
    euler.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
-                                    new SupersonicInletState(Uin),
+                                    std::make_unique<SupersonicInletState>(Uin),
                                     IntOrderOffset),
       inlet_bdr);
 
    euler.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
-                                    new SupersonicOutletState(),
+                                    std::make_unique<SupersonicOutletState>(),
                                     IntOrderOffset),
       outlet_bdr);
 
    euler.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
-                                    new SlipWallState(dim),
+                                    std::make_unique<SlipWallState>(dim),
                                     IntOrderOffset),
       slip_bdr);
 
@@ -282,12 +282,14 @@ int main(int argc, char *argv[])
          sout.precision(precision);
          // Plot magnitude of vector-valued momentum
          sout << "parallel " << numProcs << " " << myRank << "\n";
-         sout << "solution\n" << pmesh << mom;
-         sout << "window_title 'momentum, t = 0'\n";
+         // sout << "solution\n" << pmesh << mom;
+         // sout << "window_title 'momentum, t = 0'\n";
          // sout << "solution\n" << pmesh << mom_x;
          // sout << "window_title 'momentum(x), t = 0'\n";
-         // sout << "solution\n" << pmesh << density;
-         // sout << "window_title 'density, t = 0'\n";
+         // sout << "solution\n" << pmesh << mom_y;
+         // sout << "window_title 'momentum(y), t = 0'\n";
+         sout << "solution\n" << pmesh << density;
+         sout << "window_title 'density, t = 0'\n";
          sout << "view 0 0\n";  // view from top
          sout << "keys jlm\n";  // turn off perspective and light, show mesh
          sout << "pause\n";
@@ -363,13 +365,15 @@ int main(int argc, char *argv[])
          }
          if (visualization)
          {
-            sout << "window_title 'momentum, t = " << t << "'\n";
+            // sout << "window_title 'momentum, t = " << t << "'\n";
             sout << "parallel " << numProcs << " " << myRank << "\n";
-            sout << "solution\n" << pmesh << mom << flush;
+            // sout << "solution\n" << pmesh << mom << flush;
             // sout << "solution\n" << pmesh << mom_x;
             // sout << "window_title 'momentum(x), t = 0'\n";
-            // sout << "solution\n" << pmesh << density;
-            // sout << "window_title 'density, t = 0'\n";
+            // sout << "solution\n" << pmesh << mom_y;
+            // sout << "window_title 'momentum(y), t = 0'\n";
+            sout << "solution\n" << pmesh << density;
+            sout << "window_title 'density, t = 0'\n";
          }
       }
    }

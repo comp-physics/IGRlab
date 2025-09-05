@@ -23,6 +23,7 @@
 
 #include <functional>
 #include "mfem.hpp"
+#include "BdrHyperbolicFluxIntegrator.hpp"
 
 namespace mfem
 {
@@ -263,140 +264,6 @@ void DGHyperbolicConservationLaws::Update()
    ComputeInvMass();
    if (!weakdiv.empty()) {ComputeWeakDivergence();}
 }
-
-// Boundary condition flux functions for supersonic cylinder
-class BoundaryState {
-public:
-  virtual ~BoundaryState() = default;
-  // Uplus at a face point: given interior Uminus, scaled normal 'nor',
-  // unit normal 'nhat', and the physical face point x_f.
-  virtual void Eval(const mfem::Vector& Uminus,
-                    const mfem::Vector& nor,
-                    const mfem::Vector& nhat,
-                    const mfem::Vector& xf,
-                    mfem::Vector&       Uplus) const = 0;
-};
-
-// Supersonic inlet: U+ = conservative U_in(x)
-class SupersonicInletState : public BoundaryState {
-public:
-  explicit SupersonicInletState(const mfem::Vector &Uin) : Uin_(Uin) {}
-  void Eval(const mfem::Vector&, const mfem::Vector&, const mfem::Vector&,
-            const mfem::Vector&, mfem::Vector& Uplus) const override {
-    Uplus = Uin_;
-  }
-private:
-  mfem::Vector Uin_;
-};
-
-// Supersonic outlet: do-nothing/transmissive → U+ = U-
-class SupersonicOutletState : public BoundaryState {
-public:
-  void Eval(const mfem::Vector& Uminus, const mfem::Vector&, const mfem::Vector&,
-            const mfem::Vector&, mfem::Vector& Uplus) const override {
-    Uplus = Uminus;
-  }
-};
-
-// Slip wall (adiabatic): reflect normal velocity, keep rho & E
-class SlipWallState : public BoundaryState {
-public:
-  explicit SlipWallState(int dim) : dim_(dim) {}
-  void Eval(const mfem::Vector& Uminus, const mfem::Vector&,
-            const mfem::Vector& nhat, const mfem::Vector&,
-            mfem::Vector& Uplus) const override {
-    Uplus = Uminus;
-    const double rho = Uminus(0);
-    mfem::Vector u(dim_);
-    for (int d = 0; d < dim_; ++d) u(d) = Uminus(1+d) / rho;
-    const double un = mfem::InnerProduct(u, nhat);
-    for (int d = 0; d < dim_; ++d) {
-      const double uprime_d = u(d) - 2.0 * un * nhat(d);
-      Uplus(1+d) = rho * uprime_d;
-    }
-    // Uplus(0) and Uplus(1+dim_) (E) already copied
-  }
-private:
-  int dim_;
-};
-
-///// Boundary Integrator
-class BdrHyperbolicFluxIntegrator : public mfem::NonlinearFormIntegrator
-{
-public:
-  BdrHyperbolicFluxIntegrator(const mfem::NumericalFlux& numFlux,
-                              BoundaryState* bc,
-                              int intOrderOffset = 0)
-   : numFlux_(numFlux),
-     fluxFunction_(numFlux.GetFluxFunction()),
-     bc_(bc),
-     intOrderOffset_(intOrderOffset),
-     neq_(fluxFunction_.num_equations),
-     dim_(fluxFunction_.dim) {}
-
-  // NOTE: use AssembleFaceVector (this is virtual in MFEM); we'll attach as BDR.
-  void AssembleFaceVector(const mfem::FiniteElement& el1,
-                          const mfem::FiniteElement& /*el2*/,  // unused
-                          mfem::FaceElementTransformations& Tr,
-                          const mfem::Vector& elfun,
-                          mfem::Vector& elvect) override
-  {
-    using namespace mfem;
-    const int nd1 = el1.GetDof();
-    elvect.SetSize(nd1 * neq_);
-    elvect = 0.0;
-
-    const int p = el1.GetOrder();
-    const IntegrationRule *ir =
-      IntRule ? IntRule : &IntRules.Get(Tr.FaceGeom, 2*p + intOrderOffset_);
-
-    Vector shape1(nd1), Uminus(neq_), Uplus(neq_), fluxN(neq_);
-    Vector nor(dim_), nhat(dim_), xf(dim_);
-
-    for (int iq = 0; iq < ir->GetNPoints(); ++iq)
-    {
-      const IntegrationPoint &ip = ir->IntPoint(iq);
-
-      // Map face ip to element #1 and eval basis
-      IntegrationPoint eip1; Tr.Loc1.Transform(ip, eip1);
-      el1.CalcShape(eip1, shape1);
-
-      // Face geometry (boundary path still provides Tr.Face)
-      Tr.Face->SetIntPoint(&ip);
-      CalcOrtho(Tr.Face->Jacobian(), nor);         // scaled normal
-      nhat = nor; const double nrm = nhat.Norml2(); if (nrm > 0.0) nhat /= nrm;
-      Tr.Face->Transform(ip, xf);                  // physical point (optional)
-
-      // Reconstruct U-
-      for (int k = 0; k < neq_; ++k)
-      {
-        const int off = k*nd1;
-        double uk = 0.0; for (int i = 0; i < nd1; ++i) uk += shape1(i) * elfun(off+i);
-        Uminus(k) = uk;
-      }
-
-      // Ghost state U+
-      bc_->Eval(Uminus, nor, nhat, xf, Uplus);
-
-      // Rusanov from your hyperbolic.hpp
-      numFlux_.Eval(Uminus, Uplus, nor, Tr, fluxN);
-
-      const double w = Tr.Face->Weight() * ip.weight;  // -<Fhat n, v>
-      for (int k = 0; k < neq_; ++k)
-      {
-        const int off = k*nd1; const double fn = fluxN(k);
-        for (int i = 0; i < nd1; ++i) elvect(off+i) -= fn * shape1(i) * w;
-      }
-    }
-  }
-
-private:
-  const mfem::NumericalFlux& numFlux_;
-  const mfem::FluxFunction&  fluxFunction_;
-  std::unique_ptr<BoundaryState> bc_;
-  int intOrderOffset_, neq_, dim_;
-};
-
 
 ///// Mesh Utilities
 
