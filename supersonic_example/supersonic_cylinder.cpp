@@ -71,7 +71,7 @@ int main(int argc, char *argv[])
    const real_t gas_constant = 1.0;
 
    string mesh_file = "";
-   int IntOrderOffset = 1;
+   int IntOrderOffset = 1; // Normally 1
    int ser_ref_levels = 0;
    int par_ref_levels = 1;
    int order = 3;
@@ -182,6 +182,7 @@ int main(int argc, char *argv[])
    ParGridFunction density(&fes, sol.GetData());  // Start at beginning, no offset
    ParGridFunction mom_x(&fes, sol.GetData() + 1 * fes.GetNDofs());
    ParGridFunction mom_y(&fes, sol.GetData() + 2 * fes.GetNDofs());
+   ParGridFunction energy(&fes, sol.GetData() + 3 * fes.GetNDofs());
    // Output the initial solution.
    {
       ostringstream mesh_name;
@@ -205,6 +206,14 @@ int main(int argc, char *argv[])
    // 6. Set up the nonlinear form with euler flux and numerical flux
    EulerFlux flux(dim, specific_heat_ratio);
    RusanovFlux numericalFlux(flux);
+   // HLLCFlux numericalFlux(flux, specific_heat_ratio);  // pass gamma
+   // DiffusiveRusanovFlux numericalFlux(flux,
+   //                                    /*beta=*/0.5,
+   //                                    /*delta=*/0.0,
+   //                                    /*cap=*/std::numeric_limits<real_t>::infinity(),
+   //                                    /*sensor_k=*/0.0,
+   //                                    /*sensor_max=*/1.0);
+   // ComponentwiseUpwindFlux numericalSurfFlux(flux);
    DGHyperbolicConservationLaws euler(
       vfes, std::unique_ptr<HyperbolicFormIntegrator>(
          new HyperbolicFormIntegrator(numericalFlux, IntOrderOffset)),
@@ -213,50 +222,65 @@ int main(int argc, char *argv[])
    // Set up boundary markers and integrators
    // Boundary markers (attributes): 1=bottom, 2=right, 3=top, 4=left, 5=circle
    // Set up boundary condition markers
-   Array<int> inlet_bdr, outlet_bdr, slip_bdr;
+   Array<int> inlet_bdr, outlet_bdr, slip_bdr, cyl_bdr;
    MakeMarker(inlet_bdr, pmesh, {4});
    MakeMarker(outlet_bdr, pmesh, {2});
-   MakeMarker(slip_bdr, pmesh, {1,3,5});
-   // Array<int> inlet_bdr(pmesh.bdr_attributes.Max());
-   // Array<int> outlet_bdr(pmesh.bdr_attributes.Max());  
-   // Array<int> slip_wall_bdr(pmesh.bdr_attributes.Max());
-   // inlet_bdr = 0; inlet_bdr[3] = 1;      // Physical entity 4 = "left" = inlet
-   // outlet_bdr = 0; outlet_bdr[1] = 1;    // Physical entity 2 = "right" = outlet  
-   // slip_wall_bdr = 0; 
-   // slip_wall_bdr[0] = 1;                 // Physical entity 1 = "bottom" = slip wall
-   // slip_wall_bdr[2] = 1;                 // Physical entity 3 = "top" = slip wall  
-   // slip_wall_bdr[4] = 1;                 // Physical entity 5 = "circle" = slip wall
-   // mfem::Array<int> inlet_bdr(pmesh.bdr_attributes.Max());
-   // mfem::Array<int> outlet_bdr(pmesh.bdr_attributes.Max());
-   // mfem::Array<int> slip_bdr(pmesh.bdr_attributes.Max());
-   // inlet_bdr  = 0; inlet_bdr[3] = 1;  // left  (4)
-   // outlet_bdr = 0; outlet_bdr[1] = 1; // right (2)
-   // slip_bdr   = 0; slip_bdr[0] = 1;   // bottom(1)
-   // slip_bdr[2] = 1;                   // top   (3)
-   // slip_bdr[4] = 1;                   // circle(5)
-   // Add boundary face integrators (concise like ex17)
+   MakeMarker(slip_bdr, pmesh, {1,3});
+   MakeMarker(cyl_bdr, pmesh, {5});
    mfem::Vector Uin(4);
+   // Supersonic Cyl
    Uin(0) = 1.4;
-   Uin(1) = 1.4 * 3.0;
+   Uin(1) = 1.4 * 1.2;
    Uin(2) = 0.0;
    Uin(3) = 8.8;
+   // Vortex Case
+   // Uin(0) = 1.0;
+   // Uin(1) = 1.0 * 1.0;
+   // Uin(2) = 0.0;
+   // Uin(3) = 714.8;
    euler.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
                                     std::make_unique<SupersonicInletState>(Uin),
                                     IntOrderOffset),
       inlet_bdr);
+   // euler.AddBdrFaceIntegrator(
+   //    new BdrHyperbolicFluxIntegrator(numericalFlux,
+   //                                  std::make_unique<SupersonicOutletState>(),
+   //                                  IntOrderOffset),
+   //    inlet_bdr);
 
    euler.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
                                     std::make_unique<SupersonicOutletState>(),
                                     IntOrderOffset),
       outlet_bdr);
+   // euler.AddBdrFaceIntegrator(
+   //    new BdrHyperbolicFluxIntegrator(numericalFlux,
+   //                                  std::make_unique<SupersonicInletState>(Uin),
+   //                                  IntOrderOffset),
+   //    outlet_bdr);
 
    euler.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
                                     std::make_unique<SlipWallState>(dim),
                                     IntOrderOffset),
       slip_bdr);
+   // euler.AddBdrFaceIntegrator(
+   //    new BdrHyperbolicFluxIntegrator(numericalFlux,
+   //                                  std::make_unique<SupersonicInletState>(Uin),
+   //                                  IntOrderOffset),
+   //    slip_bdr);
+
+   euler.AddBdrFaceIntegrator(
+      new BdrHyperbolicFluxIntegrator(numericalFlux,
+                                    std::make_unique<SlipWallState>(dim),
+                                    IntOrderOffset),
+      cyl_bdr);
+   // euler.AddBdrFaceIntegrator(
+   //    new BdrHyperbolicFluxIntegrator(numericalFlux,
+   //                                  std::make_unique<SupersonicInletState>(Uin),
+   //                                  IntOrderOffset),
+   //    cyl_bdr);
 
 
    // 7. Visualize momentum with its magnitude
@@ -290,6 +314,8 @@ int main(int argc, char *argv[])
          // sout << "window_title 'momentum(y), t = 0'\n";
          sout << "solution\n" << pmesh << density;
          sout << "window_title 'density, t = 0'\n";
+         // sout << "solution\n" << pmesh << energy;
+         // sout << "window_title 'energy, t = 0'\n";
          sout << "view 0 0\n";  // view from top
          sout << "keys jlm\n";  // turn off perspective and light, show mesh
          sout << "pause\n";
@@ -369,11 +395,13 @@ int main(int argc, char *argv[])
             sout << "parallel " << numProcs << " " << myRank << "\n";
             // sout << "solution\n" << pmesh << mom << flush;
             // sout << "solution\n" << pmesh << mom_x;
-            // sout << "window_title 'momentum(x), t = 0'\n";
+            // sout << "window_title 'momentum(x), t = " << t << "'\n";
             // sout << "solution\n" << pmesh << mom_y;
-            // sout << "window_title 'momentum(y), t = 0'\n";
+            // sout << "window_title 'momentum(y), t = " << t << "'\n";
             sout << "solution\n" << pmesh << density;
-            sout << "window_title 'density, t = 0'\n";
+            sout << "window_title 'density, t = " << t << "'\n";
+            // sout << "solution\n" << pmesh << energy;
+            // sout << "window_title 'energy, t = " << t << "'\n";
          }
       }
    }

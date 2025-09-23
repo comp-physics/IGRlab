@@ -81,12 +81,12 @@ endfunction()
 # Check if supersonic_cylinder source files exist
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/supersonic_cylinder.cpp")
     set(SUPERSONIC_CYLINDER_SOURCES
-        supersonic_cylinder.cpp BdrHyperbolicFluxIntegrator.cpp
+        supersonic_cylinder.cpp BdrHyperbolicFluxIntegrator.cpp fluxfunctions.cpp
     )
     
     # Add header file if it exists
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/supersonic_cylinder.hpp")
-        list(APPEND SUPERSONIC_CYLINDER_SOURCES supersonic_cylinder.hpp BdrHyperbolicFluxIntegrator.hpp)
+        list(APPEND SUPERSONIC_CYLINDER_SOURCES supersonic_cylinder.hpp BdrHyperbolicFluxIntegrator.hpp fluxfunctions.hpp)
     endif()
     
     # Create supersonic_cylinder executable
