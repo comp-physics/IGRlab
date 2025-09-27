@@ -263,9 +263,92 @@ protected:
    {
       return std::max(std::abs(SL), std::abs(SR));
    }
+
 };
 
+/**
+ * @brief Decorator that adds Information Geometric Regularization (IGR) to a base FluxFunction.
+ *
+ * Applies \(p \mapsto p + \Sigma\) consistently:
+ *  - Tensor flux \(F(U)\):     momentum rows \(+\Sigma I\), energy row \(+\Sigma\,u\).
+ *  - Normal flux \(F(U)\cdot n\): momentum \(+\Sigma\,n\), energy \(+\Sigma (u\cdot n)\).
+ *
+ * \note
+ *  - The returned max characteristic speed comes from the base flux (unchanged).
+ *  - On interior faces we use the **face-average** \(\sigma = \tfrac12(\sigma_L+\sigma_R)\)
+ *    inside `ComputeFluxDotN`, so Rusanov/HLLC see a consistent physical part without MFEM changes.
+ *  - On boundary faces we use the **interior** element’s \(\sigma\).
+ *  - \(\sigma\) is clamped to be finite and \(\ge 0\); a small density floor is used only when forming \(u\).
+ */
+class FluxWithIGR : public FluxFunction
+{
+public:
+  /// Construct an IGR-decorated flux around an existing base FluxFunction.
+  explicit FluxWithIGR(const FluxFunction &base)
+  : FluxFunction(base.num_equations, base.dim), base_(base) {}
 
+  /// Provide the scalar \Sigma field (same mesh as the solution). Pass nullptr to disable IGR.
+  void SetSigmaField(const mfem::ParGridFunction *sigma) { sigma_ = sigma; }
+
+  /// Density floor used only for u = m / rho in the IGR terms (default 1e-10).
+  void SetVelocityRhoFloor(double f) { rho_vel_floor_ = f; }
+
+  /// Compute tensor flux F(U). Adds IGR tensor terms if Σ is set; returns base max speed.
+  real_t ComputeFlux(const Vector &state, ElementTransformation &Tr,
+                     DenseMatrix &flux) const override;
+
+  /// Compute normal flux F(U)·n. Adds IGR normal terms if Σ is set; returns base max speed.
+  real_t ComputeFluxDotN(const Vector &state, const Vector &normal,
+                         FaceElementTransformations &Tr,
+                         Vector &fluxN) const override;
+
+  /// Average normal flux (only if your numerical flux uses it). Adds averaged IGR contribution.
+  real_t ComputeAvgFluxDotN(const Vector &state1, const Vector &state2,
+                            const Vector &normal, FaceElementTransformations &Tr,
+                            Vector &fluxDotN) const override;
+
+  /// Jacobians: forwarded to the base (unchanged).
+  void ComputeFluxJacobian(const Vector &state, ElementTransformation &Tr,
+                           DenseTensor &J_) const override
+  { base_.ComputeFluxJacobian(state, Tr, J_); }
+
+  void ComputeFluxJacobianDotN(const Vector &state, const Vector &normal,
+                               ElementTransformation &Tr,
+                               DenseMatrix &JDotN) const override
+  { base_.ComputeFluxJacobianDotN(state, normal, Tr, JDotN); }
+
+private:
+  const FluxFunction &base_;
+  const mfem::ParGridFunction *sigma_ = nullptr;
+  double rho_vel_floor_ = 1e-10;
+
+  // helpers
+  static inline double ClampSigma(double s)
+  {
+    if (!std::isfinite(s) || s < 0.0) return 0.0;
+    return s;
+  }
+
+  inline void AddTensorSigmaTerms(const Vector &U, double sigma, DenseMatrix &F) const
+  {
+    // momentum rows: +σ I
+    for (int d = 0; d < dim; ++d) { F(1 + d, d) += sigma; }
+    // energy row: +σ u
+    const double rho = std::max(U(0), rho_vel_floor_);
+    for (int d = 0; d < dim; ++d) { F(1 + dim, d) += sigma * (U(1 + d) / rho); }
+  }
+
+  inline void AddDotNSigmaTerms(const Vector &U, const Vector &n,
+                                double sigma_face, Vector &Fn) const
+  {
+    // momentum rows: +σ n_d  (MFEM uses a scaled normal; stay consistent)
+    for (int d = 0; d < dim; ++d) { Fn(1 + d) += sigma_face * n(d); }
+    // energy row: +σ (u·n)
+    const double rho = std::max(U(0), rho_vel_floor_);
+    double un = 0.0; for (int d = 0; d < dim; ++d) un += U(1 + d) * n(d);
+    Fn(1 + dim) += sigma_face * (un / rho);
+  }
+};
 
 
 } // namespace mfem

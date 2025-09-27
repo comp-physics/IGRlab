@@ -53,6 +53,7 @@
 #include <iostream>
 #include <sstream>
 #include "supersonic_cylinder_w_igr.hpp"
+#include "glvismulti.hpp"
 
 using namespace std;
 using namespace mfem;
@@ -175,7 +176,7 @@ int main(int argc, char *argv[])
    // Effective spacing for DG(p): Δx_eff ≈ h / (p+1)
    const double dx_eff = hmin_alpha / (order + 1);
    // Choose a constant Cα (start with 1.0 for shocky cases, 0.25–0.5 for smooth)
-   const double C_alpha = 0.5;
+   const double C_alpha = 0.1;
    // α = Cα * (Δx_eff)^2
    const double alpha_igr = C_alpha * dx_eff * dx_eff;
 
@@ -228,12 +229,21 @@ int main(int argc, char *argv[])
       }
    }
 
-   // 6. Set up the nonlinear form with euler flux and numerical flux
-   EulerFlux flux(dim, specific_heat_ratio);
-   RusanovFlux numericalFlux(flux);
+   // 6. Set up the nonlinear form with Euler flux wrapped by IGR
+   EulerFlux base_flux(dim, specific_heat_ratio);
+
+   // IMPORTANT: FluxWithIGR must see the SAME ParGridFunction that IGRSolver updates.
+   // Assuming IGRSolver::GetSigma() returns ParGridFunction&.
+   // FluxWithIGR igr_flux(base_flux, &igr.GetSigma());
+   FluxWithIGR igr_flux(base_flux);
+   igr_flux.SetSigmaField(&igr.GetSigma());
+
+   // Use the wrapped flux in the numerical flux (e.g., Rusanov).
+   RusanovFlux numericalFlux(igr_flux);
 
    DGHyperbolicConservationLaws base_op(
-      vfes, std::unique_ptr<HyperbolicFormIntegrator>(
+      vfes,
+      std::unique_ptr<HyperbolicFormIntegrator>(
          new HyperbolicFormIntegrator(numericalFlux, IntOrderOffset)),
       preassembleWeakDiv);
 
@@ -268,47 +278,34 @@ int main(int argc, char *argv[])
       cyl_bdr);
 
    // 7. Visualization
+   igr.UpdateFromState(sol, /*warm_start=*/false);
+   igr.GetSigma().ExchangeFaceNbrData();
    socketstream sout;
+   socketstream s_den, s_sig;
+   vis::GLVisWindow w_density, w_sigma;
    if (visualization)
    {
-      char vishost[] = "localhost";
-      int visport = 19916;
+      const char vishost[] = "localhost";
+      const int  visport = 19916;
 
-      sout.open(vishost, visport);
-      if (!sout)
+      // Important: if you want to *display σ*, make sure it has face-neighbor data
+      // ready on this rank (no need to recompute; we just exchange).
+      igr.GetSigma().ExchangeFaceNbrData();
+
+      bool ok1 = vis::Open(w_density, vishost, visport, precision,
+                           numProcs, myRank, pmesh, density,
+                           "density, t = 0");
+      bool ok2 = vis::Open(w_sigma,   vishost, visport, precision,
+                           numProcs, myRank, pmesh, igr.GetSigma(),
+                           "sigma, t = 0");
+
+      if (!(ok1 && ok2))
       {
          visualization = false;
          if (Mpi::Root())
          {
-            cout << "Unable to connect to GLVis server at " << vishost << ':'
-                 << visport << endl;
-            cout << "GLVis visualization disabled.\n";
+            std::cout << "Unable to connect to GLVis. Visualization disabled.\n";
          }
-      }
-      else
-      {
-         sout.precision(precision);
-         sout << "parallel " << numProcs << " " << myRank << "\n";
-         // sout << "solution\n" << pmesh << mom;
-         // sout << "window_title 'momentum, t = 0'\n";
-         // sout << "solution\n" << pmesh << mom_x;
-         // sout << "window_title 'momentum(x), t = 0'\n";
-         // sout << "solution\n" << pmesh << mom_y;
-         // sout << "window_title 'momentum(y), t = 0'\n";
-         sout << "solution\n" << pmesh << density;
-         sout << "window_title 'density, t = 0'\n";
-         // sout << "solution\n" << pmesh << energy;
-         // sout << "window_title 'energy, t = 0'\n";
-         sout << "view 0 0\n";  // view from top
-         sout << "keys jlm\n";  // turn off perspective and light, show mesh
-         sout << "pause\n";
-         sout << flush;
-         if (Mpi::Root())
-         {
-            cout << "GLVis visualization paused."
-                 << " Press space (in the GLVis window) to resume it.\n";
-         }
-         MPI_Barrier(pmesh.GetComm());
       }
    }
 
@@ -376,17 +373,10 @@ int main(int argc, char *argv[])
          }
          if (visualization)
          {
-            // sout << "window_title 'momentum, t = " << t << "'\n";
-            sout << "parallel " << numProcs << " " << myRank << "\n";
-            // sout << "solution\n" << pmesh << mom << flush;
-            // sout << "solution\n" << pmesh << mom_x;
-            // sout << "window_title 'momentum(x), t = " << t << "'\n";
-            // sout << "solution\n" << pmesh << mom_y;
-            // sout << "window_title 'momentum(y), t = " << t << "'\n";
-            sout << "solution\n" << pmesh << density;
-            sout << "window_title 'density, t = " << t << "'\n";
-            // sout << "solution\n" << pmesh << energy;
-            // sout << "window_title 'energy, t = " << t << "'\n";
+            igr.UpdateFromState(sol, /*warm_start=*/true);
+            igr.GetSigma().ExchangeFaceNbrData();
+            vis::Update(w_density, numProcs, myRank, pmesh, density, t, "density");
+            vis::Update(w_sigma,   numProcs, myRank, pmesh, igr.GetSigma(), t, "sigma");
          }
       }
    }

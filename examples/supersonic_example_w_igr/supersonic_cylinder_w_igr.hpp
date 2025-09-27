@@ -52,9 +52,6 @@ private:
    std::vector<std::unique_ptr<NonlinearFormIntegrator>> ext_bdr_int_;
    std::vector<std::unique_ptr<Array<int>>>              ext_bdr_markers_;
 
-   // Optional Σ field for IGR volume injection (same mesh, scalar DG/H1 ok)
-   const ParGridFunction *sigma_gf_ = nullptr;
-
    // Compute element-wise inverse mass matrix
    void ComputeInvMass();
    // Compute element-wise weak-divergence matrix
@@ -99,21 +96,6 @@ public:
       nonlinearForm->AddBdrFaceIntegrator(nfi, *ext_bdr_markers_.back());
    }
 
-   // -------- IGR hook: provide Σ for volume-path injection --------
-   // Σ should be a scalar ParGridFunction on the same mesh (space can be DG or H1).
-   void SetSigmaField(const ParGridFunction *sigma) { sigma_gf_ = sigma; }
-
-   /// IGR: propagate Σ to all boundary flux integrators (Riemann faces).
-   void SetSigmaFieldOnBoundaryFaces(const mfem::ParGridFunction* sigma)
-   {
-      for (auto &uptr : ext_bdr_int_)
-      {
-         if (auto *bfi = dynamic_cast<BdrHyperbolicFluxIntegrator*>(uptr.get()))
-         {
-            bfi->SetSigmaField(sigma);
-         }
-      }
-   }
 };
 
 //////////////////////////////////////////////////////////////////
@@ -212,10 +194,14 @@ void DGHyperbolicConservationLaws::ComputeWeakDivergence()
       weakdiv[i].SetSize(dof, dof*dim);
 
       // Reorder columns: trial space grouped by node, then dimension.
+      // Original layout = [all DOFs in x-dir][all DOFs in y-dir][all DOFs in z-dir]
+      // New layout      = [d0_x, d0_y, (d0_z)], [d1_x, d1_y, (d1_z)], ...
+      // i.e. “ByDim per node” → makes multiplying by nodal fluxes F(u) easier.
       for (int j=0; j<dof; j++)         // loop over trial DOFs
       {
          for (int d=0; d<dim; d++)      // loop over dimensions
          {
+            // Copy column from assembled to reordered
             weakdiv[i].SetCol(j*dim + d,
                               weakdiv_bynodes.GetColumn(d*dof + j));
          }
@@ -229,6 +215,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
    formIntegrator->ResetMaxCharSpeed();
 
    // (1) Build the face contribution (and possibly the volume term) into z:
+   //     z = - < F̂(u_h, n), [[v]] >_faces
+   //     If weak-divergence is NOT preassembled, HyperbolicFormIntegrator also adds
+   //     the volume term (F(u_h), ∇v) so that:
+   //     z = - < F̂(u_h, n), [[v]] >_faces + (F(u_h), ∇v)
    nonlinearForm->Mult(x, z);
 
    if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
@@ -246,14 +236,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
       Array<int> vdofs;            // vector DOF indices for this element
       Vector xval, zval;
 
-      // For Σ access (if provided)
-      Array<int> sdofs;
-      Vector sigma_el;
-
       for (int i = 0; i < vfes.GetNE(); i++)   // loop over elements T
       {
          ElementTransformation* Tr = vfes.GetElementTransformation(i);
-         const int dof = vfes.GetFE(i)->GetDof();
+         int dof = vfes.GetFE(i)->GetDof();
          vfes.GetElementVDofs(i, vdofs);
 
          // Pull element's DOFs from x and view them as (dof × num_equations)
@@ -263,19 +249,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
          // Prepare buffer for physical flux at all dof points
          flux.SetSize(num_equations, dim*dof);
 
-         // If Σ is available, pull the element slice: sigma_el(j) = Σ at local node j
-         if (sigma_gf_)
-         {
-            const FiniteElementSpace *sFES = sigma_gf_->FESpace();
-            MFEM_VERIFY(sFES && sFES->GetMesh() == vfes.GetMesh(),
-                        "Sigma field must live on the same mesh.");
-            sFES->GetElementDofs(i, sdofs);
-            sigma_gf_->GetSubVector(sdofs, sigma_el);
-            MFEM_VERIFY(sigma_el.Size() == dof,
-                        "Sigma element dof count must match scalar dofs for the element.");
-         }
-
-         // (2) For each local node j, evaluate the conservative state and compute F(U_j)
+         // (2) For each local node j, evaluate the conservative state and compute F(u_j)
          for (int j = 0; j < dof; j++)
          {
             // current_state := U_h at node j  (size num_eq)
@@ -286,33 +260,24 @@ void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
                                          num_equations, /*ncols=*/dim);
 
             // Compute physical flux tensor F(U, x) at this node (fills current_flux)
+            // Mathematically this is: F(U_j) ∈ ℝ^{num_eq×dim}
             fluxFunction.ComputeFlux(current_state, *Tr, current_flux);
-
-            // ---------- IGR VOLUME INJECTION: p -> p + σ ----------
-            if (sigma_gf_)
-            {
-               const double sigma = sigma_el(j);
-               const double rho   = std::max(current_state(0), 1e-14);
-               // velocity u = m / rho
-               double udir[3] = {0,0,0};
-               for (int d = 0; d < dim; ++d) { udir[d] = current_state(1+d) / rho; }
-
-               // Momentum equations: add σ * I (i.e., only diagonal spatial flux components)
-               for (int d = 0; d < dim; ++d) { current_flux(1 + d, d) += sigma; }
-
-               // Energy equation: add σ * u (vector over spatial directions)
-               for (int d = 0; d < dim; ++d) { current_flux(1 + dim, d) += sigma * udir[d]; }
-            }
          }
 
          // (3) Add the preassembled weak-divergence term to z:
+         //     current_zmat += weakdiv[i] * flux^T
+         // weakdiv[i] encodes ∫_T (·, ∇v) with a “dim-reordered” layout so
+         // multiplying by flux^T yields (I_h F(u_h), ∇v)_T contribution.
          z.GetSubVector(vdofs, zval);
          current_zmat.UseExternalData(zval.GetData(), dof, num_equations);
 
          // AddMult_a_ABt: current_zmat += 1.0 * weakdiv[i] * (flux)^T
+         // (Note ABᵗ: weakdiv[i] multiplies by flux transposed as expected by the layout)
          mfem::AddMult_a_ABt(1.0, weakdiv[i], flux, current_zmat);
 
          // (4) Apply inverse mass to obtain time derivative on this element:
+         //     current_ymat = invmass[i] * current_zmat
+         // i.e. y_T = M_T^{-1} * z_T
          current_ymat.SetSize(dof, num_equations);
          mfem::Mult(invmass[i], current_zmat, current_ymat);
 
@@ -355,15 +320,30 @@ void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
 
 void DGHyperbolicConservationLaws::Update()
 {
+   // Tell the nonlinear form to refresh its internal data.
+   // This could recompute quadrature data, face integrators, etc.,
+   // especially if the mesh or finite element space has changed.
    nonlinearForm->Update();
 
+   // Height = global vector length (size of the DOF vector).
+   // Width = operator width = also the same, since this is square (u -> u).
    height = nonlinearForm->Height();
    width = height;
 
+   // Resize the auxiliary work vector z used in Mult().
+   // z stores the assembled right-hand side BEFORE multiplying by invmass.
    z.SetSize(height);
 
+   // Compute per-element inverse mass matrices:
+   // invmass[i] ≈ M_T^{-1}, where
+   //    M_T = (ϕ_m, ϕ_n)_T   (local mass matrix on element T).
+   // These are needed to apply y = M^{-1} z in Mult().
    ComputeInvMass();
 
+   // If we are using the “weak divergence preassembly” mode:
+   //    weakdiv[i] encodes the (∇v, ·) operator on element i,
+   //    arranged so that we can later do flux × weakdiv efficiently.
+   // Only compute this once when mesh/FE changes.
    if (!weakdiv.empty()) {
       ComputeWeakDivergence();
    }
@@ -386,6 +366,7 @@ Mesh EulerMesh(const int problem)
 }
 
 // Helper: make a boundary marker from a set of attribute ids {a1, a2, ...}
+// Example: MakeMarker(pmesh, {4}) creates a marker with only attribute 4 active.
 static void MakeMarker(mfem::Array<int> &marker,
                        mfem::ParMesh &pmesh,
                        std::initializer_list<int> attrs)
@@ -498,19 +479,18 @@ public:
   void SetTime(double t) override { base_.SetTime(t); }
 
   void Mult(const Vector& U, Vector& dUdt) const override
-   {
-   // Recompute Σ with a few warm-started sweeps
-   igr_.UpdateFromState(state_, /*warm_start=*/true);
+  {
+    // Recompute Σ with a few warm-started sweeps;
+    // FluxWithIGR reads Σ directly (as a ParGridFunction*) so
+    // no explicit plumbing into DG is needed here.
+    igr_.UpdateFromState(state_, /*warm_start=*/true);
 
-   // Volume path: Σ used inside DGHyperbolicConservationLaws::Mult (preassembled flux)
-   base_.SetSigmaField(&igr_.GetSigma());
+    // IMPORTANT: make Σ available on face neighbors across MPI subdomains
+    igr_.GetSigma().ExchangeFaceNbrData();
 
-   // Face path: hand Σ to all BdrHyperbolicFluxIntegrator(s)
-   base_.SetSigmaFieldOnBoundaryFaces(&igr_.GetSigma());
-
-   // Forward to the DG operator
-   base_.Mult(U, dUdt);
-   }
+    // Forward to the DG operator
+    base_.Mult(U, dUdt);
+  }
 
   real_t GetMaxCharSpeed() { return base_.GetMaxCharSpeed(); }
 

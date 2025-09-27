@@ -52,5 +52,4 @@ build
 MFEM_examples/
 notes/
 .DS_Store
-glvis*
 supersonic_example/backup
