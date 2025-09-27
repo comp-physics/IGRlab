@@ -12,3 +12,4 @@ find_package(mfem REQUIRED)
 
 add_subdirectory(src)
 add_subdirectory(examples/supersonic_example)
+add_subdirectory(examples/supersonic_example_w_igr)
