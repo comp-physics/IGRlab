@@ -46,7 +46,9 @@ mfem/
 scratch/
 tpls/
 data/
-*/build/
+build
+*/*/build/
+*/*/backup
 MFEM_examples/
 notes/
 .DS_Store

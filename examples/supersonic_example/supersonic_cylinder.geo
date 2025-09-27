@@ -5,7 +5,7 @@
 SetFactory("OpenCASCADE");
 
 // Mesh parameters
-mesh_size = 0.5;        // Global mesh size
+mesh_size = 0.4;        // Global mesh size
 circle_mesh_size = 0.2; // Finer mesh around circle
 
 // Define corner points of the rectangular domain
@@ -44,7 +44,7 @@ Mesh.HighOrderOptimize = 1;         // Optimize high-order mesh
 Mesh.Algorithm = 6;                 // Frontal-Delaunay algorithm
 Mesh.Algorithm3D = 1;               // Delaunay 3D algorithm
 Mesh.OptimizeNetgen = 1;            // Optimize with Netgen
-Mesh.Smoothing = 10;                // Smoothing iterations
+Mesh.Smoothing = 20;                // Smoothing iterations
 
 // Mesh size field for refinement around circle
 Field[1] = Distance;
@@ -55,8 +55,20 @@ Field[2] = Threshold;
 Field[2].IField = 1;
 Field[2].LcMin = circle_mesh_size;  // Fine mesh size near circle
 Field[2].LcMax = mesh_size;         // Coarse mesh size away from circle
-Field[2].DistMin = 0.1;             // Start transition distance
+Field[2].DistMin = 0.0;             // Start transition distance
 Field[2].DistMax = 0.5;             // End transition distance
+
+// Boundary layer
+Field[3] = BoundaryLayer;
+Field[3].EdgesList      = {5};
+Field[3].NbLayers       = 2;
+Field[3].Size           = 0.05;
+Field[3].Thickness      = 0.1;
+Field[3].Ratio          = 1.1;
+Field[3].Quads          = 1;
+Field[3].IntersectMetrics   = 1;
+
+BoundaryLayer Field = 3;
 
 Background Field = 2;
 
@@ -65,7 +77,7 @@ Mesh.MshFileVersion = 2.2;
 Mesh.Binary = 0;                    // ASCII format for compatibility
 
 // Quality settings
-Mesh.MinimumCirclePoints = 12;      // Minimum points on circle
+Mesh.MinimumCirclePoints = 10;      // Minimum points on circle
 Mesh.RecombineAll = 0;              // Keep triangular elements
 Mesh.SubdivisionAlgorithm = 1;      // Subdivision for high-order
 
