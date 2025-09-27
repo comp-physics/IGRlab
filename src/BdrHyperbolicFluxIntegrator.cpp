@@ -74,6 +74,7 @@ BdrHyperbolicFluxIntegrator::BdrHyperbolicFluxIntegrator(
    const int IntOrderOffset,
    real_t sign)
    : NonlinearFormIntegrator(),
+   //   max_char_speed(0.0),
      numFlux(numFlux),
      fluxFunction(numFlux.GetFluxFunction()),
      bc(std::move(bc_)),
@@ -178,7 +179,30 @@ void BdrHyperbolicFluxIntegrator::AssembleFaceVector(
       // Update the global max char speed
       max_char_speed = std::max(speed, max_char_speed);
 
-      // pre-multiply integration weight to flux
+      // ---------------- IGR FACE INJECTION: p -> p + Σ ----------------
+      if (sigma_gf_)
+      {
+         // Evaluate Σ on the *interior* side at this face point
+         ElementTransformation &T1 = *Tr.Elem1;
+         const IntegrationPoint &eip = Tr.GetElement1IntPoint();
+         T1.SetIntPoint(&eip);
+         const double sigma = sigma_gf_->GetValue(T1, eip);
+
+         // Compute (u·n) from interior state and *scaled* normal
+         const int dim = fluxFunction.dim;
+         const double rho = state1(0);
+         double mom_dot_n = 0.0;
+         for (int d = 0; d < dim; ++d) { mom_dot_n += state1(1 + d) * nor(d); }
+         const double un = mom_dot_n / rho;
+
+         // Momentum rows: + Σ * n_d
+         for (int d = 0; d < dim; ++d) { fluxN(1 + d) += sigma * nor(d); }
+
+         // Energy row: + Σ * (u·n)
+         fluxN(1 + dim) += sigma * un;
+      }
+
+      // pre-multiply integration weight to flux contribution
       AddMult_a_VWt(-ip.weight*sign, shape1, fluxN, elvect1_mat);
     //   AddMult_a_VWt(+ip.weight*sign, shape2, fluxN, elvect2_mat);
    }

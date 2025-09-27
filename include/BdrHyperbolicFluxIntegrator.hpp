@@ -157,6 +157,9 @@ private:
    DenseMatrix JDotN;   // Ĵ(u±,x) n
 #endif
 
+   // ---- IGR: optional Σ field (scalar ParGridFunction on same mesh) ----
+   const mfem::ParGridFunction* sigma_gf_ = nullptr;
+
 public:
    const int num_equations;  // the number of equations
    /**
@@ -188,7 +191,11 @@ public:
 
    const FluxFunction &GetFluxFunction() { return fluxFunction; }
 
-      /**
+   // ---- IGR: set Σ field pointer (no ownership) ----
+   // Pass nullptr to disable IGR on faces.
+   void SetSigmaField(const mfem::ParGridFunction* sigma) { sigma_gf_ = sigma; }
+
+   /**
     * @brief Implements <-F̂(u⁻,u⁺,x) n, [v]> with abstract F̂ computed by
     * NumericalFlux::Eval() of the numerical flux object
     *

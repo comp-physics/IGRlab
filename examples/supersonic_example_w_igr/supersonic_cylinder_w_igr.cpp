@@ -159,7 +159,32 @@ int main(int argc, char *argv[])
    // Finite element space for all variables together (total thermodynamic state)
    ParFiniteElementSpace vfes(&pmesh, &fec, num_equations, Ordering::byNODES);
 
-   // This example depends on this ordering of the space.
+   // IGR scalar space (same DG family/order)
+   ParFiniteElementSpace sfes(&pmesh, &fec);
+
+   // IGR params
+   const double rho_floor = 1e-10;
+   // --- compute nominal Δx and α from the mesh and polynomial order ---
+   real_t hmin_alpha = infinity();
+   for (int i = 0; i < pmesh.GetNE(); i++)
+   {
+      hmin_alpha = std::min(pmesh.GetElementSize(i, 1), hmin_alpha);
+   }
+   MPI_Allreduce(MPI_IN_PLACE, &hmin_alpha, 1,
+               MPITypeMap<real_t>::mpi_type, MPI_MIN, pmesh.GetComm());
+   // Effective spacing for DG(p): Δx_eff ≈ h / (p+1)
+   const double dx_eff = hmin_alpha / (order + 1);
+   // Choose a constant Cα (start with 1.0 for shocky cases, 0.25–0.5 for smooth)
+   const double C_alpha = 0.5;
+   // α = Cα * (Δx_eff)^2
+   const double alpha_igr = C_alpha * dx_eff * dx_eff;
+
+   // Build IGR
+   IGRSolver igr(sfes, vfes, dim, num_equations, alpha_igr);
+   igr.SetRhoFloor(rho_floor);
+   igr.SetSmoother(IGRSolver::SmootherType::L1Jacobi);
+   igr.SetSweeps(/*regular=*/5, /*warm_start=*/5);
+
    MFEM_ASSERT(fes.GetOrdering() == Ordering::byNODES, "");
 
    HYPRE_BigInt glob_size = vfes.GlobalTrueVSize();
@@ -206,84 +231,43 @@ int main(int argc, char *argv[])
    // 6. Set up the nonlinear form with euler flux and numerical flux
    EulerFlux flux(dim, specific_heat_ratio);
    RusanovFlux numericalFlux(flux);
-   // HLLCFlux numericalFlux(flux, specific_heat_ratio);  // pass gamma
-   // DiffusiveRusanovFlux numericalFlux(flux,
-   //                                    /*beta=*/0.5,
-   //                                    /*delta=*/0.0,
-   //                                    /*cap=*/std::numeric_limits<real_t>::infinity(),
-   //                                    /*sensor_k=*/0.0,
-   //                                    /*sensor_max=*/1.0);
-   // ComponentwiseUpwindFlux numericalSurfFlux(flux);
-   DGHyperbolicConservationLaws euler(
+
+   DGHyperbolicConservationLaws base_op(
       vfes, std::unique_ptr<HyperbolicFormIntegrator>(
          new HyperbolicFormIntegrator(numericalFlux, IntOrderOffset)),
       preassembleWeakDiv);
 
-   // Set up boundary markers and integrators
-   // Boundary markers (attributes): 1=bottom, 2=right, 3=top, 4=left, 5=circle
-   // Set up boundary condition markers
+   // BC markers (1=bottom, 2=right, 3=top, 4=left, 5=circle)
    Array<int> inlet_bdr, outlet_bdr, slip_bdr, cyl_bdr;
    MakeMarker(inlet_bdr, pmesh, {4});
    MakeMarker(outlet_bdr, pmesh, {2});
    MakeMarker(slip_bdr, pmesh, {1,3});
    MakeMarker(cyl_bdr, pmesh, {5});
    mfem::Vector Uin(4);
-   // Supersonic Cyl
-   Uin(0) = 1.4;
-   Uin(1) = 1.4 * 1.2;
-   Uin(2) = 0.0;
-   Uin(3) = 8.8;
-   // Vortex Case
-   // Uin(0) = 1.0;
-   // Uin(1) = 1.0 * 1.0;
-   // Uin(2) = 0.0;
-   // Uin(3) = 714.8;
-   euler.AddBdrFaceIntegrator(
+   Uin(0) = 1.4; Uin(1) = 1.4 * 1.2; Uin(2) = 0.0; Uin(3) = 8.8;
+
+   base_op.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
                                     std::make_unique<SupersonicInletState>(Uin),
                                     IntOrderOffset),
       inlet_bdr);
-   // euler.AddBdrFaceIntegrator(
-   //    new BdrHyperbolicFluxIntegrator(numericalFlux,
-   //                                  std::make_unique<SupersonicOutletState>(),
-   //                                  IntOrderOffset),
-   //    inlet_bdr);
-
-   euler.AddBdrFaceIntegrator(
+   base_op.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
                                     std::make_unique<SupersonicOutletState>(),
                                     IntOrderOffset),
       outlet_bdr);
-   // euler.AddBdrFaceIntegrator(
-   //    new BdrHyperbolicFluxIntegrator(numericalFlux,
-   //                                  std::make_unique<SupersonicInletState>(Uin),
-   //                                  IntOrderOffset),
-   //    outlet_bdr);
-
-   euler.AddBdrFaceIntegrator(
+   base_op.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
                                     std::make_unique<SlipWallState>(dim),
                                     IntOrderOffset),
       slip_bdr);
-   // euler.AddBdrFaceIntegrator(
-   //    new BdrHyperbolicFluxIntegrator(numericalFlux,
-   //                                  std::make_unique<SupersonicInletState>(Uin),
-   //                                  IntOrderOffset),
-   //    slip_bdr);
-
-   euler.AddBdrFaceIntegrator(
+   base_op.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
                                     std::make_unique<SlipWallState>(dim),
                                     IntOrderOffset),
       cyl_bdr);
-   // euler.AddBdrFaceIntegrator(
-   //    new BdrHyperbolicFluxIntegrator(numericalFlux,
-   //                                  std::make_unique<SupersonicInletState>(Uin),
-   //                                  IntOrderOffset),
-   //    cyl_bdr);
 
-
-   // 7. Visualize momentum with its magnitude
+   // 7. Visualization
    socketstream sout;
    if (visualization)
    {
@@ -304,7 +288,6 @@ int main(int argc, char *argv[])
       else
       {
          sout.precision(precision);
-         // Plot magnitude of vector-valued momentum
          sout << "parallel " << numProcs << " " << myRank << "\n";
          // sout << "solution\n" << pmesh << mom;
          // sout << "window_title 'momentum, t = 0'\n";
@@ -346,12 +329,14 @@ int main(int argc, char *argv[])
       // maximum char speed at all quadrature points on all faces (and all
       // elements with -mf).
       Vector z(sol.Size());
-      euler.Mult(sol, z);
 
-      real_t max_char_speed = euler.GetMaxCharSpeed();
+      // Use wrapped op here so Σ exists during the probe call too
+      EulerWithIGR wrapped(base_op, igr, sol);
+      wrapped.Mult(sol, z);
+
+      real_t max_char_speed = wrapped.GetMaxCharSpeed();
       MPI_Allreduce(MPI_IN_PLACE, &max_char_speed, 1,  MPITypeMap<real_t>::mpi_type,
-                    MPI_MAX,
-                    pmesh.GetComm());
+                    MPI_MAX, pmesh.GetComm());
       dt = cfl * hmin / max_char_speed / (2 * order + 1);
    }
 
@@ -359,12 +344,13 @@ int main(int argc, char *argv[])
    tic_toc.Clear();
    tic_toc.Start();
 
-   // Init time integration
    real_t t = 0.0;
-   euler.SetTime(t);
-   ode_solver->Init(euler);
 
-   // Integrate in time.
+   // Wrap the base DG op with IGR recomputation each Mult()
+   EulerWithIGR wrapped(base_op, igr, sol);
+   wrapped.SetTime(t);
+   ode_solver->Init(wrapped);
+
    bool done = false;
    for (int ti = 0; !done;)
    {
@@ -373,12 +359,11 @@ int main(int argc, char *argv[])
       ode_solver->Step(sol, t, dt_real);
       if (cfl > 0) // update time step size with CFL
       {
-         real_t max_char_speed = euler.GetMaxCharSpeed();
+         real_t max_char_speed = wrapped.GetMaxCharSpeed();
          MPI_Allreduce(MPI_IN_PLACE, &max_char_speed, 1,  MPITypeMap<real_t>::mpi_type,
-                       MPI_MAX,
-                       pmesh.GetComm());
+                       MPI_MAX, pmesh.GetComm());
          dt = cfl * hmin / max_char_speed / (2 * order + 1);
-         cout << "dt: " << dt << endl;
+         if (Mpi::Root()) { cout << "dt: " << dt << endl; }
       }
       ti++;
 
