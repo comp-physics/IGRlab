@@ -54,6 +54,8 @@
 #include <sstream>
 #include "supersonic_cylinder_w_igr.hpp"
 #include "glvismulti.hpp"
+#include "limiters.hpp"
+#include "timesteppers.hpp"
 
 using namespace std;
 using namespace mfem;
@@ -161,10 +163,22 @@ int main(int argc, char *argv[])
    ParFiniteElementSpace vfes(&pmesh, &fec, num_equations, Ordering::byNODES);
 
    // IGR scalar space (same DG family/order)
+   // H1_FECollection sfec(order, dim);
+   // ParFiniteElementSpace sfes(&pmesh, &sfec);
    ParFiniteElementSpace sfes(&pmesh, &fec);
 
+   // Timestepper
+   const double rho_min = 5.0e-7;
+   const double p_min   = 1.0e-6;
+   const int quad_order = 0;
+   const int p_bisect_iters = 12;
+   mfem::RK3SSPWithLimiter rk3(vfes);
+   rk3.SetEulerParams(dim, /*gamma=*/1.4);
+   rk3.SetLimiterParams(rho_min, p_min, quad_order, p_bisect_iters);
+   rk3.LimitInitial(true);
+
    // IGR params
-   const double rho_floor = 1e-10;
+   const double rho_floor = rho_min;
    // --- compute nominal Δx and α from the mesh and polynomial order ---
    real_t hmin_alpha = infinity();
    for (int i = 0; i < pmesh.GetNE(); i++)
@@ -175,16 +189,17 @@ int main(int argc, char *argv[])
                MPITypeMap<real_t>::mpi_type, MPI_MIN, pmesh.GetComm());
    // Effective spacing for DG(p): Δx_eff ≈ h / (p+1)
    const double dx_eff = hmin_alpha / (order + 1);
+   // const double dx_eff = hmin_alpha ;
    // Choose a constant Cα (start with 1.0 for shocky cases, 0.25–0.5 for smooth)
-   const double C_alpha = 0.1;
+   const double C_alpha = 1.0;
    // α = Cα * (Δx_eff)^2
    const double alpha_igr = C_alpha * dx_eff * dx_eff;
-
    // Build IGR
    IGRSolver igr(sfes, vfes, dim, num_equations, alpha_igr);
    igr.SetRhoFloor(rho_floor);
+   // igr.SetSmoother(IGRSolver::SmootherType::Jacobi);
    igr.SetSmoother(IGRSolver::SmootherType::L1Jacobi);
-   igr.SetSweeps(/*regular=*/5, /*warm_start=*/5);
+   igr.SetSweeps(/*regular=*/3, /*warm_start=*/3);
 
    MFEM_ASSERT(fes.GetOrdering() == Ordering::byNODES, "");
 
@@ -209,6 +224,9 @@ int main(int argc, char *argv[])
    ParGridFunction mom_x(&fes, sol.GetData() + 1 * fes.GetNDofs());
    ParGridFunction mom_y(&fes, sol.GetData() + 2 * fes.GetNDofs());
    ParGridFunction energy(&fes, sol.GetData() + 3 * fes.GetNDofs());
+   PressureCoefficient pcoef(sol, dim, specific_heat_ratio);
+   mfem::ParGridFunction press(&sfes);
+   press.ProjectCoefficient(pcoef);
    // Output the initial solution.
    {
       ostringstream mesh_name;
@@ -254,7 +272,7 @@ int main(int argc, char *argv[])
    MakeMarker(slip_bdr, pmesh, {1,3});
    MakeMarker(cyl_bdr, pmesh, {5});
    mfem::Vector Uin(4);
-   Uin(0) = 1.4; Uin(1) = 1.4 * 1.2; Uin(2) = 0.0; Uin(3) = 8.8;
+   Uin(0) = 1.4; Uin(1) = 1.4 * 3.0; Uin(2) = 0.0; Uin(3) = 8.8;
 
    base_op.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
@@ -281,8 +299,7 @@ int main(int argc, char *argv[])
    igr.UpdateFromState(sol, /*warm_start=*/false);
    igr.GetSigma().ExchangeFaceNbrData();
    socketstream sout;
-   socketstream s_den, s_sig;
-   vis::GLVisWindow w_density, w_sigma;
+   vis::GLVisWindow w_density, w_sigma, w_energy, w_pressure;
    if (visualization)
    {
       const char vishost[] = "localhost";
@@ -298,8 +315,14 @@ int main(int argc, char *argv[])
       bool ok2 = vis::Open(w_sigma,   vishost, visport, precision,
                            numProcs, myRank, pmesh, igr.GetSigma(),
                            "sigma, t = 0");
+      bool ok3 = vis::Open(w_energy, vishost, visport, precision,
+                           numProcs, myRank, pmesh, energy,
+                           "energy, t = 0");
+      bool ok4 = vis::Open(w_pressure, vishost, visport, precision,
+                           numProcs, myRank, pmesh, press,
+                           "pressure, t = 0");
 
-      if (!(ok1 && ok2))
+      if (!(ok1 && ok2 && ok3))
       {
          visualization = false;
          if (Mpi::Root())
@@ -345,15 +368,20 @@ int main(int argc, char *argv[])
 
    // Wrap the base DG op with IGR recomputation each Mult()
    EulerWithIGR wrapped(base_op, igr, sol);
-   wrapped.SetTime(t);
-   ode_solver->Init(wrapped);
+   // wrapped.SetTime(t);
+   // ode_solver->Init(wrapped);
+   rk3.Init(wrapped);
 
    bool done = false;
    for (int ti = 0; !done;)
    {
       real_t dt_real = min(dt, t_final - t);
 
-      ode_solver->Step(sol, t, dt_real);
+      // ode_solver->Step(sol, t, dt_real);
+      rk3.Step(sol, t, dt_real);
+      // ApplyZhangShuPositivityLimiter(vfes, sol, dim, specific_heat_ratio,
+      //                          5.0e-7, 1.0e-6, std::max(2*order, 4));
+      // sol.ExchangeFaceNbrData();
       if (cfl > 0) // update time step size with CFL
       {
          real_t max_char_speed = wrapped.GetMaxCharSpeed();
@@ -377,6 +405,10 @@ int main(int argc, char *argv[])
             igr.GetSigma().ExchangeFaceNbrData();
             vis::Update(w_density, numProcs, myRank, pmesh, density, t, "density");
             vis::Update(w_sigma,   numProcs, myRank, pmesh, igr.GetSigma(), t, "sigma");
+            vis::Update(w_energy,  numProcs, myRank, pmesh, energy, t, "energy");
+            pcoef.SetState(sol);
+            press.ProjectCoefficient(pcoef);
+            vis::Update(w_pressure, numProcs, myRank, pmesh, press, t, "pressure");
          }
       }
    }

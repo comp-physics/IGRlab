@@ -420,11 +420,10 @@ real_t FluxWithIGR::ComputeFlux(const Vector &U, ElementTransformation &Tr,
 {
   // Base tensor flux + base max characteristic speed
   const real_t mcs = base_.ComputeFlux(U, Tr, F);
-  if (!sigma_) return mcs;
+//   if (!sigma_) return mcs;
 
   const IntegrationPoint &ip = Tr.GetIntPoint(); // MFEM sets this before call
   double sigma = sigma_->GetValue(Tr, ip);
-  sigma = ClampSigma(sigma);
 
   AddTensorSigmaTerms(U, sigma, F);
   return mcs; // keep dissipation unchanged
@@ -436,7 +435,7 @@ real_t FluxWithIGR::ComputeFluxDotN(const Vector &U, const Vector &n,
 {
   // Base normal flux + base (normal) max characteristic speed
   const real_t mcs = base_.ComputeFluxDotN(U, n, Tr, Fn);
-  if (!sigma_) return mcs;
+//   if (!sigma_) return mcs;
 
   // Face-average σ on interior faces, interior σ on boundary faces
   double sigma_face = 0.0;
@@ -448,66 +447,22 @@ real_t FluxWithIGR::ComputeFluxDotN(const Vector &U, const Vector &n,
     const IntegrationPoint &ip2 = Tr.GetElement2IntPoint();
     T1.SetIntPoint(&ip1);
     T2.SetIntPoint(&ip2);
-    const double sL = ClampSigma(sigma_->GetValue(T1, ip1));
-    const double sR = ClampSigma(sigma_->GetValue(T2, ip2));
-    sigma_face = 0.5 * (sL + sR);
+    const double sL = sigma_->GetValue(T1, ip1);
+    const double sR = sigma_->GetValue(T2, ip2);
+   //  sigma_face = 0.5 * (sL + sR);
+   sigma_face = std::max(sL, sR);
   }
   else // boundary face
   {
     ElementTransformation &T1 = *Tr.Elem1;
     const IntegrationPoint &ip1 = Tr.GetElement1IntPoint();
     T1.SetIntPoint(&ip1);
-    sigma_face = ClampSigma(sigma_->GetValue(T1, ip1));
+    sigma_face = sigma_->GetValue(T1, ip1);
   }
 
   AddDotNSigmaTerms(U, n, sigma_face, Fn);
   return mcs;
 }
-
-real_t FluxWithIGR::ComputeAvgFluxDotN(const Vector &U1, const Vector &U2,
-                                       const Vector &n, FaceElementTransformations &Tr,
-                                       Vector &Fn) const
-{
-  // Base averaged normal flux (if implemented by the base; otherwise this path is unused)
-  const real_t mcs = base_.ComputeAvgFluxDotN(U1, U2, n, Tr, Fn);
-  if (!sigma_) return mcs;
-
-  // Same σ averaging rule as above
-  double sL = 0.0, sR = 0.0;
-  if (Tr.Elem2)
-  {
-    ElementTransformation &T1 = *Tr.Elem1;
-    ElementTransformation &T2 = *Tr.Elem2;
-    const IntegrationPoint &ip1 = Tr.GetElement1IntPoint();
-    const IntegrationPoint &ip2 = Tr.GetElement2IntPoint();
-    T1.SetIntPoint(&ip1);
-    T2.SetIntPoint(&ip2);
-    sL = ClampSigma(sigma_->GetValue(T1, ip1));
-    sR = ClampSigma(sigma_->GetValue(T2, ip2));
-  }
-  else
-  {
-    ElementTransformation &T1 = *Tr.Elem1;
-    const IntegrationPoint &ip1 = Tr.GetElement1IntPoint();
-    T1.SetIntPoint(&ip1);
-    sL = ClampSigma(sigma_->GetValue(T1, ip1));
-    sR = sL;
-  }
-
-  // Add face-averaged Σ terms to the averaged normal flux
-  const double rhoL = std::max(U1(0), rho_vel_floor_);
-  const double rhoR = std::max(U2(0), rho_vel_floor_);
-  double unL = 0.0, unR = 0.0;
-  for (int d = 0; d < dim; ++d) { unL += U1(1 + d) * n(d); unR += U2(1 + d) * n(d); }
-  unL /= rhoL; unR /= rhoR;
-
-  const double add_m = 0.5 * (sL + sR);
-  for (int d = 0; d < dim; ++d) { Fn(1 + d) += add_m * n(d); }
-  Fn(1 + dim) += 0.5 * (sL * unL + sR * unR);
-
-  return mcs;
-}
-
 
 
 } // namespace mfem

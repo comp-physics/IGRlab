@@ -23,7 +23,8 @@ class IGRSolver
 {
 public:
   /// Available smoother types for the fixed-iteration “few sweeps” update.
-  enum class SmootherType { Jacobi, L1Jacobi, Chebyshev };
+  enum class SmootherType { Jacobi, L1Jacobi };
+  // enum class SmootherType { Jacobi, L1Jacobi, Chebyshev };
 
   /**
    * @brief Construct an IGR solver.

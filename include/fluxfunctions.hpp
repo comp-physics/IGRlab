@@ -278,7 +278,6 @@ protected:
  *  - On interior faces we use the **face-average** \(\sigma = \tfrac12(\sigma_L+\sigma_R)\)
  *    inside `ComputeFluxDotN`, so Rusanov/HLLC see a consistent physical part without MFEM changes.
  *  - On boundary faces we use the **interior** element’s \(\sigma\).
- *  - \(\sigma\) is clamped to be finite and \(\ge 0\); a small density floor is used only when forming \(u\).
  */
 class FluxWithIGR : public FluxFunction
 {
@@ -302,11 +301,6 @@ public:
                          FaceElementTransformations &Tr,
                          Vector &fluxN) const override;
 
-  /// Average normal flux (only if your numerical flux uses it). Adds averaged IGR contribution.
-  real_t ComputeAvgFluxDotN(const Vector &state1, const Vector &state2,
-                            const Vector &normal, FaceElementTransformations &Tr,
-                            Vector &fluxDotN) const override;
-
   /// Jacobians: forwarded to the base (unchanged).
   void ComputeFluxJacobian(const Vector &state, ElementTransformation &Tr,
                            DenseTensor &J_) const override
@@ -323,11 +317,6 @@ private:
   double rho_vel_floor_ = 1e-10;
 
   // helpers
-  static inline double ClampSigma(double s)
-  {
-    if (!std::isfinite(s) || s < 0.0) return 0.0;
-    return s;
-  }
 
   inline void AddTensorSigmaTerms(const Vector &U, double sigma, DenseMatrix &F) const
   {

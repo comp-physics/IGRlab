@@ -58,19 +58,22 @@ double IGRSolver::SigmaSourceCoefficient::Eval(ElementTransformation &T,
     }
   }
 
-  // Frobenius norm^2 of grad(u) and (div u)^2
-  double frob2 = 0.0, divu = 0.0;
+  // divergence
+  double divu = 0.0;
+  for (int i = 0; i < dim_; ++i) { divu += gradu_(i,i); }
+
+  // tr( (∇u)^2 ) = sum_{i,j} (∂_j u_i) (∂_i u_j)
+  double trA2 = 0.0;
   for (int i = 0; i < dim_; ++i)
   {
-    divu += gradu_(i, i);
     for (int j = 0; j < dim_; ++j)
     {
-      const double g = gradu_(i, j);
-      frob2 += g * g;
+      trA2 += gradu_(i,j) * gradu_(j,i);
     }
   }
 
-  return alpha_ * (frob2 + divu * divu);
+  // Paper RHS: α ( tr((∇u)^2) + (tr ∇u)^2 )
+  return alpha_ * (trA2 + divu*divu);
 }
 
 // ---------------- IGRSolver core ----------------
@@ -191,7 +194,7 @@ void IGRSolver::DoSmootherSweeps(int sweeps, bool /*warm_start*/)
   {
     case SmootherType::Jacobi:    S.SetType(HypreSmoother::Jacobi);    break;
     case SmootherType::L1Jacobi:  S.SetType(HypreSmoother::l1Jacobi);  break;
-    case SmootherType::Chebyshev: S.SetType(HypreSmoother::Chebyshev); break;
+    // case SmootherType::Chebyshev: S.SetType(HypreSmoother::Chebyshev); break;
   }
   S.SetPositiveDiagonal(true);
 
