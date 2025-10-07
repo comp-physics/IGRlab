@@ -49,7 +49,8 @@ data/
 build
 */*/build/
 */*/backup
+*/backup
 MFEM_examples/
 notes/
 .DS_Store
-supersonic_example/backup
+# supersonic_example/backup

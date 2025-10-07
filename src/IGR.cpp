@@ -3,6 +3,33 @@
 
 using namespace mfem;
 
+// ---------------- helper: u = m / rho as a VectorCoefficient ----------------
+namespace {
+class VelFromUCoef : public VectorCoefficient
+{
+public:
+  VelFromUCoef(int vdim, const ParGridFunction &U, double rho_floor)
+    : VectorCoefficient(vdim), U_(U), dim_(vdim), rho_floor_(rho_floor),
+      state_(U.ParFESpace()->GetVDim()) {}
+
+  void Eval(Vector &V, ElementTransformation &T, const IntegrationPoint &ip) override
+  {
+    T.SetIntPoint(&ip);
+    U_.GetVectorValue(T, ip, state_); // [rho, m(0..dim-1), E]
+    const double rho = std::max(state_(0), rho_floor_);
+    if (V.Size() != dim_) { V.SetSize(dim_); }
+    if (rho <= 0.0) { V = 0.0; return; }
+    for (int d = 0; d < dim_; ++d) { V(d) = state_(1 + d) / rho; }
+  }
+
+private:
+  const ParGridFunction &U_;
+  int dim_;
+  double rho_floor_;
+  Vector state_;
+};
+} // namespace
+
 // ---------------- IGRSolver::InvRhoCoefficient ----------------
 IGRSolver::InvRhoCoefficient::InvRhoCoefficient(const ParGridFunction& U, double rho_floor)
   : U_(&U), rho_floor_(rho_floor) {}
@@ -24,7 +51,7 @@ double IGRSolver::InvRhoCoefficient::Eval(ElementTransformation &T,
 IGRSolver::SigmaSourceCoefficient::SigmaSourceCoefficient(const ParGridFunction& U,
                                                           int dim, int num_eq,
                                                           double alpha, double rho_floor)
-  : U_(&U), dim_(dim), num_eq_(num_eq),
+  : U_(&U), velH1_(nullptr), dim_(dim), num_eq_(num_eq),
     alpha_(alpha), rho_floor_(rho_floor),
     state_(num_eq), gradU_(num_eq, dim), gradu_(dim, dim)
 { }
@@ -35,6 +62,23 @@ double IGRSolver::SigmaSourceCoefficient::Eval(ElementTransformation &T,
   MFEM_VERIFY(U_ != nullptr, "SigmaSourceCoefficient requires a valid state U.");
 
   T.SetIntPoint(&ip);
+
+  // If a continuous velocity field is provided, use its gradient for the RHS
+  if (velH1_)
+  {
+    DenseMatrix gradv(dim_, dim_);
+    velH1_->GetVectorGradient(T, gradv);   // gradv(i,j) = ∂_j u_i
+
+    double divu = 0.0, trA2 = 0.0;
+    for (int i = 0; i < dim_; ++i) { divu += gradv(i,i); }
+    for (int i = 0; i < dim_; ++i)
+      for (int j = 0; j < dim_; ++j)
+        trA2 += gradv(i,j) * gradv(j,i);
+
+    return alpha_ * (trA2 + divu*divu);
+  }
+
+  // Fallback: compute u-gradients from conservative DG state by quotient rule
   U_->GetVectorValue(T, ip, state_);        // [rho, m(0..dim-1), E]
   U_->GetVectorGradient(T, gradU_);         // rows: components, cols: spatial derivs
 
@@ -114,6 +158,18 @@ IGRSolver::IGRSolver(const ParFiniteElementSpace& sigma_fes,
 
   // Initialize operator handle type we expect (parallel CSR)
   Ah_.SetType(Operator::Hypre_ParCSR);
+
+  // Build an internal H1 vector space for velocity (continuous), vdim = dim.
+  {
+    // Choose H1 polynomial order to match the (scalar) degree of sigma space by default,
+    // or at least 1 so we can compute meaningful gradients even if state is p=0.
+    int p_h1 = std::max(3, sfes_.GetMaxElementOrder());
+    h1fec_vel_  = std::make_unique<H1_FECollection>(p_h1, sfes_.GetMesh()->Dimension());
+    vel_h1_fes_ = std::make_unique<ParFiniteElementSpace>(sfes_.GetParMesh(),
+                                                          h1fec_vel_.get(), dim_);
+    vel_h1_     = std::make_unique<ParGridFunction>(vel_h1_fes_.get());
+    *vel_h1_    = 0.0;
+  }
 }
 
 void IGRSolver::SetAlpha(double a)
@@ -151,6 +207,14 @@ void IGRSolver::AssembleSystem(const ParGridFunction& U)
   // Refresh coefficient views of the current state and params
   invrho_coef_->SetState(U);
   invrho_coef_->SetRhoFloor(rho_floor_);
+
+  // --- Project velocity u = m/ρ to a continuous H1 vector field (nodal interpolation) ---
+  // This uses a VectorCoefficient that evaluates u from the conservative U.
+  {
+    VelFromUCoef ucoef(dim_, U, rho_floor_);
+    vel_h1_->ProjectCoefficient(ucoef); // H1 nodal projection (interpolate at H1 nodes)
+    src_coef_->SetVelField(vel_h1_.get());
+  }
 
   src_coef_->SetState(U);
   src_coef_->SetAlpha(alpha_);

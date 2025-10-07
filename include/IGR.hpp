@@ -106,8 +106,11 @@ private:
     void SetState(const mfem::ParGridFunction& U) { U_ = &U; }
     void SetAlpha(double a) { alpha_ = a; }
     void SetRhoFloor(double floor) { rho_floor_ = floor; }
+    // Use a continuous H1 velocity field (vdim = dim) for gradients if provided.
+    void SetVelField(const mfem::ParGridFunction* v) { velH1_ = v; }
   private:
     const mfem::ParGridFunction* U_ = nullptr;
+    const mfem::ParGridFunction* velH1_ = nullptr; // H1 velocity field (optional)
     int dim_, num_eq_;
     double alpha_, rho_floor_;
     mfem::Vector      state_;   // [rho, m(0:dim-1), E]
@@ -160,4 +163,9 @@ private:
   mfem::Array<int>        ess_tdof_list_;
   mfem::OperatorHandle    Ah_;     // holds the assembled operator (Hypre matrix)
   mfem::Vector            X_, B_;  // true-dof vectors
+
+  // ---- Internal continuous velocity space (H1) and field for RHS gradients ----
+  std::unique_ptr<mfem::H1_FECollection>           h1fec_vel_;
+  std::unique_ptr<mfem::ParFiniteElementSpace>     vel_h1_fes_; // vdim = dim_
+  std::unique_ptr<mfem::ParGridFunction>           vel_h1_;     // continuous u_h
 };

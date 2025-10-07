@@ -449,8 +449,8 @@ real_t FluxWithIGR::ComputeFluxDotN(const Vector &U, const Vector &n,
     T2.SetIntPoint(&ip2);
     const double sL = sigma_->GetValue(T1, ip1);
     const double sR = sigma_->GetValue(T2, ip2);
-   //  sigma_face = 0.5 * (sL + sR);
-   sigma_face = std::max(sL, sR);
+    sigma_face = 0.5 * (sL + sR);
+   // sigma_face = std::max(sL, sR);
   }
   else // boundary face
   {
