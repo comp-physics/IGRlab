@@ -163,7 +163,7 @@ int main(int argc, char *argv[])
    ParFiniteElementSpace vfes(&pmesh, &fec, num_equations, Ordering::byNODES);
 
    // IGR scalar space (same DG family/order)
-   // H1_FECollection sfec(order, dim);
+   // H1_FECollection sfec(std::max(order, 3), dim);
    // ParFiniteElementSpace sfes(&pmesh, &sfec);
    ParFiniteElementSpace sfes(&pmesh, &fec);
 
@@ -196,6 +196,9 @@ int main(int argc, char *argv[])
    const double alpha_igr = C_alpha * dx_eff * dx_eff;
    // Build IGR
    IGRSolver igr(sfes, vfes, dim, num_equations, alpha_igr);
+   // Pick your gradient backend:
+   igr.SetGradBackend(IGRSolver::GradBackend::H1Projection); // (default)
+   // igr.SetGradBackend(IGRSolver::GradBackend::BrokenDG);
    igr.SetRhoFloor(rho_floor);
    // igr.SetSmoother(IGRSolver::SmootherType::Jacobi);
    igr.SetSmoother(IGRSolver::SmootherType::L1Jacobi);
@@ -225,7 +228,7 @@ int main(int argc, char *argv[])
    ParGridFunction mom_y(&fes, sol.GetData() + 2 * fes.GetNDofs());
    ParGridFunction energy(&fes, sol.GetData() + 3 * fes.GetNDofs());
    PressureCoefficient pcoef(sol, dim, specific_heat_ratio);
-   mfem::ParGridFunction press(&sfes);
+   mfem::ParGridFunction press(&fes);
    press.ProjectCoefficient(pcoef);
    // Output the initial solution.
    {

@@ -26,6 +26,9 @@ public:
   enum class SmootherType { Jacobi, L1Jacobi };
   // enum class SmootherType { Jacobi, L1Jacobi, Chebyshev };
 
+  /// Gradient construction backend for the RHS (∇u terms).
+  enum class GradBackend { H1Projection, BrokenDG /*, WeakRT, BR2 */ };
+
   /**
    * @brief Construct an IGR solver.
    * @param sigma_fes   Scalar FE space for Σ (H1 or DG).
@@ -52,6 +55,9 @@ public:
 
   /// Set essential (Dirichlet) boundary attributes for Σ; default is none (natural Neumann).
   void SetDirichletBC(const mfem::Array<int>& ess_bdr);
+
+  /// Select which gradient backend to use for the Σ RHS.
+  void SetGradBackend(GradBackend b) { backend_ = b; }
 
   /**
    * @brief Assemble and apply ≤N smoother sweeps to update Σ from current state U.
@@ -95,6 +101,23 @@ private:
     double rho_floor_;
   };
 
+  /// Vector coefficient u = m/ρ assembled from conservative U.
+  class VelocityFromConsCoefficient : public mfem::VectorCoefficient
+  {
+  public:
+    VelocityFromConsCoefficient(int dim,
+                                const mfem::ParGridFunction* U,
+                                double rho_floor);
+    void SetState(const mfem::ParGridFunction* U) { U_ = U; }
+    void SetRhoFloor(double f) { rho_floor_ = f; }
+    virtual void Eval(mfem::Vector &V,
+                      mfem::ElementTransformation &T,
+                      const mfem::IntegrationPoint &ip) override;
+  private:
+    const mfem::ParGridFunction* U_;
+    double rho_floor_;
+  };
+
   /// f(x) = α ( ||∇u||_F^2 + (∇·u)^2 ), with u = m / ρ (componentwise).
   class SigmaSourceCoefficient : public mfem::Coefficient
   {
@@ -106,11 +129,11 @@ private:
     void SetState(const mfem::ParGridFunction& U) { U_ = &U; }
     void SetAlpha(double a) { alpha_ = a; }
     void SetRhoFloor(double floor) { rho_floor_ = floor; }
-    // Use a continuous H1 velocity field (vdim = dim) for gradients if provided.
+    // Optional continuous velocity field (vdim=dim); if set, its gradient is used.
     void SetVelField(const mfem::ParGridFunction* v) { velH1_ = v; }
   private:
     const mfem::ParGridFunction* U_ = nullptr;
-    const mfem::ParGridFunction* velH1_ = nullptr; // H1 velocity field (optional)
+    const mfem::ParGridFunction* velH1_ = nullptr; // optional continuous velocity
     int dim_, num_eq_;
     double alpha_, rho_floor_;
     mfem::Vector      state_;   // [rho, m(0:dim-1), E]
@@ -133,6 +156,9 @@ private:
   void AssembleSystem(const mfem::ParGridFunction& U); // fill A and b for current U
   void DoSmootherSweeps(int sweeps, bool warm_start);  // ≤N sweeps with chosen smoother
 
+  // Build / update the H1 vector space used by the H1Projection backend.
+  void EnsureH1VelocitySpace_();
+
   // ---------- Data ----------
   const mfem::ParFiniteElementSpace& sfes_;  // scalar Σ space
   const mfem::ParFiniteElementSpace& vfes_;  // vector state U space (vdim=num_eq)
@@ -140,6 +166,7 @@ private:
   double alpha_       = 0.0;
   double rho_floor_   = 1e-12;
   SmootherType smoot_ = SmootherType::L1Jacobi;
+  GradBackend backend_ = GradBackend::H1Projection;
 
   int  regular_sweeps_     = 3;
   int  warm_start_sweeps_  = 5;
@@ -164,8 +191,8 @@ private:
   mfem::OperatorHandle    Ah_;     // holds the assembled operator (Hypre matrix)
   mfem::Vector            X_, B_;  // true-dof vectors
 
-  // ---- Internal continuous velocity space (H1) and field for RHS gradients ----
-  std::unique_ptr<mfem::H1_FECollection>           h1fec_vel_;
-  std::unique_ptr<mfem::ParFiniteElementSpace>     vel_h1_fes_; // vdim = dim_
-  std::unique_ptr<mfem::ParGridFunction>           vel_h1_;     // continuous u_h
+  // H1 projection backend storage
+  std::unique_ptr<mfem::H1_FECollection>        h1_vec_fec_;
+  std::unique_ptr<mfem::ParFiniteElementSpace>  h1_vec_fes_;  // vdim = dim
+  std::unique_ptr<mfem::ParGridFunction>        vel_h1_;      // projected velocity
 };

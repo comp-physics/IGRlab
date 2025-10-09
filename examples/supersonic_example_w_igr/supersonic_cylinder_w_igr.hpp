@@ -239,6 +239,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
       for (int i = 0; i < vfes.GetNE(); i++)   // loop over elements T
       {
          ElementTransformation* Tr = vfes.GetElementTransformation(i);
+         const FiniteElement &fe   = *vfes.GetFE(i);
          int dof = vfes.GetFE(i)->GetDof();
          vfes.GetElementVDofs(i, vdofs);
 
@@ -249,9 +250,18 @@ void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
          // Prepare buffer for physical flux at all dof points
          flux.SetSize(num_equations, dim*dof);
 
+         const IntegrationRule &nodes = fe.GetNodes();
+         MFEM_ASSERT(nodes.Size() == dof,
+                     "FE is not nodal or GetNodes() != dof; "
+                     "need to evaluate at an appropriate rule.");
+
          // (2) For each local node j, evaluate the conservative state and compute F(u_j)
          for (int j = 0; j < dof; j++)
          {
+            // NEW: set the element integration point to node j
+            const IntegrationPoint &ip = nodes.IntPoint(j);
+            Tr->SetIntPoint(&ip);
+
             // current_state := U_h at node j  (size num_eq)
             current_xmat.GetRow(j, current_state);
 
@@ -445,7 +455,7 @@ VectorFunctionCoefficient EulerInitialCondition(const int problem,
          {
             MFEM_ASSERT(x.Size() == 2, "");
             const real_t density = 1.4;
-            const real_t velocity_x = 1.2;
+            const real_t velocity_x = 3.0;
             const real_t velocity_y = 0.0;
             const real_t energy = 8.8;
 
