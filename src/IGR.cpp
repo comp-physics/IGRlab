@@ -296,10 +296,11 @@ void IGRSolver::AssembleSystem(const ParGridFunction& U)
   src_coef_->SetAlpha(alpha_);
   src_coef_->SetRhoFloor(rho_floor_);
 
-  // --- Reuse existing sparsity; rebuild values ---
+  // --- IMPORTANT: tell MFEM we will re-use the same ParBilinearForm again ---
   a_->Update();
   b_->Update();
 
+  // Re-assemble values (sparsity pattern unchanged)
   a_->Assemble();
   b_->Assemble();
 
