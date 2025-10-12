@@ -29,6 +29,10 @@ public:
   /// Gradient construction backend for the RHS (∇u terms).
   enum class GradBackend { H1Projection, BrokenDG /*, WeakRT, BR2 */ };
 
+  /// Interior-penalty DG flavor for the diffusion operator on DG spaces.
+  /// Values map to DGDiffusionIntegrator's kappa parameter: -1 (SIPG), 0 (IIPG), +1 (NIPG).
+  enum class IPKind { SIPG = -1, IIPG = 0, NIPG = +1 };
+
   /**
    * @brief Construct an IGR solver.
    * @param sigma_fes   Scalar FE space for Σ (H1 or DG).
@@ -58,12 +62,13 @@ public:
 
   /// Select which gradient backend to use for the Σ RHS.
   void SetGradBackend(GradBackend b) { backend_ = b; }
+  void SetIPKind(IPKind k) { ip_kind_ = k; }
 
   /**
    * @brief Assemble and apply ≤N smoother sweeps to update Σ from current state U.
    *
    * Forms the linear system A(Σ)=b where:
-   *   A = ( (1/ρ)·,· ) + α ( (1/ρ)∇·,∇· )
+   *   A = ( (1/ρ)·,· ) + α ( (1/ρ)∇·,∇· )  [with IPDG face terms if Σ-space is DG]
    *   b = α ( ||∇u||_F^2 + (∇·u)^2 , · )
    *
    * Uses the previously computed Σ as initial guess if warm_start=true,
@@ -111,8 +116,8 @@ private:
     void SetState(const mfem::ParGridFunction* U) { U_ = U; }
     void SetRhoFloor(double f) { rho_floor_ = f; }
     virtual void Eval(mfem::Vector &V,
-                      mfem::ElementTransformation &T,
-                      const mfem::IntegrationPoint &ip) override;
+              mfem::ElementTransformation &T,
+              const mfem::IntegrationPoint &ip) override;
   private:
     const mfem::ParGridFunction* U_;
     double rho_floor_;
@@ -160,13 +165,14 @@ private:
   void EnsureH1VelocitySpace_();
 
   // ---------- Data ----------
-  const mfem::ParFiniteElementSpace& sfes_;  // scalar Σ space
+  const mfem::ParFiniteElementSpace& sfes_;  // scalar Σ space (H1 or DG)
   const mfem::ParFiniteElementSpace& vfes_;  // vector state U space (vdim=num_eq)
   int dim_, num_eq_;
   double alpha_       = 0.0;
   double rho_floor_   = 1e-12;
   SmootherType smoot_ = SmootherType::L1Jacobi;
   GradBackend backend_ = GradBackend::H1Projection;
+  IPKind      ip_kind_ = IPKind::SIPG; // default SPD
 
   int  regular_sweeps_     = 3;
   int  warm_start_sweeps_  = 5;
@@ -180,10 +186,10 @@ private:
   std::unique_ptr<mfem::ParLinearForm>   b_;
 
   // Coefficients that refer to U
-  std::unique_ptr<InvRhoCoefficient>       invrho_coef_;
-  std::unique_ptr<SigmaSourceCoefficient>  src_coef_;
-  std::unique_ptr<AlphaRefCoefficient>     alpha_coef_;  // α(x) ≡ alpha_
-  std::unique_ptr<mfem::ProductCoefficient> ck_coef_;    // ck(x) = α/ρ
+  std::unique_ptr<InvRhoCoefficient>        invrho_coef_;
+  std::unique_ptr<SigmaSourceCoefficient>   src_coef_;
+  std::unique_ptr<AlphaRefCoefficient>      alpha_coef_;  // α(x) ≡ alpha_
+  std::unique_ptr<mfem::ProductCoefficient> ck_coef_;     // ck(x) = α/ρ
 
   // Linear system objects
   mfem::Array<int>        ess_bdr_;

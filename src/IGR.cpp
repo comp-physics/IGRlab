@@ -3,6 +3,31 @@
 
 using namespace mfem;
 
+// ----------------- small helpers (file-local) -----------------
+namespace {
+
+inline bool IsDGSpace(const mfem::FiniteElementSpace &fes)
+{
+  // Identify DG/L2 spaces by their FECollection type
+  const mfem::FiniteElementCollection *fec = fes.FEColl(); // FE collection accessor
+  return dynamic_cast<const mfem::L2_FECollection*>(fec) != nullptr
+      || dynamic_cast<const mfem::DG_FECollection*>(fec) != nullptr;
+}
+
+inline int SpaceOrder(const mfem::FiniteElementSpace &fes)
+{
+  MFEM_VERIFY(fes.GetNE() > 0, "Empty FES.");
+  return fes.GetFE(0)->GetOrder();
+}
+
+inline double IPDGPenalty(const mfem::FiniteElementSpace &fes, double Cbase = 4.0)
+{
+  const int p = SpaceOrder(fes);
+  return Cbase * (p + 1) * (p + 1);
+}
+
+} // namespace
+
 // ---------------- IGRSolver::InvRhoCoefficient ----------------
 IGRSolver::InvRhoCoefficient::InvRhoCoefficient(const ParGridFunction& U, double rho_floor)
   : U_(&U), rho_floor_(rho_floor) {}
@@ -15,7 +40,7 @@ double IGRSolver::InvRhoCoefficient::Eval(ElementTransformation &T,
 
   // Conservative state value at (T, ip): state.Size() == num_eq
   Vector state;
-  U_->GetVectorValue(T, ip, state);
+  U_->GetVectorValue(T, ip, state); // [rho, m(0..dim-1), E]
   const double rho = std::max(state(0), rho_floor_);
   return 1.0 / rho;
 }
@@ -135,7 +160,6 @@ IGRSolver::IGRSolver(const ParFiniteElementSpace& sigma_fes,
   b_ = std::make_unique<ParLinearForm>(const_cast<ParFiniteElementSpace*>(&sfes_));
 
   // Create coefficients once (they hold references; we’ll update their state each call)
-  // NOTE: we pass a dummy U for construction; we'll immediately SetState(U) later.
   static ParGridFunction dummy(const_cast<ParFiniteElementSpace*>(&vfes_));
   dummy = 1.0;
 
@@ -144,13 +168,28 @@ IGRSolver::IGRSolver(const ParFiniteElementSpace& sigma_fes,
   alpha_coef_  = std::make_unique<AlphaRefCoefficient>(alpha_);
   ck_coef_     = std::make_unique<ProductCoefficient>(*alpha_coef_, *invrho_coef_);
 
-  // Attach integrators ONCE.
+  // ---- Operator: mass + diffusion (IPDG if Σ-space is DG) ----
+  // Reaction/mass: (1/ρ σ, v)
   a_->AddDomainIntegrator(new MassIntegrator(*invrho_coef_));
+
+  // Volume diffusion term: ( (α/ρ) ∇σ, ∇v )
   a_->AddDomainIntegrator(new DiffusionIntegrator(*ck_coef_));
+
+  // If Σ-space is discontinuous, add IPDG face terms (interior + boundary)
+  if (IsDGSpace(sfes_))
+  {
+    const double sigma_ip = IPDGPenalty(sfes_);                   // penalty scaling
+    const int    kappa    = static_cast<int>(ip_kind_);           // -1(SIPG),0, +1
+    a_->AddInteriorFaceIntegrator(
+        new DGDiffusionIntegrator(*ck_coef_, sigma_ip, kappa));
+    a_->AddBdrFaceIntegrator(
+        new DGDiffusionIntegrator(*ck_coef_, sigma_ip, kappa));
+  }
+
+  // RHS: α ( ||∇u||_F^2 + (∇·u)^2 , v )
   b_->AddDomainIntegrator(new DomainLFIntegrator(*src_coef_));
 
-  // Default BCs
-  ess_bdr_.SetSize(0);
+  // Default BCs: natural Neumann (no flux). For Nitsche Dirichlet, add linear terms later.
 
   // Initial Σ
   sigma_ = 0.0;
@@ -206,7 +245,7 @@ void IGRSolver::EnsureH1VelocitySpace_()
   const int p_state = GetSpaceOrder_(vfes_);
   const int p_h1 = std::max(1, p_state);
 
-  // Recreate only if absent or order changed / mesh changed
+  // Recreate only if absent or order/mesh changed
   bool need_make = (!h1_vec_fec_ || !h1_vec_fes_ || !vel_h1_);
   if (!need_make)
   {
@@ -224,6 +263,10 @@ void IGRSolver::EnsureH1VelocitySpace_()
 
 void IGRSolver::AssembleSystem(const ParGridFunction& U)
 {
+  // Needed for DG/IPDG assembly: variable coeffs evaluated on shared faces
+  // will read U on neighbor elements.
+  const_cast<ParGridFunction&>(U).ExchangeFaceNbrData();
+
   // Refresh coefficient views of the current state and params
   invrho_coef_->SetState(U);
   invrho_coef_->SetRhoFloor(rho_floor_);
@@ -253,15 +296,14 @@ void IGRSolver::AssembleSystem(const ParGridFunction& U)
   src_coef_->SetAlpha(alpha_);
   src_coef_->SetRhoFloor(rho_floor_);
 
-  // --- IMPORTANT: tell MFEM we will re-use the same ParBilinearForm again ---
+  // --- Reuse existing sparsity; rebuild values ---
   a_->Update();
   b_->Update();
 
-  // Re-assemble values (sparsity pattern unchanged)
   a_->Assemble();
   b_->Assemble();
 
-  // Rebuild essential dofs if user set Dirichlet BCs
+  // Rebuild essential dofs if user set Dirichlet BCs (for H1 spaces).
   ess_tdof_list_.SetSize(0);
   if (ess_bdr_.Size() > 0)
   {
@@ -269,9 +311,9 @@ void IGRSolver::AssembleSystem(const ParGridFunction& U)
     sfes_.GetEssentialTrueDofs(dbdr, ess_tdof_list_);
   }
 
-  // We are going to rebuild the system operator; clear the handle first.
+  // Rebuild the system operator; clear handle first.
   Ah_.Clear();
-  Ah_.SetType(Operator::Hypre_ParCSR); // keep explicit; harmless if redundant
+  Ah_.SetType(Operator::Hypre_ParCSR);
 
   // Warm-start: FormLinearSystem pulls current sigma_ into X_
   a_->FormLinearSystem(ess_tdof_list_, sigma_, *b_, Ah_, X_, B_);
