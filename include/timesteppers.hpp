@@ -1,58 +1,60 @@
 #pragma once
 #include "mfem.hpp"
+#include "limiters.hpp"   // <-- brings CharTVBOptions and BJOptions in as complete types
 #include <functional>
+#include <vector>
 
 /**
  * @file timesteppers.hpp
- * @brief SSP RK3 with stage-wise positivity limiting for hyperbolic DG.
+ * @brief SSP RK3 with a stage-wise callback pipeline (e.g., BJ -> TVB -> PP).
  *
- * This time stepper mirrors MFEM's RK3SSPSolver but inserts a positivity
- * limiter between the three SSPRK stages:
+ * Mirrors MFEM's RK3SSPSolver but inserts a user-defined sequence of
+ * element-local callbacks between stages. Each callback operates on a
+ * ParGridFunction view of the stage vector and may use the current time.
  *
- *   1) y  = x + dt * f(t, x)                 [limit(y)]
- *   2) y  = 3/4 x + 1/4 ( y + dt * f(t+dt,y) )   [limit(y)]
- *   3) x  = 1/3 x + 2/3 ( y + dt * f(t+dt/2,y) ) [limit(x)]
+ * Nothing is hardcoded: add any number of callbacks with AddCallback(...).
  *
- * The limiter is expected to enforce ρ >= ρ_min and p >= p_min at a set of
- * positivity points, preserving element-wise averages (Zhang–Shu style).
- *
- * Usage:
- *   - Construct with the ParFES you use for the conservative state U.
- *   - Set γ, (ρ_min, p_min), quadrature order, and bisection iters.
- *   - Call Init(op) and use like any MFEM ODESolver.
- *
- * Notes:
- *   - We view stage vectors as ParGridFunctions on 'vfes' using external data,
- *     so no copying is done for limiting.
- *   - If you also use IGR, your operator can keep recomputing Σ inside Mult().
+ * Convenience helpers AddZhangShuLimiter(), AddCharTVBLimiter(...),
+ * and AddBarthJespersenLimiter(...) are provided; they push properly
+ * configured callbacks that call the limiter routines from limiters.cpp.
  */
 
 namespace mfem {
 
-/// Stage-wise positivity-limited SSPRK3
+/// SSPRK(3,3) with an ordered list of stage callbacks (limiters/filters).
 class RK3SSPWithLimiter : public ODESolver
 {
 public:
-  /// Construct with the FE space used by the conservative state vector (vdim = dim+2).
+  /// Construct with the FE space used by the conservative state U (vdim = dim+2).
   explicit RK3SSPWithLimiter(ParFiniteElementSpace &vfes);
 
-  /// Configure Euler parameters and limiter thresholds.
+  /// Configure Euler parameters (used by helper callbacks).
   void SetEulerParams(int dim, double gamma) { dim_ = dim; gamma_ = gamma; }
 
-  /// Set limiter thresholds and controls.
-  /// quad_order: rule used for positivity points (recommend 2*order+2).
-  /// p_bisect_iters: bisection iters to find theta for pressure.
+  /// Set default params used by the Zhang–Shu PP helper callback.
   void SetLimiterParams(double rho_min, double p_min,
                         int quad_order, int p_bisect_iters)
-  {
-    rho_min_ = rho_min; p_min_ = p_min;
-    quad_order_ = quad_order; p_bisect_iters_ = p_bisect_iters;
-  }
+  { rho_min_ = rho_min; p_min_ = p_min; quad_order_ = quad_order; p_bisect_iters_ = p_bisect_iters; }
 
-  /// If true, also limit the *input* x at the start of Step() (default true).
+  /// If true, also apply the pipeline at the start of Step() to the input x.
   void LimitInitial(bool on) { limit_initial_ = on; }
 
-  /// ODESolver interface
+  // ----------------- Ordered list of stage callbacks -----------------
+  // Signature: void(ParFiniteElementSpace&, ParGridFunction&, double t)
+  using StageCallback = std::function<void(ParFiniteElementSpace&, ParGridFunction&, double)>;
+
+  /// Remove all callbacks.
+  void ClearCallbacks() { callbacks_.clear(); }
+
+  /// Append a callback to the pipeline (executed in registration order).
+  void AddCallback(StageCallback cb) { callbacks_.push_back(std::move(cb)); }
+
+  // ---- Convenience: push common limiters as callbacks (defined in .cpp) ----
+  void AddZhangShuLimiter();                          // uses SetEulerParams + SetLimiterParams
+  void AddCharTVBLimiter(const CharTVBOptions &opts); // characteristic TVB
+  void AddBarthJespersenLimiter(const BJOptions &opts); // component-wise BJ slope limiter
+
+  // --------------- ODESolver interface ---------------
   void Init(TimeDependentOperator &f_) override;
   void Step(Vector &x, real_t &t, real_t &dt) override;
 
@@ -60,7 +62,7 @@ private:
   // FE space for state
   ParFiniteElementSpace &vfes_;
 
-  // Euler / limiter parameters
+  // Euler / helper-limiter params (only used by helper callbacks)
   int    dim_            = 2;
   double gamma_          = 1.4;
   double rho_min_        = 1e-12;
@@ -69,11 +71,14 @@ private:
   int    p_bisect_iters_ = 12;
   bool   limit_initial_  = true;
 
+  // Callback pipeline
+  std::vector<StageCallback> callbacks_;
+
   // Work vectors
   Vector y_, k_;
 
   // Helpers
-  void LimitVectorAsGridFunction(Vector &v);
+  void ApplyCallbacks(Vector &v, double t);
   int  AutoQuadOrder() const;
 };
 
