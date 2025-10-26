@@ -85,6 +85,7 @@ int main(int argc, char *argv[])
    bool visualization = true;
    bool preassembleWeakDiv = true;
    int vis_steps = 50;
+   bool vtk_save = true;
 
    int precision = 8;
    cout.precision(precision);
@@ -117,6 +118,9 @@ int main(int argc, char *argv[])
    args.AddOption(&visualization, "-vis", "--visualization", "-no-vis",
                   "--no-visualization",
                   "Enable or disable GLVis visualization.");
+   args.AddOption(&vtk_save, "-vtk", "--vtk_save", "-no-vtk",
+                  "--no-vtk_save",
+                  "Enable or disable VTK visualization.");
    args.AddOption(&preassembleWeakDiv, "-ea", "--element-assembly-divergence",
                   "-mf", "--matrix-free-divergence",
                   "Weak divergence assembly level\n"
@@ -469,6 +473,33 @@ int main(int argc, char *argv[])
       }
    }
 
+   // ----------------------------------------------------------------------
+   //  VTK / ParaView output setup
+   // ----------------------------------------------------------------------
+   ParaViewDataCollection paraview_dc("supersonic_cylinder_output", &pmesh);
+   if (vtk_save)
+   {  
+   // Register fields you want to write (each will become its own .pvtu series)
+   paraview_dc.RegisterField("density", &density);
+   paraview_dc.RegisterField("momentum_x", &mom_x);
+   paraview_dc.RegisterField("momentum_y", &mom_y);
+   paraview_dc.RegisterField("energy", &energy);
+   paraview_dc.RegisterField("sigma", &igr.GetSigma());
+   paraview_dc.RegisterField("pressure", &press);
+   // Optional configuration
+   paraview_dc.SetPrefixPath("vtk_output"); // output directory
+   paraview_dc.SetLevelsOfDetail(order);
+   paraview_dc.SetDataFormat(VTKFormat::BINARY); // smaller, faster
+   paraview_dc.SetHighOrderOutput(true);         // keep DG high-order data
+   paraview_dc.SetCycle(0);
+   paraview_dc.SetTime(0.0);
+   paraview_dc.Save();
+   if (Mpi::Root())
+   {
+      std::cout << "Saving output to VTK.\n";
+   }
+   }
+
    // 8. Time integration
 
    // When dt is not specified, use CFL condition.
@@ -553,6 +584,12 @@ int main(int argc, char *argv[])
             // vis::Update(w_umag,  numProcs, myRank, pmesh, g_umag,  t, "|u_H1|");
             // vis::Update(w_div,   numProcs, myRank, pmesh, g_div,   t, "div u_H1");
             // vis::Update(w_gfrob, numProcs, myRank, pmesh, g_gfrob, t, "||grad u_H1||_F");
+         }
+         if (vtk_save)
+         {  // --- VTK export ---
+            paraview_dc.SetCycle(ti);
+            paraview_dc.SetTime(t);
+            paraview_dc.Save();
          }
       }
    }
