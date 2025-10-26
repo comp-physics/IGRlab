@@ -79,7 +79,7 @@ int main(int argc, char *argv[])
    int par_ref_levels = 1;
    int order = 3;
    int ode_solver_type = 4;
-   real_t t_final = 2.0;
+   real_t t_final = 4.0;
    real_t dt = -0.01;
    real_t cfl = 0.3;
    bool visualization = true;
@@ -163,19 +163,82 @@ int main(int argc, char *argv[])
    ParFiniteElementSpace vfes(&pmesh, &fec, num_equations, Ordering::byNODES);
 
    // IGR scalar space (same DG family/order)
-   // H1_FECollection sfec(std::max(order, 3), dim);
-   // ParFiniteElementSpace sfes(&pmesh, &sfec);
-   ParFiniteElementSpace sfes(&pmesh, &fec);
+   H1_FECollection sfec(std::max(order, 3), dim);
+   ParFiniteElementSpace sfes(&pmesh, &sfec);
+   // ParFiniteElementSpace sfes(&pmesh, &fec);
 
-   // Timestepper
-   const double rho_min = 5.0e-7;
-   const double p_min   = 1.0e-6;
-   const int quad_order = 0;
-   const int p_bisect_iters = 12;
+   // --- H1 velocity space (continuous) and diagnostics (scalar DG) ---
+   // Order for H1 projection: at least 1, often = order
+   H1_FECollection h1fec(std::max(1, order), dim);
+   ParFiniteElementSpace h1_vfes(&pmesh, &h1fec, /*vdim=*/dim, Ordering::byNODES);
+   // Continuous velocity for visualization / gradients
+   ParGridFunction uH1(&h1_vfes); uH1 = 0.0;
+   // Scalar DG fields to *display* diagnostics (reuse your DG scalar space 'sfes')
+   ParGridFunction g_umag(&h1_vfes), g_div(&h1_vfes), g_gfrob(&h1_vfes);
+   g_umag = 0.0; g_div = 0.0; g_gfrob = 0.0;
+
+
+  // --- RK3 with ordered limiter callbacks ---
+   const double rho_min       = 5.0e-7;
+   const double p_min         = 1.0e-6;
+   const int    quad_order    = 0;    // 0 => auto (2*order+2)
+   const int    p_bisect_iters= 12;
    mfem::RK3SSPWithLimiter rk3(vfes);
    rk3.SetEulerParams(dim, /*gamma=*/1.4);
    rk3.SetLimiterParams(rho_min, p_min, quad_order, p_bisect_iters);
    rk3.LimitInitial(true);
+   // (1) BJ slope limiter first (component-wise)
+   // BJOptions bj;
+   // bj.dim = 2;
+   // bj.qord_avg   = 0; // auto
+   // bj.slope_qord = 0; // auto
+   // bj.limit_rho = false;
+   // bj.limit_momentum = true;
+   // bj.limit_energy = false;
+   // rk3.AddBarthJespersenLimiter(bj);
+   // 1) Characteristic BJ slope limiter
+   // CharBJOptions bj;
+   // bj.dim        = 2;
+   // bj.gamma      = 1.4;
+   // bj.slope_qord = 2*vfes.GetFE(0)->GetOrder() + 2; // safe default
+   // bj.limit_x    = true;
+   // bj.limit_y    = true;
+   // rk3.AddCharBJLimiter(bj);
+   // 1) Face-normal characteristic BJ (monotonicity)
+   // FaceBJOptions bj;
+   // bj.dim        = 2;
+   // bj.gamma      = 1.4;
+   // bj.slope_qord = 2*vfes.GetFE(0)->GetOrder() + 2;
+   // rk3.AddFaceCharBJLimiter(bj);
+   // (2) Characteristic TVB (keep your previous settings)
+   // CharTVBOptions tvb;
+   // tvb.dim        = 2;
+   // tvb.gamma      = 1.4;
+   // tvb.theta      = 1.3;
+   // tvb.M_tvb      = 1.0;
+   // tvb.tau_flag   = 0.05;
+   // tvb.slope_qord = 2*vfes.GetFE(0)->GetOrder() + 2;
+   // rk3.AddCharTVBLimiter(tvb);
+   // Use the face-normal characteristic TVB (direction-invariant)
+   // rk3.AddCharTVBFaceNormalLimiter(tvb);
+   // (2) Regular characteristic Venkat (x/y)
+   VenkatOptions vk;
+   vk.dim = 2; 
+   vk.gamma = 1.4;
+   vk.slope_qord = 2*vfes.GetFE(0)->GetOrder() + 2;
+   vk.eps_kappa  = 100.0;        // increase to be less aggressive
+   // rk3.AddCharVenkatXYLimiter(vk);
+   // // Or face-normal variant for general meshes:
+   rk3.AddCharVenkatFaceNormalLimiter(vk);
+   // 2) Krivodonova hierarchical modal limiter (keeps high order away from shocks)
+   // KrivoOptions krivo;
+   // krivo.dim = 2;
+   // krivo.gamma = 1.4;
+   // krivo.face_qord = 0;    // auto: p+2
+   // krivo.inflate  = 0.05;  // slight widening of neighbor bounds (try 0.0–0.1)
+   // rk3.AddKrivodonovaLimiter(krivo);
+   // (3) Positivity limiter last
+   rk3.AddZhangShuLimiter();
 
    // IGR params
    const double rho_floor = rho_min;
@@ -230,6 +293,21 @@ int main(int argc, char *argv[])
    PressureCoefficient pcoef(sol, dim, specific_heat_ratio);
    mfem::ParGridFunction press(&fes);
    press.ProjectCoefficient(pcoef);
+   // --- Velocity/H1 diagnostics updater (call before plotting) ---
+   VelocityFromConsCoefficient ucoef(dim, /*U=*/&sol, /*rho_floor=*/rho_floor);
+   auto UpdateH1VelocityAndDiagnostics = [&]() {
+   // 1) Project conservative state -> continuous velocity (H1^dim)
+   uH1.ProjectCoefficient(ucoef);
+
+   // 2) Project diagnostics to scalar DG fields for easy coloring
+   GradFrobNormCoeff cF(&uH1, dim);
+   DivCoeff         cD(&uH1, dim);
+   VelMagCoeff      cM(&uH1, dim);
+   g_gfrob.ProjectCoefficient(cF);  // ||grad u||_F
+   g_div  .ProjectCoefficient(cD);  // div u
+   g_umag .ProjectCoefficient(cM);  // |u|
+   };
+
    // Output the initial solution.
    {
       ostringstream mesh_name;
@@ -260,6 +338,7 @@ int main(int argc, char *argv[])
    igr_flux.SetSigmaField(&igr.GetSigma());
 
    // Use the wrapped flux in the numerical flux (e.g., Rusanov).
+   // HLLCFlux numericalFlux(igr_flux, 1.4);
    RusanovFlux numericalFlux(igr_flux);
 
    DGHyperbolicConservationLaws base_op(
@@ -302,7 +381,8 @@ int main(int argc, char *argv[])
    igr.UpdateFromState(sol, /*warm_start=*/false);
    igr.GetSigma().ExchangeFaceNbrData();
    socketstream sout;
-   vis::GLVisWindow w_density, w_sigma, w_energy, w_pressure;
+   vis::GLVisWindow w_density, w_sigma, w_energy, w_pressure, w_momentum_x;
+   vis::GLVisWindow w_uvec, w_umag, w_div, w_gfrob;
    if (visualization)
    {
       const char vishost[] = "localhost";
@@ -324,6 +404,21 @@ int main(int argc, char *argv[])
       bool ok4 = vis::Open(w_pressure, vishost, visport, precision,
                            numProcs, myRank, pmesh, press,
                            "pressure, t = 0");
+      bool ok5 = vis::Open(w_momentum_x, vishost, visport, precision,
+                           numProcs, myRank, pmesh, press,
+                           "momentum_x, t = 0");
+
+      // Compute once before first frame so fields exist
+      UpdateH1VelocityAndDiagnostics();
+
+      // bool okU = vis::Open(w_uvec,  vishost, visport, precision,
+      //                      numProcs, myRank, pmesh, uH1,     "u_H1 (continuous)");
+      // bool okM = vis::Open(w_umag,  vishost, visport, precision,
+      //                      numProcs, myRank, pmesh, g_umag,  "|u_H1|");
+      // bool okD = vis::Open(w_div,   vishost, visport, precision,
+      //                      numProcs, myRank, pmesh, g_div,   "div u_H1");
+      // bool okF = vis::Open(w_gfrob, vishost, visport, precision,
+      //                      numProcs, myRank, pmesh, g_gfrob, "||grad u_H1||_F");
 
       if (!(ok1 && ok2 && ok3))
       {
@@ -412,6 +507,13 @@ int main(int argc, char *argv[])
             pcoef.SetState(sol);
             press.ProjectCoefficient(pcoef);
             vis::Update(w_pressure, numProcs, myRank, pmesh, press, t, "pressure");
+            vis::Update(w_momentum_x,  numProcs, myRank, pmesh, mom_x, t, "momentum_x");
+
+            // UpdateH1VelocityAndDiagnostics();
+            // vis::Update(w_uvec,  numProcs, myRank, pmesh, uH1,     t, "u_H1");
+            // vis::Update(w_umag,  numProcs, myRank, pmesh, g_umag,  t, "|u_H1|");
+            // vis::Update(w_div,   numProcs, myRank, pmesh, g_div,   t, "div u_H1");
+            // vis::Update(w_gfrob, numProcs, myRank, pmesh, g_gfrob, t, "||grad u_H1||_F");
          }
       }
    }

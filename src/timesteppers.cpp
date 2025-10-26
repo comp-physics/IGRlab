@@ -4,6 +4,8 @@
 
 using namespace mfem;
 
+int count=0;
+
 RK3SSPWithLimiter::RK3SSPWithLimiter(ParFiniteElementSpace &vfes)
   : vfes_(vfes)
 { }
@@ -62,6 +64,36 @@ void RK3SSPWithLimiter::AddCharTVBLimiter(const CharTVBOptions &opts)
       });
 }
 
+void RK3SSPWithLimiter::AddCharTVBFaceNormalLimiter(const CharTVBOptions &opts)
+{
+  auto local = opts; // capture by value
+  callbacks_.emplace_back(
+      [local](mfem::ParFiniteElementSpace &vf, mfem::ParGridFunction &U, double /*t*/)
+      {
+        ApplyCharacteristicTVBFaceNormal(vf, U, local);
+      });
+}
+
+void RK3SSPWithLimiter::AddCharBJLimiter(const CharBJOptions &opts)
+{
+  auto local = opts;
+  callbacks_.emplace_back(
+      [local](ParFiniteElementSpace &vf, ParGridFunction &U, double /*t*/)
+      {
+        ApplyCharacteristicBJLimiter(vf, U, local);
+      });
+}
+
+void RK3SSPWithLimiter::AddFaceCharBJLimiter(const FaceBJOptions &opts)
+{
+  auto local = opts; // capture by value for safety
+  callbacks_.emplace_back(
+      [local](mfem::ParFiniteElementSpace &vf, mfem::ParGridFunction &Ug, double /*t*/)
+      {
+        ApplyFaceNormalCharacteristicBJLimiter(vf, Ug, local);
+      });
+}
+
 void RK3SSPWithLimiter::AddBarthJespersenLimiter(const BJOptions &opts)
 {
   auto local = opts;
@@ -71,6 +103,37 @@ void RK3SSPWithLimiter::AddBarthJespersenLimiter(const BJOptions &opts)
         ApplyBarthJespersenLimiter(vf, U, local);
       });
 }
+
+void RK3SSPWithLimiter::AddCharVenkatXYLimiter(const VenkatOptions &opts)
+{
+  auto local = opts;
+  callbacks_.emplace_back(
+      [local](mfem::ParFiniteElementSpace &vf, mfem::ParGridFunction &U, double /*t*/)
+      {
+        ApplyCharacteristicVenkatXY(vf, U, local);
+      });
+}
+
+void RK3SSPWithLimiter::AddCharVenkatFaceNormalLimiter(const VenkatOptions &opts)
+{
+  auto local = opts;
+  callbacks_.emplace_back(
+      [local](mfem::ParFiniteElementSpace &vf, mfem::ParGridFunction &U, double /*t*/)
+      {
+        ApplyCharacteristicVenkatFaceNormal(vf, U, local);
+      });
+}
+
+void RK3SSPWithLimiter::AddKrivodonovaLimiter(const KrivoOptions &opts)
+{
+  auto local = opts;
+  callbacks_.emplace_back(
+      [local](ParFiniteElementSpace &vf, ParGridFunction &Ustage, double /*t*/)
+      {
+        ApplyKrivodonovaHierarchicalLimiter(vf, Ustage, local);
+      });
+}
+
 
 // --------------------------------- SSPRK(3,3) ---------------------------------
 
@@ -85,7 +148,7 @@ void RK3SSPWithLimiter::Step(Vector &x, real_t &t, real_t &dt)
 
   // y = x + dt * k0, then pipeline
   add(x, dt, k_, y_);
-  ApplyCallbacks(y_, t + dt);
+  if(count<100) ApplyCallbacks(y_, t + dt);
 
   // k1 = f(t+dt, y)
   f->SetTime(t + dt);
@@ -94,7 +157,7 @@ void RK3SSPWithLimiter::Step(Vector &x, real_t &t, real_t &dt)
   // y = 3/4*x + 1/4 ( y + dt * k1 ), then pipeline
   y_.Add(dt, k_);                 // y := y + dt*k1
   add(3.0/4.0, x, 1.0/4.0, y_, y_);
-  ApplyCallbacks(y_, t + dt);
+  // ApplyCallbacks(y_, t + dt);
 
   // k2 = f(t + dt/2, y)
   f->SetTime(t + dt/2);
@@ -105,5 +168,7 @@ void RK3SSPWithLimiter::Step(Vector &x, real_t &t, real_t &dt)
   add(1.0/3.0, x, 2.0/3.0, y_, x);
   t += dt;
 
-  ApplyCallbacks(x, t);
+  // ApplyCallbacks(x, t);
+
+  count++;
 }

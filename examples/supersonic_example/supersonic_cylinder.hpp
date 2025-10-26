@@ -157,114 +157,198 @@ void DGHyperbolicConservationLaws::ComputeInvMass()
 
 void DGHyperbolicConservationLaws::ComputeWeakDivergence()
 {
+   // Define an integrator for (∇v, w) bilinear form, but transposed.
+   // GradientIntegrator normally gives:
+   //    (∇ϕ_i, ψ_j)_T   (row = test v, col = trial u).
+   // TransposeIntegrator flips roles of test/trial, giving:
+   //    (ϕ_i, ∇ψ_j)_T
+   // which is exactly the weak divergence operator we want.
    TransposeIntegrator weak_div(new GradientIntegrator());
-   DenseMatrix weakdiv_bynodes;
 
+   DenseMatrix weakdiv_bynodes; // temporary storage of assembled element matrix
+
+   // Resize container to hold one weak-divergence matrix per element.
+   // Each weakdiv[i] is a DenseMatrix of size (dof × (dof*dim)).
+   // - Rows = test functions (dof)
+   // - Columns = trial function per dimension (dof*dim)
    weakdiv.resize(vfes.GetNE());
+
+   // Loop over all elements in the mesh
    for (int i=0; i<vfes.GetNE(); i++)
    {
       int dof = vfes.GetFE(i)->GetDof();
+
+      // Temporary matrix: (dof × (dof*dim))
       weakdiv_bynodes.SetSize(dof, dof*dim);
+
+      // Assemble the weak divergence operator for element i:
+      // weakdiv_bynodes(j, d*dof + k) ≈ ∫_T ϕ_j · ∂_d ϕ_k dx
+      // i.e. applying derivative in each spatial dimension d.
       weak_div.AssembleElementMatrix2(*vfes.GetFE(i), *vfes.GetFE(i),
                                       *vfes.GetElementTransformation(i),
                                       weakdiv_bynodes);
+
+      // Allocate storage for reordered version
       weakdiv[i].SetSize(dof, dof*dim);
-      // Reorder so that trial space is ByDim.
-      // This makes applying weak divergence to flux value simpler.
-      for (int j=0; j<dof; j++)
+
+      // Reorder columns: trial space grouped by node, then dimension.
+      // Original layout = [all DOFs in x-dir][all DOFs in y-dir][all DOFs in z-dir]
+      // New layout      = [d0_x, d0_y, (d0_z)], [d1_x, d1_y, (d1_z)], ...
+      // i.e. “ByDim per node” → makes multiplying by nodal fluxes F(u) easier.
+      for (int j=0; j<dof; j++)         // loop over trial DOFs
       {
-         for (int d=0; d<dim; d++)
+         for (int d=0; d<dim; d++)      // loop over dimensions
          {
-            weakdiv[i].SetCol(j*dim + d, weakdiv_bynodes.GetColumn(d*dof + j));
+            // Copy column from assembled to reordered
+            weakdiv[i].SetCol(j*dim + d,
+                              weakdiv_bynodes.GetColumn(d*dof + j));
          }
       }
-
    }
 }
 
-
 void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
 {
-   // 0. Reset wavespeed computation before operator application.
+   // (0) Reset the running max wave speed (used for CFL after Mult()).
    formIntegrator->ResetMaxCharSpeed();
-   // 1. Apply Nonlinear form to obtain an auxiliary result
-   //         z = - <F̂(u_h,n), [[v]]>_e
-   //    If weak-divergence is not preassembled, we also have weak-divergence
-   //         z = - <F̂(u_h,n), [[v]]>_e + (F(u_h), ∇v)
+
+   // (1) Build the face contribution (and possibly the volume term) into z:
+   //     z = - < F̂(u_h, n), [[v]] >_faces
+   //     If weak-divergence is NOT preassembled, HyperbolicFormIntegrator also adds
+   //     the volume term (F(u_h), ∇v) so that:
+   //     z = - < F̂(u_h, n), [[v]] >_faces + (F(u_h), ∇v)
    nonlinearForm->Mult(x, z);
-   if (!weakdiv.empty()) // if weak divergence is pre-assembled
+
+   if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
    {
-      // Apply weak divergence to F(u_h), and inverse mass to z_loc + weakdiv_loc
-      Vector current_state; // view of current state at a node
-      DenseMatrix current_flux; // flux of current state
-      DenseMatrix flux; // element flux value. Whose column is ordered by dim.
-      DenseMatrix current_xmat; // view of current states in an element, dof x num_eq
-      DenseMatrix current_zmat; // view of element auxiliary result, dof x num_eq
-      DenseMatrix current_ymat; // view of element result, dof x num_eq
+      // We'll now compute (I_h F(u_h), ∇v) element-by-element and add it into z,
+      // then finish with the inverse mass to get y = M^{-1} z.
+
+      Vector current_state;        // view of the state at one node (size = num_eq)
+      DenseMatrix current_flux;    // view of flux at that node (num_eq × dim)
+      DenseMatrix flux;            // element flux: stacked by nodes (num_eq × (dim * dof))
+      DenseMatrix current_xmat;    // element's states as (dof × num_eq) view into x
+      DenseMatrix current_zmat;    // element's accumulated RHS as (dof × num_eq) view into z
+      DenseMatrix current_ymat;    // element's output du/dt as (dof × num_eq) before scatter
       const FluxFunction &fluxFunction = formIntegrator->GetFluxFunction();
-      Array<int> vdofs;
+      Array<int> vdofs;            // vector DOF indices for this element
       Vector xval, zval;
-      for (int i=0; i<vfes.GetNE(); i++)
+
+      for (int i = 0; i < vfes.GetNE(); i++)   // loop over elements T
       {
          ElementTransformation* Tr = vfes.GetElementTransformation(i);
          int dof = vfes.GetFE(i)->GetDof();
          vfes.GetElementVDofs(i, vdofs);
+
+         // Pull element's DOFs from x and view them as (dof × num_eq)
          x.GetSubVector(vdofs, xval);
          current_xmat.UseExternalData(xval.GetData(), dof, num_equations);
+
+         // Prepare a buffer to hold flux at all dof points: F(u_h) evaluated nodewise
+         // Layout: for each node j, store an (num_eq × dim) block contiguous in memory.
          flux.SetSize(num_equations, dim*dof);
-         for (int j=0; j<dof; j++) // compute flux for all nodes in the element
+
+         // (2) For each local node j, evaluate the conservative state and compute F(u_j)
+         for (int j = 0; j < dof; j++)
          {
+            // current_state := U_h at node j  (size num_eq)
             current_xmat.GetRow(j, current_state);
+
+            // current_flux is a (num_eq × dim) view into the j-th block inside 'flux'
             current_flux.UseExternalData(flux.GetData() + num_equations*dim*j,
-                                         num_equations, dof);
-            // current_flux.UseExternalData(flux.GetData() + num_equations*dim*j,
-            //                  num_equations, dim);
+                                         num_equations, /*ncols=*/dim);
+
+            // Compute physical flux tensor F(U, x) at this node (fills current_flux)
+            // Mathematically this is: F(U_j) ∈ ℝ^{num_eq×dim}
             fluxFunction.ComputeFlux(current_state, *Tr, current_flux);
          }
-         // Compute weak-divergence and add it to auxiliary result, z
-         // Recalling that weakdiv is reordered by dim, we can apply
-         // weak-divergence to the transpose of flux.
+
+         // (3) Add the preassembled weak-divergence term to z:
+         //     current_zmat += weakdiv[i] * flux^T
+         // weakdiv[i] encodes ∫_T (·, ∇v) with a “dim-reordered” layout so
+         // multiplying by flux^T yields (I_h F(u_h), ∇v)_T contribution.
          z.GetSubVector(vdofs, zval);
          current_zmat.UseExternalData(zval.GetData(), dof, num_equations);
+
+         // AddMult_a_ABt: current_zmat += 1.0 * weakdiv[i] * (flux)^T
+         // (Note ABᵗ: weakdiv[i] multiplies by flux transposed as expected by the layout)
          mfem::AddMult_a_ABt(1.0, weakdiv[i], flux, current_zmat);
-         // Apply inverse mass to auxiliary result to obtain the final result
+
+         // (4) Apply inverse mass to obtain time derivative on this element:
+         //     current_ymat = invmass[i] * current_zmat
+         // i.e. y_T = M_T^{-1} * z_T
          current_ymat.SetSize(dof, num_equations);
          mfem::Mult(invmass[i], current_zmat, current_ymat);
+
+         // Scatter back to the global vector y at the element DOFs.
          y.SetSubVector(vdofs, current_ymat.GetData());
       }
    }
    else
    {
-      // Apply block inverse mass
-      Vector zval; // z_loc, dof*num_eq
+      // weak divergence NOT preassembled: z already has both face and volume terms.
+      // Just apply block inverse mass element-by-element to get y = M^{-1} z.
 
-      DenseMatrix current_zmat; // view of element auxiliary result, dof x num_eq
-      DenseMatrix current_ymat; // view of element result, dof x num_eq
+      Vector zval;                 // element slice of z  (dof*num_eq)
+      DenseMatrix current_zmat;    // (dof × num_eq) view into z
+      DenseMatrix current_ymat;    // (dof × num_eq) element output
       Array<int> vdofs;
-      for (int i=0; i<vfes.GetNE(); i++)
+
+      for (int i = 0; i < vfes.GetNE(); i++)   // loop over elements T
       {
          int dof = vfes.GetFE(i)->GetDof();
          vfes.GetElementVDofs(i, vdofs);
+
+         // View element slice of z as (dof × num_eq)
          z.GetSubVector(vdofs, zval);
          current_zmat.UseExternalData(zval.GetData(), dof, num_equations);
+
+         // Apply inverse mass on the element block
          current_ymat.SetSize(dof, num_equations);
          mfem::Mult(invmass[i], current_zmat, current_ymat);
+
+         // Scatter to y
          y.SetSubVector(vdofs, current_ymat.GetData());
       }
    }
+
+   // (5) Expose the maximum characteristic speed accumulated inside the integrators
+   //     for CFL computations by the driver.
    max_char_speed = formIntegrator->GetMaxCharSpeed();
 }
 
+
 void DGHyperbolicConservationLaws::Update()
 {
+   // Tell the nonlinear form to refresh its internal data.
+   // This could recompute quadrature data, face integrators, etc.,
+   // especially if the mesh or finite element space has changed.
    nonlinearForm->Update();
+
+   // Height = global vector length (size of the DOF vector).
+   // Width = operator width = also the same, since this is square (u -> u).
    height = nonlinearForm->Height();
    width = height;
+
+   // Resize the auxiliary work vector z used in Mult().
+   // z stores the assembled right-hand side BEFORE multiplying by invmass.
    z.SetSize(height);
 
+   // Compute per-element inverse mass matrices:
+   // invmass[i] ≈ M_T^{-1}, where
+   //    M_T = (ϕ_m, ϕ_n)_T   (local mass matrix on element T).
+   // These are needed to apply y = M^{-1} z in Mult().
    ComputeInvMass();
-   if (!weakdiv.empty()) {ComputeWeakDivergence();}
+
+   // If we are using the “weak divergence preassembly” mode:
+   //    weakdiv[i] encodes the (∇v, ·) operator on element i,
+   //    arranged so that we can later do flux × weakdiv efficiently.
+   // Only compute this once when mesh/FE changes.
+   if (!weakdiv.empty()) {
+      ComputeWeakDivergence();
+   }
 }
+
 
 ///// Mesh Utilities
 
@@ -273,10 +357,10 @@ Mesh EulerMesh(const int problem)
    switch (problem)
    {
       case 1:
-         return Mesh("../supersonic_cylinder.msh");
+         return Mesh("supersonic_cylinder.msh");
          break;
       case 2:
-         return Mesh("../supersonic_cylinder.msh");
+         return Mesh("supersonic_cylinder.msh");
          break;
       default:
          MFEM_ABORT("Problem Undefined");

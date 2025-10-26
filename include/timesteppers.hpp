@@ -17,6 +17,12 @@
  * Convenience helpers AddZhangShuLimiter(), AddCharTVBLimiter(...),
  * and AddBarthJespersenLimiter(...) are provided; they push properly
  * configured callbacks that call the limiter routines from limiters.cpp.
+ * Convenience helpers push properly configured callbacks that call the limiter
+ * routines from limiters.cpp:
+ *   - AddZhangShuLimiter()
+ *   - AddCharTVBLimiter(...)
+ *   - AddCharBJLimiter(...)
+ *   - AddBarthJespersenLimiter(...)
  */
 
 namespace mfem {
@@ -52,7 +58,13 @@ public:
   // ---- Convenience: push common limiters as callbacks (defined in .cpp) ----
   void AddZhangShuLimiter();                          // uses SetEulerParams + SetLimiterParams
   void AddCharTVBLimiter(const CharTVBOptions &opts); // characteristic TVB
+  void AddCharTVBFaceNormalLimiter(const CharTVBOptions &opts);
+  void AddCharBJLimiter (const CharBJOptions  &opts); // characteristic Barth–Jespersen
+  void AddFaceCharBJLimiter(const FaceBJOptions &opts);
   void AddBarthJespersenLimiter(const BJOptions &opts); // component-wise BJ slope limiter
+  void AddCharVenkatXYLimiter(const VenkatOptions &opts);
+  void AddCharVenkatFaceNormalLimiter(const VenkatOptions &opts);
+  void AddKrivodonovaLimiter(const KrivoOptions &opts);
 
   // --------------- ODESolver interface ---------------
   void Init(TimeDependentOperator &f_) override;
