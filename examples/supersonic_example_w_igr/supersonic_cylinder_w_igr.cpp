@@ -88,6 +88,12 @@ int main(int argc, char *argv[])
 
    int precision = 8;
    cout.precision(precision);
+   // --- New runtime IGR/Euler control flags ---
+   double C_alpha_user = -1.0;        // negative → auto (1.0 default)
+   std::string igr_space = "H1";     // options: H1, L2
+   std::string igr_grad  = "H1";     // options: H1, BrokenL2
+   double vx_in = 3.0;               // free-stream/inlet velocity x
+   double vy_in = 0.0;               // free-stream/inlet velocity y
 
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
@@ -118,6 +124,16 @@ int main(int argc, char *argv[])
                   "    mf - Nonlinear assembly in matrix-free manner");
    args.AddOption(&vis_steps, "-vs", "--visualization-steps",
                   "Visualize every n-th timestep.");
+   args.AddOption(&C_alpha_user, "-ca", "--c-alpha",
+                  "Forward scaling constant C_alpha (default 1.0).");
+   args.AddOption(&igr_space, "-is", "--igr-space",
+                  "Space to solve for sigma: 'H1' or 'L2'.");
+   args.AddOption(&igr_grad, "-ig", "--igr-grad",
+                  "Gradient reconstruction type: 'H1' or 'BrokenL2'.");
+   args.AddOption(&vx_in, "-vx", "--velocity-x",
+                  "Free-stream / inflow velocity x-component.");
+   args.AddOption(&vy_in, "-vy", "--velocity-y",
+                  "Free-stream / inflow velocity y-component.");
    args.ParseCheck();
 
    // 2. Read the mesh from the given mesh file. When the user does not provide
@@ -162,10 +178,21 @@ int main(int argc, char *argv[])
    // Finite element space for all variables together (total thermodynamic state)
    ParFiniteElementSpace vfes(&pmesh, &fec, num_equations, Ordering::byNODES);
 
-   // IGR scalar space (same DG family/order)
-   H1_FECollection sfec(std::max(order, 3), dim);
-   ParFiniteElementSpace sfes(&pmesh, &sfec);
-   // ParFiniteElementSpace sfes(&pmesh, &fec);
+   // --- Select Σ FE space based on --igr-space flag ---
+   std::unique_ptr<FiniteElementCollection> sfec_ptr;
+   if (igr_space == "H1" || igr_space == "h1")
+   {
+      sfec_ptr = std::make_unique<H1_FECollection>(std::max(order, 3), dim);
+   }
+   else if (igr_space == "L2" || igr_space == "l2")
+   {
+      sfec_ptr = std::make_unique<DG_FECollection>(order, dim);
+   }
+   else
+   {
+      sfec_ptr = std::make_unique<DG_FECollection>(order, dim);
+   }
+   ParFiniteElementSpace sfes(&pmesh, sfec_ptr.get());
 
    // --- H1 velocity space (continuous) and diagnostics (scalar DG) ---
    // Order for H1 projection: at least 1, often = order
@@ -253,15 +280,26 @@ int main(int argc, char *argv[])
    // Effective spacing for DG(p): Δx_eff ≈ h / (p+1)
    const double dx_eff = hmin_alpha / (order + 1);
    // const double dx_eff = hmin_alpha ;
-   // Choose a constant Cα (start with 1.0 for shocky cases, 0.25–0.5 for smooth)
-   const double C_alpha = 1.0;
+   // Choose a constant Cα (start with 1.0 for sharp resolution but more ringing, 3-10 generally)
+   // const double C_alpha = 1.0;
+   double C_alpha = (C_alpha_user > 0.0) ? C_alpha_user : 1.0;
    // α = Cα * (Δx_eff)^2
    const double alpha_igr = C_alpha * dx_eff * dx_eff;
    // Build IGR
    IGRSolver igr(sfes, vfes, dim, num_equations, alpha_igr);
    // Pick your gradient backend:
-   igr.SetGradBackend(IGRSolver::GradBackend::H1Projection); // (default)
-   // igr.SetGradBackend(IGRSolver::GradBackend::BrokenDG);
+   if (igr_grad == "H1" || igr_grad == "h1")
+   {
+      igr.SetGradBackend(IGRSolver::GradBackend::H1Projection);
+   }
+   else if (igr_grad == "BrokenL2" || igr_grad == "broken" || igr_grad == "L2" || igr_grad == "l2")
+   {
+      igr.SetGradBackend(IGRSolver::GradBackend::BrokenDG);
+   }
+   else
+   {
+      igr.SetGradBackend(IGRSolver::GradBackend::BrokenDG);
+   }
    igr.SetRhoFloor(rho_floor);
    // igr.SetSmoother(IGRSolver::SmootherType::Jacobi);
    igr.SetSmoother(IGRSolver::SmootherType::L1Jacobi);
@@ -280,9 +318,12 @@ int main(int argc, char *argv[])
    //    "glvis -np 4  -m euler-mesh -g euler-1-init" (for x-momentum).
 
    // Initialize the state.
-   VectorFunctionCoefficient u0 = EulerInitialCondition(problem,
-                                                        specific_heat_ratio,
-                                                        gas_constant);
+   mfem::Vector Uin(4);
+   Uin(0) = 1.4;
+   Uin(1) = 1.4 * vx_in;
+   Uin(2) = 1.4 * vy_in;
+   Uin(3) = 8.8;
+   VectorFunctionCoefficient u0 = EulerInitialCondition(Uin);
    ParGridFunction sol(&vfes);
    sol.ProjectCoefficient(u0);
    ParGridFunction mom(&dfes, sol.GetData() + fes.GetNDofs());
@@ -353,8 +394,6 @@ int main(int argc, char *argv[])
    MakeMarker(outlet_bdr, pmesh, {2});
    MakeMarker(slip_bdr, pmesh, {1,3});
    MakeMarker(cyl_bdr, pmesh, {5});
-   mfem::Vector Uin(4);
-   Uin(0) = 1.4; Uin(1) = 1.4 * 3.0; Uin(2) = 0.0; Uin(3) = 8.8;
 
    base_op.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,

@@ -98,34 +98,30 @@ std::function<void(const Vector&, Vector&)> GetMovingVortexInit(
    };
 }
 
-VectorFunctionCoefficient EulerInitialCondition(const int problem,
-                                                const real_t specific_heat_ratio,
-                                                const real_t gas_constant)
+/**
+ * @brief Create a uniform Euler initial condition from a given conservative state.
+ *
+ * @param Uin   Conservative freestream state [ρ, ρu_x, ρu_y, E].
+ * @return VectorFunctionCoefficient defining u₀(x) = Uin everywhere.
+ *
+ * This is intended for initializing the domain consistently with
+ * your inlet boundary conditions when you already have Uin in conservative form.
+ */
+VectorFunctionCoefficient EulerInitialCondition(const mfem::Vector &Uin)
 {
-   switch (problem)
-   {
-      case 1: // Supersonic Farfield
-         return VectorFunctionCoefficient(4, [](const Vector &x, Vector &y)
-         {
-            MFEM_ASSERT(x.Size() == 2, "");
-            const real_t density = 1.4;
-            const real_t velocity_x = 3.0;
-            const real_t velocity_y = 0.0;
-            const real_t energy = 8.8;
-
-            y(0) = density;
-            y(1) = density * velocity_x;
-            y(2) = density * velocity_y;
-            y(3) = energy;
-         });
-      case 2: // slow moving vortex
-         return VectorFunctionCoefficient(
-                   4, GetMovingVortexInit(0.2, 0.05, 1. / 50., gas_constant,
-                                          specific_heat_ratio));
-      default:
-         MFEM_ABORT("Problem Undefined");
-   }
+   MFEM_VERIFY(Uin.Size() >= 4, "Uin must contain at least [rho, rho*u_x, rho*u_y, E]");
+   return mfem::VectorFunctionCoefficient(
+      4,
+      [=](const mfem::Vector &, mfem::Vector &y)
+      {
+         y.SetSize(4);
+         y(0) = Uin(0);
+         y(1) = Uin(1);
+         y(2) = Uin(2);
+         y(3) = Uin(3);
+      });
 }
+
 
 
 
