@@ -95,6 +95,8 @@ int main(int argc, char *argv[])
    std::string igr_grad  = "H1";     // options: H1, BrokenL2
    double vx_in = 3.0;               // free-stream/inlet velocity x
    double vy_in = 0.0;               // free-stream/inlet velocity y
+   //DGSEM
+   // int use_dgsem = 0;
 
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
@@ -138,6 +140,8 @@ int main(int argc, char *argv[])
                   "Free-stream / inflow velocity x-component.");
    args.AddOption(&vy_in, "-vy", "--velocity-y",
                   "Free-stream / inflow velocity y-component.");
+   // args.AddOption(&use_dgsem, "-dgsem", "--dgsem",
+   //             "Use DGSEM flux-difference for volume terms.");
    args.ParseCheck();
 
    // 2. Read the mesh from the given mesh file. When the user does not provide
@@ -175,6 +179,7 @@ int main(int argc, char *argv[])
    // 4. Define the discontinuous DG finite element space of the given
    //    polynomial order on the refined mesh.
    DG_FECollection fec(order, dim);
+   // L2_FECollection fec(order, dim, BasisType::GaussLobatto);
    // Finite element space for a scalar (thermodynamic quantity)
    ParFiniteElementSpace fes(&pmesh, &fec);
    // Finite element space for a mesh-dim vector quantity (momentum)
@@ -391,6 +396,10 @@ int main(int argc, char *argv[])
       std::unique_ptr<HyperbolicFormIntegrator>(
          new HyperbolicFormIntegrator(numericalFlux, IntOrderOffset)),
       preassembleWeakDiv);
+   // if (use_dgsem)
+   //    base_op.SetVolumeMode(VolumeMode::DGSEMFluxDiff);
+   // else
+   //    base_op.SetVolumeMode(VolumeMode::WeakDivergence);
 
    // BC markers (1=bottom, 2=right, 3=top, 4=left, 5=circle)
    Array<int> inlet_bdr, outlet_bdr, slip_bdr, cyl_bdr;
@@ -587,6 +596,8 @@ int main(int argc, char *argv[])
          }
          if (vtk_save)
          {  // --- VTK export ---
+            pcoef.SetState(sol);
+            press.ProjectCoefficient(pcoef);
             paraview_dc.SetCycle(ti);
             paraview_dc.SetTime(t);
             paraview_dc.Save();
