@@ -26,8 +26,11 @@
 #include "mfem.hpp"
 #include "BdrHyperbolicFluxIntegrator.hpp"
 #include "fluxfunctions.hpp"
+#include "DGSEMCurvedVolume.hpp"
 
 namespace mfem {
+
+enum class VolumeMode { WeakDivergence, DGSEMFluxDiff };
 
 /// Choose which method to compute the *volume* contribution: /// NOT WORKING
 ///  - WeakDivergence: (F(u), ∇v)_T via preassembled weak divergence or matrix-free
@@ -89,6 +92,9 @@ public:
    void AddBdrFaceIntegrator(NonlinearFormIntegrator *nfi,
                              const Array<int> &bdr_marker);
 
+   void SetVolumeMode(VolumeMode m) { vol_mode_ = m; }
+   VolumeMode GetVolumeMode() const { return vol_mode_; }
+
    ~DGHyperbolicConservationLaws() override = default;
 
 private:
@@ -114,7 +120,7 @@ private:
    std::vector<std::unique_ptr<Array<int>>> ext_bdr_markers_;
 
    // Volume strategy
-   // VolumeMode vol_mode_ = VolumeMode::WeakDivergence;
+   VolumeMode vol_mode_ = VolumeMode::WeakDivergence;
 
    // --- Helpers ---
    /// Compute per-element inverse mass matrices (block-diagonal DG mass).

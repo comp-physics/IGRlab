@@ -153,6 +153,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
    //     z += (F(u_h), ∇v)
    nonlinearForm->Mult(x, z);
 
+   if (vol_mode_ == VolumeMode::WeakDivergence){
    if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
    {
       // We'll now compute (I_h F(u_h), ∇v) element-by-element and add it into z,
@@ -240,6 +241,129 @@ void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
          y.SetSubVector(vdofs, Ymat.GetData());
       }
    }
+}
+else // VolumeMode::DGSEMFluxDiff
+{
+    auto is_finite_vec = [](const Vector& v, const char* tag) {
+        for (int i = 0; i < v.Size(); ++i) {
+            double a = v[i];
+            if (!(a == a) || !std::isfinite(a)) {
+                mfem::out << "[NaN@" << tag << "] idx=" << i << " val=" << a << std::endl;
+                MFEM_ABORT("Non-finite detected");
+            }
+        }
+    };
+
+    // ---------- (0) sanity: x must be finite ----------
+    is_finite_vec(x, "x_true_in");
+
+    // We require Par space for the true<->local maps
+    auto *pvfes = dynamic_cast<ParFiniteElementSpace*>(&vfes);
+    MFEM_VERIFY(pvfes, "DGSEM mode requires ParFiniteElementSpace");
+
+    // ---------- (1) faces-only in TRUE space ----------
+    formIntegrator->ResetMaxCharSpeed();
+    Vector z_true(height); z_true = 0.0;
+    nonlinearForm->Mult(x, z_true);            // faces only (make sure NO domain integrator was added)
+    is_finite_vec(z_true, "z_true_after_faces");
+
+    // ---------- (2) TRUE -> LOCAL maps ----------
+    Vector x_loc(vfes.GetVSize()); x_loc = 0.0;
+   Vector z_face_loc(vfes.GetVSize()); z_face_loc = 0.0;
+
+   if (const Operator *P = vfes.GetProlongationMatrix())
+   {
+      P->Mult(x,      x_loc);
+      P->Mult(z_true, z_face_loc);
+   }
+   else
+   {
+      // DG often: identity (no constraints)
+      x_loc      = x;
+      z_face_loc = z_true;
+   }
+   is_finite_vec(x_loc,      "x_loc_after_Px");
+   is_finite_vec(z_face_loc, "z_face_loc_after_Pz");
+
+    // ---------- (2a) OPTIONAL: identity check for P * Pt ----------
+    // This verifies your maps are correct. Uncomment temporarily:
+    // {
+    //     Vector back(height); back = 0.0;
+    //     if (const Operator *P = vfes.GetProlongationMatrix()) {
+    //         const auto *Ph = dynamic_cast<const HypreParMatrix*>(P);
+    //         HypreParVector ytmp(Ph->GetComm(), vfes.GlobalTrueVSize(), (HYPRE_Int*)nullptr, Ph->GetRowStarts());
+    //         Ph->MultTranspose(x_loc, back);
+    //         // Compare 'back' vs 'x' (they won't be bitwise equal in parallel with ghosts, but no NaNs!)
+    //         is_finite_vec(back, "Pt_x_loc_back_to_true");
+    //     }
+    // }
+
+    // ---------- (3) build a LOCAL GridFunction view on x_loc ----------
+    ParGridFunction Uview(pvfes, x_loc.GetData()); // non-owning LOCAL view
+    // quick finite peek at a few entries:
+    // mfem::out << "Uview(0)=" << Uview[0] << "\n";
+
+    // ---------- (4) DGSEM volume in LOCAL space ----------
+    Vector z_vol_loc(vfes.GetVSize()); z_vol_loc = 0.0;
+
+    // ===== HARD KILL SWITCHES FOR ISOLATION =====
+    // A) comment the next two lines to check faces-only path through maps:
+    const FluxFunction &fluxFunction = formIntegrator->GetFluxFunction();
+    AddDGSEMVolumeContribution(*pvfes, Uview, fluxFunction, DGSEMOptions{}, z_vol_loc);
+    // ============================================
+
+    is_finite_vec(z_vol_loc, "z_vol_loc_after_dgsem");
+
+    // ---------- (5) combine face+volume in LOCAL ----------
+    Vector z_loc(vfes.GetVSize()); z_loc = z_face_loc; z_loc += z_vol_loc;
+    is_finite_vec(z_loc, "z_loc_combined");
+
+    // ---------- (6) apply M^{-1} in LOCAL space ----------
+    Vector y_loc(vfes.GetVSize()); y_loc = 0.0;
+    Array<int> vdofs;
+    Vector zslice;
+    DenseMatrix Zmat, Ymat;
+
+    for (int e = 0; e < vfes.GetNE(); ++e) {
+        const int dof = vfes.GetFE(e)->GetDof();
+        vfes.GetElementVDofs(e, vdofs);
+
+        z_loc.GetSubVector(vdofs, zslice);
+        Zmat.UseExternalData(zslice.GetData(), dof, num_equations);
+
+        // Guard: inverse mass must be finite
+        for (int r = 0; r < dof; ++r)
+            for (int c = 0; c < dof; ++c) {
+                double a = invmass[e](r,c);
+                if (!(a == a) || !std::isfinite(a)) {
+                    mfem::out << "[NaN@invMass e="<<e<<" ("<<r<<","<<c<<")]="<<a<<std::endl;
+                    MFEM_ABORT("Non-finite in invmass");
+                }
+            }
+
+        Ymat.SetSize(dof, num_equations);
+        mfem::Mult(invmass[e], Zmat, Ymat);
+
+        y_loc.SetSubVector(vdofs, Ymat.GetData());
+    }
+    is_finite_vec(y_loc, "y_loc_after_invMass");
+
+    // ---------- (7) LOCAL -> TRUE map ----------
+    if (const Operator *P = vfes.GetProlongationMatrix())
+   {
+      P->MultTranspose(y_loc, y);
+   }
+   else
+   {
+      y = y_loc;
+   }
+   is_finite_vec(y, "y_true_out");
+
+    // Only faces update MFEM’s internal speed:
+    max_char_speed = formIntegrator->GetMaxCharSpeed();
+}
+
+
    // (4) Expose the maximum characteristic speed accumulated inside the integrators
    max_char_speed = formIntegrator->GetMaxCharSpeed();
 }
