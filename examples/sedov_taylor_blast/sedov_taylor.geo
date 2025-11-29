@@ -1,6 +1,7 @@
 // Sedov–Taylor blast: unit square [0,1] x [0,1], 32 x 32 quads
 
 SetFactory("OpenCASCADE");
+Mesh.MshFileVersion = 2.2;
 
 // --- Parameters ---
 nx = 32;  // elements in x

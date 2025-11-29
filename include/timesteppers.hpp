@@ -65,6 +65,7 @@ public:
   void AddCharVenkatXYLimiter(const VenkatOptions &opts);
   void AddCharVenkatFaceNormalLimiter(const VenkatOptions &opts);
   void AddKrivodonovaLimiter(const KrivoOptions &opts);
+  void SetLimiterSteps(long nsteps) { max_limiter_steps_ = nsteps; }
 
   // --------------- ODESolver interface ---------------
   void Init(TimeDependentOperator &f_) override;
@@ -88,6 +89,10 @@ private:
 
   // Work vectors
   Vector y_, k_;
+
+  // limiter step control
+  long step_count_        = 0;   ///< how many global steps we've taken
+  long max_limiter_steps_ = -1;  ///< <0 => always limit, >=0 => limit for first N steps only
 
   // Helpers
   void ApplyCallbacks(Vector &v, double t);

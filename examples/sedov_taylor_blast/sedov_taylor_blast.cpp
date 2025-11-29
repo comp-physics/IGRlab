@@ -52,7 +52,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
-#include "forward_facing_step.hpp"
+#include "sedov_taylor_blast.hpp"
 #include "glvismulti.hpp"
 #include "limiters.hpp"
 #include "timesteppers.hpp"
@@ -330,12 +330,14 @@ int main(int argc, char *argv[])
    //    "glvis -np 4  -m euler-mesh -g euler-1-init" (for x-momentum).
 
    // Initialize the state.
-   mfem::Vector Uin(4);
-   Uin(0) = 1.4;
-   Uin(1) = 1.4 * vx_in;
-   Uin(2) = 1.4 * vy_in;
-   Uin(3) = 8.8;
-   VectorFunctionCoefficient u0 = EulerInitialCondition(Uin);
+   const int base_cells = 32;
+   const int total_ref  = ser_ref_levels + par_ref_levels;
+   const int mx = base_cells << total_ref;
+   const int my = base_cells << total_ref;
+   VectorFunctionCoefficient u0 = SedovTaylorBlastInitialCondition(/*gamma=*/1.4, 
+      /*E_blast*/ 1.0, 
+      mx, 
+      my);
    ParGridFunction sol(&vfes);
    sol.ProjectCoefficient(u0);
    ParGridFunction mom(&dfes, sol.GetData() + fes.GetNDofs());
@@ -406,22 +408,10 @@ int main(int argc, char *argv[])
    // else
    //    base_op.SetVolumeMode(VolumeMode::WeakDivergence);
 
-   // BC markers (1=bottom, 2=right, 3=top, 4=left, 5=circle)
-   Array<int> inlet_bdr, outlet_bdr, slip_bdr;
-   MakeMarker(inlet_bdr, pmesh, {3});
-   MakeMarker(outlet_bdr, pmesh, {4});
-   MakeMarker(slip_bdr, pmesh, {9});
+   // BC markers (1=bottom, 2=right, 3=top, 4=left)
+   Array<int> slip_bdr;
+   MakeMarker(slip_bdr, pmesh, {1,2,3,4});
 
-   base_op.AddBdrFaceIntegrator(
-      new BdrHyperbolicFluxIntegrator(numericalFlux,
-                                    std::make_unique<SupersonicInletState>(Uin),
-                                    IntOrderOffset),
-      inlet_bdr);
-   base_op.AddBdrFaceIntegrator(
-      new BdrHyperbolicFluxIntegrator(numericalFlux,
-                                    std::make_unique<SupersonicOutletState>(),
-                                    IntOrderOffset),
-      outlet_bdr);
    base_op.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
                                     std::make_unique<SlipWallState>(dim),
@@ -488,7 +478,7 @@ int main(int argc, char *argv[])
    int save_idx = 0;
    real_t t_next_save = 0.0;
    std::ostringstream dc_name;
-   dc_name << "forward_facing_step"
+   dc_name << "sedov_taylor_blast"
          << "_p_"  << order
          << "_ref_" << (ser_ref_levels+par_ref_levels)
          << "_is_" << igr_space
@@ -558,6 +548,7 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
    // wrapped.SetTime(t);
    // ode_solver->Init(wrapped);
    rk3.Init(wrapped);
+   rk3.SetLimiterSteps(0);
 
    bool done = false;
    for (int ti = 0; !done;)

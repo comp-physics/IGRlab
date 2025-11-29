@@ -4,8 +4,6 @@
 
 using namespace mfem;
 
-int count=0;
-
 RK3SSPWithLimiter::RK3SSPWithLimiter(ParFiniteElementSpace &vfes)
   : vfes_(vfes)
 { }
@@ -139,36 +137,40 @@ void RK3SSPWithLimiter::AddKrivodonovaLimiter(const KrivoOptions &opts)
 
 void RK3SSPWithLimiter::Step(Vector &x, real_t &t, real_t &dt)
 {
+  const bool limit_this_step =
+      (max_limiter_steps_ < 0) || (step_count_ < max_limiter_steps_);
+
   // Optionally ensure the incoming state satisfies pipeline constraints
-  if (limit_initial_) { ApplyCallbacks(x, t); }
+  if (limit_initial_ && limit_this_step){ ApplyCallbacks(x, t); }
 
   // k0 = f(t, x)
   f->SetTime(t);
   f->Mult(x, k_);
 
-  // y = x + dt * k0, then pipeline
+  // ===== Stage 1: y = x + dt * k0 =====
   add(x, dt, k_, y_);
-  if(count<100) ApplyCallbacks(y_, t + dt);
+  if (limit_this_step){ ApplyCallbacks(y_, t + dt); }
 
   // k1 = f(t+dt, y)
   f->SetTime(t + dt);
   f->Mult(y_, k_);
 
-  // y = 3/4*x + 1/4 ( y + dt * k1 ), then pipeline
+  // ===== Stage 2: y = 3/4*x + 1/4 ( y + dt * k1 ) =====
   y_.Add(dt, k_);                 // y := y + dt*k1
   add(3.0/4.0, x, 1.0/4.0, y_, y_);
-  // ApplyCallbacks(y_, t + dt);
+  // if (limit_this_step) { ApplyCallbacks(y_, t + dt); }
 
   // k2 = f(t + dt/2, y)
   f->SetTime(t + dt/2);
   f->Mult(y_, k_);
 
-  // x = 1/3*x + 2/3 ( y + dt*k2 ), then pipeline
+  // ===== Stage 3: x = 1/3*x + 2/3 ( y + dt*k2 ) =====
   y_.Add(dt, k_);                 // y := y + dt*k2
   add(1.0/3.0, x, 2.0/3.0, y_, x);
   t += dt;
 
-  // ApplyCallbacks(x, t);
+  // if (limit_this_step) { ApplyCallbacks(x, t); }
 
-  count++;
+  ++step_count_;
 }
+

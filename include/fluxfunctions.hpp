@@ -7,6 +7,104 @@
 namespace mfem
 {
 
+// --- Small opt-in interface: numerical flux can tell a flux which face side it is evaluating.
+enum class FaceSide { Left, Right };
+
+class FaceSideAwareFlux
+{
+public:
+   virtual ~FaceSideAwareFlux() = default;
+   virtual void SetFaceSide(FaceSide side) = 0;
+};
+
+/**
+ * @brief Decorator that adds Information Geometric Regularization (IGR) to a base FluxFunction.
+ *
+ * Applies p -> p + Σ consistently:
+ *  - Tensor flux F(U):           momentum rows +Σ I, energy row +Σ u.
+ *  - Normal flux (F(U)·n):       momentum +Σ n,   energy +Σ (u·n).
+ *
+ * Notes
+ *  - The returned max characteristic speed comes from the base flux (unchanged).
+ *  - On faces, Σ is taken from the side indicated via SetFaceSide(Left/Right).
+ *    On boundary faces (Elem2 == nullptr) the interior (Left) value is used.
+ */
+class FluxWithIGR : public FluxFunction, public FaceSideAwareFlux
+{
+public:
+   // RAII helper 
+   struct SideScope
+   {
+      FluxWithIGR &owner; FaceSide prev;
+      SideScope(FluxWithIGR &o, FaceSide s) : owner(o), prev(o.curr_side_) { o.curr_side_ = s; }
+      ~SideScope() { owner.curr_side_ = prev; }
+   };
+
+   /// Construct an IGR-decorated flux around an existing base FluxFunction.
+   explicit FluxWithIGR(const FluxFunction &base)
+      : FluxFunction(base.num_equations, base.dim), base_(base) {}
+
+   /// Provide the scalar Σ field (same mesh as the solution). Pass nullptr to disable IGR.
+   void SetSigmaField(const mfem::ParGridFunction *sigma) { sigma_ = sigma; }
+
+   /// Density floor used only for u = m / rho in the IGR terms (default 1e-10).
+   void SetVelocityRhoFloor(double f) { rho_vel_floor_ = f; }
+
+   /// Face-side hook used by side-aware numerical flux (e.g., RusanovFluxWithSides).
+   void SetFaceSide(FaceSide side) override { curr_side_ = side; }
+
+   /// Compute tensor flux F(U). Adds IGR tensor terms if Σ is set; returns base max speed.
+   real_t ComputeFlux(const Vector &state, ElementTransformation &Tr,
+                      DenseMatrix &flux) const override;
+
+   /// Compute normal flux F(U)·n. Adds IGR normal terms if Σ is set; returns base max speed.
+   real_t ComputeFluxDotN(const Vector &state, const Vector &normal,
+                          FaceElementTransformations &Tr,
+                          Vector &fluxN) const override;
+
+   /// Jacobians: forwarded to the base (unchanged).
+   void ComputeFluxJacobian(const Vector &state, ElementTransformation &Tr,
+                            DenseTensor &J_) const override
+   { base_.ComputeFluxJacobian(state, Tr, J_); }
+
+   void ComputeFluxJacobianDotN(const Vector &state, const Vector &normal,
+                                ElementTransformation &Tr,
+                                DenseMatrix &JDotN) const override
+   { base_.ComputeFluxJacobianDotN(state, normal, Tr, JDotN); }
+
+private:
+   const FluxFunction *GetBase() const { return &base_; }
+
+   const FluxFunction &base_;
+   const mfem::ParGridFunction *sigma_ = nullptr;
+   double rho_vel_floor_ = 1e-10;
+
+   // Which side are we evaluating on this face call? (Default to Left/boundary)
+   mutable FaceSide curr_side_ = FaceSide::Left;
+
+   // helpers
+
+   inline void AddTensorSigmaTerms(const Vector &U, double sigma, DenseMatrix &F) const
+   {
+      // momentum rows: +σ I
+      for (int d = 0; d < dim; ++d) { F(1 + d, d) += sigma; }
+      // energy row: +σ u
+      const double rho = std::max(U(0), rho_vel_floor_);
+      for (int d = 0; d < dim; ++d) { F(1 + dim, d) += sigma * (U(1 + d) / rho); }
+   }
+
+   inline void AddDotNSigmaTerms(const Vector &U, const Vector &n,
+                                 double sigma_face, Vector &Fn) const
+   {
+      // momentum rows: +σ n_d  (MFEM uses a scaled normal; stay consistent)
+      for (int d = 0; d < dim; ++d) { Fn(1 + d) += sigma_face * n(d); }
+      // energy row: +σ (u·n)
+      const double rho = std::max(U(0), rho_vel_floor_);
+      double un = 0.0; for (int d = 0; d < dim; ++d) un += U(1 + d) * n(d);
+      Fn(1 + dim) += sigma_face * (un / rho);
+   }
+};
+
 /**
  * @brief Diffusive Rusanov flux, a Rusanov (local Lax–Friedrichs) variant with
  * tunable extra dissipation:
@@ -160,6 +258,47 @@ protected:
 };
 
 /**
+ * @brief Rusanov flux (local Lax-Friedrichs) that mirrors MFEM's reference
+ * implementation, with one addition: if the wrapped FluxFunction implements
+ * FaceSideAwareFlux, we set the face side (Left/Right) around each call so that
+ * side-dependent fields (e.g., Σ for IGR) can be selected consistently.
+ *
+ * Math, scaling, and Jacobians are otherwise identical to MFEM's RusanovFlux.
+ */
+class RusanovFluxWithSides : public NumericalFlux
+{
+public:
+   /// @param fluxFunction physical flux F(u, x)
+   explicit RusanovFluxWithSides(const FluxFunction &fluxFunction);
+
+   /// F̂ n = ½(F(u⁻)·n + F(u⁺)·n) - ½ λ ||n|| (u⁺ - u⁻)
+   real_t Eval(const Vector &state1, const Vector &state2,
+               const Vector &nor, FaceElementTransformations &Tr,
+               Vector &flux) const override;
+
+   /// Grad w.r.t. (side == 1 ? u⁻ : u⁺); matches MFEM’s RusanovFlux exactly.
+   void Grad(int side, const Vector &state1, const Vector &state2,
+             const Vector &nor, FaceElementTransformations &Tr,
+             DenseMatrix &grad) const override;
+
+   /// Average variant, exactly as in MFEM (only sets side if supported).
+   real_t Average(const Vector &state1, const Vector &state2,
+                  const Vector &nor, FaceElementTransformations &Tr,
+                  Vector &flux) const override;
+
+   /// AverageGrad, identical structure to MFEM (only sets side if supported).
+   void AverageGrad(int side, const Vector &state1, const Vector &state2,
+                    const Vector &nor, FaceElementTransformations &Tr,
+                    DenseMatrix &grad) const override;
+
+protected:
+#ifndef MFEM_THREAD_SAFE
+   mutable Vector fluxN1, fluxN2;
+   mutable DenseMatrix JDotN;
+#endif
+};
+
+/**
  * @brief HLLC flux for compressible Euler, computed in the face-normal direction.
  *
  * Uses unit-normal HLLC formulas internally, then scales by |nor| to match MFEM's
@@ -265,80 +404,6 @@ protected:
    }
 
 };
-
-/**
- * @brief Decorator that adds Information Geometric Regularization (IGR) to a base FluxFunction.
- *
- * Applies \(p \mapsto p + \Sigma\) consistently:
- *  - Tensor flux \(F(U)\):     momentum rows \(+\Sigma I\), energy row \(+\Sigma\,u\).
- *  - Normal flux \(F(U)\cdot n\): momentum \(+\Sigma\,n\), energy \(+\Sigma (u\cdot n)\).
- *
- * \note
- *  - The returned max characteristic speed comes from the base flux (unchanged).
- *  - On interior faces we use the **face-average** \(\sigma = \tfrac12(\sigma_L+\sigma_R)\)
- *    inside `ComputeFluxDotN`, so Rusanov/HLLC see a consistent physical part without MFEM changes.
- *  - On boundary faces we use the **interior** element’s \(\sigma\).
- */
-class FluxWithIGR : public FluxFunction
-{
-public:
-  /// Construct an IGR-decorated flux around an existing base FluxFunction.
-  explicit FluxWithIGR(const FluxFunction &base)
-  : FluxFunction(base.num_equations, base.dim), base_(base) {}
-
-  /// Provide the scalar \Sigma field (same mesh as the solution). Pass nullptr to disable IGR.
-  void SetSigmaField(const mfem::ParGridFunction *sigma) { sigma_ = sigma; }
-
-  /// Density floor used only for u = m / rho in the IGR terms (default 1e-10).
-  void SetVelocityRhoFloor(double f) { rho_vel_floor_ = f; }
-
-  /// Compute tensor flux F(U). Adds IGR tensor terms if Σ is set; returns base max speed.
-  real_t ComputeFlux(const Vector &state, ElementTransformation &Tr,
-                     DenseMatrix &flux) const override;
-
-  /// Compute normal flux F(U)·n. Adds IGR normal terms if Σ is set; returns base max speed.
-  real_t ComputeFluxDotN(const Vector &state, const Vector &normal,
-                         FaceElementTransformations &Tr,
-                         Vector &fluxN) const override;
-
-  /// Jacobians: forwarded to the base (unchanged).
-  void ComputeFluxJacobian(const Vector &state, ElementTransformation &Tr,
-                           DenseTensor &J_) const override
-  { base_.ComputeFluxJacobian(state, Tr, J_); }
-
-  void ComputeFluxJacobianDotN(const Vector &state, const Vector &normal,
-                               ElementTransformation &Tr,
-                               DenseMatrix &JDotN) const override
-  { base_.ComputeFluxJacobianDotN(state, normal, Tr, JDotN); }
-
-private:
-  const FluxFunction &base_;
-  const mfem::ParGridFunction *sigma_ = nullptr;
-  double rho_vel_floor_ = 1e-10;
-
-  // helpers
-
-  inline void AddTensorSigmaTerms(const Vector &U, double sigma, DenseMatrix &F) const
-  {
-    // momentum rows: +σ I
-    for (int d = 0; d < dim; ++d) { F(1 + d, d) += sigma; }
-    // energy row: +σ u
-    const double rho = std::max(U(0), rho_vel_floor_);
-    for (int d = 0; d < dim; ++d) { F(1 + dim, d) += sigma * (U(1 + d) / rho); }
-  }
-
-  inline void AddDotNSigmaTerms(const Vector &U, const Vector &n,
-                                double sigma_face, Vector &Fn) const
-  {
-    // momentum rows: +σ n_d  (MFEM uses a scaled normal; stay consistent)
-    for (int d = 0; d < dim; ++d) { Fn(1 + d) += sigma_face * n(d); }
-    // energy row: +σ (u·n)
-    const double rho = std::max(U(0), rho_vel_floor_);
-    double un = 0.0; for (int d = 0; d < dim; ++d) un += U(1 + d) * n(d);
-    Fn(1 + dim) += sigma_face * (un / rho);
-  }
-};
-
 
 } // namespace mfem
 

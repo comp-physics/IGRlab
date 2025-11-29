@@ -1,47 +1,47 @@
-// Sedov–Taylor blast: unit square [0,1] x [0,1], 32 x 32 quads
+// shock_vortex_IH.geo
+// Inoue–Hattori canonical domain: X ∈ [-30,10], Y ∈ [-20,20]
 
 SetFactory("OpenCASCADE");
+Mesh.MshFileVersion = 2.2;
 
-// --- Parameters ---
-nx = 32;  // elements in x
-ny = 32;  // elements in y
-Lx = 1.0;
-Ly = 1.0;
+// Parameters
+xL = -30.0;
+xR =  10.0;
+yB = -20.0;
+yT =  20.0;
 
-// --- Corner points ---
-Point(1) = {0.0, 0.0, 0.0, 1.0/nx};
-Point(2) = {Lx,  0.0, 0.0, 1.0/nx};
-Point(3) = {Lx,  Ly,  0.0, 1.0/nx};
-Point(4) = {0.0, Ly,  0.0, 1.0/nx};
+// Number of cells in each direction
+NX = 32;
+NY = 32;
 
-// --- Boundary lines ---
-// 1: bottom (y = 0)
-// 2: right  (x = 1)
-// 3: top    (y = 1)
-// 4: left   (x = 0)
-Line(1) = {1, 2};  // bottom
-Line(2) = {2, 3};  // right
-Line(3) = {3, 4};  // top
-Line(4) = {4, 1};  // left
+// Characteristic length
+lc = 1.0;
 
-// --- Surface ---
-Line Loop(1)     = {1, 2, 3, 4};
-Plane Surface(1) = {1};
+// Corner points
+Point(1) = {xL, yB, 0.0, lc};
+Point(2) = {xR, yB, 0.0, lc};
+Point(3) = {xR, yT, 0.0, lc};
+Point(4) = {xL, yT, 0.0, lc};
 
-// --- Structured transfinite mesh ---
-Transfinite Curve{1, 3} = nx + 1 Using Progression 1; // in x
-Transfinite Curve{2, 4} = ny + 1 Using Progression 1; // in y
+// Boundary lines
+Line(1) = {1, 2}; // bottom
+Line(2) = {2, 3}; // right
+Line(3) = {3, 4}; // top
+Line(4) = {4, 1}; // left
 
-Transfinite Surface{1} = {1, 2, 3, 4};
-Recombine Surface{1};           // quads instead of triangles
-Mesh.RecombineAll = 1;
+Line Loop(10) = {1, 2, 3, 4};
+Plane Surface(11) = {10};
 
-// --- Physical groups ---
-// Boundary attributes for MFEM (or similar):
-Physical Curve("bottom", 1) = {1};
-Physical Curve("right",  2) = {2};
-Physical Curve("top",    3) = {3};
-Physical Curve("left",   4) = {4};
+// Structured mesh: 32×32
+Transfinite Line{1,3} = NX + 1;
+Transfinite Line{2,4} = NY + 1;
+Transfinite Surface{11};
+Recombine Surface{11}; // quads
 
-// Domain region (cell attribute)
-Physical Surface("domain", 1) = {1};
+// Physical groups
+Physical Surface("fluid", 1) = {11};
+
+Physical Line("bottom", 1) = {1};
+Physical Line("right",  2) = {2};
+Physical Line("top",    3) = {3};
+Physical Line("left",   4) = {4};

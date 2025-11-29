@@ -52,7 +52,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
-#include "forward_facing_step.hpp"
+#include "shock_vortex_interaction.hpp"
 #include "glvismulti.hpp"
 #include "limiters.hpp"
 #include "timesteppers.hpp"
@@ -79,7 +79,7 @@ int main(int argc, char *argv[])
    int par_ref_levels = 1;
    int order = 3;
    int ode_solver_type = 4;
-   real_t t_final = 4.0;
+   real_t t_final = 6.0;
    real_t dt = -0.01;
    real_t cfl = 0.3;
    bool visualization = true;
@@ -330,12 +330,27 @@ int main(int argc, char *argv[])
    //    "glvis -np 4  -m euler-mesh -g euler-1-init" (for x-momentum).
 
    // Initialize the state.
+   const real_t gamma = 1.4;
+   const real_t Ms    = 1.2;
+   const real_t rho1  = 1.0;
+   const real_t p1    = 1.0;
+   const real_t c1    = std::sqrt(gamma * p1 / rho1);
+   const real_t u1x   = -Ms * c1;  // < 0, flow right -> left
+   const real_t u1y   = 0.0;
+   const real_t v1sq  = u1x * u1x + u1y * u1y;
    mfem::Vector Uin(4);
-   Uin(0) = 1.4;
-   Uin(1) = 1.4 * vx_in;
-   Uin(2) = 1.4 * vy_in;
-   Uin(3) = 8.8;
-   VectorFunctionCoefficient u0 = EulerInitialCondition(Uin);
+   Uin(0) = rho1;
+   Uin(1) = rho1 * u1x;
+   Uin(2) = rho1 * u1y;
+   Uin(3) = p1 / (gamma - 1.0) + 0.5 * rho1 * v1sq;
+   const int base_cells = 32;
+   const int total_ref  = ser_ref_levels + par_ref_levels;
+   const int mx = base_cells << total_ref;
+   const int my = base_cells << total_ref;
+   VectorFunctionCoefficient u0 = ShockVortexInoueHattoriInitialCondition(
+      /*gamma=*/1.4, 
+      /*mx*/ mx, 
+      /*my*/ my);
    ParGridFunction sol(&vfes);
    sol.ProjectCoefficient(u0);
    ParGridFunction mom(&dfes, sol.GetData() + fes.GetNDofs());
@@ -408,9 +423,9 @@ int main(int argc, char *argv[])
 
    // BC markers (1=bottom, 2=right, 3=top, 4=left, 5=circle)
    Array<int> inlet_bdr, outlet_bdr, slip_bdr;
-   MakeMarker(inlet_bdr, pmesh, {3});
+   MakeMarker(inlet_bdr, pmesh, {2});
    MakeMarker(outlet_bdr, pmesh, {4});
-   MakeMarker(slip_bdr, pmesh, {9});
+   MakeMarker(slip_bdr, pmesh, {1,3}); 
 
    base_op.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
@@ -488,12 +503,12 @@ int main(int argc, char *argv[])
    int save_idx = 0;
    real_t t_next_save = 0.0;
    std::ostringstream dc_name;
-   dc_name << "forward_facing_step"
+   dc_name << "shock_vortex_interaction"
          << "_p_"  << order
          << "_ref_" << (ser_ref_levels+par_ref_levels)
          << "_is_" << igr_space
          << "_ig_" << igr_grad
-         << "_ca_" << C_alpha_user;
+         << "_ca_" << C_alpha;
 
 ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
    if (vtk_save)
@@ -516,6 +531,7 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
    if (Mpi::Root())
    {
       std::cout << "Saving output to VTK.\n";
+      std::cout << "Saving to " << dc_name.str() << "\n";
    }
    }
 
@@ -558,6 +574,7 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
    // wrapped.SetTime(t);
    // ode_solver->Init(wrapped);
    rk3.Init(wrapped);
+   rk3.SetLimiterSteps(0);
 
    bool done = false;
    for (int ti = 0; !done;)

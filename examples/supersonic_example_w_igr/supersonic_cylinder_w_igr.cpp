@@ -548,6 +548,7 @@ int main(int argc, char *argv[])
    // wrapped.SetTime(t);
    // ode_solver->Init(wrapped);
    rk3.Init(wrapped);
+   rk3.SetLimiterSteps(100);
 
    bool done = false;
    for (int ti = 0; !done;)
