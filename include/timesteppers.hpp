@@ -45,27 +45,57 @@ public:
   /// If true, also apply the pipeline at the start of Step() to the input x.
   void LimitInitial(bool on) { limit_initial_ = on; }
 
+  /// Limiters scheduling: optional callbacks are applied only for nsteps >= 0.
+  ///   nsteps < 0  -> optional callbacks are always applied (no limit).
+  ///   nsteps >= 0 -> optional callbacks applied while step_count_ < nsteps.
+  void SetLimiterSteps(long nsteps) { max_limiter_steps_ = nsteps; }
+
+  /// Reset the internal step counter (e.g., if restarting the time integrator).
+  void ResetStepCount() { step_count_ = 0; }
+
   // ----------------- Ordered list of stage callbacks -----------------
   // Signature: void(ParFiniteElementSpace&, ParGridFunction&, double t)
   using StageCallback = std::function<void(ParFiniteElementSpace&, ParGridFunction&, double)>;
 
-  /// Remove all callbacks.
-  void ClearCallbacks() { callbacks_.clear(); }
+  /// Remove all callbacks (both always and optional).
+  void ClearCallbacks()
+  {
+    always_callbacks_.clear();
+    optional_callbacks_.clear();
+  }
 
-  /// Append a callback to the pipeline (executed in registration order).
-  void AddCallback(StageCallback cb) { callbacks_.push_back(std::move(cb)); }
+  /// Append a callback that always runs (e.g. Zhang–Shu positivity).
+  void AddAlwaysCallback(StageCallback cb)
+  {
+    always_callbacks_.push_back(std::move(cb));
+  }
+
+  /// Append a callback that only runs for the first max_limiter_steps_ steps.
+  void AddOptionalCallback(StageCallback cb)
+  {
+    optional_callbacks_.push_back(std::move(cb));
+  }
+
+  /// Backward-compatible: generic AddCallback() -> treat as optional.
+  void AddCallback(StageCallback cb)
+  {
+    AddOptionalCallback(std::move(cb));
+  }
 
   // ---- Convenience: push common limiters as callbacks (defined in .cpp) ----
-  void AddZhangShuLimiter();                          // uses SetEulerParams + SetLimiterParams
+  /// Add a Zhang–Shu positivity limiter.
+  /// @param always_on
+  ///   - true  -> add as an always-on callback (default)
+  ///   - false -> add as an optional callback (respecting max_limiter_steps_)
+  void AddZhangShuLimiter(bool always_on = true);
   void AddCharTVBLimiter(const CharTVBOptions &opts); // characteristic TVB
   void AddCharTVBFaceNormalLimiter(const CharTVBOptions &opts);
-  void AddCharBJLimiter (const CharBJOptions  &opts); // characteristic Barth–Jespersen
+  void AddCharBJLimiter(const CharBJOptions  &opts);  // characteristic BJ
   void AddFaceCharBJLimiter(const FaceBJOptions &opts);
-  void AddBarthJespersenLimiter(const BJOptions &opts); // component-wise BJ slope limiter
+  void AddBarthJespersenLimiter(const BJOptions &opts); // component-wise BJ
   void AddCharVenkatXYLimiter(const VenkatOptions &opts);
   void AddCharVenkatFaceNormalLimiter(const VenkatOptions &opts);
   void AddKrivodonovaLimiter(const KrivoOptions &opts);
-  void SetLimiterSteps(long nsteps) { max_limiter_steps_ = nsteps; }
 
   // --------------- ODESolver interface ---------------
   void Init(TimeDependentOperator &f_) override;
@@ -84,18 +114,20 @@ private:
   int    p_bisect_iters_ = 12;
   bool   limit_initial_  = true;
 
-  // Callback pipeline
-  std::vector<StageCallback> callbacks_;
+  // Callback pipelines
+  std::vector<StageCallback> always_callbacks_;   ///< Always run
+  std::vector<StageCallback> optional_callbacks_; ///< Only early steps
+
+  // Optional limiter scheduling
+  long step_count_        = 0;   ///< number of completed Step() calls
+  long max_limiter_steps_ = -1;  ///< <0 => optional limiters always on
 
   // Work vectors
   Vector y_, k_;
 
-  // limiter step control
-  long step_count_        = 0;   ///< how many global steps we've taken
-  long max_limiter_steps_ = -1;  ///< <0 => always limit, >=0 => limit for first N steps only
-
   // Helpers
-  void ApplyCallbacks(Vector &v, double t);
+  /// Apply both always-on and (optionally) optional callbacks to vector v.
+  void ApplyCallbacks(Vector &v, double t, bool apply_optional);
   int  AutoQuadOrder() const;
 };
 
