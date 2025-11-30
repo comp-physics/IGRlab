@@ -86,6 +86,7 @@ int main(int argc, char *argv[])
    bool preassembleWeakDiv = true;
    int vis_steps = 50;
    bool vtk_save = true;
+   real_t dt_save      = 0.01; 
 
    int precision = 8;
    cout.precision(precision);
@@ -123,6 +124,8 @@ int main(int argc, char *argv[])
    args.AddOption(&vtk_save, "-vtk", "--vtk_save", "-no-vtk",
                   "--no-vtk_save",
                   "Enable or disable VTK visualization.");
+   args.AddOption(&dt_save, "-dt_save", "--time-step-save",
+                  "Saving time step for VTK output.");
    args.AddOption(&preassembleWeakDiv, "-ea", "--element-assembly-divergence",
                   "-mf", "--matrix-free-divergence",
                   "Weak divergence assembly level\n"
@@ -332,7 +335,15 @@ int main(int argc, char *argv[])
    Uin(1) = 1.4 * vx_in;
    Uin(2) = 1.4 * vy_in;
    Uin(3) = 8.8;
-   VectorFunctionCoefficient u0 = EulerInitialCondition(Uin);
+   // VectorFunctionCoefficient u0 = EulerInitialCondition(Uin);
+   // Geometry parameters for your cylinder mesh
+   const double xc    = 0.6;   // <-- set to your actual cylinder center x
+   const double yc    = 0.0;   // <-- set to your actual cylinder center y
+   const double r_cyl = 0.25;   // <-- set to your cylinder radius
+   const double delta = 0.5*r_cyl; // smoothing length (tune as desired)
+   // New smoothed IC
+   mfem::VectorFunctionCoefficient u0 =
+      SupersonicCylinderSmoothedVelocityIC(Uin, xc, yc, r_cyl, delta);
    ParGridFunction sol(&vfes);
    sol.ProjectCoefficient(u0);
    ParGridFunction mom(&dfes, sol.GetData() + fes.GetNDofs());
@@ -485,7 +496,18 @@ int main(int argc, char *argv[])
    // ----------------------------------------------------------------------
    //  VTK / ParaView output setup
    // ----------------------------------------------------------------------
-   ParaViewDataCollection paraview_dc("supersonic_cylinder_output", &pmesh);
+   // ParaViewDataCollection paraview_dc("supersonic_cylinder_output", &pmesh);
+   int save_idx = 0;
+   real_t t_next_save = 0.0;
+   std::ostringstream dc_name;
+   dc_name << "supersonic_cylinder"
+         << "_p_"  << order
+         << "_ref_" << (ser_ref_levels+par_ref_levels)
+         << "_is_" << igr_space
+         << "_ig_" << igr_grad
+         << "_ca_" << C_alpha_user;
+
+ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
    if (vtk_save)
    {  
    // Register fields you want to write (each will become its own .pvtu series)
@@ -553,29 +575,43 @@ int main(int argc, char *argv[])
    bool done = false;
    for (int ti = 0; !done;)
    {
-      real_t dt_real = min(dt, t_final - t);
+      real_t dt_real_base = std::min(dt, t_final - t);
+      real_t dt_real = dt_real_base;
 
-      // ode_solver->Step(sol, t, dt_real);
+      // Detect if we will land on the next save time this step
+      bool hit_save_boundary = false;
+      if (vtk_save && dt_save > 0.0)
+      {
+         const real_t gap = t_next_save - t;
+         if (gap >= 0.0 && gap <= dt_real_base)
+         {
+            dt_real = gap; // trim to land exactly on t_next_save
+            hit_save_boundary = true;
+         }
+      }
+
       rk3.Step(sol, t, dt_real);
-      // ApplyZhangShuPositivityLimiter(vfes, sol, dim, specific_heat_ratio,
-      //                          5.0e-7, 1.0e-6, std::max(2*order, 4));
-      // sol.ExchangeFaceNbrData();
-      if (cfl > 0) // update time step size with CFL
+
+      if (hit_save_boundary) { t = t_next_save; }
+
+      if (cfl > 0)
       {
          real_t max_char_speed = wrapped.GetMaxCharSpeed();
          MPI_Allreduce(MPI_IN_PLACE, &max_char_speed, 1,  MPITypeMap<real_t>::mpi_type,
                        MPI_MAX, pmesh.GetComm());
          dt = cfl * hmin / max_char_speed / (2 * order + 1);
-         if (Mpi::Root()) { cout << "dt: " << dt << endl; }
+         if (Mpi::Root()) { std::cout << "dt: " << dt_real << std::endl; }
       }
       ti++;
 
       done = (t >= t_final - 1e-8 * dt);
+
+      // (optional) GLVis still by step cadence
       if (done || ti % vis_steps == 0)
       {
          if (Mpi::Root())
          {
-            cout << "time step: " << ti << ", time: " << t << endl;
+            cout << "dt: " << dt_real << " time step: " << ti << ", time: " << t << endl;
          }
          if (visualization)
          {
@@ -595,14 +631,40 @@ int main(int argc, char *argv[])
             // vis::Update(w_div,   numProcs, myRank, pmesh, g_div,   t, "div u_H1");
             // vis::Update(w_gfrob, numProcs, myRank, pmesh, g_gfrob, t, "||grad u_H1||_F");
          }
-         if (vtk_save)
-         {  // --- VTK export ---
-            pcoef.SetState(sol);
-            press.ProjectCoefficient(pcoef);
-            paraview_dc.SetCycle(ti);
-            paraview_dc.SetTime(t);
-            paraview_dc.Save();
+      }
+
+      // VTK export by dt_save
+      if (vtk_save && dt_save > 0.0 && hit_save_boundary)
+      {
+         if (Mpi::Root())
+         {
+            cout << "dt: " << dt_real << " save VTK " << "time step: " << ti << ", time: " << t << endl;
          }
+         // refresh derived fields
+         igr.UpdateFromState(sol, /*warm_start=*/true);
+         igr.GetSigma().ExchangeFaceNbrData();
+         pcoef.SetState(sol);
+         press.ProjectCoefficient(pcoef);
+
+         paraview_dc.SetCycle(save_idx);   
+         paraview_dc.SetTime(t);           
+         paraview_dc.Save();
+
+         ++save_idx;
+         t_next_save += dt_save;
+      }
+
+      // Dump final step 
+      if (done && vtk_save)
+      {
+         igr.UpdateFromState(sol, /*warm_start=*/true);
+         igr.GetSigma().ExchangeFaceNbrData();
+         pcoef.SetState(sol);
+         press.ProjectCoefficient(pcoef);
+
+         paraview_dc.SetCycle(save_idx);
+         paraview_dc.SetTime(t);
+         paraview_dc.Save();
       }
    }
 

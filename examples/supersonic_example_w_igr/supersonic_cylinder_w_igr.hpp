@@ -123,6 +123,92 @@ VectorFunctionCoefficient EulerInitialCondition(const mfem::Vector &Uin)
 }
 
 
+/**
+ * @brief Smoothed IC for the supersonic cylinder: velocity goes from 0 at
+ *        the cylinder to freestream far away, radially smoothly.
+ *
+ * We keep density and energy from Uin *uniform everywhere* and only modify
+ * the velocity (i.e. momentum components).
+ *
+ * Model:
+ *   - Let (xc, yc) be the cylinder center, with radius r_cyl.
+ *   - Define r = distance from (xc, yc).
+ *   - For r <= r_cyl       : S(r) = 0      (stagnant right at the cylinder)
+ *   - For r >  r_cyl       : S(r) = 1 - exp(-((r - r_cyl)/delta)^2)
+ *                             (smoothly transitions to 1 as r increases)
+ *
+ * Then:
+ *   u(x,y)  = S(r) * u_inf
+ *   v(x,y)  = S(r) * v_inf
+ *   rho(x,y) = rho_inf (from Uin)
+ *   E(x,y)   = E_inf   (from Uin)
+ *
+ * Parameters:
+ *   - Uin      : conservative freestream state [ρ, ρu_x, ρu_y, E]
+ *   - xc, yc   : cylinder center in physical coordinates
+ *   - r_cyl    : cylinder radius
+ *   - delta    : radial smoothing length scale (how quickly you ramp to free-stream)
+ */
+inline mfem::VectorFunctionCoefficient SupersonicCylinderSmoothedVelocityIC(
+   const mfem::Vector &Uin,
+   double xc, double yc,
+   double r_cyl,
+   double delta)
+{
+   MFEM_VERIFY(Uin.Size() >= 4,
+               "Uin must contain at least [rho, rho*u_x, rho*u_y, E]");
+   MFEM_VERIFY(delta > 0.0, "delta must be positive.");
+   MFEM_VERIFY(r_cyl >= 0.0, "r_cyl must be non-negative.");
+
+   // Decode freestream conservative state
+   const double rho_inf   = Uin(0);
+   const double rhoux_inf = Uin(1);
+   const double rhouy_inf = Uin(2);
+   const double E_inf     = Uin(3);
+
+   const double ux_inf = rhoux_inf / rho_inf;
+   const double uy_inf = rhouy_inf / rho_inf;
+
+   return mfem::VectorFunctionCoefficient(
+      4,
+      [=](const mfem::Vector &x, mfem::Vector &y)
+      {
+         y.SetSize(4);
+
+         const double X = x(0);
+         const double Y = x(1);
+
+         const double dx = X - xc;
+         const double dy = Y - yc;
+         const double r  = std::sqrt(dx*dx + dy*dy);
+
+         // Radial blending factor S(r): 0 at cylinder, →1 far away
+         double S = 1.0;
+         if (r <= r_cyl)
+         {
+            S = 0.0;
+         }
+         else
+         {
+            const double s = (r - r_cyl) / delta;
+            // Smooth transition: S ~ 0 just outside r_cyl, →1 as r grows
+            double val = 1.0 - std::exp(-s*s);
+            // Just in case of any numerical weirdness, clamp to [0,1]
+            if (val < 0.0) val = 0.0;
+            if (val > 1.0) val = 1.0;
+            S = val;
+         }
+
+         const double ux = S * ux_inf;
+         const double uy = S * uy_inf;
+
+         // Leave ρ and E as in Uin; only change the momentum components
+         y(0) = rho_inf;
+         y(1) = rho_inf * ux;
+         y(2) = rho_inf * uy;
+         y(3) = E_inf;
+      });
+}
 
 
 } // namespace mfem
