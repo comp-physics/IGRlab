@@ -1,30 +1,30 @@
 #pragma once
 #include "mfem.hpp"
+#include <memory>
 
 /**
  * @file IGR.hpp
  * @brief Information Geometric Regularization (IGR) solver for Σ coupled to Euler.
  *
  * Given the current conservative state U = [ρ, ρu, E], this class computes Σ by
- * approximately solving the scalar elliptic PDE
+ * solving the scalar elliptic PDE
  *
  *   (1/ρ) Σ - α ∇·( (1/ρ) ∇Σ ) = α ( ||∇u||_F^2 + (∇·u)^2 )
  *
- * using a small, fixed number of Jacobi-like smoothing sweeps with a warm start
- * from the previously computed Σ. The result is then used by the hyperbolic
- * operator via p -> p + Σ in momentum/energy fluxes.
+ * Discretization:
+ *  - Mass term: ( (1/ρ) Σ, v )
+ *  - Diffusion term: ( (α/ρ) ∇Σ, ∇v ) [+ IPDG face terms if Σ-space is DG]
+ *  - RHS: ( α( ||∇u||_F^2 + (∇·u)^2 ), v )
  *
- * Usage (per stage):
- *   1) IGRSolver igr(sfes, vfes, dim, num_eq, alpha);
- *   2) igr.UpdateFromState(U, //warm_start=//true);
- *   3) const mfem::ParGridFunction& sigma = igr.GetSigma();
+ * Solve options:
+ *  - Legacy: a few preconditioned Richardson smoother sweeps (fast/approx)
+ *  - Recommended: MFEM Krylov solve to tolerance (CG/GMRES + preconditioner)
  */
 class IGRSolver
 {
 public:
-  /// Available smoother types for the fixed-iteration “few sweeps” update.
-  enum class SmootherType { Jacobi, L1Jacobi };
-  // enum class SmootherType { Jacobi, L1Jacobi, Chebyshev };
+  /// Available smoother types used either for legacy sweeps or as a smoother-preconditioner.
+  enum class SmootherType { Jacobi, L1Jacobi, L1GS, L1GStr, GS };
 
   /// Gradient construction backend for the RHS (∇u terms).
   enum class GradBackend { H1Projection, BrokenDG /*, WeakRT, BR2 */ };
@@ -32,6 +32,15 @@ public:
   /// Interior-penalty DG flavor for the diffusion operator on DG spaces.
   /// Values map to DGDiffusionIntegrator's kappa parameter: -1 (SIPG), 0 (IIPG), +1 (NIPG).
   enum class IPKind { SIPG = -1, IIPG = 0, NIPG = +1 };
+
+  /// How to solve A x = b each update.
+  enum class SolveMode { SmootherSweeps, Krylov };
+
+  /// Krylov solver choice.
+  enum class LinearSolverType { Auto, CG, GMRES };
+
+  /// Preconditioner choice.
+  enum class PrecondType { Auto, BoomerAMG, HypreSmoother, None };
 
   /**
    * @brief Construct an IGR solver.
@@ -48,12 +57,6 @@ public:
   /// Set regularization parameter α.
   void SetAlpha(double a);
 
-  /// Select smoother type (default: L1Jacobi for parallel robustness).
-  void SetSmoother(SmootherType t);
-
-  /// Set sweep counts: regular per-call sweeps and warm-start sweeps for the first call.
-  void SetSweeps(int regular_sweeps, int warm_start_sweeps);
-
   /// Clamp for ρ to avoid division by very small numbers (default 1e-12).
   void SetRhoFloor(double rho_floor);
 
@@ -64,20 +67,25 @@ public:
   void SetGradBackend(GradBackend b) { backend_ = b; }
   void SetIPKind(IPKind k) { ip_kind_ = k; }
 
-  /**
-   * @brief Assemble and apply ≤N smoother sweeps to update Σ from current state U.
-   *
-   * Forms the linear system A(Σ)=b where:
-   *   A = ( (1/ρ)·,· ) + α ( (1/ρ)∇·,∇· )  [with IPDG face terms if Σ-space is DG]
-   *   b = α ( ||∇u||_F^2 + (∇·u)^2 , · )
-   *
-   * Uses the previously computed Σ as initial guess if warm_start=true,
-   * then performs a small, fixed number of smoother iterations.
-   *
-   * @param U           Conservative state as a vector ParGridFunction (vdim=num_eq).
-   * @param warm_start  If true, use the current Σ as initial guess and take
-   *                    warm_start_sweeps on the first call; otherwise use regular_sweeps.
-   */
+  // ---- Legacy smoother-sweep knobs (still supported) ----
+  void SetSmoother(SmootherType t);
+  void SetSweeps(int regular_sweeps, int warm_start_sweeps);
+
+  // ---- Recommended Krylov-solve knobs ----
+  void SetSolveMode(SolveMode m) { solve_mode_ = m; }
+  void SetLinearSolver(LinearSolverType s) { lin_solver_type_ = s; }
+  void SetPreconditioner(PrecondType p) { prec_type_ = p; }
+
+  /// Set solve tolerances and iteration cap (used in Krylov mode).
+  void SetLinearSolveParams(double rel_tol, double abs_tol, int max_it, int print_level = 0)
+  {
+    lin_rtol_  = rel_tol;
+    lin_atol_  = abs_tol;
+    lin_maxit_ = max_it;
+    lin_print_ = print_level;
+  }
+
+  /// Update Σ from the current state U.
   void UpdateFromState(const mfem::ParGridFunction& U, bool warm_start);
 
   /// Access the current Σ field.
@@ -115,7 +123,7 @@ private:
                                 double rho_floor);
     void SetState(const mfem::ParGridFunction* U) { U_ = U; }
     void SetRhoFloor(double f) { rho_floor_ = f; }
-    virtual void Eval(mfem::Vector &V,
+    void Eval(mfem::Vector &V,
               mfem::ElementTransformation &T,
               const mfem::IntegrationPoint &ip) override;
   private:
@@ -159,9 +167,8 @@ private:
 
   // ---------- Core assemble/apply helpers ----------
   void AssembleSystem(const mfem::ParGridFunction& U); // fill A and b for current U
-  void DoSmootherSweeps(int sweeps, bool warm_start);  // ≤N sweeps with chosen smoother
-
-  // Build / update the H1 vector space used by the H1Projection backend.
+  void DoSmootherSweeps(int sweeps, bool warm_start);   // legacy
+  void SolveEllipticSystem_(bool warm_start);           // new recommended path
   void EnsureH1VelocitySpace_();
 
   // ---------- Data ----------
@@ -169,14 +176,25 @@ private:
   const mfem::ParFiniteElementSpace& vfes_;  // vector state U space (vdim=num_eq)
   int dim_, num_eq_;
   double alpha_       = 0.0;
-  double rho_floor_   = 1e-12;
+  double rho_floor_   = 5.0e-7;
   SmootherType smoot_ = SmootherType::L1Jacobi;
-  GradBackend backend_ = GradBackend::H1Projection;
-  IPKind      ip_kind_ = IPKind::SIPG; // default SPD
+  GradBackend  backend_ = GradBackend::H1Projection;
+  IPKind       ip_kind_ = IPKind::SIPG; //default SPD
 
-  int  regular_sweeps_     = 3;
-  int  warm_start_sweeps_  = 5;
-  bool first_call_         = true;
+  // Legacy sweeps
+  int  regular_sweeps_    = 3;
+  int  warm_start_sweeps_ = 5;
+  bool first_call_        = true;
+
+  // New solve controls
+  SolveMode        solve_mode_      = SolveMode::Krylov;
+  LinearSolverType lin_solver_type_ = LinearSolverType::Auto;
+  PrecondType      prec_type_       = PrecondType::Auto;
+
+  double lin_rtol_ = 1e-8;
+  double lin_atol_ = 0.0;
+  int    lin_maxit_ = 200;
+  int    lin_print_ = 0;
 
   // Σ field
   mfem::ParGridFunction sigma_;

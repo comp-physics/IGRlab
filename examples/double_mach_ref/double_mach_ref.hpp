@@ -186,7 +186,7 @@ inline mfem::VectorFunctionCoefficient DoubleMachReflectionInitialCondition(
    // M * (1 - ρ_a/ρ_b); with c_a = sqrt(γ p_a / ρ_a) = 1 here.
    const double u_mag_b = M * (1.0 - rho_a / rho_b);
    const double ux_b    = u_mag_b * std::cos(angle);
-   const double uy_b    = u_mag_b * std::sin(angle);
+   const double uy_b    = -u_mag_b * std::sin(angle);
 
    const double mu_b_x  = rho_b * ux_b;
    const double mu_b_y  = rho_b * uy_b;

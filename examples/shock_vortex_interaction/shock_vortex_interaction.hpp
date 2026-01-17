@@ -361,7 +361,7 @@ inline std::function<void(const Vector&, Vector&)> GetShockVortexInoueHattoriIni
 
    const real_t dX = Lx / static_cast<real_t>(mx);
    const real_t dY = Ly / static_cast<real_t>(my);
-   const real_t delta_phys = 3.0 * std::min(dX, dY); // smooth shock width
+   const real_t delta_phys = 2.0 * std::min(dX, dY); // smooth shock width
 
    // --- Upstream base state U1 (to the right, X > 0) ---
    const real_t rho1 = 1.0;

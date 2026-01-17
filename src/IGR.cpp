@@ -1,5 +1,6 @@
 #include "IGR.hpp"
 #include <cmath>
+#include <algorithm>
 
 using namespace mfem;
 
@@ -24,6 +25,19 @@ inline double IPDGPenalty(const mfem::FiniteElementSpace &fes, double Cbase = 4.
 {
   const int p = SpaceOrder(fes);
   return Cbase * (p + 1) * (p + 1);
+}
+
+inline bool IsSPD_DefaultAssumption(const mfem::FiniteElementSpace &sfes,
+                                   IGRSolver::IPKind ip_kind)
+{
+  // Safe heuristic:
+  //  - H1 space with symmetric bilinear form => SPD
+  //  - DG diffusion is SPD under SIPG (kappa = -1), but can be nonsymmetric for NIPG.
+  if (IsDGSpace(sfes))
+  {
+    return (ip_kind == IGRSolver::IPKind::SIPG);
+  }
+  return true; // H1: mass + diffusion -> SPD
 }
 
 } // namespace
@@ -91,7 +105,7 @@ double IGRSolver::SigmaSourceCoefficient::Eval(ElementTransformation &T,
 
     // div u
     double divu = 0.0;
-    for (int i = 0; i < dim_; ++i) divu += gradv(i,i);
+    for (int i = 0; i < dim_; ++i) { divu += gradv(i,i); }
 
     // tr((∇u)^2) = sum_ij (∂_j u_i)(∂_i u_j)
     double trA2 = 0.0;
@@ -322,16 +336,17 @@ void IGRSolver::AssembleSystem(const ParGridFunction& U)
 
 void IGRSolver::DoSmootherSweeps(int sweeps, bool /*warm_start*/)
 {
-  // We expect a Hypre matrix here
   HypreParMatrix *A_hypre = Ah_.As<HypreParMatrix>();
   MFEM_VERIFY(A_hypre != nullptr, "IGR: Assembled operator is not HypreParMatrix.");
 
   HypreSmoother S(*A_hypre);
   switch (smoot_)
   {
-    case SmootherType::Jacobi:    S.SetType(HypreSmoother::Jacobi);    break;
-    case SmootherType::L1Jacobi:  S.SetType(HypreSmoother::l1Jacobi);  break;
-    // case SmootherType::Chebyshev: S.SetType(HypreSmoother::Chebyshev); break;
+    case SmootherType::Jacobi:    S.SetType(HypreSmoother::Jacobi);   break;
+    case SmootherType::L1Jacobi:  S.SetType(HypreSmoother::l1Jacobi); break;
+    case SmootherType::L1GS:      S.SetType(HypreSmoother::l1GS);     break;
+    case SmootherType::L1GStr:    S.SetType(HypreSmoother::l1GStr);   break;
+    case SmootherType::GS:        S.SetType(HypreSmoother::GS);       break;
   }
   S.SetPositiveDiagonal(true);
 
@@ -351,7 +366,89 @@ void IGRSolver::DoSmootherSweeps(int sweeps, bool /*warm_start*/)
     X_ += z;
   }
 
-  // Scatter back to FE space
+  a_->RecoverFEMSolution(X_, *b_, sigma_);
+}
+
+void IGRSolver::SolveEllipticSystem_(bool warm_start)
+{
+  HypreParMatrix *A = Ah_.As<HypreParMatrix>();
+  MFEM_VERIFY(A != nullptr, "IGR: Assembled operator is not HypreParMatrix.");
+
+  MPI_Comm comm = sfes_.GetComm();
+  const bool is_dg  = IsDGSpace(sfes_);
+  const bool spd_ok = IsSPD_DefaultAssumption(sfes_, ip_kind_);
+
+  // --- Choose solver (Auto -> CG if SPD, else GMRES) ---
+  LinearSolverType solver_choice = lin_solver_type_;
+  if (solver_choice == LinearSolverType::Auto)
+  {
+    solver_choice = spd_ok ? LinearSolverType::CG : LinearSolverType::GMRES;
+  }
+
+  // --- Choose preconditioner (Auto -> AMG for H1, smoother for DG) ---
+  PrecondType prec_choice = prec_type_;
+  if (prec_choice == PrecondType::Auto)
+  {
+    prec_choice = (!is_dg) ? PrecondType::BoomerAMG : PrecondType::HypreSmoother;
+  }
+
+  std::unique_ptr<Solver> prec;
+  if (prec_choice == PrecondType::BoomerAMG)
+  {
+    auto amg = std::make_unique<HypreBoomerAMG>(*A);
+    // Typical AMG-as-preconditioner settings
+    amg->SetPrintLevel(0);
+    amg->SetMaxIter(1);
+    amg->SetTol(0.0);
+    prec = std::move(amg);
+  }
+  else if (prec_choice == PrecondType::HypreSmoother)
+  {
+    auto sm = std::make_unique<HypreSmoother>(*A);
+    switch (smoot_)
+    {
+      case SmootherType::Jacobi:   sm->SetType(HypreSmoother::Jacobi);   break;
+      case SmootherType::L1Jacobi: sm->SetType(HypreSmoother::l1Jacobi); break;
+      case SmootherType::L1GS:     sm->SetType(HypreSmoother::l1GS);     break;
+      case SmootherType::L1GStr:   sm->SetType(HypreSmoother::l1GStr);   break;
+      case SmootherType::GS:       sm->SetType(HypreSmoother::GS);       break;
+    }
+    sm->SetPositiveDiagonal(true);
+    prec = std::move(sm);
+  }
+  // else None -> leave prec null
+
+  if (solver_choice == LinearSolverType::CG)
+  {
+    CGSolver solver(comm);
+    solver.SetOperator(*A);
+    if (prec) { solver.SetPreconditioner(*prec); }
+
+    solver.SetRelTol(lin_rtol_);
+    solver.SetAbsTol(lin_atol_);
+    solver.SetMaxIter(lin_maxit_);
+    solver.SetPrintLevel(lin_print_);
+
+    // IMPORTANT: use warm-start guess X_ from FormLinearSystem if requested
+    // solver.SetInitialGuess(warm_start);
+
+    solver.Mult(B_, X_);
+  }
+  else // GMRES
+  {
+    GMRESSolver solver(comm);
+    solver.SetOperator(*A);
+    if (prec) { solver.SetPreconditioner(*prec); }
+
+    solver.SetRelTol(lin_rtol_);
+    solver.SetAbsTol(lin_atol_);
+    solver.SetMaxIter(lin_maxit_);
+    solver.SetPrintLevel(lin_print_);
+    // solver.iterative_mode = warm_start;
+
+    solver.Mult(B_, X_);
+  }
+
   a_->RecoverFEMSolution(X_, *b_, sigma_);
 }
 
@@ -360,11 +457,17 @@ void IGRSolver::UpdateFromState(const ParGridFunction& U, bool warm_start)
   // Assemble A and b for current state U (warm-start handled by FormLinearSystem)
   AssembleSystem(U);
 
-  // Decide sweep count
-  const int sweeps = (first_call_ && warm_start)
-                     ? std::max(warm_start_sweeps_, regular_sweeps_)
-                     : regular_sweeps_;
+  if (solve_mode_ == SolveMode::SmootherSweeps)
+  {
+    const int sweeps = (first_call_ && warm_start)
+                       ? std::max(warm_start_sweeps_, regular_sweeps_)
+                       : regular_sweeps_;
+    DoSmootherSweeps(sweeps, warm_start);
+  }
+  else
+  {
+    SolveEllipticSystem_(warm_start);
+  }
 
-  DoSmootherSweeps(sweeps, warm_start);
   first_call_ = false;
 }

@@ -266,9 +266,9 @@ int main(int argc, char *argv[])
    vk.gamma = 1.4;
    vk.slope_qord = 2*vfes.GetFE(0)->GetOrder() + 2;
    vk.eps_kappa  = 100.0;        // increase to be less aggressive
-   // rk3.AddCharVenkatXYLimiter(vk);
+   rk3.AddCharVenkatXYLimiter(vk);
    // // Or face-normal variant for general meshes:
-   rk3.AddCharVenkatFaceNormalLimiter(vk);
+   // rk3.AddCharVenkatFaceNormalLimiter(vk);
    // 2) Krivodonova hierarchical modal limiter (keeps high order away from shocks)
    // KrivoOptions krivo;
    // krivo.dim = 2;
@@ -290,8 +290,8 @@ int main(int argc, char *argv[])
    MPI_Allreduce(MPI_IN_PLACE, &hmin_alpha, 1,
                MPITypeMap<real_t>::mpi_type, MPI_MIN, pmesh.GetComm());
    // Effective spacing for DG(p): Δx_eff ≈ h / (p+1)
-   const double dx_eff = hmin_alpha / (order + 1);
-   // const double dx_eff = hmin_alpha ;
+   // const double dx_eff = hmin_alpha / (order + 1);
+   const double dx_eff = hmin_alpha ;
    // Choose a constant Cα (start with 1.0 for sharp resolution but more ringing, 3-10 generally)
    // const double C_alpha = 1.0;
    double C_alpha = (C_alpha_user > 0.0) ? C_alpha_user : 1.0;
@@ -315,7 +315,9 @@ int main(int argc, char *argv[])
    igr.SetRhoFloor(rho_floor);
    // igr.SetSmoother(IGRSolver::SmootherType::Jacobi);
    igr.SetSmoother(IGRSolver::SmootherType::L1Jacobi);
-   igr.SetSweeps(/*regular=*/3, /*warm_start=*/3);
+   // igr.SetSweeps(/*regular=*/1000, /*warm_start=*/1000);
+   igr.SetSolveMode(IGRSolver::SolveMode::Krylov); // default in the new header
+   igr.SetLinearSolveParams(1e-8, 0.0, 1000, /*print=*/0);
 
    MFEM_ASSERT(fes.GetOrdering() == Ordering::byNODES, "");
 
@@ -411,10 +413,12 @@ int main(int argc, char *argv[])
    //    base_op.SetVolumeMode(VolumeMode::WeakDivergence);
 
    // BC markers (1=bottom, 2=right, 3=top, 4=left, 5=circle)
-   Array<int> inlet_bdr, outlet_bdr, slip_bdr;
-   MakeMarker(inlet_bdr, pmesh, {4});
-   MakeMarker(outlet_bdr, pmesh, {2,3});
-   MakeMarker(slip_bdr, pmesh, {1}); 
+   Array<int> bottom_inlet_bdr, bottom_wall_bdr, outlet_bdr, top_bdr, inlet_bdr;
+   MakeMarker(bottom_inlet_bdr, pmesh, {1}); // bottom_left
+   MakeMarker(bottom_wall_bdr,  pmesh, {5}); // bottom_right
+   MakeMarker(outlet_bdr,        pmesh, {2});
+   MakeMarker(top_bdr,          pmesh, {3});
+   MakeMarker(inlet_bdr,         pmesh, {4});
 
    base_op.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
@@ -425,12 +429,22 @@ int main(int argc, char *argv[])
       new BdrHyperbolicFluxIntegrator(numericalFlux,
                                     std::make_unique<SupersonicOutletState>(),
                                     IntOrderOffset),
+      bottom_inlet_bdr);
+   base_op.AddBdrFaceIntegrator(
+      new BdrHyperbolicFluxIntegrator(numericalFlux,
+                                    std::make_unique<SupersonicOutletState>(),
+                                    IntOrderOffset),
       outlet_bdr);
+   base_op.AddBdrFaceIntegrator(
+      new BdrHyperbolicFluxIntegrator(numericalFlux,
+                                    std::make_unique<SupersonicOutletState>(),
+                                    IntOrderOffset),
+      top_bdr);
    base_op.AddBdrFaceIntegrator(
       new BdrHyperbolicFluxIntegrator(numericalFlux,
                                     std::make_unique<SlipWallState>(dim),
                                     IntOrderOffset),
-      slip_bdr);
+      bottom_wall_bdr);
 
    // 7. Visualization
    igr.UpdateFromState(sol, /*warm_start=*/false);
@@ -563,7 +577,7 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
    // ode_solver->Init(wrapped);
    rk3.Init(wrapped);
    rk3.LimitInitial(true);
-   rk3.SetLimiterSteps(100);
+   rk3.SetLimiterSteps(0);
 
    bool done = false;
    for (int ti = 0; !done;)
@@ -598,6 +612,10 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
       ti++;
 
       done = (t >= t_final - 1e-8 * dt);
+
+      if (std::isnan(dt_real)){
+         break;
+      }
 
       // (optional) GLVis still by step cadence
       if (done || ti % vis_steps == 0)

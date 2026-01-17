@@ -290,8 +290,8 @@ int main(int argc, char *argv[])
    MPI_Allreduce(MPI_IN_PLACE, &hmin_alpha, 1,
                MPITypeMap<real_t>::mpi_type, MPI_MIN, pmesh.GetComm());
    // Effective spacing for DG(p): Δx_eff ≈ h / (p+1)
-   const double dx_eff = hmin_alpha / (order + 1);
-   // const double dx_eff = hmin_alpha ;
+   // const double dx_eff = hmin_alpha / (order + 1);
+   const double dx_eff = hmin_alpha ;
    // Choose a constant Cα (start with 1.0 for sharp resolution but more ringing, 3-10 generally)
    // const double C_alpha = 1.0;
    double C_alpha = (C_alpha_user > 0.0) ? C_alpha_user : 1.0;
@@ -315,7 +315,9 @@ int main(int argc, char *argv[])
    igr.SetRhoFloor(rho_floor);
    // igr.SetSmoother(IGRSolver::SmootherType::Jacobi);
    igr.SetSmoother(IGRSolver::SmootherType::L1Jacobi);
-   igr.SetSweeps(/*regular=*/3, /*warm_start=*/3);
+   // igr.SetSweeps(/*regular=*/1000, /*warm_start=*/1000);
+   igr.SetSolveMode(IGRSolver::SolveMode::Krylov); // default in the new header
+   igr.SetLinearSolveParams(1e-8, 0.0, 1000, /*print=*/0);
 
    MFEM_ASSERT(fes.GetOrdering() == Ordering::byNODES, "");
 
@@ -347,6 +349,8 @@ int main(int argc, char *argv[])
    const int total_ref  = ser_ref_levels + par_ref_levels;
    const int mx = base_cells << total_ref;
    const int my = base_cells << total_ref;
+   // const int mx = base_cells;
+   // const int my = base_cells;
    VectorFunctionCoefficient u0 = ShockVortexInoueHattoriInitialCondition(
       /*gamma=*/1.4, 
       /*mx*/ mx, 
@@ -574,6 +578,7 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
    // wrapped.SetTime(t);
    // ode_solver->Init(wrapped);
    rk3.Init(wrapped);
+   rk3.LimitInitial(false);
    rk3.SetLimiterSteps(0);
 
    bool done = false;
@@ -609,6 +614,10 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
       ti++;
 
       done = (t >= t_final - 1e-8 * dt);
+
+      if (std::isnan(dt_real)){
+         break;
+      }
 
       // (optional) GLVis still by step cadence
       if (done || ti % vis_steps == 0)
