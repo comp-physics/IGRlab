@@ -45,6 +45,7 @@
 mfem/
 scratch/
 tpls/
+tpl
 data/
 build
 */*/build/
@@ -53,4 +54,5 @@ build
 MFEM_examples/
 notes/
 .DS_Store
+.spack-env
 # supersonic_example/backup
