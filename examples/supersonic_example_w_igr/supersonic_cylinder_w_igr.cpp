@@ -290,8 +290,8 @@ int main(int argc, char *argv[])
    MPI_Allreduce(MPI_IN_PLACE, &hmin_alpha, 1,
                MPITypeMap<real_t>::mpi_type, MPI_MIN, pmesh.GetComm());
    // Effective spacing for DG(p): Δx_eff ≈ h / (p+1)
-   const double dx_eff = hmin_alpha / (order + 1);
-   // const double dx_eff = hmin_alpha ;
+   // const double dx_eff = hmin_alpha / (order + 1);
+   const double dx_eff = hmin_alpha ;
    // Choose a constant Cα (start with 1.0 for sharp resolution but more ringing, 3-10 generally)
    // const double C_alpha = 1.0;
    double C_alpha = (C_alpha_user > 0.0) ? C_alpha_user : 1.0;
@@ -313,9 +313,11 @@ int main(int argc, char *argv[])
       igr.SetGradBackend(IGRSolver::GradBackend::BrokenDG);
    }
    igr.SetRhoFloor(rho_floor);
-   // igr.SetSmoother(IGRSolver::SmootherType::Jacobi);
-   igr.SetSmoother(IGRSolver::SmootherType::L1Jacobi);
-   igr.SetSweeps(/*regular=*/3, /*warm_start=*/3);
+   // igr.SetSmoother(IGRSolver::SmootherType::L1Jacobi);
+   igr.SetSmoother(IGRSolver::SmootherType::L1GS);
+   // igr.SetSweeps(/*regular=*/5, /*cold_start=*/100);
+   igr.SetSolveMode(IGRSolver::SolveMode::Krylov); // default in the new header
+   igr.SetLinearSolveParams(1e-8, 0.0, 1000, /*print=*/0);
 
    MFEM_ASSERT(fes.GetOrdering() == Ordering::byNODES, "");
 
@@ -335,15 +337,72 @@ int main(int argc, char *argv[])
    Uin(1) = 1.4 * vx_in;
    Uin(2) = 1.4 * vy_in;
    Uin(3) = 8.8;
+   real_t gamma = 1.4;
+   // mfem::Vector Uamb(4);
+   // Uamb(0) = 1.4;
+   // Uamb(1) = 0.0;
+   // Uamb(2) = 0.0;
+   // Uamb(3) = 2.5;
    // VectorFunctionCoefficient u0 = EulerInitialCondition(Uin);
-   // Geometry parameters for your cylinder mesh
-   const double xc    = 0.6;   // <-- set to your actual cylinder center x
-   const double yc    = 0.0;   // <-- set to your actual cylinder center y
-   const double r_cyl = 0.25;   // <-- set to your cylinder radius
-   const double delta = 0.5*r_cyl; // smoothing length (tune as desired)
-   // New smoothed IC
-   mfem::VectorFunctionCoefficient u0 =
-      SupersonicCylinderSmoothedVelocityIC(Uin, xc, yc, r_cyl, delta);
+   // Ambient still chamber state: you can either:
+   // A) use defaults: rho_amb=rho_in and p_amb=p_inferred (common if you nondimensionalized that way)
+   // or
+   // B) explicitly set ambient, e.g. rho=1.4, p=1.0
+   const double x_s   = 0.2;  // move it inward
+   const double delta = hmin_alpha * 15;         // choose ~2–4 element widths
+   // mfem::VectorFunctionCoefficient u0 =
+   // mfem::InflowBufferIC_2D(Uin, 1.4, x_s, delta);
+   // double rho_amb = 0.0, p_amb = 0.0;
+   // AmbientFromUin_IsentropicSimpleWaveToRest_2D(Uin, 1.4, rho_amb, p_amb);
+   // mfem::VectorFunctionCoefficient u0 =
+   // SmoothInflowBufferIC_2D(Uin, 1.4, rho_amb, p_amb, x_s, delta);
+   //////
+   const double rho_in = 1.0;
+   const double u_in   = vx_in;   // e.g. 3.0
+   const double v_in   = vy_in;   // e.g. 0.0
+   const double p_in   = 1.0;
+   mfem::Vector Uamb;
+   mfem::BuildInletAndAmbientStates_FromPrimitives(
+      rho_in, u_in, v_in, p_in, gamma, Uin, Uamb);
+   mfem::VectorFunctionCoefficient u0 = mfem::SmoothInflowBufferIC_2D(Uin, Uamb, gamma, x_s, delta);
+   //////
+   // mfem::VectorFunctionCoefficient u0 =
+   // mfem::SmoothSingleShockIC_FromUin_2D(Uin, gamma, x_s, delta);
+   // mfem::VectorFunctionCoefficient u0 =
+   // mfem::SmoothSingleShockIC_FromUin_2D(Uin, gamma, x_s, delta);
+   // VectorFunctionCoefficient u0 = ForwardFacingStepQuiescentShockIC(Uin,
+   // 1.4,
+   // 1,
+   // dx_eff * 2,
+   // 0.15);
+   // // Geometry parameters for your cylinder mesh
+   // const double xc    = 0.6;   // <-- set to your actual cylinder center x
+   // const double yc    = 0.0;   // <-- set to your actual cylinder center y
+   // const double r_cyl = 0.25;   // <-- set to your cylinder radius
+   // const double delta = 0.5*r_cyl; // smoothing length (tune as desired)
+   // // New smoothed IC
+   // mfem::VectorFunctionCoefficient u0 =
+   //    SupersonicCylinderSmoothedVelocityIC(Uin, xc, yc, r_cyl, delta);
+   // const double x0    = 0.15;   // shock centered at x=0
+   // const double delta = 0.05;  // smoothing thickness
+   // mfem::VectorFunctionCoefficient u0 =
+   // mfem::SmoothShockIC_FromUinToQuiescent(Uin, 1.4, x0, delta);
+   // const double gamma = 1.4;
+   // // --- Choose your ambient (still chamber) thermodynamics ---
+   // const double rho_amb = 1.4;
+   // const double p_amb   = 1.0;
+   // // --- Your driven/inlet velocity (Mach-3-ish if u≈3 and a=1 with this scaling) ---
+   // const double u_in = vx_in;
+   // const double v_in = vy_in;
+   // // Build conservative inlet state CONSISTENTLY (energy computed from rho,u,v,p)
+   // mfem::Vector Uin  = MakeEulerCons2D(rho_amb, u_in, v_in, p_amb, gamma);
+   // // Still chamber (quiescent) conservative state
+   // mfem::Vector Uamb = MakeEulerCons2D(rho_amb, 0.0, 0.0, p_amb, gamma);
+   // // --- IC: smooth blast front from Uin (left) -> Uamb (right) ---
+   // const double x0_ic   = 0.15;   // where the front starts at t=0
+   // const double delta_x = 0.05;  // smoothing thickness (pick ~2–4 elements)
+   // mfem::VectorFunctionCoefficient u0 =
+   //    SmoothBlastIC_2D(Uin, Uamb, gamma, x0_ic, delta_x);
    ParGridFunction sol(&vfes);
    sol.ProjectCoefficient(u0);
    ParGridFunction mom(&dfes, sol.GetData() + fes.GetNDofs());
@@ -570,7 +629,8 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
    // wrapped.SetTime(t);
    // ode_solver->Init(wrapped);
    rk3.Init(wrapped);
-   rk3.SetLimiterSteps(100);
+   rk3.LimitInitial(false);
+   rk3.SetLimiterSteps(0);
 
    bool done = false;
    for (int ti = 0; !done;)
@@ -605,6 +665,10 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
       ti++;
 
       done = (t >= t_final - 1e-8 * dt);
+
+      if (std::isnan(dt_real)){
+         break;
+      }
 
       // (optional) GLVis still by step cadence
       if (done || ti % vis_steps == 0)

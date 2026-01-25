@@ -9,6 +9,63 @@
 namespace mfem
 {
 
+// ============================================================================
+//  Euler utility conversions: Primitive ↔ Conservative
+// ============================================================================
+// Primitives: [ρ, u, v, (w), p]
+// Conserved:  [ρ, ρu, ρv, (ρw), ρE]
+// Equation of state: p = (γ - 1)(ρE - ½ρ|u|²)
+// ============================================================================
+
+inline void PrimToCons(const mfem::Vector &prim,
+                       mfem::Vector &cons,
+                       int dim,
+                       double gamma)
+{
+   MFEM_VERIFY(prim.Size() >= dim + 2, "Primitive state must have [rho, u(0..dim-1), p]");
+   MFEM_VERIFY(cons.Size() >= dim + 2, "Conservative state must have [rho, rho*u(0..dim-1), rhoE]");
+
+   const double rho = prim(0);
+   double kinetic = 0.0;
+   for (int d = 0; d < dim; ++d)
+   {
+      const double u = prim(1 + d);
+      cons(1 + d) = rho * u;
+      kinetic += 0.5 * u * u;
+   }
+   const double p = prim(1 + dim);
+   const double E = p / ((gamma - 1.0) * rho) + kinetic;
+
+   cons(0) = rho;
+   cons(1 + dim) = rho * E;
+}
+
+inline void ConsToPrim(const mfem::Vector &cons,
+                       mfem::Vector &prim,
+                       int dim,
+                       double gamma)
+{
+   MFEM_VERIFY(cons.Size() >= dim + 2, "Conservative state must have [rho, rho*u(0..dim-1), rhoE]");
+   MFEM_VERIFY(prim.Size() >= dim + 2, "Primitive state must have [rho, u(0..dim-1), p]");
+
+   const double rho = cons(0);
+   prim(0) = rho;
+
+   double vel2 = 0.0;
+   for (int d = 0; d < dim; ++d)
+   {
+      const double m = cons(1 + d);
+      const double u = m / rho;
+      prim(1 + d) = u;
+      vel2 += u * u;
+   }
+
+   const double E = cons(1 + dim) / rho;
+   const double p = (gamma - 1.0) * rho * (E - 0.5 * vel2);
+   prim(1 + dim) = p;
+}
+
+
 // Helper: make a boundary marker from a set of attribute ids {a1, a2, ...}
 // Example: MakeMarker(pmesh, {4}) creates a marker with only attribute 4 active.
 static void MakeMarker(mfem::Array<int> &marker,

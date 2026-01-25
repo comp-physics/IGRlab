@@ -215,7 +215,8 @@ int main(int argc, char *argv[])
    //                                    /*sensor_max=*/1.0);
    // ComponentwiseUpwindFlux numericalSurfFlux(flux);
    DGHyperbolicConservationLaws euler(
-      vfes, std::unique_ptr<HyperbolicFormIntegrator>(
+      vfes, 
+      std::unique_ptr<HyperbolicFormIntegrator>(
          new HyperbolicFormIntegrator(numericalFlux, IntOrderOffset)),
       preassembleWeakDiv);
 
