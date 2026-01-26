@@ -1,5 +1,5 @@
-# Collect all source files
-file(GLOB SOURCES "*.cpp")
+# Collect all source files (including module subdirectories)
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "*.cpp")
 
 # Create library
 add_library(igr_mfem STATIC ${SOURCES})

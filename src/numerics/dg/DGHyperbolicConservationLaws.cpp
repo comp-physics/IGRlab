@@ -25,7 +25,7 @@
 //    weak-divergence matrices, recomputed in Update() if needed.
 //
 
-#include "DGHyperbolicConservationLaws.hpp"
+#include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 
 namespace mfem
 {

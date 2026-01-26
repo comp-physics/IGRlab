@@ -6,4 +6,9 @@
  * @ingroup numerics_limiters
  */
 
-#include "../../limiters.hpp"
+#include "utils/config/limiter_config.hpp"
+#include "numerics/limiters/zhang_shu.hpp"
+#include "numerics/limiters/tvb.hpp"
+#include "numerics/limiters/bj.hpp"
+#include "numerics/limiters/venkat.hpp"
+#include "numerics/limiters/krivodonova.hpp"

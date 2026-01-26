@@ -1,7 +1,10 @@
-#include "IGR.hpp"
-#include <cmath>
+#include "physics/igr/IGR.hpp"
 #include <algorithm>
+#include <cmath>
 
+
+namespace dg_igr
+{
 
 // ----------------- small helpers (file-local) -----------------
 namespace {
@@ -470,3 +473,5 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U, bool warm_start)
 
   first_call_ = false;
 }
+
+} // namespace dg_igr

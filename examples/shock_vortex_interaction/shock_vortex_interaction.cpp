@@ -260,7 +260,7 @@ int main(int argc, char *argv[])
    // Use the face-normal characteristic TVB (direction-invariant)
    // rk3.AddCharTVBFaceNormalLimiter(tvb);
    // (2) Regular characteristic Venkat (x/y)
-   VenkatOptions vk;
+   mfem::VenkatOptions vk;
    vk.dim = 2; 
    vk.gamma = 1.4;
    vk.slope_qord = 2*vfes.GetFE(0)->GetOrder() + 2;
@@ -297,25 +297,25 @@ int main(int argc, char *argv[])
    // α = Cα * (Δx_eff)^2
    const double alpha_igr = C_alpha * dx_eff * dx_eff;
    // Build IGR
-   IGRSolver igr(sfes, vfes, dim, num_equations, alpha_igr);
+   dg_igr::IGRSolver igr(sfes, vfes, dim, num_equations, alpha_igr);
    // Pick your gradient backend:
    if (igr_grad == "H1" || igr_grad == "h1")
    {
-      igr.SetGradBackend(IGRSolver::GradBackend::H1Projection);
+      igr.SetGradBackend(dg_igr::IGRSolver::GradBackend::H1Projection);
    }
    else if (igr_grad == "BrokenL2" || igr_grad == "broken" || igr_grad == "L2" || igr_grad == "l2")
    {
-      igr.SetGradBackend(IGRSolver::GradBackend::BrokenDG);
+      igr.SetGradBackend(dg_igr::IGRSolver::GradBackend::BrokenDG);
    }
    else
    {
-      igr.SetGradBackend(IGRSolver::GradBackend::BrokenDG);
+      igr.SetGradBackend(dg_igr::IGRSolver::GradBackend::BrokenDG);
    }
    igr.SetRhoFloor(rho_floor);
-   // igr.SetSmoother(IGRSolver::SmootherType::Jacobi);
-   igr.SetSmoother(IGRSolver::SmootherType::L1Jacobi);
+   // igr.SetSmoother(dg_igr::IGRSolver::SmootherType::Jacobi);
+   igr.SetSmoother(dg_igr::IGRSolver::SmootherType::L1Jacobi);
    // igr.SetSweeps(/*regular=*/1000, /*warm_start=*/1000);
-   igr.SetSolveMode(IGRSolver::SolveMode::Krylov); // default in the new header
+   igr.SetSolveMode(dg_igr::IGRSolver::SolveMode::Krylov); // default in the new header
    igr.SetLinearSolveParams(1e-8, 0.0, 1000, /*print=*/0);
 
    MFEM_ASSERT(fes.GetOrdering() == mfem::Ordering::byNODES, "");
@@ -361,7 +361,7 @@ int main(int argc, char *argv[])
    mfem::ParGridFunction mom_x(&fes, sol.GetData() + 1 * fes.GetNDofs());
    mfem::ParGridFunction mom_y(&fes, sol.GetData() + 2 * fes.GetNDofs());
    mfem::ParGridFunction energy(&fes, sol.GetData() + 3 * fes.GetNDofs());
-   PressureCoefficient pcoef(sol, dim, specific_heat_ratio);
+   mfem::PressureCoefficient pcoef(sol, dim, specific_heat_ratio);
    mfem::ParGridFunction press(&fes);
    press.ProjectCoefficient(pcoef);
    // --- Velocity/H1 diagnostics updater (call before plotting) ---
@@ -402,8 +402,8 @@ int main(int argc, char *argv[])
    // 6. Set up the nonlinear form with Euler flux wrapped by IGR
    mfem::EulerFlux base_flux(dim, specific_heat_ratio);
 
-   // IMPORTANT: mfem::FluxWithIGR must see the SAME mfem::ParGridFunction that IGRSolver updates.
-   // Assuming IGRSolver::GetSigma() returns mfem::ParGridFunction&.
+   // IMPORTANT: mfem::FluxWithIGR must see the SAME mfem::ParGridFunction that dg_igr::IGRSolver updates.
+   // Assuming dg_igr::IGRSolver::GetSigma() returns mfem::ParGridFunction&.
    // mfem::FluxWithIGR igr_flux(base_flux, &igr.GetSigma());
    mfem::FluxWithIGR igr_flux(base_flux);
    igr_flux.SetSigmaField(&igr.GetSigma());

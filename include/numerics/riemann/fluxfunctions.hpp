@@ -6,4 +6,7 @@
  * @ingroup numerics_riemann
  */
 
-#include "../../fluxfunctions.hpp"
+#include "numerics/riemann/face_side.hpp"
+#include "numerics/riemann/diffusive_rusanov.hpp"
+#include "numerics/riemann/rusanov.hpp"
+#include "numerics/riemann/hllc.hpp"

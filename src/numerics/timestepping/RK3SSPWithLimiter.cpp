@@ -1,5 +1,5 @@
-#include "timesteppers.hpp"
-#include "limiters.hpp"   // ApplyZhangShuPositivityLimiter, etc.
+#include "numerics/timestepping/RK3SSPWithLimiter.hpp"
+#include "numerics/limiters/limiters.hpp"   // ApplyZhangShuPositivityLimiter, etc.
 #include <algorithm>
 
 namespace mfem {
