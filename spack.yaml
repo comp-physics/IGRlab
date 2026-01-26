@@ -1,0 +1,12 @@
+spack:
+  specs:
+    # Build tools
+  - cmake
+  - mfem +mpi
+  - doxygen
+  - openmpi
+  packages:
+    all:
+      providers: 
+        mpi: [openmpi]
+  view: true

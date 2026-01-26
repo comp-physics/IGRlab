@@ -34,14 +34,19 @@ namespace mfem
 
 ///// Mesh Utilities
 
+inline const char* SupersonicCylinderIGRDefaultMeshPath()
+{
+   return "supersonic_cylinder.msh";
+}
+
 Mesh EulerMesh(const int problem)
 {
    switch (problem)
    {
       case 1:
-         return Mesh("supersonic_cylinder.msh");
+         return Mesh(SupersonicCylinderIGRDefaultMeshPath());
       case 2:
-         return Mesh("supersonic_cylinder.msh");
+         return Mesh(SupersonicCylinderIGRDefaultMeshPath());
       default:
          MFEM_ABORT("Problem Undefined");
    }

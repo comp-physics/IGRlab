@@ -36,6 +36,11 @@ namespace mfem
 
 ///// Mesh Utilities
 
+inline const char* StationaryShockDefaultMeshPath()
+{
+   return "stationary_shock.msh";
+}
+
 Mesh EulerMesh(const int problem)
 {
    switch (problem)
@@ -43,7 +48,7 @@ Mesh EulerMesh(const int problem)
       case 1:
       {
          // Shock–vortex: make y-periodic from the same base mesh
-         Mesh mesh("stationary_shock.msh"); // [0,1]x[0,1]
+         Mesh mesh(StationaryShockDefaultMeshPath()); // [0,1]x[0,1]
 
          // // We are in 2D; SpaceDimension() == 2
          // const int dim = mesh.SpaceDimension();
@@ -70,7 +75,7 @@ Mesh EulerMesh(const int problem)
       case 2:
       {
          // Shock–vortex: make y-periodic from the same base mesh
-         Mesh mesh("stationary_shock.msh"); // [0,1]x[0,1]
+         Mesh mesh(StationaryShockDefaultMeshPath()); // [0,1]x[0,1]
 
          // // We are in 2D; SpaceDimension() == 2
          // const int dim = mesh.SpaceDimension();

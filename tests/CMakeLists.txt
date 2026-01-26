@@ -1,0 +1,132 @@
+# Unit tests for dg_igr miniapp
+
+add_executable(dg_igr_unit_tests
+  unit_tests_main.cpp
+  test_euler.cpp
+  test_fluxes.cpp
+  test_limiters.cpp
+  test_dg_operator.cpp
+  test_bc.cpp
+  test_igr.cpp
+)
+
+target_link_libraries(dg_igr_unit_tests PRIVATE igr_mfem mfem)
+
+target_include_directories(dg_igr_unit_tests PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+)
+
+add_test(NAME dg_igr_euler_tests COMMAND dg_igr_unit_tests --euler)
+add_test(NAME dg_igr_flux_tests COMMAND dg_igr_unit_tests --fluxes)
+add_test(NAME dg_igr_limiter_tests COMMAND dg_igr_unit_tests --limiters)
+add_test(NAME dg_igr_dg_operator_tests COMMAND dg_igr_unit_tests --dg-operator)
+add_test(NAME dg_igr_bc_tests COMMAND dg_igr_unit_tests --bc)
+add_test(NAME dg_igr_igr_tests COMMAND dg_igr_unit_tests --igr)
+
+# MPI parity checks: generate a 1-rank reference and compare against 2 ranks.
+if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
+  set(DG_IGR_PARITY_REF_FILE "${CMAKE_BINARY_DIR}/tests/dg_igr_parity_ref.txt")
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+
+  add_test(NAME dg_igr_parity_ref_1rank
+    COMMAND ${CMAKE_COMMAND} -E env
+            DG_IGR_PARITY_REF=${DG_IGR_PARITY_REF_FILE}
+            DG_IGR_PARITY_WRITE=1
+            ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_unit_tests> --parity --all
+            ${MPIEXEC_POSTFLAGS}
+  )
+  set_tests_properties(dg_igr_parity_ref_1rank PROPERTIES
+    FIXTURES_SETUP dg_igr_parity_ref
+    LABELS "parity"
+    TIMEOUT 120
+  )
+
+  add_test(NAME dg_igr_parity_check_2rank
+    COMMAND ${CMAKE_COMMAND} -E env
+            DG_IGR_PARITY_REF=${DG_IGR_PARITY_REF_FILE}
+            ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_unit_tests> --parity --all
+            ${MPIEXEC_POSTFLAGS}
+  )
+  set_tests_properties(dg_igr_parity_check_2rank PROPERTIES
+    FIXTURES_REQUIRED dg_igr_parity_ref
+    LABELS "parity"
+    TIMEOUT 120
+  )
+endif()
+
+# Mini-regressions: run each example for a tiny time window with IO disabled.
+function(add_example_regression test_name target mesh_path_rel)
+  if (TARGET ${target})
+    set(reg_dir "${CMAKE_BINARY_DIR}/tests/regression/${test_name}")
+    file(MAKE_DIRECTORY "${reg_dir}")
+
+    # Allow per-test overrides without duplicating CLI flags.
+    set(reg_tf "1.0e-4")
+    set(reg_dt "1.0e-4")
+    set(extra_args "")
+    set(expect_tf OFF)
+    set(expect_dt OFF)
+    foreach(arg IN LISTS ARGN)
+      if (expect_tf)
+        set(reg_tf "${arg}")
+        set(expect_tf OFF)
+      elseif (expect_dt)
+        set(reg_dt "${arg}")
+        set(expect_dt OFF)
+      elseif (arg STREQUAL "REG_TF")
+        set(expect_tf ON)
+      elseif (arg STREQUAL "REG_DT")
+        set(expect_dt ON)
+      else()
+        list(APPEND extra_args "${arg}")
+      endif()
+    endforeach()
+    if (expect_tf OR expect_dt)
+      message(FATAL_ERROR "REG_TF/REG_DT must be followed by a value")
+    endif()
+
+    add_test(NAME ${test_name}
+      COMMAND $<TARGET_FILE:${target}>
+              -m ${CMAKE_SOURCE_DIR}/${mesh_path_rel}
+              -rs 0 -rp 0 -o 1 -tf ${reg_tf} -dt ${reg_dt} -c 0.0
+              -no-vis -vs 1000000 -nan-scan
+              ${extra_args}
+    )
+    set_tests_properties(${test_name} PROPERTIES
+      WORKING_DIRECTORY "${reg_dir}"
+      LABELS "regression"
+      TIMEOUT 180
+    )
+  endif()
+endfunction()
+
+add_example_regression(dg_igr_regression_supersonic
+  supersonic_cylinder
+  examples/supersonic_example/supersonic_cylinder.msh)
+add_example_regression(dg_igr_regression_supersonic_igr
+  supersonic_cylinder_w_igr
+  examples/supersonic_example_w_igr/supersonic_cylinder.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_forward_facing
+  forward_facing_step
+  examples/forward_facing_step/forward_facing.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_stationary_shock
+  stationary_shock
+  examples/stationary_shock/stationary_shock.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_shock_vortex
+  shock_vortex_interaction
+  examples/shock_vortex_interaction/shock_vortex.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_sedov
+  sedov_taylor_blast
+  examples/sedov_taylor_blast/sedov_taylor.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_double_mach
+  double_mach_ref
+  tests/meshes/double_mach_ref_regression.mesh
+  REG_TF 1.0e-6 REG_DT 1.0e-6
+  -no-vtk -dt_save 1.0)

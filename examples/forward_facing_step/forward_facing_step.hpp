@@ -34,14 +34,19 @@ namespace mfem
 
 ///// Mesh Utilities
 
+inline const char* ForwardFacingStepDefaultMeshPath()
+{
+   return "forward_facing.msh";
+}
+
 Mesh EulerMesh(const int problem)
 {
    switch (problem)
    {
       case 1:
-         return Mesh("forward_facing.msh");
+         return Mesh(ForwardFacingStepDefaultMeshPath());
       case 2:
-         return Mesh("forward_facing.msh");
+         return Mesh(ForwardFacingStepDefaultMeshPath());
       default:
          MFEM_ABORT("Problem Undefined");
    }

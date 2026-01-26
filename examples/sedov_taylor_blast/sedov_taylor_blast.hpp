@@ -36,14 +36,19 @@ namespace mfem
 
 ///// Mesh Utilities
 
+inline const char* SedovTaylorDefaultMeshPath()
+{
+   return "sedov_taylor.msh";
+}
+
 Mesh EulerMesh(const int problem)
 {
    switch (problem)
    {
       case 1:
-         return Mesh("sedov_taylor.msh");
+         return Mesh(SedovTaylorDefaultMeshPath());
       case 2:
-         return Mesh("sedov_taylor.msh");
+         return Mesh(SedovTaylorDefaultMeshPath());
       // You can add a new case here for the Sedov mesh if desired, e.g.:
       // case 3:
       //    return Mesh("sedov_taylor_blast.msh");

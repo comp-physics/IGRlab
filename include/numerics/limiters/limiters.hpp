@@ -12,3 +12,4 @@
 #include "numerics/limiters/bj.hpp"
 #include "numerics/limiters/venkat.hpp"
 #include "numerics/limiters/krivodonova.hpp"
+#include "numerics/limiters/limiter_pipeline.hpp"

@@ -59,7 +59,7 @@ void EulerLeftRightInDirection(const mfem::Vector &Ubar, double gamma,
 {
   // Build L_n ~= nx L_x + ny L_y and R_n ~= nx R_x + ny R_y (common approximation).
   const double rho = std::max(Ubar(0), 1e-16);
-  const double p   = PressureFromCons(Ubar, /*dim=*/2, gamma, /*rho_floor=*/0.0);
+  const double p   = EulerPressureFromConservative(Ubar, /*dim=*/2, gamma, /*rho_floor=*/0.0);
   const double c   = std::sqrt(std::max(gamma * p / rho, 0.0));
   const double H   = (Ubar(3) + p) / rho;
 

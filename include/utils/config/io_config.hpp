@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include "mfem.hpp"
 
 /**
  * @file utils/config/io_config.hpp
@@ -24,3 +25,23 @@ struct GLVisConfig
 };
 
 } // namespace vis
+
+namespace mfem
+{
+namespace io
+{
+
+/// @brief Configuration for ParaView/VTK output via ParaViewDataCollection.
+/// @ingroup io_visualization
+struct VTKOutputConfig
+{
+  std::string prefix_path = "vtk_output";     ///< Output directory prefix
+  mfem::VTKFormat format = mfem::VTKFormat::BINARY; ///< Output format
+  bool high_order_output = true;             ///< Preserve high-order data
+  int levels_of_detail = -1;                 ///< <0 keeps current DC setting
+  int cycle = 0;                             ///< Initial cycle index
+  double time = 0.0;                         ///< Initial time
+};
+
+} // namespace io
+} // namespace mfem

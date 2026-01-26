@@ -15,7 +15,7 @@ static inline double ThetaForPressure(const mfem::Vector &Ubar,
 {
   mfem::Vector Utest(Ubar.Size());
   Utest = Ubar; Utest.Add(theta_max, Up); Utest.Add(-theta_max, Ubar);
-  if (mfem::PressureFromCons(Utest, dim, gamma, /*rho_floor=*/1e-16) >= p_min)
+  if (mfem::EulerPressureFromConservative(Utest, dim, gamma, /*rho_floor=*/1e-16) >= p_min)
   { return theta_max; }
 
   double lo = 0.0, hi = theta_max;
@@ -23,7 +23,7 @@ static inline double ThetaForPressure(const mfem::Vector &Ubar,
   {
     const double mid = 0.5*(lo + hi);
     Utest = Ubar; Utest.Add(mid, Up); Utest.Add(-mid, Ubar);
-    const double p = mfem::PressureFromCons(Utest, dim, gamma, /*rho_floor=*/1e-16);
+    const double p = mfem::EulerPressureFromConservative(Utest, dim, gamma, /*rho_floor=*/1e-16);
     if (p >= p_min) { lo = mid; } else { hi = mid; }
   }
   return lo;
@@ -127,7 +127,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace &vfes,
       Tr->SetIntPoint(&ip);
       fe->CalcShape(ip, shape);
       elmat.MultTranspose(shape, Up); // current point state (after rho limit)
-      const double p = PressureFromCons(Up, dim, gamma, /*rho_floor=*/1e-16);
+      const double p = EulerPressureFromConservative(Up, dim, gamma, /*rho_floor=*/1e-16);
       if (p < p_min)
       {
         theta_p = std::min(theta_p,

@@ -34,14 +34,19 @@ namespace mfem
 
 ///// Mesh Utilities
 
+inline const char* DoubleMachRefDefaultMeshPath()
+{
+   return "double_mach_ref.msh";
+}
+
 Mesh EulerMesh(const int problem)
 {
    switch (problem)
    {
       case 1:
-         return Mesh("double_mach_ref.msh");
+         return Mesh(DoubleMachRefDefaultMeshPath());
       case 2:
-         return Mesh("double_mach_ref.msh");
+         return Mesh(DoubleMachRefDefaultMeshPath());
       default:
          MFEM_ABORT("Problem Undefined");
    }

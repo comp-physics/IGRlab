@@ -105,7 +105,7 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace &vfes,
     dg_igr::limiters_detail::Subtract(Uyp, Ubar, dry); dry /= std::max(dy,1e-16);
 
     const double rho = std::max(Ubar(0), 1e-16);
-    const double p   = PressureFromCons(Ubar, 2, opt.gamma, /*rho_floor=*/1e-16);
+    const double p   = EulerPressureFromConservative(Ubar, 2, opt.gamma, /*rho_floor=*/1e-16);
     const double c   = std::sqrt(std::max(opt.gamma*p/rho, 0.0));
     const double H   = (Ubar(3) + p)/rho;
 
