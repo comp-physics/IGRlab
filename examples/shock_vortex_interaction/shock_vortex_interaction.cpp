@@ -33,7 +33,7 @@
 //               method. An additional factor can be tuned by passing the --cfl
 //               (or -c shorter) flag.
 //
-//               The example demonstrates usage of DGHyperbolicConservationLaws
+//               The example demonstrates usage of mfem::DGHyperbolicConservationLaws
 //               that wraps NonlinearFormIntegrators containing element and face
 //               integration schemes. In this case the system also involves an
 //               external approximate Riemann solver for the DG interface flux.
@@ -57,39 +57,38 @@
 #include "limiters.hpp"
 #include "timesteppers.hpp"
 
-using namespace std;
-using namespace mfem;
+
 
 int main(int argc, char *argv[])
 {
    // 0. Parallel setup
-   Mpi::Init(argc, argv);
-   const int numProcs = Mpi::WorldSize();
-   const int myRank = Mpi::WorldRank();
-   Hypre::Init();
+   mfem::Mpi::Init(argc, argv);
+   const int numProcs = mfem::Mpi::WorldSize();
+   const int myRank = mfem::Mpi::WorldRank();
+   mfem::Hypre::Init();
 
    // 1. Parse command-line options.
    int problem = 1;
-   const real_t specific_heat_ratio = 1.4;
-   const real_t gas_constant = 1.0;
+   const mfem::real_t specific_heat_ratio = 1.4;
+   const mfem::real_t gas_constant = 1.0;
 
-   string mesh_file = "";
+   std::string mesh_file = "";
    int IntOrderOffset = 1; // Normally 1
    int ser_ref_levels = 0;
    int par_ref_levels = 1;
    int order = 3;
    int ode_solver_type = 4;
-   real_t t_final = 6.0;
-   real_t dt = -0.01;
-   real_t cfl = 0.3;
+   mfem::real_t t_final = 6.0;
+   mfem::real_t dt = -0.01;
+   mfem::real_t cfl = 0.3;
    bool visualization = true;
    bool preassembleWeakDiv = true;
    int vis_steps = 50;
    bool vtk_save = true;
-   real_t dt_save = 0.01;
+   mfem::real_t dt_save = 0.01;
 
    int precision = 8;
-   cout.precision(precision);
+   std::cout.precision(precision);
    // --- New runtime IGR/Euler control flags ---
    double C_alpha_user = -1.0;        // negative → auto (1.0 default)
    std::string igr_space = "H1";     // options: H1, L2
@@ -99,12 +98,12 @@ int main(int argc, char *argv[])
    //DGSEM
    // int use_dgsem = 0;
 
-   OptionsParser args(argc, argv);
+   mfem::OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
-                  "Mesh file to use. If not provided, then a periodic square"
+                  "mfem::Mesh file to use. If not provided, then a periodic square"
                   " mesh will be used.");
    args.AddOption(&problem, "-p", "--problem",
-                  "Problem setup to use. See EulerInitialCondition().");
+                  "Problem setup to use. See mfem::EulerInitialCondition().");
    args.AddOption(&ser_ref_levels, "-rs", "--serial-refine",
                   "Number of times to refine the serial mesh uniformly.");
    args.AddOption(&par_ref_levels, "-rp", "--parallel-refine",
@@ -112,7 +111,7 @@ int main(int argc, char *argv[])
    args.AddOption(&order, "-o", "--order",
                   "Order (degree) of the finite elements.");
    args.AddOption(&ode_solver_type, "-s", "--ode-solver",
-                  ODESolver::ExplicitTypes.c_str());
+                  mfem::ODESolver::ExplicitTypes.c_str());
    args.AddOption(&t_final, "-tf", "--t-final", "Final time; start time is 0.");
    args.AddOption(&dt, "-dt", "--time-step",
                   "Time step. Positive number skips CFL timestep calculation.");
@@ -149,7 +148,7 @@ int main(int argc, char *argv[])
 
    // 2. Read the mesh from the given mesh file. When the user does not provide
    //    mesh file, use the default mesh file for the problem.
-   Mesh mesh = mesh_file.empty() ? EulerMesh(problem) : Mesh(mesh_file);
+   mfem::Mesh mesh = mesh_file.empty() ? mfem::EulerMesh(problem) : mfem::Mesh(mesh_file);
    const int dim = mesh.Dimension();
    const int num_equations = dim + 2;
 
@@ -164,7 +163,7 @@ int main(int argc, char *argv[])
    // Define a parallel mesh by a partitioning of the serial mesh. Refine this
    // mesh further in parallel to increase the resolution. Once the parallel
    // mesh is defined, the serial mesh can be deleted.
-   ParMesh pmesh = ParMesh(MPI_COMM_WORLD, mesh);
+   mfem::ParMesh pmesh = mfem::ParMesh(MPI_COMM_WORLD, mesh);
    mesh.Clear();
 
    // Refine the mesh to increase the resolution. In this example we do
@@ -177,43 +176,43 @@ int main(int argc, char *argv[])
 
    // 3. Define the ODE solver used for time integration. Several explicit
    //    Runge-Kutta methods are available.
-   unique_ptr<ODESolver> ode_solver = ODESolver::SelectExplicit(ode_solver_type);
+   std::unique_ptr<mfem::ODESolver> ode_solver = mfem::ODESolver::SelectExplicit(ode_solver_type);
 
    // 4. Define the discontinuous DG finite element space of the given
    //    polynomial order on the refined mesh.
-   DG_FECollection fec(order, dim);
+   mfem::DG_FECollection fec(order, dim);
    // L2_FECollection fec(order, dim, BasisType::GaussLobatto);
    // Finite element space for a scalar (thermodynamic quantity)
-   ParFiniteElementSpace fes(&pmesh, &fec);
+   mfem::ParFiniteElementSpace fes(&pmesh, &fec);
    // Finite element space for a mesh-dim vector quantity (momentum)
-   ParFiniteElementSpace dfes(&pmesh, &fec, dim, Ordering::byNODES);
+   mfem::ParFiniteElementSpace dfes(&pmesh, &fec, dim, mfem::Ordering::byNODES);
    // Finite element space for all variables together (total thermodynamic state)
-   ParFiniteElementSpace vfes(&pmesh, &fec, num_equations, Ordering::byNODES);
+   mfem::ParFiniteElementSpace vfes(&pmesh, &fec, num_equations, mfem::Ordering::byNODES);
 
    // --- Select Σ FE space based on --igr-space flag ---
-   std::unique_ptr<FiniteElementCollection> sfec_ptr;
+   std::unique_ptr<mfem::FiniteElementCollection> sfec_ptr;
    if (igr_space == "H1" || igr_space == "h1")
    {
-      sfec_ptr = std::make_unique<H1_FECollection>(std::max(order, 3), dim);
+      sfec_ptr = std::make_unique<mfem::H1_FECollection>(std::max(order, 3), dim);
    }
    else if (igr_space == "L2" || igr_space == "l2")
    {
-      sfec_ptr = std::make_unique<DG_FECollection>(order, dim);
+      sfec_ptr = std::make_unique<mfem::DG_FECollection>(order, dim);
    }
    else
    {
-      sfec_ptr = std::make_unique<DG_FECollection>(order, dim);
+      sfec_ptr = std::make_unique<mfem::DG_FECollection>(order, dim);
    }
-   ParFiniteElementSpace sfes(&pmesh, sfec_ptr.get());
+   mfem::ParFiniteElementSpace sfes(&pmesh, sfec_ptr.get());
 
    // --- H1 velocity space (continuous) and diagnostics (scalar DG) ---
    // Order for H1 projection: at least 1, often = order
-   H1_FECollection h1fec(std::max(1, order), dim);
-   ParFiniteElementSpace h1_vfes(&pmesh, &h1fec, /*vdim=*/dim, Ordering::byNODES);
+   mfem::H1_FECollection h1fec(std::max(1, order), dim);
+   mfem::ParFiniteElementSpace h1_vfes(&pmesh, &h1fec, /*vdim=*/dim, mfem::Ordering::byNODES);
    // Continuous velocity for visualization / gradients
-   ParGridFunction uH1(&h1_vfes); uH1 = 0.0;
+   mfem::ParGridFunction uH1(&h1_vfes); uH1 = 0.0;
    // Scalar DG fields to *display* diagnostics (reuse your DG scalar space 'sfes')
-   ParGridFunction g_umag(&h1_vfes), g_div(&h1_vfes), g_gfrob(&h1_vfes);
+   mfem::ParGridFunction g_umag(&h1_vfes), g_div(&h1_vfes), g_gfrob(&h1_vfes);
    g_umag = 0.0; g_div = 0.0; g_gfrob = 0.0;
 
 
@@ -282,13 +281,13 @@ int main(int argc, char *argv[])
    // IGR params
    const double rho_floor = rho_min;
    // --- compute nominal Δx and α from the mesh and polynomial order ---
-   real_t hmin_alpha = infinity();
+   mfem::real_t hmin_alpha = mfem::infinity();
    for (int i = 0; i < pmesh.GetNE(); i++)
    {
       hmin_alpha = std::min(pmesh.GetElementSize(i, 1), hmin_alpha);
    }
    MPI_Allreduce(MPI_IN_PLACE, &hmin_alpha, 1,
-               MPITypeMap<real_t>::mpi_type, MPI_MIN, pmesh.GetComm());
+               mfem::MPITypeMap<mfem::real_t>::mpi_type, MPI_MIN, pmesh.GetComm());
    // Effective spacing for DG(p): Δx_eff ≈ h / (p+1)
    // const double dx_eff = hmin_alpha / (order + 1);
    const double dx_eff = hmin_alpha ;
@@ -319,12 +318,12 @@ int main(int argc, char *argv[])
    igr.SetSolveMode(IGRSolver::SolveMode::Krylov); // default in the new header
    igr.SetLinearSolveParams(1e-8, 0.0, 1000, /*print=*/0);
 
-   MFEM_ASSERT(fes.GetOrdering() == Ordering::byNODES, "");
+   MFEM_ASSERT(fes.GetOrdering() == mfem::Ordering::byNODES, "");
 
    HYPRE_BigInt glob_size = vfes.GlobalTrueVSize();
-   if (Mpi::Root())
+   if (mfem::Mpi::Root())
    {
-      cout << "Number of unknowns: " << glob_size << endl;
+      std::cout << "Number of unknowns: " << glob_size << std::endl;
    }
 
    // 5. Define the initial conditions, save the corresponding mesh and grid
@@ -332,14 +331,14 @@ int main(int argc, char *argv[])
    //    "glvis -np 4  -m euler-mesh -g euler-1-init" (for x-momentum).
 
    // Initialize the state.
-   const real_t gamma = 1.4;
-   const real_t Ms    = 1.2;
-   const real_t rho1  = 1.0;
-   const real_t p1    = 1.0;
-   const real_t c1    = std::sqrt(gamma * p1 / rho1);
-   const real_t u1x   = -Ms * c1;  // < 0, flow right -> left
-   const real_t u1y   = 0.0;
-   const real_t v1sq  = u1x * u1x + u1y * u1y;
+   const mfem::real_t gamma = 1.4;
+   const mfem::real_t Ms    = 1.2;
+   const mfem::real_t rho1  = 1.0;
+   const mfem::real_t p1    = 1.0;
+   const mfem::real_t c1    = std::sqrt(gamma * p1 / rho1);
+   const mfem::real_t u1x   = -Ms * c1;  // < 0, flow right -> left
+   const mfem::real_t u1y   = 0.0;
+   const mfem::real_t v1sq  = u1x * u1x + u1y * u1y;
    mfem::Vector Uin(4);
    Uin(0) = rho1;
    Uin(1) = rho1 * u1x;
@@ -351,30 +350,30 @@ int main(int argc, char *argv[])
    const int my = base_cells << total_ref;
    // const int mx = base_cells;
    // const int my = base_cells;
-   VectorFunctionCoefficient u0 = ShockVortexInoueHattoriInitialCondition(
+   mfem::VectorFunctionCoefficient u0 = mfem::ShockVortexInoueHattoriInitialCondition(
       /*gamma=*/1.4, 
       /*mx*/ mx, 
       /*my*/ my);
-   ParGridFunction sol(&vfes);
+   mfem::ParGridFunction sol(&vfes);
    sol.ProjectCoefficient(u0);
-   ParGridFunction mom(&dfes, sol.GetData() + fes.GetNDofs());
-   ParGridFunction density(&fes, sol.GetData());  // Start at beginning, no offset
-   ParGridFunction mom_x(&fes, sol.GetData() + 1 * fes.GetNDofs());
-   ParGridFunction mom_y(&fes, sol.GetData() + 2 * fes.GetNDofs());
-   ParGridFunction energy(&fes, sol.GetData() + 3 * fes.GetNDofs());
+   mfem::ParGridFunction mom(&dfes, sol.GetData() + fes.GetNDofs());
+   mfem::ParGridFunction density(&fes, sol.GetData());  // Start at beginning, no offset
+   mfem::ParGridFunction mom_x(&fes, sol.GetData() + 1 * fes.GetNDofs());
+   mfem::ParGridFunction mom_y(&fes, sol.GetData() + 2 * fes.GetNDofs());
+   mfem::ParGridFunction energy(&fes, sol.GetData() + 3 * fes.GetNDofs());
    PressureCoefficient pcoef(sol, dim, specific_heat_ratio);
    mfem::ParGridFunction press(&fes);
    press.ProjectCoefficient(pcoef);
    // --- Velocity/H1 diagnostics updater (call before plotting) ---
-   VelocityFromConsCoefficient ucoef(dim, /*U=*/&sol, /*rho_floor=*/rho_floor);
+   mfem::VelocityFromConsCoefficient ucoef(dim, /*U=*/&sol, /*rho_floor=*/rho_floor);
    auto UpdateH1VelocityAndDiagnostics = [&]() {
    // 1) Project conservative state -> continuous velocity (H1^dim)
    uH1.ProjectCoefficient(ucoef);
 
    // 2) Project diagnostics to scalar DG fields for easy coloring
-   GradFrobNormCoeff cF(&uH1, dim);
-   DivCoeff         cD(&uH1, dim);
-   VelMagCoeff      cM(&uH1, dim);
+   mfem::GradFrobNormCoeff cF(&uH1, dim);
+   mfem::DivCoeff         cD(&uH1, dim);
+   mfem::VelMagCoeff      cM(&uH1, dim);
    g_gfrob.ProjectCoefficient(cF);  // ||grad u||_F
    g_div  .ProjectCoefficient(cD);  // div u
    g_umag .ProjectCoefficient(cM);  // |u|
@@ -382,43 +381,43 @@ int main(int argc, char *argv[])
 
    // Output the initial solution.
    {
-      ostringstream mesh_name;
-      mesh_name << "euler-mesh." << setfill('0') << setw(6) << Mpi::WorldRank();
-      ofstream mesh_ofs(mesh_name.str().c_str());
+      std::ostringstream mesh_name;
+      mesh_name << "euler-mesh." << std::setfill('0') << std::setw(6) << mfem::Mpi::WorldRank();
+      std::ofstream mesh_ofs(mesh_name.str().c_str());
       mesh_ofs.precision(precision);
       mesh_ofs << pmesh;
 
       for (int k = 0; k < num_equations; k++)
       {
-         ParGridFunction uk(&fes, sol.GetData() + k * fes.GetNDofs());
-         ostringstream sol_name;
-         sol_name << "euler-" << k << "-init." << setfill('0') << setw(6)
-                  << Mpi::WorldRank();
-         ofstream sol_ofs(sol_name.str().c_str());
+         mfem::ParGridFunction uk(&fes, sol.GetData() + k * fes.GetNDofs());
+         std::ostringstream sol_name;
+         sol_name << "euler-" << k << "-init." << std::setfill('0') << std::setw(6)
+                  << mfem::Mpi::WorldRank();
+         std::ofstream sol_ofs(sol_name.str().c_str());
          sol_ofs.precision(precision);
          sol_ofs << uk;
       }
    }
 
    // 6. Set up the nonlinear form with Euler flux wrapped by IGR
-   EulerFlux base_flux(dim, specific_heat_ratio);
+   mfem::EulerFlux base_flux(dim, specific_heat_ratio);
 
-   // IMPORTANT: FluxWithIGR must see the SAME ParGridFunction that IGRSolver updates.
-   // Assuming IGRSolver::GetSigma() returns ParGridFunction&.
-   // FluxWithIGR igr_flux(base_flux, &igr.GetSigma());
-   FluxWithIGR igr_flux(base_flux);
+   // IMPORTANT: mfem::FluxWithIGR must see the SAME mfem::ParGridFunction that IGRSolver updates.
+   // Assuming IGRSolver::GetSigma() returns mfem::ParGridFunction&.
+   // mfem::FluxWithIGR igr_flux(base_flux, &igr.GetSigma());
+   mfem::FluxWithIGR igr_flux(base_flux);
    igr_flux.SetSigmaField(&igr.GetSigma());
 
    // Use the wrapped flux in the numerical flux (e.g., Rusanov).
-   // HLLCFlux numericalFlux(igr_flux, 1.4);
-   // RusanovFlux numericalFlux(igr_flux);
-   // RusanovFlux numericalFlux(igr_flux);
-   RusanovFluxWithSides numericalFlux(igr_flux);
+   // mfem::HLLCFlux numericalFlux(igr_flux, 1.4);
+   // mfem::RusanovFlux numericalFlux(igr_flux);
+   // mfem::RusanovFlux numericalFlux(igr_flux);
+   mfem::RusanovFluxWithSides numericalFlux(igr_flux);
 
-   DGHyperbolicConservationLaws base_op(
+   mfem::DGHyperbolicConservationLaws base_op(
       vfes,
-      std::unique_ptr<HyperbolicFormIntegrator>(
-         new HyperbolicFormIntegrator(numericalFlux, IntOrderOffset)),
+      std::unique_ptr<mfem::HyperbolicFormIntegrator>(
+         new mfem::HyperbolicFormIntegrator(numericalFlux, IntOrderOffset)),
       preassembleWeakDiv);
    // if (use_dgsem)
    //    base_op.SetVolumeMode(VolumeMode::DGSEMFluxDiff);
@@ -426,31 +425,31 @@ int main(int argc, char *argv[])
    //    base_op.SetVolumeMode(VolumeMode::WeakDivergence);
 
    // BC markers (1=bottom, 2=right, 3=top, 4=left, 5=circle)
-   Array<int> inlet_bdr, outlet_bdr, slip_bdr;
-   MakeMarker(inlet_bdr, pmesh, {2});
-   MakeMarker(outlet_bdr, pmesh, {4});
-   MakeMarker(slip_bdr, pmesh, {1,3}); 
+   mfem::Array<int> inlet_bdr, outlet_bdr, slip_bdr;
+   mfem::MakeMarker(inlet_bdr, pmesh, {2});
+   mfem::MakeMarker(outlet_bdr, pmesh, {4});
+   mfem::MakeMarker(slip_bdr, pmesh, {1,3}); 
 
    base_op.AddBdrFaceIntegrator(
-      new BdrHyperbolicFluxIntegrator(numericalFlux,
-                                    std::make_unique<SupersonicInletState>(Uin),
+      new mfem::BdrHyperbolicFluxIntegrator(numericalFlux,
+                                    std::make_unique<mfem::SupersonicInletState>(Uin),
                                     IntOrderOffset),
       inlet_bdr);
    base_op.AddBdrFaceIntegrator(
-      new BdrHyperbolicFluxIntegrator(numericalFlux,
-                                    std::make_unique<SupersonicOutletState>(),
+      new mfem::BdrHyperbolicFluxIntegrator(numericalFlux,
+                                    std::make_unique<mfem::SupersonicOutletState>(),
                                     IntOrderOffset),
       outlet_bdr);
    base_op.AddBdrFaceIntegrator(
-      new BdrHyperbolicFluxIntegrator(numericalFlux,
-                                    std::make_unique<SlipWallState>(dim),
+      new mfem::BdrHyperbolicFluxIntegrator(numericalFlux,
+                                    std::make_unique<mfem::SlipWallState>(dim),
                                     IntOrderOffset),
       slip_bdr);
 
    // 7. Visualization
    igr.UpdateFromState(sol, /*warm_start=*/false);
    igr.GetSigma().ExchangeFaceNbrData();
-   socketstream sout;
+   mfem::socketstream sout;
    vis::GLVisWindow w_density, w_sigma, w_energy, w_pressure, w_momentum_x;
    vis::GLVisWindow w_uvec, w_umag, w_div, w_gfrob;
    if (visualization)
@@ -493,7 +492,7 @@ int main(int argc, char *argv[])
       if (!(ok1 && ok2 && ok3))
       {
          visualization = false;
-         if (Mpi::Root())
+         if (mfem::Mpi::Root())
          {
             std::cout << "Unable to connect to GLVis. Visualization disabled.\n";
          }
@@ -503,9 +502,9 @@ int main(int argc, char *argv[])
    // ----------------------------------------------------------------------
    //  VTK / ParaView output setup
    // ----------------------------------------------------------------------
-   // ParaViewDataCollection paraview_dc("forward_facing_output", &pmesh);
+   // mfem::ParaViewDataCollection paraview_dc("forward_facing_output", &pmesh);
    int save_idx = 0;
-   real_t t_next_save = 0.0;
+   mfem::real_t t_next_save = 0.0;
    std::ostringstream dc_name;
    dc_name << "shock_vortex_interaction"
          << "_p_"  << order
@@ -514,7 +513,7 @@ int main(int argc, char *argv[])
          << "_ig_" << igr_grad
          << "_ca_" << C_alpha;
 
-ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
+mfem::ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
    if (vtk_save)
    {  
    // Register fields you want to write (each will become its own .pvtu series)
@@ -527,12 +526,12 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
    // Optional configuration
    paraview_dc.SetPrefixPath("vtk_output"); // output directory
    paraview_dc.SetLevelsOfDetail(order);
-   paraview_dc.SetDataFormat(VTKFormat::BINARY); // smaller, faster
+   paraview_dc.SetDataFormat(mfem::VTKFormat::BINARY); // smaller, faster
    paraview_dc.SetHighOrderOutput(true);         // keep DG high-order data
    paraview_dc.SetCycle(0);
    paraview_dc.SetTime(0.0);
    paraview_dc.Save();
-   if (Mpi::Root())
+   if (mfem::Mpi::Root())
    {
       std::cout << "Saving output to VTK.\n";
       std::cout << "Saving to " << dc_name.str() << "\n";
@@ -543,38 +542,38 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
 
    // When dt is not specified, use CFL condition.
    // Compute h_min and initial maximum characteristic speed
-   real_t hmin = infinity();
+   mfem::real_t hmin = mfem::infinity();
    if (cfl > 0)
    {
       for (int i = 0; i < pmesh.GetNE(); i++)
       {
-         hmin = min(pmesh.GetElementSize(i, 1), hmin);
+         hmin = std::min(pmesh.GetElementSize(i, 1), hmin);
       }
-      MPI_Allreduce(MPI_IN_PLACE, &hmin, 1,  MPITypeMap<real_t>::mpi_type, MPI_MIN,
+      MPI_Allreduce(MPI_IN_PLACE, &hmin, 1,  mfem::MPITypeMap<mfem::real_t>::mpi_type, MPI_MIN,
                     pmesh.GetComm());
       // Find a safe dt, using a temporary vector. Calling Mult() computes the
       // maximum char speed at all quadrature points on all faces (and all
       // elements with -mf).
-      Vector z(sol.Size());
+      mfem::Vector z(sol.Size());
 
       // Use wrapped op here so Σ exists during the probe call too
-      EulerWithIGR wrapped(base_op, igr, sol);
+      mfem::EulerWithIGR wrapped(base_op, igr, sol);
       wrapped.Mult(sol, z);
 
-      real_t max_char_speed = wrapped.GetMaxCharSpeed();
-      MPI_Allreduce(MPI_IN_PLACE, &max_char_speed, 1,  MPITypeMap<real_t>::mpi_type,
+      mfem::real_t max_char_speed = wrapped.GetMaxCharSpeed();
+      MPI_Allreduce(MPI_IN_PLACE, &max_char_speed, 1,  mfem::MPITypeMap<mfem::real_t>::mpi_type,
                     MPI_MAX, pmesh.GetComm());
       dt = cfl * hmin / max_char_speed / (2 * order + 1);
    }
 
    // Start the timer.
-   tic_toc.Clear();
-   tic_toc.Start();
+   mfem::tic_toc.Clear();
+   mfem::tic_toc.Start();
 
-   real_t t = 0.0;
+   mfem::real_t t = 0.0;
 
    // Wrap the base DG op with IGR recomputation each Mult()
-   EulerWithIGR wrapped(base_op, igr, sol);
+   mfem::EulerWithIGR wrapped(base_op, igr, sol);
    // wrapped.SetTime(t);
    // ode_solver->Init(wrapped);
    rk3.Init(wrapped);
@@ -584,14 +583,14 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
    bool done = false;
    for (int ti = 0; !done;)
    {
-      real_t dt_real_base = std::min(dt, t_final - t);
-      real_t dt_real = dt_real_base;
+      mfem::real_t dt_real_base = std::min(dt, t_final - t);
+      mfem::real_t dt_real = dt_real_base;
 
       // Detect if we will land on the next save time this step
       bool hit_save_boundary = false;
       if (vtk_save && dt_save > 0.0)
       {
-         const real_t gap = t_next_save - t;
+         const mfem::real_t gap = t_next_save - t;
          if (gap >= 0.0 && gap <= dt_real_base)
          {
             dt_real = gap; // trim to land exactly on t_next_save
@@ -605,11 +604,11 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
 
       if (cfl > 0)
       {
-         real_t max_char_speed = wrapped.GetMaxCharSpeed();
-         MPI_Allreduce(MPI_IN_PLACE, &max_char_speed, 1,  MPITypeMap<real_t>::mpi_type,
+         mfem::real_t max_char_speed = wrapped.GetMaxCharSpeed();
+         MPI_Allreduce(MPI_IN_PLACE, &max_char_speed, 1,  mfem::MPITypeMap<mfem::real_t>::mpi_type,
                        MPI_MAX, pmesh.GetComm());
          dt = cfl * hmin / max_char_speed / (2 * order + 1);
-         if (Mpi::Root()) { std::cout << "dt: " << dt_real << std::endl; }
+         if (mfem::Mpi::Root()) { std::cout << "dt: " << dt_real << std::endl; }
       }
       ti++;
 
@@ -622,9 +621,9 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
       // (optional) GLVis still by step cadence
       if (done || ti % vis_steps == 0)
       {
-         if (Mpi::Root())
+         if (mfem::Mpi::Root())
          {
-            cout << "dt: " << dt_real << " time step: " << ti << ", time: " << t << endl;
+            std::cout << "dt: " << dt_real << " time step: " << ti << ", time: " << t << std::endl;
          }
          if (visualization)
          {
@@ -649,9 +648,9 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
       // VTK export by dt_save
       if (vtk_save && dt_save > 0.0 && hit_save_boundary)
       {
-         if (Mpi::Root())
+         if (mfem::Mpi::Root())
          {
-            cout << "dt: " << dt_real << " save VTK " << "time step: " << ti << ", time: " << t << endl;
+            std::cout << "dt: " << dt_real << " save VTK " << "time step: " << ti << ", time: " << t << std::endl;
          }
          // refresh derived fields
          igr.UpdateFromState(sol, /*warm_start=*/true);
@@ -681,39 +680,39 @@ ParaViewDataCollection paraview_dc(dc_name.str(), &pmesh);
       }
    }
 
-   tic_toc.Stop();
-   if (Mpi::Root())
+   mfem::tic_toc.Stop();
+   if (mfem::Mpi::Root())
    {
-      cout << " done, " << tic_toc.RealTime() << "s." << endl;
+      std::cout << " done, " << mfem::tic_toc.RealTime() << "s." << std::endl;
    }
 
    // 9. Save the final solution. This output can be viewed later using GLVis:
    //    "glvis -np 4 -m euler-mesh-final -g euler-1-final" (for x-momentum).
    {
-      ostringstream mesh_name;
-      mesh_name << "euler-mesh-final." << setfill('0') << setw(6)
-                << Mpi::WorldRank();
-      ofstream mesh_ofs(mesh_name.str().c_str());
+      std::ostringstream mesh_name;
+      mesh_name << "euler-mesh-final." << std::setfill('0') << std::setw(6)
+                << mfem::Mpi::WorldRank();
+      std::ofstream mesh_ofs(mesh_name.str().c_str());
       mesh_ofs.precision(precision);
       mesh_ofs << pmesh;
 
       for (int k = 0; k < num_equations; k++)
       {
-         ParGridFunction uk(&fes, sol.GetData() + k * fes.GetNDofs());
-         ostringstream sol_name;
-         sol_name << "euler-" << k << "-final." << setfill('0') << setw(6)
-                  << Mpi::WorldRank();
-         ofstream sol_ofs(sol_name.str().c_str());
+         mfem::ParGridFunction uk(&fes, sol.GetData() + k * fes.GetNDofs());
+         std::ostringstream sol_name;
+         sol_name << "euler-" << k << "-final." << std::setfill('0') << std::setw(6)
+                  << mfem::Mpi::WorldRank();
+         std::ofstream sol_ofs(sol_name.str().c_str());
          sol_ofs.precision(precision);
          sol_ofs << uk;
       }
    }
 
    // 10. Compute the L2 solution error summed for all components.
-   const real_t error = sol.ComputeLpError(2, u0);
-   if (Mpi::Root())
+   const mfem::real_t error = sol.ComputeLpError(2, u0);
+   if (mfem::Mpi::Root())
    {
-      cout << "Solution error: " << error << endl;
+      std::cout << "Solution error: " << error << std::endl;
    }
 
    return 0;

@@ -2,14 +2,25 @@
 #define MFEM_FLUX_FCNS
 
 #include "mfem.hpp"
+#include "dg_igr_defaults.hpp"
 // #include "hyperbolic.hpp"
+
+/**
+ * @file fluxfunctions.hpp
+ * @brief Numerical fluxes and flux decorators used by DG operators.
+ * @ingroup numerics_riemann
+ */
 
 namespace mfem
 {
 
 // --- Small opt-in interface: numerical flux can tell a flux which face side it is evaluating.
+/// @brief Side identifier for face-based flux evaluation.
+/// @ingroup numerics_riemann
 enum class FaceSide { Left, Right };
 
+/// @brief Interface for fluxes that need face-side context.
+/// @ingroup numerics_riemann
 class FaceSideAwareFlux
 {
 public:
@@ -28,6 +39,8 @@ public:
  *  - The returned max characteristic speed comes from the base flux (unchanged).
  *  - On faces, Σ is taken from the side indicated via SetFaceSide(Left/Right).
  *    On boundary faces (Elem2 == nullptr) the interior (Left) value is used.
+ *
+ * @ingroup physics_igr
  */
 class FluxWithIGR : public FluxFunction, public FaceSideAwareFlux
 {
@@ -47,7 +60,7 @@ public:
    /// Provide the scalar Σ field (same mesh as the solution). Pass nullptr to disable IGR.
    void SetSigmaField(const mfem::ParGridFunction *sigma) { sigma_ = sigma; }
 
-   /// Density floor used only for u = m / rho in the IGR terms (default 1e-10).
+   /// Density floor used only for u = m / rho in the IGR terms (default FluxDefaults::kRhoVelFloor).
    void SetVelocityRhoFloor(double f) { rho_vel_floor_ = f; }
 
    /// Face-side hook used by side-aware numerical flux (e.g., RusanovFluxWithSides).
@@ -77,7 +90,7 @@ private:
 
    const FluxFunction &base_;
    const mfem::ParGridFunction *sigma_ = nullptr;
-   double rho_vel_floor_ = 1e-10;
+   double rho_vel_floor_ = dg_igr::FluxDefaults::kRhoVelFloor;
 
    // Which side are we evaluating on this face call? (Default to Left/boundary)
    mutable FaceSide curr_side_ = FaceSide::Left;
@@ -120,6 +133,7 @@ private:
  * jump sensor s ∈ [0, sensor_max], and an optional cap to avoid blow-ups.
  *
  * @note Assumes monotonous |dF(u,x)/du⋅n| in u (same assumption as RusanovFlux).
+ * @ingroup numerics_riemann
  */
 class DiffusiveRusanovFlux : public NumericalFlux
 {
@@ -264,6 +278,7 @@ protected:
  * side-dependent fields (e.g., Σ for IGR) can be selected consistently.
  *
  * Math, scaling, and Jacobians are otherwise identical to MFEM's RusanovFlux.
+ * @ingroup numerics_riemann
  */
 class RusanovFluxWithSides : public NumericalFlux
 {
@@ -310,6 +325,7 @@ protected:
  *  - fluxFunction corresponds to Euler and returns F·n via ComputeFluxDotN
  *
  * API mimics RusanovFlux to minimize changes at call sites.
+ * @ingroup numerics_riemann
  */
 class HLLCFlux : public NumericalFlux
 {

@@ -4,6 +4,12 @@
 #include "mfem.hpp"
 // #include "hyperbolic.hpp"
 
+/**
+ * @file BdrHyperbolicFluxIntegrator.hpp
+ * @brief Boundary-face hyperbolic flux integrator and boundary state policies.
+ * @ingroup numerics_dg
+ */
+
 namespace mfem
 {
 
@@ -52,6 +58,7 @@ namespace mfem
  *
  * @note `nor` is the *scaled* face normal as used by MFEM (Jacobian scaling
  * is already included). If you need a unit normal for your math, normalize it.
+ * @ingroup physics_bc
  */
 class BoundaryState {
 public:
@@ -75,6 +82,7 @@ public:
  * @brief Supersonic inlet boundary: enforce a constant conservative state.
  *
  * Sets U^+ = U_in (constant), regardless of the interior state.
+ * @ingroup physics_bc
  */
 class SupersonicInletState : public BoundaryState {
 public:
@@ -93,6 +101,7 @@ private:
  * @brief Supersonic outlet boundary: transmissive/do-nothing.
  *
  * Sets U^+ = U^-.
+ * @ingroup physics_bc
  */
 class SupersonicOutletState : public BoundaryState {
 public:
@@ -108,6 +117,7 @@ public:
  * Implements:
  *   u' = u - 2 (u · n̂) n̂ ,  with n̂ the unit outward normal.
  * Then sets (ρu)' = ρ u' and leaves ρ and E unchanged.
+ * @ingroup physics_bc
  */
 class SlipWallState : public BoundaryState {
 public:
@@ -129,6 +139,7 @@ private:
  * This form integrator is coupled with a NumericalFlux that implements the
  * numerical flux F̂ at the faces. The flux F is obtained from the FluxFunction
  * assigned to the aforementioned NumericalFlux.
+ * @ingroup numerics_dg
  */
 class BdrHyperbolicFluxIntegrator : public NonlinearFormIntegrator
 {

@@ -1,10 +1,12 @@
 #pragma once
 #include "mfem.hpp"
+#include "dg_igr_defaults.hpp"
 #include <memory>
 
 /**
  * @file IGR.hpp
- * @brief Information Geometric Regularization (IGR) solver for Σ coupled to Euler.
+ * @brief Information Geometric Regularization (IGR) solver for sigma coupled to Euler.
+ * @ingroup physics_igr
  *
  * Given the current conservative state U = [ρ, ρu, E], this class computes Σ by
  * solving the scalar elliptic PDE
@@ -20,6 +22,8 @@
  *  - Legacy: a few preconditioned Richardson smoother sweeps (fast/approx)
  *  - Recommended: MFEM Krylov solve to tolerance (CG/GMRES + preconditioner)
  */
+/// @brief Information Geometric Regularization (IGR) solver for sigma.
+/// @ingroup physics_igr
 class IGRSolver
 {
 public:
@@ -42,6 +46,29 @@ public:
   /// Preconditioner choice.
   enum class PrecondType { Auto, BoomerAMG, HypreSmoother, None };
 
+  /// Configuration bundle for IGR defaults and runtime tuning.
+  struct Config
+  {
+    double alpha = mfem::dg_igr::IGRDefaults::kAlpha;
+    double rho_floor = mfem::dg_igr::IGRDefaults::kRhoFloor;
+
+    SmootherType smoot = SmootherType::L1Jacobi;
+    GradBackend  backend = GradBackend::H1Projection;
+    IPKind       ip_kind = IPKind::SIPG;
+
+    int  regular_sweeps = mfem::dg_igr::IGRDefaults::kRegularSweeps;
+    int  warm_start_sweeps = mfem::dg_igr::IGRDefaults::kWarmStartSweeps;
+
+    SolveMode        solve_mode = SolveMode::Krylov;
+    LinearSolverType lin_solver_type = LinearSolverType::Auto;
+    PrecondType      prec_type = PrecondType::Auto;
+
+    double lin_rtol = mfem::dg_igr::IGRDefaults::kLinRtol;
+    double lin_atol = mfem::dg_igr::IGRDefaults::kLinAtol;
+    int    lin_maxit = mfem::dg_igr::IGRDefaults::kLinMaxIters;
+    int    lin_print = mfem::dg_igr::IGRDefaults::kLinPrint;
+  };
+
   /**
    * @brief Construct an IGR solver.
    * @param sigma_fes   Scalar FE space for Σ (H1 or DG).
@@ -57,7 +84,7 @@ public:
   /// Set regularization parameter α.
   void SetAlpha(double a);
 
-  /// Clamp for ρ to avoid division by very small numbers (default 1e-12).
+  /// Clamp for rho to avoid division by very small numbers (default IGRDefaults::kRhoFloor).
   void SetRhoFloor(double rho_floor);
 
   /// Set essential (Dirichlet) boundary attributes for Σ; default is none (natural Neumann).
@@ -83,6 +110,23 @@ public:
     lin_atol_  = abs_tol;
     lin_maxit_ = max_it;
     lin_print_ = print_level;
+  }
+
+  /// Apply a configuration bundle without changing existing defaults.
+  void ApplyConfig(const Config &cfg)
+  {
+    SetAlpha(cfg.alpha);
+    SetRhoFloor(cfg.rho_floor);
+    SetGradBackend(cfg.backend);
+    SetIPKind(cfg.ip_kind);
+
+    SetSmoother(cfg.smoot);
+    SetSweeps(cfg.regular_sweeps, cfg.warm_start_sweeps);
+
+    SetSolveMode(cfg.solve_mode);
+    SetLinearSolver(cfg.lin_solver_type);
+    SetPreconditioner(cfg.prec_type);
+    SetLinearSolveParams(cfg.lin_rtol, cfg.lin_atol, cfg.lin_maxit, cfg.lin_print);
   }
 
   /// Update Σ from the current state U.
@@ -175,15 +219,15 @@ private:
   const mfem::ParFiniteElementSpace& sfes_;  // scalar Σ space (H1 or DG)
   const mfem::ParFiniteElementSpace& vfes_;  // vector state U space (vdim=num_eq)
   int dim_, num_eq_;
-  double alpha_       = 0.0;
-  double rho_floor_   = 5.0e-7;
+  double alpha_       = mfem::dg_igr::IGRDefaults::kAlpha;
+  double rho_floor_   = mfem::dg_igr::IGRDefaults::kRhoFloor;
   SmootherType smoot_ = SmootherType::L1Jacobi;
   GradBackend  backend_ = GradBackend::H1Projection;
   IPKind       ip_kind_ = IPKind::SIPG; //default SPD
 
   // Legacy sweeps
-  int  regular_sweeps_    = 3;
-  int  warm_start_sweeps_ = 5;
+  int  regular_sweeps_    = mfem::dg_igr::IGRDefaults::kRegularSweeps;
+  int  warm_start_sweeps_ = mfem::dg_igr::IGRDefaults::kWarmStartSweeps;
   bool first_call_        = true;
 
   // New solve controls
@@ -191,10 +235,10 @@ private:
   LinearSolverType lin_solver_type_ = LinearSolverType::Auto;
   PrecondType      prec_type_       = PrecondType::Auto;
 
-  double lin_rtol_ = 1e-8;
-  double lin_atol_ = 0.0;
-  int    lin_maxit_ = 200;
-  int    lin_print_ = 0;
+  double lin_rtol_ = mfem::dg_igr::IGRDefaults::kLinRtol;
+  double lin_atol_ = mfem::dg_igr::IGRDefaults::kLinAtol;
+  int    lin_maxit_ = mfem::dg_igr::IGRDefaults::kLinMaxIters;
+  int    lin_print_ = mfem::dg_igr::IGRDefaults::kLinPrint;
 
   // Σ field
   mfem::ParGridFunction sigma_;

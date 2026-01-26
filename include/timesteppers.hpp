@@ -1,5 +1,6 @@
 #pragma once
 #include "mfem.hpp"
+#include "dg_igr_defaults.hpp"
 #include "limiters.hpp"   // <-- brings CharTVBOptions and BJOptions in as complete types
 #include <functional>
 #include <vector>
@@ -7,6 +8,7 @@
 /**
  * @file timesteppers.hpp
  * @brief SSP RK3 with a stage-wise callback pipeline (e.g., BJ -> TVB -> PP).
+ * @ingroup numerics_timestepping
  *
  * Mirrors MFEM's RK3SSPSolver but inserts a user-defined sequence of
  * element-local callbacks between stages. Each callback operates on a
@@ -28,9 +30,25 @@
 namespace mfem {
 
 /// SSPRK(3,3) with an ordered list of stage callbacks (limiters/filters).
+/// @ingroup numerics_timestepping
 class RK3SSPWithLimiter : public ODESolver
 {
 public:
+  /// Configuration bundle for RK3 + limiter defaults.
+  struct Config
+  {
+    int    dim = dg_igr::EulerDefaults::kDim;
+    double gamma = dg_igr::EulerDefaults::kGamma;
+
+    double rho_min = dg_igr::LimiterDefaults::kRhoMin;
+    double p_min = dg_igr::LimiterDefaults::kPMin;
+    int    quad_order = dg_igr::LimiterDefaults::kQuadOrder;
+    int    p_bisect_iters = dg_igr::LimiterDefaults::kBisectIters;
+
+    bool   limit_initial = dg_igr::RK3Defaults::kLimitInitial;
+    long   max_limiter_steps = dg_igr::RK3Defaults::kLimiterSteps;
+  };
+
   /// Construct with the FE space used by the conservative state U (vdim = dim+2).
   explicit RK3SSPWithLimiter(ParFiniteElementSpace &vfes);
 
@@ -52,6 +70,15 @@ public:
 
   /// Reset the internal step counter (e.g., if restarting the time integrator).
   void ResetStepCount() { step_count_ = 0; }
+
+  /// Apply a configuration bundle without changing existing defaults.
+  void ApplyConfig(const Config &cfg)
+  {
+    SetEulerParams(cfg.dim, cfg.gamma);
+    SetLimiterParams(cfg.rho_min, cfg.p_min, cfg.quad_order, cfg.p_bisect_iters);
+    LimitInitial(cfg.limit_initial);
+    SetLimiterSteps(cfg.max_limiter_steps);
+  }
 
   // ----------------- Ordered list of stage callbacks -----------------
   // Signature: void(ParFiniteElementSpace&, ParGridFunction&, double t)
@@ -106,13 +133,13 @@ private:
   ParFiniteElementSpace &vfes_;
 
   // Euler / helper-limiter params (only used by helper callbacks)
-  int    dim_            = 2;
-  double gamma_          = 1.4;
-  double rho_min_        = 1e-12;
-  double p_min_          = 1e-12;
-  int    quad_order_     = 0;      // 0 => auto: 2*order+2
-  int    p_bisect_iters_ = 12;
-  bool   limit_initial_  = true;
+  int    dim_            = dg_igr::EulerDefaults::kDim;
+  double gamma_          = dg_igr::EulerDefaults::kGamma;
+  double rho_min_        = dg_igr::LimiterDefaults::kRhoMin;
+  double p_min_          = dg_igr::LimiterDefaults::kPMin;
+  int    quad_order_     = dg_igr::LimiterDefaults::kQuadOrder;   // 0 => auto: 2*order+2
+  int    p_bisect_iters_ = dg_igr::LimiterDefaults::kBisectIters;
+  bool   limit_initial_  = dg_igr::RK3Defaults::kLimitInitial;
 
   // Callback pipelines
   std::vector<StageCallback> always_callbacks_;   ///< Always run
@@ -120,7 +147,7 @@ private:
 
   // Optional limiter scheduling
   long step_count_        = 0;   ///< number of completed Step() calls
-  long max_limiter_steps_ = -1;  ///< <0 => optional limiters always on
+  long max_limiter_steps_ = dg_igr::RK3Defaults::kLimiterSteps;  ///< <0 => optional limiters always on
 
   // Work vectors
   Vector y_, k_;

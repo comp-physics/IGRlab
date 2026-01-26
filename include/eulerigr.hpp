@@ -6,17 +6,31 @@
 #include "fluxfunctions.hpp"
 #include "IGR.hpp"
 
+/**
+ * @file eulerigr.hpp
+ * @brief Euler utilities, IGR coupling helpers, and diagnostic coefficients.
+ * @ingroup physics_euler
+ */
+
 namespace mfem
 {
 
 // ============================================================================
-//  Euler utility conversions: Primitive ↔ Conservative
+//  Euler utility conversions: Primitive <-> Conservative
 // ============================================================================
-// Primitives: [ρ, u, v, (w), p]
-// Conserved:  [ρ, ρu, ρv, (ρw), ρE]
-// Equation of state: p = (γ - 1)(ρE - ½ρ|u|²)
+// Primitives: [rho, u, v, (w), p]
+// Conserved:  [rho, rho*u, rho*v, (rho*w), rho*E]
+// Equation of state: p = (gamma - 1)(rho*E - 0.5*rho*|u|^2)
 // ============================================================================
 
+/**
+ * @brief Convert primitive state to conservative state (Euler).
+ * @param[in]  prim  Primitive state [rho, u(0..dim-1), p].
+ * @param[out] cons  Conservative state [rho, rho*u(0..dim-1), rho*E].
+ * @param[in]  dim   Spatial dimension.
+ * @param[in]  gamma Ratio of specific heats.
+ * @ingroup physics_euler
+ */
 inline void PrimToCons(const mfem::Vector &prim,
                        mfem::Vector &cons,
                        int dim,
@@ -40,6 +54,14 @@ inline void PrimToCons(const mfem::Vector &prim,
    cons(1 + dim) = rho * E;
 }
 
+/**
+ * @brief Convert conservative state to primitive state (Euler).
+ * @param[in]  cons  Conservative state [rho, rho*u(0..dim-1), rho*E].
+ * @param[out] prim  Primitive state [rho, u(0..dim-1), p].
+ * @param[in]  dim   Spatial dimension.
+ * @param[in]  gamma Ratio of specific heats.
+ * @ingroup physics_euler
+ */
 inline void ConsToPrim(const mfem::Vector &cons,
                        mfem::Vector &prim,
                        int dim,
@@ -66,8 +88,15 @@ inline void ConsToPrim(const mfem::Vector &cons,
 }
 
 
-// Helper: make a boundary marker from a set of attribute ids {a1, a2, ...}
-// Example: MakeMarker(pmesh, {4}) creates a marker with only attribute 4 active.
+/**
+ * @brief Build a boundary marker from a set of attribute ids {a1, a2, ...}.
+ * @param[out] marker Boundary marker array (size = max bdr attribute).
+ * @param[in]  pmesh  Parallel mesh providing boundary attributes.
+ * @param[in]  attrs  Attribute ids to activate (1-based).
+ * @ingroup physics_bc
+ *
+ * Example: MakeMarker(pmesh, {4}) activates only attribute 4.
+ */
 static void MakeMarker(mfem::Array<int> &marker,
                        mfem::ParMesh &pmesh,
                        std::initializer_list<int> attrs)
@@ -85,8 +114,9 @@ static void MakeMarker(mfem::Array<int> &marker,
 
 
 /// --------------------------------------------------------------
-/// Wrapper operator: recompute Σ each Mult() and forward to DG.
+/// Wrapper operator: recompute sigma each Mult() and forward to DG.
 /// --------------------------------------------------------------
+/// @ingroup physics_igr
 class EulerWithIGR : public TimeDependentOperator
 {
 public:

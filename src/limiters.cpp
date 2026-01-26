@@ -5,23 +5,22 @@
 #include <utility> // std::pair
 #include <limits>
 
-using namespace mfem;
 
 // ======================= Common, small utilities =======================
 
-static inline void BlendRow(Vector &row, const Vector &ubar, double theta)
+static inline void BlendRow(mfem::Vector &row, const mfem::Vector &ubar, double theta)
 {
   for (int k = 0; k < row.Size(); ++k) { row(k) = ubar(k) + theta * (row(k) - ubar(k)); }
 }
 
-static inline void Subtract(const Vector &a, const Vector &b, Vector &out)
+static inline void Subtract(const mfem::Vector &a, const mfem::Vector &b, mfem::Vector &out)
 {
   const int n = a.Size();
   out.SetSize(n);
   for (int i = 0; i < n; ++i) out(i) = a(i) - b(i);
 }
 
-static inline double PressureCons(const Vector &U, int dim, double gamma)
+static inline double PressureCons(const mfem::Vector &U, int dim, double gamma)
 {
   const double rho = std::max(U(0), 1e-16);
   const double E   = U(1 + dim);
@@ -33,7 +32,7 @@ static inline double PressureCons(const Vector &U, int dim, double gamma)
 
 // ========================= PressureCoefficient =========================
 
-double PressureCoefficient::Eval(ElementTransformation &T, const IntegrationPoint &ip)
+double PressureCoefficient::Eval(mfem::ElementTransformation &T, const mfem::IntegrationPoint &ip)
 {
   MFEM_VERIFY(U, "PressureCoefficient: U pointer not set.");
   T.SetIntPoint(&ip);
@@ -47,12 +46,12 @@ double PressureCoefficient::Eval(ElementTransformation &T, const IntegrationPoin
 
 // ===================== Zhang–Shu positivity limiter ====================
 
-static inline double ThetaForPressure(const Vector &Ubar,
-                                      const Vector &Up,
+static inline double ThetaForPressure(const mfem::Vector &Ubar,
+                                      const mfem::Vector &Up,
                                       int dim, double gamma, double p_min,
                                       double theta_max = 1.0, int iters = 12)
 {
-  Vector Utest(Ubar.Size());
+  mfem::Vector Utest(Ubar.Size());
   Utest = Ubar; Utest.Add(theta_max, Up); Utest.Add(-theta_max, Ubar);
   if (PressureCons(Utest, dim, gamma) >= p_min) { return theta_max; }
 
@@ -67,19 +66,19 @@ static inline double ThetaForPressure(const Vector &Ubar,
   return lo;
 }
 
-static void ElementAverage(const FiniteElement &fe,
-                           ElementTransformation &Tr,
-                           const DenseMatrix &elfun_mat,
+static void ElementAverage(const mfem::FiniteElement &fe,
+                           mfem::ElementTransformation &Tr,
+                           const mfem::DenseMatrix &elfun_mat,
                            int num_eq, int qord,
-                           Vector &Ubar_out)
+                           mfem::Vector &Ubar_out)
 {
-  const IntegrationRule &ir = IntRules.Get(Tr.GetGeometryType(), qord);
-  Vector shape(fe.GetDof()), Upt(num_eq);
+  const mfem::IntegrationRule &ir = mfem::IntRules.Get(Tr.GetGeometryType(), qord);
+  mfem::Vector shape(fe.GetDof()), Upt(num_eq);
   Ubar_out.SetSize(num_eq); Ubar_out = 0.0;
   double vol = 0.0;
   for (int i = 0; i < ir.GetNPoints(); i++)
   {
-    const IntegrationPoint &ip = ir.IntPoint(i);
+    const mfem::IntegrationPoint &ip = ir.IntPoint(i);
     Tr.SetIntPoint(&ip);
     fe.CalcShape(ip, shape);
     elfun_mat.MultTranspose(shape, Upt);
@@ -90,30 +89,30 @@ static void ElementAverage(const FiniteElement &fe,
   Ubar_out /= vol;
 }
 
-void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace &vfes,
-                                    ParGridFunction &U,
+void ApplyZhangShuPositivityLimiter(mfem::ParFiniteElementSpace &vfes,
+                                    mfem::ParGridFunction &U,
                                     int dim, double gamma,
                                     double rho_min, double p_min,
                                     int quad_order, int p_bisect_iters)
 {
-  MFEM_VERIFY(vfes.GetOrdering() == Ordering::byNODES,
+  MFEM_VERIFY(vfes.GetOrdering() == mfem::Ordering::byNODES,
               "Positivity limiter assumes byNODES ordering.");
 
   const int num_eq = dim + 2;
   const int NE = vfes.GetNE();
 
-  Array<int> vdofs;
-  Vector elvec;                 // element slice (size = dof*num_eq)
-  DenseMatrix elmat;            // (dof × num_eq) view of element DOFs
-  Vector shape, Up(num_eq), Ubar(num_eq), row(num_eq);
+  mfem::Array<int> vdofs;
+  mfem::Vector elvec;                 // element slice (size = dof*num_eq)
+  mfem::DenseMatrix elmat;            // (dof × num_eq) view of element DOFs
+  mfem::Vector shape, Up(num_eq), Ubar(num_eq), row(num_eq);
 
   const int qord = (quad_order > 0) ? quad_order
                                     : (2*vfes.GetFE(0)->GetOrder() + 2);
 
   for (int i = 0; i < NE; i++)
   {
-    const FiniteElement *fe = vfes.GetFE(i);
-    ElementTransformation *Tr = vfes.GetElementTransformation(i);
+    const mfem::FiniteElement *fe = vfes.GetFE(i);
+    mfem::ElementTransformation *Tr = vfes.GetElementTransformation(i);
     const int dof = fe->GetDof();
     vfes.GetElementVDofs(i, vdofs);
 
@@ -145,14 +144,14 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace &vfes,
     }
 
     // --- positivity points (use same IR as average) ---
-    const IntegrationRule &ir = IntRules.Get(Tr->GetGeometryType(), qord);
+    const mfem::IntegrationRule &ir = mfem::IntRules.Get(Tr->GetGeometryType(), qord);
     shape.SetSize(dof);
 
     // Step 1: density limiting
     double theta_rho = 1.0;
     for (int q = 0; q < ir.GetNPoints(); ++q)
     {
-      const IntegrationPoint &ip = ir.IntPoint(q);
+      const mfem::IntegrationPoint &ip = ir.IntPoint(q);
       Tr->SetIntPoint(&ip);
       fe->CalcShape(ip, shape);
       elmat.MultTranspose(shape, Up);
@@ -174,7 +173,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace &vfes,
     double theta_p = 1.0;
     for (int q = 0; q < ir.GetNPoints(); ++q)
     {
-      const IntegrationPoint &ip = ir.IntPoint(q);
+      const mfem::IntegrationPoint &ip = ir.IntPoint(q);
       Tr->SetIntPoint(&ip);
       fe->CalcShape(ip, shape);
       elmat.MultTranspose(shape, Up); // current point state (after rho limit)
@@ -201,9 +200,9 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace &vfes,
 // Make POD for mfem::Array<T>
 struct Nbr4 { int xm, xp, ym, yp; };
 
-static void ComputeElementCenter(Mesh &mesh, int e, Vector &c)
+static void ComputeElementCenter(mfem::Mesh &mesh, int e, mfem::Vector &c)
 {
-  Array<int> verts;
+  mfem::Array<int> verts;
   mesh.GetElementVertices(e, verts);
   c.SetSize(3); c = 0.0;
   for (int vi = 0; vi < verts.Size(); ++vi)
@@ -215,9 +214,9 @@ static void ComputeElementCenter(Mesh &mesh, int e, Vector &c)
   c *= inv;
 }
 
-static void ComputeFaceCenter(Mesh &mesh, int f, Vector &c)
+static void ComputeFaceCenter(mfem::Mesh &mesh, int f, mfem::Vector &c)
 {
-  Array<int> verts;
+  mfem::Array<int> verts;
   mesh.GetFaceVertices(f, verts);
   c.SetSize(3); c = 0.0;
   for (int vi = 0; vi < verts.Size(); ++vi)
@@ -229,7 +228,7 @@ static void ComputeFaceCenter(Mesh &mesh, int f, Vector &c)
   c *= inv;
 }
 
-static void Build4Nbrs(Mesh &mesh, Array<Nbr4> &nbr)
+static void Build4Nbrs(mfem::Mesh &mesh, mfem::Array<Nbr4> &nbr)
 {
   const int NE = mesh.GetNE();
   nbr.SetSize(NE);
@@ -241,7 +240,7 @@ static void Build4Nbrs(Mesh &mesh, Array<Nbr4> &nbr)
     mesh.GetFaceElements(f, &e1, &e2);
     if (e1 < 0 || e2 < 0) { continue; } // boundary face
 
-    Vector c1(3), c2(3), fc(3);
+    mfem::Vector c1(3), c2(3), fc(3);
     ComputeFaceCenter(mesh, f, fc);
     ComputeElementCenter(mesh, e1, c1);
     ComputeElementCenter(mesh, e2, c2);
@@ -263,33 +262,33 @@ static void Build4Nbrs(Mesh &mesh, Array<Nbr4> &nbr)
 }
 
 // DOF physical coordinates (use FE nodes).
-static void ElementDofXY(const FiniteElement &fe, ElementTransformation &Tr,
-                         Array2D<double> &xy)
+static void ElementDofXY(const mfem::FiniteElement &fe, mfem::ElementTransformation &Tr,
+                         mfem::Array2D<double> &xy)
 {
-  const IntegrationRule &nodes = fe.GetNodes();
+  const mfem::IntegrationRule &nodes = fe.GetNodes();
   const int dof = fe.GetDof();
   xy.SetSize(2, dof);
   for (int j=0; j<dof; ++j)
   {
-    const IntegrationPoint &ip = nodes.IntPoint(j);
-    Vector XP(3); Tr.Transform(ip, XP);
+    const mfem::IntegrationPoint &ip = nodes.IntPoint(j);
+    mfem::Vector XP(3); Tr.Transform(ip, XP);
     xy(0,j) = XP(0); xy(1,j) = XP(1);
   }
 }
 
 // Slope weights: wx[j] ≈ ∫ ∂x φ_j, wy[j] ≈ ∫ ∂y φ_j  (over the physical element).
-static void SlopeWeights(const FiniteElement &fe, ElementTransformation &Tr,
-                         int qord_slope, Vector &wx, Vector &wy, double &area_out)
+static void SlopeWeights(const mfem::FiniteElement &fe, mfem::ElementTransformation &Tr,
+                         int qord_slope, mfem::Vector &wx, mfem::Vector &wy, double &area_out)
 {
   const int dof = fe.GetDof();
   wx.SetSize(dof); wy.SetSize(dof); wx = 0.0; wy = 0.0;
   area_out = 0.0;
 
-  const IntegrationRule &ir = IntRules.Get(Tr.GetGeometryType(), qord_slope);
-  DenseMatrix dshape(dof, Tr.GetSpaceDim());
+  const mfem::IntegrationRule &ir = mfem::IntRules.Get(Tr.GetGeometryType(), qord_slope);
+  mfem::DenseMatrix dshape(dof, Tr.GetSpaceDim());
   for (int q=0; q<ir.GetNPoints(); ++q)
   {
-    const IntegrationPoint &ip = ir.IntPoint(q);
+    const mfem::IntegrationPoint &ip = ir.IntPoint(q);
     Tr.SetIntPoint(&ip);
     fe.CalcDShape(ip, dshape);
     const double w = ip.weight * Tr.Weight();
@@ -300,19 +299,19 @@ static void SlopeWeights(const FiniteElement &fe, ElementTransformation &Tr,
 
 // Return isotropic element length h from area (dx=dy=h); simple and robust.
 static inline std::pair<double,double>
-ElementDXDYFromArea(ElementTransformation &Tr, int qord)
+ElementDXDYFromArea(mfem::ElementTransformation &Tr, int qord)
 {
-  const IntegrationRule &ir = IntRules.Get(Tr.GetGeometryType(), qord);
+  const mfem::IntegrationRule &ir = mfem::IntRules.Get(Tr.GetGeometryType(), qord);
   double area = 0.0;
   for (int q=0; q<ir.GetNPoints(); ++q)
-  { const IntegrationPoint &ip = ir.IntPoint(q); Tr.SetIntPoint(&ip); area += ip.weight * Tr.Weight(); }
+  { const mfem::IntegrationPoint &ip = ir.IntPoint(q); Tr.SetIntPoint(&ip); area += ip.weight * Tr.Weight(); }
   const double h = std::sqrt(std::max(area, 1e-30));
   return std::make_pair(h, h);
 }
 
 // Euler eigenvectors (2D) for x/y directions at mean state
-static inline void EulerRightEigen2D(const Vector &Ubar, double c, double H,
-                                     DenseMatrix &R_x, DenseMatrix &R_y)
+static inline void EulerRightEigen2D(const mfem::Vector &Ubar, double c, double H,
+                                     mfem::DenseMatrix &R_x, mfem::DenseMatrix &R_y)
 {
   const double rho = std::max(Ubar(0),1e-16);
   const double ux = Ubar(1)/rho;
@@ -334,8 +333,8 @@ static inline void EulerRightEigen2D(const Vector &Ubar, double c, double H,
   R_y(0,3)=1; R_y(1,3)=ux;   R_y(2,3)=uy+c; R_y(3,3)=H+uy*c;
 }
 
-static inline void EulerLeftEigen2D(const Vector &Ubar, double c, double H,
-                                    DenseMatrix &L_x, DenseMatrix &L_y)
+static inline void EulerLeftEigen2D(const mfem::Vector &Ubar, double c, double H,
+                                    mfem::DenseMatrix &L_x, mfem::DenseMatrix &L_y)
 {
   const double rho = std::max(Ubar(0),1e-16);
   const double ux = Ubar(1)/rho;
@@ -368,16 +367,16 @@ static inline double tvb_minmod(double a, double b, double c, double theta, doub
   return 0.0;
 }
 
-void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace &vfes,
-                                   ParGridFunction &U,
+void ApplyCharacteristicTVBLimiter(mfem::ParFiniteElementSpace &vfes,
+                                   mfem::ParGridFunction &U,
                                    const CharTVBOptions &opt)
 {
   MFEM_VERIFY(opt.dim==2, "Characteristic TVB limiter currently implemented for 2D.");
-  MFEM_VERIFY(vfes.GetOrdering() == Ordering::byNODES,
+  MFEM_VERIFY(vfes.GetOrdering() == mfem::Ordering::byNODES,
               "Characteristic TVB limiter assumes byNODES ordering.");
 
-  Mesh *pm = vfes.GetParMesh();
-  Mesh &mesh = pm ? static_cast<Mesh&>(*pm) : *vfes.GetMesh();
+  mfem::Mesh *pm = vfes.GetParMesh();
+  mfem::Mesh &mesh = pm ? static_cast<mfem::Mesh&>(*pm) : *vfes.GetMesh();
 
   const int num_eq = opt.dim + 2;  // 4
   const int NE = vfes.GetNE();
@@ -385,20 +384,20 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace &vfes,
   const int qord_avg   = 2*order + 2;
   const int qord_slope = (opt.slope_qord>0) ? opt.slope_qord : (2*order + 2);
 
-  Array<int> vdofs;
-  Vector elvec;
-  DenseMatrix elmat;
-  Vector Ubar(num_eq), row(num_eq);
-  Vector wx, wy;
-  Array2D<double> dof_xy;
-  Array<Nbr4> nbr; Build4Nbrs(mesh, nbr);
+  mfem::Array<int> vdofs;
+  mfem::Vector elvec;
+  mfem::DenseMatrix elmat;
+  mfem::Vector Ubar(num_eq), row(num_eq);
+  mfem::Vector wx, wy;
+  mfem::Array2D<double> dof_xy;
+  mfem::Array<Nbr4> nbr; Build4Nbrs(mesh, nbr);
 
-  std::vector<Vector> Ubar_all(NE, Vector(num_eq));
+  std::vector<mfem::Vector> Ubar_all(NE, mfem::Vector(num_eq));
   std::vector<std::pair<double,double>> dxy_all(NE);
   for (int i=0; i<NE; ++i)
   {
-    const FiniteElement *fe = vfes.GetFE(i);
-    ElementTransformation *Tr = vfes.GetElementTransformation(i);
+    const mfem::FiniteElement *fe = vfes.GetFE(i);
+    mfem::ElementTransformation *Tr = vfes.GetElementTransformation(i);
     const int dof = fe->GetDof();
     vfes.GetElementVDofs(i, vdofs);
     U.GetSubVector(vdofs, elvec);
@@ -410,8 +409,8 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace &vfes,
 
   for (int i=0; i<NE; ++i)
   {
-    const FiniteElement *fe = vfes.GetFE(i);
-    ElementTransformation *Tr = vfes.GetElementTransformation(i);
+    const mfem::FiniteElement *fe = vfes.GetFE(i);
+    mfem::ElementTransformation *Tr = vfes.GetElementTransformation(i);
     const int dof = fe->GetDof();
 
     const std::pair<double,double> dxy = dxy_all[i];
@@ -425,8 +424,8 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace &vfes,
 
     double area=0.0;
     SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
-    Vector sDGx(num_eq); sDGx = 0.0;
-    Vector sDGy(num_eq); sDGy = 0.0;
+    mfem::Vector sDGx(num_eq); sDGx = 0.0;
+    mfem::Vector sDGy(num_eq); sDGy = 0.0;
     for (int j=0; j<dof; ++j)
     {
       elmat.GetRow(j, row);
@@ -436,13 +435,13 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace &vfes,
     sDGx /= std::max(area, 1e-30);
     sDGy /= std::max(area, 1e-30);
 
-    auto mean_or_self = [&](int j)->const Vector& { return (j>=0) ? Ubar_all[j] : Ubar_all[i]; };
-    const Vector &Uxm = mean_or_self(nbr[i].xm);
-    const Vector &Uxp = mean_or_self(nbr[i].xp);
-    const Vector &Uym = mean_or_self(nbr[i].ym);
-    const Vector &Uyp = mean_or_self(nbr[i].yp);
+    auto mean_or_self = [&](int j)->const mfem::Vector& { return (j>=0) ? Ubar_all[j] : Ubar_all[i]; };
+    const mfem::Vector &Uxm = mean_or_self(nbr[i].xm);
+    const mfem::Vector &Uxp = mean_or_self(nbr[i].xp);
+    const mfem::Vector &Uym = mean_or_self(nbr[i].ym);
+    const mfem::Vector &Uyp = mean_or_self(nbr[i].yp);
 
-    Vector dlx(num_eq), drx(num_eq), dly(num_eq), dry(num_eq);
+    mfem::Vector dlx(num_eq), drx(num_eq), dly(num_eq), dry(num_eq);
     Subtract(Ubar, Uxm, dlx); dlx /= std::max(dx,1e-16);
     Subtract(Uxp, Ubar, drx); drx /= std::max(dx,1e-16);
     Subtract(Ubar, Uym, dly); dly /= std::max(dy,1e-16);
@@ -453,15 +452,15 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace &vfes,
     const double c   = std::sqrt(std::max(opt.gamma*p/rho, 0.0));
     const double H   = (Ubar(3) + p)/rho;
 
-    DenseMatrix R_x(4,4), R_y(4,4), L_x(4,4), L_y(4,4);
+    mfem::DenseMatrix R_x(4,4), R_y(4,4), L_x(4,4), L_y(4,4);
     EulerRightEigen2D(Ubar, c, H, R_x, R_y);
     EulerLeftEigen2D (Ubar, c, H, L_x, L_y);
 
-    Vector A_x(4), B_x(4), C_x(4), A_y(4), B_y(4), C_y(4);
+    mfem::Vector A_x(4), B_x(4), C_x(4), A_y(4), B_y(4), C_y(4);
     L_x.Mult(sDGx, A_x);  L_x.Mult(dlx, B_x);  L_x.Mult(drx, C_x);
     L_y.Mult(sDGy, A_y);  L_y.Mult(dly, B_y);  L_y.Mult(dry, C_y);
 
-    Vector W_x(4), W_y(4);
+    mfem::Vector W_x(4), W_y(4);
     const double tx = opt.M_tvb * dx*dx;
     const double ty = opt.M_tvb * dy*dy;
     for (int k=0; k<4; ++k)
@@ -470,12 +469,12 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace &vfes,
       W_y(k) = tvb_minmod(A_y(k), B_y(k), C_y(k), opt.theta, ty);
     }
 
-    Vector sUx(4), sUy(4);
+    mfem::Vector sUx(4), sUy(4);
     R_x.Mult(W_x, sUx);
     R_y.Mult(W_y, sUy);
 
     // Simple KXRCF-like density jump (decide whether to reconstruct)
-    auto reljump = [](const Vector &a, const Vector &b)->double {
+    auto reljump = [](const mfem::Vector &a, const mfem::Vector &b)->double {
       const double ar = std::max(a(0), 1e-14);
       return std::abs(a(0)-b(0))/ar;
     };
@@ -489,12 +488,12 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace &vfes,
 
     if (troubled)
     {
-      IntegrationPoint ipc; ipc.Set2(0.5,0.5);
-      Vector Xc(3); Tr->Transform(ipc, Xc);
-      Array2D<double> dof_xy;
+      mfem::IntegrationPoint ipc; ipc.Set2(0.5,0.5);
+      mfem::Vector Xc(3); Tr->Transform(ipc, Xc);
+      mfem::Array2D<double> dof_xy;
       ElementDofXY(*fe, *Tr, dof_xy);
 
-      Vector rowv(num_eq);
+      mfem::Vector rowv(num_eq);
       for (int j=0; j<dof; ++j)
       {
         const double dxj = dof_xy(0,j) - Xc(0);
@@ -783,16 +782,16 @@ static inline double BJThetaOnePoint(double wbar, double wpred,
   return 1.0; // within bounds, no restriction
 }
 
-void ApplyCharacteristicBJLimiter(ParFiniteElementSpace &vfes,
-                                  ParGridFunction &U,
+void ApplyCharacteristicBJLimiter(mfem::ParFiniteElementSpace &vfes,
+                                  mfem::ParGridFunction &U,
                                   const CharBJOptions &opt)
 {
   MFEM_VERIFY(opt.dim==2, "Characteristic BJ limiter currently implemented for 2D.");
-  MFEM_VERIFY(vfes.GetOrdering() == Ordering::byNODES,
+  MFEM_VERIFY(vfes.GetOrdering() == mfem::Ordering::byNODES,
               "Characteristic BJ limiter assumes byNODES ordering.");
 
-  Mesh *pm = vfes.GetParMesh();
-  Mesh &mesh = pm ? static_cast<Mesh&>(*pm) : *vfes.GetMesh();
+  mfem::Mesh *pm = vfes.GetParMesh();
+  mfem::Mesh &mesh = pm ? static_cast<mfem::Mesh&>(*pm) : *vfes.GetMesh();
 
   const int num_eq = opt.dim + 2;  // 4
   const int NE = vfes.GetNE();
@@ -800,18 +799,18 @@ void ApplyCharacteristicBJLimiter(ParFiniteElementSpace &vfes,
   const int qord_avg   = 2*order + 2;
   const int qord_slope = (opt.slope_qord>0) ? opt.slope_qord : (2*order + 2);
 
-  Array<Nbr4> nbr; Build4Nbrs(mesh, nbr);
+  mfem::Array<Nbr4> nbr; Build4Nbrs(mesh, nbr);
 
   // Precompute means and "sizes"
-  std::vector<Vector> Ubar_all(NE, Vector(num_eq));
+  std::vector<mfem::Vector> Ubar_all(NE, mfem::Vector(num_eq));
   std::vector<std::pair<double,double>> dxy_all(NE);
 
   {
-    Array<int> vdofs; Vector elvec; DenseMatrix elmat; Vector Ubar(num_eq);
+    mfem::Array<int> vdofs; mfem::Vector elvec; mfem::DenseMatrix elmat; mfem::Vector Ubar(num_eq);
     for (int i=0; i<NE; ++i)
     {
-      const FiniteElement *fe = vfes.GetFE(i);
-      ElementTransformation *Tr = vfes.GetElementTransformation(i);
+      const mfem::FiniteElement *fe = vfes.GetFE(i);
+      mfem::ElementTransformation *Tr = vfes.GetElementTransformation(i);
       const int dof = fe->GetDof();
       vfes.GetElementVDofs(i, vdofs);
       U.GetSubVector(vdofs, elvec);
@@ -823,13 +822,13 @@ void ApplyCharacteristicBJLimiter(ParFiniteElementSpace &vfes,
   }
 
   // Main per-element loop
-  Array<int> vdofs; Vector elvec; DenseMatrix elmat;
-  Vector wx, wy, row(num_eq), Ubar(num_eq);
+  mfem::Array<int> vdofs; mfem::Vector elvec; mfem::DenseMatrix elmat;
+  mfem::Vector wx, wy, row(num_eq), Ubar(num_eq);
 
   for (int i=0; i<NE; ++i)
   {
-    const FiniteElement *fe = vfes.GetFE(i);
-    ElementTransformation *Tr = vfes.GetElementTransformation(i);
+    const mfem::FiniteElement *fe = vfes.GetFE(i);
+    mfem::ElementTransformation *Tr = vfes.GetElementTransformation(i);
     const int dof = fe->GetDof();
     vfes.GetElementVDofs(i, vdofs);
 
@@ -844,8 +843,8 @@ void ApplyCharacteristicBJLimiter(ParFiniteElementSpace &vfes,
     // Candidate DG slopes from ∫ grad φ_j
     double area=0.0;
     SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
-    Vector sDGx(num_eq); sDGx = 0.0;
-    Vector sDGy(num_eq); sDGy = 0.0;
+    mfem::Vector sDGx(num_eq); sDGx = 0.0;
+    mfem::Vector sDGy(num_eq); sDGy = 0.0;
     for (int j=0; j<dof; ++j)
     {
       elmat.GetRow(j, row);
@@ -856,11 +855,11 @@ void ApplyCharacteristicBJLimiter(ParFiniteElementSpace &vfes,
     sDGy /= std::max(area, 1e-30);
 
     // Neighbors (fallback to self on boundary)
-    auto mean_or_self = [&](int j)->const Vector& { return (j>=0) ? Ubar_all[j] : Ubar_all[i]; };
-    const Vector &Uxm = mean_or_self(nbr[i].xm);
-    const Vector &Uxp = mean_or_self(nbr[i].xp);
-    const Vector &Uym = mean_or_self(nbr[i].ym);
-    const Vector &Uyp = mean_or_self(nbr[i].yp);
+    auto mean_or_self = [&](int j)->const mfem::Vector& { return (j>=0) ? Ubar_all[j] : Ubar_all[i]; };
+    const mfem::Vector &Uxm = mean_or_self(nbr[i].xm);
+    const mfem::Vector &Uxp = mean_or_self(nbr[i].xp);
+    const mfem::Vector &Uym = mean_or_self(nbr[i].ym);
+    const mfem::Vector &Uyp = mean_or_self(nbr[i].yp);
 
     // Characteristic transforms at the mean state
     const double rho = std::max(Ubar(0), 1e-16);
@@ -868,24 +867,24 @@ void ApplyCharacteristicBJLimiter(ParFiniteElementSpace &vfes,
     const double c   = std::sqrt(std::max(opt.gamma*p/rho, 0.0));
     const double H   = (Ubar(3) + p)/rho;
 
-    DenseMatrix R_x(4,4), R_y(4,4), L_x(4,4), L_y(4,4);
+    mfem::DenseMatrix R_x(4,4), R_y(4,4), L_x(4,4), L_y(4,4);
     EulerRightEigen2D(Ubar, c, H, R_x, R_y);
     EulerLeftEigen2D (Ubar, c, H, L_x, L_y);
 
     // Project means and slopes to characteristics
-    Vector wbar_x(4), wbar_y(4); L_x.Mult(Ubar, wbar_x); L_y.Mult(Ubar, wbar_y);
+    mfem::Vector wbar_x(4), wbar_y(4); L_x.Mult(Ubar, wbar_x); L_y.Mult(Ubar, wbar_y);
 
-    Vector wxm(4), wxp(4), wym(4), wyp(4);
+    mfem::Vector wxm(4), wxp(4), wym(4), wyp(4);
     L_x.Mult(Uxm, wxm); L_x.Mult(Uxp, wxp);
     L_y.Mult(Uym, wym); L_y.Mult(Uyp, wyp);
 
-    Vector W_x(4), W_y(4);
+    mfem::Vector W_x(4), W_y(4);
     L_x.Mult(sDGx, W_x);
     L_y.Mult(sDGy, W_y);
 
     // BJ: compute theta per wave from two face centers per direction
-    Vector theta_x(4); theta_x = 1.0;
-    Vector theta_y(4); theta_y = 1.0;
+    mfem::Vector theta_x(4); theta_x = 1.0;
+    mfem::Vector theta_y(4); theta_y = 1.0;
 
     // face-center offsets (in physical coords)
     const double hx2 = 0.5*dx;
@@ -942,17 +941,17 @@ void ApplyCharacteristicBJLimiter(ParFiniteElementSpace &vfes,
     }
 
     // Back to conserved slopes
-    Vector sUx(4), sUy(4);
+    mfem::Vector sUx(4), sUy(4);
     R_x.Mult(W_x, sUx);
     R_y.Mult(W_y, sUy);
 
     // Overwrite DOFs with the linear reconstruction Ū + sUx*dxj + sUy*dyj
-    IntegrationPoint ipc; ipc.Set2(0.5,0.5);
-    Vector Xc(3); Tr->Transform(ipc, Xc);
-    Array2D<double> dof_xy;
+    mfem::IntegrationPoint ipc; ipc.Set2(0.5,0.5);
+    mfem::Vector Xc(3); Tr->Transform(ipc, Xc);
+    mfem::Array2D<double> dof_xy;
     ElementDofXY(*fe, *Tr, dof_xy);
 
-    Vector rowv(num_eq);
+    mfem::Vector rowv(num_eq);
     for (int j=0; j<dof; ++j)
     {
       const double dxj = dof_xy(0,j) - Xc(0);
@@ -1227,11 +1226,11 @@ void ApplyBarthJespersenLimiter(mfem::ParFiniteElementSpace &vfes,
                                 const BJOptions &opt)
 {
   MFEM_VERIFY(opt.dim==2, "Barth–Jespersen limiter currently implemented for 2D.");
-  MFEM_VERIFY(vfes.GetOrdering() == Ordering::byNODES,
+  MFEM_VERIFY(vfes.GetOrdering() == mfem::Ordering::byNODES,
               "Barth–Jespersen limiter assumes byNODES ordering.");
 
-  Mesh *pm = vfes.GetParMesh();
-  Mesh &mesh = pm ? static_cast<Mesh&>(*pm) : *vfes.GetMesh();
+  mfem::Mesh *pm = vfes.GetParMesh();
+  mfem::Mesh &mesh = pm ? static_cast<mfem::Mesh&>(*pm) : *vfes.GetMesh();
 
   const int num_eq = opt.dim + 2;  // 4 for Euler 2D
   const int NE = vfes.GetNE();
@@ -1240,21 +1239,21 @@ void ApplyBarthJespersenLimiter(mfem::ParFiniteElementSpace &vfes,
   const int qord_slope = (opt.slope_qord>0) ? opt.slope_qord: (2*order + 2);
 
   // neighbor map and working arrays
-  Array<Nbr4> nbr; Build4Nbrs(mesh, nbr);
+  mfem::Array<Nbr4> nbr; Build4Nbrs(mesh, nbr);
 
-  Array<int> vdofs;
-  Vector elvec;
-  DenseMatrix elmat;                 // (dof × num_eq)
-  Vector Ubar(num_eq), row(num_eq);
-  Vector wx, wy;                     // slope weights
-  Array2D<double> dof_xy;
+  mfem::Array<int> vdofs;
+  mfem::Vector elvec;
+  mfem::DenseMatrix elmat;                 // (dof × num_eq)
+  mfem::Vector Ubar(num_eq), row(num_eq);
+  mfem::Vector wx, wy;                     // slope weights
+  mfem::Array2D<double> dof_xy;
 
   // Precompute all cell averages
-  std::vector<Vector> Ubar_all(NE, Vector(num_eq));
+  std::vector<mfem::Vector> Ubar_all(NE, mfem::Vector(num_eq));
   for (int i=0; i<NE; ++i)
   {
-    const FiniteElement *fe = vfes.GetFE(i);
-    ElementTransformation *Tr = vfes.GetElementTransformation(i);
+    const mfem::FiniteElement *fe = vfes.GetFE(i);
+    mfem::ElementTransformation *Tr = vfes.GetElementTransformation(i);
     const int dof = fe->GetDof();
     vfes.GetElementVDofs(i, vdofs);
     U.GetSubVector(vdofs, elvec);
@@ -1277,8 +1276,8 @@ void ApplyBarthJespersenLimiter(mfem::ParFiniteElementSpace &vfes,
   // Main element loop
   for (int i=0; i<NE; ++i)
   {
-    const FiniteElement *fe = vfes.GetFE(i);
-    ElementTransformation *Tr = vfes.GetElementTransformation(i);
+    const mfem::FiniteElement *fe = vfes.GetFE(i);
+    mfem::ElementTransformation *Tr = vfes.GetElementTransformation(i);
     const int dof = fe->GetDof();
 
     vfes.GetElementVDofs(i, vdofs);
@@ -1290,9 +1289,9 @@ void ApplyBarthJespersenLimiter(mfem::ParFiniteElementSpace &vfes,
     // Slope weights and candidate slopes
     double area = 0.0;
     SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
-    Vector sx(num_eq); sx = 0.0;
-    Vector sy(num_eq); sy = 0.0;
-    Vector rowloc(num_eq);
+    mfem::Vector sx(num_eq); sx = 0.0;
+    mfem::Vector sy(num_eq); sy = 0.0;
+    mfem::Vector rowloc(num_eq);
     for (int j=0; j<dof; ++j)
     {
       elmat.GetRow(j, rowloc);
@@ -1303,8 +1302,8 @@ void ApplyBarthJespersenLimiter(mfem::ParFiniteElementSpace &vfes,
     sy /= std::max(area, 1e-30);
 
     // Element center and DOF coordinates
-    IntegrationPoint ipc; ipc.Set2(0.5,0.5);
-    Vector Xc(3); Tr->Transform(ipc, Xc);
+    mfem::IntegrationPoint ipc; ipc.Set2(0.5,0.5);
+    mfem::Vector Xc(3); Tr->Transform(ipc, Xc);
     ElementDofXY(*fe, *Tr, dof_xy);
 
     // Decide which components to limit

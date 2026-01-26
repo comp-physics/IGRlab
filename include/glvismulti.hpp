@@ -2,8 +2,16 @@
 #include <string>
 #include "mfem.hpp"
 
+/**
+ * @file glvismulti.hpp
+ * @brief GLVis helper utilities for multi-window visualization.
+ * @ingroup io_visualization
+ */
+
 namespace vis {
 
+/// @brief GLVis window wrapper for a socketstream connection.
+/// @ingroup io_visualization
 struct GLVisWindow {
   mfem::socketstream ss;
   std::string title;

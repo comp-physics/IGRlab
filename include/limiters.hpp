@@ -1,11 +1,12 @@
 #pragma once
 #include "mfem.hpp"
+#include "dg_igr_defaults.hpp"
 #include <vector>
 
 /**
  * @file limiters.hpp
- * @brief Positivity-preserving, characteristic TVB, and Barth–Jespersen slope
- *        limiters for DG Euler in MFEM (2D).
+ * @brief Positivity-preserving, characteristic TVB, and BJ slope limiters.
+ * @ingroup numerics_limiters
  */
 
 // =========================== Zhang–Shu positivity limiter ===========================
@@ -52,8 +53,8 @@ void ApplyZhangShuPositivityLimiter(mfem::ParFiniteElementSpace &vfes,
 struct PressureCoefficient : public mfem::Coefficient
 {
   const mfem::ParGridFunction *U = nullptr;
-  int dim = 2;
-  double gamma = 1.4;
+  int dim = mfem::dg_igr::EulerDefaults::kDim;
+  double gamma = mfem::dg_igr::EulerDefaults::kGamma;
   mutable mfem::Vector state; // reuse buffer
 
   PressureCoefficient() = default;
@@ -72,8 +73,8 @@ struct PressureCoefficient : public mfem::Coefficient
  * @brief Options for the characteristic TVB limiter with KXRCF shock flag.
  */
 struct CharTVBOptions {
-  int    dim        = 2;      ///< Spatial dimension (implemented for 2D)
-  double gamma      = 1.4;    ///< Ratio of specific heats
+  int    dim        = mfem::dg_igr::EulerDefaults::kDim;    ///< Spatial dimension (implemented for 2D)
+  double gamma      = mfem::dg_igr::EulerDefaults::kGamma;  ///< Ratio of specific heats
   double theta      = 1.5;    ///< Shu TVB parameter (≈1–2)
   double M_tvb      = 50.0;   ///< TVB threshold constant (tune per problem)
   double tau_flag   = 0.05;   ///< KXRCF-like density jump flag threshold
@@ -124,7 +125,7 @@ void ApplyCharacteristicTVBFaceNormal( mfem::ParFiniteElementSpace &vfes,
  * - For p>1, this acts like a “linear rec” limiter (order reduction locally).
  */
 struct BJOptions {
-  int  dim            = 2;     ///< Spatial dimension (2D implemented)
+  int  dim            = mfem::dg_igr::EulerDefaults::kDim;  ///< Spatial dimension (2D implemented)
   int  qord_avg       = 0;     ///< Quadrature order to compute cell averages (0=>2*order+2)
   int  slope_qord     = 0;     ///< Quadrature order for slope weights (0=>2*order+2)
   bool limit_rho      = true;  ///< Limit density slope
@@ -160,8 +161,8 @@ void ApplyBarthJespersenLimiter(mfem::ParFiniteElementSpace &vfes,
  * basis (one per direction).
  */
 struct CharBJOptions {
-  int    dim        = 2;      ///< Spatial dimension (implemented for 2D)
-  double gamma      = 1.4;    ///< Ratio of specific heats
+  int    dim        = mfem::dg_igr::EulerDefaults::kDim;    ///< Spatial dimension (implemented for 2D)
+  double gamma      = mfem::dg_igr::EulerDefaults::kGamma;  ///< Ratio of specific heats
   int    slope_qord = 0;      ///< Quadrature for slope weights (0 => auto 2*order+2)
   bool   limit_x    = true;   ///< limit in x-direction
   bool   limit_y    = true;   ///< limit in y-direction
@@ -200,8 +201,8 @@ void ApplyCharacteristicBJLimiter(mfem::ParFiniteElementSpace &vfes,
  *       pipeline after this one.
  */
 struct FaceBJOptions {
-  int    dim        = 2;      ///< Spatial dimension (implemented for 2D)
-  double gamma      = 1.4;    ///< Ratio of specific heats
+  int    dim        = mfem::dg_igr::EulerDefaults::kDim;    ///< Spatial dimension (implemented for 2D)
+  double gamma      = mfem::dg_igr::EulerDefaults::kGamma;  ///< Ratio of specific heats
   int    slope_qord = 0;      ///< Quadrature for slope weights (0 => auto 2*order+2)
   double eps_rho    = 1e-14;  ///< Density floor used in characteristic transforms
 };
@@ -232,8 +233,8 @@ void ApplyFaceNormalCharacteristicBJLimiter(mfem::ParFiniteElementSpace &vfes,
  *  controls smoothness: ε = eps_kappa * h^3 (regular) or * (h_n)^3 (face-normal).
  */
 struct VenkatOptions {
-  int    dim        = 2;      ///< 2D supported here
-  double gamma      = 1.4;
+  int    dim        = mfem::dg_igr::EulerDefaults::kDim;    ///< 2D supported here
+  double gamma      = mfem::dg_igr::EulerDefaults::kGamma;
   int    slope_qord = 0;      ///< 0 => auto: 2*order+2
   double eps_kappa  = 1.0;    ///< Smoothness scale
 };

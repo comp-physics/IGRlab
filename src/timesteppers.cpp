@@ -2,7 +2,7 @@
 #include "limiters.hpp"   // ApplyZhangShuPositivityLimiter, etc.
 #include <algorithm>
 
-using namespace mfem;
+namespace mfem {
 
 // ------------------------------- Construction & Init ----------------------------
 
@@ -211,3 +211,5 @@ void RK3SSPWithLimiter::Step(Vector &x, real_t &t, real_t &dt)
 
   ++step_count_;
 }
+
+} // namespace mfem
