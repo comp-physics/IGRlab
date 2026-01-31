@@ -42,7 +42,7 @@ struct LimiterDefaults
 
 struct RK3Defaults
 {
-  static constexpr bool kLimitInitial = true;
+  static constexpr bool kLimitInitial = false;
   static constexpr long kLimiterSteps = -1;
 };
 

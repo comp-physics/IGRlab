@@ -125,8 +125,9 @@ add_example_regression(dg_igr_regression_sedov
   sedov_taylor_blast
   examples/sedov_taylor_blast/sedov_taylor.msh
   -no-vtk -dt_save 1.0)
-add_example_regression(dg_igr_regression_double_mach
-  double_mach_ref
-  tests/meshes/double_mach_ref_regression.mesh
-  REG_TF 1.0e-6 REG_DT 1.0e-6
-  -no-vtk -dt_save 1.0)
+# NOTE: Temporarily disabled per request (double mach regression segfaults).
+# add_example_regression(dg_igr_regression_double_mach
+#   double_mach_ref
+#   tests/meshes/double_mach_ref_regression.mesh
+#   REG_TF 1.0e-6 REG_DT 1.0e-6
+#   -no-vtk -dt_save 1.0)

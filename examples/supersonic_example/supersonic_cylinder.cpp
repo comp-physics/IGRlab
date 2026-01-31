@@ -53,7 +53,7 @@
 #include <iostream>
 #include <memory>
 
-#include "../common/solver.hpp"
+#include "sim/igr_sim.hpp"
 
 #include "supersonic_cylinder.hpp"
 
@@ -90,9 +90,7 @@ int main(int argc, char *argv[])
                     const dg_igr_examples::ExampleContext&,
                     double gamma)
   {
-    const int problem = 1;
-    const mfem::real_t gas_constant = 1.0;
-    auto ic_fun = mfem::EulerInitialCondition(problem, gamma, gas_constant);
+    auto ic_fun = mfem::EulerInitialCondition();
     return std::make_unique<mfem::VectorFunctionCoefficient>(ic_fun);
   };
 

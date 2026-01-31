@@ -57,13 +57,13 @@ struct LimiterPipelineConfig
   TVBLimiterMode tvb_mode = TVBLimiterMode::kNone;
   CharTVBOptions tvb_opts;
 
-  VenkatLimiterMode venkat_mode = VenkatLimiterMode::kFaceNormal;
+  VenkatLimiterMode venkat_mode = VenkatLimiterMode::kNone;
   VenkatOptions venkat_opts;
 
   bool krivodonova = false;
   KrivoOptions krivo_opts;
 
-  bool zhang_shu = true;
+  bool zhang_shu = false;
 };
 
 /**

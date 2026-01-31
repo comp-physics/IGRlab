@@ -1,5 +1,10 @@
 #pragma once
 
+/**
+ * @file sim/state/state_views.hpp
+ * @brief Euler state view helpers (density/momentum/pressure projections).
+ */
+
 #include "mfem.hpp"
 #include "physics/euler/diagnostics.hpp"
 

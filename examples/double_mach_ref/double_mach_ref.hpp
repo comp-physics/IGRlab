@@ -1,25 +1,23 @@
-//                  MFEM Example 18 - Serial/Parallel Shared Code
-//                      (Implementation of Time-dependent DG Operator)
-//
-// This code provide example problems for the Euler equations and implements
-// the time-dependent DG operator given by the equation:
-//
-//            (u_t, v)_T - (F(u), ∇ v)_T + <F̂(u, n), [[v]]>_F = 0.
-//
-// This operator is designed for explicit time stepping methods. Specifically,
-// the function DGHyperbolicConservationLaws::Mult implements the following
-// transformation:
-//
-//                             u ↦ M⁻¹(-DF(u) + NF(u))
-//
-// where M is the mass matrix, DF is the weak divergence of flux, and NF is the
-// interface flux. The inverse of the mass matrix is computed element-wise by
-// leveraging the block-diagonal structure of the DG mass matrix. Additionally,
-// the flux-related terms are computed using the HyperbolicFormIntegrator.
-//
-// The maximum characteristic speed is determined for each time step. For more
-// details, refer to the documentation of DGHyperbolicConservationLaws::Mult.
-//
+#pragma once
+
+/**
+ * @file examples/double_mach_ref/double_mach_ref.hpp
+ * @brief Double Mach reflection example utilities.
+ *
+ * Implements example problems for the Euler equations and provides utilities
+ * to build initial conditions for the double Mach reflection case. The DG
+ * operator solves:
+ *
+ *   (u_t, v)_T - (F(u), grad v)_T + <Fhat(u, n), [[v]]>_F = 0.
+ *
+ * DGHyperbolicConservationLaws::Mult applies:
+ *
+ *   u -> M^{-1}(-DF(u) + NF(u)),
+ *
+ * where M is the mass matrix, DF is the weak divergence of flux, and NF is the
+ * interface flux. The inverse of the mass matrix is computed element-wise via
+ * the block-diagonal structure, and flux terms use HyperbolicFormIntegrator.
+ */
 
 #include <functional>
 #include "mfem.hpp"
@@ -34,73 +32,10 @@ namespace mfem
 
 ///// Mesh Utilities
 
+/// @brief Default mesh filename for the double Mach reflection case.
 inline const char* DoubleMachRefDefaultMeshPath()
 {
    return "double_mach_ref.msh";
-}
-
-Mesh EulerMesh(const int problem)
-{
-   switch (problem)
-   {
-      case 1:
-         return Mesh(DoubleMachRefDefaultMeshPath());
-      case 2:
-         return Mesh(DoubleMachRefDefaultMeshPath());
-      default:
-         MFEM_ABORT("Problem Undefined");
-   }
-}
-
-// Initial condition
-std::function<void(const Vector&, Vector&)> GetMovingVortexInit(
-   const real_t radius, const real_t Minf, const real_t beta,
-   const real_t gas_constant, const real_t specific_heat_ratio)
-{
-   return [specific_heat_ratio,
-           gas_constant, Minf, radius, beta](const Vector &x, Vector &y)
-   {
-      MFEM_ASSERT(x.Size() == 2, "");
-
-      const real_t xc = 2.0, yc = 0.0;
-
-      // Nice units
-      const real_t vel_inf = 1.;
-      const real_t den_inf = 1.;
-
-      // Derive remainder of background state from this and Minf
-      const real_t pres_inf = (den_inf / specific_heat_ratio) *
-                              (vel_inf / Minf) * (vel_inf / Minf);
-      const real_t temp_inf = pres_inf / (den_inf * gas_constant);
-
-      real_t r2rad = 0.0;
-      r2rad += (x(0) - xc) * (x(0) - xc);
-      r2rad += (x(1) - yc) * (x(1) - yc);
-      r2rad /= (radius * radius);
-
-      const real_t shrinv1 = 1.0 / (specific_heat_ratio - 1.);
-
-      const real_t velX =
-         vel_inf * (1 - beta * (x(1) - yc) / radius * std::exp(-0.5 * r2rad));
-      const real_t velY =
-         vel_inf * beta * (x(0) - xc) / radius * std::exp(-0.5 * r2rad);
-      const real_t vel2 = velX * velX + velY * velY;
-
-      const real_t specific_heat =
-         gas_constant * specific_heat_ratio * shrinv1;
-      const real_t temp = temp_inf - 0.5 * (vel_inf * beta) *
-                          (vel_inf * beta) / specific_heat *
-                          std::exp(-r2rad);
-
-      const real_t den = den_inf * std::pow(temp / temp_inf, shrinv1);
-      const real_t pres = den * gas_constant * temp;
-      const real_t energy = shrinv1 * pres / den + 0.5 * vel2;
-
-      y(0) = den;
-      y(1) = den * velX;
-      y(2) = den * velY;
-      y(3) = den * energy;
-   };
 }
 
 /**
@@ -112,6 +47,7 @@ std::function<void(const Vector&, Vector&)> GetMovingVortexInit(
  * This is intended for initializing the domain consistently with
  * your inlet boundary conditions when you already have Uin in conservative form.
  */
+/// @brief Build a uniform Euler initial condition from a conservative state.
 VectorFunctionCoefficient EulerInitialCondition(const mfem::Vector &Uin)
 {
    MFEM_VERIFY(Uin.Size() >= 4, "Uin must contain at least [rho, rho*u_x, rho*u_y, E]");
@@ -155,6 +91,7 @@ VectorFunctionCoefficient EulerInitialCondition(const mfem::Vector &Uin)
  *   U(x,0) = S * Ua + (1 - S) * Ub
  * in conservative variables [ρ, ρu_x, ρu_y, E].
  */
+/// @brief Initial condition for the double Mach reflection problem.
 inline mfem::VectorFunctionCoefficient DoubleMachReflectionInitialCondition(
    int mx,
    int my,
@@ -241,6 +178,7 @@ inline mfem::VectorFunctionCoefficient DoubleMachReflectionInitialCondition(
       });
 }
 
+/// @brief Pre-shock conservative state for the double Mach setup.
 inline mfem::Vector DoubleMachPreShockState(double gamma = 1.4)
 {
    // Ahead-of-shock state from the paper:
@@ -261,6 +199,7 @@ inline mfem::Vector DoubleMachPreShockState(double gamma = 1.4)
    return Ua;
 }
 
+/// @brief Post-shock conservative state for the double Mach setup.
 inline mfem::Vector DoubleMachPostShockState(double gamma = 1.4,
                                              double M     = 2.0)
 {

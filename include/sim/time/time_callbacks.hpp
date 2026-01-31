@@ -1,0 +1,84 @@
+#pragma once
+
+/**
+ * @file sim/time/time_callbacks.hpp
+ * @brief Callback interfaces and payloads for time-loop diagnostics.
+ */
+
+#include <functional>
+
+namespace dg_igr_examples
+{
+
+/// @brief Per-step timing/metric payload for alive callbacks.
+struct TimeLoopInfo
+{
+  int step = 0;
+  double t = 0.0;
+  double dt = 0.0;
+  double elapsed = 0.0;
+  double avg_step = 0.0;
+  double avg_step_per_dof_local = 0.0;
+  double avg_step_per_dof_rank = 0.0;
+  int local_dofs = 0;
+  long long global_dofs = 0;
+  int ranks = 1;
+  bool is_final = false;
+};
+
+/// @brief Analysis payload with optional min/max diagnostics.
+struct AnalysisInfo
+{
+  TimeLoopInfo base;
+  bool has_rho = false;
+  double rho_min = 0.0;
+  double rho_max = 0.0;
+  bool has_p = false;
+  double p_min = 0.0;
+  double p_max = 0.0;
+};
+
+/// @brief VTK save event payload.
+struct VTKSaveInfo
+{
+  int cycle = 0;
+  int step = 0;
+  double t = 0.0;
+  bool is_initial = false;
+  bool is_final = false;
+};
+
+/// @brief End-of-run summary payload.
+struct RunSummary
+{
+  int steps = 0;
+  double elapsed = 0.0;
+  double avg_step = 0.0;
+  double avg_step_per_dof_local = 0.0;
+  double avg_step_per_dof_rank = 0.0;
+  int local_dofs = 0;
+  long long global_dofs = 0;
+  int ranks = 1;
+};
+
+/// @brief Callback bundle for time-loop diagnostics and logging.
+struct TimeLoopCallbacks
+{
+  std::function<void(const TimeLoopInfo&)> on_alive;
+  std::function<void(const AnalysisInfo&)> on_analysis;
+  std::function<void(const VTKSaveInfo&)> on_vtk_save;
+  std::function<void(const RunSummary&)> on_summary;
+  bool wants_minmax = false;
+};
+
+/// @brief Configuration for the default callback builder.
+struct DefaultCallbackConfig
+{
+  bool enable_alive = true;
+  bool enable_analysis = true;
+  bool enable_vtk = true;
+  bool enable_summary = true;
+  bool compute_minmax = true;
+};
+
+} // namespace dg_igr_examples

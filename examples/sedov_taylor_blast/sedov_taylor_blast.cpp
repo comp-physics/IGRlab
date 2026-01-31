@@ -54,7 +54,7 @@
 #include <iostream>
 #include <sstream>
 
-#include "../common/solver.hpp"
+#include "sim/igr_sim.hpp"
 
 #include "sedov_taylor_blast.hpp"
 
@@ -74,10 +74,26 @@ int main(int argc, char *argv[]) {
   spec.need_h1 = true;
   spec.vis.h1_diagnostics = false;
   spec.vis.precision = 8;
+  // Callback defaults (explicit to show the available options).
+  spec.callback_defaults.enable_alive = true;
+  spec.callback_defaults.enable_analysis = true;
+  spec.callback_defaults.enable_vtk = true;
+  spec.callback_defaults.enable_summary = true;
+  spec.callback_defaults.compute_minmax = true;
+  // Custom callbacks example (optional):
+  // spec.make_callbacks = [&](const auto&, auto&) {
+  //   auto cb =
+  //       dg_igr_examples::MakeDefaultTimeLoopCallbacks(spec.callback_defaults);
+  //   // Example: extend analysis with custom diagnostics.
+  //   // cb.on_analysis = [&](const dg_igr_examples::AnalysisInfo& info) { ...
+  //   }; return cb;
+  // };
 
   spec.configure_case = [](dg_igr_examples::CaseConfig &cfg) {
     cfg.defaults.t_final = 4.0;
     cfg.rk3_config.limit_initial = false;
+    cfg.limiter_pipeline.zhang_shu = true;
+    cfg.limiter_pipeline.krivodonova = true;
   };
 
   spec.make_ic = [](const SedovOptions &,

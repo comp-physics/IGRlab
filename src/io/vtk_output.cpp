@@ -12,8 +12,6 @@ void ApplyVTKConfig(mfem::ParaViewDataCollection& dc,
   if (cfg.levels_of_detail >= 0) { dc.SetLevelsOfDetail(cfg.levels_of_detail); }
   dc.SetDataFormat(cfg.format);
   dc.SetHighOrderOutput(cfg.high_order_output);
-  dc.SetCycle(cfg.cycle);
-  dc.SetTime(cfg.time);
 }
 
 void RegisterEulerFields(mfem::ParaViewDataCollection& dc,

@@ -1,5 +1,10 @@
 #pragma once
 
+/**
+ * @file sim/config/common_options.hpp
+ * @brief Shared CLI options for sim-layer examples.
+ */
+
 #include <string>
 
 #include "mfem.hpp"

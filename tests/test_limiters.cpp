@@ -667,9 +667,8 @@ int RunLimiterTests(TestContext& ctx)
         mfem::ApplyCharacteristicVenkatFaceNormal(space, U, opt);
       });
 
-  // Krivodonova hierarchical limiter: run non-blocking checks for now.
+  // Krivodonova hierarchical limiter: enforce admissibility.
   {
-    constexpr bool kKrivoBlocking = false;
     mfem::KrivoOptions opt;
     opt.dim = kDim;
     opt.gamma = kGamma;
@@ -684,20 +683,9 @@ int RunLimiterTests(TestContext& ctx)
     double min_rho = 0.0;
     double min_p = 0.0;
     MinRhoPressure(vfes, U_krivo, qord, min_rho, min_p);
-
-    if (kKrivoBlocking)
-    {
-      ctx.Check(finite, "Krivodonova limiter keeps values finite");
-      ctx.Check(min_rho > 0.0, "Krivodonova limiter keeps density positive");
-      ctx.Check(min_p > 0.0, "Krivodonova limiter keeps pressure positive");
-    }
-    else if (!finite || min_rho <= 0.0 || min_p <= 0.0)
-    {
-      std::cerr << "[WARN] Krivodonova limiter produced non-admissible state: "
-                << "finite=" << finite
-                << ", min_rho=" << min_rho
-                << ", min_p=" << min_p << "\n";
-    }
+    ctx.Check(finite, "Krivodonova limiter keeps values finite");
+    ctx.Check(min_rho > 0.0, "Krivodonova limiter keeps density positive");
+    ctx.Check(min_p > 0.0, "Krivodonova limiter keeps pressure positive");
   }
 
   return ctx.failures;

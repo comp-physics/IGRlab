@@ -39,8 +39,6 @@ struct VTKOutputConfig
   mfem::VTKFormat format = mfem::VTKFormat::BINARY; ///< Output format
   bool high_order_output = true;             ///< Preserve high-order data
   int levels_of_detail = -1;                 ///< <0 keeps current DC setting
-  int cycle = 0;                             ///< Initial cycle index
-  double time = 0.0;                         ///< Initial time
 };
 
 } // namespace io

@@ -1,5 +1,10 @@
 #pragma once
 
+/**
+ * @file sim/io/vis_helpers.hpp
+ * @brief GLVis/VTK field helpers for Euler visualization.
+ */
+
 #include <utility>
 
 #include "mfem.hpp"
@@ -7,7 +12,7 @@
 #include "io/euler_vis.hpp"
 #include "io/vtk_output.hpp"
 
-#include "state_helpers.hpp"
+#include "sim/state/state_views.hpp"
 
 namespace dg_igr_examples
 {
@@ -238,20 +243,16 @@ inline void UpdateEulerGLVis(EulerVisWindows& windows,
   {
     fields.pressure->Update();
   }
-  if (!fields.state)
+  if (!fields.state || !fields.pressure)
   {
     return;
   }
-
   vis::Update(windows.density, num_procs, my_rank, pmesh,
               fields.state->density, t, "density");
   vis::Update(windows.energy, num_procs, my_rank, pmesh,
               fields.state->energy, t, "energy");
-  if (fields.pressure)
-  {
-    vis::Update(windows.pressure, num_procs, my_rank, pmesh,
-                fields.pressure->pressure, t, "pressure");
-  }
+  vis::Update(windows.pressure, num_procs, my_rank, pmesh,
+              fields.pressure->pressure, t, "pressure");
   vis::Update(windows.momentum_x, num_procs, my_rank, pmesh,
               fields.state->momentum_x, t, "momentum_x");
 }

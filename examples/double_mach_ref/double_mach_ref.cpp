@@ -53,16 +53,31 @@
 #include <iostream>
 #include <memory>
 
-#include "../common/solver.hpp"
+#include "sim/igr_sim.hpp"
 
 #include "double_mach_ref.hpp"
 
 namespace
 {
 
+struct InflowOptions
+{
+  double vx = 2.0;
+  double vy = 0.0;
+};
+
+inline void AddInflowOptions(mfem::OptionsParser& args,
+                             InflowOptions& inflow_opts)
+{
+  args.AddOption(&inflow_opts.vx, "-vx", "--velocity-x",
+                 "Free-stream / inflow velocity x-component.");
+  args.AddOption(&inflow_opts.vy, "-vy", "--velocity-y",
+                 "Free-stream / inflow velocity y-component.");
+}
+
 struct DoubleMachOptions
 {
-  dg_igr_examples::InflowOptions inflow;
+  InflowOptions inflow;
 };
 
 } // namespace
@@ -88,7 +103,7 @@ int main(int argc, char *argv[])
   spec.add_options = [](mfem::OptionsParser& args, DoubleMachOptions& opts)
   {
     opts.inflow.vx = 2.0;
-    dg_igr_examples::AddInflowOptions(args, opts.inflow);
+    AddInflowOptions(args, opts.inflow);
   };
 
   spec.make_ic = [](const DoubleMachOptions&,
@@ -116,13 +131,14 @@ int main(int argc, char *argv[])
          {dg_igr_examples::BoundaryRole::Inlet, {4}}});
   };
 
-  spec.apply_bc = [](const DoubleMachOptions&,
+  spec.apply_bc = [](const DoubleMachOptions& opts,
                      const dg_igr_examples::ExampleContext&,
                      auto& bc,
                      const auto& markers)
   {
     const mfem::real_t gamma = 1.4;
-    mfem::Vector Ub = mfem::DoubleMachPostShockState(gamma, /*M=*/2.0);
+    const double M = std::max(1.0e-12, std::abs(opts.inflow.vx));
+    mfem::Vector Ub = mfem::DoubleMachPostShockState(gamma, /*M=*/M);
     bc.AddSupersonicInletFromBuilder(markers, [&]() { return Ub; });
     bc.AddSupersonicOutlet(markers, dg_igr_examples::BoundaryRole::BottomInlet);
     bc.AddSupersonicOutlet(markers);

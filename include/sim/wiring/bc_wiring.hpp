@@ -1,5 +1,10 @@
 #pragma once
 
+/**
+ * @file sim/wiring/bc_wiring.hpp
+ * @brief Boundary marker helpers and BC wiring utilities for Euler DG.
+ */
+
 #include <initializer_list>
 #include <map>
 
@@ -124,5 +129,59 @@ inline void AddSlipWall(mfem::DGHyperbolicConservationLaws& op,
           int_order_offset),
       marker);
 }
+
+/// @brief Convenience wrapper for adding Euler boundary integrators.
+template <typename NumericalFlux>
+class EulerBoundaryWiring
+{
+public:
+  EulerBoundaryWiring(mfem::DGHyperbolicConservationLaws& op,
+                      const NumericalFlux& numerical_flux,
+                      int int_order_offset,
+                      int dim)
+    : op_(op),
+      numerical_flux_(numerical_flux),
+      int_order_offset_(int_order_offset),
+      dim_(dim)
+  {}
+
+  void AddSlipWall(const BoundaryMarkerMap& markers,
+                   BoundaryRole role = BoundaryRole::Slip) const
+  {
+    dg_igr_examples::AddSlipWall(op_, numerical_flux_, int_order_offset_,
+                                 dim_, markers.At(role));
+  }
+
+  void AddSupersonicOutlet(const BoundaryMarkerMap& markers,
+                           BoundaryRole role = BoundaryRole::Outlet) const
+  {
+    dg_igr_examples::AddSupersonicOutlet(op_, numerical_flux_, int_order_offset_,
+                                         markers.At(role));
+  }
+
+  void AddSupersonicInlet(const BoundaryMarkerMap& markers,
+                          const mfem::Vector& inlet_state,
+                          BoundaryRole role = BoundaryRole::Inlet) const
+  {
+    dg_igr_examples::AddSupersonicInlet(op_, numerical_flux_, inlet_state,
+                                        int_order_offset_, markers.At(role));
+  }
+
+  template <typename StateBuilder>
+  void AddSupersonicInletFromBuilder(const BoundaryMarkerMap& markers,
+                                     StateBuilder&& build_inlet_state,
+                                     BoundaryRole role = BoundaryRole::Inlet) const
+  {
+    dg_igr_examples::AddSupersonicInletFromBuilder(
+        op_, numerical_flux_, std::forward<StateBuilder>(build_inlet_state),
+        int_order_offset_, markers.At(role));
+  }
+
+private:
+  mfem::DGHyperbolicConservationLaws& op_;
+  const NumericalFlux& numerical_flux_;
+  int int_order_offset_ = 0;
+  int dim_ = 0;
+};
 
 } // namespace dg_igr_examples

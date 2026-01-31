@@ -53,16 +53,31 @@
 #include <iostream>
 #include <memory>
 
-#include "../common/solver.hpp"
+#include "sim/igr_sim.hpp"
 
 #include "supersonic_cylinder_w_igr.hpp"
 
 namespace
 {
 
+struct InflowOptions
+{
+  double vx = 3.0;
+  double vy = 0.0;
+};
+
+inline void AddInflowOptions(mfem::OptionsParser& args,
+                             InflowOptions& inflow_opts)
+{
+  args.AddOption(&inflow_opts.vx, "-vx", "--velocity-x",
+                 "Free-stream / inflow velocity x-component.");
+  args.AddOption(&inflow_opts.vy, "-vy", "--velocity-y",
+                 "Free-stream / inflow velocity y-component.");
+}
+
 struct SupersonicIGROptions
 {
-  dg_igr_examples::InflowOptions inflow;
+  InflowOptions inflow;
 };
 
 } // namespace
@@ -83,12 +98,14 @@ int main(int argc, char *argv[])
   {
     cfg.defaults.t_final = 4.0;
     cfg.rk3_config.limit_initial = false;
-    cfg.igr_config.smoot = dg_igr::IGRSmootherType::L1GS;
+   //  cfg.igr_config.smoot = dg_igr::IGRSmootherType::L1GS;
+    cfg.limiter_pipeline.zhang_shu = true;
+   //  cfg.limiter_pipeline.krivodonova = true;
   };
 
   spec.add_options = [](mfem::OptionsParser& args, SupersonicIGROptions& opts)
   {
-    dg_igr_examples::AddInflowOptions(args, opts.inflow);
+    AddInflowOptions(args, opts.inflow);
   };
 
   spec.make_ic = [](const SupersonicIGROptions& opts,

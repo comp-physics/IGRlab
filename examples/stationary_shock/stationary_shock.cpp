@@ -54,17 +54,14 @@
 #include <iostream>
 #include <memory>
 
-#include "../common/solver.hpp"
+#include "sim/igr_sim.hpp"
 
 #include "stationary_shock.hpp"
 
 namespace
 {
 
-struct StationaryShockOptions
-{
-  dg_igr_examples::InflowOptions inflow;
-};
+using StationaryShockOptions = dg_igr_examples::EmptyCaseOptions;
 
 } // namespace
 
@@ -85,11 +82,6 @@ int main(int argc, char *argv[])
   {
     cfg.defaults.t_final = 6.0;
     cfg.rk3_config.limit_initial = false;
-  };
-
-  spec.add_options = [](mfem::OptionsParser& args, StationaryShockOptions& opts)
-  {
-    dg_igr_examples::AddInflowOptions(args, opts.inflow);
   };
 
   spec.make_ic = [](const StationaryShockOptions&,

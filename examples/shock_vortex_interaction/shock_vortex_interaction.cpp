@@ -54,17 +54,14 @@
 #include <iostream>
 #include <memory>
 
-#include "../common/solver.hpp"
+#include "sim/igr_sim.hpp"
 
 #include "shock_vortex_interaction.hpp"
 
 namespace
 {
 
-struct ShockVortexOptions
-{
-  dg_igr_examples::InflowOptions inflow;
-};
+using ShockVortexOptions = dg_igr_examples::EmptyCaseOptions;
 
 } // namespace
 
@@ -85,11 +82,6 @@ int main(int argc, char *argv[])
   {
     cfg.defaults.t_final = 6.0;
     cfg.rk3_config.limit_initial = false;
-  };
-
-  spec.add_options = [](mfem::OptionsParser& args, ShockVortexOptions& opts)
-  {
-    dg_igr_examples::AddInflowOptions(args, opts.inflow);
   };
 
   spec.make_ic = [](const ShockVortexOptions&,

@@ -1,5 +1,10 @@
 #pragma once
 
+/**
+ * @file sim/time/time_loop.hpp
+ * @brief Shared explicit time loop used by simulation examples.
+ */
+
 #include <algorithm>
 #include <cmath>
 #include <functional>

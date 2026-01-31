@@ -10,88 +10,85 @@
 
 namespace {
 
-// Build monomial index list (a,b) with total degree <= p
-static void BuildMonomialAB(int p, std::vector<std::pair<int,int>> &ab)
+static void LegendreValues(int p, double x, mfem::Vector &vals)
 {
-  ab.clear();
-  for (int t=0; t<=p; ++t) for (int a=0; a<=t; ++a) { int b = t - a; ab.emplace_back(a,b); }
-}
-
-// Evaluate monomial basis at reference point (xi,eta)
-static inline double Mono(int a, int b, double xi, double eta)
-{ double v=1.0; for(int i=0;i<a;++i) v*=xi; for(int j=0;j<b;++j) v*=eta; return v; }
-
-// Get ref nodes (xi,eta) from FE nodes (works for L2 quads). Returns 2x dof.
-static void RefDofXY(const mfem::FiniteElement &fe, mfem::Array2D<double> &xy)
-{
-  const mfem::IntegrationRule &nodes = fe.GetNodes();
-  const int dof = fe.GetDof();
-  xy.SetSize(2, dof);
-  for (int j=0; j<dof; ++j) { const mfem::IntegrationPoint &ip = nodes.IntPoint(j); xy(0,j) = ip.x; xy(1,j) = ip.y; }
-}
-
-static void DenseTranspose(const mfem::DenseMatrix &A, mfem::DenseMatrix &AT)
-{
-  AT.SetSize(A.Width(), A.Height());
-  for (int i = 0; i < A.Height(); ++i)
-    for (int j = 0; j < A.Width(); ++j)
-      AT(j, i) = A(i, j);
-}
-
-// Build Vandermonde V(dof x ncoef) and a robust LSQ projector
-//   P(ncoef x dof) ~= (V^T V + lambda I)^-1 V^T
-// where lambda is tiny Tikhonov regularization to avoid catastrophic inverses.
-static void BuildVandermondeAndProjector(const mfem::FiniteElement &fe, int p,
-                                         mfem::DenseMatrix &V, mfem::DenseMatrix &P,
-                                         std::vector<std::pair<int,int>> &ab)
-{
-  // 1) reference DOF coordinates
-  mfem::Array2D<double> xy;
-  RefDofXY(fe, xy);
-
-  // 2) monomial index list
-  BuildMonomialAB(p, ab);
-
-  const int dof   = fe.GetDof();
-  const int ncoef = (p+1)*(p+2)/2;
-
-  // 3) Vandermonde
-  V.SetSize(dof, ncoef);
-  for (int j = 0; j < dof; ++j)
+  vals.SetSize(p + 1);
+  vals(0) = 1.0;
+  if (p >= 1) { vals(1) = x; }
+  for (int n = 2; n <= p; ++n)
   {
-    const double xi  = xy(0, j);
-    const double eta = xy(1, j);
-    for (int k = 0; k < ncoef; ++k)
+    vals(n) = ((2.0 * n - 1.0) * x * vals(n - 1) - (n - 1.0) * vals(n - 2)) /
+              static_cast<double>(n);
+  }
+}
+
+static inline double LegendreNorm2D(int i, int j)
+{
+  // ∫_{-1}^1 P_i^2 dx = 2/(2i+1), so tensor-product norm is 4/((2i+1)(2j+1)).
+  return 4.0 / ((2.0 * i + 1.0) * (2.0 * j + 1.0));
+}
+
+static void BuildModalCoefficients(const mfem::FiniteElement &fe,
+                                   const mfem::DenseMatrix &elfun_mat,
+                                   int p,
+                                   int num_eq,
+                                   const mfem::Vector &Ubar,
+                                   mfem::DenseMatrix &c_all)
+{
+  const int ncoef = (p + 1) * (p + 1);
+  const int dof = fe.GetDof();
+  c_all.SetSize(ncoef, num_eq);
+  c_all = 0.0;
+
+  const int qord = std::max(2, 2 * p + 2);
+  const mfem::IntegrationRule &ir =
+      mfem::IntRules.Get(fe.GetGeomType(), qord);
+
+  mfem::Vector shape(dof);
+  mfem::Vector state(num_eq);
+  mfem::Vector Px, Py;
+
+  for (int q = 0; q < ir.GetNPoints(); ++q)
+  {
+    const mfem::IntegrationPoint &ip = ir.IntPoint(q);
+    fe.CalcShape(ip, shape);
+    elfun_mat.MultTranspose(shape, state);
+
+    LegendreValues(p, ip.x, Px);
+    LegendreValues(p, ip.y, Py);
+
+    int k = 0;
+    for (int i = 0; i <= p; ++i)
     {
-      const int a = ab[k].first, b = ab[k].second;
-      V(j, k) = Mono(a, b, xi, eta);
+      for (int j = 0; j <= p; ++j, ++k)
+      {
+        const double phi = Px(i) * Py(j);
+        for (int comp = 0; comp < num_eq; ++comp)
+        {
+          const double r = state(comp) - Ubar(comp);
+          c_all(k, comp) += ip.weight * r * phi;
+        }
+      }
     }
   }
 
-  // 4) Robust projector: P = (V^T V + lambda I)^-1 V^T
-  mfem::DenseMatrix VT, G;
-  DenseTranspose(V, VT);         // (ncoef x dof)
-  mfem::Mult(VT, V, G);          // (ncoef x ncoef)
+  int k = 0;
+  for (int i = 0; i <= p; ++i)
+  {
+    for (int j = 0; j <= p; ++j, ++k)
+    {
+      const double norm = LegendreNorm2D(i, j);
+      for (int comp = 0; comp < num_eq; ++comp)
+      {
+        c_all(k, comp) /= norm;
+      }
+    }
+  }
 
-  // Tikhonov regularization lambda = eps * trace(G) / ncoef
-  double tr = 0.0; for (int i = 0; i < G.Height(); ++i) tr += G(i,i);
-  const double lam = std::max(1e-14, 1e-14 * tr / std::max(1, G.Height()));
-  for (int i = 0; i < G.Height(); ++i) { G(i,i) += lam; }
-
-  // Solve G * X = VT  => P = X
-  // Use MFEM's DenseMatrixInverse (LU+pivoting) instead of CalcInverse
-  mfem::DenseMatrixInverse inv(G);
-  inv.Factor();                  // LU with pivoting
-  inv.Mult(VT, P);               // P: (ncoef x dof)
-
-  // Guard: if anything bad slipped in, fall back to zero projector (no limiting)
-  auto sane = [](double v){ return std::isfinite(v); };
-  bool ok = true;
-  for (int i = 0; i < P.Height() && ok; ++i)
-    for (int j = 0; j < P.Width(); ++j)
-      if (!sane(P(i,j))) { ok = false; break; }
-
-  if (!ok) { P.SetSize(ncoef, dof); P = 0.0; } // conservative fallback
+  for (int comp = 0; comp < num_eq; ++comp)
+  {
+    c_all(0, comp) = 0.0;
+  }
 }
 
 // Compute element average Ubar by quadrature (reusing helper)
@@ -115,9 +112,10 @@ static void ElementAverageQuad(const mfem::FiniteElement &fe, mfem::ElementTrans
 }
 
 // Face quadrature points in reference space for each face of the quad
-static void FaceRefQuadrature(int p, std::array<std::vector<mfem::IntegrationPoint>,4> &fqs)
+static void FaceRefQuadrature(int qord_in,
+                              std::array<std::vector<mfem::IntegrationPoint>,4> &fqs)
 {
-  const int qord = std::max(2, p+2);
+  const int qord = std::max(2, qord_in);
   const mfem::IntegrationRule &ir1d = mfem::IntRules.Get(mfem::Geometry::SEGMENT, qord);
   fqs.fill({});
   // face 0: xi=-1, eta in [-1,1]
@@ -140,6 +138,8 @@ void ApplyKrivodonovaHierarchicalLimiter(mfem::ParFiniteElementSpace &vfes,
                                          const KrivoOptions &opt)
 {
   MFEM_VERIFY(opt.dim == 2, "Krivodonova limiter implemented for 2D.");
+  MFEM_VERIFY(opt.conservative_only,
+              "Krivodonova limiter currently supports conservative limiting only.");
   MFEM_VERIFY(vfes.GetOrdering() == mfem::Ordering::byNODES, "Assumes byNODES.");
   // Only quads for now
   for (int i = 0; i < vfes.GetNE(); ++i) {
@@ -177,11 +177,34 @@ void ApplyKrivodonovaHierarchicalLimiter(mfem::ParFiniteElementSpace &vfes,
 
   // face quadrature on reference
   std::array<std::vector<mfem::IntegrationPoint>,4> face_qpts;
-  FaceRefQuadrature(p, face_qpts);
+  FaceRefQuadrature(face_q, face_qpts);
 
-  // monomial index and projection matrices (cached per order)
-  std::vector<std::pair<int,int>> ab;
-  mfem::DenseMatrix V, P; // V: dof x ncoef, P: ncoef x dof
+  const int ncoef = (p + 1) * (p + 1);
+  std::vector<int> low_modes;
+  std::vector<int> high_modes;
+  low_modes.reserve(ncoef);
+  high_modes.reserve(ncoef);
+  {
+    int k = 0;
+    for (int i = 0; i <= p; ++i)
+    {
+      for (int j = 0; j <= p; ++j, ++k)
+      {
+        if (i == 0 && j == 0)
+        {
+          continue;
+        }
+        if (std::max(i, j) < p)
+        {
+          low_modes.push_back(k);
+        }
+        else
+        {
+          high_modes.push_back(k);
+        }
+      }
+    }
+  }
 
   // main loop
   mfem::Array<int> vdofs; mfem::Vector elvec; mfem::DenseMatrix elmat;
@@ -195,39 +218,9 @@ void ApplyKrivodonovaHierarchicalLimiter(mfem::ParFiniteElementSpace &vfes,
     U.GetSubVector(vdofs, elvec);
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
 
-    // Build/calc V,P once for this FE
-    BuildVandermondeAndProjector(*fe, p, V, P, ab);
-    const int ncoef = P.Height();
-
-    // Split coefficient indices by total degree
-    std::vector<int> idx_low, idx_high;
-    idx_low.reserve(ncoef); idx_high.reserve(ncoef);
-    for (int k=0; k<ncoef; ++k) {
-      const int a = ab[k].first, b = ab[k].second;
-      if (a + b < p) idx_low.push_back(k); else idx_high.push_back(k);
-    }
-
-    // Form coefficients per component by LSQ projection: c = P * values
-    // values_j = elmat(j, comp)
-    mfem::DenseMatrix c_all(ncoef, num_eq);
-    for (int comp=0; comp<num_eq; ++comp) {
-      // column vector of nodal values for this component
-      mfem::Vector vals(dof);
-      for (int j=0;j<dof;++j){ vals(j) = elmat(j, comp); }
-      mfem::Vector c_comp(ncoef); P.Mult(vals, c_comp);
-      for (int k=0;k<ncoef;++k) c_all(k,comp) = c_comp(k);
-    }
-
-    // Build low- and high-degree reconstructions at (xi,eta): u = phi_low·c_low + phi_high·c_high
-    auto eval_poly = [&](double xi, double eta, int comp, const mfem::DenseMatrix &cMat, double alpha)->double
-    {
-      double u = 0.0;
-      // low degrees (unchanged)
-      for (int kk : idx_low) { const int a=ab[kk].first, b=ab[kk].second; u += cMat(kk,comp) * Mono(a,b,xi,eta); }
-      // scaled high-degree block
-      for (int kk : idx_high){ const int a=ab[kk].first, b=ab[kk].second; u += alpha * cMat(kk,comp) * Mono(a,b,xi,eta); }
-      return u;
-    };
+    const mfem::Vector &Ubar = Ubar_all[e];
+    mfem::DenseMatrix c_all;
+    BuildModalCoefficients(*fe, elmat, p, num_eq, Ubar, c_all);
 
     // Neighbor bounds per face, per component (use neighbor cell means; inflate)
     auto bounds_for_face = [&](int face, int comp, double &umin, double &umax)
@@ -250,18 +243,37 @@ void ApplyKrivodonovaHierarchicalLimiter(mfem::ParFiniteElementSpace &vfes,
 
     // Determine scaling alpha for high-order block (minimum over faces/points/components)
     double alpha = 1.0;
+    mfem::Vector Px, Py;
+    std::vector<double> phi(ncoef, 0.0);
     for (int face = 0; face < 4; ++face)
     {
       for (const auto &ip : face_qpts[face])
       {
-        const double xi = ip.x;
-        const double eta = ip.y;
+        LegendreValues(p, ip.x, Px);
+        LegendreValues(p, ip.y, Py);
+        int k = 0;
+        for (int i = 0; i <= p; ++i)
+        {
+          for (int j = 0; j <= p; ++j, ++k)
+          {
+            phi[k] = Px(i) * Py(j);
+          }
+        }
+
         for (int comp=0; comp<num_eq; ++comp)
         {
           double umin, umax;
           bounds_for_face(face, comp, umin, umax);
-          const double ubar = Ubar_all[e](comp);
-          const double upred = eval_poly(xi, eta, comp, c_all, /*alpha=*/1.0);
+          const double ubar = Ubar(comp);
+          double upred = ubar;
+          for (int kk : low_modes)
+          {
+            upred += c_all(kk, comp) * phi[kk];
+          }
+          for (int kk : high_modes)
+          {
+            upred += c_all(kk, comp) * phi[kk];
+          }
 
           if (upred < umin)
           {
@@ -293,11 +305,28 @@ void ApplyKrivodonovaHierarchicalLimiter(mfem::ParFiniteElementSpace &vfes,
       for (int j=0; j<dof; ++j)
       {
         const mfem::IntegrationPoint &ip = fe->GetNodes().IntPoint(j);
-        const double xi = ip.x;
-        const double eta = ip.y;
+        LegendreValues(p, ip.x, Px);
+        LegendreValues(p, ip.y, Py);
+        int k = 0;
+        for (int i = 0; i <= p; ++i)
+        {
+          for (int l = 0; l <= p; ++l, ++k)
+          {
+            phi[k] = Px(i) * Py(l);
+          }
+        }
         for (int comp=0; comp<num_eq; ++comp)
         {
-          row(comp) = eval_poly(xi, eta, comp, c_all, alpha);
+          double val = Ubar(comp);
+          for (int kk : low_modes)
+          {
+            val += c_all(kk, comp) * phi[kk];
+          }
+          for (int kk : high_modes)
+          {
+            val += alpha * c_all(kk, comp) * phi[kk];
+          }
+          row(comp) = val;
         }
         elmat.SetRow(j, row);
       }

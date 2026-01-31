@@ -53,16 +53,31 @@
 #include <iostream>
 #include <memory>
 
-#include "../common/solver.hpp"
+#include "sim/igr_sim.hpp"
 
 #include "forward_facing_step.hpp"
 
 namespace
 {
 
+struct InflowOptions
+{
+  double vx = 3.0;
+  double vy = 0.0;
+};
+
+inline void AddInflowOptions(mfem::OptionsParser& args,
+                             InflowOptions& inflow_opts)
+{
+  args.AddOption(&inflow_opts.vx, "-vx", "--velocity-x",
+                 "Free-stream / inflow velocity x-component.");
+  args.AddOption(&inflow_opts.vy, "-vy", "--velocity-y",
+                 "Free-stream / inflow velocity y-component.");
+}
+
 struct ForwardFacingOptions
 {
-  dg_igr_examples::InflowOptions inflow;
+  InflowOptions inflow;
 };
 
 } // namespace
@@ -87,7 +102,7 @@ int main(int argc, char *argv[])
 
   spec.add_options = [](mfem::OptionsParser& args, ForwardFacingOptions& opts)
   {
-    dg_igr_examples::AddInflowOptions(args, opts.inflow);
+    AddInflowOptions(args, opts.inflow);
   };
 
   spec.make_ic = [](const ForwardFacingOptions& opts,
