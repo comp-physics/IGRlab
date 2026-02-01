@@ -22,7 +22,7 @@ struct LGLBasis1D
   mfem::Vector weights;     ///< Quadrature weights on [0,1]
   mfem::Vector inv_weights; ///< 1/weights
   mfem::DenseMatrix D;      ///< Strong derivative matrix (d/dx)
-  mfem::DenseMatrix Dsplit; ///< Split form matrix: D - 0.5 M^{-1} B
+  mfem::DenseMatrix Dsplit; ///< Split form matrix: Dsplit = 2 D - M^{-1} B
   mfem::DenseMatrix Dhat;   ///< Weak form matrix: -M^{-1} D^T M
 };
 

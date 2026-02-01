@@ -78,13 +78,20 @@ int RunDGSEMBasisTests(TestContext& ctx)
     ctx.Check(sbp_err < 1.0e-10,
               "SBP identity holds (order=" + std::to_string(order) + ")");
 
-    // Dsplit consistency: D - 0.5 M^{-1} B
+    // Dsplit consistency: 2 D - M^{-1} B
     mfem::DenseMatrix Dsplit_expected(basis.n);
     Dsplit_expected = basis.D;
     for (int i = 0; i < basis.n; ++i)
     {
+      for (int j = 0; j < basis.n; ++j)
+      {
+        Dsplit_expected(i, j) *= 2.0;
+      }
+    }
+    for (int i = 0; i < basis.n; ++i)
+    {
       const double b = (i == 0) ? -1.0 : (i == basis.n - 1 ? 1.0 : 0.0);
-      Dsplit_expected(i, i) -= 0.5 * b * basis.inv_weights(i);
+      Dsplit_expected(i, i) -= b * basis.inv_weights(i);
     }
     Dsplit_expected -= basis.Dsplit;
     const double dsplit_err = MaxAbsEntry(Dsplit_expected);

@@ -7,6 +7,8 @@ add_executable(dg_igr_unit_tests
   test_limiters.cpp
   test_dg_operator.cpp
   test_dgsem_basis.cpp
+  test_dgsem_flux.cpp
+  test_dgsem_operator.cpp
   test_bc.cpp
   test_igr.cpp
 )
@@ -22,6 +24,8 @@ add_test(NAME dg_igr_flux_tests COMMAND dg_igr_unit_tests --fluxes)
 add_test(NAME dg_igr_limiter_tests COMMAND dg_igr_unit_tests --limiters)
 add_test(NAME dg_igr_dg_operator_tests COMMAND dg_igr_unit_tests --dg-operator)
 add_test(NAME dg_igr_dgsem_basis_tests COMMAND dg_igr_unit_tests --dgsem-basis)
+add_test(NAME dg_igr_dgsem_flux_tests COMMAND dg_igr_unit_tests --dgsem-flux)
+add_test(NAME dg_igr_dgsem_operator_tests COMMAND dg_igr_unit_tests --dgsem-operator)
 add_test(NAME dg_igr_bc_tests COMMAND dg_igr_unit_tests --bc)
 add_test(NAME dg_igr_igr_tests COMMAND dg_igr_unit_tests --igr)
 

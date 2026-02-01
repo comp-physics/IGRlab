@@ -87,6 +87,12 @@ inline void FillConstantState(const mfem::Vector& state, mfem::ParGridFunction& 
   gf.ProjectCoefficient(coeff);
 }
 
+inline void FillConstantState(const mfem::Vector& state, mfem::GridFunction& gf)
+{
+  mfem::VectorConstantCoefficient coeff(state);
+  gf.ProjectCoefficient(coeff);
+}
+
 inline double GlobalSum(double local)
 {
   double global = 0.0;

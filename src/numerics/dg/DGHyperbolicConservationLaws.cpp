@@ -26,6 +26,7 @@
 //
 
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
+#include "numerics/dgsem/dgsem_operator.hpp"
 
 namespace mfem
 {
@@ -76,12 +77,30 @@ void DGHyperbolicConservationLaws::ComputeInvMass()
 {
    InverseIntegrator inv_mass(new MassIntegrator());
    invmass.resize(vfes.GetNE());
+   static IntegrationRules lgl_rules(0, Quadrature1D::GaussLobatto);
 
    for (int i = 0; i < vfes.GetNE(); i++)
    {
-      int dof = vfes.GetFE(i)->GetDof();
+      const FiniteElement &fe = *vfes.GetFE(i);
+      const int dof = fe.GetDof();
+      if (const auto *tbe = dynamic_cast<const TensorBasisElement*>(&fe))
+      {
+         if (tbe->GetBasisType() == BasisType::GaussLobatto)
+         {
+            const int order = std::max(1, 2 * fe.GetOrder() - 1);
+            inv_mass.SetIntRule(&lgl_rules.Get(fe.GetGeomType(), order));
+         }
+         else
+         {
+            inv_mass.SetIntRule(nullptr);
+         }
+      }
+      else
+      {
+         inv_mass.SetIntRule(nullptr);
+      }
       invmass[i].SetSize(dof);
-      inv_mass.AssembleElementMatrix(*vfes.GetFE(i),
+      inv_mass.AssembleElementMatrix(fe,
                                      *vfes.GetElementTransformation(i),
                                      invmass[i]);
    }
@@ -143,13 +162,15 @@ void DGHyperbolicConservationLaws::ComputeWeakDivergence()
 //
 void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
 {
-   if (vol_mode_ == VolumeMode::DGSEMFluxDiff)
-   {
-      MFEM_VERIFY(false, "DGSEM flux-differencing volume mode is not implemented yet.");
-   }
-
    // (0) Reset the running max wave speed (used for CFL after Mult()).
    formIntegrator->ResetMaxCharSpeed();
+
+   if (vol_mode_ == VolumeMode::DGSEMFluxDiff)
+   {
+      dgsem::DGSEMOperator dgsem_op(*this);
+      max_char_speed = dgsem_op.AssembleResidual(x, y);
+      return;
+   }
 
    // (1) Build the face contribution (and possibly the volume term) into z:
    //     z = - < F̂(u_h, n), [[v]] >_faces
@@ -277,6 +298,10 @@ void DGHyperbolicConservationLaws::Update()
 void DGHyperbolicConservationLaws::AddBdrFaceIntegrator(NonlinearFormIntegrator *nfi,
                                                         const Array<int> &bdr_marker)
 {
+   if (face_int_rule_)
+   {
+      nfi->SetIntegrationRule(*face_int_rule_);
+   }
    // 1) Own the integrator so NonlinearForm can UseExternalIntegrators()
    ext_bdr_int_.emplace_back(nfi);
 

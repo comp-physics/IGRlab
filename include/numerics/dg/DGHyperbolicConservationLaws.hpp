@@ -30,6 +30,7 @@
 #include "numerics/riemann/fluxfunctions.hpp"
 
 namespace mfem {
+namespace dgsem { class DGSEMOperator; }
 
 /// Choose which method to compute the *volume* contribution:
 ///  - WeakDivergence: (F(u), ∇v)_T via preassembled weak divergence or matrix-free
@@ -72,6 +73,21 @@ public:
 
    /// Get the current volume-contribution strategy.
    VolumeMode GetVolumeMode() const { return vol_mode_; }
+
+   /// Set the numerical flux used for DGSEM surface evaluation (non-owning).
+   void SetNumericalFlux(const NumericalFlux *flux) { num_flux_ = flux; }
+
+   /**
+    * @brief Set a custom face integration rule for surface flux evaluation.
+    *
+    * Applies the rule to the interior-face integrator and caches it so boundary
+    * integrators added later inherit the same rule.
+    */
+   void SetFaceIntegrationRule(const IntegrationRule &ir)
+   {
+      formIntegrator->SetIntegrationRule(ir);
+      face_int_rule_ = &ir;
+   }
    
    /**
     * @brief Apply the operator: y = M⁻¹( -<F̂, [[v]]> + (F(u), ∇v) ).
@@ -100,6 +116,8 @@ public:
    ~DGHyperbolicConservationLaws() override = default;
 
 private:
+   friend class dgsem::DGSEMOperator;
+
    // --- Problem description and finite element spaces ---
    const int num_equations;          ///< number of conservative equations
    const int dim;                    ///< space dimension
@@ -120,9 +138,11 @@ private:
    // Keep external boundary integrators alive + stable copies of their markers.
    std::vector<std::unique_ptr<NonlinearFormIntegrator>> ext_bdr_int_;
    std::vector<std::unique_ptr<Array<int>>> ext_bdr_markers_;
+   const IntegrationRule *face_int_rule_ = nullptr;
 
    // Volume strategy
    VolumeMode vol_mode_ = VolumeMode::WeakDivergence;
+   const NumericalFlux *num_flux_ = nullptr;
 
    // --- Helpers ---
    /// Compute per-element inverse mass matrices (block-diagonal DG mass).

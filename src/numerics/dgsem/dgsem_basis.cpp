@@ -46,7 +46,7 @@ LGLBasis1D BuildLGLBasis1D(int order)
     }
   }
 
-  // Build Dhat = -M^{-1} D^T M and Dsplit = D - 0.5 M^{-1} B.
+  // Build Dhat = -M^{-1} D^T M and Dsplit = 2 D - M^{-1} B.
   basis.Dhat.SetSize(basis.n);
   basis.Dsplit.SetSize(basis.n);
   mfem::Vector bvec(basis.n);
@@ -67,7 +67,14 @@ LGLBasis1D BuildLGLBasis1D(int order)
   }
   for (int i = 0; i < basis.n; ++i)
   {
-    basis.Dsplit(i, i) -= 0.5 * bvec(i) * basis.inv_weights(i);
+    for (int j = 0; j < basis.n; ++j)
+    {
+      basis.Dsplit(i, j) *= 2.0;
+    }
+  }
+  for (int i = 0; i < basis.n; ++i)
+  {
+    basis.Dsplit(i, i) -= bvec(i) * basis.inv_weights(i);
   }
 
   return basis;

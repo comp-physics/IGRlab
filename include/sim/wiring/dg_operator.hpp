@@ -7,6 +7,7 @@
 
 #include "mfem.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
+#include "numerics/dgsem/dgsem_quadrature.hpp"
 
 #include "sim/context/example_context.hpp"
 
@@ -25,9 +26,15 @@ inline mfem::DGHyperbolicConservationLaws MakeDGOperator(
           new mfem::HyperbolicFormIntegrator(numerical_flux,
                                              ctx.run_cfg.int_order_offset)),
       ctx.run_cfg.opts.preassemble_weak_div);
+  op.SetNumericalFlux(&numerical_flux);
   if (ctx.run_cfg.dg_backend == DGBackend::DGSEM)
   {
     op.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+    if (ctx.dim == 2)
+    {
+      op.SetFaceIntegrationRule(
+          mfem::dgsem::GetLGLFaceRule(ctx.run_cfg.order));
+    }
   }
   return op;
 }

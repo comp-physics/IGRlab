@@ -112,6 +112,8 @@ public:
    }
 
    const FluxFunction &GetFluxFunction() { return fluxFunction; }
+   const NumericalFlux &GetNumericalFlux() const { return numFlux; }
+   const BoundaryState &GetBoundaryState() const { return *bc; }
 
    /**
     * @brief Implements <-F̂(u⁻,u⁺,x) n, [v]> with abstract F̂ computed by
