@@ -19,13 +19,7 @@
  * the block-diagonal structure, and flux terms use HyperbolicFormIntegrator.
  */
 
-#include <functional>
 #include "mfem.hpp"
-#include "BdrHyperbolicFluxIntegrator.hpp"
-#include "DGHyperbolicConservationLaws.hpp"
-#include "eulerigr.hpp"
-#include "fluxfunctions.hpp"
-#include "IGR.hpp"
 
 namespace mfem
 {
