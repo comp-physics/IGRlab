@@ -143,6 +143,11 @@ void DGHyperbolicConservationLaws::ComputeWeakDivergence()
 //
 void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
 {
+   if (vol_mode_ == VolumeMode::DGSEMFluxDiff)
+   {
+      MFEM_VERIFY(false, "DGSEM flux-differencing volume mode is not implemented yet.");
+   }
+
    // (0) Reset the running max wave speed (used for CFL after Mult()).
    formIntegrator->ResetMaxCharSpeed();
 

@@ -35,6 +35,21 @@ namespace dg_igr_examples
 namespace detail
 {
 
+inline void VerifyDGSEMElementGeometry(const mfem::Mesh& mesh)
+{
+  for (int i = 0; i < mesh.GetNE(); ++i)
+  {
+    const mfem::Geometry::Type geom = mesh.GetElementBaseGeometry(i);
+    if (geom == mfem::Geometry::SEGMENT || geom == mfem::Geometry::SQUARE)
+    {
+      continue;
+    }
+    MFEM_VERIFY(false,
+                "DGSEM v1 supports tensor-product meshes only (segment/quad). "
+                "Found geometry: " << mfem::Geometry::Name[geom] << ".");
+  }
+}
+
 template <typename NumericalFlux, typename BcSetup, typename Func>
 bool WithEulerOperator(ExampleContext& ctx,
                        double gamma,
@@ -219,6 +234,7 @@ struct Solver
     case_cfg.rk3_config.gamma = case_cfg.gamma;
     case_cfg.defaults.visualization = spec.vis.enabled;
     case_cfg.defaults.vtk_save = spec.vtk.enabled;
+    case_cfg.defaults.dg_backend = DGBackendToString(spec.dg_backend_default);
 
     CaseOptions case_opts = spec.options;
     CommonOptions cli_opts = case_cfg.defaults;
@@ -243,6 +259,10 @@ struct Solver
     const bool need_h1 = spec.need_h1 || spec.vis.h1_diagnostics;
     ExampleContext ctx = BuildExampleContext(run_cfg, run_cfg.igr_opts.space,
                                              need_sigma, need_h1);
+    if (run_cfg.dg_backend == DGBackend::DGSEM)
+    {
+      detail::VerifyDGSEMElementGeometry(ctx.Mesh());
+    }
     if (need_sigma)
     {
       MFEM_VERIFY(ctx.spaces.sigma_fes != nullptr, "Sigma space was not created.");

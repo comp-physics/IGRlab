@@ -31,6 +31,13 @@ struct IGROptions
   std::string grad = "H1";
 };
 
+/// @brief DG backend selection.
+enum class DGBackend
+{
+  DG,
+  DGSEM
+};
+
 /// @brief Per-case configuration defaults plus case identity metadata.
 struct CaseConfig
 {
@@ -52,6 +59,7 @@ struct RunConfig
   CaseConfig case_config;
   CommonOptions opts;
   IGROptions igr_opts;
+  DGBackend dg_backend = DGBackend::DG;
   std::string mesh_path;
   int order = 1;
   int ser_ref_levels = 0;
@@ -72,6 +80,31 @@ inline std::string ToLowerCopy(std::string value)
   std::transform(value.begin(), value.end(), value.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return value;
+}
+
+inline DGBackend ParseDGBackend(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "dg")
+  {
+    return DGBackend::DG;
+  }
+  if (lower == "dgsem")
+  {
+    return DGBackend::DGSEM;
+  }
+  MFEM_VERIFY(false, "Invalid DG backend '" << value << "'. Use 'dg' or 'dgsem'.");
+  return DGBackend::DG;
+}
+
+inline const char* DGBackendToString(DGBackend backend)
+{
+  switch (backend)
+  {
+    case DGBackend::DG: return "dg";
+    case DGBackend::DGSEM: return "dgsem";
+  }
+  return "dg";
 }
 
 inline std::string CaseDirFromFile(const char* file)
@@ -154,6 +187,7 @@ inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
   run_cfg.case_config = case_cfg;
   run_cfg.opts = opts;
   run_cfg.igr_opts = igr_opts;
+  run_cfg.dg_backend = ParseDGBackend(opts.dg_backend);
   run_cfg.mesh_path = ResolveCaseMesh(case_cfg, opts.mesh_file);
   run_cfg.order = opts.order;
   run_cfg.ser_ref_levels = opts.ser_ref_levels;

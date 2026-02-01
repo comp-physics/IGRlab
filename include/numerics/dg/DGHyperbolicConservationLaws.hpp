@@ -31,10 +31,10 @@
 
 namespace mfem {
 
-/// Choose which method to compute the *volume* contribution: /// NOT WORKING
+/// Choose which method to compute the *volume* contribution:
 ///  - WeakDivergence: (F(u), ∇v)_T via preassembled weak divergence or matrix-free
 ///  - DGSEMFluxDiff : flux-difference (“pairwise flux”) volume term in DGSEM style
-// enum class VolumeMode { WeakDivergence, DGSEMFluxDiff };
+enum class VolumeMode { WeakDivergence, DGSEMFluxDiff };
 
 /// ---------------------------------------------------------------------------
 /// @brief Time-dependent DG operator for hyperbolic conservation laws.
@@ -62,11 +62,16 @@ public:
                                 std::unique_ptr<HyperbolicFormIntegrator> formIntegrator_,
                                 bool preassembleWeakDivergence = true);
 
-   // /// Select volume-contribution strategy (WeakDivergence or DGSEMFluxDiff).
-   // void SetVolumeMode(VolumeMode m) { vol_mode_ = m; }
+   DGHyperbolicConservationLaws(const DGHyperbolicConservationLaws&) = delete;
+   DGHyperbolicConservationLaws& operator=(const DGHyperbolicConservationLaws&) = delete;
+   DGHyperbolicConservationLaws(DGHyperbolicConservationLaws&&) = default;
+   DGHyperbolicConservationLaws& operator=(DGHyperbolicConservationLaws&&) = default;
 
-   // /// Get the current volume-contribution strategy.
-   // VolumeMode GetVolumeMode() const { return vol_mode_; }
+   /// Select volume-contribution strategy (WeakDivergence or DGSEMFluxDiff).
+   void SetVolumeMode(VolumeMode m) { vol_mode_ = m; }
+
+   /// Get the current volume-contribution strategy.
+   VolumeMode GetVolumeMode() const { return vol_mode_; }
    
    /**
     * @brief Apply the operator: y = M⁻¹( -<F̂, [[v]]> + (F(u), ∇v) ).
@@ -117,7 +122,7 @@ private:
    std::vector<std::unique_ptr<Array<int>>> ext_bdr_markers_;
 
    // Volume strategy
-   // VolumeMode vol_mode_ = VolumeMode::WeakDivergence;
+   VolumeMode vol_mode_ = VolumeMode::WeakDivergence;
 
    // --- Helpers ---
    /// Compute per-element inverse mass matrices (block-diagonal DG mass).

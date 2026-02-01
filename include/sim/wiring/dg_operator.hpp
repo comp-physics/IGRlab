@@ -19,12 +19,17 @@ inline mfem::DGHyperbolicConservationLaws MakeDGOperator(
     ExampleContext& ctx,
     const NumericalFlux& numerical_flux)
 {
-  return mfem::DGHyperbolicConservationLaws(
+  mfem::DGHyperbolicConservationLaws op(
       ctx.spaces.vfes,
       std::unique_ptr<mfem::HyperbolicFormIntegrator>(
           new mfem::HyperbolicFormIntegrator(numerical_flux,
                                              ctx.run_cfg.int_order_offset)),
       ctx.run_cfg.opts.preassemble_weak_div);
+  if (ctx.run_cfg.dg_backend == DGBackend::DGSEM)
+  {
+    op.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+  }
+  return op;
 }
 
 } // namespace dg_igr_examples

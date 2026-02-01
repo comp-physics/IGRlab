@@ -32,10 +32,11 @@ struct DGSpaces
            int order,
            int dim,
            int num_equations,
+           int basis_type,
            const std::string& sigma_space,
            bool need_sigma,
            bool need_h1)
-    : fec(order, dim),
+    : fec(order, dim, basis_type),
       fes(&pmesh, &fec),
       dfes(&pmesh, &fec, dim, mfem::Ordering::byNODES),
       vfes(&pmesh, &fec, num_equations, mfem::Ordering::byNODES)
@@ -75,6 +76,13 @@ struct ExampleContext
   int num_equations = 0;
   DGSpaces spaces;
 
+  static int BasisTypeForBackend(DGBackend backend)
+  {
+    return (backend == DGBackend::DGSEM)
+               ? mfem::BasisType::GaussLobatto
+               : mfem::BasisType::GaussLegendre;
+  }
+
   ExampleContext(const RunConfig& cfg,
                  std::unique_ptr<mfem::ParMesh> pmesh_in,
                  const std::string& sigma_space,
@@ -84,7 +92,9 @@ struct ExampleContext
       pmesh(std::move(pmesh_in)),
       dim(pmesh->Dimension()),
       num_equations(dim + 2),
-      spaces(*pmesh, cfg.order, dim, num_equations, sigma_space, need_sigma, need_h1)
+      spaces(*pmesh, cfg.order, dim, num_equations,
+             BasisTypeForBackend(cfg.dg_backend),
+             sigma_space, need_sigma, need_h1)
   {}
 
   mfem::ParMesh& Mesh() { return *pmesh; }

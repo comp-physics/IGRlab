@@ -21,6 +21,7 @@ struct CommonOptions
   int ser_ref_levels = 0;        ///< Serial uniform refinement levels.
   int par_ref_levels = 1;        ///< Parallel uniform refinement levels.
   int order = 3;                 ///< DG polynomial order.
+  std::string dg_backend = "dg"; ///< DG backend: "dg" or "dgsem".
   mfem::real_t t_final = 1.0;    ///< Final time.
   mfem::real_t dt = -0.01;       ///< Time step (positive skips CFL computation).
   mfem::real_t cfl = 0.3;        ///< CFL number for time step computation.
@@ -52,6 +53,8 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "Number of times to refine the parallel mesh uniformly.");
   args.AddOption(&opts.order, "-o", "--order",
                  "Order (degree) of the finite elements.");
+  args.AddOption(&opts.dg_backend, "-dg", "--dg-backend",
+                 "DG backend: dg | dgsem (default set per case).");
   args.AddOption(&opts.t_final, "-tf", "--t-final",
                  "Final time; start time is 0.");
   args.AddOption(&opts.dt, "-dt", "--time-step",
