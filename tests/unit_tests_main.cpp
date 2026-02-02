@@ -21,6 +21,7 @@ int RunIGRTests(TestContext& ctx);
 int RunDGSEMBasisTests(TestContext& ctx);
 int RunDGSEMFluxTests(TestContext& ctx);
 int RunDGSEMOperatorTests(TestContext& ctx);
+int RunDGSEMIGRTests(TestContext& ctx);
 }
 
 namespace
@@ -35,6 +36,7 @@ struct SuiteSelection
   bool dgsem_basis = false;
   bool dgsem_flux = false;
   bool dgsem_operator = false;
+  bool dgsem_igr = false;
   bool bc = false;
   bool igr = false;
   bool parity = false;
@@ -55,6 +57,7 @@ void PrintUsage()
             << "  --dgsem-basis Run DGSEM basis/ordering tests.\n"
             << "  --dgsem-flux  Run DGSEM flux/volume tests.\n"
             << "  --dgsem-operator Run DGSEM operator surface/volume tests.\n"
+            << "  --dgsem-igr  Run DGSEM + IGR tests.\n"
             << "  --bc         Run boundary-state policy tests.\n"
             << "  --igr        Run IGR flux decorator tests.\n"
             << "  --parity     Emit/compare MPI parity signatures (uses DG_IGR_PARITY_* env vars).\n"
@@ -79,6 +82,7 @@ SuiteSelection ParseSuites(int argc, char** argv)
       sel.dgsem_basis = true;
       sel.dgsem_flux = true;
       sel.dgsem_operator = true;
+      sel.dgsem_igr = true;
       sel.bc = true;
       sel.igr = true;
       any_suite_flag = true;
@@ -116,6 +120,11 @@ SuiteSelection ParseSuites(int argc, char** argv)
     else if (arg == "--dgsem-operator")
     {
       sel.dgsem_operator = true;
+      any_suite_flag = true;
+    }
+    else if (arg == "--dgsem-igr")
+    {
+      sel.dgsem_igr = true;
       any_suite_flag = true;
     }
     else if (arg == "--bc")
@@ -157,6 +166,7 @@ SuiteSelection ParseSuites(int argc, char** argv)
     sel.dgsem_basis = true;
     sel.dgsem_flux = true;
     sel.dgsem_operator = true;
+    sel.dgsem_igr = true;
     sel.bc = true;
     sel.igr = true;
   }
@@ -279,7 +289,7 @@ int main(int argc, char** argv)
   if (selection.list_only)
   {
     std::cout << "Available suites: euler, fluxes, limiters, dg-operator, dgsem-basis, "
-                 "dgsem-flux, dgsem-operator, bc, igr\n";
+                 "dgsem-flux, dgsem-operator, dgsem-igr, bc, igr\n";
     return 0;
   }
 
@@ -295,6 +305,7 @@ int main(int argc, char** argv)
   int local_dgsem_basis_failures = 0;
   int local_dgsem_flux_failures = 0;
   int local_dgsem_operator_failures = 0;
+  int local_dgsem_igr_failures = 0;
   int local_bc_failures = 0;
   int local_igr_failures = 0;
 
@@ -365,6 +376,14 @@ int main(int argc, char** argv)
     local_dgsem_operator_failures = ctx.failures - before;
     if (selection.parity) { capture_parity_metric("dgsem-operator", parity_before); }
   }
+  if (selection.dgsem_igr)
+  {
+    const int before = ctx.failures;
+    const double parity_before = ctx.parity_metric;
+    dg_igr_tests::RunDGSEMIGRTests(ctx);
+    local_dgsem_igr_failures = ctx.failures - before;
+    if (selection.parity) { capture_parity_metric("dgsem-igr", parity_before); }
+  }
   if (selection.bc)
   {
     const int before = ctx.failures;
@@ -393,6 +412,8 @@ int main(int argc, char** argv)
       selection.dgsem_flux ? AllreduceSum(local_dgsem_flux_failures) : 0;
   const int global_dgsem_operator_failures =
       selection.dgsem_operator ? AllreduceSum(local_dgsem_operator_failures) : 0;
+  const int global_dgsem_igr_failures =
+      selection.dgsem_igr ? AllreduceSum(local_dgsem_igr_failures) : 0;
   const int global_bc_failures = selection.bc ? AllreduceSum(local_bc_failures) : 0;
   const int global_igr_failures = selection.igr ? AllreduceSum(local_igr_failures) : 0;
 
@@ -441,6 +462,7 @@ int main(int argc, char** argv)
     if (selection.dgsem_flux) { suites.emplace_back("dgsem-flux"); }
     if (selection.dgsem_operator) { suites.emplace_back("dgsem-operator"); }
     if (selection.dgsem_basis) { suites.emplace_back("dgsem-basis"); }
+    if (selection.dgsem_igr) { suites.emplace_back("dgsem-igr"); }
 
     std::cout << "dg_igr unit tests suites: ";
     for (size_t i = 0; i < suites.size(); ++i)
@@ -488,6 +510,12 @@ int main(int argc, char** argv)
       std::cout << "  dgsem-operator: "
                 << (global_dgsem_operator_failures == 0 ? "PASS" : "FAIL")
                 << " (" << global_dgsem_operator_failures << " failure(s))\n";
+    }
+    if (selection.dgsem_igr)
+    {
+      std::cout << "  dgsem-igr: "
+                << (global_dgsem_igr_failures == 0 ? "PASS" : "FAIL")
+                << " (" << global_dgsem_igr_failures << " failure(s))\n";
     }
     if (selection.bc)
     {

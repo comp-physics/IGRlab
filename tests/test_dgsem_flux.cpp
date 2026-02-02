@@ -1,4 +1,5 @@
 #include "numerics/dgsem/dgsem_basis.hpp"
+#include "numerics/dgsem/dgsem_entropy_flux.hpp"
 #include "numerics/dgsem/dgsem_flux.hpp"
 #include "numerics/dgsem/dgsem_quadrature.hpp"
 #include "numerics/dgsem/dgsem_tensor.hpp"
@@ -6,7 +7,9 @@
 
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
+#include "numerics/riemann/dgsem_surface_flux.hpp"
 #include "numerics/riemann/rusanov.hpp"
+#include "physics/igr/igr_flux.hpp"
 #include "physics/bc/boundary_state.hpp"
 
 #include "mfem.hpp"
@@ -14,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -526,6 +530,531 @@ int RunDGSEMFluxTests(TestContext& ctx)
               "DGSEM curved-quad residual ~0 for constant state (norm=" +
                   std::to_string(resid_norm) +
                   ", max|entry|=" + std::to_string(resid_max) + ")");
+  }
+
+  // Discrete metric/GCL sanity: stronger deformation on a quad mesh.
+  {
+    constexpr int dim = 2;
+    constexpr int num_eq = dim + 2;
+    constexpr double gamma = 1.4;
+    constexpr double kPi = 3.14159265358979323846;
+    const double tol_resid = 1.0e-10;
+
+    mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(1, 1, mfem::Element::QUADRILATERAL,
+                                                  /*gen_edges=*/true, 1.0, 1.0);
+    mesh.SetCurvature(4);
+    mfem::GridFunction& nodes = *mesh.GetNodes();
+    mfem::FiniteElementSpace* nodes_fes = nodes.FESpace();
+    for (int i = 0; i < nodes_fes->GetNDofs(); ++i)
+    {
+      const int xdof = nodes_fes->DofToVDof(i, 0);
+      const int ydof = nodes_fes->DofToVDof(i, 1);
+      const double x = nodes(xdof);
+      const double y = nodes(ydof);
+      const double warp = std::sin(kPi * x) * std::sin(kPi * y);
+      nodes(xdof) = x + 0.2 * warp;
+      nodes(ydof) = y - 0.15 * warp;
+    }
+
+    mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+
+    mfem::DG_FECollection fec(/*order=*/2, dim, mfem::BasisType::GaussLobatto);
+    mfem::ParFiniteElementSpace vfes(&pmesh, &fec, num_eq,
+                                     mfem::Ordering::byNODES);
+
+    mfem::ParGridFunction U(&vfes);
+    const mfem::Vector cons_const =
+        EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma);
+    FillConstantState(cons_const, U);
+
+    mfem::EulerFlux flux(dim, gamma);
+    mfem::RusanovFluxWithSides num_flux(flux);
+
+    constexpr int int_order_offset = 2;
+    auto form_integrator =
+        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux,
+                                                         int_order_offset);
+    mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form_integrator),
+                                            /*preassembleWeakDivergence=*/true);
+    oper.SetNumericalFlux(&num_flux);
+    oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+
+    mfem::Array<int> bdr_marker;
+    const int max_attr = pmesh.bdr_attributes.Max();
+    if (max_attr > 0)
+    {
+      bdr_marker.SetSize(max_attr);
+      bdr_marker = 1;
+      auto outlet = std::make_unique<mfem::SupersonicOutletState>();
+      oper.AddBdrFaceIntegrator(
+          new mfem::BdrHyperbolicFluxIntegrator(num_flux, std::move(outlet),
+                                                int_order_offset),
+          bdr_marker);
+    }
+
+    mfem::Vector x;
+    mfem::Vector y(vfes.GetTrueVSize());
+    U.GetTrueDofs(x);
+    oper.Mult(x, y);
+
+    const double resid_norm = GlobalL2Norm(y);
+    const double resid_max = GlobalMax(MaxAbsEntry(y));
+    ctx.AddParity(resid_norm);
+    ctx.Check(resid_norm < tol_resid,
+              "DGSEM strongly-deformed quad residual ~0 (norm=" +
+                  std::to_string(resid_norm) +
+                  ", max|entry|=" + std::to_string(resid_max) + ")");
+  }
+
+  // IGR-aware DGSEM volume flux responds to varying sigma.
+  {
+    constexpr int dim = 1;
+    constexpr int num_eq = dim + 2;
+    constexpr double gamma = 1.4;
+    const double tol_zero = 1.0e-10;
+
+    mfem::Mesh mesh = mfem::Mesh::MakeCartesian1D(2, 1.0);
+    mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+
+    mfem::DG_FECollection fec(/*order=*/2, dim, mfem::BasisType::GaussLobatto);
+    mfem::ParFiniteElementSpace vfes(&pmesh, &fec, num_eq,
+                                     mfem::Ordering::byNODES);
+
+    mfem::ParGridFunction U(&vfes);
+    const mfem::Vector cons_const =
+        EulerConsFromPrim1D(/*rho=*/1.0, /*u=*/0.0, /*p=*/1.0, gamma);
+    FillConstantState(cons_const, U);
+
+    mfem::DG_FECollection sigma_fec(/*order=*/1, dim, mfem::BasisType::GaussLobatto);
+    mfem::ParFiniteElementSpace sigma_fes(&pmesh, &sigma_fec, /*vdim=*/1,
+                                          mfem::Ordering::byNODES);
+    mfem::ParGridFunction sigma(&sigma_fes);
+
+    class SigmaLinearCoefficient final : public mfem::Coefficient
+    {
+    public:
+      double Eval(mfem::ElementTransformation& T,
+                  const mfem::IntegrationPoint& ip) override
+      {
+        mfem::Vector x(1);
+        T.Transform(ip, x);
+        return 0.2 + 0.3 * x(0);
+      }
+    };
+
+    SigmaLinearCoefficient sigma_coeff;
+    sigma.ProjectCoefficient(sigma_coeff);
+    sigma.ExchangeFaceNbrData();
+
+    mfem::EulerFlux base_flux(dim, gamma);
+    mfem::FluxWithIGR igr_flux(base_flux);
+    igr_flux.SetSigmaField(&sigma);
+    mfem::RusanovFluxWithSides num_flux(igr_flux);
+
+    constexpr int int_order_offset = 2;
+    auto form_integrator =
+        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux,
+                                                         int_order_offset);
+    mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form_integrator),
+                                            /*preassembleWeakDivergence=*/true);
+    oper.SetNumericalFlux(&num_flux);
+    oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+
+    mfem::Array<int> bdr_marker;
+    const int max_attr = pmesh.bdr_attributes.Max();
+    if (max_attr > 0)
+    {
+      bdr_marker.SetSize(max_attr);
+      bdr_marker = 1;
+      auto outlet = std::make_unique<mfem::SupersonicOutletState>();
+      oper.AddBdrFaceIntegrator(
+          new mfem::BdrHyperbolicFluxIntegrator(num_flux, std::move(outlet),
+                                                int_order_offset),
+          bdr_marker);
+    }
+
+    mfem::Vector x;
+    mfem::Vector y(vfes.GetTrueVSize());
+    U.GetTrueDofs(x);
+    oper.Mult(x, y);
+    const double resid_sigma = GlobalL2Norm(y);
+
+    mfem::ConstantCoefficient sigma_zero(0.0);
+    sigma.ProjectCoefficient(sigma_zero);
+    sigma.ExchangeFaceNbrData();
+    oper.Mult(x, y);
+    const double resid_zero = GlobalL2Norm(y);
+
+    ctx.Check(resid_zero < tol_zero,
+              "DGSEM IGR residual ~0 when sigma = 0");
+    ctx.Check(resid_sigma > 1.0e-8,
+              "DGSEM IGR residual responds to varying sigma");
+  }
+
+  // Entropy-conservative flux helpers (Chandrashekar/Ranocha) symmetry + consistency.
+  {
+    const double gamma = 1.4;
+    const mfem::Vector ul1 = EulerConsFromPrim1D(1.2, 0.3, 1.1, gamma);
+    const mfem::Vector ur1 = EulerConsFromPrim1D(0.9, -0.1, 0.7, gamma);
+    const mfem::Vector ul2 = EulerConsFromPrim2D(1.0, 0.2, -0.3, 1.0, gamma);
+    const mfem::Vector ur2 = EulerConsFromPrim2D(0.8, -0.1, 0.4, 0.9, gamma);
+
+    auto physical_flux_1d = [&](const mfem::Vector& u, mfem::Vector& f) {
+      const double rho = u(0);
+      const double m = u(1);
+      const double E = u(2);
+      const double v = m / rho;
+      const double p = (gamma - 1.0) * (E - 0.5 * rho * v * v);
+      f.SetSize(3);
+      f(0) = rho * v;
+      f(1) = rho * v * v + p;
+      f(2) = (E + p) * v;
+    };
+
+    auto physical_flux_2d = [&](const mfem::Vector& u, int dir, mfem::Vector& f) {
+      const double rho = u(0);
+      const double m1 = u(1);
+      const double m2 = u(2);
+      const double E = u(3);
+      const double v1 = m1 / rho;
+      const double v2 = m2 / rho;
+      const double p = (gamma - 1.0) * (E - 0.5 * rho * (v1 * v1 + v2 * v2));
+      f.SetSize(4);
+      if (dir == 0)
+      {
+        f(0) = rho * v1;
+        f(1) = rho * v1 * v1 + p;
+        f(2) = rho * v1 * v2;
+        f(3) = (E + p) * v1;
+      }
+      else
+      {
+        f(0) = rho * v2;
+        f(1) = rho * v1 * v2;
+        f(2) = rho * v2 * v2 + p;
+        f(3) = (E + p) * v2;
+      }
+    };
+
+    for (auto type : {mfem::dgsem::EntropyFluxType::Chandrashekar,
+                      mfem::dgsem::EntropyFluxType::Ranocha})
+    {
+      mfem::Vector f_lr, f_rl;
+      mfem::dgsem::EntropyConservativeFlux(ul1, ur1, 0, gamma, type, f_lr);
+      mfem::dgsem::EntropyConservativeFlux(ur1, ul1, 0, gamma, type, f_rl);
+      for (int i = 0; i < f_lr.Size(); ++i)
+      {
+        ctx.CheckNear(f_lr(i), f_rl(i), tol,
+                      "EC flux is symmetric in 1D");
+      }
+
+      mfem::Vector f_cons, f_phys;
+      mfem::dgsem::EntropyConservativeFlux(ul1, ul1, 0, gamma, type, f_cons);
+      physical_flux_1d(ul1, f_phys);
+      for (int i = 0; i < f_cons.Size(); ++i)
+      {
+        ctx.CheckNear(f_cons(i), f_phys(i), 1.0e-10,
+                      "EC flux matches physical flux in 1D");
+      }
+
+      mfem::Vector f2_lr, f2_rl;
+      mfem::dgsem::EntropyConservativeFlux(ul2, ur2, 0, gamma, type, f2_lr);
+      mfem::dgsem::EntropyConservativeFlux(ur2, ul2, 0, gamma, type, f2_rl);
+      for (int i = 0; i < f2_lr.Size(); ++i)
+      {
+        ctx.CheckNear(f2_lr(i), f2_rl(i), tol,
+                      "EC flux is symmetric in 2D (dir=0)");
+      }
+
+      mfem::Vector f2_cons, f2_phys;
+      mfem::dgsem::EntropyConservativeFlux(ul2, ul2, 1, gamma, type, f2_cons);
+      physical_flux_2d(ul2, 1, f2_phys);
+      for (int i = 0; i < f2_cons.Size(); ++i)
+      {
+        ctx.CheckNear(f2_cons(i), f2_phys(i), 1.0e-10,
+                      "EC flux matches physical flux in 2D (dir=1)");
+      }
+    }
+  }
+
+  // Flux differencing with EC flux: constant state gives row-sum scaling.
+  {
+    const double gamma = 1.4;
+    const int order = 3;
+    const auto& basis = mfem::dgsem::GetLGLBasis1D(order);
+    const int n1d = basis.n;
+    const std::vector<double> row_sum = OffDiagonalRowSum(basis.Dsplit);
+
+    const mfem::Vector state1d =
+        EulerConsFromPrim1D(1.0, 0.2, 1.0, gamma);
+
+    auto ec_flux = [&](const mfem::Vector& ul, const mfem::Vector& ur,
+                       int dir, mfem::Vector& f) {
+      mfem::dgsem::EntropyConservativeFlux(
+          ul, ur, dir, gamma, mfem::dgsem::EntropyFluxType::Ranocha, f);
+    };
+
+    mfem::Vector f_u;
+    mfem::dgsem::EntropyConservativeFlux(state1d, state1d, 0, gamma,
+                                         mfem::dgsem::EntropyFluxType::Ranocha,
+                                         f_u);
+    mfem::DenseMatrix u = BuildConstantStateMatrix(n1d, state1d);
+    mfem::DenseMatrix du;
+    mfem::dgsem::FluxDifferencing1D(u, basis.Dsplit, ec_flux, du);
+    mfem::DenseMatrix expected(n1d, f_u.Size());
+    for (int i = 0; i < n1d; ++i)
+    {
+      for (int eq = 0; eq < f_u.Size(); ++eq)
+      {
+        expected(i, eq) = row_sum[i] * f_u(eq);
+      }
+    }
+    expected -= du;
+    ctx.Check(MaxAbsEntry(expected) < 1.0e-10,
+              "FluxDifferencing1D constant state with EC flux");
+
+    const mfem::Vector state2d =
+        EulerConsFromPrim2D(1.0, -0.1, 0.2, 1.0, gamma);
+    mfem::DenseMatrix u2d(n1d * n1d, state2d.Size());
+    for (int i = 0; i < n1d * n1d; ++i)
+    {
+      for (int eq = 0; eq < state2d.Size(); ++eq)
+      {
+        u2d(i, eq) = state2d(eq);
+      }
+    }
+    mfem::DG_FECollection fec(order, 2, mfem::BasisType::GaussLobatto);
+    const mfem::FiniteElement* fe =
+        fec.FiniteElementForGeometry(mfem::Geometry::SQUARE);
+    const auto& dof_to_ijk = mfem::dgsem::GetTensorDofToIJK(*fe);
+    mfem::DenseMatrix du2d;
+    mfem::dgsem::FluxDifferencing2D(u2d, basis.Dsplit, dof_to_ijk,
+                                    ec_flux, du2d);
+
+    mfem::Vector fx, fy;
+    mfem::dgsem::EntropyConservativeFlux(state2d, state2d, 0, gamma,
+                                         mfem::dgsem::EntropyFluxType::Ranocha,
+                                         fx);
+    mfem::dgsem::EntropyConservativeFlux(state2d, state2d, 1, gamma,
+                                         mfem::dgsem::EntropyFluxType::Ranocha,
+                                         fy);
+    mfem::DenseMatrix expected2d(n1d * n1d, state2d.Size());
+    for (int local = 0; local < static_cast<int>(dof_to_ijk.size()); ++local)
+    {
+      const int i = dof_to_ijk[local][0];
+      const int j = dof_to_ijk[local][1];
+      for (int eq = 0; eq < state2d.Size(); ++eq)
+      {
+        expected2d(local, eq) = row_sum[i] * fx(eq) + row_sum[j] * fy(eq);
+      }
+    }
+    expected2d -= du2d;
+    ctx.Check(MaxAbsEntry(expected2d) < 1.0e-10,
+              "FluxDifferencing2D constant state with EC flux");
+  }
+
+  // Entropy-stable surface flux (Winters): constant state reduces to physical flux.
+  {
+    const double gamma = 1.4;
+    mfem::EulerFlux flux(2, gamma);
+    mfem::DGSEMSurfaceFlux es_flux(flux);
+    es_flux.SetSurfaceFluxType(mfem::DGSEMSurfaceFluxType::EntropyStableWinters);
+    es_flux.SetEntropyFluxType(mfem::dgsem::EntropyFluxType::Ranocha);
+    es_flux.SetGamma(gamma);
+
+    const mfem::Vector u =
+        EulerConsFromPrim2D(1.0, 0.3, -0.2, 1.0, gamma);
+    mfem::Vector normal(2);
+    normal(0) = 1.2;
+    normal(1) = -0.7;
+    mfem::FaceElementTransformations Tr;
+
+    mfem::Vector flux_es(u.Size());
+    es_flux.Eval(u, u, normal, Tr, flux_es);
+
+    mfem::Vector fx, fy;
+    auto physical_flux_2d = [&](const mfem::Vector& state, int dir, mfem::Vector& f) {
+      const double rho = state(0);
+      const double m1 = state(1);
+      const double m2 = state(2);
+      const double E = state(3);
+      const double v1 = m1 / rho;
+      const double v2 = m2 / rho;
+      const double p = (gamma - 1.0) * (E - 0.5 * rho * (v1 * v1 + v2 * v2));
+      f.SetSize(4);
+      if (dir == 0)
+      {
+        f(0) = rho * v1;
+        f(1) = rho * v1 * v1 + p;
+        f(2) = rho * v1 * v2;
+        f(3) = (E + p) * v1;
+      }
+      else
+      {
+        f(0) = rho * v2;
+        f(1) = rho * v1 * v2;
+        f(2) = rho * v2 * v2 + p;
+        f(3) = (E + p) * v2;
+      }
+    };
+    physical_flux_2d(u, 0, fx);
+    physical_flux_2d(u, 1, fy);
+
+    for (int eq = 0; eq < u.Size(); ++eq)
+    {
+      const double expected = normal(0) * fx(eq) + normal(1) * fy(eq);
+      ctx.CheckNear(flux_es(eq), expected, 1.0e-10,
+                    "Entropy-stable surface flux matches physical flux");
+    }
+
+    mfem::Vector diss;
+    mfem::dgsem::WintersDissipation(u, u, normal, gamma, diss);
+    ctx.Check(MaxAbsEntry(diss) < 1.0e-12,
+              "Winters dissipation is zero for identical states");
+  }
+
+  // Entropy-stable LF entropy-variable surface flux: constant state sanity.
+  {
+    const double gamma = 1.4;
+    mfem::EulerFlux flux(2, gamma);
+    mfem::DGSEMSurfaceFlux es_flux(flux);
+    es_flux.SetSurfaceFluxType(
+        mfem::DGSEMSurfaceFluxType::EntropyStableLFEntropyVars);
+    es_flux.SetEntropyFluxType(mfem::dgsem::EntropyFluxType::Ranocha);
+    es_flux.SetGamma(gamma);
+
+    const mfem::Vector u =
+        EulerConsFromPrim2D(1.1, 0.25, -0.15, 1.2, gamma);
+    mfem::Vector normal(2);
+    normal(0) = -0.9;
+    normal(1) = 0.6;
+    mfem::FaceElementTransformations Tr;
+
+    mfem::Vector flux_es(u.Size());
+    es_flux.Eval(u, u, normal, Tr, flux_es);
+
+    mfem::Vector fx, fy;
+    auto physical_flux_2d = [&](const mfem::Vector& state, int dir, mfem::Vector& f) {
+      const double rho = state(0);
+      const double m1 = state(1);
+      const double m2 = state(2);
+      const double E = state(3);
+      const double v1 = m1 / rho;
+      const double v2 = m2 / rho;
+      const double p = (gamma - 1.0) * (E - 0.5 * rho * (v1 * v1 + v2 * v2));
+      f.SetSize(4);
+      if (dir == 0)
+      {
+        f(0) = rho * v1;
+        f(1) = rho * v1 * v1 + p;
+        f(2) = rho * v1 * v2;
+        f(3) = (E + p) * v1;
+      }
+      else
+      {
+        f(0) = rho * v2;
+        f(1) = rho * v1 * v2;
+        f(2) = rho * v2 * v2 + p;
+        f(3) = (E + p) * v2;
+      }
+    };
+    physical_flux_2d(u, 0, fx);
+    physical_flux_2d(u, 1, fy);
+
+    for (int eq = 0; eq < u.Size(); ++eq)
+    {
+      const double expected = normal(0) * fx(eq) + normal(1) * fy(eq);
+      ctx.CheckNear(flux_es(eq), expected, 5.0e-8,
+                    "Entropy-variable LF surface flux matches physical flux");
+    }
+
+    mfem::Vector diss;
+    mfem::dgsem::EntropyVariableLFDissipation(u, u, gamma,
+                                              /*scale=*/1.0, diss);
+    ctx.Check(MaxAbsEntry(diss) < 1.0e-12,
+              "Entropy-variable LF dissipation is zero for identical states");
+  }
+
+  // Entropy production regression (smooth state, ES fluxes).
+  {
+    const double gamma = 1.4;
+    const mfem::Vector uL =
+        EulerConsFromPrim2D(1.0, 0.2, -0.1, 1.0, gamma);
+    const mfem::Vector uR =
+        EulerConsFromPrim2D(1.01, 0.22, -0.08, 1.02, gamma);
+    mfem::Vector normal(2);
+    normal(0) = 0.6;
+    normal(1) = -0.8;
+
+    auto entropy_prod = [&](mfem::DGSEMSurfaceFluxType surface_type,
+                            mfem::dgsem::EntropyJacobianMode mode) {
+      mfem::EulerFlux flux(2, gamma);
+      mfem::DGSEMSurfaceFlux es_flux(flux);
+      es_flux.SetSurfaceFluxType(surface_type);
+      es_flux.SetEntropyFluxType(mfem::dgsem::EntropyFluxType::Ranocha);
+      es_flux.SetEntropyJacobianMode(mode);
+      es_flux.SetGamma(gamma);
+
+      mfem::FaceElementTransformations Tr;
+      mfem::Vector flux_es(uL.Size());
+      es_flux.Eval(uL, uR, normal, Tr, flux_es);
+
+      mfem::Vector flux_ec(uL.Size());
+      mfem::dgsem::EntropyConservativeFluxDotN(
+          uL, uR, normal, gamma, mfem::dgsem::EntropyFluxType::Ranocha, flux_ec);
+
+      mfem::Vector diss(uL.Size());
+      diss = flux_es;
+      diss -= flux_ec;
+
+      mfem::Vector wL, wR;
+      mfem::dgsem::EulerEntropyVariables(uL, /*dim=*/2, gamma, /*sigma=*/0.0, wL);
+      mfem::dgsem::EulerEntropyVariables(uR, /*dim=*/2, gamma, /*sigma=*/0.0, wR);
+
+      mfem::Vector wjump(wL.Size());
+      wjump = wR;
+      wjump -= wL;
+
+      return wjump * diss;
+    };
+
+    const double prod_winters =
+        entropy_prod(mfem::DGSEMSurfaceFluxType::EntropyStableWinters,
+                     mfem::dgsem::EntropyJacobianMode::FiniteDifference);
+    const double prod_lf_fd =
+        entropy_prod(mfem::DGSEMSurfaceFluxType::EntropyStableLFEntropyVars,
+                     mfem::dgsem::EntropyJacobianMode::FiniteDifference);
+    const double prod_lf_analytic =
+        entropy_prod(mfem::DGSEMSurfaceFluxType::EntropyStableLFEntropyVars,
+                     mfem::dgsem::EntropyJacobianMode::Analytic);
+
+    const double expected_winters = -2.46898e-4;
+    const double expected_lf = -7.91901e-4;
+    const double tol_prod = 1.0e-2;
+
+    if (std::getenv("DG_IGR_PRINT_ENTROPY"))
+    {
+      std::cout << "entropy_prod_winters=" << prod_winters << "\n";
+      std::cout << "entropy_prod_lf_fd=" << prod_lf_fd << "\n";
+      std::cout << "entropy_prod_lf_analytic=" << prod_lf_analytic << "\n";
+    }
+
+    ctx.Check(prod_winters < 0.0,
+              "Entropy production (Winters) is non-positive");
+    ctx.Check(prod_lf_fd < 0.0,
+              "Entropy production (LF entropy vars, FD) is non-positive");
+    ctx.Check(prod_lf_analytic < 0.0,
+              "Entropy production (LF entropy vars, analytic) is non-positive");
+
+    ctx.CheckNear(prod_winters, expected_winters, tol_prod,
+                  "Entropy production (Winters) regression");
+    ctx.CheckNear(prod_lf_fd, expected_lf, tol_prod,
+                  "Entropy production (LF entropy vars, FD) regression");
+    ctx.CheckNear(prod_lf_analytic, expected_lf, tol_prod,
+                  "Entropy production (LF entropy vars, analytic) regression");
+
+    ctx.CheckNear(prod_lf_fd, prod_lf_analytic, 1.0e-2,
+                  "LF entropy production FD vs analytic close");
   }
 
   return ctx.failures;

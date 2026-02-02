@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 
@@ -11,11 +12,24 @@
 namespace dg_igr_tests
 {
 
+inline bool EnvEnabled(const char* name)
+{
+  const char* env = std::getenv(name);
+  if (!env) { return false; }
+  const std::string value(env);
+  return value == "1" || value == "true" || value == "TRUE" || value == "on";
+}
+
 struct TestContext
 {
   int failures = 0;
   bool parity_mode = false;
   double parity_metric = 0.0;
+  bool verbose_metrics = true;
+
+  TestContext()
+    : verbose_metrics(!EnvEnabled("DG_IGR_TEST_QUIET"))
+  {}
 
   void Check(bool cond, const std::string& msg)
   {
@@ -23,6 +37,10 @@ struct TestContext
     {
       ++failures;
       std::cerr << "[FAIL] " << msg << "\n";
+    }
+    else if (verbose_metrics)
+    {
+      std::cout << "[PASS] " << msg << "\n";
     }
   }
 
@@ -37,11 +55,25 @@ struct TestContext
                 << " (a=" << a << ", b=" << b
                 << ", err=" << err << ", tol=" << tol << ")\n";
     }
+    else if (verbose_metrics)
+    {
+      std::cout << "[PASS] " << msg
+                << " (a=" << a << ", b=" << b
+                << ", err=" << err << ", tol=" << tol << ")\n";
+    }
   }
 
   void AddParity(double value)
   {
     parity_metric += value;
+  }
+
+  void LogMetric(const std::string& msg)
+  {
+    if (verbose_metrics)
+    {
+      std::cout << "[METRIC] " << msg << "\n";
+    }
   }
 };
 
@@ -129,6 +161,37 @@ inline double GlobalAverage(double local)
   const double global_sum = GlobalSum(local);
   const int world_size = mfem::Mpi::WorldSize();
   return global_sum / static_cast<double>(world_size > 0 ? world_size : 1);
+}
+
+inline double IntegrateComponent(const mfem::GridFunction& U, int comp,
+                                 int order_offset = 2)
+{
+  const mfem::FiniteElementSpace* fes = U.FESpace();
+  MFEM_VERIFY(fes != nullptr, "IntegrateComponent requires a valid FE space.");
+  MFEM_VERIFY(comp >= 0 && comp < U.VectorDim(),
+              "IntegrateComponent component index out of range.");
+
+  double local = 0.0;
+  mfem::Vector value(U.VectorDim());
+  const int ne = fes->GetNE();
+  for (int e = 0; e < ne; ++e)
+  {
+    const mfem::FiniteElement* fe = fes->GetFE(e);
+    mfem::ElementTransformation* Tr = fes->GetElementTransformation(e);
+    const int qord = 2 * fe->GetOrder() + order_offset;
+    const mfem::IntegrationRule& ir =
+        mfem::IntRules.Get(fe->GetGeomType(), qord);
+
+    for (int q = 0; q < ir.GetNPoints(); ++q)
+    {
+      const mfem::IntegrationPoint& ip = ir.IntPoint(q);
+      Tr->SetIntPoint(&ip);
+      U.GetVectorValue(*Tr, ip, value);
+      local += value(comp) * ip.weight * Tr->Weight();
+    }
+  }
+
+  return GlobalSum(local);
 }
 
 } // namespace dg_igr_tests

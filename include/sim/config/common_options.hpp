@@ -22,6 +22,10 @@ struct CommonOptions
   int par_ref_levels = 1;        ///< Parallel uniform refinement levels.
   int order = 3;                 ///< DG polynomial order.
   std::string dg_backend = "dg"; ///< DG backend: "dg" or "dgsem".
+  std::string dgsem_stab = "none"; ///< DGSEM stabilization: "none", "split", or "filter".
+  std::string dgsem_volume_flux = "central"; ///< DGSEM volume flux: "central", "chandrashekar", or "ranocha".
+  std::string dgsem_surface_flux = "rusanov"; ///< DGSEM surface flux: "rusanov", "es-winters", or "es-lf-entropy".
+  std::string dgsem_entropy_jacobian = "fd"; ///< DGSEM ES-LF entropy Jacobian: "fd" or "analytic".
   mfem::real_t t_final = 1.0;    ///< Final time.
   mfem::real_t dt = -0.01;       ///< Time step (positive skips CFL computation).
   mfem::real_t cfl = 0.3;        ///< CFL number for time step computation.
@@ -55,6 +59,14 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "Order (degree) of the finite elements.");
   args.AddOption(&opts.dg_backend, "-dg", "--dg-backend",
                  "DG backend: dg | dgsem (default set per case).");
+  args.AddOption(&opts.dgsem_stab, "-ds", "--dgsem-stab",
+                 "DGSEM stabilization: none | split | filter (not yet implemented).");
+  args.AddOption(&opts.dgsem_volume_flux, "-dvf", "--dgsem-volume-flux",
+                 "DGSEM volume flux: central | chandrashekar | ranocha.");
+  args.AddOption(&opts.dgsem_surface_flux, "-dsf", "--dgsem-surface-flux",
+                 "DGSEM surface flux: rusanov | es-winters | es-lf-entropy.");
+  args.AddOption(&opts.dgsem_entropy_jacobian, "-dej", "--dgsem-entropy-jacobian",
+                 "DGSEM entropy Jacobian: fd | analytic (ES LF entropy variables).");
   args.AddOption(&opts.t_final, "-tf", "--t-final",
                  "Final time; start time is 0.");
   args.AddOption(&opts.dt, "-dt", "--time-step",

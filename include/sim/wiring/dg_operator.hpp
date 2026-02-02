@@ -20,6 +20,30 @@ inline mfem::DGHyperbolicConservationLaws MakeDGOperator(
     ExampleContext& ctx,
     const NumericalFlux& numerical_flux)
 {
+  auto to_mfem_stab = [](DGSEMStabilization stab) {
+    switch (stab)
+    {
+      case DGSEMStabilization::None:
+        return mfem::DGSEMStabilization::None;
+      case DGSEMStabilization::SplitForm:
+        return mfem::DGSEMStabilization::SplitForm;
+      case DGSEMStabilization::Filter:
+        return mfem::DGSEMStabilization::Filter;
+    }
+    return mfem::DGSEMStabilization::None;
+  };
+  auto to_mfem_vol = [](DGSEMVolumeFlux flux) {
+    switch (flux)
+    {
+      case DGSEMVolumeFlux::Central:
+        return mfem::DGSEMVolumeFlux::Central;
+      case DGSEMVolumeFlux::Chandrashekar:
+        return mfem::DGSEMVolumeFlux::Chandrashekar;
+      case DGSEMVolumeFlux::Ranocha:
+        return mfem::DGSEMVolumeFlux::Ranocha;
+    }
+    return mfem::DGSEMVolumeFlux::Central;
+  };
   mfem::DGHyperbolicConservationLaws op(
       ctx.spaces.vfes,
       std::unique_ptr<mfem::HyperbolicFormIntegrator>(
@@ -30,6 +54,12 @@ inline mfem::DGHyperbolicConservationLaws MakeDGOperator(
   if (ctx.run_cfg.dg_backend == DGBackend::DGSEM)
   {
     op.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+    op.SetDGSEMVolumeFlux(to_mfem_vol(ctx.run_cfg.dgsem_volume_flux));
+    op.SetDGSEMGamma(ctx.run_cfg.case_config.gamma);
+    if (ctx.run_cfg.dgsem_stab != DGSEMStabilization::None)
+    {
+      op.SetDGSEMStabilization(to_mfem_stab(ctx.run_cfg.dgsem_stab));
+    }
     if (ctx.dim == 2)
     {
       op.SetFaceIntegrationRule(

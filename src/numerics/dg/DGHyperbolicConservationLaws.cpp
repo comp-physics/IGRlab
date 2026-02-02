@@ -167,6 +167,9 @@ void DGHyperbolicConservationLaws::Mult(const Vector &x, Vector &y) const
 
    if (vol_mode_ == VolumeMode::DGSEMFluxDiff)
    {
+      MFEM_VERIFY(dgsem_stab_ == DGSEMStabilization::None,
+                  "DGSEM stabilization hooks are not implemented. "
+                  "Use --dgsem-stab none.");
       dgsem::DGSEMOperator dgsem_op(*this);
       max_char_speed = dgsem_op.AssembleResidual(x, y);
       return;

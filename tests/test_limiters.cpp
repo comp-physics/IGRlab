@@ -3,6 +3,7 @@
 #include "numerics/limiters/tvb.hpp"
 #include "numerics/limiters/venkat.hpp"
 #include "numerics/limiters/zhang_shu.hpp"
+#include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 
 #include <array>
 #include <algorithm>
@@ -648,6 +649,64 @@ int RunLimiterTests(TestContext& ctx)
         opt.gamma = kGamma;
         mfem::ApplyCharacteristicVenkatXY(space, U, opt);
       });
+
+  // --- DGSEM basis: limiter pipeline via RK3SSPWithLimiter ---
+  {
+    mfem::Mesh mesh_gl = mfem::Mesh::MakeCartesian2D(
+        /*nx=*/2, /*ny=*/2, mfem::Element::QUADRILATERAL,
+        /*generate_edges=*/true, /*sx=*/1.0, /*sy=*/1.0);
+    mfem::ParMesh pmesh_gl(MPI_COMM_WORLD, mesh_gl);
+    mfem::DG_FECollection fec_gl(/*order=*/2, kDim, mfem::BasisType::GaussLobatto);
+    mfem::ParFiniteElementSpace vfes_gl(&pmesh_gl, &fec_gl, kNumEq,
+                                        mfem::Ordering::byNODES);
+
+    mfem::ParGridFunction U_gl(&vfes_gl);
+    const mfem::Vector cons =
+        ConservativeFromPrimitive(/*rho=*/1.0, /*u=*/0.2, /*v=*/-0.1, /*p=*/1.0);
+    FillConstantState(vfes_gl, cons, U_gl);
+
+    mfem::ParGridFunction U_before(&vfes_gl);
+    U_before = U_gl;
+
+    struct ZeroOperator final : public mfem::TimeDependentOperator
+    {
+      explicit ZeroOperator(int n) : mfem::TimeDependentOperator(n) {}
+      void Mult(const mfem::Vector&, mfem::Vector& y) const override
+      {
+        y.SetSize(height);
+        y = 0.0;
+      }
+    };
+
+    ZeroOperator op(vfes_gl.GetTrueVSize());
+    mfem::RK3SSPWithLimiter rk(vfes_gl);
+    rk.SetEulerParams(kDim, kGamma);
+    rk.SetLimiterParams(/*rho_min=*/1e-10, /*p_min=*/1e-10,
+                        /*quad_order=*/0, /*p_bisect_iters=*/8);
+
+    mfem::CharTVBOptions tvb;
+    tvb.dim = kDim;
+    tvb.gamma = kGamma;
+    rk.AddZhangShuLimiter(/*always_on=*/true);
+    rk.AddCharTVBLimiter(tvb);
+
+    rk.Init(op);
+
+    mfem::Vector x;
+    U_gl.GetTrueDofs(x);
+    double t = 0.0;
+    double dt = 1.0e-3;
+    rk.Step(x, t, dt);
+
+    mfem::ParGridFunction U_after(&vfes_gl);
+    U_after.SetFromTrueDofs(x);
+
+    const double rel_change = GlobalRelativeChange(U_before, U_after);
+    ctx.Check(rel_change < 1.0e-12,
+              "RK3 limiter pipeline preserves constant state on DGSEM basis");
+    ctx.Check(AllFinite(U_after),
+              "RK3 limiter pipeline keeps finite values on DGSEM basis");
+  }
 
   // Venkatakrishnan face-normal
   CheckLimiterOnConstantState(

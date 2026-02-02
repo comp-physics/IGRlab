@@ -84,7 +84,7 @@ struct ForwardFacingOptions
 
 int main(int argc, char *argv[])
 {
-  dg_igr_examples::CaseSpec<ForwardFacingOptions, mfem::RusanovFluxWithSides> spec;
+  dg_igr_examples::CaseSpec<ForwardFacingOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "forward_facing_step";
   spec.default_mesh_path = mfem::ForwardFacingStepDefaultMeshPath();
   spec.case_file = __FILE__;

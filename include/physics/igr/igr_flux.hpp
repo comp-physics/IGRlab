@@ -69,6 +69,12 @@ public:
                                DenseMatrix &JDotN) const override
   { base_.ComputeFluxJacobianDotN(state, normal, Tr, JDotN); }
 
+  /// Get Sigma at the current element integration point (0 if IGR is off).
+  double GetSigmaAtPoint(ElementTransformation &Tr) const;
+
+  /// Get Sigma for a face side at the current face integration point (0 if off).
+  double GetSigmaAtSide(FaceElementTransformations &Tr, FaceSide side) const;
+
 private:
   const FluxFunction *GetBase() const { return &base_; }
 

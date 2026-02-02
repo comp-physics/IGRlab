@@ -65,7 +65,7 @@ struct SedovOptions {};
 } // namespace
 
 int main(int argc, char *argv[]) {
-  dg_igr_examples::CaseSpec<SedovOptions, mfem::RusanovFluxWithSides> spec;
+  dg_igr_examples::CaseSpec<SedovOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "sedov_taylor_blast";
   spec.default_mesh_path = mfem::SedovTaylorDefaultMeshPath();
   spec.case_file = __FILE__;

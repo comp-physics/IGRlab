@@ -27,6 +27,7 @@
 #include "sim/time/time_defaults.hpp"
 #include "sim/wiring/bc_wiring.hpp"
 #include "sim/wiring/dg_operator.hpp"
+#include "sim/wiring/dgsem_flux_config.hpp"
 #include "sim/wiring/igr_physics.hpp"
 
 namespace dg_igr_examples
@@ -69,6 +70,7 @@ bool WithEulerOperator(ExampleContext& ctx,
 
   mfem::EulerFlux base_flux(ctx.dim, gamma);
   NumericalFlux numerical_flux(base_flux);
+  ConfigureDGSEMSurfaceFlux(numerical_flux, ctx.run_cfg, gamma);
   mfem::DGHyperbolicConservationLaws op =
       MakeDGOperator(ctx, numerical_flux);
   EulerBoundaryWiring<NumericalFlux> bc(

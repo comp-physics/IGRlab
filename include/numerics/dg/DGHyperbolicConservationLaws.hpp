@@ -37,6 +37,12 @@ namespace dgsem { class DGSEMOperator; }
 ///  - DGSEMFluxDiff : flux-difference (“pairwise flux”) volume term in DGSEM style
 enum class VolumeMode { WeakDivergence, DGSEMFluxDiff };
 
+/// Optional DGSEM stabilization hook selection (placeholder).
+enum class DGSEMStabilization { None, SplitForm, Filter };
+
+/// DGSEM volume flux selection for entropy-conservative variants (Euler-only).
+enum class DGSEMVolumeFlux { Central, Chandrashekar, Ranocha };
+
 /// ---------------------------------------------------------------------------
 /// @brief Time-dependent DG operator for hyperbolic conservation laws.
 /// @ingroup numerics_dg
@@ -74,8 +80,26 @@ public:
    /// Get the current volume-contribution strategy.
    VolumeMode GetVolumeMode() const { return vol_mode_; }
 
+   /// Select optional DGSEM stabilization hook (not implemented yet).
+   void SetDGSEMStabilization(DGSEMStabilization s) { dgsem_stab_ = s; }
+
+   /// Get current DGSEM stabilization hook selection.
+   DGSEMStabilization GetDGSEMStabilization() const { return dgsem_stab_; }
+
    /// Set the numerical flux used for DGSEM surface evaluation (non-owning).
    void SetNumericalFlux(const NumericalFlux *flux) { num_flux_ = flux; }
+
+   /// Select DGSEM volume flux (central or entropy-conservative).
+   void SetDGSEMVolumeFlux(DGSEMVolumeFlux f) { dgsem_vol_flux_ = f; }
+
+   /// Get current DGSEM volume flux.
+   DGSEMVolumeFlux GetDGSEMVolumeFlux() const { return dgsem_vol_flux_; }
+
+   /// Set Euler gamma used by entropy-conservative DGSEM fluxes.
+   void SetDGSEMGamma(double gamma) { dgsem_gamma_ = gamma; }
+
+   /// Get Euler gamma used by DGSEM entropy-conservative fluxes.
+   double GetDGSEMGamma() const { return dgsem_gamma_; }
 
    /**
     * @brief Set a custom face integration rule for surface flux evaluation.
@@ -143,6 +167,9 @@ private:
    // Volume strategy
    VolumeMode vol_mode_ = VolumeMode::WeakDivergence;
    const NumericalFlux *num_flux_ = nullptr;
+   DGSEMStabilization dgsem_stab_ = DGSEMStabilization::None;
+   DGSEMVolumeFlux dgsem_vol_flux_ = DGSEMVolumeFlux::Central;
+   double dgsem_gamma_ = 1.4;
 
    // --- Helpers ---
    /// Compute per-element inverse mass matrices (block-diagonal DG mass).
