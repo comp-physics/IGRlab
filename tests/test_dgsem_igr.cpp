@@ -97,8 +97,8 @@ int RunDGSEMIGRTests(TestContext& ctx)
   ctx.AddParity(resid_norm);
   ctx.Check(resid_norm < tol,
             "DGSEM + IGR constant-sigma residual ~0 (norm=" +
-                std::to_string(resid_norm) +
-                ", max|entry|=" + std::to_string(resid_max) + ")");
+                FormatSci(resid_norm) +
+                ", max|entry|=" + FormatSci(resid_max) + ")");
 
   // Non-periodic mesh + BC wiring: constant sigma should still cancel.
   {
@@ -162,8 +162,8 @@ int RunDGSEMIGRTests(TestContext& ctx)
     const double resid_max_np = GlobalMax(MaxAbsEntry(y_np));
     ctx.Check(resid_norm_np < tol,
               "DGSEM + IGR constant-sigma residual ~0 with BCs (norm=" +
-                  std::to_string(resid_norm_np) +
-                  ", max|entry|=" + std::to_string(resid_max_np) + ")");
+                  FormatSci(resid_norm_np) +
+                  ", max|entry|=" + FormatSci(resid_max_np) + ")");
   }
 
   // DGSEM + IGR entropy production regression (smooth state).

@@ -45,7 +45,6 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
 
   Mesh& mesh = *op_.vfes.GetMesh();
   const int nfaces = mesh.GetNumFaces();
-
   Vector state1(op_.num_equations);
   Vector state2(op_.num_equations);
   Vector fluxN(op_.num_equations);
@@ -76,6 +75,7 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
 
     const int e1 = Tr->Elem1No;
     const int e2 = Tr->Elem2No;
+    if (e2 < 0) { continue; }
 
     const FiniteElement& fe1 = *op_.vfes.GetFE(e1);
     const int dof1 = fe1.GetDof();
@@ -161,48 +161,103 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
         CalcOrtho(Tr->Jacobian(), nor);
       }
 
-      if (e2 >= 0)
+      const IntegrationPoint& ip2 = Tr->GetElement2IntPoint();
+      const int i2 = find_node(nodes1d, ip2.x);
+      const int j2 = (op_.dim > 1) ? find_node(nodes1d, ip2.y) : 0;
+      const int local2 =
+          lex_to_local2[(op_.dim == 1) ? i2 : i2 + n1d * j2];
+
+      Xmat2.GetRow(local2, state2);
+
+      const real_t speed = op_.num_flux_->Eval(state1, state2, nor, *Tr, fluxN);
+      max_face_speed = std::max(max_face_speed, speed);
+
+      for (int eq = 0; eq < op_.num_equations; ++eq)
       {
-        const IntegrationPoint& ip2 = Tr->GetElement2IntPoint();
-        const int i2 = find_node(nodes1d, ip2.x);
-        const int j2 = (op_.dim > 1) ? find_node(nodes1d, ip2.y) : 0;
-        const int local2 =
-            lex_to_local2[(op_.dim == 1) ? i2 : i2 + n1d * j2];
-
-        Xmat2.GetRow(local2, state2);
-
-        const real_t speed = op_.num_flux_->Eval(state1, state2, nor, *Tr, fluxN);
-        max_face_speed = std::max(max_face_speed, speed);
-
-        for (int eq = 0; eq < op_.num_equations; ++eq)
-        {
-          elvect1(local1, eq) += -ip.weight * fluxN(eq);
-          elvect2(local2, eq) += +ip.weight * fluxN(eq);
-        }
-      }
-      else
-      {
-        const BdrHyperbolicFluxIntegrator* bdr =
-            FindBdrIntegrator(Tr->Attribute);
-        MFEM_VERIFY(bdr,
-                    "DGSEM boundary face is missing a boundary integrator.");
-        bdr->GetBoundaryState().Eval(state1, nor, *Tr, state2);
-
-        const real_t speed = op_.num_flux_->Eval(state1, state2, nor, *Tr, fluxN);
-        max_face_speed = std::max(max_face_speed, speed);
-
-        for (int eq = 0; eq < op_.num_equations; ++eq)
-        {
-          elvect1(local1, eq) += -ip.weight * fluxN(eq);
-        }
+        elvect1(local1, eq) += -ip.weight * fluxN(eq);
+        elvect2(local2, eq) += +ip.weight * fluxN(eq);
       }
     }
 
     z.AddElementVector(vdofs1, elvect1.GetData());
-    if (e2 >= 0)
+    z.AddElementVector(vdofs2, elvect2.GetData());
+  }
+
+  const int nbdr = mesh.GetNBE();
+  for (int b = 0; b < nbdr; ++b)
+  {
+    FaceElementTransformations* Tr = mesh.GetBdrFaceTransformations(b);
+    if (!Tr) { continue; }
+
+    const int e1 = Tr->Elem1No;
+    const FiniteElement& fe1 = *op_.vfes.GetFE(e1);
+    const int dof1 = fe1.GetDof();
+    const int order = fe1.GetOrder();
+    const auto& basis1d = mfem::dgsem::GetLGLBasis1D(order);
+    const Vector& nodes1d = basis1d.nodes;
+    const int n1d = basis1d.n;
+
+    Array<int> vdofs1;
+    Vector xval1;
+    op_.vfes.GetElementVDofs(e1, vdofs1);
+    x.GetSubVector(vdofs1, xval1);
+    DenseMatrix Xmat1(xval1.GetData(), dof1, op_.num_equations);
+
+    const std::vector<std::array<int, 3>>& dof_to_ijk1 =
+        mfem::dgsem::GetTensorDofToIJK(fe1);
+    std::vector<int> lex_to_local1(dof1, -1);
+    for (int local = 0; local < dof1; ++local)
     {
-      z.AddElementVector(vdofs2, elvect2.GetData());
+      const int i = dof_to_ijk1[local][0];
+      const int j = dof_to_ijk1[local][1];
+      const int lex = (op_.dim == 1) ? i : i + n1d * j;
+      lex_to_local1[lex] = local;
     }
+
+    DenseMatrix elvect1(dof1, op_.num_equations);
+    elvect1 = 0.0;
+
+    const IntegrationRule& ir =
+        (op_.dim == 1) ? IntRules.Get(Geometry::POINT, 1)
+                       : mfem::dgsem::GetLGLFaceRule(order);
+
+    for (int ip_id = 0; ip_id < ir.GetNPoints(); ++ip_id)
+    {
+      const IntegrationPoint& ip = ir.IntPoint(ip_id);
+      Tr->SetAllIntPoints(&ip);
+
+      const IntegrationPoint& ip1 = Tr->GetElement1IntPoint();
+      const int i1 = find_node(nodes1d, ip1.x);
+      const int j1 = (op_.dim > 1) ? find_node(nodes1d, ip1.y) : 0;
+      const int local1 = lex_to_local1[(op_.dim == 1) ? i1 : i1 + n1d * j1];
+
+      Xmat1.GetRow(local1, state1);
+
+      if (op_.dim == 1)
+      {
+        nor(0) = (ip1.x - 0.5) * 2.0;
+      }
+      else
+      {
+        CalcOrtho(Tr->Jacobian(), nor);
+      }
+
+      const BdrHyperbolicFluxIntegrator* bdr =
+          FindBdrIntegrator(Tr->Attribute);
+      MFEM_VERIFY(bdr,
+                  "DGSEM boundary face is missing a boundary integrator.");
+      bdr->GetBoundaryState().Eval(state1, nor, *Tr, state2);
+
+      const real_t speed = op_.num_flux_->Eval(state1, state2, nor, *Tr, fluxN);
+      max_face_speed = std::max(max_face_speed, speed);
+
+      for (int eq = 0; eq < op_.num_equations; ++eq)
+      {
+        elvect1(local1, eq) += -ip.weight * fluxN(eq);
+      }
+    }
+
+    z.AddElementVector(vdofs1, elvect1.GetData());
   }
 
   return max_face_speed;

@@ -135,10 +135,10 @@ int RunEulerTests(TestContext& ctx)
         cons_case, dim, gamma_case, /*rho_floor=*/0.0);
     ctx.AddParity(p_case);
     ctx.Check(std::isfinite(p_case),
-              "EOS pressure is finite for gamma=" + std::to_string(gamma_case));
+              "EOS pressure is finite for gamma=" + FormatSci(gamma_case));
     ctx.CheckNear(p_case, prim_case(1 + dim), 1.0e-11,
                   "EOS pressure matches primitive pressure for gamma=" +
-                      std::to_string(gamma_case));
+                      FormatSci(gamma_case));
   }
 
   return ctx.failures;

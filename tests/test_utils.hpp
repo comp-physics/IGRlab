@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include "mfem.hpp"
@@ -18,6 +20,32 @@ inline bool EnvEnabled(const char* name)
   if (!env) { return false; }
   const std::string value(env);
   return value == "1" || value == "true" || value == "TRUE" || value == "on";
+}
+
+inline bool EnvEnabledDefault(const char* name, bool default_value)
+{
+  const char* env = std::getenv(name);
+  if (!env) { return default_value; }
+  const std::string value(env);
+  if (value == "0" || value == "false" || value == "FALSE" ||
+      value == "off" || value == "OFF")
+  {
+    return false;
+  }
+  if (value == "1" || value == "true" || value == "TRUE" ||
+      value == "on" || value == "ON")
+  {
+    return true;
+  }
+  return default_value;
+}
+
+inline std::string FormatSci(double value, int precision = 12)
+{
+  std::ostringstream os;
+  os.setf(std::ios::scientific);
+  os << std::setprecision(precision) << value;
+  return os.str();
 }
 
 struct TestContext
@@ -52,14 +80,16 @@ struct TestContext
     {
       ++failures;
       std::cerr << "[FAIL] " << msg
-                << " (a=" << a << ", b=" << b
-                << ", err=" << err << ", tol=" << tol << ")\n";
+                << " (a=" << FormatSci(a) << ", b=" << FormatSci(b)
+                << ", err=" << FormatSci(err) << ", tol=" << FormatSci(tol)
+                << ")\n";
     }
     else if (verbose_metrics)
     {
       std::cout << "[PASS] " << msg
-                << " (a=" << a << ", b=" << b
-                << ", err=" << err << ", tol=" << tol << ")\n";
+                << " (a=" << FormatSci(a) << ", b=" << FormatSci(b)
+                << ", err=" << FormatSci(err) << ", tol=" << FormatSci(tol)
+                << ")\n";
     }
   }
 

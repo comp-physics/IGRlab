@@ -21,6 +21,8 @@ add_subdirectory(examples/sedov_taylor_blast)
 add_subdirectory(examples/shock_vortex_interaction)
 add_subdirectory(examples/stationary_shock)
 add_subdirectory(examples/double_mach_ref)
+add_subdirectory(examples/dgsem_smooth_advection)
+add_subdirectory(examples/dgsem_smooth_advection_periodic)
 
 if(BUILD_TESTING AND DG_IGR_BUILD_TESTS)
     add_subdirectory(tests)

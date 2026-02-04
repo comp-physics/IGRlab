@@ -397,8 +397,8 @@ int RunDGSEMFluxTests(TestContext& ctx)
     ctx.AddParity(resid_norm);
     ctx.Check(resid_norm < tol_resid,
               "DGSEM volume mode residual ~0 for constant 1D state (norm=" +
-                  std::to_string(resid_norm) +
-                  ", max|entry|=" + std::to_string(resid_max) + ")");
+                  FormatSci(resid_norm) +
+                  ", max|entry|=" + FormatSci(resid_max) + ")");
   }
 
   // Integration test: DGSEM volume mode constant-state residual in 2D.
@@ -456,8 +456,8 @@ int RunDGSEMFluxTests(TestContext& ctx)
     ctx.AddParity(resid_norm);
     ctx.Check(resid_norm < tol_resid,
               "DGSEM volume mode residual ~0 for constant 2D state (norm=" +
-                  std::to_string(resid_norm) +
-                  ", max|entry|=" + std::to_string(resid_max) + ")");
+                  FormatSci(resid_norm) +
+                  ", max|entry|=" + FormatSci(resid_max) + ")");
   }
 
   // Integration test: DGSEM constant-state residual on a curved quad mesh.
@@ -528,8 +528,8 @@ int RunDGSEMFluxTests(TestContext& ctx)
     ctx.AddParity(resid_norm);
     ctx.Check(resid_norm < tol_resid,
               "DGSEM curved-quad residual ~0 for constant state (norm=" +
-                  std::to_string(resid_norm) +
-                  ", max|entry|=" + std::to_string(resid_max) + ")");
+                  FormatSci(resid_norm) +
+                  ", max|entry|=" + FormatSci(resid_max) + ")");
   }
 
   // Discrete metric/GCL sanity: stronger deformation on a quad mesh.
@@ -602,8 +602,8 @@ int RunDGSEMFluxTests(TestContext& ctx)
     ctx.AddParity(resid_norm);
     ctx.Check(resid_norm < tol_resid,
               "DGSEM strongly-deformed quad residual ~0 (norm=" +
-                  std::to_string(resid_norm) +
-                  ", max|entry|=" + std::to_string(resid_max) + ")");
+                  FormatSci(resid_norm) +
+                  ", max|entry|=" + FormatSci(resid_max) + ")");
   }
 
   // IGR-aware DGSEM volume flux responds to varying sigma.
