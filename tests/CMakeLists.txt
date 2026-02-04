@@ -127,6 +127,22 @@ add_example_regression(dg_igr_regression_stationary_shock
   stationary_shock
   examples/stationary_shock/stationary_shock.msh
   -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_dgsem_stationary_shock
+  dgsem_stationary_shock
+  examples/dgsem_stationary_shock/stationary_shock.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_dgsem_shock_vortex
+  dgsem_shock_vortex_interaction
+  examples/dgsem_shock_vortex_interaction/shock_vortex.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_dgsem_forward_facing
+  dgsem_forward_facing_step
+  examples/dgsem_forward_facing_step/forward_facing.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_dgsem_sedov
+  dgsem_sedov_taylor_blast
+  examples/dgsem_sedov_taylor_blast/sedov_taylor.msh
+  -no-vtk -dt_save 1.0)
 add_example_regression(dg_igr_regression_shock_vortex
   shock_vortex_interaction
   examples/shock_vortex_interaction/shock_vortex.msh

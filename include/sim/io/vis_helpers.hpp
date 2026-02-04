@@ -22,6 +22,7 @@ struct EulerFieldList
 {
   EulerStateViews* state = nullptr;
   EulerPressureView* pressure = nullptr;
+  EulerVelocityView* velocity = nullptr;
   dg_igr::IGRSolver* igr = nullptr;
 };
 
@@ -147,9 +148,12 @@ inline mfem::io::EulerVTKFields MakeEulerVTKFields(const EulerFieldList& fields)
   if (fields.state)
   {
     out.density = &fields.state->density;
-    out.momentum_x = &fields.state->momentum_x;
-    out.momentum_y = &fields.state->momentum_y;
+    out.momentum = &fields.state->momentum;
     out.energy = &fields.state->energy;
+  }
+  if (fields.velocity)
+  {
+    out.velocity = &fields.velocity->velocity;
   }
   if (fields.igr)
   {
@@ -216,6 +220,10 @@ inline void UpdateEulerOutputFields(const EulerFieldList& fields,
   if (fields.pressure)
   {
     fields.pressure->Update();
+  }
+  if (fields.velocity)
+  {
+    fields.velocity->Update();
   }
 }
 

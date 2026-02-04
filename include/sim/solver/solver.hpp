@@ -314,7 +314,7 @@ struct Solver
         spec.make_ic(case_opts, ctx, case_cfg.gamma);
     MFEM_VERIFY(ic, "CaseSpec initial condition builder returned null.");
 
-    EulerStateBundle state_bundle(ctx, case_cfg.gamma);
+    EulerStateBundle state_bundle(ctx, case_cfg.gamma, rho_floor);
     if (igr)
     {
       state_bundle.AttachIGR(*igr);
