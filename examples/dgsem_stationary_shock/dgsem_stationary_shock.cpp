@@ -39,7 +39,7 @@ int main(int argc, char *argv[])
     cfg.defaults.vtk_save = false;
     cfg.defaults.par_ref_levels = 0;
     cfg.defaults.dgsem_volume_flux = "ranocha";
-    cfg.defaults.dgsem_surface_flux = "es-winters";
+    cfg.defaults.dgsem_surface_flux = "rusanov";
     cfg.rk3_config.limit_initial = false;
   };
 

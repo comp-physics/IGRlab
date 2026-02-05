@@ -27,6 +27,7 @@ add_subdirectory(examples/dgsem_stationary_shock)
 add_subdirectory(examples/dgsem_shock_vortex_interaction)
 add_subdirectory(examples/dgsem_forward_facing_step)
 add_subdirectory(examples/dgsem_sedov_taylor_blast)
+add_subdirectory(examples/dgsem_supersonic_cylinder)
 
 if(BUILD_TESTING AND DG_IGR_BUILD_TESTS)
     add_subdirectory(tests)

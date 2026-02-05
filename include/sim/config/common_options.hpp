@@ -92,7 +92,8 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "Print analysis every n-th timestep (0 disables, -1 uses 10x -vs).");
   args.AddOption(&opts.nan_scan, "-nan-scan", "--nan-scan", "-no-nan-scan",
                  "--no-nan-scan",
-                 "Enable or disable NaN/inf scanning during time integration.");
+                 "Enable or disable NaN/inf scanning during time integration "
+                 "(per-stage + per-step).");
 }
 
 /**

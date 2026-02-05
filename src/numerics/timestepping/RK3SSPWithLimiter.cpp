@@ -1,6 +1,9 @@
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
+
+#include "utils/diagnostics/non_finite.hpp"
 #include "numerics/limiters/limiters.hpp"   // ApplyZhangShuPositivityLimiter, etc.
 #include <algorithm>
+#include <iostream>
 
 namespace mfem {
 
@@ -165,10 +168,33 @@ void RK3SSPWithLimiter::AddKrivodonovaLimiter(const KrivoOptions &opts)
       });
 }
 
+void RK3SSPWithLimiter::MaybeScanStage(Vector &v, double t, const char* label)
+{
+  if (!nan_scan_stages_ || stage_nan_detected_)
+  {
+    return;
+  }
+
+  ParGridFunction stage(&vfes_, v);
+  const dg_igr::NonFiniteSummary summary = dg_igr::ScanNonFinite(stage);
+  if (summary.global_non_finite > 0)
+  {
+    stage_nan_detected_ = true;
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[nan-scan] Detected " << summary.global_non_finite
+                << " non-finite entries at " << label << " t=" << t
+                << " (finite min=" << summary.global_min
+                << ", finite max=" << summary.global_max << ")\n";
+    }
+  }
+}
+
 // --------------------------------- SSPRK(3,3) ---------------------------------
 
 void RK3SSPWithLimiter::Step(Vector &x, real_t &t, real_t &dt)
 {
+  stage_nan_detected_ = false;
   // Decide whether to apply optional limiters on this step.
   const bool apply_optional =
       (max_limiter_steps_ < 0) || (step_count_ < max_limiter_steps_);
@@ -180,6 +206,7 @@ void RK3SSPWithLimiter::Step(Vector &x, real_t &t, real_t &dt)
   {
     ApplyCallbacks(x, t, apply_optional);
   }
+  MaybeScanStage(x, t, "initial");
 
   // k0 = f(t, x)
   f->SetTime(t);
@@ -188,6 +215,7 @@ void RK3SSPWithLimiter::Step(Vector &x, real_t &t, real_t &dt)
   // ===== Stage 1: y = x + dt * k0 =====
   add(x, dt, k_, y_);
   ApplyCallbacks(y_, t + dt, apply_optional);
+  MaybeScanStage(y_, t + dt, "stage1");
 
   // k1 = f(t+dt, y)
   f->SetTime(t + dt);
@@ -197,6 +225,7 @@ void RK3SSPWithLimiter::Step(Vector &x, real_t &t, real_t &dt)
   y_.Add(dt, k_);                 // y := y + dt*k1
   add(3.0/4.0, x, 1.0/4.0, y_, y_);
   ApplyCallbacks(y_, t + dt, /*apply_optional=*/false);
+  MaybeScanStage(y_, t + dt, "stage2");
 
   // k2 = f(t + dt/2, y)
   f->SetTime(t + dt/2);
@@ -208,6 +237,7 @@ void RK3SSPWithLimiter::Step(Vector &x, real_t &t, real_t &dt)
   t += dt;
   // Final limiting on x 
   ApplyCallbacks(x, t, /*apply_optional=*/false);
+  MaybeScanStage(x, t, "stage3");
 
   ++step_count_;
 }

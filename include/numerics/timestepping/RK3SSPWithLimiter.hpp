@@ -56,6 +56,9 @@ public:
   ///   nsteps >= 0 -> optional callbacks applied while step_count_ < nsteps.
   void SetLimiterSteps(long nsteps) { max_limiter_steps_ = nsteps; }
 
+  /// Enable per-stage NaN/inf scans (diagnostic; off by default).
+  void EnableStageNanScan(bool on) { nan_scan_stages_ = on; }
+
   /// Reset the internal step counter (e.g., if restarting the time integrator).
   void ResetStepCount() { step_count_ = 0; }
 
@@ -143,6 +146,8 @@ private:
   // Optional limiter scheduling
   long step_count_        = 0;   ///< number of completed Step() calls
   long max_limiter_steps_ = dg_igr::RK3Defaults::kLimiterSteps;  ///< <0 => optional limiters always on
+  bool nan_scan_stages_   = false;
+  bool stage_nan_detected_ = false;
 
   // Work vectors
   Vector y_, k_;
@@ -150,6 +155,7 @@ private:
   // Helpers
   /// Apply both always-on and (optionally) optional callbacks to vector v.
   void ApplyCallbacks(Vector &v, double t, bool apply_optional);
+  void MaybeScanStage(Vector &v, double t, const char* label);
   int  AutoQuadOrder() const;
 };
 

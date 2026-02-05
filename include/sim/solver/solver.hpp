@@ -278,6 +278,7 @@ struct Solver
         ctx.spaces.vfes, ctx.dim, case_cfg.rk3_config);
     ConfigureLimiterPipeline(rk3, case_cfg.limiter_pipeline,
                              ctx.spaces.vfes, ctx.dim, case_cfg.gamma);
+    rk3.EnableStageNanScan(run_cfg.opts.nan_scan);
 
     const double rho_floor = case_cfg.rk3_config.rho_min;
     std::unique_ptr<dg_igr::IGRSolver> igr;

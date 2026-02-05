@@ -60,8 +60,25 @@
 namespace
 {
 
+struct InflowOptions
+{
+  double vx = 3.0;
+  double vy = 0.0;
+};
+
+inline void AddInflowOptions(mfem::OptionsParser& args,
+                             InflowOptions& inflow_opts)
+{
+  args.AddOption(&inflow_opts.vx, "-vx", "--velocity-x",
+                 "Free-stream / inflow velocity x-component.");
+  args.AddOption(&inflow_opts.vy, "-vy", "--velocity-y",
+                 "Free-stream / inflow velocity y-component.");
+}
+
 struct SupersonicOptions
-{};
+{
+  InflowOptions inflow;
+};
 
 } // namespace
 
@@ -86,11 +103,22 @@ int main(int argc, char *argv[])
     cfg.limiter_pipeline.zhang_shu = false;
   };
 
-  spec.make_ic = [](const SupersonicOptions&,
+  spec.add_options = [](mfem::OptionsParser& args, SupersonicOptions& opts)
+  {
+    AddInflowOptions(args, opts.inflow);
+  };
+
+  spec.make_ic = [](const SupersonicOptions& opts,
                     const dg_igr_examples::ExampleContext&,
                     double gamma)
   {
-    auto ic_fun = mfem::EulerInitialCondition();
+    mfem::Vector Uin(4);
+    Uin(0) = 1.4;
+    Uin(1) = 1.4 * opts.inflow.vx;
+    Uin(2) = 1.4 * opts.inflow.vy;
+    Uin(3) = 8.8;
+
+    auto ic_fun = mfem::EulerInitialCondition(Uin);
     return std::make_unique<mfem::VectorFunctionCoefficient>(ic_fun);
   };
 
@@ -104,15 +132,15 @@ int main(int argc, char *argv[])
          {dg_igr_examples::BoundaryRole::Cylinder, {5}}});
   };
 
-  spec.apply_bc = [](const SupersonicOptions&,
+  spec.apply_bc = [](const SupersonicOptions& opts,
                      const dg_igr_examples::ExampleContext&,
                      auto& bc,
                      const auto& markers)
   {
     mfem::Vector Uin(4);
     Uin(0) = 1.4;
-    Uin(1) = 1.4 * 1.2;
-    Uin(2) = 0.0;
+    Uin(1) = 1.4 * opts.inflow.vx;
+    Uin(2) = 1.4 * opts.inflow.vy;
     Uin(3) = 8.8;
 
     bc.AddSupersonicInletFromBuilder(markers, [&]() { return Uin; });
