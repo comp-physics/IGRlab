@@ -64,6 +64,36 @@ if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
     LABELS "parity"
     TIMEOUT 120
   )
+
+  add_test(NAME dg_igr_dgsem_operator_mpi_2rank
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_unit_tests> --dgsem-operator
+            ${MPIEXEC_POSTFLAGS}
+  )
+  set_tests_properties(dg_igr_dgsem_operator_mpi_2rank PROPERTIES
+    LABELS "mpi"
+    TIMEOUT 120
+  )
+
+  if (TARGET dgsem_smooth_advection)
+    set(reg_dir "${CMAKE_BINARY_DIR}/tests/regression/dg_igr_mpi_dgsem_smooth_advection")
+    file(MAKE_DIRECTORY "${reg_dir}")
+    add_test(NAME dg_igr_dgsem_advection_mpi_smoke
+      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:dgsem_smooth_advection>
+              -m ${CMAKE_SOURCE_DIR}/examples/dgsem_smooth_advection/smooth_advection.msh
+              -rs 0 -rp 0 -o 2 -tf 1.0e-4 -dt 1.0e-4 -c 0.0
+              -no-vis -vs 1000000 -nan-scan
+              -no-vtk -dt_save 1.0
+              --dg-backend dgsem
+              ${MPIEXEC_POSTFLAGS}
+    )
+    set_tests_properties(dg_igr_dgsem_advection_mpi_smoke PROPERTIES
+      WORKING_DIRECTORY "${reg_dir}"
+      LABELS "mpi"
+      TIMEOUT 180
+    )
+  endif()
 endif()
 
 # Mini-regressions: run each example for a tiny time window with IO disabled.

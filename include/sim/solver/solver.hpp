@@ -38,15 +38,6 @@ namespace detail
 
 inline void VerifyDGSEMElementGeometry(const mfem::Mesh& mesh)
 {
-  if (const auto* pmesh = dynamic_cast<const mfem::ParMesh*>(&mesh))
-  {
-    if (pmesh->GetNSharedFaces() > 0)
-    {
-      MFEM_VERIFY(false,
-                  "DGSEM MPI shared-face support is not implemented yet. "
-                  "Run with -np 1 or use --dg-backend dg.");
-    }
-  }
   for (int i = 0; i < mesh.GetNE(); ++i)
   {
     const mfem::Geometry::Type geom = mesh.GetElementBaseGeometry(i);
