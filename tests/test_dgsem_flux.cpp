@@ -1,6 +1,7 @@
 #include "numerics/dgsem/dgsem_basis.hpp"
 #include "numerics/dgsem/dgsem_entropy_flux.hpp"
 #include "numerics/dgsem/dgsem_flux.hpp"
+#include "numerics/dgsem/dgsem_operator.hpp"
 #include "numerics/dgsem/dgsem_quadrature.hpp"
 #include "numerics/dgsem/dgsem_tensor.hpp"
 #include "numerics/dgsem/dgsem_volume_flux.hpp"
@@ -399,6 +400,111 @@ int RunDGSEMFluxTests(TestContext& ctx)
               "DGSEM volume mode residual ~0 for constant 1D state (norm=" +
                   FormatSci(resid_norm) +
                   ", max|entry|=" + FormatSci(resid_max) + ")");
+  }
+
+  // Volume dissipation modes are runtime-selectable and active in DGSEM volume kernel.
+  {
+    constexpr int dim = 1;
+    constexpr int num_eq = dim + 2;
+    constexpr double gamma = 1.4;
+    constexpr double kPi = 3.14159265358979323846;
+    const double tol_zero = 1.0e-11;
+
+    mfem::Mesh mesh = mfem::Mesh::MakeCartesian1D(1, 1.0);
+    mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+    mfem::DG_FECollection fec(/*order=*/3, dim, mfem::BasisType::GaussLobatto);
+    mfem::ParFiniteElementSpace vfes(&pmesh, &fec, num_eq, mfem::Ordering::byNODES);
+
+    mfem::EulerFlux flux(dim, gamma);
+    mfem::RusanovFluxWithSides num_flux(flux);
+    auto form_integrator =
+        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux,
+                                                         /*int_order_offset=*/2);
+    mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form_integrator),
+                                            /*preassembleWeakDivergence=*/true);
+    oper.SetNumericalFlux(&num_flux);
+    oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+    oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
+    oper.SetDGSEMGamma(gamma);
+    oper.SetDGSEMEntropyJacobianAnalytic(false);
+
+    mfem::Vector x(vfes.GetTrueVSize());
+    x = 0.0;
+    {
+      const mfem::FiniteElement* fe = vfes.GetFE(0);
+      const int dof = fe->GetDof();
+      const mfem::IntegrationRule& nodes = fe->GetNodes();
+      mfem::Array<int> vdofs;
+      vfes.GetElementVDofs(0, vdofs);
+      mfem::Vector xelem(dof * num_eq);
+      mfem::DenseMatrix Xmat(xelem.GetData(), dof, num_eq);
+      for (int j = 0; j < dof; ++j)
+      {
+        const double xi = nodes.IntPoint(j).x;
+        const double rho = 1.0 + 0.20 * std::sin(2.0 * kPi * xi);
+        const double u = 0.25 + 0.15 * std::cos(2.0 * kPi * xi);
+        const double p = 1.0 + 0.10 * std::sin(kPi * xi);
+        const mfem::Vector cons = EulerConsFromPrim1D(rho, u, p, gamma);
+        for (int eq = 0; eq < num_eq; ++eq) { Xmat(j, eq) = cons(eq); }
+      }
+      x.SetSubVector(vdofs, xelem);
+    }
+
+    auto assemble_volume = [&](mfem::DGSEMVolumeDissipation mode, mfem::Vector& z)
+    {
+      oper.SetDGSEMVolumeDissipation(mode);
+      z.SetSize(vfes.GetTrueVSize());
+      z = 0.0;
+      mfem::dgsem::DGSEMOperator dgsem_op(oper);
+      dgsem_op.AssembleVolume(x, z);
+    };
+
+    mfem::Vector z_none, z_llf, z_entropy;
+    assemble_volume(mfem::DGSEMVolumeDissipation::None, z_none);
+    assemble_volume(mfem::DGSEMVolumeDissipation::LLF, z_llf);
+    assemble_volume(mfem::DGSEMVolumeDissipation::EntropyVarsLF, z_entropy);
+
+    const double norm_none = GlobalL2Norm(z_none);
+    const double norm_llf = GlobalL2Norm(z_llf);
+    const double norm_entropy = GlobalL2Norm(z_entropy);
+    ctx.Check(norm_none > 0.0,
+              "DGSEM volume (no dissipation) is non-trivial for non-constant state");
+    ctx.Check(norm_llf > 0.0,
+              "DGSEM LLF volume dissipation mode produces non-trivial contribution");
+    ctx.Check(norm_entropy > 0.0,
+              "DGSEM entropy-LF volume dissipation mode produces non-trivial contribution");
+
+    mfem::Vector diff_llf(z_llf);
+    diff_llf -= z_none;
+    mfem::Vector diff_entropy(z_entropy);
+    diff_entropy -= z_none;
+    mfem::Vector diff_between(z_entropy);
+    diff_between -= z_llf;
+
+    ctx.Check(GlobalL2Norm(diff_llf) > 1.0e-12,
+              "DGSEM LLF volume dissipation changes the volume residual");
+    ctx.Check(GlobalL2Norm(diff_entropy) > 1.0e-12,
+              "DGSEM entropy-LF volume dissipation changes the volume residual");
+    ctx.Check(GlobalL2Norm(diff_between) > 1.0e-12,
+              "DGSEM LLF and entropy-LF volume dissipation are distinct");
+
+    // Constant-state invariance with dissipation active.
+    const mfem::Vector cons_const =
+        EulerConsFromPrim1D(/*rho=*/1.0, /*u=*/0.15, /*p=*/1.0, gamma);
+    mfem::ParGridFunction Uconst(&vfes);
+    FillConstantState(cons_const, Uconst);
+    Uconst.GetTrueDofs(x);
+    assemble_volume(mfem::DGSEMVolumeDissipation::None, z_none);
+    assemble_volume(mfem::DGSEMVolumeDissipation::LLF, z_llf);
+    assemble_volume(mfem::DGSEMVolumeDissipation::EntropyVarsLF, z_entropy);
+    diff_llf = z_llf;
+    diff_llf -= z_none;
+    diff_entropy = z_entropy;
+    diff_entropy -= z_none;
+    ctx.Check(GlobalL2Norm(diff_llf) < tol_zero,
+              "DGSEM LLF volume dissipation leaves constant-state volume term unchanged");
+    ctx.Check(GlobalL2Norm(diff_entropy) < tol_zero,
+              "DGSEM entropy-LF volume dissipation leaves constant-state volume term unchanged");
   }
 
   // Integration test: DGSEM volume mode constant-state residual in 2D.

@@ -34,8 +34,8 @@ int main(int argc, char *argv[]) {
   spec.default_mesh_path = mfem::SupersonicCylinderDefaultMeshPath();
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
-  spec.use_igr = false;
-  spec.need_sigma = false;
+  spec.use_igr = true;
+  spec.need_sigma = true;
   spec.need_h1 = false;
   spec.vis.precision = 8;
   spec.dg_backend_default = dg_igr_examples::DGBackend::DGSEM;
@@ -45,6 +45,7 @@ int main(int argc, char *argv[]) {
     cfg.defaults.vtk_save = false;
     cfg.defaults.par_ref_levels = 0;
     cfg.defaults.dgsem_volume_flux = "ranocha";
+    cfg.defaults.dgsem_volume_dissipation = "llf";
     cfg.defaults.dgsem_surface_flux = "rusanov";
     cfg.rk3_config.limit_initial = false;
     cfg.limiter_pipeline.venkat_mode = mfem::VenkatLimiterMode::kNone;

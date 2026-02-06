@@ -24,6 +24,7 @@ struct CommonOptions
   std::string dg_backend = "dg"; ///< DG backend: "dg" or "dgsem".
   std::string dgsem_stab = "none"; ///< DGSEM stabilization: "none", "split", or "filter".
   std::string dgsem_volume_flux = "central"; ///< DGSEM volume flux: "central", "chandrashekar", or "ranocha".
+  std::string dgsem_volume_dissipation = "none"; ///< DGSEM volume dissipation: "none", "llf", or "entropy-lf".
   std::string dgsem_surface_flux = "rusanov"; ///< DGSEM surface flux: "rusanov", "es-winters", or "es-lf-entropy".
   std::string dgsem_entropy_jacobian = "fd"; ///< DGSEM ES-LF entropy Jacobian: "fd" or "analytic".
   mfem::real_t t_final = 1.0;    ///< Final time.
@@ -63,6 +64,8 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "DGSEM stabilization: none | split | filter (not yet implemented).");
   args.AddOption(&opts.dgsem_volume_flux, "-dvf", "--dgsem-volume-flux",
                  "DGSEM volume flux: central | chandrashekar | ranocha.");
+  args.AddOption(&opts.dgsem_volume_dissipation, "-dvd", "--dgsem-volume-dissipation",
+                 "DGSEM volume dissipation: none | llf | entropy-lf.");
   args.AddOption(&opts.dgsem_surface_flux, "-dsf", "--dgsem-surface-flux",
                  "DGSEM surface flux: rusanov | diffusive-rusanov | es-winters | es-lf-entropy.");
   args.AddOption(&opts.dgsem_entropy_jacobian, "-dej", "--dgsem-entropy-jacobian",

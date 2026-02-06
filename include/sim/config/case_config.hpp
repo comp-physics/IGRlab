@@ -54,6 +54,14 @@ enum class DGSEMVolumeFlux
   Ranocha
 };
 
+/// @brief DGSEM volume dissipation selection.
+enum class DGSEMVolumeDissipation
+{
+  None,
+  LLF,
+  EntropyVarsLF
+};
+
 /// @brief DGSEM surface flux selection.
 enum class DGSEMSurfaceFlux
 {
@@ -94,6 +102,8 @@ struct RunConfig
   DGBackend dg_backend = DGBackend::DG;
   DGSEMStabilization dgsem_stab = DGSEMStabilization::None;
   DGSEMVolumeFlux dgsem_volume_flux = DGSEMVolumeFlux::Central;
+  DGSEMVolumeDissipation dgsem_volume_dissipation =
+      DGSEMVolumeDissipation::None;
   DGSEMSurfaceFlux dgsem_surface_flux = DGSEMSurfaceFlux::Rusanov;
   DGSEMEntropyJacobian dgsem_entropy_jacobian = DGSEMEntropyJacobian::FiniteDifference;
   std::string mesh_path;
@@ -193,6 +203,39 @@ inline const char* DGSEMVolumeFluxToString(DGSEMVolumeFlux flux)
     case DGSEMVolumeFlux::Ranocha: return "ranocha";
   }
   return "central";
+}
+
+inline DGSEMVolumeDissipation ParseDGSEMVolumeDissipation(
+    const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "none")
+  {
+    return DGSEMVolumeDissipation::None;
+  }
+  if (lower == "llf" || lower == "lax-friedrichs" || lower == "rusanov")
+  {
+    return DGSEMVolumeDissipation::LLF;
+  }
+  if (lower == "entropy-lf" || lower == "entropy-vars-lf" ||
+      lower == "entropy-variable-lf" || lower == "es-lf")
+  {
+    return DGSEMVolumeDissipation::EntropyVarsLF;
+  }
+  MFEM_VERIFY(false, "Invalid DGSEM volume dissipation '" << value
+              << "'. Use 'none', 'llf', or 'entropy-lf'.");
+  return DGSEMVolumeDissipation::None;
+}
+
+inline const char* DGSEMVolumeDissipationToString(DGSEMVolumeDissipation diss)
+{
+  switch (diss)
+  {
+    case DGSEMVolumeDissipation::None: return "none";
+    case DGSEMVolumeDissipation::LLF: return "llf";
+    case DGSEMVolumeDissipation::EntropyVarsLF: return "entropy-lf";
+  }
+  return "none";
 }
 
 inline DGSEMSurfaceFlux ParseDGSEMSurfaceFlux(const std::string& value)
@@ -350,6 +393,8 @@ inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
   run_cfg.dg_backend = ParseDGBackend(opts.dg_backend);
   run_cfg.dgsem_stab = ParseDGSEMStabilization(opts.dgsem_stab);
   run_cfg.dgsem_volume_flux = ParseDGSEMVolumeFlux(opts.dgsem_volume_flux);
+  run_cfg.dgsem_volume_dissipation =
+      ParseDGSEMVolumeDissipation(opts.dgsem_volume_dissipation);
   run_cfg.dgsem_surface_flux = ParseDGSEMSurfaceFlux(opts.dgsem_surface_flux);
   run_cfg.dgsem_entropy_jacobian =
       ParseDGSEMEntropyJacobian(opts.dgsem_entropy_jacobian);

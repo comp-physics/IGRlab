@@ -44,6 +44,18 @@ inline mfem::DGHyperbolicConservationLaws MakeDGOperator(
     }
     return mfem::DGSEMVolumeFlux::Central;
   };
+  auto to_mfem_vol_diss = [](DGSEMVolumeDissipation diss) {
+    switch (diss)
+    {
+      case DGSEMVolumeDissipation::None:
+        return mfem::DGSEMVolumeDissipation::None;
+      case DGSEMVolumeDissipation::LLF:
+        return mfem::DGSEMVolumeDissipation::LLF;
+      case DGSEMVolumeDissipation::EntropyVarsLF:
+        return mfem::DGSEMVolumeDissipation::EntropyVarsLF;
+    }
+    return mfem::DGSEMVolumeDissipation::None;
+  };
   mfem::DGHyperbolicConservationLaws op(
       ctx.spaces.vfes,
       std::unique_ptr<mfem::HyperbolicFormIntegrator>(
@@ -55,6 +67,11 @@ inline mfem::DGHyperbolicConservationLaws MakeDGOperator(
   {
     op.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
     op.SetDGSEMVolumeFlux(to_mfem_vol(ctx.run_cfg.dgsem_volume_flux));
+    op.SetDGSEMVolumeDissipation(
+        to_mfem_vol_diss(ctx.run_cfg.dgsem_volume_dissipation));
+    op.SetDGSEMEntropyJacobianAnalytic(
+        ctx.run_cfg.dgsem_entropy_jacobian ==
+        DGSEMEntropyJacobian::Analytic);
     op.SetDGSEMGamma(ctx.run_cfg.case_config.gamma);
     if (ctx.run_cfg.dgsem_stab != DGSEMStabilization::None)
     {

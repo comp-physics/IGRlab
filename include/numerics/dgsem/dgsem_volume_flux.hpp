@@ -8,6 +8,9 @@
 
 #include "mfem.hpp"
 
+#include <algorithm>
+#include <cmath>
+
 namespace mfem
 {
 namespace dgsem
@@ -43,6 +46,47 @@ inline void SymmetricAverageContravariantFlux(const DenseMatrix& flux,
   {
     out(eq) = 0.5 * (flux(eq, col_i) + flux(eq, col_j));
   }
+}
+
+/**
+ * @brief Euler directional LF speed for flux projected along a contravariant vector.
+ *
+ * Uses lambda = |u dot a| + c |a| where `a` is the contravariant direction
+ * vector associated with the reference-space derivative direction.
+ */
+inline double EulerDirectionalLaxFriedrichsScale(const Vector& state,
+                                                 const Vector& contravariant_dir,
+                                                 int dim,
+                                                 double gamma,
+                                                 double sigma = 0.0)
+{
+  MFEM_VERIFY(state.Size() == dim + 2,
+              "EulerDirectionalLaxFriedrichsScale expects Euler conservative state.");
+  MFEM_VERIFY(contravariant_dir.Size() == dim,
+              "EulerDirectionalLaxFriedrichsScale direction size mismatch.");
+
+  constexpr double kFloor = 1.0e-14;
+  const double rho = std::max(state(0), kFloor);
+  const double rhoE = state(1 + dim);
+
+  double mom2 = 0.0;
+  double u_dot_a = 0.0;
+  double a2 = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    const double m = state(1 + d);
+    const double u = m / rho;
+    mom2 += m * m;
+    u_dot_a += u * contravariant_dir(d);
+    a2 += contravariant_dir(d) * contravariant_dir(d);
+  }
+
+  const double kinetic = 0.5 * mom2 / rho;
+  const double p = std::max((gamma - 1.0) * (rhoE - kinetic) + sigma, kFloor);
+  const double c = std::sqrt(std::max(gamma * p / rho, kFloor));
+  const double a_norm = std::sqrt(std::max(a2, 0.0));
+  const double speed = std::abs(u_dot_a) + c * a_norm;
+  return std::isfinite(speed) ? speed : 0.0;
 }
 
 } // namespace dgsem

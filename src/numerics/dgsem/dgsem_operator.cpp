@@ -380,6 +380,14 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
   const FluxWithIGR* flux_igr = dynamic_cast<const FluxWithIGR*>(&fluxFunction);
   const bool use_entropy_flux =
       (op_.GetDGSEMVolumeFlux() != DGSEMVolumeFlux::Central);
+  const DGSEMVolumeDissipation vol_diss_mode =
+      op_.GetDGSEMVolumeDissipation();
+  const bool use_volume_dissipation =
+      (vol_diss_mode != DGSEMVolumeDissipation::None);
+  const dgsem::EntropyJacobianMode entropy_jacobian_mode =
+      op_.GetDGSEMEntropyJacobianAnalytic()
+          ? dgsem::EntropyJacobianMode::Analytic
+          : dgsem::EntropyJacobianMode::FiniteDifference;
   dgsem::EntropyFluxType entropy_type = dgsem::EntropyFluxType::Ranocha;
   if (op_.GetDGSEMVolumeFlux() == DGSEMVolumeFlux::Chandrashekar)
   {
@@ -430,7 +438,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
     flux.SetSize(op_.num_equations, op_.dim * dof);
     phys_flux.SetSize(op_.num_equations, op_.dim);
     adj.SetSize(op_.dim);
-    if (use_entropy_flux)
+    if (use_entropy_flux || use_volume_dissipation)
     {
       adj_storage.assign(dof * op_.dim * op_.dim, 0.0);
       if (flux_igr)
@@ -455,7 +463,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
       const DenseMatrix& J = Tr->Jacobian();
       mfem::CalcAdjugate(J, adj);
 
-      if (use_entropy_flux)
+      if (use_entropy_flux || use_volume_dissipation)
       {
         if (flux_igr)
         {
@@ -489,8 +497,10 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
     volume = 0.0;
 
     Vector flux_ij(op_.num_equations);
+    Vector diss_ij(op_.num_equations);
     Vector state_i(op_.num_equations);
     Vector state_j(op_.num_equations);
+    Vector contravariant_dir(op_.dim);
     Vector flux_dir(op_.num_equations);
     const double vol_sign = -1.0; // match DGSEM split-form sign convention
     auto adj_at = [&](int node, int d, int k) -> double
@@ -523,6 +533,78 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
         }
       }
     };
+    auto eval_volume_dissipation = [&](int local_i,
+                                       int local_j,
+                                       int dir,
+                                       Vector& out)
+    {
+      out = 0.0;
+      if (!use_volume_dissipation) { return; }
+
+      Xmat.GetRow(local_i, state_i);
+      Xmat.GetRow(local_j, state_j);
+      const double sigma_i =
+          (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_i] : 0.0;
+      const double sigma_j =
+          (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_j] : 0.0;
+
+      for (int k = 0; k < op_.dim; ++k)
+      {
+        contravariant_dir(k) = 0.5 * (adj_at(local_i, dir, k) +
+                                      adj_at(local_j, dir, k));
+      }
+      const double lf_i = dgsem::EulerDirectionalLaxFriedrichsScale(
+          state_i, contravariant_dir, op_.dim, gamma, sigma_i);
+      const double lf_j = dgsem::EulerDirectionalLaxFriedrichsScale(
+          state_j, contravariant_dir, op_.dim, gamma, sigma_j);
+      const double scale = std::max(lf_i, lf_j);
+
+      if (vol_diss_mode == DGSEMVolumeDissipation::LLF)
+      {
+        for (int eq = 0; eq < op_.num_equations; ++eq)
+        {
+          out(eq) = -0.5 * scale * (state_j(eq) - state_i(eq));
+        }
+        return;
+      }
+
+      MFEM_ASSERT(vol_diss_mode == DGSEMVolumeDissipation::EntropyVarsLF, "");
+      const bool valid_i =
+          dgsem::EulerStateIsValid(state_i, op_.dim, gamma, sigma_i);
+      const bool valid_j =
+          dgsem::EulerStateIsValid(state_j, op_.dim, gamma, sigma_j);
+      if (valid_i && valid_j)
+      {
+        dgsem::EntropyVariableLFDissipation(
+            state_i, state_j, gamma, scale, out, sigma_i, sigma_j,
+            entropy_jacobian_mode);
+      }
+      else
+      {
+        // Conservative fallback when entropy variables are undefined.
+        for (int eq = 0; eq < op_.num_equations; ++eq)
+        {
+          out(eq) = -0.5 * scale * (state_j(eq) - state_i(eq));
+        }
+      }
+    };
+    auto eval_pair_flux = [&](int local_i,
+                              int local_j,
+                              int dir,
+                              Vector& out)
+    {
+      if (use_entropy_flux)
+      {
+        eval_ec_contravariant(local_i, local_j, dir, out);
+      }
+      else
+      {
+        mfem::dgsem::SymmetricAverageContravariantFlux(
+            flux, local_i, local_j, dir, op_.dim, out);
+      }
+      eval_volume_dissipation(local_i, local_j, dir, diss_ij);
+      if (use_volume_dissipation) { out += diss_ij; }
+    };
 
     if (op_.dim == 1)
     {
@@ -532,15 +614,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
         for (int ii = i + 1; ii < n1d; ++ii)
         {
           const int local_ii = lex_to_local[ii];
-          if (use_entropy_flux)
-          {
-            eval_ec_contravariant(local_i, local_ii, /*dir=*/0, flux_ij);
-          }
-          else
-          {
-            mfem::dgsem::SymmetricAverageContravariantFlux(
-                flux, local_i, local_ii, /*dir=*/0, op_.dim, flux_ij);
-          }
+          eval_pair_flux(local_i, local_ii, /*dir=*/0, flux_ij);
           for (int eq = 0; eq < op_.num_equations; ++eq)
           {
             volume(local_i, eq) += vol_sign * dsplit(i, ii) * flux_ij(eq);
@@ -559,15 +633,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
           for (int ii = i + 1; ii < n1d; ++ii)
           {
             const int local_ii = lex_to_local[ii + n1d * j];
-            if (use_entropy_flux)
-            {
-              eval_ec_contravariant(local_i, local_ii, /*dir=*/0, flux_ij);
-            }
-            else
-            {
-              mfem::dgsem::SymmetricAverageContravariantFlux(
-                  flux, local_i, local_ii, /*dir=*/0, op_.dim, flux_ij);
-            }
+            eval_pair_flux(local_i, local_ii, /*dir=*/0, flux_ij);
             for (int eq = 0; eq < op_.num_equations; ++eq)
             {
               volume(local_i, eq) += vol_sign * dsplit(i, ii) * flux_ij(eq);
@@ -584,15 +650,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
           for (int jj = j + 1; jj < n1d; ++jj)
           {
             const int local_jj = lex_to_local[i + n1d * jj];
-            if (use_entropy_flux)
-            {
-              eval_ec_contravariant(local_j, local_jj, /*dir=*/1, flux_ij);
-            }
-            else
-            {
-              mfem::dgsem::SymmetricAverageContravariantFlux(
-                  flux, local_j, local_jj, /*dir=*/1, op_.dim, flux_ij);
-            }
+            eval_pair_flux(local_j, local_jj, /*dir=*/1, flux_ij);
             for (int eq = 0; eq < op_.num_equations; ++eq)
             {
               volume(local_j, eq) += vol_sign * dsplit(j, jj) * flux_ij(eq);

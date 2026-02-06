@@ -43,6 +43,9 @@ enum class DGSEMStabilization { None, SplitForm, Filter };
 /// DGSEM volume flux selection for entropy-conservative variants (Euler-only).
 enum class DGSEMVolumeFlux { Central, Chandrashekar, Ranocha };
 
+/// DGSEM volume dissipation selection (added to flux-differencing pair flux).
+enum class DGSEMVolumeDissipation { None, LLF, EntropyVarsLF };
+
 /// ---------------------------------------------------------------------------
 /// @brief Time-dependent DG operator for hyperbolic conservation laws.
 /// @ingroup numerics_dg
@@ -100,6 +103,22 @@ public:
 
    /// Get Euler gamma used by DGSEM entropy-conservative fluxes.
    double GetDGSEMGamma() const { return dgsem_gamma_; }
+
+   /// Select DGSEM volume dissipation mode.
+   void SetDGSEMVolumeDissipation(DGSEMVolumeDissipation d)
+   { dgsem_vol_diss_ = d; }
+
+   /// Get DGSEM volume dissipation mode.
+   DGSEMVolumeDissipation GetDGSEMVolumeDissipation() const
+   { return dgsem_vol_diss_; }
+
+   /// Select entropy Jacobian mode for entropy-variable LF volume dissipation.
+   void SetDGSEMEntropyJacobianAnalytic(bool analytic)
+   { dgsem_entropy_jacobian_analytic_ = analytic; }
+
+   /// Query entropy Jacobian mode for entropy-variable LF volume dissipation.
+   bool GetDGSEMEntropyJacobianAnalytic() const
+   { return dgsem_entropy_jacobian_analytic_; }
 
    /**
     * @brief Set a custom face integration rule for surface flux evaluation.
@@ -169,7 +188,9 @@ private:
    const NumericalFlux *num_flux_ = nullptr;
    DGSEMStabilization dgsem_stab_ = DGSEMStabilization::None;
    DGSEMVolumeFlux dgsem_vol_flux_ = DGSEMVolumeFlux::Central;
+   DGSEMVolumeDissipation dgsem_vol_diss_ = DGSEMVolumeDissipation::None;
    double dgsem_gamma_ = 1.4;
+   bool dgsem_entropy_jacobian_analytic_ = false;
 
    // --- Helpers ---
    /// Compute per-element inverse mass matrices (block-diagonal DG mass).
