@@ -57,6 +57,9 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace &vfes,
   for (int i = 0; i < NE; i++)
   {
     const FiniteElement *fe = vfes.GetFE(i);
+    const auto *fec_l2 = dynamic_cast<const L2_FECollection*>(vfes.FEColl());
+    const bool enforce_nodes =
+        (fec_l2 != nullptr && fec_l2->GetBasisType() == BasisType::GaussLobatto);
     ElementTransformation *Tr = vfes.GetElementTransformation(i);
     const int dof = fe->GetDof();
     vfes.GetElementVDofs(i, vdofs);
@@ -94,19 +97,32 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace &vfes,
 
     // Step 1: density limiting
     double theta_rho = 1.0;
-    for (int q = 0; q < ir.GetNPoints(); ++q)
+    auto rho_update = [&](const mfem::Vector &state)
     {
-      const IntegrationPoint &ip = ir.IntPoint(q);
-      Tr->SetIntPoint(&ip);
-      fe->CalcShape(ip, shape);
-      elmat.MultTranspose(shape, Up);
-      const double rho = Up(0);
+      const double rho = state(0);
       if (rho < rho_min)
       {
         const double num = Ubar(0) - rho_min;
         const double den = Ubar(0) - rho;
         if (den > 0.0) { theta_rho = std::min(theta_rho, num / den); }
         else           { theta_rho = 0.0; }
+      }
+    };
+
+    for (int q = 0; q < ir.GetNPoints(); ++q)
+    {
+      const IntegrationPoint &ip = ir.IntPoint(q);
+      Tr->SetIntPoint(&ip);
+      fe->CalcShape(ip, shape);
+      elmat.MultTranspose(shape, Up);
+      rho_update(Up);
+    }
+    if (enforce_nodes)
+    {
+      for (int j = 0; j < dof; ++j)
+      {
+        elmat.GetRow(j, Up);
+        rho_update(Up);
       }
     }
     if (theta_rho < 1.0)
@@ -121,19 +137,33 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace &vfes,
 
     // Step 2: pressure limiting
     double theta_p = 1.0;
+    auto p_update = [&](const mfem::Vector &state)
+    {
+      const double p = EulerPressureFromConservative(state, dim, gamma,
+                                                     /*rho_floor=*/1e-16);
+      if (p < p_min)
+      {
+        theta_p = std::min(theta_p,
+                           ThetaForPressure(Ubar, state, dim, gamma, p_min,
+                                            /*theta_max=*/theta_rho,
+                                            p_bisect_iters));
+      }
+    };
+
     for (int q = 0; q < ir.GetNPoints(); ++q)
     {
       const IntegrationPoint &ip = ir.IntPoint(q);
       Tr->SetIntPoint(&ip);
       fe->CalcShape(ip, shape);
       elmat.MultTranspose(shape, Up); // current point state (after rho limit)
-      const double p = EulerPressureFromConservative(Up, dim, gamma, /*rho_floor=*/1e-16);
-      if (p < p_min)
+      p_update(Up);
+    }
+    if (enforce_nodes)
+    {
+      for (int j = 0; j < dof; ++j)
       {
-        theta_p = std::min(theta_p,
-                           ThetaForPressure(Ubar, Up, dim, gamma, p_min,
-                                            /*theta_max=*/theta_rho,
-                                            p_bisect_iters));
+        elmat.GetRow(j, Up);
+        p_update(Up);
       }
     }
     if (theta_p < 1.0)

@@ -34,6 +34,8 @@ inline void ConfigureDGSEMSurfaceFlux<mfem::DGSEMSurfaceFlux>(
     {
       case DGSEMSurfaceFlux::Rusanov:
         return mfem::DGSEMSurfaceFluxType::Rusanov;
+      case DGSEMSurfaceFlux::DiffusiveRusanov:
+        return mfem::DGSEMSurfaceFluxType::DiffusiveRusanov;
       case DGSEMSurfaceFlux::EntropyStableWinters:
         return mfem::DGSEMSurfaceFluxType::EntropyStableWinters;
       case DGSEMSurfaceFlux::EntropyStableLFEntropyVars:

@@ -9,6 +9,7 @@
 #include "mfem.hpp"
 
 #include "numerics/dgsem/dgsem_entropy_flux.hpp"
+#include "numerics/riemann/diffusive_rusanov.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "physics/igr/igr_flux.hpp"
 
@@ -19,6 +20,7 @@ namespace mfem
 enum class DGSEMSurfaceFluxType
 {
   Rusanov,
+  DiffusiveRusanov,
   EntropyStableWinters,
   EntropyStableLFEntropyVars
 };
@@ -64,6 +66,7 @@ private:
       dgsem::EntropyJacobianMode::FiniteDifference;
   double gamma_ = 1.4;
   mutable RusanovFluxWithSides rusanov_;
+  mutable DiffusiveRusanovFlux diffusive_rusanov_;
 };
 
 } // namespace mfem

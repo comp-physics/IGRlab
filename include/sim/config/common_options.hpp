@@ -64,7 +64,7 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.dgsem_volume_flux, "-dvf", "--dgsem-volume-flux",
                  "DGSEM volume flux: central | chandrashekar | ranocha.");
   args.AddOption(&opts.dgsem_surface_flux, "-dsf", "--dgsem-surface-flux",
-                 "DGSEM surface flux: rusanov | es-winters | es-lf-entropy.");
+                 "DGSEM surface flux: rusanov | diffusive-rusanov | es-winters | es-lf-entropy.");
   args.AddOption(&opts.dgsem_entropy_jacobian, "-dej", "--dgsem-entropy-jacobian",
                  "DGSEM entropy Jacobian: fd | analytic (ES LF entropy variables).");
   args.AddOption(&opts.t_final, "-tf", "--t-final",

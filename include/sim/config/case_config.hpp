@@ -58,6 +58,7 @@ enum class DGSEMVolumeFlux
 enum class DGSEMSurfaceFlux
 {
   Rusanov,
+  DiffusiveRusanov,
   EntropyStableWinters,
   EntropyStableLFEntropyVars
 };
@@ -201,6 +202,11 @@ inline DGSEMSurfaceFlux ParseDGSEMSurfaceFlux(const std::string& value)
   {
     return DGSEMSurfaceFlux::Rusanov;
   }
+  if (lower == "diffusive-rusanov" || lower == "rusanov-diffusive" ||
+      lower == "llf-diffusive" || lower == "diffusive-llf")
+  {
+    return DGSEMSurfaceFlux::DiffusiveRusanov;
+  }
   if (lower == "es-winters" || lower == "entropy-winters" || lower == "winters")
   {
     return DGSEMSurfaceFlux::EntropyStableWinters;
@@ -210,7 +216,7 @@ inline DGSEMSurfaceFlux ParseDGSEMSurfaceFlux(const std::string& value)
     return DGSEMSurfaceFlux::EntropyStableLFEntropyVars;
   }
   MFEM_VERIFY(false, "Invalid DGSEM surface flux '" << value
-              << "'. Use 'rusanov', 'es-winters', or 'es-lf-entropy'.");
+              << "'. Use 'rusanov', 'diffusive-rusanov', 'es-winters', or 'es-lf-entropy'.");
   return DGSEMSurfaceFlux::Rusanov;
 }
 

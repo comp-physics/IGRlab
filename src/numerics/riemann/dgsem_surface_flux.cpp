@@ -6,7 +6,8 @@ namespace mfem
 DGSEMSurfaceFlux::DGSEMSurfaceFlux(const FluxFunction &fluxFunction)
   : NumericalFlux(fluxFunction),
     flux_fn_(fluxFunction),
-    rusanov_(fluxFunction)
+    rusanov_(fluxFunction),
+    diffusive_rusanov_(fluxFunction, /*beta=*/2.0)
 {
 }
 
@@ -17,6 +18,10 @@ real_t DGSEMSurfaceFlux::Eval(const Vector &state1, const Vector &state2,
   if (type_ == DGSEMSurfaceFluxType::Rusanov)
   {
     return rusanov_.Eval(state1, state2, nor, Tr, flux);
+  }
+  if (type_ == DGSEMSurfaceFluxType::DiffusiveRusanov)
+  {
+    return diffusive_rusanov_.Eval(state1, state2, nor, Tr, flux);
   }
 
   const FluxWithIGR* flux_igr = dynamic_cast<const FluxWithIGR*>(&flux_fn_);
@@ -82,6 +87,11 @@ void DGSEMSurfaceFlux::Grad(int side, const Vector &state1, const Vector &state2
     rusanov_.Grad(side, state1, state2, nor, Tr, grad);
     return;
   }
+  if (type_ == DGSEMSurfaceFluxType::DiffusiveRusanov)
+  {
+    diffusive_rusanov_.Grad(side, state1, state2, nor, Tr, grad);
+    return;
+  }
   MFEM_ABORT("DGSEMSurfaceFlux::Grad not implemented for entropy-stable flux.");
 }
 
@@ -92,6 +102,10 @@ real_t DGSEMSurfaceFlux::Average(const Vector &state1, const Vector &state2,
   if (type_ == DGSEMSurfaceFluxType::Rusanov)
   {
     return rusanov_.Average(state1, state2, nor, Tr, flux);
+  }
+  if (type_ == DGSEMSurfaceFluxType::DiffusiveRusanov)
+  {
+    return diffusive_rusanov_.Average(state1, state2, nor, Tr, flux);
   }
   return Eval(state1, state2, nor, Tr, flux);
 }
@@ -104,6 +118,11 @@ void DGSEMSurfaceFlux::AverageGrad(int side, const Vector &state1,
   if (type_ == DGSEMSurfaceFluxType::Rusanov)
   {
     rusanov_.AverageGrad(side, state1, state2, nor, Tr, grad);
+    return;
+  }
+  if (type_ == DGSEMSurfaceFluxType::DiffusiveRusanov)
+  {
+    diffusive_rusanov_.AverageGrad(side, state1, state2, nor, Tr, grad);
     return;
   }
   MFEM_ABORT("DGSEMSurfaceFlux::AverageGrad not implemented for entropy-stable flux.");
