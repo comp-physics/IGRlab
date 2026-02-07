@@ -15,13 +15,25 @@ namespace mfem
 /// @ingroup numerics_riemann
 enum class FaceSide { Left, Right };
 
-/// @brief Interface for fluxes that need face-side context.
+/// @brief Optional side-explicit flux interface that avoids mutable side state.
 /// @ingroup numerics_riemann
-class FaceSideAwareFlux
+class FaceSideExplicitFlux
 {
 public:
-  virtual ~FaceSideAwareFlux() = default;
-  virtual void SetFaceSide(FaceSide side) = 0;
+  virtual ~FaceSideExplicitFlux() = default;
+
+  virtual real_t ComputeFluxDotNAtSide(const Vector &state,
+                                       const Vector &normal,
+                                       FaceElementTransformations &Tr,
+                                       FaceSide side,
+                                       Vector &fluxDotN) const = 0;
+
+  virtual real_t ComputeAvgFluxDotNAtSide(const Vector &state1,
+                                          const Vector &state2,
+                                          const Vector &normal,
+                                          FaceElementTransformations &Tr,
+                                          FaceSide side,
+                                          Vector &fluxDotN) const = 0;
 };
 
 } // namespace mfem

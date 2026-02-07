@@ -1,5 +1,6 @@
 #include "physics/igr/igr_flux.hpp"
 #include "numerics/riemann/rusanov.hpp"
+#include "numerics/riemann/side_scope_utils.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -238,6 +239,96 @@ int RunIGRTests(TestContext& ctx)
       ctx.AddParity(global_max_err + sigma_left + sigma_right);
       ctx.Check(global_max_err < 5.0e-11,
                 "FluxWithIGR side selection matches expected sigma per side");
+    }
+  }
+
+  // --- Deterministic side-selection stress: explicit-side path remains stable ---
+  {
+    mfem::Mesh mesh_side = mfem::Mesh::MakeCartesian2D(
+        /*nx=*/2, /*ny=*/1, mfem::Element::QUADRILATERAL,
+        /*generate_edges=*/true, /*sx=*/1.0, /*sy=*/1.0);
+    mfem::ParMesh pmesh_side(MPI_COMM_SELF, mesh_side);
+
+    mfem::DG_FECollection fec_side(/*order=*/0, dim);
+    mfem::ParFiniteElementSpace sigma_fes_side(&pmesh_side, &fec_side, /*vdim=*/1);
+    mfem::ParGridFunction sigma_side(&sigma_fes_side);
+    for (int e = 0; e < sigma_fes_side.GetNE(); ++e)
+    {
+      mfem::Array<int> vdofs;
+      sigma_fes_side.GetElementVDofs(e, vdofs);
+      mfem::Vector val(vdofs.Size());
+      val = (e == 0) ? 0.15 : 0.45;
+      sigma_side.SetSubVector(vdofs, val);
+    }
+    sigma_side.ExchangeFaceNbrData();
+
+    mfem::FluxWithIGR igr_flux_side(base_flux);
+    igr_flux_side.SetSigmaField(&sigma_side);
+
+    int interior_face = -1;
+    for (int f = 0; f < pmesh_side.GetNFaces(); ++f)
+    {
+      mfem::FaceElementTransformations* Tr = pmesh_side.GetFaceElementTransformations(f);
+      if (Tr && Tr->Elem1 && Tr->Elem2)
+      {
+        interior_face = f;
+        break;
+      }
+    }
+    MFEM_VERIFY(interior_face >= 0,
+                "Deterministic side-selection stress test requires an interior face.");
+
+    mfem::FaceElementTransformations* Tr = pmesh_side.GetFaceElementTransformations(interior_face);
+    MFEM_VERIFY(Tr != nullptr, "Failed to obtain interior face transformations.");
+    const mfem::IntegrationRule& ir_face =
+        mfem::IntRules.Get(Tr->GetGeometryType(), /*order=*/1);
+    const mfem::IntegrationPoint& ip_face = ir_face.IntPoint(0);
+    Tr->SetAllIntPoints(&ip_face);
+
+    mfem::Vector state = EulerConsFromPrim2D(
+        /*rho=*/1.1, /*u=*/0.9, /*v=*/-0.3, /*p=*/1.0, gamma);
+    mfem::Vector normal(dim);
+    mfem::CalcOrtho(Tr->Jacobian(), normal);
+
+    mfem::Vector left_ref(state.Size());
+    mfem::Vector right_ref(state.Size());
+    const mfem::real_t left_speed_ref = mfem::riemann_detail::ComputeFluxDotNForSide(
+        igr_flux_side, mfem::FaceSide::Left, state, normal, *Tr, left_ref);
+    const mfem::real_t right_speed_ref = mfem::riemann_detail::ComputeFluxDotNForSide(
+        igr_flux_side, mfem::FaceSide::Right, state, normal, *Tr, right_ref);
+
+    // Side regression snapshot: left/right must differ when sigma differs per element.
+    const double ref_diff =
+        std::abs(left_ref(1) - right_ref(1)) +
+        std::abs(left_ref(2) - right_ref(2)) +
+        std::abs(left_ref(3) - right_ref(3));
+    ctx.AddParity(ref_diff + left_speed_ref + right_speed_ref);
+    ctx.Check(ref_diff > 1.0e-12,
+              "IGR side snapshots differ for left/right sigma values");
+
+    for (int iter = 0; iter < 200; ++iter)
+    {
+      const mfem::FaceSide side =
+          ((iter % 2) == 0) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
+
+      mfem::Vector flux_explicit(state.Size());
+      const mfem::real_t speed_explicit = mfem::riemann_detail::ComputeFluxDotNForSide(
+          igr_flux_side, side, state, normal, *Tr, flux_explicit);
+
+      const mfem::Vector& flux_ref =
+          (side == mfem::FaceSide::Left) ? left_ref : right_ref;
+      const mfem::real_t speed_ref =
+          (side == mfem::FaceSide::Left) ? left_speed_ref : right_speed_ref;
+
+      for (int i = 0; i < flux_ref.Size(); ++i)
+      {
+        ctx.CheckNear(flux_explicit(i), flux_ref(i), tol,
+                      "Explicit-side flux remains deterministic, iter=" +
+                          std::to_string(iter) + ", component=" + std::to_string(i));
+      }
+      ctx.CheckNear(speed_explicit, speed_ref, tol,
+                    "Explicit-side speed remains deterministic, iter=" +
+                        std::to_string(iter));
     }
   }
 

@@ -568,7 +568,8 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
         return;
       }
 
-      MFEM_ASSERT(vol_diss_mode == DGSEMVolumeDissipation::EntropyVarsLF, "");
+      MFEM_ASSERT(vol_diss_mode == DGSEMVolumeDissipation::EntropyVarsLF,
+                  "Unexpected DGSEM volume dissipation mode in entropy-variable LF branch.");
       const bool valid_i =
           dgsem::EulerStateIsValid(state_i, op_.dim, gamma, sigma_i);
       const bool valid_j =

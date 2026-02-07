@@ -1,4 +1,5 @@
 #include "numerics/riemann/hllc.hpp"
+#include "numerics/riemann/side_scope_utils.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -107,9 +108,12 @@ real_t HLLCFlux::Eval(const Vector &state1, const Vector &state2,
   real_t SL = 0.0, Sstar = 0.0, SR = 0.0;
   HLLC_WaveSpeeds(WL, WR, SL, Sstar, SR);
 
-  // Fluxes on left and right
-  FluxDotNhat(state1, WL, nhat, fluxN1);
-  FluxDotNhat(state2, WR, nhat, fluxN2);
+  // Fluxes on left and right. Side-aware scope keeps IGR sigma-side selection
+  // consistent with other numerical flux implementations.
+  riemann_detail::ComputeFluxDotNForSide(
+      fluxFunction, FaceSide::Left, state1, nhat, Tr, fluxN1);
+  riemann_detail::ComputeFluxDotNForSide(
+      fluxFunction, FaceSide::Right, state2, nhat, Tr, fluxN2);
 
   Vector flux_hat(neq);
 

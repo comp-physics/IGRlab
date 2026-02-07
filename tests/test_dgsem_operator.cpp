@@ -590,7 +590,35 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     auto* bdr = new mfem::BdrHyperbolicFluxIntegrator(num_flux2, std::move(inlet2),
                                                       int_order_offset2);
     oper2.AddBdrFaceIntegrator(bdr, bdr_marker2);
-    ctx.Check(bdr->GetIntegrationRule() == &lgl_rule,
+    const mfem::IntegrationRule* bdr_rule = bdr->GetIntegrationRule();
+    bool same_rule = (bdr_rule != nullptr) &&
+                     (bdr_rule->GetNPoints() == lgl_rule.GetNPoints());
+    double rule_err_max = 0.0;
+    if (same_rule)
+    {
+      for (int q = 0; q < lgl_rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& a = bdr_rule->IntPoint(q);
+        const mfem::IntegrationPoint& b = lgl_rule.IntPoint(q);
+        const double err = std::max(std::abs(a.x - b.x),
+                                    std::abs(a.weight - b.weight));
+        rule_err_max = std::max(rule_err_max, err);
+        if (err > 1.0e-14)
+        {
+          same_rule = false;
+          break;
+        }
+      }
+    }
+    if (ctx.verbose_metrics)
+    {
+      const int bdr_npts = bdr_rule ? bdr_rule->GetNPoints() : -1;
+      const int bdr_order = bdr_rule ? bdr_rule->GetOrder() : -1;
+      ctx.LogMetric("Boundary rule audit: npts=" + std::to_string(bdr_npts) +
+                    ", order=" + std::to_string(bdr_order) +
+                    ", err_max=" + FormatSci(rule_err_max));
+    }
+    ctx.Check(same_rule,
               "Boundary integrator uses DGSEM LGL face rule");
   }
 

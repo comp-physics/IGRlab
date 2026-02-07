@@ -15,8 +15,8 @@ namespace mfem
 /**
  * @brief Rusanov flux (local Lax-Friedrichs) that mirrors MFEM's reference
  * implementation, with one addition: if the wrapped FluxFunction implements
- * FaceSideAwareFlux, we set the face side (Left/Right) around each call so that
- * side-dependent fields (e.g., Sigma for IGR) can be selected consistently.
+ * FaceSideExplicitFlux, left/right side evaluation is passed explicitly for each
+ * call so side-dependent fields (e.g., Sigma for IGR) are selected consistently.
  *
  * Math, scaling, and Jacobians are otherwise identical to MFEM's RusanovFlux.
  */

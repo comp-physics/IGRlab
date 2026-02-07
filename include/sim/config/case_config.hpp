@@ -282,9 +282,11 @@ inline const char* DGSEMSurfaceFluxToString(DGSEMSurfaceFlux flux)
   switch (flux)
   {
     case DGSEMSurfaceFlux::Rusanov: return "rusanov";
+    case DGSEMSurfaceFlux::DiffusiveRusanov: return "diffusive-rusanov";
     case DGSEMSurfaceFlux::EntropyStableWinters: return "es-winters";
     case DGSEMSurfaceFlux::EntropyStableLFEntropyVars: return "es-lf-entropy";
   }
+  MFEM_ABORT("Unhandled DGSEMSurfaceFlux enum value in DGSEMSurfaceFluxToString.");
   return "rusanov";
 }
 

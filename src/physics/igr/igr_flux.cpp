@@ -23,39 +23,38 @@ real_t FluxWithIGR::ComputeFluxDotN(const Vector &U, const Vector &n,
                                     FaceElementTransformations &Tr,
                                     Vector &Fn) const
 {
-  // Base normal flux + base (normal) max characteristic speed
+  return ComputeFluxDotNAtSide(U, n, Tr, FaceSide::Left, Fn);
+}
+
+real_t FluxWithIGR::ComputeFluxDotNAtSide(const Vector &U,
+                                          const Vector &n,
+                                          FaceElementTransformations &Tr,
+                                          FaceSide side,
+                                          Vector &Fn) const
+{
   const real_t mcs = base_.ComputeFluxDotN(U, n, Tr, Fn);
-  if (!sigma_) return mcs;
+  if (!sigma_) { return mcs; }
 
-  // Select Sigma from the SAME side as the state U we were given.
-  double sigma_face = 0.0;
-
-  if (Tr.Elem2) // interior face
-  {
-    if (curr_side_ == FaceSide::Left)
-    {
-      ElementTransformation &T1 = *Tr.Elem1;
-      const IntegrationPoint &ip1 = Tr.GetElement1IntPoint();
-      T1.SetIntPoint(&ip1);
-      sigma_face = sigma_->GetValue(T1, ip1);
-    }
-    else // Right
-    {
-      ElementTransformation &T2 = *Tr.Elem2;
-      const IntegrationPoint &ip2 = Tr.GetElement2IntPoint();
-      T2.SetIntPoint(&ip2);
-      sigma_face = sigma_->GetValue(T2, ip2);
-    }
-  }
-  else // boundary face -> only interior exists; use that Sigma
-  {
-    ElementTransformation &T1 = *Tr.Elem1;
-    const IntegrationPoint &ip1 = Tr.GetElement1IntPoint();
-    T1.SetIntPoint(&ip1);
-    sigma_face = sigma_->GetValue(T1, ip1);
-  }
-
+  const double sigma_face = GetSigmaAtSide(Tr, side);
   AddDotNSigmaTerms(U, n, sigma_face, Fn);
+  return mcs;
+}
+
+real_t FluxWithIGR::ComputeAvgFluxDotNAtSide(const Vector &U1,
+                                             const Vector &U2,
+                                             const Vector &n,
+                                             FaceElementTransformations &Tr,
+                                             FaceSide side,
+                                             Vector &Fn) const
+{
+  const real_t mcs = base_.ComputeAvgFluxDotN(U1, U2, n, Tr, Fn);
+  if (!sigma_) { return mcs; }
+
+  const double sigma_face = GetSigmaAtSide(Tr, side);
+  Vector Uavg(U1);
+  Uavg += U2;
+  Uavg *= 0.5;
+  AddDotNSigmaTerms(Uavg, n, sigma_face, Fn);
   return mcs;
 }
 

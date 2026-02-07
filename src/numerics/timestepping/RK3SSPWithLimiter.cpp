@@ -182,10 +182,12 @@ void RK3SSPWithLimiter::MaybeScanStage(Vector &v, double t, const char* label)
     stage_nan_detected_ = true;
     if (mfem::Mpi::Root())
     {
-      std::cout << "[nan-scan] Detected " << summary.global_non_finite
-                << " non-finite entries at " << label << " t=" << t
-                << " (finite min=" << summary.global_min
-                << ", finite max=" << summary.global_max << ")\n";
+      std::cout << "[nan-scan] event=stage-scan"
+                << " label=" << label
+                << " t=" << t
+                << " non_finite=" << summary.global_non_finite
+                << " finite_min=" << summary.global_min
+                << " finite_max=" << summary.global_max << "\n";
     }
   }
 }
