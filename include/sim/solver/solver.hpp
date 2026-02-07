@@ -74,7 +74,7 @@ bool WithEulerOperator(ExampleContext& ctx,
   mfem::DGHyperbolicConservationLaws op =
       MakeDGOperator(ctx, numerical_flux);
   EulerBoundaryWiring<NumericalFlux> bc(
-      op, numerical_flux, ctx.run_cfg.int_order_offset, ctx.dim);
+      op, numerical_flux, ctx.run_cfg.case_config.int_order_offset, ctx.dim);
   bc_setup(bc, markers);
   return func(op);
 }
@@ -136,7 +136,7 @@ inline bool RunEulerCase(ExampleContext& ctx,
   {
     RegisterEulerVTKFields(*paraview_dc, bundle.field_list);
     const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
-    ApplyCaseVTKConfig(*paraview_dc, vtk_cfg, run_cfg.order);
+    ApplyCaseVTKConfig(*paraview_dc, vtk_cfg, run_cfg.opts.order);
     paraview_dc->SetCycle(0);
     paraview_dc->SetTime(0.0);
     paraview_dc->Save();
@@ -229,14 +229,15 @@ struct Solver
     CaseConfig case_cfg = MakeCaseConfig(
         spec.case_name, spec.default_mesh_path,
         spec.case_file ? spec.case_file : "", spec.gamma);
+    // Apply CaseSpec defaults first; configure_case can then override them.
+    case_cfg.defaults.visualization = spec.vis.enabled;
+    case_cfg.defaults.vtk_save = spec.vtk.enabled;
+    case_cfg.defaults.dg_backend = DGBackendToString(spec.dg_backend_default);
     if (spec.configure_case)
     {
       spec.configure_case(case_cfg);
     }
     case_cfg.rk3_config.gamma = case_cfg.gamma;
-    case_cfg.defaults.visualization = spec.vis.enabled;
-    case_cfg.defaults.vtk_save = spec.vtk.enabled;
-    case_cfg.defaults.dg_backend = DGBackendToString(spec.dg_backend_default);
 
     CaseOptions case_opts = spec.options;
     CommonOptions cli_opts = case_cfg.defaults;

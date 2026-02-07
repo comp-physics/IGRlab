@@ -92,7 +92,7 @@ struct ExampleContext
       pmesh(std::move(pmesh_in)),
       dim(pmesh->Dimension()),
       num_equations(dim + 2),
-      spaces(*pmesh, cfg.order, dim, num_equations,
+      spaces(*pmesh, cfg.opts.order, dim, num_equations,
              BasisTypeForBackend(cfg.dg_backend),
              sigma_space, need_sigma, need_h1)
   {}

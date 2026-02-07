@@ -32,7 +32,7 @@ struct EulerIGRPhysics
   {
     ConfigureDGSEMSurfaceFlux(flux.numerical_flux, ctx.run_cfg, gamma);
     EulerBoundaryWiring<NumericalFlux> bc(
-        op, flux.numerical_flux, ctx.run_cfg.int_order_offset, ctx.dim);
+        op, flux.numerical_flux, ctx.run_cfg.case_config.int_order_offset, ctx.dim);
     bc_setup(bc, markers);
   }
 };

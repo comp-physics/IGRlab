@@ -60,7 +60,7 @@ inline mfem::DGHyperbolicConservationLaws MakeDGOperator(
       ctx.spaces.vfes,
       std::unique_ptr<mfem::HyperbolicFormIntegrator>(
           new mfem::HyperbolicFormIntegrator(numerical_flux,
-                                             ctx.run_cfg.int_order_offset)),
+                                             ctx.run_cfg.case_config.int_order_offset)),
       ctx.run_cfg.opts.preassemble_weak_div);
   op.SetNumericalFlux(&numerical_flux);
   if (ctx.run_cfg.dg_backend == DGBackend::DGSEM)
@@ -80,7 +80,7 @@ inline mfem::DGHyperbolicConservationLaws MakeDGOperator(
     if (ctx.dim == 2)
     {
       op.SetFaceIntegrationRule(
-          mfem::dgsem::GetLGLFaceRule(ctx.run_cfg.order));
+          mfem::dgsem::GetLGLFaceRule(ctx.run_cfg.opts.order));
     }
   }
   return op;
