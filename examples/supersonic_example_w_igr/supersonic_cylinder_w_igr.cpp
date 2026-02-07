@@ -84,7 +84,7 @@ struct SupersonicIGROptions
 
 int main(int argc, char *argv[])
 {
-  dg_igr_examples::CaseSpec<SupersonicIGROptions, mfem::RusanovFlux> spec;
+  dg_igr_examples::CaseSpec<SupersonicIGROptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "supersonic_cylinder_w_igr";
   spec.default_mesh_path = mfem::SupersonicCylinderIGRDefaultMeshPath();
   spec.case_file = __FILE__;

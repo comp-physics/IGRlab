@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include "mfem.hpp"
@@ -11,11 +14,50 @@
 namespace dg_igr_tests
 {
 
+inline bool EnvEnabled(const char* name)
+{
+  const char* env = std::getenv(name);
+  if (!env) { return false; }
+  const std::string value(env);
+  return value == "1" || value == "true" || value == "TRUE" || value == "on";
+}
+
+inline bool EnvEnabledDefault(const char* name, bool default_value)
+{
+  const char* env = std::getenv(name);
+  if (!env) { return default_value; }
+  const std::string value(env);
+  if (value == "0" || value == "false" || value == "FALSE" ||
+      value == "off" || value == "OFF")
+  {
+    return false;
+  }
+  if (value == "1" || value == "true" || value == "TRUE" ||
+      value == "on" || value == "ON")
+  {
+    return true;
+  }
+  return default_value;
+}
+
+inline std::string FormatSci(double value, int precision = 12)
+{
+  std::ostringstream os;
+  os.setf(std::ios::scientific);
+  os << std::setprecision(precision) << value;
+  return os.str();
+}
+
 struct TestContext
 {
   int failures = 0;
   bool parity_mode = false;
   double parity_metric = 0.0;
+  bool verbose_metrics = true;
+
+  TestContext()
+    : verbose_metrics(!EnvEnabled("DG_IGR_TEST_QUIET"))
+  {}
 
   void Check(bool cond, const std::string& msg)
   {
@@ -23,6 +65,10 @@ struct TestContext
     {
       ++failures;
       std::cerr << "[FAIL] " << msg << "\n";
+    }
+    else if (verbose_metrics)
+    {
+      std::cout << "[PASS] " << msg << "\n";
     }
   }
 
@@ -34,14 +80,30 @@ struct TestContext
     {
       ++failures;
       std::cerr << "[FAIL] " << msg
-                << " (a=" << a << ", b=" << b
-                << ", err=" << err << ", tol=" << tol << ")\n";
+                << " (a=" << FormatSci(a) << ", b=" << FormatSci(b)
+                << ", err=" << FormatSci(err) << ", tol=" << FormatSci(tol)
+                << ")\n";
+    }
+    else if (verbose_metrics)
+    {
+      std::cout << "[PASS] " << msg
+                << " (a=" << FormatSci(a) << ", b=" << FormatSci(b)
+                << ", err=" << FormatSci(err) << ", tol=" << FormatSci(tol)
+                << ")\n";
     }
   }
 
   void AddParity(double value)
   {
     parity_metric += value;
+  }
+
+  void LogMetric(const std::string& msg)
+  {
+    if (verbose_metrics)
+    {
+      std::cout << "[METRIC] " << msg << "\n";
+    }
   }
 };
 
@@ -87,6 +149,12 @@ inline void FillConstantState(const mfem::Vector& state, mfem::ParGridFunction& 
   gf.ProjectCoefficient(coeff);
 }
 
+inline void FillConstantState(const mfem::Vector& state, mfem::GridFunction& gf)
+{
+  mfem::VectorConstantCoefficient coeff(state);
+  gf.ProjectCoefficient(coeff);
+}
+
 inline double GlobalSum(double local)
 {
   double global = 0.0;
@@ -123,6 +191,37 @@ inline double GlobalAverage(double local)
   const double global_sum = GlobalSum(local);
   const int world_size = mfem::Mpi::WorldSize();
   return global_sum / static_cast<double>(world_size > 0 ? world_size : 1);
+}
+
+inline double IntegrateComponent(const mfem::GridFunction& U, int comp,
+                                 int order_offset = 2)
+{
+  const mfem::FiniteElementSpace* fes = U.FESpace();
+  MFEM_VERIFY(fes != nullptr, "IntegrateComponent requires a valid FE space.");
+  MFEM_VERIFY(comp >= 0 && comp < U.VectorDim(),
+              "IntegrateComponent component index out of range.");
+
+  double local = 0.0;
+  mfem::Vector value(U.VectorDim());
+  const int ne = fes->GetNE();
+  for (int e = 0; e < ne; ++e)
+  {
+    const mfem::FiniteElement* fe = fes->GetFE(e);
+    mfem::ElementTransformation* Tr = fes->GetElementTransformation(e);
+    const int qord = 2 * fe->GetOrder() + order_offset;
+    const mfem::IntegrationRule& ir =
+        mfem::IntRules.Get(fe->GetGeomType(), qord);
+
+    for (int q = 0; q < ir.GetNPoints(); ++q)
+    {
+      const mfem::IntegrationPoint& ip = ir.IntPoint(q);
+      Tr->SetIntPoint(&ip);
+      U.GetVectorValue(*Tr, ip, value);
+      local += value(comp) * ip.weight * Tr->Weight();
+    }
+  }
+
+  return GlobalSum(local);
 }
 
 } // namespace dg_igr_tests

@@ -31,6 +31,53 @@ struct IGROptions
   std::string grad = "H1";
 };
 
+/// @brief DG backend selection.
+enum class DGBackend
+{
+  DG,
+  DGSEM
+};
+
+/// @brief Optional DGSEM stabilization hook selection.
+enum class DGSEMStabilization
+{
+  None,
+  SplitForm,
+  Filter
+};
+
+/// @brief DGSEM volume flux selection for entropy-conservative options.
+enum class DGSEMVolumeFlux
+{
+  Central,
+  Chandrashekar,
+  Ranocha
+};
+
+/// @brief DGSEM volume dissipation selection.
+enum class DGSEMVolumeDissipation
+{
+  None,
+  LLF,
+  EntropyVarsLF
+};
+
+/// @brief DGSEM surface flux selection.
+enum class DGSEMSurfaceFlux
+{
+  Rusanov,
+  DiffusiveRusanov,
+  EntropyStableWinters,
+  EntropyStableLFEntropyVars
+};
+
+/// @brief Entropy Jacobian evaluation mode for ES LF surface flux.
+enum class DGSEMEntropyJacobian
+{
+  FiniteDifference,
+  Analytic
+};
+
 /// @brief Per-case configuration defaults plus case identity metadata.
 struct CaseConfig
 {
@@ -52,6 +99,13 @@ struct RunConfig
   CaseConfig case_config;
   CommonOptions opts;
   IGROptions igr_opts;
+  DGBackend dg_backend = DGBackend::DG;
+  DGSEMStabilization dgsem_stab = DGSEMStabilization::None;
+  DGSEMVolumeFlux dgsem_volume_flux = DGSEMVolumeFlux::Central;
+  DGSEMVolumeDissipation dgsem_volume_dissipation =
+      DGSEMVolumeDissipation::None;
+  DGSEMSurfaceFlux dgsem_surface_flux = DGSEMSurfaceFlux::Rusanov;
+  DGSEMEntropyJacobian dgsem_entropy_jacobian = DGSEMEntropyJacobian::FiniteDifference;
   std::string mesh_path;
   int order = 1;
   int ser_ref_levels = 0;
@@ -72,6 +126,188 @@ inline std::string ToLowerCopy(std::string value)
   std::transform(value.begin(), value.end(), value.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return value;
+}
+
+inline DGBackend ParseDGBackend(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "dg")
+  {
+    return DGBackend::DG;
+  }
+  if (lower == "dgsem")
+  {
+    return DGBackend::DGSEM;
+  }
+  MFEM_VERIFY(false, "Invalid DG backend '" << value << "'. Use 'dg' or 'dgsem'.");
+  return DGBackend::DG;
+}
+
+inline DGSEMStabilization ParseDGSEMStabilization(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "none")
+  {
+    return DGSEMStabilization::None;
+  }
+  if (lower == "split" || lower == "split-form" || lower == "splitform")
+  {
+    return DGSEMStabilization::SplitForm;
+  }
+  if (lower == "filter" || lower == "filtering")
+  {
+    return DGSEMStabilization::Filter;
+  }
+  MFEM_VERIFY(false, "Invalid DGSEM stabilization '" << value
+              << "'. Use 'none', 'split', or 'filter'.");
+  return DGSEMStabilization::None;
+}
+
+inline const char* DGSEMStabilizationToString(DGSEMStabilization stab)
+{
+  switch (stab)
+  {
+    case DGSEMStabilization::None: return "none";
+    case DGSEMStabilization::SplitForm: return "split";
+    case DGSEMStabilization::Filter: return "filter";
+  }
+  return "none";
+}
+
+inline DGSEMVolumeFlux ParseDGSEMVolumeFlux(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "central")
+  {
+    return DGSEMVolumeFlux::Central;
+  }
+  if (lower == "chandrashekar" || lower == "chandra")
+  {
+    return DGSEMVolumeFlux::Chandrashekar;
+  }
+  if (lower == "ranocha")
+  {
+    return DGSEMVolumeFlux::Ranocha;
+  }
+  MFEM_VERIFY(false, "Invalid DGSEM volume flux '" << value
+              << "'. Use 'central', 'chandrashekar', or 'ranocha'.");
+  return DGSEMVolumeFlux::Central;
+}
+
+inline const char* DGSEMVolumeFluxToString(DGSEMVolumeFlux flux)
+{
+  switch (flux)
+  {
+    case DGSEMVolumeFlux::Central: return "central";
+    case DGSEMVolumeFlux::Chandrashekar: return "chandrashekar";
+    case DGSEMVolumeFlux::Ranocha: return "ranocha";
+  }
+  return "central";
+}
+
+inline DGSEMVolumeDissipation ParseDGSEMVolumeDissipation(
+    const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "none")
+  {
+    return DGSEMVolumeDissipation::None;
+  }
+  if (lower == "llf" || lower == "lax-friedrichs" || lower == "rusanov")
+  {
+    return DGSEMVolumeDissipation::LLF;
+  }
+  if (lower == "entropy-lf" || lower == "entropy-vars-lf" ||
+      lower == "entropy-variable-lf" || lower == "es-lf")
+  {
+    return DGSEMVolumeDissipation::EntropyVarsLF;
+  }
+  MFEM_VERIFY(false, "Invalid DGSEM volume dissipation '" << value
+              << "'. Use 'none', 'llf', or 'entropy-lf'.");
+  return DGSEMVolumeDissipation::None;
+}
+
+inline const char* DGSEMVolumeDissipationToString(DGSEMVolumeDissipation diss)
+{
+  switch (diss)
+  {
+    case DGSEMVolumeDissipation::None: return "none";
+    case DGSEMVolumeDissipation::LLF: return "llf";
+    case DGSEMVolumeDissipation::EntropyVarsLF: return "entropy-lf";
+  }
+  return "none";
+}
+
+inline DGSEMSurfaceFlux ParseDGSEMSurfaceFlux(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "rusanov" || lower == "lf" || lower == "lax-friedrichs")
+  {
+    return DGSEMSurfaceFlux::Rusanov;
+  }
+  if (lower == "diffusive-rusanov" || lower == "rusanov-diffusive" ||
+      lower == "llf-diffusive" || lower == "diffusive-llf")
+  {
+    return DGSEMSurfaceFlux::DiffusiveRusanov;
+  }
+  if (lower == "es-winters" || lower == "entropy-winters" || lower == "winters")
+  {
+    return DGSEMSurfaceFlux::EntropyStableWinters;
+  }
+  if (lower == "es-lf-entropy" || lower == "entropy-lf" || lower == "es-lf")
+  {
+    return DGSEMSurfaceFlux::EntropyStableLFEntropyVars;
+  }
+  MFEM_VERIFY(false, "Invalid DGSEM surface flux '" << value
+              << "'. Use 'rusanov', 'diffusive-rusanov', 'es-winters', or 'es-lf-entropy'.");
+  return DGSEMSurfaceFlux::Rusanov;
+}
+
+inline DGSEMEntropyJacobian ParseDGSEMEntropyJacobian(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "fd" || lower == "finite" || lower == "finite-difference")
+  {
+    return DGSEMEntropyJacobian::FiniteDifference;
+  }
+  if (lower == "analytic" || lower == "exact")
+  {
+    return DGSEMEntropyJacobian::Analytic;
+  }
+  MFEM_VERIFY(false, "Invalid DGSEM entropy Jacobian '" << value
+              << "'. Use 'fd' or 'analytic'.");
+  return DGSEMEntropyJacobian::FiniteDifference;
+}
+
+inline const char* DGSEMEntropyJacobianToString(DGSEMEntropyJacobian mode)
+{
+  switch (mode)
+  {
+    case DGSEMEntropyJacobian::FiniteDifference: return "fd";
+    case DGSEMEntropyJacobian::Analytic: return "analytic";
+  }
+  return "fd";
+}
+
+inline const char* DGSEMSurfaceFluxToString(DGSEMSurfaceFlux flux)
+{
+  switch (flux)
+  {
+    case DGSEMSurfaceFlux::Rusanov: return "rusanov";
+    case DGSEMSurfaceFlux::EntropyStableWinters: return "es-winters";
+    case DGSEMSurfaceFlux::EntropyStableLFEntropyVars: return "es-lf-entropy";
+  }
+  return "rusanov";
+}
+
+inline const char* DGBackendToString(DGBackend backend)
+{
+  switch (backend)
+  {
+    case DGBackend::DG: return "dg";
+    case DGBackend::DGSEM: return "dgsem";
+  }
+  return "dg";
 }
 
 inline std::string CaseDirFromFile(const char* file)
@@ -154,6 +390,14 @@ inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
   run_cfg.case_config = case_cfg;
   run_cfg.opts = opts;
   run_cfg.igr_opts = igr_opts;
+  run_cfg.dg_backend = ParseDGBackend(opts.dg_backend);
+  run_cfg.dgsem_stab = ParseDGSEMStabilization(opts.dgsem_stab);
+  run_cfg.dgsem_volume_flux = ParseDGSEMVolumeFlux(opts.dgsem_volume_flux);
+  run_cfg.dgsem_volume_dissipation =
+      ParseDGSEMVolumeDissipation(opts.dgsem_volume_dissipation);
+  run_cfg.dgsem_surface_flux = ParseDGSEMSurfaceFlux(opts.dgsem_surface_flux);
+  run_cfg.dgsem_entropy_jacobian =
+      ParseDGSEMEntropyJacobian(opts.dgsem_entropy_jacobian);
   run_cfg.mesh_path = ResolveCaseMesh(case_cfg, opts.mesh_file);
   run_cfg.order = opts.order;
   run_cfg.ser_ref_levels = opts.ser_ref_levels;

@@ -50,6 +50,15 @@ VectorFunctionCoefficient EulerInitialCondition()
    });
 }
 
+/// @brief Euler initial condition for a uniform inflow state.
+inline VectorFunctionCoefficient EulerInitialCondition(const Vector &Uin)
+{
+   return VectorFunctionCoefficient(4, [Uin](const Vector &, Vector &y)
+   {
+      y = Uin;
+   });
+}
+
 
 
 } // namespace mfem

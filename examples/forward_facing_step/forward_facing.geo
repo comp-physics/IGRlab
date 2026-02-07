@@ -77,13 +77,13 @@ Recombine Surface   {s1, s2, s3};
 // -------------------------------
 Physical Curve("inlet_upper")       = {17};
 Physical Curve("inlet_lower")       = {18};
-Physical Curve("inlet")             = {17, 18};
+// Physical Curve("inlet")             = {17, 18};
 Physical Curve("outlet")            = {14};
 Physical Curve("top")               = {15, 16};
 Physical Curve("bottom_upstream")   = {11};
 Physical Curve("step_face")         = {12};
 Physical Curve("bottom_downstream") = {13};
-Physical Curve("walls")             = {15, 16, 11, 12, 13};
+// Physical Curve("walls")             = {15, 16, 11, 12, 13};
 
 Physical Surface("domain") = {s1, s2, s3};
 

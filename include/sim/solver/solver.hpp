@@ -27,6 +27,7 @@
 #include "sim/time/time_defaults.hpp"
 #include "sim/wiring/bc_wiring.hpp"
 #include "sim/wiring/dg_operator.hpp"
+#include "sim/wiring/dgsem_flux_config.hpp"
 #include "sim/wiring/igr_physics.hpp"
 
 namespace dg_igr_examples
@@ -34,6 +35,21 @@ namespace dg_igr_examples
 
 namespace detail
 {
+
+inline void VerifyDGSEMElementGeometry(const mfem::Mesh& mesh)
+{
+  for (int i = 0; i < mesh.GetNE(); ++i)
+  {
+    const mfem::Geometry::Type geom = mesh.GetElementBaseGeometry(i);
+    if (geom == mfem::Geometry::SEGMENT || geom == mfem::Geometry::SQUARE)
+    {
+      continue;
+    }
+    MFEM_VERIFY(false,
+                "DGSEM v1 supports tensor-product meshes only (segment/quad). "
+                "Found geometry: " << mfem::Geometry::Name[geom] << ".");
+  }
+}
 
 template <typename NumericalFlux, typename BcSetup, typename Func>
 bool WithEulerOperator(ExampleContext& ctx,
@@ -54,6 +70,7 @@ bool WithEulerOperator(ExampleContext& ctx,
 
   mfem::EulerFlux base_flux(ctx.dim, gamma);
   NumericalFlux numerical_flux(base_flux);
+  ConfigureDGSEMSurfaceFlux(numerical_flux, ctx.run_cfg, gamma);
   mfem::DGHyperbolicConservationLaws op =
       MakeDGOperator(ctx, numerical_flux);
   EulerBoundaryWiring<NumericalFlux> bc(
@@ -219,6 +236,7 @@ struct Solver
     case_cfg.rk3_config.gamma = case_cfg.gamma;
     case_cfg.defaults.visualization = spec.vis.enabled;
     case_cfg.defaults.vtk_save = spec.vtk.enabled;
+    case_cfg.defaults.dg_backend = DGBackendToString(spec.dg_backend_default);
 
     CaseOptions case_opts = spec.options;
     CommonOptions cli_opts = case_cfg.defaults;
@@ -243,6 +261,10 @@ struct Solver
     const bool need_h1 = spec.need_h1 || spec.vis.h1_diagnostics;
     ExampleContext ctx = BuildExampleContext(run_cfg, run_cfg.igr_opts.space,
                                              need_sigma, need_h1);
+    if (run_cfg.dg_backend == DGBackend::DGSEM)
+    {
+      detail::VerifyDGSEMElementGeometry(ctx.Mesh());
+    }
     if (need_sigma)
     {
       MFEM_VERIFY(ctx.spaces.sigma_fes != nullptr, "Sigma space was not created.");
@@ -256,6 +278,7 @@ struct Solver
         ctx.spaces.vfes, ctx.dim, case_cfg.rk3_config);
     ConfigureLimiterPipeline(rk3, case_cfg.limiter_pipeline,
                              ctx.spaces.vfes, ctx.dim, case_cfg.gamma);
+    rk3.EnableStageNanScan(run_cfg.opts.nan_scan);
 
     const double rho_floor = case_cfg.rk3_config.rho_min;
     std::unique_ptr<dg_igr::IGRSolver> igr;
@@ -283,7 +306,7 @@ struct Solver
         spec.make_ic(case_opts, ctx, case_cfg.gamma);
     MFEM_VERIFY(ic, "CaseSpec initial condition builder returned null.");
 
-    EulerStateBundle state_bundle(ctx, case_cfg.gamma);
+    EulerStateBundle state_bundle(ctx, case_cfg.gamma, rho_floor);
     if (igr)
     {
       state_bundle.AttachIGR(*igr);

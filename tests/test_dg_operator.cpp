@@ -65,7 +65,7 @@ int RunDGOperatorTests(TestContext& ctx)
   ctx.AddParity(resid_norm);
   ctx.Check(resid_norm < tol,
             "DG operator residual is near zero for a constant state (norm=" +
-                std::to_string(resid_norm) + ")");
+                FormatSci(resid_norm) + ")");
 
   return ctx.failures;
 }

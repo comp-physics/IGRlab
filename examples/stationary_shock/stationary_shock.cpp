@@ -67,7 +67,7 @@ using StationaryShockOptions = dg_igr_examples::EmptyCaseOptions;
 
 int main(int argc, char *argv[])
 {
-  dg_igr_examples::CaseSpec<StationaryShockOptions, mfem::RusanovFluxWithSides> spec;
+  dg_igr_examples::CaseSpec<StationaryShockOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "stationary_shock";
   spec.default_mesh_path = mfem::StationaryShockDefaultMeshPath();
   spec.case_file = __FILE__;

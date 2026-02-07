@@ -55,4 +55,7 @@ MFEM_examples/
 notes/
 .DS_Store
 .spack-env
+euler-*
+vtk_output
+tools
 # supersonic_example/backup

@@ -1,0 +1,3 @@
+# Create the dgsem_smooth_advection_periodic executable
+add_executable(dgsem_smooth_advection_periodic dgsem_smooth_advection_periodic.cpp)
+target_link_libraries(dgsem_smooth_advection_periodic igr_mfem)

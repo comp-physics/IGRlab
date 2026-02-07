@@ -67,7 +67,7 @@ using ShockVortexOptions = dg_igr_examples::EmptyCaseOptions;
 
 int main(int argc, char *argv[])
 {
-  dg_igr_examples::CaseSpec<ShockVortexOptions, mfem::RusanovFluxWithSides> spec;
+  dg_igr_examples::CaseSpec<ShockVortexOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "shock_vortex_interaction";
   spec.default_mesh_path = mfem::ShockVortexDefaultMeshPath();
   spec.case_file = __FILE__;

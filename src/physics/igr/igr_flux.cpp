@@ -59,4 +59,37 @@ real_t FluxWithIGR::ComputeFluxDotN(const Vector &U, const Vector &n,
   return mcs;
 }
 
+double FluxWithIGR::GetSigmaAtPoint(ElementTransformation &Tr) const
+{
+  if (!sigma_) { return 0.0; }
+  const IntegrationPoint &ip = Tr.GetIntPoint();
+  return sigma_->GetValue(Tr, ip);
+}
+
+double FluxWithIGR::GetSigmaAtSide(FaceElementTransformations &Tr,
+                                   FaceSide side) const
+{
+  if (!sigma_) { return 0.0; }
+
+  if (Tr.Elem2) // interior face
+  {
+    if (side == FaceSide::Left)
+    {
+      ElementTransformation &T1 = *Tr.Elem1;
+      const IntegrationPoint &ip1 = Tr.GetElement1IntPoint();
+      T1.SetIntPoint(&ip1);
+      return sigma_->GetValue(T1, ip1);
+    }
+    ElementTransformation &T2 = *Tr.Elem2;
+    const IntegrationPoint &ip2 = Tr.GetElement2IntPoint();
+    T2.SetIntPoint(&ip2);
+    return sigma_->GetValue(T2, ip2);
+  }
+
+  ElementTransformation &T1 = *Tr.Elem1;
+  const IntegrationPoint &ip1 = Tr.GetElement1IntPoint();
+  T1.SetIntPoint(&ip1);
+  return sigma_->GetValue(T1, ip1);
+}
+
 } // namespace mfem

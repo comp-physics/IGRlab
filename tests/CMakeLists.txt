@@ -6,6 +6,11 @@ add_executable(dg_igr_unit_tests
   test_fluxes.cpp
   test_limiters.cpp
   test_dg_operator.cpp
+  test_dgsem_basis.cpp
+  test_dgsem_flux.cpp
+  test_dgsem_operator.cpp
+  test_dgsem_advection.cpp
+  test_dgsem_igr.cpp
   test_bc.cpp
   test_igr.cpp
 )
@@ -20,6 +25,11 @@ add_test(NAME dg_igr_euler_tests COMMAND dg_igr_unit_tests --euler)
 add_test(NAME dg_igr_flux_tests COMMAND dg_igr_unit_tests --fluxes)
 add_test(NAME dg_igr_limiter_tests COMMAND dg_igr_unit_tests --limiters)
 add_test(NAME dg_igr_dg_operator_tests COMMAND dg_igr_unit_tests --dg-operator)
+add_test(NAME dg_igr_dgsem_basis_tests COMMAND dg_igr_unit_tests --dgsem-basis)
+add_test(NAME dg_igr_dgsem_flux_tests COMMAND dg_igr_unit_tests --dgsem-flux)
+add_test(NAME dg_igr_dgsem_operator_tests COMMAND dg_igr_unit_tests --dgsem-operator)
+add_test(NAME dg_igr_dgsem_advection_tests COMMAND dg_igr_unit_tests --dgsem-advection)
+add_test(NAME dg_igr_dgsem_igr_tests COMMAND dg_igr_unit_tests --dgsem-igr)
 add_test(NAME dg_igr_bc_tests COMMAND dg_igr_unit_tests --bc)
 add_test(NAME dg_igr_igr_tests COMMAND dg_igr_unit_tests --igr)
 
@@ -54,6 +64,36 @@ if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
     LABELS "parity"
     TIMEOUT 120
   )
+
+  add_test(NAME dg_igr_dgsem_operator_mpi_2rank
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_unit_tests> --dgsem-operator
+            ${MPIEXEC_POSTFLAGS}
+  )
+  set_tests_properties(dg_igr_dgsem_operator_mpi_2rank PROPERTIES
+    LABELS "mpi"
+    TIMEOUT 120
+  )
+
+  if (TARGET dgsem_smooth_advection)
+    set(reg_dir "${CMAKE_BINARY_DIR}/tests/regression/dg_igr_mpi_dgsem_smooth_advection")
+    file(MAKE_DIRECTORY "${reg_dir}")
+    add_test(NAME dg_igr_dgsem_advection_mpi_smoke
+      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:dgsem_smooth_advection>
+              -m ${CMAKE_SOURCE_DIR}/examples/dgsem_smooth_advection/smooth_advection.msh
+              -rs 0 -rp 0 -o 2 -tf 1.0e-4 -dt 1.0e-4 -c 0.0
+              -no-vis -vs 1000000 -nan-scan
+              -no-vtk -dt_save 1.0
+              --dg-backend dgsem
+              ${MPIEXEC_POSTFLAGS}
+    )
+    set_tests_properties(dg_igr_dgsem_advection_mpi_smoke PROPERTIES
+      WORKING_DIRECTORY "${reg_dir}"
+      LABELS "mpi"
+      TIMEOUT 180
+    )
+  endif()
 endif()
 
 # Mini-regressions: run each example for a tiny time window with IO disabled.
@@ -116,6 +156,22 @@ add_example_regression(dg_igr_regression_forward_facing
 add_example_regression(dg_igr_regression_stationary_shock
   stationary_shock
   examples/stationary_shock/stationary_shock.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_dgsem_stationary_shock
+  dgsem_stationary_shock
+  examples/dgsem_stationary_shock/stationary_shock.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_dgsem_shock_vortex
+  dgsem_shock_vortex_interaction
+  examples/dgsem_shock_vortex_interaction/shock_vortex.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_dgsem_forward_facing
+  dgsem_forward_facing_step
+  examples/dgsem_forward_facing_step/forward_facing.msh
+  -no-vtk -dt_save 1.0)
+add_example_regression(dg_igr_regression_dgsem_sedov
+  dgsem_sedov_taylor_blast
+  examples/dgsem_sedov_taylor_blast/sedov_taylor.msh
   -no-vtk -dt_save 1.0)
 add_example_regression(dg_igr_regression_shock_vortex
   shock_vortex_interaction

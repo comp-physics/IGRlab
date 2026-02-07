@@ -84,7 +84,7 @@ struct DoubleMachOptions
 
 int main(int argc, char *argv[])
 {
-  dg_igr_examples::CaseSpec<DoubleMachOptions, mfem::RusanovFluxWithSides> spec;
+  dg_igr_examples::CaseSpec<DoubleMachOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "double_mach_ref";
   spec.default_mesh_path = mfem::DoubleMachRefDefaultMeshPath();
   spec.case_file = __FILE__;

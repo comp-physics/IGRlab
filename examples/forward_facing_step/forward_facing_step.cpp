@@ -84,7 +84,7 @@ struct ForwardFacingOptions
 
 int main(int argc, char *argv[])
 {
-  dg_igr_examples::CaseSpec<ForwardFacingOptions, mfem::RusanovFluxWithSides> spec;
+  dg_igr_examples::CaseSpec<ForwardFacingOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "forward_facing_step";
   spec.default_mesh_path = mfem::ForwardFacingStepDefaultMeshPath();
   spec.case_file = __FILE__;
@@ -122,9 +122,9 @@ int main(int argc, char *argv[])
   {
     return dg_igr_examples::BuildBoundaryMarkers(
         ctx.Mesh(),
-        {{dg_igr_examples::BoundaryRole::Inlet, {3}},
-         {dg_igr_examples::BoundaryRole::Outlet, {4}},
-         {dg_igr_examples::BoundaryRole::Slip, {9}}});
+        {{dg_igr_examples::BoundaryRole::Inlet, {1, 2}},
+         {dg_igr_examples::BoundaryRole::Outlet, {3}},
+         {dg_igr_examples::BoundaryRole::Slip, {4, 5, 6, 7}}});
   };
 
   spec.apply_bc = [](const ForwardFacingOptions& opts,

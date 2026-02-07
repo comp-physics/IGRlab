@@ -30,11 +30,21 @@
 #include "numerics/riemann/fluxfunctions.hpp"
 
 namespace mfem {
+namespace dgsem { class DGSEMOperator; }
 
-/// Choose which method to compute the *volume* contribution: /// NOT WORKING
+/// Choose which method to compute the *volume* contribution:
 ///  - WeakDivergence: (F(u), ∇v)_T via preassembled weak divergence or matrix-free
 ///  - DGSEMFluxDiff : flux-difference (“pairwise flux”) volume term in DGSEM style
-// enum class VolumeMode { WeakDivergence, DGSEMFluxDiff };
+enum class VolumeMode { WeakDivergence, DGSEMFluxDiff };
+
+/// Optional DGSEM stabilization hook selection (placeholder).
+enum class DGSEMStabilization { None, SplitForm, Filter };
+
+/// DGSEM volume flux selection for entropy-conservative variants (Euler-only).
+enum class DGSEMVolumeFlux { Central, Chandrashekar, Ranocha };
+
+/// DGSEM volume dissipation selection (added to flux-differencing pair flux).
+enum class DGSEMVolumeDissipation { None, LLF, EntropyVarsLF };
 
 /// ---------------------------------------------------------------------------
 /// @brief Time-dependent DG operator for hyperbolic conservation laws.
@@ -62,11 +72,65 @@ public:
                                 std::unique_ptr<HyperbolicFormIntegrator> formIntegrator_,
                                 bool preassembleWeakDivergence = true);
 
-   // /// Select volume-contribution strategy (WeakDivergence or DGSEMFluxDiff).
-   // void SetVolumeMode(VolumeMode m) { vol_mode_ = m; }
+   DGHyperbolicConservationLaws(const DGHyperbolicConservationLaws&) = delete;
+   DGHyperbolicConservationLaws& operator=(const DGHyperbolicConservationLaws&) = delete;
+   DGHyperbolicConservationLaws(DGHyperbolicConservationLaws&&) = default;
+   DGHyperbolicConservationLaws& operator=(DGHyperbolicConservationLaws&&) = default;
 
-   // /// Get the current volume-contribution strategy.
-   // VolumeMode GetVolumeMode() const { return vol_mode_; }
+   /// Select volume-contribution strategy (WeakDivergence or DGSEMFluxDiff).
+   void SetVolumeMode(VolumeMode m) { vol_mode_ = m; }
+
+   /// Get the current volume-contribution strategy.
+   VolumeMode GetVolumeMode() const { return vol_mode_; }
+
+   /// Select optional DGSEM stabilization hook (not implemented yet).
+   void SetDGSEMStabilization(DGSEMStabilization s) { dgsem_stab_ = s; }
+
+   /// Get current DGSEM stabilization hook selection.
+   DGSEMStabilization GetDGSEMStabilization() const { return dgsem_stab_; }
+
+   /// Set the numerical flux used for DGSEM surface evaluation (non-owning).
+   void SetNumericalFlux(const NumericalFlux *flux) { num_flux_ = flux; }
+
+   /// Select DGSEM volume flux (central or entropy-conservative).
+   void SetDGSEMVolumeFlux(DGSEMVolumeFlux f) { dgsem_vol_flux_ = f; }
+
+   /// Get current DGSEM volume flux.
+   DGSEMVolumeFlux GetDGSEMVolumeFlux() const { return dgsem_vol_flux_; }
+
+   /// Set Euler gamma used by entropy-conservative DGSEM fluxes.
+   void SetDGSEMGamma(double gamma) { dgsem_gamma_ = gamma; }
+
+   /// Get Euler gamma used by DGSEM entropy-conservative fluxes.
+   double GetDGSEMGamma() const { return dgsem_gamma_; }
+
+   /// Select DGSEM volume dissipation mode.
+   void SetDGSEMVolumeDissipation(DGSEMVolumeDissipation d)
+   { dgsem_vol_diss_ = d; }
+
+   /// Get DGSEM volume dissipation mode.
+   DGSEMVolumeDissipation GetDGSEMVolumeDissipation() const
+   { return dgsem_vol_diss_; }
+
+   /// Select entropy Jacobian mode for entropy-variable LF volume dissipation.
+   void SetDGSEMEntropyJacobianAnalytic(bool analytic)
+   { dgsem_entropy_jacobian_analytic_ = analytic; }
+
+   /// Query entropy Jacobian mode for entropy-variable LF volume dissipation.
+   bool GetDGSEMEntropyJacobianAnalytic() const
+   { return dgsem_entropy_jacobian_analytic_; }
+
+   /**
+    * @brief Set a custom face integration rule for surface flux evaluation.
+    *
+    * Applies the rule to the interior-face integrator and caches it so boundary
+    * integrators added later inherit the same rule.
+    */
+   void SetFaceIntegrationRule(const IntegrationRule &ir)
+   {
+      formIntegrator->SetIntegrationRule(ir);
+      face_int_rule_ = &ir;
+   }
    
    /**
     * @brief Apply the operator: y = M⁻¹( -<F̂, [[v]]> + (F(u), ∇v) ).
@@ -95,6 +159,8 @@ public:
    ~DGHyperbolicConservationLaws() override = default;
 
 private:
+   friend class dgsem::DGSEMOperator;
+
    // --- Problem description and finite element spaces ---
    const int num_equations;          ///< number of conservative equations
    const int dim;                    ///< space dimension
@@ -115,9 +181,16 @@ private:
    // Keep external boundary integrators alive + stable copies of their markers.
    std::vector<std::unique_ptr<NonlinearFormIntegrator>> ext_bdr_int_;
    std::vector<std::unique_ptr<Array<int>>> ext_bdr_markers_;
+   const IntegrationRule *face_int_rule_ = nullptr;
 
    // Volume strategy
-   // VolumeMode vol_mode_ = VolumeMode::WeakDivergence;
+   VolumeMode vol_mode_ = VolumeMode::WeakDivergence;
+   const NumericalFlux *num_flux_ = nullptr;
+   DGSEMStabilization dgsem_stab_ = DGSEMStabilization::None;
+   DGSEMVolumeFlux dgsem_vol_flux_ = DGSEMVolumeFlux::Central;
+   DGSEMVolumeDissipation dgsem_vol_diss_ = DGSEMVolumeDissipation::None;
+   double dgsem_gamma_ = 1.4;
+   bool dgsem_entropy_jacobian_analytic_ = false;
 
    // --- Helpers ---
    /// Compute per-element inverse mass matrices (block-diagonal DG mass).

@@ -21,15 +21,18 @@ struct EulerStateBundle
   mfem::ParGridFunction sol;
   EulerStateViews state;
   EulerPressureView pressure_view;
+  EulerVelocityView velocity_view;
   EulerFieldList field_list;
 
-  EulerStateBundle(ExampleContext& ctx, double gamma)
+  EulerStateBundle(ExampleContext& ctx, double gamma, double rho_floor)
     : sol(&ctx.spaces.vfes),
       state(ctx.spaces.fes, ctx.spaces.dfes, sol, ctx.dim),
-      pressure_view(ctx.spaces.fes, sol, ctx.dim, gamma)
+      pressure_view(ctx.spaces.fes, sol, ctx.dim, gamma),
+      velocity_view(ctx.spaces.dfes, sol, ctx.dim, rho_floor)
   {
     field_list.state = &state;
     field_list.pressure = &pressure_view;
+    field_list.velocity = &velocity_view;
   }
 
   void AttachIGR(dg_igr::IGRSolver& igr) { field_list.igr = &igr; }

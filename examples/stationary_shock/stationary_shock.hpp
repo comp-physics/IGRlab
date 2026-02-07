@@ -65,7 +65,7 @@ VectorFunctionCoefficient EulerInitialCondition(const mfem::Vector &Uin)
  * @brief Shock–vortex interaction initial condition on Ω = [0,1]×[0,1].
  *
  * Mesh is assumed uniform with mx×my elements; mx,my only enter through
- * the shock smoothing width δ = 3 * min(1/mx, 1/my).
+ * the shock smoothing width δ = 3 * smoothing_scale * min(1/mx, 1/my).
  *
  * Boundary conditions (for your driver, not enforced here):
  *   - x = 0: Dirichlet (inflow with upstream vortex state)
@@ -85,7 +85,8 @@ VectorFunctionCoefficient EulerInitialCondition(const mfem::Vector &Uin)
 std::function<void(const Vector&, Vector&)> GetShockVortexInteractionInit(
    const real_t gamma,
    const int mx = 32,
-   const int my = 32)
+   const int my = 32,
+   const real_t smoothing_scale = 1.0)
 {
    // --- Upstream base state U1 ---
    const real_t M1   = 1.5;
@@ -136,7 +137,8 @@ std::function<void(const Vector&, Vector&)> GetShockVortexInteractionInit(
    const real_t xs = 0.6;
    const real_t inv_mx = 1.0 / static_cast<real_t>(mx);
    const real_t inv_my = 1.0 / static_cast<real_t>(my);
-   const real_t delta = 3.0 * std::min(inv_mx, inv_my);
+   const real_t smooth = std::max(smoothing_scale, static_cast<real_t>(1.0e-6));
+   const real_t delta = 3.0 * smooth * std::min(inv_mx, inv_my);
 
    // --- Vortex parameters (upstream) ---
    const real_t xv = 0.3;
@@ -211,9 +213,10 @@ std::function<void(const Vector&, Vector&)> GetShockVortexInteractionInit(
 VectorFunctionCoefficient ShockVortexInteractionInitialCondition(
    const real_t gamma,
    const int mx = 32,
-   const int my = 32)
+   const int my = 32,
+   const real_t smoothing_scale = 1.0)
 {
-   auto ic_fun = GetShockVortexInteractionInit(gamma, mx, my);
+   auto ic_fun = GetShockVortexInteractionInit(gamma, mx, my, smoothing_scale);
    return mfem::VectorFunctionCoefficient(4, ic_fun);
 }
 
@@ -228,6 +231,7 @@ VectorFunctionCoefficient ShockVortexInteractionInitialCondition(
  *  - mx,my : number of cells in X and Y (for shock smoothing width δ_phys)
  *  - Ms    : incident shock Mach number (default 1.2)
  *  - Mv    : vortex Mach number / strength (default 0.25)
+ *  - smoothing_scale : scale for shock thickness (1.0 = default)
  *
  * Returns u₀(X,Y) = [ρ, ρu_x, ρu_y, E].
  */
@@ -237,7 +241,8 @@ inline std::function<void(const Vector&, Vector&)> GetShockVortexInoueHattoriIni
    const int mx,
    const int my,
    const real_t Ms = 1.2,
-   const real_t Mv = 0.25)
+   const real_t Mv = 0.25,
+   const real_t smoothing_scale = 1.0)
 {
    // --- Physical domain bounds (X,Y) ---
    const real_t xL = -30.0;
@@ -250,7 +255,8 @@ inline std::function<void(const Vector&, Vector&)> GetShockVortexInoueHattoriIni
 
    const real_t dX = Lx / static_cast<real_t>(mx);
    const real_t dY = Ly / static_cast<real_t>(my);
-   const real_t delta_phys = 2.0 * std::min(dX, dY); // smooth shock width
+   const real_t smooth = std::max(smoothing_scale, static_cast<real_t>(1.0e-6));
+   const real_t delta_phys = 2.0 * smooth * std::min(dX, dY); // smooth shock width
 
    // --- Upstream base state U1 (to the right, X > 0) ---
    const real_t rho1 = 1.0;
@@ -290,7 +296,7 @@ inline std::function<void(const Vector&, Vector&)> GetShockVortexInoueHattoriIni
    const real_t mu2y = rho2 * u2y;
 
    // --- Shock location ---
-   const real_t Xs = 0.0; // stationary shock at X=0
+   const real_t Xs = -10.0; // stationary shock at X=0
 
    // --- Vortex parameters ---
    const real_t Xv = 50.0; // Remove vortex from space

@@ -52,6 +52,7 @@ struct CaseSpec
   std::string default_mesh_path;
   const char* case_file = nullptr;
   double gamma = mfem::dg_igr::EulerDefaults::kGamma;
+  DGBackend dg_backend_default = DGBackend::DG;
   bool use_igr = true;
   bool need_sigma = true;
   bool need_h1 = false;

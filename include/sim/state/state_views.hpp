@@ -63,4 +63,31 @@ struct EulerPressureView
   }
 };
 
+/**
+ * @brief Velocity projection wrapper for Euler states.
+ */
+struct EulerVelocityView
+{
+  mfem::VelocityFromConsCoefficient coeff;
+  mfem::ParGridFunction velocity;
+  mfem::ParGridFunction* state = nullptr;
+
+  EulerVelocityView(mfem::ParFiniteElementSpace& dfes,
+                    mfem::ParGridFunction& sol,
+                    int dim,
+                    double rho_floor)
+    : coeff(dim, &sol, rho_floor),
+      velocity(&dfes),
+      state(&sol)
+  {
+    Update();
+  }
+
+  void Update()
+  {
+    coeff.SetState(state);
+    velocity.ProjectCoefficient(coeff);
+  }
+};
+
 } // namespace dg_igr_examples

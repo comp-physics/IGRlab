@@ -19,9 +19,9 @@ namespace io
 struct EulerVTKFields
 {
   mfem::ParGridFunction* density = nullptr;
-  mfem::ParGridFunction* momentum_x = nullptr;
-  mfem::ParGridFunction* momentum_y = nullptr;
+  mfem::ParGridFunction* momentum = nullptr;
   mfem::ParGridFunction* energy = nullptr;
+  mfem::ParGridFunction* velocity = nullptr;
   mfem::ParGridFunction* sigma = nullptr;
   mfem::ParGridFunction* pressure = nullptr;
 };

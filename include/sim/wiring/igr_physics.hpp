@@ -8,6 +8,7 @@
 #include "sim/context/example_context.hpp"
 #include "sim/wiring/bc_wiring.hpp"
 #include "sim/wiring/dg_operator.hpp"
+#include "sim/wiring/dgsem_flux_config.hpp"
 #include "sim/wiring/flux_bundle.hpp"
 
 namespace dg_igr_examples
@@ -29,6 +30,7 @@ struct EulerIGRPhysics
     : flux(ctx.dim, gamma, igr),
       op(MakeDGOperator(ctx, flux.numerical_flux))
   {
+    ConfigureDGSEMSurfaceFlux(flux.numerical_flux, ctx.run_cfg, gamma);
     EulerBoundaryWiring<NumericalFlux> bc(
         op, flux.numerical_flux, ctx.run_cfg.int_order_offset, ctx.dim);
     bc_setup(bc, markers);
