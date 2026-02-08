@@ -45,7 +45,7 @@ std::string EnsurePeriodicMeshFile()
 
 int main(int argc, char* argv[])
 {
-  dg_igr_examples::CaseSpec<SmoothAdvectionOptions, mfem::DGSEMSurfaceFlux> spec;
+  dg_sim::CaseSpec<SmoothAdvectionOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "dgsem_smooth_advection_periodic";
   spec.default_mesh_path = EnsurePeriodicMeshFile();
   spec.case_file = __FILE__;
@@ -53,11 +53,11 @@ int main(int argc, char* argv[])
   spec.use_igr = false;
   spec.need_sigma = false;
   spec.need_h1 = false;
-  spec.dg_backend_default = dg_igr_examples::DGBackend::DGSEM;
+  spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
   spec.vis.precision = 8;
   spec.vtk.print_dataset_name = true;
 
-  spec.configure_case = [](dg_igr_examples::CaseConfig& cfg)
+  spec.configure_case = [](dg_sim::CaseConfig& cfg)
   {
     cfg.defaults.t_final = 0.1;
     cfg.defaults.vtk_save = false;
@@ -70,7 +70,7 @@ int main(int argc, char* argv[])
   };
 
   spec.make_ic = [](const SmoothAdvectionOptions&,
-                    const dg_igr_examples::ExampleContext&,
+                    const dg_sim::ExampleContext&,
                     double gamma)
   {
     const double rho0 = 1.0;
@@ -95,20 +95,20 @@ int main(int argc, char* argv[])
       mfem::EulerPrimToConservative(prim, /*dim=*/2, gamma, U);
     };
 
-    return dg_igr_examples::MakeVectorFunctionIC(4, ic_fun);
+    return dg_sim::MakeVectorFunctionIC(4, ic_fun);
   };
 
-  spec.build_markers = [](dg_igr_examples::ExampleContext&)
+  spec.build_markers = [](dg_sim::ExampleContext&)
   {
-    return dg_igr_examples::BoundaryMarkerMap{};
+    return dg_sim::BoundaryMarkerMap{};
   };
 
   spec.apply_bc = [](const SmoothAdvectionOptions&,
-                     const dg_igr_examples::ExampleContext&,
+                     const dg_sim::ExampleContext&,
                      auto&,
                      const auto&)
   {
   };
 
-  return dg_igr_examples::Solver::solve(spec, argc, argv);
+  return dg_sim::Solver::solve(spec, argc, argv);
 }

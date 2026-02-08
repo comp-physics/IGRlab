@@ -11,7 +11,7 @@
 namespace
 {
 
-using StationaryShockOptions = dg_igr_examples::EmptyCaseOptions;
+using StationaryShockOptions = dg_sim::EmptyCaseOptions;
 constexpr double kShockMach = 2.0;
 constexpr double kVortexMach = 0.0;
 constexpr double kShockSmoothing = 1.0;
@@ -20,7 +20,7 @@ constexpr double kShockSmoothing = 1.0;
 
 int main(int argc, char *argv[])
 {
-  dg_igr_examples::CaseSpec<StationaryShockOptions, mfem::DGSEMSurfaceFlux> spec;
+  dg_sim::CaseSpec<StationaryShockOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "dgsem_stationary_shock";
   spec.default_mesh_path = "stationary_shock.msh";
   spec.case_file = __FILE__;
@@ -31,9 +31,9 @@ int main(int argc, char *argv[])
   spec.vis.h1_diagnostics = true;
   spec.vis.precision = 8;
   spec.vtk.print_dataset_name = true;
-  spec.dg_backend_default = dg_igr_examples::DGBackend::DGSEM;
+  spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
 
-  spec.configure_case = [](dg_igr_examples::CaseConfig& cfg)
+  spec.configure_case = [](dg_sim::CaseConfig& cfg)
   {
     cfg.defaults.t_final = 6.0;
     cfg.defaults.vtk_save = true;
@@ -45,7 +45,7 @@ int main(int argc, char *argv[])
   };
 
   spec.make_ic = [](const StationaryShockOptions&,
-                    const dg_igr_examples::ExampleContext& ctx,
+                    const dg_sim::ExampleContext& ctx,
                     double gamma)
   {
     const mfem::real_t Ms = kShockMach;
@@ -58,20 +58,20 @@ int main(int argc, char *argv[])
     const int my = base_cells << total_ref;
     auto ic_fun = mfem::GetShockVortexInoueHattoriInit(
         gamma, mx, my, Ms, Mv, shock_smoothing);
-    return dg_igr_examples::MakeVectorFunctionIC(4, ic_fun);
+    return dg_sim::MakeVectorFunctionIC(4, ic_fun);
   };
 
-  spec.build_markers = [](dg_igr_examples::ExampleContext& ctx)
+  spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
-    return dg_igr_examples::BuildBoundaryMarkers(
+    return dg_sim::BuildBoundaryMarkers(
         ctx.Mesh(),
-        {{dg_igr_examples::BoundaryRole::Inlet, {2}},
-         {dg_igr_examples::BoundaryRole::Outlet, {4}},
-         {dg_igr_examples::BoundaryRole::Slip, {1, 3}}});
+        {{dg_sim::BoundaryRole::Inlet, {2}},
+         {dg_sim::BoundaryRole::Outlet, {4}},
+         {dg_sim::BoundaryRole::Slip, {1, 3}}});
   };
 
   spec.apply_bc = [](const StationaryShockOptions&,
-                     const dg_igr_examples::ExampleContext&,
+                     const dg_sim::ExampleContext&,
                      auto& bc,
                      const auto& markers)
   {
@@ -95,8 +95,8 @@ int main(int argc, char *argv[])
   };
 
   spec.postprocess = [](const StationaryShockOptions&,
-                        const dg_igr_examples::ExampleContext&,
-                        const dg_igr_examples::EulerStateBundle& state,
+                        const dg_sim::ExampleContext&,
+                        const dg_sim::EulerStateBundle& state,
                         mfem::VectorCoefficient& ic)
   {
     const mfem::real_t error = state.sol.ComputeLpError(2, ic);
@@ -107,5 +107,5 @@ int main(int argc, char *argv[])
     return 0;
   };
 
-  return dg_igr_examples::Solver::solve(spec, argc, argv);
+  return dg_sim::Solver::solve(spec, argc, argv);
 }

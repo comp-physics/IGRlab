@@ -11,7 +11,7 @@
 
 #include "sim/context/example_context.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Build a DG operator with a numerical flux and shared settings.
@@ -86,4 +86,4 @@ inline mfem::DGHyperbolicConservationLaws MakeDGOperator(
   return op;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

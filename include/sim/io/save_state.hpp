@@ -14,7 +14,7 @@
 
 #include "sim/context/example_context.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Save the initial mesh + conservative state in GLVis-compatible files.
@@ -71,4 +71,4 @@ inline void SaveFinalEulerState(ExampleContext& ctx,
   }
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

@@ -9,7 +9,7 @@
 
 #include "mfem.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Alpha diagnostics used in case naming and solver setup.
@@ -55,4 +55,4 @@ inline AlphaInfo ComputeAlphaInfo(const mfem::ParMesh& pmesh, double c_alpha_use
   return info;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

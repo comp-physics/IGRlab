@@ -20,7 +20,7 @@
 #include "sim/config/common_options.hpp"
 #include "sim/time/time_loop.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Options controlling the IGR discretization wiring in examples.
@@ -416,4 +416,4 @@ inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)
   return cfg;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

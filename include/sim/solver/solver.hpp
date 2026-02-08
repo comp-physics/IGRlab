@@ -30,7 +30,7 @@
 #include "sim/wiring/dgsem_flux_config.hpp"
 #include "sim/wiring/igr_physics.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 namespace detail
@@ -379,4 +379,4 @@ struct Solver
   }
 };
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

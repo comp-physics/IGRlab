@@ -7,7 +7,7 @@
 
 #include "physics/igr/igr_flux.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Flux bundle for Euler + IGR wiring with a chosen numerical flux.
@@ -27,4 +27,4 @@ struct EulerIGRFluxBundle
   }
 };
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

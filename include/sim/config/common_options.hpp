@@ -9,7 +9,7 @@
 
 #include "mfem.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /**
@@ -108,4 +108,4 @@ inline std::string ResolveMeshPath(const std::string& default_mesh,
   return override_mesh.empty() ? default_mesh : override_mesh;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

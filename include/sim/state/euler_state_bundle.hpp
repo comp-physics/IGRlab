@@ -12,7 +12,7 @@
 #include "sim/state/state_views.hpp"
 #include "sim/io/vis_helpers.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Common state/pressure bundle for Euler examples.
@@ -44,4 +44,4 @@ struct EulerStateBundle
   }
 };
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

@@ -11,7 +11,7 @@
 
 #include "mfem.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /**
@@ -30,5 +30,5 @@ inline std::unique_ptr<mfem::VectorCoefficient> MakeVectorFunctionIC(Args&&... a
       std::forward<Args>(args)...);
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim
 

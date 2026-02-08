@@ -10,7 +10,7 @@
 #include "numerics/riemann/dgsem_surface_flux.hpp"
 #include "sim/config/case_config.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 template <typename NumericalFlux>
@@ -72,4 +72,4 @@ inline void ConfigureDGSEMSurfaceFlux<mfem::DGSEMSurfaceFlux>(
   flux.SetGamma(gamma);
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

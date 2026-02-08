@@ -65,7 +65,7 @@ struct SedovOptions {};
 } // namespace
 
 int main(int argc, char *argv[]) {
-  dg_igr_examples::CaseSpec<SedovOptions, mfem::DGSEMSurfaceFlux> spec;
+  dg_sim::CaseSpec<SedovOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "sedov_taylor_blast";
   spec.default_mesh_path = mfem::SedovTaylorDefaultMeshPath();
   spec.case_file = __FILE__;
@@ -83,13 +83,13 @@ int main(int argc, char *argv[]) {
   // Custom callbacks example (optional):
   // spec.make_callbacks = [&](const auto&, auto&) {
   //   auto cb =
-  //       dg_igr_examples::MakeDefaultTimeLoopCallbacks(spec.callback_defaults);
+  //       dg_sim::MakeDefaultTimeLoopCallbacks(spec.callback_defaults);
   //   // Example: extend analysis with custom diagnostics.
-  //   // cb.on_analysis = [&](const dg_igr_examples::AnalysisInfo& info) { ...
+  //   // cb.on_analysis = [&](const dg_sim::AnalysisInfo& info) { ...
   //   }; return cb;
   // };
 
-  spec.configure_case = [](dg_igr_examples::CaseConfig &cfg) {
+  spec.configure_case = [](dg_sim::CaseConfig &cfg) {
     cfg.defaults.t_final = 4.0;
     cfg.rk3_config.limit_initial = false;
     cfg.limiter_pipeline.zhang_shu = true;
@@ -97,7 +97,7 @@ int main(int argc, char *argv[]) {
   };
 
   spec.make_ic = [](const SedovOptions &,
-                    const dg_igr_examples::ExampleContext &ctx, double gamma) {
+                    const dg_sim::ExampleContext &ctx, double gamma) {
     const int base_cells = 32;
     const int total_ref =
         ctx.run_cfg.opts.ser_ref_levels + ctx.run_cfg.opts.par_ref_levels;
@@ -108,18 +108,18 @@ int main(int argc, char *argv[]) {
     return std::make_unique<mfem::VectorFunctionCoefficient>(4, ic_fun);
   };
 
-  spec.build_markers = [](dg_igr_examples::ExampleContext &ctx) {
-    return dg_igr_examples::BuildBoundaryMarkers(
-        ctx.Mesh(), {{dg_igr_examples::BoundaryRole::Slip, {1, 2, 3, 4}}});
+  spec.build_markers = [](dg_sim::ExampleContext &ctx) {
+    return dg_sim::BuildBoundaryMarkers(
+        ctx.Mesh(), {{dg_sim::BoundaryRole::Slip, {1, 2, 3, 4}}});
   };
 
   spec.apply_bc = [](const SedovOptions &,
-                     const dg_igr_examples::ExampleContext &, auto &bc,
+                     const dg_sim::ExampleContext &, auto &bc,
                      const auto &markers) { bc.AddSlipWall(markers); };
 
   spec.postprocess = [](const SedovOptions &,
-                        const dg_igr_examples::ExampleContext &,
-                        const dg_igr_examples::EulerStateBundle &state,
+                        const dg_sim::ExampleContext &,
+                        const dg_sim::EulerStateBundle &state,
                         mfem::VectorCoefficient &ic) {
     const mfem::real_t error = state.sol.ComputeLpError(2, ic);
     if (mfem::Mpi::Root()) {
@@ -128,5 +128,5 @@ int main(int argc, char *argv[]) {
     return 0;
   };
 
-  return dg_igr_examples::Solver::solve(spec, argc, argv);
+  return dg_sim::Solver::solve(spec, argc, argv);
 }

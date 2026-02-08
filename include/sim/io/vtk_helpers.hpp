@@ -14,7 +14,7 @@
 
 #include "sim/config/case_config.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Default VTK output directory for a case (prefix_path/case_name).
@@ -52,4 +52,4 @@ inline mfem::io::VTKOutputConfig MakeCaseVTKConfig(const CaseConfig& case_cfg)
   return cfg;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

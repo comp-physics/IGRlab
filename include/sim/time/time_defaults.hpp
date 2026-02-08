@@ -23,7 +23,7 @@
 #include "sim/time/time_callbacks.hpp"
 #include "sim/time/time_loop.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Optional IO wiring for the shared time loop.
@@ -439,4 +439,4 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
   return hooks;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

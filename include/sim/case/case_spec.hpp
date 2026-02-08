@@ -18,7 +18,7 @@
 #include "sim/wiring/bc_wiring.hpp"
 #include "sim/time/time_callbacks.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Visualization configuration for GLVis/H1 diagnostics.
@@ -93,4 +93,4 @@ struct RunSpec
   const mfem::VectorCoefficient* ic = nullptr;
 };
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

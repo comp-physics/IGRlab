@@ -14,7 +14,7 @@
 
 #include "sim/state/state_views.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Field handles for common Euler visualization/export helpers.
@@ -265,4 +265,4 @@ inline void UpdateEulerGLVis(EulerVisWindows& windows,
               fields.state->momentum_x, t, "momentum_x");
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

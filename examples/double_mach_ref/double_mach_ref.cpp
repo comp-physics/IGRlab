@@ -84,7 +84,7 @@ struct DoubleMachOptions
 
 int main(int argc, char *argv[])
 {
-  dg_igr_examples::CaseSpec<DoubleMachOptions, mfem::DGSEMSurfaceFlux> spec;
+  dg_sim::CaseSpec<DoubleMachOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "double_mach_ref";
   spec.default_mesh_path = mfem::DoubleMachRefDefaultMeshPath();
   spec.case_file = __FILE__;
@@ -94,7 +94,7 @@ int main(int argc, char *argv[])
   spec.vis.h1_diagnostics = true;
   spec.vis.precision = 8;
 
-  spec.configure_case = [](dg_igr_examples::CaseConfig& cfg)
+  spec.configure_case = [](dg_sim::CaseConfig& cfg)
   {
     cfg.defaults.t_final = 4.0;
     cfg.limiter_pipeline.venkat_mode = mfem::VenkatLimiterMode::kXY;
@@ -107,7 +107,7 @@ int main(int argc, char *argv[])
   };
 
   spec.make_ic = [](const DoubleMachOptions&,
-                    const dg_igr_examples::ExampleContext& ctx,
+                    const dg_sim::ExampleContext& ctx,
                     double gamma)
   {
     const int base_cells_x = 32;
@@ -120,19 +120,19 @@ int main(int argc, char *argv[])
     return std::make_unique<mfem::VectorFunctionCoefficient>(ic_fun);
   };
 
-  spec.build_markers = [](dg_igr_examples::ExampleContext& ctx)
+  spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
-    return dg_igr_examples::BuildBoundaryMarkers(
+    return dg_sim::BuildBoundaryMarkers(
         ctx.Mesh(),
-        {{dg_igr_examples::BoundaryRole::BottomInlet, {1}},
-         {dg_igr_examples::BoundaryRole::BottomWall, {5}},
-         {dg_igr_examples::BoundaryRole::Outlet, {2}},
-         {dg_igr_examples::BoundaryRole::Top, {3}},
-         {dg_igr_examples::BoundaryRole::Inlet, {4}}});
+        {{dg_sim::BoundaryRole::BottomInlet, {1}},
+         {dg_sim::BoundaryRole::BottomWall, {5}},
+         {dg_sim::BoundaryRole::Outlet, {2}},
+         {dg_sim::BoundaryRole::Top, {3}},
+         {dg_sim::BoundaryRole::Inlet, {4}}});
   };
 
   spec.apply_bc = [](const DoubleMachOptions& opts,
-                     const dg_igr_examples::ExampleContext&,
+                     const dg_sim::ExampleContext&,
                      auto& bc,
                      const auto& markers)
   {
@@ -140,15 +140,15 @@ int main(int argc, char *argv[])
     const double M = std::max(1.0e-12, std::abs(opts.inflow.vx));
     mfem::Vector Ub = mfem::DoubleMachPostShockState(gamma, /*M=*/M);
     bc.AddSupersonicInletFromBuilder(markers, [&]() { return Ub; });
-    bc.AddSupersonicOutlet(markers, dg_igr_examples::BoundaryRole::BottomInlet);
+    bc.AddSupersonicOutlet(markers, dg_sim::BoundaryRole::BottomInlet);
     bc.AddSupersonicOutlet(markers);
-    bc.AddSupersonicOutlet(markers, dg_igr_examples::BoundaryRole::Top);
-    bc.AddSlipWall(markers, dg_igr_examples::BoundaryRole::BottomWall);
+    bc.AddSupersonicOutlet(markers, dg_sim::BoundaryRole::Top);
+    bc.AddSlipWall(markers, dg_sim::BoundaryRole::BottomWall);
   };
 
   spec.postprocess = [](const DoubleMachOptions&,
-                        const dg_igr_examples::ExampleContext&,
-                        const dg_igr_examples::EulerStateBundle& state,
+                        const dg_sim::ExampleContext&,
+                        const dg_sim::EulerStateBundle& state,
                         mfem::VectorCoefficient& ic)
   {
     const mfem::real_t error = state.sol.ComputeLpError(2, ic);
@@ -159,5 +159,5 @@ int main(int argc, char *argv[])
     return 0;
   };
 
-  return dg_igr_examples::Solver::solve(spec, argc, argv);
+  return dg_sim::Solver::solve(spec, argc, argv);
 }
