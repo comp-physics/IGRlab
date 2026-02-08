@@ -46,7 +46,7 @@ public:
                                FaceSide side,
                                Vector &fluxDotN) const override;
 
-  /// Side-explicit average normal flux path for non-breaking migration.
+  /// Side-explicit average normal flux path with exact line-average sigma term.
   real_t ComputeAvgFluxDotNAtSide(const Vector &state1, const Vector &state2,
                                   const Vector &normal,
                                   FaceElementTransformations &Tr,

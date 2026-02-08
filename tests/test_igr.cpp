@@ -47,6 +47,45 @@ private:
   double split_x_ = 0.5;
 };
 
+class LinearAverageFlux final : public mfem::FluxFunction
+{
+public:
+  LinearAverageFlux(int dim, const mfem::Vector &dir)
+    : mfem::FluxFunction(dim + 2, dim), dir_(dir)
+  {
+    MFEM_VERIFY(dir_.Size() == dim,
+                "LinearAverageFlux direction dimension mismatch.");
+  }
+
+  mfem::real_t ComputeFlux(const mfem::Vector &state,
+                           mfem::ElementTransformation &,
+                           mfem::DenseMatrix &flux) const override
+  {
+    for (int d = 0; d < dim; ++d)
+    {
+      for (int i = 0; i < num_equations; ++i)
+      {
+        flux(i, d) = dir_(d) * state(i);
+      }
+    }
+    return dir_.Norml2();
+  }
+
+  mfem::real_t ComputeAvgFlux(const mfem::Vector &state1,
+                              const mfem::Vector &state2,
+                              mfem::ElementTransformation &Tr,
+                              mfem::DenseMatrix &flux) const override
+  {
+    mfem::Vector avg(state1);
+    avg += state2;
+    avg *= 0.5;
+    return ComputeFlux(avg, Tr, flux);
+  }
+
+private:
+  mfem::Vector dir_;
+};
+
 double DotMomentumNormal(const mfem::Vector& cons, const mfem::Vector& normal, int dim)
 {
   double un = 0.0;
@@ -55,6 +94,39 @@ double DotMomentumNormal(const mfem::Vector& cons, const mfem::Vector& normal, i
     un += cons(1 + d) * normal(d);
   }
   return un;
+}
+
+double ExactAvgUnOverRho(const mfem::Vector& state1,
+                         const mfem::Vector& state2,
+                         const mfem::Vector& normal,
+                         int dim)
+{
+  const double rho1 = state1(0);
+  const double rho2 = state2(0);
+  MFEM_VERIFY(rho1 > 0.0 && rho2 > 0.0,
+              "ExactAvgUnOverRho requires positive density endpoints.");
+  const double drho = rho2 - rho1;
+
+  double mn1 = 0.0;
+  double mn2 = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    mn1 += state1(1 + d) * normal(d);
+    mn2 += state2(1 + d) * normal(d);
+  }
+  const double dmn = mn2 - mn1;
+
+  const double eps = 1.0e-14 * std::max(1.0, std::abs(rho1));
+  if (std::abs(drho) <= eps)
+  {
+    return (mn1 + 0.5 * dmn) / rho1;
+  }
+
+  const double inv_drho = 1.0 / drho;
+  const double inv_drho2 = inv_drho * inv_drho;
+  const double log_ratio = std::log1p(drho / rho1);
+  return dmn * inv_drho +
+         (mn1 * drho - dmn * rho1) * inv_drho2 * log_ratio;
 }
 
 void AddSigmaDotNTerms(const mfem::Vector& state,
@@ -153,6 +225,44 @@ int RunIGRTests(TestContext& ctx)
                 "FluxWithIGR adds sigma*n_y to momentum_y");
   ctx.CheckNear(igr_fn(3) - base_fn(3), sigma_value * un, tol,
                 "FluxWithIGR adds sigma*(u·n) to energy flux");
+
+  // --- Exact averaged sigma correction for side-explicit average flux path ---
+  {
+    mfem::Vector dir(dim);
+    dir(0) = 1.0;
+    dir(1) = -0.25;
+    LinearAverageFlux linear_base(dim, dir);
+    mfem::FluxWithIGR igr_avg(linear_base);
+    igr_avg.SetSigmaField(&sigma);
+
+    const mfem::Vector state_avg_1 = EulerConsFromPrim2D(
+        /*rho=*/0.9, /*u=*/1.8, /*v=*/-0.3, /*p=*/1.0, gamma);
+    const mfem::Vector state_avg_2 = EulerConsFromPrim2D(
+        /*rho=*/1.4, /*u=*/-0.2, /*v=*/0.6, /*p=*/0.9, gamma);
+
+    mfem::Vector base_avg_fn(dim + 2);
+    mfem::Vector igr_avg_fn(dim + 2);
+    linear_base.ComputeAvgFluxDotN(state_avg_1, state_avg_2, normal, Tr_face,
+                                    base_avg_fn);
+    igr_avg.ComputeAvgFluxDotNAtSide(state_avg_1, state_avg_2, normal, Tr_face,
+                                     mfem::FaceSide::Left, igr_avg_fn);
+
+    mfem::Vector expected_avg(base_avg_fn);
+    for (int d = 0; d < dim; ++d)
+    {
+      expected_avg(1 + d) += sigma_value * normal(d);
+    }
+    expected_avg(1 + dim) += sigma_value *
+                             ExactAvgUnOverRho(state_avg_1, state_avg_2,
+                                               normal, dim);
+
+    for (int i = 0; i < expected_avg.Size(); ++i)
+    {
+      ctx.CheckNear(igr_avg_fn(i), expected_avg(i), 5.0e-12,
+                    "FluxWithIGR exact averaged sigma correction, component " +
+                        std::to_string(i));
+    }
+  }
 
   // --- Interior-face side selection: sigma should come from the matching side ---
   {

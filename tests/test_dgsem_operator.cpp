@@ -621,6 +621,32 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     }
     ctx.Check(same_rule,
               "Boundary integrator uses DGSEM LGL face rule");
+
+    // Updating the face rule after BC registration must retarget existing
+    // boundary integrators to the new rule (no stale pointer to prior rule).
+    const mfem::IntegrationRule& lgl_rule_updated = mfem::dgsem::GetLGLFaceRule(1);
+    oper2.SetFaceIntegrationRule(lgl_rule_updated);
+    const mfem::IntegrationRule* bdr_rule_updated = bdr_ptr->GetIntegrationRule();
+    bool same_updated_rule = (bdr_rule_updated != nullptr) &&
+                             (bdr_rule_updated->GetNPoints() ==
+                              lgl_rule_updated.GetNPoints());
+    if (same_updated_rule)
+    {
+      for (int q = 0; q < lgl_rule_updated.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& a = bdr_rule_updated->IntPoint(q);
+        const mfem::IntegrationPoint& b = lgl_rule_updated.IntPoint(q);
+        const double err = std::max(std::abs(a.x - b.x),
+                                    std::abs(a.weight - b.weight));
+        if (err > 1.0e-14)
+        {
+          same_updated_rule = false;
+          break;
+        }
+      }
+    }
+    ctx.Check(same_updated_rule,
+              "Boundary integrator tracks updated DGSEM face rule");
   }
 
   // Boundary-only constant inflow diagnostic (surface term alone).

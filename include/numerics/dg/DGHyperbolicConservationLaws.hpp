@@ -126,12 +126,7 @@ public:
    * Applies the rule to the interior-face integrator and caches it so boundary
    * integrators added later inherit the same rule.
    */
-   void SetFaceIntegrationRule(const IntegrationRule &ir)
-   {
-      face_int_rule_owned_ = std::make_unique<IntegrationRule>(ir);
-      face_int_rule_ = face_int_rule_owned_.get();
-      formIntegrator->SetIntegrationRule(*face_int_rule_);
-   }
+   void SetFaceIntegrationRule(const IntegrationRule &ir);
    
    /**
     * @brief Apply the operator: y = M⁻¹( -<F̂, [[v]]> + (F(u), ∇v) ).

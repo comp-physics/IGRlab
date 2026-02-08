@@ -295,6 +295,18 @@ void DGHyperbolicConservationLaws::Update()
    if (!weakdiv.empty()) { ComputeWeakDivergence(); }
 }
 
+void DGHyperbolicConservationLaws::SetFaceIntegrationRule(
+    const IntegrationRule &ir)
+{
+   face_int_rule_owned_ = std::make_unique<IntegrationRule>(ir);
+   face_int_rule_ = face_int_rule_owned_.get();
+   formIntegrator->SetIntegrationRule(*face_int_rule_);
+   for (auto &bdr_int : ext_bdr_int_)
+   {
+      bdr_int->SetIntegrationRule(*face_int_rule_);
+   }
+}
+
 // -----------------------------------------------------------------------------
 // Add boundary face integrator with attribute marker (keeps objects alive)
 // -----------------------------------------------------------------------------

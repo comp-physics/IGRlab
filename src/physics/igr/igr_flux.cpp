@@ -1,9 +1,48 @@
 #include "physics/igr/igr_flux.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace mfem
 {
+
+namespace
+{
+
+double AverageUnOverRhoAlongSegment(const Vector &U1,
+                                    const Vector &U2,
+                                    const Vector &n,
+                                    int dim)
+{
+  const double rho1 = U1(0);
+  const double rho2 = U2(0);
+  MFEM_VERIFY(rho1 > 0.0 && rho2 > 0.0,
+              "FluxWithIGR::ComputeAvgFluxDotNAtSide requires positive "
+              "density endpoints for exact averaged sigma correction.");
+
+  double mn1 = 0.0;
+  double mn2 = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    mn1 += U1(1 + d) * n(d);
+    mn2 += U2(1 + d) * n(d);
+  }
+  const double dmn = mn2 - mn1;
+  const double drho = rho2 - rho1;
+  const double eps = 1.0e-14 * std::max(1.0, std::abs(rho1));
+  if (std::abs(drho) <= eps)
+  {
+    return (mn1 + 0.5 * dmn) / rho1;
+  }
+
+  const double inv_drho = 1.0 / drho;
+  const double inv_drho2 = inv_drho * inv_drho;
+  const double log_ratio = std::log1p(drho / rho1);
+  return dmn * inv_drho +
+         (mn1 * drho - dmn * rho1) * inv_drho2 * log_ratio;
+}
+
+} // namespace
 
 real_t FluxWithIGR::ComputeFlux(const Vector &U, ElementTransformation &Tr,
                                 DenseMatrix &F) const
@@ -51,10 +90,11 @@ real_t FluxWithIGR::ComputeAvgFluxDotNAtSide(const Vector &U1,
   if (!sigma_) { return mcs; }
 
   const double sigma_face = GetSigmaAtSide(Tr, side);
-  Vector Uavg(U1);
-  Uavg += U2;
-  Uavg *= 0.5;
-  AddDotNSigmaTerms(Uavg, n, sigma_face, Fn);
+  for (int d = 0; d < dim; ++d)
+  {
+    Fn(1 + d) += sigma_face * n(d);
+  }
+  Fn(1 + dim) += sigma_face * AverageUnOverRhoAlongSegment(U1, U2, n, dim);
   return mcs;
 }
 
