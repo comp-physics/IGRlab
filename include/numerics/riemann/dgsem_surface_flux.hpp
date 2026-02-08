@@ -10,6 +10,7 @@
 
 #include "numerics/dgsem/dgsem_entropy_flux.hpp"
 #include "numerics/riemann/diffusive_rusanov.hpp"
+#include "numerics/riemann/face_side.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "physics/igr/igr_flux.hpp"
 
@@ -60,6 +61,7 @@ public:
 
 private:
   const FluxFunction &flux_fn_;
+  const FaceSideExplicitFlux *side_explicit_flux_ = nullptr;
   DGSEMSurfaceFluxType type_ = DGSEMSurfaceFluxType::Rusanov;
   dgsem::EntropyFluxType entropy_type_ = dgsem::EntropyFluxType::Ranocha;
   dgsem::EntropyJacobianMode entropy_jacobian_mode_ =

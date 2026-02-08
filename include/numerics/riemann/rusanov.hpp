@@ -47,6 +47,7 @@ public:
                    DenseMatrix &grad) const override;
 
 protected:
+  const FaceSideExplicitFlux *side_explicit_flux_ = nullptr;
 #ifndef MFEM_THREAD_SAFE
   mutable Vector fluxN1, fluxN2;
   mutable DenseMatrix JDotN;

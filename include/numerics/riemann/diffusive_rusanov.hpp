@@ -2,6 +2,7 @@
 
 #include <limits>
 #include "mfem.hpp"
+#include "numerics/riemann/face_side.hpp"
 
 /**
  * @file numerics/riemann/diffusive_rusanov.hpp
@@ -106,6 +107,8 @@ public:
                    DenseMatrix &grad) const override;
 
 private:
+  const FaceSideExplicitFlux *side_explicit_flux_ = nullptr;
+
   /// Compute inflated lambda_tilde (without |n| scaling) from speeds and states.
   real_t EffectiveLambda(real_t speed1, real_t speed2,
                          const Vector &state1, const Vector &state2) const;

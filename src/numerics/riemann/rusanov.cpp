@@ -9,7 +9,8 @@ namespace mfem
 {
 
 RusanovFluxWithSides::RusanovFluxWithSides(const FluxFunction &fluxFunction)
-  : NumericalFlux(fluxFunction)
+  : NumericalFlux(fluxFunction),
+    side_explicit_flux_(dynamic_cast<const FaceSideExplicitFlux*>(&fluxFunction))
 {
 #ifndef MFEM_THREAD_SAFE
   fluxN1.SetSize(fluxFunction.num_equations);
@@ -28,9 +29,9 @@ real_t RusanovFluxWithSides::Eval(const Vector &state1, const Vector &state2,
   real_t speed1, speed2;
 
   speed1 = riemann_detail::ComputeFluxDotNForSide(
-      fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
+      side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
   speed2 = riemann_detail::ComputeFluxDotNForSide(
-      fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
+      side_explicit_flux_, fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
 
   // NOTE: nor in general is not a unit normal
   const real_t maxE = std::max(speed1, speed2);
@@ -55,9 +56,9 @@ void RusanovFluxWithSides::Grad(int side, const Vector &state1, const Vector &st
   real_t speed1, speed2;
 
   speed1 = riemann_detail::ComputeFluxDotNForSide(
-      fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
+      side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
   speed2 = riemann_detail::ComputeFluxDotNForSide(
-      fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
+      side_explicit_flux_, fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
 
   const real_t maxE = std::max(speed1, speed2);
   const real_t scaledMaxE = maxE * nor.Norml2();
@@ -86,9 +87,10 @@ real_t RusanovFluxWithSides::Average(const Vector &state1, const Vector &state2,
   real_t speed1, speed2;
 
   speed1 = riemann_detail::ComputeFluxDotNForSide(
-      fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
+      side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
   speed2 = riemann_detail::ComputeAvgFluxDotNForSide(
-      fluxFunction, FaceSide::Right, state1, state2, nor, Tr, fluxN2);
+      side_explicit_flux_, fluxFunction, FaceSide::Right,
+      state1, state2, nor, Tr, fluxN2);
 
   const real_t maxE = std::max(speed1, speed2);
   const real_t scaledMaxE = maxE * nor.Norml2() * 0.5;
@@ -133,9 +135,10 @@ void RusanovFluxWithSides::AverageGrad(int side, const Vector &state1,
     real_t speed1 = 0.0, speed2 = 0.0;
 
     speed1 = riemann_detail::ComputeFluxDotNForSide(
-        fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
+        side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
     speed2 = riemann_detail::ComputeAvgFluxDotNForSide(
-        fluxFunction, FaceSide::Right, state1, state2, nor, Tr, fluxN2);
+        side_explicit_flux_, fluxFunction, FaceSide::Right,
+        state1, state2, nor, Tr, fluxN2);
 
     fluxFunction.ComputeFluxJacobianDotN(state1, nor, Tr, JDotN);
 
@@ -157,9 +160,10 @@ void RusanovFluxWithSides::AverageGrad(int side, const Vector &state1,
     real_t speed1 = 0.0, speed2 = 0.0;
 
     speed1 = riemann_detail::ComputeAvgFluxDotNForSide(
-        fluxFunction, FaceSide::Left, state1, state2, nor, Tr, fluxN1);
+        side_explicit_flux_, fluxFunction, FaceSide::Left,
+        state1, state2, nor, Tr, fluxN1);
     speed2 = riemann_detail::ComputeFluxDotNForSide(
-        fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
+        side_explicit_flux_, fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
 
     const real_t maxE = std::max(speed1, speed2);
     const real_t scaledMaxE = maxE * nor.Norml2() * 0.5;

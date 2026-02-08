@@ -8,7 +8,9 @@ namespace mfem
 {
 
 HLLCFlux::HLLCFlux(const FluxFunction &fluxFunction, real_t gamma_ratio)
-  : NumericalFlux(fluxFunction), gamma(gamma_ratio)
+  : NumericalFlux(fluxFunction),
+    side_explicit_flux_(dynamic_cast<const FaceSideExplicitFlux*>(&fluxFunction)),
+    gamma(gamma_ratio)
 {
 #ifndef MFEM_THREAD_SAFE
   fluxN1.SetSize(fluxFunction.num_equations);
@@ -108,12 +110,12 @@ real_t HLLCFlux::Eval(const Vector &state1, const Vector &state2,
   real_t SL = 0.0, Sstar = 0.0, SR = 0.0;
   HLLC_WaveSpeeds(WL, WR, SL, Sstar, SR);
 
-  // Fluxes on left and right. Side-aware scope keeps IGR sigma-side selection
-  // consistent with other numerical flux implementations.
+  // Fluxes on left and right; side-explicit calls preserve IGR sigma-side
+  // semantics while reusing the common helper.
   riemann_detail::ComputeFluxDotNForSide(
-      fluxFunction, FaceSide::Left, state1, nhat, Tr, fluxN1);
+      side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nhat, Tr, fluxN1);
   riemann_detail::ComputeFluxDotNForSide(
-      fluxFunction, FaceSide::Right, state2, nhat, Tr, fluxN2);
+      side_explicit_flux_, fluxFunction, FaceSide::Right, state2, nhat, Tr, fluxN2);
 
   Vector flux_hat(neq);
 
