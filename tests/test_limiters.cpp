@@ -16,6 +16,7 @@
 #include "mfem.hpp"
 #include "physics/euler/conversions.hpp"
 #include "physics/euler/eos.hpp"
+#include "utils/math/constants.hpp"
 #include "test_utils.hpp"
 
 namespace dg_igr_tests
@@ -28,7 +29,7 @@ constexpr int kNumEq = kDim + 2;
 constexpr int kNx = 3;
 constexpr int kNy = 3;
 constexpr double kGamma = 1.4;
-constexpr double kPi = 3.14159265358979323846;
+constexpr double kPi = dg_sim::math::kPi;
 constexpr double kBoundTol = 1.0e-2;
 
 double GlobalSum(double local)

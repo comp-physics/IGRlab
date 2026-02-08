@@ -8,6 +8,7 @@
 #include "numerics/riemann/rusanov.hpp"
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 #include "physics/bc/boundary_state.hpp"
+#include "utils/math/constants.hpp"
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
@@ -1109,7 +1110,7 @@ int RunDGSEMOperatorTests(TestContext& ctx)
         mfem::Vector x(kDim);
         Tr.Transform(ip, x);
 
-        constexpr double kPi = 3.14159265358979323846;
+        constexpr double kPi = dg_sim::math::kPi;
         const double sx = std::sin(2.0 * kPi * x(0));
         const double sy = std::sin(2.0 * kPi * x(1));
         const double rho = 1.0 + 0.1 * sx * sy;
