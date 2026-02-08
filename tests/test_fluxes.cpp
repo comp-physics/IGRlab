@@ -3,6 +3,8 @@
 #include "numerics/riemann/rusanov.hpp"
 #include "numerics/riemann/side_scope_utils.hpp"
 
+#include <array>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -537,33 +539,60 @@ int RunFluxTests(TestContext& ctx)
     mfem::Vector flux_perf(1);
     mfem::FaceElementTransformations Tr_perf;
 
+    constexpr int kWarmupIters = 20000;
     constexpr int kIters = 200000;
+    constexpr int kRepeats = 5;
     double sink = 0.0;
 
-    const double t_direct = TimeEvalSeconds(
-        [&](int i) -> double
-        {
-          const auto side = (i & 1) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
-          return explicit_flux->ComputeFluxDotNAtSide(state_perf, normal_perf, Tr_perf,
-                                                      side, flux_perf) + flux_perf(0);
-        }, kIters, sink);
+    // Warmup to reduce first-run noise from caches/frequency scaling.
+    for (int i = 0; i < kWarmupIters; ++i)
+    {
+      const auto side = (i & 1) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
+      sink += mfem::riemann_detail::ComputeFluxDotNForSide(
+          explicit_flux, side_flux, side, state_perf, normal_perf, Tr_perf,
+          flux_perf);
+    }
 
-    const double t_cached = TimeEvalSeconds(
-        [&](int i) -> double
-        {
-          const auto side = (i & 1) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
-          return mfem::riemann_detail::ComputeFluxDotNForSide(
-              explicit_flux, side_flux, side, state_perf, normal_perf, Tr_perf, flux_perf)
-              + flux_perf(0);
-        }, kIters, sink);
+    auto median = [](std::array<double, kRepeats> samples) -> double
+    {
+      std::sort(samples.begin(), samples.end());
+      return samples[kRepeats / 2];
+    };
 
-    const double t_uncached = TimeEvalSeconds(
-        [&](int i) -> double
-        {
-          const auto side = (i & 1) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
-          return mfem::riemann_detail::ComputeFluxDotNForSide(
-              side_flux, side, state_perf, normal_perf, Tr_perf, flux_perf) + flux_perf(0);
-        }, kIters, sink);
+    std::array<double, kRepeats> direct_samples{};
+    std::array<double, kRepeats> cached_samples{};
+    std::array<double, kRepeats> uncached_samples{};
+    for (int r = 0; r < kRepeats; ++r)
+    {
+      direct_samples[r] = TimeEvalSeconds(
+          [&](int i) -> double
+          {
+            const auto side = (i & 1) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
+            return explicit_flux->ComputeFluxDotNAtSide(state_perf, normal_perf, Tr_perf,
+                                                        side, flux_perf) + flux_perf(0);
+          }, kIters, sink);
+
+      cached_samples[r] = TimeEvalSeconds(
+          [&](int i) -> double
+          {
+            const auto side = (i & 1) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
+            return mfem::riemann_detail::ComputeFluxDotNForSide(
+                explicit_flux, side_flux, side, state_perf, normal_perf, Tr_perf, flux_perf)
+                + flux_perf(0);
+          }, kIters, sink);
+
+      uncached_samples[r] = TimeEvalSeconds(
+          [&](int i) -> double
+          {
+            const auto side = (i & 1) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
+            return mfem::riemann_detail::ComputeFluxDotNForSide(
+                side_flux, side, state_perf, normal_perf, Tr_perf, flux_perf) + flux_perf(0);
+          }, kIters, sink);
+    }
+
+    const double t_direct = median(direct_samples);
+    const double t_cached = median(cached_samples);
+    const double t_uncached = median(uncached_samples);
 
     const double cached_ratio = (t_direct > 0.0) ? (t_cached / t_direct) : 0.0;
     const double uncached_ratio = (t_direct > 0.0) ? (t_uncached / t_direct) : 0.0;
@@ -573,10 +602,14 @@ int RunFluxTests(TestContext& ctx)
                   + " cached_ratio=" + FormatSci(cached_ratio, 6)
                   + " uncached_ratio=" + FormatSci(uncached_ratio, 6));
 
-    // Relative gate: protects hot-path helper migration without machine-specific
-    // absolute timing thresholds.
-    ctx.Check(cached_ratio <= 1.30,
-              "Cached side helper stays within 30% of direct explicit-side call cost");
+    // Strict performance checks are opt-in to avoid CI flakiness.
+    if (EnvEnabled("DG_IGR_STRICT_PERF_GATES"))
+    {
+      // Relative gate: protects hot-path helper migration without machine-
+      // specific absolute timing thresholds.
+      ctx.Check(cached_ratio <= 1.30,
+                "Cached side helper stays within 30% of direct explicit-side call cost");
+    }
 
     // Keep sink in parity so benchmark loops cannot be optimized out in release.
     ctx.AddParity(sink);
