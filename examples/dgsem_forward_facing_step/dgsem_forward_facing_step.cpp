@@ -74,7 +74,7 @@ int main(int argc, char *argv[])
     Uin(2) = 1.4 * opts.inflow.vy;
     Uin(3) = 8.8;
     auto ic_fun = mfem::EulerInitialCondition(Uin);
-    return std::make_unique<mfem::VectorFunctionCoefficient>(ic_fun);
+    return dg_igr_examples::MakeVectorFunctionIC(ic_fun);
   };
 
   spec.build_markers = [](dg_igr_examples::ExampleContext& ctx)

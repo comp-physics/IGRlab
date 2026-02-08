@@ -298,21 +298,24 @@ void DGHyperbolicConservationLaws::Update()
 // -----------------------------------------------------------------------------
 // Add boundary face integrator with attribute marker (keeps objects alive)
 // -----------------------------------------------------------------------------
-void DGHyperbolicConservationLaws::AddBdrFaceIntegrator(NonlinearFormIntegrator *nfi,
+void DGHyperbolicConservationLaws::AddBdrFaceIntegrator(
+    std::unique_ptr<NonlinearFormIntegrator> nfi,
                                                         const Array<int> &bdr_marker)
 {
+   MFEM_VERIFY(nfi != nullptr, "AddBdrFaceIntegrator received a null integrator.");
    if (face_int_rule_)
    {
       nfi->SetIntegrationRule(*face_int_rule_);
    }
    // 1) Own the integrator so NonlinearForm can UseExternalIntegrators()
-   ext_bdr_int_.emplace_back(nfi);
+   NonlinearFormIntegrator *nfi_raw = nfi.get();
+   ext_bdr_int_.emplace_back(std::move(nfi));
 
    // 2) Make a heap copy of the marker so its address is stable
    ext_bdr_markers_.emplace_back(std::make_unique<Array<int>>(bdr_marker));
 
    // 3) Register with NonlinearForm using the *referenced* stable Array<int>
-   nonlinearForm->AddBdrFaceIntegrator(nfi, *ext_bdr_markers_.back());
+   nonlinearForm->AddBdrFaceIntegrator(nfi_raw, *ext_bdr_markers_.back());
 }
 
 } // namespace mfem

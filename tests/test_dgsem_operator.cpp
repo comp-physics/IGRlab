@@ -587,10 +587,11 @@ int RunDGSEMOperatorTests(TestContext& ctx)
 
     auto inlet2 = std::make_unique<mfem::SupersonicInletState>(
         EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma));
-    auto* bdr = new mfem::BdrHyperbolicFluxIntegrator(num_flux2, std::move(inlet2),
-                                                      int_order_offset2);
-    oper2.AddBdrFaceIntegrator(bdr, bdr_marker2);
-    const mfem::IntegrationRule* bdr_rule = bdr->GetIntegrationRule();
+    auto bdr = std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+        num_flux2, std::move(inlet2), int_order_offset2);
+    mfem::BdrHyperbolicFluxIntegrator* bdr_ptr = bdr.get();
+    oper2.AddBdrFaceIntegrator(std::move(bdr), bdr_marker2);
+    const mfem::IntegrationRule* bdr_rule = bdr_ptr->GetIntegrationRule();
     bool same_rule = (bdr_rule != nullptr) &&
                      (bdr_rule->GetNPoints() == lgl_rule.GetNPoints());
     double rule_err_max = 0.0;

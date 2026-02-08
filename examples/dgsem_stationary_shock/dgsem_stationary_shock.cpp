@@ -25,8 +25,8 @@ int main(int argc, char *argv[])
   spec.default_mesh_path = "stationary_shock.msh";
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
-  spec.use_igr = false;
-  spec.need_sigma = false;
+  spec.use_igr = true;
+  spec.need_sigma = true;
   spec.need_h1 = false;
   spec.vis.h1_diagnostics = true;
   spec.vis.precision = 8;
@@ -36,9 +36,10 @@ int main(int argc, char *argv[])
   spec.configure_case = [](dg_igr_examples::CaseConfig& cfg)
   {
     cfg.defaults.t_final = 6.0;
-    cfg.defaults.vtk_save = false;
+    cfg.defaults.vtk_save = true;
     cfg.defaults.par_ref_levels = 0;
     cfg.defaults.dgsem_volume_flux = "ranocha";
+    cfg.defaults.dgsem_volume_dissipation = "llf";
     cfg.defaults.dgsem_surface_flux = "rusanov";
     cfg.rk3_config.limit_initial = false;
   };
@@ -57,7 +58,7 @@ int main(int argc, char *argv[])
     const int my = base_cells << total_ref;
     auto ic_fun = mfem::GetShockVortexInoueHattoriInit(
         gamma, mx, my, Ms, Mv, shock_smoothing);
-    return std::make_unique<mfem::VectorFunctionCoefficient>(4, ic_fun);
+    return dg_igr_examples::MakeVectorFunctionIC(4, ic_fun);
   };
 
   spec.build_markers = [](dg_igr_examples::ExampleContext& ctx)

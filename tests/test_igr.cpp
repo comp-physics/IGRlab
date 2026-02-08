@@ -1,3 +1,5 @@
+#include "physics/euler/conversions.hpp"
+#include "physics/igr/IGR.hpp"
 #include "physics/igr/igr_flux.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "numerics/riemann/side_scope_utils.hpp"
@@ -330,6 +332,72 @@ int RunIGRTests(TestContext& ctx)
                     "Explicit-side speed remains deterministic, iter=" +
                         std::to_string(iter));
     }
+  }
+
+  // --- IGR solver instance isolation: per-instance scratch/config must not alias ---
+  {
+    constexpr int igr_dim = 2;
+    constexpr int igr_num_eq = igr_dim + 2;
+
+    mfem::Mesh mesh_iso = mfem::Mesh::MakeCartesian2D(
+        /*nx=*/2, /*ny=*/2, mfem::Element::QUADRILATERAL,
+        /*generate_edges=*/true, /*sx=*/1.0, /*sy=*/1.0);
+    mfem::ParMesh pmesh_iso(MPI_COMM_SELF, mesh_iso);
+
+    mfem::DG_FECollection sigma_fec(/*order=*/1, igr_dim);
+    mfem::DG_FECollection state_fec(/*order=*/1, igr_dim);
+    mfem::ParFiniteElementSpace sigma_fes(&pmesh_iso, &sigma_fec, /*vdim=*/1);
+    mfem::ParFiniteElementSpace state_fes(&pmesh_iso, &state_fec, igr_num_eq,
+                                          mfem::Ordering::byNODES);
+
+    mfem::ParGridFunction U(&state_fes);
+    mfem::VectorFunctionCoefficient U_coeff(
+        igr_num_eq,
+        [&](const mfem::Vector& x, mfem::Vector& cons)
+        {
+          mfem::Vector prim(igr_num_eq);
+          prim(0) = 1.0 + 0.1 * x(0);               // rho
+          prim(1) = 1.5 + 0.2 * x(1);               // u
+          prim(2) = -0.25 + 0.1 * x(0);             // v
+          prim(1 + igr_dim) = 1.0 + 0.05 * x(1);    // p
+          cons.SetSize(igr_num_eq);
+          mfem::EulerPrimToConservative(prim, igr_dim, gamma, cons);
+        });
+    U.ProjectCoefficient(U_coeff);
+    U.ExchangeFaceNbrData();
+
+    dg_igr::IGRSolver solver_a(sigma_fes, state_fes, igr_dim, igr_num_eq, /*alpha=*/0.05);
+    dg_igr::IGRSolver solver_b(sigma_fes, state_fes, igr_dim, igr_num_eq, /*alpha=*/0.35);
+    solver_a.SetRhoFloor(1.0e-12);
+    solver_b.SetRhoFloor(5.0e-2);
+    solver_a.SetLinearSolveParams(/*rtol=*/1.0e-10, /*atol=*/1.0e-14, /*max_it=*/200, /*print=*/0);
+    solver_b.SetLinearSolveParams(/*rtol=*/1.0e-10, /*atol=*/1.0e-14, /*max_it=*/200, /*print=*/0);
+
+    solver_a.UpdateFromState(U, /*warm_start=*/false);
+    mfem::Vector sigma_a1(solver_a.GetSigma().Size());
+    sigma_a1 = solver_a.GetSigma();
+
+    solver_b.UpdateFromState(U, /*warm_start=*/false);
+    mfem::Vector sigma_b(solver_b.GetSigma().Size());
+    sigma_b = solver_b.GetSigma();
+
+    solver_a.UpdateFromState(U, /*warm_start=*/false);
+    mfem::Vector sigma_a2(solver_a.GetSigma().Size());
+    sigma_a2 = solver_a.GetSigma();
+
+    mfem::Vector delta_repeat(sigma_a1);
+    delta_repeat -= sigma_a2;
+    const double repeat_err = GlobalL2Norm(delta_repeat);
+
+    mfem::Vector delta_cfg(sigma_a1);
+    delta_cfg -= sigma_b;
+    const double cfg_diff = GlobalL2Norm(delta_cfg);
+
+    ctx.AddParity(repeat_err + cfg_diff);
+    ctx.Check(repeat_err < 1.0e-11,
+              "IGRSolver instance state is isolated across multiple solver objects");
+    ctx.Check(cfg_diff > 1.0e-8,
+              "Different IGRSolver configs produce distinct sigma fields");
   }
 
   return ctx.failures;

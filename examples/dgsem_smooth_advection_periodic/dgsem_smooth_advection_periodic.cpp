@@ -95,7 +95,7 @@ int main(int argc, char* argv[])
       mfem::EulerPrimToConservative(prim, /*dim=*/2, gamma, U);
     };
 
-    return std::make_unique<mfem::VectorFunctionCoefficient>(4, ic_fun);
+    return dg_igr_examples::MakeVectorFunctionIC(4, ic_fun);
   };
 
   spec.build_markers = [](dg_igr_examples::ExampleContext&)

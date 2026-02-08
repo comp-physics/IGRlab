@@ -53,7 +53,7 @@ int main(int argc, char *argv[]) {
     const int mx = base_cells;
     const int my = base_cells;
     auto ic_fun = mfem::GetSedovTaylorBlastInit(gamma, 1.0, mx, my);
-    return std::make_unique<mfem::VectorFunctionCoefficient>(4, ic_fun);
+    return dg_igr_examples::MakeVectorFunctionIC(4, ic_fun);
   };
 
   spec.build_markers = [](dg_igr_examples::ExampleContext &ctx) {

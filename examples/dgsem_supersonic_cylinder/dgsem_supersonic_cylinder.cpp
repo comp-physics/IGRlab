@@ -34,8 +34,8 @@ int main(int argc, char *argv[]) {
   spec.default_mesh_path = mfem::SupersonicCylinderDefaultMeshPath();
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
-  spec.use_igr = true;
-  spec.need_sigma = true;
+  spec.use_igr = false;
+  spec.need_sigma = false;
   spec.need_h1 = false;
   spec.vis.precision = 8;
   spec.dg_backend_default = dg_igr_examples::DGBackend::DGSEM;
@@ -65,7 +65,7 @@ int main(int argc, char *argv[]) {
     Uin(3) = 8.8;
 
     auto ic_fun = mfem::EulerInitialCondition(Uin);
-    return std::make_unique<mfem::VectorFunctionCoefficient>(ic_fun);
+    return dg_igr_examples::MakeVectorFunctionIC(ic_fun);
   };
 
   spec.build_markers = [](dg_igr_examples::ExampleContext &ctx) {

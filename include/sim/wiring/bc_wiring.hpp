@@ -7,6 +7,7 @@
 
 #include <initializer_list>
 #include <map>
+#include <memory>
 
 #include "mfem.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
@@ -84,7 +85,7 @@ inline void AddSupersonicInlet(mfem::DGHyperbolicConservationLaws& op,
                                const mfem::Array<int>& marker)
 {
   op.AddBdrFaceIntegrator(
-      new mfem::BdrHyperbolicFluxIntegrator(
+      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
           numerical_flux,
           std::make_unique<mfem::SupersonicInletState>(inlet_state),
           int_order_offset),
@@ -109,7 +110,7 @@ inline void AddSupersonicOutlet(mfem::DGHyperbolicConservationLaws& op,
                                 const mfem::Array<int>& marker)
 {
   op.AddBdrFaceIntegrator(
-      new mfem::BdrHyperbolicFluxIntegrator(
+      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
           numerical_flux,
           std::make_unique<mfem::SupersonicOutletState>(),
           int_order_offset),
@@ -123,7 +124,7 @@ inline void AddSlipWall(mfem::DGHyperbolicConservationLaws& op,
                         const mfem::Array<int>& marker)
 {
   op.AddBdrFaceIntegrator(
-      new mfem::BdrHyperbolicFluxIntegrator(
+      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
           numerical_flux,
           std::make_unique<mfem::SlipWallState>(dim),
           int_order_offset),

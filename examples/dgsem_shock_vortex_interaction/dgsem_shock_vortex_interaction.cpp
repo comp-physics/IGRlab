@@ -53,7 +53,7 @@ int main(int argc, char *argv[])
     const int my = base_cells << total_ref;
     auto ic_fun = mfem::GetShockVortexInoueHattoriInit(
         gamma, mx, my, Ms, Mv, shock_smoothing);
-    return std::make_unique<mfem::VectorFunctionCoefficient>(4, ic_fun);
+    return dg_igr_examples::MakeVectorFunctionIC(4, ic_fun);
   };
 
   spec.build_markers = [](dg_igr_examples::ExampleContext& ctx)

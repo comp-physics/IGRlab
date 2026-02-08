@@ -25,4 +25,5 @@
 #include "sim/wiring/bc_wiring.hpp"
 #include "sim/wiring/dg_operator.hpp"
 #include "sim/wiring/flux_bundle.hpp"
+#include "sim/wiring/ic_wiring.hpp"
 #include "sim/wiring/igr_physics.hpp"
