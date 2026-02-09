@@ -17,6 +17,8 @@
 namespace dg_sim
 {
 
+struct H1Diagnostics;
+
 /// @brief Field handles for common Euler visualization/export helpers.
 struct EulerFieldList
 {
@@ -24,6 +26,7 @@ struct EulerFieldList
   EulerPressureView* pressure = nullptr;
   EulerVelocityView* velocity = nullptr;
   dg_igr::IGRSolver* igr = nullptr;
+  H1Diagnostics* h1_diag = nullptr;
 };
 
 /// @brief GLVis windows for common Euler fields.
@@ -163,6 +166,13 @@ inline mfem::io::EulerVTKFields MakeEulerVTKFields(const EulerFieldList& fields)
   {
     out.pressure = &fields.pressure->pressure;
   }
+  if (fields.h1_diag)
+  {
+    out.velocity_h1 = &fields.h1_diag->u_h1;
+    out.speed_h1 = &fields.h1_diag->g_umag;
+    out.div_h1 = &fields.h1_diag->g_div;
+    out.grad_frob_h1 = &fields.h1_diag->g_gfrob;
+  }
   return out;
 }
 
@@ -224,6 +234,10 @@ inline void UpdateEulerOutputFields(const EulerFieldList& fields,
   if (fields.velocity)
   {
     fields.velocity->Update();
+  }
+  if (fields.h1_diag)
+  {
+    fields.h1_diag->Update();
   }
 }
 

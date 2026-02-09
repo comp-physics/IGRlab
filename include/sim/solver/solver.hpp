@@ -319,10 +319,11 @@ struct Solver
         : MakeDefaultTimeLoopCallbacks(spec.callback_defaults);
 
     std::unique_ptr<H1Diagnostics> h1_diag;
-    if (spec.vis.h1_diagnostics && run_cfg.opts.visualization)
+    if (spec.vis.h1_diagnostics)
     {
       h1_diag = std::make_unique<H1Diagnostics>(
           *ctx.spaces.h1_vfes, state_bundle.sol, ctx.dim, rho_floor);
+      state_bundle.field_list.h1_diag = h1_diag.get();
     }
 
     if (spec.after_init)
