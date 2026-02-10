@@ -72,8 +72,8 @@ int main(int argc, char *argv[]) {
   spec.gamma = 1.4;
   spec.need_sigma = true;
   spec.need_h1 = true;
-  spec.vis.h1_diagnostics = false;
-  spec.vis.precision = 8;
+  spec.diagnostics.h1_diagnostics = false;
+  spec.glvis.precision = 8;
   // Callback defaults (explicit to show the available options).
   spec.callback_defaults.enable_alive = true;
   spec.callback_defaults.enable_analysis = true;

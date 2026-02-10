@@ -28,8 +28,8 @@ int main(int argc, char *argv[])
   spec.use_igr = true;
   spec.need_sigma = true;
   spec.need_h1 = false;
-  spec.vis.h1_diagnostics = true;
-  spec.vis.precision = 8;
+  spec.diagnostics.h1_diagnostics = true;
+  spec.glvis.precision = 8;
   spec.vtk.print_dataset_name = true;
   spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
 
@@ -38,7 +38,7 @@ int main(int argc, char *argv[])
     cfg.defaults.t_final = 6.0;
     cfg.defaults.vtk_save = true;
     cfg.defaults.par_ref_levels = 0;
-    cfg.defaults.dgsem_volume_flux = "ranocha";
+    cfg.defaults.dgsem_volume_flux = "central";
     cfg.defaults.dgsem_volume_dissipation = "llf";
     cfg.defaults.dgsem_surface_flux = "rusanov";
     cfg.rk3_config.limit_initial = false;

@@ -24,8 +24,8 @@ int main(int argc, char *argv[])
   spec.gamma = 1.4;
   spec.need_sigma = true;
   spec.need_h1 = true;
-  spec.vis.h1_diagnostics = true;
-  spec.vis.precision = 8;
+  spec.diagnostics.h1_diagnostics = true;
+  spec.glvis.precision = 8;
   spec.vtk.print_dataset_name = true;
   spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
 

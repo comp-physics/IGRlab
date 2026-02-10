@@ -54,7 +54,7 @@ int main(int argc, char* argv[])
   spec.need_sigma = false;
   spec.need_h1 = false;
   spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
-  spec.vis.precision = 8;
+  spec.glvis.precision = 8;
   spec.vtk.print_dataset_name = true;
 
   spec.configure_case = [](dg_sim::CaseConfig& cfg)

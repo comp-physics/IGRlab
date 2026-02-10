@@ -18,7 +18,9 @@ inline const char* SurfaceFluxTypeName(DGSEMSurfaceFluxType type)
     case DGSEMSurfaceFluxType::EntropyStableWinters: return "es-winters";
     case DGSEMSurfaceFluxType::EntropyStableLFEntropyVars: return "es-lf-entropy";
   }
-  return "unknown";
+  MFEM_ABORT("Unhandled DGSEMSurfaceFluxType enum value: "
+             << static_cast<int>(type));
+  return "invalid";
 }
 
 } // namespace

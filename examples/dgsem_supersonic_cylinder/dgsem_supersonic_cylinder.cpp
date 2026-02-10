@@ -37,7 +37,7 @@ int main(int argc, char *argv[]) {
   spec.use_igr = false;
   spec.need_sigma = false;
   spec.need_h1 = false;
-  spec.vis.precision = 8;
+  spec.glvis.precision = 8;
   spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
 
   spec.configure_case = [](dg_sim::CaseConfig &cfg) {
