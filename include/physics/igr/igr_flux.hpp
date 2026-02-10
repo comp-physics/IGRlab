@@ -23,20 +23,13 @@ namespace mfem
  *
  * Notes
  *  - The returned max characteristic speed comes from the base flux (unchanged).
- *  - On faces, Sigma is taken from the side indicated via SetFaceSide(Left/Right).
+ *  - On faces, Sigma is taken from the explicit side argument in
+ *    ComputeFluxDotNAtSide/ComputeAvgFluxDotNAtSide.
  *    On boundary faces (Elem2 == nullptr) the interior (Left) value is used.
  */
-class FluxWithIGR : public FluxFunction, public FaceSideAwareFlux
+class FluxWithIGR : public FluxFunction, public FaceSideExplicitFlux
 {
 public:
-  // RAII helper
-  struct SideScope
-  {
-    FluxWithIGR &owner; FaceSide prev;
-    SideScope(FluxWithIGR &o, FaceSide s) : owner(o), prev(o.curr_side_) { o.curr_side_ = s; }
-    ~SideScope() { owner.curr_side_ = prev; }
-  };
-
   /// Construct an IGR-decorated flux around an existing base FluxFunction.
   explicit FluxWithIGR(const FluxFunction &base)
     : FluxFunction(base.num_equations, base.dim), base_(base) {}
@@ -47,8 +40,18 @@ public:
   /// Density floor used only for u = m / rho in the IGR terms (default FluxDefaults::kRhoVelFloor).
   void SetVelocityRhoFloor(double f) { rho_vel_floor_ = f; }
 
-  /// Face-side hook used by side-aware numerical flux (e.g., RusanovFluxWithSides).
-  void SetFaceSide(FaceSide side) override { curr_side_ = side; }
+  /// Side-explicit normal flux path used by side-aware numerical fluxes.
+  real_t ComputeFluxDotNAtSide(const Vector &state, const Vector &normal,
+                               FaceElementTransformations &Tr,
+                               FaceSide side,
+                               Vector &fluxDotN) const override;
+
+  /// Side-explicit average normal flux path with exact line-average sigma term.
+  real_t ComputeAvgFluxDotNAtSide(const Vector &state1, const Vector &state2,
+                                  const Vector &normal,
+                                  FaceElementTransformations &Tr,
+                                  FaceSide side,
+                                  Vector &fluxDotN) const override;
 
   /// Compute tensor flux F(U). Adds IGR tensor terms if Sigma is set; returns base max speed.
   real_t ComputeFlux(const Vector &state, ElementTransformation &Tr,
@@ -81,9 +84,6 @@ private:
   const FluxFunction &base_;
   const mfem::ParGridFunction *sigma_ = nullptr;
   double rho_vel_floor_ = dg_igr::FluxDefaults::kRhoVelFloor;
-
-  // Which side are we evaluating on this face call? (Default to Left/boundary)
-  mutable FaceSide curr_side_ = FaceSide::Left;
 
   // helpers
 

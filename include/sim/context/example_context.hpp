@@ -13,7 +13,7 @@
 #include "sim/config/case_config.hpp"
 #include "sim/context/mesh_build.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Aggregate DG spaces used by Euler examples.
@@ -92,7 +92,7 @@ struct ExampleContext
       pmesh(std::move(pmesh_in)),
       dim(pmesh->Dimension()),
       num_equations(dim + 2),
-      spaces(*pmesh, cfg.order, dim, num_equations,
+      spaces(*pmesh, cfg.opts.order, dim, num_equations,
              BasisTypeForBackend(cfg.dg_backend),
              sigma_space, need_sigma, need_h1)
   {}
@@ -115,4 +115,4 @@ inline ExampleContext BuildExampleContext(const RunConfig& run_cfg,
   return ExampleContext(run_cfg, std::move(pmesh), sigma_space, need_sigma, need_h1);
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

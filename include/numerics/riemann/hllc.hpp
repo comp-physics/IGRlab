@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include "mfem.hpp"
+#include "numerics/riemann/face_side.hpp"
 
 /**
  * @file numerics/riemann/hllc.hpp
@@ -80,6 +81,7 @@ protected:
   mutable DenseMatrix JDotN;
 #endif
 
+  const FaceSideExplicitFlux *side_explicit_flux_ = nullptr; ///< Immutable ctor-time cache.
   const real_t gamma;              ///< specific heat ratio
 
   // Helpers
@@ -106,7 +108,9 @@ protected:
   // Convert conservative U -> primitive W; un = u·n_hat
   void ConsToPrim(const Vector &U, const Vector &nhat, Prim &W) const;
 
-  // F(U)·n_hat (unit normal)
+  // F(U)·n_hat (unit normal). Retained intentionally as a local HLLC helper
+  // for potential non-side-explicit fast-path reuse; Eval currently routes
+  // through explicit-side helpers to preserve IGR side semantics.
   void FluxDotNhat(const Vector &U, const Prim &W, const Vector &nhat, Vector &Fn_hat) const;
 
   // Einfeldt/Toro wave speeds

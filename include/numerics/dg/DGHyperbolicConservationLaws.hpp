@@ -121,16 +121,12 @@ public:
    { return dgsem_entropy_jacobian_analytic_; }
 
    /**
-    * @brief Set a custom face integration rule for surface flux evaluation.
-    *
-    * Applies the rule to the interior-face integrator and caches it so boundary
-    * integrators added later inherit the same rule.
-    */
-   void SetFaceIntegrationRule(const IntegrationRule &ir)
-   {
-      formIntegrator->SetIntegrationRule(ir);
-      face_int_rule_ = &ir;
-   }
+   * @brief Set a custom face integration rule for surface flux evaluation.
+   *
+   * Applies the rule to the interior-face integrator and caches it so boundary
+   * integrators added later inherit the same rule.
+   */
+   void SetFaceIntegrationRule(const IntegrationRule &ir);
    
    /**
     * @brief Apply the operator: y = M⁻¹( -<F̂, [[v]]> + (F(u), ∇v) ).
@@ -148,13 +144,21 @@ public:
    real_t GetMaxCharSpeed() { return max_char_speed; }
 
    /**
-    * @brief Add a boundary-face integrator with a marker (MFEM-style).
-    *
-    * Ownership semantics: the operator stores the integrator and a heap copy of the marker,
-    * then registers them into the underlying NonlinearForm with UseExternalIntegrators().
-    */
-   void AddBdrFaceIntegrator(NonlinearFormIntegrator *nfi,
+   * @brief Add a boundary-face integrator with a marker (MFEM-style).
+   *
+   * Ownership semantics: the operator stores the integrator and a heap copy of the marker,
+   * then registers them into the underlying NonlinearForm with UseExternalIntegrators().
+   */
+   void AddBdrFaceIntegrator(std::unique_ptr<NonlinearFormIntegrator> nfi,
                              const Array<int> &bdr_marker);
+
+   /// Compatibility overload; ownership is transferred to the unique_ptr API.
+   void AddBdrFaceIntegrator(NonlinearFormIntegrator *nfi,
+                             const Array<int> &bdr_marker)
+   {
+      AddBdrFaceIntegrator(std::unique_ptr<NonlinearFormIntegrator>(nfi),
+                           bdr_marker);
+   }
 
    ~DGHyperbolicConservationLaws() override = default;
 
@@ -181,6 +185,7 @@ private:
    // Keep external boundary integrators alive + stable copies of their markers.
    std::vector<std::unique_ptr<NonlinearFormIntegrator>> ext_bdr_int_;
    std::vector<std::unique_ptr<Array<int>>> ext_bdr_markers_;
+   std::unique_ptr<IntegrationRule> face_int_rule_owned_;
    const IntegrationRule *face_int_rule_ = nullptr;
 
    // Volume strategy

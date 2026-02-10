@@ -7,13 +7,14 @@
 
 #include <initializer_list>
 #include <map>
+#include <memory>
 
 #include "mfem.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "utils/mesh/boundary_markers.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Semantic roles for boundary marker maps in examples.
@@ -84,7 +85,7 @@ inline void AddSupersonicInlet(mfem::DGHyperbolicConservationLaws& op,
                                const mfem::Array<int>& marker)
 {
   op.AddBdrFaceIntegrator(
-      new mfem::BdrHyperbolicFluxIntegrator(
+      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
           numerical_flux,
           std::make_unique<mfem::SupersonicInletState>(inlet_state),
           int_order_offset),
@@ -109,7 +110,7 @@ inline void AddSupersonicOutlet(mfem::DGHyperbolicConservationLaws& op,
                                 const mfem::Array<int>& marker)
 {
   op.AddBdrFaceIntegrator(
-      new mfem::BdrHyperbolicFluxIntegrator(
+      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
           numerical_flux,
           std::make_unique<mfem::SupersonicOutletState>(),
           int_order_offset),
@@ -123,7 +124,7 @@ inline void AddSlipWall(mfem::DGHyperbolicConservationLaws& op,
                         const mfem::Array<int>& marker)
 {
   op.AddBdrFaceIntegrator(
-      new mfem::BdrHyperbolicFluxIntegrator(
+      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
           numerical_flux,
           std::make_unique<mfem::SlipWallState>(dim),
           int_order_offset),
@@ -148,14 +149,14 @@ public:
   void AddSlipWall(const BoundaryMarkerMap& markers,
                    BoundaryRole role = BoundaryRole::Slip) const
   {
-    dg_igr_examples::AddSlipWall(op_, numerical_flux_, int_order_offset_,
+    dg_sim::AddSlipWall(op_, numerical_flux_, int_order_offset_,
                                  dim_, markers.At(role));
   }
 
   void AddSupersonicOutlet(const BoundaryMarkerMap& markers,
                            BoundaryRole role = BoundaryRole::Outlet) const
   {
-    dg_igr_examples::AddSupersonicOutlet(op_, numerical_flux_, int_order_offset_,
+    dg_sim::AddSupersonicOutlet(op_, numerical_flux_, int_order_offset_,
                                          markers.At(role));
   }
 
@@ -163,7 +164,7 @@ public:
                           const mfem::Vector& inlet_state,
                           BoundaryRole role = BoundaryRole::Inlet) const
   {
-    dg_igr_examples::AddSupersonicInlet(op_, numerical_flux_, inlet_state,
+    dg_sim::AddSupersonicInlet(op_, numerical_flux_, inlet_state,
                                         int_order_offset_, markers.At(role));
   }
 
@@ -172,7 +173,7 @@ public:
                                      StateBuilder&& build_inlet_state,
                                      BoundaryRole role = BoundaryRole::Inlet) const
   {
-    dg_igr_examples::AddSupersonicInletFromBuilder(
+    dg_sim::AddSupersonicInletFromBuilder(
         op_, numerical_flux_, std::forward<StateBuilder>(build_inlet_state),
         int_order_offset_, markers.At(role));
   }
@@ -184,4 +185,4 @@ private:
   int dim_ = 0;
 };
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

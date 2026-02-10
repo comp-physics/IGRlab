@@ -169,6 +169,7 @@ IGRSolver::IGRSolver(const mfem::ParFiniteElementSpace& sigma_fes,
     dim_(dim),
     num_eq_(num_eq),
     alpha_(alpha),
+    state_scratch_(const_cast<mfem::ParFiniteElementSpace*>(&vfes_)),
     sigma_(const_cast<mfem::ParFiniteElementSpace*>(&sfes_))
 {
   // Allocate forms once
@@ -176,11 +177,12 @@ IGRSolver::IGRSolver(const mfem::ParFiniteElementSpace& sigma_fes,
   b_ = std::make_unique<mfem::ParLinearForm>(const_cast<mfem::ParFiniteElementSpace*>(&sfes_));
 
   // Create coefficients once (they hold references; we’ll update their state each call)
-  static mfem::ParGridFunction dummy(const_cast<mfem::ParFiniteElementSpace*>(&vfes_));
-  dummy = 1.0;
+  state_scratch_ = 1.0;
 
-  invrho_coef_ = std::make_unique<InvRhoCoefficient>(dummy, rho_floor_);
-  src_coef_    = std::make_unique<SigmaSourceCoefficient>(dummy, dim_, num_eq_, alpha_, rho_floor_);
+  invrho_coef_ = std::make_unique<InvRhoCoefficient>(state_scratch_, rho_floor_);
+  src_coef_    = std::make_unique<SigmaSourceCoefficient>(state_scratch_,
+                                                           dim_, num_eq_,
+                                                           alpha_, rho_floor_);
   alpha_coef_  = std::make_unique<AlphaRefCoefficient>(alpha_);
   ck_coef_     = std::make_unique<mfem::ProductCoefficient>(*alpha_coef_, *invrho_coef_);
 

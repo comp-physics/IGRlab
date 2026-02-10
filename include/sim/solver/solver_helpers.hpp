@@ -13,7 +13,7 @@
 #include "sim/context/example_context.hpp"
 #include "sim/context/mesh_build.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 inline void ApplyGradOption(const std::string& grad_opt, dg_igr::IGRConfig& cfg)
@@ -57,4 +57,4 @@ inline dg_igr::IGRSolver MakeIGRSolver(const DGSpaces& spaces,
   return igr;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

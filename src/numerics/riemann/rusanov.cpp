@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <cmath>
 
+#include "numerics/riemann/side_scope_utils.hpp"
+
 namespace mfem
 {
 
 RusanovFluxWithSides::RusanovFluxWithSides(const FluxFunction &fluxFunction)
-  : NumericalFlux(fluxFunction)
+  : NumericalFlux(fluxFunction),
+    side_explicit_flux_(dynamic_cast<const FaceSideExplicitFlux*>(&fluxFunction))
 {
 #ifndef MFEM_THREAD_SAFE
   fluxN1.SetSize(fluxFunction.num_equations);
@@ -25,24 +28,10 @@ real_t RusanovFluxWithSides::Eval(const Vector &state1, const Vector &state2,
 
   real_t speed1, speed2;
 
-  // Minimal addition: if the flux supports side info, set it around each call.
-  if (auto *side_aware =
-          dynamic_cast<FaceSideAwareFlux*>(const_cast<FluxFunction*>(&fluxFunction)))
-  {
-    side_aware->SetFaceSide(FaceSide::Left);
-    speed1 = fluxFunction.ComputeFluxDotN(state1, nor, Tr, fluxN1);
-
-    side_aware->SetFaceSide(FaceSide::Right);
-    speed2 = fluxFunction.ComputeFluxDotN(state2, nor, Tr, fluxN2);
-
-    // Optional: restore to a default (not required)
-    side_aware->SetFaceSide(FaceSide::Left);
-  }
-  else
-  {
-    speed1 = fluxFunction.ComputeFluxDotN(state1, nor, Tr, fluxN1);
-    speed2 = fluxFunction.ComputeFluxDotN(state2, nor, Tr, fluxN2);
-  }
+  speed1 = riemann_detail::ComputeFluxDotNForSide(
+      side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
+  speed2 = riemann_detail::ComputeFluxDotNForSide(
+      side_explicit_flux_, fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
 
   // NOTE: nor in general is not a unit normal
   const real_t maxE = std::max(speed1, speed2);
@@ -66,22 +55,10 @@ void RusanovFluxWithSides::Grad(int side, const Vector &state1, const Vector &st
 
   real_t speed1, speed2;
 
-  if (auto *side_aware =
-          dynamic_cast<FaceSideAwareFlux*>(const_cast<FluxFunction*>(&fluxFunction)))
-  {
-    side_aware->SetFaceSide(FaceSide::Left);
-    speed1 = fluxFunction.ComputeFluxDotN(state1, nor, Tr, fluxN1);
-
-    side_aware->SetFaceSide(FaceSide::Right);
-    speed2 = fluxFunction.ComputeFluxDotN(state2, nor, Tr, fluxN2);
-
-    side_aware->SetFaceSide(FaceSide::Left);
-  }
-  else
-  {
-    speed1 = fluxFunction.ComputeFluxDotN(state1, nor, Tr, fluxN1);
-    speed2 = fluxFunction.ComputeFluxDotN(state2, nor, Tr, fluxN2);
-  }
+  speed1 = riemann_detail::ComputeFluxDotNForSide(
+      side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
+  speed2 = riemann_detail::ComputeFluxDotNForSide(
+      side_explicit_flux_, fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
 
   const real_t maxE = std::max(speed1, speed2);
   const real_t scaledMaxE = maxE * nor.Norml2();
@@ -109,22 +86,11 @@ real_t RusanovFluxWithSides::Average(const Vector &state1, const Vector &state2,
 
   real_t speed1, speed2;
 
-  if (auto *side_aware =
-          dynamic_cast<FaceSideAwareFlux*>(const_cast<FluxFunction*>(&fluxFunction)))
-  {
-    side_aware->SetFaceSide(FaceSide::Left);
-    speed1 = fluxFunction.ComputeFluxDotN(state1, nor, Tr, fluxN1);
-
-    side_aware->SetFaceSide(FaceSide::Right);
-    speed2 = fluxFunction.ComputeAvgFluxDotN(state1, state2, nor, Tr, fluxN2);
-
-    side_aware->SetFaceSide(FaceSide::Left);
-  }
-  else
-  {
-    speed1 = fluxFunction.ComputeFluxDotN(state1, nor, Tr, fluxN1);
-    speed2 = fluxFunction.ComputeAvgFluxDotN(state1, state2, nor, Tr, fluxN2);
-  }
+  speed1 = riemann_detail::ComputeFluxDotNForSide(
+      side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
+  speed2 = riemann_detail::ComputeAvgFluxDotNForSide(
+      side_explicit_flux_, fluxFunction, FaceSide::Right,
+      state1, state2, nor, Tr, fluxN2);
 
   const real_t maxE = std::max(speed1, speed2);
   const real_t scaledMaxE = maxE * nor.Norml2() * 0.5;
@@ -168,22 +134,11 @@ void RusanovFluxWithSides::AverageGrad(int side, const Vector &state1,
 #endif
     real_t speed1 = 0.0, speed2 = 0.0;
 
-    if (auto *side_aware =
-            dynamic_cast<FaceSideAwareFlux*>(const_cast<FluxFunction*>(&fluxFunction)))
-    {
-      side_aware->SetFaceSide(FaceSide::Left);
-      speed1 = fluxFunction.ComputeFluxDotN(state1, nor, Tr, fluxN1);
-
-      side_aware->SetFaceSide(FaceSide::Right);
-      speed2 = fluxFunction.ComputeAvgFluxDotN(state1, state2, nor, Tr, fluxN2);
-
-      side_aware->SetFaceSide(FaceSide::Left);
-    }
-    else
-    {
-      speed1 = fluxFunction.ComputeFluxDotN(state1, nor, Tr, fluxN1);
-      speed2 = fluxFunction.ComputeAvgFluxDotN(state1, state2, nor, Tr, fluxN2);
-    }
+    speed1 = riemann_detail::ComputeFluxDotNForSide(
+        side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
+    speed2 = riemann_detail::ComputeAvgFluxDotNForSide(
+        side_explicit_flux_, fluxFunction, FaceSide::Right,
+        state1, state2, nor, Tr, fluxN2);
 
     fluxFunction.ComputeFluxJacobianDotN(state1, nor, Tr, JDotN);
 
@@ -204,22 +159,11 @@ void RusanovFluxWithSides::AverageGrad(int side, const Vector &state1,
   {
     real_t speed1 = 0.0, speed2 = 0.0;
 
-    if (auto *side_aware =
-            dynamic_cast<FaceSideAwareFlux*>(const_cast<FluxFunction*>(&fluxFunction)))
-    {
-      side_aware->SetFaceSide(FaceSide::Left);
-      speed1 = fluxFunction.ComputeAvgFluxDotN(state1, state2, nor, Tr, fluxN1);
-
-      side_aware->SetFaceSide(FaceSide::Right);
-      speed2 = fluxFunction.ComputeFluxDotN(state2, nor, Tr, fluxN2);
-
-      side_aware->SetFaceSide(FaceSide::Left);
-    }
-    else
-    {
-      speed1 = fluxFunction.ComputeAvgFluxDotN(state1, state2, nor, Tr, fluxN1);
-      speed2 = fluxFunction.ComputeFluxDotN(state2, nor, Tr, fluxN2);
-    }
+    speed1 = riemann_detail::ComputeAvgFluxDotNForSide(
+        side_explicit_flux_, fluxFunction, FaceSide::Left,
+        state1, state2, nor, Tr, fluxN1);
+    speed2 = riemann_detail::ComputeFluxDotNForSide(
+        side_explicit_flux_, fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
 
     const real_t maxE = std::max(speed1, speed2);
     const real_t scaledMaxE = maxE * nor.Norml2() * 0.5;

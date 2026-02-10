@@ -14,7 +14,7 @@
 #include "mfem.hpp"
 #include "utils/diagnostics/non_finite.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /**
@@ -246,4 +246,4 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
   return result;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

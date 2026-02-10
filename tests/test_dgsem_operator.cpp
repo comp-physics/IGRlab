@@ -8,6 +8,7 @@
 #include "numerics/riemann/rusanov.hpp"
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 #include "physics/bc/boundary_state.hpp"
+#include "utils/math/constants.hpp"
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
@@ -587,11 +588,66 @@ int RunDGSEMOperatorTests(TestContext& ctx)
 
     auto inlet2 = std::make_unique<mfem::SupersonicInletState>(
         EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma));
-    auto* bdr = new mfem::BdrHyperbolicFluxIntegrator(num_flux2, std::move(inlet2),
-                                                      int_order_offset2);
-    oper2.AddBdrFaceIntegrator(bdr, bdr_marker2);
-    ctx.Check(bdr->GetIntegrationRule() == &lgl_rule,
+    auto bdr = std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+        num_flux2, std::move(inlet2), int_order_offset2);
+    mfem::BdrHyperbolicFluxIntegrator* bdr_ptr = bdr.get();
+    oper2.AddBdrFaceIntegrator(std::move(bdr), bdr_marker2);
+    const mfem::IntegrationRule* bdr_rule = bdr_ptr->GetIntegrationRule();
+    bool same_rule = (bdr_rule != nullptr) &&
+                     (bdr_rule->GetNPoints() == lgl_rule.GetNPoints());
+    double rule_err_max = 0.0;
+    if (same_rule)
+    {
+      for (int q = 0; q < lgl_rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& a = bdr_rule->IntPoint(q);
+        const mfem::IntegrationPoint& b = lgl_rule.IntPoint(q);
+        const double err = std::max(std::abs(a.x - b.x),
+                                    std::abs(a.weight - b.weight));
+        rule_err_max = std::max(rule_err_max, err);
+        if (err > 1.0e-14)
+        {
+          same_rule = false;
+          break;
+        }
+      }
+    }
+    if (ctx.verbose_metrics)
+    {
+      const int bdr_npts = bdr_rule ? bdr_rule->GetNPoints() : -1;
+      const int bdr_order = bdr_rule ? bdr_rule->GetOrder() : -1;
+      ctx.LogMetric("Boundary rule audit: npts=" + std::to_string(bdr_npts) +
+                    ", order=" + std::to_string(bdr_order) +
+                    ", err_max=" + FormatSci(rule_err_max));
+    }
+    ctx.Check(same_rule,
               "Boundary integrator uses DGSEM LGL face rule");
+
+    // Updating the face rule after BC registration must retarget existing
+    // boundary integrators to the new rule (no stale pointer to prior rule).
+    const mfem::IntegrationRule& lgl_rule_updated = mfem::dgsem::GetLGLFaceRule(1);
+    oper2.SetFaceIntegrationRule(lgl_rule_updated);
+    const mfem::IntegrationRule* bdr_rule_updated = bdr_ptr->GetIntegrationRule();
+    bool same_updated_rule = (bdr_rule_updated != nullptr) &&
+                             (bdr_rule_updated->GetNPoints() ==
+                              lgl_rule_updated.GetNPoints());
+    if (same_updated_rule)
+    {
+      for (int q = 0; q < lgl_rule_updated.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& a = bdr_rule_updated->IntPoint(q);
+        const mfem::IntegrationPoint& b = lgl_rule_updated.IntPoint(q);
+        const double err = std::max(std::abs(a.x - b.x),
+                                    std::abs(a.weight - b.weight));
+        if (err > 1.0e-14)
+        {
+          same_updated_rule = false;
+          break;
+        }
+      }
+    }
+    ctx.Check(same_updated_rule,
+              "Boundary integrator tracks updated DGSEM face rule");
   }
 
   // Boundary-only constant inflow diagnostic (surface term alone).
@@ -1054,7 +1110,7 @@ int RunDGSEMOperatorTests(TestContext& ctx)
         mfem::Vector x(kDim);
         Tr.Transform(ip, x);
 
-        constexpr double kPi = 3.14159265358979323846;
+        constexpr double kPi = dg_sim::math::kPi;
         const double sx = std::sin(2.0 * kPi * x(0));
         const double sy = std::sin(2.0 * kPi * x(1));
         const double rho = 1.0 + 0.1 * sx * sy;

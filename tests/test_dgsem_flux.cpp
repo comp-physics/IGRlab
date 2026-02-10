@@ -12,6 +12,7 @@
 #include "numerics/riemann/rusanov.hpp"
 #include "physics/igr/igr_flux.hpp"
 #include "physics/bc/boundary_state.hpp"
+#include "utils/math/constants.hpp"
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
@@ -407,7 +408,7 @@ int RunDGSEMFluxTests(TestContext& ctx)
     constexpr int dim = 1;
     constexpr int num_eq = dim + 2;
     constexpr double gamma = 1.4;
-    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kPi = dg_sim::math::kPi;
     const double tol_zero = 1.0e-11;
 
     mfem::Mesh mesh = mfem::Mesh::MakeCartesian1D(1, 1.0);
@@ -643,7 +644,7 @@ int RunDGSEMFluxTests(TestContext& ctx)
     constexpr int dim = 2;
     constexpr int num_eq = dim + 2;
     constexpr double gamma = 1.4;
-    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kPi = dg_sim::math::kPi;
     const double tol_resid = 1.0e-10;
 
     mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(1, 1, mfem::Element::QUADRILATERAL,

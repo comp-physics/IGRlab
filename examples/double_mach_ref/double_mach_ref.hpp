@@ -23,6 +23,7 @@
 #include <cmath>
 #include <functional>
 #include "mfem.hpp"
+#include "utils/math/constants.hpp"
 
 namespace mfem
 {
@@ -119,7 +120,7 @@ inline mfem::VectorFunctionCoefficient DoubleMachReflectionInitialCondition(
       p_a * (1.0 + 2.0 * gamma / (gamma + 1.0) * (M2 - 1.0));
 
    // Shock orientation: 60° wrt x1-axis
-   const double angle = M_PI / 3.0; // 60 degrees
+   const double angle = dg_sim::math::kPi / 3.0; // 60 degrees
 
    // Following the paper: post-shock velocity magnitude proportional to
    // M * (1 - ρ_a/ρ_b); with c_a = sqrt(γ p_a / ρ_a) = 1 here.
@@ -155,7 +156,7 @@ inline mfem::VectorFunctionCoefficient DoubleMachReflectionInitialCondition(
          const double x2 = x(1);
 
          // Signed distance to shock line (eps = 0 is the shock)
-         const double tan60 = std::tan(M_PI / 3.0);
+         const double tan60 = std::tan(dg_sim::math::kPi / 3.0);
          const double eps   = x2 - tan60 * (x1 - x0);
 
          // Smooth step S in [0,1]; S ≈ 1 ahead, ≈0 behind
@@ -223,7 +224,7 @@ inline mfem::Vector DoubleMachPostShockState(double gamma = 1.4,
       p_a * (1.0 + 2.0 * gamma / (gamma + 1.0) * (M2 - 1.0));
 
    // Shock orientation: 60° w.r.t. x-axis
-   const double angle = M_PI / 3.0;
+   const double angle = dg_sim::math::kPi / 3.0;
 
    // Paper’s formula (Eq. 5.42):
    //   u_b = [cos(π/3), sin(π/3)]ᵀ * M * (1 - ρ_a/ρ_b)

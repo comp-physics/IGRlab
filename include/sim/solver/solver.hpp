@@ -30,7 +30,7 @@
 #include "sim/wiring/dgsem_flux_config.hpp"
 #include "sim/wiring/igr_physics.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 namespace detail
@@ -74,7 +74,7 @@ bool WithEulerOperator(ExampleContext& ctx,
   mfem::DGHyperbolicConservationLaws op =
       MakeDGOperator(ctx, numerical_flux);
   EulerBoundaryWiring<NumericalFlux> bc(
-      op, numerical_flux, ctx.run_cfg.int_order_offset, ctx.dim);
+      op, numerical_flux, ctx.run_cfg.case_config.int_order_offset, ctx.dim);
   bc_setup(bc, markers);
   return func(op);
 }
@@ -89,7 +89,7 @@ inline bool RunEulerCase(ExampleContext& ctx,
                                EulerStateBundle& bundle,
                                mfem::RK3SSPWithLimiter& rk3,
                                OperatorType& op,
-                               bool& visualization,
+                               bool& glvis_enabled,
                                const TimeLoopCallbacks& callbacks,
                                int precision,
                                OnOpenCallback&& on_open_callback,
@@ -100,7 +100,7 @@ inline bool RunEulerCase(ExampleContext& ctx,
   UpdateEulerOutputFields(bundle.field_list, bundle.sol, /*warm_start=*/false);
 
   EulerVisWindows glvis_windows;
-  if (visualization)
+  if (glvis_enabled)
   {
     const bool ok =
         bundle.field_list.igr
@@ -120,7 +120,7 @@ inline bool RunEulerCase(ExampleContext& ctx,
     }
     else
     {
-      visualization = false;
+      glvis_enabled = false;
       if (mfem::Mpi::Root())
       {
         std::cout << "Unable to connect to GLVis. Visualization disabled.\n";
@@ -136,7 +136,7 @@ inline bool RunEulerCase(ExampleContext& ctx,
   {
     RegisterEulerVTKFields(*paraview_dc, bundle.field_list);
     const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
-    ApplyCaseVTKConfig(*paraview_dc, vtk_cfg, run_cfg.order);
+    ApplyCaseVTKConfig(*paraview_dc, vtk_cfg, run_cfg.opts.order);
     paraview_dc->SetCycle(0);
     paraview_dc->SetTime(0.0);
     paraview_dc->Save();
@@ -164,7 +164,7 @@ inline bool RunEulerCase(ExampleContext& ctx,
 
   TimeLoopIO io;
   io.glvis_windows = &glvis_windows;
-  io.visualization = &visualization;
+  io.glvis_enabled = &glvis_enabled;
   io.paraview = paraview_dc.get();
 
   rk3.Init(op);
@@ -205,7 +205,7 @@ inline bool RunEulerCase(ExampleContext& ctx,
                                EulerStateBundle& bundle,
                                mfem::RK3SSPWithLimiter& rk3,
                                OperatorType& op,
-                               bool& visualization,
+                               bool& glvis_enabled,
                                const TimeLoopCallbacks& callbacks,
                                int precision,
                                double c_alpha_value =
@@ -213,7 +213,7 @@ inline bool RunEulerCase(ExampleContext& ctx,
                                bool print_dataset_name = false)
 {
   return RunEulerCase(ctx, case_cfg, run_cfg, bundle, rk3, op,
-                      visualization, callbacks, precision, []() {},
+                      glvis_enabled, callbacks, precision, []() {},
                       c_alpha_value, print_dataset_name);
 }
 
@@ -229,14 +229,15 @@ struct Solver
     CaseConfig case_cfg = MakeCaseConfig(
         spec.case_name, spec.default_mesh_path,
         spec.case_file ? spec.case_file : "", spec.gamma);
+    // Apply CaseSpec defaults first; configure_case can then override them.
+    case_cfg.defaults.glvis = spec.glvis.enabled;
+    case_cfg.defaults.vtk_save = spec.vtk.enabled;
+    case_cfg.defaults.dg_backend = DGBackendToString(spec.dg_backend_default);
     if (spec.configure_case)
     {
       spec.configure_case(case_cfg);
     }
     case_cfg.rk3_config.gamma = case_cfg.gamma;
-    case_cfg.defaults.visualization = spec.vis.enabled;
-    case_cfg.defaults.vtk_save = spec.vtk.enabled;
-    case_cfg.defaults.dg_backend = DGBackendToString(spec.dg_backend_default);
 
     CaseOptions case_opts = spec.options;
     CommonOptions cli_opts = case_cfg.defaults;
@@ -254,11 +255,14 @@ struct Solver
     args.ParseCheck();
 
     const RunConfig run_cfg = MakeRunConfig(case_cfg, cli_opts, cli_igr_opts);
-    bool visualization = run_cfg.opts.visualization;
-    std::cout.precision(spec.vis.precision);
+    bool glvis_enabled = run_cfg.opts.glvis;
+    std::cout.precision(spec.glvis.precision);
 
     const bool need_sigma = spec.use_igr || spec.need_sigma;
-    const bool need_h1 = spec.need_h1 || spec.vis.h1_diagnostics;
+    const bool enable_h1_vis_diag =
+        spec.diagnostics.h1_diagnostics &&
+        (run_cfg.opts.glvis || run_cfg.opts.vtk_save);
+    const bool need_h1 = spec.need_h1 || enable_h1_vis_diag;
     ExampleContext ctx = BuildExampleContext(run_cfg, run_cfg.igr_opts.space,
                                              need_sigma, need_h1);
     if (run_cfg.dg_backend == DGBackend::DGSEM)
@@ -269,7 +273,7 @@ struct Solver
     {
       MFEM_VERIFY(ctx.spaces.sigma_fes != nullptr, "Sigma space was not created.");
     }
-    if (need_h1 || spec.vis.h1_diagnostics)
+    if (need_h1)
     {
       MFEM_VERIFY(ctx.spaces.h1_vfes != nullptr, "H1 velocity space was not created.");
     }
@@ -318,10 +322,11 @@ struct Solver
         : MakeDefaultTimeLoopCallbacks(spec.callback_defaults);
 
     std::unique_ptr<H1Diagnostics> h1_diag;
-    if (spec.vis.h1_diagnostics && run_cfg.opts.visualization)
+    if (enable_h1_vis_diag)
     {
       h1_diag = std::make_unique<H1Diagnostics>(
           *ctx.spaces.h1_vfes, state_bundle.sol, ctx.dim, rho_floor);
+      state_bundle.field_list.h1_diag = h1_diag.get();
     }
 
     if (spec.after_init)
@@ -329,7 +334,7 @@ struct Solver
       spec.after_init(case_opts, ctx, state_bundle);
     }
 
-    SaveInitialEulerState(ctx, state_bundle.sol, spec.vis.precision);
+    SaveInitialEulerState(ctx, state_bundle.sol, spec.glvis.precision);
 
     MFEM_VERIFY(spec.build_markers, "CaseSpec is missing a boundary marker builder.");
     const BoundaryMarkerMap bdr_markers = spec.build_markers(ctx);
@@ -352,10 +357,10 @@ struct Solver
         ctx, case_cfg.gamma, igr.get(), state_bundle.sol, bdr_markers, bc_setup,
         [&](auto& op)
         {
-          return RunEulerCase(
-              ctx, case_cfg, run_cfg, state_bundle, rk3, op,
-              visualization, callbacks, spec.vis.precision, on_open,
-              vtk_c_alpha, spec.vtk.print_dataset_name);
+              return RunEulerCase(
+                  ctx, case_cfg, run_cfg, state_bundle, rk3, op,
+                  glvis_enabled, callbacks, spec.glvis.precision, on_open,
+                  vtk_c_alpha, spec.vtk.print_dataset_name);
         });
 
     if (!ok)
@@ -363,7 +368,7 @@ struct Solver
       return 2;
     }
 
-    SaveFinalEulerState(ctx, state_bundle.sol, spec.vis.precision);
+    SaveFinalEulerState(ctx, state_bundle.sol, spec.glvis.precision);
 
     if (spec.postprocess)
     {
@@ -378,4 +383,4 @@ struct Solver
   }
 };
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

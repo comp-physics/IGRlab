@@ -8,7 +8,7 @@
 #include "mfem.hpp"
 #include "physics/euler/diagnostics.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /**
@@ -90,4 +90,4 @@ struct EulerVelocityView
   }
 };
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

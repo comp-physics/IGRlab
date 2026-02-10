@@ -29,18 +29,18 @@ struct SupersonicOptions {
 } // namespace
 
 int main(int argc, char *argv[]) {
-  dg_igr_examples::CaseSpec<SupersonicOptions, mfem::DGSEMSurfaceFlux> spec;
+  dg_sim::CaseSpec<SupersonicOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "dgsem_supersonic_cylinder";
   spec.default_mesh_path = mfem::SupersonicCylinderDefaultMeshPath();
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
-  spec.use_igr = true;
-  spec.need_sigma = true;
+  spec.use_igr = false;
+  spec.need_sigma = false;
   spec.need_h1 = false;
-  spec.vis.precision = 8;
-  spec.dg_backend_default = dg_igr_examples::DGBackend::DGSEM;
+  spec.glvis.precision = 8;
+  spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
 
-  spec.configure_case = [](dg_igr_examples::CaseConfig &cfg) {
+  spec.configure_case = [](dg_sim::CaseConfig &cfg) {
     cfg.defaults.t_final = 2.0;
     cfg.defaults.vtk_save = false;
     cfg.defaults.par_ref_levels = 0;
@@ -57,7 +57,7 @@ int main(int argc, char *argv[]) {
   };
 
   spec.make_ic = [](const SupersonicOptions &opts,
-                    const dg_igr_examples::ExampleContext &, double) {
+                    const dg_sim::ExampleContext &, double) {
     mfem::Vector Uin(4);
     Uin(0) = 1.4;
     Uin(1) = 1.4 * opts.inflow.vx;
@@ -65,19 +65,19 @@ int main(int argc, char *argv[]) {
     Uin(3) = 8.8;
 
     auto ic_fun = mfem::EulerInitialCondition(Uin);
-    return std::make_unique<mfem::VectorFunctionCoefficient>(ic_fun);
+    return dg_sim::MakeVectorFunctionIC(ic_fun);
   };
 
-  spec.build_markers = [](dg_igr_examples::ExampleContext &ctx) {
-    return dg_igr_examples::BuildBoundaryMarkers(
-        ctx.Mesh(), {{dg_igr_examples::BoundaryRole::Inlet, {4}},
-                     {dg_igr_examples::BoundaryRole::Outlet, {2}},
-                     {dg_igr_examples::BoundaryRole::Slip, {1, 3}},
-                     {dg_igr_examples::BoundaryRole::Cylinder, {5}}});
+  spec.build_markers = [](dg_sim::ExampleContext &ctx) {
+    return dg_sim::BuildBoundaryMarkers(
+        ctx.Mesh(), {{dg_sim::BoundaryRole::Inlet, {4}},
+                     {dg_sim::BoundaryRole::Outlet, {2}},
+                     {dg_sim::BoundaryRole::Slip, {1, 3}},
+                     {dg_sim::BoundaryRole::Cylinder, {5}}});
   };
 
   spec.apply_bc = [](const SupersonicOptions &opts,
-                     const dg_igr_examples::ExampleContext &, auto &bc,
+                     const dg_sim::ExampleContext &, auto &bc,
                      const auto &markers) {
     mfem::Vector Uin(4);
     Uin(0) = 1.4;
@@ -88,12 +88,12 @@ int main(int argc, char *argv[]) {
     bc.AddSupersonicInletFromBuilder(markers, [&]() { return Uin; });
     bc.AddSupersonicOutlet(markers);
     bc.AddSlipWall(markers);
-    bc.AddSlipWall(markers, dg_igr_examples::BoundaryRole::Cylinder);
+    bc.AddSlipWall(markers, dg_sim::BoundaryRole::Cylinder);
   };
 
   spec.postprocess = [](const SupersonicOptions &,
-                        const dg_igr_examples::ExampleContext &,
-                        const dg_igr_examples::EulerStateBundle &state,
+                        const dg_sim::ExampleContext &,
+                        const dg_sim::EulerStateBundle &state,
                         mfem::VectorCoefficient &ic) {
     const mfem::real_t error = state.sol.ComputeLpError(2, ic);
     if (mfem::Mpi::Root()) {
@@ -102,5 +102,5 @@ int main(int argc, char *argv[]) {
     return 0;
   };
 
-  return dg_igr_examples::Solver::solve(spec, argc, argv);
+  return dg_sim::Solver::solve(spec, argc, argv);
 }

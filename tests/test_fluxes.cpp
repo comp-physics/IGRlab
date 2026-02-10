@@ -1,7 +1,11 @@
 #include "numerics/riemann/diffusive_rusanov.hpp"
 #include "numerics/riemann/hllc.hpp"
 #include "numerics/riemann/rusanov.hpp"
+#include "numerics/riemann/side_scope_utils.hpp"
 
+#include <array>
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -57,6 +61,98 @@ private:
   mfem::Vector a_;
 };
 
+class SideAwareAdvectionFlux final : public mfem::FluxFunction,
+                                     public mfem::FaceSideExplicitFlux
+{
+public:
+  explicit SideAwareAdvectionFlux(const mfem::Vector& a)
+    : mfem::FluxFunction(/*num_eq=*/1, /*dim=*/a.Size()), a_(a)
+  {}
+
+  mfem::real_t ComputeFlux(const mfem::Vector& state,
+                           mfem::ElementTransformation&,
+                           mfem::DenseMatrix& flux) const override
+  {
+    flux.SetSize(num_equations, dim);
+    for (int d = 0; d < dim; ++d)
+    {
+      flux(0, d) = a_(d) * state(0);
+    }
+    return a_.Norml2();
+  }
+
+  mfem::real_t ComputeFluxDotN(const mfem::Vector& state,
+                               const mfem::Vector& normal,
+                               mfem::FaceElementTransformations&,
+                               mfem::Vector& fluxN) const override
+  {
+    fluxN.SetSize(num_equations);
+
+    double adv = 0.0;
+    for (int d = 0; d < dim; ++d)
+    {
+      adv += a_(d) * normal(d);
+    }
+
+    fluxN(0) = adv * state(0);
+    const double nmag = normal.Norml2();
+    return (nmag > 0.0) ? std::abs(adv) / nmag : 0.0;
+  }
+
+  mfem::real_t ComputeFluxDotNAtSide(const mfem::Vector& state,
+                                     const mfem::Vector& normal,
+                                     mfem::FaceElementTransformations& Tr,
+                                     mfem::FaceSide,
+                                     mfem::Vector& fluxDotN) const override
+  {
+    return ComputeFluxDotN(state, normal, Tr, fluxDotN);
+  }
+
+  mfem::real_t ComputeAvgFluxDotNAtSide(const mfem::Vector& state1,
+                                        const mfem::Vector& state2,
+                                        const mfem::Vector& normal,
+                                        mfem::FaceElementTransformations& Tr,
+                                        mfem::FaceSide,
+                                        mfem::Vector& fluxDotN) const override
+  {
+    fluxDotN.SetSize(num_equations);
+    mfem::Vector avg(state1.Size());
+    avg = 0.5;
+    avg *= state1;
+    avg.Add(0.5, state2);
+    return ComputeFluxDotN(avg, normal, Tr, fluxDotN);
+  }
+
+private:
+  mfem::Vector a_;
+};
+
+class HLLCFluxTestAdapter final : public mfem::HLLCFlux
+{
+public:
+  using mfem::HLLCFlux::HLLCFlux;
+
+  void ComputePrimitive(const mfem::Vector& U,
+                        const mfem::Vector& nhat,
+                        mfem::Vector& prim,
+                        double& un,
+                        double& a) const
+  {
+    Prim W;
+    ConsToPrim(U, nhat, W);
+    const int dim = W.u.Size();
+    prim.SetSize(dim + 2);
+    prim(0) = W.rho;
+    for (int d = 0; d < dim; ++d)
+    {
+      prim(1 + d) = W.u(d);
+    }
+    prim(1 + dim) = W.p;
+    un = W.un;
+    a = W.a;
+  }
+};
+
 void ComputeFluxDotN(const mfem::FluxFunction& flux_fn,
                      const mfem::Vector& state,
                      const mfem::Vector& normal,
@@ -82,6 +178,38 @@ double AnalyticDiffusiveFlux(double adv,
   }
   const double scaled = lam_eff * nmag;
   return 0.5 * (adv * (uL + uR) + scaled * (uL - uR));
+}
+
+void HLLCConsToPrimReference(const mfem::Vector& U,
+                             const mfem::Vector& nhat,
+                             double gamma,
+                             mfem::Vector& prim,
+                             double& un,
+                             double& a)
+{
+  const int dim = U.Size() - 2;
+  prim.SetSize(dim + 2);
+  mfem::EulerConservativeToPrimitive(U, dim, gamma, prim);
+  un = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    un += prim(1 + d) * nhat(d);
+  }
+  const double rho = prim(0);
+  const double p = prim(1 + dim);
+  a = std::sqrt(std::max(0.0, gamma * p / rho));
+}
+
+template <typename EvalFn>
+double TimeEvalSeconds(EvalFn&& fn, int iters, double& sink)
+{
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < iters; ++i)
+  {
+    sink += fn(i);
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  return std::chrono::duration<double>(t1 - t0).count();
 }
 
 } // namespace
@@ -346,6 +474,146 @@ int RunFluxTests(TestContext& ctx)
                 "HLLC 2D rotation invariance (momentum-x)");
   ctx.CheckNear(flux_rot(2), mom_flux_rot_expected(1), 1e-9,
                 "HLLC 2D rotation invariance (momentum-y)");
+
+  // --- Helper-dedup regression: HLLC local ConsToPrim == shared Euler conversions ---
+  {
+    HLLCFluxTestAdapter hllc_adapter(euler_flux_2d, gamma);
+    mfem::Vector nhat(2);
+    nhat(0) = 0.6;
+    nhat(1) = -0.8;
+
+    const mfem::Vector cons_a =
+        EulerConsFromPrim2D(/*rho=*/1.1, /*u=*/2.3, /*v=*/-0.4, /*p=*/0.9, gamma);
+    const mfem::Vector cons_b =
+        EulerConsFromPrim2D(/*rho=*/0.85, /*u=*/-1.7, /*v=*/0.6, /*p=*/1.4, gamma);
+
+    mfem::Vector prim_local;
+    mfem::Vector prim_ref;
+    double un_local = 0.0, a_local = 0.0;
+    double un_ref = 0.0, a_ref = 0.0;
+
+    hllc_adapter.ComputePrimitive(cons_a, nhat, prim_local, un_local, a_local);
+    HLLCConsToPrimReference(cons_a, nhat, gamma, prim_ref, un_ref, a_ref);
+    for (int i = 0; i < prim_ref.Size(); ++i)
+    {
+      ctx.CheckNear(prim_local(i), prim_ref(i), 1e-13,
+                    "HLLC ConsToPrim matches shared Euler conversion (state A) component "
+                        + std::to_string(i));
+    }
+    ctx.CheckNear(un_local, un_ref, 1e-13,
+                  "HLLC ConsToPrim normal velocity matches reference (state A)");
+    ctx.CheckNear(a_local, a_ref, 1e-13,
+                  "HLLC ConsToPrim sound speed matches reference (state A)");
+
+    hllc_adapter.ComputePrimitive(cons_b, nhat, prim_local, un_local, a_local);
+    HLLCConsToPrimReference(cons_b, nhat, gamma, prim_ref, un_ref, a_ref);
+    for (int i = 0; i < prim_ref.Size(); ++i)
+    {
+      ctx.CheckNear(prim_local(i), prim_ref(i), 1e-13,
+                    "HLLC ConsToPrim matches shared Euler conversion (state B) component "
+                        + std::to_string(i));
+    }
+    ctx.CheckNear(un_local, un_ref, 1e-13,
+                  "HLLC ConsToPrim normal velocity matches reference (state B)");
+    ctx.CheckNear(a_local, a_ref, 1e-13,
+                  "HLLC ConsToPrim sound speed matches reference (state B)");
+  }
+
+  // --- Micro timing gate: cached explicit-side helper should stay near direct call ---
+  if (!EnvEnabled("DG_IGR_SKIP_PERF_GATES"))
+  {
+    mfem::Vector adv_dir(2);
+    adv_dir(0) = 1.0;
+    adv_dir(1) = -0.2;
+    SideAwareAdvectionFlux side_flux(adv_dir);
+    const auto* explicit_flux =
+        dynamic_cast<const mfem::FaceSideExplicitFlux*>(&side_flux);
+    ctx.Check(explicit_flux != nullptr,
+              "Side-aware advection flux exposes explicit-side interface");
+
+    mfem::Vector state_perf(1);
+    state_perf(0) = 1.25;
+    mfem::Vector normal_perf(2);
+    normal_perf(0) = 1.2;
+    normal_perf(1) = -0.8;
+    mfem::Vector flux_perf(1);
+    mfem::FaceElementTransformations Tr_perf;
+
+    constexpr int kWarmupIters = 20000;
+    constexpr int kIters = 200000;
+    constexpr int kRepeats = 5;
+    double sink = 0.0;
+
+    // Warmup to reduce first-run noise from caches/frequency scaling.
+    for (int i = 0; i < kWarmupIters; ++i)
+    {
+      const auto side = (i & 1) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
+      sink += mfem::riemann_detail::ComputeFluxDotNForSide(
+          explicit_flux, side_flux, side, state_perf, normal_perf, Tr_perf,
+          flux_perf);
+    }
+
+    auto median = [](std::array<double, kRepeats> samples) -> double
+    {
+      std::sort(samples.begin(), samples.end());
+      return samples[kRepeats / 2];
+    };
+
+    std::array<double, kRepeats> direct_samples{};
+    std::array<double, kRepeats> cached_samples{};
+    std::array<double, kRepeats> uncached_samples{};
+    for (int r = 0; r < kRepeats; ++r)
+    {
+      direct_samples[r] = TimeEvalSeconds(
+          [&](int i) -> double
+          {
+            const auto side = (i & 1) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
+            return explicit_flux->ComputeFluxDotNAtSide(state_perf, normal_perf, Tr_perf,
+                                                        side, flux_perf) + flux_perf(0);
+          }, kIters, sink);
+
+      cached_samples[r] = TimeEvalSeconds(
+          [&](int i) -> double
+          {
+            const auto side = (i & 1) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
+            return mfem::riemann_detail::ComputeFluxDotNForSide(
+                explicit_flux, side_flux, side, state_perf, normal_perf, Tr_perf, flux_perf)
+                + flux_perf(0);
+          }, kIters, sink);
+
+      uncached_samples[r] = TimeEvalSeconds(
+          [&](int i) -> double
+          {
+            const auto side = (i & 1) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
+            return mfem::riemann_detail::ComputeFluxDotNForSide(
+                side_flux, side, state_perf, normal_perf, Tr_perf, flux_perf) + flux_perf(0);
+          }, kIters, sink);
+    }
+
+    const double t_direct = median(direct_samples);
+    const double t_cached = median(cached_samples);
+    const double t_uncached = median(uncached_samples);
+
+    const double cached_ratio = (t_direct > 0.0) ? (t_cached / t_direct) : 0.0;
+    const double uncached_ratio = (t_direct > 0.0) ? (t_uncached / t_direct) : 0.0;
+    ctx.LogMetric("side_helper_perf direct_s=" + FormatSci(t_direct, 6)
+                  + " cached_s=" + FormatSci(t_cached, 6)
+                  + " uncached_s=" + FormatSci(t_uncached, 6)
+                  + " cached_ratio=" + FormatSci(cached_ratio, 6)
+                  + " uncached_ratio=" + FormatSci(uncached_ratio, 6));
+
+    // Strict performance checks are opt-in to avoid CI flakiness.
+    if (EnvEnabled("DG_IGR_STRICT_PERF_GATES"))
+    {
+      // Relative gate: protects hot-path helper migration without machine-
+      // specific absolute timing thresholds.
+      ctx.Check(cached_ratio <= 1.30,
+                "Cached side helper stays within 30% of direct explicit-side call cost");
+    }
+
+    // Keep sink in parity so benchmark loops cannot be optimized out in release.
+    ctx.AddParity(sink);
+  }
 
   return ctx.failures;
 }

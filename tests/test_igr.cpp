@@ -1,9 +1,14 @@
+#include "physics/euler/conversions.hpp"
+#include "physics/igr/IGR.hpp"
 #include "physics/igr/igr_flux.hpp"
+#include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/riemann/rusanov.hpp"
+#include "numerics/riemann/side_scope_utils.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <vector>
 
 #include "test_utils.hpp"
 
@@ -12,6 +17,14 @@ namespace dg_igr_tests
 
 namespace
 {
+
+mfem::Mesh MakePeriodicMesh1D(int n)
+{
+  mfem::Mesh orig_mesh = mfem::Mesh::MakeCartesian1D(n, 1.0);
+  std::vector<mfem::Vector> translations = {mfem::Vector({1.0})};
+  return mfem::Mesh::MakePeriodic(
+      orig_mesh, orig_mesh.CreatePeriodicVertexMapping(translations));
+}
 
 mfem::FaceElementTransformations& GetFaceTr(mfem::ParMesh& pmesh, int face)
 {
@@ -44,6 +57,46 @@ private:
   double split_x_ = 0.5;
 };
 
+class LinearAverageFlux final : public mfem::FluxFunction
+{
+public:
+  LinearAverageFlux(int dim, const mfem::Vector &dir)
+    : mfem::FluxFunction(dim + 2, dim), dir_(dir)
+  {
+    MFEM_VERIFY(dir_.Size() == dim,
+                "LinearAverageFlux direction dimension mismatch.");
+  }
+
+  mfem::real_t ComputeFlux(const mfem::Vector &state,
+                           mfem::ElementTransformation &,
+                           mfem::DenseMatrix &flux) const override
+  {
+    flux.SetSize(num_equations, dim);
+    for (int d = 0; d < dim; ++d)
+    {
+      for (int i = 0; i < num_equations; ++i)
+      {
+        flux(i, d) = dir_(d) * state(i);
+      }
+    }
+    return dir_.Norml2();
+  }
+
+  mfem::real_t ComputeAvgFlux(const mfem::Vector &state1,
+                              const mfem::Vector &state2,
+                              mfem::ElementTransformation &Tr,
+                              mfem::DenseMatrix &flux) const override
+  {
+    mfem::Vector avg(state1);
+    avg += state2;
+    avg *= 0.5;
+    return ComputeFlux(avg, Tr, flux);
+  }
+
+private:
+  mfem::Vector dir_;
+};
+
 double DotMomentumNormal(const mfem::Vector& cons, const mfem::Vector& normal, int dim)
 {
   double un = 0.0;
@@ -52,6 +105,39 @@ double DotMomentumNormal(const mfem::Vector& cons, const mfem::Vector& normal, i
     un += cons(1 + d) * normal(d);
   }
   return un;
+}
+
+double ExactAvgUnOverRho(const mfem::Vector& state1,
+                         const mfem::Vector& state2,
+                         const mfem::Vector& normal,
+                         int dim)
+{
+  const double rho1 = state1(0);
+  const double rho2 = state2(0);
+  MFEM_VERIFY(rho1 > 0.0 && rho2 > 0.0,
+              "ExactAvgUnOverRho requires positive density endpoints.");
+  const double drho = rho2 - rho1;
+
+  double mn1 = 0.0;
+  double mn2 = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    mn1 += state1(1 + d) * normal(d);
+    mn2 += state2(1 + d) * normal(d);
+  }
+  const double dmn = mn2 - mn1;
+
+  const double eps = 1.0e-14 * std::max(1.0, std::abs(rho1));
+  if (std::abs(drho) <= eps)
+  {
+    return (mn1 + 0.5 * dmn) / rho1;
+  }
+
+  const double inv_drho = 1.0 / drho;
+  const double inv_drho2 = inv_drho * inv_drho;
+  const double log_ratio = std::log1p(drho / rho1);
+  return dmn * inv_drho +
+         (mn1 * drho - dmn * rho1) * inv_drho2 * log_ratio;
 }
 
 void AddSigmaDotNTerms(const mfem::Vector& state,
@@ -151,6 +237,72 @@ int RunIGRTests(TestContext& ctx)
   ctx.CheckNear(igr_fn(3) - base_fn(3), sigma_value * un, tol,
                 "FluxWithIGR adds sigma*(u·n) to energy flux");
 
+  // --- Tensor flux path: sigma terms must enter ComputeFlux (volume flux) ---
+  {
+    mfem::ElementTransformation* Te = pmesh.GetElementTransformation(0);
+    MFEM_VERIFY(Te != nullptr, "Failed to obtain element transformation.");
+    const mfem::IntegrationRule& ir_elem =
+        mfem::IntRules.Get(Te->GetGeometryType(), /*order=*/1);
+    const mfem::IntegrationPoint& ip_elem = ir_elem.IntPoint(0);
+    Te->SetIntPoint(&ip_elem);
+
+    mfem::DenseMatrix base_F(dim + 2, dim);
+    mfem::DenseMatrix igr_F(dim + 2, dim);
+    base_flux.ComputeFlux(state, *Te, base_F);
+    igr_flux.ComputeFlux(state, *Te, igr_F);
+
+    const double rho_vol = state(0);
+    for (int d = 0; d < dim; ++d)
+    {
+      ctx.CheckNear(igr_F(1 + d, d) - base_F(1 + d, d), sigma_value, tol,
+                    "FluxWithIGR adds +sigma to momentum tensor diagonal, dim=" +
+                        std::to_string(d));
+      const double expected_energy = sigma_value * state(1 + d) / rho_vol;
+      ctx.CheckNear(igr_F(1 + dim, d) - base_F(1 + dim, d),
+                    expected_energy, tol,
+                    "FluxWithIGR adds +sigma*u to energy tensor row, dim=" +
+                        std::to_string(d));
+    }
+  }
+
+  // --- Exact averaged sigma correction for side-explicit average flux path ---
+  {
+    mfem::Vector dir(dim);
+    dir(0) = 1.0;
+    dir(1) = -0.25;
+    LinearAverageFlux linear_base(dim, dir);
+    mfem::FluxWithIGR igr_avg(linear_base);
+    igr_avg.SetSigmaField(&sigma);
+
+    const mfem::Vector state_avg_1 = EulerConsFromPrim2D(
+        /*rho=*/0.9, /*u=*/1.8, /*v=*/-0.3, /*p=*/1.0, gamma);
+    const mfem::Vector state_avg_2 = EulerConsFromPrim2D(
+        /*rho=*/1.4, /*u=*/-0.2, /*v=*/0.6, /*p=*/0.9, gamma);
+
+    mfem::Vector base_avg_fn(dim + 2);
+    mfem::Vector igr_avg_fn(dim + 2);
+    linear_base.ComputeAvgFluxDotN(state_avg_1, state_avg_2, normal, Tr_face,
+                                    base_avg_fn);
+    igr_avg.ComputeAvgFluxDotNAtSide(state_avg_1, state_avg_2, normal, Tr_face,
+                                     mfem::FaceSide::Left, igr_avg_fn);
+
+    mfem::Vector expected_avg(base_avg_fn);
+    for (int d = 0; d < dim; ++d)
+    {
+      expected_avg(1 + d) += sigma_value * normal(d);
+    }
+    expected_avg(1 + dim) += sigma_value *
+                             ExactAvgUnOverRho(state_avg_1, state_avg_2,
+                                               normal, dim);
+
+    for (int i = 0; i < expected_avg.Size(); ++i)
+    {
+      ctx.CheckNear(igr_avg_fn(i), expected_avg(i), 5.0e-12,
+                    "FluxWithIGR exact averaged sigma correction, component " +
+                        std::to_string(i));
+    }
+  }
+
   // --- Interior-face side selection: sigma should come from the matching side ---
   {
     mfem::Mesh mesh_if = mfem::Mesh::MakeCartesian2D(
@@ -239,6 +391,236 @@ int RunIGRTests(TestContext& ctx)
       ctx.Check(global_max_err < 5.0e-11,
                 "FluxWithIGR side selection matches expected sigma per side");
     }
+  }
+
+  // --- Deterministic side-selection stress: explicit-side path remains stable ---
+  {
+    mfem::Mesh mesh_side = mfem::Mesh::MakeCartesian2D(
+        /*nx=*/2, /*ny=*/1, mfem::Element::QUADRILATERAL,
+        /*generate_edges=*/true, /*sx=*/1.0, /*sy=*/1.0);
+    mfem::ParMesh pmesh_side(MPI_COMM_SELF, mesh_side);
+
+    mfem::DG_FECollection fec_side(/*order=*/0, dim);
+    mfem::ParFiniteElementSpace sigma_fes_side(&pmesh_side, &fec_side, /*vdim=*/1);
+    mfem::ParGridFunction sigma_side(&sigma_fes_side);
+    for (int e = 0; e < sigma_fes_side.GetNE(); ++e)
+    {
+      mfem::Array<int> vdofs;
+      sigma_fes_side.GetElementVDofs(e, vdofs);
+      mfem::Vector val(vdofs.Size());
+      val = (e == 0) ? 0.15 : 0.45;
+      sigma_side.SetSubVector(vdofs, val);
+    }
+    sigma_side.ExchangeFaceNbrData();
+
+    mfem::FluxWithIGR igr_flux_side(base_flux);
+    igr_flux_side.SetSigmaField(&sigma_side);
+
+    int interior_face = -1;
+    for (int f = 0; f < pmesh_side.GetNFaces(); ++f)
+    {
+      mfem::FaceElementTransformations* Tr = pmesh_side.GetFaceElementTransformations(f);
+      if (Tr && Tr->Elem1 && Tr->Elem2)
+      {
+        interior_face = f;
+        break;
+      }
+    }
+    MFEM_VERIFY(interior_face >= 0,
+                "Deterministic side-selection stress test requires an interior face.");
+
+    mfem::FaceElementTransformations* Tr = pmesh_side.GetFaceElementTransformations(interior_face);
+    MFEM_VERIFY(Tr != nullptr, "Failed to obtain interior face transformations.");
+    const mfem::IntegrationRule& ir_face =
+        mfem::IntRules.Get(Tr->GetGeometryType(), /*order=*/1);
+    const mfem::IntegrationPoint& ip_face = ir_face.IntPoint(0);
+    Tr->SetAllIntPoints(&ip_face);
+
+    mfem::Vector state = EulerConsFromPrim2D(
+        /*rho=*/1.1, /*u=*/0.9, /*v=*/-0.3, /*p=*/1.0, gamma);
+    mfem::Vector normal(dim);
+    mfem::CalcOrtho(Tr->Jacobian(), normal);
+
+    mfem::Vector left_ref(state.Size());
+    mfem::Vector right_ref(state.Size());
+    const mfem::real_t left_speed_ref = mfem::riemann_detail::ComputeFluxDotNForSide(
+        igr_flux_side, mfem::FaceSide::Left, state, normal, *Tr, left_ref);
+    const mfem::real_t right_speed_ref = mfem::riemann_detail::ComputeFluxDotNForSide(
+        igr_flux_side, mfem::FaceSide::Right, state, normal, *Tr, right_ref);
+
+    // Side regression snapshot: left/right must differ when sigma differs per element.
+    const double ref_diff =
+        std::abs(left_ref(1) - right_ref(1)) +
+        std::abs(left_ref(2) - right_ref(2)) +
+        std::abs(left_ref(3) - right_ref(3));
+    ctx.AddParity(ref_diff + left_speed_ref + right_speed_ref);
+    ctx.Check(ref_diff > 1.0e-12,
+              "IGR side snapshots differ for left/right sigma values");
+
+    for (int iter = 0; iter < 200; ++iter)
+    {
+      const mfem::FaceSide side =
+          ((iter % 2) == 0) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
+
+      mfem::Vector flux_explicit(state.Size());
+      const mfem::real_t speed_explicit = mfem::riemann_detail::ComputeFluxDotNForSide(
+          igr_flux_side, side, state, normal, *Tr, flux_explicit);
+
+      const mfem::Vector& flux_ref =
+          (side == mfem::FaceSide::Left) ? left_ref : right_ref;
+      const mfem::real_t speed_ref =
+          (side == mfem::FaceSide::Left) ? left_speed_ref : right_speed_ref;
+
+      for (int i = 0; i < flux_ref.Size(); ++i)
+      {
+        ctx.CheckNear(flux_explicit(i), flux_ref(i), tol,
+                      "Explicit-side flux remains deterministic, iter=" +
+                          std::to_string(iter) + ", component=" + std::to_string(i));
+      }
+      ctx.CheckNear(speed_explicit, speed_ref, tol,
+                    "Explicit-side speed remains deterministic, iter=" +
+                        std::to_string(iter));
+    }
+  }
+
+  // --- DG backend operator path: varying sigma changes residual, sigma=0 cancels ---
+  {
+    constexpr int dim1 = 1;
+    constexpr int num_eq1 = dim1 + 2;
+    const double tol_zero = 1.0e-10;
+
+    mfem::Mesh mesh_dg = MakePeriodicMesh1D(/*n=*/8);
+    mfem::ParMesh pmesh_dg(MPI_COMM_WORLD, mesh_dg);
+
+    mfem::DG_FECollection state_fec(/*order=*/2, dim1, mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace vfes(&pmesh_dg, &state_fec, num_eq1,
+                                     mfem::Ordering::byNODES);
+    mfem::ParGridFunction U_const(&vfes);
+    const mfem::Vector cons_const =
+        EulerConsFromPrim1D(/*rho=*/1.0, /*u=*/0.0, /*p=*/1.0, gamma);
+    FillConstantState(cons_const, U_const);
+
+    mfem::DG_FECollection sigma_fec_dg(/*order=*/1, dim1,
+                                       mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace sigma_fes_dg(&pmesh_dg, &sigma_fec_dg,
+                                             /*vdim=*/1,
+                                             mfem::Ordering::byNODES);
+    mfem::ParGridFunction sigma_dg(&sigma_fes_dg);
+
+    class SigmaLinearCoefficient1D final : public mfem::Coefficient
+    {
+    public:
+      double Eval(mfem::ElementTransformation& T,
+                  const mfem::IntegrationPoint& ip) override
+      {
+        mfem::Vector x(1);
+        T.Transform(ip, x);
+        return 0.2 + 0.3 * x(0);
+      }
+    };
+
+    SigmaLinearCoefficient1D sigma_linear;
+    sigma_dg.ProjectCoefficient(sigma_linear);
+    sigma_dg.ExchangeFaceNbrData();
+
+    mfem::EulerFlux base_flux_dg(dim1, gamma);
+    mfem::FluxWithIGR igr_flux_dg(base_flux_dg);
+    igr_flux_dg.SetSigmaField(&sigma_dg);
+    mfem::RusanovFluxWithSides num_flux_dg(igr_flux_dg);
+
+    constexpr int int_order_offset = 2;
+    auto form_integrator =
+        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux_dg,
+                                                         int_order_offset);
+    mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form_integrator),
+                                            /*preassembleWeakDivergence=*/true);
+    oper.SetNumericalFlux(&num_flux_dg);
+
+    mfem::Vector x_dg;
+    mfem::Vector y_dg(vfes.GetTrueVSize());
+    U_const.GetTrueDofs(x_dg);
+
+    oper.Mult(x_dg, y_dg);
+    const double resid_sigma = GlobalL2Norm(y_dg);
+
+    mfem::ConstantCoefficient sigma_zero(0.0);
+    sigma_dg.ProjectCoefficient(sigma_zero);
+    sigma_dg.ExchangeFaceNbrData();
+
+    oper.Mult(x_dg, y_dg);
+    const double resid_zero = GlobalL2Norm(y_dg);
+    ctx.AddParity(resid_sigma + resid_zero);
+
+    ctx.Check(resid_zero < tol_zero,
+              "DG (weak-div) IGR residual ~0 when sigma = 0");
+    ctx.Check(resid_sigma > 1.0e-8,
+              "DG (weak-div) IGR residual responds to varying sigma");
+  }
+
+  // --- IGR solver instance isolation: per-instance scratch/config must not alias ---
+  {
+    constexpr int igr_dim = 2;
+    constexpr int igr_num_eq = igr_dim + 2;
+
+    mfem::Mesh mesh_iso = mfem::Mesh::MakeCartesian2D(
+        /*nx=*/2, /*ny=*/2, mfem::Element::QUADRILATERAL,
+        /*generate_edges=*/true, /*sx=*/1.0, /*sy=*/1.0);
+    mfem::ParMesh pmesh_iso(MPI_COMM_SELF, mesh_iso);
+
+    mfem::DG_FECollection sigma_fec(/*order=*/1, igr_dim);
+    mfem::DG_FECollection state_fec(/*order=*/1, igr_dim);
+    mfem::ParFiniteElementSpace sigma_fes(&pmesh_iso, &sigma_fec, /*vdim=*/1);
+    mfem::ParFiniteElementSpace state_fes(&pmesh_iso, &state_fec, igr_num_eq,
+                                          mfem::Ordering::byNODES);
+
+    mfem::ParGridFunction U(&state_fes);
+    mfem::VectorFunctionCoefficient U_coeff(
+        igr_num_eq,
+        [&](const mfem::Vector& x, mfem::Vector& cons)
+        {
+          mfem::Vector prim(igr_num_eq);
+          prim(0) = 1.0 + 0.1 * x(0);               // rho
+          prim(1) = 1.5 + 0.2 * x(1);               // u
+          prim(2) = -0.25 + 0.1 * x(0);             // v
+          prim(1 + igr_dim) = 1.0 + 0.05 * x(1);    // p
+          cons.SetSize(igr_num_eq);
+          mfem::EulerPrimToConservative(prim, igr_dim, gamma, cons);
+        });
+    U.ProjectCoefficient(U_coeff);
+    U.ExchangeFaceNbrData();
+
+    dg_igr::IGRSolver solver_a(sigma_fes, state_fes, igr_dim, igr_num_eq, /*alpha=*/0.05);
+    dg_igr::IGRSolver solver_b(sigma_fes, state_fes, igr_dim, igr_num_eq, /*alpha=*/0.35);
+    solver_a.SetRhoFloor(1.0e-12);
+    solver_b.SetRhoFloor(5.0e-2);
+    solver_a.SetLinearSolveParams(/*rtol=*/1.0e-10, /*atol=*/1.0e-14, /*max_it=*/200, /*print=*/0);
+    solver_b.SetLinearSolveParams(/*rtol=*/1.0e-10, /*atol=*/1.0e-14, /*max_it=*/200, /*print=*/0);
+
+    solver_a.UpdateFromState(U, /*warm_start=*/false);
+    mfem::Vector sigma_a1(solver_a.GetSigma().Size());
+    sigma_a1 = solver_a.GetSigma();
+
+    solver_b.UpdateFromState(U, /*warm_start=*/false);
+    mfem::Vector sigma_b(solver_b.GetSigma().Size());
+    sigma_b = solver_b.GetSigma();
+
+    solver_a.UpdateFromState(U, /*warm_start=*/false);
+    mfem::Vector sigma_a2(solver_a.GetSigma().Size());
+    sigma_a2 = solver_a.GetSigma();
+
+    mfem::Vector delta_repeat(sigma_a1);
+    delta_repeat -= sigma_a2;
+    const double repeat_err = GlobalL2Norm(delta_repeat);
+
+    mfem::Vector delta_cfg(sigma_a1);
+    delta_cfg -= sigma_b;
+    const double cfg_diff = GlobalL2Norm(delta_cfg);
+
+    ctx.AddParity(repeat_err + cfg_diff);
+    ctx.Check(repeat_err < 1.0e-11,
+              "IGRSolver instance state is isolated across multiple solver objects");
+    ctx.Check(cfg_diff > 1.0e-8,
+              "Different IGRSolver configs produce distinct sigma fields");
   }
 
   return ctx.failures;

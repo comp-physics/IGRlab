@@ -23,14 +23,14 @@
 #include "sim/time/time_callbacks.hpp"
 #include "sim/time/time_loop.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Optional IO wiring for the shared time loop.
 struct TimeLoopIO
 {
   EulerVisWindows* glvis_windows = nullptr;
-  bool* visualization = nullptr;
+  bool* glvis_enabled = nullptr;
   mfem::ParaViewDataCollection* paraview = nullptr;
 };
 
@@ -309,11 +309,11 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
   const int num_procs_value = num_procs;
   const int my_rank_value = my_rank;
   EulerVisWindows* glvis_windows = io.glvis_windows;
-  bool* visualization = io.visualization;
+  bool* glvis_enabled = io.glvis_enabled;
   mfem::ParaViewDataCollection* paraview = io.paraview;
   TimeLoopHooks hooks;
   hooks.on_visualize = [&, start_time, local_dofs, global_dofs,
-                        glvis_windows, visualization, num_procs_value,
+                        glvis_windows, glvis_enabled, num_procs_value,
                         my_rank_value, callbacks](int step,
                                       mfem::real_t t,
                                       mfem::real_t dt_real,
@@ -346,7 +346,7 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
       info.avg_step_per_dof_rank = avg_step_per_dof_rank;
       callbacks.on_alive(info);
     }
-    if (visualization && *visualization && glvis_windows)
+    if (glvis_enabled && *glvis_enabled && glvis_windows)
     {
       UpdateEulerGLVis(*glvis_windows, bundle.field_list, bundle.sol,
                        num_procs_value, my_rank_value, ctx.Mesh(), t,
@@ -439,4 +439,4 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
   return hooks;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

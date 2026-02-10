@@ -61,31 +61,31 @@
 namespace
 {
 
-using ShockVortexOptions = dg_igr_examples::EmptyCaseOptions;
+using ShockVortexOptions = dg_sim::EmptyCaseOptions;
 
 } // namespace
 
 int main(int argc, char *argv[])
 {
-  dg_igr_examples::CaseSpec<ShockVortexOptions, mfem::DGSEMSurfaceFlux> spec;
+  dg_sim::CaseSpec<ShockVortexOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "shock_vortex_interaction";
   spec.default_mesh_path = mfem::ShockVortexDefaultMeshPath();
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
   spec.need_sigma = true;
   spec.need_h1 = true;
-  spec.vis.h1_diagnostics = true;
-  spec.vis.precision = 8;
+  spec.diagnostics.h1_diagnostics = true;
+  spec.glvis.precision = 8;
   spec.vtk.print_dataset_name = true;
 
-  spec.configure_case = [](dg_igr_examples::CaseConfig& cfg)
+  spec.configure_case = [](dg_sim::CaseConfig& cfg)
   {
     cfg.defaults.t_final = 6.0;
     cfg.rk3_config.limit_initial = false;
   };
 
   spec.make_ic = [](const ShockVortexOptions&,
-                    const dg_igr_examples::ExampleContext& ctx,
+                    const dg_sim::ExampleContext& ctx,
                     double gamma)
   {
     const mfem::real_t Ms = 1.2;
@@ -99,17 +99,17 @@ int main(int argc, char *argv[])
     return std::make_unique<mfem::VectorFunctionCoefficient>(4, ic_fun);
   };
 
-  spec.build_markers = [](dg_igr_examples::ExampleContext& ctx)
+  spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
-    return dg_igr_examples::BuildBoundaryMarkers(
+    return dg_sim::BuildBoundaryMarkers(
         ctx.Mesh(),
-        {{dg_igr_examples::BoundaryRole::Inlet, {2}},
-         {dg_igr_examples::BoundaryRole::Outlet, {4}},
-         {dg_igr_examples::BoundaryRole::Slip, {1, 3}}});
+        {{dg_sim::BoundaryRole::Inlet, {2}},
+         {dg_sim::BoundaryRole::Outlet, {4}},
+         {dg_sim::BoundaryRole::Slip, {1, 3}}});
   };
 
   spec.apply_bc = [](const ShockVortexOptions&,
-                     const dg_igr_examples::ExampleContext&,
+                     const dg_sim::ExampleContext&,
                      auto& bc,
                      const auto& markers)
   {
@@ -133,8 +133,8 @@ int main(int argc, char *argv[])
   };
 
   spec.postprocess = [](const ShockVortexOptions&,
-                        const dg_igr_examples::ExampleContext&,
-                        const dg_igr_examples::EulerStateBundle& state,
+                        const dg_sim::ExampleContext&,
+                        const dg_sim::EulerStateBundle& state,
                         mfem::VectorCoefficient& ic)
   {
     const mfem::real_t error = state.sol.ComputeLpError(2, ic);
@@ -145,5 +145,5 @@ int main(int argc, char *argv[])
     return 0;
   };
 
-  return dg_igr_examples::Solver::solve(spec, argc, argv);
+  return dg_sim::Solver::solve(spec, argc, argv);
 }

@@ -7,7 +7,7 @@
 
 #include <functional>
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Per-step timing/metric payload for alive callbacks.
@@ -81,4 +81,4 @@ struct DefaultCallbackConfig
   bool compute_minmax = true;
 };
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

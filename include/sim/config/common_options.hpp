@@ -9,7 +9,7 @@
 
 #include "mfem.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /**
@@ -30,7 +30,7 @@ struct CommonOptions
   mfem::real_t t_final = 1.0;    ///< Final time.
   mfem::real_t dt = -0.01;       ///< Time step (positive skips CFL computation).
   mfem::real_t cfl = 0.3;        ///< CFL number for time step computation.
-  bool visualization = false;    ///< Enable GLVis visualization.
+  bool glvis = false;            ///< Enable GLVis visualization.
   bool vtk_save = true;          ///< Enable ParaView/VTK output.
   mfem::real_t dt_save = 0.01;   ///< Save cadence for ParaView output.
   bool preassemble_weak_div = true; ///< Element-assembly vs matrix-free divergence.
@@ -76,8 +76,8 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "Time step. Positive number skips CFL timestep calculation.");
   args.AddOption(&opts.cfl, "-c", "--cfl-number",
                  "CFL number for timestep calculation.");
-  args.AddOption(&opts.visualization, "-vis", "--visualization", "-no-vis",
-                 "--no-visualization",
+  args.AddOption(&opts.glvis, "-glvis", "--glvis", "-no-glvis",
+                 "--no-glvis",
                  "Enable or disable GLVis visualization.");
   args.AddOption(&opts.vtk_save, "-vtk", "--vtk_save", "-no-vtk",
                  "--no-vtk_save",
@@ -108,4 +108,4 @@ inline std::string ResolveMeshPath(const std::string& default_mesh,
   return override_mesh.empty() ? default_mesh : override_mesh;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

@@ -24,6 +24,7 @@
 #include <functional>
 
 #include "mfem.hpp"
+#include "utils/math/constants.hpp"
 
 namespace mfem
 {
@@ -145,8 +146,8 @@ std::function<void(const Vector&, Vector&)> GetShockVortexInteractionInit(
    const real_t yv = 0.5;
    const real_t eps = 5.0;
 
-   const real_t pi = 3.14159265358979323846;
-   const real_t two_pi = 2.0 * pi;
+   const real_t pi = static_cast<real_t>(dg_sim::math::kPi);
+   const real_t two_pi = static_cast<real_t>(dg_sim::math::kTwoPi);
 
    const real_t eps_over_2pi = eps / two_pi;
    const real_t coeff_Tp =
@@ -304,8 +305,8 @@ inline std::function<void(const Vector&, Vector&)> GetShockVortexInoueHattoriIni
 
    // Mv is the canonical vortex Mach number; choose eps = 2π Mv so that
    // u_θ = Mv r exp((1 - r²)/2) matches the standard isentropic vortex.
-   const real_t pi     = 3.14159265358979323846;
-   const real_t two_pi = 2.0 * pi;
+   const real_t pi = static_cast<real_t>(dg_sim::math::kPi);
+   const real_t two_pi = static_cast<real_t>(dg_sim::math::kTwoPi);
 
    const real_t eps    = two_pi * Mv;
    const real_t eps_over_2pi = eps / two_pi; // = Mv

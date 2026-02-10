@@ -18,15 +18,20 @@
 #include "sim/wiring/bc_wiring.hpp"
 #include "sim/time/time_callbacks.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
-/// @brief Visualization configuration for GLVis/H1 diagnostics.
-struct VisualizationConfig
+/// @brief GLVis runtime configuration.
+struct GLVisConfig
 {
   bool enabled = false;
-  bool h1_diagnostics = false;
   int precision = 8;
+};
+
+/// @brief Optional diagnostics fields computed for GLVis/VTK outputs.
+struct DiagnosticsConfig
+{
+  bool h1_diagnostics = false;
 };
 
 /// @brief VTK configuration knobs for example outputs.
@@ -59,7 +64,8 @@ struct CaseSpec
 
   CaseOptions options;
   IGROptions igr_defaults;
-  VisualizationConfig vis;
+  GLVisConfig glvis;
+  DiagnosticsConfig diagnostics;
   VTKConfig vtk;
   DefaultCallbackConfig callback_defaults;
   std::function<TimeLoopCallbacks(const ExampleContext&, EulerStateBundle&)> make_callbacks;
@@ -93,4 +99,4 @@ struct RunSpec
   const mfem::VectorCoefficient* ic = nullptr;
 };
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

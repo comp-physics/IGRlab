@@ -20,7 +20,7 @@
 #include "sim/config/common_options.hpp"
 #include "sim/time/time_loop.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Options controlling the IGR discretization wiring in examples.
@@ -107,18 +107,6 @@ struct RunConfig
   DGSEMSurfaceFlux dgsem_surface_flux = DGSEMSurfaceFlux::Rusanov;
   DGSEMEntropyJacobian dgsem_entropy_jacobian = DGSEMEntropyJacobian::FiniteDifference;
   std::string mesh_path;
-  int order = 1;
-  int ser_ref_levels = 0;
-  int par_ref_levels = 0;
-  mfem::real_t t_final = 0.0;
-  mfem::real_t dt = 0.0;
-  mfem::real_t cfl = 0.0;
-  bool visualization = false;
-  bool vtk_save = false;
-  mfem::real_t dt_save = 0.0;
-  bool preassemble_weak_div = true;
-  int vis_steps = 0;
-  int int_order_offset = 1;
 };
 
 inline std::string ToLowerCopy(std::string value)
@@ -294,9 +282,11 @@ inline const char* DGSEMSurfaceFluxToString(DGSEMSurfaceFlux flux)
   switch (flux)
   {
     case DGSEMSurfaceFlux::Rusanov: return "rusanov";
+    case DGSEMSurfaceFlux::DiffusiveRusanov: return "diffusive-rusanov";
     case DGSEMSurfaceFlux::EntropyStableWinters: return "es-winters";
     case DGSEMSurfaceFlux::EntropyStableLFEntropyVars: return "es-lf-entropy";
   }
+  MFEM_ABORT("Unhandled DGSEMSurfaceFlux enum value in DGSEMSurfaceFluxToString.");
   return "rusanov";
 }
 
@@ -399,18 +389,6 @@ inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
   run_cfg.dgsem_entropy_jacobian =
       ParseDGSEMEntropyJacobian(opts.dgsem_entropy_jacobian);
   run_cfg.mesh_path = ResolveCaseMesh(case_cfg, opts.mesh_file);
-  run_cfg.order = opts.order;
-  run_cfg.ser_ref_levels = opts.ser_ref_levels;
-  run_cfg.par_ref_levels = opts.par_ref_levels;
-  run_cfg.t_final = opts.t_final;
-  run_cfg.dt = opts.dt;
-  run_cfg.cfl = opts.cfl;
-  run_cfg.visualization = opts.visualization;
-  run_cfg.vtk_save = opts.vtk_save;
-  run_cfg.dt_save = opts.dt_save;
-  run_cfg.preassemble_weak_div = opts.preassemble_weak_div;
-  run_cfg.vis_steps = opts.vis_steps;
-  run_cfg.int_order_offset = case_cfg.int_order_offset;
   return run_cfg;
 }
 
@@ -438,4 +416,4 @@ inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)
   return cfg;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

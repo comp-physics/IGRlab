@@ -84,17 +84,17 @@ struct ForwardFacingOptions
 
 int main(int argc, char *argv[])
 {
-  dg_igr_examples::CaseSpec<ForwardFacingOptions, mfem::DGSEMSurfaceFlux> spec;
+  dg_sim::CaseSpec<ForwardFacingOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "forward_facing_step";
   spec.default_mesh_path = mfem::ForwardFacingStepDefaultMeshPath();
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
   spec.need_sigma = true;
   spec.need_h1 = true;
-  spec.vis.h1_diagnostics = true;
-  spec.vis.precision = 8;
+  spec.diagnostics.h1_diagnostics = true;
+  spec.glvis.precision = 8;
 
-  spec.configure_case = [](dg_igr_examples::CaseConfig& cfg)
+  spec.configure_case = [](dg_sim::CaseConfig& cfg)
   {
     cfg.defaults.t_final = 4.0;
     cfg.rk3_config.max_limiter_steps = 500;
@@ -106,7 +106,7 @@ int main(int argc, char *argv[])
   };
 
   spec.make_ic = [](const ForwardFacingOptions& opts,
-                    const dg_igr_examples::ExampleContext&,
+                    const dg_sim::ExampleContext&,
                     double)
   {
     mfem::Vector Uin(4);
@@ -118,17 +118,17 @@ int main(int argc, char *argv[])
     return std::make_unique<mfem::VectorFunctionCoefficient>(ic_fun);
   };
 
-  spec.build_markers = [](dg_igr_examples::ExampleContext& ctx)
+  spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
-    return dg_igr_examples::BuildBoundaryMarkers(
+    return dg_sim::BuildBoundaryMarkers(
         ctx.Mesh(),
-        {{dg_igr_examples::BoundaryRole::Inlet, {1, 2}},
-         {dg_igr_examples::BoundaryRole::Outlet, {3}},
-         {dg_igr_examples::BoundaryRole::Slip, {4, 5, 6, 7}}});
+        {{dg_sim::BoundaryRole::Inlet, {1, 2}},
+         {dg_sim::BoundaryRole::Outlet, {3}},
+         {dg_sim::BoundaryRole::Slip, {4, 5, 6, 7}}});
   };
 
   spec.apply_bc = [](const ForwardFacingOptions& opts,
-                     const dg_igr_examples::ExampleContext&,
+                     const dg_sim::ExampleContext&,
                      auto& bc,
                      const auto& markers)
   {
@@ -144,8 +144,8 @@ int main(int argc, char *argv[])
   };
 
   spec.postprocess = [](const ForwardFacingOptions&,
-                        const dg_igr_examples::ExampleContext&,
-                        const dg_igr_examples::EulerStateBundle& state,
+                        const dg_sim::ExampleContext&,
+                        const dg_sim::EulerStateBundle& state,
                         mfem::VectorCoefficient& ic)
   {
     const mfem::real_t error = state.sol.ComputeLpError(2, ic);
@@ -156,5 +156,5 @@ int main(int argc, char *argv[])
     return 0;
   };
 
-  return dg_igr_examples::Solver::solve(spec, argc, argv);
+  return dg_sim::Solver::solve(spec, argc, argv);
 }

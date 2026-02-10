@@ -11,7 +11,7 @@
 #include "sim/wiring/dgsem_flux_config.hpp"
 #include "sim/wiring/flux_bundle.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Euler+IGR physics bundle with BC wiring applied.
@@ -32,7 +32,7 @@ struct EulerIGRPhysics
   {
     ConfigureDGSEMSurfaceFlux(flux.numerical_flux, ctx.run_cfg, gamma);
     EulerBoundaryWiring<NumericalFlux> bc(
-        op, flux.numerical_flux, ctx.run_cfg.int_order_offset, ctx.dim);
+        op, flux.numerical_flux, ctx.run_cfg.case_config.int_order_offset, ctx.dim);
     bc_setup(bc, markers);
   }
 };
@@ -50,4 +50,4 @@ inline EulerIGRPhysics<NumericalFlux> MakeEulerIGRPhysics(
       ctx, gamma, igr, markers, std::forward<BcSetup>(bc_setup));
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

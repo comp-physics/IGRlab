@@ -211,6 +211,7 @@ private:
   int    lin_print_ = mfem::dg_igr::IGRDefaults::kLinPrint;
 
   // Σ field
+  mfem::ParGridFunction state_scratch_; // instance-owned scratch used for coeff bootstrap
   mfem::ParGridFunction sigma_;
 
   // FE forms (reused each call; values change, sparsity fixed)

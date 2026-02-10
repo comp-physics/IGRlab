@@ -24,6 +24,11 @@ struct EulerVTKFields
   mfem::ParGridFunction* velocity = nullptr;
   mfem::ParGridFunction* sigma = nullptr;
   mfem::ParGridFunction* pressure = nullptr;
+  // Optional H1 diagnostics (typically projected from conservative state).
+  mfem::ParGridFunction* velocity_h1 = nullptr;
+  mfem::ParGridFunction* speed_h1 = nullptr;
+  mfem::ParGridFunction* div_h1 = nullptr;
+  mfem::ParGridFunction* grad_frob_h1 = nullptr;
 };
 
 /// @brief Apply a standardized VTK output configuration to a data collection.

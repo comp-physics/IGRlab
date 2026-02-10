@@ -83,7 +83,7 @@ if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
               $<TARGET_FILE:dgsem_smooth_advection>
               -m ${CMAKE_SOURCE_DIR}/examples/dgsem_smooth_advection/smooth_advection.msh
               -rs 0 -rp 0 -o 2 -tf 1.0e-4 -dt 1.0e-4 -c 0.0
-              -no-vis -vs 1000000 -nan-scan
+              -no-glvis -vs 1000000 -nan-scan
               -no-vtk -dt_save 1.0
               --dg-backend dgsem
               ${MPIEXEC_POSTFLAGS}
@@ -131,7 +131,7 @@ function(add_example_regression test_name target mesh_path_rel)
       COMMAND $<TARGET_FILE:${target}>
               -m ${CMAKE_SOURCE_DIR}/${mesh_path_rel}
               -rs 0 -rp 0 -o 1 -tf ${reg_tf} -dt ${reg_dt} -c 0.0
-              -no-vis -vs 1000000 -nan-scan
+              -no-glvis -vs 1000000 -nan-scan
               ${extra_args}
     )
     set_tests_properties(${test_name} PROPERTIES

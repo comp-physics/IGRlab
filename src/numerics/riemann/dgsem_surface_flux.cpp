@@ -1,11 +1,34 @@
 #include "numerics/riemann/dgsem_surface_flux.hpp"
+#include "numerics/riemann/side_scope_utils.hpp"
+
+#include <algorithm>
 
 namespace mfem
 {
 
+namespace
+{
+
+inline const char* SurfaceFluxTypeName(DGSEMSurfaceFluxType type)
+{
+  switch (type)
+  {
+    case DGSEMSurfaceFluxType::Rusanov: return "rusanov";
+    case DGSEMSurfaceFluxType::DiffusiveRusanov: return "diffusive-rusanov";
+    case DGSEMSurfaceFluxType::EntropyStableWinters: return "es-winters";
+    case DGSEMSurfaceFluxType::EntropyStableLFEntropyVars: return "es-lf-entropy";
+  }
+  MFEM_ABORT("Unhandled DGSEMSurfaceFluxType enum value: "
+             << static_cast<int>(type));
+  return "invalid";
+}
+
+} // namespace
+
 DGSEMSurfaceFlux::DGSEMSurfaceFlux(const FluxFunction &fluxFunction)
   : NumericalFlux(fluxFunction),
     flux_fn_(fluxFunction),
+    side_explicit_flux_(dynamic_cast<const FaceSideExplicitFlux*>(&fluxFunction)),
     rusanov_(fluxFunction),
     diffusive_rusanov_(fluxFunction, /*beta=*/2.0)
 {
@@ -34,21 +57,10 @@ real_t DGSEMSurfaceFlux::Eval(const Vector &state1, const Vector &state2,
   }
 
   Vector flux_tmp(state1.Size());
-  real_t speed1 = 0.0;
-  real_t speed2 = 0.0;
-  if (auto* side_aware =
-          dynamic_cast<FaceSideAwareFlux*>(const_cast<FluxFunction*>(&flux_fn_)))
-  {
-    side_aware->SetFaceSide(FaceSide::Left);
-    speed1 = flux_fn_.ComputeFluxDotN(state1, nor, Tr, flux_tmp);
-    side_aware->SetFaceSide(FaceSide::Right);
-    speed2 = flux_fn_.ComputeFluxDotN(state2, nor, Tr, flux_tmp);
-  }
-  else
-  {
-    speed1 = flux_fn_.ComputeFluxDotN(state1, nor, Tr, flux_tmp);
-    speed2 = flux_fn_.ComputeFluxDotN(state2, nor, Tr, flux_tmp);
-  }
+  const real_t speed1 = riemann_detail::ComputeFluxDotNForSide(
+      side_explicit_flux_, flux_fn_, FaceSide::Left, state1, nor, Tr, flux_tmp);
+  const real_t speed2 = riemann_detail::ComputeFluxDotNForSide(
+      side_explicit_flux_, flux_fn_, FaceSide::Right, state2, nor, Tr, flux_tmp);
 
   const real_t max_speed = std::max(speed1, speed2);
 
@@ -92,7 +104,10 @@ void DGSEMSurfaceFlux::Grad(int side, const Vector &state1, const Vector &state2
     diffusive_rusanov_.Grad(side, state1, state2, nor, Tr, grad);
     return;
   }
-  MFEM_ABORT("DGSEMSurfaceFlux::Grad not implemented for entropy-stable flux.");
+  MFEM_VERIFY(false,
+              "DGSEMSurfaceFlux::Grad is unsupported for entropy-stable surface flux '"
+                  << SurfaceFluxTypeName(type_)
+                  << "'. Use rusanov/diffusive-rusanov for Jacobian paths.");
 }
 
 real_t DGSEMSurfaceFlux::Average(const Vector &state1, const Vector &state2,
@@ -125,7 +140,11 @@ void DGSEMSurfaceFlux::AverageGrad(int side, const Vector &state1,
     diffusive_rusanov_.AverageGrad(side, state1, state2, nor, Tr, grad);
     return;
   }
-  MFEM_ABORT("DGSEMSurfaceFlux::AverageGrad not implemented for entropy-stable flux.");
+  MFEM_VERIFY(false,
+              "DGSEMSurfaceFlux::AverageGrad is unsupported for entropy-stable "
+              "surface flux '"
+                  << SurfaceFluxTypeName(type_)
+                  << "'. Use rusanov/diffusive-rusanov for Jacobian paths.");
 }
 
 } // namespace mfem

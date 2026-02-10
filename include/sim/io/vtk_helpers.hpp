@@ -14,7 +14,7 @@
 
 #include "sim/config/case_config.hpp"
 
-namespace dg_igr_examples
+namespace dg_sim
 {
 
 /// @brief Default VTK output directory for a case (prefix_path/case_name).
@@ -36,7 +36,7 @@ inline std::string MakeCaseVTKDatasetName(const CaseConfig& case_cfg,
                              : c_alpha_value;
   std::ostringstream name;
   name << case_cfg.case_name
-       << "_p_" << run_cfg.order
+       << "_p_" << run_cfg.opts.order
        << "_ref_" << total_ref
        << "_is_" << run_cfg.igr_opts.space
        << "_ig_" << run_cfg.igr_opts.grad
@@ -52,4 +52,4 @@ inline mfem::io::VTKOutputConfig MakeCaseVTKConfig(const CaseConfig& case_cfg)
   return cfg;
 }
 
-} // namespace dg_igr_examples
+} // namespace dg_sim

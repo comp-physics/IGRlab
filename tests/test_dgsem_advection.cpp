@@ -7,6 +7,7 @@
 #include "physics/bc/boundary_state.hpp"
 #include "physics/euler/conversions.hpp"
 #include "physics/euler/eos.hpp"
+#include "utils/math/constants.hpp"
 #include "utils/mesh/boundary_markers.hpp"
 
 #include "mfem.hpp"
@@ -24,7 +25,7 @@ namespace dg_igr_tests
 namespace
 {
 
-constexpr double kPi = 3.14159265358979323846;
+constexpr double kPi = dg_sim::math::kPi;
 
 mfem::Mesh MakePeriodicMesh1D(int n)
 {
