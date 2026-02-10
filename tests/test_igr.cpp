@@ -71,6 +71,7 @@ public:
                            mfem::ElementTransformation &,
                            mfem::DenseMatrix &flux) const override
   {
+    flux.SetSize(num_equations, dim);
     for (int d = 0; d < dim; ++d)
     {
       for (int i = 0; i < num_equations; ++i)
