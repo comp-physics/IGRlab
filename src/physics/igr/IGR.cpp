@@ -32,12 +32,16 @@ inline double IPDGPenalty(const mfem::FiniteElementSpace &fes, double Cbase = 4.
 inline bool IsSPD_DefaultAssumption(const mfem::FiniteElementSpace &sfes,
                                    IGRSolver::IPKind ip_kind)
 {
-  // Safe heuristic:
-  //  - H1 space with symmetric bilinear form => SPD
-  //  - DG diffusion is SPD under SIPG (kappa = -1), but can be nonsymmetric for NIPG.
+  // Robust heuristic for solver selection:
+  //  - H1 space with symmetric bilinear form => SPD (safe for CG).
+  //  - DG/L2 spaces are treated as non-SPD in production, even with SIPG.
+  //    In theory SIPG can be SPD, but practical assembly details
+  //    (variable coefficients, face handling, parallel reductions) make CG
+  //    brittle. We select/fallback to GMRES for robustness.
   if (IsDGSpace(sfes))
   {
-    return (ip_kind == IGRSolver::IPKind::SIPG);
+    (void)ip_kind;
+    return false;
   }
   return true; // H1: mass + diffusion -> SPD
 }
@@ -200,8 +204,9 @@ IGRSolver::IGRSolver(const mfem::ParFiniteElementSpace& sigma_fes,
     const int    kappa    = static_cast<int>(ip_kind_);           // -1(SIPG),0, +1
     a_->AddInteriorFaceIntegrator(
         new mfem::DGDiffusionIntegrator(*ck_coef_, sigma_ip, kappa));
-    a_->AddBdrFaceIntegrator(
-        new mfem::DGDiffusionIntegrator(*ck_coef_, sigma_ip, kappa));
+    // For the IGR sigma equation, default behavior is natural boundary
+    // conditions. Do not add DG boundary diffusion terms unless a specific
+    // weak boundary closure is implemented.
   }
 
   // RHS: α ( ||∇u||_F^2 + (∇·u)^2 , v )
@@ -388,12 +393,30 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   {
     solver_choice = spd_ok ? LinearSolverType::CG : LinearSolverType::GMRES;
   }
+  else if (solver_choice == LinearSolverType::CG && !spd_ok)
+  {
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[igr] event=solver-fallback requested=cg selected=gmres "
+                   "reason=\"IGR operator not guaranteed SPD for this space/backend\"\n";
+    }
+    solver_choice = LinearSolverType::GMRES;
+  }
 
   // --- Choose preconditioner (Auto -> AMG for H1, smoother for DG) ---
   PrecondType prec_choice = prec_type_;
   if (prec_choice == PrecondType::Auto)
   {
-    prec_choice = (!is_dg) ? PrecondType::BoomerAMG : PrecondType::HypreSmoother;
+    // For DG/L2 with SIPG we typically get a diffusion-dominated operator
+    // where AMG is a stronger default preconditioner than simple smoothing.
+    if (!is_dg || ip_kind_ == IPKind::SIPG)
+    {
+      prec_choice = PrecondType::BoomerAMG;
+    }
+    else
+    {
+      prec_choice = PrecondType::HypreSmoother;
+    }
   }
 
   std::unique_ptr<mfem::Solver> prec;
