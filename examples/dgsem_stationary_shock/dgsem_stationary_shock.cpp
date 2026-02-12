@@ -29,6 +29,8 @@ int main(int argc, char *argv[])
   spec.need_sigma = true;
   spec.need_h1 = false;
   spec.diagnostics.h1_diagnostics = true;
+  spec.diagnostics.l2_diagnostics = true;
+  spec.diagnostics.mpi_rank_field = true;
   spec.glvis.precision = 8;
   spec.vtk.print_dataset_name = true;
   spec.dg_backend_default = dg_sim::DGBackend::DGSEM;

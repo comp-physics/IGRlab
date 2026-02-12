@@ -31,7 +31,9 @@ struct GLVisConfig
 /// @brief Optional diagnostics fields computed for GLVis/VTK outputs.
 struct DiagnosticsConfig
 {
-  bool h1_diagnostics = false;
+  bool h1_diagnostics = false;   ///< H1-projected diagnostics (velocity_h1, speed_h1, div_h1, grad_frob_h1).
+  bool l2_diagnostics = false;   ///< Broken/L2 diagnostics from conservative-state gradients (div_l2, grad_frob_l2).
+  bool mpi_rank_field = false;   ///< Per-element MPI rank field for VTK debugging.
 };
 
 /// @brief VTK configuration knobs for example outputs.

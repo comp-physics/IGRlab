@@ -27,6 +27,9 @@ void RegisterEulerFields(mfem::ParaViewDataCollection& dc,
   if (fields.speed_h1) { dc.RegisterField("speed_h1", fields.speed_h1); }
   if (fields.div_h1) { dc.RegisterField("div_h1", fields.div_h1); }
   if (fields.grad_frob_h1) { dc.RegisterField("grad_frob_h1", fields.grad_frob_h1); }
+  if (fields.div_l2) { dc.RegisterField("div_l2", fields.div_l2); }
+  if (fields.grad_frob_l2) { dc.RegisterField("grad_frob_l2", fields.grad_frob_l2); }
+  if (fields.mpi_rank) { dc.RegisterField("mpi_rank", fields.mpi_rank); }
 }
 
 } // namespace io

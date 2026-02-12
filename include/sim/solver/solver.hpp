@@ -262,6 +262,10 @@ struct Solver
     const bool enable_h1_vis_diag =
         spec.diagnostics.h1_diagnostics &&
         (run_cfg.opts.glvis || run_cfg.opts.vtk_save);
+    const bool enable_l2_diag =
+        spec.diagnostics.l2_diagnostics && run_cfg.opts.vtk_save;
+    const bool enable_mpi_rank_diag =
+        spec.diagnostics.mpi_rank_field && run_cfg.opts.vtk_save;
     const bool need_h1 = spec.need_h1 || enable_h1_vis_diag;
     ExampleContext ctx = BuildExampleContext(run_cfg, run_cfg.igr_opts.space,
                                              need_sigma, need_h1);
@@ -322,11 +326,24 @@ struct Solver
         : MakeDefaultTimeLoopCallbacks(spec.callback_defaults);
 
     std::unique_ptr<H1Diagnostics> h1_diag;
+    std::unique_ptr<L2Diagnostics> l2_diag;
+    std::unique_ptr<MPIRankField> mpi_rank_field;
     if (enable_h1_vis_diag)
     {
       h1_diag = std::make_unique<H1Diagnostics>(
           *ctx.spaces.h1_vfes, state_bundle.sol, ctx.dim, rho_floor);
       state_bundle.field_list.h1_diag = h1_diag.get();
+    }
+    if (enable_l2_diag)
+    {
+      l2_diag = std::make_unique<L2Diagnostics>(
+          ctx.spaces.fes, state_bundle.sol, ctx.dim, rho_floor);
+      state_bundle.field_list.l2_diag = l2_diag.get();
+    }
+    if (enable_mpi_rank_diag)
+    {
+      mpi_rank_field = std::make_unique<MPIRankField>(ctx.Mesh());
+      state_bundle.field_list.mpi_rank = mpi_rank_field.get();
     }
 
     if (spec.after_init)

@@ -5,6 +5,7 @@
  * @brief GLVis/VTK field helpers for Euler visualization.
  */
 
+#include <memory>
 #include <utility>
 
 #include "mfem.hpp"
@@ -18,6 +19,8 @@ namespace dg_sim
 {
 
 struct H1Diagnostics;
+struct L2Diagnostics;
+struct MPIRankField;
 
 /// @brief Field handles for common Euler visualization/export helpers.
 struct EulerFieldList
@@ -27,6 +30,8 @@ struct EulerFieldList
   EulerVelocityView* velocity = nullptr;
   dg_igr::IGRSolver* igr = nullptr;
   H1Diagnostics* h1_diag = nullptr;
+  L2Diagnostics* l2_diag = nullptr;
+  MPIRankField* mpi_rank = nullptr;
 };
 
 /// @brief GLVis windows for common Euler fields.
@@ -75,6 +80,50 @@ struct H1Diagnostics
     g_gfrob.ProjectCoefficient(cF);
     g_div.ProjectCoefficient(cD);
     g_umag.ProjectCoefficient(cM);
+  }
+};
+
+/// @brief Broken/L2 diagnostics computed directly from conservative state gradients.
+struct L2Diagnostics
+{
+  mfem::ParGridFunction g_div_l2;
+  mfem::ParGridFunction g_gfrob_l2;
+  mfem::DivFromConservativeCoeff c_div;
+  mfem::GradFrobFromConservativeCoeff c_gfrob;
+
+  L2Diagnostics(mfem::ParFiniteElementSpace& scalar_fes,
+                mfem::ParGridFunction& sol,
+                int dim_in,
+                double rho_floor)
+    : g_div_l2(&scalar_fes),
+      g_gfrob_l2(&scalar_fes),
+      c_div(&sol, dim_in, rho_floor),
+      c_gfrob(&sol, dim_in, rho_floor)
+  {
+    g_div_l2 = 0.0;
+    g_gfrob_l2 = 0.0;
+  }
+
+  void Update()
+  {
+    g_div_l2.ProjectCoefficient(c_div);
+    g_gfrob_l2.ProjectCoefficient(c_gfrob);
+  }
+};
+
+/// @brief Per-element MPI rank as an order-0 discontinuous field.
+struct MPIRankField
+{
+  std::unique_ptr<mfem::L2_FECollection> fec0;
+  std::unique_ptr<mfem::ParFiniteElementSpace> fes0;
+  mfem::ParGridFunction rank;
+
+  explicit MPIRankField(mfem::ParMesh& mesh)
+    : fec0(std::make_unique<mfem::L2_FECollection>(0, mesh.Dimension())),
+      fes0(std::make_unique<mfem::ParFiniteElementSpace>(&mesh, fec0.get())),
+      rank(fes0.get())
+  {
+    rank = static_cast<double>(mfem::Mpi::WorldRank());
   }
 };
 
@@ -173,6 +222,15 @@ inline mfem::io::EulerVTKFields MakeEulerVTKFields(const EulerFieldList& fields)
     out.div_h1 = &fields.h1_diag->g_div;
     out.grad_frob_h1 = &fields.h1_diag->g_gfrob;
   }
+  if (fields.l2_diag)
+  {
+    out.div_l2 = &fields.l2_diag->g_div_l2;
+    out.grad_frob_l2 = &fields.l2_diag->g_gfrob_l2;
+  }
+  if (fields.mpi_rank)
+  {
+    out.mpi_rank = &fields.mpi_rank->rank;
+  }
   return out;
 }
 
@@ -238,6 +296,10 @@ inline void UpdateEulerOutputFields(const EulerFieldList& fields,
   if (fields.h1_diag)
   {
     fields.h1_diag->Update();
+  }
+  if (fields.l2_diag)
+  {
+    fields.l2_diag->Update();
   }
 }
 

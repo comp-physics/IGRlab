@@ -113,4 +113,101 @@ struct VelMagCoeff : public mfem::Coefficient
   }
 };
 
+// --- Diagnostics directly from conservative state (broken/DG gradient path) ---
+class DivFromConservativeCoeff : public mfem::Coefficient
+{
+public:
+  DivFromConservativeCoeff(const mfem::ParGridFunction* U, int dim,
+                           double rho_floor)
+    : U_(U), dim_(dim), rho_floor_(rho_floor),
+      state_(dim + 2), grad_u_(dim + 2, dim), gradu_(dim, dim)
+  {
+  }
+
+  void SetState(const mfem::ParGridFunction* U) { U_ = U; }
+
+  double Eval(mfem::ElementTransformation& T,
+              const mfem::IntegrationPoint& ip) override
+  {
+    MFEM_VERIFY(U_ != nullptr, "DivFromConservativeCoeff: U is null");
+    T.SetIntPoint(&ip);
+    U_->GetVectorValue(T, ip, state_);
+    U_->GetVectorGradient(T, grad_u_);
+
+    const double rho = std::max(state_(0), rho_floor_);
+    const double rho2 = rho * rho;
+    for (int i = 0; i < dim_; ++i)
+    {
+      const double mi = state_(1 + i);
+      for (int j = 0; j < dim_; ++j)
+      {
+        const double dmij = grad_u_(1 + i, j);
+        const double drhoj = grad_u_(0, j);
+        gradu_(i, j) = (rho * dmij - mi * drhoj) / rho2;
+      }
+    }
+
+    double divu = 0.0;
+    for (int i = 0; i < dim_; ++i) { divu += gradu_(i, i); }
+    return divu;
+  }
+
+private:
+  const mfem::ParGridFunction* U_ = nullptr;
+  int dim_ = 0;
+  double rho_floor_ = 1.0e-12;
+  mutable mfem::Vector state_;
+  mutable mfem::DenseMatrix grad_u_;
+  mutable mfem::DenseMatrix gradu_;
+};
+
+class GradFrobFromConservativeCoeff : public mfem::Coefficient
+{
+public:
+  GradFrobFromConservativeCoeff(const mfem::ParGridFunction* U, int dim,
+                                double rho_floor)
+    : U_(U), dim_(dim), rho_floor_(rho_floor),
+      state_(dim + 2), grad_u_(dim + 2, dim), gradu_(dim, dim)
+  {
+  }
+
+  void SetState(const mfem::ParGridFunction* U) { U_ = U; }
+
+  double Eval(mfem::ElementTransformation& T,
+              const mfem::IntegrationPoint& ip) override
+  {
+    MFEM_VERIFY(U_ != nullptr, "GradFrobFromConservativeCoeff: U is null");
+    T.SetIntPoint(&ip);
+    U_->GetVectorValue(T, ip, state_);
+    U_->GetVectorGradient(T, grad_u_);
+
+    const double rho = std::max(state_(0), rho_floor_);
+    const double rho2 = rho * rho;
+    for (int i = 0; i < dim_; ++i)
+    {
+      const double mi = state_(1 + i);
+      for (int j = 0; j < dim_; ++j)
+      {
+        const double dmij = grad_u_(1 + i, j);
+        const double drhoj = grad_u_(0, j);
+        gradu_(i, j) = (rho * dmij - mi * drhoj) / rho2;
+      }
+    }
+
+    double sq = 0.0;
+    for (int i = 0; i < dim_; ++i)
+      for (int j = 0; j < dim_; ++j)
+        sq += gradu_(i, j) * gradu_(i, j);
+    return std::sqrt(sq);
+  }
+
+private:
+  const mfem::ParGridFunction* U_ = nullptr;
+  int dim_ = 0;
+  double rho_floor_ = 1.0e-12;
+  mutable mfem::Vector state_;
+  mutable mfem::DenseMatrix grad_u_;
+  mutable mfem::DenseMatrix gradu_;
+};
+
 } // namespace mfem
