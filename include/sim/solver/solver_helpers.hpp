@@ -13,6 +13,8 @@
 #include "sim/context/example_context.hpp"
 #include "sim/context/mesh_build.hpp"
 
+#include <limits>
+
 namespace dg_sim
 {
 
@@ -25,6 +27,33 @@ inline void ApplyGradOption(const std::string& grad_opt, dg_igr::IGRConfig& cfg)
     return;
   }
   cfg.backend = dg_igr::IGRGradBackend::BrokenDG;
+}
+
+inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
+                                           dg_igr::IGRConfig& cfg)
+{
+  ApplyGradOption(igr_opts.grad, cfg);
+  cfg.solve_mode = ParseIGRSolveMode(igr_opts.solve_mode);
+  cfg.lin_solver_type = ParseIGRLinearSolverType(igr_opts.linear_solver);
+  cfg.prec_type = ParseIGRPrecondType(igr_opts.preconditioner);
+  cfg.ip_kind = ParseIGRIPKind(igr_opts.ip_kind);
+
+  if (igr_opts.lin_rtol >= 0.0)
+  {
+    cfg.lin_rtol = igr_opts.lin_rtol;
+  }
+  if (igr_opts.lin_atol >= 0.0)
+  {
+    cfg.lin_atol = igr_opts.lin_atol;
+  }
+  if (igr_opts.lin_maxit >= 0)
+  {
+    cfg.lin_maxit = igr_opts.lin_maxit;
+  }
+  if (igr_opts.lin_print != std::numeric_limits<int>::min())
+  {
+    cfg.lin_print = igr_opts.lin_print;
+  }
 }
 
 inline mfem::RK3SSPWithLimiter MakeRK3Stepper(mfem::ParFiniteElementSpace& vfes,
@@ -50,7 +79,7 @@ inline dg_igr::IGRSolver MakeIGRSolver(const DGSpaces& spaces,
   dg_igr::IGRConfig igr_cfg = run_cfg.case_config.igr_config;
   igr_cfg.alpha = alpha_info.alpha;
   igr_cfg.rho_floor = rho_floor;
-  ApplyGradOption(run_cfg.igr_opts.grad, igr_cfg);
+  ApplyIGRRuntimeOptionOverrides(run_cfg.igr_opts, igr_cfg);
 
   dg_igr::IGRSolver igr(*spaces.sigma_fes, spaces.vfes, dim, num_equations, igr_cfg.alpha);
   igr.ApplyConfig(igr_cfg);

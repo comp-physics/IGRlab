@@ -1,7 +1,9 @@
 #pragma once
 #include "mfem.hpp"
 #include "utils/config/igr_config.hpp"
+#include <limits>
 #include <memory>
+#include <string>
 
 /**
  * @file physics/igr/IGR.hpp
@@ -105,6 +107,31 @@ public:
   /// Access the current Σ field.
   const mfem::ParGridFunction& GetSigma() const { return sigma_; }
   mfem::ParGridFunction&       GetSigma()       { return sigma_; }
+
+  /// Last linear solve diagnostics (updated by Krylov solve path).
+  int GetLastLinearIters() const { return last_linear_iters_; }
+  bool GetLastLinearConverged() const { return last_linear_converged_; }
+  double GetLastLinearFinalNorm() const { return last_linear_final_norm_; }
+  double GetLastLinearInitialNorm() const { return last_linear_initial_norm_; }
+  double GetLastLinearSolveSeconds() const { return last_linear_solve_seconds_; }
+  double GetTotalLinearSolveSeconds() const { return total_linear_solve_seconds_; }
+  int GetLinearSolveCalls() const { return linear_solve_calls_; }
+  int GetTotalLinearIterations() const { return total_linear_iters_; }
+  int GetTotalLinearConvergedCalls() const { return total_linear_converged_calls_; }
+  double GetAverageLinearIterations() const
+  {
+    return (linear_solve_calls_ > 0)
+               ? static_cast<double>(total_linear_iters_) /
+                     static_cast<double>(linear_solve_calls_)
+               : 0.0;
+  }
+  const std::string& GetLastLinearSolverName() const { return last_linear_solver_name_; }
+  const std::string& GetLastPrecondName() const { return last_precond_name_; }
+  /// Access the currently assembled linear operator (for diagnostics/tests).
+  const mfem::HypreParMatrix* GetAssembledOperator() const
+  {
+    return Ah_.As<mfem::HypreParMatrix>();
+  }
 
   /// Spatial dimension.
   int Dim() const { return dim_; }
@@ -234,6 +261,19 @@ private:
   std::unique_ptr<mfem::H1_FECollection>        h1_vec_fec_;
   std::unique_ptr<mfem::ParFiniteElementSpace>  h1_vec_fes_;  // vdim = dim
   std::unique_ptr<mfem::ParGridFunction>        vel_h1_;      // projected velocity
+
+  // Last Krylov solve telemetry.
+  int last_linear_iters_ = 0;
+  bool last_linear_converged_ = false;
+  double last_linear_final_norm_ = std::numeric_limits<double>::quiet_NaN();
+  double last_linear_initial_norm_ = std::numeric_limits<double>::quiet_NaN();
+  double last_linear_solve_seconds_ = 0.0;
+  double total_linear_solve_seconds_ = 0.0;
+  int linear_solve_calls_ = 0;
+  int total_linear_iters_ = 0;
+  int total_linear_converged_calls_ = 0;
+  std::string last_linear_solver_name_ = "none";
+  std::string last_precond_name_ = "none";
 };
 
 } // namespace dg_igr

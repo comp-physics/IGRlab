@@ -29,11 +29,28 @@ enum class IGRSolveMode { SmootherSweeps, Krylov };
 
 /// @brief Krylov solver selection for IGR solves.
 /// @ingroup utils_config
-enum class IGRLinearSolverType { Auto, CG, GMRES };
+enum class IGRLinearSolverType
+{
+  Auto,
+  CG,
+  GMRES,
+  FGMRES,
+  BiCGSTAB,
+  MINRES
+};
 
 /// @brief Preconditioner selection for IGR solves.
 /// @ingroup utils_config
-enum class IGRPrecondType { Auto, BoomerAMG, HypreSmoother, None };
+enum class IGRPrecondType
+{
+  Auto,
+  BoomerAMG,
+  HypreILU,
+  HypreEuclid,
+  ParaSails,
+  HypreSmoother,
+  None
+};
 
 /// @brief Configuration bundle for IGR defaults and runtime tuning.
 /// @ingroup utils_config

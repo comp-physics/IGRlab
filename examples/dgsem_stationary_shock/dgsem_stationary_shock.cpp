@@ -44,6 +44,27 @@ int main(int argc, char *argv[])
     cfg.defaults.dgsem_volume_dissipation = "llf";
     cfg.defaults.dgsem_surface_flux = "rusanov";
     cfg.rk3_config.limit_initial = false;
+
+    // IGR linear-solver reference defaults (runtime-overridable via CLI):
+    //   -im/--igr-solve-mode
+    //   -ils/--igr-linear-solver
+    //   -ipc/--igr-preconditioner
+    //   -iip/--igr-ip-kind
+    //   -irtol/--igr-lin-rtol
+    //   -iatol/--igr-lin-atol
+    //   -imaxit/--igr-lin-maxit
+    //   -iprint/--igr-lin-print
+    cfg.igr_config.solve_mode = dg_igr::IGRSolveMode::Krylov;
+    // Auto policy:
+    //   H1 -> CG + BoomerAMG
+    //   L2/DG -> GMRES + BoomerAMG
+    cfg.igr_config.lin_solver_type = dg_igr::IGRLinearSolverType::Auto;
+    cfg.igr_config.prec_type = dg_igr::IGRPrecondType::Auto;
+    cfg.igr_config.ip_kind = dg_igr::IGRIPKind::SIPG;
+    cfg.igr_config.lin_rtol = 1.0e-6;
+    cfg.igr_config.lin_atol = 0.0;
+    cfg.igr_config.lin_maxit = 1000;
+    cfg.igr_config.lin_print = 0;
   };
 
   spec.make_ic = [](const StationaryShockOptions&,

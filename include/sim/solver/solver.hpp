@@ -385,6 +385,22 @@ struct Solver
       return 2;
     }
 
+    if (igr && igr->GetLinearSolveCalls() > 0 && mfem::Mpi::Root())
+    {
+      const double avg_linear_time =
+          igr->GetTotalLinearSolveSeconds() /
+          static_cast<double>(igr->GetLinearSolveCalls());
+      std::cout << "[igr-linear] event=run-summary"
+                << " calls=" << igr->GetLinearSolveCalls()
+                << " converged_calls=" << igr->GetTotalLinearConvergedCalls()
+                << " avg_iters=" << igr->GetAverageLinearIterations()
+                << " avg_solve_s=" << avg_linear_time
+                << " total_solve_s=" << igr->GetTotalLinearSolveSeconds()
+                << " last_solver=" << igr->GetLastLinearSolverName()
+                << " last_precond=" << igr->GetLastPrecondName()
+                << "\n";
+    }
+
     SaveFinalEulerState(ctx, state_bundle.sol, spec.glvis.precision);
 
     if (spec.postprocess)

@@ -1,6 +1,8 @@
 #include "physics/igr/IGR.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <limits>
 
 
 namespace dg_igr
@@ -30,20 +32,115 @@ inline double IPDGPenalty(const mfem::FiniteElementSpace &fes, double Cbase = 4.
 }
 
 inline bool IsSPD_DefaultAssumption(const mfem::FiniteElementSpace &sfes,
-                                   IGRSolver::IPKind ip_kind)
+                                    IGRSolver::IPKind ip_kind)
 {
-  // Robust heuristic for solver selection:
-  //  - H1 space with symmetric bilinear form => SPD (safe for CG).
-  //  - DG/L2 spaces are treated as non-SPD in production, even with SIPG.
-  //    In theory SIPG can be SPD, but practical assembly details
-  //    (variable coefficients, face handling, parallel reductions) make CG
-  //    brittle. We select/fallback to GMRES for robustness.
+  // Structural policy:
+  //  - H1 operator is assembled symmetrically -> SPD-friendly.
+  //  - DG/L2 with SIPG is SPD-by-construction when DGDiffusionIntegrator
+  //    is wired as (sigma=-1, kappa>0 penalty). IIPG/NIPG are non-SPD.
   if (IsDGSpace(sfes))
   {
-    (void)ip_kind;
-    return false;
+    return ip_kind == IGRSolver::IPKind::SIPG;
   }
   return true; // H1: mass + diffusion -> SPD
+}
+
+inline const char* LinearSolverTypeName(IGRSolver::LinearSolverType t)
+{
+  switch (t)
+  {
+    case IGRSolver::LinearSolverType::Auto: return "auto";
+    case IGRSolver::LinearSolverType::CG: return "cg";
+    case IGRSolver::LinearSolverType::GMRES: return "gmres";
+    case IGRSolver::LinearSolverType::FGMRES: return "fgmres";
+    case IGRSolver::LinearSolverType::BiCGSTAB: return "bicgstab";
+    case IGRSolver::LinearSolverType::MINRES: return "minres";
+  }
+  return "auto";
+}
+
+inline const char* PrecondTypeName(IGRSolver::PrecondType t)
+{
+  switch (t)
+  {
+    case IGRSolver::PrecondType::Auto: return "auto";
+    case IGRSolver::PrecondType::BoomerAMG: return "boomeramg";
+    case IGRSolver::PrecondType::HypreILU: return "hypreilu";
+    case IGRSolver::PrecondType::HypreEuclid: return "hypreeuclid";
+    case IGRSolver::PrecondType::ParaSails: return "parasails";
+    case IGRSolver::PrecondType::HypreSmoother: return "hypresmoother";
+    case IGRSolver::PrecondType::None: return "none";
+  }
+  return "auto";
+}
+
+inline bool RequiresSPD(IGRSolver::LinearSolverType solver)
+{
+  return solver == IGRSolver::LinearSolverType::CG
+      || solver == IGRSolver::LinearSolverType::MINRES;
+}
+
+inline bool IsSymmetricPC(IGRSolver::PrecondType pc)
+{
+  return pc == IGRSolver::PrecondType::BoomerAMG
+      || pc == IGRSolver::PrecondType::HypreSmoother
+      || pc == IGRSolver::PrecondType::None;
+}
+
+inline bool VectorIsFinite(const mfem::Vector &v)
+{
+  const int n = v.Size();
+  for (int i = 0; i < n; ++i)
+  {
+    if (!std::isfinite(v(i)))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline void LogIGRFallback(const char* reason,
+                           IGRSolver::LinearSolverType requested_solver,
+                           IGRSolver::LinearSolverType selected_solver,
+                           IGRSolver::PrecondType requested_prec,
+                           IGRSolver::PrecondType selected_prec)
+{
+  if (!mfem::Mpi::Root())
+  {
+    return;
+  }
+  std::cout << "[igr-linear] event=fallback"
+            << " reason=\"" << reason << "\""
+            << " requested_solver=" << LinearSolverTypeName(requested_solver)
+            << " selected_solver=" << LinearSolverTypeName(selected_solver)
+            << " requested_precond=" << PrecondTypeName(requested_prec)
+            << " selected_precond=" << PrecondTypeName(selected_prec)
+            << "\n";
+}
+
+inline void LogIGRSelection(bool warm_start,
+                            bool is_dg,
+                            bool spd_ok,
+                            IGRSolver::LinearSolverType solver_choice,
+                            IGRSolver::PrecondType prec_choice,
+                            double lin_rtol,
+                            double lin_atol,
+                            int lin_maxit)
+{
+  if (!mfem::Mpi::Root())
+  {
+    return;
+  }
+  std::cout << "[igr-linear] event=select"
+            << " warm_start=" << (warm_start ? 1 : 0)
+            << " space=" << (is_dg ? "dg" : "h1")
+            << " spd_assumed=" << (spd_ok ? 1 : 0)
+            << " solver=" << LinearSolverTypeName(solver_choice)
+            << " precond=" << PrecondTypeName(prec_choice)
+            << " rtol=" << lin_rtol << " atol=" << lin_atol
+            << " maxit=" << lin_maxit
+            << "\n";
 }
 
 } // namespace
@@ -200,10 +297,10 @@ IGRSolver::IGRSolver(const mfem::ParFiniteElementSpace& sigma_fes,
   // If Σ-space is discontinuous, add IPDG face terms (interior + boundary)
   if (IsDGSpace(sfes_))
   {
-    const double sigma_ip = IPDGPenalty(sfes_);                   // penalty scaling
-    const int    kappa    = static_cast<int>(ip_kind_);           // -1(SIPG),0, +1
+    const double sigma = static_cast<double>(ip_kind_);           // -1(SIPG), 0, +1
+    const double kappa = IPDGPenalty(sfes_);                      // penalty scaling
     a_->AddInteriorFaceIntegrator(
-        new mfem::DGDiffusionIntegrator(*ck_coef_, sigma_ip, kappa));
+        new mfem::DGDiffusionIntegrator(*ck_coef_, sigma, kappa));
     // For the IGR sigma equation, default behavior is natural boundary
     // conditions. Do not add DG boundary diffusion terms unless a specific
     // weak boundary closure is implemented.
@@ -387,36 +484,49 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool is_dg  = IsDGSpace(sfes_);
   const bool spd_ok = IsSPD_DefaultAssumption(sfes_, ip_kind_);
 
-  // --- Choose solver (Auto -> CG if SPD, else GMRES) ---
+  last_linear_iters_ = 0;
+  last_linear_converged_ = false;
+  last_linear_final_norm_ = std::numeric_limits<double>::quiet_NaN();
+  last_linear_initial_norm_ = std::numeric_limits<double>::quiet_NaN();
+  last_linear_solve_seconds_ = 0.0;
+  last_linear_solver_name_ = "none";
+  last_precond_name_ = "none";
+
+  // --- Choose solver (Auto policy is space-aware) ---
+  const LinearSolverType requested_solver = lin_solver_type_;
   LinearSolverType solver_choice = lin_solver_type_;
   if (solver_choice == LinearSolverType::Auto)
   {
     solver_choice = spd_ok ? LinearSolverType::CG : LinearSolverType::GMRES;
   }
-  else if (solver_choice == LinearSolverType::CG && !spd_ok)
+
+  // Guardrail: do not use SPD-only Krylov methods when SPD assumptions fail.
+  if (RequiresSPD(solver_choice) && !spd_ok)
   {
-    if (mfem::Mpi::Root())
-    {
-      std::cout << "[igr] event=solver-fallback requested=cg selected=gmres "
-                   "reason=\"IGR operator not guaranteed SPD for this space/backend\"\n";
-    }
+    const LinearSolverType prev = solver_choice;
     solver_choice = LinearSolverType::GMRES;
+    LogIGRFallback("operator-not-spd",
+                   prev, solver_choice, prec_type_, prec_type_);
   }
 
-  // --- Choose preconditioner (Auto -> AMG for H1, smoother for DG) ---
+  // --- Choose preconditioner (Auto policy is space-aware) ---
+  const PrecondType requested_prec = prec_type_;
   PrecondType prec_choice = prec_type_;
   if (prec_choice == PrecondType::Auto)
   {
-    // For DG/L2 with SIPG we typically get a diffusion-dominated operator
-    // where AMG is a stronger default preconditioner than simple smoothing.
-    if (!is_dg || ip_kind_ == IPKind::SIPG)
-    {
-      prec_choice = PrecondType::BoomerAMG;
-    }
-    else
-    {
-      prec_choice = PrecondType::HypreSmoother;
-    }
+    // H1 and DG/L2: BoomerAMG is the robust default for this operator family.
+    // Keep other preconditioners available via runtime override.
+    (void)is_dg;
+    prec_choice = PrecondType::BoomerAMG;
+  }
+
+  // Guardrail: CG/MINRES should use symmetric/no preconditioners.
+  if (RequiresSPD(solver_choice) && !IsSymmetricPC(prec_choice))
+  {
+    const PrecondType prev = prec_choice;
+    prec_choice = PrecondType::BoomerAMG;
+    LogIGRFallback("spd-solver-with-nonsymmetric-preconditioner",
+                   requested_solver, solver_choice, prev, prec_choice);
   }
 
   std::unique_ptr<mfem::Solver> prec;
@@ -428,6 +538,27 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     amg->SetMaxIter(1);
     amg->SetTol(0.0);
     prec = std::move(amg);
+  }
+  else if (prec_choice == PrecondType::HypreILU)
+  {
+    auto ilu = std::make_unique<mfem::HypreILU>();
+    ilu->SetPrintLevel(0);
+    ilu->SetMaxIter(1);
+    ilu->SetTol(0.0);
+    ilu->SetOperator(*A);
+    prec = std::move(ilu);
+  }
+  else if (prec_choice == PrecondType::HypreEuclid)
+  {
+    auto euclid = std::make_unique<mfem::HypreEuclid>(*A);
+    euclid->SetStats(0);
+    prec = std::move(euclid);
+  }
+  else if (prec_choice == PrecondType::ParaSails)
+  {
+    auto parasails = std::make_unique<mfem::HypreParaSails>(*A);
+    parasails->SetLogging(0);
+    prec = std::move(parasails);
   }
   else if (prec_choice == PrecondType::HypreSmoother)
   {
@@ -445,36 +576,117 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
   // else None -> leave prec null
 
+  if (lin_print_ > 0)
+  {
+    LogIGRSelection(warm_start, is_dg, spd_ok, solver_choice, prec_choice,
+                    lin_rtol_, lin_atol_, lin_maxit_);
+  }
+
+  // Warm start is only safe if the prior solve produced a usable iterate.
+  // If not, fall back to a cold-start solve to avoid poisoning Krylov with
+  // stale/non-finite data.
+  bool enable_warm_start = warm_start;
+  if (enable_warm_start && linear_solve_calls_ > 0)
+  {
+    if (!last_linear_converged_ || !std::isfinite(last_linear_final_norm_))
+    {
+      enable_warm_start = false;
+      if (lin_print_ > 0)
+      {
+        LogIGRFallback("warm-start-disabled-after-unsuccessful-previous-solve",
+                       solver_choice, solver_choice, prec_choice, prec_choice);
+      }
+    }
+  }
+  if (!enable_warm_start || !VectorIsFinite(X_))
+  {
+    X_ = 0.0;
+    enable_warm_start = false;
+  }
+  MFEM_VERIFY(VectorIsFinite(B_),
+              "IGR RHS contains non-finite values before Krylov solve.");
+
+  auto configure_solver = [&](mfem::IterativeSolver& solver)
+  {
+    solver.SetOperator(*A);
+    if (prec) { solver.SetPreconditioner(*prec); }
+    solver.SetRelTol(lin_rtol_);
+    solver.SetAbsTol(lin_atol_);
+    solver.SetMaxIter(lin_maxit_);
+    solver.SetPrintLevel(lin_print_);
+    solver.iterative_mode = enable_warm_start;
+  };
+
+  const auto solve_start = std::chrono::steady_clock::now();
+
   if (solver_choice == LinearSolverType::CG)
   {
     mfem::CGSolver solver(comm);
-    solver.SetOperator(*A);
-    if (prec) { solver.SetPreconditioner(*prec); }
-
-    solver.SetRelTol(lin_rtol_);
-    solver.SetAbsTol(lin_atol_);
-    solver.SetMaxIter(lin_maxit_);
-    solver.SetPrintLevel(lin_print_);
-
-    // IMPORTANT: use warm-start guess X_ from FormLinearSystem if requested
-    // solver.SetInitialGuess(warm_start);
-
+    configure_solver(solver);
     solver.Mult(B_, X_);
+    last_linear_iters_ = solver.GetNumIterations();
+    last_linear_converged_ = solver.GetConverged();
+    last_linear_final_norm_ = solver.GetFinalNorm();
+    last_linear_initial_norm_ = solver.GetInitialNorm();
   }
-  else // GMRES
+  else if (solver_choice == LinearSolverType::GMRES)
   {
     mfem::GMRESSolver solver(comm);
-    solver.SetOperator(*A);
-    if (prec) { solver.SetPreconditioner(*prec); }
-
-    solver.SetRelTol(lin_rtol_);
-    solver.SetAbsTol(lin_atol_);
-    solver.SetMaxIter(lin_maxit_);
-    solver.SetPrintLevel(lin_print_);
-    // solver.iterative_mode = warm_start;
-
+    configure_solver(solver);
     solver.Mult(B_, X_);
+    last_linear_iters_ = solver.GetNumIterations();
+    last_linear_converged_ = solver.GetConverged();
+    last_linear_final_norm_ = solver.GetFinalNorm();
+    last_linear_initial_norm_ = solver.GetInitialNorm();
   }
+  else if (solver_choice == LinearSolverType::FGMRES)
+  {
+    mfem::FGMRESSolver solver(comm);
+    configure_solver(solver);
+    solver.Mult(B_, X_);
+    last_linear_iters_ = solver.GetNumIterations();
+    last_linear_converged_ = solver.GetConverged();
+    last_linear_final_norm_ = solver.GetFinalNorm();
+    last_linear_initial_norm_ = solver.GetInitialNorm();
+  }
+  else if (solver_choice == LinearSolverType::BiCGSTAB)
+  {
+    mfem::BiCGSTABSolver solver(comm);
+    configure_solver(solver);
+    solver.Mult(B_, X_);
+    last_linear_iters_ = solver.GetNumIterations();
+    last_linear_converged_ = solver.GetConverged();
+    last_linear_final_norm_ = solver.GetFinalNorm();
+    last_linear_initial_norm_ = solver.GetInitialNorm();
+  }
+  else if (solver_choice == LinearSolverType::MINRES)
+  {
+    mfem::MINRESSolver solver(comm);
+    configure_solver(solver);
+    solver.Mult(B_, X_);
+    last_linear_iters_ = solver.GetNumIterations();
+    last_linear_converged_ = solver.GetConverged();
+    last_linear_final_norm_ = solver.GetFinalNorm();
+    last_linear_initial_norm_ = solver.GetInitialNorm();
+  }
+  else
+  {
+    MFEM_ABORT("Unsupported IGR linear solver selection.");
+  }
+
+  const auto solve_stop = std::chrono::steady_clock::now();
+  last_linear_solve_seconds_ =
+      std::chrono::duration<double>(solve_stop - solve_start).count();
+  total_linear_solve_seconds_ += last_linear_solve_seconds_;
+  ++linear_solve_calls_;
+  total_linear_iters_ += last_linear_iters_;
+  if (last_linear_converged_)
+  {
+    ++total_linear_converged_calls_;
+  }
+
+  last_linear_solver_name_ = LinearSolverTypeName(solver_choice);
+  last_precond_name_ = PrecondTypeName(prec_choice);
 
   a_->RecoverFEMSolution(X_, *b_, sigma_);
 }

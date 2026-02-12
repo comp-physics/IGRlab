@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -29,6 +30,14 @@ struct IGROptions
   double c_alpha_user = -1.0;
   std::string space = "H1";
   std::string grad = "H1";
+  std::string solve_mode = "krylov";
+  std::string linear_solver = "auto";
+  std::string preconditioner = "auto";
+  std::string ip_kind = "sipg";
+  double lin_rtol = -1.0;
+  double lin_atol = -1.0;
+  int lin_maxit = -1;
+  int lin_print = std::numeric_limits<int>::min();
 };
 
 /// @brief DG backend selection.
@@ -114,6 +123,164 @@ inline std::string ToLowerCopy(std::string value)
   std::transform(value.begin(), value.end(), value.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return value;
+}
+
+inline dg_igr::IGRIPKind ParseIGRIPKind(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "sipg")
+  {
+    return dg_igr::IGRIPKind::SIPG;
+  }
+  if (lower == "iipg")
+  {
+    return dg_igr::IGRIPKind::IIPG;
+  }
+  if (lower == "nipg")
+  {
+    return dg_igr::IGRIPKind::NIPG;
+  }
+  MFEM_VERIFY(false, "Invalid IGR IP kind '" << value
+              << "'. Use 'sipg', 'iipg', or 'nipg'.");
+  return dg_igr::IGRIPKind::SIPG;
+}
+
+inline dg_igr::IGRSolveMode ParseIGRSolveMode(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "smoother" || lower == "smoother-sweeps" ||
+      lower == "sweeps")
+  {
+    return dg_igr::IGRSolveMode::SmootherSweeps;
+  }
+  if (lower == "krylov")
+  {
+    return dg_igr::IGRSolveMode::Krylov;
+  }
+  MFEM_VERIFY(false, "Invalid IGR solve mode '" << value
+              << "'. Use 'smoother' or 'krylov'.");
+  return dg_igr::IGRSolveMode::Krylov;
+}
+
+inline dg_igr::IGRLinearSolverType ParseIGRLinearSolverType(
+    const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "auto")
+  {
+    return dg_igr::IGRLinearSolverType::Auto;
+  }
+  if (lower == "cg")
+  {
+    return dg_igr::IGRLinearSolverType::CG;
+  }
+  if (lower == "gmres")
+  {
+    return dg_igr::IGRLinearSolverType::GMRES;
+  }
+  if (lower == "fgmres")
+  {
+    return dg_igr::IGRLinearSolverType::FGMRES;
+  }
+  if (lower == "bicgstab")
+  {
+    return dg_igr::IGRLinearSolverType::BiCGSTAB;
+  }
+  if (lower == "minres")
+  {
+    return dg_igr::IGRLinearSolverType::MINRES;
+  }
+  MFEM_VERIFY(false, "Invalid IGR linear solver '" << value
+              << "'. Use 'auto', 'cg', 'gmres', 'fgmres', "
+              << "'bicgstab', or 'minres'.");
+  return dg_igr::IGRLinearSolverType::Auto;
+}
+
+inline dg_igr::IGRPrecondType ParseIGRPrecondType(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "auto")
+  {
+    return dg_igr::IGRPrecondType::Auto;
+  }
+  if (lower == "boomeramg" || lower == "amg")
+  {
+    return dg_igr::IGRPrecondType::BoomerAMG;
+  }
+  if (lower == "hypreilu" || lower == "ilu")
+  {
+    return dg_igr::IGRPrecondType::HypreILU;
+  }
+  if (lower == "hypreeuclid" || lower == "euclid")
+  {
+    return dg_igr::IGRPrecondType::HypreEuclid;
+  }
+  if (lower == "parasails" || lower == "hypreparasails")
+  {
+    return dg_igr::IGRPrecondType::ParaSails;
+  }
+  if (lower == "hypresmoother" || lower == "smoother")
+  {
+    return dg_igr::IGRPrecondType::HypreSmoother;
+  }
+  if (lower == "none")
+  {
+    return dg_igr::IGRPrecondType::None;
+  }
+  MFEM_VERIFY(false, "Invalid IGR preconditioner '" << value
+              << "'. Use 'auto', 'boomeramg', 'hypreilu', "
+              << "'hypreeuclid', 'parasails', 'hypresmoother', or 'none'.");
+  return dg_igr::IGRPrecondType::Auto;
+}
+
+inline const char* IGRIPKindToString(dg_igr::IGRIPKind value)
+{
+  switch (value)
+  {
+    case dg_igr::IGRIPKind::SIPG: return "sipg";
+    case dg_igr::IGRIPKind::IIPG: return "iipg";
+    case dg_igr::IGRIPKind::NIPG: return "nipg";
+  }
+  return "sipg";
+}
+
+inline const char* IGRSolveModeToString(dg_igr::IGRSolveMode value)
+{
+  switch (value)
+  {
+    case dg_igr::IGRSolveMode::SmootherSweeps: return "smoother";
+    case dg_igr::IGRSolveMode::Krylov: return "krylov";
+  }
+  return "krylov";
+}
+
+inline const char* IGRLinearSolverTypeToString(dg_igr::IGRLinearSolverType value)
+{
+  switch (value)
+  {
+    case dg_igr::IGRLinearSolverType::Auto: return "auto";
+    case dg_igr::IGRLinearSolverType::CG: return "cg";
+    case dg_igr::IGRLinearSolverType::GMRES: return "gmres";
+    case dg_igr::IGRLinearSolverType::FGMRES: return "fgmres";
+    case dg_igr::IGRLinearSolverType::BiCGSTAB: return "bicgstab";
+    case dg_igr::IGRLinearSolverType::MINRES: return "minres";
+  }
+  return "auto";
+}
+
+inline const char* IGRPrecondTypeToString(dg_igr::IGRPrecondType value)
+{
+  switch (value)
+  {
+    case dg_igr::IGRPrecondType::Auto: return "auto";
+    case dg_igr::IGRPrecondType::BoomerAMG: return "boomeramg";
+    case dg_igr::IGRPrecondType::HypreILU: return "hypreilu";
+    case dg_igr::IGRPrecondType::HypreEuclid: return "hypreeuclid";
+    case dg_igr::IGRPrecondType::ParaSails: return "parasails";
+    case dg_igr::IGRPrecondType::HypreSmoother: return "hypresmoother";
+    case dg_igr::IGRPrecondType::None: return "none";
+  }
+  return "auto";
 }
 
 inline DGBackend ParseDGBackend(const std::string& value)
@@ -370,6 +537,22 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "Space to solve for sigma: 'H1' or 'L2'.");
   args.AddOption(&igr_opts.grad, "-ig", "--igr-grad",
                  "Gradient reconstruction type: 'H1' or 'BrokenL2'.");
+  args.AddOption(&igr_opts.solve_mode, "-im", "--igr-solve-mode",
+                 "IGR solve mode: krylov | smoother.");
+  args.AddOption(&igr_opts.linear_solver, "-ils", "--igr-linear-solver",
+                 "IGR linear solver: auto | cg | gmres | fgmres | bicgstab | minres.");
+  args.AddOption(&igr_opts.preconditioner, "-ipc", "--igr-preconditioner",
+                 "IGR preconditioner: auto | boomeramg | hypreilu | hypreeuclid | parasails | hypresmoother | none.");
+  args.AddOption(&igr_opts.ip_kind, "-iip", "--igr-ip-kind",
+                 "IGR DG interior penalty kind: sipg | iipg | nipg.");
+  args.AddOption(&igr_opts.lin_rtol, "-irtol", "--igr-lin-rtol",
+                 "IGR linear solver relative tolerance (<0 keeps case default).");
+  args.AddOption(&igr_opts.lin_atol, "-iatol", "--igr-lin-atol",
+                 "IGR linear solver absolute tolerance (<0 keeps case default).");
+  args.AddOption(&igr_opts.lin_maxit, "-imaxit", "--igr-lin-maxit",
+                 "IGR linear solver max iterations (<0 keeps case default).");
+  args.AddOption(&igr_opts.lin_print, "-iprint", "--igr-lin-print",
+                 "IGR linear solver print level (INT_MIN keeps case default).");
 }
 
 inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
