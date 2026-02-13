@@ -82,7 +82,7 @@ private:
   const FluxFunction *GetBase() const { return &base_; }
 
   const FluxFunction &base_;
-  const mfem::ParGridFunction *sigma_ = nullptr;
+  const mfem::ParGridFunction *sigma_ = nullptr; // non-owning; owned by IGR solver/state wiring
   double rho_vel_floor_ = dg_igr::FluxDefaults::kRhoVelFloor;
 
   // helpers

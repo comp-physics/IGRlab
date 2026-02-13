@@ -49,8 +49,8 @@ public:
    * @param num_eq      Number of conservative variables (e.g., 4 in 2D, 5 in 3D).
    * @param alpha       Regularization parameter α.
    */
-  IGRSolver(const mfem::ParFiniteElementSpace& sigma_fes,
-            const mfem::ParFiniteElementSpace& state_fes,
+  IGRSolver(mfem::ParFiniteElementSpace& sigma_fes,
+            mfem::ParFiniteElementSpace& state_fes,
             int dim, int num_eq, double alpha);
 
   /// Set regularization parameter α.
@@ -64,7 +64,7 @@ public:
 
   /// Select which gradient backend to use for the Σ RHS.
   void SetGradBackend(GradBackend b) { backend_ = b; }
-  void SetIPKind(IPKind k) { ip_kind_ = k; }
+  void SetIPKind(IPKind k);
 
   // ---- Legacy smoother-sweep knobs (still supported) ----
   void SetSmoother(SmootherType t);
@@ -151,7 +151,7 @@ private:
     void SetState(const mfem::ParGridFunction& U) { U_ = &U; }
     void SetRhoFloor(double floor) { rho_floor_ = floor; }
   private:
-    const mfem::ParGridFunction* U_ = nullptr;
+    const mfem::ParGridFunction* U_ = nullptr; // non-owning; owned by caller
     double rho_floor_;
   };
 
@@ -168,7 +168,7 @@ private:
               mfem::ElementTransformation &T,
               const mfem::IntegrationPoint &ip) override;
   private:
-    const mfem::ParGridFunction* U_;
+    const mfem::ParGridFunction* U_ = nullptr; // non-owning; owned by caller
     double rho_floor_;
   };
 
@@ -186,8 +186,8 @@ private:
     // Optional continuous velocity field (vdim=dim); if set, its gradient is used.
     void SetVelField(const mfem::ParGridFunction* v) { velH1_ = v; }
   private:
-    const mfem::ParGridFunction* U_ = nullptr;
-    const mfem::ParGridFunction* velH1_ = nullptr; // optional continuous velocity
+    const mfem::ParGridFunction* U_ = nullptr;     // non-owning; owned by caller
+    const mfem::ParGridFunction* velH1_ = nullptr; // non-owning optional continuous velocity
     int dim_, num_eq_;
     double alpha_, rho_floor_;
     mfem::Vector      state_;   // [rho, m(0:dim-1), E]
@@ -211,10 +211,11 @@ private:
   void DoSmootherSweeps(int sweeps, bool warm_start);   // legacy
   void SolveEllipticSystem_(bool warm_start);           // new recommended path
   void EnsureH1VelocitySpace_();
+  void BuildBilinearForm_();
 
   // ---------- Data ----------
-  const mfem::ParFiniteElementSpace& sfes_;  // scalar Σ space (H1 or DG)
-  const mfem::ParFiniteElementSpace& vfes_;  // vector state U space (vdim=num_eq)
+  mfem::ParFiniteElementSpace& sfes_;  // scalar Σ space (H1 or DG)
+  mfem::ParFiniteElementSpace& vfes_;  // vector state U space (vdim=num_eq)
   int dim_, num_eq_;
   double alpha_       = mfem::dg_igr::IGRDefaults::kAlpha;
   double rho_floor_   = mfem::dg_igr::IGRDefaults::kRhoFloor;

@@ -807,6 +807,18 @@ int RunIGRTests(TestContext& ctx)
     l2_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
     l2_solver.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
     l2_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+    const mfem::HypreParMatrix* A_l2_nipg = l2_solver.GetAssembledOperator();
+    MFEM_VERIFY(A_l2_nipg != nullptr,
+                "IGR L2 NIPG SPD probe requires assembled Hypre operator.");
+    const SPDProbeSummary nipg_probe = ProbeSPD(*A_l2_nipg, MPI_COMM_SELF);
+    ctx.LogMetric("igr_l2_nipg_spd_probe max_sym_rel=" +
+                  FormatSci(nipg_probe.max_sym_rel) +
+                  " min_rayleigh=" + FormatSci(nipg_probe.min_rayleigh));
+    ctx.Check(nipg_probe.finite,
+              "IGR L2 NIPG SPD probe operator-vector products are finite");
+    ctx.Check(nipg_probe.max_sym_rel >
+                  std::max(1.0e-10, 100.0 * sipg_probe.max_sym_rel),
+              "IGR L2 NIPG operator is measurably non-symmetric");
     ctx.Check(l2_solver.GetLastLinearSolverName() == "gmres",
               "IGR guardrail falls back from CG to GMRES for NIPG");
     l2_solver.SetIPKind(dg_igr::IGRIPKind::SIPG);

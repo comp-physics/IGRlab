@@ -26,6 +26,14 @@ inline void ApplyGradOption(const std::string& grad_opt, dg_igr::IGRConfig& cfg)
     cfg.backend = dg_igr::IGRGradBackend::H1Projection;
     return;
   }
+  if (lower == "l2" || lower == "brokenl2" || lower == "brokendg" ||
+      lower == "broken-dg")
+  {
+    cfg.backend = dg_igr::IGRGradBackend::BrokenDG;
+    return;
+  }
+  MFEM_VERIFY(false, "Invalid IGR gradient backend '" << grad_opt
+              << "'. Use 'H1' or 'BrokenL2'.");
   cfg.backend = dg_igr::IGRGradBackend::BrokenDG;
 }
 
@@ -68,7 +76,7 @@ inline mfem::RK3SSPWithLimiter MakeRK3Stepper(mfem::ParFiniteElementSpace& vfes,
   return rk3;
 }
 
-inline dg_igr::IGRSolver MakeIGRSolver(const DGSpaces& spaces,
+inline dg_igr::IGRSolver MakeIGRSolver(DGSpaces& spaces,
                                        int dim,
                                        int num_equations,
                                        const RunConfig& run_cfg,

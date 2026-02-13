@@ -262,20 +262,19 @@ double IGRSolver::SigmaSourceCoefficient::Eval(mfem::ElementTransformation &T,
 }
 
 // ---------------- IGRSolver core ----------------
-IGRSolver::IGRSolver(const mfem::ParFiniteElementSpace& sigma_fes,
-                     const mfem::ParFiniteElementSpace& state_fes,
+IGRSolver::IGRSolver(mfem::ParFiniteElementSpace& sigma_fes,
+                     mfem::ParFiniteElementSpace& state_fes,
                      int dim, int num_eq, double alpha)
   : sfes_(sigma_fes),
     vfes_(state_fes),
     dim_(dim),
     num_eq_(num_eq),
     alpha_(alpha),
-    state_scratch_(const_cast<mfem::ParFiniteElementSpace*>(&vfes_)),
-    sigma_(const_cast<mfem::ParFiniteElementSpace*>(&sfes_))
+    state_scratch_(&vfes_),
+    sigma_(&sfes_)
 {
-  // Allocate forms once
-  a_ = std::make_unique<mfem::ParBilinearForm>(const_cast<mfem::ParFiniteElementSpace*>(&sfes_));
-  b_ = std::make_unique<mfem::ParLinearForm>(const_cast<mfem::ParFiniteElementSpace*>(&sfes_));
+  // Allocate RHS form once; bilinear form is built through BuildBilinearForm_().
+  b_ = std::make_unique<mfem::ParLinearForm>(&sfes_);
 
   // Create coefficients once (they hold references; we’ll update their state each call)
   state_scratch_ = 1.0;
@@ -287,24 +286,7 @@ IGRSolver::IGRSolver(const mfem::ParFiniteElementSpace& sigma_fes,
   alpha_coef_  = std::make_unique<AlphaRefCoefficient>(alpha_);
   ck_coef_     = std::make_unique<mfem::ProductCoefficient>(*alpha_coef_, *invrho_coef_);
 
-  // ---- mfem::Operator: mass + diffusion (IPDG if Σ-space is DG) ----
-  // Reaction/mass: (1/ρ σ, v)
-  a_->AddDomainIntegrator(new mfem::MassIntegrator(*invrho_coef_));
-
-  // Volume diffusion term: ( (α/ρ) ∇σ, ∇v )
-  a_->AddDomainIntegrator(new mfem::DiffusionIntegrator(*ck_coef_));
-
-  // If Σ-space is discontinuous, add IPDG face terms (interior + boundary)
-  if (IsDGSpace(sfes_))
-  {
-    const double sigma = static_cast<double>(ip_kind_);           // -1(SIPG), 0, +1
-    const double kappa = IPDGPenalty(sfes_);                      // penalty scaling
-    a_->AddInteriorFaceIntegrator(
-        new mfem::DGDiffusionIntegrator(*ck_coef_, sigma, kappa));
-    // For the IGR sigma equation, default behavior is natural boundary
-    // conditions. Do not add DG boundary diffusion terms unless a specific
-    // weak boundary closure is implemented.
-  }
+  BuildBilinearForm_();
 
   // RHS: α ( ||∇u||_F^2 + (∇·u)^2 , v )
   b_->AddDomainIntegrator(new mfem::DomainLFIntegrator(*src_coef_));
@@ -327,6 +309,19 @@ void IGRSolver::SetAlpha(double a)
 void IGRSolver::SetSmoother(SmootherType t)
 {
   smoot_ = t;
+}
+
+void IGRSolver::SetIPKind(IPKind k)
+{
+  if (ip_kind_ == k)
+  {
+    return;
+  }
+  ip_kind_ = k;
+  if (a_)
+  {
+    BuildBilinearForm_();
+  }
 }
 
 void IGRSolver::SetSweeps(int regular_sweeps, int warm_start_sweeps)
@@ -378,6 +373,29 @@ void IGRSolver::EnsureH1VelocitySpace_()
     h1_vec_fes_ = std::make_unique<mfem::ParFiniteElementSpace>(pm, h1_vec_fec_.get(), /*vdim=*/dim_);
     vel_h1_     = std::make_unique<mfem::ParGridFunction>(h1_vec_fes_.get());
     *vel_h1_    = 0.0;
+  }
+}
+
+void IGRSolver::BuildBilinearForm_()
+{
+  a_ = std::make_unique<mfem::ParBilinearForm>(&sfes_);
+
+  // Reaction/mass: (1/ρ σ, v)
+  a_->AddDomainIntegrator(new mfem::MassIntegrator(*invrho_coef_));
+
+  // Volume diffusion term: ( (α/ρ) ∇σ, ∇v )
+  a_->AddDomainIntegrator(new mfem::DiffusionIntegrator(*ck_coef_));
+
+  // If Σ-space is discontinuous, add IPDG face terms (interior only).
+  if (IsDGSpace(sfes_))
+  {
+    const double sigma = static_cast<double>(ip_kind_); // -1(SIPG), 0, +1
+    const double kappa = IPDGPenalty(sfes_);            // penalty scaling
+    a_->AddInteriorFaceIntegrator(
+        new mfem::DGDiffusionIntegrator(*ck_coef_, sigma, kappa));
+    // For the IGR sigma equation, default behavior is natural boundary
+    // conditions. Do not add DG boundary diffusion terms unless a specific
+    // weak boundary closure is implemented.
   }
 }
 

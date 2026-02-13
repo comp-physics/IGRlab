@@ -63,6 +63,13 @@ private:
     {
       return std::make_unique<mfem::H1_FECollection>(std::max(order, 3), dim);
     }
+    if (lower == "l2" || lower == "dg" || lower == "brokendg" ||
+        lower == "brokenl2")
+    {
+      return std::make_unique<mfem::DG_FECollection>(order, dim);
+    }
+    MFEM_VERIFY(false, "Invalid IGR sigma space '" << sigma_space
+                << "'. Use 'H1' or 'L2'.");
     return std::make_unique<mfem::DG_FECollection>(order, dim);
   }
 };
