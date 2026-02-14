@@ -94,7 +94,6 @@ int main(int argc, char* argv[])
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
   spec.use_igr = false;
-  spec.need_sigma = false;
   spec.need_h1 = false;
   spec.glvis.precision = 8;
 

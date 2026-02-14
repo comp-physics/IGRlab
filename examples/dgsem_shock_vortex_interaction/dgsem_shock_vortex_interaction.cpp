@@ -22,7 +22,6 @@ int main(int argc, char* argv[])
   spec.default_mesh_path = mfem::ShockVortexDefaultMeshPath();
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
-  spec.need_sigma = true;
   spec.need_h1 = true;
   spec.diagnostics.h1_diagnostics = true;
   spec.glvis.precision = 8;
