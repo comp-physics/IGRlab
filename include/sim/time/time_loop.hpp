@@ -24,6 +24,7 @@ struct TimeLoopConfig
 {
   mfem::real_t t_final = 0.0;
   mfem::real_t dt = 0.0;
+  mfem::real_t dt_min = 0.0;
   mfem::real_t cfl = 0.0;
   int order = 1;
   int vis_steps = 0;
@@ -55,6 +56,7 @@ struct TimeLoopResult
   int steps = 0;
   mfem::real_t final_time = 0.0;
   int non_finite_count = 0;
+  bool dt_min_reached = false;
   double non_finite_min = std::numeric_limits<double>::infinity();
   double non_finite_max = -std::numeric_limits<double>::infinity();
 };
@@ -111,6 +113,28 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
 {
   TimeLoopResult result;
   mfem::real_t t = 0.0;
+  const mfem::real_t dt_min = std::max<mfem::real_t>(0.0, cfg.dt_min);
+
+  auto CheckDtMinimum = [&](mfem::real_t dt_value,
+                            const char* stage) -> bool
+  {
+    if (dt_min <= 0.0)
+    {
+      return false;
+    }
+    if (std::abs(dt_value) >= dt_min)
+    {
+      return false;
+    }
+    result.dt_min_reached = true;
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[dt-check] dt below minimum threshold: dt=" << dt_value
+                << " dt_min=" << dt_min << " stage=" << stage << " t=" << t
+                << "\n";
+    }
+    return true;
+  };
 
   mfem::real_t dt = cfg.dt;
   mfem::real_t hmin = mfem::infinity();
@@ -131,6 +155,10 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       summary.global_non_finite > 0 ? summary.global_non_finite : 1;
     result.non_finite_min = summary.global_min;
     result.non_finite_max = summary.global_max;
+    return result;
+  }
+  if (CheckDtMinimum(dt, "before-time-loop"))
+  {
     return result;
   }
 
@@ -207,6 +235,10 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
           summary.global_non_finite > 0 ? summary.global_non_finite : 1;
         result.non_finite_min = summary.global_min;
         result.non_finite_max = summary.global_max;
+        break;
+      }
+      if (CheckDtMinimum(dt, "after-cfl-update"))
+      {
         break;
       }
     }

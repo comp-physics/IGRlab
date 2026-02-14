@@ -194,6 +194,7 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << detail::ToJsonString(run_cfg.igr_opts.ip_kind) << ",\n";
   out << "    \"cfl\": " << run_cfg.opts.cfl << ",\n";
   out << "    \"dt\": " << run_cfg.opts.dt << ",\n";
+  out << "    \"dt_min\": " << run_cfg.opts.dt_min << ",\n";
   out << "    \"t_final\": " << run_cfg.opts.t_final << ",\n";
   out << "    \"nan_scan\": " << (run_cfg.opts.nan_scan ? "true" : "false")
       << ",\n";

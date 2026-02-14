@@ -662,6 +662,7 @@ inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)
   TimeLoopConfig cfg;
   cfg.t_final = opts.t_final;
   cfg.dt = opts.dt;
+  cfg.dt_min = opts.dt_min;
   cfg.cfl = opts.cfl;
   cfg.order = opts.order;
   cfg.vis_steps = opts.vis_steps;

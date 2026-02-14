@@ -70,7 +70,16 @@ int RunTimeDefaultsTests(TestContext& ctx)
   run_cfg.opts.order = 1;
   run_cfg.opts.glvis = false;
   run_cfg.opts.vtk_save = false;
+  run_cfg.opts.dt_min = 5.0e-13;
   run_cfg.dg_backend = dg_sim::DGBackend::DG;
+
+  {
+    const dg_sim::TimeLoopConfig loop_cfg = dg_sim::MakeTimeLoopConfig(run_cfg);
+    ctx.CheckNear(loop_cfg.dt_min,
+                  run_cfg.opts.dt_min,
+                  1.0e-16,
+                  "time loop config: dt_min propagated from runtime options");
+  }
 
   dg_sim::ExampleContext example_ctx(run_cfg,
                                      std::move(pmesh),

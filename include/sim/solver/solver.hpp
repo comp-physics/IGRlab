@@ -190,7 +190,7 @@ RunEulerCase(ExampleContext& ctx,
     MakeEulerTimeLoopHooks(ctx, bundle, num_procs, my_rank, io, callbacks);
   const TimeLoopResult result =
     RunTimeLoop(op, ctx.Mesh(), bundle.sol, rk3, loop_cfg, hooks);
-  if (result.non_finite_count > 0)
+  if (result.non_finite_count > 0 || result.dt_min_reached)
   {
     return false;
   }

@@ -35,6 +35,7 @@ struct CommonOptions
     "fd"; ///< DGSEM ES-LF entropy Jacobian: "fd" or "analytic".
   mfem::real_t t_final = 1.0;  ///< Final time.
   mfem::real_t dt = -0.01;     ///< Time step (positive skips CFL computation).
+  mfem::real_t dt_min = 1.0e-12; ///< Minimum allowed dt before aborting.
   mfem::real_t cfl = 0.3;      ///< CFL number for time step computation.
   bool glvis = false;          ///< Enable GLVis visualization.
   bool vtk_save = true;        ///< Enable ParaView/VTK output.
@@ -108,6 +109,11 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-dt",
                  "--time-step",
                  "Time step. Positive number skips CFL timestep calculation.");
+  args.AddOption(&opts.dt_min,
+                 "-dtmin",
+                 "--dt-min",
+                 "Minimum allowed dt; run aborts if dt falls below this "
+                 "threshold.");
   args.AddOption(&opts.cfl,
                  "-c",
                  "--cfl-number",
