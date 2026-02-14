@@ -61,7 +61,9 @@ struct CaseSpec
   double gamma = mfem::dg_igr::EulerDefaults::kGamma;
   DGBackend dg_backend_default = DGBackend::DG;
   bool use_igr = true;
-  bool need_sigma = true;
+  /// Optional sigma-space allocation when IGR coupling is disabled.
+  /// When use_igr=true, sigma space is always allocated.
+  bool need_sigma = false;
   bool need_h1 = false;
 
   CaseOptions options;

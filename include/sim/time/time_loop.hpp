@@ -28,7 +28,7 @@ struct TimeLoopConfig
   int order = 1;
   int vis_steps = 0;
   int analysis_steps = 0;
-  bool vtk_save = false;
+  bool vtk_save = true;
   mfem::real_t dt_save = 0.0;
   bool nan_scan = false;
   int save_index_offset = 0;

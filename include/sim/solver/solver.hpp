@@ -271,7 +271,7 @@ struct Solver
     bool glvis_enabled = run_cfg.opts.glvis;
     std::cout.precision(spec.glvis.precision);
 
-    const bool need_sigma = spec.use_igr || spec.need_sigma;
+    const bool need_sigma_space = spec.use_igr || spec.need_sigma;
     const bool enable_h1_vis_diag =
         spec.diagnostics.h1_diagnostics &&
         (run_cfg.opts.glvis || run_cfg.opts.vtk_save);
@@ -281,12 +281,12 @@ struct Solver
         spec.diagnostics.mpi_rank_field && run_cfg.opts.vtk_save;
     const bool need_h1 = spec.need_h1 || enable_h1_vis_diag;
     ExampleContext ctx = BuildExampleContext(run_cfg, run_cfg.igr_opts.space,
-                                             need_sigma, need_h1);
+                                             need_sigma_space, need_h1);
     if (run_cfg.dg_backend == DGBackend::DGSEM)
     {
       detail::VerifyDGSEMElementGeometry(ctx.Mesh());
     }
-    if (need_sigma)
+    if (need_sigma_space)
     {
       MFEM_VERIFY(ctx.spaces.sigma_fes != nullptr, "Sigma space was not created.");
     }
