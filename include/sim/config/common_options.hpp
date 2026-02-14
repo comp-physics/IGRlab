@@ -38,6 +38,8 @@ struct CommonOptions
   mfem::real_t cfl = 0.3;      ///< CFL number for time step computation.
   bool glvis = false;          ///< Enable GLVis visualization.
   bool vtk_save = true;        ///< Enable ParaView/VTK output.
+  bool save_state_files =
+    false; ///< Save GLVis-compatible init/final snapshots to disk.
   mfem::real_t dt_save = 0.01; ///< Save cadence for ParaView output.
   bool preassemble_weak_div =
     true;             ///< Element-assembly vs matrix-free divergence.
@@ -122,6 +124,13 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-no-vtk",
                  "--no-vtk_save",
                  "Enable or disable VTK visualization.");
+  args.AddOption(&opts.save_state_files,
+                 "-save-state",
+                 "--save-state",
+                 "-no-save-state",
+                 "--no-save-state",
+                 "Enable or disable GLVis-compatible init/final state file "
+                 "dumps.");
   args.AddOption(&opts.dt_save,
                  "-dt_save",
                  "--time-step-save",

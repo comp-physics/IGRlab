@@ -6,6 +6,7 @@
  */
 
 #include <cmath>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -403,7 +404,23 @@ struct Solver
       spec.after_init(case_opts, ctx, state_bundle);
     }
 
-    SaveInitialEulerState(ctx, state_bundle.sol, spec.glvis.precision);
+    std::string state_snapshot_dir;
+    if (run_cfg.opts.save_state_files)
+    {
+      const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
+      const std::string dataset_name =
+        MakeCaseVTKDatasetName(case_cfg, run_cfg, vtk_c_alpha);
+      state_snapshot_dir =
+        (std::filesystem::path(vtk_cfg.prefix_path) / dataset_name /
+         "glvis_state")
+          .string();
+      SaveInitialEulerState(ctx,
+                            state_bundle.sol,
+                            spec.glvis.precision,
+                            "euler-mesh",
+                            "euler",
+                            state_snapshot_dir);
+    }
 
     MFEM_VERIFY(spec.build_markers,
                 "CaseSpec is missing a boundary marker builder.");
@@ -487,7 +504,15 @@ struct Solver
                 << " last_precond=" << igr->GetLastPrecondName() << "\n";
     }
 
-    SaveFinalEulerState(ctx, state_bundle.sol, spec.glvis.precision);
+    if (run_cfg.opts.save_state_files)
+    {
+      SaveFinalEulerState(ctx,
+                          state_bundle.sol,
+                          spec.glvis.precision,
+                          "euler-mesh-final",
+                          "euler",
+                          state_snapshot_dir);
+    }
 
     WriteRunMetadataSidecar(case_cfg,
                             run_cfg,
