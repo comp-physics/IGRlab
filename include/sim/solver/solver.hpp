@@ -409,7 +409,7 @@ struct Solver
                 "CaseSpec is missing a boundary marker builder.");
     const BoundaryMarkerMap bdr_markers = spec.build_markers(ctx);
 
-    const auto on_open = [&]()
+    const auto on_open = [&h1_diag]()
     {
       if (h1_diag)
       {
@@ -418,7 +418,7 @@ struct Solver
     };
 
     MFEM_VERIFY(spec.apply_bc, "CaseSpec is missing boundary wiring.");
-    auto bc_setup = [&](auto& bc, const auto& markers)
+    auto bc_setup = [&spec, &case_opts, &ctx](auto& bc, const auto& markers)
     {
       spec.apply_bc(case_opts, ctx, bc, markers);
     };
@@ -430,7 +430,17 @@ struct Solver
       state_bundle.sol,
       bdr_markers,
       bc_setup,
-      [&](auto& op)
+      [&ctx,
+       &case_cfg,
+       &run_cfg,
+       &state_bundle,
+       &rk3,
+       &glvis_enabled,
+       &callbacks,
+       &spec,
+       &on_open,
+       &captured_summary,
+       vtk_c_alpha](auto& op)
       {
         return RunEulerCase(ctx,
                             case_cfg,

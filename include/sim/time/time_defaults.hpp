@@ -381,10 +381,11 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
   bool* glvis_enabled = io.glvis_enabled;
   mfem::ParaViewDataCollection* paraview = io.paraview;
   dg_igr::IGRSolver* igr_solver = bundle.field_list.igr;
+  const ExampleContext* ctx_ptr = &ctx;
+  EulerStateBundle* bundle_ptr = &bundle;
   TimeLoopHooks hooks;
   hooks.on_visualize =
-    [&,
-     start_time,
+    [start_time,
      local_dofs,
      global_dofs,
      glvis_windows,
@@ -392,7 +393,9 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
      num_procs_value,
      my_rank_value,
      callbacks,
-     igr_solver](int step, mfem::real_t t, mfem::real_t dt_real, bool)
+     igr_solver,
+     ctx_ptr,
+     bundle_ptr](int step, mfem::real_t t, mfem::real_t dt_real, bool)
   {
     const auto now = std::chrono::steady_clock::now();
     const double elapsed =
@@ -425,21 +428,20 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
     if (glvis_enabled && *glvis_enabled && glvis_windows)
     {
       UpdateEulerGLVis(*glvis_windows,
-                       bundle.field_list,
-                       bundle.sol,
+                       bundle_ptr->field_list,
+                       bundle_ptr->sol,
                        num_procs_value,
                        my_rank_value,
-                       ctx.Mesh(),
+                       ctx_ptr->Mesh(),
                        t,
                        /*warm_start=*/true);
     }
   };
 
-  hooks.on_save = [&, start_time, local_dofs, global_dofs, paraview, callbacks](
-                    int step,
-                    mfem::real_t t,
-                    int save_idx,
-                    bool is_final)
+  hooks.on_save = [paraview, callbacks, bundle_ptr](int step,
+                                                     mfem::real_t t,
+                                                     int save_idx,
+                                                     bool is_final)
   {
     if (callbacks.on_vtk_save)
     {
@@ -451,7 +453,9 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
       info.is_final = is_final;
       callbacks.on_vtk_save(info);
     }
-    UpdateEulerOutputFields(bundle.field_list, bundle.sol, /*warm_start=*/true);
+    UpdateEulerOutputFields(bundle_ptr->field_list,
+                            bundle_ptr->sol,
+                            /*warm_start=*/true);
     if (paraview)
     {
       paraview->SetCycle(save_idx);
@@ -461,13 +465,14 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
   };
 
   hooks.on_analysis =
-    [&,
-     start_time,
+    [start_time,
      local_dofs,
      global_dofs,
      num_procs_value,
      callbacks,
-     igr_solver](int step, mfem::real_t t, mfem::real_t dt_real, bool done)
+     igr_solver,
+     ctx_ptr,
+     bundle_ptr](int step, mfem::real_t t, mfem::real_t dt_real, bool done)
   {
     const auto now = std::chrono::steady_clock::now();
     const double elapsed =
@@ -498,21 +503,21 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
 
       if (callbacks.wants_minmax)
       {
-        if (bundle.field_list.state)
+        if (bundle_ptr->field_list.state)
         {
           const auto rho_mm =
-            ComputeGlobalMinMax(bundle.field_list.state->density,
-                                ctx.Mesh().GetComm());
+            ComputeGlobalMinMax(bundle_ptr->field_list.state->density,
+                                ctx_ptr->Mesh().GetComm());
           info.has_rho = true;
           info.rho_min = rho_mm.first;
           info.rho_max = rho_mm.second;
         }
-        if (bundle.field_list.pressure)
+        if (bundle_ptr->field_list.pressure)
         {
-          bundle.field_list.pressure->Update();
+          bundle_ptr->field_list.pressure->Update();
           const auto p_mm =
-            ComputeGlobalMinMax(bundle.field_list.pressure->pressure,
-                                ctx.Mesh().GetComm());
+            ComputeGlobalMinMax(bundle_ptr->field_list.pressure->pressure,
+                                ctx_ptr->Mesh().GetComm());
           info.has_p = true;
           info.p_min = p_mm.first;
           info.p_max = p_mm.second;
