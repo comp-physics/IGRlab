@@ -48,7 +48,8 @@ inline void VerifyDGSEMElementGeometry(const mfem::Mesh& mesh)
     }
     MFEM_VERIFY(false,
                 "DGSEM v1 supports tensor-product meshes only (segment/quad). "
-                "Found geometry: " << mfem::Geometry::Name[geom] << ".");
+                "Found geometry: "
+                  << mfem::Geometry::Name[geom] << ".");
   }
 }
 
@@ -63,8 +64,12 @@ bool WithEulerOperator(ExampleContext& ctx,
 {
   if (igr)
   {
-    auto physics = MakeEulerIGRPhysics<NumericalFlux>(
-        ctx, gamma, *igr, markers, std::forward<BcSetup>(bc_setup));
+    auto physics =
+      MakeEulerIGRPhysics<NumericalFlux>(ctx,
+                                         gamma,
+                                         *igr,
+                                         markers,
+                                         std::forward<BcSetup>(bc_setup));
     mfem::EulerWithIGR wrapped(physics.op, *igr, sol);
     return func(wrapped);
   }
@@ -72,10 +77,12 @@ bool WithEulerOperator(ExampleContext& ctx,
   mfem::EulerFlux base_flux(ctx.dim, gamma);
   NumericalFlux numerical_flux(base_flux);
   ConfigureDGSEMSurfaceFlux(numerical_flux, ctx.run_cfg, gamma);
-  mfem::DGHyperbolicConservationLaws op =
-      MakeDGOperator(ctx, numerical_flux);
+  mfem::DGHyperbolicConservationLaws op = MakeDGOperator(ctx, numerical_flux);
   EulerBoundaryWiring<NumericalFlux> bc(
-      op, numerical_flux, ctx.run_cfg.case_config.int_order_offset, ctx.dim);
+    op,
+    numerical_flux,
+    ctx.run_cfg.case_config.int_order_offset,
+    ctx.dim);
   bc_setup(bc, markers);
   return func(op);
 }
@@ -84,38 +91,39 @@ bool WithEulerOperator(ExampleContext& ctx,
 
 /// @brief Run Euler (with or without IGR) using the shared IO/time-loop wiring.
 template <typename OperatorType, typename OnOpenCallback>
-inline bool RunEulerCase(ExampleContext& ctx,
-                               const CaseConfig& case_cfg,
-                               const RunConfig& run_cfg,
-                               EulerStateBundle& bundle,
-                               mfem::RK3SSPWithLimiter& rk3,
-                               OperatorType& op,
-                               bool& glvis_enabled,
-                               const TimeLoopCallbacks& callbacks,
-                               int precision,
-                               OnOpenCallback&& on_open_callback,
-                               RunSummary* summary_out = nullptr,
-                               double c_alpha_value =
-                                  std::numeric_limits<double>::quiet_NaN(),
-                               bool print_dataset_name = false)
+inline bool
+RunEulerCase(ExampleContext& ctx,
+             const CaseConfig& case_cfg,
+             const RunConfig& run_cfg,
+             EulerStateBundle& bundle,
+             mfem::RK3SSPWithLimiter& rk3,
+             OperatorType& op,
+             bool& glvis_enabled,
+             const TimeLoopCallbacks& callbacks,
+             int precision,
+             OnOpenCallback&& on_open_callback,
+             RunSummary* summary_out = nullptr,
+             double c_alpha_value = std::numeric_limits<double>::quiet_NaN(),
+             bool print_dataset_name = false)
 {
   UpdateEulerOutputFields(bundle.field_list, bundle.sol, /*warm_start=*/false);
 
   EulerVisWindows glvis_windows;
   if (glvis_enabled)
   {
-    const bool ok =
-        bundle.field_list.igr
-            ? OpenEulerIGRGLVisWindows(glvis_windows, bundle.field_list,
-                                       ctx.Mesh(),
-                                       mfem::Mpi::WorldSize(),
-                                       mfem::Mpi::WorldRank(),
-                                       precision)
-            : OpenEulerGLVisWindows(glvis_windows, bundle.field_list,
-                                    ctx.Mesh(),
-                                    mfem::Mpi::WorldSize(),
-                                    mfem::Mpi::WorldRank(),
-                                    precision);
+    const bool ok = bundle.field_list.igr
+                      ? OpenEulerIGRGLVisWindows(glvis_windows,
+                                                 bundle.field_list,
+                                                 ctx.Mesh(),
+                                                 mfem::Mpi::WorldSize(),
+                                                 mfem::Mpi::WorldRank(),
+                                                 precision)
+                      : OpenEulerGLVisWindows(glvis_windows,
+                                              bundle.field_list,
+                                              ctx.Mesh(),
+                                              mfem::Mpi::WorldSize(),
+                                              mfem::Mpi::WorldRank(),
+                                              precision);
     if (ok)
     {
       on_open_callback();
@@ -131,9 +139,9 @@ inline bool RunEulerCase(ExampleContext& ctx,
   }
 
   const std::string dc_name =
-      MakeCaseVTKDatasetName(case_cfg, run_cfg, c_alpha_value);
+    MakeCaseVTKDatasetName(case_cfg, run_cfg, c_alpha_value);
   auto paraview_dc =
-      std::make_unique<mfem::ParaViewDataCollection>(dc_name, &ctx.Mesh());
+    std::make_unique<mfem::ParaViewDataCollection>(dc_name, &ctx.Mesh());
   if (run_cfg.opts.vtk_save)
   {
     RegisterEulerVTKFields(*paraview_dc, bundle.field_list);
@@ -178,9 +186,9 @@ inline bool RunEulerCase(ExampleContext& ctx,
   const int num_procs = mfem::Mpi::WorldSize();
   const int my_rank = mfem::Mpi::WorldRank();
   const TimeLoopHooks hooks =
-      MakeEulerTimeLoopHooks(ctx, bundle, num_procs, my_rank, io, callbacks);
+    MakeEulerTimeLoopHooks(ctx, bundle, num_procs, my_rank, io, callbacks);
   const TimeLoopResult result =
-      RunTimeLoop(op, ctx.Mesh(), bundle.sol, rk3, loop_cfg, hooks);
+    RunTimeLoop(op, ctx.Mesh(), bundle.sol, rk3, loop_cfg, hooks);
   if (result.non_finite_count > 0)
   {
     return false;
@@ -193,8 +201,8 @@ inline bool RunEulerCase(ExampleContext& ctx,
     std::cout << " done, " << elapsed << "s." << std::endl;
     if (callbacks.on_summary)
     {
-      const RunSummary summary = BuildRunSummary(
-          ctx, result, elapsed, num_procs, bundle.field_list.igr);
+      const RunSummary summary =
+        BuildRunSummary(ctx, result, elapsed, num_procs, bundle.field_list.igr);
       if (summary_out)
       {
         *summary_out = summary;
@@ -203,45 +211,57 @@ inline bool RunEulerCase(ExampleContext& ctx,
     }
     else if (summary_out)
     {
-      *summary_out = BuildRunSummary(
-          ctx, result, elapsed, num_procs, bundle.field_list.igr);
+      *summary_out =
+        BuildRunSummary(ctx, result, elapsed, num_procs, bundle.field_list.igr);
     }
   }
   return true;
 }
 
 template <typename OperatorType>
-inline bool RunEulerCase(ExampleContext& ctx,
-                               const CaseConfig& case_cfg,
-                               const RunConfig& run_cfg,
-                               EulerStateBundle& bundle,
-                               mfem::RK3SSPWithLimiter& rk3,
-                               OperatorType& op,
-                               bool& glvis_enabled,
-                               const TimeLoopCallbacks& callbacks,
-                               int precision,
-                               RunSummary* summary_out = nullptr,
-                               double c_alpha_value =
-                                  std::numeric_limits<double>::quiet_NaN(),
-                               bool print_dataset_name = false)
+inline bool
+RunEulerCase(ExampleContext& ctx,
+             const CaseConfig& case_cfg,
+             const RunConfig& run_cfg,
+             EulerStateBundle& bundle,
+             mfem::RK3SSPWithLimiter& rk3,
+             OperatorType& op,
+             bool& glvis_enabled,
+             const TimeLoopCallbacks& callbacks,
+             int precision,
+             RunSummary* summary_out = nullptr,
+             double c_alpha_value = std::numeric_limits<double>::quiet_NaN(),
+             bool print_dataset_name = false)
 {
-  return RunEulerCase(ctx, case_cfg, run_cfg, bundle, rk3, op,
-                      glvis_enabled, callbacks, precision, []() {}, summary_out,
-                      c_alpha_value, print_dataset_name);
+  return RunEulerCase(
+    ctx,
+    case_cfg,
+    run_cfg,
+    bundle,
+    rk3,
+    op,
+    glvis_enabled,
+    callbacks,
+    precision,
+    []() {},
+    summary_out,
+    c_alpha_value,
+    print_dataset_name);
 }
 
 struct Solver
 {
   template <typename CaseOptions, typename NumericalFlux>
-  static int solve(const CaseSpec<CaseOptions, NumericalFlux>& spec,
-                   int argc, char** argv)
+  static int
+  solve(const CaseSpec<CaseOptions, NumericalFlux>& spec, int argc, char** argv)
   {
     mfem::Mpi::Init(argc, argv);
     mfem::Hypre::Init();
 
-    CaseConfig case_cfg = MakeCaseConfig(
-        spec.case_name, spec.default_mesh_path,
-        spec.case_file ? spec.case_file : "", spec.gamma);
+    CaseConfig case_cfg = MakeCaseConfig(spec.case_name,
+                                         spec.default_mesh_path,
+                                         spec.case_file ? spec.case_file : "",
+                                         spec.gamma);
     // Apply CaseSpec defaults first; configure_case can then override them.
     case_cfg.defaults.glvis = spec.glvis.enabled;
     case_cfg.defaults.vtk_save = spec.vtk.enabled;
@@ -257,8 +277,9 @@ struct Solver
     IGROptions cli_igr_opts = spec.igr_defaults;
 
     mfem::OptionsParser args(argc, argv);
-    const std::string mesh_help = std::string("MFEM mesh file to use. Defaults to ")
-                                  + DefaultCaseMeshPath(case_cfg) + ".";
+    const std::string mesh_help =
+      std::string("MFEM mesh file to use. Defaults to ") +
+      DefaultCaseMeshPath(case_cfg) + ".";
     AddCommonOptions(args, cli_opts, mesh_help);
     AddIGROptions(args, cli_igr_opts);
     if (spec.add_options)
@@ -273,32 +294,39 @@ struct Solver
 
     const bool need_sigma_space = spec.use_igr || spec.need_sigma;
     const bool enable_h1_vis_diag =
-        spec.diagnostics.h1_diagnostics &&
-        (run_cfg.opts.glvis || run_cfg.opts.vtk_save);
+      spec.diagnostics.h1_diagnostics &&
+      (run_cfg.opts.glvis || run_cfg.opts.vtk_save);
     const bool enable_l2_diag =
-        spec.diagnostics.l2_diagnostics && run_cfg.opts.vtk_save;
+      spec.diagnostics.l2_diagnostics && run_cfg.opts.vtk_save;
     const bool enable_mpi_rank_diag =
-        spec.diagnostics.mpi_rank_field && run_cfg.opts.vtk_save;
+      spec.diagnostics.mpi_rank_field && run_cfg.opts.vtk_save;
     const bool need_h1 = spec.need_h1 || enable_h1_vis_diag;
-    ExampleContext ctx = BuildExampleContext(run_cfg, run_cfg.igr_opts.space,
-                                             need_sigma_space, need_h1);
+    ExampleContext ctx = BuildExampleContext(run_cfg,
+                                             run_cfg.igr_opts.space,
+                                             need_sigma_space,
+                                             need_h1);
     if (run_cfg.dg_backend == DGBackend::DGSEM)
     {
       detail::VerifyDGSEMElementGeometry(ctx.Mesh());
     }
     if (need_sigma_space)
     {
-      MFEM_VERIFY(ctx.spaces.sigma_fes != nullptr, "Sigma space was not created.");
+      MFEM_VERIFY(ctx.spaces.sigma_fes != nullptr,
+                  "Sigma space was not created.");
     }
     if (need_h1)
     {
-      MFEM_VERIFY(ctx.spaces.h1_vfes != nullptr, "H1 velocity space was not created.");
+      MFEM_VERIFY(ctx.spaces.h1_vfes != nullptr,
+                  "H1 velocity space was not created.");
     }
 
-    mfem::RK3SSPWithLimiter rk3 = MakeRK3Stepper(
-        ctx.spaces.vfes, ctx.dim, case_cfg.rk3_config);
-    ConfigureLimiterPipeline(rk3, case_cfg.limiter_pipeline,
-                             ctx.spaces.vfes, ctx.dim, case_cfg.gamma);
+    mfem::RK3SSPWithLimiter rk3 =
+      MakeRK3Stepper(ctx.spaces.vfes, ctx.dim, case_cfg.rk3_config);
+    ConfigureLimiterPipeline(rk3,
+                             case_cfg.limiter_pipeline,
+                             ctx.spaces.vfes,
+                             ctx.dim,
+                             case_cfg.gamma);
     rk3.EnableStageNanScan(run_cfg.opts.nan_scan);
 
     const double rho_floor = case_cfg.rk3_config.rho_min;
@@ -306,12 +334,15 @@ struct Solver
     double vtk_c_alpha = spec.vtk.c_alpha_value;
     if (spec.use_igr)
     {
-      const AlphaInfo alpha_info = ComputeAlphaInfo(ctx.Mesh(),
-                                                    run_cfg.igr_opts.c_alpha_user);
+      const AlphaInfo alpha_info =
+        ComputeAlphaInfo(ctx.Mesh(), run_cfg.igr_opts.c_alpha_user);
       vtk_c_alpha = std::isnan(vtk_c_alpha) ? alpha_info.c_alpha : vtk_c_alpha;
-      igr = std::make_unique<dg_igr::IGRSolver>(
-          MakeIGRSolver(ctx.spaces, ctx.dim, ctx.num_equations,
-                        run_cfg, rho_floor, alpha_info));
+      igr = std::make_unique<dg_igr::IGRSolver>(MakeIGRSolver(ctx.spaces,
+                                                              ctx.dim,
+                                                              ctx.num_equations,
+                                                              run_cfg,
+                                                              rho_floor,
+                                                              alpha_info));
     }
 
     MFEM_ASSERT(ctx.spaces.fes.GetOrdering() == mfem::Ordering::byNODES, "");
@@ -322,9 +353,10 @@ struct Solver
       std::cout << "Number of unknowns: " << glob_size << std::endl;
     }
 
-    MFEM_VERIFY(spec.make_ic, "CaseSpec is missing an initial condition builder.");
+    MFEM_VERIFY(spec.make_ic,
+                "CaseSpec is missing an initial condition builder.");
     std::unique_ptr<mfem::VectorCoefficient> ic =
-        spec.make_ic(case_opts, ctx, case_cfg.gamma);
+      spec.make_ic(case_opts, ctx, case_cfg.gamma);
     MFEM_VERIFY(ic, "CaseSpec initial condition builder returned null.");
 
     EulerStateBundle state_bundle(ctx, case_cfg.gamma, rho_floor);
@@ -334,7 +366,8 @@ struct Solver
     }
     state_bundle.ProjectIC(*ic);
 
-    TimeLoopCallbacks callbacks = spec.make_callbacks
+    TimeLoopCallbacks callbacks =
+      spec.make_callbacks
         ? spec.make_callbacks(ctx, state_bundle)
         : MakeDefaultTimeLoopCallbacks(spec.callback_defaults);
     RunSummary captured_summary{};
@@ -345,14 +378,18 @@ struct Solver
     std::unique_ptr<MPIRankField> mpi_rank_field;
     if (enable_h1_vis_diag)
     {
-      h1_diag = std::make_unique<H1Diagnostics>(
-          *ctx.spaces.h1_vfes, state_bundle.sol, ctx.dim, rho_floor);
+      h1_diag = std::make_unique<H1Diagnostics>(*ctx.spaces.h1_vfes,
+                                                state_bundle.sol,
+                                                ctx.dim,
+                                                rho_floor);
       state_bundle.field_list.h1_diag = h1_diag.get();
     }
     if (enable_l2_diag)
     {
-      l2_diag = std::make_unique<L2Diagnostics>(
-          ctx.spaces.fes, state_bundle.sol, ctx.dim, rho_floor);
+      l2_diag = std::make_unique<L2Diagnostics>(ctx.spaces.fes,
+                                                state_bundle.sol,
+                                                ctx.dim,
+                                                rho_floor);
       state_bundle.field_list.l2_diag = l2_diag.get();
     }
     if (enable_mpi_rank_diag)
@@ -368,7 +405,8 @@ struct Solver
 
     SaveInitialEulerState(ctx, state_bundle.sol, spec.glvis.precision);
 
-    MFEM_VERIFY(spec.build_markers, "CaseSpec is missing a boundary marker builder.");
+    MFEM_VERIFY(spec.build_markers,
+                "CaseSpec is missing a boundary marker builder.");
     const BoundaryMarkerMap bdr_markers = spec.build_markers(ctx);
 
     const auto on_open = [&]()
@@ -386,30 +424,49 @@ struct Solver
     };
 
     const bool ok = detail::WithEulerOperator<NumericalFlux>(
-        ctx, case_cfg.gamma, igr.get(), state_bundle.sol, bdr_markers, bc_setup,
-        [&](auto& op)
-        {
-              return RunEulerCase(
-                  ctx, case_cfg, run_cfg, state_bundle, rk3, op,
-                  glvis_enabled, callbacks, spec.glvis.precision, on_open,
-                  &captured_summary,
-                  vtk_c_alpha, spec.vtk.print_dataset_name);
-        });
+      ctx,
+      case_cfg.gamma,
+      igr.get(),
+      state_bundle.sol,
+      bdr_markers,
+      bc_setup,
+      [&](auto& op)
+      {
+        return RunEulerCase(ctx,
+                            case_cfg,
+                            run_cfg,
+                            state_bundle,
+                            rk3,
+                            op,
+                            glvis_enabled,
+                            callbacks,
+                            spec.glvis.precision,
+                            on_open,
+                            &captured_summary,
+                            vtk_c_alpha,
+                            spec.vtk.print_dataset_name);
+      });
     captured_summary_valid = ok;
 
     if (!ok)
     {
-      WriteRunMetadataSidecar(case_cfg, run_cfg,
-                              captured_summary_valid ? &captured_summary : nullptr,
-                              igr.get(), vtk_c_alpha, argc, argv, /*success=*/false);
+      WriteRunMetadataSidecar(case_cfg,
+                              run_cfg,
+                              captured_summary_valid ? &captured_summary
+                                                     : nullptr,
+                              igr.get(),
+                              vtk_c_alpha,
+                              argc,
+                              argv,
+                              /*success=*/false);
       return 2;
     }
 
     if (igr && igr->GetLinearSolveCalls() > 0 && mfem::Mpi::Root())
     {
       const double avg_linear_time =
-          igr->GetTotalLinearSolveSeconds() /
-          static_cast<double>(igr->GetLinearSolveCalls());
+        igr->GetTotalLinearSolveSeconds() /
+        static_cast<double>(igr->GetLinearSolveCalls());
       std::cout << "[igr-linear] event=run-summary"
                 << " calls=" << igr->GetLinearSolveCalls()
                 << " converged_calls=" << igr->GetTotalLinearConvergedCalls()
@@ -417,15 +474,20 @@ struct Solver
                 << " avg_solve_s=" << avg_linear_time
                 << " total_solve_s=" << igr->GetTotalLinearSolveSeconds()
                 << " last_solver=" << igr->GetLastLinearSolverName()
-                << " last_precond=" << igr->GetLastPrecondName()
-                << "\n";
+                << " last_precond=" << igr->GetLastPrecondName() << "\n";
     }
 
     SaveFinalEulerState(ctx, state_bundle.sol, spec.glvis.precision);
 
-    WriteRunMetadataSidecar(case_cfg, run_cfg,
-                            captured_summary_valid ? &captured_summary : nullptr,
-                            igr.get(), vtk_c_alpha, argc, argv, /*success=*/true);
+    WriteRunMetadataSidecar(case_cfg,
+                            run_cfg,
+                            captured_summary_valid ? &captured_summary
+                                                   : nullptr,
+                            igr.get(),
+                            vtk_c_alpha,
+                            argc,
+                            argv,
+                            /*success=*/true);
 
     if (spec.postprocess)
     {

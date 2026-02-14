@@ -143,20 +143,50 @@ inline bool OpenEulerIGRGLVisWindows(EulerVisWindows& windows,
 
   fields.igr->GetSigma().ExchangeFaceNbrData();
 
-  const bool ok1 = vis::Open(windows.density, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->density,
+  const bool ok1 = vis::Open(windows.density,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->density,
                              "density, t = 0");
-  const bool ok2 = vis::Open(windows.sigma, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.igr->GetSigma(),
+  const bool ok2 = vis::Open(windows.sigma,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.igr->GetSigma(),
                              "sigma, t = 0");
-  const bool ok3 = vis::Open(windows.energy, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->energy,
+  const bool ok3 = vis::Open(windows.energy,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->energy,
                              "energy, t = 0");
-  const bool ok4 = vis::Open(windows.pressure, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.pressure->pressure,
+  const bool ok4 = vis::Open(windows.pressure,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.pressure->pressure,
                              "pressure, t = 0");
-  const bool ok5 = vis::Open(windows.momentum_x, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->momentum_x,
+  const bool ok5 = vis::Open(windows.momentum_x,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->momentum_x,
                              "momentum_x, t = 0");
   (void)ok4;
   (void)ok5;
@@ -177,17 +207,41 @@ inline bool OpenEulerGLVisWindows(EulerVisWindows& windows,
     return false;
   }
 
-  const bool ok1 = vis::Open(windows.density, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->density,
+  const bool ok1 = vis::Open(windows.density,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->density,
                              "density, t = 0");
-  const bool ok2 = vis::Open(windows.energy, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->energy,
+  const bool ok2 = vis::Open(windows.energy,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->energy,
                              "energy, t = 0");
-  const bool ok3 = vis::Open(windows.pressure, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.pressure->pressure,
+  const bool ok3 = vis::Open(windows.pressure,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.pressure->pressure,
                              "pressure, t = 0");
-  const bool ok4 = vis::Open(windows.momentum_x, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->momentum_x,
+  const bool ok4 = vis::Open(windows.momentum_x,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->momentum_x,
                              "momentum_x, t = 0");
   (void)ok3;
   (void)ok4;
@@ -249,7 +303,8 @@ inline void ApplyCaseVTKConfig(mfem::ParaViewDataCollection& dc,
   mfem::io::ApplyVTKConfig(dc, local_cfg);
 }
 
-inline mfem::io::EulerIGRVisFields MakeEulerIGRVisFields(const EulerFieldList& fields)
+inline mfem::io::EulerIGRVisFields
+MakeEulerIGRVisFields(const EulerFieldList& fields)
 {
   mfem::io::EulerIGRVisFields out;
   if (fields.state)
@@ -265,7 +320,8 @@ inline mfem::io::EulerIGRVisFields MakeEulerIGRVisFields(const EulerFieldList& f
   return out;
 }
 
-inline mfem::io::EulerIGRVisWindows MakeEulerIGRVisWindows(EulerVisWindows& windows)
+inline mfem::io::EulerIGRVisWindows
+MakeEulerIGRVisWindows(EulerVisWindows& windows)
 {
   mfem::io::EulerIGRVisWindows out;
   out.density = &windows.density;
@@ -306,7 +362,8 @@ inline void UpdateEulerOutputFields(const EulerFieldList& fields,
 inline void UpdateEulerGLVis(EulerVisWindows& windows,
                              const EulerFieldList& fields,
                              mfem::ParGridFunction& state,
-                             int num_procs, int my_rank,
+                             int num_procs,
+                             int my_rank,
                              const mfem::ParMesh& pmesh,
                              double t,
                              bool warm_start)
@@ -315,11 +372,20 @@ inline void UpdateEulerGLVis(EulerVisWindows& windows,
   {
     MFEM_VERIFY(fields.pressure != nullptr,
                 "Euler GLVis update with IGR expects a pressure view.");
-    const mfem::io::EulerIGRVisFields vis_fields = MakeEulerIGRVisFields(fields);
-    const mfem::io::EulerIGRVisWindows vis_windows = MakeEulerIGRVisWindows(windows);
-    mfem::io::UpdateEulerIGRViews(vis_windows, vis_fields, *fields.igr, state,
-                                  fields.pressure->coeff, num_procs, my_rank, pmesh,
-                                  t, warm_start);
+    const mfem::io::EulerIGRVisFields vis_fields =
+      MakeEulerIGRVisFields(fields);
+    const mfem::io::EulerIGRVisWindows vis_windows =
+      MakeEulerIGRVisWindows(windows);
+    mfem::io::UpdateEulerIGRViews(vis_windows,
+                                  vis_fields,
+                                  *fields.igr,
+                                  state,
+                                  fields.pressure->coeff,
+                                  num_procs,
+                                  my_rank,
+                                  pmesh,
+                                  t,
+                                  warm_start);
     return;
   }
 
@@ -331,14 +397,34 @@ inline void UpdateEulerGLVis(EulerVisWindows& windows,
   {
     return;
   }
-  vis::Update(windows.density, num_procs, my_rank, pmesh,
-              fields.state->density, t, "density");
-  vis::Update(windows.energy, num_procs, my_rank, pmesh,
-              fields.state->energy, t, "energy");
-  vis::Update(windows.pressure, num_procs, my_rank, pmesh,
-              fields.pressure->pressure, t, "pressure");
-  vis::Update(windows.momentum_x, num_procs, my_rank, pmesh,
-              fields.state->momentum_x, t, "momentum_x");
+  vis::Update(windows.density,
+              num_procs,
+              my_rank,
+              pmesh,
+              fields.state->density,
+              t,
+              "density");
+  vis::Update(windows.energy,
+              num_procs,
+              my_rank,
+              pmesh,
+              fields.state->energy,
+              t,
+              "energy");
+  vis::Update(windows.pressure,
+              num_procs,
+              my_rank,
+              pmesh,
+              fields.pressure->pressure,
+              t,
+              "pressure");
+  vis::Update(windows.momentum_x,
+              num_procs,
+              my_rank,
+              pmesh,
+              fields.state->momentum_x,
+              t,
+              "momentum_x");
 }
 
 } // namespace dg_sim

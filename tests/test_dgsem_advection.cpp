@@ -32,7 +32,8 @@ mfem::Mesh MakePeriodicMesh1D(int n)
   mfem::Mesh orig_mesh = mfem::Mesh::MakeCartesian1D(n, 1.0);
   std::vector<mfem::Vector> translations = {mfem::Vector({1.0})};
   return mfem::Mesh::MakePeriodic(
-      orig_mesh, orig_mesh.CreatePeriodicVertexMapping(translations));
+    orig_mesh,
+    orig_mesh.CreatePeriodicVertexMapping(translations));
 }
 
 void ProjectAdvectionState(mfem::ParGridFunction& U,
@@ -66,12 +67,17 @@ enum class BoundaryMode
 mfem::Mesh MakePeriodicMesh2D(int nx, int ny)
 {
   mfem::Mesh orig_mesh =
-      mfem::Mesh::MakeCartesian2D(nx, ny, mfem::Element::QUADRILATERAL,
-                                  /*gen_edges=*/false, 1.0, 1.0);
+    mfem::Mesh::MakeCartesian2D(nx,
+                                ny,
+                                mfem::Element::QUADRILATERAL,
+                                /*gen_edges=*/false,
+                                1.0,
+                                1.0);
   std::vector<mfem::Vector> translations = {mfem::Vector({1.0, 0.0}),
                                             mfem::Vector({0.0, 1.0})};
   return mfem::Mesh::MakePeriodic(
-      orig_mesh, orig_mesh.CreatePeriodicVertexMapping(translations));
+    orig_mesh,
+    orig_mesh.CreatePeriodicVertexMapping(translations));
 }
 
 void ProjectAdvectionState2D(mfem::ParGridFunction& U,
@@ -135,12 +141,13 @@ BoundaryFluxDiagnostics MaxDiagnostics(const BoundaryFluxDiagnostics& a,
   return out;
 }
 
-BoundaryFluxDiagnostics ComputeBoundaryFluxDiagnostics(const mfem::ParGridFunction& U,
-                                                       mfem::ParMesh& pmesh,
-                                                       const mfem::NumericalFlux& num_flux,
-                                                       const mfem::Vector& inlet_state,
-                                                       int order,
-                                                       int dim)
+BoundaryFluxDiagnostics
+ComputeBoundaryFluxDiagnostics(const mfem::ParGridFunction& U,
+                               mfem::ParMesh& pmesh,
+                               const mfem::NumericalFlux& num_flux,
+                               const mfem::Vector& inlet_state,
+                               int order,
+                               int dim)
 {
   BoundaryFluxDiagnostics local;
   const int num_eq = dim + 2;
@@ -197,36 +204,31 @@ BoundaryFluxDiagnostics ComputeBoundaryFluxDiagnostics(const mfem::ParGridFuncti
       {
         tmp = state1;
         tmp -= inlet_state;
-        local.inlet_state_diff =
-            std::max(local.inlet_state_diff, tmp.Norml2());
+        local.inlet_state_diff = std::max(local.inlet_state_diff, tmp.Norml2());
 
         tmp = state2;
         tmp -= inlet_state;
-        local.inlet_ghost_diff =
-            std::max(local.inlet_ghost_diff, tmp.Norml2());
+        local.inlet_ghost_diff = std::max(local.inlet_ghost_diff, tmp.Norml2());
 
         num_flux.Eval(inlet_state, inlet_state, nor, *Tr, flux_ref);
         tmp = flux;
         tmp -= flux_ref;
-        local.inlet_flux_diff =
-            std::max(local.inlet_flux_diff, tmp.Norml2());
-        local.inlet_flux_norm =
-            std::max(local.inlet_flux_norm, flux.Norml2());
+        local.inlet_flux_diff = std::max(local.inlet_flux_diff, tmp.Norml2());
+        local.inlet_flux_norm = std::max(local.inlet_flux_norm, flux.Norml2());
       }
       else if (attr == 2)
       {
         tmp = state2;
         tmp -= state1;
         local.outlet_ghost_diff =
-            std::max(local.outlet_ghost_diff, tmp.Norml2());
+          std::max(local.outlet_ghost_diff, tmp.Norml2());
 
         num_flux.Eval(state1, state1, nor, *Tr, flux_ref);
         tmp = flux;
         tmp -= flux_ref;
-        local.outlet_flux_diff =
-            std::max(local.outlet_flux_diff, tmp.Norml2());
+        local.outlet_flux_diff = std::max(local.outlet_flux_diff, tmp.Norml2());
         local.outlet_flux_norm =
-            std::max(local.outlet_flux_norm, flux.Norml2());
+          std::max(local.outlet_flux_norm, flux.Norml2());
       }
     }
   }
@@ -242,9 +244,8 @@ BoundaryFluxDiagnostics ComputeBoundaryFluxDiagnostics(const mfem::ParGridFuncti
   return global;
 }
 
-MinMaxStats ComputeRhoPressureMinMax(const mfem::ParGridFunction& U,
-                                     int dim,
-                                     double gamma)
+MinMaxStats
+ComputeRhoPressureMinMax(const mfem::ParGridFunction& U, int dim, double gamma)
 {
   MinMaxStats stats;
   const int num_eq = dim + 2;
@@ -284,14 +285,16 @@ double MaxInletBoundaryError(const mfem::ParGridFunction& U,
                              const mfem::Vector& expected,
                              int order)
 {
-  const mfem::IntegrationRule& ir =
-      mfem::dgsem::GetLGLFaceRule(order);
+  const mfem::IntegrationRule& ir = mfem::dgsem::GetLGLFaceRule(order);
   double local_max = 0.0;
   mfem::Vector state(expected.Size());
   for (int b = 0; b < pmesh.GetNBE(); ++b)
   {
     const int attr = pmesh.GetBdrAttribute(b);
-    if (attr != 4) { continue; } // left boundary on Cartesian meshes
+    if (attr != 4)
+    {
+      continue;
+    } // left boundary on Cartesian meshes
     mfem::ElementTransformation* Tr = pmesh.GetBdrElementTransformation(b);
     for (int q = 0; q < ir.GetNPoints(); ++q)
     {
@@ -319,8 +322,12 @@ bool AllFinite(const mfem::ParGridFunction& U)
   }
   int local = local_ok ? 1 : 0;
   int global = 0;
-  MPI_Allreduce(&local, &global, 1, mfem::MPITypeMap<int>::mpi_type,
-                MPI_LAND, MPI_COMM_WORLD);
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<int>::mpi_type,
+                MPI_LAND,
+                MPI_COMM_WORLD);
   return global == 1;
 }
 
@@ -341,20 +348,23 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
     mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
 
     mfem::DG_FECollection fec(order, dim, mfem::BasisType::GaussLobatto);
-    mfem::ParFiniteElementSpace vfes(&pmesh, &fec, num_eq,
+    mfem::ParFiniteElementSpace vfes(&pmesh,
+                                     &fec,
+                                     num_eq,
                                      mfem::Ordering::byNODES);
 
     mfem::ParGridFunction U(&vfes);
     const mfem::Vector cons_const =
-        EulerConsFromPrim1D(/*rho=*/1.0, /*u=*/0.25, /*p=*/1.0, gamma);
+      EulerConsFromPrim1D(/*rho=*/1.0, /*u=*/0.25, /*p=*/1.0, gamma);
     FillConstantState(cons_const, U);
 
     mfem::EulerFlux flux(dim, gamma);
     mfem::RusanovFluxWithSides num_flux(flux);
     auto form_integrator =
-        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux,
-                                                         int_order_offset);
-    mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form_integrator),
+      std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux,
+                                                       int_order_offset);
+    mfem::DGHyperbolicConservationLaws oper(vfes,
+                                            std::move(form_integrator),
                                             /*preassembleWeakDivergence=*/true);
     oper.SetNumericalFlux(&num_flux);
     oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
@@ -369,7 +379,7 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
     ctx.AddParity(resid_norm);
     ctx.Check(resid_norm < tol_resid,
               "DGSEM 1D constant-state residual ~0 (norm=" +
-                  FormatSci(resid_norm) + ")");
+                FormatSci(resid_norm) + ")");
   }
 
   // 1D smooth advection convergence (periodic).
@@ -393,7 +403,9 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
       mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
 
       mfem::DG_FECollection fec(order, dim, mfem::BasisType::GaussLobatto);
-      mfem::ParFiniteElementSpace vfes(&pmesh, &fec, num_eq,
+      mfem::ParFiniteElementSpace vfes(&pmesh,
+                                       &fec,
+                                       num_eq,
                                        mfem::Ordering::byNODES);
 
       mfem::ParGridFunction U(&vfes);
@@ -402,10 +414,12 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
       mfem::EulerFlux flux(dim, gamma);
       mfem::RusanovFluxWithSides num_flux(flux);
       auto form_integrator =
-          std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux,
-                                                           int_order_offset);
-      mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form_integrator),
-                                              /*preassembleWeakDivergence=*/true);
+        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux,
+                                                         int_order_offset);
+      mfem::DGHyperbolicConservationLaws oper(
+        vfes,
+        std::move(form_integrator),
+        /*preassembleWeakDivergence=*/true);
       oper.SetNumericalFlux(&num_flux);
       oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
       oper.SetFaceIntegrationRule(mfem::dgsem::GetLGLFaceRule(order));
@@ -429,7 +443,7 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
       auto exact_fun = [=](const mfem::Vector& xpos, mfem::Vector& Uout)
       {
         const double rho =
-            rho0 + amp * std::sin(2.0 * kPi * (xpos(0) - u0 * t_final));
+          rho0 + amp * std::sin(2.0 * kPi * (xpos(0) - u0 * t_final));
         mfem::Vector prim(3);
         prim(0) = rho;
         prim(1) = u0;
@@ -440,18 +454,18 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
       const double err = U.ComputeL2Error(exact);
       errors.push_back(err);
       ctx.AddParity(err);
-      ctx.LogMetric("DGSEM 1D advection L2 error (n=" +
-                    std::to_string(n) + ", err=" + FormatSci(err) + ")");
+      ctx.LogMetric("DGSEM 1D advection L2 error (n=" + std::to_string(n) +
+                    ", err=" + FormatSci(err) + ")");
     }
 
     for (size_t i = 1; i < errors.size(); ++i)
     {
       const double ratio = errors[i - 1] / std::max(errors[i], 1.0e-16);
       const double obs_order = std::log(ratio) / std::log(2.0);
-      ctx.Check(obs_order > 1.0,
-                "DGSEM 1D advection observed order > 1 (p=" +
-                    std::to_string(order) +
-                    ", order=" + FormatSci(obs_order) + ")");
+      ctx.Check(
+        obs_order > 1.0,
+        "DGSEM 1D advection observed order > 1 (p=" + std::to_string(order) +
+          ", order=" + FormatSci(obs_order) + ")");
     }
   }
 
@@ -476,7 +490,8 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
     {
       bool dgsem = true;
       mfem::DGSEMVolumeFlux vol_flux = mfem::DGSEMVolumeFlux::Central;
-      mfem::DGSEMSurfaceFluxType surf_flux = mfem::DGSEMSurfaceFluxType::Rusanov;
+      mfem::DGSEMSurfaceFluxType surf_flux =
+        mfem::DGSEMSurfaceFluxType::Rusanov;
       BoundaryMode bc_mode = BoundaryMode::InletOutlet;
       bool periodic = false;
       bool evolve = true;
@@ -487,18 +502,31 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
 
     auto run_case = [&](const CaseConfig& cfg)
     {
-      mfem::Mesh mesh = cfg.periodic
-          ? MakePeriodicMesh2D(nx, ny)
-          : mfem::Mesh::MakeCartesian2D(nx, ny, mfem::Element::QUADRILATERAL,
-                                        /*gen_edges=*/true, 1.0, 1.0);
+      mfem::Mesh mesh =
+        cfg.periodic ? MakePeriodicMesh2D(nx, ny)
+                     : mfem::Mesh::MakeCartesian2D(nx,
+                                                   ny,
+                                                   mfem::Element::QUADRILATERAL,
+                                                   /*gen_edges=*/true,
+                                                   1.0,
+                                                   1.0);
       mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
 
       mfem::DG_FECollection fec(order, dim2, mfem::BasisType::GaussLobatto);
-      mfem::ParFiniteElementSpace vfes(&pmesh, &fec, num_eq2,
+      mfem::ParFiniteElementSpace vfes(&pmesh,
+                                       &fec,
+                                       num_eq2,
                                        mfem::Ordering::byNODES);
 
       mfem::ParGridFunction U(&vfes);
-      ProjectAdvectionState2D(U, gamma, u0, v0, p0, rho0, cfg.amp, /*time=*/0.0);
+      ProjectAdvectionState2D(U,
+                              gamma,
+                              u0,
+                              v0,
+                              p0,
+                              rho0,
+                              cfg.amp,
+                              /*time=*/0.0);
 
       mfem::NumericalFlux* num_flux = nullptr;
       std::unique_ptr<mfem::DGSEMSurfaceFlux> dgsem_flux;
@@ -521,10 +549,12 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
       }
 
       auto form_integrator =
-          std::make_unique<mfem::HyperbolicFormIntegrator>(*num_flux,
-                                                           int_order_offset);
-      mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form_integrator),
-                                              /*preassembleWeakDivergence=*/true);
+        std::make_unique<mfem::HyperbolicFormIntegrator>(*num_flux,
+                                                         int_order_offset);
+      mfem::DGHyperbolicConservationLaws oper(
+        vfes,
+        std::move(form_integrator),
+        /*preassembleWeakDivergence=*/true);
       oper.SetNumericalFlux(num_flux);
 
       if (cfg.dgsem)
@@ -554,31 +584,31 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
           mfem::Vector Uin(4);
           mfem::EulerPrimToConservative(prim, /*dim=*/2, gamma, Uin);
           oper.AddBdrFaceIntegrator(
-              new mfem::BdrHyperbolicFluxIntegrator(
-                  *num_flux,
-                  std::make_unique<mfem::SupersonicInletState>(Uin),
-                  int_order_offset),
-              marker);
+            new mfem::BdrHyperbolicFluxIntegrator(
+              *num_flux,
+              std::make_unique<mfem::SupersonicInletState>(Uin),
+              int_order_offset),
+            marker);
         };
 
         auto add_outlet = [&](const mfem::Array<int>& marker)
         {
           oper.AddBdrFaceIntegrator(
-              new mfem::BdrHyperbolicFluxIntegrator(
-                  *num_flux,
-                  std::make_unique<mfem::SupersonicOutletState>(),
-                  int_order_offset),
-              marker);
+            new mfem::BdrHyperbolicFluxIntegrator(
+              *num_flux,
+              std::make_unique<mfem::SupersonicOutletState>(),
+              int_order_offset),
+            marker);
         };
 
         auto add_slip = [&](const mfem::Array<int>& marker)
         {
           oper.AddBdrFaceIntegrator(
-              new mfem::BdrHyperbolicFluxIntegrator(
-                  *num_flux,
-                  std::make_unique<mfem::SlipWallState>(dim2),
-                  int_order_offset),
-              marker);
+            new mfem::BdrHyperbolicFluxIntegrator(
+              *num_flux,
+              std::make_unique<mfem::SlipWallState>(dim2),
+              int_order_offset),
+            marker);
         };
 
         if (cfg.bc_mode == BoundaryMode::InletOutlet)
@@ -631,18 +661,19 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
         U.GetTrueDofs(x);
         oper.Mult(x, y);
         const double resid_norm = GlobalL2Norm(y);
-        ctx.LogMetric("DGSEM 2D residual (" + cfg.label + "): " +
-                      FormatSci(resid_norm));
+        ctx.LogMetric("DGSEM 2D residual (" + cfg.label +
+                      "): " + FormatSci(resid_norm));
       }
 
       const bool finite = AllFinite(U);
       ctx.Check(finite, "DGSEM 2D advection finite check (" + cfg.label + ")");
 
       const MinMaxStats stats = ComputeRhoPressureMinMax(U, dim2, gamma);
-      ctx.LogMetric("DGSEM 2D advection stats (" + cfg.label + "): rho[min,max]=[" +
-                    FormatSci(stats.rho_min) + ", " + FormatSci(stats.rho_max) +
-                    "], p[min,max]=[" + FormatSci(stats.p_min) + ", " +
-                    FormatSci(stats.p_max) + "]");
+      ctx.LogMetric("DGSEM 2D advection stats (" + cfg.label +
+                    "): rho[min,max]=[" + FormatSci(stats.rho_min) + ", " +
+                    FormatSci(stats.rho_max) + "], p[min,max]=[" +
+                    FormatSci(stats.p_min) + ", " + FormatSci(stats.p_max) +
+                    "]");
 
       if (!cfg.periodic && cfg.bc_mode == BoundaryMode::InletOutlet)
       {
@@ -654,71 +685,133 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
         mfem::Vector Uin(4);
         mfem::EulerPrimToConservative(prim, /*dim=*/2, gamma, Uin);
         const double inlet_err = MaxInletBoundaryError(U, pmesh, Uin, order);
-        ctx.LogMetric("DGSEM 2D inlet max diff (" + cfg.label + "): " +
-                      FormatSci(inlet_err));
+        ctx.LogMetric("DGSEM 2D inlet max diff (" + cfg.label +
+                      "): " + FormatSci(inlet_err));
       }
     };
 
-    std::vector<CaseConfig> cases = {
-        {true, mfem::DGSEMVolumeFlux::Central,
-         mfem::DGSEMSurfaceFluxType::Rusanov, BoundaryMode::InletOutlet,
-         false, true, true, base_amp, "dgsem-central+rusanov/inlet-outlet"},
-        {false, mfem::DGSEMVolumeFlux::Central,
-         mfem::DGSEMSurfaceFluxType::Rusanov, BoundaryMode::InletOutlet,
-         false, true, false, base_amp, "dg (weak-div)/rusanov/inlet-outlet"},
-        {true, mfem::DGSEMVolumeFlux::Central,
-         mfem::DGSEMSurfaceFluxType::Rusanov, BoundaryMode::AllOutlet,
-         false, true, true, base_amp, "dgsem-central+rusanov/all-outlet"},
-        {true, mfem::DGSEMVolumeFlux::Central,
-         mfem::DGSEMSurfaceFluxType::Rusanov, BoundaryMode::AllSlip,
-         false, true, true, base_amp, "dgsem-central+rusanov/all-slip"},
-        {true, mfem::DGSEMVolumeFlux::Central,
-         mfem::DGSEMSurfaceFluxType::Rusanov, BoundaryMode::InletOutlet,
-         true, true, false, base_amp, "dgsem-central+rusanov/periodic"}
-    };
+    std::vector<CaseConfig> cases = {{true,
+                                      mfem::DGSEMVolumeFlux::Central,
+                                      mfem::DGSEMSurfaceFluxType::Rusanov,
+                                      BoundaryMode::InletOutlet,
+                                      false,
+                                      true,
+                                      true,
+                                      base_amp,
+                                      "dgsem-central+rusanov/inlet-outlet"},
+                                     {false,
+                                      mfem::DGSEMVolumeFlux::Central,
+                                      mfem::DGSEMSurfaceFluxType::Rusanov,
+                                      BoundaryMode::InletOutlet,
+                                      false,
+                                      true,
+                                      false,
+                                      base_amp,
+                                      "dg (weak-div)/rusanov/inlet-outlet"},
+                                     {true,
+                                      mfem::DGSEMVolumeFlux::Central,
+                                      mfem::DGSEMSurfaceFluxType::Rusanov,
+                                      BoundaryMode::AllOutlet,
+                                      false,
+                                      true,
+                                      true,
+                                      base_amp,
+                                      "dgsem-central+rusanov/all-outlet"},
+                                     {true,
+                                      mfem::DGSEMVolumeFlux::Central,
+                                      mfem::DGSEMSurfaceFluxType::Rusanov,
+                                      BoundaryMode::AllSlip,
+                                      false,
+                                      true,
+                                      true,
+                                      base_amp,
+                                      "dgsem-central+rusanov/all-slip"},
+                                     {true,
+                                      mfem::DGSEMVolumeFlux::Central,
+                                      mfem::DGSEMSurfaceFluxType::Rusanov,
+                                      BoundaryMode::InletOutlet,
+                                      true,
+                                      true,
+                                      false,
+                                      base_amp,
+                                      "dgsem-central+rusanov/periodic"}};
 
-    const bool enable_es_cases = EnvEnabledDefault("DG_IGR_DGSEM_DIAG_ES", true);
+    const bool enable_es_cases =
+      EnvEnabledDefault("DG_IGR_DGSEM_DIAG_ES", true);
     const bool enable_es_time_cases =
-        EnvEnabledDefault("DG_IGR_DGSEM_DIAG_ES_TIME", true);
-    const bool enable_pp_cases = EnvEnabledDefault("DG_IGR_DGSEM_DIAG_PP", true);
+      EnvEnabledDefault("DG_IGR_DGSEM_DIAG_ES_TIME", true);
+    const bool enable_pp_cases =
+      EnvEnabledDefault("DG_IGR_DGSEM_DIAG_PP", true);
     if (enable_es_cases)
     {
-      cases.push_back({true, mfem::DGSEMVolumeFlux::Ranocha,
+      cases.push_back({true,
+                       mfem::DGSEMVolumeFlux::Ranocha,
                        mfem::DGSEMSurfaceFluxType::EntropyStableWinters,
-                       BoundaryMode::InletOutlet, false, false, false, es_amp,
+                       BoundaryMode::InletOutlet,
+                       false,
+                       false,
+                       false,
+                       es_amp,
                        "dgsem-ranocha+es-winters/inlet-outlet"});
-      cases.push_back({true, mfem::DGSEMVolumeFlux::Ranocha,
+      cases.push_back({true,
+                       mfem::DGSEMVolumeFlux::Ranocha,
                        mfem::DGSEMSurfaceFluxType::EntropyStableLFEntropyVars,
-                       BoundaryMode::InletOutlet, false, false, false, es_amp,
+                       BoundaryMode::InletOutlet,
+                       false,
+                       false,
+                       false,
+                       es_amp,
                        "dgsem-ranocha+es-lf/inlet-outlet"});
-      cases.push_back({true, mfem::DGSEMVolumeFlux::Ranocha,
+      cases.push_back({true,
+                       mfem::DGSEMVolumeFlux::Ranocha,
                        mfem::DGSEMSurfaceFluxType::EntropyStableWinters,
-                       BoundaryMode::AllOutlet, false, false, false, es_amp,
+                       BoundaryMode::AllOutlet,
+                       false,
+                       false,
+                       false,
+                       es_amp,
                        "dgsem-ranocha+es-winters/all-outlet"});
-      cases.push_back({true, mfem::DGSEMVolumeFlux::Ranocha,
+      cases.push_back({true,
+                       mfem::DGSEMVolumeFlux::Ranocha,
                        mfem::DGSEMSurfaceFluxType::EntropyStableWinters,
-                       BoundaryMode::AllSlip, false, false, false, es_amp,
+                       BoundaryMode::AllSlip,
+                       false,
+                       false,
+                       false,
+                       es_amp,
                        "dgsem-ranocha+es-winters/all-slip"});
-      cases.push_back({true, mfem::DGSEMVolumeFlux::Ranocha,
+      cases.push_back({true,
+                       mfem::DGSEMVolumeFlux::Ranocha,
                        mfem::DGSEMSurfaceFluxType::EntropyStableWinters,
-                       BoundaryMode::InletOutlet, true, false, false, es_amp,
+                       BoundaryMode::InletOutlet,
+                       true,
+                       false,
+                       false,
+                       es_amp,
                        "dgsem-ranocha+es-winters/periodic"});
     }
     else
     {
-      ctx.LogMetric("DGSEM 2D ES diagnostics disabled (set DG_IGR_DGSEM_DIAG_ES=1).");
+      ctx.LogMetric(
+        "DGSEM 2D ES diagnostics disabled (set DG_IGR_DGSEM_DIAG_ES=1).");
     }
 
     if (enable_es_time_cases)
     {
-      cases.push_back({true, mfem::DGSEMVolumeFlux::Ranocha,
+      cases.push_back({true,
+                       mfem::DGSEMVolumeFlux::Ranocha,
                        mfem::DGSEMSurfaceFluxType::EntropyStableWinters,
-                       BoundaryMode::InletOutlet, false, true, false, base_amp,
+                       BoundaryMode::InletOutlet,
+                       false,
+                       true,
+                       false,
+                       base_amp,
                        "dgsem-ranocha+es-winters/inlet-outlet+time"});
     }
     else
     {
-      ctx.LogMetric("DGSEM 2D ES time-evolution disabled (set DG_IGR_DGSEM_DIAG_ES_TIME=1).");
+      ctx.LogMetric("DGSEM 2D ES time-evolution disabled (set "
+                    "DG_IGR_DGSEM_DIAG_ES_TIME=1).");
     }
 
     if (enable_pp_cases)
@@ -762,13 +855,18 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
     const double cfl = 0.1;
     const double t_final = 0.01;
 
-    mfem::Mesh mesh =
-        mfem::Mesh::MakeCartesian2D(nx, ny, mfem::Element::QUADRILATERAL,
-                                    /*gen_edges=*/true, 1.0, 1.0);
+    mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(nx,
+                                                  ny,
+                                                  mfem::Element::QUADRILATERAL,
+                                                  /*gen_edges=*/true,
+                                                  1.0,
+                                                  1.0);
     mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
 
     mfem::DG_FECollection fec(order2, dim2, mfem::BasisType::GaussLobatto);
-    mfem::ParFiniteElementSpace vfes(&pmesh, &fec, num_eq2,
+    mfem::ParFiniteElementSpace vfes(&pmesh,
+                                     &fec,
+                                     num_eq2,
                                      mfem::Ordering::byNODES);
 
     mfem::ParGridFunction U(&vfes);
@@ -785,10 +883,11 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
     const bool use_es = EnvEnabledDefault("DG_IGR_DGSEM_BDR_LOG_ES", true);
     mfem::EulerFlux base_flux(dim2, gamma);
     std::unique_ptr<mfem::DGSEMSurfaceFlux> dgsem_flux =
-        std::make_unique<mfem::DGSEMSurfaceFlux>(base_flux);
+      std::make_unique<mfem::DGSEMSurfaceFlux>(base_flux);
     if (use_es)
     {
-      dgsem_flux->SetSurfaceFluxType(mfem::DGSEMSurfaceFluxType::EntropyStableWinters);
+      dgsem_flux->SetSurfaceFluxType(
+        mfem::DGSEMSurfaceFluxType::EntropyStableWinters);
       dgsem_flux->SetEntropyFluxType(mfem::dgsem::EntropyFluxType::Ranocha);
       dgsem_flux->SetGamma(gamma);
     }
@@ -799,9 +898,10 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
 
     mfem::NumericalFlux* num_flux = dgsem_flux.get();
     auto form_integrator =
-        std::make_unique<mfem::HyperbolicFormIntegrator>(*num_flux,
-                                                         int_order_offset);
-    mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form_integrator),
+      std::make_unique<mfem::HyperbolicFormIntegrator>(*num_flux,
+                                                       int_order_offset);
+    mfem::DGHyperbolicConservationLaws oper(vfes,
+                                            std::move(form_integrator),
                                             /*preassembleWeakDivergence=*/true);
     oper.SetNumericalFlux(num_flux);
     oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
@@ -818,23 +918,21 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
     mfem::MakeMarker(marker_slip, pmesh, {1, 3});
 
     oper.AddBdrFaceIntegrator(
-        new mfem::BdrHyperbolicFluxIntegrator(
-            *num_flux,
-            std::make_unique<mfem::SupersonicInletState>(Uin),
-            int_order_offset),
-        marker_inlet);
-    oper.AddBdrFaceIntegrator(
-        new mfem::BdrHyperbolicFluxIntegrator(
-            *num_flux,
-            std::make_unique<mfem::SupersonicOutletState>(),
-            int_order_offset),
-        marker_outlet);
-    oper.AddBdrFaceIntegrator(
-        new mfem::BdrHyperbolicFluxIntegrator(
-            *num_flux,
-            std::make_unique<mfem::SlipWallState>(dim2),
-            int_order_offset),
-        marker_slip);
+      new mfem::BdrHyperbolicFluxIntegrator(
+        *num_flux,
+        std::make_unique<mfem::SupersonicInletState>(Uin),
+        int_order_offset),
+      marker_inlet);
+    oper.AddBdrFaceIntegrator(new mfem::BdrHyperbolicFluxIntegrator(
+                                *num_flux,
+                                std::make_unique<mfem::SupersonicOutletState>(),
+                                int_order_offset),
+                              marker_outlet);
+    oper.AddBdrFaceIntegrator(new mfem::BdrHyperbolicFluxIntegrator(
+                                *num_flux,
+                                std::make_unique<mfem::SlipWallState>(dim2),
+                                int_order_offset),
+                              marker_slip);
 
     mfem::RK3SSPWithLimiter rk(vfes);
     rk.Init(oper);
@@ -843,7 +941,7 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
     U.GetTrueDofs(x);
 
     BoundaryFluxDiagnostics diag0 =
-        ComputeBoundaryFluxDiagnostics(U, pmesh, *num_flux, Uin, order2, dim2);
+      ComputeBoundaryFluxDiagnostics(U, pmesh, *num_flux, Uin, order2, dim2);
     BoundaryFluxDiagnostics diag_max = diag0;
 
     double t = 0.0;
@@ -855,21 +953,26 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
       rk.Step(x, t, dt);
       U.SetFromTrueDofs(x);
       BoundaryFluxDiagnostics diag_step =
-          ComputeBoundaryFluxDiagnostics(U, pmesh, *num_flux, Uin, order2, dim2);
+        ComputeBoundaryFluxDiagnostics(U, pmesh, *num_flux, Uin, order2, dim2);
       diag_max = MaxDiagnostics(diag_max, diag_step);
     }
 
     ctx.LogMetric(std::string("DGSEM boundary diag (") +
-                  (use_es ? "es-winters" : "rusanov") + "): "
-                  "inlet_state_max=" + FormatSci(diag_max.inlet_state_diff) +
-                  ", inlet_ghost_max=" + FormatSci(diag_max.inlet_ghost_diff) +
-                  ", outlet_ghost_max=" + FormatSci(diag_max.outlet_ghost_diff));
-    ctx.LogMetric(std::string("DGSEM boundary flux diag (") +
-                  (use_es ? "es-winters" : "rusanov") + "): "
-                  "inlet_flux_diff_max=" + FormatSci(diag_max.inlet_flux_diff) +
-                  ", outlet_flux_diff_max=" + FormatSci(diag_max.outlet_flux_diff) +
-                  ", inlet_flux_norm_max=" + FormatSci(diag_max.inlet_flux_norm) +
-                  ", outlet_flux_norm_max=" + FormatSci(diag_max.outlet_flux_norm));
+                  (use_es ? "es-winters" : "rusanov") +
+                  "): "
+                  "inlet_state_max=" +
+                  FormatSci(diag_max.inlet_state_diff) + ", inlet_ghost_max=" +
+                  FormatSci(diag_max.inlet_ghost_diff) + ", outlet_ghost_max=" +
+                  FormatSci(diag_max.outlet_ghost_diff));
+    ctx.LogMetric(
+      std::string("DGSEM boundary flux diag (") +
+      (use_es ? "es-winters" : "rusanov") +
+      "): "
+      "inlet_flux_diff_max=" +
+      FormatSci(diag_max.inlet_flux_diff) +
+      ", outlet_flux_diff_max=" + FormatSci(diag_max.outlet_flux_diff) +
+      ", inlet_flux_norm_max=" + FormatSci(diag_max.inlet_flux_norm) +
+      ", outlet_flux_norm_max=" + FormatSci(diag_max.outlet_flux_norm));
   }
 
   return ctx.failures;

@@ -19,9 +19,13 @@ struct InflowOptions
 inline void AddInflowOptions(mfem::OptionsParser& args,
                              InflowOptions& inflow_opts)
 {
-  args.AddOption(&inflow_opts.vx, "-vx", "--velocity-x",
+  args.AddOption(&inflow_opts.vx,
+                 "-vx",
+                 "--velocity-x",
                  "Free-stream / inflow velocity x-component.");
-  args.AddOption(&inflow_opts.vy, "-vy", "--velocity-y",
+  args.AddOption(&inflow_opts.vy,
+                 "-vy",
+                 "--velocity-y",
                  "Free-stream / inflow velocity y-component.");
 }
 
@@ -32,7 +36,7 @@ struct ForwardFacingOptions
 
 } // namespace
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
   dg_sim::CaseSpec<ForwardFacingOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "dgsem_forward_facing_step";
@@ -64,9 +68,8 @@ int main(int argc, char *argv[])
     AddInflowOptions(args, opts.inflow);
   };
 
-  spec.make_ic = [](const ForwardFacingOptions& opts,
-                    const dg_sim::ExampleContext&,
-                    double)
+  spec.make_ic =
+    [](const ForwardFacingOptions& opts, const dg_sim::ExampleContext&, double)
   {
     mfem::Vector Uin(4);
     Uin(0) = 1.4;
@@ -80,10 +83,10 @@ int main(int argc, char *argv[])
   spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
     return dg_sim::BuildBoundaryMarkers(
-        ctx.Mesh(),
-        {{dg_sim::BoundaryRole::Inlet, {1, 2}},
-         {dg_sim::BoundaryRole::Outlet, {3}},
-         {dg_sim::BoundaryRole::Slip, {4, 5, 6, 7}}});
+      ctx.Mesh(),
+      {{dg_sim::BoundaryRole::Inlet, {1, 2}},
+       {dg_sim::BoundaryRole::Outlet, {3}},
+       {dg_sim::BoundaryRole::Slip, {4, 5, 6, 7}}});
   };
 
   spec.apply_bc = [](const ForwardFacingOptions& opts,

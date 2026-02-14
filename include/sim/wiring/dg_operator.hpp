@@ -16,62 +16,64 @@ namespace dg_sim
 
 /// @brief Build a DG operator with a numerical flux and shared settings.
 template <typename NumericalFlux>
-inline mfem::DGHyperbolicConservationLaws MakeDGOperator(
-    ExampleContext& ctx,
-    const NumericalFlux& numerical_flux)
+inline mfem::DGHyperbolicConservationLaws
+MakeDGOperator(ExampleContext& ctx, const NumericalFlux& numerical_flux)
 {
-  auto to_mfem_stab = [](DGSEMStabilization stab) {
+  auto to_mfem_stab = [](DGSEMStabilization stab)
+  {
     switch (stab)
     {
-      case DGSEMStabilization::None:
-        return mfem::DGSEMStabilization::None;
-      case DGSEMStabilization::SplitForm:
-        return mfem::DGSEMStabilization::SplitForm;
-      case DGSEMStabilization::Filter:
-        return mfem::DGSEMStabilization::Filter;
+    case DGSEMStabilization::None:
+      return mfem::DGSEMStabilization::None;
+    case DGSEMStabilization::SplitForm:
+      return mfem::DGSEMStabilization::SplitForm;
+    case DGSEMStabilization::Filter:
+      return mfem::DGSEMStabilization::Filter;
     }
     return mfem::DGSEMStabilization::None;
   };
-  auto to_mfem_vol = [](DGSEMVolumeFlux flux) {
+  auto to_mfem_vol = [](DGSEMVolumeFlux flux)
+  {
     switch (flux)
     {
-      case DGSEMVolumeFlux::Central:
-        return mfem::DGSEMVolumeFlux::Central;
-      case DGSEMVolumeFlux::Chandrashekar:
-        return mfem::DGSEMVolumeFlux::Chandrashekar;
-      case DGSEMVolumeFlux::Ranocha:
-        return mfem::DGSEMVolumeFlux::Ranocha;
+    case DGSEMVolumeFlux::Central:
+      return mfem::DGSEMVolumeFlux::Central;
+    case DGSEMVolumeFlux::Chandrashekar:
+      return mfem::DGSEMVolumeFlux::Chandrashekar;
+    case DGSEMVolumeFlux::Ranocha:
+      return mfem::DGSEMVolumeFlux::Ranocha;
     }
     return mfem::DGSEMVolumeFlux::Central;
   };
-  auto to_mfem_vol_diss = [](DGSEMVolumeDissipation diss) {
+  auto to_mfem_vol_diss = [](DGSEMVolumeDissipation diss)
+  {
     switch (diss)
     {
-      case DGSEMVolumeDissipation::None:
-        return mfem::DGSEMVolumeDissipation::None;
-      case DGSEMVolumeDissipation::LLF:
-        return mfem::DGSEMVolumeDissipation::LLF;
-      case DGSEMVolumeDissipation::EntropyVarsLF:
-        return mfem::DGSEMVolumeDissipation::EntropyVarsLF;
+    case DGSEMVolumeDissipation::None:
+      return mfem::DGSEMVolumeDissipation::None;
+    case DGSEMVolumeDissipation::LLF:
+      return mfem::DGSEMVolumeDissipation::LLF;
+    case DGSEMVolumeDissipation::EntropyVarsLF:
+      return mfem::DGSEMVolumeDissipation::EntropyVarsLF;
     }
     return mfem::DGSEMVolumeDissipation::None;
   };
   mfem::DGHyperbolicConservationLaws op(
-      ctx.spaces.vfes,
-      std::unique_ptr<mfem::HyperbolicFormIntegrator>(
-          new mfem::HyperbolicFormIntegrator(numerical_flux,
-                                             ctx.run_cfg.case_config.int_order_offset)),
-      ctx.run_cfg.opts.preassemble_weak_div);
+    ctx.spaces.vfes,
+    std::unique_ptr<mfem::HyperbolicFormIntegrator>(
+      new mfem::HyperbolicFormIntegrator(
+        numerical_flux,
+        ctx.run_cfg.case_config.int_order_offset)),
+    ctx.run_cfg.opts.preassemble_weak_div);
   op.SetNumericalFlux(&numerical_flux);
   if (ctx.run_cfg.dg_backend == DGBackend::DGSEM)
   {
     op.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
     op.SetDGSEMVolumeFlux(to_mfem_vol(ctx.run_cfg.dgsem_volume_flux));
     op.SetDGSEMVolumeDissipation(
-        to_mfem_vol_diss(ctx.run_cfg.dgsem_volume_dissipation));
-    op.SetDGSEMEntropyJacobianAnalytic(
-        ctx.run_cfg.dgsem_entropy_jacobian ==
-        DGSEMEntropyJacobian::Analytic);
+      to_mfem_vol_diss(ctx.run_cfg.dgsem_volume_dissipation));
+    op.SetDGSEMEntropyJacobianAnalytic(ctx.run_cfg.dgsem_entropy_jacobian ==
+                                       DGSEMEntropyJacobian::Analytic);
     op.SetDGSEMGamma(ctx.run_cfg.case_config.gamma);
     if (ctx.run_cfg.dgsem_stab != DGSEMStabilization::None)
     {
@@ -80,7 +82,7 @@ inline mfem::DGHyperbolicConservationLaws MakeDGOperator(
     if (ctx.dim == 2)
     {
       op.SetFaceIntegrationRule(
-          mfem::dgsem::GetLGLFaceRule(ctx.run_cfg.opts.order));
+        mfem::dgsem::GetLGLFaceRule(ctx.run_cfg.opts.order));
     }
   }
   return op;

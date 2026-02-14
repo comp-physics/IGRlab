@@ -6,8 +6,10 @@
  * @ingroup utils_config
  */
 
-namespace mfem {
-namespace dg_igr {
+namespace mfem
+{
+namespace dg_igr
+{
 
 struct EulerDefaults
 {

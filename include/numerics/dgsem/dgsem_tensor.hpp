@@ -29,9 +29,18 @@ struct TensorDofMapKeyLess
 {
   bool operator()(const TensorDofMapKey& a, const TensorDofMapKey& b) const
   {
-    if (a.order != b.order) { return a.order < b.order; }
-    if (a.dim != b.dim) { return a.dim < b.dim; }
-    if (a.basis_type != b.basis_type) { return a.basis_type < b.basis_type; }
+    if (a.order != b.order)
+    {
+      return a.order < b.order;
+    }
+    if (a.dim != b.dim)
+    {
+      return a.dim < b.dim;
+    }
+    if (a.basis_type != b.basis_type)
+    {
+      return a.basis_type < b.basis_type;
+    }
     return a.dof < b.dof;
   }
 };
@@ -81,7 +90,8 @@ inline std::vector<int> BuildLocalToLex(const FiniteElement& fe)
   return local_to_lex;
 }
 
-inline std::vector<std::array<int, 3>> BuildTensorDofToIJK(const FiniteElement& fe)
+inline std::vector<std::array<int, 3>>
+BuildTensorDofToIJK(const FiniteElement& fe)
 {
   const int dim = fe.GetDim();
   const int order = fe.GetOrder();
@@ -89,7 +99,8 @@ inline std::vector<std::array<int, 3>> BuildTensorDofToIJK(const FiniteElement& 
   const int dof = fe.GetDof();
   MFEM_VERIFY(dim >= 1 && dim <= 3, "Tensor DOF map supports dim=1..3.");
   MFEM_VERIFY(dof == TensorBasisElement::Pow(n1d, dim),
-              "Finite element is not tensor-product of order p=" << order << ".");
+              "Finite element is not tensor-product of order p=" << order
+                                                                 << ".");
 
   const std::vector<int> local_to_lex = BuildLocalToLex(fe);
   std::vector<std::array<int, 3>> dof_to_ijk(dof);
@@ -101,12 +112,18 @@ inline std::vector<std::array<int, 3>> BuildTensorDofToIJK(const FiniteElement& 
   return dof_to_ijk;
 }
 
-inline const std::vector<std::array<int, 3>>& GetTensorDofToIJK(const FiniteElement& fe)
+inline const std::vector<std::array<int, 3>>&
+GetTensorDofToIJK(const FiniteElement& fe)
 {
-  static std::map<TensorDofMapKey, std::vector<std::array<int, 3>>, TensorDofMapKeyLess> cache;
+  static std::
+    map<TensorDofMapKey, std::vector<std::array<int, 3>>, TensorDofMapKeyLess>
+      cache;
   const auto* tbe = dynamic_cast<const TensorBasisElement*>(&fe);
   const int basis_type = tbe ? tbe->GetBasisType() : -1;
-  const TensorDofMapKey key{fe.GetOrder(), fe.GetDim(), basis_type, fe.GetDof()};
+  const TensorDofMapKey key{fe.GetOrder(),
+                            fe.GetDim(),
+                            basis_type,
+                            fe.GetDof()};
   auto it = cache.find(key);
   if (it != cache.end())
   {

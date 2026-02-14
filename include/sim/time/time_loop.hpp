@@ -39,9 +39,12 @@ struct TimeLoopConfig
  */
 struct TimeLoopHooks
 {
-  std::function<void(int step, mfem::real_t t, mfem::real_t dt_real, bool done)> on_visualize;
-  std::function<void(int step, mfem::real_t t, mfem::real_t dt_real, bool done)> on_analysis;
-  std::function<void(int step, mfem::real_t t, int save_idx, bool is_final)> on_save;
+  std::function<void(int step, mfem::real_t t, mfem::real_t dt_real, bool done)>
+    on_visualize;
+  std::function<void(int step, mfem::real_t t, mfem::real_t dt_real, bool done)>
+    on_analysis;
+  std::function<void(int step, mfem::real_t t, int save_idx, bool is_final)>
+    on_save;
 };
 
 /**
@@ -63,8 +66,12 @@ inline mfem::real_t ComputeGlobalHMin(mfem::ParMesh& pmesh)
   {
     hmin = std::min(hmin, pmesh.GetElementSize(i, 1));
   }
-  MPI_Allreduce(MPI_IN_PLACE, &hmin, 1, mfem::MPITypeMap<mfem::real_t>::mpi_type,
-                MPI_MIN, pmesh.GetComm());
+  MPI_Allreduce(MPI_IN_PLACE,
+                &hmin,
+                1,
+                mfem::MPITypeMap<mfem::real_t>::mpi_type,
+                MPI_MIN,
+                pmesh.GetComm());
   return hmin;
 }
 
@@ -80,8 +87,12 @@ mfem::real_t ComputeCFLDt(OperatorType& op,
   op.Mult(sol, z);
 
   mfem::real_t max_char_speed = op.GetMaxCharSpeed();
-  MPI_Allreduce(MPI_IN_PLACE, &max_char_speed, 1,
-                mfem::MPITypeMap<mfem::real_t>::mpi_type, MPI_MAX, pmesh.GetComm());
+  MPI_Allreduce(MPI_IN_PLACE,
+                &max_char_speed,
+                1,
+                mfem::MPITypeMap<mfem::real_t>::mpi_type,
+                MPI_MAX,
+                pmesh.GetComm());
 
   if (max_char_speed <= 0.0)
   {
@@ -114,17 +125,18 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
     {
       std::cout << "[dt-check] Non-finite dt before time loop: " << dt << "\n";
     }
-    const mfem::dg_igr::NonFiniteSummary summary = mfem::dg_igr::ScanNonFinite(sol);
-    result.non_finite_count = summary.global_non_finite > 0
-                                  ? summary.global_non_finite
-                                  : 1;
+    const mfem::dg_igr::NonFiniteSummary summary =
+      mfem::dg_igr::ScanNonFinite(sol);
+    result.non_finite_count =
+      summary.global_non_finite > 0 ? summary.global_non_finite : 1;
     result.non_finite_min = summary.global_min;
     result.non_finite_max = summary.global_max;
     return result;
   }
 
   int save_idx = cfg.save_index_offset;
-  mfem::real_t t_next_save = (cfg.vtk_save && cfg.dt_save > 0.0) ? cfg.dt_save : 0.0;
+  mfem::real_t t_next_save =
+    (cfg.vtk_save && cfg.dt_save > 0.0) ? cfg.dt_save : 0.0;
 
   bool done = false;
   for (int step = 0; !done; ++step)
@@ -150,23 +162,30 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
         std::cout << "[dt-check] Non-finite dt during time loop: " << dt_real
                   << " at t=" << t << "\n";
       }
-      const mfem::dg_igr::NonFiniteSummary summary = mfem::dg_igr::ScanNonFinite(sol);
-      result.non_finite_count = summary.global_non_finite > 0
-                                    ? summary.global_non_finite
-                                    : 1;
+      const mfem::dg_igr::NonFiniteSummary summary =
+        mfem::dg_igr::ScanNonFinite(sol);
+      result.non_finite_count =
+        summary.global_non_finite > 0 ? summary.global_non_finite : 1;
       result.non_finite_min = summary.global_min;
       result.non_finite_max = summary.global_max;
       break;
     }
 
     stepper.Step(sol, t, dt_real);
-    if (hit_save_boundary) { t = t_next_save; }
+    if (hit_save_boundary)
+    {
+      t = t_next_save;
+    }
 
     if (cfg.cfl > 0.0)
     {
       mfem::real_t max_char_speed = op.GetMaxCharSpeed();
-      MPI_Allreduce(MPI_IN_PLACE, &max_char_speed, 1,
-                    mfem::MPITypeMap<mfem::real_t>::mpi_type, MPI_MAX, pmesh.GetComm());
+      MPI_Allreduce(MPI_IN_PLACE,
+                    &max_char_speed,
+                    1,
+                    mfem::MPITypeMap<mfem::real_t>::mpi_type,
+                    MPI_MAX,
+                    pmesh.GetComm());
       if (max_char_speed > 0.0)
       {
         dt = cfg.cfl * hmin / max_char_speed / (2 * cfg.order + 1);
@@ -182,10 +201,10 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
           std::cout << "[dt-check] Non-finite dt after CFL update: " << dt
                     << " at t=" << t << "\n";
         }
-        const mfem::dg_igr::NonFiniteSummary summary = mfem::dg_igr::ScanNonFinite(sol);
-        result.non_finite_count = summary.global_non_finite > 0
-                                      ? summary.global_non_finite
-                                      : 1;
+        const mfem::dg_igr::NonFiniteSummary summary =
+          mfem::dg_igr::ScanNonFinite(sol);
+        result.non_finite_count =
+          summary.global_non_finite > 0 ? summary.global_non_finite : 1;
         result.non_finite_min = summary.global_min;
         result.non_finite_max = summary.global_max;
         break;
@@ -198,7 +217,8 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
 
     if (cfg.nan_scan)
     {
-      const mfem::dg_igr::NonFiniteSummary summary = mfem::dg_igr::ScanNonFinite(sol);
+      const mfem::dg_igr::NonFiniteSummary summary =
+        mfem::dg_igr::ScanNonFinite(sol);
       if (summary.global_non_finite > 0)
       {
         result.non_finite_count = summary.global_non_finite;
@@ -216,15 +236,15 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
     }
 
     const bool should_visualize =
-        (cfg.vis_steps > 0) && (done || (result.steps % cfg.vis_steps == 0));
+      (cfg.vis_steps > 0) && (done || (result.steps % cfg.vis_steps == 0));
     if (should_visualize && hooks.on_visualize)
     {
       hooks.on_visualize(result.steps, t, dt_real, done);
     }
 
     const bool should_analyze =
-        (cfg.analysis_steps > 0) &&
-        (done || (result.steps % cfg.analysis_steps == 0));
+      (cfg.analysis_steps > 0) &&
+      (done || (result.steps % cfg.analysis_steps == 0));
     if (should_analyze && hooks.on_analysis)
     {
       hooks.on_analysis(result.steps, t, dt_real, done);

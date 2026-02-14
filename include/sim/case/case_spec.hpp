@@ -31,9 +31,12 @@ struct GLVisConfig
 /// @brief Optional diagnostics fields computed for GLVis/VTK outputs.
 struct DiagnosticsConfig
 {
-  bool h1_diagnostics = false;   ///< H1-projected diagnostics (velocity_h1, speed_h1, div_h1, grad_frob_h1).
-  bool l2_diagnostics = false;   ///< Broken/L2 diagnostics from conservative-state gradients (div_l2, grad_frob_l2).
-  bool mpi_rank_field = false;   ///< Per-element MPI rank field for VTK debugging.
+  bool h1_diagnostics =
+    false; ///< H1-projected diagnostics (velocity_h1, speed_h1, div_h1, grad_frob_h1).
+  bool l2_diagnostics =
+    false; ///< Broken/L2 diagnostics from conservative-state gradients (div_l2, grad_frob_l2).
+  bool mpi_rank_field =
+    false; ///< Per-element MPI rank field for VTK debugging.
 };
 
 /// @brief VTK configuration knobs for example outputs.
@@ -46,11 +49,11 @@ struct VTKConfig
 
 /// @brief Placeholder options type for cases with no extra CLI options.
 struct EmptyCaseOptions
-{};
+{
+};
 
 /// @brief Case specification: metadata, callbacks, and configuration hooks.
-template <typename CaseOptions, typename NumericalFlux>
-struct CaseSpec
+template <typename CaseOptions, typename NumericalFlux> struct CaseSpec
 {
   using Options = CaseOptions;
   using Flux = NumericalFlux;
@@ -72,27 +75,32 @@ struct CaseSpec
   DiagnosticsConfig diagnostics;
   VTKConfig vtk;
   DefaultCallbackConfig callback_defaults;
-  std::function<TimeLoopCallbacks(const ExampleContext&, EulerStateBundle&)> make_callbacks;
+  std::function<TimeLoopCallbacks(const ExampleContext&, EulerStateBundle&)>
+    make_callbacks;
 
   std::function<void(CaseConfig&)> configure_case;
   std::function<void(mfem::OptionsParser&, CaseOptions&)> add_options;
-  std::function<std::unique_ptr<mfem::VectorCoefficient>(
-      const CaseOptions&, const ExampleContext&, double gamma)> make_ic;
+  std::function<std::unique_ptr<mfem::VectorCoefficient>(const CaseOptions&,
+                                                         const ExampleContext&,
+                                                         double gamma)>
+    make_ic;
   std::function<BoundaryMarkerMap(ExampleContext&)> build_markers;
   std::function<void(const CaseOptions&,
                      const ExampleContext&,
                      EulerBoundaryWiring<NumericalFlux>&,
-                     const BoundaryMarkerMap&)> apply_bc;
-  std::function<void(const CaseOptions&, ExampleContext&, EulerStateBundle&)> after_init;
+                     const BoundaryMarkerMap&)>
+    apply_bc;
+  std::function<void(const CaseOptions&, ExampleContext&, EulerStateBundle&)>
+    after_init;
   std::function<int(const CaseOptions&,
                     const ExampleContext&,
                     const EulerStateBundle&,
-                    mfem::VectorCoefficient&)> postprocess;
+                    mfem::VectorCoefficient&)>
+    postprocess;
 };
 
 /// @brief Resolved runtime state for a case (primarily for tooling).
-template <typename CaseOptions, typename NumericalFlux>
-struct RunSpec
+template <typename CaseOptions, typename NumericalFlux> struct RunSpec
 {
   CaseOptions options;
   CommonOptions common_opts;

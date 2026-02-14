@@ -29,36 +29,34 @@ namespace mfem
 /// @brief Default mesh filename for the supersonic cylinder case.
 inline const char* SupersonicCylinderDefaultMeshPath()
 {
-   return "supersonic_cylinder.msh";
+  return "supersonic_cylinder.msh";
 }
 
 /// @brief Euler initial condition for the supersonic cylinder case.
 VectorFunctionCoefficient EulerInitialCondition()
 {
-   return VectorFunctionCoefficient(4, [](const Vector &x, Vector &y)
-   {
-      MFEM_ASSERT(x.Size() == 2, "");
-      const real_t density = 1.4;
-      const real_t velocity_x = 3.0;
-      const real_t velocity_y = 0.0;
-      const real_t energy = 8.8;
+  return VectorFunctionCoefficient(4,
+                                   [](const Vector& x, Vector& y)
+                                   {
+                                     MFEM_ASSERT(x.Size() == 2, "");
+                                     const real_t density = 1.4;
+                                     const real_t velocity_x = 3.0;
+                                     const real_t velocity_y = 0.0;
+                                     const real_t energy = 8.8;
 
-      y(0) = density;
-      y(1) = density * velocity_x;
-      y(2) = density * velocity_y;
-      y(3) = energy;
-   });
+                                     y(0) = density;
+                                     y(1) = density * velocity_x;
+                                     y(2) = density * velocity_y;
+                                     y(3) = energy;
+                                   });
 }
 
 /// @brief Euler initial condition for a uniform inflow state.
-inline VectorFunctionCoefficient EulerInitialCondition(const Vector &Uin)
+inline VectorFunctionCoefficient EulerInitialCondition(const Vector& Uin)
 {
-   return VectorFunctionCoefficient(4, [Uin](const Vector &, Vector &y)
-   {
-      y = Uin;
-   });
+  return VectorFunctionCoefficient(4,
+                                   [Uin](const Vector&, Vector& y)
+                                   { y = Uin; });
 }
-
-
 
 } // namespace mfem

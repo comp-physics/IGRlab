@@ -65,14 +65,13 @@ using StationaryShockOptions = dg_sim::EmptyCaseOptions;
 
 } // namespace
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
   dg_sim::CaseSpec<StationaryShockOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "stationary_shock";
   spec.default_mesh_path = mfem::StationaryShockDefaultMeshPath();
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
-  spec.need_sigma = true;
   spec.need_h1 = true;
   spec.diagnostics.h1_diagnostics = true;
   spec.glvis.precision = 8;
@@ -91,8 +90,8 @@ int main(int argc, char *argv[])
     const mfem::real_t Ms = 1.2;
     const mfem::real_t Mv = 0.25;
     const int base_cells = 32;
-    const int total_ref = ctx.run_cfg.opts.ser_ref_levels
-                          + ctx.run_cfg.opts.par_ref_levels;
+    const int total_ref =
+      ctx.run_cfg.opts.ser_ref_levels + ctx.run_cfg.opts.par_ref_levels;
     const int mx = base_cells << total_ref;
     const int my = base_cells << total_ref;
     auto ic_fun = mfem::GetShockVortexInoueHattoriInit(gamma, mx, my, Ms, Mv);
@@ -101,11 +100,10 @@ int main(int argc, char *argv[])
 
   spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
-    return dg_sim::BuildBoundaryMarkers(
-        ctx.Mesh(),
-        {{dg_sim::BoundaryRole::Inlet, {2}},
-         {dg_sim::BoundaryRole::Outlet, {4}},
-         {dg_sim::BoundaryRole::Slip, {1, 3}}});
+    return dg_sim::BuildBoundaryMarkers(ctx.Mesh(),
+                                        {{dg_sim::BoundaryRole::Inlet, {2}},
+                                         {dg_sim::BoundaryRole::Outlet, {4}},
+                                         {dg_sim::BoundaryRole::Slip, {1, 3}}});
   };
 
   spec.apply_bc = [](const StationaryShockOptions&,

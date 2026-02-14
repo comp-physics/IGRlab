@@ -44,10 +44,10 @@ public:
    * The jump sensor uses a relative L1 jump:
    *   s = clamp( sensor_k * ||u^+ - u^-||_1 / (||u^+||_1 + ||u^-||_1 + eps), 0, sensor_max ).
    */
-  DiffusiveRusanovFlux(const FluxFunction &fluxFunction,
+  DiffusiveRusanovFlux(const FluxFunction& fluxFunction,
                        real_t beta = 1.5,
                        real_t delta = 0.0,
-                       real_t cap   = std::numeric_limits<real_t>::infinity(),
+                       real_t cap = std::numeric_limits<real_t>::infinity(),
                        real_t sensor_k = 0.0,
                        real_t sensor_max = 1.0);
 
@@ -62,9 +62,11 @@ public:
    * @param[out] flux Fhat n = 1/2(F(u^+,x)n + F(u^-,x)n) - 1/2 lambda_tilde(u^+ - u^-)
    * @return max(|dF(u^+,x)/du^+·n|, |dF(u^-,x)/du^-·n|)  (baseline lambda, for CFL accounting)
    */
-  real_t Eval(const Vector &state1, const Vector &state2,
-              const Vector &nor, FaceElementTransformations &Tr,
-              Vector &flux) const override;
+  real_t Eval(const Vector& state1,
+              const Vector& state2,
+              const Vector& nor,
+              FaceElementTransformations& Tr,
+              Vector& flux) const override;
 
   /**
    * @brief  Jacobian of normal numerical flux Fhat(u^-,u^+,x) n using lambda_tilde.
@@ -80,9 +82,12 @@ public:
    * side = 1:  1/2 J(u^-,x)n + 1/2 lambda_tilde
    * side = 2:  1/2 J(u^+,x)n - 1/2 lambda_tilde
    */
-  void Grad(int side, const Vector &state1, const Vector &state2,
-            const Vector &nor, FaceElementTransformations &Tr,
-            DenseMatrix &grad) const override;
+  void Grad(int side,
+            const Vector& state1,
+            const Vector& state2,
+            const Vector& nor,
+            FaceElementTransformations& Tr,
+            DenseMatrix& grad) const override;
 
   /**
    * @brief  Average normal numerical flux over [u^-, u^+] in the second argument:
@@ -97,21 +102,28 @@ public:
    * @param[out] flux Fhat n (averaged form)
    * @return max eigenvalue for CFL accounting
    */
-  real_t Average(const Vector &state1, const Vector &state2,
-                 const Vector &nor, FaceElementTransformations &Tr,
-                 Vector &flux) const override;
+  real_t Average(const Vector& state1,
+                 const Vector& state2,
+                 const Vector& nor,
+                 FaceElementTransformations& Tr,
+                 Vector& flux) const override;
 
   /// @brief AverageGrad for the averaged form.
-  void AverageGrad(int side, const Vector &state1, const Vector &state2,
-                   const Vector &nor, FaceElementTransformations &Tr,
-                   DenseMatrix &grad) const override;
+  void AverageGrad(int side,
+                   const Vector& state1,
+                   const Vector& state2,
+                   const Vector& nor,
+                   FaceElementTransformations& Tr,
+                   DenseMatrix& grad) const override;
 
 private:
-  const FaceSideExplicitFlux *side_explicit_flux_ = nullptr;
+  const FaceSideExplicitFlux* side_explicit_flux_ = nullptr;
 
   /// Compute inflated lambda_tilde (without |n| scaling) from speeds and states.
-  real_t EffectiveLambda(real_t speed1, real_t speed2,
-                         const Vector &state1, const Vector &state2) const;
+  real_t EffectiveLambda(real_t speed1,
+                         real_t speed2,
+                         const Vector& state1,
+                         const Vector& state2) const;
 
   // Parameters
   real_t beta_, delta_, cap_;

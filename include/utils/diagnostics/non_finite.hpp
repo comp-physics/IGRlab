@@ -23,8 +23,10 @@ namespace dg_igr
 struct NonFiniteSummary
 {
   int global_non_finite = 0; ///< Total NaN/inf entries across all ranks.
-  double global_min = std::numeric_limits<double>::infinity();   ///< Global min over finite entries.
-  double global_max = -std::numeric_limits<double>::infinity();  ///< Global max over finite entries.
+  double global_min = std::numeric_limits<
+    double>::infinity(); ///< Global min over finite entries.
+  double global_max = -std::numeric_limits<
+    double>::infinity(); ///< Global max over finite entries.
 };
 
 /**
@@ -55,12 +57,24 @@ inline NonFiniteSummary ScanNonFinite(const mfem::Vector& v, MPI_Comm comm)
   }
 
   NonFiniteSummary summary;
-  MPI_Allreduce(&local_non_finite, &summary.global_non_finite, 1,
-                mfem::MPITypeMap<int>::mpi_type, MPI_SUM, comm);
-  MPI_Allreduce(&local_min, &summary.global_min, 1,
-                mfem::MPITypeMap<double>::mpi_type, MPI_MIN, comm);
-  MPI_Allreduce(&local_max, &summary.global_max, 1,
-                mfem::MPITypeMap<double>::mpi_type, MPI_MAX, comm);
+  MPI_Allreduce(&local_non_finite,
+                &summary.global_non_finite,
+                1,
+                mfem::MPITypeMap<int>::mpi_type,
+                MPI_SUM,
+                comm);
+  MPI_Allreduce(&local_min,
+                &summary.global_min,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_MIN,
+                comm);
+  MPI_Allreduce(&local_max,
+                &summary.global_max,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_MAX,
+                comm);
   return summary;
 }
 
@@ -72,10 +86,10 @@ inline NonFiniteSummary ScanNonFinite(const mfem::Vector& v, MPI_Comm comm)
 inline NonFiniteSummary ScanNonFinite(const mfem::ParGridFunction& gf)
 {
   const mfem::ParFiniteElementSpace* pfes = gf.ParFESpace();
-  MFEM_VERIFY(pfes != nullptr, "ParGridFunction must have a ParFiniteElementSpace.");
+  MFEM_VERIFY(pfes != nullptr,
+              "ParGridFunction must have a ParFiniteElementSpace.");
   return ScanNonFinite(static_cast<const mfem::Vector&>(gf), pfes->GetComm());
 }
 
 } // namespace dg_igr
 } // namespace mfem
-

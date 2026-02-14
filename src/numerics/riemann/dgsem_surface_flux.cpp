@@ -13,30 +13,37 @@ inline const char* SurfaceFluxTypeName(DGSEMSurfaceFluxType type)
 {
   switch (type)
   {
-    case DGSEMSurfaceFluxType::Rusanov: return "rusanov";
-    case DGSEMSurfaceFluxType::DiffusiveRusanov: return "diffusive-rusanov";
-    case DGSEMSurfaceFluxType::EntropyStableWinters: return "es-winters";
-    case DGSEMSurfaceFluxType::EntropyStableLFEntropyVars: return "es-lf-entropy";
+  case DGSEMSurfaceFluxType::Rusanov:
+    return "rusanov";
+  case DGSEMSurfaceFluxType::DiffusiveRusanov:
+    return "diffusive-rusanov";
+  case DGSEMSurfaceFluxType::EntropyStableWinters:
+    return "es-winters";
+  case DGSEMSurfaceFluxType::EntropyStableLFEntropyVars:
+    return "es-lf-entropy";
   }
-  MFEM_ABORT("Unhandled DGSEMSurfaceFluxType enum value: "
-             << static_cast<int>(type));
+  MFEM_ABORT(
+    "Unhandled DGSEMSurfaceFluxType enum value: " << static_cast<int>(type));
   return "invalid";
 }
 
 } // namespace
 
-DGSEMSurfaceFlux::DGSEMSurfaceFlux(const FluxFunction &fluxFunction)
+DGSEMSurfaceFlux::DGSEMSurfaceFlux(const FluxFunction& fluxFunction)
   : NumericalFlux(fluxFunction),
     flux_fn_(fluxFunction),
-    side_explicit_flux_(dynamic_cast<const FaceSideExplicitFlux*>(&fluxFunction)),
+    side_explicit_flux_(
+      dynamic_cast<const FaceSideExplicitFlux*>(&fluxFunction)),
     rusanov_(fluxFunction),
     diffusive_rusanov_(fluxFunction, /*beta=*/2.0)
 {
 }
 
-real_t DGSEMSurfaceFlux::Eval(const Vector &state1, const Vector &state2,
-                              const Vector &nor, FaceElementTransformations &Tr,
-                              Vector &flux) const
+real_t DGSEMSurfaceFlux::Eval(const Vector& state1,
+                              const Vector& state2,
+                              const Vector& nor,
+                              FaceElementTransformations& Tr,
+                              Vector& flux) const
 {
   if (type_ == DGSEMSurfaceFluxType::Rusanov)
   {
@@ -57,32 +64,59 @@ real_t DGSEMSurfaceFlux::Eval(const Vector &state1, const Vector &state2,
   }
 
   Vector flux_tmp(state1.Size());
-  const real_t speed1 = riemann_detail::ComputeFluxDotNForSide(
-      side_explicit_flux_, flux_fn_, FaceSide::Left, state1, nor, Tr, flux_tmp);
-  const real_t speed2 = riemann_detail::ComputeFluxDotNForSide(
-      side_explicit_flux_, flux_fn_, FaceSide::Right, state2, nor, Tr, flux_tmp);
+  const real_t speed1 =
+    riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
+                                           flux_fn_,
+                                           FaceSide::Left,
+                                           state1,
+                                           nor,
+                                           Tr,
+                                           flux_tmp);
+  const real_t speed2 =
+    riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
+                                           flux_fn_,
+                                           FaceSide::Right,
+                                           state2,
+                                           nor,
+                                           Tr,
+                                           flux_tmp);
 
   const real_t max_speed = std::max(speed1, speed2);
 
   Vector flux_ec(state1.Size());
-  dgsem::EntropyConservativeFluxDotN(state1, state2, nor, gamma_,
-                                     entropy_type_, flux_ec,
-                                     sigma_l, sigma_r);
+  dgsem::EntropyConservativeFluxDotN(state1,
+                                     state2,
+                                     nor,
+                                     gamma_,
+                                     entropy_type_,
+                                     flux_ec,
+                                     sigma_l,
+                                     sigma_r);
   flux = flux_ec;
 
   if (type_ == DGSEMSurfaceFluxType::EntropyStableWinters)
   {
     Vector diss(state1.Size());
-    dgsem::WintersDissipation(state1, state2, nor, gamma_, diss,
-                              sigma_l, sigma_r);
+    dgsem::WintersDissipation(state1,
+                              state2,
+                              nor,
+                              gamma_,
+                              diss,
+                              sigma_l,
+                              sigma_r);
     flux += diss;
   }
   else
   {
     const double scaled = max_speed * nor.Norml2();
     Vector diss(state1.Size());
-    dgsem::EntropyVariableLFDissipation(state1, state2, gamma_, scaled, diss,
-                                        sigma_l, sigma_r,
+    dgsem::EntropyVariableLFDissipation(state1,
+                                        state2,
+                                        gamma_,
+                                        scaled,
+                                        diss,
+                                        sigma_l,
+                                        sigma_r,
                                         entropy_jacobian_mode_);
     flux += diss;
   }
@@ -90,9 +124,12 @@ real_t DGSEMSurfaceFlux::Eval(const Vector &state1, const Vector &state2,
   return max_speed;
 }
 
-void DGSEMSurfaceFlux::Grad(int side, const Vector &state1, const Vector &state2,
-                            const Vector &nor, FaceElementTransformations &Tr,
-                            DenseMatrix &grad) const
+void DGSEMSurfaceFlux::Grad(int side,
+                            const Vector& state1,
+                            const Vector& state2,
+                            const Vector& nor,
+                            FaceElementTransformations& Tr,
+                            DenseMatrix& grad) const
 {
   if (type_ == DGSEMSurfaceFluxType::Rusanov)
   {
@@ -104,15 +141,18 @@ void DGSEMSurfaceFlux::Grad(int side, const Vector &state1, const Vector &state2
     diffusive_rusanov_.Grad(side, state1, state2, nor, Tr, grad);
     return;
   }
-  MFEM_VERIFY(false,
-              "DGSEMSurfaceFlux::Grad is unsupported for entropy-stable surface flux '"
-                  << SurfaceFluxTypeName(type_)
-                  << "'. Use rusanov/diffusive-rusanov for Jacobian paths.");
+  MFEM_VERIFY(
+    false,
+    "DGSEMSurfaceFlux::Grad is unsupported for entropy-stable surface flux '"
+      << SurfaceFluxTypeName(type_)
+      << "'. Use rusanov/diffusive-rusanov for Jacobian paths.");
 }
 
-real_t DGSEMSurfaceFlux::Average(const Vector &state1, const Vector &state2,
-                                 const Vector &nor, FaceElementTransformations &Tr,
-                                 Vector &flux) const
+real_t DGSEMSurfaceFlux::Average(const Vector& state1,
+                                 const Vector& state2,
+                                 const Vector& nor,
+                                 FaceElementTransformations& Tr,
+                                 Vector& flux) const
 {
   if (type_ == DGSEMSurfaceFluxType::Rusanov)
   {
@@ -125,10 +165,12 @@ real_t DGSEMSurfaceFlux::Average(const Vector &state1, const Vector &state2,
   return Eval(state1, state2, nor, Tr, flux);
 }
 
-void DGSEMSurfaceFlux::AverageGrad(int side, const Vector &state1,
-                                   const Vector &state2, const Vector &nor,
-                                   FaceElementTransformations &Tr,
-                                   DenseMatrix &grad) const
+void DGSEMSurfaceFlux::AverageGrad(int side,
+                                   const Vector& state1,
+                                   const Vector& state2,
+                                   const Vector& nor,
+                                   FaceElementTransformations& Tr,
+                                   DenseMatrix& grad) const
 {
   if (type_ == DGSEMSurfaceFluxType::Rusanov)
   {
@@ -143,8 +185,8 @@ void DGSEMSurfaceFlux::AverageGrad(int side, const Vector &state1,
   MFEM_VERIFY(false,
               "DGSEMSurfaceFlux::AverageGrad is unsupported for entropy-stable "
               "surface flux '"
-                  << SurfaceFluxTypeName(type_)
-                  << "'. Use rusanov/diffusive-rusanov for Jacobian paths.");
+                << SurfaceFluxTypeName(type_)
+                << "'. Use rusanov/diffusive-rusanov for Jacobian paths.");
 }
 
 } // namespace mfem

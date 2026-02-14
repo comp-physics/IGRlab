@@ -22,11 +22,13 @@ namespace mfem
  * @note Operates locally on each element (no communication). In parallel,
  *       call sol.ExchangeFaceNbrData() after limiting to refresh ghosts.
  */
-void ApplyZhangShuPositivityLimiter(mfem::ParFiniteElementSpace &vfes,
-                                   mfem::ParGridFunction &U,
-                                   int dim, double gamma,
-                                   double rho_min, double p_min,
-                                   int quad_order,
-                                   int p_bisect_iters = 12);
+void ApplyZhangShuPositivityLimiter(mfem::ParFiniteElementSpace& vfes,
+                                    mfem::ParGridFunction& U,
+                                    int dim,
+                                    double gamma,
+                                    double rho_min,
+                                    double p_min,
+                                    int quad_order,
+                                    int p_bisect_iters = 12);
 
 } // namespace mfem

@@ -20,15 +20,18 @@ namespace mfem
  * @param[in] gamma     Ratio of specific heats.
  * @param[in] rho_floor Density floor for robustness.
  */
-inline double EulerPressureFromConservative(const mfem::Vector &cons,
+inline double EulerPressureFromConservative(const mfem::Vector& cons,
                                             int dim,
                                             double gamma,
                                             double rho_floor = 0.0)
 {
   const double rho = std::max(cons(0), rho_floor);
-  const double E   = cons(1 + dim);
+  const double E = cons(1 + dim);
   double mom2 = 0.0;
-  for (int d = 0; d < dim; ++d) { mom2 += cons(1 + d) * cons(1 + d); }
+  for (int d = 0; d < dim; ++d)
+  {
+    mom2 += cons(1 + d) * cons(1 + d);
+  }
   const double k = 0.5 * mom2 / rho;
   return (gamma - 1.0) * (E - k);
 }
@@ -38,8 +41,9 @@ inline double EulerPressureFromConservative(const mfem::Vector &cons,
  *
  * @deprecated Prefer EulerPressureFromConservative(cons, dim, gamma, rho_floor).
  */
-DG_IGR_DEPRECATED("Use EulerPressureFromConservative(cons, dim, gamma, rho_floor)")
-inline double PressureFromCons(const mfem::Vector &cons,
+DG_IGR_DEPRECATED(
+  "Use EulerPressureFromConservative(cons, dim, gamma, rho_floor)")
+inline double PressureFromCons(const mfem::Vector& cons,
                                int dim,
                                double gamma,
                                double rho_floor = 0.0)

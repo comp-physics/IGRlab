@@ -17,7 +17,10 @@ namespace dg_igr_tests
 inline bool EnvEnabled(const char* name)
 {
   const char* env = std::getenv(name);
-  if (!env) { return false; }
+  if (!env)
+  {
+    return false;
+  }
   const std::string value(env);
   return value == "1" || value == "true" || value == "TRUE" || value == "on";
 }
@@ -25,15 +28,18 @@ inline bool EnvEnabled(const char* name)
 inline bool EnvEnabledDefault(const char* name, bool default_value)
 {
   const char* env = std::getenv(name);
-  if (!env) { return default_value; }
+  if (!env)
+  {
+    return default_value;
+  }
   const std::string value(env);
-  if (value == "0" || value == "false" || value == "FALSE" ||
-      value == "off" || value == "OFF")
+  if (value == "0" || value == "false" || value == "FALSE" || value == "off" ||
+      value == "OFF")
   {
     return false;
   }
-  if (value == "1" || value == "true" || value == "TRUE" ||
-      value == "on" || value == "ON")
+  if (value == "1" || value == "true" || value == "TRUE" || value == "on" ||
+      value == "ON")
   {
     return true;
   }
@@ -57,7 +63,8 @@ struct TestContext
 
   TestContext()
     : verbose_metrics(!EnvEnabled("DG_IGR_TEST_QUIET"))
-  {}
+  {
+  }
 
   void Check(bool cond, const std::string& msg)
   {
@@ -79,24 +86,19 @@ struct TestContext
     if (err > tol * scale)
     {
       ++failures;
-      std::cerr << "[FAIL] " << msg
-                << " (a=" << FormatSci(a) << ", b=" << FormatSci(b)
-                << ", err=" << FormatSci(err) << ", tol=" << FormatSci(tol)
-                << ")\n";
+      std::cerr << "[FAIL] " << msg << " (a=" << FormatSci(a)
+                << ", b=" << FormatSci(b) << ", err=" << FormatSci(err)
+                << ", tol=" << FormatSci(tol) << ")\n";
     }
     else if (verbose_metrics)
     {
-      std::cout << "[PASS] " << msg
-                << " (a=" << FormatSci(a) << ", b=" << FormatSci(b)
-                << ", err=" << FormatSci(err) << ", tol=" << FormatSci(tol)
-                << ")\n";
+      std::cout << "[PASS] " << msg << " (a=" << FormatSci(a)
+                << ", b=" << FormatSci(b) << ", err=" << FormatSci(err)
+                << ", tol=" << FormatSci(tol) << ")\n";
     }
   }
 
-  void AddParity(double value)
-  {
-    parity_metric += value;
-  }
+  void AddParity(double value) { parity_metric += value; }
 
   void LogMetric(const std::string& msg)
   {
@@ -107,7 +109,8 @@ struct TestContext
   }
 };
 
-inline mfem::Vector EulerConsFromPrim1D(double rho, double u, double p, double gamma)
+inline mfem::Vector
+EulerConsFromPrim1D(double rho, double u, double p, double gamma)
 {
   mfem::Vector prim(3);
   prim(0) = rho;
@@ -119,7 +122,8 @@ inline mfem::Vector EulerConsFromPrim1D(double rho, double u, double p, double g
   return cons;
 }
 
-inline mfem::Vector EulerConsFromPrim2D(double rho, double u, double v, double p, double gamma)
+inline mfem::Vector
+EulerConsFromPrim2D(double rho, double u, double v, double p, double gamma)
 {
   mfem::Vector prim(4);
   prim(0) = rho;
@@ -143,7 +147,8 @@ inline mfem::Vector Rotate2D(const mfem::Vector& v, double angle)
   return out;
 }
 
-inline void FillConstantState(const mfem::Vector& state, mfem::ParGridFunction& gf)
+inline void FillConstantState(const mfem::Vector& state,
+                              mfem::ParGridFunction& gf)
 {
   mfem::VectorConstantCoefficient coeff(state);
   gf.ProjectCoefficient(coeff);
@@ -158,8 +163,12 @@ inline void FillConstantState(const mfem::Vector& state, mfem::GridFunction& gf)
 inline double GlobalSum(double local)
 {
   double global = 0.0;
-  MPI_Allreduce(&local, &global, 1, mfem::MPITypeMap<double>::mpi_type,
-                MPI_SUM, MPI_COMM_WORLD);
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_SUM,
+                MPI_COMM_WORLD);
   return global;
 }
 
@@ -173,16 +182,24 @@ inline double GlobalL2Norm(const mfem::Vector& v)
 inline double GlobalMax(double local)
 {
   double global = local;
-  MPI_Allreduce(&local, &global, 1, mfem::MPITypeMap<double>::mpi_type,
-                MPI_MAX, MPI_COMM_WORLD);
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_MAX,
+                MPI_COMM_WORLD);
   return global;
 }
 
 inline double GlobalMin(double local)
 {
   double global = local;
-  MPI_Allreduce(&local, &global, 1, mfem::MPITypeMap<double>::mpi_type,
-                MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_MIN,
+                MPI_COMM_WORLD);
   return global;
 }
 
@@ -193,8 +210,8 @@ inline double GlobalAverage(double local)
   return global_sum / static_cast<double>(world_size > 0 ? world_size : 1);
 }
 
-inline double IntegrateComponent(const mfem::GridFunction& U, int comp,
-                                 int order_offset = 2)
+inline double
+IntegrateComponent(const mfem::GridFunction& U, int comp, int order_offset = 2)
 {
   const mfem::FiniteElementSpace* fes = U.FESpace();
   MFEM_VERIFY(fes != nullptr, "IntegrateComponent requires a valid FE space.");
@@ -210,7 +227,7 @@ inline double IntegrateComponent(const mfem::GridFunction& U, int comp,
     mfem::ElementTransformation* Tr = fes->GetElementTransformation(e);
     const int qord = 2 * fe->GetOrder() + order_offset;
     const mfem::IntegrationRule& ir =
-        mfem::IntRules.Get(fe->GetGeomType(), qord);
+      mfem::IntRules.Get(fe->GetGeomType(), qord);
 
     for (int q = 0; q < ir.GetNPoints(); ++q)
     {

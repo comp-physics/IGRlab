@@ -7,7 +7,10 @@ namespace dgsem
 namespace
 {
 
-void AddScaledRow(mfem::DenseMatrix& mat, int row, double scale, const mfem::Vector& vec)
+void AddScaledRow(mfem::DenseMatrix& mat,
+                  int row,
+                  double scale,
+                  const mfem::Vector& vec)
 {
   const int n = vec.Size();
   for (int i = 0; i < n; ++i)
@@ -16,8 +19,10 @@ void AddScaledRow(mfem::DenseMatrix& mat, int row, double scale, const mfem::Vec
   }
 }
 
-std::vector<int> BuildLexToLocal(const std::vector<std::array<int, 3>>& dof_to_ijk,
-                                 int n1d, int dim)
+std::vector<int>
+BuildLexToLocal(const std::vector<std::array<int, 3>>& dof_to_ijk,
+                int n1d,
+                int dim)
 {
   const int dof = static_cast<int>(dof_to_ijk.size());
   std::vector<int> lex_to_local(n1d * n1d * (dim > 2 ? n1d : 1), -1);
@@ -27,10 +32,8 @@ std::vector<int> BuildLexToLocal(const std::vector<std::array<int, 3>>& dof_to_i
     const int i = ijk[0];
     const int j = ijk[1];
     const int k = ijk[2];
-    const int lex = (dim == 1)
-                        ? i
-                        : (dim == 2 ? i + n1d * j
-                                    : i + n1d * (j + n1d * k));
+    const int lex =
+      (dim == 1) ? i : (dim == 2 ? i + n1d * j : i + n1d * (j + n1d * k));
     lex_to_local[lex] = local;
   }
   return lex_to_local;
@@ -39,10 +42,10 @@ std::vector<int> BuildLexToLocal(const std::vector<std::array<int, 3>>& dof_to_i
 } // namespace
 
 void FluxDifferencing1D(const mfem::DenseMatrix& u,
-                         const mfem::DenseMatrix& dsplit,
-                         const VolumeFlux& volume_flux,
-                         mfem::DenseMatrix& du,
-                         double scale)
+                        const mfem::DenseMatrix& dsplit,
+                        const VolumeFlux& volume_flux,
+                        mfem::DenseMatrix& du,
+                        double scale)
 {
   const int dof = u.Height();
   const int num_eq = u.Width();
@@ -70,11 +73,11 @@ void FluxDifferencing1D(const mfem::DenseMatrix& u,
 }
 
 void FluxDifferencing2D(const mfem::DenseMatrix& u,
-                         const mfem::DenseMatrix& dsplit,
-                         const std::vector<std::array<int, 3>>& dof_to_ijk,
-                         const VolumeFlux& volume_flux,
-                         mfem::DenseMatrix& du,
-                         double scale)
+                        const mfem::DenseMatrix& dsplit,
+                        const std::vector<std::array<int, 3>>& dof_to_ijk,
+                        const VolumeFlux& volume_flux,
+                        mfem::DenseMatrix& du,
+                        double scale)
 {
   const int dof = u.Height();
   const int num_eq = u.Width();

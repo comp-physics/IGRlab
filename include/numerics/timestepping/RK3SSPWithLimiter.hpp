@@ -1,7 +1,7 @@
 #pragma once
 #include "mfem.hpp"
 #include "utils/config/timestepping_config.hpp"
-#include "numerics/limiters/limiters.hpp"   // brings limiter option types
+#include "numerics/limiters/limiters.hpp" // brings limiter option types
 #include <functional>
 #include <vector>
 
@@ -27,7 +27,8 @@
  *   - AddBarthJespersenLimiter(...)
  */
 
-namespace mfem {
+namespace mfem
+{
 
 /// SSPRK(3,3) with an ordered list of stage callbacks (limiters/filters).
 /// @ingroup numerics_timestepping
@@ -38,15 +39,26 @@ public:
   using Config = RK3Config;
 
   /// Construct with the FE space used by the conservative state U (vdim = dim+2).
-  explicit RK3SSPWithLimiter(ParFiniteElementSpace &vfes);
+  explicit RK3SSPWithLimiter(ParFiniteElementSpace& vfes);
 
   /// Configure Euler parameters (used by helper callbacks).
-  void SetEulerParams(int dim, double gamma) { dim_ = dim; gamma_ = gamma; }
+  void SetEulerParams(int dim, double gamma)
+  {
+    dim_ = dim;
+    gamma_ = gamma;
+  }
 
   /// Set default params used by the Zhang–Shu PP helper callback.
-  void SetLimiterParams(double rho_min, double p_min,
-                        int quad_order, int p_bisect_iters)
-  { rho_min_ = rho_min; p_min_ = p_min; quad_order_ = quad_order; p_bisect_iters_ = p_bisect_iters; }
+  void SetLimiterParams(double rho_min,
+                        double p_min,
+                        int quad_order,
+                        int p_bisect_iters)
+  {
+    rho_min_ = rho_min;
+    p_min_ = p_min;
+    quad_order_ = quad_order;
+    p_bisect_iters_ = p_bisect_iters;
+  }
 
   /// If true, also apply the pipeline at the start of Step() to the input x.
   void LimitInitial(bool on) { limit_initial_ = on; }
@@ -63,24 +75,31 @@ public:
   void ResetStepCount() { step_count_ = 0; }
 
   /// Apply a configuration bundle without changing existing defaults.
-  void ApplyConfig(const Config &cfg)
+  void ApplyConfig(const Config& cfg)
   {
     SetEulerParams(cfg.dim, cfg.gamma);
-    SetLimiterParams(cfg.rho_min, cfg.p_min, cfg.quad_order, cfg.p_bisect_iters);
+    SetLimiterParams(cfg.rho_min,
+                     cfg.p_min,
+                     cfg.quad_order,
+                     cfg.p_bisect_iters);
     LimitInitial(cfg.limit_initial);
     SetLimiterSteps(cfg.max_limiter_steps);
   }
 
   /// Apply only limiter-related parameters (Euler + positivity defaults).
-  void ApplyLimiterConfig(const LimiterConfig &cfg)
+  void ApplyLimiterConfig(const LimiterConfig& cfg)
   {
     SetEulerParams(cfg.dim, cfg.gamma);
-    SetLimiterParams(cfg.rho_min, cfg.p_min, cfg.quad_order, cfg.p_bisect_iters);
+    SetLimiterParams(cfg.rho_min,
+                     cfg.p_min,
+                     cfg.quad_order,
+                     cfg.p_bisect_iters);
   }
 
   // ----------------- Ordered list of stage callbacks -----------------
   // Signature: void(ParFiniteElementSpace&, ParGridFunction&, double t)
-  using StageCallback = std::function<void(ParFiniteElementSpace&, ParGridFunction&, double)>;
+  using StageCallback =
+    std::function<void(ParFiniteElementSpace&, ParGridFunction&, double)>;
 
   /// Remove all callbacks (both always and optional).
   void ClearCallbacks()
@@ -102,10 +121,7 @@ public:
   }
 
   /// Backward-compatible: generic AddCallback() -> treat as optional.
-  void AddCallback(StageCallback cb)
-  {
-    AddOptionalCallback(std::move(cb));
-  }
+  void AddCallback(StageCallback cb) { AddOptionalCallback(std::move(cb)); }
 
   // ---- Convenience: push common limiters as callbacks (defined in .cpp) ----
   /// Add a Zhang–Shu positivity limiter.
@@ -113,40 +129,41 @@ public:
   ///   - true  -> add as an always-on callback (default)
   ///   - false -> add as an optional callback (respecting max_limiter_steps_)
   void AddZhangShuLimiter(bool always_on = true);
-  void AddCharTVBLimiter(const CharTVBOptions &opts); // characteristic TVB
-  void AddCharTVBFaceNormalLimiter(const CharTVBOptions &opts);
-  void AddCharBJLimiter(const CharBJOptions  &opts);  // characteristic BJ
-  void AddFaceCharBJLimiter(const FaceBJOptions &opts);
-  void AddBarthJespersenLimiter(const BJOptions &opts); // component-wise BJ
-  void AddCharVenkatXYLimiter(const VenkatOptions &opts);
-  void AddCharVenkatFaceNormalLimiter(const VenkatOptions &opts);
-  void AddKrivodonovaLimiter(const KrivoOptions &opts);
+  void AddCharTVBLimiter(const CharTVBOptions& opts); // characteristic TVB
+  void AddCharTVBFaceNormalLimiter(const CharTVBOptions& opts);
+  void AddCharBJLimiter(const CharBJOptions& opts); // characteristic BJ
+  void AddFaceCharBJLimiter(const FaceBJOptions& opts);
+  void AddBarthJespersenLimiter(const BJOptions& opts); // component-wise BJ
+  void AddCharVenkatXYLimiter(const VenkatOptions& opts);
+  void AddCharVenkatFaceNormalLimiter(const VenkatOptions& opts);
+  void AddKrivodonovaLimiter(const KrivoOptions& opts);
 
   // --------------- ODESolver interface ---------------
-  void Init(TimeDependentOperator &f_) override;
-  void Step(Vector &x, real_t &t, real_t &dt) override;
+  void Init(TimeDependentOperator& f_) override;
+  void Step(Vector& x, real_t& t, real_t& dt) override;
 
 private:
   // FE space for state
-  ParFiniteElementSpace &vfes_;
+  ParFiniteElementSpace& vfes_;
 
   // Euler / helper-limiter params (only used by helper callbacks)
-  int    dim_            = dg_igr::EulerDefaults::kDim;
-  double gamma_          = dg_igr::EulerDefaults::kGamma;
-  double rho_min_        = dg_igr::LimiterDefaults::kRhoMin;
-  double p_min_          = dg_igr::LimiterDefaults::kPMin;
-  int    quad_order_     = dg_igr::LimiterDefaults::kQuadOrder;   // 0 => auto: 2*order+2
-  int    p_bisect_iters_ = dg_igr::LimiterDefaults::kBisectIters;
-  bool   limit_initial_  = dg_igr::RK3Defaults::kLimitInitial;
+  int dim_ = dg_igr::EulerDefaults::kDim;
+  double gamma_ = dg_igr::EulerDefaults::kGamma;
+  double rho_min_ = dg_igr::LimiterDefaults::kRhoMin;
+  double p_min_ = dg_igr::LimiterDefaults::kPMin;
+  int quad_order_ = dg_igr::LimiterDefaults::kQuadOrder; // 0 => auto: 2*order+2
+  int p_bisect_iters_ = dg_igr::LimiterDefaults::kBisectIters;
+  bool limit_initial_ = dg_igr::RK3Defaults::kLimitInitial;
 
   // Callback pipelines
   std::vector<StageCallback> always_callbacks_;   ///< Always run
   std::vector<StageCallback> optional_callbacks_; ///< Only early steps
 
   // Optional limiter scheduling
-  long step_count_        = 0;   ///< number of completed Step() calls
-  long max_limiter_steps_ = dg_igr::RK3Defaults::kLimiterSteps;  ///< <0 => optional limiters always on
-  bool nan_scan_stages_   = false;
+  long step_count_ = 0; ///< number of completed Step() calls
+  long max_limiter_steps_ =
+    dg_igr::RK3Defaults::kLimiterSteps; ///< <0 => optional limiters always on
+  bool nan_scan_stages_ = false;
   bool stage_nan_detected_ = false;
 
   // Work vectors
@@ -154,9 +171,9 @@ private:
 
   // Helpers
   /// Apply both always-on and (optionally) optional callbacks to vector v.
-  void ApplyCallbacks(Vector &v, double t, bool apply_optional);
-  void MaybeScanStage(Vector &v, double t, const char* label);
-  int  AutoQuadOrder() const;
+  void ApplyCallbacks(Vector& v, double t, bool apply_optional);
+  void MaybeScanStage(Vector& v, double t, const char* label);
+  int AutoQuadOrder() const;
 };
 
 } // namespace mfem

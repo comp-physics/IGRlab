@@ -32,8 +32,9 @@ inline void ApplyGradOption(const std::string& grad_opt, dg_igr::IGRConfig& cfg)
     cfg.backend = dg_igr::IGRGradBackend::BrokenDG;
     return;
   }
-  MFEM_VERIFY(false, "Invalid IGR gradient backend '" << grad_opt
-              << "'. Use 'H1' or 'BrokenL2'.");
+  MFEM_VERIFY(false,
+              "Invalid IGR gradient backend '" << grad_opt
+                                               << "'. Use 'H1' or 'BrokenL2'.");
   cfg.backend = dg_igr::IGRGradBackend::BrokenDG;
 }
 
@@ -70,7 +71,10 @@ inline mfem::RK3SSPWithLimiter MakeRK3Stepper(mfem::ParFiniteElementSpace& vfes,
 {
   mfem::RK3SSPWithLimiter rk3(vfes);
   rk3.SetEulerParams(dim, cfg.gamma);
-  rk3.SetLimiterParams(cfg.rho_min, cfg.p_min, cfg.quad_order, cfg.p_bisect_iters);
+  rk3.SetLimiterParams(cfg.rho_min,
+                       cfg.p_min,
+                       cfg.quad_order,
+                       cfg.p_bisect_iters);
   rk3.LimitInitial(cfg.limit_initial);
   rk3.SetLimiterSteps(cfg.max_limiter_steps);
   return rk3;
@@ -89,7 +93,11 @@ inline dg_igr::IGRSolver MakeIGRSolver(DGSpaces& spaces,
   igr_cfg.rho_floor = rho_floor;
   ApplyIGRRuntimeOptionOverrides(run_cfg.igr_opts, igr_cfg);
 
-  dg_igr::IGRSolver igr(*spaces.sigma_fes, spaces.vfes, dim, num_equations, igr_cfg.alpha);
+  dg_igr::IGRSolver igr(*spaces.sigma_fes,
+                        spaces.vfes,
+                        dim,
+                        num_equations,
+                        igr_cfg.alpha);
   igr.ApplyConfig(igr_cfg);
   return igr;
 }

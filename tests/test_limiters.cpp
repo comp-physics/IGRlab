@@ -35,24 +35,36 @@ constexpr double kBoundTol = 1.0e-2;
 double GlobalSum(double local)
 {
   double global = 0.0;
-  MPI_Allreduce(&local, &global, 1, mfem::MPITypeMap<double>::mpi_type,
-                MPI_SUM, MPI_COMM_WORLD);
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_SUM,
+                MPI_COMM_WORLD);
   return global;
 }
 
 double GlobalMin(double local)
 {
   double global = 0.0;
-  MPI_Allreduce(&local, &global, 1, mfem::MPITypeMap<double>::mpi_type,
-                MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_MIN,
+                MPI_COMM_WORLD);
   return global;
 }
 
 double GlobalMax(double local)
 {
   double global = 0.0;
-  MPI_Allreduce(&local, &global, 1, mfem::MPITypeMap<double>::mpi_type,
-                MPI_MAX, MPI_COMM_WORLD);
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_MAX,
+                MPI_COMM_WORLD);
   return global;
 }
 
@@ -60,8 +72,12 @@ bool GlobalAll(bool local_ok)
 {
   int local = local_ok ? 1 : 0;
   int global = 0;
-  MPI_Allreduce(&local, &global, 1, mfem::MPITypeMap<int>::mpi_type,
-                MPI_LAND, MPI_COMM_WORLD);
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<int>::mpi_type,
+                MPI_LAND,
+                MPI_COMM_WORLD);
   return global == 1;
 }
 
@@ -86,12 +102,16 @@ void FillConstantState(mfem::ParFiniteElementSpace& vfes,
   U.ProjectCoefficient(coeff);
 }
 
-void FillPerturbedState(mfem::ParFiniteElementSpace& vfes, mfem::ParGridFunction& U)
+void FillPerturbedState(mfem::ParFiniteElementSpace& vfes,
+                        mfem::ParGridFunction& U)
 {
   class PerturbedConservativeCoefficient final : public mfem::VectorCoefficient
   {
   public:
-    PerturbedConservativeCoefficient() : mfem::VectorCoefficient(kNumEq) {}
+    PerturbedConservativeCoefficient()
+      : mfem::VectorCoefficient(kNumEq)
+    {
+    }
 
     void Eval(mfem::Vector& V,
               mfem::ElementTransformation& Tr,
@@ -149,9 +169,10 @@ double GlobalRelativeChange(const mfem::ParGridFunction& before,
   return diff_norm / std::max(base_norm, 1.0e-16);
 }
 
-std::vector<mfem::Vector> ComputeElementAverages(mfem::ParFiniteElementSpace& vfes,
-                                                 const mfem::ParGridFunction& U,
-                                                 int quad_order)
+std::vector<mfem::Vector>
+ComputeElementAverages(mfem::ParFiniteElementSpace& vfes,
+                       const mfem::ParGridFunction& U,
+                       int quad_order)
 {
   const int ne = vfes.GetNE();
   std::vector<mfem::Vector> averages(ne);
@@ -173,7 +194,7 @@ std::vector<mfem::Vector> ComputeElementAverages(mfem::ParFiniteElementSpace& vf
 
     const int qord = (quad_order > 0) ? quad_order : (2 * fe->GetOrder() + 2);
     const mfem::IntegrationRule& ir =
-        mfem::IntRules.Get(Tr->GetGeometryType(), qord);
+      mfem::IntRules.Get(Tr->GetGeometryType(), qord);
     shape.SetSize(dof);
 
     mfem::Vector sum(kNumEq);
@@ -224,11 +245,11 @@ struct ElementBounds
   double energy_max = 0.0;
 };
 
-std::vector<ElementBounds> BuildStructuredNeighborBounds(
-    mfem::ParFiniteElementSpace& vfes,
-    const std::vector<mfem::Vector>& averages,
-    int nx,
-    int ny)
+std::vector<ElementBounds>
+BuildStructuredNeighborBounds(mfem::ParFiniteElementSpace& vfes,
+                              const std::vector<mfem::Vector>& averages,
+                              int nx,
+                              int ny)
 {
   const int ne = vfes.GetNE();
   std::vector<ElementBounds> bounds(ne);
@@ -282,12 +303,11 @@ std::vector<ElementBounds> BuildStructuredNeighborBounds(
   {
     const int ix = elem_ix[e];
     const int iy = elem_iy[e];
-    const std::array<int, 5> nbrs = {
-        e,
-        elem_at(ix - 1, iy, e),
-        elem_at(ix + 1, iy, e),
-        elem_at(ix, iy - 1, e),
-        elem_at(ix, iy + 1, e)};
+    const std::array<int, 5> nbrs = {e,
+                                     elem_at(ix - 1, iy, e),
+                                     elem_at(ix + 1, iy, e),
+                                     elem_at(ix, iy - 1, e),
+                                     elem_at(ix, iy + 1, e)};
 
     ElementBounds b;
     b.rho_min = std::numeric_limits<double>::infinity();
@@ -334,17 +354,19 @@ double MaxBoundViolation(mfem::ParFiniteElementSpace& vfes,
 
     const int qord = (quad_order > 0) ? quad_order : (2 * fe->GetOrder() + 2);
     const mfem::IntegrationRule& ir =
-        mfem::IntRules.Get(Tr->GetGeometryType(), qord);
+      mfem::IntRules.Get(Tr->GetGeometryType(), qord);
     shape.SetSize(dof);
 
     const ElementBounds& b = bounds[e];
     const double rho_range = std::max(b.rho_max - b.rho_min, 1.0e-12);
     const double energy_range = std::max(b.energy_max - b.energy_min, 1.0e-12);
-    const double rho_scale = std::max({std::abs(b.rho_min), std::abs(b.rho_max), rho_range, 1.0e-6});
-    const double energy_scale =
-        std::max({std::abs(b.energy_min), std::abs(b.energy_max), energy_range, 1.0e-6});
+    const double rho_scale =
+      std::max({std::abs(b.rho_min), std::abs(b.rho_max), rho_range, 1.0e-6});
+    const double energy_scale = std::max(
+      {std::abs(b.energy_min), std::abs(b.energy_max), energy_range, 1.0e-6});
     const double rho_inflate = 0.75 * rho_range + 0.05 * rho_scale + 1.0e-10;
-    const double energy_inflate = 0.75 * energy_range + 0.05 * energy_scale + 1.0e-10;
+    const double energy_inflate =
+      0.75 * energy_range + 0.05 * energy_scale + 1.0e-10;
     const double rho_lo = b.rho_min - rho_inflate;
     const double rho_hi = b.rho_max + rho_inflate;
     const double energy_lo = b.energy_min - energy_inflate;
@@ -362,8 +384,10 @@ double MaxBoundViolation(mfem::ParFiniteElementSpace& vfes,
 
       const double rho_hi_v = std::max(0.0, (rho - rho_hi) / rho_scale);
       const double rho_lo_v = std::max(0.0, (rho_lo - rho) / rho_scale);
-      const double energy_hi_v = std::max(0.0, (energy - energy_hi) / energy_scale);
-      const double energy_lo_v = std::max(0.0, (energy_lo - energy) / energy_scale);
+      const double energy_hi_v =
+        std::max(0.0, (energy - energy_hi) / energy_scale);
+      const double energy_lo_v =
+        std::max(0.0, (energy_lo - energy) / energy_scale);
 
       local_max = std::max(local_max, rho_hi_v);
       local_max = std::max(local_max, rho_lo_v);
@@ -402,7 +426,7 @@ void MinRhoPressure(mfem::ParFiniteElementSpace& vfes,
 
     const int qord = (quad_order > 0) ? quad_order : (2 * fe->GetOrder() + 2);
     const mfem::IntegrationRule& ir =
-        mfem::IntRules.Get(Tr->GetGeometryType(), qord);
+      mfem::IntRules.Get(Tr->GetGeometryType(), qord);
     shape.SetSize(dof);
 
     for (int q = 0; q < ir.GetNPoints(); ++q)
@@ -413,8 +437,12 @@ void MinRhoPressure(mfem::ParFiniteElementSpace& vfes,
       elmat.MultTranspose(shape, state);
 
       local_min_rho = std::min(local_min_rho, state(0));
-      local_min_p = std::min(local_min_p, mfem::EulerPressureFromConservative(
-                                              state, kDim, kGamma, /*rho_floor=*/1e-16));
+      local_min_p =
+        std::min(local_min_p,
+                 mfem::EulerPressureFromConservative(state,
+                                                     kDim,
+                                                     kGamma,
+                                                     /*rho_floor=*/1e-16));
     }
   }
 
@@ -451,10 +479,11 @@ void CheckLimiterOnPerturbedState(TestContext& ctx,
   const int qord = 2 * order + 2;
 
   const std::vector<mfem::Vector> averages_before =
-      ComputeElementAverages(vfes, U_initial, qord);
+    ComputeElementAverages(vfes, U_initial, qord);
   const std::vector<ElementBounds> bounds =
-      BuildStructuredNeighborBounds(vfes, averages_before, kNx, kNy);
-  const double violation_before = MaxBoundViolation(vfes, U_initial, qord, bounds);
+    BuildStructuredNeighborBounds(vfes, averages_before, kNx, kNy);
+  const double violation_before =
+    MaxBoundViolation(vfes, U_initial, qord, bounds);
 
   mfem::ParGridFunction U_limited(&vfes);
   U_limited = U_initial;
@@ -464,12 +493,14 @@ void CheckLimiterOnPerturbedState(TestContext& ctx,
   ctx.Check(finite, name + " keeps values finite");
 
   const std::vector<mfem::Vector> averages_after =
-      ComputeElementAverages(vfes, U_limited, qord);
-  const double avg_change = MaxRelativeAverageChange(averages_before, averages_after);
+    ComputeElementAverages(vfes, U_limited, qord);
+  const double avg_change =
+    MaxRelativeAverageChange(averages_before, averages_after);
   ctx.AddParity(avg_change);
   ctx.Check(avg_change <= 1e-8, name + " preserves element averages");
 
-  const double violation_after = MaxBoundViolation(vfes, U_limited, qord, bounds);
+  const double violation_after =
+    MaxBoundViolation(vfes, U_limited, qord, bounds);
   ctx.Check(violation_after <= violation_before + 1e-8,
             name + " does not worsen neighbor-bound violations");
   if (mfem::Mpi::Root() && violation_after > kBoundTol)
@@ -483,15 +514,23 @@ void CheckLimiterOnPerturbedState(TestContext& ctx,
 
   const double rho_min = 1e-10;
   const double p_min = 1e-10;
-  mfem::ApplyZhangShuPositivityLimiter(vfes, U_limited, kDim, kGamma, rho_min, p_min,
-                                       /*quad_order=*/qord, /*p_bisect_iters=*/12);
+  mfem::ApplyZhangShuPositivityLimiter(vfes,
+                                       U_limited,
+                                       kDim,
+                                       kGamma,
+                                       rho_min,
+                                       p_min,
+                                       /*quad_order=*/qord,
+                                       /*p_bisect_iters=*/12);
 
   double min_rho = 0.0;
   double min_p = 0.0;
   MinRhoPressure(vfes, U_limited, qord, min_rho, min_p);
   ctx.AddParity(min_rho + min_p);
-  ctx.Check(min_rho >= 0.99 * rho_min, name + " + positivity keeps density positive");
-  ctx.Check(min_p >= 0.99 * p_min, name + " + positivity keeps pressure positive");
+  ctx.Check(min_rho >= 0.99 * rho_min,
+            name + " + positivity keeps density positive");
+  ctx.Check(min_p >= 0.99 * p_min,
+            name + " + positivity keeps pressure positive");
 }
 
 } // namespace
@@ -501,16 +540,25 @@ int RunLimiterTests(TestContext& ctx)
   // --- Zhang-Shu positivity on order-0 space ---
   {
     mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
-        /*nx=*/2, /*ny=*/2, mfem::Element::QUADRILATERAL, /*generate_edges=*/true,
-        /*sx=*/1.0, /*sy=*/1.0);
+      /*nx=*/2,
+      /*ny=*/2,
+      mfem::Element::QUADRILATERAL,
+      /*generate_edges=*/true,
+      /*sx=*/1.0,
+      /*sy=*/1.0);
     mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
     mfem::DG_FECollection fec(/*order=*/0, kDim);
-    mfem::ParFiniteElementSpace vfes(&pmesh, &fec, kNumEq, mfem::Ordering::byNODES);
+    mfem::ParFiniteElementSpace vfes(&pmesh,
+                                     &fec,
+                                     kNumEq,
+                                     mfem::Ordering::byNODES);
     mfem::ParGridFunction U(&vfes);
     U = 0.0;
 
-    const mfem::Vector cons = ConservativeFromPrimitive(/*rho=*/1.0, /*u=*/0.0,
-                                                        /*v=*/0.0, /*p=*/1.0);
+    const mfem::Vector cons = ConservativeFromPrimitive(/*rho=*/1.0,
+                                                        /*u=*/0.0,
+                                                        /*v=*/0.0,
+                                                        /*p=*/1.0);
     FillConstantState(vfes, cons, U);
 
     if (vfes.GetNDofs() > 0)
@@ -521,149 +569,214 @@ int RunLimiterTests(TestContext& ctx)
 
     const double rho_min = 1e-8;
     const double p_min = 1e-8;
-    mfem::ApplyZhangShuPositivityLimiter(vfes, U, kDim, kGamma, rho_min, p_min,
-                                         /*quad_order=*/0, /*p_bisect_iters=*/12);
+    mfem::ApplyZhangShuPositivityLimiter(vfes,
+                                         U,
+                                         kDim,
+                                         kGamma,
+                                         rho_min,
+                                         p_min,
+                                         /*quad_order=*/0,
+                                         /*p_bisect_iters=*/12);
 
     double min_rho = 0.0;
     double min_p = 0.0;
     MinRhoPressure(vfes, U, /*quad_order=*/0, min_rho, min_p);
-    ctx.Check(min_rho >= 0.99 * rho_min, "Zhang-Shu limiter enforces rho floor");
-    ctx.Check(min_p >= 0.99 * p_min, "Zhang-Shu limiter enforces pressure floor");
+    ctx.Check(min_rho >= 0.99 * rho_min,
+              "Zhang-Shu limiter enforces rho floor");
+    ctx.Check(min_p >= 0.99 * p_min,
+              "Zhang-Shu limiter enforces pressure floor");
   }
 
   // --- Slope limiters on order-1 space ---
   mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
-      /*nx=*/kNx, /*ny=*/kNy, mfem::Element::QUADRILATERAL, /*generate_edges=*/true,
-      /*sx=*/1.0, /*sy=*/1.0);
+    /*nx=*/kNx,
+    /*ny=*/kNy,
+    mfem::Element::QUADRILATERAL,
+    /*generate_edges=*/true,
+    /*sx=*/1.0,
+    /*sy=*/1.0);
   mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
   mfem::DG_FECollection fec(/*order=*/1, kDim);
-  mfem::ParFiniteElementSpace vfes(&pmesh, &fec, kNumEq, mfem::Ordering::byNODES);
+  mfem::ParFiniteElementSpace vfes(&pmesh,
+                                   &fec,
+                                   kNumEq,
+                                   mfem::Ordering::byNODES);
 
   const mfem::Vector cons_const =
-      ConservativeFromPrimitive(/*rho=*/1.0, /*u=*/0.25, /*v=*/-0.1, /*p=*/1.0);
+    ConservativeFromPrimitive(/*rho=*/1.0, /*u=*/0.25, /*v=*/-0.1, /*p=*/1.0);
   mfem::ParGridFunction U_const(&vfes);
   U_const = 0.0;
   FillConstantState(vfes, cons_const, U_const);
 
   // Component-wise Barth-Jespersen
   CheckLimiterOnConstantState(
-      ctx, "Barth-Jespersen (component)", vfes, U_const,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::BJOptions opt;
-        opt.dim = kDim;
-        mfem::ApplyBarthJespersenLimiter(space, U, opt);
-      });
+    ctx,
+    "Barth-Jespersen (component)",
+    vfes,
+    U_const,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::BJOptions opt;
+      opt.dim = kDim;
+      mfem::ApplyBarthJespersenLimiter(space, U, opt);
+    });
   CheckLimiterOnPerturbedState(
-      ctx, "Barth-Jespersen (component)", vfes,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::BJOptions opt;
-        opt.dim = kDim;
-        mfem::ApplyBarthJespersenLimiter(space, U, opt);
-      });
+    ctx,
+    "Barth-Jespersen (component)",
+    vfes,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::BJOptions opt;
+      opt.dim = kDim;
+      mfem::ApplyBarthJespersenLimiter(space, U, opt);
+    });
 
   // Characteristic Barth-Jespersen (x/y)
   CheckLimiterOnConstantState(
-      ctx, "Barth-Jespersen (characteristic XY)", vfes, U_const,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::CharBJOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyCharacteristicBJLimiter(space, U, opt);
-      });
+    ctx,
+    "Barth-Jespersen (characteristic XY)",
+    vfes,
+    U_const,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::CharBJOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyCharacteristicBJLimiter(space, U, opt);
+    });
   CheckLimiterOnPerturbedState(
-      ctx, "Barth-Jespersen (characteristic XY)", vfes,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::CharBJOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyCharacteristicBJLimiter(space, U, opt);
-      });
+    ctx,
+    "Barth-Jespersen (characteristic XY)",
+    vfes,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::CharBJOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyCharacteristicBJLimiter(space, U, opt);
+    });
 
   // Face-normal characteristic Barth-Jespersen
   CheckLimiterOnConstantState(
-      ctx, "Barth-Jespersen (face-normal characteristic)", vfes, U_const,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::FaceBJOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyFaceNormalCharacteristicBJLimiter(space, U, opt);
-      });
+    ctx,
+    "Barth-Jespersen (face-normal characteristic)",
+    vfes,
+    U_const,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::FaceBJOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyFaceNormalCharacteristicBJLimiter(space, U, opt);
+    });
   CheckLimiterOnPerturbedState(
-      ctx, "Barth-Jespersen (face-normal characteristic)", vfes,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::FaceBJOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyFaceNormalCharacteristicBJLimiter(space, U, opt);
-      });
+    ctx,
+    "Barth-Jespersen (face-normal characteristic)",
+    vfes,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::FaceBJOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyFaceNormalCharacteristicBJLimiter(space, U, opt);
+    });
 
   // Characteristic TVB (x/y)
   CheckLimiterOnConstantState(
-      ctx, "TVB (characteristic XY)", vfes, U_const,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::CharTVBOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyCharacteristicTVBLimiter(space, U, opt);
-      });
+    ctx,
+    "TVB (characteristic XY)",
+    vfes,
+    U_const,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::CharTVBOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyCharacteristicTVBLimiter(space, U, opt);
+    });
   CheckLimiterOnPerturbedState(
-      ctx, "TVB (characteristic XY)", vfes,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::CharTVBOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyCharacteristicTVBLimiter(space, U, opt);
-      });
+    ctx,
+    "TVB (characteristic XY)",
+    vfes,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::CharTVBOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyCharacteristicTVBLimiter(space, U, opt);
+    });
 
   // TVB face-normal
   CheckLimiterOnConstantState(
-      ctx, "TVB (face-normal characteristic)", vfes, U_const,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::CharTVBOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyCharacteristicTVBFaceNormal(space, U, opt);
-      });
+    ctx,
+    "TVB (face-normal characteristic)",
+    vfes,
+    U_const,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::CharTVBOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyCharacteristicTVBFaceNormal(space, U, opt);
+    });
   CheckLimiterOnPerturbedState(
-      ctx, "TVB (face-normal characteristic)", vfes,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::CharTVBOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyCharacteristicTVBFaceNormal(space, U, opt);
-      });
+    ctx,
+    "TVB (face-normal characteristic)",
+    vfes,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::CharTVBOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyCharacteristicTVBFaceNormal(space, U, opt);
+    });
 
   // Venkatakrishnan (x/y)
   CheckLimiterOnConstantState(
-      ctx, "Venkatakrishnan (characteristic XY)", vfes, U_const,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::VenkatOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyCharacteristicVenkatXY(space, U, opt);
-      });
+    ctx,
+    "Venkatakrishnan (characteristic XY)",
+    vfes,
+    U_const,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::VenkatOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyCharacteristicVenkatXY(space, U, opt);
+    });
   CheckLimiterOnPerturbedState(
-      ctx, "Venkatakrishnan (characteristic XY)", vfes,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::VenkatOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyCharacteristicVenkatXY(space, U, opt);
-      });
+    ctx,
+    "Venkatakrishnan (characteristic XY)",
+    vfes,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::VenkatOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyCharacteristicVenkatXY(space, U, opt);
+    });
 
   // --- DGSEM basis: limiter pipeline via RK3SSPWithLimiter ---
   {
     mfem::Mesh mesh_gl = mfem::Mesh::MakeCartesian2D(
-        /*nx=*/2, /*ny=*/2, mfem::Element::QUADRILATERAL,
-        /*generate_edges=*/true, /*sx=*/1.0, /*sy=*/1.0);
+      /*nx=*/2,
+      /*ny=*/2,
+      mfem::Element::QUADRILATERAL,
+      /*generate_edges=*/true,
+      /*sx=*/1.0,
+      /*sy=*/1.0);
     mfem::ParMesh pmesh_gl(MPI_COMM_WORLD, mesh_gl);
-    mfem::DG_FECollection fec_gl(/*order=*/2, kDim, mfem::BasisType::GaussLobatto);
-    mfem::ParFiniteElementSpace vfes_gl(&pmesh_gl, &fec_gl, kNumEq,
+    mfem::DG_FECollection fec_gl(/*order=*/2,
+                                 kDim,
+                                 mfem::BasisType::GaussLobatto);
+    mfem::ParFiniteElementSpace vfes_gl(&pmesh_gl,
+                                        &fec_gl,
+                                        kNumEq,
                                         mfem::Ordering::byNODES);
 
     mfem::ParGridFunction U_gl(&vfes_gl);
     const mfem::Vector cons =
-        ConservativeFromPrimitive(/*rho=*/1.0, /*u=*/0.2, /*v=*/-0.1, /*p=*/1.0);
+      ConservativeFromPrimitive(/*rho=*/1.0, /*u=*/0.2, /*v=*/-0.1, /*p=*/1.0);
     FillConstantState(vfes_gl, cons, U_gl);
 
     mfem::ParGridFunction U_before(&vfes_gl);
@@ -671,7 +784,10 @@ int RunLimiterTests(TestContext& ctx)
 
     struct ZeroOperator final : public mfem::TimeDependentOperator
     {
-      explicit ZeroOperator(int n) : mfem::TimeDependentOperator(n) {}
+      explicit ZeroOperator(int n)
+        : mfem::TimeDependentOperator(n)
+      {
+      }
       void Mult(const mfem::Vector&, mfem::Vector& y) const override
       {
         y.SetSize(height);
@@ -682,8 +798,10 @@ int RunLimiterTests(TestContext& ctx)
     ZeroOperator op(vfes_gl.GetTrueVSize());
     mfem::RK3SSPWithLimiter rk(vfes_gl);
     rk.SetEulerParams(kDim, kGamma);
-    rk.SetLimiterParams(/*rho_min=*/1e-10, /*p_min=*/1e-10,
-                        /*quad_order=*/0, /*p_bisect_iters=*/8);
+    rk.SetLimiterParams(/*rho_min=*/1e-10,
+                        /*p_min=*/1e-10,
+                        /*quad_order=*/0,
+                        /*p_bisect_iters=*/8);
 
     mfem::CharTVBOptions tvb;
     tvb.dim = kDim;
@@ -711,21 +829,28 @@ int RunLimiterTests(TestContext& ctx)
 
   // Venkatakrishnan face-normal
   CheckLimiterOnConstantState(
-      ctx, "Venkatakrishnan (face-normal characteristic)", vfes, U_const,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::VenkatOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyCharacteristicVenkatFaceNormal(space, U, opt);
-      });
+    ctx,
+    "Venkatakrishnan (face-normal characteristic)",
+    vfes,
+    U_const,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::VenkatOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyCharacteristicVenkatFaceNormal(space, U, opt);
+    });
   CheckLimiterOnPerturbedState(
-      ctx, "Venkatakrishnan (face-normal characteristic)", vfes,
-      [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U) {
-        mfem::VenkatOptions opt;
-        opt.dim = kDim;
-        opt.gamma = kGamma;
-        mfem::ApplyCharacteristicVenkatFaceNormal(space, U, opt);
-      });
+    ctx,
+    "Venkatakrishnan (face-normal characteristic)",
+    vfes,
+    [](mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& U)
+    {
+      mfem::VenkatOptions opt;
+      opt.dim = kDim;
+      opt.gamma = kGamma;
+      mfem::ApplyCharacteristicVenkatFaceNormal(space, U, opt);
+    });
 
   // Krivodonova hierarchical limiter: enforce admissibility.
   {

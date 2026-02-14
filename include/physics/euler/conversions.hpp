@@ -19,13 +19,15 @@ namespace mfem
  * @param[in]  gamma Ratio of specific heats.
  * @param[out] cons  Conservative state [rho, rho*u(0..dim-1), rho*E].
  */
-inline void EulerPrimToConservative(const mfem::Vector &prim,
+inline void EulerPrimToConservative(const mfem::Vector& prim,
                                     int dim,
                                     double gamma,
-                                    mfem::Vector &cons)
+                                    mfem::Vector& cons)
 {
-  MFEM_VERIFY(prim.Size() >= dim + 2, "Primitive state must have [rho, u(0..dim-1), p]");
-  MFEM_VERIFY(cons.Size() >= dim + 2, "Conservative state must have [rho, rho*u(0..dim-1), rhoE]");
+  MFEM_VERIFY(prim.Size() >= dim + 2,
+              "Primitive state must have [rho, u(0..dim-1), p]");
+  MFEM_VERIFY(cons.Size() >= dim + 2,
+              "Conservative state must have [rho, rho*u(0..dim-1), rhoE]");
 
   const double rho = prim(0);
   double kinetic = 0.0;
@@ -49,13 +51,15 @@ inline void EulerPrimToConservative(const mfem::Vector &prim,
  * @param[in]  gamma Ratio of specific heats.
  * @param[out] prim  Primitive state [rho, u(0..dim-1), p].
  */
-inline void EulerConservativeToPrimitive(const mfem::Vector &cons,
+inline void EulerConservativeToPrimitive(const mfem::Vector& cons,
                                          int dim,
                                          double gamma,
-                                         mfem::Vector &prim)
+                                         mfem::Vector& prim)
 {
-  MFEM_VERIFY(cons.Size() >= dim + 2, "Conservative state must have [rho, rho*u(0..dim-1), rhoE]");
-  MFEM_VERIFY(prim.Size() >= dim + 2, "Primitive state must have [rho, u(0..dim-1), p]");
+  MFEM_VERIFY(cons.Size() >= dim + 2,
+              "Conservative state must have [rho, rho*u(0..dim-1), rhoE]");
+  MFEM_VERIFY(prim.Size() >= dim + 2,
+              "Primitive state must have [rho, u(0..dim-1), p]");
 
   const double rho = cons(0);
   prim(0) = rho;
@@ -79,10 +83,8 @@ inline void EulerConservativeToPrimitive(const mfem::Vector &cons,
  * @deprecated Prefer EulerPrimToConservative(prim, dim, gamma, cons).
  */
 DG_IGR_DEPRECATED("Use EulerPrimToConservative(prim, dim, gamma, cons)")
-inline void PrimToCons(const mfem::Vector &prim,
-                       mfem::Vector &cons,
-                       int dim,
-                       double gamma)
+inline void
+PrimToCons(const mfem::Vector& prim, mfem::Vector& cons, int dim, double gamma)
 {
   EulerPrimToConservative(prim, dim, gamma, cons);
 }
@@ -92,10 +94,8 @@ inline void PrimToCons(const mfem::Vector &prim,
  * @deprecated Prefer EulerConservativeToPrimitive(cons, dim, gamma, prim).
  */
 DG_IGR_DEPRECATED("Use EulerConservativeToPrimitive(cons, dim, gamma, prim)")
-inline void ConsToPrim(const mfem::Vector &cons,
-                       mfem::Vector &prim,
-                       int dim,
-                       double gamma)
+inline void
+ConsToPrim(const mfem::Vector& cons, mfem::Vector& prim, int dim, double gamma)
 {
   EulerConservativeToPrimitive(cons, dim, gamma, prim);
 }

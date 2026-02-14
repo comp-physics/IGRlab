@@ -14,7 +14,8 @@ namespace
 {
 
 struct SmoothAdvectionOptions
-{};
+{
+};
 
 std::string EnsurePeriodicMeshFile()
 {
@@ -25,13 +26,17 @@ std::string EnsurePeriodicMeshFile()
   {
     constexpr int nx = 32;
     constexpr int ny = 32;
-    mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
-        nx, ny, mfem::Element::QUADRILATERAL,
-        /*gen_edges=*/true, /*sx=*/1.0, /*sy=*/1.0);
+    mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(nx,
+                                                  ny,
+                                                  mfem::Element::QUADRILATERAL,
+                                                  /*gen_edges=*/true,
+                                                  /*sx=*/1.0,
+                                                  /*sy=*/1.0);
     std::vector<mfem::Vector> translations = {mfem::Vector({1.0, 0.0}),
                                               mfem::Vector({0.0, 1.0})};
-    mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
-        mesh, mesh.CreatePeriodicVertexMapping(translations));
+    mfem::Mesh periodic =
+      mfem::Mesh::MakePeriodic(mesh,
+                               mesh.CreatePeriodicVertexMapping(translations));
 
     std::ofstream out(mesh_path);
     MFEM_VERIFY(out.good(),
@@ -106,8 +111,7 @@ int main(int argc, char* argv[])
   spec.apply_bc = [](const SmoothAdvectionOptions&,
                      const dg_sim::ExampleContext&,
                      auto&,
-                     const auto&)
-  {
+                     const auto&) {
   };
 
   return dg_sim::Solver::solve(spec, argc, argv);

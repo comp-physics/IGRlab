@@ -1,0 +1,38 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+# Match the existing codebase preference (brace-on-new-line style).
+BreakBeforeBraces: Allman
+
+# Keep indentation simple and consistent with current files.
+IndentWidth: 2
+ContinuationIndentWidth: 2
+NamespaceIndentation: None
+
+# Reduce aggressive wrapping in signatures/lambdas.
+ColumnLimit: 80
+BinPackParameters: false
+BinPackArguments: false
+AlignAfterOpenBracket: Align
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowAllArgumentsOnNextLine: false
+BreakConstructorInitializers: BeforeColon
+ConstructorInitializerIndentWidth: 2
+PackConstructorInitializers: Never
+
+# Keep short control blocks readable without forcing expansion.
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortBlocksOnASingleLine: Empty
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortLambdasOnASingleLine: Inline
+
+# Match common project type/reference style.
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+# Avoid noisy non-format changes.
+SortIncludes: false
+ReflowComments: false
+...

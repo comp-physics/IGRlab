@@ -20,24 +20,34 @@ namespace mfem
  */
 struct PressureCoefficient : public mfem::Coefficient
 {
-  const mfem::ParGridFunction *U = nullptr;
+  const mfem::ParGridFunction* U = nullptr;
   int dim = mfem::dg_igr::EulerDefaults::kDim;
   double gamma = mfem::dg_igr::EulerDefaults::kGamma;
   mutable mfem::Vector state; // reuse buffer
 
   PressureCoefficient() = default;
-  PressureCoefficient(const mfem::ParGridFunction &U_, int dim_, double g_)
-    : U(&U_), dim(dim_), gamma(g_), state(dim_ + 2) {}
+  PressureCoefficient(const mfem::ParGridFunction& U_, int dim_, double g_)
+    : U(&U_),
+      dim(dim_),
+      gamma(g_),
+      state(dim_ + 2)
+  {
+  }
 
-  void SetState(const mfem::ParGridFunction &U_) { U = &U_; }
-  void SetDimGamma(int d, double g) { dim = d; gamma = g; state.SetSize(d + 2); }
+  void SetState(const mfem::ParGridFunction& U_) { U = &U_; }
+  void SetDimGamma(int d, double g)
+  {
+    dim = d;
+    gamma = g;
+    state.SetSize(d + 2);
+  }
 
-  double Eval(mfem::ElementTransformation &T,
-              const mfem::IntegrationPoint &ip) override
+  double Eval(mfem::ElementTransformation& T,
+              const mfem::IntegrationPoint& ip) override
   {
     MFEM_VERIFY(U, "PressureCoefficient: U pointer not set.");
     T.SetIntPoint(&ip);
-    U->GetVectorValue(T, ip, state);   // [rho, m, E]
+    U->GetVectorValue(T, ip, state); // [rho, m, E]
     return PressureFromCons(state, dim, gamma, /*rho_floor=*/1e-16);
   }
 };
@@ -48,14 +58,21 @@ struct PressureCoefficient : public mfem::Coefficient
 class VelocityFromConsCoefficient : public mfem::VectorCoefficient
 {
 public:
-  VelocityFromConsCoefficient(int dim, const mfem::ParGridFunction* U,
+  VelocityFromConsCoefficient(int dim,
+                              const mfem::ParGridFunction* U,
                               double rho_floor)
-    : mfem::VectorCoefficient(dim), dim_(dim), U_(U), rho_floor_(rho_floor) {}
+    : mfem::VectorCoefficient(dim),
+      dim_(dim),
+      U_(U),
+      rho_floor_(rho_floor)
+  {
+  }
 
   void SetState(const mfem::ParGridFunction* U) { U_ = U; }
 
-  void Eval(mfem::Vector &V, mfem::ElementTransformation &T,
-            const mfem::IntegrationPoint &ip) override
+  void Eval(mfem::Vector& V,
+            mfem::ElementTransformation& T,
+            const mfem::IntegrationPoint& ip) override
   {
     MFEM_VERIFY(U_, "VelocityFromConsCoefficient: U is null");
     T.SetIntPoint(&ip);
@@ -63,7 +80,10 @@ public:
     U_->GetVectorValue(T, ip, state); // [rho, m(0..dim-1), E]
     const double rho = std::max(state(0), rho_floor_);
     V.SetSize(dim_);
-    for (int d = 0; d < dim_; ++d) { V(d) = state(1 + d) / rho; }
+    for (int d = 0; d < dim_; ++d)
+    {
+      V(d) = state(1 + d) / rho;
+    }
   }
 
 private:
@@ -75,40 +95,67 @@ private:
 // --- Diagnostics from an H1 vector velocity field (uH1) ---
 struct GradFrobNormCoeff : public mfem::Coefficient
 {
-  const mfem::ParGridFunction* v = nullptr; int dim = 0;
-  GradFrobNormCoeff(const mfem::ParGridFunction* vel, int d) : v(vel), dim(d) {}
-  double Eval(mfem::ElementTransformation& T, const mfem::IntegrationPoint& ip) override
+  const mfem::ParGridFunction* v = nullptr;
+  int dim = 0;
+  GradFrobNormCoeff(const mfem::ParGridFunction* vel, int d)
+    : v(vel),
+      dim(d)
   {
-    if (!v) return 0.0; T.SetIntPoint(&ip);
+  }
+  double Eval(mfem::ElementTransformation& T,
+              const mfem::IntegrationPoint& ip) override
+  {
+    if (!v) return 0.0;
+    T.SetIntPoint(&ip);
     mfem::DenseMatrix G(dim, dim);
     v->GetVectorGradient(T, G); // G(i,j) = d_j u_i
-    double s = 0.0; for (int i=0;i<dim;i++) for (int j=0;j<dim;j++) s += G(i,j)*G(i,j);
+    double s = 0.0;
+    for (int i = 0; i < dim; i++)
+      for (int j = 0; j < dim; j++)
+        s += G(i, j) * G(i, j);
     return std::sqrt(s);
   }
 };
 
 struct DivCoeff : public mfem::Coefficient
 {
-  const mfem::ParGridFunction* v = nullptr; int dim = 0;
-  DivCoeff(const mfem::ParGridFunction* vel, int d) : v(vel), dim(d) {}
-  double Eval(mfem::ElementTransformation& T, const mfem::IntegrationPoint& ip) override
+  const mfem::ParGridFunction* v = nullptr;
+  int dim = 0;
+  DivCoeff(const mfem::ParGridFunction* vel, int d)
+    : v(vel),
+      dim(d)
   {
-    if (!v) return 0.0; T.SetIntPoint(&ip);
+  }
+  double Eval(mfem::ElementTransformation& T,
+              const mfem::IntegrationPoint& ip) override
+  {
+    if (!v) return 0.0;
+    T.SetIntPoint(&ip);
     mfem::DenseMatrix G(dim, dim);
     v->GetVectorGradient(T, G);
-    double tr = 0.0; for (int i=0;i<dim;i++) tr += G(i,i);
+    double tr = 0.0;
+    for (int i = 0; i < dim; i++)
+      tr += G(i, i);
     return tr;
   }
 };
 
 struct VelMagCoeff : public mfem::Coefficient
 {
-  const mfem::ParGridFunction* v = nullptr; int dim = 0;
-  VelMagCoeff(const mfem::ParGridFunction* vel, int d) : v(vel), dim(d) {}
-  double Eval(mfem::ElementTransformation& T, const mfem::IntegrationPoint& ip) override
+  const mfem::ParGridFunction* v = nullptr;
+  int dim = 0;
+  VelMagCoeff(const mfem::ParGridFunction* vel, int d)
+    : v(vel),
+      dim(d)
   {
-    if (!v) return 0.0; T.SetIntPoint(&ip);
-    mfem::Vector u; v->GetVectorValue(T, ip, u);
+  }
+  double Eval(mfem::ElementTransformation& T,
+              const mfem::IntegrationPoint& ip) override
+  {
+    if (!v) return 0.0;
+    T.SetIntPoint(&ip);
+    mfem::Vector u;
+    v->GetVectorValue(T, ip, u);
     return u.Norml2();
   }
 };
@@ -117,10 +164,15 @@ struct VelMagCoeff : public mfem::Coefficient
 class DivFromConservativeCoeff : public mfem::Coefficient
 {
 public:
-  DivFromConservativeCoeff(const mfem::ParGridFunction* U, int dim,
+  DivFromConservativeCoeff(const mfem::ParGridFunction* U,
+                           int dim,
                            double rho_floor)
-    : U_(U), dim_(dim), rho_floor_(rho_floor),
-      state_(dim + 2), grad_u_(dim + 2, dim), gradu_(dim, dim)
+    : U_(U),
+      dim_(dim),
+      rho_floor_(rho_floor),
+      state_(dim + 2),
+      grad_u_(dim + 2, dim),
+      gradu_(dim, dim)
   {
   }
 
@@ -148,7 +200,10 @@ public:
     }
 
     double divu = 0.0;
-    for (int i = 0; i < dim_; ++i) { divu += gradu_(i, i); }
+    for (int i = 0; i < dim_; ++i)
+    {
+      divu += gradu_(i, i);
+    }
     return divu;
   }
 
@@ -164,10 +219,15 @@ private:
 class GradFrobFromConservativeCoeff : public mfem::Coefficient
 {
 public:
-  GradFrobFromConservativeCoeff(const mfem::ParGridFunction* U, int dim,
+  GradFrobFromConservativeCoeff(const mfem::ParGridFunction* U,
+                                int dim,
                                 double rho_floor)
-    : U_(U), dim_(dim), rho_floor_(rho_floor),
-      state_(dim + 2), grad_u_(dim + 2, dim), gradu_(dim, dim)
+    : U_(U),
+      dim_(dim),
+      rho_floor_(rho_floor),
+      state_(dim + 2),
+      grad_u_(dim + 2, dim),
+      gradu_(dim, dim)
   {
   }
 

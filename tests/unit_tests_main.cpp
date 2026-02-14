@@ -23,7 +23,7 @@ int RunDGSEMFluxTests(TestContext& ctx);
 int RunDGSEMOperatorTests(TestContext& ctx);
 int RunDGSEMAdvectionTests(TestContext& ctx);
 int RunDGSEMIGRTests(TestContext& ctx);
-}
+} // namespace dg_igr_tests
 
 namespace
 {
@@ -63,7 +63,8 @@ void PrintUsage()
             << "  --dgsem-igr  Run DGSEM + IGR tests.\n"
             << "  --bc         Run boundary-state policy tests.\n"
             << "  --igr        Run IGR flux decorator tests.\n"
-            << "  --parity     Emit/compare MPI parity signatures (uses DG_IGR_PARITY_* env vars).\n"
+            << "  --parity     Emit/compare MPI parity signatures (uses "
+               "DG_IGR_PARITY_* env vars).\n"
             << "  --list       List available suites and exit.\n"
             << "  --help       Show this help and exit.\n";
 }
@@ -187,23 +188,34 @@ SuiteSelection ParseSuites(int argc, char** argv)
 int AllreduceSum(int local)
 {
   int global = 0;
-  MPI_Allreduce(&local, &global, 1, mfem::MPITypeMap<int>::mpi_type,
-                MPI_SUM, MPI_COMM_WORLD);
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<int>::mpi_type,
+                MPI_SUM,
+                MPI_COMM_WORLD);
   return global;
 }
 
 double AllreduceSumDouble(double local)
 {
   double global = 0.0;
-  MPI_Allreduce(&local, &global, 1, mfem::MPITypeMap<double>::mpi_type,
-                MPI_SUM, MPI_COMM_WORLD);
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_SUM,
+                MPI_COMM_WORLD);
   return global;
 }
 
 bool GetEnvString(const char* name, std::string& value)
 {
   const char* env = std::getenv(name);
-  if (!env) { return false; }
+  if (!env)
+  {
+    return false;
+  }
   value = env;
   return true;
 }
@@ -211,14 +223,20 @@ bool GetEnvString(const char* name, std::string& value)
 bool EnvEnabled(const char* name)
 {
   std::string value;
-  if (!GetEnvString(name, value)) { return false; }
+  if (!GetEnvString(name, value))
+  {
+    return false;
+  }
   return value == "1" || value == "true" || value == "TRUE" || value == "on";
 }
 
 double ParityTolerance()
 {
   std::string tol_str;
-  if (!GetEnvString("DG_IGR_PARITY_TOL", tol_str)) { return 1.0e-9; }
+  if (!GetEnvString("DG_IGR_PARITY_TOL", tol_str))
+  {
+    return 1.0e-9;
+  }
   std::istringstream is(tol_str);
   double tol = 1.0e-9;
   is >> tol;
@@ -230,7 +248,10 @@ using MetricMap = std::map<std::string, double>;
 bool WriteParityReference(const std::string& path, const MetricMap& metrics)
 {
   std::ofstream ofs(path);
-  if (!ofs) { return false; }
+  if (!ofs)
+  {
+    return false;
+  }
   ofs << "# dg_igr MPI parity reference\n";
   for (const auto& kv : metrics)
   {
@@ -242,14 +263,23 @@ bool WriteParityReference(const std::string& path, const MetricMap& metrics)
 bool ReadParityReference(const std::string& path, MetricMap& metrics_out)
 {
   std::ifstream ifs(path);
-  if (!ifs) { return false; }
+  if (!ifs)
+  {
+    return false;
+  }
 
   std::string line;
   while (std::getline(ifs, line))
   {
-    if (line.empty() || line[0] == '#') { continue; }
+    if (line.empty() || line[0] == '#')
+    {
+      continue;
+    }
     const std::size_t eq = line.find('=');
-    if (eq == std::string::npos) { continue; }
+    if (eq == std::string::npos)
+    {
+      continue;
+    }
 
     const std::string key = line.substr(0, eq);
     const std::string value = line.substr(eq + 1);
@@ -275,7 +305,9 @@ void CompareParityMetrics(const MetricMap& ref,
       ctx.Check(false, "Parity reference missing suite: " + kv.first);
       continue;
     }
-    ctx.CheckNear(kv.second, it->second, tol,
+    ctx.CheckNear(kv.second,
+                  it->second,
+                  tol,
                   "MPI parity signature for suite " + kv.first);
   }
 }
@@ -298,8 +330,9 @@ int main(int argc, char** argv)
   }
   if (selection.list_only)
   {
-    std::cout << "Available suites: euler, fluxes, limiters, dg-operator, dgsem-basis, "
-                 "dgsem-flux, dgsem-operator, dgsem-advection, dgsem-igr, bc, igr\n";
+    std::cout
+      << "Available suites: euler, fluxes, limiters, dg-operator, dgsem-basis, "
+         "dgsem-flux, dgsem-operator, dgsem-advection, dgsem-igr, bc, igr\n";
     return 0;
   }
 
@@ -322,12 +355,12 @@ int main(int argc, char** argv)
 
   const int world_size = mfem::Mpi::WorldSize();
   MetricMap parity_metrics;
-  auto capture_parity_metric = [&](const char* suite_name,
-                                   double before_metric) {
+  auto capture_parity_metric = [&](const char* suite_name, double before_metric)
+  {
     const double local_metric = ctx.parity_metric - before_metric;
     const double global_sum = AllreduceSumDouble(local_metric);
     const double global_avg =
-        global_sum / static_cast<double>(world_size > 0 ? world_size : 1);
+      global_sum / static_cast<double>(world_size > 0 ? world_size : 1);
     parity_metrics[suite_name] = global_avg;
   };
 
@@ -337,7 +370,10 @@ int main(int argc, char** argv)
     const double parity_before = ctx.parity_metric;
     dg_igr_tests::RunEulerTests(ctx);
     local_euler_failures = ctx.failures - before;
-    if (selection.parity) { capture_parity_metric("euler", parity_before); }
+    if (selection.parity)
+    {
+      capture_parity_metric("euler", parity_before);
+    }
   }
   if (selection.fluxes)
   {
@@ -345,7 +381,10 @@ int main(int argc, char** argv)
     const double parity_before = ctx.parity_metric;
     dg_igr_tests::RunFluxTests(ctx);
     local_flux_failures = ctx.failures - before;
-    if (selection.parity) { capture_parity_metric("fluxes", parity_before); }
+    if (selection.parity)
+    {
+      capture_parity_metric("fluxes", parity_before);
+    }
   }
   if (selection.limiters)
   {
@@ -353,7 +392,10 @@ int main(int argc, char** argv)
     const double parity_before = ctx.parity_metric;
     dg_igr_tests::RunLimiterTests(ctx);
     local_limiter_failures = ctx.failures - before;
-    if (selection.parity) { capture_parity_metric("limiters", parity_before); }
+    if (selection.parity)
+    {
+      capture_parity_metric("limiters", parity_before);
+    }
   }
   if (selection.dg_operator)
   {
@@ -361,7 +403,10 @@ int main(int argc, char** argv)
     const double parity_before = ctx.parity_metric;
     dg_igr_tests::RunDGOperatorTests(ctx);
     local_dg_operator_failures = ctx.failures - before;
-    if (selection.parity) { capture_parity_metric("dg-operator", parity_before); }
+    if (selection.parity)
+    {
+      capture_parity_metric("dg-operator", parity_before);
+    }
   }
   if (selection.dgsem_basis)
   {
@@ -369,7 +414,10 @@ int main(int argc, char** argv)
     const double parity_before = ctx.parity_metric;
     dg_igr_tests::RunDGSEMBasisTests(ctx);
     local_dgsem_basis_failures = ctx.failures - before;
-    if (selection.parity) { capture_parity_metric("dgsem-basis", parity_before); }
+    if (selection.parity)
+    {
+      capture_parity_metric("dgsem-basis", parity_before);
+    }
   }
   if (selection.dgsem_flux)
   {
@@ -377,7 +425,10 @@ int main(int argc, char** argv)
     const double parity_before = ctx.parity_metric;
     dg_igr_tests::RunDGSEMFluxTests(ctx);
     local_dgsem_flux_failures = ctx.failures - before;
-    if (selection.parity) { capture_parity_metric("dgsem-flux", parity_before); }
+    if (selection.parity)
+    {
+      capture_parity_metric("dgsem-flux", parity_before);
+    }
   }
   if (selection.dgsem_operator)
   {
@@ -385,7 +436,10 @@ int main(int argc, char** argv)
     const double parity_before = ctx.parity_metric;
     dg_igr_tests::RunDGSEMOperatorTests(ctx);
     local_dgsem_operator_failures = ctx.failures - before;
-    if (selection.parity) { capture_parity_metric("dgsem-operator", parity_before); }
+    if (selection.parity)
+    {
+      capture_parity_metric("dgsem-operator", parity_before);
+    }
   }
   if (selection.dgsem_advection)
   {
@@ -393,7 +447,10 @@ int main(int argc, char** argv)
     const double parity_before = ctx.parity_metric;
     dg_igr_tests::RunDGSEMAdvectionTests(ctx);
     local_dgsem_advection_failures = ctx.failures - before;
-    if (selection.parity) { capture_parity_metric("dgsem-advection", parity_before); }
+    if (selection.parity)
+    {
+      capture_parity_metric("dgsem-advection", parity_before);
+    }
   }
   if (selection.dgsem_igr)
   {
@@ -401,7 +458,10 @@ int main(int argc, char** argv)
     const double parity_before = ctx.parity_metric;
     dg_igr_tests::RunDGSEMIGRTests(ctx);
     local_dgsem_igr_failures = ctx.failures - before;
-    if (selection.parity) { capture_parity_metric("dgsem-igr", parity_before); }
+    if (selection.parity)
+    {
+      capture_parity_metric("dgsem-igr", parity_before);
+    }
   }
   if (selection.bc)
   {
@@ -409,7 +469,10 @@ int main(int argc, char** argv)
     const double parity_before = ctx.parity_metric;
     dg_igr_tests::RunBCTests(ctx);
     local_bc_failures = ctx.failures - before;
-    if (selection.parity) { capture_parity_metric("bc", parity_before); }
+    if (selection.parity)
+    {
+      capture_parity_metric("bc", parity_before);
+    }
   }
   if (selection.igr)
   {
@@ -417,26 +480,35 @@ int main(int argc, char** argv)
     const double parity_before = ctx.parity_metric;
     dg_igr_tests::RunIGRTests(ctx);
     local_igr_failures = ctx.failures - before;
-    if (selection.parity) { capture_parity_metric("igr", parity_before); }
+    if (selection.parity)
+    {
+      capture_parity_metric("igr", parity_before);
+    }
   }
 
-  const int global_euler_failures = selection.euler ? AllreduceSum(local_euler_failures) : 0;
-  const int global_flux_failures = selection.fluxes ? AllreduceSum(local_flux_failures) : 0;
-  const int global_limiter_failures = selection.limiters ? AllreduceSum(local_limiter_failures) : 0;
+  const int global_euler_failures =
+    selection.euler ? AllreduceSum(local_euler_failures) : 0;
+  const int global_flux_failures =
+    selection.fluxes ? AllreduceSum(local_flux_failures) : 0;
+  const int global_limiter_failures =
+    selection.limiters ? AllreduceSum(local_limiter_failures) : 0;
   const int global_dg_operator_failures =
-      selection.dg_operator ? AllreduceSum(local_dg_operator_failures) : 0;
+    selection.dg_operator ? AllreduceSum(local_dg_operator_failures) : 0;
   const int global_dgsem_basis_failures =
-      selection.dgsem_basis ? AllreduceSum(local_dgsem_basis_failures) : 0;
+    selection.dgsem_basis ? AllreduceSum(local_dgsem_basis_failures) : 0;
   const int global_dgsem_flux_failures =
-      selection.dgsem_flux ? AllreduceSum(local_dgsem_flux_failures) : 0;
+    selection.dgsem_flux ? AllreduceSum(local_dgsem_flux_failures) : 0;
   const int global_dgsem_operator_failures =
-      selection.dgsem_operator ? AllreduceSum(local_dgsem_operator_failures) : 0;
+    selection.dgsem_operator ? AllreduceSum(local_dgsem_operator_failures) : 0;
   const int global_dgsem_advection_failures =
-      selection.dgsem_advection ? AllreduceSum(local_dgsem_advection_failures) : 0;
+    selection.dgsem_advection ? AllreduceSum(local_dgsem_advection_failures)
+                              : 0;
   const int global_dgsem_igr_failures =
-      selection.dgsem_igr ? AllreduceSum(local_dgsem_igr_failures) : 0;
-  const int global_bc_failures = selection.bc ? AllreduceSum(local_bc_failures) : 0;
-  const int global_igr_failures = selection.igr ? AllreduceSum(local_igr_failures) : 0;
+    selection.dgsem_igr ? AllreduceSum(local_dgsem_igr_failures) : 0;
+  const int global_bc_failures =
+    selection.bc ? AllreduceSum(local_bc_failures) : 0;
+  const int global_igr_failures =
+    selection.igr ? AllreduceSum(local_igr_failures) : 0;
 
   if (selection.parity && mfem::Mpi::Root())
   {
@@ -467,65 +539,108 @@ int main(int argc, char** argv)
   }
 
   int global_failures = 0;
-  MPI_Allreduce(&ctx.failures, &global_failures, 1,
-                mfem::MPITypeMap<int>::mpi_type, MPI_SUM, MPI_COMM_WORLD);
+  MPI_Allreduce(&ctx.failures,
+                &global_failures,
+                1,
+                mfem::MPITypeMap<int>::mpi_type,
+                MPI_SUM,
+                MPI_COMM_WORLD);
 
   if (mfem::Mpi::Root())
   {
 
     std::vector<std::string> suites;
-    if (selection.euler) { suites.emplace_back("euler"); }
-    if (selection.fluxes) { suites.emplace_back("fluxes"); }
-    if (selection.limiters) { suites.emplace_back("limiters"); }
-    if (selection.dg_operator) { suites.emplace_back("dg-operator"); }
-    if (selection.bc) { suites.emplace_back("bc"); }
-    if (selection.igr) { suites.emplace_back("igr"); }
-    if (selection.dgsem_flux) { suites.emplace_back("dgsem-flux"); }
-    if (selection.dgsem_operator) { suites.emplace_back("dgsem-operator"); }
-    if (selection.dgsem_advection) { suites.emplace_back("dgsem-advection"); }
-    if (selection.dgsem_basis) { suites.emplace_back("dgsem-basis"); }
-    if (selection.dgsem_igr) { suites.emplace_back("dgsem-igr"); }
+    if (selection.euler)
+    {
+      suites.emplace_back("euler");
+    }
+    if (selection.fluxes)
+    {
+      suites.emplace_back("fluxes");
+    }
+    if (selection.limiters)
+    {
+      suites.emplace_back("limiters");
+    }
+    if (selection.dg_operator)
+    {
+      suites.emplace_back("dg-operator");
+    }
+    if (selection.bc)
+    {
+      suites.emplace_back("bc");
+    }
+    if (selection.igr)
+    {
+      suites.emplace_back("igr");
+    }
+    if (selection.dgsem_flux)
+    {
+      suites.emplace_back("dgsem-flux");
+    }
+    if (selection.dgsem_operator)
+    {
+      suites.emplace_back("dgsem-operator");
+    }
+    if (selection.dgsem_advection)
+    {
+      suites.emplace_back("dgsem-advection");
+    }
+    if (selection.dgsem_basis)
+    {
+      suites.emplace_back("dgsem-basis");
+    }
+    if (selection.dgsem_igr)
+    {
+      suites.emplace_back("dgsem-igr");
+    }
 
     std::cout << "dg_igr unit tests suites: ";
     for (size_t i = 0; i < suites.size(); ++i)
     {
       std::cout << suites[i];
-      if (i + 1 < suites.size()) { std::cout << ", "; }
+      if (i + 1 < suites.size())
+      {
+        std::cout << ", ";
+      }
     }
     std::cout << "\n";
 
     if (selection.euler)
     {
-      std::cout << "  euler:    " << (global_euler_failures == 0 ? "PASS" : "FAIL")
-                << " (" << global_euler_failures << " failure(s))\n";
+      std::cout << "  euler:    "
+                << (global_euler_failures == 0 ? "PASS" : "FAIL") << " ("
+                << global_euler_failures << " failure(s))\n";
     }
     if (selection.fluxes)
     {
-      std::cout << "  fluxes:   " << (global_flux_failures == 0 ? "PASS" : "FAIL")
-                << " (" << global_flux_failures << " failure(s))\n";
+      std::cout << "  fluxes:   "
+                << (global_flux_failures == 0 ? "PASS" : "FAIL") << " ("
+                << global_flux_failures << " failure(s))\n";
     }
     if (selection.limiters)
     {
-      std::cout << "  limiters: " << (global_limiter_failures == 0 ? "PASS" : "FAIL")
-                << " (" << global_limiter_failures << " failure(s))\n";
+      std::cout << "  limiters: "
+                << (global_limiter_failures == 0 ? "PASS" : "FAIL") << " ("
+                << global_limiter_failures << " failure(s))\n";
     }
     if (selection.dg_operator)
     {
       std::cout << "  dg-operator: "
-                << (global_dg_operator_failures == 0 ? "PASS" : "FAIL")
-                << " (" << global_dg_operator_failures << " failure(s))\n";
+                << (global_dg_operator_failures == 0 ? "PASS" : "FAIL") << " ("
+                << global_dg_operator_failures << " failure(s))\n";
     }
     if (selection.dgsem_basis)
     {
       std::cout << "  dgsem-basis: "
-                << (global_dgsem_basis_failures == 0 ? "PASS" : "FAIL")
-                << " (" << global_dgsem_basis_failures << " failure(s))\n";
+                << (global_dgsem_basis_failures == 0 ? "PASS" : "FAIL") << " ("
+                << global_dgsem_basis_failures << " failure(s))\n";
     }
     if (selection.dgsem_flux)
     {
       std::cout << "  dgsem-flux: "
-                << (global_dgsem_flux_failures == 0 ? "PASS" : "FAIL")
-                << " (" << global_dgsem_flux_failures << " failure(s))\n";
+                << (global_dgsem_flux_failures == 0 ? "PASS" : "FAIL") << " ("
+                << global_dgsem_flux_failures << " failure(s))\n";
     }
     if (selection.dgsem_operator)
     {
@@ -542,8 +657,8 @@ int main(int argc, char** argv)
     if (selection.dgsem_igr)
     {
       std::cout << "  dgsem-igr: "
-                << (global_dgsem_igr_failures == 0 ? "PASS" : "FAIL")
-                << " (" << global_dgsem_igr_failures << " failure(s))\n";
+                << (global_dgsem_igr_failures == 0 ? "PASS" : "FAIL") << " ("
+                << global_dgsem_igr_failures << " failure(s))\n";
     }
     if (selection.bc)
     {
@@ -552,8 +667,9 @@ int main(int argc, char** argv)
     }
     if (selection.igr)
     {
-      std::cout << "  igr:      " << (global_igr_failures == 0 ? "PASS" : "FAIL")
-                << " (" << global_igr_failures << " failure(s))\n";
+      std::cout << "  igr:      "
+                << (global_igr_failures == 0 ? "PASS" : "FAIL") << " ("
+                << global_igr_failures << " failure(s))\n";
     }
     if (selection.parity)
     {
@@ -571,7 +687,8 @@ int main(int argc, char** argv)
     }
     else
     {
-      std::cout << "dg_igr unit tests failed: " << global_failures << " failure(s).\n";
+      std::cout << "dg_igr unit tests failed: " << global_failures
+                << " failure(s).\n";
     }
   }
 

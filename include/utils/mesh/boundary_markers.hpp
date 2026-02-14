@@ -20,18 +20,20 @@ namespace mfem
  *
  * Example: MakeMarker(pmesh, {4}) activates only attribute 4.
  */
-static void MakeMarker(mfem::Array<int> &marker,
-                       mfem::ParMesh &pmesh,
+static void MakeMarker(mfem::Array<int>& marker,
+                       mfem::ParMesh& pmesh,
                        std::initializer_list<int> attrs)
 {
   const int nb = pmesh.bdr_attributes.Max();
   MFEM_VERIFY(nb > 0, "Mesh has no boundary attributes.");
-  marker.SetSize(nb); marker = 0;
+  marker.SetSize(nb);
+  marker = 0;
   for (int a : attrs)
   {
     MFEM_VERIFY(a >= 1 && a <= nb,
-          "Requested boundary attribute " << a << " but mesh has [1.." << nb << "]");
-    marker[a-1] = 1;
+                "Requested boundary attribute " << a << " but mesh has [1.."
+                                                << nb << "]");
+    marker[a - 1] = 1;
   }
 }
 

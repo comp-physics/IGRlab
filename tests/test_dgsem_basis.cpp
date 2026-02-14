@@ -42,8 +42,11 @@ int RunDGSEMBasisTests(TestContext& ctx)
     {
       weight_sum += basis.weights(i);
     }
-    ctx.CheckNear(weight_sum, 1.0, tol,
-                  "LGL weights sum to 1 on [0,1] (order=" + std::to_string(order) + ")");
+    ctx.CheckNear(
+      weight_sum,
+      1.0,
+      tol,
+      "LGL weights sum to 1 on [0,1] (order=" + std::to_string(order) + ")");
 
     // SBP identity: M D + D^T M = B
     mfem::DenseMatrix M(basis.n);
@@ -95,35 +98,48 @@ int RunDGSEMBasisTests(TestContext& ctx)
     }
     Dsplit_expected -= basis.Dsplit;
     const double dsplit_err = MaxAbsEntry(Dsplit_expected);
-    ctx.Check(dsplit_err < 1.0e-10,
-              "Dsplit matches D - 0.5 M^{-1} B (order=" + std::to_string(order) + ")");
+    ctx.Check(
+      dsplit_err < 1.0e-10,
+      "Dsplit matches D - 0.5 M^{-1} B (order=" + std::to_string(order) + ")");
   }
 
   // Lexicographic mapping sanity (1D + 2D, Gauss-Lobatto).
   {
     const int order = 3;
-    const mfem::real_t* nodes = mfem::poly1d.GetPoints(order, mfem::BasisType::GaussLobatto);
+    const mfem::real_t* nodes =
+      mfem::poly1d.GetPoints(order, mfem::BasisType::GaussLobatto);
 
     mfem::DG_FECollection fec_1d(order, 1, mfem::BasisType::GaussLobatto);
-    const mfem::FiniteElement* fe_1d = fec_1d.FiniteElementForGeometry(mfem::Geometry::SEGMENT);
+    const mfem::FiniteElement* fe_1d =
+      fec_1d.FiniteElementForGeometry(mfem::Geometry::SEGMENT);
     const auto& map_1d = mfem::dgsem::GetTensorDofToIJK(*fe_1d);
     for (int ld = 0; ld < fe_1d->GetDof(); ++ld)
     {
       const int i = map_1d[ld][0];
       const double x = fe_1d->GetNodes().IntPoint(ld).x;
-      ctx.CheckNear(x, nodes[i], 1.0e-12, "1D lexicographic mapping matches nodes");
+      ctx.CheckNear(x,
+                    nodes[i],
+                    1.0e-12,
+                    "1D lexicographic mapping matches nodes");
     }
 
     mfem::DG_FECollection fec_2d(order, 2, mfem::BasisType::GaussLobatto);
-    const mfem::FiniteElement* fe_2d = fec_2d.FiniteElementForGeometry(mfem::Geometry::SQUARE);
+    const mfem::FiniteElement* fe_2d =
+      fec_2d.FiniteElementForGeometry(mfem::Geometry::SQUARE);
     const auto& map_2d = mfem::dgsem::GetTensorDofToIJK(*fe_2d);
     for (int ld = 0; ld < fe_2d->GetDof(); ++ld)
     {
       const int i = map_2d[ld][0];
       const int j = map_2d[ld][1];
       const mfem::IntegrationPoint& ip = fe_2d->GetNodes().IntPoint(ld);
-      ctx.CheckNear(ip.x, nodes[i], 1.0e-12, "2D lexicographic x matches nodes");
-      ctx.CheckNear(ip.y, nodes[j], 1.0e-12, "2D lexicographic y matches nodes");
+      ctx.CheckNear(ip.x,
+                    nodes[i],
+                    1.0e-12,
+                    "2D lexicographic x matches nodes");
+      ctx.CheckNear(ip.y,
+                    nodes[j],
+                    1.0e-12,
+                    "2D lexicographic y matches nodes");
     }
   }
 

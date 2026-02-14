@@ -8,13 +8,17 @@
 
 #include "sedov_taylor_blast.hpp"
 
-namespace {
+namespace
+{
 
-struct SedovOptions {};
+struct SedovOptions
+{
+};
 
 } // namespace
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[])
+{
   dg_sim::CaseSpec<SedovOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "dgsem_sedov_taylor_blast";
   spec.default_mesh_path = mfem::SedovTaylorDefaultMeshPath();
@@ -33,7 +37,8 @@ int main(int argc, char *argv[]) {
   spec.callback_defaults.enable_summary = true;
   spec.callback_defaults.compute_minmax = true;
 
-  spec.configure_case = [](dg_sim::CaseConfig &cfg) {
+  spec.configure_case = [](dg_sim::CaseConfig& cfg)
+  {
     cfg.defaults.t_final = 4.0;
     cfg.defaults.vtk_save = false;
     cfg.defaults.par_ref_levels = 0;
@@ -44,11 +49,12 @@ int main(int argc, char *argv[]) {
     cfg.limiter_pipeline.krivodonova = false;
   };
 
-  spec.make_ic = [](const SedovOptions &,
-                    const dg_sim::ExampleContext &ctx, double gamma) {
+  spec.make_ic =
+    [](const SedovOptions&, const dg_sim::ExampleContext& ctx, double gamma)
+  {
     const int base_cells = 32;
     const int total_ref =
-        ctx.run_cfg.opts.ser_ref_levels + ctx.run_cfg.opts.par_ref_levels;
+      ctx.run_cfg.opts.ser_ref_levels + ctx.run_cfg.opts.par_ref_levels;
     (void)total_ref;
     const int mx = base_cells;
     const int my = base_cells;
@@ -56,21 +62,29 @@ int main(int argc, char *argv[]) {
     return dg_sim::MakeVectorFunctionIC(4, ic_fun);
   };
 
-  spec.build_markers = [](dg_sim::ExampleContext &ctx) {
+  spec.build_markers = [](dg_sim::ExampleContext& ctx)
+  {
     return dg_sim::BuildBoundaryMarkers(
-        ctx.Mesh(), {{dg_sim::BoundaryRole::Slip, {1, 2, 3, 4}}});
+      ctx.Mesh(),
+      {{dg_sim::BoundaryRole::Slip, {1, 2, 3, 4}}});
   };
 
-  spec.apply_bc = [](const SedovOptions &,
-                     const dg_sim::ExampleContext &, auto &bc,
-                     const auto &markers) { bc.AddSlipWall(markers); };
+  spec.apply_bc = [](const SedovOptions&,
+                     const dg_sim::ExampleContext&,
+                     auto& bc,
+                     const auto& markers)
+  {
+    bc.AddSlipWall(markers);
+  };
 
-  spec.postprocess = [](const SedovOptions &,
-                        const dg_sim::ExampleContext &,
-                        const dg_sim::EulerStateBundle &state,
-                        mfem::VectorCoefficient &ic) {
+  spec.postprocess = [](const SedovOptions&,
+                        const dg_sim::ExampleContext&,
+                        const dg_sim::EulerStateBundle& state,
+                        mfem::VectorCoefficient& ic)
+  {
     const mfem::real_t error = state.sol.ComputeLpError(2, ic);
-    if (mfem::Mpi::Root()) {
+    if (mfem::Mpi::Root())
+    {
       std::cout << "Solution error: " << error << std::endl;
     }
     return 0;

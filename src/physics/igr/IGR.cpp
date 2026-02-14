@@ -4,34 +4,36 @@
 #include <cmath>
 #include <limits>
 
-
 namespace dg_igr
 {
 
 // ----------------- small helpers (file-local) -----------------
-namespace {
+namespace
+{
 
-inline bool IsDGSpace(const mfem::FiniteElementSpace &fes)
+inline bool IsDGSpace(const mfem::FiniteElementSpace& fes)
 {
   // Identify DG/L2 spaces by their FECollection type
-  const mfem::FiniteElementCollection *fec = fes.FEColl(); // FE collection accessor
-  return dynamic_cast<const mfem::L2_FECollection*>(fec) != nullptr
-      || dynamic_cast<const mfem::DG_FECollection*>(fec) != nullptr;
+  const mfem::FiniteElementCollection* fec =
+    fes.FEColl(); // FE collection accessor
+  return dynamic_cast<const mfem::L2_FECollection*>(fec) != nullptr ||
+         dynamic_cast<const mfem::DG_FECollection*>(fec) != nullptr;
 }
 
-inline int SpaceOrder(const mfem::FiniteElementSpace &fes)
+inline int SpaceOrder(const mfem::FiniteElementSpace& fes)
 {
   MFEM_VERIFY(fes.GetNE() > 0, "Empty FES.");
   return fes.GetFE(0)->GetOrder();
 }
 
-inline double IPDGPenalty(const mfem::FiniteElementSpace &fes, double Cbase = 4.0)
+inline double IPDGPenalty(const mfem::FiniteElementSpace& fes,
+                          double Cbase = 4.0)
 {
   const int p = SpaceOrder(fes);
   return Cbase * (p + 1) * (p + 1);
 }
 
-inline bool IsSPD_DefaultAssumption(const mfem::FiniteElementSpace &sfes,
+inline bool IsSPD_DefaultAssumption(const mfem::FiniteElementSpace& sfes,
                                     IGRSolver::IPKind ip_kind)
 {
   // Structural policy:
@@ -49,12 +51,18 @@ inline const char* LinearSolverTypeName(IGRSolver::LinearSolverType t)
 {
   switch (t)
   {
-    case IGRSolver::LinearSolverType::Auto: return "auto";
-    case IGRSolver::LinearSolverType::CG: return "cg";
-    case IGRSolver::LinearSolverType::GMRES: return "gmres";
-    case IGRSolver::LinearSolverType::FGMRES: return "fgmres";
-    case IGRSolver::LinearSolverType::BiCGSTAB: return "bicgstab";
-    case IGRSolver::LinearSolverType::MINRES: return "minres";
+  case IGRSolver::LinearSolverType::Auto:
+    return "auto";
+  case IGRSolver::LinearSolverType::CG:
+    return "cg";
+  case IGRSolver::LinearSolverType::GMRES:
+    return "gmres";
+  case IGRSolver::LinearSolverType::FGMRES:
+    return "fgmres";
+  case IGRSolver::LinearSolverType::BiCGSTAB:
+    return "bicgstab";
+  case IGRSolver::LinearSolverType::MINRES:
+    return "minres";
   }
   return "auto";
 }
@@ -63,31 +71,38 @@ inline const char* PrecondTypeName(IGRSolver::PrecondType t)
 {
   switch (t)
   {
-    case IGRSolver::PrecondType::Auto: return "auto";
-    case IGRSolver::PrecondType::BoomerAMG: return "boomeramg";
-    case IGRSolver::PrecondType::HypreILU: return "hypreilu";
-    case IGRSolver::PrecondType::HypreEuclid: return "hypreeuclid";
-    case IGRSolver::PrecondType::ParaSails: return "parasails";
-    case IGRSolver::PrecondType::HypreSmoother: return "hypresmoother";
-    case IGRSolver::PrecondType::None: return "none";
+  case IGRSolver::PrecondType::Auto:
+    return "auto";
+  case IGRSolver::PrecondType::BoomerAMG:
+    return "boomeramg";
+  case IGRSolver::PrecondType::HypreILU:
+    return "hypreilu";
+  case IGRSolver::PrecondType::HypreEuclid:
+    return "hypreeuclid";
+  case IGRSolver::PrecondType::ParaSails:
+    return "parasails";
+  case IGRSolver::PrecondType::HypreSmoother:
+    return "hypresmoother";
+  case IGRSolver::PrecondType::None:
+    return "none";
   }
   return "auto";
 }
 
 inline bool RequiresSPD(IGRSolver::LinearSolverType solver)
 {
-  return solver == IGRSolver::LinearSolverType::CG
-      || solver == IGRSolver::LinearSolverType::MINRES;
+  return solver == IGRSolver::LinearSolverType::CG ||
+         solver == IGRSolver::LinearSolverType::MINRES;
 }
 
 inline bool IsSymmetricPC(IGRSolver::PrecondType pc)
 {
-  return pc == IGRSolver::PrecondType::BoomerAMG
-      || pc == IGRSolver::PrecondType::HypreSmoother
-      || pc == IGRSolver::PrecondType::None;
+  return pc == IGRSolver::PrecondType::BoomerAMG ||
+         pc == IGRSolver::PrecondType::HypreSmoother ||
+         pc == IGRSolver::PrecondType::None;
 }
 
-inline bool VectorIsFinite(const mfem::Vector &v)
+inline bool VectorIsFinite(const mfem::Vector& v)
 {
   const int n = v.Size();
   for (int i = 0; i < n; ++i)
@@ -110,13 +125,11 @@ inline void LogIGRFallback(const char* reason,
   {
     return;
   }
-  std::cout << "[igr-linear] event=fallback"
-            << " reason=\"" << reason << "\""
+  std::cout << "[igr-linear] event=fallback" << " reason=\"" << reason << "\""
             << " requested_solver=" << LinearSolverTypeName(requested_solver)
             << " selected_solver=" << LinearSolverTypeName(selected_solver)
             << " requested_precond=" << PrecondTypeName(requested_prec)
-            << " selected_precond=" << PrecondTypeName(selected_prec)
-            << "\n";
+            << " selected_precond=" << PrecondTypeName(selected_prec) << "\n";
 }
 
 inline void LogIGRSelection(bool warm_start,
@@ -139,18 +152,21 @@ inline void LogIGRSelection(bool warm_start,
             << " solver=" << LinearSolverTypeName(solver_choice)
             << " precond=" << PrecondTypeName(prec_choice)
             << " rtol=" << lin_rtol << " atol=" << lin_atol
-            << " maxit=" << lin_maxit
-            << "\n";
+            << " maxit=" << lin_maxit << "\n";
 }
 
 } // namespace
 
 // ---------------- IGRSolver::InvRhoCoefficient ----------------
-IGRSolver::InvRhoCoefficient::InvRhoCoefficient(const mfem::ParGridFunction& U, double rho_floor)
-  : U_(&U), rho_floor_(rho_floor) {}
+IGRSolver::InvRhoCoefficient::InvRhoCoefficient(const mfem::ParGridFunction& U,
+                                                double rho_floor)
+  : U_(&U),
+    rho_floor_(rho_floor)
+{
+}
 
-double IGRSolver::InvRhoCoefficient::Eval(mfem::ElementTransformation &T,
-                                          const mfem::IntegrationPoint &ip)
+double IGRSolver::InvRhoCoefficient::Eval(mfem::ElementTransformation& T,
+                                          const mfem::IntegrationPoint& ip)
 {
   MFEM_VERIFY(U_ != nullptr, "InvRhoCoefficient requires a valid state U.");
   T.SetIntPoint(&ip);
@@ -164,15 +180,22 @@ double IGRSolver::InvRhoCoefficient::Eval(mfem::ElementTransformation &T,
 
 // ---------------- IGRSolver::VelocityFromConsCoefficient ---------------
 IGRSolver::VelocityFromConsCoefficient::VelocityFromConsCoefficient(
-    int dim, const mfem::ParGridFunction* U, double rho_floor)
-  : mfem::VectorCoefficient(dim), U_(U), rho_floor_(rho_floor)
-{ }
-
-void IGRSolver::VelocityFromConsCoefficient::Eval(mfem::Vector &V,
-                                                  mfem::ElementTransformation &T,
-                                                  const mfem::IntegrationPoint &ip)
+  int dim,
+  const mfem::ParGridFunction* U,
+  double rho_floor)
+  : mfem::VectorCoefficient(dim),
+    U_(U),
+    rho_floor_(rho_floor)
 {
-  MFEM_VERIFY(U_ != nullptr, "VelocityFromConsCoefficient requires a valid state U.");
+}
+
+void IGRSolver::VelocityFromConsCoefficient::Eval(
+  mfem::Vector& V,
+  mfem::ElementTransformation& T,
+  const mfem::IntegrationPoint& ip)
+{
+  MFEM_VERIFY(U_ != nullptr,
+              "VelocityFromConsCoefficient requires a valid state U.");
   T.SetIntPoint(&ip);
   mfem::Vector cons;
   U_->GetVectorValue(T, ip, cons); // [rho, m(0..dim-1), E]
@@ -186,42 +209,56 @@ void IGRSolver::VelocityFromConsCoefficient::Eval(mfem::Vector &V,
 }
 
 // ---------------- IGRSolver::SigmaSourceCoefficient ----------------
-IGRSolver::SigmaSourceCoefficient::SigmaSourceCoefficient(const mfem::ParGridFunction& U,
-                                                          int dim, int num_eq,
-                                                          double alpha, double rho_floor)
-  : U_(&U), velH1_(nullptr), dim_(dim), num_eq_(num_eq),
-    alpha_(alpha), rho_floor_(rho_floor),
-    state_(num_eq), gradU_(num_eq, dim), gradu_(dim, dim)
-{ }
-
-double IGRSolver::SigmaSourceCoefficient::Eval(mfem::ElementTransformation &T,
-                                               const mfem::IntegrationPoint &ip)
+IGRSolver::SigmaSourceCoefficient::SigmaSourceCoefficient(
+  const mfem::ParGridFunction& U,
+  int dim,
+  int num_eq,
+  double alpha,
+  double rho_floor)
+  : U_(&U),
+    velH1_(nullptr),
+    dim_(dim),
+    num_eq_(num_eq),
+    alpha_(alpha),
+    rho_floor_(rho_floor),
+    state_(num_eq),
+    gradU_(num_eq, dim),
+    gradu_(dim, dim)
 {
-  MFEM_VERIFY(U_ != nullptr, "SigmaSourceCoefficient requires a valid state U.");
+}
+
+double IGRSolver::SigmaSourceCoefficient::Eval(mfem::ElementTransformation& T,
+                                               const mfem::IntegrationPoint& ip)
+{
+  MFEM_VERIFY(U_ != nullptr,
+              "SigmaSourceCoefficient requires a valid state U.");
   T.SetIntPoint(&ip);
 
   if (velH1_)
   {
     // H1Projection backend: use ∇(projected velocity)
     mfem::DenseMatrix gradv(dim_, dim_);
-    velH1_->GetVectorGradient(T, gradv);   // gradv(i,j) = ∂_j u_i
+    velH1_->GetVectorGradient(T, gradv); // gradv(i,j) = ∂_j u_i
 
     // div u
     double divu = 0.0;
-    for (int i = 0; i < dim_; ++i) { divu += gradv(i,i); }
+    for (int i = 0; i < dim_; ++i)
+    {
+      divu += gradv(i, i);
+    }
 
     // tr((∇u)^2) = sum_ij (∂_j u_i)(∂_i u_j)
     double trA2 = 0.0;
     for (int i = 0; i < dim_; ++i)
       for (int j = 0; j < dim_; ++j)
-        trA2 += gradv(i,j) * gradv(j,i);
+        trA2 += gradv(i, j) * gradv(j, i);
 
-    return alpha_ * (trA2 + divu*divu);
+    return alpha_ * (trA2 + divu * divu);
   }
 
   // BrokenDG backend: in-cell quotient rule from conservative gradients
-  U_->GetVectorValue(T, ip, state_);        // [rho, m(0..dim-1), E]
-  U_->GetVectorGradient(T, gradU_);         // rows: components, cols: spatial derivs
+  U_->GetVectorValue(T, ip, state_); // [rho, m(0..dim-1), E]
+  U_->GetVectorGradient(T, gradU_);  // rows: components, cols: spatial derivs
 
   const double rho = std::max(state_(0), rho_floor_);
 
@@ -230,7 +267,10 @@ double IGRSolver::SigmaSourceCoefficient::Eval(mfem::ElementTransformation &T,
 
   // grad of rho: row 0 in gradU_
   mfem::Vector grad_rho(dim_);
-  for (int j = 0; j < dim_; ++j) { grad_rho(j) = gradU_(0, j); }
+  for (int j = 0; j < dim_; ++j)
+  {
+    grad_rho(j) = gradU_(0, j);
+  }
 
   // Build grad(u) via quotient rule: du_i/dx_j = (rho*dm_i/dx_j - m_i*drho/dx_j)/rho^2
   const double rho2 = rho * rho;
@@ -245,7 +285,10 @@ double IGRSolver::SigmaSourceCoefficient::Eval(mfem::ElementTransformation &T,
 
   // divergence
   double divu = 0.0;
-  for (int i = 0; i < dim_; ++i) { divu += gradu_(i,i); }
+  for (int i = 0; i < dim_; ++i)
+  {
+    divu += gradu_(i, i);
+  }
 
   // tr( (∇u)^2 ) = sum_{i,j} (∂_j u_i) (∂_i u_j)
   double trA2 = 0.0;
@@ -253,18 +296,20 @@ double IGRSolver::SigmaSourceCoefficient::Eval(mfem::ElementTransformation &T,
   {
     for (int j = 0; j < dim_; ++j)
     {
-      trA2 += gradu_(i,j) * gradu_(j,i);
+      trA2 += gradu_(i, j) * gradu_(j, i);
     }
   }
 
   // Paper RHS: α ( tr((∇u)^2) + (tr ∇u)^2 )
-  return alpha_ * (trA2 + divu*divu);
+  return alpha_ * (trA2 + divu * divu);
 }
 
 // ---------------- IGRSolver core ----------------
 IGRSolver::IGRSolver(mfem::ParFiniteElementSpace& sigma_fes,
                      mfem::ParFiniteElementSpace& state_fes,
-                     int dim, int num_eq, double alpha)
+                     int dim,
+                     int num_eq,
+                     double alpha)
   : sfes_(sigma_fes),
     vfes_(state_fes),
     dim_(dim),
@@ -279,12 +324,16 @@ IGRSolver::IGRSolver(mfem::ParFiniteElementSpace& sigma_fes,
   // Create coefficients once (they hold references; we’ll update their state each call)
   state_scratch_ = 1.0;
 
-  invrho_coef_ = std::make_unique<InvRhoCoefficient>(state_scratch_, rho_floor_);
-  src_coef_    = std::make_unique<SigmaSourceCoefficient>(state_scratch_,
-                                                           dim_, num_eq_,
-                                                           alpha_, rho_floor_);
-  alpha_coef_  = std::make_unique<AlphaRefCoefficient>(alpha_);
-  ck_coef_     = std::make_unique<mfem::ProductCoefficient>(*alpha_coef_, *invrho_coef_);
+  invrho_coef_ =
+    std::make_unique<InvRhoCoefficient>(state_scratch_, rho_floor_);
+  src_coef_ = std::make_unique<SigmaSourceCoefficient>(state_scratch_,
+                                                       dim_,
+                                                       num_eq_,
+                                                       alpha_,
+                                                       rho_floor_);
+  alpha_coef_ = std::make_unique<AlphaRefCoefficient>(alpha_);
+  ck_coef_ =
+    std::make_unique<mfem::ProductCoefficient>(*alpha_coef_, *invrho_coef_);
 
   BuildBilinearForm_();
 
@@ -302,8 +351,11 @@ IGRSolver::IGRSolver(mfem::ParFiniteElementSpace& sigma_fes,
 
 void IGRSolver::SetAlpha(double a)
 {
-  alpha_ = a;              // alpha_coef reads this by reference (see above)
-  if (src_coef_) { src_coef_->SetAlpha(a); }
+  alpha_ = a; // alpha_coef reads this by reference (see above)
+  if (src_coef_)
+  {
+    src_coef_->SetAlpha(a);
+  }
 }
 
 void IGRSolver::SetSmoother(SmootherType t)
@@ -326,15 +378,21 @@ void IGRSolver::SetIPKind(IPKind k)
 
 void IGRSolver::SetSweeps(int regular_sweeps, int warm_start_sweeps)
 {
-  regular_sweeps_    = std::max(0, regular_sweeps);
+  regular_sweeps_ = std::max(0, regular_sweeps);
   warm_start_sweeps_ = std::max(regular_sweeps_, warm_start_sweeps);
 }
 
 void IGRSolver::SetRhoFloor(double rho_floor)
 {
   rho_floor_ = rho_floor;
-  if (invrho_coef_) { invrho_coef_->SetRhoFloor(rho_floor_); }
-  if (src_coef_)    { src_coef_->SetRhoFloor(rho_floor_); }
+  if (invrho_coef_)
+  {
+    invrho_coef_->SetRhoFloor(rho_floor_);
+  }
+  if (src_coef_)
+  {
+    src_coef_->SetRhoFloor(rho_floor_);
+  }
 }
 
 void IGRSolver::SetDirichletBC(const mfem::Array<int>& ess_bdr)
@@ -351,7 +409,10 @@ static int GetSpaceOrder_(const mfem::ParFiniteElementSpace& fes)
 
 void IGRSolver::EnsureH1VelocitySpace_()
 {
-  if (backend_ != GradBackend::H1Projection) { return; }
+  if (backend_ != GradBackend::H1Projection)
+  {
+    return;
+  }
 
   mfem::ParMesh* pm = vfes_.GetParMesh();
   MFEM_VERIFY(pm, "Expected mfem::ParMesh for state space.");
@@ -369,10 +430,14 @@ void IGRSolver::EnsureH1VelocitySpace_()
   }
   if (need_make)
   {
-    h1_vec_fec_ = std::make_unique<mfem::H1_FECollection>(p_h1, pm->Dimension());
-    h1_vec_fes_ = std::make_unique<mfem::ParFiniteElementSpace>(pm, h1_vec_fec_.get(), /*vdim=*/dim_);
-    vel_h1_     = std::make_unique<mfem::ParGridFunction>(h1_vec_fes_.get());
-    *vel_h1_    = 0.0;
+    h1_vec_fec_ =
+      std::make_unique<mfem::H1_FECollection>(p_h1, pm->Dimension());
+    h1_vec_fes_ =
+      std::make_unique<mfem::ParFiniteElementSpace>(pm,
+                                                    h1_vec_fec_.get(),
+                                                    /*vdim=*/dim_);
+    vel_h1_ = std::make_unique<mfem::ParGridFunction>(h1_vec_fes_.get());
+    *vel_h1_ = 0.0;
   }
 }
 
@@ -392,7 +457,7 @@ void IGRSolver::BuildBilinearForm_()
     const double sigma = static_cast<double>(ip_kind_); // -1(SIPG), 0, +1
     const double kappa = IPDGPenalty(sfes_);            // penalty scaling
     a_->AddInteriorFaceIntegrator(
-        new mfem::DGDiffusionIntegrator(*ck_coef_, sigma, kappa));
+      new mfem::DGDiffusionIntegrator(*ck_coef_, sigma, kappa));
     // For the IGR sigma equation, default behavior is natural boundary
     // conditions. Do not add DG boundary diffusion terms unless a specific
     // weak boundary closure is implemented.
@@ -462,17 +527,28 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
 
 void IGRSolver::DoSmootherSweeps(int sweeps, bool /*warm_start*/)
 {
-  mfem::HypreParMatrix *A_hypre = Ah_.As<mfem::HypreParMatrix>();
-  MFEM_VERIFY(A_hypre != nullptr, "IGR: Assembled operator is not mfem::HypreParMatrix.");
+  mfem::HypreParMatrix* A_hypre = Ah_.As<mfem::HypreParMatrix>();
+  MFEM_VERIFY(A_hypre != nullptr,
+              "IGR: Assembled operator is not mfem::HypreParMatrix.");
 
   mfem::HypreSmoother S(*A_hypre);
   switch (smoot_)
   {
-    case SmootherType::Jacobi:    S.SetType(mfem::HypreSmoother::Jacobi);   break;
-    case SmootherType::L1Jacobi:  S.SetType(mfem::HypreSmoother::l1Jacobi); break;
-    case SmootherType::L1GS:      S.SetType(mfem::HypreSmoother::l1GS);     break;
-    case SmootherType::L1GStr:    S.SetType(mfem::HypreSmoother::l1GStr);   break;
-    case SmootherType::GS:        S.SetType(mfem::HypreSmoother::GS);       break;
+  case SmootherType::Jacobi:
+    S.SetType(mfem::HypreSmoother::Jacobi);
+    break;
+  case SmootherType::L1Jacobi:
+    S.SetType(mfem::HypreSmoother::l1Jacobi);
+    break;
+  case SmootherType::L1GS:
+    S.SetType(mfem::HypreSmoother::l1GS);
+    break;
+  case SmootherType::L1GStr:
+    S.SetType(mfem::HypreSmoother::l1GStr);
+    break;
+  case SmootherType::GS:
+    S.SetType(mfem::HypreSmoother::GS);
+    break;
   }
   S.SetPositiveDiagonal(true);
 
@@ -482,7 +558,8 @@ void IGRSolver::DoSmootherSweeps(int sweeps, bool /*warm_start*/)
     // r = b - A x
     r = B_;
     A_hypre->Mult(X_, r);
-    r.Neg(); r += B_;
+    r.Neg();
+    r += B_;
 
     // z ≈ M^{-1} r  (one application of the smoother/preconditioner)
     z = 0.0;
@@ -497,11 +574,12 @@ void IGRSolver::DoSmootherSweeps(int sweeps, bool /*warm_start*/)
 
 void IGRSolver::SolveEllipticSystem_(bool warm_start)
 {
-  mfem::HypreParMatrix *A = Ah_.As<mfem::HypreParMatrix>();
-  MFEM_VERIFY(A != nullptr, "IGR: Assembled operator is not mfem::HypreParMatrix.");
+  mfem::HypreParMatrix* A = Ah_.As<mfem::HypreParMatrix>();
+  MFEM_VERIFY(A != nullptr,
+              "IGR: Assembled operator is not mfem::HypreParMatrix.");
 
   MPI_Comm comm = sfes_.GetComm();
-  const bool is_dg  = IsDGSpace(sfes_);
+  const bool is_dg = IsDGSpace(sfes_);
   const bool spd_ok = IsSPD_DefaultAssumption(sfes_, ip_kind_);
   const bool prev_linear_converged = last_linear_converged_;
   const double prev_linear_final_norm = last_linear_final_norm_;
@@ -528,7 +606,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     const LinearSolverType prev = solver_choice;
     solver_choice = LinearSolverType::GMRES;
     LogIGRFallback("operator-not-spd",
-                   prev, solver_choice, prec_type_, prec_type_);
+                   prev,
+                   solver_choice,
+                   prec_type_,
+                   prec_type_);
   }
 
   // --- Choose preconditioner (Auto policy is space-aware) ---
@@ -548,7 +629,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     const PrecondType prev = prec_choice;
     prec_choice = PrecondType::BoomerAMG;
     LogIGRFallback("spd-solver-with-nonsymmetric-preconditioner",
-                   requested_solver, solver_choice, prev, prec_choice);
+                   requested_solver,
+                   solver_choice,
+                   prev,
+                   prec_choice);
   }
 
   std::unique_ptr<mfem::Solver> prec;
@@ -587,11 +671,21 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     auto sm = std::make_unique<mfem::HypreSmoother>(*A);
     switch (smoot_)
     {
-      case SmootherType::Jacobi:   sm->SetType(mfem::HypreSmoother::Jacobi);   break;
-      case SmootherType::L1Jacobi: sm->SetType(mfem::HypreSmoother::l1Jacobi); break;
-      case SmootherType::L1GS:     sm->SetType(mfem::HypreSmoother::l1GS);     break;
-      case SmootherType::L1GStr:   sm->SetType(mfem::HypreSmoother::l1GStr);   break;
-      case SmootherType::GS:       sm->SetType(mfem::HypreSmoother::GS);       break;
+    case SmootherType::Jacobi:
+      sm->SetType(mfem::HypreSmoother::Jacobi);
+      break;
+    case SmootherType::L1Jacobi:
+      sm->SetType(mfem::HypreSmoother::l1Jacobi);
+      break;
+    case SmootherType::L1GS:
+      sm->SetType(mfem::HypreSmoother::l1GS);
+      break;
+    case SmootherType::L1GStr:
+      sm->SetType(mfem::HypreSmoother::l1GStr);
+      break;
+    case SmootherType::GS:
+      sm->SetType(mfem::HypreSmoother::GS);
+      break;
     }
     sm->SetPositiveDiagonal(true);
     prec = std::move(sm);
@@ -600,8 +694,14 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
 
   if (lin_print_ > 0)
   {
-    LogIGRSelection(warm_start, is_dg, spd_ok, solver_choice, prec_choice,
-                    lin_rtol_, lin_atol_, lin_maxit_);
+    LogIGRSelection(warm_start,
+                    is_dg,
+                    spd_ok,
+                    solver_choice,
+                    prec_choice,
+                    lin_rtol_,
+                    lin_atol_,
+                    lin_maxit_);
   }
 
   // Warm start is only safe if the prior solve produced a usable iterate.
@@ -616,7 +716,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       if (lin_print_ > 0)
       {
         LogIGRFallback("warm-start-disabled-after-unsuccessful-previous-solve",
-                       solver_choice, solver_choice, prec_choice, prec_choice);
+                       solver_choice,
+                       solver_choice,
+                       prec_choice,
+                       prec_choice);
       }
     }
   }
@@ -631,7 +734,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   auto configure_solver = [&](mfem::IterativeSolver& solver)
   {
     solver.SetOperator(*A);
-    if (prec) { solver.SetPreconditioner(*prec); }
+    if (prec)
+    {
+      solver.SetPreconditioner(*prec);
+    }
     solver.SetRelTol(lin_rtol_);
     solver.SetAbsTol(lin_atol_);
     solver.SetMaxIter(lin_maxit_);
@@ -698,7 +804,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
 
   const auto solve_stop = std::chrono::steady_clock::now();
   last_linear_solve_seconds_ =
-      std::chrono::duration<double>(solve_stop - solve_start).count();
+    std::chrono::duration<double>(solve_stop - solve_start).count();
   total_linear_solve_seconds_ += last_linear_solve_seconds_;
   ++linear_solve_calls_;
   total_linear_iters_ += last_linear_iters_;
@@ -721,8 +827,8 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U, bool warm_start)
   if (solve_mode_ == SolveMode::SmootherSweeps)
   {
     const int sweeps = (first_call_ && warm_start)
-                       ? std::max(warm_start_sweeps_, regular_sweeps_)
-                       : regular_sweeps_;
+                         ? std::max(warm_start_sweeps_, regular_sweeps_)
+                         : regular_sweeps_;
     DoSmootherSweeps(sweeps, warm_start);
   }
   else

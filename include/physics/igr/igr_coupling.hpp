@@ -22,7 +22,11 @@ public:
                ::dg_igr::IGRSolver& igr,
                ParGridFunction& state)
     : TimeDependentOperator(base.Height()),
-      base_(base), igr_(igr), state_(state) {}
+      base_(base),
+      igr_(igr),
+      state_(state)
+  {
+  }
 
   void SetTime(double t) override { base_.SetTime(t); }
 
@@ -44,8 +48,8 @@ public:
 
 private:
   DGHyperbolicConservationLaws& base_;
-  ::dg_igr::IGRSolver&          igr_;
-  ParGridFunction&              state_;  // view of current state (vdim=num_eq)
+  ::dg_igr::IGRSolver& igr_;
+  ParGridFunction& state_; // view of current state (vdim=num_eq)
 };
 
 } // namespace mfem

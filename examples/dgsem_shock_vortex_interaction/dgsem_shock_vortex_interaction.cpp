@@ -15,7 +15,7 @@ using ShockVortexOptions = dg_sim::EmptyCaseOptions;
 
 } // namespace
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
   dg_sim::CaseSpec<ShockVortexOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "dgsem_shock_vortex_interaction";
@@ -47,22 +47,25 @@ int main(int argc, char *argv[])
     const mfem::real_t Mv = 0.25;
     const mfem::real_t shock_smoothing = 0.05;
     const int base_cells = 32;
-    const int total_ref = ctx.run_cfg.opts.ser_ref_levels
-                          + ctx.run_cfg.opts.par_ref_levels;
+    const int total_ref =
+      ctx.run_cfg.opts.ser_ref_levels + ctx.run_cfg.opts.par_ref_levels;
     const int mx = base_cells << total_ref;
     const int my = base_cells << total_ref;
-    auto ic_fun = mfem::GetShockVortexInoueHattoriInit(
-        gamma, mx, my, Ms, Mv, shock_smoothing);
+    auto ic_fun = mfem::GetShockVortexInoueHattoriInit(gamma,
+                                                       mx,
+                                                       my,
+                                                       Ms,
+                                                       Mv,
+                                                       shock_smoothing);
     return dg_sim::MakeVectorFunctionIC(4, ic_fun);
   };
 
   spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
-    return dg_sim::BuildBoundaryMarkers(
-        ctx.Mesh(),
-        {{dg_sim::BoundaryRole::Inlet, {2}},
-         {dg_sim::BoundaryRole::Outlet, {4}},
-         {dg_sim::BoundaryRole::Slip, {1, 3}}});
+    return dg_sim::BuildBoundaryMarkers(ctx.Mesh(),
+                                        {{dg_sim::BoundaryRole::Inlet, {2}},
+                                         {dg_sim::BoundaryRole::Outlet, {4}},
+                                         {dg_sim::BoundaryRole::Slip, {1, 3}}});
   };
 
   spec.apply_bc = [](const ShockVortexOptions&,

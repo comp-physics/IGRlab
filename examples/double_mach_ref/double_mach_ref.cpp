@@ -69,9 +69,13 @@ struct InflowOptions
 inline void AddInflowOptions(mfem::OptionsParser& args,
                              InflowOptions& inflow_opts)
 {
-  args.AddOption(&inflow_opts.vx, "-vx", "--velocity-x",
+  args.AddOption(&inflow_opts.vx,
+                 "-vx",
+                 "--velocity-x",
                  "Free-stream / inflow velocity x-component.");
-  args.AddOption(&inflow_opts.vy, "-vy", "--velocity-y",
+  args.AddOption(&inflow_opts.vy,
+                 "-vy",
+                 "--velocity-y",
                  "Free-stream / inflow velocity y-component.");
 }
 
@@ -82,14 +86,13 @@ struct DoubleMachOptions
 
 } // namespace
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
   dg_sim::CaseSpec<DoubleMachOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "double_mach_ref";
   spec.default_mesh_path = mfem::DoubleMachRefDefaultMeshPath();
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
-  spec.need_sigma = true;
   spec.need_h1 = true;
   spec.diagnostics.h1_diagnostics = true;
   spec.glvis.precision = 8;
@@ -112,8 +115,8 @@ int main(int argc, char *argv[])
   {
     const int base_cells_x = 32;
     const int base_cells_y = 126;
-    const int total_ref = ctx.run_cfg.opts.ser_ref_levels
-                          + ctx.run_cfg.opts.par_ref_levels;
+    const int total_ref =
+      ctx.run_cfg.opts.ser_ref_levels + ctx.run_cfg.opts.par_ref_levels;
     const int mx = base_cells_x << total_ref;
     const int my = base_cells_y << total_ref;
     auto ic_fun = mfem::DoubleMachReflectionInitialCondition(mx, my, gamma);
@@ -123,12 +126,12 @@ int main(int argc, char *argv[])
   spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
     return dg_sim::BuildBoundaryMarkers(
-        ctx.Mesh(),
-        {{dg_sim::BoundaryRole::BottomInlet, {1}},
-         {dg_sim::BoundaryRole::BottomWall, {5}},
-         {dg_sim::BoundaryRole::Outlet, {2}},
-         {dg_sim::BoundaryRole::Top, {3}},
-         {dg_sim::BoundaryRole::Inlet, {4}}});
+      ctx.Mesh(),
+      {{dg_sim::BoundaryRole::BottomInlet, {1}},
+       {dg_sim::BoundaryRole::BottomWall, {5}},
+       {dg_sim::BoundaryRole::Outlet, {2}},
+       {dg_sim::BoundaryRole::Top, {3}},
+       {dg_sim::BoundaryRole::Inlet, {4}}});
   };
 
   spec.apply_bc = [](const DoubleMachOptions& opts,

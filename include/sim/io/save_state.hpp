@@ -45,11 +45,12 @@ inline void SaveInitialEulerState(ExampleContext& ctx,
 }
 
 /// @brief Save the final mesh + conservative state in GLVis-compatible files.
-inline void SaveFinalEulerState(ExampleContext& ctx,
-                                mfem::ParGridFunction& sol,
-                                int precision,
-                                const std::string& mesh_prefix = "euler-mesh-final",
-                                const std::string& field_prefix = "euler")
+inline void
+SaveFinalEulerState(ExampleContext& ctx,
+                    mfem::ParGridFunction& sol,
+                    int precision,
+                    const std::string& mesh_prefix = "euler-mesh-final",
+                    const std::string& field_prefix = "euler")
 {
   std::ostringstream mesh_name;
   mesh_name << mesh_prefix << "." << std::setfill('0') << std::setw(6)

@@ -6,7 +6,9 @@ namespace mfem
 // ---------- SupersonicInletState ----------
 
 SupersonicInletState::SupersonicInletState(const Vector& Uin)
-  : Uin_(Uin) {}
+  : Uin_(Uin)
+{
+}
 
 void SupersonicInletState::Eval(const Vector&,
                                 const Vector&,
@@ -29,7 +31,9 @@ void SupersonicOutletState::Eval(const Vector& Uminus,
 // ---------- SlipWallState ----------
 
 SlipWallState::SlipWallState(int dim)
-  : dim_(dim) {}
+  : dim_(dim)
+{
+}
 
 void SlipWallState::Eval(const Vector& Uminus,
                          const Vector& nor,
@@ -44,11 +48,17 @@ void SlipWallState::Eval(const Vector& Uminus,
   // Unit normal from scaled normal
   Vector nhat(nor);
   const double nrm = nhat.Norml2();
-  if (nrm > 0.0) { nhat /= nrm; }
+  if (nrm > 0.0)
+  {
+    nhat /= nrm;
+  }
 
   // Reconstruct velocity u^- from momentum
   Vector u(dim_);
-  for (int d = 0; d < dim_; ++d) { u(d) = Uminus(1 + d) / rho; }
+  for (int d = 0; d < dim_; ++d)
+  {
+    u(d) = Uminus(1 + d) / rho;
+  }
 
   // Reflect normal component
   const double un = InnerProduct(u, nhat);
