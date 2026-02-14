@@ -404,6 +404,8 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
   // Needed for DG/IPDG assembly: variable coeffs evaluated on shared faces
   // will read U on neighbor elements.
   const_cast<mfem::ParGridFunction&>(U).ExchangeFaceNbrData();
+  MFEM_VERIFY(VectorIsFinite(U),
+              "IGR state contains non-finite values before linear assembly.");
 
   // Refresh coefficient views of the current state and params
   invrho_coef_->SetState(U);
@@ -501,6 +503,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   MPI_Comm comm = sfes_.GetComm();
   const bool is_dg  = IsDGSpace(sfes_);
   const bool spd_ok = IsSPD_DefaultAssumption(sfes_, ip_kind_);
+  const bool prev_linear_converged = last_linear_converged_;
+  const double prev_linear_final_norm = last_linear_final_norm_;
 
   last_linear_iters_ = 0;
   last_linear_converged_ = false;
@@ -606,7 +610,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   bool enable_warm_start = warm_start;
   if (enable_warm_start && linear_solve_calls_ > 0)
   {
-    if (!last_linear_converged_ || !std::isfinite(last_linear_final_norm_))
+    if (!prev_linear_converged || !std::isfinite(prev_linear_final_norm))
     {
       enable_warm_start = false;
       if (lin_print_ > 0)

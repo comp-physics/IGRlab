@@ -131,7 +131,8 @@ inline std::pair<double, double> ComputeGlobalMinMax(const mfem::ParGridFunction
 inline RunSummary BuildRunSummary(const ExampleContext& ctx,
                                   const TimeLoopResult& result,
                                   double elapsed_seconds,
-                                  int num_ranks)
+                                  int num_ranks,
+                                  const dg_igr::IGRSolver* igr = nullptr)
 {
   RunSummary summary;
   summary.steps = result.steps;
@@ -139,6 +140,18 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
   summary.local_dofs = static_cast<int>(ctx.spaces.vfes.TrueVSize());
   summary.global_dofs = static_cast<long long>(ctx.spaces.vfes.GlobalTrueVSize());
   summary.ranks = num_ranks;
+  if (igr)
+  {
+    summary.has_igr = true;
+    summary.igr_linear_calls = igr->GetLinearSolveCalls();
+    summary.igr_linear_converged_calls = igr->GetTotalLinearConvergedCalls();
+    summary.igr_linear_avg_iters = igr->GetAverageLinearIterations();
+    summary.igr_linear_solve_seconds = igr->GetTotalLinearSolveSeconds();
+    summary.igr_linear_solve_fraction =
+        (elapsed_seconds > 0.0)
+            ? (summary.igr_linear_solve_seconds / elapsed_seconds)
+            : 0.0;
+  }
 
   if (result.steps <= 0 || summary.local_dofs <= 0 || summary.global_dofs <= 0)
   {
@@ -157,14 +170,48 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
   return summary;
 }
 
+inline void FillIGRTimeInfo(TimeLoopInfo& info,
+                            double elapsed,
+                            const dg_igr::IGRSolver* igr_solver)
+{
+  if (!igr_solver)
+  {
+    return;
+  }
+  info.has_igr = true;
+  info.igr_linear_calls = igr_solver->GetLinearSolveCalls();
+  info.igr_linear_converged_calls =
+      igr_solver->GetTotalLinearConvergedCalls();
+  info.igr_linear_avg_iters = igr_solver->GetAverageLinearIterations();
+  info.igr_linear_solve_seconds = igr_solver->GetTotalLinearSolveSeconds();
+  info.igr_linear_solve_fraction =
+      (elapsed > 0.0) ? (info.igr_linear_solve_seconds / elapsed) : 0.0;
+}
+
 inline void PrintSummaryBox(const RunSummary& summary)
 {
+  const auto igr_line = [&summary]() -> std::string
+  {
+    if (!summary.has_igr)
+    {
+      return "IGR linear solve: disabled";
+    }
+    std::ostringstream os;
+    os << "IGR linear solve: " << FormatFixed(summary.igr_linear_solve_seconds)
+       << " s (" << FormatFixed(100.0 * summary.igr_linear_solve_fraction, 2)
+       << "%) | calls: " << summary.igr_linear_calls
+       << " | conv: " << summary.igr_linear_converged_calls
+       << " | avg iters: " << FormatFixed(summary.igr_linear_avg_iters, 2);
+    return os.str();
+  };
+
   if (summary.steps <= 0)
   {
     PrintBox({
         "Summary",
         "steps: 0",
         "elapsed: " + FormatFixed(summary.elapsed) + " s",
+        igr_line(),
         "dofs (local/global): " +
             std::to_string(static_cast<long long>(summary.local_dofs)) + " / " +
             std::to_string(static_cast<long long>(summary.global_dofs)),
@@ -177,6 +224,7 @@ inline void PrintSummaryBox(const RunSummary& summary)
       "Summary",
       "steps: " + std::to_string(summary.steps) +
           " | elapsed: " + FormatFixed(summary.elapsed) + " s",
+      igr_line(),
       "avg/step: " + FormatSci(summary.avg_step) + " s",
       "avg/step/dof (local): " + FormatSci(summary.avg_step_per_dof_local) + " s",
       "avg/step/dof/rank: " + FormatSci(summary.avg_step_per_dof_rank) + " s",
@@ -257,6 +305,18 @@ inline TimeLoopCallbacks MakeDefaultTimeLoopCallbacks(const DefaultCallbackConfi
                       FormatSci(info.base.avg_step_per_dof_local) + " s");
       lines.push_back("avg/step/dof/rank: " +
                       FormatSci(info.base.avg_step_per_dof_rank) + " s");
+      if (info.base.has_igr)
+      {
+        lines.push_back("IGR linear solve: " +
+                        FormatFixed(info.base.igr_linear_solve_seconds) + " s (" +
+                        FormatFixed(100.0 * info.base.igr_linear_solve_fraction, 2) +
+                        "%) | calls: " +
+                        std::to_string(info.base.igr_linear_calls) +
+                        " | conv: " +
+                        std::to_string(info.base.igr_linear_converged_calls) +
+                        " | avg iters: " +
+                        FormatFixed(info.base.igr_linear_avg_iters, 2));
+      }
       lines.push_back("dofs (local/global): " +
                       std::to_string(static_cast<long long>(info.base.local_dofs)) +
                       " / " +
@@ -311,10 +371,11 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
   EulerVisWindows* glvis_windows = io.glvis_windows;
   bool* glvis_enabled = io.glvis_enabled;
   mfem::ParaViewDataCollection* paraview = io.paraview;
+  dg_igr::IGRSolver* igr_solver = bundle.field_list.igr;
   TimeLoopHooks hooks;
   hooks.on_visualize = [&, start_time, local_dofs, global_dofs,
                         glvis_windows, glvis_enabled, num_procs_value,
-                        my_rank_value, callbacks](int step,
+                        my_rank_value, callbacks, igr_solver](int step,
                                       mfem::real_t t,
                                       mfem::real_t dt_real,
                                       bool)
@@ -344,6 +405,7 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
       info.avg_step = avg_step;
       info.avg_step_per_dof_local = avg_step_per_dof_local;
       info.avg_step_per_dof_rank = avg_step_per_dof_rank;
+      FillIGRTimeInfo(info, elapsed, igr_solver);
       callbacks.on_alive(info);
     }
     if (glvis_enabled && *glvis_enabled && glvis_windows)
@@ -380,7 +442,7 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
   };
 
   hooks.on_analysis = [&, start_time, local_dofs, global_dofs,
-                       num_procs_value, callbacks](int step,
+                       num_procs_value, callbacks, igr_solver](int step,
                                         mfem::real_t t,
                                         mfem::real_t dt_real,
                                         bool done)
@@ -410,6 +472,7 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
       info.base.avg_step = avg_step;
       info.base.avg_step_per_dof_local = avg_step_per_dof_local;
       info.base.avg_step_per_dof_rank = avg_step_per_dof_rank;
+      FillIGRTimeInfo(info.base, elapsed, igr_solver);
 
       if (callbacks.wants_minmax)
       {

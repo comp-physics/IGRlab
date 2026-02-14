@@ -20,6 +20,7 @@
 #include "sim/context/example_context.hpp"
 #include "sim/context/mesh_build.hpp"
 #include "sim/io/save_state.hpp"
+#include "sim/io/run_metadata.hpp"
 #include "sim/io/vis_helpers.hpp"
 #include "sim/io/vtk_helpers.hpp"
 #include "sim/state/euler_state_bundle.hpp"
@@ -93,6 +94,7 @@ inline bool RunEulerCase(ExampleContext& ctx,
                                const TimeLoopCallbacks& callbacks,
                                int precision,
                                OnOpenCallback&& on_open_callback,
+                               RunSummary* summary_out = nullptr,
                                double c_alpha_value =
                                   std::numeric_limits<double>::quiet_NaN(),
                                bool print_dataset_name = false)
@@ -191,8 +193,18 @@ inline bool RunEulerCase(ExampleContext& ctx,
     std::cout << " done, " << elapsed << "s." << std::endl;
     if (callbacks.on_summary)
     {
-      const RunSummary summary = BuildRunSummary(ctx, result, elapsed, num_procs);
+      const RunSummary summary = BuildRunSummary(
+          ctx, result, elapsed, num_procs, bundle.field_list.igr);
+      if (summary_out)
+      {
+        *summary_out = summary;
+      }
       callbacks.on_summary(summary);
+    }
+    else if (summary_out)
+    {
+      *summary_out = BuildRunSummary(
+          ctx, result, elapsed, num_procs, bundle.field_list.igr);
     }
   }
   return true;
@@ -208,12 +220,13 @@ inline bool RunEulerCase(ExampleContext& ctx,
                                bool& glvis_enabled,
                                const TimeLoopCallbacks& callbacks,
                                int precision,
+                               RunSummary* summary_out = nullptr,
                                double c_alpha_value =
                                   std::numeric_limits<double>::quiet_NaN(),
                                bool print_dataset_name = false)
 {
   return RunEulerCase(ctx, case_cfg, run_cfg, bundle, rk3, op,
-                      glvis_enabled, callbacks, precision, []() {},
+                      glvis_enabled, callbacks, precision, []() {}, summary_out,
                       c_alpha_value, print_dataset_name);
 }
 
@@ -324,6 +337,8 @@ struct Solver
     TimeLoopCallbacks callbacks = spec.make_callbacks
         ? spec.make_callbacks(ctx, state_bundle)
         : MakeDefaultTimeLoopCallbacks(spec.callback_defaults);
+    RunSummary captured_summary{};
+    bool captured_summary_valid = false;
 
     std::unique_ptr<H1Diagnostics> h1_diag;
     std::unique_ptr<L2Diagnostics> l2_diag;
@@ -377,11 +392,16 @@ struct Solver
               return RunEulerCase(
                   ctx, case_cfg, run_cfg, state_bundle, rk3, op,
                   glvis_enabled, callbacks, spec.glvis.precision, on_open,
+                  &captured_summary,
                   vtk_c_alpha, spec.vtk.print_dataset_name);
         });
+    captured_summary_valid = ok;
 
     if (!ok)
     {
+      WriteRunMetadataSidecar(case_cfg, run_cfg,
+                              captured_summary_valid ? &captured_summary : nullptr,
+                              igr.get(), vtk_c_alpha, argc, argv, /*success=*/false);
       return 2;
     }
 
@@ -402,6 +422,10 @@ struct Solver
     }
 
     SaveFinalEulerState(ctx, state_bundle.sol, spec.glvis.precision);
+
+    WriteRunMetadataSidecar(case_cfg, run_cfg,
+                            captured_summary_valid ? &captured_summary : nullptr,
+                            igr.get(), vtk_c_alpha, argc, argv, /*success=*/true);
 
     if (spec.postprocess)
     {

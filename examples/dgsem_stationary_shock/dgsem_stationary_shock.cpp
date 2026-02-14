@@ -41,7 +41,7 @@ int main(int argc, char *argv[])
     cfg.defaults.vtk_save = true;
     cfg.defaults.par_ref_levels = 0;
     cfg.defaults.dgsem_volume_flux = "central";
-    cfg.defaults.dgsem_volume_dissipation = "llf";
+    cfg.defaults.dgsem_volume_dissipation = "none";
     cfg.defaults.dgsem_surface_flux = "rusanov";
     cfg.rk3_config.limit_initial = false;
 
