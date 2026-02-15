@@ -48,6 +48,7 @@ struct EulerVisWindows
 struct H1Diagnostics
 {
   mfem::ParGridFunction u_h1;
+  std::unique_ptr<mfem::ParFiniteElementSpace> h1_scalar_fes;
   mfem::ParGridFunction g_umag;
   mfem::ParGridFunction g_div;
   mfem::ParGridFunction g_gfrob;
@@ -59,9 +60,14 @@ struct H1Diagnostics
                 int dim_in,
                 double rho_floor)
     : u_h1(&h1_vfes),
-      g_umag(&h1_vfes),
-      g_div(&h1_vfes),
-      g_gfrob(&h1_vfes),
+      h1_scalar_fes(
+        std::make_unique<mfem::ParFiniteElementSpace>(h1_vfes.GetParMesh(),
+                                                      h1_vfes.FEColl(),
+                                                      /*vdim=*/1,
+                                                      mfem::Ordering::byNODES)),
+      g_umag(h1_scalar_fes.get()),
+      g_div(h1_scalar_fes.get()),
+      g_gfrob(h1_scalar_fes.get()),
       ucoef(dim_in, &sol, rho_floor),
       dim(dim_in)
   {
@@ -73,13 +79,17 @@ struct H1Diagnostics
 
   void Update()
   {
-    u_h1.ProjectCoefficient(ucoef);
+    // u = m/rho is discontinuous across DG faces; average shared H1 dofs
+    // arithmetically so the projected field is partition-independent.
+    u_h1.ProjectDiscCoefficient(ucoef, mfem::GridFunction::ARITHMETIC);
     mfem::GradFrobNormCoeff cF(&u_h1, dim);
     mfem::DivCoeff cD(&u_h1, dim);
     mfem::VelMagCoeff cM(&u_h1, dim);
-    g_gfrob.ProjectCoefficient(cF);
-    g_div.ProjectCoefficient(cD);
-    g_umag.ProjectCoefficient(cM);
+    // grad-based diagnostics are also discontinuous; keep H1 exports
+    // partition-consistent by using discontinuous projection with averaging.
+    g_gfrob.ProjectDiscCoefficient(cF, mfem::GridFunction::ARITHMETIC);
+    g_div.ProjectDiscCoefficient(cD, mfem::GridFunction::ARITHMETIC);
+    g_umag.ProjectDiscCoefficient(cM, mfem::GridFunction::ARITHMETIC);
   }
 };
 

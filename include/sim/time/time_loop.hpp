@@ -115,8 +115,7 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
   mfem::real_t t = 0.0;
   const mfem::real_t dt_min = std::max<mfem::real_t>(0.0, cfg.dt_min);
 
-  auto CheckDtMinimum = [&](mfem::real_t dt_value,
-                            const char* stage) -> bool
+  auto CheckDtMinimum = [&](mfem::real_t dt_value, const char* stage) -> bool
   {
     if (dt_min <= 0.0)
     {

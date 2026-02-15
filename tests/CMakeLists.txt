@@ -14,6 +14,7 @@ add_executable(dg_igr_unit_tests
   test_bc.cpp
   test_igr.cpp
   test_time_defaults.cpp
+  test_diagnostics.cpp
 )
 
 target_link_libraries(dg_igr_unit_tests PRIVATE igr_mfem mfem)
@@ -34,6 +35,7 @@ add_test(NAME dg_igr_dgsem_igr_tests COMMAND dg_igr_unit_tests --dgsem-igr)
 add_test(NAME dg_igr_bc_tests COMMAND dg_igr_unit_tests --bc)
 add_test(NAME dg_igr_igr_tests COMMAND dg_igr_unit_tests --igr)
 add_test(NAME dg_igr_time_defaults_tests COMMAND dg_igr_unit_tests --time-defaults)
+add_test(NAME dg_igr_diagnostics_tests COMMAND dg_igr_unit_tests --diagnostics)
 
 # MPI parity checks: generate a 1-rank reference and compare against 2 ranks.
 if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
@@ -73,6 +75,16 @@ if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
             ${MPIEXEC_POSTFLAGS}
   )
   set_tests_properties(dg_igr_dgsem_operator_mpi_2rank PROPERTIES
+    LABELS "mpi"
+    TIMEOUT 120
+  )
+
+  add_test(NAME dg_igr_diagnostics_mpi_2rank
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_unit_tests> --diagnostics
+            ${MPIEXEC_POSTFLAGS}
+  )
+  set_tests_properties(dg_igr_diagnostics_mpi_2rank PROPERTIES
     LABELS "mpi"
     TIMEOUT 120
   )

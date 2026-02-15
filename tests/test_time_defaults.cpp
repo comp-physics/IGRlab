@@ -121,13 +121,13 @@ int RunTimeDefaultsTests(TestContext& ctx)
   bool glvis_enabled = false;
   io.glvis_enabled = &glvis_enabled;
 
-  dg_sim::TimeLoopHooks hooks = dg_sim::MakeEulerTimeLoopHooks(
-    example_ctx,
-    bundle,
-    mfem::Mpi::WorldSize(),
-    mfem::Mpi::WorldRank(),
-    io,
-    callbacks);
+  dg_sim::TimeLoopHooks hooks =
+    dg_sim::MakeEulerTimeLoopHooks(example_ctx,
+                                   bundle,
+                                   mfem::Mpi::WorldSize(),
+                                   mfem::Mpi::WorldRank(),
+                                   io,
+                                   callbacks);
 
   ctx.Check(static_cast<bool>(hooks.on_visualize),
             "time hooks: on_visualize is wired");
@@ -145,7 +145,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
 
   ctx.Check(last_alive.step == 5 && !last_alive.is_final,
             "time hooks: alive payload carries step/final flag");
-  ctx.Check(last_save.cycle == 3 && !last_save.is_initial && !last_save.is_final,
+  ctx.Check(last_save.cycle == 3 && !last_save.is_initial &&
+              !last_save.is_final,
             "time hooks: save payload carries cycle/flags");
   ctx.Check(last_analysis.base.step == 5 && last_analysis.base.is_final,
             "time hooks: analysis payload carries step/final flag");

@@ -24,6 +24,7 @@ int RunDGSEMOperatorTests(TestContext& ctx);
 int RunDGSEMAdvectionTests(TestContext& ctx);
 int RunDGSEMIGRTests(TestContext& ctx);
 int RunTimeDefaultsTests(TestContext& ctx);
+int RunDiagnosticsTests(TestContext& ctx);
 } // namespace dg_igr_tests
 
 namespace
@@ -43,6 +44,7 @@ struct SuiteSelection
   bool bc = false;
   bool igr = false;
   bool time_defaults = false;
+  bool diagnostics = false;
   bool parity = false;
   bool list_only = false;
   bool help = false;
@@ -52,24 +54,26 @@ struct SuiteSelection
 
 void PrintUsage()
 {
-  std::cout << "dg_igr_unit_tests usage:\n"
-            << "  --all        Run all suites (default).\n"
-            << "  --euler      Run Euler EOS/conversion tests.\n"
-            << "  --fluxes     Run numerical flux tests.\n"
-            << "  --limiters   Run limiter tests.\n"
-            << "  --dg-operator Run DG operator invariants.\n"
-            << "  --dgsem-basis Run DGSEM basis/ordering tests.\n"
-            << "  --dgsem-flux  Run DGSEM flux/volume tests.\n"
-            << "  --dgsem-operator Run DGSEM operator surface/volume tests.\n"
-            << "  --dgsem-advection Run DGSEM 1D advection/convergence tests.\n"
-            << "  --dgsem-igr  Run DGSEM + IGR tests.\n"
-            << "  --bc         Run boundary-state policy tests.\n"
-            << "  --igr        Run IGR flux decorator tests.\n"
-            << "  --time-defaults Run time-loop callback/default wiring tests.\n"
-            << "  --parity     Emit/compare MPI parity signatures (uses "
-               "DG_IGR_PARITY_* env vars).\n"
-            << "  --list       List available suites and exit.\n"
-            << "  --help       Show this help and exit.\n";
+  std::cout
+    << "dg_igr_unit_tests usage:\n"
+    << "  --all        Run all suites (default).\n"
+    << "  --euler      Run Euler EOS/conversion tests.\n"
+    << "  --fluxes     Run numerical flux tests.\n"
+    << "  --limiters   Run limiter tests.\n"
+    << "  --dg-operator Run DG operator invariants.\n"
+    << "  --dgsem-basis Run DGSEM basis/ordering tests.\n"
+    << "  --dgsem-flux  Run DGSEM flux/volume tests.\n"
+    << "  --dgsem-operator Run DGSEM operator surface/volume tests.\n"
+    << "  --dgsem-advection Run DGSEM 1D advection/convergence tests.\n"
+    << "  --dgsem-igr  Run DGSEM + IGR tests.\n"
+    << "  --bc         Run boundary-state policy tests.\n"
+    << "  --igr        Run IGR flux decorator tests.\n"
+    << "  --time-defaults Run time-loop callback/default wiring tests.\n"
+    << "  --diagnostics Run diagnostics projection/space tests.\n"
+    << "  --parity     Emit/compare MPI parity signatures (uses "
+       "DG_IGR_PARITY_* env vars).\n"
+    << "  --list       List available suites and exit.\n"
+    << "  --help       Show this help and exit.\n";
 }
 
 SuiteSelection ParseSuites(int argc, char** argv)
@@ -94,6 +98,7 @@ SuiteSelection ParseSuites(int argc, char** argv)
       sel.bc = true;
       sel.igr = true;
       sel.time_defaults = true;
+      sel.diagnostics = true;
       any_suite_flag = true;
     }
     else if (arg == "--euler")
@@ -156,6 +161,11 @@ SuiteSelection ParseSuites(int argc, char** argv)
       sel.time_defaults = true;
       any_suite_flag = true;
     }
+    else if (arg == "--diagnostics")
+    {
+      sel.diagnostics = true;
+      any_suite_flag = true;
+    }
     else if (arg == "--parity")
     {
       sel.parity = true;
@@ -190,6 +200,7 @@ SuiteSelection ParseSuites(int argc, char** argv)
     sel.bc = true;
     sel.igr = true;
     sel.time_defaults = true;
+    sel.diagnostics = true;
   }
 
   return sel;
@@ -343,7 +354,7 @@ int main(int argc, char** argv)
     std::cout
       << "Available suites: euler, fluxes, limiters, dg-operator, dgsem-basis, "
          "dgsem-flux, dgsem-operator, dgsem-advection, dgsem-igr, bc, igr, "
-         "time-defaults\n";
+         "time-defaults, diagnostics\n";
     return 0;
   }
 
@@ -364,6 +375,7 @@ int main(int argc, char** argv)
   int local_bc_failures = 0;
   int local_igr_failures = 0;
   int local_time_defaults_failures = 0;
+  int local_diagnostics_failures = 0;
 
   const int world_size = mfem::Mpi::WorldSize();
   MetricMap parity_metrics;
@@ -508,6 +520,17 @@ int main(int argc, char** argv)
       capture_parity_metric("time-defaults", parity_before);
     }
   }
+  if (selection.diagnostics)
+  {
+    const int before = ctx.failures;
+    const double parity_before = ctx.parity_metric;
+    dg_igr_tests::RunDiagnosticsTests(ctx);
+    local_diagnostics_failures = ctx.failures - before;
+    if (selection.parity)
+    {
+      capture_parity_metric("diagnostics", parity_before);
+    }
+  }
 
   const int global_euler_failures =
     selection.euler ? AllreduceSum(local_euler_failures) : 0;
@@ -534,6 +557,8 @@ int main(int argc, char** argv)
     selection.igr ? AllreduceSum(local_igr_failures) : 0;
   const int global_time_defaults_failures =
     selection.time_defaults ? AllreduceSum(local_time_defaults_failures) : 0;
+  const int global_diagnostics_failures =
+    selection.diagnostics ? AllreduceSum(local_diagnostics_failures) : 0;
 
   if (selection.parity && mfem::Mpi::Root())
   {
@@ -602,6 +627,10 @@ int main(int argc, char** argv)
     if (selection.time_defaults)
     {
       suites.emplace_back("time-defaults");
+    }
+    if (selection.diagnostics)
+    {
+      suites.emplace_back("diagnostics");
     }
     if (selection.dgsem_flux)
     {
@@ -705,6 +734,12 @@ int main(int argc, char** argv)
       std::cout << "  time-defaults: "
                 << (global_time_defaults_failures == 0 ? "PASS" : "FAIL")
                 << " (" << global_time_defaults_failures << " failure(s))\n";
+    }
+    if (selection.diagnostics)
+    {
+      std::cout << "  diagnostics: "
+                << (global_diagnostics_failures == 0 ? "PASS" : "FAIL") << " ("
+                << global_diagnostics_failures << " failure(s))\n";
     }
     if (selection.parity)
     {

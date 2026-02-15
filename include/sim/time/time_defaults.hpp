@@ -439,9 +439,9 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
   };
 
   hooks.on_save = [paraview, callbacks, bundle_ptr](int step,
-                                                     mfem::real_t t,
-                                                     int save_idx,
-                                                     bool is_final)
+                                                    mfem::real_t t,
+                                                    int save_idx,
+                                                    bool is_final)
   {
     if (callbacks.on_vtk_save)
     {

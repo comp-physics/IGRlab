@@ -33,12 +33,12 @@ struct CommonOptions
     "rusanov"; ///< DGSEM surface flux: "rusanov", "es-winters", or "es-lf-entropy".
   std::string dgsem_entropy_jacobian =
     "fd"; ///< DGSEM ES-LF entropy Jacobian: "fd" or "analytic".
-  mfem::real_t t_final = 1.0;  ///< Final time.
-  mfem::real_t dt = -0.01;     ///< Time step (positive skips CFL computation).
+  mfem::real_t t_final = 1.0; ///< Final time.
+  mfem::real_t dt = -0.01;    ///< Time step (positive skips CFL computation).
   mfem::real_t dt_min = 1.0e-12; ///< Minimum allowed dt before aborting.
-  mfem::real_t cfl = 0.3;      ///< CFL number for time step computation.
-  bool glvis = false;          ///< Enable GLVis visualization.
-  bool vtk_save = true;        ///< Enable ParaView/VTK output.
+  mfem::real_t cfl = 0.3;        ///< CFL number for time step computation.
+  bool glvis = false;            ///< Enable GLVis visualization.
+  bool vtk_save = true;          ///< Enable ParaView/VTK output.
   bool save_state_files =
     false; ///< Save GLVis-compatible init/final snapshots to disk.
   mfem::real_t dt_save = 0.01; ///< Save cadence for ParaView output.

@@ -199,8 +199,7 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   out << "    \"nan_scan\": " << (run_cfg.opts.nan_scan ? "true" : "false")
       << ",\n";
   out << "    \"save_state_files\": "
-      << (run_cfg.opts.save_state_files ? "true" : "false")
-      << "\n";
+      << (run_cfg.opts.save_state_files ? "true" : "false") << "\n";
   out << "  },\n";
 
   out << "  \"performance\": {\n";

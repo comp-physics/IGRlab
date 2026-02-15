@@ -410,10 +410,9 @@ struct Solver
       const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
       const std::string dataset_name =
         MakeCaseVTKDatasetName(case_cfg, run_cfg, vtk_c_alpha);
-      state_snapshot_dir =
-        (std::filesystem::path(vtk_cfg.prefix_path) / dataset_name /
-         "glvis_state")
-          .string();
+      state_snapshot_dir = (std::filesystem::path(vtk_cfg.prefix_path) /
+                            dataset_name / "glvis_state")
+                             .string();
       SaveInitialEulerState(ctx,
                             state_bundle.sol,
                             spec.glvis.precision,

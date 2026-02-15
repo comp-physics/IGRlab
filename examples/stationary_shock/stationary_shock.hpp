@@ -295,7 +295,7 @@ GetShockVortexInoueHattoriInit(const real_t gamma,
   const real_t mu2y = rho2 * u2y;
 
   // --- Shock location ---
-  const real_t Xs = -10.0; // stationary shock at X=0
+  const real_t Xs = 0.0; // stationary shock at X=0
 
   // --- Vortex parameters ---
   const real_t Xv = 50.0; // Remove vortex from space

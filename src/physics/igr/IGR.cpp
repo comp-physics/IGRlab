@@ -486,7 +486,9 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     vel_coeff.SetRhoFloor(rho_floor_);
     vel_coeff.SetState(&U);
 
-    vel_h1_->ProjectCoefficient(vel_coeff);
+    // DG state-derived velocity is generally discontinuous; use arithmetic
+    // averaging at shared H1 dofs for partition-independent projection.
+    vel_h1_->ProjectDiscCoefficient(vel_coeff, mfem::GridFunction::ARITHMETIC);
 
     // Tell RHS coefficient to use this continuous velocity field
     src_coef_->SetVelField(vel_h1_.get());
