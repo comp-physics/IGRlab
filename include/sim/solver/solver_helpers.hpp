@@ -13,6 +13,7 @@
 #include "sim/context/example_context.hpp"
 #include "sim/context/mesh_build.hpp"
 
+#include <cmath>
 #include <limits>
 
 namespace dg_sim
@@ -46,6 +47,18 @@ inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
   cfg.lin_solver_type = ParseIGRLinearSolverType(igr_opts.linear_solver);
   cfg.prec_type = ParseIGRPrecondType(igr_opts.preconditioner);
   cfg.ip_kind = ParseIGRIPKind(igr_opts.ip_kind);
+  if (!igr_opts.sigma_cadence.empty())
+  {
+    cfg.sigma_cadence = ParseIGRSigmaUpdateCadence(igr_opts.sigma_cadence);
+  }
+  if (igr_opts.sigma_update_interval > 0)
+  {
+    cfg.sigma_update_interval = igr_opts.sigma_update_interval;
+  }
+  if (igr_opts.stage_rtol_scale >= 0.0)
+  {
+    cfg.stage_rtol_scale = igr_opts.stage_rtol_scale;
+  }
 
   if (igr_opts.lin_rtol >= 0.0)
   {
@@ -62,6 +75,22 @@ inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
   if (igr_opts.lin_print != std::numeric_limits<int>::min())
   {
     cfg.lin_print = igr_opts.lin_print;
+  }
+  if (igr_opts.amg_coarsen_type >= 0)
+  {
+    cfg.amg_coarsen_type = igr_opts.amg_coarsen_type;
+  }
+  if (igr_opts.amg_relax_type >= 0)
+  {
+    cfg.amg_relax_type = igr_opts.amg_relax_type;
+  }
+  if (igr_opts.amg_max_levels >= 0)
+  {
+    cfg.amg_max_levels = igr_opts.amg_max_levels;
+  }
+  if (igr_opts.amg_strong_threshold >= 0.0)
+  {
+    cfg.amg_strong_threshold = igr_opts.amg_strong_threshold;
   }
 }
 

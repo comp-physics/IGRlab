@@ -929,6 +929,17 @@ int RunIGRTests(TestContext& ctx)
               "IGR L2 SIPG auto policy selects CG");
     ctx.Check(l2_solver.GetLastPrecondName() == "boomeramg",
               "IGR L2 auto policy selects BoomerAMG");
+    ctx.Check(l2_solver.GetLastAssembleSeconds() >= 0.0,
+              "IGR telemetry reports non-negative assemble time");
+    ctx.Check(l2_solver.GetLastFormSystemSeconds() >= 0.0,
+              "IGR telemetry reports non-negative FormLinearSystem time");
+    ctx.Check(l2_solver.GetLastPCSetupSeconds() >= 0.0,
+              "IGR telemetry reports non-negative preconditioner setup time");
+    ctx.Check(l2_solver.GetLastLinearSolveSeconds() >= 0.0,
+              "IGR telemetry reports non-negative Krylov time");
+    ctx.Check(l2_solver.GetTotalIGRWorkSeconds() >=
+                l2_solver.GetTotalLinearSolveSeconds(),
+              "IGR telemetry total includes at least Krylov time");
 
     const mfem::HypreParMatrix* A_l2_sipg = l2_solver.GetAssembledOperator();
     MFEM_VERIFY(A_l2_sipg != nullptr,

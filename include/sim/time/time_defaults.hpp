@@ -155,9 +155,17 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
     summary.igr_linear_converged_calls = igr->GetTotalLinearConvergedCalls();
     summary.igr_linear_avg_iters = igr->GetAverageLinearIterations();
     summary.igr_linear_solve_seconds = igr->GetTotalLinearSolveSeconds();
+    summary.igr_assemble_seconds = igr->GetTotalAssembleSeconds();
+    summary.igr_form_system_seconds = igr->GetTotalFormSystemSeconds();
+    summary.igr_pc_setup_seconds = igr->GetTotalPCSetupSeconds();
+    summary.igr_total_work_seconds = igr->GetTotalIGRWorkSeconds();
     summary.igr_linear_solve_fraction =
       (elapsed_seconds > 0.0)
         ? (summary.igr_linear_solve_seconds / elapsed_seconds)
+        : 0.0;
+    summary.igr_total_work_fraction =
+      (elapsed_seconds > 0.0)
+        ? (summary.igr_total_work_seconds / elapsed_seconds)
         : 0.0;
   }
 
@@ -190,8 +198,14 @@ inline void FillIGRTimeInfo(TimeLoopInfo& info,
   info.igr_linear_converged_calls = igr_solver->GetTotalLinearConvergedCalls();
   info.igr_linear_avg_iters = igr_solver->GetAverageLinearIterations();
   info.igr_linear_solve_seconds = igr_solver->GetTotalLinearSolveSeconds();
+  info.igr_assemble_seconds = igr_solver->GetTotalAssembleSeconds();
+  info.igr_form_system_seconds = igr_solver->GetTotalFormSystemSeconds();
+  info.igr_pc_setup_seconds = igr_solver->GetTotalPCSetupSeconds();
+  info.igr_total_work_seconds = igr_solver->GetTotalIGRWorkSeconds();
   info.igr_linear_solve_fraction =
     (elapsed > 0.0) ? (info.igr_linear_solve_seconds / elapsed) : 0.0;
+  info.igr_total_work_fraction =
+    (elapsed > 0.0) ? (info.igr_total_work_seconds / elapsed) : 0.0;
 }
 
 inline void PrintSummaryBox(const RunSummary& summary)
@@ -210,6 +224,23 @@ inline void PrintSummaryBox(const RunSummary& summary)
        << " | avg iters: " << FormatFixed(summary.igr_linear_avg_iters, 2);
     return os.str();
   };
+  const auto igr_breakdown = [&summary]() -> std::string
+  {
+    if (!summary.has_igr)
+    {
+      return "IGR breakdown: n/a";
+    }
+    std::ostringstream os;
+    os << "IGR breakdown [assemble/form/pc/krylov] = "
+       << FormatFixed(summary.igr_assemble_seconds) << " / "
+       << FormatFixed(summary.igr_form_system_seconds) << " / "
+       << FormatFixed(summary.igr_pc_setup_seconds) << " / "
+       << FormatFixed(summary.igr_linear_solve_seconds) << " s"
+       << " | total "
+       << FormatFixed(summary.igr_total_work_seconds) << " s ("
+       << FormatFixed(100.0 * summary.igr_total_work_fraction, 2) << "%)";
+    return os.str();
+  };
 
   if (summary.steps <= 0)
   {
@@ -217,6 +248,7 @@ inline void PrintSummaryBox(const RunSummary& summary)
               "steps: 0",
               "elapsed: " + FormatFixed(summary.elapsed) + " s",
               igr_line(),
+              igr_breakdown(),
               "dofs (local/global): " +
                 std::to_string(static_cast<long long>(summary.local_dofs)) +
                 " / " +
@@ -230,6 +262,7 @@ inline void PrintSummaryBox(const RunSummary& summary)
      "steps: " + std::to_string(summary.steps) +
        " | elapsed: " + FormatFixed(summary.elapsed) + " s",
      igr_line(),
+     igr_breakdown(),
      "avg/step: " + FormatSci(summary.avg_step) + " s",
      "avg/step/dof (local): " + FormatSci(summary.avg_step_per_dof_local) +
        " s",

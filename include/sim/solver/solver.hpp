@@ -494,12 +494,28 @@ struct Solver
       const double avg_linear_time =
         igr->GetTotalLinearSolveSeconds() /
         static_cast<double>(igr->GetLinearSolveCalls());
+      const double avg_assemble_time =
+        igr->GetTotalAssembleSeconds() /
+        static_cast<double>(igr->GetLinearSolveCalls());
+      const double avg_form_time =
+        igr->GetTotalFormSystemSeconds() /
+        static_cast<double>(igr->GetLinearSolveCalls());
+      const double avg_pc_setup_time =
+        igr->GetTotalPCSetupSeconds() /
+        static_cast<double>(igr->GetLinearSolveCalls());
       std::cout << "[igr-linear] event=run-summary"
                 << " calls=" << igr->GetLinearSolveCalls()
                 << " converged_calls=" << igr->GetTotalLinearConvergedCalls()
                 << " avg_iters=" << igr->GetAverageLinearIterations()
+                << " avg_assemble_s=" << avg_assemble_time
+                << " avg_form_s=" << avg_form_time
+                << " avg_pc_setup_s=" << avg_pc_setup_time
                 << " avg_solve_s=" << avg_linear_time
+                << " total_assemble_s=" << igr->GetTotalAssembleSeconds()
+                << " total_form_s=" << igr->GetTotalFormSystemSeconds()
+                << " total_pc_setup_s=" << igr->GetTotalPCSetupSeconds()
                 << " total_solve_s=" << igr->GetTotalLinearSolveSeconds()
+                << " total_igr_s=" << igr->GetTotalIGRWorkSeconds()
                 << " last_solver=" << igr->GetLastLinearSolverName()
                 << " last_precond=" << igr->GetLastPrecondName() << "\n";
     }

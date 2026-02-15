@@ -1,6 +1,7 @@
 #pragma once
 #include "mfem.hpp"
 #include "utils/config/igr_config.hpp"
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <string>
@@ -76,6 +77,31 @@ public:
   void SetSolveMode(SolveMode m) { solve_mode_ = m; }
   void SetLinearSolver(LinearSolverType s) { lin_solver_type_ = s; }
   void SetPreconditioner(PrecondType p) { prec_type_ = p; }
+  void SetAMGParams(int coarsen_type,
+                    int relax_type,
+                    int max_levels,
+                    double strong_threshold)
+  {
+    amg_coarsen_type_ = coarsen_type;
+    amg_relax_type_ = relax_type;
+    amg_max_levels_ = max_levels;
+    amg_strong_threshold_ = strong_threshold;
+  }
+  void SetSigmaUpdatePolicy(IGRSigmaUpdateCadence cadence, int interval)
+  {
+    sigma_cadence_ = cadence;
+    sigma_update_interval_ = std::max(1, interval);
+  }
+  void SetStageRtolScale(double scale)
+  {
+    stage_rtol_scale_ = std::max(1.0, scale);
+  }
+  void SetRKStageIndex(int stage) { rk_stage_index_ = stage; }
+  IGRSigmaUpdateCadence GetSigmaUpdateCadence() const
+  {
+    return sigma_cadence_;
+  }
+  int GetSigmaUpdateInterval() const { return sigma_update_interval_; }
 
   /// Set solve tolerances and iteration cap (used in Krylov mode).
   void SetLinearSolveParams(double rel_tol,
@@ -103,6 +129,12 @@ public:
     SetSolveMode(cfg.solve_mode);
     SetLinearSolver(cfg.lin_solver_type);
     SetPreconditioner(cfg.prec_type);
+    SetAMGParams(cfg.amg_coarsen_type,
+                 cfg.amg_relax_type,
+                 cfg.amg_max_levels,
+                 cfg.amg_strong_threshold);
+    SetSigmaUpdatePolicy(cfg.sigma_cadence, cfg.sigma_update_interval);
+    SetStageRtolScale(cfg.stage_rtol_scale);
     SetLinearSolveParams(cfg.lin_rtol,
                          cfg.lin_atol,
                          cfg.lin_maxit,
@@ -125,9 +157,23 @@ public:
   {
     return last_linear_solve_seconds_;
   }
+  double GetLastAssembleSeconds() const { return last_assemble_seconds_; }
+  double GetLastFormSystemSeconds() const { return last_form_system_seconds_; }
+  double GetLastPCSetupSeconds() const { return last_pc_setup_seconds_; }
   double GetTotalLinearSolveSeconds() const
   {
     return total_linear_solve_seconds_;
+  }
+  double GetTotalAssembleSeconds() const { return total_assemble_seconds_; }
+  double GetTotalFormSystemSeconds() const
+  {
+    return total_form_system_seconds_;
+  }
+  double GetTotalPCSetupSeconds() const { return total_pc_setup_seconds_; }
+  double GetTotalIGRWorkSeconds() const
+  {
+    return total_assemble_seconds_ + total_form_system_seconds_ +
+           total_pc_setup_seconds_ + total_linear_solve_seconds_;
   }
   int GetLinearSolveCalls() const { return linear_solve_calls_; }
   int GetTotalLinearIterations() const { return total_linear_iters_; }
@@ -267,6 +313,14 @@ private:
   SolveMode solve_mode_ = SolveMode::Krylov;
   LinearSolverType lin_solver_type_ = LinearSolverType::Auto;
   PrecondType prec_type_ = PrecondType::Auto;
+  int amg_coarsen_type_ = -1;
+  int amg_relax_type_ = -1;
+  int amg_max_levels_ = -1;
+  double amg_strong_threshold_ = -1.0;
+  IGRSigmaUpdateCadence sigma_cadence_ = IGRSigmaUpdateCadence::EveryStage;
+  int sigma_update_interval_ = 1;
+  double stage_rtol_scale_ = 1.0;
+  int rk_stage_index_ = -1;
 
   double lin_rtol_ = mfem::dg_igr::IGRDefaults::kLinRtol;
   double lin_atol_ = mfem::dg_igr::IGRDefaults::kLinAtol;
@@ -305,7 +359,13 @@ private:
   double last_linear_final_norm_ = std::numeric_limits<double>::quiet_NaN();
   double last_linear_initial_norm_ = std::numeric_limits<double>::quiet_NaN();
   double last_linear_solve_seconds_ = 0.0;
+  double last_assemble_seconds_ = 0.0;
+  double last_form_system_seconds_ = 0.0;
+  double last_pc_setup_seconds_ = 0.0;
   double total_linear_solve_seconds_ = 0.0;
+  double total_assemble_seconds_ = 0.0;
+  double total_form_system_seconds_ = 0.0;
+  double total_pc_setup_seconds_ = 0.0;
   int linear_solve_calls_ = 0;
   int total_linear_iters_ = 0;
   int total_linear_converged_calls_ = 0;

@@ -197,6 +197,11 @@ void RK3SSPWithLimiter::MaybeScanStage(Vector& v, double t, const char* label)
 void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
 {
   stage_nan_detected_ = false;
+  RKStageAwareOperator* stage_aware = dynamic_cast<RKStageAwareOperator*>(f);
+  if (stage_aware)
+  {
+    stage_aware->BeginRKStep(static_cast<int>(step_count_), t, dt);
+  }
   // Decide whether to apply optional limiters on this step.
   const bool apply_optional =
     (max_limiter_steps_ < 0) || (step_count_ < max_limiter_steps_);
@@ -211,6 +216,10 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   MaybeScanStage(x, t, "initial");
 
   // k0 = f(t, x)
+  if (stage_aware)
+  {
+    stage_aware->SetRKStage(0);
+  }
   f->SetTime(t);
   f->Mult(x, k_);
 
@@ -220,6 +229,10 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   MaybeScanStage(y_, t + dt, "stage1");
 
   // k1 = f(t+dt, y)
+  if (stage_aware)
+  {
+    stage_aware->SetRKStage(1);
+  }
   f->SetTime(t + dt);
   f->Mult(y_, k_);
 
@@ -230,6 +243,10 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   MaybeScanStage(y_, t + dt, "stage2");
 
   // k2 = f(t + dt/2, y)
+  if (stage_aware)
+  {
+    stage_aware->SetRKStage(2);
+  }
   f->SetTime(t + dt / 2);
   f->Mult(y_, k_);
 

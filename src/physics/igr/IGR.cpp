@@ -466,6 +466,8 @@ void IGRSolver::BuildBilinearForm_()
 
 void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
 {
+  const auto assemble_start = std::chrono::steady_clock::now();
+
   // Needed for DG/IPDG assembly: variable coeffs evaluated on shared faces
   // will read U on neighbor elements.
   const_cast<mfem::ParGridFunction&>(U).ExchangeFaceNbrData();
@@ -519,12 +521,22 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     sfes_.GetEssentialTrueDofs(dbdr, ess_tdof_list_);
   }
 
+  const auto assemble_stop = std::chrono::steady_clock::now();
+  last_assemble_seconds_ =
+    std::chrono::duration<double>(assemble_stop - assemble_start).count();
+  total_assemble_seconds_ += last_assemble_seconds_;
+
   // Rebuild the system operator; clear handle first.
   Ah_.Clear();
   Ah_.SetType(mfem::Operator::Hypre_ParCSR);
 
   // Warm-start: FormLinearSystem pulls current sigma_ into X_
+  const auto form_start = std::chrono::steady_clock::now();
   a_->FormLinearSystem(ess_tdof_list_, sigma_, *b_, Ah_, X_, B_);
+  const auto form_stop = std::chrono::steady_clock::now();
+  last_form_system_seconds_ =
+    std::chrono::duration<double>(form_stop - form_start).count();
+  total_form_system_seconds_ += last_form_system_seconds_;
 }
 
 void IGRSolver::DoSmootherSweeps(int sweeps, bool /*warm_start*/)
@@ -591,6 +603,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   last_linear_final_norm_ = std::numeric_limits<double>::quiet_NaN();
   last_linear_initial_norm_ = std::numeric_limits<double>::quiet_NaN();
   last_linear_solve_seconds_ = 0.0;
+  last_pc_setup_seconds_ = 0.0;
   last_linear_solver_name_ = "none";
   last_precond_name_ = "none";
 
@@ -637,6 +650,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                    prec_choice);
   }
 
+  const auto pc_setup_start = std::chrono::steady_clock::now();
   std::unique_ptr<mfem::Solver> prec;
   if (prec_choice == PrecondType::BoomerAMG)
   {
@@ -645,6 +659,22 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     amg->SetPrintLevel(0);
     amg->SetMaxIter(1);
     amg->SetTol(0.0);
+    if (amg_coarsen_type_ >= 0)
+    {
+      amg->SetCoarsening(amg_coarsen_type_);
+    }
+    if (amg_relax_type_ >= 0)
+    {
+      amg->SetRelaxType(amg_relax_type_);
+    }
+    if (amg_max_levels_ >= 0)
+    {
+      amg->SetMaxLevels(amg_max_levels_);
+    }
+    if (amg_strong_threshold_ >= 0.0)
+    {
+      amg->SetStrengthThresh(amg_strong_threshold_);
+    }
     prec = std::move(amg);
   }
   else if (prec_choice == PrecondType::HypreILU)
@@ -693,6 +723,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     prec = std::move(sm);
   }
   // else None -> leave prec null
+  const auto pc_setup_stop = std::chrono::steady_clock::now();
+  last_pc_setup_seconds_ =
+    std::chrono::duration<double>(pc_setup_stop - pc_setup_start).count();
+  total_pc_setup_seconds_ += last_pc_setup_seconds_;
 
   if (lin_print_ > 0)
   {
@@ -733,6 +767,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   MFEM_VERIFY(VectorIsFinite(B_),
               "IGR RHS contains non-finite values before Krylov solve.");
 
+  const bool is_intermediate_stage = (rk_stage_index_ >= 0 && rk_stage_index_ < 2);
+  const double effective_rtol =
+    is_intermediate_stage ? (lin_rtol_ * stage_rtol_scale_) : lin_rtol_;
+
   auto configure_solver = [&](mfem::IterativeSolver& solver)
   {
     solver.SetOperator(*A);
@@ -740,7 +778,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     {
       solver.SetPreconditioner(*prec);
     }
-    solver.SetRelTol(lin_rtol_);
+    solver.SetRelTol(effective_rtol);
     solver.SetAbsTol(lin_atol_);
     solver.SetMaxIter(lin_maxit_);
     solver.SetPrintLevel(lin_print_);
@@ -828,6 +866,15 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U, bool warm_start)
 
   if (solve_mode_ == SolveMode::SmootherSweeps)
   {
+    last_linear_iters_ = 0;
+    last_linear_converged_ = true;
+    last_linear_initial_norm_ = std::numeric_limits<double>::quiet_NaN();
+    last_linear_final_norm_ = std::numeric_limits<double>::quiet_NaN();
+    last_linear_solve_seconds_ = 0.0;
+    last_pc_setup_seconds_ = 0.0;
+    last_linear_solver_name_ = "smoother";
+    last_precond_name_ = PrecondTypeName(PrecondType::HypreSmoother);
+
     const int sweeps = (first_call_ && warm_start)
                          ? std::max(warm_start_sweeps_, regular_sweeps_)
                          : regular_sweeps_;

@@ -190,8 +190,22 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << detail::ToJsonString(run_cfg.igr_opts.linear_solver) << ",\n";
   out << "    \"igr_preconditioner\": "
       << detail::ToJsonString(run_cfg.igr_opts.preconditioner) << ",\n";
+  out << "    \"igr_sigma_cadence\": "
+      << detail::ToJsonString(run_cfg.igr_opts.sigma_cadence) << ",\n";
+  out << "    \"igr_sigma_update_interval\": "
+      << run_cfg.igr_opts.sigma_update_interval << ",\n";
+  out << "    \"igr_stage_rtol_scale\": " << run_cfg.igr_opts.stage_rtol_scale
+      << ",\n";
   out << "    \"igr_ip_kind\": "
       << detail::ToJsonString(run_cfg.igr_opts.ip_kind) << ",\n";
+  out << "    \"igr_amg_coarsen_type\": " << run_cfg.igr_opts.amg_coarsen_type
+      << ",\n";
+  out << "    \"igr_amg_relax_type\": " << run_cfg.igr_opts.amg_relax_type
+      << ",\n";
+  out << "    \"igr_amg_max_levels\": " << run_cfg.igr_opts.amg_max_levels
+      << ",\n";
+  out << "    \"igr_amg_strong_threshold\": "
+      << run_cfg.igr_opts.amg_strong_threshold << ",\n";
   out << "    \"cfl\": " << run_cfg.opts.cfl << ",\n";
   out << "    \"dt\": " << run_cfg.opts.dt << ",\n";
   out << "    \"dt_min\": " << run_cfg.opts.dt_min << ",\n";
@@ -238,12 +252,26 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
     out << "    \"converged_calls\": " << igr->GetTotalLinearConvergedCalls()
         << ",\n";
     out << "    \"avg_iters\": " << igr->GetAverageLinearIterations() << ",\n";
+    out << "    \"total_assemble_s\": " << igr->GetTotalAssembleSeconds()
+        << ",\n";
+    out << "    \"total_form_system_s\": " << igr->GetTotalFormSystemSeconds()
+        << ",\n";
+    out << "    \"total_pc_setup_s\": " << igr->GetTotalPCSetupSeconds()
+        << ",\n";
     out << "    \"total_solve_s\": " << igr->GetTotalLinearSolveSeconds()
+        << ",\n";
+    out << "    \"total_igr_work_s\": " << igr->GetTotalIGRWorkSeconds()
         << ",\n";
     out << "    \"last_solver\": "
         << detail::ToJsonString(igr->GetLastLinearSolverName()) << ",\n";
     out << "    \"last_precond\": "
         << detail::ToJsonString(igr->GetLastPrecondName()) << ",\n";
+    out << "    \"last_assemble_s\": " << igr->GetLastAssembleSeconds()
+        << ",\n";
+    out << "    \"last_form_system_s\": " << igr->GetLastFormSystemSeconds()
+        << ",\n";
+    out << "    \"last_pc_setup_s\": " << igr->GetLastPCSetupSeconds()
+        << ",\n";
     out << "    \"last_iters\": " << igr->GetLastLinearIters() << ",\n";
     out << "    \"last_converged\": "
         << (igr->GetLastLinearConverged() ? "true" : "false") << ",\n";

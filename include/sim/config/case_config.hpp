@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -34,10 +35,17 @@ struct IGROptions
   std::string linear_solver = "auto";
   std::string preconditioner = "auto";
   std::string ip_kind = "sipg";
+  std::string sigma_cadence = "";
+  int sigma_update_interval = -1;
+  double stage_rtol_scale = -1.0;
   double lin_rtol = -1.0;
   double lin_atol = -1.0;
   int lin_maxit = -1;
   int lin_print = std::numeric_limits<int>::min();
+  int amg_coarsen_type = -1;
+  int amg_relax_type = -1;
+  int amg_max_levels = -1;
+  double amg_strong_threshold = -1.0;
 };
 
 /// @brief DG backend selection.
@@ -236,8 +244,34 @@ inline dg_igr::IGRPrecondType ParseIGRPrecondType(const std::string& value)
   MFEM_VERIFY(false,
               "Invalid IGR preconditioner '"
                 << value << "'. Use 'auto', 'boomeramg', 'hypreilu', "
-                << "'hypreeuclid', 'parasails', 'hypresmoother', or 'none'.");
+                << "'hypreeuclid', 'parasails', "
+                << "'hypresmoother', or 'none'.");
   return dg_igr::IGRPrecondType::Auto;
+}
+
+inline dg_igr::IGRSigmaUpdateCadence
+ParseIGRSigmaUpdateCadence(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "every-stage" || lower == "every_stage" || lower == "stage")
+  {
+    return dg_igr::IGRSigmaUpdateCadence::EveryStage;
+  }
+  if (lower == "every-step" || lower == "every_step" || lower == "step")
+  {
+    return dg_igr::IGRSigmaUpdateCadence::EveryStep;
+  }
+  if (lower == "every-n-steps" || lower == "every_n_steps" ||
+      lower == "every-n" || lower == "nsteps")
+  {
+    return dg_igr::IGRSigmaUpdateCadence::EveryNSteps;
+  }
+  MFEM_VERIFY(false,
+              "Invalid IGR sigma cadence '"
+                << value
+                << "'. Use 'every-stage', 'every-step', or "
+                   "'every-n-steps'.");
+  return dg_igr::IGRSigmaUpdateCadence::EveryStage;
 }
 
 inline const char* IGRIPKindToString(dg_igr::IGRIPKind value)
@@ -307,6 +341,21 @@ inline const char* IGRPrecondTypeToString(dg_igr::IGRPrecondType value)
     return "none";
   }
   return "auto";
+}
+
+inline const char*
+IGRSigmaUpdateCadenceToString(dg_igr::IGRSigmaUpdateCadence value)
+{
+  switch (value)
+  {
+  case dg_igr::IGRSigmaUpdateCadence::EveryStage:
+    return "every-stage";
+  case dg_igr::IGRSigmaUpdateCadence::EveryStep:
+    return "every-step";
+  case dg_igr::IGRSigmaUpdateCadence::EveryNSteps:
+    return "every-n-steps";
+  }
+  return "every-stage";
 }
 
 inline DGBackend ParseDGBackend(const std::string& value)
@@ -562,10 +611,17 @@ inline void ApplyExampleDefaults(CaseConfig& cfg)
   cfg.rk3_config.limit_initial = false;
   cfg.rk3_config.max_limiter_steps = 0;
 
-  cfg.igr_config.lin_rtol = 1.0e-4;
+  cfg.igr_config.lin_rtol = 1.0e-6;
   cfg.igr_config.lin_atol = 0.0;
   cfg.igr_config.lin_maxit = 1000;
   cfg.igr_config.lin_print = 0;
+  cfg.igr_config.sigma_cadence = dg_igr::IGRSigmaUpdateCadence::EveryStage;
+  cfg.igr_config.sigma_update_interval = 1;
+  cfg.igr_config.stage_rtol_scale = 1.0;
+  cfg.igr_config.amg_coarsen_type = -1;
+  cfg.igr_config.amg_relax_type = -1;
+  cfg.igr_config.amg_max_levels = -1;
+  cfg.igr_config.amg_strong_threshold = -1.0;
 }
 
 inline CaseConfig
@@ -612,6 +668,21 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "IGR preconditioner: auto | boomeramg | hypreilu | "
                  "hypreeuclid | parasails | "
                  "hypresmoother | none.");
+  args.AddOption(
+    &igr_opts.sigma_cadence,
+    "-iscad",
+    "--igr-sigma-cadence",
+    "IGR sigma update cadence: every-stage | every-step | every-n-steps.");
+  args.AddOption(&igr_opts.sigma_update_interval,
+                 "-isn",
+                 "--igr-sigma-update-interval",
+                 "IGR sigma update interval N for every-n-steps cadence (<0 "
+                 "keeps case default).");
+  args.AddOption(&igr_opts.stage_rtol_scale,
+                 "-isrtol",
+                 "--igr-stage-rtol-scale",
+                 "IGR stage-rtol multiplier for intermediate RK stages (>1 "
+                 "loosens; <0 keeps case default).");
   args.AddOption(&igr_opts.ip_kind,
                  "-iip",
                  "--igr-ip-kind",
@@ -634,6 +705,22 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "-iprint",
                  "--igr-lin-print",
                  "IGR linear solver print level (INT_MIN keeps case default).");
+  args.AddOption(&igr_opts.amg_coarsen_type,
+                 "-iamgc",
+                 "--igr-amg-coarsen-type",
+                 "IGR BoomerAMG coarsen type (<0 keeps HYPRE default).");
+  args.AddOption(&igr_opts.amg_relax_type,
+                 "-iamgr",
+                 "--igr-amg-relax-type",
+                 "IGR BoomerAMG relax type (<0 keeps HYPRE default).");
+  args.AddOption(&igr_opts.amg_max_levels,
+                 "-iamgl",
+                 "--igr-amg-max-levels",
+                 "IGR BoomerAMG max levels (<0 keeps HYPRE default).");
+  args.AddOption(&igr_opts.amg_strong_threshold,
+                 "-iamgst",
+                 "--igr-amg-strong-threshold",
+                 "IGR BoomerAMG strong-threshold (<0 keeps HYPRE default).");
 }
 
 inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,

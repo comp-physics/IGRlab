@@ -72,6 +72,15 @@ enum class IGRPrecondType
   None
 };
 
+/// @brief Cadence policy for sigma updates in IGR-coupled Euler solves.
+/// @ingroup utils_config
+enum class IGRSigmaUpdateCadence
+{
+  EveryStage,
+  EveryStep,
+  EveryNSteps
+};
+
 /// @brief Configuration bundle for IGR defaults and runtime tuning.
 /// @ingroup utils_config
 struct IGRConfig
@@ -94,6 +103,20 @@ struct IGRConfig
   double lin_atol = mfem::dg_igr::IGRDefaults::kLinAtol;
   int lin_maxit = mfem::dg_igr::IGRDefaults::kLinMaxIters;
   int lin_print = mfem::dg_igr::IGRDefaults::kLinPrint;
+
+  // AMG tuning knobs. Negative values keep MFEM/HYPRE defaults.
+  int amg_coarsen_type = -1;
+  int amg_relax_type = -1;
+  int amg_max_levels = -1;
+  double amg_strong_threshold = -1.0;
+
+  // Sigma update cadence for IGR coupling.
+  IGRSigmaUpdateCadence sigma_cadence = IGRSigmaUpdateCadence::EveryStage;
+  int sigma_update_interval = 1; // used only for EveryNSteps
+
+  // Stage-wise tolerance policy (RK intermediate stages can be looser).
+  double stage_rtol_scale = 1.0; // > 1.0 loosens stage-0/1 relative tolerance
+
 };
 
 } // namespace dg_igr

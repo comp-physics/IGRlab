@@ -2,6 +2,7 @@
 #include "mfem.hpp"
 #include "utils/config/timestepping_config.hpp"
 #include "numerics/limiters/limiters.hpp" // brings limiter option types
+#include "numerics/timestepping/stage_aware_operator.hpp"
 #include <functional>
 #include <vector>
 
