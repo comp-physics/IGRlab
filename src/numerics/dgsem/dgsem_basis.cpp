@@ -35,8 +35,8 @@ LGLBasis1D BuildLGLBasis1D(int order)
   basis.D.SetSize(basis.n);
   mfem::Vector u(basis.n);
   mfem::Vector d(basis.n);
-  mfem::Poly_1D::Basis& poly_basis = mfem::poly1d.GetBasis(order,
-                                                          mfem::BasisType::GaussLobatto);
+  mfem::Poly_1D::Basis& poly_basis =
+    mfem::poly1d.GetBasis(order, mfem::BasisType::GaussLobatto);
   for (int i = 0; i < basis.n; ++i)
   {
     poly_basis.Eval(basis.nodes(i), u, d);

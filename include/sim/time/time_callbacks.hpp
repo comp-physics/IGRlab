@@ -24,6 +24,17 @@ struct TimeLoopInfo
   long long global_dofs = 0;
   int ranks = 1;
   bool is_final = false;
+  bool has_igr = false;
+  int igr_linear_calls = 0;
+  int igr_linear_converged_calls = 0;
+  double igr_linear_avg_iters = 0.0;
+  double igr_linear_solve_seconds = 0.0;
+  double igr_linear_solve_fraction = 0.0;
+  double igr_assemble_seconds = 0.0;
+  double igr_form_system_seconds = 0.0;
+  double igr_pc_setup_seconds = 0.0;
+  double igr_total_work_seconds = 0.0;
+  double igr_total_work_fraction = 0.0;
 };
 
 /// @brief Analysis payload with optional min/max diagnostics.
@@ -59,6 +70,17 @@ struct RunSummary
   int local_dofs = 0;
   long long global_dofs = 0;
   int ranks = 1;
+  bool has_igr = false;
+  int igr_linear_calls = 0;
+  int igr_linear_converged_calls = 0;
+  double igr_linear_avg_iters = 0.0;
+  double igr_linear_solve_seconds = 0.0;
+  double igr_linear_solve_fraction = 0.0;
+  double igr_assemble_seconds = 0.0;
+  double igr_form_system_seconds = 0.0;
+  double igr_pc_setup_seconds = 0.0;
+  double igr_total_work_seconds = 0.0;
+  double igr_total_work_fraction = 0.0;
 };
 
 /// @brief Callback bundle for time-loop diagnostics and logging.

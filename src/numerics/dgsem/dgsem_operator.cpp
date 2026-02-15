@@ -23,13 +23,23 @@ DGSEMOperator::DGSEMOperator(const DGHyperbolicConservationLaws& op)
 const BdrHyperbolicFluxIntegrator*
 DGSEMOperator::FindBdrIntegrator(int attr) const
 {
-  if (attr <= 0) { return nullptr; }
+  if (attr <= 0)
+  {
+    return nullptr;
+  }
   for (size_t i = 0; i < op_.ext_bdr_int_.size(); ++i)
   {
     const auto* marker = op_.ext_bdr_markers_[i].get();
-    if (!marker || attr > marker->Size()) { continue; }
-    if ((*marker)[attr - 1] == 0) { continue; }
-    return dynamic_cast<const BdrHyperbolicFluxIntegrator*>(op_.ext_bdr_int_[i].get());
+    if (!marker || attr > marker->Size())
+    {
+      continue;
+    }
+    if ((*marker)[attr - 1] == 0)
+    {
+      continue;
+    }
+    return dynamic_cast<const BdrHyperbolicFluxIntegrator*>(
+      op_.ext_bdr_int_[i].get());
   }
   return nullptr;
 }
@@ -81,13 +91,12 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
                 "DGSEM face point does not match a nodal coordinate.");
     return best;
   };
-  auto build_lex_to_local = [&](const FiniteElement& fe,
-                                int n1d,
-                                std::vector<int>& lex_to_local)
+  auto build_lex_to_local =
+    [&](const FiniteElement& fe, int n1d, std::vector<int>& lex_to_local)
   {
     const int dof = fe.GetDof();
     const std::vector<std::array<int, 3>>& dof_to_ijk =
-        mfem::dgsem::GetTensorDofToIJK(fe);
+      mfem::dgsem::GetTensorDofToIJK(fe);
     lex_to_local.assign(dof, -1);
     for (int local = 0; local < dof; ++local)
     {
@@ -101,11 +110,17 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
   for (int f = 0; f < nfaces; ++f)
   {
     FaceElementTransformations* Tr = mesh.GetFaceElementTransformations(f);
-    if (!Tr) { continue; }
+    if (!Tr)
+    {
+      continue;
+    }
 
     const int e1 = Tr->Elem1No;
     const int e2 = Tr->Elem2No;
-    if (e2 < 0) { continue; }
+    if (e2 < 0)
+    {
+      continue;
+    }
 
     const FiniteElement& fe1 = *op_.vfes.GetFE(e1);
     const int dof1 = fe1.GetDof();
@@ -149,9 +164,9 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
       elvect2 = 0.0;
     }
 
-    const IntegrationRule& ir =
-        (op_.dim == 1) ? IntRules.Get(Geometry::POINT, 1)
-                       : mfem::dgsem::GetLGLFaceRule(order);
+    const IntegrationRule& ir = (op_.dim == 1)
+                                  ? IntRules.Get(Geometry::POINT, 1)
+                                  : mfem::dgsem::GetLGLFaceRule(order);
 
     for (int ip_id = 0; ip_id < ir.GetNPoints(); ++ip_id)
     {
@@ -177,8 +192,7 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
       const IntegrationPoint& ip2 = Tr->GetElement2IntPoint();
       const int i2 = find_node(nodes1d, ip2.x);
       const int j2 = (op_.dim > 1) ? find_node(nodes1d, ip2.y) : 0;
-      const int local2 =
-          lex_to_local2[(op_.dim == 1) ? i2 : i2 + n1d * j2];
+      const int local2 = lex_to_local2[(op_.dim == 1) ? i2 : i2 + n1d * j2];
 
       Xmat2.GetRow(local2, state2);
 
@@ -198,14 +212,16 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
 
   if (pmesh && n_shared_faces > 0)
   {
-    MFEM_VERIFY(face_nbr,
-                "DGSEM shared-face assembly requires neighbor data.");
+    MFEM_VERIFY(face_nbr, "DGSEM shared-face assembly requires neighbor data.");
 
     for (int sf = 0; sf < n_shared_faces; ++sf)
     {
       FaceElementTransformations* Tr =
-          pmesh->GetSharedFaceTransformations(sf, /*use_local_face_nr=*/true);
-      if (!Tr) { continue; }
+        pmesh->GetSharedFaceTransformations(sf, /*use_local_face_nr=*/true);
+      if (!Tr)
+      {
+        continue;
+      }
 
       const int e1 = Tr->Elem1No;
       const int e2 = Tr->Elem2No - pmesh->GetNE();
@@ -243,9 +259,9 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
       DenseMatrix elvect1(dof1, op_.num_equations);
       elvect1 = 0.0;
 
-      const IntegrationRule& ir =
-          (op_.dim == 1) ? IntRules.Get(Geometry::POINT, 1)
-                         : mfem::dgsem::GetLGLFaceRule(order);
+      const IntegrationRule& ir = (op_.dim == 1)
+                                    ? IntRules.Get(Geometry::POINT, 1)
+                                    : mfem::dgsem::GetLGLFaceRule(order);
 
       for (int ip_id = 0; ip_id < ir.GetNPoints(); ++ip_id)
       {
@@ -271,13 +287,12 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
         const IntegrationPoint& ip2 = Tr->GetElement2IntPoint();
         const int i2 = find_node(nodes1d, ip2.x);
         const int j2 = (op_.dim > 1) ? find_node(nodes1d, ip2.y) : 0;
-        const int local2 =
-            lex_to_local2[(op_.dim == 1) ? i2 : i2 + n1d * j2];
+        const int local2 = lex_to_local2[(op_.dim == 1) ? i2 : i2 + n1d * j2];
 
         Xmat2.GetRow(local2, state2);
 
         const real_t speed =
-            op_.num_flux_->Eval(state1, state2, nor, *Tr, fluxN);
+          op_.num_flux_->Eval(state1, state2, nor, *Tr, fluxN);
         max_face_speed = std::max(max_face_speed, speed);
 
         for (int eq = 0; eq < op_.num_equations; ++eq)
@@ -294,7 +309,10 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
   for (int b = 0; b < nbdr; ++b)
   {
     FaceElementTransformations* Tr = mesh.GetBdrFaceTransformations(b);
-    if (!Tr) { continue; }
+    if (!Tr)
+    {
+      continue;
+    }
 
     const int e1 = Tr->Elem1No;
     const FiniteElement& fe1 = *op_.vfes.GetFE(e1);
@@ -316,9 +334,9 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
     DenseMatrix elvect1(dof1, op_.num_equations);
     elvect1 = 0.0;
 
-    const IntegrationRule& ir =
-        (op_.dim == 1) ? IntRules.Get(Geometry::POINT, 1)
-                       : mfem::dgsem::GetLGLFaceRule(order);
+    const IntegrationRule& ir = (op_.dim == 1)
+                                  ? IntRules.Get(Geometry::POINT, 1)
+                                  : mfem::dgsem::GetLGLFaceRule(order);
 
     for (int ip_id = 0; ip_id < ir.GetNPoints(); ++ip_id)
     {
@@ -341,10 +359,8 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
         CalcOrtho(Tr->Jacobian(), nor);
       }
 
-      const BdrHyperbolicFluxIntegrator* bdr =
-          FindBdrIntegrator(Tr->Attribute);
-      MFEM_VERIFY(bdr,
-                  "DGSEM boundary face is missing a boundary integrator.");
+      const BdrHyperbolicFluxIntegrator* bdr = FindBdrIntegrator(Tr->Attribute);
+      MFEM_VERIFY(bdr, "DGSEM boundary face is missing a boundary integrator.");
       bdr->GetBoundaryState().Eval(state1, nor, *Tr, state2);
 
       const real_t speed = op_.num_flux_->Eval(state1, state2, nor, *Tr, fluxN);
@@ -369,25 +385,24 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
               "(face-only form).");
 
   Vector state;
-  DenseMatrix flux;           // contravariant flux (num_eq × (dim*dof))
-  DenseMatrix Xmat;           // element states (dof × num_eq)
-  DenseMatrix volume;         // volume contribution (dof × num_eq)
-  DenseMatrix phys_flux;      // physical flux at node (num_eq × dim)
-  DenseMatrix adj;            // adjugate of Jacobian (dim × dim)
+  DenseMatrix flux;      // contravariant flux (num_eq × (dim*dof))
+  DenseMatrix Xmat;      // element states (dof × num_eq)
+  DenseMatrix volume;    // volume contribution (dof × num_eq)
+  DenseMatrix phys_flux; // physical flux at node (num_eq × dim)
+  DenseMatrix adj;       // adjugate of Jacobian (dim × dim)
   std::vector<double> adj_storage;
   std::vector<double> sigma_nodes;
   const FluxFunction& fluxFunction = op_.formIntegrator->GetFluxFunction();
   const FluxWithIGR* flux_igr = dynamic_cast<const FluxWithIGR*>(&fluxFunction);
   const bool use_entropy_flux =
-      (op_.GetDGSEMVolumeFlux() != DGSEMVolumeFlux::Central);
-  const DGSEMVolumeDissipation vol_diss_mode =
-      op_.GetDGSEMVolumeDissipation();
+    (op_.GetDGSEMVolumeFlux() != DGSEMVolumeFlux::Central);
+  const DGSEMVolumeDissipation vol_diss_mode = op_.GetDGSEMVolumeDissipation();
   const bool use_volume_dissipation =
-      (vol_diss_mode != DGSEMVolumeDissipation::None);
+    (vol_diss_mode != DGSEMVolumeDissipation::None);
   const dgsem::EntropyJacobianMode entropy_jacobian_mode =
-      op_.GetDGSEMEntropyJacobianAnalytic()
-          ? dgsem::EntropyJacobianMode::Analytic
-          : dgsem::EntropyJacobianMode::FiniteDifference;
+    op_.GetDGSEMEntropyJacobianAnalytic()
+      ? dgsem::EntropyJacobianMode::Analytic
+      : dgsem::EntropyJacobianMode::FiniteDifference;
   dgsem::EntropyFluxType entropy_type = dgsem::EntropyFluxType::Ranocha;
   if (op_.GetDGSEMVolumeFlux() == DGSEMVolumeFlux::Chandrashekar)
   {
@@ -402,7 +417,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
   for (int e = 0; e < op_.vfes.GetNE(); ++e)
   {
     ElementTransformation* Tr = op_.vfes.GetElementTransformation(e);
-    const FiniteElement& fe   = *op_.vfes.GetFE(e);
+    const FiniteElement& fe = *op_.vfes.GetFE(e);
     const int dof = fe.GetDof();
     const int order = fe.GetOrder();
     const auto& basis1d = mfem::dgsem::GetLGLBasis1D(order);
@@ -412,10 +427,10 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
 
     MFEM_VERIFY(dof == mfem::TensorBasisElement::Pow(n1d, op_.dim),
                 "DGSEM requires tensor-product elements (order "
-                    << order << ", dim " << op_.dim << ").");
+                  << order << ", dim " << op_.dim << ").");
 
     const std::vector<std::array<int, 3>>& dof_to_ijk =
-        mfem::dgsem::GetTensorDofToIJK(fe);
+      mfem::dgsem::GetTensorDofToIJK(fe);
 
     std::vector<int> lex_to_local(dof, 0);
     for (int local = 0; local < dof; ++local)
@@ -423,10 +438,9 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
       const int i = dof_to_ijk[local][0];
       const int j = dof_to_ijk[local][1];
       const int k = dof_to_ijk[local][2];
-      const int lex = (op_.dim == 1)
-                         ? i
-                         : (op_.dim == 2 ? i + n1d * j
-                                         : i + n1d * (j + n1d * k));
+      const int lex =
+        (op_.dim == 1) ? i
+                       : (op_.dim == 2 ? i + n1d * j : i + n1d * (j + n1d * k));
       lex_to_local[lex] = local;
     }
 
@@ -508,55 +522,67 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
       const int idx = (node * op_.dim + d) * op_.dim + k;
       return adj_storage[idx];
     };
-    auto eval_ec_contravariant = [&](int local_i,
-                                     int local_j,
-                                     int dir,
-                                     Vector& out)
+    auto eval_ec_contravariant =
+      [&](int local_i, int local_j, int dir, Vector& out)
     {
       Xmat.GetRow(local_i, state_i);
       Xmat.GetRow(local_j, state_j);
       const double sigma_i =
-          (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_i] : 0.0;
+        (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_i] : 0.0;
       const double sigma_j =
-          (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_j] : 0.0;
+        (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_j] : 0.0;
       out = 0.0;
       for (int k = 0; k < op_.dim; ++k)
       {
-        dgsem::EntropyConservativeFlux(state_i, state_j, k, gamma,
-                                       entropy_type, flux_dir,
-                                       sigma_i, sigma_j);
-        const double adj_avg = 0.5 * (adj_at(local_i, dir, k) +
-                                      adj_at(local_j, dir, k));
+        dgsem::EntropyConservativeFlux(state_i,
+                                       state_j,
+                                       k,
+                                       gamma,
+                                       entropy_type,
+                                       flux_dir,
+                                       sigma_i,
+                                       sigma_j);
+        const double adj_avg =
+          0.5 * (adj_at(local_i, dir, k) + adj_at(local_j, dir, k));
         for (int eq = 0; eq < op_.num_equations; ++eq)
         {
           out(eq) += adj_avg * flux_dir(eq);
         }
       }
     };
-    auto eval_volume_dissipation = [&](int local_i,
-                                       int local_j,
-                                       int dir,
-                                       Vector& out)
+    auto eval_volume_dissipation =
+      [&](int local_i, int local_j, int dir, Vector& out)
     {
       out = 0.0;
-      if (!use_volume_dissipation) { return; }
+      if (!use_volume_dissipation)
+      {
+        return;
+      }
 
       Xmat.GetRow(local_i, state_i);
       Xmat.GetRow(local_j, state_j);
       const double sigma_i =
-          (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_i] : 0.0;
+        (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_i] : 0.0;
       const double sigma_j =
-          (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_j] : 0.0;
+        (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_j] : 0.0;
 
       for (int k = 0; k < op_.dim; ++k)
       {
-        contravariant_dir(k) = 0.5 * (adj_at(local_i, dir, k) +
-                                      adj_at(local_j, dir, k));
+        contravariant_dir(k) =
+          0.5 * (adj_at(local_i, dir, k) + adj_at(local_j, dir, k));
       }
-      const double lf_i = dgsem::EulerDirectionalLaxFriedrichsScale(
-          state_i, contravariant_dir, op_.dim, gamma, sigma_i);
-      const double lf_j = dgsem::EulerDirectionalLaxFriedrichsScale(
-          state_j, contravariant_dir, op_.dim, gamma, sigma_j);
+      const double lf_i =
+        dgsem::EulerDirectionalLaxFriedrichsScale(state_i,
+                                                  contravariant_dir,
+                                                  op_.dim,
+                                                  gamma,
+                                                  sigma_i);
+      const double lf_j =
+        dgsem::EulerDirectionalLaxFriedrichsScale(state_j,
+                                                  contravariant_dir,
+                                                  op_.dim,
+                                                  gamma,
+                                                  sigma_j);
       const double scale = std::max(lf_i, lf_j);
 
       if (vol_diss_mode == DGSEMVolumeDissipation::LLF)
@@ -569,16 +595,22 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
       }
 
       MFEM_ASSERT(vol_diss_mode == DGSEMVolumeDissipation::EntropyVarsLF,
-                  "Unexpected DGSEM volume dissipation mode in entropy-variable LF branch.");
+                  "Unexpected DGSEM volume dissipation mode in "
+                  "entropy-variable LF branch.");
       const bool valid_i =
-          dgsem::EulerStateIsValid(state_i, op_.dim, gamma, sigma_i);
+        dgsem::EulerStateIsValid(state_i, op_.dim, gamma, sigma_i);
       const bool valid_j =
-          dgsem::EulerStateIsValid(state_j, op_.dim, gamma, sigma_j);
+        dgsem::EulerStateIsValid(state_j, op_.dim, gamma, sigma_j);
       if (valid_i && valid_j)
       {
-        dgsem::EntropyVariableLFDissipation(
-            state_i, state_j, gamma, scale, out, sigma_i, sigma_j,
-            entropy_jacobian_mode);
+        dgsem::EntropyVariableLFDissipation(state_i,
+                                            state_j,
+                                            gamma,
+                                            scale,
+                                            out,
+                                            sigma_i,
+                                            sigma_j,
+                                            entropy_jacobian_mode);
       }
       else
       {
@@ -589,10 +621,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
         }
       }
     };
-    auto eval_pair_flux = [&](int local_i,
-                              int local_j,
-                              int dir,
-                              Vector& out)
+    auto eval_pair_flux = [&](int local_i, int local_j, int dir, Vector& out)
     {
       if (use_entropy_flux)
       {
@@ -600,11 +629,18 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
       }
       else
       {
-        mfem::dgsem::SymmetricAverageContravariantFlux(
-            flux, local_i, local_j, dir, op_.dim, out);
+        mfem::dgsem::SymmetricAverageContravariantFlux(flux,
+                                                       local_i,
+                                                       local_j,
+                                                       dir,
+                                                       op_.dim,
+                                                       out);
       }
       eval_volume_dissipation(local_i, local_j, dir, diss_ij);
-      if (use_volume_dissipation) { out += diss_ij; }
+      if (use_volume_dissipation)
+      {
+        out += diss_ij;
+      }
     };
 
     if (op_.dim == 1)
@@ -671,7 +707,10 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
       const int i = dof_to_ijk[local][0];
       const int j = dof_to_ijk[local][1];
       double w = weights(i);
-      if (op_.dim > 1) { w *= weights(j); }
+      if (op_.dim > 1)
+      {
+        w *= weights(j);
+      }
       for (int eq = 0; eq < op_.num_equations; ++eq)
       {
         volume(local, eq) *= w;

@@ -79,6 +79,99 @@ public:
 };
 
 /**
+ * @brief Subsonic outlet with prescribed static pressure.
+ *
+ * Uses a characteristic-compatible closure:
+ *   - preserve outgoing acoustic invariant from the interior,
+ *   - impose static pressure at the boundary,
+ *   - keep interior tangential velocity.
+ */
+class SubsonicOutletPressureState : public BoundaryState
+{
+public:
+  SubsonicOutletPressureState(int dim, double gamma, double pressure_out);
+
+  void Eval(const mfem::Vector& Uminus,
+            const mfem::Vector& nor,
+            mfem::FaceElementTransformations& Tr,
+            mfem::Vector& Uplus) const override;
+
+private:
+  int dim_ = 0;
+  double gamma_ = 1.4;
+  double p_out_ = 1.0;
+};
+
+/**
+ * @brief Approximate non-reflecting outlet anchored to a reference state.
+ *
+ * Uses a one-way characteristic closure:
+ *   - outgoing acoustic invariant from interior,
+ *   - incoming acoustic invariant from reference state,
+ *   - tangential velocity from interior.
+ */
+class NonReflectingOutletState : public BoundaryState
+{
+public:
+  NonReflectingOutletState(const mfem::Vector& Uref, int dim, double gamma);
+
+  void Eval(const mfem::Vector& Uminus,
+            const mfem::Vector& nor,
+            mfem::FaceElementTransformations& Tr,
+            mfem::Vector& Uplus) const override;
+
+private:
+  mfem::Vector Uref_;
+  int dim_ = 0;
+  double gamma_ = 1.4;
+};
+
+/**
+ * @brief Subsonic inlet anchored to a reference conservative state.
+ *
+ * Uses a characteristic-compatible closure:
+ *   - outgoing acoustic invariant from interior,
+ *   - incoming acoustic invariant/entropy/tangential velocity from reference.
+ */
+class SubsonicInletState : public BoundaryState
+{
+public:
+  SubsonicInletState(const mfem::Vector& Uin, int dim, double gamma);
+
+  void Eval(const mfem::Vector& Uminus,
+            const mfem::Vector& nor,
+            mfem::FaceElementTransformations& Tr,
+            mfem::Vector& Uplus) const override;
+
+private:
+  mfem::Vector Uin_;
+  int dim_ = 0;
+  double gamma_ = 1.4;
+};
+
+/**
+ * @brief Far-field state: branch to supersonic/subsonic inflow/outflow modes.
+ *
+ * Supersonic branches reduce to Dirichlet inflow / transmissive outflow.
+ * Subsonic branches use characteristic inlet/non-reflecting outlet closures.
+ */
+class FarFieldState : public BoundaryState
+{
+public:
+  FarFieldState(const mfem::Vector& Ufar, int dim, double gamma);
+
+  void Eval(const mfem::Vector& Uminus,
+            const mfem::Vector& nor,
+            mfem::FaceElementTransformations& Tr,
+            mfem::Vector& Uplus) const override;
+
+private:
+  mfem::Vector Ufar_;
+  int dim_ = 0;
+  double gamma_ = 1.4;
+};
+
+/**
  * @brief Adiabatic slip wall: reflect normal velocity, keep rho and E.
  *
  * Implements:

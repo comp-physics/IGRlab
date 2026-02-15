@@ -30,8 +30,14 @@ void ConfigureLimiterPipeline(RK3SSPWithLimiter& rk3,
   {
     BJOptions opts = config.bj_opts;
     opts.dim = dim;
-    if (opts.qord_avg == 0) { opts.qord_avg = slope_qord; }
-    if (opts.slope_qord == 0) { opts.slope_qord = slope_qord; }
+    if (opts.qord_avg == 0)
+    {
+      opts.qord_avg = slope_qord;
+    }
+    if (opts.slope_qord == 0)
+    {
+      opts.slope_qord = slope_qord;
+    }
     rk3.AddBarthJespersenLimiter(opts);
   }
   else if (config.bj_mode == BJLimiterMode::kCharacteristic)
@@ -39,7 +45,10 @@ void ConfigureLimiterPipeline(RK3SSPWithLimiter& rk3,
     CharBJOptions opts = config.char_bj_opts;
     opts.dim = dim;
     opts.gamma = gamma;
-    if (opts.slope_qord == 0) { opts.slope_qord = slope_qord; }
+    if (opts.slope_qord == 0)
+    {
+      opts.slope_qord = slope_qord;
+    }
     rk3.AddCharBJLimiter(opts);
   }
   else if (config.bj_mode == BJLimiterMode::kFaceNormalCharacteristic)
@@ -47,7 +56,10 @@ void ConfigureLimiterPipeline(RK3SSPWithLimiter& rk3,
     FaceBJOptions opts = config.face_bj_opts;
     opts.dim = dim;
     opts.gamma = gamma;
-    if (opts.slope_qord == 0) { opts.slope_qord = slope_qord; }
+    if (opts.slope_qord == 0)
+    {
+      opts.slope_qord = slope_qord;
+    }
     rk3.AddFaceCharBJLimiter(opts);
   }
 
@@ -56,7 +68,10 @@ void ConfigureLimiterPipeline(RK3SSPWithLimiter& rk3,
     CharTVBOptions opts = config.tvb_opts;
     opts.dim = dim;
     opts.gamma = gamma;
-    if (opts.slope_qord == 0) { opts.slope_qord = slope_qord; }
+    if (opts.slope_qord == 0)
+    {
+      opts.slope_qord = slope_qord;
+    }
     rk3.AddCharTVBLimiter(opts);
   }
   else if (config.tvb_mode == TVBLimiterMode::kFaceNormal)
@@ -64,7 +79,10 @@ void ConfigureLimiterPipeline(RK3SSPWithLimiter& rk3,
     CharTVBOptions opts = config.tvb_opts;
     opts.dim = dim;
     opts.gamma = gamma;
-    if (opts.slope_qord == 0) { opts.slope_qord = slope_qord; }
+    if (opts.slope_qord == 0)
+    {
+      opts.slope_qord = slope_qord;
+    }
     rk3.AddCharTVBFaceNormalLimiter(opts);
   }
 
@@ -74,7 +92,10 @@ void ConfigureLimiterPipeline(RK3SSPWithLimiter& rk3,
     VenkatOptions opts = config.venkat_opts;
     opts.dim = dim;
     opts.gamma = gamma;
-    if (opts.slope_qord == 0) { opts.slope_qord = slope_qord; }
+    if (opts.slope_qord == 0)
+    {
+      opts.slope_qord = slope_qord;
+    }
     if (config.venkat_mode == VenkatLimiterMode::kXY)
     {
       rk3.AddCharVenkatXYLimiter(opts);
@@ -90,7 +111,10 @@ void ConfigureLimiterPipeline(RK3SSPWithLimiter& rk3,
     KrivoOptions opts = config.krivo_opts;
     opts.dim = dim;
     opts.gamma = gamma;
-    if (opts.face_qord == 0) { opts.face_qord = DefaultFaceQord(vfes); }
+    if (opts.face_qord == 0)
+    {
+      opts.face_qord = DefaultFaceQord(vfes);
+    }
     rk3.AddKrivodonovaLimiter(opts);
   }
 

@@ -35,7 +35,7 @@ public:
    * @param fluxFunction flux function F(u,x) (e.g., EulerFlux)
    * @param gamma_ratio specific heat ratio gamma
    */
-  HLLCFlux(const FluxFunction &fluxFunction, real_t gamma_ratio);
+  HLLCFlux(const FluxFunction& fluxFunction, real_t gamma_ratio);
 
   /**
    * @brief  Normal numerical flux Fhat(u^-,u^+,x) n via HLLC
@@ -47,9 +47,11 @@ public:
    * @param[out] flux HLLC normal flux (scaled by |nor|)
    * @return speed scale for CFL, here max(|S_L|, |S_R|)
    */
-  real_t Eval(const Vector &state1, const Vector &state2,
-              const Vector &nor, FaceElementTransformations &Tr,
-              Vector &flux) const override;
+  real_t Eval(const Vector& state1,
+              const Vector& state2,
+              const Vector& nor,
+              FaceElementTransformations& Tr,
+              Vector& flux) const override;
 
   /**
    * @brief  Jacobian of normal numerical flux, diagonal-stabilized
@@ -57,46 +59,65 @@ public:
    *       lambda with max(|S_L|,|S_R|). Exact HLLC Jacobians are lengthy; this
    *       robust approximation works well for explicit DG.
    */
-  void Grad(int side, const Vector &state1, const Vector &state2,
-            const Vector &nor, FaceElementTransformations &Tr,
-            DenseMatrix &grad) const override;
+  void Grad(int side,
+            const Vector& state1,
+            const Vector& state2,
+            const Vector& nor,
+            FaceElementTransformations& Tr,
+            DenseMatrix& grad) const override;
 
   /**
    * @brief  Average normal numerical flux variant
    * @note For robustness and simplicity we reuse Eval(); this matches the
    *       dominant code path in explicit DG runs.
    */
-  real_t Average(const Vector &state1, const Vector &state2,
-                 const Vector &nor, FaceElementTransformations &Tr,
-                 Vector &flux) const override;
+  real_t Average(const Vector& state1,
+                 const Vector& state2,
+                 const Vector& nor,
+                 FaceElementTransformations& Tr,
+                 Vector& flux) const override;
 
   /// @brief Approximate Jacobian for Average; same as Grad().
-  void AverageGrad(int side, const Vector &state1, const Vector &state2,
-                   const Vector &nor, FaceElementTransformations &Tr,
-                   DenseMatrix &grad) const override;
+  void AverageGrad(int side,
+                   const Vector& state1,
+                   const Vector& state2,
+                   const Vector& nor,
+                   FaceElementTransformations& Tr,
+                   DenseMatrix& grad) const override;
 
 protected:
 #ifndef MFEM_THREAD_SAFE
-  mutable Vector fluxN1, fluxN2;   ///< parity with Rusanov; not strictly needed here
+  mutable Vector fluxN1,
+    fluxN2; ///< parity with Rusanov; not strictly needed here
   mutable DenseMatrix JDotN;
 #endif
 
-  const FaceSideExplicitFlux *side_explicit_flux_ = nullptr; ///< Immutable ctor-time cache.
-  const real_t gamma;              ///< specific heat ratio
+  const FaceSideExplicitFlux* side_explicit_flux_ =
+    nullptr;          ///< Immutable ctor-time cache.
+  const real_t gamma; ///< specific heat ratio
 
   // Helpers
-  inline int DimFromState(const Vector &U) const
+  inline int DimFromState(const Vector& U) const
   {
     const int neq = U.Size();
     MFEM_ASSERT(neq >= 3, "Euler requires neq >= 3.");
     return neq - 2;
   }
 
-  static inline void UnitNormalAndMag(const Vector &nor, Vector &nhat, real_t &nmag)
+  static inline void
+  UnitNormalAndMag(const Vector& nor, Vector& nhat, real_t& nmag)
   {
     nmag = nor.Norml2();
-    if (nmag > 0.0) { nhat = nor; nhat /= nmag; }
-    else { nhat.SetSize(nor.Size()); nhat = 0.0; }
+    if (nmag > 0.0)
+    {
+      nhat = nor;
+      nhat /= nmag;
+    }
+    else
+    {
+      nhat.SetSize(nor.Size());
+      nhat = 0.0;
+    }
   }
 
   struct Prim
@@ -106,16 +127,22 @@ protected:
   };
 
   // Convert conservative U -> primitive W; un = u·n_hat
-  void ConsToPrim(const Vector &U, const Vector &nhat, Prim &W) const;
+  void ConsToPrim(const Vector& U, const Vector& nhat, Prim& W) const;
 
   // F(U)·n_hat (unit normal). Retained intentionally as a local HLLC helper
   // for potential non-side-explicit fast-path reuse; Eval currently routes
   // through explicit-side helpers to preserve IGR side semantics.
-  void FluxDotNhat(const Vector &U, const Prim &W, const Vector &nhat, Vector &Fn_hat) const;
+  void FluxDotNhat(const Vector& U,
+                   const Prim& W,
+                   const Vector& nhat,
+                   Vector& Fn_hat) const;
 
   // Einfeldt/Toro wave speeds
-  void HLLC_WaveSpeeds(const Prim &WL, const Prim &WR,
-                       real_t &SL, real_t &Sstar, real_t &SR) const;
+  void HLLC_WaveSpeeds(const Prim& WL,
+                       const Prim& WR,
+                       real_t& SL,
+                       real_t& Sstar,
+                       real_t& SR) const;
 
   static inline real_t SpeedScale(real_t SL, real_t SR)
   {

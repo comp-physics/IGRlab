@@ -15,12 +15,12 @@ namespace mfem
 /// @ingroup utils_config
 struct LimiterConfig
 {
-  int    dim            = dg_igr::EulerDefaults::kDim;    ///< Spatial dimension
-  double gamma          = dg_igr::EulerDefaults::kGamma;  ///< Ratio of specific heats
-  double rho_min        = dg_igr::LimiterDefaults::kRhoMin;
-  double p_min          = dg_igr::LimiterDefaults::kPMin;
-  int    quad_order     = dg_igr::LimiterDefaults::kQuadOrder;
-  int    p_bisect_iters = dg_igr::LimiterDefaults::kBisectIters;
+  int dim = dg_igr::EulerDefaults::kDim;        ///< Spatial dimension
+  double gamma = dg_igr::EulerDefaults::kGamma; ///< Ratio of specific heats
+  double rho_min = dg_igr::LimiterDefaults::kRhoMin;
+  double p_min = dg_igr::LimiterDefaults::kPMin;
+  int quad_order = dg_igr::LimiterDefaults::kQuadOrder;
+  int p_bisect_iters = dg_igr::LimiterDefaults::kBisectIters;
 };
 
 } // namespace mfem

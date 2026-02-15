@@ -58,64 +58,57 @@ namespace mfem
 class BdrHyperbolicFluxIntegrator : public NonlinearFormIntegrator
 {
 private:
-   // The maximum characteristic speed, updated during element/face vector assembly
-   real_t max_char_speed;
-   const NumericalFlux &numFlux;   // Numerical flux that maps F(u±,x) to F̂
-   const FluxFunction &fluxFunction;
-   const std::unique_ptr<BoundaryState> bc;
-   const int IntOrderOffset; // integration order offset, 2*p + IntOrderOffset.
-   const real_t sign;
+  // The maximum characteristic speed, updated during element/face vector assembly
+  real_t max_char_speed;
+  const NumericalFlux& numFlux; // Numerical flux that maps F(u±,x) to F̂
+  const FluxFunction& fluxFunction;
+  const std::unique_ptr<BoundaryState> bc;
+  const int IntOrderOffset; // integration order offset, 2*p + IntOrderOffset.
+  const real_t sign;
 #ifndef MFEM_THREAD_SAFE
-   // Local storage for element integration
-   Vector shape;              // shape function value at an integration point
-   Vector state;              // state value at an integration point
-   DenseMatrix flux;          // flux value at an integration point
-   DenseTensor J;             // Jacobian matrix at an integration point
-   DenseMatrix dshape;  // derivative of shape function at an integration point
+  // Local storage for element integration
+  Vector shape;       // shape function value at an integration point
+  Vector state;       // state value at an integration point
+  DenseMatrix flux;   // flux value at an integration point
+  DenseTensor J;      // Jacobian matrix at an integration point
+  DenseMatrix dshape; // derivative of shape function at an integration point
 
-   Vector shape1;  // shape function value at an integration point - first elem
-   // Vector shape2;  // shape function value at an integration point - second elem // not used
-   Vector state1;  // state value at an integration point - first elem
-   Vector state2;  // state value at an integration point - second elem
-   Vector nor;     // normal vector, see mfem::CalcOrtho()
-   Vector fluxN;   // F̂(u±,x) n
-   DenseMatrix JDotN;   // Ĵ(u±,x) n
+  Vector shape1; // shape function value at an integration point - first elem
+  // Vector shape2;  // shape function value at an integration point - second elem // not used
+  Vector state1;     // state value at an integration point - first elem
+  Vector state2;     // state value at an integration point - second elem
+  Vector nor;        // normal vector, see mfem::CalcOrtho()
+  Vector fluxN;      // F̂(u±,x) n
+  DenseMatrix JDotN; // Ĵ(u±,x) n
 #endif
 
 public:
-   const int num_equations;  // the number of equations
-   /**
+  const int num_equations; // the number of equations
+  /**
     * @brief Construct a new Hyperbolic Form Integrator object
     *
     * @param[in] numFlux numerical flux
     * @param[in] IntOrderOffset integration order offset
     * @param[in] sign sign of the convection term
     */
-   BdrHyperbolicFluxIntegrator(
-      const NumericalFlux &numFlux,
-      const std::unique_ptr<BoundaryState> bc_,
-      const int IntOrderOffset = 0,
-      const real_t sign = 1.);
+  BdrHyperbolicFluxIntegrator(const NumericalFlux& numFlux,
+                              const std::unique_ptr<BoundaryState> bc_,
+                              const int IntOrderOffset = 0,
+                              const real_t sign = 1.);
 
-   /**
+  /**
     * @brief Reset the Max Char Speed 0
     *
     */
-   void ResetMaxCharSpeed()
-   {
-      max_char_speed = 0.0;
-   }
+  void ResetMaxCharSpeed() { max_char_speed = 0.0; }
 
-   real_t GetMaxCharSpeed()
-   {
-      return max_char_speed;
-   }
+  real_t GetMaxCharSpeed() { return max_char_speed; }
 
-   const FluxFunction &GetFluxFunction() { return fluxFunction; }
-   const NumericalFlux &GetNumericalFlux() const { return numFlux; }
-   const BoundaryState &GetBoundaryState() const { return *bc; }
+  const FluxFunction& GetFluxFunction() { return fluxFunction; }
+  const NumericalFlux& GetNumericalFlux() const { return numFlux; }
+  const BoundaryState& GetBoundaryState() const { return *bc; }
 
-   /**
+  /**
     * @brief Implements <-F̂(u⁻,u⁺,x) n, [v]> with abstract F̂ computed by
     * NumericalFlux::Eval() of the numerical flux object
     *
@@ -125,11 +118,11 @@ public:
     * @param[in] elfun local coefficient of basis from both elements
     * @param[out] elvect evaluated dual vector <-F̂(u⁻,u⁺,x) n, [v]>
     */
-   void AssembleFaceVector(const FiniteElement &el1,
-                           const FiniteElement &el2,
-                           FaceElementTransformations &Tr,
-                           const Vector &elfun, Vector &elvect) override;
-
+  void AssembleFaceVector(const FiniteElement& el1,
+                          const FiniteElement& el2,
+                          FaceElementTransformations& Tr,
+                          const Vector& elfun,
+                          Vector& elvect) override;
 };
 
 } // namespace mfem

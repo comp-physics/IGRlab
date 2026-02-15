@@ -69,9 +69,13 @@ struct InflowOptions
 inline void AddInflowOptions(mfem::OptionsParser& args,
                              InflowOptions& inflow_opts)
 {
-  args.AddOption(&inflow_opts.vx, "-vx", "--velocity-x",
+  args.AddOption(&inflow_opts.vx,
+                 "-vx",
+                 "--velocity-x",
                  "Free-stream / inflow velocity x-component.");
-  args.AddOption(&inflow_opts.vy, "-vy", "--velocity-y",
+  args.AddOption(&inflow_opts.vy,
+                 "-vy",
+                 "--velocity-y",
                  "Free-stream / inflow velocity y-component.");
 }
 
@@ -82,7 +86,7 @@ struct SupersonicOptions
 
 } // namespace
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
   dg_sim::CaseSpec<SupersonicOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "supersonic_cylinder";
@@ -90,7 +94,6 @@ int main(int argc, char *argv[])
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
   spec.use_igr = false;
-  spec.need_sigma = false;
   spec.need_h1 = false;
   spec.glvis.precision = 8;
 
@@ -125,11 +128,11 @@ int main(int argc, char *argv[])
   spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
     return dg_sim::BuildBoundaryMarkers(
-        ctx.Mesh(),
-        {{dg_sim::BoundaryRole::Inlet, {4}},
-         {dg_sim::BoundaryRole::Outlet, {2}},
-         {dg_sim::BoundaryRole::Slip, {1, 3}},
-         {dg_sim::BoundaryRole::Cylinder, {5}}});
+      ctx.Mesh(),
+      {{dg_sim::BoundaryRole::Inlet, {4}},
+       {dg_sim::BoundaryRole::Outlet, {2}},
+       {dg_sim::BoundaryRole::Slip, {1, 3}},
+       {dg_sim::BoundaryRole::Cylinder, {5}}});
   };
 
   spec.apply_bc = [](const SupersonicOptions& opts,

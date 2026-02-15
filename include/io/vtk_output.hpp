@@ -29,6 +29,11 @@ struct EulerVTKFields
   mfem::ParGridFunction* speed_h1 = nullptr;
   mfem::ParGridFunction* div_h1 = nullptr;
   mfem::ParGridFunction* grad_frob_h1 = nullptr;
+  // Optional broken/L2 diagnostics from conservative state gradients.
+  mfem::ParGridFunction* div_l2 = nullptr;
+  mfem::ParGridFunction* grad_frob_l2 = nullptr;
+  // Optional per-element MPI rank field.
+  mfem::ParGridFunction* mpi_rank = nullptr;
 };
 
 /// @brief Apply a standardized VTK output configuration to a data collection.

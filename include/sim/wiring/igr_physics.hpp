@@ -15,8 +15,7 @@ namespace dg_sim
 {
 
 /// @brief Euler+IGR physics bundle with BC wiring applied.
-template <typename NumericalFlux>
-struct EulerIGRPhysics
+template <typename NumericalFlux> struct EulerIGRPhysics
 {
   EulerIGRFluxBundle<NumericalFlux> flux;
   mfem::DGHyperbolicConservationLaws op;
@@ -32,22 +31,29 @@ struct EulerIGRPhysics
   {
     ConfigureDGSEMSurfaceFlux(flux.numerical_flux, ctx.run_cfg, gamma);
     EulerBoundaryWiring<NumericalFlux> bc(
-        op, flux.numerical_flux, ctx.run_cfg.case_config.int_order_offset, ctx.dim);
+      op,
+      flux.numerical_flux,
+      ctx.run_cfg.case_config.int_order_offset,
+      ctx.dim,
+      gamma);
     bc_setup(bc, markers);
   }
 };
 
 /// @brief Build Euler+IGR physics with per-case BC wiring.
 template <typename NumericalFlux, typename BcSetup>
-inline EulerIGRPhysics<NumericalFlux> MakeEulerIGRPhysics(
-    ExampleContext& ctx,
-    double gamma,
-    dg_igr::IGRSolver& igr,
-    const BoundaryMarkerMap& markers,
-    BcSetup&& bc_setup)
+inline EulerIGRPhysics<NumericalFlux>
+MakeEulerIGRPhysics(ExampleContext& ctx,
+                    double gamma,
+                    dg_igr::IGRSolver& igr,
+                    const BoundaryMarkerMap& markers,
+                    BcSetup&& bc_setup)
 {
-  return EulerIGRPhysics<NumericalFlux>(
-      ctx, gamma, igr, markers, std::forward<BcSetup>(bc_setup));
+  return EulerIGRPhysics<NumericalFlux>(ctx,
+                                        gamma,
+                                        igr,
+                                        markers,
+                                        std::forward<BcSetup>(bc_setup));
 }
 
 } // namespace dg_sim

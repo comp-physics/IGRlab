@@ -2,9 +2,11 @@ spack:
   specs:
     # Build tools
   - cmake
-  - mfem +mpi
+  - mfem +mpi #+cuda cuda_arch=61
   - doxygen
-  - openmpi
+  - openmpi #+cuda
+  # - cuda
+  # - nvhpc
   packages:
     all:
       providers: 

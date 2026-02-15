@@ -64,9 +64,9 @@ private:
 };
 
 /// @brief Build a boundary marker map from role/attribute specifications.
-inline BoundaryMarkerMap BuildBoundaryMarkers(
-    mfem::ParMesh& pmesh,
-    std::initializer_list<BoundaryMarkerSpec> specs)
+inline BoundaryMarkerMap
+BuildBoundaryMarkers(mfem::ParMesh& pmesh,
+                     std::initializer_list<BoundaryMarkerSpec> specs)
 {
   BoundaryMarkerMap map;
   for (const auto& spec : specs)
@@ -85,20 +85,21 @@ inline void AddSupersonicInlet(mfem::DGHyperbolicConservationLaws& op,
                                const mfem::Array<int>& marker)
 {
   op.AddBdrFaceIntegrator(
-      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
-          numerical_flux,
-          std::make_unique<mfem::SupersonicInletState>(inlet_state),
-          int_order_offset),
-      marker);
+    std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+      numerical_flux,
+      std::make_unique<mfem::SupersonicInletState>(inlet_state),
+      int_order_offset),
+    marker);
 }
 
 /// @brief Add a supersonic inlet BC using a builder that returns the inlet state.
 template <typename StateBuilder>
-inline void AddSupersonicInletFromBuilder(mfem::DGHyperbolicConservationLaws& op,
-                                          const mfem::NumericalFlux& numerical_flux,
-                                          StateBuilder&& build_inlet_state,
-                                          int int_order_offset,
-                                          const mfem::Array<int>& marker)
+inline void
+AddSupersonicInletFromBuilder(mfem::DGHyperbolicConservationLaws& op,
+                              const mfem::NumericalFlux& numerical_flux,
+                              StateBuilder&& build_inlet_state,
+                              int int_order_offset,
+                              const mfem::Array<int>& marker)
 {
   mfem::Vector inlet_state = build_inlet_state();
   AddSupersonicInlet(op, numerical_flux, inlet_state, int_order_offset, marker);
@@ -109,12 +110,81 @@ inline void AddSupersonicOutlet(mfem::DGHyperbolicConservationLaws& op,
                                 int int_order_offset,
                                 const mfem::Array<int>& marker)
 {
+  op.AddBdrFaceIntegrator(std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+                            numerical_flux,
+                            std::make_unique<mfem::SupersonicOutletState>(),
+                            int_order_offset),
+                          marker);
+}
+
+inline void AddSubsonicInlet(mfem::DGHyperbolicConservationLaws& op,
+                             const mfem::NumericalFlux& numerical_flux,
+                             const mfem::Vector& inlet_state,
+                             int int_order_offset,
+                             int dim,
+                             double gamma,
+                             const mfem::Array<int>& marker)
+{
+  op.AddBdrFaceIntegrator(std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+                            numerical_flux,
+                            std::make_unique<mfem::SubsonicInletState>(inlet_state,
+                                                                        dim,
+                                                                        gamma),
+                            int_order_offset),
+                          marker);
+}
+
+inline void
+AddSubsonicOutletPressure(mfem::DGHyperbolicConservationLaws& op,
+                          const mfem::NumericalFlux& numerical_flux,
+                          double pressure_out,
+                          int int_order_offset,
+                          int dim,
+                          double gamma,
+                          const mfem::Array<int>& marker)
+{
   op.AddBdrFaceIntegrator(
-      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
-          numerical_flux,
-          std::make_unique<mfem::SupersonicOutletState>(),
-          int_order_offset),
-      marker);
+    std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+      numerical_flux,
+      std::make_unique<mfem::SubsonicOutletPressureState>(dim,
+                                                          gamma,
+                                                          pressure_out),
+      int_order_offset),
+    marker);
+}
+
+inline void AddNonReflectingOutlet(mfem::DGHyperbolicConservationLaws& op,
+                                   const mfem::NumericalFlux& numerical_flux,
+                                   const mfem::Vector& reference_state,
+                                   int int_order_offset,
+                                   int dim,
+                                   double gamma,
+                                   const mfem::Array<int>& marker)
+{
+  op.AddBdrFaceIntegrator(
+    std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+      numerical_flux,
+      std::make_unique<mfem::NonReflectingOutletState>(reference_state,
+                                                       dim,
+                                                       gamma),
+      int_order_offset),
+    marker);
+}
+
+inline void AddFarField(mfem::DGHyperbolicConservationLaws& op,
+                        const mfem::NumericalFlux& numerical_flux,
+                        const mfem::Vector& farfield_state,
+                        int int_order_offset,
+                        int dim,
+                        double gamma,
+                        const mfem::Array<int>& marker)
+{
+  op.AddBdrFaceIntegrator(
+    std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+      numerical_flux,
+      std::make_unique<mfem::FarFieldState>(farfield_state, dim, gamma),
+      int_order_offset),
+    marker);
 }
 
 inline void AddSlipWall(mfem::DGHyperbolicConservationLaws& op,
@@ -123,59 +193,124 @@ inline void AddSlipWall(mfem::DGHyperbolicConservationLaws& op,
                         int dim,
                         const mfem::Array<int>& marker)
 {
-  op.AddBdrFaceIntegrator(
-      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
-          numerical_flux,
-          std::make_unique<mfem::SlipWallState>(dim),
-          int_order_offset),
-      marker);
+  op.AddBdrFaceIntegrator(std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+                            numerical_flux,
+                            std::make_unique<mfem::SlipWallState>(dim),
+                            int_order_offset),
+                          marker);
 }
 
 /// @brief Convenience wrapper for adding Euler boundary integrators.
-template <typename NumericalFlux>
-class EulerBoundaryWiring
+template <typename NumericalFlux> class EulerBoundaryWiring
 {
 public:
   EulerBoundaryWiring(mfem::DGHyperbolicConservationLaws& op,
                       const NumericalFlux& numerical_flux,
                       int int_order_offset,
-                      int dim)
+                      int dim,
+                      double gamma)
     : op_(op),
       numerical_flux_(numerical_flux),
       int_order_offset_(int_order_offset),
-      dim_(dim)
-  {}
+      dim_(dim),
+      gamma_(gamma)
+  {
+  }
 
   void AddSlipWall(const BoundaryMarkerMap& markers,
                    BoundaryRole role = BoundaryRole::Slip) const
   {
-    dg_sim::AddSlipWall(op_, numerical_flux_, int_order_offset_,
-                                 dim_, markers.At(role));
+    dg_sim::AddSlipWall(op_,
+                        numerical_flux_,
+                        int_order_offset_,
+                        dim_,
+                        markers.At(role));
   }
 
   void AddSupersonicOutlet(const BoundaryMarkerMap& markers,
                            BoundaryRole role = BoundaryRole::Outlet) const
   {
-    dg_sim::AddSupersonicOutlet(op_, numerical_flux_, int_order_offset_,
-                                         markers.At(role));
+    dg_sim::AddSupersonicOutlet(op_,
+                                numerical_flux_,
+                                int_order_offset_,
+                                markers.At(role));
   }
 
   void AddSupersonicInlet(const BoundaryMarkerMap& markers,
                           const mfem::Vector& inlet_state,
                           BoundaryRole role = BoundaryRole::Inlet) const
   {
-    dg_sim::AddSupersonicInlet(op_, numerical_flux_, inlet_state,
-                                        int_order_offset_, markers.At(role));
+    dg_sim::AddSupersonicInlet(op_,
+                               numerical_flux_,
+                               inlet_state,
+                               int_order_offset_,
+                               markers.At(role));
+  }
+
+  void AddSubsonicInlet(const BoundaryMarkerMap& markers,
+                        const mfem::Vector& inlet_state,
+                        BoundaryRole role = BoundaryRole::Inlet) const
+  {
+    dg_sim::AddSubsonicInlet(op_,
+                             numerical_flux_,
+                             inlet_state,
+                             int_order_offset_,
+                             dim_,
+                             gamma_,
+                             markers.At(role));
+  }
+
+  void AddSubsonicOutletPressure(const BoundaryMarkerMap& markers,
+                                 double pressure_out,
+                                 BoundaryRole role = BoundaryRole::Outlet) const
+  {
+    dg_sim::AddSubsonicOutletPressure(op_,
+                                      numerical_flux_,
+                                      pressure_out,
+                                      int_order_offset_,
+                                      dim_,
+                                      gamma_,
+                                      markers.At(role));
+  }
+
+  void AddNonReflectingOutlet(const BoundaryMarkerMap& markers,
+                              const mfem::Vector& reference_state,
+                              BoundaryRole role = BoundaryRole::Outlet) const
+  {
+    dg_sim::AddNonReflectingOutlet(op_,
+                                   numerical_flux_,
+                                   reference_state,
+                                   int_order_offset_,
+                                   dim_,
+                                   gamma_,
+                                   markers.At(role));
+  }
+
+  void AddFarField(const BoundaryMarkerMap& markers,
+                   const mfem::Vector& farfield_state,
+                   BoundaryRole role = BoundaryRole::Outlet) const
+  {
+    dg_sim::AddFarField(op_,
+                        numerical_flux_,
+                        farfield_state,
+                        int_order_offset_,
+                        dim_,
+                        gamma_,
+                        markers.At(role));
   }
 
   template <typename StateBuilder>
-  void AddSupersonicInletFromBuilder(const BoundaryMarkerMap& markers,
-                                     StateBuilder&& build_inlet_state,
-                                     BoundaryRole role = BoundaryRole::Inlet) const
+  void
+  AddSupersonicInletFromBuilder(const BoundaryMarkerMap& markers,
+                                StateBuilder&& build_inlet_state,
+                                BoundaryRole role = BoundaryRole::Inlet) const
   {
     dg_sim::AddSupersonicInletFromBuilder(
-        op_, numerical_flux_, std::forward<StateBuilder>(build_inlet_state),
-        int_order_offset_, markers.At(role));
+      op_,
+      numerical_flux_,
+      std::forward<StateBuilder>(build_inlet_state),
+      int_order_offset_,
+      markers.At(role));
   }
 
 private:
@@ -183,6 +318,7 @@ private:
   const NumericalFlux& numerical_flux_;
   int int_order_offset_ = 0;
   int dim_ = 0;
+  double gamma_ = 1.4;
 };
 
 } // namespace dg_sim

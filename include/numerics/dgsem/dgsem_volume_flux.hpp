@@ -54,14 +54,16 @@ inline void SymmetricAverageContravariantFlux(const DenseMatrix& flux,
  * Uses lambda = |u dot a| + c |a| where `a` is the contravariant direction
  * vector associated with the reference-space derivative direction.
  */
-inline double EulerDirectionalLaxFriedrichsScale(const Vector& state,
-                                                 const Vector& contravariant_dir,
-                                                 int dim,
-                                                 double gamma,
-                                                 double sigma = 0.0)
+inline double
+EulerDirectionalLaxFriedrichsScale(const Vector& state,
+                                   const Vector& contravariant_dir,
+                                   int dim,
+                                   double gamma,
+                                   double sigma = 0.0)
 {
-  MFEM_VERIFY(state.Size() == dim + 2,
-              "EulerDirectionalLaxFriedrichsScale expects Euler conservative state.");
+  MFEM_VERIFY(
+    state.Size() == dim + 2,
+    "EulerDirectionalLaxFriedrichsScale expects Euler conservative state.");
   MFEM_VERIFY(contravariant_dir.Size() == dim,
               "EulerDirectionalLaxFriedrichsScale direction size mismatch.");
 

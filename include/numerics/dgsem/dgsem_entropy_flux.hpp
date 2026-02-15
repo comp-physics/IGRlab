@@ -67,8 +67,7 @@ inline void EulerPrimitive(const Vector& u,
                            double& p,
                            double& rho_e)
 {
-  MFEM_VERIFY(dim == 1 || dim == 2,
-              "EulerPrimitive supports dim=1 or dim=2.");
+  MFEM_VERIFY(dim == 1 || dim == 2, "EulerPrimitive supports dim=1 or dim=2.");
   const int num_eq = dim + 2;
   MFEM_VERIFY(u.Size() == num_eq, "EulerPrimitive: unexpected state size.");
 
@@ -107,10 +106,8 @@ inline void EulerEntropyVariables(const Vector& u,
   }
 }
 
-inline bool EulerStateIsValid(const Vector& u,
-                              int dim,
-                              double gamma,
-                              double sigma)
+inline bool
+EulerStateIsValid(const Vector& u, int dim, double gamma, double sigma)
 {
   double rho, v1, v2, p, rho_e;
   EulerPrimitive(u, dim, gamma, sigma, rho, v1, v2, p, rho_e);
@@ -146,7 +143,8 @@ inline void BuildMeanState(const Vector& ul,
   }
   const double v_sq = v1_bar * v1_bar + v2_bar * v2_bar;
   const double p_eff = p_bar;
-  const double rho_e = (p_eff - sigma_bar) / (gamma - 1.0) + 0.5 * rho_bar * v_sq;
+  const double rho_e =
+    (p_eff - sigma_bar) / (gamma - 1.0) + 0.5 * rho_bar * v_sq;
   u_bar(dim + 1) = rho_e;
 }
 
@@ -353,7 +351,7 @@ inline void ChandrashekarFlux1D(const Vector& ul,
   const double f1 = rho_mean * v_avg;
   const double f2 = f1 * v_avg + p_mean;
   const double f3 =
-      f1 * 0.5 * (1.0 / ((gamma - 1.0) * beta_mean) - v_sq_avg) + f2 * v_avg;
+    f1 * 0.5 * (1.0 / ((gamma - 1.0) * beta_mean) - v_sq_avg) + f2 * v_avg;
   flux(0) = f1;
   flux(1) = f2;
   flux(2) = f3;
@@ -392,8 +390,8 @@ inline void ChandrashekarFlux2D(const Vector& ul,
     const double f2 = f1 * v1_avg + p_mean;
     const double f3 = f1 * v2_avg;
     const double f4 =
-        f1 * 0.5 * (1.0 / ((gamma - 1.0) * beta_mean) - v_sq_avg) +
-        f2 * v1_avg + f3 * v2_avg;
+      f1 * 0.5 * (1.0 / ((gamma - 1.0) * beta_mean) - v_sq_avg) + f2 * v1_avg +
+      f3 * v2_avg;
     flux(0) = f1;
     flux(1) = f2;
     flux(2) = f3;
@@ -405,8 +403,8 @@ inline void ChandrashekarFlux2D(const Vector& ul,
     const double f2 = f1 * v1_avg;
     const double f3 = f1 * v2_avg + p_mean;
     const double f4 =
-        f1 * 0.5 * (1.0 / ((gamma - 1.0) * beta_mean) - v_sq_avg) +
-        f2 * v1_avg + f3 * v2_avg;
+      f1 * 0.5 * (1.0 / ((gamma - 1.0) * beta_mean) - v_sq_avg) + f2 * v1_avg +
+      f3 * v2_avg;
     flux(0) = f1;
     flux(1) = f2;
     flux(2) = f3;
@@ -428,7 +426,7 @@ inline void RanochaFlux1D(const Vector& ul,
 
   const double rho_mean = LogMean(rho_l, rho_r);
   const double inv_rho_p_mean =
-      p_l * p_r * InvLogMean(rho_l * p_r, rho_r * p_l);
+    p_l * p_r * InvLogMean(rho_l * p_r, rho_r * p_l);
   const double v_avg = 0.5 * (v_l + v_r);
   const double p_avg = 0.5 * (p_l + p_r);
   const double v_sq_avg = 0.5 * (v_l * v_r);
@@ -436,9 +434,8 @@ inline void RanochaFlux1D(const Vector& ul,
   flux.SetSize(3);
   const double f1 = rho_mean * v_avg;
   const double f2 = f1 * v_avg + p_avg;
-  const double f3 =
-      f1 * (v_sq_avg + inv_rho_p_mean / (gamma - 1.0)) +
-      0.5 * (p_l * v_r + p_r * v_l);
+  const double f3 = f1 * (v_sq_avg + inv_rho_p_mean / (gamma - 1.0)) +
+                    0.5 * (p_l * v_r + p_r * v_l);
   flux(0) = f1;
   flux(1) = f2;
   flux(2) = f3;
@@ -459,7 +456,7 @@ inline void RanochaFlux2D(const Vector& ul,
 
   const double rho_mean = LogMean(rho_l, rho_r);
   const double inv_rho_p_mean =
-      p_l * p_r * InvLogMean(rho_l * p_r, rho_r * p_l);
+    p_l * p_r * InvLogMean(rho_l * p_r, rho_r * p_l);
   const double v1_avg = 0.5 * (v1_l + v1_r);
   const double v2_avg = 0.5 * (v2_l + v2_r);
   const double p_avg = 0.5 * (p_l + p_r);
@@ -471,9 +468,8 @@ inline void RanochaFlux2D(const Vector& ul,
     const double f1 = rho_mean * v1_avg;
     const double f2 = f1 * v1_avg + p_avg;
     const double f3 = f1 * v2_avg;
-    const double f4 =
-        f1 * (v_sq_avg + inv_rho_p_mean / (gamma - 1.0)) +
-        0.5 * (p_l * v1_r + p_r * v1_l);
+    const double f4 = f1 * (v_sq_avg + inv_rho_p_mean / (gamma - 1.0)) +
+                      0.5 * (p_l * v1_r + p_r * v1_l);
     flux(0) = f1;
     flux(1) = f2;
     flux(2) = f3;
@@ -484,9 +480,8 @@ inline void RanochaFlux2D(const Vector& ul,
     const double f1 = rho_mean * v2_avg;
     const double f2 = f1 * v1_avg;
     const double f3 = f1 * v2_avg + p_avg;
-    const double f4 =
-        f1 * (v_sq_avg + inv_rho_p_mean / (gamma - 1.0)) +
-        0.5 * (p_l * v2_r + p_r * v2_l);
+    const double f4 = f1 * (v_sq_avg + inv_rho_p_mean / (gamma - 1.0)) +
+                      0.5 * (p_l * v2_r + p_r * v2_l);
     flux(0) = f1;
     flux(1) = f2;
     flux(2) = f3;
@@ -604,9 +599,12 @@ inline void WintersDissipation1D(const Vector& ul,
   w_jump = w_r;
   w_jump -= w_l;
 
-  const double lambda1 = std::abs(v_avg_normal - c_bar) * rho_log / (2.0 * gamma);
-  const double lambda2 = std::abs(v_avg_normal) * rho_log * (gamma - 1.0) / gamma;
-  const double lambda3 = std::abs(v_avg_normal + c_bar) * rho_log / (2.0 * gamma);
+  const double lambda1 =
+    std::abs(v_avg_normal - c_bar) * rho_log / (2.0 * gamma);
+  const double lambda2 =
+    std::abs(v_avg_normal) * rho_log * (gamma - 1.0) / gamma;
+  const double lambda3 =
+    std::abs(v_avg_normal + c_bar) * rho_log / (2.0 * gamma);
   const double lambda4 = std::abs(v_avg_normal) * p_avg;
 
   const double w1_jump = w_jump(0);
@@ -615,18 +613,17 @@ inline void WintersDissipation1D(const Vector& ul,
 
   const double w1 = lambda1 * (w1_jump + v_minus_c * w2_jump +
                                (h_bar - c_bar * v_avg_normal) * w3_jump);
-  const double w2 = lambda2 * (w1_jump + v_avg * w2_jump +
-                               0.5 * v_sq_bar * w3_jump);
+  const double w2 =
+    lambda2 * (w1_jump + v_avg * w2_jump + 0.5 * v_sq_bar * w3_jump);
   const double w3 = lambda3 * (w1_jump + v_plus_c * w2_jump +
                                (h_bar + c_bar * v_avg_normal) * w3_jump);
 
   const double diss_rho = w1 + w2 + w3;
   const double diss_rho_v = w1 * v_minus_c + w2 * v_avg + w3 * v_plus_c;
   const double diss_rhoe =
-      w1 * (h_bar - c_bar * v_avg_normal) +
-      w2 * 0.5 * v_sq_bar +
-      w3 * (h_bar + c_bar * v_avg_normal) +
-      lambda4 * (w3_jump * (v_avg * v_avg - v_avg_normal * v_avg_normal));
+    w1 * (h_bar - c_bar * v_avg_normal) + w2 * 0.5 * v_sq_bar +
+    w3 * (h_bar + c_bar * v_avg_normal) +
+    lambda4 * (w3_jump * (v_avg * v_avg - v_avg_normal * v_avg_normal));
 
   diss.SetSize(3);
   diss(0) = -0.5 * diss_rho * norm;
@@ -669,9 +666,12 @@ inline void WintersDissipation2D(const Vector& ul,
   const double c_bar = std::sqrt(gamma * p_avg / rho_log);
   const double v_avg_normal = v1_avg * nx + v2_avg * ny;
 
-  const double lambda1 = std::abs(v_avg_normal - c_bar) * rho_log / (2.0 * gamma);
-  const double lambda2 = std::abs(v_avg_normal) * rho_log * (gamma - 1.0) / gamma;
-  const double lambda3 = std::abs(v_avg_normal + c_bar) * rho_log / (2.0 * gamma);
+  const double lambda1 =
+    std::abs(v_avg_normal - c_bar) * rho_log / (2.0 * gamma);
+  const double lambda2 =
+    std::abs(v_avg_normal) * rho_log * (gamma - 1.0) / gamma;
+  const double lambda3 =
+    std::abs(v_avg_normal + c_bar) * rho_log / (2.0 * gamma);
   const double lambda4 = std::abs(v_avg_normal) * p_avg;
 
   const double v1_minus_c = v1_avg - c_bar * nx;
@@ -699,27 +699,25 @@ inline void WintersDissipation2D(const Vector& ul,
 
   const double w1 = lambda1 * (w1_jump + v_minus_dot +
                                (h_bar - c_bar * v_avg_normal) * w4_jump);
-  const double w2 = lambda2 * (w1_jump + v_avg_dot +
-                               0.5 * v_sq_bar * w4_jump);
-  const double w3 = lambda3 * (w1_jump + v_plus_dot +
-                               (h_bar + c_bar * v_avg_normal) * w4_jump);
+  const double w2 = lambda2 * (w1_jump + v_avg_dot + 0.5 * v_sq_bar * w4_jump);
+  const double w3 =
+    lambda3 * (w1_jump + v_plus_dot + (h_bar + c_bar * v_avg_normal) * w4_jump);
 
   const double w_normal_jump = w2_jump * nx + w3_jump * ny;
   const double diss_rho = w1 + w2 + w3;
   const double diss_rho_v1 =
-      w1 * v1_minus_c + w2 * v1_avg + w3 * v1_plus_c +
-      lambda4 * (w2_jump - nx * w_normal_jump + w4_jump * v1_tan);
+    w1 * v1_minus_c + w2 * v1_avg + w3 * v1_plus_c +
+    lambda4 * (w2_jump - nx * w_normal_jump + w4_jump * v1_tan);
   const double diss_rho_v2 =
-      w1 * v2_minus_c + w2 * v2_avg + w3 * v2_plus_c +
-      lambda4 * (w3_jump - ny * w_normal_jump + w4_jump * v2_tan);
+    w1 * v2_minus_c + w2 * v2_avg + w3 * v2_plus_c +
+    lambda4 * (w3_jump - ny * w_normal_jump + w4_jump * v2_tan);
 
   const double v_tan_dot = v1_tan * w2_jump + v2_tan * w3_jump;
   const double v_avg_sq = v1_avg * v1_avg + v2_avg * v2_avg;
   const double diss_rhoe =
-      w1 * (h_bar - c_bar * v_avg_normal) +
-      w2 * 0.5 * v_sq_bar +
-      w3 * (h_bar + c_bar * v_avg_normal) +
-      lambda4 * (v_tan_dot + w4_jump * (v_avg_sq - v_avg_normal * v_avg_normal));
+    w1 * (h_bar - c_bar * v_avg_normal) + w2 * 0.5 * v_sq_bar +
+    w3 * (h_bar + c_bar * v_avg_normal) +
+    lambda4 * (v_tan_dot + w4_jump * (v_avg_sq - v_avg_normal * v_avg_normal));
 
   diss.SetSize(4);
   diss(0) = -0.5 * diss_rho * norm;
@@ -750,15 +748,15 @@ inline void WintersDissipation(const Vector& ul,
   MFEM_VERIFY(false, "WintersDissipation supports Euler in 1D or 2D.");
 }
 
-inline void EntropyVariableLFDissipation(const Vector& ul,
-                                         const Vector& ur,
-                                         double gamma,
-                                         double scale,
-                                         Vector& diss,
-                                         double sigma_l = 0.0,
-                                         double sigma_r = 0.0,
-                                         EntropyJacobianMode mode =
-                                             EntropyJacobianMode::FiniteDifference)
+inline void EntropyVariableLFDissipation(
+  const Vector& ul,
+  const Vector& ur,
+  double gamma,
+  double scale,
+  Vector& diss,
+  double sigma_l = 0.0,
+  double sigma_r = 0.0,
+  EntropyJacobianMode mode = EntropyJacobianMode::FiniteDifference)
 {
   const int num_eq = ul.Size();
   MFEM_VERIFY(num_eq == ur.Size(),

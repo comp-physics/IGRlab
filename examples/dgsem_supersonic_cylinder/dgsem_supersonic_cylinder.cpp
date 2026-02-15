@@ -7,44 +7,56 @@
 
 #include "supersonic_cylinder.hpp"
 
-namespace {
+namespace
+{
 
-struct InflowOptions {
+struct InflowOptions
+{
   double vx = 3.0;
   double vy = 0.0;
 };
 
-inline void AddInflowOptions(mfem::OptionsParser &args,
-                             InflowOptions &inflow_opts) {
-  args.AddOption(&inflow_opts.vx, "-vx", "--velocity-x",
+inline void AddInflowOptions(mfem::OptionsParser& args,
+                             InflowOptions& inflow_opts)
+{
+  args.AddOption(&inflow_opts.vx,
+                 "-vx",
+                 "--velocity-x",
                  "Free-stream / inflow velocity x-component.");
-  args.AddOption(&inflow_opts.vy, "-vy", "--velocity-y",
+  args.AddOption(&inflow_opts.vy,
+                 "-vy",
+                 "--velocity-y",
                  "Free-stream / inflow velocity y-component.");
 }
 
-struct SupersonicOptions {
+struct SupersonicOptions
+{
   InflowOptions inflow;
 };
 
 } // namespace
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[])
+{
   dg_sim::CaseSpec<SupersonicOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "dgsem_supersonic_cylinder";
   spec.default_mesh_path = mfem::SupersonicCylinderDefaultMeshPath();
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
-  spec.use_igr = false;
-  spec.need_sigma = false;
+  spec.use_igr = true;
   spec.need_h1 = false;
+  spec.diagnostics.h1_diagnostics = true;
+  spec.diagnostics.l2_diagnostics = true;
+  spec.diagnostics.mpi_rank_field = true;
   spec.glvis.precision = 8;
   spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
 
-  spec.configure_case = [](dg_sim::CaseConfig &cfg) {
+  spec.configure_case = [](dg_sim::CaseConfig& cfg)
+  {
     cfg.defaults.t_final = 2.0;
-    cfg.defaults.vtk_save = false;
+    cfg.defaults.vtk_save = true;
     cfg.defaults.par_ref_levels = 0;
-    cfg.defaults.dgsem_volume_flux = "ranocha";
+    cfg.defaults.dgsem_volume_flux = "central";
     cfg.defaults.dgsem_volume_dissipation = "llf";
     cfg.defaults.dgsem_surface_flux = "rusanov";
     cfg.rk3_config.limit_initial = false;
@@ -52,12 +64,14 @@ int main(int argc, char *argv[]) {
     cfg.limiter_pipeline.zhang_shu = true;
   };
 
-  spec.add_options = [](mfem::OptionsParser &args, SupersonicOptions &opts) {
+  spec.add_options = [](mfem::OptionsParser& args, SupersonicOptions& opts)
+  {
     AddInflowOptions(args, opts.inflow);
   };
 
-  spec.make_ic = [](const SupersonicOptions &opts,
-                    const dg_sim::ExampleContext &, double) {
+  spec.make_ic =
+    [](const SupersonicOptions& opts, const dg_sim::ExampleContext&, double)
+  {
     mfem::Vector Uin(4);
     Uin(0) = 1.4;
     Uin(1) = 1.4 * opts.inflow.vx;
@@ -68,17 +82,21 @@ int main(int argc, char *argv[]) {
     return dg_sim::MakeVectorFunctionIC(ic_fun);
   };
 
-  spec.build_markers = [](dg_sim::ExampleContext &ctx) {
+  spec.build_markers = [](dg_sim::ExampleContext& ctx)
+  {
     return dg_sim::BuildBoundaryMarkers(
-        ctx.Mesh(), {{dg_sim::BoundaryRole::Inlet, {4}},
-                     {dg_sim::BoundaryRole::Outlet, {2}},
-                     {dg_sim::BoundaryRole::Slip, {1, 3}},
-                     {dg_sim::BoundaryRole::Cylinder, {5}}});
+      ctx.Mesh(),
+      {{dg_sim::BoundaryRole::Inlet, {4}},
+       {dg_sim::BoundaryRole::Outlet, {2}},
+       {dg_sim::BoundaryRole::Slip, {1, 3}},
+       {dg_sim::BoundaryRole::Cylinder, {5}}});
   };
 
-  spec.apply_bc = [](const SupersonicOptions &opts,
-                     const dg_sim::ExampleContext &, auto &bc,
-                     const auto &markers) {
+  spec.apply_bc = [](const SupersonicOptions& opts,
+                     const dg_sim::ExampleContext&,
+                     auto& bc,
+                     const auto& markers)
+  {
     mfem::Vector Uin(4);
     Uin(0) = 1.4;
     Uin(1) = 1.4 * opts.inflow.vx;
@@ -91,12 +109,14 @@ int main(int argc, char *argv[]) {
     bc.AddSlipWall(markers, dg_sim::BoundaryRole::Cylinder);
   };
 
-  spec.postprocess = [](const SupersonicOptions &,
-                        const dg_sim::ExampleContext &,
-                        const dg_sim::EulerStateBundle &state,
-                        mfem::VectorCoefficient &ic) {
+  spec.postprocess = [](const SupersonicOptions&,
+                        const dg_sim::ExampleContext&,
+                        const dg_sim::EulerStateBundle& state,
+                        mfem::VectorCoefficient& ic)
+  {
     const mfem::real_t error = state.sol.ComputeLpError(2, ic);
-    if (mfem::Mpi::Root()) {
+    if (mfem::Mpi::Root())
+    {
       std::cout << "Solution error: " << error << std::endl;
     }
     return 0;

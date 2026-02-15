@@ -21,14 +21,15 @@ namespace dg_sim
  * solver-facing ownership type (`std::unique_ptr<mfem::VectorCoefficient>`).
  */
 template <typename... Args>
-inline std::unique_ptr<mfem::VectorCoefficient> MakeVectorFunctionIC(Args&&... args)
+inline std::unique_ptr<mfem::VectorCoefficient>
+MakeVectorFunctionIC(Args&&... args)
 {
-  static_assert(std::is_constructible_v<mfem::VectorFunctionCoefficient, Args...>,
-                "MakeVectorFunctionIC arguments must match a "
-                "VectorFunctionCoefficient constructor.");
+  static_assert(
+    std::is_constructible_v<mfem::VectorFunctionCoefficient, Args...>,
+    "MakeVectorFunctionIC arguments must match a "
+    "VectorFunctionCoefficient constructor.");
   return std::make_unique<mfem::VectorFunctionCoefficient>(
-      std::forward<Args>(args)...);
+    std::forward<Args>(args)...);
 }
 
 } // namespace dg_sim
-

@@ -65,13 +65,20 @@ BoundaryTransformAudit AuditBoundaryTransforms(mfem::ParMesh& pmesh, int order)
 
   for (int b = 0; b < pmesh.GetNBE(); ++b)
   {
-    mfem::FaceElementTransformations* Tr_bdr = pmesh.GetBdrFaceTransformations(b);
-    if (!Tr_bdr) { continue; }
+    mfem::FaceElementTransformations* Tr_bdr =
+      pmesh.GetBdrFaceTransformations(b);
+    if (!Tr_bdr)
+    {
+      continue;
+    }
 
     const int face = pmesh.GetBdrElementFaceIndex(b);
     mfem::FaceElementTransformations* Tr_face =
-        pmesh.GetFaceElementTransformations(face);
-    if (!Tr_face) { continue; }
+      pmesh.GetFaceElementTransformations(face);
+    if (!Tr_face)
+    {
+      continue;
+    }
 
     for (int q = 0; q < ir.GetNPoints(); ++q)
     {
@@ -133,13 +140,17 @@ FaceNodeAudit AuditDGSEMFaceNodes(const mfem::ParGridFunction& U,
   const int n1d = basis1d.n;
   const mfem::IntegrationRule& ir = mfem::dgsem::GetLGLFaceRule(order);
 
-  const auto* vfes = dynamic_cast<const mfem::ParFiniteElementSpace*>(U.ParFESpace());
+  const auto* vfes =
+    dynamic_cast<const mfem::ParFiniteElementSpace*>(U.ParFESpace());
   MFEM_VERIFY(vfes, "AuditDGSEMFaceNodes requires a ParFiniteElementSpace.");
 
   for (int b = 0; b < pmesh.GetNBE(); ++b)
   {
     mfem::FaceElementTransformations* Tr = pmesh.GetBdrFaceTransformations(b);
-    if (!Tr) { continue; }
+    if (!Tr)
+    {
+      continue;
+    }
 
     int info = 0;
     int elem_id = -1;
@@ -200,32 +211,29 @@ FaceNodeAudit AuditDGSEMFaceNodes(const mfem::ParGridFunction& U,
         local.mismatched += 1.0;
         if (dump && dump_remaining > 0)
         {
-          std::cout << "[AUDIT] bdr=" << b
-                    << " elem=" << e1
-                    << " face_id=" << face_id
-                    << " orient=" << face_orientation
-                    << " ip=(" << FormatSci(ip1.x) << "," << FormatSci(ip1.y) << ")"
-                    << " local_idx=" << local_idx
+          std::cout << "[AUDIT] bdr=" << b << " elem=" << e1
+                    << " face_id=" << face_id << " orient=" << face_orientation
+                    << " ip=(" << FormatSci(ip1.x) << "," << FormatSci(ip1.y)
+                    << ")" << " local_idx=" << local_idx
                     << " max_idx=" << max_idx
                     << " shape_local=" << FormatSci(shape(local_idx))
-                    << " shape_max=" << FormatSci(max_val)
-                    << "\n";
+                    << " shape_max=" << FormatSci(max_val) << "\n";
           --dump_remaining;
         }
       }
       local.total += 1.0;
 
       local.shape_local_err_max =
-          std::max(local.shape_local_err_max, std::abs(1.0 - shape(local_idx)));
+        std::max(local.shape_local_err_max, std::abs(1.0 - shape(local_idx)));
       local.shape_peak_err_max =
-          std::max(local.shape_peak_err_max, std::abs(1.0 - max_val));
+        std::max(local.shape_peak_err_max, std::abs(1.0 - max_val));
 
       Xmat1.GetRow(local_idx, state_node);
       Xmat1.MultTranspose(shape, state_from_shape);
       diff = state_from_shape;
       diff -= state_node;
       local.state_interp_err_max =
-          std::max(local.state_interp_err_max, diff.Norml2());
+        std::max(local.state_interp_err_max, diff.Norml2());
     }
   }
 
@@ -254,7 +262,10 @@ void AssembleBoundaryShape(const mfem::ParFiniteElementSpace& vfes,
   for (int b = 0; b < pmesh.GetNBE(); ++b)
   {
     mfem::FaceElementTransformations* Tr = pmesh.GetBdrFaceTransformations(b);
-    if (!Tr) { continue; }
+    if (!Tr)
+    {
+      continue;
+    }
 
     const int e1 = Tr->Elem1No;
     const mfem::FiniteElement& fe1 = *vfes.GetFE(e1);
@@ -285,12 +296,14 @@ int RunDGSEMOperatorTests(TestContext& ctx)
   mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
 
   mfem::DG_FECollection fec(/*order=*/2, dim, mfem::BasisType::GaussLobatto);
-  mfem::ParFiniteElementSpace vfes(&pmesh, &fec, num_eq,
+  mfem::ParFiniteElementSpace vfes(&pmesh,
+                                   &fec,
+                                   num_eq,
                                    mfem::Ordering::byNODES);
 
   mfem::ParGridFunction U(&vfes);
   const mfem::Vector cons_const =
-      EulerConsFromPrim1D(/*rho=*/1.0, /*u=*/0.0, /*p=*/1.0, gamma);
+    EulerConsFromPrim1D(/*rho=*/1.0, /*u=*/0.0, /*p=*/1.0, gamma);
   FillConstantState(cons_const, U);
 
   mfem::EulerFlux flux(dim, gamma);
@@ -298,9 +311,10 @@ int RunDGSEMOperatorTests(TestContext& ctx)
 
   constexpr int int_order_offset = 2;
   auto form_integrator =
-      std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux,
-                                                       int_order_offset);
-  mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form_integrator),
+    std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux,
+                                                     int_order_offset);
+  mfem::DGHyperbolicConservationLaws oper(vfes,
+                                          std::move(form_integrator),
                                           /*preassembleWeakDivergence=*/true);
   oper.SetNumericalFlux(&num_flux);
   oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
@@ -313,9 +327,10 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     bdr_marker = 1;
     auto outlet = std::make_unique<mfem::SupersonicOutletState>();
     oper.AddBdrFaceIntegrator(
-        new mfem::BdrHyperbolicFluxIntegrator(num_flux, std::move(outlet),
-                                              int_order_offset),
-        bdr_marker);
+      new mfem::BdrHyperbolicFluxIntegrator(num_flux,
+                                            std::move(outlet),
+                                            int_order_offset),
+      bdr_marker);
   }
 
   mfem::Vector x;
@@ -342,14 +357,14 @@ int RunDGSEMOperatorTests(TestContext& ctx)
   ctx.Check(norm_vol > 0.0, "DGSEM volume contribution is nonzero");
   ctx.Check(norm_sum < tol,
             "DGSEM surface + volume cancel for constant state (norm=" +
-                FormatSci(norm_sum) + ")");
+              FormatSci(norm_sum) + ")");
 
   mfem::Vector y(vfes.GetTrueVSize());
   dgsem_op.ApplyInverseMass(z_sum, y);
   const double resid_norm = GlobalL2Norm(y);
   ctx.Check(resid_norm < tol,
             "DGSEM operator residual ~0 after M^{-1} (norm=" +
-                FormatSci(resid_norm) + ")");
+              FormatSci(resid_norm) + ")");
 
   ctx.AddParity(norm_surf + norm_vol + norm_sum + resid_norm);
 
@@ -359,17 +374,23 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     constexpr int num_eq2 = dim2 + 2;
     constexpr int order2 = 2;
 
-    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(1, 1, mfem::Element::QUADRILATERAL,
-                                                   /*gen_edges=*/true, 1.0, 1.0);
+    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(1,
+                                                   1,
+                                                   mfem::Element::QUADRILATERAL,
+                                                   /*gen_edges=*/true,
+                                                   1.0,
+                                                   1.0);
     mfem::ParMesh pmesh2(MPI_COMM_WORLD, mesh2);
 
     mfem::DG_FECollection fec2(order2, dim2, mfem::BasisType::GaussLobatto);
-    mfem::ParFiniteElementSpace vfes2(&pmesh2, &fec2, num_eq2,
+    mfem::ParFiniteElementSpace vfes2(&pmesh2,
+                                      &fec2,
+                                      num_eq2,
                                       mfem::Ordering::byNODES);
 
     mfem::ParGridFunction U2(&vfes2);
     const mfem::Vector cons_const2 =
-        EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma);
+      EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma);
     FillConstantState(cons_const2, U2);
 
     mfem::EulerFlux flux2(dim2, gamma);
@@ -388,19 +409,22 @@ int RunDGSEMOperatorTests(TestContext& ctx)
                                  std::unique_ptr<mfem::BoundaryState> bc_state)
     {
       auto form_integrator2 =
-          std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
-                                                           int_order_offset2);
-      mfem::DGHyperbolicConservationLaws oper2(vfes2, std::move(form_integrator2),
-                                               /*preassembleWeakDivergence=*/true);
+        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
+                                                         int_order_offset2);
+      mfem::DGHyperbolicConservationLaws oper2(
+        vfes2,
+        std::move(form_integrator2),
+        /*preassembleWeakDivergence=*/true);
       oper2.SetNumericalFlux(&num_flux2);
       oper2.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
 
       if (max_attr2 > 0)
       {
         oper2.AddBdrFaceIntegrator(
-            new mfem::BdrHyperbolicFluxIntegrator(num_flux2, std::move(bc_state),
-                                                  int_order_offset2),
-            bdr_marker2);
+          new mfem::BdrHyperbolicFluxIntegrator(num_flux2,
+                                                std::move(bc_state),
+                                                int_order_offset2),
+          bdr_marker2);
       }
 
       mfem::Vector x2;
@@ -420,15 +444,15 @@ int RunDGSEMOperatorTests(TestContext& ctx)
 
       const double norm_sum2 = GlobalL2Norm(z_sum2);
       ctx.Check(norm_sum2 < tol,
-                "DGSEM 2D surface + volume cancel (" + label + ", norm=" +
-                    FormatSci(norm_sum2) + ")");
+                "DGSEM 2D surface + volume cancel (" + label +
+                  ", norm=" + FormatSci(norm_sum2) + ")");
 
       mfem::Vector y2(vfes2.GetTrueVSize());
       dgsem_op2.ApplyInverseMass(z_sum2, y2);
       const double resid_norm2 = GlobalL2Norm(y2);
       ctx.Check(resid_norm2 < tol,
-                "DGSEM 2D residual ~0 after M^{-1} (" + label + ", norm=" +
-                    FormatSci(resid_norm2) + ")");
+                "DGSEM 2D residual ~0 after M^{-1} (" + label +
+                  ", norm=" + FormatSci(resid_norm2) + ")");
 
       ctx.AddParity(norm_sum2 + resid_norm2);
     };
@@ -436,8 +460,9 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     run_boundary_case("outlet",
                       std::make_unique<mfem::SupersonicOutletState>());
 
-    run_boundary_case("inlet",
-                      std::make_unique<mfem::SupersonicInletState>(cons_const2));
+    run_boundary_case(
+      "inlet",
+      std::make_unique<mfem::SupersonicInletState>(cons_const2));
   }
 
   // Boundary face nodes + normals sanity (LGL alignment + outward normals).
@@ -447,12 +472,18 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     constexpr int order2 = 3;
     const double tol_face = 1.0e-10;
 
-    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(1, 1, mfem::Element::QUADRILATERAL,
-                                                   /*gen_edges=*/true, 1.0, 1.0);
+    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(1,
+                                                   1,
+                                                   mfem::Element::QUADRILATERAL,
+                                                   /*gen_edges=*/true,
+                                                   1.0,
+                                                   1.0);
     mfem::ParMesh pmesh2(MPI_COMM_WORLD, mesh2);
 
     mfem::DG_FECollection fec2(order2, dim2, mfem::BasisType::GaussLobatto);
-    mfem::ParFiniteElementSpace vfes2(&pmesh2, &fec2, num_eq2,
+    mfem::ParFiniteElementSpace vfes2(&pmesh2,
+                                      &fec2,
+                                      num_eq2,
                                       mfem::Ordering::byNODES);
 
     const auto& basis = mfem::dgsem::GetLGLBasis1D(order2);
@@ -483,8 +514,11 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     for (int f = 0; f < nfaces; ++f)
     {
       mfem::FaceElementTransformations* Tr =
-          mesh_ref.GetFaceElementTransformations(f);
-      if (!Tr || Tr->Elem2No >= 0) { continue; }
+        mesh_ref.GetFaceElementTransformations(f);
+      if (!Tr || Tr->Elem2No >= 0)
+      {
+        continue;
+      }
       ++bdr_faces;
 
       mfem::Array<int> face_verts;
@@ -535,8 +569,13 @@ int RunDGSEMOperatorTests(TestContext& ctx)
         mfem::CalcOrtho(Tr->Jacobian(), nor);
         const double nmag = nor.Norml2();
         ctx.Check(nmag > 0.0, "Boundary normal magnitude is nonzero");
-        if (ref_norm < 0.0) { ref_norm = nmag; }
-        ctx.CheckNear(nmag, ref_norm, 1.0e-10,
+        if (ref_norm < 0.0)
+        {
+          ref_norm = nmag;
+        }
+        ctx.CheckNear(nmag,
+                      ref_norm,
+                      1.0e-10,
                       "Boundary normal magnitude consistent along face");
 
         const double dot = nor * expected;
@@ -564,20 +603,28 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     constexpr int order2 = 3;
     constexpr int int_order_offset2 = 2;
 
-    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(1, 1, mfem::Element::QUADRILATERAL,
-                                                   /*gen_edges=*/true, 1.0, 1.0);
+    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(1,
+                                                   1,
+                                                   mfem::Element::QUADRILATERAL,
+                                                   /*gen_edges=*/true,
+                                                   1.0,
+                                                   1.0);
     mfem::ParMesh pmesh2(MPI_COMM_WORLD, mesh2);
     mfem::DG_FECollection fec2(order2, dim2, mfem::BasisType::GaussLobatto);
-    mfem::ParFiniteElementSpace vfes2(&pmesh2, &fec2, num_eq2,
+    mfem::ParFiniteElementSpace vfes2(&pmesh2,
+                                      &fec2,
+                                      num_eq2,
                                       mfem::Ordering::byNODES);
 
     mfem::EulerFlux flux2(dim2, gamma);
     mfem::RusanovFluxWithSides num_flux2(flux2);
     auto form_integrator2 =
-        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
-                                                         int_order_offset2);
-    mfem::DGHyperbolicConservationLaws oper2(vfes2, std::move(form_integrator2),
-                                             /*preassembleWeakDivergence=*/true);
+      std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
+                                                       int_order_offset2);
+    mfem::DGHyperbolicConservationLaws oper2(
+      vfes2,
+      std::move(form_integrator2),
+      /*preassembleWeakDivergence=*/true);
     const mfem::IntegrationRule& lgl_rule = mfem::dgsem::GetLGLFaceRule(order2);
     oper2.SetFaceIntegrationRule(lgl_rule);
 
@@ -587,9 +634,11 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     bdr_marker2 = 1;
 
     auto inlet2 = std::make_unique<mfem::SupersonicInletState>(
-        EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma));
-    auto bdr = std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
-        num_flux2, std::move(inlet2), int_order_offset2);
+      EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma));
+    auto bdr =
+      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(num_flux2,
+                                                          std::move(inlet2),
+                                                          int_order_offset2);
     mfem::BdrHyperbolicFluxIntegrator* bdr_ptr = bdr.get();
     oper2.AddBdrFaceIntegrator(std::move(bdr), bdr_marker2);
     const mfem::IntegrationRule* bdr_rule = bdr_ptr->GetIntegrationRule();
@@ -602,8 +651,8 @@ int RunDGSEMOperatorTests(TestContext& ctx)
       {
         const mfem::IntegrationPoint& a = bdr_rule->IntPoint(q);
         const mfem::IntegrationPoint& b = lgl_rule.IntPoint(q);
-        const double err = std::max(std::abs(a.x - b.x),
-                                    std::abs(a.weight - b.weight));
+        const double err =
+          std::max(std::abs(a.x - b.x), std::abs(a.weight - b.weight));
         rule_err_max = std::max(rule_err_max, err);
         if (err > 1.0e-14)
         {
@@ -620,25 +669,26 @@ int RunDGSEMOperatorTests(TestContext& ctx)
                     ", order=" + std::to_string(bdr_order) +
                     ", err_max=" + FormatSci(rule_err_max));
     }
-    ctx.Check(same_rule,
-              "Boundary integrator uses DGSEM LGL face rule");
+    ctx.Check(same_rule, "Boundary integrator uses DGSEM LGL face rule");
 
     // Updating the face rule after BC registration must retarget existing
     // boundary integrators to the new rule (no stale pointer to prior rule).
-    const mfem::IntegrationRule& lgl_rule_updated = mfem::dgsem::GetLGLFaceRule(1);
+    const mfem::IntegrationRule& lgl_rule_updated =
+      mfem::dgsem::GetLGLFaceRule(1);
     oper2.SetFaceIntegrationRule(lgl_rule_updated);
-    const mfem::IntegrationRule* bdr_rule_updated = bdr_ptr->GetIntegrationRule();
-    bool same_updated_rule = (bdr_rule_updated != nullptr) &&
-                             (bdr_rule_updated->GetNPoints() ==
-                              lgl_rule_updated.GetNPoints());
+    const mfem::IntegrationRule* bdr_rule_updated =
+      bdr_ptr->GetIntegrationRule();
+    bool same_updated_rule =
+      (bdr_rule_updated != nullptr) &&
+      (bdr_rule_updated->GetNPoints() == lgl_rule_updated.GetNPoints());
     if (same_updated_rule)
     {
       for (int q = 0; q < lgl_rule_updated.GetNPoints(); ++q)
       {
         const mfem::IntegrationPoint& a = bdr_rule_updated->IntPoint(q);
         const mfem::IntegrationPoint& b = lgl_rule_updated.IntPoint(q);
-        const double err = std::max(std::abs(a.x - b.x),
-                                    std::abs(a.weight - b.weight));
+        const double err =
+          std::max(std::abs(a.x - b.x), std::abs(a.weight - b.weight));
         if (err > 1.0e-14)
         {
           same_updated_rule = false;
@@ -658,25 +708,33 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     constexpr int int_order_offset2 = 2;
     const double tol_bdr = 1.0e-12;
 
-    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(1, 1, mfem::Element::QUADRILATERAL,
-                                                   /*gen_edges=*/true, 1.0, 1.0);
+    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(1,
+                                                   1,
+                                                   mfem::Element::QUADRILATERAL,
+                                                   /*gen_edges=*/true,
+                                                   1.0,
+                                                   1.0);
     mfem::ParMesh pmesh2(MPI_COMM_WORLD, mesh2);
     mfem::DG_FECollection fec2(order2, dim2, mfem::BasisType::GaussLobatto);
-    mfem::ParFiniteElementSpace vfes2(&pmesh2, &fec2, num_eq2,
+    mfem::ParFiniteElementSpace vfes2(&pmesh2,
+                                      &fec2,
+                                      num_eq2,
                                       mfem::Ordering::byNODES);
 
     mfem::ParGridFunction U2(&vfes2);
     const mfem::Vector cons_const2 =
-        EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.25, /*v=*/0.1, /*p=*/1.0, gamma);
+      EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.25, /*v=*/0.1, /*p=*/1.0, gamma);
     FillConstantState(cons_const2, U2);
 
     mfem::EulerFlux flux2(dim2, gamma);
     mfem::RusanovFluxWithSides num_flux2(flux2);
     auto form_integrator2 =
-        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
-                                                         int_order_offset2);
-    mfem::DGHyperbolicConservationLaws oper2(vfes2, std::move(form_integrator2),
-                                             /*preassembleWeakDivergence=*/true);
+      std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
+                                                       int_order_offset2);
+    mfem::DGHyperbolicConservationLaws oper2(
+      vfes2,
+      std::move(form_integrator2),
+      /*preassembleWeakDivergence=*/true);
     oper2.SetNumericalFlux(&num_flux2);
     oper2.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
     oper2.SetFaceIntegrationRule(mfem::dgsem::GetLGLFaceRule(order2));
@@ -687,9 +745,10 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     bdr_marker2 = 1;
     auto inlet2 = std::make_unique<mfem::SupersonicInletState>(cons_const2);
     oper2.AddBdrFaceIntegrator(
-        new mfem::BdrHyperbolicFluxIntegrator(num_flux2, std::move(inlet2),
-                                              int_order_offset2),
-        bdr_marker2);
+      new mfem::BdrHyperbolicFluxIntegrator(num_flux2,
+                                            std::move(inlet2),
+                                            int_order_offset2),
+      bdr_marker2);
 
     mfem::Vector x2;
     U2.GetTrueDofs(x2);
@@ -711,16 +770,22 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     constexpr int int_order_offset2 = 2;
     const double tol_match = 1.0e-12;
 
-    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(1, 1, mfem::Element::QUADRILATERAL,
-                                                   /*gen_edges=*/true, 1.0, 1.0);
+    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(1,
+                                                   1,
+                                                   mfem::Element::QUADRILATERAL,
+                                                   /*gen_edges=*/true,
+                                                   1.0,
+                                                   1.0);
     mfem::ParMesh pmesh2(MPI_COMM_WORLD, mesh2);
     mfem::DG_FECollection fec2(order2, dim2, mfem::BasisType::GaussLobatto);
-    mfem::ParFiniteElementSpace vfes2(&pmesh2, &fec2, num_eq2,
+    mfem::ParFiniteElementSpace vfes2(&pmesh2,
+                                      &fec2,
+                                      num_eq2,
                                       mfem::Ordering::byNODES);
 
     mfem::ParGridFunction U2(&vfes2);
     const mfem::Vector cons_const2 =
-        EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma);
+      EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma);
     FillConstantState(cons_const2, U2);
 
     mfem::EulerFlux flux2(dim2, gamma);
@@ -729,10 +794,12 @@ int RunDGSEMOperatorTests(TestContext& ctx)
 
     // DGSEM surface assembly.
     auto form_integrator2 =
-        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
-                                                         int_order_offset2);
-    mfem::DGHyperbolicConservationLaws oper2(vfes2, std::move(form_integrator2),
-                                             /*preassembleWeakDivergence=*/true);
+      std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
+                                                       int_order_offset2);
+    mfem::DGHyperbolicConservationLaws oper2(
+      vfes2,
+      std::move(form_integrator2),
+      /*preassembleWeakDivergence=*/true);
     oper2.SetNumericalFlux(&num_flux2);
     oper2.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
     oper2.SetFaceIntegrationRule(lgl_rule);
@@ -743,9 +810,10 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     bdr_marker2 = 1;
     auto inlet2 = std::make_unique<mfem::SupersonicInletState>(cons_const2);
     oper2.AddBdrFaceIntegrator(
-        new mfem::BdrHyperbolicFluxIntegrator(num_flux2, std::move(inlet2),
-                                              int_order_offset2),
-        bdr_marker2);
+      new mfem::BdrHyperbolicFluxIntegrator(num_flux2,
+                                            std::move(inlet2),
+                                            int_order_offset2),
+      bdr_marker2);
 
     mfem::Vector x2;
     U2.GetTrueDofs(x2);
@@ -780,8 +848,10 @@ int RunDGSEMOperatorTests(TestContext& ctx)
                   ", nor_diff_max=" + FormatSci(tr_audit.max_nor_diff));
 
     // Manual boundary assembly using BdrHyperbolicFluxIntegrator + bdr transforms.
-    auto inlet_manual = std::make_unique<mfem::SupersonicInletState>(cons_const2);
-    mfem::BdrHyperbolicFluxIntegrator bdr_manual(num_flux2, std::move(inlet_manual),
+    auto inlet_manual =
+      std::make_unique<mfem::SupersonicInletState>(cons_const2);
+    mfem::BdrHyperbolicFluxIntegrator bdr_manual(num_flux2,
+                                                 std::move(inlet_manual),
                                                  int_order_offset2);
     bdr_manual.SetIntegrationRule(lgl_rule);
     mfem::Vector px;
@@ -815,38 +885,38 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     FaceNodeAudit audit = AuditDGSEMFaceNodes(U2, pmesh2, order2);
     const long long mismatched = static_cast<long long>(audit.mismatched);
     const long long total = static_cast<long long>(audit.total);
-    ctx.LogMetric("DGSEM face-node audit: mismatched=" + std::to_string(mismatched) +
-                  "/" + std::to_string(total) +
-                  ", shape_local_err_max=" + FormatSci(audit.shape_local_err_max) +
-                  ", shape_peak_err_max=" + FormatSci(audit.shape_peak_err_max) +
-                  ", state_interp_err_max=" + FormatSci(audit.state_interp_err_max));
+    ctx.LogMetric(
+      "DGSEM face-node audit: mismatched=" + std::to_string(mismatched) + "/" +
+      std::to_string(total) +
+      ", shape_local_err_max=" + FormatSci(audit.shape_local_err_max) +
+      ", shape_peak_err_max=" + FormatSci(audit.shape_peak_err_max) +
+      ", state_interp_err_max=" + FormatSci(audit.state_interp_err_max));
 
     const double tol_audit = 1.0e-12;
     const bool strict_audit =
-        EnvEnabledDefault("DG_IGR_DGSEM_FACE_AUDIT_STRICT", true);
+      EnvEnabledDefault("DG_IGR_DGSEM_FACE_AUDIT_STRICT", true);
     if (strict_audit)
     {
-      ctx.Check(mismatched == 0,
-                "DGSEM face-node audit has no mismatches");
+      ctx.Check(mismatched == 0, "DGSEM face-node audit has no mismatches");
       ctx.Check(audit.shape_local_err_max < tol_audit,
                 "DGSEM face-node audit local shape ~1 (err=" +
-                    FormatSci(audit.shape_local_err_max) + ")");
+                  FormatSci(audit.shape_local_err_max) + ")");
       ctx.Check(audit.state_interp_err_max < tol_audit,
                 "DGSEM face-node audit state interpolation matches node value "
-                "(err=" + FormatSci(audit.state_interp_err_max) + ")");
+                "(err=" +
+                  FormatSci(audit.state_interp_err_max) + ")");
     }
     else
     {
       ctx.LogMetric("DGSEM face-node strict audit disabled "
                     "(set DG_IGR_DGSEM_FACE_AUDIT_STRICT=1).");
     }
-    const bool strict_match =
-        EnvEnabledDefault("DG_IGR_DGSEM_BDR_MATCH", true);
+    const bool strict_match = EnvEnabledDefault("DG_IGR_DGSEM_BDR_MATCH", true);
     if (strict_match)
     {
       ctx.Check(diff_norm < tol_match,
                 "DGSEM boundary residual matches Bdr integrator (norm=" +
-                    FormatSci(diff_norm) + ")");
+                  FormatSci(diff_norm) + ")");
     }
     else
     {
@@ -863,21 +933,30 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     const int n = 3;
     const bool sfc = false;
     mfem::Mesh orig_mesh =
-        mfem::Mesh::MakeCartesian2D(n, n, mfem::Element::QUADRILATERAL,
-                                    /*gen_edges=*/false, 1.0, 1.0, sfc);
+      mfem::Mesh::MakeCartesian2D(n,
+                                  n,
+                                  mfem::Element::QUADRILATERAL,
+                                  /*gen_edges=*/false,
+                                  1.0,
+                                  1.0,
+                                  sfc);
     std::vector<mfem::Vector> translations = {mfem::Vector({1.0, 0.0}),
                                               mfem::Vector({0.0, 1.0})};
-    mfem::Mesh mesh =
-        mfem::Mesh::MakePeriodic(orig_mesh,
-                                 orig_mesh.CreatePeriodicVertexMapping(translations));
+    mfem::Mesh mesh = mfem::Mesh::MakePeriodic(
+      orig_mesh,
+      orig_mesh.CreatePeriodicVertexMapping(translations));
 
-    mfem::DG_FECollection fec2(/*order=*/2, dim2, mfem::BasisType::GaussLobatto);
-    mfem::FiniteElementSpace vfes2(&mesh, &fec2, num_eq2,
+    mfem::DG_FECollection fec2(/*order=*/2,
+                               dim2,
+                               mfem::BasisType::GaussLobatto);
+    mfem::FiniteElementSpace vfes2(&mesh,
+                                   &fec2,
+                                   num_eq2,
                                    mfem::Ordering::byNODES);
 
     mfem::GridFunction U2(&vfes2);
     const mfem::Vector cons_const2 =
-        EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma);
+      EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma);
     FillConstantState(cons_const2, U2);
 
     mfem::EulerFlux flux2(dim2, gamma);
@@ -885,10 +964,12 @@ int RunDGSEMOperatorTests(TestContext& ctx)
 
     constexpr int int_order_offset2 = 2;
     auto form_integrator2 =
-        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
-                                                         int_order_offset2);
-    mfem::DGHyperbolicConservationLaws oper2(vfes2, std::move(form_integrator2),
-                                             /*preassembleWeakDivergence=*/true);
+      std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
+                                                       int_order_offset2);
+    mfem::DGHyperbolicConservationLaws oper2(
+      vfes2,
+      std::move(form_integrator2),
+      /*preassembleWeakDivergence=*/true);
     oper2.SetNumericalFlux(&num_flux2);
     oper2.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
 
@@ -909,14 +990,14 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     const double norm_sum2 = GlobalL2Norm(z_sum2);
     ctx.Check(norm_sum2 < tol,
               "DGSEM periodic surface + volume cancel (norm=" +
-                  FormatSci(norm_sum2) + ")");
+                FormatSci(norm_sum2) + ")");
 
     mfem::Vector y2(vfes2.GetTrueVSize());
     dgsem_op2.ApplyInverseMass(z_sum2, y2);
     const double resid_norm2 = GlobalL2Norm(y2);
     ctx.Check(resid_norm2 < tol,
               "DGSEM periodic residual ~0 after M^{-1} (norm=" +
-                  FormatSci(resid_norm2) + ")");
+                FormatSci(resid_norm2) + ")");
 
     ctx.AddParity(norm_sum2 + resid_norm2);
   }
@@ -926,9 +1007,12 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     constexpr int dim2 = 2;
     constexpr int num_eq2 = dim2 + 2;
 
-    mfem::Mesh mesh =
-        mfem::Mesh::MakeCartesian2D(2, 1, mfem::Element::QUADRILATERAL,
-                                    /*gen_edges=*/true, 1.0, 1.0);
+    mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(2,
+                                                  1,
+                                                  mfem::Element::QUADRILATERAL,
+                                                  /*gen_edges=*/true,
+                                                  1.0,
+                                                  1.0);
     // Rotate vertex ordering for element 0 (permute, preserves orientation).
     {
       mfem::Element* el0 = mesh.GetElement(0);
@@ -957,13 +1041,17 @@ int RunDGSEMOperatorTests(TestContext& ctx)
 
     mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
 
-    mfem::DG_FECollection fec2(/*order=*/2, dim2, mfem::BasisType::GaussLobatto);
-    mfem::ParFiniteElementSpace vfes2(&pmesh, &fec2, num_eq2,
+    mfem::DG_FECollection fec2(/*order=*/2,
+                               dim2,
+                               mfem::BasisType::GaussLobatto);
+    mfem::ParFiniteElementSpace vfes2(&pmesh,
+                                      &fec2,
+                                      num_eq2,
                                       mfem::Ordering::byNODES);
 
     mfem::ParGridFunction U2(&vfes2);
     const mfem::Vector cons_const2 =
-        EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma);
+      EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma);
     FillConstantState(cons_const2, U2);
 
     mfem::EulerFlux flux2(dim2, gamma);
@@ -971,10 +1059,12 @@ int RunDGSEMOperatorTests(TestContext& ctx)
 
     constexpr int int_order_offset2 = 2;
     auto form_integrator2 =
-        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
-                                                         int_order_offset2);
-    mfem::DGHyperbolicConservationLaws oper2(vfes2, std::move(form_integrator2),
-                                             /*preassembleWeakDivergence=*/true);
+      std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
+                                                       int_order_offset2);
+    mfem::DGHyperbolicConservationLaws oper2(
+      vfes2,
+      std::move(form_integrator2),
+      /*preassembleWeakDivergence=*/true);
     oper2.SetNumericalFlux(&num_flux2);
     oper2.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
 
@@ -986,9 +1076,10 @@ int RunDGSEMOperatorTests(TestContext& ctx)
       bdr_marker2 = 1;
       auto outlet2 = std::make_unique<mfem::SupersonicOutletState>();
       oper2.AddBdrFaceIntegrator(
-          new mfem::BdrHyperbolicFluxIntegrator(num_flux2, std::move(outlet2),
-                                                int_order_offset2),
-          bdr_marker2);
+        new mfem::BdrHyperbolicFluxIntegrator(num_flux2,
+                                              std::move(outlet2),
+                                              int_order_offset2),
+        bdr_marker2);
     }
 
     mfem::Vector x2;
@@ -1005,7 +1096,7 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     const double resid_norm2 = GlobalL2Norm(y2);
     ctx.Check(resid_norm2 < tol,
               "DGSEM orientation/permute invariance (norm=" +
-                  FormatSci(resid_norm2) + ")");
+                FormatSci(resid_norm2) + ")");
   }
 
   // High-order constant-state residuals (p=4/5).
@@ -1018,17 +1109,26 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     for (const int order : orders)
     {
       mfem::Mesh mesh2 =
-          mfem::Mesh::MakeCartesian2D(1, 1, mfem::Element::QUADRILATERAL,
-                                      /*gen_edges=*/true, 1.0, 1.0);
+        mfem::Mesh::MakeCartesian2D(1,
+                                    1,
+                                    mfem::Element::QUADRILATERAL,
+                                    /*gen_edges=*/true,
+                                    1.0,
+                                    1.0);
       mfem::ParMesh pmesh2(MPI_COMM_WORLD, mesh2);
 
       mfem::DG_FECollection fec2(order, dim2, mfem::BasisType::GaussLobatto);
-      mfem::ParFiniteElementSpace vfes2(&pmesh2, &fec2, num_eq2,
+      mfem::ParFiniteElementSpace vfes2(&pmesh2,
+                                        &fec2,
+                                        num_eq2,
                                         mfem::Ordering::byNODES);
 
       mfem::ParGridFunction U2(&vfes2);
-      const mfem::Vector cons_const2 =
-          EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.0, /*v=*/0.0, /*p=*/1.0, gamma);
+      const mfem::Vector cons_const2 = EulerConsFromPrim2D(/*rho=*/1.0,
+                                                           /*u=*/0.0,
+                                                           /*v=*/0.0,
+                                                           /*p=*/1.0,
+                                                           gamma);
       FillConstantState(cons_const2, U2);
 
       mfem::EulerFlux flux2(dim2, gamma);
@@ -1036,10 +1136,12 @@ int RunDGSEMOperatorTests(TestContext& ctx)
 
       constexpr int int_order_offset2 = 2;
       auto form_integrator2 =
-          std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
-                                                           int_order_offset2);
-      mfem::DGHyperbolicConservationLaws oper2(vfes2, std::move(form_integrator2),
-                                               /*preassembleWeakDivergence=*/true);
+        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
+                                                         int_order_offset2);
+      mfem::DGHyperbolicConservationLaws oper2(
+        vfes2,
+        std::move(form_integrator2),
+        /*preassembleWeakDivergence=*/true);
       oper2.SetNumericalFlux(&num_flux2);
       oper2.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
 
@@ -1051,9 +1153,10 @@ int RunDGSEMOperatorTests(TestContext& ctx)
         bdr_marker2 = 1;
         auto outlet2 = std::make_unique<mfem::SupersonicOutletState>();
         oper2.AddBdrFaceIntegrator(
-            new mfem::BdrHyperbolicFluxIntegrator(num_flux2, std::move(outlet2),
-                                                  int_order_offset2),
-            bdr_marker2);
+          new mfem::BdrHyperbolicFluxIntegrator(num_flux2,
+                                                std::move(outlet2),
+                                                int_order_offset2),
+          bdr_marker2);
       }
 
       mfem::Vector x2;
@@ -1069,9 +1172,8 @@ int RunDGSEMOperatorTests(TestContext& ctx)
       dgsem_op2.ApplyInverseMass(z_sum2, y2);
       const double resid_norm2 = GlobalL2Norm(y2);
       ctx.Check(resid_norm2 < tol_hi,
-                "DGSEM high-order residual ~0 (p=" +
-                    std::to_string(order) +
-                    ", norm=" + FormatSci(resid_norm2) + ")");
+                "DGSEM high-order residual ~0 (p=" + std::to_string(order) +
+                  ", norm=" + FormatSci(resid_norm2) + ")");
     }
   }
 
@@ -1084,24 +1186,36 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     const int n = 3;
     const bool sfc = false;
     mfem::Mesh orig_mesh =
-        mfem::Mesh::MakeCartesian2D(n, n, mfem::Element::QUADRILATERAL,
-                                    /*gen_edges=*/false, 1.0, 1.0, sfc);
+      mfem::Mesh::MakeCartesian2D(n,
+                                  n,
+                                  mfem::Element::QUADRILATERAL,
+                                  /*gen_edges=*/false,
+                                  1.0,
+                                  1.0,
+                                  sfc);
     std::vector<mfem::Vector> translations = {mfem::Vector({1.0, 0.0}),
                                               mfem::Vector({0.0, 1.0})};
-    mfem::Mesh mesh =
-        mfem::Mesh::MakePeriodic(orig_mesh,
-                                 orig_mesh.CreatePeriodicVertexMapping(translations));
+    mfem::Mesh mesh = mfem::Mesh::MakePeriodic(
+      orig_mesh,
+      orig_mesh.CreatePeriodicVertexMapping(translations));
     mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
 
-    mfem::DG_FECollection fec2(/*order=*/2, dim2, mfem::BasisType::GaussLobatto);
-    mfem::ParFiniteElementSpace vfes2(&pmesh, &fec2, num_eq2,
+    mfem::DG_FECollection fec2(/*order=*/2,
+                               dim2,
+                               mfem::BasisType::GaussLobatto);
+    mfem::ParFiniteElementSpace vfes2(&pmesh,
+                                      &fec2,
+                                      num_eq2,
                                       mfem::Ordering::byNODES);
 
     class SmoothConservativeCoeff final : public mfem::VectorCoefficient
     {
     public:
       SmoothConservativeCoeff(double gamma)
-        : mfem::VectorCoefficient(kNumEq), gamma_(gamma) {}
+        : mfem::VectorCoefficient(kNumEq),
+          gamma_(gamma)
+      {
+      }
 
       void Eval(mfem::Vector& V,
                 mfem::ElementTransformation& Tr,
@@ -1122,7 +1236,11 @@ int RunDGSEMOperatorTests(TestContext& ctx)
       }
 
     private:
-      enum { kDim = 2, kNumEq = kDim + 2 };
+      enum
+      {
+        kDim = 2,
+        kNumEq = kDim + 2
+      };
       double gamma_;
     };
 
@@ -1140,10 +1258,12 @@ int RunDGSEMOperatorTests(TestContext& ctx)
 
     constexpr int int_order_offset2 = 2;
     auto form_integrator2 =
-        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
-                                                         int_order_offset2);
-    mfem::DGHyperbolicConservationLaws oper2(vfes2, std::move(form_integrator2),
-                                             /*preassembleWeakDivergence=*/true);
+      std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux2,
+                                                       int_order_offset2);
+    mfem::DGHyperbolicConservationLaws oper2(
+      vfes2,
+      std::move(form_integrator2),
+      /*preassembleWeakDivergence=*/true);
     oper2.SetNumericalFlux(&num_flux2);
     oper2.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
     oper2.SetFaceIntegrationRule(mfem::dgsem::GetLGLFaceRule(/*order=*/2));
@@ -1163,13 +1283,21 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     const double momy_after = IntegrateComponent(U2, 2);
     const double energy_after = IntegrateComponent(U2, 3);
 
-    ctx.CheckNear(mass_after, mass_before, tol_cons,
+    ctx.CheckNear(mass_after,
+                  mass_before,
+                  tol_cons,
                   "DGSEM periodic RK3 mass conserved");
-    ctx.CheckNear(momx_after, momx_before, tol_cons,
+    ctx.CheckNear(momx_after,
+                  momx_before,
+                  tol_cons,
                   "DGSEM periodic RK3 x-momentum conserved");
-    ctx.CheckNear(momy_after, momy_before, tol_cons,
+    ctx.CheckNear(momy_after,
+                  momy_before,
+                  tol_cons,
                   "DGSEM periodic RK3 y-momentum conserved");
-    ctx.CheckNear(energy_after, energy_before, tol_cons,
+    ctx.CheckNear(energy_after,
+                  energy_before,
+                  tol_cons,
                   "DGSEM periodic RK3 energy conserved");
   }
 

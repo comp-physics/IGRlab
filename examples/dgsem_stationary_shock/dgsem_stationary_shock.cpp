@@ -18,7 +18,7 @@ constexpr double kShockSmoothing = 1.0;
 
 } // namespace
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
   dg_sim::CaseSpec<StationaryShockOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "dgsem_stationary_shock";
@@ -26,9 +26,10 @@ int main(int argc, char *argv[])
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
   spec.use_igr = true;
-  spec.need_sigma = true;
   spec.need_h1 = false;
   spec.diagnostics.h1_diagnostics = true;
+  spec.diagnostics.l2_diagnostics = true;
+  spec.diagnostics.mpi_rank_field = true;
   spec.glvis.precision = 8;
   spec.vtk.print_dataset_name = true;
   spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
@@ -39,9 +40,30 @@ int main(int argc, char *argv[])
     cfg.defaults.vtk_save = true;
     cfg.defaults.par_ref_levels = 0;
     cfg.defaults.dgsem_volume_flux = "central";
-    cfg.defaults.dgsem_volume_dissipation = "llf";
+    cfg.defaults.dgsem_volume_dissipation = "none";
     cfg.defaults.dgsem_surface_flux = "rusanov";
     cfg.rk3_config.limit_initial = false;
+
+    // IGR linear-solver reference defaults (runtime-overridable via CLI):
+    //   -im/--igr-solve-mode
+    //   -ils/--igr-linear-solver
+    //   -ipc/--igr-preconditioner
+    //   -iip/--igr-ip-kind
+    //   -irtol/--igr-lin-rtol
+    //   -iatol/--igr-lin-atol
+    //   -imaxit/--igr-lin-maxit
+    //   -iprint/--igr-lin-print
+    cfg.igr_config.solve_mode = dg_igr::IGRSolveMode::Krylov;
+    // Auto policy:
+    //   H1 -> CG + BoomerAMG
+    //   L2/DG -> GMRES + BoomerAMG
+    cfg.igr_config.lin_solver_type = dg_igr::IGRLinearSolverType::Auto;
+    cfg.igr_config.prec_type = dg_igr::IGRPrecondType::Auto;
+    cfg.igr_config.ip_kind = dg_igr::IGRIPKind::SIPG;
+    cfg.igr_config.lin_rtol = 1.0e-6;
+    cfg.igr_config.lin_atol = 0.0;
+    cfg.igr_config.lin_maxit = 1000;
+    cfg.igr_config.lin_print = 0;
   };
 
   spec.make_ic = [](const StationaryShockOptions&,
@@ -52,22 +74,25 @@ int main(int argc, char *argv[])
     const mfem::real_t Mv = kVortexMach;
     const mfem::real_t shock_smoothing = kShockSmoothing;
     const int base_cells = 32;
-    const int total_ref = ctx.run_cfg.opts.ser_ref_levels
-                          + ctx.run_cfg.opts.par_ref_levels;
+    const int total_ref =
+      ctx.run_cfg.opts.ser_ref_levels + ctx.run_cfg.opts.par_ref_levels;
     const int mx = base_cells << total_ref;
     const int my = base_cells << total_ref;
-    auto ic_fun = mfem::GetShockVortexInoueHattoriInit(
-        gamma, mx, my, Ms, Mv, shock_smoothing);
+    auto ic_fun = mfem::GetShockVortexInoueHattoriInit(gamma,
+                                                       mx,
+                                                       my,
+                                                       Ms,
+                                                       Mv,
+                                                       shock_smoothing);
     return dg_sim::MakeVectorFunctionIC(4, ic_fun);
   };
 
   spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
-    return dg_sim::BuildBoundaryMarkers(
-        ctx.Mesh(),
-        {{dg_sim::BoundaryRole::Inlet, {2}},
-         {dg_sim::BoundaryRole::Outlet, {4}},
-         {dg_sim::BoundaryRole::Slip, {1, 3}}});
+    return dg_sim::BuildBoundaryMarkers(ctx.Mesh(),
+                                        {{dg_sim::BoundaryRole::Inlet, {2}},
+                                         {dg_sim::BoundaryRole::Outlet, {4}},
+                                         {dg_sim::BoundaryRole::Slip, {1, 3}}});
   };
 
   spec.apply_bc = [](const StationaryShockOptions&,

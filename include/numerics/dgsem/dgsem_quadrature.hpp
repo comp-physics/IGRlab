@@ -21,7 +21,8 @@ namespace dgsem
  */
 inline const mfem::IntegrationRule& GetLGLFaceRule(int order)
 {
-  static mfem::IntegrationRules lobatto_rules(0, mfem::Quadrature1D::GaussLobatto);
+  static mfem::IntegrationRules lobatto_rules(0,
+                                              mfem::Quadrature1D::GaussLobatto);
   const int face_order = (order > 0) ? (2 * order - 1) : 1;
   return lobatto_rules.Get(mfem::Geometry::SEGMENT, face_order);
 }

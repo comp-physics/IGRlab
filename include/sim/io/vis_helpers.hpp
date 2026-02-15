@@ -5,6 +5,7 @@
  * @brief GLVis/VTK field helpers for Euler visualization.
  */
 
+#include <memory>
 #include <utility>
 
 #include "mfem.hpp"
@@ -18,6 +19,8 @@ namespace dg_sim
 {
 
 struct H1Diagnostics;
+struct L2Diagnostics;
+struct MPIRankField;
 
 /// @brief Field handles for common Euler visualization/export helpers.
 struct EulerFieldList
@@ -27,6 +30,8 @@ struct EulerFieldList
   EulerVelocityView* velocity = nullptr;
   dg_igr::IGRSolver* igr = nullptr;
   H1Diagnostics* h1_diag = nullptr;
+  L2Diagnostics* l2_diag = nullptr;
+  MPIRankField* mpi_rank = nullptr;
 };
 
 /// @brief GLVis windows for common Euler fields.
@@ -43,6 +48,7 @@ struct EulerVisWindows
 struct H1Diagnostics
 {
   mfem::ParGridFunction u_h1;
+  std::unique_ptr<mfem::ParFiniteElementSpace> h1_scalar_fes;
   mfem::ParGridFunction g_umag;
   mfem::ParGridFunction g_div;
   mfem::ParGridFunction g_gfrob;
@@ -54,9 +60,14 @@ struct H1Diagnostics
                 int dim_in,
                 double rho_floor)
     : u_h1(&h1_vfes),
-      g_umag(&h1_vfes),
-      g_div(&h1_vfes),
-      g_gfrob(&h1_vfes),
+      h1_scalar_fes(
+        std::make_unique<mfem::ParFiniteElementSpace>(h1_vfes.GetParMesh(),
+                                                      h1_vfes.FEColl(),
+                                                      /*vdim=*/1,
+                                                      mfem::Ordering::byNODES)),
+      g_umag(h1_scalar_fes.get()),
+      g_div(h1_scalar_fes.get()),
+      g_gfrob(h1_scalar_fes.get()),
       ucoef(dim_in, &sol, rho_floor),
       dim(dim_in)
   {
@@ -68,13 +79,61 @@ struct H1Diagnostics
 
   void Update()
   {
-    u_h1.ProjectCoefficient(ucoef);
+    // u = m/rho is discontinuous across DG faces; average shared H1 dofs
+    // arithmetically so the projected field is partition-independent.
+    u_h1.ProjectDiscCoefficient(ucoef, mfem::GridFunction::ARITHMETIC);
     mfem::GradFrobNormCoeff cF(&u_h1, dim);
     mfem::DivCoeff cD(&u_h1, dim);
     mfem::VelMagCoeff cM(&u_h1, dim);
-    g_gfrob.ProjectCoefficient(cF);
-    g_div.ProjectCoefficient(cD);
-    g_umag.ProjectCoefficient(cM);
+    // grad-based diagnostics are also discontinuous; keep H1 exports
+    // partition-consistent by using discontinuous projection with averaging.
+    g_gfrob.ProjectDiscCoefficient(cF, mfem::GridFunction::ARITHMETIC);
+    g_div.ProjectDiscCoefficient(cD, mfem::GridFunction::ARITHMETIC);
+    g_umag.ProjectDiscCoefficient(cM, mfem::GridFunction::ARITHMETIC);
+  }
+};
+
+/// @brief Broken/L2 diagnostics computed directly from conservative state gradients.
+struct L2Diagnostics
+{
+  mfem::ParGridFunction g_div_l2;
+  mfem::ParGridFunction g_gfrob_l2;
+  mfem::DivFromConservativeCoeff c_div;
+  mfem::GradFrobFromConservativeCoeff c_gfrob;
+
+  L2Diagnostics(mfem::ParFiniteElementSpace& scalar_fes,
+                mfem::ParGridFunction& sol,
+                int dim_in,
+                double rho_floor)
+    : g_div_l2(&scalar_fes),
+      g_gfrob_l2(&scalar_fes),
+      c_div(&sol, dim_in, rho_floor),
+      c_gfrob(&sol, dim_in, rho_floor)
+  {
+    g_div_l2 = 0.0;
+    g_gfrob_l2 = 0.0;
+  }
+
+  void Update()
+  {
+    g_div_l2.ProjectCoefficient(c_div);
+    g_gfrob_l2.ProjectCoefficient(c_gfrob);
+  }
+};
+
+/// @brief Per-element MPI rank as an order-0 discontinuous field.
+struct MPIRankField
+{
+  std::unique_ptr<mfem::L2_FECollection> fec0;
+  std::unique_ptr<mfem::ParFiniteElementSpace> fes0;
+  mfem::ParGridFunction rank;
+
+  explicit MPIRankField(mfem::ParMesh& mesh)
+    : fec0(std::make_unique<mfem::L2_FECollection>(0, mesh.Dimension())),
+      fes0(std::make_unique<mfem::ParFiniteElementSpace>(&mesh, fec0.get())),
+      rank(fes0.get())
+  {
+    rank = static_cast<double>(mfem::Mpi::WorldRank());
   }
 };
 
@@ -94,20 +153,50 @@ inline bool OpenEulerIGRGLVisWindows(EulerVisWindows& windows,
 
   fields.igr->GetSigma().ExchangeFaceNbrData();
 
-  const bool ok1 = vis::Open(windows.density, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->density,
+  const bool ok1 = vis::Open(windows.density,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->density,
                              "density, t = 0");
-  const bool ok2 = vis::Open(windows.sigma, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.igr->GetSigma(),
+  const bool ok2 = vis::Open(windows.sigma,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.igr->GetSigma(),
                              "sigma, t = 0");
-  const bool ok3 = vis::Open(windows.energy, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->energy,
+  const bool ok3 = vis::Open(windows.energy,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->energy,
                              "energy, t = 0");
-  const bool ok4 = vis::Open(windows.pressure, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.pressure->pressure,
+  const bool ok4 = vis::Open(windows.pressure,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.pressure->pressure,
                              "pressure, t = 0");
-  const bool ok5 = vis::Open(windows.momentum_x, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->momentum_x,
+  const bool ok5 = vis::Open(windows.momentum_x,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->momentum_x,
                              "momentum_x, t = 0");
   (void)ok4;
   (void)ok5;
@@ -128,17 +217,41 @@ inline bool OpenEulerGLVisWindows(EulerVisWindows& windows,
     return false;
   }
 
-  const bool ok1 = vis::Open(windows.density, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->density,
+  const bool ok1 = vis::Open(windows.density,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->density,
                              "density, t = 0");
-  const bool ok2 = vis::Open(windows.energy, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->energy,
+  const bool ok2 = vis::Open(windows.energy,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->energy,
                              "energy, t = 0");
-  const bool ok3 = vis::Open(windows.pressure, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.pressure->pressure,
+  const bool ok3 = vis::Open(windows.pressure,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.pressure->pressure,
                              "pressure, t = 0");
-  const bool ok4 = vis::Open(windows.momentum_x, host, port, precision,
-                             num_procs, my_rank, pmesh, fields.state->momentum_x,
+  const bool ok4 = vis::Open(windows.momentum_x,
+                             host,
+                             port,
+                             precision,
+                             num_procs,
+                             my_rank,
+                             pmesh,
+                             fields.state->momentum_x,
                              "momentum_x, t = 0");
   (void)ok3;
   (void)ok4;
@@ -173,6 +286,15 @@ inline mfem::io::EulerVTKFields MakeEulerVTKFields(const EulerFieldList& fields)
     out.div_h1 = &fields.h1_diag->g_div;
     out.grad_frob_h1 = &fields.h1_diag->g_gfrob;
   }
+  if (fields.l2_diag)
+  {
+    out.div_l2 = &fields.l2_diag->g_div_l2;
+    out.grad_frob_l2 = &fields.l2_diag->g_gfrob_l2;
+  }
+  if (fields.mpi_rank)
+  {
+    out.mpi_rank = &fields.mpi_rank->rank;
+  }
   return out;
 }
 
@@ -191,7 +313,8 @@ inline void ApplyCaseVTKConfig(mfem::ParaViewDataCollection& dc,
   mfem::io::ApplyVTKConfig(dc, local_cfg);
 }
 
-inline mfem::io::EulerIGRVisFields MakeEulerIGRVisFields(const EulerFieldList& fields)
+inline mfem::io::EulerIGRVisFields
+MakeEulerIGRVisFields(const EulerFieldList& fields)
 {
   mfem::io::EulerIGRVisFields out;
   if (fields.state)
@@ -207,7 +330,8 @@ inline mfem::io::EulerIGRVisFields MakeEulerIGRVisFields(const EulerFieldList& f
   return out;
 }
 
-inline mfem::io::EulerIGRVisWindows MakeEulerIGRVisWindows(EulerVisWindows& windows)
+inline mfem::io::EulerIGRVisWindows
+MakeEulerIGRVisWindows(EulerVisWindows& windows)
 {
   mfem::io::EulerIGRVisWindows out;
   out.density = &windows.density;
@@ -239,12 +363,17 @@ inline void UpdateEulerOutputFields(const EulerFieldList& fields,
   {
     fields.h1_diag->Update();
   }
+  if (fields.l2_diag)
+  {
+    fields.l2_diag->Update();
+  }
 }
 
 inline void UpdateEulerGLVis(EulerVisWindows& windows,
                              const EulerFieldList& fields,
                              mfem::ParGridFunction& state,
-                             int num_procs, int my_rank,
+                             int num_procs,
+                             int my_rank,
                              const mfem::ParMesh& pmesh,
                              double t,
                              bool warm_start)
@@ -253,11 +382,20 @@ inline void UpdateEulerGLVis(EulerVisWindows& windows,
   {
     MFEM_VERIFY(fields.pressure != nullptr,
                 "Euler GLVis update with IGR expects a pressure view.");
-    const mfem::io::EulerIGRVisFields vis_fields = MakeEulerIGRVisFields(fields);
-    const mfem::io::EulerIGRVisWindows vis_windows = MakeEulerIGRVisWindows(windows);
-    mfem::io::UpdateEulerIGRViews(vis_windows, vis_fields, *fields.igr, state,
-                                  fields.pressure->coeff, num_procs, my_rank, pmesh,
-                                  t, warm_start);
+    const mfem::io::EulerIGRVisFields vis_fields =
+      MakeEulerIGRVisFields(fields);
+    const mfem::io::EulerIGRVisWindows vis_windows =
+      MakeEulerIGRVisWindows(windows);
+    mfem::io::UpdateEulerIGRViews(vis_windows,
+                                  vis_fields,
+                                  *fields.igr,
+                                  state,
+                                  fields.pressure->coeff,
+                                  num_procs,
+                                  my_rank,
+                                  pmesh,
+                                  t,
+                                  warm_start);
     return;
   }
 
@@ -269,14 +407,34 @@ inline void UpdateEulerGLVis(EulerVisWindows& windows,
   {
     return;
   }
-  vis::Update(windows.density, num_procs, my_rank, pmesh,
-              fields.state->density, t, "density");
-  vis::Update(windows.energy, num_procs, my_rank, pmesh,
-              fields.state->energy, t, "energy");
-  vis::Update(windows.pressure, num_procs, my_rank, pmesh,
-              fields.pressure->pressure, t, "pressure");
-  vis::Update(windows.momentum_x, num_procs, my_rank, pmesh,
-              fields.state->momentum_x, t, "momentum_x");
+  vis::Update(windows.density,
+              num_procs,
+              my_rank,
+              pmesh,
+              fields.state->density,
+              t,
+              "density");
+  vis::Update(windows.energy,
+              num_procs,
+              my_rank,
+              pmesh,
+              fields.state->energy,
+              t,
+              "energy");
+  vis::Update(windows.pressure,
+              num_procs,
+              my_rank,
+              pmesh,
+              fields.pressure->pressure,
+              t,
+              "pressure");
+  vis::Update(windows.momentum_x,
+              num_procs,
+              my_rank,
+              pmesh,
+              fields.state->momentum_x,
+              t,
+              "momentum_x");
 }
 
 } // namespace dg_sim

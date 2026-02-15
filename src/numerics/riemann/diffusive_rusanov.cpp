@@ -8,16 +8,20 @@
 namespace mfem
 {
 
-DiffusiveRusanovFlux::DiffusiveRusanovFlux(const FluxFunction &fluxFunction,
+DiffusiveRusanovFlux::DiffusiveRusanovFlux(const FluxFunction& fluxFunction,
                                            real_t beta,
                                            real_t delta,
                                            real_t cap,
                                            real_t sensor_k,
                                            real_t sensor_max)
   : NumericalFlux(fluxFunction),
-    side_explicit_flux_(dynamic_cast<const FaceSideExplicitFlux*>(&fluxFunction)),
-    beta_(beta), delta_(delta), cap_(cap),
-    sensor_k_(sensor_k), sensor_max_(sensor_max)
+    side_explicit_flux_(
+      dynamic_cast<const FaceSideExplicitFlux*>(&fluxFunction)),
+    beta_(beta),
+    delta_(delta),
+    cap_(cap),
+    sensor_k_(sensor_k),
+    sensor_max_(sensor_max)
 {
 #ifndef MFEM_THREAD_SAFE
   fluxN1.SetSize(fluxFunction.num_equations);
@@ -25,94 +29,141 @@ DiffusiveRusanovFlux::DiffusiveRusanovFlux(const FluxFunction &fluxFunction,
 #endif
 }
 
-real_t DiffusiveRusanovFlux::Eval(const Vector &state1, const Vector &state2,
-                                  const Vector &nor, FaceElementTransformations &Tr,
-                                  Vector &flux) const
+real_t DiffusiveRusanovFlux::Eval(const Vector& state1,
+                                  const Vector& state2,
+                                  const Vector& nor,
+                                  FaceElementTransformations& Tr,
+                                  Vector& flux) const
 {
 #ifdef MFEM_THREAD_SAFE
   Vector fluxN1(fluxFunction.num_equations), fluxN2(fluxFunction.num_equations);
 #endif
   real_t speed1, speed2;
   // Shared side-scoping helper keeps behavior aligned with RusanovFluxWithSides.
-  speed1 = riemann_detail::ComputeFluxDotNForSide(
-      side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
-  speed2 = riemann_detail::ComputeFluxDotNForSide(
-      side_explicit_flux_, fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
+  speed1 = riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
+                                                  fluxFunction,
+                                                  FaceSide::Left,
+                                                  state1,
+                                                  nor,
+                                                  Tr,
+                                                  fluxN1);
+  speed2 = riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
+                                                  fluxFunction,
+                                                  FaceSide::Right,
+                                                  state2,
+                                                  nor,
+                                                  Tr,
+                                                  fluxN2);
 
   // Inflate lambda and then scale by |n|
-  const real_t lam     = EffectiveLambda(speed1, speed2, state1, state2);
-  const real_t scaled  = lam * nor.Norml2();
+  const real_t lam = EffectiveLambda(speed1, speed2, state1, state2);
+  const real_t scaled = lam * nor.Norml2();
 
   const int m = fluxFunction.num_equations;
   for (int i = 0; i < m; i++)
   {
-    flux(i) = 0.5*(scaled*(state1(i) - state2(i)) + (fluxN1(i) + fluxN2(i)));
+    flux(i) =
+      0.5 * (scaled * (state1(i) - state2(i)) + (fluxN1(i) + fluxN2(i)));
   }
 
   // Return the baseline max eigenvalue (as in RusanovFlux) for CFL accounting
   return std::max(speed1, speed2);
 }
 
-void DiffusiveRusanovFlux::Grad(int side, const Vector &state1, const Vector &state2,
-                                const Vector &nor, FaceElementTransformations &Tr,
-                                DenseMatrix &grad) const
+void DiffusiveRusanovFlux::Grad(int side,
+                                const Vector& state1,
+                                const Vector& state2,
+                                const Vector& nor,
+                                FaceElementTransformations& Tr,
+                                DenseMatrix& grad) const
 {
 #ifdef MFEM_THREAD_SAFE
   Vector fluxN1(fluxFunction.num_equations), fluxN2(fluxFunction.num_equations);
 #endif
   real_t speed1, speed2;
-  speed1 = riemann_detail::ComputeFluxDotNForSide(
-      side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
-  speed2 = riemann_detail::ComputeFluxDotNForSide(
-      side_explicit_flux_, fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
+  speed1 = riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
+                                                  fluxFunction,
+                                                  FaceSide::Left,
+                                                  state1,
+                                                  nor,
+                                                  Tr,
+                                                  fluxN1);
+  speed2 = riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
+                                                  fluxFunction,
+                                                  FaceSide::Right,
+                                                  state2,
+                                                  nor,
+                                                  Tr,
+                                                  fluxN2);
 
-  const real_t lam    = EffectiveLambda(speed1, speed2, state1, state2);
+  const real_t lam = EffectiveLambda(speed1, speed2, state1, state2);
   const real_t scaled = lam * nor.Norml2();
 
   const int m = fluxFunction.num_equations;
   if (side == 1)
   {
     fluxFunction.ComputeFluxJacobianDotN(state1, nor, Tr, grad);
-    for (int i = 0; i < m; i++) { grad(i,i) += 0.5 * scaled; }
+    for (int i = 0; i < m; i++)
+    {
+      grad(i, i) += 0.5 * scaled;
+    }
   }
   else
   {
     fluxFunction.ComputeFluxJacobianDotN(state2, nor, Tr, grad);
-    for (int i = 0; i < m; i++) { grad(i,i) -= 0.5 * scaled; }
+    for (int i = 0; i < m; i++)
+    {
+      grad(i, i) -= 0.5 * scaled;
+    }
   }
 }
 
-real_t DiffusiveRusanovFlux::Average(const Vector &state1, const Vector &state2,
-                                     const Vector &nor, FaceElementTransformations &Tr,
-                                     Vector &flux) const
+real_t DiffusiveRusanovFlux::Average(const Vector& state1,
+                                     const Vector& state2,
+                                     const Vector& nor,
+                                     FaceElementTransformations& Tr,
+                                     Vector& flux) const
 {
 #ifdef MFEM_THREAD_SAFE
   Vector fluxN1(fluxFunction.num_equations), fluxN2(fluxFunction.num_equations);
 #endif
   real_t speed1, speed2;
-  speed1 = riemann_detail::ComputeFluxDotNForSide(
-      side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
-  speed2 = riemann_detail::ComputeAvgFluxDotNForSide(
-      side_explicit_flux_, fluxFunction, FaceSide::Right,
-      state1, state2, nor, Tr, fluxN2);
+  speed1 = riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
+                                                  fluxFunction,
+                                                  FaceSide::Left,
+                                                  state1,
+                                                  nor,
+                                                  Tr,
+                                                  fluxN1);
+  speed2 = riemann_detail::ComputeAvgFluxDotNForSide(side_explicit_flux_,
+                                                     fluxFunction,
+                                                     FaceSide::Right,
+                                                     state1,
+                                                     state2,
+                                                     nor,
+                                                     Tr,
+                                                     fluxN2);
 
-  const real_t lam    = EffectiveLambda(speed1, speed2, state1, state2);
+  const real_t lam = EffectiveLambda(speed1, speed2, state1, state2);
   const real_t scaled = lam * nor.Norml2() * 0.5; // MFEM halves in Average
 
   const int m = fluxFunction.num_equations;
   for (int i = 0; i < m; i++)
   {
-    flux(i) = 0.5*(scaled*(state1(i) - state2(i)) + (fluxN1(i) + fluxN2(i)));
+    flux(i) =
+      0.5 * (scaled * (state1(i) - state2(i)) + (fluxN1(i) + fluxN2(i)));
   }
 
   // Return baseline max eigenvalue
   return std::max(speed1, speed2);
 }
 
-void DiffusiveRusanovFlux::AverageGrad(int side, const Vector &state1,
-                                       const Vector &state2,
-                                       const Vector &nor, FaceElementTransformations &Tr,
-                                       DenseMatrix &grad) const
+void DiffusiveRusanovFlux::AverageGrad(int side,
+                                       const Vector& state1,
+                                       const Vector& state2,
+                                       const Vector& nor,
+                                       FaceElementTransformations& Tr,
+                                       DenseMatrix& grad) const
 {
 #ifdef MFEM_THREAD_SAFE
   Vector fluxN1(fluxFunction.num_equations), fluxN2(fluxFunction.num_equations);
@@ -140,14 +191,24 @@ void DiffusiveRusanovFlux::AverageGrad(int side, const Vector &state1,
     JDotN.SetSize(fluxFunction.num_equations);
 #endif
     real_t speed1, speed2;
-    speed1 = riemann_detail::ComputeFluxDotNForSide(
-        side_explicit_flux_, fluxFunction, FaceSide::Left, state1, nor, Tr, fluxN1);
-    speed2 = riemann_detail::ComputeAvgFluxDotNForSide(
-        side_explicit_flux_, fluxFunction, FaceSide::Right,
-        state1, state2, nor, Tr, fluxN2);
+    speed1 = riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
+                                                    fluxFunction,
+                                                    FaceSide::Left,
+                                                    state1,
+                                                    nor,
+                                                    Tr,
+                                                    fluxN1);
+    speed2 = riemann_detail::ComputeAvgFluxDotNForSide(side_explicit_flux_,
+                                                       fluxFunction,
+                                                       FaceSide::Right,
+                                                       state1,
+                                                       state2,
+                                                       nor,
+                                                       Tr,
+                                                       fluxN2);
     fluxFunction.ComputeFluxJacobianDotN(state1, nor, Tr, JDotN);
 
-    const real_t lam    = EffectiveLambda(speed1, speed2, state1, state2);
+    const real_t lam = EffectiveLambda(speed1, speed2, state1, state2);
     const real_t scaled = lam * nor.Norml2() * 0.5;
 
     grad = 0.0;
@@ -156,21 +217,34 @@ void DiffusiveRusanovFlux::AverageGrad(int side, const Vector &state1,
     for (int i = 0; i < m; i++)
     {
       // Only diagonal terms of J considered; skip if states are equal
-      if (equal_check(state1(i), state2(i))) { continue; }
-      grad(i,i) = 0.5 * ((fluxN2(i) - fluxN1(i)) / (state2(i) - state1(i))
-                         - JDotN(i,i) + scaled);
+      if (equal_check(state1(i), state2(i)))
+      {
+        continue;
+      }
+      grad(i, i) = 0.5 * ((fluxN2(i) - fluxN1(i)) / (state2(i) - state1(i)) -
+                          JDotN(i, i) + scaled);
     }
   }
   else
   {
     real_t speed1, speed2;
-    speed1 = riemann_detail::ComputeAvgFluxDotNForSide(
-        side_explicit_flux_, fluxFunction, FaceSide::Left,
-        state1, state2, nor, Tr, fluxN1);
-    speed2 = riemann_detail::ComputeFluxDotNForSide(
-        side_explicit_flux_, fluxFunction, FaceSide::Right, state2, nor, Tr, fluxN2);
+    speed1 = riemann_detail::ComputeAvgFluxDotNForSide(side_explicit_flux_,
+                                                       fluxFunction,
+                                                       FaceSide::Left,
+                                                       state1,
+                                                       state2,
+                                                       nor,
+                                                       Tr,
+                                                       fluxN1);
+    speed2 = riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
+                                                    fluxFunction,
+                                                    FaceSide::Right,
+                                                    state2,
+                                                    nor,
+                                                    Tr,
+                                                    fluxN2);
 
-    const real_t lam    = EffectiveLambda(speed1, speed2, state1, state2);
+    const real_t lam = EffectiveLambda(speed1, speed2, state1, state2);
     const real_t scaled = lam * nor.Norml2() * 0.5;
 
     grad = 0.0;
@@ -178,14 +252,20 @@ void DiffusiveRusanovFlux::AverageGrad(int side, const Vector &state1,
     const int m = fluxFunction.num_equations;
     for (int i = 0; i < m; i++)
     {
-      if (equal_check(state1(i), state2(i))) { continue; }
-      grad(i,i) = 0.5 * ((fluxN2(i) - fluxN1(i)) / (state2(i) - state1(i)) - scaled);
+      if (equal_check(state1(i), state2(i)))
+      {
+        continue;
+      }
+      grad(i, i) =
+        0.5 * ((fluxN2(i) - fluxN1(i)) / (state2(i) - state1(i)) - scaled);
     }
   }
 }
 
-real_t DiffusiveRusanovFlux::EffectiveLambda(real_t speed1, real_t speed2,
-                                             const Vector &state1, const Vector &state2) const
+real_t DiffusiveRusanovFlux::EffectiveLambda(real_t speed1,
+                                             real_t speed2,
+                                             const Vector& state1,
+                                             const Vector& state2) const
 {
   real_t lam = std::max(speed1, speed2); // baseline lambda from FluxFunction
   if (sensor_k_ > 0.0)
@@ -204,7 +284,10 @@ real_t DiffusiveRusanovFlux::EffectiveLambda(real_t speed1, real_t speed2,
     lam *= (1.0 + s);
   }
   lam = beta_ * lam + delta_;
-  if (lam > cap_) { lam = cap_; }
+  if (lam > cap_)
+  {
+    lam = cap_;
+  }
   return lam;
 }
 

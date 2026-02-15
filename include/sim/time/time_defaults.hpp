@@ -50,12 +50,12 @@ inline std::string FormatSci(double value, int precision = 3)
   return os.str();
 }
 
-inline void PrintVTKSaveLog(int cycle, int step, double t,
-                            bool is_final, bool is_initial)
+inline void
+PrintVTKSaveLog(int cycle, int step, double t, bool is_final, bool is_initial)
 {
-  std::cout << "[vtk] cycle " << std::setw(6) << cycle
-            << " | step " << std::setw(6) << step
-            << " | t " << std::setw(12) << FormatFixed(t);
+  std::cout << "[vtk] cycle " << std::setw(6) << cycle << " | step "
+            << std::setw(6) << step << " | t " << std::setw(12)
+            << FormatFixed(t);
   if (is_initial)
   {
     std::cout << " | initial";
@@ -96,8 +96,7 @@ inline void PrintBox(const std::vector<std::string>& lines)
   for (size_t i = 0; i < lines.size(); ++i)
   {
     const auto& line = lines[i];
-    std::cout << "│ " << line
-              << std::string(width - line.size(), ' ')
+    std::cout << "│ " << line << std::string(width - line.size(), ' ')
               << " │\n";
     if (i == 0 && lines.size() > 1)
     {
@@ -107,8 +106,8 @@ inline void PrintBox(const std::vector<std::string>& lines)
   std::cout << bot << std::endl;
 }
 
-inline std::pair<double, double> ComputeGlobalMinMax(const mfem::ParGridFunction& gf,
-                                                     MPI_Comm comm)
+inline std::pair<double, double>
+ComputeGlobalMinMax(const mfem::ParGridFunction& gf, MPI_Comm comm)
 {
   const int n = gf.Size();
   const double* data = gf.GetData();
@@ -121,24 +120,54 @@ inline std::pair<double, double> ComputeGlobalMinMax(const mfem::ParGridFunction
   }
   double global_min = local_min;
   double global_max = local_max;
-  MPI_Allreduce(MPI_IN_PLACE, &global_min, 1,
-                mfem::MPITypeMap<double>::mpi_type, MPI_MIN, comm);
-  MPI_Allreduce(MPI_IN_PLACE, &global_max, 1,
-                mfem::MPITypeMap<double>::mpi_type, MPI_MAX, comm);
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_min,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_MIN,
+                comm);
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_max,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_MAX,
+                comm);
   return {global_min, global_max};
 }
 
 inline RunSummary BuildRunSummary(const ExampleContext& ctx,
                                   const TimeLoopResult& result,
                                   double elapsed_seconds,
-                                  int num_ranks)
+                                  int num_ranks,
+                                  const dg_igr::IGRSolver* igr = nullptr)
 {
   RunSummary summary;
   summary.steps = result.steps;
   summary.elapsed = elapsed_seconds;
   summary.local_dofs = static_cast<int>(ctx.spaces.vfes.TrueVSize());
-  summary.global_dofs = static_cast<long long>(ctx.spaces.vfes.GlobalTrueVSize());
+  summary.global_dofs =
+    static_cast<long long>(ctx.spaces.vfes.GlobalTrueVSize());
   summary.ranks = num_ranks;
+  if (igr)
+  {
+    summary.has_igr = true;
+    summary.igr_linear_calls = igr->GetLinearSolveCalls();
+    summary.igr_linear_converged_calls = igr->GetTotalLinearConvergedCalls();
+    summary.igr_linear_avg_iters = igr->GetAverageLinearIterations();
+    summary.igr_linear_solve_seconds = igr->GetTotalLinearSolveSeconds();
+    summary.igr_assemble_seconds = igr->GetTotalAssembleSeconds();
+    summary.igr_form_system_seconds = igr->GetTotalFormSystemSeconds();
+    summary.igr_pc_setup_seconds = igr->GetTotalPCSetupSeconds();
+    summary.igr_total_work_seconds = igr->GetTotalIGRWorkSeconds();
+    summary.igr_linear_solve_fraction =
+      (elapsed_seconds > 0.0)
+        ? (summary.igr_linear_solve_seconds / elapsed_seconds)
+        : 0.0;
+    summary.igr_total_work_fraction =
+      (elapsed_seconds > 0.0)
+        ? (summary.igr_total_work_seconds / elapsed_seconds)
+        : 0.0;
+  }
 
   if (result.steps <= 0 || summary.local_dofs <= 0 || summary.global_dofs <= 0)
   {
@@ -148,43 +177,100 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
   const double steps = static_cast<double>(result.steps);
   summary.avg_step = elapsed_seconds / steps;
   summary.avg_step_per_dof_local =
-      summary.avg_step / static_cast<double>(summary.local_dofs);
+    summary.avg_step / static_cast<double>(summary.local_dofs);
   summary.avg_step_per_dof_rank =
-      (num_ranks > 0)
-          ? (summary.avg_step * static_cast<double>(num_ranks) /
-             static_cast<double>(summary.global_dofs))
-          : 0.0;
+    (num_ranks > 0) ? (summary.avg_step * static_cast<double>(num_ranks) /
+                       static_cast<double>(summary.global_dofs))
+                    : 0.0;
   return summary;
+}
+
+inline void FillIGRTimeInfo(TimeLoopInfo& info,
+                            double elapsed,
+                            const dg_igr::IGRSolver* igr_solver)
+{
+  if (!igr_solver)
+  {
+    return;
+  }
+  info.has_igr = true;
+  info.igr_linear_calls = igr_solver->GetLinearSolveCalls();
+  info.igr_linear_converged_calls = igr_solver->GetTotalLinearConvergedCalls();
+  info.igr_linear_avg_iters = igr_solver->GetAverageLinearIterations();
+  info.igr_linear_solve_seconds = igr_solver->GetTotalLinearSolveSeconds();
+  info.igr_assemble_seconds = igr_solver->GetTotalAssembleSeconds();
+  info.igr_form_system_seconds = igr_solver->GetTotalFormSystemSeconds();
+  info.igr_pc_setup_seconds = igr_solver->GetTotalPCSetupSeconds();
+  info.igr_total_work_seconds = igr_solver->GetTotalIGRWorkSeconds();
+  info.igr_linear_solve_fraction =
+    (elapsed > 0.0) ? (info.igr_linear_solve_seconds / elapsed) : 0.0;
+  info.igr_total_work_fraction =
+    (elapsed > 0.0) ? (info.igr_total_work_seconds / elapsed) : 0.0;
 }
 
 inline void PrintSummaryBox(const RunSummary& summary)
 {
+  const auto igr_line = [&summary]() -> std::string
+  {
+    if (!summary.has_igr)
+    {
+      return "IGR linear solve: disabled";
+    }
+    std::ostringstream os;
+    os << "IGR linear solve: " << FormatFixed(summary.igr_linear_solve_seconds)
+       << " s (" << FormatFixed(100.0 * summary.igr_linear_solve_fraction, 2)
+       << "%) | calls: " << summary.igr_linear_calls
+       << " | conv: " << summary.igr_linear_converged_calls
+       << " | avg iters: " << FormatFixed(summary.igr_linear_avg_iters, 2);
+    return os.str();
+  };
+  const auto igr_breakdown = [&summary]() -> std::string
+  {
+    if (!summary.has_igr)
+    {
+      return "IGR breakdown: n/a";
+    }
+    std::ostringstream os;
+    os << "IGR breakdown [assemble/form/pc/krylov] = "
+       << FormatFixed(summary.igr_assemble_seconds) << " / "
+       << FormatFixed(summary.igr_form_system_seconds) << " / "
+       << FormatFixed(summary.igr_pc_setup_seconds) << " / "
+       << FormatFixed(summary.igr_linear_solve_seconds) << " s"
+       << " | total "
+       << FormatFixed(summary.igr_total_work_seconds) << " s ("
+       << FormatFixed(100.0 * summary.igr_total_work_fraction, 2) << "%)";
+    return os.str();
+  };
+
   if (summary.steps <= 0)
   {
-    PrintBox({
-        "Summary",
-        "steps: 0",
-        "elapsed: " + FormatFixed(summary.elapsed) + " s",
-        "dofs (local/global): " +
-            std::to_string(static_cast<long long>(summary.local_dofs)) + " / " +
-            std::to_string(static_cast<long long>(summary.global_dofs)),
-        "ranks: " + std::to_string(summary.ranks)
-    });
+    PrintBox({"Summary",
+              "steps: 0",
+              "elapsed: " + FormatFixed(summary.elapsed) + " s",
+              igr_line(),
+              igr_breakdown(),
+              "dofs (local/global): " +
+                std::to_string(static_cast<long long>(summary.local_dofs)) +
+                " / " +
+                std::to_string(static_cast<long long>(summary.global_dofs)),
+              "ranks: " + std::to_string(summary.ranks)});
     return;
   }
 
-  PrintBox({
-      "Summary",
-      "steps: " + std::to_string(summary.steps) +
-          " | elapsed: " + FormatFixed(summary.elapsed) + " s",
-      "avg/step: " + FormatSci(summary.avg_step) + " s",
-      "avg/step/dof (local): " + FormatSci(summary.avg_step_per_dof_local) + " s",
-      "avg/step/dof/rank: " + FormatSci(summary.avg_step_per_dof_rank) + " s",
-      "dofs (local/global): " +
-          std::to_string(static_cast<long long>(summary.local_dofs)) + " / " +
-          std::to_string(static_cast<long long>(summary.global_dofs)),
-      "ranks: " + std::to_string(summary.ranks)
-  });
+  PrintBox(
+    {"Summary",
+     "steps: " + std::to_string(summary.steps) +
+       " | elapsed: " + FormatFixed(summary.elapsed) + " s",
+     igr_line(),
+     igr_breakdown(),
+     "avg/step: " + FormatSci(summary.avg_step) + " s",
+     "avg/step/dof (local): " + FormatSci(summary.avg_step_per_dof_local) +
+       " s",
+     "avg/step/dof/rank: " + FormatSci(summary.avg_step_per_dof_rank) + " s",
+     "dofs (local/global): " +
+       std::to_string(static_cast<long long>(summary.local_dofs)) + " / " +
+       std::to_string(static_cast<long long>(summary.global_dofs)),
+     "ranks: " + std::to_string(summary.ranks)});
 }
 
 inline void PrintStepLog(int step,
@@ -194,19 +280,18 @@ inline void PrintStepLog(int step,
                          double avg_step_per_dof_local,
                          double avg_step_per_dof_rank)
 {
-  std::cout << "[alive] step " << std::setw(6) << step
-            << " | t " << std::setw(12) << FormatFixed(t)
-            << " | dt " << std::setw(12) << FormatSci(dt)
-            << " | avg/step " << std::setw(12) << FormatSci(avg_step) << " s"
-            << " | avg/step/dof(local) " << std::setw(12)
-            << FormatSci(avg_step_per_dof_local) << " s"
+  std::cout << "[alive] step " << std::setw(6) << step << " | t "
+            << std::setw(12) << FormatFixed(t) << " | dt " << std::setw(12)
+            << FormatSci(dt) << " | avg/step " << std::setw(12)
+            << FormatSci(avg_step) << " s" << " | avg/step/dof(local) "
+            << std::setw(12) << FormatSci(avg_step_per_dof_local) << " s"
             << " | avg/step/dof/rank " << std::setw(12)
-            << FormatSci(avg_step_per_dof_rank) << " s"
-            << std::endl;
+            << FormatSci(avg_step_per_dof_rank) << " s" << std::endl;
 }
 
 /// @brief Build default callbacks (alive/analysis/vtk/summary) from config.
-inline TimeLoopCallbacks MakeDefaultTimeLoopCallbacks(const DefaultCallbackConfig& cfg)
+inline TimeLoopCallbacks
+MakeDefaultTimeLoopCallbacks(const DefaultCallbackConfig& cfg)
 {
   TimeLoopCallbacks callbacks;
   callbacks.wants_minmax = cfg.enable_analysis && cfg.compute_minmax;
@@ -219,8 +304,12 @@ inline TimeLoopCallbacks MakeDefaultTimeLoopCallbacks(const DefaultCallbackConfi
       {
         return;
       }
-      PrintStepLog(info.step, info.t, info.dt, info.avg_step,
-                   info.avg_step_per_dof_local, info.avg_step_per_dof_rank);
+      PrintStepLog(info.step,
+                   info.t,
+                   info.dt,
+                   info.avg_step,
+                   info.avg_step_per_dof_local,
+                   info.avg_step_per_dof_rank);
     };
   }
 
@@ -232,7 +321,11 @@ inline TimeLoopCallbacks MakeDefaultTimeLoopCallbacks(const DefaultCallbackConfi
       {
         return;
       }
-      PrintVTKSaveLog(info.cycle, info.step, info.t, info.is_final, info.is_initial);
+      PrintVTKSaveLog(info.cycle,
+                      info.step,
+                      info.t,
+                      info.is_final,
+                      info.is_initial);
     };
   }
 
@@ -257,11 +350,21 @@ inline TimeLoopCallbacks MakeDefaultTimeLoopCallbacks(const DefaultCallbackConfi
                       FormatSci(info.base.avg_step_per_dof_local) + " s");
       lines.push_back("avg/step/dof/rank: " +
                       FormatSci(info.base.avg_step_per_dof_rank) + " s");
-      lines.push_back("dofs (local/global): " +
-                      std::to_string(static_cast<long long>(info.base.local_dofs)) +
-                      " / " +
-                      std::to_string(static_cast<long long>(info.base.global_dofs)) +
-                      " | ranks: " + std::to_string(info.base.ranks));
+      if (info.base.has_igr)
+      {
+        lines.push_back(
+          "IGR linear solve: " +
+          FormatFixed(info.base.igr_linear_solve_seconds) + " s (" +
+          FormatFixed(100.0 * info.base.igr_linear_solve_fraction, 2) +
+          "%) | calls: " + std::to_string(info.base.igr_linear_calls) +
+          " | conv: " + std::to_string(info.base.igr_linear_converged_calls) +
+          " | avg iters: " + FormatFixed(info.base.igr_linear_avg_iters, 2));
+      }
+      lines.push_back(
+        "dofs (local/global): " +
+        std::to_string(static_cast<long long>(info.base.local_dofs)) + " / " +
+        std::to_string(static_cast<long long>(info.base.global_dofs)) +
+        " | ranks: " + std::to_string(info.base.ranks));
 
       if (info.has_rho)
       {
@@ -302,33 +405,41 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
                                             const TimeLoopCallbacks& callbacks)
 {
   const auto start_time = std::chrono::steady_clock::now();
-  const double local_dofs =
-      static_cast<double>(ctx.spaces.vfes.TrueVSize());
+  const double local_dofs = static_cast<double>(ctx.spaces.vfes.TrueVSize());
   const double global_dofs =
-      static_cast<double>(ctx.spaces.vfes.GlobalTrueVSize());
+    static_cast<double>(ctx.spaces.vfes.GlobalTrueVSize());
   const int num_procs_value = num_procs;
   const int my_rank_value = my_rank;
   EulerVisWindows* glvis_windows = io.glvis_windows;
   bool* glvis_enabled = io.glvis_enabled;
   mfem::ParaViewDataCollection* paraview = io.paraview;
+  dg_igr::IGRSolver* igr_solver = bundle.field_list.igr;
+  const ExampleContext* ctx_ptr = &ctx;
+  EulerStateBundle* bundle_ptr = &bundle;
   TimeLoopHooks hooks;
-  hooks.on_visualize = [&, start_time, local_dofs, global_dofs,
-                        glvis_windows, glvis_enabled, num_procs_value,
-                        my_rank_value, callbacks](int step,
-                                      mfem::real_t t,
-                                      mfem::real_t dt_real,
-                                      bool)
+  hooks.on_visualize =
+    [start_time,
+     local_dofs,
+     global_dofs,
+     glvis_windows,
+     glvis_enabled,
+     num_procs_value,
+     my_rank_value,
+     callbacks,
+     igr_solver,
+     ctx_ptr,
+     bundle_ptr](int step, mfem::real_t t, mfem::real_t dt_real, bool)
   {
     const auto now = std::chrono::steady_clock::now();
     const double elapsed =
-        std::chrono::duration<double>(now - start_time).count();
+      std::chrono::duration<double>(now - start_time).count();
     const double avg_step = (step > 0) ? (elapsed / step) : 0.0;
     const double avg_step_per_dof_local =
-        (step > 0 && local_dofs > 0.0) ? (avg_step / local_dofs) : 0.0;
+      (step > 0 && local_dofs > 0.0) ? (avg_step / local_dofs) : 0.0;
     const double avg_step_per_dof_rank =
-        (step > 0 && global_dofs > 0.0 && num_procs_value > 0)
-            ? (avg_step * static_cast<double>(num_procs_value) / global_dofs)
-            : 0.0;
+      (step > 0 && global_dofs > 0.0 && num_procs_value > 0)
+        ? (avg_step * static_cast<double>(num_procs_value) / global_dofs)
+        : 0.0;
 
     if (callbacks.on_alive)
     {
@@ -344,21 +455,26 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
       info.avg_step = avg_step;
       info.avg_step_per_dof_local = avg_step_per_dof_local;
       info.avg_step_per_dof_rank = avg_step_per_dof_rank;
+      FillIGRTimeInfo(info, elapsed, igr_solver);
       callbacks.on_alive(info);
     }
     if (glvis_enabled && *glvis_enabled && glvis_windows)
     {
-      UpdateEulerGLVis(*glvis_windows, bundle.field_list, bundle.sol,
-                       num_procs_value, my_rank_value, ctx.Mesh(), t,
+      UpdateEulerGLVis(*glvis_windows,
+                       bundle_ptr->field_list,
+                       bundle_ptr->sol,
+                       num_procs_value,
+                       my_rank_value,
+                       ctx_ptr->Mesh(),
+                       t,
                        /*warm_start=*/true);
     }
   };
 
-  hooks.on_save = [&, start_time, local_dofs, global_dofs, paraview,
-                   callbacks](int step,
-                                                                    mfem::real_t t,
-                                                                    int save_idx,
-                                                                    bool is_final)
+  hooks.on_save = [paraview, callbacks, bundle_ptr](int step,
+                                                    mfem::real_t t,
+                                                    int save_idx,
+                                                    bool is_final)
   {
     if (callbacks.on_vtk_save)
     {
@@ -370,7 +486,9 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
       info.is_final = is_final;
       callbacks.on_vtk_save(info);
     }
-    UpdateEulerOutputFields(bundle.field_list, bundle.sol, /*warm_start=*/true);
+    UpdateEulerOutputFields(bundle_ptr->field_list,
+                            bundle_ptr->sol,
+                            /*warm_start=*/true);
     if (paraview)
     {
       paraview->SetCycle(save_idx);
@@ -379,22 +497,26 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
     }
   };
 
-  hooks.on_analysis = [&, start_time, local_dofs, global_dofs,
-                       num_procs_value, callbacks](int step,
-                                        mfem::real_t t,
-                                        mfem::real_t dt_real,
-                                        bool done)
+  hooks.on_analysis =
+    [start_time,
+     local_dofs,
+     global_dofs,
+     num_procs_value,
+     callbacks,
+     igr_solver,
+     ctx_ptr,
+     bundle_ptr](int step, mfem::real_t t, mfem::real_t dt_real, bool done)
   {
     const auto now = std::chrono::steady_clock::now();
     const double elapsed =
-        std::chrono::duration<double>(now - start_time).count();
+      std::chrono::duration<double>(now - start_time).count();
     const double avg_step = (step > 0) ? (elapsed / step) : 0.0;
     const double avg_step_per_dof_local =
-        (step > 0 && local_dofs > 0.0) ? (avg_step / local_dofs) : 0.0;
+      (step > 0 && local_dofs > 0.0) ? (avg_step / local_dofs) : 0.0;
     const double avg_step_per_dof_rank =
-        (step > 0 && global_dofs > 0.0 && num_procs_value > 0)
-            ? (avg_step * static_cast<double>(num_procs_value) / global_dofs)
-            : 0.0;
+      (step > 0 && global_dofs > 0.0 && num_procs_value > 0)
+        ? (avg_step * static_cast<double>(num_procs_value) / global_dofs)
+        : 0.0;
 
     if (callbacks.on_analysis)
     {
@@ -410,22 +532,25 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
       info.base.avg_step = avg_step;
       info.base.avg_step_per_dof_local = avg_step_per_dof_local;
       info.base.avg_step_per_dof_rank = avg_step_per_dof_rank;
+      FillIGRTimeInfo(info.base, elapsed, igr_solver);
 
       if (callbacks.wants_minmax)
       {
-        if (bundle.field_list.state)
+        if (bundle_ptr->field_list.state)
         {
-          const auto rho_mm = ComputeGlobalMinMax(
-              bundle.field_list.state->density, ctx.Mesh().GetComm());
+          const auto rho_mm =
+            ComputeGlobalMinMax(bundle_ptr->field_list.state->density,
+                                ctx_ptr->Mesh().GetComm());
           info.has_rho = true;
           info.rho_min = rho_mm.first;
           info.rho_max = rho_mm.second;
         }
-        if (bundle.field_list.pressure)
+        if (bundle_ptr->field_list.pressure)
         {
-          bundle.field_list.pressure->Update();
-          const auto p_mm = ComputeGlobalMinMax(
-              bundle.field_list.pressure->pressure, ctx.Mesh().GetComm());
+          bundle_ptr->field_list.pressure->Update();
+          const auto p_mm =
+            ComputeGlobalMinMax(bundle_ptr->field_list.pressure->pressure,
+                                ctx_ptr->Mesh().GetComm());
           info.has_p = true;
           info.p_min = p_mm.first;
           info.p_max = p_mm.second;

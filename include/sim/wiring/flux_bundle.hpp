@@ -11,8 +11,7 @@ namespace dg_sim
 {
 
 /// @brief Flux bundle for Euler + IGR wiring with a chosen numerical flux.
-template <typename NumericalFlux>
-struct EulerIGRFluxBundle
+template <typename NumericalFlux> struct EulerIGRFluxBundle
 {
   mfem::EulerFlux base_flux;
   mfem::FluxWithIGR igr_flux;

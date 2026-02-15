@@ -6,6 +6,7 @@
  */
 
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -22,12 +23,17 @@ inline void SaveInitialEulerState(ExampleContext& ctx,
                                   mfem::ParGridFunction& sol,
                                   int precision,
                                   const std::string& mesh_prefix = "euler-mesh",
-                                  const std::string& field_prefix = "euler")
+                                  const std::string& field_prefix = "euler",
+                                  const std::string& output_dir = ".")
 {
+  std::filesystem::create_directories(output_dir);
+
   std::ostringstream mesh_name;
   mesh_name << mesh_prefix << "." << std::setfill('0') << std::setw(6)
             << mfem::Mpi::WorldRank();
-  std::ofstream mesh_ofs(mesh_name.str().c_str());
+  const std::filesystem::path mesh_path =
+    std::filesystem::path(output_dir) / mesh_name.str();
+  std::ofstream mesh_ofs(mesh_path.string().c_str());
   mesh_ofs.precision(precision);
   mesh_ofs << ctx.Mesh();
 
@@ -38,23 +44,31 @@ inline void SaveInitialEulerState(ExampleContext& ctx,
     std::ostringstream sol_name;
     sol_name << field_prefix << "-" << k << "-init." << std::setfill('0')
              << std::setw(6) << mfem::Mpi::WorldRank();
-    std::ofstream sol_ofs(sol_name.str().c_str());
+    const std::filesystem::path sol_path =
+      std::filesystem::path(output_dir) / sol_name.str();
+    std::ofstream sol_ofs(sol_path.string().c_str());
     sol_ofs.precision(precision);
     sol_ofs << uk;
   }
 }
 
 /// @brief Save the final mesh + conservative state in GLVis-compatible files.
-inline void SaveFinalEulerState(ExampleContext& ctx,
-                                mfem::ParGridFunction& sol,
-                                int precision,
-                                const std::string& mesh_prefix = "euler-mesh-final",
-                                const std::string& field_prefix = "euler")
+inline void
+SaveFinalEulerState(ExampleContext& ctx,
+                    mfem::ParGridFunction& sol,
+                    int precision,
+                    const std::string& mesh_prefix = "euler-mesh-final",
+                    const std::string& field_prefix = "euler",
+                    const std::string& output_dir = ".")
 {
+  std::filesystem::create_directories(output_dir);
+
   std::ostringstream mesh_name;
   mesh_name << mesh_prefix << "." << std::setfill('0') << std::setw(6)
             << mfem::Mpi::WorldRank();
-  std::ofstream mesh_ofs(mesh_name.str().c_str());
+  const std::filesystem::path mesh_path =
+    std::filesystem::path(output_dir) / mesh_name.str();
+  std::ofstream mesh_ofs(mesh_path.string().c_str());
   mesh_ofs.precision(precision);
   mesh_ofs << ctx.Mesh();
 
@@ -65,7 +79,9 @@ inline void SaveFinalEulerState(ExampleContext& ctx,
     std::ostringstream sol_name;
     sol_name << field_prefix << "-" << k << "-final." << std::setfill('0')
              << std::setw(6) << mfem::Mpi::WorldRank();
-    std::ofstream sol_ofs(sol_name.str().c_str());
+    const std::filesystem::path sol_path =
+      std::filesystem::path(output_dir) / sol_name.str();
+    std::ofstream sol_ofs(sol_path.string().c_str());
     sol_ofs.precision(precision);
     sol_ofs << uk;
   }

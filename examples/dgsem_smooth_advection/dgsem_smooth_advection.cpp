@@ -25,7 +25,6 @@ int main(int argc, char* argv[])
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
   spec.use_igr = false;
-  spec.need_sigma = false;
   spec.need_h1 = false;
   spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
   spec.glvis.precision = 8;
@@ -45,7 +44,9 @@ int main(int argc, char* argv[])
 
   spec.add_options = [](mfem::OptionsParser& args, SmoothAdvectionOptions& opts)
   {
-    args.AddOption(&opts.bc_mode, "-bm", "--bc-mode",
+    args.AddOption(&opts.bc_mode,
+                   "-bm",
+                   "--bc-mode",
                    "Boundary mode: inlet-outlet | all-outlet | all-slip.");
   };
 
@@ -80,11 +81,10 @@ int main(int argc, char* argv[])
 
   spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
-    return dg_sim::BuildBoundaryMarkers(
-        ctx.Mesh(),
-        {{dg_sim::BoundaryRole::Inlet, {4}},
-         {dg_sim::BoundaryRole::Outlet, {2}},
-         {dg_sim::BoundaryRole::Slip, {1, 3}}});
+    return dg_sim::BuildBoundaryMarkers(ctx.Mesh(),
+                                        {{dg_sim::BoundaryRole::Inlet, {4}},
+                                         {dg_sim::BoundaryRole::Outlet, {2}},
+                                         {dg_sim::BoundaryRole::Slip, {1, 3}}});
   };
 
   spec.apply_bc = [](const SmoothAdvectionOptions& opts,
@@ -129,8 +129,10 @@ int main(int argc, char* argv[])
       bc.AddSlipWall(markers, dg_sim::BoundaryRole::Slip);
       return;
     }
-    MFEM_VERIFY(false, "Unknown bc-mode '" << opts.bc_mode
-                                           << "'. Use inlet-outlet | all-outlet | all-slip.");
+    MFEM_VERIFY(false,
+                "Unknown bc-mode '"
+                  << opts.bc_mode
+                  << "'. Use inlet-outlet | all-outlet | all-slip.");
   };
 
   return dg_sim::Solver::solve(spec, argc, argv);

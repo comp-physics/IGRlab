@@ -1,5 +1,6 @@
 #include "physics/euler/conversions.hpp"
 #include "physics/igr/IGR.hpp"
+#include "physics/igr/igr_coupling.hpp"
 #include "physics/igr/igr_flux.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/riemann/rusanov.hpp"
@@ -7,6 +8,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -23,14 +26,38 @@ mfem::Mesh MakePeriodicMesh1D(int n)
   mfem::Mesh orig_mesh = mfem::Mesh::MakeCartesian1D(n, 1.0);
   std::vector<mfem::Vector> translations = {mfem::Vector({1.0})};
   return mfem::Mesh::MakePeriodic(
-      orig_mesh, orig_mesh.CreatePeriodicVertexMapping(translations));
+    orig_mesh,
+    orig_mesh.CreatePeriodicVertexMapping(translations));
+}
+
+mfem::Mesh MakePeriodicMesh2D(int nx, int ny, double sx = 1.0, double sy = 1.0)
+{
+  mfem::Mesh orig_mesh =
+    mfem::Mesh::MakeCartesian2D(nx,
+                                ny,
+                                mfem::Element::QUADRILATERAL,
+                                /*generate_edges=*/true,
+                                sx,
+                                sy);
+  mfem::Vector shift_x(2);
+  shift_x(0) = sx;
+  shift_x(1) = 0.0;
+  mfem::Vector shift_y(2);
+  shift_y(0) = 0.0;
+  shift_y(1) = sy;
+  std::vector<mfem::Vector> translations = {shift_x, shift_y};
+  return mfem::Mesh::MakePeriodic(
+    orig_mesh,
+    orig_mesh.CreatePeriodicVertexMapping(translations));
 }
 
 mfem::FaceElementTransformations& GetFaceTr(mfem::ParMesh& pmesh, int face)
 {
-  mfem::FaceElementTransformations* Tr = pmesh.GetFaceElementTransformations(face);
+  mfem::FaceElementTransformations* Tr =
+    pmesh.GetFaceElementTransformations(face);
   MFEM_VERIFY(Tr != nullptr, "Failed to obtain face transformations.");
-  const mfem::IntegrationRule& ir = mfem::IntRules.Get(Tr->GetGeometryType(), /*order=*/1);
+  const mfem::IntegrationRule& ir =
+    mfem::IntRules.Get(Tr->GetGeometryType(), /*order=*/1);
   const mfem::IntegrationPoint& ip = ir.IntPoint(0);
   Tr->SetAllIntPoints(&ip);
   return *Tr;
@@ -40,8 +67,11 @@ class StepSigmaCoefficient final : public mfem::Coefficient
 {
 public:
   StepSigmaCoefficient(double left, double right, double split_x)
-    : left_(left), right_(right), split_x_(split_x)
-  {}
+    : left_(left),
+      right_(right),
+      split_x_(split_x)
+  {
+  }
 
   double Eval(mfem::ElementTransformation& Tr,
               const mfem::IntegrationPoint& ip) override
@@ -60,16 +90,17 @@ private:
 class LinearAverageFlux final : public mfem::FluxFunction
 {
 public:
-  LinearAverageFlux(int dim, const mfem::Vector &dir)
-    : mfem::FluxFunction(dim + 2, dim), dir_(dir)
+  LinearAverageFlux(int dim, const mfem::Vector& dir)
+    : mfem::FluxFunction(dim + 2, dim),
+      dir_(dir)
   {
     MFEM_VERIFY(dir_.Size() == dim,
                 "LinearAverageFlux direction dimension mismatch.");
   }
 
-  mfem::real_t ComputeFlux(const mfem::Vector &state,
-                           mfem::ElementTransformation &,
-                           mfem::DenseMatrix &flux) const override
+  mfem::real_t ComputeFlux(const mfem::Vector& state,
+                           mfem::ElementTransformation&,
+                           mfem::DenseMatrix& flux) const override
   {
     flux.SetSize(num_equations, dim);
     for (int d = 0; d < dim; ++d)
@@ -82,10 +113,10 @@ public:
     return dir_.Norml2();
   }
 
-  mfem::real_t ComputeAvgFlux(const mfem::Vector &state1,
-                              const mfem::Vector &state2,
-                              mfem::ElementTransformation &Tr,
-                              mfem::DenseMatrix &flux) const override
+  mfem::real_t ComputeAvgFlux(const mfem::Vector& state1,
+                              const mfem::Vector& state2,
+                              mfem::ElementTransformation& Tr,
+                              mfem::DenseMatrix& flux) const override
   {
     mfem::Vector avg(state1);
     avg += state2;
@@ -97,7 +128,8 @@ private:
   mfem::Vector dir_;
 };
 
-double DotMomentumNormal(const mfem::Vector& cons, const mfem::Vector& normal, int dim)
+double
+DotMomentumNormal(const mfem::Vector& cons, const mfem::Vector& normal, int dim)
 {
   double un = 0.0;
   for (int d = 0; d < dim; ++d)
@@ -136,8 +168,7 @@ double ExactAvgUnOverRho(const mfem::Vector& state1,
   const double inv_drho = 1.0 / drho;
   const double inv_drho2 = inv_drho * inv_drho;
   const double log_ratio = std::log1p(drho / rho1);
-  return dmn * inv_drho +
-         (mn1 * drho - dmn * rho1) * inv_drho2 * log_ratio;
+  return dmn * inv_drho + (mn1 * drho - dmn * rho1) * inv_drho2 * log_ratio;
 }
 
 void AddSigmaDotNTerms(const mfem::Vector& state,
@@ -166,6 +197,74 @@ double SigmaAtElementPoint(const mfem::ParGridFunction& sigma,
   return sigma.GetValue(T, ip);
 }
 
+struct SPDProbeSummary
+{
+  double max_sym_rel = 0.0;
+  double min_rayleigh = std::numeric_limits<double>::infinity();
+  bool finite = true;
+};
+
+double GlobalDotMPI(const mfem::Vector& x, const mfem::Vector& y, MPI_Comm comm)
+{
+  const double local = x * y;
+  double global = 0.0;
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_SUM,
+                comm);
+  return global;
+}
+
+void FillDeterministicProbeVector(mfem::Vector& v, int seed)
+{
+  const int rank = mfem::Mpi::WorldRank();
+  for (int i = 0; i < v.Size(); ++i)
+  {
+    const double t = static_cast<double>((i + 1) * (seed + 5) + 19 * rank);
+    v(i) = std::sin(0.017 * t) + 0.5 * std::cos(0.031 * t);
+  }
+}
+
+SPDProbeSummary
+ProbeSPD(const mfem::HypreParMatrix& A, MPI_Comm comm, int samples = 4)
+{
+  SPDProbeSummary out;
+  const int n = A.Width();
+  MFEM_VERIFY(n > 0, "SPD probe requires non-empty operator.");
+
+  mfem::Vector x(n), y(n), Ax(n), Ay(n);
+  for (int s = 0; s < samples; ++s)
+  {
+    FillDeterministicProbeVector(x, 2 * s + 1);
+    FillDeterministicProbeVector(y, 2 * s + 2);
+    A.Mult(x, Ax);
+    A.Mult(y, Ay);
+
+    for (int i = 0; i < n; ++i)
+    {
+      if (!std::isfinite(Ax(i)) || !std::isfinite(Ay(i)))
+      {
+        out.finite = false;
+      }
+    }
+
+    const double xAy = GlobalDotMPI(x, Ay, comm);
+    const double yAx = GlobalDotMPI(y, Ax, comm);
+    const double sym_rel =
+      std::abs(xAy - yAx) / std::max({1.0, std::abs(xAy), std::abs(yAx)});
+    out.max_sym_rel = std::max(out.max_sym_rel, sym_rel);
+
+    const double xAx = GlobalDotMPI(x, Ax, comm);
+    const double x2 = GlobalDotMPI(x, x, comm);
+    const double rayleigh = xAx / std::max(x2, 1.0e-30);
+    out.min_rayleigh = std::min(out.min_rayleigh, rayleigh);
+  }
+
+  return out;
+}
+
 } // namespace
 
 int RunIGRTests(TestContext& ctx)
@@ -178,7 +277,11 @@ int RunIGRTests(TestContext& ctx)
   mfem::FluxWithIGR igr_flux(base_flux);
 
   const mfem::Vector state = EulerConsFromPrim2D(
-      /*rho=*/1.2, /*u=*/2.0, /*v=*/-0.5, /*p=*/1.0, gamma);
+    /*rho=*/1.2,
+    /*u=*/2.0,
+    /*v=*/-0.5,
+    /*p=*/1.0,
+    gamma);
   mfem::Vector normal(dim);
   normal(0) = 2.0;
   normal(1) = -1.0;
@@ -193,21 +296,26 @@ int RunIGRTests(TestContext& ctx)
     ctx.AddParity(igr_fn(0) + igr_fn(1) + igr_fn(2) + igr_fn(3));
     for (int i = 0; i < base_fn.Size(); ++i)
     {
-      ctx.CheckNear(igr_fn(i), base_fn(i), tol,
-                    "FluxWithIGR matches base flux when sigma is null, component " +
-                        std::to_string(i));
+      ctx.CheckNear(
+        igr_fn(i),
+        base_fn(i),
+        tol,
+        "FluxWithIGR matches base flux when sigma is null, component " +
+          std::to_string(i));
     }
   }
 
   // --- With constant sigma, momentum/energy offsets match the documented form ---
   mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
-      /*nx=*/2, /*ny=*/2, mfem::Element::QUADRILATERAL,
-      /*generate_edges=*/true, /*sx=*/1.0, /*sy=*/1.0);
-  mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
-  if (pmesh.GetNFaces() == 0)
-  {
-    return ctx.failures;
-  }
+    /*nx=*/2,
+    /*ny=*/2,
+    mfem::Element::QUADRILATERAL,
+    /*generate_edges=*/true,
+    /*sx=*/1.0,
+    /*sy=*/1.0);
+  mfem::ParMesh pmesh(MPI_COMM_SELF, mesh);
+  MFEM_VERIFY(pmesh.GetNumFaces() > 0,
+              "IGR flux tests require a mesh with faces.");
   mfem::DG_FECollection fec(/*order=*/0, dim);
   mfem::ParFiniteElementSpace sigma_fes(&pmesh, &fec, /*vdim=*/1);
   mfem::ParGridFunction sigma(&sigma_fes);
@@ -230,11 +338,17 @@ int RunIGRTests(TestContext& ctx)
   const double un = DotMomentumNormal(state, normal, dim) / rho;
 
   // Momentum rows get +sigma*n, energy row gets +sigma*(u·n).
-  ctx.CheckNear(igr_fn(1) - base_fn(1), sigma_value * normal(0), tol,
+  ctx.CheckNear(igr_fn(1) - base_fn(1),
+                sigma_value * normal(0),
+                tol,
                 "FluxWithIGR adds sigma*n_x to momentum_x");
-  ctx.CheckNear(igr_fn(2) - base_fn(2), sigma_value * normal(1), tol,
+  ctx.CheckNear(igr_fn(2) - base_fn(2),
+                sigma_value * normal(1),
+                tol,
                 "FluxWithIGR adds sigma*n_y to momentum_y");
-  ctx.CheckNear(igr_fn(3) - base_fn(3), sigma_value * un, tol,
+  ctx.CheckNear(igr_fn(3) - base_fn(3),
+                sigma_value * un,
+                tol,
                 "FluxWithIGR adds sigma*(u·n) to energy flux");
 
   // --- Tensor flux path: sigma terms must enter ComputeFlux (volume flux) ---
@@ -242,7 +356,7 @@ int RunIGRTests(TestContext& ctx)
     mfem::ElementTransformation* Te = pmesh.GetElementTransformation(0);
     MFEM_VERIFY(Te != nullptr, "Failed to obtain element transformation.");
     const mfem::IntegrationRule& ir_elem =
-        mfem::IntRules.Get(Te->GetGeometryType(), /*order=*/1);
+      mfem::IntRules.Get(Te->GetGeometryType(), /*order=*/1);
     const mfem::IntegrationPoint& ip_elem = ir_elem.IntPoint(0);
     Te->SetIntPoint(&ip_elem);
 
@@ -254,14 +368,18 @@ int RunIGRTests(TestContext& ctx)
     const double rho_vol = state(0);
     for (int d = 0; d < dim; ++d)
     {
-      ctx.CheckNear(igr_F(1 + d, d) - base_F(1 + d, d), sigma_value, tol,
-                    "FluxWithIGR adds +sigma to momentum tensor diagonal, dim=" +
-                        std::to_string(d));
+      ctx.CheckNear(
+        igr_F(1 + d, d) - base_F(1 + d, d),
+        sigma_value,
+        tol,
+        "FluxWithIGR adds +sigma to momentum tensor diagonal, dim=" +
+          std::to_string(d));
       const double expected_energy = sigma_value * state(1 + d) / rho_vol;
       ctx.CheckNear(igr_F(1 + dim, d) - base_F(1 + dim, d),
-                    expected_energy, tol,
+                    expected_energy,
+                    tol,
                     "FluxWithIGR adds +sigma*u to energy tensor row, dim=" +
-                        std::to_string(d));
+                      std::to_string(d));
     }
   }
 
@@ -275,40 +393,60 @@ int RunIGRTests(TestContext& ctx)
     igr_avg.SetSigmaField(&sigma);
 
     const mfem::Vector state_avg_1 = EulerConsFromPrim2D(
-        /*rho=*/0.9, /*u=*/1.8, /*v=*/-0.3, /*p=*/1.0, gamma);
+      /*rho=*/0.9,
+      /*u=*/1.8,
+      /*v=*/-0.3,
+      /*p=*/1.0,
+      gamma);
     const mfem::Vector state_avg_2 = EulerConsFromPrim2D(
-        /*rho=*/1.4, /*u=*/-0.2, /*v=*/0.6, /*p=*/0.9, gamma);
+      /*rho=*/1.4,
+      /*u=*/-0.2,
+      /*v=*/0.6,
+      /*p=*/0.9,
+      gamma);
 
     mfem::Vector base_avg_fn(dim + 2);
     mfem::Vector igr_avg_fn(dim + 2);
-    linear_base.ComputeAvgFluxDotN(state_avg_1, state_avg_2, normal, Tr_face,
-                                    base_avg_fn);
-    igr_avg.ComputeAvgFluxDotNAtSide(state_avg_1, state_avg_2, normal, Tr_face,
-                                     mfem::FaceSide::Left, igr_avg_fn);
+    linear_base.ComputeAvgFluxDotN(state_avg_1,
+                                   state_avg_2,
+                                   normal,
+                                   Tr_face,
+                                   base_avg_fn);
+    igr_avg.ComputeAvgFluxDotNAtSide(state_avg_1,
+                                     state_avg_2,
+                                     normal,
+                                     Tr_face,
+                                     mfem::FaceSide::Left,
+                                     igr_avg_fn);
 
     mfem::Vector expected_avg(base_avg_fn);
     for (int d = 0; d < dim; ++d)
     {
       expected_avg(1 + d) += sigma_value * normal(d);
     }
-    expected_avg(1 + dim) += sigma_value *
-                             ExactAvgUnOverRho(state_avg_1, state_avg_2,
-                                               normal, dim);
+    expected_avg(1 + dim) +=
+      sigma_value * ExactAvgUnOverRho(state_avg_1, state_avg_2, normal, dim);
 
     for (int i = 0; i < expected_avg.Size(); ++i)
     {
-      ctx.CheckNear(igr_avg_fn(i), expected_avg(i), 5.0e-12,
+      ctx.CheckNear(igr_avg_fn(i),
+                    expected_avg(i),
+                    5.0e-12,
                     "FluxWithIGR exact averaged sigma correction, component " +
-                        std::to_string(i));
+                      std::to_string(i));
     }
   }
 
   // --- Interior-face side selection: sigma should come from the matching side ---
   {
     mfem::Mesh mesh_if = mfem::Mesh::MakeCartesian2D(
-        /*nx=*/4, /*ny=*/2, mfem::Element::QUADRILATERAL,
-        /*generate_edges=*/true, /*sx=*/1.0, /*sy=*/1.0);
-    mfem::ParMesh pmesh_if(MPI_COMM_WORLD, mesh_if);
+      /*nx=*/4,
+      /*ny=*/2,
+      mfem::Element::QUADRILATERAL,
+      /*generate_edges=*/true,
+      /*sx=*/1.0,
+      /*sy=*/1.0);
+    mfem::ParMesh pmesh_if(MPI_COMM_SELF, mesh_if);
 
     mfem::DG_FECollection fec_if(/*order=*/0, dim);
     mfem::ParFiniteElementSpace sigma_fes_if(&pmesh_if, &fec_if, /*vdim=*/1);
@@ -324,9 +462,17 @@ int RunIGRTests(TestContext& ctx)
     mfem::RusanovFluxWithSides num_flux(igr_flux_if);
 
     const mfem::Vector state_left = EulerConsFromPrim2D(
-        /*rho=*/1.0, /*u=*/1.5, /*v=*/0.25, /*p=*/1.0, gamma);
+      /*rho=*/1.0,
+      /*u=*/1.5,
+      /*v=*/0.25,
+      /*p=*/1.0,
+      gamma);
     const mfem::Vector state_right = EulerConsFromPrim2D(
-        /*rho=*/0.8, /*u=*/-0.75, /*v=*/0.5, /*p=*/0.9, gamma);
+      /*rho=*/0.8,
+      /*u=*/-0.75,
+      /*v=*/0.5,
+      /*p=*/0.9,
+      gamma);
     mfem::Vector normal_if(dim);
     normal_if(0) = 1.25;
     normal_if(1) = -0.5;
@@ -335,13 +481,17 @@ int RunIGRTests(TestContext& ctx)
     int local_face_count = 0;
 
     const mfem::IntegrationRule& ir_face =
-        mfem::IntRules.Get(mfem::Geometry::SEGMENT, /*order=*/1);
+      mfem::IntRules.Get(mfem::Geometry::SEGMENT, /*order=*/1);
     const mfem::IntegrationPoint& ip_face = ir_face.IntPoint(0);
 
-    for (int f = 0; f < pmesh_if.GetNFaces(); ++f)
+    for (int f = 0; f < pmesh_if.GetNumFaces(); ++f)
     {
-      mfem::FaceElementTransformations* Tr = pmesh_if.GetFaceElementTransformations(f);
-      if (!Tr || !Tr->Elem2) { continue; }
+      mfem::FaceElementTransformations* Tr =
+        pmesh_if.GetFaceElementTransformations(f);
+      if (!Tr || !Tr->Elem2)
+      {
+        continue;
+      }
       Tr->SetAllIntPoints(&ip_face);
 
       const mfem::IntegrationPoint& ip1 = Tr->GetElement1IntPoint();
@@ -354,9 +504,9 @@ int RunIGRTests(TestContext& ctx)
       mfem::Vector fluxN1(dim + 2);
       mfem::Vector fluxN2(dim + 2);
       const mfem::real_t speed1 =
-          base_flux.ComputeFluxDotN(state_left, normal_if, *Tr, fluxN1);
+        base_flux.ComputeFluxDotN(state_left, normal_if, *Tr, fluxN1);
       const mfem::real_t speed2 =
-          base_flux.ComputeFluxDotN(state_right, normal_if, *Tr, fluxN2);
+        base_flux.ComputeFluxDotN(state_right, normal_if, *Tr, fluxN2);
 
       AddSigmaDotNTerms(state_left, normal_if, sigma1, fluxN1);
       AddSigmaDotNTerms(state_right, normal_if, sigma2, fluxN2);
@@ -367,8 +517,9 @@ int RunIGRTests(TestContext& ctx)
       mfem::Vector expected(dim + 2);
       for (int i = 0; i < expected.Size(); ++i)
       {
-        expected(i) = 0.5 * (scaled_max_speed * (state_left(i) - state_right(i)) +
-                             fluxN1(i) + fluxN2(i));
+        expected(i) =
+          0.5 * (scaled_max_speed * (state_left(i) - state_right(i)) +
+                 fluxN1(i) + fluxN2(i));
       }
 
       mfem::Vector actual(dim + 2);
@@ -376,13 +527,16 @@ int RunIGRTests(TestContext& ctx)
 
       for (int i = 0; i < actual.Size(); ++i)
       {
-        local_max_err = std::max(local_max_err, std::abs(actual(i) - expected(i)));
+        local_max_err =
+          std::max(local_max_err, std::abs(actual(i) - expected(i)));
       }
       ++local_face_count;
     }
 
-    const double global_faces = GlobalSum(static_cast<double>(local_face_count));
-    ctx.Check(global_faces > 0.0, "IGR interior-face test found interior faces");
+    const double global_faces =
+      GlobalSum(static_cast<double>(local_face_count));
+    ctx.Check(global_faces > 0.0,
+              "IGR interior-face test found interior faces");
 
     if (global_faces > 0.0)
     {
@@ -396,12 +550,18 @@ int RunIGRTests(TestContext& ctx)
   // --- Deterministic side-selection stress: explicit-side path remains stable ---
   {
     mfem::Mesh mesh_side = mfem::Mesh::MakeCartesian2D(
-        /*nx=*/2, /*ny=*/1, mfem::Element::QUADRILATERAL,
-        /*generate_edges=*/true, /*sx=*/1.0, /*sy=*/1.0);
+      /*nx=*/2,
+      /*ny=*/1,
+      mfem::Element::QUADRILATERAL,
+      /*generate_edges=*/true,
+      /*sx=*/1.0,
+      /*sy=*/1.0);
     mfem::ParMesh pmesh_side(MPI_COMM_SELF, mesh_side);
 
     mfem::DG_FECollection fec_side(/*order=*/0, dim);
-    mfem::ParFiniteElementSpace sigma_fes_side(&pmesh_side, &fec_side, /*vdim=*/1);
+    mfem::ParFiniteElementSpace sigma_fes_side(&pmesh_side,
+                                               &fec_side,
+                                               /*vdim=*/1);
     mfem::ParGridFunction sigma_side(&sigma_fes_side);
     for (int e = 0; e < sigma_fes_side.GetNE(); ++e)
     {
@@ -417,42 +577,59 @@ int RunIGRTests(TestContext& ctx)
     igr_flux_side.SetSigmaField(&sigma_side);
 
     int interior_face = -1;
-    for (int f = 0; f < pmesh_side.GetNFaces(); ++f)
+    for (int f = 0; f < pmesh_side.GetNumFaces(); ++f)
     {
-      mfem::FaceElementTransformations* Tr = pmesh_side.GetFaceElementTransformations(f);
+      mfem::FaceElementTransformations* Tr =
+        pmesh_side.GetFaceElementTransformations(f);
       if (Tr && Tr->Elem1 && Tr->Elem2)
       {
         interior_face = f;
         break;
       }
     }
-    MFEM_VERIFY(interior_face >= 0,
-                "Deterministic side-selection stress test requires an interior face.");
+    MFEM_VERIFY(
+      interior_face >= 0,
+      "Deterministic side-selection stress test requires an interior face.");
 
-    mfem::FaceElementTransformations* Tr = pmesh_side.GetFaceElementTransformations(interior_face);
-    MFEM_VERIFY(Tr != nullptr, "Failed to obtain interior face transformations.");
+    mfem::FaceElementTransformations* Tr =
+      pmesh_side.GetFaceElementTransformations(interior_face);
+    MFEM_VERIFY(Tr != nullptr,
+                "Failed to obtain interior face transformations.");
     const mfem::IntegrationRule& ir_face =
-        mfem::IntRules.Get(Tr->GetGeometryType(), /*order=*/1);
+      mfem::IntRules.Get(Tr->GetGeometryType(), /*order=*/1);
     const mfem::IntegrationPoint& ip_face = ir_face.IntPoint(0);
     Tr->SetAllIntPoints(&ip_face);
 
     mfem::Vector state = EulerConsFromPrim2D(
-        /*rho=*/1.1, /*u=*/0.9, /*v=*/-0.3, /*p=*/1.0, gamma);
+      /*rho=*/1.1,
+      /*u=*/0.9,
+      /*v=*/-0.3,
+      /*p=*/1.0,
+      gamma);
     mfem::Vector normal(dim);
     mfem::CalcOrtho(Tr->Jacobian(), normal);
 
     mfem::Vector left_ref(state.Size());
     mfem::Vector right_ref(state.Size());
-    const mfem::real_t left_speed_ref = mfem::riemann_detail::ComputeFluxDotNForSide(
-        igr_flux_side, mfem::FaceSide::Left, state, normal, *Tr, left_ref);
-    const mfem::real_t right_speed_ref = mfem::riemann_detail::ComputeFluxDotNForSide(
-        igr_flux_side, mfem::FaceSide::Right, state, normal, *Tr, right_ref);
+    const mfem::real_t left_speed_ref =
+      mfem::riemann_detail::ComputeFluxDotNForSide(igr_flux_side,
+                                                   mfem::FaceSide::Left,
+                                                   state,
+                                                   normal,
+                                                   *Tr,
+                                                   left_ref);
+    const mfem::real_t right_speed_ref =
+      mfem::riemann_detail::ComputeFluxDotNForSide(igr_flux_side,
+                                                   mfem::FaceSide::Right,
+                                                   state,
+                                                   normal,
+                                                   *Tr,
+                                                   right_ref);
 
     // Side regression snapshot: left/right must differ when sigma differs per element.
-    const double ref_diff =
-        std::abs(left_ref(1) - right_ref(1)) +
-        std::abs(left_ref(2) - right_ref(2)) +
-        std::abs(left_ref(3) - right_ref(3));
+    const double ref_diff = std::abs(left_ref(1) - right_ref(1)) +
+                            std::abs(left_ref(2) - right_ref(2)) +
+                            std::abs(left_ref(3) - right_ref(3));
     ctx.AddParity(ref_diff + left_speed_ref + right_speed_ref);
     ctx.Check(ref_diff > 1.0e-12,
               "IGR side snapshots differ for left/right sigma values");
@@ -460,26 +637,36 @@ int RunIGRTests(TestContext& ctx)
     for (int iter = 0; iter < 200; ++iter)
     {
       const mfem::FaceSide side =
-          ((iter % 2) == 0) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
+        ((iter % 2) == 0) ? mfem::FaceSide::Left : mfem::FaceSide::Right;
 
       mfem::Vector flux_explicit(state.Size());
-      const mfem::real_t speed_explicit = mfem::riemann_detail::ComputeFluxDotNForSide(
-          igr_flux_side, side, state, normal, *Tr, flux_explicit);
+      const mfem::real_t speed_explicit =
+        mfem::riemann_detail::ComputeFluxDotNForSide(igr_flux_side,
+                                                     side,
+                                                     state,
+                                                     normal,
+                                                     *Tr,
+                                                     flux_explicit);
 
       const mfem::Vector& flux_ref =
-          (side == mfem::FaceSide::Left) ? left_ref : right_ref;
+        (side == mfem::FaceSide::Left) ? left_ref : right_ref;
       const mfem::real_t speed_ref =
-          (side == mfem::FaceSide::Left) ? left_speed_ref : right_speed_ref;
+        (side == mfem::FaceSide::Left) ? left_speed_ref : right_speed_ref;
 
       for (int i = 0; i < flux_ref.Size(); ++i)
       {
-        ctx.CheckNear(flux_explicit(i), flux_ref(i), tol,
+        ctx.CheckNear(flux_explicit(i),
+                      flux_ref(i),
+                      tol,
                       "Explicit-side flux remains deterministic, iter=" +
-                          std::to_string(iter) + ", component=" + std::to_string(i));
+                        std::to_string(iter) +
+                        ", component=" + std::to_string(i));
       }
-      ctx.CheckNear(speed_explicit, speed_ref, tol,
+      ctx.CheckNear(speed_explicit,
+                    speed_ref,
+                    tol,
                     "Explicit-side speed remains deterministic, iter=" +
-                        std::to_string(iter));
+                      std::to_string(iter));
     }
   }
 
@@ -490,19 +677,25 @@ int RunIGRTests(TestContext& ctx)
     const double tol_zero = 1.0e-10;
 
     mfem::Mesh mesh_dg = MakePeriodicMesh1D(/*n=*/8);
-    mfem::ParMesh pmesh_dg(MPI_COMM_WORLD, mesh_dg);
+    mfem::ParMesh pmesh_dg(MPI_COMM_SELF, mesh_dg);
 
-    mfem::DG_FECollection state_fec(/*order=*/2, dim1, mfem::BasisType::GaussLegendre);
-    mfem::ParFiniteElementSpace vfes(&pmesh_dg, &state_fec, num_eq1,
+    mfem::DG_FECollection state_fec(/*order=*/2,
+                                    dim1,
+                                    mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace vfes(&pmesh_dg,
+                                     &state_fec,
+                                     num_eq1,
                                      mfem::Ordering::byNODES);
     mfem::ParGridFunction U_const(&vfes);
     const mfem::Vector cons_const =
-        EulerConsFromPrim1D(/*rho=*/1.0, /*u=*/0.0, /*p=*/1.0, gamma);
+      EulerConsFromPrim1D(/*rho=*/1.0, /*u=*/0.0, /*p=*/1.0, gamma);
     FillConstantState(cons_const, U_const);
 
-    mfem::DG_FECollection sigma_fec_dg(/*order=*/1, dim1,
+    mfem::DG_FECollection sigma_fec_dg(/*order=*/1,
+                                       dim1,
                                        mfem::BasisType::GaussLegendre);
-    mfem::ParFiniteElementSpace sigma_fes_dg(&pmesh_dg, &sigma_fec_dg,
+    mfem::ParFiniteElementSpace sigma_fes_dg(&pmesh_dg,
+                                             &sigma_fec_dg,
                                              /*vdim=*/1,
                                              mfem::Ordering::byNODES);
     mfem::ParGridFunction sigma_dg(&sigma_fes_dg);
@@ -530,9 +723,10 @@ int RunIGRTests(TestContext& ctx)
 
     constexpr int int_order_offset = 2;
     auto form_integrator =
-        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux_dg,
-                                                         int_order_offset);
-    mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form_integrator),
+      std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux_dg,
+                                                       int_order_offset);
+    mfem::DGHyperbolicConservationLaws oper(vfes,
+                                            std::move(form_integrator),
                                             /*preassembleWeakDivergence=*/true);
     oper.SetNumericalFlux(&num_flux_dg);
 
@@ -563,38 +757,58 @@ int RunIGRTests(TestContext& ctx)
     constexpr int igr_num_eq = igr_dim + 2;
 
     mfem::Mesh mesh_iso = mfem::Mesh::MakeCartesian2D(
-        /*nx=*/2, /*ny=*/2, mfem::Element::QUADRILATERAL,
-        /*generate_edges=*/true, /*sx=*/1.0, /*sy=*/1.0);
+      /*nx=*/2,
+      /*ny=*/2,
+      mfem::Element::QUADRILATERAL,
+      /*generate_edges=*/true,
+      /*sx=*/1.0,
+      /*sy=*/1.0);
     mfem::ParMesh pmesh_iso(MPI_COMM_SELF, mesh_iso);
 
     mfem::DG_FECollection sigma_fec(/*order=*/1, igr_dim);
     mfem::DG_FECollection state_fec(/*order=*/1, igr_dim);
     mfem::ParFiniteElementSpace sigma_fes(&pmesh_iso, &sigma_fec, /*vdim=*/1);
-    mfem::ParFiniteElementSpace state_fes(&pmesh_iso, &state_fec, igr_num_eq,
+    mfem::ParFiniteElementSpace state_fes(&pmesh_iso,
+                                          &state_fec,
+                                          igr_num_eq,
                                           mfem::Ordering::byNODES);
 
     mfem::ParGridFunction U(&state_fes);
     mfem::VectorFunctionCoefficient U_coeff(
-        igr_num_eq,
-        [&](const mfem::Vector& x, mfem::Vector& cons)
-        {
-          mfem::Vector prim(igr_num_eq);
-          prim(0) = 1.0 + 0.1 * x(0);               // rho
-          prim(1) = 1.5 + 0.2 * x(1);               // u
-          prim(2) = -0.25 + 0.1 * x(0);             // v
-          prim(1 + igr_dim) = 1.0 + 0.05 * x(1);    // p
-          cons.SetSize(igr_num_eq);
-          mfem::EulerPrimToConservative(prim, igr_dim, gamma, cons);
-        });
+      igr_num_eq,
+      [&](const mfem::Vector& x, mfem::Vector& cons)
+      {
+        mfem::Vector prim(igr_num_eq);
+        prim(0) = 1.0 + 0.1 * x(0);            // rho
+        prim(1) = 1.5 + 0.2 * x(1);            // u
+        prim(2) = -0.25 + 0.1 * x(0);          // v
+        prim(1 + igr_dim) = 1.0 + 0.05 * x(1); // p
+        cons.SetSize(igr_num_eq);
+        mfem::EulerPrimToConservative(prim, igr_dim, gamma, cons);
+      });
     U.ProjectCoefficient(U_coeff);
     U.ExchangeFaceNbrData();
 
-    dg_igr::IGRSolver solver_a(sigma_fes, state_fes, igr_dim, igr_num_eq, /*alpha=*/0.05);
-    dg_igr::IGRSolver solver_b(sigma_fes, state_fes, igr_dim, igr_num_eq, /*alpha=*/0.35);
+    dg_igr::IGRSolver solver_a(sigma_fes,
+                               state_fes,
+                               igr_dim,
+                               igr_num_eq,
+                               /*alpha=*/0.05);
+    dg_igr::IGRSolver solver_b(sigma_fes,
+                               state_fes,
+                               igr_dim,
+                               igr_num_eq,
+                               /*alpha=*/0.35);
     solver_a.SetRhoFloor(1.0e-12);
     solver_b.SetRhoFloor(5.0e-2);
-    solver_a.SetLinearSolveParams(/*rtol=*/1.0e-10, /*atol=*/1.0e-14, /*max_it=*/200, /*print=*/0);
-    solver_b.SetLinearSolveParams(/*rtol=*/1.0e-10, /*atol=*/1.0e-14, /*max_it=*/200, /*print=*/0);
+    solver_a.SetLinearSolveParams(/*rtol=*/1.0e-10,
+                                  /*atol=*/1.0e-14,
+                                  /*max_it=*/200,
+                                  /*print=*/0);
+    solver_b.SetLinearSolveParams(/*rtol=*/1.0e-10,
+                                  /*atol=*/1.0e-14,
+                                  /*max_it=*/200,
+                                  /*print=*/0);
 
     solver_a.UpdateFromState(U, /*warm_start=*/false);
     mfem::Vector sigma_a1(solver_a.GetSigma().Size());
@@ -617,10 +831,615 @@ int RunIGRTests(TestContext& ctx)
     const double cfg_diff = GlobalL2Norm(delta_cfg);
 
     ctx.AddParity(repeat_err + cfg_diff);
-    ctx.Check(repeat_err < 1.0e-11,
-              "IGRSolver instance state is isolated across multiple solver objects");
+    ctx.Check(
+      repeat_err < 1.0e-11,
+      "IGRSolver instance state is isolated across multiple solver objects");
     ctx.Check(cfg_diff > 1.0e-8,
               "Different IGRSolver configs produce distinct sigma fields");
+  }
+
+  // --- IGR linear-policy + warm-start regression ---
+  {
+    constexpr int dim_ws = 1;
+    constexpr int num_eq_ws = dim_ws + 2;
+    constexpr int nsteps = 6;
+
+    mfem::Mesh mesh_ws = MakePeriodicMesh1D(/*n=*/12);
+    mfem::ParMesh pmesh_ws(MPI_COMM_SELF, mesh_ws);
+
+    mfem::DG_FECollection state_fec_ws(/*order=*/2,
+                                       dim_ws,
+                                       mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace state_fes_ws(&pmesh_ws,
+                                             &state_fec_ws,
+                                             num_eq_ws,
+                                             mfem::Ordering::byNODES);
+    mfem::ParGridFunction U_ws(&state_fes_ws);
+
+    auto project_state = [&](double phase)
+    {
+      mfem::VectorFunctionCoefficient coeff(
+        num_eq_ws,
+        [&](const mfem::Vector& x, mfem::Vector& cons)
+        {
+          const double two_pi = 2.0 * std::acos(-1.0);
+          const double s = std::sin(two_pi * (x(0) + phase));
+          const double c = std::cos(two_pi * (x(0) + phase));
+          cons = EulerConsFromPrim1D(/*rho=*/1.0 + 0.05 * s,
+                                     /*u=*/0.6 + 0.05 * c,
+                                     /*p=*/1.0 + 0.02 * s,
+                                     gamma);
+        });
+      U_ws.ProjectCoefficient(coeff);
+      U_ws.ExchangeFaceNbrData();
+    };
+
+    // H1 auto policy -> CG + BoomerAMG.
+    mfem::H1_FECollection sigma_h1_fec(/*order=*/1, dim_ws);
+    mfem::ParFiniteElementSpace sigma_h1_fes(&pmesh_ws,
+                                             &sigma_h1_fec,
+                                             /*vdim=*/1);
+    dg_igr::IGRSolver h1_solver(sigma_h1_fes,
+                                state_fes_ws,
+                                dim_ws,
+                                num_eq_ws,
+                                /*alpha=*/0.5);
+    h1_solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+    h1_solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+    h1_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
+    h1_solver.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    h1_solver.SetLinearSolveParams(/*rtol=*/1.0e-10,
+                                   /*atol=*/0.0,
+                                   /*max_it=*/250,
+                                   /*print=*/0);
+    project_state(/*phase=*/0.0);
+    h1_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+    ctx.Check(h1_solver.GetLastLinearConverged(),
+              "IGR H1 auto policy converges");
+    ctx.Check(h1_solver.GetLastLinearSolverName() == "cg",
+              "IGR H1 auto policy selects CG");
+    ctx.Check(h1_solver.GetLastPrecondName() == "boomeramg",
+              "IGR H1 auto policy selects BoomerAMG");
+
+    // L2 auto policy with SIPG should be SPD-by-construction -> CG + BoomerAMG.
+    mfem::DG_FECollection sigma_l2_fec(/*order=*/1,
+                                       dim_ws,
+                                       mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace sigma_l2_fes(&pmesh_ws,
+                                             &sigma_l2_fec,
+                                             /*vdim=*/1,
+                                             mfem::Ordering::byNODES);
+    dg_igr::IGRSolver l2_solver(sigma_l2_fes,
+                                state_fes_ws,
+                                dim_ws,
+                                num_eq_ws,
+                                /*alpha=*/0.5);
+    l2_solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+    l2_solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+    l2_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
+    l2_solver.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    l2_solver.SetLinearSolveParams(/*rtol=*/1.0e-10,
+                                   /*atol=*/0.0,
+                                   /*max_it=*/250,
+                                   /*print=*/0);
+    project_state(/*phase=*/0.0);
+    l2_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+    ctx.Check(l2_solver.GetLastLinearConverged(),
+              "IGR L2 auto policy converges");
+    ctx.Check(l2_solver.GetLastLinearSolverName() == "cg",
+              "IGR L2 SIPG auto policy selects CG");
+    ctx.Check(l2_solver.GetLastPrecondName() == "boomeramg",
+              "IGR L2 auto policy selects BoomerAMG");
+    ctx.Check(l2_solver.GetLastAssembleSeconds() >= 0.0,
+              "IGR telemetry reports non-negative assemble time");
+    ctx.Check(l2_solver.GetLastFormSystemSeconds() >= 0.0,
+              "IGR telemetry reports non-negative FormLinearSystem time");
+    ctx.Check(l2_solver.GetLastPCSetupSeconds() >= 0.0,
+              "IGR telemetry reports non-negative preconditioner setup time");
+    ctx.Check(l2_solver.GetLastLinearSolveSeconds() >= 0.0,
+              "IGR telemetry reports non-negative Krylov time");
+    ctx.Check(l2_solver.GetTotalIGRWorkSeconds() >=
+                l2_solver.GetTotalLinearSolveSeconds(),
+              "IGR telemetry total includes at least Krylov time");
+
+    const mfem::HypreParMatrix* A_l2_sipg = l2_solver.GetAssembledOperator();
+    MFEM_VERIFY(A_l2_sipg != nullptr,
+                "IGR L2 SIPG SPD probe requires assembled Hypre operator.");
+    const SPDProbeSummary sipg_probe = ProbeSPD(*A_l2_sipg, MPI_COMM_SELF);
+    ctx.LogMetric(
+      "igr_l2_sipg_spd_probe max_sym_rel=" + FormatSci(sipg_probe.max_sym_rel) +
+      " min_rayleigh=" + FormatSci(sipg_probe.min_rayleigh));
+    ctx.Check(sipg_probe.finite,
+              "IGR L2 SIPG SPD probe operator-vector products are finite");
+    ctx.Check(sipg_probe.max_sym_rel < 1.0e-10,
+              "IGR L2 SIPG operator is symmetric to tolerance");
+    ctx.Check(sipg_probe.min_rayleigh > 1.0e-12,
+              "IGR L2 SIPG operator is positive definite on probe vectors");
+
+    // Explicit CG request with SIPG should stay on CG (no fallback).
+    l2_solver.SetIPKind(dg_igr::IGRIPKind::SIPG);
+    l2_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
+    l2_solver.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    l2_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+    ctx.Check(l2_solver.GetLastLinearConverged(),
+              "IGR L2 SIPG CG solve converges");
+    ctx.Check(l2_solver.GetLastLinearSolverName() == "cg",
+              "IGR L2 SIPG explicit CG request stays on CG");
+
+    // Guardrail: non-symmetric IP kind must not use CG.
+    l2_solver.SetIPKind(dg_igr::IGRIPKind::NIPG);
+    l2_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
+    l2_solver.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    l2_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+    const mfem::HypreParMatrix* A_l2_nipg = l2_solver.GetAssembledOperator();
+    MFEM_VERIFY(A_l2_nipg != nullptr,
+                "IGR L2 NIPG SPD probe requires assembled Hypre operator.");
+    const SPDProbeSummary nipg_probe = ProbeSPD(*A_l2_nipg, MPI_COMM_SELF);
+    ctx.LogMetric(
+      "igr_l2_nipg_spd_probe max_sym_rel=" + FormatSci(nipg_probe.max_sym_rel) +
+      " min_rayleigh=" + FormatSci(nipg_probe.min_rayleigh));
+    ctx.Check(nipg_probe.finite,
+              "IGR L2 NIPG SPD probe operator-vector products are finite");
+    ctx.Check(nipg_probe.max_sym_rel >
+                std::max(1.0e-10, 100.0 * sipg_probe.max_sym_rel),
+              "IGR L2 NIPG operator is measurably non-symmetric");
+    ctx.Check(l2_solver.GetLastLinearSolverName() == "gmres",
+              "IGR guardrail falls back from CG to GMRES for NIPG");
+    l2_solver.SetIPKind(dg_igr::IGRIPKind::SIPG);
+
+    // Guardrail: CG with ILU preconditioner on H1 should fallback preconditioner.
+    h1_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
+    h1_solver.SetPreconditioner(dg_igr::IGRPrecondType::HypreILU);
+    h1_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+    ctx.Check(h1_solver.GetLastPrecondName() == "boomeramg",
+              "IGR guardrail falls back from ILU to BoomerAMG for CG");
+
+    // Warm-start regression: warm-start should reduce iteration counts after step 0.
+    dg_igr::IGRSolver cold_solver(sigma_l2_fes,
+                                  state_fes_ws,
+                                  dim_ws,
+                                  num_eq_ws,
+                                  /*alpha=*/0.5);
+    dg_igr::IGRSolver warm_solver(sigma_l2_fes,
+                                  state_fes_ws,
+                                  dim_ws,
+                                  num_eq_ws,
+                                  /*alpha=*/0.5);
+    for (dg_igr::IGRSolver* s : {&cold_solver, &warm_solver})
+    {
+      s->SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+      s->SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+      s->SetLinearSolver(dg_igr::IGRLinearSolverType::GMRES);
+      s->SetPreconditioner(dg_igr::IGRPrecondType::None);
+      s->SetLinearSolveParams(/*rtol=*/1.0e-12,
+                              /*atol=*/0.0,
+                              /*max_it=*/500,
+                              /*print=*/0);
+    }
+
+    // Explicit same-RHS replay check: warm-start should not require more iterations.
+    project_state(/*phase=*/0.321);
+    cold_solver.GetSigma() = 0.0;
+    cold_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+    warm_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+
+    cold_solver.GetSigma() = 0.0;
+    cold_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+    warm_solver.UpdateFromState(U_ws, /*warm_start=*/true);
+    const double cold_replay_iters =
+      static_cast<double>(cold_solver.GetLastLinearIters());
+    const double warm_replay_iters =
+      static_cast<double>(warm_solver.GetLastLinearIters());
+    ctx.LogMetric(
+      "igr_warm_start_same_rhs cold_iters=" + FormatSci(cold_replay_iters) +
+      " warm_iters=" + FormatSci(warm_replay_iters));
+    ctx.Check(
+      warm_replay_iters <= cold_replay_iters,
+      "IGR warm-start replay does not take more iterations than cold-start");
+
+    std::vector<double> cold_iters;
+    std::vector<double> warm_iters;
+    std::vector<double> cold_times;
+    std::vector<double> warm_times;
+    for (int step = 0; step < nsteps; ++step)
+    {
+      project_state(0.015 * static_cast<double>(step));
+
+      cold_solver.GetSigma() = 0.0;
+      cold_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+      warm_solver.UpdateFromState(U_ws, /*warm_start=*/step > 0);
+
+      ctx.Check(cold_solver.GetLastLinearConverged(),
+                "IGR cold-start solve converges at step " +
+                  std::to_string(step));
+      ctx.Check(warm_solver.GetLastLinearConverged(),
+                "IGR warm-start solve converges at step " +
+                  std::to_string(step));
+      ctx.Check(std::isfinite(cold_solver.GetLastLinearFinalNorm()),
+                "IGR cold-start final residual is finite at step " +
+                  std::to_string(step));
+      ctx.Check(std::isfinite(warm_solver.GetLastLinearFinalNorm()),
+                "IGR warm-start final residual is finite at step " +
+                  std::to_string(step));
+
+      cold_iters.push_back(
+        static_cast<double>(cold_solver.GetLastLinearIters()));
+      warm_iters.push_back(
+        static_cast<double>(warm_solver.GetLastLinearIters()));
+      cold_times.push_back(cold_solver.GetLastLinearSolveSeconds());
+      warm_times.push_back(warm_solver.GetLastLinearSolveSeconds());
+    }
+
+    const double cold_sum =
+      std::accumulate(cold_iters.begin() + 1, cold_iters.end(), 0.0);
+    const double warm_sum =
+      std::accumulate(warm_iters.begin() + 1, warm_iters.end(), 0.0);
+    const double denom = static_cast<double>(nsteps - 1);
+    const double cold_avg = cold_sum / denom;
+    const double warm_avg = warm_sum / denom;
+    const double cold_time_avg =
+      std::accumulate(cold_times.begin() + 1, cold_times.end(), 0.0) / denom;
+    const double warm_time_avg =
+      std::accumulate(warm_times.begin() + 1, warm_times.end(), 0.0) / denom;
+    ctx.AddParity(cold_avg + warm_avg);
+    ctx.LogMetric("igr_warm_start_avg_iters cold=" + FormatSci(cold_avg) +
+                  " warm=" + FormatSci(warm_avg) +
+                  " cold_time_s=" + FormatSci(cold_time_avg) +
+                  " warm_time_s=" + FormatSci(warm_time_avg));
+    ctx.Check(
+      warm_avg <= cold_avg,
+      "IGR warm-start average iteration count is not worse than cold-start");
+  }
+
+  // --- EulerWithIGR must update sigma from the current RK stage state ---
+  {
+    constexpr int dim_s = 1;
+    constexpr int num_eq_s = dim_s + 2;
+    constexpr double two_pi = 6.28318530717958647692;
+
+    mfem::Mesh mesh_s = MakePeriodicMesh1D(/*n=*/8);
+    mfem::ParMesh pmesh_s(MPI_COMM_SELF, mesh_s);
+
+    mfem::DG_FECollection state_fec_s(/*order=*/2,
+                                      dim_s,
+                                      mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace state_fes_s(&pmesh_s,
+                                            &state_fec_s,
+                                            num_eq_s,
+                                            mfem::Ordering::byNODES);
+    mfem::ParGridFunction U_base(&state_fes_s);
+    mfem::ParGridFunction U_stage(&state_fes_s);
+
+    auto project_state = [&](mfem::ParGridFunction& U, double phase)
+    {
+      mfem::VectorFunctionCoefficient coeff(
+        num_eq_s,
+        [phase, two_pi, gamma](const mfem::Vector& x, mfem::Vector& cons)
+        {
+          const double rho = 1.0 + 0.15 * std::sin(two_pi * (x(0) + phase));
+          const double u = 1.8 + 0.25 * std::cos(two_pi * (x(0) + phase));
+          const double p = 1.0 + 0.12 * std::sin(two_pi * (x(0) + phase + 0.31));
+          cons = EulerConsFromPrim1D(rho, u, p, gamma);
+        });
+      U.ProjectCoefficient(coeff);
+      U.ExchangeFaceNbrData();
+    };
+
+    project_state(U_base, /*phase=*/0.00);
+    project_state(U_stage, /*phase=*/0.11);
+
+    mfem::DG_FECollection sigma_fec_s(/*order=*/1,
+                                      dim_s,
+                                      mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace sigma_fes_s(&pmesh_s,
+                                            &sigma_fec_s,
+                                            /*vdim=*/1,
+                                            mfem::Ordering::byNODES);
+
+    dg_igr::IGRSolver igr_solver_s(sigma_fes_s,
+                                   state_fes_s,
+                                   dim_s,
+                                   num_eq_s,
+                                   /*alpha=*/0.25);
+    igr_solver_s.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+    igr_solver_s.SetIPKind(dg_igr::IGRIPKind::SIPG);
+    igr_solver_s.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+    igr_solver_s.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
+    igr_solver_s.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    igr_solver_s.SetLinearSolveParams(/*rtol=*/1.0e-12,
+                                      /*atol=*/0.0,
+                                      /*max_it=*/400,
+                                      /*print=*/0);
+    igr_solver_s.SetSigmaUpdatePolicy(dg_igr::IGRSigmaUpdateCadence::EveryStage,
+                                      /*interval=*/1);
+    igr_solver_s.SetStageRtolScale(1.0);
+
+    mfem::EulerFlux base_flux_s(dim_s, gamma);
+    mfem::FluxWithIGR igr_flux_s(base_flux_s);
+    igr_flux_s.SetSigmaField(&igr_solver_s.GetSigma());
+    mfem::RusanovFluxWithSides num_flux_s(igr_flux_s);
+
+    auto form_integrator_s =
+      std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux_s,
+                                                       /*IntOrderOffset=*/2);
+    mfem::DGHyperbolicConservationLaws op_s(state_fes_s,
+                                            std::move(form_integrator_s),
+                                            /*preassembleWeakDivergence=*/true);
+    op_s.SetNumericalFlux(&num_flux_s);
+
+    mfem::EulerWithIGR wrapped(op_s, igr_solver_s, U_base);
+    wrapped.BeginRKStep(/*step=*/0, /*t=*/0.0, /*dt=*/0.01);
+    wrapped.SetRKStage(/*stage=*/0);
+
+    mfem::Vector rhs(U_stage.Size());
+    wrapped.Mult(U_stage, rhs);
+
+    mfem::Vector sigma_wrapped(igr_solver_s.GetSigma().Size());
+    sigma_wrapped = igr_solver_s.GetSigma();
+
+    igr_solver_s.SetRKStageIndex(/*stage=*/0);
+    igr_solver_s.UpdateFromState(U_stage, /*warm_start=*/false);
+    mfem::Vector sigma_stage(igr_solver_s.GetSigma().Size());
+    sigma_stage = igr_solver_s.GetSigma();
+
+    igr_solver_s.SetRKStageIndex(/*stage=*/0);
+    igr_solver_s.UpdateFromState(U_base, /*warm_start=*/false);
+    mfem::Vector sigma_base(igr_solver_s.GetSigma().Size());
+    sigma_base = igr_solver_s.GetSigma();
+
+    mfem::Vector delta_stage(sigma_wrapped);
+    delta_stage -= sigma_stage;
+    const double stage_err = GlobalL2Norm(delta_stage);
+
+    mfem::Vector delta_base(sigma_wrapped);
+    delta_base -= sigma_base;
+    const double stale_err = GlobalL2Norm(delta_base);
+
+    mfem::Vector delta_stage_vs_base(sigma_stage);
+    delta_stage_vs_base -= sigma_base;
+    const double stage_vs_base = GlobalL2Norm(delta_stage_vs_base);
+
+    ctx.LogMetric("igr_stage_sigma_consistency stage_err=" + FormatSci(stage_err) +
+                  " stale_err=" + FormatSci(stale_err) +
+                  " stage_vs_base=" + FormatSci(stage_vs_base));
+    ctx.AddParity(stage_err + stale_err + stage_vs_base);
+
+    ctx.Check(stage_vs_base > 1.0e-8,
+              "IGR stage-consistency test setup distinguishes base and stage sigma");
+    ctx.Check(stage_err <= 1.0e-5 * stage_vs_base,
+              "EulerWithIGR updates sigma from stage state used in RHS");
+    ctx.Check(stale_err >= 0.5 * stage_vs_base,
+              "EulerWithIGR sigma is not sourced from persistent base state");
+
+    auto check_non_stage_fallback =
+      [&](dg_igr::IGRSigmaUpdateCadence cadence,
+          int interval,
+          const std::string& label)
+    {
+      dg_igr::IGRSolver igr_solver_fb(sigma_fes_s,
+                                      state_fes_s,
+                                      dim_s,
+                                      num_eq_s,
+                                      /*alpha=*/0.25);
+      igr_solver_fb.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+      igr_solver_fb.SetIPKind(dg_igr::IGRIPKind::SIPG);
+      igr_solver_fb.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+      igr_solver_fb.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
+      igr_solver_fb.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+      igr_solver_fb.SetLinearSolveParams(/*rtol=*/1.0e-12,
+                                         /*atol=*/0.0,
+                                         /*max_it=*/400,
+                                         /*print=*/0);
+      igr_solver_fb.SetSigmaUpdatePolicy(cadence, interval);
+      igr_solver_fb.SetStageRtolScale(1.0);
+
+      mfem::EulerFlux base_flux_fb(dim_s, gamma);
+      mfem::FluxWithIGR igr_flux_fb(base_flux_fb);
+      igr_flux_fb.SetSigmaField(&igr_solver_fb.GetSigma());
+      mfem::RusanovFluxWithSides num_flux_fb(igr_flux_fb);
+
+      auto form_integrator_fb =
+        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux_fb,
+                                                         /*IntOrderOffset=*/2);
+      mfem::DGHyperbolicConservationLaws op_fb(state_fes_s,
+                                               std::move(form_integrator_fb),
+                                               /*preassembleWeakDivergence=*/true);
+      op_fb.SetNumericalFlux(&num_flux_fb);
+
+      mfem::EulerWithIGR wrapped_fb(op_fb, igr_solver_fb, U_base);
+      mfem::Vector rhs_fb(U_stage.Size());
+
+      // Intentionally do not call BeginRKStep()/SetRKStage() to validate
+      // non-stage-aware fallback behavior.
+      wrapped_fb.Mult(U_base, rhs_fb);
+      mfem::Vector sigma_fb_base(igr_solver_fb.GetSigma().Size());
+      sigma_fb_base = igr_solver_fb.GetSigma();
+
+      wrapped_fb.Mult(U_stage, rhs_fb);
+      mfem::Vector sigma_fb_stage(igr_solver_fb.GetSigma().Size());
+      sigma_fb_stage = igr_solver_fb.GetSigma();
+
+      igr_solver_fb.SetRKStageIndex(-1);
+      igr_solver_fb.UpdateFromState(U_stage, /*warm_start=*/false);
+      mfem::Vector sigma_fb_ref(igr_solver_fb.GetSigma().Size());
+      sigma_fb_ref = igr_solver_fb.GetSigma();
+
+      mfem::Vector delta_fb_stage_base(sigma_fb_stage);
+      delta_fb_stage_base -= sigma_fb_base;
+      const double fb_stage_vs_base = GlobalL2Norm(delta_fb_stage_base);
+
+      mfem::Vector delta_fb_ref(sigma_fb_stage);
+      delta_fb_ref -= sigma_fb_ref;
+      const double fb_stage_err = GlobalL2Norm(delta_fb_ref);
+
+      ctx.LogMetric("igr_non_stage_fallback label=" + label +
+                    " stage_err=" + FormatSci(fb_stage_err) +
+                    " stage_vs_base=" + FormatSci(fb_stage_vs_base));
+      ctx.AddParity(fb_stage_err + fb_stage_vs_base);
+
+      ctx.Check(fb_stage_vs_base > 1.0e-8,
+                "EulerWithIGR non-stage fallback updates sigma between distinct states (" +
+                  label + ")");
+      ctx.Check(fb_stage_err <= 1.0e-5 * fb_stage_vs_base,
+                "EulerWithIGR non-stage fallback sigma matches direct stage update (" +
+                  label + ")");
+    };
+
+    check_non_stage_fallback(dg_igr::IGRSigmaUpdateCadence::EveryStep,
+                             /*interval=*/1,
+                             "every-step");
+    check_non_stage_fallback(dg_igr::IGRSigmaUpdateCadence::EveryNSteps,
+                             /*interval=*/3,
+                             "every-n-steps");
+  }
+
+  // --- Quasi-1D MPI robustness: sigma should vary primarily in x, not y ---
+  {
+    constexpr int dim_q = 2;
+    constexpr int num_eq_q = dim_q + 2;
+    constexpr int nx_q = 24;
+    constexpr int ny_q = 6;
+    constexpr double gamma_q = 1.4;
+
+    mfem::Mesh mesh_q = MakePeriodicMesh2D(nx_q, ny_q, /*sx=*/1.0, /*sy=*/0.25);
+    mfem::ParMesh pmesh_q(MPI_COMM_WORLD, mesh_q);
+
+    mfem::DG_FECollection state_fec_q(/*order=*/2,
+                                      dim_q,
+                                      mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace state_fes_q(&pmesh_q,
+                                            &state_fec_q,
+                                            num_eq_q,
+                                            mfem::Ordering::byNODES);
+    mfem::ParGridFunction U_q(&state_fes_q);
+    mfem::VectorFunctionCoefficient U_coeff_q(
+      num_eq_q,
+      [&](const mfem::Vector& x, mfem::Vector& cons)
+      {
+        // Quasi-1D stationary-shock-like profile in x only.
+        const double xc = 0.5;
+        const double w = 0.04;
+        const double s = 0.5 * (1.0 - std::tanh((x(0) - xc) / w));
+        const double rho = 1.0 + 1.2 * s;
+        const double u = -2.2 + 1.6 * s;
+        const double v = 0.0;
+        const double p = 0.8 + 1.0 * s;
+        cons = EulerConsFromPrim2D(rho, u, v, p, gamma_q);
+      });
+    U_q.ProjectCoefficient(U_coeff_q);
+    U_q.ExchangeFaceNbrData();
+
+    mfem::DG_FECollection sigma_fec_q(/*order=*/1,
+                                      dim_q,
+                                      mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace sigma_fes_q(&pmesh_q,
+                                            &sigma_fec_q,
+                                            /*vdim=*/1,
+                                            mfem::Ordering::byNODES);
+
+    dg_igr::IGRSolver solver_q(sigma_fes_q,
+                               state_fes_q,
+                               dim_q,
+                               num_eq_q,
+                               /*alpha=*/0.5);
+    solver_q.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+    solver_q.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
+    solver_q.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    solver_q.SetLinearSolveParams(/*rtol=*/1.0e-8,
+                                  /*atol=*/0.0,
+                                  /*max_it=*/500,
+                                  /*print=*/0);
+    solver_q.UpdateFromState(U_q, /*warm_start=*/false);
+
+    ctx.Check(solver_q.GetLastLinearConverged(),
+              "IGR quasi-1D L2 solve converges");
+
+    const mfem::ParGridFunction& sigma_q = solver_q.GetSigma();
+    const mfem::ParFiniteElementSpace* sfes_q = sigma_q.ParFESpace();
+    MFEM_VERIFY(sfes_q != nullptr,
+                "IGR quasi-1D test requires sigma FE space.");
+
+    std::vector<double> local_col_min(nx_q,
+                                      std::numeric_limits<double>::infinity());
+    std::vector<double> local_col_max(nx_q,
+                                      -std::numeric_limits<double>::infinity());
+    std::vector<double> local_col_sum(nx_q, 0.0);
+    std::vector<double> local_col_count(nx_q, 0.0);
+
+    mfem::IntegrationPoint ip_center;
+    ip_center.Set2(0.0, 0.0);
+    for (int e = 0; e < sfes_q->GetNE(); ++e)
+    {
+      const long long gid = pmesh_q.GetGlobalElementNum(e);
+      const int ix = static_cast<int>(gid % nx_q);
+      mfem::ElementTransformation* Te = sfes_q->GetElementTransformation(e);
+      MFEM_VERIFY(Te != nullptr,
+                  "IGR quasi-1D test failed to get element transformation.");
+      Te->SetIntPoint(&ip_center);
+      const double sigma_val = sigma_q.GetValue(*Te, ip_center);
+
+      local_col_min[ix] = std::min(local_col_min[ix], sigma_val);
+      local_col_max[ix] = std::max(local_col_max[ix], sigma_val);
+      local_col_sum[ix] += sigma_val;
+      local_col_count[ix] += 1.0;
+    }
+
+    std::vector<double> global_col_min(nx_q, 0.0);
+    std::vector<double> global_col_max(nx_q, 0.0);
+    std::vector<double> global_col_sum(nx_q, 0.0);
+    std::vector<double> global_col_count(nx_q, 0.0);
+
+    MPI_Allreduce(local_col_min.data(),
+                  global_col_min.data(),
+                  nx_q,
+                  mfem::MPITypeMap<double>::mpi_type,
+                  MPI_MIN,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(local_col_max.data(),
+                  global_col_max.data(),
+                  nx_q,
+                  mfem::MPITypeMap<double>::mpi_type,
+                  MPI_MAX,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(local_col_sum.data(),
+                  global_col_sum.data(),
+                  nx_q,
+                  mfem::MPITypeMap<double>::mpi_type,
+                  MPI_SUM,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(local_col_count.data(),
+                  global_col_count.data(),
+                  nx_q,
+                  mfem::MPITypeMap<double>::mpi_type,
+                  MPI_SUM,
+                  MPI_COMM_WORLD);
+
+    double max_y_spread = 0.0;
+    double x_min_avg = std::numeric_limits<double>::infinity();
+    double x_max_avg = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < nx_q; ++i)
+    {
+      if (global_col_count[i] <= 0.0)
+      {
+        continue;
+      }
+      max_y_spread =
+        std::max(max_y_spread, global_col_max[i] - global_col_min[i]);
+      const double avg = global_col_sum[i] / global_col_count[i];
+      x_min_avg = std::min(x_min_avg, avg);
+      x_max_avg = std::max(x_max_avg, avg);
+    }
+    const double x_span = x_max_avg - x_min_avg;
+    const double y_to_x_ratio = max_y_spread / std::max(x_span, 1.0e-14);
+    ctx.LogMetric("igr_quasi1d_sigma_spread max_y_spread=" +
+                  FormatSci(max_y_spread) + " x_span=" + FormatSci(x_span) +
+                  " y_to_x_ratio=" + FormatSci(y_to_x_ratio));
+    ctx.AddParity(max_y_spread + x_span + y_to_x_ratio);
+
+    ctx.Check(x_span > 1.0e-6,
+              "IGR quasi-1D sigma has non-trivial x variation");
+    ctx.Check(std::isfinite(y_to_x_ratio) && y_to_x_ratio < 20.0,
+              "IGR quasi-1D sigma y-variation remains bounded relative to x");
   }
 
   return ctx.failures;

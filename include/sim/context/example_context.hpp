@@ -44,13 +44,17 @@ struct DGSpaces
     if (need_sigma)
     {
       sigma_fec = BuildSigmaCollection(order, dim, sigma_space);
-      sigma_fes = std::make_unique<mfem::ParFiniteElementSpace>(&pmesh, sigma_fec.get());
+      sigma_fes =
+        std::make_unique<mfem::ParFiniteElementSpace>(&pmesh, sigma_fec.get());
     }
     if (need_h1)
     {
       h1_fec = std::make_unique<mfem::H1_FECollection>(std::max(1, order), dim);
-      h1_vfes = std::make_unique<mfem::ParFiniteElementSpace>(
-          &pmesh, h1_fec.get(), dim, mfem::Ordering::byNODES);
+      h1_vfes =
+        std::make_unique<mfem::ParFiniteElementSpace>(&pmesh,
+                                                      h1_fec.get(),
+                                                      dim,
+                                                      mfem::Ordering::byNODES);
     }
   }
 
@@ -63,6 +67,14 @@ private:
     {
       return std::make_unique<mfem::H1_FECollection>(std::max(order, 3), dim);
     }
+    if (lower == "l2" || lower == "dg" || lower == "brokendg" ||
+        lower == "brokenl2")
+    {
+      return std::make_unique<mfem::DG_FECollection>(order, dim);
+    }
+    MFEM_VERIFY(false,
+                "Invalid IGR sigma space '" << sigma_space
+                                            << "'. Use 'H1' or 'L2'.");
     return std::make_unique<mfem::DG_FECollection>(order, dim);
   }
 };
@@ -78,9 +90,8 @@ struct ExampleContext
 
   static int BasisTypeForBackend(DGBackend backend)
   {
-    return (backend == DGBackend::DGSEM)
-               ? mfem::BasisType::GaussLobatto
-               : mfem::BasisType::GaussLegendre;
+    return (backend == DGBackend::DGSEM) ? mfem::BasisType::GaussLobatto
+                                         : mfem::BasisType::GaussLegendre;
   }
 
   ExampleContext(const RunConfig& cfg,
@@ -92,10 +103,16 @@ struct ExampleContext
       pmesh(std::move(pmesh_in)),
       dim(pmesh->Dimension()),
       num_equations(dim + 2),
-      spaces(*pmesh, cfg.opts.order, dim, num_equations,
+      spaces(*pmesh,
+             cfg.opts.order,
+             dim,
+             num_equations,
              BasisTypeForBackend(cfg.dg_backend),
-             sigma_space, need_sigma, need_h1)
-  {}
+             sigma_space,
+             need_sigma,
+             need_h1)
+  {
+  }
 
   mfem::ParMesh& Mesh() { return *pmesh; }
   const mfem::ParMesh& Mesh() const { return *pmesh; }
@@ -107,12 +124,17 @@ inline ExampleContext BuildExampleContext(const RunConfig& run_cfg,
                                           bool need_sigma,
                                           bool need_h1)
 {
-  mfem::Mesh mesh = LoadSerialMesh(run_cfg.mesh_path, run_cfg.opts.ser_ref_levels);
+  mfem::Mesh mesh =
+    LoadSerialMesh(run_cfg.mesh_path, run_cfg.opts.ser_ref_levels);
   auto pmesh = std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD, mesh);
   mesh.Clear();
   RefineParMesh(*pmesh, run_cfg.opts.par_ref_levels);
 
-  return ExampleContext(run_cfg, std::move(pmesh), sigma_space, need_sigma, need_h1);
+  return ExampleContext(run_cfg,
+                        std::move(pmesh),
+                        sigma_space,
+                        need_sigma,
+                        need_h1);
 }
 
 } // namespace dg_sim

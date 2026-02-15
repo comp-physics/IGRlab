@@ -19,7 +19,7 @@ struct GLVisConfig
   std::string host = "localhost";
   int port = 19916;
   int precision = 8;
-  std::string view = "view 0 0";  ///< Full GLVis view command; empty disables.
+  std::string view = "view 0 0"; ///< Full GLVis view command; empty disables.
   std::string keys = "keys jlm"; ///< Full GLVis keys command; empty disables.
   bool pause = true;             ///< Send "pause" after initial draw.
 };
@@ -35,10 +35,10 @@ namespace io
 /// @ingroup io_visualization
 struct VTKOutputConfig
 {
-  std::string prefix_path = "vtk_output";     ///< Output directory prefix
+  std::string prefix_path = "vtk_output";           ///< Output directory prefix
   mfem::VTKFormat format = mfem::VTKFormat::BINARY; ///< Output format
-  bool high_order_output = true;             ///< Preserve high-order data
-  int levels_of_detail = -1;                 ///< <0 keeps current DC setting
+  bool high_order_output = true; ///< Preserve high-order data
+  int levels_of_detail = -1;     ///< <0 keeps current DC setting
 };
 
 } // namespace io
