@@ -73,9 +73,17 @@ public:
 
     if (update_sigma)
     {
+      int igr_solve_stage = rk_stage_;
+      if (sigma_cadence_ != ::dg_igr::IGRSigmaUpdateCadence::EveryStage)
+      {
+        // Stage-based rtol loosening is only meaningful when a later stage
+        // solve will occur in the same RK step.
+        igr_solve_stage = -1;
+      }
+
       // Recompute sigma and expose current RK stage so staged tolerance
       // policies can use looser settings on intermediate stages.
-      igr_.SetRKStageIndex(rk_stage_);
+      igr_.SetRKStageIndex(igr_solve_stage);
       igr_.UpdateFromState(state_, /*warm_start=*/true);
 
       // Make sigma available on face neighbors across MPI subdomains.

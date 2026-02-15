@@ -197,7 +197,21 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       result.non_finite_max = summary.global_max;
       break;
     }
-
+    if (dt_real <= 0.0)
+    {
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[dt-check] non-positive dt_real encountered: dt_real="
+                  << dt_real << " t=" << t << " dt=" << dt << "\n";
+      }
+      result.final_time = t;
+      done = true;
+      if (cfg.vtk_save && hooks.on_save)
+      {
+        hooks.on_save(result.steps, t, save_idx, /*is_final=*/true);
+      }
+      break;
+    }
     stepper.Step(sol, t, dt_real);
     if (hit_save_boundary)
     {
@@ -281,9 +295,12 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       hooks.on_analysis(result.steps, t, dt_real, done);
     }
 
-    if (cfg.vtk_save && cfg.dt_save > 0.0 && hit_save_boundary && hooks.on_save)
+    if (cfg.vtk_save && cfg.dt_save > 0.0 && hit_save_boundary)
     {
-      hooks.on_save(result.steps, t, save_idx, /*is_final=*/false);
+      if (hooks.on_save)
+      {
+        hooks.on_save(result.steps, t, save_idx, /*is_final=*/false);
+      }
       ++save_idx;
       t_next_save += cfg.dt_save;
     }

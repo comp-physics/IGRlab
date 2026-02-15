@@ -92,6 +92,116 @@ int RunTimeDefaultsTests(TestContext& ctx)
     EulerConsFromPrim2D(/*rho=*/1.2, /*u=*/0.3, /*v=*/-0.1, /*p=*/0.9, gamma);
   FillConstantState(state, bundle.sol);
 
+  struct TimeLoopDummyOperator
+  {
+    void Mult(const mfem::Vector&, mfem::Vector& y) const { y = 0.0; }
+    mfem::real_t GetMaxCharSpeed() const { return 1.0; }
+  };
+  struct TimeLoopCountingStepper
+  {
+    int calls = 0;
+    void Step(mfem::Vector&, mfem::real_t& t, mfem::real_t& dt)
+    {
+      ++calls;
+      t += dt;
+    }
+  };
+
+  // --- dt_min guard uses nominal dt (before stepping) ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.2;
+    cfg.dt = 0.04;
+    cfg.dt_min = 0.05;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = false;
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
+    ctx.Check(result.dt_min_reached,
+              "time loop: dt_min guard uses nominal dt before stepping");
+    ctx.Check(stepper.calls == 0,
+              "time loop: dt_min guard aborts before first step");
+    ctx.Check(result.steps == 0,
+              "time loop: dt_min abort leaves completed step count at zero");
+  }
+
+  // --- clipped/snap dt_real below dt_min is allowed (bookkeeping policy) ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.41;
+    cfg.dt = 0.2;
+    cfg.dt_min = 0.05;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = false;
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
+    ctx.Check(!result.dt_min_reached,
+              "time loop: clipped final dt_real does not trigger dt_min guard");
+    ctx.Check(stepper.calls == 3,
+              "time loop: clipped final dt_real still advances final step");
+    ctx.Check(result.steps == 3,
+              "time loop: step counter includes clipped final step");
+    ctx.CheckNear(result.final_time,
+                  0.41,
+                  1.0e-12,
+                  "time loop: clipped final dt_real reaches target final time");
+  }
+
+  // --- zero-step guard: do not call Step when t_final is already reached ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.0;
+    cfg.dt = 0.1;
+    cfg.dt_min = 0.0;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = false;
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
+    ctx.Check(stepper.calls == 0,
+              "time loop: zero dt_real does not invoke stepper");
+    ctx.Check(result.steps == 0,
+              "time loop: zero dt_real exits before any step is counted");
+    ctx.Check(!result.dt_min_reached,
+              "time loop: zero-step exit is distinct from dt_min guard");
+    ctx.CheckNear(result.final_time,
+                  0.0,
+                  1.0e-14,
+                  "time loop: zero-step exit keeps initial final_time");
+  }
+
+  // --- save-boundary snapping advances even when on_save hook is missing ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.5;
+    cfg.dt = 0.2;
+    cfg.dt_min = 0.0;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = true;
+    cfg.dt_save = 0.1;
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
+    ctx.Check(stepper.calls == 5,
+              "time loop: save snapping without hook still advances all steps");
+    ctx.Check(result.steps == 5,
+              "time loop: step counter reaches final time without save hook");
+    ctx.CheckNear(result.final_time,
+                  0.5,
+                  1.0e-12,
+                  "time loop: save snapping without hook reaches t_final");
+  }
+
   int alive_count = 0;
   int save_count = 0;
   int analysis_count = 0;
