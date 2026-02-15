@@ -1210,6 +1210,87 @@ int RunIGRTests(TestContext& ctx)
               "EulerWithIGR updates sigma from stage state used in RHS");
     ctx.Check(stale_err >= 0.5 * stage_vs_base,
               "EulerWithIGR sigma is not sourced from persistent base state");
+
+    auto check_non_stage_fallback =
+      [&](dg_igr::IGRSigmaUpdateCadence cadence,
+          int interval,
+          const std::string& label)
+    {
+      dg_igr::IGRSolver igr_solver_fb(sigma_fes_s,
+                                      state_fes_s,
+                                      dim_s,
+                                      num_eq_s,
+                                      /*alpha=*/0.25);
+      igr_solver_fb.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+      igr_solver_fb.SetIPKind(dg_igr::IGRIPKind::SIPG);
+      igr_solver_fb.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+      igr_solver_fb.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
+      igr_solver_fb.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+      igr_solver_fb.SetLinearSolveParams(/*rtol=*/1.0e-12,
+                                         /*atol=*/0.0,
+                                         /*max_it=*/400,
+                                         /*print=*/0);
+      igr_solver_fb.SetSigmaUpdatePolicy(cadence, interval);
+      igr_solver_fb.SetStageRtolScale(1.0);
+
+      mfem::EulerFlux base_flux_fb(dim_s, gamma);
+      mfem::FluxWithIGR igr_flux_fb(base_flux_fb);
+      igr_flux_fb.SetSigmaField(&igr_solver_fb.GetSigma());
+      mfem::RusanovFluxWithSides num_flux_fb(igr_flux_fb);
+
+      auto form_integrator_fb =
+        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux_fb,
+                                                         /*IntOrderOffset=*/2);
+      mfem::DGHyperbolicConservationLaws op_fb(state_fes_s,
+                                               std::move(form_integrator_fb),
+                                               /*preassembleWeakDivergence=*/true);
+      op_fb.SetNumericalFlux(&num_flux_fb);
+
+      mfem::EulerWithIGR wrapped_fb(op_fb, igr_solver_fb, U_base);
+      mfem::Vector rhs_fb(U_stage.Size());
+
+      // Intentionally do not call BeginRKStep()/SetRKStage() to validate
+      // non-stage-aware fallback behavior.
+      wrapped_fb.Mult(U_base, rhs_fb);
+      mfem::Vector sigma_fb_base(igr_solver_fb.GetSigma().Size());
+      sigma_fb_base = igr_solver_fb.GetSigma();
+
+      wrapped_fb.Mult(U_stage, rhs_fb);
+      mfem::Vector sigma_fb_stage(igr_solver_fb.GetSigma().Size());
+      sigma_fb_stage = igr_solver_fb.GetSigma();
+
+      igr_solver_fb.SetRKStageIndex(-1);
+      igr_solver_fb.UpdateFromState(U_stage, /*warm_start=*/false);
+      mfem::Vector sigma_fb_ref(igr_solver_fb.GetSigma().Size());
+      sigma_fb_ref = igr_solver_fb.GetSigma();
+
+      mfem::Vector delta_fb_stage_base(sigma_fb_stage);
+      delta_fb_stage_base -= sigma_fb_base;
+      const double fb_stage_vs_base = GlobalL2Norm(delta_fb_stage_base);
+
+      mfem::Vector delta_fb_ref(sigma_fb_stage);
+      delta_fb_ref -= sigma_fb_ref;
+      const double fb_stage_err = GlobalL2Norm(delta_fb_ref);
+
+      ctx.LogMetric("igr_non_stage_fallback label=" + label +
+                    " stage_err=" + FormatSci(fb_stage_err) +
+                    " stage_vs_base=" + FormatSci(fb_stage_vs_base));
+      ctx.AddParity(fb_stage_err + fb_stage_vs_base);
+
+      ctx.Check(fb_stage_vs_base > 1.0e-8,
+                "EulerWithIGR non-stage fallback updates sigma between distinct states (" +
+                  label + ")");
+      ctx.Check(fb_stage_err <= 1.0e-5 * fb_stage_vs_base,
+                "EulerWithIGR non-stage fallback sigma matches direct stage update (" +
+                  label + ")");
+    };
+
+    check_non_stage_fallback(dg_igr::IGRSigmaUpdateCadence::EveryStep,
+                             /*interval=*/1,
+                             "every-step");
+    check_non_stage_fallback(dg_igr::IGRSigmaUpdateCadence::EveryNSteps,
+                             /*interval=*/3,
+                             "every-n-steps");
   }
 
   // --- Quasi-1D MPI robustness: sigma should vary primarily in x, not y ---

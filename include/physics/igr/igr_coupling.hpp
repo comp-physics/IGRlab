@@ -46,21 +46,29 @@ public:
   void Mult(const Vector& U, Vector& dUdt) const override
   {
     bool update_sigma = false;
+    const bool have_rk_step = (rk_step_ >= 0);
     switch (sigma_cadence_)
     {
     case ::dg_igr::IGRSigmaUpdateCadence::EveryStage:
       update_sigma = true;
       break;
     case ::dg_igr::IGRSigmaUpdateCadence::EveryStep:
-      update_sigma =
-        (!sigma_initialized_ || (rk_step_ >= 0 && last_sigma_step_ != rk_step_));
+      update_sigma = !have_rk_step
+                       ? true
+                       : (!sigma_initialized_ || (last_sigma_step_ != rk_step_));
       break;
     case ::dg_igr::IGRSigmaUpdateCadence::EveryNSteps:
-      if (!sigma_initialized_)
+      if (!have_rk_step)
+      {
+        // Outside stage-aware steppers, prefer safety over cadence fidelity:
+        // recompute sigma on every RHS evaluation to avoid stale coupling.
+        update_sigma = true;
+      }
+      else if (!sigma_initialized_)
       {
         update_sigma = true;
       }
-      else if (rk_step_ >= 0 && (rk_step_ % sigma_interval_ == 0))
+      else if (rk_step_ % sigma_interval_ == 0)
       {
         update_sigma = (last_sigma_step_ != rk_step_);
       }
