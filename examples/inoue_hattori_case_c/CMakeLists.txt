@@ -1,0 +1,4 @@
+add_executable(inoue_hattori_case_c inoue_hattori_case_c.cpp)
+target_link_libraries(inoue_hattori_case_c igr_mfem)
+target_include_directories(inoue_hattori_case_c PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../shock_vortex_interaction)

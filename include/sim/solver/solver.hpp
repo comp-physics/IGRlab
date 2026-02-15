@@ -83,7 +83,8 @@ bool WithEulerOperator(ExampleContext& ctx,
     op,
     numerical_flux,
     ctx.run_cfg.case_config.int_order_offset,
-    ctx.dim);
+    ctx.dim,
+    gamma);
   bc_setup(bc, markers);
   return func(op);
 }

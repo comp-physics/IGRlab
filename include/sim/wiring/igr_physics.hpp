@@ -34,7 +34,8 @@ template <typename NumericalFlux> struct EulerIGRPhysics
       op,
       flux.numerical_flux,
       ctx.run_cfg.case_config.int_order_offset,
-      ctx.dim);
+      ctx.dim,
+      gamma);
     bc_setup(bc, markers);
   }
 };

@@ -235,23 +235,24 @@ ShockVortexInteractionInitialCondition(const real_t gamma,
  *
  * Returns u₀(X,Y) = [ρ, ρu_x, ρu_y, E].
  */
-/// @brief Shock-vortex IC following Inoue/Hattori setup.
+/// @brief Parameterized Inoue/Hattori IC with explicit domain and vortex center.
 inline std::function<void(const Vector&, Vector&)>
-GetShockVortexInoueHattoriInit(const real_t gamma,
-                               const int mx,
-                               const int my,
-                               const real_t Ms = 1.2,
-                               const real_t Mv = 0.25,
-                               const real_t smoothing_scale = 1.0)
+GetShockVortexInoueHattoriInitCustom(const real_t gamma,
+                                     const int mx,
+                                     const int my,
+                                     const real_t Ms,
+                                     const real_t Mv,
+                                     const real_t smoothing_scale,
+                                     const real_t xL,
+                                     const real_t xR,
+                                     const real_t yB,
+                                     const real_t yT,
+                                     const real_t Xv,
+                                     const real_t Yv = 0.0,
+                                     const real_t Xs = 0.0)
 {
-  // --- Physical domain bounds (X,Y) ---
-  const real_t xL = -30.0;
-  const real_t xR = 10.0;
-  const real_t yB = -20.0;
-  const real_t yT = 20.0;
-
-  const real_t Lx = xR - xL; // 40
-  const real_t Ly = yT - yB; // 40
+  const real_t Lx = xR - xL;
+  const real_t Ly = yT - yB;
 
   const real_t dX = Lx / static_cast<real_t>(mx);
   const real_t dY = Ly / static_cast<real_t>(my);
@@ -294,13 +295,6 @@ GetShockVortexInoueHattoriInit(const real_t gamma,
   const real_t mu2x = rho2 * u2x;
   const real_t mu2y = rho2 * u2y;
 
-  // --- Shock location ---
-  const real_t Xs = 0.0; // stationary shock at X=0
-
-  // --- Vortex parameters ---
-  const real_t Xv = 4.0;
-  const real_t Yv = 0.0;
-
   // Mv is the canonical vortex Mach number; choose eps = 2π Mv so that
   // u_θ = Mv r exp((1 - r²)/2) matches the standard isentropic vortex.
   const real_t pi = static_cast<real_t>(dg_sim::math::kPi);
@@ -324,8 +318,8 @@ GetShockVortexInoueHattoriInit(const real_t gamma,
     const real_t Y = x(1);
 
     // Smooth shock indicator S(X):
-    //  X << 0  → S ≈ 0 → U ≈ U2 (downstream)
-    //  X >> 0  → S ≈ 1 → U ≈ upstream vortex state
+    //  X << Xs  → S ≈ 0 → U ≈ U2 (downstream)
+    //  X >> Xs  → S ≈ 1 → U ≈ upstream vortex state
     const real_t S = 0.5 * (1.0 + std::tanh((X - Xs) / delta_phys));
 
     // --- Upstream vortex perturbations (isentropic vortex) ---
@@ -356,8 +350,8 @@ GetShockVortexInoueHattoriInit(const real_t gamma,
     const real_t mu_up_y = rho_up * u_up_y;
 
     // --- Mix upstream vortex state with downstream state via S(X) ---
-    // For X << 0: S ≈ 0 → (ρ,μ,p) ≈ downstream (ρ₂,μ₂,p₂)
-    // For X >> 0: S ≈ 1 → (ρ,μ,p) ≈ upstream vortex state
+    // For X << Xs: S ≈ 0 → (ρ,μ,p) ≈ downstream (ρ₂,μ₂,p₂)
+    // For X >> Xs: S ≈ 1 → (ρ,μ,p) ≈ upstream vortex state
     const real_t rho = S * rho_up + (1.0 - S) * rho2;
     const real_t mux = S * mu_up_x + (1.0 - S) * mu2x;
     const real_t muy = S * mu_up_y + (1.0 - S) * mu2y;
@@ -371,6 +365,30 @@ GetShockVortexInoueHattoriInit(const real_t gamma,
     y(2) = muy;
     y(3) = E;
   };
+}
+
+/// @brief Shock-vortex IC following Inoue/Hattori setup.
+inline std::function<void(const Vector&, Vector&)>
+GetShockVortexInoueHattoriInit(const real_t gamma,
+                               const int mx,
+                               const int my,
+                               const real_t Ms = 1.2,
+                               const real_t Mv = 0.25,
+                               const real_t smoothing_scale = 1.0)
+{
+  return GetShockVortexInoueHattoriInitCustom(gamma,
+                                              mx,
+                                              my,
+                                              Ms,
+                                              Mv,
+                                              smoothing_scale,
+                                              /*xL=*/-30.0,
+                                              /*xR=*/10.0,
+                                              /*yB=*/-20.0,
+                                              /*yT=*/20.0,
+                                              /*Xv=*/4.0,
+                                              /*Yv=*/0.0,
+                                              /*Xs=*/0.0);
 }
 
 /**

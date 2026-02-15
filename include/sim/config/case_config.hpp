@@ -562,7 +562,7 @@ inline void ApplyExampleDefaults(CaseConfig& cfg)
   cfg.rk3_config.limit_initial = false;
   cfg.rk3_config.max_limiter_steps = 0;
 
-  cfg.igr_config.lin_rtol = 1.0e-8;
+  cfg.igr_config.lin_rtol = 1.0e-4;
   cfg.igr_config.lin_atol = 0.0;
   cfg.igr_config.lin_maxit = 1000;
   cfg.igr_config.lin_print = 0;
