@@ -35,7 +35,8 @@ int FindLeftElement(const dg_sim::ExampleContext& ctx)
   double best_x = std::numeric_limits<double>::infinity();
   for (int e = 0; e < ctx.Mesh().GetNE(); ++e)
   {
-    mfem::ElementTransformation* Tr = ctx.spaces.fes.GetElementTransformation(e);
+    mfem::ElementTransformation* Tr =
+      ctx.spaces.fes.GetElementTransformation(e);
     mfem::Vector x;
     Tr->Transform(ip_center, x);
     if (x(0) < best_x)
@@ -55,7 +56,8 @@ int FindRightElement(const dg_sim::ExampleContext& ctx)
   double best_x = -std::numeric_limits<double>::infinity();
   for (int e = 0; e < ctx.Mesh().GetNE(); ++e)
   {
-    mfem::ElementTransformation* Tr = ctx.spaces.fes.GetElementTransformation(e);
+    mfem::ElementTransformation* Tr =
+      ctx.spaces.fes.GetElementTransformation(e);
     mfem::Vector x;
     Tr->Transform(ip_center, x);
     if (x(0) > best_x)
@@ -93,9 +95,12 @@ int RunDiagnosticsTests(TestContext& ctx)
                                        /*need_sigma=*/false,
                                        /*need_h1=*/true);
     dg_sim::EulerStateBundle bundle(example_ctx, gamma, rho_floor);
-    FillConstantState(
-      EulerConsFromPrim2D(/*rho=*/1.0, /*u=*/0.25, /*v=*/-0.05, /*p=*/1.0, gamma),
-      bundle.sol);
+    FillConstantState(EulerConsFromPrim2D(/*rho=*/1.0,
+                                          /*u=*/0.25,
+                                          /*v=*/-0.05,
+                                          /*p=*/1.0,
+                                          gamma),
+                      bundle.sol);
 
     dg_sim::H1Diagnostics h1_diag(*example_ctx.spaces.h1_vfes,
                                   bundle.sol,
@@ -194,11 +199,13 @@ int RunDiagnosticsTests(TestContext& ctx)
     ctx.CheckNear(ul(0),
                   1.0,
                   1.0e-8,
-                  "H1 velocity projection averages discontinuous DG states at interface (left).");
+                  "H1 velocity projection averages discontinuous DG states at "
+                  "interface (left).");
     ctx.CheckNear(ur(0),
                   1.0,
                   1.0e-8,
-                  "H1 velocity projection averages discontinuous DG states at interface (right).");
+                  "H1 velocity projection averages discontinuous DG states at "
+                  "interface (right).");
   }
 
   // L2 diagnostics remain broken/local (no H1-style shared-dof averaging).
@@ -260,20 +267,18 @@ int RunDiagnosticsTests(TestContext& ctx)
     ip_left.Set2(0.5, 0.5);
     ip_right.Set2(0.5, 0.5);
 
-    const double div_left =
-      [&]()
-      {
-        mfem::ElementTransformation* Tr_left =
-          example_ctx.spaces.fes.GetElementTransformation(left_e);
-        return l2_diag.g_div_l2.GetValue(*Tr_left, ip_left);
-      }();
-    const double div_right =
-      [&]()
-      {
-        mfem::ElementTransformation* Tr_right =
-          example_ctx.spaces.fes.GetElementTransformation(right_e);
-        return l2_diag.g_div_l2.GetValue(*Tr_right, ip_right);
-      }();
+    const double div_left = [&]()
+    {
+      mfem::ElementTransformation* Tr_left =
+        example_ctx.spaces.fes.GetElementTransformation(left_e);
+      return l2_diag.g_div_l2.GetValue(*Tr_left, ip_left);
+    }();
+    const double div_right = [&]()
+    {
+      mfem::ElementTransformation* Tr_right =
+        example_ctx.spaces.fes.GetElementTransformation(right_e);
+      return l2_diag.g_div_l2.GetValue(*Tr_right, ip_right);
+    }();
 
     // For u_x = x (left) and u_x = 2x (right), broken gradients stay local:
     // div_left ~= 1, div_right ~= 2 in the two elements.
