@@ -81,10 +81,19 @@ public:
         igr_solve_stage = -1;
       }
 
+      MFEM_VERIFY(U.Size() == state_.Size(),
+                  "EulerWithIGR::Mult received state with unexpected size.");
+
+      // Build a temporary ParGridFunction view over the stage vector so sigma
+      // is updated from the same state used for RHS evaluation.
+      ParGridFunction stage_state(state_.ParFESpace(),
+                                  const_cast<Vector&>(U),
+                                  /*base_offset=*/0);
+
       // Recompute sigma and expose current RK stage so staged tolerance
       // policies can use looser settings on intermediate stages.
       igr_.SetRKStageIndex(igr_solve_stage);
-      igr_.UpdateFromState(state_, /*warm_start=*/true);
+      igr_.UpdateFromState(stage_state, /*warm_start=*/true);
 
       // Make sigma available on face neighbors across MPI subdomains.
       igr_.GetSigma().ExchangeFaceNbrData();

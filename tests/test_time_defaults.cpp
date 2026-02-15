@@ -106,6 +106,16 @@ int RunTimeDefaultsTests(TestContext& ctx)
       t += dt;
     }
   };
+  struct TimeLoopVariableSpeedOperator
+  {
+    mutable int speed_calls = 0;
+    void Mult(const mfem::Vector&, mfem::Vector& y) const { y = 0.0; }
+    mfem::real_t GetMaxCharSpeed() const
+    {
+      ++speed_calls;
+      return (speed_calls == 1) ? 1.0 : 200.0;
+    }
+  };
 
   // --- dt_min guard uses nominal dt (before stepping) ---
   {
@@ -151,6 +161,55 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   0.41,
                   1.0e-12,
                   "time loop: clipped final dt_real reaches target final time");
+  }
+
+  // --- dt_min after CFL update records current step and emits final save ---
+  {
+    TimeLoopVariableSpeedOperator op;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 1.0;
+    cfg.dt = 0.0;
+    cfg.dt_min = 0.05;
+    cfg.cfl = 0.3;
+    cfg.order = 1;
+    cfg.vtk_save = true;
+    cfg.dt_save = 100.0; // avoid save-boundary snapping in this test
+
+    int final_save_calls = 0;
+    int final_save_step = -1;
+    mfem::real_t final_save_time = -1.0;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int step, mfem::real_t t, int /*save_idx*/, bool is_final)
+    {
+      if (is_final)
+      {
+        ++final_save_calls;
+        final_save_step = step;
+        final_save_time = t;
+      }
+    };
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.dt_min_reached,
+              "time loop: dt_min set when CFL update drops nominal dt below threshold");
+    ctx.Check(stepper.calls == 1,
+              "time loop: dt_min after CFL update occurs after one completed step");
+    ctx.Check(result.steps == 1,
+              "time loop: dt_min after CFL update preserves completed step count");
+    ctx.CheckNear(result.final_time,
+                  0.1,
+                  1.0e-12,
+                  "time loop: dt_min after CFL update preserves advanced time");
+    ctx.Check(final_save_calls == 1,
+              "time loop: dt_min after CFL update emits one final save callback");
+    ctx.Check(final_save_step == result.steps,
+              "time loop: final save step matches reported completed steps");
+    ctx.CheckNear(final_save_time,
+                  result.final_time,
+                  1.0e-12,
+                  "time loop: final save time matches reported final time");
   }
 
   // --- zero-step guard: do not call Step when t_final is already reached ---

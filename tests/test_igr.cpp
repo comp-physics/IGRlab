@@ -1,5 +1,6 @@
 #include "physics/euler/conversions.hpp"
 #include "physics/igr/IGR.hpp"
+#include "physics/igr/igr_coupling.hpp"
 #include "physics/igr/igr_flux.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/riemann/rusanov.hpp"
@@ -1088,6 +1089,127 @@ int RunIGRTests(TestContext& ctx)
     ctx.Check(
       warm_avg <= cold_avg,
       "IGR warm-start average iteration count is not worse than cold-start");
+  }
+
+  // --- EulerWithIGR must update sigma from the current RK stage state ---
+  {
+    constexpr int dim_s = 1;
+    constexpr int num_eq_s = dim_s + 2;
+    constexpr double two_pi = 6.28318530717958647692;
+
+    mfem::Mesh mesh_s = MakePeriodicMesh1D(/*n=*/8);
+    mfem::ParMesh pmesh_s(MPI_COMM_SELF, mesh_s);
+
+    mfem::DG_FECollection state_fec_s(/*order=*/2,
+                                      dim_s,
+                                      mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace state_fes_s(&pmesh_s,
+                                            &state_fec_s,
+                                            num_eq_s,
+                                            mfem::Ordering::byNODES);
+    mfem::ParGridFunction U_base(&state_fes_s);
+    mfem::ParGridFunction U_stage(&state_fes_s);
+
+    auto project_state = [&](mfem::ParGridFunction& U, double phase)
+    {
+      mfem::VectorFunctionCoefficient coeff(
+        num_eq_s,
+        [phase, two_pi, gamma](const mfem::Vector& x, mfem::Vector& cons)
+        {
+          const double rho = 1.0 + 0.15 * std::sin(two_pi * (x(0) + phase));
+          const double u = 1.8 + 0.25 * std::cos(two_pi * (x(0) + phase));
+          const double p = 1.0 + 0.12 * std::sin(two_pi * (x(0) + phase + 0.31));
+          cons = EulerConsFromPrim1D(rho, u, p, gamma);
+        });
+      U.ProjectCoefficient(coeff);
+      U.ExchangeFaceNbrData();
+    };
+
+    project_state(U_base, /*phase=*/0.00);
+    project_state(U_stage, /*phase=*/0.11);
+
+    mfem::DG_FECollection sigma_fec_s(/*order=*/1,
+                                      dim_s,
+                                      mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace sigma_fes_s(&pmesh_s,
+                                            &sigma_fec_s,
+                                            /*vdim=*/1,
+                                            mfem::Ordering::byNODES);
+
+    dg_igr::IGRSolver igr_solver_s(sigma_fes_s,
+                                   state_fes_s,
+                                   dim_s,
+                                   num_eq_s,
+                                   /*alpha=*/0.25);
+    igr_solver_s.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+    igr_solver_s.SetIPKind(dg_igr::IGRIPKind::SIPG);
+    igr_solver_s.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+    igr_solver_s.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
+    igr_solver_s.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    igr_solver_s.SetLinearSolveParams(/*rtol=*/1.0e-12,
+                                      /*atol=*/0.0,
+                                      /*max_it=*/400,
+                                      /*print=*/0);
+    igr_solver_s.SetSigmaUpdatePolicy(dg_igr::IGRSigmaUpdateCadence::EveryStage,
+                                      /*interval=*/1);
+    igr_solver_s.SetStageRtolScale(1.0);
+
+    mfem::EulerFlux base_flux_s(dim_s, gamma);
+    mfem::FluxWithIGR igr_flux_s(base_flux_s);
+    igr_flux_s.SetSigmaField(&igr_solver_s.GetSigma());
+    mfem::RusanovFluxWithSides num_flux_s(igr_flux_s);
+
+    auto form_integrator_s =
+      std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux_s,
+                                                       /*IntOrderOffset=*/2);
+    mfem::DGHyperbolicConservationLaws op_s(state_fes_s,
+                                            std::move(form_integrator_s),
+                                            /*preassembleWeakDivergence=*/true);
+    op_s.SetNumericalFlux(&num_flux_s);
+
+    mfem::EulerWithIGR wrapped(op_s, igr_solver_s, U_base);
+    wrapped.BeginRKStep(/*step=*/0, /*t=*/0.0, /*dt=*/0.01);
+    wrapped.SetRKStage(/*stage=*/0);
+
+    mfem::Vector rhs(U_stage.Size());
+    wrapped.Mult(U_stage, rhs);
+
+    mfem::Vector sigma_wrapped(igr_solver_s.GetSigma().Size());
+    sigma_wrapped = igr_solver_s.GetSigma();
+
+    igr_solver_s.SetRKStageIndex(/*stage=*/0);
+    igr_solver_s.UpdateFromState(U_stage, /*warm_start=*/false);
+    mfem::Vector sigma_stage(igr_solver_s.GetSigma().Size());
+    sigma_stage = igr_solver_s.GetSigma();
+
+    igr_solver_s.SetRKStageIndex(/*stage=*/0);
+    igr_solver_s.UpdateFromState(U_base, /*warm_start=*/false);
+    mfem::Vector sigma_base(igr_solver_s.GetSigma().Size());
+    sigma_base = igr_solver_s.GetSigma();
+
+    mfem::Vector delta_stage(sigma_wrapped);
+    delta_stage -= sigma_stage;
+    const double stage_err = GlobalL2Norm(delta_stage);
+
+    mfem::Vector delta_base(sigma_wrapped);
+    delta_base -= sigma_base;
+    const double stale_err = GlobalL2Norm(delta_base);
+
+    mfem::Vector delta_stage_vs_base(sigma_stage);
+    delta_stage_vs_base -= sigma_base;
+    const double stage_vs_base = GlobalL2Norm(delta_stage_vs_base);
+
+    ctx.LogMetric("igr_stage_sigma_consistency stage_err=" + FormatSci(stage_err) +
+                  " stale_err=" + FormatSci(stale_err) +
+                  " stage_vs_base=" + FormatSci(stage_vs_base));
+    ctx.AddParity(stage_err + stale_err + stage_vs_base);
+
+    ctx.Check(stage_vs_base > 1.0e-8,
+              "IGR stage-consistency test setup distinguishes base and stage sigma");
+    ctx.Check(stage_err <= 1.0e-5 * stage_vs_base,
+              "EulerWithIGR updates sigma from stage state used in RHS");
+    ctx.Check(stale_err >= 0.5 * stage_vs_base,
+              "EulerWithIGR sigma is not sourced from persistent base state");
   }
 
   // --- Quasi-1D MPI robustness: sigma should vary primarily in x, not y ---

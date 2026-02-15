@@ -252,6 +252,13 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       }
       if (CheckDtMinimum(dt, "after-cfl-update"))
       {
+        result.steps = step + 1;
+        result.final_time = t;
+        done = true;
+        if (cfg.vtk_save && hooks.on_save)
+        {
+          hooks.on_save(result.steps, t, save_idx, /*is_final=*/true);
+        }
         break;
       }
     }
