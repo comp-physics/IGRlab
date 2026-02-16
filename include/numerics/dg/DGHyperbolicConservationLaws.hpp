@@ -25,6 +25,7 @@
  */
 
 #include <functional>
+#include <cstdint>
 #include "mfem.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/riemann/fluxfunctions.hpp"
@@ -194,7 +195,7 @@ public:
                          bdr_marker);
   }
 
-  ~DGHyperbolicConservationLaws() override = default;
+  ~DGHyperbolicConservationLaws() override;
 
 private:
   friend class dgsem::DGSEMOperator;
@@ -232,6 +233,18 @@ private:
   DGSEMVolumeDissipation dgsem_vol_diss_ = DGSEMVolumeDissipation::None;
   double dgsem_gamma_ = 1.4;
   bool dgsem_entropy_jacobian_analytic_ = false;
+  mutable bool dgsem_timing_enabled_ = false;
+  mutable bool dgsem_timing_init_ = false;
+
+  struct DGSEMTimingStats
+  {
+    std::int64_t calls = 0;
+    double surface_seconds = 0.0;
+    double volume_seconds = 0.0;
+    double invmass_seconds = 0.0;
+    double total_seconds = 0.0;
+  };
+  mutable DGSEMTimingStats dgsem_timing_stats_;
 
   // --- Helpers ---
   /// Compute per-element inverse mass matrices (block-diagonal DG mass).
@@ -240,6 +253,13 @@ private:
   /// Preassemble the weak-divergence operator on each element (optional).
   /// The layout is (test dof) × (trial node × dim), i.e. ByDim grouped per node.
   void ComputeWeakDivergence();
+
+  bool IsDGSEMTimingEnabled_() const;
+  void RecordDGSEMTiming_(double surface_seconds,
+                          double volume_seconds,
+                          double invmass_seconds,
+                          double total_seconds) const;
+  void PrintDGSEMTimingSummary_() const;
 };
 
 } // namespace mfem

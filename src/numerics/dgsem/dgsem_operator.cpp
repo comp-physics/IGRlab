@@ -8,6 +8,7 @@
 #include "numerics/dgsem/dgsem_volume_flux.hpp"
 #include "physics/igr/igr_flux.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 namespace mfem
@@ -392,6 +393,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
   DenseMatrix adj;       // adjugate of Jacobian (dim × dim)
   std::vector<double> adj_storage;
   std::vector<double> sigma_nodes;
+  std::vector<int> lex_to_local;
   const FluxFunction& fluxFunction = op_.formIntegrator->GetFluxFunction();
   const FluxWithIGR* flux_igr = dynamic_cast<const FluxWithIGR*>(&fluxFunction);
   const bool use_entropy_flux =
@@ -411,6 +413,28 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
   const double gamma = op_.GetDGSEMGamma();
   Array<int> vdofs;
   Vector xval;
+
+  int max_dof = 0;
+  for (int e = 0; e < op_.vfes.GetNE(); ++e)
+  {
+    max_dof = std::max(max_dof, op_.vfes.GetFE(e)->GetDof());
+  }
+  lex_to_local.reserve(max_dof);
+  if (use_entropy_flux || use_volume_dissipation)
+  {
+    adj_storage.reserve(max_dof * op_.dim * op_.dim);
+    if (flux_igr)
+    {
+      sigma_nodes.reserve(max_dof);
+    }
+  }
+
+  Vector flux_ij(op_.num_equations);
+  Vector diss_ij(op_.num_equations);
+  Vector state_i(op_.num_equations);
+  Vector state_j(op_.num_equations);
+  Vector contravariant_dir(op_.dim);
+  Vector flux_dir(op_.num_equations);
 
   real_t max_vol_speed = 0.0;
 
@@ -432,7 +456,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
     const std::vector<std::array<int, 3>>& dof_to_ijk =
       mfem::dgsem::GetTensorDofToIJK(fe);
 
-    std::vector<int> lex_to_local(dof, 0);
+    lex_to_local.assign(dof, 0);
     for (int local = 0; local < dof; ++local)
     {
       const int i = dof_to_ijk[local][0];
@@ -454,10 +478,10 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
     adj.SetSize(op_.dim);
     if (use_entropy_flux || use_volume_dissipation)
     {
-      adj_storage.assign(dof * op_.dim * op_.dim, 0.0);
+      adj_storage.resize(dof * op_.dim * op_.dim);
       if (flux_igr)
       {
-        sigma_nodes.assign(dof, 0.0);
+        sigma_nodes.resize(dof);
       }
     }
     const IntegrationRule& nodes = fe.GetNodes();
@@ -510,12 +534,6 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
     volume.SetSize(dof, op_.num_equations);
     volume = 0.0;
 
-    Vector flux_ij(op_.num_equations);
-    Vector diss_ij(op_.num_equations);
-    Vector state_i(op_.num_equations);
-    Vector state_j(op_.num_equations);
-    Vector contravariant_dir(op_.dim);
-    Vector flux_dir(op_.num_equations);
     const double vol_sign = -1.0; // match DGSEM split-form sign convention
     auto adj_at = [&](int node, int d, int k) -> double
     {

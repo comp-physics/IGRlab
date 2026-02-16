@@ -102,6 +102,18 @@ inline bool IsSymmetricPC(IGRSolver::PrecondType pc)
          pc == IGRSolver::PrecondType::None;
 }
 
+inline bool IsCudaBackendActive()
+{
+  return mfem::Device::Allows(mfem::Backend::CUDA_MASK);
+}
+
+inline bool IsCudaUnsupportedPreconditioner(IGRSolver::PrecondType pc)
+{
+  return pc == IGRSolver::PrecondType::HypreILU ||
+         pc == IGRSolver::PrecondType::HypreEuclid ||
+         pc == IGRSolver::PrecondType::ParaSails;
+}
+
 inline bool VectorIsFinite(const mfem::Vector& v)
 {
   const int n = v.Size();
@@ -135,6 +147,7 @@ inline void LogIGRFallback(const char* reason,
 inline void LogIGRSelection(bool warm_start,
                             bool is_dg,
                             bool spd_ok,
+                            bool using_cuda,
                             IGRSolver::LinearSolverType solver_choice,
                             IGRSolver::PrecondType prec_choice,
                             double lin_rtol,
@@ -149,6 +162,7 @@ inline void LogIGRSelection(bool warm_start,
             << " warm_start=" << (warm_start ? 1 : 0)
             << " space=" << (is_dg ? "dg" : "h1")
             << " spd_assumed=" << (spd_ok ? 1 : 0)
+            << " device=" << (using_cuda ? "cuda" : "cpu")
             << " solver=" << LinearSolverTypeName(solver_choice)
             << " precond=" << PrecondTypeName(prec_choice)
             << " rtol=" << lin_rtol << " atol=" << lin_atol
@@ -618,6 +632,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   MPI_Comm comm = sfes_.GetComm();
   const bool is_dg = IsDGSpace(sfes_);
   const bool spd_ok = IsSPD_DefaultAssumption(sfes_, ip_kind_);
+  const bool using_cuda = IsCudaBackendActive();
   const bool prev_linear_converged = last_linear_converged_;
   const double prev_linear_final_norm = last_linear_final_norm_;
 
@@ -667,6 +682,17 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     const PrecondType prev = prec_choice;
     prec_choice = PrecondType::BoomerAMG;
     LogIGRFallback("spd-solver-with-nonsymmetric-preconditioner",
+                   requested_solver,
+                   solver_choice,
+                   prev,
+                   prec_choice);
+  }
+
+  if (using_cuda && IsCudaUnsupportedPreconditioner(prec_choice))
+  {
+    const PrecondType prev = prec_choice;
+    prec_choice = PrecondType::BoomerAMG;
+    LogIGRFallback("cuda-unsupported-preconditioner",
                    requested_solver,
                    solver_choice,
                    prev,
@@ -756,6 +782,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     LogIGRSelection(warm_start,
                     is_dg,
                     spd_ok,
+                    using_cuda,
                     solver_choice,
                     prec_choice,
                     lin_rtol_,

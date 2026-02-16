@@ -28,8 +28,29 @@
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/dgsem/dgsem_operator.hpp"
 
+#include <chrono>
+#include <cstdlib>
+#include <string>
+
 namespace mfem
 {
+
+namespace
+{
+
+bool EnvFlagEnabled(const char* name)
+{
+  const char* raw = std::getenv(name);
+  if (!raw)
+  {
+    return false;
+  }
+  const std::string value(raw);
+  return !(value.empty() || value == "0" || value == "false" ||
+           value == "FALSE" || value == "off" || value == "OFF");
+}
+
+} // namespace
 
 DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
   FiniteElementSpace& vfes_,
@@ -180,7 +201,40 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
                 "DGSEM stabilization hooks are not implemented. "
                 "Use --dgsem-stab none.");
     dgsem::DGSEMOperator dgsem_op(*this);
-    max_char_speed = dgsem_op.AssembleResidual(x, y);
+
+    const bool timing_enabled = IsDGSEMTimingEnabled_();
+    const auto t_mult_start = std::chrono::steady_clock::now();
+
+    const auto t_surface_start = std::chrono::steady_clock::now();
+    const real_t max_face_speed = dgsem_op.AssembleSurface(x, z);
+    const auto t_surface_stop = std::chrono::steady_clock::now();
+
+    const auto t_volume_start = std::chrono::steady_clock::now();
+    const real_t max_vol_speed = dgsem_op.AssembleVolume(x, z);
+    const auto t_volume_stop = std::chrono::steady_clock::now();
+
+    const auto t_invmass_start = std::chrono::steady_clock::now();
+    dgsem_op.ApplyInverseMass(z, y);
+    const auto t_invmass_stop = std::chrono::steady_clock::now();
+
+    max_char_speed = std::max(max_face_speed, max_vol_speed);
+
+    if (timing_enabled)
+    {
+      const auto t_mult_stop = std::chrono::steady_clock::now();
+      const double surface_seconds =
+        std::chrono::duration<double>(t_surface_stop - t_surface_start).count();
+      const double volume_seconds =
+        std::chrono::duration<double>(t_volume_stop - t_volume_start).count();
+      const double invmass_seconds =
+        std::chrono::duration<double>(t_invmass_stop - t_invmass_start).count();
+      const double total_seconds =
+        std::chrono::duration<double>(t_mult_stop - t_mult_start).count();
+      RecordDGSEMTiming_(surface_seconds,
+                         volume_seconds,
+                         invmass_seconds,
+                         total_seconds);
+    }
     return;
   }
 
@@ -284,6 +338,14 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   max_char_speed = formIntegrator->GetMaxCharSpeed();
 }
 
+DGHyperbolicConservationLaws::~DGHyperbolicConservationLaws()
+{
+  if (IsDGSEMTimingEnabled_())
+  {
+    PrintDGSEMTimingSummary_();
+  }
+}
+
 // -----------------------------------------------------------------------------
 // Update internal data (mass matrices, etc.) when mesh/space changes
 // -----------------------------------------------------------------------------
@@ -319,6 +381,64 @@ void DGHyperbolicConservationLaws::SetFaceIntegrationRule(
   {
     bdr_int->SetIntegrationRule(*face_int_rule_);
   }
+}
+
+bool DGHyperbolicConservationLaws::IsDGSEMTimingEnabled_() const
+{
+  if (!dgsem_timing_init_)
+  {
+    dgsem_timing_enabled_ = EnvFlagEnabled("DG_IGR_DGSEM_TIMING");
+    dgsem_timing_init_ = true;
+  }
+  return dgsem_timing_enabled_;
+}
+
+void DGHyperbolicConservationLaws::RecordDGSEMTiming_(double surface_seconds,
+                                                      double volume_seconds,
+                                                      double invmass_seconds,
+                                                      double total_seconds) const
+{
+  ++dgsem_timing_stats_.calls;
+  dgsem_timing_stats_.surface_seconds += surface_seconds;
+  dgsem_timing_stats_.volume_seconds += volume_seconds;
+  dgsem_timing_stats_.invmass_seconds += invmass_seconds;
+  dgsem_timing_stats_.total_seconds += total_seconds;
+}
+
+void DGHyperbolicConservationLaws::PrintDGSEMTimingSummary_() const
+{
+  if (dgsem_timing_stats_.calls <= 0)
+  {
+    return;
+  }
+
+  const double calls = static_cast<double>(dgsem_timing_stats_.calls);
+  const double total = dgsem_timing_stats_.total_seconds;
+  const double surface_pct =
+    (total > 0.0) ? (100.0 * dgsem_timing_stats_.surface_seconds / total) : 0.0;
+  const double volume_pct =
+    (total > 0.0) ? (100.0 * dgsem_timing_stats_.volume_seconds / total) : 0.0;
+  const double invmass_pct =
+    (total > 0.0) ? (100.0 * dgsem_timing_stats_.invmass_seconds / total) : 0.0;
+  const int rank =
+    (mfem::Mpi::IsInitialized() && !mfem::Mpi::IsFinalized())
+      ? mfem::Mpi::WorldRank()
+      : 0;
+
+  std::cout << "[dgsem-op] event=run-summary"
+            << " rank=" << rank
+            << " calls=" << dgsem_timing_stats_.calls
+            << " surface_s=" << dgsem_timing_stats_.surface_seconds
+            << " volume_s=" << dgsem_timing_stats_.volume_seconds
+            << " invmass_s=" << dgsem_timing_stats_.invmass_seconds
+            << " total_mult_s=" << total
+            << " avg_surface_s=" << (dgsem_timing_stats_.surface_seconds / calls)
+            << " avg_volume_s=" << (dgsem_timing_stats_.volume_seconds / calls)
+            << " avg_invmass_s=" << (dgsem_timing_stats_.invmass_seconds / calls)
+            << " avg_mult_s=" << (total / calls)
+            << " surface_pct=" << surface_pct
+            << " volume_pct=" << volume_pct
+            << " invmass_pct=" << invmass_pct << "\n";
 }
 
 // -----------------------------------------------------------------------------

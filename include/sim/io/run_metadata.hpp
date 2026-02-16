@@ -161,6 +161,10 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   out << "    \"serial_refinement\": " << run_cfg.opts.ser_ref_levels << ",\n";
   out << "    \"parallel_refinement\": " << run_cfg.opts.par_ref_levels
       << ",\n";
+  out << "    \"device_backend\": "
+      << detail::ToJsonString(
+           DeviceBackendToString(run_cfg.device_backend))
+      << ",\n";
   out << "    \"dg_backend\": "
       << detail::ToJsonString(DGBackendToString(run_cfg.dg_backend)) << ",\n";
   out << "    \"dgsem_volume_flux\": "
@@ -247,6 +251,7 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   out << "    \"enabled\": " << ((igr != nullptr) ? "true" : "false");
   if (igr)
   {
+    const double elapsed_seconds = summary ? summary->elapsed : 0.0;
     out << ",\n";
     out << "    \"calls\": " << igr->GetLinearSolveCalls() << ",\n";
     out << "    \"converged_calls\": " << igr->GetTotalLinearConvergedCalls()
@@ -261,6 +266,16 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
     out << "    \"total_solve_s\": " << igr->GetTotalLinearSolveSeconds()
         << ",\n";
     out << "    \"total_igr_work_s\": " << igr->GetTotalIGRWorkSeconds()
+        << ",\n";
+    out << "    \"linear_solve_fraction\": "
+        << ((elapsed_seconds > 0.0)
+              ? (igr->GetTotalLinearSolveSeconds() / elapsed_seconds)
+              : 0.0)
+        << ",\n";
+    out << "    \"total_igr_work_fraction\": "
+        << ((elapsed_seconds > 0.0)
+              ? (igr->GetTotalIGRWorkSeconds() / elapsed_seconds)
+              : 0.0)
         << ",\n";
     out << "    \"last_solver\": "
         << detail::ToJsonString(igr->GetLastLinearSolverName()) << ",\n";

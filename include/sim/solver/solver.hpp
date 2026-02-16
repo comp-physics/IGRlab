@@ -291,6 +291,21 @@ struct Solver
     args.ParseCheck();
 
     const RunConfig run_cfg = MakeRunConfig(case_cfg, cli_opts, cli_igr_opts);
+    if (run_cfg.device_backend == DeviceBackend::CUDA)
+    {
+#ifndef MFEM_USE_CUDA
+      MFEM_VERIFY(false,
+                  "Requested '--device cuda' but MFEM was built without CUDA "
+                  "support.");
+#endif
+    }
+    mfem::Device device(DeviceBackendToString(run_cfg.device_backend));
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[device] requested="
+                << DeviceBackendToString(run_cfg.device_backend) << "\n";
+      device.Print();
+    }
     bool glvis_enabled = run_cfg.opts.glvis;
     std::cout.precision(spec.glvis.precision);
 
@@ -526,6 +541,15 @@ struct Solver
       const double avg_pc_setup_time =
         igr->GetTotalPCSetupSeconds() /
         static_cast<double>(igr->GetLinearSolveCalls());
+      const double igr_total_pct =
+        (captured_summary_valid && captured_summary.elapsed > 0.0)
+          ? (100.0 * igr->GetTotalIGRWorkSeconds() / captured_summary.elapsed)
+          : 0.0;
+      const double igr_solve_pct =
+        (captured_summary_valid && captured_summary.elapsed > 0.0)
+          ? (100.0 * igr->GetTotalLinearSolveSeconds() /
+             captured_summary.elapsed)
+          : 0.0;
       std::cout << "[igr-linear] event=run-summary"
                 << " calls=" << igr->GetLinearSolveCalls()
                 << " converged_calls=" << igr->GetTotalLinearConvergedCalls()
@@ -539,6 +563,8 @@ struct Solver
                 << " total_pc_setup_s=" << igr->GetTotalPCSetupSeconds()
                 << " total_solve_s=" << igr->GetTotalLinearSolveSeconds()
                 << " total_igr_s=" << igr->GetTotalIGRWorkSeconds()
+                << " solve_pct=" << igr_solve_pct
+                << " total_igr_pct=" << igr_total_pct
                 << " last_solver=" << igr->GetLastLinearSolverName()
                 << " last_precond=" << igr->GetLastPrecondName() << "\n";
     }

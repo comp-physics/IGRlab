@@ -32,10 +32,16 @@ add_test(NAME dg_igr_dgsem_flux_tests COMMAND dg_igr_unit_tests --dgsem-flux)
 add_test(NAME dg_igr_dgsem_operator_tests COMMAND dg_igr_unit_tests --dgsem-operator)
 add_test(NAME dg_igr_dgsem_advection_tests COMMAND dg_igr_unit_tests --dgsem-advection)
 add_test(NAME dg_igr_dgsem_igr_tests COMMAND dg_igr_unit_tests --dgsem-igr)
+add_test(NAME dg_igr_dgsem_portability_refactor_tests
+         COMMAND dg_igr_unit_tests --dgsem-operator --dgsem-igr)
 add_test(NAME dg_igr_bc_tests COMMAND dg_igr_unit_tests --bc)
 add_test(NAME dg_igr_igr_tests COMMAND dg_igr_unit_tests --igr)
 add_test(NAME dg_igr_time_defaults_tests COMMAND dg_igr_unit_tests --time-defaults)
 add_test(NAME dg_igr_diagnostics_tests COMMAND dg_igr_unit_tests --diagnostics)
+set_tests_properties(dg_igr_dgsem_portability_refactor_tests PROPERTIES
+  LABELS "dgsem;portability"
+  TIMEOUT 180
+)
 
 # MPI parity checks: generate a 1-rank reference and compare against 2 ranks.
 # Keep this list curated to suites with stable, decomposition-invariant metrics.
@@ -147,6 +153,114 @@ if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
       LABELS "mpi"
       TIMEOUT 180
     )
+  endif()
+endif()
+
+if (MFEM_USE_CUDA AND TARGET inoue_hattori_stationary_shock_1dy)
+  set(cpu_cuda_parity_script
+      "${CMAKE_SOURCE_DIR}/tests/scripts/check_cpu_cuda_parity.sh")
+  foreach(parity_backend IN ITEMS dg dgsem)
+    set(parity_test_name
+        "dg_igr_inoue_${parity_backend}_cpu_cuda_parity")
+    add_test(NAME ${parity_test_name}
+      COMMAND ${CMAKE_COMMAND} -E env
+              OMP_NUM_THREADS=1
+              /bin/bash
+              ${cpu_cuda_parity_script}
+              $<TARGET_FILE:inoue_hattori_stationary_shock_1dy>
+              ${parity_backend}
+    )
+    set_tests_properties(${parity_test_name} PROPERTIES
+      LABELS "cuda;parity"
+      TIMEOUT 240
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+    )
+  endforeach()
+endif()
+
+if (TARGET inoue_hattori_stationary_shock_1dy)
+  set(perf_script "${CMAKE_SOURCE_DIR}/tests/scripts/dgsem_perf_harness.py")
+  set(perf_gate_script
+      "${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_perf_regression.py")
+  set(perf_dir "${CMAKE_BINARY_DIR}/tests/perf")
+  file(MAKE_DIRECTORY "${perf_dir}")
+
+  set(perf_cpu_output "${perf_dir}/dgsem_operator_perf_cpu.json")
+  add_test(NAME dg_igr_dgsem_perf_cpu_benchmark
+    COMMAND ${CMAKE_COMMAND} -E env
+            OMP_NUM_THREADS=1
+            DG_IGR_DGSEM_TIMING=1
+            /usr/bin/env python3
+            ${perf_script}
+            --exe $<TARGET_FILE:inoue_hattori_stationary_shock_1dy>
+            --device cpu
+            --output ${perf_cpu_output}
+  )
+  set_tests_properties(dg_igr_dgsem_perf_cpu_benchmark PROPERTIES
+    FIXTURES_SETUP dg_igr_dgsem_perf_cpu
+    LABELS "perf"
+    TIMEOUT 600
+    DISABLED TRUE
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+  )
+
+  set(perf_cpu_baseline
+      "${CMAKE_SOURCE_DIR}/tests/perf_refs/dgsem_operator_inoue_cpu.json")
+  if (EXISTS "${perf_cpu_baseline}")
+    add_test(NAME dg_igr_dgsem_perf_cpu_gate
+      COMMAND /usr/bin/env python3
+              ${perf_gate_script}
+              --baseline ${perf_cpu_baseline}
+              --current ${perf_cpu_output}
+              --threshold 0.10
+    )
+    set_tests_properties(dg_igr_dgsem_perf_cpu_gate PROPERTIES
+      FIXTURES_REQUIRED dg_igr_dgsem_perf_cpu
+      LABELS "perf"
+      TIMEOUT 120
+      DISABLED TRUE
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+    )
+  endif()
+
+  if (MFEM_USE_CUDA)
+    set(perf_cuda_output "${perf_dir}/dgsem_operator_perf_cuda.json")
+    add_test(NAME dg_igr_dgsem_perf_cuda_benchmark
+      COMMAND ${CMAKE_COMMAND} -E env
+              OMP_NUM_THREADS=1
+              DG_IGR_DGSEM_TIMING=1
+              /usr/bin/env python3
+              ${perf_script}
+              --exe $<TARGET_FILE:inoue_hattori_stationary_shock_1dy>
+              --device cuda
+              --output ${perf_cuda_output}
+    )
+    set_tests_properties(dg_igr_dgsem_perf_cuda_benchmark PROPERTIES
+      FIXTURES_SETUP dg_igr_dgsem_perf_cuda
+      LABELS "perf;cuda"
+      TIMEOUT 600
+      DISABLED TRUE
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+    )
+
+    set(perf_cuda_baseline
+        "${CMAKE_SOURCE_DIR}/tests/perf_refs/dgsem_operator_inoue_cuda.json")
+    if (EXISTS "${perf_cuda_baseline}")
+      add_test(NAME dg_igr_dgsem_perf_cuda_gate
+        COMMAND /usr/bin/env python3
+                ${perf_gate_script}
+                --baseline ${perf_cuda_baseline}
+                --current ${perf_cuda_output}
+                --threshold 0.10
+      )
+      set_tests_properties(dg_igr_dgsem_perf_cuda_gate PROPERTIES
+        FIXTURES_REQUIRED dg_igr_dgsem_perf_cuda
+        LABELS "perf;cuda"
+        TIMEOUT 120
+        DISABLED TRUE
+        SKIP_REGULAR_EXPRESSION "^SKIP:"
+      )
+    endif()
   endif()
 endif()
 

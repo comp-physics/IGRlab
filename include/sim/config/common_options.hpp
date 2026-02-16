@@ -22,6 +22,7 @@ struct CommonOptions
   int ser_ref_levels = 0;        ///< Serial uniform refinement levels.
   int par_ref_levels = 1;        ///< Parallel uniform refinement levels.
   int order = 3;                 ///< DG polynomial order.
+  std::string device = "cpu";    ///< Runtime device backend: "cpu" or "cuda".
   std::string dg_backend = "dg"; ///< DG backend: "dg" or "dgsem".
   std::string dgsem_stab =
     "none"; ///< DGSEM stabilization: "none", "split", or "filter".
@@ -76,6 +77,10 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-o",
                  "--order",
                  "Order (degree) of the finite elements.");
+  args.AddOption(&opts.device,
+                 "-dev",
+                 "--device",
+                 "Runtime device backend: cpu | cuda.");
   args.AddOption(&opts.dg_backend,
                  "-dg",
                  "--dg-backend",

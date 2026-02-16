@@ -56,6 +56,13 @@ enum class DGBackend
   DGSEM
 };
 
+/// @brief Runtime compute device selection.
+enum class DeviceBackend
+{
+  CPU,
+  CUDA
+};
+
 /// @brief Optional DGSEM stabilization hook selection.
 enum class DGSEMStabilization
 {
@@ -117,6 +124,7 @@ struct RunConfig
   CaseConfig case_config;
   CommonOptions opts;
   IGROptions igr_opts;
+  DeviceBackend device_backend = DeviceBackend::CPU;
   DGBackend dg_backend = DGBackend::DG;
   DGSEMStabilization dgsem_stab = DGSEMStabilization::None;
   DGSEMVolumeFlux dgsem_volume_flux = DGSEMVolumeFlux::Central;
@@ -419,6 +427,23 @@ inline DGBackend ParseDGBackend(const std::string& value)
   return DGBackend::DG;
 }
 
+inline DeviceBackend ParseDeviceBackend(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "cpu")
+  {
+    return DeviceBackend::CPU;
+  }
+  if (lower == "cuda")
+  {
+    return DeviceBackend::CUDA;
+  }
+  MFEM_VERIFY(false,
+              "Invalid device backend '" << value
+                                         << "'. Use 'cpu' or 'cuda'.");
+  return DeviceBackend::CPU;
+}
+
 inline DGSEMStabilization ParseDGSEMStabilization(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
@@ -613,6 +638,18 @@ inline const char* DGBackendToString(DGBackend backend)
   return "dg";
 }
 
+inline const char* DeviceBackendToString(DeviceBackend backend)
+{
+  switch (backend)
+  {
+  case DeviceBackend::CPU:
+    return "cpu";
+  case DeviceBackend::CUDA:
+    return "cuda";
+  }
+  return "cpu";
+}
+
 inline std::string CaseDirFromFile(const char* file)
 {
   return std::filesystem::path(file).parent_path().string();
@@ -795,6 +832,7 @@ inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
   run_cfg.case_config = case_cfg;
   run_cfg.opts = opts;
   run_cfg.igr_opts = igr_opts;
+  run_cfg.device_backend = ParseDeviceBackend(opts.device);
   run_cfg.dg_backend = ParseDGBackend(opts.dg_backend);
   run_cfg.dgsem_stab = ParseDGSEMStabilization(opts.dgsem_stab);
   run_cfg.dgsem_volume_flux = ParseDGSEMVolumeFlux(opts.dgsem_volume_flux);
