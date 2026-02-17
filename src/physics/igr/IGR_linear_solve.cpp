@@ -217,7 +217,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     src_coef_->SetRhoFloor(rho_floor_);
   }
 
-  // --- IMPORTANT: tell MFEM we will re-use the same mfem::ParBilinearForm again ---
+  // Keep MFEM form internals consistent before re-assembly across policy modes.
   a_->Update();
   b_->Update();
   b_->UseFastAssembly(use_partial_assembly_);

@@ -968,6 +968,432 @@ struct PackedBoundaryFaceEulerRusanovKernel
   }
 };
 
+// Q-parallel variants: each thread handles one (face, q) sample and scatters
+// contributions atomically. A separate reduction kernel computes per-face max
+// characteristic speed.
+struct PackedInteriorFaceEulerRusanovQKernel
+{
+  int dof = 0;
+  int neq = 0;
+  int dim = 0;
+  int nq = 0;
+  int ldof = 0;
+  int sigma_ldof = 0;
+  real_t gamma = 1.4;
+  real_t sigma_rho_floor = 1.0e-12;
+  bool use_sigma = false;
+  const int* state_map = nullptr;
+  const int* face_e1 = nullptr;
+  const int* face_e2 = nullptr;
+  const real_t* shape1 = nullptr;
+  const real_t* shape2 = nullptr;
+  const real_t* normals = nullptr;
+  const real_t* weights = nullptr;
+  const real_t* x = nullptr;
+  real_t* z = nullptr;
+  real_t* face_speed_q = nullptr;
+  const int* sigma_map = nullptr;
+  const real_t* sigma_vals = nullptr;
+  const real_t* sigma_shape1 = nullptr;
+  const real_t* sigma_shape2 = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int fq) const
+  {
+    const int f = fq / nq;
+    const int q = fq - f * nq;
+    const int e1 = face_e1[f];
+    const int e2 = face_e2[f];
+    const int state_off_1 = e1 * ldof;
+    const int state_off_2 = e2 * ldof;
+    const int face_q = f * nq + q;
+    const int shape_off = face_q * dof;
+    const int normal_off = face_q * dim;
+
+    real_t u1[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t u2[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t flux1[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t flux2[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t flux_hat[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t normal[3] = {0.0, 0.0, 0.0};
+
+    for (int d = 0; d < dim; ++d)
+    {
+      normal[d] = normals[normal_off + d];
+    }
+
+    for (int eq = 0; eq < neq; ++eq)
+    {
+      real_t lhs = 0.0;
+      real_t rhs = 0.0;
+      for (int i = 0; i < dof; ++i)
+      {
+        const real_t s1 = shape1[shape_off + i];
+        const real_t s2 = shape2[shape_off + i];
+        lhs += s1 * x[state_map[state_off_1 + i * neq + eq]];
+        rhs += s2 * x[state_map[state_off_2 + i * neq + eq]];
+      }
+      u1[eq] = lhs;
+      u2[eq] = rhs;
+    }
+
+    real_t sigma_1 = 0.0;
+    real_t sigma_2 = 0.0;
+    if (use_sigma)
+    {
+      const int sigma_shape_off = face_q * sigma_ldof;
+      const int sigma_map_off_1 = e1 * sigma_ldof;
+      const int sigma_map_off_2 = e2 * sigma_ldof;
+      for (int k = 0; k < sigma_ldof; ++k)
+      {
+        sigma_1 += sigma_shape1[sigma_shape_off + k] *
+                   sigma_vals[sigma_map[sigma_map_off_1 + k]];
+        sigma_2 += sigma_shape2[sigma_shape_off + k] *
+                   sigma_vals[sigma_map[sigma_map_off_2 + k]];
+      }
+    }
+
+    real_t speed1 = 0.0;
+    real_t speed2 = 0.0;
+    ComputeEulerFluxDotN_(u1, normal, dim, gamma, flux1, speed1);
+    ComputeEulerFluxDotN_(u2, normal, dim, gamma, flux2, speed2);
+
+    if (use_sigma)
+    {
+      AddSigmaDotNTerms_(
+        u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
+      AddSigmaDotNTerms_(
+        u2, normal, dim, sigma_2, sigma_rho_floor, flux2);
+    }
+
+    real_t normal_norm2 = 0.0;
+    for (int d = 0; d < dim; ++d)
+    {
+      normal_norm2 += normal[d] * normal[d];
+    }
+    const real_t speed_q = fmax(speed1, speed2);
+    const real_t scaled_max_speed = speed_q * sqrt(normal_norm2);
+    face_speed_q[fq] = speed_q;
+
+    for (int eq = 0; eq < neq; ++eq)
+    {
+      flux_hat[eq] = 0.5 * (scaled_max_speed * (u1[eq] - u2[eq]) + flux1[eq] +
+                            flux2[eq]);
+    }
+
+    const real_t wq = weights[face_q];
+    for (int i = 0; i < dof; ++i)
+    {
+      const real_t c1 = -wq * shape1[shape_off + i];
+      const real_t c2 = +wq * shape2[shape_off + i];
+      for (int eq = 0; eq < neq; ++eq)
+      {
+        const int zi1 = state_map[state_off_1 + i * neq + eq];
+        const int zi2 = state_map[state_off_2 + i * neq + eq];
+        AtomicAdd(z[zi1], c1 * flux_hat[eq]);
+        AtomicAdd(z[zi2], c2 * flux_hat[eq]);
+      }
+    }
+  }
+};
+
+struct PackedSharedFaceEulerRusanovQKernel
+{
+  int dof = 0;
+  int neq = 0;
+  int dim = 0;
+  int nq = 0;
+  int ldof = 0;
+  int sigma_ldof = 0;
+  real_t gamma = 1.4;
+  real_t sigma_rho_floor = 1.0e-12;
+  bool use_sigma = false;
+  const int* state_map = nullptr;
+  const int* face_e1 = nullptr;
+  const int* face_nbr_vdof_map = nullptr;
+  const real_t* shape1 = nullptr;
+  const real_t* shape2 = nullptr;
+  const real_t* normals = nullptr;
+  const real_t* weights = nullptr;
+  const real_t* x = nullptr;
+  const real_t* x_nbr = nullptr;
+  real_t* z = nullptr;
+  real_t* face_speed_q = nullptr;
+  const int* sigma_map = nullptr;
+  const real_t* sigma_vals = nullptr;
+  const int* sigma_nbr_dof_map = nullptr;
+  const real_t* sigma_nbr_vals = nullptr;
+  const real_t* sigma_shape1 = nullptr;
+  const real_t* sigma_shape2 = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int fq) const
+  {
+    const int f = fq / nq;
+    const int q = fq - f * nq;
+    const int e1 = face_e1[f];
+    const int state_off_1 = e1 * ldof;
+    const int nbr_map_off = f * ldof;
+    const int face_q = f * nq + q;
+    const int shape_off = face_q * dof;
+    const int normal_off = face_q * dim;
+
+    real_t u1[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t u2[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t flux1[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t flux2[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t flux_hat[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t normal[3] = {0.0, 0.0, 0.0};
+
+    for (int d = 0; d < dim; ++d)
+    {
+      normal[d] = normals[normal_off + d];
+    }
+
+    for (int eq = 0; eq < neq; ++eq)
+    {
+      real_t lhs = 0.0;
+      real_t rhs = 0.0;
+      for (int i = 0; i < dof; ++i)
+      {
+        const real_t s1 = shape1[shape_off + i];
+        const real_t s2 = shape2[shape_off + i];
+        const int vd_nbr = face_nbr_vdof_map[nbr_map_off + i * neq + eq];
+        const real_t u2_i = (vd_nbr >= 0) ? x_nbr[vd_nbr] : -x_nbr[-1 - vd_nbr];
+        lhs += s1 * x[state_map[state_off_1 + i * neq + eq]];
+        rhs += s2 * u2_i;
+      }
+      u1[eq] = lhs;
+      u2[eq] = rhs;
+    }
+
+    real_t sigma_1 = 0.0;
+    real_t sigma_2 = 0.0;
+    if (use_sigma)
+    {
+      const int sigma_shape_off = face_q * sigma_ldof;
+      const int sigma_map_off_1 = e1 * sigma_ldof;
+      const int sigma_map_off_2 = f * sigma_ldof;
+      for (int k = 0; k < sigma_ldof; ++k)
+      {
+        const int sigma_nbr_d = sigma_nbr_dof_map[sigma_map_off_2 + k];
+        const real_t sigma_nbr =
+          (sigma_nbr_d >= 0) ? sigma_nbr_vals[sigma_nbr_d]
+                             : -sigma_nbr_vals[-1 - sigma_nbr_d];
+        sigma_1 += sigma_shape1[sigma_shape_off + k] *
+                   sigma_vals[sigma_map[sigma_map_off_1 + k]];
+        sigma_2 += sigma_shape2[sigma_shape_off + k] * sigma_nbr;
+      }
+    }
+
+    real_t speed1 = 0.0;
+    real_t speed2 = 0.0;
+    ComputeEulerFluxDotN_(u1, normal, dim, gamma, flux1, speed1);
+    ComputeEulerFluxDotN_(u2, normal, dim, gamma, flux2, speed2);
+
+    if (use_sigma)
+    {
+      AddSigmaDotNTerms_(
+        u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
+      AddSigmaDotNTerms_(
+        u2, normal, dim, sigma_2, sigma_rho_floor, flux2);
+    }
+
+    real_t normal_norm2 = 0.0;
+    for (int d = 0; d < dim; ++d)
+    {
+      normal_norm2 += normal[d] * normal[d];
+    }
+    const real_t speed_q = fmax(speed1, speed2);
+    const real_t scaled_max_speed = speed_q * sqrt(normal_norm2);
+    face_speed_q[fq] = speed_q;
+
+    for (int eq = 0; eq < neq; ++eq)
+    {
+      flux_hat[eq] = 0.5 * (scaled_max_speed * (u1[eq] - u2[eq]) + flux1[eq] +
+                            flux2[eq]);
+    }
+
+    const real_t wq = weights[face_q];
+    for (int i = 0; i < dof; ++i)
+    {
+      const real_t c1 = -wq * shape1[shape_off + i];
+      for (int eq = 0; eq < neq; ++eq)
+      {
+        const int zi1 = state_map[state_off_1 + i * neq + eq];
+        AtomicAdd(z[zi1], c1 * flux_hat[eq]);
+      }
+    }
+  }
+};
+
+struct PackedBoundaryFaceEulerRusanovQKernel
+{
+  int dof = 0;
+  int neq = 0;
+  int dim = 0;
+  int nq = 0;
+  int ldof = 0;
+  int sigma_ldof = 0;
+  real_t gamma_default = 1.4;
+  real_t sigma_rho_floor = 1.0e-12;
+  bool use_sigma = false;
+  int bdr_max_attr = 0;
+  const int* state_map = nullptr;
+  const int* face_e1 = nullptr;
+  const int* face_attr = nullptr;
+  const real_t* shape1 = nullptr;
+  const real_t* normals = nullptr;
+  const real_t* weights = nullptr;
+  const real_t* x = nullptr;
+  real_t* z = nullptr;
+  real_t* face_speed_q = nullptr;
+  const int* bdr_type_by_attr = nullptr;
+  const real_t* bdr_gamma_by_attr = nullptr;
+  const real_t* bdr_pressure_by_attr = nullptr;
+  const real_t* bdr_state_by_attr = nullptr;
+  const int* sigma_map = nullptr;
+  const real_t* sigma_vals = nullptr;
+  const real_t* sigma_shape1 = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int fq) const
+  {
+    const int f = fq / nq;
+    const int q = fq - f * nq;
+    const int e1 = face_e1[f];
+    const int state_off = e1 * ldof;
+    const int attr = face_attr[f];
+    if (attr <= 0 || attr > bdr_max_attr)
+    {
+      face_speed_q[fq] = 0.0;
+      return;
+    }
+
+    const int bdr_type = bdr_type_by_attr[attr];
+    if (bdr_type == static_cast<int>(DeviceBoundaryType::Unsupported))
+    {
+      face_speed_q[fq] = 0.0;
+      return;
+    }
+
+    real_t gamma = bdr_gamma_by_attr[attr];
+    if (!(gamma > 0.0))
+    {
+      gamma = gamma_default;
+    }
+    const real_t p_out = bdr_pressure_by_attr[attr];
+    const real_t* state_ref = bdr_state_by_attr + attr * neq;
+
+    const int face_q = f * nq + q;
+    const int shape_off = face_q * dof;
+    const int normal_off = face_q * dim;
+    const int sigma_map_off = e1 * sigma_ldof;
+
+    real_t u1[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t u2[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t flux1[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t flux2[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t flux_hat[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    real_t normal[3] = {0.0, 0.0, 0.0};
+
+    for (int d = 0; d < dim; ++d)
+    {
+      normal[d] = normals[normal_off + d];
+    }
+
+    for (int eq = 0; eq < neq; ++eq)
+    {
+      real_t lhs = 0.0;
+      for (int i = 0; i < dof; ++i)
+      {
+        const real_t s1 = shape1[shape_off + i];
+        lhs += s1 * x[state_map[state_off + i * neq + eq]];
+      }
+      u1[eq] = lhs;
+    }
+
+    if (!EvalBoundaryGhostEuler_(bdr_type,
+                                 dim,
+                                 neq,
+                                 gamma,
+                                 p_out,
+                                 state_ref,
+                                 normal,
+                                 u1,
+                                 u2))
+    {
+      face_speed_q[fq] = 0.0;
+      return;
+    }
+
+    real_t sigma_1 = 0.0;
+    if (use_sigma)
+    {
+      const int sigma_shape_off = face_q * sigma_ldof;
+      for (int k = 0; k < sigma_ldof; ++k)
+      {
+        sigma_1 += sigma_shape1[sigma_shape_off + k] *
+                   sigma_vals[sigma_map[sigma_map_off + k]];
+      }
+    }
+
+    real_t speed1 = 0.0;
+    real_t speed2 = 0.0;
+    ComputeEulerFluxDotN_(u1, normal, dim, gamma, flux1, speed1);
+    ComputeEulerFluxDotN_(u2, normal, dim, gamma, flux2, speed2);
+
+    if (use_sigma)
+    {
+      AddSigmaDotNTerms_(
+        u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
+      AddSigmaDotNTerms_(
+        u2, normal, dim, sigma_1, sigma_rho_floor, flux2);
+    }
+
+    real_t normal_norm2 = 0.0;
+    for (int d = 0; d < dim; ++d)
+    {
+      normal_norm2 += normal[d] * normal[d];
+    }
+    const real_t speed_q = fmax(speed1, speed2);
+    const real_t scaled_max_speed = speed_q * sqrt(normal_norm2);
+    face_speed_q[fq] = speed_q;
+
+    for (int eq = 0; eq < neq; ++eq)
+    {
+      flux_hat[eq] = 0.5 * (scaled_max_speed * (u1[eq] - u2[eq]) + flux1[eq] +
+                            flux2[eq]);
+    }
+
+    const real_t wq = weights[face_q];
+    for (int i = 0; i < dof; ++i)
+    {
+      const real_t c1 = -wq * shape1[shape_off + i];
+      for (int eq = 0; eq < neq; ++eq)
+      {
+        const int zi = state_map[state_off + i * neq + eq];
+        AtomicAdd(z[zi], c1 * flux_hat[eq]);
+      }
+    }
+  }
+};
+
+struct FaceSpeedQReduceKernel
+{
+  int nq = 0;
+  const real_t* face_speed_q = nullptr;
+  real_t* face_speed = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int f) const
+  {
+    const int off = f * nq;
+    real_t max_speed = 0.0;
+    for (int q = 0; q < nq; ++q)
+    {
+      max_speed = fmax(max_speed, face_speed_q[off + q]);
+    }
+    face_speed[f] = max_speed;
+  }
+};
+
 struct MaxSpeedReductionBody
 {
   const real_t* speed = nullptr;

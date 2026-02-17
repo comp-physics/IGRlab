@@ -18,22 +18,22 @@ struct FaceQFProjectInfo
   int qf_size = 0;
 };
 
-struct FaceQFProjectDim1
+struct FaceQFProjectDim1Threaded
 {
   int vdim = 0;
+  int nf = 0;
   const mfem::real_t* f = nullptr;
   mfem::real_t* q = nullptr;
 
   MFEM_HOST_DEVICE void operator()(int face) const
   {
-    for (int c = 0; c < vdim; ++c)
-    {
-      q[c + vdim * face] = f[c + vdim * face];
-    }
+    auto F = mfem::Reshape(f, vdim, nf);
+    auto Q = mfem::Reshape(q, vdim, nf);
+    MFEM_FOREACH_THREAD(c, x, vdim) { Q(c, face) = F(c, face); }
   }
 };
 
-struct FaceQFProjectDim2
+struct FaceQFProjectDim2Threaded
 {
   int nd1d = 0;
   int nq1d = 0;
@@ -48,9 +48,9 @@ struct FaceQFProjectDim2
     auto Bm = mfem::Reshape(B, nq1d, nd1d);
     auto F = mfem::Reshape(f, nd1d, vdim, nf);
     auto Q = mfem::Reshape(q, vdim, nq1d, nf);
-    for (int c = 0; c < vdim; ++c)
+    MFEM_FOREACH_THREAD(qpt, x, nq1d)
     {
-      for (int qpt = 0; qpt < nq1d; ++qpt)
+      MFEM_FOREACH_THREAD(c, y, vdim)
       {
         mfem::real_t val = 0.0;
         for (int d = 0; d < nd1d; ++d)
@@ -63,7 +63,7 @@ struct FaceQFProjectDim2
   }
 };
 
-struct FaceQFProjectDim3
+struct FaceQFProjectDim3Threaded
 {
   int nd1d = 0;
   int nq1d = 0;
@@ -78,11 +78,11 @@ struct FaceQFProjectDim3
     auto Bm = mfem::Reshape(B, nq1d, nd1d);
     auto F = mfem::Reshape(f, nd1d, nd1d, vdim, nf);
     auto Q = mfem::Reshape(q, vdim, nq1d, nq1d, nf);
-    for (int c = 0; c < vdim; ++c)
+    MFEM_FOREACH_THREAD(q1, x, nq1d)
     {
-      for (int q2 = 0; q2 < nq1d; ++q2)
+      MFEM_FOREACH_THREAD(q2, y, nq1d)
       {
-        for (int q1 = 0; q1 < nq1d; ++q1)
+        MFEM_FOREACH_THREAD(c, z, vdim)
         {
           mfem::real_t val = 0.0;
           for (int d2 = 0; d2 < nd1d; ++d2)
@@ -145,17 +145,18 @@ inline FaceQFProjectInfo ProjectFaceQuadratureValues(
 
   if (info.dim == 1)
   {
-    FaceQFProjectDim1 kernel;
+    FaceQFProjectDim1Threaded kernel;
     kernel.vdim = info.vdim;
+    kernel.nf = info.nf;
     kernel.f = f_data;
     kernel.q = q_data;
-    mfem::forall(info.nf, kernel);
+    mfem::forall_2D(info.nf, info.vdim, 1, kernel);
     return info;
   }
 
   if (info.dim == 2)
   {
-    FaceQFProjectDim2 kernel;
+    FaceQFProjectDim2Threaded kernel;
     kernel.nd1d = info.nd1d;
     kernel.nq1d = info.nq1d;
     kernel.vdim = info.vdim;
@@ -163,13 +164,13 @@ inline FaceQFProjectInfo ProjectFaceQuadratureValues(
     kernel.B = B_data;
     kernel.f = f_data;
     kernel.q = q_data;
-    mfem::forall(info.nf, kernel);
+    mfem::forall_2D(info.nf, info.nq1d, info.vdim, kernel);
     return info;
   }
 
   if (info.dim == 3)
   {
-    FaceQFProjectDim3 kernel;
+    FaceQFProjectDim3Threaded kernel;
     kernel.nd1d = info.nd1d;
     kernel.nq1d = info.nq1d;
     kernel.vdim = info.vdim;
@@ -177,7 +178,7 @@ inline FaceQFProjectInfo ProjectFaceQuadratureValues(
     kernel.B = B_data;
     kernel.f = f_data;
     kernel.q = q_data;
-    mfem::forall(info.nf, kernel);
+    mfem::forall_3D(info.nf, info.nq1d, info.nq1d, info.vdim, kernel);
     return info;
   }
 

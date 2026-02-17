@@ -176,6 +176,38 @@ if (MFEM_USE_CUDA AND TARGET inoue_hattori_stationary_shock_1dy)
       SKIP_REGULAR_EXPRESSION "^SKIP:"
     )
   endforeach()
+
+  set(dg_nsys_script
+      "${CMAKE_SOURCE_DIR}/tests/scripts/profile_dg_igr_nsys.sh")
+  add_test(NAME dg_igr_inoue_dg_nsys_profile
+    COMMAND ${CMAKE_COMMAND} -E env
+            OMP_NUM_THREADS=1
+            /bin/bash
+            ${dg_nsys_script}
+            $<TARGET_FILE:inoue_hattori_stationary_shock_1dy>
+  )
+  set_tests_properties(dg_igr_inoue_dg_nsys_profile PROPERTIES
+    LABELS "perf;cuda;profiling"
+    TIMEOUT 1200
+    DISABLED TRUE
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+  )
+
+  set(dg_ncu_script
+      "${CMAKE_SOURCE_DIR}/tests/scripts/profile_dg_igr_ncu.sh")
+  add_test(NAME dg_igr_inoue_dg_ncu_profile
+    COMMAND ${CMAKE_COMMAND} -E env
+            OMP_NUM_THREADS=1
+            /bin/bash
+            ${dg_ncu_script}
+            $<TARGET_FILE:inoue_hattori_stationary_shock_1dy>
+  )
+  set_tests_properties(dg_igr_inoue_dg_ncu_profile PROPERTIES
+    LABELS "perf;cuda;profiling"
+    TIMEOUT 1200
+    DISABLED TRUE
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+  )
 endif()
 
 if (TARGET inoue_hattori_stationary_shock_1dy)

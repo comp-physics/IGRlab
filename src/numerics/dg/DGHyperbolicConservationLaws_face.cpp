@@ -170,6 +170,7 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   face_int_ip1_ref_.SetSize(0);
   face_int_ip2_ref_.SetSize(0);
   face_int_speed_.SetSize(0);
+  face_int_speed_q_.SetSize(0);
   face_bdr_e1_.SetSize(0);
   face_bdr_attr_.SetSize(0);
   face_bdr_mesh_id_.SetSize(0);
@@ -178,6 +179,7 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   face_bdr_weights_.SetSize(0);
   face_bdr_ip1_ref_.SetSize(0);
   face_bdr_speed_.SetSize(0);
+  face_bdr_speed_q_.SetSize(0);
   face_shared_e1_.SetSize(0);
   face_shared_nbr_vdof_map_.SetSize(0);
   face_shared_shape1_.SetSize(0);
@@ -187,6 +189,7 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   face_shared_ip1_ref_.SetSize(0);
   face_shared_ip2_ref_.SetSize(0);
   face_shared_speed_.SetSize(0);
+  face_shared_speed_q_.SetSize(0);
   face_bdr_policy_ready_ = false;
   face_sigma_ready_ = false;
   face_sigma_fes_ = nullptr;
@@ -634,6 +637,8 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
             face_int_ip2_ref_.HostWrite());
   face_int_speed_.SetSize(face_int_e1_.Size());
   face_int_speed_ = 0.0;
+  face_int_speed_q_.SetSize(face_int_e1_.Size() * std::max(face_int_nq_, 0));
+  face_int_speed_q_ = 0.0;
 
   face_bdr_e1_.SetSize(static_cast<int>(bdr_e1.size()));
   face_bdr_attr_.SetSize(static_cast<int>(bdr_attr.size()));
@@ -660,6 +665,8 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
             face_bdr_ip1_ref_.HostWrite());
   face_bdr_speed_.SetSize(face_bdr_e1_.Size());
   face_bdr_speed_ = 0.0;
+  face_bdr_speed_q_.SetSize(face_bdr_e1_.Size() * std::max(face_bdr_nq_, 0));
+  face_bdr_speed_q_ = 0.0;
 
   face_shared_e1_.SetSize(static_cast<int>(shared_e1.size()));
   face_shared_nbr_vdof_map_.SetSize(static_cast<int>(shared_nbr_vdof_map.size()));
@@ -697,6 +704,8 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
             face_shared_ip2_ref_.HostWrite());
   face_shared_speed_.SetSize(face_shared_e1_.Size());
   face_shared_speed_ = 0.0;
+  face_shared_speed_q_.SetSize(face_shared_e1_.Size() * std::max(face_shared_nq_, 0));
+  face_shared_speed_q_ = 0.0;
 
   if (!BuildBoundaryPolicyData_())
   {
@@ -1039,6 +1048,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   const int dof = face_elem_dof_;
   const int neq = num_equations;
   const int ldof = dof * neq;
+  const bool use_q_parallel =
+    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FACE_Q_PARALLEL", true);
 
   const int* sigma_map = nullptr;
   const real_t* sigma_vals = nullptr;
@@ -1048,8 +1059,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   const real_t* shared_sigma_shape1 = nullptr;
   const real_t* shared_sigma_shape2 = nullptr;
   const int* shared_sigma_nbr_dof_map = nullptr;
-  Vector x_nbr_data;
-  Vector sigma_nbr_data;
+  const real_t* x_nbr_vals = nullptr;
+  const real_t* sigma_nbr_vals = nullptr;
   int sigma_ldof = 0;
   if (use_sigma)
   {
@@ -1067,31 +1078,68 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   const int n_int = face_int_e1_.Size();
   if (n_int > 0)
   {
-    PackedInteriorFaceEulerRusanovKernel int_kernel;
-    int_kernel.dof = dof;
-    int_kernel.neq = neq;
-    int_kernel.dim = dim;
-    int_kernel.nq = face_int_nq_;
-    int_kernel.ldof = ldof;
-    int_kernel.sigma_ldof = sigma_ldof;
-    int_kernel.gamma = dgsem_gamma_;
-    int_kernel.sigma_rho_floor = sigma_rho_floor;
-    int_kernel.use_sigma = use_sigma;
-    int_kernel.state_map = invmass_elem_vdof_map_.Read();
-    int_kernel.face_e1 = face_int_e1_.Read();
-    int_kernel.face_e2 = face_int_e2_.Read();
-    int_kernel.shape1 = face_int_shape1_.Read();
-    int_kernel.shape2 = face_int_shape2_.Read();
-    int_kernel.normals = face_int_normals_.Read();
-    int_kernel.weights = face_int_weights_.Read();
-    int_kernel.x = x_in.Read();
-    int_kernel.z = z_inout.ReadWrite();
-    int_kernel.face_speed = face_int_speed_.Write();
-    int_kernel.sigma_map = sigma_map;
-    int_kernel.sigma_vals = sigma_vals;
-    int_kernel.sigma_shape1 = int_sigma_shape1;
-    int_kernel.sigma_shape2 = int_sigma_shape2;
-    mfem::forall(n_int, int_kernel);
+    if (use_q_parallel)
+    {
+      PackedInteriorFaceEulerRusanovQKernel int_kernel;
+      int_kernel.dof = dof;
+      int_kernel.neq = neq;
+      int_kernel.dim = dim;
+      int_kernel.nq = face_int_nq_;
+      int_kernel.ldof = ldof;
+      int_kernel.sigma_ldof = sigma_ldof;
+      int_kernel.gamma = dgsem_gamma_;
+      int_kernel.sigma_rho_floor = sigma_rho_floor;
+      int_kernel.use_sigma = use_sigma;
+      int_kernel.state_map = invmass_elem_vdof_map_.Read();
+      int_kernel.face_e1 = face_int_e1_.Read();
+      int_kernel.face_e2 = face_int_e2_.Read();
+      int_kernel.shape1 = face_int_shape1_.Read();
+      int_kernel.shape2 = face_int_shape2_.Read();
+      int_kernel.normals = face_int_normals_.Read();
+      int_kernel.weights = face_int_weights_.Read();
+      int_kernel.x = x_in.Read();
+      int_kernel.z = z_inout.ReadWrite();
+      int_kernel.face_speed_q = face_int_speed_q_.Write();
+      int_kernel.sigma_map = sigma_map;
+      int_kernel.sigma_vals = sigma_vals;
+      int_kernel.sigma_shape1 = int_sigma_shape1;
+      int_kernel.sigma_shape2 = int_sigma_shape2;
+      mfem::forall(n_int * face_int_nq_, int_kernel);
+
+      FaceSpeedQReduceKernel int_speed_reduce;
+      int_speed_reduce.nq = face_int_nq_;
+      int_speed_reduce.face_speed_q = face_int_speed_q_.Read();
+      int_speed_reduce.face_speed = face_int_speed_.Write();
+      mfem::forall(n_int, int_speed_reduce);
+    }
+    else
+    {
+      PackedInteriorFaceEulerRusanovKernel int_kernel;
+      int_kernel.dof = dof;
+      int_kernel.neq = neq;
+      int_kernel.dim = dim;
+      int_kernel.nq = face_int_nq_;
+      int_kernel.ldof = ldof;
+      int_kernel.sigma_ldof = sigma_ldof;
+      int_kernel.gamma = dgsem_gamma_;
+      int_kernel.sigma_rho_floor = sigma_rho_floor;
+      int_kernel.use_sigma = use_sigma;
+      int_kernel.state_map = invmass_elem_vdof_map_.Read();
+      int_kernel.face_e1 = face_int_e1_.Read();
+      int_kernel.face_e2 = face_int_e2_.Read();
+      int_kernel.shape1 = face_int_shape1_.Read();
+      int_kernel.shape2 = face_int_shape2_.Read();
+      int_kernel.normals = face_int_normals_.Read();
+      int_kernel.weights = face_int_weights_.Read();
+      int_kernel.x = x_in.Read();
+      int_kernel.z = z_inout.ReadWrite();
+      int_kernel.face_speed = face_int_speed_.Write();
+      int_kernel.sigma_map = sigma_map;
+      int_kernel.sigma_vals = sigma_vals;
+      int_kernel.sigma_shape1 = int_sigma_shape1;
+      int_kernel.sigma_shape2 = int_sigma_shape2;
+      mfem::forall(n_int, int_kernel);
+    }
   }
 
   const int n_bdr = face_bdr_e1_.Size();
@@ -1103,41 +1151,81 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       return false;
     }
 
-    PackedBoundaryFaceEulerRusanovKernel bdr_kernel;
-    bdr_kernel.dof = dof;
-    bdr_kernel.neq = neq;
-    bdr_kernel.dim = dim;
-    bdr_kernel.nq = face_bdr_nq_;
-    bdr_kernel.ldof = ldof;
-    bdr_kernel.sigma_ldof = sigma_ldof;
-    bdr_kernel.gamma_default = dgsem_gamma_;
-    bdr_kernel.sigma_rho_floor = sigma_rho_floor;
-    bdr_kernel.use_sigma = use_sigma;
-    bdr_kernel.bdr_max_attr = face_bdr_max_attr_;
-    bdr_kernel.state_map = invmass_elem_vdof_map_.Read();
-    bdr_kernel.face_e1 = face_bdr_e1_.Read();
-    bdr_kernel.face_attr = face_bdr_attr_.Read();
-    bdr_kernel.shape1 = face_bdr_shape1_.Read();
-    bdr_kernel.normals = face_bdr_normals_.Read();
-    bdr_kernel.weights = face_bdr_weights_.Read();
-    bdr_kernel.x = x_in.Read();
-    bdr_kernel.z = z_inout.ReadWrite();
-    bdr_kernel.face_speed = face_bdr_speed_.Write();
-    bdr_kernel.bdr_type_by_attr = face_bdr_type_by_attr_.Read();
-    bdr_kernel.bdr_gamma_by_attr = face_bdr_gamma_by_attr_.Read();
-    bdr_kernel.bdr_pressure_by_attr = face_bdr_pressure_by_attr_.Read();
-    bdr_kernel.bdr_state_by_attr = face_bdr_state_by_attr_.Read();
-    bdr_kernel.sigma_map = sigma_map;
-    bdr_kernel.sigma_vals = sigma_vals;
-    bdr_kernel.sigma_shape1 = bdr_sigma_shape1;
-    mfem::forall(n_bdr, bdr_kernel);
+    if (use_q_parallel)
+    {
+      PackedBoundaryFaceEulerRusanovQKernel bdr_kernel;
+      bdr_kernel.dof = dof;
+      bdr_kernel.neq = neq;
+      bdr_kernel.dim = dim;
+      bdr_kernel.nq = face_bdr_nq_;
+      bdr_kernel.ldof = ldof;
+      bdr_kernel.sigma_ldof = sigma_ldof;
+      bdr_kernel.gamma_default = dgsem_gamma_;
+      bdr_kernel.sigma_rho_floor = sigma_rho_floor;
+      bdr_kernel.use_sigma = use_sigma;
+      bdr_kernel.bdr_max_attr = face_bdr_max_attr_;
+      bdr_kernel.state_map = invmass_elem_vdof_map_.Read();
+      bdr_kernel.face_e1 = face_bdr_e1_.Read();
+      bdr_kernel.face_attr = face_bdr_attr_.Read();
+      bdr_kernel.shape1 = face_bdr_shape1_.Read();
+      bdr_kernel.normals = face_bdr_normals_.Read();
+      bdr_kernel.weights = face_bdr_weights_.Read();
+      bdr_kernel.x = x_in.Read();
+      bdr_kernel.z = z_inout.ReadWrite();
+      bdr_kernel.face_speed_q = face_bdr_speed_q_.Write();
+      bdr_kernel.bdr_type_by_attr = face_bdr_type_by_attr_.Read();
+      bdr_kernel.bdr_gamma_by_attr = face_bdr_gamma_by_attr_.Read();
+      bdr_kernel.bdr_pressure_by_attr = face_bdr_pressure_by_attr_.Read();
+      bdr_kernel.bdr_state_by_attr = face_bdr_state_by_attr_.Read();
+      bdr_kernel.sigma_map = sigma_map;
+      bdr_kernel.sigma_vals = sigma_vals;
+      bdr_kernel.sigma_shape1 = bdr_sigma_shape1;
+      mfem::forall(n_bdr * face_bdr_nq_, bdr_kernel);
+
+      FaceSpeedQReduceKernel bdr_speed_reduce;
+      bdr_speed_reduce.nq = face_bdr_nq_;
+      bdr_speed_reduce.face_speed_q = face_bdr_speed_q_.Read();
+      bdr_speed_reduce.face_speed = face_bdr_speed_.Write();
+      mfem::forall(n_bdr, bdr_speed_reduce);
+    }
+    else
+    {
+      PackedBoundaryFaceEulerRusanovKernel bdr_kernel;
+      bdr_kernel.dof = dof;
+      bdr_kernel.neq = neq;
+      bdr_kernel.dim = dim;
+      bdr_kernel.nq = face_bdr_nq_;
+      bdr_kernel.ldof = ldof;
+      bdr_kernel.sigma_ldof = sigma_ldof;
+      bdr_kernel.gamma_default = dgsem_gamma_;
+      bdr_kernel.sigma_rho_floor = sigma_rho_floor;
+      bdr_kernel.use_sigma = use_sigma;
+      bdr_kernel.bdr_max_attr = face_bdr_max_attr_;
+      bdr_kernel.state_map = invmass_elem_vdof_map_.Read();
+      bdr_kernel.face_e1 = face_bdr_e1_.Read();
+      bdr_kernel.face_attr = face_bdr_attr_.Read();
+      bdr_kernel.shape1 = face_bdr_shape1_.Read();
+      bdr_kernel.normals = face_bdr_normals_.Read();
+      bdr_kernel.weights = face_bdr_weights_.Read();
+      bdr_kernel.x = x_in.Read();
+      bdr_kernel.z = z_inout.ReadWrite();
+      bdr_kernel.face_speed = face_bdr_speed_.Write();
+      bdr_kernel.bdr_type_by_attr = face_bdr_type_by_attr_.Read();
+      bdr_kernel.bdr_gamma_by_attr = face_bdr_gamma_by_attr_.Read();
+      bdr_kernel.bdr_pressure_by_attr = face_bdr_pressure_by_attr_.Read();
+      bdr_kernel.bdr_state_by_attr = face_bdr_state_by_attr_.Read();
+      bdr_kernel.sigma_map = sigma_map;
+      bdr_kernel.sigma_vals = sigma_vals;
+      bdr_kernel.sigma_shape1 = bdr_sigma_shape1;
+      mfem::forall(n_bdr, bdr_kernel);
+    }
   }
 
   const int n_shared = face_shared_e1_.Size();
   if (n_shared > 0)
   {
 #ifdef MFEM_USE_MPI
-    const auto* pfes = dynamic_cast<const ParFiniteElementSpace*>(&vfes);
+    auto* pfes = dynamic_cast<ParFiniteElementSpace*>(&vfes);
     if (!pfes)
     {
       max_face_speed = 0.0;
@@ -1145,26 +1233,33 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
     }
     MFEM_VERIFY(x_in.Size() == pfes->GetVSize(),
                 "DG shared-face device assembly expects local L-vector size.");
-    x_nbr_data = mfem::GetLVectorFaceNbrData(vfes, x_in, mfem::FaceType::Interior);
+
+    if (!face_state_face_nbr_alias_ ||
+        face_state_face_nbr_alias_->ParFESpace() != pfes)
+    {
+      face_state_face_nbr_alias_ = std::make_unique<ParGridFunction>(pfes);
+    }
+    face_state_face_nbr_alias_->MakeRef(pfes, const_cast<Vector&>(x_in), 0);
+    face_state_face_nbr_alias_->ExchangeFaceNbrData();
+    const Vector& x_nbr_data = face_state_face_nbr_alias_->FaceNbrData();
     if (x_nbr_data.Size() == 0)
     {
       max_face_speed = 0.0;
       return false;
     }
+    x_nbr_vals = x_nbr_data.Read();
 
-    const real_t* sigma_nbr_vals = nullptr;
     if (use_sigma)
     {
-      const FiniteElementSpace* sfes = sigma_field->ParFESpace();
+      const auto* sfes = dynamic_cast<const ParFiniteElementSpace*>(sigma_field->ParFESpace());
       if (!sfes)
       {
         max_face_speed = 0.0;
         return false;
       }
       const_cast<ParGridFunction*>(sigma_field)->ExchangeFaceNbrData();
-      sigma_nbr_data = mfem::GetLVectorFaceNbrData(*sfes,
-                                                   *sigma_field,
-                                                   mfem::FaceType::Interior);
+      const Vector& sigma_nbr_data =
+        const_cast<ParGridFunction*>(sigma_field)->FaceNbrData();
       if (sigma_nbr_data.Size() == 0)
       {
         max_face_speed = 0.0;
@@ -1173,34 +1268,74 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       sigma_nbr_vals = sigma_nbr_data.Read();
     }
 
-    PackedSharedFaceEulerRusanovKernel shared_kernel;
-    shared_kernel.dof = dof;
-    shared_kernel.neq = neq;
-    shared_kernel.dim = dim;
-    shared_kernel.nq = face_shared_nq_;
-    shared_kernel.ldof = ldof;
-    shared_kernel.sigma_ldof = sigma_ldof;
-    shared_kernel.gamma = dgsem_gamma_;
-    shared_kernel.sigma_rho_floor = sigma_rho_floor;
-    shared_kernel.use_sigma = use_sigma;
-    shared_kernel.state_map = invmass_elem_vdof_map_.Read();
-    shared_kernel.face_e1 = face_shared_e1_.Read();
-    shared_kernel.face_nbr_vdof_map = face_shared_nbr_vdof_map_.Read();
-    shared_kernel.shape1 = face_shared_shape1_.Read();
-    shared_kernel.shape2 = face_shared_shape2_.Read();
-    shared_kernel.normals = face_shared_normals_.Read();
-    shared_kernel.weights = face_shared_weights_.Read();
-    shared_kernel.x = x_in.Read();
-    shared_kernel.x_nbr = x_nbr_data.Read();
-    shared_kernel.z = z_inout.ReadWrite();
-    shared_kernel.face_speed = face_shared_speed_.Write();
-    shared_kernel.sigma_map = sigma_map;
-    shared_kernel.sigma_vals = sigma_vals;
-    shared_kernel.sigma_nbr_dof_map = shared_sigma_nbr_dof_map;
-    shared_kernel.sigma_nbr_vals = sigma_nbr_vals;
-    shared_kernel.sigma_shape1 = shared_sigma_shape1;
-    shared_kernel.sigma_shape2 = shared_sigma_shape2;
-    mfem::forall(n_shared, shared_kernel);
+    if (use_q_parallel)
+    {
+      PackedSharedFaceEulerRusanovQKernel shared_kernel;
+      shared_kernel.dof = dof;
+      shared_kernel.neq = neq;
+      shared_kernel.dim = dim;
+      shared_kernel.nq = face_shared_nq_;
+      shared_kernel.ldof = ldof;
+      shared_kernel.sigma_ldof = sigma_ldof;
+      shared_kernel.gamma = dgsem_gamma_;
+      shared_kernel.sigma_rho_floor = sigma_rho_floor;
+      shared_kernel.use_sigma = use_sigma;
+      shared_kernel.state_map = invmass_elem_vdof_map_.Read();
+      shared_kernel.face_e1 = face_shared_e1_.Read();
+      shared_kernel.face_nbr_vdof_map = face_shared_nbr_vdof_map_.Read();
+      shared_kernel.shape1 = face_shared_shape1_.Read();
+      shared_kernel.shape2 = face_shared_shape2_.Read();
+      shared_kernel.normals = face_shared_normals_.Read();
+      shared_kernel.weights = face_shared_weights_.Read();
+      shared_kernel.x = x_in.Read();
+      shared_kernel.x_nbr = x_nbr_vals;
+      shared_kernel.z = z_inout.ReadWrite();
+      shared_kernel.face_speed_q = face_shared_speed_q_.Write();
+      shared_kernel.sigma_map = sigma_map;
+      shared_kernel.sigma_vals = sigma_vals;
+      shared_kernel.sigma_nbr_dof_map = shared_sigma_nbr_dof_map;
+      shared_kernel.sigma_nbr_vals = sigma_nbr_vals;
+      shared_kernel.sigma_shape1 = shared_sigma_shape1;
+      shared_kernel.sigma_shape2 = shared_sigma_shape2;
+      mfem::forall(n_shared * face_shared_nq_, shared_kernel);
+
+      FaceSpeedQReduceKernel shared_speed_reduce;
+      shared_speed_reduce.nq = face_shared_nq_;
+      shared_speed_reduce.face_speed_q = face_shared_speed_q_.Read();
+      shared_speed_reduce.face_speed = face_shared_speed_.Write();
+      mfem::forall(n_shared, shared_speed_reduce);
+    }
+    else
+    {
+      PackedSharedFaceEulerRusanovKernel shared_kernel;
+      shared_kernel.dof = dof;
+      shared_kernel.neq = neq;
+      shared_kernel.dim = dim;
+      shared_kernel.nq = face_shared_nq_;
+      shared_kernel.ldof = ldof;
+      shared_kernel.sigma_ldof = sigma_ldof;
+      shared_kernel.gamma = dgsem_gamma_;
+      shared_kernel.sigma_rho_floor = sigma_rho_floor;
+      shared_kernel.use_sigma = use_sigma;
+      shared_kernel.state_map = invmass_elem_vdof_map_.Read();
+      shared_kernel.face_e1 = face_shared_e1_.Read();
+      shared_kernel.face_nbr_vdof_map = face_shared_nbr_vdof_map_.Read();
+      shared_kernel.shape1 = face_shared_shape1_.Read();
+      shared_kernel.shape2 = face_shared_shape2_.Read();
+      shared_kernel.normals = face_shared_normals_.Read();
+      shared_kernel.weights = face_shared_weights_.Read();
+      shared_kernel.x = x_in.Read();
+      shared_kernel.x_nbr = x_nbr_vals;
+      shared_kernel.z = z_inout.ReadWrite();
+      shared_kernel.face_speed = face_shared_speed_.Write();
+      shared_kernel.sigma_map = sigma_map;
+      shared_kernel.sigma_vals = sigma_vals;
+      shared_kernel.sigma_nbr_dof_map = shared_sigma_nbr_dof_map;
+      shared_kernel.sigma_nbr_vals = sigma_nbr_vals;
+      shared_kernel.sigma_shape1 = shared_sigma_shape1;
+      shared_kernel.sigma_shape2 = shared_sigma_shape2;
+      mfem::forall(n_shared, shared_kernel);
+    }
 #else
     max_face_speed = 0.0;
     return false;

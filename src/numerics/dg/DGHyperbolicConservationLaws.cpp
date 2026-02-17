@@ -150,9 +150,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   real_t device_face_speed = 0.0;
   if (Device::Allows(Backend::DEVICE_MASK))
   {
+    const bool default_force_nonlinearform_face = !UseDeviceFaceResidual_();
     const bool force_nonlinearform_face =
       ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FORCE_NLFORM_FACE",
-                                      mfem::Mpi::WorldSize() > 1);
+                                      default_force_nonlinearform_face);
     if (force_nonlinearform_face)
     {
       nonlinearForm->Mult(*x_eval, z_eval);

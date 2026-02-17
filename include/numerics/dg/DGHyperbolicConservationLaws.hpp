@@ -380,6 +380,8 @@ private:
   Vector face_int_ip2_ref_;
   /// Per-interior-face max speed scratch.
   mutable Vector face_int_speed_;
+  /// Per-interior-face quadrature-point speed scratch (face, q).
+  mutable Vector face_int_speed_q_;
 
   /// Packed boundary face -> element 1 index map.
   Array<int> face_bdr_e1_;
@@ -397,6 +399,8 @@ private:
   Vector face_bdr_ip1_ref_;
   /// Per-boundary-face max speed scratch.
   mutable Vector face_bdr_speed_;
+  /// Per-boundary-face quadrature-point speed scratch (face, q).
+  mutable Vector face_bdr_speed_q_;
   /// Packed shared face -> local element index map.
   Array<int> face_shared_e1_;
   /// Packed shared-face neighbor vector-dof map (face, node, eq).
@@ -415,6 +419,14 @@ private:
   Vector face_shared_ip2_ref_;
   /// Per-shared-face max speed scratch.
   mutable Vector face_shared_speed_;
+  /// Per-shared-face quadrature-point speed scratch (face, q).
+  mutable Vector face_shared_speed_q_;
+
+#ifdef MFEM_USE_MPI
+  /// Reused alias for state L-vector neighbor exchange (avoids per-step temp
+  /// ParGridFunction construction in packed shared-face assembly).
+  mutable std::unique_ptr<ParGridFunction> face_state_face_nbr_alias_;
+#endif
 
   /// Max boundary attribute value represented in policy arrays.
   int face_bdr_max_attr_ = 0;
