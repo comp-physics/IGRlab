@@ -265,6 +265,39 @@ ProbeSPD(const mfem::HypreParMatrix& A, MPI_Comm comm, int samples = 4)
   return out;
 }
 
+class ScopedEnvVar
+{
+public:
+  ScopedEnvVar(const char* name, const char* value)
+    : name_(name)
+  {
+    const char* prev = std::getenv(name_.c_str());
+    if (prev)
+    {
+      had_prev_ = true;
+      prev_value_ = prev;
+    }
+    setenv(name_.c_str(), value, 1);
+  }
+
+  ~ScopedEnvVar()
+  {
+    if (had_prev_)
+    {
+      setenv(name_.c_str(), prev_value_.c_str(), 1);
+    }
+    else
+    {
+      unsetenv(name_.c_str());
+    }
+  }
+
+private:
+  std::string name_;
+  bool had_prev_ = false;
+  std::string prev_value_;
+};
+
 } // namespace
 
 int RunIGRTests(TestContext& ctx)
@@ -900,6 +933,34 @@ int RunIGRTests(TestContext& ctx)
               "IGR H1 auto policy selects CG");
     ctx.Check(h1_solver.GetLastPrecondName() == "boomeramg",
               "IGR H1 auto policy selects BoomerAMG");
+
+    // If partial assembly is forced on but a matrix-only preconditioner is
+    // requested, policy should still honor the preconditioner by switching to
+    // assembled-matrix path.
+    {
+      ScopedEnvVar force_pa("DG_IGR_IGR_PARTIAL_ASSEMBLY", "1");
+      dg_igr::IGRSolver pa_boomer_solver(sigma_h1_fes,
+                                         state_fes_ws,
+                                         dim_ws,
+                                         num_eq_ws,
+                                         /*alpha=*/0.5);
+      pa_boomer_solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+      pa_boomer_solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+      pa_boomer_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
+      pa_boomer_solver.SetPreconditioner(dg_igr::IGRPrecondType::BoomerAMG);
+      pa_boomer_solver.SetLinearSolveParams(/*rtol=*/1.0e-10,
+                                            /*atol=*/0.0,
+                                            /*max_it=*/250,
+                                            /*print=*/0);
+      project_state(/*phase=*/0.0);
+      pa_boomer_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+      ctx.Check(pa_boomer_solver.GetLastLinearConverged(),
+                "IGR forced-PA matrix-preconditioner policy converges");
+      ctx.Check(pa_boomer_solver.GetLastPrecondName() == "boomeramg",
+                "IGR forced-PA matrix-preconditioner policy keeps BoomerAMG");
+      ctx.Check(pa_boomer_solver.GetAssembledOperator() != nullptr,
+                "IGR forced-PA matrix-preconditioner policy keeps assembled operator");
+    }
 
     // L2 auto policy with SIPG should be SPD-by-construction -> CG + BoomerAMG.
     mfem::DG_FECollection sigma_l2_fec(/*order=*/1,

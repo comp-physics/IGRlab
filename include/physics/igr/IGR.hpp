@@ -78,7 +78,7 @@ public:
   // ---- Recommended Krylov-solve knobs ----
   void SetSolveMode(SolveMode m) { solve_mode_ = m; }
   void SetLinearSolver(LinearSolverType s) { lin_solver_type_ = s; }
-  void SetPreconditioner(PrecondType p) { prec_type_ = p; }
+  void SetPreconditioner(PrecondType p);
   void SetAMGParams(int coarsen_type,
                     int relax_type,
                     int max_levels,
@@ -178,6 +178,8 @@ public:
     return total_assemble_seconds_ + total_form_system_seconds_ +
            total_pc_setup_seconds_ + total_linear_solve_seconds_;
   }
+  double GetLastUpdateCallSeconds() const { return last_update_call_seconds_; }
+  double GetTotalUpdateCallSeconds() const { return total_update_call_seconds_; }
   int GetLinearSolveCalls() const { return linear_solve_calls_; }
   int GetTotalLinearIterations() const { return total_linear_iters_; }
   int GetTotalLinearConvergedCalls() const
@@ -199,7 +201,7 @@ public:
   /// Access the currently assembled linear operator (for diagnostics/tests).
   const mfem::HypreParMatrix* GetAssembledOperator() const
   {
-    return Ah_.As<mfem::HypreParMatrix>();
+    return Ah_.Is<mfem::HypreParMatrix>();
   }
 
   /// Spatial dimension.
@@ -209,6 +211,11 @@ public:
   int NumEquations() const { return num_eq_; }
 
 private:
+  // --- Device coefficient path (QuadratureFunction-based, host-sync free) ---
+  bool UseDeviceCoefficients_() const;
+  void EnsureDeviceQuadrature_();
+  void UpdateDeviceCoefficients_(const mfem::ParGridFunction& U);
+
   // ---------- Coefficients that depend on the current state U ----------
   /// c_M(x) = 1 / max(ρ, rho_floor_)
   class InvRhoCoefficient : public mfem::Coefficient
@@ -273,6 +280,31 @@ private:
     mfem::DenseMatrix gradu_; // dim_ x dim_
   };
 
+  // Device/QF coefficient cache.
+  bool using_device_coeffs_ = false;
+  bool device_coeff_logged_ = false;
+  long device_mesh_sequence_ = -1;
+  long device_sfes_sequence_ = -1;
+  long device_vfes_sequence_ = -1;
+  int device_qorder_ = 0;
+  int device_face_qorder_ = 0;
+
+  std::unique_ptr<mfem::QuadratureSpace> sigma_qs_;
+  std::unique_ptr<mfem::FaceQuadratureSpace> sigma_fqs_;
+  std::unique_ptr<mfem::QuadratureFunction> u_qf_;
+  std::unique_ptr<mfem::QuadratureFunction> u_face_qf_;
+  std::unique_ptr<mfem::QuadratureFunction> grad_u_qf_;
+  std::unique_ptr<mfem::QuadratureFunction> invrho_qf_;
+  std::unique_ptr<mfem::QuadratureFunction> ck_qf_;
+  std::unique_ptr<mfem::QuadratureFunction> src_qf_;
+  std::unique_ptr<mfem::QuadratureFunction> ck_face_qf_;
+  std::unique_ptr<mfem::QuadratureFunctionCoefficient> invrho_qf_coef_;
+  std::unique_ptr<mfem::QuadratureFunctionCoefficient> ck_qf_coef_;
+  std::unique_ptr<mfem::QuadratureFunctionCoefficient> src_qf_coef_;
+  std::unique_ptr<mfem::QuadratureFunctionCoefficient> ck_face_qf_coef_;
+  mfem::Vector device_qinterp_evec_;
+  mfem::Vector device_face_restr_evec_;
+
   /// α(x) as a coefficient derived from the selected length-scale policy.
   class AlphaPolicyCoefficient : public mfem::Coefficient
   {
@@ -302,6 +334,7 @@ private:
   void SolveEllipticSystem_(bool warm_start);         // new recommended path
   void EnsureH1VelocitySpace_();
   void BuildBilinearForm_();
+  bool ShouldUsePartialAssembly_() const;
 
   // ---------- Data ----------
   mfem::ParFiniteElementSpace& sfes_; // scalar Σ space (H1 or DG)
@@ -346,6 +379,7 @@ private:
   // FE forms (reused each call; values change, sparsity fixed)
   std::unique_ptr<mfem::ParBilinearForm> a_;
   std::unique_ptr<mfem::ParLinearForm> b_;
+  bool use_partial_assembly_ = false;
 
   // Coefficients that refer to U
   std::unique_ptr<InvRhoCoefficient> invrho_coef_;
@@ -377,6 +411,8 @@ private:
   double total_assemble_seconds_ = 0.0;
   double total_form_system_seconds_ = 0.0;
   double total_pc_setup_seconds_ = 0.0;
+  double last_update_call_seconds_ = 0.0;
+  double total_update_call_seconds_ = 0.0;
   int linear_solve_calls_ = 0;
   int total_linear_iters_ = 0;
   int total_linear_converged_calls_ = 0;

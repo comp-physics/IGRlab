@@ -267,6 +267,8 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
         << ",\n";
     out << "    \"total_igr_work_s\": " << igr->GetTotalIGRWorkSeconds()
         << ",\n";
+    out << "    \"total_update_s\": " << igr->GetTotalUpdateCallSeconds()
+        << ",\n";
     out << "    \"linear_solve_fraction\": "
         << ((elapsed_seconds > 0.0)
               ? (igr->GetTotalLinearSolveSeconds() / elapsed_seconds)
@@ -275,6 +277,18 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
     out << "    \"total_igr_work_fraction\": "
         << ((elapsed_seconds > 0.0)
               ? (igr->GetTotalIGRWorkSeconds() / elapsed_seconds)
+              : 0.0)
+        << ",\n";
+    out << "    \"linear_solve_fraction_stage\": "
+        << ((igr->GetTotalUpdateCallSeconds() > 0.0)
+              ? (igr->GetTotalLinearSolveSeconds() /
+                 igr->GetTotalUpdateCallSeconds())
+              : 0.0)
+        << ",\n";
+    out << "    \"total_igr_work_fraction_stage\": "
+        << ((igr->GetTotalUpdateCallSeconds() > 0.0)
+              ? (igr->GetTotalIGRWorkSeconds() /
+                 igr->GetTotalUpdateCallSeconds())
               : 0.0)
         << ",\n";
     out << "    \"last_solver\": "

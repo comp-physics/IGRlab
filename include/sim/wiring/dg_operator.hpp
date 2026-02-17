@@ -11,6 +11,10 @@
 
 #include "sim/context/example_context.hpp"
 
+#include <cstdlib>
+#include <iostream>
+#include <string>
+
 namespace dg_sim
 {
 
@@ -58,13 +62,51 @@ MakeDGOperator(ExampleContext& ctx, const NumericalFlux& numerical_flux)
     }
     return mfem::DGSEMVolumeDissipation::None;
   };
+  auto env_flag = [](const char* name, bool default_value)
+  {
+    const char* raw = std::getenv(name);
+    if (!raw)
+    {
+      return default_value;
+    }
+    const std::string value(raw);
+    return !(value.empty() || value == "0" || value == "false" ||
+             value == "FALSE" || value == "off" || value == "OFF");
+  };
+  bool preassemble_weak_div = ctx.run_cfg.opts.preassemble_weak_div;
+  const bool force_device_matrix_free =
+    env_flag("DG_IGR_DG_FORCE_MATRIX_FREE", false);
+  if (ctx.run_cfg.dg_backend == DGBackend::DG && preassemble_weak_div &&
+      mfem::Device::Allows(mfem::Backend::DEVICE_MASK) &&
+      force_device_matrix_free)
+  {
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[dg-device] event=weak-divergence"
+                << " requested=element-assembly"
+                << " effective=matrix-free"
+                << " reason=env-force-matrix-free\n";
+    }
+    preassemble_weak_div = false;
+  }
+  else if (ctx.run_cfg.dg_backend == DGBackend::DG && preassemble_weak_div &&
+           mfem::Device::Allows(mfem::Backend::DEVICE_MASK) &&
+           mfem::Mpi::Root())
+  {
+    std::cout << "[dg-device] event=weak-divergence"
+              << " requested=element-assembly"
+              << " effective=element-assembly"
+              << " reason=device-default\n";
+  }
   mfem::DGHyperbolicConservationLaws op(
     ctx.spaces.vfes,
     std::unique_ptr<mfem::HyperbolicFormIntegrator>(
       new mfem::HyperbolicFormIntegrator(
         numerical_flux,
         ctx.run_cfg.case_config.int_order_offset)),
-    ctx.run_cfg.opts.preassemble_weak_div);
+    preassemble_weak_div);
+  op.SetDGSEMGamma(ctx.run_cfg.case_config.gamma);
+  op.SetFaceQuadratureOrderOffset(ctx.run_cfg.case_config.int_order_offset);
   op.SetNumericalFlux(&numerical_flux);
   if (ctx.run_cfg.dg_backend == DGBackend::DGSEM)
   {

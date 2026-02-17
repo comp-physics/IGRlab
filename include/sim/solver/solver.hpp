@@ -550,6 +550,16 @@ struct Solver
           ? (100.0 * igr->GetTotalLinearSolveSeconds() /
              captured_summary.elapsed)
           : 0.0;
+      const double igr_stage_total_pct =
+        (igr->GetTotalUpdateCallSeconds() > 0.0)
+          ? (100.0 * igr->GetTotalIGRWorkSeconds() /
+             igr->GetTotalUpdateCallSeconds())
+          : 0.0;
+      const double igr_stage_solve_pct =
+        (igr->GetTotalUpdateCallSeconds() > 0.0)
+          ? (100.0 * igr->GetTotalLinearSolveSeconds() /
+             igr->GetTotalUpdateCallSeconds())
+          : 0.0;
       std::cout << "[igr-linear] event=run-summary"
                 << " calls=" << igr->GetLinearSolveCalls()
                 << " converged_calls=" << igr->GetTotalLinearConvergedCalls()
@@ -563,8 +573,11 @@ struct Solver
                 << " total_pc_setup_s=" << igr->GetTotalPCSetupSeconds()
                 << " total_solve_s=" << igr->GetTotalLinearSolveSeconds()
                 << " total_igr_s=" << igr->GetTotalIGRWorkSeconds()
+                << " total_update_s=" << igr->GetTotalUpdateCallSeconds()
                 << " solve_pct=" << igr_solve_pct
                 << " total_igr_pct=" << igr_total_pct
+                << " solve_pct_stage=" << igr_stage_solve_pct
+                << " total_igr_pct_stage=" << igr_stage_total_pct
                 << " last_solver=" << igr->GetLastLinearSolverName()
                 << " last_precond=" << igr->GetLastPrecondName() << "\n";
     }

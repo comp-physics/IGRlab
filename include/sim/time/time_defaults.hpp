@@ -110,13 +110,13 @@ inline std::pair<double, double>
 ComputeGlobalMinMax(const mfem::ParGridFunction& gf, MPI_Comm comm)
 {
   const int n = gf.Size();
-  const double* data = gf.GetData();
+  const mfem::real_t* data = gf.HostRead();
   double local_min = std::numeric_limits<double>::infinity();
   double local_max = -std::numeric_limits<double>::infinity();
   for (int i = 0; i < n; ++i)
   {
-    local_min = std::min(local_min, data[i]);
-    local_max = std::max(local_max, data[i]);
+    local_min = std::min(local_min, static_cast<double>(data[i]));
+    local_max = std::max(local_max, static_cast<double>(data[i]));
   }
   double global_min = local_min;
   double global_max = local_max;

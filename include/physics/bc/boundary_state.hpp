@@ -60,6 +60,8 @@ public:
             mfem::FaceElementTransformations& Tr,
             mfem::Vector& Uplus) const override;
 
+  const mfem::Vector& GetInletState() const { return Uin_; }
+
 private:
   mfem::Vector Uin_;
 };
@@ -96,6 +98,10 @@ public:
             mfem::FaceElementTransformations& Tr,
             mfem::Vector& Uplus) const override;
 
+  int GetDimension() const { return dim_; }
+  double GetGamma() const { return gamma_; }
+  double GetOutletPressure() const { return p_out_; }
+
 private:
   int dim_ = 0;
   double gamma_ = 1.4;
@@ -120,6 +126,10 @@ public:
             mfem::FaceElementTransformations& Tr,
             mfem::Vector& Uplus) const override;
 
+  const mfem::Vector& GetReferenceState() const { return Uref_; }
+  int GetDimension() const { return dim_; }
+  double GetGamma() const { return gamma_; }
+
 private:
   mfem::Vector Uref_;
   int dim_ = 0;
@@ -143,6 +153,10 @@ public:
             mfem::FaceElementTransformations& Tr,
             mfem::Vector& Uplus) const override;
 
+  const mfem::Vector& GetInletState() const { return Uin_; }
+  int GetDimension() const { return dim_; }
+  double GetGamma() const { return gamma_; }
+
 private:
   mfem::Vector Uin_;
   int dim_ = 0;
@@ -164,6 +178,10 @@ public:
             const mfem::Vector& nor,
             mfem::FaceElementTransformations& Tr,
             mfem::Vector& Uplus) const override;
+
+  const mfem::Vector& GetFarFieldState() const { return Ufar_; }
+  int GetDimension() const { return dim_; }
+  double GetGamma() const { return gamma_; }
 
 private:
   mfem::Vector Ufar_;
@@ -187,6 +205,8 @@ public:
             const mfem::Vector& nor,
             mfem::FaceElementTransformations& Tr,
             mfem::Vector& Uplus) const override;
+
+  int GetDimension() const { return dim_; }
 
 private:
   int dim_;

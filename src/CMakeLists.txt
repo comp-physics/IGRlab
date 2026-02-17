@@ -4,6 +4,55 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "*.cpp")
 # Create library
 add_library(igr_mfem STATIC ${SOURCES})
 
+set(_dg_igr_default_accel_sources "")
+if(DG_IGR_ACCELERATOR_LANGUAGE)
+    list(APPEND _dg_igr_default_accel_sources
+         "src/numerics/dg/DGHyperbolicConservationLaws.cpp"
+         "src/numerics/dg/DGHyperbolicConservationLaws_face.cpp"
+         "src/numerics/dg/DGHyperbolicConservationLaws_mass.cpp"
+         "src/numerics/dg/DGHyperbolicConservationLaws_weakdiv.cpp"
+         "src/physics/igr/IGR_device_coefficients.cpp")
+endif()
+
+set(DG_IGR_AUTO_DG_ACCELERATOR_SOURCE
+    ON
+    CACHE BOOL
+    "When ON, automatically compile DGHyperbolicConservationLaws.cpp with the accelerator language in CUDA/HIP builds.")
+
+if(NOT DEFINED DG_IGR_ACCELERATOR_KERNEL_SOURCES)
+    set(DG_IGR_ACCELERATOR_KERNEL_SOURCES
+        "${_dg_igr_default_accel_sources}"
+        CACHE STRING
+        "Semicolon-separated source files (repo-relative or absolute) to compile with ${DG_IGR_ACCELERATOR_LANGUAGE} for MFEM_FORALL kernels.")
+else()
+    if(DG_IGR_AUTO_DG_ACCELERATOR_SOURCE AND
+       DG_IGR_ACCELERATOR_LANGUAGE AND
+       _dg_igr_default_accel_sources AND
+       "${DG_IGR_ACCELERATOR_KERNEL_SOURCES}" STREQUAL "")
+        set(DG_IGR_ACCELERATOR_KERNEL_SOURCES "${_dg_igr_default_accel_sources}")
+    endif()
+    set(DG_IGR_ACCELERATOR_KERNEL_SOURCES
+        "${DG_IGR_ACCELERATOR_KERNEL_SOURCES}"
+        CACHE STRING
+        "Semicolon-separated source files (repo-relative or absolute) to compile with ${DG_IGR_ACCELERATOR_LANGUAGE} for MFEM_FORALL kernels.")
+endif()
+
+if(DG_IGR_AUTO_DG_ACCELERATOR_SOURCE AND
+   DG_IGR_ACCELERATOR_LANGUAGE AND
+   _dg_igr_default_accel_sources)
+    foreach(_required_src IN LISTS _dg_igr_default_accel_sources)
+        list(FIND DG_IGR_ACCELERATOR_KERNEL_SOURCES "${_required_src}" _required_idx)
+        if(_required_idx EQUAL -1)
+            list(APPEND DG_IGR_ACCELERATOR_KERNEL_SOURCES "${_required_src}")
+        endif()
+    endforeach()
+    set(DG_IGR_ACCELERATOR_KERNEL_SOURCES
+        "${DG_IGR_ACCELERATOR_KERNEL_SOURCES}"
+        CACHE STRING
+        "Semicolon-separated source files (repo-relative or absolute) to compile with ${DG_IGR_ACCELERATOR_LANGUAGE} for MFEM_FORALL kernels."
+        FORCE)
+endif()
+
 # Include directories  
 target_include_directories(igr_mfem PUBLIC 
     ${CMAKE_SOURCE_DIR}/include
@@ -11,9 +60,57 @@ target_include_directories(igr_mfem PUBLIC
 
 # Link MFEM
 target_link_libraries(igr_mfem PUBLIC mfem)
+if(MFEM_USE_MPI)
+    target_link_libraries(igr_mfem PUBLIC MPI::MPI_CXX)
+    if(DG_IGR_MPI_INCLUDE_DIRS)
+        target_include_directories(igr_mfem PUBLIC ${DG_IGR_MPI_INCLUDE_DIRS})
+    endif()
+endif()
 
 if(MFEM_USE_CUDA)
     # Keep CUDA TPL linkage explicit to avoid transitive-link drops when MFEM/HYPRE
     # exports are incomplete.
     target_link_libraries(igr_mfem PUBLIC ${DG_IGR_REQUIRED_CUDA_TARGETS})
+endif()
+
+if(DG_IGR_ACCELERATOR_KERNEL_SOURCES)
+    if(NOT DG_IGR_ACCELERATOR_LANGUAGE)
+        message(FATAL_ERROR
+                "DG_IGR_ACCELERATOR_KERNEL_SOURCES is set, but local accelerator language support "
+                "is unavailable. Ensure MFEM backend and CMAKE_<backend>_COMPILER are configured.")
+    endif()
+
+    set(_dg_igr_accel_sources_abs "")
+    foreach(_src IN LISTS DG_IGR_ACCELERATOR_KERNEL_SOURCES)
+        if(IS_ABSOLUTE "${_src}")
+            set(_src_abs "${_src}")
+        else()
+            set(_src_abs "${CMAKE_SOURCE_DIR}/${_src}")
+        endif()
+        if(NOT EXISTS "${_src_abs}")
+            message(FATAL_ERROR
+                    "DG_IGR accelerator source not found: ${_src_abs}")
+        endif()
+        list(APPEND _dg_igr_accel_sources_abs "${_src_abs}")
+    endforeach()
+
+    set_source_files_properties(${_dg_igr_accel_sources_abs}
+                                PROPERTIES
+                                LANGUAGE ${DG_IGR_ACCELERATOR_LANGUAGE})
+
+    if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA")
+        set_target_properties(igr_mfem
+                              PROPERTIES
+                              CUDA_SEPARABLE_COMPILATION ON)
+        target_compile_options(igr_mfem PRIVATE
+                               $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+        if(CMAKE_CUDA_ARCHITECTURES)
+            set_property(TARGET igr_mfem
+                         PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
+        endif()
+    endif()
+
+    message(STATUS
+            "DG_IGR accelerator kernel sources (${DG_IGR_ACCELERATOR_LANGUAGE}): "
+            "${_dg_igr_accel_sources_abs}")
 endif()

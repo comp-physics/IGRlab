@@ -1,56 +1,12 @@
-// Implementation of DGHyperbolicConservationLaws
-// --------------------------------------------------------------
-//
-// Mult() assembles the face contribution (via HyperbolicFormIntegrator)
-// and then adds a volume contribution depending on the chosen VolumeMode:
-//
-//  • WeakDivergence (default):
-//      If preassembled, add (I_h F(u), ∇v)_T per element with
-//         Z_T += WeakDiv_T * Flux(U_T)^T
-//      where Flux(U_T) is the physical flux evaluated at the nodal points.
-//      Finally, y_T = M_T^{-1} Z_T.
-//
-//      If not preassembled (matrix-free path), HyperbolicFormIntegrator
-//      already contributes (F(u), ∇v) into z; we only apply M_T^{-1}.
-//
-//  • DGSEMFluxDiff:
-//      Replace the volume term with a DGSEM-style flux-difference contribution
-//      built from pairwise numerical fluxes at the element nodes.
-//      This is added into z, and then M_T^{-1} is applied.
-//
-// Notes:
-//  - max_char_speed is reset before nonlinearForm->Mult(x, z) and
-//    is updated by the face integrators; we expose it for CFL updates.
-//  - The class stores per-element inverse mass matrices and (optionally)
-//    weak-divergence matrices, recomputed in Update() if needed.
-//
+// Implementation of DGHyperbolicConservationLaws main operator flow.
 
-#include "numerics/dg/DGHyperbolicConservationLaws.hpp"
+#include "DGHyperbolicConservationLaws_impl.hpp"
 #include "numerics/dgsem/dgsem_operator.hpp"
 
 #include <chrono>
-#include <cstdlib>
-#include <string>
 
 namespace mfem
 {
-
-namespace
-{
-
-bool EnvFlagEnabled(const char* name)
-{
-  const char* raw = std::getenv(name);
-  if (!raw)
-  {
-    return false;
-  }
-  const std::string value(raw);
-  return !(value.empty() || value == "0" || value == "false" ||
-           value == "FALSE" || value == "off" || value == "OFF");
-}
-
-} // namespace
 
 DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
   FiniteElementSpace& vfes_,
@@ -65,6 +21,8 @@ DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
 {
   // (A) Compute inverse mass matrices (one per element)
   ComputeInvMass();
+  BuildInvMassApplyData_();
+  BuildNativeMassInverseSolver_();
 
   // (B) Build the nonlinear form for face/domain contributions.
 #ifndef MFEM_USE_MPI
@@ -80,6 +38,7 @@ DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
   if (preassembleWeakDivergence)
   {
     ComputeWeakDivergence();
+    BuildWeakDivApplyData_();
   }
   else
   {
@@ -91,92 +50,10 @@ DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
   nonlinearForm->UseExternalIntegrators();
 }
 
-// -----------------------------------------------------------------------------
-// Compute inverse mass matrices
-// -----------------------------------------------------------------------------
-//
-// For each element T, assemble M_T^{-1} by applying InverseIntegrator(MassIntegrator).
-// We store the dense inverse per element, so we can do:
-//     y_T = M_T^{-1} z_T
-// cheaply in Mult().
-//
-void DGHyperbolicConservationLaws::ComputeInvMass()
+void DGHyperbolicConservationLaws::SetNumericalFlux(const NumericalFlux* flux)
 {
-  InverseIntegrator inv_mass(new MassIntegrator());
-  invmass.resize(vfes.GetNE());
-  static IntegrationRules lgl_rules(0, Quadrature1D::GaussLobatto);
-
-  for (int i = 0; i < vfes.GetNE(); i++)
-  {
-    const FiniteElement& fe = *vfes.GetFE(i);
-    const int dof = fe.GetDof();
-    if (const auto* tbe = dynamic_cast<const TensorBasisElement*>(&fe))
-    {
-      if (tbe->GetBasisType() == BasisType::GaussLobatto)
-      {
-        const int order = std::max(1, 2 * fe.GetOrder() - 1);
-        inv_mass.SetIntRule(&lgl_rules.Get(fe.GetGeomType(), order));
-      }
-      else
-      {
-        inv_mass.SetIntRule(nullptr);
-      }
-    }
-    else
-    {
-      inv_mass.SetIntRule(nullptr);
-    }
-    invmass[i].SetSize(dof);
-    inv_mass.AssembleElementMatrix(fe,
-                                   *vfes.GetElementTransformation(i),
-                                   invmass[i]);
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Preassemble weak divergence matrices
-// -----------------------------------------------------------------------------
-//
-// We need a matrix that maps nodal flux values to test-function contributions:
-//
-//   weakdiv[i] (dof × (dof*dim)) with columns ordered as
-//      [node0_x, node0_y, (node0_z)], [node1_x, node1_y, (node1_z)], ...
-//
-// We get this by assembling the transpose of GradientIntegrator:
-//   TransposeIntegrator(GradientIntegrator()) gives (ϕ_i, ∇ψ_j)_T.
-//
-// Then we reorder the columns to ByDim-per-node layout to match how we pack
-// the nodal flux tensor F(U_j) ∈ ℝ^{num_eq×dim} for each node j.
-//
-void DGHyperbolicConservationLaws::ComputeWeakDivergence()
-{
-  TransposeIntegrator weak_div(new GradientIntegrator());
-  DenseMatrix tmp;
-
-  weakdiv.resize(vfes.GetNE());
-
-  for (int i = 0; i < vfes.GetNE(); i++)
-  {
-    const FiniteElement& fe = *vfes.GetFE(i);
-    int dof = fe.GetDof();
-
-    tmp.SetSize(dof, dof * dim);
-    weak_div.AssembleElementMatrix2(fe,
-                                    fe,
-                                    *vfes.GetElementTransformation(i),
-                                    tmp);
-
-    weakdiv[i].SetSize(dof, dof * dim);
-    for (int j = 0; j < dof; j++)
-    {
-      for (int d = 0; d < dim; d++)
-      {
-        // Copy column from the assembled block [all dofs for dimension d]
-        // into the “ByDim per node” layout at (node j, dimension d).
-        weakdiv[i].SetCol(j * dim + d, tmp.GetColumn(d * dof + j));
-      }
-    }
-  }
+  num_flux_ = flux;
+  face_data_dirty_ = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -194,6 +71,32 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
 {
   // (0) Reset the running max wave speed (used for CFL after Mult()).
   formIntegrator->ResetMaxCharSpeed();
+
+  // ParNonlinearForm evaluates in local (L-vector) space as:
+  // y_true = P^T A_local (P x_true). The packed DG device path follows the
+  // same mapping when a non-trivial prolongation exists.
+  const Vector* x_eval = &x;
+  Vector x_local;
+  Vector z_local;
+  Vector y_local;
+  const Operator* prolongation = nullptr;
+#ifdef MFEM_USE_MPI
+  if (Device::Allows(Backend::DEVICE_MASK))
+  {
+    if (const auto* pvfes = dynamic_cast<const ParFiniteElementSpace*>(&vfes))
+    {
+      prolongation = pvfes->GetProlongationMatrix();
+      if (prolongation)
+      {
+        x_local.SetSize(pvfes->GetVSize());
+        prolongation->Mult(x, x_local);
+        x_eval = &x_local;
+        z_local.SetSize(pvfes->GetVSize());
+      }
+    }
+  }
+#endif
+  Vector& z_eval = prolongation ? z_local : z;
 
   if (vol_mode_ == VolumeMode::DGSEMFluxDiff)
   {
@@ -243,99 +146,80 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   //     If weak-divergence is NOT preassembled, HyperbolicFormIntegrator also adds
   //     the volume term (F(u_h), ∇v):
   //     z += (F(u_h), ∇v)
-  nonlinearForm->Mult(x, z);
-
-  if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
+  bool used_device_face = false;
+  real_t device_face_speed = 0.0;
+  if (Device::Allows(Backend::DEVICE_MASK))
   {
-    // We'll now compute (I_h F(u_h), ∇v) element-by-element and add it into z,
-    // then finish with the inverse mass to get y = M^{-1} z.
-
-    Vector state; // local conservative state at one node (size = num_eq)
-    DenseMatrix
-      flux; // packed nodal fluxes for the element (num_eq × (dim*dof))
-    DenseMatrix Xmat; // element's states as (dof × num_eq) view into x
-    DenseMatrix Zmat; // element's assembled RHS as (dof × num_eq) view into z
-    DenseMatrix Ymat; // element's output du/dt as (dof × num_eq) before scatter
-    const FluxFunction& fluxFunction = formIntegrator->GetFluxFunction();
-    Array<int> vdofs; // vector DOF indices for this element
-    Vector xval, zval;
-
-    for (int i = 0; i < vfes.GetNE(); i++) // loop over elements T
+    const bool force_nonlinearform_face =
+      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FORCE_NLFORM_FACE",
+                                      mfem::Mpi::WorldSize() > 1);
+    if (force_nonlinearform_face)
     {
-      ElementTransformation* Tr = vfes.GetElementTransformation(i);
-      const FiniteElement& fe = *vfes.GetFE(i);
-      int dof = fe.GetDof();
-      vfes.GetElementVDofs(i, vdofs);
-
-      // Pull element's DOFs from x and view them as (dof × num_equations)
-      x.GetSubVector(vdofs, xval);
-      Xmat.UseExternalData(xval.GetData(), dof, num_equations);
-
-      // Pack physical flux tensor F(U_j) at all nodal points j into 'flux'
-      flux.SetSize(num_equations, dim * dof);
-      const IntegrationRule& nodes = fe.GetNodes();
-      MFEM_ASSERT(nodes.Size() == dof,
-                  "FE is not nodal or GetNodes() != dof; "
-                  "need to evaluate at an appropriate rule.");
-
-      for (int j = 0; j < dof; j++)
+      nonlinearForm->Mult(*x_eval, z_eval);
+      used_device_face = false;
+      device_face_speed = formIntegrator->GetMaxCharSpeed();
+      if (!dg_face_path_logged_ && mfem::Mpi::Root())
       {
-        // Set the element integration point to node j
-        const IntegrationPoint& ip = nodes.IntPoint(j);
-        Tr->SetIntPoint(&ip);
-
-        // state := U_h at node j
-        Xmat.GetRow(j, state);
-
-        // flux_j is a (num_eq × dim) view into the j-th block inside 'flux'
-        DenseMatrix flux_j(flux.GetData() + j * num_equations * dim,
-                           num_equations,
-                           /*ncols=*/dim);
-
-        // Compute physical flux tensor F(U, x) at this node (fills flux_j)
-        fluxFunction.ComputeFlux(state, *Tr, flux_j);
+        std::cout << "[dg-device] event=face-domain-path"
+                  << " selected=nonlinearForm->Mult"
+                  << " backend=device-mfem-face"
+                  << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
+                  << " x_size=" << x.Size()
+                  << " local_vsize=" << vfes.GetVSize()
+                  << " true_vsize=" << vfes.GetTrueVSize() << "\n";
+        dg_face_path_logged_ = true;
       }
-
-      // Add the preassembled weak-divergence term to z:
-      // Z_T += WeakDiv_T * Flux(U_T)^T  (weakdiv has the ByDim-per-node layout)
-      z.GetSubVector(vdofs, zval);
-      Zmat.UseExternalData(zval.GetData(), dof, num_equations);
-      mfem::AddMult_a_ABt(1.0, weakdiv[i], flux, Zmat);
-
-      // Apply inverse mass: y_T = M_T^{-1} * Z_T
-      Ymat.SetSize(dof, num_equations);
-      mfem::Mult(invmass[i], Zmat, Ymat);
-
-      // Scatter back to the global vector y
-      y.SetSubVector(vdofs, Ymat.GetData());
+    }
+    else
+    {
+      MFEM_VERIFY(UseDeviceFaceResidual_(),
+                  "DG device-closure requires packed device face residual path "
+                  "(no host fallback).");
+      used_device_face =
+        AddDeviceFaceContributionsEulerRusanov_(*x_eval, z_eval, device_face_speed);
+      MFEM_VERIFY(used_device_face,
+                  "DG device-closure requires packed Euler/Rusanov face kernels "
+                  "and supported boundary/sigma metadata (no fallback).");
+      if (!dg_face_path_logged_ && mfem::Mpi::Root())
+      {
+        std::cout << "[dg-device] event=face-domain-path"
+                  << " selected=packed-mfem-forall-euler-rusanov"
+                  << " backend=device"
+                  << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
+                  << " x_size=" << x.Size()
+                  << " local_vsize=" << vfes.GetVSize()
+                  << " true_vsize=" << vfes.GetTrueVSize() << "\n";
+        dg_face_path_logged_ = true;
+      }
     }
   }
   else
   {
-    // Weak divergence NOT preassembled:
-    // z already has both face and volume terms.
-    // Just apply block inverse mass element-by-element to get y = M^{-1} z.
-
-    Array<int> vdofs;
-    Vector zval;
-    DenseMatrix Zmat, Ymat;
-
-    for (int i = 0; i < vfes.GetNE(); i++)
-    {
-      int dof = vfes.GetFE(i)->GetDof();
-      vfes.GetElementVDofs(i, vdofs);
-
-      z.GetSubVector(vdofs, zval);
-      Zmat.UseExternalData(zval.GetData(), dof, num_equations);
-
-      Ymat.SetSize(dof, num_equations);
-      mfem::Mult(invmass[i], Zmat, Ymat);
-
-      y.SetSubVector(vdofs, Ymat.GetData());
-    }
+    nonlinearForm->Mult(x, z);
   }
+
+  if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
+  {
+    // Compute (I_h F(u_h), ∇v) and accumulate directly into z.
+    AddPreassembledWeakDivergence_(*x_eval, z_eval);
+  }
+
+  // Apply inverse mass after all contributions have been assembled in z.
+  if (prolongation)
+  {
+    y_local.SetSize(z_eval.Size());
+    ApplyInverseMass_(z_eval, y_local);
+    y = 0.0;
+    prolongation->MultTranspose(y_local, y);
+  }
+  else
+  {
+    ApplyInverseMass_(z_eval, y);
+  }
+
   // (4) Expose the maximum characteristic speed accumulated inside the integrators
-  max_char_speed = formIntegrator->GetMaxCharSpeed();
+  max_char_speed =
+    used_device_face ? device_face_speed : formIntegrator->GetMaxCharSpeed();
 }
 
 DGHyperbolicConservationLaws::~DGHyperbolicConservationLaws()
@@ -363,12 +247,21 @@ void DGHyperbolicConservationLaws::Update()
 
   // Recompute per-element inverse mass matrices
   ComputeInvMass();
+  BuildInvMassApplyData_();
+  BuildNativeMassInverseSolver_();
 
   // If we already had weakdiv matrices, refresh them too
   if (!weakdiv.empty())
   {
     ComputeWeakDivergence();
+    BuildWeakDivApplyData_();
   }
+  else
+  {
+    BuildWeakDivApplyData_();
+  }
+
+  face_data_dirty_ = true;
 }
 
 void DGHyperbolicConservationLaws::SetFaceIntegrationRule(
@@ -381,13 +274,14 @@ void DGHyperbolicConservationLaws::SetFaceIntegrationRule(
   {
     bdr_int->SetIntegrationRule(*face_int_rule_);
   }
+  face_data_dirty_ = true;
 }
 
 bool DGHyperbolicConservationLaws::IsDGSEMTimingEnabled_() const
 {
   if (!dgsem_timing_init_)
   {
-    dgsem_timing_enabled_ = EnvFlagEnabled("DG_IGR_DGSEM_TIMING");
+    dgsem_timing_enabled_ = ::dg_igr::EnvFlagEnabled("DG_IGR_DGSEM_TIMING");
     dgsem_timing_init_ = true;
   }
   return dgsem_timing_enabled_;
@@ -463,6 +357,7 @@ void DGHyperbolicConservationLaws::AddBdrFaceIntegrator(
 
   // 3) Register with NonlinearForm using the *referenced* stable Array<int>
   nonlinearForm->AddBdrFaceIntegrator(nfi_raw, *ext_bdr_markers_.back());
+  face_data_dirty_ = true;
 }
 
 } // namespace mfem

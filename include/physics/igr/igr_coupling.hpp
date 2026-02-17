@@ -104,7 +104,10 @@ public:
       igr_.UpdateFromState(stage_state, /*warm_start=*/true);
 
       // Make sigma available on face neighbors across MPI subdomains.
-      igr_.GetSigma().ExchangeFaceNbrData();
+      if (mfem::Mpi::WorldSize() > 1)
+      {
+        igr_.GetSigma().ExchangeFaceNbrData();
+      }
 
       sigma_initialized_ = true;
       if (rk_step_ >= 0)

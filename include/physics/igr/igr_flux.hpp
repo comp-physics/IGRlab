@@ -91,6 +91,15 @@ public:
   /// Get Sigma for a face side at the current face integration point (0 if off).
   double GetSigmaAtSide(FaceElementTransformations& Tr, FaceSide side) const;
 
+  /// Return true when the wrapped base flux is MFEM EulerFlux.
+  bool HasEulerBase() const { return dynamic_cast<const EulerFlux*>(&base_) != nullptr; }
+
+  /// Access the current Sigma field pointer (may be null).
+  const mfem::ParGridFunction* GetSigmaField() const { return sigma_; }
+
+  /// Access the density floor used only in the IGR energy sigma term.
+  double GetVelocityRhoFloor() const { return rho_vel_floor_; }
+
 private:
   const FluxFunction* GetBase() const { return &base_; }
 
