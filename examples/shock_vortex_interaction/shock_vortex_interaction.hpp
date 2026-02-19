@@ -258,7 +258,7 @@ GetShockVortexInoueHattoriInitCustom(const real_t gamma,
   const real_t dY = Ly / static_cast<real_t>(my);
   const real_t smooth = std::max(smoothing_scale, static_cast<real_t>(1.0e-6));
   const real_t delta_phys =
-    2.0 * smooth * std::min(dX, dY); // smooth shock width
+    smooth * std::min(dX, dY); // smooth shock width
 
   // --- Upstream base state U1 (to the right, X > 0) ---
   const real_t rho1 = 1.0;
