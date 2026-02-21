@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "launcher": [
+      "mpirun",
+      "-np",
+      "1"
+    ],
+    "base_args": [
+      "-no-vtk",
+      "-no-glvis",
+      "-iprint",
+      "0"
+    ],
+    "workdir": ".",
+    "env": {
+      "OMP_NUM_THREADS": "1"
+    },
+    "keep_going": true
+  },
+  "cases": [
+    {
+      "name": "sedov_taylor_blast",
+      "executable": "./build/examples/sedov_taylor_blast/sedov_taylor_blast",
+      "base_args": [],
+      "sweep": {
+        "-ca": [
+          1.0,
+          5.0
+        ],
+        "-o": [
+          3,
+          5
+        ],
+        "-rs": [
+          0
+        ],
+        "-rp": [
+          0
+        ],
+        "-tf": [
+          0.02
+        ],
+        "-c": [
+          0.25
+        ]
+      }
+    },
+    {
+      "name": "inoue_hattori_large_domain_slip_tb",
+      "executable": "./build/examples/inoue_hattori_large_domain/inoue_hattori_large_domain_slip_tb",
+      "base_args": [
+        "-is",
+        "L2",
+        "-ig",
+        "L2"
+      ],
+      "sweep": {
+        "-ca": [
+          1.0,
+          5.0
+        ],
+        "-o": [
+          3,
+          5
+        ],
+        "-rs": [
+          0
+        ],
+        "-rp": [
+          0
+        ],
+        "-tf": [
+          0.02
+        ],
+        "-c": [
+          0.2,
+          0.25
+        ]
+      }
+    }
+  ]
+}
