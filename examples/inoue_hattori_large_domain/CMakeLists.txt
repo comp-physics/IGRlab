@@ -2,3 +2,9 @@ add_executable(inoue_hattori_large_domain inoue_hattori_large_domain.cpp)
 target_link_libraries(inoue_hattori_large_domain igr_mfem)
 target_include_directories(inoue_hattori_large_domain PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../shock_vortex_interaction)
+
+add_executable(inoue_hattori_large_domain_slip_tb
+               inoue_hattori_large_domain_slip_tb.cpp)
+target_link_libraries(inoue_hattori_large_domain_slip_tb igr_mfem)
+target_include_directories(inoue_hattori_large_domain_slip_tb PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../shock_vortex_interaction)
