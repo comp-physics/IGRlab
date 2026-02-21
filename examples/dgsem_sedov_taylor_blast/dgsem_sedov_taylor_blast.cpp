@@ -29,17 +29,11 @@ int main(int argc, char* argv[])
   spec.diagnostics.h1_diagnostics = false;
   spec.glvis.precision = 8;
   spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
-  // Callback defaults (explicit to show the available options).
-  spec.callback_defaults.enable_alive = true;
-  spec.callback_defaults.enable_analysis = true;
-  spec.callback_defaults.enable_vtk = true;
-  spec.callback_defaults.enable_summary = true;
-  spec.callback_defaults.compute_minmax = true;
+  spec.vtk.enabled = false;
 
   spec.configure_case = [](dg_sim::CaseConfig& cfg)
   {
     cfg.defaults.t_final = 4.0;
-    cfg.defaults.vtk_save = false;
     cfg.defaults.par_ref_levels = 0;
     cfg.defaults.dgsem_volume_flux = "ranocha";
     cfg.defaults.dgsem_surface_flux = "es-winters";

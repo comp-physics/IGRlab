@@ -93,9 +93,15 @@ int main(int argc, char* argv[])
   spec.default_mesh_path = mfem::SupersonicCylinderIGRDefaultMeshPath();
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
+  spec.dg_backend_default = dg_sim::DGBackend::DG;
+  spec.use_igr = true;
   spec.need_h1 = true;
   spec.diagnostics.h1_diagnostics = true;
+  spec.diagnostics.l2_diagnostics = false;
+  spec.diagnostics.mpi_rank_field = false;
   spec.glvis.precision = 8;
+  spec.vtk.enabled = true;
+  spec.vtk.print_dataset_name = true;
 
   spec.configure_case = [](dg_sim::CaseConfig& cfg)
   {

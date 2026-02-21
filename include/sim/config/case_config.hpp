@@ -588,6 +588,18 @@ inline std::string DefaultCaseMeshPath(const CaseConfig& cfg)
   return ResolveCaseMesh(cfg, "");
 }
 
+inline std::string DefaultVTKPrefixFromCaseDir(const std::string& case_dir)
+{
+  const auto default_prefix = mfem::io::VTKOutputConfig{}.prefix_path;
+  const std::filesystem::path case_path(case_dir);
+  if (case_path.empty() || !case_path.has_parent_path() ||
+      !case_path.parent_path().has_parent_path())
+  {
+    return default_prefix;
+  }
+  return (case_path.parent_path().parent_path() / "out").string();
+}
+
 /// @brief Apply global example defaults, overriding any struct defaults.
 ///
 /// This function reinitializes config members with default-constructed values
@@ -622,6 +634,7 @@ inline void ApplyExampleDefaults(CaseConfig& cfg)
   cfg.igr_config.amg_relax_type = -1;
   cfg.igr_config.amg_max_levels = -1;
   cfg.igr_config.amg_strong_threshold = -1.0;
+  cfg.vtk_config.prefix_path = DefaultVTKPrefixFromCaseDir(cfg.case_dir);
 }
 
 inline CaseConfig
