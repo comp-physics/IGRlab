@@ -58,4 +58,8 @@ notes/
 euler-*
 vtk_output
 tools
+build_*
+tests/perf*
+tests/scripts
+out/
 # supersonic_example/backup
