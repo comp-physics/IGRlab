@@ -101,9 +101,8 @@ def append_option_tokens(dst: List[str], option: str, value: Any) -> None:
 
 def _sanitize_token(value: str) -> str:
     token = value.strip()
-    token = token.replace(".", "p")
     token = token.replace("+", "")
-    token = re.sub(r"[^A-Za-z0-9_-]+", "_", token)
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", token)
     token = token.strip("_")
     return token or "x"
 
@@ -133,7 +132,9 @@ def build_run_id(
 
     base = _sanitize_token(case_name)
     if parts:
-        candidate = f"{base}__{'__'.join(parts)}__{idx:04d}"
+        # Keep "__" only as major section delimiters; join metadata tokens with
+        # single "_" to avoid visually noisy "__a__b__c" patterns.
+        candidate = f"{base}__{'_'.join(parts)}__{idx:04d}"
     else:
         candidate = f"{base}_{idx:04d}"
 

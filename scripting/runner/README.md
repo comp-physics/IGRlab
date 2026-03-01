@@ -22,9 +22,31 @@ The runner writes logs + summary JSON under `scripting/runner/out/<timestamp>/`.
 Run IDs (and log filenames) now include sweep metadata, not just a sequence
 number. Example shape:
 
-- `sedov_taylor_blast__o_3__rs_0__rp_1__tf_1p0__dt_save_0p01__c_0p25__0002.log`
+- `sedov_taylor_blast__o_3_rs_0_rp_1_tf_1.0_dt_save_0.01_c_0.25__0002.log`
 
 This makes `summary.json` and downstream render grouping easier to inspect.
+
+## Merge Multiple Summary Files
+
+If you ran sweeps in separate batches and want one post-process pass, merge
+their `summary.json` files first:
+
+```bash
+python3 scripting/runner/merge_summaries.py \
+  --summary scripting/runner/out/<runA>/summary.json \
+  --summary scripting/runner/out/<runB>/summary.json \
+  --out scripting/runner/out/merged_summary.json
+```
+
+Defaults:
+
+- duplicate handling is `--dedupe run-id` (last input wins on duplicate run_id)
+- merged runs include `summary_source` so provenance is preserved
+
+Alternative dedupe modes:
+
+- `--dedupe none`: keep all runs
+- `--dedupe run-id-log`: consider both run_id and log_path
 
 ## Config Schema (JSON)
 
