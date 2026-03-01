@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "summary_path": "scripting/runner/out/20260226T031956Z/summary.json",
+  "output_dir": "out/render/latest",
+  "clean_output_dir": true,
+  "discovery": {
+    "out_root": "out",
+    "require_success": true,
+    "skip_dry_run": true,
+    "require_dataset": true
+  },
+  "render": {
+    "enabled": true,
+    "pvpython": "pvpython",
+    "pvpython_args": [
+      "--force-offscreen-rendering"
+    ],
+    "width": 4200,
+    "height": 2300,
+    "transparent_bg": false,
+    "use_time_values": true,
+    "scale_mode": "per_dataset",
+    "color_preset": "Inferno (matplotlib)",
+    "field_colormaps": {
+      "schlieren": "X Ray"
+    },
+    "invert_field_colormaps": [],
+    "show_scalar_bar": false,
+    "show_title": false,
+    "filename_metadata_level": "rich"
+  },
+  "render_jobs": [
+    {
+      "name": "sedov",
+      "include_cases": [
+        "sedov_taylor_blast"
+      ],
+      "fields": [
+        "density",
+        "pressure",
+        "energy",
+        "momentum",
+        "velocity",
+        "sigma",
+        "schlieren",
+        "vorticity"
+      ],
+      "times": [
+        "0",
+        "0.1",
+        "0.15",
+        "0.2",
+        "0.25",
+        "0.3",
+        "0.35",
+        "0.4",
+        "0.45",
+        "0.5",
+        "0.55",
+        "0.6",
+        "1"
+      ],
+      "scale_modes": [
+        "per_frame",
+        "per_dataset",
+        "per_case"
+      ]
+    },
+    {
+      "name": "inoue_large_slip",
+      "include_cases": [
+        "inoue_hattori_large_domain_slip_tb"
+      ],
+      "fields": [
+        "density",
+        "pressure",
+        "energy",
+        "momentum",
+        "velocity",
+        "sigma",
+        "schlieren",
+        "vorticity"
+      ],
+      "times": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10"
+      ],
+      "scale_modes": [
+        "per_frame",
+        "per_dataset",
+        "per_case"
+      ]
+    }
+  ],
+  "postprocess": {
+    "enabled": true,
+    "out_subdir": "images_cropped",
+    "crop": null,
+    "crop_gravity": null,
+    "trim_background_color": "white",
+    "trim_background_fuzz": "0%",
+    "trim_background_border": 1,
+    "trim": false
+  },
+  "tikz": {
+    "enabled": true,
+    "out_file": "figures.tex",
+    "group_by": "job_field",
+    "image_width": "0.31\\textwidth",
+    "max_cols": 3,
+    "max_rows": 2,
+    "label_mode": "none",
+    "max_sweep_keys": 2,
+    "fields": [],
+    "time_tokens": []
+  },
+  "latex": {
+    "enabled": true,
+    "engine": "pdflatex",
+    "wrapper_file": "figures_wrapper.tex",
+    "runs": 1,
+    "preamble_lines": []
+  }
+}

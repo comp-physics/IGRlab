@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import itertools
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -95,6 +97,53 @@ def append_option_tokens(dst: List[str], option: str, value: Any) -> None:
         return
     dst.append(option)
     dst.append(str(value))
+
+
+def _sanitize_token(value: str) -> str:
+    token = value.strip()
+    token = token.replace(".", "p")
+    token = token.replace("+", "")
+    token = re.sub(r"[^A-Za-z0-9_-]+", "_", token)
+    token = token.strip("_")
+    return token or "x"
+
+
+def _option_token(option: str) -> str:
+    base = option.strip()
+    base = re.sub(r"^-+", "", base)
+    return _sanitize_token(base or "opt")
+
+
+def _value_token(value: Any) -> str:
+    if isinstance(value, list):
+        joined = "x".join(_sanitize_token(str(v)) for v in value)
+        return joined or "x"
+    return _sanitize_token(str(value))
+
+
+def build_run_id(
+    case_name: str,
+    idx: int,
+    combo: List[Tuple[str, Any]],
+    max_len: int = 180,
+) -> str:
+    parts: List[str] = []
+    for option, value in combo:
+        parts.append(f"{_option_token(option)}_{_value_token(value)}")
+
+    base = _sanitize_token(case_name)
+    if parts:
+        candidate = f"{base}__{'__'.join(parts)}__{idx:04d}"
+    else:
+        candidate = f"{base}_{idx:04d}"
+
+    if len(candidate) <= max_len:
+        return candidate
+
+    digest = hashlib.sha1(candidate.encode("utf-8")).hexdigest()[:10]
+    keep = max(8, max_len - 13)
+    trimmed = candidate[:keep].rstrip("_")
+    return f"{trimmed}__{digest}"
 
 
 def run_single(
@@ -246,7 +295,7 @@ def main() -> int:
                 append_option_tokens(combo_tokens, option, value)
 
             command = launcher + [exe] + base_args + combo_tokens
-            run_id = f"{name}_{idx:04d}"
+            run_id = build_run_id(name, idx, combo)
             log_path = out_dir / "logs" / f"{run_id}.log"
 
             print(f"[runner] case={name} run={idx}/{len(combinations)}")

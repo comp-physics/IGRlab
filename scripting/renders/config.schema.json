@@ -1,0 +1,282 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dg-igr-miniapp.local/scripting/renders/config.schema.json",
+  "title": "Render Pipeline Config",
+  "type": "object",
+  "required": ["schema_version", "summary_path"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "summary_path": {
+      "type": "string",
+      "description": "Path to scripting/runner output summary.json"
+    },
+    "output_dir": {
+      "type": "string",
+      "description": "Render artifact root. Defaults to scripting/renders/out/<timestamp>."
+    },
+    "clean_output_dir": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, delete output_dir contents before running."
+    },
+    "discovery": {
+      "type": "object",
+      "properties": {
+        "out_root": { "type": "string", "default": "out" },
+        "include_cases": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "exclude_cases": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "include_run_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "require_success": { "type": "boolean", "default": true },
+        "skip_dry_run": { "type": "boolean", "default": true },
+        "require_dataset": { "type": "boolean", "default": true }
+      },
+      "additionalProperties": true
+    },
+    "render": {
+      "type": "object",
+      "description": "Default render settings. Overridden by each render_jobs entry.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "pvpython": { "type": "string", "default": "pvpython" },
+        "pvpython_args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "fields": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "times": {
+          "type": "array",
+          "items": { "type": ["string", "number"] },
+          "default": []
+        },
+        "use_time_values": { "type": "boolean", "default": false },
+        "width": { "type": "integer", "minimum": 1, "default": 2400 },
+        "height": { "type": "integer", "minimum": 1, "default": 1600 },
+        "transparent_bg": { "type": "boolean", "default": false },
+        "show_scalar_bar": { "type": "boolean", "default": true },
+        "show_title": { "type": "boolean", "default": true },
+        "embed_scale_in_filename": {
+          "type": "boolean",
+          "default": true,
+          "description": "Deprecated; use filename_metadata_level."
+        },
+        "filename_metadata_level": {
+          "type": "string",
+          "enum": ["minimal", "legacy", "rich"],
+          "default": "rich"
+        },
+        "scale_mode": {
+          "type": "string",
+          "enum": ["per_frame", "per_dataset", "per_case", "global", "fixed"],
+          "default": "per_dataset"
+        },
+        "scale_modes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["per_frame", "per_dataset", "per_case", "global", "fixed"]
+          },
+          "default": []
+        },
+        "color_preset": {
+          "type": ["string", "null"],
+          "default": null
+        },
+        "field_colormaps": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "default": {}
+        },
+        "invert_field_colormaps": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "fixed_ranges": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "number" },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": true
+    },
+    "render_jobs": {
+      "type": "array",
+      "description": "Optional per-problem render jobs. Each job can define different fields/times/scaling and run filters.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "allow_empty": { "type": "boolean", "default": false },
+          "include_cases": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          },
+          "exclude_cases": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          },
+          "include_run_ids": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          },
+          "exclude_run_ids": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          },
+          "pvpython": { "type": "string" },
+          "pvpython_args": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "fields": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "times": {
+            "type": "array",
+            "items": { "type": ["string", "number"] }
+          },
+          "use_time_values": { "type": "boolean" },
+          "width": { "type": "integer", "minimum": 1 },
+          "height": { "type": "integer", "minimum": 1 },
+          "transparent_bg": { "type": "boolean" },
+          "show_scalar_bar": { "type": "boolean" },
+          "show_title": { "type": "boolean" },
+          "embed_scale_in_filename": {
+            "type": "boolean",
+            "description": "Deprecated; use filename_metadata_level."
+          },
+          "filename_metadata_level": {
+            "type": "string",
+            "enum": ["minimal", "legacy", "rich"]
+          },
+          "scale_mode": {
+            "type": "string",
+            "enum": ["per_frame", "per_dataset", "per_case", "global", "fixed"]
+          },
+          "scale_modes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["per_frame", "per_dataset", "per_case", "global", "fixed"]
+            }
+          },
+          "color_preset": {
+            "type": ["string", "null"]
+          },
+          "field_colormaps": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
+          "invert_field_colormaps": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "fixed_ranges": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": { "type": "number" },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "postprocess": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "out_subdir": { "type": "string", "default": "images_post" },
+        "source_frames_manifest": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Optional existing frames manifest to postprocess without rerender."
+        },
+        "crop": { "type": ["string", "null"], "default": null },
+        "crop_gravity": { "type": ["string", "null"], "default": null },
+        "trim_background_color": { "type": ["string", "null"], "default": null },
+        "trim_background_fuzz": { "type": ["string", "null"], "default": "2%" },
+        "trim_background_border": { "type": "integer", "minimum": 0, "default": 1 },
+        "trim": { "type": "boolean", "default": false }
+      },
+      "additionalProperties": true
+    },
+    "tikz": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "out_file": { "type": "string", "default": "figures.tex" },
+        "group_by": {
+          "type": "string",
+          "enum": ["field", "case", "time", "job", "job_field", "case_field"],
+          "default": "field"
+        },
+        "image_width": { "type": "string", "default": "0.3\\textwidth" },
+        "max_cols": { "type": "integer", "minimum": 1, "default": 3 },
+        "max_rows": { "type": "integer", "minimum": 1, "default": 3 },
+        "label_mode": {
+          "type": "string",
+          "enum": ["none", "run", "short", "full"],
+          "default": "short"
+        },
+        "max_sweep_keys": { "type": "integer", "minimum": 0, "default": 2 },
+        "fields": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "time_tokens": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        }
+      },
+      "additionalProperties": true
+    },
+    "latex": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "engine": { "type": "string", "default": "pdflatex" },
+        "wrapper_file": { "type": "string", "default": "figures_wrapper.tex" },
+        "runs": { "type": "integer", "minimum": 1, "default": 1 },
+        "preamble_lines": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

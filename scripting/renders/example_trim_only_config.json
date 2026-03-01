@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "summary_path": "scripting/runner/out/20260226T031956Z/summary.json",
+  "output_dir": "out/render/latest",
+  "clean_output_dir": false,
+  "discovery": {
+    "out_root": "out",
+    "require_success": true,
+    "skip_dry_run": true,
+    "require_dataset": true
+  },
+  "render": {
+    "enabled": false
+  },
+  "postprocess": {
+    "enabled": true,
+    "source_frames_manifest": "out/render/latest/frames_raw.json",
+    "out_subdir": "images_cropped",
+    "crop": null,
+    "crop_gravity": null,
+    "trim_background_color": "white",
+    "trim_background_fuzz": "0%",
+    "trim_background_border": 1,
+    "trim": false
+  },
+  "tikz": {
+    "enabled": false
+  },
+  "latex": {
+    "enabled": false
+  }
+}

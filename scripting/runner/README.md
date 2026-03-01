@@ -19,6 +19,13 @@ python3 scripting/runner/parametric_runner.py \
 
 The runner writes logs + summary JSON under `scripting/runner/out/<timestamp>/`.
 
+Run IDs (and log filenames) now include sweep metadata, not just a sequence
+number. Example shape:
+
+- `sedov_taylor_blast__o_3__rs_0__rp_1__tf_1p0__dt_save_0p01__c_0p25__0002.log`
+
+This makes `summary.json` and downstream render grouping easier to inspect.
+
 ## Config Schema (JSON)
 
 - `schema_version`: currently `1`

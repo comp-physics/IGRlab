@@ -17,14 +17,14 @@ constexpr int kNy = 32;
 constexpr double kGamma = 1.4;
 constexpr double kShockMach = 2.0;
 constexpr double kVortexMach = 0.25;
-constexpr double kShockSmoothing = 1.0;
+constexpr double kShockSmoothing = 4.0;
 constexpr double kXLeft = -30.0;
 constexpr double kXRight = 10.0;
 constexpr double kYBottom = -20.0;
 constexpr double kYTop = 20.0;
-constexpr double kVortexX = 4.0;
+constexpr double kVortexX = 5.0;
 constexpr double kVortexY = 0.0;
-constexpr double kShockX = 0.0;
+constexpr double kShockX = -10.0;
 constexpr dg_sim::inoue_hattori::PeriodicYMeshConfig kMeshCfg = {
   kNx,
   kNy,
