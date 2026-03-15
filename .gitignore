@@ -58,8 +58,9 @@ notes/
 euler-*
 vtk_output
 tools
-build_*
+build_*/
 tests/perf*
 tests/scripts
 out/
+__pycache__
 # supersonic_example/backup
