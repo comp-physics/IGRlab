@@ -27,6 +27,8 @@
 namespace mfem
 {
 
+inline double PressureFromCons2D(const mfem::Vector& U, double gamma);
+
 ///// Mesh Utilities
 
 /// @brief Default mesh filename for the supersonic cylinder + IGR case.
@@ -65,8 +67,9 @@ VectorFunctionCoefficient EulerInitialCondition(const mfem::Vector& Uin)
  * @brief Smoothed IC for the supersonic cylinder: velocity goes from 0 at
  *        the cylinder to freestream far away, radially smoothly.
  *
- * We keep density and energy from Uin *uniform everywhere* and only modify
- * the velocity (i.e. momentum components).
+ * We keep density and pressure from Uin uniform everywhere and only modify
+ * the velocity. Total energy is recomputed from the modified velocity so the
+ * thermodynamic state remains EOS-consistent.
  *
  * Model:
  *   - Let (xc, yc) be the cylinder center, with radius r_cyl.
@@ -79,7 +82,7 @@ VectorFunctionCoefficient EulerInitialCondition(const mfem::Vector& Uin)
  *   u(x,y)  = S(r) * u_inf
  *   v(x,y)  = S(r) * v_inf
  *   rho(x,y) = rho_inf (from Uin)
- *   E(x,y)   = E_inf   (from Uin)
+ *   p(x,y)   = p_inf   (from Uin)
  *
  * Parameters:
  *   - Uin      : conservative freestream state [ρ, ρu_x, ρu_y, E]
@@ -89,6 +92,7 @@ VectorFunctionCoefficient EulerInitialCondition(const mfem::Vector& Uin)
  */
 inline mfem::VectorFunctionCoefficient
 SupersonicCylinderSmoothedVelocityIC(const mfem::Vector& Uin,
+                                     double gamma,
                                      double xc,
                                      double yc,
                                      double r_cyl,
@@ -103,10 +107,10 @@ SupersonicCylinderSmoothedVelocityIC(const mfem::Vector& Uin,
   const double rho_inf = Uin(0);
   const double rhoux_inf = Uin(1);
   const double rhouy_inf = Uin(2);
-  const double E_inf = Uin(3);
-
   const double ux_inf = rhoux_inf / rho_inf;
   const double uy_inf = rhouy_inf / rho_inf;
+  const double p_inf = PressureFromCons2D(Uin, gamma);
+  MFEM_VERIFY(p_inf > 0.0, "Uin implies non-positive pressure.");
 
   return mfem::VectorFunctionCoefficient(
     4,
@@ -130,9 +134,7 @@ SupersonicCylinderSmoothedVelocityIC(const mfem::Vector& Uin,
       else
       {
         const double s = (r - r_cyl) / delta;
-        // Smooth transition: S ~ 0 just outside r_cyl, →1 as r grows
         double val = 1.0 - std::exp(-s * s);
-        // Just in case of any numerical weirdness, clamp to [0,1]
         if (val < 0.0) val = 0.0;
         if (val > 1.0) val = 1.0;
         S = val;
@@ -141,11 +143,102 @@ SupersonicCylinderSmoothedVelocityIC(const mfem::Vector& Uin,
       const double ux = S * ux_inf;
       const double uy = S * uy_inf;
 
-      // Leave ρ and E as in Uin; only change the momentum components
       y(0) = rho_inf;
       y(1) = rho_inf * ux;
       y(2) = rho_inf * uy;
-      y(3) = E_inf;
+      y(3) = p_inf / (gamma - 1.0) + 0.5 * rho_inf * (ux * ux + uy * uy);
+    });
+}
+
+/**
+ * @brief Smoothed IC for the supersonic cylinder that only damps the wall-normal
+ *        velocity near the cylinder while leaving the tangential component intact.
+ *
+ * This is a better startup match to the slip-wall condition than damping the
+ * full velocity vector.
+ *
+ * We keep density and pressure from Uin uniform everywhere and only modify the
+ * velocity decomposition relative to the cylinder wall normal:
+ *
+ *   u_n(x,y) = S(r) * u_n,inf
+ *   u_t(x,y) = u_t,inf
+ *
+ * where S(r)=0 on the cylinder and smoothly approaches 1 away from the wall.
+ * Total energy is recomputed from the modified velocity so the state remains
+ * thermodynamically consistent.
+ */
+inline mfem::VectorFunctionCoefficient
+SupersonicCylinderSmoothedNormalVelocityIC(const mfem::Vector& Uin,
+                                           double gamma,
+                                           double xc,
+                                           double yc,
+                                           double r_cyl,
+                                           double delta)
+{
+  MFEM_VERIFY(Uin.Size() >= 4,
+              "Uin must contain at least [rho, rho*u_x, rho*u_y, E]");
+  MFEM_VERIFY(delta > 0.0, "delta must be positive.");
+  MFEM_VERIFY(r_cyl >= 0.0, "r_cyl must be non-negative.");
+
+  const double rho_inf = Uin(0);
+  const double rhoux_inf = Uin(1);
+  const double rhouy_inf = Uin(2);
+  const double ux_inf = rhoux_inf / rho_inf;
+  const double uy_inf = rhouy_inf / rho_inf;
+  const double p_inf = PressureFromCons2D(Uin, gamma);
+  MFEM_VERIFY(p_inf > 0.0, "Uin implies non-positive pressure.");
+
+  return mfem::VectorFunctionCoefficient(
+    4,
+    [=](const mfem::Vector& x, mfem::Vector& y)
+    {
+      y.SetSize(4);
+
+      const double X = x(0);
+      const double Y = x(1);
+
+      const double dx = X - xc;
+      const double dy = Y - yc;
+      const double r = std::sqrt(dx * dx + dy * dy);
+
+      // Radial blending factor S(r): 0 at cylinder, →1 far away
+      double S = 1.0;
+      if (r <= r_cyl)
+      {
+        S = 0.0;
+      }
+      else
+      {
+        const double s = (r - r_cyl) / delta;
+        double val = 1.0 - std::exp(-s * s);
+        if (val < 0.0) val = 0.0;
+        if (val > 1.0) val = 1.0;
+        S = val;
+      }
+
+      double nx = 1.0;
+      double ny = 0.0;
+      if (r > 1e-14)
+      {
+        nx = dx / r;
+        ny = dy / r;
+      }
+      const double tx = -ny;
+      const double ty = nx;
+
+      const double un_inf = ux_inf * nx + uy_inf * ny;
+      const double ut_inf = ux_inf * tx + uy_inf * ty;
+
+      const double un = S * un_inf;
+      const double ut = ut_inf;
+
+      const double ux = un * nx + ut * tx;
+      const double uy = un * ny + ut * ty;
+
+      y(0) = rho_inf;
+      y(1) = rho_inf * ux;
+      y(2) = rho_inf * uy;
+      y(3) = p_inf / (gamma - 1.0) + 0.5 * rho_inf * (ux * ux + uy * uy);
     });
 }
 
@@ -304,6 +397,13 @@ inline double PressureFromCons2D(const mfem::Vector& U, double gamma)
   return (gamma - 1.0) * (E - kin);
 }
 
+inline double QuinticSmoothStep(const double s)
+{
+  if (s <= 0.0) { return 0.0; }
+  if (s >= 1.0) { return 1.0; }
+  return s * s * s * (10.0 + s * (-15.0 + 6.0 * s));
+}
+
 /**
  * @brief Inflow-buffer IC: U = Uin near the inlet, then smoothly transitions
  *        to a quiescent ambient state inside the domain.
@@ -393,6 +493,62 @@ AmbientFromUin_IsentropicSimpleWaveToRest_2D(const mfem::Vector& Uin,
 
   rhoR = std::pow((aR * aR) / (gamma * K), 1.0 / (gamma - 1.0));
   pR = K * std::pow(rhoR, gamma);
+}
+
+inline mfem::VectorFunctionCoefficient
+CompactSmoothInflowBufferIC_2D(const mfem::Vector& Uin,
+                               const double gamma,
+                               const double rho_amb,
+                               const double p_amb,
+                               const double x_left,
+                               const double x_right)
+{
+  MFEM_VERIFY(Uin.Size() == 4, "2D Euler expects Uin size 4.");
+  MFEM_VERIFY(x_right > x_left,
+              "Compact inflow buffer interval must satisfy x_right > x_left.");
+
+  const double rhoL = Uin(0);
+  const double uL = Uin(1) / rhoL;
+  const double vL = Uin(2) / rhoL;
+  const double pL = PressureFromCons2D(Uin, gamma);
+  MFEM_VERIFY(pL > 0.0, "Uin implies non-positive pressure.");
+
+  const double rhoR = rho_amb;
+  const double pR = p_amb;
+  const double uR = 0.0;
+  const double vR = 0.0;
+
+  return mfem::VectorFunctionCoefficient(
+    4,
+    [=](const mfem::Vector& x, mfem::Vector& U)
+    {
+      U.SetSize(4);
+      const double blend = QuinticSmoothStep((x(0) - x_left) / (x_right - x_left));
+      const double theta = 1.0 - blend; // 1 on inlet side, 0 in ambient region
+
+      const double rho = theta * rhoL + (1.0 - theta) * rhoR;
+      const double u = theta * uL + (1.0 - theta) * uR;
+      const double v = theta * vL + (1.0 - theta) * vR;
+      const double p = theta * pL + (1.0 - theta) * pR;
+
+      U(0) = rho;
+      U(1) = rho * u;
+      U(2) = rho * v;
+      U(3) = p / (gamma - 1.0) + 0.5 * rho * (u * u + v * v);
+    });
+}
+
+inline mfem::VectorFunctionCoefficient
+CompactSmoothInflowBufferIC_2D(const mfem::Vector& Uin,
+                               const double gamma,
+                               const double x_left,
+                               const double x_right)
+{
+  double rho_amb = 0.0;
+  double p_amb = 0.0;
+  AmbientFromUin_IsentropicSimpleWaveToRest_2D(Uin, gamma, rho_amb, p_amb);
+  return CompactSmoothInflowBufferIC_2D(
+    Uin, gamma, rho_amb, p_amb, x_left, x_right);
 }
 
 // Your smooth inflow-buffer IC (left Uin -> right quiescent ambient)
@@ -558,12 +714,13 @@ inline void UpstreamQuiescentFromPostShock_2D(const Vector& U2,
  * Blend in primitives + recompute E for clean EOS consistency.
  */
 inline VectorFunctionCoefficient
-SmoothSingleShockIC_FromUin_2D(const Vector& Uin,
-                               double gamma,
-                               double x_s,
-                               double delta)
+CompactSmoothSingleShockIC_FromUin_2D(const Vector& Uin,
+                                      double gamma,
+                                      double x_left,
+                                      double x_right)
 {
-  MFEM_VERIFY(delta > 0.0, "delta must be positive.");
+  MFEM_VERIFY(x_right > x_left,
+              "Compact shock interval must satisfy x_right > x_left.");
 
   Vector Uup;
   double Vs = 0.0;
@@ -577,8 +734,8 @@ SmoothSingleShockIC_FromUin_2D(const Vector& Uin,
 
   // Right primitives (quiescent upstream)
   const double rhoR = Uup(0);
-  const double uR = 0.5;
-  const double vR = 0.0;
+  const double uR = Uup(1) / rhoR;
+  const double vR = Uup(2) / rhoR;
   const double pR = PressureFromCons2D(Uup, gamma); // = (gamma-1)*E
 
   return VectorFunctionCoefficient(
@@ -586,8 +743,8 @@ SmoothSingleShockIC_FromUin_2D(const Vector& Uin,
     [=](const Vector& x, Vector& U)
     {
       U.SetSize(4);
-      const double theta =
-        0.5 * (1.0 - std::tanh((x(0) - x_s) / delta)); // 1 left, 0 right
+      const double blend = QuinticSmoothStep((x(0) - x_left) / (x_right - x_left));
+      const double theta = 1.0 - blend; // 1 left, 0 right
 
       const double rho = theta * rhoL + (1.0 - theta) * rhoR;
       const double u = theta * uL + (1.0 - theta) * uR;
@@ -599,6 +756,16 @@ SmoothSingleShockIC_FromUin_2D(const Vector& Uin,
       U(2) = rho * v;
       U(3) = p / (gamma - 1.0) + 0.5 * rho * (u * u + v * v);
     });
+}
+
+inline VectorFunctionCoefficient
+SmoothSingleShockIC_FromUin_2D(const Vector& Uin,
+                               double gamma,
+                               double x_s,
+                               double delta)
+{
+  MFEM_VERIFY(delta > 0.0, "delta must be positive.");
+  return CompactSmoothSingleShockIC_FromUin_2D(Uin, gamma, x_s - delta, x_s + delta);
 }
 
 /**

@@ -97,8 +97,9 @@ int main(int argc, char* argv[])
   spec.use_igr = true;
   spec.need_h1 = true;
   spec.diagnostics.h1_diagnostics = true;
-  spec.diagnostics.l2_diagnostics = false;
-  spec.diagnostics.mpi_rank_field = false;
+  spec.diagnostics.l2_diagnostics = true;
+  spec.diagnostics.mpi_rank_field = true;
+  spec.diagnostics.zhang_shu_limiter = true;
   spec.glvis.precision = 8;
   spec.vtk.enabled = true;
   spec.vtk.print_dataset_name = true;
@@ -106,10 +107,13 @@ int main(int argc, char* argv[])
   spec.configure_case = [](dg_sim::CaseConfig& cfg)
   {
     cfg.defaults.t_final = 4.0;
-    cfg.rk3_config.limit_initial = false;
+    cfg.rk3_config.limit_initial = true;
+    cfg.igr_config.alpha_length_scale_policy =
+      dg_igr::IGRAlphaLengthScalePolicy::Max;
     //  cfg.igr_config.smoot = dg_igr::IGRSmootherType::L1GS;
     cfg.limiter_pipeline.zhang_shu = true;
-    //  cfg.limiter_pipeline.krivodonova = true;
+    // cfg.limiter_pipeline.krivodonova = true;
+    // cfg.rk3_config.max_limiter_steps = -1;
   };
 
   spec.add_options = [](mfem::OptionsParser& args, SupersonicIGROptions& opts)
@@ -127,25 +131,22 @@ int main(int argc, char* argv[])
     Uin(2) = 1.4 * opts.inflow.vy;
     Uin(3) = 8.8;
 
-    const double x_s = 0.2;
-    const double hmin =
-      dg_sim::ComputeAlphaInfo(ctx.Mesh(), ctx.run_cfg.igr_opts.c_alpha_user)
-        .hmin;
-    const double delta = hmin * 15.0;
+    const double hmin = dg_sim::ComputeAlphaInfo(
+                          ctx.Mesh(),
+                          ctx.run_cfg.igr_opts.c_alpha_user,
+                          dg_sim::ResolveIGRAlphaLengthScalePolicy(ctx.run_cfg))
+                          .hmin;
+    const double xc = 0.6;
+    const double yc = 0.0;
+    const double r_cyl = 0.25;
+    const double delta = std::max(8.0 * hmin, 0.08);
 
-    const double rho_in = 1.0;
-    const double u_in = opts.inflow.vx;
-    const double v_in = opts.inflow.vy;
-    const double p_in = 1.0;
-    mfem::Vector Uamb;
-    mfem::BuildInletAndAmbientStates_FromPrimitives(rho_in,
-                                                    u_in,
-                                                    v_in,
-                                                    p_in,
-                                                    gamma,
-                                                    Uin,
-                                                    Uamb);
-    auto ic_fun = mfem::SmoothInflowBufferIC_2D(Uin, Uamb, gamma, x_s, delta);
+    auto ic_fun = mfem::SupersonicCylinderSmoothedNormalVelocityIC(Uin,
+                                                                   gamma,
+                                                                   xc,
+                                                                   yc,
+                                                                   r_cyl,
+                                                                   delta);
     return std::make_unique<mfem::VectorFunctionCoefficient>(ic_fun);
   };
 
