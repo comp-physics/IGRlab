@@ -48,6 +48,8 @@ struct CommonOptions
   int analysis_steps =
     -1; ///< Analysis cadence in steps (-1 = 10x vis_steps, 0 disables).
   bool nan_scan = false; ///< Enable NaN/inf scanning during the time loop.
+  bool admissibility_scan =
+    false; ///< Enable Euler density/pressure admissibility scans during the time loop.
 };
 
 /**
@@ -165,6 +167,13 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "--no-nan-scan",
                  "Enable or disable NaN/inf scanning during time integration "
                  "(per-stage + per-step).");
+  args.AddOption(&opts.admissibility_scan,
+                 "-adm-scan",
+                 "--admissibility-scan",
+                 "-no-adm-scan",
+                 "--no-admissibility-scan",
+                 "Enable or disable Euler density/pressure admissibility "
+                 "scans during time integration.");
 }
 
 /**

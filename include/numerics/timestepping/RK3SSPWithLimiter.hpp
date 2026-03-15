@@ -61,6 +61,23 @@ public:
     p_bisect_iters_ = p_bisect_iters;
   }
 
+  /// Set additional face quadrature orders that the positivity limiter must
+  /// enforce. These should match the actual DG face integration rule(s).
+  void SetLimiterFaceQuadratureOrders(std::vector<int> qords)
+  {
+    face_quad_orders_ = std::move(qords);
+  }
+
+  /// Optional order-0 DG fields storing the latest Zhang-Shu limiter activity.
+  void SetZhangShuDiagnosticsFields(ParGridFunction* active,
+                                    ParGridFunction* theta_rho,
+                                    ParGridFunction* theta_p)
+  {
+    zhang_shu_active_field_ = active;
+    zhang_shu_theta_rho_field_ = theta_rho;
+    zhang_shu_theta_p_field_ = theta_p;
+  }
+
   /// If true, also apply the pipeline at the start of Step() to the input x.
   void LimitInitial(bool on) { limit_initial_ = on; }
 
@@ -71,6 +88,8 @@ public:
 
   /// Enable per-stage NaN/inf scans (diagnostic; off by default).
   void EnableStageNanScan(bool on) { nan_scan_stages_ = on; }
+  /// Enable per-stage Euler admissibility scans (diagnostic; off by default).
+  void EnableStageAdmissibilityScan(bool on) { admissibility_scan_stages_ = on; }
 
   /// Reset the internal step counter (e.g., if restarting the time integrator).
   void ResetStepCount() { step_count_ = 0; }
@@ -154,6 +173,11 @@ private:
   double p_min_ = dg_igr::LimiterDefaults::kPMin;
   int quad_order_ = dg_igr::LimiterDefaults::kQuadOrder; // 0 => auto: 2*order+2
   int p_bisect_iters_ = dg_igr::LimiterDefaults::kBisectIters;
+  std::vector<int> face_quad_orders_;
+  ParGridFunction* zhang_shu_active_field_ = nullptr;
+  ParGridFunction* zhang_shu_theta_rho_field_ = nullptr;
+  ParGridFunction* zhang_shu_theta_p_field_ = nullptr;
+  ZhangShuLimiterElementDiagnostics zhang_shu_diagnostics_;
   bool limit_initial_ = dg_igr::RK3Defaults::kLimitInitial;
 
   // Callback pipelines
@@ -166,6 +190,7 @@ private:
     dg_igr::RK3Defaults::kLimiterSteps; ///< <0 => optional limiters always on
   bool nan_scan_stages_ = false;
   bool stage_nan_detected_ = false;
+  bool admissibility_scan_stages_ = false;
 
   // Work vectors
   Vector y_, k_;
@@ -173,7 +198,8 @@ private:
   // Helpers
   /// Apply both always-on and (optionally) optional callbacks to vector v.
   void ApplyCallbacks(Vector& v, double t, bool apply_optional);
-  void MaybeScanStage(Vector& v, double t, const char* label);
+  void MaybeScanVector(Vector& v, double t, const char* label);
+  void MaybeScanAdmissibility(Vector& v, double t, const char* label);
   int AutoQuadOrder() const;
 };
 

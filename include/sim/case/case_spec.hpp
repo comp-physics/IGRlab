@@ -37,6 +37,8 @@ struct DiagnosticsConfig
     false; ///< Broken/L2 diagnostics from conservative-state gradients (div_l2, grad_frob_l2).
   bool mpi_rank_field =
     false; ///< Per-element MPI rank field for VTK debugging.
+  bool zhang_shu_limiter =
+    false; ///< Per-element Zhang-Shu limiter activity/theta fields for VTK debugging.
 };
 
 /// @brief VTK configuration knobs for example outputs.

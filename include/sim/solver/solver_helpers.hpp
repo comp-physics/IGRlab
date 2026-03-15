@@ -42,6 +42,11 @@ inline void ApplyGradOption(const std::string& grad_opt, dg_igr::IGRConfig& cfg)
 inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
                                            dg_igr::IGRConfig& cfg)
 {
+  if (!igr_opts.alpha_length_policy.empty())
+  {
+    cfg.alpha_length_scale_policy =
+      ParseIGRAlphaLengthScalePolicy(igr_opts.alpha_length_policy);
+  }
   ApplyGradOption(igr_opts.grad, cfg);
   cfg.solve_mode = ParseIGRSolveMode(igr_opts.solve_mode);
   cfg.lin_solver_type = ParseIGRLinearSolverType(igr_opts.linear_solver);
@@ -119,6 +124,7 @@ inline dg_igr::IGRSolver MakeIGRSolver(DGSpaces& spaces,
   MFEM_VERIFY(spaces.sigma_fes != nullptr, "IGR requires a sigma space.");
   dg_igr::IGRConfig igr_cfg = run_cfg.case_config.igr_config;
   igr_cfg.alpha = alpha_info.alpha;
+  igr_cfg.alpha_length_scale_policy = alpha_info.policy;
   igr_cfg.rho_floor = rho_floor;
   ApplyIGRRuntimeOptionOverrides(run_cfg.igr_opts, igr_cfg);
 

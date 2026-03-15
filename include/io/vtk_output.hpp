@@ -34,6 +34,10 @@ struct EulerVTKFields
   mfem::ParGridFunction* grad_frob_l2 = nullptr;
   // Optional per-element MPI rank field.
   mfem::ParGridFunction* mpi_rank = nullptr;
+  // Optional per-element Zhang-Shu limiter diagnostics.
+  mfem::ParGridFunction* zhang_shu_active = nullptr;
+  mfem::ParGridFunction* zhang_shu_theta_rho = nullptr;
+  mfem::ParGridFunction* zhang_shu_theta_p = nullptr;
 };
 
 /// @brief Apply a standardized VTK output configuration to a data collection.

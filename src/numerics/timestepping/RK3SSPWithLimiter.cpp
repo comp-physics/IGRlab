@@ -1,12 +1,83 @@
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 
+#include "utils/diagnostics/euler_admissibility.hpp"
 #include "utils/diagnostics/non_finite.hpp"
 #include "numerics/limiters/limiters.hpp" // ApplyZhangShuPositivityLimiter, etc.
 #include <algorithm>
 #include <iostream>
+#include <limits>
+#include <sstream>
 
 namespace mfem
 {
+
+namespace
+{
+
+inline const char* AdmissibilityPointSetName(
+  mfem::dg_igr::EulerAdmissibilityPointSet point_set)
+{
+  switch (point_set)
+  {
+  case mfem::dg_igr::EulerAdmissibilityPointSet::Dof:
+    return "dof";
+  case mfem::dg_igr::EulerAdmissibilityPointSet::Limiter:
+    return "limiter";
+  case mfem::dg_igr::EulerAdmissibilityPointSet::Output:
+    return "output";
+  }
+  return "unknown";
+}
+
+inline std::string StateComponentName(int component, int dim, int vdim)
+{
+  if (component < 0)
+  {
+    return "unknown";
+  }
+  if (vdim == dim + 2)
+  {
+    if (component == 0)
+    {
+      return "density";
+    }
+    if (component >= 1 && component <= dim)
+    {
+      static const char* kAxes[] = {"x", "y", "z"};
+      std::ostringstream os;
+      os << "momentum_" << kAxes[component - 1];
+      return os.str();
+    }
+    if (component == dim + 1)
+    {
+      return "energy";
+    }
+  }
+
+  std::ostringstream os;
+  os << "component_" << component;
+  return os.str();
+}
+
+inline void WriteDG0ElementField(mfem::ParGridFunction& field,
+                                 const mfem::Vector& element_values)
+{
+  auto* fes = field.ParFESpace();
+  MFEM_VERIFY(fes != nullptr, "Limiter diagnostics field is missing an FE space.");
+  MFEM_VERIFY(fes->GetNE() == element_values.Size(),
+              "Limiter diagnostics field has the wrong number of elements.");
+
+  mfem::Array<int> vdofs;
+  for (int i = 0; i < fes->GetNE(); ++i)
+  {
+    fes->GetElementVDofs(i, vdofs);
+    MFEM_VERIFY(vdofs.Size() == 1,
+                "Limiter diagnostics field must use one scalar dof per element.");
+    field(vdofs[0]) = element_values(i);
+  }
+}
+
+} // namespace
 
 // ------------------------------- Construction & Init ----------------------------
 
@@ -76,10 +147,17 @@ void RK3SSPWithLimiter::AddZhangShuLimiter(bool always_on)
   const double rhomin = rho_min_;
   const double pmin = p_min_;
   const int qord = (quad_order_ > 0) ? quad_order_ : AutoQuadOrder();
+  const auto face_qords = face_quad_orders_;
   const int iters = p_bisect_iters_;
 
-  auto cb = [=](ParFiniteElementSpace& vf, ParGridFunction& U, double /*t*/)
+  auto cb = [this, dim, gamma, rhomin, pmin, qord, face_qords, iters](
+              ParFiniteElementSpace& vf, ParGridFunction& U, double /*t*/)
   {
+    mfem::ZhangShuLimiterElementDiagnostics* diagnostics_ptr =
+      (zhang_shu_active_field_ != nullptr && zhang_shu_theta_rho_field_ != nullptr &&
+       zhang_shu_theta_p_field_ != nullptr)
+        ? &zhang_shu_diagnostics_
+        : nullptr;
     ApplyZhangShuPositivityLimiter(vf,
                                    U,
                                    dim,
@@ -87,7 +165,16 @@ void RK3SSPWithLimiter::AddZhangShuLimiter(bool always_on)
                                    rhomin,
                                    pmin,
                                    qord,
-                                   iters);
+                                   face_qords,
+                                   iters,
+                                   diagnostics_ptr);
+    if (diagnostics_ptr != nullptr)
+    {
+      WriteDG0ElementField(*zhang_shu_active_field_, diagnostics_ptr->active);
+      WriteDG0ElementField(*zhang_shu_theta_rho_field_,
+                           diagnostics_ptr->theta_rho);
+      WriteDG0ElementField(*zhang_shu_theta_p_field_, diagnostics_ptr->theta_p);
+    }
   };
 
   if (always_on)
@@ -170,7 +257,7 @@ void RK3SSPWithLimiter::AddKrivodonovaLimiter(const KrivoOptions& opts)
     { ApplyKrivodonovaHierarchicalLimiter(vf, Ustage, local); });
 }
 
-void RK3SSPWithLimiter::MaybeScanStage(Vector& v, double t, const char* label)
+void RK3SSPWithLimiter::MaybeScanVector(Vector& v, double t, const char* label)
 {
   if (!nan_scan_stages_ || stage_nan_detected_)
   {
@@ -178,18 +265,125 @@ void RK3SSPWithLimiter::MaybeScanStage(Vector& v, double t, const char* label)
   }
 
   ParGridFunction stage(&vfes_, v);
-  const dg_igr::NonFiniteSummary summary = dg_igr::ScanNonFinite(stage);
-  if (summary.global_non_finite > 0)
+  const MPI_Comm comm = vfes_.GetComm();
+  const int vdim = stage.VectorDim();
+  const auto ordering = vfes_.GetOrdering();
+  const auto scan =
+    mfem::dg_igr::ScanNonFiniteDetailed(v, comm, vdim, ordering);
+
+  if (scan.summary.global_non_finite > 0)
   {
     stage_nan_detected_ = true;
+    int rank = 0;
+    MPI_Comm_rank(comm, &rank);
+
     if (mfem::Mpi::Root())
     {
-      std::cout << "[nan-scan] event=stage-scan" << " label=" << label
-                << " t=" << t << " non_finite=" << summary.global_non_finite
-                << " finite_min=" << summary.global_min
-                << " finite_max=" << summary.global_max << "\n";
+      std::ostringstream os;
+      os << "[nan-scan] event=vector-scan"
+         << " label=" << label
+         << " t=" << t
+         << " non_finite=" << scan.summary.global_non_finite
+         << " finite_min=" << scan.summary.global_min
+         << " finite_max=" << scan.summary.global_max
+         << " first_bad_rank=" << scan.first_bad_rank;
+      for (int c = 0; c < vdim; ++c)
+      {
+        if (c < static_cast<int>(scan.global_component_non_finite.size()) &&
+            scan.global_component_non_finite[c] > 0)
+        {
+          os << " " << StateComponentName(c, dim_, vdim)
+             << "=" << scan.global_component_non_finite[c];
+        }
+      }
+      std::cout << os.str() << "\n";
+    }
+
+    if (scan.first_local_entry.found && rank == scan.first_bad_rank)
+    {
+      std::cout << "[nan-scan] event=vector-scan"
+                << " label=" << label
+                << " t=" << t
+                << " rank=" << rank
+                << " local_index=" << scan.first_local_entry.local_index
+                << " scalar_dof=" << scan.first_local_entry.scalar_dof
+                << " component="
+                << StateComponentName(scan.first_local_entry.component,
+                                      dim_,
+                                      vdim)
+                << " value=" << scan.first_local_entry.value
+                << " ordering="
+                << ((ordering == mfem::Ordering::byNODES) ? "byNODES"
+                                                          : "byVDIM")
+                << "\n";
     }
   }
+}
+
+void RK3SSPWithLimiter::MaybeScanAdmissibility(Vector& v,
+                                               double t,
+                                               const char* label)
+{
+  if (!admissibility_scan_stages_)
+  {
+    return;
+  }
+
+  const auto report_scan =
+    [&](mfem::dg_igr::EulerAdmissibilityPointSet point_set)
+  {
+    const auto scan = mfem::dg_igr::ScanEulerAdmissibility(vfes_,
+                                                           v,
+                                                           dim_,
+                                                           gamma_,
+                                                           rho_min_,
+                                                           p_min_,
+                                                           quad_order_,
+                                                           face_quad_orders_,
+                                                           point_set);
+    if (scan.global_bad_rho <= 0 && scan.global_bad_pressure <= 0)
+    {
+      return;
+    }
+
+    int rank = 0;
+    MPI_Comm_rank(vfes_.GetComm(), &rank);
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[admissibility-scan] event=euler"
+                << " label=" << label
+                << " point_set=" << AdmissibilityPointSetName(point_set)
+                << " t=" << t
+                << " bad_rho=" << scan.global_bad_rho
+                << " bad_pressure=" << scan.global_bad_pressure
+                << " min_rho=" << scan.global_min_rho
+                << " min_pressure=" << scan.global_min_pressure
+                << " first_bad_rank=" << scan.first_bad_rank << "\n";
+    }
+
+    if (scan.first_local_issue.found && rank == scan.first_bad_rank)
+    {
+      std::cout << "[admissibility-scan] event=euler"
+                << " label=" << label
+                << " point_set=" << AdmissibilityPointSetName(point_set)
+                << " t=" << t
+                << " rank=" << rank
+                << " issue="
+                << (scan.first_local_issue.pressure_bad ? "pressure" : "density")
+                << " element=" << scan.first_local_issue.element
+                << " face=" << scan.first_local_issue.face
+                << " qpt=" << scan.first_local_issue.point_index
+                << " scalar_dof=" << scan.first_local_issue.scalar_dof
+                << " rho=" << scan.first_local_issue.rho
+                << " pressure=" << scan.first_local_issue.pressure
+                << " face_point=" << (scan.first_local_issue.face_point ? 1 : 0)
+                << "\n";
+    }
+  };
+
+  report_scan(mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
+  report_scan(mfem::dg_igr::EulerAdmissibilityPointSet::Limiter);
+  report_scan(mfem::dg_igr::EulerAdmissibilityPointSet::Output);
 }
 
 // --------------------------------- SSPRK(3,3) ---------------------------------
@@ -213,7 +407,8 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   {
     ApplyCallbacks(x, t, apply_optional);
   }
-  MaybeScanStage(x, t, "initial");
+  MaybeScanVector(x, t, "initial");
+  MaybeScanAdmissibility(x, t, "initial");
 
   // k0 = f(t, x)
   if (stage_aware)
@@ -222,11 +417,15 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   }
   f->SetTime(t);
   f->Mult(x, k_);
+  MaybeScanVector(k_, t, "rhs0");
 
   // ===== Stage 1: y = x + dt * k0 =====
   add(x, dt, k_, y_);
+  MaybeScanVector(y_, t + dt, "stage1-prelimit");
+  MaybeScanAdmissibility(y_, t + dt, "stage1-prelimit");
   ApplyCallbacks(y_, t + dt, apply_optional);
-  MaybeScanStage(y_, t + dt, "stage1");
+  MaybeScanVector(y_, t + dt, "stage1");
+  MaybeScanAdmissibility(y_, t + dt, "stage1");
 
   // k1 = f(t+dt, y)
   if (stage_aware)
@@ -235,12 +434,16 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   }
   f->SetTime(t + dt);
   f->Mult(y_, k_);
+  MaybeScanVector(k_, t + dt, "rhs1");
 
   // ===== Stage 2: y = 3/4*x + 1/4 ( y + dt * k1 ) =====
   y_.Add(dt, k_); // y := y + dt*k1
   add(3.0 / 4.0, x, 1.0 / 4.0, y_, y_);
+  MaybeScanVector(y_, t + dt, "stage2-prelimit");
+  MaybeScanAdmissibility(y_, t + dt, "stage2-prelimit");
   ApplyCallbacks(y_, t + dt, /*apply_optional=*/false);
-  MaybeScanStage(y_, t + dt, "stage2");
+  MaybeScanVector(y_, t + dt, "stage2");
+  MaybeScanAdmissibility(y_, t + dt, "stage2");
 
   // k2 = f(t + dt/2, y)
   if (stage_aware)
@@ -249,14 +452,18 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   }
   f->SetTime(t + dt / 2);
   f->Mult(y_, k_);
+  MaybeScanVector(k_, t + dt / 2, "rhs2");
 
   // ===== Stage 3: x = 1/3*x + 2/3 ( y + dt*k2 ) =====
   y_.Add(dt, k_); // y := y + dt*k2
   add(1.0 / 3.0, x, 2.0 / 3.0, y_, x);
+  MaybeScanVector(x, t + dt, "stage3-prelimit");
+  MaybeScanAdmissibility(x, t + dt, "stage3-prelimit");
   t += dt;
   // Final limiting on x
   ApplyCallbacks(x, t, /*apply_optional=*/false);
-  MaybeScanStage(x, t, "stage3");
+  MaybeScanVector(x, t, "stage3");
+  MaybeScanAdmissibility(x, t, "stage3");
 
   ++step_count_;
 }

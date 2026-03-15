@@ -391,7 +391,8 @@ void SlipWallState::Eval(const Vector& Uminus,
   // Copy conservative state
   Uplus = Uminus;
 
-  const double rho = Uminus(0);
+  const double rho_raw = Uminus(0);
+  const double rho = std::max(rho_raw, kRhoFloor);
 
   // Unit normal from scaled normal
   Vector nhat(nor);
@@ -410,6 +411,7 @@ void SlipWallState::Eval(const Vector& Uminus,
 
   // Reflect normal component
   const double un = InnerProduct(u, nhat);
+  Uplus(0) = rho;
   for (int d = 0; d < dim_; ++d)
   {
     const double uprime_d = u(d) - 2.0 * un * nhat(d);

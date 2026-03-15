@@ -29,6 +29,7 @@ namespace dg_sim
 struct IGROptions
 {
   double c_alpha_user = -1.0;
+  std::string alpha_length_policy = "";
   std::string space = "H1";
   std::string grad = "H1";
   std::string solve_mode = "krylov";
@@ -274,6 +275,33 @@ ParseIGRSigmaUpdateCadence(const std::string& value)
   return dg_igr::IGRSigmaUpdateCadence::EveryStage;
 }
 
+inline dg_igr::IGRAlphaLengthScalePolicy
+ParseIGRAlphaLengthScalePolicy(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "min" || lower == "minimum")
+  {
+    return dg_igr::IGRAlphaLengthScalePolicy::Min;
+  }
+  if (lower == "avg" || lower == "average" || lower == "mean")
+  {
+    return dg_igr::IGRAlphaLengthScalePolicy::Average;
+  }
+  if (lower == "max" || lower == "maximum")
+  {
+    return dg_igr::IGRAlphaLengthScalePolicy::Max;
+  }
+  if (lower == "local" || lower == "local-dx" || lower == "element-local")
+  {
+    return dg_igr::IGRAlphaLengthScalePolicy::Local;
+  }
+  MFEM_VERIFY(false,
+              "Invalid IGR alpha length-scale policy '"
+                << value
+                << "'. Use 'min', 'average', 'max', or 'local'.");
+  return dg_igr::IGRAlphaLengthScalePolicy::Average;
+}
+
 inline const char* IGRIPKindToString(dg_igr::IGRIPKind value)
 {
   switch (value)
@@ -356,6 +384,23 @@ IGRSigmaUpdateCadenceToString(dg_igr::IGRSigmaUpdateCadence value)
     return "every-n-steps";
   }
   return "every-stage";
+}
+
+inline const char*
+IGRAlphaLengthScalePolicyToString(dg_igr::IGRAlphaLengthScalePolicy value)
+{
+  switch (value)
+  {
+  case dg_igr::IGRAlphaLengthScalePolicy::Min:
+    return "min";
+  case dg_igr::IGRAlphaLengthScalePolicy::Average:
+    return "average";
+  case dg_igr::IGRAlphaLengthScalePolicy::Max:
+    return "max";
+  case dg_igr::IGRAlphaLengthScalePolicy::Local:
+    return "local";
+  }
+  return "average";
 }
 
 inline DGBackend ParseDGBackend(const std::string& value)
@@ -627,6 +672,8 @@ inline void ApplyExampleDefaults(CaseConfig& cfg)
   cfg.igr_config.lin_atol = 0.0;
   cfg.igr_config.lin_maxit = 1000;
   cfg.igr_config.lin_print = 0;
+  cfg.igr_config.alpha_length_scale_policy =
+    dg_igr::IGRAlphaLengthScalePolicy::Average;
   cfg.igr_config.sigma_cadence = dg_igr::IGRSigmaUpdateCadence::EveryStage;
   cfg.igr_config.sigma_update_interval = 1;
   cfg.igr_config.stage_rtol_scale = 1.0;
@@ -658,6 +705,10 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "-ca",
                  "--c-alpha",
                  "Forward scaling constant C_alpha (default 1.0).");
+  args.AddOption(&igr_opts.alpha_length_policy,
+                 "-ial",
+                 "--igr-alpha-length",
+                 "IGR alpha length-scale policy: min | average | max | local.");
   args.AddOption(&igr_opts.space,
                  "-is",
                  "--igr-space",
@@ -754,6 +805,16 @@ inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
     ParseDGSEMEntropyJacobian(opts.dgsem_entropy_jacobian);
   run_cfg.mesh_path = ResolveCaseMesh(case_cfg, opts.mesh_file);
   return run_cfg;
+}
+
+inline dg_igr::IGRAlphaLengthScalePolicy
+ResolveIGRAlphaLengthScalePolicy(const RunConfig& run_cfg)
+{
+  if (!run_cfg.igr_opts.alpha_length_policy.empty())
+  {
+    return ParseIGRAlphaLengthScalePolicy(run_cfg.igr_opts.alpha_length_policy);
+  }
+  return run_cfg.case_config.igr_config.alpha_length_scale_policy;
 }
 
 inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)

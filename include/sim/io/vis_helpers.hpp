@@ -21,6 +21,7 @@ namespace dg_sim
 struct H1Diagnostics;
 struct L2Diagnostics;
 struct MPIRankField;
+struct ZhangShuLimiterField;
 
 /// @brief Field handles for common Euler visualization/export helpers.
 struct EulerFieldList
@@ -32,6 +33,7 @@ struct EulerFieldList
   H1Diagnostics* h1_diag = nullptr;
   L2Diagnostics* l2_diag = nullptr;
   MPIRankField* mpi_rank = nullptr;
+  ZhangShuLimiterField* zhang_shu = nullptr;
 };
 
 /// @brief GLVis windows for common Euler fields.
@@ -134,6 +136,33 @@ struct MPIRankField
       rank(fes0.get())
   {
     rank = static_cast<double>(mfem::Mpi::WorldRank());
+  }
+};
+
+/// @brief Per-element Zhang-Shu limiter activity exported as order-0 DG fields.
+struct ZhangShuLimiterField
+{
+  std::unique_ptr<mfem::L2_FECollection> fec0;
+  std::unique_ptr<mfem::ParFiniteElementSpace> fes0;
+  mfem::ParGridFunction active;
+  mfem::ParGridFunction theta_rho;
+  mfem::ParGridFunction theta_p;
+
+  explicit ZhangShuLimiterField(mfem::ParMesh& mesh)
+    : fec0(std::make_unique<mfem::L2_FECollection>(0, mesh.Dimension())),
+      fes0(std::make_unique<mfem::ParFiniteElementSpace>(&mesh, fec0.get())),
+      active(fes0.get()),
+      theta_rho(fes0.get()),
+      theta_p(fes0.get())
+  {
+    Reset();
+  }
+
+  void Reset()
+  {
+    active = 0.0;
+    theta_rho = 1.0;
+    theta_p = 1.0;
   }
 };
 
@@ -294,6 +323,12 @@ inline mfem::io::EulerVTKFields MakeEulerVTKFields(const EulerFieldList& fields)
   if (fields.mpi_rank)
   {
     out.mpi_rank = &fields.mpi_rank->rank;
+  }
+  if (fields.zhang_shu)
+  {
+    out.zhang_shu_active = &fields.zhang_shu->active;
+    out.zhang_shu_theta_rho = &fields.zhang_shu->theta_rho;
+    out.zhang_shu_theta_p = &fields.zhang_shu->theta_p;
   }
   return out;
 }

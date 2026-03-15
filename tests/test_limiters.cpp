@@ -521,6 +521,7 @@ void CheckLimiterOnPerturbedState(TestContext& ctx,
                                        rho_min,
                                        p_min,
                                        /*quad_order=*/qord,
+                                       /*face_quad_orders=*/{},
                                        /*p_bisect_iters=*/12);
 
   double min_rho = 0.0;
@@ -576,6 +577,7 @@ int RunLimiterTests(TestContext& ctx)
                                          rho_min,
                                          p_min,
                                          /*quad_order=*/0,
+                                         /*face_quad_orders=*/{},
                                          /*p_bisect_iters=*/12);
 
     double min_rho = 0.0;

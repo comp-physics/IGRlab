@@ -40,6 +40,7 @@ public:
   using SolveMode = IGRSolveMode;
   using LinearSolverType = IGRLinearSolverType;
   using PrecondType = IGRPrecondType;
+  using AlphaLengthScalePolicy = IGRAlphaLengthScalePolicy;
   using Config = IGRConfig;
 
   /**
@@ -58,6 +59,7 @@ public:
 
   /// Set regularization parameter α.
   void SetAlpha(double a);
+  void SetAlphaLengthScalePolicy(AlphaLengthScalePolicy policy);
 
   /// Clamp for rho to avoid division by very small numbers (default IGRDefaults::kRhoFloor).
   void SetRhoFloor(double rho_floor);
@@ -119,6 +121,7 @@ public:
   void ApplyConfig(const Config& cfg)
   {
     SetAlpha(cfg.alpha);
+    SetAlphaLengthScalePolicy(cfg.alpha_length_scale_policy);
     SetRhoFloor(cfg.rho_floor);
     SetGradBackend(cfg.backend);
     SetIPKind(cfg.ip_kind);
@@ -253,6 +256,7 @@ private:
                 const mfem::IntegrationPoint& ip) override;
     void SetState(const mfem::ParGridFunction& U) { U_ = &U; }
     void SetAlpha(double a) { alpha_ = a; }
+    void SetAlphaCoefficient(mfem::Coefficient* coeff) { alpha_coeff_ = coeff; }
     void SetRhoFloor(double floor) { rho_floor_ = floor; }
     // Optional continuous velocity field (vdim=dim); if set, its gradient is used.
     void SetVelField(const mfem::ParGridFunction* v) { velH1_ = v; }
@@ -263,27 +267,32 @@ private:
       nullptr; // non-owning optional continuous velocity
     int dim_, num_eq_;
     double alpha_, rho_floor_;
+    mfem::Coefficient* alpha_coeff_ = nullptr; // non-owning
     mfem::Vector state_;      // [rho, m(0:dim-1), E]
     mfem::DenseMatrix gradU_; // num_eq_ x dim_
     mfem::DenseMatrix gradu_; // dim_ x dim_
   };
 
-  /// α as a coefficient that references a double.
-  class AlphaRefCoefficient : public mfem::Coefficient
+  /// α(x) as a coefficient derived from the selected length-scale policy.
+  class AlphaPolicyCoefficient : public mfem::Coefficient
   {
   public:
-    explicit AlphaRefCoefficient(const double& a_ref)
-      : a_ref_(a_ref)
+    AlphaPolicyCoefficient(const mfem::ParMesh& mesh,
+                           const double& a_ref,
+                           const AlphaLengthScalePolicy& policy_ref)
+      : mesh_(mesh),
+        a_ref_(a_ref),
+        policy_ref_(policy_ref)
     {
     }
     double Eval(mfem::ElementTransformation&,
                 const mfem::IntegrationPoint&) override
-    {
-      return a_ref_;
-    }
+    ;
 
   private:
+    const mfem::ParMesh& mesh_;
     const double& a_ref_;
+    const AlphaLengthScalePolicy& policy_ref_;
   };
 
   // ---------- Core assemble/apply helpers ----------
@@ -300,6 +309,8 @@ private:
   int dim_, num_eq_;
   double alpha_ = mfem::dg_igr::IGRDefaults::kAlpha;
   double rho_floor_ = mfem::dg_igr::IGRDefaults::kRhoFloor;
+  AlphaLengthScalePolicy alpha_length_scale_policy_ =
+    AlphaLengthScalePolicy::Average;
   SmootherType smoot_ = SmootherType::L1Jacobi;
   GradBackend backend_ = GradBackend::H1Projection;
   IPKind ip_kind_ = IPKind::SIPG; //default SPD
@@ -339,7 +350,7 @@ private:
   // Coefficients that refer to U
   std::unique_ptr<InvRhoCoefficient> invrho_coef_;
   std::unique_ptr<SigmaSourceCoefficient> src_coef_;
-  std::unique_ptr<AlphaRefCoefficient> alpha_coef_;   // α(x) ≡ alpha_
+  std::unique_ptr<AlphaPolicyCoefficient> alpha_coef_; // α(x) from policy
   std::unique_ptr<mfem::ProductCoefficient> ck_coef_; // ck(x) = α/ρ
 
   // Linear system objects

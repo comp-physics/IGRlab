@@ -253,7 +253,9 @@ double IGRSolver::SigmaSourceCoefficient::Eval(mfem::ElementTransformation& T,
       for (int j = 0; j < dim_; ++j)
         trA2 += gradv(i, j) * gradv(j, i);
 
-    return alpha_ * (trA2 + divu * divu);
+    const double alpha =
+      alpha_coeff_ ? alpha_coeff_->Eval(T, ip) : alpha_;
+    return alpha * (trA2 + divu * divu);
   }
 
   // BrokenDG backend: in-cell quotient rule from conservative gradients
@@ -301,7 +303,20 @@ double IGRSolver::SigmaSourceCoefficient::Eval(mfem::ElementTransformation& T,
   }
 
   // Paper RHS: α ( tr((∇u)^2) + (tr ∇u)^2 )
-  return alpha_ * (trA2 + divu * divu);
+  const double alpha = alpha_coeff_ ? alpha_coeff_->Eval(T, ip) : alpha_;
+  return alpha * (trA2 + divu * divu);
+}
+
+double IGRSolver::AlphaPolicyCoefficient::Eval(
+  mfem::ElementTransformation& T,
+  const mfem::IntegrationPoint&)
+{
+  if (policy_ref_ != AlphaLengthScalePolicy::Local || T.ElementNo < 0)
+  {
+    return a_ref_;
+  }
+  const double h = mesh_.GetElementSize(&T, 1);
+  return a_ref_ * h * h;
 }
 
 // ---------------- IGRSolver core ----------------
@@ -331,7 +346,9 @@ IGRSolver::IGRSolver(mfem::ParFiniteElementSpace& sigma_fes,
                                                        num_eq_,
                                                        alpha_,
                                                        rho_floor_);
-  alpha_coef_ = std::make_unique<AlphaRefCoefficient>(alpha_);
+  alpha_coef_ = std::make_unique<AlphaPolicyCoefficient>(
+    *sfes_.GetParMesh(), alpha_, alpha_length_scale_policy_);
+  src_coef_->SetAlphaCoefficient(alpha_coef_.get());
   ck_coef_ =
     std::make_unique<mfem::ProductCoefficient>(*alpha_coef_, *invrho_coef_);
 
@@ -356,6 +373,11 @@ void IGRSolver::SetAlpha(double a)
   {
     src_coef_->SetAlpha(a);
   }
+}
+
+void IGRSolver::SetAlphaLengthScalePolicy(AlphaLengthScalePolicy policy)
+{
+  alpha_length_scale_policy_ = policy;
 }
 
 void IGRSolver::SetSmoother(SmootherType t)
@@ -503,6 +525,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
 
   src_coef_->SetState(U);
   src_coef_->SetAlpha(alpha_);
+  src_coef_->SetAlphaCoefficient(alpha_coef_.get());
   src_coef_->SetRhoFloor(rho_floor_);
 
   // --- IMPORTANT: tell MFEM we will re-use the same mfem::ParBilinearForm again ---

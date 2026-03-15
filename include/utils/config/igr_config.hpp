@@ -81,12 +81,24 @@ enum class IGRSigmaUpdateCadence
   EveryNSteps
 };
 
+/// @brief Policy for converting mesh size into the IGR alpha length scale.
+/// @ingroup utils_config
+enum class IGRAlphaLengthScalePolicy
+{
+  Min,
+  Average,
+  Max,
+  Local
+};
+
 /// @brief Configuration bundle for IGR defaults and runtime tuning.
 /// @ingroup utils_config
 struct IGRConfig
 {
   double alpha = mfem::dg_igr::IGRDefaults::kAlpha;
   double rho_floor = mfem::dg_igr::IGRDefaults::kRhoFloor;
+  IGRAlphaLengthScalePolicy alpha_length_scale_policy =
+    IGRAlphaLengthScalePolicy::Average;
 
   IGRSmootherType smoot = IGRSmootherType::L1Jacobi;
   IGRGradBackend backend = IGRGradBackend::H1Projection;

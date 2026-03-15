@@ -302,6 +302,10 @@ struct Solver
       spec.diagnostics.l2_diagnostics && run_cfg.opts.vtk_save;
     const bool enable_mpi_rank_diag =
       spec.diagnostics.mpi_rank_field && run_cfg.opts.vtk_save;
+    const bool enable_zhang_shu_diag =
+      spec.diagnostics.zhang_shu_limiter &&
+      run_cfg.opts.vtk_save &&
+      case_cfg.limiter_pipeline.zhang_shu;
     const bool need_h1 = spec.need_h1 || enable_h1_vis_diag;
     ExampleContext ctx = BuildExampleContext(run_cfg,
                                              run_cfg.igr_opts.space,
@@ -324,20 +328,30 @@ struct Solver
 
     mfem::RK3SSPWithLimiter rk3 =
       MakeRK3Stepper(ctx.spaces.vfes, ctx.dim, case_cfg.rk3_config);
+    if (run_cfg.dg_backend == DGBackend::DG)
+    {
+      const int dg_face_qord =
+        2 * ctx.spaces.vfes.GetFE(0)->GetOrder() + case_cfg.int_order_offset;
+      rk3.SetLimiterFaceQuadratureOrders({dg_face_qord});
+    }
     ConfigureLimiterPipeline(rk3,
                              case_cfg.limiter_pipeline,
                              ctx.spaces.vfes,
                              ctx.dim,
                              case_cfg.gamma);
     rk3.EnableStageNanScan(run_cfg.opts.nan_scan);
+    rk3.EnableStageAdmissibilityScan(run_cfg.opts.admissibility_scan);
 
     const double rho_floor = case_cfg.rk3_config.rho_min;
     std::unique_ptr<dg_igr::IGRSolver> igr;
     double vtk_c_alpha = spec.vtk.c_alpha_value;
     if (spec.use_igr)
     {
+      const auto alpha_policy = ResolveIGRAlphaLengthScalePolicy(run_cfg);
       const AlphaInfo alpha_info =
-        ComputeAlphaInfo(ctx.Mesh(), run_cfg.igr_opts.c_alpha_user);
+        ComputeAlphaInfo(ctx.Mesh(),
+                         run_cfg.igr_opts.c_alpha_user,
+                         alpha_policy);
       vtk_c_alpha = std::isnan(vtk_c_alpha) ? alpha_info.c_alpha : vtk_c_alpha;
       igr = std::make_unique<dg_igr::IGRSolver>(MakeIGRSolver(ctx.spaces,
                                                               ctx.dim,
@@ -378,6 +392,7 @@ struct Solver
     std::unique_ptr<H1Diagnostics> h1_diag;
     std::unique_ptr<L2Diagnostics> l2_diag;
     std::unique_ptr<MPIRankField> mpi_rank_field;
+    std::unique_ptr<ZhangShuLimiterField> zhang_shu_field;
     if (enable_h1_vis_diag)
     {
       h1_diag = std::make_unique<H1Diagnostics>(*ctx.spaces.h1_vfes,
@@ -398,6 +413,14 @@ struct Solver
     {
       mpi_rank_field = std::make_unique<MPIRankField>(ctx.Mesh());
       state_bundle.field_list.mpi_rank = mpi_rank_field.get();
+    }
+    if (enable_zhang_shu_diag)
+    {
+      zhang_shu_field = std::make_unique<ZhangShuLimiterField>(ctx.Mesh());
+      state_bundle.field_list.zhang_shu = zhang_shu_field.get();
+      rk3.SetZhangShuDiagnosticsFields(&zhang_shu_field->active,
+                                       &zhang_shu_field->theta_rho,
+                                       &zhang_shu_field->theta_p);
     }
 
     if (spec.after_init)

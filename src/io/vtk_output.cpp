@@ -72,6 +72,18 @@ void RegisterEulerFields(mfem::ParaViewDataCollection& dc,
   {
     dc.RegisterField("mpi_rank", fields.mpi_rank);
   }
+  if (fields.zhang_shu_active)
+  {
+    dc.RegisterField("zhang_shu_active", fields.zhang_shu_active);
+  }
+  if (fields.zhang_shu_theta_rho)
+  {
+    dc.RegisterField("zhang_shu_theta_rho", fields.zhang_shu_theta_rho);
+  }
+  if (fields.zhang_shu_theta_p)
+  {
+    dc.RegisterField("zhang_shu_theta_p", fields.zhang_shu_theta_p);
+  }
 }
 
 } // namespace io

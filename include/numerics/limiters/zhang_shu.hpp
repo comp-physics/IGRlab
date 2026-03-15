@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mfem.hpp"
+#include <vector>
 
 /**
  * @file numerics/limiters/zhang_shu.hpp
@@ -10,6 +11,23 @@
 
 namespace mfem
 {
+
+struct ZhangShuLimiterElementDiagnostics
+{
+  mfem::Vector active;
+  mfem::Vector theta_rho;
+  mfem::Vector theta_p;
+
+  void SetSize(int ne)
+  {
+    active.SetSize(ne);
+    theta_rho.SetSize(ne);
+    theta_p.SetSize(ne);
+    active = 0.0;
+    theta_rho = 1.0;
+    theta_p = 1.0;
+  }
+};
 
 /**
  * @brief Zhang-Shu positivity-preserving limiter for DG Euler.
@@ -29,6 +47,8 @@ void ApplyZhangShuPositivityLimiter(mfem::ParFiniteElementSpace& vfes,
                                     double rho_min,
                                     double p_min,
                                     int quad_order,
-                                    int p_bisect_iters = 12);
+                                    const std::vector<int>& face_quad_orders = {},
+                                    int p_bisect_iters = 12,
+                                    ZhangShuLimiterElementDiagnostics* diagnostics = nullptr);
 
 } // namespace mfem
