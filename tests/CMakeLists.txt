@@ -38,8 +38,18 @@ add_test(NAME dg_igr_time_defaults_tests COMMAND dg_igr_unit_tests --time-defaul
 add_test(NAME dg_igr_diagnostics_tests COMMAND dg_igr_unit_tests --diagnostics)
 
 # MPI parity checks: generate a 1-rank reference and compare against 2 ranks.
+# Keep this list curated to suites with stable, decomposition-invariant metrics.
 if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
   set(DG_IGR_PARITY_REF_FILE "${CMAKE_BINARY_DIR}/tests/dg_igr_parity_ref.txt")
+  set(DG_IGR_PARITY_SUITES
+    --dg-operator
+    --dgsem-flux
+    --dgsem-operator
+    --dgsem-advection
+    --dgsem-igr
+    --diagnostics
+    --time-defaults
+  )
   file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 
   add_test(NAME dg_igr_parity_ref_1rank
@@ -47,7 +57,7 @@ if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
             DG_IGR_PARITY_REF=${DG_IGR_PARITY_REF_FILE}
             DG_IGR_PARITY_WRITE=1
             ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
-            $<TARGET_FILE:dg_igr_unit_tests> --parity --all
+            $<TARGET_FILE:dg_igr_unit_tests> --parity ${DG_IGR_PARITY_SUITES}
             ${MPIEXEC_POSTFLAGS}
   )
   set_tests_properties(dg_igr_parity_ref_1rank PROPERTIES
@@ -60,7 +70,7 @@ if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
     COMMAND ${CMAKE_COMMAND} -E env
             DG_IGR_PARITY_REF=${DG_IGR_PARITY_REF_FILE}
             ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
-            $<TARGET_FILE:dg_igr_unit_tests> --parity --all
+            $<TARGET_FILE:dg_igr_unit_tests> --parity ${DG_IGR_PARITY_SUITES}
             ${MPIEXEC_POSTFLAGS}
   )
   set_tests_properties(dg_igr_parity_check_2rank PROPERTIES
@@ -85,6 +95,36 @@ if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
             ${MPIEXEC_POSTFLAGS}
   )
   set_tests_properties(dg_igr_diagnostics_mpi_2rank PROPERTIES
+    LABELS "mpi"
+    TIMEOUT 120
+  )
+
+  add_test(NAME dg_igr_dgsem_flux_mpi_2rank
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_unit_tests> --dgsem-flux
+            ${MPIEXEC_POSTFLAGS}
+  )
+  set_tests_properties(dg_igr_dgsem_flux_mpi_2rank PROPERTIES
+    LABELS "mpi"
+    TIMEOUT 120
+  )
+
+  add_test(NAME dg_igr_igr_mpi_2rank
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_unit_tests> --igr
+            ${MPIEXEC_POSTFLAGS}
+  )
+  set_tests_properties(dg_igr_igr_mpi_2rank PROPERTIES
+    LABELS "mpi"
+    TIMEOUT 120
+  )
+
+  add_test(NAME dg_igr_limiters_mpi_2rank
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_unit_tests> --limiters
+            ${MPIEXEC_POSTFLAGS}
+  )
+  set_tests_properties(dg_igr_limiters_mpi_2rank PROPERTIES
     LABELS "mpi"
     TIMEOUT 120
   )

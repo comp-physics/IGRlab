@@ -348,33 +348,36 @@ int RunDGSEMFluxTests(TestContext& ctx)
                                       num_eq,
                                       mfem::Ordering::byNODES);
 
-      const mfem::FiniteElement* fe = fes.GetFE(0);
-      const int dof = fe->GetDof();
-      const auto& dof_to_ijk = mfem::dgsem::GetTensorDofToIJK(*fe);
-
-      mfem::DenseMatrix u = BuildConstantStateMatrix(dof, state);
-      mfem::DenseMatrix du;
-      mfem::dgsem::FluxDifferencing2D(u,
-                                      basis.Dsplit,
-                                      dof_to_ijk,
-                                      central_flux,
-                                      du);
-
-      mfem::DenseMatrix expected(dof, num_eq);
-      for (int local = 0; local < dof; ++local)
+      if (fes.GetNE() > 0)
       {
-        const int i = dof_to_ijk[local][0];
-        const int j = dof_to_ijk[local][1];
-        const double scale = row_sum[i] + row_sum[j];
-        for (int eq = 0; eq < num_eq; ++eq)
+        const mfem::FiniteElement* fe = fes.GetFE(0);
+        const int dof = fe->GetDof();
+        const auto& dof_to_ijk = mfem::dgsem::GetTensorDofToIJK(*fe);
+
+        mfem::DenseMatrix u = BuildConstantStateMatrix(dof, state);
+        mfem::DenseMatrix du;
+        mfem::dgsem::FluxDifferencing2D(u,
+                                        basis.Dsplit,
+                                        dof_to_ijk,
+                                        central_flux,
+                                        du);
+
+        mfem::DenseMatrix expected(dof, num_eq);
+        for (int local = 0; local < dof; ++local)
         {
-          expected(local, eq) = scale * state(eq);
+          const int i = dof_to_ijk[local][0];
+          const int j = dof_to_ijk[local][1];
+          const double scale = row_sum[i] + row_sum[j];
+          for (int eq = 0; eq < num_eq; ++eq)
+          {
+            expected(local, eq) = scale * state(eq);
+          }
         }
+        expected -= du;
+        const double err = MaxAbsEntry(expected);
+        ctx.Check(err < 1.0e-10,
+                  "FluxDifferencing2D matches Dsplit sums on single quad");
       }
-      expected -= du;
-      const double err = MaxAbsEntry(expected);
-      ctx.Check(err < 1.0e-10,
-                "FluxDifferencing2D matches Dsplit sums on single quad");
     }
   }
 
@@ -472,6 +475,7 @@ int RunDGSEMFluxTests(TestContext& ctx)
 
     mfem::Vector x(vfes.GetTrueVSize());
     x = 0.0;
+    if (vfes.GetNE() > 0)
     {
       const mfem::FiniteElement* fe = vfes.GetFE(0);
       const int dof = fe->GetDof();
@@ -501,8 +505,11 @@ int RunDGSEMFluxTests(TestContext& ctx)
       oper.SetDGSEMVolumeDissipation(mode);
       z.SetSize(vfes.GetTrueVSize());
       z = 0.0;
-      mfem::dgsem::DGSEMOperator dgsem_op(oper);
-      dgsem_op.AssembleVolume(x, z);
+      if (vfes.GetNE() > 0)
+      {
+        mfem::dgsem::DGSEMOperator dgsem_op(oper);
+        dgsem_op.AssembleVolume(x, z);
+      }
     };
 
     mfem::Vector z_none, z_llf, z_entropy;
@@ -560,6 +567,8 @@ int RunDGSEMFluxTests(TestContext& ctx)
   }
 
   // Integration test: DGSEM volume mode constant-state residual in 2D.
+  // Intentionally use a single global element so the 2-rank MPI test covers
+  // empty-partition robustness on one rank.
   {
     constexpr int dim = 2;
     constexpr int num_eq = dim + 2;
@@ -615,7 +624,11 @@ int RunDGSEMFluxTests(TestContext& ctx)
     mfem::Vector x;
     mfem::Vector y(vfes.GetTrueVSize());
     U.GetTrueDofs(x);
-    oper.Mult(x, y);
+    y = 0.0;
+    if (vfes.GetNE() > 0)
+    {
+      oper.Mult(x, y);
+    }
 
     const double resid_norm = GlobalL2Norm(y);
     const double resid_max = GlobalMax(MaxAbsEntry(y));
@@ -627,6 +640,8 @@ int RunDGSEMFluxTests(TestContext& ctx)
   }
 
   // Integration test: DGSEM constant-state residual on a curved quad mesh.
+  // Intentionally use a single global element so the 2-rank MPI test covers
+  // empty-partition robustness on one rank.
   {
     constexpr int dim = 2;
     constexpr int num_eq = dim + 2;
@@ -695,7 +710,11 @@ int RunDGSEMFluxTests(TestContext& ctx)
     mfem::Vector x;
     mfem::Vector y(vfes.GetTrueVSize());
     U.GetTrueDofs(x);
-    oper.Mult(x, y);
+    y = 0.0;
+    if (vfes.GetNE() > 0)
+    {
+      oper.Mult(x, y);
+    }
 
     const double resid_norm = GlobalL2Norm(y);
     const double resid_max = GlobalMax(MaxAbsEntry(y));
@@ -707,6 +726,8 @@ int RunDGSEMFluxTests(TestContext& ctx)
   }
 
   // Discrete metric/GCL sanity: stronger deformation on a quad mesh.
+  // Intentionally use a single global element so the 2-rank MPI test covers
+  // empty-partition robustness on one rank.
   {
     constexpr int dim = 2;
     constexpr int num_eq = dim + 2;
@@ -777,7 +798,11 @@ int RunDGSEMFluxTests(TestContext& ctx)
     mfem::Vector x;
     mfem::Vector y(vfes.GetTrueVSize());
     U.GetTrueDofs(x);
-    oper.Mult(x, y);
+    y = 0.0;
+    if (vfes.GetNE() > 0)
+    {
+      oper.Mult(x, y);
+    }
 
     const double resid_norm = GlobalL2Norm(y);
     const double resid_max = GlobalMax(MaxAbsEntry(y));

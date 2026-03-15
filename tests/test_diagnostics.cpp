@@ -27,46 +27,47 @@ dg_sim::RunConfig MakeRunConfig(int order)
   return cfg;
 }
 
-int FindLeftElement(const dg_sim::ExampleContext& ctx)
+int FindInterfaceSideElement(const dg_sim::ExampleContext& ctx, bool left)
 {
   mfem::IntegrationPoint ip_center;
   ip_center.Set2(0.5, 0.5);
   int best_e = -1;
-  double best_x = std::numeric_limits<double>::infinity();
+  double best_x = left ? -std::numeric_limits<double>::infinity()
+                       : std::numeric_limits<double>::infinity();
   for (int e = 0; e < ctx.Mesh().GetNE(); ++e)
   {
     mfem::ElementTransformation* Tr =
       ctx.spaces.fes.GetElementTransformation(e);
     mfem::Vector x;
     Tr->Transform(ip_center, x);
-    if (x(0) < best_x)
+    if (left)
     {
-      best_x = x(0);
-      best_e = e;
+      if (x(0) < 0.5 && x(0) > best_x)
+      {
+        best_x = x(0);
+        best_e = e;
+      }
+    }
+    else
+    {
+      if (x(0) > 0.5 && x(0) < best_x)
+      {
+        best_x = x(0);
+        best_e = e;
+      }
     }
   }
   return best_e;
 }
 
-int FindRightElement(const dg_sim::ExampleContext& ctx)
+double ReduceOwnedValue(double local_value, bool owned)
 {
-  mfem::IntegrationPoint ip_center;
-  ip_center.Set2(0.5, 0.5);
-  int best_e = -1;
-  double best_x = -std::numeric_limits<double>::infinity();
-  for (int e = 0; e < ctx.Mesh().GetNE(); ++e)
-  {
-    mfem::ElementTransformation* Tr =
-      ctx.spaces.fes.GetElementTransformation(e);
-    mfem::Vector x;
-    Tr->Transform(ip_center, x);
-    if (x(0) > best_x)
-    {
-      best_x = x(0);
-      best_e = e;
-    }
-  }
-  return best_e;
+  return GlobalSum(owned ? local_value : 0.0);
+}
+
+double ReduceOwnedCount(bool owned)
+{
+  return GlobalSum(owned ? 1.0 : 0.0);
 }
 
 } // namespace
@@ -159,10 +160,14 @@ int RunDiagnosticsTests(TestContext& ctx)
                                   rho_floor);
     h1_diag.Update();
 
-    const int left_e = FindLeftElement(example_ctx);
-    const int right_e = FindRightElement(example_ctx);
-    ctx.Check(left_e >= 0 && right_e >= 0 && left_e != right_e,
-              "Diagnostics test mesh has distinct left/right elements.");
+    const int left_e = FindInterfaceSideElement(example_ctx, /*left=*/true);
+    const int right_e = FindInterfaceSideElement(example_ctx, /*left=*/false);
+    const bool owns_left = (left_e >= 0);
+    const bool owns_right = (right_e >= 0);
+    const double left_count = ReduceOwnedCount(owns_left);
+    const double right_count = ReduceOwnedCount(owns_right);
+    ctx.Check(left_count == 1.0 && right_count == 1.0,
+              "Diagnostics test mesh exposes left/right interface elements.");
 
     mfem::Vector x_left(2);
     x_left(0) = 0.5 - 1.0e-10;
@@ -172,36 +177,46 @@ int RunDiagnosticsTests(TestContext& ctx)
     x_right(1) = 0.5;
     mfem::IntegrationPoint ip_left;
     mfem::IntegrationPoint ip_right;
+    if (owns_left)
     {
       mfem::ElementTransformation* Tr_left =
         example_ctx.spaces.h1_vfes->GetElementTransformation(left_e);
       Tr_left->TransformBack(x_left, ip_left);
     }
+    if (owns_right)
     {
       mfem::ElementTransformation* Tr_right =
         example_ctx.spaces.h1_vfes->GetElementTransformation(right_e);
       Tr_right->TransformBack(x_right, ip_right);
     }
 
-    mfem::Vector ul, ur;
+    mfem::Vector ul(2);
+    mfem::Vector ur(2);
+    ul = 0.0;
+    ur = 0.0;
+    if (owns_left)
     {
       mfem::ElementTransformation* Tr_left =
         example_ctx.spaces.h1_vfes->GetElementTransformation(left_e);
       h1_diag.u_h1.GetVectorValue(*Tr_left, ip_left, ul);
     }
+    if (owns_right)
     {
       mfem::ElementTransformation* Tr_right =
         example_ctx.spaces.h1_vfes->GetElementTransformation(right_e);
       h1_diag.u_h1.GetVectorValue(*Tr_right, ip_right, ur);
     }
 
+    const double ul0 = ReduceOwnedValue(ul(0), owns_left);
+    const double ur0 = ReduceOwnedValue(ur(0), owns_right);
+
     // With arithmetic averaging, shared interface velocity is (0 + 2)/2 = 1.
-    ctx.CheckNear(ul(0),
+    ctx.CheckNear(ul0,
                   1.0,
                   1.0e-8,
                   "H1 velocity projection averages discontinuous DG states at "
                   "interface (left).");
-    ctx.CheckNear(ur(0),
+    ctx.CheckNear(ur0,
                   1.0,
                   1.0e-8,
                   "H1 velocity projection averages discontinuous DG states at "
@@ -257,28 +272,42 @@ int RunDiagnosticsTests(TestContext& ctx)
                 l2_diag.g_div_l2.ParFESpace()->FEColl()) != nullptr,
               "L2 diagnostics use DG/L2 finite element collection.");
 
-    const int left_e = FindLeftElement(example_ctx);
-    const int right_e = FindRightElement(example_ctx);
-    ctx.Check(left_e >= 0 && right_e >= 0 && left_e != right_e,
-              "L2 diagnostics test mesh has distinct left/right elements.");
+    const int left_e = FindInterfaceSideElement(example_ctx, /*left=*/true);
+    const int right_e = FindInterfaceSideElement(example_ctx, /*left=*/false);
+    const bool owns_left = (left_e >= 0);
+    const bool owns_right = (right_e >= 0);
+    const double left_count = ReduceOwnedCount(owns_left);
+    const double right_count = ReduceOwnedCount(owns_right);
+    ctx.Check(left_count == 1.0 && right_count == 1.0,
+              "L2 diagnostics test mesh exposes left/right interface elements.");
 
     mfem::IntegrationPoint ip_left;
     mfem::IntegrationPoint ip_right;
     ip_left.Set2(0.5, 0.5);
     ip_right.Set2(0.5, 0.5);
 
-    const double div_left = [&]()
+    const double div_left_local = [&]()
     {
+      if (!owns_left)
+      {
+        return 0.0;
+      }
       mfem::ElementTransformation* Tr_left =
         example_ctx.spaces.fes.GetElementTransformation(left_e);
       return l2_diag.g_div_l2.GetValue(*Tr_left, ip_left);
     }();
-    const double div_right = [&]()
+    const double div_right_local = [&]()
     {
+      if (!owns_right)
+      {
+        return 0.0;
+      }
       mfem::ElementTransformation* Tr_right =
         example_ctx.spaces.fes.GetElementTransformation(right_e);
       return l2_diag.g_div_l2.GetValue(*Tr_right, ip_right);
     }();
+    const double div_left = ReduceOwnedValue(div_left_local, owns_left);
+    const double div_right = ReduceOwnedValue(div_right_local, owns_right);
 
     // For u_x = x (left) and u_x = 2x (right), broken gradients stay local:
     // div_left ~= 1, div_right ~= 2 in the two elements.

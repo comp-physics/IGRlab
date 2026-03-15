@@ -273,6 +273,8 @@ bool WriteParityReference(const std::string& path, const MetricMap& metrics)
   {
     return false;
   }
+  ofs.setf(std::ios::scientific);
+  ofs << std::setprecision(std::numeric_limits<double>::max_digits10);
   ofs << "# dg_igr MPI parity reference\n";
   for (const auto& kv : metrics)
   {

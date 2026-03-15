@@ -374,7 +374,7 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     constexpr int num_eq2 = dim2 + 2;
     constexpr int order2 = 2;
 
-    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(1,
+    mfem::Mesh mesh2 = mfem::Mesh::MakeCartesian2D(2,
                                                    1,
                                                    mfem::Element::QUADRILATERAL,
                                                    /*gen_edges=*/true,
@@ -430,13 +430,16 @@ int RunDGSEMOperatorTests(TestContext& ctx)
       mfem::Vector x2;
       U2.GetTrueDofs(x2);
 
-      mfem::dgsem::DGSEMOperator dgsem_op2(oper2);
-
       mfem::Vector z_surf2(vfes2.GetTrueVSize());
       mfem::Vector z_vol2(vfes2.GetTrueVSize());
-      dgsem_op2.AssembleSurface(x2, z_surf2);
+      z_surf2 = 0.0;
       z_vol2 = 0.0;
-      dgsem_op2.AssembleVolume(x2, z_vol2);
+      if (vfes2.GetNE() > 0)
+      {
+        mfem::dgsem::DGSEMOperator dgsem_op2(oper2);
+        dgsem_op2.AssembleSurface(x2, z_surf2);
+        dgsem_op2.AssembleVolume(x2, z_vol2);
+      }
 
       mfem::Vector z_sum2(z_surf2.Size());
       z_sum2 = z_surf2;
@@ -448,7 +451,12 @@ int RunDGSEMOperatorTests(TestContext& ctx)
                   ", norm=" + FormatSci(norm_sum2) + ")");
 
       mfem::Vector y2(vfes2.GetTrueVSize());
-      dgsem_op2.ApplyInverseMass(z_sum2, y2);
+      y2 = 0.0;
+      if (vfes2.GetNE() > 0)
+      {
+        mfem::dgsem::DGSEMOperator dgsem_op2(oper2);
+        dgsem_op2.ApplyInverseMass(z_sum2, y2);
+      }
       const double resid_norm2 = GlobalL2Norm(y2);
       ctx.Check(resid_norm2 < tol,
                 "DGSEM 2D residual ~0 after M^{-1} (" + label +
@@ -466,6 +474,8 @@ int RunDGSEMOperatorTests(TestContext& ctx)
   }
 
   // Boundary face nodes + normals sanity (LGL alignment + outward normals).
+  // On a tiny partitioned mesh some ranks may own no local boundary faces, so
+  // the final check is global rather than per-rank.
   {
     constexpr int dim2 = 2;
     constexpr int num_eq2 = dim2 + 2;
@@ -593,7 +603,8 @@ int RunDGSEMOperatorTests(TestContext& ctx)
         }
       }
     }
-    ctx.Check(bdr_faces > 0, "Found boundary faces to check");
+    ctx.Check(GlobalSum(static_cast<double>(bdr_faces)) > 0.0,
+              "Found boundary faces to check");
   }
 
   // Boundary integrators use LGL face rule when configured.
@@ -1109,7 +1120,7 @@ int RunDGSEMOperatorTests(TestContext& ctx)
     for (const int order : orders)
     {
       mfem::Mesh mesh2 =
-        mfem::Mesh::MakeCartesian2D(1,
+        mfem::Mesh::MakeCartesian2D(2,
                                     1,
                                     mfem::Element::QUADRILATERAL,
                                     /*gen_edges=*/true,
@@ -1162,14 +1173,22 @@ int RunDGSEMOperatorTests(TestContext& ctx)
       mfem::Vector x2;
       U2.GetTrueDofs(x2);
 
-      mfem::dgsem::DGSEMOperator dgsem_op2(oper2);
       mfem::Vector z_sum2(vfes2.GetTrueVSize());
       z_sum2 = 0.0;
-      dgsem_op2.AssembleSurface(x2, z_sum2);
-      dgsem_op2.AssembleVolume(x2, z_sum2);
+      if (vfes2.GetNE() > 0)
+      {
+        mfem::dgsem::DGSEMOperator dgsem_op2(oper2);
+        dgsem_op2.AssembleSurface(x2, z_sum2);
+        dgsem_op2.AssembleVolume(x2, z_sum2);
+      }
 
       mfem::Vector y2(vfes2.GetTrueVSize());
-      dgsem_op2.ApplyInverseMass(z_sum2, y2);
+      y2 = 0.0;
+      if (vfes2.GetNE() > 0)
+      {
+        mfem::dgsem::DGSEMOperator dgsem_op2(oper2);
+        dgsem_op2.ApplyInverseMass(z_sum2, y2);
+      }
       const double resid_norm2 = GlobalL2Norm(y2);
       ctx.Check(resid_norm2 < tol_hi,
                 "DGSEM high-order residual ~0 (p=" + std::to_string(order) +
