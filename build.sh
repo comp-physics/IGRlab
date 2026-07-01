@@ -99,6 +99,15 @@ if ((INSTALL_DEPS)); then
   spack -e "${SPACK_ENV}" install
 fi
 
+SPACK_VIEW="${SPACK_ENV}/.spack-env/view"
+[[ -d "${SPACK_VIEW}" ]] || {
+  echo "ERROR: Spack environment view not found at ${SPACK_VIEW}" >&2
+  echo "       Run without --no-deps once to install the selected profile." >&2
+  exit 3
+}
+export PATH="${SPACK_VIEW}/bin:${PATH}"
+export LD_LIBRARY_PATH="${SPACK_VIEW}/lib:${SPACK_VIEW}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
 mfem_args=("--${MODE}" --jobs "${JOBS}")
 if [[ "${MODE}" == "gpu" ]]; then
   mfem_args+=(--cuda-arch "${SPACK_CUDA_ARCH}")

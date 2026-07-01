@@ -90,6 +90,13 @@ fi
   echo "ERROR: Spack environment not found at ${SPACK_ENV}" >&2
   exit 2
 }
+SPACK_VIEW="${SPACK_ENV}/.spack-env/view"
+[[ -d "${SPACK_VIEW}" ]] || {
+  echo "ERROR: Spack environment view not found at ${SPACK_VIEW}" >&2
+  exit 3
+}
+export PATH="${SPACK_VIEW}/bin:${PATH}"
+export LD_LIBRARY_PATH="${SPACK_VIEW}/lib:${SPACK_VIEW}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 [[ -f "${MFEM_SRC}/CMakeLists.txt" ]] || {
   echo "ERROR: MFEM submodule is missing; run git submodule update --init." >&2
   exit 2
