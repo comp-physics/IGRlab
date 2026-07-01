@@ -1,0 +1,13 @@
+spack:
+  specs:
+  - cmake
+  - doxygen
+  - cuda@13
+  - hypre@develop +mpi +cuda cuda_arch=120
+  - metis
+  - openmpi +cuda
+  packages:
+    all:
+      providers:
+        mpi: [openmpi]
+  view: true

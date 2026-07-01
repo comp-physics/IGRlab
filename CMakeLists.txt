@@ -6,12 +6,26 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(CTest)
 option(DG_IGR_BUILD_TESTS "Build dg_igr unit tests" ON)
+option(DG_IGR_REQUIRE_MFEM_CUDA
+       "Fail configure unless the discovered MFEM package has CUDA enabled."
+       OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
 find_package(MFEM REQUIRED CONFIG)
+
+if(DG_IGR_REQUIRE_MFEM_CUDA AND NOT MFEM_USE_CUDA)
+    message(FATAL_ERROR
+            "DG_IGR_REQUIRE_MFEM_CUDA=ON but the discovered MFEM package has CUDA disabled.")
+endif()
+
+# CUDA-enabled HYPRE exposes Umpire types from public headers. MFEM's exported
+# target references umpire but does not load its CMake package downstream.
+if(MFEM_USE_UMPIRE)
+    find_package(umpire REQUIRED CONFIG)
+endif()
 
 add_subdirectory(src)
 add_subdirectory(examples/supersonic_example)

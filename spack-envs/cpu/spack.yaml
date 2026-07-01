@@ -1,0 +1,13 @@
+spack:
+  specs:
+    # Build tools and dependencies for a CPU-only local MFEM build.
+  - cmake
+  - doxygen
+  - hypre +mpi ~cuda
+  - metis
+  - openmpi ~cuda
+  packages:
+    all:
+      providers:
+        mpi: [openmpi]
+  view: true

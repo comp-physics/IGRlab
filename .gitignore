@@ -45,7 +45,9 @@
 mfem/
 scratch/
 tpls/
-tpl
+tpl/*
+!tpl/mfem
+!tpl/mfem/
 data/
 build
 */*/build/
@@ -55,10 +57,13 @@ MFEM_examples/
 notes/
 .DS_Store
 .spack-env
+spack.lock
 euler-*
 vtk_output
 tools
 build_*/
+build-*/
+install-*/
 tests/perf*
 tests/scripts
 out/

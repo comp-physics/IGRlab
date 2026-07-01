@@ -39,7 +39,7 @@ BdrHyperbolicFluxIntegrator::BdrHyperbolicFluxIntegrator(
 
 void BdrHyperbolicFluxIntegrator::AssembleFaceVector(
   const FiniteElement& el1,
-  const FiniteElement& el2,
+  const FiniteElement&,
   FaceElementTransformations& Tr,
   const Vector& elfun,
   Vector& elvect)
@@ -47,15 +47,12 @@ void BdrHyperbolicFluxIntegrator::AssembleFaceVector(
   // current elements' the number of degrees of freedom
   // does not consider the number of equations
   const int dof1 = el1.GetDof();
-  const int dof2 = el2.GetDof();
 
 #ifdef MFEM_THREAD_SAFE
   // Local storage for element integration
 
   // shape function value at an integration point - first elem
   Vector shape1(dof1);
-  // shape function value at an integration point - second elem
-  // Vector shape2(dof2); // Unused for BC
   // normal vector (usually not a unit vector)
   Vector nor(Tr.GetSpaceDim());
   // state value at an integration point - first elem
@@ -66,19 +63,14 @@ void BdrHyperbolicFluxIntegrator::AssembleFaceVector(
   Vector fluxN(num_equations);
 #else
   shape1.SetSize(dof1);
-  // shape2.SetSize(dof2); // Unused for BC
 #endif
 
-  elvect.SetSize((dof1 + dof2) * num_equations);
+  elvect.SetSize(dof1 * num_equations);
   elvect = 0.0;
 
   const DenseMatrix elfun1_mat(elfun.GetData(), dof1, num_equations);
-  //    const DenseMatrix elfun2_mat(elfun.GetData() + dof1 * num_equations, dof2,
-  //                                 num_equations);
 
   DenseMatrix elvect1_mat(elvect.GetData(), dof1, num_equations);
-  //    DenseMatrix elvect2_mat(elvect.GetData() + dof1 * num_equations, dof2,
-  //                            num_equations);
 
   // Obtain integration rule. If integration is rule is given, then use it.
   // Otherwise, get (2*p + IntOrderOffset) order integration rule
@@ -95,20 +87,16 @@ void BdrHyperbolicFluxIntegrator::AssembleFaceVector(
 
     Tr.SetAllIntPoints(&ip); // set face and element int. points
 
-    // Calculate basis functions on both elements at the face
+    // Calculate basis functions on the interior element at the face.
     el1.CalcShape(Tr.GetElement1IntPoint(), shape1);
-    //   el2.CalcShape(Tr.GetElement2IntPoint(), shape2);
 
     // Interpolate elfun at the point
     elfun1_mat.MultTranspose(shape1, state1);
-    //   elfun2_mat.MultTranspose(shape2, state2);
 
     // Get the normal vector and the flux on the face
     if (nor.Size() == 1) // if 1D, use 1 or -1.
     {
-      // This assume the 1D integration point is in (0,1). This may not work
-      // if this changes.
-      nor(0) = (Tr.GetElement1IntPoint().x - 0.5) * 2.0;
+      nor(0) = 2.0 * Tr.GetElement1IntPoint().x - 1.0;
     }
     else
     {

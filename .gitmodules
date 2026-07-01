@@ -1,0 +1,3 @@
+[submodule "tpl/mfem"]
+	path = tpl/mfem
+	url = https://github.com/mfem/mfem.git
