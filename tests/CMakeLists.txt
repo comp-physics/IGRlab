@@ -165,10 +165,15 @@ if (MFEM_USE_CUDA AND TARGET inoue_hattori_stationary_shock_1dy)
     add_test(NAME ${parity_test_name}
       COMMAND ${CMAKE_COMMAND} -E env
               OMP_NUM_THREADS=1
+              DG_IGR_PARITY_SOL_RTL=5e-3
+              DG_IGR_PARITY_SIGMA_RTL=1e-3
+              DG_IGR_PARITY_SIGMA_ATOL=1e-6
               /bin/bash
               ${cpu_cuda_parity_script}
               $<TARGET_FILE:inoue_hattori_stationary_shock_1dy>
               ${parity_backend}
+              --igr-linear-solver cg
+              --igr-preconditioner none
     )
     set_tests_properties(${parity_test_name} PROPERTIES
       LABELS "cuda;parity"
