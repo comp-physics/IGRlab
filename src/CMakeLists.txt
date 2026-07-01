@@ -103,6 +103,7 @@ if(DG_IGR_ACCELERATOR_KERNEL_SOURCES)
                               PROPERTIES
                               CUDA_SEPARABLE_COMPILATION ON)
         target_compile_options(igr_mfem PRIVATE
+                               $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
                                $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
         if(CMAKE_CUDA_ARCHITECTURES)
             set_property(TARGET igr_mfem
