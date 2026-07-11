@@ -12,6 +12,65 @@ int RunTimeDefaultsTests(TestContext& ctx)
 {
   constexpr double gamma = 1.4;
 
+  // --- IGR derived runtime defaults ---
+  {
+    dg_sim::CommonOptions opts;
+    dg_sim::IGROptions igr_opts;
+    opts.device = "cuda";
+    opts.dg_backend = "dg";
+    igr_opts.space = "L2";
+    igr_opts.grad = "BrokenL2";
+    dg_sim::ApplyIGRDerivedRuntimeDefaults(opts,
+                                           igr_opts,
+                                           /*exact_face_operator_overridden=*/false);
+    ctx.Check(igr_opts.exact_dg_face_operator,
+              "IGR defaults: CUDA L2/BrokenL2 DG enables exact face");
+    ctx.Check(igr_opts.linear_solver == "minres",
+              "IGR defaults: CUDA L2/BrokenL2 DG selects MINRES");
+    ctx.Check(igr_opts.preconditioner == "chebyshev",
+              "IGR defaults: CUDA L2/BrokenL2 DG selects Chebyshev");
+    ctx.CheckNear(igr_opts.stage_rtol_scale,
+                  1.0,
+                  0.0,
+                  "IGR defaults: CUDA L2/BrokenL2 DG pins stage rtol scale");
+    ctx.CheckNear(igr_opts.lin_rtol,
+                  1.0e-5,
+                  0.0,
+                  "IGR defaults: CUDA L2/BrokenL2 DG uses production rtol");
+    ctx.CheckNear(igr_opts.lin_atol,
+                  0.0,
+                  0.0,
+                  "IGR defaults: CUDA L2/BrokenL2 DG uses zero atol");
+  }
+
+  {
+    dg_sim::CommonOptions opts;
+    dg_sim::IGROptions igr_opts;
+    opts.device = "cuda";
+    opts.dg_backend = "dg";
+    igr_opts.space = "L2";
+    igr_opts.grad = "BrokenL2";
+    dg_sim::ApplyIGRDerivedRuntimeDefaults(opts,
+                                           igr_opts,
+                                           /*exact_face_operator_overridden=*/true);
+    ctx.Check(!igr_opts.exact_dg_face_operator,
+              "IGR defaults: explicit exact-face override is preserved");
+  }
+
+  {
+    dg_sim::CommonOptions opts;
+    dg_sim::IGROptions igr_opts;
+    opts.device = "cpu";
+    opts.dg_backend = "dg";
+    igr_opts.space = "L2";
+    igr_opts.grad = "BrokenL2";
+    dg_sim::ApplyIGRDerivedRuntimeDefaults(opts,
+                                           igr_opts,
+                                           /*exact_face_operator_overridden=*/false);
+    ctx.Check(!igr_opts.exact_dg_face_operator,
+              "IGR defaults: CPU L2/BrokenL2 keeps exact face opt-in");
+  }
+
   // --- Callback config wiring ---
   {
     dg_sim::DefaultCallbackConfig cfg;
@@ -259,6 +318,58 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   0.5,
                   1.0e-12,
                   "time loop: save snapping without hook reaches t_final");
+  }
+
+  // --- final time on save boundary emits one final save, not a duplicate ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.2;
+    cfg.dt = 0.1;
+    cfg.dt_min = 1.0e-12;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = true;
+    cfg.dt_save = 0.1;
+
+    int save_count = 0;
+    int final_save_count = 0;
+    int last_save_step = -1;
+    int last_save_idx = -1;
+    mfem::real_t last_save_time = -1.0;
+    bool last_save_final = false;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int step,
+                        mfem::real_t t,
+                        int save_idx,
+                        bool is_final)
+    {
+      ++save_count;
+      if (is_final)
+      {
+        ++final_save_count;
+      }
+      last_save_step = step;
+      last_save_idx = save_idx;
+      last_save_time = t;
+      last_save_final = is_final;
+    };
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.steps == 2,
+              "time loop: final save-boundary case completes two steps");
+    ctx.Check(save_count == 2,
+              "time loop: final save boundary avoids duplicate final save");
+    ctx.Check(final_save_count == 1,
+              "time loop: final save boundary marks exactly one save final");
+    ctx.Check(last_save_step == result.steps && last_save_idx == 1 &&
+                last_save_final,
+              "time loop: final boundary save carries final step/index flag");
+    ctx.CheckNear(last_save_time,
+                  result.final_time,
+                  1.0e-12,
+                  "time loop: final boundary save time matches final time");
   }
 
   int alive_count = 0;
