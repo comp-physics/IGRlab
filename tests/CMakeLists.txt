@@ -43,6 +43,244 @@ set_tests_properties(dg_igr_dgsem_portability_refactor_tests PROPERTIES
   TIMEOUT 180
 )
 
+if (MFEM_USE_CUDA AND TARGET supersonic_cylinder_w_igr)
+  add_test(NAME dg_igr_cylinder_l2_cpu_cuda_pvd_drift_exact_face
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/check_cpu_cuda_pvd_drift.py
+            --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+            --out-dir ${CMAKE_BINARY_DIR}/tests/cylinder-l2-cpu-cuda-pvd-drift-exact-face
+            --order 1
+            --serial-ref 0
+            --parallel-ref 0
+            --tf 2.0e-4
+            --dt 1.0e-4
+            --dt-save 1.0e-4
+            --igr-stage-rtol-scale 10
+            --igr-lin-rtol 1.0e-8
+            --cpu-igr-lin-atol 0.0
+            --cuda-igr-lin-atol 0.0
+            --cpu-igr-linear-solver minres
+            --cuda-igr-linear-solver minres
+            --cpu-igr-preconditioner chebyshev
+            --cuda-igr-preconditioner chebyshev
+            --default-rel-rms-limit 1.0e-5
+            --cpu-igr-exact-dg-face
+            --cuda-igr-exact-dg-face
+            --cpu-env DG_IGR_IGR_PARTIAL_ASSEMBLY=1
+            --cpu-env DG_IGR_IGR_DEVICE_QF=1
+            --cpu-env DG_IGR_DEBUG_QF=1
+            --cpu-env DG_IGR_IGR_CHEB_ORDER=3
+            --cpu-env DG_IGR_IGR_CHEB_BASE_OPERATOR=1
+            --cuda-env DG_IGR_IGR_PARTIAL_ASSEMBLY=1
+            --cuda-env DG_IGR_IGR_DEVICE_QF=1
+            --cuda-env DG_IGR_DEBUG_QF=1
+            --cuda-env DG_IGR_IGR_CHEB_ORDER=3
+            --cuda-env DG_IGR_IGR_CHEB_BASE_OPERATOR=1
+            --require-cpu-igr-converged
+            --require-cuda-igr-converged
+            --require-cpu-log "event=exact-dg-face-operator"
+            --require-cpu-log "exact_face_effective=1"
+            --require-cuda-log "event=exact-dg-face-operator"
+            --require-cuda-log "exact_face_effective=1"
+  )
+  set_tests_properties(dg_igr_cylinder_l2_cpu_cuda_pvd_drift_exact_face
+    PROPERTIES
+      LABELS "cuda;parity;igr;vtk;exact-face"
+      TIMEOUT 360
+  )
+
+  add_test(NAME dg_igr_cylinder_l2_cuda_direct_identity_parity_exact_face
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/check_cuda_direct_identity_parity.py
+            --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+            --out-dir ${CMAKE_BINARY_DIR}/tests/cylinder-l2-cuda-direct-identity-parity-exact-face
+            --order 1
+            --serial-ref 0
+            --parallel-ref 0
+            --tf 2.0e-4
+            --dt 1.0e-4
+            --dt-save 1.0e-4
+            --igr-stage-rtol-scale 10
+            --igr-lin-rtol 1.0e-8
+            --default-rel-rms-limit 1.0e-8
+  )
+  set_tests_properties(dg_igr_cylinder_l2_cuda_direct_identity_parity_exact_face
+    PROPERTIES
+      LABELS "cuda;parity;igr;vtk;exact-face;direct-identity"
+      TIMEOUT 360
+  )
+
+  add_test(NAME dg_igr_cylinder_l2_cpu_cuda_pvd_drift_exact_face_production
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/check_cpu_cuda_pvd_drift.py
+            --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+            --out-dir ${CMAKE_BINARY_DIR}/tests/cylinder-l2-cpu-cuda-pvd-drift-exact-face-production
+            --order 2
+            --serial-ref 0
+            --parallel-ref 1
+            --igr-space L2
+            --igr-grad BrokenL2
+            --tf 1.0e-3
+            --dt 1.0e-4
+            --dt-save 2.0e-4
+            --disable-vtk-diagnostics
+            --arrays density pressure sigma energy momentum velocity
+            --igr-stage-rtol-scale 1
+            --cpu-igr-lin-rtol 1.0e-8
+            --cuda-igr-lin-rtol 1.0e-5
+            --cpu-igr-lin-atol 0.0
+            --cuda-igr-lin-atol 0.0
+            --cpu-igr-linear-solver minres
+            --cuda-igr-linear-solver minres
+            --cpu-igr-preconditioner chebyshev
+            --cuda-igr-preconditioner chebyshev
+            --cpu-igr-exact-dg-face
+            --cuda-igr-exact-dg-face
+            --default-rel-rms-limit 1.0e-5
+            --nan-scan
+            --admissibility-scan
+            --cpu-env DG_IGR_IGR_PARTIAL_ASSEMBLY=1
+            --cpu-env DG_IGR_IGR_DEVICE_QF=1
+            --cpu-env DG_IGR_DEBUG_QF=1
+            --cpu-env DG_IGR_IGR_CHEB_ORDER=3
+            --cpu-env DG_IGR_IGR_CHEB_BASE_OPERATOR=1
+            --cuda-env DG_IGR_IGR_PARTIAL_ASSEMBLY=1
+            --cuda-env DG_IGR_IGR_DEVICE_QF=1
+            --cuda-env DG_IGR_DEBUG_QF=1
+            --cuda-env DG_IGR_IGR_CHEB_ORDER=3
+            --cuda-env DG_IGR_IGR_CHEB_BASE_OPERATOR=1
+            --require-cpu-igr-converged
+            --require-cuda-igr-converged
+            --require-cpu-log "event=exact-dg-face-operator"
+            --require-cpu-log "last_solver=minres"
+            --require-cpu-log "last_precond=operatorchebyshev-base"
+            --require-cpu-log "exact_face_effective=1"
+            --require-cuda-log "event=exact-dg-face-operator"
+            --require-cuda-log "last_solver=minres"
+            --require-cuda-log "last_precond=operatorchebyshev-base"
+            --require-cuda-log "exact_face_effective=1"
+  )
+  set_tests_properties(dg_igr_cylinder_l2_cpu_cuda_pvd_drift_exact_face_production
+    PROPERTIES
+      LABELS "cuda;parity;igr;vtk;exact-face;production"
+      TIMEOUT 900
+      RUN_SERIAL TRUE
+  )
+
+  if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
+    add_test(NAME dg_igr_cylinder_l2_mpi_cpu_cuda_pvd_drift_exact_face
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_cpu_cuda_pvd_drift.py
+              --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+              --out-dir ${CMAKE_BINARY_DIR}/tests/cylinder-l2-mpi-cpu-cuda-pvd-drift-exact-face
+              --mpi-ranks 2
+              --mpiexec ${MPIEXEC_EXECUTABLE}
+              --mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}
+              --order 1
+              --serial-ref 0
+              --parallel-ref 0
+              --tf 2.0e-4
+              --dt 1.0e-4
+              --dt-save 1.0e-4
+              --igr-stage-rtol-scale 10
+              --igr-lin-rtol 1.0e-8
+              --cpu-igr-lin-atol 0.0
+              --cuda-igr-lin-atol 0.0
+              --cpu-igr-linear-solver minres
+              --cuda-igr-linear-solver minres
+              --cpu-igr-preconditioner chebyshev
+              --cuda-igr-preconditioner chebyshev
+              --default-rel-rms-limit 1.0e-5
+              --cpu-igr-exact-dg-face
+              --cuda-igr-exact-dg-face
+              --cpu-env DG_IGR_IGR_PARTIAL_ASSEMBLY=1
+              --cpu-env DG_IGR_IGR_DEVICE_QF=1
+              --cpu-env DG_IGR_DEBUG_QF=1
+              --cpu-env DG_IGR_IGR_CHEB_ORDER=3
+              --cpu-env DG_IGR_IGR_CHEB_BASE_OPERATOR=1
+              --cuda-env DG_IGR_IGR_PARTIAL_ASSEMBLY=1
+              --cuda-env DG_IGR_IGR_DEVICE_QF=1
+              --cuda-env DG_IGR_DEBUG_QF=1
+              --cuda-env DG_IGR_IGR_CHEB_ORDER=3
+              --cuda-env DG_IGR_IGR_CHEB_BASE_OPERATOR=1
+              --require-cpu-igr-converged
+              --require-cuda-igr-converged
+              --require-cpu-log "event=exact-dg-face-operator"
+              --require-cpu-log "exact_face_effective=1"
+              --require-cuda-log "event=exact-dg-face-operator"
+              --require-cuda-log "mode=local-and-shared-2d"
+              --require-cuda-log "exact_face_effective=1"
+    )
+    set_tests_properties(dg_igr_cylinder_l2_mpi_cpu_cuda_pvd_drift_exact_face
+      PROPERTIES
+        LABELS "cuda;mpi;parity;igr;vtk;exact-face"
+        TIMEOUT 480
+    )
+
+    add_test(NAME dg_igr_cylinder_l2_mpi_cpu_cuda_pvd_drift_exact_face_production
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_cpu_cuda_pvd_drift.py
+              --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+              --out-dir ${CMAKE_BINARY_DIR}/tests/cylinder-l2-mpi-cpu-cuda-pvd-drift-exact-face-production
+              --mpi-ranks 2
+              --mpiexec ${MPIEXEC_EXECUTABLE}
+              --mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}
+              --order 2
+              --serial-ref 0
+              --parallel-ref 1
+              --igr-space L2
+              --igr-grad BrokenL2
+              --tf 1.0e-3
+              --dt 1.0e-4
+              --dt-save 2.0e-4
+              --disable-vtk-diagnostics
+              --arrays density pressure sigma energy momentum velocity
+              --igr-stage-rtol-scale 1
+              --cpu-igr-lin-rtol 1.0e-8
+              --cuda-igr-lin-rtol 1.0e-5
+              --cpu-igr-lin-atol 0.0
+              --cuda-igr-lin-atol 0.0
+              --cpu-igr-linear-solver minres
+              --cuda-igr-linear-solver minres
+              --cpu-igr-preconditioner chebyshev
+              --cuda-igr-preconditioner chebyshev
+              --cpu-igr-exact-dg-face
+              --cuda-igr-exact-dg-face
+              --default-rel-rms-limit 1.0e-5
+              --nan-scan
+              --admissibility-scan
+              --cpu-env DG_IGR_IGR_PARTIAL_ASSEMBLY=1
+              --cpu-env DG_IGR_IGR_DEVICE_QF=1
+              --cpu-env DG_IGR_DEBUG_QF=1
+              --cpu-env DG_IGR_IGR_CHEB_ORDER=3
+              --cpu-env DG_IGR_IGR_CHEB_BASE_OPERATOR=1
+              --cuda-env DG_IGR_IGR_PARTIAL_ASSEMBLY=1
+              --cuda-env DG_IGR_IGR_DEVICE_QF=1
+              --cuda-env DG_IGR_DEBUG_QF=1
+              --cuda-env DG_IGR_IGR_CHEB_ORDER=3
+              --cuda-env DG_IGR_IGR_CHEB_BASE_OPERATOR=1
+              --require-cpu-igr-converged
+              --require-cuda-igr-converged
+              --require-cpu-log "event=exact-dg-face-operator"
+              --require-cpu-log "last_solver=minres"
+              --require-cpu-log "last_precond=operatorchebyshev-base"
+              --require-cpu-log "exact_face_effective=1"
+              --require-cuda-log "event=exact-dg-face-operator"
+              --require-cuda-log "mode=local-and-shared-2d"
+              --require-cuda-log "last_solver=minres"
+              --require-cuda-log "last_precond=operatorchebyshev-base"
+              --require-cuda-log "exact_face_effective=1"
+    )
+    set_tests_properties(dg_igr_cylinder_l2_mpi_cpu_cuda_pvd_drift_exact_face_production
+      PROPERTIES
+        LABELS "cuda;mpi;parity;igr;vtk;exact-face;production"
+        TIMEOUT 1200
+        RUN_SERIAL TRUE
+        PROCESSORS 2
+    )
+  endif()
+endif()
+
 # MPI parity checks: generate a 1-rank reference and compare against 2 ranks.
 # Keep this list curated to suites with stable, decomposition-invariant metrics.
 if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
