@@ -1,6 +1,7 @@
 #include "physics/igr/IGR.hpp"
 #include "utils/config/env_flags.hpp"
 #include "IGR_internal_utils.hpp"
+#include "utils/profiling/nvtx.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -258,6 +259,19 @@ void IGRSolver::SetIPKind(IPKind k)
   }
 }
 
+void IGRSolver::SetExactDGFaceOperator(bool enabled)
+{
+  if (exact_dg_face_operator_ == enabled)
+  {
+    return;
+  }
+  exact_dg_face_operator_ = enabled;
+  if (a_)
+  {
+    BuildBilinearForm_();
+  }
+}
+
 void IGRSolver::SetSweeps(int regular_sweeps, int warm_start_sweeps)
 {
   regular_sweeps_ = std::max(0, regular_sweeps);
@@ -285,15 +299,26 @@ void IGRSolver::SetDirichletBC(const mfem::Array<int>& ess_bdr)
 
 bool IGRSolver::UseDeviceCoefficients_() const
 {
-  if (!mfem::Device::Allows(mfem::Backend::DEVICE_MASK))
+  const bool device_backend =
+    mfem::Device::Allows(mfem::Backend::DEVICE_MASK);
+  const bool qf_enabled =
+    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_DEVICE_QF", device_backend);
+  if (!qf_enabled)
   {
     return false;
   }
-  return ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_DEVICE_QF", true);
+  if (!device_backend && !IsDGSpace(sfes_))
+  {
+    // The CPU opt-in exists to build an L2/DG PA reference that avoids
+    // face-time GetVectorValue() on discontinuous state fields.
+    return false;
+  }
+  return true;
 }
 
 void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U, bool warm_start)
 {
+  ::dg_igr::NVTXRange range("IGR/update-from-state");
   const auto update_start = std::chrono::steady_clock::now();
 
   // Assemble A and b for current state U (warm-start handled by FormLinearSystem)
@@ -307,6 +332,17 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U, bool warm_start)
     last_linear_final_norm_ = std::numeric_limits<double>::quiet_NaN();
     last_linear_solve_seconds_ = 0.0;
     last_pc_setup_seconds_ = 0.0;
+    last_chebyshev_diagonal_seconds_ = 0.0;
+    last_chebyshev_setup_seconds_ = 0.0;
+    last_chebyshev_eigenvalue_reused_ = false;
+    last_chebyshev_smoother_reused_ = false;
+    last_chebyshev_eigenvalue_estimate_ = 0.0;
+    last_krylov_operator_apply_seconds_ = 0.0;
+    last_krylov_preconditioner_apply_seconds_ = 0.0;
+    last_krylov_preconditioner_operator_apply_seconds_ = 0.0;
+    last_krylov_operator_apply_count_ = 0;
+    last_krylov_preconditioner_apply_count_ = 0;
+    last_krylov_preconditioner_operator_apply_count_ = 0;
     last_linear_solver_name_ = "smoother";
     last_precond_name_ = Ah_.Is<mfem::HypreParMatrix>() ? "hypresmoother"
                                                          : "operatorjacobi";

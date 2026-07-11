@@ -97,6 +97,7 @@ inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
   {
     cfg.amg_strong_threshold = igr_opts.amg_strong_threshold;
   }
+  cfg.exact_dg_face_operator = igr_opts.exact_dg_face_operator;
 }
 
 inline mfem::RK3SSPWithLimiter MakeRK3Stepper(mfem::ParFiniteElementSpace& vfes,

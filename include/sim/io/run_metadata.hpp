@@ -210,6 +210,9 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << ",\n";
   out << "    \"igr_amg_strong_threshold\": "
       << run_cfg.igr_opts.amg_strong_threshold << ",\n";
+  out << "    \"igr_exact_dg_face_operator\": "
+      << (run_cfg.igr_opts.exact_dg_face_operator ? "true" : "false")
+      << ",\n";
   out << "    \"cfl\": " << run_cfg.opts.cfl << ",\n";
   out << "    \"dt\": " << run_cfg.opts.dt << ",\n";
   out << "    \"dt_min\": " << run_cfg.opts.dt_min << ",\n";
@@ -217,7 +220,16 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   out << "    \"nan_scan\": " << (run_cfg.opts.nan_scan ? "true" : "false")
       << ",\n";
   out << "    \"save_state_files\": "
-      << (run_cfg.opts.save_state_files ? "true" : "false") << "\n";
+      << (run_cfg.opts.save_state_files ? "true" : "false") << ",\n";
+  out << "    \"vtk_h1_diagnostics\": "
+      << (run_cfg.opts.vtk_h1_diagnostics ? "true" : "false") << ",\n";
+  out << "    \"vtk_l2_diagnostics\": "
+      << (run_cfg.opts.vtk_l2_diagnostics ? "true" : "false") << ",\n";
+  out << "    \"vtk_mpi_rank_field\": "
+      << (run_cfg.opts.vtk_mpi_rank_field ? "true" : "false") << ",\n";
+  out << "    \"vtk_zhang_shu_diagnostics\": "
+      << (run_cfg.opts.vtk_zhang_shu_diagnostics ? "true" : "false")
+      << "\n";
   out << "  },\n";
 
   out << "  \"performance\": {\n";
@@ -252,17 +264,88 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   if (igr)
   {
     const double elapsed_seconds = summary ? summary->elapsed : 0.0;
+    const int total_linear_iters = igr->GetTotalLinearIterations();
     out << ",\n";
     out << "    \"calls\": " << igr->GetLinearSolveCalls() << ",\n";
     out << "    \"converged_calls\": " << igr->GetTotalLinearConvergedCalls()
         << ",\n";
+    out << "    \"total_iters\": " << total_linear_iters << ",\n";
     out << "    \"avg_iters\": " << igr->GetAverageLinearIterations() << ",\n";
+    out << "    \"max_iters\": " << igr->GetMaxLinearIterations() << ",\n";
+    out << "    \"avg_solve_iter_s\": "
+        << ((total_linear_iters > 0)
+              ? (igr->GetTotalLinearSolveSeconds() /
+                 static_cast<double>(total_linear_iters))
+              : 0.0)
+        << ",\n";
+    out << "    \"avg_krylov_operator_apply_count\": "
+        << ((igr->GetLinearSolveCalls() > 0)
+              ? (static_cast<double>(igr->GetTotalKrylovOperatorApplyCount()) /
+                 static_cast<double>(igr->GetLinearSolveCalls()))
+              : 0.0)
+        << ",\n";
+    out << "    \"avg_krylov_preconditioner_apply_count\": "
+        << ((igr->GetLinearSolveCalls() > 0)
+              ? (static_cast<double>(
+                   igr->GetTotalKrylovPreconditionerApplyCount()) /
+                 static_cast<double>(igr->GetLinearSolveCalls()))
+              : 0.0)
+        << ",\n";
+    out << "    \"avg_krylov_preconditioner_operator_apply_count\": "
+        << ((igr->GetLinearSolveCalls() > 0)
+              ? (static_cast<double>(
+                   igr->GetTotalKrylovPreconditionerOperatorApplyCount()) /
+                 static_cast<double>(igr->GetLinearSolveCalls()))
+              : 0.0)
+        << ",\n";
+    out << "    \"krylov_operator_apply_count_per_iter\": "
+        << ((total_linear_iters > 0)
+              ? (static_cast<double>(igr->GetTotalKrylovOperatorApplyCount()) /
+                 static_cast<double>(total_linear_iters))
+              : 0.0)
+        << ",\n";
+    out << "    \"krylov_preconditioner_apply_count_per_iter\": "
+        << ((total_linear_iters > 0)
+              ? (static_cast<double>(
+                   igr->GetTotalKrylovPreconditionerApplyCount()) /
+                 static_cast<double>(total_linear_iters))
+              : 0.0)
+        << ",\n";
+    out << "    \"krylov_preconditioner_operator_apply_count_per_iter\": "
+        << ((total_linear_iters > 0)
+              ? (static_cast<double>(
+                   igr->GetTotalKrylovPreconditionerOperatorApplyCount()) /
+                 static_cast<double>(total_linear_iters))
+              : 0.0)
+        << ",\n";
     out << "    \"total_assemble_s\": " << igr->GetTotalAssembleSeconds()
         << ",\n";
     out << "    \"total_form_system_s\": " << igr->GetTotalFormSystemSeconds()
         << ",\n";
     out << "    \"total_pc_setup_s\": " << igr->GetTotalPCSetupSeconds()
         << ",\n";
+    out << "    \"total_cheb_diag_s\": "
+        << igr->GetTotalChebyshevDiagonalSeconds() << ",\n";
+    out << "    \"total_cheb_setup_s\": "
+        << igr->GetTotalChebyshevSetupSeconds() << ",\n";
+    out << "    \"total_cheb_eigen_reuses\": "
+        << igr->GetTotalChebyshevEigenvalueReuses() << ",\n";
+    out << "    \"total_cheb_smoother_reuses\": "
+        << igr->GetTotalChebyshevSmootherReuses() << ",\n";
+    out << "    \"total_cheb_smoother_builds\": "
+        << igr->GetTotalChebyshevSmootherBuilds() << ",\n";
+    out << "    \"total_krylov_operator_apply_s\": "
+        << igr->GetTotalKrylovOperatorApplySeconds() << ",\n";
+    out << "    \"total_krylov_preconditioner_apply_s\": "
+        << igr->GetTotalKrylovPreconditionerApplySeconds() << ",\n";
+    out << "    \"total_krylov_preconditioner_operator_apply_s\": "
+        << igr->GetTotalKrylovPreconditionerOperatorApplySeconds() << ",\n";
+    out << "    \"total_krylov_operator_apply_count\": "
+        << igr->GetTotalKrylovOperatorApplyCount() << ",\n";
+    out << "    \"total_krylov_preconditioner_apply_count\": "
+        << igr->GetTotalKrylovPreconditionerApplyCount() << ",\n";
+    out << "    \"total_krylov_preconditioner_operator_apply_count\": "
+        << igr->GetTotalKrylovPreconditionerOperatorApplyCount() << ",\n";
     out << "    \"total_solve_s\": " << igr->GetTotalLinearSolveSeconds()
         << ",\n";
     out << "    \"total_igr_work_s\": " << igr->GetTotalIGRWorkSeconds()
@@ -301,6 +384,30 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
         << ",\n";
     out << "    \"last_pc_setup_s\": " << igr->GetLastPCSetupSeconds()
         << ",\n";
+    out << "    \"last_cheb_diag_s\": "
+        << igr->GetLastChebyshevDiagonalSeconds() << ",\n";
+    out << "    \"last_cheb_setup_s\": "
+        << igr->GetLastChebyshevSetupSeconds() << ",\n";
+    out << "    \"last_cheb_eigen_reused\": "
+        << (igr->GetLastChebyshevEigenvalueReused() ? "true" : "false")
+        << ",\n";
+    out << "    \"last_cheb_smoother_reused\": "
+        << (igr->GetLastChebyshevSmootherReused() ? "true" : "false")
+        << ",\n";
+    out << "    \"last_cheb_eigen_estimate\": "
+        << igr->GetLastChebyshevEigenvalueEstimate() << ",\n";
+    out << "    \"last_krylov_operator_apply_s\": "
+        << igr->GetLastKrylovOperatorApplySeconds() << ",\n";
+    out << "    \"last_krylov_preconditioner_apply_s\": "
+        << igr->GetLastKrylovPreconditionerApplySeconds() << ",\n";
+    out << "    \"last_krylov_preconditioner_operator_apply_s\": "
+        << igr->GetLastKrylovPreconditionerOperatorApplySeconds() << ",\n";
+    out << "    \"last_krylov_operator_apply_count\": "
+        << igr->GetLastKrylovOperatorApplyCount() << ",\n";
+    out << "    \"last_krylov_preconditioner_apply_count\": "
+        << igr->GetLastKrylovPreconditionerApplyCount() << ",\n";
+    out << "    \"last_krylov_preconditioner_operator_apply_count\": "
+        << igr->GetLastKrylovPreconditionerOperatorApplyCount() << ",\n";
     out << "    \"last_iters\": " << igr->GetLastLinearIters() << ",\n";
     out << "    \"last_converged\": "
         << (igr->GetLastLinearConverged() ? "true" : "false") << ",\n";
@@ -308,7 +415,31 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
         << ",\n";
     out << "    \"last_final_norm\": " << igr->GetLastLinearFinalNorm()
         << ",\n";
-    out << "    \"last_solve_s\": " << igr->GetLastLinearSolveSeconds() << "\n";
+    out << "    \"last_solve_s\": " << igr->GetLastLinearSolveSeconds()
+        << ",\n";
+    out << "    \"direct_identity_system\": {\n";
+    out << "      \"effective\": "
+        << (igr->GetLastDirectIdentitySystem() ? "true" : "false") << ",\n";
+    out << "      \"reason\": "
+        << detail::ToJsonString(igr->GetLastDirectIdentityReason()) << ",\n";
+    out << "      \"uses\": " << igr->GetDirectIdentitySystemUses() << "\n";
+    out << "    },\n";
+    out << "    \"exact_face\": {\n";
+    out << "      \"requested\": "
+        << (igr->GetLastExactFaceRequested() ? "true" : "false") << ",\n";
+    out << "      \"effective\": "
+        << (igr->GetLastExactFaceEffective() ? "true" : "false") << ",\n";
+    out << "      \"reason\": "
+        << detail::ToJsonString(igr->GetLastExactFaceReason()) << ",\n";
+    out << "      \"operator_uses\": "
+        << igr->GetExactFaceOperatorUseCount() << ",\n";
+    out << "      \"local_faces\": "
+        << igr->GetLastExactFaceLocalFaceCount() << ",\n";
+    out << "      \"shared_faces\": "
+        << igr->GetLastExactFaceSharedFaceCount() << ",\n";
+    out << "      \"last_operator_mult_calls\": "
+        << igr->GetLastExactFaceOperatorMultCalls() << "\n";
+    out << "    }\n";
   }
   else
   {

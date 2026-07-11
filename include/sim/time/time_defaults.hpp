@@ -22,6 +22,7 @@
 #include "sim/io/vis_helpers.hpp"
 #include "sim/time/time_callbacks.hpp"
 #include "sim/time/time_loop.hpp"
+#include "utils/config/env_flags.hpp"
 
 namespace dg_sim
 {
@@ -65,6 +66,105 @@ PrintVTKSaveLog(int cycle, int step, double t, bool is_final, bool is_initial)
     std::cout << " | final";
   }
   std::cout << std::endl;
+}
+
+inline double SecondsSince(std::chrono::steady_clock::time_point start)
+{
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+    .count();
+}
+
+inline double MaxOverComm(double value, MPI_Comm comm)
+{
+  double global = value;
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_MAX,
+                comm);
+  return global;
+}
+
+inline void PrintVTKOutputTiming(const char* phase,
+                                 int cycle,
+                                 int step,
+                                 double t,
+                                 bool is_initial,
+                                 bool is_final,
+                                 double update_fields_s,
+                                 double paraview_save_s,
+                                 MPI_Comm comm)
+{
+  if (!::dg_igr::EnvFlagEnabled("DG_IGR_VTK_OUTPUT_TIMING"))
+  {
+    return;
+  }
+
+  const double max_update_fields_s = MaxOverComm(update_fields_s, comm);
+  const double max_paraview_save_s = MaxOverComm(paraview_save_s, comm);
+  const double max_total_s =
+    MaxOverComm(update_fields_s + paraview_save_s, comm);
+
+  if (!mfem::Mpi::Root())
+  {
+    return;
+  }
+
+  std::cout << "[vtk-timing] event=output"
+            << " phase=" << phase
+            << " cycle=" << cycle
+            << " step=" << step
+            << " t=" << FormatFixed(t, 12)
+            << " initial=" << (is_initial ? 1 : 0)
+            << " final=" << (is_final ? 1 : 0)
+            << " update_fields_s=" << max_update_fields_s
+            << " paraview_save_s=" << max_paraview_save_s
+            << " total_s=" << max_total_s << "\n";
+}
+
+inline void PrintVTKOutputFieldTiming(const char* phase,
+                                      int cycle,
+                                      int step,
+                                      double t,
+                                      bool is_initial,
+                                      bool is_final,
+                                      const EulerOutputFieldTiming& timing,
+                                      MPI_Comm comm)
+{
+  if (!::dg_igr::EnvFlagEnabled("DG_IGR_VTK_OUTPUT_TIMING"))
+  {
+    return;
+  }
+
+  const double max_igr_update_s = MaxOverComm(timing.igr_update_s, comm);
+  const double max_sigma_exchange_s =
+    MaxOverComm(timing.sigma_exchange_s, comm);
+  const double max_pressure_s = MaxOverComm(timing.pressure_s, comm);
+  const double max_velocity_s = MaxOverComm(timing.velocity_s, comm);
+  const double max_h1_diag_s = MaxOverComm(timing.h1_diag_s, comm);
+  const double max_l2_diag_s = MaxOverComm(timing.l2_diag_s, comm);
+  const double max_total_s = MaxOverComm(timing.total_s, comm);
+
+  if (!mfem::Mpi::Root())
+  {
+    return;
+  }
+
+  std::cout << "[vtk-timing] event=output-fields"
+            << " phase=" << phase
+            << " cycle=" << cycle
+            << " step=" << step
+            << " t=" << FormatFixed(t, 12)
+            << " initial=" << (is_initial ? 1 : 0)
+            << " final=" << (is_final ? 1 : 0)
+            << " igr_update_s=" << max_igr_update_s
+            << " sigma_exchange_s=" << max_sigma_exchange_s
+            << " pressure_s=" << max_pressure_s
+            << " velocity_s=" << max_velocity_s
+            << " h1_diag_s=" << max_h1_diag_s
+            << " l2_diag_s=" << max_l2_diag_s
+            << " total_s=" << max_total_s << "\n";
 }
 
 inline void PrintBox(const std::vector<std::string>& lines)
@@ -471,10 +571,8 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
     }
   };
 
-  hooks.on_save = [paraview, callbacks, bundle_ptr](int step,
-                                                    mfem::real_t t,
-                                                    int save_idx,
-                                                    bool is_final)
+  hooks.on_save = [paraview, callbacks, bundle_ptr, ctx_ptr](
+                    int step, mfem::real_t t, int save_idx, bool is_final)
   {
     if (callbacks.on_vtk_save)
     {
@@ -486,15 +584,38 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
       info.is_final = is_final;
       callbacks.on_vtk_save(info);
     }
+    EulerOutputFieldTiming field_timing;
     UpdateEulerOutputFields(bundle_ptr->field_list,
                             bundle_ptr->sol,
-                            /*warm_start=*/true);
+                            /*warm_start=*/true,
+                            &field_timing);
+    const double update_fields_s = field_timing.total_s;
+    double paraview_save_s = 0.0;
     if (paraview)
     {
       paraview->SetCycle(save_idx);
       paraview->SetTime(t);
+      const auto save_start = std::chrono::steady_clock::now();
       paraview->Save();
+      paraview_save_s = SecondsSince(save_start);
     }
+    PrintVTKOutputTiming("save",
+                         save_idx,
+                         step,
+                         t,
+                         /*is_initial=*/false,
+                         is_final,
+                         update_fields_s,
+                         paraview_save_s,
+                         ctx_ptr->Mesh().GetComm());
+    PrintVTKOutputFieldTiming("save",
+                              save_idx,
+                              step,
+                              t,
+                              /*is_initial=*/false,
+                              is_final,
+                              field_timing,
+                              ctx_ptr->Mesh().GetComm());
   };
 
   hooks.on_analysis =

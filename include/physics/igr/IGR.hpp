@@ -70,6 +70,7 @@ public:
   /// Select which gradient backend to use for the Σ RHS.
   void SetGradBackend(GradBackend b) { backend_ = b; }
   void SetIPKind(IPKind k);
+  void SetExactDGFaceOperator(bool enabled);
 
   // ---- Legacy smoother-sweep knobs (still supported) ----
   void SetSmoother(SmootherType t);
@@ -138,6 +139,7 @@ public:
                  cfg.amg_strong_threshold);
     SetSigmaUpdatePolicy(cfg.sigma_cadence, cfg.sigma_update_interval);
     SetStageRtolScale(cfg.stage_rtol_scale);
+    SetExactDGFaceOperator(cfg.exact_dg_face_operator);
     SetLinearSolveParams(cfg.lin_rtol,
                          cfg.lin_atol,
                          cfg.lin_maxit,
@@ -163,6 +165,50 @@ public:
   double GetLastAssembleSeconds() const { return last_assemble_seconds_; }
   double GetLastFormSystemSeconds() const { return last_form_system_seconds_; }
   double GetLastPCSetupSeconds() const { return last_pc_setup_seconds_; }
+  double GetLastChebyshevDiagonalSeconds() const
+  {
+    return last_chebyshev_diagonal_seconds_;
+  }
+  double GetLastChebyshevSetupSeconds() const
+  {
+    return last_chebyshev_setup_seconds_;
+  }
+  bool GetLastChebyshevEigenvalueReused() const
+  {
+    return last_chebyshev_eigenvalue_reused_;
+  }
+  bool GetLastChebyshevSmootherReused() const
+  {
+    return last_chebyshev_smoother_reused_;
+  }
+  double GetLastChebyshevEigenvalueEstimate() const
+  {
+    return last_chebyshev_eigenvalue_estimate_;
+  }
+  double GetLastKrylovOperatorApplySeconds() const
+  {
+    return last_krylov_operator_apply_seconds_;
+  }
+  double GetLastKrylovPreconditionerApplySeconds() const
+  {
+    return last_krylov_preconditioner_apply_seconds_;
+  }
+  double GetLastKrylovPreconditionerOperatorApplySeconds() const
+  {
+    return last_krylov_preconditioner_operator_apply_seconds_;
+  }
+  long long GetLastKrylovOperatorApplyCount() const
+  {
+    return last_krylov_operator_apply_count_;
+  }
+  long long GetLastKrylovPreconditionerApplyCount() const
+  {
+    return last_krylov_preconditioner_apply_count_;
+  }
+  long long GetLastKrylovPreconditionerOperatorApplyCount() const
+  {
+    return last_krylov_preconditioner_operator_apply_count_;
+  }
   double GetTotalLinearSolveSeconds() const
   {
     return total_linear_solve_seconds_;
@@ -173,6 +219,50 @@ public:
     return total_form_system_seconds_;
   }
   double GetTotalPCSetupSeconds() const { return total_pc_setup_seconds_; }
+  double GetTotalChebyshevDiagonalSeconds() const
+  {
+    return total_chebyshev_diagonal_seconds_;
+  }
+  double GetTotalChebyshevSetupSeconds() const
+  {
+    return total_chebyshev_setup_seconds_;
+  }
+  int GetTotalChebyshevEigenvalueReuses() const
+  {
+    return total_chebyshev_eigenvalue_reuses_;
+  }
+  int GetTotalChebyshevSmootherReuses() const
+  {
+    return total_chebyshev_smoother_reuses_;
+  }
+  int GetTotalChebyshevSmootherBuilds() const
+  {
+    return total_chebyshev_smoother_builds_;
+  }
+  double GetTotalKrylovOperatorApplySeconds() const
+  {
+    return total_krylov_operator_apply_seconds_;
+  }
+  double GetTotalKrylovPreconditionerApplySeconds() const
+  {
+    return total_krylov_preconditioner_apply_seconds_;
+  }
+  double GetTotalKrylovPreconditionerOperatorApplySeconds() const
+  {
+    return total_krylov_preconditioner_operator_apply_seconds_;
+  }
+  long long GetTotalKrylovOperatorApplyCount() const
+  {
+    return total_krylov_operator_apply_count_;
+  }
+  long long GetTotalKrylovPreconditionerApplyCount() const
+  {
+    return total_krylov_preconditioner_apply_count_;
+  }
+  long long GetTotalKrylovPreconditionerOperatorApplyCount() const
+  {
+    return total_krylov_preconditioner_operator_apply_count_;
+  }
   double GetTotalIGRWorkSeconds() const
   {
     return total_assemble_seconds_ + total_form_system_seconds_ +
@@ -182,6 +272,7 @@ public:
   double GetTotalUpdateCallSeconds() const { return total_update_call_seconds_; }
   int GetLinearSolveCalls() const { return linear_solve_calls_; }
   int GetTotalLinearIterations() const { return total_linear_iters_; }
+  int GetMaxLinearIterations() const { return max_linear_iters_; }
   int GetTotalLinearConvergedCalls() const
   {
     return total_linear_converged_calls_;
@@ -203,6 +294,54 @@ public:
   {
     return Ah_.Is<mfem::HypreParMatrix>();
   }
+  /// Access the currently formed linear operator (for diagnostics/tests).
+  const mfem::Operator* GetLinearOperator() const
+  {
+    return ActiveLinearOperator_();
+  }
+
+  /// Access the currently formed linear RHS (for diagnostics/tests).
+  const mfem::Vector& GetLinearRHS() const { return B_; }
+  int GetLastExactFaceLocalFaceCount() const
+  {
+    return last_exact_face_local_nf_;
+  }
+  int GetLastExactFaceSharedFaceCount() const
+  {
+    return last_exact_face_shared_nf_;
+  }
+  bool GetLastExactFaceRequested() const
+  {
+    return last_exact_face_requested_;
+  }
+  bool GetLastExactFaceEffective() const
+  {
+    return last_exact_face_effective_;
+  }
+  const std::string& GetLastExactFaceReason() const
+  {
+    return last_exact_face_reason_;
+  }
+  long long GetExactFaceOperatorUseCount() const
+  {
+    return exact_face_operator_uses_;
+  }
+  long long GetLastExactFaceOperatorMultCalls() const
+  {
+    return last_exact_face_operator_mult_calls_;
+  }
+  bool GetLastDirectIdentitySystem() const
+  {
+    return direct_identity_system_;
+  }
+  int GetDirectIdentitySystemUses() const
+  {
+    return direct_identity_system_uses_;
+  }
+  const std::string& GetLastDirectIdentityReason() const
+  {
+    return last_direct_identity_reason_;
+  }
 
   /// Spatial dimension.
   int Dim() const { return dim_; }
@@ -211,7 +350,9 @@ public:
   int NumEquations() const { return num_eq_; }
 
 private:
-  // --- Device coefficient path (QuadratureFunction-based, host-sync free) ---
+  // --- QuadratureFunction coefficient path for PA/device operators. ---
+  // On CUDA this is the default host-sync-free path. On CPU it is explicit
+  // opt-in for operator-equivalence diagnostics and PA reference runs.
   bool UseDeviceCoefficients_() const;
   void EnsureDeviceQuadrature_();
   void UpdateDeviceCoefficients_(const mfem::ParGridFunction& U);
@@ -287,13 +428,21 @@ private:
   long device_sfes_sequence_ = -1;
   long device_vfes_sequence_ = -1;
   int device_qorder_ = 0;
+  int device_mass_qorder_ = 0;
+  int device_diff_qorder_ = 0;
+  int device_rhs_qorder_ = 0;
   int device_face_qorder_ = 0;
 
+  std::unique_ptr<mfem::QuadratureSpace> mass_qs_;
   std::unique_ptr<mfem::QuadratureSpace> sigma_qs_;
+  std::unique_ptr<mfem::QuadratureSpace> rhs_qs_;
   std::unique_ptr<mfem::FaceQuadratureSpace> sigma_fqs_;
+  std::unique_ptr<mfem::QuadratureFunction> u_mass_qf_;
   std::unique_ptr<mfem::QuadratureFunction> u_qf_;
+  std::unique_ptr<mfem::QuadratureFunction> u_rhs_qf_;
   std::unique_ptr<mfem::QuadratureFunction> u_face_qf_;
   std::unique_ptr<mfem::QuadratureFunction> grad_u_qf_;
+  std::unique_ptr<mfem::QuadratureFunction> grad_u_rhs_qf_;
   std::unique_ptr<mfem::QuadratureFunction> invrho_qf_;
   std::unique_ptr<mfem::QuadratureFunction> ck_qf_;
   std::unique_ptr<mfem::QuadratureFunction> src_qf_;
@@ -335,6 +484,10 @@ private:
   void EnsureH1VelocitySpace_();
   void BuildBilinearForm_();
   bool ShouldUsePartialAssembly_() const;
+  bool UseExactDGFaceOperator_() const;
+  bool ShouldUseDirectIdentitySystem_(bool use_device_qf,
+                                      std::string& reason) const;
+  mfem::Operator* ActiveLinearOperator_() const;
 
   // ---------- Data ----------
   mfem::ParFiniteElementSpace& sfes_; // scalar Σ space (H1 or DG)
@@ -391,6 +544,8 @@ private:
   mfem::Array<int> ess_bdr_;
   mfem::Array<int> ess_tdof_list_;
   mfem::OperatorHandle Ah_; // holds the assembled operator (Hypre matrix)
+  // Owns the current stage's exact-face operator while Ah_ owns the sum.
+  std::unique_ptr<mfem::Operator> exact_face_operator_;
   mfem::Vector X_, B_;      // true-dof vectors
 
   // H1 projection backend storage
@@ -407,15 +562,49 @@ private:
   double last_assemble_seconds_ = 0.0;
   double last_form_system_seconds_ = 0.0;
   double last_pc_setup_seconds_ = 0.0;
+  double last_chebyshev_diagonal_seconds_ = 0.0;
+  double last_chebyshev_setup_seconds_ = 0.0;
+  bool last_chebyshev_eigenvalue_reused_ = false;
+  bool last_chebyshev_smoother_reused_ = false;
+  double last_chebyshev_eigenvalue_estimate_ = 0.0;
+  double last_krylov_operator_apply_seconds_ = 0.0;
+  double last_krylov_preconditioner_apply_seconds_ = 0.0;
+  double last_krylov_preconditioner_operator_apply_seconds_ = 0.0;
+  long long last_krylov_operator_apply_count_ = 0;
+  long long last_krylov_preconditioner_apply_count_ = 0;
+  long long last_krylov_preconditioner_operator_apply_count_ = 0;
   double total_linear_solve_seconds_ = 0.0;
   double total_assemble_seconds_ = 0.0;
   double total_form_system_seconds_ = 0.0;
   double total_pc_setup_seconds_ = 0.0;
+  double total_chebyshev_diagonal_seconds_ = 0.0;
+  double total_chebyshev_setup_seconds_ = 0.0;
+  int total_chebyshev_eigenvalue_reuses_ = 0;
+  int total_chebyshev_smoother_reuses_ = 0;
+  int total_chebyshev_smoother_builds_ = 0;
+  double total_krylov_operator_apply_seconds_ = 0.0;
+  double total_krylov_preconditioner_apply_seconds_ = 0.0;
+  double total_krylov_preconditioner_operator_apply_seconds_ = 0.0;
+  long long total_krylov_operator_apply_count_ = 0;
+  long long total_krylov_preconditioner_apply_count_ = 0;
+  long long total_krylov_preconditioner_operator_apply_count_ = 0;
   double last_update_call_seconds_ = 0.0;
   double total_update_call_seconds_ = 0.0;
   int linear_solve_calls_ = 0;
   int total_linear_iters_ = 0;
+  int max_linear_iters_ = 0;
   int total_linear_converged_calls_ = 0;
+  bool direct_identity_system_ = false;
+  int direct_identity_system_uses_ = 0;
+  std::string last_direct_identity_reason_ = "not-evaluated";
+  bool exact_dg_face_operator_ = false;
+  bool last_exact_face_requested_ = false;
+  bool last_exact_face_effective_ = false;
+  std::string last_exact_face_reason_ = "not-requested";
+  int last_exact_face_local_nf_ = 0;
+  int last_exact_face_shared_nf_ = 0;
+  long long exact_face_operator_uses_ = 0;
+  long long last_exact_face_operator_mult_calls_ = 0;
   std::string last_linear_solver_name_ = "none";
   std::string last_precond_name_ = "none";
 };

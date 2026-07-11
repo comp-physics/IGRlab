@@ -2,6 +2,7 @@
 
 #include "DGHyperbolicConservationLaws_impl.hpp"
 #include "numerics/dgsem/dgsem_operator.hpp"
+#include "utils/profiling/nvtx.hpp"
 
 #include <chrono>
 
@@ -69,6 +70,8 @@ void DGHyperbolicConservationLaws::SetNumericalFlux(const NumericalFlux* flux)
 //
 void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
 {
+  ::dg_igr::NVTXRange mult_range("DG/Mult");
+
   // (0) Reset the running max wave speed (used for CFL after Mult()).
   formIntegrator->ResetMaxCharSpeed();
 
@@ -88,6 +91,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
       prolongation = pvfes->GetProlongationMatrix();
       if (prolongation)
       {
+        ::dg_igr::NVTXRange range("DG/prolong-true-to-local");
         x_local.SetSize(pvfes->GetVSize());
         prolongation->Mult(x, x_local);
         x_eval = &x_local;
@@ -156,6 +160,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
                                       default_force_nonlinearform_face);
     if (force_nonlinearform_face)
     {
+      ::dg_igr::NVTXRange range("DG/face-domain-mfem-nonlinearform");
       nonlinearForm->Mult(*x_eval, z_eval);
       used_device_face = false;
       device_face_speed = formIntegrator->GetMaxCharSpeed();
@@ -173,6 +178,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     }
     else
     {
+      ::dg_igr::NVTXRange range("DG/face-packed-euler-rusanov");
       MFEM_VERIFY(UseDeviceFaceResidual_(),
                   "DG device-closure requires packed device face residual path "
                   "(no host fallback).");
@@ -196,11 +202,13 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   }
   else
   {
+    ::dg_igr::NVTXRange range("DG/face-domain-cpu-nonlinearform");
     nonlinearForm->Mult(x, z);
   }
 
   if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
   {
+    ::dg_igr::NVTXRange range("DG/weak-divergence");
     // Compute (I_h F(u_h), ∇v) and accumulate directly into z.
     AddPreassembledWeakDivergence_(*x_eval, z_eval);
   }
@@ -208,6 +216,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   // Apply inverse mass after all contributions have been assembled in z.
   if (prolongation)
   {
+    ::dg_igr::NVTXRange range("DG/inverse-mass-local-and-restrict");
     y_local.SetSize(z_eval.Size());
     ApplyInverseMass_(z_eval, y_local);
     y = 0.0;
@@ -215,6 +224,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   }
   else
   {
+    ::dg_igr::NVTXRange range("DG/inverse-mass");
     ApplyInverseMass_(z_eval, y);
   }
 

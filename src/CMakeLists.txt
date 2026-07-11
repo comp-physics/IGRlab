@@ -11,6 +11,8 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
          "src/numerics/dg/DGHyperbolicConservationLaws_face.cpp"
          "src/numerics/dg/DGHyperbolicConservationLaws_mass.cpp"
          "src/numerics/dg/DGHyperbolicConservationLaws_weakdiv.cpp"
+         "src/numerics/dg/DGFaceQuadratureKernels.cpp"
+         "src/numerics/limiters/zhang_shu.cpp"
          "src/physics/igr/IGR_device_coefficients.cpp")
 endif()
 

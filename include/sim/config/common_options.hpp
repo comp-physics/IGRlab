@@ -40,6 +40,14 @@ struct CommonOptions
   mfem::real_t cfl = 0.3;        ///< CFL number for time step computation.
   bool glvis = false;            ///< Enable GLVis visualization.
   bool vtk_save = true;          ///< Enable ParaView/VTK output.
+  bool vtk_h1_diagnostics =
+    true; ///< Enable optional H1 diagnostic fields when the case provides them.
+  bool vtk_l2_diagnostics =
+    true; ///< Enable optional L2 diagnostic fields when the case provides them.
+  bool vtk_mpi_rank_field =
+    true; ///< Enable optional per-element MPI rank VTK field.
+  bool vtk_zhang_shu_diagnostics =
+    true; ///< Enable optional Zhang-Shu limiter diagnostic VTK fields.
   bool save_state_files =
     false; ///< Save GLVis-compatible init/final snapshots to disk.
   mfem::real_t dt_save = 0.01; ///< Save cadence for ParaView output.
@@ -137,6 +145,31 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-no-vtk",
                  "--no-vtk_save",
                  "Enable or disable VTK visualization.");
+  args.AddOption(&opts.vtk_h1_diagnostics,
+                 "-vtk-h1",
+                 "--vtk-h1-diagnostics",
+                 "-no-vtk-h1",
+                 "--no-vtk-h1-diagnostics",
+                 "Enable or disable optional H1 diagnostic VTK fields.");
+  args.AddOption(&opts.vtk_l2_diagnostics,
+                 "-vtk-l2",
+                 "--vtk-l2-diagnostics",
+                 "-no-vtk-l2",
+                 "--no-vtk-l2-diagnostics",
+                 "Enable or disable optional L2 diagnostic VTK fields.");
+  args.AddOption(&opts.vtk_mpi_rank_field,
+                 "-vtk-rank",
+                 "--vtk-mpi-rank-field",
+                 "-no-vtk-rank",
+                 "--no-vtk-mpi-rank-field",
+                 "Enable or disable optional per-element MPI rank VTK field.");
+  args.AddOption(
+    &opts.vtk_zhang_shu_diagnostics,
+    "-vtk-zs",
+    "--vtk-zhang-shu-diagnostics",
+    "-no-vtk-zs",
+    "--no-vtk-zhang-shu-diagnostics",
+    "Enable or disable optional Zhang-Shu limiter diagnostic VTK fields.");
   args.AddOption(&opts.save_state_files,
                  "-save-state",
                  "--save-state",

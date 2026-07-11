@@ -20,7 +20,7 @@ Modes:
   --gpu             Build the CUDA dependency profile, MFEM, and the app.
 
 Options:
-  -j, --jobs N      Parallel build/test jobs (default: NPROC or 4).
+  -j, --jobs N      Parallel build jobs (default: NPROC or 4).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
   --clean           Rebuild the selected mode from clean caches (default).
   --no-clean        Reuse existing build and install directories.
@@ -30,7 +30,8 @@ Options:
   -h, --help        Show this help.
 
 Environment overrides:
-  DG_IGR_SPACK_ENV, CUDA_ARCHS, SPACK_CUDA_ARCH, CMAKE_BUILD_TYPE
+  DG_IGR_SPACK_ENV, CUDA_ARCHS, SPACK_CUDA_ARCH, CMAKE_BUILD_TYPE,
+  DG_IGR_ACCELERATOR_KERNEL_SOURCES
 EOF
 }
 
@@ -138,6 +139,8 @@ if [[ "${MODE}" == "gpu" ]]; then
   UMPIRE_PREFIX="$(spack -e "${SPACK_ENV}" location -i umpire)"
   app_cmake_args+=(
     -DDG_IGR_REQUIRE_MFEM_CUDA=ON
+    -DDG_IGR_EXPECT_CUDA_ARCH="${SPACK_CUDA_ARCH}"
+    -DDG_IGR_ACCELERATOR_KERNEL_SOURCES="${DG_IGR_ACCELERATOR_KERNEL_SOURCES:-}"
     -DCMAKE_CUDA_COMPILER="${CUDA_PREFIX}/bin/nvcc"
     -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}"
     -DCUDAToolkit_ROOT="${CUDA_PREFIX}"
@@ -155,7 +158,7 @@ fi
 
 if ((RUN_TESTS)); then
   CTEST_BIN="$(dirname -- "${CMAKE_BIN}")/ctest"
-  "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure -j"${JOBS}"
+  "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure
 fi
 
 if ((RUN_SMOKE)); then

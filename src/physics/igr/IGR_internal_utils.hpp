@@ -88,6 +88,8 @@ inline const char* PrecondTypeName(IGRSolver::PrecondType t)
     return "parasails";
   case IGRSolver::PrecondType::HypreSmoother:
     return "hypresmoother";
+  case IGRSolver::PrecondType::OperatorChebyshev:
+    return "chebyshev";
   case IGRSolver::PrecondType::None:
     return "none";
   }
@@ -104,6 +106,7 @@ inline bool IsSymmetricPC(IGRSolver::PrecondType pc)
 {
   return pc == IGRSolver::PrecondType::BoomerAMG ||
          pc == IGRSolver::PrecondType::HypreSmoother ||
+         pc == IGRSolver::PrecondType::OperatorChebyshev ||
          pc == IGRSolver::PrecondType::None;
 }
 

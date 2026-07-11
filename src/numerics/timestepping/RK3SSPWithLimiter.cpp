@@ -67,14 +67,25 @@ inline void WriteDG0ElementField(mfem::ParGridFunction& field,
   MFEM_VERIFY(fes->GetNE() == element_values.Size(),
               "Limiter diagnostics field has the wrong number of elements.");
 
+  const double* values = element_values.HostRead();
+  double* field_data = field.HostWrite();
   mfem::Array<int> vdofs;
   for (int i = 0; i < fes->GetNE(); ++i)
   {
     fes->GetElementVDofs(i, vdofs);
     MFEM_VERIFY(vdofs.Size() == 1,
                 "Limiter diagnostics field must use one scalar dof per element.");
-    field(vdofs[0]) = element_values(i);
+    const int dof = vdofs[0] >= 0 ? vdofs[0] : -1 - vdofs[0];
+    field_data[dof] = values[i];
   }
+}
+
+inline void VerifyHostLimiter(const char* name)
+{
+  MFEM_VERIFY(!mfem::Device::Allows(mfem::Backend::DEVICE_MASK),
+              name << " is host-only and cannot be added to a CUDA RK "
+                   << "pipeline. Use the device-native Zhang-Shu limiter or "
+                   << "run this method on CPU.");
 }
 
 } // namespace
@@ -119,7 +130,7 @@ void RK3SSPWithLimiter::ApplyCallbacks(Vector& v, double t, bool apply_optional)
   }
 
   // Non-owning view of v as a ParGridFunction.
-  ParGridFunction U(&vfes_, v.GetData());
+  ParGridFunction U(&vfes_, v);
 
   // Always-on callbacks (e.g., Zhang–Shu positivity).
   for (auto& cb : always_callbacks_)
@@ -189,6 +200,7 @@ void RK3SSPWithLimiter::AddZhangShuLimiter(bool always_on)
 
 void RK3SSPWithLimiter::AddCharTVBLimiter(const CharTVBOptions& opts)
 {
+  VerifyHostLimiter("Characteristic TVB limiter");
   auto local = opts; // make a self-contained copy for the stored lambda
   AddOptionalCallback(
     [local](ParFiniteElementSpace& vf, ParGridFunction& U, double /*t*/)
@@ -197,6 +209,7 @@ void RK3SSPWithLimiter::AddCharTVBLimiter(const CharTVBOptions& opts)
 
 void RK3SSPWithLimiter::AddCharTVBFaceNormalLimiter(const CharTVBOptions& opts)
 {
+  VerifyHostLimiter("Face-normal TVB limiter");
   auto local = opts; // capture by value
   AddOptionalCallback([local](mfem::ParFiniteElementSpace& vf,
                               mfem::ParGridFunction& U,
@@ -206,6 +219,7 @@ void RK3SSPWithLimiter::AddCharTVBFaceNormalLimiter(const CharTVBOptions& opts)
 
 void RK3SSPWithLimiter::AddCharBJLimiter(const CharBJOptions& opts)
 {
+  VerifyHostLimiter("Characteristic BJ limiter");
   auto local = opts;
   AddOptionalCallback(
     [local](ParFiniteElementSpace& vf, ParGridFunction& U, double /*t*/)
@@ -214,6 +228,7 @@ void RK3SSPWithLimiter::AddCharBJLimiter(const CharBJOptions& opts)
 
 void RK3SSPWithLimiter::AddFaceCharBJLimiter(const FaceBJOptions& opts)
 {
+  VerifyHostLimiter("Face-normal characteristic BJ limiter");
   auto local = opts; // capture by value for safety
   AddOptionalCallback(
     [local](mfem::ParFiniteElementSpace& vf,
@@ -224,6 +239,7 @@ void RK3SSPWithLimiter::AddFaceCharBJLimiter(const FaceBJOptions& opts)
 
 void RK3SSPWithLimiter::AddBarthJespersenLimiter(const BJOptions& opts)
 {
+  VerifyHostLimiter("Barth-Jespersen limiter");
   auto local = opts;
   AddOptionalCallback(
     [local](ParFiniteElementSpace& vf, ParGridFunction& U, double /*t*/)
@@ -232,6 +248,7 @@ void RK3SSPWithLimiter::AddBarthJespersenLimiter(const BJOptions& opts)
 
 void RK3SSPWithLimiter::AddCharVenkatXYLimiter(const VenkatOptions& opts)
 {
+  VerifyHostLimiter("Characteristic Venkat XY limiter");
   auto local = opts;
   AddOptionalCallback([local](mfem::ParFiniteElementSpace& vf,
                               mfem::ParGridFunction& U,
@@ -242,6 +259,7 @@ void RK3SSPWithLimiter::AddCharVenkatXYLimiter(const VenkatOptions& opts)
 void RK3SSPWithLimiter::AddCharVenkatFaceNormalLimiter(
   const VenkatOptions& opts)
 {
+  VerifyHostLimiter("Face-normal characteristic Venkat limiter");
   auto local = opts;
   AddOptionalCallback([local](mfem::ParFiniteElementSpace& vf,
                               mfem::ParGridFunction& U,
@@ -251,6 +269,7 @@ void RK3SSPWithLimiter::AddCharVenkatFaceNormalLimiter(
 
 void RK3SSPWithLimiter::AddKrivodonovaLimiter(const KrivoOptions& opts)
 {
+  VerifyHostLimiter("Krivodonova limiter");
   auto local = opts;
   AddOptionalCallback(
     [local](ParFiniteElementSpace& vf, ParGridFunction& Ustage, double /*t*/)

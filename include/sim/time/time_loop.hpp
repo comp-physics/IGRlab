@@ -302,17 +302,19 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       hooks.on_analysis(result.steps, t, dt_real, done);
     }
 
+    bool saved_this_step = false;
     if (cfg.vtk_save && cfg.dt_save > 0.0 && hit_save_boundary)
     {
       if (hooks.on_save)
       {
-        hooks.on_save(result.steps, t, save_idx, /*is_final=*/false);
+        hooks.on_save(result.steps, t, save_idx, /*is_final=*/done);
       }
+      saved_this_step = true;
       ++save_idx;
       t_next_save += cfg.dt_save;
     }
 
-    if (done && cfg.vtk_save && hooks.on_save)
+    if (done && cfg.vtk_save && hooks.on_save && !saved_this_step)
     {
       hooks.on_save(result.steps, t, save_idx, /*is_final=*/true);
     }

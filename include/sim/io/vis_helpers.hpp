@@ -5,6 +5,7 @@
  * @brief GLVis/VTK field helpers for Euler visualization.
  */
 
+#include <chrono>
 #include <memory>
 #include <utility>
 
@@ -35,6 +36,23 @@ struct EulerFieldList
   MPIRankField* mpi_rank = nullptr;
   ZhangShuLimiterField* zhang_shu = nullptr;
 };
+
+struct EulerOutputFieldTiming
+{
+  double igr_update_s = 0.0;
+  double sigma_exchange_s = 0.0;
+  double pressure_s = 0.0;
+  double velocity_s = 0.0;
+  double h1_diag_s = 0.0;
+  double l2_diag_s = 0.0;
+  double total_s = 0.0;
+};
+
+inline double VisSecondsSince(std::chrono::steady_clock::time_point start)
+{
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+    .count();
+}
 
 /// @brief GLVis windows for common Euler fields.
 struct EulerVisWindows
@@ -379,28 +397,49 @@ MakeEulerIGRVisWindows(EulerVisWindows& windows)
 
 inline void UpdateEulerOutputFields(const EulerFieldList& fields,
                                     mfem::ParGridFunction& state,
-                                    bool warm_start)
+                                    bool warm_start,
+                                    EulerOutputFieldTiming* timing = nullptr)
 {
+  const auto total_start = std::chrono::steady_clock::now();
+  EulerOutputFieldTiming local_timing;
   if (fields.igr)
   {
+    fields.igr->SetRKStageIndex(-1);
+    const auto igr_start = std::chrono::steady_clock::now();
     fields.igr->UpdateFromState(state, warm_start);
+    local_timing.igr_update_s = VisSecondsSince(igr_start);
+    const auto exchange_start = std::chrono::steady_clock::now();
     fields.igr->GetSigma().ExchangeFaceNbrData();
+    local_timing.sigma_exchange_s = VisSecondsSince(exchange_start);
   }
   if (fields.pressure)
   {
+    const auto pressure_start = std::chrono::steady_clock::now();
     fields.pressure->Update();
+    local_timing.pressure_s = VisSecondsSince(pressure_start);
   }
   if (fields.velocity)
   {
+    const auto velocity_start = std::chrono::steady_clock::now();
     fields.velocity->Update();
+    local_timing.velocity_s = VisSecondsSince(velocity_start);
   }
   if (fields.h1_diag)
   {
+    const auto h1_start = std::chrono::steady_clock::now();
     fields.h1_diag->Update();
+    local_timing.h1_diag_s = VisSecondsSince(h1_start);
   }
   if (fields.l2_diag)
   {
+    const auto l2_start = std::chrono::steady_clock::now();
     fields.l2_diag->Update();
+    local_timing.l2_diag_s = VisSecondsSince(l2_start);
+  }
+  local_timing.total_s = VisSecondsSince(total_start);
+  if (timing)
+  {
+    *timing = local_timing;
   }
 }
 

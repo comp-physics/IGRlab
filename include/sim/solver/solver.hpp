@@ -5,6 +5,7 @@
  * @brief Euler-specific solver orchestration for sim-layer cases.
  */
 
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <functional>
@@ -108,7 +109,29 @@ RunEulerCase(ExampleContext& ctx,
              double c_alpha_value = std::numeric_limits<double>::quiet_NaN(),
              bool print_dataset_name = false)
 {
-  UpdateEulerOutputFields(bundle.field_list, bundle.sol, /*warm_start=*/false);
+  EulerOutputFieldTiming initial_field_timing;
+  UpdateEulerOutputFields(bundle.field_list,
+                          bundle.sol,
+                          /*warm_start=*/false,
+                          &initial_field_timing);
+  const double initial_update_fields_s = initial_field_timing.total_s;
+  PrintVTKOutputTiming("initial-fields",
+                       /*cycle=*/0,
+                       /*step=*/0,
+                       /*t=*/0.0,
+                       /*is_initial=*/true,
+                       /*is_final=*/false,
+                       initial_update_fields_s,
+                       /*paraview_save_s=*/0.0,
+                       ctx.Mesh().GetComm());
+  PrintVTKOutputFieldTiming("initial-fields",
+                            /*cycle=*/0,
+                            /*step=*/0,
+                            /*t=*/0.0,
+                            /*is_initial=*/true,
+                            /*is_final=*/false,
+                            initial_field_timing,
+                            ctx.Mesh().GetComm());
 
   EulerVisWindows glvis_windows;
   if (glvis_enabled)
@@ -151,7 +174,18 @@ RunEulerCase(ExampleContext& ctx,
     ApplyCaseVTKConfig(*paraview_dc, vtk_cfg, run_cfg.opts.order);
     paraview_dc->SetCycle(0);
     paraview_dc->SetTime(0.0);
+    const auto initial_save_start = std::chrono::steady_clock::now();
     paraview_dc->Save();
+    const double initial_save_s = SecondsSince(initial_save_start);
+    PrintVTKOutputTiming("initial-save",
+                         /*cycle=*/0,
+                         /*step=*/0,
+                         /*t=*/0.0,
+                         /*is_initial=*/true,
+                         /*is_final=*/false,
+                         /*update_fields_s=*/0.0,
+                         initial_save_s,
+                         ctx.Mesh().GetComm());
     if (callbacks.on_vtk_save)
     {
       VTKSaveInfo info;
@@ -289,8 +323,22 @@ struct Solver
       spec.add_options(args, case_opts);
     }
     args.ParseCheck();
+    ApplyIGRDerivedRuntimeDefaults(cli_opts,
+                                   cli_igr_opts,
+                                   HasExactDGFaceOptionOverride(argc, argv));
 
     const RunConfig run_cfg = MakeRunConfig(case_cfg, cli_opts, cli_igr_opts);
+    if (spec.use_igr && mfem::Mpi::Root())
+    {
+      std::cout << "[igr-options] event=effective"
+                << " exact_dg_face="
+                << (run_cfg.igr_opts.exact_dg_face_operator ? "on" : "off")
+                << " solver=" << run_cfg.igr_opts.linear_solver
+                << " preconditioner=" << run_cfg.igr_opts.preconditioner
+                << " stage_rtol_scale=" << run_cfg.igr_opts.stage_rtol_scale
+                << " lin_rtol=" << run_cfg.igr_opts.lin_rtol
+                << " lin_atol=" << run_cfg.igr_opts.lin_atol << "\n";
+    }
     if (run_cfg.device_backend == DeviceBackend::CUDA)
     {
 #ifndef MFEM_USE_CUDA
@@ -312,14 +360,18 @@ struct Solver
     const bool need_sigma_space = spec.use_igr || spec.need_sigma;
     const bool enable_h1_vis_diag =
       spec.diagnostics.h1_diagnostics &&
-      (run_cfg.opts.glvis || run_cfg.opts.vtk_save);
+      (run_cfg.opts.glvis ||
+       (run_cfg.opts.vtk_save && run_cfg.opts.vtk_h1_diagnostics));
     const bool enable_l2_diag =
-      spec.diagnostics.l2_diagnostics && run_cfg.opts.vtk_save;
+      spec.diagnostics.l2_diagnostics && run_cfg.opts.vtk_save &&
+      run_cfg.opts.vtk_l2_diagnostics;
     const bool enable_mpi_rank_diag =
-      spec.diagnostics.mpi_rank_field && run_cfg.opts.vtk_save;
+      spec.diagnostics.mpi_rank_field && run_cfg.opts.vtk_save &&
+      run_cfg.opts.vtk_mpi_rank_field;
     const bool enable_zhang_shu_diag =
       spec.diagnostics.zhang_shu_limiter &&
       run_cfg.opts.vtk_save &&
+      run_cfg.opts.vtk_zhang_shu_diagnostics &&
       case_cfg.limiter_pipeline.zhang_shu;
     const bool need_h1 = spec.need_h1 || enable_h1_vis_diag;
     ExampleContext ctx = BuildExampleContext(run_cfg,
@@ -541,6 +593,31 @@ struct Solver
       const double avg_pc_setup_time =
         igr->GetTotalPCSetupSeconds() /
         static_cast<double>(igr->GetLinearSolveCalls());
+      const int total_linear_iters = igr->GetTotalLinearIterations();
+      const double avg_krylov_operator_apply_count =
+        igr->GetTotalKrylovOperatorApplyCount() /
+        static_cast<double>(igr->GetLinearSolveCalls());
+      const double avg_krylov_preconditioner_apply_count =
+        igr->GetTotalKrylovPreconditionerApplyCount() /
+        static_cast<double>(igr->GetLinearSolveCalls());
+      const double avg_krylov_preconditioner_operator_apply_count =
+        igr->GetTotalKrylovPreconditionerOperatorApplyCount() /
+        static_cast<double>(igr->GetLinearSolveCalls());
+      const double krylov_operator_apply_count_per_iter =
+        (total_linear_iters > 0)
+          ? (igr->GetTotalKrylovOperatorApplyCount() /
+             static_cast<double>(total_linear_iters))
+          : 0.0;
+      const double krylov_preconditioner_apply_count_per_iter =
+        (total_linear_iters > 0)
+          ? (igr->GetTotalKrylovPreconditionerApplyCount() /
+             static_cast<double>(total_linear_iters))
+          : 0.0;
+      const double krylov_preconditioner_operator_apply_count_per_iter =
+        (total_linear_iters > 0)
+          ? (igr->GetTotalKrylovPreconditionerOperatorApplyCount() /
+             static_cast<double>(total_linear_iters))
+          : 0.0;
       const double igr_total_pct =
         (captured_summary_valid && captured_summary.elapsed > 0.0)
           ? (100.0 * igr->GetTotalIGRWorkSeconds() / captured_summary.elapsed)
@@ -563,7 +640,26 @@ struct Solver
       std::cout << "[igr-linear] event=run-summary"
                 << " calls=" << igr->GetLinearSolveCalls()
                 << " converged_calls=" << igr->GetTotalLinearConvergedCalls()
+                << " total_iters=" << total_linear_iters
                 << " avg_iters=" << igr->GetAverageLinearIterations()
+                << " max_iters=" << igr->GetMaxLinearIterations()
+                << " avg_solve_iter_s="
+                << ((total_linear_iters > 0)
+                      ? (igr->GetTotalLinearSolveSeconds() /
+                         static_cast<double>(total_linear_iters))
+                      : 0.0)
+                << " avg_krylov_operator_apply_count="
+                << avg_krylov_operator_apply_count
+                << " avg_krylov_preconditioner_apply_count="
+                << avg_krylov_preconditioner_apply_count
+                << " avg_krylov_preconditioner_operator_apply_count="
+                << avg_krylov_preconditioner_operator_apply_count
+                << " krylov_operator_apply_count_per_iter="
+                << krylov_operator_apply_count_per_iter
+                << " krylov_preconditioner_apply_count_per_iter="
+                << krylov_preconditioner_apply_count_per_iter
+                << " krylov_preconditioner_operator_apply_count_per_iter="
+                << krylov_preconditioner_operator_apply_count_per_iter
                 << " avg_assemble_s=" << avg_assemble_time
                 << " avg_form_s=" << avg_form_time
                 << " avg_pc_setup_s=" << avg_pc_setup_time
@@ -571,6 +667,28 @@ struct Solver
                 << " total_assemble_s=" << igr->GetTotalAssembleSeconds()
                 << " total_form_s=" << igr->GetTotalFormSystemSeconds()
                 << " total_pc_setup_s=" << igr->GetTotalPCSetupSeconds()
+                << " total_cheb_diag_s="
+                << igr->GetTotalChebyshevDiagonalSeconds()
+                << " total_cheb_setup_s="
+                << igr->GetTotalChebyshevSetupSeconds()
+                << " total_cheb_eigen_reuses="
+                << igr->GetTotalChebyshevEigenvalueReuses()
+                << " total_cheb_smoother_reuses="
+                << igr->GetTotalChebyshevSmootherReuses()
+                << " total_cheb_smoother_builds="
+                << igr->GetTotalChebyshevSmootherBuilds()
+                << " total_krylov_operator_apply_s="
+                << igr->GetTotalKrylovOperatorApplySeconds()
+                << " total_krylov_preconditioner_apply_s="
+                << igr->GetTotalKrylovPreconditionerApplySeconds()
+                << " total_krylov_preconditioner_operator_apply_s="
+                << igr->GetTotalKrylovPreconditionerOperatorApplySeconds()
+                << " total_krylov_operator_apply_count="
+                << igr->GetTotalKrylovOperatorApplyCount()
+                << " total_krylov_preconditioner_apply_count="
+                << igr->GetTotalKrylovPreconditionerApplyCount()
+                << " total_krylov_preconditioner_operator_apply_count="
+                << igr->GetTotalKrylovPreconditionerOperatorApplyCount()
                 << " total_solve_s=" << igr->GetTotalLinearSolveSeconds()
                 << " total_igr_s=" << igr->GetTotalIGRWorkSeconds()
                 << " total_update_s=" << igr->GetTotalUpdateCallSeconds()
@@ -579,7 +697,48 @@ struct Solver
                 << " solve_pct_stage=" << igr_stage_solve_pct
                 << " total_igr_pct_stage=" << igr_stage_total_pct
                 << " last_solver=" << igr->GetLastLinearSolverName()
-                << " last_precond=" << igr->GetLastPrecondName() << "\n";
+                << " last_precond=" << igr->GetLastPrecondName()
+                << " last_cheb_diag_s="
+                << igr->GetLastChebyshevDiagonalSeconds()
+                << " last_cheb_setup_s="
+                << igr->GetLastChebyshevSetupSeconds()
+                << " last_cheb_eigen_reused="
+                << (igr->GetLastChebyshevEigenvalueReused() ? 1 : 0)
+                << " last_cheb_smoother_reused="
+                << (igr->GetLastChebyshevSmootherReused() ? 1 : 0)
+                << " last_cheb_eigen_estimate="
+                << igr->GetLastChebyshevEigenvalueEstimate()
+                << " last_krylov_operator_apply_s="
+                << igr->GetLastKrylovOperatorApplySeconds()
+                << " last_krylov_preconditioner_apply_s="
+                << igr->GetLastKrylovPreconditionerApplySeconds()
+                << " last_krylov_preconditioner_operator_apply_s="
+                << igr->GetLastKrylovPreconditionerOperatorApplySeconds()
+                << " last_krylov_operator_apply_count="
+                << igr->GetLastKrylovOperatorApplyCount()
+                << " last_krylov_preconditioner_apply_count="
+                << igr->GetLastKrylovPreconditionerApplyCount()
+                << " last_krylov_preconditioner_operator_apply_count="
+                << igr->GetLastKrylovPreconditionerOperatorApplyCount()
+                << " direct_identity_system="
+                << (igr->GetLastDirectIdentitySystem() ? 1 : 0)
+                << " direct_identity_reason="
+                << igr->GetLastDirectIdentityReason()
+                << " direct_identity_uses="
+                << igr->GetDirectIdentitySystemUses()
+                << " exact_face_requested="
+                << (igr->GetLastExactFaceRequested() ? 1 : 0)
+                << " exact_face_effective="
+                << (igr->GetLastExactFaceEffective() ? 1 : 0)
+                << " exact_face_reason=" << igr->GetLastExactFaceReason()
+                << " exact_face_local_nf="
+                << igr->GetLastExactFaceLocalFaceCount()
+                << " exact_face_shared_nf="
+                << igr->GetLastExactFaceSharedFaceCount()
+                << " exact_face_operator_uses="
+                << igr->GetExactFaceOperatorUseCount()
+                << " exact_face_last_mult_calls="
+                << igr->GetLastExactFaceOperatorMultCalls() << "\n";
     }
 
     if (run_cfg.opts.save_state_files)

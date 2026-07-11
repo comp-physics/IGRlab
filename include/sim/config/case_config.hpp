@@ -47,6 +47,7 @@ struct IGROptions
   int amg_relax_type = -1;
   int amg_max_levels = -1;
   double amg_strong_threshold = -1.0;
+  bool exact_dg_face_operator = false;
 };
 
 /// @brief DG backend selection.
@@ -246,6 +247,11 @@ inline dg_igr::IGRPrecondType ParseIGRPrecondType(const std::string& value)
   {
     return dg_igr::IGRPrecondType::HypreSmoother;
   }
+  if (lower == "chebyshev" || lower == "operatorchebyshev" ||
+      lower == "operator-chebyshev")
+  {
+    return dg_igr::IGRPrecondType::OperatorChebyshev;
+  }
   if (lower == "none")
   {
     return dg_igr::IGRPrecondType::None;
@@ -254,7 +260,7 @@ inline dg_igr::IGRPrecondType ParseIGRPrecondType(const std::string& value)
               "Invalid IGR preconditioner '"
                 << value << "'. Use 'auto', 'boomeramg', 'hypreilu', "
                 << "'hypreeuclid', 'parasails', "
-                << "'hypresmoother', or 'none'.");
+                << "'hypresmoother', 'chebyshev', or 'none'.");
   return dg_igr::IGRPrecondType::Auto;
 }
 
@@ -373,6 +379,8 @@ inline const char* IGRPrecondTypeToString(dg_igr::IGRPrecondType value)
     return "parasails";
   case dg_igr::IGRPrecondType::HypreSmoother:
     return "hypresmoother";
+  case dg_igr::IGRPrecondType::OperatorChebyshev:
+    return "chebyshev";
   case dg_igr::IGRPrecondType::None:
     return "none";
   }
@@ -442,6 +450,87 @@ inline DeviceBackend ParseDeviceBackend(const std::string& value)
               "Invalid device backend '" << value
                                          << "'. Use 'cpu' or 'cuda'.");
   return DeviceBackend::CPU;
+}
+
+inline bool IsL2IGRSpaceName(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  return lower == "l2";
+}
+
+inline bool IsBrokenDGIGRGradName(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  return lower == "l2" || lower == "brokenl2" || lower == "brokendg" ||
+         lower == "broken-dg";
+}
+
+inline bool IsExactDGFaceOptionName(const std::string& value)
+{
+  return value == "-iexface" || value == "--igr-exact-dg-face" ||
+         value == "-ino-exface" || value == "--no-igr-exact-dg-face";
+}
+
+inline bool HasExactDGFaceOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsExactDGFaceOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool ShouldDefaultExactDGFaceOperator(const CommonOptions& opts,
+                                             const IGROptions& igr_opts)
+{
+  return ParseDeviceBackend(opts.device) == DeviceBackend::CUDA &&
+         ParseDGBackend(opts.dg_backend) == DGBackend::DG &&
+         IsL2IGRSpaceName(igr_opts.space) &&
+         IsBrokenDGIGRGradName(igr_opts.grad);
+}
+
+inline void
+ApplyIGRDerivedRuntimeDefaults(const CommonOptions& opts,
+                               IGROptions& igr_opts,
+                               bool exact_face_operator_overridden)
+{
+  const bool cuda_l2_broken_dg =
+    ParseDeviceBackend(opts.device) == DeviceBackend::CUDA &&
+    ParseDGBackend(opts.dg_backend) == DGBackend::DG &&
+    IsL2IGRSpaceName(igr_opts.space) && IsBrokenDGIGRGradName(igr_opts.grad);
+
+  if (!exact_face_operator_overridden &&
+      ShouldDefaultExactDGFaceOperator(opts, igr_opts))
+  {
+    igr_opts.exact_dg_face_operator = true;
+  }
+
+  if (cuda_l2_broken_dg && igr_opts.exact_dg_face_operator)
+  {
+    if (ToLowerCopy(igr_opts.linear_solver) == "auto")
+    {
+      igr_opts.linear_solver = "minres";
+    }
+    if (ToLowerCopy(igr_opts.preconditioner) == "auto")
+    {
+      igr_opts.preconditioner = "chebyshev";
+    }
+    if (igr_opts.stage_rtol_scale < 0.0)
+    {
+      igr_opts.stage_rtol_scale = 1.0;
+    }
+    if (igr_opts.lin_rtol < 0.0)
+    {
+      igr_opts.lin_rtol = 1.0e-5;
+    }
+    if (igr_opts.lin_atol < 0.0)
+    {
+      igr_opts.lin_atol = 0.0;
+    }
+  }
 }
 
 inline DGSEMStabilization ParseDGSEMStabilization(const std::string& value)
@@ -768,7 +857,7 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "--igr-preconditioner",
                  "IGR preconditioner: auto | boomeramg | hypreilu | "
                  "hypreeuclid | parasails | "
-                 "hypresmoother | none.");
+                 "hypresmoother | chebyshev | none.");
   args.AddOption(
     &igr_opts.sigma_cadence,
     "-iscad",
@@ -822,6 +911,13 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "-iamgst",
                  "--igr-amg-strong-threshold",
                  "IGR BoomerAMG strong-threshold (<0 keeps HYPRE default).");
+  args.AddOption(&igr_opts.exact_dg_face_operator,
+                 "-iexface",
+                 "--igr-exact-dg-face",
+                 "-ino-exface",
+                 "--no-igr-exact-dg-face",
+                 "Enable or disable the side-aware exact DG face operator "
+                 "for L2/DG IGR.");
 }
 
 inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,

@@ -69,6 +69,7 @@ enum class IGRPrecondType
   HypreEuclid,
   ParaSails,
   HypreSmoother,
+  OperatorChebyshev,
   None
 };
 
@@ -128,6 +129,9 @@ struct IGRConfig
 
   // Stage-wise tolerance policy (RK intermediate stages can be looser).
   double stage_rtol_scale = 1.0; // > 1.0 loosens stage-0/1 relative tolerance
+
+  // Use the side-aware exact DG face wrapper for L2/DG IGR.
+  bool exact_dg_face_operator = false;
 
 };
 
