@@ -3,6 +3,8 @@
 #include "utils/config/timestepping_config.hpp"
 #include "numerics/limiters/limiters.hpp" // brings limiter option types
 #include "numerics/timestepping/stage_aware_operator.hpp"
+
+#include <cstdint>
 #include <functional>
 #include <vector>
 
@@ -145,10 +147,13 @@ public:
 
   // ---- Convenience: push common limiters as callbacks (defined in .cpp) ----
   /// Add a Zhang–Shu positivity limiter.
+  /// @param point_set Positivity points enforced by the limiter.
   /// @param always_on
   ///   - true  -> add as an always-on callback (default)
   ///   - false -> add as an optional callback (respecting max_limiter_steps_)
-  void AddZhangShuLimiter(bool always_on = true);
+  void AddZhangShuLimiter(
+    ZhangShuPointSet point_set = ZhangShuPointSet::kConsumer,
+    bool always_on = true);
   void AddCharTVBLimiter(const CharTVBOptions& opts); // characteristic TVB
   void AddCharTVBFaceNormalLimiter(const CharTVBOptions& opts);
   void AddCharBJLimiter(const CharBJOptions& opts); // characteristic BJ
@@ -160,6 +165,10 @@ public:
 
   // --------------- ODESolver interface ---------------
   void Init(TimeDependentOperator& f_) override;
+
+  /// Generation of the accepted state vector, for auxiliary-field provenance.
+  std::uint64_t GetStateGeneration() const { return state_generation_; }
+  long GetStepCount() const { return step_count_; }
   void Step(Vector& x, real_t& t, real_t& dt) override;
 
 private:
@@ -191,15 +200,19 @@ private:
   bool nan_scan_stages_ = false;
   bool stage_nan_detected_ = false;
   bool admissibility_scan_stages_ = false;
+  bool stage_pair_capture_written_ = false;
+  std::uint64_t state_generation_ = 0;
 
   // Work vectors
   Vector y_, k_;
 
   // Helpers
   /// Apply both always-on and (optionally) optional callbacks to vector v.
-  void ApplyCallbacks(Vector& v, double t, bool apply_optional);
+  bool ApplyCallbacks(Vector& v, double t, bool apply_optional);
+  void AdvanceStateGeneration();
   void MaybeScanVector(Vector& v, double t, const char* label);
   void MaybeScanAdmissibility(Vector& v, double t, const char* label);
+  void MaybeCaptureStagePair(Vector& v, double t, const char* side);
   int AutoQuadOrder() const;
 };
 

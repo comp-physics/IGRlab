@@ -109,11 +109,24 @@ RunEulerCase(ExampleContext& ctx,
              double c_alpha_value = std::numeric_limits<double>::quiet_NaN(),
              bool print_dataset_name = false)
 {
+  rk3.Init(op);
+  auto* sigma_provider = dynamic_cast<mfem::IGRSigmaStateProvider*>(&op);
+
   EulerOutputFieldTiming initial_field_timing;
-  UpdateEulerOutputFields(bundle.field_list,
-                          bundle.sol,
-                          /*warm_start=*/false,
-                          &initial_field_timing);
+  double initial_sigma_prepare_s = 0.0;
+  if (sigma_provider && (run_cfg.opts.vtk_save || glvis_enabled))
+  {
+    const auto prepare_start = std::chrono::steady_clock::now();
+    sigma_provider->PrepareSigmaForOutput(bundle.sol,
+                                          rk3.GetStateGeneration(),
+                                          /*next_rk_step=*/0,
+                                          /*time=*/0.0,
+                                          /*reusable_stage0=*/true);
+    initial_sigma_prepare_s = SecondsSince(prepare_start);
+  }
+  UpdateEulerOutputFields(bundle.field_list, &initial_field_timing);
+  initial_field_timing.igr_update_s = initial_sigma_prepare_s;
+  initial_field_timing.total_s += initial_sigma_prepare_s;
   const double initial_update_fields_s = initial_field_timing.total_s;
   PrintVTKOutputTiming("initial-fields",
                        /*cycle=*/0,
@@ -212,8 +225,23 @@ RunEulerCase(ExampleContext& ctx,
   io.glvis_windows = &glvis_windows;
   io.glvis_enabled = &glvis_enabled;
   io.paraview = paraview_dc.get();
+  if (sigma_provider)
+  {
+    io.prepare_sigma = [sigma_provider, &bundle, &rk3](int,
+                                                       mfem::real_t t,
+                                                       bool is_final)
+    {
+      const auto prepare_start = std::chrono::steady_clock::now();
+      sigma_provider->PrepareSigmaForOutput(
+        bundle.sol,
+        rk3.GetStateGeneration(),
+        static_cast<int>(rk3.GetStepCount()),
+        t,
+        /*reusable_stage0=*/!is_final);
+      return SecondsSince(prepare_start);
+    };
+  }
 
-  rk3.Init(op);
   TimeLoopConfig loop_cfg = MakeTimeLoopConfig(run_cfg);
   if (run_cfg.opts.vtk_save)
   {
@@ -225,6 +253,18 @@ RunEulerCase(ExampleContext& ctx,
     MakeEulerTimeLoopHooks(ctx, bundle, num_procs, my_rank, io, callbacks);
   const TimeLoopResult result =
     RunTimeLoop(op, ctx.Mesh(), bundle.sol, rk3, loop_cfg, hooks);
+  if (sigma_provider && mfem::Mpi::Root())
+  {
+    std::cout << "[igr-sigma-lifecycle] event=run-summary"
+              << " prefetch_solves="
+              << sigma_provider->GetSigmaPrefetchSolveCount()
+              << " stage0_reuses="
+              << sigma_provider->GetSigmaStage0ReuseCount()
+              << " output_only_solves="
+              << sigma_provider->GetSigmaOutputOnlySolveCount()
+              << " prefetch_invalidations="
+              << sigma_provider->GetSigmaPrefetchInvalidationCount() << "\n";
+  }
   if (result.non_finite_count > 0 || result.dt_min_reached)
   {
     return false;
@@ -335,9 +375,13 @@ struct Solver
                 << (run_cfg.igr_opts.exact_dg_face_operator ? "on" : "off")
                 << " solver=" << run_cfg.igr_opts.linear_solver
                 << " preconditioner=" << run_cfg.igr_opts.preconditioner
+                << " nonconvergence_policy="
+                << run_cfg.igr_opts.nonconvergence_policy
                 << " stage_rtol_scale=" << run_cfg.igr_opts.stage_rtol_scale
                 << " lin_rtol=" << run_cfg.igr_opts.lin_rtol
-                << " lin_atol=" << run_cfg.igr_opts.lin_atol << "\n";
+                << " lin_atol=" << run_cfg.igr_opts.lin_atol
+                << " lin_maxit="
+                << run_cfg.case_config.igr_config.lin_maxit << "\n";
     }
     if (run_cfg.device_backend == DeviceBackend::CUDA)
     {
@@ -640,6 +684,20 @@ struct Solver
       std::cout << "[igr-linear] event=run-summary"
                 << " calls=" << igr->GetLinearSolveCalls()
                 << " converged_calls=" << igr->GetTotalLinearConvergedCalls()
+                << " production_calls="
+                << igr->GetProductionLinearSolveCalls()
+                << " production_converged_calls="
+                << igr->GetProductionLinearConvergedCalls()
+                << " output_only_calls="
+                << igr->GetOutputOnlyLinearSolveCalls()
+                << " output_only_converged_calls="
+                << igr->GetOutputOnlyLinearConvergedCalls()
+                << " output_only_iters="
+                << igr->GetOutputOnlyLinearIterations()
+                << " output_only_solve_s="
+                << igr->GetOutputOnlyLinearSolveSeconds()
+                << " output_only_igr_s="
+                << igr->GetOutputOnlyIGRWorkSeconds()
                 << " total_iters=" << total_linear_iters
                 << " avg_iters=" << igr->GetAverageLinearIterations()
                 << " max_iters=" << igr->GetMaxLinearIterations()

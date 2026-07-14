@@ -12,6 +12,15 @@
 namespace mfem
 {
 
+/// Points at which Zhang-Shu positivity is enforced.
+enum class ZhangShuPointSet
+{
+  /// Legacy volume/face quadrature points.
+  kQuadrature,
+  /// Quadrature points plus FE nodes consumed by production operators.
+  kConsumer
+};
+
 struct ZhangShuLimiterElementDiagnostics
 {
   mfem::Vector active;
@@ -34,7 +43,8 @@ struct ZhangShuLimiterElementDiagnostics
  *
  * Enforces non-negativity of density and pressure at a set of intra-element
  * positivity points by blending each cell's polynomial solution toward its
- * cell average.
+ * cell average. The default consumer point set includes FE nodes evaluated by
+ * production Euler and IGR operators.
  *
  * @note Assumes vfes uses Ordering::byNODES.
  * @note Operates locally on each element (no communication). In parallel,
@@ -49,6 +59,9 @@ void ApplyZhangShuPositivityLimiter(mfem::ParFiniteElementSpace& vfes,
                                     int quad_order,
                                     const std::vector<int>& face_quad_orders = {},
                                     int p_bisect_iters = 12,
-                                    ZhangShuLimiterElementDiagnostics* diagnostics = nullptr);
+                                    ZhangShuPointSet point_set =
+                                      ZhangShuPointSet::kConsumer,
+                                    ZhangShuLimiterElementDiagnostics*
+                                      diagnostics = nullptr);
 
 } // namespace mfem

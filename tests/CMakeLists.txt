@@ -23,6 +23,50 @@ target_include_directories(dg_igr_unit_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/include
 )
 
+if (MFEM_USE_CUDA)
+  set_source_files_properties(test_analysis_device_alias.cpp PROPERTIES
+    LANGUAGE CUDA
+  )
+  add_executable(dg_igr_analysis_device_alias_test
+    test_analysis_device_alias.cpp
+  )
+  set_target_properties(dg_igr_analysis_device_alias_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+  target_compile_options(dg_igr_analysis_device_alias_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  )
+  target_link_libraries(dg_igr_analysis_device_alias_test PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_analysis_device_alias_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+  )
+  add_test(NAME dg_igr_analysis_device_alias_cuda
+    COMMAND dg_igr_analysis_device_alias_test cuda
+  )
+  set_tests_properties(dg_igr_analysis_device_alias_cuda PROPERTIES
+    LABELS "cuda;analysis;diagnostics"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+  )
+
+  add_executable(dg_igr_limiter_device_alias_test
+    test_limiter_device_alias.cpp
+  )
+  target_link_libraries(dg_igr_limiter_device_alias_test PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_limiter_device_alias_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+  )
+  add_test(NAME dg_igr_limiter_device_alias_cuda
+    COMMAND dg_igr_limiter_device_alias_test cuda
+  )
+  set_tests_properties(dg_igr_limiter_device_alias_cuda PROPERTIES
+    LABELS "cuda;limiter;admissibility"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+  )
+endif()
+
 add_test(NAME dg_igr_euler_tests COMMAND dg_igr_unit_tests --euler)
 add_test(NAME dg_igr_flux_tests COMMAND dg_igr_unit_tests --fluxes)
 add_test(NAME dg_igr_limiter_tests COMMAND dg_igr_unit_tests --limiters)
@@ -38,6 +82,57 @@ add_test(NAME dg_igr_bc_tests COMMAND dg_igr_unit_tests --bc)
 add_test(NAME dg_igr_igr_tests COMMAND dg_igr_unit_tests --igr)
 add_test(NAME dg_igr_time_defaults_tests COMMAND dg_igr_unit_tests --time-defaults)
 add_test(NAME dg_igr_diagnostics_tests COMMAND dg_igr_unit_tests --diagnostics)
+
+if (TARGET supersonic_cylinder_w_igr)
+  add_test(NAME dg_igr_sigma_vtk_lifecycle_cpu
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/check_sigma_vtk_lifecycle.py
+            --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+            --device cpu
+            --out-dir ${CMAKE_BINARY_DIR}/tests/sigma-vtk-lifecycle-cpu
+            --failure-control
+            --igr-stage-rtol-scale 10
+  )
+  set_tests_properties(dg_igr_sigma_vtk_lifecycle_cpu PROPERTIES
+    LABELS "igr;vtk;lifecycle"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+  )
+
+  if (MFEM_USE_CUDA)
+    add_test(NAME dg_igr_sigma_vtk_lifecycle_cuda
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_sigma_vtk_lifecycle.py
+              --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+              --device cuda
+              --out-dir ${CMAKE_BINARY_DIR}/tests/sigma-vtk-lifecycle-cuda
+    )
+    set_tests_properties(dg_igr_sigma_vtk_lifecycle_cuda PROPERTIES
+      LABELS "cuda;igr;vtk;lifecycle"
+      TIMEOUT 180
+      RUN_SERIAL TRUE
+    )
+
+    if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
+      add_test(NAME dg_igr_sigma_vtk_lifecycle_mpi_cuda
+        COMMAND /usr/bin/env python3
+                ${CMAKE_SOURCE_DIR}/tests/scripts/check_sigma_vtk_lifecycle.py
+                --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+                --device cuda
+                --out-dir ${CMAKE_BINARY_DIR}/tests/sigma-vtk-lifecycle-mpi-cuda
+                --mpi-ranks 2
+                --mpiexec ${MPIEXEC_EXECUTABLE}
+                --mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}
+      )
+      set_tests_properties(dg_igr_sigma_vtk_lifecycle_mpi_cuda PROPERTIES
+        LABELS "cuda;mpi;igr;vtk;lifecycle;exact-face"
+        TIMEOUT 240
+        RUN_SERIAL TRUE
+        PROCESSORS 2
+      )
+    endif()
+  endif()
+endif()
 set_tests_properties(dg_igr_dgsem_portability_refactor_tests PROPERTIES
   LABELS "dgsem;portability"
   TIMEOUT 180
@@ -103,6 +198,7 @@ if (MFEM_USE_CUDA AND TARGET supersonic_cylinder_w_igr)
             --igr-stage-rtol-scale 10
             --igr-lin-rtol 1.0e-8
             --default-rel-rms-limit 1.0e-8
+            --intermediate-sigma-rel-rms-limit 1.0e-7
   )
   set_tests_properties(dg_igr_cylinder_l2_cuda_direct_identity_parity_exact_face
     PROPERTIES

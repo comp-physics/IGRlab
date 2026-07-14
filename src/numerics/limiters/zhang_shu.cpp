@@ -40,6 +40,8 @@ struct DeviceLimiterCache
   bool tensor_points = false;
   bool mfem_volume_points = false;
   bool mfem_face_points = false;
+  bool enforce_nodes = false;
+  bool enforce_vtk_points = false;
   std::vector<int> face_qords;
   const mfem::Operator* restriction = nullptr;
   const mfem::QuadratureInterpolator* volume_interpolator = nullptr;
@@ -100,6 +102,7 @@ struct LimiterTimingState
 {
   bool initialized = false;
   bool enabled = false;
+  bool phase_enabled = false;
   int warmup_calls = 0;
   int seen_calls = 0;
   int calls = 0;
@@ -109,6 +112,22 @@ struct LimiterTimingState
   double avg_mfem_volume_points = 0.0;
   double avg_mfem_face_points = 0.0;
   double avg_point_count = 0.0;
+  double average_seconds = 0.0;
+  double admissible_average_seconds = 0.0;
+  double density_volume_seconds = 0.0;
+  double density_face_seconds = 0.0;
+  double density_node_seconds = 0.0;
+  double density_blend_seconds = 0.0;
+  double pressure_volume_seconds = 0.0;
+  double pressure_face_seconds = 0.0;
+  double pressure_node_seconds = 0.0;
+  double pressure_blend_seconds = 0.0;
+  double scatter_seconds = 0.0;
+  double avg_collapsed_elements = 0.0;
+  double avg_pressure_bisections = 0.0;
+  double avg_volume_points = 0.0;
+  double avg_face_points = 0.0;
+  double avg_node_points = 0.0;
   mfem::Array<mfem::real_t> active_reduce_workspace;
 
   ~LimiterTimingState()
@@ -133,8 +152,51 @@ struct LimiterTimingState
               << avg_mfem_volume_points * inv_calls
               << " avg_mfem_face_points="
               << avg_mfem_face_points * inv_calls
-              << " avg_points=" << avg_point_count * inv_calls << "\n";
+              << " avg_points=" << avg_point_count * inv_calls;
+    if (phase_enabled)
+    {
+      std::cout << " cpu_average_s=" << average_seconds
+                << " cpu_admissible_average_s=" << admissible_average_seconds
+                << " cpu_density_volume_s=" << density_volume_seconds
+                << " cpu_density_face_s=" << density_face_seconds
+                << " cpu_density_node_s=" << density_node_seconds
+                << " cpu_density_blend_s=" << density_blend_seconds
+                << " cpu_pressure_volume_s=" << pressure_volume_seconds
+                << " cpu_pressure_face_s=" << pressure_face_seconds
+                << " cpu_pressure_node_s=" << pressure_node_seconds
+                << " cpu_pressure_blend_s=" << pressure_blend_seconds
+                << " cpu_scatter_s=" << scatter_seconds
+                << " avg_collapsed_elements="
+                << avg_collapsed_elements * inv_calls
+                << " avg_pressure_bisections="
+                << avg_pressure_bisections * inv_calls
+                << " avg_volume_points=" << avg_volume_points * inv_calls
+                << " avg_face_points=" << avg_face_points * inv_calls
+                << " avg_node_points=" << avg_node_points * inv_calls;
+    }
+    std::cout << "\n";
   }
+};
+
+struct CpuLimiterPhaseSample
+{
+  double average_seconds = 0.0;
+  double admissible_average_seconds = 0.0;
+  double density_volume_seconds = 0.0;
+  double density_face_seconds = 0.0;
+  double density_node_seconds = 0.0;
+  double density_blend_seconds = 0.0;
+  double pressure_volume_seconds = 0.0;
+  double pressure_face_seconds = 0.0;
+  double pressure_node_seconds = 0.0;
+  double pressure_blend_seconds = 0.0;
+  double scatter_seconds = 0.0;
+  double active_elements = 0.0;
+  double collapsed_elements = 0.0;
+  double pressure_bisections = 0.0;
+  double volume_points = 0.0;
+  double face_points = 0.0;
+  double node_points = 0.0;
 };
 
 struct ActiveCountReductionBody
@@ -183,7 +245,10 @@ LimiterTimingState& GetLimiterTimingState()
   static LimiterTimingState state;
   if (!state.initialized)
   {
-    state.enabled = dg_igr::EnvFlagEnabled("DG_IGR_LIMITER_TIMING");
+    state.phase_enabled =
+      dg_igr::EnvFlagEnabled("DG_IGR_LIMITER_CPU_PHASE_TIMING");
+    state.enabled = dg_igr::EnvFlagEnabled("DG_IGR_LIMITER_TIMING") ||
+                    state.phase_enabled;
     if (const char* value = std::getenv("DG_IGR_TIMING_WARMUP_CALLS"))
     {
       state.warmup_calls = std::max(0, std::atoi(value));
@@ -628,7 +693,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   mfem::ParFiniteElementSpace& vfes,
   int num_eq,
   int qord,
-  const std::vector<int>& face_qords)
+  const std::vector<int>& face_qords,
+  mfem::ZhangShuPointSet point_set)
 {
   static std::unordered_map<const mfem::ParFiniteElementSpace*,
                             std::unique_ptr<DeviceLimiterCache>> caches;
@@ -645,6 +711,16 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     mfem::QuadratureInterpolator::SupportsFESpace(vfes);
   const bool requested_mfem_face_points =
     ne > 0 && SupportsMfemFaceLimiterPath(vfes, face_qords);
+  const auto* l2_fec =
+    dynamic_cast<const mfem::L2_FECollection*>(vfes.FEColl());
+  const bool consumer_points =
+    point_set == mfem::ZhangShuPointSet::kConsumer;
+  const bool requested_enforce_nodes =
+    (l2_fec != nullptr &&
+     l2_fec->GetBasisType() == mfem::BasisType::GaussLobatto) ||
+    consumer_points;
+  const bool requested_enforce_vtk_points =
+    dg_igr::EnvFlagEnabledDefault("DG_IGR_LIMITER_ENFORCE_VTK_POINTS", false);
   const mfem::QuadratureInterpolator* current_volume_interpolator = nullptr;
   int current_volume_nq = 0;
   if (requested_mfem_volume_points)
@@ -665,7 +741,9 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     cache_ptr->dof != dof || cache_ptr->num_eq != num_eq ||
     cache_ptr->face_qords != face_qords ||
     cache_ptr->mfem_volume_points != requested_mfem_volume_points ||
-    cache_ptr->mfem_face_points != requested_mfem_face_points;
+    cache_ptr->mfem_face_points != requested_mfem_face_points ||
+    cache_ptr->enforce_nodes != requested_enforce_nodes ||
+    cache_ptr->enforce_vtk_points != requested_enforce_vtk_points;
   if (!rebuild)
   {
     return *cache_ptr;
@@ -695,6 +773,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
 
   cache.mfem_volume_points = requested_mfem_volume_points;
   cache.mfem_face_points = requested_mfem_face_points;
+  cache.enforce_nodes = requested_enforce_nodes;
+  cache.enforce_vtk_points = requested_enforce_vtk_points;
   if (cache.mfem_volume_points)
   {
     cache.volume_nq = current_volume_nq;
@@ -906,13 +986,25 @@ DeviceLimiterCache& GetDeviceLimiterCache(
       }
     }
 
-    const auto* l2 = dynamic_cast<const mfem::L2_FECollection*>(vfes.FEColl());
-    if (l2 != nullptr && l2->GetBasisType() == mfem::BasisType::GaussLobatto)
+    if (cache.enforce_nodes)
     {
       const mfem::IntegrationRule& nodes = fe.GetNodes();
       for (int q = 0; q < nodes.GetNPoints(); ++q)
       {
         fe.CalcShape(nodes.IntPoint(q), shape);
+        for (int d = 0; d < dof; ++d)
+        {
+          point_shapes.push_back(shape(NativeDof(fe, d)));
+        }
+      }
+    }
+    if (cache.enforce_vtk_points)
+    {
+      const mfem::RefinedGeometry* refined =
+        mfem::GlobGeometryRefiner.Refine(fe.GetGeomType(), fe.GetOrder(), 1);
+      for (int q = 0; q < refined->RefPts.GetNPoints(); ++q)
+      {
+        fe.CalcShape(refined->RefPts.IntPoint(q), shape);
         for (int d = 0; d < dof; ++d)
         {
           point_shapes.push_back(shape(NativeDof(fe, d)));
@@ -1110,6 +1202,7 @@ void ApplyDeviceZhangShuPositivityLimiter(
   int qord,
   const std::vector<int>& face_qords,
   int p_bisect_iters,
+  mfem::ZhangShuPointSet point_set,
   mfem::ZhangShuLimiterElementDiagnostics* diagnostics)
 {
   ::dg_igr::NVTXRange limiter_range("Limiter/Zhang-Shu");
@@ -1119,7 +1212,7 @@ void ApplyDeviceZhangShuPositivityLimiter(
 
   const int num_eq = dim + 2;
   DeviceLimiterCache& cache =
-    GetDeviceLimiterCache(vfes, num_eq, qord, face_qords);
+    GetDeviceLimiterCache(vfes, num_eq, qord, face_qords, point_set);
   cache.restriction->Mult(U, cache.element_state);
   if (cache.mfem_volume_points)
   {
@@ -1407,6 +1500,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
                                     int quad_order,
                                     const std::vector<int>& face_quad_orders,
                                     int p_bisect_iters,
+                                    ZhangShuPointSet point_set,
                                     ZhangShuLimiterElementDiagnostics* diagnostics)
 {
   MFEM_VERIFY(vfes.GetOrdering() == Ordering::byNODES,
@@ -1440,12 +1534,26 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
                                          qord,
                                          limiter_face_qords,
                                          p_bisect_iters,
+                                         point_set,
                                          diagnostics);
     return;
   }
 
   LimiterTimingState& timing = GetLimiterTimingState();
   const auto timing_start = std::chrono::steady_clock::now();
+  CpuLimiterPhaseSample phase;
+  using PhaseClock = std::chrono::steady_clock;
+  auto phase_start = [&]()
+  {
+    return timing.phase_enabled ? PhaseClock::now() : PhaseClock::time_point{};
+  };
+  auto phase_add = [&](const PhaseClock::time_point& start, double& total)
+  {
+    if (timing.phase_enabled)
+    {
+      total += std::chrono::duration<double>(PhaseClock::now() - start).count();
+    }
+  };
 
   if (diagnostics)
   {
@@ -1456,8 +1564,13 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
   {
     const FiniteElement* fe = vfes.GetFE(i);
     const auto* fec_l2 = dynamic_cast<const L2_FECollection*>(vfes.FEColl());
+    const bool consumer_points = point_set == ZhangShuPointSet::kConsumer;
     const bool enforce_nodes =
-      (fec_l2 != nullptr && fec_l2->GetBasisType() == BasisType::GaussLobatto);
+      (fec_l2 != nullptr && fec_l2->GetBasisType() == BasisType::GaussLobatto) ||
+      consumer_points;
+    const bool enforce_vtk_points =
+      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_LIMITER_ENFORCE_VTK_POINTS",
+                                      false);
     ElementTransformation* Tr = vfes.GetElementTransformation(i);
     const int dof = fe->GetDof();
     vfes.GetElementVDofs(i, vdofs);
@@ -1466,15 +1579,14 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
 
     // --- compute cell average ---
-    dg_igr::limiters_detail::ElementAverage(*fe,
-                                            *Tr,
-                                            elmat,
-                                            num_eq,
-                                            qord,
-                                            Ubar);
+    const auto average_start = phase_start();
+    dg_igr::limiters_detail::ElementAverage(
+      *fe, *Tr, elmat, num_eq, qord, Ubar);
+    phase_add(average_start, phase.average_seconds);
 
     // If the average itself is unphysical, collapse element to constant admissible state
     {
+      const auto admissible_average_start = phase_start();
       const double rho_bar = std::max(Ubar(0), rho_min);
       double mom2_bar = 0.0;
       for (int d = 0; d < dim; ++d)
@@ -1485,6 +1597,8 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
 
       if (rho_bar <= rho_min || p_bar <= p_min)
       {
+        phase.collapsed_elements += 1.0;
+        phase.active_elements += 1.0;
         Ubar(0) = rho_bar;
         E_bar = k_bar + p_min / (gamma - 1.0);
         Ubar(1 + dim) = E_bar;
@@ -1502,8 +1616,12 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
           diagnostics->theta_rho(i) = 0.0;
           diagnostics->theta_p(i) = 0.0;
         }
+        phase_add(admissible_average_start,
+                  phase.admissible_average_seconds);
         continue; // done with this element
       }
+      phase_add(admissible_average_start,
+                phase.admissible_average_seconds);
     }
 
     // --- positivity points (use same IR as average) ---
@@ -1530,6 +1648,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
       }
     };
 
+    const auto density_volume_start = phase_start();
     for (int q = 0; q < ir.GetNPoints(); ++q)
     {
       const IntegrationPoint& ip = ir.IntPoint(q);
@@ -1538,6 +1657,10 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
       elmat.MultTranspose(shape, Up);
       rho_update(Up);
     }
+    phase.volume_points += static_cast<double>(ir.GetNPoints());
+    phase_add(density_volume_start, phase.density_volume_seconds);
+
+    const auto density_face_start = phase_start();
     for (const int face : elem_faces[i])
     {
       FaceElementTransformations* FTr = mesh.GetFaceElementTransformations(face);
@@ -1561,6 +1684,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
           IntRules.Get(FTr->GetGeometryType(), fqord);
         for (int q = 0; q < fir.GetNPoints(); ++q)
         {
+          phase.face_points += 1.0;
           const IntegrationPoint& fip = fir.IntPoint(q);
           FTr->SetAllIntPoints(&fip);
           const IntegrationPoint& eip = elem_is_first
@@ -1572,6 +1696,9 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
         }
       }
     }
+    phase_add(density_face_start, phase.density_face_seconds);
+
+    const auto density_node_start = phase_start();
     if (enforce_nodes)
     {
       for (int j = 0; j < dof; ++j)
@@ -1579,7 +1706,23 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
         elmat.GetRow(j, Up);
         rho_update(Up);
       }
+      phase.node_points += static_cast<double>(dof);
     }
+    phase_add(density_node_start, phase.density_node_seconds);
+
+    if (enforce_vtk_points)
+    {
+      const mfem::RefinedGeometry* refined =
+        mfem::GlobGeometryRefiner.Refine(fe->GetGeomType(), fe->GetOrder(), 1);
+      for (int q = 0; q < refined->RefPts.GetNPoints(); ++q)
+      {
+        fe->CalcShape(refined->RefPts.IntPoint(q), shape);
+        elmat.MultTranspose(shape, Up);
+        rho_update(Up);
+      }
+    }
+
+    const auto density_blend_start = phase_start();
     if (theta_rho < 1.0)
     {
       for (int j = 0; j < dof; ++j)
@@ -1589,6 +1732,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
         elmat.SetRow(j, row);
       }
     }
+    phase_add(density_blend_start, phase.density_blend_seconds);
 
     // Step 2: pressure limiting
     double theta_p = 1.0;
@@ -1600,6 +1744,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
                                                      /*rho_floor=*/1e-16);
       if (p < p_min)
       {
+        phase.pressure_bisections += 1.0;
         theta_p = std::min(theta_p,
                            ThetaForPressure(Ubar,
                                             state,
@@ -1611,6 +1756,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
       }
     };
 
+    const auto pressure_volume_start = phase_start();
     for (int q = 0; q < ir.GetNPoints(); ++q)
     {
       const IntegrationPoint& ip = ir.IntPoint(q);
@@ -1619,6 +1765,9 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
       elmat.MultTranspose(shape, Up); // current point state (after rho limit)
       p_update(Up);
     }
+    phase_add(pressure_volume_start, phase.pressure_volume_seconds);
+
+    const auto pressure_face_start = phase_start();
     for (const int face : elem_faces[i])
     {
       FaceElementTransformations* FTr = mesh.GetFaceElementTransformations(face);
@@ -1653,6 +1802,9 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
         }
       }
     }
+    phase_add(pressure_face_start, phase.pressure_face_seconds);
+
+    const auto pressure_node_start = phase_start();
     if (enforce_nodes)
     {
       for (int j = 0; j < dof; ++j)
@@ -1661,6 +1813,21 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
         p_update(Up);
       }
     }
+    phase_add(pressure_node_start, phase.pressure_node_seconds);
+
+    if (enforce_vtk_points)
+    {
+      const mfem::RefinedGeometry* refined =
+        mfem::GlobGeometryRefiner.Refine(fe->GetGeomType(), fe->GetOrder(), 1);
+      for (int q = 0; q < refined->RefPts.GetNPoints(); ++q)
+      {
+        fe->CalcShape(refined->RefPts.IntPoint(q), shape);
+        elmat.MultTranspose(shape, Up);
+        p_update(Up);
+      }
+    }
+
+    const auto pressure_blend_start = phase_start();
     if (theta_p < 1.0)
     {
       for (int j = 0; j < dof; ++j)
@@ -1670,6 +1837,12 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
         elmat.SetRow(j, row);
       }
     }
+    phase_add(pressure_blend_start, phase.pressure_blend_seconds);
+
+    if (theta_rho < 1.0 || theta_p < 1.0)
+    {
+      phase.active_elements += 1.0;
+    }
 
     if (diagnostics)
     {
@@ -1678,17 +1851,16 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
       diagnostics->active(i) = (theta_rho < 1.0 || theta_p < 1.0) ? 1.0 : 0.0;
     }
 
+    const auto scatter_start = phase_start();
     U.SetSubVector(vdofs, elmat.GetData());
+    phase_add(scatter_start, phase.scatter_seconds);
   }
 
   if (timing.enabled)
   {
     if (timing.seen_calls++ >= timing.warmup_calls)
     {
-      double local_active =
-        CountActiveElements(diagnostics != nullptr ? &diagnostics->active
-                                                   : nullptr,
-                            timing.active_reduce_workspace);
+      const double local_active = phase.active_elements;
       double global_active = local_active;
       if (Mpi::IsInitialized() && !Mpi::IsFinalized())
       {
@@ -1707,6 +1879,25 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
       timing.avg_active_elements += global_active;
       timing.avg_tensor_points += 0.0;
       timing.avg_point_count += 0.0;
+      if (timing.phase_enabled)
+      {
+        timing.average_seconds += phase.average_seconds;
+        timing.admissible_average_seconds += phase.admissible_average_seconds;
+        timing.density_volume_seconds += phase.density_volume_seconds;
+        timing.density_face_seconds += phase.density_face_seconds;
+        timing.density_node_seconds += phase.density_node_seconds;
+        timing.density_blend_seconds += phase.density_blend_seconds;
+        timing.pressure_volume_seconds += phase.pressure_volume_seconds;
+        timing.pressure_face_seconds += phase.pressure_face_seconds;
+        timing.pressure_node_seconds += phase.pressure_node_seconds;
+        timing.pressure_blend_seconds += phase.pressure_blend_seconds;
+        timing.scatter_seconds += phase.scatter_seconds;
+        timing.avg_collapsed_elements += phase.collapsed_elements;
+        timing.avg_pressure_bisections += phase.pressure_bisections;
+        timing.avg_volume_points += phase.volume_points;
+        timing.avg_face_points += phase.face_points;
+        timing.avg_node_points += phase.node_points;
+      }
     }
   }
 }

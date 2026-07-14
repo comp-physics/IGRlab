@@ -6,6 +6,7 @@
  */
 
 #include <filesystem>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -47,6 +48,10 @@ inline mfem::io::VTKOutputConfig MakeCaseVTKConfig(const CaseConfig& case_cfg)
 {
   mfem::io::VTKOutputConfig cfg = case_cfg.vtk_config;
   cfg.prefix_path = DefaultCaseVTKOutputDir(case_cfg);
+  if (const char* prefix = std::getenv("DG_IGR_VTK_PREFIX_PATH"))
+  {
+    if (prefix[0] != '\0') { cfg.prefix_path = prefix; }
+  }
   return cfg;
 }
 

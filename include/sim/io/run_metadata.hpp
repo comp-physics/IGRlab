@@ -194,6 +194,8 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << detail::ToJsonString(run_cfg.igr_opts.linear_solver) << ",\n";
   out << "    \"igr_preconditioner\": "
       << detail::ToJsonString(run_cfg.igr_opts.preconditioner) << ",\n";
+  out << "    \"igr_nonconvergence_policy\": "
+      << detail::ToJsonString(run_cfg.igr_opts.nonconvergence_policy) << ",\n";
   out << "    \"igr_sigma_cadence\": "
       << detail::ToJsonString(run_cfg.igr_opts.sigma_cadence) << ",\n";
   out << "    \"igr_sigma_update_interval\": "
@@ -213,6 +215,8 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   out << "    \"igr_exact_dg_face_operator\": "
       << (run_cfg.igr_opts.exact_dg_face_operator ? "true" : "false")
       << ",\n";
+  out << "    \"zhang_shu_points\": "
+      << detail::ToJsonString(run_cfg.opts.zhang_shu_points) << ",\n";
   out << "    \"cfl\": " << run_cfg.opts.cfl << ",\n";
   out << "    \"dt\": " << run_cfg.opts.dt << ",\n";
   out << "    \"dt_min\": " << run_cfg.opts.dt_min << ",\n";

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace dg_igr
 {
@@ -30,6 +31,140 @@ MakeVolumeQuadratureSpace(mfem::Mesh& mesh,
     return std::make_unique<mfem::QuadratureSpace>(mesh, ir);
   }
   return std::make_unique<mfem::QuadratureSpace>(&mesh, ir.GetOrder());
+}
+
+void LogStateQuadratureAudit(const char* name,
+                             const mfem::QuadratureFunction& values,
+                             const mfem::QuadratureSpace& space,
+                             int num_eq,
+                             int dim,
+                             double rho_floor,
+                             int solve_call,
+                             MPI_Comm comm)
+{
+  const int ne = space.GetNE();
+  const int nq = space.GetIntRule(0).GetNPoints();
+  const auto state = mfem::Reshape(values.HostRead(), num_eq, nq, ne);
+  double local_min_rho = std::numeric_limits<double>::infinity();
+  double local_max_rho = -std::numeric_limits<double>::infinity();
+  double local_min_internal = std::numeric_limits<double>::infinity();
+  long long local_floor = 0;
+  long long local_negative_internal = 0;
+  long long local_nonfinite = 0;
+  for (int e = 0; e < ne; ++e)
+  {
+    for (int q = 0; q < nq; ++q)
+    {
+      const double rho = state(0, q, e);
+      double momentum_sq = 0.0;
+      for (int d = 0; d < dim; ++d)
+      {
+        momentum_sq += state(1 + d, q, e) * state(1 + d, q, e);
+      }
+      const double internal = rho > 0.0
+        ? state(1 + dim, q, e) - 0.5 * momentum_sq / rho
+        : -std::numeric_limits<double>::infinity();
+      local_min_rho = std::min(local_min_rho, rho);
+      local_max_rho = std::max(local_max_rho, rho);
+      local_min_internal = std::min(local_min_internal, internal);
+      local_floor += rho < rho_floor ? 1 : 0;
+      local_negative_internal += internal < 0.0 ? 1 : 0;
+      local_nonfinite += (!std::isfinite(rho) || !std::isfinite(internal)) ? 1 : 0;
+    }
+  }
+
+  double global_min_rho = local_min_rho;
+  double global_max_rho = local_max_rho;
+  double global_min_internal = local_min_internal;
+  long long global_floor = local_floor;
+  long long global_negative_internal = local_negative_internal;
+  long long global_nonfinite = local_nonfinite;
+  long long global_evaluations = static_cast<long long>(ne) * nq;
+  MPI_Allreduce(MPI_IN_PLACE, &global_min_rho, 1, MPI_DOUBLE, MPI_MIN, comm);
+  MPI_Allreduce(MPI_IN_PLACE, &global_max_rho, 1, MPI_DOUBLE, MPI_MAX, comm);
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_min_internal,
+                1,
+                MPI_DOUBLE,
+                MPI_MIN,
+                comm);
+  MPI_Allreduce(MPI_IN_PLACE, &global_floor, 1, MPI_LONG_LONG, MPI_SUM, comm);
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_negative_internal,
+                1,
+                MPI_LONG_LONG,
+                MPI_SUM,
+                comm);
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_nonfinite,
+                1,
+                MPI_LONG_LONG,
+                MPI_SUM,
+                comm);
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_evaluations,
+                1,
+                MPI_LONG_LONG,
+                MPI_SUM,
+                comm);
+  if (mfem::Mpi::Root())
+  {
+    std::cout << "[igr-ingestion-audit] kind=state"
+              << " solve=" << solve_call
+              << " space=" << name
+              << " evaluations=" << global_evaluations
+              << " min_rho=" << global_min_rho
+              << " max_rho=" << global_max_rho
+              << " min_internal_energy=" << global_min_internal
+              << " density_floor_activations=" << global_floor
+              << " negative_internal_energy=" << global_negative_internal
+              << " nonfinite=" << global_nonfinite << std::endl;
+  }
+}
+
+void LogScalarQuadratureAudit(const char* name,
+                              const mfem::Vector& values,
+                              int solve_call,
+                              MPI_Comm comm)
+{
+  const double* data = values.HostRead();
+  double local_min = std::numeric_limits<double>::infinity();
+  double local_max = -std::numeric_limits<double>::infinity();
+  long long local_nonfinite = 0;
+  for (int i = 0; i < values.Size(); ++i)
+  {
+    local_min = std::min(local_min, data[i]);
+    local_max = std::max(local_max, data[i]);
+    local_nonfinite += std::isfinite(data[i]) ? 0 : 1;
+  }
+  double global_min = local_min;
+  double global_max = local_max;
+  long long global_nonfinite = local_nonfinite;
+  long long global_values = values.Size();
+  MPI_Allreduce(MPI_IN_PLACE, &global_min, 1, MPI_DOUBLE, MPI_MIN, comm);
+  MPI_Allreduce(MPI_IN_PLACE, &global_max, 1, MPI_DOUBLE, MPI_MAX, comm);
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_nonfinite,
+                1,
+                MPI_LONG_LONG,
+                MPI_SUM,
+                comm);
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_values,
+                1,
+                MPI_LONG_LONG,
+                MPI_SUM,
+                comm);
+  if (mfem::Mpi::Root())
+  {
+    std::cout << "[igr-ingestion-audit] kind=derived"
+              << " solve=" << solve_call
+              << " field=" << name
+              << " values=" << global_values
+              << " min=" << global_min
+              << " max=" << global_max
+              << " nonfinite=" << global_nonfinite << std::endl;
+  }
 }
 
 } // namespace
@@ -403,6 +538,47 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
     }
   }
 #endif
+
+  if (::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false))
+  {
+    const int solve_call = linear_solve_calls_ + 1;
+    const MPI_Comm comm = vfes_.GetComm();
+    LogStateQuadratureAudit("mass",
+                            *u_mass_qf_,
+                            *mass_qs_,
+                            num_eq,
+                            dim,
+                            rho_floor,
+                            solve_call,
+                            comm);
+    LogStateQuadratureAudit("diffusion",
+                            *u_qf_,
+                            *sigma_qs_,
+                            num_eq,
+                            dim,
+                            rho_floor,
+                            solve_call,
+                            comm);
+    LogStateQuadratureAudit("rhs",
+                            *u_rhs_qf_,
+                            *rhs_qs_,
+                            num_eq,
+                            dim,
+                            rho_floor,
+                            solve_call,
+                            comm);
+    LogScalarQuadratureAudit("grad_diffusion",
+                             *grad_u_qf_,
+                             solve_call,
+                             comm);
+    LogScalarQuadratureAudit("grad_rhs",
+                             *grad_u_rhs_qf_,
+                             solve_call,
+                             comm);
+    LogScalarQuadratureAudit("invrho", *invrho_qf_, solve_call, comm);
+    LogScalarQuadratureAudit("alpha_over_rho", *ck_qf_, solve_call, comm);
+    LogScalarQuadratureAudit("rhs_source", *src_qf_, solve_call, comm);
+  }
 
   if (!device_coeff_logged_ && mfem::Mpi::Root())
   {

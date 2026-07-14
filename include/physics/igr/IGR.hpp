@@ -28,6 +28,13 @@
 namespace dg_igr
 {
 
+enum class IGRSolvePurpose
+{
+  ProductionStage,
+  ProductionStage0Prefetch,
+  OutputOnly
+};
+
 /// @brief Information Geometric Regularization (IGR) solver for sigma.
 /// @ingroup physics_igr
 class IGRSolver
@@ -40,6 +47,7 @@ public:
   using SolveMode = IGRSolveMode;
   using LinearSolverType = IGRLinearSolverType;
   using PrecondType = IGRPrecondType;
+  using NonconvergencePolicy = IGRNonconvergencePolicy;
   using AlphaLengthScalePolicy = IGRAlphaLengthScalePolicy;
   using Config = IGRConfig;
 
@@ -80,6 +88,10 @@ public:
   void SetSolveMode(SolveMode m) { solve_mode_ = m; }
   void SetLinearSolver(LinearSolverType s) { lin_solver_type_ = s; }
   void SetPreconditioner(PrecondType p);
+  void SetNonconvergencePolicy(NonconvergencePolicy policy)
+  {
+    nonconvergence_policy_ = policy;
+  }
   void SetAMGParams(int coarsen_type,
                     int relax_type,
                     int max_levels,
@@ -100,6 +112,9 @@ public:
     stage_rtol_scale_ = std::max(1.0, scale);
   }
   void SetRKStageIndex(int stage) { rk_stage_index_ = stage; }
+  void SetRKStepIndex(int step) { rk_step_index_ = step; }
+  void SetCurrentTime(double time) { current_time_ = time; }
+  void SetCurrentTimeStep(double dt) { current_dt_ = dt; }
   IGRSigmaUpdateCadence GetSigmaUpdateCadence() const
   {
     return sigma_cadence_;
@@ -133,6 +148,7 @@ public:
     SetSolveMode(cfg.solve_mode);
     SetLinearSolver(cfg.lin_solver_type);
     SetPreconditioner(cfg.prec_type);
+    SetNonconvergencePolicy(cfg.nonconvergence_policy);
     SetAMGParams(cfg.amg_coarsen_type,
                  cfg.amg_relax_type,
                  cfg.amg_max_levels,
@@ -147,7 +163,17 @@ public:
   }
 
   /// Update Σ from the current state U.
-  void UpdateFromState(const mfem::ParGridFunction& U, bool warm_start);
+  void UpdateFromState(
+    const mfem::ParGridFunction& U,
+    bool warm_start,
+    IGRSolvePurpose purpose = IGRSolvePurpose::ProductionStage);
+  void ConsumePendingStage0PrefetchAccounting();
+  bool ReclassifyPendingStage0PrefetchAsOutputOnly(
+    bool restore_warm_start = true);
+  bool HasPendingStage0PrefetchAccounting() const
+  {
+    return pending_stage0_prefetch_accounting_.valid;
+  }
 
   /// Access the current Σ field.
   const mfem::ParGridFunction& GetSigma() const { return sigma_; }
@@ -158,6 +184,30 @@ public:
   bool GetLastLinearConverged() const { return last_linear_converged_; }
   double GetLastLinearFinalNorm() const { return last_linear_final_norm_; }
   double GetLastLinearInitialNorm() const { return last_linear_initial_norm_; }
+  double GetLastLinearTrueResidualAbs() const
+  {
+    return last_linear_true_residual_abs_;
+  }
+  double GetLastLinearTrueResidualRelRHS() const
+  {
+    return last_linear_true_residual_rel_rhs_;
+  }
+  double GetLastLinearTrueResidualRel() const
+  {
+    return last_linear_true_residual_rel_initial_;
+  }
+  double GetLastLinearTrueInitialResidualAbs() const
+  {
+    return last_linear_true_initial_residual_abs_;
+  }
+  double GetLastLinearRecomputedPreconditionedInitialNorm() const
+  {
+    return last_linear_recomputed_preconditioned_initial_norm_;
+  }
+  double GetLastLinearRecomputedPreconditionedFinalNorm() const
+  {
+    return last_linear_recomputed_preconditioned_final_norm_;
+  }
   double GetLastLinearSolveSeconds() const
   {
     return last_linear_solve_seconds_;
@@ -284,6 +334,68 @@ public:
                  static_cast<double>(linear_solve_calls_)
              : 0.0;
   }
+  int GetOutputOnlyLinearSolveCalls() const
+  {
+    return output_only_linear_solve_calls_;
+  }
+  int GetProductionLinearSolveCalls() const
+  {
+    return linear_solve_calls_ - output_only_linear_solve_calls_;
+  }
+  int GetProductionLinearIterations() const
+  {
+    return total_linear_iters_ - output_only_linear_iters_;
+  }
+  int GetProductionLinearConvergedCalls() const
+  {
+    return total_linear_converged_calls_ -
+           output_only_linear_converged_calls_;
+  }
+  double GetProductionLinearSolveSeconds() const
+  {
+    return total_linear_solve_seconds_ - output_only_linear_solve_seconds_;
+  }
+  double GetProductionAssembleSeconds() const
+  {
+    return total_assemble_seconds_ - output_only_assemble_seconds_;
+  }
+  double GetProductionFormSystemSeconds() const
+  {
+    return total_form_system_seconds_ - output_only_form_system_seconds_;
+  }
+  double GetProductionPCSetupSeconds() const
+  {
+    return total_pc_setup_seconds_ - output_only_pc_setup_seconds_;
+  }
+  double GetProductionIGRWorkSeconds() const
+  {
+    return GetProductionAssembleSeconds() + GetProductionFormSystemSeconds() +
+           GetProductionPCSetupSeconds() + GetProductionLinearSolveSeconds();
+  }
+  double GetAverageProductionLinearIterations() const
+  {
+    const int calls = GetProductionLinearSolveCalls();
+    return calls > 0 ? static_cast<double>(GetProductionLinearIterations()) /
+                         static_cast<double>(calls)
+                     : 0.0;
+  }
+  int GetOutputOnlyLinearIterations() const
+  {
+    return output_only_linear_iters_;
+  }
+  int GetOutputOnlyLinearConvergedCalls() const
+  {
+    return output_only_linear_converged_calls_;
+  }
+  double GetOutputOnlyLinearSolveSeconds() const
+  {
+    return output_only_linear_solve_seconds_;
+  }
+  double GetOutputOnlyIGRWorkSeconds() const
+  {
+    return output_only_assemble_seconds_ + output_only_form_system_seconds_ +
+           output_only_pc_setup_seconds_ + output_only_linear_solve_seconds_;
+  }
   const std::string& GetLastLinearSolverName() const
   {
     return last_linear_solver_name_;
@@ -299,6 +411,9 @@ public:
   {
     return ActiveLinearOperator_();
   }
+  /// Access exact-face operator components when active (diagnostics/tests).
+  const mfem::Operator* GetLinearBaseOperator() const;
+  const mfem::Operator* GetLinearFaceOperator() const;
 
   /// Access the currently formed linear RHS (for diagnostics/tests).
   const mfem::Vector& GetLinearRHS() const { return B_; }
@@ -350,6 +465,20 @@ public:
   int NumEquations() const { return num_eq_; }
 
 private:
+  struct SolveAccountingDelta
+  {
+    bool valid = false;
+    int calls = 0;
+    int iterations = 0;
+    int converged_calls = 0;
+    double solve_seconds = 0.0;
+    double assemble_seconds = 0.0;
+    double form_system_seconds = 0.0;
+    double pc_setup_seconds = 0.0;
+  };
+
+  void AddOutputOnlyAccounting_(const SolveAccountingDelta& delta);
+
   // --- QuadratureFunction coefficient path for PA/device operators. ---
   // On CUDA this is the default host-sync-free path. On CPU it is explicit
   // opt-in for operator-equivalence diagnostics and PA reference runs.
@@ -510,6 +639,8 @@ private:
   SolveMode solve_mode_ = SolveMode::Krylov;
   LinearSolverType lin_solver_type_ = LinearSolverType::Auto;
   PrecondType prec_type_ = PrecondType::Auto;
+  NonconvergencePolicy nonconvergence_policy_ =
+    NonconvergencePolicy::Error;
   int amg_coarsen_type_ = -1;
   int amg_relax_type_ = -1;
   int amg_max_levels_ = -1;
@@ -518,6 +649,9 @@ private:
   int sigma_update_interval_ = 1;
   double stage_rtol_scale_ = 1.0;
   int rk_stage_index_ = -1;
+  int rk_step_index_ = -1;
+  double current_time_ = std::numeric_limits<double>::quiet_NaN();
+  double current_dt_ = std::numeric_limits<double>::quiet_NaN();
 
   double lin_rtol_ = mfem::dg_igr::IGRDefaults::kLinRtol;
   double lin_atol_ = mfem::dg_igr::IGRDefaults::kLinAtol;
@@ -527,6 +661,7 @@ private:
   // Σ field
   mfem::ParGridFunction
     state_scratch_; // instance-owned scratch used for coeff bootstrap
+  const mfem::ParGridFunction* diagnostic_state_ = nullptr;
   mfem::ParGridFunction sigma_;
 
   // FE forms (reused each call; values change, sparsity fixed)
@@ -558,6 +693,18 @@ private:
   bool last_linear_converged_ = false;
   double last_linear_final_norm_ = std::numeric_limits<double>::quiet_NaN();
   double last_linear_initial_norm_ = std::numeric_limits<double>::quiet_NaN();
+  double last_linear_true_residual_abs_ =
+    std::numeric_limits<double>::quiet_NaN();
+  double last_linear_true_residual_rel_rhs_ =
+    std::numeric_limits<double>::quiet_NaN();
+  double last_linear_true_initial_residual_abs_ =
+    std::numeric_limits<double>::quiet_NaN();
+  double last_linear_true_residual_rel_initial_ =
+    std::numeric_limits<double>::quiet_NaN();
+  double last_linear_recomputed_preconditioned_initial_norm_ =
+    std::numeric_limits<double>::quiet_NaN();
+  double last_linear_recomputed_preconditioned_final_norm_ =
+    std::numeric_limits<double>::quiet_NaN();
   double last_linear_solve_seconds_ = 0.0;
   double last_assemble_seconds_ = 0.0;
   double last_form_system_seconds_ = 0.0;
@@ -594,10 +741,26 @@ private:
   int total_linear_iters_ = 0;
   int max_linear_iters_ = 0;
   int total_linear_converged_calls_ = 0;
+  IGRSolvePurpose current_solve_purpose_ = IGRSolvePurpose::ProductionStage;
+  int output_only_linear_solve_calls_ = 0;
+  int output_only_linear_iters_ = 0;
+  int output_only_linear_converged_calls_ = 0;
+  double output_only_linear_solve_seconds_ = 0.0;
+  double output_only_assemble_seconds_ = 0.0;
+  double output_only_form_system_seconds_ = 0.0;
+  double output_only_pc_setup_seconds_ = 0.0;
+  SolveAccountingDelta pending_stage0_prefetch_accounting_;
+  mfem::Vector pending_stage0_prefetch_sigma_checkpoint_;
+  bool pending_stage0_prefetch_first_call_ = true;
+  bool pending_stage0_prefetch_last_converged_ = false;
+  double pending_stage0_prefetch_last_final_norm_ =
+    std::numeric_limits<double>::quiet_NaN();
   bool direct_identity_system_ = false;
   int direct_identity_system_uses_ = 0;
   std::string last_direct_identity_reason_ = "not-evaluated";
   bool exact_dg_face_operator_ = false;
+  bool negative_quadratic_capture_written_ = false;
+  bool linear_event_capture_written_ = false;
   bool last_exact_face_requested_ = false;
   bool last_exact_face_effective_ = false;
   std::string last_exact_face_reason_ = "not-requested";

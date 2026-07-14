@@ -22,8 +22,9 @@ struct EulerVTKFields
   mfem::ParGridFunction* momentum = nullptr;
   mfem::ParGridFunction* energy = nullptr;
   mfem::ParGridFunction* velocity = nullptr;
-  mfem::ParGridFunction* sigma = nullptr;
+  const mfem::ParGridFunction* sigma = nullptr;
   mfem::ParGridFunction* pressure = nullptr;
+  mfem::Coefficient* pressure_coefficient = nullptr;
   // Optional H1 diagnostics (typically projected from conservative state).
   mfem::ParGridFunction* velocity_h1 = nullptr;
   mfem::ParGridFunction* speed_h1 = nullptr;

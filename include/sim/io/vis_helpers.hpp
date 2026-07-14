@@ -16,6 +16,11 @@
 
 #include "sim/state/state_views.hpp"
 
+namespace dg_igr
+{
+class IGRSolver;
+}
+
 namespace dg_sim
 {
 
@@ -31,6 +36,7 @@ struct EulerFieldList
   EulerPressureView* pressure = nullptr;
   EulerVelocityView* velocity = nullptr;
   dg_igr::IGRSolver* igr = nullptr;
+  const mfem::ParGridFunction* sigma = nullptr;
   H1Diagnostics* h1_diag = nullptr;
   L2Diagnostics* l2_diag = nullptr;
   MPIRankField* mpi_rank = nullptr;
@@ -193,12 +199,10 @@ inline bool OpenEulerIGRGLVisWindows(EulerVisWindows& windows,
                                      const char* host = "localhost",
                                      int port = 19916)
 {
-  if (!fields.state || !fields.pressure || !fields.igr)
+  if (!fields.state || !fields.pressure || !fields.sigma)
   {
     return false;
   }
-
-  fields.igr->GetSigma().ExchangeFaceNbrData();
 
   const bool ok1 = vis::Open(windows.density,
                              host,
@@ -216,7 +220,7 @@ inline bool OpenEulerIGRGLVisWindows(EulerVisWindows& windows,
                              num_procs,
                              my_rank,
                              pmesh,
-                             fields.igr->GetSigma(),
+                             *fields.sigma,
                              "sigma, t = 0");
   const bool ok3 = vis::Open(windows.energy,
                              host,
@@ -318,13 +322,14 @@ inline mfem::io::EulerVTKFields MakeEulerVTKFields(const EulerFieldList& fields)
   {
     out.velocity = &fields.velocity->velocity;
   }
-  if (fields.igr)
+  if (fields.sigma)
   {
-    out.sigma = &fields.igr->GetSigma();
+    out.sigma = fields.sigma;
   }
   if (fields.pressure)
   {
     out.pressure = &fields.pressure->pressure;
+    out.pressure_coefficient = &fields.pressure->coeff;
   }
   if (fields.h1_diag)
   {
@@ -376,6 +381,7 @@ MakeEulerIGRVisFields(const EulerFieldList& fields)
     out.energy = &fields.state->energy;
     out.momentum_x = &fields.state->momentum_x;
   }
+  out.sigma = fields.sigma;
   if (fields.pressure)
   {
     out.pressure = &fields.pressure->pressure;
@@ -396,22 +402,10 @@ MakeEulerIGRVisWindows(EulerVisWindows& windows)
 }
 
 inline void UpdateEulerOutputFields(const EulerFieldList& fields,
-                                    mfem::ParGridFunction& state,
-                                    bool warm_start,
                                     EulerOutputFieldTiming* timing = nullptr)
 {
   const auto total_start = std::chrono::steady_clock::now();
   EulerOutputFieldTiming local_timing;
-  if (fields.igr)
-  {
-    fields.igr->SetRKStageIndex(-1);
-    const auto igr_start = std::chrono::steady_clock::now();
-    fields.igr->UpdateFromState(state, warm_start);
-    local_timing.igr_update_s = VisSecondsSince(igr_start);
-    const auto exchange_start = std::chrono::steady_clock::now();
-    fields.igr->GetSigma().ExchangeFaceNbrData();
-    local_timing.sigma_exchange_s = VisSecondsSince(exchange_start);
-  }
   if (fields.pressure)
   {
     const auto pressure_start = std::chrono::steady_clock::now();
@@ -445,31 +439,26 @@ inline void UpdateEulerOutputFields(const EulerFieldList& fields,
 
 inline void UpdateEulerGLVis(EulerVisWindows& windows,
                              const EulerFieldList& fields,
-                             mfem::ParGridFunction& state,
                              int num_procs,
                              int my_rank,
                              const mfem::ParMesh& pmesh,
-                             double t,
-                             bool warm_start)
+                             double t)
 {
-  if (fields.igr)
+  if (fields.sigma)
   {
     MFEM_VERIFY(fields.pressure != nullptr,
                 "Euler GLVis update with IGR expects a pressure view.");
+    fields.pressure->Update();
     const mfem::io::EulerIGRVisFields vis_fields =
       MakeEulerIGRVisFields(fields);
     const mfem::io::EulerIGRVisWindows vis_windows =
       MakeEulerIGRVisWindows(windows);
     mfem::io::UpdateEulerIGRViews(vis_windows,
                                   vis_fields,
-                                  *fields.igr,
-                                  state,
-                                  fields.pressure->coeff,
                                   num_procs,
                                   my_rank,
                                   pmesh,
-                                  t,
-                                  warm_start);
+                                  t);
     return;
   }
 

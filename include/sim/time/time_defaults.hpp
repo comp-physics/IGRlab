@@ -33,6 +33,8 @@ struct TimeLoopIO
   EulerVisWindows* glvis_windows = nullptr;
   bool* glvis_enabled = nullptr;
   mfem::ParaViewDataCollection* paraview = nullptr;
+  std::function<double(int step, mfem::real_t t, bool is_final)>
+    prepare_sigma;
 };
 
 inline std::string FormatFixed(double value, int precision = 6)
@@ -251,14 +253,21 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
   if (igr)
   {
     summary.has_igr = true;
-    summary.igr_linear_calls = igr->GetLinearSolveCalls();
-    summary.igr_linear_converged_calls = igr->GetTotalLinearConvergedCalls();
-    summary.igr_linear_avg_iters = igr->GetAverageLinearIterations();
-    summary.igr_linear_solve_seconds = igr->GetTotalLinearSolveSeconds();
-    summary.igr_assemble_seconds = igr->GetTotalAssembleSeconds();
-    summary.igr_form_system_seconds = igr->GetTotalFormSystemSeconds();
-    summary.igr_pc_setup_seconds = igr->GetTotalPCSetupSeconds();
-    summary.igr_total_work_seconds = igr->GetTotalIGRWorkSeconds();
+    summary.igr_linear_calls = igr->GetProductionLinearSolveCalls();
+    summary.igr_linear_converged_calls =
+      igr->GetProductionLinearConvergedCalls();
+    summary.igr_linear_avg_iters = igr->GetAverageProductionLinearIterations();
+    summary.igr_linear_solve_seconds = igr->GetProductionLinearSolveSeconds();
+    summary.igr_assemble_seconds = igr->GetProductionAssembleSeconds();
+    summary.igr_form_system_seconds = igr->GetProductionFormSystemSeconds();
+    summary.igr_pc_setup_seconds = igr->GetProductionPCSetupSeconds();
+    summary.igr_total_work_seconds = igr->GetProductionIGRWorkSeconds();
+    summary.igr_output_only_linear_calls =
+      igr->GetOutputOnlyLinearSolveCalls();
+    summary.igr_output_only_linear_converged_calls =
+      igr->GetOutputOnlyLinearConvergedCalls();
+    summary.igr_output_only_work_seconds =
+      igr->GetOutputOnlyIGRWorkSeconds();
     summary.igr_linear_solve_fraction =
       (elapsed_seconds > 0.0)
         ? (summary.igr_linear_solve_seconds / elapsed_seconds)
@@ -294,14 +303,23 @@ inline void FillIGRTimeInfo(TimeLoopInfo& info,
     return;
   }
   info.has_igr = true;
-  info.igr_linear_calls = igr_solver->GetLinearSolveCalls();
-  info.igr_linear_converged_calls = igr_solver->GetTotalLinearConvergedCalls();
-  info.igr_linear_avg_iters = igr_solver->GetAverageLinearIterations();
-  info.igr_linear_solve_seconds = igr_solver->GetTotalLinearSolveSeconds();
-  info.igr_assemble_seconds = igr_solver->GetTotalAssembleSeconds();
-  info.igr_form_system_seconds = igr_solver->GetTotalFormSystemSeconds();
-  info.igr_pc_setup_seconds = igr_solver->GetTotalPCSetupSeconds();
-  info.igr_total_work_seconds = igr_solver->GetTotalIGRWorkSeconds();
+  info.igr_linear_calls = igr_solver->GetProductionLinearSolveCalls();
+  info.igr_linear_converged_calls =
+    igr_solver->GetProductionLinearConvergedCalls();
+  info.igr_linear_avg_iters =
+    igr_solver->GetAverageProductionLinearIterations();
+  info.igr_linear_solve_seconds =
+    igr_solver->GetProductionLinearSolveSeconds();
+  info.igr_assemble_seconds = igr_solver->GetProductionAssembleSeconds();
+  info.igr_form_system_seconds = igr_solver->GetProductionFormSystemSeconds();
+  info.igr_pc_setup_seconds = igr_solver->GetProductionPCSetupSeconds();
+  info.igr_total_work_seconds = igr_solver->GetProductionIGRWorkSeconds();
+  info.igr_output_only_linear_calls =
+    igr_solver->GetOutputOnlyLinearSolveCalls();
+  info.igr_output_only_linear_converged_calls =
+    igr_solver->GetOutputOnlyLinearConvergedCalls();
+  info.igr_output_only_work_seconds =
+    igr_solver->GetOutputOnlyIGRWorkSeconds();
   info.igr_linear_solve_fraction =
     (elapsed > 0.0) ? (info.igr_linear_solve_seconds / elapsed) : 0.0;
   info.igr_total_work_fraction =
@@ -321,7 +339,8 @@ inline void PrintSummaryBox(const RunSummary& summary)
        << " s (" << FormatFixed(100.0 * summary.igr_linear_solve_fraction, 2)
        << "%) | calls: " << summary.igr_linear_calls
        << " | conv: " << summary.igr_linear_converged_calls
-       << " | avg iters: " << FormatFixed(summary.igr_linear_avg_iters, 2);
+       << " | avg iters: " << FormatFixed(summary.igr_linear_avg_iters, 2)
+       << " | output-only: " << summary.igr_output_only_linear_calls;
     return os.str();
   };
   const auto igr_breakdown = [&summary]() -> std::string
@@ -513,6 +532,7 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
   EulerVisWindows* glvis_windows = io.glvis_windows;
   bool* glvis_enabled = io.glvis_enabled;
   mfem::ParaViewDataCollection* paraview = io.paraview;
+  const auto prepare_sigma = io.prepare_sigma;
   dg_igr::IGRSolver* igr_solver = bundle.field_list.igr;
   const ExampleContext* ctx_ptr = &ctx;
   EulerStateBundle* bundle_ptr = &bundle;
@@ -527,8 +547,12 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
      my_rank_value,
      callbacks,
      igr_solver,
+     prepare_sigma,
      ctx_ptr,
-     bundle_ptr](int step, mfem::real_t t, mfem::real_t dt_real, bool)
+     bundle_ptr](int step,
+                 mfem::real_t t,
+                 mfem::real_t dt_real,
+                 bool done)
   {
     const auto now = std::chrono::steady_clock::now();
     const double elapsed =
@@ -560,20 +584,31 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
     }
     if (glvis_enabled && *glvis_enabled && glvis_windows)
     {
+      if (prepare_sigma)
+      {
+        prepare_sigma(step, t, done);
+      }
       UpdateEulerGLVis(*glvis_windows,
                        bundle_ptr->field_list,
-                       bundle_ptr->sol,
                        num_procs_value,
                        my_rank_value,
                        ctx_ptr->Mesh(),
-                       t,
-                       /*warm_start=*/true);
+                       t);
     }
   };
 
-  hooks.on_save = [paraview, callbacks, bundle_ptr, ctx_ptr](
+  hooks.on_save = [paraview,
+                   callbacks,
+                   prepare_sigma,
+                   bundle_ptr,
+                   ctx_ptr](
                     int step, mfem::real_t t, int save_idx, bool is_final)
   {
+    double sigma_prepare_s = 0.0;
+    if (prepare_sigma)
+    {
+      sigma_prepare_s = prepare_sigma(step, t, is_final);
+    }
     if (callbacks.on_vtk_save)
     {
       VTKSaveInfo info;
@@ -585,10 +620,9 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
       callbacks.on_vtk_save(info);
     }
     EulerOutputFieldTiming field_timing;
-    UpdateEulerOutputFields(bundle_ptr->field_list,
-                            bundle_ptr->sol,
-                            /*warm_start=*/true,
-                            &field_timing);
+    UpdateEulerOutputFields(bundle_ptr->field_list, &field_timing);
+    field_timing.igr_update_s = sigma_prepare_s;
+    field_timing.total_s += sigma_prepare_s;
     const double update_fields_s = field_timing.total_s;
     double paraview_save_s = 0.0;
     if (paraview)
@@ -659,6 +693,9 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
       {
         if (bundle_ptr->field_list.state)
         {
+          // Component views hold raw host pointers into sol. Synchronize sol
+          // before reading them after device-side RK updates.
+          bundle_ptr->sol.HostRead();
           const auto rho_mm =
             ComputeGlobalMinMax(bundle_ptr->field_list.state->density,
                                 ctx_ptr->Mesh().GetComm());

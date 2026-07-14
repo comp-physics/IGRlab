@@ -316,10 +316,69 @@ bool IGRSolver::UseDeviceCoefficients_() const
   return true;
 }
 
-void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U, bool warm_start)
+void IGRSolver::AddOutputOnlyAccounting_(const SolveAccountingDelta& delta)
 {
+  output_only_linear_solve_calls_ += delta.calls;
+  output_only_linear_iters_ += delta.iterations;
+  output_only_linear_converged_calls_ += delta.converged_calls;
+  output_only_linear_solve_seconds_ += delta.solve_seconds;
+  output_only_assemble_seconds_ += delta.assemble_seconds;
+  output_only_form_system_seconds_ += delta.form_system_seconds;
+  output_only_pc_setup_seconds_ += delta.pc_setup_seconds;
+}
+
+void IGRSolver::ConsumePendingStage0PrefetchAccounting()
+{
+  pending_stage0_prefetch_accounting_ = {};
+}
+
+bool IGRSolver::ReclassifyPendingStage0PrefetchAsOutputOnly(
+  bool restore_warm_start)
+{
+  if (!pending_stage0_prefetch_accounting_.valid)
+  {
+    return false;
+  }
+  if (restore_warm_start)
+  {
+    MFEM_VERIFY(
+      pending_stage0_prefetch_sigma_checkpoint_.Size() == sigma_.Size(),
+      "Pending stage-0 prefetch has no valid sigma checkpoint.");
+    sigma_ = pending_stage0_prefetch_sigma_checkpoint_;
+    first_call_ = pending_stage0_prefetch_first_call_;
+    last_linear_converged_ = pending_stage0_prefetch_last_converged_;
+    last_linear_final_norm_ = pending_stage0_prefetch_last_final_norm_;
+  }
+  AddOutputOnlyAccounting_(pending_stage0_prefetch_accounting_);
+  pending_stage0_prefetch_accounting_ = {};
+  return true;
+}
+
+void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
+                                bool warm_start,
+                                IGRSolvePurpose purpose)
+{
+  MFEM_VERIFY(!pending_stage0_prefetch_accounting_.valid,
+              "A stage-0 sigma prefetch must be consumed or reclassified "
+              "before another IGR solve.");
+  if (purpose == IGRSolvePurpose::ProductionStage0Prefetch)
+  {
+    pending_stage0_prefetch_sigma_checkpoint_ = sigma_;
+    pending_stage0_prefetch_first_call_ = first_call_;
+    pending_stage0_prefetch_last_converged_ = last_linear_converged_;
+    pending_stage0_prefetch_last_final_norm_ = last_linear_final_norm_;
+  }
   ::dg_igr::NVTXRange range("IGR/update-from-state");
   const auto update_start = std::chrono::steady_clock::now();
+  const int calls_before = linear_solve_calls_;
+  const int iters_before = total_linear_iters_;
+  const int converged_before = total_linear_converged_calls_;
+  const double solve_before = total_linear_solve_seconds_;
+  const double assemble_before = total_assemble_seconds_;
+  const double form_before = total_form_system_seconds_;
+  const double pc_before = total_pc_setup_seconds_;
+  current_solve_purpose_ = purpose;
+  diagnostic_state_ = &U;
 
   // Assemble A and b for current state U (warm-start handled by FormLinearSystem)
   AssembleSystem(U);
@@ -330,6 +389,18 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U, bool warm_start)
     last_linear_converged_ = true;
     last_linear_initial_norm_ = std::numeric_limits<double>::quiet_NaN();
     last_linear_final_norm_ = std::numeric_limits<double>::quiet_NaN();
+    last_linear_true_residual_abs_ =
+      std::numeric_limits<double>::quiet_NaN();
+    last_linear_true_residual_rel_rhs_ =
+      std::numeric_limits<double>::quiet_NaN();
+    last_linear_true_initial_residual_abs_ =
+      std::numeric_limits<double>::quiet_NaN();
+    last_linear_true_residual_rel_initial_ =
+      std::numeric_limits<double>::quiet_NaN();
+    last_linear_recomputed_preconditioned_initial_norm_ =
+      std::numeric_limits<double>::quiet_NaN();
+    last_linear_recomputed_preconditioned_final_norm_ =
+      std::numeric_limits<double>::quiet_NaN();
     last_linear_solve_seconds_ = 0.0;
     last_pc_setup_seconds_ = 0.0;
     last_chebyshev_diagonal_seconds_ = 0.0;
@@ -358,11 +429,31 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U, bool warm_start)
   }
 
   first_call_ = false;
+  diagnostic_state_ = nullptr;
 
   const auto update_stop = std::chrono::steady_clock::now();
   last_update_call_seconds_ =
     std::chrono::duration<double>(update_stop - update_start).count();
   total_update_call_seconds_ += last_update_call_seconds_;
+
+  SolveAccountingDelta delta;
+  delta.valid = true;
+  delta.calls = linear_solve_calls_ - calls_before;
+  delta.iterations = total_linear_iters_ - iters_before;
+  delta.converged_calls = total_linear_converged_calls_ - converged_before;
+  delta.solve_seconds = total_linear_solve_seconds_ - solve_before;
+  delta.assemble_seconds = total_assemble_seconds_ - assemble_before;
+  delta.form_system_seconds = total_form_system_seconds_ - form_before;
+  delta.pc_setup_seconds = total_pc_setup_seconds_ - pc_before;
+
+  if (purpose == IGRSolvePurpose::OutputOnly)
+  {
+    AddOutputOnlyAccounting_(delta);
+  }
+  else if (purpose == IGRSolvePurpose::ProductionStage0Prefetch)
+  {
+    pending_stage0_prefetch_accounting_ = delta;
+  }
 }
 
 } // namespace dg_igr

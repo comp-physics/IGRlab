@@ -7,24 +7,11 @@ namespace io
 
 void UpdateEulerIGRViews(const EulerIGRVisWindows& windows,
                          const EulerIGRVisFields& fields,
-                         ::dg_igr::IGRSolver& igr,
-                         const mfem::ParGridFunction& state,
-                         mfem::PressureCoefficient& pcoef,
                          int num_procs,
                          int my_rank,
                          const mfem::ParMesh& pmesh,
-                         double t,
-                         bool warm_start)
+                         double t)
 {
-  igr.UpdateFromState(state, warm_start);
-  igr.GetSigma().ExchangeFaceNbrData();
-
-  if (fields.pressure)
-  {
-    pcoef.SetState(state);
-    fields.pressure->ProjectCoefficient(pcoef);
-  }
-
   if (windows.density && fields.density)
   {
     vis::Update(*windows.density,
@@ -35,13 +22,13 @@ void UpdateEulerIGRViews(const EulerIGRVisWindows& windows,
                 t,
                 "density");
   }
-  if (windows.sigma)
+  if (windows.sigma && fields.sigma)
   {
     vis::Update(*windows.sigma,
                 num_procs,
                 my_rank,
                 pmesh,
-                igr.GetSigma(),
+                *fields.sigma,
                 t,
                 "sigma");
   }

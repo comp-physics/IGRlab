@@ -637,7 +637,8 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
         rk.SetEulerParams(dim2, gamma);
         if (cfg.use_positivity_limiter)
         {
-          rk.AddZhangShuLimiter(/*always_on=*/true);
+          rk.AddZhangShuLimiter(mfem::ZhangShuPointSet::kConsumer,
+                                /*always_on=*/true);
         }
         rk.Init(oper);
 

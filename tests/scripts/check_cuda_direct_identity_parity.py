@@ -187,13 +187,25 @@ def compare(args: argparse.Namespace, off_pvd: Path, on_pvd: Path) -> Dict:
     ]
     aggregate = vtk_compare.aggregate_frame_diffs(frame_diffs)
     worst = vtk_compare.worst_aggregate_metrics(aggregate)
-    worst_rel = worst.get("max_rel_rms", {}).get("value")
-    if worst_rel is None or float(worst_rel) > args.default_rel_rms_limit:
-        raise RuntimeError(
-            "direct identity parity drift exceeds limit: "
-            f"worst_rel_rms={sci(worst_rel)} "
-            f"limit={sci(args.default_rel_rms_limit)}"
-        )
+    for name, metrics in aggregate.items():
+        max_rel = float(metrics.get("max_rel_rms", float("inf")))
+        final_rel = float(metrics.get("final_rel_rms", float("inf")))
+        if name == "sigma":
+            sigma_limit = args.intermediate_sigma_rel_rms_limit
+            if max_rel > sigma_limit or final_rel > args.default_rel_rms_limit:
+                raise RuntimeError(
+                    "direct identity sigma parity drift exceeds limit: "
+                    f"max_rel_rms={sci(max_rel)} "
+                    f"intermediate_limit={sci(sigma_limit)} "
+                    f"final_rel_rms={sci(final_rel)} "
+                    f"final_limit={sci(args.default_rel_rms_limit)}"
+                )
+        elif max_rel > args.default_rel_rms_limit:
+            raise RuntimeError(
+                "direct identity parity drift exceeds limit: "
+                f"array={name} max_rel_rms={sci(max_rel)} "
+                f"limit={sci(args.default_rel_rms_limit)}"
+            )
     return {
         "schema_version": 1,
         "benchmark": "cuda_direct_identity_parity",
@@ -205,6 +217,8 @@ def compare(args: argparse.Namespace, off_pvd: Path, on_pvd: Path) -> Dict:
         "aggregate": aggregate,
         "worst": worst,
         "default_rel_rms_limit": args.default_rel_rms_limit,
+        "intermediate_sigma_rel_rms_limit":
+            args.intermediate_sigma_rel_rms_limit,
     }
 
 
@@ -221,6 +235,8 @@ def write_summary(out_dir: Path, payload: Dict) -> None:
         f"- Direct-on PVD: `{payload['direct_on_pvd']}`",
         f"- Matched frames: {payload['matched_frames']}",
         f"- Relative RMS limit: `{sci(payload['default_rel_rms_limit'])}`",
+        "- Intermediate sigma relative RMS limit: "
+        f"`{sci(payload['intermediate_sigma_rel_rms_limit'])}`",
         "",
         "| metric | array | value |",
         "| --- | --- | ---: |",
@@ -256,6 +272,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--array", action="append")
     parser.add_argument("--time-tolerance", type=float, default=1.0e-12)
     parser.add_argument("--default-rel-rms-limit", type=float, default=1.0e-10)
+    parser.add_argument(
+        "--intermediate-sigma-rel-rms-limit", type=float, default=1.0e-10
+    )
     parser.add_argument("--env", action="append", default=[])
     return parser.parse_args()
 

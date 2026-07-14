@@ -35,6 +35,7 @@ struct IGROptions
   std::string solve_mode = "krylov";
   std::string linear_solver = "auto";
   std::string preconditioner = "auto";
+  std::string nonconvergence_policy = "";
   std::string ip_kind = "sipg";
   std::string sigma_cadence = "";
   int sigma_update_interval = -1;
@@ -145,6 +146,37 @@ inline std::string ToLowerCopy(std::string value)
                  [](unsigned char c)
                  { return static_cast<char>(std::tolower(c)); });
   return value;
+}
+
+inline mfem::ZhangShuPointSet
+ParseZhangShuPointSet(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "consumer")
+  {
+    return mfem::ZhangShuPointSet::kConsumer;
+  }
+  if (lower == "quadrature")
+  {
+    return mfem::ZhangShuPointSet::kQuadrature;
+  }
+  MFEM_VERIFY(false,
+              "Invalid Zhang-Shu point set '"
+                << value << "'. Use 'consumer' or 'quadrature'.");
+  return mfem::ZhangShuPointSet::kConsumer;
+}
+
+inline const char*
+ZhangShuPointSetToString(mfem::ZhangShuPointSet point_set)
+{
+  switch (point_set)
+  {
+  case mfem::ZhangShuPointSet::kQuadrature:
+    return "quadrature";
+  case mfem::ZhangShuPointSet::kConsumer:
+    return "consumer";
+  }
+  return "consumer";
 }
 
 inline dg_igr::IGRIPKind ParseIGRIPKind(const std::string& value)
@@ -262,6 +294,24 @@ inline dg_igr::IGRPrecondType ParseIGRPrecondType(const std::string& value)
                 << "'hypreeuclid', 'parasails', "
                 << "'hypresmoother', 'chebyshev', or 'none'.");
   return dg_igr::IGRPrecondType::Auto;
+}
+
+inline dg_igr::IGRNonconvergencePolicy
+ParseIGRNonconvergencePolicy(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "error" || lower == "fail")
+  {
+    return dg_igr::IGRNonconvergencePolicy::Error;
+  }
+  if (lower == "accept" || lower == "legacy")
+  {
+    return dg_igr::IGRNonconvergencePolicy::Accept;
+  }
+  MFEM_VERIFY(false,
+              "Invalid IGR nonconvergence policy '"
+                << value << "'. Use 'error' or 'accept'.");
+  return dg_igr::IGRNonconvergencePolicy::Error;
 }
 
 inline dg_igr::IGRSigmaUpdateCadence
@@ -497,6 +547,10 @@ ApplyIGRDerivedRuntimeDefaults(const CommonOptions& opts,
                                IGROptions& igr_opts,
                                bool exact_face_operator_overridden)
 {
+  if (igr_opts.nonconvergence_policy.empty())
+  {
+    igr_opts.nonconvergence_policy = "error";
+  }
   const bool cuda_l2_broken_dg =
     ParseDeviceBackend(opts.device) == DeviceBackend::CUDA &&
     ParseDGBackend(opts.dg_backend) == DGBackend::DG &&
@@ -858,6 +912,11 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "IGR preconditioner: auto | boomeramg | hypreilu | "
                  "hypreeuclid | parasails | "
                  "hypresmoother | chebyshev | none.");
+  args.AddOption(&igr_opts.nonconvergence_policy,
+                 "-incp",
+                 "--igr-nonconvergence-policy",
+                 "IGR nonconvergence policy: error | accept (empty keeps "
+                 "case default).");
   args.AddOption(
     &igr_opts.sigma_cadence,
     "-iscad",
@@ -926,7 +985,11 @@ inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
 {
   RunConfig run_cfg;
   run_cfg.case_config = case_cfg;
+  const mfem::ZhangShuPointSet zhang_shu_points =
+    ParseZhangShuPointSet(opts.zhang_shu_points);
+  run_cfg.case_config.limiter_pipeline.zhang_shu_points = zhang_shu_points;
   run_cfg.opts = opts;
+  run_cfg.opts.zhang_shu_points = ZhangShuPointSetToString(zhang_shu_points);
   run_cfg.igr_opts = igr_opts;
   run_cfg.device_backend = ParseDeviceBackend(opts.device);
   run_cfg.dg_backend = ParseDGBackend(opts.dg_backend);

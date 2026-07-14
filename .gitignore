@@ -66,6 +66,9 @@ build-*/
 install-*/
 tests/perf*
 tests/scripts
+!tests/scripts/
+tests/scripts/*
+!tests/scripts/check_sigma_vtk_lifecycle.py
 out/
 __pycache__
 # supersonic_example/backup

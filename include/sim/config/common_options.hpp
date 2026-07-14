@@ -24,6 +24,8 @@ struct CommonOptions
   int order = 3;                 ///< DG polynomial order.
   std::string device = "cpu";    ///< Runtime device backend: "cpu" or "cuda".
   std::string dg_backend = "dg"; ///< DG backend: "dg" or "dgsem".
+  std::string zhang_shu_points =
+    "consumer"; ///< Zhang-Shu point set: "consumer" or "quadrature".
   std::string dgsem_stab =
     "none"; ///< DGSEM stabilization: "none", "split", or "filter".
   std::string dgsem_volume_flux =
@@ -93,6 +95,10 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-dg",
                  "--dg-backend",
                  "DG backend: dg | dgsem (default set per case).");
+  args.AddOption(&opts.zhang_shu_points,
+                 "-zsp",
+                 "--zhang-shu-points",
+                 "Zhang-Shu positivity points: consumer | quadrature.");
   args.AddOption(
     &opts.dgsem_stab,
     "-ds",

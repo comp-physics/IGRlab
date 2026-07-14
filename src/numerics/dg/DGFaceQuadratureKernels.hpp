@@ -9,6 +9,14 @@ namespace dg_igr
 namespace dg_face
 {
 
+enum class DGDiffusionFaceScaling
+{
+  Arithmetic,
+  Max,
+  Sum,
+  HarmonicWeighted
+};
+
 struct FaceQFProjectInfo
 {
   int dim = 0;
@@ -674,7 +682,8 @@ BuildInteriorFaceDGDiffusionApplyData2D(
   mfem::Vector& weighted_normal_dshape,
   mfem::Vector& penalty,
   mfem::Array<int>& face_elements,
-  mfem::Array<int>& element_vdof_map)
+  mfem::Array<int>& element_vdof_map,
+  DGDiffusionFaceScaling face_scaling = DGDiffusionFaceScaling::Arithmetic)
 {
   std::string reason;
   MFEM_VERIFY(SupportsInteriorFaceScalarTraceProjection2D(sfes, fqs, &reason),
@@ -753,7 +762,7 @@ BuildInteriorFaceDGDiffusionApplyData2D(
       Tr->SetAllIntPoints(&ip);
       mfem::CalcOrtho(Tr->Jacobian(), normal);
 
-      mfem::real_t penalty_q = 0.0;
+      mfem::real_t penalty_metric[2] = {0.0, 0.0};
       for (int side = 0; side < 2; ++side)
       {
         mfem::ElementTransformation& elem_tr =
@@ -770,12 +779,12 @@ BuildInteriorFaceDGDiffusionApplyData2D(
           ip.weight * static_cast<mfem::real_t>(0.5) / elem_tr.Weight();
         const mfem::real_t side_q_value = qside(side, q, of);
         const mfem::real_t penalty_factor_value =
-          base_weight * (normal * normal);
+          ip.weight * (normal * normal) / elem_tr.Weight();
         ni.Set(base_weight, normal);
         mfem::CalcAdjugate(elem_tr.Jacobian(), adjJ);
         adjJ.Mult(ni, nh);
         side_dshape.Mult(nh, side_dshape_dn);
-        penalty_q += side_q_value * penalty_factor_value;
+        penalty_metric[side] = side_q_value * penalty_factor_value;
 
         for (int d = 0; d < info.dof; ++d)
         {
@@ -783,6 +792,38 @@ BuildInteriorFaceDGDiffusionApplyData2D(
           ndshape_out(side, q, d, of) =
             side_q_value * side_dshape_dn(d);
         }
+      }
+      const mfem::real_t metric_sum =
+        penalty_metric[0] + penalty_metric[1];
+      if (face_scaling == DGDiffusionFaceScaling::HarmonicWeighted &&
+          metric_sum > 0.0)
+      {
+        const mfem::real_t weight[2] = {
+          penalty_metric[1] / metric_sum,
+          penalty_metric[0] / metric_sum
+        };
+        for (int side = 0; side < 2; ++side)
+        {
+          for (int d = 0; d < info.dof; ++d)
+          {
+            ndshape_out(side, q, d, of) *= 2.0 * weight[side];
+          }
+        }
+      }
+      mfem::real_t penalty_q = 0.5 * metric_sum;
+      if (face_scaling == DGDiffusionFaceScaling::Max)
+      {
+        penalty_q = std::max(penalty_metric[0], penalty_metric[1]);
+      }
+      else if (face_scaling == DGDiffusionFaceScaling::Sum)
+      {
+        penalty_q = metric_sum;
+      }
+      else if (face_scaling == DGDiffusionFaceScaling::HarmonicWeighted)
+      {
+        penalty_q = metric_sum > 0.0
+          ? 2.0 * penalty_metric[0] * penalty_metric[1] / metric_sum
+          : 0.0;
       }
       penalty_out(q, of) = kappa * penalty_q;
     }
@@ -807,7 +848,8 @@ BuildSharedFaceDGDiffusionApplyData2D(
   mfem::Vector& penalty,
   mfem::Array<int>& face_elements,
   mfem::Array<int>& element_vdof_map,
-  mfem::Array<int>& face_nbr_dof_map)
+  mfem::Array<int>& face_nbr_dof_map,
+  DGDiffusionFaceScaling face_scaling = DGDiffusionFaceScaling::Arithmetic)
 {
 #ifndef MFEM_USE_MPI
   (void)sfes;
@@ -820,6 +862,7 @@ BuildSharedFaceDGDiffusionApplyData2D(
   (void)face_elements;
   (void)element_vdof_map;
   (void)face_nbr_dof_map;
+  (void)face_scaling;
   MFEM_ABORT("Shared exact DG diffusion face data requires MFEM MPI support.");
   return {};
 #else
@@ -924,7 +967,7 @@ BuildSharedFaceDGDiffusionApplyData2D(
       Tr->SetAllIntPoints(&ip);
       mfem::CalcOrtho(Tr->Jacobian(), normal);
 
-      mfem::real_t penalty_q = 0.0;
+      mfem::real_t penalty_metric[2] = {0.0, 0.0};
       for (int side = 0; side < 2; ++side)
       {
         mfem::ElementTransformation& elem_tr =
@@ -941,12 +984,12 @@ BuildSharedFaceDGDiffusionApplyData2D(
           ip.weight * static_cast<mfem::real_t>(0.5) / elem_tr.Weight();
         const mfem::real_t side_q_value = qside(side, q, sf);
         const mfem::real_t penalty_factor_value =
-          base_weight * (normal * normal);
+          ip.weight * (normal * normal) / elem_tr.Weight();
         ni.Set(base_weight, normal);
         mfem::CalcAdjugate(elem_tr.Jacobian(), adjJ);
         adjJ.Mult(ni, nh);
         side_dshape.Mult(nh, side_dshape_dn);
-        penalty_q += side_q_value * penalty_factor_value;
+        penalty_metric[side] = side_q_value * penalty_factor_value;
 
         for (int d = 0; d < info.dof; ++d)
         {
@@ -954,6 +997,38 @@ BuildSharedFaceDGDiffusionApplyData2D(
           ndshape_out(side, q, d, sf) =
             side_q_value * side_dshape_dn(d);
         }
+      }
+      const mfem::real_t metric_sum =
+        penalty_metric[0] + penalty_metric[1];
+      if (face_scaling == DGDiffusionFaceScaling::HarmonicWeighted &&
+          metric_sum > 0.0)
+      {
+        const mfem::real_t weight[2] = {
+          penalty_metric[1] / metric_sum,
+          penalty_metric[0] / metric_sum
+        };
+        for (int side = 0; side < 2; ++side)
+        {
+          for (int d = 0; d < info.dof; ++d)
+          {
+            ndshape_out(side, q, d, sf) *= 2.0 * weight[side];
+          }
+        }
+      }
+      mfem::real_t penalty_q = 0.5 * metric_sum;
+      if (face_scaling == DGDiffusionFaceScaling::Max)
+      {
+        penalty_q = std::max(penalty_metric[0], penalty_metric[1]);
+      }
+      else if (face_scaling == DGDiffusionFaceScaling::Sum)
+      {
+        penalty_q = metric_sum;
+      }
+      else if (face_scaling == DGDiffusionFaceScaling::HarmonicWeighted)
+      {
+        penalty_q = metric_sum > 0.0
+          ? 2.0 * penalty_metric[0] * penalty_metric[1] / metric_sum
+          : 0.0;
       }
       penalty_out(q, sf) = kappa * penalty_q;
     }

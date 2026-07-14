@@ -5,6 +5,7 @@
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "numerics/riemann/side_scope_utils.hpp"
+#include "sim/io/vis_helpers.hpp"
 #include "../src/numerics/dg/DGFaceQuadratureKernels.hpp"
 
 #include <algorithm>
@@ -2589,6 +2590,74 @@ int RunIGRTests(TestContext& ctx)
       warm_replay_iters <= cold_replay_iters,
       "IGR warm-start replay does not take more iterations than cold-start");
 
+    constexpr const char* true_residual_env =
+      "DG_IGR_IGR_TRUE_RESIDUAL";
+    constexpr const char* true_initial_residual_env =
+      "DG_IGR_IGR_TRUE_INITIAL_RESIDUAL";
+    const char* original_true_residual = std::getenv(true_residual_env);
+    const char* original_true_initial_residual =
+      std::getenv(true_initial_residual_env);
+    const std::string original_true_residual_value =
+      original_true_residual ? original_true_residual : "";
+    const std::string original_true_initial_residual_value =
+      original_true_initial_residual ? original_true_initial_residual : "";
+    setenv(true_residual_env, "1", 1);
+    setenv(true_initial_residual_env, "1", 1);
+
+    cold_solver.GetSigma() = 0.0;
+    cold_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+    ctx.Check(std::isfinite(cold_solver.GetLastLinearTrueResidualRel()),
+              "IGR converged solve reports finite true relative residual");
+    ctx.Check(cold_solver.GetLastLinearTrueResidualRel() <= 1.0e-10,
+              "IGR converged solve satisfies independently recomputed residual");
+
+    dg_igr::IGRSolver forced_failure_solver(sigma_l2_fes,
+                                            state_fes_ws,
+                                            dim_ws,
+                                            num_eq_ws,
+                                            /*alpha=*/0.5);
+    forced_failure_solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+    forced_failure_solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+    forced_failure_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::GMRES);
+    forced_failure_solver.SetPreconditioner(dg_igr::IGRPrecondType::None);
+    forced_failure_solver.SetNonconvergencePolicy(
+      dg_igr::IGRNonconvergencePolicy::Accept);
+    forced_failure_solver.SetLinearSolveParams(/*rtol=*/1.0e-16,
+                                               /*atol=*/0.0,
+                                               /*max_it=*/1,
+                                               /*print=*/0);
+    forced_failure_solver.UpdateFromState(U_ws, /*warm_start=*/false);
+    ctx.Check(!forced_failure_solver.GetLastLinearConverged(),
+              "IGR one-iteration control reports nonconvergence");
+    ctx.Check(forced_failure_solver.GetLastLinearIters() == 1,
+              "IGR nonconvergence control reaches configured iteration cap");
+    ctx.Check(
+      std::isfinite(forced_failure_solver.GetLastLinearTrueResidualRel()),
+      "IGR nonconverged solve reports finite true relative residual");
+    ctx.Check(forced_failure_solver.GetLastLinearTrueResidualRel() > 1.0e-16,
+              "IGR nonconverged solve remains above requested tolerance");
+    ctx.Check(std::isfinite(GlobalL2Norm(forced_failure_solver.GetSigma())),
+              "IGR explicit accept policy recovers a finite max-iteration sigma");
+
+    if (original_true_residual)
+    {
+      setenv(true_residual_env, original_true_residual_value.c_str(), 1);
+    }
+    else
+    {
+      unsetenv(true_residual_env);
+    }
+    if (original_true_initial_residual)
+    {
+      setenv(true_initial_residual_env,
+             original_true_initial_residual_value.c_str(),
+             1);
+    }
+    else
+    {
+      unsetenv(true_initial_residual_env);
+    }
+
     std::vector<double> cold_iters;
     std::vector<double> warm_iters;
     std::vector<double> cold_times;
@@ -2763,6 +2832,208 @@ int RunIGRTests(TestContext& ctx)
     ctx.Check(stale_err >= 0.5 * stage_vs_base,
               "EulerWithIGR sigma is not sourced from persistent base state");
 
+    // --- Sigma output lifecycle: freshness, direct reuse, and invalidation ---
+    const int lifecycle_calls_start = igr_solver_s.GetLinearSolveCalls();
+    const int lifecycle_production_start =
+      igr_solver_s.GetProductionLinearSolveCalls();
+    const int lifecycle_output_start =
+      igr_solver_s.GetOutputOnlyLinearSolveCalls();
+    const long long lifecycle_reuses_start =
+      wrapped.GetSigmaStage0ReuseCount();
+    const long long lifecycle_invalidations_start =
+      wrapped.GetSigmaPrefetchInvalidationCount();
+    const long long lifecycle_provider_output_start =
+      wrapped.GetSigmaOutputOnlySolveCount();
+
+    mfem::Vector state_before_prepare(U_base);
+    wrapped.EndRKStep(U_base, /*t=*/0.1, /*state_generation=*/100);
+    const mfem::IGRSigmaPreparationResult prepared =
+      wrapped.PrepareSigmaForOutput(U_base,
+                                    /*state_generation=*/100,
+                                    /*next_rk_step=*/1,
+                                    /*time=*/0.1,
+                                    /*reusable_stage0=*/true);
+    ctx.Check(prepared.solved && prepared.reusable_stage0 &&
+                !prepared.output_only,
+              "Sigma lifecycle: stale stage sigma is refreshed for final state");
+    ctx.Check(igr_solver_s.GetLinearSolveCalls() == lifecycle_calls_start + 1,
+              "Sigma lifecycle: final-state preparation performs one solve");
+    mfem::Vector state_after_prepare(U_base);
+    state_after_prepare -= state_before_prepare;
+    ctx.CheckNear(state_after_prepare.Normlinf(),
+                  0.0,
+                  0.0,
+                  "Sigma lifecycle: preparation leaves conservative state unchanged");
+
+    mfem::Vector sigma_prepared(igr_solver_s.GetSigma());
+    mfem::Vector prepared_error(sigma_prepared);
+    prepared_error -= sigma_base;
+    ctx.Check(prepared_error.Norml2() <= 1.0e-5 * stage_vs_base,
+              "Sigma lifecycle: prepared sigma matches direct final-state solve");
+    ctx.Check(wrapped.GetSigmaStateGeneration() == 100,
+              "Sigma lifecycle: prepared sigma records state generation");
+
+    const mfem::IGRSigmaPreparationResult prepared_again =
+      wrapped.PrepareSigmaForOutput(U_base,
+                                    /*state_generation=*/100,
+                                    /*next_rk_step=*/1,
+                                    /*time=*/0.1,
+                                    /*reusable_stage0=*/true);
+    ctx.Check(!prepared_again.solved,
+              "Sigma lifecycle: matching live sigma is reused directly");
+    ctx.Check(igr_solver_s.GetLinearSolveCalls() == lifecycle_calls_start + 1,
+              "Sigma lifecycle: repeated output preparation adds no solve");
+
+    dg_sim::EulerFieldList output_fields;
+    output_fields.igr = &igr_solver_s;
+    output_fields.sigma = &igr_solver_s.GetSigma();
+    const int calls_before_io = igr_solver_s.GetLinearSolveCalls();
+    mfem::Vector sigma_before_io(igr_solver_s.GetSigma());
+    dg_sim::EulerOutputFieldTiming io_timing;
+    dg_sim::UpdateEulerOutputFields(output_fields, &io_timing);
+    mfem::Vector sigma_after_io(igr_solver_s.GetSigma());
+    sigma_after_io -= sigma_before_io;
+    ctx.Check(igr_solver_s.GetLinearSolveCalls() == calls_before_io,
+              "Sigma lifecycle: output field updater invokes zero IGR solves");
+    ctx.CheckNear(sigma_after_io.Normlinf(),
+                  0.0,
+                  0.0,
+                  "Sigma lifecycle: output field updater is read-only for sigma");
+
+    wrapped.BeginRKStep(/*step=*/1, /*t=*/0.1, /*dt=*/0.01);
+    wrapped.SetRKStageState(/*stage=*/0, /*state_generation=*/100);
+    wrapped.Mult(U_base, rhs);
+    ctx.Check(igr_solver_s.GetLinearSolveCalls() == lifecycle_calls_start + 1,
+              "Sigma lifecycle: prepared final state replaces next stage-0 solve");
+    ctx.Check(wrapped.GetSigmaStage0ReuseCount() == lifecycle_reuses_start + 1,
+              "Sigma lifecycle: stage-0 reuse is accounted once");
+    mfem::Vector sigma_after_reuse(igr_solver_s.GetSigma());
+    sigma_after_reuse -= sigma_prepared;
+    ctx.CheckNear(sigma_after_reuse.Normlinf(),
+                  0.0,
+                  0.0,
+                  "Sigma lifecycle: stage-0 reuse preserves prepared sigma exactly");
+
+    wrapped.SetRKStageState(/*stage=*/1, /*state_generation=*/101);
+    wrapped.Mult(U_stage, rhs);
+    ctx.Check(igr_solver_s.GetLinearSolveCalls() == lifecycle_calls_start + 2,
+              "Sigma lifecycle: distinct stage generation recomputes sigma");
+
+    wrapped.EndRKStep(U_base, /*t=*/0.2, /*state_generation=*/102);
+    wrapped.PrepareSigmaForOutput(U_base,
+                                  /*state_generation=*/102,
+                                  /*next_rk_step=*/2,
+                                  /*time=*/0.2,
+                                  /*reusable_stage0=*/true);
+    const int calls_before_invalidated_stage =
+      igr_solver_s.GetLinearSolveCalls();
+    const int production_before_invalidated_stage =
+      igr_solver_s.GetProductionLinearSolveCalls();
+    mfem::Vector U_changed(U_base);
+    U_changed(0) += 1.0e-6;
+    wrapped.BeginRKStep(/*step=*/2, /*t=*/0.2, /*dt=*/0.01);
+    wrapped.SetRKStageState(/*stage=*/0, /*state_generation=*/103);
+    wrapped.Mult(U_changed, rhs);
+    ctx.Check(igr_solver_s.GetLinearSolveCalls() ==
+                calls_before_invalidated_stage + 1,
+              "Sigma lifecycle: intervening state generation invalidates reuse");
+    ctx.Check(wrapped.GetSigmaStage0ReuseCount() == lifecycle_reuses_start + 1,
+              "Sigma lifecycle: invalidated stage does not count as reuse");
+    ctx.Check(wrapped.GetSigmaPrefetchInvalidationCount() ==
+                lifecycle_invalidations_start + 1,
+              "Sigma lifecycle: changed state records one prefetch invalidation");
+    ctx.Check(igr_solver_s.GetOutputOnlyLinearSolveCalls() ==
+                lifecycle_output_start + 1,
+              "Sigma lifecycle: invalidated prefetch becomes output-only work");
+    ctx.Check(igr_solver_s.GetProductionLinearSolveCalls() ==
+                production_before_invalidated_stage,
+              "Sigma lifecycle: invalidated prefetch and replacement do not "
+              "double count production work");
+
+    wrapped.EndRKStep(U_stage, /*t=*/0.3, /*state_generation=*/104);
+    const int production_before_output_only =
+      igr_solver_s.GetProductionLinearSolveCalls();
+    const mfem::IGRSigmaPreparationResult output_only =
+      wrapped.PrepareSigmaForOutput(U_stage,
+                                    /*state_generation=*/104,
+                                    /*next_rk_step=*/3,
+                                    /*time=*/0.3,
+                                    /*reusable_stage0=*/false);
+    ctx.Check(output_only.solved && output_only.output_only,
+              "Sigma lifecycle: final output solve is explicitly classified");
+    ctx.Check(igr_solver_s.GetOutputOnlyLinearSolveCalls() ==
+                lifecycle_output_start + 2,
+              "Sigma lifecycle: output-only solve has separate accounting");
+    ctx.Check(igr_solver_s.GetProductionLinearSolveCalls() ==
+                production_before_output_only,
+              "Sigma lifecycle: output-only solve does not alter production count");
+    ctx.Check(wrapped.GetSigmaOutputOnlySolveCount() ==
+                lifecycle_provider_output_start + 2,
+              "Sigma lifecycle: provider records output-only solve");
+    ctx.Check(igr_solver_s.GetProductionLinearSolveCalls() ==
+                lifecycle_production_start + 3,
+              "Sigma lifecycle: production preparations remain production work");
+
+    mfem::ParGridFunction U_checkpoint_next(&state_fes_s);
+    project_state(U_checkpoint_next, /*phase=*/0.05);
+    auto configure_checkpoint_solver = [](dg_igr::IGRSolver& solver)
+    {
+      solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+      solver.SetIPKind(dg_igr::IGRIPKind::SIPG);
+      solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+      solver.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
+      solver.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+      solver.SetLinearSolveParams(/*rtol=*/1.0e-12,
+                                  /*atol=*/0.0,
+                                  /*max_it=*/400,
+                                  /*print=*/0);
+    };
+    dg_igr::IGRSolver checkpoint_solver(sigma_fes_s,
+                                        state_fes_s,
+                                        dim_s,
+                                        num_eq_s,
+                                        /*alpha=*/0.25);
+    dg_igr::IGRSolver checkpoint_control(sigma_fes_s,
+                                         state_fes_s,
+                                         dim_s,
+                                         num_eq_s,
+                                         /*alpha=*/0.25);
+    configure_checkpoint_solver(checkpoint_solver);
+    configure_checkpoint_solver(checkpoint_control);
+    checkpoint_solver.UpdateFromState(U_base, /*warm_start=*/false);
+    checkpoint_control.UpdateFromState(U_base, /*warm_start=*/false);
+    mfem::Vector sigma_before_abandoned_prefetch(checkpoint_solver.GetSigma());
+    checkpoint_solver.UpdateFromState(
+      U_stage,
+      /*warm_start=*/true,
+      dg_igr::IGRSolvePurpose::ProductionStage0Prefetch);
+    ctx.Check(checkpoint_solver.ReclassifyPendingStage0PrefetchAsOutputOnly(),
+              "Sigma lifecycle: pending prefetch can be reclassified");
+    mfem::Vector restored_sigma(checkpoint_solver.GetSigma());
+    restored_sigma -= sigma_before_abandoned_prefetch;
+    ctx.CheckNear(restored_sigma.Normlinf(),
+                  0.0,
+                  0.0,
+                  "Sigma lifecycle: abandoned prefetch restores warm-start sigma");
+    checkpoint_solver.UpdateFromState(U_checkpoint_next, /*warm_start=*/true);
+    const int checkpoint_iters = checkpoint_solver.GetLastLinearIters();
+    checkpoint_control.UpdateFromState(U_checkpoint_next, /*warm_start=*/true);
+    mfem::Vector checkpoint_delta(checkpoint_solver.GetSigma());
+    checkpoint_delta -= checkpoint_control.GetSigma();
+    ctx.CheckNear(checkpoint_delta.Normlinf(),
+                  0.0,
+                  0.0,
+                  "Sigma lifecycle: abandoned prefetch leaves production sigma exact");
+    ctx.Check(checkpoint_iters == checkpoint_control.GetLastLinearIters(),
+              "Sigma lifecycle: abandoned prefetch leaves production iterations exact");
+    ctx.Check(checkpoint_solver.GetProductionLinearSolveCalls() == 2 &&
+                checkpoint_solver.GetOutputOnlyLinearSolveCalls() == 1,
+              "Sigma lifecycle: abandoned prefetch accounting is separated");
+
+    ctx.AddParity(static_cast<double>(wrapped.GetSigmaPrefetchSolveCount() +
+                                      wrapped.GetSigmaStage0ReuseCount() +
+                                      wrapped.GetSigmaOutputOnlySolveCount()));
+
     auto check_non_stage_fallback =
       [&](dg_igr::IGRSigmaUpdateCadence cadence,
           int interval,
@@ -2845,10 +3116,8 @@ int RunIGRTests(TestContext& ctx)
                              "every-n-steps");
   }
 
-  // Exact-face L2 PA/QF currently has no shared-face operator. Pin down the
-  // boundary: MFEM exposes shared faces through FaceQuadratureSpace, and the
-  // custom helpers must reject them instead of silently building a partial
-  // MPI operator.
+  // Exercise both the MFEM-matching arithmetic shared-face path and the
+  // opt-in harmonic-weighted candidate on an actual partition boundary.
   if (mfem::Mpi::WorldSize() > 1)
   {
     constexpr int dim_shared = 2;
@@ -3194,6 +3463,9 @@ int RunIGRTests(TestContext& ctx)
     int local_exact_operator_shared_nf = 0;
     int local_exact_operator_local_nf = 0;
     int local_exact_operator_converged = 0;
+    int local_harmonic_operator_bad = 0;
+    int local_harmonic_operator_converged = 0;
+    double harmonic_symmetry_defect = 0.0;
     if (local_pmesh_shared > 0)
     {
       constexpr int num_eq_shared = dim_shared + 2;
@@ -3222,6 +3494,10 @@ int RunIGRTests(TestContext& ctx)
       ScopedEnvVar force_pa("DG_IGR_IGR_PARTIAL_ASSEMBLY", "1");
       ScopedEnvVar force_qf("DG_IGR_IGR_DEVICE_QF", "1");
       ScopedEnvVar force_exact("DG_IGR_IGR_EXACT_DG_FACE_OPERATOR", "1");
+      ScopedEnvVar force_certificate_start(
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_START", "1");
+      ScopedEnvVar force_certificate_factor(
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR", "100");
       dg_igr::IGRSolver shared_exact_solver(shared_fes,
                                             shared_state_fes,
                                             dim_shared,
@@ -3246,6 +3522,99 @@ int RunIGRTests(TestContext& ctx)
       {
         local_exact_operator_bad = 1;
       }
+      if (!std::isfinite(
+            shared_exact_solver.GetLastLinearTrueResidualRelRHS()))
+      {
+        local_exact_operator_bad = 1;
+      }
+
+      {
+        ScopedEnvVar reject_certificate_factor(
+          "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR", "1e-12");
+        dg_igr::IGRSolver certificate_rejection_solver(shared_fes,
+                                                       shared_state_fes,
+                                                       dim_shared,
+                                                       num_eq_shared,
+                                                       /*alpha=*/0.19);
+        certificate_rejection_solver.SetLinearSolver(
+          dg_igr::IGRLinearSolverType::CG);
+        certificate_rejection_solver.SetPreconditioner(
+          dg_igr::IGRPrecondType::None);
+        certificate_rejection_solver.SetNonconvergencePolicy(
+          dg_igr::IGRNonconvergencePolicy::Accept);
+        certificate_rejection_solver.SetLinearSolveParams(/*rtol=*/1.0e-9,
+                                                          /*atol=*/0.0,
+                                                          /*max_it=*/400,
+                                                          /*print=*/0);
+        certificate_rejection_solver.UpdateFromState(
+          shared_state, /*warm_start=*/false);
+        if (certificate_rejection_solver.GetLastLinearConverged())
+        {
+          local_exact_operator_bad = 1;
+        }
+      }
+
+      {
+        ScopedEnvVar force_harmonic(
+          "DG_IGR_IGR_IPDG_FACE_SCALING", "harmonic");
+        dg_igr::IGRSolver harmonic_solver(shared_fes,
+                                          shared_state_fes,
+                                          dim_shared,
+                                          num_eq_shared,
+                                          /*alpha=*/0.19);
+        harmonic_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
+        harmonic_solver.SetPreconditioner(dg_igr::IGRPrecondType::None);
+        harmonic_solver.SetLinearSolveParams(/*rtol=*/1.0e-9,
+                                             /*atol=*/0.0,
+                                             /*max_it=*/400,
+                                             /*print=*/0);
+        harmonic_solver.UpdateFromState(shared_state, /*warm_start=*/false);
+        local_harmonic_operator_converged =
+          harmonic_solver.GetLastLinearConverged() ? 1 : 0;
+
+        const mfem::Operator* harmonic_operator =
+          harmonic_solver.GetLinearOperator();
+        if (harmonic_operator == nullptr ||
+            harmonic_solver.GetLastExactFaceSharedFaceCount() !=
+              local_pmesh_shared)
+        {
+          local_harmonic_operator_bad = 1;
+        }
+        else
+        {
+          mfem::Vector x(harmonic_operator->Width());
+          mfem::Vector y(harmonic_operator->Width());
+          mfem::Vector ax(harmonic_operator->Height());
+          mfem::Vector ay(harmonic_operator->Height());
+          for (int i = 0; i < x.Size(); ++i)
+          {
+            const double index = static_cast<double>(
+              i + 1 + 104729 * mfem::Mpi::WorldRank());
+            x(i) = std::sin(0.017 * index) + 0.31 * std::cos(0.023 * index);
+            y(i) = std::cos(0.019 * index) - 0.27 * std::sin(0.029 * index);
+          }
+          harmonic_operator->Mult(x, ax);
+          harmonic_operator->Mult(y, ay);
+          double products[2] = {x * ay, y * ax};
+          MPI_Allreduce(MPI_IN_PLACE,
+                        products,
+                        2,
+                        mfem::MPITypeMap<double>::mpi_type,
+                        MPI_SUM,
+                        MPI_COMM_WORLD);
+          harmonic_symmetry_defect =
+            std::abs(products[0] - products[1]) /
+            std::max({std::abs(products[0]), std::abs(products[1]), 1.0});
+          if (harmonic_symmetry_defect > 1.0e-11)
+          {
+            local_harmonic_operator_bad = 1;
+          }
+        }
+        if (!harmonic_solver.GetLastLinearConverged())
+        {
+          local_harmonic_operator_bad = 1;
+        }
+      }
     }
 
     const int local_bad_support =
@@ -3258,6 +3627,8 @@ int RunIGRTests(TestContext& ctx)
     int global_exact_operator_shared_nf = 0;
     int global_exact_operator_local_nf = 0;
     int global_exact_operator_converged = 0;
+    int global_harmonic_operator_bad = 0;
+    int global_harmonic_operator_converged = 0;
     MPI_Allreduce(&local_bad_support,
                   &global_bad_support,
                   1,
@@ -3300,6 +3671,18 @@ int RunIGRTests(TestContext& ctx)
                   MPI_INT,
                   MPI_SUM,
                   MPI_COMM_WORLD);
+    MPI_Allreduce(&local_harmonic_operator_bad,
+                  &global_harmonic_operator_bad,
+                  1,
+                  MPI_INT,
+                  MPI_SUM,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(&local_harmonic_operator_converged,
+                  &global_harmonic_operator_converged,
+                  1,
+                  MPI_INT,
+                  MPI_SUM,
+                  MPI_COMM_WORLD);
 
     ctx.LogMetric("igr_l2_exact_face_shared_guard local_shared_fqs=" +
                   std::to_string(local_shared_in_fqs) +
@@ -3325,13 +3708,18 @@ int RunIGRTests(TestContext& ctx)
                   std::to_string(global_exact_operator_shared_nf) +
                   " converged_ranks=" +
                   std::to_string(global_exact_operator_converged));
+    ctx.LogMetric("igr_l2_exact_face_harmonic_mpi symmetry=" +
+                  FormatSci(harmonic_symmetry_defect) +
+                  " converged_ranks=" +
+                  std::to_string(global_harmonic_operator_converged));
     ctx.AddParity(static_cast<double>(global_shared_in_fqs +
                                       global_pmesh_shared +
                                       global_bad_support +
                                       global_shared_apply_bad +
                                       global_shared_apply_nf +
                                       global_exact_operator_bad +
-                                      global_exact_operator_shared_nf));
+                                      global_exact_operator_shared_nf +
+                                      global_harmonic_operator_bad));
     ctx.Check(global_pmesh_shared > 0,
               "IGR exact-face MPI guard test creates shared ParMesh faces");
     ctx.Check(global_shared_in_fqs > 0,
@@ -3346,6 +3734,8 @@ int RunIGRTests(TestContext& ctx)
               "IGR exact-face MPI operator path converges with shared faces");
     ctx.Check(global_exact_operator_shared_nf == global_pmesh_shared,
               "IGR exact-face MPI operator constructs shared face data");
+    ctx.Check(global_harmonic_operator_bad == 0,
+              "IGR harmonic exact-face MPI operator is symmetric and converges");
   }
 
   // --- Quasi-1D MPI robustness: sigma should vary primarily in x, not y ---

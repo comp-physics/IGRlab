@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 
 namespace dg_igr
@@ -35,16 +36,24 @@ inline double IPDGPenalty(const mfem::FiniteElementSpace& fes,
                           double Cbase = 4.0)
 {
   const int p = SpaceOrder(fes);
-  return Cbase * (p + 1) * (p + 1);
+  double scale = 1.0;
+  if (const char* raw = std::getenv("DG_IGR_IGR_IPDG_PENALTY_SCALE"))
+  {
+    char* end = nullptr;
+    scale = std::strtod(raw, &end);
+    MFEM_VERIFY(end && *end == '\0' && scale > 0.0,
+                "DG_IGR_IGR_IPDG_PENALTY_SCALE must be positive.");
+  }
+  return scale * Cbase * (p + 1) * (p + 1);
 }
 
 inline bool IsSPD_DefaultAssumption(const mfem::FiniteElementSpace& sfes,
                                     IGRSolver::IPKind ip_kind)
 {
-  // Structural policy:
-  //  - H1 operator is assembled symmetrically -> SPD-friendly.
-  //  - DG/L2 with SIPG is SPD-by-construction when DGDiffusionIntegrator
-  //    is wired as (sigma=-1, kappa>0 penalty). IIPG/NIPG are non-SPD.
+  // Legacy auto-selection policy. SIPG wiring makes the DG form symmetric,
+  // but coercivity additionally requires a sufficiently large penalty. This
+  // predicate is therefore an assumption for solver selection, not an SPD
+  // certificate for a variable-coefficient production operator.
   if (IsDGSpace(sfes))
   {
     return ip_kind == IGRSolver::IPKind::SIPG;

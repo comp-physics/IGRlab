@@ -1,9 +1,20 @@
 #include "sim/config/case_config.hpp"
 #include "sim/context/example_context.hpp"
+#include "sim/io/vtk_helpers.hpp"
+#include "sim/solver/solver_helpers.hpp"
 #include "sim/state/euler_state_bundle.hpp"
 #include "sim/time/time_defaults.hpp"
 
 #include "test_utils.hpp"
+
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <optional>
+#include <sstream>
+#include <string>
 
 namespace dg_igr_tests
 {
@@ -11,6 +22,31 @@ namespace dg_igr_tests
 int RunTimeDefaultsTests(TestContext& ctx)
 {
   constexpr double gamma = 1.4;
+
+  // --- Zhang-Shu point policy defaults and runtime resolution ---
+  {
+    dg_sim::CommonOptions opts;
+    dg_sim::CaseConfig case_cfg;
+    dg_sim::IGROptions igr_opts;
+    ctx.Check(opts.zhang_shu_points == "consumer",
+              "Zhang-Shu defaults: consumer point set selected");
+    ctx.Check(dg_sim::ParseZhangShuPointSet("consumer") ==
+                mfem::ZhangShuPointSet::kConsumer,
+              "Zhang-Shu options: parse consumer point set");
+    ctx.Check(dg_sim::ParseZhangShuPointSet("quadrature") ==
+                mfem::ZhangShuPointSet::kQuadrature,
+              "Zhang-Shu options: parse quadrature point set");
+
+    opts.zhang_shu_points = "quadrature";
+    const dg_sim::RunConfig run_cfg =
+      dg_sim::MakeRunConfig(case_cfg, opts, igr_opts);
+    ctx.Check(run_cfg.case_config.limiter_pipeline.zhang_shu_points ==
+                mfem::ZhangShuPointSet::kQuadrature,
+              "Zhang-Shu options: CLI policy reaches limiter pipeline");
+    ctx.Check(std::string(dg_sim::ZhangShuPointSetToString(
+                mfem::ZhangShuPointSet::kConsumer)) == "consumer",
+              "Zhang-Shu options: consumer policy has stable metadata name");
+  }
 
   // --- IGR derived runtime defaults ---
   {
@@ -29,6 +65,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "IGR defaults: CUDA L2/BrokenL2 DG selects MINRES");
     ctx.Check(igr_opts.preconditioner == "chebyshev",
               "IGR defaults: CUDA L2/BrokenL2 DG selects Chebyshev");
+    ctx.Check(igr_opts.nonconvergence_policy == "error",
+              "IGR defaults: CUDA L2/BrokenL2 DG fails on nonconvergence");
     ctx.CheckNear(igr_opts.stage_rtol_scale,
                   1.0,
                   0.0,
@@ -41,6 +79,20 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   0.0,
                   0.0,
                   "IGR defaults: CUDA L2/BrokenL2 DG uses zero atol");
+    ctx.Check(igr_opts.lin_maxit < 0,
+              "IGR defaults: CUDA L2/BrokenL2 DG keeps the case iteration cap");
+    dg_igr::IGRConfig igr_config;
+    ctx.Check(igr_config.nonconvergence_policy ==
+                dg_igr::IGRNonconvergencePolicy::Error,
+              "IGR defaults: linear nonconvergence is a production error");
+    ctx.Check(dg_sim::ParseIGRNonconvergencePolicy("accept") ==
+                dg_igr::IGRNonconvergencePolicy::Accept,
+              "IGR options: explicit diagnostic accept policy parses");
+    igr_opts.nonconvergence_policy = "accept";
+    dg_sim::ApplyIGRRuntimeOptionOverrides(igr_opts, igr_config);
+    ctx.Check(igr_config.nonconvergence_policy ==
+                dg_igr::IGRNonconvergencePolicy::Accept,
+              "IGR options: nonconvergence policy reaches solver config");
   }
 
   {
@@ -55,6 +107,23 @@ int RunTimeDefaultsTests(TestContext& ctx)
                                            /*exact_face_operator_overridden=*/true);
     ctx.Check(!igr_opts.exact_dg_face_operator,
               "IGR defaults: explicit exact-face override is preserved");
+    ctx.Check(igr_opts.lin_maxit < 0,
+              "IGR defaults: exact-face opt-out keeps the case iteration cap");
+  }
+
+  {
+    dg_sim::CommonOptions opts;
+    dg_sim::IGROptions igr_opts;
+    opts.device = "cuda";
+    opts.dg_backend = "dg";
+    igr_opts.space = "L2";
+    igr_opts.grad = "BrokenL2";
+    igr_opts.lin_maxit = 777;
+    dg_sim::ApplyIGRDerivedRuntimeDefaults(opts,
+                                           igr_opts,
+                                           /*exact_face_operator_overridden=*/false);
+    ctx.Check(igr_opts.lin_maxit == 777,
+              "IGR defaults: explicit iteration cap is preserved");
   }
 
   {
@@ -150,6 +219,144 @@ int RunTimeDefaultsTests(TestContext& ctx)
   const mfem::Vector state =
     EulerConsFromPrim2D(/*rho=*/1.2, /*u=*/0.3, /*v=*/-0.1, /*p=*/0.9, gamma);
   FillConstantState(state, bundle.sol);
+
+  // --- VTK pressure can bypass the projected pressure polynomial ---
+  {
+    constexpr const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
+    const char* original_prefix_text = std::getenv(prefix_env_name);
+    const std::optional<std::string> original_prefix = original_prefix_text
+      ? std::optional<std::string>(original_prefix_text)
+      : std::nullopt;
+    dg_sim::CaseConfig vtk_case;
+    vtk_case.case_name = "vtk-prefix-case";
+    vtk_case.vtk_config.prefix_path = "/default-vtk-prefix";
+    setenv(prefix_env_name, "/tmp/dg-igr-vtk-override", 1);
+    ctx.Check(dg_sim::MakeCaseVTKConfig(vtk_case).prefix_path ==
+                "/tmp/dg-igr-vtk-override",
+              "VTK output: environment override isolates prefix path");
+    if (original_prefix)
+    {
+      setenv(prefix_env_name, original_prefix->c_str(), 1);
+    }
+    else
+    {
+      unsetenv(prefix_env_name);
+    }
+
+    constexpr const char* env_name = "DG_IGR_VTK_PRESSURE_COEFFICIENT";
+    const char* original_text = std::getenv(env_name);
+    const std::optional<std::string> original =
+      original_text ? std::optional<std::string>(original_text) : std::nullopt;
+
+    setenv(env_name, "0", 1);
+    mfem::ParaViewDataCollection projected("vtk-pressure-projected",
+                                            &example_ctx.Mesh());
+    dg_sim::RegisterEulerVTKFields(projected, bundle.field_list);
+    ctx.Check(projected.HasField("pressure"),
+              "VTK pressure: default registers projected grid function");
+    ctx.Check(projected.GetCoeffFieldMap().count("pressure") == 0,
+              "VTK pressure: default does not register direct coefficient");
+
+    setenv(env_name, "1", 1);
+    mfem::ParaViewDataCollection direct("vtk-pressure-direct",
+                                         &example_ctx.Mesh());
+    dg_sim::RegisterEulerVTKFields(direct, bundle.field_list);
+    ctx.Check(!direct.HasField("pressure"),
+              "VTK pressure: direct mode omits projected grid function");
+    ctx.Check(direct.GetCoeffFieldMap().count("pressure") == 1,
+              "VTK pressure: direct mode registers pressure coefficient");
+
+    long long output_token = 0;
+    if (mfem::Mpi::Root())
+    {
+      output_token = std::chrono::high_resolution_clock::now()
+                       .time_since_epoch()
+                       .count();
+    }
+    MPI_Bcast(&output_token,
+              1,
+              mfem::MPITypeMap<long long>::mpi_type,
+              0,
+              MPI_COMM_WORLD);
+    const std::filesystem::path output_root =
+      std::filesystem::path("/tmp") /
+      ("dg_igr_vtk_pressure_direct_" + std::to_string(output_token));
+    direct.SetPrefixPath(output_root.string());
+    direct.SetDataFormat(mfem::VTKFormat::ASCII);
+    direct.SetLevelsOfDetail(1);
+    direct.SetHighOrderOutput(false);
+    direct.SetCycle(0);
+    direct.SetTime(0.0);
+    mfem::Vector state_before_vtk(bundle.sol);
+    direct.Save();
+    MPI_Barrier(MPI_COMM_WORLD);
+    mfem::Vector state_after_vtk(bundle.sol);
+    state_after_vtk -= state_before_vtk;
+    ctx.CheckNear(state_after_vtk.Normlinf(),
+                  0.0,
+                  0.0,
+                  "VTK pressure: direct save does not mutate RK state");
+
+    bool found_pressure = false;
+    int pressure_values = 0;
+    double min_saved_pressure = std::numeric_limits<double>::infinity();
+    double max_saved_pressure = -std::numeric_limits<double>::infinity();
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator(output_root))
+    {
+      if (!entry.is_regular_file() || entry.path().extension() != ".vtu")
+      {
+        continue;
+      }
+      std::ifstream input(entry.path());
+      const std::string contents((std::istreambuf_iterator<char>(input)),
+                                 std::istreambuf_iterator<char>());
+      const std::size_t name = contents.find("Name=\"pressure\"");
+      if (name == std::string::npos)
+      {
+        continue;
+      }
+      const std::size_t begin = contents.find('>', name);
+      const std::size_t end = contents.find("</DataArray>", begin);
+      if (begin == std::string::npos || end == std::string::npos)
+      {
+        continue;
+      }
+      found_pressure = true;
+      std::istringstream values(contents.substr(begin + 1, end - begin - 1));
+      double value = 0.0;
+      while (values >> value)
+      {
+        ++pressure_values;
+        min_saved_pressure = std::min(min_saved_pressure, value);
+        max_saved_pressure = std::max(max_saved_pressure, value);
+      }
+    }
+    ctx.Check(found_pressure && pressure_values > 0,
+              "VTK pressure: direct coefficient is present in saved VTU");
+    ctx.CheckNear(min_saved_pressure,
+                  0.9,
+                  1.0e-12,
+                  "VTK pressure: direct saved minimum equals p(U)");
+    ctx.CheckNear(max_saved_pressure,
+                  0.9,
+                  1.0e-12,
+                  "VTK pressure: direct saved maximum equals p(U)");
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (mfem::Mpi::Root())
+    {
+      std::filesystem::remove_all(output_root);
+    }
+
+    if (original)
+    {
+      setenv(env_name, original->c_str(), 1);
+    }
+    else
+    {
+      unsetenv(env_name);
+    }
+  }
 
   struct TimeLoopDummyOperator
   {

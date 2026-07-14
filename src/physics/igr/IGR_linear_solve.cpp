@@ -8,9 +8,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace dg_igr
 {
@@ -69,6 +74,442 @@ mfem::real_t ReadEnvReal(const char* name, mfem::real_t default_value)
   MFEM_VERIFY(end && *end == '\0',
               "Invalid real value for " << name << ": " << raw);
   return static_cast<mfem::real_t>(value);
+}
+
+dg_face::DGDiffusionFaceScaling ReadIPDGFaceScaling()
+{
+  const char* raw = std::getenv("DG_IGR_IGR_IPDG_FACE_SCALING");
+  const std::string value = raw ? raw : "arithmetic";
+  if (value == "arithmetic")
+  {
+    return dg_face::DGDiffusionFaceScaling::Arithmetic;
+  }
+  if (value == "max")
+  {
+    return dg_face::DGDiffusionFaceScaling::Max;
+  }
+  if (value == "sum")
+  {
+    return dg_face::DGDiffusionFaceScaling::Sum;
+  }
+  if (value == "harmonic")
+  {
+    return dg_face::DGDiffusionFaceScaling::HarmonicWeighted;
+  }
+  MFEM_ABORT("DG_IGR_IGR_IPDG_FACE_SCALING must be one of "
+             "arithmetic|max|sum|harmonic.");
+  return dg_face::DGDiffusionFaceScaling::Arithmetic;
+}
+
+const char* IPDGFaceScalingName(dg_face::DGDiffusionFaceScaling value)
+{
+  switch (value)
+  {
+  case dg_face::DGDiffusionFaceScaling::Arithmetic:
+    return "arithmetic";
+  case dg_face::DGDiffusionFaceScaling::Max:
+    return "max";
+  case dg_face::DGDiffusionFaceScaling::Sum:
+    return "sum";
+  case dg_face::DGDiffusionFaceScaling::HarmonicWeighted:
+    return "harmonic";
+  }
+  return "arithmetic";
+}
+
+double OperatorProbeDot(const mfem::Vector& x,
+                        const mfem::Vector& y,
+                        MPI_Comm comm)
+{
+  const double local = x * y;
+  double global = local;
+#ifdef MFEM_USE_MPI
+  MPI_Allreduce(&local,
+                &global,
+                1,
+                mfem::MPITypeMap<double>::mpi_type,
+                MPI_SUM,
+                comm);
+#else
+  (void)comm;
+#endif
+  return global;
+}
+
+double OperatorProbeNorm(const mfem::Vector& x, MPI_Comm comm)
+{
+  return std::sqrt(std::max(OperatorProbeDot(x, x, comm), 0.0));
+}
+
+void WriteVectorLines(const std::filesystem::path& path,
+                      const mfem::Vector& vector)
+{
+  std::ofstream output(path);
+  output << std::setprecision(17);
+  const double* data = vector.HostRead();
+  for (int i = 0; i < vector.Size(); ++i)
+  {
+    output << data[i] << '\n';
+  }
+}
+
+void SaveLinearEventCapture(
+  const std::filesystem::path& prefix,
+  int solve_call,
+  int rk_step,
+  int rk_stage,
+  double time,
+  double dt,
+  const mfem::ParGridFunction& state,
+  const mfem::ParFiniteElementSpace& sigma_fes,
+  const mfem::Vector& rhs,
+  const mfem::Vector& initial_guess,
+  const mfem::Vector& solution,
+  int iterations,
+  bool converged,
+  double reported_initial_norm,
+  double reported_final_norm,
+  double true_initial_residual_abs,
+  double true_residual_abs,
+  double true_residual_rel_rhs,
+  double true_residual_rel_initial,
+  double recomputed_preconditioned_initial_norm,
+  double recomputed_preconditioned_final_norm,
+  double effective_rtol,
+  bool warm_start_requested,
+  bool warm_start_effective,
+  const std::string& solver,
+  const std::string& preconditioner,
+  double chebyshev_eigenvalue)
+{
+  const int rank = mfem::Mpi::WorldRank();
+  std::ostringstream rank_name;
+  rank_name << std::setfill('0') << std::setw(6) << rank;
+  const std::filesystem::path output_dir =
+    prefix / ("solve-" + std::to_string(solve_call));
+  std::filesystem::create_directories(output_dir);
+
+  {
+    std::ofstream output(output_dir /
+                         ("euler-mesh-final." + rank_name.str()));
+    output.precision(17);
+    output << *state.ParFESpace()->GetParMesh();
+  }
+
+  const auto* state_fes = state.ParFESpace();
+  MFEM_VERIFY(state_fes->GetOrdering() == mfem::Ordering::byNODES,
+              "Linear-event state capture requires byNODES ordering.");
+  const int ndofs = state_fes->GetNDofs();
+  const double* state_data = state.HostRead();
+  mfem::ParFiniteElementSpace scalar_fes(state_fes->GetParMesh(),
+                                         state_fes->FEColl(),
+                                         1,
+                                         mfem::Ordering::byNODES);
+  for (int component = 0; component < state_fes->GetVDim(); ++component)
+  {
+    mfem::ParGridFunction field(&scalar_fes,
+                                const_cast<double*>(state_data) +
+                                  component * ndofs);
+    std::ofstream output(
+      output_dir /
+      ("euler-" + std::to_string(component) + "-final." + rank_name.str()));
+    output.precision(17);
+    output << field;
+  }
+
+  WriteVectorLines(output_dir / ("rhs." + rank_name.str()), rhs);
+  WriteVectorLines(output_dir / ("initial-guess." + rank_name.str()),
+                   initial_guess);
+  WriteVectorLines(output_dir / ("solution." + rank_name.str()), solution);
+
+  if (mfem::Mpi::Root())
+  {
+    std::ofstream output(output_dir / "metadata.txt");
+    output << std::setprecision(17)
+           << "solve_call=" << solve_call << '\n'
+           << "rk_step=" << rk_step << '\n'
+           << "rk_stage=" << rk_stage << '\n'
+           << "time=" << time << '\n'
+           << "dt=" << dt << '\n'
+           << "iterations=" << iterations << '\n'
+           << "converged=" << (converged ? 1 : 0) << '\n'
+           << "reported_initial_norm=" << reported_initial_norm << '\n'
+           << "reported_final_norm=" << reported_final_norm << '\n'
+           << "true_initial_residual_abs=" << true_initial_residual_abs << '\n'
+           << "true_residual_abs=" << true_residual_abs << '\n'
+           << "true_residual_rel_rhs=" << true_residual_rel_rhs << '\n'
+           << "true_residual_rel_initial=" << true_residual_rel_initial << '\n'
+           << "recomputed_preconditioned_initial_norm="
+           << recomputed_preconditioned_initial_norm << '\n'
+           << "recomputed_preconditioned_final_norm="
+           << recomputed_preconditioned_final_norm << '\n'
+           << "effective_rtol=" << effective_rtol << '\n'
+           << "warm_start_requested=" << (warm_start_requested ? 1 : 0)
+           << '\n'
+           << "warm_start_effective=" << (warm_start_effective ? 1 : 0)
+           << '\n'
+           << "solver=" << solver << '\n'
+           << "preconditioner=" << preconditioner << '\n'
+           << "chebyshev_eigenvalue=" << chebyshev_eigenvalue << '\n'
+           << "rhs_size=" << rhs.Size() << '\n'
+           << "sigma_true_size=" << sigma_fes.GetTrueVSize() << '\n';
+  }
+}
+
+void LogFaceCoefficientAudit(const char* domain,
+                             const mfem::Vector& coefficient,
+                             double alpha,
+                             double rho_floor,
+                             int solve_call,
+                             MPI_Comm comm)
+{
+  const double* data = coefficient.HostRead();
+  double local_min = std::numeric_limits<double>::infinity();
+  double local_max = -std::numeric_limits<double>::infinity();
+  long long local_values = coefficient.Size();
+  long long local_floor = 0;
+  long long local_nonfinite = 0;
+  const double floor_value = alpha / rho_floor;
+  for (int i = 0; i < coefficient.Size(); ++i)
+  {
+    local_min = std::min(local_min, data[i]);
+    local_max = std::max(local_max, data[i]);
+    local_floor += data[i] >= floor_value * (1.0 - 1.0e-12) ? 1 : 0;
+    local_nonfinite += std::isfinite(data[i]) ? 0 : 1;
+  }
+  double global_min = local_min;
+  double global_max = local_max;
+  long long global_values = local_values;
+  long long global_floor = local_floor;
+  long long global_nonfinite = local_nonfinite;
+  MPI_Allreduce(MPI_IN_PLACE, &global_min, 1, MPI_DOUBLE, MPI_MIN, comm);
+  MPI_Allreduce(MPI_IN_PLACE, &global_max, 1, MPI_DOUBLE, MPI_MAX, comm);
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_values,
+                1,
+                MPI_LONG_LONG,
+                MPI_SUM,
+                comm);
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_floor,
+                1,
+                MPI_LONG_LONG,
+                MPI_SUM,
+                comm);
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_nonfinite,
+                1,
+                MPI_LONG_LONG,
+                MPI_SUM,
+                comm);
+  if (mfem::Mpi::Root())
+  {
+    std::cout << "[igr-ingestion-audit] kind=face-coefficient"
+              << " solve=" << solve_call
+              << " domain=" << domain
+              << " values=" << global_values
+              << " min=" << global_min
+              << " max=" << global_max
+              << " density_floor_activations=" << global_floor
+              << " nonfinite=" << global_nonfinite << std::endl;
+  }
+}
+
+void FillOperatorProbeVector(mfem::Vector& value, int seed)
+{
+  double* data = value.HostWrite();
+  const int rank = mfem::Mpi::WorldRank();
+  for (int i = 0; i < value.Size(); ++i)
+  {
+    const double index = static_cast<double>(i + 1 + 104729 * rank);
+    data[i] = std::sin((0.013 + 0.001 * seed) * index) +
+              0.5 * std::cos((0.021 + 0.002 * seed) * index);
+  }
+}
+
+struct OperatorAlgebraProbe
+{
+  double symmetry_defect = std::numeric_limits<double>::quiet_NaN();
+  double repeatability_defect = std::numeric_limits<double>::quiet_NaN();
+  double min_rayleigh = std::numeric_limits<double>::quiet_NaN();
+  double min_ritz = std::numeric_limits<double>::quiet_NaN();
+  double max_ritz = std::numeric_limits<double>::quiet_NaN();
+  int lanczos_steps = 0;
+};
+
+void SymmetricEigenvalueBounds(mfem::DenseMatrix matrix,
+                               double& min_eigenvalue,
+                               double& max_eigenvalue)
+{
+  const int n = matrix.Height();
+  MFEM_VERIFY(n > 0 && matrix.Width() == n,
+              "Symmetric eigenvalue probe requires a square matrix.");
+  for (int sweep = 0; sweep < 50 * n * n; ++sweep)
+  {
+    int p = 0;
+    int q = 0;
+    double largest = 0.0;
+    double diagonal_scale = 1.0;
+    for (int i = 0; i < n; ++i)
+    {
+      diagonal_scale = std::max(diagonal_scale, std::abs(matrix(i, i)));
+      for (int j = i + 1; j < n; ++j)
+      {
+        if (std::abs(matrix(i, j)) > largest)
+        {
+          largest = std::abs(matrix(i, j));
+          p = i;
+          q = j;
+        }
+      }
+    }
+    if (largest <= 1.0e-13 * diagonal_scale)
+    {
+      break;
+    }
+
+    const double angle =
+      0.5 * std::atan2(2.0 * matrix(p, q), matrix(q, q) - matrix(p, p));
+    const double cosine = std::cos(angle);
+    const double sine = std::sin(angle);
+    const double app = matrix(p, p);
+    const double aqq = matrix(q, q);
+    const double apq = matrix(p, q);
+    matrix(p, p) = cosine * cosine * app - 2.0 * sine * cosine * apq +
+                   sine * sine * aqq;
+    matrix(q, q) = sine * sine * app + 2.0 * sine * cosine * apq +
+                   cosine * cosine * aqq;
+    matrix(p, q) = 0.0;
+    matrix(q, p) = 0.0;
+    for (int k = 0; k < n; ++k)
+    {
+      if (k == p || k == q)
+      {
+        continue;
+      }
+      const double akp = matrix(k, p);
+      const double akq = matrix(k, q);
+      matrix(k, p) = cosine * akp - sine * akq;
+      matrix(p, k) = matrix(k, p);
+      matrix(k, q) = sine * akp + cosine * akq;
+      matrix(q, k) = matrix(k, q);
+    }
+  }
+
+  min_eigenvalue = matrix(0, 0);
+  max_eigenvalue = matrix(0, 0);
+  for (int i = 1; i < n; ++i)
+  {
+    min_eigenvalue = std::min(min_eigenvalue, matrix(i, i));
+    max_eigenvalue = std::max(max_eigenvalue, matrix(i, i));
+  }
+}
+
+OperatorAlgebraProbe ProbeOperatorAlgebra(const mfem::Operator& op,
+                                          MPI_Comm comm,
+                                          int requested_steps)
+{
+  OperatorAlgebraProbe result;
+  const int n = op.Width();
+  MFEM_VERIFY(n > 0 && op.Height() == n,
+              "IGR operator algebra probe requires a non-empty square operator.");
+
+  mfem::Vector x(n), y(n), Ax(n), Ax_repeat(n), Ay(n);
+  FillOperatorProbeVector(x, 1);
+  FillOperatorProbeVector(y, 2);
+  op.Mult(x, Ax);
+  op.Mult(x, Ax_repeat);
+  op.Mult(y, Ay);
+  Ax_repeat -= Ax;
+  result.repeatability_defect =
+    std::sqrt(std::max(OperatorProbeDot(Ax_repeat, Ax_repeat, comm), 0.0)) /
+    std::max(std::sqrt(std::max(OperatorProbeDot(Ax, Ax, comm), 0.0)), 1.0e-30);
+  const double xAy = OperatorProbeDot(x, Ay, comm);
+  const double yAx = OperatorProbeDot(y, Ax, comm);
+  result.symmetry_defect =
+    std::abs(xAy - yAx) / std::max({1.0, std::abs(xAy), std::abs(yAx)});
+  const double x2 = std::max(OperatorProbeDot(x, x, comm), 1.0e-30);
+  const double y2 = std::max(OperatorProbeDot(y, y, comm), 1.0e-30);
+  result.min_rayleigh =
+    std::min(OperatorProbeDot(x, Ax, comm) / x2,
+             OperatorProbeDot(y, Ay, comm) / y2);
+
+  const int max_steps = std::max(1, std::min(requested_steps, n));
+  mfem::Vector q(n), previous(n), work(n);
+  FillOperatorProbeVector(q, 7);
+  q *= 1.0 / std::sqrt(std::max(OperatorProbeDot(q, q, comm), 1.0e-30));
+  previous = 0.0;
+  std::vector<mfem::Vector> basis;
+  std::vector<double> alpha;
+  std::vector<double> beta;
+  basis.reserve(max_steps);
+  alpha.reserve(max_steps);
+  beta.reserve(max_steps);
+  double previous_beta = 0.0;
+
+  for (int step = 0; step < max_steps; ++step)
+  {
+    basis.emplace_back(q);
+    op.Mult(q, work);
+    const double diagonal = OperatorProbeDot(q, work, comm);
+    alpha.push_back(diagonal);
+    work.Add(-diagonal, q);
+    if (step > 0)
+    {
+      work.Add(-previous_beta, previous);
+    }
+    for (const mfem::Vector& vector : basis)
+    {
+      work.Add(-OperatorProbeDot(vector, work, comm), vector);
+    }
+    const double next_beta =
+      std::sqrt(std::max(OperatorProbeDot(work, work, comm), 0.0));
+    if (step + 1 >= max_steps || next_beta <= 1.0e-14)
+    {
+      break;
+    }
+    beta.push_back(next_beta);
+    previous = q;
+    q = work;
+    q *= 1.0 / next_beta;
+    previous_beta = next_beta;
+  }
+
+  result.lanczos_steps = static_cast<int>(alpha.size());
+  mfem::DenseMatrix tridiagonal(result.lanczos_steps);
+  tridiagonal = 0.0;
+  for (int i = 0; i < result.lanczos_steps; ++i)
+  {
+    tridiagonal(i, i) = alpha[i];
+    if (i + 1 < result.lanczos_steps)
+    {
+      tridiagonal(i, i + 1) = beta[i];
+      tridiagonal(i + 1, i) = beta[i];
+    }
+  }
+  SymmetricEigenvalueBounds(tridiagonal, result.min_ritz, result.max_ritz);
+  return result;
+}
+
+void LogOperatorAlgebraProbe(const char* component,
+                             int solve_call,
+                             const mfem::Operator& op,
+                             MPI_Comm comm,
+                             int lanczos_steps)
+{
+  const OperatorAlgebraProbe probe =
+    ProbeOperatorAlgebra(op, comm, lanczos_steps);
+  if (mfem::Mpi::Root())
+  {
+    std::cout << "[igr-operator-probe] solve_call=" << solve_call
+              << " component=" << component
+              << " symmetry_defect=" << probe.symmetry_defect
+              << " repeatability_defect=" << probe.repeatability_defect
+              << " min_rayleigh=" << probe.min_rayleigh
+              << " min_ritz=" << probe.min_ritz
+              << " max_ritz=" << probe.max_ritz
+              << " lanczos_steps=" << probe.lanczos_steps << std::endl;
+  }
 }
 
 void MakeDiagonalPositive(mfem::Vector& diag)
@@ -137,10 +578,28 @@ class KrylovTelemetryOperator final : public mfem::Operator
 {
 public:
   KrylovTelemetryOperator(const mfem::Operator& op,
-                          KrylovApplyTelemetry& telemetry)
+                          KrylovApplyTelemetry& telemetry,
+                          const mfem::Operator* base_component = nullptr,
+                          const mfem::Operator* face_component = nullptr,
+                          const mfem::ParGridFunction* state = nullptr,
+                          mfem::ParFiniteElementSpace* sigma_fes = nullptr,
+                          bool* capture_written = nullptr,
+                          MPI_Comm comm = MPI_COMM_WORLD,
+                          int solve_call = 0)
     : mfem::Operator(op.Height(), op.Width()),
       op_(op),
-      telemetry_(telemetry)
+      telemetry_(telemetry),
+      base_component_(base_component),
+      face_component_(face_component),
+      state_(state),
+      sigma_fes_(sigma_fes),
+      capture_written_(capture_written),
+      comm_(comm),
+      solve_call_(solve_call),
+      capture_negative_quadratic_(
+        base_component != nullptr && face_component != nullptr &&
+        ::dg_igr::EnvFlagEnabledDefault(
+          "DG_IGR_IGR_CAPTURE_NEGATIVE_QUADRATIC", false))
   {
   }
 
@@ -150,6 +609,7 @@ public:
     if (!telemetry_.record_seconds)
     {
       op_.Mult(x, y);
+      MaybeReportQuadratic(x, y);
       ++telemetry_.operator_apply_count;
       if (telemetry_.inside_preconditioner)
       {
@@ -159,6 +619,7 @@ public:
     }
     const auto start = Clock::now();
     op_.Mult(x, y);
+    MaybeReportQuadratic(x, y);
     if (telemetry_.sync)
     {
       MFEM_DEVICE_SYNC;
@@ -210,8 +671,127 @@ public:
   }
 
 private:
+  void MaybeReportQuadratic(const mfem::Vector& x,
+                            const mfem::Vector& y) const
+  {
+    if (!capture_negative_quadratic_ || negative_quadratic_reported_ ||
+        telemetry_.inside_preconditioner)
+    {
+      return;
+    }
+    const double full = OperatorProbeDot(x, y, comm_);
+    if (full > 0.0)
+    {
+      return;
+    }
+    component_work_.SetSize(y.Size(), y);
+    base_component_->Mult(x, component_work_);
+    const double base = OperatorProbeDot(x, component_work_, comm_);
+    face_component_->Mult(x, component_work_);
+    const double face = OperatorProbeDot(x, component_work_, comm_);
+    const double norm_sq = std::max(OperatorProbeDot(x, x, comm_), 1.0e-300);
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[igr-negative-quadratic] solve_call=" << solve_call_
+                << " operator_apply=" << telemetry_.operator_apply_count + 1
+                << " full=" << full
+                << " base=" << base
+                << " face=" << face
+                << " base_plus_face=" << base + face
+                << " direction_norm_sq=" << norm_sq
+                << " full_rayleigh=" << full / norm_sq << std::endl;
+    }
+    MaybeSaveNegativeDirection(x, full, base, face, norm_sq);
+    negative_quadratic_reported_ = true;
+  }
+
+  void MaybeSaveNegativeDirection(const mfem::Vector& x,
+                                  double full,
+                                  double base,
+                                  double face,
+                                  double norm_sq) const
+  {
+    const char* prefix = std::getenv("DG_IGR_IGR_NEGATIVE_CAPTURE_PREFIX");
+    if (!prefix || prefix[0] == '\0' || !state_ || !sigma_fes_ ||
+        !capture_written_ || *capture_written_)
+    {
+      return;
+    }
+
+    const int rank = mfem::Mpi::WorldRank();
+    std::ostringstream rank_name;
+    rank_name << std::setfill('0') << std::setw(6) << rank;
+    const std::filesystem::path output_dir =
+      std::filesystem::path(prefix) /
+      ("solve-" + std::to_string(solve_call_));
+    std::filesystem::create_directories(output_dir);
+
+    {
+      std::ofstream output(output_dir /
+                           ("euler-mesh-final." + rank_name.str()));
+      output.precision(17);
+      output << *state_->ParFESpace()->GetParMesh();
+    }
+
+    const auto* state_fes = state_->ParFESpace();
+    MFEM_VERIFY(state_fes->GetOrdering() == mfem::Ordering::byNODES,
+                "Negative-direction state capture requires byNODES ordering.");
+    const int ndofs = state_fes->GetNDofs();
+    const double* state_data = state_->HostRead();
+    mfem::ParFiniteElementSpace scalar_fes(state_fes->GetParMesh(),
+                                           state_fes->FEColl(),
+                                           1,
+                                           mfem::Ordering::byNODES);
+    for (int component = 0; component < state_fes->GetVDim(); ++component)
+    {
+      mfem::ParGridFunction field(&scalar_fes,
+                                  const_cast<double*>(state_data) +
+                                    component * ndofs);
+      std::ofstream output(
+        output_dir /
+        ("euler-" + std::to_string(component) + "-final." + rank_name.str()));
+      output.precision(17);
+      output << field;
+    }
+
+    {
+      std::ofstream output(output_dir /
+                           ("direction." + rank_name.str()));
+      output << std::setprecision(17);
+      const double* direction_data = x.HostRead();
+      for (int i = 0; i < x.Size(); ++i)
+      {
+        output << direction_data[i] << '\n';
+      }
+    }
+    if (mfem::Mpi::Root())
+    {
+      std::ofstream output(output_dir / "metadata.txt");
+      output << std::setprecision(17)
+             << "solve_call=" << solve_call_ << '\n'
+             << "full=" << full << '\n'
+             << "base=" << base << '\n'
+             << "face=" << face << '\n'
+             << "direction_norm_sq=" << norm_sq << '\n'
+             << "direction_size=" << x.Size() << '\n';
+      std::cout << "[igr-negative-quadratic] capture_dir="
+                << output_dir.string() << std::endl;
+    }
+    *capture_written_ = true;
+  }
+
   const mfem::Operator& op_;
   KrylovApplyTelemetry& telemetry_;
+  const mfem::Operator* base_component_ = nullptr;
+  const mfem::Operator* face_component_ = nullptr;
+  const mfem::ParGridFunction* state_ = nullptr;
+  mfem::ParFiniteElementSpace* sigma_fes_ = nullptr;
+  bool* capture_written_ = nullptr;
+  MPI_Comm comm_ = MPI_COMM_WORLD;
+  int solve_call_ = 0;
+  bool capture_negative_quadratic_ = false;
+  mutable bool negative_quadratic_reported_ = false;
+  mutable mfem::Vector component_work_;
 };
 
 class KrylovTelemetryPreconditioner final : public mfem::Solver
@@ -304,7 +884,8 @@ public:
                         const mfem::IntegrationRule& shared_ir,
                         const mfem::Vector& shared_side_q,
                         mfem::real_t ip_sigma,
-                        mfem::real_t kappa)
+                        mfem::real_t kappa,
+                        dg_face::DGDiffusionFaceScaling face_scaling)
     : mfem::Operator(sfes.GetTrueVSize()),
       sfes_(sfes),
       prolong_(sfes.GetProlongationMatrix()),
@@ -321,7 +902,8 @@ public:
       scratch_.weighted_normal_dshape,
       scratch_.penalty,
       scratch_.face_elements,
-      scratch_.element_vdof_map);
+      scratch_.element_vdof_map,
+      face_scaling);
     timing_enabled_ =
       ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_EXACT_FACE_TIMING",
                                       false);
@@ -337,7 +919,8 @@ public:
         shared_scratch_.penalty,
         shared_scratch_.face_elements,
         shared_scratch_.element_vdof_map,
-        shared_scratch_.face_nbr_dof_map);
+        shared_scratch_.face_nbr_dof_map,
+        face_scaling);
       has_shared_ = (shared_info_.nf > 0);
     }
   }
@@ -550,6 +1133,7 @@ public:
   bool TimingEnabled() const { return timing_enabled_; }
 
   mfem::Operator& BaseOperator() const { return *base_; }
+  mfem::Operator& FaceOperator() const { return *face_; }
 
   void ResetTiming() const
   {
@@ -707,6 +1291,20 @@ private:
 };
 
 } // namespace
+
+const mfem::Operator* IGRSolver::GetLinearBaseOperator() const
+{
+  const auto* exact_sum =
+    dynamic_cast<const ExactFaceSumOperator*>(ActiveLinearOperator_());
+  return exact_sum ? &exact_sum->BaseOperator() : nullptr;
+}
+
+const mfem::Operator* IGRSolver::GetLinearFaceOperator() const
+{
+  const auto* exact_sum =
+    dynamic_cast<const ExactFaceSumOperator*>(ActiveLinearOperator_());
+  return exact_sum ? &exact_sum->FaceOperator() : nullptr;
+}
 
 void IGRSolver::BuildBilinearForm_()
 {
@@ -1151,6 +1749,17 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                                                        side_q,
                                                        &side_scratch);
     last_exact_face_local_nf_ = side_info.nf;
+    const bool ingestion_audit =
+      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false);
+    if (ingestion_audit)
+    {
+      LogFaceCoefficientAudit("local",
+                              side_q,
+                              alpha_,
+                              rho_floor_,
+                              linear_solve_calls_ + 1,
+                              vfes_.GetComm());
+    }
 
     mfem::Vector shared_side_q;
     dg_face::SharedFaceSideDensityProjectionScratch shared_side_scratch;
@@ -1184,6 +1793,15 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                                                        shared_side_q,
                                                        &shared_side_scratch);
       last_exact_face_shared_nf_ = shared_side_info.nf;
+      if (ingestion_audit)
+      {
+        LogFaceCoefficientAudit("shared",
+                                shared_side_q,
+                                alpha_,
+                                rho_floor_,
+                                linear_solve_calls_ + 1,
+                                vfes_.GetComm());
+      }
     }
 
     mfem::Operator* base_op =
@@ -1194,6 +1812,8 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     ExactL2DGFaceOperator* face_op = nullptr;
     const mfem::real_t face_kappa =
       static_cast<mfem::real_t>(IPDGPenalty(sfes_));
+    const dg_face::DGDiffusionFaceScaling face_scaling =
+      ReadIPDGFaceScaling();
     // Keep the stage-wise exact-face refresh on the original, fully rebuilt
     // path until the device qdata update kernel has an end-to-end parity test.
     // Reusing the geometry is an optimization, not a correctness requirement.
@@ -1205,7 +1825,8 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
       exact_face_ir,
       shared_side_q,
       static_cast<mfem::real_t>(ip_kind_),
-      face_kappa);
+      face_kappa,
+      face_scaling);
     face_op = dynamic_cast<ExactL2DGFaceOperator*>(
       exact_face_operator_.get());
     MFEM_VERIFY(face_op != nullptr,
@@ -1230,6 +1851,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                 << " qf_size=" << side_info.qf_size
                 << " shared_nf=" << shared_side_info.nf
                 << " shared_qf_size=" << shared_side_info.qf_size
+                << " face_scaling=" << IPDGFaceScalingName(face_scaling)
                 << " mode=local-and-shared-2d"
                 << std::endl;
     }
@@ -1341,6 +1963,58 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   auto* exact_face_sum_op = dynamic_cast<ExactFaceSumOperator*>(A_op);
 
   MPI_Comm comm = sfes_.GetComm();
+  const int operator_probe_every =
+    ReadEnvInt("DG_IGR_IGR_OPERATOR_PROBE_EVERY", 0);
+  const int operator_probe_start =
+    ReadEnvInt("DG_IGR_IGR_OPERATOR_PROBE_START", 1);
+  const int solve_call = linear_solve_calls_ + 1;
+  const int event_log_min_iters =
+    ReadEnvInt("DG_IGR_IGR_EVENT_LOG_MIN_ITERS", 0);
+  const char* event_capture_prefix_text =
+    std::getenv("DG_IGR_IGR_EVENT_CAPTURE_PREFIX");
+  const bool event_capture_enabled =
+    event_capture_prefix_text && event_capture_prefix_text[0] != '\0';
+  const int event_capture_min_iters =
+    ReadEnvInt("DG_IGR_IGR_EVENT_CAPTURE_MIN_ITERS",
+               event_log_min_iters > 0 ? event_log_min_iters : lin_maxit_);
+  const bool true_residual_requested =
+    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_TRUE_RESIDUAL", false);
+  const bool true_initial_residual_requested =
+    true_residual_requested && ::dg_igr::EnvFlagEnabledDefault(
+                                 "DG_IGR_IGR_TRUE_INITIAL_RESIDUAL", false);
+  const int extended_certificate_start =
+    ReadEnvInt("DG_IGR_IGR_EXTENDED_CERTIFICATE_START", 1000);
+  const double extended_certificate_factor =
+    ReadEnvReal("DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR", 5.0);
+  MFEM_VERIFY(extended_certificate_start > 0,
+              "DG_IGR_IGR_EXTENDED_CERTIFICATE_START must be positive.");
+  MFEM_VERIFY(extended_certificate_factor > 0.0,
+              "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR must be positive.");
+  const bool extended_certificate_enabled =
+    exact_face_sum_op && lin_maxit_ > extended_certificate_start;
+  const bool run_operator_probe =
+    operator_probe_every > 0 && solve_call >= operator_probe_start &&
+    (solve_call - operator_probe_start) % operator_probe_every == 0;
+  const int operator_probe_steps =
+    ReadEnvInt("DG_IGR_IGR_OPERATOR_PROBE_STEPS", 12);
+  if (run_operator_probe)
+  {
+    LogOperatorAlgebraProbe(
+      "full", solve_call, *A_op, comm, operator_probe_steps);
+    if (exact_face_sum_op)
+    {
+      LogOperatorAlgebraProbe("base",
+                              solve_call,
+                              exact_face_sum_op->BaseOperator(),
+                              comm,
+                              operator_probe_steps);
+      LogOperatorAlgebraProbe("face",
+                              solve_call,
+                              exact_face_sum_op->FaceOperator(),
+                              comm,
+                              operator_probe_steps);
+    }
+  }
   const bool is_dg = IsDGSpace(sfes_);
   const bool spd_ok = IsSPD_DefaultAssumption(sfes_, ip_kind_);
   const bool using_cuda = IsCudaBackendActive();
@@ -1351,6 +2025,18 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   last_linear_converged_ = false;
   last_linear_final_norm_ = std::numeric_limits<double>::quiet_NaN();
   last_linear_initial_norm_ = std::numeric_limits<double>::quiet_NaN();
+  last_linear_true_residual_abs_ =
+    std::numeric_limits<double>::quiet_NaN();
+  last_linear_true_residual_rel_rhs_ =
+    std::numeric_limits<double>::quiet_NaN();
+  last_linear_true_initial_residual_abs_ =
+    std::numeric_limits<double>::quiet_NaN();
+  last_linear_true_residual_rel_initial_ =
+    std::numeric_limits<double>::quiet_NaN();
+  last_linear_recomputed_preconditioned_initial_norm_ =
+    std::numeric_limits<double>::quiet_NaN();
+  last_linear_recomputed_preconditioned_final_norm_ =
+    std::numeric_limits<double>::quiet_NaN();
   last_linear_solve_seconds_ = 0.0;
   last_pc_setup_seconds_ = 0.0;
   last_chebyshev_diagonal_seconds_ = 0.0;
@@ -1570,7 +2256,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
         exact_face_sum_op &&
         ::dg_igr::EnvFlagEnabledDefault(
           "DG_IGR_IGR_CHEB_BASE_OPERATOR",
-          using_cuda);
+          false);
       mfem::Operator* cheb_op =
         use_base_operator
           ? &exact_face_sum_op->BaseOperator()
@@ -1662,6 +2348,13 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   last_pc_setup_seconds_ =
     std::chrono::duration<double>(pc_setup_stop - pc_setup_start).count();
   total_pc_setup_seconds_ += last_pc_setup_seconds_;
+  if (run_operator_probe && prec &&
+      ::dg_igr::EnvFlagEnabledDefault(
+        "DG_IGR_IGR_PRECONDITIONER_PROBE", false))
+  {
+    LogOperatorAlgebraProbe(
+      "preconditioner", solve_call, *prec, comm, operator_probe_steps);
+  }
   krylov_telemetry.ResetCounters();
 
   if (lin_print_ > 0)
@@ -1681,7 +2374,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   // If not, fall back to a cold-start solve to avoid poisoning Krylov with
   // stale/non-finite data.
   bool enable_warm_start = warm_start;
-  if (enable_warm_start && linear_solve_calls_ > 0)
+  if (enable_warm_start && GetProductionLinearSolveCalls() > 0)
   {
     if (!prev_linear_converged || !std::isfinite(prev_linear_final_norm))
     {
@@ -1707,6 +2400,11 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool is_intermediate_stage = (rk_stage_index_ >= 0 && rk_stage_index_ < 2);
   const double effective_rtol =
     is_intermediate_stage ? (lin_rtol_ * stage_rtol_scale_) : lin_rtol_;
+  mfem::Vector event_initial_guess;
+  if (event_capture_enabled || true_initial_residual_requested)
+  {
+    event_initial_guess = X_;
+  }
 
   std::unique_ptr<KrylovTelemetryOperator> solve_operator_telemetry;
   std::unique_ptr<KrylovTelemetryPreconditioner> telemetry_preconditioner;
@@ -1715,7 +2413,16 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   if (use_krylov_telemetry)
   {
     solve_operator_telemetry =
-      std::make_unique<KrylovTelemetryOperator>(*A_op, krylov_telemetry);
+      std::make_unique<KrylovTelemetryOperator>(
+        *A_op,
+        krylov_telemetry,
+        exact_face_sum_op ? &exact_face_sum_op->BaseOperator() : nullptr,
+        exact_face_sum_op ? &exact_face_sum_op->FaceOperator() : nullptr,
+        diagnostic_state_,
+        &sfes_,
+        &negative_quadratic_capture_written_,
+        comm,
+        solve_call);
     solve_operator = solve_operator_telemetry.get();
     if (prec)
     {
@@ -1723,6 +2430,31 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
         std::make_unique<KrylovTelemetryPreconditioner>(*prec,
                                                         krylov_telemetry);
       solve_preconditioner = telemetry_preconditioner.get();
+    }
+  }
+
+  if (true_initial_residual_requested)
+  {
+    mfem::Vector operator_initial(B_.Size());
+    mfem::Vector initial_residual(B_);
+    A_op->Mult(X_, operator_initial);
+    initial_residual -= operator_initial;
+    last_linear_true_initial_residual_abs_ =
+      OperatorProbeNorm(initial_residual, comm);
+    if (prec)
+    {
+      mfem::Vector preconditioned_initial(B_.Size());
+      prec->Mult(initial_residual, preconditioned_initial);
+      const double norm_squared =
+        OperatorProbeDot(initial_residual, preconditioned_initial, comm);
+      last_linear_recomputed_preconditioned_initial_norm_ =
+        norm_squared >= 0.0 ? std::sqrt(norm_squared)
+                            : std::numeric_limits<double>::quiet_NaN();
+    }
+    else
+    {
+      last_linear_recomputed_preconditioned_initial_norm_ =
+        last_linear_true_initial_residual_abs_;
     }
   }
 
@@ -1809,6 +2541,72 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   last_linear_solve_seconds_ =
     std::chrono::duration<double>(solve_stop - solve_start).count();
   total_linear_solve_seconds_ += last_linear_solve_seconds_;
+
+  const bool certify_extended_solve =
+    extended_certificate_enabled &&
+    last_linear_iters_ >= extended_certificate_start;
+  if (true_residual_requested || certify_extended_solve)
+  {
+    mfem::Vector residual(B_);
+    mfem::Vector operator_solution(B_.Size());
+    A_op->Mult(X_, operator_solution);
+    residual -= operator_solution;
+    last_linear_true_residual_abs_ = OperatorProbeNorm(residual, comm);
+    const double rhs_norm = OperatorProbeNorm(B_, comm);
+    last_linear_true_residual_rel_rhs_ =
+      last_linear_true_residual_abs_ / std::max(rhs_norm, 1.0e-300);
+    last_linear_true_residual_rel_initial_ =
+      last_linear_true_residual_abs_ /
+      std::max(last_linear_true_initial_residual_abs_, 1.0e-300);
+    if (true_residual_requested)
+    {
+      if (prec)
+      {
+        mfem::Vector preconditioned_residual(B_.Size());
+        prec->Mult(residual, preconditioned_residual);
+        const double norm_squared =
+          OperatorProbeDot(residual, preconditioned_residual, comm);
+        last_linear_recomputed_preconditioned_final_norm_ =
+          norm_squared >= 0.0 ? std::sqrt(norm_squared)
+                              : std::numeric_limits<double>::quiet_NaN();
+      }
+      else
+      {
+        last_linear_recomputed_preconditioned_final_norm_ =
+          last_linear_true_residual_abs_;
+      }
+    }
+  }
+  bool extended_certificate_passed = true;
+  if (certify_extended_solve)
+  {
+    const double certificate_limit =
+      extended_certificate_factor * effective_rtol;
+    extended_certificate_passed =
+      std::isfinite(last_linear_true_residual_rel_rhs_) &&
+      last_linear_true_residual_rel_rhs_ <= certificate_limit;
+    if (!extended_certificate_passed)
+    {
+      last_linear_converged_ = false;
+    }
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[igr-linear] event=extended-residual-certificate"
+                << " solve_call=" << solve_call
+                << " rk_step=" << rk_step_index_
+                << " rk_stage=" << rk_stage_index_
+                << " iterations=" << last_linear_iters_
+                << " start=" << extended_certificate_start
+                << " factor=" << extended_certificate_factor
+                << " limit=" << certificate_limit
+                << " true_residual_rel_rhs="
+                << last_linear_true_residual_rel_rhs_
+                << " true_residual_rel_initial="
+                << last_linear_true_residual_rel_initial_
+                << " passed=" << (extended_certificate_passed ? 1 : 0)
+                << std::endl;
+    }
+  }
   last_krylov_operator_apply_seconds_ =
     krylov_telemetry.operator_apply_seconds;
   last_krylov_preconditioner_apply_seconds_ =
@@ -1851,6 +2649,121 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                               : (using_operator_jacobi
                                    ? "operatorjacobi"
                                    : PrecondTypeName(prec_choice)));
+
+  const bool capture_linear_event =
+    event_capture_enabled && !linear_event_capture_written_ &&
+    (!last_linear_converged_ || last_linear_iters_ >= event_capture_min_iters);
+  if (capture_linear_event)
+  {
+    SaveLinearEventCapture(event_capture_prefix_text,
+                           solve_call,
+                           rk_step_index_,
+                           rk_stage_index_,
+                           current_time_,
+                           current_dt_,
+                           *diagnostic_state_,
+                           sfes_,
+                           B_,
+                           event_initial_guess,
+                           X_,
+                           last_linear_iters_,
+                           last_linear_converged_,
+                           last_linear_initial_norm_,
+                           last_linear_final_norm_,
+                           last_linear_true_initial_residual_abs_,
+                           last_linear_true_residual_abs_,
+                           last_linear_true_residual_rel_rhs_,
+                           last_linear_true_residual_rel_initial_,
+                           last_linear_recomputed_preconditioned_initial_norm_,
+                           last_linear_recomputed_preconditioned_final_norm_,
+                           effective_rtol,
+                           warm_start,
+                           enable_warm_start,
+                           last_linear_solver_name_,
+                           last_precond_name_,
+                           last_chebyshev_eigenvalue_estimate_);
+    linear_event_capture_written_ = true;
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[igr-linear] event=solve-capture"
+                << " solve_call=" << solve_call
+                << " capture_dir=" << event_capture_prefix_text << "/solve-"
+                << solve_call << std::endl;
+    }
+  }
+
+  const bool log_linear_event =
+    !last_linear_converged_ ||
+    (event_log_min_iters > 0 && last_linear_iters_ >= event_log_min_iters);
+  if (log_linear_event && mfem::Mpi::Root())
+  {
+    std::cout << "[igr-linear] event=solve"
+              << " solve_call=" << solve_call
+              << " purpose="
+              << (current_solve_purpose_ == IGRSolvePurpose::OutputOnly
+                    ? "output-only"
+                    : (current_solve_purpose_ ==
+                           IGRSolvePurpose::ProductionStage0Prefetch
+                         ? "stage0-prefetch"
+                         : "stage"))
+              << " rk_step=" << rk_step_index_
+              << " rk_stage=" << rk_stage_index_
+              << " time=" << current_time_
+              << " dt=" << current_dt_
+              << " iters=" << last_linear_iters_
+              << " converged=" << (last_linear_converged_ ? 1 : 0)
+              << " reported_initial_norm=" << last_linear_initial_norm_
+              << " reported_final_norm=" << last_linear_final_norm_
+              << " true_initial_residual_abs="
+              << last_linear_true_initial_residual_abs_
+              << " true_residual_abs=" << last_linear_true_residual_abs_
+              << " true_residual_rel_rhs="
+              << last_linear_true_residual_rel_rhs_
+              << " true_residual_rel_initial="
+              << last_linear_true_residual_rel_initial_
+              << " recomputed_preconditioned_initial_norm="
+              << last_linear_recomputed_preconditioned_initial_norm_
+              << " recomputed_preconditioned_final_norm="
+              << last_linear_recomputed_preconditioned_final_norm_
+              << " effective_rtol=" << effective_rtol
+              << " warm_requested=" << (warm_start ? 1 : 0)
+              << " warm_effective=" << (enable_warm_start ? 1 : 0)
+              << " solver=" << last_linear_solver_name_
+              << " preconditioner=" << last_precond_name_
+              << " cheb_eigen=" << last_chebyshev_eigenvalue_estimate_
+              << std::endl;
+  }
+
+  if (!last_linear_converged_)
+  {
+    if (nonconvergence_policy_ == NonconvergencePolicy::Accept)
+    {
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[igr-linear] event=nonconvergence-policy"
+                  << " policy=accept"
+                  << " solve_call=" << solve_call
+                  << " rk_step=" << rk_step_index_
+                  << " rk_stage=" << rk_stage_index_
+                  << " time=" << current_time_
+                  << " iters=" << last_linear_iters_
+                  << " action=recover-max-iteration-iterate"
+                  << std::endl;
+      }
+    }
+    else
+    {
+      MFEM_ABORT("IGR linear solve did not converge: solve_call="
+                 << solve_call << " rk_step=" << rk_step_index_
+                 << " rk_stage=" << rk_stage_index_ << " time="
+                 << current_time_ << " iterations=" << last_linear_iters_
+                 << " solver=" << last_linear_solver_name_
+                 << " preconditioner=" << last_precond_name_
+                 << ". The failed iterate was not recovered into sigma. "
+                    "Use --igr-nonconvergence-policy accept only for an "
+                    "explicit diagnostic legacy replay.");
+    }
+  }
 
   if (exact_face_sum_op)
   {
