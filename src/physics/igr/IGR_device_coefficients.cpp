@@ -580,35 +580,39 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
     LogScalarQuadratureAudit("rhs_source", *src_qf_, solve_call, comm);
   }
 
-  if (!device_coeff_logged_ && mfem::Mpi::Root())
+  if (!device_coeff_logged_)
   {
-    const bool u_mass_ok = VectorIsFinite(*u_mass_qf_);
-    const bool u_diff_ok = VectorIsFinite(*u_qf_);
-    const bool u_rhs_ok = VectorIsFinite(*u_rhs_qf_);
-    const bool grad_diff_ok = VectorIsFinite(*grad_u_qf_);
-    const bool grad_rhs_ok = VectorIsFinite(*grad_u_rhs_qf_);
-    const bool invrho_ok = VectorIsFinite(*invrho_qf_);
-    const bool ck_ok = VectorIsFinite(*ck_qf_);
-    const bool src_ok = VectorIsFinite(*src_qf_);
-    std::cout << "[igr-linear] event=device-qf-finite"
-              << " u_mass=" << (u_mass_ok ? 1 : 0)
-              << " u_diff=" << (u_diff_ok ? 1 : 0)
-              << " u_rhs=" << (u_rhs_ok ? 1 : 0)
-              << " grad_diff=" << (grad_diff_ok ? 1 : 0)
-              << " grad_rhs=" << (grad_rhs_ok ? 1 : 0)
-              << " invrho=" << (invrho_ok ? 1 : 0)
-              << " ck=" << (ck_ok ? 1 : 0)
-              << " src=" << (src_ok ? 1 : 0) << "\n";
-    if (!(u_mass_ok && u_diff_ok && u_rhs_ok && grad_diff_ok &&
-          grad_rhs_ok && invrho_ok && ck_ok && src_ok))
+    const MPI_Comm comm = vfes_.GetComm();
+    int finite[8] = {VectorIsFinite(*u_mass_qf_) ? 1 : 0,
+                     VectorIsFinite(*u_qf_) ? 1 : 0,
+                     VectorIsFinite(*u_rhs_qf_) ? 1 : 0,
+                     VectorIsFinite(*grad_u_qf_) ? 1 : 0,
+                     VectorIsFinite(*grad_u_rhs_qf_) ? 1 : 0,
+                     VectorIsFinite(*invrho_qf_) ? 1 : 0,
+                     VectorIsFinite(*ck_qf_) ? 1 : 0,
+                     VectorIsFinite(*src_qf_) ? 1 : 0};
+    MPI_Allreduce(MPI_IN_PLACE, finite, 8, MPI_INT, MPI_MIN, comm);
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[igr-linear] event=device-qf-finite"
+                << " u_mass=" << finite[0]
+                << " u_diff=" << finite[1]
+                << " u_rhs=" << finite[2]
+                << " grad_diff=" << finite[3]
+                << " grad_rhs=" << finite[4]
+                << " invrho=" << finite[5]
+                << " ck=" << finite[6]
+                << " src=" << finite[7] << "\n";
+    }
+    if (!(finite[0] && finite[1] && finite[2] && finite[3] && finite[4] &&
+          finite[5] && finite[6] && finite[7]))
     {
       MFEM_ABORT("IGR device quadrature data contains non-finite values.");
     }
 
-    mfem::Vector inv_vals, ck_vals, src_vals;
-    invrho_qf_->GetValues(0, inv_vals);
-    ck_qf_->GetValues(0, ck_vals);
-    src_qf_->GetValues(0, src_vals);
+    const mfem::Vector& inv_vals = *invrho_qf_;
+    const mfem::Vector& ck_vals = *ck_qf_;
+    const mfem::Vector& src_vals = *src_qf_;
     auto host_minmax = [](const mfem::Vector& v, double& vmin, double& vmax)
     {
       const double* data = v.HostRead();
@@ -627,15 +631,25 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
     host_minmax(inv_vals, inv_min, inv_max);
     host_minmax(ck_vals, ck_min, ck_max);
     host_minmax(src_vals, src_min, src_max);
-    std::cout << "[igr-linear] event=device-qf-range"
-              << " invrho_min=" << inv_min
-              << " invrho_max=" << inv_max
-              << " ck_min=" << ck_min
-              << " ck_max=" << ck_max
-              << " src_min=" << src_min
-              << " src_max=" << src_max << "\n";
+    MPI_Allreduce(MPI_IN_PLACE, &inv_min, 1, MPI_DOUBLE, MPI_MIN, comm);
+    MPI_Allreduce(MPI_IN_PLACE, &inv_max, 1, MPI_DOUBLE, MPI_MAX, comm);
+    MPI_Allreduce(MPI_IN_PLACE, &ck_min, 1, MPI_DOUBLE, MPI_MIN, comm);
+    MPI_Allreduce(MPI_IN_PLACE, &ck_max, 1, MPI_DOUBLE, MPI_MAX, comm);
+    MPI_Allreduce(MPI_IN_PLACE, &src_min, 1, MPI_DOUBLE, MPI_MIN, comm);
+    MPI_Allreduce(MPI_IN_PLACE, &src_max, 1, MPI_DOUBLE, MPI_MAX, comm);
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[igr-linear] event=device-qf-range"
+                << " invrho_min=" << inv_min
+                << " invrho_max=" << inv_max
+                << " ck_min=" << ck_min
+                << " ck_max=" << ck_max
+                << " src_min=" << src_min
+                << " src_max=" << src_max << "\n";
+    }
 
-    if (inv_vals.Size() > 0 && ck_vals.Size() > 0 && src_vals.Size() > 0)
+    if (mfem::Mpi::Root() && inv_vals.Size() > 0 && ck_vals.Size() > 0 &&
+        src_vals.Size() > 0)
     {
       const mfem::real_t inv_q = inv_vals(0);
       const mfem::real_t ck_q = ck_vals(0);
