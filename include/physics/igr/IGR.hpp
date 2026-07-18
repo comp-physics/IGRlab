@@ -166,7 +166,8 @@ public:
   void UpdateFromState(
     const mfem::ParGridFunction& U,
     bool warm_start,
-    IGRSolvePurpose purpose = IGRSolvePurpose::ProductionStage);
+    IGRSolvePurpose purpose = IGRSolvePurpose::ProductionStage,
+    bool certify_residual = false);
   void ConsumePendingStage0PrefetchAccounting();
   bool ReclassifyPendingStage0PrefetchAsOutputOnly(
     bool restore_warm_start = true);
@@ -764,6 +765,7 @@ private:
   int max_linear_iters_ = 0;
   int total_linear_converged_calls_ = 0;
   IGRSolvePurpose current_solve_purpose_ = IGRSolvePurpose::ProductionStage;
+  bool certify_current_solve_ = false;
   int output_only_linear_solve_calls_ = 0;
   int output_only_linear_iters_ = 0;
   int output_only_linear_converged_calls_ = 0;

@@ -133,6 +133,7 @@ app_cmake_args=(
   -DCMAKE_CXX_COMPILER="${MPI_PREFIX}/bin/mpicxx"
   -DCMAKE_INSTALL_PREFIX="${APP_INSTALL}"
   -DMFEM_DIR="${MFEM_INSTALL}/lib/cmake/mfem"
+  -DZLIB_ROOT="${SPACK_VIEW}"
 )
 if [[ "${MODE}" == "gpu" ]]; then
   CUDA_PREFIX="$(spack -e "${SPACK_ENV}" location -i cuda)"

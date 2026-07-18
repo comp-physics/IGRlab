@@ -61,6 +61,9 @@ struct CommonOptions
   bool nan_scan = false; ///< Enable NaN/inf scanning during the time loop.
   bool admissibility_scan =
     false; ///< Enable Euler density/pressure admissibility scans during the time loop.
+  std::string restart_vtk; ///< PVD file or dataset directory to restart from.
+  int restart_cycle = -1;  ///< Selected PVD cycle; -1 selects the latest cycle.
+  int restart_step = -1;   ///< Completed global step for legacy VTK cycles.
 };
 
 /**
@@ -218,6 +221,18 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "--no-admissibility-scan",
                  "Enable or disable Euler density/pressure admissibility "
                  "scans during time integration.");
+  args.AddOption(&opts.restart_vtk,
+                 "-restart-vtk",
+                 "--restart-vtk",
+                 "Restart from an MFEM ParaView PVD file or dataset directory.");
+  args.AddOption(&opts.restart_cycle,
+                 "-restart-cycle",
+                 "--restart-cycle",
+                 "Restart cycle (-1 selects the latest complete cycle).");
+  args.AddOption(&opts.restart_step,
+                 "-restart-step",
+                 "--restart-step",
+                 "Completed global RK step for legacy cycles without a manifest.");
 }
 
 /**

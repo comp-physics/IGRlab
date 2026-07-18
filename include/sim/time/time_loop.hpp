@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <string>
 
 #include "mfem.hpp"
 #include "utils/diagnostics/non_finite.hpp"
@@ -33,6 +35,9 @@ struct TimeLoopConfig
   mfem::real_t dt_save = 0.0;
   bool nan_scan = false;
   int save_index_offset = 0;
+  mfem::real_t initial_time = 0.0;
+  int initial_step = 0;
+  mfem::real_t next_save_time = -1.0;
 };
 
 /**
@@ -54,6 +59,8 @@ struct TimeLoopHooks
 struct TimeLoopResult
 {
   int steps = 0;
+  int segment_steps = 0;
+  mfem::real_t initial_time = 0.0;
   mfem::real_t final_time = 0.0;
   int non_finite_count = 0;
   bool dt_min_reached = false;
@@ -112,8 +119,33 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
                            const TimeLoopHooks& hooks = {})
 {
   TimeLoopResult result;
-  mfem::real_t t = 0.0;
+  MFEM_VERIFY(cfg.initial_step >= 0, "Initial global step must be nonnegative.");
+  MFEM_VERIFY(std::isfinite(cfg.initial_time), "Initial time must be finite.");
+  MFEM_VERIFY(cfg.t_final >= cfg.initial_time,
+              "Final time must not precede the initial/restart time.");
+  mfem::real_t t = cfg.initial_time;
+  result.steps = cfg.initial_step;
+  result.initial_time = t;
+  result.final_time = t;
   const mfem::real_t dt_min = std::max<mfem::real_t>(0.0, cfg.dt_min);
+  const char* dt_trace_text = std::getenv("DG_IGR_TIME_DT_TRACE");
+  const bool trace_nominal_dt =
+    dt_trace_text != nullptr && std::string(dt_trace_text) != "0" &&
+    std::string(dt_trace_text) != "false";
+  auto TraceNominalDt = [&](const char* stage,
+                            int step,
+                            mfem::real_t time,
+                            mfem::real_t value)
+  {
+    if (trace_nominal_dt && mfem::Mpi::Root())
+    {
+      std::cout << "[time-loop] event=nominal-dt"
+                << " stage=" << stage
+                << " step=" << step
+                << " time=" << time
+                << " dt=" << value << "\n";
+    }
+  };
 
   auto CheckDtMinimum = [&](mfem::real_t dt_value, const char* stage) -> bool
   {
@@ -142,6 +174,7 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
     hmin = ComputeGlobalHMin(pmesh);
     dt = ComputeCFLDt(op, pmesh, sol, cfg.cfl, cfg.order, hmin);
   }
+  TraceNominalDt("initial", cfg.initial_step, t, dt);
   if (!std::isfinite(dt))
   {
     if (mfem::Mpi::Root())
@@ -163,10 +196,13 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
 
   int save_idx = cfg.save_index_offset;
   mfem::real_t t_next_save =
-    (cfg.vtk_save && cfg.dt_save > 0.0) ? cfg.dt_save : 0.0;
+    (cfg.vtk_save && cfg.dt_save > 0.0)
+      ? ((cfg.next_save_time > cfg.initial_time) ? cfg.next_save_time
+                                                 : cfg.initial_time + cfg.dt_save)
+      : 0.0;
 
   bool done = false;
-  for (int step = 0; !done; ++step)
+  for (int segment_step = 0; !done; ++segment_step)
   {
     mfem::real_t dt_real_base = std::min(dt, cfg.t_final - t);
     mfem::real_t dt_real = dt_real_base;
@@ -235,6 +271,7 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       {
         dt = cfg.cfl * hmin / (2 * cfg.order + 1);
       }
+      TraceNominalDt("update", cfg.initial_step + segment_step + 1, t, dt);
       if (!std::isfinite(dt))
       {
         if (mfem::Mpi::Root())
@@ -252,7 +289,8 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       }
       if (CheckDtMinimum(dt, "after-cfl-update"))
       {
-        result.steps = step + 1;
+        result.segment_steps = segment_step + 1;
+        result.steps = cfg.initial_step + result.segment_steps;
         result.final_time = t;
         done = true;
         if (cfg.vtk_save && hooks.on_save)
@@ -263,7 +301,8 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       }
     }
 
-    result.steps = step + 1;
+    result.segment_steps = segment_step + 1;
+    result.steps = cfg.initial_step + result.segment_steps;
     result.final_time = t;
     done = (t >= cfg.t_final - 1e-8 * std::abs(dt));
 

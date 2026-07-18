@@ -59,9 +59,13 @@ endif()
 target_include_directories(igr_mfem PUBLIC 
     ${CMAKE_SOURCE_DIR}/include
 )
+target_include_directories(igr_mfem PRIVATE
+    ${CMAKE_SOURCE_DIR}/tpl/mfem/fem
+    ${CMAKE_SOURCE_DIR}/tpl/mfem/general
+)
 
 # Link MFEM
-target_link_libraries(igr_mfem PUBLIC mfem)
+target_link_libraries(igr_mfem PUBLIC mfem ZLIB::ZLIB)
 if(MFEM_USE_MPI)
     target_link_libraries(igr_mfem PUBLIC MPI::MPI_CXX)
     if(DG_IGR_MPI_INCLUDE_DIRS)

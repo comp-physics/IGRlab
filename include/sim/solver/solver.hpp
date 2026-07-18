@@ -11,6 +11,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "mfem.hpp"
@@ -25,6 +26,7 @@
 #include "sim/io/run_metadata.hpp"
 #include "sim/io/vis_helpers.hpp"
 #include "sim/io/vtk_helpers.hpp"
+#include "sim/io/vtk_restart.hpp"
 #include "sim/state/euler_state_bundle.hpp"
 #include "sim/solver/solver_helpers.hpp"
 #include "sim/time/time_defaults.hpp"
@@ -38,6 +40,22 @@ namespace dg_sim
 
 namespace detail
 {
+
+inline std::string MakeEulerOutputDatasetName(
+  const CaseConfig& case_cfg,
+  const RunConfig& run_cfg,
+  double c_alpha_value,
+  const VTKRestartInfo* restart_info)
+{
+  std::string name =
+    MakeCaseVTKDatasetName(case_cfg, run_cfg, c_alpha_value);
+  if (restart_info)
+  {
+    name += "_restart_c" + std::to_string(restart_info->cycle) + "_s" +
+            std::to_string(restart_info->step);
+  }
+  return name;
+}
 
 inline void VerifyDGSEMElementGeometry(const mfem::Mesh& mesh)
 {
@@ -107,41 +125,68 @@ RunEulerCase(ExampleContext& ctx,
              OnOpenCallback&& on_open_callback,
              RunSummary* summary_out = nullptr,
              double c_alpha_value = std::numeric_limits<double>::quiet_NaN(),
-             bool print_dataset_name = false)
+             bool print_dataset_name = false,
+             const VTKRestartInfo* restart_info = nullptr)
 {
+  const mfem::real_t initial_time = restart_info ? restart_info->time : 0.0;
+  MFEM_VERIFY(!restart_info ||
+                restart_info->step <= std::numeric_limits<int>::max(),
+              "Restart step exceeds the supported time-loop counter range.");
+  const int initial_step = restart_info ? static_cast<int>(restart_info->step) : 0;
+  const int initial_cycle = restart_info ? restart_info->cycle : 0;
   rk3.Init(op);
+  rk3.SetStepCount(initial_step);
   auto* sigma_provider = dynamic_cast<mfem::IGRSigmaStateProvider*>(&op);
 
   EulerOutputFieldTiming initial_field_timing;
   double initial_sigma_prepare_s = 0.0;
-  if (sigma_provider && (run_cfg.opts.vtk_save || glvis_enabled))
+  mfem::IGRSigmaPreparationResult initial_sigma_preparation;
+  if (sigma_provider &&
+      (restart_info || run_cfg.opts.vtk_save || glvis_enabled))
   {
     const auto prepare_start = std::chrono::steady_clock::now();
-    sigma_provider->PrepareSigmaForOutput(bundle.sol,
-                                          rk3.GetStateGeneration(),
-                                          /*next_rk_step=*/0,
-                                          /*time=*/0.0,
-                                          /*reusable_stage0=*/true);
+    initial_sigma_preparation = sigma_provider->PrepareSigmaForOutput(
+      bundle.sol,
+      rk3.GetStateGeneration(),
+      initial_step,
+      initial_time,
+      /*reusable_stage0=*/true,
+      /*cold_start=*/restart_info != nullptr,
+      /*certify_residual=*/restart_info != nullptr);
     initial_sigma_prepare_s = SecondsSince(prepare_start);
+  }
+  if (restart_info && sigma_provider && mfem::Mpi::Root())
+  {
+    std::cout << "[vtk-restart] event=sigma-initialization"
+              << " solved=" << (initial_sigma_preparation.solved ? 1 : 0)
+              << " cold_start=1"
+              << " reusable_stage0="
+              << (initial_sigma_preparation.reusable_stage0 ? 1 : 0)
+              << " independent_residual_certified="
+              << (initial_sigma_preparation.independent_residual_certified ? 1
+                                                                          : 0)
+              << " independent_residual_rel_rhs="
+              << initial_sigma_preparation.independent_residual_rel_rhs
+              << "\n";
   }
   UpdateEulerOutputFields(bundle.field_list, &initial_field_timing);
   initial_field_timing.igr_update_s = initial_sigma_prepare_s;
   initial_field_timing.total_s += initial_sigma_prepare_s;
   const double initial_update_fields_s = initial_field_timing.total_s;
   PrintVTKOutputTiming("initial-fields",
-                       /*cycle=*/0,
-                       /*step=*/0,
-                       /*t=*/0.0,
-                       /*is_initial=*/true,
+                       initial_cycle,
+                       initial_step,
+                       initial_time,
+                       /*is_initial=*/restart_info == nullptr,
                        /*is_final=*/false,
                        initial_update_fields_s,
                        /*paraview_save_s=*/0.0,
                        ctx.Mesh().GetComm());
   PrintVTKOutputFieldTiming("initial-fields",
-                            /*cycle=*/0,
-                            /*step=*/0,
-                            /*t=*/0.0,
-                            /*is_initial=*/true,
+                            initial_cycle,
+                            initial_step,
+                            initial_time,
+                            /*is_initial=*/restart_info == nullptr,
                             /*is_final=*/false,
                             initial_field_timing,
                             ctx.Mesh().GetComm());
@@ -176,38 +221,52 @@ RunEulerCase(ExampleContext& ctx,
     }
   }
 
-  const std::string dc_name =
-    MakeCaseVTKDatasetName(case_cfg, run_cfg, c_alpha_value);
+  const std::string dc_name = detail::MakeEulerOutputDatasetName(
+    case_cfg, run_cfg, c_alpha_value, restart_info);
   auto paraview_dc =
     std::make_unique<mfem::ParaViewDataCollection>(dc_name, &ctx.Mesh());
+  const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
+  const std::string dataset_dir =
+    (std::filesystem::path(vtk_cfg.prefix_path) / dc_name).string();
   if (run_cfg.opts.vtk_save)
   {
     RegisterEulerVTKFields(*paraview_dc, bundle.field_list);
-    const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
     ApplyCaseVTKConfig(*paraview_dc, vtk_cfg, run_cfg.opts.order);
-    paraview_dc->SetCycle(0);
-    paraview_dc->SetTime(0.0);
-    const auto initial_save_start = std::chrono::steady_clock::now();
-    paraview_dc->Save();
-    const double initial_save_s = SecondsSince(initial_save_start);
-    PrintVTKOutputTiming("initial-save",
-                         /*cycle=*/0,
-                         /*step=*/0,
-                         /*t=*/0.0,
-                         /*is_initial=*/true,
-                         /*is_final=*/false,
-                         /*update_fields_s=*/0.0,
-                         initial_save_s,
-                         ctx.Mesh().GetComm());
-    if (callbacks.on_vtk_save)
+    if (!restart_info)
     {
-      VTKSaveInfo info;
-      info.cycle = 0;
-      info.step = 0;
-      info.t = 0.0;
-      info.is_initial = true;
-      info.is_final = false;
-      callbacks.on_vtk_save(info);
+      paraview_dc->SetCycle(0);
+      paraview_dc->SetTime(0.0);
+      const auto initial_save_start = std::chrono::steady_clock::now();
+      paraview_dc->Save();
+      const double initial_save_s = SecondsSince(initial_save_start);
+      WriteVTKRestartManifest(dataset_dir,
+                              dc_name,
+                              0,
+                              0.0,
+                              0,
+                              run_cfg,
+                              ctx,
+                              bundle.field_list.sigma != nullptr,
+                              paraview_dc->GetCompressionLevel());
+      PrintVTKOutputTiming("initial-save",
+                           /*cycle=*/0,
+                           /*step=*/0,
+                           /*t=*/0.0,
+                           /*is_initial=*/true,
+                           /*is_final=*/false,
+                           /*update_fields_s=*/0.0,
+                           initial_save_s,
+                           ctx.Mesh().GetComm());
+      if (callbacks.on_vtk_save)
+      {
+        VTKSaveInfo info;
+        info.cycle = 0;
+        info.step = 0;
+        info.t = 0.0;
+        info.is_initial = true;
+        info.is_final = false;
+        callbacks.on_vtk_save(info);
+      }
     }
     if (mfem::Mpi::Root())
     {
@@ -225,6 +284,28 @@ RunEulerCase(ExampleContext& ctx,
   io.glvis_windows = &glvis_windows;
   io.glvis_enabled = &glvis_enabled;
   io.paraview = paraview_dc.get();
+  if (run_cfg.opts.vtk_save)
+  {
+    io.after_vtk_save = [&run_cfg,
+                         &ctx,
+                         dataset_dir,
+                         dc_name,
+                         sigma_saved = bundle.field_list.sigma != nullptr,
+                         vtk_compression_level =
+                           paraview_dc->GetCompressionLevel()](
+                          int step, mfem::real_t t, int cycle)
+    {
+      WriteVTKRestartManifest(dataset_dir,
+                              dc_name,
+                              cycle,
+                              t,
+                              step,
+                              run_cfg,
+                              ctx,
+                              sigma_saved,
+                              vtk_compression_level);
+    };
+  }
   if (sigma_provider)
   {
     io.prepare_sigma = [sigma_provider, &bundle, &rk3](int,
@@ -245,12 +326,24 @@ RunEulerCase(ExampleContext& ctx,
   TimeLoopConfig loop_cfg = MakeTimeLoopConfig(run_cfg);
   if (run_cfg.opts.vtk_save)
   {
-    loop_cfg.save_index_offset = 1;
+    loop_cfg.save_index_offset = restart_info ? restart_info->cycle + 1 : 1;
   }
+  loop_cfg.initial_time = initial_time;
+  loop_cfg.initial_step = initial_step;
+  loop_cfg.next_save_time =
+    (run_cfg.opts.vtk_save && run_cfg.opts.dt_save > 0.0)
+      ? initial_time + run_cfg.opts.dt_save
+      : -1.0;
   const int num_procs = mfem::Mpi::WorldSize();
   const int my_rank = mfem::Mpi::WorldRank();
   const TimeLoopHooks hooks =
-    MakeEulerTimeLoopHooks(ctx, bundle, num_procs, my_rank, io, callbacks);
+    MakeEulerTimeLoopHooks(ctx,
+                           bundle,
+                           num_procs,
+                           my_rank,
+                           io,
+                           callbacks,
+                           initial_step);
   const TimeLoopResult result =
     RunTimeLoop(op, ctx.Mesh(), bundle.sol, rk3, loop_cfg, hooks);
   if (sigma_provider && mfem::Mpi::Root())
@@ -307,7 +400,8 @@ RunEulerCase(ExampleContext& ctx,
              int precision,
              RunSummary* summary_out = nullptr,
              double c_alpha_value = std::numeric_limits<double>::quiet_NaN(),
-             bool print_dataset_name = false)
+             bool print_dataset_name = false,
+             const VTKRestartInfo* restart_info = nullptr)
 {
   return RunEulerCase(
     ctx,
@@ -322,7 +416,8 @@ RunEulerCase(ExampleContext& ctx,
     []() {},
     summary_out,
     c_alpha_value,
-    print_dataset_name);
+    print_dataset_name,
+    restart_info);
 }
 
 struct Solver
@@ -363,6 +458,9 @@ struct Solver
       spec.add_options(args, case_opts);
     }
     args.ParseCheck();
+    MFEM_VERIFY(!cli_opts.restart_vtk.empty() ||
+                  (cli_opts.restart_cycle < 0 && cli_opts.restart_step < 0),
+                "--restart-cycle/--restart-step require --restart-vtk.");
     ApplyIGRDerivedRuntimeDefaults(cli_opts,
                                    cli_igr_opts,
                                    HasExactDGFaceOptionOverride(argc, argv));
@@ -507,7 +605,47 @@ struct Solver
     {
       state_bundle.AttachIGR(*igr);
     }
-    state_bundle.ProjectIC(*ic);
+    std::optional<VTKRestartInfo> restart_info;
+    if (run_cfg.opts.restart_vtk.empty())
+    {
+      state_bundle.ProjectIC(*ic);
+    }
+    else
+    {
+      VTKRestartRequest request;
+      request.path = run_cfg.opts.restart_vtk;
+      request.cycle = run_cfg.opts.restart_cycle;
+      request.legacy_step = run_cfg.opts.restart_step;
+      restart_info = LoadEulerVTKRestart(
+        request, run_cfg, ctx, state_bundle.sol, igr != nullptr);
+      MFEM_VERIFY(run_cfg.opts.t_final > restart_info->time,
+                  "-tf/--t-final must be greater than the restart time "
+                    << restart_info->time << ".");
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[vtk-restart] source=" << restart_info->pvd_path
+                  << " cycle=" << restart_info->cycle
+                  << " time=" << restart_info->time
+                  << " step=" << restart_info->step
+                  << " legacy=" << (restart_info->legacy ? 1 : 0)
+                  << " ranks=" << mfem::Mpi::WorldSize()
+                  << " reconstruction_max_abs="
+                  << restart_info->reconstruction_max_abs
+                  << " reconstruction_rel_l2="
+                  << restart_info->reconstruction_rel_l2
+                  << " mesh_point_max_abs="
+                  << restart_info->mesh_point_max_abs
+                  << " condition_inf="
+                  << restart_info->interpolation_condition_inf
+                  << " rho_min=" << restart_info->density_min
+                  << " p_min=" << restart_info->pressure_min
+                  << " sigma_policy=cold-recompute"
+                  << " output_mode=new"
+                  << " next_cycle=" << restart_info->cycle + 1
+                  << " next_time=" << restart_info->time + run_cfg.opts.dt_save
+                  << " load_seconds=" << restart_info->load_seconds << "\n";
+      }
+    }
 
     TimeLoopCallbacks callbacks =
       spec.make_callbacks
@@ -555,14 +693,18 @@ struct Solver
       spec.after_init(case_opts, ctx, state_bundle);
     }
 
+    const std::string output_dataset_name = detail::MakeEulerOutputDatasetName(
+      case_cfg,
+      run_cfg,
+      vtk_c_alpha,
+      restart_info ? &*restart_info : nullptr);
+
     std::string state_snapshot_dir;
     if (run_cfg.opts.save_state_files)
     {
       const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
-      const std::string dataset_name =
-        MakeCaseVTKDatasetName(case_cfg, run_cfg, vtk_c_alpha);
       state_snapshot_dir = (std::filesystem::path(vtk_cfg.prefix_path) /
-                            dataset_name / "glvis_state")
+                            output_dataset_name / "glvis_state")
                              .string();
       SaveInitialEulerState(ctx,
                             state_bundle.sol,
@@ -607,6 +749,7 @@ struct Solver
        &spec,
        &on_open,
        &captured_summary,
+       &restart_info,
        vtk_c_alpha](auto& op)
       {
         return RunEulerCase(ctx,
@@ -621,7 +764,8 @@ struct Solver
                             on_open,
                             &captured_summary,
                             vtk_c_alpha,
-                            spec.vtk.print_dataset_name);
+                            spec.vtk.print_dataset_name,
+                            restart_info ? &*restart_info : nullptr);
       });
     captured_summary_valid = ok;
 
@@ -635,7 +779,9 @@ struct Solver
                               vtk_c_alpha,
                               argc,
                               argv,
-                              /*success=*/false);
+                              /*success=*/false,
+                              output_dataset_name,
+                              restart_info ? &*restart_info : nullptr);
       return 2;
     }
 
@@ -833,7 +979,9 @@ struct Solver
                             vtk_c_alpha,
                             argc,
                             argv,
-                            /*success=*/true);
+                            /*success=*/true,
+                            output_dataset_name,
+                            restart_info ? &*restart_info : nullptr);
 
     if (spec.postprocess)
     {

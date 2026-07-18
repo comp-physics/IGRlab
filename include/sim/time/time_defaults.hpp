@@ -35,6 +35,7 @@ struct TimeLoopIO
   mfem::ParaViewDataCollection* paraview = nullptr;
   std::function<double(int step, mfem::real_t t, bool is_final)>
     prepare_sigma;
+  std::function<void(int step, mfem::real_t t, int cycle)> after_vtk_save;
 };
 
 inline std::string FormatFixed(double value, int precision = 6)
@@ -245,6 +246,9 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
 {
   RunSummary summary;
   summary.steps = result.steps;
+  summary.segment_steps = result.segment_steps;
+  summary.initial_time = result.initial_time;
+  summary.final_time = result.final_time;
   summary.elapsed = elapsed_seconds;
   summary.local_dofs = static_cast<int>(ctx.spaces.vfes.TrueVSize());
   summary.global_dofs =
@@ -278,12 +282,13 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
         : 0.0;
   }
 
-  if (result.steps <= 0 || summary.local_dofs <= 0 || summary.global_dofs <= 0)
+  if (result.segment_steps <= 0 || summary.local_dofs <= 0 ||
+      summary.global_dofs <= 0)
   {
     return summary;
   }
 
-  const double steps = static_cast<double>(result.steps);
+  const double steps = static_cast<double>(result.segment_steps);
   summary.avg_step = elapsed_seconds / steps;
   summary.avg_step_per_dof_local =
     summary.avg_step / static_cast<double>(summary.local_dofs);
@@ -361,10 +366,14 @@ inline void PrintSummaryBox(const RunSummary& summary)
     return os.str();
   };
 
-  if (summary.steps <= 0)
+  if (summary.segment_steps <= 0)
   {
     PrintBox({"Summary",
-              "steps: 0",
+              "steps (cumulative/segment): " +
+                std::to_string(summary.steps) + " / " +
+                std::to_string(summary.segment_steps),
+              "time (initial/final): " + FormatFixed(summary.initial_time) +
+                " / " + FormatFixed(summary.final_time),
               "elapsed: " + FormatFixed(summary.elapsed) + " s",
               igr_line(),
               igr_breakdown(),
@@ -378,8 +387,11 @@ inline void PrintSummaryBox(const RunSummary& summary)
 
   PrintBox(
     {"Summary",
-     "steps: " + std::to_string(summary.steps) +
+     "steps (cumulative/segment): " + std::to_string(summary.steps) + " / " +
+       std::to_string(summary.segment_steps) +
        " | elapsed: " + FormatFixed(summary.elapsed) + " s",
+     "time (initial/final): " + FormatFixed(summary.initial_time) + " / " +
+       FormatFixed(summary.final_time),
      igr_line(),
      igr_breakdown(),
      "avg/step: " + FormatSci(summary.avg_step) + " s",
@@ -521,7 +533,8 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
                                             int num_procs,
                                             int my_rank,
                                             TimeLoopIO io,
-                                            const TimeLoopCallbacks& callbacks)
+                                            const TimeLoopCallbacks& callbacks,
+                                            int initial_step = 0)
 {
   const auto start_time = std::chrono::steady_clock::now();
   const double local_dofs = static_cast<double>(ctx.spaces.vfes.TrueVSize());
@@ -529,10 +542,12 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
     static_cast<double>(ctx.spaces.vfes.GlobalTrueVSize());
   const int num_procs_value = num_procs;
   const int my_rank_value = my_rank;
+  const int initial_step_value = initial_step;
   EulerVisWindows* glvis_windows = io.glvis_windows;
   bool* glvis_enabled = io.glvis_enabled;
   mfem::ParaViewDataCollection* paraview = io.paraview;
   const auto prepare_sigma = io.prepare_sigma;
+  const auto after_vtk_save = io.after_vtk_save;
   dg_igr::IGRSolver* igr_solver = bundle.field_list.igr;
   const ExampleContext* ctx_ptr = &ctx;
   EulerStateBundle* bundle_ptr = &bundle;
@@ -545,6 +560,7 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
      glvis_enabled,
      num_procs_value,
      my_rank_value,
+     initial_step_value,
      callbacks,
      igr_solver,
      prepare_sigma,
@@ -557,11 +573,13 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
     const auto now = std::chrono::steady_clock::now();
     const double elapsed =
       std::chrono::duration<double>(now - start_time).count();
-    const double avg_step = (step > 0) ? (elapsed / step) : 0.0;
+    const int segment_steps = std::max(0, step - initial_step_value);
+    const double avg_step =
+      (segment_steps > 0) ? (elapsed / segment_steps) : 0.0;
     const double avg_step_per_dof_local =
-      (step > 0 && local_dofs > 0.0) ? (avg_step / local_dofs) : 0.0;
+      (segment_steps > 0 && local_dofs > 0.0) ? (avg_step / local_dofs) : 0.0;
     const double avg_step_per_dof_rank =
-      (step > 0 && global_dofs > 0.0 && num_procs_value > 0)
+      (segment_steps > 0 && global_dofs > 0.0 && num_procs_value > 0)
         ? (avg_step * static_cast<double>(num_procs_value) / global_dofs)
         : 0.0;
 
@@ -600,6 +618,7 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
   hooks.on_save = [paraview,
                    callbacks,
                    prepare_sigma,
+                   after_vtk_save,
                    bundle_ptr,
                    ctx_ptr](
                     int step, mfem::real_t t, int save_idx, bool is_final)
@@ -633,6 +652,10 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
       paraview->Save();
       paraview_save_s = SecondsSince(save_start);
     }
+    if (after_vtk_save)
+    {
+      after_vtk_save(step, t, save_idx);
+    }
     PrintVTKOutputTiming("save",
                          save_idx,
                          step,
@@ -657,6 +680,7 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
      local_dofs,
      global_dofs,
      num_procs_value,
+     initial_step_value,
      callbacks,
      igr_solver,
      ctx_ptr,
@@ -665,11 +689,13 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
     const auto now = std::chrono::steady_clock::now();
     const double elapsed =
       std::chrono::duration<double>(now - start_time).count();
-    const double avg_step = (step > 0) ? (elapsed / step) : 0.0;
+    const int segment_steps = std::max(0, step - initial_step_value);
+    const double avg_step =
+      (segment_steps > 0) ? (elapsed / segment_steps) : 0.0;
     const double avg_step_per_dof_local =
-      (step > 0 && local_dofs > 0.0) ? (avg_step / local_dofs) : 0.0;
+      (segment_steps > 0 && local_dofs > 0.0) ? (avg_step / local_dofs) : 0.0;
     const double avg_step_per_dof_rank =
-      (step > 0 && global_dofs > 0.0 && num_procs_value > 0)
+      (segment_steps > 0 && global_dofs > 0.0 && num_procs_value > 0)
         ? (avg_step * static_cast<double>(num_procs_value) / global_dofs)
         : 0.0;
 

@@ -356,7 +356,8 @@ bool IGRSolver::ReclassifyPendingStage0PrefetchAsOutputOnly(
 
 void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
                                 bool warm_start,
-                                IGRSolvePurpose purpose)
+                                IGRSolvePurpose purpose,
+                                bool certify_residual)
 {
   MFEM_VERIFY(!pending_stage0_prefetch_accounting_.valid,
               "A stage-0 sigma prefetch must be consumed or reclassified "
@@ -378,6 +379,7 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
   const double form_before = total_form_system_seconds_;
   const double pc_before = total_pc_setup_seconds_;
   current_solve_purpose_ = purpose;
+  certify_current_solve_ = certify_residual;
   diagnostic_state_ = &U;
 
   // Assemble A and b for current state U (warm-start handled by FormLinearSystem)
@@ -385,6 +387,9 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
 
   if (solve_mode_ == SolveMode::SmootherSweeps)
   {
+    MFEM_VERIFY(!certify_current_solve_,
+                "Independent restart residual certification requires a "
+                "Krylov IGR solve.");
     last_linear_iters_ = 0;
     last_linear_converged_ = true;
     last_linear_initial_norm_ = std::numeric_limits<double>::quiet_NaN();
@@ -428,6 +433,7 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
     SolveEllipticSystem_(warm_start);
   }
 
+  certify_current_solve_ = false;
   first_call_ = false;
   diagnostic_state_ = nullptr;
 

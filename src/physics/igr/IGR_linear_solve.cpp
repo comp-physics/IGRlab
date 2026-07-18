@@ -2517,18 +2517,20 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     }
   }
 
-  auto configure_solver = [&](mfem::IterativeSolver& solver)
+  auto configure_solver = [&](mfem::IterativeSolver& solver,
+                              double relative_tolerance,
+                              bool iterative_mode)
   {
     solver.SetOperator(*solve_operator);
     if (solve_preconditioner)
     {
       solver.SetPreconditioner(*solve_preconditioner);
     }
-    solver.SetRelTol(effective_rtol);
+    solver.SetRelTol(relative_tolerance);
     solver.SetAbsTol(lin_atol_);
     solver.SetMaxIter(lin_maxit_);
     solver.SetPrintLevel(lin_print_);
-    solver.iterative_mode = enable_warm_start;
+    solver.iterative_mode = iterative_mode;
   };
 
   if (exact_face_sum_op)
@@ -2538,12 +2540,13 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
 
   const auto solve_start = std::chrono::steady_clock::now();
 
+  auto run_krylov = [&](double relative_tolerance, bool iterative_mode)
   {
     ::dg_igr::NVTXRange krylov_range("IGR/krylov-solve");
     if (solver_choice == LinearSolverType::CG)
     {
       mfem::CGSolver solver(comm);
-      configure_solver(solver);
+      configure_solver(solver, relative_tolerance, iterative_mode);
       solver.Mult(B_, X_);
       last_linear_iters_ = solver.GetNumIterations();
       last_linear_converged_ = solver.GetConverged();
@@ -2553,7 +2556,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     else if (solver_choice == LinearSolverType::GMRES)
     {
       mfem::GMRESSolver solver(comm);
-      configure_solver(solver);
+      configure_solver(solver, relative_tolerance, iterative_mode);
       solver.Mult(B_, X_);
       last_linear_iters_ = solver.GetNumIterations();
       last_linear_converged_ = solver.GetConverged();
@@ -2563,7 +2566,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     else if (solver_choice == LinearSolverType::FGMRES)
     {
       mfem::FGMRESSolver solver(comm);
-      configure_solver(solver);
+      configure_solver(solver, relative_tolerance, iterative_mode);
       solver.Mult(B_, X_);
       last_linear_iters_ = solver.GetNumIterations();
       last_linear_converged_ = solver.GetConverged();
@@ -2573,7 +2576,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     else if (solver_choice == LinearSolverType::BiCGSTAB)
     {
       mfem::BiCGSTABSolver solver(comm);
-      configure_solver(solver);
+      configure_solver(solver, relative_tolerance, iterative_mode);
       solver.Mult(B_, X_);
       last_linear_iters_ = solver.GetNumIterations();
       last_linear_converged_ = solver.GetConverged();
@@ -2583,7 +2586,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     else if (solver_choice == LinearSolverType::MINRES)
     {
       mfem::MINRESSolver solver(comm);
-      configure_solver(solver);
+      configure_solver(solver, relative_tolerance, iterative_mode);
       solver.Mult(B_, X_);
       last_linear_iters_ = solver.GetNumIterations();
       last_linear_converged_ = solver.GetConverged();
@@ -2594,17 +2597,16 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     {
       MFEM_ABORT("Unsupported IGR linear solver selection.");
     }
-  }
+  };
 
-  const auto solve_stop = std::chrono::steady_clock::now();
-  last_linear_solve_seconds_ =
-    std::chrono::duration<double>(solve_stop - solve_start).count();
-  total_linear_solve_seconds_ += last_linear_solve_seconds_;
+  run_krylov(effective_rtol, enable_warm_start);
 
   const bool certify_extended_solve =
     extended_certificate_enabled &&
     last_linear_iters_ >= extended_certificate_start;
-  if (true_residual_requested || certify_extended_solve)
+  const bool certify_independent_residual =
+    certify_current_solve_ || certify_extended_solve;
+  auto recompute_true_residual = [&]()
   {
     mfem::Vector residual(B_);
     mfem::Vector operator_solution(B_.Size());
@@ -2635,37 +2637,82 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
           last_linear_true_residual_abs_;
       }
     }
-  }
-  bool extended_certificate_passed = true;
-  if (certify_extended_solve)
+  };
+  if (true_residual_requested || certify_independent_residual)
   {
+    recompute_true_residual();
+  }
+
+  bool independent_certificate_passed = true;
+  int residual_replacement_retries = 0;
+  if (certify_independent_residual)
+  {
+    const double certificate_factor = extended_certificate_factor;
     const double certificate_limit =
-      extended_certificate_factor * effective_rtol;
-    extended_certificate_passed =
+      certificate_factor * effective_rtol;
+    independent_certificate_passed =
       std::isfinite(last_linear_true_residual_rel_rhs_) &&
       last_linear_true_residual_rel_rhs_ <= certificate_limit;
-    if (!extended_certificate_passed)
+    if (!independent_certificate_passed && VectorIsFinite(X_))
     {
-      last_linear_converged_ = false;
+      const int first_attempt_iters = last_linear_iters_;
+      const double first_attempt_initial_norm = last_linear_initial_norm_;
+      const double first_attempt_true_rel = last_linear_true_residual_rel_rhs_;
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[igr-linear] event=residual-replacement-retry"
+                  << " solve_call=" << solve_call
+                  << " rk_step=" << rk_step_index_
+                  << " rk_stage=" << rk_stage_index_
+                  << " attempt=2"
+                  << " first_attempt_iters=" << first_attempt_iters
+                  << " first_true_residual_rel_rhs="
+                  << first_attempt_true_rel
+                  << " limit=" << certificate_limit
+                  << " action=restart-recurrence-from-current-iterate"
+                  << std::endl;
+      }
+
+      run_krylov(effective_rtol, /*iterative_mode=*/true);
+      last_linear_iters_ += first_attempt_iters;
+      last_linear_initial_norm_ = first_attempt_initial_norm;
+      ++residual_replacement_retries;
+      recompute_true_residual();
+      independent_certificate_passed =
+        std::isfinite(last_linear_true_residual_rel_rhs_) &&
+        last_linear_true_residual_rel_rhs_ <= certificate_limit;
     }
+    // The independent residual is authoritative for certified solves. This
+    // also recognizes a valid capped iterate when the Krylov recurrence's
+    // reported norm has drifted from the true residual.
+    last_linear_converged_ = independent_certificate_passed;
     if (mfem::Mpi::Root())
     {
-      std::cout << "[igr-linear] event=extended-residual-certificate"
+      std::cout << "[igr-linear] event=independent-residual-certificate"
                 << " solve_call=" << solve_call
                 << " rk_step=" << rk_step_index_
                 << " rk_stage=" << rk_stage_index_
                 << " iterations=" << last_linear_iters_
+                << " reason="
+                << (certify_current_solve_ ? "restart" : "extended-solve")
                 << " start=" << extended_certificate_start
-                << " factor=" << extended_certificate_factor
+                << " factor=" << certificate_factor
                 << " limit=" << certificate_limit
                 << " true_residual_rel_rhs="
                 << last_linear_true_residual_rel_rhs_
                 << " true_residual_rel_initial="
                 << last_linear_true_residual_rel_initial_
-                << " passed=" << (extended_certificate_passed ? 1 : 0)
+                << " residual_replacement_retries="
+                << residual_replacement_retries
+                << " passed=" << (independent_certificate_passed ? 1 : 0)
                 << std::endl;
     }
   }
+
+  const auto solve_stop = std::chrono::steady_clock::now();
+  last_linear_solve_seconds_ =
+    std::chrono::duration<double>(solve_stop - solve_start).count();
+  total_linear_solve_seconds_ += last_linear_solve_seconds_;
   last_krylov_operator_apply_seconds_ =
     krylov_telemetry.operator_apply_seconds;
   last_krylov_preconditioner_apply_seconds_ =

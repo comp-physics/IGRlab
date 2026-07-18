@@ -95,6 +95,12 @@ public:
 
   /// Reset the internal step counter (e.g., if restarting the time integrator).
   void ResetStepCount() { step_count_ = 0; }
+  /// Restore the completed global step count for limiter scheduling on restart.
+  void SetStepCount(long step)
+  {
+    MFEM_VERIFY(step >= 0, "RK restart step must be nonnegative.");
+    step_count_ = step;
+  }
 
   /// Apply a configuration bundle without changing existing defaults.
   void ApplyConfig(const Config& cfg)

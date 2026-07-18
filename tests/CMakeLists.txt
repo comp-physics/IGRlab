@@ -125,6 +125,86 @@ if (TARGET supersonic_cylinder_w_igr)
     RUN_SERIAL TRUE
   )
 
+  add_test(NAME dg_igr_vtk_restart_cpu
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+            --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+            --device cpu
+            --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-cpu
+            --format-controls
+            --negative-controls
+  )
+  set_tests_properties(dg_igr_vtk_restart_cpu PROPERTIES
+    LABELS "igr;vtk;restart"
+    TIMEOUT 300
+    RUN_SERIAL TRUE
+  )
+
+  foreach(restart_order IN ITEMS 2 3)
+    add_test(NAME dg_igr_vtk_restart_order${restart_order}_cpu
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+              --device cpu
+              --order ${restart_order}
+              --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-order${restart_order}-cpu
+    )
+    set_tests_properties(dg_igr_vtk_restart_order${restart_order}_cpu PROPERTIES
+      LABELS "igr;vtk;restart;high-order"
+      TIMEOUT 300
+      RUN_SERIAL TRUE
+    )
+  endforeach()
+
+  add_test(NAME dg_igr_vtk_restart_cfl_save_boundary_cpu
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+            --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+            --device cpu
+            --cfl-driven
+            --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-cfl-save-boundary-cpu
+  )
+  set_tests_properties(dg_igr_vtk_restart_cfl_save_boundary_cpu PROPERTIES
+    LABELS "igr;vtk;restart;cfl"
+    TIMEOUT 240
+    RUN_SERIAL TRUE
+  )
+
+  if (TARGET supersonic_cylinder)
+    add_test(NAME dg_vtk_restart_no_igr_cpu
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              --exe $<TARGET_FILE:supersonic_cylinder>
+              --device cpu
+              --no-igr
+              --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-no-igr-cpu
+    )
+    set_tests_properties(dg_vtk_restart_no_igr_cpu PROPERTIES
+      LABELS "dg;vtk;restart"
+      TIMEOUT 180
+      RUN_SERIAL TRUE
+    )
+  endif()
+
+  if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
+    add_test(NAME dg_igr_vtk_restart_mpi_cpu
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+              --device cpu
+              --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-mpi-cpu
+              --mpi-ranks 2
+              --mpiexec ${MPIEXEC_EXECUTABLE}
+              --mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}
+    )
+    set_tests_properties(dg_igr_vtk_restart_mpi_cpu PROPERTIES
+      LABELS "mpi;igr;vtk;restart;exact-face"
+      TIMEOUT 300
+      RUN_SERIAL TRUE
+      PROCESSORS 2
+    )
+  endif()
+
   if (MFEM_USE_CUDA)
     add_test(NAME dg_igr_sigma_vtk_lifecycle_cuda
       COMMAND /usr/bin/env python3
@@ -136,6 +216,19 @@ if (TARGET supersonic_cylinder_w_igr)
     set_tests_properties(dg_igr_sigma_vtk_lifecycle_cuda PROPERTIES
       LABELS "cuda;igr;vtk;lifecycle"
       TIMEOUT 180
+      RUN_SERIAL TRUE
+    )
+
+    add_test(NAME dg_igr_vtk_restart_cuda
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+              --device cuda
+              --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-cuda
+    )
+    set_tests_properties(dg_igr_vtk_restart_cuda PROPERTIES
+      LABELS "cuda;igr;vtk;restart;exact-face"
+      TIMEOUT 300
       RUN_SERIAL TRUE
     )
 
@@ -153,6 +246,23 @@ if (TARGET supersonic_cylinder_w_igr)
       set_tests_properties(dg_igr_sigma_vtk_lifecycle_mpi_cuda PROPERTIES
         LABELS "cuda;mpi;igr;vtk;lifecycle;exact-face"
         TIMEOUT 240
+        RUN_SERIAL TRUE
+        PROCESSORS 2
+      )
+
+      add_test(NAME dg_igr_vtk_restart_mpi_cuda
+        COMMAND /usr/bin/env python3
+                ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+                --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+                --device cuda
+                --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-mpi-cuda
+                --mpi-ranks 2
+                --mpiexec ${MPIEXEC_EXECUTABLE}
+                --mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}
+      )
+      set_tests_properties(dg_igr_vtk_restart_mpi_cuda PROPERTIES
+        LABELS "cuda;mpi;igr;vtk;restart;exact-face"
+        TIMEOUT 360
         RUN_SERIAL TRUE
         PROCESSORS 2
       )

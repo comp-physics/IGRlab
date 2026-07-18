@@ -6,6 +6,7 @@
  */
 
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +18,7 @@
 
 #include "physics/igr/IGR.hpp"
 #include "sim/config/case_config.hpp"
+#include "sim/io/vtk_restart.hpp"
 #include "sim/io/vtk_helpers.hpp"
 #include "sim/time/time_callbacks.hpp"
 
@@ -77,6 +79,18 @@ inline std::string ToJsonString(const std::string& value)
   return std::string("\"") + JsonEscape(value) + "\"";
 }
 
+inline std::string ToJsonNumber(double value)
+{
+  if (!std::isfinite(value))
+  {
+    return "null";
+  }
+
+  std::ostringstream os;
+  os << std::setprecision(17) << value;
+  return os.str();
+}
+
 inline std::string ISO8601NowUTC()
 {
   const auto now = std::chrono::system_clock::now();
@@ -116,7 +130,9 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
                                     double c_alpha_value,
                                     int argc,
                                     char** argv,
-                                    bool success)
+                                    bool success,
+                                    const std::string& output_dataset_name = {},
+                                    const VTKRestartInfo* restart_info = nullptr)
 {
   if (!run_cfg.opts.vtk_save || !mfem::Mpi::Root())
   {
@@ -124,8 +140,10 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   }
 
   const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
-  const std::string dataset_name =
-    MakeCaseVTKDatasetName(case_cfg, run_cfg, c_alpha_value);
+  const std::string dataset_name = output_dataset_name.empty()
+                                     ? MakeCaseVTKDatasetName(
+                                         case_cfg, run_cfg, c_alpha_value)
+                                     : output_dataset_name;
   const std::filesystem::path output_dir =
     std::filesystem::path(vtk_cfg.prefix_path) / dataset_name;
   std::filesystem::create_directories(output_dir);
@@ -183,7 +201,8 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << detail::ToJsonString(
            DGSEMEntropyJacobianToString(run_cfg.dgsem_entropy_jacobian))
       << ",\n";
-  out << "    \"c_alpha\": " << c_alpha_value << ",\n";
+  out << "    \"c_alpha\": " << detail::ToJsonNumber(c_alpha_value)
+      << ",\n";
   out << "    \"igr_space\": " << detail::ToJsonString(run_cfg.igr_opts.space)
       << ",\n";
   out << "    \"igr_grad\": " << detail::ToJsonString(run_cfg.igr_opts.grad)
@@ -205,6 +224,23 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   out << "    \"igr_sigma_update_interval\": "
       << run_cfg.igr_opts.sigma_update_interval << ",\n";
   out << "    \"igr_stage_rtol_scale\": " << run_cfg.igr_opts.stage_rtol_scale
+      << ",\n";
+  out << "    \"igr_lin_rtol\": "
+      << detail::ToJsonNumber(
+           run_cfg.igr_opts.lin_rtol >= 0.0
+             ? run_cfg.igr_opts.lin_rtol
+             : run_cfg.case_config.igr_config.lin_rtol)
+      << ",\n";
+  out << "    \"igr_lin_atol\": "
+      << detail::ToJsonNumber(
+           run_cfg.igr_opts.lin_atol >= 0.0
+             ? run_cfg.igr_opts.lin_atol
+             : run_cfg.case_config.igr_config.lin_atol)
+      << ",\n";
+  out << "    \"igr_lin_maxit\": "
+      << (run_cfg.igr_opts.lin_maxit >= 0
+            ? run_cfg.igr_opts.lin_maxit
+            : run_cfg.case_config.igr_config.lin_maxit)
       << ",\n";
   out << "    \"igr_ip_kind\": "
       << detail::ToJsonString(run_cfg.igr_opts.ip_kind) << ",\n";
@@ -239,11 +275,33 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << (run_cfg.opts.vtk_zhang_shu_diagnostics ? "true" : "false")
       << "\n";
   out << "  },\n";
+  out << "  \"restart\": {\n";
+  out << "    \"enabled\": " << (restart_info ? "true" : "false");
+  if (restart_info)
+  {
+    out << ",\n";
+    out << "    \"source\": "
+        << detail::ToJsonString(restart_info->pvd_path) << ",\n";
+    out << "    \"cycle\": " << restart_info->cycle << ",\n";
+    out << "    \"time\": " << restart_info->time << ",\n";
+    out << "    \"step\": " << restart_info->step << ",\n";
+    out << "    \"legacy\": "
+        << (restart_info->legacy ? "true" : "false") << ",\n";
+    out << "    \"output_mode\": \"new\"\n";
+  }
+  else
+  {
+    out << "\n";
+  }
+  out << "  },\n";
 
   out << "  \"performance\": {\n";
   if (summary)
   {
     out << "    \"steps\": " << summary->steps << ",\n";
+    out << "    \"segment_steps\": " << summary->segment_steps << ",\n";
+    out << "    \"initial_time\": " << summary->initial_time << ",\n";
+    out << "    \"final_time\": " << summary->final_time << ",\n";
     out << "    \"elapsed\": " << summary->elapsed << ",\n";
     out << "    \"avg_step\": " << summary->avg_step << ",\n";
     out << "    \"avg_step_per_dof_local\": " << summary->avg_step_per_dof_local
@@ -257,6 +315,9 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   else
   {
     out << "    \"steps\": 0,\n";
+    out << "    \"segment_steps\": 0,\n";
+    out << "    \"initial_time\": 0.0,\n";
+    out << "    \"final_time\": 0.0,\n";
     out << "    \"elapsed\": 0.0,\n";
     out << "    \"avg_step\": 0.0,\n";
     out << "    \"avg_step_per_dof_local\": 0.0,\n";

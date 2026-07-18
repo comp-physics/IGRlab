@@ -23,6 +23,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(MFEM REQUIRED CONFIG)
+find_package(ZLIB REQUIRED)
 
 if(MFEM_USE_UMPIRE)
     find_package(umpire REQUIRED CONFIG)

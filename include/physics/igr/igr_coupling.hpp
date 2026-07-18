@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -24,6 +25,9 @@ struct IGRSigmaPreparationResult
   bool solved = false;
   bool reusable_stage0 = false;
   bool output_only = false;
+  bool independent_residual_certified = false;
+  double independent_residual_rel_rhs =
+    std::numeric_limits<double>::quiet_NaN();
 };
 
 /// Read-only sigma field plus lifecycle preparation for output orchestration.
@@ -37,7 +41,9 @@ public:
     std::uint64_t state_generation,
     int next_rk_step,
     real_t time,
-    bool reusable_stage0) = 0;
+    bool reusable_stage0,
+    bool cold_start = false,
+    bool certify_residual = false) = 0;
   virtual std::uint64_t GetSigmaStateGeneration() const = 0;
   virtual long long GetSigmaPrefetchSolveCount() const = 0;
   virtual long long GetSigmaStage0ReuseCount() const = 0;
@@ -110,7 +116,9 @@ public:
     std::uint64_t state_generation,
     int next_rk_step,
     real_t time,
-    bool reusable_stage0) override
+    bool reusable_stage0,
+    bool cold_start = false,
+    bool certify_residual = false) override
   {
     MFEM_VERIFY(state.Size() == state_.Size(),
                 "Sigma output preparation received an unexpected state size.");
@@ -143,10 +151,16 @@ public:
       igr_.SetCurrentTimeStep(std::numeric_limits<double>::quiet_NaN());
       igr_.UpdateFromState(
         state,
-        /*warm_start=*/true,
+        /*warm_start=*/!cold_start,
         reusable_stage0
           ? ::dg_igr::IGRSolvePurpose::ProductionStage0Prefetch
-                        : ::dg_igr::IGRSolvePurpose::OutputOnly);
+                        : ::dg_igr::IGRSolvePurpose::OutputOnly,
+        certify_residual);
+      result.independent_residual_rel_rhs =
+        igr_.GetLastLinearTrueResidualRelRHS();
+      result.independent_residual_certified =
+        certify_residual && igr_.GetLastLinearConverged() &&
+        std::isfinite(result.independent_residual_rel_rhs);
       if (mfem::Mpi::WorldSize() > 1)
       {
         igr_.GetSigma().ExchangeFaceNbrData();

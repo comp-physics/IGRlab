@@ -15,6 +15,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace dg_igr_tests
 {
@@ -640,6 +641,63 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   result.final_time,
                   1.0e-12,
                   "time loop: final boundary save time matches final time");
+  }
+
+  // --- restart semantics preserve cumulative steps and save numbering ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.initial_time = 0.2;
+    cfg.initial_step = 7;
+    cfg.t_final = 0.4;
+    cfg.dt = 0.1;
+    cfg.dt_min = 1.0e-12;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = true;
+    cfg.dt_save = 0.1;
+    cfg.next_save_time = 0.3;
+    cfg.save_index_offset = 3;
+
+    std::vector<int> save_steps;
+    std::vector<int> save_indices;
+    std::vector<mfem::real_t> save_times;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int step,
+                        mfem::real_t t,
+                        int save_idx,
+                        bool /*is_final*/)
+    {
+      save_steps.push_back(step);
+      save_indices.push_back(save_idx);
+      save_times.push_back(t);
+    };
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.steps == 9,
+              "time loop restart: cumulative step count advances from saved step");
+    ctx.Check(result.segment_steps == 2,
+              "time loop restart: segment step count excludes saved history");
+    ctx.Check(stepper.calls == 2,
+              "time loop restart: only the resumed segment is advanced");
+    ctx.Check(save_steps == std::vector<int>({8, 9}),
+              "time loop restart: save callbacks use cumulative steps");
+    ctx.Check(save_indices == std::vector<int>({3, 4}),
+              "time loop restart: save indices continue monotonically");
+    ctx.Check(save_times.size() == 2,
+              "time loop restart: no duplicate imported checkpoint is saved");
+    if (save_times.size() == 2)
+    {
+      ctx.CheckNear(save_times[0],
+                    0.3,
+                    1.0e-12,
+                    "time loop restart: first save uses the next boundary");
+      ctx.CheckNear(save_times[1],
+                    0.4,
+                    1.0e-12,
+                    "time loop restart: final save reaches absolute tf");
+    }
   }
 
   int alive_count = 0;

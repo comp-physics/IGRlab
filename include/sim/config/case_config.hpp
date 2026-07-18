@@ -1088,6 +1088,10 @@ inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)
     cfg.analysis_steps = opts.analysis_steps;
   }
   cfg.save_index_offset = 0;
+  cfg.initial_time = 0.0;
+  cfg.initial_step = 0;
+  cfg.next_save_time = (opts.vtk_save && opts.dt_save > 0.0) ? opts.dt_save
+                                                              : -1.0;
   return cfg;
 }
 
