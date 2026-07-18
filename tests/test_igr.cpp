@@ -567,6 +567,87 @@ int RunIGRTests(TestContext& ctx)
   constexpr double gamma = 1.4;
   const double tol = 1.0e-11;
 
+  // --- Manufactured primitive-gradient source and quotient invariance ---
+  {
+    mfem::Mesh source_mesh = mfem::Mesh::MakeCartesian2D(
+      1, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+    mfem::ParMesh source_pmesh(MPI_COMM_SELF, source_mesh);
+    mfem::DG_FECollection source_fec(1,
+                                     dim,
+                                     mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace source_fes(
+      &source_pmesh, &source_fec, dim + 2, mfem::Ordering::byNODES);
+    mfem::ParGridFunction source_state(&source_fes);
+    constexpr double source_alpha = 0.37;
+    BrokenDGIGRSourceCoefficient source(
+      source_state, dim, dim + 2, source_alpha, 5.0e-7);
+
+    auto SetManufacturedPoint = [&](double rho,
+                                    const mfem::Vector& velocity,
+                                    const mfem::Vector& grad_rho,
+                                    const mfem::DenseMatrix& grad_velocity)
+    {
+      mfem::Vector& state_scratch = source.StateScratch();
+      mfem::DenseMatrix& gradient_scratch = source.GradientScratch();
+      state_scratch = 0.0;
+      gradient_scratch = 0.0;
+      state_scratch(0) = rho;
+      state_scratch(1 + dim) = 1.0;
+      for (int j = 0; j < dim; ++j)
+      {
+        gradient_scratch(0, j) = grad_rho(j);
+      }
+      for (int i = 0; i < dim; ++i)
+      {
+        state_scratch(1 + i) = rho * velocity(i);
+        for (int j = 0; j < dim; ++j)
+        {
+          gradient_scratch(1 + i, j) =
+            velocity(i) * grad_rho(j) + rho * grad_velocity(i, j);
+        }
+      }
+    };
+
+    mfem::Vector velocity({2.1, -0.7});
+    mfem::Vector grad_rho({0.8, -1.3});
+    mfem::DenseMatrix strain(dim);
+    strain(0, 0) = 1.2;
+    strain(0, 1) = -0.4;
+    strain(1, 0) = 0.7;
+    strain(1, 1) = -0.3;
+    const double strain_div = strain(0, 0) + strain(1, 1);
+    const double strain_tr_a2 =
+      strain(0, 0) * strain(0, 0) +
+      2.0 * strain(0, 1) * strain(1, 0) +
+      strain(1, 1) * strain(1, 1);
+    const double expected_strain_source =
+      source_alpha * (strain_tr_a2 + strain_div * strain_div);
+
+    SetManufacturedPoint(1.7, velocity, grad_rho, strain);
+    const double variable_density_source = source.EvalFromStateAndGradient();
+    SetManufacturedPoint(0.002, velocity, grad_rho, strain);
+    const double low_density_source = source.EvalFromStateAndGradient();
+    ctx.CheckNear(variable_density_source,
+                  expected_strain_source,
+                  2.0e-12,
+                  "IGR source quotient recovers manufactured velocity gradient");
+    ctx.CheckNear(low_density_source,
+                  expected_strain_source,
+                  2.0e-12,
+                  "IGR source has no spurious density scaling above the floor");
+
+    mfem::DenseMatrix rotation(dim);
+    rotation = 0.0;
+    rotation(0, 1) = -2.0;
+    rotation(1, 0) = 2.0;
+    grad_rho = 0.0;
+    SetManufacturedPoint(1.0, velocity, grad_rho, rotation);
+    ctx.CheckNear(source.EvalFromStateAndGradient(),
+                  -8.0 * source_alpha,
+                  2.0e-12,
+                  "IGR multidimensional source retains its rotational sign");
+  }
+
   mfem::EulerFlux base_flux(dim, gamma);
   mfem::FluxWithIGR igr_flux(base_flux);
 
@@ -4012,6 +4093,121 @@ int RunIGRTests(TestContext& ctx)
               "IGR exact-face MPI operator constructs shared face data");
     ctx.Check(global_harmonic_operator_bad == 0,
               "IGR harmonic exact-face MPI operator is symmetric and converges");
+  }
+
+  // --- Constant-density locality: alpha=h^2 keeps response width in cells ---
+  {
+    struct LocalityResult
+    {
+      double radius_over_h = 0.0;
+      double sigma_max = 0.0;
+    };
+    auto MeasureLocality = [&](int elements)
+    {
+      constexpr int locality_dim = 1;
+      constexpr int locality_num_eq = locality_dim + 2;
+      const double h = 1.0 / static_cast<double>(elements);
+      mfem::Mesh locality_mesh = MakePeriodicMesh1D(elements);
+      mfem::ParMesh locality_pmesh(MPI_COMM_SELF, locality_mesh);
+      mfem::DG_FECollection locality_state_fec(
+        2, locality_dim, mfem::BasisType::GaussLegendre);
+      mfem::ParFiniteElementSpace locality_state_fes(
+        &locality_pmesh,
+        &locality_state_fec,
+        locality_num_eq,
+        mfem::Ordering::byNODES);
+      mfem::ParGridFunction locality_state(&locality_state_fes);
+      mfem::VectorFunctionCoefficient locality_state_coefficient(
+        locality_num_eq,
+        [h](const mfem::Vector& x, mfem::Vector& conservative)
+        {
+          const double distance = std::abs(x(0) - 0.5);
+          const double width = 2.0 * h;
+          const double velocity =
+            std::exp(-(distance * distance) / (width * width));
+          mfem::Vector primitive(3);
+          primitive(0) = 1.0;
+          primitive(1) = velocity;
+          primitive(2) = 1.0;
+          mfem::EulerPrimToConservative(
+            primitive, /*dim=*/1, /*gamma=*/1.4, conservative);
+        });
+      locality_state.ProjectCoefficient(locality_state_coefficient);
+
+      mfem::DG_FECollection locality_sigma_fec(
+        1, locality_dim, mfem::BasisType::GaussLegendre);
+      mfem::ParFiniteElementSpace locality_sigma_fes(
+        &locality_pmesh,
+        &locality_sigma_fec,
+        1,
+        mfem::Ordering::byNODES);
+      dg_igr::IGRSolver locality_solver(locality_sigma_fes,
+                                        locality_state_fes,
+                                        locality_dim,
+                                        locality_num_eq,
+                                        h * h);
+      locality_solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+      locality_solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+      locality_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
+      locality_solver.SetPreconditioner(dg_igr::IGRPrecondType::None);
+      locality_solver.SetLinearSolveParams(1.0e-10, 0.0, 1000, 0);
+      locality_solver.UpdateFromState(locality_state, /*warm_start=*/false);
+      ctx.Check(locality_solver.GetLastLinearConverged(),
+                "IGR constant-density locality solve converges at n=" +
+                  std::to_string(elements));
+
+      const mfem::ParGridFunction& locality_sigma =
+        locality_solver.GetSigma();
+      const mfem::IntegrationPoint& center =
+        mfem::Geometries.GetCenter(mfem::Geometry::SEGMENT);
+      double weighted_distance2 = 0.0;
+      double total_weight = 0.0;
+      double sigma_max = 0.0;
+      for (int e = 0; e < locality_sigma_fes.GetNE(); ++e)
+      {
+        mfem::ElementTransformation* transformation =
+          locality_sigma_fes.GetElementTransformation(e);
+        MFEM_VERIFY(transformation,
+                    "IGR locality test requires element transformation.");
+        transformation->SetIntPoint(&center);
+        mfem::Vector physical(1);
+        transformation->Transform(center, physical);
+        const double sigma_value =
+          locality_sigma.GetValue(*transformation, center);
+        const double weight = std::abs(sigma_value) * h;
+        const double distance = std::abs(physical(0) - 0.5);
+        weighted_distance2 += weight * distance * distance;
+        total_weight += weight;
+        sigma_max = std::max(sigma_max, std::abs(sigma_value));
+      }
+      MFEM_VERIFY(total_weight > 0.0,
+                  "IGR locality test requires nonzero sigma response.");
+      return LocalityResult{
+        std::sqrt(weighted_distance2 / total_weight) / h,
+        sigma_max};
+    };
+
+    const LocalityResult locality_32 = MeasureLocality(32);
+    const LocalityResult locality_64 = MeasureLocality(64);
+    const double locality_radius_ratio =
+      locality_64.radius_over_h / locality_32.radius_over_h;
+    const double locality_amplitude_ratio =
+      locality_64.sigma_max / locality_32.sigma_max;
+    ctx.LogMetric("igr_locality_alpha_h2 n32_radius_over_h=" +
+                  FormatSci(locality_32.radius_over_h) +
+                  " n64_radius_over_h=" +
+                  FormatSci(locality_64.radius_over_h) +
+                  " radius_ratio=" + FormatSci(locality_radius_ratio) +
+                  " amplitude_ratio=" +
+                  FormatSci(locality_amplitude_ratio));
+    ctx.Check(std::isfinite(locality_radius_ratio) &&
+                locality_radius_ratio > 0.65 &&
+                locality_radius_ratio < 1.55,
+              "IGR alpha=h^2 response radius remains bounded in cell counts");
+    ctx.Check(std::isfinite(locality_amplitude_ratio) &&
+                locality_amplitude_ratio > 0.35 &&
+                locality_amplitude_ratio < 2.5,
+              "IGR alpha=h^2 response amplitude remains mesh-bounded");
   }
 
   // --- Quasi-1D MPI robustness: sigma should vary primarily in x, not y ---
