@@ -5,6 +5,7 @@
 #include "numerics/limiters/krivodonova.hpp"
 #include "numerics/limiters/tvb.hpp"
 #include "numerics/limiters/venkat.hpp"
+#include "numerics/limiters/zhang_shu.hpp"
 
 /**
  * @file numerics/limiters/limiter_pipeline.hpp
@@ -64,6 +65,7 @@ struct LimiterPipelineConfig
   KrivoOptions krivo_opts;
 
   bool zhang_shu = false;
+  ZhangShuPointSet zhang_shu_points = ZhangShuPointSet::kConsumer;
 };
 
 /**

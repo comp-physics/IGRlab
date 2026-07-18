@@ -35,6 +35,7 @@ struct IGROptions
   std::string solve_mode = "krylov";
   std::string linear_solver = "auto";
   std::string preconditioner = "auto";
+  std::string nonconvergence_policy = "";
   std::string ip_kind = "sipg";
   std::string sigma_cadence = "";
   int sigma_update_interval = -1;
@@ -47,6 +48,9 @@ struct IGROptions
   int amg_relax_type = -1;
   int amg_max_levels = -1;
   double amg_strong_threshold = -1.0;
+  bool exact_dg_face_operator = false;
+  bool sigma_aware_cfl = false;
+  bool sigma_aware_rusanov = false;
 };
 
 /// @brief DG backend selection.
@@ -54,6 +58,13 @@ enum class DGBackend
 {
   DG,
   DGSEM
+};
+
+/// @brief Runtime compute device selection.
+enum class DeviceBackend
+{
+  CPU,
+  CUDA
 };
 
 /// @brief Optional DGSEM stabilization hook selection.
@@ -117,6 +128,7 @@ struct RunConfig
   CaseConfig case_config;
   CommonOptions opts;
   IGROptions igr_opts;
+  DeviceBackend device_backend = DeviceBackend::CPU;
   DGBackend dg_backend = DGBackend::DG;
   DGSEMStabilization dgsem_stab = DGSEMStabilization::None;
   DGSEMVolumeFlux dgsem_volume_flux = DGSEMVolumeFlux::Central;
@@ -136,6 +148,37 @@ inline std::string ToLowerCopy(std::string value)
                  [](unsigned char c)
                  { return static_cast<char>(std::tolower(c)); });
   return value;
+}
+
+inline mfem::ZhangShuPointSet
+ParseZhangShuPointSet(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "consumer")
+  {
+    return mfem::ZhangShuPointSet::kConsumer;
+  }
+  if (lower == "quadrature")
+  {
+    return mfem::ZhangShuPointSet::kQuadrature;
+  }
+  MFEM_VERIFY(false,
+              "Invalid Zhang-Shu point set '"
+                << value << "'. Use 'consumer' or 'quadrature'.");
+  return mfem::ZhangShuPointSet::kConsumer;
+}
+
+inline const char*
+ZhangShuPointSetToString(mfem::ZhangShuPointSet point_set)
+{
+  switch (point_set)
+  {
+  case mfem::ZhangShuPointSet::kQuadrature:
+    return "quadrature";
+  case mfem::ZhangShuPointSet::kConsumer:
+    return "consumer";
+  }
+  return "consumer";
 }
 
 inline dg_igr::IGRIPKind ParseIGRIPKind(const std::string& value)
@@ -238,6 +281,11 @@ inline dg_igr::IGRPrecondType ParseIGRPrecondType(const std::string& value)
   {
     return dg_igr::IGRPrecondType::HypreSmoother;
   }
+  if (lower == "chebyshev" || lower == "operatorchebyshev" ||
+      lower == "operator-chebyshev")
+  {
+    return dg_igr::IGRPrecondType::OperatorChebyshev;
+  }
   if (lower == "none")
   {
     return dg_igr::IGRPrecondType::None;
@@ -246,8 +294,26 @@ inline dg_igr::IGRPrecondType ParseIGRPrecondType(const std::string& value)
               "Invalid IGR preconditioner '"
                 << value << "'. Use 'auto', 'boomeramg', 'hypreilu', "
                 << "'hypreeuclid', 'parasails', "
-                << "'hypresmoother', or 'none'.");
+                << "'hypresmoother', 'chebyshev', or 'none'.");
   return dg_igr::IGRPrecondType::Auto;
+}
+
+inline dg_igr::IGRNonconvergencePolicy
+ParseIGRNonconvergencePolicy(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "error" || lower == "fail")
+  {
+    return dg_igr::IGRNonconvergencePolicy::Error;
+  }
+  if (lower == "accept" || lower == "legacy")
+  {
+    return dg_igr::IGRNonconvergencePolicy::Accept;
+  }
+  MFEM_VERIFY(false,
+              "Invalid IGR nonconvergence policy '"
+                << value << "'. Use 'error' or 'accept'.");
+  return dg_igr::IGRNonconvergencePolicy::Error;
 }
 
 inline dg_igr::IGRSigmaUpdateCadence
@@ -365,6 +431,8 @@ inline const char* IGRPrecondTypeToString(dg_igr::IGRPrecondType value)
     return "parasails";
   case dg_igr::IGRPrecondType::HypreSmoother:
     return "hypresmoother";
+  case dg_igr::IGRPrecondType::OperatorChebyshev:
+    return "chebyshev";
   case dg_igr::IGRPrecondType::None:
     return "none";
   }
@@ -417,6 +485,143 @@ inline DGBackend ParseDGBackend(const std::string& value)
   MFEM_VERIFY(false,
               "Invalid DG backend '" << value << "'. Use 'dg' or 'dgsem'.");
   return DGBackend::DG;
+}
+
+inline DeviceBackend ParseDeviceBackend(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "cpu")
+  {
+    return DeviceBackend::CPU;
+  }
+  if (lower == "cuda")
+  {
+    return DeviceBackend::CUDA;
+  }
+  MFEM_VERIFY(false,
+              "Invalid device backend '" << value
+                                         << "'. Use 'cpu' or 'cuda'.");
+  return DeviceBackend::CPU;
+}
+
+inline bool IsL2IGRSpaceName(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  return lower == "l2";
+}
+
+inline bool IsBrokenDGIGRGradName(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  return lower == "l2" || lower == "brokenl2" || lower == "brokendg" ||
+         lower == "broken-dg";
+}
+
+inline bool IsExactDGFaceOptionName(const std::string& value)
+{
+  return value == "-iexface" || value == "--igr-exact-dg-face" ||
+         value == "-ino-exface" || value == "--no-igr-exact-dg-face";
+}
+
+inline bool HasExactDGFaceOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsExactDGFaceOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool ShouldDefaultExactDGFaceOperator(const CommonOptions& opts,
+                                             const IGROptions& igr_opts)
+{
+  return ParseDeviceBackend(opts.device) == DeviceBackend::CUDA &&
+         ParseDGBackend(opts.dg_backend) == DGBackend::DG &&
+         IsL2IGRSpaceName(igr_opts.space) &&
+         IsBrokenDGIGRGradName(igr_opts.grad);
+}
+
+inline void
+ApplyIGRDerivedRuntimeDefaults(const CommonOptions& opts,
+                               IGROptions& igr_opts,
+                               bool exact_face_operator_overridden)
+{
+  if (igr_opts.nonconvergence_policy.empty())
+  {
+    igr_opts.nonconvergence_policy = "accept";
+  }
+  const bool cuda_l2_broken_dg =
+    ParseDeviceBackend(opts.device) == DeviceBackend::CUDA &&
+    ParseDGBackend(opts.dg_backend) == DGBackend::DG &&
+    IsL2IGRSpaceName(igr_opts.space) && IsBrokenDGIGRGradName(igr_opts.grad);
+  const bool cpu_l2_dg =
+    ParseDeviceBackend(opts.device) == DeviceBackend::CPU &&
+    ParseDGBackend(opts.dg_backend) == DGBackend::DG &&
+    IsL2IGRSpaceName(igr_opts.space);
+
+  if (!exact_face_operator_overridden &&
+      ShouldDefaultExactDGFaceOperator(opts, igr_opts))
+  {
+    igr_opts.exact_dg_face_operator = true;
+  }
+
+  if (cuda_l2_broken_dg && igr_opts.exact_dg_face_operator)
+  {
+    if (ToLowerCopy(igr_opts.linear_solver) == "auto")
+    {
+      igr_opts.linear_solver = "minres";
+    }
+    if (ToLowerCopy(igr_opts.preconditioner) == "auto")
+    {
+      igr_opts.preconditioner = "chebyshev";
+    }
+    if (igr_opts.stage_rtol_scale < 0.0)
+    {
+      igr_opts.stage_rtol_scale = 1.0;
+    }
+    if (igr_opts.lin_rtol < 0.0)
+    {
+      igr_opts.lin_rtol = 1.0e-2;
+    }
+    if (igr_opts.lin_atol < 0.0)
+    {
+      igr_opts.lin_atol = 0.0;
+    }
+    if (igr_opts.lin_maxit < 0)
+    {
+      igr_opts.lin_maxit = 500;
+    }
+  }
+  else if (cpu_l2_dg)
+  {
+    if (ToLowerCopy(igr_opts.linear_solver) == "auto")
+    {
+      igr_opts.linear_solver = "gmres";
+    }
+    if (ToLowerCopy(igr_opts.preconditioner) == "auto")
+    {
+      igr_opts.preconditioner = "boomeramg";
+    }
+    if (igr_opts.stage_rtol_scale < 0.0)
+    {
+      igr_opts.stage_rtol_scale = 1.0;
+    }
+    if (igr_opts.lin_rtol < 0.0)
+    {
+      igr_opts.lin_rtol = 1.0e-2;
+    }
+    if (igr_opts.lin_atol < 0.0)
+    {
+      igr_opts.lin_atol = 0.0;
+    }
+    if (igr_opts.lin_maxit < 0)
+    {
+      igr_opts.lin_maxit = 500;
+    }
+  }
 }
 
 inline DGSEMStabilization ParseDGSEMStabilization(const std::string& value)
@@ -613,6 +818,18 @@ inline const char* DGBackendToString(DGBackend backend)
   return "dg";
 }
 
+inline const char* DeviceBackendToString(DeviceBackend backend)
+{
+  switch (backend)
+  {
+  case DeviceBackend::CPU:
+    return "cpu";
+  case DeviceBackend::CUDA:
+    return "cuda";
+  }
+  return "cpu";
+}
+
 inline std::string CaseDirFromFile(const char* file)
 {
   return std::filesystem::path(file).parent_path().string();
@@ -731,7 +948,12 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "--igr-preconditioner",
                  "IGR preconditioner: auto | boomeramg | hypreilu | "
                  "hypreeuclid | parasails | "
-                 "hypresmoother | none.");
+                 "hypresmoother | chebyshev | none.");
+  args.AddOption(&igr_opts.nonconvergence_policy,
+                 "-incp",
+                 "--igr-nonconvergence-policy",
+                 "IGR nonconvergence policy: accept | error (default accept "
+                 "retains the capped iterate).");
   args.AddOption(
     &igr_opts.sigma_cadence,
     "-iscad",
@@ -785,6 +1007,28 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "-iamgst",
                  "--igr-amg-strong-threshold",
                  "IGR BoomerAMG strong-threshold (<0 keeps HYPRE default).");
+  args.AddOption(&igr_opts.exact_dg_face_operator,
+                 "-iexface",
+                 "--igr-exact-dg-face",
+                 "-ino-exface",
+                 "--no-igr-exact-dg-face",
+                 "Enable or disable the side-aware exact DG face operator "
+                 "for L2/DG IGR.");
+  args.AddOption(&igr_opts.sigma_aware_cfl,
+                 "-isigcfl",
+                 "--igr-sigma-cfl",
+                 "-ino-sigcfl",
+                 "--no-igr-sigma-cfl",
+                 "Include or exclude the IGR sigma speed in CFL accounting "
+                 "(default off).");
+  args.AddOption(
+    &igr_opts.sigma_aware_rusanov,
+    "-isigrus",
+    "--igr-sigma-rusanov",
+    "-ino-sigrus",
+    "--no-igr-sigma-rusanov",
+    "Include or exclude the IGR sigma speed in Rusanov dissipation "
+    "(default off).");
 }
 
 inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
@@ -793,8 +1037,13 @@ inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
 {
   RunConfig run_cfg;
   run_cfg.case_config = case_cfg;
+  const mfem::ZhangShuPointSet zhang_shu_points =
+    ParseZhangShuPointSet(opts.zhang_shu_points);
+  run_cfg.case_config.limiter_pipeline.zhang_shu_points = zhang_shu_points;
   run_cfg.opts = opts;
+  run_cfg.opts.zhang_shu_points = ZhangShuPointSetToString(zhang_shu_points);
   run_cfg.igr_opts = igr_opts;
+  run_cfg.device_backend = ParseDeviceBackend(opts.device);
   run_cfg.dg_backend = ParseDGBackend(opts.dg_backend);
   run_cfg.dgsem_stab = ParseDGSEMStabilization(opts.dgsem_stab);
   run_cfg.dgsem_volume_flux = ParseDGSEMVolumeFlux(opts.dgsem_volume_flux);
@@ -839,6 +1088,10 @@ inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)
     cfg.analysis_steps = opts.analysis_steps;
   }
   cfg.save_index_offset = 0;
+  cfg.initial_time = 0.0;
+  cfg.initial_step = 0;
+  cfg.next_save_time = (opts.vtk_save && opts.dt_save > 0.0) ? opts.dt_save
+                                                              : -1.0;
   return cfg;
 }
 

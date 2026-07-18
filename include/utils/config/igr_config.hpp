@@ -69,7 +69,15 @@ enum class IGRPrecondType
   HypreEuclid,
   ParaSails,
   HypreSmoother,
+  OperatorChebyshev,
   None
+};
+
+/// @brief Policy applied when an IGR Krylov solve reaches its iteration cap.
+enum class IGRNonconvergencePolicy
+{
+  Error,
+  Accept
 };
 
 /// @brief Cadence policy for sigma updates in IGR-coupled Euler solves.
@@ -110,6 +118,8 @@ struct IGRConfig
   IGRSolveMode solve_mode = IGRSolveMode::Krylov;
   IGRLinearSolverType lin_solver_type = IGRLinearSolverType::Auto;
   IGRPrecondType prec_type = IGRPrecondType::Auto;
+  IGRNonconvergencePolicy nonconvergence_policy =
+    IGRNonconvergencePolicy::Accept;
 
   double lin_rtol = mfem::dg_igr::IGRDefaults::kLinRtol;
   double lin_atol = mfem::dg_igr::IGRDefaults::kLinAtol;
@@ -128,6 +138,9 @@ struct IGRConfig
 
   // Stage-wise tolerance policy (RK intermediate stages can be looser).
   double stage_rtol_scale = 1.0; // > 1.0 loosens stage-0/1 relative tolerance
+
+  // Use the side-aware exact DG face wrapper for L2/DG IGR.
+  bool exact_dg_face_operator = false;
 
 };
 

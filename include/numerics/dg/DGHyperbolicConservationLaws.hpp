@@ -25,6 +25,7 @@
  */
 
 #include <functional>
+#include <cstdint>
 #include "mfem.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/riemann/fluxfunctions.hpp"
@@ -116,7 +117,7 @@ public:
   DGSEMStabilization GetDGSEMStabilization() const { return dgsem_stab_; }
 
   /// Set the numerical flux used for DGSEM surface evaluation (non-owning).
-  void SetNumericalFlux(const NumericalFlux* flux) { num_flux_ = flux; }
+  void SetNumericalFlux(const NumericalFlux* flux);
 
   /// Select DGSEM volume flux (central or entropy-conservative).
   void SetDGSEMVolumeFlux(DGSEMVolumeFlux f) { dgsem_vol_flux_ = f; }
@@ -126,6 +127,13 @@ public:
 
   /// Set Euler gamma used by entropy-conservative DGSEM fluxes.
   void SetDGSEMGamma(double gamma) { dgsem_gamma_ = gamma; }
+
+  /// Set face quadrature order offset (2*p + offset) for DG face integration.
+  void SetFaceQuadratureOrderOffset(int offset)
+  {
+    face_int_order_offset_ = offset;
+    face_data_dirty_ = true;
+  }
 
   /// Get Euler gamma used by DGSEM entropy-conservative fluxes.
   double GetDGSEMGamma() const { return dgsem_gamma_; }
@@ -194,7 +202,7 @@ public:
                          bdr_marker);
   }
 
-  ~DGHyperbolicConservationLaws() override = default;
+  ~DGHyperbolicConservationLaws() override;
 
 private:
   friend class dgsem::DGSEMOperator;
@@ -232,6 +240,18 @@ private:
   DGSEMVolumeDissipation dgsem_vol_diss_ = DGSEMVolumeDissipation::None;
   double dgsem_gamma_ = 1.4;
   bool dgsem_entropy_jacobian_analytic_ = false;
+  mutable bool dgsem_timing_enabled_ = false;
+  mutable bool dgsem_timing_init_ = false;
+
+  struct DGSEMTimingStats
+  {
+    std::int64_t calls = 0;
+    double surface_seconds = 0.0;
+    double volume_seconds = 0.0;
+    double invmass_seconds = 0.0;
+    double total_seconds = 0.0;
+  };
+  mutable DGSEMTimingStats dgsem_timing_stats_;
 
   // --- Helpers ---
   /// Compute per-element inverse mass matrices (block-diagonal DG mass).
@@ -240,6 +260,250 @@ private:
   /// Preassemble the weak-divergence operator on each element (optional).
   /// The layout is (test dof) × (trial node × dim), i.e. ByDim grouped per node.
   void ComputeWeakDivergence();
+
+  /// Build packed data required by the inverse-mass apply path.
+  void BuildInvMassApplyData_();
+
+  /// Build packed data required by the preassembled weak-divergence apply path.
+  void BuildWeakDivApplyData_();
+
+  /// Apply y = M^{-1} z using the best available path for the active backend.
+  void ApplyInverseMass_(const Vector& z_in, Vector& y_out) const;
+
+  /// Add the preassembled weak-divergence volume contribution into z.
+  void AddPreassembledWeakDivergence_(const Vector& x_in,
+                                      Vector& z_inout) const;
+
+  /// Build interpolation data for sigma(e, state-node) sampling on device.
+  bool BuildWeakDivSigmaData_(const ParGridFunction& sigma) const;
+
+  /// Build packed interior/boundary face data for device DG surface assembly.
+  void BuildFaceApplyData_();
+
+  /// Build interpolation data for sigma(e, face-qpoint) sampling on device.
+  bool BuildFaceSigmaData_(const ParGridFunction& sigma) const;
+
+  /// Build boundary-attribute policy data for device boundary-face kernels.
+  bool BuildBoundaryPolicyData_();
+
+  /// Find a boundary face integrator matching the given boundary attribute.
+  const BdrHyperbolicFluxIntegrator* FindBdrIntegrator_(int attr) const;
+
+  /// Return true when the custom device face residual path is available.
+  bool UseDeviceFaceResidual_() const;
+
+  /// Add DG face contributions with a packed Euler/Rusanov device path.
+  bool AddDeviceFaceContributionsEulerRusanov_(const Vector& x_in,
+                                               Vector& z_inout,
+                                               real_t& max_face_speed) const;
+
+  /// Reduce a per-face speed vector to max speed with device support.
+  real_t ReduceFaceMaxSpeed_(const Vector& face_speed,
+                             Array<real_t>& workspace) const;
+
+  /// Device weak-divergence path for Euler-family fluxes.
+  void AddPreassembledWeakDivergenceDeviceEuler_(
+    const Vector& x_in,
+    Vector& z_inout,
+    bool use_sigma,
+    const ParGridFunction* sigma_field,
+    real_t sigma_rho_floor) const;
+
+  /// Packed inverse-mass apply (element-major, equation-minor map).
+  void ApplyInverseMassPacked_(const Vector& z_in, Vector& y_out) const;
+
+  /// Host fallback inverse-mass apply (packed element map, no subvector staging).
+  void ApplyInverseMassHost_(const Vector& z_in, Vector& y_out) const;
+
+  /// Return true when packed inverse-mass path should run on device.
+  bool UsePackedInverseMassDevice_() const;
+
+  /// Build MFEM-native inverse-mass solver for accelerated backends.
+  void BuildNativeMassInverseSolver_();
+
+  /// Return true when MFEM-native inverse-mass solver is available.
+  bool UseNativeMassInverseSolver_() const;
+
+  bool IsDGSEMTimingEnabled_() const;
+  void RecordDGSEMTiming_(double surface_seconds,
+                          double volume_seconds,
+                          double invmass_seconds,
+                          double total_seconds) const;
+  void PrintDGSEMTimingSummary_() const;
+
+  /// Per-element scalar dof count used by packed inverse-mass apply.
+  int invmass_elem_dof_ = 0;
+  /// Flattened per-element inverse mass blocks (column-major dof x dof).
+  Vector invmass_data_flat_;
+  /// Per-element vector-dof map in node-major, equation-minor layout.
+  Array<int> invmass_elem_vdof_map_;
+  /// Whether packed inverse-mass data is available.
+  bool invmass_apply_ready_ = false;
+  /// Ensures inverse-mass path selection is logged only once.
+  mutable bool invmass_path_logged_ = false;
+  /// Ensures DG face/domain primary path is logged only once.
+  mutable bool dg_face_path_logged_ = false;
+  /// Marks packed face data as stale after topology/configuration changes.
+  mutable bool face_data_dirty_ = true;
+  /// Ensures weak-divergence volume path selection is logged only once.
+  mutable bool weakdiv_volume_path_logged_ = false;
+
+  /// Default face quadrature order offset for custom DG face assembly.
+  int face_int_order_offset_ = 1;
+  /// Packed DG face apply is ready when all required metadata exists.
+  bool face_apply_ready_ = false;
+  /// Packed interior face scalar dof count.
+  int face_elem_dof_ = 0;
+  /// Interior-face quadrature point count.
+  int face_int_nq_ = 0;
+  /// Boundary-face quadrature point count.
+  int face_bdr_nq_ = 0;
+  /// Shared-face quadrature point count (MPI face-neighbor interfaces).
+  int face_shared_nq_ = 0;
+  /// Packed interior face -> element 1 index map.
+  Array<int> face_int_e1_;
+  /// Packed interior face -> element 2 index map.
+  Array<int> face_int_e2_;
+  /// Packed interior face -> mesh face index map.
+  Array<int> face_int_mesh_id_;
+  /// Packed interior face shape values on side 1 (face, q, dof).
+  Vector face_int_shape1_;
+  /// Packed interior face shape values on side 2 (face, q, dof).
+  Vector face_int_shape2_;
+  /// Packed interior face normals (face, q, dim).
+  Vector face_int_normals_;
+  /// Packed interior face quadrature weights (face, q).
+  Vector face_int_weights_;
+  /// Packed interior side-1 reference coordinates (face, q, dim).
+  Vector face_int_ip1_ref_;
+  /// Packed interior side-2 reference coordinates (face, q, dim).
+  Vector face_int_ip2_ref_;
+  /// Per-interior-face max speed scratch.
+  mutable Vector face_int_speed_;
+  /// Per-interior-face quadrature-point speed scratch (face, q).
+  mutable Vector face_int_speed_q_;
+
+  /// Packed boundary face -> element 1 index map.
+  Array<int> face_bdr_e1_;
+  /// Packed boundary face -> boundary attribute map.
+  Array<int> face_bdr_attr_;
+  /// Packed boundary face -> boundary-face index map.
+  Array<int> face_bdr_mesh_id_;
+  /// Packed boundary face shape values on side 1 (face, q, dof).
+  Vector face_bdr_shape1_;
+  /// Packed boundary face normals (face, q, dim).
+  Vector face_bdr_normals_;
+  /// Packed boundary face quadrature weights (face, q).
+  Vector face_bdr_weights_;
+  /// Packed boundary side-1 reference coordinates (face, q, dim).
+  Vector face_bdr_ip1_ref_;
+  /// Per-boundary-face max speed scratch.
+  mutable Vector face_bdr_speed_;
+  /// Per-boundary-face quadrature-point speed scratch (face, q).
+  mutable Vector face_bdr_speed_q_;
+  /// Packed shared face -> local element index map.
+  Array<int> face_shared_e1_;
+  /// Packed shared-face neighbor vector-dof map (face, node, eq).
+  Array<int> face_shared_nbr_vdof_map_;
+  /// Packed shared face shape values on local side 1 (face, q, dof).
+  Vector face_shared_shape1_;
+  /// Packed shared face shape values on neighbor side 2 (face, q, dof).
+  Vector face_shared_shape2_;
+  /// Packed shared face normals (face, q, dim).
+  Vector face_shared_normals_;
+  /// Packed shared face quadrature weights (face, q).
+  Vector face_shared_weights_;
+  /// Packed shared side-1 reference coordinates (face, q, dim).
+  Vector face_shared_ip1_ref_;
+  /// Packed shared side-2 reference coordinates (face, q, dim).
+  Vector face_shared_ip2_ref_;
+  /// Per-shared-face max speed scratch.
+  mutable Vector face_shared_speed_;
+  /// Per-shared-face quadrature-point speed scratch (face, q).
+  mutable Vector face_shared_speed_q_;
+
+#ifdef MFEM_USE_MPI
+  /// Reused alias for state L-vector neighbor exchange (avoids per-step temp
+  /// ParGridFunction construction in packed shared-face assembly).
+  mutable std::unique_ptr<ParGridFunction> face_state_face_nbr_alias_;
+#endif
+
+  /// Max boundary attribute value represented in policy arrays.
+  int face_bdr_max_attr_ = 0;
+  /// Boundary policy type by attribute (enum value stored as int).
+  Array<int> face_bdr_type_by_attr_;
+  /// Boundary policy gamma by attribute.
+  Vector face_bdr_gamma_by_attr_;
+  /// Boundary policy outlet pressure by attribute (if applicable).
+  Vector face_bdr_pressure_by_attr_;
+  /// Boundary policy reference state by attribute (flattened attr-major).
+  Vector face_bdr_state_by_attr_;
+  /// Boundary policy metadata is complete for all active boundary attributes.
+  bool face_bdr_policy_ready_ = false;
+
+  /// Per-element sigma scalar dof count for face interpolation.
+  mutable int face_sigma_ldof_ = 0;
+  /// Per-element sigma scalar-dof map for face interpolation.
+  mutable Array<int> face_sigma_elem_dof_map_;
+  /// Interior-face sigma shape values on side 1 (face, q, sigma_ldof).
+  mutable Vector face_int_sigma_shape1_;
+  /// Interior-face sigma shape values on side 2 (face, q, sigma_ldof).
+  mutable Vector face_int_sigma_shape2_;
+  /// Boundary-face sigma shape values on side 1 (face, q, sigma_ldof).
+  mutable Vector face_bdr_sigma_shape1_;
+  /// Shared-face sigma shape values on side 1 (face, q, sigma_ldof).
+  mutable Vector face_shared_sigma_shape1_;
+  /// Shared-face sigma shape values on side 2 (face, q, sigma_ldof).
+  mutable Vector face_shared_sigma_shape2_;
+  /// Shared-face sigma neighbor-dof map (face, sigma_ldof).
+  mutable Array<int> face_shared_sigma_nbr_dof_map_;
+  /// Face sigma interpolation metadata is valid for current sigma space.
+  mutable bool face_sigma_ready_ = false;
+  /// Sigma FE-space used to build face interpolation metadata.
+  mutable const FiniteElementSpace* face_sigma_fes_ = nullptr;
+  /// Sigma FE-space sequence used to build face interpolation metadata.
+  mutable long face_sigma_fes_sequence_ = -1;
+  /// Reduction workspace for interior-face max-speed reduction.
+  mutable Array<real_t> face_int_speed_reduce_workspace_;
+  /// Reduction workspace for boundary-face max-speed reduction.
+  mutable Array<real_t> face_bdr_speed_reduce_workspace_;
+  /// Reduction workspace for shared-face max-speed reduction.
+  mutable Array<real_t> face_shared_speed_reduce_workspace_;
+
+  /// Per-element scalar dof count used by packed weak-divergence apply.
+  int weakdiv_elem_dof_ = 0;
+  /// Flattened per-element weak-divergence blocks (row-major dof x (dof*dim)).
+  Vector weakdiv_data_flat_;
+  /// Whether packed weak-divergence data is available.
+  bool weakdiv_apply_ready_ = false;
+
+  /// Per-element scalar dof count for sigma interpolation.
+  mutable int weakdiv_sigma_ldof_ = 0;
+  /// Per-element sigma scalar-dof map (for packed interpolation).
+  mutable Array<int> weakdiv_sigma_elem_dof_map_;
+  /// Interpolation weights from sigma dofs to state nodes per element.
+  mutable Vector weakdiv_sigma_interp_;
+  /// Whether packed sigma interpolation data is available.
+  mutable bool weakdiv_sigma_ready_ = false;
+  /// Sigma space pointer used to build interpolation data.
+  mutable const FiniteElementSpace* weakdiv_sigma_fes_ = nullptr;
+  /// Sigma FE-space sequence used to build interpolation data.
+  mutable long weakdiv_sigma_fes_sequence_ = -1;
+
+  /// MFEM-native vector-mass form (serial).
+  std::unique_ptr<BilinearForm> mass_form_;
+#ifdef MFEM_USE_MPI
+  /// MFEM-native vector-mass form (parallel).
+  std::unique_ptr<ParBilinearForm> par_mass_form_;
+#endif
+  /// Jacobi preconditioner for native inverse-mass solve.
+  std::unique_ptr<OperatorJacobiSmoother> mass_inv_prec_;
+  /// Krylov solver for native inverse-mass solve.
+  std::unique_ptr<CGSolver> mass_inv_solver_;
+  /// Whether the native inverse-mass solver path is available.
+  bool mass_inv_solver_ready_ = false;
+  /// Ensures accelerated mass-inverse fallback warning is emitted once.
+  mutable bool mass_inv_solver_fallback_warned_ = false;
 };
 
 } // namespace mfem

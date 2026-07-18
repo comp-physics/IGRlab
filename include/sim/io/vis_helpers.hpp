@@ -5,6 +5,7 @@
  * @brief GLVis/VTK field helpers for Euler visualization.
  */
 
+#include <chrono>
 #include <memory>
 #include <utility>
 
@@ -14,6 +15,11 @@
 #include "io/vtk_output.hpp"
 
 #include "sim/state/state_views.hpp"
+
+namespace dg_igr
+{
+class IGRSolver;
+}
 
 namespace dg_sim
 {
@@ -30,11 +36,29 @@ struct EulerFieldList
   EulerPressureView* pressure = nullptr;
   EulerVelocityView* velocity = nullptr;
   dg_igr::IGRSolver* igr = nullptr;
+  const mfem::ParGridFunction* sigma = nullptr;
   H1Diagnostics* h1_diag = nullptr;
   L2Diagnostics* l2_diag = nullptr;
   MPIRankField* mpi_rank = nullptr;
   ZhangShuLimiterField* zhang_shu = nullptr;
 };
+
+struct EulerOutputFieldTiming
+{
+  double igr_update_s = 0.0;
+  double sigma_exchange_s = 0.0;
+  double pressure_s = 0.0;
+  double velocity_s = 0.0;
+  double h1_diag_s = 0.0;
+  double l2_diag_s = 0.0;
+  double total_s = 0.0;
+};
+
+inline double VisSecondsSince(std::chrono::steady_clock::time_point start)
+{
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+    .count();
+}
 
 /// @brief GLVis windows for common Euler fields.
 struct EulerVisWindows
@@ -175,12 +199,10 @@ inline bool OpenEulerIGRGLVisWindows(EulerVisWindows& windows,
                                      const char* host = "localhost",
                                      int port = 19916)
 {
-  if (!fields.state || !fields.pressure || !fields.igr)
+  if (!fields.state || !fields.pressure || !fields.sigma)
   {
     return false;
   }
-
-  fields.igr->GetSigma().ExchangeFaceNbrData();
 
   const bool ok1 = vis::Open(windows.density,
                              host,
@@ -198,7 +220,7 @@ inline bool OpenEulerIGRGLVisWindows(EulerVisWindows& windows,
                              num_procs,
                              my_rank,
                              pmesh,
-                             fields.igr->GetSigma(),
+                             *fields.sigma,
                              "sigma, t = 0");
   const bool ok3 = vis::Open(windows.energy,
                              host,
@@ -300,13 +322,14 @@ inline mfem::io::EulerVTKFields MakeEulerVTKFields(const EulerFieldList& fields)
   {
     out.velocity = &fields.velocity->velocity;
   }
-  if (fields.igr)
+  if (fields.sigma)
   {
-    out.sigma = &fields.igr->GetSigma();
+    out.sigma = fields.sigma;
   }
   if (fields.pressure)
   {
     out.pressure = &fields.pressure->pressure;
+    out.pressure_coefficient = &fields.pressure->coeff;
   }
   if (fields.h1_diag)
   {
@@ -358,6 +381,7 @@ MakeEulerIGRVisFields(const EulerFieldList& fields)
     out.energy = &fields.state->energy;
     out.momentum_x = &fields.state->momentum_x;
   }
+  out.sigma = fields.sigma;
   if (fields.pressure)
   {
     out.pressure = &fields.pressure->pressure;
@@ -378,59 +402,63 @@ MakeEulerIGRVisWindows(EulerVisWindows& windows)
 }
 
 inline void UpdateEulerOutputFields(const EulerFieldList& fields,
-                                    mfem::ParGridFunction& state,
-                                    bool warm_start)
+                                    EulerOutputFieldTiming* timing = nullptr)
 {
-  if (fields.igr)
-  {
-    fields.igr->UpdateFromState(state, warm_start);
-    fields.igr->GetSigma().ExchangeFaceNbrData();
-  }
+  const auto total_start = std::chrono::steady_clock::now();
+  EulerOutputFieldTiming local_timing;
   if (fields.pressure)
   {
+    const auto pressure_start = std::chrono::steady_clock::now();
     fields.pressure->Update();
+    local_timing.pressure_s = VisSecondsSince(pressure_start);
   }
   if (fields.velocity)
   {
+    const auto velocity_start = std::chrono::steady_clock::now();
     fields.velocity->Update();
+    local_timing.velocity_s = VisSecondsSince(velocity_start);
   }
   if (fields.h1_diag)
   {
+    const auto h1_start = std::chrono::steady_clock::now();
     fields.h1_diag->Update();
+    local_timing.h1_diag_s = VisSecondsSince(h1_start);
   }
   if (fields.l2_diag)
   {
+    const auto l2_start = std::chrono::steady_clock::now();
     fields.l2_diag->Update();
+    local_timing.l2_diag_s = VisSecondsSince(l2_start);
+  }
+  local_timing.total_s = VisSecondsSince(total_start);
+  if (timing)
+  {
+    *timing = local_timing;
   }
 }
 
 inline void UpdateEulerGLVis(EulerVisWindows& windows,
                              const EulerFieldList& fields,
-                             mfem::ParGridFunction& state,
                              int num_procs,
                              int my_rank,
                              const mfem::ParMesh& pmesh,
-                             double t,
-                             bool warm_start)
+                             double t)
 {
-  if (fields.igr)
+  if (fields.sigma)
   {
     MFEM_VERIFY(fields.pressure != nullptr,
                 "Euler GLVis update with IGR expects a pressure view.");
+    fields.pressure->Update();
     const mfem::io::EulerIGRVisFields vis_fields =
       MakeEulerIGRVisFields(fields);
     const mfem::io::EulerIGRVisWindows vis_windows =
       MakeEulerIGRVisWindows(windows);
     mfem::io::UpdateEulerIGRViews(vis_windows,
                                   vis_fields,
-                                  *fields.igr,
-                                  state,
-                                  fields.pressure->coeff,
                                   num_procs,
                                   my_rank,
                                   pmesh,
-                                  t,
-                                  warm_start);
+                                  t);
     return;
   }
 

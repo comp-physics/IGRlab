@@ -8,8 +8,10 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -44,7 +46,7 @@ double GlobalSum(double local)
   return global;
 }
 
-double GlobalMin(double local)
+double LimiterGlobalMin(double local)
 {
   double global = 0.0;
   MPI_Allreduce(&local,
@@ -446,8 +448,8 @@ void MinRhoPressure(mfem::ParFiniteElementSpace& vfes,
     }
   }
 
-  min_rho = GlobalMin(local_min_rho);
-  min_p = GlobalMin(local_min_p);
+  min_rho = LimiterGlobalMin(local_min_rho);
+  min_p = LimiterGlobalMin(local_min_p);
 }
 
 void CheckLimiterOnConstantState(TestContext& ctx,
@@ -538,6 +540,184 @@ void CheckLimiterOnPerturbedState(TestContext& ctx,
 
 int RunLimiterTests(TestContext& ctx)
 {
+  // --- Production GL nodes are not nested in the higher GL volume rule ---
+  {
+    mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
+      2, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+    mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+    mfem::DG_FECollection fec(
+      2, kDim, mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace vfes(
+      &pmesh, &fec, kNumEq, mfem::Ordering::byNODES);
+    mfem::ParGridFunction initial(&vfes);
+    mfem::Array<int> vdofs;
+    for (int element_index = 0; element_index < vfes.GetNE(); ++element_index)
+    {
+      vfes.GetElementVDofs(element_index, vdofs);
+      mfem::Vector element(vdofs.Size());
+      mfem::DenseMatrix values(element.GetData(),
+                               vfes.GetFE(element_index)->GetDof(),
+                               kNumEq);
+      const mfem::IntegrationRule& nodes =
+        vfes.GetFE(element_index)->GetNodes();
+      for (int dof = 0; dof < nodes.GetNPoints(); ++dof)
+      {
+        const mfem::IntegrationPoint& ip = nodes.IntPoint(dof);
+        const double pressure =
+          (ip.x - 0.5) * (ip.x - 0.5) +
+          (ip.y - 0.5) * (ip.y - 0.5) - 0.02;
+        mfem::Vector state(kNumEq);
+        state = 0.0;
+        state(0) = 1.0;
+        state(kNumEq - 1) = pressure / (kGamma - 1.0);
+        values.SetRow(dof, state);
+      }
+      initial.SetSubVector(vdofs, element);
+    }
+
+    const auto nodal_min_pressure = [&](const mfem::ParGridFunction& state)
+    {
+      double minimum = std::numeric_limits<double>::infinity();
+      for (int element_index = 0; element_index < vfes.GetNE(); ++element_index)
+      {
+        mfem::Array<int> element_vdofs;
+        vfes.GetElementVDofs(element_index, element_vdofs);
+        mfem::Vector local;
+        state.GetSubVector(element_vdofs, local);
+        mfem::DenseMatrix matrix(local.GetData(),
+                                 vfes.GetFE(element_index)->GetDof(),
+                                 kNumEq);
+        mfem::Vector value(kNumEq);
+        for (int dof = 0; dof < matrix.Height(); ++dof)
+        {
+          matrix.GetRow(dof, value);
+          minimum = std::min(minimum,
+                             mfem::EulerPressureFromConservative(
+                               value, kDim, kGamma, 1.0e-16));
+        }
+      }
+      return LimiterGlobalMin(minimum);
+    };
+
+    constexpr const char* vtk_env = "DG_IGR_LIMITER_ENFORCE_VTK_POINTS";
+    const char* original_vtk_text = std::getenv(vtk_env);
+    const std::optional<std::string> original_vtk = original_vtk_text
+      ? std::optional<std::string>(original_vtk_text)
+      : std::nullopt;
+    setenv(vtk_env, "0", 1);
+
+    mfem::ParGridFunction current(&vfes);
+    current = initial;
+    mfem::ApplyZhangShuPositivityLimiter(
+      vfes,
+      current,
+      kDim,
+      kGamma,
+      1.0e-10,
+      1.0e-10,
+      6,
+      {5},
+      16,
+      mfem::ZhangShuPointSet::kQuadrature);
+    ctx.Check(nodal_min_pressure(current) < 0.0,
+              "Zhang-Shu GL control exposes omitted production node");
+
+    mfem::ParGridFunction nodal(&vfes);
+    nodal = initial;
+    const auto averages_before = ComputeElementAverages(vfes, nodal, 6);
+    mfem::ApplyZhangShuPositivityLimiter(
+      vfes,
+      nodal,
+      kDim,
+      kGamma,
+      1.0e-10,
+      1.0e-10,
+      6,
+      {5},
+      16,
+      mfem::ZhangShuPointSet::kConsumer);
+    const auto averages_after = ComputeElementAverages(vfes, nodal, 6);
+    ctx.Check(nodal_min_pressure(nodal) >= 0.99e-10,
+              "Zhang-Shu nodal union protects production GL nodes");
+    ctx.Check(MaxRelativeAverageChange(averages_before, averages_after) < 1.0e-12,
+              "Zhang-Shu nodal union preserves element average");
+
+    mfem::ParGridFunction smooth(&vfes);
+    for (int element_index = 0; element_index < vfes.GetNE(); ++element_index)
+    {
+      vfes.GetElementVDofs(element_index, vdofs);
+      mfem::Vector element(vdofs.Size());
+      mfem::DenseMatrix values(element.GetData(),
+                               vfes.GetFE(element_index)->GetDof(),
+                               kNumEq);
+      for (int dof = 0; dof < values.Height(); ++dof)
+      {
+        const double rho = 1.0 + 0.01 * static_cast<double>(dof + 1);
+        const double velocity_x = 0.1;
+        const double velocity_y = -0.05;
+        const double pressure = 1.0 + 0.005 * static_cast<double>(dof);
+        mfem::Vector state(kNumEq);
+        state(0) = rho;
+        state(1) = rho * velocity_x;
+        state(2) = rho * velocity_y;
+        state(3) = pressure / (kGamma - 1.0) +
+                   0.5 * rho * (velocity_x * velocity_x +
+                                velocity_y * velocity_y);
+        values.SetRow(dof, state);
+      }
+      smooth.SetSubVector(vdofs, element);
+    }
+    mfem::ParGridFunction smooth_current(&vfes);
+    smooth_current = smooth;
+    mfem::ApplyZhangShuPositivityLimiter(
+      vfes,
+      smooth_current,
+      kDim,
+      kGamma,
+      1.0e-10,
+      1.0e-10,
+      6,
+      {5},
+      16,
+      mfem::ZhangShuPointSet::kQuadrature);
+    mfem::ParGridFunction smooth_nodes(&vfes);
+    smooth_nodes = smooth;
+    mfem::ApplyZhangShuPositivityLimiter(
+      vfes,
+      smooth_nodes,
+      kDim,
+      kGamma,
+      1.0e-10,
+      1.0e-10,
+      6,
+      {5},
+      16,
+      mfem::ZhangShuPointSet::kConsumer);
+    smooth_current -= smooth;
+    smooth_nodes -= smooth;
+    double smooth_current_error = smooth_current.Normlinf();
+    double smooth_nodes_error = smooth_nodes.Normlinf();
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &smooth_current_error,
+                  1,
+                  mfem::MPITypeMap<double>::mpi_type,
+                  MPI_MAX,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &smooth_nodes_error,
+                  1,
+                  mfem::MPITypeMap<double>::mpi_type,
+                  MPI_MAX,
+                  MPI_COMM_WORLD);
+    ctx.Check(smooth_current_error == 0.0,
+              "Zhang-Shu current policy leaves smooth admissible GL state unchanged");
+    ctx.Check(smooth_nodes_error == 0.0,
+              "Zhang-Shu nodal union leaves smooth admissible GL state unchanged");
+
+    if (original_vtk) { setenv(vtk_env, original_vtk->c_str(), 1); }
+    else { unsetenv(vtk_env); }
+  }
+
   // --- Zhang-Shu positivity on order-0 space ---
   {
     mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
@@ -808,7 +988,8 @@ int RunLimiterTests(TestContext& ctx)
     mfem::CharTVBOptions tvb;
     tvb.dim = kDim;
     tvb.gamma = kGamma;
-    rk.AddZhangShuLimiter(/*always_on=*/true);
+    rk.AddZhangShuLimiter(mfem::ZhangShuPointSet::kConsumer,
+                          /*always_on=*/true);
     rk.AddCharTVBLimiter(tvb);
 
     rk.Init(op);

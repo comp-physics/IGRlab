@@ -4,6 +4,10 @@
 #include "utils/diagnostics/non_finite.hpp"
 #include "numerics/limiters/limiters.hpp" // ApplyZhangShuPositivityLimiter, etc.
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -67,14 +71,25 @@ inline void WriteDG0ElementField(mfem::ParGridFunction& field,
   MFEM_VERIFY(fes->GetNE() == element_values.Size(),
               "Limiter diagnostics field has the wrong number of elements.");
 
+  const double* values = element_values.HostRead();
+  double* field_data = field.HostWrite();
   mfem::Array<int> vdofs;
   for (int i = 0; i < fes->GetNE(); ++i)
   {
     fes->GetElementVDofs(i, vdofs);
     MFEM_VERIFY(vdofs.Size() == 1,
                 "Limiter diagnostics field must use one scalar dof per element.");
-    field(vdofs[0]) = element_values(i);
+    const int dof = vdofs[0] >= 0 ? vdofs[0] : -1 - vdofs[0];
+    field_data[dof] = values[i];
   }
+}
+
+inline void VerifyHostLimiter(const char* name)
+{
+  MFEM_VERIFY(!mfem::Device::Allows(mfem::Backend::DEVICE_MASK),
+              name << " is host-only and cannot be added to a CUDA RK "
+                   << "pipeline. Use the device-native Zhang-Shu limiter or "
+                   << "run this method on CPU.");
 }
 
 } // namespace
@@ -89,6 +104,7 @@ RK3SSPWithLimiter::RK3SSPWithLimiter(ParFiniteElementSpace& vfes)
 void RK3SSPWithLimiter::Init(TimeDependentOperator& f_)
 {
   ODESolver::Init(f_);
+  state_generation_ = 0;
   const int n = f->Width();
   y_.SetSize(n, mem_type);
   k_.SetSize(n, mem_type);
@@ -109,17 +125,19 @@ int RK3SSPWithLimiter::AutoQuadOrder() const
 
 // ----------------------------- Callback application ----------------------------
 
-void RK3SSPWithLimiter::ApplyCallbacks(Vector& v, double t, bool apply_optional)
+bool RK3SSPWithLimiter::ApplyCallbacks(Vector& v,
+                                       double t,
+                                       bool apply_optional)
 {
   // Quick exit if no callbacks at all.
   if (always_callbacks_.empty() &&
       (!apply_optional || optional_callbacks_.empty()))
   {
-    return;
+    return false;
   }
 
   // Non-owning view of v as a ParGridFunction.
-  ParGridFunction U(&vfes_, v.GetData());
+  ParGridFunction U(&vfes_, v);
 
   // Always-on callbacks (e.g., Zhang–Shu positivity).
   for (auto& cb : always_callbacks_)
@@ -135,11 +153,25 @@ void RK3SSPWithLimiter::ApplyCallbacks(Vector& v, double t, bool apply_optional)
       cb(vfes_, U, t);
     }
   }
+
+  // Callbacks may update the non-owning view on the device. Propagate its
+  // memory validity to the owning RK vector before host diagnostics or output.
+  U.SyncAliasMemory(v);
+  return true;
+}
+
+void RK3SSPWithLimiter::AdvanceStateGeneration()
+{
+  MFEM_VERIFY(state_generation_ !=
+                std::numeric_limits<std::uint64_t>::max(),
+              "RK state generation overflow.");
+  ++state_generation_;
 }
 
 // ----------------------- Convenience helpers to add callbacks ------------------
 
-void RK3SSPWithLimiter::AddZhangShuLimiter(bool always_on)
+void RK3SSPWithLimiter::AddZhangShuLimiter(ZhangShuPointSet point_set,
+                                           bool always_on)
 {
   // Capture parameters by value; the callback will call the PP limiter on the stage.
   const int dim = dim_;
@@ -150,7 +182,15 @@ void RK3SSPWithLimiter::AddZhangShuLimiter(bool always_on)
   const auto face_qords = face_quad_orders_;
   const int iters = p_bisect_iters_;
 
-  auto cb = [this, dim, gamma, rhomin, pmin, qord, face_qords, iters](
+  auto cb = [this,
+             dim,
+             gamma,
+             rhomin,
+             pmin,
+             qord,
+             face_qords,
+             iters,
+             point_set](
               ParFiniteElementSpace& vf, ParGridFunction& U, double /*t*/)
   {
     mfem::ZhangShuLimiterElementDiagnostics* diagnostics_ptr =
@@ -167,6 +207,7 @@ void RK3SSPWithLimiter::AddZhangShuLimiter(bool always_on)
                                    qord,
                                    face_qords,
                                    iters,
+                                   point_set,
                                    diagnostics_ptr);
     if (diagnostics_ptr != nullptr)
     {
@@ -189,6 +230,7 @@ void RK3SSPWithLimiter::AddZhangShuLimiter(bool always_on)
 
 void RK3SSPWithLimiter::AddCharTVBLimiter(const CharTVBOptions& opts)
 {
+  VerifyHostLimiter("Characteristic TVB limiter");
   auto local = opts; // make a self-contained copy for the stored lambda
   AddOptionalCallback(
     [local](ParFiniteElementSpace& vf, ParGridFunction& U, double /*t*/)
@@ -197,6 +239,7 @@ void RK3SSPWithLimiter::AddCharTVBLimiter(const CharTVBOptions& opts)
 
 void RK3SSPWithLimiter::AddCharTVBFaceNormalLimiter(const CharTVBOptions& opts)
 {
+  VerifyHostLimiter("Face-normal TVB limiter");
   auto local = opts; // capture by value
   AddOptionalCallback([local](mfem::ParFiniteElementSpace& vf,
                               mfem::ParGridFunction& U,
@@ -206,6 +249,7 @@ void RK3SSPWithLimiter::AddCharTVBFaceNormalLimiter(const CharTVBOptions& opts)
 
 void RK3SSPWithLimiter::AddCharBJLimiter(const CharBJOptions& opts)
 {
+  VerifyHostLimiter("Characteristic BJ limiter");
   auto local = opts;
   AddOptionalCallback(
     [local](ParFiniteElementSpace& vf, ParGridFunction& U, double /*t*/)
@@ -214,6 +258,7 @@ void RK3SSPWithLimiter::AddCharBJLimiter(const CharBJOptions& opts)
 
 void RK3SSPWithLimiter::AddFaceCharBJLimiter(const FaceBJOptions& opts)
 {
+  VerifyHostLimiter("Face-normal characteristic BJ limiter");
   auto local = opts; // capture by value for safety
   AddOptionalCallback(
     [local](mfem::ParFiniteElementSpace& vf,
@@ -224,6 +269,7 @@ void RK3SSPWithLimiter::AddFaceCharBJLimiter(const FaceBJOptions& opts)
 
 void RK3SSPWithLimiter::AddBarthJespersenLimiter(const BJOptions& opts)
 {
+  VerifyHostLimiter("Barth-Jespersen limiter");
   auto local = opts;
   AddOptionalCallback(
     [local](ParFiniteElementSpace& vf, ParGridFunction& U, double /*t*/)
@@ -232,6 +278,7 @@ void RK3SSPWithLimiter::AddBarthJespersenLimiter(const BJOptions& opts)
 
 void RK3SSPWithLimiter::AddCharVenkatXYLimiter(const VenkatOptions& opts)
 {
+  VerifyHostLimiter("Characteristic Venkat XY limiter");
   auto local = opts;
   AddOptionalCallback([local](mfem::ParFiniteElementSpace& vf,
                               mfem::ParGridFunction& U,
@@ -242,6 +289,7 @@ void RK3SSPWithLimiter::AddCharVenkatXYLimiter(const VenkatOptions& opts)
 void RK3SSPWithLimiter::AddCharVenkatFaceNormalLimiter(
   const VenkatOptions& opts)
 {
+  VerifyHostLimiter("Face-normal characteristic Venkat limiter");
   auto local = opts;
   AddOptionalCallback([local](mfem::ParFiniteElementSpace& vf,
                               mfem::ParGridFunction& U,
@@ -251,6 +299,7 @@ void RK3SSPWithLimiter::AddCharVenkatFaceNormalLimiter(
 
 void RK3SSPWithLimiter::AddKrivodonovaLimiter(const KrivoOptions& opts)
 {
+  VerifyHostLimiter("Krivodonova limiter");
   auto local = opts;
   AddOptionalCallback(
     [local](ParFiniteElementSpace& vf, ParGridFunction& Ustage, double /*t*/)
@@ -386,6 +435,78 @@ void RK3SSPWithLimiter::MaybeScanAdmissibility(Vector& v,
   report_scan(mfem::dg_igr::EulerAdmissibilityPointSet::Output);
 }
 
+void RK3SSPWithLimiter::MaybeCaptureStagePair(Vector& v,
+                                              double t,
+                                              const char* side)
+{
+  const char* prefix = std::getenv("DG_IGR_RK_STAGE_CAPTURE_DIR");
+  if (!prefix || prefix[0] == '\0' || stage_pair_capture_written_)
+  {
+    return;
+  }
+
+  const char* min_time_text = std::getenv("DG_IGR_RK_STAGE_CAPTURE_MIN_TIME");
+  const double min_time = min_time_text ? std::strtod(min_time_text, nullptr) : 0.0;
+  if (t < min_time)
+  {
+    return;
+  }
+
+  int rank = 0;
+  MPI_Comm_rank(vfes_.GetComm(), &rank);
+  std::ostringstream rank_name;
+  rank_name << std::setfill('0') << std::setw(6) << rank;
+  const std::filesystem::path output_dir =
+    std::filesystem::path(prefix) / side;
+  std::filesystem::create_directories(output_dir);
+
+  auto* mesh = vfes_.GetParMesh();
+  {
+    std::ofstream output(output_dir /
+                         ("euler-mesh-final." + rank_name.str()));
+    output.precision(17);
+    output << *mesh;
+  }
+
+  MFEM_VERIFY(vfes_.GetOrdering() == mfem::Ordering::byNODES,
+              "RK stage capture requires byNODES ordering.");
+  const int ndofs = vfes_.GetNDofs();
+  const double* state_data = v.HostRead();
+  mfem::ParFiniteElementSpace scalar_fes(
+    mesh, vfes_.FEColl(), 1, mfem::Ordering::byNODES);
+  for (int component = 0; component < vfes_.GetVDim(); ++component)
+  {
+    mfem::ParGridFunction field(&scalar_fes,
+                                const_cast<double*>(state_data) +
+                                  component * ndofs);
+    std::ofstream output(
+      output_dir /
+      ("euler-" + std::to_string(component) + "-final." + rank_name.str()));
+    output.precision(17);
+    output << field;
+  }
+
+  if (rank == 0)
+  {
+    std::ofstream output(output_dir / "metadata.txt");
+    output << std::setprecision(17)
+           << "side=" << side << '\n'
+           << "step=" << step_count_ << '\n'
+           << "time=" << t << '\n'
+           << "order=" << vfes_.GetFE(0)->GetOrder() << '\n'
+           << "local_state_size=" << v.Size() << '\n';
+    std::cout << "[rk-stage-capture] side=" << side
+              << " step=" << step_count_
+              << " t=" << t
+              << " dir=" << output_dir.string() << std::endl;
+  }
+
+  if (std::string(side) == "post")
+  {
+    stage_pair_capture_written_ = true;
+  }
+}
+
 // --------------------------------- SSPRK(3,3) ---------------------------------
 
 void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
@@ -405,7 +526,10 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   //   - Optional-callbacks: only early steps if apply_optional = true.
   if (limit_initial_)
   {
-    ApplyCallbacks(x, t, apply_optional);
+    if (ApplyCallbacks(x, t, apply_optional))
+    {
+      AdvanceStateGeneration();
+    }
   }
   MaybeScanVector(x, t, "initial");
   MaybeScanAdmissibility(x, t, "initial");
@@ -413,7 +537,7 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   // k0 = f(t, x)
   if (stage_aware)
   {
-    stage_aware->SetRKStage(0);
+    stage_aware->SetRKStageState(0, state_generation_);
   }
   f->SetTime(t);
   f->Mult(x, k_);
@@ -424,13 +548,14 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   MaybeScanVector(y_, t + dt, "stage1-prelimit");
   MaybeScanAdmissibility(y_, t + dt, "stage1-prelimit");
   ApplyCallbacks(y_, t + dt, apply_optional);
+  AdvanceStateGeneration();
   MaybeScanVector(y_, t + dt, "stage1");
   MaybeScanAdmissibility(y_, t + dt, "stage1");
 
   // k1 = f(t+dt, y)
   if (stage_aware)
   {
-    stage_aware->SetRKStage(1);
+    stage_aware->SetRKStageState(1, state_generation_);
   }
   f->SetTime(t + dt);
   f->Mult(y_, k_);
@@ -442,13 +567,14 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   MaybeScanVector(y_, t + dt, "stage2-prelimit");
   MaybeScanAdmissibility(y_, t + dt, "stage2-prelimit");
   ApplyCallbacks(y_, t + dt, /*apply_optional=*/false);
+  AdvanceStateGeneration();
   MaybeScanVector(y_, t + dt, "stage2");
   MaybeScanAdmissibility(y_, t + dt, "stage2");
 
   // k2 = f(t + dt/2, y)
   if (stage_aware)
   {
-    stage_aware->SetRKStage(2);
+    stage_aware->SetRKStageState(2, state_generation_);
   }
   f->SetTime(t + dt / 2);
   f->Mult(y_, k_);
@@ -457,13 +583,21 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   // ===== Stage 3: x = 1/3*x + 2/3 ( y + dt*k2 ) =====
   y_.Add(dt, k_); // y := y + dt*k2
   add(1.0 / 3.0, x, 2.0 / 3.0, y_, x);
+  MaybeCaptureStagePair(x, t + dt, "pre");
   MaybeScanVector(x, t + dt, "stage3-prelimit");
   MaybeScanAdmissibility(x, t + dt, "stage3-prelimit");
   t += dt;
   // Final limiting on x
   ApplyCallbacks(x, t, /*apply_optional=*/false);
+  AdvanceStateGeneration();
+  MaybeCaptureStagePair(x, t, "post");
   MaybeScanVector(x, t, "stage3");
   MaybeScanAdmissibility(x, t, "stage3");
+
+  if (stage_aware)
+  {
+    stage_aware->EndRKStep(x, t, state_generation_);
+  }
 
   ++step_count_;
 }

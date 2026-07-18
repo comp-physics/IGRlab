@@ -22,7 +22,10 @@ struct CommonOptions
   int ser_ref_levels = 0;        ///< Serial uniform refinement levels.
   int par_ref_levels = 1;        ///< Parallel uniform refinement levels.
   int order = 3;                 ///< DG polynomial order.
+  std::string device = "cpu";    ///< Runtime device backend: "cpu" or "cuda".
   std::string dg_backend = "dg"; ///< DG backend: "dg" or "dgsem".
+  std::string zhang_shu_points =
+    "consumer"; ///< Zhang-Shu point set: "consumer" or "quadrature".
   std::string dgsem_stab =
     "none"; ///< DGSEM stabilization: "none", "split", or "filter".
   std::string dgsem_volume_flux =
@@ -39,6 +42,14 @@ struct CommonOptions
   mfem::real_t cfl = 0.3;        ///< CFL number for time step computation.
   bool glvis = false;            ///< Enable GLVis visualization.
   bool vtk_save = true;          ///< Enable ParaView/VTK output.
+  bool vtk_h1_diagnostics =
+    true; ///< Enable optional H1 diagnostic fields when the case provides them.
+  bool vtk_l2_diagnostics =
+    true; ///< Enable optional L2 diagnostic fields when the case provides them.
+  bool vtk_mpi_rank_field =
+    true; ///< Enable optional per-element MPI rank VTK field.
+  bool vtk_zhang_shu_diagnostics =
+    true; ///< Enable optional Zhang-Shu limiter diagnostic VTK fields.
   bool save_state_files =
     false; ///< Save GLVis-compatible init/final snapshots to disk.
   mfem::real_t dt_save = 0.01; ///< Save cadence for ParaView output.
@@ -50,6 +61,9 @@ struct CommonOptions
   bool nan_scan = false; ///< Enable NaN/inf scanning during the time loop.
   bool admissibility_scan =
     false; ///< Enable Euler density/pressure admissibility scans during the time loop.
+  std::string restart_vtk; ///< PVD file or dataset directory to restart from.
+  int restart_cycle = -1;  ///< Selected PVD cycle; -1 selects the latest cycle.
+  int restart_step = -1;   ///< Completed global step for legacy VTK cycles.
 };
 
 /**
@@ -76,10 +90,18 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-o",
                  "--order",
                  "Order (degree) of the finite elements.");
+  args.AddOption(&opts.device,
+                 "-dev",
+                 "--device",
+                 "Runtime device backend: cpu | cuda.");
   args.AddOption(&opts.dg_backend,
                  "-dg",
                  "--dg-backend",
                  "DG backend: dg | dgsem (default set per case).");
+  args.AddOption(&opts.zhang_shu_points,
+                 "-zsp",
+                 "--zhang-shu-points",
+                 "Zhang-Shu positivity points: consumer | quadrature.");
   args.AddOption(
     &opts.dgsem_stab,
     "-ds",
@@ -132,6 +154,31 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-no-vtk",
                  "--no-vtk_save",
                  "Enable or disable VTK visualization.");
+  args.AddOption(&opts.vtk_h1_diagnostics,
+                 "-vtk-h1",
+                 "--vtk-h1-diagnostics",
+                 "-no-vtk-h1",
+                 "--no-vtk-h1-diagnostics",
+                 "Enable or disable optional H1 diagnostic VTK fields.");
+  args.AddOption(&opts.vtk_l2_diagnostics,
+                 "-vtk-l2",
+                 "--vtk-l2-diagnostics",
+                 "-no-vtk-l2",
+                 "--no-vtk-l2-diagnostics",
+                 "Enable or disable optional L2 diagnostic VTK fields.");
+  args.AddOption(&opts.vtk_mpi_rank_field,
+                 "-vtk-rank",
+                 "--vtk-mpi-rank-field",
+                 "-no-vtk-rank",
+                 "--no-vtk-mpi-rank-field",
+                 "Enable or disable optional per-element MPI rank VTK field.");
+  args.AddOption(
+    &opts.vtk_zhang_shu_diagnostics,
+    "-vtk-zs",
+    "--vtk-zhang-shu-diagnostics",
+    "-no-vtk-zs",
+    "--no-vtk-zhang-shu-diagnostics",
+    "Enable or disable optional Zhang-Shu limiter diagnostic VTK fields.");
   args.AddOption(&opts.save_state_files,
                  "-save-state",
                  "--save-state",
@@ -174,6 +221,18 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "--no-admissibility-scan",
                  "Enable or disable Euler density/pressure admissibility "
                  "scans during time integration.");
+  args.AddOption(&opts.restart_vtk,
+                 "-restart-vtk",
+                 "--restart-vtk",
+                 "Restart from an MFEM ParaView PVD file or dataset directory.");
+  args.AddOption(&opts.restart_cycle,
+                 "-restart-cycle",
+                 "--restart-cycle",
+                 "Restart cycle (-1 selects the latest complete cycle).");
+  args.AddOption(&opts.restart_step,
+                 "-restart-step",
+                 "--restart-step",
+                 "Completed global RK step for legacy cycles without a manifest.");
 }
 
 /**

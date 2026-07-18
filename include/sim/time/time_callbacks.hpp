@@ -27,6 +27,8 @@ struct TimeLoopInfo
   bool has_igr = false;
   int igr_linear_calls = 0;
   int igr_linear_converged_calls = 0;
+  int igr_output_only_linear_calls = 0;
+  int igr_output_only_linear_converged_calls = 0;
   double igr_linear_avg_iters = 0.0;
   double igr_linear_solve_seconds = 0.0;
   double igr_linear_solve_fraction = 0.0;
@@ -35,6 +37,7 @@ struct TimeLoopInfo
   double igr_pc_setup_seconds = 0.0;
   double igr_total_work_seconds = 0.0;
   double igr_total_work_fraction = 0.0;
+  double igr_output_only_work_seconds = 0.0;
 };
 
 /// @brief Analysis payload with optional min/max diagnostics.
@@ -63,6 +66,9 @@ struct VTKSaveInfo
 struct RunSummary
 {
   int steps = 0;
+  int segment_steps = 0;
+  double initial_time = 0.0;
+  double final_time = 0.0;
   double elapsed = 0.0;
   double avg_step = 0.0;
   double avg_step_per_dof_local = 0.0;
@@ -73,6 +79,8 @@ struct RunSummary
   bool has_igr = false;
   int igr_linear_calls = 0;
   int igr_linear_converged_calls = 0;
+  int igr_output_only_linear_calls = 0;
+  int igr_output_only_linear_converged_calls = 0;
   double igr_linear_avg_iters = 0.0;
   double igr_linear_solve_seconds = 0.0;
   double igr_linear_solve_fraction = 0.0;
@@ -81,6 +89,7 @@ struct RunSummary
   double igr_pc_setup_seconds = 0.0;
   double igr_total_work_seconds = 0.0;
   double igr_total_work_fraction = 0.0;
+  double igr_output_only_work_seconds = 0.0;
 };
 
 /// @brief Callback bundle for time-loop diagnostics and logging.

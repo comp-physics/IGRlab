@@ -1,5 +1,7 @@
 #include "io/vtk_output.hpp"
 
+#include "utils/config/env_flags.hpp"
+
 namespace mfem
 {
 namespace io
@@ -38,9 +40,18 @@ void RegisterEulerFields(mfem::ParaViewDataCollection& dc,
   }
   if (fields.sigma)
   {
-    dc.RegisterField("sigma", fields.sigma);
+    // MFEM's registration API predates const field handles; ParaView output
+    // only reads the registered GridFunction.
+    dc.RegisterField("sigma",
+                     const_cast<mfem::ParGridFunction*>(fields.sigma));
   }
-  if (fields.pressure)
+  if (fields.pressure_coefficient &&
+      ::dg_igr::EnvFlagEnabledDefault(
+        "DG_IGR_VTK_PRESSURE_COEFFICIENT", false))
+  {
+    dc.RegisterCoeffField("pressure", fields.pressure_coefficient);
+  }
+  else if (fields.pressure)
   {
     dc.RegisterField("pressure", fields.pressure);
   }

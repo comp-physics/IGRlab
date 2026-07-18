@@ -5,26 +5,202 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(CTest)
+include(CheckLanguage)
 option(DG_IGR_BUILD_TESTS "Build dg_igr unit tests" ON)
 option(DG_IGR_REQUIRE_MFEM_CUDA
        "Fail configure unless the discovered MFEM package has CUDA enabled."
        OFF)
+option(DG_IGR_ENABLE_ACCELERATOR_LANGUAGE
+       "Enable local CUDA/HIP language support when MFEM backend requires it."
+       ON)
+set(DG_IGR_EXPECT_CUDA_ARCH
+    ""
+    CACHE STRING
+    "Expected concrete CUDA dependency/device arch for CUDA builds (e.g. 61, sm_61, 120).")
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
 find_package(MFEM REQUIRED CONFIG)
+find_package(ZLIB REQUIRED)
+
+if(MFEM_USE_UMPIRE)
+    find_package(umpire REQUIRED CONFIG)
+endif()
+
+if(MFEM_USE_MPI)
+    find_package(MPI REQUIRED COMPONENTS CXX)
+    set(DG_IGR_MPI_INCLUDE_DIRS "${MPI_CXX_INCLUDE_DIRS}")
+    if((NOT DG_IGR_MPI_INCLUDE_DIRS) AND MPI_CXX_COMPILER)
+        execute_process(
+            COMMAND "${MPI_CXX_COMPILER}" --showme:incdirs
+            RESULT_VARIABLE _dg_igr_mpi_incdirs_rc
+            OUTPUT_VARIABLE _dg_igr_mpi_incdirs_raw
+            ERROR_QUIET
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(_dg_igr_mpi_incdirs_rc EQUAL 0 AND _dg_igr_mpi_incdirs_raw)
+            string(REPLACE " " ";" DG_IGR_MPI_INCLUDE_DIRS "${_dg_igr_mpi_incdirs_raw}")
+        endif()
+    endif()
+endif()
+
+if(MFEM_USE_CUDA AND MFEM_USE_HIP)
+    message(FATAL_ERROR
+            "MFEM reports both CUDA and HIP enabled for this target; "
+            "dg_igr_miniapp expects one accelerator backend at a time.")
+endif()
+
+set(_dg_igr_expected_arch "")
+if(DG_IGR_EXPECT_CUDA_ARCH)
+    set(_dg_igr_expected_arch "${DG_IGR_EXPECT_CUDA_ARCH}")
+    string(REPLACE "sm_" "" _dg_igr_expected_arch "${_dg_igr_expected_arch}")
+    if(NOT _dg_igr_expected_arch MATCHES "^[0-9]+$")
+        message(FATAL_ERROR
+                "DG_IGR_EXPECT_CUDA_ARCH must be numeric or sm_<num>, got '${DG_IGR_EXPECT_CUDA_ARCH}'.")
+    endif()
+endif()
+
+set(DG_IGR_ACCELERATOR_LANGUAGE "")
+if(DG_IGR_ENABLE_ACCELERATOR_LANGUAGE)
+    if(MFEM_USE_CUDA)
+        if(_dg_igr_expected_arch AND NOT CMAKE_CUDA_ARCHITECTURES)
+            set(_dg_igr_default_cuda_arch "${_dg_igr_expected_arch}")
+            if(_dg_igr_expected_arch STREQUAL "120")
+                # Current local sm120 workflow relies on CUDA 80 virtual PTX;
+                # native sm120 codegen is intentionally avoided for now.
+                set(_dg_igr_default_cuda_arch "80-virtual")
+            endif()
+            set(CMAKE_CUDA_ARCHITECTURES
+                "${_dg_igr_default_cuda_arch}"
+                CACHE STRING
+                "CUDA architectures for local accelerator-compiled sources."
+                FORCE)
+        endif()
+
+        check_language(CUDA)
+        if(CMAKE_CUDA_COMPILER)
+            enable_language(CUDA)
+            if(NOT DEFINED CMAKE_CUDA_STANDARD)
+                set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
+                set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+            endif()
+            set(DG_IGR_ACCELERATOR_LANGUAGE "CUDA")
+        else()
+            message(WARNING
+                    "MFEM_USE_CUDA=ON but no CUDA compiler is available to CMake. "
+                    "MFEM CUDA runtime paths remain usable, but local sources cannot "
+                    "compile mfem::forall CUDA kernels until CMAKE_CUDA_COMPILER is set.")
+        endif()
+    elseif(MFEM_USE_HIP)
+        if(CMAKE_VERSION VERSION_LESS 3.21)
+            message(FATAL_ERROR
+                    "MFEM_USE_HIP=ON requires CMake >= 3.21 to enable HIP language.")
+        endif()
+        check_language(HIP)
+        if(CMAKE_HIP_COMPILER)
+            enable_language(HIP)
+            if(NOT DEFINED CMAKE_HIP_STANDARD)
+                set(CMAKE_HIP_STANDARD ${CMAKE_CXX_STANDARD})
+                set(CMAKE_HIP_STANDARD_REQUIRED ON)
+            endif()
+            set(DG_IGR_ACCELERATOR_LANGUAGE "HIP")
+        else()
+            message(WARNING
+                    "MFEM_USE_HIP=ON but no HIP compiler is available to CMake. "
+                    "MFEM HIP runtime paths remain usable, but local sources cannot "
+                    "compile mfem::forall HIP kernels until CMAKE_HIP_COMPILER is set.")
+        endif()
+    endif()
+endif()
 
 if(DG_IGR_REQUIRE_MFEM_CUDA AND NOT MFEM_USE_CUDA)
     message(FATAL_ERROR
-            "DG_IGR_REQUIRE_MFEM_CUDA=ON but the discovered MFEM package has CUDA disabled.")
+            "DG_IGR_REQUIRE_MFEM_CUDA=ON but discovered MFEM has MFEM_USE_CUDA=OFF. "
+            "Point MFEM_DIR to a CUDA-enabled local MFEM install.")
 endif()
 
-# CUDA-enabled HYPRE exposes Umpire types from public headers. MFEM's exported
-# target references umpire but does not load its CMake package downstream.
-if(MFEM_USE_UMPIRE)
-    find_package(umpire REQUIRED CONFIG)
+if(MFEM_USE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+
+    # Required for explicit, fail-fast CUDA dep validation and explicit
+    # downstream linkage in src/CMakeLists.txt.
+    set(DG_IGR_REQUIRED_CUDA_TARGETS
+        CUDA::cudart
+        CUDA::cusparse
+        CUDA::cublas
+        CUDA::curand)
+
+    set(_dg_igr_missing_cuda_targets "")
+    foreach(_cuda_target IN LISTS DG_IGR_REQUIRED_CUDA_TARGETS)
+        if(NOT TARGET ${_cuda_target})
+            list(APPEND _dg_igr_missing_cuda_targets ${_cuda_target})
+        endif()
+    endforeach()
+    if(_dg_igr_missing_cuda_targets)
+        message(FATAL_ERROR
+                "MFEM reports CUDA enabled, but required CUDA toolkit targets are missing: "
+                "${_dg_igr_missing_cuda_targets}. "
+                "Check CUDAToolkit_ROOT/CMAKE_PREFIX_PATH and CUDA installation.")
+    endif()
+
+    get_target_property(_dg_igr_mfem_iface_links mfem INTERFACE_LINK_LIBRARIES)
+    set(_dg_igr_missing_cuda_link_names "")
+    if(_dg_igr_mfem_iface_links)
+        string(JOIN ";" _dg_igr_mfem_iface_links_joined ${_dg_igr_mfem_iface_links})
+        # MFEM CUDA exports may omit cudart while still requiring it as a
+        # transitive runtime dependency; we explicitly link CUDA::cudart in src/.
+        foreach(_cuda_lib_name IN ITEMS cusparse cublas curand)
+            if(NOT _dg_igr_mfem_iface_links_joined MATCHES "${_cuda_lib_name}")
+                list(APPEND _dg_igr_missing_cuda_link_names ${_cuda_lib_name})
+            endif()
+        endforeach()
+    else()
+        list(APPEND _dg_igr_missing_cuda_link_names cusparse cublas curand)
+    endif()
+
+    if(_dg_igr_missing_cuda_link_names)
+        message(FATAL_ERROR
+                "MFEM reports CUDA enabled, but mfem INTERFACE_LINK_LIBRARIES is missing: "
+                "${_dg_igr_missing_cuda_link_names}. "
+                "This is a common transitive-link failure surface (e.g., cusparse not propagating). "
+                "Rebuild local MFEM with CUDA-enabled HYPRE and verify MFEMTargets.cmake exports CUDA deps.")
+    endif()
+endif()
+
+if(DG_IGR_EXPECT_CUDA_ARCH AND MFEM_USE_CUDA)
+    if(CMAKE_CUDA_ARCHITECTURES)
+        string(REPLACE ";" "," _dg_igr_arches "${CMAKE_CUDA_ARCHITECTURES}")
+        set(_dg_igr_cuda_arch_ok OFF)
+        set(_dg_igr_cuda_arch_compat OFF)
+        foreach(_dg_igr_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            if(_dg_igr_arch STREQUAL "${_dg_igr_expected_arch}" OR
+               _dg_igr_arch STREQUAL "${_dg_igr_expected_arch}-real" OR
+               _dg_igr_arch STREQUAL "${_dg_igr_expected_arch}-virtual")
+                set(_dg_igr_cuda_arch_ok ON)
+            endif()
+            if(_dg_igr_expected_arch STREQUAL "120" AND
+               _dg_igr_arch STREQUAL "80-virtual")
+                set(_dg_igr_cuda_arch_ok ON)
+                set(_dg_igr_cuda_arch_compat ON)
+            endif()
+        endforeach()
+        if(NOT _dg_igr_cuda_arch_ok)
+            message(FATAL_ERROR
+                    "CUDA arch policy mismatch: expected concrete profile ${_dg_igr_expected_arch}, "
+                    "configured CMAKE_CUDA_ARCHITECTURES=${_dg_igr_arches}. "
+                    "For the current sm120 workflow, use CMAKE_CUDA_ARCHITECTURES=80-virtual.")
+        elseif(_dg_igr_cuda_arch_compat)
+            message(STATUS
+                    "CUDA arch policy: expected concrete profile ${_dg_igr_expected_arch}; "
+                    "using compatibility codegen CMAKE_CUDA_ARCHITECTURES=${_dg_igr_arches}.")
+        endif()
+    else()
+        message(STATUS
+                "DG_IGR_EXPECT_CUDA_ARCH=${_dg_igr_expected_arch}: local CUDA language is not enabled "
+                "or imported MFEM package does not export architecture metadata; "
+                "validate arch during local MFEM configure/build.")
+    endif()
 endif()
 
 add_subdirectory(src)

@@ -51,6 +51,11 @@ inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
   cfg.solve_mode = ParseIGRSolveMode(igr_opts.solve_mode);
   cfg.lin_solver_type = ParseIGRLinearSolverType(igr_opts.linear_solver);
   cfg.prec_type = ParseIGRPrecondType(igr_opts.preconditioner);
+  if (!igr_opts.nonconvergence_policy.empty())
+  {
+    cfg.nonconvergence_policy =
+      ParseIGRNonconvergencePolicy(igr_opts.nonconvergence_policy);
+  }
   cfg.ip_kind = ParseIGRIPKind(igr_opts.ip_kind);
   if (!igr_opts.sigma_cadence.empty())
   {
@@ -97,6 +102,7 @@ inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
   {
     cfg.amg_strong_threshold = igr_opts.amg_strong_threshold;
   }
+  cfg.exact_dg_face_operator = igr_opts.exact_dg_face_operator;
 }
 
 inline mfem::RK3SSPWithLimiter MakeRK3Stepper(mfem::ParFiniteElementSpace& vfes,

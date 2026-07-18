@@ -5,11 +5,13 @@
  * @brief Euler-specific solver orchestration for sim-layer cases.
  */
 
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "mfem.hpp"
@@ -24,6 +26,7 @@
 #include "sim/io/run_metadata.hpp"
 #include "sim/io/vis_helpers.hpp"
 #include "sim/io/vtk_helpers.hpp"
+#include "sim/io/vtk_restart.hpp"
 #include "sim/state/euler_state_bundle.hpp"
 #include "sim/solver/solver_helpers.hpp"
 #include "sim/time/time_defaults.hpp"
@@ -37,6 +40,22 @@ namespace dg_sim
 
 namespace detail
 {
+
+inline std::string MakeEulerOutputDatasetName(
+  const CaseConfig& case_cfg,
+  const RunConfig& run_cfg,
+  double c_alpha_value,
+  const VTKRestartInfo* restart_info)
+{
+  std::string name =
+    MakeCaseVTKDatasetName(case_cfg, run_cfg, c_alpha_value);
+  if (restart_info)
+  {
+    name += "_restart_c" + std::to_string(restart_info->cycle) + "_s" +
+            std::to_string(restart_info->step);
+  }
+  return name;
+}
 
 inline void VerifyDGSEMElementGeometry(const mfem::Mesh& mesh)
 {
@@ -106,9 +125,71 @@ RunEulerCase(ExampleContext& ctx,
              OnOpenCallback&& on_open_callback,
              RunSummary* summary_out = nullptr,
              double c_alpha_value = std::numeric_limits<double>::quiet_NaN(),
-             bool print_dataset_name = false)
+             bool print_dataset_name = false,
+             const VTKRestartInfo* restart_info = nullptr)
 {
-  UpdateEulerOutputFields(bundle.field_list, bundle.sol, /*warm_start=*/false);
+  const mfem::real_t initial_time = restart_info ? restart_info->time : 0.0;
+  MFEM_VERIFY(!restart_info ||
+                restart_info->step <= std::numeric_limits<int>::max(),
+              "Restart step exceeds the supported time-loop counter range.");
+  const int initial_step = restart_info ? static_cast<int>(restart_info->step) : 0;
+  const int initial_cycle = restart_info ? restart_info->cycle : 0;
+  rk3.Init(op);
+  rk3.SetStepCount(initial_step);
+  auto* sigma_provider = dynamic_cast<mfem::IGRSigmaStateProvider*>(&op);
+
+  EulerOutputFieldTiming initial_field_timing;
+  double initial_sigma_prepare_s = 0.0;
+  mfem::IGRSigmaPreparationResult initial_sigma_preparation;
+  if (sigma_provider &&
+      (restart_info || run_cfg.opts.vtk_save || glvis_enabled))
+  {
+    const auto prepare_start = std::chrono::steady_clock::now();
+    initial_sigma_preparation = sigma_provider->PrepareSigmaForOutput(
+      bundle.sol,
+      rk3.GetStateGeneration(),
+      initial_step,
+      initial_time,
+      /*reusable_stage0=*/true,
+      /*cold_start=*/restart_info != nullptr,
+      /*certify_residual=*/restart_info != nullptr);
+    initial_sigma_prepare_s = SecondsSince(prepare_start);
+  }
+  if (restart_info && sigma_provider && mfem::Mpi::Root())
+  {
+    std::cout << "[vtk-restart] event=sigma-initialization"
+              << " solved=" << (initial_sigma_preparation.solved ? 1 : 0)
+              << " cold_start=1"
+              << " reusable_stage0="
+              << (initial_sigma_preparation.reusable_stage0 ? 1 : 0)
+              << " independent_residual_certified="
+              << (initial_sigma_preparation.independent_residual_certified ? 1
+                                                                          : 0)
+              << " independent_residual_rel_rhs="
+              << initial_sigma_preparation.independent_residual_rel_rhs
+              << "\n";
+  }
+  UpdateEulerOutputFields(bundle.field_list, &initial_field_timing);
+  initial_field_timing.igr_update_s = initial_sigma_prepare_s;
+  initial_field_timing.total_s += initial_sigma_prepare_s;
+  const double initial_update_fields_s = initial_field_timing.total_s;
+  PrintVTKOutputTiming("initial-fields",
+                       initial_cycle,
+                       initial_step,
+                       initial_time,
+                       /*is_initial=*/restart_info == nullptr,
+                       /*is_final=*/false,
+                       initial_update_fields_s,
+                       /*paraview_save_s=*/0.0,
+                       ctx.Mesh().GetComm());
+  PrintVTKOutputFieldTiming("initial-fields",
+                            initial_cycle,
+                            initial_step,
+                            initial_time,
+                            /*is_initial=*/restart_info == nullptr,
+                            /*is_final=*/false,
+                            initial_field_timing,
+                            ctx.Mesh().GetComm());
 
   EulerVisWindows glvis_windows;
   if (glvis_enabled)
@@ -140,27 +221,52 @@ RunEulerCase(ExampleContext& ctx,
     }
   }
 
-  const std::string dc_name =
-    MakeCaseVTKDatasetName(case_cfg, run_cfg, c_alpha_value);
+  const std::string dc_name = detail::MakeEulerOutputDatasetName(
+    case_cfg, run_cfg, c_alpha_value, restart_info);
   auto paraview_dc =
     std::make_unique<mfem::ParaViewDataCollection>(dc_name, &ctx.Mesh());
+  const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
+  const std::string dataset_dir =
+    (std::filesystem::path(vtk_cfg.prefix_path) / dc_name).string();
   if (run_cfg.opts.vtk_save)
   {
     RegisterEulerVTKFields(*paraview_dc, bundle.field_list);
-    const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
     ApplyCaseVTKConfig(*paraview_dc, vtk_cfg, run_cfg.opts.order);
-    paraview_dc->SetCycle(0);
-    paraview_dc->SetTime(0.0);
-    paraview_dc->Save();
-    if (callbacks.on_vtk_save)
+    if (!restart_info)
     {
-      VTKSaveInfo info;
-      info.cycle = 0;
-      info.step = 0;
-      info.t = 0.0;
-      info.is_initial = true;
-      info.is_final = false;
-      callbacks.on_vtk_save(info);
+      paraview_dc->SetCycle(0);
+      paraview_dc->SetTime(0.0);
+      const auto initial_save_start = std::chrono::steady_clock::now();
+      paraview_dc->Save();
+      const double initial_save_s = SecondsSince(initial_save_start);
+      WriteVTKRestartManifest(dataset_dir,
+                              dc_name,
+                              0,
+                              0.0,
+                              0,
+                              run_cfg,
+                              ctx,
+                              bundle.field_list.sigma != nullptr,
+                              paraview_dc->GetCompressionLevel());
+      PrintVTKOutputTiming("initial-save",
+                           /*cycle=*/0,
+                           /*step=*/0,
+                           /*t=*/0.0,
+                           /*is_initial=*/true,
+                           /*is_final=*/false,
+                           /*update_fields_s=*/0.0,
+                           initial_save_s,
+                           ctx.Mesh().GetComm());
+      if (callbacks.on_vtk_save)
+      {
+        VTKSaveInfo info;
+        info.cycle = 0;
+        info.step = 0;
+        info.t = 0.0;
+        info.is_initial = true;
+        info.is_final = false;
+        callbacks.on_vtk_save(info);
+      }
     }
     if (mfem::Mpi::Root())
     {
@@ -178,19 +284,80 @@ RunEulerCase(ExampleContext& ctx,
   io.glvis_windows = &glvis_windows;
   io.glvis_enabled = &glvis_enabled;
   io.paraview = paraview_dc.get();
+  if (run_cfg.opts.vtk_save)
+  {
+    io.after_vtk_save = [&run_cfg,
+                         &ctx,
+                         dataset_dir,
+                         dc_name,
+                         sigma_saved = bundle.field_list.sigma != nullptr,
+                         vtk_compression_level =
+                           paraview_dc->GetCompressionLevel()](
+                          int step, mfem::real_t t, int cycle)
+    {
+      WriteVTKRestartManifest(dataset_dir,
+                              dc_name,
+                              cycle,
+                              t,
+                              step,
+                              run_cfg,
+                              ctx,
+                              sigma_saved,
+                              vtk_compression_level);
+    };
+  }
+  if (sigma_provider)
+  {
+    io.prepare_sigma = [sigma_provider, &bundle, &rk3](int,
+                                                       mfem::real_t t,
+                                                       bool is_final)
+    {
+      const auto prepare_start = std::chrono::steady_clock::now();
+      sigma_provider->PrepareSigmaForOutput(
+        bundle.sol,
+        rk3.GetStateGeneration(),
+        static_cast<int>(rk3.GetStepCount()),
+        t,
+        /*reusable_stage0=*/!is_final);
+      return SecondsSince(prepare_start);
+    };
+  }
 
-  rk3.Init(op);
   TimeLoopConfig loop_cfg = MakeTimeLoopConfig(run_cfg);
   if (run_cfg.opts.vtk_save)
   {
-    loop_cfg.save_index_offset = 1;
+    loop_cfg.save_index_offset = restart_info ? restart_info->cycle + 1 : 1;
   }
+  loop_cfg.initial_time = initial_time;
+  loop_cfg.initial_step = initial_step;
+  loop_cfg.next_save_time =
+    (run_cfg.opts.vtk_save && run_cfg.opts.dt_save > 0.0)
+      ? initial_time + run_cfg.opts.dt_save
+      : -1.0;
   const int num_procs = mfem::Mpi::WorldSize();
   const int my_rank = mfem::Mpi::WorldRank();
   const TimeLoopHooks hooks =
-    MakeEulerTimeLoopHooks(ctx, bundle, num_procs, my_rank, io, callbacks);
+    MakeEulerTimeLoopHooks(ctx,
+                           bundle,
+                           num_procs,
+                           my_rank,
+                           io,
+                           callbacks,
+                           initial_step);
   const TimeLoopResult result =
     RunTimeLoop(op, ctx.Mesh(), bundle.sol, rk3, loop_cfg, hooks);
+  if (sigma_provider && mfem::Mpi::Root())
+  {
+    std::cout << "[igr-sigma-lifecycle] event=run-summary"
+              << " prefetch_solves="
+              << sigma_provider->GetSigmaPrefetchSolveCount()
+              << " stage0_reuses="
+              << sigma_provider->GetSigmaStage0ReuseCount()
+              << " output_only_solves="
+              << sigma_provider->GetSigmaOutputOnlySolveCount()
+              << " prefetch_invalidations="
+              << sigma_provider->GetSigmaPrefetchInvalidationCount() << "\n";
+  }
   if (result.non_finite_count > 0 || result.dt_min_reached)
   {
     return false;
@@ -233,7 +400,8 @@ RunEulerCase(ExampleContext& ctx,
              int precision,
              RunSummary* summary_out = nullptr,
              double c_alpha_value = std::numeric_limits<double>::quiet_NaN(),
-             bool print_dataset_name = false)
+             bool print_dataset_name = false,
+             const VTKRestartInfo* restart_info = nullptr)
 {
   return RunEulerCase(
     ctx,
@@ -248,7 +416,8 @@ RunEulerCase(ExampleContext& ctx,
     []() {},
     summary_out,
     c_alpha_value,
-    print_dataset_name);
+    print_dataset_name,
+    restart_info);
 }
 
 struct Solver
@@ -289,22 +458,78 @@ struct Solver
       spec.add_options(args, case_opts);
     }
     args.ParseCheck();
+    MFEM_VERIFY(!cli_opts.restart_vtk.empty() ||
+                  (cli_opts.restart_cycle < 0 && cli_opts.restart_step < 0),
+                "--restart-cycle/--restart-step require --restart-vtk.");
+    ApplyIGRDerivedRuntimeDefaults(cli_opts,
+                                   cli_igr_opts,
+                                   HasExactDGFaceOptionOverride(argc, argv));
 
     const RunConfig run_cfg = MakeRunConfig(case_cfg, cli_opts, cli_igr_opts);
+    if (spec.use_igr && mfem::Mpi::Root())
+    {
+      std::cout << "[igr-options] event=effective"
+                << " exact_dg_face="
+                << (run_cfg.igr_opts.exact_dg_face_operator ? "on" : "off")
+                << " solver=" << run_cfg.igr_opts.linear_solver
+                << " preconditioner=" << run_cfg.igr_opts.preconditioner
+                << " nonconvergence_policy="
+                << run_cfg.igr_opts.nonconvergence_policy
+                << " sigma_cfl="
+                << (run_cfg.igr_opts.sigma_aware_cfl ? "on" : "off")
+                << " sigma_rusanov="
+                << (run_cfg.igr_opts.sigma_aware_rusanov ? "on" : "off")
+                << " stage_rtol_scale="
+                << (run_cfg.igr_opts.stage_rtol_scale >= 0.0
+                      ? run_cfg.igr_opts.stage_rtol_scale
+                      : run_cfg.case_config.igr_config.stage_rtol_scale)
+                << " lin_rtol="
+                << (run_cfg.igr_opts.lin_rtol >= 0.0
+                      ? run_cfg.igr_opts.lin_rtol
+                      : run_cfg.case_config.igr_config.lin_rtol)
+                << " lin_atol="
+                << (run_cfg.igr_opts.lin_atol >= 0.0
+                      ? run_cfg.igr_opts.lin_atol
+                      : run_cfg.case_config.igr_config.lin_atol)
+                << " lin_maxit="
+                << (run_cfg.igr_opts.lin_maxit >= 0
+                      ? run_cfg.igr_opts.lin_maxit
+                      : run_cfg.case_config.igr_config.lin_maxit)
+                << "\n";
+    }
+    if (run_cfg.device_backend == DeviceBackend::CUDA)
+    {
+#ifndef MFEM_USE_CUDA
+      MFEM_VERIFY(false,
+                  "Requested '--device cuda' but MFEM was built without CUDA "
+                  "support.");
+#endif
+    }
+    mfem::Device device(DeviceBackendToString(run_cfg.device_backend));
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[device] requested="
+                << DeviceBackendToString(run_cfg.device_backend) << "\n";
+      device.Print();
+    }
     bool glvis_enabled = run_cfg.opts.glvis;
     std::cout.precision(spec.glvis.precision);
 
     const bool need_sigma_space = spec.use_igr || spec.need_sigma;
     const bool enable_h1_vis_diag =
       spec.diagnostics.h1_diagnostics &&
-      (run_cfg.opts.glvis || run_cfg.opts.vtk_save);
+      (run_cfg.opts.glvis ||
+       (run_cfg.opts.vtk_save && run_cfg.opts.vtk_h1_diagnostics));
     const bool enable_l2_diag =
-      spec.diagnostics.l2_diagnostics && run_cfg.opts.vtk_save;
+      spec.diagnostics.l2_diagnostics && run_cfg.opts.vtk_save &&
+      run_cfg.opts.vtk_l2_diagnostics;
     const bool enable_mpi_rank_diag =
-      spec.diagnostics.mpi_rank_field && run_cfg.opts.vtk_save;
+      spec.diagnostics.mpi_rank_field && run_cfg.opts.vtk_save &&
+      run_cfg.opts.vtk_mpi_rank_field;
     const bool enable_zhang_shu_diag =
       spec.diagnostics.zhang_shu_limiter &&
       run_cfg.opts.vtk_save &&
+      run_cfg.opts.vtk_zhang_shu_diagnostics &&
       case_cfg.limiter_pipeline.zhang_shu;
     const bool need_h1 = spec.need_h1 || enable_h1_vis_diag;
     ExampleContext ctx = BuildExampleContext(run_cfg,
@@ -380,7 +605,47 @@ struct Solver
     {
       state_bundle.AttachIGR(*igr);
     }
-    state_bundle.ProjectIC(*ic);
+    std::optional<VTKRestartInfo> restart_info;
+    if (run_cfg.opts.restart_vtk.empty())
+    {
+      state_bundle.ProjectIC(*ic);
+    }
+    else
+    {
+      VTKRestartRequest request;
+      request.path = run_cfg.opts.restart_vtk;
+      request.cycle = run_cfg.opts.restart_cycle;
+      request.legacy_step = run_cfg.opts.restart_step;
+      restart_info = LoadEulerVTKRestart(
+        request, run_cfg, ctx, state_bundle.sol, igr != nullptr);
+      MFEM_VERIFY(run_cfg.opts.t_final > restart_info->time,
+                  "-tf/--t-final must be greater than the restart time "
+                    << restart_info->time << ".");
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[vtk-restart] source=" << restart_info->pvd_path
+                  << " cycle=" << restart_info->cycle
+                  << " time=" << restart_info->time
+                  << " step=" << restart_info->step
+                  << " legacy=" << (restart_info->legacy ? 1 : 0)
+                  << " ranks=" << mfem::Mpi::WorldSize()
+                  << " reconstruction_max_abs="
+                  << restart_info->reconstruction_max_abs
+                  << " reconstruction_rel_l2="
+                  << restart_info->reconstruction_rel_l2
+                  << " mesh_point_max_abs="
+                  << restart_info->mesh_point_max_abs
+                  << " condition_inf="
+                  << restart_info->interpolation_condition_inf
+                  << " rho_min=" << restart_info->density_min
+                  << " p_min=" << restart_info->pressure_min
+                  << " sigma_policy=cold-recompute"
+                  << " output_mode=new"
+                  << " next_cycle=" << restart_info->cycle + 1
+                  << " next_time=" << restart_info->time + run_cfg.opts.dt_save
+                  << " load_seconds=" << restart_info->load_seconds << "\n";
+      }
+    }
 
     TimeLoopCallbacks callbacks =
       spec.make_callbacks
@@ -428,14 +693,18 @@ struct Solver
       spec.after_init(case_opts, ctx, state_bundle);
     }
 
+    const std::string output_dataset_name = detail::MakeEulerOutputDatasetName(
+      case_cfg,
+      run_cfg,
+      vtk_c_alpha,
+      restart_info ? &*restart_info : nullptr);
+
     std::string state_snapshot_dir;
     if (run_cfg.opts.save_state_files)
     {
       const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
-      const std::string dataset_name =
-        MakeCaseVTKDatasetName(case_cfg, run_cfg, vtk_c_alpha);
       state_snapshot_dir = (std::filesystem::path(vtk_cfg.prefix_path) /
-                            dataset_name / "glvis_state")
+                            output_dataset_name / "glvis_state")
                              .string();
       SaveInitialEulerState(ctx,
                             state_bundle.sol,
@@ -480,6 +749,7 @@ struct Solver
        &spec,
        &on_open,
        &captured_summary,
+       &restart_info,
        vtk_c_alpha](auto& op)
       {
         return RunEulerCase(ctx,
@@ -494,7 +764,8 @@ struct Solver
                             on_open,
                             &captured_summary,
                             vtk_c_alpha,
-                            spec.vtk.print_dataset_name);
+                            spec.vtk.print_dataset_name,
+                            restart_info ? &*restart_info : nullptr);
       });
     captured_summary_valid = ok;
 
@@ -508,7 +779,9 @@ struct Solver
                               vtk_c_alpha,
                               argc,
                               argv,
-                              /*success=*/false);
+                              /*success=*/false,
+                              output_dataset_name,
+                              restart_info ? &*restart_info : nullptr);
       return 2;
     }
 
@@ -526,10 +799,87 @@ struct Solver
       const double avg_pc_setup_time =
         igr->GetTotalPCSetupSeconds() /
         static_cast<double>(igr->GetLinearSolveCalls());
+      const int total_linear_iters = igr->GetTotalLinearIterations();
+      const double avg_krylov_operator_apply_count =
+        igr->GetTotalKrylovOperatorApplyCount() /
+        static_cast<double>(igr->GetLinearSolveCalls());
+      const double avg_krylov_preconditioner_apply_count =
+        igr->GetTotalKrylovPreconditionerApplyCount() /
+        static_cast<double>(igr->GetLinearSolveCalls());
+      const double avg_krylov_preconditioner_operator_apply_count =
+        igr->GetTotalKrylovPreconditionerOperatorApplyCount() /
+        static_cast<double>(igr->GetLinearSolveCalls());
+      const double krylov_operator_apply_count_per_iter =
+        (total_linear_iters > 0)
+          ? (igr->GetTotalKrylovOperatorApplyCount() /
+             static_cast<double>(total_linear_iters))
+          : 0.0;
+      const double krylov_preconditioner_apply_count_per_iter =
+        (total_linear_iters > 0)
+          ? (igr->GetTotalKrylovPreconditionerApplyCount() /
+             static_cast<double>(total_linear_iters))
+          : 0.0;
+      const double krylov_preconditioner_operator_apply_count_per_iter =
+        (total_linear_iters > 0)
+          ? (igr->GetTotalKrylovPreconditionerOperatorApplyCount() /
+             static_cast<double>(total_linear_iters))
+          : 0.0;
+      const double igr_total_pct =
+        (captured_summary_valid && captured_summary.elapsed > 0.0)
+          ? (100.0 * igr->GetTotalIGRWorkSeconds() / captured_summary.elapsed)
+          : 0.0;
+      const double igr_solve_pct =
+        (captured_summary_valid && captured_summary.elapsed > 0.0)
+          ? (100.0 * igr->GetTotalLinearSolveSeconds() /
+             captured_summary.elapsed)
+          : 0.0;
+      const double igr_stage_total_pct =
+        (igr->GetTotalUpdateCallSeconds() > 0.0)
+          ? (100.0 * igr->GetTotalIGRWorkSeconds() /
+             igr->GetTotalUpdateCallSeconds())
+          : 0.0;
+      const double igr_stage_solve_pct =
+        (igr->GetTotalUpdateCallSeconds() > 0.0)
+          ? (100.0 * igr->GetTotalLinearSolveSeconds() /
+             igr->GetTotalUpdateCallSeconds())
+          : 0.0;
       std::cout << "[igr-linear] event=run-summary"
                 << " calls=" << igr->GetLinearSolveCalls()
                 << " converged_calls=" << igr->GetTotalLinearConvergedCalls()
+                << " production_calls="
+                << igr->GetProductionLinearSolveCalls()
+                << " production_converged_calls="
+                << igr->GetProductionLinearConvergedCalls()
+                << " output_only_calls="
+                << igr->GetOutputOnlyLinearSolveCalls()
+                << " output_only_converged_calls="
+                << igr->GetOutputOnlyLinearConvergedCalls()
+                << " output_only_iters="
+                << igr->GetOutputOnlyLinearIterations()
+                << " output_only_solve_s="
+                << igr->GetOutputOnlyLinearSolveSeconds()
+                << " output_only_igr_s="
+                << igr->GetOutputOnlyIGRWorkSeconds()
+                << " total_iters=" << total_linear_iters
                 << " avg_iters=" << igr->GetAverageLinearIterations()
+                << " max_iters=" << igr->GetMaxLinearIterations()
+                << " avg_solve_iter_s="
+                << ((total_linear_iters > 0)
+                      ? (igr->GetTotalLinearSolveSeconds() /
+                         static_cast<double>(total_linear_iters))
+                      : 0.0)
+                << " avg_krylov_operator_apply_count="
+                << avg_krylov_operator_apply_count
+                << " avg_krylov_preconditioner_apply_count="
+                << avg_krylov_preconditioner_apply_count
+                << " avg_krylov_preconditioner_operator_apply_count="
+                << avg_krylov_preconditioner_operator_apply_count
+                << " krylov_operator_apply_count_per_iter="
+                << krylov_operator_apply_count_per_iter
+                << " krylov_preconditioner_apply_count_per_iter="
+                << krylov_preconditioner_apply_count_per_iter
+                << " krylov_preconditioner_operator_apply_count_per_iter="
+                << krylov_preconditioner_operator_apply_count_per_iter
                 << " avg_assemble_s=" << avg_assemble_time
                 << " avg_form_s=" << avg_form_time
                 << " avg_pc_setup_s=" << avg_pc_setup_time
@@ -537,10 +887,78 @@ struct Solver
                 << " total_assemble_s=" << igr->GetTotalAssembleSeconds()
                 << " total_form_s=" << igr->GetTotalFormSystemSeconds()
                 << " total_pc_setup_s=" << igr->GetTotalPCSetupSeconds()
+                << " total_cheb_diag_s="
+                << igr->GetTotalChebyshevDiagonalSeconds()
+                << " total_cheb_setup_s="
+                << igr->GetTotalChebyshevSetupSeconds()
+                << " total_cheb_eigen_reuses="
+                << igr->GetTotalChebyshevEigenvalueReuses()
+                << " total_cheb_smoother_reuses="
+                << igr->GetTotalChebyshevSmootherReuses()
+                << " total_cheb_smoother_builds="
+                << igr->GetTotalChebyshevSmootherBuilds()
+                << " total_krylov_operator_apply_s="
+                << igr->GetTotalKrylovOperatorApplySeconds()
+                << " total_krylov_preconditioner_apply_s="
+                << igr->GetTotalKrylovPreconditionerApplySeconds()
+                << " total_krylov_preconditioner_operator_apply_s="
+                << igr->GetTotalKrylovPreconditionerOperatorApplySeconds()
+                << " total_krylov_operator_apply_count="
+                << igr->GetTotalKrylovOperatorApplyCount()
+                << " total_krylov_preconditioner_apply_count="
+                << igr->GetTotalKrylovPreconditionerApplyCount()
+                << " total_krylov_preconditioner_operator_apply_count="
+                << igr->GetTotalKrylovPreconditionerOperatorApplyCount()
                 << " total_solve_s=" << igr->GetTotalLinearSolveSeconds()
                 << " total_igr_s=" << igr->GetTotalIGRWorkSeconds()
+                << " total_update_s=" << igr->GetTotalUpdateCallSeconds()
+                << " solve_pct=" << igr_solve_pct
+                << " total_igr_pct=" << igr_total_pct
+                << " solve_pct_stage=" << igr_stage_solve_pct
+                << " total_igr_pct_stage=" << igr_stage_total_pct
                 << " last_solver=" << igr->GetLastLinearSolverName()
-                << " last_precond=" << igr->GetLastPrecondName() << "\n";
+                << " last_precond=" << igr->GetLastPrecondName()
+                << " last_cheb_diag_s="
+                << igr->GetLastChebyshevDiagonalSeconds()
+                << " last_cheb_setup_s="
+                << igr->GetLastChebyshevSetupSeconds()
+                << " last_cheb_eigen_reused="
+                << (igr->GetLastChebyshevEigenvalueReused() ? 1 : 0)
+                << " last_cheb_smoother_reused="
+                << (igr->GetLastChebyshevSmootherReused() ? 1 : 0)
+                << " last_cheb_eigen_estimate="
+                << igr->GetLastChebyshevEigenvalueEstimate()
+                << " last_krylov_operator_apply_s="
+                << igr->GetLastKrylovOperatorApplySeconds()
+                << " last_krylov_preconditioner_apply_s="
+                << igr->GetLastKrylovPreconditionerApplySeconds()
+                << " last_krylov_preconditioner_operator_apply_s="
+                << igr->GetLastKrylovPreconditionerOperatorApplySeconds()
+                << " last_krylov_operator_apply_count="
+                << igr->GetLastKrylovOperatorApplyCount()
+                << " last_krylov_preconditioner_apply_count="
+                << igr->GetLastKrylovPreconditionerApplyCount()
+                << " last_krylov_preconditioner_operator_apply_count="
+                << igr->GetLastKrylovPreconditionerOperatorApplyCount()
+                << " direct_identity_system="
+                << (igr->GetLastDirectIdentitySystem() ? 1 : 0)
+                << " direct_identity_reason="
+                << igr->GetLastDirectIdentityReason()
+                << " direct_identity_uses="
+                << igr->GetDirectIdentitySystemUses()
+                << " exact_face_requested="
+                << (igr->GetLastExactFaceRequested() ? 1 : 0)
+                << " exact_face_effective="
+                << (igr->GetLastExactFaceEffective() ? 1 : 0)
+                << " exact_face_reason=" << igr->GetLastExactFaceReason()
+                << " exact_face_local_nf="
+                << igr->GetLastExactFaceLocalFaceCount()
+                << " exact_face_shared_nf="
+                << igr->GetLastExactFaceSharedFaceCount()
+                << " exact_face_operator_uses="
+                << igr->GetExactFaceOperatorUseCount()
+                << " exact_face_last_mult_calls="
+                << igr->GetLastExactFaceOperatorMultCalls() << "\n";
     }
 
     if (run_cfg.opts.save_state_files)
@@ -561,7 +979,9 @@ struct Solver
                             vtk_c_alpha,
                             argc,
                             argv,
-                            /*success=*/true);
+                            /*success=*/true,
+                            output_dataset_name,
+                            restart_info ? &*restart_info : nullptr);
 
     if (spec.postprocess)
     {

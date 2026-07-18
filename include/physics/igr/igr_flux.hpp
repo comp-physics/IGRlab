@@ -14,6 +14,51 @@
 namespace mfem
 {
 
+/** Conservative explicit speed bound for the pressure-like IGR flux.
+ *
+ * Sigma has pressure units, so sqrt(|Sigma|/rho) is an additional velocity
+ * scale that can be used independently for numerical-flux dissipation and
+ * CFL accounting.
+ */
+MFEM_HOST_DEVICE inline real_t IGRFluxCharacteristicSpeed(real_t base_speed,
+                                                           real_t rho,
+                                                           real_t sigma,
+                                                           real_t rho_floor)
+{
+  const real_t safe_rho = fmax(rho, rho_floor);
+  return base_speed + sqrt(fabs(sigma) / safe_rho);
+}
+
+/** Frozen-stage invariant-domain threshold for the IGR flux.
+ *
+ * For normal velocity u_n and total pressure P = p + sigma, positivity of
+ * both Lax-Friedrichs split states U +/- F_IGR(U)/a requires
+ *
+ *   a >= |u_n| + |P| sqrt((gamma - 1)/(2 rho p)).
+ *
+ * The ordinary Euler characteristic speed already bounds this expression
+ * when sigma is zero. During one explicit stage sigma is fixed by the stage
+ * state, so the bound applies to that stage's face flux and CFL estimate.
+ */
+MFEM_HOST_DEVICE inline real_t IGRFluxInvariantDomainSpeed(
+  real_t base_speed,
+  real_t rho,
+  real_t pressure,
+  real_t transport_speed,
+  real_t sigma,
+  real_t gamma,
+  real_t rho_floor,
+  real_t pressure_floor = dg_igr::LimiterDefaults::kPMin)
+{
+  const real_t safe_rho = fmax(rho, rho_floor);
+  const real_t safe_pressure = fmax(pressure, pressure_floor);
+  const real_t pressure_scale =
+    sqrt(fmax((gamma - 1.0) / (2.0 * safe_rho * safe_pressure), 0.0));
+  const real_t split_speed =
+    transport_speed + fabs(pressure + sigma) * pressure_scale;
+  return fmax(base_speed, split_speed);
+}
+
 /**
  * @brief Decorator that adds Information Geometric Regularization (IGR) to a base FluxFunction.
  *
@@ -22,7 +67,8 @@ namespace mfem
  *  - Normal flux (F(U)·n):       momentum +Sigma n,   energy +Sigma (u·n).
  *
  * Notes
- *  - The returned max characteristic speed comes from the base flux (unchanged).
+ *  - The returned max characteristic speed includes the pressure-like IGR
+ *    scale sqrt(|Sigma|/rho) when Sigma is active and sigma-aware CFL is on.
  *  - On faces, Sigma is taken from the explicit side argument in
  *    ComputeFluxDotNAtSide/ComputeAvgFluxDotNAtSide.
  *    On boundary faces (Elem2 == nullptr) the interior (Left) value is used.
@@ -43,6 +89,29 @@ public:
   /// Density floor used only for u = m / rho in the IGR terms (default FluxDefaults::kRhoVelFloor).
   void SetVelocityRhoFloor(double f) { rho_vel_floor_ = f; }
 
+  /// Include the sigma characteristic scale in the speed returned for CFL accounting.
+  /// Disabled by default; enable it explicitly for sigma-aware CFL diagnostics.
+  void SetSigmaAwareCFL(bool enabled) { sigma_aware_cfl_ = enabled; }
+
+  /// Include the sigma characteristic scale in Rusanov dissipation.
+  /// Disabled by default; enable it explicitly when requested by the case.
+  void SetSigmaAwareRusanov(bool enabled) { sigma_aware_rusanov_ = enabled; }
+
+  bool GetSigmaAwareCFL() const { return sigma_aware_cfl_; }
+  bool GetSigmaAwareRusanov() const { return sigma_aware_rusanov_; }
+
+  /// Select the Rusanov speed independently from the speed reported for CFL.
+  real_t SelectRusanovDissipationSpeed(real_t reported_speed,
+                                       real_t rho,
+                                       real_t sigma) const
+  {
+    const real_t sigma_scale =
+      sqrt(fabs(sigma) / fmax(rho, rho_vel_floor_));
+    const real_t base_speed =
+      fmax(reported_speed - (sigma_aware_cfl_ ? sigma_scale : 0.0), 0.0);
+    return base_speed + (sigma_aware_rusanov_ ? sigma_scale : 0.0);
+  }
+
   /// Side-explicit normal flux path used by side-aware numerical fluxes.
   real_t ComputeFluxDotNAtSide(const Vector& state,
                                const Vector& normal,
@@ -58,12 +127,12 @@ public:
                                   FaceSide side,
                                   Vector& fluxDotN) const override;
 
-  /// Compute tensor flux F(U). Adds IGR tensor terms if Sigma is set; returns base max speed.
+  /// Compute tensor flux F(U), including the IGR flux and configured CFL speed.
   real_t ComputeFlux(const Vector& state,
                      ElementTransformation& Tr,
                      DenseMatrix& flux) const override;
 
-  /// Compute normal flux F(U)·n. Adds IGR normal terms if Sigma is set; returns base max speed.
+  /// Compute normal flux F(U)·n, including the IGR flux and configured CFL speed.
   real_t ComputeFluxDotN(const Vector& state,
                          const Vector& normal,
                          FaceElementTransformations& Tr,
@@ -91,6 +160,15 @@ public:
   /// Get Sigma for a face side at the current face integration point (0 if off).
   double GetSigmaAtSide(FaceElementTransformations& Tr, FaceSide side) const;
 
+  /// Return true when the wrapped base flux is MFEM EulerFlux.
+  bool HasEulerBase() const { return dynamic_cast<const EulerFlux*>(&base_) != nullptr; }
+
+  /// Access the current Sigma field pointer (may be null).
+  const mfem::ParGridFunction* GetSigmaField() const { return sigma_; }
+
+  /// Access the density floor used only in the IGR energy sigma term.
+  double GetVelocityRhoFloor() const { return rho_vel_floor_; }
+
 private:
   const FluxFunction* GetBase() const { return &base_; }
 
@@ -98,6 +176,8 @@ private:
   const mfem::ParGridFunction* sigma_ =
     nullptr; // non-owning; owned by IGR solver/state wiring
   double rho_vel_floor_ = dg_igr::FluxDefaults::kRhoVelFloor;
+  bool sigma_aware_cfl_ = false;
+  bool sigma_aware_rusanov_ = false;
 
   // helpers
 

@@ -26,7 +26,11 @@ template <typename NumericalFlux> struct EulerIGRPhysics
                   dg_igr::IGRSolver& igr,
                   const BoundaryMarkerMap& markers,
                   BcSetup&& bc_setup)
-    : flux(ctx.dim, gamma, igr),
+    : flux(ctx.dim,
+           gamma,
+           igr,
+           ctx.run_cfg.igr_opts.sigma_aware_cfl,
+           ctx.run_cfg.igr_opts.sigma_aware_rusanov),
       op(MakeDGOperator(ctx, flux.numerical_flux))
   {
     ConfigureDGSEMSurfaceFlux(flux.numerical_flux, ctx.run_cfg, gamma);
