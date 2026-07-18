@@ -55,7 +55,9 @@ real_t FluxWithIGR::ComputeFlux(const Vector& U,
   const double sigma = sigma_->GetValue(Tr, ip);
 
   AddTensorSigmaTerms(U, sigma, F);
-  return mcs; // keep dissipation unchanged
+  return sigma_aware_cfl_
+           ? IGRFluxCharacteristicSpeed(mcs, U(0), sigma, rho_vel_floor_)
+           : mcs;
 }
 
 real_t FluxWithIGR::ComputeFluxDotN(const Vector& U,
@@ -80,7 +82,10 @@ real_t FluxWithIGR::ComputeFluxDotNAtSide(const Vector& U,
 
   const double sigma_face = GetSigmaAtSide(Tr, side);
   AddDotNSigmaTerms(U, n, sigma_face, Fn);
-  return mcs;
+  return sigma_aware_cfl_
+           ? IGRFluxCharacteristicSpeed(
+               mcs, U(0), sigma_face, rho_vel_floor_)
+           : mcs;
 }
 
 real_t FluxWithIGR::ComputeAvgFluxDotNAtSide(const Vector& U1,
@@ -102,7 +107,10 @@ real_t FluxWithIGR::ComputeAvgFluxDotNAtSide(const Vector& U1,
     Fn(1 + d) += sigma_face * n(d);
   }
   Fn(1 + dim) += sigma_face * AverageUnOverRhoAlongSegment(U1, U2, n, dim);
-  return mcs;
+  return sigma_aware_cfl_
+           ? IGRFluxCharacteristicSpeed(
+               mcs, std::min(U1(0), U2(0)), sigma_face, rho_vel_floor_)
+           : mcs;
 }
 
 double FluxWithIGR::GetSigmaAtPoint(ElementTransformation& Tr) const

@@ -196,6 +196,10 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << detail::ToJsonString(run_cfg.igr_opts.preconditioner) << ",\n";
   out << "    \"igr_nonconvergence_policy\": "
       << detail::ToJsonString(run_cfg.igr_opts.nonconvergence_policy) << ",\n";
+  out << "    \"igr_sigma_cfl\": "
+      << (run_cfg.igr_opts.sigma_aware_cfl ? "true" : "false") << ",\n";
+  out << "    \"igr_sigma_rusanov\": "
+      << (run_cfg.igr_opts.sigma_aware_rusanov ? "true" : "false") << ",\n";
   out << "    \"igr_sigma_cadence\": "
       << detail::ToJsonString(run_cfg.igr_opts.sigma_cadence) << ",\n";
   out << "    \"igr_sigma_update_interval\": "

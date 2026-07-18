@@ -377,11 +377,27 @@ struct Solver
                 << " preconditioner=" << run_cfg.igr_opts.preconditioner
                 << " nonconvergence_policy="
                 << run_cfg.igr_opts.nonconvergence_policy
-                << " stage_rtol_scale=" << run_cfg.igr_opts.stage_rtol_scale
-                << " lin_rtol=" << run_cfg.igr_opts.lin_rtol
-                << " lin_atol=" << run_cfg.igr_opts.lin_atol
+                << " sigma_cfl="
+                << (run_cfg.igr_opts.sigma_aware_cfl ? "on" : "off")
+                << " sigma_rusanov="
+                << (run_cfg.igr_opts.sigma_aware_rusanov ? "on" : "off")
+                << " stage_rtol_scale="
+                << (run_cfg.igr_opts.stage_rtol_scale >= 0.0
+                      ? run_cfg.igr_opts.stage_rtol_scale
+                      : run_cfg.case_config.igr_config.stage_rtol_scale)
+                << " lin_rtol="
+                << (run_cfg.igr_opts.lin_rtol >= 0.0
+                      ? run_cfg.igr_opts.lin_rtol
+                      : run_cfg.case_config.igr_config.lin_rtol)
+                << " lin_atol="
+                << (run_cfg.igr_opts.lin_atol >= 0.0
+                      ? run_cfg.igr_opts.lin_atol
+                      : run_cfg.case_config.igr_config.lin_atol)
                 << " lin_maxit="
-                << run_cfg.case_config.igr_config.lin_maxit << "\n";
+                << (run_cfg.igr_opts.lin_maxit >= 0
+                      ? run_cfg.igr_opts.lin_maxit
+                      : run_cfg.case_config.igr_config.lin_maxit)
+                << "\n";
     }
     if (run_cfg.device_backend == DeviceBackend::CUDA)
     {

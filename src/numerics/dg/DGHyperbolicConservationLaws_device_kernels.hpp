@@ -560,6 +560,8 @@ struct PackedInteriorFaceEulerRusanovKernel
   real_t gamma = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
   bool use_sigma = false;
+  bool sigma_aware_cfl = false;
+  bool sigma_aware_rusanov = false;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
   const int* face_e2 = nullptr;
@@ -637,12 +639,24 @@ struct PackedInteriorFaceEulerRusanovKernel
       ComputeEulerFluxDotN_(u1, normal, dim, gamma, flux1, speed1);
       ComputeEulerFluxDotN_(u2, normal, dim, gamma, flux2, speed2);
 
+      real_t cfl_speed1 = speed1;
+      real_t cfl_speed2 = speed2;
+      real_t dissipation_speed1 = speed1;
+      real_t dissipation_speed2 = speed2;
       if (use_sigma)
       {
         AddSigmaDotNTerms_(
           u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
         AddSigmaDotNTerms_(
           u2, normal, dim, sigma_2, sigma_rho_floor, flux2);
+        const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
+          speed1, u1[0], sigma_1, sigma_rho_floor);
+        const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
+          speed2, u2[0], sigma_2, sigma_rho_floor);
+        cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
+        cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
+        dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
+        dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
       }
 
       real_t normal_norm2 = 0.0;
@@ -650,8 +664,9 @@ struct PackedInteriorFaceEulerRusanovKernel
       {
         normal_norm2 += normal[d] * normal[d];
       }
-      const real_t scaled_max_speed = fmax(speed1, speed2) * sqrt(normal_norm2);
-      speed_max = fmax(speed_max, fmax(speed1, speed2));
+      const real_t scaled_max_speed =
+        fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
+      speed_max = fmax(speed_max, fmax(cfl_speed1, cfl_speed2));
 
       for (int eq = 0; eq < neq; ++eq)
       {
@@ -688,6 +703,8 @@ struct PackedSharedFaceEulerRusanovKernel
   real_t gamma = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
   bool use_sigma = false;
+  bool sigma_aware_cfl = false;
+  bool sigma_aware_rusanov = false;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
   const int* face_nbr_vdof_map = nullptr;
@@ -774,12 +791,24 @@ struct PackedSharedFaceEulerRusanovKernel
       ComputeEulerFluxDotN_(u1, normal, dim, gamma, flux1, speed1);
       ComputeEulerFluxDotN_(u2, normal, dim, gamma, flux2, speed2);
 
+      real_t cfl_speed1 = speed1;
+      real_t cfl_speed2 = speed2;
+      real_t dissipation_speed1 = speed1;
+      real_t dissipation_speed2 = speed2;
       if (use_sigma)
       {
         AddSigmaDotNTerms_(
           u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
         AddSigmaDotNTerms_(
           u2, normal, dim, sigma_2, sigma_rho_floor, flux2);
+        const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
+          speed1, u1[0], sigma_1, sigma_rho_floor);
+        const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
+          speed2, u2[0], sigma_2, sigma_rho_floor);
+        cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
+        cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
+        dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
+        dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
       }
 
       real_t normal_norm2 = 0.0;
@@ -787,8 +816,9 @@ struct PackedSharedFaceEulerRusanovKernel
       {
         normal_norm2 += normal[d] * normal[d];
       }
-      const real_t scaled_max_speed = fmax(speed1, speed2) * sqrt(normal_norm2);
-      speed_max = fmax(speed_max, fmax(speed1, speed2));
+      const real_t scaled_max_speed =
+        fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
+      speed_max = fmax(speed_max, fmax(cfl_speed1, cfl_speed2));
 
       for (int eq = 0; eq < neq; ++eq)
       {
@@ -823,6 +853,8 @@ struct PackedBoundaryFaceEulerRusanovKernel
   real_t gamma_default = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
   bool use_sigma = false;
+  bool sigma_aware_cfl = false;
+  bool sigma_aware_rusanov = false;
   int bdr_max_attr = 0;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
@@ -929,6 +961,10 @@ struct PackedBoundaryFaceEulerRusanovKernel
       ComputeEulerFluxDotN_(u1, normal, dim, gamma, flux1, speed1);
       ComputeEulerFluxDotN_(u2, normal, dim, gamma, flux2, speed2);
 
+      real_t cfl_speed1 = speed1;
+      real_t cfl_speed2 = speed2;
+      real_t dissipation_speed1 = speed1;
+      real_t dissipation_speed2 = speed2;
       if (use_sigma)
       {
         AddSigmaDotNTerms_(
@@ -937,6 +973,14 @@ struct PackedBoundaryFaceEulerRusanovKernel
         // for both evaluations (Elem2 is null); mirror that behavior.
         AddSigmaDotNTerms_(
           u2, normal, dim, sigma_1, sigma_rho_floor, flux2);
+        const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
+          speed1, u1[0], sigma_1, sigma_rho_floor);
+        const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
+          speed2, u2[0], sigma_1, sigma_rho_floor);
+        cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
+        cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
+        dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
+        dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
       }
 
       real_t normal_norm2 = 0.0;
@@ -944,8 +988,9 @@ struct PackedBoundaryFaceEulerRusanovKernel
       {
         normal_norm2 += normal[d] * normal[d];
       }
-      const real_t scaled_max_speed = fmax(speed1, speed2) * sqrt(normal_norm2);
-      speed_max = fmax(speed_max, fmax(speed1, speed2));
+      const real_t scaled_max_speed =
+        fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
+      speed_max = fmax(speed_max, fmax(cfl_speed1, cfl_speed2));
 
       for (int eq = 0; eq < neq; ++eq)
       {
@@ -982,6 +1027,8 @@ struct PackedInteriorFaceEulerRusanovQKernel
   real_t gamma = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
   bool use_sigma = false;
+  bool sigma_aware_cfl = false;
+  bool sigma_aware_rusanov = false;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
   const int* face_e2 = nullptr;
@@ -1057,12 +1104,24 @@ struct PackedInteriorFaceEulerRusanovQKernel
     ComputeEulerFluxDotN_(u1, normal, dim, gamma, flux1, speed1);
     ComputeEulerFluxDotN_(u2, normal, dim, gamma, flux2, speed2);
 
+    real_t cfl_speed1 = speed1;
+    real_t cfl_speed2 = speed2;
+    real_t dissipation_speed1 = speed1;
+    real_t dissipation_speed2 = speed2;
     if (use_sigma)
     {
       AddSigmaDotNTerms_(
         u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
       AddSigmaDotNTerms_(
         u2, normal, dim, sigma_2, sigma_rho_floor, flux2);
+      const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
+        speed1, u1[0], sigma_1, sigma_rho_floor);
+      const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
+        speed2, u2[0], sigma_2, sigma_rho_floor);
+      cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
+      cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
+      dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
+      dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
     }
 
     real_t normal_norm2 = 0.0;
@@ -1070,9 +1129,9 @@ struct PackedInteriorFaceEulerRusanovQKernel
     {
       normal_norm2 += normal[d] * normal[d];
     }
-    const real_t speed_q = fmax(speed1, speed2);
-    const real_t scaled_max_speed = speed_q * sqrt(normal_norm2);
-    face_speed_q[fq] = speed_q;
+    const real_t scaled_max_speed =
+      fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
+    face_speed_q[fq] = fmax(cfl_speed1, cfl_speed2);
 
     for (int eq = 0; eq < neq; ++eq)
     {
@@ -1107,6 +1166,8 @@ struct PackedSharedFaceEulerRusanovQKernel
   real_t gamma = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
   bool use_sigma = false;
+  bool sigma_aware_cfl = false;
+  bool sigma_aware_rusanov = false;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
   const int* face_nbr_vdof_map = nullptr;
@@ -1189,12 +1250,24 @@ struct PackedSharedFaceEulerRusanovQKernel
     ComputeEulerFluxDotN_(u1, normal, dim, gamma, flux1, speed1);
     ComputeEulerFluxDotN_(u2, normal, dim, gamma, flux2, speed2);
 
+    real_t cfl_speed1 = speed1;
+    real_t cfl_speed2 = speed2;
+    real_t dissipation_speed1 = speed1;
+    real_t dissipation_speed2 = speed2;
     if (use_sigma)
     {
       AddSigmaDotNTerms_(
         u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
       AddSigmaDotNTerms_(
         u2, normal, dim, sigma_2, sigma_rho_floor, flux2);
+      const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
+        speed1, u1[0], sigma_1, sigma_rho_floor);
+      const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
+        speed2, u2[0], sigma_2, sigma_rho_floor);
+      cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
+      cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
+      dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
+      dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
     }
 
     real_t normal_norm2 = 0.0;
@@ -1202,9 +1275,9 @@ struct PackedSharedFaceEulerRusanovQKernel
     {
       normal_norm2 += normal[d] * normal[d];
     }
-    const real_t speed_q = fmax(speed1, speed2);
-    const real_t scaled_max_speed = speed_q * sqrt(normal_norm2);
-    face_speed_q[fq] = speed_q;
+    const real_t scaled_max_speed =
+      fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
+    face_speed_q[fq] = fmax(cfl_speed1, cfl_speed2);
 
     for (int eq = 0; eq < neq; ++eq)
     {
@@ -1236,6 +1309,8 @@ struct PackedBoundaryFaceEulerRusanovQKernel
   real_t gamma_default = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
   bool use_sigma = false;
+  bool sigma_aware_cfl = false;
+  bool sigma_aware_rusanov = false;
   int bdr_max_attr = 0;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
@@ -1340,12 +1415,24 @@ struct PackedBoundaryFaceEulerRusanovQKernel
     ComputeEulerFluxDotN_(u1, normal, dim, gamma, flux1, speed1);
     ComputeEulerFluxDotN_(u2, normal, dim, gamma, flux2, speed2);
 
+    real_t cfl_speed1 = speed1;
+    real_t cfl_speed2 = speed2;
+    real_t dissipation_speed1 = speed1;
+    real_t dissipation_speed2 = speed2;
     if (use_sigma)
     {
       AddSigmaDotNTerms_(
         u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
       AddSigmaDotNTerms_(
         u2, normal, dim, sigma_1, sigma_rho_floor, flux2);
+      const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
+        speed1, u1[0], sigma_1, sigma_rho_floor);
+      const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
+        speed2, u2[0], sigma_1, sigma_rho_floor);
+      cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
+      cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
+      dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
+      dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
     }
 
     real_t normal_norm2 = 0.0;
@@ -1353,9 +1440,9 @@ struct PackedBoundaryFaceEulerRusanovQKernel
     {
       normal_norm2 += normal[d] * normal[d];
     }
-    const real_t speed_q = fmax(speed1, speed2);
-    const real_t scaled_max_speed = speed_q * sqrt(normal_norm2);
-    face_speed_q[fq] = speed_q;
+    const real_t scaled_max_speed =
+      fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
+    face_speed_q[fq] = fmax(cfl_speed1, cfl_speed2);
 
     for (int eq = 0; eq < neq; ++eq)
     {

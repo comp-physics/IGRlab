@@ -67,6 +67,10 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "IGR defaults: CUDA L2/BrokenL2 DG selects Chebyshev");
     ctx.Check(igr_opts.nonconvergence_policy == "accept",
               "IGR defaults: CUDA L2/BrokenL2 DG retains capped iterate");
+    ctx.Check(!igr_opts.sigma_aware_cfl,
+              "IGR defaults: sigma-aware CFL is disabled");
+    ctx.Check(!igr_opts.sigma_aware_rusanov,
+              "IGR defaults: sigma-aware Rusanov is disabled");
     ctx.CheckNear(igr_opts.stage_rtol_scale,
                   1.0,
                   0.0,
@@ -165,6 +169,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     igr_opts.preconditioner = "none";
     igr_opts.lin_rtol = 3.0e-3;
     igr_opts.lin_maxit = 777;
+    igr_opts.sigma_aware_cfl = true;
     dg_sim::ApplyIGRDerivedRuntimeDefaults(opts,
                                            igr_opts,
                                            /*exact_face_operator_overridden=*/false);
@@ -178,6 +183,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   "IGR defaults: explicit CPU L2 tolerance is preserved");
     ctx.Check(igr_opts.lin_maxit == 777,
               "IGR defaults: explicit CPU L2 iteration cap is preserved");
+    ctx.Check(igr_opts.sigma_aware_cfl,
+              "IGR defaults: explicit sigma-aware CFL opt-in is preserved");
   }
 
   {

@@ -1029,6 +1029,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   const auto* flux_igr = dynamic_cast<const FluxWithIGR*>(&flux_fn);
 
   bool use_sigma = false;
+  bool sigma_aware_cfl = false;
+  bool sigma_aware_rusanov = false;
   const ParGridFunction* sigma_field = nullptr;
   real_t sigma_rho_floor = 1.0e-12;
   if (flux_igr && flux_igr->GetSigmaField())
@@ -1040,6 +1042,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       return false;
     }
     sigma_rho_floor = flux_igr->GetVelocityRhoFloor();
+    sigma_aware_cfl = flux_igr->GetSigmaAwareCFL();
+    sigma_aware_rusanov = flux_igr->GetSigmaAwareRusanov();
     use_sigma = true;
   }
 
@@ -1090,6 +1094,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       int_kernel.gamma = dgsem_gamma_;
       int_kernel.sigma_rho_floor = sigma_rho_floor;
       int_kernel.use_sigma = use_sigma;
+      int_kernel.sigma_aware_cfl = sigma_aware_cfl;
+      int_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       int_kernel.state_map = invmass_elem_vdof_map_.Read();
       int_kernel.face_e1 = face_int_e1_.Read();
       int_kernel.face_e2 = face_int_e2_.Read();
@@ -1124,6 +1130,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       int_kernel.gamma = dgsem_gamma_;
       int_kernel.sigma_rho_floor = sigma_rho_floor;
       int_kernel.use_sigma = use_sigma;
+      int_kernel.sigma_aware_cfl = sigma_aware_cfl;
+      int_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       int_kernel.state_map = invmass_elem_vdof_map_.Read();
       int_kernel.face_e1 = face_int_e1_.Read();
       int_kernel.face_e2 = face_int_e2_.Read();
@@ -1163,6 +1171,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       bdr_kernel.gamma_default = dgsem_gamma_;
       bdr_kernel.sigma_rho_floor = sigma_rho_floor;
       bdr_kernel.use_sigma = use_sigma;
+      bdr_kernel.sigma_aware_cfl = sigma_aware_cfl;
+      bdr_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       bdr_kernel.bdr_max_attr = face_bdr_max_attr_;
       bdr_kernel.state_map = invmass_elem_vdof_map_.Read();
       bdr_kernel.face_e1 = face_bdr_e1_.Read();
@@ -1200,6 +1210,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       bdr_kernel.gamma_default = dgsem_gamma_;
       bdr_kernel.sigma_rho_floor = sigma_rho_floor;
       bdr_kernel.use_sigma = use_sigma;
+      bdr_kernel.sigma_aware_cfl = sigma_aware_cfl;
+      bdr_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       bdr_kernel.bdr_max_attr = face_bdr_max_attr_;
       bdr_kernel.state_map = invmass_elem_vdof_map_.Read();
       bdr_kernel.face_e1 = face_bdr_e1_.Read();
@@ -1280,6 +1292,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       shared_kernel.gamma = dgsem_gamma_;
       shared_kernel.sigma_rho_floor = sigma_rho_floor;
       shared_kernel.use_sigma = use_sigma;
+      shared_kernel.sigma_aware_cfl = sigma_aware_cfl;
+      shared_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       shared_kernel.state_map = invmass_elem_vdof_map_.Read();
       shared_kernel.face_e1 = face_shared_e1_.Read();
       shared_kernel.face_nbr_vdof_map = face_shared_nbr_vdof_map_.Read();
@@ -1317,6 +1331,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       shared_kernel.gamma = dgsem_gamma_;
       shared_kernel.sigma_rho_floor = sigma_rho_floor;
       shared_kernel.use_sigma = use_sigma;
+      shared_kernel.sigma_aware_cfl = sigma_aware_cfl;
+      shared_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       shared_kernel.state_map = invmass_elem_vdof_map_.Read();
       shared_kernel.face_e1 = face_shared_e1_.Read();
       shared_kernel.face_nbr_vdof_map = face_shared_nbr_vdof_map_.Read();

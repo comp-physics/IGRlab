@@ -12,6 +12,8 @@
 namespace mfem
 {
 
+class FluxWithIGR;
+
 /**
  * @brief Rusanov flux (local Lax-Friedrichs) that mirrors MFEM's reference
  * implementation, with one addition: if the wrapped FluxFunction implements
@@ -58,6 +60,7 @@ public:
 
 protected:
   const FaceSideExplicitFlux* side_explicit_flux_ = nullptr;
+  const FluxWithIGR* igr_flux_ = nullptr;
 #ifndef MFEM_THREAD_SAFE
   mutable Vector fluxN1, fluxN2;
   mutable DenseMatrix JDotN;

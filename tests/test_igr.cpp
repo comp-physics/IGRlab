@@ -585,8 +585,14 @@ int RunIGRTests(TestContext& ctx)
     mfem::FaceElementTransformations Tr_dummy;
     mfem::Vector base_fn(dim + 2);
     mfem::Vector igr_fn(dim + 2);
-    base_flux.ComputeFluxDotN(state, normal, Tr_dummy, base_fn);
-    igr_flux.ComputeFluxDotN(state, normal, Tr_dummy, igr_fn);
+    const double base_speed =
+      base_flux.ComputeFluxDotN(state, normal, Tr_dummy, base_fn);
+    const double igr_speed =
+      igr_flux.ComputeFluxDotN(state, normal, Tr_dummy, igr_fn);
+    ctx.CheckNear(igr_speed,
+                  base_speed,
+                  tol,
+                  "FluxWithIGR preserves Euler speed when sigma is null");
     ctx.AddParity(igr_fn(0) + igr_fn(1) + igr_fn(2) + igr_fn(3));
     for (int i = 0; i < base_fn.Size(); ++i)
     {
@@ -619,13 +625,19 @@ int RunIGRTests(TestContext& ctx)
   sigma.ExchangeFaceNbrData();
 
   igr_flux.SetSigmaField(&sigma);
+  ctx.Check(!igr_flux.GetSigmaAwareCFL(),
+            "FluxWithIGR defaults to Euler-only CFL accounting");
+  ctx.Check(!igr_flux.GetSigmaAwareRusanov(),
+            "FluxWithIGR defaults to Euler-only Rusanov dissipation");
 
   mfem::FaceElementTransformations& Tr_face = GetFaceTr(pmesh, /*face=*/0);
 
   mfem::Vector base_fn(dim + 2);
   mfem::Vector igr_fn(dim + 2);
-  base_flux.ComputeFluxDotN(state, normal, Tr_face, base_fn);
-  igr_flux.ComputeFluxDotN(state, normal, Tr_face, igr_fn);
+  const double base_speed =
+    base_flux.ComputeFluxDotN(state, normal, Tr_face, base_fn);
+  const double default_igr_speed =
+    igr_flux.ComputeFluxDotN(state, normal, Tr_face, igr_fn);
   ctx.AddParity(igr_fn(0) + igr_fn(1) + igr_fn(2) + igr_fn(3));
 
   const double rho = state(0);
@@ -644,6 +656,89 @@ int RunIGRTests(TestContext& ctx)
                 sigma_value * un,
                 tol,
                 "FluxWithIGR adds sigma*(u·n) to energy flux");
+  ctx.CheckNear(default_igr_speed,
+                base_speed,
+                tol,
+                "FluxWithIGR defaults to the Euler face speed");
+
+  igr_flux.SetSigmaAwareCFL(true);
+  mfem::Vector sigma_cfl_fn(dim + 2);
+  const double igr_speed =
+    igr_flux.ComputeFluxDotN(state, normal, Tr_face, sigma_cfl_fn);
+  for (int i = 0; i < igr_fn.Size(); ++i)
+  {
+    ctx.CheckNear(sigma_cfl_fn(i),
+                  igr_fn(i),
+                  tol,
+                  "Sigma-aware CFL does not alter physical flux, component " +
+                    std::to_string(i));
+  }
+  ctx.CheckNear(igr_speed,
+                base_speed + std::sqrt(std::abs(sigma_value) / rho),
+                tol,
+                "FluxWithIGR opt-in includes sigma pressure scale in face speed");
+
+  // The IGR bound is the exact pressure threshold for both frozen-stage
+  // Lax-Friedrichs split states. This low-pressure case distinguishes it from
+  // the former sqrt(|sigma|/rho) heuristic by several orders of magnitude.
+  {
+    const mfem::Vector low_pressure_state = EulerConsFromPrim2D(
+      /*rho=*/1.0e-2,
+      /*u=*/0.2,
+      /*v=*/0.3,
+      /*p=*/1.0e-6,
+      gamma);
+    mfem::Vector unit_normal(dim);
+    unit_normal(0) = 1.0;
+    unit_normal(1) = 0.0;
+    mfem::Vector full_flux(dim + 2);
+    const double current_speed = igr_flux.ComputeFluxDotN(
+      low_pressure_state, unit_normal, Tr_face, full_flux);
+    const double analytic_threshold =
+      0.2 + std::abs(1.0e-6 + sigma_value) *
+              std::sqrt((gamma - 1.0) /
+                        (2.0 * 1.0e-2 * 1.0e-6));
+    const double split_threshold = mfem::IGRFluxInvariantDomainSpeed(
+      current_speed,
+      1.0e-2,
+      1.0e-6,
+      0.2,
+      sigma_value,
+      gamma,
+      igr_flux.GetVelocityRhoFloor());
+    ctx.CheckNear(split_threshold,
+                  analytic_threshold,
+                  2.0e-10 * analytic_threshold,
+                  "IGR invariant-domain speed matches the analytic threshold");
+
+    auto pressure_of = [gamma, dim](const mfem::Vector& value)
+    {
+      double momentum_sq = 0.0;
+      for (int d = 0; d < dim; ++d)
+      {
+        momentum_sq += value(1 + d) * value(1 + d);
+      }
+      return (gamma - 1.0) *
+             (value(1 + dim) - 0.5 * momentum_sq / value(0));
+    };
+    bool safe_splits = true;
+    bool unsafe_split_detected = false;
+    for (const double sign : {-1.0, 1.0})
+    {
+      mfem::Vector safe(low_pressure_state);
+      safe.Add(sign / (1.001 * split_threshold), full_flux);
+      safe_splits = safe_splits && safe(0) > 0.0 && pressure_of(safe) > 0.0;
+
+      mfem::Vector unsafe(low_pressure_state);
+      unsafe.Add(sign / (0.999 * split_threshold), full_flux);
+      unsafe_split_detected = unsafe_split_detected ||
+                              unsafe(0) <= 0.0 || pressure_of(unsafe) <= 0.0;
+    }
+    ctx.Check(safe_splits,
+              "IGR invariant-domain speed keeps both split states admissible");
+    ctx.Check(unsafe_split_detected,
+              "A speed below the IGR invariant-domain threshold loses pressure");
+  }
 
   // --- Tensor flux path: sigma terms must enter ComputeFlux (volume flux) ---
   {
@@ -753,6 +848,8 @@ int RunIGRTests(TestContext& ctx)
 
     mfem::FluxWithIGR igr_flux_if(base_flux);
     igr_flux_if.SetSigmaField(&sigma_if);
+    igr_flux_if.SetSigmaAwareCFL(true);
+    igr_flux_if.SetSigmaAwareRusanov(true);
     mfem::RusanovFluxWithSides num_flux(igr_flux_if);
 
     const mfem::Vector state_left = EulerConsFromPrim2D(
@@ -772,6 +869,8 @@ int RunIGRTests(TestContext& ctx)
     normal_if(1) = -0.5;
 
     double local_max_err = 0.0;
+    double local_base_dissipation_err = 0.0;
+    double local_cfl_separation_err = 0.0;
     int local_face_count = 0;
 
     const mfem::IntegrationRule& ir_face =
@@ -805,7 +904,11 @@ int RunIGRTests(TestContext& ctx)
       AddSigmaDotNTerms(state_left, normal_if, sigma1, fluxN1);
       AddSigmaDotNTerms(state_right, normal_if, sigma2, fluxN2);
 
-      const double max_speed = std::max(speed1, speed2);
+      const double igr_speed1 = mfem::IGRFluxCharacteristicSpeed(
+        speed1, state_left(0), sigma1, igr_flux_if.GetVelocityRhoFloor());
+      const double igr_speed2 = mfem::IGRFluxCharacteristicSpeed(
+        speed2, state_right(0), sigma2, igr_flux_if.GetVelocityRhoFloor());
+      const double max_speed = std::max(igr_speed1, igr_speed2);
       const double scaled_max_speed = max_speed * normal_if.Norml2();
 
       mfem::Vector expected(dim + 2);
@@ -817,13 +920,53 @@ int RunIGRTests(TestContext& ctx)
       }
 
       mfem::Vector actual(dim + 2);
-      num_flux.Eval(state_left, state_right, normal_if, *Tr, actual);
+      const double actual_cfl_speed =
+        num_flux.Eval(state_left, state_right, normal_if, *Tr, actual);
 
       for (int i = 0; i < actual.Size(); ++i)
       {
         local_max_err =
           std::max(local_max_err, std::abs(actual(i) - expected(i)));
       }
+
+      igr_flux_if.SetSigmaAwareRusanov(false);
+      mfem::Vector base_dissipation_actual(dim + 2);
+      const double base_dissipation_cfl = num_flux.Eval(
+        state_left, state_right, normal_if, *Tr, base_dissipation_actual);
+      const double base_max_speed = std::max(speed1, speed2);
+      const double base_scaled_max_speed = base_max_speed * normal_if.Norml2();
+      for (int i = 0; i < base_dissipation_actual.Size(); ++i)
+      {
+        const double base_expected =
+          0.5 * (base_scaled_max_speed *
+                   (state_left(i) - state_right(i)) +
+                 fluxN1(i) + fluxN2(i));
+        local_base_dissipation_err =
+          std::max(local_base_dissipation_err,
+                   std::abs(base_dissipation_actual(i) - base_expected));
+      }
+      local_cfl_separation_err =
+        std::max(local_cfl_separation_err,
+                 std::abs(base_dissipation_cfl - max_speed));
+
+      igr_flux_if.SetSigmaAwareRusanov(true);
+      igr_flux_if.SetSigmaAwareCFL(false);
+      mfem::Vector base_cfl_actual(dim + 2);
+      const double base_cfl_speed = num_flux.Eval(
+        state_left, state_right, normal_if, *Tr, base_cfl_actual);
+      for (int i = 0; i < base_cfl_actual.Size(); ++i)
+      {
+        local_cfl_separation_err =
+          std::max(local_cfl_separation_err,
+                   std::abs(base_cfl_actual(i) - actual(i)));
+      }
+      local_cfl_separation_err =
+        std::max(local_cfl_separation_err,
+                 std::abs(base_cfl_speed - base_max_speed));
+      local_cfl_separation_err =
+        std::max(local_cfl_separation_err,
+                 std::abs(actual_cfl_speed - max_speed));
+      igr_flux_if.SetSigmaAwareCFL(true);
       ++local_face_count;
     }
 
@@ -838,6 +981,11 @@ int RunIGRTests(TestContext& ctx)
       ctx.AddParity(global_max_err + sigma_left + sigma_right);
       ctx.Check(global_max_err < 5.0e-11,
                 "FluxWithIGR side selection matches expected sigma per side");
+      ctx.Check(GlobalMax(local_base_dissipation_err) < 5.0e-11,
+                "IGR sigma Rusanov toggle preserves sigma physical flux and "
+                "uses base Euler dissipation");
+      ctx.Check(GlobalMax(local_cfl_separation_err) < 5.0e-11,
+                "IGR sigma CFL and Rusanov controls are independent");
     }
   }
 
@@ -1043,6 +1191,56 @@ int RunIGRTests(TestContext& ctx)
               "DG (weak-div) IGR residual ~0 when sigma = 0");
     ctx.Check(resid_sigma > 1.0e-8,
               "DG (weak-div) IGR residual responds to varying sigma");
+
+    mfem::ParGridFunction U_varying(&vfes);
+    mfem::VectorFunctionCoefficient varying_state(
+      num_eq1,
+      [gamma](const mfem::Vector& point, mfem::Vector& value)
+      {
+        value = EulerConsFromPrim1D(1.0 + 0.1 * point(0),
+                                    0.2 - 0.15 * point(0),
+                                    0.8 + 0.2 * point(0),
+                                    gamma);
+      });
+    U_varying.ProjectCoefficient(varying_state);
+    U_varying.GetTrueDofs(x_dg);
+    sigma_dg.ProjectCoefficient(sigma_linear);
+    sigma_dg.ExchangeFaceNbrData();
+
+    igr_flux_dg.SetSigmaAwareCFL(true);
+    igr_flux_dg.SetSigmaAwareRusanov(true);
+    mfem::Vector residual_both(vfes.GetTrueVSize());
+    oper.Mult(x_dg, residual_both);
+    const double speed_both = oper.GetMaxCharSpeed();
+
+    igr_flux_dg.SetSigmaAwareRusanov(false);
+    mfem::Vector residual_base_rusanov(vfes.GetTrueVSize());
+    oper.Mult(x_dg, residual_base_rusanov);
+    const double speed_base_rusanov = oper.GetMaxCharSpeed();
+
+    igr_flux_dg.SetSigmaAwareRusanov(true);
+    igr_flux_dg.SetSigmaAwareCFL(false);
+    mfem::Vector residual_base_cfl(vfes.GetTrueVSize());
+    oper.Mult(x_dg, residual_base_cfl);
+    const double speed_base_cfl = oper.GetMaxCharSpeed();
+
+    mfem::Vector rusanov_delta(residual_both);
+    rusanov_delta -= residual_base_rusanov;
+    mfem::Vector cfl_delta(residual_both);
+    cfl_delta -= residual_base_cfl;
+    ctx.Check(GlobalL2Norm(rusanov_delta) > 1.0e-10,
+              "DG IGR sigma Rusanov switch changes only face dissipation");
+    ctx.Check(GlobalL2Norm(cfl_delta) <=
+                1.0e-11 * std::max(1.0, GlobalL2Norm(residual_both)),
+              "DG IGR sigma CFL switch does not change the residual");
+    ctx.CheckNear(speed_base_rusanov,
+                  speed_both,
+                  1.0e-12 * std::max(1.0, speed_both),
+                  "DG IGR sigma Rusanov switch preserves CFL speed");
+    ctx.Check(speed_base_cfl < speed_both,
+              "DG IGR sigma CFL switch independently lowers CFL speed");
+
+    igr_flux_dg.SetSigmaAwareCFL(true);
   }
 
   // --- IGR solver instance isolation: per-instance scratch/config must not alias ---

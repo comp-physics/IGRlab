@@ -49,6 +49,8 @@ struct IGROptions
   int amg_max_levels = -1;
   double amg_strong_threshold = -1.0;
   bool exact_dg_face_operator = false;
+  bool sigma_aware_cfl = false;
+  bool sigma_aware_rusanov = false;
 };
 
 /// @brief DG backend selection.
@@ -1012,6 +1014,21 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "--no-igr-exact-dg-face",
                  "Enable or disable the side-aware exact DG face operator "
                  "for L2/DG IGR.");
+  args.AddOption(&igr_opts.sigma_aware_cfl,
+                 "-isigcfl",
+                 "--igr-sigma-cfl",
+                 "-ino-sigcfl",
+                 "--no-igr-sigma-cfl",
+                 "Include or exclude the IGR sigma speed in CFL accounting "
+                 "(default off).");
+  args.AddOption(
+    &igr_opts.sigma_aware_rusanov,
+    "-isigrus",
+    "--igr-sigma-rusanov",
+    "-ino-sigrus",
+    "--no-igr-sigma-rusanov",
+    "Include or exclude the IGR sigma speed in Rusanov dissipation "
+    "(default off).");
 }
 
 inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,

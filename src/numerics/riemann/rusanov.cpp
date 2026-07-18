@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "numerics/riemann/side_scope_utils.hpp"
+#include "physics/igr/igr_flux.hpp"
 
 namespace mfem
 {
@@ -11,7 +12,8 @@ namespace mfem
 RusanovFluxWithSides::RusanovFluxWithSides(const FluxFunction& fluxFunction)
   : NumericalFlux(fluxFunction),
     side_explicit_flux_(
-      dynamic_cast<const FaceSideExplicitFlux*>(&fluxFunction))
+      dynamic_cast<const FaceSideExplicitFlux*>(&fluxFunction)),
+    igr_flux_(dynamic_cast<const FluxWithIGR*>(&fluxFunction))
 {
 #ifndef MFEM_THREAD_SAFE
   fluxN1.SetSize(fluxFunction.num_equations);
@@ -47,16 +49,24 @@ real_t RusanovFluxWithSides::Eval(const Vector& state1,
                                                   fluxN2);
 
   // NOTE: nor in general is not a unit normal
-  const real_t maxE = std::max(speed1, speed2);
+  const real_t cflMaxE = std::max(speed1, speed2);
+  if (igr_flux_)
+  {
+    speed1 = igr_flux_->SelectRusanovDissipationSpeed(
+      speed1, state1(0), igr_flux_->GetSigmaAtSide(Tr, FaceSide::Left));
+    speed2 = igr_flux_->SelectRusanovDissipationSpeed(
+      speed2, state2(0), igr_flux_->GetSigmaAtSide(Tr, FaceSide::Right));
+  }
+  const real_t dissipationMaxE = std::max(speed1, speed2);
   // here, nor.Norml2() is multiplied to match the scale with fluxN
-  const real_t scaledMaxE = maxE * nor.Norml2();
+  const real_t scaledMaxE = dissipationMaxE * nor.Norml2();
 
   for (int i = 0; i < fluxFunction.num_equations; i++)
   {
     flux(i) =
       0.5 * (scaledMaxE * (state1(i) - state2(i)) + (fluxN1(i) + fluxN2(i)));
   }
-  return maxE;
+  return cflMaxE;
 }
 
 void RusanovFluxWithSides::Grad(int side,
@@ -87,8 +97,15 @@ void RusanovFluxWithSides::Grad(int side,
                                                   Tr,
                                                   fluxN2);
 
-  const real_t maxE = std::max(speed1, speed2);
-  const real_t scaledMaxE = maxE * nor.Norml2();
+  if (igr_flux_)
+  {
+    speed1 = igr_flux_->SelectRusanovDissipationSpeed(
+      speed1, state1(0), igr_flux_->GetSigmaAtSide(Tr, FaceSide::Left));
+    speed2 = igr_flux_->SelectRusanovDissipationSpeed(
+      speed2, state2(0), igr_flux_->GetSigmaAtSide(Tr, FaceSide::Right));
+  }
+  const real_t dissipationMaxE = std::max(speed1, speed2);
+  const real_t scaledMaxE = dissipationMaxE * nor.Norml2();
 
   const int m = fluxFunction.num_equations;
   if (side == 1)
@@ -137,15 +154,25 @@ real_t RusanovFluxWithSides::Average(const Vector& state1,
                                                      Tr,
                                                      fluxN2);
 
-  const real_t maxE = std::max(speed1, speed2);
-  const real_t scaledMaxE = maxE * nor.Norml2() * 0.5;
+  const real_t cflMaxE = std::max(speed1, speed2);
+  if (igr_flux_)
+  {
+    speed1 = igr_flux_->SelectRusanovDissipationSpeed(
+      speed1, state1(0), igr_flux_->GetSigmaAtSide(Tr, FaceSide::Left));
+    speed2 = igr_flux_->SelectRusanovDissipationSpeed(
+      speed2,
+      std::min(state1(0), state2(0)),
+      igr_flux_->GetSigmaAtSide(Tr, FaceSide::Right));
+  }
+  const real_t dissipationMaxE = std::max(speed1, speed2);
+  const real_t scaledMaxE = dissipationMaxE * nor.Norml2() * 0.5;
 
   for (int i = 0; i < fluxFunction.num_equations; i++)
   {
     flux(i) =
       0.5 * (scaledMaxE * (state1(i) - state2(i)) + (fluxN1(i) + fluxN2(i)));
   }
-  return maxE;
+  return cflMaxE;
 }
 
 void RusanovFluxWithSides::AverageGrad(int side,
@@ -200,8 +227,17 @@ void RusanovFluxWithSides::AverageGrad(int side,
 
     fluxFunction.ComputeFluxJacobianDotN(state1, nor, Tr, JDotN);
 
-    const real_t maxE = std::max(speed1, speed2);
-    const real_t scaledMaxE = maxE * nor.Norml2() * 0.5;
+    if (igr_flux_)
+    {
+      speed1 = igr_flux_->SelectRusanovDissipationSpeed(
+        speed1, state1(0), igr_flux_->GetSigmaAtSide(Tr, FaceSide::Left));
+      speed2 = igr_flux_->SelectRusanovDissipationSpeed(
+        speed2,
+        std::min(state1(0), state2(0)),
+        igr_flux_->GetSigmaAtSide(Tr, FaceSide::Right));
+    }
+    const real_t dissipationMaxE = std::max(speed1, speed2);
+    const real_t scaledMaxE = dissipationMaxE * nor.Norml2() * 0.5;
 
     grad = 0.0;
 
@@ -236,8 +272,17 @@ void RusanovFluxWithSides::AverageGrad(int side,
                                                     Tr,
                                                     fluxN2);
 
-    const real_t maxE = std::max(speed1, speed2);
-    const real_t scaledMaxE = maxE * nor.Norml2() * 0.5;
+    if (igr_flux_)
+    {
+      speed1 = igr_flux_->SelectRusanovDissipationSpeed(
+        speed1,
+        std::min(state1(0), state2(0)),
+        igr_flux_->GetSigmaAtSide(Tr, FaceSide::Left));
+      speed2 = igr_flux_->SelectRusanovDissipationSpeed(
+        speed2, state2(0), igr_flux_->GetSigmaAtSide(Tr, FaceSide::Right));
+    }
+    const real_t dissipationMaxE = std::max(speed1, speed2);
+    const real_t scaledMaxE = dissipationMaxE * nor.Norml2() * 0.5;
 
     grad = 0.0;
 

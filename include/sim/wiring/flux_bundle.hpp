@@ -17,12 +17,18 @@ template <typename NumericalFlux> struct EulerIGRFluxBundle
   mfem::FluxWithIGR igr_flux;
   NumericalFlux numerical_flux;
 
-  EulerIGRFluxBundle(int dim, double gamma, dg_igr::IGRSolver& igr)
+  EulerIGRFluxBundle(int dim,
+                     double gamma,
+                     dg_igr::IGRSolver& igr,
+                     bool sigma_aware_cfl,
+                     bool sigma_aware_rusanov)
     : base_flux(dim, gamma),
       igr_flux(base_flux),
       numerical_flux(igr_flux)
   {
     igr_flux.SetSigmaField(&igr.GetSigma());
+    igr_flux.SetSigmaAwareCFL(sigma_aware_cfl);
+    igr_flux.SetSigmaAwareRusanov(sigma_aware_rusanov);
   }
 };
 
