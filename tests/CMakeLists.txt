@@ -250,6 +250,7 @@ if (MFEM_USE_CUDA AND TARGET supersonic_cylinder_w_igr)
             --igr-stage-rtol-scale 1
             --cpu-igr-lin-rtol 1.0e-8
             --cuda-igr-lin-rtol 1.0e-5
+            --cpu-igr-lin-maxit 1000
             --cpu-igr-lin-atol 0.0
             --cuda-igr-lin-atol 0.0
             --cpu-igr-linear-solver minres
@@ -360,6 +361,7 @@ if (MFEM_USE_CUDA AND TARGET supersonic_cylinder_w_igr)
               --igr-stage-rtol-scale 1
               --cpu-igr-lin-rtol 1.0e-8
               --cuda-igr-lin-rtol 1.0e-5
+              --cpu-igr-lin-maxit 1000
               --cpu-igr-lin-atol 0.0
               --cuda-igr-lin-atol 0.0
               --cpu-igr-linear-solver minres

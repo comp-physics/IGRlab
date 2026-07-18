@@ -1991,6 +1991,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   MFEM_VERIFY(extended_certificate_factor > 0.0,
               "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR must be positive.");
   const bool extended_certificate_enabled =
+    ::dg_igr::EnvFlagEnabledDefault(
+      "DG_IGR_IGR_EXTENDED_CERTIFICATE", false) &&
     exact_face_sum_op && lin_maxit_ > extended_certificate_start;
   const bool run_operator_probe =
     operator_probe_every > 0 && solve_call >= operator_probe_start &&
@@ -2058,7 +2060,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   LinearSolverType solver_choice = lin_solver_type_;
   if (solver_choice == LinearSolverType::Auto)
   {
-    solver_choice = spd_ok ? LinearSolverType::CG : LinearSolverType::GMRES;
+    solver_choice = is_dg ? LinearSolverType::GMRES : LinearSolverType::CG;
   }
 
   // Guardrail: do not use SPD-only Krylov methods when SPD assumptions fail.
@@ -2396,6 +2398,63 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
   MFEM_VERIFY(VectorIsFinite(B_),
               "IGR RHS contains non-finite values before Krylov solve.");
+
+  last_warm_start_guard_rejected_ = false;
+  last_warm_start_residual_norm_ =
+    std::numeric_limits<double>::quiet_NaN();
+  last_zero_start_residual_norm_ =
+    std::numeric_limits<double>::quiet_NaN();
+  if (enable_warm_start &&
+      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_WARM_START_GUARD", false))
+  {
+    ::dg_igr::NVTXRange warm_guard_range("IGR/warm-start-residual-guard");
+    mfem::Vector operator_guess(B_.Size());
+    mfem::Vector warm_residual(B_);
+    A_op->Mult(X_, operator_guess);
+    warm_residual -= operator_guess;
+
+    auto residual_norm = [&](const mfem::Vector& residual)
+    {
+      if (!prec)
+      {
+        return OperatorProbeNorm(residual, comm);
+      }
+      mfem::Vector preconditioned(residual.Size());
+      prec->Mult(residual, preconditioned);
+      const double norm_squared =
+        OperatorProbeDot(residual, preconditioned, comm);
+      return norm_squared >= 0.0
+               ? std::sqrt(norm_squared)
+               : std::numeric_limits<double>::quiet_NaN();
+    };
+
+    last_warm_start_residual_norm_ = residual_norm(warm_residual);
+    last_zero_start_residual_norm_ = residual_norm(B_);
+    const bool warm_residual_usable =
+      std::isfinite(last_warm_start_residual_norm_) &&
+      std::isfinite(last_zero_start_residual_norm_) &&
+      last_warm_start_residual_norm_ <= last_zero_start_residual_norm_;
+    if (!warm_residual_usable)
+    {
+      X_ = 0.0;
+      enable_warm_start = false;
+      last_warm_start_guard_rejected_ = true;
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[igr-linear] event=warm-start-residual-guard"
+                  << " solve_call=" << solve_call
+                  << " rk_step=" << rk_step_index_
+                  << " rk_stage=" << rk_stage_index_
+                  << " action=cold-start"
+                  << " warm_residual_norm="
+                  << last_warm_start_residual_norm_
+                  << " zero_residual_norm="
+                  << last_zero_start_residual_norm_
+                  << std::endl;
+      }
+    }
+  }
+  last_warm_start_effective_ = enable_warm_start;
 
   const bool is_intermediate_stage = (rk_stage_index_ >= 0 && rk_stage_index_ < 2);
   const double effective_rtol =
@@ -2738,6 +2797,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   {
     if (nonconvergence_policy_ == NonconvergencePolicy::Accept)
     {
+      MFEM_VERIFY(VectorIsFinite(X_),
+                  "IGR linear solve produced a non-finite capped iterate; "
+                  "nonconvergence policy 'accept' cannot recover it into "
+                  "sigma.");
       if (mfem::Mpi::Root())
       {
         std::cout << "[igr-linear] event=nonconvergence-policy"
@@ -2760,8 +2823,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                  << " solver=" << last_linear_solver_name_
                  << " preconditioner=" << last_precond_name_
                  << ". The failed iterate was not recovered into sigma. "
-                    "Use --igr-nonconvergence-policy accept only for an "
-                    "explicit diagnostic legacy replay.");
+                    "Use --igr-nonconvergence-policy accept to recover the "
+                    "finite capped iterate and continue.");
     }
   }
 
@@ -2801,6 +2864,13 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   else
   {
     a_->RecoverFEMSolution(X_, *b_, sigma_);
+  }
+  if (!last_linear_converged_ &&
+      nonconvergence_policy_ == NonconvergencePolicy::Accept)
+  {
+    MFEM_VERIFY(VectorIsFinite(sigma_),
+                "IGR recovery produced non-finite sigma from an accepted "
+                "capped linear iterate.");
   }
 }
 

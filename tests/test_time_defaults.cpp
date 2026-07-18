@@ -65,34 +65,34 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "IGR defaults: CUDA L2/BrokenL2 DG selects MINRES");
     ctx.Check(igr_opts.preconditioner == "chebyshev",
               "IGR defaults: CUDA L2/BrokenL2 DG selects Chebyshev");
-    ctx.Check(igr_opts.nonconvergence_policy == "error",
-              "IGR defaults: CUDA L2/BrokenL2 DG fails on nonconvergence");
+    ctx.Check(igr_opts.nonconvergence_policy == "accept",
+              "IGR defaults: CUDA L2/BrokenL2 DG retains capped iterate");
     ctx.CheckNear(igr_opts.stage_rtol_scale,
                   1.0,
                   0.0,
                   "IGR defaults: CUDA L2/BrokenL2 DG pins stage rtol scale");
     ctx.CheckNear(igr_opts.lin_rtol,
-                  1.0e-5,
+                  1.0e-2,
                   0.0,
                   "IGR defaults: CUDA L2/BrokenL2 DG uses production rtol");
     ctx.CheckNear(igr_opts.lin_atol,
                   0.0,
                   0.0,
                   "IGR defaults: CUDA L2/BrokenL2 DG uses zero atol");
-    ctx.Check(igr_opts.lin_maxit < 0,
-              "IGR defaults: CUDA L2/BrokenL2 DG keeps the case iteration cap");
+    ctx.Check(igr_opts.lin_maxit == 500,
+              "IGR defaults: CUDA L2/BrokenL2 DG uses production iteration cap");
     dg_igr::IGRConfig igr_config;
     ctx.Check(igr_config.nonconvergence_policy ==
-                dg_igr::IGRNonconvergencePolicy::Error,
-              "IGR defaults: linear nonconvergence is a production error");
-    ctx.Check(dg_sim::ParseIGRNonconvergencePolicy("accept") ==
                 dg_igr::IGRNonconvergencePolicy::Accept,
-              "IGR options: explicit diagnostic accept policy parses");
-    igr_opts.nonconvergence_policy = "accept";
+              "IGR defaults: linear nonconvergence retains capped iterate");
+    ctx.Check(dg_sim::ParseIGRNonconvergencePolicy("error") ==
+                dg_igr::IGRNonconvergencePolicy::Error,
+              "IGR options: explicit strict error policy parses");
+    igr_opts.nonconvergence_policy = "error";
     dg_sim::ApplyIGRRuntimeOptionOverrides(igr_opts, igr_config);
     ctx.Check(igr_config.nonconvergence_policy ==
-                dg_igr::IGRNonconvergencePolicy::Accept,
-              "IGR options: nonconvergence policy reaches solver config");
+                dg_igr::IGRNonconvergencePolicy::Error,
+              "IGR options: strict nonconvergence policy reaches solver config");
   }
 
   {
@@ -138,6 +138,62 @@ int RunTimeDefaultsTests(TestContext& ctx)
                                            /*exact_face_operator_overridden=*/false);
     ctx.Check(!igr_opts.exact_dg_face_operator,
               "IGR defaults: CPU L2/BrokenL2 keeps exact face opt-in");
+    ctx.Check(igr_opts.linear_solver == "gmres",
+              "IGR defaults: CPU L2 DG selects GMRES");
+    ctx.Check(igr_opts.preconditioner == "boomeramg",
+              "IGR defaults: CPU L2 DG selects BoomerAMG");
+    ctx.CheckNear(igr_opts.lin_rtol,
+                  1.0e-2,
+                  0.0,
+                  "IGR defaults: CPU L2 DG uses production rtol");
+    ctx.CheckNear(igr_opts.lin_atol,
+                  0.0,
+                  0.0,
+                  "IGR defaults: CPU L2 DG uses zero atol");
+    ctx.Check(igr_opts.lin_maxit == 500,
+              "IGR defaults: CPU L2 DG uses production iteration cap");
+  }
+
+  {
+    dg_sim::CommonOptions opts;
+    dg_sim::IGROptions igr_opts;
+    opts.device = "cpu";
+    opts.dg_backend = "dg";
+    igr_opts.space = "L2";
+    igr_opts.grad = "BrokenL2";
+    igr_opts.linear_solver = "cg";
+    igr_opts.preconditioner = "none";
+    igr_opts.lin_rtol = 3.0e-3;
+    igr_opts.lin_maxit = 777;
+    dg_sim::ApplyIGRDerivedRuntimeDefaults(opts,
+                                           igr_opts,
+                                           /*exact_face_operator_overridden=*/false);
+    ctx.Check(igr_opts.linear_solver == "cg",
+              "IGR defaults: explicit CPU L2 solver is preserved");
+    ctx.Check(igr_opts.preconditioner == "none",
+              "IGR defaults: explicit CPU L2 preconditioner is preserved");
+    ctx.CheckNear(igr_opts.lin_rtol,
+                  3.0e-3,
+                  0.0,
+                  "IGR defaults: explicit CPU L2 tolerance is preserved");
+    ctx.Check(igr_opts.lin_maxit == 777,
+              "IGR defaults: explicit CPU L2 iteration cap is preserved");
+  }
+
+  {
+    dg_sim::CommonOptions opts;
+    dg_sim::IGROptions igr_opts;
+    opts.device = "cpu";
+    opts.dg_backend = "dg";
+    igr_opts.space = "H1";
+    igr_opts.grad = "H1";
+    dg_sim::ApplyIGRDerivedRuntimeDefaults(opts,
+                                           igr_opts,
+                                           /*exact_face_operator_overridden=*/false);
+    ctx.Check(igr_opts.linear_solver == "auto",
+              "IGR defaults: CPU H1 keeps its CG-resolving auto policy");
+    ctx.Check(igr_opts.preconditioner == "auto",
+              "IGR defaults: CPU H1 keeps its BoomerAMG-resolving auto policy");
   }
 
   // --- Callback config wiring ---

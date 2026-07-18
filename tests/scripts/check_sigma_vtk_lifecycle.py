@@ -145,7 +145,14 @@ def verify_required_solve_failure(
     failure_command[failure_command.index("-ils") + 1] = "gmres"
     failure_command[failure_command.index("-ipc") + 1] = "none"
     failure_command[failure_command.index("--igr-lin-rtol") + 1] = "1.0e-16"
-    failure_command.extend(["--igr-lin-maxit", "1"])
+    failure_command.extend(
+        [
+            "--igr-lin-maxit",
+            "1",
+            "--igr-nonconvergence-policy",
+            "error",
+        ]
+    )
     completed = subprocess.run(
         failure_command,
         env=failure_env,

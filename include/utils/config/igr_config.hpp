@@ -119,7 +119,7 @@ struct IGRConfig
   IGRLinearSolverType lin_solver_type = IGRLinearSolverType::Auto;
   IGRPrecondType prec_type = IGRPrecondType::Auto;
   IGRNonconvergencePolicy nonconvergence_policy =
-    IGRNonconvergencePolicy::Error;
+    IGRNonconvergencePolicy::Accept;
 
   double lin_rtol = mfem::dg_igr::IGRDefaults::kLinRtol;
   double lin_atol = mfem::dg_igr::IGRDefaults::kLinAtol;

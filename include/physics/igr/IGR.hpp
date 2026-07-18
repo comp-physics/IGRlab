@@ -192,6 +192,22 @@ public:
   {
     return last_linear_true_residual_rel_rhs_;
   }
+  bool GetLastWarmStartEffective() const
+  {
+    return last_warm_start_effective_;
+  }
+  bool GetLastWarmStartGuardRejected() const
+  {
+    return last_warm_start_guard_rejected_;
+  }
+  double GetLastWarmStartResidualNorm() const
+  {
+    return last_warm_start_residual_norm_;
+  }
+  double GetLastZeroStartResidualNorm() const
+  {
+    return last_zero_start_residual_norm_;
+  }
   double GetLastLinearTrueResidualRel() const
   {
     return last_linear_true_residual_rel_initial_;
@@ -640,7 +656,7 @@ private:
   LinearSolverType lin_solver_type_ = LinearSolverType::Auto;
   PrecondType prec_type_ = PrecondType::Auto;
   NonconvergencePolicy nonconvergence_policy_ =
-    NonconvergencePolicy::Error;
+    NonconvergencePolicy::Accept;
   int amg_coarsen_type_ = -1;
   int amg_relax_type_ = -1;
   int amg_max_levels_ = -1;
@@ -704,6 +720,12 @@ private:
   double last_linear_recomputed_preconditioned_initial_norm_ =
     std::numeric_limits<double>::quiet_NaN();
   double last_linear_recomputed_preconditioned_final_norm_ =
+    std::numeric_limits<double>::quiet_NaN();
+  bool last_warm_start_effective_ = false;
+  bool last_warm_start_guard_rejected_ = false;
+  double last_warm_start_residual_norm_ =
+    std::numeric_limits<double>::quiet_NaN();
+  double last_zero_start_residual_norm_ =
     std::numeric_limits<double>::quiet_NaN();
   double last_linear_solve_seconds_ = 0.0;
   double last_assemble_seconds_ = 0.0;

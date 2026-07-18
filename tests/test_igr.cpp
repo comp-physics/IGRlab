@@ -1223,7 +1223,7 @@ int RunIGRTests(TestContext& ctx)
                 "IGR forced-PA matrix-preconditioner policy keeps assembled operator");
     }
 
-    // L2 auto policy with SIPG should be SPD-by-construction -> CG + BoomerAMG.
+    // L2 auto policy avoids assuming production SIPG coercivity.
     mfem::DG_FECollection sigma_l2_fec(/*order=*/1,
                                        dim_ws,
                                        mfem::BasisType::GaussLegendre);
@@ -1248,8 +1248,8 @@ int RunIGRTests(TestContext& ctx)
     l2_solver.UpdateFromState(U_ws, /*warm_start=*/false);
     ctx.Check(l2_solver.GetLastLinearConverged(),
               "IGR L2 auto policy converges");
-    ctx.Check(l2_solver.GetLastLinearSolverName() == "cg",
-              "IGR L2 SIPG auto policy selects CG");
+    ctx.Check(l2_solver.GetLastLinearSolverName() == "gmres",
+              "IGR L2 SIPG auto policy selects GMRES");
     ctx.Check(l2_solver.GetLastPrecondName() == "boomeramg",
               "IGR L2 auto policy selects BoomerAMG");
     ctx.Check(l2_solver.GetLastAssembleSeconds() >= 0.0,
@@ -2589,6 +2589,84 @@ int RunIGRTests(TestContext& ctx)
     ctx.Check(
       warm_replay_iters <= cold_replay_iters,
       "IGR warm-start replay does not take more iterations than cold-start");
+    ctx.Check(warm_solver.GetLastWarmStartEffective(),
+              "IGR useful same-system warm start remains enabled");
+    ctx.Check(!warm_solver.GetLastWarmStartGuardRejected(),
+              "IGR default warm start is not rejected");
+    ctx.Check(std::isnan(warm_solver.GetLastWarmStartResidualNorm()) &&
+                std::isnan(warm_solver.GetLastZeroStartResidualNorm()),
+              "IGR warm-start residual comparison is disabled by default");
+
+    // Exercise the guard on the 2D L2 partial-assembly path used by CUDA.
+    {
+      ScopedEnvVar warm_start_guard("DG_IGR_IGR_WARM_START_GUARD", "1");
+      ScopedEnvVar device_qf("DG_IGR_IGR_DEVICE_QF", "1");
+      ScopedEnvVar partial_assembly("DG_IGR_IGR_PARTIAL_ASSEMBLY", "1");
+      mfem::Mesh guard_mesh = mfem::Mesh::MakeCartesian2D(
+        2, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      mfem::ParMesh guard_pmesh(MPI_COMM_SELF, guard_mesh);
+      mfem::DG_FECollection guard_state_fec(
+        1, 2, mfem::BasisType::GaussLegendre);
+      mfem::DG_FECollection guard_sigma_fec(
+        1, 2, mfem::BasisType::GaussLegendre);
+      mfem::ParFiniteElementSpace guard_state_fes(
+        &guard_pmesh, &guard_state_fec, 4, mfem::Ordering::byNODES);
+      mfem::ParFiniteElementSpace guard_sigma_fes(
+        &guard_pmesh, &guard_sigma_fec, 1, mfem::Ordering::byNODES);
+      mfem::ParGridFunction guard_state(&guard_state_fes);
+      mfem::VectorFunctionCoefficient guard_state_coeff(
+        4,
+        [&](const mfem::Vector& x, mfem::Vector& cons)
+        {
+          mfem::Vector prim(4);
+          prim(0) = 1.0 + 0.05 * x(0);
+          prim(1) = 0.6 + 0.04 * x(1);
+          prim(2) = -0.1 + 0.03 * x(0);
+          prim(3) = 1.0 + 0.02 * x(1);
+          mfem::EulerPrimToConservative(prim, 2, gamma, cons);
+        });
+      guard_state.ProjectCoefficient(guard_state_coeff);
+      guard_state.ExchangeFaceNbrData();
+
+      dg_igr::IGRSolver guard_control(
+        guard_sigma_fes, guard_state_fes, 2, 4, 0.05);
+      dg_igr::IGRSolver guard_solver(
+        guard_sigma_fes, guard_state_fes, 2, 4, 0.05);
+      for (dg_igr::IGRSolver* solver : {&guard_control, &guard_solver})
+      {
+        solver->SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+        solver->SetSolveMode(dg_igr::IGRSolveMode::Krylov);
+        solver->SetLinearSolver(dg_igr::IGRLinearSolverType::GMRES);
+        solver->SetPreconditioner(dg_igr::IGRPrecondType::None);
+        solver->SetExactDGFaceOperator(true);
+        solver->SetLinearSolveParams(1.0e-10, 0.0, 500, 0);
+      }
+      guard_control.UpdateFromState(guard_state, /*warm_start=*/false);
+      guard_solver.UpdateFromState(guard_state, /*warm_start=*/false);
+      guard_solver.GetSigma() = 1.0e8;
+      guard_solver.UpdateFromState(guard_state, /*warm_start=*/true);
+
+      ctx.LogMetric(
+        "igr_warm_start_guard stale_norm=" +
+        FormatSci(guard_solver.GetLastWarmStartResidualNorm()) +
+        " zero_norm=" +
+        FormatSci(guard_solver.GetLastZeroStartResidualNorm()));
+      ctx.Check(guard_solver.GetLastWarmStartGuardRejected(),
+                "IGR stale oversized warm start is rejected");
+      ctx.Check(!guard_solver.GetLastWarmStartEffective(),
+                "IGR stale oversized warm start uses a cold solve");
+      ctx.Check(std::isfinite(guard_solver.GetLastWarmStartResidualNorm()) &&
+                  std::isfinite(guard_solver.GetLastZeroStartResidualNorm()) &&
+                  guard_solver.GetLastWarmStartResidualNorm() >
+                    guard_solver.GetLastZeroStartResidualNorm(),
+                "IGR warm-start guard compares current-system residuals");
+      mfem::Vector guarded_difference(guard_solver.GetSigma());
+      guarded_difference -= guard_control.GetSigma();
+      ctx.Check(GlobalL2Norm(guarded_difference) <=
+                  1.0e-9 *
+                    std::max(1.0, GlobalL2Norm(guard_control.GetSigma())),
+                "IGR guarded stale warm start recovers the cold solution");
+    }
 
     constexpr const char* true_residual_env =
       "DG_IGR_IGR_TRUE_RESIDUAL";
@@ -2620,8 +2698,6 @@ int RunIGRTests(TestContext& ctx)
     forced_failure_solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
     forced_failure_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::GMRES);
     forced_failure_solver.SetPreconditioner(dg_igr::IGRPrecondType::None);
-    forced_failure_solver.SetNonconvergencePolicy(
-      dg_igr::IGRNonconvergencePolicy::Accept);
     forced_failure_solver.SetLinearSolveParams(/*rtol=*/1.0e-16,
                                                /*atol=*/0.0,
                                                /*max_it=*/1,
@@ -2637,7 +2713,7 @@ int RunIGRTests(TestContext& ctx)
     ctx.Check(forced_failure_solver.GetLastLinearTrueResidualRel() > 1.0e-16,
               "IGR nonconverged solve remains above requested tolerance");
     ctx.Check(std::isfinite(GlobalL2Norm(forced_failure_solver.GetSigma())),
-              "IGR explicit accept policy recovers a finite max-iteration sigma");
+              "IGR default policy recovers a finite max-iteration sigma");
 
     if (original_true_residual)
     {
@@ -3494,6 +3570,8 @@ int RunIGRTests(TestContext& ctx)
       ScopedEnvVar force_pa("DG_IGR_IGR_PARTIAL_ASSEMBLY", "1");
       ScopedEnvVar force_qf("DG_IGR_IGR_DEVICE_QF", "1");
       ScopedEnvVar force_exact("DG_IGR_IGR_EXACT_DG_FACE_OPERATOR", "1");
+      ScopedEnvVar enable_extended_certificate(
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE", "1");
       ScopedEnvVar force_certificate_start(
         "DG_IGR_IGR_EXTENDED_CERTIFICATE_START", "1");
       ScopedEnvVar force_certificate_factor(

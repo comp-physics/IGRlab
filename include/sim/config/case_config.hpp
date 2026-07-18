@@ -549,12 +549,16 @@ ApplyIGRDerivedRuntimeDefaults(const CommonOptions& opts,
 {
   if (igr_opts.nonconvergence_policy.empty())
   {
-    igr_opts.nonconvergence_policy = "error";
+    igr_opts.nonconvergence_policy = "accept";
   }
   const bool cuda_l2_broken_dg =
     ParseDeviceBackend(opts.device) == DeviceBackend::CUDA &&
     ParseDGBackend(opts.dg_backend) == DGBackend::DG &&
     IsL2IGRSpaceName(igr_opts.space) && IsBrokenDGIGRGradName(igr_opts.grad);
+  const bool cpu_l2_dg =
+    ParseDeviceBackend(opts.device) == DeviceBackend::CPU &&
+    ParseDGBackend(opts.dg_backend) == DGBackend::DG &&
+    IsL2IGRSpaceName(igr_opts.space);
 
   if (!exact_face_operator_overridden &&
       ShouldDefaultExactDGFaceOperator(opts, igr_opts))
@@ -578,11 +582,42 @@ ApplyIGRDerivedRuntimeDefaults(const CommonOptions& opts,
     }
     if (igr_opts.lin_rtol < 0.0)
     {
-      igr_opts.lin_rtol = 1.0e-5;
+      igr_opts.lin_rtol = 1.0e-2;
     }
     if (igr_opts.lin_atol < 0.0)
     {
       igr_opts.lin_atol = 0.0;
+    }
+    if (igr_opts.lin_maxit < 0)
+    {
+      igr_opts.lin_maxit = 500;
+    }
+  }
+  else if (cpu_l2_dg)
+  {
+    if (ToLowerCopy(igr_opts.linear_solver) == "auto")
+    {
+      igr_opts.linear_solver = "gmres";
+    }
+    if (ToLowerCopy(igr_opts.preconditioner) == "auto")
+    {
+      igr_opts.preconditioner = "boomeramg";
+    }
+    if (igr_opts.stage_rtol_scale < 0.0)
+    {
+      igr_opts.stage_rtol_scale = 1.0;
+    }
+    if (igr_opts.lin_rtol < 0.0)
+    {
+      igr_opts.lin_rtol = 1.0e-2;
+    }
+    if (igr_opts.lin_atol < 0.0)
+    {
+      igr_opts.lin_atol = 0.0;
+    }
+    if (igr_opts.lin_maxit < 0)
+    {
+      igr_opts.lin_maxit = 500;
     }
   }
 }
@@ -915,8 +950,8 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
   args.AddOption(&igr_opts.nonconvergence_policy,
                  "-incp",
                  "--igr-nonconvergence-policy",
-                 "IGR nonconvergence policy: error | accept (empty keeps "
-                 "case default).");
+                 "IGR nonconvergence policy: accept | error (default accept "
+                 "retains the capped iterate).");
   args.AddOption(
     &igr_opts.sigma_cadence,
     "-iscad",
