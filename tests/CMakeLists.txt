@@ -23,7 +23,33 @@ target_include_directories(dg_igr_unit_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/include
 )
 
+add_executable(dg_igr_zhang_shu_sequential_test
+  test_zhang_shu_sequential.cpp
+)
+target_link_libraries(dg_igr_zhang_shu_sequential_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_zhang_shu_sequential_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+)
+
+add_test(NAME dg_igr_zhang_shu_sequential_cpu
+  COMMAND dg_igr_zhang_shu_sequential_test cpu
+)
+set_tests_properties(dg_igr_zhang_shu_sequential_cpu PROPERTIES
+  LABELS "limiter;admissibility;conservation"
+  TIMEOUT 120
+  RUN_SERIAL TRUE
+)
+
 if (MFEM_USE_CUDA)
+  add_test(NAME dg_igr_zhang_shu_sequential_cuda
+    COMMAND dg_igr_zhang_shu_sequential_test cuda
+  )
+  set_tests_properties(dg_igr_zhang_shu_sequential_cuda PROPERTIES
+    LABELS "cuda;limiter;admissibility;conservation"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+  )
+
   set_source_files_properties(test_analysis_device_alias.cpp PROPERTIES
     LANGUAGE CUDA
   )

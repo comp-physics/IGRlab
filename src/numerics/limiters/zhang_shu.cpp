@@ -61,6 +61,8 @@ struct DeviceLimiterCache
   mfem::Vector theta_rho;
   mfem::Vector theta_p;
   mfem::Vector active;
+  mfem::Vector collapsed_average;
+  mfem::Vector average_repair;
 
   struct FaceCopyPlan
   {
@@ -1057,6 +1059,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   cache.theta_rho.SetSize(ne);
   cache.theta_p.SetSize(ne);
   cache.active.SetSize(ne);
+  cache.collapsed_average.SetSize(ne);
+  cache.average_repair.SetSize(ne * num_eq);
   if (cache.mfem_face_points)
   {
     cache.face_component_lvec.SetSize(vfes.GetNDofs());
@@ -1095,6 +1099,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   cache.theta_rho.UseDevice(true);
   cache.theta_p.UseDevice(true);
   cache.active.UseDevice(true);
+  cache.collapsed_average.UseDevice(true);
+  cache.average_repair.UseDevice(true);
   cache.face_component_lvec.UseDevice(true);
   cache.interior_face_double.UseDevice(true);
   cache.interior_face_side0.UseDevice(true);
@@ -1236,6 +1242,7 @@ void ApplyDeviceZhangShuPositivityLimiter(
   const bool tensor_points = cache.tensor_points;
   const bool mfem_volume_points = cache.mfem_volume_points;
   const bool mfem_face_points = cache.mfem_face_points;
+  const bool capture_diagnostics = diagnostics != nullptr;
   const int volume_nq = cache.volume_nq;
   const int total_face_points =
     cache.mfem_face_points && ne > 0 ? cache.face_point_offsets[ne] : 0;
@@ -1245,6 +1252,8 @@ void ApplyDeviceZhangShuPositivityLimiter(
   double* theta_rho = cache.theta_rho.Write();
   double* theta_p = cache.theta_p.Write();
   double* active = cache.active.Write();
+  double* collapsed_average = cache.collapsed_average.Write();
+  double* average_repair = cache.average_repair.Write();
 
   mfem::forall(ne, [=] MFEM_HOST_DEVICE(int e)
   {
@@ -1256,6 +1265,16 @@ void ApplyDeviceZhangShuPositivityLimiter(
         average[c] += weights[e * dof + d] *
                       state[d + dof * (c + num_eq * e)];
       }
+    }
+    double original_average[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    if (capture_diagnostics)
+    {
+      for (int c = 0; c < num_eq; ++c)
+      {
+        original_average[c] = average[c];
+        average_repair[e + ne * c] = 0.0;
+      }
+      collapsed_average[e] = 0.0;
     }
 
     const double rho_bar = average[0] > rho_min ? average[0] : rho_min;
@@ -1282,6 +1301,14 @@ void ApplyDeviceZhangShuPositivityLimiter(
       theta_rho[e] = 0.0;
       theta_p[e] = 0.0;
       active[e] = 1.0;
+      if (capture_diagnostics)
+      {
+        collapsed_average[e] = 1.0;
+        for (int c = 0; c < num_eq; ++c)
+        {
+          average_repair[e + ne * c] = average[c] - original_average[c];
+        }
+      }
     }
     else
     {
@@ -1375,7 +1402,7 @@ void ApplyDeviceZhangShuPositivityLimiter(
                                      dim,
                                      gamma,
                                      p_min,
-                                     rho_theta,
+                                     1.0,
                                      p_bisect_iters);
             pressure_theta = candidate < pressure_theta
                                ? candidate
@@ -1403,7 +1430,7 @@ void ApplyDeviceZhangShuPositivityLimiter(
                                      dim,
                                      gamma,
                                      p_min,
-                                     rho_theta,
+                                     1.0,
                                      p_bisect_iters);
             pressure_theta = candidate < pressure_theta
                                ? candidate
@@ -1438,7 +1465,7 @@ void ApplyDeviceZhangShuPositivityLimiter(
                                    dim,
                                    gamma,
                                    p_min,
-                                   rho_theta,
+                                   1.0,
                                    p_bisect_iters);
           pressure_theta = candidate < pressure_theta
                              ? candidate
@@ -1473,6 +1500,9 @@ void ApplyDeviceZhangShuPositivityLimiter(
     CopyDeviceVector(cache.theta_rho, diagnostics->theta_rho);
     CopyDeviceVector(cache.theta_p, diagnostics->theta_p);
     CopyDeviceVector(cache.active, diagnostics->active);
+    CopyDeviceVector(cache.collapsed_average,
+                     diagnostics->collapsed_average);
+    CopyDeviceVector(cache.average_repair, diagnostics->average_repair);
   }
 
   if (timing.enabled) { MFEM_DEVICE_SYNC; }
@@ -1557,7 +1587,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
 
   if (diagnostics)
   {
-    diagnostics->SetSize(NE);
+    diagnostics->SetSize(NE, num_eq);
   }
 
   for (int i = 0; i < NE; i++)
@@ -1587,12 +1617,14 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
     // If the average itself is unphysical, collapse element to constant admissible state
     {
       const auto admissible_average_start = phase_start();
+      const double original_rho_bar = Ubar(0);
       const double rho_bar = std::max(Ubar(0), rho_min);
       double mom2_bar = 0.0;
       for (int d = 0; d < dim; ++d)
         mom2_bar += Ubar(1 + d) * Ubar(1 + d);
       const double k_bar = 0.5 * mom2_bar / std::max(rho_bar, 1e-16);
       double E_bar = Ubar(1 + dim);
+      const double original_energy_bar = E_bar;
       double p_bar = (gamma - 1.0) * (E_bar - k_bar);
 
       if (rho_bar <= rho_min || p_bar <= p_min)
@@ -1615,6 +1647,10 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
           diagnostics->active(i) = 1.0;
           diagnostics->theta_rho(i) = 0.0;
           diagnostics->theta_p(i) = 0.0;
+          diagnostics->collapsed_average(i) = 1.0;
+          diagnostics->average_repair(i) = Ubar(0) - original_rho_bar;
+          diagnostics->average_repair(i + NE * (1 + dim)) =
+            Ubar(1 + dim) - original_energy_bar;
         }
         phase_add(admissible_average_start,
                   phase.admissible_average_seconds);
@@ -1751,7 +1787,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
                                             dim,
                                             gamma,
                                             p_min,
-                                            /*theta_max=*/theta_rho,
+                                            /*theta_max=*/1.0,
                                             p_bisect_iters));
       }
     };

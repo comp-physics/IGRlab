@@ -26,15 +26,22 @@ struct ZhangShuLimiterElementDiagnostics
   mfem::Vector active;
   mfem::Vector theta_rho;
   mfem::Vector theta_p;
+  mfem::Vector collapsed_average;
+  /// Component-major change applied to an inadmissible average: e + ne*c.
+  mfem::Vector average_repair;
 
-  void SetSize(int ne)
+  void SetSize(int ne, int num_eq = 0)
   {
     active.SetSize(ne);
     theta_rho.SetSize(ne);
     theta_p.SetSize(ne);
+    collapsed_average.SetSize(ne);
+    average_repair.SetSize(ne * num_eq);
     active = 0.0;
     theta_rho = 1.0;
     theta_p = 1.0;
+    collapsed_average = 0.0;
+    average_repair = 0.0;
   }
 };
 
