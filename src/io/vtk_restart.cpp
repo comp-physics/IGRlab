@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cctype>
@@ -14,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -140,7 +140,10 @@ T ByteSwap(T value)
 
 bool FileByteSwapRequired(const std::string& byte_order)
 {
-  const bool host_little = std::endian::native == std::endian::little;
+  const std::uint16_t marker = 1;
+  unsigned char first_byte = 0;
+  std::memcpy(&first_byte, &marker, sizeof(first_byte));
+  const bool host_little = first_byte == 1;
   if (byte_order == "LittleEndian") { return !host_little; }
   if (byte_order == "BigEndian") { return host_little; }
   Fail("unsupported VTK byte_order '" + byte_order + "'");
@@ -450,19 +453,37 @@ ReconstructionMetrics ValidateAndReconstruct(const PieceData& piece,
                                              const ExampleContext& ctx,
                                              mfem::ParGridFunction& state)
 {
-  if (run_cfg.dg_backend != DGBackend::DG)
+  const auto* dg =
+    dynamic_cast<const mfem::L2_FECollection*>(ctx.spaces.vfes.FEColl());
+  if (dg == nullptr)
   {
-    Fail("VTK restart currently supports the L2 DG backend only");
+    Fail("VTK restart requires an L2_FECollection/DG_FECollection state space");
   }
-  if (run_cfg.opts.order < 1 || run_cfg.opts.order > 3)
+  if (ctx.spaces.vfes.GetOrdering() != mfem::Ordering::byNODES)
   {
-    Fail("VTK restart currently supports polynomial orders 1, 2, and 3");
+    Fail("VTK restart requires byNODES state ordering");
   }
-  const auto* l2 = dynamic_cast<const mfem::L2_FECollection*>(ctx.spaces.vfes.FEColl());
-  if (l2 == nullptr || l2->GetBasisType() != mfem::BasisType::GaussLegendre ||
-      ctx.spaces.vfes.GetOrdering() != mfem::Ordering::byNODES)
+  if (run_cfg.dg_backend == DGBackend::DG)
   {
-    Fail("VTK restart requires a byNODES Gauss-Legendre L2 state space");
+    if (dg->GetBasisType() != mfem::BasisType::GaussLegendre)
+    {
+      Fail("VTK restart backend/basis mismatch: DG requires GaussLegendre");
+    }
+    if (run_cfg.opts.order < 1 || run_cfg.opts.order > 3)
+    {
+      Fail("VTK restart DG backend supports polynomial orders 1 through 3");
+    }
+  }
+  else if (run_cfg.dg_backend == DGBackend::DGSEM)
+  {
+    if (dg->GetBasisType() != mfem::BasisType::GaussLobatto)
+    {
+      Fail("VTK restart backend/basis mismatch: DGSEM requires GaussLobatto");
+    }
+    if (run_cfg.opts.order < 1 || run_cfg.opts.order > 4)
+    {
+      Fail("VTK restart DGSEM backend supports polynomial orders 1 through 4");
+    }
   }
   if (piece.cells_count != ctx.Mesh().GetNE())
   {
@@ -497,8 +518,9 @@ ReconstructionMetrics ValidateAndReconstruct(const PieceData& piece,
   ReconstructionMetrics metrics;
   std::size_t point_offset = 0;
   mfem::Array<int> dofs;
-  double* destination = state.HostWrite();
-  (void)destination;
+  std::vector<double> planned_state(static_cast<std::size_t>(state.Size()));
+  std::vector<unsigned char> planned_dofs(
+    static_cast<std::size_t>(state.Size()), 0);
 
   for (int e = 0; e < ctx.Mesh().GetNE(); ++e)
   {
@@ -582,7 +604,17 @@ ReconstructionMetrics ValidateAndReconstruct(const PieceData& piece,
         const int scalar_dof = dofs[j] >= 0 ? dofs[j] : -1 - dofs[j];
         const double sign = dofs[j] >= 0 ? 1.0 : -1.0;
         const int vdof = ctx.spaces.vfes.DofToVDof(scalar_dof, component);
-        destination[vdof] = sign * coefficients(j);
+        if (vdof < 0 || vdof >= state.Size())
+        {
+          Fail("reconstructed VTK coefficient maps outside the active state");
+        }
+        const std::size_t planned = static_cast<std::size_t>(vdof);
+        if (planned_dofs[planned] != 0)
+        {
+          Fail("reconstructed VTK coefficient maps to a duplicate state DOF");
+        }
+        planned_state[planned] = sign * coefficients(j);
+        planned_dofs[planned] = 1;
       }
     }
     point_offset += npoints;
@@ -606,6 +638,15 @@ ReconstructionMetrics ValidateAndReconstruct(const PieceData& piece,
   {
     Fail("VTK conservative fields are not representable in the active L2 space");
   }
+  if (!std::all_of(planned_dofs.begin(),
+                   planned_dofs.end(),
+                   [](unsigned char planned) { return planned == 1; }))
+  {
+    Fail("VTK reconstruction did not define every active state DOF exactly once");
+  }
+
+  double* destination = state.HostWrite();
+  std::copy(planned_state.begin(), planned_state.end(), destination);
   return metrics;
 }
 
@@ -694,6 +735,7 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
   Manifest manifest;
   bool has_manifest = false;
   std::string error;
+  std::unique_ptr<mfem::ParGridFunction> candidate;
   try
   {
     if (igr_enabled)
@@ -752,6 +794,10 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
     }
     else
     {
+      if (run_cfg.dg_backend == DGBackend::DGSEM)
+      {
+        Fail("DGSEM VTK restart requires a complete restart manifest");
+      }
       if (request.legacy_step < 0)
       {
         Fail("legacy VTK cycle has no restart manifest; provide --restart-step");
@@ -759,7 +805,10 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
       info.step = request.legacy_step;
       info.legacy = true;
     }
-    local_metrics = ValidateAndReconstruct(piece, run_cfg, ctx, state);
+    candidate = std::make_unique<mfem::ParGridFunction>(
+      const_cast<mfem::ParFiniteElementSpace*>(&ctx.spaces.vfes));
+    local_metrics =
+      ValidateAndReconstruct(piece, run_cfg, ctx, *candidate);
   }
   catch (const std::exception& ex)
   {
@@ -792,8 +841,9 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
                 MPI_MAX,
                 ctx.Mesh().GetComm());
 
+  MFEM_VERIFY(candidate, "collective VTK restart candidate is unavailable");
   const mfem::dg_igr::NonFiniteSummary finite =
-    mfem::dg_igr::ScanNonFinite(state);
+    mfem::dg_igr::ScanNonFinite(*candidate);
   if (finite.global_non_finite != 0)
   {
     MFEM_ABORT("VTK restart reconstructed a non-finite conservative state.");
@@ -810,7 +860,7 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
     std::max(1.0, std::abs(pressure_floor));
   auto admissibility = mfem::dg_igr::ScanEulerAdmissibility(
     ctx.spaces.vfes,
-    state,
+    *candidate,
     ctx.dim,
     run_cfg.case_config.gamma,
     rho_floor - rho_roundoff,
@@ -820,7 +870,7 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
     mfem::dg_igr::EulerAdmissibilityPointSet::Limiter);
   const auto nodal_admissibility = mfem::dg_igr::ScanEulerAdmissibility(
     ctx.spaces.vfes,
-    state,
+    *candidate,
     ctx.dim,
     run_cfg.case_config.gamma,
     rho_floor - rho_roundoff,
@@ -859,6 +909,7 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
                << " reconstruction_rel_l2=" << info.reconstruction_rel_l2
                << " first_bad_rank=" << admissibility.first_bad_rank << ".");
   }
+  state = *candidate;
   info.load_seconds = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - start)
                         .count();

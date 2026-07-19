@@ -289,6 +289,91 @@ if (TARGET supersonic_cylinder_w_igr)
     endif()
   endif()
 endif()
+
+if (TARGET dgsem_sedov_taylor_blast)
+  add_test(NAME dgsem_vtk_restart_p1_cpu
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
+            --device cpu
+            --order 1
+            --negative-controls
+            --out-dir ${CMAKE_BINARY_DIR}/tests/dgsem-vtk-restart-p1-cpu
+  )
+  set_tests_properties(dgsem_vtk_restart_p1_cpu PROPERTIES
+    LABELS "dgsem;vtk;restart;cold;gauss-lobatto;host-route;negative"
+    TIMEOUT 600
+    RUN_SERIAL TRUE
+  )
+
+  add_test(NAME dgsem_vtk_restart_p4_cpu
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
+            --device cpu
+            --order 4
+            --out-dir ${CMAKE_BINARY_DIR}/tests/dgsem-vtk-restart-p4-cpu
+  )
+  set_tests_properties(dgsem_vtk_restart_p4_cpu PROPERTIES
+    LABELS "dgsem;vtk;restart;cold;gauss-lobatto;host-route;high-order"
+    TIMEOUT 300
+    RUN_SERIAL TRUE
+  )
+
+  add_test(NAME dgsem_vtk_restart_p3_cpu
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
+            --device cpu
+            --order 3
+            --out-dir ${CMAKE_BINARY_DIR}/tests/dgsem-vtk-restart-p3-cpu
+  )
+  set_tests_properties(dgsem_vtk_restart_p3_cpu PROPERTIES
+    LABELS "dgsem;vtk;restart;cold;gauss-lobatto;host-route;interior-order"
+    TIMEOUT 300
+    RUN_SERIAL TRUE
+  )
+
+  if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
+    add_test(NAME dgsem_vtk_restart_p2_mpi_cpu
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+              --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
+              --device cpu
+              --order 2
+              --mpi-ranks 2
+              --mpiexec ${MPIEXEC_EXECUTABLE}
+              --mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}
+              --rank-piece-reorder-negative
+              --out-dir ${CMAKE_BINARY_DIR}/tests/dgsem-vtk-restart-p2-mpi-cpu
+    )
+    set_tests_properties(dgsem_vtk_restart_p2_mpi_cpu PROPERTIES
+      LABELS "mpi;dgsem;vtk;restart;cold;gauss-lobatto;host-route"
+      TIMEOUT 300
+      RUN_SERIAL TRUE
+      PROCESSORS 2
+      SKIP_RETURN_CODE 75
+    )
+  endif()
+
+  if (MFEM_USE_CUDA)
+    add_test(NAME dgsem_vtk_restart_p2_cuda
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+              --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
+              --device cuda
+              --order 2
+              --out-dir ${CMAKE_BINARY_DIR}/tests/dgsem-vtk-restart-p2-cuda
+    )
+    set_tests_properties(dgsem_vtk_restart_p2_cuda PROPERTIES
+      LABELS "cuda;dgsem;vtk;restart;cold;gauss-lobatto;host-route;pre-composition"
+      TIMEOUT 600
+      RUN_SERIAL TRUE
+      SKIP_RETURN_CODE 75
+    )
+  endif()
+endif()
+
 set_tests_properties(dg_igr_dgsem_portability_refactor_tests PROPERTIES
   LABELS "dgsem;portability"
   TIMEOUT 180
