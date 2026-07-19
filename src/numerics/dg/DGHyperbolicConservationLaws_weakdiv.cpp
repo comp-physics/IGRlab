@@ -276,7 +276,8 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
               flux_md += pressure;
               if (use_sigma)
               {
-                flux_md += sigma_j;
+                flux_md += ::dg_igr::frozen_scalar_igr_algebra::
+                  TensorSigmaMomentumDiagonalTerm(sigma_j);
               }
             }
             sum_m += weak_flat[wbase + d] * flux_md;
@@ -290,7 +291,9 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
           real_t flux_ed = mom[d] * H;
           if (use_sigma)
           {
-            flux_ed += sigma_j * mom[d] * inv_rho_sigma;
+            flux_ed += ::dg_igr::frozen_scalar_igr_algebra::
+              TensorSigmaEnergyTermFromInverseDensity(
+                sigma_j, mom[d], inv_rho_sigma);
           }
           sum_e += weak_flat[wbase + d] * flux_ed;
         }

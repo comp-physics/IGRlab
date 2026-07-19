@@ -395,18 +395,15 @@ MFEM_HOST_DEVICE inline void AddSigmaDotNTerms_(const real_t* state,
                                                  real_t rho_floor,
                                                  real_t* flux_dot_n)
 {
-  const int energy_eq = 1 + dim;
-  for (int d = 0; d < dim; ++d)
-  {
-    flux_dot_n[1 + d] += sigma * normal[d];
-  }
-  const real_t rho = fmax(state[0], rho_floor);
-  real_t un = 0.0;
-  for (int d = 0; d < dim; ++d)
-  {
-    un += state[1 + d] * normal[d];
-  }
-  flux_dot_n[energy_eq] += sigma * (un / rho);
+  ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFlux(dim,
+                                                          state,
+                                                          1,
+                                                          normal,
+                                                          1,
+                                                          sigma,
+                                                          rho_floor,
+                                                          flux_dot_n,
+                                                          1);
 }
 
 struct PackedInverseMassKernel
@@ -524,7 +521,8 @@ struct PackedWeakDivEulerKernel
               flux_md += pressure;
               if (use_sigma)
               {
-                flux_md += sigma_j;
+                flux_md += ::dg_igr::frozen_scalar_igr_algebra::
+                  TensorSigmaMomentumDiagonalTerm(sigma_j);
               }
             }
             sum_m += weakdiv[wbase + d] * flux_md;
@@ -539,7 +537,9 @@ struct PackedWeakDivEulerKernel
           real_t flux_ed = mom[d] * H;
           if (use_sigma)
           {
-            flux_ed += sigma_j * mom[d] * inv_rho_sigma;
+            flux_ed += ::dg_igr::frozen_scalar_igr_algebra::
+              TensorSigmaEnergyTermFromInverseDensity(
+                sigma_j, mom[d], inv_rho_sigma);
           }
           sum_e += weakdiv[wbase + d] * flux_ed;
         }
