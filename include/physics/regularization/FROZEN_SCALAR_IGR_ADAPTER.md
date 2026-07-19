@@ -1,85 +1,156 @@
-# Frozen scalar IGR adapter inventory
+# Frozen scalar IGR adapter contract handoff
 
-CONTRACT-01 intentionally registers only `ZeroFixtureModelTag` and
-`ConstantFixtureModelTag`. It does not change, reinterpret, or wire the current
-scalar IGR implementation.
+CONTRACT-ADAPTER-02 extends the static regularization contract so a later
+frozen-scalar BrokenDG CPU adapter can describe its inputs and capabilities
+truthfully. It registers only a neutral `BrokenDGContractProbeModelTag`.
+It does not define a physical frozen-scalar model, call scalar IGR algebra, or
+wire configuration, DG operators, time integration, boundaries, restart, or
+output.
 
-## Existing frozen scalar IGR surfaces
+## Static selection and support boundary
 
-- `include/physics/igr/IGR.hpp` owns the auxiliary solve and the scalar sigma
-  field lifecycle.
-- `src/physics/igr/IGR_device_kernels.hpp` contains the current coefficient and
-  source point algebra used by the device coefficient path.
-- `include/physics/igr/igr_flux.hpp` and `src/physics/igr/igr_flux.cpp` contain
-  the existing tensor and normal-flux correction behavior.
-- `include/physics/igr/igr_coupling.hpp` records the current state/sigma
-  coupling boundary.
-- `include/utils/config/igr_config.hpp`,
-  `include/utils/config/dg_igr_defaults.hpp`, and
-  `include/sim/time/time_defaults.hpp` own the current configuration and
-  default-selection behavior.
-- `tests/test_igr.cpp`, `tests/test_dgsem_igr.cpp`, and
-  `tests/test_time_defaults.cpp` are the existing scalar behavior/default
-  fixtures that must remain unchanged.
+`GradientTreatmentKind` is an independent axis with exactly `None` and
+`ConservativeStateBrokenDG`. Existing fixture combinations retain `None`.
+The neutral probe accepts only:
 
-## Accepted type-level shape boundary
+- `ElementL2` auxiliary discretization;
+- `GlobalLinearSolve` auxiliary solution;
+- `DG` spatial backend and `MFEMCpu` execution;
+- `ConservativeStateBrokenDG` gradient treatment;
+- `FrozenRKStage` time treatment; and
+- `EntropyNeutral` entropy treatment.
 
-The public launch contract is system-shaped even though CONTRACT-01 registers
-only neutral fixtures. `RegularizationLaunchBuffers` carries `state_components`; its distinct
-`VolumeFluxCorrectionFieldBinding` and `StateVectorCorrectionFieldBinding`
-carry matching correction-component extents. The volume correction has
-layout `(direction, correction_component, point)`, while normal and wall
-corrections have layout `(correction_component, point)`. Typed scalar, vector,
-or tensor auxiliary descriptors enter the launch through
-`BindAuxiliaryField`; the binding retains value kind, topology, ownership,
-identity, capabilities, provenance, component count, and MFEM storage without a
-runtime polymorphism or an owning pointer.
-`AuxiliaryFieldBinding` is const-only for every ownership value: binding a
-descriptor never grants mutation. Descriptor ownership records host lifecycle
-responsibility only; the separately typed correction bindings remain the
-writable launch destinations.
+`ModelCombinationSupport<ModelTag, ...>` is the model-specific customization
+point. The generic `StaticCombinationSupport` delegates to it instead of
+hard-coding future model matrices in one runtime Boolean. Runtime validation
+and static dispatch must agree with that same model-specific support result.
 
-Consequently, a later Euler scalar-IGR trait can bind one scalar auxiliary, set
-`state_components = dimension + 2` and bind correction fields with the same component count, and emit a full
-Euler-sized volume tensor and normal/wall vectors without changing the public
-contract. The future trait remains responsible for its reviewed algebra.
+`ConfigureRegularization` performs the host selection once and binds a
+`RegularizationStaticFunctionTable`. Each enabled operation has its own
+statically specialized function. An MFEM point kernel contains no model or
+operation switch. `ExecuteRegularization` is only the one-shot wrapper around
+that configured path.
 
-## Configured launch and alias boundary
+## Operation table
 
-`ConfigureRegularization` is the primary repeated-launch API. It validates and
-traverses the model, discretization, solve, spatial, execution, time, and entropy
-selection once, then stores a specialized host function pointer. The configured
-launcher may validate and launch new buffers and provenance stamps repeatedly
-without revisiting those switches. `ExecuteRegularization` is only a one-shot
-convenience wrapper.
+Every launch selects one `RegularizationOperationKind`, one evaluated point
+batch, and one writable output. Point counts and point-set identities are
+operation-specific; no shared coefficient/source/volume/face/wall quadrature is
+implied.
 
-Before acquiring any MFEM data pointer, host validation rejects a writable
-output `mfem::Vector` object that is also an input object or another writable
-output object. MFEM does not provide a portable pre-acquisition overlap query
-for distinct `Vector` objects. Distinct objects that share overlapping backing
-storage are therefore unsupported caller error.
+| Operation | Site | Probe-required evaluated fields | Selected output | Probe capability |
+| --- | --- | --- | --- | --- |
+| `AuxiliaryCoefficient` | Volume | state, auxiliary | `auxiliary_coefficient` | enabled |
+| `AuxiliarySource` | Volume | state, conservative-state-gradient, auxiliary | `auxiliary_source` | enabled |
+| `VolumeCorrection` | Volume | state, auxiliary | `volume_correction` | enabled |
+| `NormalCorrection` | Face | state, auxiliary, normal | `normal_correction` | enabled |
+| `WallLaw` | Wall | state, trace when a model enables it | `wall_flux` | disabled and hook absent |
+| `CharacteristicBounds` | Face | state, normal | `characteristic_bounds` | enabled |
+| `Diagnostics` | Volume | state, auxiliary, trace when a model enables it | `diagnostics` | disabled and hook absent |
 
-## Future adapter boundary
+Coefficient and source are independent capabilities and hooks. The same is true
+for volume correction, normal correction, wall law, characteristic bounds, and
+diagnostics. Trait discovery requires a hook only when the corresponding
+constexpr capability is true. Selecting a disabled operation returns
+`UnsupportedCapability` before batch or output validation, so its hook,
+inputs, output, and expected producer generations may all be absent.
 
-A later adapter may be added without modifying the files above:
+## Explicit evaluated-point batches
 
-1. Define a new, explicitly named model tag and a
-   `RegularizationTraits<ModelTag>` specialization under
-   `include/physics/regularization/`.
-2. Copy only trivially-copyable scalar parameters into
-   `RegularizationDevicePolicy`; keep MFEM grid functions, solvers, and
-   ownership on the host side.
-3. Bind the existing sigma storage through a typed
-   `ScalarAuxiliaryFieldDescriptor`, with RK-stage/state-generation provenance
-   supplied by the existing stage owner.
-4. Reuse or factor the already-tested scalar coefficient/source and flux
-   algebra only after its owners approve that refactor. Do not duplicate or
-   invent equations in the adapter.
-5. Add the model to host validation and host dispatch only after its
-   discretization, solve, backend, time, and entropy support matrix is agreed.
-6. Preserve all current IGR option defaults and numerical fixtures; adapter
-   registration must be opt-in until a separate wiring task changes that
-   policy.
+`EvaluatedPointBatch` names five possible producer-owned inputs:
 
-No backend registration, configuration parsing, time integration, boundary
-condition, output/restart, or scalar IGR source is changed by CONTRACT-01.
+- evaluated state;
+- evaluated conservative-state gradient;
+- evaluated auxiliary;
+- evaluated trace; and
+- evaluated normal.
+
+Each `EvaluatedPointFieldBinding` binds exactly an `mfem::Vector` containing
+an explicitly allocated and filled evaluated array. Its metadata records point
+count, component extent, dimension, `EvaluationSiteKind`, nonzero point-set
+identity, RK stage, state generation, and its own producer generation. Raw
+`GridFunction` or `ParGridFunction` DOFs and
+`ParGridFunction::Size()` are not evaluated-point storage or point counts.
+
+Validation considers only fields required by the statically selected operation.
+Required fields must agree with their batch on site, point count, point-set
+identity, dimension, RK stage, and state generation. Unrequired fields may be
+absent and need no storage or producer expectation. The probe therefore needs
+no trace or wall buffer.
+
+## Authoritative provenance
+
+RK stages are zero-based. Stage 0 is valid; `-1` is the explicit
+unbound/invalid default in evaluated-field metadata, batch metadata, evaluated
+batches, auxiliary provenance, and `RegularizationValidationContext`.
+A valid provenance stamp has a nonnegative stage, a nonzero state generation,
+and a nonzero producer generation.
+
+`RegularizationValidationContext` supplies the authoritative expected RK
+stage, state generation, and
+`ExpectedEvaluatedPointProducerGenerations` for state, conservative-state
+gradient, auxiliary, trace, and normal. For each operation-required field:
+
+1. its own expected producer generation must be nonzero;
+2. its binding producer generation must be nonzero; and
+3. the binding generation must equal that field's expected generation.
+
+A zero producer authority is `InvalidProvenanceStamp`; a mismatched
+nonnegative stage or mismatched nonzero state/producer generation is
+`StaleProvenance`. Producer counters are independent: state, gradient,
+auxiliary, trace, and normal generations are never compared with one another,
+and valid unequal values are expected.
+
+## Model preflight and access ordering
+
+Each trait provides a host-only `ModelPreflight(operation, batch.Metadata())`.
+It runs after static configuration selection and before validation can acquire
+any MFEM `Read`, `Write`, or `ReadWrite` pointer. The neutral BrokenDG
+probe requires:
+
+- dimension in `[1,3]`;
+- Euler state extent `dimension + 2`;
+- conservative-gradient extent
+  `state_components * dimension` for source evaluation;
+- scalar auxiliary input where that operation requires auxiliary data;
+- Volume site for coefficient, source, and volume correction; and
+- Face site with a dimension-vector normal for normal correction and bounds.
+
+A failed preflight returns `InvalidModelShape` and preserves every writable
+output, including when the supplied storage is deliberately missing.
+
+## Writable output and alias boundary
+
+Only the output selected by the current operation is shape-validated, acquired,
+and written. Other operation outputs may be absent. Before acquisition, the
+selected writable `mfem::Vector` object is rejected if it is also any present
+evaluated input object. Input and selected-output extent multiplication is
+checked for overflow.
+
+MFEM exposes no portable pre-acquisition overlap query for distinct
+`mfem::Vector` objects. Distinct vector objects with overlapping backing
+storage remain unsupported caller error. Likewise, output bindings for
+operations not being launched do not create a cross-operation alias contract.
+
+## Auxiliary restart truthfulness
+
+`AuxiliaryRestartKind` has exactly:
+
+- `None`: no serialized auxiliary state and restart identity zero;
+- `Serialized`: persisted auxiliary state with a nonzero restart identity;
+  and
+- `ColdRecomputed`: restart identity zero, followed by regeneration with a
+  fresh producer epoch after restart.
+
+`ColdRecomputed` never claims persisted sigma or trace data. Evaluated point
+arrays carry neither restart identity nor output identity.
+
+## Later adapter responsibility
+
+A later adapter requires a separately reviewed model tag, traits, physical
+algebra boundary, producer implementation, and opt-in production wiring. It
+must stamp explicitly evaluated MFEM vectors with the authoritative stage,
+state, point-set, and independent producer generations described above. This
+contract does not admit wall behavior, device execution, restart persistence,
+H1, trace production, two-state face production, scientific validity, or a
+performance claim for that future adapter.
