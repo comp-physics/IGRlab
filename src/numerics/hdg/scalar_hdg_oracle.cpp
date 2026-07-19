@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <utility>
@@ -85,6 +86,17 @@ double Source(const ScalarProblem problem, const double x)
    }
    return beta * ExactDerivative(problem, x);
 }
+
+double PoissonSourceCoefficient(const mfem::Vector &point)
+{
+   return Source(ScalarProblem::poisson, point[0]);
+}
+
+double AdvectionSourceCoefficient(const mfem::Vector &point)
+{
+   return Source(ScalarProblem::advection, point[0]);
+}
+
 
 double WarpedCoordinate(const double point)
 {
@@ -811,6 +823,69 @@ double ResidualJacobianError(const DiscreteSystem &system)
    return MaxDifference(analytic, finite_difference);
 }
 
+mfem::Vector EvaluateSkeletonResidual(const DiscreteSystem &system,
+                                      const mfem::Vector &free_trace)
+{
+   mfem::Vector residual(free_trace.Size());
+   residual = 0.0;
+   for (const LocalSystem &local : system.local)
+   {
+      const mfem::Vector trace = LocalTrace(system, local, free_trace);
+      mfem::Vector interior_rhs(local.rhs);
+      mfem::Vector btrace(local.A.Height());
+      local.B.Mult(trace, btrace);
+      interior_rhs -= btrace;
+      const mfem::Vector interior = Solve(local.A, interior_rhs);
+      mfem::Vector local_residual(2);
+      local.C.Mult(interior, local_residual);
+      mfem::Vector dtrace(2);
+      local.D.Mult(trace, dtrace);
+      local_residual += dtrace;
+      for (int side = 0; side < 2; ++side)
+      {
+         const int free = system.face_to_free[local.faces[side]];
+         if (free >= 0) { residual[free] += local_residual[side]; }
+      }
+   }
+   return residual;
+}
+
+double SkeletonResidualJacobianError(const DiscreteSystem &system)
+{
+   const CondensedSystem condensed = Condense(system);
+   const int size = condensed.rhs.Size();
+   mfem::Vector trace(size);
+   for (int i = 0; i < size; ++i)
+   {
+      trace[i] = 0.35 + 0.017 * static_cast<double>(i + 1);
+   }
+   mfem::DenseMatrix finite_difference(size);
+   const double step = 1.0e-5;
+   for (int column = 0; column < size; ++column)
+   {
+      mfem::Vector plus(trace);
+      mfem::Vector minus(trace);
+      plus[column] += step;
+      minus[column] -= step;
+      const mfem::Vector residual_plus =
+         EvaluateSkeletonResidual(system, plus);
+      const mfem::Vector residual_minus =
+         EvaluateSkeletonResidual(system, minus);
+      for (int row = 0; row < size; ++row)
+      {
+         finite_difference(row, column) =
+            (residual_plus[row] - residual_minus[row]) / (2.0 * step);
+      }
+   }
+
+   mfem::Vector direct = EvaluateSkeletonResidual(system, trace);
+   mfem::Vector assembled(size);
+   condensed.matrix.Mult(trace, assembled);
+   assembled -= condensed.rhs;
+   return std::max(MaxDifference(condensed.matrix, finite_difference),
+                   MaxDifference(direct, assembled));
+}
+
 double SchurActionError(const DiscreteSystem &system)
 {
    const CondensedSystem condensed = Condense(system);
@@ -847,6 +922,340 @@ double SchurActionError(const DiscreteSystem &system)
       }
    }
    return MaxDifference(assembled, action);
+}
+
+double IndependentMfemOperatorError(const ScalarProblem problem)
+{
+   constexpr int order = 3;
+   const DiscreteSystem system =
+      AssembleSystem(problem, MeshGeometry::curved, order, 2);
+   mfem::Mesh mesh = MakeMesh(2, MeshGeometry::curved, order);
+   mfem::L2_FECollection collection(order, 1,
+                                    mfem::BasisType::GaussLegendre);
+   mfem::FiniteElementSpace space(&mesh, &collection);
+   const mfem::FiniteElement &fe = *space.GetFE(0);
+   mfem::ElementTransformation &transformation =
+      *mesh.GetElementTransformation(0);
+   const mfem::IntegrationRule &rule =
+      mfem::IntRules.Get(mfem::Geometry::SEGMENT, 2 * order + 8);
+   const LocalSystem &local = system.local.front();
+   double error = 0.0;
+
+   mfem::FunctionCoefficient source_coefficient(
+      problem == ScalarProblem::poisson ? PoissonSourceCoefficient
+                                        : AdvectionSourceCoefficient);
+   mfem::DomainLFIntegrator source_integrator(source_coefficient, &rule);
+   mfem::Vector mfem_rhs;
+   source_integrator.AssembleRHSElementVect(fe, transformation, mfem_rhs);
+   const int rhs_offset =
+      problem == ScalarProblem::poisson ? local.scalar_dofs : 0;
+   for (int i = 0; i < local.scalar_dofs; ++i)
+   {
+      error = std::max(
+         error, std::abs(local.rhs[rhs_offset + i] - mfem_rhs[i]));
+   }
+
+   if (problem == ScalarProblem::poisson)
+   {
+      mfem::MassIntegrator mass_integrator(&rule);
+      mfem::DenseMatrix mfem_mass;
+      mass_integrator.AssembleElementMatrix(fe, transformation, mfem_mass);
+      for (int i = 0; i < local.scalar_dofs; ++i)
+      {
+         for (int j = 0; j < local.scalar_dofs; ++j)
+         {
+            error = std::max(
+               error, std::abs(local.A(i, j) - mfem_mass(i, j)));
+         }
+      }
+      mfem::MixedScalarWeakDerivativeIntegrator weak_derivative;
+      weak_derivative.SetIntRule(&rule);
+      mfem::DenseMatrix mfem_weak_derivative;
+      weak_derivative.AssembleElementMatrix2(
+         fe, fe, transformation, mfem_weak_derivative);
+      for (int i = 0; i < local.scalar_dofs; ++i)
+      {
+         for (int j = 0; j < local.scalar_dofs; ++j)
+         {
+            error = std::max(
+               error,
+               std::abs(local.A(i, local.scalar_dofs + j) -
+                        mfem_weak_derivative(i, j)));
+         }
+      }
+   }
+   else
+   {
+      mfem::Vector velocity(1);
+      velocity[0] = beta;
+      mfem::VectorConstantCoefficient velocity_coefficient(velocity);
+      mfem::ConvectionIntegrator convection_integrator(velocity_coefficient);
+      mfem::DenseMatrix mfem_convection;
+      convection_integrator.AssembleElementMatrix(
+         fe, transformation, mfem_convection);
+
+      mfem::DenseMatrix manual_volume(local.A);
+      std::array<mfem::Vector, 2> face_shape = {
+         mfem::Vector(local.scalar_dofs), mfem::Vector(local.scalar_dofs)};
+      mfem::IntegrationPoint endpoint;
+      endpoint.x = 0.0;
+      fe.CalcShape(endpoint, face_shape[0]);
+      endpoint.x = 1.0;
+      fe.CalcShape(endpoint, face_shape[1]);
+      const double h =
+         std::abs(system.face_coordinate[local.faces[1]] -
+                  system.face_coordinate[local.faces[0]]);
+      for (int side = 0; side < 2; ++side)
+      {
+         const double normal = side == 0 ? -1.0 : 1.0;
+         const double tau = FaceTau(problem, order, h, normal);
+         for (int i = 0; i < local.scalar_dofs; ++i)
+         {
+            for (int j = 0; j < local.scalar_dofs; ++j)
+            {
+               manual_volume(i, j) -=
+                  tau * face_shape[side][i] * face_shape[side][j];
+            }
+         }
+      }
+      for (int i = 0; i < local.scalar_dofs; ++i)
+      {
+         for (int j = 0; j < local.scalar_dofs; ++j)
+         {
+            error = std::max(
+               error,
+               std::abs(manual_volume(i, j) + mfem_convection(j, i)));
+         }
+      }
+   }
+   return error;
+}
+
+int AbsoluteDof(const int dof)
+{
+   return dof < 0 ? -1 - dof : dof;
+}
+
+double DofSign(const int dof)
+{
+   return dof < 0 ? -1.0 : 1.0;
+}
+
+double OrientedSkeletonCondensationError(const int order)
+{
+   mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
+      2, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0, false);
+   mfem::L2_FECollection interior_collection(
+      order, 2, mfem::BasisType::GaussLegendre, mfem::FiniteElement::VALUE);
+   mfem::FiniteElementSpace interior_space(&mesh, &interior_collection);
+   mfem::DG_Interface_FECollection trace_collection(
+      order, 2, mfem::FiniteElement::VALUE, mfem::BasisType::GaussLegendre);
+   mfem::FiniteElementSpace trace_space(&mesh, &trace_collection);
+   mfem::DenseMatrix assembled(trace_space.GetNDofs());
+   mfem::DenseMatrix assembled_reversed(trace_space.GetNDofs());
+   assembled = 0.0;
+   assembled_reversed = 0.0;
+
+   int shared_face = -1;
+   for (int face = 0; face < mesh.GetNumFaces(); ++face)
+   {
+      if (mesh.FaceIsInterior(face))
+      {
+         if (shared_face >= 0)
+         {
+            return std::numeric_limits<double>::infinity();
+         }
+         shared_face = face;
+      }
+   }
+   if (shared_face < 0) { return std::numeric_limits<double>::infinity(); }
+
+   std::array<int, 2> shared_orientation = {0, 0};
+   int shared_orientation_count = 0;
+   const mfem::IntegrationRule &face_rule =
+      mfem::IntRules.Get(mfem::Geometry::SEGMENT, 2 * order + 8);
+   for (int element = 0; element < mesh.GetNE(); ++element)
+   {
+      const mfem::FiniteElement &interior_fe = *interior_space.GetFE(element);
+      mfem::ElementTransformation &element_transformation =
+         *mesh.GetElementTransformation(element);
+      mfem::MassIntegrator mass_integrator;
+      mfem::DiffusionIntegrator diffusion_integrator;
+      mfem::DenseMatrix interior_matrix;
+      mfem::DenseMatrix diffusion_matrix;
+      mass_integrator.AssembleElementMatrix(
+         interior_fe, element_transformation, interior_matrix);
+      diffusion_integrator.AssembleElementMatrix(
+         interior_fe, element_transformation, diffusion_matrix);
+      interior_matrix += diffusion_matrix;
+
+      mfem::Array<int> faces;
+      mfem::Array<int> orientations;
+      mesh.GetElementEdges(element, faces, orientations);
+      const int face_dofs = order + 1;
+      const int local_trace_size = faces.Size() * face_dofs;
+      mfem::DenseMatrix coupling(interior_fe.GetDof(), local_trace_size);
+      mfem::DenseMatrix coupling_reversed(
+         interior_fe.GetDof(), local_trace_size);
+      mfem::DenseMatrix trace_matrix(local_trace_size);
+      mfem::DenseMatrix trace_matrix_reversed(local_trace_size);
+      coupling = 0.0;
+      coupling_reversed = 0.0;
+      trace_matrix = 0.0;
+      trace_matrix_reversed = 0.0;
+      mfem::Array<int> global_trace_dofs(local_trace_size);
+
+      for (int local_face = 0; local_face < faces.Size(); ++local_face)
+      {
+         const int face = faces[local_face];
+         mfem::Array<int> face_global_dofs;
+         trace_space.GetFaceDofs(face, face_global_dofs);
+         if (face_global_dofs.Size() != face_dofs)
+         {
+            return std::numeric_limits<double>::infinity();
+         }
+         for (int i = 0; i < face_dofs; ++i)
+         {
+            global_trace_dofs[local_face * face_dofs + i] =
+               face_global_dofs[i];
+         }
+         if (face == shared_face)
+         {
+            shared_orientation[shared_orientation_count++] =
+               orientations[local_face];
+         }
+
+         mfem::FaceElementTransformations *face_transformation =
+            mesh.GetFaceElementTransformations(face);
+         if (!face_transformation)
+         {
+            return std::numeric_limits<double>::infinity();
+         }
+         const bool first = face_transformation->Elem1No == element;
+         if (!first && face_transformation->Elem2No != element)
+         {
+            return std::numeric_limits<double>::infinity();
+         }
+         const mfem::FiniteElement &trace_fe =
+            *trace_space.GetFaceElement(face);
+         mfem::Vector interior_shape(interior_fe.GetDof());
+         mfem::Vector trace_shape(face_dofs);
+         mfem::Vector reversed_shape(face_dofs);
+         for (int q = 0; q < face_rule.GetNPoints(); ++q)
+         {
+            const mfem::IntegrationPoint &face_point =
+               face_rule.IntPoint(q);
+            mfem::IntegrationPoint element_point;
+            if (first)
+            {
+               face_transformation->Loc1.Transform(
+                  face_point, element_point);
+            }
+            else
+            {
+               face_transformation->Loc2.Transform(
+                  face_point, element_point);
+            }
+            interior_fe.CalcShape(element_point, interior_shape);
+            trace_fe.CalcShape(face_point, trace_shape);
+            if (face == shared_face)
+            {
+               mfem::IntegrationPoint reversed_point(face_point);
+               reversed_point.x = 1.0 - face_point.x;
+               trace_fe.CalcShape(reversed_point, reversed_shape);
+            }
+            else
+            {
+               reversed_shape = trace_shape;
+            }
+            face_transformation->Face->SetIntPoint(&face_point);
+            const double weight =
+               face_point.weight * face_transformation->Face->Weight();
+            const int offset = local_face * face_dofs;
+            for (int i = 0; i < interior_fe.GetDof(); ++i)
+            {
+               for (int j = 0; j < face_dofs; ++j)
+               {
+                  coupling(i, offset + j) -=
+                     weight * interior_shape[i] * trace_shape[j];
+                  coupling_reversed(i, offset + j) -=
+                     weight * interior_shape[i] * reversed_shape[j];
+               }
+            }
+            for (int i = 0; i < face_dofs; ++i)
+            {
+               for (int j = 0; j < face_dofs; ++j)
+               {
+                  trace_matrix(offset + i, offset + j) +=
+                     2.0 * weight * trace_shape[i] * trace_shape[j];
+                  trace_matrix_reversed(offset + i, offset + j) +=
+                     2.0 * weight * reversed_shape[i] * reversed_shape[j];
+               }
+            }
+         }
+      }
+
+      const mfem::DenseMatrix inverse_coupling =
+         ApplyInverse(interior_matrix, coupling);
+      const mfem::DenseMatrix inverse_coupling_reversed =
+         ApplyInverse(interior_matrix, coupling_reversed);
+      mfem::DenseMatrix schur(trace_matrix);
+      mfem::DenseMatrix schur_reversed(trace_matrix_reversed);
+      for (int i = 0; i < local_trace_size; ++i)
+      {
+         for (int j = 0; j < local_trace_size; ++j)
+         {
+            for (int k = 0; k < interior_fe.GetDof(); ++k)
+            {
+               schur(i, j) -=
+                  coupling(k, i) * inverse_coupling(k, j);
+               schur_reversed(i, j) -=
+                  coupling_reversed(k, i) *
+                  inverse_coupling_reversed(k, j);
+            }
+            const int global_i = AbsoluteDof(global_trace_dofs[i]);
+            const int global_j = AbsoluteDof(global_trace_dofs[j]);
+            const double sign =
+               DofSign(global_trace_dofs[i]) * DofSign(global_trace_dofs[j]);
+            assembled(global_i, global_j) += sign * schur(i, j);
+            assembled_reversed(global_i, global_j) +=
+               sign * schur_reversed(i, j);
+         }
+      }
+   }
+
+   if (shared_orientation_count != 2 ||
+       shared_orientation[0] == shared_orientation[1])
+   {
+      return std::numeric_limits<double>::infinity();
+   }
+   mfem::Array<int> shared_dofs;
+   trace_space.GetFaceDofs(shared_face, shared_dofs);
+   const int *permutation =
+      trace_collection.DofOrderForOrientation(
+         mfem::Geometry::SEGMENT, -1);
+   std::vector<int> global_permutation(trace_space.GetNDofs());
+   std::iota(global_permutation.begin(), global_permutation.end(), 0);
+   for (int i = 0; i < shared_dofs.Size(); ++i)
+   {
+      const int mapped =
+         permutation[i] < 0 ? -1 - permutation[i] : permutation[i];
+      global_permutation[AbsoluteDof(shared_dofs[i])] =
+         AbsoluteDof(shared_dofs[mapped]);
+   }
+   double error = 0.0;
+   for (int i = 0; i < assembled.Height(); ++i)
+   {
+      for (int j = 0; j < assembled.Width(); ++j)
+      {
+         error = std::max(
+            error,
+            std::abs(assembled(i, j) -
+                     assembled_reversed(global_permutation[i],
+                                        global_permutation[j])));
+      }
+   }
+   return error;
 }
 
 double OrientationShapeError(const int order)
@@ -959,7 +1368,9 @@ double OrientationSchurError(const DiscreteSystem &system)
    return error;
 }
 
-std::vector<ConvergenceRow> RunConvergence(std::vector<Comparison> &checks)
+std::vector<ConvergenceRow> RunConvergence(
+   std::vector<Comparison> &checks,
+   std::vector<ConvergenceGate> &gates)
 {
    std::vector<ConvergenceRow> rows;
    constexpr std::array<int, 4> levels = {4, 8, 16, 32};
@@ -973,7 +1384,9 @@ std::vector<ConvergenceRow> RunConvergence(std::vector<Comparison> &checks)
          {
             double previous_error = 0.0;
             double previous_h = 0.0;
-            double best_rate = 0.0;
+            double final_rate = std::numeric_limits<double>::quiet_NaN();
+            bool all_values_finite = true;
+            bool errors_strictly_decrease = true;
             for (int elements : levels)
             {
                const DiscreteSystem system =
@@ -990,20 +1403,34 @@ std::vector<ConvergenceRow> RunConvergence(std::vector<Comparison> &checks)
                {
                   rate = std::log(previous_error / error) /
                          std::log(previous_h / system.h_max);
-                  best_rate = std::max(best_rate, rate);
+                  final_rate = rate;
+                  errors_strictly_decrease =
+                     errors_strictly_decrease && error < previous_error;
                }
+               all_values_finite =
+                  all_values_finite && std::isfinite(system.h_max) &&
+                  std::isfinite(error) && std::isfinite(rate) &&
+                  std::isfinite(recovery) && std::isfinite(conservation);
                rows.push_back({problem, geometry, order, elements,
                                system.h_max, error, rate, recovery,
                                conservation});
                previous_error = error;
                previous_h = system.h_max;
             }
-            AddComparison(
-               checks,
-               std::string("convergence/") + ToString(problem) + "/" +
-                  ToString(geometry) + "/p" + std::to_string(order),
-               std::max(0.0, (static_cast<double>(order) + 0.65) - best_rate),
-               0.0);
+            const double required_rate = static_cast<double>(order) + 0.65;
+            const double margin = final_rate - required_rate;
+            const bool pass = all_values_finite &&
+                              errors_strictly_decrease &&
+                              std::isfinite(final_rate) && margin >= 0.0;
+            gates.push_back({problem, geometry, order, final_rate,
+                             required_rate, margin, all_values_finite,
+                             errors_strictly_decrease, pass});
+            AddComparison(checks,
+                          std::string("convergence/") + ToString(problem) +
+                             "/" + ToString(geometry) + "/p" +
+                             std::to_string(order),
+                          pass ? 0.0 : std::numeric_limits<double>::infinity(),
+                          0.0);
          }
       }
    }
@@ -1042,6 +1469,16 @@ SerialEvidence RunSerialOracle()
       AddComparison(evidence.comparisons,
                     std::string("residual_jacobian/") + ToString(problem),
                     ResidualJacobianError(fixture), jacobian_tolerance);
+      AddComparison(evidence.comparisons,
+                    std::string("skeleton_residual_jacobian/") +
+                       ToString(problem),
+                    SkeletonResidualJacobianError(fixture),
+                    jacobian_tolerance);
+      AddComparison(evidence.comparisons,
+                    std::string("mfem_element_operator/") +
+                       ToString(problem),
+                    IndependentMfemOperatorError(problem),
+                    comparison_tolerance);
       AddComparison(evidence.comparisons,
                     std::string("constant_state/") + ToString(problem),
                     ConstantStateError(fixture), comparison_tolerance);
@@ -1110,8 +1547,14 @@ SerialEvidence RunSerialOracle()
       AddComparison(evidence.comparisons,
                     "mfem_trace_orientation/p" + std::to_string(order),
                     OrientationShapeError(order), comparison_tolerance);
+      AddComparison(evidence.comparisons,
+                    "oriented_skeleton_condensation/p" +
+                       std::to_string(order),
+                    OrientedSkeletonCondensationError(order),
+                    comparison_tolerance);
    }
-   evidence.convergence = RunConvergence(evidence.comparisons);
+   evidence.convergence = RunConvergence(evidence.comparisons,
+                                         evidence.convergence_gates);
    double maximum_recovery = 0.0;
    double maximum_conservation = 0.0;
    for (const ConvergenceRow &row : evidence.convergence)
@@ -1124,7 +1567,11 @@ SerialEvidence RunSerialOracle()
                  maximum_recovery, recovery_tolerance);
    AddComparison(evidence.comparisons, "p1_p4_conservation",
                  maximum_conservation, comparison_tolerance);
-   evidence.pass = AllPass(evidence.comparisons);
+   evidence.pass = AllPass(evidence.comparisons) &&
+                   std::all_of(evidence.convergence_gates.begin(),
+                               evidence.convergence_gates.end(),
+                               [](const ConvergenceGate &gate)
+                               { return gate.pass; });
    return evidence;
 }
 
@@ -1150,75 +1597,258 @@ MpiEvidence RunMpiOracle(MPI_Comm comm)
                   element * evidence.ranks / evidence.global_elements);
    }
    mfem::ParMesh parallel_mesh(comm, serial_mesh, partition.data());
-   int partition_elements = parallel_mesh.GetNE();
-   MPI_Allreduce(&partition_elements, &evidence.mfem_partition_elements, 1,
+   const int local_elements = parallel_mesh.GetNE();
+   MPI_Allreduce(&local_elements, &evidence.mfem_partition_elements, 1,
                  MPI_INT, MPI_SUM, comm);
-   mfem::H1_Trace_FECollection parallel_trace_collection(1, 1);
-   mfem::ParFiniteElementSpace parallel_trace_space(
-      &parallel_mesh, &parallel_trace_collection);
-   int local_mfem_trace_dofs = parallel_trace_space.GetTrueVSize();
-   int global_mfem_trace_dofs = 0;
-   MPI_Allreduce(&local_mfem_trace_dofs, &global_mfem_trace_dofs, 1, MPI_INT,
-                 MPI_SUM, comm);
 
-   const DiscreteSystem system = AssembleSystem(
-      ScalarProblem::poisson, MeshGeometry::curved, 3,
-      evidence.global_elements);
-   const int first = rank * evidence.global_elements / evidence.ranks;
-   const int last =
-      (rank + 1) * evidence.global_elements / evidence.ranks;
-   const CondensedSystem local = Condense(system, first, last);
-   CondensedSystem distributed;
-   distributed.matrix.SetSize(local.matrix.Height(), local.matrix.Width());
-   distributed.rhs.SetSize(local.rhs.Size());
-   MPI_Allreduce(local.matrix.GetData(), distributed.matrix.GetData(),
-                 local.matrix.Height() * local.matrix.Width(), MPI_DOUBLE,
+   mfem::H1_Trace_FECollection trace_collection(1, 1);
+   mfem::ParFiniteElementSpace trace_space(&parallel_mesh, &trace_collection);
+   const int local_trace_dofs = trace_space.GetVSize();
+   const int local_true_dofs = trace_space.GetTrueVSize();
+   std::vector<int> true_dof_counts(evidence.ranks);
+   MPI_Allgather(&local_true_dofs, 1, MPI_INT, true_dof_counts.data(), 1,
+                 MPI_INT, comm);
+   std::vector<long long> true_dof_offsets(evidence.ranks + 1, 0);
+   for (int process = 0; process < evidence.ranks; ++process)
+   {
+      true_dof_offsets[process + 1] =
+         true_dof_offsets[process] + true_dof_counts[process];
+   }
+   const long long global_true_dofs = true_dof_offsets.back();
+
+   std::vector<int> local_map_rank(local_trace_dofs, rank);
+   std::vector<int> local_map_dof(local_trace_dofs);
+   std::vector<long long> local_map_global(local_trace_dofs);
+   std::vector<int> local_map_owner(local_trace_dofs);
+   std::vector<int> local_map_owned(local_trace_dofs);
+   int local_owned = 0;
+   int local_ghost = 0;
+   int local_map_errors = 0;
+   for (int local_dof = 0; local_dof < local_trace_dofs; ++local_dof)
+   {
+      local_map_dof[local_dof] = local_dof;
+      const long long global_dof =
+         static_cast<long long>(trace_space.GetGlobalTDofNumber(local_dof));
+      local_map_global[local_dof] = global_dof;
+      int owner = 0;
+      while (owner + 1 < evidence.ranks &&
+             global_dof >= true_dof_offsets[owner + 1])
+      {
+         ++owner;
+      }
+      local_map_owner[local_dof] = owner;
+      const int local_true = trace_space.GetLocalTDofNumber(local_dof);
+      const bool owned = local_true >= 0;
+      local_map_owned[local_dof] = owned ? 1 : 0;
+      local_owned += owned ? 1 : 0;
+      local_ghost += owned ? 0 : 1;
+      if (global_dof < 0 || global_dof >= global_true_dofs ||
+          owned != (owner == rank) ||
+          (owned && global_dof != true_dof_offsets[rank] + local_true))
+      {
+         ++local_map_errors;
+      }
+   }
+   MPI_Allreduce(&local_owned, &evidence.owned_trace_dofs, 1, MPI_INT,
                  MPI_SUM, comm);
-   MPI_Allreduce(local.rhs.GetData(), distributed.rhs.GetData(),
-                 local.rhs.Size(), MPI_DOUBLE, MPI_SUM, comm);
-   const CondensedSystem reference = Condense(system);
+   MPI_Allreduce(&local_ghost, &evidence.ghost_trace_dofs, 1, MPI_INT,
+                 MPI_SUM, comm);
+   int map_errors = 0;
+   MPI_Allreduce(&local_map_errors, &map_errors, 1, MPI_INT, MPI_SUM, comm);
+
+   const int local_shared_faces = parallel_mesh.GetNSharedFaces();
+   int shared_face_records = 0;
+   MPI_Allreduce(&local_shared_faces, &shared_face_records, 1, MPI_INT,
+                 MPI_SUM, comm);
+   evidence.shared_faces = shared_face_records / 2;
+
+   std::vector<int> map_counts(evidence.ranks);
+   MPI_Gather(&local_trace_dofs, 1, MPI_INT, map_counts.data(), 1, MPI_INT, 0,
+              comm);
+   std::vector<int> map_displacements(evidence.ranks, 0);
+   int total_map_entries = 0;
+   if (rank == 0)
+   {
+      for (int process = 0; process < evidence.ranks; ++process)
+      {
+         map_displacements[process] = total_map_entries;
+         total_map_entries += map_counts[process];
+      }
+      evidence.map_rank.resize(total_map_entries);
+      evidence.map_local_dof.resize(total_map_entries);
+      evidence.map_global_true_dof.resize(total_map_entries);
+      evidence.map_owner_rank.resize(total_map_entries);
+      evidence.map_is_owned.resize(total_map_entries);
+   }
+   MPI_Gatherv(local_map_rank.data(), local_trace_dofs, MPI_INT,
+               rank == 0 ? evidence.map_rank.data() : nullptr,
+               map_counts.data(), map_displacements.data(), MPI_INT, 0, comm);
+   MPI_Gatherv(local_map_dof.data(), local_trace_dofs, MPI_INT,
+               rank == 0 ? evidence.map_local_dof.data() : nullptr,
+               map_counts.data(), map_displacements.data(), MPI_INT, 0, comm);
+   MPI_Gatherv(local_map_global.data(), local_trace_dofs, MPI_LONG_LONG_INT,
+               rank == 0 ? evidence.map_global_true_dof.data() : nullptr,
+               map_counts.data(), map_displacements.data(), MPI_LONG_LONG_INT,
+               0, comm);
+   MPI_Gatherv(local_map_owner.data(), local_trace_dofs, MPI_INT,
+               rank == 0 ? evidence.map_owner_rank.data() : nullptr,
+               map_counts.data(), map_displacements.data(), MPI_INT, 0, comm);
+   MPI_Gatherv(local_map_owned.data(), local_trace_dofs, MPI_INT,
+               rank == 0 ? evidence.map_is_owned.data() : nullptr,
+               map_counts.data(), map_displacements.data(), MPI_INT, 0, comm);
+
+   mfem::ParGridFunction expected_trace(&trace_space);
+   for (int local_dof = 0; local_dof < local_trace_dofs; ++local_dof)
+   {
+      expected_trace[local_dof] =
+         2.0 + 0.125 * static_cast<double>(local_map_global[local_dof]);
+   }
+   mfem::ParGridFunction owner_seed(&trace_space);
+   owner_seed = -12345.0;
+   for (int local_dof = 0; local_dof < local_trace_dofs; ++local_dof)
+   {
+      if (trace_space.GetLocalTDofNumber(local_dof) >= 0)
+      {
+         owner_seed[local_dof] = expected_trace[local_dof];
+      }
+   }
+   std::unique_ptr<mfem::HypreParVector> true_trace(
+      owner_seed.ParallelProject());
+   mfem::ParGridFunction exchanged_trace(&trace_space);
+   exchanged_trace = -6789.0;
+   exchanged_trace.Distribute(*true_trace);
+   double local_exchange_error = 0.0;
+   for (int local_dof = 0; local_dof < local_trace_dofs; ++local_dof)
+   {
+      local_exchange_error =
+         std::max(local_exchange_error,
+                  std::abs(exchanged_trace[local_dof] -
+                           expected_trace[local_dof]));
+   }
+   double exchange_error = 0.0;
+   MPI_Allreduce(&local_exchange_error, &exchange_error, 1, MPI_DOUBLE,
+                 MPI_MAX, comm);
+
+   mfem::L2_FECollection interior_collection(
+      3, 1, mfem::BasisType::GaussLegendre);
+   mfem::ParFiniteElementSpace interior_space(&parallel_mesh,
+                                               &interior_collection);
+   mfem::SparseMatrix local_schur(local_trace_dofs);
+   mfem::Vector local_reduced_rhs(local_trace_dofs);
+   local_reduced_rhs = 0.0;
+   for (int element = 0; element < local_elements; ++element)
+   {
+      mfem::Array<int> trace_dofs;
+      trace_space.GetElementDofs(element, trace_dofs);
+      if (trace_dofs.Size() != 2)
+      {
+         throw std::runtime_error(
+            "one-dimensional trace element must have two endpoint dofs");
+      }
+      const LocalSystem local = AssembleLocal(
+         ScalarProblem::poisson, 3, parallel_mesh, interior_space, element,
+         {AbsoluteDof(trace_dofs[0]), AbsoluteDof(trace_dofs[1])});
+      const mfem::DenseMatrix inverse_b = ApplyInverse(local.A, local.B);
+      const mfem::Vector particular = Solve(local.A, local.rhs);
+      mfem::DenseMatrix schur(2);
+      mfem::Vector reduced_rhs(2);
+      for (int row = 0; row < 2; ++row)
+      {
+         reduced_rhs[row] = 0.0;
+         for (int interior = 0; interior < local.C.Width(); ++interior)
+         {
+            reduced_rhs[row] -= local.C(row, interior) * particular[interior];
+         }
+         for (int column = 0; column < 2; ++column)
+         {
+            schur(row, column) = local.D(row, column);
+            for (int interior = 0; interior < local.C.Width(); ++interior)
+            {
+               schur(row, column) -=
+                  local.C(row, interior) * inverse_b(interior, column);
+            }
+         }
+         local_reduced_rhs[AbsoluteDof(trace_dofs[row])] +=
+            DofSign(trace_dofs[row]) * reduced_rhs[row];
+      }
+      local_schur.AddSubMatrix(trace_dofs, trace_dofs, schur);
+   }
+   local_schur.Finalize();
+
+   mfem::ParBilinearForm schur_form(&trace_space);
+   std::unique_ptr<mfem::HypreParMatrix> true_schur(
+      schur_form.ParallelAssemble(&local_schur));
+   mfem::Vector true_reduced_rhs(local_true_dofs);
+   trace_space.Dof_TrueDof_Matrix()->MultTranspose(local_reduced_rhs,
+                                                   true_reduced_rhs);
+   mfem::Vector operator_residual(local_true_dofs);
+   true_schur->Mult(*true_trace, operator_residual);
+   operator_residual -= true_reduced_rhs;
+
+   mfem::Vector local_direct_residual(local_trace_dofs);
+   local_direct_residual = 0.0;
+   for (int element = 0; element < local_elements; ++element)
+   {
+      mfem::Array<int> trace_dofs;
+      trace_space.GetElementDofs(element, trace_dofs);
+      const LocalSystem local = AssembleLocal(
+         ScalarProblem::poisson, 3, parallel_mesh, interior_space, element,
+         {AbsoluteDof(trace_dofs[0]), AbsoluteDof(trace_dofs[1])});
+      mfem::Vector local_trace(2);
+      for (int side = 0; side < 2; ++side)
+      {
+         local_trace[side] = DofSign(trace_dofs[side]) *
+                             exchanged_trace[AbsoluteDof(trace_dofs[side])];
+      }
+      mfem::Vector interior_rhs(local.rhs);
+      mfem::Vector trace_product(local.A.Height());
+      local.B.Mult(local_trace, trace_product);
+      interior_rhs -= trace_product;
+      const mfem::Vector interior_solution = Solve(local.A, interior_rhs);
+      mfem::Vector skeleton_residual(2);
+      mfem::Vector trace_residual(2);
+      local.C.Mult(interior_solution, skeleton_residual);
+      local.D.Mult(local_trace, trace_residual);
+      skeleton_residual += trace_residual;
+      for (int side = 0; side < 2; ++side)
+      {
+         local_direct_residual[AbsoluteDof(trace_dofs[side])] +=
+            DofSign(trace_dofs[side]) * skeleton_residual[side];
+      }
+   }
+   mfem::Vector true_direct_residual(local_true_dofs);
+   trace_space.Dof_TrueDof_Matrix()->MultTranspose(local_direct_residual,
+                                                   true_direct_residual);
+   const double local_operator_error =
+      MaxDifference(operator_residual, true_direct_residual);
+   double operator_error = 0.0;
+   MPI_Allreduce(&local_operator_error, &operator_error, 1, MPI_DOUBLE,
+                 MPI_MAX, comm);
+
    AddComparison(evidence.comparisons, "mpi_partition_element_count",
                  std::abs(evidence.mfem_partition_elements -
                           evidence.global_elements),
                  0.0);
    AddComparison(evidence.comparisons, "mfem_parallel_trace_true_dofs",
-                 std::abs(global_mfem_trace_dofs -
-                          (evidence.global_elements + 1)),
+                 std::abs(static_cast<double>(global_true_dofs -
+                                              (evidence.global_elements + 1))),
                  0.0);
-   AddComparison(evidence.comparisons, "mpi_reduced_matrix_exchange",
-                 MaxDifference(distributed.matrix, reference.matrix),
-                 comparison_tolerance);
-   AddComparison(evidence.comparisons, "mpi_reduced_rhs_exchange",
-                 MaxDifference(distributed.rhs, reference.rhs),
-                 comparison_tolerance);
-
-   const mfem::Vector trace = Solve(distributed.matrix, distributed.rhs);
-   mfem::Vector owned(trace.Size());
-   mfem::Vector exchanged(trace.Size());
-   owned = 0.0;
-   int local_owned = 0;
-   for (int face = 0; face < static_cast<int>(system.face_to_free.size()); ++face)
-   {
-      const int free = system.face_to_free[face];
-      if (free < 0) { continue; }
-      const int owner_element = std::max(0, face - 1);
-      const int owner = std::min(evidence.ranks - 1,
-                                 owner_element * evidence.ranks /
-                                    evidence.global_elements);
-      if (owner == rank)
-      {
-         owned[free] = trace[free];
-         ++local_owned;
-      }
-   }
-   MPI_Allreduce(owned.GetData(), exchanged.GetData(), owned.Size(), MPI_DOUBLE,
-                 MPI_SUM, comm);
-   MPI_Allreduce(&local_owned, &evidence.owned_trace_dofs, 1, MPI_INT, MPI_SUM,
-                 comm);
-   AddComparison(evidence.comparisons, "mpi_owned_trace_count",
-                 std::abs(evidence.owned_trace_dofs - trace.Size()), 0.0);
-   AddComparison(evidence.comparisons, "mpi_owner_exchange",
-                 MaxDifference(exchanged, trace), comparison_tolerance);
+   AddComparison(evidence.comparisons, "mfem_true_dof_owner_map",
+                 static_cast<double>(map_errors), 0.0);
+   AddComparison(evidence.comparisons, "mfem_owned_true_dof_count",
+                 std::abs(static_cast<double>(evidence.owned_trace_dofs) -
+                          static_cast<double>(global_true_dofs)),
+                 0.0);
+   AddComparison(evidence.comparisons, "mfem_owner_ghost_presence",
+                 evidence.ranks == 2 && evidence.ghost_trace_dofs == 0 ? 1.0
+                                                                       : 0.0,
+                 0.0);
+   AddComparison(evidence.comparisons, "mfem_shared_trace_face_count",
+                 std::abs(evidence.shared_faces - (evidence.ranks - 1)), 0.0);
+   AddComparison(evidence.comparisons, "mfem_owner_ghost_exchange",
+                 exchange_error, comparison_tolerance);
+   AddComparison(evidence.comparisons, "mfem_parallel_schur_residual",
+                 operator_error, comparison_tolerance);
    evidence.pass = AllPass(evidence.comparisons);
    return evidence;
 }

@@ -2,6 +2,7 @@
 
 #include <mfem.hpp>
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -11,6 +12,18 @@
 
 namespace
 {
+
+void WriteJsonNumber(std::ostream &stream, const double value)
+{
+   if (std::isfinite(value))
+   {
+      stream << value;
+   }
+   else
+   {
+      stream << "null";
+   }
+}
 
 void WriteSerialJson(const std::filesystem::path &path,
                      const dg::hdg::SerialEvidence &evidence)
@@ -28,10 +41,32 @@ void WriteSerialJson(const std::filesystem::path &path,
    for (std::size_t i = 0; i < evidence.comparisons.size(); ++i)
    {
       const auto &check = evidence.comparisons[i];
-      stream << "    {\"name\": \"" << check.name << "\", \"value\": "
-             << check.value << ", \"tolerance\": " << check.tolerance
-             << ", \"pass\": " << (check.pass ? "true" : "false") << "}"
+      stream << "    {\"name\": \"" << check.name << "\", \"value\": ";
+      WriteJsonNumber(stream, check.value);
+      stream << ", \"tolerance\": ";
+      WriteJsonNumber(stream, check.tolerance);
+      stream << ", \"pass\": " << (check.pass ? "true" : "false") << "}"
              << (i + 1 == evidence.comparisons.size() ? "\n" : ",\n");
+   }
+   stream << "  ],\n  \"convergence_gates\": [\n";
+   for (std::size_t i = 0; i < evidence.convergence_gates.size(); ++i)
+   {
+      const auto &gate = evidence.convergence_gates[i];
+      stream << "    {\"problem\": \"" << dg::hdg::ToString(gate.problem)
+             << "\", \"geometry\": \"" << dg::hdg::ToString(gate.geometry)
+             << "\", \"order\": " << gate.order
+             << ", \"observed_final_rate\": ";
+      WriteJsonNumber(stream, gate.observed_final_rate);
+      stream << ", \"required_final_rate\": ";
+      WriteJsonNumber(stream, gate.required_final_rate);
+      stream << ", \"margin\": ";
+      WriteJsonNumber(stream, gate.margin);
+      stream << ", \"all_values_finite\": "
+             << (gate.all_values_finite ? "true" : "false")
+             << ", \"errors_strictly_decrease\": "
+             << (gate.errors_strictly_decrease ? "true" : "false")
+             << ", \"pass\": " << (gate.pass ? "true" : "false") << "}"
+             << (i + 1 == evidence.convergence_gates.size() ? "\n" : ",\n");
    }
    stream << "  ]\n}\n";
 }
@@ -67,15 +102,31 @@ void WriteMpiJson(const std::filesystem::path &path,
           << "  \"mfem_partition_elements\": "
           << evidence.mfem_partition_elements << ",\n"
           << "  \"owned_trace_dofs\": " << evidence.owned_trace_dofs << ",\n"
+          << "  \"ghost_trace_dofs\": " << evidence.ghost_trace_dofs << ",\n"
+          << "  \"shared_faces\": " << evidence.shared_faces << ",\n"
           << "  \"pass\": " << (evidence.pass ? "true" : "false") << ",\n"
           << "  \"comparisons\": [\n";
    for (std::size_t i = 0; i < evidence.comparisons.size(); ++i)
    {
       const auto &check = evidence.comparisons[i];
-      stream << "    {\"name\": \"" << check.name << "\", \"value\": "
-             << check.value << ", \"tolerance\": " << check.tolerance
-             << ", \"pass\": " << (check.pass ? "true" : "false") << "}"
+      stream << "    {\"name\": \"" << check.name << "\", \"value\": ";
+      WriteJsonNumber(stream, check.value);
+      stream << ", \"tolerance\": ";
+      WriteJsonNumber(stream, check.tolerance);
+      stream << ", \"pass\": " << (check.pass ? "true" : "false") << "}"
              << (i + 1 == evidence.comparisons.size() ? "\n" : ",\n");
+   }
+   stream << "  ],\n  \"trace_true_dof_map\": [\n";
+   for (std::size_t i = 0; i < evidence.map_rank.size(); ++i)
+   {
+      stream << "    {\"rank\": " << evidence.map_rank[i]
+             << ", \"local_dof\": " << evidence.map_local_dof[i]
+             << ", \"global_true_dof\": "
+             << evidence.map_global_true_dof[i]
+             << ", \"owner_rank\": " << evidence.map_owner_rank[i]
+             << ", \"is_owned\": "
+             << (evidence.map_is_owned[i] ? "true" : "false") << "}"
+             << (i + 1 == evidence.map_rank.size() ? "\n" : ",\n");
    }
    stream << "  ]\n}\n";
 }

@@ -5,14 +5,29 @@
   "ranks": 1,
   "global_elements": 8,
   "mfem_partition_elements": 8,
-  "owned_trace_dofs": 7,
+  "owned_trace_dofs": 9,
+  "ghost_trace_dofs": 0,
+  "shared_faces": 0,
   "pass": true,
   "comparisons": [
     {"name": "mpi_partition_element_count", "value": 0, "tolerance": 0, "pass": true},
     {"name": "mfem_parallel_trace_true_dofs", "value": 0, "tolerance": 0, "pass": true},
-    {"name": "mpi_reduced_matrix_exchange", "value": 0, "tolerance": 2.0000000000000001e-10, "pass": true},
-    {"name": "mpi_reduced_rhs_exchange", "value": 0, "tolerance": 2.0000000000000001e-10, "pass": true},
-    {"name": "mpi_owned_trace_count", "value": 0, "tolerance": 0, "pass": true},
-    {"name": "mpi_owner_exchange", "value": 0, "tolerance": 2.0000000000000001e-10, "pass": true}
+    {"name": "mfem_true_dof_owner_map", "value": 0, "tolerance": 0, "pass": true},
+    {"name": "mfem_owned_true_dof_count", "value": 0, "tolerance": 0, "pass": true},
+    {"name": "mfem_owner_ghost_presence", "value": 0, "tolerance": 0, "pass": true},
+    {"name": "mfem_shared_trace_face_count", "value": 0, "tolerance": 0, "pass": true},
+    {"name": "mfem_owner_ghost_exchange", "value": 0, "tolerance": 2.0000000000000001e-10, "pass": true},
+    {"name": "mfem_parallel_schur_residual", "value": 2.468025783741723e-12, "tolerance": 2.0000000000000001e-10, "pass": true}
+  ],
+  "trace_true_dof_map": [
+    {"rank": 0, "local_dof": 0, "global_true_dof": 0, "owner_rank": 0, "is_owned": true},
+    {"rank": 0, "local_dof": 1, "global_true_dof": 1, "owner_rank": 0, "is_owned": true},
+    {"rank": 0, "local_dof": 2, "global_true_dof": 2, "owner_rank": 0, "is_owned": true},
+    {"rank": 0, "local_dof": 3, "global_true_dof": 3, "owner_rank": 0, "is_owned": true},
+    {"rank": 0, "local_dof": 4, "global_true_dof": 4, "owner_rank": 0, "is_owned": true},
+    {"rank": 0, "local_dof": 5, "global_true_dof": 5, "owner_rank": 0, "is_owned": true},
+    {"rank": 0, "local_dof": 6, "global_true_dof": 6, "owner_rank": 0, "is_owned": true},
+    {"rank": 0, "local_dof": 7, "global_true_dof": 7, "owner_rank": 0, "is_owned": true},
+    {"rank": 0, "local_dof": 8, "global_true_dof": 8, "owner_rank": 0, "is_owned": true}
   ]
 }

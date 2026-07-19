@@ -1,0 +1,11 @@
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /home/jarias9/spack/opt/spack/linux-x86_64_v4/openmpi-5.0.10-belap7umgzjinzggojo3kmnw5le2fmez/bin/mpicxx - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found MPI_CXX: /home/jarias9/spack/opt/spack/linux-x86_64_v4/openmpi-5.0.10-belap7umgzjinzggojo3kmnw5le2fmez/bin/mpicxx (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Configuring done (1.3s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/dg_igr-hdg-oracle-0214-remediation-compile02/build-cpu

@@ -15,7 +15,12 @@ mfem_dir="/home/jarias9/projects/dg_igr_miniapp/tpl/mfem/install-cpu/lib/cmake/m
 cmake_bin="/home/jarias9/spack/opt/spack/linux-x86_64_v4/cmake-3.31.11-pmpktklqoi7vhujc6hxwper32bbmw3jt/bin/cmake"
 mpi_bin="/home/jarias9/spack/opt/spack/linux-x86_64_v4/openmpi-5.0.10-belap7umgzjinzggojo3kmnw5le2fmez/bin"
 
-mkdir -p "${build_dir}" "${output_dir}" "${log_dir}"
+if [[ -e "${run_dir}" ]]; then
+  echo "HDG_ORACLE_RUN_DIRECTORY_EXISTS ${run_dir}" >&2
+  exit 73
+fi
+mkdir "${run_dir}"
+mkdir "${build_dir}" "${output_dir}" "${log_dir}"
 
 "${cmake_bin}" -S "${script_dir}" -B "${build_dir}" \
   -DCMAKE_BUILD_TYPE=Release \
