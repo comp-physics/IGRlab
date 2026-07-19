@@ -8,6 +8,7 @@
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
+#include "test_dgsem_reference_igr.hpp"
 
 #include <cstdlib>
 #include <string>
@@ -288,6 +289,8 @@ int RunDGSEMIGRTests(TestContext& ctx)
       tol_prod,
       "IGR entropy production (LF entropy vars, analytic) regression");
   }
+
+  RunDGSEMScalarIGRScopeFixture(ctx);
 
   return ctx.failures;
 }

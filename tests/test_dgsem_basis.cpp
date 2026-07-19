@@ -1,10 +1,15 @@
 #include "numerics/dgsem/dgsem_basis.hpp"
+#include "numerics/dgsem/dgsem_reference.hpp"
 #include "numerics/dgsem/dgsem_tensor.hpp"
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
 
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <set>
 #include <string>
 
 namespace dg_igr_tests
@@ -30,7 +35,7 @@ double MaxAbsEntry(const mfem::DenseMatrix& mat)
 
 int RunDGSEMBasisTests(TestContext& ctx)
 {
-  const double tol = 1.0e-12;
+  const double tol = mfem::dgsem::DGSEMReferenceTolerances::lgl;
   const int orders[] = {1, 2, 3, 4};
 
   for (int order : orders)
@@ -48,7 +53,47 @@ int RunDGSEMBasisTests(TestContext& ctx)
       tol,
       "LGL weights sum to 1 on [0,1] (order=" + std::to_string(order) + ")");
 
-    // SBP identity: M D + D^T M = B
+    // Freeze quadrature exactness through degree 2p-1.
+    for (int degree = 0; degree <= 2 * order - 1; ++degree)
+    {
+      double moment = 0.0;
+      for (int i = 0; i < basis.n; ++i)
+      {
+        moment += basis.weights(i) * std::pow(basis.nodes(i), degree);
+      }
+      ctx.CheckNear(moment,
+                    1.0 / static_cast<double>(degree + 1),
+                    tol,
+                    "LGL polynomial moment is exact (p=" +
+                      std::to_string(order) + ", degree=" +
+                      std::to_string(degree) + ")");
+    }
+
+    // Freeze nodal interpolation for every represented polynomial degree.
+    mfem::Poly_1D::Basis& poly_basis =
+      mfem::poly1d.GetBasis(order, mfem::BasisType::GaussLobatto);
+    mfem::Vector shape(basis.n);
+    const double sample_points[] = {0.137, 0.431, 0.793};
+    for (int degree = 0; degree <= order; ++degree)
+    {
+      for (const double x : sample_points)
+      {
+        poly_basis.Eval(x, shape);
+        double interpolated = 0.0;
+        for (int i = 0; i < basis.n; ++i)
+        {
+          interpolated += shape(i) * std::pow(basis.nodes(i), degree);
+        }
+        ctx.CheckNear(interpolated,
+                      std::pow(x, degree),
+                      tol,
+                      "LGL interpolation is exact (p=" +
+                        std::to_string(order) + ", degree=" +
+                        std::to_string(degree) + ")");
+      }
+    }
+
+    // SBP identity: M D + D^T M = B.
     mfem::DenseMatrix M(basis.n);
     M = 0.0;
     for (int i = 0; i < basis.n; ++i)
@@ -78,10 +123,10 @@ int RunDGSEMBasisTests(TestContext& ctx)
 
     sbp -= B;
     const double sbp_err = MaxAbsEntry(sbp);
-    ctx.Check(sbp_err < 1.0e-10,
+    ctx.Check(sbp_err < mfem::dgsem::DGSEMReferenceTolerances::sbp,
               "SBP identity holds (order=" + std::to_string(order) + ")");
 
-    // Dsplit consistency: 2 D - M^{-1} B
+    // Dsplit consistency: 2 D - M^{-1} B.
     mfem::DenseMatrix Dsplit_expected(basis.n);
     Dsplit_expected = basis.D;
     for (int i = 0; i < basis.n; ++i)
@@ -99,13 +144,13 @@ int RunDGSEMBasisTests(TestContext& ctx)
     Dsplit_expected -= basis.Dsplit;
     const double dsplit_err = MaxAbsEntry(Dsplit_expected);
     ctx.Check(
-      dsplit_err < 1.0e-10,
-      "Dsplit matches D - 0.5 M^{-1} B (order=" + std::to_string(order) + ")");
+      dsplit_err < mfem::dgsem::DGSEMReferenceTolerances::sbp,
+      "Dsplit matches 2 D - M^{-1} B (order=" + std::to_string(order) + ")");
   }
 
-  // Lexicographic mapping sanity (1D + 2D, Gauss-Lobatto).
+  // Lexicographic tensor mapping (1D + 2D, p1-p4, Gauss-Lobatto).
+  for (const int order : orders)
   {
-    const int order = 3;
     const mfem::real_t* nodes =
       mfem::poly1d.GetPoints(order, mfem::BasisType::GaussLobatto);
 
@@ -119,8 +164,9 @@ int RunDGSEMBasisTests(TestContext& ctx)
       const double x = fe_1d->GetNodes().IntPoint(ld).x;
       ctx.CheckNear(x,
                     nodes[i],
-                    1.0e-12,
-                    "1D lexicographic mapping matches nodes");
+                    tol,
+                    "1D lexicographic mapping matches nodes (p=" +
+                      std::to_string(order) + ")");
     }
 
     mfem::DG_FECollection fec_2d(order, 2, mfem::BasisType::GaussLobatto);
@@ -134,13 +180,115 @@ int RunDGSEMBasisTests(TestContext& ctx)
       const mfem::IntegrationPoint& ip = fe_2d->GetNodes().IntPoint(ld);
       ctx.CheckNear(ip.x,
                     nodes[i],
-                    1.0e-12,
-                    "2D lexicographic x matches nodes");
+                    tol,
+                    "2D lexicographic x matches nodes (p=" +
+                      std::to_string(order) + ")");
       ctx.CheckNear(ip.y,
                     nodes[j],
-                    1.0e-12,
-                    "2D lexicographic y matches nodes");
+                    tol,
+                    "2D lexicographic y matches nodes (p=" +
+                      std::to_string(order) + ")");
     }
+  }
+
+  // Freeze the production/reference state and auxiliary consumer inventory.
+  const std::set<std::string> required_consumers = {
+    "DGHyperbolicConservationLaws::Mult",
+    "DGSEMOperator::AssembleVolume",
+    "DGSEMOperator::AssembleSurface",
+    "DGSEMOperator::ApplyInverseMass",
+    "DGSEMSurfaceFlux",
+    "RusanovFluxWithSides",
+    "DiffusiveRusanovFlux",
+    "FluxWithIGR",
+    "EulerIGRFluxBundle sigma ownership handoff",
+    "BdrHyperbolicFluxIntegrator/BoundaryState",
+    "RK3SSPWithLimiter",
+    "limiter pipeline",
+    "solver/backend wiring",
+    "DGSEM flux wiring",
+    "diagnostics/output/restart",
+    "smooth-advection examples",
+    "wall/shock examples",
+    "blast/vortex examples",
+    "registered DGSEM reference suites"};
+  bool saw_flux_bundle_handoff = false;
+  std::set<std::string> consumer_names;
+  for (const auto& consumer : mfem::dgsem::kDGSEMReferenceConsumers)
+  {
+    const bool complete = consumer.consumer && consumer.consumer[0] &&
+                          consumer.path && consumer.path[0] &&
+                          consumer.state_contract && consumer.state_contract[0] &&
+                          consumer.auxiliary_contract &&
+                          consumer.auxiliary_contract[0];
+    ctx.Check(complete,
+              std::string("DGSEM consumer inventory record is complete: ") +
+                consumer.consumer);
+    const bool relative_specific_path = consumer.path &&
+                                        consumer.path[0] != '/' &&
+                                        std::string(consumer.path).find('/') !=
+                                          std::string::npos;
+    ctx.Check(consumer_names.insert(consumer.consumer).second,
+              std::string("DGSEM consumer inventory name is unique: ") +
+                consumer.consumer);
+    ctx.Check(relative_specific_path,
+              std::string("DGSEM consumer inventory path is scoped: ") +
+                consumer.consumer);
+    if (std::string(consumer.consumer) ==
+        "EulerIGRFluxBundle sigma ownership handoff")
+    {
+      saw_flux_bundle_handoff =
+        std::string(consumer.path) ==
+          "include/sim/wiring/flux_bundle.hpp:29" &&
+        std::string(consumer.auxiliary_contract).find("IGRSolver-owned") !=
+          std::string::npos &&
+        std::string(consumer.auxiliary_contract).find("non-owning") !=
+          std::string::npos;
+    }
+  }
+  ctx.Check(std::string(mfem::dgsem::kDGSEMScalarIGRScope).find("B-SCI-001") !=
+              std::string::npos,
+            "DGSEM scalar-IGR scope explicitly preserves B-SCI-001");
+  ctx.Check(std::string(mfem::dgsem::kDGSEMScalarIGRScope).find("CONTRACT-01") !=
+              std::string::npos,
+            "DGSEM scalar-IGR scope explicitly avoids CONTRACT-01 dependency");
+
+  ctx.Check(consumer_names == required_consumers,
+            "DGSEM consumer inventory matches the frozen required set");
+  ctx.Check(mfem::dgsem::kDGSEMReferenceConsumers.size() ==
+              required_consumers.size(),
+            "DGSEM consumer inventory has no missing or extra records");
+  ctx.Check(saw_flux_bundle_handoff,
+            "DGSEM inventory freezes the actual sigma ownership handoff");
+  // Optional machine-readable inventory for the reference-gate evidence run.
+  const char* output_dir = std::getenv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
+  if (output_dir && mfem::Mpi::Root())
+  {
+    std::error_code ec;
+    std::filesystem::create_directories(output_dir, ec);
+    const std::filesystem::path path =
+      std::filesystem::path(output_dir) / "consumer_inventory.json";
+    std::ofstream out(path);
+    out << "{\n  \"schema\": \"dgsem-consumer-inventory-v1\",\n"
+        << "  \"scalar_igr_scope\": \""
+        << mfem::dgsem::kDGSEMScalarIGRScope << "\",\n"
+        << "  \"consumers\": [\n";
+    for (std::size_t i = 0;
+         i < mfem::dgsem::kDGSEMReferenceConsumers.size();
+         ++i)
+    {
+      const auto& consumer = mfem::dgsem::kDGSEMReferenceConsumers[i];
+      out << "    {\"consumer\": \"" << consumer.consumer
+          << "\", \"path\": \"" << consumer.path
+          << "\", \"state_contract\": \"" << consumer.state_contract
+          << "\", \"auxiliary_contract\": \""
+          << consumer.auxiliary_contract << "\"}"
+          << (i + 1 == mfem::dgsem::kDGSEMReferenceConsumers.size() ? "\n"
+                                                                    : ",\n");
+    }
+    out << "  ]\n}\n";
+    ctx.Check(!ec && out.good(),
+              "DGSEM machine-readable consumer inventory written");
   }
 
   return ctx.failures;
