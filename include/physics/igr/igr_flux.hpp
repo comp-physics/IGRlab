@@ -171,6 +171,9 @@ public:
   /// Return true when the wrapped base flux is MFEM EulerFlux.
   bool HasEulerBase() const { return dynamic_cast<const EulerFlux*>(&base_) != nullptr; }
 
+  /// Host-side identity/preflight access to the wrapped physical flux.
+  const FluxFunction& GetBaseFlux() const { return base_; }
+
   /// Access the current Sigma field pointer (may be null).
   const mfem::ParGridFunction* GetSigmaField() const { return sigma_; }
 
@@ -178,8 +181,6 @@ public:
   double GetVelocityRhoFloor() const { return rho_vel_floor_; }
 
 private:
-  const FluxFunction* GetBase() const { return &base_; }
-
   const FluxFunction& base_;
   const mfem::ParGridFunction* sigma_ =
     nullptr; // non-owning; owned by IGR solver/state wiring

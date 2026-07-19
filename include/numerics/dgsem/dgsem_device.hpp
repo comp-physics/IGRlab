@@ -43,6 +43,82 @@ struct DGSEMDeviceRuntimeInfo
 
 DGSEMDeviceRuntimeInfo GetDGSEMDeviceRuntimeInfo();
 
+/** Gather a local MFEM L-vector into packed element/component columns.
+ *
+ * `element_vdofs` is ordered `(element,equation,local)` with local fastest.
+ * Signed MFEM vdofs are interpreted with the standard `-1-v` convention.
+ */
+void GatherElementStateDevice(int ne,
+                              int dof,
+                              int num_equations,
+                              const Array<int>& element_vdofs,
+                              const Vector& local_state,
+                              DenseMatrix& packed_state);
+
+/** Interpolate a scalar finite-element field to packed DGSEM state nodes. */
+void InterpolateElementScalarDevice(int rows,
+                                    int scalar_dofs_per_element,
+                                    const Array<int>& scalar_element_dofs,
+                                    const DenseMatrix& interpolation,
+                                    const Vector& scalar_field,
+                                    Vector& packed_scalar);
+
+/** Interpolate shared-neighbor scalar data to packed face points.
+ *
+ * The interpolation and signed neighbor map have height `nfaces`; rows for
+ * non-shared faces may be all zero.
+ */
+void InterpolateSharedFaceScalarDevice(
+  int nfaces,
+  int scalar_dofs_per_element,
+  const Array<int>& scalar_face_neighbor_dofs,
+  const DenseMatrix& interpolation,
+  const Vector& scalar_face_neighbor_data,
+  Vector& packed_shared_scalar);
+
+/** Gather persistent nodal face maps and apply the statically bound slip wall.
+ *
+ * Local and shared rows obtain their right state from the local packed batch
+ * or MFEM face-neighbor vector, respectively. Boundary rows execute the one
+ * accepted production boundary policy: adiabatic slip reflection. There is no
+ * model, flux, or boundary-policy switch inside the point kernel.
+ */
+void GatherEulerRusanovSlipFacesDevice(
+  int dim,
+  int ne,
+  int dof,
+  const DenseMatrix& packed_states,
+  const Vector& packed_sigma,
+  const Vector& face_neighbor_state,
+  const Array<int>& shared_state_vdofs,
+  const Vector& shared_sigma,
+  const DenseMatrix& normals,
+  const Array<int>& left_elements,
+  const Array<int>& left_local_dofs,
+  const Array<int>& right_elements,
+  const Array<int>& right_local_dofs,
+  const Array<int>& ownership,
+  DenseMatrix& left_states,
+  DenseMatrix& right_states,
+  Vector& left_sigma,
+  Vector& right_sigma);
+
+/// Add two identically shaped packed matrices without host staging.
+void AddPackedMatricesDevice(const DenseMatrix& addend,
+                             DenseMatrix& inout);
+
+/** Scatter a packed element/component matrix to a local MFEM L-vector.
+ *
+ * The metadata preflight guarantees a one-to-one DG map, so this kernel does
+ * not require atomics and overwrites every local entry exactly once.
+ */
+void ScatterElementStateDevice(int ne,
+                               int dof,
+                               int num_equations,
+                               const Array<int>& element_vdofs,
+                               const DenseMatrix& packed_state,
+                               Vector& local_state);
+
 /** Evaluate the frozen LGL moment, derivative, SBP, and split-form identities.
  *
  * `derivative(degree*n+i)` is represented as a DenseMatrix with height `n`;

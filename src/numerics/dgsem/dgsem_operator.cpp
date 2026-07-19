@@ -17,15 +17,6 @@ namespace mfem
 namespace dgsem
 {
 
-DGSEMOperator::DGSEMOperator(const DGHyperbolicConservationLaws& op)
-  : op_(op)
-{
-  MFEM_VERIFY(DGSEMOperatorSupportsDimension(op_.dim),
-              "DGSEMOperator supports spatial dimensions 1 and 2 only; "
-              "3D tensor face quadrature, nodal surface indexing, and "
-              "curl-form metrics are not implemented in Wave 1.");
-}
-
 const BdrHyperbolicFluxIntegrator*
 DGSEMOperator::FindBdrIntegrator(int attr) const
 {
@@ -52,6 +43,8 @@ DGSEMOperator::FindBdrIntegrator(int attr) const
 
 real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
 {
+  MFEM_VERIFY(DGSEMOperatorSupportsDimension(op_.dim),
+              "DGSEM legacy surface oracle supports only 1D/2D.");
   MFEM_VERIFY(op_.num_flux_,
               "DGSEM surface assembly requires a NumericalFlux; call "
               "DGHyperbolicConservationLaws::SetNumericalFlux().");
@@ -394,6 +387,8 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
 
 real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
 {
+  MFEM_VERIFY(DGSEMOperatorSupportsDimension(op_.dim),
+              "DGSEM legacy volume oracle supports only 1D/2D.");
   MFEM_VERIFY(!op_.weakdiv.empty(),
               "DGSEM volume mode requires preassembled weak divergence "
               "(face-only form).");
@@ -772,6 +767,8 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
 
 void DGSEMOperator::ApplyInverseMass(const Vector& z, Vector& y) const
 {
+  MFEM_VERIFY(DGSEMOperatorSupportsDimension(op_.dim),
+              "DGSEM legacy inverse-mass oracle supports only 1D/2D.");
   DenseMatrix Zmat_elem, Ymat;
   Vector zval_elem;
   Array<int> vdofs_elem;
@@ -790,6 +787,8 @@ void DGSEMOperator::ApplyInverseMass(const Vector& z, Vector& y) const
 
 real_t DGSEMOperator::AssembleResidual(const Vector& x, Vector& y) const
 {
+  MFEM_VERIFY(DGSEMOperatorSupportsDimension(op_.dim),
+              "DGSEM legacy residual oracle supports only 1D/2D.");
   Vector& z = op_.z;
   const real_t max_face_speed = AssembleSurface(x, z);
   const real_t max_vol_speed = AssembleVolume(x, z);

@@ -141,6 +141,299 @@ DGSEMDeviceRuntimeInfo GetDGSEMDeviceRuntimeInfo()
   return info;
 }
 
+void GatherElementStateDevice(int ne,
+                              int dof,
+                              int num_equations,
+                              const Array<int>& element_vdofs,
+                              const Vector& local_state,
+                              DenseMatrix& packed_state)
+{
+  const int rows = ne * dof;
+  MFEM_VERIFY(ne >= 0 && dof > 0 && num_equations > 0 &&
+                element_vdofs.Size() == rows * num_equations,
+              "DGSEM production element-state map size mismatch.");
+  if (packed_state.Height() != rows ||
+      packed_state.Width() != num_equations)
+  {
+    packed_state.SetSize(rows, num_equations);
+  }
+  packed_state.GetMemory().UseDevice(true);
+  const int* map = element_vdofs.Read();
+  const real_t* input = local_state.Read();
+  real_t* output = packed_state.Write();
+  mfem::forall(
+    rows * num_equations,
+    [=] MFEM_HOST_DEVICE(int entry)
+    {
+      const int vdof = map[entry];
+      output[entry] = vdof >= 0 ? input[vdof] : -input[-1 - vdof];
+    });
+}
+
+void InterpolateElementScalarDevice(int rows,
+                                    int scalar_dofs_per_element,
+                                    const Array<int>& scalar_element_dofs,
+                                    const DenseMatrix& interpolation,
+                                    const Vector& scalar_field,
+                                    Vector& packed_scalar)
+{
+  MFEM_VERIFY(rows >= 0 && scalar_dofs_per_element > 0 &&
+                scalar_element_dofs.Size() ==
+                  rows * scalar_dofs_per_element &&
+                interpolation.Height() == rows &&
+                interpolation.Width() == scalar_dofs_per_element,
+              "DGSEM production sigma interpolation size mismatch.");
+  if (packed_scalar.Size() != rows)
+  {
+    packed_scalar.SetSize(rows);
+  }
+  packed_scalar.UseDevice(true);
+  const int* map = scalar_element_dofs.Read();
+  const real_t* shape = interpolation.Read();
+  const real_t* field = scalar_field.Read();
+  real_t* output = packed_scalar.Write();
+  mfem::forall(
+    rows,
+    [=] MFEM_HOST_DEVICE(int row)
+    {
+      real_t value = 0.0;
+      for (int j = 0; j < scalar_dofs_per_element; ++j)
+      {
+        const int entry = row + rows * j;
+        const int dof_index = map[entry];
+        const real_t dof_value =
+          dof_index >= 0 ? field[dof_index] : -field[-1 - dof_index];
+        value += shape[entry] * dof_value;
+      }
+      output[row] = value;
+    });
+}
+
+void InterpolateSharedFaceScalarDevice(
+  int nfaces,
+  int scalar_dofs_per_element,
+  const Array<int>& scalar_face_neighbor_dofs,
+  const DenseMatrix& interpolation,
+  const Vector& scalar_face_neighbor_data,
+  Vector& packed_shared_scalar)
+{
+  MFEM_VERIFY(nfaces >= 0 && scalar_dofs_per_element > 0 &&
+                scalar_face_neighbor_dofs.Size() ==
+                  nfaces * scalar_dofs_per_element &&
+                interpolation.Height() == nfaces &&
+                interpolation.Width() == scalar_dofs_per_element,
+              "DGSEM production shared sigma interpolation size mismatch.");
+  if (packed_shared_scalar.Size() != nfaces)
+  {
+    packed_shared_scalar.SetSize(nfaces);
+  }
+  packed_shared_scalar.UseDevice(true);
+  const int* map = scalar_face_neighbor_dofs.Read();
+  const real_t* shape = interpolation.Read();
+  const real_t* field = scalar_face_neighbor_data.Read();
+  real_t* output = packed_shared_scalar.Write();
+  mfem::forall(
+    nfaces,
+    [=] MFEM_HOST_DEVICE(int face)
+    {
+      real_t value = 0.0;
+      for (int j = 0; j < scalar_dofs_per_element; ++j)
+      {
+        const int entry = face + nfaces * j;
+        const real_t coefficient = shape[entry];
+        if (coefficient != 0.0)
+        {
+          const int dof_index = map[entry];
+          const real_t dof_value =
+            dof_index >= 0 ? field[dof_index] : -field[-1 - dof_index];
+          value += coefficient * dof_value;
+        }
+      }
+      output[face] = value;
+    });
+}
+
+void GatherEulerRusanovSlipFacesDevice(
+  int dim,
+  int ne,
+  int dof,
+  const DenseMatrix& packed_states,
+  const Vector& packed_sigma,
+  const Vector& face_neighbor_state,
+  const Array<int>& shared_state_vdofs,
+  const Vector& shared_sigma,
+  const DenseMatrix& normals,
+  const Array<int>& left_elements,
+  const Array<int>& left_local_dofs,
+  const Array<int>& right_elements,
+  const Array<int>& right_local_dofs,
+  const Array<int>& ownership,
+  DenseMatrix& left_states,
+  DenseMatrix& right_states,
+  Vector& left_sigma,
+  Vector& right_sigma)
+{
+  const int nfaces = normals.Height();
+  const int num_equations = dim + 2;
+  const int rows = ne * dof;
+  MFEM_VERIFY((dim == 1 || dim == 2) && ne >= 0 && dof > 0 &&
+                packed_states.Height() == rows &&
+                packed_states.Width() == num_equations &&
+                packed_sigma.Size() == rows && normals.Width() == dim &&
+                left_elements.Size() == nfaces &&
+                left_local_dofs.Size() == nfaces &&
+                right_elements.Size() == nfaces &&
+                right_local_dofs.Size() == nfaces &&
+                ownership.Size() == nfaces &&
+                shared_state_vdofs.Size() == nfaces * num_equations &&
+                shared_sigma.Size() == nfaces,
+              "DGSEM production face gather size mismatch.");
+
+  if (left_states.Height() != nfaces ||
+      left_states.Width() != num_equations)
+  {
+    left_states.SetSize(nfaces, num_equations);
+  }
+  if (right_states.Height() != nfaces ||
+      right_states.Width() != num_equations)
+  {
+    right_states.SetSize(nfaces, num_equations);
+  }
+  if (left_sigma.Size() != nfaces)
+  {
+    left_sigma.SetSize(nfaces);
+  }
+  if (right_sigma.Size() != nfaces)
+  {
+    right_sigma.SetSize(nfaces);
+  }
+  left_states.GetMemory().UseDevice(true);
+  right_states.GetMemory().UseDevice(true);
+  left_sigma.UseDevice(true);
+  right_sigma.UseDevice(true);
+
+  const real_t* states = packed_states.Read();
+  const real_t* sigma = packed_sigma.Read();
+  const real_t* neighbor = face_neighbor_state.Read();
+  const int* neighbor_map = shared_state_vdofs.Read();
+  const real_t* neighbor_sigma = shared_sigma.Read();
+  const real_t* normal = normals.Read();
+  const int* element_l = left_elements.Read();
+  const int* local_l = left_local_dofs.Read();
+  const int* element_r = right_elements.Read();
+  const int* local_r = right_local_dofs.Read();
+  const int* owner = ownership.Read();
+  real_t* left = left_states.Write();
+  real_t* right = right_states.Write();
+  real_t* sigma_l = left_sigma.Write();
+  real_t* sigma_r = right_sigma.Write();
+
+  mfem::forall(
+    nfaces,
+    [=] MFEM_HOST_DEVICE(int face)
+    {
+      const int left_row = element_l[face] * dof + local_l[face];
+      for (int equation = 0; equation < num_equations; ++equation)
+      {
+        left[face + nfaces * equation] =
+          states[left_row + rows * equation];
+      }
+      sigma_l[face] = sigma[left_row];
+
+      if (owner[face] ==
+          static_cast<int>(DGSEMDeviceFaceOwnership::Local))
+      {
+        const int right_row = element_r[face] * dof + local_r[face];
+        for (int equation = 0; equation < num_equations; ++equation)
+        {
+          right[face + nfaces * equation] =
+            states[right_row + rows * equation];
+        }
+        sigma_r[face] = sigma[right_row];
+      }
+      else if (owner[face] ==
+               static_cast<int>(DGSEMDeviceFaceOwnership::Shared))
+      {
+        for (int equation = 0; equation < num_equations; ++equation)
+        {
+          const int vdof = neighbor_map[face + nfaces * equation];
+          right[face + nfaces * equation] =
+            vdof >= 0 ? neighbor[vdof] : -neighbor[-1 - vdof];
+        }
+        sigma_r[face] = neighbor_sigma[face];
+      }
+      else
+      {
+        for (int equation = 0; equation < num_equations; ++equation)
+        {
+          right[face + nfaces * equation] =
+            left[face + nfaces * equation];
+        }
+        real_t normal_squared = 0.0;
+        real_t momentum_dot_normal = 0.0;
+        for (int d = 0; d < dim; ++d)
+        {
+          const real_t normal_value = normal[face + nfaces * d];
+          normal_squared += normal_value * normal_value;
+          momentum_dot_normal +=
+            left[face + nfaces * (1 + d)] * normal_value;
+        }
+        const real_t scale = 2.0 * momentum_dot_normal / normal_squared;
+        for (int d = 0; d < dim; ++d)
+        {
+          right[face + nfaces * (1 + d)] -=
+            scale * normal[face + nfaces * d];
+        }
+        sigma_r[face] = sigma_l[face];
+      }
+    });
+}
+
+void AddPackedMatricesDevice(const DenseMatrix& addend, DenseMatrix& inout)
+{
+  MFEM_VERIFY(addend.Height() == inout.Height() &&
+                addend.Width() == inout.Width(),
+              "DGSEM production packed add size mismatch.");
+  const int size = addend.Height() * addend.Width();
+  const real_t* input = addend.Read();
+  real_t* output = inout.ReadWrite();
+  mfem::forall(size,
+               [=] MFEM_HOST_DEVICE(int entry)
+               { output[entry] += input[entry]; });
+}
+
+void ScatterElementStateDevice(int ne,
+                               int dof,
+                               int num_equations,
+                               const Array<int>& element_vdofs,
+                               const DenseMatrix& packed_state,
+                               Vector& local_state)
+{
+  const int rows = ne * dof;
+  MFEM_VERIFY(ne >= 0 && dof > 0 && num_equations > 0 &&
+                element_vdofs.Size() == rows * num_equations &&
+                packed_state.Height() == rows &&
+                packed_state.Width() == num_equations,
+              "DGSEM production element scatter size mismatch.");
+  const int* map = element_vdofs.Read();
+  const real_t* input = packed_state.Read();
+  real_t* output = local_state.Write();
+  mfem::forall(
+    rows * num_equations,
+    [=] MFEM_HOST_DEVICE(int entry)
+    {
+      const int vdof = map[entry];
+      if (vdof >= 0)
+      {
+        output[vdof] = input[entry];
+      }
+      else
+      {
+        output[-1 - vdof] = -input[entry];
+      }
+    });
+}
+
 void EvaluateLGLBasisDevice(const Vector& nodes,
                             const Vector& weights,
                             const DenseMatrix& derivative_matrix,
@@ -315,8 +608,15 @@ void BuildEulerContravariantFluxDevice(int dim,
   MFEM_VERIFY(metrics.Height() == rows && metrics.Width() == dim * dim,
               "DGSEM device Euler metric size mismatch.");
 
-  contravariant_flux.SetSize(rows, dim * num_equations);
-  nodal_speeds.SetSize(rows);
+  if (contravariant_flux.Height() != rows ||
+      contravariant_flux.Width() != dim * num_equations)
+  {
+    contravariant_flux.SetSize(rows, dim * num_equations);
+  }
+  if (nodal_speeds.Size() != rows)
+  {
+    nodal_speeds.SetSize(rows);
+  }
   contravariant_flux.GetMemory().UseDevice(true);
   nodal_speeds.UseDevice(true);
   const real_t* state = states.Read();
@@ -389,7 +689,10 @@ void ApplyCentralVolumeDevice(int dim,
               "DGSEM device central volume flux size mismatch.");
 
   const int rows = contravariant_flux.Height();
-  weak_volume.SetSize(rows, num_equations);
+  if (weak_volume.Height() != rows || weak_volume.Width() != num_equations)
+  {
+    weak_volume.SetSize(rows, num_equations);
+  }
   weak_volume.GetMemory().UseDevice(true);
   const int* local = lex_to_local.Read();
   const real_t* split = split_matrix.Read();
@@ -507,9 +810,18 @@ void AssembleEulerRusanovFacesDevice(int dim,
   }
 
   const int rows = ne * dof;
-  face_flux.SetSize(nfaces, num_equations);
-  face_speeds.SetSize(nfaces);
-  weak_surface.SetSize(rows, num_equations);
+  if (face_flux.Height() != nfaces || face_flux.Width() != num_equations)
+  {
+    face_flux.SetSize(nfaces, num_equations);
+  }
+  if (face_speeds.Size() != nfaces)
+  {
+    face_speeds.SetSize(nfaces);
+  }
+  if (weak_surface.Height() != rows || weak_surface.Width() != num_equations)
+  {
+    weak_surface.SetSize(rows, num_equations);
+  }
   face_flux.GetMemory().UseDevice(true);
   face_speeds.UseDevice(true);
   weak_surface.GetMemory().UseDevice(true);
@@ -611,7 +923,10 @@ void ApplyInverseMassDevice(int ne,
                 inverse_mass.Width() == dof && weak.Height() == rows,
               "DGSEM device inverse-mass size mismatch.");
   const int num_equations = weak.Width();
-  strong.SetSize(rows, num_equations);
+  if (strong.Height() != rows || strong.Width() != num_equations)
+  {
+    strong.SetSize(rows, num_equations);
+  }
   strong.GetMemory().UseDevice(true);
   const real_t* mass = inverse_mass.Read();
   const real_t* input = weak.Read();
@@ -637,7 +952,10 @@ void ComponentSumsDevice(const DenseMatrix& values, Vector& sums)
 {
   const int rows = values.Height();
   const int num_equations = values.Width();
-  sums.SetSize(num_equations);
+  if (sums.Size() != num_equations)
+  {
+    sums.SetSize(num_equations);
+  }
   sums.UseDevice(true);
   const real_t* value = values.Read();
   real_t* sum = sums.Write();
@@ -655,7 +973,10 @@ void ComponentSumsDevice(const DenseMatrix& values, Vector& sums)
 
 void DeterministicMaximumDevice(const Vector& values, Vector& maximum)
 {
-  maximum.SetSize(1);
+  if (maximum.Size() != 1)
+  {
+    maximum.SetSize(1);
+  }
   maximum.UseDevice(true);
   const int size = values.Size();
   const real_t* value = values.Read();

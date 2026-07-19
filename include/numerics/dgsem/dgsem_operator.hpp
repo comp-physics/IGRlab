@@ -7,6 +7,9 @@
  */
 
 #include "mfem.hpp"
+#include "numerics/dgsem/dgsem_production.hpp"
+
+#include <memory>
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 
 namespace mfem
@@ -15,6 +18,7 @@ class DGHyperbolicConservationLaws;
 
 namespace dgsem
 {
+struct DGSEMProductionCache;
 
 /// DGSEM Wave 1 has complete tensor volume/surface semantics in 1D and 2D.
 inline constexpr bool DGSEMOperatorSupportsDimension(int dim)
@@ -27,6 +31,10 @@ class DGSEMOperator
 {
 public:
   explicit DGSEMOperator(const DGHyperbolicConservationLaws& op);
+  ~DGSEMOperator();
+
+  DGSEMOperator(const DGSEMOperator&) = delete;
+  DGSEMOperator& operator=(const DGSEMOperator&) = delete;
 
   /// @brief Assemble DGSEM surface contributions into z (overwrites z).
   real_t AssembleSurface(const Vector& x, Vector& z) const;
@@ -40,10 +48,43 @@ public:
   /// @brief Assemble surface + volume and apply M^{-1}, returns max wave speed.
   real_t AssembleResidual(const Vector& x, Vector& y) const;
 
+  /** Bind and, when supported, build the persistent production policy/cache.
+   *
+   * This operation does not mutate a residual output. In strict mode every
+   * unsupported tuple is returned with a stable reason code for the caller to
+   * fail closed. Non-strict callers may use the host oracle only after logging
+   * that same reason explicitly.
+   */
+  DGSEMProductionSelection BindProductionPolicy(bool strict) const;
+
+  /** Execute the accepted production kernels on an MFEM local L-vector.
+   *
+   * State/sigma admissibility is checked before `y_local` is written. The
+   * caller is responsible for true-to-local `P x` before this call and local-
+   * to-true `P^T y` afterward.
+   */
+  DGSEMProductionResult AssembleProductionResidual(
+    const Vector& x_local,
+    Vector& y_local,
+    bool strict) const;
+
+  /// Invalidate only the named cache layer after an owning lifecycle change.
+  void InvalidateProductionCache(DGSEMProductionInvalidation invalidation) const;
+
+  DGSEMProductionCacheCounters GetProductionCacheCounters() const;
+  DGSEMProductionSelection GetProductionSelection() const;
+  DGSEMProductionWorkspaceEvidence GetProductionWorkspaceEvidence() const;
+
 private:
   const BdrHyperbolicFluxIntegrator* FindBdrIntegrator(int attr) const;
 
+  DGSEMProductionReason BuildProductionCacheLocal_(bool strict,
+                                                    int ranks,
+                                                    std::uint64_t fingerprint) const;
+  DGSEMProductionReason EnsureProductionCache_(bool strict) const;
+
   const DGHyperbolicConservationLaws& op_;
+  mutable std::unique_ptr<DGSEMProductionCache> production_;
 };
 
 } // namespace dgsem
