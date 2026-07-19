@@ -1,0 +1,18 @@
+{
+  "schema": "dg_igr.hdg_cpu_oracle.mpi.v1",
+  "mfem_version": "MFEM v4.9.0 (release)",
+  "mfem_git": "tags/v4.9-0-gd9d6526cc1749980a2ba1da16e2c1ca1e07d82ec",
+  "ranks": 2,
+  "global_elements": 8,
+  "mfem_partition_elements": 8,
+  "owned_trace_dofs": 7,
+  "pass": true,
+  "comparisons": [
+    {"name": "mpi_partition_element_count", "value": 0, "tolerance": 0, "pass": true},
+    {"name": "mfem_parallel_trace_true_dofs", "value": 0, "tolerance": 0, "pass": true},
+    {"name": "mpi_reduced_matrix_exchange", "value": 0, "tolerance": 2.0000000000000001e-10, "pass": true},
+    {"name": "mpi_reduced_rhs_exchange", "value": 0, "tolerance": 2.0000000000000001e-10, "pass": true},
+    {"name": "mpi_owned_trace_count", "value": 0, "tolerance": 0, "pass": true},
+    {"name": "mpi_owner_exchange", "value": 0, "tolerance": 2.0000000000000001e-10, "pass": true}
+  ]
+}
