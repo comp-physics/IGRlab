@@ -2,6 +2,8 @@
 // This file is intentionally included after MFEM backend headers.
 #pragma once
 
+#include "physics/igr/frozen_scalar_igr_algebra.hpp"
+
 #include <string>
 
 namespace dg_igr
@@ -1192,8 +1194,8 @@ struct InteriorFaceSideDensityProjection2D
       {
         rho += S(side, q, d, face) * state[D(d, 0, e)];
       }
-      if (rho < rho_floor) { rho = rho_floor; }
-      Q(side, q, face) = alpha / rho;
+      Q(side, q, face) =
+        frozen_scalar_igr_algebra::AlphaOverDensity(alpha, rho, rho_floor);
     }
   }
 };
@@ -1418,8 +1420,8 @@ ProjectInteriorFaceDensityCoefficient2D(
         {
           rho += S(side, q, d, f) * state_data[D(d, 0, e)];
         }
-        if (rho < rho_floor) { rho = rho_floor; }
-        Q(side, q, f) = alpha / rho;
+        Q(side, q, f) =
+          frozen_scalar_igr_algebra::AlphaOverDensity(alpha, rho, rho_floor);
       }
     }
   }
@@ -1508,10 +1510,10 @@ ProjectSharedFaceDensityCoefficient2D(
                           : -nbr_data[-1 - nbr_vdof];
         rho1 += S(1, q, d, f) * nbr_value;
       }
-      if (rho0 < rho_floor) { rho0 = rho_floor; }
-      if (rho1 < rho_floor) { rho1 = rho_floor; }
-      Q(0, q, f) = alpha / rho0;
-      Q(1, q, f) = alpha / rho1;
+      Q(0, q, f) =
+        frozen_scalar_igr_algebra::AlphaOverDensity(alpha, rho0, rho_floor);
+      Q(1, q, f) =
+        frozen_scalar_igr_algebra::AlphaOverDensity(alpha, rho1, rho_floor);
     }
   }
 

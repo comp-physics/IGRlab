@@ -1,5 +1,25 @@
 # Unit tests for dg_igr miniapp
 
+add_executable(dg_igr_frozen_scalar_igr_algebra_test
+  test_frozen_scalar_igr_algebra.cpp
+)
+set_target_properties(dg_igr_frozen_scalar_igr_algebra_test PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+  CXX_EXTENSIONS NO
+)
+target_link_libraries(dg_igr_frozen_scalar_igr_algebra_test PRIVATE mfem)
+target_include_directories(dg_igr_frozen_scalar_igr_algebra_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+)
+add_test(NAME dg_igr_frozen_scalar_igr_algebra_tests
+  COMMAND dg_igr_frozen_scalar_igr_algebra_test
+)
+set_tests_properties(dg_igr_frozen_scalar_igr_algebra_tests PROPERTIES
+  LABELS "igr;frozen-scalar;algebra"
+  TIMEOUT 30
+)
+
 add_executable(dg_igr_unit_tests
   unit_tests_main.cpp
   test_euler.cpp

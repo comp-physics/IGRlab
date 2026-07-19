@@ -469,16 +469,15 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
   src_kernel.src = src_data;
   mfem::forall(rhs_ne * rhs_nq, src_kernel);
 #else
-  const mfem::real_t zero = static_cast<mfem::real_t>(0.0);
   const auto u_mass = mfem::Reshape(u_mass_data, num_eq, mass_nq, mass_ne);
   auto invrho = mfem::Reshape(invrho_data, mass_nq, mass_ne);
   for (int e = 0; e < mass_ne; ++e)
   {
     for (int q = 0; q < mass_nq; ++q)
     {
-      mfem::real_t rho = u_mass(0, q, e);
-      if (rho < rho_floor) { rho = rho_floor; }
-      invrho(q, e) = 1.0 / rho;
+      invrho(q, e) =
+        frozen_scalar_igr_algebra::SafeInverseDensity(u_mass(0, q, e),
+                                                      rho_floor);
     }
   }
 
@@ -488,53 +487,27 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
   {
     for (int q = 0; q < diff_nq; ++q)
     {
-      mfem::real_t rho = u_diff(0, q, e);
-      if (rho < rho_floor) { rho = rho_floor; }
-      ck(q, e) = alpha / rho;
+      ck(q, e) = frozen_scalar_igr_algebra::AlphaOverDensity(alpha,
+                                                             u_diff(0, q, e),
+                                                             rho_floor);
     }
   }
 
-  const auto u_rhs = mfem::Reshape(u_rhs_data, num_eq, rhs_nq, rhs_ne);
-  const auto grad_rhs =
-    mfem::Reshape(grad_rhs_data, num_eq, dim, rhs_nq, rhs_ne);
   auto src = mfem::Reshape(src_data, rhs_nq, rhs_ne);
   for (int e = 0; e < rhs_ne; ++e)
   {
     for (int q = 0; q < rhs_nq; ++q)
     {
-      mfem::real_t rho = u_rhs(0, q, e);
-      if (rho < rho_floor) { rho = rho_floor; }
-      mfem::real_t divu = zero;
-      mfem::real_t trA2 = zero;
-      mfem::real_t gradu[3][3] = {{zero, zero, zero},
-                                  {zero, zero, zero},
-                                  {zero, zero, zero}};
-
-      const mfem::real_t rho2 = rho * rho;
-      for (int i = 0; i < dim; ++i)
-      {
-        const mfem::real_t mom_i = u_rhs(1 + i, q, e);
-        for (int j = 0; j < dim; ++j)
-        {
-          const mfem::real_t dmij = grad_rhs(1 + i, j, q, e);
-          const mfem::real_t drhoj = grad_rhs(0, j, q, e);
-          gradu[i][j] = (rho * dmij - mom_i * drhoj) / rho2;
-        }
-      }
-
-      for (int i = 0; i < dim; ++i)
-      {
-        divu += gradu[i][i];
-      }
-      for (int i = 0; i < dim; ++i)
-      {
-        for (int j = 0; j < dim; ++j)
-        {
-          trA2 += gradu[i][j] * gradu[j][i];
-        }
-      }
-
-      src(q, e) = alpha * (trA2 + divu * divu);
+      src(q, e) =
+        frozen_scalar_igr_algebra::SourceFromConservativeStateGradient(
+          dim,
+          u_rhs_data + num_eq * (q + rhs_nq * e),
+          1,
+          grad_rhs_data + num_eq * dim * (q + rhs_nq * e),
+          1,
+          num_eq,
+          alpha,
+          rho_floor);
     }
   }
 #endif
@@ -715,9 +688,10 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
     {
       for (int q = 0; q < nqf; ++q)
       {
-        mfem::real_t rho = uface(0, q, f);
-        if (rho < rho_floor) { rho = rho_floor; }
-        ckface(q, f) = alpha / rho;
+        ckface(q, f) =
+          frozen_scalar_igr_algebra::AlphaOverDensity(alpha,
+                                                      uface(0, q, f),
+                                                      rho_floor);
       }
     }
 #endif

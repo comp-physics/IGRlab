@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include "mfem.hpp"
+#include "physics/igr/frozen_scalar_igr_algebra.hpp"
 #include "utils/config/dg_igr_defaults.hpp"
 #include "numerics/riemann/face_side.hpp"
 
@@ -25,8 +26,11 @@ MFEM_HOST_DEVICE inline real_t IGRFluxCharacteristicSpeed(real_t base_speed,
                                                            real_t sigma,
                                                            real_t rho_floor)
 {
-  const real_t safe_rho = fmax(rho, rho_floor);
-  return base_speed + sqrt(fabs(sigma) / safe_rho);
+  return ::dg_igr::frozen_scalar_igr_algebra::FluxCharacteristicSpeed(
+    base_speed,
+    rho,
+    sigma,
+    rho_floor);
 }
 
 /** Frozen-stage invariant-domain threshold for the IGR flux.
@@ -50,13 +54,15 @@ MFEM_HOST_DEVICE inline real_t IGRFluxInvariantDomainSpeed(
   real_t rho_floor,
   real_t pressure_floor = dg_igr::LimiterDefaults::kPMin)
 {
-  const real_t safe_rho = fmax(rho, rho_floor);
-  const real_t safe_pressure = fmax(pressure, pressure_floor);
-  const real_t pressure_scale =
-    sqrt(fmax((gamma - 1.0) / (2.0 * safe_rho * safe_pressure), 0.0));
-  const real_t split_speed =
-    transport_speed + fabs(pressure + sigma) * pressure_scale;
-  return fmax(base_speed, split_speed);
+  return ::dg_igr::frozen_scalar_igr_algebra::FluxInvariantDomainSpeed(
+    base_speed,
+    rho,
+    pressure,
+    transport_speed,
+    sigma,
+    gamma,
+    rho_floor,
+    pressure_floor);
 }
 
 /**
@@ -105,11 +111,13 @@ public:
                                        real_t rho,
                                        real_t sigma) const
   {
-    const real_t sigma_scale =
-      sqrt(fabs(sigma) / fmax(rho, rho_vel_floor_));
-    const real_t base_speed =
-      fmax(reported_speed - (sigma_aware_cfl_ ? sigma_scale : 0.0), 0.0);
-    return base_speed + (sigma_aware_rusanov_ ? sigma_scale : 0.0);
+    return ::dg_igr::frozen_scalar_igr_algebra::SelectRusanovDissipationSpeed(
+      reported_speed,
+      rho,
+      sigma,
+      rho_vel_floor_,
+      sigma_aware_cfl_,
+      sigma_aware_rusanov_);
   }
 
   /// Side-explicit normal flux path used by side-aware numerical fluxes.
@@ -184,17 +192,14 @@ private:
   inline void
   AddTensorSigmaTerms(const Vector& U, double sigma, DenseMatrix& F) const
   {
-    // momentum rows: +sigma I
-    for (int d = 0; d < dim; ++d)
-    {
-      F(1 + d, d) += sigma;
-    }
-    // energy row: +sigma u
-    const double rho = std::max(U(0), rho_vel_floor_);
-    for (int d = 0; d < dim; ++d)
-    {
-      F(1 + dim, d) += sigma * (U(1 + d) / rho);
-    }
+    ::dg_igr::frozen_scalar_igr_algebra::AddTensorSigmaFlux(dim,
+                                                            U.GetData(),
+                                                            1,
+                                                            sigma,
+                                                            rho_vel_floor_,
+                                                            F.GetData(),
+                                                            1,
+                                                            F.Height());
   }
 
   inline void AddDotNSigmaTerms(const Vector& U,
@@ -202,17 +207,15 @@ private:
                                 double sigma_face,
                                 Vector& Fn) const
   {
-    // momentum rows: +sigma n_d  (MFEM uses a scaled normal; stay consistent)
-    for (int d = 0; d < dim; ++d)
-    {
-      Fn(1 + d) += sigma_face * n(d);
-    }
-    // energy row: +sigma (u·n)
-    const double rho = std::max(U(0), rho_vel_floor_);
-    double un = 0.0;
-    for (int d = 0; d < dim; ++d)
-      un += U(1 + d) * n(d);
-    Fn(1 + dim) += sigma_face * (un / rho);
+    ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFlux(dim,
+                                                            U.GetData(),
+                                                            1,
+                                                            n.GetData(),
+                                                            1,
+                                                            sigma_face,
+                                                            rho_vel_floor_,
+                                                            Fn.GetData(),
+                                                            1);
   }
 };
 
