@@ -106,21 +106,15 @@ MFEM_HOST_DEVICE inline real_t EulerSpeed(const real_t* state,
   const real_t pressure = EulerPressure(state, stride, dim, gamma);
   real_t normal_squared = 0.0;
   real_t momentum_dot_normal = 0.0;
-  real_t momentum_squared = 0.0;
   for (int d = 0; d < dim; ++d)
   {
     const real_t momentum = state[(1 + d) * stride];
     const real_t normal_value = normal[d * normal_stride];
     momentum_dot_normal += momentum * normal_value;
-    momentum_squared += momentum * momentum;
     normal_squared += normal_value * normal_value;
   }
   const real_t sound = sqrt(gamma * pressure / rho);
-  if (normal)
-  {
-    return fabs(momentum_dot_normal / rho) / sqrt(normal_squared) + sound;
-  }
-  return sqrt(momentum_squared) / rho + sound;
+  return fabs(momentum_dot_normal / rho) / sqrt(normal_squared) + sound;
 }
 
 } // namespace
@@ -489,6 +483,21 @@ void AssembleEulerRusanovFacesDevice(int dim,
                 right_elements.Size() == nfaces &&
                 right_local_dofs.Size() == nfaces && ownership.Size() == nfaces,
               "DGSEM device Rusanov face map size mismatch.");
+
+  // One packed host preflight avoids a separate device synchronization for
+  // every point while keeping the bounded correctness fixture well-defined.
+  const real_t* host_normal = normals.HostRead();
+  for (int face = 0; face < nfaces; ++face)
+  {
+    real_t normal_squared = 0.0;
+    for (int d = 0; d < dim; ++d)
+    {
+      const real_t value = host_normal[face + nfaces * d];
+      normal_squared += value * value;
+    }
+    MFEM_VERIFY(normal_squared > 0.0,
+                "DGSEM device Rusanov face normal must be nonzero.");
+  }
 
   const int rows = ne * dof;
   face_flux.SetSize(nfaces, num_equations);

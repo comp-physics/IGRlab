@@ -25,7 +25,18 @@ The face kernel receives explicit left/right element and local-DOF maps. A
 `Local` face writes both sides with opposite signs; `Shared` writes only its
 locally owned left side; `Boundary` writes only the interior side. The normal
 always points out of the left side, and host-resolved right orientation is
-consumed without reinterpretation.
+consumed without reinterpretation. One packed host preflight checks that every
+normal is nonzero before the MFEM kernel launches; it does not synchronize once
+per face point.
+
+The focused parity fixture uses one dimension-parameterized implementation for
+direct p1--p4 checks in dimensions 1 and 2. Euler plus prescribed stage-frozen
+scalar sigma, central volume, constant cancellation, inverse mass,
+local/shared/boundary faces, component sums, and maximum reduction execute in
+both dimensions. Curl-form metric construction is recorded only for dimension
+2; the 1D flux fixture consumes its exact affine contravariant metric as input.
+The machine-readable evidence records `dimensions: [1,2]`, per-dimension
+errors, and this kernel-specific coverage boundary.
 
 ## Integration boundary
 
