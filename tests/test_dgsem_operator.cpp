@@ -13,9 +13,11 @@
 #include "mfem.hpp"
 #include "test_utils.hpp"
 #include "test_dgsem_device_parity.hpp"
+#include "test_dgsem_production_operator.hpp"
 #include "test_dgsem_reference_operator.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -283,11 +285,71 @@ void AssembleBoundaryShape(const mfem::ParFiniteElementSpace& vfes,
   }
 }
 
+void RunLegacy3DGuardProbeIfRequested()
+{
+  const char* requested = std::getenv("DG_IGR_DGSEM_LEGACY_3D_PROBE");
+  if (!requested || requested[0] == 0)
+  {
+    return;
+  }
+
+  constexpr int dim = 3;
+  constexpr int num_eq = dim + 2;
+  mfem::Mesh serial_mesh =
+    mfem::Mesh::MakeCartesian3D(1, 1, 1, mfem::Element::HEXAHEDRON);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh);
+  mfem::DG_FECollection fec(1, dim, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace vfes(
+    &mesh, &fec, num_eq, mfem::Ordering::byNODES);
+  mfem::EulerFlux flux(dim, 1.4);
+  mfem::RusanovFluxWithSides numerical_flux(flux);
+  auto form =
+    std::make_unique<mfem::HyperbolicFormIntegrator>(numerical_flux, 2);
+  mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form), true);
+  oper.SetNumericalFlux(&numerical_flux);
+  oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+  mfem::dgsem::DGSEMOperator dgsem_op(oper);
+  mfem::Vector input(vfes.GetTrueVSize());
+  mfem::Vector output(vfes.GetTrueVSize());
+  input = 1.0;
+  output = 0.0;
+
+  const std::string probe(requested);
+  if (probe == "surface")
+  {
+    dgsem_op.AssembleSurface(input, output);
+  }
+  else if (probe == "volume")
+  {
+    dgsem_op.AssembleVolume(input, output);
+  }
+  else if (probe == "inverse-mass")
+  {
+    dgsem_op.ApplyInverseMass(input, output);
+  }
+  else if (probe == "residual")
+  {
+    dgsem_op.AssembleResidual(input, output);
+  }
+  else
+  {
+    MFEM_ABORT("Unknown DGSEM legacy 3D probe.");
+  }
+  MFEM_ABORT("DGSEM legacy 3D probe unexpectedly passed its dimension guard.");
+}
+
 } // namespace
 
 int RunDGSEMOperatorTests(TestContext& ctx)
 {
+  if (std::getenv("DG_IGR_DGSEM_SPLIT_COMM_PROBE"))
+  {
+    dgsem_production_test::RunDGSEMProductionSplitCommunicatorTests(ctx);
+    return ctx.failures;
+  }
+  RunLegacy3DGuardProbeIfRequested();
   RunDGSEMDeviceParityTests(ctx);
+  dgsem_production_test::RunDGSEMProductionOperatorTests(ctx);
 
   const double tol = 1.0e-10;
 
