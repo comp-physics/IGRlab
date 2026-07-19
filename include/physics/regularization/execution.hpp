@@ -53,33 +53,34 @@ RegularizationLaunchResult LaunchStaticRegularization(
     (void)sizeof(Contract);
     (void)sizeof(DiscretizationTag);
     (void)sizeof(SolutionTag);
+    (void)sizeof(typename BackendTag::spatial_backend_tag);
+    (void)sizeof(typename BackendTag::execution_target_tag);
     (void)sizeof(TimeTag);
     (void)sizeof(EntropyTag);
 
     constexpr bool use_device = BackendTag::use_device;
     const int point_count = buffers.point_count;
     const int dimension = buffers.dimension;
+    const int state_components = buffers.state_components;
+    const int auxiliary_components = buffers.auxiliary.components;
+    const int trace_components = buffers.trace.components;
+    const int correction_components =
+      buffers.volume_correction.components;
 
-    const auto state =
-      mfem::Reshape(buffers.state->Read(use_device), point_count);
-    const auto auxiliary =
-      mfem::Reshape(buffers.auxiliary->Read(use_device), point_count);
-    const auto trace =
-      mfem::Reshape(buffers.trace->Read(use_device), point_count);
-    const auto gradient = mfem::Reshape(
-      buffers.gradient->Read(use_device), dimension, point_count);
-    const auto normals = mfem::Reshape(
-      buffers.normals->Read(use_device), dimension, point_count);
+    const mfem::real_t* state = buffers.state->Read(use_device);
+    const mfem::real_t* auxiliary = buffers.auxiliary.Read(use_device);
+    const mfem::real_t* trace = buffers.trace.Read(use_device);
+    const mfem::real_t* state_gradient =
+      buffers.state_gradient->Read(use_device);
+    const mfem::real_t* normal_data = buffers.normals->Read(use_device);
 
-    auto coefficient =
-      mfem::Reshape(buffers.coefficient->Write(use_device), point_count);
-    auto source = mfem::Reshape(buffers.source->Write(use_device), point_count);
-    auto volume = mfem::Reshape(
-      buffers.volume_correction->ReadWrite(use_device), dimension, point_count);
-    auto normal = mfem::Reshape(
-      buffers.normal_correction->ReadWrite(use_device), point_count);
-    auto wall =
-      mfem::Reshape(buffers.wall_flux->ReadWrite(use_device), point_count);
+    mfem::real_t* coefficient = buffers.coefficient->Write(use_device);
+    mfem::real_t* source = buffers.source->Write(use_device);
+    mfem::real_t* volume =
+      buffers.volume_correction.storage->ReadWrite(use_device);
+    mfem::real_t* normal =
+      buffers.normal_correction.storage->ReadWrite(use_device);
+    mfem::real_t* wall = buffers.wall_flux.storage->ReadWrite(use_device);
     auto bounds = mfem::Reshape(
       buffers.characteristic_bounds->Write(use_device), 2, point_count);
     auto diagnostics =
@@ -92,33 +93,34 @@ RegularizationLaunchResult LaunchStaticRegularization(
       [=] MFEM_HOST_DEVICE(int point_index)
       {
         RegularizationPointInput point{};
-        point.state = state(point_index);
-        point.auxiliary = auxiliary(point_index);
-        point.trace = trace(point_index);
+        point.state = state + state_components * point_index;
+        point.auxiliary =
+          auxiliary + auxiliary_components * point_index;
+        point.trace = trace + trace_components * point_index;
+        point.state_gradient =
+          state_gradient + state_components * dimension * point_index;
+        point.normal = normal_data + dimension * point_index;
+        point.state_components = state_components;
+        point.auxiliary_components = auxiliary_components;
+        point.trace_components = trace_components;
+        point.correction_components = correction_components;
         point.dimension = dimension;
-        for (int d = 0; d < dimension; ++d)
-        {
-          point.gradient[d] = gradient(d, point_index);
-          point.normal[d] = normals(d, point_index);
-        }
 
-        const CoefficientSourceResult coefficient_source =
-          Traits::CoefficientsAndSource(kernel_policy, point);
-        coefficient(point_index) = coefficient_source.coefficient;
-        source(point_index) = coefficient_source.source;
+        mfem::real_t* point_coefficient =
+          coefficient + auxiliary_components * point_index;
+        mfem::real_t* point_source =
+          source + auxiliary_components * point_index;
+        mfem::real_t* point_volume =
+          volume + correction_components * dimension * point_index;
+        mfem::real_t* point_normal =
+          normal + correction_components * point_index;
+        mfem::real_t* point_wall = wall + correction_components * point_index;
 
-        mfem::real_t point_volume[3] = {0.0, 0.0, 0.0};
-        for (int d = 0; d < dimension; ++d)
-        {
-          point_volume[d] = volume(d, point_index);
-        }
+        Traits::CoefficientsAndSource(
+          kernel_policy, point, point_coefficient, point_source);
         Traits::AddVolumeCorrection(kernel_policy, point, point_volume);
-        for (int d = 0; d < dimension; ++d)
-        {
-          volume(d, point_index) = point_volume[d];
-        }
-        normal(point_index) += Traits::NormalCorrection(kernel_policy, point);
-        wall(point_index) += Traits::WallLaw(kernel_policy, point);
+        Traits::AddNormalCorrection(kernel_policy, point, point_normal);
+        Traits::ApplyWallLaw(kernel_policy, point, point_wall);
 
         const CharacteristicBoundsResult point_bounds =
           Traits::CharacteristicBounds(kernel_policy, point);
@@ -215,30 +217,66 @@ RegularizationLaunchResult DispatchTime(
 
 template <typename ModelTag,
           typename DiscretizationTag,
-          typename SolutionTag>
-RegularizationLaunchResult DispatchBackend(
+          typename SolutionTag,
+          typename SpatialTag>
+RegularizationLaunchResult DispatchExecutionTarget(
   const RegularizationSelection& selection,
   const RegularizationDevicePolicy& policy,
   const RegularizationLaunchBuffers& buffers)
 {
-  switch (selection.axes.execution_backend)
+  switch (selection.axes.backend.execution)
   {
-    case ExecutionBackendKind::MFEMCpu:
-      return DispatchTime<ModelTag,
-                          DiscretizationTag,
-                          SolutionTag,
-                          MFEMCpuBackendTag>(selection.compatibility,
-                                             policy,
-                                             buffers);
-    case ExecutionBackendKind::MFEMDevice:
-      return DispatchTime<ModelTag,
-                          DiscretizationTag,
-                          SolutionTag,
-                          MFEMDeviceBackendTag>(selection.compatibility,
-                                                policy,
-                                                buffers);
+    case ExecutionTargetKind::MFEMCpu:
+      return DispatchTime<
+        ModelTag,
+        DiscretizationTag,
+        SolutionTag,
+        SpatialExecutionBackendTag<SpatialTag, MFEMCpuTargetTag>>(
+        selection.compatibility, policy, buffers);
+    case ExecutionTargetKind::MFEMDevice:
+      return DispatchTime<
+        ModelTag,
+        DiscretizationTag,
+        SolutionTag,
+        SpatialExecutionBackendTag<SpatialTag, MFEMDeviceTargetTag>>(
+        selection.compatibility, policy, buffers);
   }
-  return DispatchFailure("unknown execution backend during host dispatch");
+  return DispatchFailure("unknown execution target during host dispatch");
+}
+
+template <typename ModelTag,
+          typename DiscretizationTag,
+          typename SolutionTag>
+RegularizationLaunchResult DispatchSpatialBackend(
+  const RegularizationSelection& selection,
+  const RegularizationDevicePolicy& policy,
+  const RegularizationLaunchBuffers& buffers)
+{
+  switch (selection.axes.backend.spatial)
+  {
+    case SpatialBackendKind::DG:
+      return DispatchExecutionTarget<ModelTag,
+                                     DiscretizationTag,
+                                     SolutionTag,
+                                     DGSpatialBackendTag>(selection,
+                                                          policy,
+                                                          buffers);
+    case SpatialBackendKind::DGSEM:
+      return DispatchExecutionTarget<ModelTag,
+                                     DiscretizationTag,
+                                     SolutionTag,
+                                     DGSEMSpatialBackendTag>(selection,
+                                                             policy,
+                                                             buffers);
+    case SpatialBackendKind::HDG:
+      return DispatchExecutionTarget<ModelTag,
+                                     DiscretizationTag,
+                                     SolutionTag,
+                                     HDGSpatialBackendTag>(selection,
+                                                           policy,
+                                                           buffers);
+  }
+  return DispatchFailure("unknown spatial backend during host dispatch");
 }
 
 template <typename ModelTag, typename DiscretizationTag>
@@ -250,19 +288,23 @@ RegularizationLaunchResult DispatchSolution(
   switch (selection.axes.auxiliary_solution)
   {
     case AuxiliarySolutionKind::PointwiseEvaluation:
-      return DispatchBackend<ModelTag,
-                             DiscretizationTag,
-                             PointwiseEvaluationTag>(selection,
-                                                     policy,
-                                                     buffers);
+      return DispatchSpatialBackend<ModelTag,
+                                    DiscretizationTag,
+                                    PointwiseEvaluationTag>(selection,
+                                                            policy,
+                                                            buffers);
     case AuxiliarySolutionKind::LocalElimination:
-      return DispatchBackend<ModelTag,
-                             DiscretizationTag,
-                             LocalEliminationTag>(selection, policy, buffers);
+      return DispatchSpatialBackend<ModelTag,
+                                    DiscretizationTag,
+                                    LocalEliminationTag>(selection,
+                                                         policy,
+                                                         buffers);
     case AuxiliarySolutionKind::GlobalLinearSolve:
-      return DispatchBackend<ModelTag,
-                             DiscretizationTag,
-                             GlobalLinearSolveTag>(selection, policy, buffers);
+      return DispatchSpatialBackend<ModelTag,
+                                    DiscretizationTag,
+                                    GlobalLinearSolveTag>(selection,
+                                                          policy,
+                                                          buffers);
   }
   return DispatchFailure("unknown auxiliary solve during host dispatch");
 }

@@ -214,6 +214,50 @@ using TensorAuxiliaryFieldDescriptor =
 using TraceAuxiliaryFieldDescriptor =
   AuxiliaryFieldDescriptor<ScalarValueTag, TraceTopologyTag>;
 
+struct AuxiliaryFieldBinding
+{
+  const mfem::Vector* storage = nullptr;
+  int entity_count = 0;
+  int dimension = 0;
+  int components = 0;
+  AuxiliaryValueKind value_kind = AuxiliaryValueKind::Scalar;
+  AuxiliaryFieldTopology topology = AuxiliaryFieldTopology::Volume;
+  AuxiliaryFieldOwnership ownership =
+    AuxiliaryFieldOwnership::BorrowedReadOnly;
+  AuxiliaryFieldProvenance provenance{};
+  AuxiliaryFieldIdentity identity{};
+  AuxiliaryFieldCapabilities capabilities{};
+
+  int ExpectedSize() const { return entity_count * components; }
+  bool HasExpectedSize() const
+  {
+    return storage != nullptr && storage->Size() == ExpectedSize();
+  }
+  const mfem::real_t* Read(bool on_device) const
+  {
+    return storage->Read(on_device);
+  }
+};
+
+template <typename ValueTag, typename TopologyTag>
+AuxiliaryFieldBinding BindAuxiliaryField(
+  const AuxiliaryFieldDescriptor<ValueTag, TopologyTag>& descriptor)
+{
+  return {&descriptor.Storage(),
+          descriptor.EntityCount(),
+          descriptor.Dimension(),
+          descriptor.Components(),
+          descriptor.ValueKind(),
+          descriptor.Topology(),
+          descriptor.Ownership(),
+          descriptor.Provenance(),
+          descriptor.Identity(),
+          descriptor.Capabilities()};
+}
+
+static_assert(std::is_trivially_copyable<AuxiliaryFieldBinding>::value,
+              "auxiliary field binding must be trivially copyable");
+
 static_assert(std::is_same<ScalarAuxiliaryFieldDescriptor::value_tag,
                            ScalarValueTag>::value,
               "scalar auxiliary descriptor must retain its value type");

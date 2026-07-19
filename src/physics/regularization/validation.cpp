@@ -1,5 +1,7 @@
 #include "physics/regularization/validation.hpp"
 
+#include <limits>
+
 namespace dg_igr
 {
 namespace regularization
@@ -27,10 +29,16 @@ bool Known(AuxiliarySolutionKind value)
          value == AuxiliarySolutionKind::GlobalLinearSolve;
 }
 
-bool Known(ExecutionBackendKind value)
+bool Known(SpatialBackendKind value)
 {
-  return value == ExecutionBackendKind::MFEMCpu ||
-         value == ExecutionBackendKind::MFEMDevice;
+  return value == SpatialBackendKind::DG || value == SpatialBackendKind::DGSEM ||
+         value == SpatialBackendKind::HDG;
+}
+
+bool Known(ExecutionTargetKind value)
+{
+  return value == ExecutionTargetKind::MFEMCpu ||
+         value == ExecutionTargetKind::MFEMDevice;
 }
 
 bool Known(TimeTreatmentKind value)
@@ -49,52 +57,70 @@ bool Known(EntropyTreatmentKind value)
 
 bool HasSize(const mfem::Vector* vector, int expected)
 {
-  return vector != nullptr && vector->Size() == expected;
+  return vector != nullptr && expected >= 0 && vector->Size() == expected;
+}
+
+bool ProductFits(int first, int second, int third, int& product)
+{
+  if (first < 0 || second < 0 || third < 0)
+  {
+    return false;
+  }
+  const long long value = static_cast<long long>(first) * second * third;
+  if (value > std::numeric_limits<int>::max())
+  {
+    return false;
+  }
+  product = static_cast<int>(value);
+  return true;
 }
 
 ValidationResult ValidateIdentityAndCapabilities(
-  const ScalarAuxiliaryFieldDescriptor& auxiliary,
-  const TraceAuxiliaryFieldDescriptor& trace,
-  ExecutionBackendKind backend)
+  const AuxiliaryFieldBinding& auxiliary,
+  const AuxiliaryFieldBinding& trace,
+  ExecutionTargetKind execution)
 {
-  const AuxiliaryFieldIdentity auxiliary_id = auxiliary.Identity();
-  const AuxiliaryFieldIdentity trace_id = trace.Identity();
-  if (auxiliary_id.semantic_id == 0u || trace_id.semantic_id == 0u ||
-      auxiliary_id == trace_id)
+  if (auxiliary.topology != AuxiliaryFieldTopology::Volume ||
+      trace.topology != AuxiliaryFieldTopology::Trace)
+  {
+    return {ValidationCode::InvalidFieldTopology,
+            "launch requires a volume auxiliary and a trace field"};
+  }
+
+  if (auxiliary.identity.semantic_id == 0u ||
+      trace.identity.semantic_id == 0u || auxiliary.identity == trace.identity)
   {
     return {ValidationCode::InvalidFieldIdentity,
             "auxiliary and trace fields require distinct nonzero identities"};
   }
 
-  const AuxiliaryFieldCapabilities auxiliary_caps = auxiliary.Capabilities();
-  const AuxiliaryFieldCapabilities trace_caps = trace.Capabilities();
-  if (!auxiliary_caps.Has(AuxiliaryCapability::StageLocal) ||
-      !trace_caps.Has(AuxiliaryCapability::StageLocal) ||
-      !trace_caps.Has(AuxiliaryCapability::TraceCoupled))
+  if (!auxiliary.capabilities.Has(AuxiliaryCapability::StageLocal) ||
+      !trace.capabilities.Has(AuxiliaryCapability::StageLocal) ||
+      !trace.capabilities.Has(AuxiliaryCapability::TraceCoupled))
   {
     return {ValidationCode::MissingFieldCapability,
             "launch fields lack required stage/trace capabilities"};
   }
 
-  if ((auxiliary_caps.Has(AuxiliaryCapability::Restartable) &&
-       auxiliary_id.restart_id == 0u) ||
-      (trace_caps.Has(AuxiliaryCapability::Restartable) &&
-       trace_id.restart_id == 0u) ||
-      (auxiliary_caps.Has(AuxiliaryCapability::OutputVisible) &&
-       auxiliary_id.output_id == 0u) ||
-      (trace_caps.Has(AuxiliaryCapability::OutputVisible) &&
-       trace_id.output_id == 0u))
+  if ((auxiliary.capabilities.Has(AuxiliaryCapability::Restartable) &&
+       auxiliary.identity.restart_id == 0u) ||
+      (trace.capabilities.Has(AuxiliaryCapability::Restartable) &&
+       trace.identity.restart_id == 0u) ||
+      (auxiliary.capabilities.Has(AuxiliaryCapability::OutputVisible) &&
+       auxiliary.identity.output_id == 0u) ||
+      (trace.capabilities.Has(AuxiliaryCapability::OutputVisible) &&
+       trace.identity.output_id == 0u))
   {
     return {ValidationCode::InvalidFieldIdentity,
             "restart/output capability requires a stable identity"};
   }
 
-  if (backend == ExecutionBackendKind::MFEMDevice &&
-      (!auxiliary_caps.Has(AuxiliaryCapability::DeviceAccessible) ||
-       !trace_caps.Has(AuxiliaryCapability::DeviceAccessible)))
+  if (execution == ExecutionTargetKind::MFEMDevice &&
+      (!auxiliary.capabilities.Has(AuxiliaryCapability::DeviceAccessible) ||
+       !trace.capabilities.Has(AuxiliaryCapability::DeviceAccessible)))
   {
     return {ValidationCode::MissingFieldCapability,
-            "device backend requires device-accessible fields"};
+            "device execution requires device-accessible fields"};
   }
 
   return {};
@@ -109,8 +135,9 @@ bool IsRuntimeCombinationSupported(const RegularizationSelection& selection)
 
   if (!Known(axes.continuum_model) ||
       !Known(axes.auxiliary_discretization) ||
-      !Known(axes.auxiliary_solution) || !Known(axes.execution_backend) ||
-      !Known(compatibility.time) || !Known(compatibility.entropy))
+      !Known(axes.auxiliary_solution) || !Known(axes.backend.spatial) ||
+      !Known(axes.backend.execution) || !Known(compatibility.time) ||
+      !Known(compatibility.entropy))
   {
     return false;
   }
@@ -123,26 +150,26 @@ bool IsRuntimeCombinationSupported(const RegularizationSelection& selection)
 
   if (axes.auxiliary_discretization ==
         AuxiliaryDiscretizationKind::ElementL2 &&
-      axes.auxiliary_solution ==
-        AuxiliarySolutionKind::PointwiseEvaluation)
+      axes.auxiliary_solution == AuxiliarySolutionKind::PointwiseEvaluation)
   {
     return true;
   }
 
-  if (axes.continuum_model != ContinuumModelKind::ConstantFixture ||
-      axes.execution_backend != ExecutionBackendKind::MFEMCpu)
+  if (axes.continuum_model != ContinuumModelKind::ConstantFixture)
   {
     return false;
   }
 
   const bool local_trace =
-    axes.auxiliary_discretization ==
-      AuxiliaryDiscretizationKind::TraceL2 &&
-    axes.auxiliary_solution == AuxiliarySolutionKind::LocalElimination;
+    axes.auxiliary_discretization == AuxiliaryDiscretizationKind::TraceL2 &&
+    axes.auxiliary_solution == AuxiliarySolutionKind::LocalElimination &&
+    (axes.backend.spatial == SpatialBackendKind::DG ||
+     axes.backend.spatial == SpatialBackendKind::DGSEM);
   const bool global_hybrid =
     axes.auxiliary_discretization ==
       AuxiliaryDiscretizationKind::HybridizedTrace &&
-    axes.auxiliary_solution == AuxiliarySolutionKind::GlobalLinearSolve;
+    axes.auxiliary_solution == AuxiliarySolutionKind::GlobalLinearSolve &&
+    axes.backend.spatial == SpatialBackendKind::HDG;
   return local_trace || global_hybrid;
 }
 
@@ -155,8 +182,9 @@ ValidationResult ValidateRegularizationLaunch(
   const RegularizationCompatibility& compatibility = selection.compatibility;
   if (!Known(axes.continuum_model) ||
       !Known(axes.auxiliary_discretization) ||
-      !Known(axes.auxiliary_solution) || !Known(axes.execution_backend) ||
-      !Known(compatibility.time) || !Known(compatibility.entropy))
+      !Known(axes.auxiliary_solution) || !Known(axes.backend.spatial) ||
+      !Known(axes.backend.execution) || !Known(compatibility.time) ||
+      !Known(compatibility.entropy))
   {
     return {ValidationCode::UnknownAxisValue,
             "selection contains an unknown axis value"};
@@ -165,14 +193,14 @@ ValidationResult ValidateRegularizationLaunch(
   if (!IsRuntimeCombinationSupported(selection))
   {
     return {ValidationCode::UnsupportedCombination,
-            "model/discretization/solve/backend/time/entropy combination is unsupported"};
+            "model/discretization/solve/spatial/execution/time/entropy combination is unsupported"};
   }
 
-  if (axes.execution_backend == ExecutionBackendKind::MFEMDevice &&
+  if (axes.backend.execution == ExecutionTargetKind::MFEMDevice &&
       !context.mfem_device_available)
   {
     return {ValidationCode::BackendUnavailable,
-            "MFEM device backend is unavailable"};
+            "MFEM device execution target is unavailable"};
   }
 
   if (buffers.dimension < 1 || buffers.dimension > 3)
@@ -180,17 +208,26 @@ ValidationResult ValidateRegularizationLaunch(
     return {ValidationCode::InvalidDimension,
             "point-kernel dimension must be in [1,3]"};
   }
+  if (buffers.state_components <= 0 ||
+      buffers.volume_correction.components <= 0 ||
+      buffers.auxiliary.components <= 0 || buffers.trace.components <= 0)
+  {
+    return {ValidationCode::InvalidComponentCount,
+            "state, auxiliary, trace, and correction component counts must be positive"};
+  }
   if (buffers.point_count <= 0)
   {
     return {ValidationCode::InvalidPointCount,
             "point-kernel launch requires at least one point"};
   }
 
-  if (buffers.state == nullptr || buffers.auxiliary == nullptr ||
-      buffers.trace == nullptr || buffers.gradient == nullptr ||
+  if (buffers.state == nullptr || buffers.auxiliary.storage == nullptr ||
+      buffers.trace.storage == nullptr || buffers.state_gradient == nullptr ||
       buffers.normals == nullptr || buffers.coefficient == nullptr ||
-      buffers.source == nullptr || buffers.volume_correction == nullptr ||
-      buffers.normal_correction == nullptr || buffers.wall_flux == nullptr ||
+      buffers.source == nullptr ||
+      buffers.volume_correction.storage == nullptr ||
+      buffers.normal_correction.storage == nullptr ||
+      buffers.wall_flux.storage == nullptr ||
       buffers.characteristic_bounds == nullptr ||
       buffers.diagnostics == nullptr)
   {
@@ -200,20 +237,54 @@ ValidationResult ValidateRegularizationLaunch(
 
   const int points = buffers.point_count;
   const int dimension = buffers.dimension;
-  if (!HasSize(buffers.state, points) ||
-      buffers.auxiliary->EntityCount() != points ||
-      buffers.auxiliary->Dimension() != dimension ||
-      !buffers.auxiliary->HasExpectedSize() ||
-      buffers.trace->EntityCount() != points ||
-      buffers.trace->Dimension() != dimension ||
-      !buffers.trace->HasExpectedSize() ||
-      !HasSize(buffers.gradient, dimension * points) ||
+  const int correction_components = buffers.volume_correction.components;
+  int state_size = 0;
+  int gradient_size = 0;
+  int coefficient_size = 0;
+  int volume_size = 0;
+  int correction_size = 0;
+  if (!ProductFits(buffers.state_components, points, 1, state_size) ||
+      !ProductFits(buffers.state_components,
+                   dimension,
+                   points,
+                   gradient_size) ||
+      !ProductFits(buffers.auxiliary.components,
+                   points,
+                   1,
+                   coefficient_size) ||
+      !ProductFits(correction_components,
+                   dimension,
+                   points,
+                   volume_size) ||
+      !ProductFits(correction_components,
+                   points,
+                   1,
+                   correction_size))
+  {
+    return {ValidationCode::InvalidComponentCount,
+            "regularization launch shape exceeds MFEM Vector limits"};
+  }
+
+  if (!HasSize(buffers.state, state_size) ||
+      buffers.auxiliary.entity_count != points ||
+      buffers.auxiliary.dimension != dimension ||
+      !buffers.auxiliary.HasExpectedSize() ||
+      buffers.trace.entity_count != points ||
+      buffers.trace.dimension != dimension ||
+      !buffers.trace.HasExpectedSize() ||
+      !HasSize(buffers.state_gradient, gradient_size) ||
       !HasSize(buffers.normals, dimension * points) ||
-      !HasSize(buffers.coefficient, points) ||
-      !HasSize(buffers.source, points) ||
-      !HasSize(buffers.volume_correction, dimension * points) ||
-      !HasSize(buffers.normal_correction, points) ||
-      !HasSize(buffers.wall_flux, points) ||
+      !HasSize(buffers.coefficient, coefficient_size) ||
+      !HasSize(buffers.source, coefficient_size) ||
+      buffers.volume_correction.dimension != dimension ||
+      buffers.volume_correction.point_count != points ||
+      buffers.normal_correction.components != correction_components ||
+      buffers.normal_correction.point_count != points ||
+      buffers.wall_flux.components != correction_components ||
+      buffers.wall_flux.point_count != points ||
+      !HasSize(buffers.volume_correction.storage, volume_size) ||
+      !HasSize(buffers.normal_correction.storage, correction_size) ||
+      !HasSize(buffers.wall_flux.storage, correction_size) ||
       !HasSize(buffers.characteristic_bounds, 2 * points) ||
       !HasSize(buffers.diagnostics, 3 * points))
   {
@@ -222,7 +293,7 @@ ValidationResult ValidateRegularizationLaunch(
   }
 
   const ValidationResult field_validation = ValidateIdentityAndCapabilities(
-    *buffers.auxiliary, *buffers.trace, axes.execution_backend);
+    buffers.auxiliary, buffers.trace, axes.backend.execution);
   if (!field_validation.Ok())
   {
     return field_validation;
@@ -230,8 +301,8 @@ ValidationResult ValidateRegularizationLaunch(
 
   const AuxiliaryFieldProvenance expected{
     context.expected_rk_stage, context.expected_state_generation, 0u};
-  if (!SameStageState(buffers.auxiliary->Provenance(), expected) ||
-      !SameStageState(buffers.trace->Provenance(), expected))
+  if (!SameStageState(buffers.auxiliary.provenance, expected) ||
+      !SameStageState(buffers.trace.provenance, expected))
   {
     return {ValidationCode::StaleProvenance,
             "auxiliary field provenance does not match the RK-stage state"};

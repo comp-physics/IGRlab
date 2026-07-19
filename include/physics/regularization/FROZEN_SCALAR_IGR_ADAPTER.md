@@ -22,6 +22,24 @@ scalar IGR implementation.
   `tests/test_time_defaults.cpp` are the existing scalar behavior/default
   fixtures that must remain unchanged.
 
+## Accepted type-level shape boundary
+
+The public launch contract is system-shaped even though CONTRACT-01 registers
+only neutral fixtures. `RegularizationLaunchBuffers` carries `state_components`; its distinct
+`VolumeFluxCorrectionFieldBinding` and `StateVectorCorrectionFieldBinding`
+carry matching correction-component extents. The volume correction has
+layout `(direction, correction_component, point)`, while normal and wall
+corrections have layout `(correction_component, point)`. Typed scalar, vector,
+or tensor auxiliary descriptors enter the launch through
+`BindAuxiliaryField`; the binding retains value kind, topology, ownership,
+identity, capabilities, provenance, component count, and MFEM storage without a
+runtime polymorphism or an owning pointer.
+
+Consequently, a later Euler scalar-IGR trait can bind one scalar auxiliary, set
+`state_components = dimension + 2` and bind correction fields with the same component count, and emit a full
+Euler-sized volume tensor and normal/wall vectors without changing the public
+contract. The future trait remains responsible for its reviewed algebra.
+
 ## Future adapter boundary
 
 A later adapter may be added without modifying the files above:

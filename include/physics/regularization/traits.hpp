@@ -33,20 +33,45 @@ struct RegularizationDevicePolicy
   mfem::real_t characteristic_speed = 0.0;
 };
 
+/** Non-owning point view passed to a statically selected model trait.
+ *
+ * Component-major point slices allow a future system model to consume a state
+ * vector and emit equation-by-dimension volume corrections plus equation
+ * vectors for normal and wall corrections without changing this interface.
+ */
 struct RegularizationPointInput
 {
-  mfem::real_t state = 0.0;
-  mfem::real_t auxiliary = 0.0;
-  mfem::real_t trace = 0.0;
-  mfem::real_t gradient[3] = {0.0, 0.0, 0.0};
-  mfem::real_t normal[3] = {0.0, 0.0, 0.0};
+  const mfem::real_t* state = nullptr;
+  const mfem::real_t* auxiliary = nullptr;
+  const mfem::real_t* trace = nullptr;
+  const mfem::real_t* state_gradient = nullptr;
+  const mfem::real_t* normal = nullptr;
+  int state_components = 0;
+  int auxiliary_components = 0;
+  int trace_components = 0;
+  int correction_components = 0;
   int dimension = 0;
-};
 
-struct CoefficientSourceResult
-{
-  mfem::real_t coefficient = 0.0;
-  mfem::real_t source = 0.0;
+  MFEM_HOST_DEVICE mfem::real_t State(int component) const
+  {
+    return state[component];
+  }
+  MFEM_HOST_DEVICE mfem::real_t Auxiliary(int component) const
+  {
+    return auxiliary[component];
+  }
+  MFEM_HOST_DEVICE mfem::real_t Trace(int component) const
+  {
+    return trace[component];
+  }
+  MFEM_HOST_DEVICE mfem::real_t Gradient(int component, int direction) const
+  {
+    return state_gradient[component + state_components * direction];
+  }
+  MFEM_HOST_DEVICE mfem::real_t Normal(int direction) const
+  {
+    return normal[direction];
+  }
 };
 
 struct CharacteristicBoundsResult
@@ -80,6 +105,11 @@ MFEM_HOST_DEVICE inline mfem::real_t AbsoluteValue(mfem::real_t value)
   return value < 0.0 ? -value : value;
 }
 
+MFEM_HOST_DEVICE inline mfem::real_t FixtureComponentScale(int component)
+{
+  return static_cast<mfem::real_t>(component + 1);
+}
+
 } // namespace detail
 
 /** A neutral fixture whose complete regularization contribution is zero. */
@@ -90,11 +120,17 @@ struct RegularizationTraits<ZeroFixtureModelTag>
   static constexpr RegularizationCapabilities capabilities{
     true, true, true, true, true, true};
 
-  MFEM_HOST_DEVICE static CoefficientSourceResult
+  MFEM_HOST_DEVICE static void
   CoefficientsAndSource(const RegularizationDevicePolicy&,
-                        const RegularizationPointInput&)
+                        const RegularizationPointInput& point,
+                        mfem::real_t* coefficient,
+                        mfem::real_t* source)
   {
-    return {};
+    for (int component = 0; component < point.auxiliary_components; ++component)
+    {
+      coefficient[component] = 0.0;
+      source[component] = 0.0;
+    }
   }
 
   MFEM_HOST_DEVICE static void
@@ -104,18 +140,18 @@ struct RegularizationTraits<ZeroFixtureModelTag>
   {
   }
 
-  MFEM_HOST_DEVICE static mfem::real_t
-  NormalCorrection(const RegularizationDevicePolicy&,
-                   const RegularizationPointInput&)
+  MFEM_HOST_DEVICE static void
+  AddNormalCorrection(const RegularizationDevicePolicy&,
+                      const RegularizationPointInput&,
+                      mfem::real_t*)
   {
-    return 0.0;
   }
 
-  MFEM_HOST_DEVICE static mfem::real_t
-  WallLaw(const RegularizationDevicePolicy&,
-          const RegularizationPointInput&)
+  MFEM_HOST_DEVICE static void
+  ApplyWallLaw(const RegularizationDevicePolicy&,
+               const RegularizationPointInput&,
+               mfem::real_t*)
   {
-    return 0.0;
   }
 
   MFEM_HOST_DEVICE static CharacteristicBoundsResult
@@ -142,11 +178,35 @@ struct RegularizationTraits<ConstantFixtureModelTag>
   static constexpr RegularizationCapabilities capabilities{
     true, true, true, true, true, true};
 
-  MFEM_HOST_DEVICE static CoefficientSourceResult
-  CoefficientsAndSource(const RegularizationDevicePolicy& policy,
-                        const RegularizationPointInput&)
+  MFEM_HOST_DEVICE static mfem::real_t
+  ComponentCorrection(const RegularizationDevicePolicy& policy,
+                      const RegularizationPointInput& point,
+                      int component)
   {
-    return {policy.coefficient, policy.source};
+    return detail::FixtureComponentScale(component) * policy.volume_scale *
+           point.Auxiliary(0);
+  }
+
+  MFEM_HOST_DEVICE static mfem::real_t
+  ComponentWallFlux(const RegularizationDevicePolicy& policy,
+                    const RegularizationPointInput& point,
+                    int component)
+  {
+    return detail::FixtureComponentScale(component) * policy.wall_scale *
+           (point.Trace(0) - point.State(0));
+  }
+
+  MFEM_HOST_DEVICE static void
+  CoefficientsAndSource(const RegularizationDevicePolicy& policy,
+                        const RegularizationPointInput& point,
+                        mfem::real_t* coefficient,
+                        mfem::real_t* source)
+  {
+    for (int component = 0; component < point.auxiliary_components; ++component)
+    {
+      coefficient[component] = policy.coefficient;
+      source[component] = policy.source;
+    }
   }
 
   MFEM_HOST_DEVICE static void
@@ -154,31 +214,44 @@ struct RegularizationTraits<ConstantFixtureModelTag>
                       const RegularizationPointInput& point,
                       mfem::real_t* volume_correction)
   {
-    for (int d = 0; d < point.dimension; ++d)
+    for (int component = 0; component < point.correction_components; ++component)
     {
-      volume_correction[d] += policy.volume_scale * point.auxiliary;
+      const mfem::real_t correction =
+        ComponentCorrection(policy, point, component);
+      for (int direction = 0; direction < point.dimension; ++direction)
+      {
+        volume_correction[direction + point.dimension * component] +=
+          correction;
+      }
     }
   }
 
-  MFEM_HOST_DEVICE static mfem::real_t
-  NormalCorrection(const RegularizationDevicePolicy& policy,
-                   const RegularizationPointInput& point)
+  MFEM_HOST_DEVICE static void
+  AddNormalCorrection(const RegularizationDevicePolicy& policy,
+                      const RegularizationPointInput& point,
+                      mfem::real_t* normal_correction)
   {
-    mfem::real_t correction[3] = {0.0, 0.0, 0.0};
-    AddVolumeCorrection(policy, point, correction);
-    mfem::real_t normal_correction = 0.0;
-    for (int d = 0; d < point.dimension; ++d)
+    mfem::real_t normal_sum = 0.0;
+    for (int direction = 0; direction < point.dimension; ++direction)
     {
-      normal_correction += correction[d] * point.normal[d];
+      normal_sum += point.Normal(direction);
     }
-    return normal_correction;
+    for (int component = 0; component < point.correction_components; ++component)
+    {
+      normal_correction[component] +=
+        ComponentCorrection(policy, point, component) * normal_sum;
+    }
   }
 
-  MFEM_HOST_DEVICE static mfem::real_t
-  WallLaw(const RegularizationDevicePolicy& policy,
-          const RegularizationPointInput& point)
+  MFEM_HOST_DEVICE static void
+  ApplyWallLaw(const RegularizationDevicePolicy& policy,
+               const RegularizationPointInput& point,
+               mfem::real_t* wall_flux)
   {
-    return policy.wall_scale * (point.trace - point.state);
+    for (int component = 0; component < point.correction_components; ++component)
+    {
+      wall_flux[component] += ComponentWallFlux(policy, point, component);
+    }
   }
 
   MFEM_HOST_DEVICE static CharacteristicBoundsResult
@@ -195,15 +268,16 @@ struct RegularizationTraits<ConstantFixtureModelTag>
               const RegularizationPointInput& point)
   {
     mfem::real_t correction_l1 = 0.0;
-    const mfem::real_t component =
-      detail::AbsoluteValue(policy.volume_scale * point.auxiliary);
-    for (int d = 0; d < point.dimension; ++d)
+    mfem::real_t wall_l1 = 0.0;
+    for (int component = 0; component < point.correction_components; ++component)
     {
-      correction_l1 += component;
+      const mfem::real_t correction = detail::AbsoluteValue(
+        ComponentCorrection(policy, point, component));
+      correction_l1 += static_cast<mfem::real_t>(point.dimension) * correction;
+      wall_l1 += detail::AbsoluteValue(
+        ComponentWallFlux(policy, point, component));
     }
-    return {detail::AbsoluteValue(policy.source),
-            correction_l1,
-            detail::AbsoluteValue(WallLaw(policy, point))};
+    return {detail::AbsoluteValue(policy.source), correction_l1, wall_l1};
   }
 };
 
@@ -219,17 +293,21 @@ struct HasRegularizationTraits<
     decltype(RegularizationTraits<ModelTag>::capabilities),
     decltype(RegularizationTraits<ModelTag>::CoefficientsAndSource(
       std::declval<const RegularizationDevicePolicy&>(),
-      std::declval<const RegularizationPointInput&>())),
+      std::declval<const RegularizationPointInput&>(),
+      std::declval<mfem::real_t*>(),
+      std::declval<mfem::real_t*>())),
     decltype(RegularizationTraits<ModelTag>::AddVolumeCorrection(
       std::declval<const RegularizationDevicePolicy&>(),
       std::declval<const RegularizationPointInput&>(),
       std::declval<mfem::real_t*>())),
-    decltype(RegularizationTraits<ModelTag>::NormalCorrection(
+    decltype(RegularizationTraits<ModelTag>::AddNormalCorrection(
       std::declval<const RegularizationDevicePolicy&>(),
-      std::declval<const RegularizationPointInput&>())),
-    decltype(RegularizationTraits<ModelTag>::WallLaw(
+      std::declval<const RegularizationPointInput&>(),
+      std::declval<mfem::real_t*>())),
+    decltype(RegularizationTraits<ModelTag>::ApplyWallLaw(
       std::declval<const RegularizationDevicePolicy&>(),
-      std::declval<const RegularizationPointInput&>())),
+      std::declval<const RegularizationPointInput&>(),
+      std::declval<mfem::real_t*>())),
     decltype(RegularizationTraits<ModelTag>::CharacteristicBounds(
       std::declval<const RegularizationDevicePolicy&>(),
       std::declval<const RegularizationPointInput&>())),
@@ -249,8 +327,10 @@ struct RegularizationTraitContract
   static_assert(
     std::is_same<decltype(Traits::CoefficientsAndSource(
                    std::declval<const RegularizationDevicePolicy&>(),
-                   std::declval<const RegularizationPointInput&>())),
-                 CoefficientSourceResult>::value,
+                   std::declval<const RegularizationPointInput&>(),
+                   std::declval<mfem::real_t*>(),
+                   std::declval<mfem::real_t*>())),
+                 void>::value,
     "coefficient/source signature does not satisfy the static contract");
   static_assert(
     std::is_same<decltype(Traits::AddVolumeCorrection(
@@ -260,16 +340,18 @@ struct RegularizationTraitContract
                  void>::value,
     "volume correction signature does not satisfy the static contract");
   static_assert(
-    std::is_same<decltype(Traits::NormalCorrection(
+    std::is_same<decltype(Traits::AddNormalCorrection(
                    std::declval<const RegularizationDevicePolicy&>(),
-                   std::declval<const RegularizationPointInput&>())),
-                 mfem::real_t>::value,
+                   std::declval<const RegularizationPointInput&>(),
+                   std::declval<mfem::real_t*>())),
+                 void>::value,
     "normal correction signature does not satisfy the static contract");
   static_assert(
-    std::is_same<decltype(Traits::WallLaw(
+    std::is_same<decltype(Traits::ApplyWallLaw(
                    std::declval<const RegularizationDevicePolicy&>(),
-                   std::declval<const RegularizationPointInput&>())),
-                 mfem::real_t>::value,
+                   std::declval<const RegularizationPointInput&>(),
+                   std::declval<mfem::real_t*>())),
+                 void>::value,
     "wall-law signature does not satisfy the static contract");
   static_assert(
     std::is_same<decltype(Traits::CharacteristicBounds(
