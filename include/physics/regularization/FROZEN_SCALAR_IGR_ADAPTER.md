@@ -34,6 +34,10 @@ or tensor auxiliary descriptors enter the launch through
 `BindAuxiliaryField`; the binding retains value kind, topology, ownership,
 identity, capabilities, provenance, component count, and MFEM storage without a
 runtime polymorphism or an owning pointer.
+`AuxiliaryFieldBinding` is const-only for every ownership value: binding a
+descriptor never grants mutation. Descriptor ownership records host lifecycle
+responsibility only; the separately typed correction bindings remain the
+writable launch destinations.
 
 Consequently, a later Euler scalar-IGR trait can bind one scalar auxiliary, set
 `state_components = dimension + 2` and bind correction fields with the same component count, and emit a full

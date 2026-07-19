@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <type_traits>
 
 namespace regularization = dg_igr::regularization;
@@ -689,6 +690,83 @@ void TestSupportMatrixAndFailures(TestContext& test)
              "unknown execution target fails before launch");
 }
 
+void TestIdentityCollisions(TestContext& test)
+{
+  FixtureBuffers fixture;
+  fixture.ResetOutputs(29.0);
+  const regularization::AuxiliaryFieldIdentity collisions[] = {
+    {kScalarIdentity.semantic_id,
+     kTraceIdentity.restart_id,
+     kTraceIdentity.output_id},
+    {kTraceIdentity.semantic_id,
+     kScalarIdentity.restart_id,
+     kTraceIdentity.output_id},
+    {kTraceIdentity.semantic_id,
+     kTraceIdentity.restart_id,
+     kScalarIdentity.output_id}};
+  const char* messages[] = {"semantic identity collision fails before launch",
+                            "restart identity collision fails before launch",
+                            "output identity collision fails before launch"};
+
+  for (int collision = 0; collision < 3; ++collision)
+  {
+    regularization::RegularizationLaunchBuffers buffers =
+      fixture.LaunchBuffers();
+    buffers.trace.identity = collisions[collision];
+    const regularization::RegularizationLaunchResult result =
+      regularization::ExecuteRegularization(ConstantCpuSelection(),
+                                            ValidationContext(),
+                                            {},
+                                            buffers);
+    test.Check(result.validation.code ==
+                 regularization::ValidationCode::InvalidFieldIdentity &&
+                 !result.launched && result.host_selection_count == 0,
+               messages[collision]);
+    test.Near(fixture.volume.HostRead()[0],
+              29.0,
+              0.0,
+              "identity collision leaves outputs untouched");
+  }
+}
+
+void TestValidationProductOverflow(TestContext& test)
+{
+  FixtureBuffers fixture;
+  const int point_counts[] = {std::numeric_limits<int>::max(),
+                              std::numeric_limits<int>::max() / 2};
+  const char* messages[] = {
+    "characteristic-bound size overflow fails before buffer access",
+    "diagnostic size overflow fails before buffer access"};
+
+  for (int scenario = 0; scenario < 2; ++scenario)
+  {
+    regularization::RegularizationLaunchBuffers buffers =
+      fixture.LaunchBuffers();
+    buffers.point_count = point_counts[scenario];
+    buffers.dimension = 1;
+    buffers.state_components = 1;
+    buffers.auxiliary.components = 1;
+    buffers.trace.components = 1;
+    buffers.volume_correction.components = 1;
+    buffers.volume_correction.dimension = 1;
+    buffers.volume_correction.point_count = point_counts[scenario];
+    buffers.normal_correction.components = 1;
+    buffers.normal_correction.point_count = point_counts[scenario];
+    buffers.wall_flux.components = 1;
+    buffers.wall_flux.point_count = point_counts[scenario];
+
+    const regularization::RegularizationLaunchResult result =
+      regularization::ExecuteRegularization(ConstantCpuSelection(),
+                                            ValidationContext(),
+                                            {},
+                                            buffers);
+    test.Check(result.validation.code ==
+                 regularization::ValidationCode::InvalidComponentCount &&
+                 !result.launched && result.host_selection_count == 0,
+               messages[scenario]);
+  }
+}
+
 void TestStaleProvenanceAndShape(TestContext& test)
 {
   FixtureBuffers fixture;
@@ -703,6 +781,23 @@ void TestStaleProvenanceAndShape(TestContext& test)
                regularization::ValidationCode::StaleProvenance &&
                !result.launched,
              "stale state-generation provenance fails before launch");
+
+  regularization::RegularizationLaunchBuffers wrong_extent =
+    fixture.LaunchBuffers();
+  wrong_extent.volume_correction.components = 3;
+  wrong_extent.normal_correction.components = 3;
+  wrong_extent.wall_flux.components = 3;
+  wrong_extent.volume_correction.storage = nullptr;
+  wrong_extent.normal_correction.storage = nullptr;
+  wrong_extent.wall_flux.storage = nullptr;
+  result = regularization::ExecuteRegularization(ConstantCpuSelection(),
+                                                 ValidationContext(),
+                                                 {},
+                                                 wrong_extent);
+  test.Check(result.validation.code ==
+               regularization::ValidationCode::InvalidBufferSize &&
+               !result.launched && result.host_selection_count == 0,
+             "matching correction extents that differ from state fail before buffer access");
 
   regularization::RegularizationLaunchBuffers wrong_shape =
     fixture.LaunchBuffers();
@@ -729,6 +824,8 @@ int main()
   TestVectorAuxiliaryBinding(test);
   TestZeroBehavior(test);
   TestSupportMatrixAndFailures(test);
+  TestIdentityCollisions(test);
+  TestValidationProductOverflow(test);
   TestStaleProvenanceAndShape(test);
 
   if (test.Failures() == 0)

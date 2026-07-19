@@ -66,12 +66,19 @@ bool ProductFits(int first, int second, int third, int& product)
   {
     return false;
   }
-  const long long value = static_cast<long long>(first) * second * third;
-  if (value > std::numeric_limits<int>::max())
+  const int maximum = std::numeric_limits<int>::max();
+  int value = first;
+  if (second != 0 && value > maximum / second)
   {
     return false;
   }
-  product = static_cast<int>(value);
+  value *= second;
+  if (third != 0 && value > maximum / third)
+  {
+    return false;
+  }
+  value *= third;
+  product = value;
   return true;
 }
 
@@ -88,10 +95,11 @@ ValidationResult ValidateIdentityAndCapabilities(
   }
 
   if (auxiliary.identity.semantic_id == 0u ||
-      trace.identity.semantic_id == 0u || auxiliary.identity == trace.identity)
+      trace.identity.semantic_id == 0u ||
+      auxiliary.identity.semantic_id == trace.identity.semantic_id)
   {
     return {ValidationCode::InvalidFieldIdentity,
-            "auxiliary and trace fields require distinct nonzero identities"};
+            "auxiliary and trace fields require distinct nonzero semantic identities"};
   }
 
   if (!auxiliary.capabilities.Has(AuxiliaryCapability::StageLocal) ||
@@ -113,6 +121,22 @@ ValidationResult ValidateIdentityAndCapabilities(
   {
     return {ValidationCode::InvalidFieldIdentity,
             "restart/output capability requires a stable identity"};
+  }
+
+  if (auxiliary.capabilities.Has(AuxiliaryCapability::Restartable) &&
+      trace.capabilities.Has(AuxiliaryCapability::Restartable) &&
+      auxiliary.identity.restart_id == trace.identity.restart_id)
+  {
+    return {ValidationCode::InvalidFieldIdentity,
+            "restartable auxiliary and trace fields require distinct restart identities"};
+  }
+
+  if (auxiliary.capabilities.Has(AuxiliaryCapability::OutputVisible) &&
+      trace.capabilities.Has(AuxiliaryCapability::OutputVisible) &&
+      auxiliary.identity.output_id == trace.identity.output_id)
+  {
+    return {ValidationCode::InvalidFieldIdentity,
+            "output-visible auxiliary and trace fields require distinct output identities"};
   }
 
   if (execution == ExecutionTargetKind::MFEMDevice &&
@@ -210,6 +234,8 @@ ValidationResult ValidateRegularizationLaunch(
   }
   if (buffers.state_components <= 0 ||
       buffers.volume_correction.components <= 0 ||
+      buffers.normal_correction.components <= 0 ||
+      buffers.wall_flux.components <= 0 ||
       buffers.auxiliary.components <= 0 || buffers.trace.components <= 0)
   {
     return {ValidationCode::InvalidComponentCount,
@@ -219,6 +245,15 @@ ValidationResult ValidateRegularizationLaunch(
   {
     return {ValidationCode::InvalidPointCount,
             "point-kernel launch requires at least one point"};
+  }
+
+  if (buffers.volume_correction.components != buffers.state_components ||
+      buffers.normal_correction.components !=
+        buffers.volume_correction.components ||
+      buffers.wall_flux.components != buffers.volume_correction.components)
+  {
+    return {ValidationCode::InvalidBufferSize,
+            "volume, normal, and wall correction extents must match the state component extent"};
   }
 
   if (buffers.state == nullptr || buffers.auxiliary.storage == nullptr ||
@@ -241,8 +276,12 @@ ValidationResult ValidateRegularizationLaunch(
   int state_size = 0;
   int gradient_size = 0;
   int coefficient_size = 0;
+  int trace_size = 0;
   int volume_size = 0;
   int correction_size = 0;
+  int normal_input_size = 0;
+  int bounds_size = 0;
+  int diagnostics_size = 0;
   if (!ProductFits(buffers.state_components, points, 1, state_size) ||
       !ProductFits(buffers.state_components,
                    dimension,
@@ -252,6 +291,10 @@ ValidationResult ValidateRegularizationLaunch(
                    points,
                    1,
                    coefficient_size) ||
+      !ProductFits(buffers.trace.components,
+                   points,
+                   1,
+                   trace_size) ||
       !ProductFits(correction_components,
                    dimension,
                    points,
@@ -259,7 +302,10 @@ ValidationResult ValidateRegularizationLaunch(
       !ProductFits(correction_components,
                    points,
                    1,
-                   correction_size))
+                   correction_size) ||
+      !ProductFits(dimension, points, 1, normal_input_size) ||
+      !ProductFits(2, points, 1, bounds_size) ||
+      !ProductFits(3, points, 1, diagnostics_size))
   {
     return {ValidationCode::InvalidComponentCount,
             "regularization launch shape exceeds MFEM Vector limits"};
@@ -268,12 +314,12 @@ ValidationResult ValidateRegularizationLaunch(
   if (!HasSize(buffers.state, state_size) ||
       buffers.auxiliary.entity_count != points ||
       buffers.auxiliary.dimension != dimension ||
-      !buffers.auxiliary.HasExpectedSize() ||
+      !HasSize(buffers.auxiliary.storage, coefficient_size) ||
       buffers.trace.entity_count != points ||
       buffers.trace.dimension != dimension ||
-      !buffers.trace.HasExpectedSize() ||
+      !HasSize(buffers.trace.storage, trace_size) ||
       !HasSize(buffers.state_gradient, gradient_size) ||
-      !HasSize(buffers.normals, dimension * points) ||
+      !HasSize(buffers.normals, normal_input_size) ||
       !HasSize(buffers.coefficient, coefficient_size) ||
       !HasSize(buffers.source, coefficient_size) ||
       buffers.volume_correction.dimension != dimension ||
@@ -285,8 +331,8 @@ ValidationResult ValidateRegularizationLaunch(
       !HasSize(buffers.volume_correction.storage, volume_size) ||
       !HasSize(buffers.normal_correction.storage, correction_size) ||
       !HasSize(buffers.wall_flux.storage, correction_size) ||
-      !HasSize(buffers.characteristic_bounds, 2 * points) ||
-      !HasSize(buffers.diagnostics, 3 * points))
+      !HasSize(buffers.characteristic_bounds, bounds_size) ||
+      !HasSize(buffers.diagnostics, diagnostics_size))
   {
     return {ValidationCode::InvalidBufferSize,
             "regularization launch buffer size does not match its typed shape"};
