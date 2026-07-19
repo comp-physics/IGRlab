@@ -16,6 +16,7 @@
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
+#include "test_dgsem_reference_fixtures.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1326,6 +1327,8 @@ int RunDGSEMFluxTests(TestContext& ctx)
                   1.0e-2,
                   "LF entropy production FD vs analytic close");
   }
+
+  RunDGSEMDeterministicFluxFixtures(ctx);
 
   return ctx.failures;
 }

@@ -12,6 +12,7 @@
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
+#include "test_dgsem_reference_operator.hpp"
 
 #include <cmath>
 #include <string>
@@ -1319,6 +1320,8 @@ int RunDGSEMOperatorTests(TestContext& ctx)
                   tol_cons,
                   "DGSEM periodic RK3 energy conserved");
   }
+
+  RunDGSEMReferenceOperatorGate(ctx);
 
   return ctx.failures;
 }

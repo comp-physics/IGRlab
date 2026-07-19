@@ -3,6 +3,7 @@
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/dgsem/dgsem_basis.hpp"
 #include "numerics/dgsem/dgsem_entropy_flux.hpp"
+#include "numerics/dgsem/dgsem_metric.hpp"
 #include "numerics/dgsem/dgsem_quadrature.hpp"
 #include "numerics/dgsem/dgsem_tensor.hpp"
 #include "numerics/dgsem/dgsem_volume_flux.hpp"
@@ -19,6 +20,10 @@ namespace dgsem
 DGSEMOperator::DGSEMOperator(const DGHyperbolicConservationLaws& op)
   : op_(op)
 {
+  MFEM_VERIFY(DGSEMOperatorSupportsDimension(op_.dim),
+              "DGSEMOperator supports spatial dimensions 1 and 2 only; "
+              "3D tensor face quadrature, nodal surface indexing, and "
+              "curl-form metrics are not implemented in Wave 1.");
 }
 
 const BdrHyperbolicFluxIntegrator*
@@ -65,6 +70,10 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
   ParGridFunction x_par;
   const Vector* face_nbr = nullptr;
   int n_shared_faces = 0;
+  std::vector<std::vector<dgsem::ContravariantMetric2D>> metric_cache(
+    static_cast<std::size_t>(mesh.GetNE()));
+  std::vector<char> metric_cache_ready(static_cast<std::size_t>(mesh.GetNE()),
+                                       0);
   if (pmesh && pmesh->GetNSharedFaces() > 0)
   {
     MFEM_VERIFY(x.Size() == pfes->GetVSize(),
@@ -106,6 +115,31 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
       const int lex = (op_.dim == 1) ? i : i + n1d * j;
       lex_to_local[lex] = local;
     }
+  };
+  auto set_nodal_normal = [&](FaceElementTransformations& face_tr,
+                              int element,
+                              const FiniteElement& fe,
+                              int local,
+                              const IntegrationPoint& element_ip)
+  {
+    if (op_.dim == 1)
+    {
+      nor(0) = (element_ip.x - 0.5) * 2.0;
+      return;
+    }
+    if (!metric_cache_ready[static_cast<std::size_t>(element)])
+    {
+      dgsem::BuildContravariantMetrics2D(
+        fe,
+        *op_.vfes.GetElementTransformation(element),
+        metric_cache[static_cast<std::size_t>(element)]);
+      metric_cache_ready[static_cast<std::size_t>(element)] = 1;
+    }
+
+    const auto& metric = metric_cache[static_cast<std::size_t>(element)]
+                                     [static_cast<std::size_t>(local)];
+    dgsem::BuildNodalFaceNormal2D(
+      metric, face_tr.Loc1.Transf.Jacobian(), element_ip, nor);
   };
 
   for (int f = 0; f < nfaces; ++f)
@@ -181,14 +215,7 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
 
       Xmat1.GetRow(local1, state1);
 
-      if (op_.dim == 1)
-      {
-        nor(0) = (ip1.x - 0.5) * 2.0;
-      }
-      else
-      {
-        CalcOrtho(Tr->Jacobian(), nor);
-      }
+      set_nodal_normal(*Tr, e1, fe1, local1, ip1);
 
       const IntegrationPoint& ip2 = Tr->GetElement2IntPoint();
       const int i2 = find_node(nodes1d, ip2.x);
@@ -218,7 +245,7 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
     for (int sf = 0; sf < n_shared_faces; ++sf)
     {
       FaceElementTransformations* Tr =
-        pmesh->GetSharedFaceTransformations(sf, /*use_local_face_nr=*/true);
+        pmesh->GetSharedFaceTransformations(sf, /*fill2=*/true);
       if (!Tr)
       {
         continue;
@@ -276,14 +303,7 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
 
         Xmat1.GetRow(local1, state1);
 
-        if (op_.dim == 1)
-        {
-          nor(0) = (ip1.x - 0.5) * 2.0;
-        }
-        else
-        {
-          CalcOrtho(Tr->Jacobian(), nor);
-        }
+        set_nodal_normal(*Tr, e1, fe1, local1, ip1);
 
         const IntegrationPoint& ip2 = Tr->GetElement2IntPoint();
         const int i2 = find_node(nodes1d, ip2.x);
@@ -351,14 +371,7 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
 
       Xmat1.GetRow(local1, state1);
 
-      if (op_.dim == 1)
-      {
-        nor(0) = (ip1.x - 0.5) * 2.0;
-      }
-      else
-      {
-        CalcOrtho(Tr->Jacobian(), nor);
-      }
+      set_nodal_normal(*Tr, e1, fe1, local1, ip1);
 
       const BdrHyperbolicFluxIntegrator* bdr = FindBdrIntegrator(Tr->Attribute);
       MFEM_VERIFY(bdr, "DGSEM boundary face is missing a boundary integrator.");
@@ -393,6 +406,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
   DenseMatrix adj;       // adjugate of Jacobian (dim × dim)
   std::vector<double> adj_storage;
   std::vector<double> sigma_nodes;
+  std::vector<dgsem::ContravariantMetric2D> discrete_metrics;
   std::vector<int> lex_to_local;
   const FluxFunction& fluxFunction = op_.formIntegrator->GetFluxFunction();
   const FluxWithIGR* flux_igr = dynamic_cast<const FluxWithIGR*>(&fluxFunction);
@@ -420,7 +434,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
     max_dof = std::max(max_dof, op_.vfes.GetFE(e)->GetDof());
   }
   lex_to_local.reserve(max_dof);
-  if (use_entropy_flux || use_volume_dissipation)
+  if (op_.dim == 2 || use_entropy_flux || use_volume_dissipation)
   {
     adj_storage.reserve(max_dof * op_.dim * op_.dim);
     if (flux_igr)
@@ -476,13 +490,18 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
     flux.SetSize(op_.num_equations, op_.dim * dof);
     phys_flux.SetSize(op_.num_equations, op_.dim);
     adj.SetSize(op_.dim);
-    if (use_entropy_flux || use_volume_dissipation)
+    if (op_.dim == 2 || use_entropy_flux || use_volume_dissipation)
     {
       adj_storage.resize(dof * op_.dim * op_.dim);
       if (flux_igr)
       {
         sigma_nodes.resize(dof);
       }
+    }
+    if (op_.dim == 2)
+    {
+      dgsem::BuildContravariantMetrics2D(
+        fe, *Tr, discrete_metrics);
     }
     const IntegrationRule& nodes = fe.GetNodes();
     MFEM_ASSERT(nodes.Size() == dof,
@@ -498,8 +517,22 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
       const real_t mcs = fluxFunction.ComputeFlux(state, *Tr, phys_flux);
       max_vol_speed = std::max(max_vol_speed, mcs);
 
-      const DenseMatrix& J = Tr->Jacobian();
-      mfem::CalcAdjugate(J, adj);
+      if (op_.dim == 2)
+      {
+        const auto& metric =
+          discrete_metrics[static_cast<std::size_t>(j)];
+        for (int d = 0; d < op_.dim; ++d)
+        {
+          for (int k = 0; k < op_.dim; ++k)
+          {
+            adj(d, k) = metric(d, k);
+          }
+        }
+      }
+      else
+      {
+        mfem::CalcAdjugate(Tr->Jacobian(), adj);
+      }
 
       if (use_entropy_flux || use_volume_dissipation)
       {
@@ -678,7 +711,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
         }
       }
     }
-    else if (op_.dim == 2)
+    else
     {
       for (int j = 0; j < n1d; ++j)
       {
@@ -714,10 +747,6 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
           }
         }
       }
-    }
-    else
-    {
-      MFEM_VERIFY(false, "DGSEM volume mode supports dim=1 or 2 only.");
     }
 
     for (int local = 0; local < dof; ++local)
