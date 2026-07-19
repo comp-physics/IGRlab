@@ -55,6 +55,13 @@ bool Known(EntropyTreatmentKind value)
          value == EntropyTreatmentKind::EntropyStable;
 }
 
+bool Known(AuxiliaryValueKind value)
+{
+  return value == AuxiliaryValueKind::Scalar ||
+         value == AuxiliaryValueKind::Vector ||
+         value == AuxiliaryValueKind::Tensor;
+}
+
 bool HasSize(const mfem::Vector* vector, int expected)
 {
   return vector != nullptr && expected >= 0 && vector->Size() == expected;
@@ -80,6 +87,61 @@ bool ProductFits(int first, int second, int third, int& product)
   value *= third;
   product = value;
   return true;
+}
+
+bool ExpectedValueComponents(AuxiliaryValueKind value_kind,
+                             int dimension,
+                             int& components)
+{
+  switch (value_kind)
+  {
+    case AuxiliaryValueKind::Scalar:
+      components = 1;
+      return true;
+    case AuxiliaryValueKind::Vector:
+      components = dimension;
+      return true;
+    case AuxiliaryValueKind::Tensor:
+      return ProductFits(dimension, dimension, 1, components);
+  }
+  return false;
+}
+
+bool HasForbiddenVectorAliasing(const RegularizationLaunchBuffers& buffers)
+{
+  const mfem::Vector* const inputs[] = {buffers.state,
+                                        buffers.auxiliary.storage,
+                                        buffers.trace.storage,
+                                        buffers.state_gradient,
+                                        buffers.normals};
+  mfem::Vector* const outputs[] = {buffers.coefficient,
+                                   buffers.source,
+                                   buffers.volume_correction.storage,
+                                   buffers.normal_correction.storage,
+                                   buffers.wall_flux.storage,
+                                   buffers.characteristic_bounds,
+                                   buffers.diagnostics};
+  constexpr int input_count = static_cast<int>(sizeof(inputs) / sizeof(inputs[0]));
+  constexpr int output_count =
+    static_cast<int>(sizeof(outputs) / sizeof(outputs[0]));
+  for (int output = 0; output < output_count; ++output)
+  {
+    for (int input = 0; input < input_count; ++input)
+    {
+      if (outputs[output] == inputs[input])
+      {
+        return true;
+      }
+    }
+    for (int previous = 0; previous < output; ++previous)
+    {
+      if (outputs[output] == outputs[previous])
+      {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 ValidationResult ValidateIdentityAndCapabilities(
@@ -197,10 +259,8 @@ bool IsRuntimeCombinationSupported(const RegularizationSelection& selection)
   return local_trace || global_hybrid;
 }
 
-ValidationResult ValidateRegularizationLaunch(
-  const RegularizationSelection& selection,
-  const RegularizationValidationContext& context,
-  const RegularizationLaunchBuffers& buffers)
+ValidationResult ValidateRegularizationSelection(
+  const RegularizationSelection& selection)
 {
   const RegularizationAxes& axes = selection.axes;
   const RegularizationCompatibility& compatibility = selection.compatibility;
@@ -219,12 +279,47 @@ ValidationResult ValidateRegularizationLaunch(
     return {ValidationCode::UnsupportedCombination,
             "model/discretization/solve/spatial/execution/time/entropy combination is unsupported"};
   }
+  return {};
+}
 
-  if (axes.backend.execution == ExecutionTargetKind::MFEMDevice &&
+ValidationResult ValidateRegularizationLaunch(
+  const RegularizationSelection& selection,
+  const RegularizationValidationContext& context,
+  const RegularizationLaunchBuffers& buffers)
+{
+  const ValidationResult selection_validation =
+    ValidateRegularizationSelection(selection);
+  if (!selection_validation.Ok())
+  {
+    return selection_validation;
+  }
+  return ValidateConfiguredRegularizationLaunch(
+    selection.axes.backend.execution, context, buffers);
+}
+
+ValidationResult ValidateConfiguredRegularizationLaunch(
+  ExecutionTargetKind execution_target,
+  const RegularizationValidationContext& context,
+  const RegularizationLaunchBuffers& buffers)
+{
+  if (!Known(execution_target))
+  {
+    return {ValidationCode::UnknownAxisValue,
+            "configured launch contains an unknown execution target"};
+  }
+
+  if (execution_target == ExecutionTargetKind::MFEMDevice &&
       !context.mfem_device_available)
   {
     return {ValidationCode::BackendUnavailable,
             "MFEM device execution target is unavailable"};
+  }
+
+  if (context.expected_rk_stage < 0 ||
+      context.expected_state_generation == 0u)
+  {
+    return {ValidationCode::InvalidProvenanceStamp,
+            "launch validation requires a stamped RK stage and state generation"};
   }
 
   if (buffers.dimension < 1 || buffers.dimension > 3)
@@ -245,6 +340,32 @@ ValidationResult ValidateRegularizationLaunch(
   {
     return {ValidationCode::InvalidPointCount,
             "point-kernel launch requires at least one point"};
+  }
+
+  if (!Known(buffers.auxiliary.value_kind) ||
+      !Known(buffers.trace.value_kind))
+  {
+    return {ValidationCode::InvalidFieldValueKind,
+            "auxiliary and trace fields require a known value kind"};
+  }
+
+  int expected_auxiliary_components = 0;
+  int expected_trace_components = 0;
+  if (!ExpectedValueComponents(buffers.auxiliary.value_kind,
+                               buffers.dimension,
+                               expected_auxiliary_components) ||
+      !ExpectedValueComponents(buffers.trace.value_kind,
+                               buffers.dimension,
+                               expected_trace_components))
+  {
+    return {ValidationCode::InvalidComponentCount,
+            "auxiliary or trace value-kind extent exceeds MFEM Vector limits"};
+  }
+  if (buffers.auxiliary.components != expected_auxiliary_components ||
+      buffers.trace.components != expected_trace_components)
+  {
+    return {ValidationCode::InvalidComponentCount,
+            "auxiliary and trace component extents must match their value kinds"};
   }
 
   if (buffers.volume_correction.components != buffers.state_components ||
@@ -268,6 +389,12 @@ ValidationResult ValidateRegularizationLaunch(
   {
     return {ValidationCode::MissingBuffer,
             "regularization launch is missing an input or output buffer"};
+  }
+
+  if (HasForbiddenVectorAliasing(buffers))
+  {
+    return {ValidationCode::InvalidBufferAliasing,
+            "writable outputs must not alias inputs or other writable outputs"};
   }
 
   const int points = buffers.point_count;
@@ -339,7 +466,7 @@ ValidationResult ValidateRegularizationLaunch(
   }
 
   const ValidationResult field_validation = ValidateIdentityAndCapabilities(
-    buffers.auxiliary, buffers.trace, axes.backend.execution);
+    buffers.auxiliary, buffers.trace, execution_target);
   if (!field_validation.Ok())
   {
     return field_validation;

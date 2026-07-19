@@ -22,6 +22,15 @@ struct RegularizationCapabilities
   bool diagnostics = false;
 };
 
+constexpr bool HasAllRegularizationCapabilities(
+  RegularizationCapabilities capabilities)
+{
+  return capabilities.coefficient_and_source &&
+         capabilities.volume_correction && capabilities.normal_correction &&
+         capabilities.wall_law && capabilities.characteristic_bounds &&
+         capabilities.diagnostics;
+}
+
 /** POD policy copied into an MFEM kernel closure. It deliberately contains no
  * owning handle, polymorphic object, or runtime model discriminator. */
 struct RegularizationDevicePolicy
@@ -314,7 +323,11 @@ struct HasRegularizationTraits<
     decltype(RegularizationTraits<ModelTag>::Diagnostics(
       std::declval<const RegularizationDevicePolicy&>(),
       std::declval<const RegularizationPointInput&>()))>>
-  : std::integral_constant<bool, RegularizationTraits<ModelTag>::available>
+  : std::integral_constant<
+      bool,
+      RegularizationTraits<ModelTag>::available &&
+        HasAllRegularizationCapabilities(
+          RegularizationTraits<ModelTag>::capabilities)>
 {};
 
 template <typename ModelTag>
@@ -324,6 +337,9 @@ struct RegularizationTraitContract
 
   static_assert(HasRegularizationTraits<ModelTag>::value,
                 "model tag must provide RegularizationTraits");
+  static_assert(
+    HasAllRegularizationCapabilities(Traits::capabilities),
+    "registered models must enable all six required regularization hooks");
   static_assert(
     std::is_same<decltype(Traits::CoefficientsAndSource(
                    std::declval<const RegularizationDevicePolicy&>(),
@@ -367,6 +383,12 @@ struct RegularizationTraitContract
     "diagnostic signature does not satisfy the static contract");
 };
 
+static_assert(HasAllRegularizationCapabilities(
+                RegularizationTraits<ZeroFixtureModelTag>::capabilities),
+              "zero fixture must enable all required hooks");
+static_assert(HasAllRegularizationCapabilities(
+                RegularizationTraits<ConstantFixtureModelTag>::capabilities),
+              "constant fixture must enable all required hooks");
 static_assert(HasRegularizationTraits<ZeroFixtureModelTag>::value,
               "zero fixture traits must be registered");
 static_assert(HasRegularizationTraits<ConstantFixtureModelTag>::value,

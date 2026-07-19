@@ -33,6 +33,15 @@ static_assert(
   std::is_trivially_copyable<regularization::AuxiliaryFieldBinding>::value,
   "typed field binding must remain trivially copyable");
 static_assert(
+  regularization::HasAllRegularizationCapabilities(
+    regularization::RegularizationTraits<
+      regularization::ZeroFixtureModelTag>::capabilities),
+  "registered traits must enable all six hooks");
+static_assert(
+  !regularization::HasAllRegularizationCapabilities(
+    {true, true, true, true, true, false}),
+  "an incomplete hook declaration must fail the capability contract");
+static_assert(
   std::is_same<decltype(regularization::RegularizationAxes{}.backend),
                regularization::SpatialExecutionBackend>::value,
   "the fourth axis must be a spatial/execution backend product");
@@ -77,9 +86,9 @@ public:
     }
   }
 
-  void Near(double actual,
-            double expected,
-            double tolerance,
+  void Near(mfem::real_t actual,
+            mfem::real_t expected,
+            mfem::real_t tolerance,
             const char* message)
   {
     if (std::abs(actual - expected) > tolerance)
@@ -95,6 +104,12 @@ public:
 private:
   int failures_ = 0;
 };
+
+constexpr mfem::real_t PrecisionTolerance()
+{
+  return static_cast<mfem::real_t>(64) *
+         std::numeric_limits<mfem::real_t>::epsilon();
+}
 
 regularization::AuxiliaryFieldCapabilities VolumeCapabilities()
 {
@@ -165,7 +180,7 @@ void TestTypedDescriptors(TestContext& test)
   {
     for (int d = 0; d < dimension; ++d)
     {
-      vector_view(d, point) = static_cast<double>(10 * point + d);
+      vector_view(d, point) = static_cast<mfem::real_t>(10 * point + d);
     }
   }
 
@@ -276,14 +291,14 @@ struct FixtureBuffers
   {
     auto state_view =
       mfem::Reshape(state.HostWrite(), state_components, points);
-    double* trace_values = trace_storage.HostWrite();
+    mfem::real_t* trace_values = trace_storage.HostWrite();
     for (int point = 0; point < points; ++point)
     {
-      state_view(0, point) = static_cast<double>(point + 1);
+      state_view(0, point) = static_cast<mfem::real_t>(point + 1);
       for (int component = 1; component < state_components; ++component)
       {
         state_view(component, point) =
-          static_cast<double>(10 * component + point);
+          static_cast<mfem::real_t>(10 * component + point);
       }
       trace_values[point] = state_view(0, point) + 0.5;
     }
@@ -301,7 +316,7 @@ struct FixtureBuffers
     ResetOutputs(0.0);
   }
 
-  void ResetOutputs(double value)
+  void ResetOutputs(mfem::real_t value)
   {
     coefficient = value;
     source = value;
@@ -377,8 +392,8 @@ void TestSystemShapedConstantCorrection(TestContext& test)
   test.Check(result.host_selection_count == 1,
              "host selection occurs exactly once before static execution");
 
-  const double* coefficient = fixture.coefficient.HostRead();
-  const double* source = fixture.source.HostRead();
+  const mfem::real_t* coefficient = fixture.coefficient.HostRead();
+  const mfem::real_t* source = fixture.source.HostRead();
   const auto volume = mfem::Reshape(fixture.volume.HostRead(),
                                      FixtureBuffers::dimension,
                                      FixtureBuffers::correction_components,
@@ -407,8 +422,9 @@ void TestSystemShapedConstantCorrection(TestContext& test)
          component < FixtureBuffers::correction_components;
          ++component)
     {
-      const double expected_component = static_cast<double>(component + 1);
-      double tensor_dot_normal = 0.0;
+      const mfem::real_t expected_component =
+        static_cast<mfem::real_t>(component + 1);
+      mfem::real_t tensor_dot_normal = 0.0;
       for (int direction = 0; direction < FixtureBuffers::dimension;
            ++direction)
       {
@@ -421,7 +437,7 @@ void TestSystemShapedConstantCorrection(TestContext& test)
       }
       test.Near(normal(component, point),
                 tensor_dot_normal,
-                1.0e-14,
+                PrecisionTolerance(),
                 "normal vector equals volume-tensor contraction");
       test.Near(wall(component, point),
                 expected_component,
@@ -439,6 +455,50 @@ void TestSystemShapedConstantCorrection(TestContext& test)
     test.Near(diagnostics(2, point), 10.0, 0.0,
               "system wall diagnostic behavior");
   }
+}
+
+void TestConfiguredLauncherReuse(TestContext& test)
+{
+  regularization::ConfiguredRegularizationLauncher launcher =
+    regularization::ConfigureRegularization(ConstantCpuSelection());
+  test.Check(launcher.IsConfigured() && launcher.HostSelectionCount() == 1 &&
+               launcher.LaunchCount() == 0,
+             "configuration traverses the host selection exactly once");
+
+  FixtureBuffers first_fixture;
+  FixtureBuffers second_fixture;
+  regularization::RegularizationLaunchBuffers first_buffers =
+    first_fixture.LaunchBuffers();
+  regularization::RegularizationLaunchBuffers second_buffers =
+    second_fixture.LaunchBuffers();
+  second_buffers.auxiliary.provenance = {3, 20u, 8u};
+  second_buffers.trace.provenance = {3, 20u, 9u};
+  const regularization::RegularizationDevicePolicy policy{
+    1.5, -2.0, 0.25, 1.0, 3.0};
+
+  const regularization::RegularizationLaunchResult first =
+    launcher.Launch(ValidationContext(), policy, first_buffers);
+  const regularization::RegularizationValidationContext second_context{
+    false, 3, 20u};
+  const regularization::RegularizationLaunchResult second =
+    launcher.Launch(second_context, policy, second_buffers);
+
+  test.Check(first.validation.Ok() && first.launched &&
+               second.validation.Ok() && second.launched,
+             "one configured launcher accepts two valid buffer/provenance sets");
+  test.Check(first.host_selection_count == 1 &&
+               second.host_selection_count == 1 &&
+               launcher.HostSelectionCount() == 1 &&
+               launcher.LaunchCount() == 2,
+             "two launches do not retraverse model or axis selection");
+  test.Near(first_fixture.coefficient.HostRead()[0],
+            static_cast<mfem::real_t>(1.5),
+            0.0,
+            "first configured launch writes its distinct buffers");
+  test.Near(second_fixture.coefficient.HostRead()[0],
+            static_cast<mfem::real_t>(1.5),
+            0.0,
+            "second configured launch writes its distinct buffers");
 }
 
 void TestAllSpatialBackends(TestContext& test)
@@ -556,7 +616,7 @@ void TestZeroBehavior(TestContext& test)
                                    &fixture.diagnostics};
   for (const mfem::Vector* output : outputs)
   {
-    const double* values = output->HostRead();
+    const mfem::real_t* values = output->HostRead();
     for (int i = 0; i < output->Size(); ++i)
     {
       test.Near(values[i], 0.0, 0.0, "zero fixture output behavior");
@@ -690,6 +750,136 @@ void TestSupportMatrixAndFailures(TestContext& test)
              "unknown execution target fails before launch");
 }
 
+void TestOnePointBufferAliasing(TestContext& test)
+{
+  constexpr int points = 1;
+  constexpr int dimension = 1;
+  constexpr int components = 1;
+  mfem::Vector state(points);
+  mfem::Vector auxiliary_storage(points);
+  mfem::Vector trace_storage(points);
+  mfem::Vector state_gradient(points);
+  mfem::Vector normals(points);
+  mfem::Vector coefficient(points);
+  mfem::Vector source(points);
+  mfem::Vector volume(points);
+  mfem::Vector normal(points);
+  mfem::Vector wall(points);
+  mfem::Vector bounds(2 * points);
+  mfem::Vector diagnostics(3 * points);
+  state = 4.0;
+  auxiliary_storage = 2.0;
+  trace_storage = 4.5;
+  state_gradient = 0.0;
+  normals = 1.0;
+  coefficient = 0.0;
+  source = 0.0;
+  volume = 0.0;
+  normal = 0.0;
+  wall = 0.0;
+  bounds = 0.0;
+  diagnostics = 0.0;
+
+  const regularization::AuxiliaryFieldProvenance provenance{2, 19u, 7u};
+  const regularization::AuxiliaryFieldBinding auxiliary{
+    &auxiliary_storage,
+    points,
+    dimension,
+    components,
+    regularization::AuxiliaryValueKind::Scalar,
+    regularization::AuxiliaryFieldTopology::Volume,
+    regularization::AuxiliaryFieldOwnership::StateOwned,
+    provenance,
+    kScalarIdentity,
+    VolumeCapabilities()};
+  const regularization::AuxiliaryFieldBinding trace{
+    &trace_storage,
+    points,
+    dimension,
+    components,
+    regularization::AuxiliaryValueKind::Scalar,
+    regularization::AuxiliaryFieldTopology::Trace,
+    regularization::AuxiliaryFieldOwnership::OperatorOwned,
+    provenance,
+    kTraceIdentity,
+    TraceCapabilities()};
+  regularization::RegularizationLaunchBuffers buffers{
+    points,
+    dimension,
+    components,
+    &state,
+    auxiliary,
+    trace,
+    &state_gradient,
+    &normals,
+    &coefficient,
+    &source,
+    regularization::BindVolumeFluxCorrection(
+      volume, components, dimension, points),
+    regularization::BindStateVectorCorrection(normal, components, points),
+    regularization::BindStateVectorCorrection(wall, components, points),
+    &bounds,
+    &diagnostics};
+
+  regularization::ConfiguredRegularizationLauncher launcher =
+    regularization::ConfigureRegularization(ConstantCpuSelection());
+  regularization::RegularizationLaunchBuffers input_alias = buffers;
+  input_alias.coefficient = &state;
+  regularization::RegularizationLaunchResult result =
+    launcher.Launch(ValidationContext(), {}, input_alias);
+  test.Check(result.validation.code ==
+               regularization::ValidationCode::InvalidBufferAliasing &&
+               !result.launched && launcher.LaunchCount() == 0,
+             "one-point writable-output/input alias fails before launch");
+
+  regularization::RegularizationLaunchBuffers output_alias = buffers;
+  output_alias.source = &coefficient;
+  result = launcher.Launch(ValidationContext(), {}, output_alias);
+  test.Check(result.validation.code ==
+               regularization::ValidationCode::InvalidBufferAliasing &&
+               !result.launched && launcher.LaunchCount() == 0,
+             "one-point writable-output/output alias fails before launch");
+  test.Near(state.HostRead()[0],
+            static_cast<mfem::real_t>(4.0),
+            0.0,
+            "alias rejection leaves the input object untouched");
+}
+
+void TestValueKindValidation(TestContext& test)
+{
+  FixtureBuffers fixture;
+  regularization::ConfiguredRegularizationLauncher launcher =
+    regularization::ConfigureRegularization(ConstantCpuSelection());
+
+  regularization::RegularizationLaunchBuffers malformed =
+    fixture.LaunchBuffers();
+  malformed.auxiliary.value_kind =
+    static_cast<regularization::AuxiliaryValueKind>(255);
+  regularization::RegularizationLaunchResult result =
+    launcher.Launch(ValidationContext(), {}, malformed);
+  test.Check(result.validation.code ==
+               regularization::ValidationCode::InvalidFieldValueKind &&
+               !result.launched,
+             "unknown auxiliary value kind fails before launch");
+
+  malformed = fixture.LaunchBuffers();
+  malformed.trace.value_kind = regularization::AuxiliaryValueKind::Vector;
+  result = launcher.Launch(ValidationContext(), {}, malformed);
+  test.Check(result.validation.code ==
+               regularization::ValidationCode::InvalidComponentCount &&
+               !result.launched,
+             "trace component extent must match its vector value kind");
+
+  malformed = fixture.LaunchBuffers();
+  malformed.auxiliary.value_kind = regularization::AuxiliaryValueKind::Tensor;
+  malformed.auxiliary.components = 3;
+  result = launcher.Launch(ValidationContext(), {}, malformed);
+  test.Check(result.validation.code ==
+               regularization::ValidationCode::InvalidComponentCount &&
+               !result.launched && launcher.LaunchCount() == 0,
+             "tensor component extent must equal checked dimension square");
+}
+
 void TestIdentityCollisions(TestContext& test)
 {
   FixtureBuffers fixture;
@@ -720,7 +910,7 @@ void TestIdentityCollisions(TestContext& test)
                                             buffers);
     test.Check(result.validation.code ==
                  regularization::ValidationCode::InvalidFieldIdentity &&
-                 !result.launched && result.host_selection_count == 0,
+                 !result.launched && result.host_selection_count == 1,
                messages[collision]);
     test.Near(fixture.volume.HostRead()[0],
               29.0,
@@ -762,7 +952,7 @@ void TestValidationProductOverflow(TestContext& test)
                                             buffers);
     test.Check(result.validation.code ==
                  regularization::ValidationCode::InvalidComponentCount &&
-                 !result.launched && result.host_selection_count == 0,
+                 !result.launched && result.host_selection_count == 1,
                messages[scenario]);
   }
 }
@@ -770,16 +960,28 @@ void TestValidationProductOverflow(TestContext& test)
 void TestStaleProvenanceAndShape(TestContext& test)
 {
   FixtureBuffers fixture;
+  fixture.ResetOutputs(37.0);
+  regularization::ConfiguredRegularizationLauncher launcher =
+    regularization::ConfigureRegularization(ConstantCpuSelection());
+  regularization::RegularizationLaunchResult result = launcher.Launch(
+    regularization::RegularizationValidationContext{},
+    {},
+    fixture.LaunchBuffers());
+  test.Check(result.validation.code ==
+               regularization::ValidationCode::InvalidProvenanceStamp &&
+               !result.launched && launcher.LaunchCount() == 0,
+             "default provenance context fails before launch");
+  test.Near(fixture.source.HostRead()[0],
+            static_cast<mfem::real_t>(37.0),
+            0.0,
+            "unstamped provenance leaves outputs untouched");
+
   regularization::RegularizationValidationContext stale = ValidationContext();
   stale.expected_state_generation = 20u;
-  regularization::RegularizationLaunchResult result =
-    regularization::ExecuteRegularization(ConstantCpuSelection(),
-                                          stale,
-                                          {},
-                                          fixture.LaunchBuffers());
+  result = launcher.Launch(stale, {}, fixture.LaunchBuffers());
   test.Check(result.validation.code ==
                regularization::ValidationCode::StaleProvenance &&
-               !result.launched,
+               !result.launched && launcher.LaunchCount() == 0,
              "stale state-generation provenance fails before launch");
 
   regularization::RegularizationLaunchBuffers wrong_extent =
@@ -796,7 +998,7 @@ void TestStaleProvenanceAndShape(TestContext& test)
                                                  wrong_extent);
   test.Check(result.validation.code ==
                regularization::ValidationCode::InvalidBufferSize &&
-               !result.launched && result.host_selection_count == 0,
+               !result.launched && result.host_selection_count == 1,
              "matching correction extents that differ from state fail before buffer access");
 
   regularization::RegularizationLaunchBuffers wrong_shape =
@@ -820,10 +1022,13 @@ int main()
   TestContext test;
   TestTypedDescriptors(test);
   TestSystemShapedConstantCorrection(test);
+  TestConfiguredLauncherReuse(test);
   TestAllSpatialBackends(test);
   TestVectorAuxiliaryBinding(test);
   TestZeroBehavior(test);
   TestSupportMatrixAndFailures(test);
+  TestOnePointBufferAliasing(test);
+  TestValueKindValidation(test);
   TestIdentityCollisions(test);
   TestValidationProductOverflow(test);
   TestStaleProvenanceAndShape(test);

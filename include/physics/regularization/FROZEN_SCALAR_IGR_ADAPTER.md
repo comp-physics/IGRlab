@@ -44,6 +44,21 @@ Consequently, a later Euler scalar-IGR trait can bind one scalar auxiliary, set
 Euler-sized volume tensor and normal/wall vectors without changing the public
 contract. The future trait remains responsible for its reviewed algebra.
 
+## Configured launch and alias boundary
+
+`ConfigureRegularization` is the primary repeated-launch API. It validates and
+traverses the model, discretization, solve, spatial, execution, time, and entropy
+selection once, then stores a specialized host function pointer. The configured
+launcher may validate and launch new buffers and provenance stamps repeatedly
+without revisiting those switches. `ExecuteRegularization` is only a one-shot
+convenience wrapper.
+
+Before acquiring any MFEM data pointer, host validation rejects a writable
+output `mfem::Vector` object that is also an input object or another writable
+output object. MFEM does not provide a portable pre-acquisition overlap query
+for distinct `Vector` objects. Distinct objects that share overlapping backing
+storage are therefore unsupported caller error.
+
 ## Future adapter boundary
 
 A later adapter may be added without modifying the files above:

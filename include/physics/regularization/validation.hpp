@@ -24,9 +24,12 @@ enum class ValidationCode : std::uint8_t
   InvalidPointCount,
   MissingBuffer,
   InvalidBufferSize,
+  InvalidBufferAliasing,
   InvalidFieldIdentity,
+  InvalidFieldValueKind,
   InvalidFieldTopology,
   MissingFieldCapability,
+  InvalidProvenanceStamp,
   StaleProvenance
 };
 
@@ -139,6 +142,14 @@ struct RegularizationLaunchBuffers
 };
 
 bool IsRuntimeCombinationSupported(const RegularizationSelection& selection);
+
+ValidationResult ValidateRegularizationSelection(
+  const RegularizationSelection& selection);
+
+ValidationResult ValidateConfiguredRegularizationLaunch(
+  ExecutionTargetKind execution_target,
+  const RegularizationValidationContext& context,
+  const RegularizationLaunchBuffers& buffers);
 
 ValidationResult ValidateRegularizationLaunch(
   const RegularizationSelection& selection,

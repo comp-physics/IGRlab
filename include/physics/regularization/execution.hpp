@@ -17,12 +17,84 @@ struct RegularizationLaunchResult
   int host_selection_count = 0;
 };
 
+using RegularizationStaticLaunchFunction = RegularizationLaunchResult (*)(
+  const RegularizationDevicePolicy&,
+  const RegularizationLaunchBuffers&);
+
+/** Host-configured, reusable entry point for one statically selected contract.
+ *
+ * Configuration traverses the runtime axes once and binds a specialized host
+ * function pointer. Each Launch call validates its current context and buffers,
+ * then invokes that function without revisiting model or axis selection.
+ */
+class ConfiguredRegularizationLauncher
+{
+public:
+  bool IsConfigured() const
+  {
+    return configuration_validation_.Ok() && static_launch_ != nullptr;
+  }
+  const ValidationResult& ConfigurationValidation() const
+  {
+    return configuration_validation_;
+  }
+  int HostSelectionCount() const { return host_selection_count_; }
+  int LaunchCount() const { return launch_count_; }
+
+  RegularizationLaunchResult Launch(
+    const RegularizationValidationContext& context,
+    const RegularizationDevicePolicy& policy,
+    const RegularizationLaunchBuffers& buffers)
+  {
+    if (!IsConfigured())
+    {
+      return {configuration_validation_, false, host_selection_count_};
+    }
+    const ValidationResult validation =
+      ValidateConfiguredRegularizationLaunch(execution_target_, context, buffers);
+    if (!validation.Ok())
+    {
+      return {validation, false, host_selection_count_};
+    }
+    RegularizationLaunchResult result = static_launch_(policy, buffers);
+    result.host_selection_count = host_selection_count_;
+    if (result.launched)
+    {
+      ++launch_count_;
+    }
+    return result;
+  }
+
+private:
+  ConfiguredRegularizationLauncher(
+    ExecutionTargetKind execution_target,
+    RegularizationStaticLaunchFunction static_launch,
+    ValidationResult configuration_validation,
+    int host_selection_count)
+    : execution_target_(execution_target), static_launch_(static_launch),
+      configuration_validation_(configuration_validation),
+      host_selection_count_(host_selection_count)
+  {
+  }
+
+  ExecutionTargetKind execution_target_ = ExecutionTargetKind::MFEMCpu;
+  RegularizationStaticLaunchFunction static_launch_ = nullptr;
+  ValidationResult configuration_validation_{};
+  int host_selection_count_ = 0;
+  int launch_count_ = 0;
+
+  friend ConfiguredRegularizationLauncher ConfigureRegularization(
+    const RegularizationSelection& selection);
+};
+
 namespace detail
 {
 
 inline RegularizationLaunchResult DispatchFailure(const char* message)
 {
-  return {{ValidationCode::UnsupportedCombination, message}, false, 1};
+  RegularizationLaunchResult result;
+  result.validation = {ValidationCode::UnsupportedCombination, message};
+  return result;
 }
 
 template <typename ModelTag,
@@ -134,7 +206,40 @@ RegularizationLaunchResult LaunchStaticRegularization(
         diagnostics(2, point_index) = point_diagnostics.wall_magnitude;
       });
 
-    return {{}, true, 1};
+    RegularizationLaunchResult result;
+    result.launched = true;
+    return result;
+  }
+}
+
+template <typename ModelTag,
+          typename DiscretizationTag,
+          typename SolutionTag,
+          typename BackendTag,
+          typename TimeTag,
+          typename EntropyTag>
+RegularizationStaticLaunchFunction BindStaticRegularization(
+  int& host_selection_count)
+{
+  using Supported = StaticCombinationSupport<ModelTag,
+                                              DiscretizationTag,
+                                              SolutionTag,
+                                              BackendTag,
+                                              TimeTag,
+                                              EntropyTag>;
+  if constexpr (!Supported::value)
+  {
+    return nullptr;
+  }
+  else
+  {
+    ++host_selection_count;
+    return &LaunchStaticRegularization<ModelTag,
+                                       DiscretizationTag,
+                                       SolutionTag,
+                                       BackendTag,
+                                       TimeTag,
+                                       EntropyTag>;
   }
 }
 
@@ -143,47 +248,46 @@ template <typename ModelTag,
           typename SolutionTag,
           typename BackendTag,
           typename TimeTag>
-RegularizationLaunchResult DispatchEntropy(
+RegularizationStaticLaunchFunction DispatchEntropy(
   EntropyTreatmentKind entropy,
-  const RegularizationDevicePolicy& policy,
-  const RegularizationLaunchBuffers& buffers)
+  int& host_selection_count)
 {
   // Host-only dispatch: no switch reaches the point kernel.
   switch (entropy)
   {
     case EntropyTreatmentKind::Neutral:
-      return LaunchStaticRegularization<ModelTag,
-                                        DiscretizationTag,
-                                        SolutionTag,
-                                        BackendTag,
-                                        TimeTag,
-                                        EntropyNeutralTag>(policy, buffers);
+      return BindStaticRegularization<ModelTag,
+                                      DiscretizationTag,
+                                      SolutionTag,
+                                      BackendTag,
+                                      TimeTag,
+                                      EntropyNeutralTag>(host_selection_count);
     case EntropyTreatmentKind::EntropyConservative:
-      return LaunchStaticRegularization<ModelTag,
-                                        DiscretizationTag,
-                                        SolutionTag,
-                                        BackendTag,
-                                        TimeTag,
-                                        EntropyConservativeTag>(policy, buffers);
+      return BindStaticRegularization<ModelTag,
+                                      DiscretizationTag,
+                                      SolutionTag,
+                                      BackendTag,
+                                      TimeTag,
+                                      EntropyConservativeTag>(
+        host_selection_count);
     case EntropyTreatmentKind::EntropyStable:
-      return LaunchStaticRegularization<ModelTag,
-                                        DiscretizationTag,
-                                        SolutionTag,
-                                        BackendTag,
-                                        TimeTag,
-                                        EntropyStableTag>(policy, buffers);
+      return BindStaticRegularization<ModelTag,
+                                      DiscretizationTag,
+                                      SolutionTag,
+                                      BackendTag,
+                                      TimeTag,
+                                      EntropyStableTag>(host_selection_count);
   }
-  return DispatchFailure("unknown entropy treatment during host dispatch");
+  return nullptr;
 }
 
 template <typename ModelTag,
           typename DiscretizationTag,
           typename SolutionTag,
           typename BackendTag>
-RegularizationLaunchResult DispatchTime(
+RegularizationStaticLaunchFunction DispatchTime(
   const RegularizationCompatibility& compatibility,
-  const RegularizationDevicePolicy& policy,
-  const RegularizationLaunchBuffers& buffers)
+  int& host_selection_count)
 {
   switch (compatibility.time)
   {
@@ -193,36 +297,32 @@ RegularizationLaunchResult DispatchTime(
                              SolutionTag,
                              BackendTag,
                              FrozenRKStageTag>(compatibility.entropy,
-                                               policy,
-                                               buffers);
+                                               host_selection_count);
     case TimeTreatmentKind::LaggedStep:
       return DispatchEntropy<ModelTag,
                              DiscretizationTag,
                              SolutionTag,
                              BackendTag,
                              LaggedStepTag>(compatibility.entropy,
-                                            policy,
-                                            buffers);
+                                            host_selection_count);
     case TimeTreatmentKind::FullyCoupled:
       return DispatchEntropy<ModelTag,
                              DiscretizationTag,
                              SolutionTag,
                              BackendTag,
                              FullyCoupledTag>(compatibility.entropy,
-                                              policy,
-                                              buffers);
+                                              host_selection_count);
   }
-  return DispatchFailure("unknown time treatment during host dispatch");
+  return nullptr;
 }
 
 template <typename ModelTag,
           typename DiscretizationTag,
           typename SolutionTag,
           typename SpatialTag>
-RegularizationLaunchResult DispatchExecutionTarget(
+RegularizationStaticLaunchFunction DispatchExecutionTarget(
   const RegularizationSelection& selection,
-  const RegularizationDevicePolicy& policy,
-  const RegularizationLaunchBuffers& buffers)
+  int& host_selection_count)
 {
   switch (selection.axes.backend.execution)
   {
@@ -232,25 +332,24 @@ RegularizationLaunchResult DispatchExecutionTarget(
         DiscretizationTag,
         SolutionTag,
         SpatialExecutionBackendTag<SpatialTag, MFEMCpuTargetTag>>(
-        selection.compatibility, policy, buffers);
+        selection.compatibility, host_selection_count);
     case ExecutionTargetKind::MFEMDevice:
       return DispatchTime<
         ModelTag,
         DiscretizationTag,
         SolutionTag,
         SpatialExecutionBackendTag<SpatialTag, MFEMDeviceTargetTag>>(
-        selection.compatibility, policy, buffers);
+        selection.compatibility, host_selection_count);
   }
-  return DispatchFailure("unknown execution target during host dispatch");
+  return nullptr;
 }
 
 template <typename ModelTag,
           typename DiscretizationTag,
           typename SolutionTag>
-RegularizationLaunchResult DispatchSpatialBackend(
+RegularizationStaticLaunchFunction DispatchSpatialBackend(
   const RegularizationSelection& selection,
-  const RegularizationDevicePolicy& policy,
-  const RegularizationLaunchBuffers& buffers)
+  int& host_selection_count)
 {
   switch (selection.axes.backend.spatial)
   {
@@ -259,31 +358,27 @@ RegularizationLaunchResult DispatchSpatialBackend(
                                      DiscretizationTag,
                                      SolutionTag,
                                      DGSpatialBackendTag>(selection,
-                                                          policy,
-                                                          buffers);
+                                                          host_selection_count);
     case SpatialBackendKind::DGSEM:
       return DispatchExecutionTarget<ModelTag,
                                      DiscretizationTag,
                                      SolutionTag,
                                      DGSEMSpatialBackendTag>(selection,
-                                                             policy,
-                                                             buffers);
+                                                             host_selection_count);
     case SpatialBackendKind::HDG:
       return DispatchExecutionTarget<ModelTag,
                                      DiscretizationTag,
                                      SolutionTag,
                                      HDGSpatialBackendTag>(selection,
-                                                           policy,
-                                                           buffers);
+                                                           host_selection_count);
   }
-  return DispatchFailure("unknown spatial backend during host dispatch");
+  return nullptr;
 }
 
 template <typename ModelTag, typename DiscretizationTag>
-RegularizationLaunchResult DispatchSolution(
+RegularizationStaticLaunchFunction DispatchSolution(
   const RegularizationSelection& selection,
-  const RegularizationDevicePolicy& policy,
-  const RegularizationLaunchBuffers& buffers)
+  int& host_selection_count)
 {
   switch (selection.axes.auxiliary_solution)
   {
@@ -291,83 +386,101 @@ RegularizationLaunchResult DispatchSolution(
       return DispatchSpatialBackend<ModelTag,
                                     DiscretizationTag,
                                     PointwiseEvaluationTag>(selection,
-                                                            policy,
-                                                            buffers);
+                                                            host_selection_count);
     case AuxiliarySolutionKind::LocalElimination:
       return DispatchSpatialBackend<ModelTag,
                                     DiscretizationTag,
                                     LocalEliminationTag>(selection,
-                                                         policy,
-                                                         buffers);
+                                                         host_selection_count);
     case AuxiliarySolutionKind::GlobalLinearSolve:
       return DispatchSpatialBackend<ModelTag,
                                     DiscretizationTag,
                                     GlobalLinearSolveTag>(selection,
-                                                          policy,
-                                                          buffers);
+                                                          host_selection_count);
   }
-  return DispatchFailure("unknown auxiliary solve during host dispatch");
+  return nullptr;
 }
 
 template <typename ModelTag>
-RegularizationLaunchResult DispatchDiscretization(
+RegularizationStaticLaunchFunction DispatchDiscretization(
   const RegularizationSelection& selection,
-  const RegularizationDevicePolicy& policy,
-  const RegularizationLaunchBuffers& buffers)
+  int& host_selection_count)
 {
   switch (selection.axes.auxiliary_discretization)
   {
     case AuxiliaryDiscretizationKind::ElementL2:
       return DispatchSolution<ModelTag, ElementL2Tag>(selection,
-                                                       policy,
-                                                       buffers);
+                                                       host_selection_count);
     case AuxiliaryDiscretizationKind::TraceL2:
-      return DispatchSolution<ModelTag, TraceL2Tag>(selection, policy, buffers);
+      return DispatchSolution<ModelTag, TraceL2Tag>(selection,
+                                                     host_selection_count);
     case AuxiliaryDiscretizationKind::HybridizedTrace:
       return DispatchSolution<ModelTag, HybridizedTraceTag>(selection,
-                                                             policy,
-                                                             buffers);
+                                                             host_selection_count);
   }
-  return DispatchFailure("unknown auxiliary discretization during host dispatch");
+  return nullptr;
 }
 
-inline RegularizationLaunchResult DispatchModel(
+inline RegularizationStaticLaunchFunction DispatchModel(
   const RegularizationSelection& selection,
-  const RegularizationDevicePolicy& policy,
-  const RegularizationLaunchBuffers& buffers)
+  int& host_selection_count)
 {
   switch (selection.axes.continuum_model)
   {
     case ContinuumModelKind::ZeroFixture:
       return DispatchDiscretization<ZeroFixtureModelTag>(selection,
-                                                          policy,
-                                                          buffers);
+                                                          host_selection_count);
     case ContinuumModelKind::ConstantFixture:
       return DispatchDiscretization<ConstantFixtureModelTag>(selection,
-                                                              policy,
-                                                              buffers);
+                                                              host_selection_count);
   }
-  return DispatchFailure("unknown continuum model during host dispatch");
+  return nullptr;
 }
 
 } // namespace detail
 
-/** Validate once on the host, select each independent axis once, then execute
- * a fully templated model kernel. Validation failure returns without touching
- * any MFEM data pointer or launching any point work. */
+/** Validate and freeze every host selection axis into one reusable launcher. */
+inline ConfiguredRegularizationLauncher ConfigureRegularization(
+  const RegularizationSelection& selection)
+{
+  const ValidationResult validation =
+    ValidateRegularizationSelection(selection);
+  if (!validation.Ok())
+  {
+    return {selection.axes.backend.execution,
+            nullptr,
+            validation,
+            0};
+  }
+
+  int host_selection_count = 0;
+  const RegularizationStaticLaunchFunction static_launch =
+    detail::DispatchModel(selection, host_selection_count);
+  if (static_launch == nullptr)
+  {
+    return {selection.axes.backend.execution,
+            nullptr,
+            {ValidationCode::UnsupportedCombination,
+             "validated selection did not bind a static launch function"},
+            host_selection_count};
+  }
+  return {selection.axes.backend.execution,
+          static_launch,
+          {},
+          host_selection_count};
+}
+
+/** One-shot convenience wrapper. Repeated launches should configure once and
+ * reuse ConfiguredRegularizationLauncher::Launch directly. */
 inline RegularizationLaunchResult ExecuteRegularization(
   const RegularizationSelection& selection,
   const RegularizationValidationContext& context,
   const RegularizationDevicePolicy& policy,
   const RegularizationLaunchBuffers& buffers)
 {
-  const ValidationResult validation =
-    ValidateRegularizationLaunch(selection, context, buffers);
-  if (!validation.Ok())
-  {
-    return {validation, false, 0};
-  }
-  return detail::DispatchModel(selection, policy, buffers);
+  ConfiguredRegularizationLauncher launcher =
+    ConfigureRegularization(selection);
+  return launcher.Launch(context, policy, buffers);
 }
 
 } // namespace regularization
