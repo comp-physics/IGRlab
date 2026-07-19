@@ -139,6 +139,28 @@ struct DGSEMProductionWorkspaceEvidence
   std::int64_t failures = 0;
 };
 
+/** Evidence-only snapshot for the coordinator-owned production-Mult bridge.
+ *
+ * Capturing storage identity synchronizes MFEM memory and may materialize
+ * host/device views. It is deliberately outside the production hot path and
+ * makes no allocation-free observation claim.
+ */
+struct DGSEMProductionBridgeEvidence
+{
+  bool operator_ready = false;
+  int x_local_size = 0;
+  int z_local_size = 0;
+  int y_local_size = 0;
+  int x_local_capacity = 0;
+  int z_local_capacity = 0;
+  int y_local_capacity = 0;
+  std::uint64_t workspace_storage_signature = 0;
+  std::int64_t operator_constructions = 0;
+  std::int64_t operator_rebinds = 0;
+  std::int64_t production_mult_calls = 0;
+  std::int64_t fallback_mult_calls = 0;
+};
+
 /** Read-only packed metadata view used by the production preflight.
  *
  * All arrays use the accepted packed layouts.  The element map is ordered

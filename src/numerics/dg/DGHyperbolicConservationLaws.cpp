@@ -51,10 +51,134 @@ DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
   nonlinearForm->UseExternalIntegrators();
 }
 
+DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
+  DGHyperbolicConservationLaws&&) = default;
+
 void DGHyperbolicConservationLaws::SetNumericalFlux(const NumericalFlux* flux)
 {
   num_flux_ = flux;
   face_data_dirty_ = true;
+}
+
+dgsem::DGSEMOperator&
+DGHyperbolicConservationLaws::GetDGSEMProductionOperator_() const
+{
+  if (!dgsem_production_operator_)
+  {
+    dgsem_production_operator_ =
+      std::make_unique<dgsem::DGSEMOperator>(*this);
+    ++dgsem_production_operator_constructions_;
+  }
+  else if (dgsem_production_operator_->Rebind(*this))
+  {
+    ++dgsem_production_operator_rebinds_;
+    dgsem_production_dispatch_observed_ = false;
+  }
+  return *dgsem_production_operator_;
+}
+
+bool DGHyperbolicConservationLaws::IsDGSEMProductionLogRoot_() const
+{
+#ifdef MFEM_USE_MPI
+  if (Mpi::IsInitialized() && !Mpi::IsFinalized())
+  {
+    if (const auto* par_fes =
+          dynamic_cast<const ParFiniteElementSpace*>(&vfes))
+    {
+      int owner_rank = 0;
+      MPI_Comm_rank(par_fes->GetComm(), &owner_rank);
+      return owner_rank == 0;
+    }
+  }
+#endif
+  return true;
+}
+
+dgsem::DGSEMProductionSelection
+DGHyperbolicConservationLaws::GetDGSEMProductionSelection() const
+{
+  if (!dgsem_production_operator_)
+  {
+    return {};
+  }
+  if (dgsem_production_operator_->Rebind(*this))
+  {
+    ++dgsem_production_operator_rebinds_;
+    dgsem_production_dispatch_observed_ = false;
+  }
+  return dgsem_production_operator_->GetProductionSelection();
+}
+
+dgsem::DGSEMProductionCacheCounters
+DGHyperbolicConservationLaws::GetDGSEMProductionCacheCounters() const
+{
+  if (!dgsem_production_operator_)
+  {
+    return {};
+  }
+  if (dgsem_production_operator_->Rebind(*this))
+  {
+    ++dgsem_production_operator_rebinds_;
+    dgsem_production_dispatch_observed_ = false;
+  }
+  return dgsem_production_operator_->GetProductionCacheCounters();
+}
+
+dgsem::DGSEMProductionWorkspaceEvidence
+DGHyperbolicConservationLaws::GetDGSEMProductionWorkspaceEvidence() const
+{
+  if (!dgsem_production_operator_)
+  {
+    return {};
+  }
+  if (dgsem_production_operator_->Rebind(*this))
+  {
+    ++dgsem_production_operator_rebinds_;
+    dgsem_production_dispatch_observed_ = false;
+  }
+  return dgsem_production_operator_->GetProductionWorkspaceEvidence();
+}
+
+dgsem::DGSEMProductionBridgeEvidence
+DGHyperbolicConservationLaws::GetDGSEMProductionBridgeEvidence() const
+{
+  if (dgsem_production_operator_ &&
+      dgsem_production_operator_->Rebind(*this))
+  {
+    ++dgsem_production_operator_rebinds_;
+    dgsem_production_dispatch_observed_ = false;
+  }
+  dgsem::DGSEMProductionBridgeEvidence evidence;
+  evidence.operator_ready = dgsem_production_operator_ != nullptr;
+  evidence.x_local_size = dgsem_x_local_workspace_.Size();
+  evidence.z_local_size = dgsem_z_local_workspace_.Size();
+  evidence.y_local_size = dgsem_y_local_workspace_.Size();
+  evidence.x_local_capacity = dgsem_x_local_workspace_.Capacity();
+  evidence.z_local_capacity = dgsem_z_local_workspace_.Capacity();
+  evidence.y_local_capacity = dgsem_y_local_workspace_.Capacity();
+  evidence.operator_constructions = dgsem_production_operator_constructions_;
+  evidence.operator_rebinds = dgsem_production_operator_rebinds_;
+  evidence.production_mult_calls = dgsem_production_mult_calls_;
+  evidence.fallback_mult_calls = dgsem_production_fallback_calls_;
+
+  std::uint64_t signature = UINT64_C(0x326e0b47cd18a95f);
+  const auto append_pointer = [&](const void* pointer)
+  {
+    signature ^= static_cast<std::uint64_t>(
+                   reinterpret_cast<std::uintptr_t>(pointer)) +
+                 UINT64_C(0x9e3779b97f4a7c15) + (signature << 6) +
+                 (signature >> 2);
+  };
+  const auto append_workspace = [&](const Vector& workspace)
+  {
+    append_pointer(workspace.Size() > 0 ? workspace.HostRead() : nullptr);
+    append_pointer(workspace.Size() > 0 ? workspace.Read(true) : nullptr);
+  };
+  append_workspace(dgsem_x_local_workspace_);
+  append_workspace(dgsem_z_local_workspace_);
+  append_workspace(dgsem_y_local_workspace_);
+  evidence.workspace_storage_signature = signature;
+  return evidence;
 }
 
 // -----------------------------------------------------------------------------
@@ -79,12 +203,13 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   // y_true = P^T A_local (P x_true). The packed DG device path follows the
   // same mapping when a non-trivial prolongation exists.
   const Vector* x_eval = &x;
-  Vector x_local;
-  Vector z_local;
-  Vector y_local;
+  Vector& x_local = dgsem_x_local_workspace_;
+  Vector& z_local = dgsem_z_local_workspace_;
+  Vector& y_local = dgsem_y_local_workspace_;
   const Operator* prolongation = nullptr;
 #ifdef MFEM_USE_MPI
-  if (Device::Allows(Backend::DEVICE_MASK))
+  if (Device::Allows(Backend::DEVICE_MASK) ||
+      vol_mode_ == VolumeMode::DGSEMFluxDiff)
   {
     if (const auto* pvfes = dynamic_cast<const ParFiniteElementSpace*>(&vfes))
     {
@@ -107,24 +232,154 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     MFEM_VERIFY(dgsem_stab_ == DGSEMStabilization::None,
                 "DGSEM stabilization hooks are not implemented. "
                 "Use --dgsem-stab none.");
-    dgsem::DGSEMOperator dgsem_op(*this);
+    dgsem::DGSEMOperator& dgsem_op = GetDGSEMProductionOperator_();
+    const bool requested_strict =
+      ::dg_igr::EnvFlagEnabled("DG_IGR_DGSEM_PRODUCTION_STRICT");
+    const dgsem::DGSEMProductionSelection selection =
+      dgsem_op.BindProductionPolicy(requested_strict);
+    const bool strict = selection.strict;
+    const dgsem::DGSEMProductionReason reason_code = selection.reason;
+    const bool dispatch_transition =
+      !dgsem_production_dispatch_observed_ ||
+      dgsem_production_dispatch_supported_ != selection.supported ||
+      dgsem_production_dispatch_strict_ != strict ||
+      dgsem_production_dispatch_cuda_ != selection.cuda ||
+      dgsem_production_dispatch_reason_ != reason_code;
+    const auto record_dispatch = [&]()
+    {
+      dgsem_production_dispatch_observed_ = true;
+      dgsem_production_dispatch_supported_ = selection.supported;
+      dgsem_production_dispatch_strict_ = strict;
+      dgsem_production_dispatch_cuda_ = selection.cuda;
+      dgsem_production_dispatch_reason_ = reason_code;
+    };
 
     const bool timing_enabled = IsDGSEMTimingEnabled_();
     const auto t_mult_start = std::chrono::steady_clock::now();
 
+    if (selection.supported)
+    {
+      if (y_local.Size() != vfes.GetVSize())
+      {
+        y_local.SetSize(vfes.GetVSize());
+      }
+      const dgsem::DGSEMProductionResult result =
+        dgsem_op.AssembleProductionResidual(*x_eval, y_local, strict);
+      MFEM_VERIFY(result.executed,
+                  "DGSEM production execution rejected before output: "
+                    << dgsem::DGSEMProductionReasonName(result.reason));
+
+      if (prolongation)
+      {
+        y = 0.0;
+        prolongation->MultTranspose(y_local, y);
+      }
+      else
+      {
+        y = y_local;
+      }
+      max_char_speed = result.max_characteristic_speed;
+      ++dgsem_production_mult_calls_;
+
+      if (timing_enabled)
+      {
+        const double total_seconds = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t_mult_start).count();
+        RecordDGSEMTiming_(0.0, 0.0, 0.0, total_seconds);
+      }
+      if (dispatch_transition && IsDGSEMProductionLogRoot_())
+      {
+        std::cout << "[dgsem-production] selected=mfem-native-packed"
+                  << " strict=" << strict
+                  << " backend=" << (selection.cuda ? "cuda" : "cpu")
+                  << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
+                  << " order=" << selection.order
+                  << " dim=" << selection.dimension << '\n';
+      }
+      record_dispatch();
+      return;
+    }
+
+    if (dispatch_transition && IsDGSEMProductionLogRoot_())
+    {
+      std::cout << "[dgsem-production] selected="
+                << (strict ? "strict-rejection" : "host-oracle-fallback")
+                << " strict=" << strict
+                << " reason="
+                << dgsem::DGSEMProductionReasonName(selection.reason)
+                << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
+                << '\n';
+    }
+    record_dispatch();
+    MFEM_VERIFY(!strict,
+                "DGSEM production strict policy rejected tuple before output: "
+                  << dgsem::DGSEMProductionReasonName(selection.reason));
+    MFEM_VERIFY(dgsem::DGSEMOperatorSupportsDimension(dim),
+                "DGSEM host oracle cannot execute rejected dimension: "
+                  << dgsem::DGSEMProductionReasonName(selection.reason));
+    ++dgsem_production_fallback_calls_;
+
+    const bool has_local_elements = vfes.GetNE() > 0;
     const auto t_surface_start = std::chrono::steady_clock::now();
-    const real_t max_face_speed = dgsem_op.AssembleSurface(x, z);
+    real_t max_face_speed = 0.0;
+    if (has_local_elements)
+    {
+      max_face_speed = dgsem_op.AssembleSurface(*x_eval, z_eval);
+    }
     const auto t_surface_stop = std::chrono::steady_clock::now();
 
     const auto t_volume_start = std::chrono::steady_clock::now();
-    const real_t max_vol_speed = dgsem_op.AssembleVolume(x, z);
+    real_t max_vol_speed = 0.0;
+    if (has_local_elements)
+    {
+      max_vol_speed = dgsem_op.AssembleVolume(*x_eval, z_eval);
+    }
     const auto t_volume_stop = std::chrono::steady_clock::now();
 
     const auto t_invmass_start = std::chrono::steady_clock::now();
-    dgsem_op.ApplyInverseMass(z, y);
+    if (prolongation)
+    {
+      y_local.SetSize(z_eval.Size());
+      if (has_local_elements)
+      {
+        dgsem_op.ApplyInverseMass(z_eval, y_local);
+      }
+      else
+      {
+        y_local = 0.0;
+      }
+      y = 0.0;
+      prolongation->MultTranspose(y_local, y);
+    }
+    else if (has_local_elements)
+    {
+      dgsem_op.ApplyInverseMass(z_eval, y);
+    }
+    else
+    {
+      y = 0.0;
+    }
     const auto t_invmass_stop = std::chrono::steady_clock::now();
 
-    max_char_speed = std::max(max_face_speed, max_vol_speed);
+    real_t fallback_max_speed = std::max(max_face_speed, max_vol_speed);
+#ifdef MFEM_USE_MPI
+    if (Mpi::IsInitialized() && !Mpi::IsFinalized())
+    {
+      if (const auto* par_fes =
+            dynamic_cast<const ParFiniteElementSpace*>(&vfes))
+      {
+        real_t owning_comm_max = fallback_max_speed;
+        MPI_Allreduce(&fallback_max_speed,
+                      &owning_comm_max,
+                      1,
+                      MPITypeMap<real_t>::mpi_type,
+                      MPI_MAX,
+                      par_fes->GetComm());
+        fallback_max_speed = owning_comm_max;
+      }
+    }
+#endif
+    max_char_speed = fallback_max_speed;
 
     if (timing_enabled)
     {
@@ -273,6 +528,23 @@ void DGHyperbolicConservationLaws::Update()
   }
 
   face_data_dirty_ = true;
+  if (dgsem_production_operator_)
+  {
+    if (dgsem_production_operator_->Rebind(*this))
+    {
+      ++dgsem_production_operator_rebinds_;
+    }
+    dgsem_production_operator_->InvalidateProductionCache(
+      dgsem::DGSEMProductionInvalidation::Topology);
+  }
+  dgsem_x_local_workspace_.SetSize(0);
+  dgsem_z_local_workspace_.SetSize(0);
+  dgsem_y_local_workspace_.SetSize(0);
+  dgsem_production_dispatch_observed_ = false;
+  dgsem_production_dispatch_supported_ = false;
+  dgsem_production_dispatch_strict_ = false;
+  dgsem_production_dispatch_cuda_ = false;
+  dgsem_production_dispatch_reason_ = dgsem::DGSEMProductionReason::None;
 }
 
 void DGHyperbolicConservationLaws::SetFaceIntegrationRule(

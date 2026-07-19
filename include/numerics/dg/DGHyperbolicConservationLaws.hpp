@@ -28,6 +28,7 @@
 #include <cstdint>
 #include "mfem.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
+#include "numerics/dgsem/dgsem_production.hpp"
 #include "numerics/riemann/fluxfunctions.hpp"
 
 namespace mfem
@@ -100,9 +101,9 @@ public:
   DGHyperbolicConservationLaws(const DGHyperbolicConservationLaws&) = delete;
   DGHyperbolicConservationLaws&
   operator=(const DGHyperbolicConservationLaws&) = delete;
-  DGHyperbolicConservationLaws(DGHyperbolicConservationLaws&&) = default;
+  DGHyperbolicConservationLaws(DGHyperbolicConservationLaws&&);
   DGHyperbolicConservationLaws&
-  operator=(DGHyperbolicConservationLaws&&) = default;
+  operator=(DGHyperbolicConservationLaws&&) = delete;
 
   /// Select volume-contribution strategy (WeakDivergence or DGSEMFluxDiff).
   void SetVolumeMode(VolumeMode m) { vol_mode_ = m; }
@@ -185,6 +186,23 @@ public:
   /// Max characteristic speed seen during the last Mult() (for CFL).
   real_t GetMaxCharSpeed() { return max_char_speed; }
 
+  /// Read-only production selection from the persistent Mult bridge.
+  dgsem::DGSEMProductionSelection GetDGSEMProductionSelection() const;
+
+  /// Read-only worker cache counters reached through production Mult.
+  dgsem::DGSEMProductionCacheCounters
+  GetDGSEMProductionCacheCounters() const;
+
+  /// Read-only packed-worker workspace identity reached through Mult.
+  dgsem::DGSEMProductionWorkspaceEvidence
+  GetDGSEMProductionWorkspaceEvidence() const;
+
+  /// Coordinator bridge lifetime/workspace evidence. Evidence-only: taking
+  /// the snapshot synchronizes MFEM memory and may materialize host/device
+  /// views; it is not an allocation-free hot-path observation.
+  dgsem::DGSEMProductionBridgeEvidence
+  GetDGSEMProductionBridgeEvidence() const;
+
   /**
    * @brief Add a boundary-face integrator with a marker (MFEM-style).
    *
@@ -225,6 +243,21 @@ private:
   mutable real_t max_char_speed =
     0.0;            ///< updated during Mult() by the form integrator
   mutable Vector z; ///< scratch for the assembled RHS before M⁻¹
+
+  mutable std::unique_ptr<dgsem::DGSEMOperator> dgsem_production_operator_;
+  mutable Vector dgsem_x_local_workspace_;
+  mutable Vector dgsem_z_local_workspace_;
+  mutable Vector dgsem_y_local_workspace_;
+  mutable bool dgsem_production_dispatch_observed_ = false;
+  mutable bool dgsem_production_dispatch_supported_ = false;
+  mutable bool dgsem_production_dispatch_strict_ = false;
+  mutable bool dgsem_production_dispatch_cuda_ = false;
+  mutable dgsem::DGSEMProductionReason dgsem_production_dispatch_reason_ =
+    dgsem::DGSEMProductionReason::None;
+  mutable std::int64_t dgsem_production_operator_constructions_ = 0;
+  mutable std::int64_t dgsem_production_operator_rebinds_ = 0;
+  mutable std::int64_t dgsem_production_mult_calls_ = 0;
+  mutable std::int64_t dgsem_production_fallback_calls_ = 0;
 
   // Keep external boundary integrators alive + stable copies of their markers.
   std::vector<std::unique_ptr<NonlinearFormIntegrator>> ext_bdr_int_;
@@ -330,6 +363,13 @@ private:
                           double invmass_seconds,
                           double total_seconds) const;
   void PrintDGSEMTimingSummary_() const;
+
+  /// Return the persistent worker, repairing ownership after a parent move.
+  dgsem::DGSEMOperator& GetDGSEMProductionOperator_() const;
+
+  /// True only on rank zero of the active FE-space communicator.
+  bool IsDGSEMProductionLogRoot_() const;
+
 
   /// Per-element scalar dof count used by packed inverse-mass apply.
   int invmass_elem_dof_ = 0;

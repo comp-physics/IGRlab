@@ -36,6 +36,14 @@ public:
   DGSEMOperator(const DGSEMOperator&) = delete;
   DGSEMOperator& operator=(const DGSEMOperator&) = delete;
 
+  /** Rebind a moved persistent bridge to its new owning operator.
+   *
+   * A changed owner discards all cache state so no pointer, topology,
+   * communicator, or policy fingerprint from the moved-from object survives.
+   * Returns true exactly when a rebind occurred.
+   */
+  bool Rebind(const DGHyperbolicConservationLaws& op);
+
   /// @brief Assemble DGSEM surface contributions into z (overwrites z).
   real_t AssembleSurface(const Vector& x, Vector& z) const;
 
@@ -83,7 +91,7 @@ private:
                                                     std::uint64_t fingerprint) const;
   DGSEMProductionReason EnsureProductionCache_(bool strict) const;
 
-  const DGHyperbolicConservationLaws& op_;
+  const DGHyperbolicConservationLaws* op_ = nullptr;
   mutable std::unique_ptr<DGSEMProductionCache> production_;
 };
 
