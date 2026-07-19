@@ -30,13 +30,19 @@ enum class AuxiliaryValueKind : std::uint8_t
   Tensor
 };
 
+enum class AuxiliaryRestartKind : std::uint8_t
+{
+  None,
+  Serialized,
+  ColdRecomputed
+};
+
 enum class AuxiliaryCapability : std::uint32_t
 {
   DeviceAccessible = 1u << 0,
-  Restartable = 1u << 1,
-  OutputVisible = 1u << 2,
-  StageLocal = 1u << 3,
-  TraceCoupled = 1u << 4
+  OutputVisible = 1u << 1,
+  StageLocal = 1u << 2,
+  TraceCoupled = 1u << 3
 };
 
 constexpr std::uint32_t CapabilityBit(AuxiliaryCapability capability)
@@ -54,8 +60,12 @@ struct AuxiliaryFieldCapabilities
   }
 };
 
-/** Stable semantic, restart, and output identities. These are numeric by
- * design so identity checks do not depend on pointer or string lifetime. */
+/** Stable semantic, serialized-restart, and output identities.
+ *
+ * A restart identity describes owned auxiliary storage only. Evaluated point
+ * arrays intentionally use EvaluatedPointFieldBinding and carry no restart or
+ * output identity.
+ */
 struct AuxiliaryFieldIdentity
 {
   std::uint64_t semantic_id = 0u;
@@ -126,8 +136,8 @@ struct TraceTopologyTag
 
 /** Typed host descriptor for MFEM-managed auxiliary storage.
  *
- * The descriptor does not allocate or delete storage. Ownership records which
- * subsystem owns the field, while MFEM Memory remains the sole data handle.
+ * ColdRecomputed means the field is regenerated after restart with a fresh
+ * producer epoch; it does not claim persisted auxiliary or trace data.
  */
 template <typename ValueTag, typename TopologyTag>
 class AuxiliaryFieldDescriptor
@@ -142,6 +152,7 @@ public:
                            AuxiliaryFieldOwnership ownership,
                            AuxiliaryFieldProvenance provenance,
                            AuxiliaryFieldIdentity identity,
+                           AuxiliaryRestartKind restart_kind,
                            AuxiliaryFieldCapabilities capabilities)
     : storage_(&storage),
       entity_count_(entity_count),
@@ -149,6 +160,7 @@ public:
       ownership_(ownership),
       provenance_(provenance),
       identity_(identity),
+      restart_kind_(restart_kind),
       capabilities_(capabilities)
   {
   }
@@ -171,6 +183,7 @@ public:
   AuxiliaryFieldOwnership Ownership() const { return ownership_; }
   AuxiliaryFieldProvenance Provenance() const { return provenance_; }
   AuxiliaryFieldIdentity Identity() const { return identity_; }
+  AuxiliaryRestartKind RestartKind() const { return restart_kind_; }
   AuxiliaryFieldCapabilities Capabilities() const { return capabilities_; }
 
   const mfem::Vector& Storage() const { return *storage_; }
@@ -199,9 +212,11 @@ private:
   mfem::Vector* storage_ = nullptr;
   int entity_count_ = 0;
   int dimension_ = 0;
-  AuxiliaryFieldOwnership ownership_ = AuxiliaryFieldOwnership::BorrowedReadOnly;
+  AuxiliaryFieldOwnership ownership_ =
+    AuxiliaryFieldOwnership::BorrowedReadOnly;
   AuxiliaryFieldProvenance provenance_{};
   AuxiliaryFieldIdentity identity_{};
+  AuxiliaryRestartKind restart_kind_ = AuxiliaryRestartKind::None;
   AuxiliaryFieldCapabilities capabilities_{};
 };
 
@@ -222,10 +237,10 @@ struct AuxiliaryFieldBinding
   int components = 0;
   AuxiliaryValueKind value_kind = AuxiliaryValueKind::Scalar;
   AuxiliaryFieldTopology topology = AuxiliaryFieldTopology::Volume;
-  AuxiliaryFieldOwnership ownership =
-    AuxiliaryFieldOwnership::BorrowedReadOnly;
+  AuxiliaryFieldOwnership ownership = AuxiliaryFieldOwnership::BorrowedReadOnly;
   AuxiliaryFieldProvenance provenance{};
   AuxiliaryFieldIdentity identity{};
+  AuxiliaryRestartKind restart_kind = AuxiliaryRestartKind::None;
   AuxiliaryFieldCapabilities capabilities{};
 
   int ExpectedSize() const { return entity_count * components; }
@@ -252,6 +267,7 @@ AuxiliaryFieldBinding BindAuxiliaryField(
           descriptor.Ownership(),
           descriptor.Provenance(),
           descriptor.Identity(),
+          descriptor.RestartKind(),
           descriptor.Capabilities()};
 }
 

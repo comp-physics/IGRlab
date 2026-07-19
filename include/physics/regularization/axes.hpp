@@ -12,7 +12,27 @@ namespace regularization
 enum class ContinuumModelKind : std::uint8_t
 {
   ZeroFixture,
-  ConstantFixture
+  ConstantFixture,
+  BrokenDGContractProbe
+};
+
+/** How a model interprets an evaluated conservative-state gradient. */
+enum class GradientTreatmentKind : std::uint8_t
+{
+  None,
+  ConservativeStateBrokenDG
+};
+
+/** Independently launchable pieces of the regularization contract. */
+enum class RegularizationOperationKind : std::uint8_t
+{
+  AuxiliaryCoefficient,
+  AuxiliarySource,
+  VolumeCorrection,
+  NormalCorrection,
+  WallLaw,
+  CharacteristicBounds,
+  Diagnostics
 };
 
 /** The finite-element representation used for auxiliary unknowns. */
@@ -73,6 +93,7 @@ enum class EntropyTreatmentKind : std::uint8_t
 struct RegularizationAxes
 {
   ContinuumModelKind continuum_model = ContinuumModelKind::ZeroFixture;
+  GradientTreatmentKind gradient_treatment = GradientTreatmentKind::None;
   AuxiliaryDiscretizationKind auxiliary_discretization =
     AuxiliaryDiscretizationKind::ElementL2;
   AuxiliarySolutionKind auxiliary_solution =
@@ -94,32 +115,90 @@ struct RegularizationSelection
 
 // Type-level representatives used after the one-time host selection.
 struct ZeroFixtureModelTag
-{};
+{
+};
 struct ConstantFixtureModelTag
-{};
+{
+};
 struct UnregisteredFixtureModelTag
-{};
+{
+};
+struct BrokenDGContractProbeModelTag
+{
+};
+
+struct NoneGradientTreatmentTag
+{
+};
+struct ConservativeStateBrokenDGTag
+{
+};
+
+struct AuxiliaryCoefficientOperationTag
+{
+  static constexpr RegularizationOperationKind kind =
+    RegularizationOperationKind::AuxiliaryCoefficient;
+};
+struct AuxiliarySourceOperationTag
+{
+  static constexpr RegularizationOperationKind kind =
+    RegularizationOperationKind::AuxiliarySource;
+};
+struct VolumeCorrectionOperationTag
+{
+  static constexpr RegularizationOperationKind kind =
+    RegularizationOperationKind::VolumeCorrection;
+};
+struct NormalCorrectionOperationTag
+{
+  static constexpr RegularizationOperationKind kind =
+    RegularizationOperationKind::NormalCorrection;
+};
+struct WallLawOperationTag
+{
+  static constexpr RegularizationOperationKind kind =
+    RegularizationOperationKind::WallLaw;
+};
+struct CharacteristicBoundsOperationTag
+{
+  static constexpr RegularizationOperationKind kind =
+    RegularizationOperationKind::CharacteristicBounds;
+};
+struct DiagnosticsOperationTag
+{
+  static constexpr RegularizationOperationKind kind =
+    RegularizationOperationKind::Diagnostics;
+};
 
 struct ElementL2Tag
-{};
+{
+};
 struct TraceL2Tag
-{};
+{
+};
 struct HybridizedTraceTag
-{};
+{
+};
 
 struct PointwiseEvaluationTag
-{};
+{
+};
 struct LocalEliminationTag
-{};
+{
+};
 struct GlobalLinearSolveTag
-{};
+{
+};
 
 struct DGSpatialBackendTag
-{};
+{
+};
 struct DGSEMSpatialBackendTag
-{};
+{
+};
 struct HDGSpatialBackendTag
-{};
+{
+};
 
 struct MFEMCpuTargetTag
 {
@@ -152,18 +231,24 @@ using HDGDeviceBackendTag =
   SpatialExecutionBackendTag<HDGSpatialBackendTag, MFEMDeviceTargetTag>;
 
 struct FrozenRKStageTag
-{};
+{
+};
 struct LaggedStepTag
-{};
+{
+};
 struct FullyCoupledTag
-{};
+{
+};
 
 struct EntropyNeutralTag
-{};
+{
+};
 struct EntropyConservativeTag
-{};
+{
+};
 struct EntropyStableTag
-{};
+{
+};
 
 } // namespace regularization
 } // namespace dg_igr
