@@ -350,6 +350,33 @@ struct FixtureBuffers
   }
 };
 
+void CheckAllWritableOutputsPreserved(TestContext& test,
+                                      FixtureBuffers& fixture,
+                                      mfem::real_t expected,
+                                      const char* message)
+{
+  const mfem::Vector* const outputs[] = {&fixture.coefficient,
+                                         &fixture.source,
+                                         &fixture.volume,
+                                         &fixture.normal,
+                                         &fixture.wall,
+                                         &fixture.bounds,
+                                         &fixture.diagnostics};
+  bool preserved = true;
+  for (const mfem::Vector* output : outputs)
+  {
+    const mfem::real_t* values = output->HostRead();
+    for (int value = 0; value < output->Size(); ++value)
+    {
+      if (values[value] != expected)
+      {
+        preserved = false;
+      }
+    }
+  }
+  test.Check(preserved, message);
+}
+
 regularization::RegularizationSelection ConstantCpuSelection(
   regularization::SpatialBackendKind spatial =
     regularization::SpatialBackendKind::DG)
@@ -957,6 +984,46 @@ void TestValidationProductOverflow(TestContext& test)
   }
 }
 
+void TestProducerGenerationStamps(TestContext& test)
+{
+  FixtureBuffers fixture;
+  regularization::ConfiguredRegularizationLauncher launcher =
+    regularization::ConfigureRegularization(ConstantCpuSelection());
+  const char* failure_messages[] = {
+    "zero auxiliary producer generation fails before launch",
+    "zero trace producer generation fails before launch"};
+  const char* preservation_messages[] = {
+    "auxiliary producer rejection preserves every writable output value",
+    "trace producer rejection preserves every writable output value"};
+
+  for (int scenario = 0; scenario < 2; ++scenario)
+  {
+    const mfem::real_t sentinel =
+      static_cast<mfem::real_t>(43 + scenario);
+    fixture.ResetOutputs(sentinel);
+    regularization::RegularizationLaunchBuffers buffers =
+      fixture.LaunchBuffers();
+    if (scenario == 0)
+    {
+      buffers.auxiliary.provenance.producer_generation = 0u;
+    }
+    else
+    {
+      buffers.trace.provenance.producer_generation = 0u;
+    }
+
+    const regularization::RegularizationLaunchResult result =
+      launcher.Launch(ValidationContext(), {}, buffers);
+    test.Check(result.validation.code ==
+                 regularization::ValidationCode::InvalidProvenanceStamp &&
+                 !result.launched && launcher.LaunchCount() == 0 &&
+                 launcher.HostSelectionCount() == 1,
+               failure_messages[scenario]);
+    CheckAllWritableOutputsPreserved(
+      test, fixture, sentinel, preservation_messages[scenario]);
+  }
+}
+
 void TestStaleProvenanceAndShape(TestContext& test)
 {
   FixtureBuffers fixture;
@@ -1031,6 +1098,7 @@ int main()
   TestValueKindValidation(test);
   TestIdentityCollisions(test);
   TestValidationProductOverflow(test);
+  TestProducerGenerationStamps(test);
   TestStaleProvenanceAndShape(test);
 
   if (test.Failures() == 0)

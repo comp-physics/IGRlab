@@ -322,6 +322,13 @@ ValidationResult ValidateConfiguredRegularizationLaunch(
             "launch validation requires a stamped RK stage and state generation"};
   }
 
+  if (buffers.auxiliary.provenance.producer_generation == 0u ||
+      buffers.trace.provenance.producer_generation == 0u)
+  {
+    return {ValidationCode::InvalidProvenanceStamp,
+            "auxiliary and trace fields require independent nonzero producer generations"};
+  }
+
   if (buffers.dimension < 1 || buffers.dimension > 3)
   {
     return {ValidationCode::InvalidDimension,
