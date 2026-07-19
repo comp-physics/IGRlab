@@ -255,12 +255,15 @@ LaunchStaticOperation(const RegularizationValidationContext& context,
   const int gradient_components =
     batch.conservative_state_gradient.ComponentExtent();
   const int normal_components = batch.normal.ComponentExtent();
+  const int base_characteristic_speed_components =
+    batch.base_characteristic_speed.ComponentExtent();
 
   const mfem::real_t* state = nullptr;
   const mfem::real_t* auxiliary = nullptr;
   const mfem::real_t* trace = nullptr;
   const mfem::real_t* conservative_state_gradient = nullptr;
   const mfem::real_t* normal = nullptr;
+  const mfem::real_t* base_characteristic_speed = nullptr;
   if constexpr (requirements.state)
   {
     state = batch.state.Read(use_device);
@@ -281,6 +284,11 @@ LaunchStaticOperation(const RegularizationValidationContext& context,
   if constexpr (requirements.normal)
   {
     normal = batch.normal.Read(use_device);
+  }
+  if constexpr (requirements.base_characteristic_speed)
+  {
+    base_characteristic_speed =
+      batch.base_characteristic_speed.Read(use_device);
   }
 
   const EvaluatedPointOutputBinding& output =
@@ -320,6 +328,11 @@ LaunchStaticOperation(const RegularizationValidationContext& context,
           : conservative_state_gradient + gradient_components * point_index;
       point.normal =
         normal == nullptr ? nullptr : normal + normal_components * point_index;
+      point.base_characteristic_speed =
+        base_characteristic_speed == nullptr
+          ? nullptr
+          : base_characteristic_speed +
+              base_characteristic_speed_components * point_index;
       point.state_components = state_components;
       point.auxiliary_components = auxiliary_components;
       point.trace_components = trace_components;

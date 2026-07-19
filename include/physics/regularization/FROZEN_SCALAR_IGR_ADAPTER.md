@@ -45,7 +45,7 @@ implied.
 | `VolumeCorrection` | Volume | state, auxiliary | `volume_correction` | enabled |
 | `NormalCorrection` | Face | state, auxiliary, normal | `normal_correction` | enabled |
 | `WallLaw` | Wall | state, trace when a model enables it | `wall_flux` | disabled and hook absent |
-| `CharacteristicBounds` | Face | state, normal | `characteristic_bounds` | enabled |
+| `CharacteristicBounds` | Face | state, normal, base-characteristic-speed | `characteristic_bounds` | enabled |
 | `Diagnostics` | Volume | state, auxiliary, trace when a model enables it | `diagnostics` | disabled and hook absent |
 
 Coefficient and source are independent capabilities and hooks. The same is true
@@ -57,13 +57,14 @@ inputs, output, and expected producer generations may all be absent.
 
 ## Explicit evaluated-point batches
 
-`EvaluatedPointBatch` names five possible producer-owned inputs:
+`EvaluatedPointBatch` names six possible producer-owned inputs:
 
 - evaluated state;
 - evaluated conservative-state gradient;
 - evaluated auxiliary;
-- evaluated trace; and
-- evaluated normal.
+- evaluated trace;
+- evaluated normal; and
+- evaluated base characteristic speed.
 
 Each `EvaluatedPointFieldBinding` binds exactly an `mfem::Vector` containing
 an explicitly allocated and filled evaluated array. Its metadata records point
@@ -71,6 +72,12 @@ count, component extent, dimension, `EvaluationSiteKind`, nonzero point-set
 identity, RK stage, state generation, and its own producer generation. Raw
 `GridFunction` or `ParGridFunction` DOFs and
 `ParGridFunction::Size()` are not evaluated-point storage or point counts.
+
+The `base_characteristic_speed` field has exactly one scalar component at each
+evaluated point. It uses the same site/count/dimension/point-set/stage/state
+metadata contract and its own nonzero authoritative producer generation. A
+configuration scalar is not an evaluated value, and this contract does not
+infer the field from state or normal storage.
 
 Validation considers only fields required by the statically selected operation.
 Required fields must agree with their batch on site, point count, point-set
@@ -89,7 +96,8 @@ and a nonzero producer generation.
 `RegularizationValidationContext` supplies the authoritative expected RK
 stage, state generation, and
 `ExpectedEvaluatedPointProducerGenerations` for state, conservative-state
-gradient, auxiliary, trace, and normal. For each operation-required field:
+gradient, auxiliary, trace, normal, and base characteristic speed. For each
+operation-required field:
 
 1. its own expected producer generation must be nonzero;
 2. its binding producer generation must be nonzero; and
@@ -98,8 +106,8 @@ gradient, auxiliary, trace, and normal. For each operation-required field:
 A zero producer authority is `InvalidProvenanceStamp`; a mismatched
 nonnegative stage or mismatched nonzero state/producer generation is
 `StaleProvenance`. Producer counters are independent: state, gradient,
-auxiliary, trace, and normal generations are never compared with one another,
-and valid unequal values are expected.
+auxiliary, trace, normal, and base-characteristic-speed generations are never
+compared with one another, and valid unequal values are expected.
 
 ## Model preflight and access ordering
 
@@ -116,7 +124,12 @@ probe requires:
 - Volume site for coefficient, source, and volume correction; and
 - Face site with a dimension-vector normal for normal correction and bounds.
 
+The probe opts `CharacteristicBounds` into the required
+`base_characteristic_speed` field. Configured validation rejects every
+non-scalar extent and all ordinary required-field provenance, size, storage, and
+alias failures before output pointer acquisition.
 A failed preflight returns `InvalidModelShape` and preserves every writable
+
 output, including when the supplied storage is deliberately missing.
 
 ## Writable output and alias boundary
@@ -149,8 +162,14 @@ arrays carry neither restart identity nor output identity.
 
 A later adapter requires a separately reviewed model tag, traits, physical
 algebra boundary, producer implementation, and opt-in production wiring. It
-must stamp explicitly evaluated MFEM vectors with the authoritative stage,
-state, point-set, and independent producer generations described above. This
-contract does not admit wall behavior, device execution, restart persistence,
-H1, trace production, two-state face production, scientific validity, or a
-performance claim for that future adapter.
+must produce the physical Euler base characteristic speed at every evaluated
+face point from the same point-local state and normal used by that evaluation,
+bind it as the scalar `base_characteristic_speed` field, and stamp its own
+nonzero authoritative producer generation alongside the shared batch
+provenance. The configuration
+`RegularizationDevicePolicy::characteristic_speed` scalar is not a truthful
+substitute for that varying field. This contract documentation neither
+implements nor revives the rejected physical frozen-scalar adapter. It does not
+admit wall behavior, device execution, restart persistence, H1, trace
+production, two-state face production, scientific validity, or a performance
+claim for that future adapter.

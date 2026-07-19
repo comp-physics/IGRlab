@@ -120,6 +120,7 @@ struct EvaluatedPointBatchMetadata
   EvaluatedPointFieldMetadata auxiliary{};
   EvaluatedPointFieldMetadata trace{};
   EvaluatedPointFieldMetadata normal{};
+  EvaluatedPointFieldMetadata base_characteristic_speed{};
 };
 
 /** Inputs for exactly one operation at exactly one evaluated point set. */
@@ -137,6 +138,7 @@ struct EvaluatedPointBatch
   EvaluatedPointFieldBinding auxiliary{};
   EvaluatedPointFieldBinding trace{};
   EvaluatedPointFieldBinding normal{};
+  EvaluatedPointFieldBinding base_characteristic_speed{};
 
   EvaluatedPointBatchMetadata Metadata() const
   {
@@ -150,7 +152,8 @@ struct EvaluatedPointBatch
             conservative_state_gradient.Metadata(),
             auxiliary.Metadata(),
             trace.Metadata(),
-            normal.Metadata()};
+            normal.Metadata(),
+            base_characteristic_speed.Metadata()};
   }
 };
 
@@ -161,6 +164,7 @@ struct EvaluatedPointFieldRequirements
   bool auxiliary = false;
   bool trace = false;
   bool normal = false;
+  bool base_characteristic_speed = false;
 };
 
 struct ModelPreflightResult

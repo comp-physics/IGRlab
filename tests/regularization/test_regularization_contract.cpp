@@ -43,6 +43,18 @@ static_assert(
 static_assert(
   std::is_trivially_copyable<regularization::RegularizationPointInput>::value,
   "point input must remain trivially copyable");
+static_assert(
+  std::is_standard_layout<regularization::RegularizationPointInput>::value,
+  "point input must remain standard layout");
+constexpr regularization::EvaluatedPointFieldRequirements
+  legacy_five_field_requirements{true, false, true, false, false};
+static_assert(!legacy_five_field_requirements.base_characteristic_speed,
+              "appended requirement must default false");
+constexpr regularization::ExpectedEvaluatedPointProducerGenerations
+  legacy_five_producer_generations{11u, 17u, 23u, 29u, 31u};
+static_assert(legacy_five_producer_generations.base_characteristic_speed == 0u,
+              "appended producer authority must default zero");
+
 static_assert(regularization::HasRegularizationTraits<
                 regularization::BrokenDGContractProbeModelTag>::value,
               "optional-hook probe must satisfy trait discovery");
@@ -224,6 +236,17 @@ regularization::RegularizationValidationContext ValidationContext(
           expected_producer_generations};
 }
 
+regularization::RegularizationValidationContext
+CharacteristicBoundsValidationContext(
+  int expected_rk_stage = 2,
+  std::uint64_t expected_state_generation = 19u)
+{
+  regularization::RegularizationValidationContext context =
+    ValidationContext(expected_rk_stage, expected_state_generation);
+  context.expected_producer_generations.base_characteristic_speed = 37u;
+  return context;
+}
+
 regularization::AuxiliaryFieldCapabilities VolumeCapabilities()
 {
   using regularization::AuxiliaryCapability;
@@ -288,6 +311,7 @@ struct PointFixture
   mfem::Vector auxiliary;
   mfem::Vector trace;
   mfem::Vector normal_input;
+  mfem::Vector base_characteristic_speed;
   mfem::Vector coefficient;
   mfem::Vector source;
   mfem::Vector volume;
@@ -309,6 +333,7 @@ struct PointFixture
       auxiliary(auxiliary_components * points),
       trace(points),
       normal_input(dimension * points),
+      base_characteristic_speed(points),
       coefficient(auxiliary_components * points),
       source(auxiliary_components * points),
       volume(state_components * dimension * points),
@@ -339,6 +364,7 @@ struct PointFixture
     }
     gradient = static_cast<mfem::real_t>(0.25);
     auxiliary = static_cast<mfem::real_t>(2.0);
+    base_characteristic_speed = static_cast<mfem::real_t>(4.0);
     ResetOutputs(0.0);
   }
 
@@ -414,6 +440,15 @@ struct PointFixture
                31u,
                stage,
                state_generation));
+    batch.base_characteristic_speed =
+      regularization::BindEvaluatedPointField(
+        base_characteristic_speed,
+        Metadata(1,
+                 site,
+                 point_set_id,
+                 37u,
+                 stage,
+                 state_generation));
     return batch;
   }
 
@@ -693,6 +728,7 @@ void TestExistingFixtureNumerics(TestContext& test)
 
   regularization::EvaluatedPointBatch face_batch =
     fixture.Batch(regularization::EvaluationSiteKind::Face, 0x201u);
+  face_batch.base_characteristic_speed = {};
   regularization::RegularizationOperationOutputs face_outputs =
     fixture.Outputs(regularization::EvaluationSiteKind::Face, 0x201u);
   for (regularization::RegularizationOperationKind operation :
@@ -871,9 +907,14 @@ void TestProbeOperations(TestContext& test)
       launch.fixture->Outputs(launch.site, launch.point_set_id);
     operation_outputs.wall_flux = {};
     operation_outputs.diagnostics = {};
+    const regularization::RegularizationValidationContext launch_context =
+      launch.operation ==
+          regularization::RegularizationOperationKind::CharacteristicBounds
+        ? CharacteristicBoundsValidationContext(0)
+        : ValidationContext(0);
     const regularization::RegularizationLaunchResult result =
       launcher.Launch(launch.operation,
-                      ValidationContext(0),
+                      launch_context,
                       policy,
                       batch,
                       operation_outputs);
@@ -917,6 +958,231 @@ void TestProbeOperations(TestContext& test)
             -4.0,
             0.0,
             "probe bounds output");
+}
+
+void TestPerPointBaseCharacteristicSpeed(TestContext& test)
+{
+  regularization::ConfiguredRegularizationLauncher launcher =
+    regularization::ConfigureRegularization(ProbeSelection());
+  PointFixture fixture(3, 2, 4);
+  mfem::real_t* const speeds = fixture.base_characteristic_speed.HostWrite();
+  speeds[0] = 1.25;
+  speeds[1] = 3.5;
+  speeds[2] = 7.75;
+  fixture.ResetOutputs(211.0);
+
+  const std::uint64_t point_set_id = 0x2201u;
+  const regularization::RegularizationDevicePolicy policy{
+    0.0, 0.0, 0.0, 0.0, -999.0};
+  const regularization::EvaluatedPointBatch batch =
+    fixture.Batch(regularization::EvaluationSiteKind::Face, point_set_id);
+  const regularization::RegularizationLaunchResult result = launcher.Launch(
+    regularization::RegularizationOperationKind::CharacteristicBounds,
+    CharacteristicBoundsValidationContext(),
+    policy,
+    batch,
+    fixture.Outputs(regularization::EvaluationSiteKind::Face, point_set_id));
+
+  test.Check(result.validation.Ok() && result.launched &&
+               result.host_selection_count == 1 &&
+               launcher.LaunchCount() == 1 &&
+               batch.base_characteristic_speed.ComponentExtent() == 1 &&
+               batch.base_characteristic_speed.ProducerGeneration() == 37u,
+             "point-local base speeds launch once through the static CPU path");
+  const mfem::real_t* const bounds = fixture.bounds.HostRead();
+  test.Near(bounds[0], -1.25, 0.0, "first point lower characteristic bound");
+  test.Near(bounds[1], 1.25, 0.0, "first point upper characteristic bound");
+  test.Near(bounds[2], -3.5, 0.0, "second point lower characteristic bound");
+  test.Near(bounds[3], 3.5, 0.0, "second point upper characteristic bound");
+  test.Near(bounds[4], -7.75, 0.0, "third point lower characteristic bound");
+  test.Near(bounds[5], 7.75, 0.0, "third point upper characteristic bound");
+}
+
+void TestBaseCharacteristicSpeedValidationMatrix(TestContext& test)
+{
+  regularization::ConfiguredRegularizationLauncher launcher =
+    regularization::ConfigureRegularization(ProbeSelection());
+  PointFixture fixture(3, 2, 4);
+  const regularization::EvaluationSiteKind site =
+    regularization::EvaluationSiteKind::Face;
+  const std::uint64_t point_set_id = 0x2202u;
+  const mfem::real_t sentinel = 223.0;
+  const regularization::RegularizationDevicePolicy policy{
+    0.0, 0.0, 0.0, 0.0, -999.0};
+
+  auto expect_failure =
+    [&](const regularization::EvaluatedPointBatch& candidate_batch,
+        const regularization::RegularizationValidationContext& context,
+        regularization::ValidationCode expected,
+        const char* message,
+        bool alias_output = false)
+  {
+    fixture.ResetOutputs(sentinel);
+    regularization::RegularizationOperationOutputs outputs =
+      fixture.Outputs(site, point_set_id);
+    if (alias_output)
+    {
+      fixture.base_characteristic_speed = sentinel;
+      outputs.characteristic_bounds =
+        regularization::BindEvaluatedPointOutput(
+          fixture.base_characteristic_speed,
+          fixture.points,
+          2,
+          fixture.dimension,
+          site,
+          point_set_id);
+    }
+    const int launch_count = launcher.LaunchCount();
+    const regularization::RegularizationLaunchResult result = launcher.Launch(
+      regularization::RegularizationOperationKind::CharacteristicBounds,
+      context,
+      policy,
+      candidate_batch,
+      outputs);
+    test.Check(
+      result.validation.code == expected && !result.launched &&
+        launcher.LaunchCount() == launch_count &&
+        AllOutputsEqual(fixture, sentinel) &&
+        (!alias_output ||
+         AllValuesEqual(fixture.base_characteristic_speed, sentinel)),
+      message);
+  };
+
+  regularization::EvaluatedPointBatch batch = fixture.Batch(site, point_set_id);
+  batch.base_characteristic_speed =
+    regularization::EvaluatedPointFieldBinding::Missing(
+      fixture.Metadata(1, site, point_set_id, 37u));
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::MissingBuffer,
+                 "missing base-speed storage preserves output and launch count");
+
+  regularization::RegularizationValidationContext context =
+    CharacteristicBoundsValidationContext();
+  context.expected_producer_generations.base_characteristic_speed = 0u;
+  expect_failure(fixture.Batch(site, point_set_id),
+                 context,
+                 regularization::ValidationCode::InvalidProvenanceStamp,
+                 "zero base-speed producer authority is rejected before write");
+
+  batch = fixture.Batch(site, point_set_id);
+  batch.base_characteristic_speed = regularization::BindEvaluatedPointField(
+    fixture.base_characteristic_speed,
+    fixture.Metadata(1, site, point_set_id, 0u));
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::InvalidProvenanceStamp,
+                 "zero bound base-speed producer stamp is rejected");
+
+  batch = fixture.Batch(site, point_set_id);
+  batch.base_characteristic_speed = regularization::BindEvaluatedPointField(
+    fixture.base_characteristic_speed,
+    fixture.Metadata(1, site, point_set_id, 38u));
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::StaleProvenance,
+                 "stale base-speed producer generation is rejected");
+
+  batch = fixture.Batch(site, point_set_id);
+  batch.base_characteristic_speed = regularization::BindEvaluatedPointField(
+    fixture.base_characteristic_speed,
+    fixture.Metadata(0, site, point_set_id, 37u));
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::InvalidComponentCount,
+                 "zero-component base-speed metadata is rejected");
+
+  batch = fixture.Batch(site, point_set_id);
+  batch.base_characteristic_speed = regularization::BindEvaluatedPointField(
+    fixture.base_characteristic_speed,
+    fixture.Metadata(2, site, point_set_id, 37u));
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::InvalidComponentCount,
+                 "non-scalar base-speed extent is rejected");
+
+  mfem::Vector undersized_speed_storage(fixture.points - 1);
+  undersized_speed_storage = 4.0;
+  batch = fixture.Batch(site, point_set_id);
+  batch.base_characteristic_speed = regularization::BindEvaluatedPointField(
+    undersized_speed_storage,
+    fixture.Metadata(1, site, point_set_id, 37u));
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::InvalidBufferSize,
+                 "wrong base-speed storage size is rejected before write");
+
+  batch = fixture.Batch(site, point_set_id);
+  batch.base_characteristic_speed = regularization::BindEvaluatedPointField(
+    fixture.base_characteristic_speed,
+    fixture.Metadata(1,
+                     site,
+                     point_set_id,
+                     37u,
+                     2,
+                     19u,
+                     fixture.points + 1));
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::InvalidPointCount,
+                 "wrong base-speed point count is rejected before write");
+
+  batch = fixture.Batch(site, point_set_id);
+  batch.base_characteristic_speed = regularization::BindEvaluatedPointField(
+    fixture.base_characteristic_speed,
+    fixture.Metadata(1,
+                     regularization::EvaluationSiteKind::Volume,
+                     point_set_id,
+                     37u));
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::InvalidEvaluationSite,
+                 "wrong base-speed evaluation site is rejected before write");
+
+  batch = fixture.Batch(site, point_set_id);
+  regularization::EvaluatedPointFieldMetadata wrong_dimension =
+    fixture.Metadata(1, site, point_set_id, 37u);
+  wrong_dimension.dimension = fixture.dimension + 1;
+  batch.base_characteristic_speed = regularization::BindEvaluatedPointField(
+    fixture.base_characteristic_speed, wrong_dimension);
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::InvalidDimension,
+                 "wrong base-speed dimension is rejected before write");
+
+  batch = fixture.Batch(site, point_set_id);
+  batch.base_characteristic_speed = regularization::BindEvaluatedPointField(
+    fixture.base_characteristic_speed,
+    fixture.Metadata(1, site, point_set_id + 1u, 37u));
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::InvalidPointSetIdentity,
+                 "wrong base-speed point-set identity is rejected before write");
+
+  batch = fixture.Batch(site, point_set_id);
+  batch.base_characteristic_speed = regularization::BindEvaluatedPointField(
+    fixture.base_characteristic_speed,
+    fixture.Metadata(1, site, point_set_id, 37u, 3));
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::StaleProvenance,
+                 "stale base-speed RK stage is rejected before write");
+
+  batch = fixture.Batch(site, point_set_id);
+  batch.base_characteristic_speed = regularization::BindEvaluatedPointField(
+    fixture.base_characteristic_speed,
+    fixture.Metadata(1, site, point_set_id, 37u, 2, 20u));
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::StaleProvenance,
+                 "stale base-speed state generation is rejected before write");
+
+  batch = fixture.Batch(site, point_set_id);
+  expect_failure(batch,
+                 CharacteristicBoundsValidationContext(),
+                 regularization::ValidationCode::InvalidBufferAliasing,
+                 "base-speed/output alias is rejected before write",
+                 true);
 }
 
 void TestProbeUnsupportedSelections(TestContext& test)
@@ -1333,7 +1599,7 @@ void TestProducerGenerationAuthority(TestContext& test)
 
   point_set_id = 0x6204u;
   batch = fixture.Batch(regularization::EvaluationSiteKind::Face, point_set_id);
-  context = ValidationContext();
+  context = CharacteristicBoundsValidationContext();
   context.expected_producer_generations.normal = 0u;
   expect_probe_failure(
     regularization::RegularizationOperationKind::CharacteristicBounds,
@@ -1344,13 +1610,32 @@ void TestProducerGenerationAuthority(TestContext& test)
     regularization::ValidationCode::InvalidProvenanceStamp,
     "required normal needs a nonzero authoritative producer generation");
 
-  context = ValidationContext();
+  context = CharacteristicBoundsValidationContext();
+  fixture.ResetOutputs(131.0);
+  const regularization::RegularizationLaunchResult valid_normal_authority =
+    probe.Launch(
+      regularization::RegularizationOperationKind::CharacteristicBounds,
+      context,
+      {},
+      batch,
+      fixture.Outputs(regularization::EvaluationSiteKind::Face,
+                      point_set_id));
+  test.Check(
+    context.expected_producer_generations.normal == 31u &&
+      context.expected_producer_generations.base_characteristic_speed == 37u &&
+      valid_normal_authority.validation.Ok() &&
+      valid_normal_authority.launched &&
+      !AllValuesEqual(fixture.bounds, 131.0),
+    "valid normal and base-speed producer authorities launch as a control");
+
+  batch = fixture.Batch(regularization::EvaluationSiteKind::Face, point_set_id);
   batch.normal = regularization::BindEvaluatedPointField(
     fixture.normal_input,
     fixture.Metadata(2,
                      regularization::EvaluationSiteKind::Face,
                      point_set_id,
                      32u));
+  context = CharacteristicBoundsValidationContext();
   expect_probe_failure(
     regularization::RegularizationOperationKind::CharacteristicBounds,
     regularization::EvaluationSiteKind::Face,
@@ -1700,6 +1985,8 @@ int main()
   TestExistingFixtureSelections(test);
   TestExistingFixtureNumerics(test);
   TestProbeOperations(test);
+  TestPerPointBaseCharacteristicSpeed(test);
+  TestBaseCharacteristicSpeedValidationMatrix(test);
   TestProbeUnsupportedSelections(test);
   TestUnsupportedCapabilitiesBeforeBuffers(test);
   TestPreflightBeforeAccess(test);

@@ -612,19 +612,31 @@ ValidationResult ValidateConfiguredRegularizationLaunch(
     &batch.conservative_state_gradient,
     &batch.auxiliary,
     &batch.trace,
-    &batch.normal};
+    &batch.normal,
+    &batch.base_characteristic_speed};
   const bool required[] = {requirements.state,
                            requirements.conservative_state_gradient,
                            requirements.auxiliary,
                            requirements.trace,
-                           requirements.normal};
+                           requirements.normal,
+                           requirements.base_characteristic_speed};
   const std::uint64_t expected_producer_generations[] = {
     context.expected_producer_generations.state,
     context.expected_producer_generations.conservative_state_gradient,
     context.expected_producer_generations.auxiliary,
     context.expected_producer_generations.trace,
-    context.expected_producer_generations.normal};
-  for (int index = 0; index < 5; ++index)
+    context.expected_producer_generations.normal,
+    context.expected_producer_generations.base_characteristic_speed};
+  constexpr int evaluated_field_count =
+    static_cast<int>(sizeof(fields) / sizeof(fields[0]));
+  static_assert(sizeof(required) / sizeof(required[0]) ==
+                  sizeof(fields) / sizeof(fields[0]),
+                "required-field inventory must match evaluated fields");
+  static_assert(sizeof(expected_producer_generations) /
+                    sizeof(expected_producer_generations[0]) ==
+                  sizeof(fields) / sizeof(fields[0]),
+                "producer-authority inventory must match evaluated fields");
+  for (int index = 0; index < evaluated_field_count; ++index)
   {
     if (!required[index])
     {
@@ -638,6 +650,14 @@ ValidationResult ValidateConfiguredRegularizationLaunch(
     {
       return validation;
     }
+  }
+
+  if (requirements.base_characteristic_speed &&
+      batch.base_characteristic_speed.ComponentExtent() != 1)
+  {
+    return {ValidationCode::InvalidComponentCount,
+            "base characteristic speed must have exactly one scalar "
+            "component per evaluated point"};
   }
 
   bool output_components_fit = false;
@@ -670,7 +690,7 @@ ValidationResult ValidateConfiguredRegularizationLaunch(
             "operation output point-set identity does not match its batch"};
   }
 
-  for (int index = 0; index < 5; ++index)
+  for (int index = 0; index < evaluated_field_count; ++index)
   {
     if (required[index] && fields[index]->Storage() == nullptr)
     {
@@ -684,7 +704,7 @@ ValidationResult ValidateConfiguredRegularizationLaunch(
             "selected operation output storage is missing"};
   }
 
-  for (int index = 0; index < 5; ++index)
+  for (int index = 0; index < evaluated_field_count; ++index)
   {
     if (fields[index]->Storage() != nullptr &&
         output.Storage() == fields[index]->Storage())
@@ -694,7 +714,7 @@ ValidationResult ValidateConfiguredRegularizationLaunch(
     }
   }
 
-  for (int index = 0; index < 5; ++index)
+  for (int index = 0; index < evaluated_field_count; ++index)
   {
     if (!required[index])
     {
