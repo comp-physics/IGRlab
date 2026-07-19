@@ -866,3 +866,4 @@ add_example_regression(dg_igr_regression_sedov
 #   -no-vtk -dt_save 1.0)
 
 add_subdirectory(hdg)
+add_subdirectory(regularization)
