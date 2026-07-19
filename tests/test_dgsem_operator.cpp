@@ -12,6 +12,7 @@
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
+#include "test_dgsem_device_parity.hpp"
 #include "test_dgsem_reference_operator.hpp"
 
 #include <cmath>
@@ -286,6 +287,8 @@ void AssembleBoundaryShape(const mfem::ParFiniteElementSpace& vfes,
 
 int RunDGSEMOperatorTests(TestContext& ctx)
 {
+  RunDGSEMDeviceParityTests(ctx);
+
   const double tol = 1.0e-10;
 
   // 1D constant-state cancellation.
