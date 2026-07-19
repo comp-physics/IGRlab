@@ -48,6 +48,7 @@ struct RegularizationPointInput
   int trace_components = 0;
   int correction_components = 0;
   int dimension = 0;
+  const mfem::real_t* base_characteristic_speed = nullptr;
 
   MFEM_HOST_DEVICE mfem::real_t State(int component) const
   {
@@ -71,6 +72,10 @@ struct RegularizationPointInput
   {
     return normal[direction];
   }
+  MFEM_HOST_DEVICE mfem::real_t BaseCharacteristicSpeed() const
+  {
+    return base_characteristic_speed[0];
+  }
 };
 
 struct CharacteristicBoundsResult
@@ -92,6 +97,8 @@ static_assert(std::is_standard_layout<RegularizationDevicePolicy>::value,
               "regularization device policy must have standard layout");
 static_assert(std::is_trivially_copyable<RegularizationPointInput>::value,
               "regularization point input must be trivially copyable");
+static_assert(std::is_standard_layout<RegularizationPointInput>::value,
+              "regularization point input must have standard layout");
 
 template <typename ModelTag> struct RegularizationTraits;
 
@@ -182,6 +189,18 @@ struct RegularizationOperationRequirements<BrokenDGContractProbeModelTag,
                                                          true,
                                                          false,
                                                          false};
+};
+
+template <>
+struct RegularizationOperationRequirements<BrokenDGContractProbeModelTag,
+                                           CharacteristicBoundsOperationTag>
+{
+  static constexpr EvaluatedPointFieldRequirements value{true,
+                                                         false,
+                                                         false,
+                                                         false,
+                                                         true,
+                                                         true};
 };
 
 namespace detail
@@ -521,11 +540,11 @@ template <> struct RegularizationTraits<BrokenDGContractProbeModelTag>
   }
 
   MFEM_HOST_DEVICE static CharacteristicBoundsResult
-  CharacteristicBounds(const RegularizationDevicePolicy& policy,
-                       const RegularizationPointInput&)
+  CharacteristicBounds(const RegularizationDevicePolicy&,
+                       const RegularizationPointInput& point)
   {
     const mfem::real_t speed =
-      detail::AbsoluteValue(policy.characteristic_speed);
+      detail::AbsoluteValue(point.BaseCharacteristicSpeed());
     return {-speed, speed};
   }
 };

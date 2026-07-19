@@ -50,6 +50,7 @@ struct ExpectedEvaluatedPointProducerGenerations
   std::uint64_t auxiliary = 0u;
   std::uint64_t trace = 0u;
   std::uint64_t normal = 0u;
+  std::uint64_t base_characteristic_speed = 0u;
 };
 
 struct RegularizationValidationContext
