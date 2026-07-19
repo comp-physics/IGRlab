@@ -20,6 +20,10 @@ namespace dgsem
 DGSEMOperator::DGSEMOperator(const DGHyperbolicConservationLaws& op)
   : op_(op)
 {
+  MFEM_VERIFY(DGSEMOperatorSupportsDimension(op_.dim),
+              "DGSEMOperator supports spatial dimensions 1 and 2 only; "
+              "3D tensor face quadrature, nodal surface indexing, and "
+              "curl-form metrics are not implemented in Wave 1.");
 }
 
 const BdrHyperbolicFluxIntegrator*
@@ -123,8 +127,6 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
       nor(0) = (element_ip.x - 0.5) * 2.0;
       return;
     }
-    MFEM_VERIFY(op_.dim == 2,
-                "DGSEM nodal surface metrics support dim=1 or dim=2.");
     if (!metric_cache_ready[static_cast<std::size_t>(element)])
     {
       dgsem::BuildContravariantMetrics2D(
@@ -243,7 +245,7 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
     for (int sf = 0; sf < n_shared_faces; ++sf)
     {
       FaceElementTransformations* Tr =
-        pmesh->GetSharedFaceTransformations(sf, /*use_local_face_nr=*/true);
+        pmesh->GetSharedFaceTransformations(sf, /*fill2=*/true);
       if (!Tr)
       {
         continue;
@@ -709,7 +711,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
         }
       }
     }
-    else if (op_.dim == 2)
+    else
     {
       for (int j = 0; j < n1d; ++j)
       {
@@ -745,10 +747,6 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
           }
         }
       }
-    }
-    else
-    {
-      MFEM_VERIFY(false, "DGSEM volume mode supports dim=1 or 2 only.");
     }
 
     for (int local = 0; local < dof; ++local)

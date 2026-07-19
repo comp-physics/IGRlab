@@ -16,6 +16,12 @@ class DGHyperbolicConservationLaws;
 namespace dgsem
 {
 
+/// DGSEM Wave 1 has complete tensor volume/surface semantics in 1D and 2D.
+inline constexpr bool DGSEMOperatorSupportsDimension(int dim)
+{
+  return dim == 1 || dim == 2;
+}
+
 /// @brief Helper to assemble DGSEM volume/surface contributions.
 class DGSEMOperator
 {

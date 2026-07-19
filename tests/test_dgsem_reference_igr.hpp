@@ -7,10 +7,12 @@
 #include "mfem.hpp"
 #include "test_utils.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 namespace dg_igr_tests
 {
@@ -24,9 +26,28 @@ inline void RunDGSEMScalarIGRScopeFixture(TestContext& ctx)
   const double tol =
     mfem::dgsem::DGSEMReferenceTolerances::pointwise_fixture;
 
+  const int world_size = mfem::Mpi::WorldSize();
+  ctx.Check(world_size >= 1,
+            "DGSEM scalar-IGR fixture has an active MPI communicator");
+  const int global_elements = std::max(world_size, 1);
   mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
-    1, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
-  mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+    global_elements, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  std::vector<int> partition(static_cast<std::size_t>(global_elements), 0);
+  for (int element = 0; element < global_elements; ++element)
+  {
+    partition[static_cast<std::size_t>(element)] = element % world_size;
+  }
+  mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh, partition.data());
+  const int local_elements = pmesh.GetNE();
+  int min_local_elements = 0;
+  MPI_Allreduce(&local_elements,
+                &min_local_elements,
+                1,
+                mfem::MPITypeMap<int>::mpi_type,
+                MPI_MIN,
+                MPI_COMM_WORLD);
+  ctx.Check(min_local_elements > 0,
+            "DGSEM scalar-IGR fixture gives every tested rank owned work");
   mfem::DG_FECollection sigma_fec(1, dim, mfem::BasisType::GaussLobatto);
   mfem::ParFiniteElementSpace sigma_fes(
     &pmesh, &sigma_fec, 1, mfem::Ordering::byNODES);
@@ -158,7 +179,11 @@ inline void RunDGSEMScalarIGRScopeFixture(TestContext& ctx)
     std::ofstream out(std::filesystem::path(output_dir) /
                       "scalar_igr_frozen_auxiliary.json");
     out << "{\n"
-        << "  \"schema\": \"dgsem-scalar-igr-frozen-auxiliary-v2\",\n"
+        << "  \"schema\": \"dgsem-scalar-igr-frozen-auxiliary-v3\",\n"
+        << "  \"ranks\": " << world_size << ",\n"
+        << "  \"global_elements\": " << global_elements << ",\n"
+        << "  \"minimum_local_elements\": " << min_local_elements << ",\n"
+        << "  \"empty_rank_safe_assertion_executed\": true,\n"
         << "  \"sigma\": " << sigma_value << ",\n"
         << "  \"primitive_state\": [2,0.3,-0.2,1.1],\n"
         << "  \"expected_flux_correction\": "

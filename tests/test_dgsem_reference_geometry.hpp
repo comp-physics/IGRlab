@@ -17,20 +17,21 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace dg_igr_tests
 {
 namespace dgsem_reference_geometry
-#include <memory>
-#include <string>
 {
 
 struct MetricOracleEvidence
 {
-  std::array<double, 4> affine_adjugate_max_error{{}};
-  std::array<double, 4> affine_face_normal_max_error{{}};
-  std::array<double, 4> curved_metric_identity_max_error{{}};
+  std::array<mfem::real_t, 4> affine_adjugate_max_error{{}};
+  std::array<mfem::real_t, 4> affine_face_normal_max_error{{}};
+  std::array<mfem::real_t, 4> affine_cross_term_max{{}};
+  std::array<mfem::real_t, 4> curved_metric_identity_max_error{{}};
 };
 
 struct PermutationOracleEvidence
@@ -137,18 +138,28 @@ inline MetricOracleEvidence RunP1P4MetricOracles(TestContext& ctx)
 {
   MetricOracleEvidence evidence;
   constexpr int dim = 2;
-  const double fixture_tolerance =
-    mfem::dgsem::DGSEMReferenceTolerances::pointwise_fixture;
-  const double identity_tolerance =
-    mfem::dgsem::DGSEMReferenceTolerances::sbp;
+  const mfem::real_t fixture_tolerance =
+    mfem::dgsem::PrecisionAwareMetricTolerance(
+      mfem::dgsem::DGSEMReferenceTolerances::pointwise_fixture);
+  const mfem::real_t identity_tolerance =
+    mfem::dgsem::PrecisionAwareMetricTolerance(
+      mfem::dgsem::DGSEMReferenceTolerances::sbp);
 
   for (const int order : mfem::dgsem::DGSEMConvergenceContract::orders)
   {
     const std::size_t order_index = static_cast<std::size_t>(order - 1);
 
-    // Affine equivalence to MFEM's pointwise adjugate and scaled face normal.
+    // Positive-Jacobian sheared parallelogram. Its nonzero cross terms catch
+    // row/column swaps and off-diagonal sign errors that an axis-aligned map
+    // cannot distinguish.
     mfem::Mesh affine = mfem::Mesh::MakeCartesian2D(
-      1, 1, mfem::Element::QUADRILATERAL, true, 1.3, 0.7);
+      1, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+    affine.Transform([](const mfem::Vector& reference, mfem::Vector& physical)
+    {
+      physical.SetSize(2);
+      physical(0) = 1.2 * reference(0) + 0.35 * reference(1);
+      physical(1) = -0.2 * reference(0) + 0.9 * reference(1);
+    });
     mfem::DG_FECollection affine_fec(
       order, dim, mfem::BasisType::GaussLobatto);
     mfem::FiniteElementSpace affine_fes(&affine, &affine_fec);
@@ -177,6 +188,10 @@ inline MetricOracleEvidence RunP1P4MetricOracles(TestContext& ctx)
               exact_adjugate(reference, physical)));
         }
       }
+      evidence.affine_cross_term_max[order_index] = std::max(
+        evidence.affine_cross_term_max[order_index],
+        std::max(std::abs(exact_adjugate(0, 1)),
+                 std::abs(exact_adjugate(1, 0))));
     }
     mfem::Vector nodal_normal(dim);
     mfem::Vector exact_normal(dim);
@@ -236,7 +251,7 @@ inline MetricOracleEvidence RunP1P4MetricOracles(TestContext& ctx)
       {
         for (int physical = 0; physical < dim; ++physical)
         {
-          double divergence = 0.0;
+          mfem::real_t divergence = 0.0;
           for (int m = 0; m < basis.n; ++m)
           {
             const int xi_local =
@@ -262,8 +277,13 @@ inline MetricOracleEvidence RunP1P4MetricOracles(TestContext& ctx)
       GlobalMax(evidence.affine_adjugate_max_error[order_index]);
     evidence.affine_face_normal_max_error[order_index] =
       GlobalMax(evidence.affine_face_normal_max_error[order_index]);
+    evidence.affine_cross_term_max[order_index] =
+      GlobalMax(evidence.affine_cross_term_max[order_index]);
     evidence.curved_metric_identity_max_error[order_index] =
       GlobalMax(evidence.curved_metric_identity_max_error[order_index]);
+    ctx.Check(evidence.affine_cross_term_max[order_index] > 0.1,
+              "DGSEM sheared affine oracle has nonzero cross terms p=" +
+                std::to_string(order));
     ctx.Check(evidence.affine_adjugate_max_error[order_index] <
                 fixture_tolerance,
               "DGSEM affine adjugate equivalence p=" +

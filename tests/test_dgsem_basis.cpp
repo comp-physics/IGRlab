@@ -37,6 +37,20 @@ int RunDGSEMBasisTests(TestContext& ctx)
 {
   const double tol = mfem::dgsem::DGSEMReferenceTolerances::lgl;
   const int orders[] = {1, 2, 3, 4};
+  constexpr double frozen_base_lgl_and_lex = 1.0e-12;
+  constexpr double frozen_base_sbp_and_dsplit = 1.0e-10;
+  static_assert(mfem::dgsem::DGSEMReferenceTolerances::lgl ==
+                  frozen_base_lgl_and_lex,
+                "DGSEM LGL/lex gate must equal the frozen base.");
+  ctx.Check(tol == frozen_base_lgl_and_lex,
+            "DGSEM LGL/lex tolerance equals frozen-base 1e-12");
+  ctx.Check(mfem::dgsem::DGSEMReferenceTolerances::sbp <=
+              frozen_base_sbp_and_dsplit,
+            "DGSEM SBP/Dsplit tolerance is no weaker than frozen base");
+  const bool preexisting_tolerances_relaxed =
+    tol > frozen_base_lgl_and_lex ||
+    mfem::dgsem::DGSEMReferenceTolerances::sbp >
+      frozen_base_sbp_and_dsplit;
 
   for (int order : orders)
   {
@@ -289,6 +303,30 @@ int RunDGSEMBasisTests(TestContext& ctx)
     out << "  ]\n}\n";
     ctx.Check(!ec && out.good(),
               "DGSEM machine-readable consumer inventory written");
+
+    std::ofstream tolerance_out(
+      std::filesystem::path(output_dir) / "tolerance_audit.json");
+    tolerance_out
+      << "{\n"
+      << "  \"schema\": \"dgsem-base-child-tolerance-audit-v1\",\n"
+      << "  \"frozen_base\": {\"lgl_and_lex\": 1e-12, "
+         "\"sbp_and_dsplit\": 1e-10},\n"
+      << "  \"child\": {\"lgl_and_lex\": " << tol
+      << ", \"sbp_and_dsplit\": "
+      << mfem::dgsem::DGSEMReferenceTolerances::sbp << "},\n"
+      << "  \"preexisting_tolerances_relaxed\": "
+      << (preexisting_tolerances_relaxed ? "true" : "false") << ",\n"
+      << "  \"metric_real_t_bytes\": " << sizeof(mfem::real_t) << ",\n"
+      << "  \"double_pointwise_gate\": "
+      << mfem::dgsem::DGSEMReferenceTolerances::pointwise_fixture << ",\n"
+      << "  \"precision_aware_pointwise_gate\": "
+      << mfem::dgsem::PrecisionAwareMetricTolerance(
+           mfem::dgsem::DGSEMReferenceTolerances::pointwise_fixture)
+      << ",\n"
+      << "  \"mandatory_assertions_executed\": true\n"
+      << "}\n";
+    ctx.Check(!ec && tolerance_out.good(),
+              "DGSEM machine-readable tolerance audit written");
   }
 
   return ctx.failures;

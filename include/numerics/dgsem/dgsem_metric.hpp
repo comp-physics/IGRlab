@@ -11,8 +11,10 @@
 
 #include "mfem.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace mfem
@@ -27,9 +29,9 @@ namespace dgsem
  */
 struct ContravariantMetric2D
 {
-  std::array<double, 4> data{{0.0, 0.0, 0.0, 0.0}};
+  std::array<real_t, 4> data{{0.0, 0.0, 0.0, 0.0}};
 
-  double operator()(int reference, int physical) const
+  real_t operator()(int reference, int physical) const
   {
     return data[static_cast<std::size_t>(2 * reference + physical)];
   }
@@ -69,7 +71,7 @@ inline void BuildContravariantMetrics2D(
     lex_to_local[static_cast<std::size_t>(i + n1d * j)] = local;
   }
 
-  std::vector<std::array<double, 2>> coordinates(
+  std::vector<std::array<real_t, 2>> coordinates(
     static_cast<std::size_t>(dof));
   Vector physical(2);
   const IntegrationRule& nodes = fe.GetNodes();
@@ -86,10 +88,10 @@ inline void BuildContravariantMetrics2D(
   {
     for (int i = 0; i < n1d; ++i)
     {
-      double dx_dxi = 0.0;
-      double dy_dxi = 0.0;
-      double dx_deta = 0.0;
-      double dy_deta = 0.0;
+      real_t dx_dxi = 0.0;
+      real_t dy_dxi = 0.0;
+      real_t dx_deta = 0.0;
+      real_t dy_deta = 0.0;
       for (int m = 0; m < n1d; ++m)
       {
         const int local_xi =
@@ -137,12 +139,14 @@ inline void BuildNodalFaceNormal2D(
   MFEM_VERIFY(normal.Size() == 2,
               "BuildNodalFaceNormal2D requires a two-entry normal.");
   const int direction = ReferenceFaceDirection2D(reference_tangent);
-  const double coordinate =
+  const real_t coordinate =
     direction == 0 ? element_point.x : element_point.y;
-  MFEM_VERIFY(std::abs(coordinate) < 1.0e-10 ||
-                std::abs(coordinate - 1.0) < 1.0e-10,
+  const real_t endpoint_tolerance = std::max(
+    real_t(1.0e-10), real_t(32) * std::numeric_limits<real_t>::epsilon());
+  MFEM_VERIFY(std::abs(coordinate) < endpoint_tolerance ||
+                std::abs(coordinate - real_t(1.0)) < endpoint_tolerance,
               "DGSEM face point is not on a reference endpoint.");
-  const double sign = coordinate < 0.5 ? -1.0 : 1.0;
+  const real_t sign = coordinate < real_t(0.5) ? real_t(-1.0) : real_t(1.0);
   for (int physical = 0; physical < 2; ++physical)
   {
     normal(physical) = sign * metric(direction, physical);

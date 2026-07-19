@@ -11,8 +11,12 @@
  * used by the registered DGSEM tests and their machine-readable evidence.
  */
 
+#include "mfem.hpp"
+
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <limits>
 
 namespace mfem
 {
@@ -134,7 +138,7 @@ struct DGSEMConvergenceContract
 
 struct DGSEMReferenceTolerances
 {
-  inline static constexpr double lgl = 2.0e-12;
+  inline static constexpr double lgl = 1.0e-12;
   inline static constexpr double sbp = 2.0e-11;
   inline static constexpr double pointwise_fixture = 2.0e-12;
   inline static constexpr double constant_affine = 2.0e-10;
@@ -144,6 +148,19 @@ struct DGSEMReferenceTolerances
   inline static constexpr double inverse_mass = 2.0e-12;
   inline static constexpr double mpi_parity = 1.0e-9;
 };
+
+/** Preserve frozen double gates while permitting a narrower mfem::real_t.
+ *
+ * The epsilon floor changes no supported double-precision threshold because
+ * every frozen metric tolerance is larger. It is active only when real_t has
+ * less precision than double.
+ */
+inline constexpr real_t PrecisionAwareMetricTolerance(
+  double frozen_double_tolerance)
+{
+  return std::max(static_cast<real_t>(frozen_double_tolerance),
+                  real_t(256) * std::numeric_limits<real_t>::epsilon());
+}
 
 inline constexpr std::size_t kDGSEMAttributionSamples = 9;
 

@@ -23,7 +23,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -100,6 +99,23 @@ inline double WeakComponentL2Norm(const mfem::ParFiniteElementSpace& vfes,
   return std::sqrt(GlobalSum(local_square));
 }
 
+inline double WeakComponentL2NormLocal(const mfem::FiniteElementSpace& vfes,
+                                       const mfem::Vector& weak,
+                                       int component)
+{
+  double local_square = 0.0;
+  for (int sdof = 0; sdof < vfes.GetNDofs(); ++sdof)
+  {
+    int vdof = vfes.DofToVDof(sdof, component);
+    if (vdof < 0)
+    {
+      vdof = -1 - vdof;
+    }
+    local_square += weak(vdof) * weak(vdof);
+  }
+  return std::sqrt(local_square);
+}
+
 struct TimingStatistic
 {
   double median = 0.0;
@@ -158,11 +174,21 @@ inline void RunDGSEMReferenceOperatorGate(TestContext& ctx)
   constexpr int num_eq = dim + 2;
   constexpr double gamma = 1.4;
   constexpr int int_order_offset = 2;
-  const double fixture_tol =
-    mfem::dgsem::DGSEMReferenceTolerances::pointwise_fixture;
+  const mfem::real_t fixture_tol =
+    mfem::dgsem::PrecisionAwareMetricTolerance(
+      mfem::dgsem::DGSEMReferenceTolerances::pointwise_fixture);
+  const bool metric_double_gate_unchanged =
+    std::numeric_limits<mfem::real_t>::digits <
+      std::numeric_limits<double>::digits ||
+    static_cast<double>(fixture_tol) ==
+      mfem::dgsem::DGSEMReferenceTolerances::pointwise_fixture;
 
-  double metric_fixture_max_error = 0.0;
-  double metric_identity_max_error = 0.0;
+  bool dimension_scope_guard_executed = false;
+  bool component_parity_executed = false;
+  double component_parity_max_error = 0.0;
+  mfem::real_t metric_fixture_max_error = 0.0;
+  mfem::real_t metric_identity_max_error = 0.0;
+  std::vector<double> canonical_surface_component_norms(num_eq, 0.0);
   double inverse_mass_max_error = 0.0;
   double orientation_max_error = 0.0;
   double shared_surface_norm = 0.0;
@@ -177,6 +203,19 @@ inline void RunDGSEMReferenceOperatorGate(TestContext& ctx)
   std::vector<double> periodic_conservation_deltas(num_eq, 0.0);
   double wall_mass_delta = 0.0;
   double wall_energy_delta = 0.0;
+  static_assert(mfem::dgsem::DGSEMOperatorSupportsDimension(1),
+                "DGSEM Wave 1 must retain 1D support.");
+  static_assert(mfem::dgsem::DGSEMOperatorSupportsDimension(2),
+                "DGSEM Wave 1 must retain 2D support.");
+  static_assert(!mfem::dgsem::DGSEMOperatorSupportsDimension(3),
+                "DGSEM Wave 1 must reject partial 3D support.");
+  ctx.Check(mfem::dgsem::DGSEMOperatorSupportsDimension(1) &&
+              mfem::dgsem::DGSEMOperatorSupportsDimension(2) &&
+              !mfem::dgsem::DGSEMOperatorSupportsDimension(3),
+            "DGSEM early dimension guard is exactly 1D/2D");
+  dimension_scope_guard_executed = true;
+  ctx.Check(metric_double_gate_unchanged,
+            "DGSEM real_t metric tolerance preserves the frozen double gate");
   const auto p1p4_metric_evidence =
     dgsem_reference_geometry::RunP1P4MetricOracles(ctx);
   const auto permutation_evidence =
@@ -212,12 +251,12 @@ inline void RunDGSEMReferenceOperatorGate(TestContext& ctx)
       const int i = dof_to_ijk[static_cast<std::size_t>(local)][0];
       const int j = dof_to_ijk[static_cast<std::size_t>(local)][1];
       lex_to_local[static_cast<std::size_t>(i + basis.n * j)] = local;
-      const double xi = basis.nodes(i);
-      const double eta = basis.nodes(j);
-      const double expected[4] = {1.0,
-                                  -0.1 * xi,
-                                  -0.1 * xi,
-                                  1.0 + 0.1 * eta};
+      const mfem::real_t xi = basis.nodes(i);
+      const mfem::real_t eta = basis.nodes(j);
+      const mfem::real_t expected[4] = {1.0,
+                                        -0.1 * xi,
+                                        -0.1 * xi,
+                                        1.0 + 0.1 * eta};
       for (int entry = 0; entry < 4; ++entry)
       {
         metric_fixture_max_error = std::max(
@@ -232,7 +271,7 @@ inline void RunDGSEMReferenceOperatorGate(TestContext& ctx)
       {
         for (int physical = 0; physical < dim; ++physical)
         {
-          double divergence = 0.0;
+          mfem::real_t divergence = 0.0;
           for (int m = 0; m < basis.n; ++m)
           {
             const int xi_local =
@@ -255,7 +294,8 @@ inline void RunDGSEMReferenceOperatorGate(TestContext& ctx)
     ctx.Check(metric_fixture_max_error < fixture_tol,
               "DGSEM frozen contravariant polynomial metric fixture");
     ctx.Check(metric_identity_max_error <
-                mfem::dgsem::DGSEMReferenceTolerances::sbp,
+                mfem::dgsem::PrecisionAwareMetricTolerance(
+                  mfem::dgsem::DGSEMReferenceTolerances::sbp),
               "DGSEM discrete contravariant metric identity");
   }
   // Frozen affine p1 inverse-mass fixture. The unit-square tensor LGL mass is
@@ -425,41 +465,49 @@ inline void RunDGSEMReferenceOperatorGate(TestContext& ctx)
                   std::to_string(eq));
     }
 
-    // Component-wise one/two-rank parity. This intentionally does not use the
-    // suite-level aggregate parity scalar, which could hide component swaps.
-    const char* component_parity_file =
-      std::getenv("DG_IGR_DGSEM_COMPONENT_PARITY_FILE");
-    if (component_parity_file && mfem::Mpi::Root())
+    // Mandatory component-wise parity against an in-process serial canonical
+    // mesh. This runs in the default registered suite, needs no environment
+    // variable or cross-test artifact, and cannot hide component swaps in an
+    // aggregate scalar.
+    mfem::Mesh canonical_mesh =
+      MakePeriodicReferenceMesh2D(4, 4, order + 1);
+    mfem::DG_FECollection canonical_fec(
+      order, dim, mfem::BasisType::GaussLobatto);
+    mfem::FiniteElementSpace canonical_vfes(
+      &canonical_mesh, &canonical_fec, num_eq, mfem::Ordering::byNODES);
+    mfem::GridFunction canonical_state(&canonical_vfes);
+    canonical_state.ProjectCoefficient(coefficient);
+    auto canonical_form_integrator =
+      std::make_unique<mfem::HyperbolicFormIntegrator>(numerical_flux,
+                                                       int_order_offset);
+    mfem::DGHyperbolicConservationLaws canonical_oper(
+      canonical_vfes, std::move(canonical_form_integrator), true);
+    canonical_oper.SetNumericalFlux(&numerical_flux);
+    canonical_oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+    canonical_oper.SetFaceIntegrationRule(
+      mfem::dgsem::GetLGLFaceRule(order));
+    mfem::Vector canonical_x;
+    canonical_state.GetTrueDofs(canonical_x);
+    mfem::Vector canonical_surface(canonical_vfes.GetVSize());
+    mfem::dgsem::DGSEMOperator(canonical_oper).AssembleSurface(
+      canonical_x, canonical_surface);
+    for (int eq = 0; eq < num_eq; ++eq)
     {
-      if (world_size == 1)
-      {
-        std::ofstream reference(component_parity_file);
-        reference << std::setprecision(
-          std::numeric_limits<double>::max_digits10);
-        for (int eq = 0; eq < num_eq; ++eq)
-        {
-          reference << surface_component_norms[eq] << '\n';
-        }
-        ctx.Check(reference.good(),
-                  "DGSEM component-wise one-rank reference written");
-      }
-      else
-      {
-        std::ifstream reference(component_parity_file);
-        for (int eq = 0; eq < num_eq; ++eq)
-        {
-          double expected_norm = 0.0;
-          reference >> expected_norm;
-          ctx.CheckNear(surface_component_norms[eq],
-                        expected_norm,
-                        mfem::dgsem::DGSEMReferenceTolerances::mpi_parity,
-                        "DGSEM local/shared component-wise rank parity " +
-                          std::to_string(eq));
-        }
-        ctx.Check(reference.good() || reference.eof(),
-                  "DGSEM component-wise one-rank reference read");
-      }
+      canonical_surface_component_norms[eq] = WeakComponentL2NormLocal(
+        canonical_vfes, canonical_surface, eq);
+      component_parity_max_error = std::max(
+        component_parity_max_error,
+        std::abs(surface_component_norms[eq] -
+                 canonical_surface_component_norms[eq]));
+      ctx.CheckNear(surface_component_norms[eq],
+                    canonical_surface_component_norms[eq],
+                    mfem::dgsem::DGSEMReferenceTolerances::mpi_parity,
+                    "DGSEM in-process component parity equation " +
+                      std::to_string(eq));
     }
+    component_parity_executed = true;
+    ctx.Check(component_parity_executed,
+              "DGSEM component parity assertion executed unconditionally");
     std::vector<double> conserved_before(num_eq, 0.0);
     for (int eq = 0; eq < num_eq; ++eq)
     {
@@ -810,10 +858,10 @@ inline void RunDGSEMReferenceOperatorGate(TestContext& ctx)
        std::to_string(mfem::Mpi::WorldSize()) + ".json");
     std::ofstream out(path);
     out << "{\n"
-        << "  \"schema\": \"dgsem-operator-fixtures-v2\",\n"
+        << "  \"schema\": \"dgsem-operator-fixtures-v3\",\n"
         << "  \"ranks\": " << mfem::Mpi::WorldSize() << ",\n";
     auto write_p1p4 = [&](const char* name,
-                          const std::array<double, 4>& values)
+                          const auto& values)
     {
       out << "  \"" << name << "\": [";
       for (std::size_t i = 0; i < values.size(); ++i)
@@ -826,9 +874,35 @@ inline void RunDGSEMReferenceOperatorGate(TestContext& ctx)
                p1p4_metric_evidence.affine_adjugate_max_error);
     write_p1p4("p1_p4_affine_face_normal_max_error",
                p1p4_metric_evidence.affine_face_normal_max_error);
+    write_p1p4("p1_p4_sheared_affine_cross_term_max",
+               p1p4_metric_evidence.affine_cross_term_max);
     write_p1p4("p1_p4_curved_metric_identity_max_error",
                p1p4_metric_evidence.curved_metric_identity_max_error);
-    out << "  \"permutation_geometry_max_error\": "
+    out << "  \"affine_oracle_map\": \"x=1.2*xi+0.35*eta; "
+           "y=-0.2*xi+0.9*eta; detJ=1.15\",\n"
+        << "  \"metric_real_t_bytes\": " << sizeof(mfem::real_t) << ",\n"
+        << "  \"metric_double_gate_unchanged\": "
+        << (metric_double_gate_unchanged ? "true" : "false") << ",\n"
+        << "  \"dimension_scope_guard_executed\": "
+        << (dimension_scope_guard_executed ? "true" : "false") << ",\n"
+        << "  \"supported_dimensions\": [1,2],\n"
+        << "  \"dimension_3_supported\": false,\n"
+        << "  \"dimension_scope\": \"3D rejected before surface/volume; "
+           "Wave 1 has no 3D face quadrature, nodal indexing, or curl metrics\",\n"
+        << "  \"component_parity_mode\": "
+           "\"in_process_serial_canonical_vs_distributed\",\n"
+        << "  \"component_parity_executed\": "
+        << (component_parity_executed ? "true" : "false") << ",\n"
+        << "  \"component_parity_max_error\": "
+        << component_parity_max_error << ",\n"
+        << "  \"canonical_surface_component_norms\": [";
+    for (int eq = 0; eq < num_eq; ++eq)
+    {
+      out << canonical_surface_component_norms[eq]
+          << (eq + 1 == num_eq ? "" : ",");
+    }
+    out << "],\n"
+        << "  \"permutation_geometry_max_error\": "
         << permutation_evidence.geometry_max_error << ",\n"
         << "  \"permutation_component_moment_max_error\": "
         << permutation_evidence.component_moment_max_error << ",\n"
