@@ -864,3 +864,5 @@ add_example_regression(dg_igr_regression_sedov
 #   tests/meshes/double_mach_ref_regression.mesh
 #   REG_TF 1.0e-6 REG_DT 1.0e-6
 #   -no-vtk -dt_save 1.0)
+
+add_subdirectory(hdg)
