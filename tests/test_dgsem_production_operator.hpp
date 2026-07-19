@@ -14,12 +14,14 @@
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
+#include <type_traits>
 
 namespace dg_igr_tests
 {
@@ -30,6 +32,48 @@ inline int AbsoluteDof(int vdof)
 {
   return vdof >= 0 ? vdof : -1 - vdof;
 }
+
+class ScopedEnvironment
+{
+public:
+  ScopedEnvironment(const char* name, const char* value)
+    : name_(name)
+  {
+    if (const char* previous = std::getenv(name))
+    {
+      had_value_ = true;
+      previous_ = previous;
+    }
+    if (value)
+    {
+      setenv(name, value, 1);
+    }
+    else
+    {
+      unsetenv(name);
+    }
+  }
+
+  ~ScopedEnvironment()
+  {
+    if (had_value_)
+    {
+      setenv(name_.c_str(), previous_.c_str(), 1);
+    }
+    else
+    {
+      unsetenv(name_.c_str());
+    }
+  }
+
+  ScopedEnvironment(const ScopedEnvironment&) = delete;
+  ScopedEnvironment& operator=(const ScopedEnvironment&) = delete;
+
+private:
+  std::string name_;
+  std::string previous_;
+  bool had_value_ = false;
+};
 
 inline bool IsSentinel(const mfem::Vector& values, double sentinel)
 {
@@ -844,6 +888,68 @@ inline void CheckCollectiveRejectionSemantics(TestContext& ctx,
 #endif
 }
 
+inline void RunDGSEMProductionMultStrictRejectionProbe(TestContext& ctx)
+{
+  if (!std::getenv("DG_IGR_DGSEM_MULT_STRICT_REJECTION_PROBE"))
+  {
+    return;
+  }
+  ctx.Check(mfem::Mpi::WorldSize() == 1,
+            "DGSEM production Mult strict probe requires one rank");
+  if (mfem::Mpi::WorldSize() != 1)
+  {
+    return;
+  }
+
+  constexpr int dimension = 1;
+  constexpr int equations = dimension + 2;
+  constexpr double gamma = 1.4;
+  mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian1D(2, 1.0);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh);
+  mfem::DG_FECollection fec(
+    1, dimension, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace vfes(
+    &mesh, &fec, equations, mfem::Ordering::byNODES);
+  mfem::EulerFlux euler(dimension, gamma);
+  mfem::RusanovFluxWithSides numerical_flux(euler);
+  auto form = std::make_unique<mfem::HyperbolicFormIntegrator>(
+    numerical_flux, 2);
+  mfem::DGHyperbolicConservationLaws oper(
+    vfes, std::move(form), true);
+  oper.SetNumericalFlux(&numerical_flux);
+  oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+  oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Chandrashekar);
+  oper.SetDGSEMVolumeDissipation(
+    mfem::DGSEMVolumeDissipation::None);
+  oper.SetDGSEMStabilization(mfem::DGSEMStabilization::None);
+  oper.SetDGSEMGamma(gamma);
+  mfem::Array<int> marker(mesh.bdr_attributes.Max());
+  if (marker.Size() > 0)
+  {
+    marker = 1;
+    oper.AddBdrFaceIntegrator(
+      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+        numerical_flux,
+        std::make_unique<mfem::SlipWallState>(dimension),
+        2),
+      marker);
+  }
+
+  mfem::ParGridFunction state(&vfes);
+  FillConstantState(
+    EulerConsFromPrim1D(1.0, 0.1, 1.0, gamma), state);
+  mfem::Vector state_true;
+  state.GetTrueDofs(state_true);
+  mfem::Vector output(vfes.GetTrueVSize());
+  output = 6421.0;
+  std::cout << "[DGSEM_MULT_STRICT_PROBE] reason="
+            << "unsupported-volume-flux output_sentinel_before="
+            << (IsSentinel(output, 6421.0) ? 1 : 0) << '\n';
+  ScopedEnvironment strict("DG_IGR_DGSEM_PRODUCTION_STRICT", "1");
+  oper.Mult(state_true, output);
+  MFEM_ABORT("DGSEM production Mult strict rejection probe unexpectedly returned.");
+}
+
 inline void RunDGSEMProductionSplitCommunicatorTests(TestContext& ctx)
 {
 #ifdef MFEM_USE_MPI
@@ -876,6 +982,9 @@ inline void RunDGSEMProductionSplitCommunicatorTests(TestContext& ctx)
   double expected_cfl = 0.0;
   double actual_cfl = 0.0;
   bool cfl_ok = false;
+  double expected_fallback_cfl = 0.0;
+  double actual_fallback_cfl = 0.0;
+  bool fallback_cfl_ok = false;
   {
     constexpr double gamma = 1.4;
     mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
@@ -1024,7 +1133,46 @@ inline void RunDGSEMProductionSplitCommunicatorTests(TestContext& ctx)
     output = -8300.0 - group;
     const auto result = production.AssembleProductionResidual(
       input, output, true);
-    actual_cfl = result.max_characteristic_speed;
+    const double direct_cfl = result.max_characteristic_speed;
+    mfem::Vector host_local(vfes.GetVSize());
+    host.ApplyInverseMass(host_weak, host_local);
+    mfem::Vector host_true(vfes.GetTrueVSize());
+    if (const mfem::Operator* prolongation = vfes.GetProlongationMatrix())
+    {
+      host_true = 0.0;
+      prolongation->MultTranspose(host_local, host_true);
+    }
+    else
+    {
+      host_true = host_local;
+    }
+    mfem::Vector input_true;
+    state.GetTrueDofs(input_true);
+    mfem::Vector mult_true(vfes.GetTrueVSize());
+    mult_true = -8400.0 - group;
+    ScopedEnvironment split_strict(
+      "DG_IGR_DGSEM_PRODUCTION_STRICT", "1");
+    oper.Mult(input_true, mult_true);
+    mfem::Vector mult_difference(mult_true);
+    mult_difference -= host_true;
+    const auto mult_selection = oper.GetDGSEMProductionSelection();
+    const auto mult_bridge = oper.GetDGSEMProductionBridgeEvidence();
+    const double local_mult_norm_squared =
+      mult_difference * mult_difference;
+    double group_mult_norm_squared = local_mult_norm_squared;
+    MPI_Allreduce(&local_mult_norm_squared,
+                  &group_mult_norm_squared,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_SUM,
+                  communicator);
+    const bool mult_ok = mult_selection.supported &&
+                         mult_selection.strict &&
+                         mult_selection.ranks == 2 &&
+                         mult_bridge.production_mult_calls == 1 &&
+                         mult_bridge.operator_constructions == 1 &&
+                         std::sqrt(group_mult_norm_squared) < 2.0e-10;
+    actual_cfl = oper.GetMaxCharSpeed();
     double minimum_actual = actual_cfl;
     double maximum_actual = actual_cfl;
     MPI_Allreduce(&actual_cfl,
@@ -1040,9 +1188,83 @@ inline void RunDGSEMProductionSplitCommunicatorTests(TestContext& ctx)
                   MPI_MAX,
                   communicator);
     cfl_ok = selection.supported && selection.ranks == 2 &&
-             result.executed &&
+             result.executed && mult_ok &&
+             std::abs(direct_cfl - expected_cfl) < 5.0e-13 &&
              std::abs(actual_cfl - expected_cfl) < 5.0e-13 &&
              std::abs(maximum_actual - minimum_actual) < 5.0e-13;
+    {
+      ScopedEnvironment split_fallback(
+        "DG_IGR_DGSEM_PRODUCTION_STRICT", nullptr);
+      oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Chandrashekar);
+      mfem::Vector fallback_weak(vfes.GetVSize());
+      const double fallback_surface_speed =
+        host.AssembleSurface(input, fallback_weak);
+      const double fallback_volume_speed =
+        host.AssembleVolume(input, fallback_weak);
+      const double local_fallback_cfl =
+        std::max(fallback_surface_speed, fallback_volume_speed);
+      MPI_Allreduce(&local_fallback_cfl,
+                    &expected_fallback_cfl,
+                    1,
+                    MPI_DOUBLE,
+                    MPI_MAX,
+                    communicator);
+      mfem::Vector fallback_host_local(vfes.GetVSize());
+      host.ApplyInverseMass(fallback_weak, fallback_host_local);
+      mfem::Vector fallback_host_true(vfes.GetTrueVSize());
+      if (const mfem::Operator* prolongation =
+            vfes.GetProlongationMatrix())
+      {
+        fallback_host_true = 0.0;
+        prolongation->MultTranspose(
+          fallback_host_local, fallback_host_true);
+      }
+      else
+      {
+        fallback_host_true = fallback_host_local;
+      }
+      mfem::Vector fallback_true(vfes.GetTrueVSize());
+      fallback_true = -8500.0 - group;
+      oper.Mult(input_true, fallback_true);
+      actual_fallback_cfl = oper.GetMaxCharSpeed();
+      mfem::Vector fallback_difference(fallback_true);
+      fallback_difference -= fallback_host_true;
+      const double local_fallback_norm_squared =
+        fallback_difference * fallback_difference;
+      double group_fallback_norm_squared = local_fallback_norm_squared;
+      MPI_Allreduce(&local_fallback_norm_squared,
+                    &group_fallback_norm_squared,
+                    1,
+                    MPI_DOUBLE,
+                    MPI_SUM,
+                    communicator);
+      double fallback_minimum = actual_fallback_cfl;
+      double fallback_maximum = actual_fallback_cfl;
+      MPI_Allreduce(&actual_fallback_cfl,
+                    &fallback_minimum,
+                    1,
+                    MPI_DOUBLE,
+                    MPI_MIN,
+                    communicator);
+      MPI_Allreduce(&actual_fallback_cfl,
+                    &fallback_maximum,
+                    1,
+                    MPI_DOUBLE,
+                    MPI_MAX,
+                    communicator);
+      const auto fallback_selection =
+        oper.GetDGSEMProductionSelection();
+      fallback_cfl_ok = !fallback_selection.supported &&
+                        !fallback_selection.strict &&
+                        fallback_selection.reason ==
+                          DGSEMProductionReason::UnsupportedVolumeFlux &&
+                        std::sqrt(group_fallback_norm_squared) < 2.0e-10 &&
+                        std::abs(actual_fallback_cfl -
+                                 expected_fallback_cfl) < 5.0e-13 &&
+                        std::abs(fallback_maximum - fallback_minimum) <
+                          5.0e-13;
+      oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
+    }
   }
 
   MPI_Comm_free(&communicator);
@@ -1063,6 +1285,16 @@ inline void RunDGSEMProductionSplitCommunicatorTests(TestContext& ctx)
                 2,
                 MPI_DOUBLE,
                 cfl_records,
+                2,
+                MPI_DOUBLE,
+                MPI_COMM_WORLD);
+  double local_fallback_cfl_record[2] = {
+    expected_fallback_cfl, actual_fallback_cfl};
+  double fallback_cfl_records[8] = {};
+  MPI_Allgather(local_fallback_cfl_record,
+                2,
+                MPI_DOUBLE,
+                fallback_cfl_records,
                 2,
                 MPI_DOUBLE,
                 MPI_COMM_WORLD);
@@ -1094,6 +1326,21 @@ inline void RunDGSEMProductionSplitCommunicatorTests(TestContext& ctx)
     exact_cfl && std::abs(cfl_records[0] - cfl_records[4]) > 1.0e-3;
   ctx.Check(exact_cfl,
             "DGSEM split groups reduce only their own distinct CFL maximum");
+  bool exact_fallback_cfl = fallback_cfl_ok;
+  for (int rank = 0; rank < 4; ++rank)
+  {
+    exact_fallback_cfl =
+      exact_fallback_cfl &&
+      std::abs(fallback_cfl_records[2 * rank] -
+               fallback_cfl_records[2 * (rank / 2) * 2]) < 5.0e-13 &&
+      std::abs(fallback_cfl_records[2 * rank + 1] -
+               fallback_cfl_records[2 * rank]) < 5.0e-13;
+  }
+  exact_fallback_cfl =
+    exact_fallback_cfl &&
+    std::abs(fallback_cfl_records[0] - fallback_cfl_records[4]) > 1.0e-3;
+  ctx.Check(exact_fallback_cfl,
+            "DGSEM split ordinary fallback reduces CFL only on owning communicator");
   if (world_rank == 0)
   {
     for (int rank = 0; rank < 4; ++rank)
@@ -1112,15 +1359,133 @@ inline void RunDGSEMProductionSplitCommunicatorTests(TestContext& ctx)
       << " actual=" << FormatSci(cfl_records[1]) << "\n"
       << "[DGSEM_SPLIT_CFL] group=1 expected="
       << FormatSci(cfl_records[4])
-      << " actual=" << FormatSci(cfl_records[5]) << "\n";
+      << " actual=" << FormatSci(cfl_records[5]) << "\n"
+      << "[DGSEM_SPLIT_FALLBACK_CFL] group=0 expected="
+      << FormatSci(fallback_cfl_records[0])
+      << " actual=" << FormatSci(fallback_cfl_records[1]) << "\n"
+      << "[DGSEM_SPLIT_FALLBACK_CFL] group=1 expected="
+      << FormatSci(fallback_cfl_records[4])
+      << " actual=" << FormatSci(fallback_cfl_records[5]) << "\n";
   }
 #else
   (void)ctx;
 #endif
 }
 
+inline void CheckDGSEMProductionMultSerialIdentityAndMove(TestContext& ctx)
+{
+  if (mfem::Mpi::WorldSize() != 1)
+  {
+    return;
+  }
+  static_assert(
+    std::is_move_constructible<mfem::DGHyperbolicConservationLaws>::value,
+    "DG production operator must remain move constructible");
+  static_assert(
+    !std::is_move_assignable<mfem::DGHyperbolicConservationLaws>::value,
+    "DG production operator cannot safely move-assign its FE-space reference");
+
+  constexpr int dimension = 1;
+  constexpr int equations = dimension + 2;
+  constexpr double gamma = 1.4;
+  mfem::Mesh mesh = mfem::Mesh::MakeCartesian1D(2, 1.0);
+  mfem::DG_FECollection fec(
+    2, dimension, mfem::BasisType::GaussLobatto);
+  mfem::FiniteElementSpace vfes(
+    &mesh, &fec, equations, mfem::Ordering::byNODES);
+  mfem::EulerFlux euler(dimension, gamma);
+  mfem::RusanovFluxWithSides numerical_flux(euler);
+  auto form = std::make_unique<mfem::HyperbolicFormIntegrator>(
+    numerical_flux, 2);
+  mfem::DGHyperbolicConservationLaws oper(
+    vfes, std::move(form), true);
+  oper.SetNumericalFlux(&numerical_flux);
+  oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+  oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
+  oper.SetDGSEMVolumeDissipation(
+    mfem::DGSEMVolumeDissipation::None);
+  oper.SetDGSEMStabilization(mfem::DGSEMStabilization::None);
+  oper.SetDGSEMGamma(gamma);
+  mfem::Array<int> marker(mesh.bdr_attributes.Max());
+  if (marker.Size() > 0)
+  {
+    marker = 1;
+    oper.AddBdrFaceIntegrator(
+      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+        numerical_flux,
+        std::make_unique<mfem::SlipWallState>(dimension),
+        2),
+      marker);
+  }
+
+  mfem::GridFunction state(&vfes);
+  auto state_function = [=](const mfem::Vector& point,
+                            mfem::Vector& value)
+  {
+    value = EulerConsFromPrim1D(
+      1.0 + 0.02 * point(0),
+      0.12 + 0.01 * point(0),
+      1.0 + 0.03 * point(0),
+      gamma);
+  };
+  mfem::VectorFunctionCoefficient coefficient(equations, state_function);
+  state.ProjectCoefficient(coefficient);
+  mfem::Vector input(state);
+
+  mfem::dgsem::DGSEMOperator host(oper);
+  mfem::Vector weak(vfes.GetVSize());
+  const double face_speed = host.AssembleSurface(input, weak);
+  const double volume_speed = host.AssembleVolume(input, weak);
+  mfem::Vector expected(vfes.GetVSize());
+  host.ApplyInverseMass(weak, expected);
+  const double expected_speed = std::max(face_speed, volume_speed);
+
+  mfem::Vector output(vfes.GetTrueVSize());
+  output = -7100.0;
+  oper.Mult(input, output);
+  mfem::Vector difference(output);
+  difference -= expected;
+  const auto selection = oper.GetDGSEMProductionSelection();
+  const auto bridge = oper.GetDGSEMProductionBridgeEvidence();
+  ctx.Check(selection.supported && selection.strict &&
+              selection.reason ==
+                mfem::dgsem::DGSEMProductionReason::None &&
+              difference.Norml2() < 2.0e-10 &&
+              std::abs(oper.GetMaxCharSpeed() - expected_speed) < 5.0e-13 &&
+              bridge.operator_ready && bridge.x_local_size == 0 &&
+              bridge.z_local_size == 0 &&
+              bridge.y_local_size == vfes.GetVSize() &&
+              bridge.operator_constructions == 1 &&
+              bridge.operator_rebinds == 0 &&
+              bridge.production_mult_calls == 1,
+            "DGSEM production Mult preserves serial identity-vector semantics");
+
+  mfem::DGHyperbolicConservationLaws moved(std::move(oper));
+  mfem::Vector moved_output(vfes.GetTrueVSize());
+  moved_output = -7200.0;
+  moved.Mult(input, moved_output);
+  mfem::Vector moved_difference(moved_output);
+  moved_difference -= expected;
+  const auto moved_selection = moved.GetDGSEMProductionSelection();
+  const auto moved_bridge = moved.GetDGSEMProductionBridgeEvidence();
+  const auto moved_counters = moved.GetDGSEMProductionCacheCounters();
+  ctx.Check(moved_selection.supported && moved_selection.strict &&
+              moved_difference.Norml2() < 2.0e-10 &&
+              std::abs(moved.GetMaxCharSpeed() - expected_speed) < 5.0e-13 &&
+              moved_bridge.operator_constructions == 1 &&
+              moved_bridge.operator_rebinds == 1 &&
+              moved_bridge.production_mult_calls == 2 &&
+              moved_counters.topology_builds == 1 &&
+              moved_counters.workspace_builds == 1,
+            "DGSEM persistent production bridge rebinds safely after parent move");
+}
+
 inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
 {
+  RunDGSEMProductionMultStrictRejectionProbe(ctx);
+  ScopedEnvironment strict_production_mult(
+    "DG_IGR_DGSEM_PRODUCTION_STRICT", "1");
+  CheckDGSEMProductionMultSerialIdentityAndMove(ctx);
   using mfem::dgsem::DGSEMProductionReason;
   constexpr double gamma = 1.4;
   constexpr double residual_tolerance = 2.0e-10;
@@ -1148,6 +1513,8 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
 
   double max_residual_difference = 0.0;
   double max_true_residual_difference = 0.0;
+  double max_mult_true_residual_difference = 0.0;
+  double max_mult_cfl_difference = 0.0;
   double max_constant_residual = 0.0;
   double max_cfl_difference = 0.0;
   double max_mass_conservation = 0.0;
@@ -1168,6 +1535,8 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
   std::int64_t max_selection_reason_reductions = 0;
   std::int64_t max_stage_reason_reductions = 0;
   std::int64_t max_host_syncs = 0;
+  std::int64_t max_mult_unchanged_cache_fast_paths = 0;
+  std::int64_t max_mult_bridge_storage_reuses = 0;
   int executed_cases = 0;
   int local_face_cases = 0;
   int shared_face_cases = 0;
@@ -1175,6 +1544,10 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
   int explicit_mapping_cases = 0;
   int invalidation_cases = 0;
   int trajectory_cases = 0;
+  int production_mult_cases = 0;
+  int production_mult_mapping_cases = 0;
+  int production_mult_fallback_cases = 0;
+  int production_mult_update_cases = 0;
 
   for (int dim = 1; dim <= 2; ++dim)
   {
@@ -1457,6 +1830,112 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
           std::max(max_true_residual_difference,
                    GlobalL2Norm(production_true));
 
+        mfem::Vector mult_true(vfes.GetTrueVSize());
+        mult_true = -6100.0;
+        oper.Mult(state_true, mult_true);
+        const auto mult_selection = oper.GetDGSEMProductionSelection();
+        const auto mult_worker_first =
+          oper.GetDGSEMProductionCacheCounters();
+        const auto mult_workspace_first =
+          oper.GetDGSEMProductionWorkspaceEvidence();
+        const auto mult_bridge_first =
+          oper.GetDGSEMProductionBridgeEvidence();
+        mfem::Vector mult_difference(mult_true);
+        mult_difference -= host_true;
+        const double mult_residual_difference =
+          GlobalL2Norm(mult_difference);
+        const double mult_cfl_difference =
+          std::abs(oper.GetMaxCharSpeed() - host_speed);
+        max_mult_true_residual_difference = std::max(
+          max_mult_true_residual_difference, mult_residual_difference);
+        max_mult_cfl_difference =
+          std::max(max_mult_cfl_difference, mult_cfl_difference);
+
+        mfem::Vector mult_repeated(vfes.GetTrueVSize());
+        mult_repeated = -6200.0;
+        oper.Mult(state_true, mult_repeated);
+        const auto mult_worker_second =
+          oper.GetDGSEMProductionCacheCounters();
+        const auto mult_workspace_second =
+          oper.GetDGSEMProductionWorkspaceEvidence();
+        const auto mult_bridge_second =
+          oper.GetDGSEMProductionBridgeEvidence();
+        mfem::Vector mult_repeated_difference(mult_repeated);
+        mult_repeated_difference -= host_true;
+        const bool bridge_storage_reused =
+          mult_bridge_first.workspace_storage_signature ==
+            mult_bridge_second.workspace_storage_signature &&
+          mult_bridge_first.x_local_capacity ==
+            mult_bridge_second.x_local_capacity &&
+          mult_bridge_first.z_local_capacity ==
+            mult_bridge_second.z_local_capacity &&
+          mult_bridge_first.y_local_capacity ==
+            mult_bridge_second.y_local_capacity;
+        max_mult_bridge_storage_reuses = std::max<std::int64_t>(
+          max_mult_bridge_storage_reuses,
+          bridge_storage_reused ? 1 : 0);
+        max_mult_unchanged_cache_fast_paths = std::max(
+          max_mult_unchanged_cache_fast_paths,
+          mult_worker_second.unchanged_cache_fast_paths);
+        const bool has_prolongation =
+          vfes.GetProlongationMatrix() != nullptr;
+        production_mult_mapping_cases += has_prolongation ? 1 : 0;
+        ++production_mult_cases;
+
+        ctx.Check(mult_selection.supported && mult_selection.strict &&
+                    mult_selection.reason == DGSEMProductionReason::None &&
+                    mult_selection.dimension == dim &&
+                    mult_selection.order == order &&
+                    mult_residual_difference < residual_tolerance &&
+                    GlobalL2Norm(mult_repeated_difference) <
+                      residual_tolerance &&
+                    mult_cfl_difference < 5.0e-13,
+                  "DGSEM production strict Mult reaches accepted worker and "
+                  "matches true host oracle p" + std::to_string(order) +
+                    " " + std::to_string(dim) + "D sigma=" +
+                    std::to_string(sigma_mode));
+        ctx.Check(mult_worker_first.topology_builds == 1 &&
+                    mult_worker_first.geometry_builds == 1 &&
+                    mult_worker_first.sigma_metadata_builds == 1 &&
+                    mult_worker_first.workspace_builds == 1 &&
+                    mult_worker_second.topology_builds ==
+                      mult_worker_first.topology_builds &&
+                    mult_worker_second.geometry_builds ==
+                      mult_worker_first.geometry_builds &&
+                    mult_worker_second.sigma_metadata_builds ==
+                      mult_worker_first.sigma_metadata_builds &&
+                    mult_worker_second.workspace_builds ==
+                      mult_worker_first.workspace_builds &&
+                    mult_worker_second.unchanged_cache_fast_paths ==
+                      mult_worker_first.unchanged_cache_fast_paths + 2 &&
+                    mult_worker_second.rebuild_preflight_entries ==
+                      mult_worker_first.rebuild_preflight_entries &&
+                    mult_workspace_first.ready &&
+                    mult_workspace_second.ready &&
+                    mult_workspace_first.size_signature ==
+                      mult_workspace_second.size_signature &&
+                    mult_workspace_first.capacity_signature ==
+                      mult_workspace_second.capacity_signature &&
+                    mult_workspace_first.storage_signature ==
+                      mult_workspace_second.storage_signature &&
+                    mult_workspace_second.failures == 0,
+                  "DGSEM production repeated Mult reuses accepted cache/workspace p" +
+                    std::to_string(order) + " " + std::to_string(dim) +
+                    "D sigma=" + std::to_string(sigma_mode));
+        ctx.Check(bridge_storage_reused &&
+                    mult_bridge_second.operator_ready &&
+                    mult_bridge_second.operator_constructions == 1 &&
+                    mult_bridge_second.operator_rebinds == 0 &&
+                    mult_bridge_second.production_mult_calls == 2 &&
+                    mult_bridge_second.fallback_mult_calls == 0 &&
+                    mult_bridge_second.y_local_size == vfes.GetVSize() &&
+                    (!has_prolongation ||
+                     (mult_bridge_second.x_local_size == vfes.GetVSize() &&
+                      mult_bridge_second.z_local_size == vfes.GetVSize())),
+                  "DGSEM coordinator bridge preserves persistent P/P^T workspaces p" +
+                    std::to_string(order) + " " + std::to_string(dim) +
+                    "D sigma=" + std::to_string(sigma_mode));
+
         mfem::Vector repeated(vfes.GetVSize());
         repeated = -19.0;
         const auto repeated_result =
@@ -1725,6 +2204,43 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
           ++negative_checks;
           ++assemble_rejections;
           oper.SetDGSEMGamma(gamma);
+
+          {
+            ScopedEnvironment ordinary_fallback(
+              "DG_IGR_DGSEM_PRODUCTION_STRICT", nullptr);
+            oper.SetDGSEMVolumeFlux(
+              mfem::DGSEMVolumeFlux::Chandrashekar);
+            mfem::Vector fallback_host_local;
+            double fallback_host_speed = 0.0;
+            host_residual(state_local,
+                          fallback_host_local,
+                          fallback_host_speed,
+                          nullptr);
+            mfem::Vector fallback_host_true;
+            local_to_true(fallback_host_local, fallback_host_true);
+            mfem::Vector fallback_true(vfes.GetTrueVSize());
+            fallback_true = -6300.0;
+            oper.Mult(state_true, fallback_true);
+            mfem::Vector fallback_difference(fallback_true);
+            fallback_difference -= fallback_host_true;
+            const auto fallback_selection =
+              oper.GetDGSEMProductionSelection();
+            const auto fallback_bridge =
+              oper.GetDGSEMProductionBridgeEvidence();
+            ctx.Check(!fallback_selection.supported &&
+                        !fallback_selection.strict &&
+                        fallback_selection.reason ==
+                          DGSEMProductionReason::UnsupportedVolumeFlux &&
+                        GlobalL2Norm(fallback_difference) <
+                          residual_tolerance &&
+                        std::abs(oper.GetMaxCharSpeed() -
+                                 fallback_host_speed) < 5.0e-13 &&
+                        fallback_bridge.production_mult_calls == 2 &&
+                        fallback_bridge.fallback_mult_calls == 1,
+                      "DGSEM production Mult ordinary fallback is exact and reason-coded");
+            ++production_mult_fallback_cases;
+            oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
+          }
         }
 
         if (dim == 1 && order == 1 && sigma_mode == 1)
@@ -1898,6 +2414,48 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
                         sigma_counters.workspace_builds + 1,
                     "DGSEM production Update invalidation rebuilds all dependent layers");
           ++invalidation_cases;
+
+          const auto mult_before_update =
+            oper.GetDGSEMProductionCacheCounters();
+          const auto bridge_before_update =
+            oper.GetDGSEMProductionBridgeEvidence();
+          oper.Update();
+          mfem::Vector mult_after_update(vfes.GetTrueVSize());
+          mult_after_update = -6400.0;
+          oper.Mult(state_true, mult_after_update);
+          mfem::Vector mult_update_difference(mult_after_update);
+          mult_update_difference -= host_true;
+          const auto mult_update_selection =
+            oper.GetDGSEMProductionSelection();
+          const auto mult_after_update_counters =
+            oper.GetDGSEMProductionCacheCounters();
+          const auto bridge_after_update =
+            oper.GetDGSEMProductionBridgeEvidence();
+          ctx.Check(mult_update_selection.supported &&
+                      mult_update_selection.strict &&
+                      mult_update_selection.reason ==
+                        DGSEMProductionReason::None &&
+                      GlobalL2Norm(mult_update_difference) <
+                        residual_tolerance &&
+                      std::abs(oper.GetMaxCharSpeed() - host_speed) <
+                        5.0e-13 &&
+                      mult_after_update_counters.update_invalidations ==
+                        mult_before_update.update_invalidations + 1 &&
+                      mult_after_update_counters.topology_builds ==
+                        mult_before_update.topology_builds + 1 &&
+                      mult_after_update_counters.geometry_builds ==
+                        mult_before_update.geometry_builds + 1 &&
+                      mult_after_update_counters.sigma_metadata_builds ==
+                        mult_before_update.sigma_metadata_builds + 1 &&
+                      mult_after_update_counters.workspace_builds ==
+                        mult_before_update.workspace_builds + 1 &&
+                      bridge_after_update.operator_constructions ==
+                        bridge_before_update.operator_constructions &&
+                      bridge_after_update.operator_rebinds == 0 &&
+                      bridge_after_update.production_mult_calls ==
+                        bridge_before_update.production_mult_calls + 1,
+                    "DGSEM production parent Update invalidates and safely rebuilds Mult state");
+          ++production_mult_update_cases;
         }
         }
       }
@@ -1907,6 +2465,20 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
   ctx.Check(executed_cases == 24,
             "DGSEM production executes affine/sheared p1-p4 1D/2D "
             "zero/frozen-sigma cases");
+  ctx.Check(production_mult_cases == 24,
+            "DGSEM production Mult executes all focused p1-p4 1D/2D cases");
+  ctx.Check(production_mult_mapping_cases > 0,
+            "DGSEM production Mult executes true/local P and P^T mapping");
+  ctx.Check(max_mult_true_residual_difference < residual_tolerance &&
+              max_mult_cfl_difference < 5.0e-13,
+            "DGSEM production Mult aggregate true residual and CFL parity");
+  ctx.Check(max_mult_unchanged_cache_fast_paths > 0 &&
+              max_mult_bridge_storage_reuses == 1,
+            "DGSEM production repeated Mult reuses persistent worker/bridge storage");
+  ctx.Check(production_mult_fallback_cases == 1,
+            "DGSEM production Mult exercises one exact ordinary fallback reason");
+  ctx.Check(production_mult_update_cases == 1,
+            "DGSEM production Mult exercises one exact parent Update rebuild");
   ctx.Check(local_face_cases > 0 || world_size == 2,
             "DGSEM production records local-face ownership coverage");
   ctx.Check(shared_face_cases > 0 || world_size == 1,
@@ -1967,7 +2539,9 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
   }
 
   ctx.AddParity(max_residual_difference + max_true_residual_difference +
-                max_constant_residual + max_cfl_difference);
+                max_constant_residual + max_cfl_difference +
+                max_mult_true_residual_difference +
+                max_mult_cfl_difference);
   ctx.LogMetric("DGSEM production aggregate: residual=" +
                 FormatSci(max_residual_difference) +
                 " true_residual=" + FormatSci(max_true_residual_difference) +
@@ -1975,10 +2549,12 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
                 " cfl=" + FormatSci(max_cfl_difference) +
                 " mass_conservation=" + FormatSci(max_mass_conservation) +
                 " energy_conservation=" + FormatSci(max_energy_conservation) +
-                " trajectory_state=" +
-                FormatSci(max_trajectory_state_difference) +
+                " trajectory_state=" + FormatSci(max_trajectory_state_difference) +
                 " trajectory_conservation=" +
                 FormatSci(max_trajectory_conservation_drift) +
+                " mult_true_residual=" +
+                FormatSci(max_mult_true_residual_difference) +
+                " mult_cfl=" + FormatSci(max_mult_cfl_difference) +
                 " negative_checks=" + std::to_string(negative_checks));
 
   const char* output_directory =
@@ -1992,7 +2568,7 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
     out.setf(std::ios::scientific);
     out.precision(17);
     out << "{\n"
-        << "  \"schema\": \"dgsem-production-operator-v1\",\n"
+        << "  \"schema\": \"dgsem-production-operator-v2\",\n"
         << "  \"dimensions\": [1, 2],\n"
         << "  \"orders\": [1, 2, 3, 4],\n"
         << "  \"sigma_modes\": [\"zero\", \"stage-frozen\"],\n"
@@ -2004,6 +2580,18 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
         << max_true_residual_difference << ",\n"
         << "  \"max_constant_residual\": "
         << max_constant_residual << ",\n"
+        << "  \"production_mult_cases\": " << production_mult_cases
+        << ",\n"
+        << "  \"production_mult_mapping_cases\": "
+        << production_mult_mapping_cases << ",\n"
+        << "  \"production_mult_fallback_cases\": "
+        << production_mult_fallback_cases << ",\n"
+        << "  \"production_mult_update_cases\": "
+        << production_mult_update_cases << ",\n"
+        << "  \"max_mult_true_residual_difference\": "
+        << max_mult_true_residual_difference << ",\n"
+        << "  \"max_mult_cfl_difference\": " << max_mult_cfl_difference
+        << ",\n"
         << "  \"max_cfl_difference\": " << max_cfl_difference << ",\n"
         << "  \"max_mass_conservation\": "
         << max_mass_conservation << ",\n"
@@ -2039,6 +2627,10 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
         << max_rebuild_preflight_entries << ",\n"
         << "  \"max_state_exchanges\": " << max_state_exchanges << ",\n"
         << "  \"max_sigma_exchanges\": " << max_sigma_exchanges << ",\n"
+        << "  \"max_mult_unchanged_cache_fast_paths\": "
+        << max_mult_unchanged_cache_fast_paths << ",\n"
+        << "  \"max_mult_bridge_storage_reuses\": "
+        << max_mult_bridge_storage_reuses << ",\n"
         << "  \"max_mpi_reductions\": " << max_mpi_reductions << ",\n"
         << "  \"max_selection_reason_reductions\": "
         << max_selection_reason_reductions << ",\n"

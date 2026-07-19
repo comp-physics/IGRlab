@@ -626,10 +626,9 @@ int RunDGSEMFluxTests(TestContext& ctx)
     mfem::Vector y(vfes.GetTrueVSize());
     U.GetTrueDofs(x);
     y = 0.0;
-    if (vfes.GetNE() > 0)
-    {
-      oper.Mult(x, y);
-    }
+    // Production Mult owns communicator-wide selection and CFL state;
+    // empty partitions must participate in the same call.
+    oper.Mult(x, y);
 
     const double resid_norm = GlobalL2Norm(y);
     const double resid_max = GlobalMax(MaxAbsEntry(y));
@@ -712,10 +711,9 @@ int RunDGSEMFluxTests(TestContext& ctx)
     mfem::Vector y(vfes.GetTrueVSize());
     U.GetTrueDofs(x);
     y = 0.0;
-    if (vfes.GetNE() > 0)
-    {
-      oper.Mult(x, y);
-    }
+    // Production Mult owns communicator-wide selection and CFL state;
+    // empty partitions must participate in the same call.
+    oper.Mult(x, y);
 
     const double resid_norm = GlobalL2Norm(y);
     const double resid_max = GlobalMax(MaxAbsEntry(y));
@@ -800,10 +798,9 @@ int RunDGSEMFluxTests(TestContext& ctx)
     mfem::Vector y(vfes.GetTrueVSize());
     U.GetTrueDofs(x);
     y = 0.0;
-    if (vfes.GetNE() > 0)
-    {
-      oper.Mult(x, y);
-    }
+    // Production Mult owns communicator-wide selection and CFL state;
+    // empty partitions must participate in the same call.
+    oper.Mult(x, y);
 
     const double resid_norm = GlobalL2Norm(y);
     const double resid_max = GlobalMax(MaxAbsEntry(y));

@@ -792,11 +792,22 @@ bool SameWorkspaceStorage(const DGSEMProductionWorkspaceEvidence& left,
 }
 
 DGSEMOperator::DGSEMOperator(const DGHyperbolicConservationLaws& op)
-  : op_(op)
+  : op_(&op)
 {
 }
 
 DGSEMOperator::~DGSEMOperator() = default;
+
+bool DGSEMOperator::Rebind(const DGHyperbolicConservationLaws& op)
+{
+  if (op_ == &op)
+  {
+    return false;
+  }
+  op_ = &op;
+  production_.reset();
+  return true;
+}
 
 DGSEMProductionCacheCounters DGSEMOperator::GetProductionCacheCounters() const
 {
@@ -850,20 +861,20 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   }
   DGSEMProductionCache& c = *production_;
   const ProductionCommunicator context =
-    GetProductionCommunicator(op_.vfes);
+    GetProductionCommunicator(op_->vfes);
   const bool collective_strict =
     ReduceAny(context, strict, c.counters.selection_reason_reductions);
 
-  Mesh* mesh = op_.vfes.GetMesh();
+  Mesh* mesh = op_->vfes.GetMesh();
   const FluxFunction* flux_function =
-    op_.formIntegrator ? &op_.formIntegrator->GetFluxFunction() : nullptr;
+    op_->formIntegrator ? &op_->formIntegrator->GetFluxFunction() : nullptr;
   const auto* flux_igr =
     flux_function ? dynamic_cast<const FluxWithIGR*>(flux_function) : nullptr;
   const ParGridFunction* sigma_field =
     flux_igr ? flux_igr->GetSigmaField() : nullptr;
   const FiniteElementSpace* sigma_fes =
     sigma_field ? sigma_field->FESpace() : nullptr;
-  const real_t gamma = op_.GetDGSEMGamma();
+  const real_t gamma = op_->GetDGSEMGamma();
   const real_t velocity_density_floor =
     flux_igr ? flux_igr->GetVelocityRhoFloor()
              : dg_igr::FluxDefaults::kRhoVelFloor;
@@ -871,21 +882,21 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   const bool sigma_aware_rusanov =
     flux_igr && flux_igr->GetSigmaAwareRusanov();
   const bool cuda = Device::Allows(Backend::CUDA_MASK);
-  const long vfes_sequence = op_.vfes.GetSequence();
+  const long vfes_sequence = op_->vfes.GetSequence();
   const long mesh_sequence = mesh ? mesh->GetSequence() : -1;
   const long sigma_sequence = sigma_fes ? sigma_fes->GetSequence() : -1;
   const FluxFunction* numerical_flux_function =
-    op_.num_flux_ ? &op_.num_flux_->GetFluxFunction() : nullptr;
+    op_->num_flux_ ? &op_->num_flux_->GetFluxFunction() : nullptr;
   const FluxFunction* igr_base_flux =
     flux_igr ? &flux_igr->GetBaseFlux() : nullptr;
 
   std::uint64_t fingerprint = UINT64_C(0xd6730f2e456d9a31);
   std::uint64_t semantic = UINT64_C(0x2a891f347bc61d05);
   fingerprint = HashPointer(fingerprint, mesh);
-  fingerprint = HashPointer(fingerprint, op_.vfes.FEColl());
-  fingerprint = HashPointer(fingerprint, op_.formIntegrator.get());
+  fingerprint = HashPointer(fingerprint, op_->vfes.FEColl());
+  fingerprint = HashPointer(fingerprint, op_->formIntegrator.get());
   fingerprint = HashPointer(fingerprint, flux_function);
-  fingerprint = HashPointer(fingerprint, op_.num_flux_);
+  fingerprint = HashPointer(fingerprint, op_->num_flux_);
   fingerprint = HashPointer(fingerprint, numerical_flux_function);
   fingerprint = HashPointer(fingerprint, igr_base_flux);
   fingerprint = HashPointer(fingerprint, sigma_field);
@@ -897,40 +908,40 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   fingerprint = HashCombine(
     fingerprint, static_cast<std::uint64_t>(sigma_sequence));
   fingerprint = HashCombine(fingerprint,
-                            static_cast<std::uint64_t>(op_.dim));
+                            static_cast<std::uint64_t>(op_->dim));
   fingerprint = HashCombine(fingerprint,
-                            static_cast<std::uint64_t>(op_.num_equations));
+                            static_cast<std::uint64_t>(op_->num_equations));
   fingerprint = HashCombine(fingerprint,
-                            static_cast<std::uint64_t>(op_.GetVolumeMode()));
+                            static_cast<std::uint64_t>(op_->GetVolumeMode()));
   fingerprint = HashCombine(
     fingerprint,
-    static_cast<std::uint64_t>(op_.GetDGSEMStabilization()));
+    static_cast<std::uint64_t>(op_->GetDGSEMStabilization()));
   fingerprint = HashCombine(
     fingerprint,
-    static_cast<std::uint64_t>(op_.GetDGSEMVolumeFlux()));
+    static_cast<std::uint64_t>(op_->GetDGSEMVolumeFlux()));
   fingerprint = HashCombine(
     fingerprint,
-    static_cast<std::uint64_t>(op_.GetDGSEMVolumeDissipation()));
+    static_cast<std::uint64_t>(op_->GetDGSEMVolumeDissipation()));
   fingerprint = HashReal(fingerprint, gamma);
   fingerprint = HashReal(fingerprint, velocity_density_floor);
   fingerprint = HashCombine(fingerprint, sigma_aware_cfl ? 1 : 0);
   fingerprint = HashCombine(fingerprint, sigma_aware_rusanov ? 1 : 0);
   fingerprint = HashCombine(fingerprint, cuda ? 1 : 0);
 
-  semantic = HashCombine(semantic, static_cast<std::uint64_t>(op_.dim));
+  semantic = HashCombine(semantic, static_cast<std::uint64_t>(op_->dim));
   semantic = HashCombine(semantic,
-                         static_cast<std::uint64_t>(op_.num_equations));
+                         static_cast<std::uint64_t>(op_->num_equations));
   semantic = HashCombine(semantic,
-                         static_cast<std::uint64_t>(op_.GetVolumeMode()));
+                         static_cast<std::uint64_t>(op_->GetVolumeMode()));
   semantic = HashCombine(
     semantic,
-    static_cast<std::uint64_t>(op_.GetDGSEMStabilization()));
+    static_cast<std::uint64_t>(op_->GetDGSEMStabilization()));
   semantic = HashCombine(
     semantic,
-    static_cast<std::uint64_t>(op_.GetDGSEMVolumeFlux()));
+    static_cast<std::uint64_t>(op_->GetDGSEMVolumeFlux()));
   semantic = HashCombine(
     semantic,
-    static_cast<std::uint64_t>(op_.GetDGSEMVolumeDissipation()));
+    static_cast<std::uint64_t>(op_->GetDGSEMVolumeDissipation()));
   semantic = HashReal(semantic, gamma);
   semantic = HashReal(semantic, velocity_density_floor);
   semantic = HashCombine(semantic, sigma_field ? 1 : 0);
@@ -945,11 +956,11 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
 
   int surface_type = -1;
   if (const auto* dgsem_flux =
-        dynamic_cast<const DGSEMSurfaceFlux*>(op_.num_flux_))
+        dynamic_cast<const DGSEMSurfaceFlux*>(op_->num_flux_))
   {
     surface_type = static_cast<int>(dgsem_flux->GetSurfaceFluxType());
   }
-  else if (dynamic_cast<const RusanovFluxWithSides*>(op_.num_flux_))
+  else if (dynamic_cast<const RusanovFluxWithSides*>(op_->num_flux_))
   {
     surface_type = static_cast<int>(DGSEMSurfaceFluxType::Rusanov);
   }
@@ -960,13 +971,13 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
     semantic,
     static_cast<std::uint64_t>(static_cast<std::int64_t>(surface_type)));
 
-  fingerprint = HashCombine(fingerprint, op_.ext_bdr_int_.size());
-  semantic = HashCombine(semantic, op_.ext_bdr_int_.size());
-  for (std::size_t i = 0; i < op_.ext_bdr_int_.size(); ++i)
+  fingerprint = HashCombine(fingerprint, op_->ext_bdr_int_.size());
+  semantic = HashCombine(semantic, op_->ext_bdr_int_.size());
+  for (std::size_t i = 0; i < op_->ext_bdr_int_.size(); ++i)
   {
-    const NonlinearFormIntegrator* generic = op_.ext_bdr_int_[i].get();
-    const Array<int>* marker = i < op_.ext_bdr_markers_.size()
-                                 ? op_.ext_bdr_markers_[i].get()
+    const NonlinearFormIntegrator* generic = op_->ext_bdr_int_[i].get();
+    const Array<int>* marker = i < op_->ext_bdr_markers_.size()
+                                 ? op_->ext_bdr_markers_[i].get()
                                  : nullptr;
     const auto* boundary =
       dynamic_cast<const BdrHyperbolicFluxIntegrator*>(generic);
@@ -1000,7 +1011,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
       static_cast<std::uint64_t>(wall ? wall->GetDimension() : -1));
     semantic = HashCombine(
       semantic,
-      boundary_numerical_flux == op_.num_flux_ ? 1 : 0);
+      boundary_numerical_flux == op_->num_flux_ ? 1 : 0);
     semantic = HashCombine(
       semantic,
       boundary_physical_flux == flux_function ? 1 : 0);
@@ -1038,8 +1049,8 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
     c.selection.strict = collective_strict;
     c.selection.cuda = cuda;
     c.selection.uses_sigma = sigma_field != nullptr;
-    c.selection.dimension = op_.dim;
-    c.selection.elements = op_.vfes.GetNE();
+    c.selection.dimension = op_->dim;
+    c.selection.elements = op_->vfes.GetNE();
     c.selection.ranks = context.size;
   };
 
@@ -1059,29 +1070,29 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   ++c.counters.rebuild_preflight_entries;
 
   DGSEMProductionReason policy_reason = DGSEMProductionReason::None;
-  if (!mesh || (op_.dim != 1 && op_.dim != 2))
+  if (!mesh || (op_->dim != 1 && op_->dim != 2))
   {
     policy_reason = DGSEMProductionReason::UnsupportedDimension;
   }
-  else if (op_.num_equations != op_.dim + 2)
+  else if (op_->num_equations != op_->dim + 2)
   {
     policy_reason = DGSEMProductionReason::UnsupportedEquationCount;
   }
-  else if (!op_.formIntegrator || !op_.num_flux_)
+  else if (!op_->formIntegrator || !op_->num_flux_)
   {
     policy_reason = DGSEMProductionReason::UnsupportedSurfaceFlux;
   }
-  else if (op_.GetVolumeMode() != VolumeMode::DGSEMFluxDiff ||
-           op_.GetDGSEMVolumeFlux() != DGSEMVolumeFlux::Central)
+  else if (op_->GetVolumeMode() != VolumeMode::DGSEMFluxDiff ||
+           op_->GetDGSEMVolumeFlux() != DGSEMVolumeFlux::Central)
   {
     policy_reason = DGSEMProductionReason::UnsupportedVolumeFlux;
   }
-  else if (op_.GetDGSEMVolumeDissipation() !=
+  else if (op_->GetDGSEMVolumeDissipation() !=
            DGSEMVolumeDissipation::None)
   {
     policy_reason = DGSEMProductionReason::UnsupportedVolumeDissipation;
   }
-  else if (op_.GetDGSEMStabilization() != DGSEMStabilization::None)
+  else if (op_->GetDGSEMStabilization() != DGSEMStabilization::None)
   {
     policy_reason = DGSEMProductionReason::UnsupportedStabilization;
   }
@@ -1094,7 +1105,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   {
     policy_reason = DGSEMProductionReason::InvalidDensityFloor;
   }
-  else if (&op_.num_flux_->GetFluxFunction() != flux_function)
+  else if (&op_->num_flux_->GetFluxFunction() != flux_function)
   {
     policy_reason = DGSEMProductionReason::FluxIdentityMismatch;
   }
@@ -1116,25 +1127,25 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   if (policy_reason == DGSEMProductionReason::None)
   {
     ElementTransformation* transformation =
-      op_.vfes.GetNE() > 0 ? op_.vfes.GetElementTransformation(0) : nullptr;
+      op_->vfes.GetNE() > 0 ? op_->vfes.GetElementTransformation(0) : nullptr;
     if (transformation)
     {
       IntegrationPoint point;
       point.x = 0.5;
       point.y = 0.5;
       transformation->SetIntPoint(&point);
-      Vector probe(op_.num_equations);
+      Vector probe(op_->num_equations);
       probe = 0.0;
       probe(0) = 1.0;
-      probe(op_.dim + 1) = 1.0 / (gamma - 1.0);
-      DenseMatrix physical_flux(op_.num_equations, op_.dim);
+      probe(op_->dim + 1) = 1.0 / (gamma - 1.0);
+      DenseMatrix physical_flux(op_->num_equations, op_->dim);
       euler_model->ComputeFlux(probe, *transformation, physical_flux);
       const real_t tolerance =
         4096.0 * std::numeric_limits<real_t>::epsilon();
       bool gamma_matches =
-        physical_flux.Height() == op_.num_equations &&
-        physical_flux.Width() == op_.dim && physical_flux.CheckFinite() == 0;
-      for (int d = 0; gamma_matches && d < op_.dim; ++d)
+        physical_flux.Height() == op_->num_equations &&
+        physical_flux.Width() == op_->dim && physical_flux.CheckFinite() == 0;
+      for (int d = 0; gamma_matches && d < op_->dim; ++d)
       {
         gamma_matches = std::abs(physical_flux(1 + d, d) - 1.0) <=
                         tolerance;
@@ -1163,7 +1174,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   }
   if (policy_reason == DGSEMProductionReason::None && sigma_field &&
       (!sigma_fes || sigma_fes->GetMesh() != mesh ||
-       sigma_fes->GetNE() != op_.vfes.GetNE() || sigma_fes->GetVDim() != 1))
+       sigma_fes->GetNE() != op_->vfes.GetNE() || sigma_fes->GetVDim() != 1))
   {
     policy_reason = DGSEMProductionReason::UnsupportedSigma;
   }
@@ -1171,7 +1182,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   if (policy_reason == DGSEMProductionReason::None && sigma_field)
   {
     const auto* state_pfes =
-      dynamic_cast<const ParFiniteElementSpace*>(&op_.vfes);
+      dynamic_cast<const ParFiniteElementSpace*>(&op_->vfes);
     const auto* scalar_pfes =
       dynamic_cast<const ParFiniteElementSpace*>(sigma_fes);
     if (state_pfes && !scalar_pfes)
@@ -1218,10 +1229,10 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
       }
       int applicable = 0;
       const BdrHyperbolicFluxIntegrator* selected = nullptr;
-      for (std::size_t i = 0; i < op_.ext_bdr_int_.size(); ++i)
+      for (std::size_t i = 0; i < op_->ext_bdr_int_.size(); ++i)
       {
-        const Array<int>* marker = i < op_.ext_bdr_markers_.size()
-                                     ? op_.ext_bdr_markers_[i].get()
+        const Array<int>* marker = i < op_->ext_bdr_markers_.size()
+                                     ? op_->ext_bdr_markers_[i].get()
                                      : nullptr;
         if (!marker || attr > marker->Size() || (*marker)[attr - 1] == 0)
         {
@@ -1229,7 +1240,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
         }
         ++applicable;
         selected = dynamic_cast<const BdrHyperbolicFluxIntegrator*>(
-          op_.ext_bdr_int_[i].get());
+          op_->ext_bdr_int_[i].get());
       }
       if (applicable == 0 || !selected)
       {
@@ -1247,11 +1258,11 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
         {
           policy_reason = DGSEMProductionReason::UnsupportedBoundary;
         }
-        else if (wall->GetDimension() != op_.dim)
+        else if (wall->GetDimension() != op_->dim)
         {
           policy_reason = DGSEMProductionReason::BoundaryDimensionMismatch;
         }
-        else if (&selected->GetNumericalFlux() != op_.num_flux_ ||
+        else if (&selected->GetNumericalFlux() != op_->num_flux_ ||
                  &selected->GetNumericalFlux().GetFluxFunction() !=
                    flux_function)
         {
@@ -1273,14 +1284,14 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   DGSEMProductionReason topology_reason = DGSEMProductionReason::None;
   int topology_order = -1;
   std::uint64_t topology_semantic = UINT64_C(0xe13c98f04a2576bd);
-  if (op_.vfes.GetNE() <= 0 ||
-      op_.vfes.GetOrdering() != Ordering::byNODES ||
-      !op_.vfes.IsDGSpace())
+  if (op_->vfes.GetNE() <= 0 ||
+      op_->vfes.GetOrdering() != Ordering::byNODES ||
+      !op_->vfes.IsDGSpace())
   {
     topology_reason = DGSEMProductionReason::UnsupportedTensorElement;
   }
   const auto* l2_collection =
-    dynamic_cast<const L2_FECollection*>(op_.vfes.FEColl());
+    dynamic_cast<const L2_FECollection*>(op_->vfes.FEColl());
   if (topology_reason == DGSEMProductionReason::None &&
       (!l2_collection ||
        l2_collection->GetBasisType() != BasisType::GaussLobatto))
@@ -1291,16 +1302,16 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   std::vector<int> reference_lex_to_local;
   if (topology_reason == DGSEMProductionReason::None)
   {
-    topology_order = op_.vfes.GetFE(0)->GetOrder();
+    topology_order = op_->vfes.GetFE(0)->GetOrder();
     if (topology_order < 1 || topology_order > 4)
     {
       topology_reason = DGSEMProductionReason::UnsupportedOrder;
     }
   }
   const int n1d = topology_order + 1;
-  const int expected_dof = op_.dim == 1 ? n1d : n1d * n1d;
+  const int expected_dof = op_->dim == 1 ? n1d : n1d * n1d;
   const Geometry::Type expected_geometry =
-    op_.dim == 1 ? Geometry::SEGMENT : Geometry::SQUARE;
+    op_->dim == 1 ? Geometry::SEGMENT : Geometry::SQUARE;
   if (topology_reason == DGSEMProductionReason::None)
   {
     const LGLBasis1D& basis = GetLGLBasis1D(topology_order);
@@ -1308,12 +1319,12 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
       4096.0 * std::numeric_limits<real_t>::epsilon();
     for (int e = 0;
          topology_reason == DGSEMProductionReason::None &&
-         e < op_.vfes.GetNE();
+         e < op_->vfes.GetNE();
          ++e)
     {
-      const FiniteElement& fe = *op_.vfes.GetFE(e);
+      const FiniteElement& fe = *op_->vfes.GetFE(e);
       const auto* tensor = dynamic_cast<const TensorBasisElement*>(&fe);
-      if (!tensor || fe.GetDim() != op_.dim ||
+      if (!tensor || fe.GetDim() != op_->dim ||
           fe.GetGeomType() != expected_geometry ||
           fe.GetOrder() != topology_order || fe.GetDof() != expected_dof)
       {
@@ -1345,9 +1356,9 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
         lex_to_local[static_cast<std::size_t>(lex)] = local;
         const IntegrationPoint& point = fe.GetNodes().IntPoint(local);
         const int i = lex % n1d;
-        const int j = op_.dim == 2 ? lex / n1d : 0;
+        const int j = op_->dim == 2 ? lex / n1d : 0;
         if (std::abs(point.x - basis.nodes(i)) > tolerance ||
-            (op_.dim == 2 &&
+            (op_->dim == 2 &&
              std::abs(point.y - basis.nodes(j)) > tolerance))
         {
           topology_reason = DGSEMProductionReason::UnsupportedNodalBasis;
@@ -1368,7 +1379,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
 
   topology_semantic = HashCombine(
     topology_semantic,
-    static_cast<std::uint64_t>(op_.dim));
+    static_cast<std::uint64_t>(op_->dim));
   topology_semantic = HashCombine(
     topology_semantic,
     static_cast<std::uint64_t>(topology_order));
@@ -1404,7 +1415,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
     c.sigma_ready = false;
     c.workspaces_ready = false;
 #ifdef MFEM_USE_MPI
-    if (auto* pfes = dynamic_cast<ParFiniteElementSpace*>(&op_.vfes))
+    if (auto* pfes = dynamic_cast<ParFiniteElementSpace*>(&op_->vfes))
     {
       pfes->ExchangeFaceNbrData();
     }
@@ -1490,8 +1501,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   DGSEMProductionCache& c = *production_;
   c.selection.strict = strict;
 
-  Mesh* mesh = op_.vfes.GetMesh();
-  const FluxFunction& flux_function = op_.formIntegrator->GetFluxFunction();
+  Mesh* mesh = op_->vfes.GetMesh();
+  const FluxFunction& flux_function = op_->formIntegrator->GetFluxFunction();
   const auto* flux_igr = dynamic_cast<const FluxWithIGR*>(&flux_function);
   const ParGridFunction* sigma_field =
     flux_igr ? flux_igr->GetSigmaField() : nullptr;
@@ -1499,7 +1510,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     flux_igr ? flux_igr->GetVelocityRhoFloor()
              : dg_igr::FluxDefaults::kRhoVelFloor;
   const bool cuda = Device::Allows(Backend::CUDA_MASK);
-  const long vfes_sequence = op_.vfes.GetSequence();
+  const long vfes_sequence = op_->vfes.GetSequence();
   const long mesh_sequence = mesh ? mesh->GetSequence() : -1;
   const FiniteElementSpace* sigma_fes =
     sigma_field ? sigma_field->FESpace() : nullptr;
@@ -1513,13 +1524,13 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.sigma_fes_sequence != sigma_sequence;
   const bool policy_changed =
     !c.policy_bound || c.policy_fingerprint != fingerprint ||
-    c.numerical_flux != op_.num_flux_ ||
+    c.numerical_flux != op_->num_flux_ ||
     c.flux_function != &flux_function || sigma_metadata_changed ||
-    c.volume_mode != op_.GetVolumeMode() ||
-    c.stabilization != op_.GetDGSEMStabilization() ||
-    c.volume_flux != op_.GetDGSEMVolumeFlux() ||
-    c.volume_dissipation != op_.GetDGSEMVolumeDissipation() ||
-    c.gamma != op_.GetDGSEMGamma() ||
+    c.volume_mode != op_->GetVolumeMode() ||
+    c.stabilization != op_->GetDGSEMStabilization() ||
+    c.volume_flux != op_->GetDGSEMVolumeFlux() ||
+    c.volume_dissipation != op_->GetDGSEMVolumeDissipation() ||
+    c.gamma != op_->GetDGSEMGamma() ||
     c.velocity_density_floor != velocity_density_floor ||
     c.sigma_aware_cfl != sigma_aware_cfl ||
     c.sigma_aware_rusanov != sigma_aware_rusanov;
@@ -1548,16 +1559,16 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   }
   c.policy_bound = true;
   c.policy_fingerprint = fingerprint;
-  c.numerical_flux = op_.num_flux_;
+  c.numerical_flux = op_->num_flux_;
   c.flux_function = &flux_function;
   c.sigma_field = sigma_field;
   c.sigma_fes = sigma_fes;
   c.sigma_fes_sequence = sigma_sequence;
-  c.volume_mode = op_.GetVolumeMode();
-  c.stabilization = op_.GetDGSEMStabilization();
-  c.volume_flux = op_.GetDGSEMVolumeFlux();
-  c.volume_dissipation = op_.GetDGSEMVolumeDissipation();
-  c.gamma = op_.GetDGSEMGamma();
+  c.volume_mode = op_->GetVolumeMode();
+  c.stabilization = op_->GetDGSEMStabilization();
+  c.volume_flux = op_->GetDGSEMVolumeFlux();
+  c.volume_dissipation = op_->GetDGSEMVolumeDissipation();
+  c.gamma = op_->GetDGSEMGamma();
   c.velocity_density_floor = velocity_density_floor;
   c.sigma_aware_cfl = sigma_aware_cfl;
   c.sigma_aware_rusanov = sigma_aware_rusanov;
@@ -1566,8 +1577,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   c.selection.strict = strict;
   c.selection.cuda = cuda;
   c.selection.uses_sigma = sigma_field != nullptr;
-  c.selection.dimension = op_.dim;
-  c.selection.elements = op_.vfes.GetNE();
+  c.selection.dimension = op_->dim;
+  c.selection.elements = op_->vfes.GetNE();
   c.selection.ranks = ranks;
 
   auto fail = [&](DGSEMProductionReason reason)
@@ -1577,27 +1588,27 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     return reason;
   };
 
-  if (!mesh || (op_.dim != 1 && op_.dim != 2))
+  if (!mesh || (op_->dim != 1 && op_->dim != 2))
   {
     return fail(DGSEMProductionReason::UnsupportedDimension);
   }
-  if (op_.num_equations != op_.dim + 2)
+  if (op_->num_equations != op_->dim + 2)
   {
     return fail(DGSEMProductionReason::UnsupportedEquationCount);
   }
-  if (op_.GetVolumeMode() != VolumeMode::DGSEMFluxDiff)
+  if (op_->GetVolumeMode() != VolumeMode::DGSEMFluxDiff)
   {
     return fail(DGSEMProductionReason::UnsupportedVolumeFlux);
   }
-  if (op_.GetDGSEMStabilization() != DGSEMStabilization::None)
+  if (op_->GetDGSEMStabilization() != DGSEMStabilization::None)
   {
     return fail(DGSEMProductionReason::UnsupportedStabilization);
   }
-  if (op_.GetDGSEMVolumeFlux() != DGSEMVolumeFlux::Central)
+  if (op_->GetDGSEMVolumeFlux() != DGSEMVolumeFlux::Central)
   {
     return fail(DGSEMProductionReason::UnsupportedVolumeFlux);
   }
-  if (op_.GetDGSEMVolumeDissipation() != DGSEMVolumeDissipation::None)
+  if (op_->GetDGSEMVolumeDissipation() != DGSEMVolumeDissipation::None)
   {
     return fail(DGSEMProductionReason::UnsupportedVolumeDissipation);
   }
@@ -1622,9 +1633,9 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     return fail(DGSEMProductionReason::UnsupportedSigmaSpeedPolicy);
   }
   bool surface_supported =
-    dynamic_cast<const RusanovFluxWithSides*>(op_.num_flux_) != nullptr;
+    dynamic_cast<const RusanovFluxWithSides*>(op_->num_flux_) != nullptr;
   if (const auto* dgsem_flux =
-        dynamic_cast<const DGSEMSurfaceFlux*>(op_.num_flux_))
+        dynamic_cast<const DGSEMSurfaceFlux*>(op_->num_flux_))
   {
     surface_supported =
       dgsem_flux->GetSurfaceFluxType() == DGSEMSurfaceFluxType::Rusanov;
@@ -1655,13 +1666,13 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
 
   if (!c.topology_ready)
   {
-    c.ne = op_.vfes.GetNE();
-    c.equations = op_.num_equations;
-    if (c.ne <= 0 || op_.vfes.GetOrdering() != Ordering::byNODES)
+    c.ne = op_->vfes.GetNE();
+    c.equations = op_->num_equations;
+    if (c.ne <= 0 || op_->vfes.GetOrdering() != Ordering::byNODES)
     {
       return fail(DGSEMProductionReason::UnsupportedTensorElement);
     }
-    const FiniteElement& first_fe = *op_.vfes.GetFE(0);
+    const FiniteElement& first_fe = *op_->vfes.GetFE(0);
     const int order = first_fe.GetOrder();
     if (order < 1 || order > 4)
     {
@@ -1671,7 +1682,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.n1d = order + 1;
     c.dof = first_fe.GetDof();
     c.rows = c.ne * c.dof;
-    const int expected_dof = op_.dim == 1 ? c.n1d : c.n1d * c.n1d;
+    const int expected_dof = op_->dim == 1 ? c.n1d : c.n1d * c.n1d;
     if (c.dof != expected_dof)
     {
       return fail(DGSEMProductionReason::UnsupportedTensorElement);
@@ -1682,7 +1693,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     const auto& first_ijk = GetTensorDofToIJK(first_fe);
     for (int local = 0; local < c.dof; ++local)
     {
-      const int lex = op_.dim == 1
+      const int lex = op_->dim == 1
                         ? first_ijk[static_cast<std::size_t>(local)][0]
                         : first_ijk[static_cast<std::size_t>(local)][0] +
                             c.n1d *
@@ -1696,12 +1707,12 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
 
     c.element_vdofs.SetSize(c.rows * c.equations);
     c.inverse_mass.SetSize(c.rows, c.dof);
-    c.coordinates.SetSize(c.rows, op_.dim);
+    c.coordinates.SetSize(c.rows, op_->dim);
     Array<int> vdofs;
-    Vector physical(op_.dim);
+    Vector physical(op_->dim);
     for (int e = 0; e < c.ne; ++e)
     {
-      const FiniteElement& fe = *op_.vfes.GetFE(e);
+      const FiniteElement& fe = *op_->vfes.GetFE(e);
       if (fe.GetOrder() != order)
       {
         return fail(DGSEMProductionReason::MixedOrder);
@@ -1715,7 +1726,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       const auto& ijk = GetTensorDofToIJK(fe);
       for (int local = 0; local < c.dof; ++local)
       {
-        const int lex = op_.dim == 1
+        const int lex = op_->dim == 1
                           ? ijk[static_cast<std::size_t>(local)][0]
                           : ijk[static_cast<std::size_t>(local)][0] +
                               c.n1d * ijk[static_cast<std::size_t>(local)][1];
@@ -1733,7 +1744,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
         }
       }
 
-      op_.vfes.GetElementVDofs(e, vdofs);
+      op_->vfes.GetElementVDofs(e, vdofs);
       if (vdofs.Size() != c.dof * c.equations)
       {
         return fail(DGSEMProductionReason::InvalidElementVdofMap);
@@ -1746,9 +1757,9 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
             vdofs[local + c.dof * equation];
         }
       }
-      if (e >= static_cast<int>(op_.invmass.size()) ||
-          op_.invmass[static_cast<std::size_t>(e)].Height() != c.dof ||
-          op_.invmass[static_cast<std::size_t>(e)].Width() != c.dof)
+      if (e >= static_cast<int>(op_->invmass.size()) ||
+          op_->invmass[static_cast<std::size_t>(e)].Height() != c.dof ||
+          op_->invmass[static_cast<std::size_t>(e)].Width() != c.dof)
       {
         return fail(DGSEMProductionReason::InvalidMetric);
       }
@@ -1757,11 +1768,11 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
         for (int j = 0; j < c.dof; ++j)
         {
           c.inverse_mass(e * c.dof + i, j) =
-            op_.invmass[static_cast<std::size_t>(e)](i, j);
+            op_->invmass[static_cast<std::size_t>(e)](i, j);
         }
       }
       ElementTransformation* transformation =
-        op_.vfes.GetElementTransformation(e);
+        op_->vfes.GetElementTransformation(e);
       if (!transformation || fe.GetNodes().GetNPoints() != c.dof)
       {
         return fail(DGSEMProductionReason::InvalidMetric);
@@ -1769,14 +1780,14 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       for (int local = 0; local < c.dof; ++local)
       {
         transformation->Transform(fe.GetNodes().IntPoint(local), physical);
-        for (int d = 0; d < op_.dim; ++d)
+        for (int d = 0; d < op_->dim; ++d)
         {
           c.coordinates(e * c.dof + local, d) = physical(d);
         }
       }
     }
 
-    if (op_.dim == 1)
+    if (op_->dim == 1)
     {
       c.metrics.SetSize(c.rows, 1);
       c.metrics = 1.0;
@@ -1809,7 +1820,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.boundary_faces = 0;
 
 #ifdef MFEM_USE_MPI
-    auto* pfes = dynamic_cast<ParFiniteElementSpace*>(&op_.vfes);
+    auto* pfes = dynamic_cast<ParFiniteElementSpace*>(&op_->vfes);
     ParMesh* pmesh = pfes ? pfes->GetParMesh() : nullptr;
     std::vector<char> is_shared_face;
     if (pmesh && pmesh->GetNSharedFaces() > 0)
@@ -1843,12 +1854,12 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       }
       const Vector& nodes = GetLGLBasis1D(order).nodes;
       const int i = FindNode(nodes, point.x);
-      const int j = op_.dim == 2 ? FindNode(nodes, point.y) : 0;
+      const int j = op_->dim == 2 ? FindNode(nodes, point.y) : 0;
       if (i < 0 || j < 0)
       {
         return -1;
       }
-      return c.lex_to_local[op_.dim == 1 ? i : i + c.n1d * j];
+      return c.lex_to_local[op_->dim == 1 ? i : i + c.n1d * j];
     };
     auto normal_from_point = [&](FaceElementTransformations& transformation,
                                  int element,
@@ -1857,7 +1868,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
                                  std::array<real_t, 2>& normal) -> bool
     {
       normal = {0.0, 0.0};
-      if (op_.dim == 1)
+      if (op_->dim == 1)
       {
         normal[0] = (point.x - 0.5) * 2.0;
         return true;
@@ -1903,7 +1914,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
           : std::array<real_t, 2>{{0.0, 0.0}});
     };
 
-    const IntegrationRule& face_rule = op_.dim == 1
+    const IntegrationRule& face_rule = op_->dim == 1
                                          ? IntRules.Get(Geometry::POINT, 1)
                                          : GetLGLFaceRule(order);
     for (int f = 0; f < mesh->GetNumFaces(); ++f)
@@ -1920,8 +1931,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       }
       const int e1 = transformation->Elem1No;
       const int e2 = transformation->Elem2No;
-      const FiniteElement& fe1 = *op_.vfes.GetFE(e1);
-      const FiniteElement& fe2 = *op_.vfes.GetFE(e2);
+      const FiniteElement& fe1 = *op_->vfes.GetFE(e1);
+      const FiniteElement& fe2 = *op_->vfes.GetFE(e2);
       for (int q = 0; q < face_rule.GetNPoints(); ++q)
       {
         const IntegrationPoint& point = face_rule.IntPoint(q);
@@ -1974,7 +1985,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
         {
           return fail(DGSEMProductionReason::InvalidFaceRange);
         }
-        const FiniteElement& fe1 = *op_.vfes.GetFE(e1);
+        const FiniteElement& fe1 = *op_->vfes.GetFE(e1);
         const FiniteElement& fe2 = *pfes->GetFaceNbrFE(e2);
         for (int q = 0; q < face_rule.GetNPoints(); ++q)
         {
@@ -2026,7 +2037,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
         continue;
       }
       const int e1 = transformation->Elem1No;
-      const FiniteElement& fe1 = *op_.vfes.GetFE(e1);
+      const FiniteElement& fe1 = *op_->vfes.GetFE(e1);
       for (int q = 0; q < face_rule.GetNPoints(); ++q)
       {
         const IntegrationPoint& point = face_rule.IntPoint(q);
@@ -2058,7 +2069,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     }
 
     const int nfaces = static_cast<int>(left_elements.size());
-    c.normals.SetSize(nfaces, op_.dim);
+    c.normals.SetSize(nfaces, op_->dim);
     c.face_weights.SetSize(nfaces);
     c.left_elements.SetSize(nfaces);
     c.left_local_dofs.SetSize(nfaces);
@@ -2067,7 +2078,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.ownership.SetSize(nfaces);
     c.shared_state_vdofs.SetSize(nfaces * c.equations);
     c.shared_neighbor_elements.SetSize(nfaces);
-    c.shared_neighbor_points.SetSize(nfaces, op_.dim);
+    c.shared_neighbor_points.SetSize(nfaces, op_->dim);
     for (int face = 0; face < nfaces; ++face)
     {
       c.face_weights(face) = face_weights[static_cast<std::size_t>(face)];
@@ -2078,7 +2089,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       c.ownership[face] = ownership[static_cast<std::size_t>(face)];
       c.shared_neighbor_elements[face] =
         neighbor_elements[static_cast<std::size_t>(face)];
-      for (int d = 0; d < op_.dim; ++d)
+      for (int d = 0; d < op_->dim; ++d)
       {
         c.normals(face, d) =
           face_normals[static_cast<std::size_t>(face)][static_cast<std::size_t>(d)];
@@ -2094,12 +2105,12 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     }
 
     DGSEMProductionMetadataView metadata;
-    metadata.dimension = op_.dim;
+    metadata.dimension = op_->dim;
     metadata.order = order;
     metadata.elements = c.ne;
     metadata.dofs_per_element = c.dof;
     metadata.equations = c.equations;
-    metadata.local_vector_size = op_.vfes.GetVSize();
+    metadata.local_vector_size = op_->vfes.GetVSize();
     metadata.face_neighbor_vector_size = c.face_neighbor_vsize;
     metadata.lex_to_local = &c.lex_to_local;
     metadata.element_vdofs = &c.element_vdofs;
@@ -2164,7 +2175,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       for (int e = 0; e < c.ne; ++e)
       {
         const FiniteElement& scalar_fe = *scalar_fes->GetFE(e);
-        const FiniteElement& state_fe = *op_.vfes.GetFE(e);
+        const FiniteElement& state_fe = *op_->vfes.GetFE(e);
         if (scalar_fe.GetDof() != c.sigma_ldof)
         {
           return fail(DGSEMProductionReason::UnsupportedSigma);
@@ -2223,7 +2234,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
           }
           IntegrationPoint point;
           point.x = c.shared_neighbor_points(face, 0);
-          if (op_.dim == 2)
+          if (op_->dim == 2)
           {
             point.y = c.shared_neighbor_points(face, 1);
           }
@@ -2259,7 +2270,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     const int nfaces = c.normals.Height();
     c.states.SetSize(c.rows, c.equations);
     c.sigma_nodes.SetSize(c.rows);
-    c.contravariant_flux.SetSize(c.rows, op_.dim * c.equations);
+    c.contravariant_flux.SetSize(c.rows, op_->dim * c.equations);
     c.nodal_speeds.SetSize(c.rows);
     c.weak_volume.SetSize(c.rows, c.equations);
     c.left_states.SetSize(nfaces, c.equations);
@@ -2298,7 +2309,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
 #ifdef MFEM_USE_MPI
     if (c.shared_faces > 0)
     {
-      auto* pfes = dynamic_cast<ParFiniteElementSpace*>(&op_.vfes);
+      auto* pfes = dynamic_cast<ParFiniteElementSpace*>(&op_->vfes);
       if (!pfes)
       {
         return fail(DGSEMProductionReason::InvalidFaceRange);
@@ -2321,8 +2332,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
 
   c.selection.supported = true;
   c.selection.reason = DGSEMProductionReason::None;
-  c.selection.dimension = op_.dim;
-  c.selection.order = op_.vfes.GetFE(0)->GetOrder();
+  c.selection.dimension = op_->dim;
+  c.selection.order = op_->vfes.GetFE(0)->GetOrder();
   c.selection.elements = c.ne;
   c.selection.uses_sigma = sigma_field != nullptr;
   c.selection.has_local_faces = c.local_faces > 0;
@@ -2352,21 +2363,21 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
 
   DGSEMProductionCache& c = *production_;
   const ProductionCommunicator context =
-    GetProductionCommunicator(op_.vfes);
+    GetProductionCommunicator(op_->vfes);
   ++c.counters.stage_calls;
 
   DGSEMProductionReason local_gate = DGSEMProductionReason::None;
-  if (x_local.Size() != op_.vfes.GetVSize())
+  if (x_local.Size() != op_->vfes.GetVSize())
   {
     local_gate = DGSEMProductionReason::InputSizeMismatch;
   }
-  else if (y_local.Size() != op_.vfes.GetVSize())
+  else if (y_local.Size() != op_->vfes.GetVSize())
   {
     local_gate = DGSEMProductionReason::OutputSizeMismatch;
   }
-  else if (!op_.vfes.GetMesh() ||
-           c.vfes_sequence != op_.vfes.GetSequence() ||
-           c.mesh_sequence != op_.vfes.GetMesh()->GetSequence())
+  else if (!op_->vfes.GetMesh() ||
+           c.vfes_sequence != op_->vfes.GetSequence() ||
+           c.mesh_sequence != op_->vfes.GetMesh()->GetSequence())
   {
     local_gate = DGSEMProductionReason::StaleCache;
   }
@@ -2427,7 +2438,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
 
   ++c.counters.host_synchronizations;
   DGSEMProductionReason local_state_reason =
-    ValidateDGSEMProductionState(op_.dim,
+    ValidateDGSEMProductionState(op_->dim,
                                  c.gamma,
                                  c.velocity_density_floor,
                                  c.states,
@@ -2447,7 +2458,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
 #ifdef MFEM_USE_MPI
   if (c.shared_faces > 0)
   {
-    auto* pfes = dynamic_cast<ParFiniteElementSpace*>(&op_.vfes);
+    auto* pfes = dynamic_cast<ParFiniteElementSpace*>(&op_->vfes);
     if (!pfes)
     {
       exchange_reason = DGSEMProductionReason::InvalidFaceRange;
@@ -2510,7 +2521,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     return result;
   }
 
-  GatherEulerRusanovSlipFacesDevice(op_.dim,
+  GatherEulerRusanovSlipFacesDevice(op_->dim,
                                     c.ne,
                                     c.dof,
                                     c.states,
@@ -2531,7 +2542,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
 
   ++c.counters.host_synchronizations;
   DGSEMProductionReason local_face_reason =
-    ValidateDGSEMProductionState(op_.dim,
+    ValidateDGSEMProductionState(op_->dim,
                                  c.gamma,
                                  c.velocity_density_floor,
                                  c.left_states,
@@ -2540,7 +2551,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   {
     ++c.counters.host_synchronizations;
     local_face_reason =
-      ValidateDGSEMProductionState(op_.dim,
+      ValidateDGSEMProductionState(op_->dim,
                                    c.gamma,
                                    c.velocity_density_floor,
                                    c.right_states,
@@ -2556,7 +2567,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     return result;
   }
 
-  BuildEulerContravariantFluxDevice(op_.dim,
+  BuildEulerContravariantFluxDevice(op_->dim,
                                     c.gamma,
                                     c.velocity_density_floor,
                                     c.states,
@@ -2565,7 +2576,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                     c.contravariant_flux,
                                     c.nodal_speeds);
   const LGLBasis1D& basis = GetLGLBasis1D(c.selection.order);
-  ApplyCentralVolumeDevice(op_.dim,
+  ApplyCentralVolumeDevice(op_->dim,
                            c.n1d,
                            c.lex_to_local,
                            basis.Dsplit,
@@ -2576,7 +2587,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   // The accepted face kernel retains its packed host normal preflight. This
   // is one explicit, accounted synchronization per production stage.
   ++c.counters.host_synchronizations;
-  AssembleEulerRusanovFacesDevice(op_.dim,
+  AssembleEulerRusanovFacesDevice(op_->dim,
                                   c.ne,
                                   c.dof,
                                   c.gamma,

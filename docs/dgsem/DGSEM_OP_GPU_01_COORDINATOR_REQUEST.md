@@ -2,12 +2,12 @@
 
 ## Disposition
 
-The worker-owned production cache and MFEM-native kernels are separable, but
-the task cannot make an end-to-end production claim without coordinator-owned
-changes.  Apply the worker commit first, then make the narrow integration below
-in `DGHyperbolicConservationLaws`.  Do not merge the worker commit as a completed
-`DGSEM-OP-GPU-01` gate until the production-`Mult` and restart conditions at the
-end of this document are independently satisfied.
+The worker-owned production cache and MFEM-native kernels were independently
+accepted and merged before the current `c01c0cbc` composition base.  The
+DGSEM-RESTART-01 Gauss-Lobatto cold-restart foundation was also independently
+accepted and merged at that base.  The remaining coordinator-owned gate is the
+narrow production-`Mult` integration below; this document records design
+guidance rather than a patch to paste unchanged.
 
 The strict evidence switch in the requested patch is
 `DG_IGR_DGSEM_PRODUCTION_STRICT=1`.  A supported tuple executes the persistent
@@ -15,7 +15,7 @@ worker path on both CPU and CUDA.  An unsupported tuple logs its reason before
 using the existing host oracle in ordinary mode and aborts before output writes
 in strict mode.
 
-## Exact coordinator-owned patch
+## Historical coordinator-owned design patch
 
 ```diff
 diff --git a/include/numerics/dg/DGHyperbolicConservationLaws.hpp b/include/numerics/dg/DGHyperbolicConservationLaws.hpp
@@ -222,24 +222,21 @@ storage, after the first successful call.  This proves narrowly zero
 worker-owned rebuild-scratch construction on unchanged admission plus stable
 persistent storage; it is not
 allocator-wide MFEM/MPI/backend instrumentation and makes no performance claim.
-Any allocator-level proof, and any work on the deliberately deterministic
-O(rows*faces) face scan, remains for a separately authorized
-`PROFILE-DGSEM-01`; that task must not start while `B-DGSEM-OP-001` remains
-open.
+Any allocator-level proof and any work on the deliberately deterministic
+O(rows*faces) face scan remain for separately authorized profiling after the
+production composition gate is independently accepted.
 
-## Independently evidenced output/restart blocker
+## Accepted output/restart foundation
 
-The existing VTK lifecycle and cold-restart matrix remains green, but it is an
-L2 DG matrix.  `src/io/vtk_restart.cpp` rejects `DGBackend::DGSEM` at its
-reconstruction preflight and additionally requires a by-NODES Gauss-Legendre
-`L2_FECollection`.  DGSEM-OP-GPU-01 requires Gauss-Lobatto DGSEM restart
-identity, so the current loader cannot exercise that gate.
+DGSEM-RESTART-01 supplied the separately reviewed by-NODES Gauss-Lobatto
+p1--p4 reconstruction and exact cold-restart identity path.  Candidate
+`93f364fde9134c521c830935df6b33f3c9610c6d` was accepted, merged, and published
+in the exact `c01c0cbc20c3fa19c6a6ba05b364595330cf9aaa` composition base.
+Its CPU, two-rank MPI, reordered-piece rejection, sanitizer-bounded no-IGR
+loader, and one-rank CUDA restart evidence close the blocker described by the
+superseded prose above.
 
-The output/restart owner must either:
-
-1. add a separately reviewed DGSEM Gauss-Lobatto reconstruction and exact
-   cold-restart identity path without changing output/restart semantics; or
-2. explicitly revise the DGSEM-OP-GPU-01 gate to defer DGSEM cold restart.
-
-Until one of those actions and the production-`Mult` assertions pass, retain
-`B-DGSEM-OP-001` and do not launch `PROFILE-DGSEM-01` or `PERF-DGSEM-01`.
+The accepted CUDA restart run predates production composition and therefore
+proves the host-route restart path only.  Production-`Mult` CPU/MPI/CUDA,
+P/P^T, CFL, strict/fallback, and lifecycle assertions remain required before
+profiling or performance work can start.
