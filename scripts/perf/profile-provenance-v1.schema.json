@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dg-igr.local/schemas/profile-provenance-v1.schema.json",
+  "title": "Profile provenance v1",
+  "type": "object",
+  "required": ["schema_version", "created_utc", "tool", "capture", "source", "environment", "labels"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "created_utc": {"type": "string"},
+    "tool": {"type": "object", "required": ["name", "executable", "version"], "properties": {"name": {"type": "string", "minLength": 1}, "executable": {"$ref": "#/$defs/fact"}, "version": {"$ref": "#/$defs/fact"}}},
+    "capture": {"type": "object", "required": ["command", "output_stem"], "properties": {"command": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}, "output_stem": {"$ref": "#/$defs/fact"}}},
+    "source": {"type": "object", "required": ["root", "revision", "tree", "status"], "properties": {"root": {"$ref": "#/$defs/fact"}, "revision": {"$ref": "#/$defs/fact"}, "tree": {"$ref": "#/$defs/fact"}, "status": {"$ref": "#/$defs/fact"}}},
+    "environment": {"type": "object", "additionalProperties": {"$ref": "#/$defs/fact"}},
+    "labels": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}}
+  },
+  "$defs": {
+    "fact": {
+      "oneOf": [
+        {"type": "object", "required": ["status", "value"], "properties": {"status": {"const": "available"}, "value": {"type": "string", "minLength": 1}}},
+        {"type": "object", "required": ["status", "reason"], "properties": {"status": {"const": "unavailable"}, "reason": {"type": "string", "minLength": 1}}}
+      ]
+    }
+  }
+}
