@@ -83,8 +83,8 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def regular_bytes(path: Path, out_dir: Path) -> bytes:
-    """Read a regular, non-symlink artifact confined to out_dir."""
+def regular_snapshot(path: Path, out_dir: Path) -> tuple[bytes, dict[str, int]]:
+    """Read a regular, non-symlink artifact with its open-file identity."""
     try:
         relative = path.relative_to(out_dir)
         current = out_dir
@@ -106,9 +106,16 @@ def regular_bytes(path: Path, out_dir: Path) -> bytes:
         final = os.lstat(path)
         if final.st_ino != info.st_ino or final.st_dev != info.st_dev or stat.S_ISLNK(final.st_mode):
             raise ValueError(f"artifact changed while reading: {relative}")
-        return data
+        return data, {"st_dev": info.st_dev, "st_ino": info.st_ino,
+                      "st_ctime_ns": info.st_ctime_ns, "st_size": info.st_size}
     except (OSError, ValueError) as exc:
         raise ValueError(str(exc)) from exc
+
+
+def regular_bytes(path: Path, out_dir: Path) -> bytes:
+    """Read a regular, non-symlink artifact confined to out_dir."""
+    return regular_snapshot(path, out_dir)[0]
+
 
 def write_exclusive_json(path: Path, payload: dict[str, Any]) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -240,12 +247,13 @@ def write_provenance(args: argparse.Namespace, command: list[str], tool: str | N
 
 
 def pin_provenance(path: Path, out_dir: Path) -> dict[str, Any]:
-    data = regular_bytes(path, out_dir)
+    data, identity = regular_snapshot(path, out_dir)
     try:
         payload = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"provenance is not valid JSON: {exc}") from exc
-    return {"path": path, "bytes": len(data), "sha256": sha256_bytes(data), "payload": payload}
+    return {"path": path, "bytes": len(data), "sha256": sha256_bytes(data), "payload": payload,
+            "identity": identity}
 
 
 def unchanged_provenance(pin: dict[str, Any], out_dir: Path) -> bool:
@@ -253,7 +261,8 @@ def unchanged_provenance(pin: dict[str, Any], out_dir: Path) -> bool:
         current = pin_provenance(pin["path"], out_dir)
     except (RuntimeError, ValueError):
         return False
-    return current["bytes"] == pin["bytes"] and current["sha256"] == pin["sha256"] and current["payload"] == pin["payload"]
+    return (current["bytes"] == pin["bytes"] and current["sha256"] == pin["sha256"]
+            and current["payload"] == pin["payload"] and current["identity"] == pin["identity"])
 
 
 def pinned_environment(pin: dict[str, Any] | None) -> dict[str, Any]:

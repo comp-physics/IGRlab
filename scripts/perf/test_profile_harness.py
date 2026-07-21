@@ -177,6 +177,12 @@ def main() -> int:
             "--ncu-target-processes", "all", "--ncu-set", "basic", "--require-data", "summary=summary.txt", expected=6)
         replacement_manifest = read_manifest(replaced_pin)
         assert replacement_manifest["outcome"] == "validation_failure"
+        recreate_pin = root / "recreate-pin-ncu"
+        executable(recreate_pin, "import pathlib\np=pathlib.Path.cwd()\ncontents=(p / 'profile-provenance.json').read_bytes()\n(p / 'summary.txt').write_text('ok')\n(p / 'profile-provenance.json').unlink()\n(p / 'profile-provenance.json').write_bytes(contents)\n")
+        recreated_pin = root / "recreated-pin"
+        run("--level", "l2-ncu", *common(app, recreated_pin), "--tool-executable", str(recreate_pin),
+            "--ncu-target-processes", "all", "--ncu-set", "basic", "--require-data", "summary=summary.txt", expected=6)
+        assert read_manifest(recreated_pin)["outcome"] == "validation_failure"
     print("profile-harness-test: pass")
     return 0
 
