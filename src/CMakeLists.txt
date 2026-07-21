@@ -64,6 +64,10 @@ target_include_directories(igr_mfem PRIVATE
     ${CMAKE_SOURCE_DIR}/tpl/mfem/fem
     ${CMAKE_SOURCE_DIR}/tpl/mfem/general
 )
+target_compile_definitions(igr_mfem PUBLIC
+    DG_IGR_ENABLE_OBSERVABILITY=$<BOOL:${DG_IGR_ENABLE_OBSERVABILITY}>
+    DG_IGR_OBSERVABILITY_USE_NVTX=$<BOOL:${DG_IGR_OBSERVABILITY_USE_NVTX}>
+)
 
 # Link MFEM
 target_link_libraries(igr_mfem PUBLIC mfem ZLIB::ZLIB)
