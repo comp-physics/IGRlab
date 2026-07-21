@@ -1,5 +1,30 @@
 # Unit tests for dg_igr miniapp
 
+function(dg_igr_add_observability_test target_name compile_enabled)
+  add_executable(${target_name} test_observability.cpp)
+  set_target_properties(${target_name} PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+  target_include_directories(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_compile_definitions(${target_name} PRIVATE
+    DG_IGR_ENABLE_OBSERVABILITY=${compile_enabled}
+    DG_IGR_OBSERVABILITY_USE_NVTX=0
+  )
+  target_compile_options(${target_name} PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+  )
+  add_test(NAME ${target_name} COMMAND ${target_name})
+  set_tests_properties(${target_name} PROPERTIES
+    LABELS "observability;contract"
+    TIMEOUT 30
+  )
+endfunction()
+
+dg_igr_add_observability_test(dg_igr_observability_noop_test 0)
+dg_igr_add_observability_test(dg_igr_observability_recording_test 1)
+
 add_executable(dg_igr_frozen_scalar_igr_algebra_test
   test_frozen_scalar_igr_algebra.cpp
 )

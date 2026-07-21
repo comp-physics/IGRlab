@@ -7,6 +7,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(CTest)
 include(CheckLanguage)
 option(DG_IGR_BUILD_TESTS "Build dg_igr unit tests" ON)
+option(DG_IGR_ENABLE_OBSERVABILITY
+       "Compile the core observability contract (runtime remains default-off)."
+       OFF)
+option(DG_IGR_OBSERVABILITY_USE_NVTX
+       "Use the NVTX adapter for compiled observability regions."
+       OFF)
+if(DG_IGR_OBSERVABILITY_USE_NVTX AND NOT DG_IGR_ENABLE_OBSERVABILITY)
+    message(FATAL_ERROR
+            "DG_IGR_OBSERVABILITY_USE_NVTX requires DG_IGR_ENABLE_OBSERVABILITY=ON.")
+endif()
 option(DG_IGR_REQUIRE_MFEM_CUDA
        "Fail configure unless the discovered MFEM package has CUDA enabled."
        OFF)
