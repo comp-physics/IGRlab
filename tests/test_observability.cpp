@@ -12,7 +12,7 @@ static_assert(obs::region_name(obs::RegionId::dg_mult)[0] == 'D');
 static_assert(obs::counter_name(obs::CounterId::iterations)[0] == 'c');
 static_assert(!std::is_polymorphic<obs::NoopBackend>::value);
 
-#if DG_IGR_ENABLE_OBSERVABILITY
+#if DG_IGR_ENABLE_OBSERVABILITY && !DG_IGR_OBSERVABILITY_USE_CALIPER
 
 using Recorder = obs::StaticRecordingBackend<8>;
 
@@ -77,8 +77,27 @@ static int check_recording_backend()
 
 #else
 
+#if DG_IGR_ENABLE_OBSERVABILITY
+static_assert(obs::compile_enabled);
+static_assert(obs::caliper_backend_enabled);
+static_assert(!obs::nvtx_backend_enabled);
+static_assert(std::is_same<obs::DefaultBackend, obs::CaliperBackend>::value);
+static_assert(!std::is_polymorphic<obs::CaliperBackend>::value);
+
+static int check_caliper_adapter()
+{
+  // Runtime remains disabled: this verifies the selected static adapter and
+  // its link interface without producing a Caliper capture.
+  obs::set_runtime_enabled(false);
+  dg_igr::NVTXRange region(obs::RegionId::dg_mult);
+  obs::record_counter(obs::CounterId::iterations, std::int64_t{1} << 40);
+  return obs::runtime_enabled() ? 1 : 0;
+}
+
+#else
 static_assert(!obs::compile_enabled);
 static_assert(!obs::nvtx_backend_enabled);
+static_assert(!obs::caliper_backend_enabled);
 static_assert(std::is_same<obs::DefaultBackend, obs::NoopBackend>::value);
 static_assert(std::is_empty<dg_igr::NVTXRange>::value);
 static_assert(std::is_trivially_destructible<dg_igr::NVTXRange>::value);
@@ -93,14 +112,18 @@ static int disabled_probe(const int input) noexcept
 
 #endif
 
+#endif
+
 int main()
 {
   // Header availability cannot turn on either gate.
-#if DG_IGR_ENABLE_OBSERVABILITY
+#if DG_IGR_ENABLE_OBSERVABILITY && !DG_IGR_OBSERVABILITY_USE_CALIPER
   static_assert(obs::compile_enabled);
   static_assert(!obs::nvtx_backend_enabled);
   dg_igr::NVTXRange compatibility("DG/Mult");
   return check_recording_backend();
+#elif DG_IGR_ENABLE_OBSERVABILITY
+  return check_caliper_adapter();
 #else
   obs::set_runtime_enabled(true);
   if (obs::runtime_enabled())
