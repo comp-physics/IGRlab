@@ -33,6 +33,9 @@ def main() -> int:
         assert payload["source"]["revision"]["status"] == "available"
         run(sys.executable, str(VALIDATOR), "--metadata", str(metadata), "--require", "tool.version", "--require", "source.tree", "--require", "environment.PROFILE_PROVENANCE_TEST")
         payload["tool"]["version"] = {"status": "unavailable", "reason": "not installed"}
+        rejected = run(sys.executable, str(WRITER), "--output", str(metadata), "--tool", "nsys", "--environment", "API_TOKEN", "--command", "application", expected=2)
+        assert "refuses sensitive key" in rejected.stderr
+
         metadata.write_text(json.dumps(payload), encoding="utf-8")
         run(sys.executable, str(VALIDATOR), "--metadata", str(metadata), "--require", "tool.version", expected=1)
     print("profile-provenance-test: pass")

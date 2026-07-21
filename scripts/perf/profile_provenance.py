@@ -32,6 +32,15 @@ def unavailable(reason: str) -> dict[str, str]:
 
 def supplied(value: str, name: str) -> dict[str, str]:
     return available(value) if value else unavailable(f"{name} was not supplied")
+SENSITIVE_ENV_COMPONENTS = frozenset(
+    {"ACCESSKEY", "APIKEY", "AUTH", "CREDENTIAL", "CREDENTIALS", "KEY",
+     "PASSWD", "PASSWORD", "PRIVATE", "PRIVATEKEY", "SECRET", "TOKEN"}
+)
+
+
+def is_sensitive_environment_key(key: str) -> bool:
+    return bool(set(key.upper().replace("-", "_").split("_")) & SENSITIVE_ENV_COMPONENTS)
+
 
 
 def git_value(root: Path, *args: str) -> dict[str, str]:
@@ -124,6 +133,8 @@ def main() -> int:
     for key in args.environment:
         if not key or "=" in key:
             parser.error(f"--environment expects a variable name: {key!r}")
+        if is_sensitive_environment_key(key):
+            parser.error(f"--environment refuses sensitive key: {key!r}")
         environment[key] = (
             available(os.environ[key])
             if key in os.environ
