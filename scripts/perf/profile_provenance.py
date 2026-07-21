@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -32,11 +33,14 @@ def unavailable(reason: str) -> dict[str, str]:
 
 def supplied(value: str, name: str) -> dict[str, str]:
     return available(value) if value else unavailable(f"{name} was not supplied")
+
+
 SENSITIVE_ENV_COMPONENTS = frozenset(
-    {"ACCESSKEY", "APIKEY", "AUTH", "CREDENTIAL", "CREDENTIALS", "KEY",
+    {"ACCESSKEY", "APIKEY", "AUTH", "AUTHENTICATION", "CREDENTIAL", "CREDENTIALS", "KEY",
      "PASSWD", "PASSWORD", "PRIVATE", "PRIVATEKEY", "SECRET", "TOKEN"}
 )
 
+ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 def is_sensitive_environment_key(key: str) -> bool:
     return bool(set(key.upper().replace("-", "_").split("_")) & SENSITIVE_ENV_COMPONENTS)
@@ -130,9 +134,13 @@ def main() -> int:
         parser.error("--command must contain a non-empty command after --")
 
     environment: dict[str, dict[str, str]] = {}
+    seen_environment_keys: set[str] = set()
     for key in args.environment:
-        if not key or "=" in key:
-            parser.error(f"--environment expects a variable name: {key!r}")
+        if not ENVIRONMENT_NAME_RE.fullmatch(key):
+            parser.error(f"--environment expects a portable variable name: {key!r}")
+        if key in seen_environment_keys:
+            parser.error(f"duplicate environment key: {key!r}")
+        seen_environment_keys.add(key)
         if is_sensitive_environment_key(key):
             parser.error(f"--environment refuses sensitive key: {key!r}")
         environment[key] = (

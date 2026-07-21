@@ -12,7 +12,10 @@ This record preserves the auditable lineage needed to rebuild profiling support 
 
 ## Recovered seed
 
-`profile_provenance.py` writes a sidecar from explicit capture inputs. It never invokes Nsight, queries a GPU, scans a build tree, or supplies application arguments. It refuses requested environment keys with secret, credential, authentication, private, or key components. `validate_profile_provenance.py` validates the sidecar and can make a requested fact mandatory with `--require`; absent requested facts fail explicitly rather than becoming a silent skip. The JSON schema documents the stable v1 boundary.
+`profile_provenance.py` writes a sidecar from explicit capture inputs. It never invokes Nsight, queries a GPU, scans a build tree, or supplies application arguments. Its recognized-sensitive-component denylist rejects likely secret-bearing environment names; it is not a complete secret detector. `validate_profile_provenance.py` validates the sidecar and can make a requested fact mandatory with `--require`; absent requested facts fail explicitly rather than becoming a silent skip. The JSON schema documents the stable v1 boundary.
+
+`RETAINED_EVIDENCE.md` records the selected historical/protected Nsight evidence
+families, their immutable file identities, and their retained provenance.
 
 The base ignores `tools/`, so this recovery deliberately uses the owned, tracked `scripts/perf/` path instead of the initially considered `tools/perf/` location.
 

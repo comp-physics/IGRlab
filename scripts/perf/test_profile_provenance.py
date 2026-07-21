@@ -31,10 +31,16 @@ def main() -> int:
         assert payload["tool"]["name"] == "nsys"
         assert payload["capture"]["command"] == ["application", "--device", "cuda"]
         assert payload["source"]["revision"]["status"] == "available"
+        assert payload["environment"]["PROFILE_PROVENANCE_TEST"]["status"] == "available"
         run(sys.executable, str(VALIDATOR), "--metadata", str(metadata), "--require", "tool.version", "--require", "source.tree", "--require", "environment.PROFILE_PROVENANCE_TEST")
         payload["tool"]["version"] = {"status": "unavailable", "reason": "not installed"}
-        rejected = run(sys.executable, str(WRITER), "--output", str(metadata), "--tool", "nsys", "--environment", "API_TOKEN", "--command", "application", expected=2)
-        assert "refuses sensitive key" in rejected.stderr
+        for key in ("TOKEN", "PASSWORD", "SECRET", "CREDENTIAL", "AUTH", "AUTHENTICATION", "PRIVATE", "API_KEY", "ACCESS_KEY"):
+            rejected = run(sys.executable, str(WRITER), "--output", str(metadata), "--tool", "nsys", "--environment", key, "--command", "application", expected=2)
+            assert "refuses sensitive key" in rejected.stderr
+        duplicate = run(sys.executable, str(WRITER), "--output", str(metadata), "--tool", "nsys", "--environment", "PROFILE_PROVENANCE_TEST", "--environment", "PROFILE_PROVENANCE_TEST", "--command", "application", expected=2)
+        assert "duplicate environment key" in duplicate.stderr
+        malformed = run(sys.executable, str(WRITER), "--output", str(metadata), "--tool", "nsys", "--environment", "not-valid", "--command", "application", expected=2)
+        assert "portable variable name" in malformed.stderr
 
         metadata.write_text(json.dumps(payload), encoding="utf-8")
         run(sys.executable, str(VALIDATOR), "--metadata", str(metadata), "--require", "tool.version", expected=1)
