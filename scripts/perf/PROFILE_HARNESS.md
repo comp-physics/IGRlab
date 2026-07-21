@@ -13,7 +13,8 @@ CUDA, MPI, mesh, order, time-step, or physics default.
   standard-deviation dispersion.
 - `--level l2-nsys` requires `--tool-executable`, `--nsys-trace`,
   `--nsys-sample`, and at least one `--require-data NAME=RELATIVE_PATH`.
-- `--level l2-ncu` requires `--tool-executable`, an explicit `--ncu-set` or
+- `--level l2-ncu` requires `--tool-executable`, explicit
+  `--ncu-target-processes application-only|all`, an explicit `--ncu-set` or
   `--ncu-section`, and at least one `--require-data NAME=RELATIVE_PATH`.
 
 L2 command construction preserves requested trace/sample or metric/filter
@@ -27,7 +28,15 @@ is `tool_unavailable` (exit 3), a non-zero process or launch `OSError` is
 use argparse exit 2.
 
 Outputs are confined to a newly-created `--out-dir`; path traversal and
-absolute requested-data paths are rejected. `profile-provenance.json` reuses
+absolute requested-data paths are rejected. Harness-owned
+`profile-provenance.json`, `execution.log`, and `profile-manifest.json` are
+reserved from requested data and use exclusive no-follow creation. Required
+data must be a non-empty regular file with no symlink path component and must
+resolve under the output directory. The provenance sidecar is validated and
+integrity-pinned before execution, then revalidated unchanged afterward; any
+deletion, replacement, symlink, or byte/schema change is a validation failure.
+Final manifest provenance fields come solely from that initial pin.
+`profile-provenance.json` reuses
 the accepted v1 provenance writer/validator. `profile-manifest.json` is sorted
 JSON containing deterministic artifact paths, byte counts, SHA-256, generating
 command, supplied tool/executable/MFEM/GPU identities, executable byte count

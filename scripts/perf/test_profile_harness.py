@@ -75,12 +75,24 @@ def main() -> int:
         executable(ncu, "import pathlib\n(pathlib.Path.cwd() / 'summary.txt').write_text('summary')\n")
         ncu_out = root / "ncu"
         run("--level", "l2-ncu", *common(app, ncu_out), "--tool-executable", str(ncu),
+            "--ncu-target-processes", "all",
             "--ncu-set", "basic", "--ncu-section", "Occupancy", "--ncu-kernel-name-base", "demangled",
             "--ncu-kernel-name", "kernel.*", "--ncu-launch-count", "3", "--ncu-launch-skip", "2",
             "--ncu-nvtx-include", "DG/*", "--require-data", "summary=summary.txt")
         ncu_command = read_manifest(ncu_out)["generating_command"]
         for option in ("--set", "--section", "--kernel-name-base", "--kernel-name", "--launch-count", "--launch-skip", "--nvtx", "--nvtx-include"):
             assert option in ncu_command
+        assert ncu_command[ncu_command.index("--target-processes") + 1] == "all"
+        ncu_dry = root / "ncu-dry"
+        run("--level", "l2-ncu", *common(app, ncu_dry), "--tool-executable", str(ncu),
+            "--ncu-target-processes", "application-only", "--ncu-set", "basic",
+            "--require-data", "summary=summary.txt", "--dry-run")
+        dry_ncu_command = read_manifest(ncu_dry)["generating_command"]
+        assert dry_ncu_command[dry_ncu_command.index("--target-processes") + 1] == "application-only"
+        missing_ncu_target = root / "missing-ncu-target"
+        assert "ncu-target-processes" in run("--level", "l2-ncu", *common(app, missing_ncu_target),
+                                               "--tool-executable", str(ncu), "--ncu-set", "basic",
+                                               "--require-data", "summary=summary.txt", expected=2).stderr
         dry = root / "dry"
         run("--level", "l2-nsys", *common(app, dry), "--tool-executable", str(root / "not-installed"),
             "--nsys-trace", "cuda", "--nsys-sample", "none", "--require-data", "table=table.csv", "--dry-run")
@@ -91,12 +103,14 @@ def main() -> int:
         assert read_manifest(missing_tool)["outcome"] == "tool_unavailable"
         missing_data = root / "missing-data"
         run("--level", "l2-ncu", *common(app, missing_data), "--tool-executable", str(ncu),
+            "--ncu-target-processes", "all",
             "--ncu-set", "basic", "--require-data", "missing=missing.csv", expected=4)
         assert read_manifest(missing_data)["outcome"] == "data_unavailable"
         empty_ncu = root / "fake-empty-ncu"
         executable(empty_ncu, "import pathlib\n(pathlib.Path.cwd() / 'empty.csv').write_text('')\n")
         empty_data = root / "empty-data"
         run("--level", "l2-ncu", *common(app, empty_data), "--tool-executable", str(empty_ncu),
+            "--ncu-target-processes", "all",
             "--ncu-set", "basic", "--require-data", "empty=empty.csv", expected=4)
         assert read_manifest(empty_data)["outcome"] == "data_unavailable"
         bad = root / "bad-app"
@@ -114,6 +128,10 @@ def main() -> int:
         rejected = root / "rejected"
         assert "relative path" in run("--level", "l2-nsys", *common(app, rejected), "--tool-executable", str(nsys),
                                        "--nsys-trace", "cuda", "--nsys-sample", "none", "--require-data", "bad=../escape.csv", expected=2).stderr
+        log_alias = root / "log-alias"
+        assert "reserve" in run("--level", "l2-nsys", *common(app, log_alias), "--tool-executable", str(nsys),
+                                 "--nsys-trace", "cuda", "--nsys-sample", "none",
+                                 "--require-data", "log=execution.log", expected=2).stderr
         secret = "do-not-write-this-secret"
         sensitive = root / "sensitive"
         sensitive_result = run("--level", "l0", *common(app, sensitive), "--environment", "API_TOKEN", expected=6,
@@ -129,6 +147,36 @@ def main() -> int:
         assert relative_manifest["outcome"] == "success"
         assert relative_manifest["identity"]["executable"]["path"] == str(app.resolve())
         assert relative_manifest["source_dirty_state"]["status"] == "available"
+        victim = root / "outside-victim"
+        victim.write_text("unchanged", encoding="utf-8")
+        manifest_attacker = root / "manifest-attacker"
+        executable(manifest_attacker, "import os\nos.symlink(os.environ['VICTIM'], 'profile-manifest.json')\n")
+        manifest_attack = root / "manifest-attack"
+        run("--level", "l0", *common(manifest_attacker, manifest_attack), expected=6,
+            env={**os.environ, "VICTIM": str(victim)})
+        assert victim.read_text(encoding="utf-8") == "unchanged"
+        assert (manifest_attack / "profile-manifest.json").is_symlink()
+        symlink_ncu = root / "symlink-ncu"
+        executable(symlink_ncu, "import os\nos.symlink(os.environ['VICTIM'], 'outside.csv')\n")
+        symlink_data = root / "symlink-data"
+        run("--level", "l2-ncu", *common(app, symlink_data), "--tool-executable", str(symlink_ncu),
+            "--ncu-target-processes", "all", "--ncu-set", "basic", "--require-data", "outside=outside.csv",
+            expected=4, env={**os.environ, "VICTIM": str(victim)})
+        assert victim.read_text(encoding="utf-8") == "unchanged"
+        assert (symlink_data / "outside.csv").is_symlink()
+        delete_pin = root / "delete-pin-ncu"
+        executable(delete_pin, "import pathlib\np=pathlib.Path.cwd()\n(p / 'summary.txt').write_text('ok')\n(p / 'profile-provenance.json').unlink()\n")
+        deleted_pin = root / "deleted-pin"
+        run("--level", "l2-ncu", *common(app, deleted_pin), "--tool-executable", str(delete_pin),
+            "--ncu-target-processes", "all", "--ncu-set", "basic", "--require-data", "summary=summary.txt", expected=6)
+        assert read_manifest(deleted_pin)["outcome"] == "validation_failure"
+        replace_pin = root / "replace-pin-ncu"
+        executable(replace_pin, "import pathlib\np=pathlib.Path.cwd()\n(p / 'summary.txt').write_text('ok')\n(p / 'profile-provenance.json').write_text('{}')\n")
+        replaced_pin = root / "replaced-pin"
+        run("--level", "l2-ncu", *common(app, replaced_pin), "--tool-executable", str(replace_pin),
+            "--ncu-target-processes", "all", "--ncu-set", "basic", "--require-data", "summary=summary.txt", expected=6)
+        replacement_manifest = read_manifest(replaced_pin)
+        assert replacement_manifest["outcome"] == "validation_failure"
     print("profile-harness-test: pass")
     return 0
 

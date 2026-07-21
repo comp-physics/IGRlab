@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import statistics
 import subprocess
 import sys
@@ -27,6 +28,7 @@ PROVENANCE_VALIDATOR = ROOT / "scripts/perf/validate_profile_provenance.py"
 EXIT_TOOL_UNAVAILABLE = 3
 EXIT_DATA_UNAVAILABLE = 4
 EXIT_EXECUTION_FAILURE = 5
+RESERVED_ARTIFACTS = frozenset({"profile-provenance.json", "profile-manifest.json", "execution.log"})
 EXIT_VALIDATION_FAILURE = 6
 
 
@@ -57,10 +59,16 @@ def sha256(path: Path) -> str:
             digest.update(chunk)
     return digest.hexdigest()
 
+def sha256_bytes(data: bytes) -> str:
+    digest = hashlib.sha256()
+    digest.update(data)
+    return digest.hexdigest()
+
 
 def artifact_entry(path: Path, out_dir: Path, command: list[str]) -> dict[str, Any]:
-    return {"path": path.relative_to(out_dir).as_posix(), "bytes": path.stat().st_size,
-            "sha256": sha256(path), "generating_command": command}
+    data = regular_bytes(path, out_dir)
+    return {"path": path.relative_to(out_dir).as_posix(), "bytes": len(data),
+            "sha256": sha256_bytes(data), "generating_command": command}
 
 
 def tool_path(value: str) -> str | None:
@@ -73,6 +81,40 @@ def tool_path(value: str) -> str | None:
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def regular_bytes(path: Path, out_dir: Path) -> bytes:
+    """Read a regular, non-symlink artifact confined to out_dir."""
+    try:
+        relative = path.relative_to(out_dir)
+        current = out_dir
+        for component in relative.parts:
+            current = current / component
+            if current.is_symlink():
+                raise ValueError(f"symlink path component: {relative}")
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"not a regular file: {relative}")
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(out_dir.resolve(strict=True)):
+            raise ValueError(f"path escapes output directory: {relative}")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"not a regular file: {relative}")
+            data = stream.read()
+        final = os.lstat(path)
+        if final.st_ino != info.st_ino or final.st_dev != info.st_dev or stat.S_ISLNK(final.st_mode):
+            raise ValueError(f"artifact changed while reading: {relative}")
+        return data
+    except (OSError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+
+def write_exclusive_json(path: Path, payload: dict[str, Any]) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -94,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nsys-trace", default="", help="Required L2 Nsys trace set.")
     parser.add_argument("--nsys-sample", default="", help="Required L2 Nsys sample mode.")
     parser.add_argument("--ncu-set", default="", help="Explicit NCU metric set.")
+    parser.add_argument("--ncu-target-processes", choices=("application-only", "all"), default="")
     parser.add_argument("--ncu-section", action="append", default=[], help="Explicit NCU section; repeat as needed.")
     parser.add_argument("--ncu-kernel-name", default="", help="Explicit NCU kernel-name filter.")
     parser.add_argument("--ncu-kernel-name-base", default="", help="Explicit NCU kernel-name-base semantics.")
@@ -125,13 +168,15 @@ def validate_inputs(parser: argparse.ArgumentParser, args: argparse.Namespace) -
         parser.error("L2 Nsys requires explicit --nsys-trace and --nsys-sample")
     if args.level == "l2-ncu" and not (args.ncu_set or args.ncu_section):
         parser.error("L2 NCU requires explicit --ncu-set or at least one --ncu-section")
+    if args.level == "l2-ncu" and not args.ncu_target_processes:
+        parser.error("L2 NCU requires explicit --ncu-target-processes")
     if args.level.startswith("l2-") and not args.require_data:
         parser.error("L2 requires at least one explicit --require-data NAME=RELATIVE_PATH")
     names = [name for name, _ in args.require_data]
     if len(set(names)) != len(names):
         parser.error("duplicate --require-data name")
     for _, relative in args.require_data:
-        if relative in {Path("profile-manifest.json"), Path("profile-provenance.json")}:
+        if relative.as_posix() in RESERVED_ARTIFACTS:
             parser.error("--require-data cannot reserve a harness-owned artifact name")
 
 
@@ -144,7 +189,7 @@ def build_command(args: argparse.Namespace, tool: str | None) -> list[str]:
     if args.level == "l2-nsys":
         return [tool, "profile", "--trace", args.nsys_trace, "--sample", args.nsys_sample,
                 "--force-overwrite=true", "--output", str(stem), *app_command]
-    command = [tool, "--target-processes", "application-only", "--force-overwrite", "--export", str(stem)]
+    command = [tool, "--target-processes", args.ncu_target_processes, "--force-overwrite", "--export", str(stem)]
     if args.ncu_set:
         command.extend(("--set", args.ncu_set))
     for section in args.ncu_section:
@@ -191,6 +236,31 @@ def write_provenance(args: argparse.Namespace, command: list[str], tool: str | N
     result = subprocess.run(validator_command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "provenance validator failed")
+    return pin_provenance(output, args.out_dir)
+
+
+def pin_provenance(path: Path, out_dir: Path) -> dict[str, Any]:
+    data = regular_bytes(path, out_dir)
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"provenance is not valid JSON: {exc}") from exc
+    return {"path": path, "bytes": len(data), "sha256": sha256_bytes(data), "payload": payload}
+
+
+def unchanged_provenance(pin: dict[str, Any], out_dir: Path) -> bool:
+    try:
+        current = pin_provenance(pin["path"], out_dir)
+    except (RuntimeError, ValueError):
+        return False
+    return current["bytes"] == pin["bytes"] and current["sha256"] == pin["sha256"] and current["payload"] == pin["payload"]
+
+
+def pinned_environment(pin: dict[str, Any] | None) -> dict[str, Any]:
+    if not pin:
+        return {}
+    environment = pin["payload"].get("environment")
+    return environment if isinstance(environment, dict) else {}
 
 
 def dirty_state(out_dir: Path) -> dict[str, str]:
@@ -211,11 +281,30 @@ def recorded_environment(out_dir: Path, provenance_valid: bool) -> dict[str, Any
     return environment if isinstance(environment, dict) else {}
 
 
+def safe_existing(paths: list[Path], out_dir: Path) -> list[Path]:
+    accepted: list[Path] = []
+    for path in paths:
+        try:
+            regular_bytes(path, out_dir)
+        except ValueError:
+            continue
+        accepted.append(path)
+    return sorted(accepted, key=lambda path: path.relative_to(out_dir).as_posix())
+def missing_requested(args: argparse.Namespace) -> list[str]:
+    missing: list[str] = []
+    for name, relative in args.require_data:
+        try:
+            if not regular_bytes(args.out_dir / relative, args.out_dir):
+                missing.append(f"{name}={relative}")
+        except ValueError:
+            missing.append(f"{name}={relative}")
+    return missing
+
 def make_manifest(args: argparse.Namespace, command: list[str], tool: str | None, outcome: str, detail: str,
-                  artifacts: list[Path], timings: list[float], provenance_valid: bool) -> dict[str, Any]:
-    selected_environment = recorded_environment(args.out_dir, provenance_valid)
+                  artifacts: list[Path], timings: list[float], pin: dict[str, Any] | None) -> dict[str, Any]:
+    selected_environment = pinned_environment(pin)
     requested = [{"name": name, "path": path.as_posix()} for name, path in sorted(args.require_data)]
-    existing = sorted((path for path in artifacts if path.is_file()), key=lambda path: path.relative_to(args.out_dir).as_posix())
+    existing = safe_existing(artifacts, args.out_dir)
     executable_identity = {"path": str(args.exe), "bytes": args.exe.stat().st_size, "sha256": sha256(args.exe)}
     timing_statistics: dict[str, float | int] = {"measured_repetitions": len(timings)}
     if timings:
@@ -226,7 +315,7 @@ def make_manifest(args: argparse.Namespace, command: list[str], tool: str | None
             "identity": {"tool": args.level.removeprefix("l2-") if args.level.startswith("l2-") else "none",
                          "tool_executable": tool or "unavailable", "tool_version": args.tool_version or "unavailable",
                          "executable": executable_identity, "mfem": args.mfem_identity or "unavailable", "gpu": args.gpu_identity or "unavailable"},
-            "environment": selected_environment, "requested_data": requested, "source_dirty_state": dirty_state(args.out_dir),
+            "environment": selected_environment, "requested_data": requested, "source_dirty_state": pin["payload"].get("source", {}).get("status", {"status": "unavailable", "reason": "no pinned provenance"}) if pin else {"status": "unavailable", "reason": "no pinned provenance"},
             "timing_seconds": timings, "timing_statistics": timing_statistics,
             "artifacts": [artifact_entry(path, args.out_dir, command) for path in existing]}
 
@@ -234,7 +323,11 @@ def make_manifest(args: argparse.Namespace, command: list[str], tool: str | None
 def execute(command: list[str], log_path: Path, warmups: int, repetitions: int) -> tuple[int, list[float], str]:
     """Run explicit warm-ups, then record only measured repetition durations."""
     timings: list[float] = []
-    with log_path.open("w", encoding="utf-8") as log:
+    try:
+        descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as exc:
+        return 127, timings, f"could not create execution log: {exc}"
+    with os.fdopen(descriptor, "w", encoding="utf-8") as log:
         for _ in range(warmups):
             try:
                 result = subprocess.run(command, cwd=log_path.parent, stdout=log, stderr=subprocess.STDOUT)
@@ -268,11 +361,14 @@ def main() -> int:
     command = build_command(args, tool or args.tool_executable if args.level.startswith("l2-") else None)
     provenance = args.out_dir / "profile-provenance.json"
     try:
-        write_provenance(args, command, tool, provenance)
+        pin = write_provenance(args, command, tool, provenance)
     except RuntimeError as exc:
         print(f"profile-harness: provenance validation failure: {exc}", file=sys.stderr)
-        write_json(args.out_dir / "profile-manifest.json",
-                   make_manifest(args, command, tool, "validation_failure", str(exc), [provenance], [], False))
+        try:
+            write_exclusive_json(args.out_dir / "profile-manifest.json",
+                                 make_manifest(args, command, tool, "validation_failure", str(exc), [provenance], [], None))
+        except OSError:
+            pass
         return EXIT_VALIDATION_FAILURE
     artifacts: list[Path] = [provenance]
     timings: list[float] = []
@@ -286,8 +382,7 @@ def main() -> int:
         if returncode:
             outcome, detail, exit_code = "execution_failure", execution_detail or f"command exited {returncode}", EXIT_EXECUTION_FAILURE
         elif args.level.startswith("l2-"):
-            missing = [f"{name}={relative}" for name, relative in args.require_data
-                       if not (args.out_dir / relative).is_file() or (args.out_dir / relative).stat().st_size == 0]
+            missing = missing_requested(args)
             artifacts.extend(args.out_dir / relative for _, relative in args.require_data)
             if missing:
                 outcome, detail, exit_code = "data_unavailable", "missing requested data: " + ", ".join(missing), EXIT_DATA_UNAVAILABLE
@@ -295,8 +390,15 @@ def main() -> int:
                 detail = "command completed with all requested data present"
     else:
         artifacts.extend(args.out_dir / relative for _, relative in args.require_data)
+    if not args.dry_run and not unchanged_provenance(pin, args.out_dir):
+        outcome, detail, exit_code = "validation_failure", "pinned provenance changed or disappeared during execution", EXIT_VALIDATION_FAILURE
+        artifacts = [path for path in artifacts if path != provenance]
     manifest_path = args.out_dir / "profile-manifest.json"
-    write_json(manifest_path, make_manifest(args, command, tool, outcome, detail, artifacts, timings, True))
+    try:
+        write_exclusive_json(manifest_path, make_manifest(args, command, tool, outcome, detail, artifacts, timings, pin))
+    except OSError as exc:
+        print(f"profile-harness: manifest write failure: {exc}", file=sys.stderr)
+        return EXIT_VALIDATION_FAILURE
     print(f"profile-harness: outcome={outcome} manifest={manifest_path}")
     return exit_code
 
