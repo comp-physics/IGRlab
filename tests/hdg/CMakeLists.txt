@@ -5,6 +5,22 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   find_package(MPI REQUIRED COMPONENTS CXX)
 endif()
 
+add_executable(dg_igr_hdg_contract_test test_hdg_contract.cpp)
+target_include_directories(dg_igr_hdg_contract_test PRIVATE ../../include)
+target_compile_options(dg_igr_hdg_contract_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_contract_test PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+
+if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_test(NAME dg_igr_hdg_contract_cpu COMMAND dg_igr_hdg_contract_test)
+  set_tests_properties(dg_igr_hdg_contract_cpu PROPERTIES
+    LABELS "hdg;cpu;contract"
+    TIMEOUT 30)
+endif()
+
 if(NOT MFEM_VERSION_INT EQUAL 40900)
   message(FATAL_ERROR "HDG oracle requires immutable MFEM v4.9, got ${MFEM_VERSION}")
 endif()
