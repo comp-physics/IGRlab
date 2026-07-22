@@ -156,6 +156,26 @@ constexpr LocalIndex ReferenceDimension(const ReferenceGeometry reference) noexc
   return invalid_local_index;
 }
 
+constexpr bool IsValidReferenceGeometry(
+    const ReferenceGeometry reference) noexcept
+{
+  switch (reference)
+  {
+    case ReferenceGeometry::point:
+    case ReferenceGeometry::segment:
+    case ReferenceGeometry::triangle:
+    case ReferenceGeometry::quadrilateral:
+    case ReferenceGeometry::tetrahedron:
+    case ReferenceGeometry::hexahedron:
+    case ReferenceGeometry::prism:
+    case ReferenceGeometry::pyramid:
+      return true;
+    case ReferenceGeometry::unknown:
+      return false;
+  }
+  return false;
+}
+
 constexpr bool IsValidOwnership(const Ownership ownership) noexcept
 {
   return ownership == Ownership::owned || ownership == Ownership::ghost;
@@ -334,6 +354,7 @@ struct HdgTopologyStorage
     for (const auto& geometry : geometries)
     {
       if (geometry.global_id < 0 ||
+          !IsValidReferenceGeometry(geometry.reference) ||
           ReferenceDimension(geometry.reference) != geometry.reference_dimension ||
           geometry.space_dimension < geometry.reference_dimension ||
           geometry.mapping_order < 0 || geometry.quadrature_points < 0)
@@ -420,6 +441,13 @@ struct HdgTopologyStorage
             !IsValidOrientation(entry.orientation))
         {
           return false;
+        }
+        for (std::size_t previous = begin; previous < entry_index; ++previous)
+        {
+          if (element_faces[previous].face == entry.face)
+          {
+            return false;
+          }
         }
         const auto& face = faces[static_cast<std::size_t>(entry.face)];
         bool matches_face = false;

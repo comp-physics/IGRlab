@@ -85,9 +85,32 @@ struct WorkspaceLayout
   std::size_t scalars_per_batch = 0;
   std::size_t batch_count = 0;
 
-  constexpr std::size_t ScalarCount() const noexcept
+  constexpr bool TryScalarCount(std::size_t& scalar_count) const noexcept
   {
-    return scalars_per_batch * batch_count;
+    const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+    std::size_t expected_offset = 0;
+    const WorkspaceRegion regions[] = {local_residual,
+                                       local_jacobian,
+                                       factorization,
+                                       condensed_system,
+                                       temporary};
+    for (const WorkspaceRegion region : regions)
+    {
+      if (region.offset != expected_offset ||
+          region.size > maximum - expected_offset)
+      {
+        return false;
+      }
+      expected_offset += region.size;
+    }
+    if (scalars_per_batch != expected_offset ||
+        (scalars_per_batch != 0 &&
+         batch_count > maximum / scalars_per_batch))
+    {
+      return false;
+    }
+    scalar_count = scalars_per_batch * batch_count;
+    return true;
   }
 };
 
@@ -207,10 +230,16 @@ template <typename Scalar>
 class HostWorkspaceStorage
 {
 public:
-  void Resize(const WorkspaceLayout layout)
+  bool Resize(const WorkspaceLayout layout)
   {
+    std::size_t scalar_count = 0;
+    if (!layout.TryScalarCount(scalar_count) || scalar_count > storage_.max_size())
+    {
+      return false;
+    }
+    storage_.resize(scalar_count);
     layout_ = layout;
-    storage_.resize(layout.ScalarCount());
+    return true;
   }
 
   WorkspaceView<Scalar> View() noexcept
@@ -559,11 +588,81 @@ bool HasConsistentRangesForSpec(const HdgTopologyStorage& topology) noexcept
     return false;
   }
   const LocalIndex components = Spec::trace_component_count;
-  for (const auto& element : topology.elements)
+  for (std::size_t element_index = 0;
+       element_index < topology.elements.size();
+       ++element_index)
   {
+    const auto& element = topology.elements[element_index];
     if (element.blocks.trace_components != components)
     {
       return false;
+    }
+
+    const std::size_t expected_trace_dofs =
+        static_cast<std::size_t>(element.blocks.trace_dofs);
+    const std::size_t expected_scalar_entries =
+        static_cast<std::size_t>(element.blocks.TraceUnknowns());
+    const std::size_t incidence_begin =
+        static_cast<std::size_t>(topology.element_face_offsets[element_index]);
+    const std::size_t incidence_end = static_cast<std::size_t>(
+        topology.element_face_offsets[element_index + 1]);
+    std::size_t scalar_entries = 0;
+    for (std::size_t incidence = incidence_begin;
+         incidence < incidence_end;
+         ++incidence)
+    {
+      const LocalIndex face_index = topology.element_faces[incidence].face;
+      for (std::size_t previous = incidence_begin; previous < incidence;
+           ++previous)
+      {
+        if (topology.element_faces[previous].face == face_index)
+        {
+          return false;
+        }
+      }
+      const auto& face = topology.faces[static_cast<std::size_t>(face_index)];
+      const std::size_t face_scalar_entries =
+          static_cast<std::size_t>(face.trace_count);
+      if (face_scalar_entries > expected_scalar_entries - scalar_entries)
+      {
+        return false;
+      }
+      scalar_entries += face_scalar_entries;
+    }
+    if (scalar_entries != expected_scalar_entries)
+    {
+      return false;
+    }
+
+    for (LocalIndex component = 0; component < components; ++component)
+    {
+      std::size_t component_entries = 0;
+      for (std::size_t incidence = incidence_begin;
+           incidence < incidence_end;
+           ++incidence)
+      {
+        const auto& face = topology.faces[static_cast<std::size_t>(
+            topology.element_faces[incidence].face)];
+        const std::size_t trace_begin =
+            static_cast<std::size_t>(face.trace_offset);
+        const std::size_t trace_end =
+            trace_begin + static_cast<std::size_t>(face.trace_count);
+        for (std::size_t dof = trace_begin; dof < trace_end; ++dof)
+        {
+          if (topology.trace_dofs[dof].component == component)
+          {
+            if (component_entries == expected_trace_dofs)
+            {
+              return false;
+            }
+            ++component_entries;
+          }
+        }
+      }
+      if (component_entries != expected_trace_dofs)
+      {
+        return false;
+      }
     }
   }
   for (const auto& face : topology.faces)

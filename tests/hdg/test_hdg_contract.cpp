@@ -127,6 +127,27 @@ bool CheckTopologyRejections()
   }
   {
     HdgTopologyStorage topology = MakeTopology();
+    topology.elements[0].blocks.trace_dofs = 1;
+    if (!topology.HasConsistentRanges() ||
+        HasConsistentRangesForSpec<TestSpec>(topology))
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    for (auto& dof : topology.trace_dofs)
+    {
+      dof.component = 0;
+    }
+    if (!topology.HasConsistentRanges() ||
+        HasConsistentRangesForSpec<TestSpec>(topology))
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
     topology.elements[0].blocks.interior_dofs = -1;
     if (topology.HasConsistentRanges())
     {
@@ -161,6 +182,15 @@ bool CheckTopologyRejections()
   }
   {
     HdgTopologyStorage topology = MakeTopology();
+    topology.element_faces.push_back(topology.element_faces[0]);
+    topology.element_face_offsets.back() = 2;
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
     topology.trace_dofs[0].face = invalid_local_index;
     if (topology.HasConsistentRanges())
     {
@@ -170,6 +200,32 @@ bool CheckTopologyRejections()
   {
     HdgTopologyStorage topology = MakeTopology();
     topology.geometries[0].reference_dimension = 2;
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.geometries.push_back({41,
+                                   ReferenceGeometry::unknown,
+                                   invalid_local_index,
+                                   0,
+                                   0,
+                                   0});
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.geometries.push_back({41,
+                                   static_cast<ReferenceGeometry>(255),
+                                   invalid_local_index,
+                                   0,
+                                   0,
+                                   0});
     if (topology.HasConsistentRanges())
     {
       return false;
@@ -233,6 +289,7 @@ bool CheckStridesAndWorkspace()
   }
 
   WorkspaceLayout layout;
+  std::size_t scalar_count = 0;
   if (!TryMakeWorkspaceLayout({2, 1, 2, 8}, 3, 7, layout) ||
       TryMakeWorkspaceLayout({-1, 1, 2, 8}, 3, 7, layout) ||
       TryMakeWorkspaceLayout({std::numeric_limits<LocalIndex>::max(),
@@ -253,16 +310,44 @@ bool CheckStridesAndWorkspace()
           layout.factorization.offset + layout.factorization.size ||
       layout.temporary.offset !=
           layout.condensed_system.offset + layout.condensed_system.size ||
-      layout.ScalarCount() != layout.scalars_per_batch * 3)
+      !layout.TryScalarCount(scalar_count) ||
+      scalar_count != layout.scalars_per_batch * 3)
   {
     return false;
   }
 
   HostWorkspaceStorage<double> workspace;
-  workspace.Resize(layout);
+  if (!workspace.Resize(layout))
+  {
+    return false;
+  }
   const auto view = workspace.View();
   view.RegionData(2, layout.temporary)[6] = 9.0;
-  return view.BatchData(2)[layout.temporary.offset + 6] == 9.0;
+  if (view.BatchData(2)[layout.temporary.offset + 6] != 9.0)
+  {
+    return false;
+  }
+
+  const std::size_t overflowing_stride =
+      std::numeric_limits<std::size_t>::max() / 2 + 1;
+  WorkspaceLayout forged_overflow{};
+  forged_overflow.temporary = {0, overflowing_stride};
+  forged_overflow.scalars_per_batch = overflowing_stride;
+  forged_overflow.batch_count = 2;
+  HostWorkspaceStorage<double> forged_workspace;
+  if (forged_workspace.Resize(forged_overflow) ||
+      forged_workspace.Layout().scalars_per_batch != 0 ||
+      forged_workspace.Layout().batch_count != 0 ||
+      forged_workspace.View().layout.scalars_per_batch != 0)
+  {
+    return false;
+  }
+
+  WorkspaceLayout forged_regions = layout;
+  ++forged_regions.local_jacobian.offset;
+  return !forged_workspace.Resize(forged_regions) &&
+         forged_workspace.Layout().scalars_per_batch == 0 &&
+         forged_workspace.Layout().batch_count == 0;
 }
 
 struct StageRecord
