@@ -1,13 +1,13 @@
 #include "negative_support.hpp"
 
-struct BadLocal : hdg_negative::GoodLocal
+struct BadSolver
 {
-  virtual ~BadLocal() = default;
+  void Solve(int) {}
 };
 using BadPipeline = dg::hdg::Pipeline<hdg_negative::GoodSpec,
-                                      BadLocal,
+                                      hdg_negative::GoodLocal,
                                       hdg_negative::GoodCondensation,
                                       hdg_negative::GoodAssembly,
-                                      hdg_negative::GoodSolver,
+                                      BadSolver,
                                       hdg_negative::GoodRecovery>;
-static_assert(sizeof(BadPipeline) > 0, "must instantiate polymorphic phase");
+static_assert(sizeof(BadPipeline) > 0, "force wrong Solve");

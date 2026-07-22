@@ -139,9 +139,9 @@ struct TraceTuple
   static_assert(sizeof...(Potentials) > 0,
                 "an HDG trace tuple needs at least one potential");
   static_assert((detail::IsTracePotential<Potentials>::value && ...),
-                "an HDG trace tuple requires TracePotential entries");
+                "HDG_CONTRACT_TRACE_POTENTIAL: trace tuple requires TracePotential entries");
   static_assert(detail::AreUnique<typename Potentials::name_tag...>::value,
-                "HDG trace potential name tags must be unique");
+                "HDG_CONTRACT_TRACE_UNIQUE_NAMES: trace potential name tags must be unique");
   static constexpr std::size_t potential_count = sizeof...(Potentials);
   static constexpr std::size_t component_count =
       detail::TraceComponentCount<Potentials...>::value;

@@ -1,11 +1,8 @@
 #include "negative_support.hpp"
 
-struct BadLocal
+struct BadLocal : hdg_negative::GoodLocal
 {
-  void EvaluateResidual(int) {}
-  void EvaluateJacobian(const dg::hdg::LocalJacobianRequest<hdg_negative::GoodSpec>&,
-                        dg::hdg::LocalJacobianResult<hdg_negative::GoodSpec>&)
-  {}
+  virtual ~BadLocal() = default;
 };
 using BadPipeline = dg::hdg::Pipeline<hdg_negative::GoodSpec,
                                       BadLocal,
@@ -13,4 +10,4 @@ using BadPipeline = dg::hdg::Pipeline<hdg_negative::GoodSpec,
                                       hdg_negative::GoodAssembly,
                                       hdg_negative::GoodSolver,
                                       hdg_negative::GoodRecovery>;
-static_assert(sizeof(BadPipeline) > 0, "must instantiate wrong phase signature");
+static_assert(sizeof(BadPipeline) > 0, "force polymorphic local phase");

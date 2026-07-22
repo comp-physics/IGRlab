@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <limits>
 #include <type_traits>
 
 namespace
@@ -134,6 +135,16 @@ bool CheckTopologyRejections()
   }
   {
     HdgTopologyStorage topology = MakeTopology();
+    topology.elements[0].blocks.interior_dofs =
+        std::numeric_limits<LocalIndex>::max();
+    topology.elements[0].blocks.interior_components = 2;
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
     topology.faces[0].local_faces[1] = 0;
     if (topology.HasConsistentRanges())
     {
@@ -167,6 +178,22 @@ bool CheckTopologyRejections()
   {
     HdgTopologyStorage topology = MakeTopology();
     topology.faces[0].owner_rank = invalid_rank;
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.faces[0].ownership = static_cast<Ownership>(255);
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.trace_dofs[0].ownership = static_cast<Ownership>(255);
     if (topology.HasConsistentRanges())
     {
       return false;
@@ -208,6 +235,17 @@ bool CheckStridesAndWorkspace()
   WorkspaceLayout layout;
   if (!TryMakeWorkspaceLayout({2, 1, 2, 8}, 3, 7, layout) ||
       TryMakeWorkspaceLayout({-1, 1, 2, 8}, 3, 7, layout) ||
+      TryMakeWorkspaceLayout({std::numeric_limits<LocalIndex>::max(),
+                              std::numeric_limits<LocalIndex>::max(),
+                              1,
+                              1},
+                             1,
+                             0,
+                             layout) ||
+      TryMakeWorkspaceLayout({1, 1, 1, 8},
+                             std::numeric_limits<std::size_t>::max(),
+                             0,
+                             layout) ||
       layout.local_jacobian.offset != layout.local_residual.size ||
       layout.factorization.offset !=
           layout.local_jacobian.offset + layout.local_jacobian.size ||

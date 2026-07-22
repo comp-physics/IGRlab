@@ -288,12 +288,12 @@ struct PrecisionPolicy
                     std::is_floating_point<JacobianScalar>::value &&
                     std::is_floating_point<FactorScalar>::value &&
                     std::is_floating_point<AccumulatorScalar>::value,
-                "HDG precision roles must use floating-point scalar types");
+                "HDG_CONTRACT_PRECISION_FLOATING: precision roles must use floating-point scalar types");
   static_assert(std::is_same<StateScalar, ResidualScalar>::value &&
                     std::is_same<StateScalar, JacobianScalar>::value &&
                     std::is_same<StateScalar, FactorScalar>::value &&
                     std::is_same<StateScalar, AccumulatorScalar>::value,
-                "the static HDG core currently requires homogeneous precision across all five roles");
+                "HDG_CONTRACT_PRECISION_HOMOGENEOUS: the static core requires homogeneous precision across all five roles");
   using state_scalar = StateScalar;
   using residual_scalar = ResidualScalar;
   using jacobian_scalar = JacobianScalar;
@@ -330,26 +330,26 @@ template <typename ModelTag,
 struct KernelSpec
 {
   static_assert(IsModelTag<ModelTag>::value,
-                "HDG model tags must explicitly opt into ModelTagMarker");
+                "HDG_CONTRACT_MODEL_TAG: model tags must opt into ModelTagMarker");
   static_assert(IsTraceTuple<TracePolicy>::value,
-                "HDG kernel trace policy must be a TraceTuple");
+                "HDG_CONTRACT_TRACE_TUPLE: kernel trace policy must be a TraceTuple");
   static_assert(IsStabilizationTag<StabilizationTag>::value,
-                "HDG stabilization tags must explicitly opt into StabilizationTagMarker");
+                "HDG_CONTRACT_STABILIZATION_TAG: stabilization tags must opt into StabilizationTagMarker");
   static_assert(IsTimeTreatmentTag<TimeTreatmentTag>::value,
-                "HDG time-treatment tags must explicitly opt into TimeTreatmentTagMarker");
+                "HDG_CONTRACT_TIME_TAG: time-treatment tags must opt into TimeTreatmentTagMarker");
   static_assert(IsBackendPolicy<Backend>::value,
-                "HDG kernel backend must be a BackendPolicy");
+                "HDG_CONTRACT_BACKEND_POLICY: kernel backend must be a BackendPolicy");
   static_assert(IsPrecisionPolicy<Precision>::value,
-                "HDG kernel precision must be a PrecisionPolicy");
+                "HDG_CONTRACT_PRECISION_POLICY: kernel precision must be a PrecisionPolicy");
   static_assert(TracePolicy::component_count <=
                     static_cast<std::size_t>(std::numeric_limits<LocalIndex>::max()),
-                "HDG trace component count exceeds LocalIndex");
+                "HDG_CONTRACT_TRACE_COMPONENT_RANGE: trace component count exceeds LocalIndex");
   static_assert(std::is_trivially_copyable<DevicePolicy>::value,
-                "per-model HDG device policy must be trivially copyable");
+                "HDG_CONTRACT_DEVICE_TRIVIAL: device policy must be trivially copyable");
   static_assert(std::is_standard_layout<DevicePolicy>::value,
-                "per-model HDG device policy must have standard layout");
+                "HDG_CONTRACT_DEVICE_STANDARD_LAYOUT: device policy must have standard layout");
   static_assert(!std::is_polymorphic<DevicePolicy>::value,
-                "per-model HDG device policy cannot use virtual dispatch");
+                "HDG_CONTRACT_DEVICE_NONPOLYMORPHIC: device policy cannot use virtual dispatch");
 
   using model_tag = ModelTag;
   using trace_policy = TracePolicy;
@@ -586,20 +586,17 @@ bool HasConsistentRangesForSpec(const HdgTopologyStorage& topology) noexcept
 namespace detail
 {
 
-#define DG_IGR_HDG_DECLARE_EXACT_PHASE(TRAIT, METHOD)                         \
+#define DG_IGR_HDG_DECLARE_EXACT_PHASE(TRAIT, METHOD)                          \
   template <typename Operator, typename Request, typename Result, typename = void> \
-  struct TRAIT : std::false_type                                                \
-  {};                                                                            \
-  template <typename Operator, typename Request, typename Result>              \
-  struct TRAIT<Operator,                                                         \
-               Request,                                                          \
-               Result,                                                           \
-               std::void_t<decltype(std::declval<Operator&>().METHOD(          \
-                   std::declval<const Request&>(), std::declval<Result&>()))>> \
-      : std::is_same<decltype(std::declval<Operator&>().METHOD(                 \
-                         std::declval<const Request&>(),                        \
-                         std::declval<Result&>())),                             \
-                     void>                                                       \
+  struct TRAIT : std::false_type                                                 \
+  {};                                                                             \
+  template <typename Operator, typename Request, typename Result>               \
+  struct TRAIT<Operator,                                                          \
+               Request,                                                           \
+               Result,                                                            \
+               std::void_t<decltype(&Operator::METHOD)>>                        \
+      : std::is_same<decltype(&Operator::METHOD),                               \
+                     void (Operator::*)(const Request&, Result&)>                \
   {}
 
 DG_IGR_HDG_DECLARE_EXACT_PHASE(HasEvaluateResidual, EvaluateResidual);
@@ -626,43 +623,43 @@ class Pipeline
   static_assert(IsKernelSpec<Spec>::value,
                 "HDG pipelines require a validated KernelSpec");
   static_assert(!std::is_polymorphic<LocalOperator>::value,
-                "HDG local operator cannot use virtual dispatch");
+                "HDG_CONTRACT_LOCAL_NONPOLYMORPHIC: local operator cannot use virtual dispatch");
   static_assert(!std::is_polymorphic<CondensationOperator>::value,
-                "HDG condensation operator cannot use virtual dispatch");
+                "HDG_CONTRACT_CONDENSATION_NONPOLYMORPHIC: condensation operator cannot use virtual dispatch");
   static_assert(!std::is_polymorphic<TraceAssembler>::value,
-                "HDG trace assembler cannot use virtual dispatch");
+                "HDG_CONTRACT_ASSEMBLER_NONPOLYMORPHIC: trace assembler cannot use virtual dispatch");
   static_assert(!std::is_polymorphic<GlobalTraceSolver>::value,
-                "HDG trace solver cannot use virtual dispatch");
+                "HDG_CONTRACT_SOLVER_NONPOLYMORPHIC: trace solver cannot use virtual dispatch");
   static_assert(!std::is_polymorphic<RecoveryOperator>::value,
-                "HDG recovery operator cannot use virtual dispatch");
+                "HDG_CONTRACT_RECOVERY_NONPOLYMORPHIC: recovery operator cannot use virtual dispatch");
   static_assert(detail::HasEvaluateResidual<LocalOperator,
                                             LocalResidualRequest<Spec>,
                                             LocalResidualResult<Spec>>::value,
-                "HDG local residual phase must use its exact Spec-bound request/result signature");
+                "HDG_CONTRACT_EXACT_EVALUATE_RESIDUAL: local residual phase requires its exact Spec-bound signature");
   static_assert(detail::HasEvaluateJacobian<LocalOperator,
                                             LocalJacobianRequest<Spec>,
                                             LocalJacobianResult<Spec>>::value,
-                "HDG local Jacobian phase must use its exact Spec-bound request/result signature");
+                "HDG_CONTRACT_EXACT_EVALUATE_JACOBIAN: local Jacobian phase requires its exact Spec-bound signature");
   static_assert(detail::HasCondense<CondensationOperator,
                                     CondenseRequest<Spec>,
                                     CondenseResult<Spec>>::value,
-                "HDG condensation phase must use its exact Spec-bound request/result signature");
+                "HDG_CONTRACT_EXACT_CONDENSE: condensation phase requires its exact Spec-bound signature");
   static_assert(detail::HasApplySchur<CondensationOperator,
                                       ApplySchurRequest<Spec>,
                                       ApplySchurResult<Spec>>::value,
-                "HDG Schur phase must use its exact Spec-bound request/result signature");
+                "HDG_CONTRACT_EXACT_APPLY_SCHUR: Schur phase requires its exact Spec-bound signature");
   static_assert(detail::HasAssemble<TraceAssembler,
                                     TraceAssemblyRequest<Spec>,
                                     TraceAssemblyResult<Spec>>::value,
-                "HDG trace assembly phase must use its exact Spec-bound request/result signature");
+                "HDG_CONTRACT_EXACT_ASSEMBLE: trace assembly phase requires its exact Spec-bound signature");
   static_assert(detail::HasSolve<GlobalTraceSolver,
                                  TraceSolveRequest<Spec>,
                                  TraceSolveResult<Spec>>::value,
-                "HDG trace solve phase must use its exact Spec-bound request/result signature");
+                "HDG_CONTRACT_EXACT_SOLVE: trace solve phase requires its exact Spec-bound signature");
   static_assert(detail::HasRecover<RecoveryOperator,
                                    RecoveryRequest<Spec>,
                                    RecoveryResult<Spec>>::value,
-                "HDG recovery phase must use its exact Spec-bound request/result signature");
+                "HDG_CONTRACT_EXACT_RECOVER: recovery phase requires its exact Spec-bound signature");
 
 public:
   using spec_type = Spec;

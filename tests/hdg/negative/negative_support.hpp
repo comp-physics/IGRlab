@@ -65,4 +65,11 @@ struct GoodRecovery
   void Recover(const RecoveryRequest<GoodSpec>&, RecoveryResult<GoodSpec>&) {}
 };
 
+using GoodPipeline = Pipeline<GoodSpec,
+                              GoodLocal,
+                              GoodCondensation,
+                              GoodAssembly,
+                              GoodSolver,
+                              GoodRecovery>;
+
 } // namespace hdg_negative
