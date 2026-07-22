@@ -86,11 +86,14 @@ static_assert(!std::is_polymorphic<obs::CaliperBackend>::value);
 
 static int check_caliper_adapter()
 {
-  // Runtime remains disabled: this verifies the selected static adapter and
-  // its link interface without producing a Caliper capture.
+  // A Caliper configuration is deliberately not required: this exercises the
+  // enabled adapter's attribute setup, region enter/exit, and counter path.
+  obs::set_runtime_enabled(true);
+  {
+    dg_igr::NVTXRange region(obs::RegionId::dg_mult);
+    obs::record_counter(obs::CounterId::iterations, std::int64_t{1} << 40);
+  }
   obs::set_runtime_enabled(false);
-  dg_igr::NVTXRange region(obs::RegionId::dg_mult);
-  obs::record_counter(obs::CounterId::iterations, std::int64_t{1} << 40);
   return obs::runtime_enabled() ? 1 : 0;
 }
 

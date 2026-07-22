@@ -58,6 +58,7 @@ notes/
 .DS_Store
 .spack-env
 spack.lock
+!spack-envs/cpu-caliper/spack.lock
 euler-*
 vtk_output
 tools
