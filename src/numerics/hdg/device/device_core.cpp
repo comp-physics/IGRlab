@@ -35,6 +35,75 @@ bool FitsMfemSize(const std::size_t count) noexcept
 }
 
 template <typename Scalar>
+bool ValidVectorView(const StridedBlockView<Scalar> view,
+                     const std::size_t batches,
+                     const std::size_t rows) noexcept
+{
+  if (view.data == nullptr || view.batch_count != static_cast<LocalIndex>(batches) ||
+      view.rows != static_cast<LocalIndex>(rows) || view.columns != 1 ||
+      view.batch_stride <= 0 || view.row_stride <= 0 || view.column_stride <= 0)
+  {
+    return false;
+  }
+  const auto maximum = std::numeric_limits<std::ptrdiff_t>::max();
+  const auto fits = [maximum](const std::size_t count,
+                              const std::ptrdiff_t stride) noexcept
+  { return count > 0 && count - 1 <= static_cast<std::size_t>(maximum / stride); };
+  if (!fits(batches, view.batch_stride) || !fits(rows, view.row_stride))
+  {
+    return false;
+  }
+  const auto batch_offset = (batches - 1) * view.batch_stride;
+  const auto row_offset = (rows - 1) * view.row_stride;
+  return batch_offset <= maximum - row_offset;
+}
+
+template <typename Scalar>
+bool AllFinite(const StridedBlockView<Scalar> view) noexcept
+{
+  for (LocalIndex batch = 0; batch < view.batch_count; ++batch)
+    for (LocalIndex row = 0; row < view.rows; ++row)
+      if (!std::isfinite(view(batch, row, 0))) { return false; }
+  return true;
+}
+
+template <typename Left, typename Right>
+bool Overlaps(const StridedBlockView<Left> left,
+              const StridedBlockView<Right> right) noexcept
+{
+  for (LocalIndex left_batch = 0; left_batch < left.batch_count; ++left_batch)
+    for (LocalIndex left_row = 0; left_row < left.rows; ++left_row)
+      for (LocalIndex right_batch = 0; right_batch < right.batch_count;
+           ++right_batch)
+        for (LocalIndex right_row = 0; right_row < right.rows; ++right_row)
+          if (static_cast<const void*>(&left(left_batch, left_row, 0)) ==
+              static_cast<const void*>(&right(right_batch, right_row, 0)))
+          {
+            return true;
+          }
+  return false;
+}
+
+template <typename Scalar>
+bool HasDistinctAddresses(const StridedBlockView<Scalar> view) noexcept
+{
+  for (LocalIndex first_batch = 0; first_batch < view.batch_count;
+       ++first_batch)
+    for (LocalIndex first_row = 0; first_row < view.rows; ++first_row)
+      for (LocalIndex second_batch = first_batch;
+           second_batch < view.batch_count; ++second_batch)
+        for (LocalIndex second_row =
+                 second_batch == first_batch ? first_row + 1 : 0;
+             second_row < view.rows; ++second_row)
+          if (static_cast<const void*>(&view(first_batch, first_row, 0)) ==
+              static_cast<const void*>(&view(second_batch, second_row, 0)))
+          {
+            return false;
+          }
+  return true;
+}
+
+template <typename Scalar>
 void Pack(const StridedBlockView<const Scalar> input, Scalar* packed) noexcept
 {
   std::size_t entry = 0;
@@ -85,6 +154,13 @@ bool Matches(const double* packed, const std::size_t batches,
   return true;
 }
 
+bool PackedFinite(const double* values, const std::size_t count) noexcept
+{
+  for (std::size_t entry = 0; entry < count; ++entry)
+    if (!std::isfinite(values[entry])) { return false; }
+  return true;
+}
+
 MFEM_HOST_DEVICE void SolvePivoted(const double* lu, const double* pivots,
                                    const int ni, double* values,
                                    const int columns)
@@ -119,14 +195,48 @@ MFEM_HOST_DEVICE void SolvePivoted(const double* lu, const double* pivots,
 }
 }  // namespace
 
+bool MakePersistentStorageLayout(const std::size_t ni, const std::size_t nt,
+                                 const std::size_t batches,
+                                 PersistentStorageLayout& layout) noexcept
+{
+  std::size_t ni2 = 0, ni_nt = 0, nt_ni = 0, nt2 = 0, solve_per_batch = 0;
+  if (ni == 0 || nt == 0 || batches == 0 ||
+      nt == std::numeric_limits<std::size_t>::max() || !Multiply(ni, ni, ni2) ||
+      !Multiply(ni, nt, ni_nt) || !Multiply(nt, ni, nt_ni) ||
+      !Multiply(nt, nt, nt2) || !Multiply(ni, nt + 1, solve_per_batch))
+  {
+    return false;
+  }
+  const std::size_t per_batch[] = {ni2, ni, ni_nt, nt_ni, nt2, ni,
+                                   solve_per_batch, nt2, nt, nt, nt, ni};
+  PersistentStorageLayout next{};
+  for (std::size_t index = 0; index < 12; ++index)
+  {
+    if (!Multiply(batches, per_batch[index], next.counts[index]) ||
+        !FitsMfemSize(next.counts[index]) ||
+        next.counts[index] >
+            std::numeric_limits<std::size_t>::max() / sizeof(double) ||
+        next.bytes > std::numeric_limits<std::size_t>::max() -
+                         next.counts[index] * sizeof(double))
+    {
+      return false;
+    }
+    next.bytes += next.counts[index] * sizeof(double);
+  }
+  layout = next;
+  return true;
+}
+
 bool DeviceCoreEngine::DeviceEligible() const noexcept
 {
-  // Do not cause a backend query in a normal CPU process.  A configured MFEM
-  // device is an explicit caller decision; a multi-device configuration falls
-  // back because this bounded core is single-GPU only.
-  return mfem::Device::IsConfigured() &&
-         mfem::Device::Allows(mfem::Backend::DEVICE_MASK) &&
-         mfem::Device::GetDeviceCount() == 1;
+  // MFEM already selects a single device id.  Do not reject that selection
+  // merely because the process can see several GPUs, and do not mistake the
+  // host-only DEBUG_DEVICE backend for hardware GPU execution.
+  return IsGpuExecutionEligible(
+      {mfem::Device::IsConfigured(),
+       mfem::Device::Allows(mfem::Backend::CUDA_MASK),
+       mfem::Device::Allows(mfem::Backend::HIP_MASK),
+       mfem::Device::Allows(mfem::Backend::DEBUG_DEVICE), 0});
 }
 
 void DeviceCoreEngine::RecordHostToDevice(const std::size_t bytes) noexcept
@@ -141,57 +251,32 @@ void DeviceCoreEngine::RecordDeviceToHost(const std::size_t bytes) noexcept
 
 bool DeviceCoreEngine::ResizePersistent(const std::size_t ni,
                                         const std::size_t nt,
-                                        const std::size_t batches) noexcept
+                                        const std::size_t batches)
 {
-  std::size_t ni2 = 0, ni_nt = 0, nt_ni = 0, nt2 = 0, solve_per_batch = 0;
-  if (!Multiply(ni, ni, ni2) || !Multiply(ni, nt, ni_nt) ||
-      !Multiply(nt, ni, nt_ni) || !Multiply(nt, nt, nt2) ||
-      !Multiply(ni, nt + 1, solve_per_batch))
-  {
-    return false;
-  }
-  const std::size_t counts[] = {ni2, ni, ni_nt, nt_ni, nt2, ni,
-                                solve_per_batch, nt2, nt, nt, nt, ni};
-  std::size_t total_bytes = 0;
-  for (const std::size_t per_batch : counts)
-  {
-    std::size_t count = 0;
-    if (!Multiply(batches, per_batch, count) || !FitsMfemSize(count) ||
-        count > std::numeric_limits<std::size_t>::max() / sizeof(double) ||
-        total_bytes > std::numeric_limits<std::size_t>::max() -
-                          count * sizeof(double))
-    {
-      return false;
-    }
-    total_bytes += count * sizeof(double);
-  }
-  std::array<mfem::Vector*, 12> vectors{{
-      &lu_, &pivots_, &b_, &c_, &d_, &f_, &solve_, &schur_, &rhs_, &trace_,
-      &action_, &interior_}};
-  std::array<int, 12> old_capacities{};
-  for (std::size_t index = 0; index < vectors.size(); ++index)
-  {
-    old_capacities[index] = vectors[index]->Capacity();
-  }
+  PersistentStorageLayout layout{};
+  if (!MakePersistentStorageLayout(ni, nt, batches, layout)) { return false; }
   try
   {
-    const auto resize = [](mfem::Vector& vector, const std::size_t count)
+    // MFEM may make device allocation/registration lazy.  Establish every
+    // staged vector on both sides before swapping it into the engine.  A C++
+    // allocation exception leaves the live engine untouched.  Condense is
+    // intentionally not noexcept: MFEM fatal allocation policy is not
+    // recoverable through a false Status claim.
+    std::array<mfem::Vector, 12> staged{};
+    for (std::size_t index = 0; index < staged.size(); ++index)
     {
-      vector.SetSize(static_cast<int>(count));
-      vector.UseDevice(true);
-    };
-    resize(lu_, batches * ni2);
-    resize(pivots_, batches * ni);
-    resize(b_, batches * ni_nt);
-    resize(c_, batches * nt_ni);
-    resize(d_, batches * nt2);
-    resize(f_, batches * ni);
-    resize(solve_, batches * solve_per_batch);
-    resize(schur_, batches * nt2);
-    resize(rhs_, batches * nt);
-    resize(trace_, batches * nt);
-    resize(action_, batches * nt);
-    resize(interior_, batches * ni);
+      staged[index].SetSize(static_cast<int>(layout.counts[index]));
+      staged[index].UseDevice(true);
+      std::fill_n(staged[index].HostWrite(), layout.counts[index], 0.0);
+      (void)staged[index].Read();
+    }
+    std::array<mfem::Vector*, 12> live{{
+        &lu_, &pivots_, &b_, &c_, &d_, &f_, &solve_, &schur_, &rhs_, &trace_,
+        &action_, &interior_}};
+    for (std::size_t index = 0; index < live.size(); ++index)
+    {
+      live[index]->Swap(staged[index]);
+    }
   }
   catch (const std::bad_alloc&)
   {
@@ -201,29 +286,14 @@ bool DeviceCoreEngine::ResizePersistent(const std::size_t ni,
   {
     return false;
   }
-  std::size_t persistent_bytes = 0;
-  for (std::size_t index = 0; index < vectors.size(); ++index)
-  {
-    const std::size_t capacity =
-        static_cast<std::size_t>(vectors[index]->Capacity());
-    if (capacity > std::numeric_limits<std::size_t>::max() / sizeof(double) ||
-        persistent_bytes > std::numeric_limits<std::size_t>::max() -
-                               capacity * sizeof(double))
-    {
-      return false;
-    }
-    persistent_bytes += capacity * sizeof(double);
-    if (vectors[index]->Capacity() != old_capacities[index])
-    {
-      ++accounting_.allocation_events;
-    }
-  }
-  accounting_.persistent_bytes = persistent_bytes;
+  accounting_.persistent_bytes = layout.bytes;
+  accounting_.allocation_events += 12;
+  RecordHostToDevice(layout.bytes);
   return true;
 }
 
 Status DeviceCoreEngine::Condense(const core::LocalSystemBatchView& input,
-                                  const core::CondensedBatchView& output) noexcept
+                                  const core::CondensedBatchView& output)
 {
   ScopedRegion condensation(
       dg_igr::observability::RegionId::hdg_condensation);
@@ -232,20 +302,44 @@ Status DeviceCoreEngine::Condense(const core::LocalSystemBatchView& input,
   {
     return reference_status;
   }
-  ready_ = true;
-  shape_ = input.shape;
-  batch_count_ = static_cast<std::size_t>(input.a.batch_count);
+  const std::size_t next_batches = static_cast<std::size_t>(input.a.batch_count);
   if (!DeviceEligible())
   {
+    ready_ = true;
+    shape_ = input.shape;
+    batch_count_ = next_batches;
     path_ = ExecutionPath::host_reference;
     ++accounting_.host_reference_fallbacks;
     return Status::success;
   }
 
-  const std::size_t ni = static_cast<std::size_t>(shape_.InteriorUnknowns());
-  const std::size_t nt = static_cast<std::size_t>(shape_.TraceUnknowns());
-  if (!ResizePersistent(ni, nt, batch_count_))
+  const std::size_t ni =
+      static_cast<std::size_t>(input.shape.InteriorUnknowns());
+  const std::size_t nt =
+      static_cast<std::size_t>(input.shape.TraceUnknowns());
+  PersistentStorageLayout layout{};
+  const bool valid_layout = MakePersistentStorageLayout(ni, nt, next_batches,
+                                                        layout);
+  const std::array<const mfem::Vector*, 12> vectors{{
+      &lu_, &pivots_, &b_, &c_, &d_, &f_, &solve_, &schur_, &rhs_, &trace_,
+      &action_, &interior_}};
+  const bool same_shape = ready_ && path_ == ExecutionPath::mfem_device &&
+                          shape_.interior_dofs == input.shape.interior_dofs &&
+                          shape_.trace_dofs == input.shape.trace_dofs &&
+                          shape_.interior_components ==
+                              input.shape.interior_components &&
+                          shape_.trace_components == input.shape.trace_components &&
+                          batch_count_ == next_batches;
+  bool reusable = valid_layout && same_shape;
+  for (std::size_t index = 0; reusable && index < vectors.size(); ++index)
   {
+    reusable = vectors[index]->Size() == static_cast<int>(layout.counts[index]);
+  }
+  if (!reusable && (!valid_layout || !ResizePersistent(ni, nt, next_batches)))
+  {
+    ready_ = true;
+    shape_ = input.shape;
+    batch_count_ = next_batches;
     path_ = ExecutionPath::host_reference;
     ++accounting_.host_reference_fallbacks;
     return Status::success;
@@ -263,11 +357,11 @@ Status DeviceCoreEngine::Condense(const core::LocalSystemBatchView& input,
   std::size_t upload_scalars = 0;
   for (const std::size_t count : {ni * ni, ni * nt, nt * ni, nt * nt, ni, nt})
   {
-    upload_scalars += batch_count_ * count;
+    upload_scalars += next_batches * count;
   }
   RecordHostToDevice(upload_scalars * sizeof(double));
 
-  const int batches = static_cast<int>(batch_count_);
+  const int batches = static_cast<int>(next_batches);
   const int ni_i = static_cast<int>(ni);
   const int nt_i = static_cast<int>(nt);
   double* lu = lu_.ReadWrite();
@@ -356,16 +450,22 @@ Status DeviceCoreEngine::Condense(const core::LocalSystemBatchView& input,
 
   const double* host_schur = schur_.HostRead();
   const double* host_rhs = rhs_.HostRead();
-  RecordDeviceToHost(batch_count_ * (nt * nt + nt) * sizeof(double));
-  if (!Matches(host_schur, batch_count_, nt, nt, output.schur) ||
-      !Matches(host_rhs, batch_count_, nt, 1, output.right_hand_side))
+  RecordDeviceToHost(next_batches * (nt * nt + nt) * sizeof(double));
+  if (!Matches(host_schur, next_batches, nt, nt, output.schur) ||
+      !Matches(host_rhs, next_batches, nt, 1, output.right_hand_side))
   {
+    ready_ = true;
+    shape_ = input.shape;
+    batch_count_ = next_batches;
     path_ = ExecutionPath::host_reference;
     ++accounting_.host_reference_fallbacks;
     return Status::success;
   }
-  CopyOut(host_schur, batch_count_, nt, nt, output.schur);
-  CopyOut(host_rhs, batch_count_, nt, 1, output.right_hand_side);
+  CopyOut(host_schur, next_batches, nt, nt, output.schur);
+  CopyOut(host_rhs, next_batches, nt, 1, output.right_hand_side);
+  ready_ = true;
+  shape_ = input.shape;
+  batch_count_ = next_batches;
   path_ = ExecutionPath::mfem_device;
   return Status::success;
 }
@@ -375,14 +475,26 @@ Status DeviceCoreEngine::ApplySchur(const StridedBlockView<const double> trace,
 {
   ScopedRegion action_region(
       dg_igr::observability::RegionId::hdg_schur_action);
-  const Status reference_status = reference_.ApplySchur(trace, result);
-  if (reference_status != Status::success || path_ != ExecutionPath::mfem_device)
+  if (!ready_) { return Status::not_ready; }
+  if (path_ != ExecutionPath::mfem_device)
   {
+    const Status reference_status = reference_.ApplySchur(trace, result);
     if (reference_status == Status::success) { ++accounting_.host_reference_fallbacks; }
     return reference_status;
   }
   const std::size_t ni = static_cast<std::size_t>(shape_.InteriorUnknowns());
   const std::size_t nt = static_cast<std::size_t>(shape_.TraceUnknowns());
+  if (!ValidVectorView(trace, batch_count_, nt) ||
+      !ValidVectorView(result, batch_count_, nt))
+  {
+    return Status::invalid_view;
+  }
+  if (!HasDistinctAddresses(trace) || !HasDistinctAddresses(result) ||
+      Overlaps(trace, result))
+  {
+    return Status::unsupported_alias;
+  }
+  if (!AllFinite(trace)) { return Status::non_finite; }
   Pack(trace, trace_.HostWrite());
   RecordHostToDevice(batch_count_ * nt * sizeof(double));
   const int batches = static_cast<int>(batch_count_);
@@ -428,11 +540,9 @@ Status DeviceCoreEngine::ApplySchur(const StridedBlockView<const double> trace,
   });
   const double* host_action = action_.HostRead();
   RecordDeviceToHost(batch_count_ * nt * sizeof(double));
-  if (!Matches(host_action, batch_count_, nt, 1, result))
+  if (!PackedFinite(host_action, batch_count_ * nt))
   {
-    path_ = ExecutionPath::host_reference;
-    ++accounting_.host_reference_fallbacks;
-    return Status::success;
+    return Status::non_finite;
   }
   CopyOut(host_action, batch_count_, nt, 1, result);
   return Status::success;
@@ -443,14 +553,26 @@ Status DeviceCoreEngine::Recover(const StridedBlockView<const double> trace,
 {
   ScopedRegion recovery_region(
       dg_igr::observability::RegionId::hdg_interior_recovery);
-  const Status reference_status = reference_.Recover(trace, interior);
-  if (reference_status != Status::success || path_ != ExecutionPath::mfem_device)
+  if (!ready_) { return Status::not_ready; }
+  if (path_ != ExecutionPath::mfem_device)
   {
+    const Status reference_status = reference_.Recover(trace, interior);
     if (reference_status == Status::success) { ++accounting_.host_reference_fallbacks; }
     return reference_status;
   }
   const std::size_t ni = static_cast<std::size_t>(shape_.InteriorUnknowns());
   const std::size_t nt = static_cast<std::size_t>(shape_.TraceUnknowns());
+  if (!ValidVectorView(trace, batch_count_, nt) ||
+      !ValidVectorView(interior, batch_count_, ni))
+  {
+    return Status::invalid_view;
+  }
+  if (!HasDistinctAddresses(trace) || !HasDistinctAddresses(interior) ||
+      Overlaps(trace, interior))
+  {
+    return Status::unsupported_alias;
+  }
+  if (!AllFinite(trace)) { return Status::non_finite; }
   Pack(trace, trace_.HostWrite());
   RecordHostToDevice(batch_count_ * nt * sizeof(double));
   const int batches = static_cast<int>(batch_count_);
@@ -480,11 +602,9 @@ Status DeviceCoreEngine::Recover(const StridedBlockView<const double> trace,
   });
   const double* host_interior = interior_.HostRead();
   RecordDeviceToHost(batch_count_ * ni * sizeof(double));
-  if (!Matches(host_interior, batch_count_, ni, 1, interior))
+  if (!PackedFinite(host_interior, batch_count_ * ni))
   {
-    path_ = ExecutionPath::host_reference;
-    ++accounting_.host_reference_fallbacks;
-    return Status::success;
+    return Status::non_finite;
   }
   CopyOut(host_interior, batch_count_, ni, 1, interior);
   return Status::success;
