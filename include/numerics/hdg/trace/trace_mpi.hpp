@@ -89,9 +89,14 @@ TraceStatus BuildOrientationMap(const mfem::FiniteElementCollection& collection,
  */
 struct TraceExchangePlan
 {
+  /** Exact space instance used to create map; no compatible-size substitution. */
+  const mfem::ParFiniteElementSpace* space = nullptr;
   TraceMap map;
 
-  bool IsConsistent() const noexcept { return map.IsConsistent(); }
+  bool IsConsistent() const noexcept
+  {
+    return space != nullptr && map.IsConsistent();
+  }
   TraceStatus Distribute(mfem::ParFiniteElementSpace& space,
                          const mfem::Vector& owned_true_values,
                          mfem::Vector& local_values) const;

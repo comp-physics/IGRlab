@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace
 {
@@ -18,6 +19,16 @@ using dg::hdg::trace::TraceContribution;
 using dg::hdg::trace::TraceExchangePlan;
 using dg::hdg::trace::TraceMap;
 using dg::hdg::trace::TraceStatus;
+
+bool SameValues(const mfem::Vector& left, const mfem::Vector& right)
+{
+  if (left.Size() != right.Size()) { return false; }
+  for (int i = 0; i < left.Size(); ++i)
+  {
+    if (left[i] != right[i]) { return false; }
+  }
+  return true;
+}
 
 bool CheckActions()
 {
@@ -44,10 +55,47 @@ bool CheckActions()
   if (CompareTraceActions(assembled, reference, input, 0.0, error) !=
           TraceStatus::success || error != 0.0) { return false; }
   input[1] = std::numeric_limits<double>::quiet_NaN();
-  mfem::Vector output;
-  return assembled.Apply(input, output) == TraceStatus::non_finite &&
-         assembled.Apply(input, input) == TraceStatus::invalid_argument &&
-         assembled.Add(3, 0, 1.0) == TraceStatus::invalid_action;
+  mfem::Vector output(3);
+  output = 17.0;
+  const mfem::Vector output_before(output);
+  if (assembled.Apply(input, output) != TraceStatus::non_finite ||
+      reference.Apply(input, output) != TraceStatus::non_finite ||
+      !SameValues(output, output_before) ||
+      assembled.Apply(input, input) != TraceStatus::invalid_argument ||
+      assembled.Add(3, 0, 1.0) != TraceStatus::invalid_action)
+  {
+    return false;
+  }
+
+  mfem::Vector backing(4);
+  backing = 3.0;
+  mfem::Vector overlap_input;
+  mfem::Vector overlap_output;
+  overlap_input.MakeRef(backing, 0, 3);
+  overlap_output.MakeRef(backing, 1, 3);
+  const mfem::Vector backing_before(backing);
+  if (assembled.Apply(overlap_input, overlap_output) != TraceStatus::invalid_argument ||
+      reference.Apply(overlap_input, overlap_output) != TraceStatus::invalid_argument ||
+      !SameValues(backing, backing_before))
+  {
+    return false;
+  }
+
+  AssembledTraceAction bounded;
+  if (bounded.Reset(1) != TraceStatus::success ||
+      bounded.Add(0, 0, std::numeric_limits<double>::max()) != TraceStatus::success ||
+      bounded.Add(0, 0, std::numeric_limits<double>::max()) != TraceStatus::non_finite ||
+      !bounded.IsConsistent() ||
+      bounded.Reset(std::numeric_limits<LocalIndex>::max()) != TraceStatus::invalid_action ||
+      bounded.Size() != 1)
+  {
+    return false;
+  }
+  mfem::Vector one(1);
+  mfem::Vector bounded_output;
+  one[0] = 1.0;
+  return bounded.Apply(one, bounded_output) == TraceStatus::success &&
+         bounded_output[0] == std::numeric_limits<double>::max();
 }
 
 bool CheckOrientation()
@@ -63,27 +111,62 @@ bool CheckOrientation()
   mfem::Vector source(count);
   for (int i = 0; i < count; ++i) { source[i] = 1.25 + i; }
   mfem::Vector oriented;
-  const int* expected = collection.DofOrderForOrientation(
-      mfem::Geometry::SEGMENT, 1);
-  if (!forward.IsConsistent() || !reverse.IsConsistent() || expected == nullptr ||
+  if (!forward.IsConsistent() || !reverse.IsConsistent() ||
       forward.Apply(source, oriented) != TraceStatus::success ||
       oriented.Size() != source.Size())
   {
     return false;
   }
-  for (int i = 0; i < count; ++i)
+  const mfem::Vector oriented_before(oriented);
+  source[0] = std::numeric_limits<double>::quiet_NaN();
+  if (forward.Apply(source, oriented) != TraceStatus::non_finite ||
+      !SameValues(oriented, oriented_before))
   {
-    const int encoded = expected[i];
-    const int source_index = encoded < 0 ? -1 - encoded : encoded;
-    const double expected_value = (encoded < 0 ? -1.0 : 1.0) * source[source_index];
-    if (forward.source[static_cast<std::size_t>(i)] != source_index ||
-        forward.sign[static_cast<std::size_t>(i)] != (encoded < 0 ? -1 : 1) ||
-        oriented[i] != expected_value)
-    {
-      return false;
-    }
+    return false;
   }
-  return true;
+  source[0] = 1.25;
+  if (BuildOrientationMap(collection, mfem::Geometry::SEGMENT, -1, count, forward) !=
+          TraceStatus::invalid_orientation ||
+      BuildOrientationMap(collection, mfem::Geometry::SEGMENT, 2, count, forward) !=
+          TraceStatus::invalid_orientation ||
+      BuildOrientationMap(collection, mfem::Geometry::CUBE, 0, 0, forward) !=
+          TraceStatus::invalid_orientation ||
+      BuildOrientationMap(collection, static_cast<mfem::Geometry::Type>(
+          mfem::Geometry::INVALID), 0, count, forward) != TraceStatus::invalid_argument ||
+      BuildOrientationMap(collection, static_cast<mfem::Geometry::Type>(-2), 0, count,
+                          forward) != TraceStatus::invalid_argument ||
+      BuildOrientationMap(collection, static_cast<mfem::Geometry::Type>(
+          mfem::Geometry::NUM_GEOMETRIES), 0, count, forward) != TraceStatus::invalid_argument ||
+      BuildOrientationMap(collection, static_cast<mfem::Geometry::Type>(
+          static_cast<int>(mfem::Geometry::NUM_GEOMETRIES) + 1), 0, count,
+                          forward) != TraceStatus::invalid_argument)
+  {
+    return false;
+  }
+
+  mfem::ND_FECollection signed_collection(2, 2);
+  const LocalIndex signed_count = signed_collection.DofForGeometry(
+      mfem::Geometry::SEGMENT);
+  dg::hdg::trace::TraceOrientationMap signed_map;
+  mfem::Vector signed_input(signed_count);
+  signed_input = 1.0;
+  mfem::Vector signed_output;
+  if (signed_count <= 0 || BuildOrientationMap(signed_collection,
+      mfem::Geometry::SEGMENT, 0, signed_count, signed_map) != TraceStatus::success ||
+      signed_map.Apply(signed_input, signed_output) != TraceStatus::success)
+  {
+    return false;
+  }
+  bool mfem_reports_negative = false;
+  bool application_preserves_negative = false;
+  const int* mfem_order = signed_collection.DofOrderForOrientation(
+      mfem::Geometry::SEGMENT, 0);
+  for (int i = 0; i < signed_count; ++i)
+  {
+    mfem_reports_negative = mfem_reports_negative || mfem_order[i] < 0;
+    application_preserves_negative = application_preserves_negative || signed_output[i] < 0.0;
+  }
+  return mfem_reports_negative && application_preserves_negative;
 }
 
 bool CheckMapAndExchange(MPI_Comm comm)
@@ -121,6 +204,46 @@ bool CheckMapAndExchange(MPI_Comm comm)
         (entry.ownership == Ownership::owned) !=
             (entry.owner_rank == trace_space.GetMyRank())) { return false; }
   }
+
+  mfem::ParFiniteElementSpace unrelated_space(&parallel_mesh, &collection);
+  mfem::Vector unrelated_true(unrelated_space.GetTrueVSize());
+  unrelated_true = 1.0;
+  mfem::Vector unrelated_local(1);
+  unrelated_local[0] = -11.0;
+  if (plan.Distribute(unrelated_space, unrelated_true, unrelated_local) !=
+          TraceStatus::invalid_map || unrelated_local.Size() != 1 ||
+      unrelated_local[0] != -11.0)
+  {
+    return false;
+  }
+
+  if (plan.map.entries.size() > 1)
+  {
+    TraceExchangePlan stale = plan;
+    std::swap(stale.map.entries[0].global_true_dof,
+              stale.map.entries[1].global_true_dof);
+    mfem::Vector stale_local(1);
+    stale_local[0] = -13.0;
+    if (!stale.IsConsistent() ||
+        stale.Distribute(trace_space, true_values, stale_local) !=
+            TraceStatus::invalid_map || stale_local.Size() != 1 ||
+        stale_local[0] != -13.0)
+    {
+      return false;
+    }
+  }
+
+  mfem::Vector non_finite_true(true_values);
+  non_finite_true[0] = std::numeric_limits<double>::quiet_NaN();
+  mfem::Vector preserved_local(1);
+  preserved_local[0] = -19.0;
+  if (plan.Distribute(trace_space, non_finite_true, preserved_local) !=
+          TraceStatus::non_finite || preserved_local.Size() != 1 ||
+      preserved_local[0] != -19.0)
+  {
+    return false;
+  }
+
   TraceMap invalid = plan.map;
   invalid.entries[0].owner_rank = invalid.rank_count;
   return !invalid.IsConsistent();
