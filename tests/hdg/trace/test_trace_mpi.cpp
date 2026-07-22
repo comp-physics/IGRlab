@@ -13,6 +13,7 @@ using dg::hdg::Ownership;
 using dg::hdg::trace::AssembledTraceAction;
 using dg::hdg::trace::BuildOrientationMap;
 using dg::hdg::trace::BuildTraceExchangePlan;
+using dg::hdg::trace::BuildTraceMap;
 using dg::hdg::trace::CompareTraceActions;
 using dg::hdg::trace::ReferenceTraceAction;
 using dg::hdg::trace::TraceContribution;
@@ -235,6 +236,25 @@ bool CheckMapAndExchange(MPI_Comm comm)
   mfem::ParMesh parallel_mesh(comm, serial_mesh);
   mfem::H1_Trace_FECollection collection(1, 1);
   mfem::ParFiniteElementSpace trace_space(&parallel_mesh, &collection);
+  if (rank_count == 2)
+  {
+    int rank = 0;
+    MPI_Comm_rank(comm, &rank);
+    int rank_zero_map_status = 1;
+    if (rank == 0)
+    {
+      TraceMap rank_zero_map;
+      const bool rank_zero_map_valid = BuildTraceMap(trace_space, rank_zero_map) ==
+              TraceStatus::success && rank_zero_map.IsConsistent() &&
+          rank_zero_map.OwnedCount() ==
+              static_cast<std::size_t>(trace_space.GetTrueVSize()) &&
+          rank_zero_map.entries.size() ==
+              static_cast<std::size_t>(trace_space.GetVSize());
+      rank_zero_map_status = rank_zero_map_valid ? 1 : 0;
+    }
+    MPI_Bcast(&rank_zero_map_status, 1, MPI_INT, 0, comm);
+    if (rank_zero_map_status != 1) { return false; }
+  }
   TraceExchangePlan plan;
   if (BuildTraceExchangePlan(trace_space, plan) != TraceStatus::success ||
       !plan.IsConsistent() || plan.map.OwnedCount() !=

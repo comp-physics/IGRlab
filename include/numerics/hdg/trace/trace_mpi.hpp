@@ -67,7 +67,7 @@ struct TraceMap
   std::size_t GhostCount() const noexcept;
 };
 
-/** Build ownership from a conforming MFEM true-dof partition. */
+/** Build ownership from a scalar, conforming H1 MFEM true-dof partition. */
 TraceStatus BuildTraceMap(const mfem::ParFiniteElementSpace& space,
                           TraceMap& map);
 

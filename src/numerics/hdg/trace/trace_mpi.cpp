@@ -25,17 +25,6 @@ bool IsValidIndex(const LocalIndex value, const LocalIndex size) noexcept
   return value >= 0 && value < size;
 }
 
-RankIndex OwnerFor(const GlobalIndex global,
-                   const std::vector<GlobalIndex>& offsets) noexcept
-{
-  if (global < 0 || offsets.size() < 2 || global >= offsets.back())
-  {
-    return invalid_rank;
-  }
-  const auto upper = std::upper_bound(offsets.begin(), offsets.end(), global);
-  return static_cast<RankIndex>(std::distance(offsets.begin(), upper) - 1);
-}
-
 template <typename T>
 bool FitsVectorCount(const std::size_t count) noexcept
 {
@@ -208,60 +197,92 @@ TraceStatus BuildTraceMap(const mfem::ParFiniteElementSpace& space,
   {
     if (!space.Conforming() || space.GetVSize() < 0 || space.GetTrueVSize() < 0 ||
         space.GetNRanks() <= 0 || space.GetMyRank() < 0 ||
-        space.GetMyRank() >= space.GetNRanks())
+        space.GetMyRank() >= space.GetNRanks() || space.GetVDim() != 1 ||
+        space.FEColl() == nullptr ||
+        dynamic_cast<const mfem::H1_FECollection*>(space.FEColl()) == nullptr)
     {
       return TraceStatus::invalid_argument;
     }
-    const std::size_t rank_count = static_cast<std::size_t>(space.GetNRanks());
-    if (!FitsVectorCount<long long>(rank_count) ||
-        rank_count == std::numeric_limits<std::size_t>::max() ||
-        !FitsVectorCount<GlobalIndex>(rank_count + 1))
+    const std::size_t local_dof_count = static_cast<std::size_t>(space.GetVSize());
+    if (!FitsVectorCount<RankIndex>(local_dof_count) ||
+        !FitsVectorCount<TraceMapEntry>(local_dof_count))
     {
       return TraceStatus::size_mismatch;
     }
-    const long long local_count = space.GetTrueVSize();
-    std::vector<long long> counts(rank_count);
-    if (MPI_Allgather(&local_count, 1, MPI_LONG_LONG,
-                      counts.data(), 1, MPI_LONG_LONG, space.GetComm()) != MPI_SUCCESS)
+    const mfem::GroupCommunicator& group_communicator = space.GroupComm();
+    const mfem::Table& group_local_dofs = group_communicator.GroupLDofTable();
+    const mfem::GroupTopology& group_topology =
+        group_communicator.GetGroupTopology();
+    if (group_local_dofs.Size() != group_topology.NGroups())
     {
       return TraceStatus::invalid_map;
-    }
-    std::vector<GlobalIndex> offsets(rank_count + 1, 0);
-    for (RankIndex process = 0; process < space.GetNRanks(); ++process)
-    {
-      if (counts[static_cast<std::size_t>(process)] < 0 ||
-          offsets[static_cast<std::size_t>(process)] >
-              std::numeric_limits<GlobalIndex>::max() -
-                  counts[static_cast<std::size_t>(process)])
-      {
-        return TraceStatus::invalid_map;
-      }
-      offsets[static_cast<std::size_t>(process) + 1] =
-          offsets[static_cast<std::size_t>(process)] +
-          counts[static_cast<std::size_t>(process)];
     }
     TraceMap next;
     next.rank = static_cast<RankIndex>(space.GetMyRank());
     next.rank_count = static_cast<RankIndex>(space.GetNRanks());
     next.local_true_dof_count = static_cast<LocalIndex>(space.GetTrueVSize());
-    next.global_true_dof_count = offsets.back();
-    if (next.global_true_dof_count !=
-        static_cast<GlobalIndex>(space.GlobalTrueVSize()))
+    const HYPRE_BigInt* const true_dof_offsets = space.GetTrueDofOffsets();
+    if (true_dof_offsets == nullptr) { return TraceStatus::invalid_map; }
+    const HYPRE_BigInt local_begin = HYPRE_AssumedPartitionCheck() ?
+        true_dof_offsets[0] : true_dof_offsets[next.rank];
+    const HYPRE_BigInt local_end = HYPRE_AssumedPartitionCheck() ?
+        true_dof_offsets[1] : true_dof_offsets[next.rank + 1];
+    const HYPRE_BigInt global_end = HYPRE_AssumedPartitionCheck() ?
+        true_dof_offsets[2] : true_dof_offsets[next.rank_count];
+    if (local_begin < 0 || local_end < local_begin || global_end < local_end ||
+        global_end > std::numeric_limits<GlobalIndex>::max() ||
+        local_end - local_begin != space.GetTrueVSize())
     {
       return TraceStatus::invalid_map;
     }
-    if (!FitsVectorCount<TraceMapEntry>(static_cast<std::size_t>(space.GetVSize())))
+    next.global_true_dof_count = static_cast<GlobalIndex>(global_end);
+    if (!FitsVectorCount<std::uint8_t>(local_dof_count))
     {
       return TraceStatus::size_mismatch;
     }
-    next.entries.reserve(static_cast<std::size_t>(space.GetVSize()));
+    std::vector<RankIndex> owner_by_local_dof(local_dof_count, next.rank);
+    std::vector<std::uint8_t> shared_local_dof(local_dof_count, 0);
+    for (int group = 1; group < group_local_dofs.Size(); ++group)
+    {
+      const RankIndex master_rank = static_cast<RankIndex>(
+          group_topology.GetGroupMasterRank(group));
+      if (master_rank < 0 || master_rank >= next.rank_count)
+      {
+        return TraceStatus::invalid_map;
+      }
+      const int* const local_dofs = group_local_dofs.GetRow(group);
+      for (int index = 0; index < group_local_dofs.RowSize(group); ++index)
+      {
+        const int local_dof = local_dofs[index];
+        if (local_dof < 0 || local_dof >= space.GetVSize())
+        {
+          return TraceStatus::invalid_map;
+        }
+        const std::size_t local_index = static_cast<std::size_t>(local_dof);
+        if (shared_local_dof[local_index] != 0)
+        {
+          return TraceStatus::invalid_map;
+        }
+        shared_local_dof[local_index] = 1;
+        owner_by_local_dof[local_index] = master_rank;
+      }
+    }
+    next.entries.reserve(local_dof_count);
     for (LocalIndex local = 0; local < space.GetVSize(); ++local)
     {
-      const GlobalIndex global = static_cast<GlobalIndex>(space.GetGlobalTDofNumber(local));
+      const auto global_true_dof = space.GetGlobalTDofNumber(local);
+      if (global_true_dof < 0 ||
+          global_true_dof > std::numeric_limits<GlobalIndex>::max())
+      {
+        return TraceStatus::invalid_map;
+      }
+      const GlobalIndex global = static_cast<GlobalIndex>(global_true_dof);
       const LocalIndex local_true = static_cast<LocalIndex>(space.GetLocalTDofNumber(local));
-      const RankIndex owner = OwnerFor(global, offsets);
-      if (owner == invalid_rank ||
+      const RankIndex owner = owner_by_local_dof[static_cast<std::size_t>(local)];
+      if (global >= next.global_true_dof_count ||
           (local_true >= 0 && local_true >= next.local_true_dof_count) ||
+          (local_true >= 0 && global !=
+              static_cast<GlobalIndex>(local_begin + local_true)) ||
           (local_true >= 0) != (owner == next.rank))
       {
         return TraceStatus::invalid_map;
