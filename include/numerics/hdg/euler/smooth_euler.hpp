@@ -144,6 +144,20 @@ struct ExperimentEvidence
 };
 
 /**
+ * Read-only local-system capture used by the serial, independent assembly
+ * oracles.  The signed trace map deliberately remains in MFEM's native
+ * orientation convention; callers must decode it before global insertion.
+ */
+struct LocalLinearizationSnapshot
+{
+  int elements = 0;
+  int interior_dofs = 0;
+  int trace_dofs = 0;
+  std::vector<double> a, b, c, d, f, g;
+  std::vector<int> signed_trace_dofs;
+};
+
+/**
  * Serial-only owner for the fixed 2-D experiment. The implementation uses
  * L2(p,2) interiors, DG_Interface(p,2) skeleton unknowns, Ordering::byNODES,
  * a SparseMatrix trace system, and local HostReferenceEngine condensation.
@@ -180,6 +194,8 @@ public:
   const mfem::FiniteElementSpace* trace_space() const noexcept;
   const mfem::GridFunction* old_trace() const noexcept;
   const mfem::SparseMatrix* trace_matrix() const noexcept;
+  /** Copies assembled blocks without exposing mutable implementation state. */
+  bool CopyLocalLinearization(LocalLinearizationSnapshot& snapshot) const;
 
 private:
   struct Implementation;

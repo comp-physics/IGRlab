@@ -81,30 +81,85 @@ StridedBlockView<T> View(T* data, const LocalIndex batch, const LocalIndex rows,
   return {data, batch, rows, columns, rows * columns, columns, 1};
 }
 
-class FaceBlockILU
+bool InterpolateByNodes(const mfem::GridFunction& field,
+                        const mfem::Array<int>& signed_vdofs,
+                        const mfem::Vector& shape, ConservedState& state)
 {
-public:
-  explicit FaceBlockILU(const mfem::SparseMatrix& matrix)
-      : inverse_diagonal_(matrix.Height())
+  if (signed_vdofs.Size() != conserved_components * shape.Size()) return false;
+  state = {};
+  for (int node = 0; node < shape.Size(); ++node)
   {
-    for (int row = 0; row < matrix.Height(); ++row)
+    for (int component = 0; component < conserved_components; ++component)
     {
-      const double diagonal = matrix(row, row);
-      inverse_diagonal_[row] = std::abs(diagonal) > 0.0 ? 1.0 / diagonal : 1.0;
+      double sign = 1.0;
+      const int vdof = DecodeSignedVDof(
+          signed_vdofs[ByNodesIndex(node, shape.Size(), component)], sign);
+      if (vdof < 0 || vdof >= field.Size()) return false;
+      state[component] += shape[node] * sign * field[vdof];
     }
   }
+  return IsFinite(state);
+}
 
-  void Apply(const mfem::Vector& input, mfem::Vector& output) const
+/**
+ * Keeps the accepted byNODES trace layout while presenting contiguous
+ * (face-node, conserved-component) blocks to MFEM's BlockILU.  This is an
+ * actual similarity permutation of the assembled sparse operator, not a
+ * diagonal surrogate: GMRES sees this Solver as its preconditioner.
+ */
+class PermutedFaceBlockILU final : public mfem::Solver
+{
+public:
+  PermutedFaceBlockILU(const mfem::SparseMatrix& matrix,
+                       std::vector<int> permuted_to_global,
+                       const int face_block_size)
+      : mfem::Solver(matrix.Height()), source_(&matrix),
+        permuted_to_global_(std::move(permuted_to_global)),
+        permuted_matrix_(matrix.Height())
   {
-    output.SetSize(input.Size());
-    for (int i = 0; i < input.Size(); ++i)
+    if (matrix.Height() != matrix.Width() ||
+        static_cast<int>(permuted_to_global_.size()) != matrix.Height() ||
+        face_block_size <= 0 || matrix.Height() % face_block_size != 0)
     {
-      output[i] = inverse_diagonal_[i] * input[i];
+      throw std::invalid_argument("invalid face-block ILU permutation");
+    }
+    for (int row = 0; row < matrix.Height(); ++row)
+      for (int column = 0; column < matrix.Width(); ++column)
+      {
+        const double value = matrix(permuted_to_global_[row],
+                                    permuted_to_global_[column]);
+        if (value != 0.0) { permuted_matrix_.Add(row, column, value); }
+      }
+    permuted_matrix_.Finalize();
+    block_ilu_ = std::make_unique<mfem::BlockILU>(
+        permuted_matrix_, face_block_size, mfem::BlockILU::Reordering::NONE);
+  }
+
+  void SetOperator(const mfem::Operator& op) override
+  {
+    if (&op != source_) { throw std::invalid_argument("face-block ILU operator changed"); }
+  }
+
+  void Mult(const mfem::Vector& input, mfem::Vector& output) const override
+  {
+    mfem::Vector reordered_rhs(height), reordered_solution(height);
+    for (int row = 0; row < height; ++row)
+    {
+      reordered_rhs[row] = input[permuted_to_global_[row]];
+    }
+    block_ilu_->Mult(reordered_rhs, reordered_solution);
+    output.SetSize(height);
+    for (int row = 0; row < height; ++row)
+    {
+      output[permuted_to_global_[row]] = reordered_solution[row];
     }
   }
 
 private:
-  mfem::Vector inverse_diagonal_;
+  const mfem::SparseMatrix* source_;
+  std::vector<int> permuted_to_global_;
+  mfem::SparseMatrix permuted_matrix_;
+  std::unique_ptr<mfem::BlockILU> block_ilu_;
 };
 
 } // namespace
@@ -298,8 +353,10 @@ struct SmoothEulerExperiment::Implementation
   mfem::Vector trace_rhs, trace_increment;
   std::vector<int> trace_dofs;
   std::vector<double> a, b, c, d, f, g, schur, reduced_rhs, recovered;
+  std::unique_ptr<PermutedFaceBlockILU> trace_preconditioner;
   core::HostReferenceEngine condensation;
-  int local_interior = 0, local_trace = 0, elements = 0;
+  int local_interior = 0, local_trace = 0, elements = 0, trace_face_block_size = 0;
+  std::vector<int> trace_permutation;
 };
 
 SmoothEulerExperiment::SmoothEulerExperiment(const int polynomial_order)
@@ -374,6 +431,63 @@ bool SmoothEulerExperiment::BuildPeriodicMesh(const int elements_per_direction)
       }
       candidate->local_trace += face_vdofs.Size();
     }
+    candidate->trace_face_block_size = conserved_components *
+        candidate->trace_space->GetFaceElement(faces[0])->GetDof();
+    if (candidate->trace_face_block_size <= 0 ||
+        candidate->trace_space->GetVSize() % candidate->trace_face_block_size != 0)
+    {
+      return false;
+    }
+    candidate->trace_dofs.assign(
+        static_cast<std::size_t>(candidate->elements) * candidate->local_trace, 0);
+    for (int element = 0; element < candidate->elements; ++element)
+    {
+      mfem::Array<int> element_faces, element_orientations;
+      candidate->mesh->GetElementFaces(element, element_faces, element_orientations);
+      if (element_faces.Size() != faces.Size() ||
+          element_orientations.Size() != element_faces.Size()) { return false; }
+      int offset = 0;
+      for (int local_face = 0; local_face < element_faces.Size(); ++local_face)
+      {
+        mfem::Array<int> face_vdofs;
+        candidate->trace_space->GetFaceVDofs(element_faces[local_face], face_vdofs);
+        if (face_vdofs.Size() <= 0 || offset + face_vdofs.Size() > candidate->local_trace)
+        {
+          return false;
+        }
+        std::copy(face_vdofs.begin(), face_vdofs.end(),
+                  candidate->trace_dofs.begin() +
+                      static_cast<std::size_t>(element) * candidate->local_trace + offset);
+        offset += face_vdofs.Size();
+      }
+      if (offset != candidate->local_trace) { return false; }
+    }
+    candidate->trace_permutation.clear();
+    std::vector<bool> seen(static_cast<std::size_t>(candidate->trace_space->GetVSize()), false);
+    for (int face = 0; face < candidate->mesh->GetNumFaces(); ++face)
+    {
+      const mfem::FiniteElement* face_fe = candidate->trace_space->GetFaceElement(face);
+      if (face_fe == nullptr || face_fe->GetDof() <= 0) { return false; }
+      const int scalar_dofs = face_fe->GetDof();
+      mfem::Array<int> face_vdofs;
+      candidate->trace_space->GetFaceVDofs(face, face_vdofs);
+      for (int node = 0; node < scalar_dofs; ++node)
+        for (int component = 0; component < conserved_components; ++component)
+        {
+          double sign = 1.0;
+          const int vdof = DecodeSignedVDof(
+              face_vdofs[ByNodesIndex(node, scalar_dofs, component)], sign);
+          if (vdof < 0 || vdof >= candidate->trace_space->GetVSize() || seen[vdof])
+          {
+            return false;
+          }
+          seen[vdof] = true;
+          candidate->trace_permutation.push_back(vdof);
+        }
+    }
+    if (static_cast<int>(candidate->trace_permutation.size()) !=
+            candidate->trace_space->GetVSize() ||
+        std::find(seen.begin(), seen.end(), false) != seen.end()) return false;
   }
   catch (const std::exception&)
   {
@@ -459,18 +573,27 @@ bool SmoothEulerExperiment::ProjectOldStage()
 bool SmoothEulerExperiment::AssembleLinearization()
 {
   if (!implementation_->mesh || !implementation_->old_interior ||
-      implementation_->local_interior <= 0 || implementation_->local_trace <= 0) return false;
+      !implementation_->old_trace || implementation_->local_interior <= 0 ||
+      implementation_->local_trace <= 0) return false;
   const int ni = implementation_->local_interior;
+  const int nt = implementation_->local_trace;
   const int batches = implementation_->elements;
   std::vector<double> candidate_a(static_cast<std::size_t>(batches) * ni * ni,
                                   0.0);
+  std::vector<double> candidate_b(static_cast<std::size_t>(batches) * ni * nt, 0.0);
+  std::vector<double> candidate_c(static_cast<std::size_t>(batches) * nt * ni, 0.0);
+  std::vector<double> candidate_d(static_cast<std::size_t>(batches) * nt * nt, 0.0);
   std::vector<double> candidate_f(static_cast<std::size_t>(batches) * ni, 0.0);
+  std::vector<double> candidate_g(static_cast<std::size_t>(batches) * nt, 0.0);
   for (int element = 0; element < batches; ++element)
   {
     const mfem::FiniteElement& fe = *implementation_->interior_space->GetFE(element);
     mfem::ElementTransformation& transformation =
         *implementation_->mesh->GetElementTransformation(element);
     const int scalar_dofs = fe.GetDof();
+    mfem::Array<int> interior_vdofs;
+    implementation_->interior_space->GetElementVDofs(element, interior_vdofs);
+    if (interior_vdofs.Size() != ni) return false;
     const mfem::IntegrationRule& rule =
         mfem::IntRules.Get(fe.GetGeomType(), quadrature_order_);
     const std::size_t a_offset = static_cast<std::size_t>(element) * ni * ni;
@@ -490,7 +613,7 @@ bool SmoothEulerExperiment::AssembleLinearization()
       FluxVector flux_y{};
       FluxJacobian jacobian_x{};
       FluxJacobian jacobian_y{};
-      if (!ManufacturedConservative(physical[0], physical[1], state).ok() ||
+      if (!InterpolateByNodes(*implementation_->old_interior, interior_vdofs, shape, state) ||
           !ManufacturedSource(physical[0], physical[1], source).ok() ||
           !NormalFlux(state, {{1.0, 0.0}}, flux_x).ok() ||
           !NormalFlux(state, {{0.0, 1.0}}, flux_y).ok() ||
@@ -529,19 +652,165 @@ bool SmoothEulerExperiment::AssembleLinearization()
         }
       }
     }
+
+    // Every local face is evaluated in the canonical DG_Interface face
+    // coordinate.  MFEM's Loc1/Loc2 mapping supplies the element-side point;
+    // the shared signed VDof list is retained verbatim for global assembly.
+    mfem::Array<int> faces, orientations;
+    implementation_->mesh->GetElementFaces(element, faces, orientations);
+    int trace_offset = 0;
+    for (int local_face = 0; local_face < faces.Size(); ++local_face)
+    {
+      const int face = faces[local_face];
+      mfem::FaceElementTransformations* face_transformation =
+          implementation_->mesh->GetFaceElementTransformations(face);
+      const mfem::FiniteElement* trace_fe =
+          implementation_->trace_space->GetFaceElement(face);
+      mfem::Array<int> face_vdofs;
+      implementation_->trace_space->GetFaceVDofs(face, face_vdofs);
+      if (face_transformation == nullptr || face_transformation->Face == nullptr ||
+          trace_fe == nullptr || face_vdofs.Size() !=
+              conserved_components * trace_fe->GetDof()) return false;
+      const bool is_element_one = face_transformation->Elem1No == element;
+      if (!is_element_one && face_transformation->Elem2No != element) return false;
+      const int trace_scalar_dofs = trace_fe->GetDof();
+      const mfem::IntegrationRule& face_rule =
+          mfem::IntRules.Get(trace_fe->GetGeomType(), quadrature_order_);
+      mfem::Vector interior_shape(scalar_dofs), trace_shape(trace_scalar_dofs);
+      for (int point_index = 0; point_index < face_rule.GetNPoints(); ++point_index)
+      {
+        const mfem::IntegrationPoint& face_point = face_rule.IntPoint(point_index);
+        face_transformation->SetAllIntPoints(&face_point);
+        const mfem::IntegrationPoint& element_point = is_element_one ?
+            face_transformation->GetElement1IntPoint() :
+            face_transformation->GetElement2IntPoint();
+        mfem::Vector physical(dimension), scaled_normal(dimension);
+        face_transformation->Face->Transform(face_point, physical);
+        mfem::CalcOrtho(face_transformation->Face->Jacobian(), scaled_normal);
+        const double face_measure = scaled_normal.Norml2();
+        if (!(face_measure > 0.0) || !std::isfinite(face_measure)) return false;
+        const double side = is_element_one ? 1.0 : -1.0;
+        const std::array<double, dimension> unit_normal{{
+            side * scaled_normal[0] / face_measure,
+            side * scaled_normal[1] / face_measure}};
+        fe.CalcShape(element_point, interior_shape);
+        trace_fe->CalcShape(face_point, trace_shape);
+        ConservedState interior_state{}, trace_state{};
+        FluxVector trace_flux{};
+        FluxJacobian trace_jacobian{};
+        if (!InterpolateByNodes(*implementation_->old_interior, interior_vdofs,
+                                interior_shape, interior_state) ||
+            !InterpolateByNodes(*implementation_->old_trace, face_vdofs,
+                                trace_shape, trace_state) ||
+            !NormalFlux(trace_state, unit_normal, trace_flux).ok() ||
+            !NormalFluxJacobian(trace_state, unit_normal, trace_jacobian).ok()) return false;
+        const double weight = face_point.weight * face_measure;
+        for (int row = 0; row < scalar_dofs; ++row)
+        {
+          for (int component = 0; component < conserved_components; ++component)
+          {
+            const int local_row = ByNodesIndex(row, scalar_dofs, component);
+            const double residual = weight * interior_shape[row] *
+                (trace_flux[component] + fixed_scalar_tau *
+                    (interior_state[component] - trace_state[component]));
+            candidate_f[static_cast<std::size_t>(element) * ni + local_row] -= residual;
+          }
+        }
+        for (int trace_row = 0; trace_row < trace_scalar_dofs; ++trace_row)
+        {
+          for (int component = 0; component < conserved_components; ++component)
+          {
+            const int local_row = trace_offset +
+                ByNodesIndex(trace_row, trace_scalar_dofs, component);
+            const double residual = weight * trace_shape[trace_row] *
+                (trace_flux[component] + fixed_scalar_tau *
+                    (interior_state[component] - trace_state[component]));
+            candidate_g[static_cast<std::size_t>(element) * nt + local_row] -= residual;
+          }
+        }
+        for (int row = 0; row < scalar_dofs; ++row)
+        {
+          for (int column = 0; column < scalar_dofs; ++column)
+          {
+            for (int r = 0; r < conserved_components; ++r)
+            {
+              for (int c = 0; c < conserved_components; ++c)
+              {
+                const int local_row = ByNodesIndex(row, scalar_dofs, r);
+                const int local_column = ByNodesIndex(column, scalar_dofs, c);
+                if (r == c)
+                {
+                  candidate_a[a_offset + static_cast<std::size_t>(local_row) * ni +
+                              local_column] += weight * interior_shape[row] *
+                                               fixed_scalar_tau * interior_shape[column];
+                }
+              }
+            }
+          }
+        }
+        for (int row = 0; row < scalar_dofs; ++row)
+          for (int column = 0; column < trace_scalar_dofs; ++column)
+            for (int r = 0; r < conserved_components; ++r)
+              for (int c = 0; c < conserved_components; ++c)
+              {
+                const int local_row = ByNodesIndex(row, scalar_dofs, r);
+                const int local_column = trace_offset +
+                    ByNodesIndex(column, trace_scalar_dofs, c);
+                candidate_b[static_cast<std::size_t>(element) * ni * nt +
+                            static_cast<std::size_t>(local_row) * nt + local_column] +=
+                    weight * interior_shape[row] * trace_shape[column] *
+                    (trace_jacobian[r][c] - (r == c ? fixed_scalar_tau : 0.0));
+              }
+        for (int row = 0; row < trace_scalar_dofs; ++row)
+          for (int column = 0; column < scalar_dofs; ++column)
+            for (int r = 0; r < conserved_components; ++r)
+            {
+              const int local_row = trace_offset + ByNodesIndex(row, trace_scalar_dofs, r);
+              const int local_column = ByNodesIndex(column, scalar_dofs, r);
+              candidate_c[static_cast<std::size_t>(element) * nt * ni +
+                          static_cast<std::size_t>(local_row) * ni + local_column] +=
+                  weight * trace_shape[row] * fixed_scalar_tau * interior_shape[column];
+            }
+        for (int row = 0; row < trace_scalar_dofs; ++row)
+          for (int column = 0; column < trace_scalar_dofs; ++column)
+            for (int r = 0; r < conserved_components; ++r)
+              for (int c = 0; c < conserved_components; ++c)
+              {
+                const int local_row = trace_offset + ByNodesIndex(row, trace_scalar_dofs, r);
+                const int local_column = trace_offset +
+                    ByNodesIndex(column, trace_scalar_dofs, c);
+                candidate_d[static_cast<std::size_t>(element) * nt * nt +
+                            static_cast<std::size_t>(local_row) * nt + local_column] +=
+                    weight * trace_shape[row] * trace_shape[column] *
+                    (trace_jacobian[r][c] - (r == c ? fixed_scalar_tau : 0.0));
+              }
+      }
+      trace_offset += face_vdofs.Size();
+    }
+    if (trace_offset != nt) return false;
   }
-  // 03B owns the oriented Euler face operator and local A/B/C/D coupling.
-  // Do not publish a volume-only candidate as a usable linearization.
-  (void)candidate_a;
-  (void)candidate_f;
-  return false;
+  implementation_->a = std::move(candidate_a);
+  implementation_->b = std::move(candidate_b);
+  implementation_->c = std::move(candidate_c);
+  implementation_->d = std::move(candidate_d);
+  implementation_->f = std::move(candidate_f);
+  implementation_->g = std::move(candidate_g);
+  implementation_->trace_matrix.reset();
+  implementation_->trace_preconditioner.reset();
+  return true;
 }
 
 bool SmoothEulerExperiment::CondenseAndAssembleTrace()
 {
   const int batches = implementation_->elements, ni = implementation_->local_interior,
             nt = implementation_->local_trace;
-  if (batches <= 0 || ni <= 0 || nt <= 0) return false;
+  if (batches <= 0 || ni <= 0 || nt <= 0 ||
+      implementation_->a.size() != static_cast<std::size_t>(batches) * ni * ni ||
+      implementation_->b.size() != static_cast<std::size_t>(batches) * ni * nt ||
+      implementation_->c.size() != static_cast<std::size_t>(batches) * nt * ni ||
+      implementation_->d.size() != static_cast<std::size_t>(batches) * nt * nt ||
+      implementation_->f.size() != static_cast<std::size_t>(batches) * ni ||
+      implementation_->g.size() != static_cast<std::size_t>(batches) * nt) return false;
   implementation_->schur.assign(static_cast<std::size_t>(batches) * nt * nt, 0.0);
   implementation_->reduced_rhs.assign(static_cast<std::size_t>(batches) * nt, 0.0);
   const LocalBlockShape shape{ni / conserved_components, nt / conserved_components,
@@ -577,11 +846,12 @@ bool SmoothEulerExperiment::CondenseAndAssembleTrace()
 bool SmoothEulerExperiment::SolveTrace()
 {
   if (!implementation_->trace_matrix) return false;
-  FaceBlockILU block_ilu(*implementation_->trace_matrix);
-  mfem::Vector checked_rhs; block_ilu.Apply(implementation_->trace_rhs, checked_rhs);
-  if (!std::isfinite(checked_rhs.Norml2())) return false;
+  implementation_->trace_preconditioner = std::make_unique<PermutedFaceBlockILU>(
+      *implementation_->trace_matrix, implementation_->trace_permutation,
+      implementation_->trace_face_block_size);
   mfem::GMRESSolver gmres;
   gmres.SetOperator(*implementation_->trace_matrix);
+  gmres.SetPreconditioner(*implementation_->trace_preconditioner);
   gmres.SetRelTol(1.0e-10); gmres.SetAbsTol(0.0);
   gmres.SetMaxIter(std::max(50, implementation_->trace_matrix->Height()));
   gmres.SetPrintLevel(0);
@@ -614,18 +884,10 @@ bool SmoothEulerExperiment::RecoverInterior()
 
 bool SmoothEulerExperiment::SolveDampedNewton(NewtonEvidence& evidence)
 {
-  evidence = {}; evidence.maximum_wave_speed = ManufacturedMaximumWaveSpeed();
-  if (evidence.maximum_wave_speed >= 1.78 || !BuildPeriodicMesh(3) || !ProjectOldStage() ||
-      !AssembleLinearization() || !CondenseAndAssembleTrace() || !SolveTrace() || !RecoverInterior()) return false;
-  mfem::Vector residual(implementation_->trace_rhs.Size());
-  implementation_->trace_matrix->Mult(implementation_->trace_increment, residual); residual -= implementation_->trace_rhs;
-  evidence.initial_residual = implementation_->trace_rhs.Norml2();
-  evidence.final_residual = residual.Norml2();
-  evidence.trace_relative_residual = evidence.final_residual / std::max(1.0, evidence.initial_residual);
-  evidence.nonlinear_iterations = 1; evidence.linear_iterations = implementation_->trace_matrix->Height();
-  evidence.minimum_damping = 1.0; evidence.minimum_density = 0.9; evidence.minimum_pressure = 0.9;
-  evidence.admissible = true;
-  return evidence.trace_relative_residual <= 1.0e-10;
+  evidence = {};
+  // 03C owns state-updating Newton, admissibility, and convergence evidence.
+  // A linearized 03B candidate must not manufacture any of that evidence.
+  return false;
 }
 
 bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
@@ -639,6 +901,27 @@ bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
 const mfem::SparseMatrix* SmoothEulerExperiment::trace_matrix() const noexcept
 {
   return implementation_->trace_matrix.get();
+}
+
+bool SmoothEulerExperiment::CopyLocalLinearization(
+    LocalLinearizationSnapshot& snapshot) const
+{
+  snapshot = {};
+  if (implementation_->elements <= 0 || implementation_->local_interior <= 0 ||
+      implementation_->local_trace <= 0 || implementation_->a.empty() ||
+      implementation_->b.empty() || implementation_->c.empty() ||
+      implementation_->d.empty() || implementation_->trace_dofs.empty()) return false;
+  snapshot.elements = implementation_->elements;
+  snapshot.interior_dofs = implementation_->local_interior;
+  snapshot.trace_dofs = implementation_->local_trace;
+  snapshot.a = implementation_->a;
+  snapshot.b = implementation_->b;
+  snapshot.c = implementation_->c;
+  snapshot.d = implementation_->d;
+  snapshot.f = implementation_->f;
+  snapshot.g = implementation_->g;
+  snapshot.signed_trace_dofs = implementation_->trace_dofs;
+  return true;
 }
 
 const mfem::FiniteElementSpace* SmoothEulerExperiment::trace_space() const noexcept
