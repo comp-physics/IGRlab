@@ -108,6 +108,14 @@ def parse_labels(values: list[str]) -> dict[str, str]:
     return labels
 
 
+def write_exclusive(path: Path, text: str) -> None:
+    """Create a sidecar once without following a pre-existing final symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(text)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
@@ -170,8 +178,7 @@ def main() -> int:
         "environment": environment,
         "labels": labels,
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_exclusive(args.output, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(f"profile-provenance: wrote {args.output}")
     return 0
 
