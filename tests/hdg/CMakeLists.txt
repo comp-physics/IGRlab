@@ -165,6 +165,21 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     TIMEOUT 30)
 endif()
 
+# CPU core, trace, device, and formulation tests remain independently
+# registerable even when the accelerator-only oracle below is unavailable.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/core/CMakeLists.txt")
+  add_subdirectory(core)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/trace/CMakeLists.txt")
+  add_subdirectory(trace)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/device/CMakeLists.txt")
+  add_subdirectory(device)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/euler/CMakeLists.txt")
+  add_subdirectory(euler)
+endif()
+
 if(NOT MFEM_VERSION_INT EQUAL 40900)
   message(FATAL_ERROR "HDG oracle requires immutable MFEM v4.9, got ${MFEM_VERSION}")
 endif()

@@ -108,7 +108,15 @@ enum class RegionId : std::uint16_t
   igr_chebyshev_setup = 243,
   igr_chebyshev_diagonal = 244,
   igr_warm_start_residual_guard = 245,
-  igr_krylov_solve = 246
+  igr_krylov_solve = 246,
+  hdg_local_assembly = 300,
+  hdg_local_factorization = 301,
+  hdg_condensation = 302,
+  hdg_schur_action = 303,
+  hdg_trace_assembly = 304,
+  hdg_interior_recovery = 305,
+  hdg_packing = 306,
+  hdg_device_transfer = 307
 };
 
 /** Stable counter IDs reserved for shared core performance measurements. */
@@ -163,6 +171,14 @@ constexpr const char* region_name(const RegionId id) noexcept
     case RegionId::igr_chebyshev_diagonal: return "IGR/chebyshev-diagonal";
     case RegionId::igr_warm_start_residual_guard: return "IGR/warm-start-residual-guard";
     case RegionId::igr_krylov_solve: return "IGR/krylov-solve";
+    case RegionId::hdg_local_assembly: return "HDG/local-assembly";
+    case RegionId::hdg_local_factorization: return "HDG/local-factorization";
+    case RegionId::hdg_condensation: return "HDG/condensation";
+    case RegionId::hdg_schur_action: return "HDG/schur-action";
+    case RegionId::hdg_trace_assembly: return "HDG/trace-assembly";
+    case RegionId::hdg_interior_recovery: return "HDG/interior-recovery";
+    case RegionId::hdg_packing: return "HDG/packing";
+    case RegionId::hdg_device_transfer: return "HDG/device-transfer";
     case RegionId::unknown: return "core/unknown";
   }
   return "core/unknown";
