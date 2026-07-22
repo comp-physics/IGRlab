@@ -36,6 +36,13 @@ enum class TraceStatus : std::uint8_t
   non_finite
 };
 
+/**
+ * Status results cover validated deterministic arguments, map/orientation
+ * metadata, finite arithmetic, and catchable C++ allocation/runtime errors.
+ * MFEM in this pinned configuration uses process-abort error handling, so an
+ * MFEM abort is deliberately not converted into a TraceStatus result.
+ */
+
 /** One local MFEM vector dof and its deterministic true-dof identity. */
 struct TraceMapEntry
 {
@@ -91,11 +98,15 @@ struct TraceExchangePlan
 {
   /** Exact space instance used to create map; no compatible-size substitution. */
   const mfem::ParFiniteElementSpace* space = nullptr;
+  /** Space and mesh generations observed when the plan was constructed. */
+  long space_sequence = -1;
+  long mesh_sequence = -1;
   TraceMap map;
 
   bool IsConsistent() const noexcept
   {
-    return space != nullptr && map.IsConsistent();
+    return space != nullptr && space_sequence >= 0 && mesh_sequence >= 0 &&
+           map.IsConsistent();
   }
   TraceStatus Distribute(mfem::ParFiniteElementSpace& space,
                          const mfem::Vector& owned_true_values,

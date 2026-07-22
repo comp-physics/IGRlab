@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -54,7 +55,7 @@ bool TrySquareCount(const LocalIndex size, std::size_t& count) noexcept
 }
 
 bool HasStorageOverlap(const mfem::Vector& left,
-                       const mfem::Vector& right) noexcept
+                       const mfem::Vector& right)
 {
   if (left.Size() == 0 || right.Size() == 0) { return false; }
   if (left.GetData() == nullptr || right.GetData() == nullptr) { return true; }
@@ -76,6 +77,27 @@ bool HasStorageOverlap(const mfem::Vector& left,
   }
   return left_begin < right_begin + right_bytes &&
          right_begin < left_begin + left_bytes;
+}
+
+TraceStatus CommitStagedVector(mfem::Vector& staged, mfem::Vector& output)
+{
+  if (output.OwnsData() || output.GetData() == nullptr)
+  {
+    output.Swap(staged);
+    return TraceStatus::success;
+  }
+  if (output.Size() != staged.Size()) { return TraceStatus::size_mismatch; }
+  for (int i = 0; i < staged.Size(); ++i) { output[i] = staged[i]; }
+  return TraceStatus::success;
+}
+
+TraceStatus ValidateOutputShape(const mfem::Vector& output, const int size)
+{
+  if (!output.OwnsData() && output.GetData() != nullptr && output.Size() != size)
+  {
+    return TraceStatus::size_mismatch;
+  }
+  return TraceStatus::success;
 }
 
 bool IsValidGeometry(const mfem::Geometry::Type geometry) noexcept
@@ -182,21 +204,21 @@ std::size_t TraceMap::GhostCount() const noexcept
 TraceStatus BuildTraceMap(const mfem::ParFiniteElementSpace& space,
                           TraceMap& map)
 {
-  if (!space.Conforming() || space.GetVSize() < 0 || space.GetTrueVSize() < 0 ||
-      space.GetNRanks() <= 0 || space.GetMyRank() < 0 ||
-      space.GetMyRank() >= space.GetNRanks())
-  {
-    return TraceStatus::invalid_argument;
-  }
-  const std::size_t rank_count = static_cast<std::size_t>(space.GetNRanks());
-  if (!FitsVectorCount<long long>(rank_count) ||
-      rank_count == std::numeric_limits<std::size_t>::max() ||
-      !FitsVectorCount<GlobalIndex>(rank_count + 1))
-  {
-    return TraceStatus::size_mismatch;
-  }
   try
   {
+    if (!space.Conforming() || space.GetVSize() < 0 || space.GetTrueVSize() < 0 ||
+        space.GetNRanks() <= 0 || space.GetMyRank() < 0 ||
+        space.GetMyRank() >= space.GetNRanks())
+    {
+      return TraceStatus::invalid_argument;
+    }
+    const std::size_t rank_count = static_cast<std::size_t>(space.GetNRanks());
+    if (!FitsVectorCount<long long>(rank_count) ||
+        rank_count == std::numeric_limits<std::size_t>::max() ||
+        !FitsVectorCount<GlobalIndex>(rank_count + 1))
+    {
+      return TraceStatus::size_mismatch;
+    }
     const long long local_count = space.GetTrueVSize();
     std::vector<long long> counts(rank_count);
     if (MPI_Allgather(&local_count, 1, MPI_LONG_LONG,
@@ -253,6 +275,7 @@ TraceStatus BuildTraceMap(const mfem::ParFiniteElementSpace& space,
   }
   catch (const std::bad_alloc&) { return TraceStatus::size_mismatch; }
   catch (const std::length_error&) { return TraceStatus::size_mismatch; }
+  catch (const std::exception&) { return TraceStatus::invalid_map; }
 }
 
 bool TraceOrientationMap::IsConsistent() const noexcept
@@ -282,10 +305,15 @@ TraceStatus TraceOrientationMap::Apply(const mfem::Vector& input,
                                        mfem::Vector& output) const
 {
   if (!IsConsistent()) { return TraceStatus::invalid_orientation; }
-  if (input.Size() != static_cast<int>(source.size())) { return TraceStatus::size_mismatch; }
-  if (HasStorageOverlap(input, output)) { return TraceStatus::invalid_argument; }
   try
   {
+    if (input.Size() != static_cast<int>(source.size()))
+    {
+      return TraceStatus::size_mismatch;
+    }
+    if (HasStorageOverlap(input, output)) { return TraceStatus::invalid_argument; }
+    const TraceStatus output_status = ValidateOutputShape(output, input.Size());
+    if (output_status != TraceStatus::success) { return output_status; }
     mfem::Vector staged(input.Size());
     for (int destination = 0; destination < staged.Size(); ++destination)
     {
@@ -293,11 +321,11 @@ TraceStatus TraceOrientationMap::Apply(const mfem::Vector& input,
       if (!IsFinite(value)) { return TraceStatus::non_finite; }
       staged[destination] = sign[static_cast<std::size_t>(destination)] * value;
     }
-    output.Swap(staged);
-    return TraceStatus::success;
+    return CommitStagedVector(staged, output);
   }
   catch (const std::bad_alloc&) { return TraceStatus::size_mismatch; }
   catch (const std::length_error&) { return TraceStatus::size_mismatch; }
+  catch (const std::exception&) { return TraceStatus::invalid_orientation; }
 }
 
 TraceStatus BuildOrientationMap(const mfem::FiniteElementCollection& collection,
@@ -314,15 +342,15 @@ TraceStatus BuildOrientationMap(const mfem::FiniteElementCollection& collection,
   {
     return TraceStatus::invalid_orientation;
   }
-  if (OrientationCount(geometry) == 0 ||
-      collection.DofForGeometry(geometry) != dof_count ||
-      !FitsVectorCount<LocalIndex>(static_cast<std::size_t>(dof_count)) ||
-      !FitsVectorCount<std::int8_t>(static_cast<std::size_t>(dof_count)))
-  {
-    return TraceStatus::invalid_argument;
-  }
   try
   {
+    if (OrientationCount(geometry) == 0 ||
+        collection.DofForGeometry(geometry) != dof_count ||
+        !FitsVectorCount<LocalIndex>(static_cast<std::size_t>(dof_count)) ||
+        !FitsVectorCount<std::int8_t>(static_cast<std::size_t>(dof_count)))
+    {
+      return TraceStatus::invalid_argument;
+    }
     const int* order = collection.DofOrderForOrientation(geometry, orientation);
     if (dof_count != 0 && order == nullptr) { return TraceStatus::invalid_orientation; }
     TraceOrientationMap next;
@@ -342,28 +370,33 @@ TraceStatus BuildOrientationMap(const mfem::FiniteElementCollection& collection,
   }
   catch (const std::bad_alloc&) { return TraceStatus::size_mismatch; }
   catch (const std::length_error&) { return TraceStatus::size_mismatch; }
+  catch (const std::exception&) { return TraceStatus::invalid_orientation; }
 }
 
 TraceStatus TraceExchangePlan::Distribute(mfem::ParFiniteElementSpace& space,
                                           const mfem::Vector& owned_true_values,
                                           mfem::Vector& local_values) const
 {
-  if (!IsConsistent() || &space != this->space ||
-      owned_true_values.Size() != space.GetTrueVSize() ||
-      HasStorageOverlap(owned_true_values, local_values))
-  {
-    return TraceStatus::invalid_map;
-  }
-  for (int i = 0; i < owned_true_values.Size(); ++i)
-  {
-    if (!IsFinite(owned_true_values[i])) { return TraceStatus::non_finite; }
-  }
-  TraceMap current;
-  const TraceStatus map_status = BuildTraceMap(space, current);
-  if (map_status != TraceStatus::success) { return map_status; }
-  if (!SameMap(map, current)) { return TraceStatus::invalid_map; }
   try
   {
+    if (!IsConsistent() || &space != this->space ||
+        space.GetSequence() != space_sequence || space.GetMesh() == nullptr ||
+        space.GetMesh()->GetSequence() != mesh_sequence ||
+        owned_true_values.Size() != space.GetTrueVSize() ||
+        HasStorageOverlap(owned_true_values, local_values))
+    {
+      return TraceStatus::invalid_map;
+    }
+    const TraceStatus output_status = ValidateOutputShape(local_values, space.GetVSize());
+    if (output_status != TraceStatus::success) { return output_status; }
+    for (int i = 0; i < owned_true_values.Size(); ++i)
+    {
+      if (!IsFinite(owned_true_values[i])) { return TraceStatus::non_finite; }
+    }
+    TraceMap current;
+    const TraceStatus map_status = BuildTraceMap(space, current);
+    if (map_status != TraceStatus::success) { return map_status; }
+    if (!SameMap(map, current)) { return TraceStatus::invalid_map; }
     mfem::ParGridFunction local(&space);
     local.Distribute(owned_true_values);
     mfem::Vector staged(space.GetVSize());
@@ -372,22 +405,32 @@ TraceStatus TraceExchangePlan::Distribute(mfem::ParFiniteElementSpace& space,
       if (!IsFinite(local[i])) { return TraceStatus::non_finite; }
       staged[i] = local[i];
     }
-    local_values.Swap(staged);
-    return TraceStatus::success;
+    return CommitStagedVector(staged, local_values);
   }
   catch (const std::bad_alloc&) { return TraceStatus::size_mismatch; }
   catch (const std::length_error&) { return TraceStatus::size_mismatch; }
+  catch (const std::exception&) { return TraceStatus::invalid_map; }
 }
 
 TraceStatus BuildTraceExchangePlan(const mfem::ParFiniteElementSpace& space,
                                    TraceExchangePlan& plan)
 {
-  TraceExchangePlan next;
-  const TraceStatus status = BuildTraceMap(space, next.map);
-  if (status != TraceStatus::success) { return status; }
-  next.space = &space;
-  plan = std::move(next);
-  return TraceStatus::success;
+  try
+  {
+    TraceExchangePlan next;
+    const TraceStatus status = BuildTraceMap(space, next.map);
+    if (status != TraceStatus::success) { return status; }
+    const mfem::Mesh* mesh = space.GetMesh();
+    if (mesh == nullptr) { return TraceStatus::invalid_argument; }
+    next.space = &space;
+    next.space_sequence = space.GetSequence();
+    next.mesh_sequence = mesh->GetSequence();
+    plan = std::move(next);
+    return TraceStatus::success;
+  }
+  catch (const std::bad_alloc&) { return TraceStatus::size_mismatch; }
+  catch (const std::length_error&) { return TraceStatus::size_mismatch; }
+  catch (const std::exception&) { return TraceStatus::invalid_map; }
 }
 
 bool AssembledTraceAction::IsConsistent() const noexcept
@@ -434,10 +477,12 @@ TraceStatus AssembledTraceAction::Apply(const mfem::Vector& input,
                                         mfem::Vector& output) const
 {
   if (!IsConsistent()) { return TraceStatus::invalid_action; }
-  if (input.Size() != size_) { return TraceStatus::size_mismatch; }
-  if (HasStorageOverlap(input, output)) { return TraceStatus::invalid_argument; }
   try
   {
+    if (input.Size() != size_) { return TraceStatus::size_mismatch; }
+    if (HasStorageOverlap(input, output)) { return TraceStatus::invalid_argument; }
+    const TraceStatus output_status = ValidateOutputShape(output, size_);
+    if (output_status != TraceStatus::success) { return output_status; }
     mfem::Vector staged(size_);
     for (LocalIndex row = 0; row < size_; ++row)
     {
@@ -455,11 +500,11 @@ TraceStatus AssembledTraceAction::Apply(const mfem::Vector& input,
       }
       staged[row] = value;
     }
-    output.Swap(staged);
-    return TraceStatus::success;
+    return CommitStagedVector(staged, output);
   }
   catch (const std::bad_alloc&) { return TraceStatus::size_mismatch; }
   catch (const std::length_error&) { return TraceStatus::size_mismatch; }
+  catch (const std::exception&) { return TraceStatus::invalid_action; }
 }
 
 bool ReferenceTraceAction::IsConsistent() const noexcept
@@ -508,14 +553,16 @@ TraceStatus ReferenceTraceAction::Apply(const mfem::Vector& input,
                                         mfem::Vector& output) const
 {
   if (!IsConsistent()) { return TraceStatus::invalid_action; }
-  if (input.Size() != size_) { return TraceStatus::size_mismatch; }
-  if (HasStorageOverlap(input, output)) { return TraceStatus::invalid_argument; }
-  for (int i = 0; i < input.Size(); ++i)
-  {
-    if (!IsFinite(input[i])) { return TraceStatus::non_finite; }
-  }
   try
   {
+    if (input.Size() != size_) { return TraceStatus::size_mismatch; }
+    if (HasStorageOverlap(input, output)) { return TraceStatus::invalid_argument; }
+    const TraceStatus output_status = ValidateOutputShape(output, size_);
+    if (output_status != TraceStatus::success) { return output_status; }
+    for (int i = 0; i < input.Size(); ++i)
+    {
+      if (!IsFinite(input[i])) { return TraceStatus::non_finite; }
+    }
     mfem::Vector staged(size_);
     staged = 0.0;
     for (const TraceContribution contribution : contributions_)
@@ -526,11 +573,11 @@ TraceStatus ReferenceTraceAction::Apply(const mfem::Vector& input,
       if (!IsFinite(next)) { return TraceStatus::non_finite; }
       staged[contribution.row] = next;
     }
-    output.Swap(staged);
-    return TraceStatus::success;
+    return CommitStagedVector(staged, output);
   }
   catch (const std::bad_alloc&) { return TraceStatus::size_mismatch; }
   catch (const std::length_error&) { return TraceStatus::size_mismatch; }
+  catch (const std::exception&) { return TraceStatus::invalid_action; }
 }
 
 TraceStatus CompareTraceActions(const AssembledTraceAction& assembled,

@@ -54,6 +54,25 @@ bool CheckActions()
   double error = 0.0;
   if (CompareTraceActions(assembled, reference, input, 0.0, error) !=
           TraceStatus::success || error != 0.0) { return false; }
+
+  mfem::Vector action_backing(5);
+  action_backing = -7.0;
+  mfem::Vector assembled_view;
+  mfem::Vector reference_view;
+  assembled_view.MakeRef(action_backing, 1, 3);
+  reference_view.MakeRef(action_backing, 1, 3);
+  double* const action_view_data = assembled_view.GetData();
+  if (assembled.Apply(input, assembled_view) != TraceStatus::success ||
+      assembled_view.OwnsData() || assembled_view.GetData() != action_view_data ||
+      assembled_view[0] != 2.5 || assembled_view[1] != 1.5 ||
+      assembled_view[2] != 9.5 ||
+      reference.Apply(input, reference_view) != TraceStatus::success ||
+      reference_view.OwnsData() || reference_view.GetData() != action_view_data ||
+      !SameValues(assembled_view, reference_view))
+  {
+    return false;
+  }
+
   input[1] = std::numeric_limits<double>::quiet_NaN();
   mfem::Vector output(3);
   output = 17.0;
@@ -117,6 +136,46 @@ bool CheckOrientation()
   {
     return false;
   }
+
+  mfem::Vector orientation_backing(count + 2);
+  orientation_backing = -5.0;
+  mfem::Vector orientation_view;
+  orientation_view.MakeRef(orientation_backing, 1, count);
+  double* const orientation_view_data = orientation_view.GetData();
+  if (forward.Apply(source, orientation_view) != TraceStatus::success ||
+      orientation_view.OwnsData() ||
+      orientation_view.GetData() != orientation_view_data ||
+      !SameValues(orientation_view, oriented))
+  {
+    return false;
+  }
+  mfem::Vector orientation_overlap_backing(count + 1);
+  for (int i = 0; i < orientation_overlap_backing.Size(); ++i)
+  {
+    orientation_overlap_backing[i] = 10.0 + i;
+  }
+  mfem::Vector orientation_overlap_input;
+  mfem::Vector orientation_overlap_output;
+  orientation_overlap_input.MakeRef(orientation_overlap_backing, 0, count);
+  orientation_overlap_output.MakeRef(orientation_overlap_backing, 1, count);
+  const mfem::Vector orientation_overlap_before(orientation_overlap_backing);
+  if (forward.Apply(orientation_overlap_input, orientation_overlap_output) !=
+          TraceStatus::invalid_argument ||
+      !SameValues(orientation_overlap_backing, orientation_overlap_before))
+  {
+    return false;
+  }
+  mfem::Vector orientation_short_backing(count - 1);
+  orientation_short_backing = -31.0;
+  mfem::Vector orientation_short_view;
+  orientation_short_view.MakeRef(orientation_short_backing, 0, count - 1);
+  const mfem::Vector orientation_short_before(orientation_short_backing);
+  if (forward.Apply(source, orientation_short_view) != TraceStatus::size_mismatch ||
+      !SameValues(orientation_short_backing, orientation_short_before))
+  {
+    return false;
+  }
+
   const mfem::Vector oriented_before(oriented);
   source[0] = std::numeric_limits<double>::quiet_NaN();
   if (forward.Apply(source, oriented) != TraceStatus::non_finite ||
@@ -149,24 +208,22 @@ bool CheckOrientation()
       mfem::Geometry::SEGMENT);
   dg::hdg::trace::TraceOrientationMap signed_map;
   mfem::Vector signed_input(signed_count);
-  signed_input = 1.0;
+  if (signed_count == 2)
+  {
+    signed_input[0] = 3.0;
+    signed_input[1] = 7.0;
+  }
   mfem::Vector signed_output;
-  if (signed_count <= 0 || BuildOrientationMap(signed_collection,
+  if (signed_count != 2 || BuildOrientationMap(signed_collection,
       mfem::Geometry::SEGMENT, 0, signed_count, signed_map) != TraceStatus::success ||
-      signed_map.Apply(signed_input, signed_output) != TraceStatus::success)
+      signed_map.Apply(signed_input, signed_output) != TraceStatus::success ||
+      signed_map.source[0] != 1 || signed_map.source[1] != 0 ||
+      signed_map.sign[0] != -1 || signed_map.sign[1] != -1 ||
+      signed_output[0] != -7.0 || signed_output[1] != -3.0)
   {
     return false;
   }
-  bool mfem_reports_negative = false;
-  bool application_preserves_negative = false;
-  const int* mfem_order = signed_collection.DofOrderForOrientation(
-      mfem::Geometry::SEGMENT, 0);
-  for (int i = 0; i < signed_count; ++i)
-  {
-    mfem_reports_negative = mfem_reports_negative || mfem_order[i] < 0;
-    application_preserves_negative = application_preserves_negative || signed_output[i] < 0.0;
-  }
-  return mfem_reports_negative && application_preserves_negative;
+  return true;
 }
 
 bool CheckMapAndExchange(MPI_Comm comm)
@@ -203,6 +260,41 @@ bool CheckMapAndExchange(MPI_Comm comm)
     if (std::abs(local_values[entry.local_dof] - expected) != 0.0 ||
         (entry.ownership == Ownership::owned) !=
             (entry.owner_rank == trace_space.GetMyRank())) { return false; }
+  }
+
+  mfem::Vector exchange_backing(trace_space.GetVSize() + 2);
+  exchange_backing = -23.0;
+  mfem::Vector exchange_view;
+  exchange_view.MakeRef(exchange_backing, 1, trace_space.GetVSize());
+  double* const exchange_view_data = exchange_view.GetData();
+  if (plan.Distribute(trace_space, true_values, exchange_view) != TraceStatus::success ||
+      exchange_view.OwnsData() || exchange_view.GetData() != exchange_view_data)
+  {
+    return false;
+  }
+  for (const auto& entry : plan.map.entries)
+  {
+    const double expected = 0.5 + static_cast<double>(entry.global_true_dof);
+    if (exchange_view[entry.local_dof] != expected) { return false; }
+  }
+
+  const int overlap_size = trace_space.GetTrueVSize() > trace_space.GetVSize() ?
+      trace_space.GetTrueVSize() : trace_space.GetVSize();
+  mfem::Vector exchange_overlap_backing(overlap_size + 1);
+  for (int i = 0; i < exchange_overlap_backing.Size(); ++i)
+  {
+    exchange_overlap_backing[i] = 100.0 + i;
+  }
+  mfem::Vector exchange_overlap_input;
+  mfem::Vector exchange_overlap_output;
+  exchange_overlap_input.MakeRef(exchange_overlap_backing, 0, trace_space.GetTrueVSize());
+  exchange_overlap_output.MakeRef(exchange_overlap_backing, 0, trace_space.GetVSize());
+  const mfem::Vector exchange_overlap_before(exchange_overlap_backing);
+  if (plan.Distribute(trace_space, exchange_overlap_input, exchange_overlap_output) !=
+          TraceStatus::invalid_map ||
+      !SameValues(exchange_overlap_backing, exchange_overlap_before))
+  {
+    return false;
   }
 
   mfem::ParFiniteElementSpace unrelated_space(&parallel_mesh, &collection);
@@ -246,7 +338,29 @@ bool CheckMapAndExchange(MPI_Comm comm)
 
   TraceMap invalid = plan.map;
   invalid.entries[0].owner_rank = invalid.rank_count;
-  return !invalid.IsConsistent();
+  if (invalid.IsConsistent()) { return false; }
+
+  mfem::Vector stale_local(1);
+  stale_local[0] = -29.0;
+  parallel_mesh.UniformRefinement();
+  if (trace_space.GetSequence() != plan.space_sequence ||
+      parallel_mesh.GetSequence() == plan.mesh_sequence)
+  {
+    return false;
+  }
+  if (plan.Distribute(trace_space, true_values, stale_local) != TraceStatus::invalid_map ||
+      stale_local.Size() != 1 || stale_local[0] != -29.0)
+  {
+    return false;
+  }
+  trace_space.Update(false);
+  if (trace_space.GetSequence() == plan.space_sequence ||
+      plan.Distribute(trace_space, true_values, stale_local) != TraceStatus::invalid_map ||
+      stale_local.Size() != 1 || stale_local[0] != -29.0)
+  {
+    return false;
+  }
+  return true;
 }
 
 } // namespace
