@@ -1,0 +1,114 @@
+#include "numerics/hdg/euler/smooth_euler.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
+
+namespace
+{
+using dg::hdg::euler::ConservedState;
+using dg::hdg::euler::FluxJacobian;
+using dg::hdg::euler::FluxVector;
+using dg::hdg::euler::ManufacturedConservative;
+using dg::hdg::euler::ManufacturedMaximumWaveSpeed;
+using dg::hdg::euler::ManufacturedSource;
+using dg::hdg::euler::NormalFlux;
+using dg::hdg::euler::NormalFluxJacobian;
+using dg::hdg::euler::PhysicsStatus;
+using dg::hdg::euler::conserved_components;
+
+bool Close(const double left, const double right, const double tolerance)
+{
+  return std::abs(left - right) <= tolerance * std::max({1.0, std::abs(left), std::abs(right)});
+}
+
+int TestHandFluxAndFailureAtomicity()
+{
+  const ConservedState state{{1.0, 2.0, 3.0, 10.0}};
+  FluxVector flux{{-7.0, -7.0, -7.0, -7.0}};
+  if (!NormalFlux(state, {{1.0, 0.0}}, flux).ok()) { return 1; }
+  const FluxVector expected{{2.0, 5.4, 6.0, 22.8}};
+  for (int component = 0; component < conserved_components; ++component)
+  {
+    if (!Close(flux[component], expected[component], 2.0e-14)) { return 2; }
+  }
+  const FluxVector saved = flux;
+  ConservedState bad_density = state;
+  bad_density[0] = 0.0;
+  if (NormalFlux(bad_density, {{1.0, 0.0}}, flux).status != PhysicsStatus::invalid_density ||
+      flux != saved) { return 3; }
+  ConservedState bad_pressure = state;
+  bad_pressure[3] = 6.5;
+  if (NormalFlux(bad_pressure, {{1.0, 0.0}}, flux).status != PhysicsStatus::invalid_pressure ||
+      flux != saved) { return 4; }
+  ConservedState non_finite = state;
+  non_finite[2] = std::numeric_limits<double>::infinity();
+  if (NormalFlux(non_finite, {{1.0, 0.0}}, flux).status != PhysicsStatus::non_finite ||
+      flux != saved) { return 5; }
+  return 0;
+}
+
+int TestAnalyticFluxJacobian()
+{
+  const ConservedState state{{1.2, 0.35, -0.22, 2.8}};
+  const std::array<double, 2> normal{{0.6, -0.8}};
+  FluxJacobian analytic{};
+  if (!NormalFluxJacobian(state, normal, analytic).ok()) { return 1; }
+  if (analytic[0][0] != 0.0) { return 2; }
+  for (int column = 0; column < conserved_components; ++column)
+  {
+    ConservedState plus = state;
+    ConservedState minus = state;
+    const double step = 1.0e-7 * std::max(1.0, std::abs(state[column]));
+    plus[column] += step;
+    minus[column] -= step;
+    FluxVector positive{};
+    FluxVector negative{};
+    if (!NormalFlux(plus, normal, positive).ok() || !NormalFlux(minus, normal, negative).ok())
+    {
+      return 3;
+    }
+    for (int row = 0; row < conserved_components; ++row)
+    {
+      const double difference = (positive[row] - negative[row]) / (2.0 * step);
+      if (!Close(analytic[row][column], difference, 2.0e-6)) { return 4; }
+    }
+  }
+  return 0;
+}
+
+int TestManufacturedSource()
+{
+  constexpr double x = 0.173, y = 0.619, h = 1.0e-5;
+  ConservedState source{};
+  if (!ManufacturedSource(x, y, source).ok()) { return 1; }
+  FluxVector xp{}, xm{}, yp{}, ym{};
+  ConservedState state{};
+  if (!ManufacturedConservative(x + h, y, state).ok() || !NormalFlux(state, {{1.0, 0.0}}, xp).ok() ||
+      !ManufacturedConservative(x - h, y, state).ok() || !NormalFlux(state, {{1.0, 0.0}}, xm).ok() ||
+      !ManufacturedConservative(x, y + h, state).ok() || !NormalFlux(state, {{0.0, 1.0}}, yp).ok() ||
+      !ManufacturedConservative(x, y - h, state).ok() || !NormalFlux(state, {{0.0, 1.0}}, ym).ok())
+  {
+    return 2;
+  }
+  for (int component = 0; component < conserved_components; ++component)
+  {
+    const double finite_difference = (xp[component] - xm[component] + yp[component] - ym[component]) /
+                                     (2.0 * h);
+    if (!Close(source[component], finite_difference, 2.0e-6)) { return 3; }
+  }
+  return ManufacturedMaximumWaveSpeed() < 1.78 ? 0 : 4;
+}
+
+} // namespace
+
+int main()
+{
+  const int flux = TestHandFluxAndFailureAtomicity();
+  if (flux != 0) { return 10 + flux; }
+  const int jacobian = TestAnalyticFluxJacobian();
+  if (jacobian != 0) { return 20 + jacobian; }
+  const int source = TestManufacturedSource();
+  return source == 0 ? 0 : 30 + source;
+}
