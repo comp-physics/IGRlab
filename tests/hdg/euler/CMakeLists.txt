@@ -14,8 +14,8 @@ elseif(NOT TARGET mfem)
 endif()
 
 if(MFEM_USE_CUDA OR MFEM_USE_HIP)
-  message(STATUS "Skipping serial smooth-Euler HDG experiment for accelerator MFEM")
-  return()
+  message(FATAL_ERROR
+    "DG_IGR_ENABLE_HDG_EULER_EXPERIMENT=ON requires a non-CUDA, non-HIP MFEM")
 endif()
 
 add_executable(dg_igr_hdg_smooth_euler_cpu_test

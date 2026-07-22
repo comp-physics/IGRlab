@@ -10,6 +10,9 @@
 namespace
 {
 using dg::hdg::euler::ConservedState;
+using dg::hdg::euler::ByNodesIndex;
+using dg::hdg::euler::ComponentFromByNodesIndex;
+using dg::hdg::euler::DecodeSignedVDof;
 using dg::hdg::euler::FluxJacobian;
 using dg::hdg::euler::FluxVector;
 using dg::hdg::euler::ManufacturedConservative;
@@ -19,36 +22,11 @@ using dg::hdg::euler::NormalFlux;
 using dg::hdg::euler::NormalFluxJacobian;
 using dg::hdg::euler::PhysicsStatus;
 using dg::hdg::euler::RunSmoothEulerExperiment;
+using dg::hdg::euler::ScalarFromByNodesIndex;
 using dg::hdg::euler::SmoothEulerExperiment;
 using dg::hdg::euler::ExperimentEvidence;
 using dg::hdg::euler::fixed_scalar_tau;
 using dg::hdg::euler::conserved_components;
-
-constexpr int ByNodesIndex(const int scalar_dof, const int scalar_count,
-                           const int component)
-{
-  return scalar_dof + scalar_count * component;
-}
-
-constexpr int ComponentFromByNodesIndex(const int vector_dof,
-                                        const int scalar_count)
-{
-  return vector_dof / scalar_count;
-}
-
-constexpr int ScalarFromByNodesIndex(const int vector_dof,
-                                     const int scalar_count)
-{
-  return vector_dof - scalar_count * ComponentFromByNodesIndex(vector_dof,
-                                                                 scalar_count);
-}
-
-static_assert(ByNodesIndex(3, 11, 2) == 25,
-              "MFEM byNODES is scalar_dof + scalar_count * component");
-static_assert(ComponentFromByNodesIndex(25, 11) == 2,
-              "byNODES inverse must retain the scalar extent");
-static_assert(ScalarFromByNodesIndex(25, 11) == 3,
-              "byNODES inverse must recover the scalar dof");
 
 bool Close(const double left, const double right, const double tolerance)
 {
@@ -142,7 +120,10 @@ int TestMfemByNodesAndSignedVDofs()
     for (int scalar = 0; scalar < scalar_count; ++scalar)
     {
       const int vector_dof = ByNodesIndex(scalar, scalar_count, component);
-      if (ComponentFromByNodesIndex(vector_dof, scalar_count) != component ||
+      const int mfem_vector_dof = mfem::Ordering::Map<mfem::Ordering::byNODES>(
+          scalar_count, conserved_components, scalar, component);
+      if (vector_dof != mfem_vector_dof ||
+          ComponentFromByNodesIndex(vector_dof, scalar_count) != component ||
           ScalarFromByNodesIndex(vector_dof, scalar_count) != scalar)
       {
         return 1;
@@ -150,16 +131,65 @@ int TestMfemByNodesAndSignedVDofs()
     }
   }
   double positive_sign = 0.0;
-  if (mfem::FiniteElementSpace::DecodeDof(23, positive_sign) != 23 ||
-      positive_sign != 1.0)
+  double production_positive_sign = 0.0;
+  if (DecodeSignedVDof(23, production_positive_sign) !=
+          mfem::FiniteElementSpace::DecodeDof(23, positive_sign) ||
+      production_positive_sign != positive_sign)
   {
     return 2;
   }
   double negative_sign = 0.0;
-  if (mfem::FiniteElementSpace::DecodeDof(-24, negative_sign) != 23 ||
-      negative_sign != -1.0)
+  double production_negative_sign = 0.0;
+  if (DecodeSignedVDof(-24, production_negative_sign) !=
+          mfem::FiniteElementSpace::DecodeDof(-24, negative_sign) ||
+      production_negative_sign != negative_sign)
   {
     return 3;
+  }
+  return 0;
+}
+
+int TestProjectedTraceComponentOrdering()
+{
+  SmoothEulerExperiment experiment(1);
+  if (!experiment.BuildPeriodicMesh(3) || !experiment.ProjectOldStage())
+  {
+    return 1;
+  }
+  const mfem::FiniteElementSpace* trace_space = experiment.trace_space();
+  const mfem::GridFunction* trace = experiment.old_trace();
+  if (trace_space == nullptr || trace == nullptr || trace_space->GetMesh() == nullptr)
+  {
+    return 2;
+  }
+  mfem::Mesh* mesh = trace_space->GetMesh();
+  for (int face = 0; face < mesh->GetNumFaces(); ++face)
+  {
+    const mfem::FiniteElement* face_fe = trace_space->GetFaceElement(face);
+    mfem::ElementTransformation* transformation = mesh->GetFaceTransformation(face);
+    if (face_fe == nullptr || transformation == nullptr) { return 3; }
+    const int face_scalar_dofs = face_fe->GetDof();
+    mfem::Array<int> face_vdofs;
+    trace_space->GetFaceVDofs(face, face_vdofs);
+    if (face_vdofs.Size() != conserved_components * face_scalar_dofs) { return 4; }
+    for (int scalar = 0; scalar < face_scalar_dofs; ++scalar)
+    {
+      mfem::Vector point(dg::hdg::euler::dimension);
+      transformation->Transform(face_fe->GetNodes().IntPoint(scalar), point);
+      ConservedState state{};
+      if (!ManufacturedConservative(point[0], point[1], state).ok()) { return 5; }
+      for (int component = 0; component < conserved_components; ++component)
+      {
+        const int local = ByNodesIndex(scalar, face_scalar_dofs, component);
+        double production_sign = 0.0;
+        const int vdof = DecodeSignedVDof(face_vdofs[local], production_sign);
+        if (vdof < 0 || vdof >= trace->Size() ||
+            !Close((*trace)[vdof], production_sign * state[component], 2.0e-14))
+        {
+          return 6;
+        }
+      }
+    }
   }
   return 0;
 }
@@ -200,8 +230,10 @@ int main()
   if (source != 0) { return 30 + source; }
   const int ordering = TestMfemByNodesAndSignedVDofs();
   if (ordering != 0) { return 40 + ordering; }
+  const int trace_ordering = TestProjectedTraceComponentOrdering();
+  if (trace_ordering != 0) { return 50 + trace_ordering; }
   const int setup = TestFailurePreservingSetup();
-  if (setup != 0) { return 50 + setup; }
+  if (setup != 0) { return 60 + setup; }
   const int experiment = TestCompleteExperimentGate();
-  return experiment == 0 ? 0 : 60 + experiment;
+  return experiment == 0 ? 0 : 70 + experiment;
 }

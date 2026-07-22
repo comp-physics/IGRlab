@@ -19,6 +19,8 @@
 
 namespace mfem
 {
+class FiniteElementSpace;
+class GridFunction;
 class SparseMatrix;
 }
 
@@ -103,6 +105,12 @@ PhysicsResult ManufacturedSource(double x, double y,
                                 ConservedState& source) noexcept;
 double ManufacturedMaximumWaveSpeed() noexcept;
 
+/** Pinned MFEM Ordering::byNODES helpers used by the serial experiment. */
+int ByNodesIndex(int scalar_dof, int scalar_count, int component) noexcept;
+int ComponentFromByNodesIndex(int vector_dof, int scalar_count) noexcept;
+int ScalarFromByNodesIndex(int vector_dof, int scalar_count) noexcept;
+int DecodeSignedVDof(int signed_vdof, double& sign) noexcept;
+
 struct NewtonEvidence
 {
   int nonlinear_iterations = 0;
@@ -169,6 +177,8 @@ public:
 
   int polynomial_order() const noexcept { return polynomial_order_; }
   int quadrature_order() const noexcept { return quadrature_order_; }
+  const mfem::FiniteElementSpace* trace_space() const noexcept;
+  const mfem::GridFunction* old_trace() const noexcept;
   const mfem::SparseMatrix* trace_matrix() const noexcept;
 
 private:

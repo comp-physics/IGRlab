@@ -81,30 +81,6 @@ StridedBlockView<T> View(T* data, const LocalIndex batch, const LocalIndex rows,
   return {data, batch, rows, columns, rows * columns, columns, 1};
 }
 
-int ByNodesIndex(const int scalar_dof, const int scalar_count,
-                 const int component) noexcept
-{
-  return scalar_dof + scalar_count * component;
-}
-
-[[maybe_unused]] int ComponentFromByNodesIndex(const int vector_dof,
-                                               const int scalar_count) noexcept
-{
-  return vector_dof / scalar_count;
-}
-
-[[maybe_unused]] int ScalarFromByNodesIndex(const int vector_dof,
-                                            const int scalar_count) noexcept
-{
-  return vector_dof - scalar_count * ComponentFromByNodesIndex(vector_dof,
-                                                                 scalar_count);
-}
-
-int DecodeSignedVDof(const int signed_vdof, double& sign) noexcept
-{
-  return mfem::FiniteElementSpace::DecodeDof(signed_vdof, sign);
-}
-
 class FaceBlockILU
 {
 public:
@@ -132,6 +108,30 @@ private:
 };
 
 } // namespace
+
+int ByNodesIndex(const int scalar_dof, const int scalar_count,
+                 const int component) noexcept
+{
+  return scalar_dof + scalar_count * component;
+}
+
+int ComponentFromByNodesIndex(const int vector_dof,
+                              const int scalar_count) noexcept
+{
+  return vector_dof / scalar_count;
+}
+
+int ScalarFromByNodesIndex(const int vector_dof,
+                           const int scalar_count) noexcept
+{
+  return vector_dof - scalar_count * ComponentFromByNodesIndex(vector_dof,
+                                                                 scalar_count);
+}
+
+int DecodeSignedVDof(const int signed_vdof, double& sign) noexcept
+{
+  return mfem::FiniteElementSpace::DecodeDof(signed_vdof, sign);
+}
 
 PhysicsResult ConservativeFromPrimitive(const PrimitiveState& primitive,
                                        ConservedState& conservative) noexcept
@@ -639,6 +639,16 @@ bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
 const mfem::SparseMatrix* SmoothEulerExperiment::trace_matrix() const noexcept
 {
   return implementation_->trace_matrix.get();
+}
+
+const mfem::FiniteElementSpace* SmoothEulerExperiment::trace_space() const noexcept
+{
+  return implementation_->trace_space.get();
+}
+
+const mfem::GridFunction* SmoothEulerExperiment::old_trace() const noexcept
+{
+  return implementation_->old_trace.get();
 }
 
 bool RunSmoothEulerExperiment(ExperimentEvidence& evidence)
