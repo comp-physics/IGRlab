@@ -7,6 +7,17 @@ if(NOT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT)
   return()
 endif()
 
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  find_package(MFEM 4.9 CONFIG REQUIRED)
+elseif(NOT TARGET mfem)
+  message(FATAL_ERROR "smooth-Euler HDG requires the parent MFEM discovery")
+endif()
+
+if(MFEM_USE_CUDA OR MFEM_USE_HIP)
+  message(STATUS "Skipping serial smooth-Euler HDG experiment for accelerator MFEM")
+  return()
+endif()
+
 add_executable(dg_igr_hdg_smooth_euler_cpu_test
   test_smooth_euler.cpp
   ${DG_IGR_HDG_EULER_ROOT}/src/numerics/hdg/euler/smooth_euler.cpp)
@@ -18,18 +29,16 @@ set_target_properties(dg_igr_hdg_smooth_euler_cpu_test PROPERTIES
   CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-  find_package(MFEM 4.9 CONFIG REQUIRED)
   target_sources(dg_igr_hdg_smooth_euler_cpu_test PRIVATE
     ${DG_IGR_HDG_EULER_ROOT}/src/numerics/hdg/core/host_reference.cpp)
   target_link_libraries(dg_igr_hdg_smooth_euler_cpu_test PRIVATE mfem)
 else()
-  if(MFEM_USE_CUDA OR MFEM_USE_HIP OR MFEM_USE_RAJA OR MFEM_USE_UMPIRE)
-    message(STATUS "Skipping serial smooth-Euler HDG experiment for accelerator MFEM")
-    return()
-  endif()
   target_link_libraries(dg_igr_hdg_smooth_euler_cpu_test PRIVATE igr_mfem mfem)
   add_test(NAME dg_igr_hdg_smooth_euler_serial_cpu
     COMMAND dg_igr_hdg_smooth_euler_cpu_test)
   set_tests_properties(dg_igr_hdg_smooth_euler_serial_cpu PROPERTIES
     LABELS "hdg;euler;cpu;experimental;serial" TIMEOUT 600)
 endif()
+
+# The production source glob and root build.sh default-off seam are owned by
+# later W5C-03 coordination; this file only isolates its own registration.

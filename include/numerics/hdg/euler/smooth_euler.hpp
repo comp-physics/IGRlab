@@ -150,9 +150,9 @@ public:
   SmoothEulerExperiment(const SmoothEulerExperiment&) = delete;
   SmoothEulerExperiment& operator=(const SmoothEulerExperiment&) = delete;
 
-  /** Creates a periodic affine quadrilateral mesh and verifies every face. */
+  /** Builds and atomically publishes a fresh verified periodic mesh/space graph. */
   bool BuildPeriodicMesh(int elements_per_direction);
-  /** Projects the exact old interior state and exact single-valued trace. */
+  /** Stages then publishes the exact old interior state and single-valued trace. */
   bool ProjectOldStage();
   /** Assembles the current candidate volume/face/forcing local A/B/C/D data. */
   bool AssembleLinearization();

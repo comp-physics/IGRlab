@@ -1,5 +1,7 @@
 #include "numerics/hdg/euler/smooth_euler.hpp"
 
+#include <mfem.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -17,9 +19,36 @@ using dg::hdg::euler::NormalFlux;
 using dg::hdg::euler::NormalFluxJacobian;
 using dg::hdg::euler::PhysicsStatus;
 using dg::hdg::euler::RunSmoothEulerExperiment;
+using dg::hdg::euler::SmoothEulerExperiment;
 using dg::hdg::euler::ExperimentEvidence;
 using dg::hdg::euler::fixed_scalar_tau;
 using dg::hdg::euler::conserved_components;
+
+constexpr int ByNodesIndex(const int scalar_dof, const int scalar_count,
+                           const int component)
+{
+  return scalar_dof + scalar_count * component;
+}
+
+constexpr int ComponentFromByNodesIndex(const int vector_dof,
+                                        const int scalar_count)
+{
+  return vector_dof / scalar_count;
+}
+
+constexpr int ScalarFromByNodesIndex(const int vector_dof,
+                                     const int scalar_count)
+{
+  return vector_dof - scalar_count * ComponentFromByNodesIndex(vector_dof,
+                                                                 scalar_count);
+}
+
+static_assert(ByNodesIndex(3, 11, 2) == 25,
+              "MFEM byNODES is scalar_dof + scalar_count * component");
+static_assert(ComponentFromByNodesIndex(25, 11) == 2,
+              "byNODES inverse must retain the scalar extent");
+static_assert(ScalarFromByNodesIndex(25, 11) == 3,
+              "byNODES inverse must recover the scalar dof");
 
 bool Close(const double left, const double right, const double tolerance)
 {
@@ -105,9 +134,54 @@ int TestManufacturedSource()
   return maximum_wave_speed < 1.78 && fixed_scalar_tau - maximum_wave_speed > 0.72 ? 0 : 4;
 }
 
+int TestMfemByNodesAndSignedVDofs()
+{
+  constexpr int scalar_count = 9;
+  for (int component = 0; component < conserved_components; ++component)
+  {
+    for (int scalar = 0; scalar < scalar_count; ++scalar)
+    {
+      const int vector_dof = ByNodesIndex(scalar, scalar_count, component);
+      if (ComponentFromByNodesIndex(vector_dof, scalar_count) != component ||
+          ScalarFromByNodesIndex(vector_dof, scalar_count) != scalar)
+      {
+        return 1;
+      }
+    }
+  }
+  double positive_sign = 0.0;
+  if (mfem::FiniteElementSpace::DecodeDof(23, positive_sign) != 23 ||
+      positive_sign != 1.0)
+  {
+    return 2;
+  }
+  double negative_sign = 0.0;
+  if (mfem::FiniteElementSpace::DecodeDof(-24, negative_sign) != 23 ||
+      negative_sign != -1.0)
+  {
+    return 3;
+  }
+  return 0;
+}
+
+int TestFailurePreservingSetup()
+{
+  SmoothEulerExperiment experiment(1);
+  if (!experiment.BuildPeriodicMesh(3) || !experiment.ProjectOldStage())
+  {
+    return 1;
+  }
+  if (experiment.BuildPeriodicMesh(2)) { return 2; }
+  // A failed fresh build cannot displace the previously complete mesh/space
+  // graph, so the already configured projection remains reusable.
+  if (!experiment.ProjectOldStage()) { return 3; }
+  return experiment.BuildPeriodicMesh(3) && experiment.ProjectOldStage() ? 0 : 4;
+}
+
 int TestCompleteExperimentGate()
 {
   ExperimentEvidence evidence{};
+  evidence.passed = true;
   // This is deliberately a real complete-gate invocation, not a print-only
   // status. Until the source implementation contains all independent oracles
   // and the convergence ladder, its false result fails this executable.
@@ -124,6 +198,10 @@ int main()
   if (jacobian != 0) { return 20 + jacobian; }
   const int source = TestManufacturedSource();
   if (source != 0) { return 30 + source; }
+  const int ordering = TestMfemByNodesAndSignedVDofs();
+  if (ordering != 0) { return 40 + ordering; }
+  const int setup = TestFailurePreservingSetup();
+  if (setup != 0) { return 50 + setup; }
   const int experiment = TestCompleteExperimentGate();
-  return experiment == 0 ? 0 : 40 + experiment;
+  return experiment == 0 ? 0 : 60 + experiment;
 }
