@@ -67,10 +67,14 @@ target_include_directories(igr_mfem PRIVATE
 target_compile_definitions(igr_mfem PUBLIC
     DG_IGR_ENABLE_OBSERVABILITY=$<BOOL:${DG_IGR_ENABLE_OBSERVABILITY}>
     DG_IGR_OBSERVABILITY_USE_NVTX=$<BOOL:${DG_IGR_OBSERVABILITY_USE_NVTX}>
+    DG_IGR_OBSERVABILITY_USE_CALIPER=$<BOOL:${DG_IGR_OBSERVABILITY_USE_CALIPER}>
 )
 
 # Link MFEM
 target_link_libraries(igr_mfem PUBLIC mfem ZLIB::ZLIB)
+if(DG_IGR_OBSERVABILITY_USE_CALIPER)
+    target_link_libraries(igr_mfem PUBLIC caliper)
+endif()
 if(MFEM_USE_MPI)
     target_link_libraries(igr_mfem PUBLIC MPI::MPI_CXX)
     if(DG_IGR_MPI_INCLUDE_DIRS)

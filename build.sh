@@ -8,6 +8,7 @@ CLEAN=1
 INSTALL_DEPS=1
 RUN_TESTS=1
 RUN_SMOKE=0
+CALIPER=0
 SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
 CUDA_ARCH_WAS_SET=0
 
@@ -20,6 +21,7 @@ Modes:
   --gpu             Build the CUDA dependency profile, MFEM, and the app.
 
 Options:
+  --caliper         Build the CPU-only Caliper observability profile.
   -j, --jobs N      Parallel build jobs (default: NPROC or 4).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
   --clean           Rebuild the selected mode from clean caches (default).
@@ -39,6 +41,7 @@ while (($#)); do
   case "$1" in
     --cpu|--cpu-only) MODE="cpu" ;;
     --gpu) MODE="gpu" ;;
+    --caliper) CALIPER=1 ;;
     --cuda-arch)
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
       SPACK_CUDA_ARCH="$2"
@@ -73,6 +76,10 @@ if [[ "${MODE}" == "cpu" && "${CUDA_ARCH_WAS_SET}" == "1" ]]; then
   echo "ERROR: --cuda-arch is only valid with --gpu." >&2
   exit 2
 fi
+if [[ "${MODE}" == "gpu" && "${CALIPER}" == "1" ]]; then
+  echo "ERROR: --caliper is only valid with --cpu-only." >&2
+  exit 2
+fi
 command -v spack >/dev/null 2>&1 || {
   echo "ERROR: spack is not available; source Spack's setup-env.sh first." >&2
   exit 2
@@ -87,16 +94,28 @@ if [[ "${MODE}" == "gpu" ]]; then
   APP_INSTALL="${SCRIPT_DIR}/install-gpu-sm${SPACK_CUDA_ARCH}"
   CUDA_ARCHS="${CUDA_ARCHS:-80-virtual}"
 else
-  PROFILE="cpu"
-  SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu}"
-  MFEM_INSTALL="${SCRIPT_DIR}/tpl/mfem/install-cpu"
-  APP_BUILD="${SCRIPT_DIR}/build-cpu"
-  APP_INSTALL="${SCRIPT_DIR}/install-cpu"
+  if ((CALIPER)); then
+    PROFILE="cpu-caliper"
+    SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu-caliper}"
+    MFEM_INSTALL="${SCRIPT_DIR}/tpl/mfem/install-cpu-caliper"
+    APP_BUILD="${SCRIPT_DIR}/build-cpu-caliper"
+    APP_INSTALL="${SCRIPT_DIR}/install-cpu-caliper"
+  else
+    PROFILE="cpu"
+    SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu}"
+    MFEM_INSTALL="${SCRIPT_DIR}/tpl/mfem/install-cpu"
+    APP_BUILD="${SCRIPT_DIR}/build-cpu"
+    APP_INSTALL="${SCRIPT_DIR}/install-cpu"
+  fi
 fi
 
 if ((INSTALL_DEPS)); then
   echo "[build] installing ${MODE} dependencies from ${SPACK_ENV}"
-  spack -e "${SPACK_ENV}" concretize -f
+  if ((CALIPER)); then
+    spack -e "${SPACK_ENV}" concretize
+  else
+    spack -e "${SPACK_ENV}" concretize -f
+  fi
   spack -e "${SPACK_ENV}" install
 fi
 
@@ -110,6 +129,9 @@ export PATH="${SPACK_VIEW}/bin:${PATH}"
 export LD_LIBRARY_PATH="${SPACK_VIEW}/lib:${SPACK_VIEW}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 mfem_args=("--${MODE}" --jobs "${JOBS}")
+if ((CALIPER)); then
+  mfem_args+=(--caliper)
+fi
 if [[ "${MODE}" == "gpu" ]]; then
   mfem_args+=(--cuda-arch "${SPACK_CUDA_ARCH}")
 fi
@@ -135,6 +157,14 @@ app_cmake_args=(
   -DMFEM_DIR="${MFEM_INSTALL}/lib/cmake/mfem"
   -DZLIB_ROOT="${SPACK_VIEW}"
 )
+if ((CALIPER)); then
+  app_cmake_args+=(
+    -DCMAKE_PREFIX_PATH="${SPACK_VIEW}"
+    -DDG_IGR_ENABLE_OBSERVABILITY=ON
+    -DDG_IGR_OBSERVABILITY_USE_NVTX=OFF
+    -DDG_IGR_OBSERVABILITY_USE_CALIPER=ON
+  )
+fi
 if [[ "${MODE}" == "gpu" ]]; then
   CUDA_PREFIX="$(spack -e "${SPACK_ENV}" location -i cuda)"
   UMPIRE_PREFIX="$(spack -e "${SPACK_ENV}" location -i umpire)"

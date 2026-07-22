@@ -1,6 +1,6 @@
 # Unit tests for dg_igr miniapp
 
-function(dg_igr_add_observability_test target_name compile_enabled)
+function(dg_igr_add_observability_test target_name compile_enabled caliper_enabled)
   add_executable(${target_name} test_observability.cpp)
   set_target_properties(${target_name} PROPERTIES
     CXX_STANDARD 17
@@ -11,7 +11,11 @@ function(dg_igr_add_observability_test target_name compile_enabled)
   target_compile_definitions(${target_name} PRIVATE
     DG_IGR_ENABLE_OBSERVABILITY=${compile_enabled}
     DG_IGR_OBSERVABILITY_USE_NVTX=0
+    DG_IGR_OBSERVABILITY_USE_CALIPER=${caliper_enabled}
   )
+  if(caliper_enabled)
+    target_link_libraries(${target_name} PRIVATE caliper)
+  endif()
   target_compile_options(${target_name} PRIVATE
     $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
   )
@@ -22,8 +26,11 @@ function(dg_igr_add_observability_test target_name compile_enabled)
   )
 endfunction()
 
-dg_igr_add_observability_test(dg_igr_observability_noop_test 0)
-dg_igr_add_observability_test(dg_igr_observability_recording_test 1)
+dg_igr_add_observability_test(dg_igr_observability_noop_test 0 0)
+dg_igr_add_observability_test(dg_igr_observability_recording_test 1 0)
+if(DG_IGR_ENABLE_OBSERVABILITY AND DG_IGR_OBSERVABILITY_USE_CALIPER)
+  dg_igr_add_observability_test(dg_igr_observability_caliper_test 1 1)
+endif()
 
 add_executable(dg_igr_frozen_scalar_igr_algebra_test
   test_frozen_scalar_igr_algebra.cpp

@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MODE="cpu"
 JOBS="${NPROC:-4}"
 CLEAN=0
+CALIPER=0
 SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
 CUDA_ARCH_WAS_SET=0
 
@@ -15,6 +16,7 @@ Usage: ./build_mfem_tpl.sh [--cpu-only | --gpu] [options]
 Options:
   --cpu-only        Build MPI-enabled MFEM without CUDA (default).
   --gpu             Build MPI/CUDA-enabled MFEM.
+  --caliper         Build CPU-only MFEM with Caliper support.
   -j, --jobs N      Parallel build jobs (default: NPROC or 4).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
   --clean           Remove the selected MFEM build and install directories.
@@ -31,6 +33,7 @@ while (($#)); do
   case "$1" in
     --cpu|--cpu-only) MODE="cpu" ;;
     --gpu) MODE="gpu" ;;
+    --caliper) CALIPER=1 ;;
     --cuda-arch)
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
       SPACK_CUDA_ARCH="$2"
@@ -62,6 +65,10 @@ if [[ "${MODE}" == "cpu" && "${CUDA_ARCH_WAS_SET}" == "1" ]]; then
   echo "ERROR: --cuda-arch is only valid with --gpu." >&2
   exit 2
 fi
+if [[ "${MODE}" == "gpu" && "${CALIPER}" == "1" ]]; then
+  echo "ERROR: --caliper is only valid with --cpu-only." >&2
+  exit 2
+fi
 command -v spack >/dev/null 2>&1 || {
   echo "ERROR: spack is not available; source Spack's setup-env.sh first." >&2
   exit 2
@@ -79,9 +86,15 @@ if [[ "${MODE}" == "gpu" ]]; then
   HYPRE_SPEC="hypre@develop+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
   MPI_SPEC="openmpi+cuda"
 else
-  SPACK_ENV="${DG_IGR_SPACK_ENV:-${REPO_DIR}/spack-envs/cpu}"
-  MFEM_BUILD="${MFEM_BUILD:-${MFEM_SRC}/build-cpu}"
-  MFEM_INSTALL="${MFEM_INSTALL:-${MFEM_SRC}/install-cpu}"
+  if ((CALIPER)); then
+    SPACK_ENV="${DG_IGR_SPACK_ENV:-${REPO_DIR}/spack-envs/cpu-caliper}"
+    MFEM_BUILD="${MFEM_BUILD:-${MFEM_SRC}/build-cpu-caliper}"
+    MFEM_INSTALL="${MFEM_INSTALL:-${MFEM_SRC}/install-cpu-caliper}"
+  else
+    SPACK_ENV="${DG_IGR_SPACK_ENV:-${REPO_DIR}/spack-envs/cpu}"
+    MFEM_BUILD="${MFEM_BUILD:-${MFEM_SRC}/build-cpu}"
+    MFEM_INSTALL="${MFEM_INSTALL:-${MFEM_SRC}/install-cpu}"
+  fi
   HYPRE_SPEC="hypre+mpi~cuda"
   MPI_SPEC="openmpi~cuda"
 fi
@@ -147,6 +160,12 @@ else
     -DMFEM_USE_CUDA=OFF
     -DMFEM_USE_UMPIRE=OFF
   )
+  if ((CALIPER)); then
+    cmake_args+=(
+      -DCMAKE_PREFIX_PATH="${SPACK_VIEW}"
+      -DMFEM_USE_CALIPER=ON
+    )
+  fi
 fi
 
 echo "[mfem] mode=${MODE} env=${SPACK_ENV} build=${MFEM_BUILD} install=${MFEM_INSTALL} jobs=${JOBS}"
@@ -175,6 +194,12 @@ else
     echo "ERROR: installed MFEM unexpectedly reports CUDA support." >&2
     exit 3
   }
+  if ((CALIPER)); then
+    grep -Fq 'set(MFEM_USE_CALIPER ON)' "${MFEM_CONFIG}" || {
+      echo "ERROR: installed MFEM does not report Caliper support." >&2
+      exit 3
+    }
+  fi
 fi
 
 echo "[mfem] complete: ${MFEM_CONFIG}"

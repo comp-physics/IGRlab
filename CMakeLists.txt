@@ -13,9 +13,25 @@ option(DG_IGR_ENABLE_OBSERVABILITY
 option(DG_IGR_OBSERVABILITY_USE_NVTX
        "Use the NVTX adapter for compiled observability regions."
        OFF)
-if(DG_IGR_OBSERVABILITY_USE_NVTX AND NOT DG_IGR_ENABLE_OBSERVABILITY)
+option(DG_IGR_OBSERVABILITY_USE_CALIPER
+       "Use the Caliper adapter for compiled observability regions."
+       OFF)
+if((DG_IGR_OBSERVABILITY_USE_NVTX OR DG_IGR_OBSERVABILITY_USE_CALIPER) AND
+   NOT DG_IGR_ENABLE_OBSERVABILITY)
     message(FATAL_ERROR
-            "DG_IGR_OBSERVABILITY_USE_NVTX requires DG_IGR_ENABLE_OBSERVABILITY=ON.")
+            "An observability backend requires DG_IGR_ENABLE_OBSERVABILITY=ON.")
+endif()
+if(DG_IGR_OBSERVABILITY_USE_NVTX AND DG_IGR_OBSERVABILITY_USE_CALIPER)
+    message(FATAL_ERROR
+            "DG_IGR_OBSERVABILITY_USE_NVTX and DG_IGR_OBSERVABILITY_USE_CALIPER are mutually exclusive.")
+endif()
+if(DG_IGR_OBSERVABILITY_USE_CALIPER)
+    # Caliper documents this package and imported target as `caliper`.
+    find_package(caliper REQUIRED)
+    if(NOT TARGET caliper)
+        message(FATAL_ERROR
+                "The discovered Caliper package does not export the required 'caliper' target.")
+    endif()
 endif()
 option(DG_IGR_REQUIRE_MFEM_CUDA
        "Fail configure unless the discovered MFEM package has CUDA enabled."

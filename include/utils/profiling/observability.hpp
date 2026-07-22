@@ -23,8 +23,17 @@
 #define DG_IGR_OBSERVABILITY_USE_NVTX 0
 #endif
 
-#if DG_IGR_OBSERVABILITY_USE_NVTX && !DG_IGR_ENABLE_OBSERVABILITY
-#error "DG_IGR_OBSERVABILITY_USE_NVTX requires DG_IGR_ENABLE_OBSERVABILITY"
+#ifndef DG_IGR_OBSERVABILITY_USE_CALIPER
+#define DG_IGR_OBSERVABILITY_USE_CALIPER 0
+#endif
+
+#if (DG_IGR_OBSERVABILITY_USE_NVTX || DG_IGR_OBSERVABILITY_USE_CALIPER) && \
+    !DG_IGR_ENABLE_OBSERVABILITY
+#error "An observability backend requires DG_IGR_ENABLE_OBSERVABILITY"
+#endif
+
+#if DG_IGR_OBSERVABILITY_USE_NVTX && DG_IGR_OBSERVABILITY_USE_CALIPER
+#error "DG_IGR_OBSERVABILITY_USE_NVTX and DG_IGR_OBSERVABILITY_USE_CALIPER are mutually exclusive"
 #endif
 
 #if DG_IGR_ENABLE_OBSERVABILITY && DG_IGR_OBSERVABILITY_USE_NVTX
@@ -36,6 +45,15 @@
 #include <nvtx3/nvToolsExt.h>
 #endif
 
+#if DG_IGR_ENABLE_OBSERVABILITY && DG_IGR_OBSERVABILITY_USE_CALIPER
+#if defined(__has_include)
+#if !__has_include(<caliper/cali.h>)
+#error "Explicit Caliper observability requested, but caliper/cali.h is unavailable"
+#endif
+#endif
+#include <caliper/cali.h>
+#endif
+
 namespace dg_igr
 {
 namespace observability
@@ -45,6 +63,9 @@ inline constexpr bool compile_enabled = DG_IGR_ENABLE_OBSERVABILITY != 0;
 inline constexpr bool nvtx_backend_enabled =
     DG_IGR_ENABLE_OBSERVABILITY != 0 &&
     DG_IGR_OBSERVABILITY_USE_NVTX != 0;
+inline constexpr bool caliper_backend_enabled =
+    DG_IGR_ENABLE_OBSERVABILITY != 0 &&
+    DG_IGR_OBSERVABILITY_USE_CALIPER != 0;
 
 /** Stable region IDs. Existing string names remain supported by NVTXRange. */
 enum class RegionId : std::uint16_t
@@ -171,6 +192,83 @@ constexpr RegionDescriptor region_descriptor(const RegionId id) noexcept
   return {id, region_name(id)};
 }
 
+struct NoopBackend
+{
+  static constexpr void begin(RegionDescriptor) noexcept {}
+  static constexpr void end(RegionDescriptor) noexcept {}
+  static constexpr void counter(CounterId, std::int64_t) noexcept {}
+};
+
+#if DG_IGR_ENABLE_OBSERVABILITY && DG_IGR_OBSERVABILITY_USE_CALIPER
+struct CaliperBackend
+{
+  // Initialize the fixed counter attributes during serial runtime-gate setup,
+  // so the adapter adds no attribute creation to hot counter calls.
+  static void initialize() noexcept
+  {
+    if (initialized_)
+    {
+      return;
+    }
+
+    counter_attributes_ = {
+        cali_create_attribute(counter_name(CounterId::iterations), CALI_TYPE_INT,
+                              CALI_ATTR_ASVALUE),
+        cali_create_attribute(counter_name(CounterId::degrees_of_freedom),
+                              CALI_TYPE_INT, CALI_ATTR_ASVALUE),
+        cali_create_attribute(counter_name(CounterId::elements), CALI_TYPE_INT,
+                              CALI_ATTR_ASVALUE),
+        cali_create_attribute(counter_name(CounterId::operator_applications),
+                              CALI_TYPE_INT, CALI_ATTR_ASVALUE),
+        cali_create_attribute(counter_name(CounterId::bytes), CALI_TYPE_INT,
+                              CALI_ATTR_ASVALUE)};
+    initialized_ = true;
+  }
+
+  static void begin(const RegionDescriptor region) noexcept
+  {
+    cali_begin_region(region.name);
+  }
+
+  static void end(const RegionDescriptor region) noexcept
+  {
+    cali_end_region(region.name);
+  }
+
+  static void counter(const CounterId id, const std::int64_t value) noexcept
+  {
+    if (!initialized_)
+    {
+      return;
+    }
+
+    switch (id)
+    {
+      case CounterId::iterations:
+        cali_set(counter_attributes_[0], &value, sizeof(value));
+        break;
+      case CounterId::degrees_of_freedom:
+        cali_set(counter_attributes_[1], &value, sizeof(value));
+        break;
+      case CounterId::elements:
+        cali_set(counter_attributes_[2], &value, sizeof(value));
+        break;
+      case CounterId::operator_applications:
+        cali_set(counter_attributes_[3], &value, sizeof(value));
+        break;
+      case CounterId::bytes:
+        cali_set(counter_attributes_[4], &value, sizeof(value));
+        break;
+    }
+  }
+
+private:
+  inline static std::array<cali_id_t, 5> counter_attributes_{
+      CALI_INV_ID, CALI_INV_ID, CALI_INV_ID, CALI_INV_ID, CALI_INV_ID};
+  inline static bool initialized_ = false;
+};
+#endif
+
 #if DG_IGR_ENABLE_OBSERVABILITY
 inline bool& runtime_enabled_storage() noexcept
 {
@@ -180,6 +278,12 @@ inline bool& runtime_enabled_storage() noexcept
 
 inline void set_runtime_enabled(const bool enabled) noexcept
 {
+#if DG_IGR_OBSERVABILITY_USE_CALIPER
+  if (enabled)
+  {
+    CaliperBackend::initialize();
+  }
+#endif
   runtime_enabled_storage() = enabled;
 }
 
@@ -191,13 +295,6 @@ inline bool runtime_enabled() noexcept
 inline constexpr void set_runtime_enabled(bool) noexcept {}
 inline constexpr bool runtime_enabled() noexcept { return false; }
 #endif
-
-struct NoopBackend
-{
-  static constexpr void begin(RegionDescriptor) noexcept {}
-  static constexpr void end(RegionDescriptor) noexcept {}
-  static constexpr void counter(CounterId, std::int64_t) noexcept {}
-};
 
 enum class RecordedEventKind : std::uint8_t
 {
@@ -288,6 +385,8 @@ struct NvtxBackend
 };
 
 using DefaultBackend = NvtxBackend;
+#elif DG_IGR_ENABLE_OBSERVABILITY && DG_IGR_OBSERVABILITY_USE_CALIPER
+using DefaultBackend = CaliperBackend;
 #else
 using DefaultBackend = NoopBackend;
 #endif
