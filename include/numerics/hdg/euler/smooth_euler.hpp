@@ -30,6 +30,34 @@ inline constexpr double gamma = 1.4;
 inline constexpr double fixed_scalar_tau = 2.5;
 inline constexpr double backward_euler_dt = 0.05;
 
+// Closed compile-time description: the experiment never chooses a model,
+// stabilization, time rule, or backend per quadrature point.
+struct SmoothEulerModelTag : ModelTagMarker {};
+struct FixedScalarTauTag : StabilizationTagMarker {};
+struct BackwardEulerTag : TimeTreatmentTagMarker {};
+struct TraceStateName;
+struct SerialExecutionTag;
+struct HostMemoryTag;
+struct NoCommunicationTag;
+struct SmoothEulerDevicePolicy
+{
+  double tau = fixed_scalar_tau;
+  double dt = backward_euler_dt;
+};
+using SmoothEulerTrace = TraceTuple<TracePotential<TraceStateName,
+                                                   VectorTrace<conserved_components>>>;
+using SmoothEulerSpec = KernelSpec<SmoothEulerModelTag,
+                                  SmoothEulerTrace,
+                                  FixedScalarTauTag,
+                                  BackwardEulerTag,
+                                  BackendPolicy<SerialExecutionTag,
+                                                HostMemoryTag,
+                                                NoCommunicationTag>,
+                                  PrecisionPolicy<double, double, double, double, double>,
+                                  SmoothEulerDevicePolicy>;
+static_assert(IsKernelSpec<SmoothEulerSpec>::value,
+              "smooth Euler must remain a closed static HDG KernelSpec");
+
 using ConservedState = std::array<double, conserved_components>;
 using PrimitiveState = std::array<double, conserved_components>; // rho,u,v,p
 using FluxVector = std::array<double, conserved_components>;
@@ -126,17 +154,17 @@ public:
   bool BuildPeriodicMesh(int elements_per_direction);
   /** Projects the exact old interior state and exact single-valued trace. */
   bool ProjectOldStage();
-  /** Assembles volume, face, forcing, and backward-Euler local A/B/C/D data. */
+  /** Assembles the current candidate volume/face/forcing local A/B/C/D data. */
   bool AssembleLinearization();
   /** Condenses actual local blocks through HostReferenceEngine and assembles S. */
   bool CondenseAndAssembleTrace();
-  /** Nonsymmetric serial GMRES with a face-block ILU preconditioner. */
+  /** Solves the current nonsymmetric serial trace candidate. */
   bool SolveTrace();
   /** Recovers local increments through HostReferenceEngine. */
   bool RecoverInterior();
-  /** Positivity-preserving damped Newton stage; fills reproducible evidence. */
+  /** Attempts the candidate Newton stage; unimplemented frozen gates fail closed. */
   bool SolveDampedNewton(NewtonEvidence& evidence);
-  /** Independently integrated volume and skeleton error on the 3/6/12 ladder. */
+  /** Runs the 3/6/12 ladder only when independent error gates are available. */
   bool RunConvergenceLadder(ConvergenceEvidence& evidence);
 
   int polynomial_order() const noexcept { return polynomial_order_; }

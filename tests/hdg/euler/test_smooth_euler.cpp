@@ -16,6 +16,9 @@ using dg::hdg::euler::ManufacturedSource;
 using dg::hdg::euler::NormalFlux;
 using dg::hdg::euler::NormalFluxJacobian;
 using dg::hdg::euler::PhysicsStatus;
+using dg::hdg::euler::RunSmoothEulerExperiment;
+using dg::hdg::euler::ExperimentEvidence;
+using dg::hdg::euler::fixed_scalar_tau;
 using dg::hdg::euler::conserved_components;
 
 bool Close(const double left, const double right, const double tolerance)
@@ -98,7 +101,17 @@ int TestManufacturedSource()
                                      (2.0 * h);
     if (!Close(source[component], finite_difference, 2.0e-6)) { return 3; }
   }
-  return ManufacturedMaximumWaveSpeed() < 1.78 ? 0 : 4;
+  const double maximum_wave_speed = ManufacturedMaximumWaveSpeed();
+  return maximum_wave_speed < 1.78 && fixed_scalar_tau - maximum_wave_speed > 0.72 ? 0 : 4;
+}
+
+int TestCompleteExperimentGate()
+{
+  ExperimentEvidence evidence{};
+  // This is deliberately a real complete-gate invocation, not a print-only
+  // status. Until the source implementation contains all independent oracles
+  // and the convergence ladder, its false result fails this executable.
+  return RunSmoothEulerExperiment(evidence) && evidence.passed ? 0 : 1;
 }
 
 } // namespace
@@ -110,5 +123,7 @@ int main()
   const int jacobian = TestAnalyticFluxJacobian();
   if (jacobian != 0) { return 20 + jacobian; }
   const int source = TestManufacturedSource();
-  return source == 0 ? 0 : 30 + source;
+  if (source != 0) { return 30 + source; }
+  const int experiment = TestCompleteExperimentGate();
+  return experiment == 0 ? 0 : 40 + experiment;
 }

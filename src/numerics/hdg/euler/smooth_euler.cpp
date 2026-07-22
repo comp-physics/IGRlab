@@ -84,6 +84,21 @@ StridedBlockView<T> View(T* data, const LocalIndex batch, const LocalIndex rows,
 int AbsoluteDof(const int dof) noexcept { return dof < 0 ? -1 - dof : dof; }
 double DofSign(const int dof) noexcept { return dof < 0 ? -1.0 : 1.0; }
 
+int ByNodesIndex(const int scalar_dof, const int component) noexcept
+{
+  return scalar_dof * conserved_components + component;
+}
+
+int ComponentFromByNodesIndex(const int vector_dof) noexcept
+{
+  return vector_dof - conserved_components * (vector_dof / conserved_components);
+}
+
+int ScalarFromByNodesIndex(const int vector_dof) noexcept
+{
+  return vector_dof / conserved_components;
+}
+
 class FaceBlockILU
 {
 public:
@@ -257,24 +272,11 @@ PhysicsResult ManufacturedSource(const double x, const double y,
 
 double ManufacturedMaximumWaveSpeed() noexcept
 {
-  // Evaluate the specified smooth state directly.  A component-wise envelope
-  // is too pessimistic here because the extrema of rho, p, u, and v do not
-  // coincide.  The fixed sample set is deterministic and is used only for
-  // reporting/admissibility margin, never for flux selection.
-  double maximum = 0.0;
-  constexpr int samples = 512;
-  for (int iy = 0; iy <= samples; ++iy)
-  {
-    for (int ix = 0; ix <= samples; ++ix)
-    {
-      PrimitiveState primitive{};
-      (void)ManufacturedPrimitive(static_cast<double>(ix) / samples,
-                                  static_cast<double>(iy) / samples, primitive);
-      maximum = std::max(maximum, std::hypot(primitive[1], primitive[2]) +
-                                      std::sqrt(gamma * primitive[3] / primitive[0]));
-    }
-  }
-  return maximum;
+  // With r=cos(2*pi*x)sin(2*pi*y), s=sin(2*pi*x)cos(2*pi*y), r^2+s^2<=1.
+  // Hence |(u,v)| <= |(.35,-.20)| + .05 and p/rho <= 1.1/.9. This is a
+  // proved bound, unlike the previous sampled value, and remains below 1.78.
+  return std::hypot(0.35, 0.20) + 0.05 +
+         std::sqrt(gamma * 1.1 / 0.9);
 }
 
 struct SmoothEulerExperiment::Implementation
@@ -314,8 +316,13 @@ bool SmoothEulerExperiment::BuildPeriodicMesh(const int elements_per_direction)
   mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
       elements_per_direction, elements_per_direction, mfem::Element::QUADRILATERAL,
       false, 1.0, 1.0, false);
-  std::vector<mfem::Vector> translations{{mfem::Vector({1.0, 0.0}),
-                                           mfem::Vector({0.0, 1.0})}};
+  std::vector<mfem::Vector> translations;
+  translations.emplace_back(dimension);
+  translations.emplace_back(dimension);
+  translations[0][0] = 1.0;
+  translations[0][1] = 0.0;
+  translations[1][0] = 0.0;
+  translations[1][1] = 1.0;
   implementation_->mesh = std::make_unique<mfem::Mesh>(mfem::Mesh::MakePeriodic(
       original, original.CreatePeriodicVertexMapping(translations)));
   for (int face = 0; face < implementation_->mesh->GetNumFaces(); ++face)
@@ -371,7 +378,35 @@ bool SmoothEulerExperiment::ProjectOldStage()
   implementation_->old_interior = std::make_unique<mfem::GridFunction>(implementation_->interior_space.get());
   implementation_->old_trace = std::make_unique<mfem::GridFunction>(implementation_->trace_space.get());
   implementation_->old_interior->ProjectCoefficient(exact);
-  implementation_->old_trace->ProjectCoefficient(exact);
+  // DG_Interface has face, rather than volume, finite elements. Project its
+  // single-valued skeleton directly at its face nodes. GetFaceVDofs supplies
+  // MFEM's canonical signed/permuted orientation, which is applied exactly
+  // once when writing the byNODES vector entry.
+  for (int face = 0; face < implementation_->mesh->GetNumFaces(); ++face)
+  {
+    const mfem::FiniteElement* face_fe = implementation_->trace_space->GetFaceFE(face);
+    mfem::FaceElementTransformations* face_transformations =
+        implementation_->mesh->GetFaceElementTransformations(face);
+    if (face_fe == nullptr || face_transformations == nullptr ||
+        face_transformations->Face == nullptr) { return false; }
+    mfem::Array<int> face_vdofs;
+    implementation_->trace_space->GetFaceVDofs(face, face_vdofs);
+    if (face_vdofs.Size() != conserved_components * face_fe->GetDof()) { return false; }
+    const mfem::IntegrationRule& nodes = face_fe->GetNodes();
+    for (int scalar = 0; scalar < face_fe->GetDof(); ++scalar)
+    {
+      mfem::Vector point(dimension);
+      face_transformations->Face->Transform(nodes.IntPoint(scalar), point);
+      ConservedState state{};
+      if (!ManufacturedConservative(point[0], point[1], state).ok()) { return false; }
+      for (int component = 0; component < conserved_components; ++component)
+      {
+        const int local = ByNodesIndex(scalar, component);
+        const int vdof = face_vdofs[local];
+        (*implementation_->old_trace)[AbsoluteDof(vdof)] = DofSign(vdof) * state[component];
+      }
+    }
+  }
   return true;
 }
 
@@ -390,30 +425,67 @@ bool SmoothEulerExperiment::AssembleLinearization()
   implementation_->trace_dofs.assign(static_cast<std::size_t>(batches) * nt, 0);
   for (int element = 0; element < batches; ++element)
   {
-    mfem::MassIntegrator mass;
-    mfem::DenseMatrix scalar_mass;
-    mass.AssembleElementMatrix(*implementation_->interior_space->GetFE(element),
-                               *implementation_->mesh->GetElementTransformation(element), scalar_mass);
-    const int scalar_dofs = scalar_mass.Height();
+    const mfem::FiniteElement& fe = *implementation_->interior_space->GetFE(element);
+    mfem::ElementTransformation& transformation =
+        *implementation_->mesh->GetElementTransformation(element);
+    const int scalar_dofs = fe.GetDof();
+    const mfem::IntegrationRule& rule =
+        mfem::IntRules.Get(fe.GetGeomType(), quadrature_order_);
     const std::size_t a_offset = static_cast<std::size_t>(element) * ni * ni;
-    for (int component = 0; component < conserved_components; ++component)
+    for (int point_index = 0; point_index < rule.GetNPoints(); ++point_index)
+    {
+      const mfem::IntegrationPoint& point = rule.IntPoint(point_index);
+      transformation.SetIntPoint(&point);
+      mfem::Vector physical(dimension);
+      transformation.Transform(point, physical);
+      mfem::Vector shape(scalar_dofs);
+      mfem::DenseMatrix derivative(scalar_dofs, dimension);
+      fe.CalcShape(point, shape);
+      fe.CalcPhysDShape(transformation, derivative);
+      ConservedState state{};
+      ConservedState source{};
+      FluxVector flux_x{};
+      FluxVector flux_y{};
+      FluxJacobian jacobian_x{};
+      FluxJacobian jacobian_y{};
+      if (!ManufacturedConservative(physical[0], physical[1], state).ok() ||
+          !ManufacturedSource(physical[0], physical[1], source).ok() ||
+          !NormalFlux(state, {{1.0, 0.0}}, flux_x).ok() ||
+          !NormalFlux(state, {{0.0, 1.0}}, flux_y).ok() ||
+          !NormalFluxJacobian(state, {{1.0, 0.0}}, jacobian_x).ok() ||
+          !NormalFluxJacobian(state, {{0.0, 1.0}}, jacobian_y).ok()) return false;
+      const double weight = point.weight * transformation.Weight();
       for (int row = 0; row < scalar_dofs; ++row)
+      {
+        for (int component = 0; component < conserved_components; ++component)
+        {
+          const int local_row = ByNodesIndex(row, component);
+          const double residual = -weight *
+              (derivative(row, 0) * flux_x[component] +
+               derivative(row, 1) * flux_y[component] + shape[row] * source[component]);
+          implementation_->f[static_cast<std::size_t>(element) * ni + local_row] -= residual;
+        }
         for (int column = 0; column < scalar_dofs; ++column)
         {
-          const int local_row = row * conserved_components + component;
-          const int local_column = column * conserved_components + component;
-          implementation_->a[a_offset + static_cast<std::size_t>(local_row) * ni + local_column] +=
-              scalar_mass(row, column) / backward_euler_dt;
+          for (int row_component = 0; row_component < conserved_components; ++row_component)
+          {
+            const int local_row = ByNodesIndex(row, row_component);
+            for (int column_component = 0; column_component < conserved_components;
+                 ++column_component)
+            {
+              const int local_column = ByNodesIndex(column, column_component);
+              const double mass = row_component == column_component ?
+                  shape[row] * shape[column] / backward_euler_dt : 0.0;
+              const double volume = -(derivative(row, 0) * jacobian_x[row_component][column_component] +
+                                      derivative(row, 1) * jacobian_y[row_component][column_component]) *
+                                    shape[column];
+              implementation_->a[a_offset + static_cast<std::size_t>(local_row) * ni + local_column] +=
+                  weight * (mass + volume);
+            }
+          }
         }
-    mfem::Vector center(dimension);
-    mfem::IntegrationPoint ip; ip.Set2(0.5, 0.5);
-    implementation_->mesh->GetElementTransformation(element)->Transform(ip, center);
-    ConservedState source{};
-    if (!ManufacturedSource(center[0], center[1], source).ok()) return false;
-    for (int row = 0; row < scalar_dofs; ++row)
-      for (int component = 0; component < conserved_components; ++component)
-        implementation_->f[static_cast<std::size_t>(element) * ni + row * conserved_components + component] +=
-            scalar_mass(row, row) * source[component];
+      }
+    }
     mfem::Array<int> faces, orientations;
     implementation_->mesh->GetElementFaces(element, faces, orientations);
     int trace_offset = 0;
@@ -423,7 +495,11 @@ bool SmoothEulerExperiment::AssembleLinearization()
       implementation_->trace_space->GetFaceVDofs(faces[local_face], face_dofs);
       for (int local = 0; local < face_dofs.Size(); ++local)
       {
-        const int trace = trace_offset + local, interior = trace % ni;
+        const int trace = trace_offset + local;
+        const int trace_scalar = ScalarFromByNodesIndex(local);
+        const int trace_component = ComponentFromByNodesIndex(local);
+        const int interior_scalar = std::min(trace_scalar, scalar_dofs - 1);
+        const int interior = ByNodesIndex(interior_scalar, trace_component);
         implementation_->trace_dofs[static_cast<std::size_t>(element) * nt + trace] = face_dofs[local];
         implementation_->a[a_offset + static_cast<std::size_t>(interior) * ni + interior] += fixed_scalar_tau;
         implementation_->b[static_cast<std::size_t>(element) * ni * nt + static_cast<std::size_t>(interior) * nt + trace] -= fixed_scalar_tau;
