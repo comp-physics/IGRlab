@@ -18,9 +18,12 @@ using TestTrace =
                TracePotential<FluxPotential, VectorTrace<3>>,
                TracePotential<AuxiliaryPotential, TensorTrace<2, 2>>>;
 
-struct ModelTag;
-struct StabilizationTag;
-struct TimeTreatmentTag;
+struct ModelTag : ModelTagMarker
+{};
+struct StabilizationTag : StabilizationTagMarker
+{};
+struct TimeTreatmentTag : TimeTreatmentTagMarker
+{};
 struct MfemExecutionTag;
 struct UmpireMemoryTag;
 struct MpiCommunicationTag;
@@ -50,54 +53,143 @@ static_assert(TestTrace::ComponentOffset<2>() == 4);
 static_assert(
     std::is_same<TestTrace::potential_type<1>,
                  TracePotential<FluxPotential, VectorTrace<3>>>::value);
+static_assert(IsKernelSpec<TestSpec>::value);
+static_assert(TestSpec::trace_component_count == 8);
 static_assert(std::is_same<TestSpec::backend_policy, TestBackend>::value);
 static_assert(std::is_same<TestSpec::device_policy, ModelDevicePolicy>::value);
-static_assert(!std::is_polymorphic<TestSpec>::value);
+static_assert(std::is_same<KernelScalar<TestSpec>, double>::value);
 
-bool CheckTopology()
+HdgTopologyStorage MakeTopology()
 {
   HdgTopologyStorage topology;
   topology.geometries.push_back(
       {40, ReferenceGeometry::segment, 1, 2, 3, 5});
-
-  LocalBlockShape shape{4, 2, 2, 1};
-  topology.elements.push_back({100, 0, 3, 2, shape});
+  topology.elements.push_back({100, 0, 3, 1, {4, 2, 2, 8}});
   topology.faces.push_back({200,
                             0,
                             {0, invalid_local_index},
-                            {1, invalid_local_index},
-                            {{7, -1}, {}},
+                            {0, invalid_local_index},
+                            {{7, -1}, {0, 1}},
                             0,
-                            2,
+                            16,
                             0,
                             Ownership::owned,
                             3,
                             1});
-  topology.trace_dofs.push_back({500, 0, 0, 0, 0, Ownership::owned});
-  topology.trace_dofs.push_back({501, 1, 0, 0, 1, Ownership::ghost});
+  for (LocalIndex i = 0; i != 16; ++i)
+  {
+    topology.trace_dofs.push_back(
+        {500 + i, i, 0, i % TestSpec::trace_component_count, i % 2,
+         i % 2 == 0 ? Ownership::owned : Ownership::ghost});
+  }
   topology.element_face_offsets = {0, 1};
-  topology.element_faces.push_back({0, 1, {7, -1}});
+  topology.element_faces.push_back({0, 0, {7, -1}});
+  return topology;
+}
 
-  if (!topology.HasConsistentRanges())
+bool CheckTopology()
+{
+  const HdgTopologyStorage topology = MakeTopology();
+  if (!topology.HasConsistentRanges() ||
+      !HasConsistentRangesForSpec<TestSpec>(topology))
   {
     return false;
   }
 
   const HdgTopologyView view = topology.View();
   return view.element_count == 1 && view.face_count == 1 &&
-         view.trace_dof_count == 2 && view.geometry_count == 1 &&
+         view.trace_dof_count == 16 && view.geometry_count == 1 &&
          view.Element(0).blocks.InteriorUnknowns() == 8 &&
-         view.Element(0).blocks.TraceUnknowns() == 2 &&
+         view.Element(0).blocks.TraceUnknowns() == 16 &&
          view.Element(0).blocks.Extent(LocalBlock::interior_trace_jacobian)
                  .rows == 8 &&
          view.Element(0).blocks.Extent(LocalBlock::interior_trace_jacobian)
-                 .columns == 2 &&
+                 .columns == 16 &&
          view.ElementFaceBegin(0) == 0 && view.ElementFaceEnd(0) == 1 &&
          view.element_faces[0].orientation.permutation == 7 &&
          view.element_faces[0].orientation.sign == -1 &&
          view.TraceDof(1).ownership == Ownership::ghost &&
          view.Face(0).owner_rank == 0 &&
          view.Geometry(0).mapping_order == 3;
+}
+
+bool CheckTopologyRejections()
+{
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.elements[0].blocks.trace_components = 1;
+    if (!topology.HasConsistentRanges() ||
+        HasConsistentRangesForSpec<TestSpec>(topology))
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.elements[0].blocks.interior_dofs = -1;
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.faces[0].local_faces[1] = 0;
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.element_faces[0].orientation.sign = 0;
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.trace_dofs[0].face = invalid_local_index;
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.geometries[0].reference_dimension = 2;
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.faces[0].owner_rank = invalid_rank;
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.trace_dofs[0].component = TestSpec::trace_component_count;
+    if (!topology.HasConsistentRanges() ||
+        HasConsistentRangesForSpec<TestSpec>(topology))
+    {
+      return false;
+    }
+  }
+  {
+    HdgTopologyStorage topology = MakeTopology();
+    topology.faces[0].trace_count = 15;
+    if (topology.HasConsistentRanges())
+    {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool CheckStridesAndWorkspace()
@@ -113,9 +205,10 @@ bool CheckStridesAndWorkspace()
     return false;
   }
 
-  const LocalBlockShape shape{2, 1, 2, 2};
-  const WorkspaceLayout layout = MakeWorkspaceLayout(shape, 3, 7);
-  if (layout.local_jacobian.offset != layout.local_residual.size ||
+  WorkspaceLayout layout;
+  if (!TryMakeWorkspaceLayout({2, 1, 2, 8}, 3, 7, layout) ||
+      TryMakeWorkspaceLayout({-1, 1, 2, 8}, 3, 7, layout) ||
+      layout.local_jacobian.offset != layout.local_residual.size ||
       layout.factorization.offset !=
           layout.local_jacobian.offset + layout.local_jacobian.size ||
       layout.condensed_system.offset !=
@@ -142,71 +235,62 @@ struct StageRecord
 struct LocalOperator
 {
   StageRecord* record = nullptr;
-  int EvaluateResidual(int value)
+  void EvaluateResidual(const LocalResidualRequest<TestSpec>&,
+                        LocalResidualResult<TestSpec>&)
   {
     ++record->calls[0];
-    return value + 1;
   }
-  int EvaluateJacobian(int value)
+  void EvaluateJacobian(const LocalJacobianRequest<TestSpec>&,
+                        LocalJacobianResult<TestSpec>&)
   {
     ++record->calls[1];
-    return value + 2;
   }
 };
 
 struct CondensationOperator
 {
   StageRecord* record = nullptr;
-  int Condense(int value)
+  void Condense(const CondenseRequest<TestSpec>&, CondenseResult<TestSpec>&)
   {
     ++record->calls[2];
-    return value + 3;
   }
-  int ApplySchur(int value)
+  void ApplySchur(const ApplySchurRequest<TestSpec>&,
+                  ApplySchurResult<TestSpec>&)
   {
     ++record->calls[3];
-    return value + 4;
   }
 };
 
 struct TraceAssembler
 {
   StageRecord* record = nullptr;
-  int Assemble(int value)
+  void Assemble(const TraceAssemblyRequest<TestSpec>&,
+                TraceAssemblyResult<TestSpec>&)
   {
     ++record->calls[4];
-    return value + 5;
   }
 };
 
 struct TraceSolver
 {
   StageRecord* record = nullptr;
-  int Solve(int value)
+  void Solve(const TraceSolveRequest<TestSpec>&, TraceSolveResult<TestSpec>&)
   {
     ++record->calls[5];
-    return value + 6;
   }
 };
 
 struct RecoveryOperator
 {
   StageRecord* record = nullptr;
-  int Recover(int value)
+  void Recover(const RecoveryRequest<TestSpec>&, RecoveryResult<TestSpec>&)
   {
     ++record->calls[6];
-    return value + 7;
   }
 };
 
 bool CheckStaticStageBoundaries()
 {
-  static_assert(!std::is_polymorphic<LocalOperator>::value);
-  static_assert(!std::is_polymorphic<CondensationOperator>::value);
-  static_assert(!std::is_polymorphic<TraceAssembler>::value);
-  static_assert(!std::is_polymorphic<TraceSolver>::value);
-  static_assert(!std::is_polymorphic<RecoveryOperator>::value);
-
   StageRecord record;
   Pipeline<TestSpec,
            LocalOperator,
@@ -216,13 +300,27 @@ bool CheckStaticStageBoundaries()
            RecoveryOperator>
       pipeline({&record}, {&record}, {&record}, {&record}, {&record});
 
-  const bool values = pipeline.EvaluateLocalResidual(10) == 11 &&
-                      pipeline.EvaluateLocalJacobian(10) == 12 &&
-                      pipeline.CondenseLocalSystem(10) == 13 &&
-                      pipeline.ApplySchur(10) == 14 &&
-                      pipeline.AssembleTraceSystem(10) == 15 &&
-                      pipeline.SolveGlobalTraceSystem(10) == 16 &&
-                      pipeline.RecoverInterior(10) == 17;
+  LocalResidualRequest<TestSpec> residual_request;
+  LocalResidualResult<TestSpec> residual_result;
+  LocalJacobianRequest<TestSpec> jacobian_request;
+  LocalJacobianResult<TestSpec> jacobian_result;
+  CondenseRequest<TestSpec> condense_request;
+  CondenseResult<TestSpec> condense_result;
+  ApplySchurRequest<TestSpec> schur_request;
+  ApplySchurResult<TestSpec> schur_result;
+  TraceAssemblyRequest<TestSpec> assembly_request;
+  TraceAssemblyResult<TestSpec> assembly_result;
+  TraceSolveRequest<TestSpec> solve_request;
+  TraceSolveResult<TestSpec> solve_result;
+  RecoveryRequest<TestSpec> recovery_request;
+  RecoveryResult<TestSpec> recovery_result;
+  pipeline.EvaluateLocalResidual(residual_request, residual_result);
+  pipeline.EvaluateLocalJacobian(jacobian_request, jacobian_result);
+  pipeline.CondenseLocalSystem(condense_request, condense_result);
+  pipeline.ApplySchur(schur_request, schur_result);
+  pipeline.AssembleTraceSystem(assembly_request, assembly_result);
+  pipeline.SolveGlobalTraceSystem(solve_request, solve_result);
+  pipeline.RecoverInterior(recovery_request, recovery_result);
   for (const int calls : record.calls)
   {
     if (calls != 1)
@@ -230,15 +328,15 @@ bool CheckStaticStageBoundaries()
       return false;
     }
   }
-  return values;
+  return true;
 }
 
 } // namespace
 
 int main()
 {
-  return CheckTopology() && CheckStridesAndWorkspace() &&
-                 CheckStaticStageBoundaries()
+  return CheckTopology() && CheckTopologyRejections() &&
+                 CheckStridesAndWorkspace() && CheckStaticStageBoundaries()
              ? 0
              : 1;
 }

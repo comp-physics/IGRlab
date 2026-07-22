@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -88,12 +89,14 @@ struct LocalBlockShape
 
   DG_IGR_HDG_HOST_DEVICE constexpr LocalIndex InteriorUnknowns() const noexcept
   {
-    return interior_dofs * interior_components;
+    return static_cast<LocalIndex>(
+        static_cast<std::int64_t>(interior_dofs) * interior_components);
   }
 
   DG_IGR_HDG_HOST_DEVICE constexpr LocalIndex TraceUnknowns() const noexcept
   {
-    return trace_dofs * trace_components;
+    return static_cast<LocalIndex>(
+        static_cast<std::int64_t>(trace_dofs) * trace_components);
   }
 
   DG_IGR_HDG_HOST_DEVICE constexpr BlockExtent Extent(
@@ -115,6 +118,54 @@ struct LocalBlockShape
     return {};
   }
 };
+
+/** Host construction must validate this before calling the unchecked execution
+ * accessors or converting local extents to size_t. */
+DG_IGR_HDG_HOST_DEVICE constexpr bool IsValidLocalBlockShape(
+    const LocalBlockShape shape) noexcept
+{
+  const std::int64_t maximum = std::numeric_limits<LocalIndex>::max();
+  return shape.interior_dofs >= 0 && shape.trace_dofs >= 0 &&
+         shape.interior_components >= 0 && shape.trace_components >= 0 &&
+         static_cast<std::int64_t>(shape.interior_dofs) *
+                 shape.interior_components <=
+             maximum &&
+         static_cast<std::int64_t>(shape.trace_dofs) * shape.trace_components <=
+             maximum;
+}
+
+constexpr LocalIndex ReferenceDimension(const ReferenceGeometry reference) noexcept
+{
+  switch (reference)
+  {
+    case ReferenceGeometry::point:
+      return 0;
+    case ReferenceGeometry::segment:
+      return 1;
+    case ReferenceGeometry::triangle:
+    case ReferenceGeometry::quadrilateral:
+      return 2;
+    case ReferenceGeometry::tetrahedron:
+    case ReferenceGeometry::hexahedron:
+    case ReferenceGeometry::prism:
+    case ReferenceGeometry::pyramid:
+      return 3;
+    case ReferenceGeometry::unknown:
+      return invalid_local_index;
+  }
+  return invalid_local_index;
+}
+
+constexpr bool IsValidOwnership(const Ownership ownership) noexcept
+{
+  return ownership == Ownership::owned || ownership == Ownership::ghost;
+}
+
+constexpr bool IsValidOrientation(const OrientationMetadata orientation) noexcept
+{
+  return orientation.permutation >= 0 &&
+         (orientation.sign == -1 || orientation.sign == 1);
+}
 
 struct GeometryMetadata
 {
@@ -251,6 +302,21 @@ struct HdgTopologyStorage
   /** Structural validation only; no mesh or formulation semantics are added. */
   bool HasConsistentRanges() const noexcept
   {
+    const auto fits_local_index = [](const std::size_t size) noexcept
+    { return size <= static_cast<std::size_t>(std::numeric_limits<LocalIndex>::max()); };
+    const auto valid_index = [](const LocalIndex index,
+                                const std::size_t size) noexcept
+    {
+      return index >= 0 && static_cast<std::size_t>(index) < size;
+    };
+
+    if (!fits_local_index(elements.size()) || !fits_local_index(faces.size()) ||
+        !fits_local_index(trace_dofs.size()) ||
+        !fits_local_index(geometries.size()) ||
+        !fits_local_index(element_faces.size()))
+    {
+      return false;
+    }
     if (element_face_offsets.size() != elements.size() + 1 ||
         element_face_offsets.empty() || element_face_offsets.front() != 0 ||
         element_face_offsets.back() !=
@@ -265,11 +331,162 @@ struct HdgTopologyStorage
         return false;
       }
     }
-    for (const auto& face : faces)
+    for (const auto& geometry : geometries)
     {
-      if (face.trace_offset < 0 || face.trace_count < 0 ||
-          face.trace_offset + face.trace_count >
-              static_cast<LocalIndex>(trace_dofs.size()))
+      if (geometry.global_id < 0 ||
+          ReferenceDimension(geometry.reference) != geometry.reference_dimension ||
+          geometry.space_dimension < geometry.reference_dimension ||
+          geometry.mapping_order < 0 || geometry.quadrature_points < 0)
+      {
+        return false;
+      }
+    }
+    for (const auto& element : elements)
+    {
+      if (element.global_id < 0 || !valid_index(element.geometry, geometries.size()) ||
+          element.order < 0 || element.dimension < 0 ||
+          element.dimension != geometries[static_cast<std::size_t>(element.geometry)]
+                                   .reference_dimension ||
+          !IsValidLocalBlockShape(element.blocks))
+      {
+        return false;
+      }
+    }
+    for (std::size_t face_index = 0; face_index < faces.size(); ++face_index)
+    {
+      const auto& face = faces[face_index];
+      if (face.global_id < 0 || !valid_index(face.geometry, geometries.size()) ||
+          face.order < 0 || face.dimension < 0 ||
+          face.dimension != geometries[static_cast<std::size_t>(face.geometry)]
+                                .reference_dimension ||
+          !IsValidOwnership(face.ownership) || face.owner_rank < 0 ||
+          face.trace_offset < 0 || face.trace_count < 0 ||
+          static_cast<std::size_t>(face.trace_offset) > trace_dofs.size() ||
+          static_cast<std::size_t>(face.trace_count) >
+              trace_dofs.size() - static_cast<std::size_t>(face.trace_offset))
+      {
+        return false;
+      }
+
+      int adjacent_count = 0;
+      for (int side = 0; side != 2; ++side)
+      {
+        const LocalIndex element = face.adjacent_elements[side];
+        if (element == invalid_local_index)
+        {
+          if (face.local_faces[side] != invalid_local_index ||
+              face.orientations[side].permutation != 0 ||
+              face.orientations[side].sign != 1)
+          {
+            return false;
+          }
+          continue;
+        }
+        if (!valid_index(element, elements.size()) || face.local_faces[side] < 0 ||
+            !IsValidOrientation(face.orientations[side]))
+        {
+          return false;
+        }
+        ++adjacent_count;
+      }
+      if (adjacent_count == 0 ||
+          (adjacent_count == 2 &&
+           face.adjacent_elements[0] == face.adjacent_elements[1]))
+      {
+        return false;
+      }
+
+      const std::size_t begin = static_cast<std::size_t>(face.trace_offset);
+      const std::size_t end = begin + static_cast<std::size_t>(face.trace_count);
+      for (std::size_t dof = begin; dof < end; ++dof)
+      {
+        if (trace_dofs[dof].face != static_cast<LocalIndex>(face_index))
+        {
+          return false;
+        }
+      }
+    }
+
+    for (std::size_t element_index = 0; element_index < elements.size();
+         ++element_index)
+    {
+      const std::size_t begin = static_cast<std::size_t>(element_face_offsets[element_index]);
+      const std::size_t end =
+          static_cast<std::size_t>(element_face_offsets[element_index + 1]);
+      for (std::size_t entry_index = begin; entry_index < end; ++entry_index)
+      {
+        const auto& entry = element_faces[entry_index];
+        if (!valid_index(entry.face, faces.size()) || entry.local_face < 0 ||
+            !IsValidOrientation(entry.orientation))
+        {
+          return false;
+        }
+        const auto& face = faces[static_cast<std::size_t>(entry.face)];
+        bool matches_face = false;
+        for (int side = 0; side != 2; ++side)
+        {
+          matches_face = matches_face ||
+                         (face.adjacent_elements[side] ==
+                              static_cast<LocalIndex>(element_index) &&
+                          face.local_faces[side] == entry.local_face &&
+                          face.orientations[side].permutation ==
+                              entry.orientation.permutation &&
+                          face.orientations[side].sign == entry.orientation.sign);
+        }
+        if (!matches_face)
+        {
+          return false;
+        }
+      }
+    }
+
+    for (std::size_t face_index = 0; face_index < faces.size(); ++face_index)
+    {
+      const auto& face = faces[face_index];
+      for (int side = 0; side != 2; ++side)
+      {
+        if (face.adjacent_elements[side] == invalid_local_index)
+        {
+          continue;
+        }
+        const std::size_t element =
+            static_cast<std::size_t>(face.adjacent_elements[side]);
+        const std::size_t begin =
+            static_cast<std::size_t>(element_face_offsets[element]);
+        const std::size_t end =
+            static_cast<std::size_t>(element_face_offsets[element + 1]);
+        bool found = false;
+        for (std::size_t entry = begin; entry < end; ++entry)
+        {
+          const auto& incidence = element_faces[entry];
+          found = found ||
+                  (incidence.face == static_cast<LocalIndex>(face_index) &&
+                   incidence.local_face == face.local_faces[side] &&
+                   incidence.orientation.permutation ==
+                       face.orientations[side].permutation &&
+                   incidence.orientation.sign == face.orientations[side].sign);
+        }
+        if (!found)
+        {
+          return false;
+        }
+      }
+    }
+
+    for (std::size_t dof_index = 0; dof_index < trace_dofs.size(); ++dof_index)
+    {
+      const auto& dof = trace_dofs[dof_index];
+      if (dof.global_true_dof < 0 ||
+          dof.local_dof != static_cast<LocalIndex>(dof_index) ||
+          !valid_index(dof.face, faces.size()) || dof.component < 0 ||
+          dof.owner_rank < 0 || !IsValidOwnership(dof.ownership))
+      {
+        return false;
+      }
+      const auto& face = faces[static_cast<std::size_t>(dof.face)];
+      const std::size_t begin = static_cast<std::size_t>(face.trace_offset);
+      const std::size_t end = begin + static_cast<std::size_t>(face.trace_count);
+      if (dof_index < begin || dof_index >= end)
       {
         return false;
       }
