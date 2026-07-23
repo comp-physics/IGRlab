@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -677,6 +679,11 @@ int TestElementFaceOrientationAndPermutation()
   if (trace_space == nullptr || trace_space->GetMesh() == nullptr ||
       !experiment.CopyLocalLinearization(snapshot)) return 2;
   mfem::Mesh* mesh = trace_space->GetMesh();
+  int ordinary_zero_shift_samples = 0;
+  int periodic_x_shift_samples = 0;
+  int periodic_y_shift_samples = 0;
+  double maximum_wrapped_error = 0.0;
+  double maximum_unwrapped_seam_discrepancy = 0.0;
   for (int element = 0; element < snapshot.elements; ++element)
   {
     mfem::Array<int> faces, orientations;
@@ -703,18 +710,89 @@ int TestElementFaceOrientationAndPermutation()
       {
         const mfem::IntegrationPoint& face_point = face_fe->GetNodes().IntPoint(node);
         transform->SetAllIntPoints(&face_point);
-        const mfem::IntegrationPoint& element_point = transform->Elem1No == element ?
+        const bool element_is_elem1 = transform->Elem1No == element;
+        const mfem::IntegrationPoint& element_point = element_is_elem1 ?
             transform->GetElement1IntPoint() : transform->GetElement2IntPoint();
         mfem::Vector face_physical(dg::hdg::euler::dimension);
         mfem::Vector element_physical(dg::hdg::euler::dimension);
         transform->Face->Transform(face_point, face_physical);
         mesh->GetElementTransformation(element)->Transform(element_point, element_physical);
-        if (!Close(face_physical[0], element_physical[0], 2.0e-14) ||
-            !Close(face_physical[1], element_physical[1], 2.0e-14)) return 5;
+        std::array<double, dimension> raw_delta{}, lattice_shift{}, wrapped_delta{};
+        bool lattice_shift_valid = true;
+        bool wrapped_close = true;
+        for (int coordinate = 0; coordinate < dimension; ++coordinate)
+        {
+          raw_delta[coordinate] = element_physical[coordinate] -
+                                  face_physical[coordinate];
+          lattice_shift[coordinate] = std::round(raw_delta[coordinate]);
+          wrapped_delta[coordinate] = raw_delta[coordinate] -
+                                      lattice_shift[coordinate];
+          lattice_shift_valid = lattice_shift_valid &&
+              (lattice_shift[coordinate] == -1.0 ||
+               lattice_shift[coordinate] == 0.0 ||
+               lattice_shift[coordinate] == 1.0);
+          wrapped_close = wrapped_close &&
+              Close(wrapped_delta[coordinate], 0.0, 2.0e-14);
+          maximum_wrapped_error = std::max(
+              maximum_wrapped_error, std::abs(wrapped_delta[coordinate]));
+        }
+        const bool zero_shift = lattice_shift[0] == 0.0 &&
+                                lattice_shift[1] == 0.0;
+        const bool ordinary_raw_coordinates_close = !zero_shift ||
+            (Close(face_physical[0], element_physical[0], 2.0e-14) &&
+             Close(face_physical[1], element_physical[1], 2.0e-14));
+        if (!lattice_shift_valid || !wrapped_close ||
+            (element_is_elem1 && !zero_shift) ||
+            !ordinary_raw_coordinates_close)
+        {
+          std::cerr << std::setprecision(std::numeric_limits<double>::max_digits10)
+                    << "DETAIL predicate=periodic_face_equivalence"
+                    << " face=" << face
+                    << " element=" << element
+                    << " side=" << (element_is_elem1 ? "Elem1" : "Elem2")
+                    << " node=" << node
+                    << " face=(" << face_physical[0] << ',' << face_physical[1] << ')'
+                    << " element=(" << element_physical[0] << ','
+                    << element_physical[1] << ')'
+                    << " raw_delta=(" << raw_delta[0] << ',' << raw_delta[1] << ')'
+                    << " lattice_shift=(" << lattice_shift[0] << ','
+                    << lattice_shift[1] << ')'
+                    << " wrapped_delta=(" << wrapped_delta[0] << ','
+                    << wrapped_delta[1] << ')'
+                    << " tolerance=2e-14\n";
+          return 5;
+        }
+        if (!element_is_elem1)
+        {
+          if (zero_shift) ++ordinary_zero_shift_samples;
+          if (lattice_shift[0] != 0.0) ++periodic_x_shift_samples;
+          if (lattice_shift[1] != 0.0) ++periodic_y_shift_samples;
+          if (!zero_shift)
+          {
+            maximum_unwrapped_seam_discrepancy = std::max(
+                maximum_unwrapped_seam_discrepancy,
+                std::max(std::abs(raw_delta[0]), std::abs(raw_delta[1])));
+          }
+        }
       }
       offset += face_vdofs.Size();
     }
     if (offset != snapshot.trace_dofs || orientations.Size() != faces.Size()) return 6;
+  }
+  if (ordinary_zero_shift_samples == 0 || periodic_x_shift_samples == 0 ||
+      periodic_y_shift_samples == 0 ||
+      !(maximum_unwrapped_seam_discrepancy > 0.5))
+  {
+    std::cerr << std::setprecision(std::numeric_limits<double>::max_digits10)
+              << "DETAIL predicate=periodic_face_nonvacuity"
+              << " ordinary_count=" << ordinary_zero_shift_samples
+              << " x_shift_count=" << periodic_x_shift_samples
+              << " y_shift_count=" << periodic_y_shift_samples
+              << " maximum_wrapped_error=" << maximum_wrapped_error
+              << " maximum_unwrapped_error="
+              << maximum_unwrapped_seam_discrepancy
+              << " unwrapped_threshold=0.5\n";
+    return 5;
   }
   return 0;
 }
@@ -1337,29 +1415,95 @@ int TestCompleteExperimentGate()
 int main()
 {
   const int flux = TestHandFluxAndFailureAtomicity();
-  if (flux != 0) { return 10 + flux; }
+  if (flux != 0)
+  {
+    std::cerr << "FAIL group=TestHandFluxAndFailureAtomicity subcode=" << flux
+              << " exit=" << 10 + flux << '\n';
+    return 10 + flux;
+  }
   const int jacobian = TestAnalyticFluxJacobian();
-  if (jacobian != 0) { return 20 + jacobian; }
+  if (jacobian != 0)
+  {
+    std::cerr << "FAIL group=TestAnalyticFluxJacobian subcode=" << jacobian
+              << " exit=" << 20 + jacobian << '\n';
+    return 20 + jacobian;
+  }
   const int source = TestManufacturedSource();
-  if (source != 0) { return 30 + source; }
+  if (source != 0)
+  {
+    std::cerr << "FAIL group=TestManufacturedSource subcode=" << source
+              << " exit=" << 30 + source << '\n';
+    return 30 + source;
+  }
   const int ordering = TestMfemByNodesAndSignedVDofs();
-  if (ordering != 0) { return 40 + ordering; }
+  if (ordering != 0)
+  {
+    std::cerr << "FAIL group=TestMfemByNodesAndSignedVDofs subcode=" << ordering
+              << " exit=" << 40 + ordering << '\n';
+    return 40 + ordering;
+  }
   const int trace_ordering = TestProjectedTraceComponentOrdering();
-  if (trace_ordering != 0) { return 50 + trace_ordering; }
+  if (trace_ordering != 0)
+  {
+    std::cerr << "FAIL group=TestProjectedTraceComponentOrdering subcode="
+              << trace_ordering << " exit=" << 50 + trace_ordering << '\n';
+    return 50 + trace_ordering;
+  }
   const int orientation = TestElementFaceOrientationAndPermutation();
-  if (orientation != 0) { return 60 + orientation; }
+  if (orientation != 0)
+  {
+    std::cerr << "FAIL group=TestElementFaceOrientationAndPermutation subcode="
+              << orientation << " exit=" << 60 + orientation << '\n';
+    return 60 + orientation;
+  }
   const int setup = TestFailurePreservingSetup();
-  if (setup != 0) { return 70 + setup; }
+  if (setup != 0)
+  {
+    std::cerr << "FAIL group=TestFailurePreservingSetup subcode=" << setup
+              << " exit=" << 70 + setup << '\n';
+    return 70 + setup;
+  }
   const int face_oracles = TestFixedScalarTauConstantAndConservationOracles();
-  if (face_oracles != 0) { return 80 + face_oracles; }
+  if (face_oracles != 0)
+  {
+    std::cerr << "FAIL group=TestFixedScalarTauConstantAndConservationOracles subcode="
+              << face_oracles << " exit=" << 80 + face_oracles << '\n';
+    return 80 + face_oracles;
+  }
   const int snapshots = TestSnapshotGenerationAndExtentValidation();
-  if (snapshots != 0) { return 90 + snapshots; }
+  if (snapshots != 0)
+  {
+    std::cerr << "FAIL group=TestSnapshotGenerationAndExtentValidation subcode="
+              << snapshots << " exit=" << 90 + snapshots << '\n';
+    return 90 + snapshots;
+  }
   const int assembled_oracle = TestIndependentAssembledLinearizationOracle();
-  if (assembled_oracle != 0) { return 110 + assembled_oracle; }
+  if (assembled_oracle != 0)
+  {
+    std::cerr << "FAIL group=TestIndependentAssembledLinearizationOracle subcode="
+              << assembled_oracle << " exit=" << 110 + assembled_oracle << '\n';
+    return 110 + assembled_oracle;
+  }
   const int two_sided_orientation = TestTwoSidedP2OrientationOracle();
-  if (two_sided_orientation != 0) { return 130 + two_sided_orientation; }
+  if (two_sided_orientation != 0)
+  {
+    std::cerr << "FAIL group=TestTwoSidedP2OrientationOracle subcode="
+              << two_sided_orientation << " exit="
+              << 130 + two_sided_orientation << '\n';
+    return 130 + two_sided_orientation;
+  }
   const int block_oracles = TestFaceBlockDirectionalAndIndependentSchurOracles();
-  if (block_oracles != 0) { return 150 + block_oracles; }
+  if (block_oracles != 0)
+  {
+    std::cerr << "FAIL group=TestFaceBlockDirectionalAndIndependentSchurOracles subcode="
+              << block_oracles << " exit=" << 150 + block_oracles << '\n';
+    return 150 + block_oracles;
+  }
   const int experiment = TestCompleteExperimentGate();
+  if (experiment != 0)
+  {
+    std::cerr << "FAIL group=TestCompleteExperimentGate subcode=" << experiment
+              << " exit=" << 180 + experiment << '\n';
+  }
   return experiment == 0 ? 0 : 180 + experiment;
 }
