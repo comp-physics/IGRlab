@@ -14,6 +14,8 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -31,6 +33,8 @@ inline constexpr int conserved_components = 4;
 inline constexpr double gamma = 1.4;
 inline constexpr double fixed_scalar_tau = 2.5;
 inline constexpr double backward_euler_dt = 0.05;
+inline constexpr double experiment_epsilon =
+    std::numeric_limits<double>::epsilon();
 
 // Closed compile-time description: the experiment never chooses a model,
 // stabilization, time rule, or backend per quadrature point.
@@ -111,10 +115,51 @@ int ComponentFromByNodesIndex(int vector_dof, int scalar_count) noexcept;
 int ScalarFromByNodesIndex(int vector_dof, int scalar_count) noexcept;
 int DecodeSignedVDof(int signed_vdof, double& sign) noexcept;
 
+enum class ExperimentStatus : unsigned char
+{
+  Success,
+  SetupFailure,
+  ProjectionFailure,
+  InitialAdmissibilityFailure,
+  AssemblyFailure,
+  CondensationFailure,
+  GmresFailure,
+  LinearResidualFailure,
+  RecoveryFailure,
+  LineSearchExhausted,
+  IterationLimit,
+  ErrorIntegrationFailure,
+  ErrorFloorFailure,
+  RateFailure,
+  EvidenceConsistencyFailure
+};
+
+enum class TrialRejectionReason : unsigned char
+{
+  None,
+  Nonfinite,
+  Density,
+  Pressure,
+  WaveSpeed,
+  Armijo
+};
+
+struct AdmissibilityEvidence
+{
+  bool passed = false;
+  TrialRejectionReason reason = TrialRejectionReason::None;
+  double minimum_density = 0.0;
+  double minimum_pressure = 0.0;
+  double maximum_wave_speed = 0.0;
+};
+
 struct NewtonEvidence
 {
+  ExperimentStatus status = ExperimentStatus::SetupFailure;
   int nonlinear_iterations = 0;
   int linear_iterations = 0;
+  int assembly_attempts = 0;
+  int rejected_trials = 0;
   double initial_residual = 0.0;
   double final_residual = 0.0;
   double trace_relative_residual = 0.0;
@@ -122,25 +167,56 @@ struct NewtonEvidence
   double minimum_pressure = 0.0;
   double minimum_damping = 1.0;
   double maximum_wave_speed = 0.0;
+  double maximum_coefficient_update = 0.0;
+  double maximum_jacobian_change = 0.0;
+  double relative_coefficient_change = 0.0;
+  double relative_jacobian_change = 0.0;
+  double residual_after_first_accepted = 0.0;
+  bool residual_after_first_above_convergence = false;
+  bool initial_prescreen_passed = false;
   bool admissible = false;
 };
 
-struct ConvergenceEvidence
+struct LinearSolveEvidence
 {
-  int polynomial_order = 0;
-  std::array<int, 3> mesh_widths{{3, 6, 12}};
-  std::array<double, 3> volume_relative_l2{{0.0, 0.0, 0.0}};
-  std::array<double, 3> trace_relative_l2{{0.0, 0.0, 0.0}};
-  double volume_rate = 0.0;
-  double trace_rate = 0.0;
-  bool passed = false;
+  int nonlinear_iteration = 0;
+  int gmres_iterations = 0;
+  double right_hand_side_norm = 0.0;
+  double reported_relative_residual = 0.0;
+  double true_relative_residual = 0.0;
+  ExperimentStatus status = ExperimentStatus::SetupFailure;
 };
 
-struct ExperimentEvidence
+struct TrialEvidence
 {
-  NewtonEvidence newton{};
-  std::vector<ConvergenceEvidence> convergence{};
-  bool passed = false;
+  int nonlinear_iteration = 0;
+  int trial_index = 0;
+  double alpha = 0.0;
+  double base_residual = 0.0;
+  double armijo_boundary = 0.0;
+  double trial_residual = 0.0;
+  double coefficient_update = 0.0;
+  double jacobian_change = 0.0;
+  AdmissibilityEvidence admissibility{};
+  ExperimentStatus status = ExperimentStatus::SetupFailure;
+  TrialRejectionReason rejection_reason = TrialRejectionReason::None;
+  bool reassembly_attempted = false;
+  bool residual_evaluated = false;
+  bool trial_residual_present = false;
+  bool accepted = false;
+  bool generation_published = false;
+  bool generation_discarded = false;
+};
+
+struct ErrorIntegralEvidence
+{
+  double error_squared = 0.0;
+  double exact_norm_squared = 0.0;
+  double measure = 0.0;
+  double direct_l2 = 0.0;
+  double rms = 0.0;
+  double relative_l2 = 0.0;
+  int unique_face_count = 0;
 };
 
 /**
@@ -155,6 +231,159 @@ struct LocalLinearizationSnapshot
   int trace_dofs = 0;
   std::vector<double> a, b, c, d, f, g;
   std::vector<int> signed_trace_dofs;
+};
+
+struct LocalAssemblyAuditSnapshot
+{
+  int polynomial_order = 0;
+  int elements_per_direction = 0;
+  int element = -1;
+  int quadrature_order = 0;
+  int volume_quadrature_points = 0;
+  int face_quadrature_points = 0;
+  int interior_dofs = 0;
+  int trace_dofs = 0;
+  std::vector<double> old_interior;
+  std::vector<double> current_interior;
+  std::vector<double> trace;
+  std::vector<double> residual_interior;
+  std::vector<double> residual_trace;
+  std::vector<double> a, b, c, d;
+  std::vector<int> signed_trace_dofs;
+  std::uint64_t interior_reconstruction_id = 0;
+  std::uint64_t trace_reconstruction_id = 0;
+};
+
+struct LinearAuditSnapshot
+{
+  int polynomial_order = 0;
+  int elements_per_direction = 0;
+  int nonlinear_iteration = 0;
+  int rows = 0;
+  std::vector<int> row_offsets;
+  std::vector<int> columns;
+  std::vector<double> values;
+  std::vector<double> right_hand_side;
+  std::vector<double> trace_increment;
+  double true_relative_residual = 0.0;
+};
+
+struct TrialAuditSnapshot
+{
+  int nonlinear_iteration = 0;
+  int trial_index = 0;
+  double alpha = 0.0;
+  double base_residual = 0.0;
+  double armijo_boundary = 0.0;
+  double trial_residual = 0.0;
+  double coefficient_update = 0.0;
+  double jacobian_change = 0.0;
+  double formula_identity_error = 0.0;
+  std::vector<double> base_interior;
+  std::vector<double> base_trace;
+  std::vector<double> delta_interior;
+  std::vector<double> delta_trace;
+  std::vector<double> trial_interior;
+  std::vector<double> trial_trace;
+  std::vector<double> post_decision_interior;
+  std::vector<double> post_decision_trace;
+  AdmissibilityEvidence admissibility{};
+  ExperimentStatus status = ExperimentStatus::SetupFailure;
+  TrialRejectionReason rejection_reason = TrialRejectionReason::None;
+  bool reassembly_attempted = false;
+  bool residual_evaluated = false;
+  bool accepted = false;
+  bool generation_published = false;
+  bool generation_discarded = false;
+};
+
+struct SolvedMeshEvidence
+{
+  int polynomial_order = 0;
+  int elements_per_direction = 0;
+  int q_a = 0;
+  int q_e = 0;
+  int q_e_plus_four = 0;
+  ExperimentStatus status = ExperimentStatus::SetupFailure;
+  NewtonEvidence newton{};
+  AdmissibilityEvidence initial_admissibility{};
+  std::vector<double> old_interior;
+  std::vector<double> initial_interior;
+  std::vector<double> final_interior;
+  std::vector<double> old_trace;
+  std::vector<double> initial_trace;
+  std::vector<double> final_trace;
+  std::vector<double> initial_residual_interior;
+  std::vector<double> initial_residual_trace;
+  std::vector<double> final_residual_interior;
+  std::vector<double> final_residual_trace;
+  std::vector<int> signed_trace_dofs;
+  std::vector<double> residual_history;
+  std::vector<LinearSolveEvidence> linear_history;
+  std::vector<TrialEvidence> trial_history;
+  ErrorIntegralEvidence q_e_volume{};
+  ErrorIntegralEvidence q_e_plus_four_volume{};
+  ErrorIntegralEvidence q_e_trace{};
+  ErrorIntegralEvidence q_e_plus_four_trace{};
+  LocalAssemblyAuditSnapshot local_assembly{};
+  bool has_linear_audit = false;
+  LinearAuditSnapshot linear_audit{};
+  std::vector<TrialAuditSnapshot> trial_audits;
+  bool internal_consistency = false;
+};
+
+struct ConvergenceEvidence
+{
+  ExperimentStatus status = ExperimentStatus::SetupFailure;
+  int polynomial_order = 0;
+  std::array<int, 3> mesh_widths{{3, 6, 12}};
+  std::array<SolvedMeshEvidence, 3> solves{};
+  std::array<double, 3> volume_relative_l2{{0.0, 0.0, 0.0}};
+  std::array<double, 3> trace_relative_l2{{0.0, 0.0, 0.0}};
+  std::array<double, 2> volume_rates{{0.0, 0.0}};
+  std::array<double, 2> trace_rates{{0.0, 0.0}};
+  bool passed = false;
+};
+
+struct RollbackAuditEvidence
+{
+  ExperimentStatus status = ExperimentStatus::SetupFailure;
+  AdmissibilityEvidence initial_admissibility{};
+  int accepted_updates = 0;
+  double initial_residual = 0.0;
+  double residual_after_first_accepted = 0.0;
+  bool residual_after_first_above_convergence = false;
+  std::vector<double> entry_interior;
+  std::vector<double> restored_interior;
+  std::vector<double> entry_trace;
+  std::vector<double> restored_trace;
+  std::uint64_t entry_interior_hash = 0;
+  std::uint64_t restored_interior_hash = 0;
+  std::uint64_t entry_trace_hash = 0;
+  std::uint64_t restored_trace_hash = 0;
+  bool returned_success = false;
+  bool interior_byte_equal = false;
+  bool trace_byte_equal = false;
+  bool local_generation_invalid = false;
+  bool condensed_generation_invalid = false;
+  bool solve_generation_invalid = false;
+  bool local_copy_rejected = false;
+  bool right_hand_side_copy_rejected = false;
+  bool trace_increment_copy_rejected = false;
+  bool condensation_consume_rejected = false;
+  bool solve_consume_rejected = false;
+  bool recovery_consume_rejected = false;
+  bool partial_solve_evidence = false;
+  bool partial_convergence_evidence = false;
+  bool passed = false;
+};
+
+struct ExperimentEvidence
+{
+  ExperimentStatus status = ExperimentStatus::SetupFailure;
+  RollbackAuditEvidence rollback{};
+  std::vector<ConvergenceEvidence> convergence{};
+  bool passed = false;
 };
 
 /**
@@ -184,9 +413,9 @@ public:
   bool SolveTrace();
   /** Recovers local increments through HostReferenceEngine. */
   bool RecoverInterior();
-  /** Attempts the candidate Newton stage; unimplemented frozen gates fail closed. */
+  /** Runs the frozen admissible, damped Newton transaction. */
   bool SolveDampedNewton(NewtonEvidence& evidence);
-  /** Runs the 3/6/12 ladder only when independent error gates are available. */
+  /** Runs and validates the frozen 3/6/12 error ladder. */
   bool RunConvergenceLadder(ConvergenceEvidence& evidence);
 
   int polynomial_order() const noexcept { return polynomial_order_; }
@@ -194,6 +423,9 @@ public:
   const mfem::FiniteElementSpace* trace_space() const noexcept;
   const mfem::GridFunction* old_interior() const noexcept;
   const mfem::GridFunction* old_trace() const noexcept;
+  const mfem::GridFunction* current_interior() const noexcept;
+  const mfem::GridFunction* current_trace() const noexcept;
+  const SolvedMeshEvidence* solved_evidence() const noexcept;
   const mfem::SparseMatrix* trace_matrix() const noexcept;
   /** Copies assembled blocks without exposing mutable implementation state. */
   bool CopyLocalLinearization(LocalLinearizationSnapshot& snapshot) const;
@@ -203,10 +435,19 @@ public:
   bool CopyTraceIncrement(std::vector<double>& increment) const;
 
 private:
+  bool ProjectPerturbedCurrentStage();
+  bool SolveNewtonTransaction(NewtonEvidence& evidence,
+                              SolvedMeshEvidence* solved_evidence);
+  bool IntegrateErrorEvidence(int quadrature_order,
+                              ErrorIntegralEvidence& volume,
+                              ErrorIntegralEvidence& trace) const;
+
   struct Implementation;
   std::unique_ptr<Implementation> implementation_;
   int polynomial_order_ = 0;
   int quadrature_order_ = 0;
+
+  friend bool RunSmoothEulerExperiment(ExperimentEvidence& evidence);
 };
 
 /** Runs the p=1..4 serial manufactured candidate and returns all evidence. */
