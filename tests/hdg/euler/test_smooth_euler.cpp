@@ -163,7 +163,7 @@ int FindElementFaceOffset(mfem::Mesh& mesh,
                           const int element, const int selected_face)
 {
   mfem::Array<int> faces, orientations;
-  mesh.GetElementFaces(element, faces, orientations);
+  mesh.GetElementEdges(element, faces, orientations);
   int offset = 0;
   for (int local_face = 0; local_face < faces.Size(); ++local_face)
   {
@@ -198,7 +198,7 @@ bool ExtractElementCoefficients(const SmoothEulerExperiment& experiment,
     interior[local] = sign * (*interior_field)[vdof];
   }
   mfem::Array<int> faces, orientations;
-  trace_space->GetMesh()->GetElementFaces(element, faces, orientations);
+  trace_space->GetMesh()->GetElementEdges(element, faces, orientations);
   trace.clear();
   for (int local_face = 0; local_face < faces.Size(); ++local_face)
   {
@@ -276,7 +276,7 @@ bool AssembleIndependentQ(const SmoothEulerExperiment& experiment,
   }
 
   mfem::Array<int> faces, orientations;
-  mesh.GetElementFaces(element, faces, orientations);
+  mesh.GetElementEdges(element, faces, orientations);
   int trace_offset = 0;
   for (int local_face = 0; local_face < faces.Size(); ++local_face)
   {
@@ -680,7 +680,7 @@ int TestElementFaceOrientationAndPermutation()
   for (int element = 0; element < snapshot.elements; ++element)
   {
     mfem::Array<int> faces, orientations;
-    mesh->GetElementFaces(element, faces, orientations);
+    mesh->GetElementEdges(element, faces, orientations);
     int offset = 0;
     for (int local_face = 0; local_face < faces.Size(); ++local_face)
     {
