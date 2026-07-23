@@ -9,6 +9,7 @@ INSTALL_DEPS=1
 RUN_TESTS=1
 RUN_SMOKE=0
 CALIPER=0
+HDG_EULER_EXPERIMENT="OFF"
 SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
 CUDA_ARCH_WAS_SET=0
 
@@ -22,6 +23,8 @@ Modes:
 
 Options:
   --caliper         Build the CPU-only Caliper observability profile.
+  --hdg-euler-experiment
+                    Enable the CPU-only experimental HDG Euler path.
   -j, --jobs N      Parallel build jobs (default: NPROC or 4).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
   --clean           Rebuild the selected mode from clean caches (default).
@@ -42,6 +45,7 @@ while (($#)); do
     --cpu|--cpu-only) MODE="cpu" ;;
     --gpu) MODE="gpu" ;;
     --caliper) CALIPER=1 ;;
+    --hdg-euler-experiment) HDG_EULER_EXPERIMENT="ON" ;;
     --cuda-arch)
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
       SPACK_CUDA_ARCH="$2"
@@ -64,6 +68,10 @@ while (($#)); do
   shift
 done
 
+if [[ "${MODE}" == "gpu" && "${HDG_EULER_EXPERIMENT}" == "ON" ]]; then
+  echo "ERROR: --hdg-euler-experiment is only valid with --cpu-only." >&2
+  exit 2
+fi
 [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] || {
   echo "ERROR: jobs must be a positive integer (got '${JOBS}')" >&2
   exit 2
@@ -156,6 +164,7 @@ app_cmake_args=(
   -DCMAKE_INSTALL_PREFIX="${APP_INSTALL}"
   -DMFEM_DIR="${MFEM_INSTALL}/lib/cmake/mfem"
   -DZLIB_ROOT="${SPACK_VIEW}"
+  -DDG_IGR_ENABLE_HDG_EULER_EXPERIMENT="${HDG_EULER_EXPERIMENT}"
 )
 if ((CALIPER)); then
   app_cmake_args+=(
