@@ -398,13 +398,14 @@ struct SmoothEulerAssemblyPhase
         candidate_matrix->AddSubMatrix(dofs, dofs, local_schur);
       }
       candidate_matrix->Finalize();
+      const mfem::SparseMatrix& finalized_matrix = *candidate_matrix;
       state->global_matrix->assign(static_cast<std::size_t>(global_dofs) *
                                    global_dofs, 0.0);
       for (int row = 0; row < global_dofs; ++row)
         for (int column = 0; column < global_dofs; ++column)
         {
           (*state->global_matrix)[static_cast<std::size_t>(row) * global_dofs +
-                                  column] = (*candidate_matrix)(row, column);
+                                  column] = finalized_matrix(row, column);
         }
       *state->trace_matrix = std::move(candidate_matrix);
       state->trace_rhs->SetSize(global_dofs);
