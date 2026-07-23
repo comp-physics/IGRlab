@@ -192,6 +192,7 @@ public:
   int polynomial_order() const noexcept { return polynomial_order_; }
   int quadrature_order() const noexcept { return quadrature_order_; }
   const mfem::FiniteElementSpace* trace_space() const noexcept;
+  const mfem::GridFunction* old_interior() const noexcept;
   const mfem::GridFunction* old_trace() const noexcept;
   const mfem::SparseMatrix* trace_matrix() const noexcept;
   /** Copies assembled blocks without exposing mutable implementation state. */
