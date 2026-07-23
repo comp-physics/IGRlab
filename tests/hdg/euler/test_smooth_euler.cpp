@@ -467,13 +467,22 @@ bool FindTwoSidedOrientationCase(const SmoothEulerExperiment& experiment,
     ++orientation_0_1;
     mfem::FaceElementTransformations* transform =
         mesh.GetFaceElementTransformations(face);
-    mfem::ElementTransformation* element_one_transform =
-        mesh.GetElementTransformation(element_one);
-    mfem::ElementTransformation* element_two_transform =
-        mesh.GetElementTransformation(element_two);
-    if (transform == nullptr || transform->Face == nullptr ||
-        element_one_transform == nullptr || element_two_transform == nullptr ||
-        transform->Elem1No != element_one || transform->Elem2No != element_two)
+    constexpr int required_face_configuration =
+        mfem::FaceElementTransformations::HAVE_ELEM1 |
+        mfem::FaceElementTransformations::HAVE_ELEM2 |
+        mfem::FaceElementTransformations::HAVE_LOC1 |
+        mfem::FaceElementTransformations::HAVE_LOC2 |
+        mfem::FaceElementTransformations::HAVE_FACE;
+    // MFEM pointer-returning mesh transformation access reuses scratch
+    // Transformation storage, so it cannot occur while this face bundle is live.
+    if (transform == nullptr ||
+        (transform->GetConfigurationMask() & required_face_configuration) !=
+            required_face_configuration ||
+        transform->Face == nullptr || transform->Elem1 == nullptr ||
+        transform->Elem2 == nullptr || transform->Elem1 == transform->Elem2 ||
+        transform->Elem1No != element_one || transform->Elem2No != element_two ||
+        transform->Elem1->ElementNo != element_one ||
+        transform->Elem2->ElementNo != element_two)
     {
       ++rejected_invalid_transform;
       continue;
@@ -484,8 +493,8 @@ bool FindTwoSidedOrientationCase(const SmoothEulerExperiment& experiment,
     mfem::Vector face_physical(dimension), one_physical(dimension),
         two_physical(dimension);
     transform->Face->Transform(midpoint, face_physical);
-    element_one_transform->Transform(transform->GetElement1IntPoint(), one_physical);
-    element_two_transform->Transform(transform->GetElement2IntPoint(), two_physical);
+    transform->Elem1->Transform(transform->GetElement1IntPoint(), one_physical);
+    transform->Elem2->Transform(transform->GetElement2IntPoint(), two_physical);
     // Both midpoint coordinates strictly inside the unit square exclude the
     // periodic seams; the generated Cartesian mesh is ordinary conforming.
     if (!(face_physical[0] > 1.0e-12 && face_physical[0] < 1.0 - 1.0e-12 &&
@@ -503,8 +512,8 @@ bool FindTwoSidedOrientationCase(const SmoothEulerExperiment& experiment,
       const mfem::IntegrationPoint& point = coincidence_rule.IntPoint(node);
       transform->SetAllIntPoints(&point);
       transform->Face->Transform(point, face_physical);
-      element_one_transform->Transform(transform->GetElement1IntPoint(), one_physical);
-      element_two_transform->Transform(transform->GetElement2IntPoint(), two_physical);
+      transform->Elem1->Transform(transform->GetElement1IntPoint(), one_physical);
+      transform->Elem2->Transform(transform->GetElement2IntPoint(), two_physical);
       for (int coordinate = 0; coordinate < dimension; ++coordinate)
       {
         coincident = coincident &&
