@@ -149,8 +149,8 @@ struct OrientationCase
   int face = -1;
   int element_one = -1;
   int element_two = -1;
-  int element_one_axis = -1;
-  int element_two_axis = -1;
+  int element_one_orientation = -1;
+  int element_two_orientation = -1;
 };
 
 enum class OrientationMutation
@@ -307,14 +307,21 @@ bool AssembleIndependentQ(const SmoothEulerExperiment& experiment,
           face_transform->GetElement2IntPoint();
       fe->CalcShape(element_point, interior_shape);
       bool explicit_orientation = orientation != nullptr && face == orientation->face;
+      bool reverse = false;
       if (explicit_orientation)
       {
-        const int axis = is_element_one ? orientation->element_one_axis :
-                                          orientation->element_two_axis;
-        if (axis < 0 || axis >= dimension) return false;
-        mfem::IntegrationPoint side_point;
-        side_point.x = axis == 0 ? element_point.x : element_point.y;
+        const int side_orientation = is_element_one ?
+            orientation->element_one_orientation :
+            orientation->element_two_orientation;
+        if (side_orientation != 0 && side_orientation != 1) return false;
+        mfem::IntegrationPoint side_point = face_point;
+        side_point.x = side_orientation == 0 ? face_point.x : 1.0 - face_point.x;
         trace_fe->CalcShape(side_point, trace_shape);
+        // The wrong-permutation mutation retains the oriented side point and
+        // suppresses only the p-i coefficient/residual-row map.
+        const bool use_wrong_elem2_permutation = !is_element_one &&
+            mutation == OrientationMutation::wrong_elem2_permutation;
+        reverse = side_orientation == 1 && !use_wrong_elem2_permutation;
       }
       else
       {
@@ -327,12 +334,7 @@ bool AssembleIndependentQ(const SmoothEulerExperiment& experiment,
       for (int component = 0; component < conserved_components; ++component)
         for (int node = 0; node < trace_scalar_dofs; ++node)
         {
-          int canonical_node = node;
-          if (explicit_orientation && !is_element_one &&
-              mutation != OrientationMutation::wrong_elem2_permutation)
-          {
-            canonical_node = trace_scalar_dofs - 1 - node;
-          }
+          const int canonical_node = reverse ? trace_scalar_dofs - 1 - node : node;
           trace_state[component] += trace_shape[node] * trace[
               trace_offset + canonical_node + trace_scalar_dofs * component];
         }
@@ -357,12 +359,7 @@ bool AssembleIndependentQ(const SmoothEulerExperiment& experiment,
               weight * interior_shape[row] * numerical_flux;
         for (int row = 0; row < trace_scalar_dofs; ++row)
         {
-          int canonical_row = row;
-          if (explicit_orientation && !is_element_one &&
-              mutation != OrientationMutation::wrong_elem2_permutation)
-          {
-            canonical_row = trace_scalar_dofs - 1 - row;
-          }
+          const int canonical_row = reverse ? trace_scalar_dofs - 1 - row : row;
           trace_residual[trace_offset + canonical_row +
                          trace_scalar_dofs * component] +=
               weight * trace_shape[row] * numerical_flux;
@@ -418,54 +415,86 @@ bool FindTwoSidedOrientationCase(const SmoothEulerExperiment& experiment,
   const mfem::FiniteElementSpace* trace_space = experiment.trace_space();
   if (trace_space == nullptr || trace_space->GetMesh() == nullptr) return false;
   mfem::Mesh& mesh = *trace_space->GetMesh();
+  int faces = 0;
+  int two_sided = 0;
+  int p2 = 0;
+  int orientation_0_1 = 0;
+  int ordinary = 0;
+  int coincident_faces = 0;
+  int admitted = 0;
+  int periodic_excluded = 0;
+  int rejected_not_local_conforming = 0;
+  int rejected_invalid_elements = 0;
+  int rejected_not_p2_segment = 0;
+  int rejected_orientation = 0;
+  int rejected_invalid_transform = 0;
+  int rejected_not_coincident = 0;
   for (int face = 0; face < mesh.GetNumFaces(); ++face)
   {
-    mfem::FaceElementTransformations* transform =
-        mesh.GetFaceElementTransformations(face);
-    const mfem::FiniteElement* face_fe = trace_space->GetFaceElement(face);
-    if (transform == nullptr || transform->Face == nullptr || face_fe == nullptr ||
-        transform->Elem1No < 0 || transform->Elem2No < 0 ||
-        transform->Elem1No == transform->Elem2No || face_fe->GetDof() != 3)
+    ++faces;
+    const mfem::Mesh::FaceInformation face_information =
+        mesh.GetFaceInformation(face);
+    if (face_information.tag != mfem::Mesh::FaceInfoTag::LocalConforming ||
+        !face_information.IsLocal() || !face_information.IsConforming())
     {
+      ++rejected_not_local_conforming;
       continue;
     }
-    mfem::IntegrationPoint endpoint_zero, endpoint_one, midpoint;
-    endpoint_zero.x = 0.0;
-    endpoint_one.x = 1.0;
+    const int element_one = face_information.element[0].index;
+    const int element_two = face_information.element[1].index;
+    if (element_one < 0 || element_one >= mesh.GetNE() || element_two < 0 ||
+        element_two >= mesh.GetNE() || element_one == element_two)
+    {
+      ++rejected_invalid_elements;
+      continue;
+    }
+    ++two_sided;
+    const mfem::FiniteElement* face_fe = trace_space->GetFaceElement(face);
+    if (face_fe == nullptr || face_fe->GetGeomType() != mfem::Geometry::SEGMENT ||
+        face_fe->GetOrder() != 2 || face_fe->GetDof() != 3)
+    {
+      ++rejected_not_p2_segment;
+      continue;
+    }
+    ++p2;
+    const int element_one_orientation = face_information.element[0].orientation;
+    const int element_two_orientation = face_information.element[1].orientation;
+    if (element_one_orientation != 0 || element_two_orientation != 1)
+    {
+      ++rejected_orientation;
+      continue;
+    }
+    ++orientation_0_1;
+    mfem::FaceElementTransformations* transform =
+        mesh.GetFaceElementTransformations(face);
+    mfem::ElementTransformation* element_one_transform =
+        mesh.GetElementTransformation(element_one);
+    mfem::ElementTransformation* element_two_transform =
+        mesh.GetElementTransformation(element_two);
+    if (transform == nullptr || transform->Face == nullptr ||
+        element_one_transform == nullptr || element_two_transform == nullptr ||
+        transform->Elem1No != element_one || transform->Elem2No != element_two)
+    {
+      ++rejected_invalid_transform;
+      continue;
+    }
+    mfem::IntegrationPoint midpoint;
     midpoint.x = 0.5;
-    transform->SetAllIntPoints(&endpoint_zero);
-    const mfem::IntegrationPoint element_one_zero =
-        transform->GetElement1IntPoint();
-    const mfem::IntegrationPoint element_two_zero =
-        transform->GetElement2IntPoint();
-    transform->SetAllIntPoints(&endpoint_one);
-    const mfem::IntegrationPoint element_one_one =
-        transform->GetElement1IntPoint();
-    const mfem::IntegrationPoint element_two_one =
-        transform->GetElement2IntPoint();
-    const double one_delta[2] = {element_one_one.x - element_one_zero.x,
-                                 element_one_one.y - element_one_zero.y};
-    const double two_delta[2] = {element_two_one.x - element_two_zero.x,
-                                 element_two_one.y - element_two_zero.y};
-    const int one_axis = std::abs(one_delta[0]) > std::abs(one_delta[1]) ? 0 : 1;
-    const int two_axis = std::abs(two_delta[0]) > std::abs(two_delta[1]) ? 0 : 1;
-    if (!(one_delta[one_axis] > 0.5 && two_delta[two_axis] < -0.5)) continue;
-
     transform->SetAllIntPoints(&midpoint);
     mfem::Vector face_physical(dimension), one_physical(dimension),
         two_physical(dimension);
     transform->Face->Transform(midpoint, face_physical);
-    mesh.GetElementTransformation(transform->Elem1No)->Transform(
-        transform->GetElement1IntPoint(), one_physical);
-    mesh.GetElementTransformation(transform->Elem2No)->Transform(
-        transform->GetElement2IntPoint(), two_physical);
+    element_one_transform->Transform(transform->GetElement1IntPoint(), one_physical);
+    element_two_transform->Transform(transform->GetElement2IntPoint(), two_physical);
     // Both midpoint coordinates strictly inside the unit square exclude the
     // periodic seams; the generated Cartesian mesh is ordinary conforming.
     if (!(face_physical[0] > 1.0e-12 && face_physical[0] < 1.0 - 1.0e-12 &&
           face_physical[1] > 1.0e-12 && face_physical[1] < 1.0 - 1.0e-12))
     {
+      ++periodic_excluded;
       continue;
     }
+    ++ordinary;
     bool coincident = true;
     const mfem::IntegrationRule& coincidence_rule = mfem::IntRules.Get(
         face_fe->GetGeomType(), experiment.quadrature_order());
@@ -474,10 +503,8 @@ bool FindTwoSidedOrientationCase(const SmoothEulerExperiment& experiment,
       const mfem::IntegrationPoint& point = coincidence_rule.IntPoint(node);
       transform->SetAllIntPoints(&point);
       transform->Face->Transform(point, face_physical);
-      mesh.GetElementTransformation(transform->Elem1No)->Transform(
-          transform->GetElement1IntPoint(), one_physical);
-      mesh.GetElementTransformation(transform->Elem2No)->Transform(
-          transform->GetElement2IntPoint(), two_physical);
+      element_one_transform->Transform(transform->GetElement1IntPoint(), one_physical);
+      element_two_transform->Transform(transform->GetElement2IntPoint(), two_physical);
       for (int coordinate = 0; coordinate < dimension; ++coordinate)
       {
         coincident = coincident &&
@@ -485,15 +512,53 @@ bool FindTwoSidedOrientationCase(const SmoothEulerExperiment& experiment,
             std::abs(face_physical[coordinate] - two_physical[coordinate]) <= 2.0e-14;
       }
     }
-    if (!coincident) continue;
-    selected.face = face;
-    selected.element_one = transform->Elem1No;
-    selected.element_two = transform->Elem2No;
-    selected.element_one_axis = one_axis;
-    selected.element_two_axis = two_axis;
-    return true;
+    if (!coincident)
+    {
+      ++rejected_not_coincident;
+      continue;
+    }
+    ++coincident_faces;
+    ++admitted;
+    // The ascending scan fixes the first admitted face but continues so the
+    // topology census remains deterministic and non-vacuous.
+    if (selected.face < 0)
+    {
+      selected.face = face;
+      selected.element_one = element_one;
+      selected.element_two = element_two;
+      selected.element_one_orientation = element_one_orientation;
+      selected.element_two_orientation = element_two_orientation;
+    }
   }
-  return false;
+  const bool exact_census = faces == 18 && two_sided == 18 && p2 == 18 &&
+      orientation_0_1 == 18 && ordinary == 12 && coincident_faces == 12 &&
+      admitted == 12 && periodic_excluded == 6;
+  if (!exact_census || admitted == 0 || selected.face < 0)
+  {
+    std::cerr << "DETAIL predicate=two_sided_p2_orientation_selector"
+              << " faces=" << faces
+              << " two_sided=" << two_sided
+              << " p2=" << p2
+              << " orientation_0_1=" << orientation_0_1
+              << " ordinary=" << ordinary
+              << " coincident=" << coincident_faces
+              << " admitted=" << admitted
+              << " periodic_excluded=" << periodic_excluded
+              << " rejected_not_local_conforming="
+              << rejected_not_local_conforming
+              << " rejected_invalid_elements=" << rejected_invalid_elements
+              << " rejected_not_p2_segment=" << rejected_not_p2_segment
+              << " rejected_orientation=" << rejected_orientation
+              << " rejected_invalid_transform=" << rejected_invalid_transform
+              << " rejected_not_coincident=" << rejected_not_coincident
+              << " selected=(face=" << selected.face
+              << ",elements=(" << selected.element_one << ','
+              << selected.element_two << "),orientations=("
+              << selected.element_one_orientation << ','
+              << selected.element_two_orientation << "))\n";
+    return false;
+  }
+  return true;
 }
 
 double NormalizedTraceActionError(const std::vector<double>& interior_action,
@@ -970,9 +1035,35 @@ int TestTwoSidedP2OrientationOracle()
   double elem2_correct_error = 0.0;
   double elem2_wrong_normal_error = 0.0;
   double elem2_wrong_permutation_error = 0.0;
+  double reversal_gap = std::numeric_limits<double>::infinity();
+  int elem1_evaluations = 0;
+  int elem2_evaluations = 0;
+  auto report_orientation_controls = [&]()
+  {
+    const double ratio_floor =
+        100.0 * std::max(elem2_correct_error, epsilon);
+    std::cerr << std::setprecision(std::numeric_limits<double>::max_digits10)
+              << "DETAIL predicate=two_sided_p2_orientation_controls"
+              << " correct_error=" << elem2_correct_error
+              << " wrong_normal_error=" << elem2_wrong_normal_error
+              << " wrong_permutation_error=" << elem2_wrong_permutation_error
+              << " reversal_gap=" << reversal_gap
+              << " elem1_evaluations=" << elem1_evaluations
+              << " elem2_evaluations=" << elem2_evaluations
+              << " absolute_threshold=1e-5"
+              << " ratio_floor=" << ratio_floor
+              << " reversal_threshold=0.5\n";
+  };
   const int elements[2] = {orientation.element_one, orientation.element_two};
   for (const int element : elements)
   {
+    if (element == orientation.element_one) ++elem1_evaluations;
+    else if (element == orientation.element_two) ++elem2_evaluations;
+    else
+    {
+      report_orientation_controls();
+      return 15;
+    }
     std::vector<double> base_interior, base_trace;
     if (!ExtractElementCoefficients(experiment, element, base_interior, base_trace))
       return 5;
@@ -996,10 +1087,23 @@ int TestTwoSidedP2OrientationOracle()
             offsets[node] * (1.0 + 0.25 * component);
       }
     NormalizeInfinity(trace_direction);
+    double local_reversal_gap = 0.0;
+    for (int component = 0; component < conserved_components; ++component)
+      for (int node = 0; node < 3; ++node)
+      {
+        local_reversal_gap = std::max(local_reversal_gap, std::abs(
+            trace_direction[trace_offset + node + 3 * component] -
+            trace_direction[trace_offset + (2 - node) + 3 * component]));
+      }
+    reversal_gap = std::min(reversal_gap, local_reversal_gap);
     if (trace_direction[trace_offset] == trace_direction[trace_offset + 1] ||
         trace_direction[trace_offset + 1] == trace_direction[trace_offset + 2] ||
         trace_direction[trace_offset] == trace_direction[trace_offset + 2] ||
-        InfinityNorm(trace_direction) != 1.0) return 7;
+        InfinityNorm(trace_direction) != 1.0)
+    {
+      report_orientation_controls();
+      return 7;
+    }
     const double step = std::cbrt(epsilon) *
         std::max({1.0, InfinityNorm(base_interior), InfinityNorm(base_trace)});
 
@@ -1089,12 +1193,16 @@ int TestTwoSidedP2OrientationOracle()
         InfinityNorm(d_action), InfinityNorm(correct_r), InfinityNorm(correct_g)});
     const double trace_tolerance = 2.0e-6 * trace_scale +
         256.0 * epsilon * q_scale / step;
+    if (element == orientation.element_two) elem2_correct_error = correct_error;
     if (!std::isfinite(correct_error) ||
         DifferenceNorm(correct_r, b_action) > trace_tolerance ||
-        DifferenceNorm(correct_g, d_action) > trace_tolerance) return 12;
+        DifferenceNorm(correct_g, d_action) > trace_tolerance)
+    {
+      report_orientation_controls();
+      return 12;
+    }
     if (element == orientation.element_two)
     {
-      elem2_correct_error = correct_error;
       std::vector<double> mutated_r, mutated_g;
       elem2_wrong_normal_error = trace_action_error(
           OrientationMutation::wrong_elem2_normal, mutated_r, mutated_g);
@@ -1102,13 +1210,31 @@ int TestTwoSidedP2OrientationOracle()
           OrientationMutation::wrong_elem2_permutation, mutated_r, mutated_g);
     }
   }
+  if (elem1_evaluations != 1 || elem2_evaluations != 1)
+  {
+    report_orientation_controls();
+    return 15;
+  }
+  if (!(reversal_gap > 0.5))
+  {
+    report_orientation_controls();
+    return 7;
+  }
   const double ratio_floor = 100.0 * std::max(elem2_correct_error, epsilon);
   if (!std::isfinite(elem2_wrong_normal_error) ||
       elem2_wrong_normal_error < 1.0e-5 ||
-      elem2_wrong_normal_error < ratio_floor) return 13;
+      elem2_wrong_normal_error < ratio_floor)
+  {
+    report_orientation_controls();
+    return 13;
+  }
   if (!std::isfinite(elem2_wrong_permutation_error) ||
       elem2_wrong_permutation_error < 1.0e-5 ||
-      elem2_wrong_permutation_error < ratio_floor) return 14;
+      elem2_wrong_permutation_error < ratio_floor)
+  {
+    report_orientation_controls();
+    return 14;
+  }
   return 0;
 }
 
