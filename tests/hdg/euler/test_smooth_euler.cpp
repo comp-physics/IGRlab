@@ -555,9 +555,11 @@ bool AssembleIndependentAnalyticBlocks(
                 shape[row_node] * shape[column_node] / backward_euler_dt : 0.0;
             a[static_cast<std::size_t>(row) * ni + column] += weight *
                 (mass - derivative(row_node, 0) *
-                            x_jacobian[row_component][column_component] -
+                            x_jacobian[row_component][column_component] *
+                            shape[column_node] -
                         derivative(row_node, 1) *
-                            y_jacobian[row_component][column_component]);
+                            y_jacobian[row_component][column_component] *
+                            shape[column_node]);
           }
   }
 
@@ -2307,11 +2309,14 @@ bool IndependentContinuousErrors(const IndependentContext& context,
       transformation->SetIntPoint(&point);
       mfem::Vector scaled_normal(dimension);
       mfem::CalcOrtho(transformation->Jacobian(), scaled_normal);
-      const double face_jacobian = scaled_normal.Norml2();
-      if (!(face_jacobian > 0.0) || !std::isfinite(face_jacobian)) return false;
+      const double normal_magnitude = scaled_normal.Norml2();
+      if (!(normal_magnitude > 0.0) || !std::isfinite(normal_magnitude))
+      {
+        return false;
+      }
       const std::array<double, dimension> normal{{
-          scaled_normal[0] / face_jacobian,
-          scaled_normal[1] / face_jacobian}};
+          scaled_normal[0] / normal_magnitude,
+          scaled_normal[1] / normal_magnitude}};
       if (!std::isfinite(normal[0]) || !std::isfinite(normal[1])) return false;
       mfem::Vector physical(dimension);
       transformation->Transform(point, physical);
@@ -2320,7 +2325,9 @@ bool IndependentContinuousErrors(const IndependentContext& context,
       if (!InterpolateOracleState(local_trace, fe->GetDof(), 0, shape,
                                   numerical) ||
           !OracleExactConservative(physical[0], physical[1], exact)) return false;
-      const double weight = point.weight * face_jacobian;
+      const double face_weight = transformation->Weight();
+      if (!(face_weight > 0.0) || !std::isfinite(face_weight)) return false;
+      const double weight = point.weight * face_weight;
       if (!(weight > 0.0) || !std::isfinite(weight)) return false;
       face_measure += weight;
       trace_measure += weight;
@@ -2784,9 +2791,12 @@ bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
   {
     return false;
   }
-  for (const auto& linear : solved.linear_history)
+  for (std::size_t iteration = 0; iteration < solved.linear_history.size();
+       ++iteration)
   {
+    const auto& linear = solved.linear_history[iteration];
     if (linear.status != ExperimentStatus::Success ||
+        linear.nonlinear_iteration != static_cast<int>(iteration) ||
         linear.gmres_iterations < 0 ||
         !std::isfinite(linear.right_hand_side_norm) ||
         !(linear.right_hand_side_norm >= 0.0) ||
@@ -2798,6 +2808,16 @@ bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
   }
 
   if (!FiniteVector(solved.residual_history)) return false;
+  const bool residual_after_first_above_convergence =
+      solved.residual_history[1] >
+          1.0e-10 * (1.0 + solved.residual_history.front());
+  if (!Close(solved.newton.residual_after_first_accepted,
+             solved.residual_history[1], 4096.0 * experiment_epsilon) ||
+      solved.newton.residual_after_first_above_convergence !=
+          residual_after_first_above_convergence)
+  {
+    return false;
+  }
   int accepted_history = 0, rejected_history = 0, reassembly_history = 0;
   int linear_iterations = 0;
   for (const auto& linear : solved.linear_history)
@@ -2833,6 +2853,7 @@ bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
     {
       ++accepted_history;
       if (trial.rejection_reason != TrialRejectionReason::None ||
+          trial.admissibility.reason != TrialRejectionReason::None ||
           !trial.admissibility.passed || !trial.reassembly_attempted ||
           !trial.residual_evaluated || !trial.trial_residual_present ||
           !trial.generation_published || trial.generation_discarded ||
@@ -2858,7 +2879,8 @@ bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
     else if (trial.rejection_reason == TrialRejectionReason::Armijo)
     {
       ++rejected_history;
-      if (!trial.admissibility.passed || !trial.reassembly_attempted ||
+      if (trial.admissibility.reason != TrialRejectionReason::None ||
+          !trial.admissibility.passed || !trial.reassembly_attempted ||
           !trial.residual_evaluated || !trial.trial_residual_present ||
           !std::isfinite(trial.trial_residual) ||
           trial.trial_residual <= trial.armijo_boundary ||
@@ -2868,7 +2890,14 @@ bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
     else
     {
       ++rejected_history;
-      if (trial.admissibility.passed || trial.reassembly_attempted ||
+      const bool named_prescreen_rejection =
+          trial.rejection_reason == TrialRejectionReason::Nonfinite ||
+          trial.rejection_reason == TrialRejectionReason::Density ||
+          trial.rejection_reason == TrialRejectionReason::Pressure ||
+          trial.rejection_reason == TrialRejectionReason::WaveSpeed;
+      if (!named_prescreen_rejection ||
+          trial.rejection_reason != trial.admissibility.reason ||
+          trial.admissibility.passed || trial.reassembly_attempted ||
           trial.residual_evaluated || trial.trial_residual_present ||
           !trial.generation_discarded || trial.generation_published) return false;
       ++expected_trial_index;
@@ -2914,6 +2943,37 @@ bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
         !std::isfinite(audit.coefficient_update) ||
         !std::isfinite(audit.jacobian_change) ||
         !std::isfinite(audit.formula_identity_error)) return false;
+    const auto earliest_trial = std::find_if(
+        solved.trial_history.begin(), solved.trial_history.end(),
+        [&audit](const auto& trial) { return trial.accepted == audit.accepted; });
+    if (earliest_trial == solved.trial_history.end() ||
+        audit.nonlinear_iteration != earliest_trial->nonlinear_iteration ||
+        audit.trial_index != earliest_trial->trial_index ||
+        audit.alpha != earliest_trial->alpha ||
+        audit.base_residual != earliest_trial->base_residual ||
+        audit.armijo_boundary != earliest_trial->armijo_boundary ||
+        audit.trial_residual != earliest_trial->trial_residual ||
+        audit.coefficient_update != earliest_trial->coefficient_update ||
+        audit.jacobian_change != earliest_trial->jacobian_change ||
+        audit.admissibility.passed != earliest_trial->admissibility.passed ||
+        audit.admissibility.reason != earliest_trial->admissibility.reason ||
+        audit.admissibility.minimum_density !=
+            earliest_trial->admissibility.minimum_density ||
+        audit.admissibility.minimum_pressure !=
+            earliest_trial->admissibility.minimum_pressure ||
+        audit.admissibility.maximum_wave_speed !=
+            earliest_trial->admissibility.maximum_wave_speed ||
+        audit.status != earliest_trial->status ||
+        audit.rejection_reason != earliest_trial->rejection_reason ||
+        audit.reassembly_attempted != earliest_trial->reassembly_attempted ||
+        audit.residual_evaluated != earliest_trial->residual_evaluated ||
+        audit.residual_evaluated != earliest_trial->trial_residual_present ||
+        audit.accepted != earliest_trial->accepted ||
+        audit.generation_published != earliest_trial->generation_published ||
+        audit.generation_discarded != earliest_trial->generation_discarded)
+    {
+      return false;
+    }
     const double scale = std::max({1.0, InfinityNorm(audit.base_interior),
                                    InfinityNorm(audit.base_trace),
                                    InfinityNorm(audit.trial_interior),

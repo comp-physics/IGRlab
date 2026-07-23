@@ -1968,10 +1968,14 @@ bool SmoothEulerExperiment::IntegrateErrorEvidence(
       transformation->SetIntPoint(&point);
       mfem::Vector scaled_normal(dimension);
       mfem::CalcOrtho(transformation->Jacobian(), scaled_normal);
-      const double face_measure = scaled_normal.Norml2();
-      if (!(face_measure > 0.0) || !std::isfinite(face_measure)) return false;
+      const double normal_magnitude = scaled_normal.Norml2();
+      if (!(normal_magnitude > 0.0) || !std::isfinite(normal_magnitude))
+      {
+        return false;
+      }
       const std::array<double, dimension> normal{{
-          scaled_normal[0] / face_measure, scaled_normal[1] / face_measure}};
+          scaled_normal[0] / normal_magnitude,
+          scaled_normal[1] / normal_magnitude}};
       if (!IsFinite(normal)) return false;
       mfem::Vector physical(dimension);
       transformation->Transform(point, physical);
@@ -1983,8 +1987,10 @@ bool SmoothEulerExperiment::IntegrateErrorEvidence(
       {
         return false;
       }
-      // CalcOrtho supplies and normalizes the physical normal; its norm is the
-      // face Jacobian and is applied exactly once to each unique face.
+      // CalcOrtho validates and normalizes the physical normal.  The face
+      // transformation supplies the unique-face quadrature measure once.
+      const double face_measure = transformation->Weight();
+      if (!(face_measure > 0.0) || !std::isfinite(face_measure)) return false;
       const double weight = point.weight * face_measure;
       if (!(weight > 0.0) || !std::isfinite(weight)) return false;
       trace_measure += weight;
@@ -2878,8 +2884,10 @@ bool RunSmoothEulerExperiment(ExperimentEvidence& evidence)
   RollbackAuditEvidence rollback{};
   if (!run_rollback_probe(rollback_experiment, rollback))
   {
-    evidence.status = rollback.status == ExperimentStatus::Success ?
-        ExperimentStatus::EvidenceConsistencyFailure : rollback.status;
+    const bool hard_failure = rollback.status != ExperimentStatus::Success &&
+        rollback.status != ExperimentStatus::IterationLimit;
+    evidence.status = hard_failure ? rollback.status :
+        ExperimentStatus::EvidenceConsistencyFailure;
     evidence.rollback = std::move(rollback);
     return false;
   }
