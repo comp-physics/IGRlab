@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <cstdint>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 
@@ -194,6 +197,10 @@ struct PipelinePhaseState
   mfem::Vector* trace_rhs = nullptr;
   mfem::Vector* trace_increment = nullptr;
   std::unique_ptr<PermutedFaceBlockILU>* trace_preconditioner = nullptr;
+  int gmres_iterations = 0;
+  double reported_relative_residual = 0.0;
+  double true_relative_residual = 0.0;
+  bool gmres_converged = false, linear_residual_valid = false;
   bool residual_published = false, jacobian_published = false,
        condensed = false, assembled = false, solved = false, recovered_state = false;
 };
@@ -432,6 +439,11 @@ struct SmoothEulerTraceSolvePhase
   {
     result = {};
     state->solved = false;
+    state->gmres_iterations = 0;
+    state->reported_relative_residual = 0.0;
+    state->true_relative_residual = 0.0;
+    state->gmres_converged = false;
+    state->linear_residual_valid = false;
     if (state->trace_matrix == nullptr || !*state->trace_matrix ||
         state->trace_solve_matrix == nullptr ||
         state->trace_increment == nullptr || state->trace_preconditioner == nullptr ||
@@ -479,7 +491,19 @@ struct SmoothEulerTraceSolvePhase
       }
       candidate_increment = 0.0;
       gmres.Mult(rhs, candidate_increment);
-      if (!gmres.GetConverged()) { return; }
+      state->gmres_iterations = gmres.GetNumIterations();
+      state->reported_relative_residual = gmres.GetFinalRelNorm();
+      state->gmres_converged = gmres.GetConverged();
+      if (!state->gmres_converged) { return; }
+      mfem::Vector action(global_dofs);
+      candidate_solve_matrix->Mult(candidate_increment, action);
+      action -= rhs;
+      state->true_relative_residual =
+          action.Norml2() / std::max(rhs.Norml2(), 1.0e-300);
+      state->linear_residual_valid =
+          std::isfinite(state->true_relative_residual) &&
+          state->true_relative_residual <= 1.0e-10;
+      if (!state->linear_residual_valid) { return; }
       *state->trace_increment = candidate_increment;
       *state->trace_solve_matrix = std::move(candidate_solve_matrix);
       *state->trace_preconditioner = std::move(candidate_preconditioner);
@@ -545,6 +569,232 @@ using SmoothEulerPipeline = Pipeline<SmoothEulerSpec, SmoothEulerLocalPhase,
                                     SmoothEulerAssemblyPhase,
                                     SmoothEulerTraceSolvePhase,
                                     SmoothEulerRecoveryPhase>;
+
+std::vector<double> GridValues(const mfem::GridFunction& field)
+{
+  return std::vector<double>(field.GetData(), field.GetData() + field.Size());
+}
+
+bool AssignGridValues(mfem::GridFunction& field,
+                      const std::vector<double>& values)
+{
+  if (field.Size() != static_cast<int>(values.size())) return false;
+  std::copy(values.begin(), values.end(), field.GetData());
+  return true;
+}
+
+std::uint64_t HashValues(const std::vector<double>& values) noexcept
+{
+  constexpr std::uint64_t offset = UINT64_C(1469598103934665603);
+  constexpr std::uint64_t prime = UINT64_C(1099511628211);
+  std::uint64_t hash = offset;
+  const auto* bytes = reinterpret_cast<const unsigned char*>(values.data());
+  for (std::size_t byte = 0; byte < values.size() * sizeof(double); ++byte)
+  {
+    hash ^= bytes[byte];
+    hash *= prime;
+  }
+  return hash;
+}
+
+double MaxAbsDifference(const std::vector<double>& first,
+                        const std::vector<double>& second) noexcept
+{
+  if (first.size() != second.size())
+  {
+    return std::numeric_limits<double>::infinity();
+  }
+  double result = 0.0;
+  for (std::size_t index = 0; index < first.size(); ++index)
+  {
+    result = std::max(result, std::abs(first[index] - second[index]));
+  }
+  return result;
+}
+
+double ResidualNorm(const std::vector<double>& interior_residual,
+                    const std::vector<double>& trace_residual,
+                    const std::vector<int>& signed_trace_dofs,
+                    const int global_trace_dofs)
+{
+  if (trace_residual.size() != signed_trace_dofs.size() ||
+      global_trace_dofs <= 0)
+  {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  long double squared = 0.0L;
+  for (const double value : interior_residual)
+  {
+    squared += static_cast<long double>(value) * value;
+  }
+  std::vector<double> unique_trace(static_cast<std::size_t>(global_trace_dofs), 0.0);
+  for (std::size_t local = 0; local < trace_residual.size(); ++local)
+  {
+    double sign = 1.0;
+    const int global = DecodeSignedVDof(signed_trace_dofs[local], sign);
+    if (global < 0 || global >= global_trace_dofs)
+    {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    unique_trace[global] += sign * trace_residual[local];
+  }
+  for (const double value : unique_trace)
+  {
+    squared += static_cast<long double>(value) * value;
+  }
+  return std::sqrt(static_cast<double>(squared));
+}
+
+void ObserveAdmissibility(const ConservedState& state,
+                          bool& nonfinite, bool& density, bool& pressure,
+                          bool& wave_speed, AdmissibilityEvidence& evidence)
+{
+  if (!IsFinite(state))
+  {
+    nonfinite = true;
+    return;
+  }
+  evidence.minimum_density = std::min(evidence.minimum_density, state[0]);
+  if (!(state[0] >= 1.0e-8))
+  {
+    density = true;
+    return;
+  }
+  const double kinetic = 0.5 * (state[1] * state[1] + state[2] * state[2]) /
+                         state[0];
+  const double p = (gamma - 1.0) * (state[3] - kinetic);
+  if (!std::isfinite(p))
+  {
+    nonfinite = true;
+    return;
+  }
+  evidence.minimum_pressure = std::min(evidence.minimum_pressure, p);
+  if (!(p >= 1.0e-8))
+  {
+    pressure = true;
+    return;
+  }
+  const double speed = std::hypot(state[1] / state[0], state[2] / state[0]) +
+                       std::sqrt(gamma * p / state[0]);
+  if (!std::isfinite(speed))
+  {
+    nonfinite = true;
+    return;
+  }
+  evidence.maximum_wave_speed = std::max(evidence.maximum_wave_speed, speed);
+  if (!(speed < fixed_scalar_tau)) wave_speed = true;
+}
+
+bool PrescreenFields(mfem::Mesh& mesh,
+                     const mfem::FiniteElementSpace& interior_space,
+                     const mfem::FiniteElementSpace& trace_space,
+                     const mfem::GridFunction& interior,
+                     const mfem::GridFunction& trace,
+                     const int quadrature_order,
+                     AdmissibilityEvidence& evidence)
+{
+  evidence = {};
+  evidence.minimum_density = std::numeric_limits<double>::infinity();
+  evidence.minimum_pressure = std::numeric_limits<double>::infinity();
+  bool nonfinite = false, density = false, pressure = false, wave_speed = false;
+  for (int element = 0; element < mesh.GetNE(); ++element)
+  {
+    const mfem::FiniteElement* fe = interior_space.GetFE(element);
+    mfem::ElementTransformation* transformation =
+        mesh.GetElementTransformation(element);
+    if (fe == nullptr || transformation == nullptr) return false;
+    mfem::Array<int> interior_vdofs;
+    interior_space.GetElementVDofs(element, interior_vdofs);
+    mfem::Vector shape(fe->GetDof());
+    const mfem::IntegrationRule& volume_rule =
+        mfem::IntRules.Get(fe->GetGeomType(), quadrature_order);
+    for (int q = 0; q < volume_rule.GetNPoints(); ++q)
+    {
+      fe->CalcShape(volume_rule.IntPoint(q), shape);
+      ConservedState state{};
+      if (!InterpolateByNodes(interior, interior_vdofs, shape, state))
+      {
+        nonfinite = true;
+      }
+      else
+      {
+        ObserveAdmissibility(state, nonfinite, density, pressure, wave_speed,
+                             evidence);
+      }
+    }
+
+    mfem::Array<int> faces, orientations;
+    mesh.GetElementEdges(element, faces, orientations);
+    for (int local_face = 0; local_face < faces.Size(); ++local_face)
+    {
+      mfem::FaceElementTransformations* face_transform =
+          mesh.GetFaceElementTransformations(faces[local_face]);
+      if (face_transform == nullptr || face_transform->Face == nullptr ||
+          face_transform->Elem1 == nullptr || face_transform->Elem2 == nullptr)
+      {
+        return false;
+      }
+      const bool first = face_transform->Elem1No == element;
+      if (!first && face_transform->Elem2No != element) return false;
+      const mfem::FiniteElement* trace_fe =
+          trace_space.GetFaceElement(faces[local_face]);
+      if (trace_fe == nullptr) return false;
+      const mfem::IntegrationRule& face_rule =
+          mfem::IntRules.Get(trace_fe->GetGeomType(), quadrature_order);
+      for (int q = 0; q < face_rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& face_point = face_rule.IntPoint(q);
+        face_transform->SetAllIntPoints(&face_point);
+        const mfem::IntegrationPoint& element_point = first ?
+            face_transform->GetElement1IntPoint() :
+            face_transform->GetElement2IntPoint();
+        fe->CalcShape(element_point, shape);
+        ConservedState state{};
+        if (!InterpolateByNodes(interior, interior_vdofs, shape, state))
+        {
+          nonfinite = true;
+        }
+        else
+        {
+          ObserveAdmissibility(state, nonfinite, density, pressure, wave_speed,
+                               evidence);
+        }
+      }
+    }
+  }
+  for (int face = 0; face < mesh.GetNumFaces(); ++face)
+  {
+    const mfem::FiniteElement* fe = trace_space.GetFaceElement(face);
+    if (fe == nullptr) return false;
+    mfem::Array<int> vdofs;
+    trace_space.GetFaceVDofs(face, vdofs);
+    mfem::Vector shape(fe->GetDof());
+    const mfem::IntegrationRule& rule =
+        mfem::IntRules.Get(fe->GetGeomType(), quadrature_order);
+    for (int q = 0; q < rule.GetNPoints(); ++q)
+    {
+      fe->CalcShape(rule.IntPoint(q), shape);
+      ConservedState state{};
+      if (!InterpolateByNodes(trace, vdofs, shape, state))
+      {
+        nonfinite = true;
+      }
+      else
+      {
+        ObserveAdmissibility(state, nonfinite, density, pressure, wave_speed,
+                             evidence);
+      }
+    }
+  }
+  if (!std::isfinite(evidence.minimum_density)) evidence.minimum_density = 0.0;
+  if (!std::isfinite(evidence.minimum_pressure)) evidence.minimum_pressure = 0.0;
+  evidence.reason = nonfinite ? TrialRejectionReason::Nonfinite :
+      density ? TrialRejectionReason::Density :
+      pressure ? TrialRejectionReason::Pressure :
+      wave_speed ? TrialRejectionReason::WaveSpeed : TrialRejectionReason::None;
+  evidence.passed = evidence.reason == TrialRejectionReason::None;
+  return true;
+}
 
 } // namespace
 
@@ -733,6 +983,8 @@ struct SmoothEulerExperiment::Implementation
   std::unique_ptr<mfem::FiniteElementSpace> trace_space;
   std::unique_ptr<mfem::GridFunction> old_interior;
   std::unique_ptr<mfem::GridFunction> old_trace;
+  std::unique_ptr<mfem::GridFunction> current_interior;
+  std::unique_ptr<mfem::GridFunction> current_trace;
   std::unique_ptr<mfem::SparseMatrix> trace_matrix;
   std::unique_ptr<mfem::SparseMatrix> trace_solve_matrix;
   mfem::Vector trace_rhs, trace_increment;
@@ -741,13 +993,44 @@ struct SmoothEulerExperiment::Implementation
   std::vector<double> schur, reduced_rhs, schur_action, recovered, global_matrix;
   std::unique_ptr<PermutedFaceBlockILU> trace_preconditioner;
   core::HostReferenceEngine condensation;
-  int local_interior = 0, local_trace = 0, elements = 0, trace_face_block_size = 0;
+  int local_interior = 0, local_trace = 0, elements = 0,
+      elements_per_direction = 0, trace_face_block_size = 0;
   std::vector<int> trace_permutation;
   std::size_t generation = 0, linearization_generation = 0,
               condensation_generation = 0, solve_generation = 0,
               recovery_generation = 0;
   PipelinePhaseState pipeline_state{};
   std::unique_ptr<SmoothEulerPipeline> pipeline;
+  SolvedMeshEvidence solved_evidence{};
+  bool has_solved_evidence = false;
+
+  void InvalidateNumericalState()
+  {
+    ++generation;
+    linearization_generation = 0;
+    condensation_generation = 0;
+    solve_generation = 0;
+    recovery_generation = 0;
+    residual_r.clear();
+    residual_g.clear();
+    a.clear();
+    b.clear();
+    c.clear();
+    d.clear();
+    f.clear();
+    g.clear();
+    schur.clear();
+    reduced_rhs.clear();
+    schur_action.clear();
+    recovered.clear();
+    global_matrix.clear();
+    trace_matrix.reset();
+    trace_solve_matrix.reset();
+    trace_rhs.SetSize(0);
+    trace_increment.SetSize(0);
+    trace_preconditioner.reset();
+    pipeline_state = {};
+  }
 };
 
 SmoothEulerExperiment::SmoothEulerExperiment(const int polynomial_order)
@@ -815,6 +1098,7 @@ bool SmoothEulerExperiment::BuildPeriodicMesh(const int elements_per_direction)
         candidate->mesh.get(), candidate->trace_collection.get(),
         conserved_components, mfem::Ordering::byNODES);
     candidate->elements = candidate->mesh->GetNE();
+    candidate->elements_per_direction = elements_per_direction;
     const mfem::FiniteElement* interior_fe = candidate->interior_space->GetFE(0);
     if (interior_fe == nullptr || interior_fe->GetDof() <= 0) { return false; }
     candidate->local_interior = conserved_components * interior_fe->GetDof();
@@ -907,30 +1191,8 @@ bool SmoothEulerExperiment::ProjectOldStage()
 {
   // A reprojection attempt immediately makes any prior local linearization
   // stale.  Candidate fields remain private until the projection succeeds.
-  ++implementation_->generation;
-  implementation_->linearization_generation = 0;
-  implementation_->condensation_generation = 0;
-  implementation_->solve_generation = 0;
-  implementation_->recovery_generation = 0;
-  implementation_->residual_r.clear();
-  implementation_->residual_g.clear();
-  implementation_->a.clear();
-  implementation_->b.clear();
-  implementation_->c.clear();
-  implementation_->d.clear();
-  implementation_->f.clear();
-  implementation_->g.clear();
-  implementation_->schur.clear();
-  implementation_->reduced_rhs.clear();
-  implementation_->schur_action.clear();
-  implementation_->global_matrix.clear();
-  implementation_->trace_matrix.reset();
-  implementation_->trace_solve_matrix.reset();
-  implementation_->trace_rhs.SetSize(0);
-  implementation_->trace_preconditioner.reset();
-  implementation_->trace_increment.SetSize(0);
-  implementation_->recovered.clear();
-  implementation_->pipeline_state = {};
+  implementation_->InvalidateNumericalState();
+  implementation_->has_solved_evidence = false;
   if (!implementation_->mesh || !implementation_->interior_space ||
       !implementation_->trace_space) { return false; }
   auto coefficient = [](const mfem::Vector& point, mfem::Vector& value)
@@ -948,6 +1210,8 @@ bool SmoothEulerExperiment::ProjectOldStage()
   };
   std::unique_ptr<mfem::GridFunction> candidate_interior;
   std::unique_ptr<mfem::GridFunction> candidate_trace;
+  std::unique_ptr<mfem::GridFunction> candidate_current_interior;
+  std::unique_ptr<mfem::GridFunction> candidate_current_trace;
   try
   {
     mfem::VectorFunctionCoefficient exact(conserved_components, coefficient);
@@ -989,6 +1253,12 @@ bool SmoothEulerExperiment::ProjectOldStage()
         }
       }
     }
+    candidate_current_interior =
+        std::make_unique<mfem::GridFunction>(implementation_->interior_space.get());
+    candidate_current_trace =
+        std::make_unique<mfem::GridFunction>(implementation_->trace_space.get());
+    *candidate_current_interior = *candidate_interior;
+    *candidate_current_trace = *candidate_trace;
   }
   catch (const std::exception&)
   {
@@ -996,6 +1266,96 @@ bool SmoothEulerExperiment::ProjectOldStage()
   }
   implementation_->old_interior = std::move(candidate_interior);
   implementation_->old_trace = std::move(candidate_trace);
+  implementation_->current_interior = std::move(candidate_current_interior);
+  implementation_->current_trace = std::move(candidate_current_trace);
+  return true;
+}
+
+bool SmoothEulerExperiment::ProjectPerturbedCurrentStage()
+{
+  implementation_->InvalidateNumericalState();
+  implementation_->has_solved_evidence = false;
+  if (!implementation_->mesh || !implementation_->interior_space ||
+      !implementation_->trace_space || !implementation_->old_interior ||
+      !implementation_->old_trace)
+  {
+    return false;
+  }
+  auto perturbed = [](const mfem::Vector& point, mfem::Vector& value)
+  {
+    PrimitiveState primitive{};
+    if (!ManufacturedPrimitive(point[0], point[1], primitive).ok())
+    {
+      throw std::runtime_error("manufactured primitive failed");
+    }
+    const double psi_one = std::sin(2.0 * pi * point[0]) *
+                           std::cos(2.0 * pi * point[1]);
+    const double psi_two = std::cos(2.0 * pi * point[0]) *
+                           std::sin(2.0 * pi * point[1]);
+    const double psi_three = std::sin(2.0 * pi * (point[0] + point[1]));
+    primitive[0] *= 1.0 + 0.04 * psi_one;
+    primitive[1] += 0.03 * psi_two;
+    primitive[2] -= 0.03 * psi_one;
+    primitive[3] *= 1.0 + 0.04 * psi_three;
+    ConservedState conservative{};
+    if (!ConservativeFromPrimitive(primitive, conservative).ok())
+    {
+      throw std::runtime_error("perturbed primitive failed");
+    }
+    value.SetSize(conserved_components);
+    for (int component = 0; component < conserved_components; ++component)
+    {
+      value[component] = conservative[component];
+    }
+  };
+  std::unique_ptr<mfem::GridFunction> candidate_interior;
+  std::unique_ptr<mfem::GridFunction> candidate_trace;
+  try
+  {
+    mfem::VectorFunctionCoefficient coefficient(conserved_components, perturbed);
+    candidate_interior =
+        std::make_unique<mfem::GridFunction>(implementation_->interior_space.get());
+    candidate_trace =
+        std::make_unique<mfem::GridFunction>(implementation_->trace_space.get());
+    candidate_interior->ProjectCoefficient(coefficient);
+    for (int face = 0; face < implementation_->mesh->GetNumFaces(); ++face)
+    {
+      const mfem::FiniteElement* face_fe =
+          implementation_->trace_space->GetFaceElement(face);
+      mfem::ElementTransformation* face_transformation =
+          implementation_->mesh->GetFaceTransformation(face);
+      if (face_fe == nullptr || face_transformation == nullptr) return false;
+      const int face_scalar_dofs = face_fe->GetDof();
+      mfem::Array<int> face_vdofs;
+      implementation_->trace_space->GetFaceVDofs(face, face_vdofs);
+      if (face_scalar_dofs <= 0 ||
+          face_vdofs.Size() != conserved_components * face_scalar_dofs)
+      {
+        return false;
+      }
+      const mfem::IntegrationRule& nodes = face_fe->GetNodes();
+      for (int scalar = 0; scalar < face_scalar_dofs; ++scalar)
+      {
+        mfem::Vector point(dimension), value(conserved_components);
+        face_transformation->Transform(nodes.IntPoint(scalar), point);
+        perturbed(point, value);
+        for (int component = 0; component < conserved_components; ++component)
+        {
+          const int local = ByNodesIndex(scalar, face_scalar_dofs, component);
+          double sign = 1.0;
+          const int vdof = DecodeSignedVDof(face_vdofs[local], sign);
+          if (vdof < 0 || vdof >= candidate_trace->Size()) return false;
+          (*candidate_trace)[vdof] = sign * value[component];
+        }
+      }
+    }
+  }
+  catch (const std::exception&)
+  {
+    return false;
+  }
+  implementation_->current_interior = std::move(candidate_interior);
+  implementation_->current_trace = std::move(candidate_trace);
   return true;
 }
 
@@ -1003,32 +1363,10 @@ bool SmoothEulerExperiment::AssembleLinearization()
 {
   // An assembly attempt is a new generation.  Invalidate and erase the old
   // snapshot first so every failure path rejects stale data atomically.
-  ++implementation_->generation;
-  implementation_->linearization_generation = 0;
-  implementation_->condensation_generation = 0;
-  implementation_->solve_generation = 0;
-  implementation_->recovery_generation = 0;
-  implementation_->residual_r.clear();
-  implementation_->residual_g.clear();
-  implementation_->a.clear();
-  implementation_->b.clear();
-  implementation_->c.clear();
-  implementation_->d.clear();
-  implementation_->f.clear();
-  implementation_->g.clear();
-  implementation_->schur.clear();
-  implementation_->reduced_rhs.clear();
-  implementation_->schur_action.clear();
-  implementation_->global_matrix.clear();
-  implementation_->trace_matrix.reset();
-  implementation_->trace_solve_matrix.reset();
-  implementation_->trace_rhs.SetSize(0);
-  implementation_->trace_preconditioner.reset();
-  implementation_->trace_increment.SetSize(0);
-  implementation_->recovered.clear();
-  implementation_->pipeline_state = {};
+  implementation_->InvalidateNumericalState();
   if (!implementation_->mesh || !implementation_->old_interior ||
-      !implementation_->old_trace || implementation_->local_interior <= 0 ||
+      !implementation_->old_trace || !implementation_->current_interior ||
+      !implementation_->current_trace || implementation_->local_interior <= 0 ||
       implementation_->local_trace <= 0) return false;
   const int ni = implementation_->local_interior;
   const int nt = implementation_->local_trace;
@@ -1062,13 +1400,16 @@ bool SmoothEulerExperiment::AssembleLinearization()
       mfem::DenseMatrix derivative(scalar_dofs, dimension);
       fe.CalcShape(point, shape);
       fe.CalcPhysDShape(transformation, derivative);
-      ConservedState state{};
+      ConservedState state{}, old_state{};
       ConservedState source{};
       FluxVector flux_x{};
       FluxVector flux_y{};
       FluxJacobian jacobian_x{};
       FluxJacobian jacobian_y{};
-      if (!InterpolateByNodes(*implementation_->old_interior, interior_vdofs, shape, state) ||
+      if (!InterpolateByNodes(*implementation_->current_interior, interior_vdofs,
+                              shape, state) ||
+          !InterpolateByNodes(*implementation_->old_interior, interior_vdofs,
+                              shape, old_state) ||
           !ManufacturedSource(physical[0], physical[1], source).ok() ||
           !NormalFlux(state, {{1.0, 0.0}}, flux_x).ok() ||
           !NormalFlux(state, {{0.0, 1.0}}, flux_y).ok() ||
@@ -1080,9 +1421,12 @@ bool SmoothEulerExperiment::AssembleLinearization()
         for (int component = 0; component < conserved_components; ++component)
         {
           const int local_row = ByNodesIndex(row, scalar_dofs, component);
-          const double residual = -weight *
-              (derivative(row, 0) * flux_x[component] +
-               derivative(row, 1) * flux_y[component] + shape[row] * source[component]);
+          const double residual = weight *
+              (shape[row] * (state[component] - old_state[component]) /
+                   backward_euler_dt -
+               derivative(row, 0) * flux_x[component] -
+               derivative(row, 1) * flux_y[component] -
+               shape[row] * source[component]);
           candidate_r[static_cast<std::size_t>(element) * ni + local_row] += residual;
         }
         for (int column = 0; column < scalar_dofs; ++column)
@@ -1153,9 +1497,9 @@ bool SmoothEulerExperiment::AssembleLinearization()
         ConservedState interior_state{}, trace_state{};
         FluxVector trace_flux{};
         FluxJacobian trace_jacobian{};
-        if (!InterpolateByNodes(*implementation_->old_interior, interior_vdofs,
+        if (!InterpolateByNodes(*implementation_->current_interior, interior_vdofs,
                                 interior_shape, interior_state) ||
-            !InterpolateByNodes(*implementation_->old_trace, face_vdofs,
+            !InterpolateByNodes(*implementation_->current_trace, face_vdofs,
                                 trace_shape, trace_state) ||
             !NormalFlux(trace_state, unit_normal, trace_flux).ok() ||
             !NormalFluxJacobian(trace_state, unit_normal, trace_jacobian).ok()) return false;
@@ -1475,18 +1819,695 @@ bool SmoothEulerExperiment::RecoverInterior()
 
 bool SmoothEulerExperiment::SolveDampedNewton(NewtonEvidence& evidence)
 {
+  implementation_->solved_evidence = {};
+  const bool success = SolveNewtonTransaction(
+      evidence, &implementation_->solved_evidence, 20);
+  implementation_->has_solved_evidence = success;
+  return success;
+}
+
+bool SmoothEulerExperiment::IntegrateErrorEvidence(
+    const int quadrature_order, ErrorIntegralEvidence& volume,
+    ErrorIntegralEvidence& trace) const
+{
+  volume = {};
+  trace = {};
+  if (!implementation_->mesh || !implementation_->interior_space ||
+      !implementation_->trace_space || !implementation_->current_interior ||
+      !implementation_->current_trace || quadrature_order <= 0)
+  {
+    return false;
+  }
+  long double volume_error = 0.0L, volume_norm = 0.0L, volume_measure = 0.0L;
+  for (int element = 0; element < implementation_->mesh->GetNE(); ++element)
+  {
+    const mfem::FiniteElement* fe = implementation_->interior_space->GetFE(element);
+    mfem::ElementTransformation* transformation =
+        implementation_->mesh->GetElementTransformation(element);
+    if (fe == nullptr || transformation == nullptr) return false;
+    mfem::Array<int> vdofs;
+    implementation_->interior_space->GetElementVDofs(element, vdofs);
+    mfem::Vector shape(fe->GetDof());
+    const mfem::IntegrationRule& rule =
+        mfem::IntRules.Get(fe->GetGeomType(), quadrature_order);
+    for (int q = 0; q < rule.GetNPoints(); ++q)
+    {
+      const mfem::IntegrationPoint& point = rule.IntPoint(q);
+      transformation->SetIntPoint(&point);
+      mfem::Vector physical(dimension);
+      transformation->Transform(point, physical);
+      fe->CalcShape(point, shape);
+      ConservedState numerical{}, exact{};
+      if (!InterpolateByNodes(*implementation_->current_interior, vdofs, shape,
+                              numerical) ||
+          !ManufacturedConservative(physical[0], physical[1], exact).ok())
+      {
+        return false;
+      }
+      const double weight = point.weight * transformation->Weight();
+      if (!(weight > 0.0) || !std::isfinite(weight)) return false;
+      volume_measure += weight;
+      for (int component = 0; component < conserved_components; ++component)
+      {
+        const long double difference = numerical[component] - exact[component];
+        volume_error += weight * difference * difference;
+        volume_norm += weight * static_cast<long double>(exact[component]) *
+                       exact[component];
+      }
+    }
+  }
+
+  long double trace_error = 0.0L, trace_norm = 0.0L, trace_measure = 0.0L;
+  for (int face = 0; face < implementation_->mesh->GetNumFaces(); ++face)
+  {
+    const mfem::FiniteElement* fe = implementation_->trace_space->GetFaceElement(face);
+    mfem::ElementTransformation* transformation =
+        implementation_->mesh->GetFaceTransformation(face);
+    if (fe == nullptr || transformation == nullptr) return false;
+    mfem::Array<int> vdofs;
+    implementation_->trace_space->GetFaceVDofs(face, vdofs);
+    mfem::Vector shape(fe->GetDof());
+    const mfem::IntegrationRule& rule =
+        mfem::IntRules.Get(fe->GetGeomType(), quadrature_order);
+    for (int q = 0; q < rule.GetNPoints(); ++q)
+    {
+      const mfem::IntegrationPoint& point = rule.IntPoint(q);
+      transformation->SetIntPoint(&point);
+      mfem::Vector physical(dimension);
+      transformation->Transform(point, physical);
+      fe->CalcShape(point, shape);
+      ConservedState numerical{}, exact{};
+      if (!InterpolateByNodes(*implementation_->current_trace, vdofs, shape,
+                              numerical) ||
+          !ManufacturedConservative(physical[0], physical[1], exact).ok())
+      {
+        return false;
+      }
+      // Face Jacobian Weight is applied exactly once to each unique face.
+      const double weight = point.weight * transformation->Weight();
+      if (!(weight > 0.0) || !std::isfinite(weight)) return false;
+      trace_measure += weight;
+      for (int component = 0; component < conserved_components; ++component)
+      {
+        const long double difference = numerical[component] - exact[component];
+        trace_error += weight * difference * difference;
+        trace_norm += weight * static_cast<long double>(exact[component]) *
+                      exact[component];
+      }
+    }
+  }
+  auto publish = [](const long double error, const long double norm,
+                    const long double measure, const int faces,
+                    ErrorIntegralEvidence& output)
+  {
+    if (!(error > 0.0L) || !(norm > 0.0L) || !(measure > 0.0L)) return false;
+    output.error_squared = static_cast<double>(error);
+    output.exact_norm_squared = static_cast<double>(norm);
+    output.measure = static_cast<double>(measure);
+    output.direct_l2 = std::sqrt(output.error_squared);
+    output.rms = std::sqrt(output.error_squared / output.measure);
+    output.relative_l2 = std::sqrt(output.error_squared / output.exact_norm_squared);
+    output.unique_face_count = faces;
+    return std::isfinite(output.direct_l2) && std::isfinite(output.rms) &&
+           std::isfinite(output.relative_l2);
+  };
+  return publish(volume_error, volume_norm, volume_measure, 0, volume) &&
+         publish(trace_error, trace_norm, trace_measure,
+                 implementation_->mesh->GetNumFaces(), trace);
+}
+
+bool SmoothEulerExperiment::SolveNewtonTransaction(
+    NewtonEvidence& evidence, SolvedMeshEvidence* solved_evidence,
+    const int maximum_accepted_updates)
+{
   evidence = {};
-  // 03C owns state-updating Newton, admissibility, and convergence evidence.
-  // A linearized 03B candidate must not manufacture any of that evidence.
-  return false;
+  if (maximum_accepted_updates < 1 || maximum_accepted_updates > 20 ||
+      !implementation_->mesh || !implementation_->interior_space ||
+      !implementation_->trace_space || !implementation_->old_interior ||
+      !implementation_->old_trace || !implementation_->current_interior ||
+      !implementation_->current_trace)
+  {
+    evidence.status = ExperimentStatus::SetupFailure;
+    return false;
+  }
+
+  SolvedMeshEvidence local_solved{};
+  SolvedMeshEvidence& solved = solved_evidence == nullptr ? local_solved : *solved_evidence;
+  solved = {};
+  solved.polynomial_order = polynomial_order_;
+  solved.elements_per_direction = implementation_->elements_per_direction;
+  solved.q_a = quadrature_order_;
+  solved.q_e = 4 * polynomial_order_ + 12;
+  solved.q_e_plus_four = solved.q_e + 4;
+  solved.old_interior = GridValues(*implementation_->old_interior);
+  solved.old_trace = GridValues(*implementation_->old_trace);
+  solved.initial_interior = GridValues(*implementation_->current_interior);
+  solved.initial_trace = GridValues(*implementation_->current_trace);
+  const std::vector<double> entry_interior = solved.initial_interior;
+  const std::vector<double> entry_trace = solved.initial_trace;
+
+  auto fail = [&](const ExperimentStatus status)
+  {
+    (void)AssignGridValues(*implementation_->current_interior, entry_interior);
+    (void)AssignGridValues(*implementation_->current_trace, entry_trace);
+    implementation_->InvalidateNumericalState();
+    evidence.status = status;
+    evidence.admissible = false;
+    solved.status = status;
+    solved.newton = evidence;
+    solved.final_interior.clear();
+    solved.final_trace.clear();
+    solved.internal_consistency = false;
+    return false;
+  };
+
+  AdmissibilityEvidence initial_admissibility{};
+  const bool initial_screen_evaluated = PrescreenFields(
+      *implementation_->mesh, *implementation_->interior_space,
+      *implementation_->trace_space, *implementation_->current_interior,
+      *implementation_->current_trace, quadrature_order_, initial_admissibility);
+  solved.initial_admissibility = initial_admissibility;
+  if (!initial_screen_evaluated || !initial_admissibility.passed)
+  {
+    evidence.minimum_density = initial_admissibility.minimum_density;
+    evidence.minimum_pressure = initial_admissibility.minimum_pressure;
+    evidence.maximum_wave_speed = initial_admissibility.maximum_wave_speed;
+    return fail(ExperimentStatus::InitialAdmissibilityFailure);
+  }
+  evidence.initial_prescreen_passed = true;
+  evidence.minimum_density = initial_admissibility.minimum_density;
+  evidence.minimum_pressure = initial_admissibility.minimum_pressure;
+  evidence.maximum_wave_speed = initial_admissibility.maximum_wave_speed;
+
+  ++evidence.assembly_attempts;
+  if (!AssembleLinearization()) return fail(ExperimentStatus::AssemblyFailure);
+  double residual = ResidualNorm(
+      implementation_->residual_r, implementation_->residual_g,
+      implementation_->trace_dofs, implementation_->trace_space->GetVSize());
+  if (!std::isfinite(residual)) return fail(ExperimentStatus::AssemblyFailure);
+  evidence.initial_residual = residual;
+  evidence.final_residual = residual;
+  solved.initial_residual_interior = implementation_->residual_r;
+  solved.initial_residual_trace = implementation_->residual_g;
+  solved.signed_trace_dofs = implementation_->trace_dofs;
+  solved.residual_history.push_back(residual);
+  if (!(residual > 1.0e-8))
+  {
+    return fail(ExperimentStatus::EvidenceConsistencyFailure);
+  }
+
+  // Capture the first element of the exact production assembly generation.
+  {
+    LocalAssemblyAuditSnapshot& audit = solved.local_assembly;
+    audit.polynomial_order = polynomial_order_;
+    audit.elements_per_direction = implementation_->elements_per_direction;
+    audit.element = 0;
+    audit.quadrature_order = quadrature_order_;
+    const mfem::FiniteElement* fe = implementation_->interior_space->GetFE(0);
+    mfem::Array<int> interior_vdofs;
+    implementation_->interior_space->GetElementVDofs(0, interior_vdofs);
+    if (fe == nullptr || interior_vdofs.Size() != implementation_->local_interior)
+    {
+      return fail(ExperimentStatus::EvidenceConsistencyFailure);
+    }
+    const mfem::IntegrationRule& volume_rule =
+        mfem::IntRules.Get(fe->GetGeomType(), quadrature_order_);
+    audit.volume_quadrature_points = volume_rule.GetNPoints();
+    audit.interior_dofs = implementation_->local_interior;
+    audit.trace_dofs = implementation_->local_trace;
+    audit.old_interior.resize(audit.interior_dofs);
+    audit.current_interior.resize(audit.interior_dofs);
+    for (int local = 0; local < audit.interior_dofs; ++local)
+    {
+      double sign = 1.0;
+      const int global = DecodeSignedVDof(interior_vdofs[local], sign);
+      if (global < 0 || global >= implementation_->old_interior->Size())
+      {
+        return fail(ExperimentStatus::EvidenceConsistencyFailure);
+      }
+      audit.old_interior[local] = sign * (*implementation_->old_interior)[global];
+      audit.current_interior[local] =
+          sign * (*implementation_->current_interior)[global];
+    }
+    audit.trace.resize(audit.trace_dofs);
+    audit.signed_trace_dofs.assign(implementation_->trace_dofs.begin(),
+                                   implementation_->trace_dofs.begin() +
+                                       audit.trace_dofs);
+    for (int local = 0; local < audit.trace_dofs; ++local)
+    {
+      double sign = 1.0;
+      const int global = DecodeSignedVDof(audit.signed_trace_dofs[local], sign);
+      if (global < 0 || global >= implementation_->current_trace->Size())
+      {
+        return fail(ExperimentStatus::EvidenceConsistencyFailure);
+      }
+      audit.trace[local] = sign * (*implementation_->current_trace)[global];
+    }
+    audit.residual_interior.assign(implementation_->residual_r.begin(),
+                                   implementation_->residual_r.begin() +
+                                       audit.interior_dofs);
+    audit.residual_trace.assign(implementation_->residual_g.begin(),
+                                implementation_->residual_g.begin() +
+                                    audit.trace_dofs);
+    audit.a.assign(implementation_->a.begin(), implementation_->a.begin() +
+        static_cast<std::size_t>(audit.interior_dofs) * audit.interior_dofs);
+    audit.b.assign(implementation_->b.begin(), implementation_->b.begin() +
+        static_cast<std::size_t>(audit.interior_dofs) * audit.trace_dofs);
+    audit.c.assign(implementation_->c.begin(), implementation_->c.begin() +
+        static_cast<std::size_t>(audit.trace_dofs) * audit.interior_dofs);
+    audit.d.assign(implementation_->d.begin(), implementation_->d.begin() +
+        static_cast<std::size_t>(audit.trace_dofs) * audit.trace_dofs);
+    mfem::Array<int> faces, orientations;
+    implementation_->mesh->GetElementEdges(0, faces, orientations);
+    audit.face_quadrature_points = 0;
+    for (int local_face = 0; local_face < faces.Size(); ++local_face)
+    {
+      const mfem::FiniteElement* trace_fe =
+          implementation_->trace_space->GetFaceElement(faces[local_face]);
+      if (trace_fe == nullptr)
+      {
+        return fail(ExperimentStatus::EvidenceConsistencyFailure);
+      }
+      audit.face_quadrature_points +=
+          mfem::IntRules.Get(trace_fe->GetGeomType(), quadrature_order_).GetNPoints();
+    }
+    audit.interior_reconstruction_id = HashValues(audit.current_interior) ^
+        (static_cast<std::uint64_t>(quadrature_order_) << 32);
+    audit.trace_reconstruction_id = HashValues(audit.trace) ^
+        static_cast<std::uint64_t>(audit.face_quadrature_points);
+  }
+
+  const double target = 1.0e-10 * (1.0 + evidence.initial_residual);
+  bool captured_first_rejected_trial = false;
+  for (int nonlinear_iteration = 0; nonlinear_iteration < 20; ++nonlinear_iteration)
+  {
+    if (evidence.nonlinear_iterations >= 2 && residual <= target) break;
+    const std::vector<double> base_a = implementation_->a;
+    const std::vector<double> base_b = implementation_->b;
+    const std::vector<double> base_c = implementation_->c;
+    const std::vector<double> base_d = implementation_->d;
+    const std::vector<double> base_interior =
+        GridValues(*implementation_->current_interior);
+    const std::vector<double> base_trace =
+        GridValues(*implementation_->current_trace);
+
+    if (!CondenseAndAssembleTrace())
+    {
+      return fail(ExperimentStatus::CondensationFailure);
+    }
+    LinearSolveEvidence linear{};
+    linear.nonlinear_iteration = nonlinear_iteration;
+    linear.right_hand_side_norm = implementation_->trace_rhs.Norml2();
+    if (!SolveTrace())
+    {
+      linear.gmres_iterations = implementation_->pipeline_state.gmres_iterations;
+      linear.reported_relative_residual =
+          implementation_->pipeline_state.reported_relative_residual;
+      linear.true_relative_residual =
+          implementation_->pipeline_state.true_relative_residual;
+      linear.status = implementation_->pipeline_state.gmres_converged ?
+          ExperimentStatus::LinearResidualFailure : ExperimentStatus::GmresFailure;
+      solved.linear_history.push_back(linear);
+      return fail(linear.status);
+    }
+    linear.gmres_iterations = implementation_->pipeline_state.gmres_iterations;
+    linear.reported_relative_residual =
+        implementation_->pipeline_state.reported_relative_residual;
+    linear.true_relative_residual =
+        implementation_->pipeline_state.true_relative_residual;
+    linear.status = ExperimentStatus::Success;
+    solved.linear_history.push_back(linear);
+    evidence.linear_iterations += linear.gmres_iterations;
+    evidence.trace_relative_residual = linear.true_relative_residual;
+
+    if (implementation_->elements_per_direction == 3 &&
+        nonlinear_iteration == 0)
+    {
+      LinearAuditSnapshot& audit = solved.linear_audit;
+      audit.polynomial_order = polynomial_order_;
+      audit.elements_per_direction = implementation_->elements_per_direction;
+      audit.nonlinear_iteration = nonlinear_iteration;
+      audit.rows = implementation_->trace_matrix->Height();
+      const int* offsets = implementation_->trace_matrix->GetI();
+      const int* columns = implementation_->trace_matrix->GetJ();
+      const double* values = implementation_->trace_matrix->GetData();
+      if (offsets == nullptr || columns == nullptr || values == nullptr)
+      {
+        return fail(ExperimentStatus::EvidenceConsistencyFailure);
+      }
+      audit.row_offsets.assign(offsets, offsets + audit.rows + 1);
+      const int nonzeros = audit.row_offsets.back();
+      audit.columns.assign(columns, columns + nonzeros);
+      audit.values.assign(values, values + nonzeros);
+      audit.right_hand_side.assign(implementation_->trace_rhs.GetData(),
+          implementation_->trace_rhs.GetData() + implementation_->trace_rhs.Size());
+      audit.trace_increment.assign(implementation_->trace_increment.GetData(),
+          implementation_->trace_increment.GetData() +
+              implementation_->trace_increment.Size());
+      audit.true_relative_residual = linear.true_relative_residual;
+      solved.has_linear_audit = true;
+    }
+
+    if (!RecoverInterior()) return fail(ExperimentStatus::RecoveryFailure);
+    std::vector<double> delta_interior(base_interior.size(), 0.0);
+    for (int element = 0; element < implementation_->elements; ++element)
+    {
+      mfem::Array<int> vdofs;
+      implementation_->interior_space->GetElementVDofs(element, vdofs);
+      if (vdofs.Size() != implementation_->local_interior)
+      {
+        return fail(ExperimentStatus::RecoveryFailure);
+      }
+      for (int local = 0; local < vdofs.Size(); ++local)
+      {
+        double sign = 1.0;
+        const int global = DecodeSignedVDof(vdofs[local], sign);
+        if (global < 0 || global >= static_cast<int>(delta_interior.size()))
+        {
+          return fail(ExperimentStatus::RecoveryFailure);
+        }
+        delta_interior[global] = sign * implementation_->recovered[
+            static_cast<std::size_t>(element) * implementation_->local_interior +
+            local];
+      }
+    }
+    const std::vector<double> delta_trace(
+        implementation_->trace_increment.GetData(),
+        implementation_->trace_increment.GetData() +
+            implementation_->trace_increment.Size());
+
+    bool accepted = false;
+    for (int trial_index = 0; trial_index <= 12; ++trial_index)
+    {
+      const double alpha = std::ldexp(1.0, -trial_index);
+      std::vector<double> trial_interior(base_interior.size());
+      std::vector<double> trial_trace(base_trace.size());
+      double formula_error = 0.0;
+      for (std::size_t index = 0; index < trial_interior.size(); ++index)
+      {
+        trial_interior[index] = base_interior[index] + alpha * delta_interior[index];
+        formula_error = std::max(formula_error, std::abs(
+            trial_interior[index] -
+            (base_interior[index] + alpha * delta_interior[index])));
+      }
+      for (std::size_t index = 0; index < trial_trace.size(); ++index)
+      {
+        trial_trace[index] = base_trace[index] + alpha * delta_trace[index];
+        formula_error = std::max(formula_error, std::abs(
+            trial_trace[index] - (base_trace[index] + alpha * delta_trace[index])));
+      }
+      if (!AssignGridValues(*implementation_->current_interior, trial_interior) ||
+          !AssignGridValues(*implementation_->current_trace, trial_trace))
+      {
+        return fail(ExperimentStatus::EvidenceConsistencyFailure);
+      }
+      implementation_->InvalidateNumericalState();
+
+      TrialEvidence trial{};
+      trial.nonlinear_iteration = nonlinear_iteration;
+      trial.trial_index = trial_index;
+      trial.alpha = alpha;
+      trial.status = ExperimentStatus::Success;
+      trial.base_residual = residual;
+      trial.armijo_boundary = (1.0 - 1.0e-4 * alpha) * residual;
+      trial.coefficient_update = std::max(
+          MaxAbsDifference(base_interior, trial_interior),
+          MaxAbsDifference(base_trace, trial_trace));
+      if (!PrescreenFields(*implementation_->mesh, *implementation_->interior_space,
+                           *implementation_->trace_space,
+                           *implementation_->current_interior,
+                           *implementation_->current_trace, quadrature_order_,
+                           trial.admissibility))
+      {
+        return fail(ExperimentStatus::AssemblyFailure);
+      }
+
+      TrialAuditSnapshot audit{};
+      audit.nonlinear_iteration = nonlinear_iteration;
+      audit.trial_index = trial_index;
+      audit.alpha = alpha;
+      audit.status = ExperimentStatus::Success;
+      audit.base_residual = residual;
+      audit.armijo_boundary = trial.armijo_boundary;
+      audit.coefficient_update = trial.coefficient_update;
+      audit.formula_identity_error = formula_error;
+      audit.base_interior = base_interior;
+      audit.base_trace = base_trace;
+      audit.delta_interior = delta_interior;
+      audit.delta_trace = delta_trace;
+      audit.trial_interior = trial_interior;
+      audit.trial_trace = trial_trace;
+      audit.admissibility = trial.admissibility;
+
+      if (!trial.admissibility.passed)
+      {
+        trial.rejection_reason = trial.admissibility.reason;
+        trial.generation_discarded = true;
+        audit.rejection_reason = trial.rejection_reason;
+        audit.generation_discarded = true;
+        ++evidence.rejected_trials;
+        solved.trial_history.push_back(trial);
+        if (!captured_first_rejected_trial)
+        {
+          solved.trial_audits.push_back(std::move(audit));
+          captured_first_rejected_trial = true;
+        }
+        (void)AssignGridValues(*implementation_->current_interior, base_interior);
+        (void)AssignGridValues(*implementation_->current_trace, base_trace);
+        implementation_->InvalidateNumericalState();
+        continue;
+      }
+
+      trial.reassembly_attempted = true;
+      audit.reassembly_attempted = true;
+      ++evidence.assembly_attempts;
+      if (!AssembleLinearization())
+      {
+        trial.status = ExperimentStatus::AssemblyFailure;
+        audit.status = ExperimentStatus::AssemblyFailure;
+        solved.trial_history.push_back(trial);
+        solved.trial_audits.push_back(std::move(audit));
+        return fail(ExperimentStatus::AssemblyFailure);
+      }
+      const double trial_residual = ResidualNorm(
+          implementation_->residual_r, implementation_->residual_g,
+          implementation_->trace_dofs, implementation_->trace_space->GetVSize());
+      if (!std::isfinite(trial_residual))
+      {
+        return fail(ExperimentStatus::AssemblyFailure);
+      }
+      trial.residual_evaluated = true;
+      trial.trial_residual_present = true;
+      trial.trial_residual = trial_residual;
+      audit.residual_evaluated = true;
+      audit.trial_residual = trial_residual;
+      trial.jacobian_change = std::max(
+          std::max(MaxAbsDifference(base_a, implementation_->a),
+                   MaxAbsDifference(base_b, implementation_->b)),
+          std::max(MaxAbsDifference(base_c, implementation_->c),
+                   MaxAbsDifference(base_d, implementation_->d)));
+      audit.jacobian_change = trial.jacobian_change;
+
+      if (trial_residual > trial.armijo_boundary)
+      {
+        trial.rejection_reason = TrialRejectionReason::Armijo;
+        trial.generation_discarded = true;
+        audit.rejection_reason = trial.rejection_reason;
+        audit.generation_discarded = true;
+        ++evidence.rejected_trials;
+        solved.trial_history.push_back(trial);
+        if (!captured_first_rejected_trial)
+        {
+          solved.trial_audits.push_back(std::move(audit));
+          captured_first_rejected_trial = true;
+        }
+        (void)AssignGridValues(*implementation_->current_interior, base_interior);
+        (void)AssignGridValues(*implementation_->current_trace, base_trace);
+        implementation_->InvalidateNumericalState();
+        continue;
+      }
+
+      trial.accepted = true;
+      trial.generation_published = true;
+      audit.accepted = true;
+      audit.generation_published = true;
+      solved.trial_history.push_back(trial);
+      solved.trial_audits.push_back(std::move(audit));
+      residual = trial_residual;
+      solved.residual_history.push_back(residual);
+      ++evidence.nonlinear_iterations;
+      evidence.final_residual = residual;
+      evidence.minimum_damping =
+          std::min(evidence.minimum_damping, alpha);
+      evidence.minimum_density = std::min(
+          evidence.minimum_density, trial.admissibility.minimum_density);
+      evidence.minimum_pressure = std::min(
+          evidence.minimum_pressure, trial.admissibility.minimum_pressure);
+      evidence.maximum_wave_speed = std::max(
+          evidence.maximum_wave_speed, trial.admissibility.maximum_wave_speed);
+      evidence.maximum_coefficient_update = std::max(
+          evidence.maximum_coefficient_update, trial.coefficient_update);
+      evidence.maximum_jacobian_change = std::max(
+          evidence.maximum_jacobian_change, trial.jacobian_change);
+      accepted = true;
+      break;
+    }
+    if (!accepted) return fail(ExperimentStatus::LineSearchExhausted);
+    if (maximum_accepted_updates < 20 &&
+        evidence.nonlinear_iterations >= maximum_accepted_updates)
+    {
+      return fail(ExperimentStatus::IterationLimit);
+    }
+  }
+
+  if (evidence.nonlinear_iterations < 2 || residual > target)
+  {
+    return fail(ExperimentStatus::IterationLimit);
+  }
+  if (evidence.linear_iterations < 1 ||
+      !(evidence.maximum_coefficient_update >= 1.0e-6) ||
+      !(evidence.maximum_jacobian_change >= 1.0e-8))
+  {
+    return fail(ExperimentStatus::EvidenceConsistencyFailure);
+  }
+  evidence.status = ExperimentStatus::Success;
+  evidence.final_residual = residual;
+  evidence.admissible = true;
+  solved.status = ExperimentStatus::Success;
+  solved.newton = evidence;
+  solved.final_interior = GridValues(*implementation_->current_interior);
+  solved.final_trace = GridValues(*implementation_->current_trace);
+  solved.final_residual_interior = implementation_->residual_r;
+  solved.final_residual_trace = implementation_->residual_g;
+  return true;
 }
 
 bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
 {
-  evidence = {}; evidence.polynomial_order = polynomial_order_;
-  // No result is reported until independently integrated volume and skeleton errors exist.
-  // This fail-closed path prevents a source-only candidate from fabricating convergence.
-  return false;
+  evidence = {};
+  evidence.polynomial_order = polynomial_order_;
+  constexpr std::array<int, 3> widths{{3, 6, 12}};
+  evidence.mesh_widths = widths;
+  auto fail_ladder = [&](const ExperimentStatus status)
+  {
+    for (auto solve = evidence.solves.rbegin(); solve != evidence.solves.rend();
+         ++solve)
+    {
+      if (implementation_->current_interior && implementation_->current_trace &&
+          solve->initial_interior.size() ==
+              static_cast<std::size_t>(implementation_->current_interior->Size()) &&
+          solve->initial_trace.size() ==
+              static_cast<std::size_t>(implementation_->current_trace->Size()))
+      {
+        (void)AssignGridValues(*implementation_->current_interior,
+                               solve->initial_interior);
+        (void)AssignGridValues(*implementation_->current_trace,
+                               solve->initial_trace);
+        break;
+      }
+    }
+    implementation_->InvalidateNumericalState();
+    implementation_->has_solved_evidence = false;
+    ConvergenceEvidence failed{};
+    failed.status = status;
+    failed.polynomial_order = polynomial_order_;
+    failed.mesh_widths = widths;
+    evidence = std::move(failed);
+    return false;
+  };
+  for (std::size_t mesh_index = 0; mesh_index < widths.size(); ++mesh_index)
+  {
+    SolvedMeshEvidence& solved = evidence.solves[mesh_index];
+    solved.polynomial_order = polynomial_order_;
+    solved.elements_per_direction = widths[mesh_index];
+    if (!BuildPeriodicMesh(widths[mesh_index]))
+    {
+      return fail_ladder(ExperimentStatus::SetupFailure);
+    }
+    if (!ProjectOldStage() || !ProjectPerturbedCurrentStage())
+    {
+      return fail_ladder(ExperimentStatus::ProjectionFailure);
+    }
+    NewtonEvidence newton{};
+    if (!SolveNewtonTransaction(newton, &solved, 20))
+    {
+      return fail_ladder(newton.status);
+    }
+    if (!IntegrateErrorEvidence(solved.q_e, solved.q_e_volume,
+                                solved.q_e_trace) ||
+        !IntegrateErrorEvidence(solved.q_e_plus_four,
+                                solved.q_e_plus_four_volume,
+                                solved.q_e_plus_four_trace))
+    {
+      return fail_ladder(ExperimentStatus::ErrorIntegrationFailure);
+    }
+    const auto error_pair_is_valid = [](const ErrorIntegralEvidence& q_e,
+                                        const ErrorIntegralEvidence& q_e_plus_four)
+    {
+      const double difference = std::abs(q_e.relative_l2 -
+                                         q_e_plus_four.relative_l2);
+      return std::isfinite(q_e.relative_l2) &&
+             std::isfinite(q_e_plus_four.relative_l2) &&
+             q_e.relative_l2 >= 1.0e-10 &&
+             q_e_plus_four.relative_l2 >= 1.0e-10 &&
+             difference / std::max(q_e_plus_four.relative_l2, 1.0e-300) <=
+                 1.0e-8 &&
+             q_e_plus_four.relative_l2 > 100.0 * difference;
+    };
+    const double expected_trace_measure = 2.0 * widths[mesh_index];
+    if (!error_pair_is_valid(solved.q_e_volume,
+                             solved.q_e_plus_four_volume) ||
+        !error_pair_is_valid(solved.q_e_trace,
+                             solved.q_e_plus_four_trace) ||
+        solved.q_e_plus_four_trace.unique_face_count !=
+            2 * widths[mesh_index] * widths[mesh_index] ||
+        std::abs(solved.q_e_plus_four_volume.measure - 1.0) >
+            128.0 * experiment_epsilon ||
+        std::abs(solved.q_e_plus_four_trace.measure - expected_trace_measure) >
+            128.0 * experiment_epsilon *
+                std::max(1.0, expected_trace_measure))
+    {
+      return fail_ladder(ExperimentStatus::ErrorFloorFailure);
+    }
+    solved.internal_consistency = true;
+    evidence.volume_relative_l2[mesh_index] =
+        solved.q_e_plus_four_volume.relative_l2;
+    evidence.trace_relative_l2[mesh_index] =
+        solved.q_e_plus_four_trace.relative_l2;
+    implementation_->solved_evidence = solved;
+    implementation_->has_solved_evidence = true;
+  }
+  for (int interval = 0; interval < 2; ++interval)
+  {
+    if (!(evidence.volume_relative_l2[interval] >
+          evidence.volume_relative_l2[interval + 1]) ||
+        !(evidence.trace_relative_l2[interval] >
+          evidence.trace_relative_l2[interval + 1]))
+    {
+      return fail_ladder(ExperimentStatus::RateFailure);
+    }
+    evidence.volume_rates[interval] = std::log2(
+        evidence.volume_relative_l2[interval] /
+        evidence.volume_relative_l2[interval + 1]);
+    evidence.trace_rates[interval] = std::log2(
+        evidence.trace_relative_l2[interval] /
+        evidence.trace_relative_l2[interval + 1]);
+  }
+  const double minimum_volume = static_cast<double>(polynomial_order_) + 0.25;
+  const double minimum_trace = static_cast<double>(polynomial_order_) + 0.50;
+  for (int interval = 0; interval < 2; ++interval)
+  {
+    if (!std::isfinite(evidence.volume_rates[interval]) ||
+        !std::isfinite(evidence.trace_rates[interval]) ||
+        evidence.volume_rates[interval] < minimum_volume ||
+        evidence.trace_rates[interval] < minimum_trace)
+    {
+      return fail_ladder(ExperimentStatus::RateFailure);
+    }
+  }
+  evidence.status = ExperimentStatus::Success;
+  evidence.passed = true;
+  return true;
 }
 
 const mfem::SparseMatrix* SmoothEulerExperiment::trace_matrix() const noexcept
@@ -1570,10 +2591,133 @@ const mfem::GridFunction* SmoothEulerExperiment::old_trace() const noexcept
   return implementation_->old_trace.get();
 }
 
+const mfem::GridFunction* SmoothEulerExperiment::current_interior() const noexcept
+{
+  return implementation_->current_interior.get();
+}
+
+const mfem::GridFunction* SmoothEulerExperiment::current_trace() const noexcept
+{
+  return implementation_->current_trace.get();
+}
+
+const SolvedMeshEvidence* SmoothEulerExperiment::solved_evidence() const noexcept
+{
+  return implementation_->has_solved_evidence ?
+      &implementation_->solved_evidence : nullptr;
+}
+
+bool SmoothEulerExperiment::RunRollbackProbe(RollbackAuditEvidence& evidence)
+{
+  evidence = {};
+  if (polynomial_order_ != 1 || !BuildPeriodicMesh(3))
+  {
+    evidence.status = ExperimentStatus::SetupFailure;
+    return false;
+  }
+  if (!ProjectOldStage() || !ProjectPerturbedCurrentStage())
+  {
+    evidence.status = ExperimentStatus::ProjectionFailure;
+    return false;
+  }
+  evidence.entry_interior = GridValues(*implementation_->current_interior);
+  evidence.entry_trace = GridValues(*implementation_->current_trace);
+  evidence.entry_interior_hash = HashValues(evidence.entry_interior);
+  evidence.entry_trace_hash = HashValues(evidence.entry_trace);
+  if (!PrescreenFields(*implementation_->mesh, *implementation_->interior_space,
+                       *implementation_->trace_space,
+                       *implementation_->current_interior,
+                       *implementation_->current_trace, quadrature_order_,
+                       evidence.initial_admissibility) ||
+      !evidence.initial_admissibility.passed)
+  {
+    evidence.status = ExperimentStatus::InitialAdmissibilityFailure;
+    return false;
+  }
+
+  NewtonEvidence newton{};
+  SolvedMeshEvidence private_solved{};
+  evidence.returned_success =
+      SolveNewtonTransaction(newton, &private_solved, 1);
+  evidence.status = newton.status;
+  evidence.accepted_updates = newton.nonlinear_iterations;
+  evidence.restored_interior = GridValues(*implementation_->current_interior);
+  evidence.restored_trace = GridValues(*implementation_->current_trace);
+  evidence.restored_interior_hash = HashValues(evidence.restored_interior);
+  evidence.restored_trace_hash = HashValues(evidence.restored_trace);
+  evidence.interior_byte_equal =
+      evidence.entry_interior.size() == evidence.restored_interior.size() &&
+      std::memcmp(evidence.entry_interior.data(), evidence.restored_interior.data(),
+                  evidence.entry_interior.size() * sizeof(double)) == 0;
+  evidence.trace_byte_equal =
+      evidence.entry_trace.size() == evidence.restored_trace.size() &&
+      std::memcmp(evidence.entry_trace.data(), evidence.restored_trace.data(),
+                  evidence.entry_trace.size() * sizeof(double)) == 0;
+  evidence.local_generation_invalid =
+      implementation_->linearization_generation == 0;
+  evidence.condensed_generation_invalid =
+      implementation_->condensation_generation == 0;
+  evidence.solve_generation_invalid = implementation_->solve_generation == 0 &&
+                                         implementation_->recovery_generation == 0;
+  LocalLinearizationSnapshot local_snapshot;
+  std::vector<double> right_hand_side, increment;
+  evidence.local_copy_rejected = !CopyLocalLinearization(local_snapshot);
+  evidence.right_hand_side_copy_rejected =
+      !CopyTraceRightHandSide(right_hand_side);
+  evidence.trace_increment_copy_rejected = !CopyTraceIncrement(increment);
+  evidence.condensation_consume_rejected = !CondenseAndAssembleTrace();
+  evidence.solve_consume_rejected = !SolveTrace();
+  evidence.recovery_consume_rejected = !RecoverInterior();
+  evidence.partial_solve_evidence = implementation_->has_solved_evidence;
+  evidence.partial_convergence_evidence = false;
+  evidence.passed = !evidence.returned_success &&
+      evidence.status == ExperimentStatus::IterationLimit &&
+      evidence.initial_admissibility.passed && evidence.accepted_updates == 1 &&
+      evidence.interior_byte_equal && evidence.trace_byte_equal &&
+      evidence.entry_interior_hash == evidence.restored_interior_hash &&
+      evidence.entry_trace_hash == evidence.restored_trace_hash &&
+      evidence.local_generation_invalid && evidence.condensed_generation_invalid &&
+      evidence.solve_generation_invalid && evidence.local_copy_rejected &&
+      evidence.right_hand_side_copy_rejected &&
+      evidence.trace_increment_copy_rejected &&
+      evidence.condensation_consume_rejected &&
+      evidence.solve_consume_rejected && evidence.recovery_consume_rejected &&
+      !evidence.partial_solve_evidence && !evidence.partial_convergence_evidence;
+  return evidence.passed;
+}
+
 bool RunSmoothEulerExperiment(ExperimentEvidence& evidence)
 {
   evidence = {};
-  return false;
+  SmoothEulerExperiment rollback_experiment(1);
+  RollbackAuditEvidence rollback{};
+  if (!rollback_experiment.RunRollbackProbe(rollback))
+  {
+    evidence.status = rollback.status == ExperimentStatus::Success ?
+        ExperimentStatus::EvidenceConsistencyFailure : rollback.status;
+    evidence.rollback = std::move(rollback);
+    return false;
+  }
+
+  std::vector<ConvergenceEvidence> convergence;
+  convergence.reserve(4);
+  for (int polynomial_order = 1; polynomial_order <= 4; ++polynomial_order)
+  {
+    SmoothEulerExperiment experiment(polynomial_order);
+    ConvergenceEvidence ladder{};
+    if (!experiment.RunConvergenceLadder(ladder))
+    {
+      evidence.status = ladder.status;
+      evidence.rollback = std::move(rollback);
+      return false;
+    }
+    convergence.push_back(std::move(ladder));
+  }
+  evidence.status = ExperimentStatus::Success;
+  evidence.rollback = std::move(rollback);
+  evidence.convergence = std::move(convergence);
+  evidence.passed = true;
+  return true;
 }
 
 } // namespace dg::hdg::euler
