@@ -818,7 +818,7 @@ bool SmoothEulerExperiment::BuildPeriodicMesh(const int elements_per_direction)
     if (interior_fe == nullptr || interior_fe->GetDof() <= 0) { return false; }
     candidate->local_interior = conserved_components * interior_fe->GetDof();
     mfem::Array<int> faces, orientations;
-    candidate->mesh->GetElementFaces(0, faces, orientations);
+    candidate->mesh->GetElementEdges(0, faces, orientations);
     candidate->local_trace = 0;
     for (int local_face = 0; local_face < faces.Size(); ++local_face)
     {
@@ -845,7 +845,7 @@ bool SmoothEulerExperiment::BuildPeriodicMesh(const int elements_per_direction)
     for (int element = 0; element < candidate->elements; ++element)
     {
       mfem::Array<int> element_faces, element_orientations;
-      candidate->mesh->GetElementFaces(element, element_faces, element_orientations);
+      candidate->mesh->GetElementEdges(element, element_faces, element_orientations);
       if (element_faces.Size() != faces.Size() ||
           element_orientations.Size() != element_faces.Size()) { return false; }
       int offset = 0;
@@ -1111,7 +1111,7 @@ bool SmoothEulerExperiment::AssembleLinearization()
     // coordinate.  MFEM's Loc1/Loc2 mapping supplies the element-side point;
     // the shared signed VDof list is retained verbatim for global assembly.
     mfem::Array<int> faces, orientations;
-    implementation_->mesh->GetElementFaces(element, faces, orientations);
+    implementation_->mesh->GetElementEdges(element, faces, orientations);
     int trace_offset = 0;
     for (int local_face = 0; local_face < faces.Size(); ++local_face)
     {
