@@ -81,6 +81,98 @@ StridedBlockView<T> View(T* data, const LocalIndex batch, const LocalIndex rows,
   return {data, batch, rows, columns, rows * columns, columns, 1};
 }
 
+struct PipelinePhaseState
+{
+  StridedBlockView<double> interior_residual{}, trace_residual{};
+  StridedBlockView<double> a{}, b{}, c{}, d{}, schur{}, rhs{};
+  StridedBlockView<double> trace_solution{}, interior_solution{};
+  bool residual = false, jacobian = false, condensed = false, schur_applied = false,
+       assembled = false, solved = false, recovered = false;
+};
+
+struct SmoothEulerLocalPhase
+{
+  PipelinePhaseState* state = nullptr;
+  void EvaluateResidual(const LocalResidualRequest<SmoothEulerSpec>&,
+                        LocalResidualResult<SmoothEulerSpec>& result)
+  {
+    result.interior_residual = state->interior_residual;
+    result.trace_residual = state->trace_residual;
+    state->residual = result.interior_residual.data != nullptr &&
+                      result.trace_residual.data != nullptr;
+  }
+  void EvaluateJacobian(const LocalJacobianRequest<SmoothEulerSpec>&,
+                        LocalJacobianResult<SmoothEulerSpec>& result)
+  {
+    result.linearization = {state->interior_residual, state->trace_residual,
+                            state->a, state->b, state->c, state->d};
+    state->jacobian = result.linearization.A.data != nullptr &&
+                      result.linearization.D.data != nullptr;
+  }
+};
+
+struct SmoothEulerCondensationPhase
+{
+  PipelinePhaseState* state = nullptr;
+  void Condense(const CondenseRequest<SmoothEulerSpec>&,
+                CondenseResult<SmoothEulerSpec>& result)
+  {
+    result.contribution.schur = AsConst(state->schur);
+    result.contribution.right_hand_side = AsConst(state->rhs);
+    result.contribution.trace_dof_count = state->schur.rows;
+    state->condensed = result.contribution.schur.data != nullptr;
+  }
+  void ApplySchur(const ApplySchurRequest<SmoothEulerSpec>& request,
+                  ApplySchurResult<SmoothEulerSpec>& result)
+  {
+    result.trace_residual = state->trace_solution;
+    state->schur_applied = request.contribution.schur.data != nullptr &&
+                           result.trace_residual.data != nullptr;
+  }
+};
+
+struct SmoothEulerAssemblyPhase
+{
+  PipelinePhaseState* state = nullptr;
+  void Assemble(const TraceAssemblyRequest<SmoothEulerSpec>& request,
+                TraceAssemblyResult<SmoothEulerSpec>& result)
+  {
+    result.trace_system = state->schur;
+    result.right_hand_side = state->rhs;
+    state->assembled = request.contribution.schur.data != nullptr &&
+                       result.trace_system.data != nullptr;
+  }
+};
+
+struct SmoothEulerTraceSolvePhase
+{
+  PipelinePhaseState* state = nullptr;
+  void Solve(const TraceSolveRequest<SmoothEulerSpec>& request,
+             TraceSolveResult<SmoothEulerSpec>& result)
+  {
+    result.trace_solution = state->trace_solution;
+    state->solved = request.trace_system.data != nullptr &&
+                    result.trace_solution.data != nullptr;
+  }
+};
+
+struct SmoothEulerRecoveryPhase
+{
+  PipelinePhaseState* state = nullptr;
+  void Recover(const RecoveryRequest<SmoothEulerSpec>&,
+               RecoveryResult<SmoothEulerSpec>& result)
+  {
+    result.interior_solution = state->interior_solution;
+    state->recovered = result.interior_solution.data != nullptr;
+  }
+};
+
+using SmoothEulerPipeline = Pipeline<SmoothEulerSpec, SmoothEulerLocalPhase,
+                                    SmoothEulerCondensationPhase,
+                                    SmoothEulerAssemblyPhase,
+                                    SmoothEulerTraceSolvePhase,
+                                    SmoothEulerRecoveryPhase>;
+
 bool InterpolateByNodes(const mfem::GridFunction& field,
                         const mfem::Array<int>& signed_vdofs,
                         const mfem::Vector& shape, ConservedState& state)
@@ -357,6 +449,11 @@ struct SmoothEulerExperiment::Implementation
   core::HostReferenceEngine condensation;
   int local_interior = 0, local_trace = 0, elements = 0, trace_face_block_size = 0;
   std::vector<int> trace_permutation;
+  std::size_t generation = 0, linearization_generation = 0,
+              condensation_generation = 0, solve_generation = 0,
+              recovery_generation = 0;
+  PipelinePhaseState pipeline_state{};
+  std::unique_ptr<SmoothEulerPipeline> pipeline;
 };
 
 SmoothEulerExperiment::SmoothEulerExperiment(const int polynomial_order)
@@ -367,6 +464,12 @@ SmoothEulerExperiment::SmoothEulerExperiment(const int polynomial_order)
   {
     throw std::invalid_argument("smooth Euler experiment requires p in [1,4]");
   }
+  implementation_->pipeline = std::make_unique<SmoothEulerPipeline>(
+      SmoothEulerLocalPhase{&implementation_->pipeline_state},
+      SmoothEulerCondensationPhase{&implementation_->pipeline_state},
+      SmoothEulerAssemblyPhase{&implementation_->pipeline_state},
+      SmoothEulerTraceSolvePhase{&implementation_->pipeline_state},
+      SmoothEulerRecoveryPhase{&implementation_->pipeline_state});
 }
 
 SmoothEulerExperiment::~SmoothEulerExperiment() = default;
@@ -380,6 +483,12 @@ bool SmoothEulerExperiment::BuildPeriodicMesh(const int elements_per_direction)
   try
   {
     candidate = std::make_unique<Implementation>();
+    candidate->pipeline = std::make_unique<SmoothEulerPipeline>(
+        SmoothEulerLocalPhase{&candidate->pipeline_state},
+        SmoothEulerCondensationPhase{&candidate->pipeline_state},
+        SmoothEulerAssemblyPhase{&candidate->pipeline_state},
+        SmoothEulerTraceSolvePhase{&candidate->pipeline_state},
+        SmoothEulerRecoveryPhase{&candidate->pipeline_state});
     mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
         elements_per_direction, elements_per_direction, mfem::Element::QUADRILATERAL,
         false, 1.0, 1.0, false);
@@ -567,6 +676,16 @@ bool SmoothEulerExperiment::ProjectOldStage()
   }
   implementation_->old_interior = std::move(candidate_interior);
   implementation_->old_trace = std::move(candidate_trace);
+  ++implementation_->generation;
+  implementation_->linearization_generation = 0;
+  implementation_->condensation_generation = 0;
+  implementation_->solve_generation = 0;
+  implementation_->recovery_generation = 0;
+  implementation_->trace_matrix.reset();
+  implementation_->trace_preconditioner.reset();
+  implementation_->trace_increment.SetSize(0);
+  implementation_->recovered.clear();
+  implementation_->pipeline_state = {};
   return true;
 }
 
@@ -797,6 +916,29 @@ bool SmoothEulerExperiment::AssembleLinearization()
   implementation_->g = std::move(candidate_g);
   implementation_->trace_matrix.reset();
   implementation_->trace_preconditioner.reset();
+  implementation_->trace_increment.SetSize(0);
+  implementation_->recovered.clear();
+  ++implementation_->generation;
+  implementation_->linearization_generation = implementation_->generation;
+  implementation_->condensation_generation = 0;
+  implementation_->solve_generation = 0;
+  implementation_->recovery_generation = 0;
+  implementation_->pipeline_state = {};
+  if (!implementation_->pipeline) return false;
+  auto& pipeline_state = implementation_->pipeline_state;
+  pipeline_state.interior_residual = View(implementation_->f.data(), batches, ni, 1);
+  pipeline_state.trace_residual = View(implementation_->g.data(), batches, nt, 1);
+  pipeline_state.a = View(implementation_->a.data(), batches, ni, ni);
+  pipeline_state.b = View(implementation_->b.data(), batches, ni, nt);
+  pipeline_state.c = View(implementation_->c.data(), batches, nt, ni);
+  pipeline_state.d = View(implementation_->d.data(), batches, nt, nt);
+  LocalResidualRequest<SmoothEulerSpec> residual_request;
+  LocalResidualResult<SmoothEulerSpec> residual_result;
+  LocalJacobianRequest<SmoothEulerSpec> jacobian_request;
+  LocalJacobianResult<SmoothEulerSpec> jacobian_result;
+  implementation_->pipeline->EvaluateLocalResidual(residual_request, residual_result);
+  implementation_->pipeline->EvaluateLocalJacobian(jacobian_request, jacobian_result);
+  if (!pipeline_state.residual || !pipeline_state.jacobian) return false;
   return true;
 }
 
@@ -804,7 +946,7 @@ bool SmoothEulerExperiment::CondenseAndAssembleTrace()
 {
   const int batches = implementation_->elements, ni = implementation_->local_interior,
             nt = implementation_->local_trace;
-  if (batches <= 0 || ni <= 0 || nt <= 0 ||
+  if (implementation_->linearization_generation == 0 || batches <= 0 || ni <= 0 || nt <= 0 ||
       implementation_->a.size() != static_cast<std::size_t>(batches) * ni * ni ||
       implementation_->b.size() != static_cast<std::size_t>(batches) * ni * nt ||
       implementation_->c.size() != static_cast<std::size_t>(batches) * nt * ni ||
@@ -840,32 +982,76 @@ bool SmoothEulerExperiment::CondenseAndAssembleTrace()
     implementation_->trace_matrix->AddSubMatrix(dofs, dofs, local_schur);
   }
   implementation_->trace_matrix->Finalize();
+  implementation_->trace_increment.SetSize(0);
+  implementation_->recovered.clear();
+  implementation_->trace_preconditioner.reset();
+  implementation_->condensation_generation = implementation_->linearization_generation;
+  implementation_->solve_generation = 0;
+  implementation_->recovery_generation = 0;
+  if (!implementation_->pipeline) return false;
+  auto& pipeline_state = implementation_->pipeline_state;
+  pipeline_state.schur = View(implementation_->schur.data(), batches, nt, nt);
+  pipeline_state.rhs = View(implementation_->reduced_rhs.data(), batches, nt, 1);
+  pipeline_state.trace_solution = View(implementation_->trace_rhs.GetData(), 1,
+                                       implementation_->trace_rhs.Size(), 1);
+  CondenseRequest<SmoothEulerSpec> condense_request;
+  CondenseResult<SmoothEulerSpec> condense_result;
+  implementation_->pipeline->CondenseLocalSystem(condense_request, condense_result);
+  ApplySchurRequest<SmoothEulerSpec> apply_request;
+  apply_request.contribution = condense_result.contribution;
+  ApplySchurResult<SmoothEulerSpec> apply_result;
+  implementation_->pipeline->ApplySchur(apply_request, apply_result);
+  TraceAssemblyRequest<SmoothEulerSpec> assembly_request;
+  assembly_request.contribution = condense_result.contribution;
+  TraceAssemblyResult<SmoothEulerSpec> assembly_result;
+  implementation_->pipeline->AssembleTraceSystem(assembly_request, assembly_result);
+  if (!pipeline_state.condensed || !pipeline_state.schur_applied ||
+      !pipeline_state.assembled) return false;
   return true;
 }
 
 bool SmoothEulerExperiment::SolveTrace()
 {
-  if (!implementation_->trace_matrix) return false;
+  if (!implementation_->trace_matrix || implementation_->condensation_generation == 0 ||
+      implementation_->condensation_generation != implementation_->linearization_generation) return false;
+  implementation_->trace_increment.SetSize(0);
+  implementation_->recovered.clear();
+  implementation_->solve_generation = 0;
+  implementation_->recovery_generation = 0;
   implementation_->trace_preconditioner = std::make_unique<PermutedFaceBlockILU>(
       *implementation_->trace_matrix, implementation_->trace_permutation,
       implementation_->trace_face_block_size);
   mfem::GMRESSolver gmres;
-  gmres.SetOperator(*implementation_->trace_matrix);
   gmres.SetPreconditioner(*implementation_->trace_preconditioner);
+  gmres.SetOperator(*implementation_->trace_matrix);
   gmres.SetRelTol(1.0e-10); gmres.SetAbsTol(0.0);
   gmres.SetMaxIter(std::max(50, implementation_->trace_matrix->Height()));
   gmres.SetPrintLevel(0);
-  implementation_->trace_increment.SetSize(implementation_->trace_rhs.Size());
-  implementation_->trace_increment = 0.0;
-  gmres.Mult(implementation_->trace_rhs, implementation_->trace_increment);
-  return gmres.GetConverged();
+  mfem::Vector candidate_increment(implementation_->trace_rhs.Size());
+  candidate_increment = 0.0;
+  gmres.Mult(implementation_->trace_rhs, candidate_increment);
+  if (!gmres.GetConverged()) return false;
+  implementation_->trace_increment = candidate_increment;
+  implementation_->solve_generation = implementation_->condensation_generation;
+  if (!implementation_->pipeline) return false;
+  auto& pipeline_state = implementation_->pipeline_state;
+  pipeline_state.trace_solution = View(implementation_->trace_increment.GetData(), 1,
+                                       implementation_->trace_increment.Size(), 1);
+  TraceSolveRequest<SmoothEulerSpec> solve_request;
+  solve_request.trace_system = AsConst(pipeline_state.schur);
+  solve_request.right_hand_side = AsConst(pipeline_state.rhs);
+  TraceSolveResult<SmoothEulerSpec> solve_result;
+  implementation_->pipeline->SolveGlobalTraceSystem(solve_request, solve_result);
+  if (!pipeline_state.solved) return false;
+  return true;
 }
 
 bool SmoothEulerExperiment::RecoverInterior()
 {
   const int batches = implementation_->elements, ni = implementation_->local_interior,
             nt = implementation_->local_trace;
-  if (implementation_->trace_increment.Size() == 0) return false;
+  if (implementation_->trace_increment.Size() == 0 || implementation_->solve_generation == 0 ||
+      implementation_->solve_generation != implementation_->condensation_generation) return false;
   std::vector<double> local_trace(static_cast<std::size_t>(batches) * nt);
   for (int element = 0; element < batches; ++element)
     for (int local = 0; local < nt; ++local)
@@ -877,9 +1063,19 @@ bool SmoothEulerExperiment::RecoverInterior()
       local_trace[static_cast<std::size_t>(element) * nt + local] =
           sign * implementation_->trace_increment[vdof];
     }
-  implementation_->recovered.assign(static_cast<std::size_t>(batches) * ni, 0.0);
-  return implementation_->condensation.Recover(AsConst(View(local_trace.data(), batches, nt, 1)),
-      View(implementation_->recovered.data(), batches, ni, 1)) == core::Status::success;
+  std::vector<double> candidate_recovered(static_cast<std::size_t>(batches) * ni, 0.0);
+  if (implementation_->condensation.Recover(AsConst(View(local_trace.data(), batches, nt, 1)),
+      View(candidate_recovered.data(), batches, ni, 1)) != core::Status::success) return false;
+  implementation_->recovered = std::move(candidate_recovered);
+  implementation_->recovery_generation = implementation_->solve_generation;
+  if (!implementation_->pipeline) return false;
+  auto& pipeline_state = implementation_->pipeline_state;
+  pipeline_state.interior_solution = View(implementation_->recovered.data(), batches, ni, 1);
+  RecoveryRequest<SmoothEulerSpec> recovery_request;
+  RecoveryResult<SmoothEulerSpec> recovery_result;
+  implementation_->pipeline->RecoverInterior(recovery_request, recovery_result);
+  if (!pipeline_state.recovered) return false;
+  return true;
 }
 
 bool SmoothEulerExperiment::SolveDampedNewton(NewtonEvidence& evidence)
@@ -921,6 +1117,30 @@ bool SmoothEulerExperiment::CopyLocalLinearization(
   snapshot.f = implementation_->f;
   snapshot.g = implementation_->g;
   snapshot.signed_trace_dofs = implementation_->trace_dofs;
+  return true;
+}
+
+bool SmoothEulerExperiment::CopyTraceIncrement(std::vector<double>& increment) const
+{
+  increment.clear();
+  if (implementation_->solve_generation == 0 ||
+      implementation_->solve_generation != implementation_->condensation_generation ||
+      implementation_->trace_increment.Size() == 0) return false;
+  increment.assign(implementation_->trace_increment.GetData(),
+                   implementation_->trace_increment.GetData() +
+                       implementation_->trace_increment.Size());
+  return true;
+}
+
+bool SmoothEulerExperiment::CopyTraceRightHandSide(
+    std::vector<double>& right_hand_side) const
+{
+  right_hand_side.clear();
+  if (!implementation_->trace_matrix || implementation_->condensation_generation == 0 ||
+      implementation_->trace_rhs.Size() != implementation_->trace_matrix->Height()) return false;
+  right_hand_side.assign(implementation_->trace_rhs.GetData(),
+                         implementation_->trace_rhs.GetData() +
+                             implementation_->trace_rhs.Size());
   return true;
 }
 

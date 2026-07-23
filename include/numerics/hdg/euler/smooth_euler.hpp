@@ -196,6 +196,10 @@ public:
   const mfem::SparseMatrix* trace_matrix() const noexcept;
   /** Copies assembled blocks without exposing mutable implementation state. */
   bool CopyLocalLinearization(LocalLinearizationSnapshot& snapshot) const;
+  /** Copies the assembled trace right-hand side for independent solve checks. */
+  bool CopyTraceRightHandSide(std::vector<double>& right_hand_side) const;
+  /** Copies the current trace increment only after a successful trace solve. */
+  bool CopyTraceIncrement(std::vector<double>& increment) const;
 
 private:
   struct Implementation;

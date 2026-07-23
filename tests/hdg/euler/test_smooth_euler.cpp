@@ -492,6 +492,34 @@ int TestFaceBlockDirectionalAndIndependentSchurOracles()
       if (!Close(monolithic[static_cast<std::size_t>(row) * condensed.Width() + column],
                  condensed(row, column), 2.0e-10)) return 8;
     }
+  // Exercise the actual similarity-permuted BlockILU/GMRES path, then check
+  // its global residual and an independently pivoted dense reference solve.
+  if (!experiment.SolveTrace()) return 9;
+  std::vector<double> trace_increment, trace_rhs;
+  if (!experiment.CopyTraceIncrement(trace_increment) ||
+      !experiment.CopyTraceRightHandSide(trace_rhs)) return 10;
+  for (int row = 0; row < condensed.Height(); ++row)
+  {
+    double action = 0.0;
+    for (int column = 0; column < condensed.Width(); ++column)
+    {
+      action += condensed(row, column) * trace_increment[column];
+    }
+    if (!Close(action, trace_rhs[row], 2.0e-9)) return 11;
+  }
+  std::vector<double> dense_matrix(static_cast<std::size_t>(condensed.Height()) * condensed.Width());
+  for (int row = 0; row < condensed.Height(); ++row)
+    for (int column = 0; column < condensed.Width(); ++column)
+    {
+      dense_matrix[static_cast<std::size_t>(row) * condensed.Width() + column] =
+          condensed(row, column);
+    }
+  std::vector<double> dense_solution = trace_rhs;
+  if (!SolveDense(std::move(dense_matrix), dense_solution, condensed.Height())) return 12;
+  for (int row = 0; row < condensed.Height(); ++row)
+  {
+    if (!Close(trace_increment[row], dense_solution[row], 3.0e-8)) return 13;
+  }
   // Independently resolve the local interior state for two perturbed traces,
   // then difference the reduced residual.  This is not ApplySchur applied to
   // itself: the interior solve and residual evaluation are reconstructed here.
@@ -507,7 +535,7 @@ int TestFaceBlockDirectionalAndIndependentSchurOracles()
   }
   const std::vector<double> reduced_plus = ResolveInteriorThenEvaluateTrace(snapshot, 0, plus);
   const std::vector<double> reduced_minus = ResolveInteriorThenEvaluateTrace(snapshot, 0, minus);
-  if (reduced_plus.empty() || reduced_minus.empty()) return 9;
+  if (reduced_plus.empty() || reduced_minus.empty()) return 14;
   for (int row = 0; row < snapshot.trace_dofs; ++row)
     for (int column = 0; column < snapshot.trace_dofs; ++column)
     {
@@ -516,7 +544,7 @@ int TestFaceBlockDirectionalAndIndependentSchurOracles()
   for (int row = 0; row < snapshot.trace_dofs; ++row)
   {
     const double derivative = (reduced_plus[row] - reduced_minus[row]) / (2.0 * reduced_step);
-    if (!Close(derivative, expected[row], 2.0e-6)) return 10;
+    if (!Close(derivative, expected[row], 2.0e-6)) return 15;
   }
   return 0;
 }
