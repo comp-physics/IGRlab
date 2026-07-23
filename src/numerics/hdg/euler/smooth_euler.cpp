@@ -612,6 +612,74 @@ double MaxAbsDifference(const std::vector<double>& first,
   return result;
 }
 
+bool FiniteVector(const std::vector<double>& values) noexcept
+{
+  return std::all_of(values.begin(), values.end(),
+                     [](const double value) { return std::isfinite(value); });
+}
+
+bool AccumulateRelativeSquares(const std::vector<double>& initial,
+                               const std::vector<double>& current,
+                               long double& difference_squared,
+                               long double& initial_squared) noexcept
+{
+  if (initial.size() != current.size() || !FiniteVector(initial) ||
+      !FiniteVector(current))
+  {
+    return false;
+  }
+  for (std::size_t index = 0; index < initial.size(); ++index)
+  {
+    const long double difference = static_cast<long double>(current[index]) -
+                                   initial[index];
+    difference_squared += difference * difference;
+    initial_squared += static_cast<long double>(initial[index]) * initial[index];
+  }
+  return true;
+}
+
+double RelativeCoefficientChange(const std::vector<double>& initial_interior,
+                                 const std::vector<double>& final_interior,
+                                 const std::vector<double>& initial_trace,
+                                 const std::vector<double>& final_trace) noexcept
+{
+  long double difference_squared = 0.0L, initial_squared = 0.0L;
+  if (!AccumulateRelativeSquares(initial_interior, final_interior,
+                                 difference_squared, initial_squared) ||
+      !AccumulateRelativeSquares(initial_trace, final_trace,
+                                 difference_squared, initial_squared))
+  {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const long double denominator = std::max(initial_squared, 1.0e-600L);
+  return std::sqrt(static_cast<double>(difference_squared / denominator));
+}
+
+double RelativeJacobianChange(const std::vector<double>& initial_a,
+                              const std::vector<double>& current_a,
+                              const std::vector<double>& initial_b,
+                              const std::vector<double>& current_b,
+                              const std::vector<double>& initial_c,
+                              const std::vector<double>& current_c,
+                              const std::vector<double>& initial_d,
+                              const std::vector<double>& current_d) noexcept
+{
+  long double difference_squared = 0.0L, initial_squared = 0.0L;
+  if (!AccumulateRelativeSquares(initial_a, current_a, difference_squared,
+                                 initial_squared) ||
+      !AccumulateRelativeSquares(initial_b, current_b, difference_squared,
+                                 initial_squared) ||
+      !AccumulateRelativeSquares(initial_c, current_c, difference_squared,
+                                 initial_squared) ||
+      !AccumulateRelativeSquares(initial_d, current_d, difference_squared,
+                                 initial_squared))
+  {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const long double denominator = std::max(initial_squared, 1.0e-600L);
+  return std::sqrt(static_cast<double>(difference_squared / denominator));
+}
+
 double ResidualNorm(const std::vector<double>& interior_residual,
                     const std::vector<double>& trace_residual,
                     const std::vector<int>& signed_trace_dofs,
@@ -674,8 +742,11 @@ void ObserveAdmissibility(const ConservedState& state,
     pressure = true;
     return;
   }
-  const double speed = std::hypot(state[1] / state[0], state[2] / state[0]) +
-                       std::sqrt(gamma * p / state[0]);
+  const double rho = state[0];
+  const double u = state[1] / rho;
+  const double v = state[2] / rho;
+  const double speed = std::sqrt(u * u + v * v) +
+                       std::sqrt(gamma * p / rho);
   if (!std::isfinite(speed))
   {
     nonfinite = true;
@@ -970,7 +1041,7 @@ double ManufacturedMaximumWaveSpeed() noexcept
   // With r=cos(2*pi*x)sin(2*pi*y), s=sin(2*pi*x)cos(2*pi*y), r^2+s^2<=1.
   // Hence |(u,v)| <= |(.35,-.20)| + .05 and p/rho <= 1.1/.9. This is a
   // proved bound, unlike the previous sampled value, and remains below 1.78.
-  return std::hypot(0.35, 0.20) + 0.05 +
+  return std::sqrt(0.35 * 0.35 + 0.20 * 0.20) + 0.05 +
          std::sqrt(gamma * 1.1 / 0.9);
 }
 
@@ -1003,6 +1074,7 @@ struct SmoothEulerExperiment::Implementation
   std::unique_ptr<SmoothEulerPipeline> pipeline;
   SolvedMeshEvidence solved_evidence{};
   bool has_solved_evidence = false;
+  bool rollback_probe_mode = false;
 
   void InvalidateNumericalState()
   {
@@ -1820,8 +1892,9 @@ bool SmoothEulerExperiment::RecoverInterior()
 bool SmoothEulerExperiment::SolveDampedNewton(NewtonEvidence& evidence)
 {
   implementation_->solved_evidence = {};
+  implementation_->rollback_probe_mode = false;
   const bool success = SolveNewtonTransaction(
-      evidence, &implementation_->solved_evidence, 20);
+      evidence, &implementation_->solved_evidence);
   implementation_->has_solved_evidence = success;
   return success;
 }
@@ -1893,6 +1966,13 @@ bool SmoothEulerExperiment::IntegrateErrorEvidence(
     {
       const mfem::IntegrationPoint& point = rule.IntPoint(q);
       transformation->SetIntPoint(&point);
+      mfem::Vector scaled_normal(dimension);
+      mfem::CalcOrtho(transformation->Jacobian(), scaled_normal);
+      const double face_measure = scaled_normal.Norml2();
+      if (!(face_measure > 0.0) || !std::isfinite(face_measure)) return false;
+      const std::array<double, dimension> normal{{
+          scaled_normal[0] / face_measure, scaled_normal[1] / face_measure}};
+      if (!IsFinite(normal)) return false;
       mfem::Vector physical(dimension);
       transformation->Transform(point, physical);
       fe->CalcShape(point, shape);
@@ -1903,8 +1983,9 @@ bool SmoothEulerExperiment::IntegrateErrorEvidence(
       {
         return false;
       }
-      // Face Jacobian Weight is applied exactly once to each unique face.
-      const double weight = point.weight * transformation->Weight();
+      // CalcOrtho supplies and normalizes the physical normal; its norm is the
+      // face Jacobian and is applied exactly once to each unique face.
+      const double weight = point.weight * face_measure;
       if (!(weight > 0.0) || !std::isfinite(weight)) return false;
       trace_measure += weight;
       for (int component = 0; component < conserved_components; ++component)
@@ -1928,8 +2009,10 @@ bool SmoothEulerExperiment::IntegrateErrorEvidence(
     output.rms = std::sqrt(output.error_squared / output.measure);
     output.relative_l2 = std::sqrt(output.error_squared / output.exact_norm_squared);
     output.unique_face_count = faces;
-    return std::isfinite(output.direct_l2) && std::isfinite(output.rms) &&
-           std::isfinite(output.relative_l2);
+    return std::isfinite(output.error_squared) &&
+           std::isfinite(output.exact_norm_squared) &&
+           std::isfinite(output.measure) && std::isfinite(output.direct_l2) &&
+           std::isfinite(output.rms) && std::isfinite(output.relative_l2);
   };
   return publish(volume_error, volume_norm, volume_measure, 0, volume) &&
          publish(trace_error, trace_norm, trace_measure,
@@ -1937,12 +2020,10 @@ bool SmoothEulerExperiment::IntegrateErrorEvidence(
 }
 
 bool SmoothEulerExperiment::SolveNewtonTransaction(
-    NewtonEvidence& evidence, SolvedMeshEvidence* solved_evidence,
-    const int maximum_accepted_updates)
+    NewtonEvidence& evidence, SolvedMeshEvidence* solved_evidence)
 {
   evidence = {};
-  if (maximum_accepted_updates < 1 || maximum_accepted_updates > 20 ||
-      !implementation_->mesh || !implementation_->interior_space ||
+  if (!implementation_->mesh || !implementation_->interior_space ||
       !implementation_->trace_space || !implementation_->old_interior ||
       !implementation_->old_trace || !implementation_->current_interior ||
       !implementation_->current_trace)
@@ -1981,6 +2062,13 @@ bool SmoothEulerExperiment::SolveNewtonTransaction(
     return false;
   };
 
+  if (!FiniteVector(solved.old_interior) || !FiniteVector(solved.old_trace) ||
+      !FiniteVector(solved.initial_interior) ||
+      !FiniteVector(solved.initial_trace))
+  {
+    return fail(ExperimentStatus::EvidenceConsistencyFailure);
+  }
+
   AdmissibilityEvidence initial_admissibility{};
   const bool initial_screen_evaluated = PrescreenFields(
       *implementation_->mesh, *implementation_->interior_space,
@@ -2011,6 +2099,10 @@ bool SmoothEulerExperiment::SolveNewtonTransaction(
   solved.initial_residual_trace = implementation_->residual_g;
   solved.signed_trace_dofs = implementation_->trace_dofs;
   solved.residual_history.push_back(residual);
+  const std::vector<double> initial_a = implementation_->a;
+  const std::vector<double> initial_b = implementation_->b;
+  const std::vector<double> initial_c = implementation_->c;
+  const std::vector<double> initial_d = implementation_->d;
   if (!(residual > 1.0e-8))
   {
     return fail(ExperimentStatus::EvidenceConsistencyFailure);
@@ -2099,6 +2191,7 @@ bool SmoothEulerExperiment::SolveNewtonTransaction(
 
   const double target = 1.0e-10 * (1.0 + evidence.initial_residual);
   bool captured_first_rejected_trial = false;
+  bool captured_first_accepted_trial = false;
   for (int nonlinear_iteration = 0; nonlinear_iteration < 20; ++nonlinear_iteration)
   {
     if (evidence.nonlinear_iterations >= 2 && residual <= target) break;
@@ -2265,6 +2358,8 @@ bool SmoothEulerExperiment::SolveNewtonTransaction(
         trial.generation_discarded = true;
         audit.rejection_reason = trial.rejection_reason;
         audit.generation_discarded = true;
+        audit.post_decision_interior = base_interior;
+        audit.post_decision_trace = base_trace;
         ++evidence.rejected_trials;
         solved.trial_history.push_back(trial);
         if (!captured_first_rejected_trial)
@@ -2286,7 +2381,6 @@ bool SmoothEulerExperiment::SolveNewtonTransaction(
         trial.status = ExperimentStatus::AssemblyFailure;
         audit.status = ExperimentStatus::AssemblyFailure;
         solved.trial_history.push_back(trial);
-        solved.trial_audits.push_back(std::move(audit));
         return fail(ExperimentStatus::AssemblyFailure);
       }
       const double trial_residual = ResidualNorm(
@@ -2314,6 +2408,8 @@ bool SmoothEulerExperiment::SolveNewtonTransaction(
         trial.generation_discarded = true;
         audit.rejection_reason = trial.rejection_reason;
         audit.generation_discarded = true;
+        audit.post_decision_interior = base_interior;
+        audit.post_decision_trace = base_trace;
         ++evidence.rejected_trials;
         solved.trial_history.push_back(trial);
         if (!captured_first_rejected_trial)
@@ -2331,8 +2427,17 @@ bool SmoothEulerExperiment::SolveNewtonTransaction(
       trial.generation_published = true;
       audit.accepted = true;
       audit.generation_published = true;
+      audit.post_decision_interior = trial_interior;
+      audit.post_decision_trace = trial_trace;
       solved.trial_history.push_back(trial);
-      solved.trial_audits.push_back(std::move(audit));
+      if (!captured_first_accepted_trial)
+      {
+        evidence.relative_jacobian_change = RelativeJacobianChange(
+            initial_a, implementation_->a, initial_b, implementation_->b,
+            initial_c, implementation_->c, initial_d, implementation_->d);
+        solved.trial_audits.push_back(std::move(audit));
+        captured_first_accepted_trial = true;
+      }
       residual = trial_residual;
       solved.residual_history.push_back(residual);
       ++evidence.nonlinear_iterations;
@@ -2349,13 +2454,24 @@ bool SmoothEulerExperiment::SolveNewtonTransaction(
           evidence.maximum_coefficient_update, trial.coefficient_update);
       evidence.maximum_jacobian_change = std::max(
           evidence.maximum_jacobian_change, trial.jacobian_change);
+      if (evidence.nonlinear_iterations == 1)
+      {
+        evidence.residual_after_first_accepted = residual;
+        evidence.residual_after_first_above_convergence =
+            std::isfinite(residual) && residual > target;
+      }
       accepted = true;
       break;
     }
     if (!accepted) return fail(ExperimentStatus::LineSearchExhausted);
-    if (maximum_accepted_updates < 20 &&
-        evidence.nonlinear_iterations >= maximum_accepted_updates)
+    if (implementation_->rollback_probe_mode &&
+        evidence.nonlinear_iterations == 1)
     {
+      if (!std::isfinite(evidence.residual_after_first_accepted) ||
+          !evidence.residual_after_first_above_convergence)
+      {
+        return fail(ExperimentStatus::EvidenceConsistencyFailure);
+      }
       return fail(ExperimentStatus::IterationLimit);
     }
   }
@@ -2364,9 +2480,17 @@ bool SmoothEulerExperiment::SolveNewtonTransaction(
   {
     return fail(ExperimentStatus::IterationLimit);
   }
+  const std::vector<double> final_interior =
+      GridValues(*implementation_->current_interior);
+  const std::vector<double> final_trace =
+      GridValues(*implementation_->current_trace);
+  evidence.relative_coefficient_change = RelativeCoefficientChange(
+      solved.initial_interior, final_interior, solved.initial_trace, final_trace);
   if (evidence.linear_iterations < 1 ||
-      !(evidence.maximum_coefficient_update >= 1.0e-6) ||
-      !(evidence.maximum_jacobian_change >= 1.0e-8))
+      !std::isfinite(evidence.relative_coefficient_change) ||
+      !std::isfinite(evidence.relative_jacobian_change) ||
+      !(evidence.relative_coefficient_change >= 1.0e-6) ||
+      !(evidence.relative_jacobian_change >= 1.0e-8))
   {
     return fail(ExperimentStatus::EvidenceConsistencyFailure);
   }
@@ -2375,8 +2499,8 @@ bool SmoothEulerExperiment::SolveNewtonTransaction(
   evidence.admissible = true;
   solved.status = ExperimentStatus::Success;
   solved.newton = evidence;
-  solved.final_interior = GridValues(*implementation_->current_interior);
-  solved.final_trace = GridValues(*implementation_->current_trace);
+  solved.final_interior = final_interior;
+  solved.final_trace = final_trace;
   solved.final_residual_interior = implementation_->residual_r;
   solved.final_residual_trace = implementation_->residual_g;
   return true;
@@ -2429,7 +2553,8 @@ bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
       return fail_ladder(ExperimentStatus::ProjectionFailure);
     }
     NewtonEvidence newton{};
-    if (!SolveNewtonTransaction(newton, &solved, 20))
+    implementation_->rollback_probe_mode = false;
+    if (!SolveNewtonTransaction(newton, &solved))
     {
       return fail_ladder(newton.status);
     }
@@ -2454,18 +2579,52 @@ bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
                  1.0e-8 &&
              q_e_plus_four.relative_l2 > 100.0 * difference;
     };
+    const auto error_integral_is_valid = [](const ErrorIntegralEvidence& value)
+    {
+      if (!std::isfinite(value.error_squared) ||
+          !std::isfinite(value.exact_norm_squared) ||
+          !std::isfinite(value.measure) || !std::isfinite(value.direct_l2) ||
+          !std::isfinite(value.rms) || !std::isfinite(value.relative_l2) ||
+          !(value.error_squared > 0.0) || !(value.exact_norm_squared > 0.0) ||
+          !(value.measure > 0.0) || !(value.direct_l2 > 0.0) ||
+          !(value.rms > 0.0) || !(value.relative_l2 > 0.0))
+      {
+        return false;
+      }
+      const double scale = std::max(1.0, value.error_squared);
+      return std::abs(value.direct_l2 * value.direct_l2 -
+                      value.error_squared) <=
+                 128.0 * experiment_epsilon * scale &&
+             std::abs(value.rms * value.rms * value.measure -
+                      value.error_squared) <=
+                 128.0 * experiment_epsilon * scale &&
+             std::abs(value.relative_l2 * value.relative_l2 *
+                          value.exact_norm_squared - value.error_squared) <=
+                 128.0 * experiment_epsilon * scale;
+    };
     const double expected_trace_measure = 2.0 * widths[mesh_index];
-    if (!error_pair_is_valid(solved.q_e_volume,
+    const double trace_measure_tolerance = 128.0 * experiment_epsilon *
+        std::max(1.0, expected_trace_measure);
+    if (!error_integral_is_valid(solved.q_e_volume) ||
+        !error_integral_is_valid(solved.q_e_plus_four_volume) ||
+        !error_integral_is_valid(solved.q_e_trace) ||
+        !error_integral_is_valid(solved.q_e_plus_four_trace) ||
+        !error_pair_is_valid(solved.q_e_volume,
                              solved.q_e_plus_four_volume) ||
         !error_pair_is_valid(solved.q_e_trace,
                              solved.q_e_plus_four_trace) ||
+        solved.q_e_trace.unique_face_count !=
+            2 * widths[mesh_index] * widths[mesh_index] ||
         solved.q_e_plus_four_trace.unique_face_count !=
             2 * widths[mesh_index] * widths[mesh_index] ||
+        std::abs(solved.q_e_volume.measure - 1.0) >
+            128.0 * experiment_epsilon ||
         std::abs(solved.q_e_plus_four_volume.measure - 1.0) >
             128.0 * experiment_epsilon ||
+        std::abs(solved.q_e_trace.measure - expected_trace_measure) >
+            trace_measure_tolerance ||
         std::abs(solved.q_e_plus_four_trace.measure - expected_trace_measure) >
-            128.0 * experiment_epsilon *
-                std::max(1.0, expected_trace_measure))
+            trace_measure_tolerance)
     {
       return fail_ladder(ExperimentStatus::ErrorFloorFailure);
     }
@@ -2607,91 +2766,117 @@ const SolvedMeshEvidence* SmoothEulerExperiment::solved_evidence() const noexcep
       &implementation_->solved_evidence : nullptr;
 }
 
-bool SmoothEulerExperiment::RunRollbackProbe(RollbackAuditEvidence& evidence)
-{
-  evidence = {};
-  if (polynomial_order_ != 1 || !BuildPeriodicMesh(3))
-  {
-    evidence.status = ExperimentStatus::SetupFailure;
-    return false;
-  }
-  if (!ProjectOldStage() || !ProjectPerturbedCurrentStage())
-  {
-    evidence.status = ExperimentStatus::ProjectionFailure;
-    return false;
-  }
-  evidence.entry_interior = GridValues(*implementation_->current_interior);
-  evidence.entry_trace = GridValues(*implementation_->current_trace);
-  evidence.entry_interior_hash = HashValues(evidence.entry_interior);
-  evidence.entry_trace_hash = HashValues(evidence.entry_trace);
-  if (!PrescreenFields(*implementation_->mesh, *implementation_->interior_space,
-                       *implementation_->trace_space,
-                       *implementation_->current_interior,
-                       *implementation_->current_trace, quadrature_order_,
-                       evidence.initial_admissibility) ||
-      !evidence.initial_admissibility.passed)
-  {
-    evidence.status = ExperimentStatus::InitialAdmissibilityFailure;
-    return false;
-  }
-
-  NewtonEvidence newton{};
-  SolvedMeshEvidence private_solved{};
-  evidence.returned_success =
-      SolveNewtonTransaction(newton, &private_solved, 1);
-  evidence.status = newton.status;
-  evidence.accepted_updates = newton.nonlinear_iterations;
-  evidence.restored_interior = GridValues(*implementation_->current_interior);
-  evidence.restored_trace = GridValues(*implementation_->current_trace);
-  evidence.restored_interior_hash = HashValues(evidence.restored_interior);
-  evidence.restored_trace_hash = HashValues(evidence.restored_trace);
-  evidence.interior_byte_equal =
-      evidence.entry_interior.size() == evidence.restored_interior.size() &&
-      std::memcmp(evidence.entry_interior.data(), evidence.restored_interior.data(),
-                  evidence.entry_interior.size() * sizeof(double)) == 0;
-  evidence.trace_byte_equal =
-      evidence.entry_trace.size() == evidence.restored_trace.size() &&
-      std::memcmp(evidence.entry_trace.data(), evidence.restored_trace.data(),
-                  evidence.entry_trace.size() * sizeof(double)) == 0;
-  evidence.local_generation_invalid =
-      implementation_->linearization_generation == 0;
-  evidence.condensed_generation_invalid =
-      implementation_->condensation_generation == 0;
-  evidence.solve_generation_invalid = implementation_->solve_generation == 0 &&
-                                         implementation_->recovery_generation == 0;
-  LocalLinearizationSnapshot local_snapshot;
-  std::vector<double> right_hand_side, increment;
-  evidence.local_copy_rejected = !CopyLocalLinearization(local_snapshot);
-  evidence.right_hand_side_copy_rejected =
-      !CopyTraceRightHandSide(right_hand_side);
-  evidence.trace_increment_copy_rejected = !CopyTraceIncrement(increment);
-  evidence.condensation_consume_rejected = !CondenseAndAssembleTrace();
-  evidence.solve_consume_rejected = !SolveTrace();
-  evidence.recovery_consume_rejected = !RecoverInterior();
-  evidence.partial_solve_evidence = implementation_->has_solved_evidence;
-  evidence.partial_convergence_evidence = false;
-  evidence.passed = !evidence.returned_success &&
-      evidence.status == ExperimentStatus::IterationLimit &&
-      evidence.initial_admissibility.passed && evidence.accepted_updates == 1 &&
-      evidence.interior_byte_equal && evidence.trace_byte_equal &&
-      evidence.entry_interior_hash == evidence.restored_interior_hash &&
-      evidence.entry_trace_hash == evidence.restored_trace_hash &&
-      evidence.local_generation_invalid && evidence.condensed_generation_invalid &&
-      evidence.solve_generation_invalid && evidence.local_copy_rejected &&
-      evidence.right_hand_side_copy_rejected &&
-      evidence.trace_increment_copy_rejected &&
-      evidence.condensation_consume_rejected &&
-      evidence.solve_consume_rejected && evidence.recovery_consume_rejected &&
-      !evidence.partial_solve_evidence && !evidence.partial_convergence_evidence;
-  return evidence.passed;
-}
-
 bool RunSmoothEulerExperiment(ExperimentEvidence& evidence)
 {
   evidence = {};
+  // The probe selector and transaction call remain source-local.  This invokes
+  // the same Newton transaction as an ordinary solve; it exposes no public or
+  // header-visible one-step control.
+  const auto run_rollback_probe = [](SmoothEulerExperiment& experiment,
+                                     RollbackAuditEvidence& rollback)
+  {
+    rollback = {};
+    if (experiment.polynomial_order_ != 1 || !experiment.BuildPeriodicMesh(3))
+    {
+      rollback.status = ExperimentStatus::SetupFailure;
+      return false;
+    }
+    if (!experiment.ProjectOldStage() ||
+        !experiment.ProjectPerturbedCurrentStage())
+    {
+      rollback.status = ExperimentStatus::ProjectionFailure;
+      return false;
+    }
+    auto& implementation = *experiment.implementation_;
+    rollback.entry_interior = GridValues(*implementation.current_interior);
+    rollback.entry_trace = GridValues(*implementation.current_trace);
+    rollback.entry_interior_hash = HashValues(rollback.entry_interior);
+    rollback.entry_trace_hash = HashValues(rollback.entry_trace);
+    if (!FiniteVector(rollback.entry_interior) ||
+        !FiniteVector(rollback.entry_trace) ||
+        !PrescreenFields(*implementation.mesh, *implementation.interior_space,
+                         *implementation.trace_space,
+                         *implementation.current_interior,
+                         *implementation.current_trace,
+                         experiment.quadrature_order_,
+                         rollback.initial_admissibility) ||
+        !rollback.initial_admissibility.passed)
+    {
+      rollback.status = ExperimentStatus::InitialAdmissibilityFailure;
+      return false;
+    }
+
+    NewtonEvidence newton{};
+    SolvedMeshEvidence private_solved{};
+    implementation.rollback_probe_mode = true;
+    rollback.returned_success =
+        experiment.SolveNewtonTransaction(newton, &private_solved);
+    implementation.rollback_probe_mode = false;
+    rollback.status = newton.status;
+    rollback.accepted_updates = newton.nonlinear_iterations;
+    rollback.initial_residual = newton.initial_residual;
+    rollback.residual_after_first_accepted =
+        newton.residual_after_first_accepted;
+    rollback.residual_after_first_above_convergence =
+        newton.residual_after_first_above_convergence;
+    rollback.restored_interior = GridValues(*implementation.current_interior);
+    rollback.restored_trace = GridValues(*implementation.current_trace);
+    rollback.restored_interior_hash = HashValues(rollback.restored_interior);
+    rollback.restored_trace_hash = HashValues(rollback.restored_trace);
+    rollback.interior_byte_equal =
+        rollback.entry_interior.size() == rollback.restored_interior.size() &&
+        std::memcmp(rollback.entry_interior.data(), rollback.restored_interior.data(),
+                    rollback.entry_interior.size() * sizeof(double)) == 0;
+    rollback.trace_byte_equal =
+        rollback.entry_trace.size() == rollback.restored_trace.size() &&
+        std::memcmp(rollback.entry_trace.data(), rollback.restored_trace.data(),
+                    rollback.entry_trace.size() * sizeof(double)) == 0;
+    rollback.local_generation_invalid =
+        implementation.linearization_generation == 0;
+    rollback.condensed_generation_invalid =
+        implementation.condensation_generation == 0;
+    rollback.solve_generation_invalid = implementation.solve_generation == 0 &&
+        implementation.recovery_generation == 0;
+    LocalLinearizationSnapshot local_snapshot;
+    std::vector<double> right_hand_side, increment;
+    rollback.local_copy_rejected =
+        !experiment.CopyLocalLinearization(local_snapshot);
+    rollback.right_hand_side_copy_rejected =
+        !experiment.CopyTraceRightHandSide(right_hand_side);
+    rollback.trace_increment_copy_rejected =
+        !experiment.CopyTraceIncrement(increment);
+    rollback.condensation_consume_rejected =
+        !experiment.CondenseAndAssembleTrace();
+    rollback.solve_consume_rejected = !experiment.SolveTrace();
+    rollback.recovery_consume_rejected = !experiment.RecoverInterior();
+    rollback.partial_solve_evidence = implementation.has_solved_evidence;
+    rollback.partial_convergence_evidence = false;
+    rollback.passed = !rollback.returned_success &&
+        rollback.status == ExperimentStatus::IterationLimit &&
+        rollback.initial_admissibility.passed && rollback.accepted_updates == 1 &&
+        std::isfinite(rollback.initial_residual) &&
+        std::isfinite(rollback.residual_after_first_accepted) &&
+        rollback.residual_after_first_above_convergence &&
+        rollback.residual_after_first_accepted >
+            1.0e-10 * (1.0 + newton.initial_residual) &&
+        rollback.interior_byte_equal && rollback.trace_byte_equal &&
+        rollback.entry_interior_hash == rollback.restored_interior_hash &&
+        rollback.entry_trace_hash == rollback.restored_trace_hash &&
+        rollback.local_generation_invalid &&
+        rollback.condensed_generation_invalid &&
+        rollback.solve_generation_invalid && rollback.local_copy_rejected &&
+        rollback.right_hand_side_copy_rejected &&
+        rollback.trace_increment_copy_rejected &&
+        rollback.condensation_consume_rejected &&
+        rollback.solve_consume_rejected && rollback.recovery_consume_rejected &&
+        !rollback.partial_solve_evidence &&
+        !rollback.partial_convergence_evidence;
+    return rollback.passed;
+  };
+
   SmoothEulerExperiment rollback_experiment(1);
   RollbackAuditEvidence rollback{};
-  if (!rollback_experiment.RunRollbackProbe(rollback))
+  if (!run_rollback_probe(rollback_experiment, rollback))
   {
     evidence.status = rollback.status == ExperimentStatus::Success ?
         ExperimentStatus::EvidenceConsistencyFailure : rollback.status;

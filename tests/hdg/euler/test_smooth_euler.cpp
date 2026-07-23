@@ -50,11 +50,21 @@ using dg::hdg::euler::experiment_epsilon;
 
 bool Close(const double left, const double right, const double tolerance)
 {
-  return std::abs(left - right) <= tolerance * std::max({1.0, std::abs(left), std::abs(right)});
+  return std::isfinite(left) && std::isfinite(right) &&
+         std::isfinite(tolerance) && tolerance >= 0.0 &&
+         std::abs(left - right) <=
+             tolerance * std::max({1.0, std::abs(left), std::abs(right)});
+}
+
+bool FiniteVector(const std::vector<double>& values)
+{
+  return std::all_of(values.begin(), values.end(),
+                     [](const double value) { return std::isfinite(value); });
 }
 
 double InfinityNorm(const std::vector<double>& values)
 {
+  if (!FiniteVector(values)) return std::numeric_limits<double>::infinity();
   double result = 0.0;
   for (const double value : values) { result = std::max(result, std::abs(value)); }
   return result;
@@ -63,13 +73,67 @@ double InfinityNorm(const std::vector<double>& values)
 double DifferenceNorm(const std::vector<double>& left,
                       const std::vector<double>& right)
 {
-  if (left.size() != right.size()) return std::numeric_limits<double>::infinity();
+  if (left.size() != right.size() || !FiniteVector(left) || !FiniteVector(right))
+  {
+    return std::numeric_limits<double>::infinity();
+  }
   double result = 0.0;
   for (std::size_t i = 0; i < left.size(); ++i)
   {
     result = std::max(result, std::abs(left[i] - right[i]));
   }
   return result;
+}
+
+double RelativeCoefficientTwoNorm(const std::vector<double>& initial,
+                                  const std::vector<double>& current)
+{
+  if (initial.size() != current.size() || !FiniteVector(initial) ||
+      !FiniteVector(current))
+  {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  long double difference_squared = 0.0L, initial_squared = 0.0L;
+  for (std::size_t index = 0; index < initial.size(); ++index)
+  {
+    const long double difference = static_cast<long double>(current[index]) -
+                                   initial[index];
+    difference_squared += difference * difference;
+    initial_squared += static_cast<long double>(initial[index]) * initial[index];
+  }
+  return std::sqrt(static_cast<double>(difference_squared)) /
+         std::max(std::sqrt(static_cast<double>(initial_squared)), 1.0e-300);
+}
+
+double ConcatenatedCoefficientRelativeTwoNorm(
+    const std::vector<double>& initial_interior,
+    const std::vector<double>& final_interior,
+    const std::vector<double>& initial_trace,
+    const std::vector<double>& final_trace)
+{
+  if (initial_interior.size() != final_interior.size() ||
+      initial_trace.size() != final_trace.size() ||
+      !FiniteVector(initial_interior) || !FiniteVector(final_interior) ||
+      !FiniteVector(initial_trace) || !FiniteVector(final_trace))
+  {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  long double difference_squared = 0.0L, initial_squared = 0.0L;
+  const auto accumulate = [&](const std::vector<double>& initial,
+                              const std::vector<double>& current)
+  {
+    for (std::size_t index = 0; index < initial.size(); ++index)
+    {
+      const long double difference = static_cast<long double>(current[index]) -
+                                     initial[index];
+      difference_squared += difference * difference;
+      initial_squared += static_cast<long double>(initial[index]) * initial[index];
+    }
+  };
+  accumulate(initial_interior, final_interior);
+  accumulate(initial_trace, final_trace);
+  return std::sqrt(static_cast<double>(difference_squared)) /
+         std::max(std::sqrt(static_cast<double>(initial_squared)), 1.0e-300);
 }
 
 void NormalizeInfinity(std::vector<double>& values)
@@ -379,6 +443,223 @@ bool AssembleIndependentQOnSpaces(
     trace_offset += face_vdofs.Size();
   }
   return trace_offset == static_cast<int>(trace.size());
+}
+
+using OracleFluxMatrix =
+    std::array<std::array<double, conserved_components>, conserved_components>;
+
+bool OracleFluxJacobian(const ConservedState& state,
+                        const std::array<double, dimension>& normal,
+                        OracleFluxMatrix& jacobian)
+{
+  if (!std::all_of(state.begin(), state.end(),
+                   [](const double value) { return std::isfinite(value); }) ||
+      !std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
+      !(state[0] > 0.0))
+  {
+    return false;
+  }
+  const double rho = state[0], mx = state[1], my = state[2], energy = state[3];
+  const double momentum_normal = normal[0] * mx + normal[1] * my;
+  const double normal_velocity = momentum_normal / rho;
+  const double pressure = (gamma - 1.0) *
+      (energy - 0.5 * (mx * mx + my * my) / rho);
+  if (!(pressure > 0.0) || !std::isfinite(pressure)) return false;
+  const std::array<double, conserved_components> dp{{
+      0.5 * (gamma - 1.0) * (mx * mx + my * my) / (rho * rho),
+      -(gamma - 1.0) * mx / rho,
+      -(gamma - 1.0) * my / rho,
+      gamma - 1.0}};
+  const std::array<double, conserved_components> dvn{{
+      -momentum_normal / (rho * rho), normal[0] / rho,
+      normal[1] / rho, 0.0}};
+  jacobian = {};
+  jacobian[0][1] = normal[0];
+  jacobian[0][2] = normal[1];
+  for (int column = 0; column < conserved_components; ++column)
+  {
+    jacobian[1][column] = (column == 1 ? normal_velocity : 0.0) +
+        mx * dvn[column] + normal[0] * dp[column];
+    jacobian[2][column] = (column == 2 ? normal_velocity : 0.0) +
+        my * dvn[column] + normal[1] * dp[column];
+    jacobian[3][column] =
+        ((column == 3 ? 1.0 : 0.0) + dp[column]) * normal_velocity +
+        (energy + pressure) * dvn[column];
+  }
+  for (const auto& row : jacobian)
+    for (const double value : row)
+      if (!std::isfinite(value)) return false;
+  return true;
+}
+
+bool AssembleIndependentAnalyticBlocks(
+    const mfem::FiniteElementSpace& interior_space,
+    const mfem::FiniteElementSpace& trace_space, const int quadrature_order,
+    const int element, const std::vector<double>& interior,
+    const std::vector<double>& trace, std::vector<double>& a,
+    std::vector<double>& b, std::vector<double>& c, std::vector<double>& d)
+{
+  if (interior_space.GetMesh() == nullptr ||
+      interior_space.GetMesh() != trace_space.GetMesh()) return false;
+  mfem::Mesh& mesh = *interior_space.GetMesh();
+  const mfem::FiniteElement* fe = interior_space.GetFE(element);
+  mfem::ElementTransformation* transformation =
+      mesh.GetElementTransformation(element);
+  if (fe == nullptr || transformation == nullptr) return false;
+  const int scalar_dofs = fe->GetDof();
+  const int ni = conserved_components * scalar_dofs;
+  if (static_cast<int>(interior.size()) != ni) return false;
+
+  mfem::Array<int> faces, orientations;
+  mesh.GetElementEdges(element, faces, orientations);
+  int nt = 0;
+  for (int local_face = 0; local_face < faces.Size(); ++local_face)
+  {
+    mfem::Array<int> face_vdofs;
+    trace_space.GetFaceVDofs(faces[local_face], face_vdofs);
+    nt += face_vdofs.Size();
+  }
+  if (static_cast<int>(trace.size()) != nt) return false;
+  a.assign(static_cast<std::size_t>(ni) * ni, 0.0);
+  b.assign(static_cast<std::size_t>(ni) * nt, 0.0);
+  c.assign(static_cast<std::size_t>(nt) * ni, 0.0);
+  d.assign(static_cast<std::size_t>(nt) * nt, 0.0);
+
+  const mfem::IntegrationRule& volume_rule =
+      mfem::IntRules.Get(fe->GetGeomType(), quadrature_order);
+  mfem::Vector shape(scalar_dofs);
+  mfem::DenseMatrix derivative(scalar_dofs, dimension);
+  for (int q = 0; q < volume_rule.GetNPoints(); ++q)
+  {
+    const mfem::IntegrationPoint& point = volume_rule.IntPoint(q);
+    transformation->SetIntPoint(&point);
+    fe->CalcShape(point, shape);
+    fe->CalcPhysDShape(*transformation, derivative);
+    ConservedState state{};
+    OracleFluxMatrix x_jacobian{}, y_jacobian{};
+    if (!InterpolateOracleState(interior, scalar_dofs, 0, shape, state) ||
+        !OracleFluxJacobian(state, {{1.0, 0.0}}, x_jacobian) ||
+        !OracleFluxJacobian(state, {{0.0, 1.0}}, y_jacobian)) return false;
+    const double weight = point.weight * transformation->Weight();
+    if (!(weight > 0.0) || !std::isfinite(weight)) return false;
+    for (int row_node = 0; row_node < scalar_dofs; ++row_node)
+      for (int column_node = 0; column_node < scalar_dofs; ++column_node)
+        for (int row_component = 0; row_component < conserved_components;
+             ++row_component)
+          for (int column_component = 0;
+               column_component < conserved_components; ++column_component)
+          {
+            const int row = row_node + scalar_dofs * row_component;
+            const int column = column_node + scalar_dofs * column_component;
+            const double mass = row_component == column_component ?
+                shape[row_node] * shape[column_node] / backward_euler_dt : 0.0;
+            a[static_cast<std::size_t>(row) * ni + column] += weight *
+                (mass - derivative(row_node, 0) *
+                            x_jacobian[row_component][column_component] -
+                        derivative(row_node, 1) *
+                            y_jacobian[row_component][column_component]);
+          }
+  }
+
+  int trace_offset = 0;
+  for (int local_face = 0; local_face < faces.Size(); ++local_face)
+  {
+    const int face = faces[local_face];
+    mfem::FaceElementTransformations* face_transform =
+        mesh.GetFaceElementTransformations(face);
+    const mfem::FiniteElement* trace_fe = trace_space.GetFaceElement(face);
+    mfem::Array<int> face_vdofs;
+    trace_space.GetFaceVDofs(face, face_vdofs);
+    if (face_transform == nullptr || face_transform->Face == nullptr ||
+        trace_fe == nullptr) return false;
+    const bool first = face_transform->Elem1No == element;
+    if (!first && face_transform->Elem2No != element) return false;
+    const int trace_scalar_dofs = trace_fe->GetDof();
+    const mfem::IntegrationRule& rule =
+        mfem::IntRules.Get(trace_fe->GetGeomType(), quadrature_order);
+    mfem::Vector interior_shape(scalar_dofs), trace_shape(trace_scalar_dofs);
+    for (int q = 0; q < rule.GetNPoints(); ++q)
+    {
+      const mfem::IntegrationPoint& face_point = rule.IntPoint(q);
+      face_transform->SetAllIntPoints(&face_point);
+      const mfem::IntegrationPoint& element_point = first ?
+          face_transform->GetElement1IntPoint() :
+          face_transform->GetElement2IntPoint();
+      fe->CalcShape(element_point, interior_shape);
+      trace_fe->CalcShape(face_point, trace_shape);
+      ConservedState trace_state{};
+      if (!InterpolateOracleState(trace, trace_scalar_dofs, trace_offset,
+                                  trace_shape, trace_state)) return false;
+      mfem::Vector scaled_normal(dimension);
+      mfem::CalcOrtho(face_transform->Face->Jacobian(), scaled_normal);
+      const double face_measure = scaled_normal.Norml2();
+      if (!(face_measure > 0.0) || !std::isfinite(face_measure)) return false;
+      const double side = first ? 1.0 : -1.0;
+      const std::array<double, dimension> normal{{
+          side * scaled_normal[0] / face_measure,
+          side * scaled_normal[1] / face_measure}};
+      OracleFluxMatrix trace_jacobian{};
+      if (!OracleFluxJacobian(trace_state, normal, trace_jacobian)) return false;
+      const double weight = face_point.weight * face_measure;
+      for (int row_component = 0; row_component < conserved_components;
+           ++row_component)
+        for (int column_component = 0;
+             column_component < conserved_components; ++column_component)
+        {
+          const double interior_derivative =
+              row_component == column_component ? fixed_scalar_tau : 0.0;
+          const double trace_derivative =
+              trace_jacobian[row_component][column_component] -
+              (row_component == column_component ? fixed_scalar_tau : 0.0);
+          for (int row_node = 0; row_node < scalar_dofs; ++row_node)
+          {
+            const int interior_row = row_node + scalar_dofs * row_component;
+            for (int column_node = 0; column_node < scalar_dofs; ++column_node)
+            {
+              const int interior_column =
+                  column_node + scalar_dofs * column_component;
+              a[static_cast<std::size_t>(interior_row) * ni + interior_column] +=
+                  weight * interior_shape[row_node] *
+                  interior_shape[column_node] * interior_derivative;
+            }
+            for (int column_node = 0; column_node < trace_scalar_dofs;
+                 ++column_node)
+            {
+              const int trace_column = trace_offset + column_node +
+                  trace_scalar_dofs * column_component;
+              b[static_cast<std::size_t>(interior_row) * nt + trace_column] +=
+                  weight * interior_shape[row_node] * trace_shape[column_node] *
+                  trace_derivative;
+            }
+          }
+          for (int row_node = 0; row_node < trace_scalar_dofs; ++row_node)
+          {
+            const int trace_row = trace_offset + row_node +
+                trace_scalar_dofs * row_component;
+            for (int column_node = 0; column_node < scalar_dofs; ++column_node)
+            {
+              const int interior_column =
+                  column_node + scalar_dofs * column_component;
+              c[static_cast<std::size_t>(trace_row) * ni + interior_column] +=
+                  weight * trace_shape[row_node] * interior_shape[column_node] *
+                  interior_derivative;
+            }
+            for (int column_node = 0; column_node < trace_scalar_dofs;
+                 ++column_node)
+            {
+              const int trace_column = trace_offset + column_node +
+                  trace_scalar_dofs * column_component;
+              d[static_cast<std::size_t>(trace_row) * nt + trace_column] +=
+                  weight * trace_shape[row_node] * trace_shape[column_node] *
+                  trace_derivative;
+            }
+          }
+        }
+    }
+    trace_offset += face_vdofs.Size();
+  }
+  return trace_offset == nt && FiniteVector(a) && FiniteVector(b) &&
+         FiniteVector(c) && FiniteVector(d);
 }
 
 bool AssembleIndependentQ(const SmoothEulerExperiment& experiment,
@@ -1832,8 +2113,11 @@ void OracleObserveState(const ConservedState& state, bool& nonfinite,
     pressure = true;
     return;
   }
-  const double speed = std::hypot(state[1] / state[0], state[2] / state[0]) +
-                       std::sqrt(gamma * p / state[0]);
+  const double rho = state[0];
+  const double u = state[1] / rho;
+  const double v = state[2] / rho;
+  const double speed = std::sqrt(u * u + v * v) +
+                       std::sqrt(gamma * p / rho);
   if (!std::isfinite(speed))
   {
     nonfinite = true;
@@ -1984,6 +2268,7 @@ bool IndependentContinuousErrors(const IndependentContext& context,
                                   numerical) ||
           !OracleExactConservative(physical[0], physical[1], exact)) return false;
       const double weight = point.weight * transformation->Weight();
+      if (!(weight > 0.0) || !std::isfinite(weight)) return false;
       volume_measure += weight;
       for (int component = 0; component < conserved_components; ++component)
       {
@@ -2020,6 +2305,14 @@ bool IndependentContinuousErrors(const IndependentContext& context,
     {
       const mfem::IntegrationPoint& point = rule.IntPoint(q);
       transformation->SetIntPoint(&point);
+      mfem::Vector scaled_normal(dimension);
+      mfem::CalcOrtho(transformation->Jacobian(), scaled_normal);
+      const double face_jacobian = scaled_normal.Norml2();
+      if (!(face_jacobian > 0.0) || !std::isfinite(face_jacobian)) return false;
+      const std::array<double, dimension> normal{{
+          scaled_normal[0] / face_jacobian,
+          scaled_normal[1] / face_jacobian}};
+      if (!std::isfinite(normal[0]) || !std::isfinite(normal[1])) return false;
       mfem::Vector physical(dimension);
       transformation->Transform(point, physical);
       fe->CalcShape(point, shape);
@@ -2027,7 +2320,8 @@ bool IndependentContinuousErrors(const IndependentContext& context,
       if (!InterpolateOracleState(local_trace, fe->GetDof(), 0, shape,
                                   numerical) ||
           !OracleExactConservative(physical[0], physical[1], exact)) return false;
-      const double weight = point.weight * transformation->Weight();
+      const double weight = point.weight * face_jacobian;
+      if (!(weight > 0.0) || !std::isfinite(weight)) return false;
       face_measure += weight;
       trace_measure += weight;
       for (int component = 0; component < conserved_components; ++component)
@@ -2054,7 +2348,10 @@ bool IndependentContinuousErrors(const IndependentContext& context,
     output.rms = std::sqrt(output.error_squared / output.measure);
     output.relative_l2 = std::sqrt(output.error_squared / output.exact_norm_squared);
     output.unique_face_count = faces;
-    return true;
+    return std::isfinite(output.error_squared) &&
+           std::isfinite(output.exact_norm_squared) &&
+           std::isfinite(output.measure) && std::isfinite(output.direct_l2) &&
+           std::isfinite(output.rms) && std::isfinite(output.relative_l2);
   };
   return publish(volume_error, volume_norm, volume_measure, 0, result.volume) &&
          publish(trace_error, trace_norm, trace_measure,
@@ -2101,98 +2398,6 @@ double IndependentResidualNorm(const std::vector<double>& residual_interior,
   return std::sqrt(static_cast<double>(squared));
 }
 
-double IndependentInitialOldL2Ratio(
-    const IndependentContext& context, const int quadrature_order,
-    const std::vector<double>& old_interior,
-    const std::vector<double>& initial_interior,
-    const std::vector<double>& old_trace,
-    const std::vector<double>& initial_trace)
-{
-  long double difference_squared = 0.0L, old_squared = 0.0L;
-  for (int element = 0; element < context.mesh->GetNE(); ++element)
-  {
-    std::vector<double> old_local, initial_local, ignored;
-    if (!ExtractIndependentElement(context, old_interior, old_trace, element,
-                                   old_local, ignored) ||
-        !ExtractIndependentElement(context, initial_interior, initial_trace,
-                                   element, initial_local, ignored))
-    {
-      return 0.0;
-    }
-    const mfem::FiniteElement* fe = context.interior_space->GetFE(element);
-    mfem::ElementTransformation* transformation =
-        context.mesh->GetElementTransformation(element);
-    if (fe == nullptr || transformation == nullptr) return 0.0;
-    mfem::Vector shape(fe->GetDof());
-    const mfem::IntegrationRule& rule =
-        mfem::IntRules.Get(fe->GetGeomType(), quadrature_order);
-    for (int q = 0; q < rule.GetNPoints(); ++q)
-    {
-      const mfem::IntegrationPoint& point = rule.IntPoint(q);
-      transformation->SetIntPoint(&point);
-      fe->CalcShape(point, shape);
-      ConservedState old_state{}, initial_state{};
-      if (!InterpolateOracleState(old_local, fe->GetDof(), 0, shape,
-                                  old_state) ||
-          !InterpolateOracleState(initial_local, fe->GetDof(), 0, shape,
-                                  initial_state)) return 0.0;
-      const double weight = point.weight * transformation->Weight();
-      for (int component = 0; component < conserved_components; ++component)
-      {
-        const long double difference = initial_state[component] -
-                                       old_state[component];
-        difference_squared += weight * difference * difference;
-        old_squared += weight * static_cast<long double>(old_state[component]) *
-                       old_state[component];
-      }
-    }
-  }
-  for (int face = 0; face < context.mesh->GetNumFaces(); ++face)
-  {
-    const mfem::FiniteElement* fe = context.trace_space->GetFaceElement(face);
-    mfem::ElementTransformation* transformation =
-        context.mesh->GetFaceTransformation(face);
-    if (fe == nullptr || transformation == nullptr) return 0.0;
-    mfem::Array<int> vdofs;
-    context.trace_space->GetFaceVDofs(face, vdofs);
-    std::vector<double> old_local(vdofs.Size()), initial_local(vdofs.Size());
-    for (int local = 0; local < vdofs.Size(); ++local)
-    {
-      double sign = 1.0;
-      const int global = OracleDecodeSignedVDof(vdofs[local], sign);
-      if (global < 0 || global >= static_cast<int>(old_trace.size()) ||
-          global >= static_cast<int>(initial_trace.size())) return 0.0;
-      old_local[local] = sign * old_trace[global];
-      initial_local[local] = sign * initial_trace[global];
-    }
-    mfem::Vector shape(fe->GetDof());
-    const mfem::IntegrationRule& rule =
-        mfem::IntRules.Get(fe->GetGeomType(), quadrature_order);
-    for (int q = 0; q < rule.GetNPoints(); ++q)
-    {
-      const mfem::IntegrationPoint& point = rule.IntPoint(q);
-      transformation->SetIntPoint(&point);
-      fe->CalcShape(point, shape);
-      ConservedState old_state{}, initial_state{};
-      if (!InterpolateOracleState(old_local, fe->GetDof(), 0, shape,
-                                  old_state) ||
-          !InterpolateOracleState(initial_local, fe->GetDof(), 0, shape,
-                                  initial_state)) return 0.0;
-      const double weight = point.weight * transformation->Weight();
-      for (int component = 0; component < conserved_components; ++component)
-      {
-        const long double difference = initial_state[component] -
-                                       old_state[component];
-        difference_squared += weight * difference * difference;
-        old_squared += weight * static_cast<long double>(old_state[component]) *
-                       old_state[component];
-      }
-    }
-  }
-  return old_squared > 0.0L ?
-      std::sqrt(static_cast<double>(difference_squared / old_squared)) : 0.0;
-}
-
 bool CheckProjectionAndInitialAdmissibility(
     const IndependentContext& context, const SolvedMeshEvidence& solved)
 {
@@ -2205,7 +2410,12 @@ bool CheckProjectionAndInitialAdmissibility(
   {
     return false;
   }
-  if (!VectorWithinScale(expected_old_interior, solved.old_interior, 4096.0) ||
+  if (!FiniteVector(expected_old_interior) || !FiniteVector(expected_old_trace) ||
+      !FiniteVector(expected_initial_interior) ||
+      !FiniteVector(expected_initial_trace) || !FiniteVector(solved.old_interior) ||
+      !FiniteVector(solved.old_trace) || !FiniteVector(solved.initial_interior) ||
+      !FiniteVector(solved.initial_trace) ||
+      !VectorWithinScale(expected_old_interior, solved.old_interior, 4096.0) ||
       !VectorWithinScale(expected_old_trace, solved.old_trace, 4096.0) ||
       !VectorWithinScale(expected_initial_interior, solved.initial_interior,
                          4096.0) ||
@@ -2213,9 +2423,12 @@ bool CheckProjectionAndInitialAdmissibility(
   {
     return false;
   }
-  if (!(IndependentInitialOldL2Ratio(
-            context, solved.q_a, solved.old_interior, solved.initial_interior,
-            solved.old_trace, solved.initial_trace) >= 1.0e-3)) return false;
+  const double interior_change = RelativeCoefficientTwoNorm(
+      solved.old_interior, solved.initial_interior);
+  const double trace_change = RelativeCoefficientTwoNorm(
+      solved.old_trace, solved.initial_trace);
+  if (!std::isfinite(interior_change) || !std::isfinite(trace_change) ||
+      !(interior_change >= 1.0e-3) || !(trace_change >= 1.0e-3)) return false;
   OracleAdmissibility admissibility{};
   return IndependentPrescreen(context, solved.q_a, solved.initial_interior,
                               solved.initial_trace, admissibility) &&
@@ -2257,7 +2470,14 @@ bool CheckLocalAssemblyAndAllColumns(const IndependentContext& context,
       audit.c.size() != static_cast<std::size_t>(audit.trace_dofs) *
                             audit.interior_dofs ||
       audit.d.size() != static_cast<std::size_t>(audit.trace_dofs) *
-                            audit.trace_dofs)
+                            audit.trace_dofs ||
+      !FiniteVector(audit.old_interior) ||
+      !FiniteVector(audit.current_interior) || !FiniteVector(audit.trace) ||
+      !FiniteVector(audit.residual_interior) ||
+      !FiniteVector(audit.residual_trace) || !FiniteVector(audit.a) ||
+      !FiniteVector(audit.b) || !FiniteVector(audit.c) ||
+      !FiniteVector(audit.d) ||
+      !(DifferenceNorm(audit.old_interior, audit.current_interior) > 0.0))
   {
     return false;
   }
@@ -2265,9 +2485,20 @@ bool CheckLocalAssemblyAndAllColumns(const IndependentContext& context,
   if (!AssembleIndependentQOnSpaces(
           *context.interior_space, *context.trace_space, solved.q_a, 0,
           audit.current_interior, audit.old_interior, audit.trace, base_r,
-          base_g) ||
-      !VectorWithinScale(base_r, audit.residual_interior, 2048.0) ||
-      !VectorWithinScale(base_g, audit.residual_trace, 2048.0))
+          base_g) || !FiniteVector(base_r) || !FiniteVector(base_g))
+  {
+    return false;
+  }
+  std::vector<double> stored_q = audit.residual_interior;
+  stored_q.insert(stored_q.end(), audit.residual_trace.begin(),
+                  audit.residual_trace.end());
+  std::vector<double> independent_q = base_r;
+  independent_q.insert(independent_q.end(), base_g.begin(), base_g.end());
+  const double s_q = std::max({1.0, InfinityNorm(stored_q),
+                               InfinityNorm(independent_q)});
+  if (!std::isfinite(s_q) ||
+      DifferenceNorm(stored_q, independent_q) >
+          2048.0 * experiment_epsilon * s_q)
   {
     return false;
   }
@@ -2275,7 +2506,7 @@ bool CheckLocalAssemblyAndAllColumns(const IndependentContext& context,
   mfem::ElementTransformation* transformation =
       context.mesh->GetElementTransformation(0);
   if (fe == nullptr || transformation == nullptr) return false;
-  long double mass_norm = 0.0L;
+  std::vector<double> mass_residual(audit.interior_dofs, 0.0);
   mfem::Vector shape(fe->GetDof());
   const mfem::IntegrationRule& rule =
       mfem::IntRules.Get(fe->GetGeomType(), solved.q_a);
@@ -2285,14 +2516,26 @@ bool CheckLocalAssemblyAndAllColumns(const IndependentContext& context,
     transformation->SetIntPoint(&point);
     fe->CalcShape(point, shape);
     const double weight = point.weight * transformation->Weight();
+    ConservedState current_state{}, old_state{};
+    if (!InterpolateOracleState(audit.current_interior, fe->GetDof(), 0, shape,
+                                current_state) ||
+        !InterpolateOracleState(audit.old_interior, fe->GetDof(), 0, shape,
+                                old_state))
+    {
+      return false;
+    }
     for (int row = 0; row < shape.Size(); ++row)
-      for (int column = 0; column < shape.Size(); ++column)
+      for (int component = 0; component < conserved_components; ++component)
       {
-        mass_norm += std::abs(weight * shape[row] * shape[column] /
-                              backward_euler_dt);
+        mass_residual[row + shape.Size() * component] += weight * shape[row] *
+            (current_state[component] - old_state[component]) /
+            backward_euler_dt;
       }
   }
-  if (!(mass_norm > 0.0L)) return false;
+  if (!FiniteVector(mass_residual) || !(InfinityNorm(mass_residual) > 0.0))
+  {
+    return false;
+  }
 
   const double h = std::cbrt(experiment_epsilon) * std::max(
       {1.0, InfinityNorm(audit.current_interior), InfinityNorm(audit.trace)});
@@ -2336,29 +2579,30 @@ bool CheckLocalAssemblyAndAllColumns(const IndependentContext& context,
     {
       return false;
     }
+    std::vector<double> finite_difference, jacobian_column;
+    finite_difference.reserve(audit.interior_dofs + audit.trace_dofs);
+    jacobian_column.reserve(audit.interior_dofs + audit.trace_dofs);
     for (int row = 0; row < audit.interior_dofs; ++row)
     {
-      const double derivative = (plus_r[row] - minus_r[row]) / (2.0 * h);
-      const double expected = audit.a[
-          static_cast<std::size_t>(row) * audit.interior_dofs + column];
-      const double sj = std::max({1.0, std::abs(expected),
-                                  std::abs(derivative)});
-      const double sq = std::max({1.0, std::abs(plus_r[row]),
-                                  std::abs(minus_r[row])});
-      if (std::abs(derivative - expected) >
-          2.0e-6 * sj + 256.0 * experiment_epsilon * sq / h) return false;
+      finite_difference.push_back((plus_r[row] - minus_r[row]) / (2.0 * h));
+      jacobian_column.push_back(audit.a[
+          static_cast<std::size_t>(row) * audit.interior_dofs + column]);
     }
     for (int row = 0; row < audit.trace_dofs; ++row)
     {
-      const double derivative = (plus_g[row] - minus_g[row]) / (2.0 * h);
-      const double expected = audit.c[
-          static_cast<std::size_t>(row) * audit.interior_dofs + column];
-      const double sj = std::max({1.0, std::abs(expected),
-                                  std::abs(derivative)});
-      const double sq = std::max({1.0, std::abs(plus_g[row]),
-                                  std::abs(minus_g[row])});
-      if (std::abs(derivative - expected) >
-          2.0e-6 * sj + 256.0 * experiment_epsilon * sq / h) return false;
+      finite_difference.push_back((plus_g[row] - minus_g[row]) / (2.0 * h));
+      jacobian_column.push_back(audit.c[
+          static_cast<std::size_t>(row) * audit.interior_dofs + column]);
+    }
+    const double s_j = std::max({1.0, InfinityNorm(jacobian_column),
+                                 InfinityNorm(finite_difference)});
+    if (!FiniteVector(plus_r) || !FiniteVector(plus_g) ||
+        !FiniteVector(minus_r) || !FiniteVector(minus_g) ||
+        !std::isfinite(s_j) ||
+        DifferenceNorm(jacobian_column, finite_difference) >
+            2.0e-6 * s_j + 256.0 * experiment_epsilon * s_q / h)
+    {
+      return false;
     }
   }
   for (int column = 0; column < audit.trace_dofs; ++column)
@@ -2393,29 +2637,30 @@ bool CheckLocalAssemblyAndAllColumns(const IndependentContext& context,
     {
       return false;
     }
+    std::vector<double> finite_difference, jacobian_column;
+    finite_difference.reserve(audit.interior_dofs + audit.trace_dofs);
+    jacobian_column.reserve(audit.interior_dofs + audit.trace_dofs);
     for (int row = 0; row < audit.interior_dofs; ++row)
     {
-      const double derivative = (plus_r[row] - minus_r[row]) / (2.0 * h);
-      const double expected = audit.b[
-          static_cast<std::size_t>(row) * audit.trace_dofs + column];
-      const double sj = std::max({1.0, std::abs(expected),
-                                  std::abs(derivative)});
-      const double sq = std::max({1.0, std::abs(plus_r[row]),
-                                  std::abs(minus_r[row])});
-      if (std::abs(derivative - expected) >
-          2.0e-6 * sj + 256.0 * experiment_epsilon * sq / h) return false;
+      finite_difference.push_back((plus_r[row] - minus_r[row]) / (2.0 * h));
+      jacobian_column.push_back(audit.b[
+          static_cast<std::size_t>(row) * audit.trace_dofs + column]);
     }
     for (int row = 0; row < audit.trace_dofs; ++row)
     {
-      const double derivative = (plus_g[row] - minus_g[row]) / (2.0 * h);
-      const double expected = audit.d[
-          static_cast<std::size_t>(row) * audit.trace_dofs + column];
-      const double sj = std::max({1.0, std::abs(expected),
-                                  std::abs(derivative)});
-      const double sq = std::max({1.0, std::abs(plus_g[row]),
-                                  std::abs(minus_g[row])});
-      if (std::abs(derivative - expected) >
-          2.0e-6 * sj + 256.0 * experiment_epsilon * sq / h) return false;
+      finite_difference.push_back((plus_g[row] - minus_g[row]) / (2.0 * h));
+      jacobian_column.push_back(audit.d[
+          static_cast<std::size_t>(row) * audit.trace_dofs + column]);
+    }
+    const double s_j = std::max({1.0, InfinityNorm(jacobian_column),
+                                 InfinityNorm(finite_difference)});
+    if (!FiniteVector(plus_r) || !FiniteVector(plus_g) ||
+        !FiniteVector(minus_r) || !FiniteVector(minus_g) ||
+        !std::isfinite(s_j) ||
+        DifferenceNorm(jacobian_column, finite_difference) >
+            2.0e-6 * s_j + 256.0 * experiment_epsilon * s_q / h)
+    {
+      return false;
     }
   }
   return true;
@@ -2424,6 +2669,17 @@ bool CheckLocalAssemblyAndAllColumns(const IndependentContext& context,
 bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
                                    const SolvedMeshEvidence& solved)
 {
+  if (!FiniteVector(solved.old_interior) || !FiniteVector(solved.old_trace) ||
+      !FiniteVector(solved.initial_interior) ||
+      !FiniteVector(solved.initial_trace) || !FiniteVector(solved.final_interior) ||
+      !FiniteVector(solved.final_trace) ||
+      !FiniteVector(solved.initial_residual_interior) ||
+      !FiniteVector(solved.initial_residual_trace) ||
+      !FiniteVector(solved.final_residual_interior) ||
+      !FiniteVector(solved.final_residual_trace))
+  {
+    return false;
+  }
   std::vector<double> initial_r, initial_g, final_r, final_g;
   std::vector<int> initial_map, final_map;
   if (!AssembleIndependentGlobalQ(
@@ -2444,7 +2700,71 @@ bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
       initial_r, initial_g, initial_map, context.trace_space->GetVSize());
   const double final_norm = IndependentResidualNorm(
       final_r, final_g, final_map, context.trace_space->GetVSize());
-  if (!Close(initial_norm, solved.newton.initial_residual,
+  const double coefficient_change = ConcatenatedCoefficientRelativeTwoNorm(
+      solved.initial_interior, solved.final_interior, solved.initial_trace,
+      solved.final_trace);
+  const TrialAuditSnapshot* first_accepted = nullptr;
+  for (const TrialAuditSnapshot& audit : solved.trial_audits)
+    if (audit.accepted)
+    {
+      if (first_accepted != nullptr) return false;
+      first_accepted = &audit;
+    }
+  if (first_accepted == nullptr) return false;
+  std::vector<double> initial_jacobian, accepted_jacobian;
+  for (int element = 0; element < context.mesh->GetNE(); ++element)
+  {
+    std::vector<double> initial_local, initial_trace_local, accepted_local,
+        accepted_trace_local, initial_a, initial_b, initial_c, initial_d,
+        accepted_a, accepted_b, accepted_c, accepted_d;
+    if (!ExtractIndependentElement(context, solved.initial_interior,
+                                   solved.initial_trace, element, initial_local,
+                                   initial_trace_local) ||
+        !ExtractIndependentElement(context, first_accepted->trial_interior,
+                                   first_accepted->trial_trace, element,
+                                   accepted_local, accepted_trace_local) ||
+        !AssembleIndependentAnalyticBlocks(
+            *context.interior_space, *context.trace_space, solved.q_a, element,
+            initial_local, initial_trace_local, initial_a, initial_b, initial_c,
+            initial_d) ||
+        !AssembleIndependentAnalyticBlocks(
+            *context.interior_space, *context.trace_space, solved.q_a, element,
+            accepted_local, accepted_trace_local, accepted_a, accepted_b,
+            accepted_c, accepted_d))
+    {
+      return false;
+    }
+    const auto append = [](std::vector<double>& target,
+                           const std::vector<double>& source)
+    {
+      target.insert(target.end(), source.begin(), source.end());
+    };
+    append(initial_jacobian, initial_a);
+    append(initial_jacobian, initial_b);
+    append(initial_jacobian, initial_c);
+    append(initial_jacobian, initial_d);
+    append(accepted_jacobian, accepted_a);
+    append(accepted_jacobian, accepted_b);
+    append(accepted_jacobian, accepted_c);
+    append(accepted_jacobian, accepted_d);
+  }
+  const double jacobian_change = RelativeCoefficientTwoNorm(
+      initial_jacobian, accepted_jacobian);
+  if (solved.newton.status != ExperimentStatus::Success ||
+      !solved.newton.admissible ||
+      !std::isfinite(solved.newton.initial_residual) ||
+      !std::isfinite(solved.newton.final_residual) ||
+      !std::isfinite(solved.newton.trace_relative_residual) ||
+      !std::isfinite(solved.newton.minimum_density) ||
+      !std::isfinite(solved.newton.minimum_pressure) ||
+      !std::isfinite(solved.newton.minimum_damping) ||
+      !std::isfinite(solved.newton.maximum_wave_speed) ||
+      !std::isfinite(solved.newton.maximum_coefficient_update) ||
+      !std::isfinite(solved.newton.maximum_jacobian_change) ||
+      !std::isfinite(solved.newton.relative_coefficient_change) ||
+      !std::isfinite(solved.newton.relative_jacobian_change) ||
+      !std::isfinite(solved.newton.residual_after_first_accepted) ||
+      !Close(initial_norm, solved.newton.initial_residual,
              4096.0 * experiment_epsilon) ||
       !Close(final_norm, solved.newton.final_residual,
              4096.0 * experiment_epsilon) ||
@@ -2454,8 +2774,12 @@ bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
           static_cast<std::size_t>(solved.newton.nonlinear_iterations + 1) ||
       solved.linear_history.size() !=
           static_cast<std::size_t>(solved.newton.nonlinear_iterations) ||
-      solved.newton.maximum_coefficient_update < 1.0e-6 ||
-      solved.newton.maximum_jacobian_change < 1.0e-8 ||
+      !std::isfinite(coefficient_change) || coefficient_change < 1.0e-6 ||
+      !std::isfinite(jacobian_change) || jacobian_change < 1.0e-8 ||
+      !Close(coefficient_change, solved.newton.relative_coefficient_change,
+             4096.0 * experiment_epsilon) ||
+      !Close(jacobian_change, solved.newton.relative_jacobian_change,
+             4096.0 * experiment_epsilon) ||
       !(final_norm <= 1.0e-10 * (1.0 + initial_norm)))
   {
     return false;
@@ -2464,19 +2788,47 @@ bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
   {
     if (linear.status != ExperimentStatus::Success ||
         linear.gmres_iterations < 0 ||
+        !std::isfinite(linear.right_hand_side_norm) ||
+        !(linear.right_hand_side_norm >= 0.0) ||
         !std::isfinite(linear.reported_relative_residual) ||
         linear.reported_relative_residual < 0.0 ||
+        !std::isfinite(linear.true_relative_residual) ||
+        !(linear.true_relative_residual >= 0.0) ||
         !(linear.true_relative_residual <= 1.0e-10)) return false;
   }
 
-  int accepted_history = 0;
+  if (!FiniteVector(solved.residual_history)) return false;
+  int accepted_history = 0, rejected_history = 0, reassembly_history = 0;
+  int linear_iterations = 0;
+  for (const auto& linear : solved.linear_history)
+  {
+    linear_iterations += linear.gmres_iterations;
+  }
+  double minimum_damping = 1.0;
+  double minimum_density = solved.initial_admissibility.minimum_density;
+  double minimum_pressure = solved.initial_admissibility.minimum_pressure;
+  double maximum_wave_speed = solved.initial_admissibility.maximum_wave_speed;
+  double maximum_update = 0.0, maximum_jacobian = 0.0;
+  int expected_trial_index = 0;
   for (const auto& trial : solved.trial_history)
   {
-    if (trial.status != ExperimentStatus::Success) return false;
-    if (trial.trial_index < 0 || trial.trial_index > 12 ||
+    if (trial.status != ExperimentStatus::Success ||
+        !std::isfinite(trial.alpha) || !std::isfinite(trial.base_residual) ||
+        !std::isfinite(trial.armijo_boundary) ||
+        !std::isfinite(trial.coefficient_update) ||
+        !std::isfinite(trial.jacobian_change) ||
+        !std::isfinite(trial.admissibility.minimum_density) ||
+        !std::isfinite(trial.admissibility.minimum_pressure) ||
+        !std::isfinite(trial.admissibility.maximum_wave_speed) ||
+        trial.nonlinear_iteration != accepted_history ||
+        trial.trial_index != expected_trial_index ||
+        trial.trial_index < 0 || trial.trial_index > 12 ||
         trial.alpha != std::ldexp(1.0, -trial.trial_index) ||
         trial.armijo_boundary !=
-            (1.0 - 1.0e-4 * trial.alpha) * trial.base_residual) return false;
+            (1.0 - 1.0e-4 * trial.alpha) * trial.base_residual ||
+        !Close(trial.base_residual, solved.residual_history[accepted_history],
+               4096.0 * experiment_epsilon)) return false;
+    if (trial.reassembly_attempted) ++reassembly_history;
     if (trial.accepted)
     {
       ++accepted_history;
@@ -2484,31 +2836,84 @@ bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
           !trial.admissibility.passed || !trial.reassembly_attempted ||
           !trial.residual_evaluated || !trial.trial_residual_present ||
           !trial.generation_published || trial.generation_discarded ||
+          !std::isfinite(trial.trial_residual) ||
           trial.trial_residual > trial.armijo_boundary) return false;
+      if (!Close(trial.base_residual,
+                 solved.residual_history[accepted_history - 1],
+                 4096.0 * experiment_epsilon) ||
+          !Close(trial.trial_residual,
+                 solved.residual_history[accepted_history],
+                 4096.0 * experiment_epsilon)) return false;
+      minimum_damping = std::min(minimum_damping, trial.alpha);
+      minimum_density = std::min(minimum_density,
+                                 trial.admissibility.minimum_density);
+      minimum_pressure = std::min(minimum_pressure,
+                                  trial.admissibility.minimum_pressure);
+      maximum_wave_speed = std::max(maximum_wave_speed,
+                                    trial.admissibility.maximum_wave_speed);
+      maximum_update = std::max(maximum_update, trial.coefficient_update);
+      maximum_jacobian = std::max(maximum_jacobian, trial.jacobian_change);
+      expected_trial_index = 0;
     }
     else if (trial.rejection_reason == TrialRejectionReason::Armijo)
     {
+      ++rejected_history;
       if (!trial.admissibility.passed || !trial.reassembly_attempted ||
           !trial.residual_evaluated || !trial.trial_residual_present ||
+          !std::isfinite(trial.trial_residual) ||
           trial.trial_residual <= trial.armijo_boundary ||
           !trial.generation_discarded || trial.generation_published) return false;
+      ++expected_trial_index;
     }
     else
     {
+      ++rejected_history;
       if (trial.admissibility.passed || trial.reassembly_attempted ||
           trial.residual_evaluated || trial.trial_residual_present ||
           !trial.generation_discarded || trial.generation_published) return false;
+      ++expected_trial_index;
     }
   }
-  if (accepted_history != solved.newton.nonlinear_iterations) return false;
+  if (accepted_history != solved.newton.nonlinear_iterations ||
+      rejected_history != solved.newton.rejected_trials ||
+      reassembly_history + 1 != solved.newton.assembly_attempts ||
+      linear_iterations != solved.newton.linear_iterations ||
+      !Close(minimum_damping, solved.newton.minimum_damping,
+             256.0 * experiment_epsilon) ||
+      !Close(minimum_density, solved.newton.minimum_density,
+             4096.0 * experiment_epsilon) ||
+      !Close(minimum_pressure, solved.newton.minimum_pressure,
+             4096.0 * experiment_epsilon) ||
+      !Close(maximum_wave_speed, solved.newton.maximum_wave_speed,
+             4096.0 * experiment_epsilon) ||
+      !Close(maximum_update, solved.newton.maximum_coefficient_update,
+             256.0 * experiment_epsilon) ||
+      !Close(maximum_jacobian, solved.newton.maximum_jacobian_change,
+             256.0 * experiment_epsilon))
+  {
+    return false;
+  }
 
   int accepted_audits = 0, rejected_audits = 0;
   for (const TrialAuditSnapshot& audit : solved.trial_audits)
   {
-    if (audit.base_interior.size() != audit.delta_interior.size() ||
+    if (audit.status != ExperimentStatus::Success ||
+        audit.base_interior.size() != audit.delta_interior.size() ||
         audit.base_trace.size() != audit.delta_trace.size() ||
         audit.trial_interior.size() != audit.base_interior.size() ||
-        audit.trial_trace.size() != audit.base_trace.size()) return false;
+        audit.trial_trace.size() != audit.base_trace.size() ||
+        audit.post_decision_interior.size() != audit.base_interior.size() ||
+        audit.post_decision_trace.size() != audit.base_trace.size() ||
+        !FiniteVector(audit.base_interior) || !FiniteVector(audit.base_trace) ||
+        !FiniteVector(audit.delta_interior) || !FiniteVector(audit.delta_trace) ||
+        !FiniteVector(audit.trial_interior) || !FiniteVector(audit.trial_trace) ||
+        !FiniteVector(audit.post_decision_interior) ||
+        !FiniteVector(audit.post_decision_trace) || !std::isfinite(audit.alpha) ||
+        !std::isfinite(audit.base_residual) ||
+        !std::isfinite(audit.armijo_boundary) ||
+        !std::isfinite(audit.coefficient_update) ||
+        !std::isfinite(audit.jacobian_change) ||
+        !std::isfinite(audit.formula_identity_error)) return false;
     const double scale = std::max({1.0, InfinityNorm(audit.base_interior),
                                    InfinityNorm(audit.base_trace),
                                    InfinityNorm(audit.trial_interior),
@@ -2569,17 +2974,39 @@ bool CheckGlobalResidualsAndTrials(const IndependentContext& context,
     if (audit.accepted)
     {
       ++accepted_audits;
-      if (!audit.generation_published || audit.generation_discarded ||
+      if (audit.rejection_reason != TrialRejectionReason::None ||
+          !audit.admissibility.passed || !audit.reassembly_attempted ||
+          !audit.residual_evaluated || !std::isfinite(audit.trial_residual) ||
+          !audit.generation_published || audit.generation_discarded ||
+          audit.post_decision_interior != audit.trial_interior ||
+          audit.post_decision_trace != audit.trial_trace ||
           audit.trial_residual > audit.armijo_boundary) return false;
     }
     else
     {
       ++rejected_audits;
-      if (!audit.generation_discarded || audit.generation_published) return false;
+      if (!audit.generation_discarded || audit.generation_published ||
+          audit.post_decision_interior != audit.base_interior ||
+          audit.post_decision_trace != audit.base_trace) return false;
+      if (audit.rejection_reason == TrialRejectionReason::Armijo)
+      {
+        if (!audit.admissibility.passed || !audit.reassembly_attempted ||
+            !audit.residual_evaluated || !std::isfinite(audit.trial_residual) ||
+            !(audit.trial_residual > audit.armijo_boundary)) return false;
+      }
+      else if (audit.rejection_reason == TrialRejectionReason::None ||
+               audit.admissibility.passed || audit.reassembly_attempted ||
+               audit.residual_evaluated ||
+               audit.rejection_reason != audit.admissibility.reason)
+      {
+        return false;
+      }
     }
   }
-  return accepted_audits == solved.newton.nonlinear_iterations &&
-         rejected_audits <= 1;
+  return accepted_audits == 1 &&
+         rejected_audits == (solved.newton.rejected_trials > 0 ? 1 : 0) &&
+         solved.trial_audits.size() ==
+             static_cast<std::size_t>(1 + rejected_audits);
 }
 
 bool CheckLinearAudit(const SolvedMeshEvidence& solved)
@@ -2627,6 +3054,34 @@ struct IndependentCampaignOracles
   std::array<std::array<double, 2>, 4> trace_rates{};
 };
 
+bool ErrorIntegralIsValid(const ErrorIntegralEvidence& value,
+                          const double expected_measure,
+                          const int expected_faces)
+{
+  if (!std::isfinite(value.error_squared) ||
+      !std::isfinite(value.exact_norm_squared) ||
+      !std::isfinite(value.measure) || !std::isfinite(value.direct_l2) ||
+      !std::isfinite(value.rms) || !std::isfinite(value.relative_l2) ||
+      !(value.error_squared > 0.0) || !(value.exact_norm_squared > 0.0) ||
+      !(value.measure > 0.0) || !(value.direct_l2 > 0.0) ||
+      !(value.rms > 0.0) || !(value.relative_l2 >= 1.0e-10) ||
+      value.unique_face_count != expected_faces ||
+      std::abs(value.measure - expected_measure) >
+          128.0 * experiment_epsilon * std::max(1.0, expected_measure))
+  {
+    return false;
+  }
+  const double scale = std::max(1.0, value.error_squared);
+  return std::abs(value.direct_l2 * value.direct_l2 - value.error_squared) <=
+             128.0 * experiment_epsilon * scale &&
+         std::abs(value.rms * value.rms * value.measure -
+                  value.error_squared) <=
+             128.0 * experiment_epsilon * scale &&
+         std::abs(value.relative_l2 * value.relative_l2 *
+                      value.exact_norm_squared - value.error_squared) <=
+             128.0 * experiment_epsilon * scale;
+}
+
 bool CheckContinuousErrors(const ExperimentEvidence& evidence,
                            IndependentCampaignOracles& oracles)
 {
@@ -2639,6 +3094,10 @@ bool CheckContinuousErrors(const ExperimentEvidence& evidence,
     for (std::size_t mesh_index = 0; mesh_index < 3; ++mesh_index)
     {
       const SolvedMeshEvidence& solved = ladder.solves[mesh_index];
+      const double expected_trace_measure =
+          2.0 * solved.elements_per_direction;
+      const int expected_faces = 2 * solved.elements_per_direction *
+                                 solved.elements_per_direction;
       const auto quadrature_pair_passes = [](
           const ErrorIntegralEvidence& q_e,
           const ErrorIntegralEvidence& q_e_plus_four)
@@ -2651,10 +3110,25 @@ bool CheckContinuousErrors(const ExperimentEvidence& evidence,
                    1.0e-8 &&
                q_e_plus_four.relative_l2 > 100.0 * difference;
       };
-      if (!quadrature_pair_passes(solved.q_e_volume,
+      if (!ErrorIntegralIsValid(solved.q_e_volume, 1.0, 0) ||
+          !ErrorIntegralIsValid(solved.q_e_plus_four_volume, 1.0, 0) ||
+          !ErrorIntegralIsValid(solved.q_e_trace, expected_trace_measure,
+                                expected_faces) ||
+          !ErrorIntegralIsValid(solved.q_e_plus_four_trace,
+                                expected_trace_measure, expected_faces) ||
+          !quadrature_pair_passes(solved.q_e_volume,
                                   solved.q_e_plus_four_volume) ||
           !quadrature_pair_passes(solved.q_e_trace,
-                                  solved.q_e_plus_four_trace)) return false;
+                                  solved.q_e_plus_four_trace) ||
+          !std::isfinite(ladder.volume_relative_l2[mesh_index]) ||
+          !std::isfinite(ladder.trace_relative_l2[mesh_index]) ||
+          ladder.volume_relative_l2[mesh_index] !=
+              solved.q_e_plus_four_volume.relative_l2 ||
+          ladder.trace_relative_l2[mesh_index] !=
+              solved.q_e_plus_four_trace.relative_l2)
+      {
+        return false;
+      }
       IndependentContext context;
       if (!BuildIndependentContext(solved.polynomial_order,
                                    solved.elements_per_direction, context) ||
@@ -2666,32 +3140,39 @@ bool CheckContinuousErrors(const ExperimentEvidence& evidence,
       const auto raw_agrees = [](const ErrorIntegralEvidence& production,
                                  const ErrorIntegralEvidence& oracle)
       {
-        const double error_scale = std::max(oracle.error_squared, 1.0e-300);
-        const double norm_scale = std::max(oracle.exact_norm_squared, 1.0e-300);
+        const double error_scale = std::max(
+            {std::abs(production.error_squared),
+             std::abs(oracle.error_squared), 1.0e-300});
+        const double norm_scale = std::max(
+            {std::abs(production.exact_norm_squared),
+             std::abs(oracle.exact_norm_squared), 1.0e-300});
+        const double relative_scale = std::max(
+            {std::abs(production.relative_l2),
+             std::abs(oracle.relative_l2), 1.0e-300});
         return std::abs(production.error_squared - oracle.error_squared) /
                        error_scale <= 2.0e-8 &&
                std::abs(production.exact_norm_squared -
                         oracle.exact_norm_squared) / norm_scale <= 2.0e-8 &&
                std::abs(production.relative_l2 - oracle.relative_l2) /
-                       std::max(oracle.relative_l2, 1.0e-300) <= 2.0e-8;
+                       relative_scale <= 2.0e-8;
       };
-      const double expected_measure = 2.0 * solved.elements_per_direction;
-      if (!raw_agrees(solved.q_e_plus_four_volume, q_o.volume) ||
+      if (!ErrorIntegralIsValid(q_o.volume, 1.0, 0) ||
+          !ErrorIntegralIsValid(q_o.trace, expected_trace_measure,
+                                expected_faces) ||
+          !raw_agrees(solved.q_e_plus_four_volume, q_o.volume) ||
           !raw_agrees(solved.q_e_plus_four_trace, q_o.trace) ||
-          q_o.volume.error_squared <= 0.0 || q_o.volume.exact_norm_squared <= 0.0 ||
-          q_o.trace.error_squared <= 0.0 || q_o.trace.exact_norm_squared <= 0.0 ||
           std::abs(q_o.volume.measure -
                    solved.q_e_plus_four_volume.measure) >
               256.0 * experiment_epsilon *
-                  std::max(1.0, expected_measure) ||
+                  std::max(1.0, expected_trace_measure) ||
           std::abs(q_o.trace.measure - solved.q_e_plus_four_trace.measure) >
               256.0 * experiment_epsilon *
-                  std::max(1.0, expected_measure) ||
+                  std::max(1.0, expected_trace_measure) ||
+          !std::isfinite(q_o.maximum_face_measure_error) ||
           q_o.maximum_face_measure_error >
               256.0 * experiment_epsilon *
                   std::max(1.0, 1.0 / solved.elements_per_direction) ||
-          q_o.trace.unique_face_count !=
-              2 * solved.elements_per_direction * solved.elements_per_direction)
+          q_o.trace.unique_face_count != expected_faces)
       {
         return false;
       }
@@ -2704,7 +3185,19 @@ bool CheckContinuousErrors(const ExperimentEvidence& evidence,
       oracles.trace_rates[p_index][interval] = std::log2(
           oracles.solves[p_index][interval].trace.relative_l2 /
           oracles.solves[p_index][interval + 1].trace.relative_l2);
-      if (std::abs(oracles.volume_rates[p_index][interval] -
+      const double recorded_volume_rate = std::log2(
+          ladder.volume_relative_l2[interval] /
+          ladder.volume_relative_l2[interval + 1]);
+      const double recorded_trace_rate = std::log2(
+          ladder.trace_relative_l2[interval] /
+          ladder.trace_relative_l2[interval + 1]);
+      if (!std::isfinite(oracles.volume_rates[p_index][interval]) ||
+          !std::isfinite(oracles.trace_rates[p_index][interval]) ||
+          !std::isfinite(ladder.volume_rates[interval]) ||
+          !std::isfinite(ladder.trace_rates[interval]) ||
+          ladder.volume_rates[interval] != recorded_volume_rate ||
+          ladder.trace_rates[interval] != recorded_trace_rate ||
+          std::abs(oracles.volume_rates[p_index][interval] -
                    ladder.volume_rates[interval]) > 1.0e-7 ||
           std::abs(oracles.trace_rates[p_index][interval] -
                    ladder.trace_rates[interval]) > 1.0e-7) return false;
@@ -2733,6 +3226,14 @@ std::string ValidateEvidenceCandidate(
       evidence.rollback.entry_trace_hash != evidence.rollback.restored_trace_hash)
   {
     return "RollbackVectorMismatch";
+  }
+  if (!std::isfinite(evidence.rollback.initial_residual) ||
+      !std::isfinite(evidence.rollback.residual_after_first_accepted) ||
+      !evidence.rollback.residual_after_first_above_convergence ||
+      !(evidence.rollback.residual_after_first_accepted >
+        1.0e-10 * (1.0 + evidence.rollback.initial_residual)))
+  {
+    return "RollbackResidualProofMismatch";
   }
   if (!evidence.rollback.local_generation_invalid ||
       !evidence.rollback.condensed_generation_invalid ||
@@ -2781,6 +3282,16 @@ std::string ValidateEvidenceCandidate(
         return "SkeletonMeasureMismatch";
       }
       int accepted = 0;
+      for (const TrialAuditSnapshot& audit : solved.trial_audits)
+      {
+        if (audit.accepted &&
+            (!std::isfinite(audit.trial_residual) ||
+             !std::isfinite(audit.armijo_boundary) ||
+             audit.trial_residual > audit.armijo_boundary))
+        {
+          return "ArmijoBoundaryViolation";
+        }
+      }
       for (const auto& trial : solved.trial_history)
       {
         if (trial.accepted)
@@ -2837,10 +3348,12 @@ std::string ValidateEvidenceCandidate(
       const double volume_difference = std::abs(
           solved.q_e_plus_four_volume.relative_l2 -
           oracle.volume.relative_l2) /
-          std::max(oracle.volume.relative_l2, 1.0e-300);
+          std::max({std::abs(solved.q_e_plus_four_volume.relative_l2),
+                    std::abs(oracle.volume.relative_l2), 1.0e-300});
       const double trace_difference = std::abs(
           solved.q_e_plus_four_trace.relative_l2 - oracle.trace.relative_l2) /
-          std::max(oracle.trace.relative_l2, 1.0e-300);
+          std::max({std::abs(solved.q_e_plus_four_trace.relative_l2),
+                    std::abs(oracle.trace.relative_l2), 1.0e-300});
       if (volume_difference > 2.0e-8 || trace_difference > 2.0e-8)
       {
         return "QuadratureOracleMismatch";
@@ -2943,18 +3456,36 @@ bool TestActiveEvidenceControls(const ExperimentEvidence& baseline,
   }
   {
     ExperimentEvidence candidate = baseline;
-    bool mutated = false;
-    for (auto& ladder : candidate.convergence)
-      for (auto& solved : ladder.solves)
-        for (auto& trial : solved.trial_history)
-          if (!mutated && trial.accepted)
-          {
-            const double positive_margin = 1024.0 * experiment_epsilon *
-                std::max(1.0, std::abs(trial.armijo_boundary));
-            trial.trial_residual = trial.armijo_boundary + positive_margin;
-            mutated = true;
-          }
-    if (!mutated || ValidateEvidenceCandidate(candidate, baseline_oracles) !=
+    if (candidate.convergence.size() < 2 ||
+        candidate.convergence[1].solves[0].polynomial_order != 2 ||
+        candidate.convergence[1].solves[0].elements_per_direction != 3)
+    {
+      return false;
+    }
+    TrialAuditSnapshot* accepted = nullptr;
+    for (TrialAuditSnapshot& audit :
+         candidate.convergence[1].solves[0].trial_audits)
+      if (audit.accepted)
+      {
+        if (accepted != nullptr) return false;
+        accepted = &audit;
+      }
+    if (accepted == nullptr || !accepted->admissibility.passed ||
+        !FiniteVector(accepted->trial_interior) ||
+        !FiniteVector(accepted->trial_trace) ||
+        !std::isfinite(accepted->alpha) ||
+        !std::isfinite(accepted->base_residual))
+    {
+      return false;
+    }
+    accepted->armijo_boundary =
+        (1.0 - 1.0e-4 * accepted->alpha) * accepted->base_residual;
+    const double positive_margin = 1024.0 * experiment_epsilon *
+        std::max(1.0, std::abs(accepted->armijo_boundary));
+    accepted->trial_residual = accepted->armijo_boundary + positive_margin;
+    if (!std::isfinite(accepted->trial_residual) ||
+        !(accepted->trial_residual > accepted->armijo_boundary) ||
+        ValidateEvidenceCandidate(candidate, baseline_oracles) !=
         "ArmijoBoundaryViolation") return false;
   }
   {
@@ -2974,6 +3505,11 @@ int TestCompleteExperimentGate()
   if (!evidence.rollback.passed || evidence.rollback.returned_success ||
       evidence.rollback.status != ExperimentStatus::IterationLimit ||
       evidence.rollback.accepted_updates != 1 ||
+      !std::isfinite(evidence.rollback.initial_residual) ||
+      !std::isfinite(evidence.rollback.residual_after_first_accepted) ||
+      !evidence.rollback.residual_after_first_above_convergence ||
+      !(evidence.rollback.residual_after_first_accepted >
+        1.0e-10 * (1.0 + evidence.rollback.initial_residual)) ||
       !evidence.rollback.interior_byte_equal ||
       !evidence.rollback.trace_byte_equal) return 2;
   IndependentContext rollback_context;
@@ -2985,6 +3521,13 @@ int TestCompleteExperimentGate()
                              rollback_old_trace) ||
       !IndependentProjection(rollback_context, true, rollback_initial_interior,
                              rollback_initial_trace) ||
+      !FiniteVector(rollback_old_interior) || !FiniteVector(rollback_old_trace) ||
+      !FiniteVector(rollback_initial_interior) ||
+      !FiniteVector(rollback_initial_trace) ||
+      !FiniteVector(evidence.rollback.entry_interior) ||
+      !FiniteVector(evidence.rollback.entry_trace) ||
+      !FiniteVector(evidence.rollback.restored_interior) ||
+      !FiniteVector(evidence.rollback.restored_trace) ||
       !VectorWithinScale(rollback_initial_interior,
                          evidence.rollback.entry_interior, 4096.0) ||
       !VectorWithinScale(rollback_initial_trace, evidence.rollback.entry_trace,
@@ -2994,6 +3537,17 @@ int TestCompleteExperimentGate()
                             evidence.rollback.entry_trace,
                             rollback_admissibility) ||
       !rollback_admissibility.passed) return 3;
+  std::vector<double> rollback_r, rollback_g;
+  std::vector<int> rollback_map;
+  if (!AssembleIndependentGlobalQ(
+          rollback_context, 3 * 1 + 8, rollback_old_interior,
+          evidence.rollback.entry_interior, evidence.rollback.entry_trace,
+          rollback_r, rollback_g, rollback_map)) return 3;
+  const double rollback_initial_residual = IndependentResidualNorm(
+      rollback_r, rollback_g, rollback_map,
+      rollback_context.trace_space->GetVSize());
+  if (!Close(rollback_initial_residual, evidence.rollback.initial_residual,
+             4096.0 * experiment_epsilon)) return 3;
   if (evidence.convergence.size() != 4) return 4;
   int solve_count = 0;
   for (std::size_t p_index = 0; p_index < evidence.convergence.size(); ++p_index)

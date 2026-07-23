@@ -169,6 +169,10 @@ struct NewtonEvidence
   double maximum_wave_speed = 0.0;
   double maximum_coefficient_update = 0.0;
   double maximum_jacobian_change = 0.0;
+  double relative_coefficient_change = 0.0;
+  double relative_jacobian_change = 0.0;
+  double residual_after_first_accepted = 0.0;
+  bool residual_after_first_above_convergence = false;
   bool initial_prescreen_passed = false;
   bool admissible = false;
 };
@@ -281,6 +285,8 @@ struct TrialAuditSnapshot
   std::vector<double> delta_trace;
   std::vector<double> trial_interior;
   std::vector<double> trial_trace;
+  std::vector<double> post_decision_interior;
+  std::vector<double> post_decision_trace;
   AdmissibilityEvidence admissibility{};
   ExperimentStatus status = ExperimentStatus::SetupFailure;
   TrialRejectionReason rejection_reason = TrialRejectionReason::None;
@@ -344,6 +350,9 @@ struct RollbackAuditEvidence
   ExperimentStatus status = ExperimentStatus::SetupFailure;
   AdmissibilityEvidence initial_admissibility{};
   int accepted_updates = 0;
+  double initial_residual = 0.0;
+  double residual_after_first_accepted = 0.0;
+  bool residual_after_first_above_convergence = false;
   std::vector<double> entry_interior;
   std::vector<double> restored_interior;
   std::vector<double> entry_trace;
@@ -428,12 +437,10 @@ public:
 private:
   bool ProjectPerturbedCurrentStage();
   bool SolveNewtonTransaction(NewtonEvidence& evidence,
-                              SolvedMeshEvidence* solved_evidence,
-                              int maximum_accepted_updates);
+                              SolvedMeshEvidence* solved_evidence);
   bool IntegrateErrorEvidence(int quadrature_order,
                               ErrorIntegralEvidence& volume,
                               ErrorIntegralEvidence& trace) const;
-  bool RunRollbackProbe(RollbackAuditEvidence& evidence);
 
   struct Implementation;
   std::unique_ptr<Implementation> implementation_;
