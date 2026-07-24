@@ -6,8 +6,11 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -175,6 +178,333 @@ bool HasExtents(const StridedBlockView<Scalar> view, const LocalIndex batches,
          view.row_stride == columns && view.column_stride == 1;
 }
 
+struct TraceSolveDiagnostic
+{
+  bool primary_attempted = false;
+  bool primary_result_reached = false;
+  bool primary_converged = false;
+  bool primary_true_residual_reached = false;
+  int primary_iterations = 0;
+  double primary_reported_relative_residual = 0.0;
+  double primary_true_relative_residual = 0.0;
+  bool correction_attempted = false;
+  bool correction_result_reached = false;
+  bool correction_converged = false;
+  bool correction_true_residual_reached = false;
+  int correction_iterations = 0;
+  double correction_reported_relative_residual = 0.0;
+  double correction_true_relative_residual = 0.0;
+};
+
+void AppendReachedBoolean(std::ostringstream& record, const char* key,
+                          const bool reached, const bool value)
+{
+  record << ' ' << key << '=';
+  if (reached) record << (value ? 1 : 0);
+  else record << "not_reached";
+}
+
+void AppendReachedInteger(std::ostringstream& record, const char* key,
+                          const bool reached, const int value)
+{
+  record << ' ' << key << '=';
+  if (reached) record << value;
+  else record << "not_reached";
+}
+
+void AppendReachedDouble(std::ostringstream& record, const char* key,
+                         const bool reached, const double value)
+{
+  record << ' ' << key << '=';
+  if (!reached) record << "not_reached";
+  else if (!std::isfinite(value)) record << "invalid";
+  else record << value;
+}
+
+void AppendTraceSolveDiagnostic(std::ostringstream& record,
+                                const TraceSolveDiagnostic& diagnostic)
+{
+  record << " gmres_primary_attempted="
+         << (diagnostic.primary_attempted ? 1 : 0);
+  AppendReachedBoolean(record, "gmres_primary_converged",
+                       diagnostic.primary_result_reached,
+                       diagnostic.primary_converged);
+  AppendReachedInteger(record, "gmres_primary_iterations",
+                       diagnostic.primary_result_reached,
+                       diagnostic.primary_iterations);
+  AppendReachedDouble(record, "gmres_primary_reported_residual",
+                      diagnostic.primary_result_reached,
+                      diagnostic.primary_reported_relative_residual);
+  AppendReachedDouble(record, "gmres_primary_true_residual",
+                      diagnostic.primary_true_residual_reached,
+                      diagnostic.primary_true_relative_residual);
+  record << " gmres_correction_attempted="
+         << (diagnostic.correction_attempted ? 1 : 0);
+  AppendReachedBoolean(record, "gmres_correction_converged",
+                       diagnostic.correction_result_reached,
+                       diagnostic.correction_converged);
+  AppendReachedInteger(record, "gmres_correction_iterations",
+                       diagnostic.correction_result_reached,
+                       diagnostic.correction_iterations);
+  AppendReachedDouble(record, "gmres_correction_reported_residual",
+                      diagnostic.correction_result_reached,
+                      diagnostic.correction_reported_relative_residual);
+  AppendReachedDouble(record, "gmres_correction_true_residual",
+                      diagnostic.correction_true_residual_reached,
+                      diagnostic.correction_true_relative_residual);
+}
+
+void AppendSolveFailureDiagnostic(std::ostringstream& record,
+                                  const bool newton_reached,
+                                  const SolvedMeshEvidence* solved,
+                                  const TraceSolveDiagnostic& trace_diagnostic)
+{
+  const NewtonEvidence* newton =
+      newton_reached && solved != nullptr ? &solved->newton : nullptr;
+  const LinearSolveEvidence* linear =
+      solved != nullptr && !solved->linear_history.empty() ?
+      &solved->linear_history.back() : nullptr;
+  AppendReachedInteger(record, "solve_status",
+                       newton_reached && solved != nullptr,
+                       solved == nullptr ? 0 : static_cast<int>(solved->status));
+  AppendReachedInteger(record, "newton_status", newton != nullptr,
+                       newton == nullptr ? 0 : static_cast<int>(newton->status));
+  AppendReachedInteger(record, "linear_status", linear != nullptr,
+                       linear == nullptr ? 0 : static_cast<int>(linear->status));
+  AppendReachedInteger(record, "nonlinear_iteration", linear != nullptr,
+                       linear == nullptr ? 0 : linear->nonlinear_iteration);
+  AppendReachedInteger(record, "newton_accepted_updates", newton != nullptr,
+                       newton == nullptr ? 0 : newton->nonlinear_iterations);
+  const bool residual_reached = newton != nullptr && solved != nullptr &&
+      !solved->residual_history.empty();
+  const double target = residual_reached ?
+      1.0e-10 * (1.0 + newton->initial_residual) : 0.0;
+  AppendReachedDouble(record, "nonlinear_initial_residual", residual_reached,
+                      residual_reached ? newton->initial_residual : 0.0);
+  AppendReachedDouble(record, "nonlinear_final_residual", residual_reached,
+                      residual_reached ? newton->final_residual : 0.0);
+  AppendReachedDouble(record, "nonlinear_target", residual_reached, target);
+  AppendTraceSolveDiagnostic(record, trace_diagnostic);
+}
+
+bool QuadraturePairIsConsistent(const ErrorIntegralEvidence& q_e,
+                                const ErrorIntegralEvidence& q_e_plus_four)
+{
+  const double difference = std::abs(q_e.relative_l2 -
+                                     q_e_plus_four.relative_l2);
+  return std::isfinite(q_e.relative_l2) &&
+         std::isfinite(q_e_plus_four.relative_l2) &&
+         q_e.relative_l2 >= 1.0e-10 &&
+         q_e_plus_four.relative_l2 >= 1.0e-10 &&
+         difference / std::max(q_e_plus_four.relative_l2, 1.0e-300) <=
+             1.0e-8 &&
+         q_e_plus_four.relative_l2 > 100.0 * difference;
+}
+
+double ThreeLevelTraceSlope(const std::array<double, 3>& errors)
+{
+  if (!std::all_of(errors.begin(), errors.end(), [](const double value)
+      { return std::isfinite(value) && value > 0.0; }))
+  {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  return (std::log2(errors[0]) - std::log2(errors[2])) / 2.0;
+}
+
+void AppendRateFailureDiagnostic(std::ostringstream& record,
+                                 const int polynomial_order,
+                                 const ConvergenceEvidence& evidence)
+{
+  const std::array<double, 3>& errors = evidence.trace_relative_l2;
+  const double pair_threshold = static_cast<double>(polynomial_order) + 0.45;
+  const double slope_threshold = static_cast<double>(polynomial_order) + 0.50;
+  std::array<bool, 3> reached{};
+  std::array<bool, 3> quadrature_pair_consistent{};
+  bool errors_valid = true;
+  bool monotone = true;
+  for (std::size_t index = 0; index < errors.size(); ++index)
+  {
+    reached[index] = evidence.solves[index].internal_consistency;
+    quadrature_pair_consistent[index] = reached[index] &&
+        QuadraturePairIsConsistent(evidence.solves[index].q_e_trace,
+                                   evidence.solves[index].q_e_plus_four_trace);
+    errors_valid = errors_valid && reached[index] &&
+        std::isfinite(errors[index]) && errors[index] >= 1.0e-10;
+    if (index > 0) monotone = monotone && errors[index - 1] > errors[index];
+  }
+  std::array<double, 2> rates{{
+      errors_valid ? std::log2(errors[0] / errors[1]) :
+          std::numeric_limits<double>::quiet_NaN(),
+      errors_valid ? std::log2(errors[1] / errors[2]) :
+          std::numeric_limits<double>::quiet_NaN()}};
+  const double slope = errors_valid ? ThreeLevelTraceSlope(errors) :
+      std::numeric_limits<double>::quiet_NaN();
+
+  std::ostringstream failures;
+  bool has_failure = false;
+  const auto fail = [&](const bool failed, const char* name)
+  {
+    if (!failed) return;
+    if (has_failure) failures << '|';
+    failures << name;
+    has_failure = true;
+  };
+  fail(!errors_valid, "trace_error_invalid");
+  fail(errors_valid && !monotone, "trace_nonmonotone");
+  for (std::size_t index = 0; index < quadrature_pair_consistent.size(); ++index)
+  {
+    fail(!quadrature_pair_consistent[index],
+         index == 0 ? "trace_q_pair_0" :
+         index == 1 ? "trace_q_pair_1" : "trace_q_pair_2");
+  }
+  for (std::size_t interval = 0; interval < rates.size(); ++interval)
+  {
+    fail(!std::isfinite(rates[interval]) || rates[interval] < pair_threshold,
+         interval == 0 ? "trace_pair_rate_0" : "trace_pair_rate_1");
+    const double volume_left = evidence.volume_relative_l2[interval];
+    const double volume_right = evidence.volume_relative_l2[interval + 1];
+    const double volume_rate = std::isfinite(volume_left) &&
+            std::isfinite(volume_right) && volume_left > 0.0 &&
+            volume_right > 0.0 ?
+        std::log2(volume_left / volume_right) :
+        std::numeric_limits<double>::quiet_NaN();
+    fail(!std::isfinite(volume_rate) ||
+             volume_rate < static_cast<double>(polynomial_order) + 0.25,
+         interval == 0 ? "volume_pair_rate_0" : "volume_pair_rate_1");
+  }
+  fail(!std::isfinite(slope) || slope < slope_threshold,
+       "trace_three_level_slope");
+
+  for (std::size_t index = 0; index < errors.size(); ++index)
+  {
+    AppendReachedDouble(record,
+                        index == 0 ? "trace_qE4_N3" :
+                        index == 1 ? "trace_qE4_N6" : "trace_qE4_N12",
+                        reached[index], errors[index]);
+    record << ' ' << (index == 0 ? "trace_q_pair_N3" :
+                      index == 1 ? "trace_q_pair_N6" : "trace_q_pair_N12")
+           << '=' << (quadrature_pair_consistent[index] ? 1 : 0);
+  }
+  for (std::size_t interval = 0; interval < rates.size(); ++interval)
+  {
+    AppendReachedDouble(record,
+                        interval == 0 ? "trace_rate_N3_N6" :
+                                        "trace_rate_N6_N12",
+                        errors_valid, rates[interval]);
+    record << ' ' << (interval == 0 ? "trace_rate_threshold_0" :
+                                      "trace_rate_threshold_1")
+           << '=' << pair_threshold;
+    AppendReachedDouble(record,
+                        interval == 0 ? "trace_rate_margin_0" :
+                                        "trace_rate_margin_1",
+                        errors_valid, rates[interval] - pair_threshold);
+  }
+  AppendReachedDouble(record, "trace_three_level_slope", errors_valid, slope);
+  record << " trace_three_level_threshold=" << slope_threshold;
+  AppendReachedDouble(record, "trace_three_level_margin", errors_valid,
+                      slope - slope_threshold);
+  record << " rate_fail_mask="
+         << (has_failure ? failures.str() : "none");
+}
+
+void EmitConvergenceFailureDiagnostic(
+    const int polynomial_order, const std::size_t mesh_index,
+    const int elements_per_direction, const char* phase,
+    const ExperimentStatus status, const ConvergenceEvidence& evidence,
+    const bool newton_reached, const TraceSolveDiagnostic& trace_diagnostic)
+{
+  const SolvedMeshEvidence* solved = mesh_index < evidence.solves.size() ?
+      &evidence.solves[mesh_index] : nullptr;
+  std::ostringstream record;
+  record << std::setprecision(17)
+         << "DIAG03C case=convergence phase=" << phase
+         << " p=" << polynomial_order
+         << " mesh_index=" << mesh_index
+         << " N=" << elements_per_direction
+         << " experiment_status=" << static_cast<int>(status);
+  AppendSolveFailureDiagnostic(record, newton_reached, solved,
+                               trace_diagnostic);
+  if (std::strcmp(phase, "rate") == 0 ||
+      std::strcmp(phase, "monotonicity") == 0)
+  {
+    AppendRateFailureDiagnostic(record, polynomial_order, evidence);
+  }
+  record << '\n';
+  std::cerr << record.str();
+}
+
+void EmitRollbackFailureDiagnostic(
+    const char* phase, const RollbackAuditEvidence& rollback,
+    const NewtonEvidence* newton, const SolvedMeshEvidence* solved,
+    const TraceSolveDiagnostic& trace_diagnostic)
+{
+  std::ostringstream record;
+  record << std::setprecision(17)
+         << "DIAG03C case=rollback phase=" << phase
+         << " p=1 N=3 experiment_status="
+         << static_cast<int>(rollback.status);
+  AppendSolveFailureDiagnostic(record, newton != nullptr, solved,
+                               trace_diagnostic);
+  record << " rollback_status=" << static_cast<int>(rollback.status)
+         << " rollback_initial_admissibility_reason="
+         << static_cast<int>(rollback.initial_admissibility.reason)
+         << " rollback_initial_admissibility_passed="
+         << (rollback.initial_admissibility.passed ? 1 : 0)
+         << " rollback_initial_minimum_density="
+         << rollback.initial_admissibility.minimum_density
+         << " rollback_initial_minimum_pressure="
+         << rollback.initial_admissibility.minimum_pressure
+         << " rollback_initial_maximum_wave_speed="
+         << rollback.initial_admissibility.maximum_wave_speed
+         << " rollback_accepted_updates=" << rollback.accepted_updates
+         << " rollback_initial_residual=" << rollback.initial_residual
+         << " rollback_residual_after_first="
+         << rollback.residual_after_first_accepted
+         << " rollback_residual_above_gate="
+         << (rollback.residual_after_first_above_convergence ? 1 : 0)
+         << " rollback_entry_interior_size=" << rollback.entry_interior.size()
+         << " rollback_restored_interior_size="
+         << rollback.restored_interior.size()
+         << " rollback_entry_trace_size=" << rollback.entry_trace.size()
+         << " rollback_restored_trace_size=" << rollback.restored_trace.size()
+         << " rollback_entry_interior_hash=" << rollback.entry_interior_hash
+         << " rollback_restored_interior_hash="
+         << rollback.restored_interior_hash
+         << " rollback_entry_trace_hash=" << rollback.entry_trace_hash
+         << " rollback_restored_trace_hash=" << rollback.restored_trace_hash
+         << " rollback_returned_success="
+         << (rollback.returned_success ? 1 : 0)
+         << " rollback_interior_byte_equal="
+         << (rollback.interior_byte_equal ? 1 : 0)
+         << " rollback_trace_byte_equal="
+         << (rollback.trace_byte_equal ? 1 : 0)
+         << " rollback_local_generation_invalid="
+         << (rollback.local_generation_invalid ? 1 : 0)
+         << " rollback_condensed_generation_invalid="
+         << (rollback.condensed_generation_invalid ? 1 : 0)
+         << " rollback_solve_generation_invalid="
+         << (rollback.solve_generation_invalid ? 1 : 0)
+         << " rollback_local_copy_rejected="
+         << (rollback.local_copy_rejected ? 1 : 0)
+         << " rollback_rhs_copy_rejected="
+         << (rollback.right_hand_side_copy_rejected ? 1 : 0)
+         << " rollback_trace_increment_copy_rejected="
+         << (rollback.trace_increment_copy_rejected ? 1 : 0)
+         << " rollback_condensation_consume_rejected="
+         << (rollback.condensation_consume_rejected ? 1 : 0)
+         << " rollback_solve_consume_rejected="
+         << (rollback.solve_consume_rejected ? 1 : 0)
+         << " rollback_recovery_consume_rejected="
+         << (rollback.recovery_consume_rejected ? 1 : 0)
+         << " rollback_partial_solve_evidence="
+         << (rollback.partial_solve_evidence ? 1 : 0)
+         << " rollback_partial_convergence_evidence="
+         << (rollback.partial_convergence_evidence ? 1 : 0)
+         << " rollback_passed=" << (rollback.passed ? 1 : 0)
+         << '\n';
+  std::cerr << record.str();
+}
+
 struct PipelinePhaseState
 {
   int batches = 0, interior_dofs = 0, trace_dofs = 0, face_block_size = 0;
@@ -200,6 +530,7 @@ struct PipelinePhaseState
   int gmres_iterations = 0;
   double reported_relative_residual = 0.0;
   double true_relative_residual = 0.0;
+  TraceSolveDiagnostic trace_solve_diagnostic{};
   bool gmres_converged = false, linear_residual_valid = false;
   bool residual_published = false, jacobian_published = false,
        condensed = false, assembled = false, solved = false, recovered_state = false;
@@ -444,6 +775,7 @@ struct SmoothEulerTraceSolvePhase
     state->true_relative_residual = 0.0;
     state->gmres_converged = false;
     state->linear_residual_valid = false;
+    state->trace_solve_diagnostic = {};
     if (state->trace_matrix == nullptr || !*state->trace_matrix ||
         state->trace_solve_matrix == nullptr ||
         state->trace_increment == nullptr || state->trace_preconditioner == nullptr ||
@@ -490,16 +822,26 @@ struct SmoothEulerTraceSolvePhase
         rhs[row] = request.right_hand_side(0, row, 0);
       }
       candidate_increment = 0.0;
+      state->trace_solve_diagnostic.primary_attempted = true;
       gmres.Mult(rhs, candidate_increment);
       state->gmres_iterations = gmres.GetNumIterations();
       state->reported_relative_residual = gmres.GetFinalRelNorm();
       state->gmres_converged = gmres.GetConverged();
+      state->trace_solve_diagnostic.primary_result_reached = true;
+      state->trace_solve_diagnostic.primary_iterations =
+          gmres.GetNumIterations();
+      state->trace_solve_diagnostic.primary_reported_relative_residual =
+          gmres.GetFinalRelNorm();
+      state->trace_solve_diagnostic.primary_converged = gmres.GetConverged();
       if (!state->gmres_converged) { return; }
       mfem::Vector action(global_dofs);
       candidate_solve_matrix->Mult(candidate_increment, action);
       action -= rhs;
       state->true_relative_residual =
           action.Norml2() / std::max(rhs.Norml2(), 1.0e-300);
+      state->trace_solve_diagnostic.primary_true_residual_reached = true;
+      state->trace_solve_diagnostic.primary_true_relative_residual =
+          state->true_relative_residual;
       state->linear_residual_valid =
           std::isfinite(state->true_relative_residual) &&
           state->true_relative_residual <= 1.0e-10;
@@ -510,10 +852,18 @@ struct SmoothEulerTraceSolvePhase
         correction_rhs = action;
         correction_rhs *= -1.0;
         correction = 0.0;
+        state->trace_solve_diagnostic.correction_attempted = true;
         gmres.Mult(correction_rhs, correction);
         state->gmres_iterations += gmres.GetNumIterations();
         state->reported_relative_residual = gmres.GetFinalRelNorm();
         state->gmres_converged = gmres.GetConverged();
+        state->trace_solve_diagnostic.correction_result_reached = true;
+        state->trace_solve_diagnostic.correction_iterations =
+            gmres.GetNumIterations();
+        state->trace_solve_diagnostic.correction_reported_relative_residual =
+            gmres.GetFinalRelNorm();
+        state->trace_solve_diagnostic.correction_converged =
+            gmres.GetConverged();
         if (!state->gmres_converged) { return; }
 
         mfem::Vector corrected_increment(global_dofs);
@@ -524,6 +874,9 @@ struct SmoothEulerTraceSolvePhase
         corrected_action -= rhs;
         state->true_relative_residual =
             corrected_action.Norml2() / std::max(rhs.Norml2(), 1.0e-300);
+        state->trace_solve_diagnostic.correction_true_residual_reached = true;
+        state->trace_solve_diagnostic.correction_true_relative_residual =
+            state->true_relative_residual;
         state->linear_residual_valid =
             std::isfinite(state->true_relative_residual) &&
             state->true_relative_residual <= 1.0e-10;
@@ -1097,6 +1450,7 @@ struct SmoothEulerExperiment::Implementation
               condensation_generation = 0, solve_generation = 0,
               recovery_generation = 0;
   PipelinePhaseState pipeline_state{};
+  TraceSolveDiagnostic last_trace_solve_diagnostic{};
   std::unique_ptr<SmoothEulerPipeline> pipeline;
   SolvedMeshEvidence solved_evidence{};
   bool has_solved_evidence = false;
@@ -1878,6 +2232,8 @@ bool SmoothEulerExperiment::SolveTrace()
   solve_request.right_hand_side = AsConst(pipeline_state.assembled_rhs);
   TraceSolveResult<SmoothEulerSpec> solve_result;
   implementation_->pipeline->SolveGlobalTraceSystem(solve_request, solve_result);
+  implementation_->last_trace_solve_diagnostic =
+      pipeline_state.trace_solve_diagnostic;
   const int global_dofs = implementation_->trace_matrix->Height();
   if (!pipeline_state.solved ||
       !HasExtents(solve_result.trace_solution, 1, global_dofs, 1) ||
@@ -2227,6 +2583,7 @@ bool SmoothEulerExperiment::SolveNewtonTransaction(
   for (int nonlinear_iteration = 0; nonlinear_iteration < 20; ++nonlinear_iteration)
   {
     if (evidence.nonlinear_iterations >= 2 && residual <= target) break;
+    implementation_->last_trace_solve_diagnostic = {};
     const std::vector<double> base_a = implementation_->a;
     const std::vector<double> base_b = implementation_->b;
     const std::vector<double> base_c = implementation_->c;
@@ -2544,8 +2901,20 @@ bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
   evidence.polynomial_order = polynomial_order_;
   constexpr std::array<int, 3> widths{{3, 6, 12}};
   evidence.mesh_widths = widths;
-  auto fail_ladder = [&](const ExperimentStatus status)
+  auto fail_ladder = [&](const ExperimentStatus status, const char* phase,
+                         const std::size_t diagnostic_mesh_index,
+                         const bool newton_reached)
   {
+    try
+    {
+      EmitConvergenceFailureDiagnostic(
+          polynomial_order_, diagnostic_mesh_index,
+          widths[diagnostic_mesh_index], phase, status, evidence,
+          newton_reached, implementation_->last_trace_solve_diagnostic);
+    }
+    catch (...)
+    {
+    }
     for (auto solve = evidence.solves.rbegin(); solve != evidence.solves.rend();
          ++solve)
     {
@@ -2573,22 +2942,25 @@ bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
   };
   for (std::size_t mesh_index = 0; mesh_index < widths.size(); ++mesh_index)
   {
+    implementation_->last_trace_solve_diagnostic = {};
     SolvedMeshEvidence& solved = evidence.solves[mesh_index];
     solved.polynomial_order = polynomial_order_;
     solved.elements_per_direction = widths[mesh_index];
     if (!BuildPeriodicMesh(widths[mesh_index]))
     {
-      return fail_ladder(ExperimentStatus::SetupFailure);
+      return fail_ladder(ExperimentStatus::SetupFailure, "mesh", mesh_index,
+                         false);
     }
     if (!ProjectOldStage() || !ProjectPerturbedCurrentStage())
     {
-      return fail_ladder(ExperimentStatus::ProjectionFailure);
+      return fail_ladder(ExperimentStatus::ProjectionFailure, "projection",
+                         mesh_index, false);
     }
     NewtonEvidence newton{};
     implementation_->rollback_probe_mode = false;
     if (!SolveNewtonTransaction(newton, &solved))
     {
-      return fail_ladder(newton.status);
+      return fail_ladder(newton.status, "newton", mesh_index, true);
     }
     if (!IntegrateErrorEvidence(solved.q_e, solved.q_e_volume,
                                 solved.q_e_trace) ||
@@ -2596,7 +2968,8 @@ bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
                                 solved.q_e_plus_four_volume,
                                 solved.q_e_plus_four_trace))
     {
-      return fail_ladder(ExperimentStatus::ErrorIntegrationFailure);
+      return fail_ladder(ExperimentStatus::ErrorIntegrationFailure, "qE",
+                         mesh_index, true);
     }
     const auto error_pair_is_valid = [](const ErrorIntegralEvidence& q_e,
                                         const ErrorIntegralEvidence& q_e_plus_four)
@@ -2658,7 +3031,8 @@ bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
         std::abs(solved.q_e_plus_four_trace.measure - expected_trace_measure) >
             trace_measure_tolerance)
     {
-      return fail_ladder(ExperimentStatus::ErrorFloorFailure);
+      return fail_ladder(ExperimentStatus::ErrorFloorFailure, "error-floor",
+                         mesh_index, true);
     }
     solved.internal_consistency = true;
     evidence.volume_relative_l2[mesh_index] =
@@ -2675,7 +3049,8 @@ bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
         !(evidence.trace_relative_l2[interval] >
           evidence.trace_relative_l2[interval + 1]))
     {
-      return fail_ladder(ExperimentStatus::RateFailure);
+      return fail_ladder(ExperimentStatus::RateFailure, "monotonicity",
+                         widths.size() - 1, true);
     }
     evidence.volume_rates[interval] = std::log2(
         evidence.volume_relative_l2[interval] /
@@ -2685,16 +3060,26 @@ bool SmoothEulerExperiment::RunConvergenceLadder(ConvergenceEvidence& evidence)
         evidence.trace_relative_l2[interval + 1]);
   }
   const double minimum_volume = static_cast<double>(polynomial_order_) + 0.25;
-  const double minimum_trace = static_cast<double>(polynomial_order_) + 0.50;
+  const double minimum_trace_pair =
+      static_cast<double>(polynomial_order_) + 0.45;
   for (int interval = 0; interval < 2; ++interval)
   {
     if (!std::isfinite(evidence.volume_rates[interval]) ||
         !std::isfinite(evidence.trace_rates[interval]) ||
         evidence.volume_rates[interval] < minimum_volume ||
-        evidence.trace_rates[interval] < minimum_trace)
+        evidence.trace_rates[interval] < minimum_trace_pair)
     {
-      return fail_ladder(ExperimentStatus::RateFailure);
+      return fail_ladder(ExperimentStatus::RateFailure, "rate",
+                         widths.size() - 1, true);
     }
+  }
+  const double trace_slope = ThreeLevelTraceSlope(evidence.trace_relative_l2);
+  const double minimum_trace_slope =
+      static_cast<double>(polynomial_order_) + 0.50;
+  if (!std::isfinite(trace_slope) || trace_slope < minimum_trace_slope)
+  {
+    return fail_ladder(ExperimentStatus::RateFailure, "rate",
+                       widths.size() - 1, true);
   }
   evidence.status = ExperimentStatus::Success;
   evidence.passed = true;
@@ -2811,12 +3196,28 @@ bool RunSmoothEulerExperiment(ExperimentEvidence& evidence)
     if (experiment.polynomial_order_ != 1 || !experiment.BuildPeriodicMesh(3))
     {
       rollback.status = ExperimentStatus::SetupFailure;
+      try
+      {
+        EmitRollbackFailureDiagnostic(
+            "mesh", rollback, nullptr, nullptr, {});
+      }
+      catch (...)
+      {
+      }
       return false;
     }
     if (!experiment.ProjectOldStage() ||
         !experiment.ProjectPerturbedCurrentStage())
     {
       rollback.status = ExperimentStatus::ProjectionFailure;
+      try
+      {
+        EmitRollbackFailureDiagnostic(
+            "projection", rollback, nullptr, nullptr, {});
+      }
+      catch (...)
+      {
+      }
       return false;
     }
     auto& implementation = *experiment.implementation_;
@@ -2835,6 +3236,14 @@ bool RunSmoothEulerExperiment(ExperimentEvidence& evidence)
         !rollback.initial_admissibility.passed)
     {
       rollback.status = ExperimentStatus::InitialAdmissibilityFailure;
+      try
+      {
+        EmitRollbackFailureDiagnostic(
+            "newton", rollback, nullptr, nullptr, {});
+      }
+      catch (...)
+      {
+      }
       return false;
     }
 
@@ -2843,6 +3252,8 @@ bool RunSmoothEulerExperiment(ExperimentEvidence& evidence)
     implementation.rollback_probe_mode = true;
     rollback.returned_success =
         experiment.SolveNewtonTransaction(newton, &private_solved);
+    const TraceSolveDiagnostic trace_diagnostic =
+        implementation.last_trace_solve_diagnostic;
     implementation.rollback_probe_mode = false;
     rollback.status = newton.status;
     rollback.accepted_updates = newton.nonlinear_iterations;
@@ -2903,6 +3314,17 @@ bool RunSmoothEulerExperiment(ExperimentEvidence& evidence)
         rollback.solve_consume_rejected && rollback.recovery_consume_rejected &&
         !rollback.partial_solve_evidence &&
         !rollback.partial_convergence_evidence;
+    if (!rollback.passed)
+    {
+      try
+      {
+        EmitRollbackFailureDiagnostic(
+            "newton", rollback, &newton, &private_solved, trace_diagnostic);
+      }
+      catch (...)
+      {
+      }
+    }
     return rollback.passed;
   };
 

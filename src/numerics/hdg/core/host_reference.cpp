@@ -279,6 +279,9 @@ bool Solve(const double* lu, const int* pivots, std::size_t n,
     const auto pivot = static_cast<std::size_t>(pivots[row]);
     if (pivot != row)
       for (std::size_t rhs = 0; rhs < nrhs; ++rhs) { std::swap(x[row*nrhs+rhs], x[pivot*nrhs+rhs]); }
+  }
+  for (std::size_t row = 0; row < n; ++row)
+  {
     for (std::size_t below = row + 1; below < n; ++below)
       for (std::size_t rhs = 0; rhs < nrhs; ++rhs) { x[below*nrhs+rhs] -= lu[below*n+row] * x[row*nrhs+rhs]; }
   }

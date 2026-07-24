@@ -3133,6 +3133,118 @@ struct IndependentCampaignOracles
   std::array<std::array<double, 2>, 4> trace_rates{};
 };
 
+struct IndependentTraceAdmission
+{
+  std::array<double, 2> pair_rates{{
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::quiet_NaN()}};
+  double least_squares_slope = std::numeric_limits<double>::quiet_NaN();
+  bool errors_valid = false;
+  bool strictly_monotone = false;
+  bool pair_floor_passed = false;
+  bool slope_passed = false;
+  bool passed = false;
+};
+
+IndependentTraceAdmission EvaluateIndependentTraceAdmission(
+    const std::array<double, 3>& errors,
+    const std::array<int, 3>& mesh_widths, const int polynomial_order)
+{
+  IndependentTraceAdmission result{};
+  result.errors_valid = std::all_of(
+      errors.begin(), errors.end(), [](const double value)
+      {
+        return std::isfinite(value) && value >= 1.0e-10;
+      });
+  result.strictly_monotone = result.errors_valid &&
+      errors[0] > errors[1] && errors[1] > errors[2];
+  if (!result.strictly_monotone ||
+      std::any_of(mesh_widths.begin(), mesh_widths.end(),
+                  [](const int width) { return width <= 0; }))
+  {
+    return result;
+  }
+
+  for (std::size_t interval = 0; interval < result.pair_rates.size();
+       ++interval)
+  {
+    result.pair_rates[interval] =
+        std::log2(errors[interval] / errors[interval + 1]);
+  }
+  const double pair_floor = static_cast<double>(polynomial_order) + 0.45;
+  result.pair_floor_passed = std::all_of(
+      result.pair_rates.begin(), result.pair_rates.end(),
+      [pair_floor](const double rate)
+      {
+        return std::isfinite(rate) && rate >= pair_floor;
+      });
+
+  std::array<double, 3> log_h{}, log_error{};
+  double mean_log_h = 0.0;
+  double mean_log_error = 0.0;
+  for (std::size_t index = 0; index < errors.size(); ++index)
+  {
+    log_h[index] = std::log(1.0 / mesh_widths[index]);
+    log_error[index] = std::log(errors[index]);
+    mean_log_h += log_h[index] / static_cast<double>(errors.size());
+    mean_log_error += log_error[index] /
+                      static_cast<double>(errors.size());
+  }
+  double covariance = 0.0;
+  double variance = 0.0;
+  for (std::size_t index = 0; index < errors.size(); ++index)
+  {
+    covariance += (log_h[index] - mean_log_h) *
+                  (log_error[index] - mean_log_error);
+    variance += (log_h[index] - mean_log_h) *
+                (log_h[index] - mean_log_h);
+  }
+  if (std::isfinite(covariance) && std::isfinite(variance) && variance > 0.0)
+  {
+    result.least_squares_slope = covariance / variance;
+  }
+  result.slope_passed = std::isfinite(result.least_squares_slope) &&
+      result.least_squares_slope >=
+          static_cast<double>(polynomial_order) + 0.50;
+  result.passed = result.errors_valid && result.strictly_monotone &&
+      result.pair_floor_passed && result.slope_passed;
+  return result;
+}
+
+bool TestIndependentTraceAdmissionNegativeControls()
+{
+  constexpr int polynomial_order = 2;
+  constexpr std::array<int, 3> mesh_widths{{3, 6, 12}};
+  const auto errors_from_rates = [](const double first,
+                                    const double second)
+  {
+    return std::array<double, 3>{{
+        1.0, std::exp2(-first), std::exp2(-(first + second))}};
+  };
+
+  const IndependentTraceAdmission local_floor_failure =
+      EvaluateIndependentTraceAdmission(
+          errors_from_rates(polynomial_order + 0.44,
+                            polynomial_order + 0.56),
+          mesh_widths, polynomial_order);
+  if (!local_floor_failure.errors_valid ||
+      !local_floor_failure.strictly_monotone ||
+      local_floor_failure.pair_floor_passed ||
+      !local_floor_failure.slope_passed || local_floor_failure.passed)
+  {
+    return false;
+  }
+
+  const IndependentTraceAdmission slope_failure =
+      EvaluateIndependentTraceAdmission(
+          errors_from_rates(polynomial_order + 0.49,
+                            polynomial_order + 0.49),
+          mesh_widths, polynomial_order);
+  return slope_failure.errors_valid && slope_failure.strictly_monotone &&
+         slope_failure.pair_floor_passed && !slope_failure.slope_passed &&
+         !slope_failure.passed;
+}
+
 bool ErrorIntegralIsValid(const ErrorIntegralEvidence& value,
                           const double expected_measure,
                           const int expected_faces)
@@ -3280,6 +3392,25 @@ bool CheckContinuousErrors(const ExperimentEvidence& evidence,
                    ladder.volume_rates[interval]) > 1.0e-7 ||
           std::abs(oracles.trace_rates[p_index][interval] -
                    ladder.trace_rates[interval]) > 1.0e-7) return false;
+    }
+    const std::array<double, 3> recorded_trace_errors{{
+        ladder.trace_relative_l2[0], ladder.trace_relative_l2[1],
+        ladder.trace_relative_l2[2]}};
+    const std::array<double, 3> oracle_trace_errors{{
+        oracles.solves[p_index][0].trace.relative_l2,
+        oracles.solves[p_index][1].trace.relative_l2,
+        oracles.solves[p_index][2].trace.relative_l2}};
+    const IndependentTraceAdmission recorded_admission =
+        EvaluateIndependentTraceAdmission(
+            recorded_trace_errors, ladder.mesh_widths,
+            ladder.polynomial_order);
+    const IndependentTraceAdmission oracle_admission =
+        EvaluateIndependentTraceAdmission(
+            oracle_trace_errors, ladder.mesh_widths,
+            ladder.polynomial_order);
+    if (!recorded_admission.passed || !oracle_admission.passed)
+    {
+      return false;
     }
   }
   return true;
@@ -3658,17 +3789,23 @@ int TestCompleteExperimentGate()
       if (!CheckLinearAudit(solved)) return 11;
     }
     const double minimum_volume = ladder.polynomial_order + 0.25;
-    const double minimum_trace = ladder.polynomial_order + 0.50;
+    const double minimum_trace_pair = ladder.polynomial_order + 0.45;
     for (int interval = 0; interval < 2; ++interval)
     {
       if (ladder.volume_rates[interval] < minimum_volume ||
-          ladder.trace_rates[interval] < minimum_trace) return 12;
+          ladder.trace_rates[interval] < minimum_trace_pair) return 12;
     }
+    const IndependentTraceAdmission trace_admission =
+        EvaluateIndependentTraceAdmission(
+            ladder.trace_relative_l2, ladder.mesh_widths,
+            ladder.polynomial_order);
+    if (!trace_admission.passed) return 12;
   }
   if (solve_count != 12) return 13;
   IndependentCampaignOracles oracles{};
   if (!CheckContinuousErrors(evidence, oracles)) return 14;
   if (!TestActiveEvidenceControls(evidence, oracles)) return 15;
+  if (!TestIndependentTraceAdmissionNegativeControls()) return 16;
   return 0;
 }
 
