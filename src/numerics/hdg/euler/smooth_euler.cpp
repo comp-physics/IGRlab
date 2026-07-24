@@ -503,7 +503,33 @@ struct SmoothEulerTraceSolvePhase
       state->linear_residual_valid =
           std::isfinite(state->true_relative_residual) &&
           state->true_relative_residual <= 1.0e-10;
-      if (!state->linear_residual_valid) { return; }
+      if (!std::isfinite(state->true_relative_residual)) { return; }
+      if (!state->linear_residual_valid)
+      {
+        mfem::Vector correction_rhs(global_dofs), correction(global_dofs);
+        correction_rhs = action;
+        correction_rhs *= -1.0;
+        correction = 0.0;
+        gmres.Mult(correction_rhs, correction);
+        state->gmres_iterations += gmres.GetNumIterations();
+        state->reported_relative_residual = gmres.GetFinalRelNorm();
+        state->gmres_converged = gmres.GetConverged();
+        if (!state->gmres_converged) { return; }
+
+        mfem::Vector corrected_increment(global_dofs);
+        corrected_increment = candidate_increment;
+        corrected_increment += correction;
+        mfem::Vector corrected_action(global_dofs);
+        candidate_solve_matrix->Mult(corrected_increment, corrected_action);
+        corrected_action -= rhs;
+        state->true_relative_residual =
+            corrected_action.Norml2() / std::max(rhs.Norml2(), 1.0e-300);
+        state->linear_residual_valid =
+            std::isfinite(state->true_relative_residual) &&
+            state->true_relative_residual <= 1.0e-10;
+        if (!state->linear_residual_valid) { return; }
+        candidate_increment = corrected_increment;
+      }
       *state->trace_increment = candidate_increment;
       *state->trace_solve_matrix = std::move(candidate_solve_matrix);
       *state->trace_preconditioner = std::move(candidate_preconditioner);
