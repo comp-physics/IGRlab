@@ -131,6 +131,89 @@ int TestParity()
   return 0;
 }
 
+int TestDelayedPivotRecovery()
+{
+  constexpr LocalIndex batches=1, ni=3, nt=2;
+  std::array<double,9> a{{4.,2.,0., 1.,1.,5., 2.,3.,1.}};
+  std::array<double,6> b{{1.,-2., 3.,.5, -1.,4.}};
+  std::array<double,6> c{{2.,-1.,.5, -3.,2.,1.}};
+  std::array<double,4> d{{6.,.25, -.75,5.}};
+  std::array<double,3> f{{7.,-2.,5.}};
+  std::array<double,2> g{{1.5,-4.}};
+
+  const double first_multiplier_row_one=a[3]/a[0];
+  const double first_multiplier_row_two=a[6]/a[0];
+  const double reduced_row_one=a[4]-first_multiplier_row_one*a[1];
+  const double reduced_row_two=a[7]-first_multiplier_row_two*a[1];
+  if(!(std::abs(a[0])>std::abs(a[3]) &&
+       std::abs(a[0])>std::abs(a[6]) &&
+       first_multiplier_row_one!=0. && first_multiplier_row_two!=0. &&
+       first_multiplier_row_one!=first_multiplier_row_two &&
+       std::abs(reduced_row_two)>std::abs(reduced_row_one))) return 1;
+
+  std::array<double,4> schur{};
+  std::array<double,2> condensed_rhs{};
+  LocalSystemBatchView input{{ni,nt,1,1},ConstView(a.data(),batches,ni,ni),
+      ConstView(b.data(),batches,ni,nt),ConstView(c.data(),batches,nt,ni),
+      ConstView(d.data(),batches,nt,nt),ConstView(f.data(),batches,ni,1),
+      ConstView(g.data(),batches,nt,1)};
+  HostReferenceEngine engine;
+  if(engine.Condense(input,{View(schur.data(),batches,nt,nt),
+      View(condensed_rhs.data(),batches,nt,1)})!=Status::success) return 2;
+
+  mfem::DenseMatrix local_a(ni);
+  for(LocalIndex row=0;row<ni;++row)
+    for(LocalIndex column=0;column<ni;++column)
+      local_a(row,column)=a[row*ni+column];
+  mfem::DenseMatrixInverse inverse(local_a);
+  mfem::Vector solve_rhs(ni),solve_result(ni);
+  std::array<double,6> inverse_b{};
+  for(LocalIndex column=0;column<nt;++column)
+  {
+    for(LocalIndex row=0;row<ni;++row) solve_rhs(row)=b[row*nt+column];
+    inverse.Mult(solve_rhs,solve_result);
+    for(LocalIndex row=0;row<ni;++row)
+      inverse_b[row*nt+column]=solve_result(row);
+  }
+  for(LocalIndex row=0;row<ni;++row) solve_rhs(row)=f[row];
+  inverse.Mult(solve_rhs,solve_result);
+  for(LocalIndex row=0;row<nt;++row)
+  {
+    double expected_rhs=g[row];
+    for(LocalIndex k=0;k<ni;++k) expected_rhs-=c[row*ni+k]*solve_result(k);
+    if(!Near(condensed_rhs[row],expected_rhs)) return 3;
+    for(LocalIndex column=0;column<nt;++column)
+    {
+      double expected_schur=d[row*nt+column];
+      for(LocalIndex k=0;k<ni;++k)
+        expected_schur-=c[row*ni+k]*inverse_b[k*nt+column];
+      if(!Near(schur[row*nt+column],expected_schur)) return 4;
+    }
+  }
+
+  std::array<double,2> trace{{.75,-.5}};
+  std::array<double,3> recovered{};
+  if(engine.Recover(ConstView(trace.data(),batches,nt,1),
+                    View(recovered.data(),batches,ni,1))!=Status::success)
+    return 5;
+  for(LocalIndex row=0;row<ni;++row)
+  {
+    solve_rhs(row)=f[row];
+    for(LocalIndex column=0;column<nt;++column)
+      solve_rhs(row)-=b[row*nt+column]*trace[column];
+  }
+  inverse.Mult(solve_rhs,solve_result);
+  for(LocalIndex row=0;row<ni;++row)
+  {
+    if(!Near(recovered[row],solve_result(row))) return 6;
+    double product=0.;
+    for(LocalIndex column=0;column<ni;++column)
+      product+=a[row*ni+column]*recovered[column];
+    if(!Near(product,solve_rhs(row))) return 7;
+  }
+  return 0;
+}
+
 int TestWritableLayoutsAndOverlap()
 {
   constexpr LocalIndex batches=2, ni=2, nt=2;
@@ -308,6 +391,8 @@ int main()
 {
   const int parity=TestParity();
   if(parity!=0) return parity;
+  const int delayed_pivot=TestDelayedPivotRecovery();
+  if(delayed_pivot!=0) return 10+delayed_pivot;
   const int writable=TestWritableLayoutsAndOverlap();
   return writable==0 ? TestFailuresAndCensus() : 20+writable;
 }
