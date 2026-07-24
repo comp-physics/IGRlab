@@ -1,5 +1,7 @@
 #include "numerics/hdg/device/device_core.hpp"
 
+#include "pivoted_solve.hpp"
+
 #include "utils/profiling/observability.hpp"
 
 #include <algorithm>
@@ -161,38 +163,6 @@ bool PackedFinite(const double* values, const std::size_t count) noexcept
   return true;
 }
 
-MFEM_HOST_DEVICE void SolvePivoted(const double* lu, const double* pivots,
-                                   const int ni, double* values,
-                                   const int columns)
-{
-  for (int row = 0; row < ni; ++row)
-  {
-    const int pivot = static_cast<int>(pivots[row]);
-    if (pivot != row)
-      for (int column = 0; column < columns; ++column)
-      {
-        const double temporary = values[row * columns + column];
-        values[row * columns + column] = values[pivot * columns + column];
-        values[pivot * columns + column] = temporary;
-      }
-    for (int below = row + 1; below < ni; ++below)
-      for (int column = 0; column < columns; ++column)
-      {
-        values[below * columns + column] -=
-            lu[below * ni + row] * values[row * columns + column];
-      }
-  }
-  for (int row = ni; row-- > 0;)
-    for (int column = 0; column < columns; ++column)
-    {
-      for (int right = row + 1; right < ni; ++right)
-      {
-        values[row * columns + column] -=
-            lu[row * ni + right] * values[right * columns + column];
-      }
-      values[row * columns + column] /= lu[row * ni + row];
-    }
-}
 }  // namespace
 
 bool MakePersistentStorageLayout(const std::size_t ni, const std::size_t nt,
@@ -425,7 +395,7 @@ Status DeviceCoreEngine::Condense(const core::LocalSystemBatchView& input,
       }
       local_solve[row * (nt_i + 1) + nt_i] = f[batch * ni_i + row];
     }
-    SolvePivoted(local_lu, local_pivots, ni_i, local_solve, nt_i + 1);
+    detail::SolvePivoted(local_lu, local_pivots, ni_i, local_solve, nt_i + 1);
     for (int row = 0; row < nt_i; ++row)
     {
       double condensed_rhs = rhs[batch * nt_i + row];
@@ -521,8 +491,8 @@ Status DeviceCoreEngine::ApplySchur(const StridedBlockView<const double> trace,
       }
       local[row] = value;
     }
-    SolvePivoted(lu + batch * ni_i * ni_i, pivots + batch * ni_i, ni_i,
-                 local, 1);
+    detail::SolvePivoted(lu + batch * ni_i * ni_i,
+                         pivots + batch * ni_i, ni_i, local, 1);
     for (int row = 0; row < nt_i; ++row)
     {
       double value = 0.0;
@@ -597,8 +567,8 @@ Status DeviceCoreEngine::Recover(const StridedBlockView<const double> trace,
       }
       local[row] = value;
     }
-    SolvePivoted(lu + batch * ni_i * ni_i, pivots + batch * ni_i, ni_i,
-                 local, 1);
+    detail::SolvePivoted(lu + batch * ni_i * ni_i,
+                         pivots + batch * ni_i, ni_i, local, 1);
   });
   const double* host_interior = interior_.HostRead();
   RecordDeviceToHost(batch_count_ * ni * sizeof(double));
