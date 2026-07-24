@@ -1803,6 +1803,25 @@ int TestFaceBlockDirectionalAndIndependentSchurOracles()
     }
     if (!Close(action, trace_rhs[row], 2.0e-9)) return 11;
   }
+  long double residual_squared = 0.0L;
+  long double right_hand_side_squared = 0.0L;
+  for (int row = 0; row < condensed.Height(); ++row)
+  {
+    long double action = 0.0L;
+    for (int column = 0; column < condensed.Width(); ++column)
+    {
+      action += static_cast<long double>(condensed(row, column)) *
+          static_cast<long double>(trace_increment[column]);
+    }
+    const long double right_hand_side =
+        static_cast<long double>(trace_rhs[row]);
+    const long double residual = action - right_hand_side;
+    residual_squared += residual * residual;
+    right_hand_side_squared += right_hand_side * right_hand_side;
+  }
+  const long double relative_residual = std::sqrt(residual_squared) /
+      std::max(std::sqrt(right_hand_side_squared), 1.0e-300L);
+  if (!(relative_residual <= 1.0e-10L)) return 30;
   std::vector<double> dense_matrix(static_cast<std::size_t>(condensed.Height()) * condensed.Width());
   for (int row = 0; row < condensed.Height(); ++row)
     for (int column = 0; column < condensed.Width(); ++column)
