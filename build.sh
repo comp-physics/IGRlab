@@ -157,7 +157,7 @@ if ((CLEAN)); then
   rm -rf "${APP_BUILD}" "${APP_INSTALL}"
 fi
 
-echo "[build] configuring app (${MODE})"
+echo "[build] configuring app (${MODE}, hdg_euler_experiment=${HDG_EULER_EXPERIMENT})"
 app_cmake_args=(
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   -DCMAKE_CXX_COMPILER="${MPI_PREFIX}/bin/mpicxx"
@@ -217,4 +217,4 @@ if ((RUN_SMOKE)); then
     "${smoke_exe}" "${smoke_args[@]}"
 fi
 
-echo "[build] complete: profile=${PROFILE} build=${APP_BUILD} install=${APP_INSTALL}"
+echo "[build] complete: profile=${PROFILE} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} build=${APP_BUILD} install=${APP_INSTALL}"

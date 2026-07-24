@@ -7,6 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(CTest)
 include(CheckLanguage)
 option(DG_IGR_BUILD_TESTS "Build dg_igr unit tests" ON)
+option(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT
+       "Build the serial smooth-Euler HDG experiment."
+       OFF)
 option(DG_IGR_ENABLE_OBSERVABILITY
        "Compile the core observability contract (runtime remains default-off)."
        OFF)
@@ -49,6 +52,11 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(MFEM REQUIRED CONFIG)
+if(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT AND
+   (MFEM_USE_CUDA OR MFEM_USE_HIP))
+    message(FATAL_ERROR
+            "DG_IGR_ENABLE_HDG_EULER_EXPERIMENT=ON requires a non-CUDA, non-HIP MFEM.")
+endif()
 find_package(ZLIB REQUIRED)
 
 if(MFEM_USE_UMPIRE)
