@@ -69,6 +69,7 @@ tests/perf*
 tests/scripts
 !tests/scripts/
 tests/scripts/*
+!tests/scripts/check_cuda_build_policy.sh
 !tests/scripts/check_sigma_vtk_lifecycle.py
 !tests/scripts/check_vtk_restart.py
 out/

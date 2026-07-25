@@ -7,6 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(CTest)
 include(CheckLanguage)
 option(DG_IGR_BUILD_TESTS "Build dg_igr unit tests" ON)
+option(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT
+       "Build the serial smooth-Euler HDG experiment."
+       OFF)
 option(DG_IGR_ENABLE_OBSERVABILITY
        "Compile the core observability contract (runtime remains default-off)."
        OFF)
@@ -49,6 +52,11 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(MFEM REQUIRED CONFIG)
+if(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT AND
+   (MFEM_USE_CUDA OR MFEM_USE_HIP))
+    message(FATAL_ERROR
+            "DG_IGR_ENABLE_HDG_EULER_EXPERIMENT=ON requires a non-CUDA, non-HIP MFEM.")
+endif()
 find_package(ZLIB REQUIRED)
 
 if(MFEM_USE_UMPIRE)
@@ -92,11 +100,6 @@ if(DG_IGR_ENABLE_ACCELERATOR_LANGUAGE)
     if(MFEM_USE_CUDA)
         if(_dg_igr_expected_arch AND NOT CMAKE_CUDA_ARCHITECTURES)
             set(_dg_igr_default_cuda_arch "${_dg_igr_expected_arch}")
-            if(_dg_igr_expected_arch STREQUAL "120")
-                # Current local sm120 workflow relies on CUDA 80 virtual PTX;
-                # native sm120 codegen is intentionally avoided for now.
-                set(_dg_igr_default_cuda_arch "80-virtual")
-            endif()
             set(CMAKE_CUDA_ARCHITECTURES
                 "${_dg_igr_default_cuda_arch}"
                 CACHE STRING
@@ -198,28 +201,17 @@ if(DG_IGR_EXPECT_CUDA_ARCH AND MFEM_USE_CUDA)
     if(CMAKE_CUDA_ARCHITECTURES)
         string(REPLACE ";" "," _dg_igr_arches "${CMAKE_CUDA_ARCHITECTURES}")
         set(_dg_igr_cuda_arch_ok OFF)
-        set(_dg_igr_cuda_arch_compat OFF)
         foreach(_dg_igr_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
             if(_dg_igr_arch STREQUAL "${_dg_igr_expected_arch}" OR
-               _dg_igr_arch STREQUAL "${_dg_igr_expected_arch}-real" OR
-               _dg_igr_arch STREQUAL "${_dg_igr_expected_arch}-virtual")
+               _dg_igr_arch STREQUAL "${_dg_igr_expected_arch}-real")
                 set(_dg_igr_cuda_arch_ok ON)
-            endif()
-            if(_dg_igr_expected_arch STREQUAL "120" AND
-               _dg_igr_arch STREQUAL "80-virtual")
-                set(_dg_igr_cuda_arch_ok ON)
-                set(_dg_igr_cuda_arch_compat ON)
             endif()
         endforeach()
         if(NOT _dg_igr_cuda_arch_ok)
             message(FATAL_ERROR
                     "CUDA arch policy mismatch: expected concrete profile ${_dg_igr_expected_arch}, "
                     "configured CMAKE_CUDA_ARCHITECTURES=${_dg_igr_arches}. "
-                    "For the current sm120 workflow, use CMAKE_CUDA_ARCHITECTURES=80-virtual.")
-        elseif(_dg_igr_cuda_arch_compat)
-            message(STATUS
-                    "CUDA arch policy: expected concrete profile ${_dg_igr_expected_arch}; "
-                    "using compatibility codegen CMAKE_CUDA_ARCHITECTURES=${_dg_igr_arches}.")
+                    "Application CUDA sources must target the selected native profile.")
         endif()
     else()
         message(STATUS

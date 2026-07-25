@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MODE="cpu"
 JOBS="${NPROC:-4}"
+MFEM_JOBS=""
 CLEAN=1
 INSTALL_DEPS=1
 RUN_TESTS=1
@@ -12,6 +13,7 @@ CALIPER=0
 HDG_EULER_EXPERIMENT="OFF"
 SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
 CUDA_ARCH_WAS_SET=0
+PRINT_PLAN=0
 
 usage() {
   cat <<'EOF'
@@ -26,7 +28,9 @@ Options:
   --hdg-euler-experiment
                     Enable the CPU-only experimental HDG Euler path.
   -j, --jobs N      Parallel build jobs (default: NPROC or 4).
+  --mfem-jobs N     Parallel MFEM build jobs (default: --jobs value).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
+  --print-plan      Validate and print the resolved build policy, then exit.
   --clean           Rebuild the selected mode from clean caches (default).
   --no-clean        Reuse existing build and install directories.
   --no-deps         Do not run `spack install`.
@@ -35,8 +39,12 @@ Options:
   -h, --help        Show this help.
 
 Environment overrides:
-  DG_IGR_SPACK_ENV, CUDA_ARCHS, SPACK_CUDA_ARCH, CMAKE_BUILD_TYPE,
-  DG_IGR_ACCELERATOR_KERNEL_SOURCES
+  DG_IGR_SPACK_ENV, SPACK_CUDA_ARCH, MFEM_CUDA_ARCHS, APP_CUDA_ARCHS,
+  CMAKE_BUILD_TYPE, DG_IGR_ACCELERATOR_KERNEL_SOURCES
+
+CUDA_ARCHS is intentionally rejected in GPU mode. Use MFEM_CUDA_ARCHS and
+APP_CUDA_ARCHS so MFEM compatibility code generation cannot be confused with
+native application code generation.
 EOF
 }
 
@@ -57,6 +65,12 @@ while (($#)); do
       JOBS="$2"
       shift
       ;;
+    --mfem-jobs)
+      [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+      MFEM_JOBS="$2"
+      shift
+      ;;
+    --print-plan) PRINT_PLAN=1 ;;
     --clean) CLEAN=1 ;;
     --no-clean) CLEAN=0 ;;
     --no-deps) INSTALL_DEPS=0 ;;
@@ -68,12 +82,20 @@ while (($#)); do
   shift
 done
 
+if [[ -z "${MFEM_JOBS}" ]]; then
+  MFEM_JOBS="${JOBS}"
+fi
+
 if [[ "${MODE}" == "gpu" && "${HDG_EULER_EXPERIMENT}" == "ON" ]]; then
   echo "ERROR: --hdg-euler-experiment is only valid with --cpu-only." >&2
   exit 2
 fi
 [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] || {
   echo "ERROR: jobs must be a positive integer (got '${JOBS}')" >&2
+  exit 2
+}
+[[ "${MFEM_JOBS}" =~ ^[1-9][0-9]*$ ]] || {
+  echo "ERROR: MFEM jobs must be a positive integer (got '${MFEM_JOBS}')" >&2
   exit 2
 }
 [[ "${SPACK_CUDA_ARCH}" =~ ^[0-9]+$ ]] || {
@@ -88,20 +110,41 @@ if [[ "${MODE}" == "gpu" && "${CALIPER}" == "1" ]]; then
   echo "ERROR: --caliper is only valid with --cpu-only." >&2
   exit 2
 fi
-command -v spack >/dev/null 2>&1 || {
-  echo "ERROR: spack is not available; source Spack's setup-env.sh first." >&2
+if [[ "${MODE}" == "gpu" && -n "${CUDA_ARCHS+x}" ]]; then
+  echo "ERROR: CUDA_ARCHS is ambiguous and is rejected in GPU mode." >&2
+  echo "       Use MFEM_CUDA_ARCHS for MFEM and APP_CUDA_ARCHS for project sources." >&2
   exit 2
-}
+fi
 
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 if [[ "${MODE}" == "gpu" ]]; then
   PROFILE="cuda-sm${SPACK_CUDA_ARCH}"
+  DEPENDENCY_CUDA_ARCH="${SPACK_CUDA_ARCH}"
   SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/${PROFILE}}"
   MFEM_INSTALL="${SCRIPT_DIR}/tpl/mfem/install-gpu-sm${SPACK_CUDA_ARCH}"
   APP_BUILD="${SCRIPT_DIR}/build-gpu-sm${SPACK_CUDA_ARCH}"
   APP_INSTALL="${SCRIPT_DIR}/install-gpu-sm${SPACK_CUDA_ARCH}"
-  CUDA_ARCHS="${CUDA_ARCHS:-80-virtual}"
+  EXPECTED_MFEM_CUDA_ARCHS="${SPACK_CUDA_ARCH}"
+  if [[ "${SPACK_CUDA_ARCH}" == "120" ]]; then
+    EXPECTED_MFEM_CUDA_ARCHS="80-virtual"
+  fi
+  MFEM_CUDA_ARCHS="${MFEM_CUDA_ARCHS:-${EXPECTED_MFEM_CUDA_ARCHS}}"
+  APP_CUDA_ARCHS="${APP_CUDA_ARCHS:-${SPACK_CUDA_ARCH}}"
+
+  if [[ "${MFEM_CUDA_ARCHS}" != "${EXPECTED_MFEM_CUDA_ARCHS}" ]]; then
+    echo "ERROR: CUDA profile ${SPACK_CUDA_ARCH} requires MFEM_CUDA_ARCHS=${EXPECTED_MFEM_CUDA_ARCHS}." >&2
+    if [[ "${SPACK_CUDA_ARCH}" == "120" ]]; then
+      echo "       Native MFEM sm_120 code generation is blocked because it can exhaust memory." >&2
+    fi
+    exit 2
+  fi
+  if [[ "${APP_CUDA_ARCHS}" != "${SPACK_CUDA_ARCH}" ]]; then
+    echo "ERROR: CUDA profile ${SPACK_CUDA_ARCH} requires APP_CUDA_ARCHS=${SPACK_CUDA_ARCH}." >&2
+    echo "       Application sources use the native profile architecture." >&2
+    exit 2
+  fi
 else
+  DEPENDENCY_CUDA_ARCH="none"
   if ((CALIPER)); then
     PROFILE="cpu-caliper"
     SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu-caliper}"
@@ -115,7 +158,21 @@ else
     APP_BUILD="${SCRIPT_DIR}/build-cpu"
     APP_INSTALL="${SCRIPT_DIR}/install-cpu"
   fi
+  MFEM_CUDA_ARCHS="none"
+  APP_CUDA_ARCHS="none"
 fi
+
+echo "[build-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH} mfem_cuda_archs=${MFEM_CUDA_ARCHS} app_cuda_archs=${APP_CUDA_ARCHS} app_jobs=${JOBS} mfem_jobs=${MFEM_JOBS}"
+echo "[build-plan] env=${SPACK_ENV} app_build=${APP_BUILD} app_install=${APP_INSTALL}"
+
+if ((PRINT_PLAN)); then
+  exit 0
+fi
+
+command -v spack >/dev/null 2>&1 || {
+  echo "ERROR: spack is not available; source Spack's setup-env.sh first." >&2
+  exit 2
+}
 
 if ((INSTALL_DEPS)); then
   echo "[build] installing ${MODE} dependencies from ${SPACK_ENV}"
@@ -136,12 +193,15 @@ SPACK_VIEW="${SPACK_ENV}/.spack-env/view"
 export PATH="${SPACK_VIEW}/bin:${PATH}"
 export LD_LIBRARY_PATH="${SPACK_VIEW}/lib:${SPACK_VIEW}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-mfem_args=("--${MODE}" --jobs "${JOBS}")
+mfem_args=("--${MODE}" --jobs "${MFEM_JOBS}")
 if ((CALIPER)); then
   mfem_args+=(--caliper)
 fi
 if [[ "${MODE}" == "gpu" ]]; then
-  mfem_args+=(--cuda-arch "${SPACK_CUDA_ARCH}")
+  mfem_args+=(
+    --cuda-arch "${SPACK_CUDA_ARCH}"
+    --cuda-codegen "${MFEM_CUDA_ARCHS}"
+  )
 fi
 if ((CLEAN)); then
   mfem_args+=(--clean)
@@ -157,7 +217,7 @@ if ((CLEAN)); then
   rm -rf "${APP_BUILD}" "${APP_INSTALL}"
 fi
 
-echo "[build] configuring app (${MODE})"
+echo "[build] configuring app (${MODE}, hdg_euler_experiment=${HDG_EULER_EXPERIMENT})"
 app_cmake_args=(
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   -DCMAKE_CXX_COMPILER="${MPI_PREFIX}/bin/mpicxx"
@@ -182,7 +242,7 @@ if [[ "${MODE}" == "gpu" ]]; then
     -DDG_IGR_EXPECT_CUDA_ARCH="${SPACK_CUDA_ARCH}"
     -DDG_IGR_ACCELERATOR_KERNEL_SOURCES="${DG_IGR_ACCELERATOR_KERNEL_SOURCES:-}"
     -DCMAKE_CUDA_COMPILER="${CUDA_PREFIX}/bin/nvcc"
-    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}"
+    -DCMAKE_CUDA_ARCHITECTURES="${APP_CUDA_ARCHS}"
     -DCUDAToolkit_ROOT="${CUDA_PREFIX}"
     -Dumpire_DIR="${UMPIRE_PREFIX}/lib/cmake/umpire"
   )
@@ -193,6 +253,21 @@ if ((CLEAN)); then
 fi
 "${CMAKE_BIN}" "${configure_args[@]}" -S "${SCRIPT_DIR}" -B "${APP_BUILD}" \
   "${app_cmake_args[@]}"
+if [[ "${MODE}" == "gpu" ]]; then
+  app_cache="${APP_BUILD}/CMakeCache.txt"
+  [[ -f "${app_cache}" ]] || {
+    echo "ERROR: application CMake cache was not created at ${app_cache}" >&2
+    exit 3
+  }
+  configured_app_cuda_archs="$(
+    sed -n 's/^CMAKE_CUDA_ARCHITECTURES:[^=]*=//p' "${app_cache}" | tail -n 1
+  )"
+  if [[ "${configured_app_cuda_archs}" != "${APP_CUDA_ARCHS}" ]]; then
+    echo "ERROR: application CUDA architecture cache mismatch." >&2
+    echo "       requested=${APP_CUDA_ARCHS} configured=${configured_app_cuda_archs:-<missing>}" >&2
+    exit 3
+  fi
+fi
 "${CMAKE_BIN}" --build "${APP_BUILD}" -j"${JOBS}"
 "${CMAKE_BIN}" --install "${APP_BUILD}"
 
@@ -217,4 +292,4 @@ if ((RUN_SMOKE)); then
     "${smoke_exe}" "${smoke_args[@]}"
 fi
 
-echo "[build] complete: profile=${PROFILE} build=${APP_BUILD} install=${APP_INSTALL}"
+echo "[build] complete: profile=${PROFILE} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} build=${APP_BUILD} install=${APP_INSTALL}"
