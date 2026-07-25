@@ -1,8 +1,13 @@
 # Collect all source files (including module subdirectories)
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "*.cpp")
-if(NOT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT)
+if(NOT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT AND
+   NOT DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
     list(REMOVE_ITEM SOURCES
          "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler.cpp")
+endif()
+if(NOT DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
+    list(REMOVE_ITEM SOURCES
+         "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler_device.cpp")
 endif()
 
 # Create library
@@ -20,6 +25,10 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
          "src/numerics/hdg/device/device_core.cpp"
          "src/numerics/limiters/zhang_shu.cpp"
          "src/physics/igr/IGR_device_coefficients.cpp")
+    if(DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
+        list(APPEND _dg_igr_default_accel_sources
+             "src/numerics/hdg/euler/smooth_euler_device.cpp")
+    endif()
 endif()
 
 set(DG_IGR_AUTO_DG_ACCELERATOR_SOURCE

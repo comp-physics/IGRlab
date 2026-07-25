@@ -10,6 +10,9 @@ option(DG_IGR_BUILD_TESTS "Build dg_igr unit tests" ON)
 option(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT
        "Build the serial smooth-Euler HDG experiment."
        OFF)
+option(DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT
+       "Build the default-off smooth-Euler HDG CPU-fallback/device experiment."
+       OFF)
 option(DG_IGR_ENABLE_OBSERVABILITY
        "Compile the core observability contract (runtime remains default-off)."
        OFF)
