@@ -8,6 +8,9 @@ CLEAN=0
 CALIPER=0
 SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
 CUDA_ARCH_WAS_SET=0
+CUDA_CODEGEN=""
+CUDA_CODEGEN_WAS_SET=0
+PRINT_PLAN=0
 
 usage() {
   cat <<'EOF'
@@ -19,13 +22,18 @@ Options:
   --caliper         Build CPU-only MFEM with Caliper support.
   -j, --jobs N      Parallel build jobs (default: NPROC or 4).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
+  --cuda-codegen A  MFEM CUDA code-generation architecture.
+  --print-plan      Validate and print the resolved MFEM policy, then exit.
   --clean           Remove the selected MFEM build and install directories.
   --no-clean        Reconfigure and continue the existing build.
   -h, --help        Show this help.
 
 Environment overrides:
   DG_IGR_SPACK_ENV, MFEM_SRC, MFEM_BUILD, MFEM_INSTALL, CMAKE_BUILD_TYPE,
-  CUDA_ARCHS, SPACK_CUDA_ARCH
+  SPACK_CUDA_ARCH
+
+CUDA_ARCHS is intentionally rejected in GPU mode. The canonical build driver
+passes MFEM's code-generation architecture explicitly with --cuda-codegen.
 EOF
 }
 
@@ -40,11 +48,18 @@ while (($#)); do
       CUDA_ARCH_WAS_SET=1
       shift
       ;;
+    --cuda-codegen)
+      [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+      CUDA_CODEGEN="$2"
+      CUDA_CODEGEN_WAS_SET=1
+      shift
+      ;;
     -j|--jobs)
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
       JOBS="$2"
       shift
       ;;
+    --print-plan) PRINT_PLAN=1 ;;
     --clean) CLEAN=1 ;;
     --no-clean) CLEAN=0 ;;
     -h|--help) usage; exit 0 ;;
@@ -65,39 +80,75 @@ if [[ "${MODE}" == "cpu" && "${CUDA_ARCH_WAS_SET}" == "1" ]]; then
   echo "ERROR: --cuda-arch is only valid with --gpu." >&2
   exit 2
 fi
+if [[ "${MODE}" == "cpu" && "${CUDA_CODEGEN_WAS_SET}" == "1" ]]; then
+  echo "ERROR: --cuda-codegen is only valid with --gpu." >&2
+  exit 2
+fi
 if [[ "${MODE}" == "gpu" && "${CALIPER}" == "1" ]]; then
   echo "ERROR: --caliper is only valid with --cpu-only." >&2
   exit 2
 fi
-command -v spack >/dev/null 2>&1 || {
-  echo "ERROR: spack is not available; source Spack's setup-env.sh first." >&2
+if [[ "${MODE}" == "gpu" && -n "${CUDA_ARCHS+x}" ]]; then
+  echo "ERROR: CUDA_ARCHS is ambiguous and is rejected in GPU mode." >&2
+  echo "       Pass MFEM code generation explicitly with --cuda-codegen." >&2
   exit 2
-}
+fi
 
 REPO_DIR="${REPO_DIR:-${SCRIPT_DIR}}"
 MFEM_SRC="${MFEM_SRC:-${REPO_DIR}/tpl/mfem}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 
 if [[ "${MODE}" == "gpu" ]]; then
+  PROFILE="cuda-sm${SPACK_CUDA_ARCH}"
+  DEPENDENCY_CUDA_ARCH="${SPACK_CUDA_ARCH}"
   SPACK_ENV="${DG_IGR_SPACK_ENV:-${REPO_DIR}/spack-envs/cuda-sm${SPACK_CUDA_ARCH}}"
   MFEM_BUILD="${MFEM_BUILD:-${MFEM_SRC}/build-gpu-sm${SPACK_CUDA_ARCH}}"
   MFEM_INSTALL="${MFEM_INSTALL:-${MFEM_SRC}/install-gpu-sm${SPACK_CUDA_ARCH}}"
-  CUDA_ARCHS="${CUDA_ARCHS:-80-virtual}"
+  EXPECTED_CUDA_CODEGEN="${SPACK_CUDA_ARCH}"
+  if [[ "${SPACK_CUDA_ARCH}" == "120" ]]; then
+    EXPECTED_CUDA_CODEGEN="80-virtual"
+  fi
+  if [[ -z "${CUDA_CODEGEN}" ]]; then
+    CUDA_CODEGEN="${EXPECTED_CUDA_CODEGEN}"
+  fi
+  if [[ "${CUDA_CODEGEN}" != "${EXPECTED_CUDA_CODEGEN}" ]]; then
+    echo "ERROR: CUDA profile ${SPACK_CUDA_ARCH} requires --cuda-codegen ${EXPECTED_CUDA_CODEGEN} for MFEM." >&2
+    if [[ "${SPACK_CUDA_ARCH}" == "120" ]]; then
+      echo "       Native MFEM sm_120 code generation is blocked because it can exhaust memory." >&2
+    fi
+    exit 2
+  fi
   HYPRE_SPEC="hypre@develop+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
   MPI_SPEC="openmpi+cuda"
 else
   if ((CALIPER)); then
+    PROFILE="cpu-caliper"
     SPACK_ENV="${DG_IGR_SPACK_ENV:-${REPO_DIR}/spack-envs/cpu-caliper}"
     MFEM_BUILD="${MFEM_BUILD:-${MFEM_SRC}/build-cpu-caliper}"
     MFEM_INSTALL="${MFEM_INSTALL:-${MFEM_SRC}/install-cpu-caliper}"
   else
+    PROFILE="cpu"
     SPACK_ENV="${DG_IGR_SPACK_ENV:-${REPO_DIR}/spack-envs/cpu}"
     MFEM_BUILD="${MFEM_BUILD:-${MFEM_SRC}/build-cpu}"
     MFEM_INSTALL="${MFEM_INSTALL:-${MFEM_SRC}/install-cpu}"
   fi
   HYPRE_SPEC="hypre+mpi~cuda"
   MPI_SPEC="openmpi~cuda"
+  DEPENDENCY_CUDA_ARCH="none"
+  CUDA_CODEGEN="none"
 fi
+
+echo "[mfem-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH} cuda_codegen_archs=${CUDA_CODEGEN} jobs=${JOBS}"
+echo "[mfem-plan] env=${SPACK_ENV} source=${MFEM_SRC} build=${MFEM_BUILD} install=${MFEM_INSTALL}"
+
+if ((PRINT_PLAN)); then
+  exit 0
+fi
+
+command -v spack >/dev/null 2>&1 || {
+  echo "ERROR: spack is not available; source Spack's setup-env.sh first." >&2
+  exit 2
+}
 
 [[ -f "${SPACK_ENV}/spack.yaml" ]] || {
   echo "ERROR: Spack environment not found at ${SPACK_ENV}" >&2
@@ -150,7 +201,7 @@ if [[ "${MODE}" == "gpu" ]]; then
   cmake_args+=(
     -DMFEM_USE_CUDA=ON
     -DMFEM_USE_UMPIRE=ON
-    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}"
+    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_CODEGEN}"
     -DCMAKE_CUDA_COMPILER="${CUDA_PREFIX}/bin/nvcc"
     -DCUDAToolkit_ROOT="${CUDA_PREFIX}"
     -DUMPIRE_DIR="${UMPIRE_PREFIX}"
@@ -175,6 +226,21 @@ if ((CLEAN)); then
 fi
 "${CMAKE_BIN}" "${configure_args[@]}" \
   -S "${MFEM_SRC}" -B "${MFEM_BUILD}" "${cmake_args[@]}"
+if [[ "${MODE}" == "gpu" ]]; then
+  mfem_cache="${MFEM_BUILD}/CMakeCache.txt"
+  [[ -f "${mfem_cache}" ]] || {
+    echo "ERROR: MFEM CMake cache was not created at ${mfem_cache}" >&2
+    exit 3
+  }
+  configured_mfem_cuda_archs="$(
+    sed -n 's/^CMAKE_CUDA_ARCHITECTURES:[^=]*=//p' "${mfem_cache}" | tail -n 1
+  )"
+  if [[ "${configured_mfem_cuda_archs}" != "${CUDA_CODEGEN}" ]]; then
+    echo "ERROR: MFEM CUDA architecture cache mismatch." >&2
+    echo "       requested=${CUDA_CODEGEN} configured=${configured_mfem_cuda_archs:-<missing>}" >&2
+    exit 3
+  fi
+fi
 "${CMAKE_BIN}" --build "${MFEM_BUILD}" -j"${JOBS}"
 "${CMAKE_BIN}" --install "${MFEM_BUILD}"
 
