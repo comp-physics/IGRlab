@@ -11,6 +11,7 @@ RUN_TESTS=1
 RUN_SMOKE=0
 CALIPER=0
 HDG_EULER_EXPERIMENT="OFF"
+HDG_EULER_DEVICE_EXPERIMENT="OFF"
 SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
 CUDA_ARCH_WAS_SET=0
 PRINT_PLAN=0
@@ -27,6 +28,8 @@ Options:
   --caliper         Build the CPU-only Caliper observability profile.
   --hdg-euler-experiment
                     Enable the CPU-only experimental HDG Euler path.
+  --hdg-euler-device-experiment
+                    Enable the experimental HDG Euler CPU-fallback/device path.
   -j, --jobs N      Parallel build jobs (default: NPROC or 4).
   --mfem-jobs N     Parallel MFEM build jobs (default: --jobs value).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
@@ -54,6 +57,7 @@ while (($#)); do
     --gpu) MODE="gpu" ;;
     --caliper) CALIPER=1 ;;
     --hdg-euler-experiment) HDG_EULER_EXPERIMENT="ON" ;;
+    --hdg-euler-device-experiment) HDG_EULER_DEVICE_EXPERIMENT="ON" ;;
     --cuda-arch)
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
       SPACK_CUDA_ARCH="$2"
@@ -217,7 +221,7 @@ if ((CLEAN)); then
   rm -rf "${APP_BUILD}" "${APP_INSTALL}"
 fi
 
-echo "[build] configuring app (${MODE}, hdg_euler_experiment=${HDG_EULER_EXPERIMENT})"
+echo "[build] configuring app (${MODE}, hdg_euler_experiment=${HDG_EULER_EXPERIMENT}, hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT})"
 app_cmake_args=(
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   -DCMAKE_CXX_COMPILER="${MPI_PREFIX}/bin/mpicxx"
@@ -225,6 +229,7 @@ app_cmake_args=(
   -DMFEM_DIR="${MFEM_INSTALL}/lib/cmake/mfem"
   -DZLIB_ROOT="${SPACK_VIEW}"
   -DDG_IGR_ENABLE_HDG_EULER_EXPERIMENT="${HDG_EULER_EXPERIMENT}"
+  -DDG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT="${HDG_EULER_DEVICE_EXPERIMENT}"
 )
 if ((CALIPER)); then
   app_cmake_args+=(
@@ -292,4 +297,4 @@ if ((RUN_SMOKE)); then
     "${smoke_exe}" "${smoke_args[@]}"
 fi
 
-echo "[build] complete: profile=${PROFILE} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} build=${APP_BUILD} install=${APP_INSTALL}"
+echo "[build] complete: profile=${PROFILE} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} build=${APP_BUILD} install=${APP_INSTALL}"
