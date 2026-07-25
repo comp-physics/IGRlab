@@ -1,5 +1,15 @@
 # Unit tests for dg_igr miniapp
 
+add_test(NAME dg_igr_cuda_build_policy
+  COMMAND /usr/bin/env bash
+          ${CMAKE_SOURCE_DIR}/tests/scripts/check_cuda_build_policy.sh
+          ${CMAKE_SOURCE_DIR}
+)
+set_tests_properties(dg_igr_cuda_build_policy PROPERTIES
+  LABELS "build;cuda;contract"
+  TIMEOUT 30
+)
+
 function(dg_igr_add_observability_test target_name compile_enabled caliper_enabled)
   add_executable(${target_name} test_observability.cpp)
   set_target_properties(${target_name} PROPERTIES

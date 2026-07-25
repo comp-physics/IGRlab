@@ -1,5 +1,9 @@
 # Collect all source files (including module subdirectories)
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "*.cpp")
+if(NOT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT)
+    list(REMOVE_ITEM SOURCES
+         "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler.cpp")
+endif()
 
 # Create library
 add_library(igr_mfem STATIC ${SOURCES})
@@ -13,6 +17,7 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
          "src/numerics/dg/DGHyperbolicConservationLaws_weakdiv.cpp"
          "src/numerics/dg/DGFaceQuadratureKernels.cpp"
          "src/numerics/dgsem/dgsem_device.cpp"
+         "src/numerics/hdg/device/device_core.cpp"
          "src/numerics/limiters/zhang_shu.cpp"
          "src/physics/igr/IGR_device_coefficients.cpp")
 endif()

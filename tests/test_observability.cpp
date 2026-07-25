@@ -7,8 +7,11 @@ namespace obs = dg_igr::observability;
 
 static_assert(static_cast<std::uint16_t>(obs::RegionId::dg_mult) == 100);
 static_assert(static_cast<std::uint16_t>(obs::RegionId::igr_krylov_solve) == 246);
+static_assert(static_cast<std::uint16_t>(obs::RegionId::hdg_local_assembly) == 300);
+static_assert(static_cast<std::uint16_t>(obs::RegionId::hdg_device_transfer) == 307);
 static_assert(static_cast<std::uint16_t>(obs::CounterId::iterations) == 100);
 static_assert(obs::region_name(obs::RegionId::dg_mult)[0] == 'D');
+static_assert(obs::region_name(obs::RegionId::hdg_condensation)[0] == 'H');
 static_assert(obs::counter_name(obs::CounterId::iterations)[0] == 'c');
 static_assert(!std::is_polymorphic<obs::NoopBackend>::value);
 
