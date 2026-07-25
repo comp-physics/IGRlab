@@ -1,5 +1,7 @@
 #include "numerics/hdg/device/device_core.hpp"
 
+#include "../../../src/numerics/hdg/device/pivoted_solve.hpp"
+
 #include <array>
 #include <cmath>
 #include <limits>
@@ -326,6 +328,115 @@ int TestPaddedTwoBatchPivotAndFailures()
   }
   return 0;
 }
+
+int TestDelayedPivotSharedSolveAndProductionPath()
+{
+  constexpr LocalIndex batches = 1;
+  constexpr LocalIndex ni = 3;
+  constexpr LocalIndex nt = 2;
+
+  // Exact retained factorization of A.  Column zero is not swapped; column
+  // one swaps rows with distinct retained column-zero multipliers.
+  std::array<double, 9> a{{4., 2., 0., 1., 1., 5., 2., 3., 1.}};
+  const std::array<double, 9> lu{{4., 2., 0., .5, 2., 1., .25, .25, 19. / 4.}};
+  const std::array<double, 3> pivots{{0., 2., 2.}};
+  std::array<double, 6> b{{1., -2., 3., .5, -1., 4.}};
+  std::array<double, 3> f{{7., -2., 5.}};
+  std::array<double, 6> inverse_b = b;
+  std::array<double, 3> inverse_f = f;
+  const std::array<double, 6> expected_inverse_b{{
+      15. / 19., -67. / 38., -41. / 38., 48. / 19., 25. / 38., -1. / 19.}};
+  const std::array<double, 3> expected_inverse_f{{
+      22. / 19., 45. / 38., -33. / 38.}};
+  dg::hdg::device::detail::SolvePivoted(lu.data(), pivots.data(), ni,
+                                        inverse_b.data(), nt);
+  dg::hdg::device::detail::SolvePivoted(lu.data(), pivots.data(), ni,
+                                        inverse_f.data(), 1);
+  if (!Matches(inverse_b, expected_inverse_b) ||
+      !Matches(inverse_f, expected_inverse_f))
+  {
+    return 50;
+  }
+
+  std::array<double, 6> c{{2., -1., .5, -3., 2., 1.}};
+  std::array<double, 4> d{{6., .25, -.75, 5.}};
+  std::array<double, 2> g{{1.5, -4.}};
+  std::array<double, 4> schur{};
+  std::array<double, 2> condensed_rhs{};
+  const LocalSystemBatchView input{
+      {ni, nt, 1, 1}, ConstView(a.data(), batches, ni, ni),
+      ConstView(b.data(), batches, ni, nt), ConstView(c.data(), batches, nt, ni),
+      ConstView(d.data(), batches, nt, nt), ConstView(f.data(), batches, ni, 1),
+      ConstView(g.data(), batches, nt, 1)};
+  DeviceCoreEngine engine;
+  if (engine.Condense(input, {View(schur.data(), batches, nt, nt),
+                              View(condensed_rhs.data(), batches, nt, 1)}) !=
+      Status::success)
+  {
+    return 51;
+  }
+  const std::array<double, 4> expected_schur{{
+      229. / 76., 481. / 76., 237. / 76., -201. / 38.}};
+  const std::array<double, 2> expected_condensed_rhs{{61. / 76., -77. / 38.}};
+  if (!Matches(schur, expected_schur) ||
+      !Matches(condensed_rhs, expected_condensed_rhs))
+  {
+    return 52;
+  }
+
+  const std::size_t allocations = engine.accounting().allocation_events;
+  if (!ExpectedExecution(engine, allocations)) { return 53; }
+  if constexpr (expect_actual_device)
+  {
+    if (allocations == 0 || engine.accounting().host_reference_fallbacks != 0)
+    {
+      return 54;
+    }
+  }
+
+  std::array<double, 2> trace{{.75, -.5}};
+  std::array<double, 2> action{};
+  std::array<double, 3> recovered{};
+  if (engine.ApplySchur(ConstView(trace.data(), batches, nt, 1),
+                        View(action.data(), batches, nt, 1)) != Status::success ||
+      engine.Recover(ConstView(trace.data(), batches, nt, 1),
+                     View(recovered.data(), batches, ni, 1)) != Status::success)
+  {
+    return 55;
+  }
+  const std::array<double, 2> expected_action{{-275. / 304., 1515. / 304.}};
+  const std::array<double, 3> expected_recovered{{
+      -6. / 19., 495. / 152., -211. / 152.}};
+  const std::array<double, 3> expected_recovery_rhs{{21. / 4., -4., 31. / 4.}};
+  if (!Matches(action, expected_action) ||
+      !Matches(recovered, expected_recovered) ||
+      !ExpectedExecution(engine, allocations) ||
+      engine.accounting().steady_state_allocation_events != 0)
+  {
+    return 56;
+  }
+  if constexpr (expect_actual_device)
+  {
+    if (engine.accounting().host_reference_fallbacks != 0) { return 57; }
+  }
+
+  for (LocalIndex row = 0; row < ni; ++row)
+  {
+    double recovery_rhs = f[row];
+    for (LocalIndex column = 0; column < nt; ++column)
+    {
+      recovery_rhs -= b[row * nt + column] * trace[column];
+    }
+    if (!Near(recovery_rhs, expected_recovery_rhs[row])) { return 58; }
+    double product = 0.0;
+    for (LocalIndex column = 0; column < ni; ++column)
+    {
+      product += a[row * ni + column] * recovered[column];
+    }
+    if (!Near(product, expected_recovery_rhs[row])) { return 59; }
+  }
+  return 0;
+}
 }  // namespace
 
 int main()
@@ -343,5 +454,7 @@ int main()
   if (policy != 0) { return policy; }
   const int parity = TestCondenseActionRecoverParityAndContracts();
   if (parity != 0) { return parity; }
-  return TestPaddedTwoBatchPivotAndFailures();
+  const int padded = TestPaddedTwoBatchPivotAndFailures();
+  if (padded != 0) { return padded; }
+  return TestDelayedPivotSharedSolveAndProductionPath();
 }
