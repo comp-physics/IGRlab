@@ -64,3 +64,81 @@ elseif(NOT MFEM_USE_HIP)
     LABELS "hdg;euler;cpu;device;fallback;experimental"
     TIMEOUT 600)
 endif()
+
+get_target_property(_dg_igr_mfem_link_dependencies mfem
+  INTERFACE_LINK_LIBRARIES)
+set(_dg_igr_hdg_full_device_dependencies_available OFF)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND
+   MFEM_USE_CUDA AND MFEM_USE_MPI AND MFEM_USE_UMPIRE AND TARGET umpire AND
+   _dg_igr_mfem_link_dependencies MATCHES "HYPRE")
+  set(_dg_igr_hdg_full_device_dependencies_available ON)
+endif()
+if(_dg_igr_hdg_full_device_dependencies_available)
+  add_executable(dg_igr_hdg_smooth_euler_device_full_test
+    test_smooth_euler_device_full.cpp)
+  target_include_directories(dg_igr_hdg_smooth_euler_device_full_test PRIVATE
+    ${DG_IGR_HDG_REPOSITORY_ROOT}/include)
+  target_link_libraries(dg_igr_hdg_smooth_euler_device_full_test PRIVATE
+    igr_mfem mfem umpire)
+  target_compile_options(dg_igr_hdg_smooth_euler_device_full_test PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+  set_target_properties(dg_igr_hdg_smooth_euler_device_full_test PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  add_test(NAME dg_igr_hdg_smooth_euler_device_full_cuda
+    COMMAND dg_igr_hdg_smooth_euler_device_full_test)
+  set_tests_properties(dg_igr_hdg_smooth_euler_device_full_cuda PROPERTIES
+    LABELS "hdg;euler;gpu;cuda;device;hypre;full;experimental"
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 3600)
+  add_test(NAME dg_igr_hdg_smooth_euler_device_full_umpire_events
+    COMMAND dg_igr_hdg_smooth_euler_device_full_test
+      --umpire-event-audit-driver)
+  set_tests_properties(
+    dg_igr_hdg_smooth_euler_device_full_umpire_events PROPERTIES
+    LABELS "hdg;euler;gpu;cuda;device;hypre;full;experimental;umpire"
+    DEPENDS dg_igr_hdg_smooth_euler_device_full_cuda
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 3600)
+  add_test(NAME dg_igr_hdg_smooth_euler_mpi_device_2_cuda
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+            ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_hdg_smooth_euler_device_full_test>
+            --mpi-device-rank2
+            ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(dg_igr_hdg_smooth_euler_mpi_device_2_cuda PROPERTIES
+    LABELS "hdg;euler;gpu;cuda;device;hypre;full;experimental;mpi;rank2;one-gpu;host-staged"
+    PROCESSORS 2
+    RESOURCE_LOCK dg_igr_sm120
+    SKIP_RETURN_CODE 75
+    TIMEOUT 3600)
+  foreach(_dg_igr_hdg_mpi_device_p RANGE 1 4)
+    add_test(
+      NAME dg_igr_hdg_smooth_euler_mpi_device_p${_dg_igr_hdg_mpi_device_p}_2_cuda
+      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+              ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:dg_igr_hdg_smooth_euler_device_full_test>
+              --mpi-device-rank2-production-p${_dg_igr_hdg_mpi_device_p}
+              ${MPIEXEC_POSTFLAGS})
+    set_tests_properties(
+      dg_igr_hdg_smooth_euler_mpi_device_p${_dg_igr_hdg_mpi_device_p}_2_cuda
+      PROPERTIES
+      LABELS "hdg;euler;gpu;cuda;device;hypre;full;experimental;mpi;rank2;one-gpu;host-staged;production;p${_dg_igr_hdg_mpi_device_p}"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      SKIP_RETURN_CODE 75
+      TIMEOUT 1800)
+  endforeach()
+  add_test(NAME dg_igr_hdg_smooth_euler_mpi_device_rollbacks_2_cuda
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+            ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_hdg_smooth_euler_device_full_test>
+            --mpi-device-rank2-rollbacks
+            ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(
+    dg_igr_hdg_smooth_euler_mpi_device_rollbacks_2_cuda PROPERTIES
+    LABELS "hdg;euler;gpu;cuda;device;hypre;full;experimental;mpi;rank2;one-gpu;host-staged;rollback"
+    PROCESSORS 2
+    RESOURCE_LOCK dg_igr_sm120
+    SKIP_RETURN_CODE 75
+    TIMEOUT 3600)
+endif()
