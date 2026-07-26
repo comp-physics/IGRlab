@@ -68,30 +68,22 @@ endif()
 get_target_property(_dg_igr_mfem_link_dependencies mfem
   INTERFACE_LINK_LIBRARIES)
 set(_dg_igr_hdg_full_device_dependencies_available OFF)
-if(MFEM_USE_CUDA AND MFEM_USE_MPI AND MFEM_USE_UMPIRE AND TARGET umpire AND
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND
+   MFEM_USE_CUDA AND MFEM_USE_MPI AND MFEM_USE_UMPIRE AND TARGET umpire AND
    _dg_igr_mfem_link_dependencies MATCHES "HYPRE")
   set(_dg_igr_hdg_full_device_dependencies_available ON)
 endif()
 if(_dg_igr_hdg_full_device_dependencies_available)
-  set(_dg_igr_hdg_euler_device_full_source
-    ${DG_IGR_HDG_REPOSITORY_ROOT}/src/numerics/hdg/euler/smooth_euler_device_full.cu)
-  set_source_files_properties(${_dg_igr_hdg_euler_device_full_source}
-    PROPERTIES LANGUAGE CUDA)
   add_executable(dg_igr_hdg_smooth_euler_device_full_test
-    test_smooth_euler_device_full.cpp
-    ${_dg_igr_hdg_euler_device_full_source})
+    test_smooth_euler_device_full.cpp)
   target_include_directories(dg_igr_hdg_smooth_euler_device_full_test PRIVATE
     ${DG_IGR_HDG_REPOSITORY_ROOT}/include)
   target_link_libraries(dg_igr_hdg_smooth_euler_device_full_test PRIVATE
     igr_mfem mfem umpire)
   target_compile_options(dg_igr_hdg_smooth_euler_device_full_test PRIVATE
-    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
   set_target_properties(dg_igr_hdg_smooth_euler_device_full_test PROPERTIES
-    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF
-    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF
-    CUDA_SEPARABLE_COMPILATION ON)
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
   add_test(NAME dg_igr_hdg_smooth_euler_device_full_cuda
     COMMAND dg_igr_hdg_smooth_euler_device_full_test)
   set_tests_properties(dg_igr_hdg_smooth_euler_device_full_cuda PROPERTIES

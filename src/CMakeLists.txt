@@ -1,5 +1,9 @@
 # Collect all source files (including module subdirectories)
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "*.cpp")
+if(NOT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT)
+    list(REMOVE_ITEM SOURCES
+         "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler_mpi.cpp")
+endif()
 if(NOT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT AND
    NOT DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
     list(REMOVE_ITEM SOURCES
@@ -8,6 +12,19 @@ endif()
 if(NOT DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
     list(REMOVE_ITEM SOURCES
          "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler_device.cpp")
+endif()
+
+set(_dg_igr_hdg_euler_full_device_enabled OFF)
+if(DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT AND
+   DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND
+   MFEM_USE_CUDA AND MFEM_USE_MPI AND MFEM_USE_UMPIRE AND TARGET umpire)
+    get_target_property(_dg_igr_mfem_link_dependencies mfem
+                        INTERFACE_LINK_LIBRARIES)
+    if(_dg_igr_mfem_link_dependencies MATCHES "HYPRE")
+        set(_dg_igr_hdg_euler_full_device_enabled ON)
+        list(APPEND SOURCES
+             "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler_device_full.cu")
+    endif()
 endif()
 
 # Create library
@@ -28,6 +45,10 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
     if(DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
         list(APPEND _dg_igr_default_accel_sources
              "src/numerics/hdg/euler/smooth_euler_device.cpp")
+    endif()
+    if(_dg_igr_hdg_euler_full_device_enabled)
+        list(APPEND _dg_igr_default_accel_sources
+             "src/numerics/hdg/euler/smooth_euler_device_full.cu")
     endif()
 endif()
 
@@ -95,6 +116,9 @@ if(MFEM_USE_MPI)
         target_include_directories(igr_mfem PUBLIC ${DG_IGR_MPI_INCLUDE_DIRS})
     endif()
 endif()
+if(_dg_igr_hdg_euler_full_device_enabled)
+    target_link_libraries(igr_mfem PRIVATE umpire)
+endif()
 
 if(MFEM_USE_CUDA)
     # Keep CUDA TPL linkage explicit to avoid transitive-link drops when MFEM/HYPRE
@@ -130,6 +154,9 @@ if(DG_IGR_ACCELERATOR_KERNEL_SOURCES)
     if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA")
         set_target_properties(igr_mfem
                               PROPERTIES
+                              CUDA_STANDARD 17
+                              CUDA_STANDARD_REQUIRED ON
+                              CUDA_EXTENSIONS OFF
                               CUDA_SEPARABLE_COMPILATION ON)
         target_compile_options(igr_mfem PRIVATE
                                $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
