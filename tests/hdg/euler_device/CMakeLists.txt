@@ -99,4 +99,46 @@ if(_dg_igr_hdg_full_device_dependencies_available)
     DEPENDS dg_igr_hdg_smooth_euler_device_full_cuda
     RESOURCE_LOCK dg_igr_sm120
     TIMEOUT 3600)
+  add_test(NAME dg_igr_hdg_smooth_euler_mpi_device_2_cuda
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+            ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_hdg_smooth_euler_device_full_test>
+            --mpi-device-rank2
+            ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(dg_igr_hdg_smooth_euler_mpi_device_2_cuda PROPERTIES
+    LABELS "hdg;euler;gpu;cuda;device;hypre;full;experimental;mpi;rank2;one-gpu;host-staged"
+    PROCESSORS 2
+    RESOURCE_LOCK dg_igr_sm120
+    SKIP_RETURN_CODE 75
+    TIMEOUT 3600)
+  foreach(_dg_igr_hdg_mpi_device_p RANGE 1 4)
+    add_test(
+      NAME dg_igr_hdg_smooth_euler_mpi_device_p${_dg_igr_hdg_mpi_device_p}_2_cuda
+      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+              ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:dg_igr_hdg_smooth_euler_device_full_test>
+              --mpi-device-rank2-production-p${_dg_igr_hdg_mpi_device_p}
+              ${MPIEXEC_POSTFLAGS})
+    set_tests_properties(
+      dg_igr_hdg_smooth_euler_mpi_device_p${_dg_igr_hdg_mpi_device_p}_2_cuda
+      PROPERTIES
+      LABELS "hdg;euler;gpu;cuda;device;hypre;full;experimental;mpi;rank2;one-gpu;host-staged;production;p${_dg_igr_hdg_mpi_device_p}"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      SKIP_RETURN_CODE 75
+      TIMEOUT 1800)
+  endforeach()
+  add_test(NAME dg_igr_hdg_smooth_euler_mpi_device_rollbacks_2_cuda
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+            ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_hdg_smooth_euler_device_full_test>
+            --mpi-device-rank2-rollbacks
+            ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(
+    dg_igr_hdg_smooth_euler_mpi_device_rollbacks_2_cuda PROPERTIES
+    LABELS "hdg;euler;gpu;cuda;device;hypre;full;experimental;mpi;rank2;one-gpu;host-staged;rollback"
+    PROCESSORS 2
+    RESOURCE_LOCK dg_igr_sm120
+    SKIP_RETURN_CODE 75
+    TIMEOUT 3600)
 endif()

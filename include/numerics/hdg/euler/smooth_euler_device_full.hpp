@@ -2,12 +2,13 @@
 
 /**
  * @file numerics/hdg/euler/smooth_euler_device_full.hpp
- * @brief Default-off conventional single-rank CUDA HDG Euler transaction.
+ * @brief Default-off conventional bounded rank-1/rank-2 CUDA HDG Euler path.
  *
  * This verified-experimental interface owns a complete local-assembly,
  * condensation, MFEM/HYPRE trace-solve, recovery, admissibility, and state
- * update transaction.  It is not a supported/default solver, an MPI-device
- * path, or a performance claim.
+ * update transaction. Rank 2 deliberately shares one physical GPU and uses
+ * an accounted host-staged MFEM exchange. It makes no CUDA-aware MPI,
+ * multi-GPU, supported/default-solver, or performance claim.
  */
 
 #include "numerics/hdg/euler/smooth_euler.hpp"
@@ -56,6 +57,19 @@ enum class FullDevicePhase : unsigned char
   count
 };
 
+/** Test-only collective fault locations, injected after a phase mutation. */
+enum class FullDeviceFailurePoint : unsigned char
+{
+  none,
+  local_assembly,
+  condensation,
+  trace_assembly,
+  trace_solve,
+  distribution,
+  recovery,
+  state_update
+};
+
 struct FullDevicePhaseTelemetry
 {
   FullDevicePhase phase = FullDevicePhase::setup;
@@ -70,6 +84,11 @@ struct FullDevicePhaseTelemetry
   std::size_t host_to_device_bytes = 0;
   std::size_t device_to_host_bytes = 0;
   std::size_t synchronization_events = 0;
+  std::size_t mpi_collective_events = 0;
+  std::size_t host_staged_mpi_exchange_events = 0;
+  std::size_t host_staged_mpi_device_to_host_bytes = 0;
+  std::size_t host_staged_mpi_host_to_device_bytes = 0;
+  std::size_t host_staged_mpi_local_values = 0;
   std::size_t fallback_events = 0;
   std::size_t managed_device_objects_checked = 0;
   std::size_t managed_device_objects_valid = 0;
@@ -110,6 +129,11 @@ struct FullDeviceTransferTelemetry
   std::size_t device_to_host_bytes = 0;
   std::size_t test_only_device_to_host_bytes = 0;
   std::size_t synchronization_events = 0;
+  std::size_t mpi_collective_events = 0;
+  std::size_t host_staged_mpi_exchange_events = 0;
+  std::size_t host_staged_mpi_device_to_host_bytes = 0;
+  std::size_t host_staged_mpi_host_to_device_bytes = 0;
+  std::size_t host_staged_mpi_local_values = 0;
   std::size_t fallback_events = 0;
   std::size_t dense_host_trace_inverse_events = 0;
   std::size_t solver_substitution_events = 0;
@@ -133,6 +157,27 @@ struct FullDeviceTransferTelemetry
 /** Optional, explicitly requested final-boundary data for independent tests. */
 struct FullDeviceTestSnapshot
 {
+  struct RefinementRecord
+  {
+    std::uint64_t generation = 0;
+    int correction_index = 0;
+    int error = 0;
+    int convergence_query = 0;
+    int converged = -1;
+    int iterations = 0;
+    double reported_residual = std::numeric_limits<double>::infinity();
+    double previous_true_residual = std::numeric_limits<double>::infinity();
+    double correction_true_residual = std::numeric_limits<double>::infinity();
+    double derived_candidate_true_residual =
+        std::numeric_limits<double>::infinity();
+    double direct_candidate_true_residual =
+        std::numeric_limits<double>::infinity();
+    double reduction_factor = std::numeric_limits<double>::infinity();
+    double derived_direct_agreement =
+        std::numeric_limits<double>::infinity();
+    bool published = false;
+  };
+
   int polynomial_order = 0;
   int elements_per_direction = 0;
   int elements = 0;
@@ -141,6 +186,13 @@ struct FullDeviceTestSnapshot
   int global_trace_dofs = 0;
   int assembly_quadrature_order = 0;
   std::vector<int> signed_trace_dofs;
+  std::vector<int> signed_global_trace_dofs;
+  std::vector<std::int64_t> local_trace_global_true_dofs;
+  std::vector<std::int64_t> owned_true_global_dofs;
+  /** Interleaved quantized x/y element centers in rank-local MFEM order. */
+  std::vector<std::int64_t> element_coordinate_keys;
+  std::vector<double> ghost_probe_owned;
+  std::vector<double> ghost_probe_distributed;
   std::vector<double> old_interior;
   std::vector<double> initial_interior;
   std::vector<double> initial_trace;
@@ -173,12 +225,17 @@ struct FullDeviceTestSnapshot
   std::vector<int> actual_true_csr_columns;
   std::vector<double> actual_true_csr_values;
   std::vector<double> actual_true_rhs;
+  std::vector<double> actual_true_solution;
+  /** Column-major global basis actions, storing this rank's owned rows. */
+  std::vector<double> actual_true_basis_actions;
   std::vector<double> final_residual_r;
   std::vector<double> final_residual_g;
   std::vector<double> last_base_interior;
   std::vector<double> last_base_trace;
   std::vector<double> last_delta_interior;
   std::vector<double> last_delta_trace;
+  /** Raw bounded inner terminals and true-residual checks for the last solve. */
+  std::vector<RefinementRecord> refinement_corrections;
   std::vector<double> rollback_entry_interior;
   std::vector<double> rollback_changed_interior;
   std::vector<double> rollback_restored_interior;
@@ -193,19 +250,40 @@ struct FullDeviceMeshEvidence
 {
   int polynomial_order = 0;
   int elements_per_direction = 0;
+  int rank = -1;
+  int ranks = 0;
   int elements = 0;
+  int global_elements = 0;
   int interior_unknowns_per_element = 0;
   int trace_unknowns_per_element = 0;
   int local_trace_unknowns = 0;
   int true_trace_unknowns = 0;
+  std::int64_t global_true_trace_unknowns = 0;
+  std::size_t owned_trace_unknowns = 0;
+  std::size_t ghost_trace_unknowns = 0;
+  std::size_t global_ghost_trace_unknowns = 0;
+  int shared_faces = 0;
+  int global_shared_faces = 0;
+  int global_unique_trace_faces = 0;
   int nonlinear_iterations = 0;
   int linear_iterations = 0;
   int rejected_trials = 0;
   int effective_hypre_ilu_type = -1;
   int effective_hypre_ilu_level_of_fill = -1;
+  int effective_hypre_ilu_local_reordering = -1;
   int negative_trace_vdof_count = -1;
+  int global_negative_trace_vdof_count = -1;
   int discarded_nonlinear_iterations = 0;
   int discarded_linear_iterations = 0;
+  int trace_solve_failure_code = 0;
+  int last_hypre_error = 0;
+  int last_hypre_converged = -1;
+  int last_hypre_iterations = 0;
+  int last_hypre_krylov_dimension = 0;
+  int last_hypre_max_iterations = 0;
+  int last_hypre_global_rows = 0;
+  double last_hypre_reported_residual =
+      std::numeric_limits<double>::infinity();
   FullDeviceStatus status = FullDeviceStatus::setup_failure;
   FullDevicePhase failure_phase = FullDevicePhase::setup;
   FullDeviceStatus failure_phase_status = FullDeviceStatus::setup_failure;
@@ -241,6 +319,12 @@ struct FullDeviceMeshEvidence
   bool bynodes_vdim4 = false;
   bool reversed_trace_permutation_observed = false;
   bool shared_face_orientation_action_verified = false;
+  bool mfem_true_dof_ownership_verified = false;
+  bool real_partition_verified = false;
+  bool cross_rank_ghost_exchange_verified = false;
+  bool cross_rank_ghost_orientation_verified = false;
+  bool host_staged_mpi_exchange = false;
+  bool collective_failure_atomic = false;
   bool exact_ptslp_assembly = false;
   bool hypre_matrix_device = false;
   bool hypre_rhs_device = false;
@@ -290,6 +374,15 @@ struct FullDeviceRequest
   bool enable_test_oracle_staging = false;
   /** Stage the bounded p1--p4/N3 all-element first-Newton oracles only. */
   bool enable_global_linear_oracle_staging = false;
+  /** Run only the bounded p1--p4/N3 one-/two-rank MPI-device cases. */
+  bool run_mpi_device_rank_bounded = false;
+  /** Select the honest MFEM host-staged Distribute path in MPI mode. */
+  bool enable_host_staged_mpi_exchange = false;
+  /** Test-only single-p selector for bounded fault-injection transactions. */
+  int test_only_polynomial_order = 0;
+  FullDeviceFailurePoint injected_failure_point =
+      FullDeviceFailurePoint::none;
+  int injected_failure_rank = -1;
   bool inject_failure_after_first_update = false;
   int injected_failure_polynomial_order = 1;
   int injected_failure_elements_per_direction = 3;
@@ -304,6 +397,8 @@ struct FullDeviceEvidence
   std::array<FullDeviceConvergenceEvidence, 4> convergence{};
   bool real_mfem_cuda_path = false;
   bool real_hypre_device_path = false;
+  int ranks = 0;
+  bool one_physical_gpu_shared = false;
   bool default_off = true;
   bool verified_experimental = true;
   bool pass = false;

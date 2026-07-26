@@ -1,5 +1,6 @@
 #include "numerics/hdg/euler/smooth_euler_device_full.hpp"
 
+#include <HYPRE_utilities.h>
 #include <mfem.hpp>
 #include <umpire/Umpire.hpp>
 #include <umpire/json/json.hpp>
@@ -14,8 +15,10 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -27,6 +30,7 @@
 namespace
 {
 using dg::hdg::euler::FullDeviceEvidence;
+using dg::hdg::euler::FullDeviceFailurePoint;
 using dg::hdg::euler::FullDeviceMeshEvidence;
 using dg::hdg::euler::FullDevicePhase;
 using dg::hdg::euler::FullDeviceRequest;
@@ -362,6 +366,22 @@ bool BitwiseEqual(const std::vector<double>& first,
                       first.size() * sizeof(double)) == 0);
 }
 
+bool GlobalAll(const bool local)
+{
+  const int local_value = local ? 1 : 0;
+  int global_value = 0;
+  MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN,
+                MPI_COMM_WORLD);
+  return global_value == 1;
+}
+
+double GlobalMaximum(const double local)
+{
+  double global = 0.0;
+  MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+  return global;
+}
+
 bool DerivedSnapshotEmpty(const FullDeviceTestSnapshot& snapshot)
 {
   return snapshot.polynomial_order == 0 &&
@@ -369,7 +389,14 @@ bool DerivedSnapshotEmpty(const FullDeviceTestSnapshot& snapshot)
          snapshot.interior_dofs == 0 && snapshot.trace_dofs == 0 &&
          snapshot.global_trace_dofs == 0 &&
          snapshot.assembly_quadrature_order == 0 &&
-         snapshot.signed_trace_dofs.empty() && snapshot.old_interior.empty() &&
+         snapshot.signed_trace_dofs.empty() &&
+         snapshot.signed_global_trace_dofs.empty() &&
+         snapshot.local_trace_global_true_dofs.empty() &&
+         snapshot.owned_true_global_dofs.empty() &&
+         snapshot.element_coordinate_keys.empty() &&
+         snapshot.ghost_probe_owned.empty() &&
+         snapshot.ghost_probe_distributed.empty() &&
+         snapshot.old_interior.empty() &&
          snapshot.initial_interior.empty() && snapshot.initial_trace.empty() &&
          snapshot.final_interior.empty() && snapshot.final_trace.empty() &&
          snapshot.first_a.empty() && snapshot.first_b.empty() &&
@@ -393,12 +420,15 @@ bool DerivedSnapshotEmpty(const FullDeviceTestSnapshot& snapshot)
          snapshot.actual_true_csr_columns.empty() &&
          snapshot.actual_true_csr_values.empty() &&
          snapshot.actual_true_rhs.empty() &&
+         snapshot.actual_true_solution.empty() &&
+         snapshot.actual_true_basis_actions.empty() &&
          snapshot.final_residual_r.empty() &&
          snapshot.final_residual_g.empty() &&
          snapshot.last_base_interior.empty() &&
          snapshot.last_base_trace.empty() &&
          snapshot.last_delta_interior.empty() &&
          snapshot.last_delta_trace.empty() &&
+         snapshot.refinement_corrections.empty() &&
          snapshot.last_accepted_alpha == 0.0 &&
          !snapshot.global_linear_oracle_staged;
 }
@@ -533,6 +563,11 @@ struct OracleMesh
 
 bool BuildOracleMesh(const int p, const int N, OracleMesh& result)
 {
+  int rank = -1;
+  int ranks = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  int local_failure_stage = 0;
   try
   {
     mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
@@ -544,8 +579,12 @@ bool BuildOracleMesh(const int p, const int N, OracleMesh& result)
     translations[1][1] = 1.0;
     result.serial = std::make_unique<mfem::Mesh>(mfem::Mesh::MakePeriodic(
         original, original.CreatePeriodicVertexMapping(translations)));
-    result.mesh =
-        std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD, *result.serial);
+    std::vector<int> partition(result.serial->GetNE());
+    for (int element = 0; element < result.serial->GetNE(); ++element)
+      partition[static_cast<std::size_t>(element)] =
+          element * ranks / result.serial->GetNE();
+    result.mesh = std::make_unique<mfem::ParMesh>(
+        MPI_COMM_WORLD, *result.serial, partition.data());
     result.interior_collection = std::make_unique<mfem::L2_FECollection>(
         p, dimension, mfem::BasisType::GaussLegendre,
         mfem::FiniteElement::VALUE);
@@ -562,9 +601,44 @@ bool BuildOracleMesh(const int p, const int N, OracleMesh& result)
   }
   catch (const std::exception&)
   {
+    local_failure_stage = 1;
+  }
+  if (local_failure_stage == 0 &&
+      (!result.serial || !result.mesh || !result.interior_collection ||
+       !result.trace_collection || !result.interior_space ||
+       !result.trace_space))
+  {
+    local_failure_stage = 2;
+  }
+  std::vector<int> failure_stages(static_cast<std::size_t>(ranks), 0);
+  MPI_Allgather(&local_failure_stage, 1, MPI_INT, failure_stages.data(), 1,
+                MPI_INT, MPI_COMM_WORLD);
+  const int maximum_failure_stage = *std::max_element(
+      failure_stages.begin(), failure_stages.end());
+  if (maximum_failure_stage != 0)
+  {
+    int minimum_failure_stage = std::numeric_limits<int>::max();
+    for (const int stage : failure_stages)
+      if (stage != 0)
+        minimum_failure_stage = std::min(minimum_failure_stage, stage);
+    if (rank == 0)
+    {
+      std::cerr << "HDG_EULER_DEVICE_FULL_ORACLE_MESH_COLLECTIVE_FAILURE"
+                << " failure_stage_min=" << minimum_failure_stage
+                << " failure_stage_max=" << maximum_failure_stage
+                << " rank_stages=";
+      for (int peer = 0; peer < ranks; ++peer)
+        std::cerr << (peer == 0 ? "" : ",")
+                  << failure_stages[static_cast<std::size_t>(peer)];
+      std::cerr << '\n';
+    }
     return false;
   }
-  return result.mesh->GetNE() == N * N &&
+  const int local_elements = result.mesh->GetNE();
+  int global_elements = 0;
+  MPI_Allreduce(&local_elements, &global_elements, 1, MPI_INT, MPI_SUM,
+                MPI_COMM_WORLD);
+  return local_elements > 0 && global_elements == N * N &&
          result.interior_space->GetOrdering() == mfem::Ordering::byNODES &&
          result.trace_space->GetOrdering() == mfem::Ordering::byNODES;
 }
@@ -999,8 +1073,10 @@ bool IndependentFinalPdeResidual(const FullDeviceMeshEvidence& evidence,
 }
 
 bool FactorAndSolve(std::vector<double> matrix, const int rows,
-                    std::vector<double>& right_hand_sides, const int columns)
+                    std::vector<double>& right_hand_sides, const int columns,
+                    int* const failed_pivot = nullptr)
 {
+  if (failed_pivot != nullptr) { *failed_pivot = -1; }
   for (int pivot = 0; pivot < rows; ++pivot)
   {
     int best = pivot;
@@ -1010,7 +1086,11 @@ bool FactorAndSolve(std::vector<double> matrix, const int rows,
       {
         best = row;
       }
-    if (!(std::abs(matrix[best * rows + pivot]) > 1.0e-14)) { return false; }
+    if (!(std::abs(matrix[best * rows + pivot]) > 1.0e-14))
+    {
+      if (failed_pivot != nullptr) { *failed_pivot = pivot; }
+      return false;
+    }
     if (best != pivot)
       for (int column = 0; column < rows; ++column)
         std::swap(matrix[pivot * rows + column],
@@ -1177,12 +1257,13 @@ bool IndependentAssembleLinearization(
       static_cast<std::size_t>(result.elements) * result.ni;
   const std::size_t total_trace =
       static_cast<std::size_t>(result.elements) * result.nt;
-  if (result.elements != snapshot.elements || result.elements != 9 ||
+  const std::size_t local_trace_size = trace_coefficients.size();
+  if (result.elements != snapshot.elements ||
       result.ni <= 0 || result.nt <= 0 || result.ng <= 0 ||
       snapshot.assembly_quadrature_order != result.quadrature_order ||
       snapshot.old_interior.size() != total_interior ||
       interior_coefficients.size() != total_interior ||
-      trace_coefficients.size() != static_cast<std::size_t>(result.ng) ||
+      local_trace_size == 0 ||
       snapshot.signed_trace_dofs.size() != total_trace)
   {
     return false;
@@ -1197,16 +1278,61 @@ bool IndependentAssembleLinearization(
   result.g.assign(total_trace, 0.0);
   result.admissible = true;
 
+  // Never assume that MFEM preserves the serial or production element order
+  // after partitioning.  Match each independently rebuilt local element to
+  // the production snapshot by its periodic physical center.
+  constexpr double coordinate_scale = 1.0e12;
+  using ElementKey = std::pair<std::int64_t, std::int64_t>;
+  std::map<ElementKey, int> snapshot_element_for_key;
+  if (snapshot.element_coordinate_keys.size() !=
+      static_cast<std::size_t>(result.elements) * dimension)
+  {
+    return false;
+  }
   for (int element = 0; element < result.elements; ++element)
   {
-    const mfem::FiniteElement* fe = oracle.interior_space->GetFE(element);
+    const ElementKey key{
+        snapshot.element_coordinate_keys[
+            static_cast<std::size_t>(element) * dimension],
+        snapshot.element_coordinate_keys[
+            static_cast<std::size_t>(element) * dimension + 1]};
+    if (!snapshot_element_for_key.emplace(key, element).second) { return false; }
+  }
+
+  for (int oracle_element = 0; oracle_element < result.elements;
+       ++oracle_element)
+  {
+    const mfem::FiniteElement* fe =
+        oracle.interior_space->GetFE(oracle_element);
     mfem::ElementTransformation* transformation =
-        oracle.mesh->GetElementTransformation(element);
+        oracle.mesh->GetElementTransformation(oracle_element);
     if (fe == nullptr || transformation == nullptr ||
         conserved_components * fe->GetDof() != result.ni)
     {
       return false;
     }
+    mfem::IntegrationPoint center;
+    center.x = 0.5;
+    center.y = 0.5;
+    mfem::Vector center_physical(dimension);
+    transformation->Transform(center, center_physical);
+    auto coordinate_bin = [](const double coordinate)
+    {
+      double periodic = std::fmod(coordinate, 1.0);
+      if (periodic < 0.0) { periodic += 1.0; }
+      if (std::abs(periodic) <= 1.0e-11 ||
+          std::abs(periodic - 1.0) <= 1.0e-11)
+      {
+        periodic = 0.0;
+      }
+      return static_cast<std::int64_t>(
+          std::llround(periodic * coordinate_scale));
+    };
+    const ElementKey key{coordinate_bin(center_physical[0]),
+                         coordinate_bin(center_physical[1])};
+    const auto matched = snapshot_element_for_key.find(key);
+    if (matched == snapshot_element_for_key.end()) { return false; }
+    const int element = matched->second;
     const int scalar_dofs = fe->GetDof();
     const std::size_t interior_offset =
         static_cast<std::size_t>(element) * result.ni;
@@ -1282,7 +1408,7 @@ bool IndependentAssembleLinearization(
     }
 
     mfem::Array<int> faces, orientations;
-    oracle.mesh->GetElementEdges(element, faces, orientations);
+    oracle.mesh->GetElementEdges(oracle_element, faces, orientations);
     if (faces.Size() != 4) { return false; }
     int local_trace_offset = 0;
     for (int local_face = 0; local_face < faces.Size(); ++local_face)
@@ -1299,8 +1425,11 @@ bool IndependentAssembleLinearization(
       }
       const int face_scalar_dofs = trace_fe->GetDof();
       const int face_vdofs = conserved_components * face_scalar_dofs;
-      const bool first = face_transformation->Elem1No == element;
-      if (!first && face_transformation->Elem2No != element) { return false; }
+      const bool first = face_transformation->Elem1No == oracle_element;
+      if (!first && face_transformation->Elem2No != oracle_element)
+      {
+        return false;
+      }
       mfem::Vector interior_shape(scalar_dofs);
       mfem::Vector trace_shape(face_scalar_dofs);
       const mfem::IntegrationRule& face_rule =
@@ -1330,7 +1459,11 @@ bool IndependentAssembleLinearization(
             double sign = 1.0;
             const int global = Decode(
                 snapshot.signed_trace_dofs[trace_offset + local], sign);
-            if (global < 0 || global >= result.ng) { return false; }
+            if (global < 0 ||
+                static_cast<std::size_t>(global) >= local_trace_size)
+            {
+              return false;
+            }
             trace_state[component] +=
                 trace_shape[scalar] * sign * trace_coefficients[global];
           }
@@ -1470,127 +1603,364 @@ struct IndependentCondensedSystem
   std::vector<double> recovered_increment;
 };
 
+enum class IndependentCondenseFailureStage : int
+{
+  none = 0,
+  invalid_dimensions = 1,
+  invalid_storage = 2,
+  invalid_global_map = 3,
+  injected_preparation = 4,
+  element_factorization = 5,
+  decoded_global_row = 6,
+  decoded_global_column = 7,
+  preparation_exception = 8,
+  collective_signature = 9,
+  global_factorization = 10,
+  recovery_map = 11,
+  recovery_factorization = 12,
+  nonfinite_result = 13,
+  post_reduction_exception = 14
+};
+
+struct IndependentCondenseDiagnostic
+{
+  int local_failure_stage = 0;
+  int local_element = -1;
+  int local_index = -1;
+  int local_decoded_value = -1;
+  int local_pivot = -1;
+  int minimum_failure_stage = 0;
+  int maximum_failure_stage = 0;
+};
+
+bool CondenseCollectiveReady(
+    const IndependentCondenseDiagnostic& local, const int ni, const int nt,
+    const int ng, const bool distributed_reduction, const char* const phase,
+    IndependentCondenseDiagnostic* const diagnostic)
+{
+  int rank = -1;
+  int ranks = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  const std::array<int, 9> local_values{{
+      local.local_failure_stage, local.local_element, local.local_index,
+      local.local_decoded_value, local.local_pivot, ni, nt, ng,
+      distributed_reduction ? 1 : 0}};
+  std::vector<int> gathered(static_cast<std::size_t>(ranks) *
+                            local_values.size());
+  MPI_Allgather(local_values.data(), static_cast<int>(local_values.size()),
+                MPI_INT, gathered.data(), static_cast<int>(local_values.size()),
+                MPI_INT, MPI_COMM_WORLD);
+
+  int minimum_failure_stage = std::numeric_limits<int>::max();
+  int maximum_failure_stage = 0;
+  for (int peer = 0; peer < ranks; ++peer)
+  {
+    const int stage = gathered[static_cast<std::size_t>(peer) *
+                               local_values.size()];
+    if (stage != 0)
+    {
+      minimum_failure_stage = std::min(minimum_failure_stage, stage);
+      maximum_failure_stage = std::max(maximum_failure_stage, stage);
+    }
+  }
+  bool signature_matches = true;
+  if (maximum_failure_stage == 0)
+  {
+    for (int peer = 1; peer < ranks; ++peer)
+      for (std::size_t entry = 5; entry < local_values.size(); ++entry)
+        signature_matches = signature_matches &&
+            gathered[static_cast<std::size_t>(peer) * local_values.size() +
+                     entry] == gathered[entry];
+    if (!signature_matches)
+    {
+      minimum_failure_stage = static_cast<int>(
+          IndependentCondenseFailureStage::collective_signature);
+      maximum_failure_stage = minimum_failure_stage;
+    }
+  }
+  const bool ready = maximum_failure_stage == 0 && signature_matches;
+  if (diagnostic != nullptr)
+  {
+    *diagnostic = local;
+    diagnostic->minimum_failure_stage = ready ? 0 : minimum_failure_stage;
+    diagnostic->maximum_failure_stage = ready ? 0 : maximum_failure_stage;
+  }
+  if (!ready && rank == 0)
+  {
+    std::cerr << "HDG_EULER_DEVICE_FULL_MPI_ORACLE_CONDENSE_FAILURE"
+              << " phase=" << phase
+              << " failure_stage_min=" << minimum_failure_stage
+              << " failure_stage_max=" << maximum_failure_stage
+              << " rank_details=";
+    for (int peer = 0; peer < ranks; ++peer)
+    {
+      const std::size_t offset =
+          static_cast<std::size_t>(peer) * local_values.size();
+      std::cerr << (peer == 0 ? "" : ";") << peer << ":"
+                << gathered[offset] << "/e" << gathered[offset + 1]
+                << "/i" << gathered[offset + 2] << "/v"
+                << gathered[offset + 3] << "/p" << gathered[offset + 4]
+                << "/shape" << gathered[offset + 5] << ","
+                << gathered[offset + 6] << "," << gathered[offset + 7]
+                << "," << gathered[offset + 8];
+    }
+    std::cerr << '\n';
+  }
+  return ready;
+}
+
 bool IndependentCondenseSolve(const FullDeviceTestSnapshot& snapshot,
                               const IndependentLinearization& linearization,
-                              IndependentCondensedSystem& result)
+                              IndependentCondensedSystem& result,
+                              const int injected_preparation_failure_rank = -1,
+                              IndependentCondenseDiagnostic* const diagnostic =
+                                  nullptr)
 {
   const int elements = linearization.elements;
   const int ni = linearization.ni;
   const int nt = linearization.nt;
   const int ng = linearization.ng;
-  if (elements <= 0 || ni <= 0 || nt <= 0 || ng <= 0) { return false; }
-  result = {};
-  result.schur.assign(static_cast<std::size_t>(elements) * nt * nt, 0.0);
-  result.condensed_rhs.assign(static_cast<std::size_t>(elements) * nt, 0.0);
-  result.true_matrix.assign(static_cast<std::size_t>(ng) * ng, 0.0);
-  result.true_rhs.assign(ng, 0.0);
-  result.local_trace_increment.assign(
-      static_cast<std::size_t>(elements) * nt, 0.0);
-  result.recovered_increment.assign(
-      static_cast<std::size_t>(elements) * ni, 0.0);
-  for (int element = 0; element < elements; ++element)
+  int rank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  IndependentCondenseDiagnostic local;
+  const auto fail = [&local](const IndependentCondenseFailureStage stage,
+                             const int element, const int index,
+                             const int decoded_value, const int pivot)
   {
-    const double* a = linearization.a.data() +
-                      static_cast<std::size_t>(element) * ni * ni;
-    const double* b = linearization.b.data() +
-                      static_cast<std::size_t>(element) * ni * nt;
-    const double* c = linearization.c.data() +
-                      static_cast<std::size_t>(element) * nt * ni;
-    const double* d = linearization.d.data() +
-                      static_cast<std::size_t>(element) * nt * nt;
-    const double* f = linearization.f.data() +
-                      static_cast<std::size_t>(element) * ni;
-    const double* g = linearization.g.data() +
-                      static_cast<std::size_t>(element) * nt;
-    std::vector<double> solved(static_cast<std::size_t>(ni) * (nt + 1));
-    for (int row = 0; row < ni; ++row)
+    if (local.local_failure_stage != 0) { return; }
+    local.local_failure_stage = static_cast<int>(stage);
+    local.local_element = element;
+    local.local_index = index;
+    local.local_decoded_value = decoded_value;
+    local.local_pivot = pivot;
+  };
+  if (elements <= 0 || ni <= 0 || nt <= 0 || ng <= 0 ||
+      static_cast<long long>(ng) * ng > std::numeric_limits<int>::max())
+  {
+    fail(IndependentCondenseFailureStage::invalid_dimensions, -1, -1, -1,
+         -1);
+  }
+  if (rank == injected_preparation_failure_rank)
+  {
+    fail(IndependentCondenseFailureStage::injected_preparation, -1, -1,
+         rank, -1);
+  }
+  result = {};
+  const std::vector<int>& global_map =
+      snapshot.signed_global_trace_dofs.empty() ?
+          snapshot.signed_trace_dofs : snapshot.signed_global_trace_dofs;
+  const bool distributed_reduction =
+      snapshot.signed_global_trace_dofs.size() == global_map.size();
+  std::vector<double> global_matrix;
+  std::vector<double> global_rhs;
+  try
+  {
+    if (local.local_failure_stage == 0)
     {
-      std::copy_n(b + row * nt, nt, solved.data() + row * (nt + 1));
-      solved[row * (nt + 1) + nt] = f[row];
+      const std::size_t local_interior =
+          static_cast<std::size_t>(elements) * ni;
+      const std::size_t local_trace =
+          static_cast<std::size_t>(elements) * nt;
+      const bool storage_valid =
+          linearization.a.size() == local_interior * ni &&
+          linearization.b.size() == local_interior * nt &&
+          linearization.c.size() == local_trace * ni &&
+          linearization.d.size() == local_trace * nt &&
+          linearization.f.size() == local_interior &&
+          linearization.g.size() == local_trace;
+      if (!storage_valid)
+        fail(IndependentCondenseFailureStage::invalid_storage, -1, -1, -1,
+             -1);
+      else if (global_map.size() != local_trace)
+        fail(IndependentCondenseFailureStage::invalid_global_map, -1,
+             static_cast<int>(global_map.size()),
+             static_cast<int>(local_trace), -1);
     }
-    if (!FactorAndSolve(std::vector<double>(a, a + ni * ni), ni, solved,
-                        nt + 1))
+    if (local.local_failure_stage == 0)
     {
-      return false;
-    }
-    for (int row = 0; row < nt; ++row)
-    {
-      const std::size_t local_row =
-          static_cast<std::size_t>(element) * nt + row;
-      double local_rhs = g[row];
-      for (int interior = 0; interior < ni; ++interior)
-        local_rhs -= c[row * ni + interior] *
-                     solved[interior * (nt + 1) + nt];
-      result.condensed_rhs[local_row] = local_rhs;
-      double row_sign = 1.0;
-      const int global_row =
-          Decode(snapshot.signed_trace_dofs[local_row], row_sign);
-      if (global_row < 0 || global_row >= ng) { return false; }
-      result.true_rhs[global_row] += row_sign * local_rhs;
-      for (int column = 0; column < nt; ++column)
+      result.schur.assign(static_cast<std::size_t>(elements) * nt * nt, 0.0);
+      result.condensed_rhs.assign(static_cast<std::size_t>(elements) * nt,
+                                  0.0);
+      result.true_matrix.assign(static_cast<std::size_t>(ng) * ng, 0.0);
+      result.true_rhs.assign(ng, 0.0);
+      result.local_trace_increment.assign(
+          static_cast<std::size_t>(elements) * nt, 0.0);
+      result.recovered_increment.assign(
+          static_cast<std::size_t>(elements) * ni, 0.0);
+      if (distributed_reduction)
       {
-        double value = d[row * nt + column];
+        global_matrix.assign(result.true_matrix.size(), 0.0);
+        global_rhs.assign(result.true_rhs.size(), 0.0);
+      }
+    }
+    for (int element = 0;
+         element < elements && local.local_failure_stage == 0; ++element)
+    {
+      const double* a = linearization.a.data() +
+                        static_cast<std::size_t>(element) * ni * ni;
+      const double* b = linearization.b.data() +
+                        static_cast<std::size_t>(element) * ni * nt;
+      const double* c = linearization.c.data() +
+                        static_cast<std::size_t>(element) * nt * ni;
+      const double* d = linearization.d.data() +
+                        static_cast<std::size_t>(element) * nt * nt;
+      const double* f = linearization.f.data() +
+                        static_cast<std::size_t>(element) * ni;
+      const double* g = linearization.g.data() +
+                        static_cast<std::size_t>(element) * nt;
+      std::vector<double> solved(static_cast<std::size_t>(ni) * (nt + 1));
+      for (int row = 0; row < ni; ++row)
+      {
+        std::copy_n(b + row * nt, nt, solved.data() + row * (nt + 1));
+        solved[row * (nt + 1) + nt] = f[row];
+      }
+      int failed_pivot = -1;
+      if (!FactorAndSolve(std::vector<double>(a, a + ni * ni), ni, solved,
+                          nt + 1, &failed_pivot))
+      {
+        fail(IndependentCondenseFailureStage::element_factorization, element,
+             -1, -1, failed_pivot);
+        break;
+      }
+      for (int row = 0; row < nt && local.local_failure_stage == 0; ++row)
+      {
+        const std::size_t local_row =
+            static_cast<std::size_t>(element) * nt + row;
+        double local_rhs = g[row];
         for (int interior = 0; interior < ni; ++interior)
-          value -= c[row * ni + interior] *
-                   solved[interior * (nt + 1) + column];
-        result.schur[(static_cast<std::size_t>(element) * nt + row) * nt +
-                     column] = value;
-        double column_sign = 1.0;
-        const int global_column = Decode(
-            snapshot.signed_trace_dofs[static_cast<std::size_t>(element) * nt +
-                                       column],
-            column_sign);
-        if (global_column < 0 || global_column >= ng) { return false; }
-        result.true_matrix[static_cast<std::size_t>(global_row) * ng +
-                           global_column] +=
-            row_sign * column_sign * value;
+          local_rhs -= c[row * ni + interior] *
+                       solved[interior * (nt + 1) + nt];
+        result.condensed_rhs[local_row] = local_rhs;
+        double row_sign = 1.0;
+        const int global_row = Decode(global_map[local_row], row_sign);
+        if (global_row < 0 || global_row >= ng)
+        {
+          fail(IndependentCondenseFailureStage::decoded_global_row, element,
+               static_cast<int>(local_row), global_row, -1);
+          break;
+        }
+        result.true_rhs[global_row] += row_sign * local_rhs;
+        for (int column = 0; column < nt; ++column)
+        {
+          double value = d[row * nt + column];
+          for (int interior = 0; interior < ni; ++interior)
+            value -= c[row * ni + interior] *
+                     solved[interior * (nt + 1) + column];
+          result.schur[(static_cast<std::size_t>(element) * nt + row) * nt +
+                       column] = value;
+          double column_sign = 1.0;
+          const std::size_t local_column =
+              static_cast<std::size_t>(element) * nt + column;
+          const int global_column =
+              Decode(global_map[local_column], column_sign);
+          if (global_column < 0 || global_column >= ng)
+          {
+            fail(IndependentCondenseFailureStage::decoded_global_column,
+                 element, static_cast<int>(local_column), global_column, -1);
+            break;
+          }
+          result.true_matrix[static_cast<std::size_t>(global_row) * ng +
+                             global_column] +=
+              row_sign * column_sign * value;
+        }
       }
     }
   }
-  result.trace_increment = result.true_rhs;
-  if (!FactorAndSolve(result.true_matrix, ng, result.trace_increment, 1))
-    return false;
-  for (int element = 0; element < elements; ++element)
+  catch (const std::exception&)
   {
-    const double* a = linearization.a.data() +
-                      static_cast<std::size_t>(element) * ni * ni;
-    const double* b = linearization.b.data() +
-                      static_cast<std::size_t>(element) * ni * nt;
-    const double* f = linearization.f.data() +
-                      static_cast<std::size_t>(element) * ni;
-    std::vector<double> recovered(ni);
-    for (int column = 0; column < nt; ++column)
-    {
-      double sign = 1.0;
-      const int global = Decode(
-          snapshot.signed_trace_dofs[static_cast<std::size_t>(element) * nt +
-                                     column],
-          sign);
-      if (global < 0 || global >= ng) { return false; }
-      result.local_trace_increment[static_cast<std::size_t>(element) * nt +
-                                   column] =
-          sign * result.trace_increment[global];
-    }
-    for (int row = 0; row < ni; ++row)
-    {
-      recovered[row] = f[row];
-      for (int column = 0; column < nt; ++column)
-        recovered[row] -=
-            b[row * nt + column] *
-            result.local_trace_increment[static_cast<std::size_t>(element) *
-                                             nt + column];
-    }
-    if (!FactorAndSolve(std::vector<double>(a, a + ni * ni), ni, recovered, 1))
-      return false;
-    std::copy(recovered.begin(), recovered.end(),
-              result.recovered_increment.begin() +
-                  static_cast<std::size_t>(element) * ni);
+    fail(IndependentCondenseFailureStage::preparation_exception, -1, -1, -1,
+         -1);
   }
-  return FiniteVector(result.schur) && FiniteVector(result.condensed_rhs) &&
-         FiniteVector(result.true_matrix) && FiniteVector(result.true_rhs) &&
-         FiniteVector(result.trace_increment) &&
-         FiniteVector(result.local_trace_increment) &&
-         FiniteVector(result.recovered_increment);
+
+  if (!CondenseCollectiveReady(local, ni, nt, ng, distributed_reduction,
+                               "prepare", diagnostic))
+    return false;
+  if (distributed_reduction)
+  {
+    MPI_Allreduce(result.true_matrix.data(), global_matrix.data(),
+                  static_cast<int>(result.true_matrix.size()), MPI_DOUBLE,
+                  MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(result.true_rhs.data(), global_rhs.data(),
+                  static_cast<int>(result.true_rhs.size()), MPI_DOUBLE,
+                  MPI_SUM, MPI_COMM_WORLD);
+    result.true_matrix = std::move(global_matrix);
+    result.true_rhs = std::move(global_rhs);
+  }
+  try
+  {
+    result.trace_increment = result.true_rhs;
+    int failed_pivot = -1;
+    if (!FactorAndSolve(result.true_matrix, ng, result.trace_increment, 1,
+                        &failed_pivot))
+    {
+      fail(IndependentCondenseFailureStage::global_factorization, -1, -1, -1,
+           failed_pivot);
+    }
+    for (int element = 0;
+         element < elements && local.local_failure_stage == 0; ++element)
+    {
+      const double* a = linearization.a.data() +
+                        static_cast<std::size_t>(element) * ni * ni;
+      const double* b = linearization.b.data() +
+                        static_cast<std::size_t>(element) * ni * nt;
+      const double* f = linearization.f.data() +
+                        static_cast<std::size_t>(element) * ni;
+      std::vector<double> recovered(ni);
+      for (int column = 0; column < nt; ++column)
+      {
+        double sign = 1.0;
+        const std::size_t local_column =
+            static_cast<std::size_t>(element) * nt + column;
+        const int global = Decode(global_map[local_column], sign);
+        if (global < 0 || global >= ng)
+        {
+          fail(IndependentCondenseFailureStage::recovery_map, element,
+               static_cast<int>(local_column), global, -1);
+          break;
+        }
+        result.local_trace_increment[local_column] =
+            sign * result.trace_increment[global];
+      }
+      if (local.local_failure_stage != 0) { break; }
+      for (int row = 0; row < ni; ++row)
+      {
+        recovered[row] = f[row];
+        for (int column = 0; column < nt; ++column)
+          recovered[row] -=
+              b[row * nt + column] *
+              result.local_trace_increment[
+                  static_cast<std::size_t>(element) * nt + column];
+      }
+      failed_pivot = -1;
+      if (!FactorAndSolve(std::vector<double>(a, a + ni * ni), ni, recovered,
+                          1, &failed_pivot))
+      {
+        fail(IndependentCondenseFailureStage::recovery_factorization, element,
+             -1, -1, failed_pivot);
+        break;
+      }
+      std::copy(recovered.begin(), recovered.end(),
+                result.recovered_increment.begin() +
+                    static_cast<std::size_t>(element) * ni);
+    }
+    if (local.local_failure_stage == 0 &&
+        !(FiniteVector(result.schur) &&
+          FiniteVector(result.condensed_rhs) &&
+          FiniteVector(result.true_matrix) && FiniteVector(result.true_rhs) &&
+          FiniteVector(result.trace_increment) &&
+          FiniteVector(result.local_trace_increment) &&
+          FiniteVector(result.recovered_increment)))
+      fail(IndependentCondenseFailureStage::nonfinite_result, -1, -1, -1,
+           -1);
+  }
+  catch (const std::exception&)
+  {
+    fail(IndependentCondenseFailureStage::post_reduction_exception, -1, -1,
+         -1, -1);
+  }
+  return CondenseCollectiveReady(local, ni, nt, ng, distributed_reduction,
+                                 "post_reduction", diagnostic);
 }
 
 struct GlobalLinearOracleResult
@@ -1920,6 +2290,11 @@ bool ValidateCase(const FullDeviceMeshEvidence& value)
       !value.hypre_gmres || !value.hypre_ilu_type_zero_fill_zero ||
       value.effective_hypre_ilu_type != 0 ||
       value.effective_hypre_ilu_level_of_fill != 0 ||
+      value.effective_hypre_ilu_local_reordering != 1 ||
+      value.trace_solve_failure_code != 0 || value.last_hypre_error != 0 ||
+      value.last_hypre_converged != 1 || value.last_hypre_iterations <= 0 ||
+      !std::isfinite(value.last_hypre_reported_residual) ||
+      !value.test_snapshot.refinement_corrections.empty() ||
       value.telemetry.hypre_ilu_configuration_checks <
           static_cast<std::size_t>(value.nonlinear_iterations + 1) ||
       value.telemetry.hypre_setup_refresh_events <
@@ -2146,7 +2521,23 @@ void PrintFailure(const FullDeviceEvidence& evidence, const std::string& stage)
               << " N=" << value.elements_per_direction
               << " status=" << static_cast<int>(value.status)
               << " nonlinear=" << value.nonlinear_iterations
+              << " discarded_nonlinear="
+              << value.discarded_nonlinear_iterations
               << " linear=" << value.linear_iterations
+              << " discarded_linear=" << value.discarded_linear_iterations
+              << " rejected_trials=" << value.rejected_trials
+              << " discarded_residual="
+              << value.discarded_accepted_residual
+              << " refinement_records="
+              << value.test_snapshot.refinement_corrections.size()
+              << " solve_diag=" << value.trace_solve_failure_code
+              << "/" << value.last_hypre_error
+              << "/" << value.last_hypre_converged
+              << "/" << value.last_hypre_iterations
+              << "/" << value.last_hypre_krylov_dimension
+              << "/" << value.last_hypre_max_iterations
+              << "/" << value.last_hypre_global_rows
+              << "/" << value.last_hypre_reported_residual
               << " residual=" << value.final_residual
               << " true_residual=" << value.true_relative_residual
               << " action=" << value.schur_action_error
@@ -2308,6 +2699,904 @@ bool ValidateRollbackEvidence(const FullDeviceEvidence& rollback,
          std::none_of(rollback.convergence.begin(), rollback.convergence.end(),
                       [](const auto& item) { return item.pass; });
 }
+
+struct MpiDeviceOracleResult
+{
+  double residual_error = std::numeric_limits<double>::infinity();
+  double jacobian_error = std::numeric_limits<double>::infinity();
+  double condensation_error = std::numeric_limits<double>::infinity();
+  double true_matrix_error = std::numeric_limits<double>::infinity();
+  double true_rhs_error = std::numeric_limits<double>::infinity();
+  double trace_solution_error = std::numeric_limits<double>::infinity();
+  double recovery_error = std::numeric_limits<double>::infinity();
+  double state_error = std::numeric_limits<double>::infinity();
+  bool coordinate_coverage = false;
+  bool ghost_truth = false;
+  bool offdiag_action = false;
+  bool status_truth = false;
+  bool pass = false;
+  int condense_local_failure_stage = 0;
+  int condense_failure_stage_min = 0;
+  int condense_failure_stage_max = 0;
+};
+
+bool CoordinateCoverage(const FullDeviceTestSnapshot& snapshot)
+{
+  const int local_key_count = static_cast<int>(
+      snapshot.element_coordinate_keys.size());
+  int ranks = 0;
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  std::vector<int> counts(static_cast<std::size_t>(ranks), 0);
+  MPI_Allgather(&local_key_count, 1, MPI_INT, counts.data(), 1, MPI_INT,
+                MPI_COMM_WORLD);
+  std::vector<int> displacements(static_cast<std::size_t>(ranks), 0);
+  int global_key_count = 0;
+  for (int rank = 0; rank < ranks; ++rank)
+  {
+    displacements[static_cast<std::size_t>(rank)] = global_key_count;
+    global_key_count += counts[static_cast<std::size_t>(rank)];
+  }
+  std::vector<std::int64_t> global_keys(
+      static_cast<std::size_t>(global_key_count));
+  MPI_Allgatherv(snapshot.element_coordinate_keys.data(), local_key_count,
+                 MPI_INT64_T, global_keys.data(), counts.data(),
+                 displacements.data(), MPI_INT64_T, MPI_COMM_WORLD);
+  bool local_ok = local_key_count == 2 * snapshot.elements &&
+      global_key_count == 2 * 9;
+  std::set<std::pair<std::int64_t, std::int64_t>> partition_keys;
+  for (int entry = 0; entry + 1 < global_key_count; entry += 2)
+    local_ok = partition_keys.emplace(global_keys[entry],
+                                      global_keys[entry + 1]).second &&
+        local_ok;
+  try
+  {
+    mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+        3, 3, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+    std::vector<mfem::Vector> translations(2, mfem::Vector(dimension));
+    translations[0][0] = 1.0;
+    translations[0][1] = 0.0;
+    translations[1][0] = 0.0;
+    translations[1][1] = 1.0;
+    mfem::Mesh serial = mfem::Mesh::MakePeriodic(
+        original, original.CreatePeriodicVertexMapping(translations));
+    std::set<std::pair<std::int64_t, std::int64_t>> serial_keys;
+    for (int element = 0; element < serial.GetNE(); ++element)
+    {
+      mfem::ElementTransformation* transformation =
+          serial.GetElementTransformation(element);
+      if (transformation == nullptr)
+      {
+        local_ok = false;
+        break;
+      }
+      mfem::IntegrationPoint center;
+      center.x = 0.5;
+      center.y = 0.5;
+      mfem::Vector physical(dimension);
+      transformation->Transform(center, physical);
+      serial_keys.emplace(
+          static_cast<std::int64_t>(std::llround(physical[0] * 1.0e12)),
+          static_cast<std::int64_t>(std::llround(physical[1] * 1.0e12)));
+    }
+    local_ok = local_ok && serial_keys == partition_keys &&
+        serial_keys.size() == 9;
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  return GlobalAll(local_ok);
+}
+
+bool ValidateMpiDeviceCase(const FullDeviceMeshEvidence& value,
+                           MpiDeviceOracleResult& result,
+                           const int injected_condense_failure_rank = -1)
+{
+  result = {};
+  const FullDeviceTestSnapshot& snapshot = value.test_snapshot;
+  const int elements = snapshot.elements;
+  const int ni = snapshot.interior_dofs;
+  const int nt = snapshot.trace_dofs;
+  const int ng = snapshot.global_trace_dofs;
+  const int owned = static_cast<int>(snapshot.owned_true_global_dofs.size());
+  const int local_trace =
+      static_cast<int>(snapshot.local_trace_global_true_dofs.size());
+  const std::size_t total_interior =
+      static_cast<std::size_t>(elements) * ni;
+  const std::size_t total_trace =
+      static_cast<std::size_t>(elements) * nt;
+  const auto sized = [](const auto& values, const std::size_t expected)
+  { return values.size() == expected; };
+  const auto& corrections = snapshot.refinement_corrections;
+  bool refinement_records_valid =
+      corrections.size() <=
+      static_cast<std::size_t>(2 * value.nonlinear_iterations);
+  std::uint64_t previous_generation = 0;
+  int previous_index = 0;
+  double previous_candidate_residual =
+      std::numeric_limits<double>::infinity();
+  for (std::size_t entry = 0; entry < corrections.size(); ++entry)
+  {
+    const auto& record = corrections[entry];
+    const bool clean = record.error == 0 && record.convergence_query == 0 &&
+        record.converged == 1;
+    const bool pure_warning = record.error == HYPRE_ERROR_CONV &&
+        (record.convergence_query == 0 ||
+         record.convergence_query == HYPRE_ERROR_CONV) &&
+        record.converged == 0;
+    const double expected_reduction = record.direct_candidate_true_residual /
+        std::max(record.previous_true_residual, 1.0e-300);
+    const bool same_generation =
+        entry != 0 && record.generation == previous_generation;
+    refinement_records_valid = refinement_records_valid &&
+        record.generation > 0 && record.correction_index >= 1 &&
+        record.correction_index <= 2 && (clean != pure_warning) &&
+        record.iterations > 0 && std::isfinite(record.reported_residual) &&
+        std::isfinite(record.previous_true_residual) &&
+        std::isfinite(record.correction_true_residual) &&
+        std::isfinite(record.derived_candidate_true_residual) &&
+        std::isfinite(record.direct_candidate_true_residual) &&
+        std::isfinite(record.reduction_factor) &&
+        std::isfinite(record.derived_direct_agreement) &&
+        record.correction_true_residual < 1.0 &&
+        record.derived_candidate_true_residual <
+            record.previous_true_residual &&
+        record.direct_candidate_true_residual <
+            record.previous_true_residual &&
+        record.reduction_factor < 1.0 &&
+        record.derived_direct_agreement <= 1.0e-10 &&
+        std::abs(record.reduction_factor - expected_reduction) <=
+            1.0e-12 * std::max(1.0, std::abs(expected_reduction)) &&
+        (record.published ==
+         (record.direct_candidate_true_residual <= 1.0e-10));
+    if (same_generation)
+    {
+      refinement_records_valid = refinement_records_valid &&
+          record.correction_index == previous_index + 1 &&
+          std::abs(record.previous_true_residual -
+                   previous_candidate_residual) <=
+              1.0e-12 *
+                  std::max(1.0, std::abs(previous_candidate_residual));
+    }
+    else
+    {
+      refinement_records_valid = refinement_records_valid &&
+          record.generation > previous_generation &&
+          record.correction_index == 1 &&
+          (entry == 0 || corrections[entry - 1].published);
+    }
+    if (!record.published)
+    {
+      refinement_records_valid = refinement_records_valid &&
+          entry + 1 < corrections.size() &&
+          corrections[entry + 1].generation == record.generation;
+    }
+    previous_generation = record.generation;
+    previous_index = record.correction_index;
+    previous_candidate_residual = record.direct_candidate_true_residual;
+  }
+  refinement_records_valid = refinement_records_valid &&
+      (corrections.empty() || corrections.back().published);
+  const bool clean_inner_terminal = value.last_hypre_error == 0 &&
+      value.last_hypre_converged == 1;
+  const bool exact_bounded_warning =
+      value.last_hypre_error == HYPRE_ERROR_CONV &&
+      value.last_hypre_converged == 0;
+  bool local_ok = value.rank >= 0 && value.rank < 2 && value.ranks == 2 &&
+      value.elements_per_direction == 3 && elements > 0 && elements < 9 &&
+      value.global_elements == 9 && ni > 0 && nt > 0 &&
+      ng == 2 * 3 * 3 * (value.polynomial_order + 1) * conserved_components &&
+      value.global_true_trace_unknowns == ng && owned > 0 &&
+      local_trace >= owned && value.global_ghost_trace_unknowns > 0 &&
+      value.global_unique_trace_faces == 18 &&
+      value.effective_hypre_ilu_type == 0 &&
+      value.effective_hypre_ilu_level_of_fill == 0 &&
+      value.effective_hypre_ilu_local_reordering == 0 &&
+      value.trace_solve_failure_code == 0 &&
+      (clean_inner_terminal || exact_bounded_warning) &&
+      value.last_hypre_iterations > 0 &&
+      value.last_hypre_global_rows == ng &&
+      value.last_hypre_krylov_dimension == ng &&
+      value.last_hypre_max_iterations == std::max(200, 2 * ng) &&
+      std::isfinite(value.last_hypre_reported_residual) &&
+      refinement_records_valid &&
+      snapshot.global_linear_oracle_staged &&
+      sized(snapshot.old_interior, total_interior) &&
+      sized(snapshot.initial_interior, total_interior) &&
+      sized(snapshot.initial_trace, local_trace) &&
+      sized(snapshot.signed_trace_dofs, total_trace) &&
+      sized(snapshot.signed_global_trace_dofs, total_trace) &&
+      sized(snapshot.global_residual_r, total_interior) &&
+      sized(snapshot.global_residual_g, total_trace) &&
+      sized(snapshot.global_a, total_interior * ni) &&
+      sized(snapshot.global_b, total_interior * nt) &&
+      sized(snapshot.global_c, total_trace * ni) &&
+      sized(snapshot.global_d, total_trace * nt) &&
+      sized(snapshot.global_f, total_interior) &&
+      sized(snapshot.global_g, total_trace) &&
+      sized(snapshot.global_schur, total_trace * nt) &&
+      sized(snapshot.global_condensed_rhs, total_trace) &&
+      sized(snapshot.global_trace_increment, local_trace) &&
+      sized(snapshot.global_local_trace_increment, total_trace) &&
+      sized(snapshot.global_recovered_increment, total_interior) &&
+      sized(snapshot.actual_true_rhs, owned) &&
+      sized(snapshot.actual_true_solution, owned) &&
+      sized(snapshot.actual_true_basis_actions,
+            static_cast<std::size_t>(ng) * owned) &&
+      sized(snapshot.final_interior, total_interior) &&
+      sized(snapshot.final_trace, local_trace) &&
+      sized(snapshot.last_base_interior, total_interior) &&
+      sized(snapshot.last_base_trace, local_trace) &&
+      sized(snapshot.last_delta_interior, total_interior) &&
+      sized(snapshot.last_delta_trace, local_trace) &&
+      snapshot.last_accepted_alpha > 0.0;
+  if (!GlobalAll(local_ok)) { return false; }
+
+  IndependentLinearization first_linearization;
+  local_ok = IndependentAssembleLinearization(
+      snapshot, snapshot.initial_interior, snapshot.initial_trace,
+      first_linearization);
+  if (!GlobalAll(local_ok)) { return false; }
+  IndependentCondensedSystem first_system;
+  IndependentCondenseDiagnostic first_condense_diagnostic;
+  local_ok = IndependentCondenseSolve(
+      snapshot, first_linearization, first_system,
+      injected_condense_failure_rank, &first_condense_diagnostic);
+  result.condense_local_failure_stage =
+      first_condense_diagnostic.local_failure_stage;
+  result.condense_failure_stage_min =
+      first_condense_diagnostic.minimum_failure_stage;
+  result.condense_failure_stage_max =
+      first_condense_diagnostic.maximum_failure_stage;
+  if (!GlobalAll(local_ok)) { return false; }
+
+  result.residual_error = std::max(
+      MaximumDifference(first_linearization.residual_r,
+                        snapshot.global_residual_r),
+      MaximumDifference(first_linearization.residual_g,
+                        snapshot.global_residual_g));
+  result.jacobian_error = std::max({
+      MaximumDifference(first_linearization.a, snapshot.global_a),
+      MaximumDifference(first_linearization.b, snapshot.global_b),
+      MaximumDifference(first_linearization.c, snapshot.global_c),
+      MaximumDifference(first_linearization.d, snapshot.global_d),
+      MaximumDifference(first_linearization.f, snapshot.global_f),
+      MaximumDifference(first_linearization.g, snapshot.global_g)});
+  result.condensation_error = std::max(
+      MaximumDifference(first_system.schur, snapshot.global_schur),
+      MaximumDifference(first_system.condensed_rhs,
+                        snapshot.global_condensed_rhs));
+  result.recovery_error = std::max(
+      MaximumDifference(first_system.local_trace_increment,
+                        snapshot.global_local_trace_increment),
+      MaximumDifference(first_system.recovered_increment,
+                        snapshot.global_recovered_increment));
+
+  std::set<std::int64_t> owned_ids(
+      snapshot.owned_true_global_dofs.begin(),
+      snapshot.owned_true_global_dofs.end());
+  bool local_offdiag = false;
+  result.true_matrix_error = 0.0;
+  result.true_rhs_error = 0.0;
+  result.trace_solution_error = 0.0;
+  for (int row = 0; row < owned; ++row)
+  {
+    const std::int64_t global_row_i64 =
+        snapshot.owned_true_global_dofs[static_cast<std::size_t>(row)];
+    if (global_row_i64 < 0 || global_row_i64 >= ng)
+    {
+      local_ok = false;
+      continue;
+    }
+    const int global_row = static_cast<int>(global_row_i64);
+    result.true_rhs_error = std::max(
+        result.true_rhs_error,
+        std::abs(snapshot.actual_true_rhs[static_cast<std::size_t>(row)] -
+                 first_system.true_rhs[static_cast<std::size_t>(global_row)]));
+    result.trace_solution_error = std::max(
+        result.trace_solution_error,
+        std::abs(snapshot.actual_true_solution[static_cast<std::size_t>(row)] -
+                 first_system.trace_increment[
+                     static_cast<std::size_t>(global_row)]));
+    for (int column = 0; column < ng; ++column)
+    {
+      const double expected = first_system.true_matrix[
+          static_cast<std::size_t>(global_row) * ng + column];
+      const double actual = snapshot.actual_true_basis_actions[
+          static_cast<std::size_t>(column) * owned + row];
+      result.true_matrix_error = std::max(
+          result.true_matrix_error, std::abs(actual - expected));
+      local_offdiag = local_offdiag ||
+          (owned_ids.count(column) == 0 && std::abs(expected) > 1.0e-14);
+    }
+  }
+  if (!GlobalAll(local_ok)) { return false; }
+  int local_offdiag_value = local_offdiag ? 1 : 0;
+  int global_offdiag_value = 0;
+  MPI_Allreduce(&local_offdiag_value, &global_offdiag_value, 1, MPI_INT,
+                MPI_MAX, MPI_COMM_WORLD);
+  result.offdiag_action = global_offdiag_value == 1;
+
+  // Check the distributed first solution through the signed element maps,
+  // independently of the owner-only true-vector comparison above.
+  double distributed_trace_error = 0.0;
+  for (std::size_t entry = 0; entry < total_trace; ++entry)
+  {
+    double sign = 1.0;
+    const int local = Decode(snapshot.signed_trace_dofs[entry], sign);
+    if (local < 0 || local >= local_trace)
+    {
+      local_ok = false;
+      continue;
+    }
+    distributed_trace_error = std::max(
+        distributed_trace_error,
+        std::abs(sign * snapshot.global_trace_increment[
+                            static_cast<std::size_t>(local)] -
+                 first_system.local_trace_increment[entry]));
+  }
+
+  IndependentLinearization last_linearization;
+  if (!GlobalAll(local_ok)) { return false; }
+  local_ok = IndependentAssembleLinearization(
+      snapshot, snapshot.last_base_interior, snapshot.last_base_trace,
+      last_linearization);
+  if (!GlobalAll(local_ok)) { return false; }
+  IndependentCondensedSystem last_system;
+  IndependentCondenseDiagnostic last_condense_diagnostic;
+  local_ok = IndependentCondenseSolve(snapshot, last_linearization,
+                                      last_system, -1,
+                                      &last_condense_diagnostic);
+  if (!local_ok)
+  {
+    result.condense_local_failure_stage =
+        last_condense_diagnostic.local_failure_stage;
+    result.condense_failure_stage_min =
+        last_condense_diagnostic.minimum_failure_stage;
+    result.condense_failure_stage_max =
+        last_condense_diagnostic.maximum_failure_stage;
+  }
+  if (!GlobalAll(local_ok)) { return false; }
+  result.recovery_error = std::max(
+      result.recovery_error,
+      MaximumDifference(last_system.recovered_increment,
+                        snapshot.last_delta_interior));
+  result.state_error = 0.0;
+  for (std::size_t entry = 0; entry < total_interior; ++entry)
+    result.state_error = std::max(
+        result.state_error,
+        std::abs(snapshot.final_interior[entry] -
+                 (snapshot.last_base_interior[entry] +
+                  snapshot.last_accepted_alpha *
+                      last_system.recovered_increment[entry])));
+  for (std::size_t entry = 0; entry < snapshot.final_trace.size(); ++entry)
+    result.state_error = std::max(
+        result.state_error,
+        std::abs(snapshot.final_trace[entry] -
+                 (snapshot.last_base_trace[entry] +
+                  snapshot.last_accepted_alpha *
+                      snapshot.last_delta_trace[entry])));
+  for (std::size_t entry = 0; entry < total_trace; ++entry)
+  {
+    double sign = 1.0;
+    const int local = Decode(snapshot.signed_trace_dofs[entry], sign);
+    if (local < 0 || local >= local_trace)
+    {
+      local_ok = false;
+      continue;
+    }
+    result.state_error = std::max(
+        result.state_error,
+        std::abs(sign * snapshot.last_delta_trace[
+                            static_cast<std::size_t>(local)] -
+                 last_system.local_trace_increment[entry]));
+  }
+  result.trace_solution_error = std::max(
+      result.trace_solution_error, distributed_trace_error);
+
+  bool local_ghost = false;
+  bool local_ghost_truth =
+      sized(snapshot.ghost_probe_owned, owned) &&
+      sized(snapshot.ghost_probe_distributed, local_trace);
+  for (int row = 0; row < owned && local_ghost_truth; ++row)
+  {
+    const double expected = 0.25 + std::sin(
+        0.01 * static_cast<double>(
+            snapshot.owned_true_global_dofs[static_cast<std::size_t>(row)] +
+            1));
+    local_ghost_truth = std::abs(
+        snapshot.ghost_probe_owned[static_cast<std::size_t>(row)] -
+        expected) <= 1.0e-14;
+  }
+  for (int local = 0; local < local_trace && local_ghost_truth; ++local)
+  {
+    const std::int64_t global =
+        snapshot.local_trace_global_true_dofs[static_cast<std::size_t>(local)];
+    const double expected =
+        0.25 + std::sin(0.01 * static_cast<double>(global + 1));
+    local_ghost_truth = global >= 0 && global < ng &&
+        std::abs(snapshot.ghost_probe_distributed[
+                     static_cast<std::size_t>(local)] - expected) <= 1.0e-14;
+    local_ghost = local_ghost || owned_ids.count(global) == 0;
+  }
+  for (std::size_t entry = 0;
+       entry < total_trace && local_ghost_truth; ++entry)
+  {
+    double local_sign = 1.0;
+    double global_sign = 1.0;
+    const int local = Decode(snapshot.signed_trace_dofs[entry], local_sign);
+    const int global =
+        Decode(snapshot.signed_global_trace_dofs[entry], global_sign);
+    local_ghost_truth = local >= 0 && local < local_trace && global >= 0 &&
+        global < ng && local_sign == global_sign &&
+        snapshot.local_trace_global_true_dofs[
+            static_cast<std::size_t>(local)] == global;
+  }
+  int local_ghost_value = local_ghost ? 1 : 0;
+  int global_ghost_value = 0;
+  MPI_Allreduce(&local_ghost_value, &global_ghost_value, 1, MPI_INT, MPI_MAX,
+                MPI_COMM_WORLD);
+  result.ghost_truth = GlobalAll(local_ghost_truth) &&
+      global_ghost_value == 1;
+  result.coordinate_coverage = CoordinateCoverage(snapshot);
+
+  result.residual_error = GlobalMaximum(result.residual_error);
+  result.jacobian_error = GlobalMaximum(result.jacobian_error);
+  result.condensation_error = GlobalMaximum(result.condensation_error);
+  result.true_matrix_error = GlobalMaximum(result.true_matrix_error);
+  result.true_rhs_error = GlobalMaximum(result.true_rhs_error);
+  result.trace_solution_error = GlobalMaximum(result.trace_solution_error);
+  result.recovery_error = GlobalMaximum(result.recovery_error);
+  result.state_error = GlobalMaximum(result.state_error);
+  int minimum_status = static_cast<int>(value.status);
+  int maximum_status = minimum_status;
+  MPI_Allreduce(MPI_IN_PLACE, &minimum_status, 1, MPI_INT, MPI_MIN,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &maximum_status, 1, MPI_INT, MPI_MAX,
+                MPI_COMM_WORLD);
+  result.status_truth = minimum_status == maximum_status && value.pass &&
+      value.status == FullDeviceStatus::success &&
+      value.nonlinear_iterations >= 2 &&
+      value.committed_generation ==
+          static_cast<std::uint64_t>(value.nonlinear_iterations) &&
+      std::isfinite(value.true_relative_residual) &&
+      value.true_relative_residual <= 1.0e-10;
+  local_ok = local_ok && result.coordinate_coverage && result.ghost_truth &&
+      result.offdiag_action && result.status_truth &&
+      result.residual_error <= 5.0e-11 &&
+      result.jacobian_error <= 5.0e-11 &&
+      result.condensation_error <= 5.0e-11 &&
+      result.true_matrix_error <= 5.0e-11 &&
+      result.true_rhs_error <= 5.0e-11 &&
+      result.trace_solution_error <= 5.0e-9 &&
+      result.recovery_error <= 5.0e-9 && result.state_error <= 5.0e-9 &&
+      value.real_partition_verified &&
+      value.mfem_true_dof_ownership_verified &&
+      value.cross_rank_ghost_exchange_verified &&
+      value.cross_rank_ghost_orientation_verified &&
+      value.host_staged_mpi_exchange && value.collective_failure_atomic &&
+      value.global_unique_trace_faces == 18 &&
+      value.global_shared_faces > 0 && value.global_ghost_trace_unknowns > 0 &&
+      value.exact_ptslp_assembly && value.hypre_matrix_device &&
+      value.hypre_rhs_device && value.hypre_solution_device &&
+      value.hypre_gmres && value.hypre_ilu_type_zero_fill_zero &&
+      value.effective_hypre_ilu_type == 0 &&
+      value.effective_hypre_ilu_level_of_fill == 0 &&
+      value.telemetry.host_staged_mpi_exchange_events > 0 &&
+      value.telemetry.host_staged_mpi_device_to_host_bytes > 0 &&
+      value.telemetry.host_staged_mpi_host_to_device_bytes > 0 &&
+      value.telemetry.mpi_collective_events > 0 &&
+      value.telemetry.fallback_events == 0 &&
+      value.telemetry.dense_host_trace_inverse_events == 0 &&
+      value.telemetry.solver_substitution_events == 0 &&
+      value.telemetry.app_forall_host_fallbacks == 0;
+  result.pass = GlobalAll(local_ok);
+  return result.pass;
+}
+
+FullDevicePhase InjectedFailurePhase(const FullDeviceFailurePoint point)
+{
+  switch (point)
+  {
+    case FullDeviceFailurePoint::local_assembly:
+      return FullDevicePhase::local_assembly;
+    case FullDeviceFailurePoint::condensation:
+      return FullDevicePhase::condensation;
+    case FullDeviceFailurePoint::trace_assembly:
+      return FullDevicePhase::trace_assembly;
+    case FullDeviceFailurePoint::trace_solve:
+    case FullDeviceFailurePoint::distribution:
+      return FullDevicePhase::trace_solve;
+    case FullDeviceFailurePoint::recovery:
+      return FullDevicePhase::recovery;
+    case FullDeviceFailurePoint::state_update:
+      return FullDevicePhase::state_update;
+    case FullDeviceFailurePoint::none:
+      return FullDevicePhase::setup;
+  }
+  return FullDevicePhase::setup;
+}
+
+bool ValidateMpiRollback(const FullDeviceEvidence& rollback, const int p,
+                         const FullDeviceFailurePoint point)
+{
+  bool local_ok = rollback.status == FullDeviceStatus::injected_failure &&
+      !rollback.pass && rollback.cases.size() == 1;
+  if (!GlobalAll(local_ok)) { return false; }
+  const FullDeviceMeshEvidence& rolled = rollback.cases.front();
+  const FullDeviceTestSnapshot& snapshot = rolled.test_snapshot;
+  const FullDevicePhase failure_phase = InjectedFailurePhase(point);
+  const bool entry_restored =
+      BitwiseEqual(snapshot.rollback_entry_interior,
+                   snapshot.rollback_restored_interior) &&
+      BitwiseEqual(snapshot.rollback_entry_trace,
+                   snapshot.rollback_restored_trace);
+  const bool changed =
+      !BitwiseEqual(snapshot.rollback_entry_interior,
+                    snapshot.rollback_changed_interior) ||
+      !BitwiseEqual(snapshot.rollback_entry_trace,
+                    snapshot.rollback_changed_trace);
+  int minimum_status = static_cast<int>(rolled.status);
+  int maximum_status = minimum_status;
+  unsigned long long minimum_generation = rolled.committed_generation;
+  unsigned long long maximum_generation = minimum_generation;
+  MPI_Allreduce(MPI_IN_PLACE, &minimum_status, 1, MPI_INT, MPI_MIN,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &maximum_status, 1, MPI_INT, MPI_MAX,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &minimum_generation, 1,
+                MPI_UNSIGNED_LONG_LONG, MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &maximum_generation, 1,
+                MPI_UNSIGNED_LONG_LONG, MPI_MAX, MPI_COMM_WORLD);
+  const auto& failed =
+      rolled.phases[static_cast<std::size_t>(failure_phase)];
+  local_ok = minimum_status == maximum_status &&
+      minimum_generation == maximum_generation &&
+      rolled.polynomial_order == p && rolled.elements_per_direction == 3 &&
+      rolled.ranks == 2 && rolled.status == FullDeviceStatus::injected_failure &&
+      !rolled.pass && rolled.rollback_restored && entry_restored &&
+      rolled.rollback_had_uncommitted_change ==
+          (point == FullDeviceFailurePoint::state_update) &&
+      rolled.rollback_nonfinite_change_observed ==
+          (point == FullDeviceFailurePoint::state_update) &&
+      changed == (point == FullDeviceFailurePoint::state_update) &&
+      rolled.rollback_rejected_post_failure_consumption &&
+      rolled.invalidated_product_count == 5 &&
+      rolled.rejected_consumer_count == 6 &&
+      rolled.nonlinear_iterations == 0 && rolled.linear_iterations == 0 &&
+      rolled.committed_generation == 0 &&
+      rolled.discarded_attempt_generation > 0 &&
+      rolled.final_residual == rolled.initial_residual &&
+      std::isinf(rolled.true_relative_residual) &&
+      DerivedSnapshotEmpty(snapshot) && failed.reached &&
+      failed.status == FullDeviceStatus::injected_failure &&
+      failed.contemporaneous_audit && !failed.device_resident &&
+      rolled.failure_phase_audit_valid &&
+      rolled.failure_phase == failure_phase &&
+      rolled.failure_phase_status == FullDeviceStatus::injected_failure &&
+      rolled.failure_phase_generation == rolled.discarded_attempt_generation &&
+      rolled.phase_audit_append_only && rolled.managed_residency_verified &&
+      rolled.telemetry.fallback_events == 0 &&
+      rolled.telemetry.dense_host_trace_inverse_events == 0 &&
+      rolled.telemetry.solver_substitution_events == 0;
+  return GlobalAll(local_ok);
+}
+
+FullDeviceRequest MpiDeviceRequest()
+{
+  FullDeviceRequest request;
+  request.enabled = true;
+  request.run_complete_ladder = false;
+  request.enable_test_oracle_staging = true;
+  request.enable_global_linear_oracle_staging = true;
+  request.run_mpi_device_rank_bounded = true;
+  request.enable_host_staged_mpi_exchange = true;
+  return request;
+}
+
+bool RunMpiRollbackCampaign(const FullDeviceRequest& request,
+                            int& failure_transactions)
+{
+  int rank = -1;
+  int ranks = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  const std::array<FullDeviceFailurePoint, 7> failure_points{{
+      FullDeviceFailurePoint::local_assembly,
+      FullDeviceFailurePoint::condensation,
+      FullDeviceFailurePoint::trace_assembly,
+      FullDeviceFailurePoint::trace_solve,
+      FullDeviceFailurePoint::distribution,
+      FullDeviceFailurePoint::recovery,
+      FullDeviceFailurePoint::state_update}};
+  bool campaign_ok = true;
+  failure_transactions = 0;
+  for (const FullDeviceFailurePoint point : failure_points)
+  {
+    const int last_p = point == FullDeviceFailurePoint::state_update ? 4 : 1;
+    for (int p = 1; p <= last_p; ++p)
+    {
+      FullDeviceRequest failure_request = request;
+      failure_request.test_only_polynomial_order = p;
+      failure_request.injected_failure_point = point;
+      failure_request.injected_failure_rank =
+          (failure_transactions + p) % ranks;
+      failure_request.inject_nonfinite_before_rollback =
+          point == FullDeviceFailurePoint::state_update;
+      FullDeviceEvidence rollback;
+      const bool unexpectedly_passed =
+          dg::hdg::euler::RunSmoothEulerDeviceFullExperiment(
+              failure_request, rollback);
+      const bool expected_failure = GlobalAll(!unexpectedly_passed);
+      const bool rollback_valid =
+          expected_failure && ValidateMpiRollback(rollback, p, point);
+      const bool transaction_ok = GlobalAll(rollback_valid);
+      if (!transaction_ok && rank == 0)
+      {
+        PrintFailure(rollback, expected_failure ?
+            "mpi_rank2_rollback" : "mpi_rank2_rollback_pass");
+      }
+      campaign_ok = campaign_ok && transaction_ok;
+      ++failure_transactions;
+    }
+  }
+  return GlobalAll(campaign_ok);
+}
+
+int RunMpiDeviceRank2Production(const int p)
+{
+  int rank = -1;
+  int ranks = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  if (!GlobalAll(ranks == 2 && p >= 1 && p <= 4)) { return 90; }
+  FullDeviceRequest request = MpiDeviceRequest();
+  request.test_only_polynomial_order = p;
+  FullDeviceEvidence evidence;
+  const bool production =
+      dg::hdg::euler::RunSmoothEulerDeviceFullExperiment(request, evidence);
+  if (!GlobalAll(production && evidence.pass &&
+                 evidence.status == FullDeviceStatus::success &&
+                 evidence.cases.size() == 1 && evidence.ranks == 2 &&
+                 evidence.one_physical_gpu_shared))
+  {
+    if (rank == 0) { PrintFailure(evidence, "mpi_rank2_split_production"); }
+    return 100 + p;
+  }
+  MpiDeviceOracleResult oracle;
+  if (!ValidateMpiDeviceCase(evidence.cases.front(), oracle))
+  {
+    if (rank == 0)
+    {
+      std::cerr << "HDG_EULER_DEVICE_FULL_MPI_SPLIT_ORACLE_FAILURE"
+                << " p=" << p
+                << " residual=" << oracle.residual_error
+                << " jacobian=" << oracle.jacobian_error
+                << " condensation=" << oracle.condensation_error
+                << " true=" << oracle.true_matrix_error << "/"
+                << oracle.true_rhs_error
+                << " trace=" << oracle.trace_solution_error
+                << " recovery=" << oracle.recovery_error
+                << " state=" << oracle.state_error
+                << " coordinate=" << oracle.coordinate_coverage
+                << " ghost=" << oracle.ghost_truth
+                << " offdiag=" << oracle.offdiag_action
+                << " status=" << oracle.status_truth << '\n';
+    }
+    return 110 + p;
+  }
+  const FullDeviceMeshEvidence& value = evidence.cases.front();
+  if (rank == 0)
+  {
+    std::cout << "HDG_EULER_DEVICE_FULL_MPI_RANK2_PRODUCTION_SUCCESS"
+              << " p=" << p << " N=3 cases=1 ranks=2"
+              << " nonlinear=" << value.nonlinear_iterations
+              << " linear=" << value.linear_iterations
+              << " refinement_records="
+              << value.test_snapshot.refinement_corrections.size()
+              << " true_residual=" << value.true_relative_residual
+              << " oracle_max="
+              << std::max({oracle.residual_error, oracle.jacobian_error,
+                           oracle.condensation_error,
+                           oracle.true_matrix_error, oracle.true_rhs_error,
+                           oracle.trace_solution_error, oracle.recovery_error,
+                           oracle.state_error})
+              << " fallback=0 dense_host_inverse=0 solver_substitution=0\n";
+  }
+  return 0;
+}
+
+int RunMpiDeviceRank2Rollbacks()
+{
+  int rank = -1;
+  int ranks = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  if (!GlobalAll(ranks == 2)) { return 120; }
+  int failure_transactions = 0;
+  if (!RunMpiRollbackCampaign(MpiDeviceRequest(), failure_transactions))
+    return 121;
+  if (rank == 0)
+  {
+    std::cout << "HDG_EULER_DEVICE_FULL_MPI_RANK2_ROLLBACK_SUCCESS"
+              << " ranks=2 transactions=" << failure_transactions
+              << " fallback=0 dense_host_inverse=0 solver_substitution=0\n";
+  }
+  return 0;
+}
+
+int RunMpiDeviceRank2()
+{
+  int rank = -1;
+  int ranks = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  if (!GlobalAll(ranks == 2)) { return 80; }
+  FullDeviceEvidence disabled;
+  if (dg::hdg::euler::RunSmoothEulerDeviceFullExperiment({}, disabled) ||
+      !GlobalAll(disabled.status == FullDeviceStatus::default_disabled &&
+                 disabled.cases.empty() && !disabled.pass))
+  {
+    if (rank == 0) { PrintFailure(disabled, "mpi_rank2_default_off"); }
+    return 81;
+  }
+
+  FullDeviceRequest request = MpiDeviceRequest();
+  FullDeviceEvidence evidence;
+  const bool production =
+      dg::hdg::euler::RunSmoothEulerDeviceFullExperiment(request, evidence);
+  if (!GlobalAll(production && evidence.pass &&
+                 evidence.status == FullDeviceStatus::success &&
+                 evidence.cases.size() == 4 && evidence.ranks == 2 &&
+                 evidence.one_physical_gpu_shared))
+  {
+    if (rank == 0) { PrintFailure(evidence, "mpi_rank2_production"); }
+    return 82;
+  }
+  double maximum_oracle_error = 0.0;
+  std::array<int, 3> p1_local_topology{{0, 0, 0}};
+  int p1_global_rows = 0;
+  int p1_global_shared_faces = 0;
+  std::size_t p1_global_ghosts = 0;
+  double maximum_true_residual = 0.0;
+  bool oracle_preflight_collective_failure_verified = false;
+  for (int p = 1; p <= 4; ++p)
+  {
+    const auto found = std::find_if(
+        evidence.cases.begin(), evidence.cases.end(),
+        [p](const FullDeviceMeshEvidence& value)
+        { return value.polynomial_order == p; });
+    bool found_case = found != evidence.cases.end();
+    if (!GlobalAll(found_case)) { return 83; }
+    if (p == 1)
+    {
+      MpiDeviceOracleResult injected_oracle;
+      const bool unexpectedly_admitted =
+          ValidateMpiDeviceCase(*found, injected_oracle, 1);
+      const int expected_stage = static_cast<int>(
+          IndependentCondenseFailureStage::injected_preparation);
+      const bool local_injection_observed =
+          injected_oracle.condense_local_failure_stage ==
+              (rank == 1 ? expected_stage : 0) &&
+          injected_oracle.condense_failure_stage_min == expected_stage &&
+          injected_oracle.condense_failure_stage_max == expected_stage;
+      oracle_preflight_collective_failure_verified =
+          GlobalAll(!unexpectedly_admitted && local_injection_observed);
+      if (!oracle_preflight_collective_failure_verified)
+      {
+        if (rank == 0)
+        {
+          std::cerr
+              << "HDG_EULER_DEVICE_FULL_MPI_ORACLE_PREFLIGHT_FAILURE"
+              << " local_stage="
+              << injected_oracle.condense_local_failure_stage
+              << " stage_min="
+              << injected_oracle.condense_failure_stage_min
+              << " stage_max="
+              << injected_oracle.condense_failure_stage_max << '\n';
+        }
+        return 86;
+      }
+      if (rank == 0)
+      {
+        std::cout
+            << "HDG_EULER_DEVICE_FULL_MPI_ORACLE_PREFLIGHT_COLLECTIVE_SUCCESS"
+            << " injected_rank=1 failure_stage=" << expected_stage
+            << " failure_stage_min="
+            << injected_oracle.condense_failure_stage_min
+            << " failure_stage_max="
+            << injected_oracle.condense_failure_stage_max << '\n';
+      }
+    }
+    MpiDeviceOracleResult oracle;
+    if (!ValidateMpiDeviceCase(*found, oracle))
+    {
+      if (rank == 0)
+      {
+        std::cerr << "HDG_EULER_DEVICE_FULL_MPI_ORACLE_FAILURE p=" << p
+                  << " residual=" << oracle.residual_error
+                  << " jacobian=" << oracle.jacobian_error
+                  << " condensation=" << oracle.condensation_error
+                  << " true=" << oracle.true_matrix_error << "/"
+                  << oracle.true_rhs_error
+                  << " trace=" << oracle.trace_solution_error
+                  << " recovery=" << oracle.recovery_error
+                  << " state=" << oracle.state_error
+                  << " coordinate=" << oracle.coordinate_coverage
+                  << " ghost=" << oracle.ghost_truth
+                  << " offdiag=" << oracle.offdiag_action
+                  << " status=" << oracle.status_truth << '\n';
+      }
+      return 84;
+    }
+    maximum_oracle_error = std::max({
+        maximum_oracle_error, oracle.residual_error, oracle.jacobian_error,
+        oracle.condensation_error, oracle.true_matrix_error,
+        oracle.true_rhs_error, oracle.trace_solution_error,
+        oracle.recovery_error, oracle.state_error});
+    maximum_true_residual =
+        std::max(maximum_true_residual, found->true_relative_residual);
+    if (p == 1)
+    {
+      p1_local_topology = {{found->local_trace_unknowns,
+                            found->true_trace_unknowns,
+                            static_cast<int>(found->ghost_trace_unknowns)}};
+      p1_global_rows = static_cast<int>(found->global_true_trace_unknowns);
+      p1_global_shared_faces = found->global_shared_faces;
+      p1_global_ghosts = found->global_ghost_trace_unknowns;
+    }
+  }
+
+  int failure_transactions = 0;
+  if (!RunMpiRollbackCampaign(request, failure_transactions))
+  {
+    return 85;
+  }
+
+  std::array<int, 6> p1_topology_by_rank{{0, 0, 0, 0, 0, 0}};
+  MPI_Gather(p1_local_topology.data(), 3, MPI_INT,
+             p1_topology_by_rank.data(), 3, MPI_INT, 0, MPI_COMM_WORLD);
+  unsigned long long local_telemetry[4] = {0, 0, 0, 0};
+  for (const FullDeviceMeshEvidence& value : evidence.cases)
+  {
+    local_telemetry[0] += value.telemetry.host_staged_mpi_exchange_events;
+    local_telemetry[1] +=
+        value.telemetry.host_staged_mpi_device_to_host_bytes;
+    local_telemetry[2] +=
+        value.telemetry.host_staged_mpi_host_to_device_bytes;
+    local_telemetry[3] += value.telemetry.mpi_collective_events;
+  }
+  unsigned long long global_telemetry[4] = {0, 0, 0, 0};
+  MPI_Allreduce(local_telemetry, global_telemetry, 4,
+                MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  if (rank == 0)
+  {
+    std::cout << "HDG_EULER_DEVICE_FULL_MPI_RANK2_SUCCESS"
+              << " ranks=2 cases=4 p=1-4 N=3 global_elements=9"
+              << " shared_gpu=" << evidence.one_physical_gpu_shared
+              << " p1_global_rows=" << p1_global_rows
+              << " p1_global_shared_faces=" << p1_global_shared_faces
+              << " p1_global_ghosts=" << p1_global_ghosts
+              << " p1_rank0_vsize/true/ghost=" << p1_topology_by_rank[0]
+              << "/" << p1_topology_by_rank[1] << "/"
+              << p1_topology_by_rank[2]
+              << " p1_rank1_vsize/true/ghost=" << p1_topology_by_rank[3]
+              << "/" << p1_topology_by_rank[4] << "/"
+              << p1_topology_by_rank[5]
+              << " oracle_max=" << maximum_oracle_error
+              << " true_residual_max=" << maximum_true_residual
+              << " host_staging_events_global=" << global_telemetry[0]
+              << " staged_d2h_global=" << global_telemetry[1]
+              << " staged_h2d_global=" << global_telemetry[2]
+              << " collective_events_global=" << global_telemetry[3]
+              << " rollback_transactions=" << failure_transactions
+              << " oracle_preflight_collective_failure="
+              << oracle_preflight_collective_failure_verified
+              << " fallback=0 dense_host_inverse=0 solver_substitution=0"
+              << '\n';
+  }
+  return 0;
+}
 }  // namespace
 
 int main(int argc, char* argv[])
@@ -2316,11 +3605,31 @@ int main(int argc, char* argv[])
     return RunUmpireAuditDriver(argv[0]);
   const bool umpire_audit_child =
       argc == 2 && std::string(argv[1]) == "--umpire-audit-child";
-  if (argc != 1 && !umpire_audit_child) { return 73; }
+  const bool mpi_device_rank2 =
+      argc == 2 && std::string(argv[1]) == "--mpi-device-rank2";
+  const bool mpi_device_rank2_rollbacks =
+      argc == 2 && std::string(argv[1]) == "--mpi-device-rank2-rollbacks";
+  int mpi_device_rank2_production_p = 0;
+  if (argc == 2)
+  {
+    const std::string mode(argv[1]);
+    for (int p = 1; p <= 4; ++p)
+      if (mode == "--mpi-device-rank2-production-p" + std::to_string(p))
+        mpi_device_rank2_production_p = p;
+  }
+  const bool mpi_device_split = mpi_device_rank2_rollbacks ||
+      mpi_device_rank2_production_p != 0;
+  if (argc != 1 && !umpire_audit_child && !mpi_device_rank2 &&
+      !mpi_device_split)
+    return 73;
   mfem::Mpi::Init(argc, argv);
   mfem::Device device("cuda");
   (void)device;
-  if (!IndependentPhysicsProbe()) { return 1; }
+  if (!GlobalAll(IndependentPhysicsProbe())) { return 1; }
+  if (mpi_device_rank2_production_p != 0)
+    return RunMpiDeviceRank2Production(mpi_device_rank2_production_p);
+  if (mpi_device_rank2_rollbacks) { return RunMpiDeviceRank2Rollbacks(); }
+  if (mpi_device_rank2) { return RunMpiDeviceRank2(); }
 
   FullDeviceEvidence disabled;
   if (dg::hdg::euler::RunSmoothEulerDeviceFullExperiment({}, disabled) ||
