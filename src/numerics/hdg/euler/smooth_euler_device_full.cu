@@ -5795,29 +5795,79 @@ bool BuildGraphAndStorage(const FullDeviceRequest& request, const int p,
 
   // Refresh the analytic trace and independently exercise every real ghost
   // through the accepted persistent MFEM ParGridFunction exchange plan.
-  mfem::ParGridFunction projected_trace(graph.trace_space.get());
   mfem::Vector owned_trace(graph.true_trace_dofs);
   mfem::Vector refreshed_trace(graph.local_trace_dofs);
   mfem::Vector owned_probe(graph.true_trace_dofs);
   mfem::Vector distributed_probe(graph.local_trace_dofs);
-  std::copy(current_trace.begin(), current_trace.end(),
-            projected_trace.HostWrite());
-  projected_trace.ParallelProject(owned_trace);
+  owned_trace = std::numeric_limits<double>::quiet_NaN();
+  double* owned_trace_values = owned_trace.HostWrite();
+  bool owned_trace_seed_valid =
+      owned_trace_values != nullptr || graph.true_trace_dofs == 0;
+  for (const trace::TraceMapEntry& entry : trace_map.entries)
+  {
+    if (entry.ownership != Ownership::owned) { continue; }
+    const bool entry_valid = owned_trace_values != nullptr &&
+        entry.local_dof >= 0 && entry.local_dof < graph.local_trace_dofs &&
+        entry.local_true_dof >= 0 &&
+        entry.local_true_dof < graph.true_trace_dofs;
+    owned_trace_seed_valid = entry_valid && owned_trace_seed_valid;
+    if (entry_valid)
+    {
+      owned_trace_values[entry.local_true_dof] =
+          current_trace[entry.local_dof];
+    }
+  }
+  for (int owned = 0;
+       owned_trace_values != nullptr && owned < graph.true_trace_dofs;
+       ++owned)
+  {
+    owned_trace_seed_valid = std::isfinite(owned_trace_values[owned]) &&
+        owned_trace_seed_valid;
+  }
+  if (!CollectiveAll(graph, owned_trace_seed_valid, evidence.telemetry))
+  {
+    return false;
+  }
   refreshed_trace = std::numeric_limits<double>::quiet_NaN();
   if (!graph.exchange_plan.Distribute(*graph.trace_space, owned_trace,
                                       refreshed_trace))
   {
     return false;
   }
+  bool refreshed_trace_valid = true;
+  int first_invalid_refreshed_trace = -1;
+  double first_invalid_refreshed_value = 0.0;
+  double first_invalid_expected_value = 0.0;
+  double maximum_refreshed_trace_difference = 0.0;
   for (int local = 0; local < graph.local_trace_dofs; ++local)
   {
     const double value = refreshed_trace[local];
-    if (!std::isfinite(value) ||
-        std::abs(value - current_trace[local]) > 1.0e-12)
+    const double difference = std::abs(value - current_trace[local]);
+    const bool valid = std::isfinite(value) && difference <= 1.0e-12;
+    if (!valid && first_invalid_refreshed_trace < 0)
     {
-      return false;
+      first_invalid_refreshed_trace = local;
+      first_invalid_refreshed_value = value;
+      first_invalid_expected_value = current_trace[local];
     }
-    current_trace[local] = value;
+    refreshed_trace_valid = valid && refreshed_trace_valid;
+    maximum_refreshed_trace_difference = std::max(
+        maximum_refreshed_trace_difference, difference);
+    if (valid) { current_trace[local] = value; }
+  }
+  if (!refreshed_trace_valid)
+  {
+    mfem::err << "HDG_EULER_DEVICE_FULL_MPI_REFRESH_FAILURE"
+              << " rank=" << graph.rank << " p=" << p << " N=" << N
+              << " local=" << first_invalid_refreshed_trace
+              << " value=" << first_invalid_refreshed_value
+              << " expected=" << first_invalid_expected_value
+              << " max_difference=" << maximum_refreshed_trace_difference
+              << '\n';
+  }
+  if (!CollectiveAll(graph, refreshed_trace_valid, evidence.telemetry))
+  {
+    return false;
   }
   for (int owned = 0; owned < graph.true_trace_dofs; ++owned)
   {
