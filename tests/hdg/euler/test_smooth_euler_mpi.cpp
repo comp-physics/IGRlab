@@ -9,8 +9,11 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -24,6 +27,11 @@ using dg::hdg::euler::SmoothEulerMPIFailureInjection;
 using dg::hdg::euler::SmoothEulerMPIFailurePoint;
 using dg::hdg::euler::SmoothEulerMPILinearization;
 using dg::hdg::euler::SmoothEulerMPIStatus;
+using dg::hdg::euler::ExperimentStatus;
+using dg::hdg::euler::ConvergenceEvidence;
+using dg::hdg::euler::SmoothEulerExperiment;
+using dg::hdg::euler::SolvedMeshEvidence;
+using dg::hdg::euler::TrialAuditSnapshot;
 using dg::hdg::Ownership;
 using dg::hdg::trace::TraceMapEntry;
 
@@ -57,6 +65,15 @@ bool Finite(const std::vector<double>& values)
 {
   return std::all_of(values.begin(), values.end(),
                      [](const double value) { return Finite(value); });
+}
+
+bool GlobalAll(MPI_Comm communicator, const bool local)
+{
+  int local_value = local ? 1 : 0;
+  int global_value = 0;
+  MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN,
+                communicator);
+  return global_value == 1;
 }
 
 double Pressure(const State& state)
@@ -215,12 +232,12 @@ struct OracleSystem
   std::vector<int> signed_trace_dofs;
 };
 
-bool AssembleOracle(mfem::ParMesh& mesh,
-                    mfem::ParFiniteElementSpace& interior_space,
-                    mfem::ParFiniteElementSpace& trace_space,
-                    const mfem::ParGridFunction& old_interior,
-                    const mfem::ParGridFunction& current_interior,
-                    const mfem::ParGridFunction& current_trace,
+bool AssembleOracle(mfem::Mesh& mesh,
+                    mfem::FiniteElementSpace& interior_space,
+                    mfem::FiniteElementSpace& trace_space,
+                    const mfem::GridFunction& old_interior,
+                    const mfem::GridFunction& current_interior,
+                    const mfem::GridFunction& current_trace,
                     const int polynomial_order, OracleSystem& oracle)
 {
   OracleSystem next;
@@ -703,78 +720,115 @@ bool AssembleGlobalOracle(
     const std::vector<double>& reduced_rhs, GlobalOracle& oracle)
 {
   GlobalOracle next;
-  if (map.dofs.global_true_dof_count <= 0 ||
-      map.dofs.global_true_dof_count > std::numeric_limits<int>::max())
+  const long long local_global_size = static_cast<long long>(
+      map.dofs.global_true_dof_count);
+  long long minimum_global_size = 0;
+  long long maximum_global_size = 0;
+  MPI_Allreduce(&local_global_size, &minimum_global_size, 1,
+                MPI_LONG_LONG_INT, MPI_MIN, communicator);
+  MPI_Allreduce(&local_global_size, &maximum_global_size, 1,
+                MPI_LONG_LONG_INT, MPI_MAX, communicator);
+  bool local_ok = local_global_size > 0 &&
+      local_global_size <= std::numeric_limits<int>::max() &&
+      minimum_global_size == maximum_global_size && local.elements > 0 &&
+      local.nt > 0 &&
+      local.signed_trace_dofs.size() ==
+          static_cast<std::size_t>(local.elements) * local.nt &&
+      schur.size() == static_cast<std::size_t>(local.elements) * local.nt *
+          local.nt &&
+      reduced_rhs.size() ==
+          static_cast<std::size_t>(local.elements) * local.nt &&
+      map.dofs.entries.size() > 0;
+  if (!GlobalAll(communicator, local_ok))
   {
     return false;
   }
-  next.size = static_cast<int>(map.dofs.global_true_dof_count);
-  std::vector<double> local_matrix(
-      static_cast<std::size_t>(next.size) * next.size, 0.0);
-  std::vector<double> local_rhs(static_cast<std::size_t>(next.size), 0.0);
-  for (int element = 0; element < local.elements; ++element)
-    for (int row = 0; row < local.nt; ++row)
-    {
-      double row_sign = 1.0;
-      const int local_row = Decode(local.signed_trace_dofs[
-          static_cast<std::size_t>(element) * local.nt + row], row_sign);
-      if (local_row < 0 ||
-          static_cast<std::size_t>(local_row) >= map.dofs.entries.size())
+  next.size = static_cast<int>(local_global_size);
+  std::vector<double> local_matrix;
+  std::vector<double> local_rhs;
+  try
+  {
+    local_matrix.assign(
+        static_cast<std::size_t>(next.size) * next.size, 0.0);
+    local_rhs.assign(static_cast<std::size_t>(next.size), 0.0);
+    for (int element = 0; element < local.elements; ++element)
+      for (int row = 0; row < local.nt; ++row)
       {
-        return false;
-      }
-      const std::int64_t global_row =
-          map.dofs.entries[static_cast<std::size_t>(local_row)].global_true_dof;
-      local_rhs[static_cast<std::size_t>(global_row)] += row_sign *
-          reduced_rhs[static_cast<std::size_t>(element) * local.nt + row];
-      for (int column = 0; column < local.nt; ++column)
-      {
-        double column_sign = 1.0;
-        const int local_column = Decode(local.signed_trace_dofs[
-            static_cast<std::size_t>(element) * local.nt + column],
-            column_sign);
-        if (local_column < 0 ||
-            static_cast<std::size_t>(local_column) >= map.dofs.entries.size())
+        double row_sign = 1.0;
+        const int local_row = Decode(local.signed_trace_dofs[
+            static_cast<std::size_t>(element) * local.nt + row], row_sign);
+        local_ok = local_row >= 0 &&
+            static_cast<std::size_t>(local_row) < map.dofs.entries.size();
+        if (!local_ok) { break; }
+        const std::int64_t global_row = map.dofs.entries[
+            static_cast<std::size_t>(local_row)].global_true_dof;
+        local_ok = global_row >= 0 && global_row < next.size;
+        if (!local_ok) { break; }
+        local_rhs[static_cast<std::size_t>(global_row)] += row_sign *
+            reduced_rhs[static_cast<std::size_t>(element) * local.nt + row];
+        for (int column = 0; column < local.nt; ++column)
         {
-          return false;
+          double column_sign = 1.0;
+          const int local_column = Decode(local.signed_trace_dofs[
+              static_cast<std::size_t>(element) * local.nt + column],
+              column_sign);
+          local_ok = local_column >= 0 &&
+              static_cast<std::size_t>(local_column) <
+                  map.dofs.entries.size();
+          if (!local_ok) { break; }
+          const std::int64_t global_column = map.dofs.entries[
+              static_cast<std::size_t>(local_column)].global_true_dof;
+          local_ok = global_column >= 0 && global_column < next.size;
+          if (!local_ok) { break; }
+          local_matrix[static_cast<std::size_t>(global_row) * next.size +
+                       global_column] += row_sign * column_sign * schur[
+              static_cast<std::size_t>(element) * local.nt * local.nt +
+              static_cast<std::size_t>(row) * local.nt + column];
         }
-        const std::int64_t global_column = map.dofs.entries[
-            static_cast<std::size_t>(local_column)].global_true_dof;
-        local_matrix[static_cast<std::size_t>(global_row) * next.size +
-                     global_column] += row_sign * column_sign * schur[
-            static_cast<std::size_t>(element) * local.nt * local.nt +
-            static_cast<std::size_t>(row) * local.nt + column];
+        if (!local_ok) { break; }
       }
-    }
-  next.matrix.resize(local_matrix.size());
-  next.right_hand_side.resize(local_rhs.size());
+    next.matrix.resize(local_matrix.size());
+    next.right_hand_side.resize(local_rhs.size());
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  if (!GlobalAll(communicator, local_ok)) { return false; }
+
   MPI_Allreduce(local_matrix.data(), next.matrix.data(),
                 static_cast<int>(local_matrix.size()), MPI_DOUBLE, MPI_SUM,
                 communicator);
   MPI_Allreduce(local_rhs.data(), next.right_hand_side.data(), next.size,
                 MPI_DOUBLE, MPI_SUM, communicator);
-  LUFactorization factorization;
-  if (!factorization.Factor(next.matrix.data(), next.size) ||
-      !factorization.Solve(next.right_hand_side, next.solution))
+  try
   {
-    return false;
-  }
-  next.probe.resize(static_cast<std::size_t>(next.size));
-  next.probe_action.assign(static_cast<std::size_t>(next.size), 0.0);
-  for (int row = 0; row < next.size; ++row)
-  {
-    next.probe[static_cast<std::size_t>(row)] =
-        0.25 + std::sin(0.01 * static_cast<double>(row + 1));
-  }
-  for (int row = 0; row < next.size; ++row)
-  {
-    for (int column = 0; column < next.size; ++column)
+    LUFactorization factorization;
+    local_ok = factorization.Factor(next.matrix.data(), next.size) &&
+        factorization.Solve(next.right_hand_side, next.solution);
+    next.probe.resize(static_cast<std::size_t>(next.size));
+    next.probe_action.assign(static_cast<std::size_t>(next.size), 0.0);
+    for (int row = 0; row < next.size; ++row)
     {
-      next.probe_action[static_cast<std::size_t>(row)] +=
-          next.matrix[static_cast<std::size_t>(row) * next.size + column] *
-          next.probe[static_cast<std::size_t>(column)];
+      next.probe[static_cast<std::size_t>(row)] =
+          0.25 + std::sin(0.01 * static_cast<double>(row + 1));
     }
+    for (int row = 0; row < next.size; ++row)
+      for (int column = 0; column < next.size; ++column)
+      {
+        next.probe_action[static_cast<std::size_t>(row)] +=
+            next.matrix[static_cast<std::size_t>(row) * next.size + column] *
+            next.probe[static_cast<std::size_t>(column)];
+      }
+    local_ok = local_ok && Finite(next.matrix) &&
+        Finite(next.right_hand_side) && Finite(next.solution) &&
+        Finite(next.probe) && Finite(next.probe_action);
   }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  if (!GlobalAll(communicator, local_ok)) { return false; }
   oracle = std::move(next);
   return true;
 }
@@ -908,41 +962,61 @@ std::uint64_t EvidenceHash(const SmoothEulerMPIEvidence& evidence)
 double GlobalNorm(MPI_Comm communicator, const OracleSystem& system,
                   const dg::hdg::trace::DGInterfaceTraceMap& map)
 {
-  if (map.dofs.global_true_dof_count <= 0 ||
-      map.dofs.global_true_dof_count > std::numeric_limits<int>::max() ||
-      map.dofs.entries.empty() ||
-      system.residual_trace.size() != system.signed_trace_dofs.size())
+  const long long local_global_size = static_cast<long long>(
+      map.dofs.global_true_dof_count);
+  long long minimum_global_size = 0;
+  long long maximum_global_size = 0;
+  MPI_Allreduce(&local_global_size, &minimum_global_size, 1,
+                MPI_LONG_LONG_INT, MPI_MIN, communicator);
+  MPI_Allreduce(&local_global_size, &maximum_global_size, 1,
+                MPI_LONG_LONG_INT, MPI_MAX, communicator);
+  bool local_ok = local_global_size > 0 &&
+      local_global_size <= std::numeric_limits<int>::max() &&
+      minimum_global_size == maximum_global_size &&
+      !map.dofs.entries.empty() &&
+      system.residual_trace.size() == system.signed_trace_dofs.size();
+  if (!GlobalAll(communicator, local_ok))
   {
     return std::numeric_limits<double>::infinity();
   }
-  std::vector<double> local_trace(map.dofs.entries.size(), 0.0);
-  for (std::size_t local = 0; local < system.residual_trace.size(); ++local)
+  const int global_size = static_cast<int>(local_global_size);
+  std::vector<double> local_trace;
+  std::vector<double> local_global_trace;
+  std::vector<double> global_trace;
+  try
   {
-    double sign = 1.0;
-    const int dof = Decode(system.signed_trace_dofs[local], sign);
-    if (dof < 0 || static_cast<std::size_t>(dof) >= local_trace.size())
+    local_trace.assign(map.dofs.entries.size(), 0.0);
+    local_global_trace.assign(static_cast<std::size_t>(global_size), 0.0);
+    global_trace.assign(local_global_trace.size(), 0.0);
+    for (std::size_t local = 0; local < system.residual_trace.size(); ++local)
     {
-      return std::numeric_limits<double>::infinity();
+      double sign = 1.0;
+      const int dof = Decode(system.signed_trace_dofs[local], sign);
+      local_ok = dof >= 0 &&
+          static_cast<std::size_t>(dof) < local_trace.size();
+      if (!local_ok) { break; }
+      local_trace[static_cast<std::size_t>(dof)] +=
+          sign * system.residual_trace[local];
     }
-    local_trace[static_cast<std::size_t>(dof)] +=
-        sign * system.residual_trace[local];
+    for (const TraceMapEntry& entry : map.dofs.entries)
+    {
+      local_ok = entry.local_dof >= 0 &&
+          static_cast<std::size_t>(entry.local_dof) < local_trace.size() &&
+          entry.global_true_dof >= 0 &&
+          entry.global_true_dof < global_size;
+      if (!local_ok) { break; }
+      local_global_trace[static_cast<std::size_t>(entry.global_true_dof)] +=
+          local_trace[static_cast<std::size_t>(entry.local_dof)];
+    }
   }
-  const int global_size =
-      static_cast<int>(map.dofs.global_true_dof_count);
-  std::vector<double> local_global_trace(
-      static_cast<std::size_t>(global_size), 0.0);
-  for (const TraceMapEntry& entry : map.dofs.entries)
+  catch (const std::exception&)
   {
-    if (entry.local_dof < 0 ||
-        static_cast<std::size_t>(entry.local_dof) >= local_trace.size() ||
-        entry.global_true_dof < 0 || entry.global_true_dof >= global_size)
-    {
-      return std::numeric_limits<double>::infinity();
-    }
-    local_global_trace[static_cast<std::size_t>(entry.global_true_dof)] +=
-        local_trace[static_cast<std::size_t>(entry.local_dof)];
+    local_ok = false;
   }
-  std::vector<double> global_trace(local_global_trace.size(), 0.0);
+  if (!GlobalAll(communicator, local_ok))
+  {
+    return std::numeric_limits<double>::infinity();
+  }
   MPI_Allreduce(local_global_trace.data(), global_trace.data(), global_size,
                 MPI_DOUBLE, MPI_SUM, communicator);
   double local = 0.0;
@@ -959,19 +1033,1123 @@ double GlobalNorm(MPI_Comm communicator, const OracleSystem& system,
   return std::sqrt(global);
 }
 
+constexpr long long coordinate_scale = 1000000000000LL;
+
+long long CoordinateBin(const double coordinate)
+{
+  double periodic = std::fmod(coordinate, 1.0);
+  if (periodic < 0.0) { periodic += 1.0; }
+  if (std::abs(periodic) <= 1.0e-11 ||
+      std::abs(periodic - 1.0) <= 1.0e-11)
+  {
+    periodic = 0.0;
+  }
+  return std::llround(periodic * static_cast<double>(coordinate_scale));
+}
+
+struct CoordinateKey
+{
+  long long x = -1;
+  long long y = -1;
+  int component = -1;
+
+  bool operator<(const CoordinateKey& other) const noexcept
+  {
+    return std::tie(x, y, component) <
+        std::tie(other.x, other.y, other.component);
+  }
+
+  bool operator==(const CoordinateKey& other) const noexcept
+  {
+    return x == other.x && y == other.y && component == other.component;
+  }
+};
+
+struct ElementDofKey
+{
+  long long element_x = -1;
+  long long element_y = -1;
+  CoordinateKey dof{};
+
+  bool operator<(const ElementDofKey& other) const noexcept
+  {
+    return std::tie(element_x, element_y, dof.x, dof.y, dof.component) <
+        std::tie(other.element_x, other.element_y, other.dof.x, other.dof.y,
+                 other.dof.component);
+  }
+};
+
+bool ElementCoordinate(mfem::Mesh& mesh, const int element,
+                       long long& x, long long& y)
+{
+  mfem::ElementTransformation* const transformation =
+      mesh.GetElementTransformation(element);
+  if (transformation == nullptr) { return false; }
+  mfem::IntegrationPoint center;
+  center.x = 0.5;
+  center.y = 0.5;
+  mfem::Vector physical(dimension);
+  transformation->Transform(center, physical);
+  x = CoordinateBin(physical[0]);
+  y = CoordinateBin(physical[1]);
+  return true;
+}
+
+bool BuildElementDofKeys(
+    mfem::Mesh& mesh, mfem::FiniteElementSpace& interior_space,
+    mfem::FiniteElementSpace& trace_space,
+    std::vector<std::vector<ElementDofKey>>& interior_keys,
+    std::vector<std::vector<ElementDofKey>>& trace_keys)
+{
+  interior_keys.clear();
+  trace_keys.clear();
+  try
+  {
+    interior_keys.resize(static_cast<std::size_t>(mesh.GetNE()));
+    trace_keys.resize(static_cast<std::size_t>(mesh.GetNE()));
+    for (int element = 0; element < mesh.GetNE(); ++element)
+    {
+      long long element_x = -1;
+      long long element_y = -1;
+      if (!ElementCoordinate(mesh, element, element_x, element_y))
+      {
+        return false;
+      }
+      const mfem::FiniteElement* const interior_element =
+          interior_space.GetFE(element);
+      mfem::ElementTransformation* const element_transformation =
+          mesh.GetElementTransformation(element);
+      if (interior_element == nullptr || element_transformation == nullptr)
+      {
+        return false;
+      }
+      const int interior_scalar_dofs = interior_element->GetDof();
+      auto& element_interior =
+          interior_keys[static_cast<std::size_t>(element)];
+      element_interior.resize(
+          static_cast<std::size_t>(components) * interior_scalar_dofs);
+      const mfem::IntegrationRule& interior_nodes =
+          interior_element->GetNodes();
+      for (int scalar = 0; scalar < interior_scalar_dofs; ++scalar)
+      {
+        mfem::Vector physical(dimension);
+        element_transformation->Transform(interior_nodes.IntPoint(scalar),
+                                          physical);
+        for (int component = 0; component < components; ++component)
+        {
+          element_interior[static_cast<std::size_t>(
+              Index(scalar, interior_scalar_dofs, component))] =
+              {element_x, element_y,
+               {CoordinateBin(physical[0]), CoordinateBin(physical[1]),
+                component}};
+        }
+      }
+
+      mfem::Array<int> faces, orientations;
+      mesh.GetElementEdges(element, faces, orientations);
+      auto& element_trace = trace_keys[static_cast<std::size_t>(element)];
+      for (int local_face = 0; local_face < faces.Size(); ++local_face)
+      {
+        const int face = faces[local_face];
+        const mfem::FiniteElement* const trace_element =
+            trace_space.GetFaceElement(face);
+        mfem::ElementTransformation* const face_transformation =
+            mesh.GetFaceTransformation(face);
+        if (trace_element == nullptr || face_transformation == nullptr)
+        {
+          return false;
+        }
+        const int trace_scalar_dofs = trace_element->GetDof();
+        const mfem::IntegrationRule& trace_nodes = trace_element->GetNodes();
+        const std::size_t face_offset = element_trace.size();
+        element_trace.resize(face_offset +
+            static_cast<std::size_t>(components) * trace_scalar_dofs);
+        for (int scalar = 0; scalar < trace_scalar_dofs; ++scalar)
+        {
+          mfem::Vector physical(dimension);
+          face_transformation->Transform(trace_nodes.IntPoint(scalar),
+                                         physical);
+          for (int component = 0; component < components; ++component)
+          {
+            element_trace[face_offset + static_cast<std::size_t>(
+                Index(scalar, trace_scalar_dofs, component))] =
+                {element_x, element_y,
+                 {CoordinateBin(physical[0]), CoordinateBin(physical[1]),
+                  component}};
+          }
+        }
+      }
+    }
+  }
+  catch (const std::exception&)
+  {
+    return false;
+  }
+  return true;
+}
+
+bool BuildGridDofKeys(mfem::Mesh& mesh, mfem::FiniteElementSpace& space,
+                      const bool trace_space,
+                      std::vector<CoordinateKey>& keys)
+{
+  keys.assign(static_cast<std::size_t>(space.GetVSize()), {});
+  std::vector<int> census(keys.size(), 0);
+  try
+  {
+    if (trace_space)
+    {
+      for (int face = 0; face < mesh.GetNumFaces(); ++face)
+      {
+        const mfem::FiniteElement* const finite_element =
+            space.GetFaceElement(face);
+        mfem::ElementTransformation* const transformation =
+            mesh.GetFaceTransformation(face);
+        if (finite_element == nullptr || transformation == nullptr)
+        {
+          return false;
+        }
+        const int scalar_dofs = finite_element->GetDof();
+        const mfem::IntegrationRule& nodes = finite_element->GetNodes();
+        mfem::Array<int> vdofs;
+        space.GetFaceVDofs(face, vdofs);
+        if (vdofs.Size() != components * scalar_dofs) { return false; }
+        for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+        {
+          mfem::Vector physical(dimension);
+          transformation->Transform(nodes.IntPoint(scalar), physical);
+          for (int component = 0; component < components; ++component)
+          {
+            double sign = 1.0;
+            const int dof = Decode(
+                vdofs[Index(scalar, scalar_dofs, component)], sign);
+            if (dof < 0 || static_cast<std::size_t>(dof) >= keys.size())
+            {
+              return false;
+            }
+            const CoordinateKey key{CoordinateBin(physical[0]),
+                                    CoordinateBin(physical[1]), component};
+            if (census[static_cast<std::size_t>(dof)] > 0 &&
+                !(keys[static_cast<std::size_t>(dof)] == key))
+            {
+              return false;
+            }
+            keys[static_cast<std::size_t>(dof)] = key;
+            ++census[static_cast<std::size_t>(dof)];
+          }
+        }
+      }
+    }
+    else
+    {
+      for (int element = 0; element < mesh.GetNE(); ++element)
+      {
+        const mfem::FiniteElement* const finite_element =
+            space.GetFE(element);
+        mfem::ElementTransformation* const transformation =
+            mesh.GetElementTransformation(element);
+        if (finite_element == nullptr || transformation == nullptr)
+        {
+          return false;
+        }
+        const int scalar_dofs = finite_element->GetDof();
+        const mfem::IntegrationRule& nodes = finite_element->GetNodes();
+        mfem::Array<int> vdofs;
+        space.GetElementVDofs(element, vdofs);
+        if (vdofs.Size() != components * scalar_dofs) { return false; }
+        for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+        {
+          mfem::Vector physical(dimension);
+          transformation->Transform(nodes.IntPoint(scalar), physical);
+          for (int component = 0; component < components; ++component)
+          {
+            double sign = 1.0;
+            const int dof = Decode(
+                vdofs[Index(scalar, scalar_dofs, component)], sign);
+            if (dof < 0 || static_cast<std::size_t>(dof) >= keys.size())
+            {
+              return false;
+            }
+            const CoordinateKey key{CoordinateBin(physical[0]),
+                                    CoordinateBin(physical[1]), component};
+            keys[static_cast<std::size_t>(dof)] = key;
+            ++census[static_cast<std::size_t>(dof)];
+          }
+        }
+      }
+    }
+  }
+  catch (const std::exception&)
+  {
+    return false;
+  }
+  return std::all_of(census.begin(), census.end(),
+                     [](const int count) { return count > 0; });
+}
+
+double EntryError(const double actual, const double expected)
+{
+  if (!Finite(actual) || !Finite(expected))
+  {
+    return std::numeric_limits<double>::infinity();
+  }
+  return std::abs(actual - expected) / std::max(1.0, std::abs(expected));
+}
+
+State PerturbedConservative(const double x, const double y)
+{
+  State primitive = ManufacturedPrimitive(x, y);
+  const double psi_one = std::sin(2.0 * oracle_pi * x) *
+      std::cos(2.0 * oracle_pi * y);
+  const double psi_two = std::cos(2.0 * oracle_pi * x) *
+      std::sin(2.0 * oracle_pi * y);
+  const double psi_three = std::sin(2.0 * oracle_pi * (x + y));
+  primitive[0] *= 1.0 + 0.04 * psi_one;
+  primitive[1] += 0.03 * psi_two;
+  primitive[2] -= 0.03 * psi_one;
+  primitive[3] *= 1.0 + 0.04 * psi_three;
+  return PrimitiveToConservative(primitive);
+}
+
+struct OwnerRefreshResult
+{
+  bool passed = false;
+  bool staging_ok = false;
+  bool exact_owner_bytes = false;
+  bool exact_ghost_bytes = false;
+  bool coordinate_values_ok = false;
+  int owner_values = 0;
+  int ghost_values = 0;
+  double owner_value_error = std::numeric_limits<double>::infinity();
+  double ghost_value_error = std::numeric_limits<double>::infinity();
+  double coordinate_value_error = std::numeric_limits<double>::infinity();
+};
+
+OwnerRefreshResult CheckOwnerRefreshedInitialTrace(
+    MPI_Comm communicator, mfem::ParMesh& mesh,
+    mfem::ParFiniteElementSpace& trace_space,
+    const dg::hdg::trace::DGInterfaceTraceMap& map,
+    const SmoothEulerMPIEvidence& evidence)
+{
+  OwnerRefreshResult result;
+  std::unique_ptr<mfem::ParGridFunction> projected;
+  std::unique_ptr<mfem::ParGridFunction> redistributed;
+  mfem::Vector owned_true;
+  std::vector<CoordinateKey> trace_keys;
+  bool local_ok = false;
+  try
+  {
+    projected = std::make_unique<mfem::ParGridFunction>(&trace_space);
+    redistributed = std::make_unique<mfem::ParGridFunction>(&trace_space);
+    local_ok = Assign(*projected, evidence.entry_trace) &&
+        BuildGridDofKeys(mesh, trace_space, true, trace_keys) &&
+        map.dofs.entries.size() == trace_keys.size();
+    if (local_ok)
+    {
+      owned_true.SetSize(trace_space.GetTrueVSize());
+      projected->ParallelProject(owned_true);
+      *redistributed = std::numeric_limits<double>::quiet_NaN();
+      local_ok = Finite(Values(owned_true));
+    }
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  result.staging_ok = local_ok;
+  if (!GlobalAll(communicator, local_ok)) { return result; }
+
+  try
+  {
+    redistributed->Distribute(owned_true);
+    local_ok = Finite(Values(*redistributed));
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  if (!GlobalAll(communicator, local_ok)) { return result; }
+
+  bool owner_bytes = true;
+  bool ghost_bytes = true;
+  double owner_error = 0.0;
+  double ghost_error = 0.0;
+  double coordinate_error = 0.0;
+  try
+  {
+    const double* const projected_values = projected->HostRead();
+    const double* const redistributed_values = redistributed->HostRead();
+    const double* const true_values = owned_true.HostRead();
+    local_ok = projected_values != nullptr && redistributed_values != nullptr &&
+        (true_values != nullptr || owned_true.Size() == 0);
+    for (const TraceMapEntry& entry : map.dofs.entries)
+    {
+      if (!local_ok || entry.local_dof < 0 ||
+          static_cast<std::size_t>(entry.local_dof) >= trace_keys.size())
+      {
+        local_ok = false;
+        break;
+      }
+      const int local_dof = entry.local_dof;
+      const double projected_value = projected_values[local_dof];
+      const double redistributed_value = redistributed_values[local_dof];
+      const bool byte_equal = std::memcmp(&projected_value,
+                                          &redistributed_value,
+                                          sizeof(double)) == 0;
+      const double exchange_error =
+          EntryError(redistributed_value, projected_value);
+      if (entry.ownership == Ownership::owned)
+      {
+        ++result.owner_values;
+        owner_bytes = owner_bytes && byte_equal &&
+            entry.local_true_dof >= 0 &&
+            entry.local_true_dof < owned_true.Size();
+        if (entry.local_true_dof >= 0 &&
+            entry.local_true_dof < owned_true.Size())
+        {
+          owner_bytes = owner_bytes &&
+              std::memcmp(&projected_value,
+                          true_values + entry.local_true_dof,
+                          sizeof(double)) == 0;
+        }
+        owner_error = std::max(owner_error, exchange_error);
+      }
+      else
+      {
+        ++result.ghost_values;
+        ghost_bytes = ghost_bytes && byte_equal;
+        ghost_error = std::max(ghost_error, exchange_error);
+      }
+      const CoordinateKey& key =
+          trace_keys[static_cast<std::size_t>(local_dof)];
+      const double x = static_cast<double>(key.x) /
+          static_cast<double>(coordinate_scale);
+      const double y = static_cast<double>(key.y) /
+          static_cast<double>(coordinate_scale);
+      const State expected = PerturbedConservative(x, y);
+      local_ok = key.component >= 0 && key.component < components && local_ok;
+      if (key.component >= 0 && key.component < components)
+      {
+        coordinate_error = std::max(
+            coordinate_error,
+            EntryError(projected_value, expected[key.component]));
+      }
+    }
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  result.exact_owner_bytes = owner_bytes;
+  result.exact_ghost_bytes = ghost_bytes;
+  result.owner_value_error = owner_error;
+  result.ghost_value_error = ghost_error;
+  result.coordinate_value_error = coordinate_error;
+  result.coordinate_values_ok = coordinate_error <= state_tolerance;
+  result.passed = local_ok && result.staging_ok && result.exact_owner_bytes &&
+      result.exact_ghost_bytes && result.coordinate_values_ok &&
+      result.owner_values == trace_space.GetTrueVSize();
+  return result;
+}
+
+struct SerialParityResult
+{
+  bool passed = false;
+  bool serial_truth_ok = false;
+  bool coordinate_keys_ok = false;
+  bool assembly_ok = false;
+  bool condensation_ok = false;
+  bool action_rhs_ok = false;
+  bool trace_solution_ok = false;
+  bool recovery_ok = false;
+  bool state_ok = false;
+  bool status_ok = false;
+  int matched_elements = 0;
+  double residual_error = std::numeric_limits<double>::infinity();
+  double jacobian_error = std::numeric_limits<double>::infinity();
+  double condensation_error = std::numeric_limits<double>::infinity();
+  double matrix_error = std::numeric_limits<double>::infinity();
+  double action_error = std::numeric_limits<double>::infinity();
+  double right_hand_side_error = std::numeric_limits<double>::infinity();
+  double trace_solution_error = std::numeric_limits<double>::infinity();
+  double recovery_error = std::numeric_limits<double>::infinity();
+  double state_error = std::numeric_limits<double>::infinity();
+};
+
+double CoordinateProbe(const CoordinateKey& key)
+{
+  const double x = static_cast<double>(key.x) /
+      static_cast<double>(coordinate_scale);
+  const double y = static_cast<double>(key.y) /
+      static_cast<double>(coordinate_scale);
+  return 0.31 + 0.17 * x + 0.23 * y + 0.07 * key.component +
+      0.013 * x * y;
+}
+
+SerialParityResult CheckSerialParity(
+    MPI_Comm communicator, const int polynomial_order,
+    mfem::ParMesh& parallel_mesh,
+    mfem::ParFiniteElementSpace& parallel_interior_space,
+    mfem::ParFiniteElementSpace& parallel_trace_space,
+    const dg::hdg::trace::DGInterfaceTraceMap& parallel_map,
+    const SmoothEulerMPIEvidence& mpi_evidence)
+{
+  SerialParityResult result;
+  ConvergenceEvidence serial_ladder;
+  std::unique_ptr<SmoothEulerExperiment> serial_truth;
+  std::unique_ptr<SmoothEulerExperiment> serial_graph;
+  const SolvedMeshEvidence* serial_solved = nullptr;
+  const TrialAuditSnapshot* accepted_trial = nullptr;
+  mfem::Mesh* serial_mesh = nullptr;
+  mfem::FiniteElementSpace* serial_interior_space = nullptr;
+  mfem::FiniteElementSpace* serial_trace_space = nullptr;
+  bool local_ok = false;
+  try
+  {
+    serial_truth = std::make_unique<SmoothEulerExperiment>(polynomial_order);
+    local_ok = serial_truth->RunConvergenceLadder(serial_ladder) &&
+        serial_ladder.status == ExperimentStatus::Success &&
+        serial_ladder.solves[0].elements_per_direction == 3 &&
+        serial_ladder.solves[0].status == ExperimentStatus::Success &&
+        serial_ladder.solves[0].has_linear_audit;
+    if (local_ok)
+    {
+      serial_solved = &serial_ladder.solves[0];
+      for (const TrialAuditSnapshot& audit : serial_solved->trial_audits)
+        if (audit.nonlinear_iteration == 0 && audit.accepted)
+        {
+          accepted_trial = &audit;
+          break;
+        }
+      local_ok = accepted_trial != nullptr;
+    }
+    serial_graph = std::make_unique<SmoothEulerExperiment>(polynomial_order);
+    local_ok = serial_graph->BuildPeriodicMesh(3) &&
+        serial_graph->ProjectOldStage() && local_ok;
+    if (local_ok)
+    {
+      serial_trace_space = const_cast<mfem::FiniteElementSpace*>(
+          serial_graph->trace_space());
+      serial_interior_space = const_cast<mfem::FiniteElementSpace*>(
+          serial_graph->current_interior()->FESpace());
+      serial_mesh = serial_trace_space == nullptr ? nullptr :
+          serial_trace_space->GetMesh();
+      local_ok = serial_mesh != nullptr && serial_interior_space != nullptr &&
+          serial_trace_space != nullptr;
+    }
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  result.serial_truth_ok = local_ok;
+  if (!GlobalAll(communicator, local_ok)) { return result; }
+
+  std::vector<std::vector<ElementDofKey>> parallel_interior_element_keys;
+  std::vector<std::vector<ElementDofKey>> parallel_trace_element_keys;
+  std::vector<std::vector<ElementDofKey>> serial_interior_element_keys;
+  std::vector<std::vector<ElementDofKey>> serial_trace_element_keys;
+  std::vector<CoordinateKey> parallel_interior_keys;
+  std::vector<CoordinateKey> parallel_trace_keys;
+  std::vector<CoordinateKey> serial_interior_keys;
+  std::vector<CoordinateKey> serial_trace_keys;
+  try
+  {
+    local_ok = BuildElementDofKeys(
+        parallel_mesh, parallel_interior_space, parallel_trace_space,
+        parallel_interior_element_keys, parallel_trace_element_keys) &&
+        BuildElementDofKeys(
+            *serial_mesh, *serial_interior_space, *serial_trace_space,
+            serial_interior_element_keys, serial_trace_element_keys) &&
+        BuildGridDofKeys(parallel_mesh, parallel_interior_space, false,
+                         parallel_interior_keys) &&
+        BuildGridDofKeys(parallel_mesh, parallel_trace_space, true,
+                         parallel_trace_keys) &&
+        BuildGridDofKeys(*serial_mesh, *serial_interior_space, false,
+                         serial_interior_keys) &&
+        BuildGridDofKeys(*serial_mesh, *serial_trace_space, true,
+                         serial_trace_keys);
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  result.coordinate_keys_ok = local_ok;
+  if (!GlobalAll(communicator, local_ok)) { return result; }
+
+  std::map<ElementDofKey, std::size_t> serial_interior_slots;
+  std::map<ElementDofKey, std::size_t> serial_trace_slots;
+  OracleSystem serial_all_elements;
+  std::vector<double> serial_schur;
+  std::vector<double> serial_reduced_rhs;
+  double residual_error = 0.0;
+  double jacobian_error = 0.0;
+  double condensation_error = 0.0;
+  int local_matched_elements = 0;
+  try
+  {
+    const int serial_elements = static_cast<int>(
+        serial_interior_element_keys.size());
+    const int serial_ni = mpi_evidence.linearization.interior_dofs;
+    const int serial_nt = mpi_evidence.linearization.trace_dofs;
+    mfem::GridFunction serial_current_interior(serial_interior_space);
+    mfem::GridFunction serial_current_trace(serial_trace_space);
+    std::vector<double> serial_interior_values(serial_interior_keys.size(),
+                                               0.0);
+    std::vector<double> serial_trace_values(serial_trace_keys.size(), 0.0);
+    for (std::size_t dof = 0; dof < serial_interior_keys.size(); ++dof)
+    {
+      const CoordinateKey& key = serial_interior_keys[dof];
+      const State state = PerturbedConservative(
+          static_cast<double>(key.x) / coordinate_scale,
+          static_cast<double>(key.y) / coordinate_scale);
+      local_ok = key.component >= 0 && key.component < components;
+      if (!local_ok) { break; }
+      serial_interior_values[dof] = state[key.component];
+    }
+    for (std::size_t dof = 0;
+         dof < serial_trace_keys.size() && local_ok; ++dof)
+    {
+      const CoordinateKey& key = serial_trace_keys[dof];
+      const State state = PerturbedConservative(
+          static_cast<double>(key.x) / coordinate_scale,
+          static_cast<double>(key.y) / coordinate_scale);
+      local_ok = key.component >= 0 && key.component < components;
+      if (!local_ok) { break; }
+      serial_trace_values[dof] = state[key.component];
+    }
+    local_ok = local_ok && Assign(serial_current_interior,
+                                  serial_interior_values) &&
+        Assign(serial_current_trace, serial_trace_values) &&
+        AssembleOracle(*serial_mesh, *serial_interior_space,
+                       *serial_trace_space, *serial_graph->old_interior(),
+                       serial_current_interior, serial_current_trace,
+                       polynomial_order, serial_all_elements) &&
+        CondenseOracle(serial_all_elements, serial_schur,
+                       serial_reduced_rhs);
+    local_ok = local_ok && serial_elements == 9 && serial_ni > 0 &&
+        serial_nt > 0 && serial_all_elements.elements == serial_elements &&
+        serial_all_elements.ni == serial_ni &&
+        serial_all_elements.nt == serial_nt;
+    for (int element = 0; element < serial_elements && local_ok; ++element)
+    {
+      local_ok = serial_interior_element_keys[
+                     static_cast<std::size_t>(element)].size() ==
+              static_cast<std::size_t>(serial_ni) &&
+          serial_trace_element_keys[
+              static_cast<std::size_t>(element)].size() ==
+              static_cast<std::size_t>(serial_nt);
+      for (int local = 0; local < serial_ni && local_ok; ++local)
+      {
+        local_ok = serial_interior_slots.emplace(
+            serial_interior_element_keys[static_cast<std::size_t>(element)]
+                                        [static_cast<std::size_t>(local)],
+            static_cast<std::size_t>(element) * serial_ni + local).second;
+      }
+      for (int local = 0; local < serial_nt && local_ok; ++local)
+      {
+        local_ok = serial_trace_slots.emplace(
+            serial_trace_element_keys[static_cast<std::size_t>(element)]
+                                     [static_cast<std::size_t>(local)],
+            static_cast<std::size_t>(element) * serial_nt + local).second;
+      }
+    }
+
+    const int local_elements = mpi_evidence.linearization.local_elements;
+    local_ok = local_ok && local_elements == parallel_mesh.GetNE() &&
+        mpi_evidence.linearization.residual_interior.size() ==
+            static_cast<std::size_t>(local_elements) * serial_ni &&
+        mpi_evidence.linearization.residual_trace.size() ==
+            static_cast<std::size_t>(local_elements) * serial_nt;
+    for (int element = 0; element < local_elements && local_ok; ++element)
+    {
+      const auto& interior =
+          parallel_interior_element_keys[static_cast<std::size_t>(element)];
+      const auto& trace =
+          parallel_trace_element_keys[static_cast<std::size_t>(element)];
+      local_ok = interior.size() == static_cast<std::size_t>(serial_ni) &&
+          trace.size() == static_cast<std::size_t>(serial_nt);
+      std::vector<int> serial_interior_local(
+          static_cast<std::size_t>(serial_ni), -1);
+      std::vector<int> serial_trace_local(
+          static_cast<std::size_t>(serial_nt), -1);
+      int serial_element = -1;
+      for (int row = 0; row < serial_ni && local_ok; ++row)
+      {
+        const auto found = serial_interior_slots.find(
+            interior[static_cast<std::size_t>(row)]);
+        local_ok = found != serial_interior_slots.end();
+        if (local_ok)
+        {
+          const int found_element =
+              static_cast<int>(found->second) / serial_ni;
+          serial_element = serial_element < 0 ? found_element : serial_element;
+          local_ok = found_element == serial_element;
+          serial_interior_local[static_cast<std::size_t>(row)] =
+              static_cast<int>(found->second) % serial_ni;
+          residual_error = std::max(
+              residual_error,
+              EntryError(
+                  mpi_evidence.linearization.residual_interior[
+                      static_cast<std::size_t>(element) * serial_ni + row],
+                  serial_all_elements.residual_interior[found->second]));
+        }
+      }
+      for (int row = 0; row < serial_nt && local_ok; ++row)
+      {
+        const auto found = serial_trace_slots.find(
+            trace[static_cast<std::size_t>(row)]);
+        local_ok = found != serial_trace_slots.end();
+        if (local_ok)
+        {
+          const int found_element =
+              static_cast<int>(found->second) / serial_nt;
+          serial_element = serial_element < 0 ? found_element : serial_element;
+          local_ok = found_element == serial_element;
+          serial_trace_local[static_cast<std::size_t>(row)] =
+              static_cast<int>(found->second) % serial_nt;
+          residual_error = std::max(
+              residual_error,
+              EntryError(
+                  mpi_evidence.linearization.residual_trace[
+                      static_cast<std::size_t>(element) * serial_nt + row],
+                  serial_all_elements.residual_trace[found->second]));
+        }
+      }
+      if (local_ok)
+      {
+        ++local_matched_elements;
+        for (int row = 0; row < serial_ni && local_ok; ++row)
+          for (int column = 0; column < serial_ni; ++column)
+          {
+            const int serial_row =
+                serial_interior_local[static_cast<std::size_t>(row)];
+            const int serial_column =
+                serial_interior_local[static_cast<std::size_t>(column)];
+            jacobian_error = std::max(
+                jacobian_error,
+                EntryError(
+                    mpi_evidence.linearization.a[
+                        static_cast<std::size_t>(element) * serial_ni *
+                            serial_ni +
+                        static_cast<std::size_t>(row) * serial_ni + column],
+                    serial_all_elements.a[
+                        static_cast<std::size_t>(serial_element) * serial_ni *
+                            serial_ni +
+                        static_cast<std::size_t>(serial_row) * serial_ni +
+                        serial_column]));
+          }
+        for (int row = 0; row < serial_ni && local_ok; ++row)
+          for (int column = 0; column < serial_nt; ++column)
+          {
+            const int serial_row =
+                serial_interior_local[static_cast<std::size_t>(row)];
+            const int serial_column =
+                serial_trace_local[static_cast<std::size_t>(column)];
+            jacobian_error = std::max(
+                jacobian_error,
+                EntryError(
+                    mpi_evidence.linearization.b[
+                        static_cast<std::size_t>(element) * serial_ni *
+                            serial_nt +
+                        static_cast<std::size_t>(row) * serial_nt + column],
+                    serial_all_elements.b[
+                        static_cast<std::size_t>(serial_element) * serial_ni *
+                            serial_nt +
+                        static_cast<std::size_t>(serial_row) * serial_nt +
+                        serial_column]));
+          }
+        for (int row = 0; row < serial_nt && local_ok; ++row)
+          for (int column = 0; column < serial_ni; ++column)
+          {
+            const int serial_row =
+                serial_trace_local[static_cast<std::size_t>(row)];
+            const int serial_column =
+                serial_interior_local[static_cast<std::size_t>(column)];
+            jacobian_error = std::max(
+                jacobian_error,
+                EntryError(
+                    mpi_evidence.linearization.c[
+                        static_cast<std::size_t>(element) * serial_nt *
+                            serial_ni +
+                        static_cast<std::size_t>(row) * serial_ni + column],
+                    serial_all_elements.c[
+                        static_cast<std::size_t>(serial_element) * serial_nt *
+                            serial_ni +
+                        static_cast<std::size_t>(serial_row) * serial_ni +
+                        serial_column]));
+          }
+        for (int row = 0; row < serial_nt && local_ok; ++row)
+          for (int column = 0; column < serial_nt; ++column)
+          {
+            const int serial_row =
+                serial_trace_local[static_cast<std::size_t>(row)];
+            const int serial_column =
+                serial_trace_local[static_cast<std::size_t>(column)];
+            jacobian_error = std::max(
+                jacobian_error,
+                EntryError(
+                    mpi_evidence.linearization.d[
+                        static_cast<std::size_t>(element) * serial_nt *
+                            serial_nt +
+                        static_cast<std::size_t>(row) * serial_nt + column],
+                    serial_all_elements.d[
+                        static_cast<std::size_t>(serial_element) * serial_nt *
+                            serial_nt +
+                        static_cast<std::size_t>(serial_row) * serial_nt +
+                        serial_column]));
+          }
+        for (int row = 0; row < serial_nt && local_ok; ++row)
+        {
+          const int serial_row =
+              serial_trace_local[static_cast<std::size_t>(row)];
+          condensation_error = std::max(
+              condensation_error,
+              EntryError(
+                  mpi_evidence.condensation.right_hand_side[
+                      static_cast<std::size_t>(element) * serial_nt + row],
+                  serial_reduced_rhs[
+                      static_cast<std::size_t>(serial_element) * serial_nt +
+                      serial_row]));
+          for (int column = 0; column < serial_nt; ++column)
+          {
+            const int serial_column =
+                serial_trace_local[static_cast<std::size_t>(column)];
+            condensation_error = std::max(
+                condensation_error,
+                EntryError(
+                    mpi_evidence.condensation.schur[
+                        static_cast<std::size_t>(element) * serial_nt *
+                            serial_nt +
+                        static_cast<std::size_t>(row) * serial_nt + column],
+                    serial_schur[
+                        static_cast<std::size_t>(serial_element) * serial_nt *
+                            serial_nt +
+                        static_cast<std::size_t>(serial_row) * serial_nt +
+                        serial_column]));
+          }
+        }
+      }
+    }
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  int global_matched_elements = 0;
+  MPI_Allreduce(&local_matched_elements, &global_matched_elements,
+                1, MPI_INT, MPI_SUM, communicator);
+  result.matched_elements = global_matched_elements;
+  result.residual_error = residual_error;
+  result.jacobian_error = jacobian_error;
+  result.condensation_error = condensation_error;
+  result.assembly_ok = local_ok && residual_error <= local_tolerance &&
+      jacobian_error <= local_tolerance && global_matched_elements == 9;
+  result.condensation_ok = local_ok &&
+      condensation_error <= local_tolerance &&
+      global_matched_elements == 9;
+  if (!GlobalAll(communicator, local_ok)) { return result; }
+
+  const int global_trace_size = static_cast<int>(
+      parallel_map.dofs.global_true_dof_count);
+  std::vector<long long> local_global_x;
+  std::vector<long long> local_global_y;
+  std::vector<int> local_global_component;
+  std::vector<long long> global_x;
+  std::vector<long long> global_y;
+  std::vector<int> global_component;
+  try
+  {
+    local_ok = global_trace_size > 0 &&
+        serial_solved->linear_audit.rows == global_trace_size &&
+        mpi_evidence.local_true_trace_dofs ==
+            parallel_trace_space.GetTrueVSize();
+    local_global_x.assign(static_cast<std::size_t>(global_trace_size), -1);
+    local_global_y.assign(static_cast<std::size_t>(global_trace_size), -1);
+    local_global_component.assign(
+        static_cast<std::size_t>(global_trace_size), -1);
+    global_x.resize(local_global_x.size());
+    global_y.resize(local_global_y.size());
+    global_component.resize(local_global_component.size());
+    for (const TraceMapEntry& entry : parallel_map.dofs.entries)
+      if (entry.ownership == Ownership::owned)
+      {
+        local_ok = entry.local_dof >= 0 &&
+            static_cast<std::size_t>(entry.local_dof) <
+                parallel_trace_keys.size() && entry.global_true_dof >= 0 &&
+            entry.global_true_dof < global_trace_size && local_ok;
+        if (local_ok)
+        {
+          const CoordinateKey& key = parallel_trace_keys[
+              static_cast<std::size_t>(entry.local_dof)];
+          local_global_x[static_cast<std::size_t>(entry.global_true_dof)] =
+              key.x;
+          local_global_y[static_cast<std::size_t>(entry.global_true_dof)] =
+              key.y;
+          local_global_component[
+              static_cast<std::size_t>(entry.global_true_dof)] = key.component;
+        }
+      }
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  if (!GlobalAll(communicator, local_ok)) { return result; }
+  MPI_Allreduce(local_global_x.data(), global_x.data(), global_trace_size,
+                MPI_LONG_LONG_INT, MPI_MAX, communicator);
+  MPI_Allreduce(local_global_y.data(), global_y.data(), global_trace_size,
+                MPI_LONG_LONG_INT, MPI_MAX, communicator);
+  MPI_Allreduce(local_global_component.data(), global_component.data(),
+                global_trace_size, MPI_INT, MPI_MAX, communicator);
+
+  std::map<CoordinateKey, int> serial_trace_lookup;
+  std::map<CoordinateKey, int> serial_interior_lookup;
+  std::vector<int> serial_column_for_global(
+      static_cast<std::size_t>(global_trace_size), -1);
+  std::vector<double> serial_dense;
+  double matrix_error = 0.0;
+  double action_error = 0.0;
+  double rhs_error = 0.0;
+  double solution_error = 0.0;
+  double recovery_error = 0.0;
+  double state_error = 0.0;
+  try
+  {
+    for (int dof = 0; dof < static_cast<int>(serial_trace_keys.size()); ++dof)
+    {
+      local_ok = serial_trace_lookup.emplace(
+          serial_trace_keys[static_cast<std::size_t>(dof)], dof).second &&
+          local_ok;
+    }
+    for (int dof = 0;
+         dof < static_cast<int>(serial_interior_keys.size()); ++dof)
+    {
+      local_ok = serial_interior_lookup.emplace(
+          serial_interior_keys[static_cast<std::size_t>(dof)], dof).second &&
+          local_ok;
+    }
+    for (int global = 0; global < global_trace_size; ++global)
+    {
+      const CoordinateKey key{
+          global_x[static_cast<std::size_t>(global)],
+          global_y[static_cast<std::size_t>(global)],
+          global_component[static_cast<std::size_t>(global)]};
+      const auto found = serial_trace_lookup.find(key);
+      local_ok = found != serial_trace_lookup.end() && local_ok;
+      if (found != serial_trace_lookup.end())
+      {
+        serial_column_for_global[static_cast<std::size_t>(global)] =
+            found->second;
+      }
+    }
+
+    const auto& linear = serial_solved->linear_audit;
+    local_ok = linear.row_offsets.size() ==
+            static_cast<std::size_t>(linear.rows + 1) &&
+        linear.right_hand_side.size() == static_cast<std::size_t>(linear.rows) &&
+        linear.trace_increment.size() == static_cast<std::size_t>(linear.rows) &&
+        local_ok;
+    serial_dense.assign(
+        static_cast<std::size_t>(linear.rows) * linear.rows, 0.0);
+    for (int row = 0; row < linear.rows && local_ok; ++row)
+    {
+      local_ok = linear.row_offsets[static_cast<std::size_t>(row)] >= 0 &&
+          linear.row_offsets[static_cast<std::size_t>(row)] <=
+              linear.row_offsets[static_cast<std::size_t>(row + 1)] &&
+          linear.row_offsets[static_cast<std::size_t>(row + 1)] <=
+              static_cast<int>(linear.values.size()) &&
+          linear.values.size() == linear.columns.size();
+      for (int entry = linear.row_offsets[static_cast<std::size_t>(row)];
+           entry < linear.row_offsets[static_cast<std::size_t>(row + 1)] &&
+           local_ok; ++entry)
+      {
+        const int column = linear.columns[static_cast<std::size_t>(entry)];
+        local_ok = column >= 0 && column < linear.rows;
+        if (local_ok)
+        {
+          serial_dense[static_cast<std::size_t>(row) * linear.rows + column] =
+              linear.values[static_cast<std::size_t>(entry)];
+        }
+      }
+    }
+
+    for (const TraceMapEntry& entry : parallel_map.dofs.entries)
+      if (entry.ownership == Ownership::owned && local_ok)
+      {
+        const int row_global = static_cast<int>(entry.global_true_dof);
+        const int serial_row =
+            serial_column_for_global[static_cast<std::size_t>(row_global)];
+        local_ok = entry.local_true_dof >= 0 &&
+            entry.local_true_dof < parallel_trace_space.GetTrueVSize() &&
+            serial_row >= 0 && serial_row < linear.rows;
+        if (!local_ok) { break; }
+        rhs_error = std::max(
+            rhs_error,
+            EntryError(
+                mpi_evidence.true_right_hand_side[
+                    static_cast<std::size_t>(entry.local_true_dof)],
+                linear.right_hand_side[static_cast<std::size_t>(serial_row)]));
+        solution_error = std::max(
+            solution_error,
+            EntryError(
+                mpi_evidence.true_trace_increment[
+                    static_cast<std::size_t>(entry.local_true_dof)],
+                linear.trace_increment[static_cast<std::size_t>(serial_row)]));
+        double mpi_action = 0.0;
+        double serial_action = 0.0;
+        for (int column_global = 0; column_global < global_trace_size;
+             ++column_global)
+        {
+          const int serial_column = serial_column_for_global[
+              static_cast<std::size_t>(column_global)];
+          const CoordinateKey column_key{
+              global_x[static_cast<std::size_t>(column_global)],
+              global_y[static_cast<std::size_t>(column_global)],
+              global_component[static_cast<std::size_t>(column_global)]};
+          const double probe = CoordinateProbe(column_key);
+          const double mpi_entry = mpi_evidence.true_basis_actions[
+              static_cast<std::size_t>(column_global) *
+                  parallel_trace_space.GetTrueVSize() +
+              entry.local_true_dof];
+          const double serial_entry = serial_dense[
+              static_cast<std::size_t>(serial_row) * linear.rows +
+              serial_column];
+          matrix_error = std::max(
+              matrix_error, EntryError(mpi_entry, serial_entry));
+          mpi_action += mpi_entry * probe;
+          serial_action += serial_entry * probe;
+        }
+        action_error = std::max(
+            action_error, EntryError(mpi_action, serial_action));
+      }
+
+    std::vector<double> parallel_recovery_grid(
+        static_cast<std::size_t>(parallel_interior_space.GetVSize()), 0.0);
+    std::vector<int> recovery_census(parallel_recovery_grid.size(), 0);
+    for (int element = 0; element < parallel_mesh.GetNE() && local_ok;
+         ++element)
+    {
+      mfem::Array<int> vdofs;
+      parallel_interior_space.GetElementVDofs(element, vdofs);
+      local_ok = vdofs.Size() == mpi_evidence.linearization.interior_dofs;
+      for (int local = 0; local < vdofs.Size() && local_ok; ++local)
+      {
+        double sign = 1.0;
+        const int dof = Decode(vdofs[local], sign);
+        local_ok = dof >= 0 &&
+            static_cast<std::size_t>(dof) < parallel_recovery_grid.size();
+        if (local_ok)
+        {
+          parallel_recovery_grid[static_cast<std::size_t>(dof)] = sign *
+              mpi_evidence.recovered_interior_increment[
+                  static_cast<std::size_t>(element) * vdofs.Size() + local];
+          ++recovery_census[static_cast<std::size_t>(dof)];
+        }
+      }
+    }
+    local_ok = std::all_of(
+        recovery_census.begin(), recovery_census.end(),
+        [](const int count) { return count == 1; }) && local_ok;
+    for (int local_dof = 0;
+         local_dof < parallel_interior_space.GetVSize() && local_ok;
+         ++local_dof)
+    {
+      const auto found = serial_interior_lookup.find(
+          parallel_interior_keys[static_cast<std::size_t>(local_dof)]);
+      local_ok = found != serial_interior_lookup.end();
+      if (!local_ok) { break; }
+      const std::size_t serial_dof = static_cast<std::size_t>(found->second);
+      recovery_error = std::max(
+          recovery_error,
+          EntryError(parallel_recovery_grid[static_cast<std::size_t>(local_dof)],
+                     accepted_trial->delta_interior[serial_dof]));
+      state_error = std::max(
+          state_error,
+          EntryError(mpi_evidence.entry_interior[
+                         static_cast<std::size_t>(local_dof)],
+                     accepted_trial->base_interior[serial_dof]));
+      state_error = std::max(
+          state_error,
+          EntryError(mpi_evidence.final_interior[
+                         static_cast<std::size_t>(local_dof)],
+                     accepted_trial->trial_interior[serial_dof]));
+    }
+    for (int local_dof = 0;
+         local_dof < parallel_trace_space.GetVSize() && local_ok;
+         ++local_dof)
+    {
+      const auto found = serial_trace_lookup.find(
+          parallel_trace_keys[static_cast<std::size_t>(local_dof)]);
+      local_ok = found != serial_trace_lookup.end();
+      if (!local_ok) { break; }
+      const std::size_t serial_dof = static_cast<std::size_t>(found->second);
+      recovery_error = std::max(
+          recovery_error,
+          EntryError(mpi_evidence.distributed_trace_increment[
+                         static_cast<std::size_t>(local_dof)],
+                     accepted_trial->delta_trace[serial_dof]));
+      state_error = std::max(
+          state_error,
+          EntryError(mpi_evidence.entry_trace[
+                         static_cast<std::size_t>(local_dof)],
+                     accepted_trial->base_trace[serial_dof]));
+      state_error = std::max(
+          state_error,
+          EntryError(mpi_evidence.final_trace[
+                         static_cast<std::size_t>(local_dof)],
+                     accepted_trial->trial_trace[serial_dof]));
+    }
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  result.matrix_error = matrix_error;
+  result.action_error = action_error;
+  result.right_hand_side_error = rhs_error;
+  result.trace_solution_error = solution_error;
+  result.recovery_error = recovery_error;
+  result.state_error = state_error;
+  result.action_rhs_ok = local_ok && matrix_error <= local_tolerance &&
+      action_error <= local_tolerance && rhs_error <= local_tolerance;
+  result.trace_solution_ok = local_ok &&
+      solution_error <= state_tolerance;
+  result.recovery_ok = local_ok && recovery_error <= state_tolerance;
+  result.state_ok = local_ok && state_error <= state_tolerance &&
+      EntryError(mpi_evidence.damping, accepted_trial->alpha) == 0.0;
+  result.status_ok = local_ok &&
+      serial_solved->status == ExperimentStatus::Success &&
+      serial_solved->newton.status == ExperimentStatus::Success &&
+      accepted_trial->accepted && accepted_trial->generation_published &&
+      mpi_evidence.status == SmoothEulerMPIStatus::Success &&
+      mpi_evidence.passed;
+  result.passed = result.serial_truth_ok && result.coordinate_keys_ok &&
+      result.assembly_ok && result.condensation_ok && result.action_rhs_ok &&
+      result.trace_solution_ok && result.recovery_ok && result.state_ok &&
+      result.status_ok;
+  return result;
+}
+
 struct OrientationOracleResult
 {
   bool passed = false;
+  bool finite_element_permutation_ok = false;
+  bool actual_shared_reversal_ok = false;
+  bool wrong_permutation_rejected = false;
   int shared_faces = 0;
   int reversed_dofs = 0;
+  int actual_reversed_face_pairs = 0;
   double value_error = std::numeric_limits<double>::infinity();
   double action_error = std::numeric_limits<double>::infinity();
+  double wrong_value_error = 0.0;
+  double wrong_action_error = 0.0;
 };
 
 OrientationOracleResult CheckOrientationOracle(
-    mfem::ParMesh& mesh, mfem::ParFiniteElementSpace& trace_space,
+    MPI_Comm communicator, mfem::ParMesh& mesh,
+    mfem::ParFiniteElementSpace& trace_space,
     const dg::hdg::trace::DGInterfaceTraceMap& map,
-    const int polynomial_order, const int rank_count)
+    const int rank, const int polynomial_order, const int rank_count)
 {
   OrientationOracleResult result;
   const mfem::FiniteElementCollection* const collection = trace_space.FEColl();
@@ -981,129 +2159,261 @@ OrientationOracleResult CheckOrientationOracle(
   const int scalar_dofs = polynomial_order + 1;
   const int* const permutation = collection == nullptr ? nullptr :
       collection->DofOrderForOrientation(mfem::Geometry::SEGMENT, -1);
-  if (finite_element == nullptr || permutation == nullptr ||
-      finite_element->GetDof() != scalar_dofs)
-  {
-    return result;
-  }
-
-  bool valid = true;
-  for (int destination = 0; destination < scalar_dofs; ++destination)
+  bool valid = finite_element != nullptr && permutation != nullptr &&
+      (finite_element == nullptr || finite_element->GetDof() == scalar_dofs);
+  for (int destination = 0; destination < scalar_dofs && valid; ++destination)
   {
     valid = permutation[destination] == scalar_dofs - 1 - destination &&
         permutation[destination] >= 0 && valid;
     result.reversed_dofs += permutation[destination] != destination ? 1 : 0;
   }
+  result.finite_element_permutation_ok =
+      valid && result.reversed_dofs > 0;
   result.shared_faces = mesh.GetNSharedFaces();
-  valid = result.reversed_dofs > 0 &&
-      (rank_count == 1 ? result.shared_faces == 0 : result.shared_faces > 0) &&
-      valid;
-
-  std::vector<int> faces;
-  if (rank_count == 1)
+  std::vector<CoordinateKey> trace_keys;
+  std::vector<long long> local_records;
+  const int record_width = 3 + scalar_dofs;
+  try
   {
-    if (mesh.GetNumFaces() > 0) faces.push_back(0);
-  }
-  else
-  {
-    for (int shared = 0; shared < result.shared_faces; ++shared)
+    valid = BuildGridDofKeys(mesh, trace_space, true, trace_keys) &&
+        map.dofs.entries.size() == trace_keys.size() && valid;
+    for (int shared = 0; shared < result.shared_faces && valid; ++shared)
     {
-      faces.push_back(mesh.GetSharedFace(shared));
-    }
-  }
-  valid = !faces.empty() && valid;
-  result.value_error = 0.0;
-  result.action_error = 0.0;
-  for (const int face : faces)
-  {
-    mfem::Array<int> direct;
-    trace_space.GetFaceVDofs(face, direct);
-    const auto face_map = std::find_if(
-        map.faces.begin(), map.faces.end(),
-        [face](const dg::hdg::trace::DGInterfaceFaceMap& entry)
-        { return entry.local_face == face; });
-    valid = direct.Size() == components * scalar_dofs &&
-        face_map != map.faces.end() &&
-        (face_map == map.faces.end() ||
-         std::equal(direct.begin(), direct.end(),
-                    face_map->signed_local_vdofs.begin(),
-                    face_map->signed_local_vdofs.end())) && valid;
-
-    for (const double point : {0.07, 0.23, 0.61, 0.91})
-    {
-      mfem::IntegrationPoint forward_point;
-      mfem::IntegrationPoint reverse_point;
-      forward_point.x = point;
-      reverse_point.x = 1.0 - point;
-      mfem::Vector forward(scalar_dofs), reverse(scalar_dofs);
-      finite_element->CalcShape(forward_point, forward);
-      finite_element->CalcShape(reverse_point, reverse);
-      for (int component = 0; component < components; ++component)
+      const int face = mesh.GetSharedFace(shared);
+      const mfem::FiniteElement* const face_element =
+          trace_space.GetFaceElement(face);
+      mfem::ElementTransformation* const transformation =
+          mesh.GetFaceTransformation(face);
+      mfem::Array<int> vdofs;
+      trace_space.GetFaceVDofs(face, vdofs);
+      valid = face_element != nullptr && transformation != nullptr &&
+          face_element->GetDof() == scalar_dofs &&
+          vdofs.Size() == components * scalar_dofs && valid;
+      if (!valid) { break; }
+      mfem::IntegrationPoint center;
+      center.x = 0.5;
+      mfem::Vector physical(dimension);
+      transformation->Transform(center, physical);
+      local_records.push_back(rank);
+      local_records.push_back(CoordinateBin(physical[0]));
+      local_records.push_back(CoordinateBin(physical[1]));
+      for (int scalar = 0; scalar < scalar_dofs; ++scalar)
       {
-        std::vector<double> value(static_cast<std::size_t>(scalar_dofs), 0.0);
-        std::vector<double> reversed_value(value.size(), 0.0);
-        for (int dof = 0; dof < scalar_dofs; ++dof)
-        {
-          value[static_cast<std::size_t>(dof)] =
-              0.25 + 0.03 * component + 0.07 * dof;
-        }
-        for (int dof = 0; dof < scalar_dofs; ++dof)
-        {
-          reversed_value[static_cast<std::size_t>(dof)] =
-              value[static_cast<std::size_t>(permutation[dof])];
-        }
-        double forward_action = 0.0;
-        double reverse_action = 0.0;
-        for (int dof = 0; dof < scalar_dofs; ++dof)
-        {
-          forward_action += forward[dof] * reversed_value[
-              static_cast<std::size_t>(dof)];
-          reverse_action +=
-              reverse[dof] * value[static_cast<std::size_t>(dof)];
-        }
-        result.value_error = std::max(
-            result.value_error, std::abs(forward_action - reverse_action));
-
-        std::vector<double> action(value.size(), 0.0);
-        std::vector<double> reversed_action(value.size(), 0.0);
-        for (int row = 0; row < scalar_dofs; ++row)
-          for (int column = 0; column < scalar_dofs; ++column)
-          {
-            const double entry =
-                (row == column ? 2.0 : 0.0) +
-                0.01 * (row + 1) * (column + 2) + 0.001 * component;
-            action[static_cast<std::size_t>(row)] +=
-                entry * value[static_cast<std::size_t>(column)];
-            const double reversed_entry =
-                (permutation[row] == permutation[column] ? 2.0 : 0.0) +
-                0.01 * (permutation[row] + 1) *
-                    (permutation[column] + 2) + 0.001 * component;
-            reversed_action[static_cast<std::size_t>(row)] +=
-                reversed_entry *
-                reversed_value[static_cast<std::size_t>(column)];
-          }
-        for (int row = 0; row < scalar_dofs; ++row)
-        {
-          result.action_error = std::max(
-              result.action_error,
-              std::abs(reversed_action[static_cast<std::size_t>(row)] -
-                       action[static_cast<std::size_t>(permutation[row])]));
-        }
+        double sign = 1.0;
+        const int local_dof = Decode(
+            vdofs[Index(scalar, scalar_dofs, 0)], sign);
+        valid = local_dof >= 0 &&
+            static_cast<std::size_t>(local_dof) < map.dofs.entries.size() &&
+            valid;
+        if (!valid) { break; }
+        local_records.push_back(map.dofs.entries[
+            static_cast<std::size_t>(local_dof)].global_true_dof);
       }
     }
+    valid = valid && local_records.size() ==
+        static_cast<std::size_t>(result.shared_faces * record_width);
   }
-  result.passed = valid && result.value_error <= local_tolerance &&
+  catch (const std::exception&)
+  {
+    valid = false;
+  }
+  if (!GlobalAll(communicator, valid)) { return result; }
+
+  const int local_record_count = result.shared_faces;
+  std::vector<int> record_counts;
+  try
+  {
+    record_counts.assign(static_cast<std::size_t>(rank_count), 0);
+  }
+  catch (const std::exception&)
+  {
+    valid = false;
+  }
+  if (!GlobalAll(communicator, valid)) { return result; }
+  MPI_Allgather(&local_record_count, 1, MPI_INT, record_counts.data(), 1,
+                MPI_INT, communicator);
+  std::vector<int> value_counts;
+  std::vector<int> displacements;
+  std::vector<long long> records;
+  int total_records = 0;
+  try
+  {
+    value_counts.assign(record_counts.size(), 0);
+    displacements.assign(record_counts.size(), 0);
+    for (int process = 0; process < rank_count; ++process)
+    {
+      displacements[static_cast<std::size_t>(process)] =
+          total_records * record_width;
+      value_counts[static_cast<std::size_t>(process)] =
+          record_counts[static_cast<std::size_t>(process)] * record_width;
+      total_records += record_counts[static_cast<std::size_t>(process)];
+    }
+    records.assign(static_cast<std::size_t>(total_records) * record_width,
+                   -1);
+  }
+  catch (const std::exception&)
+  {
+    valid = false;
+  }
+  if (!GlobalAll(communicator, valid)) { return result; }
+  MPI_Allgatherv(local_records.data(),
+                 static_cast<int>(local_records.size()), MPI_LONG_LONG_INT,
+                 records.data(), value_counts.data(), displacements.data(),
+                 MPI_LONG_LONG_INT, communicator);
+
+  const long long local_global_size = static_cast<long long>(
+      map.dofs.global_true_dof_count);
+  long long minimum_global_size = 0;
+  long long maximum_global_size = 0;
+  MPI_Allreduce(&local_global_size, &minimum_global_size, 1,
+                MPI_LONG_LONG_INT, MPI_MIN, communicator);
+  MPI_Allreduce(&local_global_size, &maximum_global_size, 1,
+                MPI_LONG_LONG_INT, MPI_MAX, communicator);
+  valid = local_global_size > 0 &&
+      local_global_size <= std::numeric_limits<int>::max() &&
+      minimum_global_size == maximum_global_size && valid;
+  if (!GlobalAll(communicator, valid)) { return result; }
+  const int global_size = static_cast<int>(local_global_size);
+
+  result.value_error = 0.0;
+  result.action_error = 0.0;
+  for (int first = 0; first < total_records; ++first)
+    for (int second = first + 1; second < total_records; ++second)
+    {
+      const long long* const a = records.data() +
+          static_cast<std::size_t>(first) * record_width;
+      const long long* const b = records.data() +
+          static_cast<std::size_t>(second) * record_width;
+      if (a[0] == b[0] || a[1] != b[1] || a[2] != b[2]) { continue; }
+      bool reversed = true;
+      bool identical = true;
+      for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+      {
+        reversed = a[3 + scalar] ==
+            b[3 + scalar_dofs - 1 - scalar] && reversed;
+        identical = a[3 + scalar] == b[3 + scalar] && identical;
+      }
+      if (!reversed || identical) { continue; }
+      ++result.actual_reversed_face_pairs;
+      std::vector<int> a_for_peer(static_cast<std::size_t>(scalar_dofs), -1);
+      std::vector<int> peer_for_a(static_cast<std::size_t>(scalar_dofs), -1);
+      for (int a_index = 0; a_index < scalar_dofs; ++a_index)
+      {
+        valid = a[3 + a_index] >= 0 &&
+            a[3 + a_index] < global_size && valid;
+        if (!valid) { break; }
+        const auto peer = std::find(b + 3, b + 3 + scalar_dofs,
+                                    a[3 + a_index]);
+        valid = peer != b + 3 + scalar_dofs && valid;
+        if (!valid) { break; }
+        const int peer_index = static_cast<int>(peer - (b + 3));
+        peer_for_a[static_cast<std::size_t>(a_index)] = peer_index;
+        a_for_peer[static_cast<std::size_t>(peer_index)] = a_index;
+      }
+      std::vector<double> a_value(static_cast<std::size_t>(scalar_dofs), 0.0);
+      std::vector<double> peer_value(a_value.size(), 0.0);
+      std::vector<double> a_action(a_value.size(), 0.0);
+      std::vector<double> peer_action(a_value.size(), 0.0);
+      std::vector<double> wrong_action(a_value.size(), 0.0);
+      for (int index = 0; index < scalar_dofs && valid; ++index)
+      {
+        a_value[static_cast<std::size_t>(index)] =
+            0.27 + 0.09 * index + 0.017 * index * index;
+      }
+      for (int peer_index = 0; peer_index < scalar_dofs && valid;
+           ++peer_index)
+      {
+        const int a_index =
+            a_for_peer[static_cast<std::size_t>(peer_index)];
+        valid = a_index >= 0 && a_index < scalar_dofs;
+        if (valid)
+        {
+          peer_value[static_cast<std::size_t>(peer_index)] =
+              a_value[static_cast<std::size_t>(a_index)];
+        }
+      }
+      for (int row = 0; row < scalar_dofs && valid; ++row)
+        for (int column = 0; column < scalar_dofs; ++column)
+        {
+          const double entry = 0.41 + 0.13 * (row + 1) +
+              0.019 * (column + 1) * (column + 1) +
+              0.007 * (row + 1) * (column + 1);
+          a_action[static_cast<std::size_t>(row)] +=
+              entry * a_value[static_cast<std::size_t>(column)];
+        }
+      for (int peer_row = 0; peer_row < scalar_dofs && valid; ++peer_row)
+        for (int peer_column = 0; peer_column < scalar_dofs; ++peer_column)
+        {
+          const int a_row =
+              a_for_peer[static_cast<std::size_t>(peer_row)];
+          const int a_column =
+              a_for_peer[static_cast<std::size_t>(peer_column)];
+          valid = a_row >= 0 && a_column >= 0;
+          if (!valid) { break; }
+          const double transformed_entry =
+              0.41 + 0.13 * (a_row + 1) +
+              0.019 * (a_column + 1) * (a_column + 1) +
+              0.007 * (a_row + 1) * (a_column + 1);
+          const double wrong_entry = 0.41 + 0.13 * (peer_row + 1) +
+              0.019 * (peer_column + 1) * (peer_column + 1) +
+              0.007 * (peer_row + 1) * (peer_column + 1);
+          peer_action[static_cast<std::size_t>(peer_row)] +=
+              transformed_entry *
+              peer_value[static_cast<std::size_t>(peer_column)];
+          wrong_action[static_cast<std::size_t>(peer_row)] +=
+              wrong_entry * peer_value[static_cast<std::size_t>(peer_column)];
+        }
+      for (int a_index = 0; a_index < scalar_dofs && valid; ++a_index)
+      {
+        const int peer_index =
+            peer_for_a[static_cast<std::size_t>(a_index)];
+        result.value_error = std::max(
+            result.value_error,
+            EntryError(a_value[static_cast<std::size_t>(a_index)],
+                       peer_value[static_cast<std::size_t>(peer_index)]));
+        result.action_error = std::max(
+            result.action_error,
+            EntryError(a_action[static_cast<std::size_t>(a_index)],
+                       peer_action[static_cast<std::size_t>(peer_index)]));
+        result.wrong_value_error = std::max(
+            result.wrong_value_error,
+            EntryError(a_value[static_cast<std::size_t>(peer_index)],
+                       peer_value[static_cast<std::size_t>(peer_index)]));
+        result.wrong_action_error = std::max(
+            result.wrong_action_error,
+            EntryError(a_action[static_cast<std::size_t>(a_index)],
+                       wrong_action[static_cast<std::size_t>(peer_index)]));
+      }
+    }
+  result.actual_shared_reversal_ok = rank_count == 1 ?
+      result.shared_faces == 0 : result.actual_reversed_face_pairs > 0;
+  result.wrong_permutation_rejected = rank_count == 1 ||
+      (result.wrong_value_error > local_tolerance &&
+       result.wrong_action_error > local_tolerance);
+  result.passed = valid && result.finite_element_permutation_ok &&
+      result.actual_shared_reversal_ok &&
+      result.wrong_permutation_rejected &&
+      result.value_error <= local_tolerance &&
       result.action_error <= local_tolerance;
   return result;
 }
 
-bool GlobalAll(MPI_Comm communicator, const bool local)
+const char* FailurePointName(const SmoothEulerMPIFailurePoint point)
 {
-  int local_value = local ? 1 : 0;
-  int global_value = 0;
-  MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN,
-                communicator);
-  return global_value == 1;
+  switch (point)
+  {
+    case SmoothEulerMPIFailurePoint::None: return "None";
+    case SmoothEulerMPIFailurePoint::Assembly: return "Assembly";
+    case SmoothEulerMPIFailurePoint::Condensation: return "Condensation";
+    case SmoothEulerMPIFailurePoint::TrueAssembly: return "TrueAssembly";
+    case SmoothEulerMPIFailurePoint::TraceSolve: return "TraceSolve";
+    case SmoothEulerMPIFailurePoint::Distribution: return "Distribution";
+    case SmoothEulerMPIFailurePoint::Recovery: return "Recovery";
+    case SmoothEulerMPIFailurePoint::CandidateValidation:
+      return "CandidateValidation";
+    case SmoothEulerMPIFailurePoint::Commit: return "Commit";
+  }
+  return "Invalid";
 }
 
 bool CheckOneOrder(MPI_Comm communicator, const int rank,
@@ -1123,22 +2433,56 @@ bool CheckOneOrder(MPI_Comm communicator, const int rank,
       const_cast<mfem::ParFiniteElementSpace*>(experiment.trace_space());
   const auto* const map = experiment.trace_map();
   const mfem::ParGridFunction* const old_interior = experiment.old_interior();
-  if (mesh == nullptr || interior_space == nullptr || trace_space == nullptr ||
-      map == nullptr || old_interior == nullptr)
+  const bool graph_requirements_ok = mesh != nullptr &&
+      interior_space != nullptr && trace_space != nullptr && map != nullptr &&
+      old_interior != nullptr;
+  if (!GlobalAll(communicator, graph_requirements_ok))
   {
+    std::cerr << "FAIL requirement=graph rank=" << rank
+              << " ranks=" << rank_count << " p=" << polynomial_order
+              << " local_ok=" << graph_requirements_ok << '\n';
     return false;
   }
-  mfem::ParGridFunction entry_interior(interior_space);
-  mfem::ParGridFunction entry_trace(trace_space);
-  const bool entry_assignment_ok =
-      Assign(entry_interior, evidence.entry_interior) &&
-      Assign(entry_trace, evidence.entry_trace);
+  std::unique_ptr<mfem::ParGridFunction> entry_interior;
+  std::unique_ptr<mfem::ParGridFunction> entry_trace;
+  bool entry_assignment_ok = false;
+  try
+  {
+    entry_interior =
+        std::make_unique<mfem::ParGridFunction>(interior_space);
+    entry_trace = std::make_unique<mfem::ParGridFunction>(trace_space);
+    entry_assignment_ok = Assign(*entry_interior, evidence.entry_interior) &&
+        Assign(*entry_trace, evidence.entry_trace);
+  }
+  catch (const std::exception&)
+  {
+    entry_assignment_ok = false;
+  }
   passed = entry_assignment_ok && passed;
+  if (!GlobalAll(communicator, entry_assignment_ok))
+  {
+    std::cerr << "FAIL requirement=entry_assignment rank=" << rank
+              << " ranks=" << rank_count << " p=" << polynomial_order
+              << " local_ok=" << entry_assignment_ok << '\n';
+    return false;
+  }
+  const OwnerRefreshResult owner_refresh =
+      CheckOwnerRefreshedInitialTrace(
+          communicator, *mesh, *trace_space, *map, evidence);
+  const bool owner_refresh_ok = owner_refresh.passed;
+  passed = owner_refresh_ok && passed;
   OracleSystem local;
   const bool local_oracle_ok = AssembleOracle(
-      *mesh, *interior_space, *trace_space, *old_interior, entry_interior,
-      entry_trace, polynomial_order, local);
+      *mesh, *interior_space, *trace_space, *old_interior, *entry_interior,
+      *entry_trace, polynomial_order, local);
   passed = local_oracle_ok && passed;
+  if (!GlobalAll(communicator, local_oracle_ok))
+  {
+    std::cerr << "FAIL requirement=local_oracle_prerequisite rank=" << rank
+              << " ranks=" << rank_count << " p=" << polynomial_order
+              << " local_ok=" << local_oracle_ok << '\n';
+    return false;
+  }
   const double initial_residual = GlobalNorm(communicator, local, *map);
   const SmoothEulerMPILinearization& production = evidence.linearization;
   const bool linearization_ok =
@@ -1164,11 +2508,25 @@ bool CheckOneOrder(MPI_Comm communicator, const int rank,
       ScaledError(evidence.condensation.right_hand_side, reduced_rhs) <=
           local_tolerance;
   passed = condensation_ok && passed;
+  if (!GlobalAll(communicator, condensation_ok))
+  {
+    std::cerr << "FAIL requirement=condensation_prerequisite rank=" << rank
+              << " ranks=" << rank_count << " p=" << polynomial_order
+              << " local_ok=" << condensation_ok << '\n';
+    return false;
+  }
 
   GlobalOracle global;
   const bool global_oracle_ok = AssembleGlobalOracle(
       communicator, local, *map, schur, reduced_rhs, global);
   passed = global_oracle_ok && passed;
+  if (!GlobalAll(communicator, global_oracle_ok))
+  {
+    std::cerr << "FAIL requirement=global_oracle_prerequisite rank=" << rank
+              << " ranks=" << rank_count << " p=" << polynomial_order
+              << " local_ok=" << global_oracle_ok << '\n';
+    return false;
+  }
   std::vector<double> expected_local_rhs(
       static_cast<std::size_t>(trace_space->GetVSize()), 0.0);
   for (int element = 0; element < local.elements; ++element)
@@ -1335,16 +2693,39 @@ bool CheckOneOrder(MPI_Comm communicator, const int rank,
                   evidence.final_trace) == 0.0;
   passed = state_publication_ok && passed;
 
-  mfem::ParGridFunction final_interior(interior_space);
-  mfem::ParGridFunction final_trace(trace_space);
+  const SerialParityResult serial_parity = CheckSerialParity(
+      communicator, polynomial_order, *mesh, *interior_space, *trace_space,
+      *map, evidence);
+  const bool serial_parity_ok = serial_parity.passed;
+  passed = serial_parity_ok && passed;
+
+  std::unique_ptr<mfem::ParGridFunction> final_interior;
+  std::unique_ptr<mfem::ParGridFunction> final_trace;
   OracleSystem final_system;
-  const bool final_oracle_ok =
-      Assign(final_interior, evidence.final_interior) &&
-      Assign(final_trace, evidence.final_trace) &&
-      AssembleOracle(*mesh, *interior_space, *trace_space, *old_interior,
-                     final_interior, final_trace, polynomial_order,
-                     final_system);
+  bool final_oracle_ok = false;
+  try
+  {
+    final_interior =
+        std::make_unique<mfem::ParGridFunction>(interior_space);
+    final_trace = std::make_unique<mfem::ParGridFunction>(trace_space);
+    final_oracle_ok = Assign(*final_interior, evidence.final_interior) &&
+        Assign(*final_trace, evidence.final_trace) &&
+        AssembleOracle(*mesh, *interior_space, *trace_space, *old_interior,
+                       *final_interior, *final_trace, polynomial_order,
+                       final_system);
+  }
+  catch (const std::exception&)
+  {
+    final_oracle_ok = false;
+  }
   passed = final_oracle_ok && passed;
+  if (!GlobalAll(communicator, final_oracle_ok))
+  {
+    std::cerr << "FAIL requirement=final_oracle_prerequisite rank=" << rank
+              << " ranks=" << rank_count << " p=" << polynomial_order
+              << " local_ok=" << final_oracle_ok << '\n';
+    return false;
+  }
   const double final_residual = GlobalNorm(communicator, final_system, *map);
   const int local_negative_signed_trace_dofs =
       static_cast<int>(std::count_if(
@@ -1355,18 +2736,23 @@ bool CheckOneOrder(MPI_Comm communicator, const int rank,
                 &global_negative_signed_trace_dofs, 1, MPI_INT, MPI_SUM,
                 communicator);
   const OrientationOracleResult orientation = CheckOrientationOracle(
-      *mesh, *trace_space, *map, polynomial_order, rank_count);
-  const bool nonlinear_and_evidence_ok =
+      communicator, *mesh, *trace_space, *map, rank, polynomial_order,
+      rank_count);
+  const bool nonlinear_residual_ok =
       std::abs(final_residual - evidence.candidate_nonlinear_residual) /
           std::max(1.0, final_residual) <= local_tolerance &&
       std::abs(initial_residual - evidence.initial_nonlinear_residual) /
               std::max(1.0, initial_residual) <= local_tolerance &&
-      final_residual < evidence.initial_nonlinear_residual &&
+      final_residual < evidence.initial_nonlinear_residual;
+  const bool status_publication_ok =
       evidence.status == SmoothEulerMPIStatus::Success && evidence.passed &&
-      evidence.entry_generation == 1 && evidence.committed_generation == 2 &&
+      experiment.status() == SmoothEulerMPIStatus::Success;
+  const bool generation_publication_ok = evidence.entry_generation == 1 &&
+      evidence.committed_generation == 2 && experiment.generation() == 2;
+  const bool evidence_identity_ok =
       experiment.status() == SmoothEulerMPIStatus::Success &&
-      experiment.generation() == 2 && evidence.polynomial_order ==
-          polynomial_order && evidence.elements_per_direction == 3 &&
+      evidence.polynomial_order == polynomial_order &&
+      evidence.elements_per_direction == 3 &&
       evidence.ranks == rank_count && evidence.rank == rank &&
       evidence.global_elements == 9 &&
       evidence.owned_trace_dofs ==
@@ -1375,35 +2761,80 @@ bool CheckOneOrder(MPI_Comm communicator, const int rank,
       evidence.negative_signed_trace_dofs ==
           local_negative_signed_trace_dofs &&
       evidence.global_negative_signed_trace_dofs ==
-          global_negative_signed_trace_dofs &&
-      orientation.passed;
-  passed = nonlinear_and_evidence_ok && passed;
+          global_negative_signed_trace_dofs;
+  const bool orientation_requirements_ok = orientation.passed;
+  passed = nonlinear_residual_ok && status_publication_ok &&
+      generation_publication_ok && evidence_identity_ok &&
+      orientation_requirements_ok && passed;
 
-  std::vector<int> local_owners(static_cast<std::size_t>(global.size), 0);
-  for (const TraceMapEntry& entry : map->dofs.entries)
-    if (entry.ownership == Ownership::owned)
-    {
-      ++local_owners[static_cast<std::size_t>(entry.global_true_dof)];
-    }
-  std::vector<int> global_owners(local_owners.size(), 0);
+  std::vector<int> local_owners;
+  std::vector<int> global_owners;
+  bool owner_census_staging_ok = true;
+  try
+  {
+    local_owners.assign(static_cast<std::size_t>(global.size), 0);
+    global_owners.assign(local_owners.size(), 0);
+    for (const TraceMapEntry& entry : map->dofs.entries)
+      if (entry.ownership == Ownership::owned)
+      {
+        owner_census_staging_ok = entry.global_true_dof >= 0 &&
+            entry.global_true_dof < global.size && owner_census_staging_ok;
+        if (owner_census_staging_ok)
+        {
+          ++local_owners[static_cast<std::size_t>(entry.global_true_dof)];
+        }
+      }
+  }
+  catch (const std::exception&)
+  {
+    owner_census_staging_ok = false;
+  }
+  if (!GlobalAll(communicator, owner_census_staging_ok))
+  {
+    std::cerr << "FAIL requirement=ownership_census_staging rank=" << rank
+              << " ranks=" << rank_count << " p=" << polynomial_order
+              << " local_ok=" << owner_census_staging_ok << '\n';
+    return false;
+  }
   MPI_Allreduce(local_owners.data(), global_owners.data(), global.size,
                 MPI_INT, MPI_SUM, communicator);
-  const bool ownership_ok =
+  const bool single_owner_requirement_ok =
       std::all_of(global_owners.begin(), global_owners.end(),
-                  [](const int count) { return count == 1; }) &&
-      (rank_count == 1 ? evidence.global_ghost_trace_dofs == 0 :
-                         evidence.global_ghost_trace_dofs > 0) &&
-      (rank_count == 1 ? evidence.global_shared_faces == 0 :
-                         evidence.global_shared_faces > 0);
-  passed = ownership_ok && passed;
+                  [](const int count) { return count == 1; });
+  const bool ghost_census_requirement_ok = rank_count == 1 ?
+      evidence.global_ghost_trace_dofs == 0 :
+      evidence.global_ghost_trace_dofs > 0;
+  const bool shared_face_census_requirement_ok = rank_count == 1 ?
+      evidence.global_shared_faces == 0 :
+      evidence.global_shared_faces > 0;
+  passed = single_owner_requirement_ok && ghost_census_requirement_ok &&
+      shared_face_census_requirement_ok && owner_refresh_ok && passed;
 
-  const std::vector<double> rollback_interior =
-      Values(*experiment.current_interior());
-  const std::vector<double> rollback_trace = Values(*experiment.current_trace());
+  std::vector<double> rollback_interior;
+  std::vector<double> rollback_trace;
   const std::uint64_t rollback_generation = experiment.generation();
   const SmoothEulerMPIStatus rollback_status = experiment.status();
-  const std::uint64_t rollback_evidence_hash = EvidenceHash(experiment.evidence());
+  std::uint64_t rollback_evidence_hash = 0;
+  bool rollback_staging_ok = true;
+  try
+  {
+    rollback_interior = Values(*experiment.current_interior());
+    rollback_trace = Values(*experiment.current_trace());
+    rollback_evidence_hash = EvidenceHash(experiment.evidence());
+  }
+  catch (const std::exception&)
+  {
+    rollback_staging_ok = false;
+  }
+  if (!GlobalAll(communicator, rollback_staging_ok))
+  {
+    std::cerr << "FAIL requirement=rollback_staging rank=" << rank
+              << " ranks=" << rank_count << " p=" << polynomial_order
+              << " local_ok=" << rollback_staging_ok << '\n';
+    return false;
+  }
   bool rollback_ok = true;
+  int rollback_cases_exercised = 0;
   if (polynomial_order == 1)
   {
     const std::array<SmoothEulerMPIFailurePoint, 8> failure_points{{
@@ -1418,16 +2849,55 @@ bool CheckOneOrder(MPI_Comm communicator, const int rank,
     for (const SmoothEulerMPIFailurePoint point : failure_points)
       for (int failing_rank = 0; failing_rank < rank_count; ++failing_rank)
       {
-        const bool failed =
+        ++rollback_cases_exercised;
+        const bool return_requirement_ok =
             !experiment.Execute({point, failing_rank});
-        rollback_ok = failed &&
-            experiment.last_failure_point_reached() == point &&
-            experiment.generation() == rollback_generation &&
-            experiment.status() == rollback_status &&
-            EvidenceHash(experiment.evidence()) == rollback_evidence_hash &&
-            Values(*experiment.current_interior()) == rollback_interior &&
-            Values(*experiment.current_trace()) == rollback_trace &&
-            rollback_ok;
+        const bool phase_requirement_ok =
+            experiment.last_failure_point_reached() == point;
+        const bool generation_rollback_ok =
+            experiment.generation() == rollback_generation;
+        const bool status_rollback_ok =
+            experiment.status() == rollback_status;
+        bool evidence_byte_rollback_ok = false;
+        bool interior_byte_rollback_ok = false;
+        bool trace_byte_rollback_ok = false;
+        bool rollback_observation_ok = true;
+        try
+        {
+          evidence_byte_rollback_ok =
+              EvidenceHash(experiment.evidence()) == rollback_evidence_hash;
+          interior_byte_rollback_ok =
+              Values(*experiment.current_interior()) == rollback_interior;
+          trace_byte_rollback_ok =
+              Values(*experiment.current_trace()) == rollback_trace;
+        }
+        catch (const std::exception&)
+        {
+          rollback_observation_ok = false;
+        }
+        rollback_observation_ok =
+            GlobalAll(communicator, rollback_observation_ok);
+        const bool rollback_case_ok = return_requirement_ok &&
+            phase_requirement_ok && generation_rollback_ok &&
+            status_rollback_ok && evidence_byte_rollback_ok &&
+            interior_byte_rollback_ok && trace_byte_rollback_ok &&
+            rollback_observation_ok;
+        if (!rollback_case_ok)
+        {
+          std::cerr << "FAIL requirement=rollback rank=" << rank
+                    << " ranks=" << rank_count << " p=" << polynomial_order
+                    << " phase=" << FailurePointName(point)
+                    << " injected_rank=" << failing_rank
+                    << " return_ok=" << return_requirement_ok
+                    << " phase_reached_ok=" << phase_requirement_ok
+                    << " generation_ok=" << generation_rollback_ok
+                    << " status_ok=" << status_rollback_ok
+                    << " observation_ok=" << rollback_observation_ok
+                    << " evidence_bytes_ok=" << evidence_byte_rollback_ok
+                    << " interior_bytes_ok=" << interior_byte_rollback_ok
+                    << " trace_bytes_ok=" << trace_byte_rollback_ok << '\n';
+        }
+        rollback_ok = rollback_case_ok && rollback_ok;
       }
   }
   passed = rollback_ok && passed;
@@ -1441,26 +2911,70 @@ bool CheckOneOrder(MPI_Comm communicator, const int rank,
 
   if (!passed)
   {
-    std::cerr << "FAIL rank=" << rank << " ranks=" << rank_count
-              << " p=" << polynomial_order
-              << " setup_ok=" << setup_ok
-              << " entry_assignment_ok=" << entry_assignment_ok
-              << " local_oracle_ok=" << local_oracle_ok
-              << " linearization_ok=" << linearization_ok
-              << " condensation_ok=" << condensation_ok
-              << " global_oracle_ok=" << global_oracle_ok
-              << " local_rhs_ok=" << local_rhs_ok
-              << " true_system_ok=" << true_system_ok
-              << " distribution_ok=" << distribution_ok
-              << " recovery_ok=" << recovery_ok
-              << " state_publication_ok=" << state_publication_ok
-              << " final_oracle_ok=" << final_oracle_ok
-              << " nonlinear_and_evidence_ok="
-              << nonlinear_and_evidence_ok
-              << " ownership_ok=" << ownership_ok
-              << " rollback_ok=" << rollback_ok
-              << " damping_ok=" << damping_ok
-              << " local_error_R="
+    const auto report_requirement = [&](const char* name, const bool ok)
+    {
+      if (!ok)
+      {
+        std::cerr << "FAIL requirement=" << name << " rank=" << rank
+                  << " ranks=" << rank_count << " p=" << polynomial_order
+                  << '\n';
+      }
+    };
+    report_requirement("setup", setup_ok);
+    report_requirement("entry_assignment", entry_assignment_ok);
+    report_requirement("owner_refresh_staging", owner_refresh.staging_ok);
+    report_requirement("owner_refresh_owner_bytes",
+                       owner_refresh.exact_owner_bytes);
+    report_requirement("owner_refresh_ghost_bytes",
+                       owner_refresh.exact_ghost_bytes);
+    report_requirement("owner_refresh_coordinate_values",
+                       owner_refresh.coordinate_values_ok);
+    report_requirement("owner_refresh", owner_refresh_ok);
+    report_requirement("local_oracle", local_oracle_ok);
+    report_requirement("linearization", linearization_ok);
+    report_requirement("condensation", condensation_ok);
+    report_requirement("global_oracle", global_oracle_ok);
+    report_requirement("local_rhs", local_rhs_ok);
+    report_requirement("true_system", true_system_ok);
+    report_requirement("distribution", distribution_ok);
+    report_requirement("recovery", recovery_ok);
+    report_requirement("state_publication", state_publication_ok);
+    report_requirement("serial_parity_truth", serial_parity.serial_truth_ok);
+    report_requirement("serial_parity_coordinate_keys",
+                       serial_parity.coordinate_keys_ok);
+    report_requirement("serial_parity_assembly", serial_parity.assembly_ok);
+    report_requirement("serial_parity_condensation",
+                       serial_parity.condensation_ok);
+    report_requirement("serial_parity_action_rhs",
+                       serial_parity.action_rhs_ok);
+    report_requirement("serial_parity_trace_solution",
+                       serial_parity.trace_solution_ok);
+    report_requirement("serial_parity_recovery", serial_parity.recovery_ok);
+    report_requirement("serial_parity_state", serial_parity.state_ok);
+    report_requirement("serial_parity_status", serial_parity.status_ok);
+    report_requirement("serial_parity", serial_parity_ok);
+    report_requirement("final_oracle", final_oracle_ok);
+    report_requirement("nonlinear_residual", nonlinear_residual_ok);
+    report_requirement("status_publication", status_publication_ok);
+    report_requirement("generation_publication", generation_publication_ok);
+    report_requirement("evidence_identity", evidence_identity_ok);
+    report_requirement("orientation_finite_element_permutation",
+                       orientation.finite_element_permutation_ok);
+    report_requirement("orientation_actual_shared_reversal",
+                       orientation.actual_shared_reversal_ok);
+    report_requirement("orientation_wrong_permutation_rejected",
+                       orientation.wrong_permutation_rejected);
+    report_requirement("orientation_values_actions",
+                       orientation_requirements_ok);
+    report_requirement("ownership_single_owner", single_owner_requirement_ok);
+    report_requirement("ownership_ghost_census",
+                       ghost_census_requirement_ok);
+    report_requirement("ownership_shared_face_census",
+                       shared_face_census_requirement_ok);
+    report_requirement("rollback", rollback_ok);
+    report_requirement("damping", damping_ok);
+    std::cerr << "FAIL metrics rank=" << rank << " ranks=" << rank_count
+              << " p=" << polynomial_order << " local_error_R="
               << ScaledError(production.residual_interior,
                              local.residual_interior)
               << " local_error_G="
@@ -1509,8 +3023,35 @@ bool CheckOneOrder(MPI_Comm communicator, const int rank,
               << global_negative_signed_trace_dofs
               << " orientation_shared_faces=" << orientation.shared_faces
               << " orientation_reversed_dofs=" << orientation.reversed_dofs
+              << " orientation_actual_pairs="
+              << orientation.actual_reversed_face_pairs
               << " orientation_value_error=" << orientation.value_error
               << " orientation_action_error=" << orientation.action_error
+              << " orientation_wrong_value_error="
+              << orientation.wrong_value_error
+              << " orientation_wrong_action_error="
+              << orientation.wrong_action_error
+              << " owner_values=" << owner_refresh.owner_values
+              << " ghost_values=" << owner_refresh.ghost_values
+              << " owner_value_error=" << owner_refresh.owner_value_error
+              << " ghost_value_error=" << owner_refresh.ghost_value_error
+              << " owner_coordinate_error="
+              << owner_refresh.coordinate_value_error
+              << " serial_matched_elements="
+              << serial_parity.matched_elements
+              << " serial_residual_error=" << serial_parity.residual_error
+              << " serial_jacobian_error=" << serial_parity.jacobian_error
+              << " serial_condensation_error="
+              << serial_parity.condensation_error
+              << " serial_matrix_error=" << serial_parity.matrix_error
+              << " serial_action_error=" << serial_parity.action_error
+              << " serial_rhs_error="
+              << serial_parity.right_hand_side_error
+              << " serial_trace_solution_error="
+              << serial_parity.trace_solution_error
+              << " serial_recovery_error=" << serial_parity.recovery_error
+              << " serial_state_error=" << serial_parity.state_error
+              << " rollback_cases=" << rollback_cases_exercised
               << " damping=" << evidence.damping
               << " true_residual=" << evidence.true_relative_residual
               << " dense_residual=" << DenseRelativeResidual(global)

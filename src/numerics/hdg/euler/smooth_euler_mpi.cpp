@@ -934,75 +934,121 @@ bool SmoothEulerMPIExperiment::Initialize(const int elements_per_direction)
 
   try
   {
-        candidate.old_interior = std::make_unique<mfem::ParGridFunction>(
-            candidate.interior_space.get());
-        candidate.old_trace = std::make_unique<mfem::ParGridFunction>(
-            candidate.trace_space.get());
-        candidate.current_interior = std::make_unique<mfem::ParGridFunction>(
-            candidate.interior_space.get());
-        candidate.current_trace = std::make_unique<mfem::ParGridFunction>(
-            candidate.trace_space.get());
-        auto exact = [](const mfem::Vector& point, mfem::Vector& value)
-        {
-          ConservedState state{};
-          if (!ManufacturedConservative(point[0], point[1], state).ok())
-          {
-            throw std::runtime_error("manufactured state projection failed");
-          }
-          value.SetSize(conserved_components);
-          for (int component = 0; component < conserved_components; ++component)
-          {
-            value[component] = state[component];
-          }
-        };
-        auto perturbed = [](const mfem::Vector& point, mfem::Vector& value)
-        {
-          PrimitiveState primitive{};
-          if (!ManufacturedPrimitive(point[0], point[1], primitive).ok())
-          {
-            throw std::runtime_error("manufactured primitive failed");
-          }
-          const double psi_one = std::sin(2.0 * pi * point[0]) *
-              std::cos(2.0 * pi * point[1]);
-          const double psi_two = std::cos(2.0 * pi * point[0]) *
-              std::sin(2.0 * pi * point[1]);
-          const double psi_three =
-              std::sin(2.0 * pi * (point[0] + point[1]));
-          primitive[0] *= 1.0 + 0.04 * psi_one;
-          primitive[1] += 0.03 * psi_two;
-          primitive[2] -= 0.03 * psi_one;
-          primitive[3] *= 1.0 + 0.04 * psi_three;
-          ConservedState state{};
-          if (!ConservativeFromPrimitive(primitive, state).ok())
-          {
-            throw std::runtime_error("perturbed state projection failed");
-          }
-          value.SetSize(conserved_components);
-          for (int component = 0; component < conserved_components; ++component)
-          {
-            value[component] = state[component];
-          }
-        };
-        mfem::VectorFunctionCoefficient exact_coefficient(
-            conserved_components, exact);
-        mfem::VectorFunctionCoefficient perturbed_coefficient(
-            conserved_components, perturbed);
-        candidate.old_interior->ProjectCoefficient(exact_coefficient);
-        candidate.current_interior->ProjectCoefficient(perturbed_coefficient);
-        local_ok = ProjectTrace(*candidate.mesh, *candidate.trace_space,
-                                *candidate.old_trace, false) &&
-            ProjectTrace(*candidate.mesh, *candidate.trace_space,
-                         *candidate.current_trace, true);
-      if (local_ok)
+    candidate.old_interior = std::make_unique<mfem::ParGridFunction>(
+        candidate.interior_space.get());
+    candidate.old_trace = std::make_unique<mfem::ParGridFunction>(
+        candidate.trace_space.get());
+    candidate.current_interior = std::make_unique<mfem::ParGridFunction>(
+        candidate.interior_space.get());
+    candidate.current_trace = std::make_unique<mfem::ParGridFunction>(
+        candidate.trace_space.get());
+    auto exact = [](const mfem::Vector& point, mfem::Vector& value)
+    {
+      ConservedState state{};
+      if (!ManufacturedConservative(point[0], point[1], state).ok())
       {
-        double minimum_density = 0.0;
-        double minimum_pressure = 0.0;
-        local_ok = PrescreenState(
-            *candidate.mesh, *candidate.interior_space,
-            *candidate.trace_space, *candidate.current_interior,
-            *candidate.current_trace, quadrature_order_, minimum_density,
-            minimum_pressure);
+        throw std::runtime_error("manufactured state projection failed");
       }
+      value.SetSize(conserved_components);
+      for (int component = 0; component < conserved_components; ++component)
+      {
+        value[component] = state[component];
+      }
+    };
+    auto perturbed = [](const mfem::Vector& point, mfem::Vector& value)
+    {
+      PrimitiveState primitive{};
+      if (!ManufacturedPrimitive(point[0], point[1], primitive).ok())
+      {
+        throw std::runtime_error("manufactured primitive failed");
+      }
+      const double psi_one = std::sin(2.0 * pi * point[0]) *
+          std::cos(2.0 * pi * point[1]);
+      const double psi_two = std::cos(2.0 * pi * point[0]) *
+          std::sin(2.0 * pi * point[1]);
+      const double psi_three =
+          std::sin(2.0 * pi * (point[0] + point[1]));
+      primitive[0] *= 1.0 + 0.04 * psi_one;
+      primitive[1] += 0.03 * psi_two;
+      primitive[2] -= 0.03 * psi_one;
+      primitive[3] *= 1.0 + 0.04 * psi_three;
+      ConservedState state{};
+      if (!ConservativeFromPrimitive(primitive, state).ok())
+      {
+        throw std::runtime_error("perturbed state projection failed");
+      }
+      value.SetSize(conserved_components);
+      for (int component = 0; component < conserved_components; ++component)
+      {
+        value[component] = state[component];
+      }
+    };
+    mfem::VectorFunctionCoefficient exact_coefficient(
+        conserved_components, exact);
+    mfem::VectorFunctionCoefficient perturbed_coefficient(
+        conserved_components, perturbed);
+    candidate.old_interior->ProjectCoefficient(exact_coefficient);
+    candidate.current_interior->ProjectCoefficient(perturbed_coefficient);
+    local_ok = ProjectTrace(*candidate.mesh, *candidate.trace_space,
+                            *candidate.old_trace, false) &&
+        ProjectTrace(*candidate.mesh, *candidate.trace_space,
+                     *candidate.current_trace, true);
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  if (!implementation_->CollectiveAll(local_ok)) { return false; }
+
+  mfem::Vector owned_current_trace;
+  mfem::Vector refreshed_current_trace;
+  try
+  {
+    owned_current_trace.SetSize(candidate.trace_space->GetTrueVSize());
+    refreshed_current_trace.SetSize(candidate.trace_space->GetVSize());
+    candidate.current_trace->ParallelProject(owned_current_trace);
+    refreshed_current_trace = std::numeric_limits<double>::quiet_NaN();
+    local_ok = FiniteValues(VectorValues(owned_current_trace));
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  if (!implementation_->CollectiveAll(local_ok)) { return false; }
+
+  try
+  {
+    local_ok = candidate.exchange_plan.Distribute(
+        *candidate.trace_space, owned_current_trace,
+        refreshed_current_trace);
+  }
+  catch (const std::exception&)
+  {
+    local_ok = false;
+  }
+  if (!implementation_->CollectiveAll(local_ok)) { return false; }
+
+  try
+  {
+    local_ok = AssignValues(*candidate.current_trace,
+                            VectorValues(refreshed_current_trace));
+    if (local_ok)
+    {
+      mfem::Vector owner_round_trip(candidate.trace_space->GetTrueVSize());
+      candidate.current_trace->ParallelProject(owner_round_trip);
+      local_ok = VectorValues(owner_round_trip) ==
+          VectorValues(owned_current_trace);
+    }
+    if (local_ok)
+    {
+      double minimum_density = 0.0;
+      double minimum_pressure = 0.0;
+      local_ok = PrescreenState(
+          *candidate.mesh, *candidate.interior_space,
+          *candidate.trace_space, *candidate.current_interior,
+          *candidate.current_trace, quadrature_order_, minimum_density,
+          minimum_pressure);
+    }
   }
   catch (const std::exception&)
   {
