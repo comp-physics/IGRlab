@@ -156,6 +156,8 @@ struct FullDeviceTestSnapshot
   std::vector<double> first_condensed_rhs;
   std::vector<double> first_local_trace_increment;
   std::vector<double> first_recovered_increment;
+  std::vector<double> global_residual_r;
+  std::vector<double> global_residual_g;
   std::vector<double> global_a;
   std::vector<double> global_b;
   std::vector<double> global_c;
@@ -286,7 +288,7 @@ struct FullDeviceRequest
   bool enabled = false;
   bool run_complete_ladder = true;
   bool enable_test_oracle_staging = false;
-  /** Stage the bounded p1/N3 all-element first-Newton oracle only. */
+  /** Stage the bounded p1--p4/N3 all-element first-Newton oracles only. */
   bool enable_global_linear_oracle_staging = false;
   bool inject_failure_after_first_update = false;
   int injected_failure_polynomial_order = 1;

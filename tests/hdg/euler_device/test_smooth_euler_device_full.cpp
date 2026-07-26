@@ -379,6 +379,8 @@ bool DerivedSnapshotEmpty(const FullDeviceTestSnapshot& snapshot)
          snapshot.first_condensed_rhs.empty() &&
          snapshot.first_local_trace_increment.empty() &&
          snapshot.first_recovered_increment.empty() &&
+         snapshot.global_residual_r.empty() &&
+         snapshot.global_residual_g.empty() &&
          snapshot.global_a.empty() && snapshot.global_b.empty() &&
          snapshot.global_c.empty() && snapshot.global_d.empty() &&
          snapshot.global_f.empty() && snapshot.global_g.empty() &&
@@ -1108,8 +1110,499 @@ bool IndependentFirstLinearOracle(const FullDeviceTestSnapshot& snapshot,
   return std::isfinite(condensed_error) && std::isfinite(recovery_error);
 }
 
+struct IndependentLinearization
+{
+  int elements = 0;
+  int ni = 0;
+  int nt = 0;
+  int ng = 0;
+  int quadrature_order = 0;
+  bool admissible = false;
+  std::vector<double> residual_r;
+  std::vector<double> residual_g;
+  std::vector<double> a;
+  std::vector<double> b;
+  std::vector<double> c;
+  std::vector<double> d;
+  std::vector<double> f;
+  std::vector<double> g;
+};
+
+bool AdmissibleIndependentState(
+    const std::array<double, conserved_components>& state)
+{
+  if (!(state[0] >= 1.0e-8)) { return false; }
+  const double pressure = (gamma - 1.0) *
+      (state[3] - 0.5 * (state[1] * state[1] + state[2] * state[2]) /
+                      state[0]);
+  return pressure >= 1.0e-8 && std::isfinite(pressure);
+}
+
+bool FiniteVector(const std::vector<double>& values)
+{
+  return std::all_of(values.begin(), values.end(),
+                     [](const double value) { return std::isfinite(value); });
+}
+
+double MaximumDifference(const std::vector<double>& first,
+                         const std::vector<double>& second)
+{
+  if (first.size() != second.size())
+    return std::numeric_limits<double>::infinity();
+  double error = 0.0;
+  for (std::size_t entry = 0; entry < first.size(); ++entry)
+    error = std::max(error, std::abs(first[entry] - second[entry]));
+  return error;
+}
+
+bool IndependentAssembleLinearization(
+    const FullDeviceTestSnapshot& snapshot,
+    const std::vector<double>& interior_coefficients,
+    const std::vector<double>& trace_coefficients,
+    IndependentLinearization& result)
+{
+  OracleMesh oracle;
+  if (!BuildOracleMesh(snapshot.polynomial_order,
+                       snapshot.elements_per_direction, oracle))
+  {
+    return false;
+  }
+  result = {};
+  result.elements = oracle.mesh->GetNE();
+  result.ni = snapshot.interior_dofs;
+  result.nt = snapshot.trace_dofs;
+  result.ng = snapshot.global_trace_dofs;
+  result.quadrature_order = 5 * snapshot.polynomial_order + 16;
+  const std::size_t total_interior =
+      static_cast<std::size_t>(result.elements) * result.ni;
+  const std::size_t total_trace =
+      static_cast<std::size_t>(result.elements) * result.nt;
+  if (result.elements != snapshot.elements || result.elements != 9 ||
+      result.ni <= 0 || result.nt <= 0 || result.ng <= 0 ||
+      snapshot.assembly_quadrature_order != result.quadrature_order ||
+      snapshot.old_interior.size() != total_interior ||
+      interior_coefficients.size() != total_interior ||
+      trace_coefficients.size() != static_cast<std::size_t>(result.ng) ||
+      snapshot.signed_trace_dofs.size() != total_trace)
+  {
+    return false;
+  }
+  result.residual_r.assign(total_interior, 0.0);
+  result.residual_g.assign(total_trace, 0.0);
+  result.a.assign(total_interior * result.ni, 0.0);
+  result.b.assign(total_interior * result.nt, 0.0);
+  result.c.assign(total_trace * result.ni, 0.0);
+  result.d.assign(total_trace * result.nt, 0.0);
+  result.f.assign(total_interior, 0.0);
+  result.g.assign(total_trace, 0.0);
+  result.admissible = true;
+
+  for (int element = 0; element < result.elements; ++element)
+  {
+    const mfem::FiniteElement* fe = oracle.interior_space->GetFE(element);
+    mfem::ElementTransformation* transformation =
+        oracle.mesh->GetElementTransformation(element);
+    if (fe == nullptr || transformation == nullptr ||
+        conserved_components * fe->GetDof() != result.ni)
+    {
+      return false;
+    }
+    const int scalar_dofs = fe->GetDof();
+    const std::size_t interior_offset =
+        static_cast<std::size_t>(element) * result.ni;
+    const std::size_t trace_offset =
+        static_cast<std::size_t>(element) * result.nt;
+    const std::size_t a_offset = interior_offset * result.ni;
+    const std::size_t b_offset = interior_offset * result.nt;
+    const std::size_t c_offset = trace_offset * result.ni;
+    const std::size_t d_offset = trace_offset * result.nt;
+    mfem::Vector shape(scalar_dofs), physical(dimension);
+    mfem::DenseMatrix derivative(scalar_dofs, dimension);
+    const mfem::IntegrationRule& volume_rule =
+        mfem::IntRules.Get(fe->GetGeomType(), result.quadrature_order);
+    for (int q = 0; q < volume_rule.GetNPoints(); ++q)
+    {
+      const auto& point = volume_rule.IntPoint(q);
+      transformation->SetIntPoint(&point);
+      transformation->Transform(point, physical);
+      fe->CalcShape(point, shape);
+      fe->CalcPhysDShape(*transformation, derivative);
+      std::array<double, conserved_components> state{}, old_state{};
+      std::array<double, conserved_components> source{}, flux_x{}, flux_y{};
+      std::array<double, conserved_components * conserved_components>
+          jacobian_x{}, jacobian_y{};
+      if (!Interpolate(interior_coefficients,
+                       static_cast<int>(interior_offset), scalar_dofs, shape,
+                       state) ||
+          !Interpolate(snapshot.old_interior,
+                       static_cast<int>(interior_offset), scalar_dofs, shape,
+                       old_state) ||
+          !ManufacturedSourceIndependent(physical[0], physical[1], source) ||
+          !FluxJacobian(state, 1.0, 0.0, flux_x, jacobian_x) ||
+          !FluxJacobian(state, 0.0, 1.0, flux_y, jacobian_y))
+      {
+        return false;
+      }
+      result.admissible = result.admissible &&
+                          AdmissibleIndependentState(state);
+      const double weight = point.weight * transformation->Weight();
+      if (!(weight > 0.0) || !std::isfinite(weight)) { return false; }
+      for (int row = 0; row < scalar_dofs; ++row)
+        for (int row_component = 0;
+             row_component < conserved_components; ++row_component)
+        {
+          const int local_row = ByNodes(row, scalar_dofs, row_component);
+          result.residual_r[interior_offset + local_row] += weight *
+              (shape[row] * (state[row_component] - old_state[row_component]) /
+                   backward_euler_dt -
+               derivative(row, 0) * flux_x[row_component] -
+               derivative(row, 1) * flux_y[row_component] -
+               shape[row] * source[row_component]);
+          for (int column = 0; column < scalar_dofs; ++column)
+            for (int column_component = 0;
+                 column_component < conserved_components; ++column_component)
+            {
+              const int local_column =
+                  ByNodes(column, scalar_dofs, column_component);
+              const double mass = row_component == column_component ?
+                  shape[row] * shape[column] / backward_euler_dt : 0.0;
+              const double volume =
+                  -(derivative(row, 0) *
+                        jacobian_x[row_component * conserved_components +
+                                   column_component] +
+                    derivative(row, 1) *
+                        jacobian_y[row_component * conserved_components +
+                                   column_component]) *
+                  shape[column];
+              result.a[a_offset + static_cast<std::size_t>(local_row) *
+                                      result.ni + local_column] +=
+                  weight * (mass + volume);
+            }
+        }
+    }
+
+    mfem::Array<int> faces, orientations;
+    oracle.mesh->GetElementEdges(element, faces, orientations);
+    if (faces.Size() != 4) { return false; }
+    int local_trace_offset = 0;
+    for (int local_face = 0; local_face < faces.Size(); ++local_face)
+    {
+      const int face = faces[local_face];
+      const mfem::FiniteElement* trace_fe =
+          oracle.trace_space->GetFaceElement(face);
+      mfem::FaceElementTransformations* face_transformation =
+          oracle.mesh->GetFaceElementTransformations(face);
+      if (trace_fe == nullptr || face_transformation == nullptr ||
+          face_transformation->Face == nullptr)
+      {
+        return false;
+      }
+      const int face_scalar_dofs = trace_fe->GetDof();
+      const int face_vdofs = conserved_components * face_scalar_dofs;
+      const bool first = face_transformation->Elem1No == element;
+      if (!first && face_transformation->Elem2No != element) { return false; }
+      mfem::Vector interior_shape(scalar_dofs);
+      mfem::Vector trace_shape(face_scalar_dofs);
+      const mfem::IntegrationRule& face_rule =
+          mfem::IntRules.Get(trace_fe->GetGeomType(), result.quadrature_order);
+      for (int q = 0; q < face_rule.GetNPoints(); ++q)
+      {
+        const auto& point = face_rule.IntPoint(q);
+        face_transformation->SetAllIntPoints(&point);
+        const auto& element_point = first ?
+            face_transformation->GetElement1IntPoint() :
+            face_transformation->GetElement2IntPoint();
+        fe->CalcShape(element_point, interior_shape);
+        trace_fe->CalcShape(point, trace_shape);
+        std::array<double, conserved_components> state{}, trace_state{};
+        if (!Interpolate(interior_coefficients,
+                         static_cast<int>(interior_offset), scalar_dofs,
+                         interior_shape, state))
+        {
+          return false;
+        }
+        for (int scalar = 0; scalar < face_scalar_dofs; ++scalar)
+          for (int component = 0; component < conserved_components;
+               ++component)
+          {
+            const int local = local_trace_offset +
+                ByNodes(scalar, face_scalar_dofs, component);
+            double sign = 1.0;
+            const int global = Decode(
+                snapshot.signed_trace_dofs[trace_offset + local], sign);
+            if (global < 0 || global >= result.ng) { return false; }
+            trace_state[component] +=
+                trace_shape[scalar] * sign * trace_coefficients[global];
+          }
+        result.admissible = result.admissible &&
+                            AdmissibleIndependentState(state) &&
+                            AdmissibleIndependentState(trace_state);
+        mfem::Vector scaled_normal(dimension);
+        mfem::CalcOrtho(face_transformation->Face->Jacobian(), scaled_normal);
+        const double measure = scaled_normal.Norml2();
+        if (!(measure > 0.0) || !std::isfinite(measure)) { return false; }
+        const double side = first ? 1.0 : -1.0;
+        const double nx = side * scaled_normal[0] / measure;
+        const double ny = side * scaled_normal[1] / measure;
+        const double weight = point.weight * measure;
+        std::array<double, conserved_components> trace_flux{};
+        std::array<double, conserved_components * conserved_components>
+            trace_jacobian{};
+        if (!FluxJacobian(trace_state, nx, ny, trace_flux,
+                          trace_jacobian) ||
+            !(weight > 0.0) || !std::isfinite(weight))
+        {
+          return false;
+        }
+        for (int row = 0; row < scalar_dofs; ++row)
+        {
+          for (int component = 0; component < conserved_components;
+               ++component)
+          {
+            const int local_row = ByNodes(row, scalar_dofs, component);
+            result.residual_r[interior_offset + local_row] +=
+                weight * interior_shape[row] *
+                (trace_flux[component] + fixed_scalar_tau *
+                    (state[component] - trace_state[component]));
+          }
+          for (int column = 0; column < scalar_dofs; ++column)
+            for (int component = 0; component < conserved_components;
+                 ++component)
+            {
+              const int local_row = ByNodes(row, scalar_dofs, component);
+              const int local_column =
+                  ByNodes(column, scalar_dofs, component);
+              result.a[a_offset + static_cast<std::size_t>(local_row) *
+                                      result.ni + local_column] +=
+                  weight * interior_shape[row] * fixed_scalar_tau *
+                  interior_shape[column];
+            }
+          for (int column = 0; column < face_scalar_dofs; ++column)
+            for (int row_component = 0;
+                 row_component < conserved_components; ++row_component)
+              for (int column_component = 0;
+                   column_component < conserved_components;
+                   ++column_component)
+              {
+                const int local_row =
+                    ByNodes(row, scalar_dofs, row_component);
+                const int local_column = local_trace_offset +
+                    ByNodes(column, face_scalar_dofs, column_component);
+                result.b[b_offset + static_cast<std::size_t>(local_row) *
+                                        result.nt + local_column] +=
+                    weight * interior_shape[row] * trace_shape[column] *
+                    (trace_jacobian[row_component * conserved_components +
+                                    column_component] -
+                     (row_component == column_component ? fixed_scalar_tau :
+                                                          0.0));
+              }
+        }
+        for (int row = 0; row < face_scalar_dofs; ++row)
+        {
+          for (int component = 0; component < conserved_components;
+               ++component)
+          {
+            const int local_row = local_trace_offset +
+                ByNodes(row, face_scalar_dofs, component);
+            result.residual_g[trace_offset + local_row] +=
+                weight * trace_shape[row] *
+                (trace_flux[component] + fixed_scalar_tau *
+                    (state[component] - trace_state[component]));
+          }
+          for (int column = 0; column < scalar_dofs; ++column)
+            for (int component = 0; component < conserved_components;
+                 ++component)
+            {
+              const int local_row = local_trace_offset +
+                  ByNodes(row, face_scalar_dofs, component);
+              const int local_column =
+                  ByNodes(column, scalar_dofs, component);
+              result.c[c_offset + static_cast<std::size_t>(local_row) *
+                                      result.ni + local_column] +=
+                  weight * trace_shape[row] * fixed_scalar_tau *
+                  interior_shape[column];
+            }
+          for (int column = 0; column < face_scalar_dofs; ++column)
+            for (int row_component = 0;
+                 row_component < conserved_components; ++row_component)
+              for (int column_component = 0;
+                   column_component < conserved_components;
+                   ++column_component)
+              {
+                const int local_row = local_trace_offset +
+                    ByNodes(row, face_scalar_dofs, row_component);
+                const int local_column = local_trace_offset +
+                    ByNodes(column, face_scalar_dofs, column_component);
+                result.d[d_offset + static_cast<std::size_t>(local_row) *
+                                        result.nt + local_column] +=
+                    weight * trace_shape[row] * trace_shape[column] *
+                    (trace_jacobian[row_component * conserved_components +
+                                    column_component] -
+                     (row_component == column_component ? fixed_scalar_tau :
+                                                          0.0));
+              }
+        }
+      }
+      local_trace_offset += face_vdofs;
+    }
+    if (local_trace_offset != result.nt) { return false; }
+    for (int row = 0; row < result.ni; ++row)
+      result.f[interior_offset + row] =
+          -result.residual_r[interior_offset + row];
+    for (int row = 0; row < result.nt; ++row)
+      result.g[trace_offset + row] = -result.residual_g[trace_offset + row];
+  }
+  return result.admissible && FiniteVector(result.residual_r) &&
+         FiniteVector(result.residual_g) && FiniteVector(result.a) &&
+         FiniteVector(result.b) && FiniteVector(result.c) &&
+         FiniteVector(result.d) && FiniteVector(result.f) &&
+         FiniteVector(result.g);
+}
+
+struct IndependentCondensedSystem
+{
+  std::vector<double> schur;
+  std::vector<double> condensed_rhs;
+  std::vector<double> true_matrix;
+  std::vector<double> true_rhs;
+  std::vector<double> trace_increment;
+  std::vector<double> local_trace_increment;
+  std::vector<double> recovered_increment;
+};
+
+bool IndependentCondenseSolve(const FullDeviceTestSnapshot& snapshot,
+                              const IndependentLinearization& linearization,
+                              IndependentCondensedSystem& result)
+{
+  const int elements = linearization.elements;
+  const int ni = linearization.ni;
+  const int nt = linearization.nt;
+  const int ng = linearization.ng;
+  if (elements <= 0 || ni <= 0 || nt <= 0 || ng <= 0) { return false; }
+  result = {};
+  result.schur.assign(static_cast<std::size_t>(elements) * nt * nt, 0.0);
+  result.condensed_rhs.assign(static_cast<std::size_t>(elements) * nt, 0.0);
+  result.true_matrix.assign(static_cast<std::size_t>(ng) * ng, 0.0);
+  result.true_rhs.assign(ng, 0.0);
+  result.local_trace_increment.assign(
+      static_cast<std::size_t>(elements) * nt, 0.0);
+  result.recovered_increment.assign(
+      static_cast<std::size_t>(elements) * ni, 0.0);
+  for (int element = 0; element < elements; ++element)
+  {
+    const double* a = linearization.a.data() +
+                      static_cast<std::size_t>(element) * ni * ni;
+    const double* b = linearization.b.data() +
+                      static_cast<std::size_t>(element) * ni * nt;
+    const double* c = linearization.c.data() +
+                      static_cast<std::size_t>(element) * nt * ni;
+    const double* d = linearization.d.data() +
+                      static_cast<std::size_t>(element) * nt * nt;
+    const double* f = linearization.f.data() +
+                      static_cast<std::size_t>(element) * ni;
+    const double* g = linearization.g.data() +
+                      static_cast<std::size_t>(element) * nt;
+    std::vector<double> solved(static_cast<std::size_t>(ni) * (nt + 1));
+    for (int row = 0; row < ni; ++row)
+    {
+      std::copy_n(b + row * nt, nt, solved.data() + row * (nt + 1));
+      solved[row * (nt + 1) + nt] = f[row];
+    }
+    if (!FactorAndSolve(std::vector<double>(a, a + ni * ni), ni, solved,
+                        nt + 1))
+    {
+      return false;
+    }
+    for (int row = 0; row < nt; ++row)
+    {
+      const std::size_t local_row =
+          static_cast<std::size_t>(element) * nt + row;
+      double local_rhs = g[row];
+      for (int interior = 0; interior < ni; ++interior)
+        local_rhs -= c[row * ni + interior] *
+                     solved[interior * (nt + 1) + nt];
+      result.condensed_rhs[local_row] = local_rhs;
+      double row_sign = 1.0;
+      const int global_row =
+          Decode(snapshot.signed_trace_dofs[local_row], row_sign);
+      if (global_row < 0 || global_row >= ng) { return false; }
+      result.true_rhs[global_row] += row_sign * local_rhs;
+      for (int column = 0; column < nt; ++column)
+      {
+        double value = d[row * nt + column];
+        for (int interior = 0; interior < ni; ++interior)
+          value -= c[row * ni + interior] *
+                   solved[interior * (nt + 1) + column];
+        result.schur[(static_cast<std::size_t>(element) * nt + row) * nt +
+                     column] = value;
+        double column_sign = 1.0;
+        const int global_column = Decode(
+            snapshot.signed_trace_dofs[static_cast<std::size_t>(element) * nt +
+                                       column],
+            column_sign);
+        if (global_column < 0 || global_column >= ng) { return false; }
+        result.true_matrix[static_cast<std::size_t>(global_row) * ng +
+                           global_column] +=
+            row_sign * column_sign * value;
+      }
+    }
+  }
+  result.trace_increment = result.true_rhs;
+  if (!FactorAndSolve(result.true_matrix, ng, result.trace_increment, 1))
+    return false;
+  for (int element = 0; element < elements; ++element)
+  {
+    const double* a = linearization.a.data() +
+                      static_cast<std::size_t>(element) * ni * ni;
+    const double* b = linearization.b.data() +
+                      static_cast<std::size_t>(element) * ni * nt;
+    const double* f = linearization.f.data() +
+                      static_cast<std::size_t>(element) * ni;
+    std::vector<double> recovered(ni);
+    for (int column = 0; column < nt; ++column)
+    {
+      double sign = 1.0;
+      const int global = Decode(
+          snapshot.signed_trace_dofs[static_cast<std::size_t>(element) * nt +
+                                     column],
+          sign);
+      if (global < 0 || global >= ng) { return false; }
+      result.local_trace_increment[static_cast<std::size_t>(element) * nt +
+                                   column] =
+          sign * result.trace_increment[global];
+    }
+    for (int row = 0; row < ni; ++row)
+    {
+      recovered[row] = f[row];
+      for (int column = 0; column < nt; ++column)
+        recovered[row] -=
+            b[row * nt + column] *
+            result.local_trace_increment[static_cast<std::size_t>(element) *
+                                             nt + column];
+    }
+    if (!FactorAndSolve(std::vector<double>(a, a + ni * ni), ni, recovered, 1))
+      return false;
+    std::copy(recovered.begin(), recovered.end(),
+              result.recovered_increment.begin() +
+                  static_cast<std::size_t>(element) * ni);
+  }
+  return FiniteVector(result.schur) && FiniteVector(result.condensed_rhs) &&
+         FiniteVector(result.true_matrix) && FiniteVector(result.true_rhs) &&
+         FiniteVector(result.trace_increment) &&
+         FiniteVector(result.local_trace_increment) &&
+         FiniteVector(result.recovered_increment);
+}
+
 struct GlobalLinearOracleResult
 {
+  double residual_r_error = std::numeric_limits<double>::infinity();
+  double residual_g_error = std::numeric_limits<double>::infinity();
+  double a_error = std::numeric_limits<double>::infinity();
+  double b_error = std::numeric_limits<double>::infinity();
+  double c_error = std::numeric_limits<double>::infinity();
+  double d_error = std::numeric_limits<double>::infinity();
+  double f_error = std::numeric_limits<double>::infinity();
+  double g_error = std::numeric_limits<double>::infinity();
   double condensation_error = std::numeric_limits<double>::infinity();
   double rhs_error = std::numeric_limits<double>::infinity();
   double true_matrix_error = std::numeric_limits<double>::infinity();
@@ -1117,9 +1610,13 @@ struct GlobalLinearOracleResult
   double action_error = std::numeric_limits<double>::infinity();
   double trace_error = std::numeric_limits<double>::infinity();
   double recovery_error = std::numeric_limits<double>::infinity();
+  double last_trace_error = std::numeric_limits<double>::infinity();
+  double last_recovery_error = std::numeric_limits<double>::infinity();
   double state_error = std::numeric_limits<double>::infinity();
   double final_residual = std::numeric_limits<double>::infinity();
   double final_residual_error = std::numeric_limits<double>::infinity();
+  bool admissible = false;
+  bool generation_matches = false;
   bool status_matches = false;
 };
 
@@ -1134,105 +1631,66 @@ bool IndependentGlobalLinearOracle(const FullDeviceMeshEvidence& evidence,
   const auto sized = [](const std::vector<double>& values,
                         const std::size_t expected)
   { return values.size() == expected; };
+  const std::size_t total_interior =
+      static_cast<std::size_t>(elements) * ni;
+  const std::size_t total_trace = static_cast<std::size_t>(elements) * nt;
   if (!snapshot.global_linear_oracle_staged || elements != 9 || ni <= 0 ||
       nt <= 0 || ng <= 0 ||
-      snapshot.signed_trace_dofs.size() !=
-          static_cast<std::size_t>(elements * nt) ||
-      !sized(snapshot.global_a,
-             static_cast<std::size_t>(elements) * ni * ni) ||
-      !sized(snapshot.global_b,
-             static_cast<std::size_t>(elements) * ni * nt) ||
-      !sized(snapshot.global_c,
-             static_cast<std::size_t>(elements) * nt * ni) ||
-      !sized(snapshot.global_d,
-             static_cast<std::size_t>(elements) * nt * nt) ||
-      !sized(snapshot.global_f, static_cast<std::size_t>(elements) * ni) ||
-      !sized(snapshot.global_g, static_cast<std::size_t>(elements) * nt) ||
-      !sized(snapshot.global_schur,
-             static_cast<std::size_t>(elements) * nt * nt) ||
-      !sized(snapshot.global_condensed_rhs,
-             static_cast<std::size_t>(elements) * nt) ||
+      snapshot.signed_trace_dofs.size() != total_trace ||
+      !sized(snapshot.global_residual_r, total_interior) ||
+      !sized(snapshot.global_residual_g, total_trace) ||
+      !sized(snapshot.global_a, total_interior * ni) ||
+      !sized(snapshot.global_b, total_interior * nt) ||
+      !sized(snapshot.global_c, total_trace * ni) ||
+      !sized(snapshot.global_d, total_trace * nt) ||
+      !sized(snapshot.global_f, total_interior) ||
+      !sized(snapshot.global_g, total_trace) ||
+      !sized(snapshot.global_schur, total_trace * nt) ||
+      !sized(snapshot.global_condensed_rhs, total_trace) ||
       !sized(snapshot.global_trace_increment, ng) ||
-      !sized(snapshot.global_local_trace_increment,
-             static_cast<std::size_t>(elements) * nt) ||
-      !sized(snapshot.global_recovered_increment,
-             static_cast<std::size_t>(elements) * ni) ||
+      !sized(snapshot.global_local_trace_increment, total_trace) ||
+      !sized(snapshot.global_recovered_increment, total_interior) ||
       snapshot.actual_true_csr_offsets.size() !=
           static_cast<std::size_t>(ng + 1) ||
       snapshot.actual_true_csr_columns.size() !=
           snapshot.actual_true_csr_values.size() ||
-      !sized(snapshot.actual_true_rhs, ng))
+      !sized(snapshot.actual_true_rhs, ng) ||
+      !sized(snapshot.last_base_interior, total_interior) ||
+      !sized(snapshot.last_delta_interior, total_interior) ||
+      !sized(snapshot.last_base_trace, ng) ||
+      !sized(snapshot.last_delta_trace, ng) ||
+      !sized(snapshot.final_interior, total_interior) ||
+      !sized(snapshot.final_trace, ng) ||
+      !(snapshot.last_accepted_alpha > 0.0))
   {
     return false;
   }
 
-  std::vector<double> global_matrix(static_cast<std::size_t>(ng) * ng, 0.0);
-  std::vector<double> global_rhs(ng, 0.0);
-  result.condensation_error = 0.0;
-  result.rhs_error = 0.0;
-  for (int element = 0; element < elements; ++element)
+  IndependentLinearization first_linearization;
+  IndependentCondensedSystem first_system;
+  if (!IndependentAssembleLinearization(
+          snapshot, snapshot.initial_interior, snapshot.initial_trace,
+          first_linearization) ||
+      !IndependentCondenseSolve(snapshot, first_linearization, first_system))
   {
-    const double* a = snapshot.global_a.data() +
-                      static_cast<std::size_t>(element) * ni * ni;
-    const double* b = snapshot.global_b.data() +
-                      static_cast<std::size_t>(element) * ni * nt;
-    const double* c = snapshot.global_c.data() +
-                      static_cast<std::size_t>(element) * nt * ni;
-    const double* d = snapshot.global_d.data() +
-                      static_cast<std::size_t>(element) * nt * nt;
-    const double* f = snapshot.global_f.data() +
-                      static_cast<std::size_t>(element) * ni;
-    const double* g = snapshot.global_g.data() +
-                      static_cast<std::size_t>(element) * nt;
-    std::vector<double> matrix(a, a + ni * ni);
-    std::vector<double> solved(static_cast<std::size_t>(ni) * (nt + 1));
-    for (int row = 0; row < ni; ++row)
-    {
-      std::copy_n(b + row * nt, nt, solved.data() + row * (nt + 1));
-      solved[row * (nt + 1) + nt] = f[row];
-    }
-    if (!FactorAndSolve(matrix, ni, solved, nt + 1)) { return false; }
-    for (int row = 0; row < nt; ++row)
-    {
-      double local_rhs = g[row];
-      for (int interior = 0; interior < ni; ++interior)
-        local_rhs -= c[row * ni + interior] *
-                     solved[interior * (nt + 1) + nt];
-      const std::size_t local_row =
-          static_cast<std::size_t>(element) * nt + row;
-      result.rhs_error = std::max(
-          result.rhs_error,
-          std::abs(local_rhs - snapshot.global_condensed_rhs[local_row]));
-      double row_sign = 1.0;
-      const int global_row =
-          Decode(snapshot.signed_trace_dofs[local_row], row_sign);
-      global_rhs[global_row] += row_sign * local_rhs;
-      for (int column = 0; column < nt; ++column)
-      {
-        double local_value = d[row * nt + column];
-        for (int interior = 0; interior < ni; ++interior)
-          local_value -= c[row * ni + interior] *
-                         solved[interior * (nt + 1) + column];
-        const std::size_t local_entry =
-            (static_cast<std::size_t>(element) * nt + row) * nt + column;
-        result.condensation_error = std::max(
-            result.condensation_error,
-            std::abs(local_value - snapshot.global_schur[local_entry]));
-        double column_sign = 1.0;
-        const int global_column = Decode(
-            snapshot.signed_trace_dofs[static_cast<std::size_t>(element) * nt +
-                                       column],
-            column_sign);
-        global_matrix[static_cast<std::size_t>(global_row) * ng +
-                      global_column] +=
-            row_sign * column_sign * local_value;
-      }
-    }
+    return false;
   }
+  result.residual_r_error = MaximumDifference(
+      first_linearization.residual_r, snapshot.global_residual_r);
+  result.residual_g_error = MaximumDifference(
+      first_linearization.residual_g, snapshot.global_residual_g);
+  result.a_error = MaximumDifference(first_linearization.a, snapshot.global_a);
+  result.b_error = MaximumDifference(first_linearization.b, snapshot.global_b);
+  result.c_error = MaximumDifference(first_linearization.c, snapshot.global_c);
+  result.d_error = MaximumDifference(first_linearization.d, snapshot.global_d);
+  result.f_error = MaximumDifference(first_linearization.f, snapshot.global_f);
+  result.g_error = MaximumDifference(first_linearization.g, snapshot.global_g);
+  result.condensation_error =
+      MaximumDifference(first_system.schur, snapshot.global_schur);
+  result.rhs_error = MaximumDifference(
+      first_system.condensed_rhs, snapshot.global_condensed_rhs);
 
   std::vector<double> actual_matrix(static_cast<std::size_t>(ng) * ng, 0.0);
-  result.true_matrix_error = 0.0;
-  result.true_rhs_error = 0.0;
   if (snapshot.actual_true_csr_offsets.front() != 0 ||
       snapshot.actual_true_csr_offsets.back() !=
           static_cast<int>(snapshot.actual_true_csr_values.size()))
@@ -1255,100 +1713,49 @@ bool IndependentGlobalLinearOracle(const FullDeviceMeshEvidence& evidence,
       actual_matrix[static_cast<std::size_t>(row) * ng + column] +=
           snapshot.actual_true_csr_values[entry];
     }
-    result.true_rhs_error = std::max(
-        result.true_rhs_error,
-        std::abs(snapshot.actual_true_rhs[row] - global_rhs[row]));
   }
-  for (std::size_t entry = 0; entry < actual_matrix.size(); ++entry)
-    result.true_matrix_error = std::max(
-        result.true_matrix_error,
-        std::abs(actual_matrix[entry] - global_matrix[entry]));
-
+  result.true_matrix_error =
+      MaximumDifference(actual_matrix, first_system.true_matrix);
+  result.true_rhs_error =
+      MaximumDifference(snapshot.actual_true_rhs, first_system.true_rhs);
+  result.trace_error = MaximumDifference(
+      first_system.trace_increment, snapshot.global_trace_increment);
+  result.trace_error = std::max(
+      result.trace_error,
+      MaximumDifference(first_system.local_trace_increment,
+                        snapshot.global_local_trace_increment));
+  result.recovery_error = MaximumDifference(
+      first_system.recovered_increment, snapshot.global_recovered_increment);
   long double rhs_norm_squared = 0.0L;
   long double action_norm_squared = 0.0L;
   for (int row = 0; row < ng; ++row)
   {
-    double action = -global_rhs[row];
+    double action = -first_system.true_rhs[row];
     for (int column = 0; column < ng; ++column)
-      action += global_matrix[static_cast<std::size_t>(row) * ng + column] *
+      action += first_system.true_matrix[
+                    static_cast<std::size_t>(row) * ng + column] *
                 snapshot.global_trace_increment[column];
-    rhs_norm_squared += static_cast<long double>(global_rhs[row]) *
-                        global_rhs[row];
+    rhs_norm_squared +=
+        static_cast<long double>(first_system.true_rhs[row]) *
+        first_system.true_rhs[row];
     action_norm_squared += static_cast<long double>(action) * action;
   }
   result.action_error = std::sqrt(static_cast<double>(action_norm_squared)) /
-                        std::max(std::sqrt(static_cast<double>(rhs_norm_squared)),
-                                 1.0e-300);
+      std::max(std::sqrt(static_cast<double>(rhs_norm_squared)), 1.0e-300);
 
-  std::vector<double> independent_trace = global_rhs;
-  if (!FactorAndSolve(global_matrix, ng, independent_trace, 1)) { return false; }
-  result.trace_error = 0.0;
-  result.recovery_error = 0.0;
-  for (int entry = 0; entry < ng; ++entry)
-    result.trace_error = std::max(
-        result.trace_error,
-        std::abs(independent_trace[entry] -
-                 snapshot.global_trace_increment[entry]));
-  for (int element = 0; element < elements; ++element)
-  {
-    const double* a = snapshot.global_a.data() +
-                      static_cast<std::size_t>(element) * ni * ni;
-    const double* b = snapshot.global_b.data() +
-                      static_cast<std::size_t>(element) * ni * nt;
-    const double* f = snapshot.global_f.data() +
-                      static_cast<std::size_t>(element) * ni;
-    std::vector<double> local_trace(nt);
-    for (int column = 0; column < nt; ++column)
-    {
-      double sign = 1.0;
-      const int global = Decode(
-          snapshot.signed_trace_dofs[static_cast<std::size_t>(element) * nt +
-                                     column],
-          sign);
-      local_trace[column] = sign * independent_trace[global];
-      result.trace_error = std::max(
-          result.trace_error,
-          std::abs(local_trace[column] -
-                   snapshot.global_local_trace_increment[
-                       static_cast<std::size_t>(element) * nt + column]));
-    }
-    std::vector<double> recovered(ni);
-    for (int row = 0; row < ni; ++row)
-    {
-      recovered[row] = f[row];
-      for (int column = 0; column < nt; ++column)
-        recovered[row] -= b[row * nt + column] * local_trace[column];
-    }
-    if (!FactorAndSolve(std::vector<double>(a, a + ni * ni), ni, recovered, 1))
-      return false;
-    for (int row = 0; row < ni; ++row)
-      result.recovery_error = std::max(
-          result.recovery_error,
-          std::abs(recovered[row] -
-                   snapshot.global_recovered_increment[
-                       static_cast<std::size_t>(element) * ni + row]));
-  }
-
-  if (!sized(snapshot.last_base_interior,
-             static_cast<std::size_t>(elements) * ni) ||
-      !sized(snapshot.last_delta_interior,
-             static_cast<std::size_t>(elements) * ni) ||
-      !sized(snapshot.last_base_trace, ng) ||
-      !sized(snapshot.last_delta_trace, ng) ||
-      !sized(snapshot.final_interior,
-             static_cast<std::size_t>(elements) * ni) ||
-      !sized(snapshot.final_trace, ng) ||
-      !(snapshot.last_accepted_alpha > 0.0))
+  IndependentLinearization last_linearization;
+  IndependentCondensedSystem last_system;
+  if (!IndependentAssembleLinearization(
+          snapshot, snapshot.last_base_interior, snapshot.last_base_trace,
+          last_linearization) ||
+      !IndependentCondenseSolve(snapshot, last_linearization, last_system))
   {
     return false;
   }
-  bool independent_success = false;
-  if (!IndependentFinalPdeResidual(evidence, result.final_residual,
-                                   result.final_residual_error,
-                                   independent_success))
-  {
-    return false;
-  }
+  result.last_trace_error = MaximumDifference(
+      last_system.trace_increment, snapshot.last_delta_trace);
+  result.last_recovery_error = MaximumDifference(
+      last_system.recovered_increment, snapshot.last_delta_interior);
   result.state_error = 0.0;
   for (std::size_t entry = 0; entry < snapshot.final_interior.size(); ++entry)
     result.state_error = std::max(
@@ -1356,28 +1763,96 @@ bool IndependentGlobalLinearOracle(const FullDeviceMeshEvidence& evidence,
         std::abs(snapshot.final_interior[entry] -
                  (snapshot.last_base_interior[entry] +
                   snapshot.last_accepted_alpha *
-                      snapshot.last_delta_interior[entry])));
+                      last_system.recovered_increment[entry])));
   for (std::size_t entry = 0; entry < snapshot.final_trace.size(); ++entry)
     result.state_error = std::max(
         result.state_error,
         std::abs(snapshot.final_trace[entry] -
                  (snapshot.last_base_trace[entry] +
                   snapshot.last_accepted_alpha *
-                      snapshot.last_delta_trace[entry])));
+                      last_system.trace_increment[entry])));
+
+  bool independent_success = false;
+  if (!IndependentFinalPdeResidual(evidence, result.final_residual,
+                                   result.final_residual_error,
+                                   independent_success))
+  {
+    return false;
+  }
+  result.admissible = first_linearization.admissible &&
+                      last_linearization.admissible && independent_success;
+  result.generation_matches = evidence.nonlinear_iterations >= 2 &&
+      evidence.committed_generation ==
+          static_cast<std::uint64_t>(evidence.nonlinear_iterations);
   const double target = 1.0e-10 * (1.0 + evidence.initial_residual);
-  result.status_matches = independent_success &&
+  result.status_matches = result.admissible && result.generation_matches &&
                           evidence.status == FullDeviceStatus::success &&
-                          evidence.pass && evidence.nonlinear_iterations >= 2 &&
-                          result.final_residual <= target;
-  return std::isfinite(result.condensation_error) &&
+                          evidence.pass && result.final_residual <= target;
+  return std::isfinite(result.residual_r_error) &&
+         std::isfinite(result.residual_g_error) &&
+         std::isfinite(result.a_error) && std::isfinite(result.b_error) &&
+         std::isfinite(result.c_error) && std::isfinite(result.d_error) &&
+         std::isfinite(result.f_error) && std::isfinite(result.g_error) &&
+         std::isfinite(result.condensation_error) &&
          std::isfinite(result.rhs_error) &&
          std::isfinite(result.true_matrix_error) &&
          std::isfinite(result.true_rhs_error) &&
          std::isfinite(result.action_error) &&
          std::isfinite(result.trace_error) &&
          std::isfinite(result.recovery_error) &&
+         std::isfinite(result.last_trace_error) &&
+         std::isfinite(result.last_recovery_error) &&
          std::isfinite(result.state_error) &&
          std::isfinite(result.final_residual_error);
+}
+
+bool GlobalOracleAccepted(const GlobalLinearOracleResult& result)
+{
+  return result.status_matches && result.admissible &&
+         result.generation_matches &&
+         result.residual_r_error <= 5.0e-11 &&
+         result.residual_g_error <= 5.0e-11 &&
+         result.a_error <= 5.0e-11 && result.b_error <= 5.0e-11 &&
+         result.c_error <= 5.0e-11 && result.d_error <= 5.0e-11 &&
+         result.f_error <= 5.0e-11 && result.g_error <= 5.0e-11 &&
+         result.condensation_error <= 5.0e-11 &&
+         result.rhs_error <= 5.0e-11 &&
+         result.true_matrix_error <= 5.0e-11 &&
+         result.true_rhs_error <= 5.0e-11 &&
+         result.action_error <= 1.0e-10 &&
+         result.trace_error <= 5.0e-9 &&
+         result.recovery_error <= 5.0e-9 &&
+         result.last_trace_error <= 5.0e-9 &&
+         result.last_recovery_error <= 5.0e-9 &&
+         result.state_error <= 5.0e-9 &&
+         result.final_residual_error <= 5.0e-9;
+}
+
+void PrintGlobalOracleFailure(const int p,
+                              const GlobalLinearOracleResult& result)
+{
+  std::cerr << "HDG_EULER_DEVICE_FULL_GLOBAL_ORACLE_FAILURE"
+            << " p=" << p
+            << " R/G=" << result.residual_r_error << "/"
+            << result.residual_g_error
+            << " A/B/C/D=" << result.a_error << "/" << result.b_error
+            << "/" << result.c_error << "/" << result.d_error
+            << " f/g=" << result.f_error << "/" << result.g_error
+            << " condensed=" << result.condensation_error << "/"
+            << result.rhs_error
+            << " true=" << result.true_matrix_error << "/"
+            << result.true_rhs_error
+            << " action=" << result.action_error
+            << " trace/recovery=" << result.trace_error << "/"
+            << result.recovery_error
+            << " last=" << result.last_trace_error << "/"
+            << result.last_recovery_error
+            << " state=" << result.state_error
+            << " final=" << result.final_residual << "/"
+            << result.final_residual_error
+            << " admissible=" << result.admissible
+            << " generation=" << result.generation_matches
+            << " status=" << result.status_matches << '\n';
 }
 
 bool Flux(const std::array<double, conserved_components>& state,
@@ -1411,9 +1886,10 @@ bool IndependentPhysicsProbe()
     for (int component = 0; component < conserved_components; ++component)
       sum[component] += value[component];
   }
-  return *std::max_element(sum.begin(), sum.end(),
-                           [](const double first, const double second)
-                           { return std::abs(first) < std::abs(second); }) <=
+  return std::abs(*std::max_element(
+             sum.begin(), sum.end(),
+             [](const double first, const double second)
+             { return std::abs(first) < std::abs(second); })) <=
          5.0e-12;
 }
 
@@ -1741,6 +2217,97 @@ void PrintFailure(const FullDeviceEvidence& evidence, const std::string& stage)
     }
   }
 }
+
+bool ValidateRollbackEvidence(const FullDeviceEvidence& rollback,
+                              const int polynomial_order)
+{
+  if (rollback.status != FullDeviceStatus::injected_failure ||
+      rollback.pass || rollback.cases.size() != 1)
+  {
+    return false;
+  }
+  const auto& rolled = rollback.cases.front();
+  const auto& snapshot = rolled.test_snapshot;
+  if (rolled.polynomial_order != polynomial_order ||
+      rolled.elements_per_direction != 3 || rolled.pass ||
+      rolled.status != FullDeviceStatus::injected_failure)
+  {
+    return false;
+  }
+  const bool interior_changed = !BitwiseEqual(
+      snapshot.rollback_entry_interior, snapshot.rollback_changed_interior);
+  const bool trace_changed = !BitwiseEqual(
+      snapshot.rollback_entry_trace, snapshot.rollback_changed_trace);
+  const bool nonfinite_changed = std::any_of(
+      snapshot.rollback_changed_interior.begin(),
+      snapshot.rollback_changed_interior.end(),
+      [](const double value) { return !std::isfinite(value); });
+  const auto& failed_phase =
+      rolled.phases[static_cast<std::size_t>(FullDevicePhase::state_update)];
+  return rolled.rollback_restored &&
+         rolled.rollback_had_uncommitted_change &&
+         rolled.rollback_nonfinite_change_observed && nonfinite_changed &&
+         rolled.rollback_rejected_post_failure_consumption &&
+         rolled.invalidated_product_count == 5 &&
+         rolled.rejected_consumer_count == 6 &&
+         rolled.nonlinear_iterations == 0 && rolled.linear_iterations == 0 &&
+         rolled.committed_generation == 0 &&
+         rolled.discarded_nonlinear_iterations == 1 &&
+         rolled.discarded_linear_iterations > 0 &&
+         rolled.discarded_attempt_generation > 0 &&
+         rolled.final_residual == rolled.initial_residual &&
+         std::isinf(rolled.true_relative_residual) &&
+         rolled.discarded_accepted_residual >
+             1.0e-10 * (1.0 + rolled.initial_residual) &&
+         interior_changed && trace_changed &&
+         BitwiseEqual(snapshot.rollback_entry_interior,
+                      snapshot.rollback_restored_interior) &&
+         BitwiseEqual(snapshot.rollback_entry_trace,
+                      snapshot.rollback_restored_trace) &&
+         DerivedSnapshotEmpty(snapshot) && failed_phase.reached &&
+         failed_phase.status == FullDeviceStatus::injected_failure &&
+         failed_phase.contemporaneous_audit && !failed_phase.device_resident &&
+         failed_phase.generation > 0 && rolled.phase_audit_append_only &&
+         rolled.failure_phase_audit_valid &&
+         rolled.failure_phase == FullDevicePhase::state_update &&
+         rolled.failure_phase_status == FullDeviceStatus::injected_failure &&
+         rolled.failure_phase_generation ==
+             rolled.discarded_attempt_generation &&
+         !rolled.phase_audit_log.empty() &&
+         rolled.phase_audit_log.back().phase ==
+             FullDevicePhase::state_update &&
+         rolled.phase_audit_log.back().status ==
+             FullDeviceStatus::injected_failure &&
+         rolled.phase_audit_log.back().contemporaneous_audit &&
+         !rolled.phase_audit_log.back().device_resident &&
+         std::all_of(rolled.phase_audit_log.begin(),
+                     rolled.phase_audit_log.end() - 1,
+                     [](const auto& record)
+                     {
+                       return record.reached &&
+                              record.contemporaneous_audit &&
+                              record.device_resident &&
+                              record.status == FullDeviceStatus::success;
+                     }) &&
+         rolled.phases[static_cast<std::size_t>(FullDevicePhase::trace_solve)]
+             .reached &&
+         rolled.phases[static_cast<std::size_t>(FullDevicePhase::recovery)]
+             .reached &&
+         rolled.managed_residency_verified &&
+         rolled.allocation_observability_reported &&
+         rolled.app_forall_fallback_census_complete &&
+         !rolled.fallback_census_complete &&
+         rolled.telemetry.managed_device_objects_checked > 0 &&
+         rolled.telemetry.managed_device_objects_checked ==
+             rolled.telemetry.managed_device_objects_valid &&
+         rolled.telemetry.phase_residency_audit_events > 0 &&
+         rolled.telemetry.synchronization_events > 0 &&
+         rolled.telemetry.fallback_events == 0 &&
+         rolled.telemetry.dense_host_trace_inverse_events == 0 &&
+         rolled.telemetry.solver_substitution_events == 0 &&
+         std::none_of(rollback.convergence.begin(), rollback.convergence.end(),
+                      [](const auto& item) { return item.pass; });
+}
 }  // namespace
 
 int main(int argc, char* argv[])
@@ -1796,17 +2363,9 @@ int main(int argc, char* argv[])
   }
   GlobalLinearOracleResult global_oracle;
   if (!IndependentGlobalLinearOracle(smoke.cases[0], global_oracle) ||
-      !global_oracle.status_matches ||
-      global_oracle.condensation_error > 5.0e-11 ||
-      global_oracle.rhs_error > 5.0e-11 ||
-      global_oracle.true_matrix_error > 5.0e-11 ||
-      global_oracle.true_rhs_error > 5.0e-11 ||
-      global_oracle.action_error > 1.0e-10 ||
-      global_oracle.trace_error > 5.0e-9 ||
-      global_oracle.recovery_error > 5.0e-9 ||
-      global_oracle.state_error > 5.0e-9 ||
-      global_oracle.final_residual_error > 5.0e-9)
+      !GlobalOracleAccepted(global_oracle))
   {
+    PrintGlobalOracleFailure(1, global_oracle);
     PrintFailure(smoke, "p1_n3_global_oracle");
     return 8;
   }
@@ -1837,11 +2396,37 @@ int main(int argc, char* argv[])
                     [](const FullDeviceMeshEvidence& value)
                     {
                       return value.test_snapshot.global_linear_oracle_staged;
-                    }) != 1 ||
-      !evidence.cases.front().test_snapshot.global_linear_oracle_staged)
+                    }) != 4 ||
+      !std::all_of(evidence.cases.begin(), evidence.cases.end(),
+                   [](const FullDeviceMeshEvidence& value)
+                   {
+                     return value.test_snapshot.global_linear_oracle_staged ==
+                            (value.elements_per_direction == 3);
+                   }))
   {
     PrintFailure(evidence, "bounded_global_staging");
     return 11;
+  }
+  std::size_t global_oracle_count = 0;
+  for (int p = 1; p <= 4; ++p)
+  {
+    const auto found = std::find_if(
+        evidence.cases.begin(), evidence.cases.end(),
+        [p](const FullDeviceMeshEvidence& value)
+        {
+          return value.polynomial_order == p &&
+                 value.elements_per_direction == 3;
+        });
+    GlobalLinearOracleResult oracle;
+    if (found == evidence.cases.end() ||
+        !IndependentGlobalLinearOracle(*found, oracle) ||
+        !GlobalOracleAccepted(oracle))
+    {
+      PrintGlobalOracleFailure(p, oracle);
+      PrintFailure(evidence, "p1_p4_n3_global_oracle");
+      return 13;
+    }
+    ++global_oracle_count;
   }
   for (int p = 1; p <= 4; ++p)
   {
@@ -1858,111 +2443,31 @@ int main(int argc, char* argv[])
     }
   }
 
-  FullDeviceRequest rollback_request;
-  rollback_request.enabled = true;
-  rollback_request.run_complete_ladder = false;
-  rollback_request.enable_test_oracle_staging = true;
-  rollback_request.inject_failure_after_first_update = true;
-  rollback_request.inject_nonfinite_before_rollback = true;
-  FullDeviceEvidence rollback;
-  if (dg::hdg::euler::RunSmoothEulerDeviceFullExperiment(rollback_request,
-                                                          rollback) ||
-      rollback.status != FullDeviceStatus::injected_failure ||
-      rollback.cases.size() != 1 || rollback.cases[0].pass)
+  std::size_t rollback_count = 0;
+  for (int p = 1; p <= 4; ++p)
   {
-    PrintFailure(rollback, "rollback");
-    return 7;
-  }
-  const auto& rolled = rollback.cases[0];
-  const auto& rollback_snapshot = rolled.test_snapshot;
-  const bool interior_changed = !BitwiseEqual(
-      rollback_snapshot.rollback_entry_interior,
-      rollback_snapshot.rollback_changed_interior);
-  const bool trace_changed = !BitwiseEqual(
-      rollback_snapshot.rollback_entry_trace,
-      rollback_snapshot.rollback_changed_trace);
-  const bool nonfinite_changed = std::any_of(
-      rollback_snapshot.rollback_changed_interior.begin(),
-      rollback_snapshot.rollback_changed_interior.end(),
-      [](const double value) { return !std::isfinite(value); });
-  const auto& failed_phase =
-      rolled.phases[static_cast<std::size_t>(FullDevicePhase::state_update)];
-  if (!rolled.rollback_restored || !rolled.rollback_had_uncommitted_change ||
-      !rolled.rollback_nonfinite_change_observed || !nonfinite_changed ||
-      !rolled.rollback_rejected_post_failure_consumption ||
-      rolled.invalidated_product_count != 5 ||
-      rolled.rejected_consumer_count != 6 ||
-      rolled.nonlinear_iterations != 0 || rolled.linear_iterations != 0 ||
-      rolled.committed_generation != 0 ||
-      rolled.discarded_nonlinear_iterations != 1 ||
-      rolled.discarded_linear_iterations <= 0 ||
-      rolled.discarded_attempt_generation == 0 ||
-      !(rolled.discarded_accepted_residual >
-        1.0e-10 * (1.0 + rolled.initial_residual)) ||
-      !interior_changed || !trace_changed ||
-      !BitwiseEqual(rollback_snapshot.rollback_entry_interior,
-                    rollback_snapshot.rollback_restored_interior) ||
-      !BitwiseEqual(rollback_snapshot.rollback_entry_trace,
-                    rollback_snapshot.rollback_restored_trace) ||
-      !DerivedSnapshotEmpty(rollback_snapshot) || !failed_phase.reached ||
-      failed_phase.status != FullDeviceStatus::injected_failure ||
-      failed_phase.device_resident ||
-      failed_phase.generation == 0 ||
-      !rolled.phase_audit_append_only ||
-      !rolled.failure_phase_audit_valid ||
-      rolled.failure_phase != FullDevicePhase::state_update ||
-      rolled.failure_phase_status != FullDeviceStatus::injected_failure ||
-      rolled.failure_phase_generation !=
-          rolled.discarded_attempt_generation ||
-      rolled.phase_audit_log.empty() ||
-      rolled.phase_audit_log.back().phase !=
-          FullDevicePhase::state_update ||
-      rolled.phase_audit_log.back().status !=
-          FullDeviceStatus::injected_failure ||
-      rolled.phase_audit_log.back().device_resident ||
-      std::any_of(rolled.phase_audit_log.begin(),
-                  rolled.phase_audit_log.end() - 1,
-                  [](const auto& record)
-                  {
-                    return !record.reached ||
-                           !record.contemporaneous_audit ||
-                           !record.device_resident ||
-                           record.status != FullDeviceStatus::success;
-                  }) ||
-      !rolled.phases[static_cast<std::size_t>(FullDevicePhase::trace_solve)]
-           .reached ||
-      !rolled.phases[static_cast<std::size_t>(FullDevicePhase::recovery)]
-           .reached)
-  {
-    PrintFailure(rollback, "rollback_transaction");
-    return 9;
-  }
-
-  FullDeviceRequest late_failure_request;
-  late_failure_request.enabled = true;
-  late_failure_request.run_complete_ladder = true;
-  late_failure_request.enable_test_oracle_staging = true;
-  late_failure_request.inject_failure_after_first_update = true;
-  late_failure_request.injected_failure_polynomial_order = 2;
-  late_failure_request.injected_failure_elements_per_direction = 3;
-  FullDeviceEvidence late_failure;
-  if (dg::hdg::euler::RunSmoothEulerDeviceFullExperiment(
-          late_failure_request, late_failure) ||
-      late_failure.status != FullDeviceStatus::injected_failure ||
-      late_failure.cases.size() != 1 ||
-      late_failure.cases.front().polynomial_order != 2 ||
-      late_failure.cases.front().elements_per_direction != 3 ||
-      !DerivedSnapshotEmpty(late_failure.cases.front().test_snapshot) ||
-      std::any_of(late_failure.convergence.begin(),
-                  late_failure.convergence.end(),
-                  [](const auto& item) { return item.pass; }))
-  {
-    PrintFailure(late_failure, "prior_campaign_sanitization");
-    return 12;
+    FullDeviceRequest rollback_request;
+    rollback_request.enabled = true;
+    rollback_request.run_complete_ladder = true;
+    rollback_request.enable_test_oracle_staging = true;
+    rollback_request.inject_failure_after_first_update = true;
+    rollback_request.injected_failure_polynomial_order = p;
+    rollback_request.injected_failure_elements_per_direction = 3;
+    rollback_request.inject_nonfinite_before_rollback = true;
+    FullDeviceEvidence rollback;
+    if (dg::hdg::euler::RunSmoothEulerDeviceFullExperiment(rollback_request,
+                                                            rollback) ||
+        !ValidateRollbackEvidence(rollback, p))
+    {
+      PrintFailure(rollback, "p1_p4_n3_rollback_transaction");
+      return p == 1 ? 7 : 9;
+    }
+    ++rollback_count;
   }
 
   std::cout << "HDG_EULER_DEVICE_FULL_SUCCESS cases=" << evidence.cases.size()
-            << " rollback=restored\n";
+            << " global_oracles=" << global_oracle_count
+            << " rollbacks=" << rollback_count << " rollback=restored\n";
   if (umpire_audit_child) { umpire::mark_event(umpire_terminal_marker); }
   return 0;
 }

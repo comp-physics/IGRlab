@@ -1236,6 +1236,10 @@ void CaptureInitialSnapshot(const DeviceGraph& graph,
   CopyTestPrefix(storage.g, nt, snapshot.first_g, evidence.telemetry);
   if (stage_global_linear_oracle)
   {
+    CopyTestVector(storage.residual_r, snapshot.global_residual_r,
+                   evidence.telemetry);
+    CopyTestVector(storage.residual_g, snapshot.global_residual_g,
+                   evidence.telemetry);
     CopyTestVector(storage.a, snapshot.global_a, evidence.telemetry);
     CopyTestVector(storage.b, snapshot.global_b, evidence.telemetry);
     CopyTestVector(storage.c, snapshot.global_c, evidence.telemetry);
@@ -1807,7 +1811,7 @@ bool RunSmoothEulerDeviceFullExperiment(const FullDeviceRequest& request,
     FullDeviceMeshEvidence current;
     FullDeviceRequest case_request = request;
     case_request.enable_global_linear_oracle_staging =
-        request.enable_global_linear_oracle_staging && p == 1 && N == 3;
+        request.enable_global_linear_oracle_staging && N == 3;
     const bool passed = RunMeshCase(case_request, p, N, current);
     if (!passed)
     {
