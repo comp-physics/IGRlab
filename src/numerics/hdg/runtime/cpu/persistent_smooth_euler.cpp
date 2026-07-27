@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -555,9 +556,15 @@ struct CpuCollectiveTestLogicalState
       detail::CpuCollectiveTestFault::none;
   std::uint64_t arm_generation = 0;
   std::uint64_t local_consumption_count = 0;
+  std::uint64_t owner_incarnation = 0;
+  std::uint64_t consumed_incarnation = 0;
+  std::uint64_t last_rejected_incarnation = 0;
+  std::uint64_t local_wrong_owner_rejections = 0;
+  std::uint64_t local_reset_completions = 0;
   int target_rank = -1;
   int consumed_rank = -1;
   bool armed = false;
+  bool reset_collectively_attested = false;
 };
 
 // Arming, execution, and observation are deliberately confined to the same
@@ -565,21 +572,57 @@ struct CpuCollectiveTestLogicalState
 // or consume this private fault state.
 thread_local CpuCollectiveTestLogicalState collective_test_state{};
 
-bool ConsumeCollectiveTestFault(
-    const detail::CpuCollectiveTestFault expected, const int rank) noexcept
+bool ConsumeOwnedCollectiveTestFault(
+    const detail::CpuCollectiveTestFault expected, const int rank,
+    const std::uint64_t incarnation) noexcept
 {
   if (!collective_test_state.armed ||
       collective_test_state.armed_fault != expected)
   {
     return false;
   }
+  if (collective_test_state.owner_incarnation != incarnation)
+  {
+    ++collective_test_state.local_wrong_owner_rejections;
+    collective_test_state.last_rejected_incarnation = incarnation;
+    return false;
+  }
   collective_test_state.armed = false;
   collective_test_state.armed_fault = detail::CpuCollectiveTestFault::none;
   if (collective_test_state.target_rank != rank) { return false; }
   ++collective_test_state.local_consumption_count;
+  collective_test_state.consumed_incarnation = incarnation;
   collective_test_state.consumed_fault = expected;
   collective_test_state.consumed_rank = rank;
   return true;
+}
+
+void RecordCollectiveTestReset(const std::uint64_t incarnation,
+                               const bool collectively_attested) noexcept
+{
+  if (collective_test_state.owner_incarnation != incarnation) { return; }
+  if (collectively_attested)
+  {
+    ++collective_test_state.local_reset_completions;
+  }
+  collective_test_state.reset_collectively_attested = collectively_attested;
+}
+
+bool RefuseCollectiveTestReset(const std::uint64_t incarnation,
+                               const int rank) noexcept
+{
+  return collective_test_state.owner_incarnation == incarnation &&
+      collective_test_state.consumed_fault ==
+          detail::CpuCollectiveTestFault::
+              initialization_facade_readiness_reset_refusal &&
+      collective_test_state.target_rank == rank;
+}
+
+std::uint64_t NextCoreIncarnation() noexcept
+{
+  static std::atomic<std::uint64_t> next{1};
+  const std::uint64_t value = next.fetch_add(1, std::memory_order_relaxed);
+  return value == 0 ? 0 : value;
 }
 
 struct CpuCheckpointImportAdmission
@@ -628,15 +671,17 @@ std::uint64_t SumU64(const std::uint64_t local) noexcept
 } // namespace
 
 void detail::ArmCpuCollectiveTestFault(
-    const detail::CpuCollectiveTestFault fault, const int target_rank) noexcept
+    const detail::CpuCollectiveTestFault fault, const int target_rank,
+    const std::uint64_t owner_incarnation) noexcept
 {
   const std::uint64_t next_generation = collective_test_state.arm_generation + 1;
   collective_test_state = {};
   collective_test_state.arm_generation =
       next_generation == 0 ? 1 : next_generation;
   collective_test_state.armed_fault = fault;
+  collective_test_state.owner_incarnation = owner_incarnation;
   collective_test_state.target_rank = target_rank;
-  collective_test_state.armed =
+  collective_test_state.armed = owner_incarnation != 0 &&
       fault != detail::CpuCollectiveTestFault::none;
 }
 
@@ -650,10 +695,16 @@ detail::ObserveCpuCollectiveTestFault() noexcept
 {
   return {collective_test_state.arm_generation,
           collective_test_state.local_consumption_count,
+          collective_test_state.owner_incarnation,
+          collective_test_state.consumed_incarnation,
+          collective_test_state.last_rejected_incarnation,
+          collective_test_state.local_wrong_owner_rejections,
+          collective_test_state.local_reset_completions,
           collective_test_state.consumed_fault,
           collective_test_state.consumed_rank,
           collective_test_state.target_rank,
           collective_test_state.armed,
+          collective_test_state.reset_collectively_attested,
           true};
 }
 
@@ -1331,6 +1382,7 @@ struct detail::CpuNumericsCore::Implementation
 
   CpuPersistentConfig config{};
   RuntimeTupleDescriptor tuple{};
+  std::uint64_t incarnation = 0;
   int rank = -1;
   int ranks = 0;
   bool initialized = false;
@@ -1341,7 +1393,7 @@ struct detail::CpuNumericsCore::Implementation
   std::unique_ptr<mfem::DG_Interface_FECollection> trace_collection;
   std::unique_ptr<mfem::ParFiniteElementSpace> interior_space;
   std::unique_ptr<mfem::ParFiniteElementSpace> trace_space;
-  trace::DGInterfaceTraceExchangePlan exchange_plan;
+  std::optional<trace::DGInterfaceTraceExchangePlan> exchange_plan;
 
   CpuStateSlot committed_slot{};
   CpuStateSlot candidate_slot{};
@@ -1636,8 +1688,9 @@ struct detail::CpuNumericsCore::Implementation
     try
     {
       trace_distribution_workspace = 0.0;
-      local_prepared = !ConsumeCollectiveTestFault(
-          detail::CpuCollectiveTestFault::trace_load_preparation, rank);
+      local_prepared = exchange_plan && !ConsumeOwnedCollectiveTestFault(
+          detail::CpuCollectiveTestFault::trace_load_preparation, rank,
+          incarnation);
     }
     catch (...)
     {
@@ -1648,7 +1701,7 @@ struct detail::CpuNumericsCore::Implementation
     bool distributed = false;
     try
     {
-      distributed = exchange_plan.Distribute(
+      distributed = exchange_plan->Distribute(
           *trace_space, true_values, trace_distribution_workspace);
     }
     catch (...)
@@ -1686,6 +1739,7 @@ struct detail::CpuNumericsCore::Implementation
   {
     try
     {
+      if (!exchange_plan) { return false; }
       if (!ResizeOwned(interior_global_ids,
                        static_cast<std::size_t>(interior_space->GetVSize()),
                        CpuOwnedAllocationSite::topology_vector,
@@ -1751,12 +1805,13 @@ struct detail::CpuNumericsCore::Implementation
             const int local_dof = Decode(
                 vdofs[ByNodes(scalar, 2, component)], sign);
             if (local_dof < 0 ||
-                local_dof >= static_cast<int>(exchange_plan.map.dofs.entries.size()))
+                local_dof >= static_cast<int>(
+                    exchange_plan->map.dofs.entries.size()))
             {
               return false;
             }
             const trace::TraceMapEntry& entry =
-                exchange_plan.map.dofs.entries[
+                exchange_plan->map.dofs.entries[
                     static_cast<std::size_t>(local_dof)];
             if (entry.ownership != Ownership::owned) { continue; }
             const std::uint64_t canonical =
@@ -1971,10 +2026,10 @@ struct detail::CpuNumericsCore::Implementation
       *hypre_rhs = 1.0;
       *hypre_solution = 0.0;
       hypre_input_ready = Finite(*hypre_rhs) && Finite(*hypre_solution) &&
-          !ConsumeCollectiveTestFault(
+          !ConsumeOwnedCollectiveTestFault(
               detail::CpuCollectiveTestFault::
                   initialization_before_gmres_prime,
-              rank);
+              rank, incarnation);
     }
     catch (...)
     {
@@ -1985,6 +2040,10 @@ struct detail::CpuNumericsCore::Implementation
     bool prime_complete = true;
     try
     {
+      // This is the opaque-call boundary from the frozen card: all W8-owned
+      // preparation was admitted above.  If Mult returns, its result is
+      // consensused below.  An in-call interruption is process-terminal; this
+      // leaf neither injects it nor fabricates a RuntimeFailure/retry for it.
       gmres->Mult(*hypre_rhs, *hypre_solution);
       prime_complete = Finite(*hypre_solution);
     }
@@ -2075,6 +2134,7 @@ struct detail::CpuNumericsCore::Implementation
     {
       const auto prepare_outgoing = [&]() -> bool
       {
+      if (!exchange_plan) { return false; }
       for (int element = 0; element < mesh->GetNE(); ++element)
         for (int row = 0; row < local_trace; ++row)
         {
@@ -2082,11 +2142,11 @@ struct detail::CpuNumericsCore::Implementation
           const int row_dof = Decode(signed_trace_dofs[
               static_cast<std::size_t>(element) * local_trace + row], sign);
           if (row_dof < 0 || row_dof >= static_cast<int>(
-                  exchange_plan.map.dofs.entries.size()))
+                  exchange_plan->map.dofs.entries.size()))
           {
             return false;
           }
-          const auto& row_entry = exchange_plan.map.dofs.entries[
+          const auto& row_entry = exchange_plan->map.dofs.entries[
               static_cast<std::size_t>(row_dof)];
           const std::size_t count = static_cast<std::size_t>(local_trace);
           if (row_entry.owner_rank == rank) { owned_count += count; }
@@ -2117,7 +2177,7 @@ struct detail::CpuNumericsCore::Implementation
           const int row_dof = Decode(signed_trace_dofs[
               static_cast<std::size_t>(element) * local_trace + row],
                                      row_sign);
-          const auto& row_entry = exchange_plan.map.dofs.entries[
+          const auto& row_entry = exchange_plan->map.dofs.entries[
               static_cast<std::size_t>(row_dof)];
           for (int column = 0; column < local_trace; ++column)
           {
@@ -2126,11 +2186,11 @@ struct detail::CpuNumericsCore::Implementation
                 static_cast<std::size_t>(element) * local_trace + column],
                                           column_sign);
             if (column_dof < 0 || column_dof >= static_cast<int>(
-                    exchange_plan.map.dofs.entries.size()))
+                    exchange_plan->map.dofs.entries.size()))
             {
               return false;
             }
-            const auto& column_entry = exchange_plan.map.dofs.entries[
+            const auto& column_entry = exchange_plan->map.dofs.entries[
                 static_cast<std::size_t>(column_dof)];
             const std::size_t schur_index =
                 static_cast<std::size_t>(element) * local_trace * local_trace +
@@ -2164,10 +2224,10 @@ struct detail::CpuNumericsCore::Implementation
         return false;
       }
 
-      return !ConsumeCollectiveTestFault(
+      return !ConsumeOwnedCollectiveTestFault(
           detail::CpuCollectiveTestFault::
               initialization_before_sparse_count_exchange,
-          rank);
+          rank, incarnation);
       };
       outgoing_ready = prepare_outgoing();
     }
@@ -2203,10 +2263,10 @@ struct detail::CpuNumericsCore::Implementation
       {
         incoming_count = static_cast<std::size_t>(receive_count);
         incoming_keys.resize(incoming_count);
-        incoming_allocation_ready = !ConsumeCollectiveTestFault(
+        incoming_allocation_ready = !ConsumeOwnedCollectiveTestFault(
             detail::CpuCollectiveTestFault::
                 initialization_between_sparse_exchanges,
-            rank);
+            rank, incarnation);
       }
     }
     catch (...)
@@ -2391,6 +2451,9 @@ struct detail::CpuNumericsCore::Implementation
     bool parallel_assembly_ready = false;
     try
     {
+      // ParallelAssemble is opaque.  The complete W8-owned graph was admitted
+      // above, and every returned result is consensused below.  No in-call
+      // failure seam or same-process recovery claim exists here.
       true_matrix.reset(parallel_form->ParallelAssemble(local_matrix.get()));
       parallel_assembly_ready = ObserveWrapper(true_matrix) && true_matrix &&
           true_matrix->Height() == trace_space->GetTrueVSize() &&
@@ -2868,8 +2931,9 @@ struct detail::CpuNumericsCore::Implementation
       local_prepared = local_prepared && Finite(local_trace_residual) &&
           Finite(local_interior_squared) &&
           trace_space && trace_space->Dof_TrueDof_Matrix() &&
-          !ConsumeCollectiveTestFault(
-              detail::CpuCollectiveTestFault::residual_map_preparation, rank);
+          !ConsumeOwnedCollectiveTestFault(
+              detail::CpuCollectiveTestFault::residual_map_preparation, rank,
+              incarnation);
     }
     catch (...)
     {
@@ -3130,10 +3194,10 @@ struct detail::CpuNumericsCore::Implementation
             incoming_schur_values.size() <=
                    static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
             Finite(outgoing_schur_values) &&
-            !ConsumeCollectiveTestFault(
+            !ConsumeOwnedCollectiveTestFault(
                 detail::CpuCollectiveTestFault::
                     condensation_outgoing_preparation,
-                rank);
+                rank, incarnation);
       };
       outgoing_ready = prepare_outgoing();
     }
@@ -3347,10 +3411,11 @@ struct detail::CpuNumericsCore::Implementation
 
   bool Recover() noexcept
   {
-    bool distribution_prepared = true;
+    bool distribution_prepared = false;
     try
     {
       distributed_increment = 0.0;
+      distribution_prepared = exchange_plan.has_value();
     }
     catch (...)
     {
@@ -3361,7 +3426,7 @@ struct detail::CpuNumericsCore::Implementation
     bool distributed_ready = false;
     try
     {
-      distributed_ready = exchange_plan.Distribute(
+      distributed_ready = exchange_plan->Distribute(
           *trace_space, true_increment, distributed_increment);
     }
     catch (...)
@@ -3556,8 +3621,10 @@ bool AssignGridFunction(mfem::ParGridFunction& destination,
 } // namespace
 
 detail::CpuNumericsCore::CpuNumericsCore()
-    : implementation_(std::make_unique<Implementation>())
+    : implementation_(std::make_unique<Implementation>()),
+      incarnation_(NextCoreIncarnation())
 {
+  implementation_->incarnation = incarnation_;
   (void)implementation_->allocations.Observe(
       CpuOwnedAllocationSite::core_wrapper, sizeof(Implementation),
       alignof(Implementation), 1, implementation_.get());
@@ -3570,22 +3637,68 @@ detail::CpuNumericsCore& detail::CpuNumericsCore::operator=(
 
 bool detail::CpuNumericsCore::ResetAfterInitializationFailure() noexcept
 {
-  std::unique_ptr<Implementation> replacement;
-  bool local_ready = false;
-  try
+  // The exchange plan is optional, so an empty Implementation performs no
+  // selected W8-owned allocation.  Reverse member destruction releases every
+  // dependent solver/space/mesh object before the same fixed core storage is
+  // reconstructed.  No make_unique/vector resize occurs on this reset path.
+  Implementation* const storage = implementation_.get();
+  bool local_ready = storage != nullptr && incarnation_ != 0;
+  const int previous_rank = local_ready ? storage->rank : -1;
+  if (local_ready)
   {
-    replacement = std::make_unique<Implementation>();
-    local_ready = replacement->allocations.Observe(
+    storage->~Implementation();
+    ::new (static_cast<void*>(storage)) Implementation();
+    storage->incarnation = incarnation_;
+    local_ready = storage->allocations.Observe(
         CpuOwnedAllocationSite::core_wrapper, sizeof(Implementation),
-        alignof(Implementation), 1, replacement.get());
+        alignof(Implementation), 1, storage) && !storage->initialized &&
+        !storage->mesh && !storage->interior_space &&
+        !storage->trace_space && !storage->exchange_plan &&
+        !storage->committed_slot.interior.cell &&
+        !storage->candidate_slot.interior.cell && !storage->true_matrix &&
+        !storage->gmres && !storage->ilu &&
+        !RefuseCollectiveTestReset(incarnation_, previous_rank);
   }
-  catch (...)
-  {
-    local_ready = false;
-  }
-  if (!AllRanks(local_ready)) { return false; }
-  implementation_ = std::move(replacement);
-  return true;
+  const bool reset_complete = AllRanks(local_ready);
+  RecordCollectiveTestReset(incarnation_, reset_complete);
+  return reset_complete;
+}
+
+bool detail::CpuNumericsCore::AdmitInitialization(
+    const bool facade_empty, const CpuPersistentConfig& config,
+    const RuntimeTupleDescriptor& tuple) const noexcept
+{
+  const Implementation& state = *implementation_;
+  int mpi_initialized = 0;
+  int mpi_finalized = 0;
+  int ranks = 0;
+  MPI_Initialized(&mpi_initialized);
+  MPI_Finalized(&mpi_finalized);
+  const bool local_ready = facade_empty && incarnation_ != 0 &&
+      state.incarnation == incarnation_ && !state.initialized &&
+      mpi_initialized != 0 && mpi_finalized == 0 &&
+      MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS &&
+      (ranks == 1 || ranks == 2) && ExactConfig(config) &&
+      ExactTuple(tuple, ranks);
+  return AllRanks(local_ready);
+}
+
+bool detail::CpuNumericsCore::CollectiveAll(const bool local) const noexcept
+{
+  return AllRanks(local);
+}
+
+bool detail::CpuNumericsCore::ConsumeCollectiveTestFault(
+    const detail::CpuCollectiveTestFault fault) noexcept
+{
+  const Implementation& state = *implementation_;
+  return ConsumeOwnedCollectiveTestFault(
+      fault, state.rank, incarnation_);
+}
+
+std::uint64_t detail::CpuNumericsCore::incarnation() const noexcept
+{
+  return incarnation_;
 }
 
 bool detail::CpuNumericsCore::Initialize(
@@ -3715,15 +3828,16 @@ bool detail::CpuNumericsCore::Initialize(
 
   try
   {
+    state.exchange_plan.emplace();
     local_ok = trace::BuildDGInterfaceTraceExchangePlan(
-        *state.trace_space, state.exchange_plan);
+        *state.trace_space, *state.exchange_plan);
   }
   catch (...)
   {
     local_ok = false;
   }
   if (!AllRanks(local_ok)) { return false; }
-  local_ok = state.exchange_plan.IsConsistent();
+  local_ok = state.exchange_plan && state.exchange_plan->IsConsistent();
   if (!AllRanks(local_ok)) { return false; }
 
   local_ok = state.BuildTopology();
@@ -4073,8 +4187,9 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   }
   bool assembled = state.Assemble(
       *state.iterate_interior, *state.iterate_trace, state.current_system);
-  const bool assembly_fault = ConsumeCollectiveTestFault(
-      detail::CpuCollectiveTestFault::assembly_completion, state.rank);
+  const bool assembly_fault = ConsumeOwnedCollectiveTestFault(
+      detail::CpuCollectiveTestFault::assembly_completion, state.rank,
+      state.incarnation);
   assembled = assembled && !assembly_fault;
   if (!state.CollectiveAll(assembled))
   {
