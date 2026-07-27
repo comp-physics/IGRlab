@@ -640,11 +640,28 @@ enum class CpuCollectiveTestFault : unsigned char
   trace_load_preparation,
   assembly_completion,
   residual_map_preparation,
-  condensation_outgoing_preparation
+  condensation_outgoing_preparation,
+  initialization_before_sparse_count_exchange,
+  initialization_between_sparse_exchanges,
+  initialization_before_gmres_prime
 };
 
+struct CpuCollectiveTestConsumptionEvidence
+{
+  std::uint64_t arm_generation = 0;
+  std::uint64_t local_consumption_count = 0;
+  CpuCollectiveTestFault consumed_fault = CpuCollectiveTestFault::none;
+  int consumed_rank = -1;
+  int target_rank = -1;
+  bool armed = false;
+  bool thread_confined = true;
+};
+
+// Arm, execute, and observe on the same test thread.  The thread-confined
+// logical state prevents an unrelated concurrent adapter from consuming it.
 void ArmCpuCollectiveTestFault(CpuCollectiveTestFault, int target_rank) noexcept;
 void ResetCpuCollectiveTestFault() noexcept;
+CpuCollectiveTestConsumptionEvidence ObserveCpuCollectiveTestFault() noexcept;
 
 struct CpuInitialization
 {
@@ -674,6 +691,7 @@ public:
   bool Initialize(const CpuPersistentConfig&,
                   const RuntimeTupleDescriptor&,
                   CpuInitialization&) noexcept;
+  bool ResetAfterInitializationFailure() noexcept;
   CpuNumericalResult Execute(const AttemptIdentity&,
                              const StateCoordinates&,
                              const CpuFailureInjection&) noexcept;
@@ -756,7 +774,11 @@ public:
       return false;
     }
     detail::CpuInitialization initialized;
-    if (!core_.Initialize(config, tuple, initialized)) { return false; }
+    if (!core_.Initialize(config, tuple, initialized))
+    {
+      (void)core_.ResetAfterInitializationFailure();
+      return false;
+    }
     try
     {
       contract_ = std::make_unique<contract_type>(

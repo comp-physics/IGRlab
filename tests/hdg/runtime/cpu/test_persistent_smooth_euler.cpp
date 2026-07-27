@@ -739,11 +739,112 @@ void CheckProductNegatives(Checks& checks)
   }
 }
 
+bool ExactRank1FaultConsumption(
+    MPI_Comm communicator, const int rank,
+    const cpu_detail::CpuCollectiveTestFault expected,
+    const cpu_detail::CpuCollectiveTestConsumptionEvidence& evidence)
+{
+  const unsigned long long local_count =
+      static_cast<unsigned long long>(evidence.local_consumption_count);
+  unsigned long long global_count = 0;
+  const int count_status = MPI_Allreduce(
+      &local_count, &global_count, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM,
+      communicator);
+  const bool local_exact = evidence.arm_generation != 0 &&
+      evidence.target_rank == 1 && !evidence.armed &&
+      evidence.thread_confined &&
+      (rank == 1
+           ? evidence.local_consumption_count == 1 &&
+                 evidence.consumed_rank == 1 &&
+                 evidence.consumed_fault == expected
+           : evidence.local_consumption_count == 0 &&
+                 evidence.consumed_rank == -1 &&
+                 evidence.consumed_fault ==
+                     cpu_detail::CpuCollectiveTestFault::none);
+  int local_valid = local_exact ? 1 : 0;
+  int all_valid = 0;
+  const int validity_status = MPI_Allreduce(
+      &local_valid, &all_valid, 1, MPI_INT, MPI_MIN, communicator);
+  return count_status == MPI_SUCCESS && validity_status == MPI_SUCCESS &&
+      global_count == 1 && all_valid == 1;
+}
+
+bool SameFaultObservation(
+    const cpu_detail::CpuCollectiveTestConsumptionEvidence& left,
+    const cpu_detail::CpuCollectiveTestConsumptionEvidence& right) noexcept
+{
+  return left.arm_generation == right.arm_generation &&
+      left.local_consumption_count == right.local_consumption_count &&
+      left.consumed_fault == right.consumed_fault &&
+      left.consumed_rank == right.consumed_rank &&
+      left.target_rank == right.target_rank && left.armed == right.armed &&
+      left.thread_confined == right.thread_confined;
+}
+
 template <typename Selection>
-void CheckAsymmetricCollectiveNumericsFaults(
-    Checks& checks, MPI_Comm communicator, const int ranks)
+void CheckAsymmetricCollectiveInitializationFaults(
+    Checks& checks, MPI_Comm communicator, const int rank, const int ranks)
 {
   if (ranks != 2) { return; }
+  PersistentSmoothEulerCpuAdapter<Selection> truth;
+  checks.Require(truth.Initialize(),
+                 "uninterrupted initialization truth setup");
+  const CpuStateSnapshot expected = truth.Snapshot();
+  const std::vector<double> expected_interior = CopyView(expected.interior);
+  const std::vector<double> expected_trace = CopyView(expected.trace);
+
+  const std::array<cpu_detail::CpuCollectiveTestFault, 3> faults{{
+      cpu_detail::CpuCollectiveTestFault::
+          initialization_before_sparse_count_exchange,
+      cpu_detail::CpuCollectiveTestFault::
+          initialization_between_sparse_exchanges,
+      cpu_detail::CpuCollectiveTestFault::initialization_before_gmres_prime}};
+  for (const cpu_detail::CpuCollectiveTestFault fault : faults)
+  {
+    cpu_detail::ResetCpuCollectiveTestFault();
+    cpu_detail::ArmCpuCollectiveTestFault(fault, 1);
+    PersistentSmoothEulerCpuAdapter<Selection> adapter;
+    const bool initialized = adapter.Initialize();
+    checks.Require(CollectivelyFalse(initialized, communicator),
+                   "rank1 initialization fault fails collectively");
+    const auto consumed = cpu_detail::ObserveCpuCollectiveTestFault();
+    checks.Require(ExactRank1FaultConsumption(
+                       communicator, rank, fault, consumed),
+                   "initialization fault has one exact rank1 consumption");
+
+    const bool reentered = adapter.Initialize();
+    const auto after_reentry = cpu_detail::ObserveCpuCollectiveTestFault();
+    const CpuStateSnapshot actual = adapter.Snapshot();
+    const bool reentry_consumption_exact = ExactRank1FaultConsumption(
+        communicator, rank, fault, after_reentry);
+    checks.Require(reentered && SameFaultObservation(consumed, after_reentry) &&
+                       reentry_consumption_exact,
+                   "initialization seam is automatic one-shot before cleanup");
+    checks.Require(ByteEqual(actual.interior, expected_interior) &&
+                       ByteEqual(actual.trace, expected_trace) &&
+                       actual.interior_hash == expected.interior_hash &&
+                       actual.trace_hash == expected.trace_hash &&
+                       actual.state_hash == expected.state_hash &&
+                       actual.coordinates.step == 0 &&
+                       NearTime(actual.coordinates.time, 0.0),
+                   "reentered initialization matches uninterrupted truth");
+    cpu_detail::ResetCpuCollectiveTestFault();
+  }
+}
+
+template <typename Selection>
+void CheckAsymmetricCollectiveNumericsFaults(
+    Checks& checks, MPI_Comm communicator, const int rank, const int ranks)
+{
+  if (ranks != 2) { return; }
+  PersistentSmoothEulerCpuAdapter<Selection> truth;
+  const bool truth_initialized = truth.Initialize();
+  const AttemptOutcome truth_advance = truth.Advance();
+  checks.Require(truth_initialized && truth_advance.committed,
+                 "uninterrupted numerical truth setup");
+  const CpuStateSnapshot expected = truth.Snapshot();
+  const std::vector<double> expected_interior = CopyView(expected.interior);
+  const std::vector<double> expected_trace = CopyView(expected.trace);
   struct Case
   {
     cpu_detail::CpuCollectiveTestFault fault;
@@ -777,6 +878,10 @@ void CheckAsymmetricCollectiveNumericsFaults(
     checks.Require(prepared_call && commonly_not_ready &&
                        prepared.failure_phase == test_case.phase,
                    "one-rank numerical preparation fault fails commonly");
+    const auto consumed = cpu_detail::ObserveCpuCollectiveTestFault();
+    checks.Require(ExactRank1FaultConsumption(
+                       communicator, rank, test_case.fault, consumed),
+                   "numerical fault has one exact rank1 consumption");
     const AttemptOutcome failure = adapter.FinalizePrepared(prepared);
     const CpuStateSnapshot rolled_back = adapter.Snapshot();
     checks.Require(CollectivelyFalse(failure.committed, communicator) &&
@@ -792,14 +897,27 @@ void CheckAsymmetricCollectiveNumericsFaults(
                        NearTime(rolled_back.coordinates.time, 0.0),
                    "asymmetric numerical fault rolls back without publication");
 
-    cpu_detail::ResetCpuCollectiveTestFault();
     CpuPreparedStep retry;
     checks.Require(adapter.PrepareRetry(retry) && retry.numerically_ready,
                    "asymmetric numerical fault permits collective retry");
     const AttemptOutcome retried = adapter.FinalizePrepared(retry);
+    const auto after_retry = cpu_detail::ObserveCpuCollectiveTestFault();
+    const CpuStateSnapshot actual = adapter.Snapshot();
+    const bool retry_consumption_exact = ExactRank1FaultConsumption(
+        communicator, rank, test_case.fault, after_retry);
     checks.Require(retried.committed && adapter.coordinates().step == 1 &&
-                       NearTime(adapter.coordinates().time, 0.05),
-                   "cleared numerical seam re-enters and commits step 1");
+                       NearTime(adapter.coordinates().time, 0.05) &&
+                       SameFaultObservation(consumed, after_retry) &&
+                       retry_consumption_exact,
+                   "automatic one-shot numerical seam retries before cleanup");
+    checks.Require(ByteEqual(actual.interior, expected_interior) &&
+                       ByteEqual(actual.trace, expected_trace) &&
+                       actual.interior_hash == expected.interior_hash &&
+                       actual.trace_hash == expected.trace_hash &&
+                       actual.state_hash == expected.state_hash &&
+                       actual.coordinates.step == 1 &&
+                       NearTime(actual.coordinates.time, 0.05),
+                   "numerical retry matches uninterrupted step-1 truth");
     cpu_detail::ResetCpuCollectiveTestFault();
   }
 }
@@ -1165,8 +1283,10 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                  "independent mesh/source/flux/Jacobian/signed-map/Schur/"
                  "P^TSP/true-residual/distribute/recovery oracle");
 
+  CheckAsymmetricCollectiveInitializationFaults<Selection>(
+      checks, communicator, rank, ranks);
   CheckAsymmetricCollectiveNumericsFaults<Selection>(
-      checks, communicator, ranks);
+      checks, communicator, rank, ranks);
 
   PersistentSmoothEulerCpuAdapter<Selection> adapter;
   checks.Require(adapter.Initialize(), "persistent adapter initialization");
