@@ -546,6 +546,37 @@ bool AllRanks(const bool local) noexcept
                        MPI_COMM_WORLD) == MPI_SUCCESS && reduced == 1;
 }
 
+struct CpuCheckpointImportAdmission
+{
+  CheckpointDescriptor descriptor{};
+  std::uint32_t representation_version = 1;
+  int local_ready = 0;
+};
+static_assert(std::is_trivially_copyable<
+                  CpuCheckpointImportAdmission>::value,
+              "checkpoint import admission has a fixed MPI representation");
+
+bool AdmitCpuCheckpointImport(const CheckpointDescriptor& descriptor,
+                              const bool local_ready) noexcept
+{
+  const CpuCheckpointImportAdmission admission{
+      descriptor, 1, local_ready ? 1 : 0};
+  int ranks = 0;
+  const bool same = ContextsEqual(
+      admission,
+      [](const CpuCheckpointImportAdmission& left,
+         const CpuCheckpointImportAdmission& right)
+      {
+        return left.representation_version == 1 &&
+            right.representation_version == 1 && left.local_ready == 1 &&
+            right.local_ready == 1 &&
+            ::dg::hdg::runtime::detail::SameCheckpoint(
+                left.descriptor, right.descriptor);
+      },
+      ranks);
+  return same && descriptor.rank_count == static_cast<std::uint32_t>(ranks);
+}
+
 std::uint64_t SumU64(const std::uint64_t local) noexcept
 {
   unsigned long long input = static_cast<unsigned long long>(local);
@@ -799,49 +830,79 @@ bool ImportCpuCheckpoint(const CheckpointDescriptor& descriptor,
                          const std::size_t local_true_trace_size,
                          CpuCheckpoint& checkpoint) noexcept
 {
-  if (checkpoint.valid || !descriptor.successful_commit ||
-      (!local_interior && local_interior_size != 0) ||
-      (!local_true_trace && local_true_trace_size != 0))
+  const bool local_arguments_ready = !checkpoint.valid &&
+      descriptor.successful_commit &&
+      (local_interior || local_interior_size == 0) &&
+      (local_true_trace || local_true_trace_size == 0) &&
+      local_interior_size <=
+          std::numeric_limits<std::size_t>::max() / sizeof(double) &&
+      local_true_trace_size <=
+          std::numeric_limits<std::size_t>::max() / sizeof(double);
+  // Phase 1: one fixed admission record gathers local readiness and the full
+  // descriptor identity.  Every subsequent return is behind a consensus.
+  if (!AdmitCpuCheckpointImport(descriptor, local_arguments_ready))
   {
     return false;
   }
+
+  CpuOwnedAllocationLedger checkpoint_allocations;
+  CpuStateSlot imported{};
+  bool local_prepared = false;
   try
   {
-    CpuOwnedAllocationLedger checkpoint_allocations;
-    CpuStateSlot imported = MakeSlot(local_interior_size,
-                                     local_true_trace_size,
-                                     checkpoint_allocations);
+    imported = MakeSlot(local_interior_size, local_true_trace_size,
+                        checkpoint_allocations);
     CpuSlotStorage* storage = Storage(imported);
-    if (!storage) { return false; }
-    if (local_interior_size != 0)
+    if (storage && checkpoint_allocations.count <=
+                       checkpoint.owned_allocation_events.size())
     {
-      std::memcpy(storage->interior.data(), local_interior,
-                  local_interior_size * sizeof(double));
+      if (local_interior_size != 0)
+      {
+        std::memcpy(storage->interior.data(), local_interior,
+                    local_interior_size * sizeof(double));
+      }
+      if (local_true_trace_size != 0)
+      {
+        std::memcpy(storage->trace.data(), local_true_trace,
+                    local_true_trace_size * sizeof(double));
+      }
+      local_prepared = storage->interior.size() == local_interior_size &&
+          storage->trace.size() == local_true_trace_size;
     }
-    if (local_true_trace_size != 0)
-    {
-      std::memcpy(storage->trace.data(), local_true_trace,
-                  local_true_trace_size * sizeof(double));
-    }
-    const bool local_ok = Finite(storage->interior) && Finite(storage->trace) &&
-        CpuStateStoragePolicy::HashInterior(imported.interior) ==
-            descriptor.interior_hash &&
-        CpuStateStoragePolicy::HashTrace(imported.trace) ==
-            descriptor.trace_hash;
-    if (!AllRanks(local_ok)) { return false; }
-    checkpoint.descriptor = descriptor;
-    checkpoint.state = std::move(imported);
-    checkpoint.owned_allocation_event_count = checkpoint_allocations.count;
-    std::copy_n(checkpoint_allocations.events.begin(),
-                checkpoint_allocations.count,
-                checkpoint.owned_allocation_events.begin());
-    checkpoint.valid = true;
-    return true;
   }
   catch (...)
   {
-    return false;
+    local_prepared = false;
   }
+  // Phase 2: allocation/copy exceptions are reduced after every rank has
+  // attempted its local preparation.
+  if (!AllRanks(local_prepared)) { return false; }
+
+  const CpuSlotStorage* storage = Storage(imported);
+  const bool local_interior_finite = storage && Finite(storage->interior);
+  const bool local_trace_finite = storage && Finite(storage->trace);
+  // Phase 3: no rank enters a rank-common hash unless all local bytes are
+  // finite and both local checks have run.
+  if (!AllRanks(local_interior_finite && local_trace_finite)) { return false; }
+
+  // The preparation and finite consensuses make both vectors valid on every
+  // rank, so neither rank-common hash can be skipped by a local guard.
+  const StateHash imported_interior_hash = RankCommonHash(storage->interior);
+  const StateHash imported_trace_hash = RankCommonHash(storage->trace);
+  const bool local_hashes_match =
+      imported_interior_hash == descriptor.interior_hash &&
+      imported_trace_hash == descriptor.trace_hash;
+  // Phase 6 follows the ordered interior/trace hash collectives (phases 4/5).
+  if (!AllRanks(local_hashes_match)) { return false; }
+
+  checkpoint.descriptor = descriptor;
+  checkpoint.state = std::move(imported);
+  std::copy_n(checkpoint_allocations.events.begin(),
+              checkpoint_allocations.count,
+              checkpoint.owned_allocation_events.begin());
+  checkpoint.owned_allocation_event_count = checkpoint_allocations.count;
+  checkpoint.valid = true;
+  return true;
 }
 
 CollectiveAdmissionReport CpuWorldCollectivePolicy::Admit(
