@@ -499,8 +499,10 @@ BuildPersistentTrueSystem() noexcept
       hypre_action_.emplace(*true_matrix_);
       ilu_.emplace();
       gmres_.emplace(*true_matrix_);
+      CudaHypreSetupOrderEvidence initial_setup{};
       local_objects_ready = CudaConfigurePersistentHypre(
-          *true_matrix_, *ilu_, *gmres_, ranks_);
+          *true_matrix_, *ilu_, *gmres_, ranks_, 0, initial_setup) &&
+          initial_setup.ConfigurationExactForGeneration(0);
     }
     if (local_objects_ready)
     {
@@ -551,7 +553,8 @@ BuildPersistentTrueSystem() noexcept
   CudaSolveDiagnostics warm{};
   const bool warmed = CudaRefreshFactorAndSolve(
       *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_, ranks_,
-      warm) && warm.device_policy && warm.configured_ilu0;
+      0, warm) && warm.device_policy && warm.configured_ilu0 &&
+      warm.matrix_generation == 0;
   return CollectiveContinue(warmed);
 }
 
@@ -863,12 +866,8 @@ Ticket(const CudaFailurePhase phase) noexcept
           CudaTransferSite::scalar_status) ||
       !TransportPolicy::Synchronize(CudaTransferSite::scalar_status))
     return false;
-  const bool valid = words[0] == 1 && words[1] == 1200 &&
-      words[2] == device_ && words[3] == static_cast<int>(phase) &&
-      static_cast<std::uint32_t>(words[4]) ==
-          static_cast<std::uint32_t>(current_attempt_.sequence) &&
-      static_cast<std::uint32_t>(words[6]) ==
-          static_cast<std::uint32_t>(current_generation_);
+  const bool valid = CudaTicketWordsValid(
+      words, phase, current_attempt_.sequence, current_generation_, device_);
   if (valid && ticket_count_ < tickets_.size())
     tickets_[ticket_count_++] = {phase, current_attempt_.sequence,
                                  current_generation_, words[1], words[2],
@@ -1091,13 +1090,15 @@ AssembleTrueSystem() noexcept
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
-SolveTrueSystem(double& true_relative_residual) noexcept
+SolveTrueSystem(double& true_relative_residual,
+                const std::uint64_t matrix_generation) noexcept
 {
   CudaSolveDiagnostics diagnostics{};
   const bool local_solve = CudaRefreshFactorAndSolve(
           *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-          ranks_, diagnostics) &&
+          ranks_, matrix_generation, diagnostics) &&
       diagnostics.device_policy && diagnostics.configured_ilu0 &&
+      diagnostics.matrix_generation == matrix_generation &&
       diagnostics.converged && diagnostics.finite;
   if (!CollectiveContinue(local_solve))
     return false;

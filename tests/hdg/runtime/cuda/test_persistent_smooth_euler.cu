@@ -26,6 +26,115 @@ namespace
 using namespace dg::hdg::runtime;
 using namespace dg::hdg::runtime::cuda_w8a;
 
+constexpr detail::CudaHypreSetupOrderEvidence ExactHypreSetup(
+    const std::uint64_t generation, const bool include_mult) noexcept
+{
+  detail::CudaHypreSetupOrderEvidence evidence{};
+  evidence.matrix_generation = generation;
+  evidence.Record(detail::CudaHypreSetupAction::bind_preconditioner);
+  evidence.Record(detail::CudaHypreSetupAction::set_operator);
+  evidence.Record(detail::CudaHypreSetupAction::ilu_type0);
+  evidence.Record(detail::CudaHypreSetupAction::ilu_fill0);
+  evidence.Record(detail::CudaHypreSetupAction::ilu_reorder0);
+  evidence.Record(detail::CudaHypreSetupAction::ilu_maxiter1);
+  evidence.Record(detail::CudaHypreSetupAction::ilu_tol0);
+  evidence.Record(detail::CudaHypreSetupAction::ilu_print0);
+  evidence.Record(detail::CudaHypreSetupAction::rebind_preconditioner);
+  evidence.Record(detail::CudaHypreSetupAction::gmres_settings);
+  if (include_mult)
+    evidence.Record(detail::CudaHypreSetupAction::mult);
+  return evidence;
+}
+
+constexpr detail::CudaHypreSetupOrderEvidence LegacyPreOperatorIluSetup(
+    const std::uint64_t generation) noexcept
+{
+  detail::CudaHypreSetupOrderEvidence evidence{};
+  evidence.matrix_generation = generation;
+  evidence.Record(detail::CudaHypreSetupAction::ilu_type0);
+  evidence.Record(detail::CudaHypreSetupAction::ilu_fill0);
+  evidence.Record(detail::CudaHypreSetupAction::ilu_reorder0);
+  evidence.Record(detail::CudaHypreSetupAction::ilu_maxiter1);
+  evidence.Record(detail::CudaHypreSetupAction::ilu_tol0);
+  evidence.Record(detail::CudaHypreSetupAction::ilu_print0);
+  evidence.Record(detail::CudaHypreSetupAction::gmres_settings);
+  evidence.Record(detail::CudaHypreSetupAction::bind_preconditioner);
+  evidence.Record(detail::CudaHypreSetupAction::set_operator);
+  evidence.Record(detail::CudaHypreSetupAction::mult);
+  return evidence;
+}
+
+constexpr auto exact_configured_hypre = ExactHypreSetup(17, false);
+constexpr auto exact_solved_hypre = ExactHypreSetup(17, true);
+constexpr auto legacy_pre_operator_hypre = LegacyPreOperatorIluSetup(17);
+static_assert(exact_configured_hypre.ConfigurationExactForGeneration(17));
+static_assert(!exact_configured_hypre.SolveExactForGeneration(17));
+static_assert(exact_solved_hypre.SolveExactForGeneration(17));
+static_assert(!exact_solved_hypre.SolveExactForGeneration(18));
+static_assert(
+    !legacy_pre_operator_hypre.ConfigurationExactForGeneration(17));
+static_assert(!legacy_pre_operator_hypre.SolveExactForGeneration(17));
+
+bool HypreIluGenerationSetupRegression() noexcept
+{
+  const auto configured = ExactHypreSetup(29, false);
+  const auto solved = ExactHypreSetup(29, true);
+  const auto legacy = LegacyPreOperatorIluSetup(29);
+  return configured.ConfigurationExactForGeneration(29) &&
+      !configured.SolveExactForGeneration(29) &&
+      solved.SolveExactForGeneration(29) &&
+      !solved.SolveExactForGeneration(28) &&
+      !legacy.ConfigurationExactForGeneration(29) &&
+      !legacy.SolveExactForGeneration(29);
+}
+
+constexpr std::array<int, 8> TicketWords(
+    const CudaFailurePhase phase, const std::uint64_t attempt,
+    const std::uint64_t generation, const int device) noexcept
+{
+  return {{1, 1200, device, static_cast<int>(phase),
+           static_cast<int>(attempt), static_cast<int>(attempt >> 32U),
+           static_cast<int>(generation),
+           static_cast<int>(generation >> 32U)}};
+}
+
+constexpr std::uint64_t synthetic_attempt =
+    (std::uint64_t{5} << 32U) | 17U;
+constexpr std::uint64_t synthetic_generation =
+    (std::uint64_t{9} << 32U) | 23U;
+constexpr auto exact_ticket_words = TicketWords(
+    CudaFailurePhase::trace_solve, synthetic_attempt,
+    synthetic_generation, 0);
+constexpr auto wrong_attempt_high_words = TicketWords(
+    CudaFailurePhase::trace_solve,
+    synthetic_attempt ^ (std::uint64_t{1} << 32U),
+    synthetic_generation, 0);
+constexpr auto wrong_generation_high_words = TicketWords(
+    CudaFailurePhase::trace_solve, synthetic_attempt,
+    synthetic_generation ^ (std::uint64_t{1} << 32U), 0);
+static_assert(detail::CudaTicketWordsValid(
+    exact_ticket_words, CudaFailurePhase::trace_solve, synthetic_attempt,
+    synthetic_generation, 0));
+static_assert(!detail::CudaTicketWordsValid(
+    wrong_attempt_high_words, CudaFailurePhase::trace_solve,
+    synthetic_attempt, synthetic_generation, 0));
+static_assert(!detail::CudaTicketWordsValid(
+    wrong_generation_high_words, CudaFailurePhase::trace_solve,
+    synthetic_attempt, synthetic_generation, 0));
+
+bool TicketHighHalfRegression() noexcept
+{
+  return detail::CudaTicketWordsValid(
+             exact_ticket_words, CudaFailurePhase::trace_solve,
+             synthetic_attempt, synthetic_generation, 0) &&
+      !detail::CudaTicketWordsValid(
+          wrong_attempt_high_words, CudaFailurePhase::trace_solve,
+          synthetic_attempt, synthetic_generation, 0) &&
+      !detail::CudaTicketWordsValid(
+          wrong_generation_high_words, CudaFailurePhase::trace_solve,
+          synthetic_attempt, synthetic_generation, 0);
+}
+
 struct TestModelTag
 {
   inline static constexpr std::string_view id = "euler.compressible.2d";
@@ -151,6 +260,7 @@ struct AuditedAllocator
   inline static std::uint64_t ordinal = 0;
   // The production allocator deliberately retains generations across resets.
   inline static std::uint64_t generation = 0;
+  inline static std::uint64_t w8_owned_allocation_calls = 0;
 
   static void ResetLedger() noexcept
   {
@@ -203,6 +313,7 @@ struct AuditedAllocator
                        const CudaAllocationSite site,
                        void*& pointer) noexcept
   {
+    ++w8_owned_allocation_calls;
     const bool success = UmpireDeviceAllocatorPolicy::Allocate(
         bytes, alignment, site, pointer);
     Record(site, bytes, alignment, pointer, true, success);
@@ -244,6 +355,8 @@ struct AuditedAllocator
 
   static std::uint64_t AllocationEvents() noexcept
   { return UmpireDeviceAllocatorPolicy::AllocationEvents(); }
+  static std::uint64_t W8OwnedAllocationCalls() noexcept
+  { return w8_owned_allocation_calls; }
   static std::uint64_t DeallocationEvents() noexcept
   { return UmpireDeviceAllocatorPolicy::DeallocationEvents(); }
   static bool DevicePoolPolicyValid() noexcept
@@ -663,7 +776,8 @@ bool ExactFailedStagingEvidence(const CudaStepEvidence& evidence,
 
 bool SetupValid(const CudaRunEvidence& setup, const int ranks) noexcept
 {
-  return setup.status == CudaRunStatus::ready && setup.ranks == ranks &&
+  return setup.status == CudaRunStatus::ready &&
+      setup.setup_origin == FailureReason::none && setup.ranks == ranks &&
       setup.device == 0 && setup.mfem_device_valid &&
       setup.hypre_cuda_umpire_device && setup.same_physical_gpu &&
       setup.signed_owner_ghost_semantics &&
@@ -683,6 +797,9 @@ bool SetupValid(const CudaRunEvidence& setup, const int ranks) noexcept
       setup.reuse.trace_slot_tokens[1] != 0 &&
       setup.reuse.trace_slot_tokens[0] != setup.reuse.trace_slot_tokens[1] &&
       setup.reuse.post_baseline_allocation_events == 0 &&
+      setup.reuse.post_baseline_w8_owned_allocation_calls == 0 &&
+      setup.reuse.observes_w8_owned_calls_and_pool_growth_only &&
+      !setup.reuse.opaque_pool_reuse_churn_observed &&
       ExactPolicyLedgers();
 }
 
@@ -699,6 +816,36 @@ template <typename Backend>
 using TestEngine = PersistentCudaSmoothEulerEngine<
     TestSelection<Backend>, AuditedAllocator, AuditedTransport,
     CudaMpiCollectivePolicy>;
+
+template <typename Backend>
+bool RunConfigConsensusNegative(const int ranks) noexcept
+{
+  if (ranks != 2) { return true; }
+  int rank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  CudaConfig config = Config(ranks, rank != 0);
+  config.injection.enabled = true;
+  config.injection.target_step = 2;
+  config.injection.source_rank = rank;
+  config.injection.token_fault = rank == 0
+      ? CudaTokenFault::omit_solution : CudaTokenFault::stale_attempt;
+  const std::uint64_t owned_before =
+      AuditedAllocator::W8OwnedAllocationCalls();
+  const std::uint64_t observed_before =
+      AuditedAllocator::AllocationEvents();
+  const CudaAllocationLedgerV1 allocation_before =
+      AuditedAllocator::Ledger();
+  const CudaTransferLedgerV1 transfer_before = AuditedTransport::Ledger();
+  auto engine = std::make_unique<TestEngine<Backend>>(config);
+  CudaRunEvidence evidence{};
+  const bool initialized = engine->Initialize(evidence);
+  return !initialized && evidence.status == CudaRunStatus::setup_failure &&
+      evidence.setup_origin == FailureReason::collective_protocol &&
+      AuditedAllocator::W8OwnedAllocationCalls() == owned_before &&
+      AuditedAllocator::AllocationEvents() == observed_before &&
+      SameLedger(AuditedAllocator::Ledger(), allocation_before) &&
+      SameLedger(AuditedTransport::Ledger(), transfer_before);
+}
 
 using AffineContract = typename TestEngine<TestRankOneBackendTag>::contract_type;
 static_assert(!std::is_default_constructible<
@@ -762,8 +909,12 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
                              const int ranks,
                              const std::uint64_t allocation_baseline,
                              CudaSerializedCheckpointV1& checkpoint,
-                             const bool mutate_oracle = false) noexcept
+                             const bool mutate_oracle = false,
+                             CudaPrecommitSnapshot* captured = nullptr)
+    noexcept
 {
+  const std::uint64_t owned_allocation_calls =
+      AuditedAllocator::W8OwnedAllocationCalls();
   CudaPrecommitSnapshot snapshot{};
   CudaStepEvidence evidence{};
   const auto* contract = engine.contract();
@@ -785,6 +936,7 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
   {
     return false;
   }
+  if (captured != nullptr) { *captured = snapshot; }
 
   if (!engine.StagePreparedCheckpoint(checkpoint, evidence) ||
       checkpoint.schema != 1 || checkpoint.rank_count != ranks ||
@@ -855,7 +1007,10 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
   auto exported = std::make_unique<CudaOraclePod>();
   return engine.ExportOracle(*exported) &&
       OracleIdentity(*exported, snapshot, ranks) &&
-      cuda_w8a_test_oracle::Verify(*exported) && ExactPolicyLedgers();
+      cuda_w8a_test_oracle::Verify(*exported) &&
+      AuditedAllocator::W8OwnedAllocationCalls() ==
+          owned_allocation_calls &&
+      ExactPolicyLedgers();
 }
 
 template <typename Backend>
@@ -973,12 +1128,17 @@ template <typename Backend>
 bool RunFreshRestore(const int ranks,
                      const CudaSerializedCheckpointV1& checkpoint) noexcept
 {
-  auto engine = std::make_unique<TestEngine<Backend>>(Config(ranks));
+  auto engine = std::make_unique<TestEngine<Backend>>(Config(ranks, true));
   const bool result = [&]() noexcept
   {
     CudaRunEvidence setup{};
     if (!engine->Initialize(setup) || !SetupValid(setup, ranks))
       return false;
+    const auto* pristine_contract = engine->contract();
+    if (pristine_contract == nullptr) { return false; }
+    const auto stale_pre_restore_publication =
+        pristine_contract->Published();
+    const CheckpointDescriptor source_descriptor = checkpoint.descriptor;
     CudaStepEvidence evidence{};
     if (!engine->Restore(checkpoint, evidence) || !evidence.committed ||
         evidence.status != CudaRunStatus::committed ||
@@ -990,14 +1150,50 @@ bool RunFreshRestore(const int ranks,
         !ValidRange(evidence.transfer_range, AuditedTransport::Ledger()) ||
         AuditedAllocator::AllocationEvents() !=
             setup.reuse.baseline_allocation_events ||
+        AuditedAllocator::W8OwnedAllocationCalls() !=
+            setup.reuse.baseline_w8_owned_allocation_calls ||
         !ExactPolicyLedgers())
     {
       return false;
     }
     const auto* contract = engine->contract();
+    StateCoordinates stale_visible{};
+    if (contract == nullptr ||
+        !SameCoordinates(contract->coordinates(),
+                         checkpoint.descriptor.coordinates) ||
+        contract->PublishedCoordinates(stale_pre_restore_publication,
+                                       stale_visible) ||
+        !dg::hdg::runtime::detail::SameCheckpoint(
+            source_descriptor, checkpoint.descriptor))
+    {
+      return false;
+    }
+    const StateCoordinates restored = contract->coordinates();
+    const auto restored_publication = contract->Published();
+    CudaSerializedCheckpointV1 continued_checkpoint{};
+    CudaPrecommitSnapshot continued{};
+    if (!CommitSuccessfulAttempt(
+            *engine, false, restored.step + 1, ranks,
+            setup.reuse.baseline_allocation_events, continued_checkpoint,
+            false, &continued))
+    {
+      return false;
+    }
+    contract = engine->contract();
     return contract != nullptr &&
-        SameCoordinates(contract->coordinates(),
-                        checkpoint.descriptor.coordinates);
+        continued.attempt.sequence > restored.cursor &&
+        continued.attempt.committed_step == restored.step &&
+        continued.attempt.committed_generation == restored.generation &&
+        continued.target.cursor == continued.attempt.sequence &&
+        continued.target.cursor > restored.cursor &&
+        continued_checkpoint.attempt.sequence == continued.attempt.sequence &&
+        continued_checkpoint.descriptor.coordinates.cursor ==
+            continued.target.cursor &&
+        continued_checkpoint.descriptor.coordinates.step ==
+            restored.step + 1 &&
+        !contract->PublishedCoordinates(restored_publication, stale_visible) &&
+        dg::hdg::runtime::detail::SameCheckpoint(
+            source_descriptor, checkpoint.descriptor);
   }();
   engine.reset();
   return result && ExactPolicyLedgers();
@@ -1426,6 +1622,18 @@ bool Global(const bool local) noexcept
   return MPI_Allreduce(&value, &all, 1, MPI_INT, MPI_MIN,
                        MPI_COMM_WORLD) == MPI_SUCCESS && all == 1;
 }
+
+bool CollectiveCaseBoundaryRegression() noexcept
+{
+  int rank = -1;
+  int ranks = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  if (ranks == 1) { return true; }
+  const bool rank_local_failure_rejected = !Global(rank == 0);
+  const bool all_ranks_reenter_next_boundary = Global(true);
+  return rank_local_failure_rejected && all_ranks_reenter_next_boundary;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -1437,53 +1645,64 @@ int main(int argc, char** argv)
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
   const bool token_mode = argc == 2 &&
       std::string_view(argv[1]) == "--token-negatives";
-  bool pass = DirectSharedContractNegatives();
+  bool pass = true;
+  const auto run_case = [&](const bool local_result)
+  {
+    const bool collective_result = Global(local_result);
+    pass = pass && collective_result;
+  };
+  run_case(HypreIluGenerationSetupRegression());
+  run_case(TicketHighHalfRegression());
+  run_case(DirectSharedContractNegatives());
+  run_case(CollectiveCaseBoundaryRegression());
   if (ranks == 1)
   {
+    run_case(RunConfigConsensusNegative<TestRankOneBackendTag>(1));
     if (token_mode)
     {
-      pass = pass && RunTokenFault<TestRankOneBackendTag>(
-          1, CudaTokenFault::omit_solution, FailureReason::missing_product) &&
-          RunTokenFault<TestRankOneBackendTag>(
-              1, CudaTokenFault::stale_attempt,
-              FailureReason::missing_product) &&
-          RunTokenFault<TestRankOneBackendTag>(
-              1, CudaTokenFault::issue_matrix_before_residual,
-              FailureReason::none);
+      run_case(RunTokenFault<TestRankOneBackendTag>(
+          1, CudaTokenFault::omit_solution, FailureReason::missing_product));
+      run_case(RunTokenFault<TestRankOneBackendTag>(
+          1, CudaTokenFault::stale_attempt,
+          FailureReason::missing_product));
+      run_case(RunTokenFault<TestRankOneBackendTag>(
+          1, CudaTokenFault::issue_matrix_before_residual,
+          FailureReason::none));
     }
     else
     {
       CudaSerializedCheckpointV1 checkpoint{};
-      pass = pass && RunLifecycle<TestRankOneBackendTag>(1, checkpoint) &&
-          RunCorruptRestore<TestRankOneBackendTag>(1, checkpoint) &&
-          RunFreshRestore<TestRankOneBackendTag>(1, checkpoint) &&
-          RunProvisionalRevert<TestRankOneBackendTag>(1) &&
-          RunPreparedAbort<TestRankOneBackendTag>(1) &&
-          RunStagingFailure<TestRankOneBackendTag>(1);
+      run_case(RunLifecycle<TestRankOneBackendTag>(1, checkpoint));
+      run_case(RunCorruptRestore<TestRankOneBackendTag>(1, checkpoint));
+      run_case(RunFreshRestore<TestRankOneBackendTag>(1, checkpoint));
+      run_case(RunProvisionalRevert<TestRankOneBackendTag>(1));
+      run_case(RunPreparedAbort<TestRankOneBackendTag>(1));
+      run_case(RunStagingFailure<TestRankOneBackendTag>(1));
     }
   }
   else if (ranks == 2)
   {
+    run_case(RunConfigConsensusNegative<TestRankTwoBackendTag>(2));
     if (token_mode)
     {
-      pass = pass && RunTokenFault<TestRankTwoBackendTag>(
-          2, CudaTokenFault::omit_solution, FailureReason::missing_product) &&
-          RunTokenFault<TestRankTwoBackendTag>(
-              2, CudaTokenFault::stale_attempt,
-              FailureReason::missing_product) &&
-          RunTokenFault<TestRankTwoBackendTag>(
-              2, CudaTokenFault::issue_matrix_before_residual,
-              FailureReason::none);
+      run_case(RunTokenFault<TestRankTwoBackendTag>(
+          2, CudaTokenFault::omit_solution, FailureReason::missing_product));
+      run_case(RunTokenFault<TestRankTwoBackendTag>(
+          2, CudaTokenFault::stale_attempt,
+          FailureReason::missing_product));
+      run_case(RunTokenFault<TestRankTwoBackendTag>(
+          2, CudaTokenFault::issue_matrix_before_residual,
+          FailureReason::none));
     }
     else
     {
       CudaSerializedCheckpointV1 checkpoint{};
-      pass = pass && RunLifecycle<TestRankTwoBackendTag>(2, checkpoint) &&
-          RunCorruptRestore<TestRankTwoBackendTag>(2, checkpoint) &&
-          RunFreshRestore<TestRankTwoBackendTag>(2, checkpoint) &&
-          RunProvisionalRevert<TestRankTwoBackendTag>(2) &&
-          RunPreparedAbort<TestRankTwoBackendTag>(2) &&
-          RunStagingFailure<TestRankTwoBackendTag>(2);
+      run_case(RunLifecycle<TestRankTwoBackendTag>(2, checkpoint));
+      run_case(RunCorruptRestore<TestRankTwoBackendTag>(2, checkpoint));
+      run_case(RunFreshRestore<TestRankTwoBackendTag>(2, checkpoint));
+      run_case(RunProvisionalRevert<TestRankTwoBackendTag>(2));
+      run_case(RunPreparedAbort<TestRankTwoBackendTag>(2));
+      run_case(RunStagingFailure<TestRankTwoBackendTag>(2));
     }
   }
   else

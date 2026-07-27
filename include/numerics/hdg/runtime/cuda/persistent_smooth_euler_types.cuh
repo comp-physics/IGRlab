@@ -254,8 +254,15 @@ struct CudaReuseEvidence
   std::uintptr_t workspace_token = 0;
   std::array<std::uintptr_t, 2> interior_slot_tokens{{0, 0}};
   std::array<std::uintptr_t, 2> trace_slot_tokens{{0, 0}};
+  // Composite observed signal: W8-owned calls plus MFEM/HYPRE pool high-water
+  // growth. This does not observe opaque churn that reuses pool capacity.
   std::uint64_t baseline_allocation_events = 0;
   std::uint64_t post_baseline_allocation_events = 0;
+  // Exact application-owned policy-call boundary.
+  std::uint64_t baseline_w8_owned_allocation_calls = 0;
+  std::uint64_t post_baseline_w8_owned_allocation_calls = 0;
+  bool observes_w8_owned_calls_and_pool_growth_only = true;
+  bool opaque_pool_reuse_churn_observed = false;
   bool persistent_graph = false;
   bool persistent_slots = false;
   bool persistent_workspace = false;
@@ -395,6 +402,7 @@ struct CudaSerializedCheckpointV1
 struct CudaRunEvidence
 {
   CudaRunStatus status = CudaRunStatus::ready;
+  FailureReason setup_origin = FailureReason::none;
   std::array<CudaStepEvidence, maximum_attempt_records> attempts{};
   std::size_t attempt_count = 0;
   CudaReuseEvidence reuse{};
@@ -552,6 +560,12 @@ struct CudaFutureSharedAbiRequest
   // this leaf separately serializes each local piece hash and payload.
   static constexpr std::string_view checkpoint_local_piece =
       "RankLocalCheckpointPieceV1";
+  // The application can count every W8-owned allocator-policy call and can
+  // observe MFEM/HYPRE pool high-water growth. Umpire does not expose a stable
+  // application-owned callback for allocate/free churn that reuses capacity,
+  // so this leaf deliberately makes no zero-all-allocator-activity claim.
+  static constexpr std::string_view allocation_observation_scope =
+      "W8-owned calls + pool high-water growth; opaque reuse churn unobserved";
   // FreezeCandidate is rank-local and returns optional authority.  If a
   // collective census ever observes a mixed frozen/unfrozen result, no current
   // shared operation can roll both phases back without dropping a live token.

@@ -45,6 +45,7 @@ struct UmpireDeviceAllocatorPolicy
                        CudaAllocationSite site, void*& pointer) noexcept;
   static void Deallocate(void* pointer, CudaAllocationSite site) noexcept;
   static std::uint64_t AllocationEvents() noexcept;
+  static std::uint64_t W8OwnedAllocationCalls() noexcept;
   static std::uint64_t DeallocationEvents() noexcept;
   static bool DevicePoolPolicyValid() noexcept;
   static CudaAllocationLedgerV1 Ledger() noexcept;
@@ -434,16 +435,28 @@ public:
   bool Initialize(CudaRunEvidence& evidence) noexcept
   {
     evidence = {};
-    AllocatorPolicy::ResetLedger();
-    const int local_config = ValidateConfig() ? 1 : 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &evidence.rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &evidence.ranks);
+    const bool descriptor_consensus = ConfigurationConsensus();
+    const int local_config =
+        ValidateConfig() && facade_incarnation_ != 0 ? 1 : 0;
     int global_config = 0;
-    const bool config_agreed = MPI_Allreduce(
+    const bool validity_consensus = MPI_Allreduce(
         &local_config, &global_config, 1, MPI_INT, MPI_MIN,
         MPI_COMM_WORLD) == MPI_SUCCESS && global_config == 1;
-    if (!config_agreed || facade_incarnation_ == 0 ||
-        !numerics_.Initialize(config_, evidence, Selection::Descriptor()))
+    if (!descriptor_consensus || !validity_consensus)
     {
       evidence.status = CudaRunStatus::setup_failure;
+      evidence.setup_origin = descriptor_consensus
+          ? FailureReason::backend_failure
+          : FailureReason::collective_protocol;
+      return false;
+    }
+    AllocatorPolicy::ResetLedger();
+    if (!numerics_.Initialize(config_, evidence, Selection::Descriptor()))
+    {
+      evidence.status = CudaRunStatus::setup_failure;
+      evidence.setup_origin = FailureReason::backend_failure;
       return false;
     }
     StateCoordinates initial{};
@@ -453,6 +466,7 @@ public:
     if (contract_->status() != RunStatus::ready)
     {
       evidence.status = CudaRunStatus::setup_failure;
+      evidence.setup_origin = contract_->last_failure();
       return false;
     }
     initialized_ = true;
@@ -732,7 +746,29 @@ public:
     evidence = {};
     if (!initialized_ || pending_.active) { return false; }
     evidence.before = contract_->coordinates();
+    const StateCoordinates restored_coordinates =
+        checkpoint.descriptor.coordinates;
+    const std::uint64_t restored_frontier = restored_coordinates.cursor;
+    const bool local_frontier_valid =
+        contract_->status() == RunStatus::ready &&
+        evidence.before.step == 0 && evidence.before.generation == 0 &&
+        evidence.before.cursor == 0 && evidence.before.time == 0.0 &&
+        checkpoint.attempt.sequence == restored_frontier &&
+        restored_frontier != 0 &&
+        restored_frontier != std::numeric_limits<std::uint64_t>::max() &&
+        restored_coordinates.step != 0 &&
+        restored_coordinates.generation != 0 &&
+        checkpoint.attempt.committed_step == restored_coordinates.step - 1 &&
+        checkpoint.attempt.committed_generation ==
+            restored_coordinates.generation - 1;
+    if (!numerics_.CollectiveContinue(local_frontier_valid))
+    {
+      evidence.status = CudaRunStatus::runtime_failure;
+      evidence.contract_reason = FailureReason::restart_incompatible;
+      return false;
+    }
     CudaPolicyContext context{};
+    context.attempt_sequence = restored_frontier;
     context.target_step = checkpoint.descriptor.coordinates.step;
     context.generation = checkpoint.descriptor.coordinates.generation;
     context.rank = numerics_.rank();
@@ -749,8 +785,29 @@ public:
       UpdateAttemptEvidence(evidence);
       return false;
     }
+    // The accepted public constructor carries the attempt frontier while the
+    // c879 Restore seam restores coordinates only. Recreate the still-pristine
+    // contract before publication so the next sequence/candidate cursor is
+    // strictly newer and every capability from the pre-restore incarnation is
+    // stale. A later shared Restore frontier implementation is compatible with
+    // this identical seed and can replace this owned bridge.
+    contract_.reset();
+    StateCoordinates initial{};
+    contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
+                      initial, numerics_.Resources(), restored_frontier);
     const RestoreOutcome restored =
         contract_->Restore(checkpoint.descriptor, loaded);
+    if (!restored.restored)
+    {
+      contract_.reset();
+      contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
+                        initial, numerics_.Resources(), 0);
+      next_attempt_sequence_ = 0;
+    }
+    else
+    {
+      next_attempt_sequence_ = restored_frontier;
+    }
     evidence.after = contract_->coordinates();
     evidence.after_interior_hash = loaded.interior.hash;
     evidence.after_trace_hash = loaded.trace.hash;
@@ -860,8 +917,9 @@ private:
 
   void UpdateSharedAccounting() noexcept
   {
-    const std::uint64_t allocations = AllocatorPolicy::AllocationEvents() -
-        pending_.allocation_begin;
+    const std::uint64_t allocations =
+        AllocatorPolicy::W8OwnedAllocationCalls() -
+        pending_.w8_owned_allocation_begin;
     pending_.report.telemetry.transfers = ProjectSharedAccounting(
         TransportPolicy::Accounting(), allocations);
   }
@@ -960,6 +1018,103 @@ private:
         detail::ExactSelection<Selection>(config_);
   }
 
+  using ConfigDescriptor = std::array<unsigned char, 1024>;
+
+  template <typename Value>
+  static void AppendConfigValue(ConfigDescriptor& descriptor,
+                                std::size_t& cursor, bool& complete,
+                                const Value& value) noexcept
+  {
+    static_assert(std::is_trivially_copyable<Value>::value,
+                  "configuration descriptor values must be bitwise stable");
+    if (!complete || sizeof(Value) > descriptor.size() - cursor)
+    {
+      complete = false;
+      return;
+    }
+    std::memcpy(descriptor.data() + cursor, &value, sizeof(Value));
+    cursor += sizeof(Value);
+  }
+
+  static void AppendConfigId(ConfigDescriptor& descriptor,
+                             std::size_t& cursor, bool& complete,
+                             const StableIdentity& id) noexcept
+  {
+    const std::uint64_t size = static_cast<std::uint64_t>(id.size());
+    const std::uint8_t valid = id.valid() ? 1U : 0U;
+    AppendConfigValue(descriptor, cursor, complete, size);
+    AppendConfigValue(descriptor, cursor, complete, valid);
+    if (!complete || id.size() > descriptor.size() - cursor)
+    {
+      complete = false;
+      return;
+    }
+    std::memcpy(descriptor.data() + cursor, id.data(), id.size());
+    cursor += id.size();
+  }
+
+  bool MakeConfigDescriptor(ConfigDescriptor& descriptor) const noexcept
+  {
+    descriptor = {};
+    std::size_t cursor = 0;
+    bool complete = true;
+    const auto append_bool = [&](const bool value)
+    {
+      const std::uint8_t bit = value ? 1U : 0U;
+      AppendConfigValue(descriptor, cursor, complete, bit);
+    };
+    AppendConfigId(descriptor, cursor, complete, config_.experiment);
+    AppendConfigValue(descriptor, cursor, complete, config_.order);
+    AppendConfigValue(descriptor, cursor, complete, config_.mesh_n);
+    AppendConfigValue(descriptor, cursor, complete, config_.dt);
+    AppendConfigValue(descriptor, cursor, complete, config_.requested_device);
+    AppendConfigValue(descriptor, cursor, complete,
+                      config_.expected_rank_count);
+    append_bool(config_.require_host_staged_rank2);
+    append_bool(config_.capture_oracle);
+    AppendConfigValue(descriptor, cursor, complete, config_.injection.phase);
+    AppendConfigValue(descriptor, cursor, complete,
+                      config_.injection.target_step);
+    AppendConfigValue(descriptor, cursor, complete,
+                      config_.injection.source_rank);
+    append_bool(config_.injection.enabled);
+    AppendConfigValue(descriptor, cursor, complete,
+                      config_.injection.token_fault);
+    const RuntimeTupleDescriptor tuple = Selection::Descriptor();
+    AppendConfigId(descriptor, cursor, complete, tuple.model);
+    AppendConfigId(descriptor, cursor, complete, tuple.formulation);
+    AppendConfigId(descriptor, cursor, complete, tuple.trace);
+    AppendConfigId(descriptor, cursor, complete, tuple.stabilization);
+    AppendConfigId(descriptor, cursor, complete, tuple.time_treatment);
+    AppendConfigId(descriptor, cursor, complete, tuple.backend);
+    AppendConfigId(descriptor, cursor, complete, tuple.precision);
+    AppendConfigValue(descriptor, cursor, complete,
+                      Selection::interior_space);
+    return complete;
+  }
+
+  bool ConfigurationConsensus() const noexcept
+  {
+    ConfigDescriptor local{};
+    ConfigDescriptor minimum{};
+    ConfigDescriptor maximum{};
+    const bool descriptor_complete = MakeConfigDescriptor(local);
+    minimum = local;
+    maximum = local;
+    int ranks = 0;
+    const bool size_ready =
+        MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS;
+    const bool minimum_ready = MPI_Allreduce(
+        local.data(), minimum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        local.data(), maximum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+    return descriptor_complete && size_ready && minimum_ready &&
+        maximum_ready && ranks == config_.expected_rank_count &&
+        minimum == maximum;
+  }
+
   bool PreparePending(const bool retry, CudaStepEvidence& evidence) noexcept
   {
     evidence = {};
@@ -971,7 +1126,8 @@ private:
     context.rank = numerics_.rank();
     TransportPolicy::BeginAttempt(context);
     pending_.ledger_begin = TransportPolicy::Ledger().observed_count + 1;
-    pending_.allocation_begin = AllocatorPolicy::AllocationEvents();
+    pending_.w8_owned_allocation_begin =
+        AllocatorPolicy::W8OwnedAllocationCalls();
     const BeginOutcome begin = retry ? contract_->Retry() :
         contract_->BeginStep({InteriorSpace::l2, config_.dt});
     evidence.attempt = begin.attempt;
@@ -1151,7 +1307,8 @@ private:
     report.telemetry.identity = attempt;
     report.telemetry.transfers = ProjectSharedAccounting(
         TransportPolicy::Accounting(),
-        AllocatorPolicy::AllocationEvents() - pending_.allocation_begin);
+        AllocatorPolicy::W8OwnedAllocationCalls() -
+            pending_.w8_owned_allocation_begin);
     report.telemetry.true_relative_residual =
         std::numeric_limits<double>::infinity();
     report.candidate_cursor = attempt.sequence;
@@ -1212,7 +1369,7 @@ private:
     StateHash candidate_local_trace_hash{};
     CheckpointDescriptor prepared_checkpoint{};
     std::uint64_t ledger_begin = 0;
-    std::uint64_t allocation_begin = 0;
+    std::uint64_t w8_owned_allocation_begin = 0;
     CudaOraclePod oracle{};
   };
 

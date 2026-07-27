@@ -20,6 +20,7 @@ namespace dg::hdg::runtime::cuda_w8a
 namespace
 {
 std::atomic<std::uint64_t> allocation_events{0};
+std::atomic<std::uint64_t> w8_owned_allocation_calls{0};
 std::atomic<std::uint64_t> deallocation_events{0};
 std::atomic<std::uint64_t> allocator_growth_events{0};
 std::atomic<std::size_t> mfem_highwater{0};
@@ -290,6 +291,7 @@ bool UmpireDeviceAllocatorPolicy::Allocate(
     const std::size_t bytes, const std::size_t alignment,
     const CudaAllocationSite site, void*& pointer) noexcept
 {
+  ++w8_owned_allocation_calls;
   pointer = nullptr;
   if (bytes == 0 || alignment == 0 ||
       (alignment & (alignment - 1)) != 0 ||
@@ -396,6 +398,8 @@ std::uint64_t UmpireDeviceAllocatorPolicy::AllocationEvents() noexcept
 #endif
   return allocation_events.load() + allocator_growth_events.load();
 }
+std::uint64_t UmpireDeviceAllocatorPolicy::W8OwnedAllocationCalls() noexcept
+{ return w8_owned_allocation_calls.load(); }
 std::uint64_t UmpireDeviceAllocatorPolicy::DeallocationEvents() noexcept
 { return deallocation_events.load(); }
 
@@ -733,15 +737,39 @@ bool CudaGetTrueMatrixDeviceView(mfem::HypreParMatrix& matrix,
 bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   mfem::HypreILU& ilu,
                                   mfem::HypreGMRES& gmres,
-                                  const int ranks) noexcept
+                                  const int ranks,
+                                  const std::uint64_t matrix_generation,
+                                  CudaHypreSetupOrderEvidence& evidence)
+    noexcept
 {
+  evidence = {};
+  evidence.matrix_generation = matrix_generation;
   try
   {
+    // Pinned MFEM v4.9 HypreGMRES::SetOperator forwards the new matrix to the
+    // preconditioner.  HypreILU::SetOperator then recreates its HYPRE handle
+    // with MFEM defaults (fill 1/reorder 1), so all exact ILU(0) settings must
+    // follow this generation's SetOperator call.
+    gmres.SetPreconditioner(ilu);
+    evidence.Record(CudaHypreSetupAction::bind_preconditioner);
+    gmres.SetOperator(matrix);
+    evidence.Record(CudaHypreSetupAction::set_operator);
     ilu.SetType(0);
+    evidence.Record(CudaHypreSetupAction::ilu_type0);
     ilu.SetLevelOfFill(0);
+    evidence.Record(CudaHypreSetupAction::ilu_fill0);
     ilu.SetLocalReordering(0);
+    evidence.Record(CudaHypreSetupAction::ilu_reorder0);
     ilu.SetMaxIter(1);
+    evidence.Record(CudaHypreSetupAction::ilu_maxiter1);
     ilu.SetTol(0.0);
+    evidence.Record(CudaHypreSetupAction::ilu_tol0);
+    ilu.SetPrintLevel(0);
+    evidence.Record(CudaHypreSetupAction::ilu_print0);
+    // SetOperator already installs the recreated ILU handle.  Rebinding after
+    // the setters makes that handle association explicit without resetting it.
+    gmres.SetPreconditioner(ilu);
+    evidence.Record(CudaHypreSetupAction::rebind_preconditioner);
     gmres.SetTol(1.0e-13);
     gmres.SetAbsTol(0.0);
     gmres.SetMaxIter(400);
@@ -750,9 +778,8 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
     gmres.SetLogging(1);
     gmres.SetPrintLevel(0);
     gmres.SetZeroInitialIterate();
-    gmres.SetPreconditioner(ilu);
-    gmres.SetOperator(matrix);
-    return true;
+    evidence.Record(CudaHypreSetupAction::gmres_settings);
+    return evidence.ConfigurationExactForGeneration(matrix_generation);
   }
   catch (...) { return false; }
 }
@@ -779,14 +806,18 @@ bool CudaRefreshFactorAndSolve(
     mfem::HypreParMatrix& matrix, mfem::HypreParVector& rhs,
     mfem::HypreParVector& solution, mfem::HypreILU& ilu,
     mfem::HypreGMRES& gmres, const int ranks,
+    const std::uint64_t matrix_generation,
     CudaSolveDiagnostics& diagnostics) noexcept
 {
   diagnostics = {};
+  diagnostics.matrix_generation = matrix_generation;
+  CudaHypreSetupOrderEvidence setup_order{};
   bool policy_ready = false;
   try
   {
     policy_ready = CudaHypreDevicePolicyValid(matrix, rhs, solution) &&
-        CudaConfigurePersistentHypre(matrix, ilu, gmres, ranks);
+        CudaConfigurePersistentHypre(matrix, ilu, gmres, ranks,
+                                     matrix_generation, setup_order);
   }
   catch (...) { policy_ready = false; }
   if (!AllRanksReady(policy_ready)) { return false; }
@@ -802,15 +833,18 @@ bool CudaRefreshFactorAndSolve(
   try
   {
     gmres.Mult(rhs, solution);
+    if (!setup_order.Record(CudaHypreSetupAction::mult)) { return false; }
     diagnostics.device_policy =
         CudaHypreDevicePolicyValid(matrix, rhs, solution);
-    diagnostics.configured_ilu0 = true;
+    diagnostics.configured_ilu0 =
+        setup_order.SolveExactForGeneration(matrix_generation);
     gmres.GetNumIterations(diagnostics.iterations);
     gmres.GetFinalResidualNorm(diagnostics.reported_residual);
     diagnostics.finite = std::isfinite(diagnostics.reported_residual);
     diagnostics.converged = diagnostics.finite &&
         diagnostics.reported_residual <= 1.0e-10;
-    return diagnostics.device_policy && diagnostics.converged;
+    return diagnostics.device_policy && diagnostics.configured_ilu0 &&
+        diagnostics.converged;
   }
   catch (...) { return false; }
 }
