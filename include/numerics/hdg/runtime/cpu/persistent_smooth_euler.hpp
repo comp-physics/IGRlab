@@ -630,6 +630,22 @@ bool ImportCpuCheckpoint(const CheckpointDescriptor&,
 namespace detail
 {
 
+/**
+ * Private one-shot seams used only to prove collective failure admission.
+ * They are inert unless an owned leaf test explicitly arms one on all ranks.
+ */
+enum class CpuCollectiveTestFault : unsigned char
+{
+  none,
+  trace_load_preparation,
+  assembly_completion,
+  residual_map_preparation,
+  condensation_outgoing_preparation
+};
+
+void ArmCpuCollectiveTestFault(CpuCollectiveTestFault, int target_rank) noexcept;
+void ResetCpuCollectiveTestFault() noexcept;
+
 struct CpuInitialization
 {
   CpuStateSlot committed{};

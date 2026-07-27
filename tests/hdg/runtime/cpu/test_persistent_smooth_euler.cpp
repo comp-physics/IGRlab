@@ -21,6 +21,7 @@ namespace
 
 using namespace dg::hdg::runtime;
 using namespace dg::hdg::runtime::cpu;
+namespace cpu_detail = dg::hdg::runtime::cpu::detail;
 
 struct TestEulerModelTag
 {
@@ -739,6 +740,71 @@ void CheckProductNegatives(Checks& checks)
 }
 
 template <typename Selection>
+void CheckAsymmetricCollectiveNumericsFaults(
+    Checks& checks, MPI_Comm communicator, const int ranks)
+{
+  if (ranks != 2) { return; }
+  struct Case
+  {
+    cpu_detail::CpuCollectiveTestFault fault;
+    CpuFailurePhase phase;
+  };
+  const std::array<Case, 4> cases{{
+      {cpu_detail::CpuCollectiveTestFault::trace_load_preparation,
+       CpuFailurePhase::setup},
+      {cpu_detail::CpuCollectiveTestFault::assembly_completion,
+       CpuFailurePhase::assembly},
+      {cpu_detail::CpuCollectiveTestFault::residual_map_preparation,
+       CpuFailurePhase::assembly},
+      {cpu_detail::CpuCollectiveTestFault::condensation_outgoing_preparation,
+       CpuFailurePhase::condensation}}};
+
+  for (const Case& test_case : cases)
+  {
+    cpu_detail::ResetCpuCollectiveTestFault();
+    PersistentSmoothEulerCpuAdapter<Selection> adapter;
+    checks.Require(adapter.Initialize(),
+                   "asymmetric collective numerical seam setup");
+    const CpuStateSnapshot entry = adapter.Snapshot();
+    const std::vector<double> interior = CopyView(entry.interior);
+    const std::vector<double> trace = CopyView(entry.trace);
+
+    cpu_detail::ArmCpuCollectiveTestFault(test_case.fault, 1);
+    CpuPreparedStep prepared;
+    const bool prepared_call = adapter.PrepareAdvance(prepared);
+    const bool commonly_not_ready = CollectivelyFalse(
+        prepared.numerically_ready, communicator);
+    checks.Require(prepared_call && commonly_not_ready &&
+                       prepared.failure_phase == test_case.phase,
+                   "one-rank numerical preparation fault fails commonly");
+    const AttemptOutcome failure = adapter.FinalizePrepared(prepared);
+    const CpuStateSnapshot rolled_back = adapter.Snapshot();
+    checks.Require(CollectivelyFalse(failure.committed, communicator) &&
+                       failure.retry_available &&
+                       ByteEqual(rolled_back.interior, interior) &&
+                       ByteEqual(rolled_back.trace, trace) &&
+                       rolled_back.interior_hash == entry.interior_hash &&
+                       rolled_back.trace_hash == entry.trace_hash &&
+                       rolled_back.state_hash == entry.state_hash &&
+                       rolled_back.coordinates.step == 0 &&
+                       rolled_back.coordinates.generation == 0 &&
+                       rolled_back.coordinates.cursor == 0 &&
+                       NearTime(rolled_back.coordinates.time, 0.0),
+                   "asymmetric numerical fault rolls back without publication");
+
+    cpu_detail::ResetCpuCollectiveTestFault();
+    CpuPreparedStep retry;
+    checks.Require(adapter.PrepareRetry(retry) && retry.numerically_ready,
+                   "asymmetric numerical fault permits collective retry");
+    const AttemptOutcome retried = adapter.FinalizePrepared(retry);
+    checks.Require(retried.committed && adapter.coordinates().step == 1 &&
+                       NearTime(adapter.coordinates().time, 0.05),
+                   "cleared numerical seam re-enters and commits step 1");
+    cpu_detail::ResetCpuCollectiveTestFault();
+  }
+}
+
+template <typename Selection>
 void CheckPhaseRankInjection(Checks& checks, const int ranks)
 {
   const std::array<CpuFailurePhase, 6> phases{{
@@ -1098,6 +1164,9 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                      communicator, oracle) && oracle.passed,
                  "independent mesh/source/flux/Jacobian/signed-map/Schur/"
                  "P^TSP/true-residual/distribute/recovery oracle");
+
+  CheckAsymmetricCollectiveNumericsFaults<Selection>(
+      checks, communicator, ranks);
 
   PersistentSmoothEulerCpuAdapter<Selection> adapter;
   checks.Require(adapter.Initialize(), "persistent adapter initialization");
