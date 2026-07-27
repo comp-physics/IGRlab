@@ -18,17 +18,38 @@ struct IndependentLinearizationHashes
   std::array<std::uint8_t, 32> candidate{};
 };
 
+struct IndependentNewtonStepEvidence
+{
+  int update_index = -1;
+  int attempted_trials = 0;
+  int accepted_trial_index = -1;
+  double base_residual = 0.0;
+  double accepted_alpha = 0.0;
+  double accepted_candidate_residual = 0.0;
+  double true_relative_residual = 0.0;
+  std::vector<double> true_trace_increment;
+  std::vector<double> accepted_candidate_interior;
+  std::vector<double> accepted_candidate_true_trace;
+  bool armijo_satisfied = false;
+};
+
 struct IndependentOracleResult
 {
   std::vector<double> interior;
   std::vector<double> true_trace;
   std::vector<IndependentLinearizationHashes> linearizations;
+  std::vector<IndependentNewtonStepEvidence> newton_steps;
   double initial_residual = 0.0;
   double final_residual = 0.0;
   double maximum_true_residual = 0.0;
   int newton_updates = 0;
+  std::uint64_t negative_signed_trace_dofs = 0;
   bool mesh_rebuilt = false;
   bool analytic_source_flux_jacobian = false;
+  bool signed_map_extent_valid = false;
+  bool signed_map_entries_valid = false;
+  bool signed_map_permutation_rebuilt = false;
+  bool signed_map_used = false;
   bool signed_maps_rebuilt = false;
   bool local_schur_rebuilt = false;
   bool global_ptsp_rebuilt = false;
