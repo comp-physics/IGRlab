@@ -603,6 +603,11 @@ bool CollectivelyFalse(const bool local, MPI_Comm communicator)
       minimum == 0 && maximum == 0;
 }
 
+bool CollectivelyTrue(const bool local, MPI_Comm communicator)
+{
+  return CollectivelyFalse(!local, communicator);
+}
+
 void SeedInvalidCheckpoint(CpuCheckpoint& checkpoint,
                            const CheckpointDescriptor& descriptor)
 {
@@ -739,11 +744,284 @@ void CheckProductNegatives(Checks& checks)
   }
 }
 
+bool ExactRank1FaultConsumption(
+    MPI_Comm communicator, const int rank,
+    const cpu_detail::CpuCollectiveTestFault expected,
+    const std::uint64_t expected_owner,
+    const std::uint64_t expected_rejected_owner,
+    const bool expect_initialization_reset,
+    const cpu_detail::CpuCollectiveTestConsumptionEvidence& evidence)
+{
+  const unsigned long long local_count =
+      static_cast<unsigned long long>(evidence.local_consumption_count);
+  unsigned long long global_count = 0;
+  const int count_status = MPI_Allreduce(
+      &local_count, &global_count, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM,
+      communicator);
+  const std::uint64_t expected_rejections =
+      expected_rejected_owner == 0 ? 0 : 1;
+  const bool local_exact = evidence.arm_generation != 0 &&
+      evidence.owner_incarnation == expected_owner && expected_owner != 0 &&
+      evidence.target_rank == 1 && !evidence.armed &&
+      evidence.thread_confined &&
+      evidence.local_wrong_owner_rejections == expected_rejections &&
+      evidence.last_rejected_incarnation == expected_rejected_owner &&
+      evidence.local_reset_completions ==
+          (expect_initialization_reset ? 1U : 0U) &&
+      evidence.reset_collectively_attested == expect_initialization_reset &&
+      (rank == 1
+           ? evidence.local_consumption_count == 1 &&
+                 evidence.consumed_incarnation == expected_owner &&
+                 evidence.consumed_rank == 1 &&
+                 evidence.consumed_fault == expected
+           : evidence.local_consumption_count == 0 &&
+                 evidence.consumed_incarnation == 0 &&
+                 evidence.consumed_rank == -1 &&
+                 evidence.consumed_fault ==
+                     cpu_detail::CpuCollectiveTestFault::none);
+  int local_valid = local_exact ? 1 : 0;
+  int all_valid = 0;
+  const int validity_status = MPI_Allreduce(
+      &local_valid, &all_valid, 1, MPI_INT, MPI_MIN, communicator);
+  return count_status == MPI_SUCCESS && validity_status == MPI_SUCCESS &&
+      global_count == 1 && all_valid == 1;
+}
+
+bool SameFaultObservation(
+    const cpu_detail::CpuCollectiveTestConsumptionEvidence& left,
+    const cpu_detail::CpuCollectiveTestConsumptionEvidence& right) noexcept
+{
+  return left.arm_generation == right.arm_generation &&
+      left.local_consumption_count == right.local_consumption_count &&
+      left.owner_incarnation == right.owner_incarnation &&
+      left.consumed_incarnation == right.consumed_incarnation &&
+      left.last_rejected_incarnation == right.last_rejected_incarnation &&
+      left.local_wrong_owner_rejections ==
+          right.local_wrong_owner_rejections &&
+      left.local_reset_completions == right.local_reset_completions &&
+      left.consumed_fault == right.consumed_fault &&
+      left.consumed_rank == right.consumed_rank &&
+      left.target_rank == right.target_rank && left.armed == right.armed &&
+      left.reset_collectively_attested ==
+          right.reset_collectively_attested &&
+      left.thread_confined == right.thread_confined;
+}
+
+bool ExactWrongOwnerNonConsumption(
+    MPI_Comm communicator, const std::uint64_t intended_owner,
+    const std::uint64_t rejected_owner,
+    const cpu_detail::CpuCollectiveTestConsumptionEvidence& evidence)
+{
+  const bool local_exact = intended_owner != 0 && rejected_owner != 0 &&
+      intended_owner != rejected_owner && evidence.arm_generation != 0 &&
+      evidence.owner_incarnation == intended_owner && evidence.armed &&
+      evidence.local_consumption_count == 0 &&
+      evidence.consumed_incarnation == 0 &&
+      evidence.last_rejected_incarnation == rejected_owner &&
+      evidence.local_wrong_owner_rejections == 1 &&
+      evidence.local_reset_completions == 0 &&
+      evidence.consumed_fault ==
+          cpu_detail::CpuCollectiveTestFault::none &&
+      evidence.consumed_rank == -1 && evidence.target_rank == 1 &&
+      !evidence.reset_collectively_attested && evidence.thread_confined;
+  int local_valid = local_exact ? 1 : 0;
+  int all_valid = 0;
+  const int status = MPI_Allreduce(
+      &local_valid, &all_valid, 1, MPI_INT, MPI_MIN, communicator);
+  return status == MPI_SUCCESS && all_valid == 1;
+}
+
 template <typename Selection>
-void CheckAsymmetricCollectiveNumericsFaults(
-    Checks& checks, MPI_Comm communicator, const int ranks)
+void CheckAsymmetricCollectiveInitializationFaults(
+    Checks& checks, MPI_Comm communicator, const int rank, const int ranks)
 {
   if (ranks != 2) { return; }
+  PersistentSmoothEulerCpuAdapter<Selection> truth;
+  checks.Require(truth.Initialize(),
+                 "uninterrupted initialization truth setup");
+  const CpuStateSnapshot expected = truth.Snapshot();
+  const std::vector<double> expected_interior = CopyView(expected.interior);
+  const std::vector<double> expected_trace = CopyView(expected.trace);
+
+  const std::array<cpu_detail::CpuCollectiveTestFault, 3> faults{{
+      cpu_detail::CpuCollectiveTestFault::
+          initialization_before_sparse_count_exchange,
+      cpu_detail::CpuCollectiveTestFault::
+          initialization_between_sparse_exchanges,
+      cpu_detail::CpuCollectiveTestFault::initialization_before_gmres_prime}};
+  for (const cpu_detail::CpuCollectiveTestFault fault : faults)
+  {
+    cpu_detail::ResetCpuCollectiveTestFault();
+    PersistentSmoothEulerCpuAdapter<Selection> adapter;
+    const std::uint64_t owner =
+        cpu_detail::CpuCollectiveTestAccess::CoreIncarnation(adapter);
+    cpu_detail::ArmCpuCollectiveTestFault(fault, 1, adapter);
+    const bool initialized = adapter.Initialize();
+    checks.Require(CollectivelyFalse(initialized, communicator),
+                   "rank1 initialization fault fails collectively");
+    const auto consumed = cpu_detail::ObserveCpuCollectiveTestFault();
+    checks.Require(ExactRank1FaultConsumption(
+                       communicator, rank, fault, owner, 0, true, consumed),
+                   "initialization fault has one exact rank1 consumption");
+
+    const bool reentered = adapter.Initialize();
+    const auto after_reentry = cpu_detail::ObserveCpuCollectiveTestFault();
+    const CpuStateSnapshot actual = adapter.Snapshot();
+    const bool reentry_consumption_exact = ExactRank1FaultConsumption(
+        communicator, rank, fault, owner, 0, true, after_reentry);
+    checks.Require(reentered && SameFaultObservation(consumed, after_reentry) &&
+                       reentry_consumption_exact,
+                   "initialization seam is automatic one-shot before cleanup");
+    checks.Require(ByteEqual(actual.interior, expected_interior) &&
+                       ByteEqual(actual.trace, expected_trace) &&
+                       actual.interior_hash == expected.interior_hash &&
+                       actual.trace_hash == expected.trace_hash &&
+                       actual.state_hash == expected.state_hash &&
+                       actual.coordinates.step == 0 &&
+                       NearTime(actual.coordinates.time, 0.0),
+                   "reentered initialization matches uninterrupted truth");
+    cpu_detail::ResetCpuCollectiveTestFault();
+  }
+}
+
+template <typename Selection>
+void CheckCollectiveFacadeInitialization(
+    Checks& checks, MPI_Comm communicator, const int rank, const int ranks)
+{
+  if (ranks != 2) { return; }
+
+  PersistentSmoothEulerCpuAdapter<Selection> truth;
+  checks.Require(truth.Initialize(), "collective facade truth setup");
+  const CpuStateSnapshot expected = truth.Snapshot();
+  const std::vector<double> expected_interior = CopyView(expected.interior);
+  const std::vector<double> expected_trace = CopyView(expected.trace);
+
+  PersistentSmoothEulerCpuAdapter<Selection> preconditioned;
+  CpuPersistentConfig asymmetric = MakeCpuSmokeConfig();
+  if (rank == 1) { --asymmetric.maximum_newton_updates; }
+  const bool admitted = preconditioned.Initialize(asymmetric);
+  const CpuStateSnapshot rejected = preconditioned.Snapshot();
+  checks.Require(CollectivelyFalse(admitted, communicator) &&
+                     preconditioned.status() == RunStatus::invalid_request &&
+                     rejected.interior.size == 0 && rejected.trace.size == 0 &&
+                     rejected.state_hash == StateHash{},
+                 "asymmetric facade precondition is rejected before core entry");
+  const bool precondition_retry = preconditioned.Initialize();
+  const CpuStateSnapshot precondition_state = preconditioned.Snapshot();
+  checks.Require(CollectivelyTrue(precondition_retry, communicator) &&
+                     ByteEqual(precondition_state.interior,
+                               expected_interior) &&
+                     ByteEqual(precondition_state.trace, expected_trace) &&
+                     precondition_state.state_hash == expected.state_hash,
+                 "precondition refusal preserves empty same-adapter retry");
+  const bool existing_state_reentry = preconditioned.Initialize();
+  const CpuStateSnapshot after_existing = preconditioned.Snapshot();
+  checks.Require(CollectivelyFalse(existing_state_reentry, communicator) &&
+                     ByteEqual(after_existing.interior, expected_interior) &&
+                     ByteEqual(after_existing.trace, expected_trace) &&
+                     after_existing.state_hash == expected.state_hash,
+                 "existing facade state is collectively refused and retained");
+
+  cpu_detail::ResetCpuCollectiveTestFault();
+  PersistentSmoothEulerCpuAdapter<Selection> intended;
+  PersistentSmoothEulerCpuAdapter<Selection> unrelated;
+  const std::uint64_t intended_owner =
+      cpu_detail::CpuCollectiveTestAccess::CoreIncarnation(intended);
+  const std::uint64_t unrelated_owner =
+      cpu_detail::CpuCollectiveTestAccess::CoreIncarnation(unrelated);
+  cpu_detail::ArmCpuCollectiveTestFault(
+      cpu_detail::CpuCollectiveTestFault::initialization_facade_readiness,
+      1, intended);
+
+  const bool unrelated_ready = unrelated.Initialize();
+  const auto rejected_owner = cpu_detail::ObserveCpuCollectiveTestFault();
+  const bool unrelated_common = CollectivelyTrue(
+      unrelated_ready, communicator);
+  const bool wrong_owner_exact = ExactWrongOwnerNonConsumption(
+      communicator, intended_owner, unrelated_owner, rejected_owner);
+  checks.Require(unrelated_common && wrong_owner_exact,
+                 "different same-thread adapter cannot consume intended arm");
+
+  const bool intended_ready = intended.Initialize();
+  const auto consumed = cpu_detail::ObserveCpuCollectiveTestFault();
+  const CpuStateSnapshot failed_snapshot = intended.Snapshot();
+  const bool intended_consumption_exact = ExactRank1FaultConsumption(
+      communicator, rank,
+      cpu_detail::CpuCollectiveTestFault::initialization_facade_readiness,
+      intended_owner, unrelated_owner, true, consumed);
+  checks.Require(CollectivelyFalse(intended_ready, communicator) &&
+                     intended.status() == RunStatus::invalid_request &&
+                     intended.contract_telemetry() == nullptr &&
+                     failed_snapshot.interior.size == 0 &&
+                     failed_snapshot.trace.size == 0 &&
+                     failed_snapshot.state_hash == StateHash{} &&
+                     intended_consumption_exact,
+                 "rank1 post-core facade fault resets without publication");
+
+  const bool retried = intended.Initialize();
+  const auto after_retry = cpu_detail::ObserveCpuCollectiveTestFault();
+  const CpuStateSnapshot actual = intended.Snapshot();
+  const bool retry_consumption_exact = ExactRank1FaultConsumption(
+      communicator, rank,
+      cpu_detail::CpuCollectiveTestFault::initialization_facade_readiness,
+      intended_owner, unrelated_owner, true, after_retry);
+  checks.Require(CollectivelyTrue(retried, communicator) &&
+                     SameFaultObservation(consumed, after_retry) &&
+                     retry_consumption_exact &&
+                     ByteEqual(actual.interior, expected_interior) &&
+                     ByteEqual(actual.trace, expected_trace) &&
+                     actual.state_hash == expected.state_hash,
+                 "collectively attested reset permits same-adapter retry");
+  cpu_detail::ResetCpuCollectiveTestFault();
+
+  PersistentSmoothEulerCpuAdapter<Selection> poisoned;
+  const std::uint64_t poisoned_owner =
+      cpu_detail::CpuCollectiveTestAccess::CoreIncarnation(poisoned);
+  cpu_detail::ArmCpuCollectiveTestFault(
+      cpu_detail::CpuCollectiveTestFault::
+          initialization_facade_readiness_reset_refusal,
+      1, poisoned);
+  const bool poisoned_initialization = poisoned.Initialize();
+  const auto refused_reset = cpu_detail::ObserveCpuCollectiveTestFault();
+  const bool refused_reset_exact = ExactRank1FaultConsumption(
+      communicator, rank,
+      cpu_detail::CpuCollectiveTestFault::
+          initialization_facade_readiness_reset_refusal,
+      poisoned_owner, 0, false, refused_reset);
+  const bool poisoned_retry = poisoned.Initialize();
+  const auto after_poisoned_retry =
+      cpu_detail::ObserveCpuCollectiveTestFault();
+  const CpuStateSnapshot poisoned_snapshot = poisoned.Snapshot();
+  const bool poisoned_initialization_common = CollectivelyFalse(
+      poisoned_initialization, communicator);
+  const bool poisoned_retry_common = CollectivelyFalse(
+      poisoned_retry, communicator);
+  checks.Require(poisoned_initialization_common && poisoned_retry_common &&
+                     refused_reset_exact &&
+                     SameFaultObservation(refused_reset,
+                                          after_poisoned_retry) &&
+                     poisoned.status() == RunStatus::invalid_request &&
+                     poisoned.contract_telemetry() == nullptr &&
+                     poisoned_snapshot.interior.size == 0 &&
+                     poisoned_snapshot.trace.size == 0 &&
+                     poisoned_snapshot.state_hash == StateHash{},
+                 "unattested reset terminally poisons same-adapter reentry");
+  cpu_detail::ResetCpuCollectiveTestFault();
+}
+
+template <typename Selection>
+void CheckAsymmetricCollectiveNumericsFaults(
+    Checks& checks, MPI_Comm communicator, const int rank, const int ranks)
+{
+  if (ranks != 2) { return; }
+  PersistentSmoothEulerCpuAdapter<Selection> truth;
+  const bool truth_initialized = truth.Initialize();
+  const AttemptOutcome truth_advance = truth.Advance();
+  checks.Require(truth_initialized && truth_advance.committed,
+                 "uninterrupted numerical truth setup");
+  const CpuStateSnapshot expected = truth.Snapshot();
+  const std::vector<double> expected_interior = CopyView(expected.interior);
+  const std::vector<double> expected_trace = CopyView(expected.trace);
   struct Case
   {
     cpu_detail::CpuCollectiveTestFault fault;
@@ -769,7 +1047,9 @@ void CheckAsymmetricCollectiveNumericsFaults(
     const std::vector<double> interior = CopyView(entry.interior);
     const std::vector<double> trace = CopyView(entry.trace);
 
-    cpu_detail::ArmCpuCollectiveTestFault(test_case.fault, 1);
+    const std::uint64_t owner =
+        cpu_detail::CpuCollectiveTestAccess::CoreIncarnation(adapter);
+    cpu_detail::ArmCpuCollectiveTestFault(test_case.fault, 1, adapter);
     CpuPreparedStep prepared;
     const bool prepared_call = adapter.PrepareAdvance(prepared);
     const bool commonly_not_ready = CollectivelyFalse(
@@ -777,6 +1057,11 @@ void CheckAsymmetricCollectiveNumericsFaults(
     checks.Require(prepared_call && commonly_not_ready &&
                        prepared.failure_phase == test_case.phase,
                    "one-rank numerical preparation fault fails commonly");
+    const auto consumed = cpu_detail::ObserveCpuCollectiveTestFault();
+    checks.Require(ExactRank1FaultConsumption(
+                       communicator, rank, test_case.fault, owner, 0, false,
+                       consumed),
+                   "numerical fault has one exact rank1 consumption");
     const AttemptOutcome failure = adapter.FinalizePrepared(prepared);
     const CpuStateSnapshot rolled_back = adapter.Snapshot();
     checks.Require(CollectivelyFalse(failure.committed, communicator) &&
@@ -792,14 +1077,27 @@ void CheckAsymmetricCollectiveNumericsFaults(
                        NearTime(rolled_back.coordinates.time, 0.0),
                    "asymmetric numerical fault rolls back without publication");
 
-    cpu_detail::ResetCpuCollectiveTestFault();
     CpuPreparedStep retry;
     checks.Require(adapter.PrepareRetry(retry) && retry.numerically_ready,
                    "asymmetric numerical fault permits collective retry");
     const AttemptOutcome retried = adapter.FinalizePrepared(retry);
+    const auto after_retry = cpu_detail::ObserveCpuCollectiveTestFault();
+    const CpuStateSnapshot actual = adapter.Snapshot();
+    const bool retry_consumption_exact = ExactRank1FaultConsumption(
+        communicator, rank, test_case.fault, owner, 0, false, after_retry);
     checks.Require(retried.committed && adapter.coordinates().step == 1 &&
-                       NearTime(adapter.coordinates().time, 0.05),
-                   "cleared numerical seam re-enters and commits step 1");
+                       NearTime(adapter.coordinates().time, 0.05) &&
+                       SameFaultObservation(consumed, after_retry) &&
+                       retry_consumption_exact,
+                   "automatic one-shot numerical seam retries before cleanup");
+    checks.Require(ByteEqual(actual.interior, expected_interior) &&
+                       ByteEqual(actual.trace, expected_trace) &&
+                       actual.interior_hash == expected.interior_hash &&
+                       actual.trace_hash == expected.trace_hash &&
+                       actual.state_hash == expected.state_hash &&
+                       actual.coordinates.step == 1 &&
+                       NearTime(actual.coordinates.time, 0.05),
+                   "numerical retry matches uninterrupted step-1 truth");
     cpu_detail::ResetCpuCollectiveTestFault();
   }
 }
@@ -1165,8 +1463,12 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                  "independent mesh/source/flux/Jacobian/signed-map/Schur/"
                  "P^TSP/true-residual/distribute/recovery oracle");
 
+  CheckAsymmetricCollectiveInitializationFaults<Selection>(
+      checks, communicator, rank, ranks);
+  CheckCollectiveFacadeInitialization<Selection>(
+      checks, communicator, rank, ranks);
   CheckAsymmetricCollectiveNumericsFaults<Selection>(
-      checks, communicator, ranks);
+      checks, communicator, rank, ranks);
 
   PersistentSmoothEulerCpuAdapter<Selection> adapter;
   checks.Require(adapter.Initialize(), "persistent adapter initialization");

@@ -14,6 +14,7 @@
 #include <memory>
 #include <new>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -547,19 +548,81 @@ bool AllRanks(const bool local) noexcept
                        MPI_COMM_WORLD) == MPI_SUCCESS && reduced == 1;
 }
 
-std::atomic<unsigned int> collective_test_fault{
-    static_cast<unsigned int>(detail::CpuCollectiveTestFault::none)};
-std::atomic<int> collective_test_fault_rank{-1};
-
-bool ConsumeCollectiveTestFault(
-    const detail::CpuCollectiveTestFault expected, const int rank) noexcept
+struct CpuCollectiveTestLogicalState
 {
-  unsigned int armed = static_cast<unsigned int>(expected);
-  const bool selected = collective_test_fault.compare_exchange_strong(
-      armed, static_cast<unsigned int>(detail::CpuCollectiveTestFault::none),
-      std::memory_order_relaxed);
-  return selected && collective_test_fault_rank.load(std::memory_order_relaxed) ==
-      rank;
+  detail::CpuCollectiveTestFault armed_fault =
+      detail::CpuCollectiveTestFault::none;
+  detail::CpuCollectiveTestFault consumed_fault =
+      detail::CpuCollectiveTestFault::none;
+  std::uint64_t arm_generation = 0;
+  std::uint64_t local_consumption_count = 0;
+  std::uint64_t owner_incarnation = 0;
+  std::uint64_t consumed_incarnation = 0;
+  std::uint64_t last_rejected_incarnation = 0;
+  std::uint64_t local_wrong_owner_rejections = 0;
+  std::uint64_t local_reset_completions = 0;
+  int target_rank = -1;
+  int consumed_rank = -1;
+  bool armed = false;
+  bool reset_collectively_attested = false;
+};
+
+// Arming, execution, and observation are deliberately confined to the same
+// test thread.  An unrelated adapter running on another thread cannot observe
+// or consume this private fault state.
+thread_local CpuCollectiveTestLogicalState collective_test_state{};
+
+bool ConsumeOwnedCollectiveTestFault(
+    const detail::CpuCollectiveTestFault expected, const int rank,
+    const std::uint64_t incarnation) noexcept
+{
+  if (!collective_test_state.armed ||
+      collective_test_state.armed_fault != expected)
+  {
+    return false;
+  }
+  if (collective_test_state.owner_incarnation != incarnation)
+  {
+    ++collective_test_state.local_wrong_owner_rejections;
+    collective_test_state.last_rejected_incarnation = incarnation;
+    return false;
+  }
+  collective_test_state.armed = false;
+  collective_test_state.armed_fault = detail::CpuCollectiveTestFault::none;
+  if (collective_test_state.target_rank != rank) { return false; }
+  ++collective_test_state.local_consumption_count;
+  collective_test_state.consumed_incarnation = incarnation;
+  collective_test_state.consumed_fault = expected;
+  collective_test_state.consumed_rank = rank;
+  return true;
+}
+
+void RecordCollectiveTestReset(const std::uint64_t incarnation,
+                               const bool collectively_attested) noexcept
+{
+  if (collective_test_state.owner_incarnation != incarnation) { return; }
+  if (collectively_attested)
+  {
+    ++collective_test_state.local_reset_completions;
+  }
+  collective_test_state.reset_collectively_attested = collectively_attested;
+}
+
+bool RefuseCollectiveTestReset(const std::uint64_t incarnation,
+                               const int rank) noexcept
+{
+  return collective_test_state.owner_incarnation == incarnation &&
+      collective_test_state.consumed_fault ==
+          detail::CpuCollectiveTestFault::
+              initialization_facade_readiness_reset_refusal &&
+      collective_test_state.target_rank == rank;
+}
+
+std::uint64_t NextCoreIncarnation() noexcept
+{
+  static std::atomic<std::uint64_t> next{1};
+  const std::uint64_t value = next.fetch_add(1, std::memory_order_relaxed);
+  return value == 0 ? 0 : value;
 }
 
 struct CpuCheckpointImportAdmission
@@ -608,19 +671,41 @@ std::uint64_t SumU64(const std::uint64_t local) noexcept
 } // namespace
 
 void detail::ArmCpuCollectiveTestFault(
-    const detail::CpuCollectiveTestFault fault, const int target_rank) noexcept
+    const detail::CpuCollectiveTestFault fault, const int target_rank,
+    const std::uint64_t owner_incarnation) noexcept
 {
-  collective_test_fault_rank.store(target_rank, std::memory_order_relaxed);
-  collective_test_fault.store(static_cast<unsigned int>(fault),
-                              std::memory_order_relaxed);
+  const std::uint64_t next_generation = collective_test_state.arm_generation + 1;
+  collective_test_state = {};
+  collective_test_state.arm_generation =
+      next_generation == 0 ? 1 : next_generation;
+  collective_test_state.armed_fault = fault;
+  collective_test_state.owner_incarnation = owner_incarnation;
+  collective_test_state.target_rank = target_rank;
+  collective_test_state.armed = owner_incarnation != 0 &&
+      fault != detail::CpuCollectiveTestFault::none;
 }
 
 void detail::ResetCpuCollectiveTestFault() noexcept
 {
-  collective_test_fault.store(
-      static_cast<unsigned int>(detail::CpuCollectiveTestFault::none),
-      std::memory_order_relaxed);
-  collective_test_fault_rank.store(-1, std::memory_order_relaxed);
+  collective_test_state = {};
+}
+
+detail::CpuCollectiveTestConsumptionEvidence
+detail::ObserveCpuCollectiveTestFault() noexcept
+{
+  return {collective_test_state.arm_generation,
+          collective_test_state.local_consumption_count,
+          collective_test_state.owner_incarnation,
+          collective_test_state.consumed_incarnation,
+          collective_test_state.last_rejected_incarnation,
+          collective_test_state.local_wrong_owner_rejections,
+          collective_test_state.local_reset_completions,
+          collective_test_state.consumed_fault,
+          collective_test_state.consumed_rank,
+          collective_test_state.target_rank,
+          collective_test_state.armed,
+          collective_test_state.reset_collectively_attested,
+          true};
 }
 
 struct CpuSlotStorage
@@ -1297,6 +1382,7 @@ struct detail::CpuNumericsCore::Implementation
 
   CpuPersistentConfig config{};
   RuntimeTupleDescriptor tuple{};
+  std::uint64_t incarnation = 0;
   int rank = -1;
   int ranks = 0;
   bool initialized = false;
@@ -1307,7 +1393,7 @@ struct detail::CpuNumericsCore::Implementation
   std::unique_ptr<mfem::DG_Interface_FECollection> trace_collection;
   std::unique_ptr<mfem::ParFiniteElementSpace> interior_space;
   std::unique_ptr<mfem::ParFiniteElementSpace> trace_space;
-  trace::DGInterfaceTraceExchangePlan exchange_plan;
+  std::optional<trace::DGInterfaceTraceExchangePlan> exchange_plan;
 
   CpuStateSlot committed_slot{};
   CpuStateSlot candidate_slot{};
@@ -1602,8 +1688,9 @@ struct detail::CpuNumericsCore::Implementation
     try
     {
       trace_distribution_workspace = 0.0;
-      local_prepared = !ConsumeCollectiveTestFault(
-          detail::CpuCollectiveTestFault::trace_load_preparation, rank);
+      local_prepared = exchange_plan && !ConsumeOwnedCollectiveTestFault(
+          detail::CpuCollectiveTestFault::trace_load_preparation, rank,
+          incarnation);
     }
     catch (...)
     {
@@ -1614,7 +1701,7 @@ struct detail::CpuNumericsCore::Implementation
     bool distributed = false;
     try
     {
-      distributed = exchange_plan.Distribute(
+      distributed = exchange_plan->Distribute(
           *trace_space, true_values, trace_distribution_workspace);
     }
     catch (...)
@@ -1652,6 +1739,7 @@ struct detail::CpuNumericsCore::Implementation
   {
     try
     {
+      if (!exchange_plan) { return false; }
       if (!ResizeOwned(interior_global_ids,
                        static_cast<std::size_t>(interior_space->GetVSize()),
                        CpuOwnedAllocationSite::topology_vector,
@@ -1717,12 +1805,13 @@ struct detail::CpuNumericsCore::Implementation
             const int local_dof = Decode(
                 vdofs[ByNodes(scalar, 2, component)], sign);
             if (local_dof < 0 ||
-                local_dof >= static_cast<int>(exchange_plan.map.dofs.entries.size()))
+                local_dof >= static_cast<int>(
+                    exchange_plan->map.dofs.entries.size()))
             {
               return false;
             }
             const trace::TraceMapEntry& entry =
-                exchange_plan.map.dofs.entries[
+                exchange_plan->map.dofs.entries[
                     static_cast<std::size_t>(local_dof)];
             if (entry.ownership != Ownership::owned) { continue; }
             const std::uint64_t canonical =
@@ -1870,54 +1959,114 @@ struct detail::CpuNumericsCore::Implementation
   {
     // This allocation/setup prime is deliberately outside the scientific
     // factor-setup generation and census; every Newton matrix is rebound later.
-    true_matrix->HostReadWrite();
-    true_matrix->GetDiag(true_diagonal_view);
-    true_matrix->GetOffd(true_offdiagonal_view,
-                         true_offdiagonal_columns);
-    const HYPRE_BigInt* row_starts = true_matrix->GetRowStarts();
-    int* diagonal_i = true_diagonal_view.GetI();
-    int* diagonal_j = true_diagonal_view.GetJ();
-    double* diagonal_data = true_diagonal_view.GetData();
-    double* offdiagonal_data = true_offdiagonal_view.GetData();
-    if (!row_starts || !diagonal_i || !diagonal_j || !diagonal_data ||
-        (true_offdiagonal_view.NumNonZeroElems() != 0 &&
-         !offdiagonal_data))
+    bool local_setup_ready = false;
+    try
     {
-      return false;
-    }
-    const HYPRE_BigInt row_begin = HYPRE_AssumedPartitionCheck()
-        ? row_starts[0] : row_starts[rank];
-    std::fill(diagonal_data,
-              diagonal_data + true_diagonal_view.NumNonZeroElems(), 0.0);
-    if (true_offdiagonal_view.NumNonZeroElems() != 0)
-    {
-      std::fill(offdiagonal_data,
-                offdiagonal_data +
-                    true_offdiagonal_view.NumNonZeroElems(), 0.0);
-    }
-    for (int row = 0; row < true_diagonal_view.Height(); ++row)
-    {
-      bool found = false;
-      for (int entry = diagonal_i[row]; entry < diagonal_i[row + 1];
-           ++entry)
+      const auto prepare_prime = [&]() -> bool
       {
-        if (row_begin + diagonal_j[entry] == row_begin + row)
+        if (!true_matrix || !hypre_rhs || !hypre_solution ||
+            !hypre_residual || !ilu || !gmres)
         {
-          diagonal_data[entry] = 1.0;
-          found = true;
-          break;
+          return false;
         }
-      }
-      if (!found) { return false; }
+        true_matrix->HostReadWrite();
+        true_matrix->GetDiag(true_diagonal_view);
+        true_matrix->GetOffd(true_offdiagonal_view,
+                             true_offdiagonal_columns);
+        const HYPRE_BigInt* row_starts = true_matrix->GetRowStarts();
+        int* diagonal_i = true_diagonal_view.GetI();
+        int* diagonal_j = true_diagonal_view.GetJ();
+        double* diagonal_data = true_diagonal_view.GetData();
+        double* offdiagonal_data = true_offdiagonal_view.GetData();
+        if (!row_starts || !diagonal_i || !diagonal_j || !diagonal_data ||
+            (true_offdiagonal_view.NumNonZeroElems() != 0 &&
+             !offdiagonal_data))
+        {
+          return false;
+        }
+        const HYPRE_BigInt row_begin = HYPRE_AssumedPartitionCheck()
+            ? row_starts[0] : row_starts[rank];
+        std::fill(diagonal_data,
+                  diagonal_data + true_diagonal_view.NumNonZeroElems(), 0.0);
+        if (true_offdiagonal_view.NumNonZeroElems() != 0)
+        {
+          std::fill(
+              offdiagonal_data,
+              offdiagonal_data + true_offdiagonal_view.NumNonZeroElems(), 0.0);
+        }
+        for (int row = 0; row < true_diagonal_view.Height(); ++row)
+        {
+          bool found = false;
+          for (int entry = diagonal_i[row]; entry < diagonal_i[row + 1];
+               ++entry)
+          {
+            if (row_begin + diagonal_j[entry] == row_begin + row)
+            {
+              diagonal_data[entry] = 1.0;
+              found = true;
+              break;
+            }
+          }
+          if (!found) { return false; }
+        }
+        return true;
+      };
+      local_setup_ready = prepare_prime();
     }
-    true_matrix->HypreRead();
-    *hypre_rhs = 1.0;
-    *hypre_solution = 0.0;
-    gmres->Mult(*hypre_rhs, *hypre_solution);
-    *hypre_rhs = 0.0;
-    *hypre_solution = 0.0;
-    *hypre_residual = 0.0;
-    return true;
+    catch (...)
+    {
+      local_setup_ready = false;
+    }
+    if (!CollectiveAll(local_setup_ready)) { return false; }
+
+    bool hypre_input_ready = true;
+    try
+    {
+      true_matrix->HypreRead();
+      *hypre_rhs = 1.0;
+      *hypre_solution = 0.0;
+      hypre_input_ready = Finite(*hypre_rhs) && Finite(*hypre_solution) &&
+          !ConsumeOwnedCollectiveTestFault(
+              detail::CpuCollectiveTestFault::
+                  initialization_before_gmres_prime,
+              rank, incarnation);
+    }
+    catch (...)
+    {
+      hypre_input_ready = false;
+    }
+    if (!CollectiveAll(hypre_input_ready)) { return false; }
+
+    bool prime_complete = true;
+    try
+    {
+      // This is the opaque-call boundary from the frozen card: all W8-owned
+      // preparation was admitted above.  If Mult returns, its result is
+      // consensused below.  An in-call interruption is process-terminal; this
+      // leaf neither injects it nor fabricates a RuntimeFailure/retry for it.
+      gmres->Mult(*hypre_rhs, *hypre_solution);
+      prime_complete = Finite(*hypre_solution);
+    }
+    catch (...)
+    {
+      prime_complete = false;
+    }
+    if (!CollectiveAll(prime_complete)) { return false; }
+
+    bool reset_complete = true;
+    try
+    {
+      *hypre_rhs = 0.0;
+      *hypre_solution = 0.0;
+      *hypre_residual = 0.0;
+      reset_complete = Finite(*hypre_rhs) && Finite(*hypre_solution) &&
+          Finite(*hypre_residual);
+    }
+    catch (...)
+    {
+      reset_complete = false;
+    }
+    return CollectiveAll(reset_complete);
   }
 
   bool FindOwnedTrueEntry(const std::uint64_t global_row,
@@ -1977,10 +2126,15 @@ struct detail::CpuNumericsCore::Implementation
 
   bool BuildSparseSchurPlan() noexcept
   {
+    std::size_t owned_count = 0;
+    std::size_t outgoing_count = 0;
+    std::vector<std::array<std::uint64_t, 2>> outgoing_keys;
+    bool outgoing_ready = false;
     try
     {
-      std::size_t owned_count = 0;
-      std::size_t outgoing_count = 0;
+      const auto prepare_outgoing = [&]() -> bool
+      {
+      if (!exchange_plan) { return false; }
       for (int element = 0; element < mesh->GetNE(); ++element)
         for (int row = 0; row < local_trace; ++row)
         {
@@ -1988,11 +2142,11 @@ struct detail::CpuNumericsCore::Implementation
           const int row_dof = Decode(signed_trace_dofs[
               static_cast<std::size_t>(element) * local_trace + row], sign);
           if (row_dof < 0 || row_dof >= static_cast<int>(
-                  exchange_plan.map.dofs.entries.size()))
+                  exchange_plan->map.dofs.entries.size()))
           {
             return false;
           }
-          const auto& row_entry = exchange_plan.map.dofs.entries[
+          const auto& row_entry = exchange_plan->map.dofs.entries[
               static_cast<std::size_t>(row_dof)];
           const std::size_t count = static_cast<std::size_t>(local_trace);
           if (row_entry.owner_rank == rank) { owned_count += count; }
@@ -2007,7 +2161,13 @@ struct detail::CpuNumericsCore::Implementation
       {
         return false;
       }
-      std::vector<std::array<std::uint64_t, 2>> outgoing_keys(outgoing_count);
+      if (outgoing_count > static_cast<std::size_t>(
+              std::numeric_limits<int>::max() / 2) ||
+          (ranks == 1 && outgoing_count != 0))
+      {
+        return false;
+      }
+      outgoing_keys.resize(outgoing_count);
       std::size_t owned_cursor = 0;
       std::size_t outgoing_cursor = 0;
       for (int element = 0; element < mesh->GetNE(); ++element)
@@ -2017,7 +2177,7 @@ struct detail::CpuNumericsCore::Implementation
           const int row_dof = Decode(signed_trace_dofs[
               static_cast<std::size_t>(element) * local_trace + row],
                                      row_sign);
-          const auto& row_entry = exchange_plan.map.dofs.entries[
+          const auto& row_entry = exchange_plan->map.dofs.entries[
               static_cast<std::size_t>(row_dof)];
           for (int column = 0; column < local_trace; ++column)
           {
@@ -2026,11 +2186,11 @@ struct detail::CpuNumericsCore::Implementation
                 static_cast<std::size_t>(element) * local_trace + column],
                                           column_sign);
             if (column_dof < 0 || column_dof >= static_cast<int>(
-                    exchange_plan.map.dofs.entries.size()))
+                    exchange_plan->map.dofs.entries.size()))
             {
               return false;
             }
-            const auto& column_entry = exchange_plan.map.dofs.entries[
+            const auto& column_entry = exchange_plan->map.dofs.entries[
                 static_cast<std::size_t>(column_dof)];
             const std::size_t schur_index =
                 static_cast<std::size_t>(element) * local_trace * local_trace +
@@ -2064,74 +2224,116 @@ struct detail::CpuNumericsCore::Implementation
         return false;
       }
 
-      std::size_t incoming_count = 0;
-      std::vector<std::array<std::uint64_t, 2>> incoming_keys;
-      if (ranks == 2)
-      {
-        const int peer = 1 - rank;
-        unsigned long long send_count =
-            static_cast<unsigned long long>(outgoing_count);
-        unsigned long long receive_count = 0;
-        if (MPI_Sendrecv(&send_count, 1, MPI_UNSIGNED_LONG_LONG, peer, 810,
-                         &receive_count, 1, MPI_UNSIGNED_LONG_LONG, peer, 810,
-                         MPI_COMM_WORLD, MPI_STATUS_IGNORE) != MPI_SUCCESS ||
-            receive_count > static_cast<unsigned long long>(
-                std::numeric_limits<int>::max()))
-        {
-          return false;
-        }
-        incoming_count = static_cast<std::size_t>(receive_count);
-        incoming_keys.resize(incoming_count);
-        if (MPI_Sendrecv(outgoing_keys.data(),
-                         static_cast<int>(outgoing_count * 2),
-                         MPI_UINT64_T, peer, 811,
-                         incoming_keys.data(),
-                         static_cast<int>(incoming_count * 2),
-                         MPI_UINT64_T, peer, 811,
-                         MPI_COMM_WORLD, MPI_STATUS_IGNORE) != MPI_SUCCESS)
-        {
-          return false;
-        }
-      }
-      else if (outgoing_count != 0)
-      {
-        return false;
-      }
-      if (!ResizeOwned(incoming_schur_slots, incoming_count,
-                       CpuOwnedAllocationSite::sparse_exchange_graph,
-                       allocations) ||
-          !ResizeOwned(outgoing_schur_values, outgoing_count,
-                       CpuOwnedAllocationSite::sparse_exchange_buffer,
-                       allocations) ||
-          !ResizeOwned(incoming_schur_values, incoming_count,
-                       CpuOwnedAllocationSite::sparse_exchange_buffer,
-                       allocations))
-      {
-        return false;
-      }
-      for (std::size_t index = 0; index < incoming_count; ++index)
-      {
-        int data_index = -1;
-        bool offdiagonal = false;
-        if (!FindOwnedTrueEntry(incoming_keys[index][0], incoming_keys[index][1],
-                                data_index, offdiagonal))
-        {
-          return false;
-        }
-        incoming_schur_slots[index] = {data_index, offdiagonal};
-      }
-      return true;
+      return !ConsumeOwnedCollectiveTestFault(
+          detail::CpuCollectiveTestFault::
+              initialization_before_sparse_count_exchange,
+          rank, incarnation);
+      };
+      outgoing_ready = prepare_outgoing();
     }
     catch (...)
     {
-      return false;
+      outgoing_ready = false;
     }
+    if (!CollectiveAll(outgoing_ready)) { return false; }
+
+    unsigned long long receive_count = 0;
+    bool count_exchange_ready = true;
+    if (ranks == 2)
+    {
+      const int peer = 1 - rank;
+      const unsigned long long send_count =
+          static_cast<unsigned long long>(outgoing_count);
+      count_exchange_ready = MPI_Sendrecv(
+          &send_count, 1, MPI_UNSIGNED_LONG_LONG, peer, 810,
+          &receive_count, 1, MPI_UNSIGNED_LONG_LONG, peer, 810,
+          MPI_COMM_WORLD, MPI_STATUS_IGNORE) == MPI_SUCCESS;
+    }
+    if (!CollectiveAll(count_exchange_ready)) { return false; }
+
+    std::size_t incoming_count = 0;
+    std::vector<std::array<std::uint64_t, 2>> incoming_keys;
+    bool incoming_allocation_ready = false;
+    try
+    {
+      incoming_allocation_ready = receive_count <=
+          static_cast<unsigned long long>(
+              std::numeric_limits<int>::max() / 2);
+      if (incoming_allocation_ready)
+      {
+        incoming_count = static_cast<std::size_t>(receive_count);
+        incoming_keys.resize(incoming_count);
+        incoming_allocation_ready = !ConsumeOwnedCollectiveTestFault(
+            detail::CpuCollectiveTestFault::
+                initialization_between_sparse_exchanges,
+            rank, incarnation);
+      }
+    }
+    catch (...)
+    {
+      incoming_allocation_ready = false;
+    }
+    if (!CollectiveAll(incoming_allocation_ready)) { return false; }
+
+    bool key_exchange_ready = true;
+    if (ranks == 2)
+    {
+      const int peer = 1 - rank;
+      key_exchange_ready = MPI_Sendrecv(
+          outgoing_keys.data(), static_cast<int>(outgoing_count * 2),
+          MPI_UINT64_T, peer, 811, incoming_keys.data(),
+          static_cast<int>(incoming_count * 2), MPI_UINT64_T, peer, 811,
+          MPI_COMM_WORLD, MPI_STATUS_IGNORE) == MPI_SUCCESS;
+    }
+    if (!CollectiveAll(key_exchange_ready)) { return false; }
+
+    bool final_ready = false;
+    try
+    {
+      const auto finalize_plan = [&]() -> bool
+      {
+        if (!ResizeOwned(incoming_schur_slots, incoming_count,
+                         CpuOwnedAllocationSite::sparse_exchange_graph,
+                         allocations) ||
+            !ResizeOwned(outgoing_schur_values, outgoing_count,
+                         CpuOwnedAllocationSite::sparse_exchange_buffer,
+                         allocations) ||
+            !ResizeOwned(incoming_schur_values, incoming_count,
+                         CpuOwnedAllocationSite::sparse_exchange_buffer,
+                         allocations))
+        {
+          return false;
+        }
+        for (std::size_t index = 0; index < incoming_count; ++index)
+        {
+          int data_index = -1;
+          bool offdiagonal = false;
+          if (!FindOwnedTrueEntry(incoming_keys[index][0],
+                                  incoming_keys[index][1], data_index,
+                                  offdiagonal))
+          {
+            return false;
+          }
+          incoming_schur_slots[index] = {data_index, offdiagonal};
+        }
+        return true;
+      };
+      final_ready = finalize_plan();
+    }
+    catch (...)
+    {
+      final_ready = false;
+    }
+    return CollectiveAll(final_ready);
   }
 
   bool AllocateWorkspace() noexcept
   {
+    bool local_graph_ready = false;
     try
     {
+      const auto prepare_local_graph = [&]() -> bool
+      {
       if (!current_system.Allocate(mesh->GetNE(), local_interior, local_trace,
                                    allocations) ||
           !trial_system.Allocate(mesh->GetNE(), local_interior, local_trace,
@@ -2236,35 +2438,119 @@ struct detail::CpuNumericsCore::Implementation
       parallel_form =
           std::make_unique<mfem::ParBilinearForm>(trace_space.get());
       if (!ObserveWrapper(parallel_form)) { return false; }
+      return true;
+      };
+      local_graph_ready = prepare_local_graph();
+    }
+    catch (...)
+    {
+      local_graph_ready = false;
+    }
+    if (!CollectiveAll(local_graph_ready)) { return false; }
+
+    bool parallel_assembly_ready = false;
+    try
+    {
+      // ParallelAssemble is opaque.  The complete W8-owned graph was admitted
+      // above, and every returned result is consensused below.  No in-call
+      // failure seam or same-process recovery claim exists here.
       true_matrix.reset(parallel_form->ParallelAssemble(local_matrix.get()));
-      if (!ObserveWrapper(true_matrix)) { return false; }
-      if (!true_matrix ||
-          true_matrix->Height() != trace_space->GetTrueVSize() ||
-          true_matrix->GetGlobalNumRows() != trace_space->GlobalTrueVSize() ||
-          true_matrix->GetGlobalNumCols() != trace_space->GlobalTrueVSize())
+      parallel_assembly_ready = ObserveWrapper(true_matrix) && true_matrix &&
+          true_matrix->Height() == trace_space->GetTrueVSize() &&
+          true_matrix->GetGlobalNumRows() == trace_space->GlobalTrueVSize() &&
+          true_matrix->GetGlobalNumCols() == trace_space->GlobalTrueVSize();
+      if (parallel_assembly_ready)
       {
-        return false;
+        true_matrix->GetDiag(true_diagonal_view);
+        true_matrix->GetOffd(true_offdiagonal_view,
+                             true_offdiagonal_columns);
       }
-      true_matrix->GetDiag(true_diagonal_view);
-      true_matrix->GetOffd(true_offdiagonal_view,
-                           true_offdiagonal_columns);
-      if (!BuildSparseSchurPlan()) { return false; }
+    }
+    catch (...)
+    {
+      parallel_assembly_ready = false;
+    }
+    if (!CollectiveAll(parallel_assembly_ready)) { return false; }
+    if (!BuildSparseSchurPlan()) { return false; }
+
+    bool condensation_prime_ready = true;
+    try
+    {
       *local_matrix = 0.0;
-      if (!PrimeCondensationWorkspace()) { return false; }
+      condensation_prime_ready = PrimeCondensationWorkspace();
+    }
+    catch (...)
+    {
+      condensation_prime_ready = false;
+    }
+    if (!CollectiveAll(condensation_prime_ready)) { return false; }
+
+    bool hypre_rhs_ready = false;
+    try
+    {
       hypre_rhs = std::make_unique<mfem::HypreParVector>(trace_space.get());
+      hypre_rhs_ready = ObserveWrapper(hypre_rhs);
+    }
+    catch (...)
+    {
+      hypre_rhs_ready = false;
+    }
+    if (!CollectiveAll(hypre_rhs_ready)) { return false; }
+
+    bool hypre_solution_ready = false;
+    try
+    {
       hypre_solution =
           std::make_unique<mfem::HypreParVector>(trace_space.get());
+      hypre_solution_ready = ObserveWrapper(hypre_solution);
+    }
+    catch (...)
+    {
+      hypre_solution_ready = false;
+    }
+    if (!CollectiveAll(hypre_solution_ready)) { return false; }
+
+    bool hypre_residual_ready = false;
+    try
+    {
       hypre_residual =
           std::make_unique<mfem::HypreParVector>(trace_space.get());
+      hypre_residual_ready = ObserveWrapper(hypre_residual);
+    }
+    catch (...)
+    {
+      hypre_residual_ready = false;
+    }
+    if (!CollectiveAll(hypre_residual_ready)) { return false; }
+
+    bool ilu_ready = false;
+    try
+    {
       ilu = std::make_unique<mfem::HypreILU>();
       ApplyFrozenIluSettings();
+      ilu_ready = ObserveWrapper(ilu);
+    }
+    catch (...)
+    {
+      ilu_ready = false;
+    }
+    if (!CollectiveAll(ilu_ready)) { return false; }
+
+    bool gmres_ready = false;
+    try
+    {
       gmres = std::make_unique<mfem::HypreGMRES>(MPI_COMM_WORLD);
-      if (!ObserveWrapper(hypre_rhs) || !ObserveWrapper(hypre_solution) ||
-          !ObserveWrapper(hypre_residual) || !ObserveWrapper(ilu) ||
-          !ObserveWrapper(gmres))
-      {
-        return false;
-      }
+      gmres_ready = ObserveWrapper(gmres);
+    }
+    catch (...)
+    {
+      gmres_ready = false;
+    }
+    if (!CollectiveAll(gmres_ready)) { return false; }
+
+    bool solver_configuration_ready = true;
+    try
+    {
       gmres->SetTol(1.0e-12);
       gmres->SetAbsTol(0.0);
       const int global_trace_size =
@@ -2273,14 +2559,35 @@ struct detail::CpuNumericsCore::Implementation
       gmres->SetKDim(std::min(100, std::max(20, global_trace_size)));
       gmres->SetLogging(1);
       gmres->SetPrintLevel(0);
-      gmres->SetPreconditioner(*ilu);
-      gmres->SetOperator(*true_matrix);
-      return PrimeHypreWorkspace();
     }
     catch (...)
     {
-      return false;
+      solver_configuration_ready = false;
     }
+    if (!CollectiveAll(solver_configuration_ready)) { return false; }
+
+    bool preconditioner_binding_ready = true;
+    try
+    {
+      gmres->SetPreconditioner(*ilu);
+    }
+    catch (...)
+    {
+      preconditioner_binding_ready = false;
+    }
+    if (!CollectiveAll(preconditioner_binding_ready)) { return false; }
+
+    bool operator_binding_ready = true;
+    try
+    {
+      gmres->SetOperator(*true_matrix);
+    }
+    catch (...)
+    {
+      operator_binding_ready = false;
+    }
+    if (!CollectiveAll(operator_binding_ready)) { return false; }
+    return PrimeHypreWorkspace();
   }
 
   std::size_t WorkspaceBytes() const noexcept
@@ -2624,8 +2931,9 @@ struct detail::CpuNumericsCore::Implementation
       local_prepared = local_prepared && Finite(local_trace_residual) &&
           Finite(local_interior_squared) &&
           trace_space && trace_space->Dof_TrueDof_Matrix() &&
-          !ConsumeCollectiveTestFault(
-              detail::CpuCollectiveTestFault::residual_map_preparation, rank);
+          !ConsumeOwnedCollectiveTestFault(
+              detail::CpuCollectiveTestFault::residual_map_preparation, rank,
+              incarnation);
     }
     catch (...)
     {
@@ -2886,10 +3194,10 @@ struct detail::CpuNumericsCore::Implementation
             incoming_schur_values.size() <=
                    static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
             Finite(outgoing_schur_values) &&
-            !ConsumeCollectiveTestFault(
+            !ConsumeOwnedCollectiveTestFault(
                 detail::CpuCollectiveTestFault::
                     condensation_outgoing_preparation,
-                rank);
+                rank, incarnation);
       };
       outgoing_ready = prepare_outgoing();
     }
@@ -3103,10 +3411,11 @@ struct detail::CpuNumericsCore::Implementation
 
   bool Recover() noexcept
   {
-    bool distribution_prepared = true;
+    bool distribution_prepared = false;
     try
     {
       distributed_increment = 0.0;
+      distribution_prepared = exchange_plan.has_value();
     }
     catch (...)
     {
@@ -3117,7 +3426,7 @@ struct detail::CpuNumericsCore::Implementation
     bool distributed_ready = false;
     try
     {
-      distributed_ready = exchange_plan.Distribute(
+      distributed_ready = exchange_plan->Distribute(
           *trace_space, true_increment, distributed_increment);
     }
     catch (...)
@@ -3312,8 +3621,10 @@ bool AssignGridFunction(mfem::ParGridFunction& destination,
 } // namespace
 
 detail::CpuNumericsCore::CpuNumericsCore()
-    : implementation_(std::make_unique<Implementation>())
+    : implementation_(std::make_unique<Implementation>()),
+      incarnation_(NextCoreIncarnation())
 {
+  implementation_->incarnation = incarnation_;
   (void)implementation_->allocations.Observe(
       CpuOwnedAllocationSite::core_wrapper, sizeof(Implementation),
       alignof(Implementation), 1, implementation_.get());
@@ -3324,6 +3635,72 @@ detail::CpuNumericsCore::CpuNumericsCore(CpuNumericsCore&&) noexcept = default;
 detail::CpuNumericsCore& detail::CpuNumericsCore::operator=(
     CpuNumericsCore&&) noexcept = default;
 
+bool detail::CpuNumericsCore::ResetAfterInitializationFailure() noexcept
+{
+  // The exchange plan is optional, so an empty Implementation performs no
+  // selected W8-owned allocation.  Reverse member destruction releases every
+  // dependent solver/space/mesh object before the same fixed core storage is
+  // reconstructed.  No make_unique/vector resize occurs on this reset path.
+  Implementation* const storage = implementation_.get();
+  bool local_ready = storage != nullptr && incarnation_ != 0;
+  const int previous_rank = local_ready ? storage->rank : -1;
+  if (local_ready)
+  {
+    storage->~Implementation();
+    ::new (static_cast<void*>(storage)) Implementation();
+    storage->incarnation = incarnation_;
+    local_ready = storage->allocations.Observe(
+        CpuOwnedAllocationSite::core_wrapper, sizeof(Implementation),
+        alignof(Implementation), 1, storage) && !storage->initialized &&
+        !storage->mesh && !storage->interior_space &&
+        !storage->trace_space && !storage->exchange_plan &&
+        !storage->committed_slot.interior.cell &&
+        !storage->candidate_slot.interior.cell && !storage->true_matrix &&
+        !storage->gmres && !storage->ilu &&
+        !RefuseCollectiveTestReset(incarnation_, previous_rank);
+  }
+  const bool reset_complete = AllRanks(local_ready);
+  RecordCollectiveTestReset(incarnation_, reset_complete);
+  return reset_complete;
+}
+
+bool detail::CpuNumericsCore::AdmitInitialization(
+    const bool facade_empty, const CpuPersistentConfig& config,
+    const RuntimeTupleDescriptor& tuple) const noexcept
+{
+  const Implementation& state = *implementation_;
+  int mpi_initialized = 0;
+  int mpi_finalized = 0;
+  int ranks = 0;
+  MPI_Initialized(&mpi_initialized);
+  MPI_Finalized(&mpi_finalized);
+  const bool local_ready = facade_empty && incarnation_ != 0 &&
+      state.incarnation == incarnation_ && !state.initialized &&
+      mpi_initialized != 0 && mpi_finalized == 0 &&
+      MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS &&
+      (ranks == 1 || ranks == 2) && ExactConfig(config) &&
+      ExactTuple(tuple, ranks);
+  return AllRanks(local_ready);
+}
+
+bool detail::CpuNumericsCore::CollectiveAll(const bool local) const noexcept
+{
+  return AllRanks(local);
+}
+
+bool detail::CpuNumericsCore::ConsumeCollectiveTestFault(
+    const detail::CpuCollectiveTestFault fault) noexcept
+{
+  const Implementation& state = *implementation_;
+  return ConsumeOwnedCollectiveTestFault(
+      fault, state.rank, incarnation_);
+}
+
+std::uint64_t detail::CpuNumericsCore::incarnation() const noexcept
+{
+  return incarnation_;
+}
+
 bool detail::CpuNumericsCore::Initialize(
     const CpuPersistentConfig& config,
     const RuntimeTupleDescriptor& tuple,
@@ -3331,7 +3708,7 @@ bool detail::CpuNumericsCore::Initialize(
 {
   initialized = {};
   Implementation& state = *implementation_;
-  if (state.initialized) { return false; }
+  if (!AllRanks(!state.initialized)) { return false; }
   int mpi_initialized = 0;
   int mpi_finalized = 0;
   MPI_Initialized(&mpi_initialized);
@@ -3346,6 +3723,7 @@ bool detail::CpuNumericsCore::Initialize(
   state.tuple = tuple;
 
   std::vector<int> partition;
+  std::optional<mfem::Mesh> periodic_mesh;
   try
   {
     mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
@@ -3356,11 +3734,31 @@ bool detail::CpuNumericsCore::Initialize(
     translations[0][1] = 0.0;
     translations[1][0] = 0.0;
     translations[1][1] = 1.0;
-    mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
-        original, original.CreatePeriodicVertexMapping(translations));
-    partition = BuildPartition(periodic, state.ranks);
+    periodic_mesh.emplace(mfem::Mesh::MakePeriodic(
+        original, original.CreatePeriodicVertexMapping(translations)));
+    partition = BuildPartition(*periodic_mesh, state.ranks);
+    local_ok = periodic_mesh.has_value() && !partition.empty();
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!AllRanks(local_ok)) { return false; }
+
+  try
+  {
     state.mesh = std::make_unique<mfem::ParMesh>(
-        MPI_COMM_WORLD, periodic, partition.data());
+        MPI_COMM_WORLD, *periodic_mesh, partition.data());
+    local_ok = state.ObserveWrapper(state.mesh) && state.mesh->GetNE() > 0;
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!AllRanks(local_ok)) { return false; }
+
+  try
+  {
     state.interior_collection = std::make_unique<mfem::L2_FECollection>(
         cpu_polynomial_order, cpu_dimension, mfem::BasisType::GaussLegendre,
         mfem::FiniteElement::VALUE);
@@ -3368,31 +3766,78 @@ bool detail::CpuNumericsCore::Initialize(
         std::make_unique<mfem::DG_Interface_FECollection>(
             cpu_polynomial_order, cpu_dimension, mfem::FiniteElement::VALUE,
             mfem::BasisType::GaussLegendre);
-    state.interior_space = std::make_unique<mfem::ParFiniteElementSpace>(
-        state.mesh.get(), state.interior_collection.get(),
-        cpu_conserved_components, mfem::Ordering::byNODES);
-    state.trace_space = std::make_unique<mfem::ParFiniteElementSpace>(
-        state.mesh.get(), state.trace_collection.get(),
-        cpu_conserved_components, mfem::Ordering::byNODES);
-    local_ok = state.ObserveWrapper(state.mesh) &&
-        state.ObserveWrapper(state.interior_collection) &&
-        state.ObserveWrapper(state.trace_collection) &&
-        state.ObserveWrapper(state.interior_space) &&
-        state.ObserveWrapper(state.trace_space);
-    state.interior_space->ExchangeFaceNbrData();
-    state.trace_space->ExchangeFaceNbrData();
-    local_ok = local_ok && state.mesh->GetNE() > 0 &&
-        state.interior_space->GetVSize() > 0 &&
-        state.trace_space->GetVSize() > 0 &&
-        state.trace_space->GetTrueVSize() > 0 &&
-        trace::BuildDGInterfaceTraceExchangePlan(
-            *state.trace_space, state.exchange_plan) &&
-        state.exchange_plan.IsConsistent();
+    local_ok = state.ObserveWrapper(state.interior_collection) &&
+        state.ObserveWrapper(state.trace_collection);
   }
   catch (...)
   {
     local_ok = false;
   }
+  if (!AllRanks(local_ok)) { return false; }
+
+  try
+  {
+    state.interior_space = std::make_unique<mfem::ParFiniteElementSpace>(
+        state.mesh.get(), state.interior_collection.get(),
+        cpu_conserved_components, mfem::Ordering::byNODES);
+    local_ok = state.ObserveWrapper(state.interior_space) &&
+        state.interior_space->GetVSize() > 0;
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!AllRanks(local_ok)) { return false; }
+
+  try
+  {
+    state.trace_space = std::make_unique<mfem::ParFiniteElementSpace>(
+        state.mesh.get(), state.trace_collection.get(),
+        cpu_conserved_components, mfem::Ordering::byNODES);
+    local_ok = state.ObserveWrapper(state.trace_space) &&
+        state.trace_space->GetVSize() > 0 &&
+        state.trace_space->GetTrueVSize() > 0;
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!AllRanks(local_ok)) { return false; }
+
+  try
+  {
+    state.interior_space->ExchangeFaceNbrData();
+    local_ok = true;
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!AllRanks(local_ok)) { return false; }
+
+  try
+  {
+    state.trace_space->ExchangeFaceNbrData();
+    local_ok = true;
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!AllRanks(local_ok)) { return false; }
+
+  try
+  {
+    state.exchange_plan.emplace();
+    local_ok = trace::BuildDGInterfaceTraceExchangePlan(
+        *state.trace_space, *state.exchange_plan);
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!AllRanks(local_ok)) { return false; }
+  local_ok = state.exchange_plan && state.exchange_plan->IsConsistent();
   if (!AllRanks(local_ok)) { return false; }
 
   local_ok = state.BuildTopology();
@@ -3413,14 +3858,15 @@ bool detail::CpuNumericsCore::Initialize(
                            state.allocations) &&
         ResizeOwned(state.first_iterate_trace, trace_size,
                     CpuOwnedAllocationSite::recovery_vector,
-                    state.allocations) &&
-        state.AllocateWorkspace();
+                    state.allocations);
   }
   catch (...)
   {
     local_ok = false;
   }
   if (!AllRanks(local_ok)) { return false; }
+  const bool workspace_ready = state.AllocateWorkspace();
+  if (!AllRanks(workspace_ready)) { return false; }
 
   try
   {
@@ -3564,7 +4010,7 @@ bool detail::CpuNumericsCore::Initialize(
        state.Committed()->trace.capacity()) * sizeof(double);
   resources.reuse = {true, true, true, false, 1, 1,
                      2 * state_bytes, state.WorkspaceBytes()};
-  if (!resources.Valid()) { return false; }
+  if (!AllRanks(resources.Valid())) { return false; }
 
   state.evidence.tuple = tuple;
   state.evidence.experiment = config.experiment;
@@ -3741,8 +4187,9 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   }
   bool assembled = state.Assemble(
       *state.iterate_interior, *state.iterate_trace, state.current_system);
-  const bool assembly_fault = ConsumeCollectiveTestFault(
-      detail::CpuCollectiveTestFault::assembly_completion, state.rank);
+  const bool assembly_fault = ConsumeOwnedCollectiveTestFault(
+      detail::CpuCollectiveTestFault::assembly_completion, state.rank,
+      state.incarnation);
   assembled = assembled && !assembly_fault;
   if (!state.CollectiveAll(assembled))
   {

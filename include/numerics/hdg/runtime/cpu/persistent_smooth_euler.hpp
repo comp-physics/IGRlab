@@ -16,7 +16,6 @@
 #include <mpi.h>
 
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -633,6 +632,10 @@ namespace detail
 /**
  * Private one-shot seams used only to prove collective failure admission.
  * They are inert unless an owned leaf test explicitly arms one on all ranks.
+ * Every seam is at a W8-owned boundary before an opaque communication call or
+ * after such a call has returned.  There is deliberately no seam inside
+ * MFEM/HYPRE/MPI: an opaque call that does not return is process-terminal and
+ * is never represented as a recoverable RuntimeFailure or retry.
  */
 enum class CpuCollectiveTestFault : unsigned char
 {
@@ -640,11 +643,49 @@ enum class CpuCollectiveTestFault : unsigned char
   trace_load_preparation,
   assembly_completion,
   residual_map_preparation,
-  condensation_outgoing_preparation
+  condensation_outgoing_preparation,
+  initialization_before_sparse_count_exchange,
+  initialization_between_sparse_exchanges,
+  initialization_before_gmres_prime,
+  initialization_facade_readiness,
+  initialization_facade_readiness_reset_refusal
 };
 
-void ArmCpuCollectiveTestFault(CpuCollectiveTestFault, int target_rank) noexcept;
+struct CpuCollectiveTestConsumptionEvidence
+{
+  std::uint64_t arm_generation = 0;
+  std::uint64_t local_consumption_count = 0;
+  std::uint64_t owner_incarnation = 0;
+  std::uint64_t consumed_incarnation = 0;
+  std::uint64_t last_rejected_incarnation = 0;
+  std::uint64_t local_wrong_owner_rejections = 0;
+  std::uint64_t local_reset_completions = 0;
+  CpuCollectiveTestFault consumed_fault = CpuCollectiveTestFault::none;
+  int consumed_rank = -1;
+  int target_rank = -1;
+  bool armed = false;
+  bool reset_collectively_attested = false;
+  bool thread_confined = true;
+};
+
+// Arm, execute, and observe on the same test thread.  The thread-confined
+// logical state and owner incarnation prevent another adapter from consuming
+// it, including another adapter running sequentially on that thread.
+void ArmCpuCollectiveTestFault(CpuCollectiveTestFault, int target_rank,
+                               std::uint64_t owner_incarnation) noexcept;
+template <typename Selection>
+void ArmCpuCollectiveTestFault(
+    CpuCollectiveTestFault, int target_rank,
+    const PersistentSmoothEulerCpuAdapter<Selection>& owner) noexcept;
 void ResetCpuCollectiveTestFault() noexcept;
+CpuCollectiveTestConsumptionEvidence ObserveCpuCollectiveTestFault() noexcept;
+
+struct CpuCollectiveTestAccess
+{
+  template <typename Selection>
+  static std::uint64_t CoreIncarnation(
+      const PersistentSmoothEulerCpuAdapter<Selection>&) noexcept;
+};
 
 struct CpuInitialization
 {
@@ -674,6 +715,13 @@ public:
   bool Initialize(const CpuPersistentConfig&,
                   const RuntimeTupleDescriptor&,
                   CpuInitialization&) noexcept;
+  bool AdmitInitialization(bool facade_empty,
+                           const CpuPersistentConfig&,
+                           const RuntimeTupleDescriptor&) const noexcept;
+  bool CollectiveAll(bool) const noexcept;
+  bool ResetAfterInitializationFailure() noexcept;
+  bool ConsumeCollectiveTestFault(CpuCollectiveTestFault) noexcept;
+  std::uint64_t incarnation() const noexcept;
   CpuNumericalResult Execute(const AttemptIdentity&,
                              const StateCoordinates&,
                              const CpuFailureInjection&) noexcept;
@@ -707,6 +755,7 @@ public:
 private:
   struct Implementation;
   std::unique_ptr<Implementation> implementation_;
+  std::uint64_t incarnation_ = 0;
 };
 
 } // namespace detail
@@ -746,40 +795,71 @@ public:
     static_assert(::dg::hdg::runtime::detail::SupportsTwoPhaseSlotExchange<
                       CpuStateStoragePolicy, CpuStateSlot>::value,
                   "CPU facade requires the frozen reversible-slot contract");
-    if (contract_) { return false; }
     const RuntimeTupleDescriptor tuple = Selection::Descriptor();
     const StableIdentity selected_experiment =
         StableIdentity::Copy(std::string_view{Selection::experiment_id});
-    if (!tuple.Valid() || !selected_experiment.valid() ||
-        selected_experiment != config.experiment)
+    const bool local_preconditions = FacadeEmptyForInitialization() &&
+        tuple.Valid() && selected_experiment.valid() &&
+        selected_experiment == config.experiment;
+    if (!core_.AdmitInitialization(local_preconditions, config, tuple))
     {
       return false;
     }
+
     detail::CpuInitialization initialized;
-    if (!core_.Initialize(config, tuple, initialized)) { return false; }
+    const bool core_ready = core_.Initialize(config, tuple, initialized);
+    if (!core_.CollectiveAll(core_ready))
+    {
+      if (!RestoreEmptyAfterInitializationFailure()) { return false; }
+      return false;
+    }
+
+    std::unique_ptr<contract_type> next_contract;
+    const std::uint64_t next_incarnation = core_.incarnation();
+    bool local_facade_ready = false;
     try
     {
-      contract_ = std::make_unique<contract_type>(
+      next_contract = std::make_unique<contract_type>(
           std::move(initialized.committed), std::move(initialized.candidate),
           initialized.coordinates, initialized.resources);
+      local_facade_ready = next_incarnation != 0 && next_contract &&
+          core_.ObserveOwnedAllocation(
+              CpuOwnedAllocationSite::contract_wrapper,
+              sizeof(contract_type), alignof(contract_type), 1,
+              next_contract.get()) &&
+          next_contract->status() == RunStatus::ready;
+      if (local_facade_ready)
+      {
+        const bool facade_fault = core_.ConsumeCollectiveTestFault(
+            detail::CpuCollectiveTestFault::initialization_facade_readiness) ||
+            core_.ConsumeCollectiveTestFault(
+                detail::CpuCollectiveTestFault::
+                    initialization_facade_readiness_reset_refusal);
+        local_facade_ready = !facade_fault;
+      }
     }
     catch (...)
     {
-      contract_.reset();
-      return false;
+      local_facade_ready = false;
     }
-    facade_incarnation_ = NextFacadeIncarnation();
-    if (facade_incarnation_ == 0 ||
-        !core_.ObserveOwnedAllocation(CpuOwnedAllocationSite::contract_wrapper,
-                                      sizeof(contract_type),
-                                      alignof(contract_type), 1,
-                                      contract_.get()))
+    if (!core_.CollectiveAll(local_facade_ready))
     {
-      contract_.reset();
+      next_contract.reset();
+      if (!RestoreEmptyAfterInitializationFailure()) { return false; }
       return false;
     }
+
+    contract_ = std::move(next_contract);
+    facade_incarnation_ = next_incarnation;
     core_.SealOwnedAllocationBaseline();
-    return contract_->status() == RunStatus::ready;
+    const bool published_ready = contract_ && facade_incarnation_ != 0 &&
+        contract_->status() == RunStatus::ready;
+    if (!core_.CollectiveAll(published_ready))
+    {
+      if (!RestoreEmptyAfterInitializationFailure()) { return false; }
+      return false;
+    }
+    return true;
   }
 
   bool PrepareAdvance(
@@ -1013,11 +1093,37 @@ public:
   }
 
 private:
-  static std::uint64_t NextFacadeIncarnation() noexcept
+  bool FacadeEmptyForInitialization() const noexcept
   {
-    static std::atomic<std::uint64_t> next{1};
-    const std::uint64_t value = next.fetch_add(1, std::memory_order_relaxed);
-    return value == 0 ? 0 : value;
+    return !initialization_terminal_ && !contract_ &&
+        facade_incarnation_ == 0 && !staging_token_ && !prepared_token_ &&
+        !provisional_token_ && !staging_active_ &&
+        !commit_prepared_active_ && !provisional_active_;
+  }
+  void ClearFacadeInitializationState() noexcept
+  {
+    contract_.reset();
+    staging_token_.reset();
+    prepared_token_.reset();
+    provisional_token_.reset();
+    prepared_begin_ = {};
+    prepared_numerical_ = {};
+    ResetProductBundle();
+    last_transition_outcome_ = {};
+    facade_incarnation_ = 0;
+    next_authority_serial_ = 1;
+    active_authority_serial_ = 0;
+    active_candidate_generation_ = 0;
+    staging_active_ = false;
+    commit_prepared_active_ = false;
+    provisional_active_ = false;
+  }
+  bool RestoreEmptyAfterInitializationFailure() noexcept
+  {
+    ClearFacadeInitializationState();
+    const bool reset_complete = core_.ResetAfterInitializationFailure();
+    initialization_terminal_ = !reset_complete;
+    return reset_complete;
   }
   std::uint64_t NextAuthoritySerial() noexcept
   {
@@ -1207,6 +1313,7 @@ private:
     ResetProductBundle();
   }
 
+  friend struct detail::CpuCollectiveTestAccess;
   detail::CpuNumericsCore core_{};
   std::unique_ptr<contract_type> contract_{};
   BeginOutcome prepared_begin_{};
@@ -1224,6 +1331,24 @@ private:
   bool staging_active_ = false;
   bool commit_prepared_active_ = false;
   bool provisional_active_ = false;
+  bool initialization_terminal_ = false;
 };
+
+template <typename Selection>
+std::uint64_t detail::CpuCollectiveTestAccess::CoreIncarnation(
+    const PersistentSmoothEulerCpuAdapter<Selection>& owner) noexcept
+{
+  return owner.core_.incarnation();
+}
+
+template <typename Selection>
+void detail::ArmCpuCollectiveTestFault(
+    const detail::CpuCollectiveTestFault fault, const int target_rank,
+    const PersistentSmoothEulerCpuAdapter<Selection>& owner) noexcept
+{
+  detail::ArmCpuCollectiveTestFault(
+      fault, target_rank,
+      detail::CpuCollectiveTestAccess::CoreIncarnation(owner));
+}
 
 } // namespace dg::hdg::runtime::cpu
