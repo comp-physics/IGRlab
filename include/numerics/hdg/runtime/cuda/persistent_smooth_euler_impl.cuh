@@ -10,6 +10,43 @@ static inline void ReportCudaSetupFailure(const int rank,
     std::fprintf(stderr, "CUDA_SETUP_FAIL stage=%s\n", stage);
 }
 
+// Stable private backend-admission mask: bits 0..16 are rank count,
+// cudaSetDevice, cudaGetDevice, selected device zero, MFEM configured,
+// MFEM CUDA allowed, MFEM debug-device disabled, zero incoming HYPRE error,
+// normal Hypre::Init return, zero error captured immediately after Init, Hypre
+// GPU selection, HYPRE memory query, HYPRE execution query, device memory,
+// device execution, zero post-policy HYPRE error, and Umpire pools.
+enum CudaBackendFailureBit : std::uint64_t
+{
+  backend_rank_count_failure = std::uint64_t{1} << 0U,
+  backend_cuda_set_device_failure = std::uint64_t{1} << 1U,
+  backend_cuda_get_device_failure = std::uint64_t{1} << 2U,
+  backend_selected_device_failure = std::uint64_t{1} << 3U,
+  backend_mfem_configured_failure = std::uint64_t{1} << 4U,
+  backend_mfem_cuda_failure = std::uint64_t{1} << 5U,
+  backend_mfem_debug_failure = std::uint64_t{1} << 6U,
+  backend_hypre_incoming_error_failure = std::uint64_t{1} << 7U,
+  backend_hypre_initialize_return_failure = std::uint64_t{1} << 8U,
+  backend_hypre_initialize_error_failure = std::uint64_t{1} << 9U,
+  backend_hypre_gpu_failure = std::uint64_t{1} << 10U,
+  backend_hypre_memory_query_failure = std::uint64_t{1} << 11U,
+  backend_hypre_execution_query_failure = std::uint64_t{1} << 12U,
+  backend_hypre_memory_device_failure = std::uint64_t{1} << 13U,
+  backend_hypre_execution_device_failure = std::uint64_t{1} << 14U,
+  backend_hypre_policy_error_failure = std::uint64_t{1} << 15U,
+  backend_umpire_pools_failure = std::uint64_t{1} << 16U
+};
+
+static inline void ReportCudaBackendFailure(
+    const int rank, const std::uint64_t failure_mask) noexcept
+{
+  if (rank == 0)
+  {
+    std::fprintf(stderr, "CUDA_BACKEND_FAIL rank0_mask=0x%llx\n",
+                 static_cast<unsigned long long>(failure_mask));
+  }
+}
+
 inline constexpr std::size_t persistent_double_capacity = 220000;
 inline constexpr std::size_t persistent_integer_capacity = 120000;
 
@@ -973,15 +1010,133 @@ private:
   {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks_);
-    const bool local_device_valid =
-        ranks_ == config.expected_rank_count &&
-        cudaSetDevice(config.requested_device) == cudaSuccess &&
-        cudaGetDevice(&device_) == cudaSuccess && device_ == 0 &&
-        mfem::Device::IsConfigured() &&
-        mfem::Device::Allows(mfem::Backend::CUDA_MASK) &&
-        !mfem::Device::Allows(mfem::Backend::DEBUG_DEVICE) &&
+    const bool rank_count_valid = ranks_ == config.expected_rank_count;
+    const bool cuda_set_device_valid =
+        cudaSetDevice(config.requested_device) == cudaSuccess;
+    const bool cuda_get_device_valid =
+        cudaGetDevice(&device_) == cudaSuccess;
+    const bool selected_device_valid = device_ == 0;
+    const bool mfem_configured = mfem::Device::IsConfigured();
+    const bool mfem_cuda_allowed =
+        mfem::Device::Allows(mfem::Backend::CUDA_MASK);
+    const bool mfem_debug_disabled =
+        !mfem::Device::Allows(mfem::Backend::DEBUG_DEVICE);
+
+    evidence.device = device_;
+    evidence.mfem_device_valid =
+        mfem_configured && mfem_cuda_allowed && mfem_debug_disabled;
+    evidence.hypre_cuda_umpire_device = false;
+
+    std::uint64_t backend_failure_mask = 0;
+    if (!rank_count_valid)
+      backend_failure_mask |= backend_rank_count_failure;
+    if (!cuda_set_device_valid)
+      backend_failure_mask |= backend_cuda_set_device_failure;
+    if (!cuda_get_device_valid)
+      backend_failure_mask |= backend_cuda_get_device_failure;
+    if (!selected_device_valid)
+      backend_failure_mask |= backend_selected_device_failure;
+    if (!mfem_configured)
+      backend_failure_mask |= backend_mfem_configured_failure;
+    if (!mfem_cuda_allowed)
+      backend_failure_mask |= backend_mfem_cuda_failure;
+    if (!mfem_debug_disabled)
+      backend_failure_mask |= backend_mfem_debug_failure;
+
+    // Capture a stale flag before clearing it.  HYPRE_ClearAllErrors() returns
+    // zero after the clear and is therefore never used as prior-error evidence.
+    const HYPRE_Int hypre_incoming_error = HYPRE_GetError();
+    const bool hypre_incoming_error_free = hypre_incoming_error == 0;
+    if (!hypre_incoming_error_free)
+      backend_failure_mask |= backend_hypre_incoming_error_failure;
+    (void)HYPRE_ClearAllErrors();
+
+    // No rank calls Hypre::Init unless every rank arrived with a clean flag.
+    const bool local_preinit_valid = hypre_incoming_error_free;
+    const bool preinit_collectively_valid =
+        CollectiveContinue(local_preinit_valid);
+    if (!preinit_collectively_valid)
+    {
+      ReportCudaBackendFailure(rank_, backend_failure_mask);
+      return false;
+    }
+
+    bool hypre_init_returned = false;
+    try
+    {
+      // Accepted W7 parity: create/configure the rank-local HYPRE singleton
+      // before querying its device policy or allocator pool identity.
+      mfem::Hypre::Init();
+      hypre_init_returned = true;
+    }
+    catch (...) {}
+    // Capture Init's error before any later clear can erase it.
+    const HYPRE_Int hypre_init_error = HYPRE_GetError();
+    const bool hypre_init_error_free = hypre_init_error == 0;
+    if (!hypre_init_returned)
+      backend_failure_mask |= backend_hypre_initialize_return_failure;
+    if (!hypre_init_error_free)
+      backend_failure_mask |= backend_hypre_initialize_error_failure;
+
+    // This second gate is intentionally before every later HYPRE/Umpire query.
+    // A rank-local throw or Init error converges before any peer advances.
+    const bool local_hypre_init_valid =
+        hypre_init_returned && hypre_init_error_free;
+    const bool hypre_init_collectively_valid =
+        CollectiveContinue(local_hypre_init_valid);
+    if (!hypre_init_collectively_valid)
+    {
+      ReportCudaBackendFailure(rank_, backend_failure_mask);
+      return false;
+    }
+
+    // Init's zero error was recorded before this reset.  From this point all
+    // ranks execute the same policy/query/pool sequence unconditionally.
+    (void)HYPRE_ClearAllErrors();
+    HYPRE_MemoryLocation memory_location = HYPRE_MEMORY_UNDEFINED;
+    HYPRE_ExecutionPolicy execution_policy = HYPRE_EXEC_UNDEFINED;
+    const bool hypre_gpu = mfem::HypreUsingGPU();
+    const bool hypre_memory_query_valid =
+        HYPRE_GetMemoryLocation(&memory_location) == 0;
+    const bool hypre_execution_query_valid =
+        HYPRE_GetExecutionPolicy(&execution_policy) == 0;
+    const bool hypre_memory_device =
+        memory_location == HYPRE_MEMORY_DEVICE;
+    const bool hypre_execution_device =
+        execution_policy == HYPRE_EXEC_DEVICE;
+    const HYPRE_Int hypre_policy_error = HYPRE_GetError();
+    const bool hypre_policy_error_free = hypre_policy_error == 0;
+    const bool umpire_pools_valid =
         AllocatorPolicy::DevicePoolPolicyValid();
-    if (!CollectiveContinue(local_device_valid)) { return false; }
+
+    evidence.hypre_cuda_umpire_device = local_preinit_valid &&
+        local_hypre_init_valid && hypre_gpu &&
+        hypre_memory_query_valid && hypre_execution_query_valid &&
+        hypre_memory_device && hypre_execution_device &&
+        hypre_policy_error_free && umpire_pools_valid;
+    if (!hypre_gpu)
+      backend_failure_mask |= backend_hypre_gpu_failure;
+    if (!hypre_memory_query_valid)
+      backend_failure_mask |= backend_hypre_memory_query_failure;
+    if (!hypre_execution_query_valid)
+      backend_failure_mask |= backend_hypre_execution_query_failure;
+    if (!hypre_memory_device)
+      backend_failure_mask |= backend_hypre_memory_device_failure;
+    if (!hypre_execution_device)
+      backend_failure_mask |= backend_hypre_execution_device_failure;
+    if (!hypre_policy_error_free)
+      backend_failure_mask |= backend_hypre_policy_error_failure;
+    if (!umpire_pools_valid)
+      backend_failure_mask |= backend_umpire_pools_failure;
+
+    const bool local_backend_valid = backend_failure_mask == 0;
+    const bool backend_collectively_valid =
+        CollectiveContinue(local_backend_valid);
+    if (!backend_collectively_valid)
+    {
+      ReportCudaBackendFailure(rank_, backend_failure_mask);
+      return false;
+    }
     cudaDeviceProp properties{};
     const bool uuid_ready =
         cudaGetDeviceProperties(&properties, device_) == cudaSuccess;
