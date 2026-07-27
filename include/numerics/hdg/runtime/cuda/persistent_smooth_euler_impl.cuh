@@ -47,6 +47,28 @@ static inline void ReportCudaBackendFailure(
   }
 }
 
+// Private teardown diagnostics.  MFEM's DEVICE_UMPIRE Wrap(..., own=false)
+// still owns a MemoryManager registration, while the raw device allocation
+// remains policy-owned.  These bits therefore describe failures to release
+// MFEM bookkeeping before the policy is allowed to deallocate either arena.
+enum CudaArenaTeardownFailureBit : std::uint64_t
+{
+  arena_vector_alias_release_failure = std::uint64_t{1} << 0U,
+  arena_double_registration_release_failure = std::uint64_t{1} << 1U,
+  arena_integer_registration_release_failure = std::uint64_t{1} << 2U,
+  arena_idempotent_state_failure = std::uint64_t{1} << 3U
+};
+
+static inline void ReportCudaArenaTeardownFailure(
+    const int rank, const std::uint64_t failure_mask) noexcept
+{
+  if (rank == 0)
+  {
+    std::fprintf(stderr, "CUDA_TEARDOWN_FAIL rank0_mask=0x%llx\n",
+                 static_cast<unsigned long long>(failure_mask));
+  }
+}
+
 inline constexpr std::size_t persistent_double_capacity = 220000;
 inline constexpr std::size_t persistent_integer_capacity = 120000;
 
@@ -363,14 +385,13 @@ public:
   using state_slot = CompleteStateSlot<CudaInteriorState, CudaTrueTraceState>;
 
   CudaPersistentNumerics() noexcept = default;
-  ~CudaPersistentNumerics()
+  ~CudaPersistentNumerics() noexcept
   {
-    if (integer_arena_ != nullptr)
-      AllocatorPolicy::Deallocate(integer_arena_,
-                                  CudaAllocationSite::persistent_integer_arena);
-    if (double_arena_ != nullptr)
-      AllocatorPolicy::Deallocate(double_arena_,
-                                  CudaAllocationSite::persistent_double_arena);
+    ReleaseArenas();
+    // The second call is an allocation-free runtime attestation that the
+    // release path is idempotent; exchanged pointers cannot be deallocated
+    // twice and the test policy observes this no-op pass.
+    ReleaseArenas();
   }
 
   CudaPersistentNumerics(const CudaPersistentNumerics&) = delete;
@@ -1256,6 +1277,95 @@ private:
     return double_arena_ != nullptr && integer_arena_ != nullptr;
   }
 
+  void ReleaseArenas() noexcept
+  {
+    if (arena_teardown_started_)
+    {
+      const bool vector_released = double_arena_vector_.Size() == 0 &&
+          double_arena_vector_.GetMemory().Empty();
+      const bool double_released = double_memory_.Empty();
+      const bool integer_released = integer_memory_.Empty();
+      const bool idempotent = vector_released && double_released &&
+          integer_released && double_arena_ == nullptr &&
+          integer_arena_ == nullptr && arena_teardown_complete_;
+      if (!idempotent && !arena_teardown_failure_reported_)
+      {
+        arena_teardown_failure_reported_ = true;
+        ReportCudaArenaTeardownFailure(
+            rank_, arena_idempotent_state_failure);
+      }
+      return;
+    }
+    arena_teardown_started_ = true;
+
+    bool vector_released = false;
+    bool double_released = false;
+    bool integer_released = false;
+    try
+    {
+      // NewMemoryAndSize(..., own=false) made a zero-offset alias of
+      // double_memory_.  Destroy the alias while the raw arena is still live.
+      double_arena_vector_.Destroy();
+      vector_released = double_arena_vector_.Size() == 0 &&
+          double_arena_vector_.GetMemory().Empty();
+    }
+    catch (...) {}
+
+    if (vector_released)
+    {
+      try
+      {
+        // own=false makes Delete erase MFEM's base registration with
+        // free_dev_ptr=false; it cannot free the raw Umpire arena.
+        double_memory_.Delete();
+        double_released = double_memory_.Empty();
+      }
+      catch (...) {}
+    }
+    try
+    {
+      integer_memory_.Delete();
+      integer_released = integer_memory_.Empty();
+    }
+    catch (...) {}
+
+    std::uint64_t failure_mask = 0;
+    if (!vector_released)
+      failure_mask |= arena_vector_alias_release_failure;
+    if (!double_released)
+      failure_mask |= arena_double_registration_release_failure;
+    if (!integer_released)
+      failure_mask |= arena_integer_registration_release_failure;
+
+    // Clear all non-owning numerical views before poisoning the owning raw
+    // tokens.  integer_arena_array_ is deliberately untouched: it is unbound.
+    view_ = {};
+    committed_slot_ = {};
+    candidate_slot_ = {};
+    workspace_slot_ = {};
+
+    if (failure_mask != 0)
+    {
+      // Fail closed: a token that may still be registered with MFEM is leaked
+      // rather than directly freed and later removed a second time.
+      arena_teardown_failure_reported_ = true;
+      ReportCudaArenaTeardownFailure(rank_, failure_mask);
+      return;
+    }
+
+    // Reverse allocation order.  Poison each member before the policy call so
+    // re-entry or the idempotence attestation cannot repeat a deallocation.
+    int* const integers = std::exchange(integer_arena_, nullptr);
+    if (integers != nullptr)
+      AllocatorPolicy::Deallocate(
+          integers, CudaAllocationSite::persistent_integer_arena);
+    double* const doubles = std::exchange(double_arena_, nullptr);
+    if (doubles != nullptr)
+      AllocatorPolicy::Deallocate(
+          doubles, CudaAllocationSite::persistent_double_arena);
+    arena_teardown_complete_ = true;
+  }
+
   bool BindArenaViews() noexcept;
   bool UploadTopologyAndState() noexcept;
   bool BindStateSlots() noexcept;
@@ -1314,6 +1424,9 @@ private:
   CudaTrueMatrixDeviceView true_device_{};
   double* double_arena_ = nullptr;
   int* integer_arena_ = nullptr;
+  bool arena_teardown_started_ = false;
+  bool arena_teardown_complete_ = false;
+  bool arena_teardown_failure_reported_ = false;
   mfem::Memory<double> double_memory_{};
   mfem::Memory<int> integer_memory_{};
   mfem::Vector double_arena_vector_{};
