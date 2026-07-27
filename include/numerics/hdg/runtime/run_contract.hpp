@@ -6,12 +6,26 @@
  *
  * Backend, formulation, trace, stabilization, time, and precision choices are
  * compile-time tags. The contract owns two disjoint complete state slots,
- * publishes only committed state, and makes every candidate operation and
- * derived product attempt-bound. Backend policies provide only static,
- * non-polymorphic storage and collective operations.
+ * publishes only committed state, and makes every candidate capability and
+ * derived-product token attempt- and contract-incarnation-bound. Backend
+ * policies provide only static, non-polymorphic storage and collective
+ * operations.
+ *
+ * Adapter proof obligations intentionally outside this storage-agnostic slice:
+ * (1) the selected backend tag must name the concrete storage/collective
+ * policies used to instantiate the contract; and (2) issued product tokens
+ * must be coupled by that adapter to the actual residual, matrix, factor, and
+ * solution payloads in the required numerical order. Tokens prove contract
+ * issuance, order, ownership, and consumption, not numerical payload content;
+ * and (3) StoragePolicy::Publish is a trusted adapter proof obligation whose
+ * semantic atomicity/deep-copy behavior cannot be proved by the C++ type
+ * system. This contract enforces its void-noexcept type, orders every
+ * detectable precondition before it, and performs no recoverable check after
+ * it.
  */
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -49,11 +63,14 @@ enum class FailureReason : unsigned char
   invalid_interior_space,
   invalid_dt,
   invalid_resource_descriptor,
+  incarnation_exhausted,
   coordinate_overflow,
   candidate_preparation,
   shared_backing_store,
+  publication_precondition,
   stale_attempt,
-  collective_identity,
+  collective_protocol,
+  restart_incompatible,
   missing_product,
   invalid_product,
   stale_product,
@@ -83,8 +100,10 @@ enum class RestartMode : unsigned char
 enum class RestartCompatibility : unsigned char
 {
   compatible,
+  contract_busy,
   no_successful_commit,
   schema_mismatch,
+  time_mismatch,
   coordinate_mismatch,
   cursor_mismatch,
   dt_mismatch,
@@ -100,6 +119,10 @@ enum class RestartCompatibility : unsigned char
   precision_mismatch,
   interior_hash_mismatch,
   trace_hash_mismatch,
+  candidate_preparation,
+  shared_backing_store,
+  publication_precondition,
+  collective_protocol,
   policy_mismatch
 };
 
@@ -209,20 +232,6 @@ struct StateCoordinates
   double dt = 0.0;
 };
 
-constexpr bool operator==(const StateCoordinates& left,
-                          const StateCoordinates& right) noexcept
-{
-  return left.time == right.time && left.step == right.step &&
-      left.generation == right.generation && left.cursor == right.cursor &&
-      left.dt == right.dt;
-}
-
-constexpr bool operator!=(const StateCoordinates& left,
-                          const StateCoordinates& right) noexcept
-{
-  return !(left == right);
-}
-
 struct AttemptIdentity
 {
   std::uint64_t sequence = 0;
@@ -231,21 +240,6 @@ struct AttemptIdentity
   unsigned char retry_index = 0;
   double dt = 0.0;
 };
-
-constexpr bool operator==(const AttemptIdentity& left,
-                          const AttemptIdentity& right) noexcept
-{
-  return left.sequence == right.sequence &&
-      left.committed_step == right.committed_step &&
-      left.committed_generation == right.committed_generation &&
-      left.retry_index == right.retry_index && left.dt == right.dt;
-}
-
-constexpr bool operator!=(const AttemptIdentity& left,
-                          const AttemptIdentity& right) noexcept
-{
-  return !(left == right);
-}
 
 struct GateReport
 {
@@ -271,25 +265,16 @@ struct AttemptCollectiveContext
   std::uint64_t candidate_cursor = 0;
 };
 
-constexpr bool operator==(const AttemptCollectiveContext& left,
-                          const AttemptCollectiveContext& right) noexcept
-{
-  return left.attempt == right.attempt && left.committed == right.committed &&
-      left.target == right.target &&
-      left.candidate_cursor == right.candidate_cursor;
-}
-
-constexpr bool operator!=(const AttemptCollectiveContext& left,
-                          const AttemptCollectiveContext& right) noexcept
-{
-  return !(left == right);
-}
-
 struct CollectiveAdmissionReport
 {
   AttemptCollectiveContext context{};
   std::uint32_t participating_ranks = 0;
+  bool identity_consistent = false;
+  bool failure_consistent = false;
   bool all_prepared = false;
+  bool any_failure = false;
+  std::uint64_t failure_mask = 0;
+  FailureReason resolved_reason = FailureReason::none;
 };
 
 struct CollectiveGateReport
@@ -297,6 +282,11 @@ struct CollectiveGateReport
   AttemptCollectiveContext context{};
   GateReport gates{};
   std::uint32_t participating_ranks = 0;
+  bool identity_consistent = false;
+  bool failure_consistent = false;
+  bool any_failure = false;
+  std::uint64_t failure_mask = 0;
+  FailureReason resolved_reason = FailureReason::none;
 };
 
 struct TransferAccounting
@@ -345,6 +335,9 @@ struct AcceptedTelemetry
 
 struct RunTelemetry
 {
+  // Summary event counters deliberately saturate at uint64_t max. Transfer
+  // totals do not saturate: capacity is preflighted and overflow is rejected
+  // without mutating any transfer total.
   std::uint64_t admissions_started = 0;
   std::uint64_t admissions_failed = 0;
   std::uint64_t attempts_started = 0;
@@ -352,14 +345,17 @@ struct RunTelemetry
   std::uint64_t rollbacks = 0;
   std::uint64_t retries_started = 0;
   std::uint64_t commits = 0;
+  std::uint64_t restores = 0;
   std::uint64_t stale_consumers_rejected = 0;
   std::uint64_t duplicate_product_issues_rejected = 0;
+  std::uint64_t out_of_order_product_issues_rejected = 0;
+  std::uint64_t transfer_accounting_overflow_rejections = 0;
   TransferAccounting attempted_transfers{0, 0, 0, 0, 0, true};
   TransferAccounting rolled_back_transfers{0, 0, 0, 0, 0, true};
   TransferAccounting committed_transfers{0, 0, 0, 0, 0, true};
   AttemptTelemetry last_attempt{};
   AcceptedTelemetry accepted{};
-  FailureReason first_originating_failure = FailureReason::none;
+  FailureReason first_failure = FailureReason::none;
 };
 
 struct ReuseDescriptor
@@ -457,6 +453,43 @@ struct CheckpointDescriptor
   std::uint64_t coordinate_fingerprint = 0;
   StateHash interior_hash{};
   StateHash trace_hash{};
+};
+
+struct RestoreOutcome
+{
+  bool restored = false;
+  RestartCompatibility compatibility = RestartCompatibility::policy_mismatch;
+};
+
+// Telemetry boundary: an exact RestartCompatibility remains observable in
+// RestoreOutcome. Any non-compatible result records the generic write-once
+// FailureReason::restart_incompatible, except collective contradictions, which
+// record FailureReason::collective_protocol. A later successful restore does
+// not erase that first-failure record.
+
+struct RestoreCollectiveContext
+{
+  CheckpointDescriptor checkpoint{};
+  StateHash loaded_interior_hash{};
+  StateHash loaded_trace_hash{};
+  StateHash prepared_interior_hash{};
+  StateHash prepared_trace_hash{};
+  bool preparation_attempted = false;
+  bool candidate_prepared = false;
+};
+
+struct CollectiveRestoreReport
+{
+  RestoreCollectiveContext context{};
+  std::uint32_t participating_ranks = 0;
+  bool identity_consistent = false;
+  bool failure_consistent = false;
+  bool any_failure = false;
+  std::uint64_t failure_mask = 0;
+  std::uint64_t compatibility_mask = 0;
+  FailureReason resolved_reason = FailureReason::none;
+  RestartCompatibility resolved_compatibility =
+      RestartCompatibility::compatible;
 };
 
 /** Threshold values remain unset until a later scenario card supplies them. */
@@ -571,6 +604,114 @@ struct AttemptOutcome
 namespace detail
 {
 
+static_assert(static_cast<unsigned int>(FailureReason::retry_exhausted) < 64,
+              "failure truth mask must represent every FailureReason");
+static_assert(static_cast<unsigned int>(RestartCompatibility::policy_mismatch) <
+                  64,
+              "restore truth mask must represent every incompatibility");
+
+inline std::atomic<std::uint64_t> next_contract_incarnation{1};
+
+inline std::uint64_t AcquireContractIncarnation() noexcept
+{
+  std::uint64_t current = next_contract_incarnation.load(
+      std::memory_order_relaxed);
+  const std::uint64_t maximum = std::numeric_limits<std::uint64_t>::max();
+  while (current != maximum)
+  {
+    if (next_contract_incarnation.compare_exchange_weak(
+            current, current + 1, std::memory_order_relaxed,
+            std::memory_order_relaxed))
+    {
+      return current;
+    }
+  }
+  return 0;
+}
+
+inline std::uint64_t DoubleBits(const double value) noexcept
+{
+  std::uint64_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+inline bool SameCoordinates(const StateCoordinates& left,
+                            const StateCoordinates& right) noexcept
+{
+  return DoubleBits(left.time) == DoubleBits(right.time) &&
+      left.step == right.step && left.generation == right.generation &&
+      left.cursor == right.cursor &&
+      DoubleBits(left.dt) == DoubleBits(right.dt);
+}
+
+inline bool SameAttempt(const AttemptIdentity& left,
+                        const AttemptIdentity& right) noexcept
+{
+  return left.sequence == right.sequence &&
+      left.committed_step == right.committed_step &&
+      left.committed_generation == right.committed_generation &&
+      left.retry_index == right.retry_index &&
+      DoubleBits(left.dt) == DoubleBits(right.dt);
+}
+
+inline bool SameContext(const AttemptCollectiveContext& left,
+                        const AttemptCollectiveContext& right) noexcept
+{
+  return SameAttempt(left.attempt, right.attempt) &&
+      SameCoordinates(left.committed, right.committed) &&
+      SameCoordinates(left.target, right.target) &&
+      left.candidate_cursor == right.candidate_cursor;
+}
+
+constexpr std::uint64_t FailureBit(const FailureReason reason) noexcept
+{
+  return reason == FailureReason::none
+      ? 0
+      : (std::uint64_t{1} << static_cast<unsigned int>(reason));
+}
+
+constexpr std::uint64_t CompatibilityBit(
+    const RestartCompatibility compatibility) noexcept
+{
+  return compatibility == RestartCompatibility::compatible
+      ? 0
+      : (std::uint64_t{1} << static_cast<unsigned int>(compatibility));
+}
+
+inline bool SameCheckpoint(const CheckpointDescriptor& left,
+                           const CheckpointDescriptor& right) noexcept
+{
+  return left.schema_version == right.schema_version &&
+      left.successful_commit == right.successful_commit &&
+      left.restart_mode == right.restart_mode && left.tuple == right.tuple &&
+      left.mfem_pin == right.mfem_pin &&
+      left.mesh_hash == right.mesh_hash &&
+      left.partition_hash == right.partition_hash &&
+      left.topology_hash == right.topology_hash &&
+      left.rank_count == right.rank_count &&
+      left.polynomial_order == right.polynomial_order &&
+      left.layout == right.layout && left.precision == right.precision &&
+      left.cursor == right.cursor &&
+      DoubleBits(left.dt) == DoubleBits(right.dt) &&
+      SameCoordinates(left.coordinates, right.coordinates) &&
+      left.coordinate_fingerprint == right.coordinate_fingerprint &&
+      left.interior_hash == right.interior_hash &&
+      left.trace_hash == right.trace_hash;
+}
+
+inline bool SameRestoreContext(const RestoreCollectiveContext& left,
+                               const RestoreCollectiveContext& right) noexcept
+{
+  return SameCheckpoint(left.checkpoint, right.checkpoint) &&
+      left.loaded_interior_hash == right.loaded_interior_hash &&
+      left.loaded_trace_hash == right.loaded_trace_hash &&
+      left.prepared_interior_hash == right.prepared_interior_hash &&
+      left.prepared_trace_hash == right.prepared_trace_hash &&
+      left.preparation_attempted == right.preparation_attempted &&
+      left.candidate_prepared == right.candidate_prepared;
+}
+
 constexpr bool WouldOverflow(const std::uint64_t left,
                              const std::uint64_t right) noexcept
 {
@@ -598,21 +739,16 @@ inline bool CanAddTransfersExactly(const TransferAccounting& total,
                      value.synchronization_events);
 }
 
-inline void AddTransfers(TransferAccounting& total,
-                         const TransferAccounting& value) noexcept
+/** Caller proves CanAddTransfersExactly before this non-saturating mutation. */
+inline void AddTransfersExact(TransferAccounting& total,
+                              const TransferAccounting& value) noexcept
 {
-  const bool exact = CanAddTransfersExactly(total, value);
-  total.host_to_device_bytes =
-      SaturatingAdd(total.host_to_device_bytes, value.host_to_device_bytes);
-  total.device_to_host_bytes =
-      SaturatingAdd(total.device_to_host_bytes, value.device_to_host_bytes);
-  total.mpi_staging_bytes =
-      SaturatingAdd(total.mpi_staging_bytes, value.mpi_staging_bytes);
-  total.allocation_events =
-      SaturatingAdd(total.allocation_events, value.allocation_events);
-  total.synchronization_events = SaturatingAdd(
-      total.synchronization_events, value.synchronization_events);
-  total.complete = total.complete && value.complete && exact;
+  total.host_to_device_bytes += value.host_to_device_bytes;
+  total.device_to_host_bytes += value.device_to_host_bytes;
+  total.mpi_staging_bytes += value.mpi_staging_bytes;
+  total.allocation_events += value.allocation_events;
+  total.synchronization_events += value.synchronization_events;
+  total.complete = total.complete && value.complete;
 }
 
 constexpr FailureReason FirstFailedGate(const GateReport& gates) noexcept
@@ -629,15 +765,11 @@ constexpr FailureReason FirstFailedGate(const GateReport& gates) noexcept
 inline std::uint64_t CoordinateFingerprint(
     const StateCoordinates& coordinates) noexcept
 {
-  std::uint64_t time_bits = 0;
-  std::uint64_t dt_bits = 0;
-  std::memcpy(&time_bits, &coordinates.time, sizeof(time_bits));
-  std::memcpy(&dt_bits, &coordinates.dt, sizeof(dt_bits));
-  const std::array<std::uint64_t, 5> fields{{time_bits,
+  const std::array<std::uint64_t, 5> fields{{DoubleBits(coordinates.time),
                                              coordinates.step,
                                              coordinates.generation,
                                              coordinates.cursor,
-                                             dt_bits}};
+                                             DoubleBits(coordinates.dt)}};
   std::uint64_t hash = 1469598103934665603ULL;
   for (const std::uint64_t field : fields)
   {
@@ -662,14 +794,30 @@ constexpr std::size_t ProductIndex(const DerivedProductKind kind) noexcept
   return 4;
 }
 
+inline bool GateReductionContainsLocal(const GateReport& local,
+                                       const GateReport& reduced) noexcept
+{
+  return !(!local.finite && reduced.finite) &&
+      !(!local.admissible && reduced.admissible) &&
+      !(!local.recovery && reduced.recovery) &&
+      !(!local.true_residual && reduced.true_residual) &&
+      !(!local.telemetry && reduced.telemetry) &&
+      !(!local.success && reduced.success);
+}
+
 } // namespace detail
 
 /**
  * Persistent two-slot lifecycle.
  *
- * StoragePolicy supplies static PrepareCandidate, DiscardCandidate, Commit,
- * Disjoint, HashInterior, and HashTrace operations. CollectivePolicy supplies
- * static Admit and Reduce operations. Both policies are non-polymorphic.
+ * StoragePolicy supplies static, noexcept preparation, private-copy,
+ * disjointness, hash, publication-preflight, and publication operations.
+ * Publish is the sole mutation of committed storage. Its semantic atomicity
+ * and disjointness preservation are explicit trusted adapter attestations;
+ * the contract mechanically enforces only its void-noexcept type and that all
+ * detectable fallible checks precede it. CollectivePolicy supplies static
+ * admission, finish, and restore reductions. Neither policy uses dynamic
+ * dispatch.
  */
 template <typename Selection,
           typename InteriorState,
@@ -686,9 +834,17 @@ public:
 private:
   using prepare_result = decltype(StoragePolicy::PrepareCandidate(
       std::declval<const state_slot&>(), std::declval<state_slot&>()));
+  using restore_prepare_result = decltype(StoragePolicy::PrepareRestore(
+      std::declval<const state_slot&>(), std::declval<state_slot&>()));
+  using store_result = decltype(StoragePolicy::StoreCandidate(
+      std::declval<state_slot&>(), std::declval<const state_slot&>()));
+  using copy_result = decltype(StoragePolicy::CopyOut(
+      std::declval<const state_slot&>(), std::declval<state_slot&>()));
   using discard_result = decltype(
       StoragePolicy::DiscardCandidate(std::declval<state_slot&>()));
-  using commit_result = decltype(StoragePolicy::Commit(
+  using prepublish_result = decltype(StoragePolicy::CanPublish(
+      std::declval<const state_slot&>(), std::declval<const state_slot&>()));
+  using publish_result = decltype(StoragePolicy::Publish(
       std::declval<state_slot&>(), std::declval<state_slot&>()));
   using disjoint_result = decltype(StoragePolicy::Disjoint(
       std::declval<const state_slot&>(), std::declval<const state_slot&>()));
@@ -698,25 +854,42 @@ private:
       StoragePolicy::HashTrace(std::declval<const TraceState&>()));
   using admission_result = decltype(CollectivePolicy::Admit(
       std::declval<const AttemptCollectiveContext&>(), bool{},
-      std::declval<std::uint32_t>()));
+      std::declval<FailureReason>(), std::declval<std::uint32_t>()));
   using collective_result = decltype(CollectivePolicy::Reduce(
       std::declval<const AttemptCollectiveContext&>(),
-      std::declval<const GateReport&>(), std::declval<std::uint32_t>()));
+      std::declval<const GateReport&>(), std::declval<FailureReason>(),
+      std::declval<std::uint32_t>()));
+  using restore_collective_result = decltype(CollectivePolicy::ReduceRestore(
+      std::declval<const RestoreCollectiveContext&>(),
+      std::declval<RestartCompatibility>(),
+      std::declval<FailureReason>(), std::declval<std::uint32_t>()));
 
   static_assert(!std::is_polymorphic<StoragePolicy>::value,
                 "HDG run storage policy must be non-polymorphic");
   static_assert(!std::is_polymorphic<CollectivePolicy>::value,
                 "HDG run collective policy must be non-polymorphic");
-  static_assert(StoragePolicy::commit_is_atomic,
-                "storage policy must declare atomic commit");
-  static_assert(StoragePolicy::commit_preserves_disjoint_backing,
-                "storage policy must declare disjoint commit backing");
+  static_assert(StoragePolicy::preparation_preserves_committed,
+                "preparation must preserve committed bytes");
+  static_assert(StoragePolicy::private_copy_is_independent,
+                "candidate/copy operations must create independent storage");
+  static_assert(StoragePolicy::publish_is_atomic,
+                "storage policy must declare atomic publication");
+  static_assert(StoragePolicy::publish_preserves_disjoint_backing,
+                "publication must preserve disjoint slot backing");
   static_assert(std::is_same<prepare_result, bool>::value,
                 "PrepareCandidate must return bool");
+  static_assert(std::is_same<restore_prepare_result, bool>::value,
+                "PrepareRestore must return bool");
+  static_assert(std::is_same<store_result, bool>::value,
+                "StoreCandidate must return bool");
+  static_assert(std::is_same<copy_result, bool>::value,
+                "CopyOut must return bool");
   static_assert(std::is_same<discard_result, void>::value,
                 "DiscardCandidate must return void");
-  static_assert(std::is_same<commit_result, void>::value,
-                "Commit must return void");
+  static_assert(std::is_same<prepublish_result, bool>::value,
+                "CanPublish must return bool");
+  static_assert(std::is_same<publish_result, void>::value,
+                "Publish must return void");
   static_assert(std::is_same<disjoint_result, bool>::value,
                 "Disjoint must return bool");
   static_assert(std::is_same<interior_hash_result, StateHash>::value,
@@ -729,30 +902,57 @@ private:
   static_assert(std::is_same<collective_result,
                              CollectiveGateReport>::value,
                 "collective Reduce must return CollectiveGateReport");
+  static_assert(std::is_same<restore_collective_result,
+                             CollectiveRestoreReport>::value,
+                "collective ReduceRestore must return CollectiveRestoreReport");
   static_assert(noexcept(StoragePolicy::PrepareCandidate(
                     std::declval<const state_slot&>(),
                     std::declval<state_slot&>())),
                 "PrepareCandidate must be noexcept");
+  static_assert(noexcept(StoragePolicy::PrepareRestore(
+                    std::declval<const state_slot&>(),
+                    std::declval<state_slot&>())),
+                "PrepareRestore must be noexcept");
+  static_assert(noexcept(StoragePolicy::StoreCandidate(
+                    std::declval<state_slot&>(),
+                    std::declval<const state_slot&>())),
+                "StoreCandidate must be noexcept");
+  static_assert(noexcept(StoragePolicy::CopyOut(
+                    std::declval<const state_slot&>(),
+                    std::declval<state_slot&>())),
+                "CopyOut must be noexcept");
   static_assert(noexcept(StoragePolicy::DiscardCandidate(
                     std::declval<state_slot&>())),
                 "DiscardCandidate must be noexcept");
-  static_assert(noexcept(StoragePolicy::Commit(
+  static_assert(noexcept(StoragePolicy::CanPublish(
+                    std::declval<const state_slot&>(),
+                    std::declval<const state_slot&>())),
+                "CanPublish must be noexcept");
+  static_assert(noexcept(StoragePolicy::Publish(
                     std::declval<state_slot&>(),
                     std::declval<state_slot&>())),
-                "Commit must be noexcept");
+                "Publish must be noexcept");
   static_assert(noexcept(StoragePolicy::Disjoint(
                     std::declval<const state_slot&>(),
                     std::declval<const state_slot&>())),
                 "Disjoint must be noexcept");
   static_assert(noexcept(CollectivePolicy::Admit(
                     std::declval<const AttemptCollectiveContext&>(), bool{},
+                    std::declval<FailureReason>(),
                     std::declval<std::uint32_t>())),
                 "collective Admit must be noexcept");
   static_assert(noexcept(CollectivePolicy::Reduce(
                     std::declval<const AttemptCollectiveContext&>(),
                     std::declval<const GateReport&>(),
+                    std::declval<FailureReason>(),
                     std::declval<std::uint32_t>())),
                 "collective Reduce must be noexcept");
+  static_assert(noexcept(CollectivePolicy::ReduceRestore(
+                    std::declval<const RestoreCollectiveContext&>(),
+                    std::declval<RestartCompatibility>(),
+                    std::declval<FailureReason>(),
+                    std::declval<std::uint32_t>())),
+                "collective ReduceRestore must be noexcept");
   static_assert(noexcept(StoragePolicy::HashInterior(
                     std::declval<const InteriorState&>())),
                 "HashInterior must be noexcept");
@@ -770,7 +970,7 @@ public:
     ProductToken& operator=(const ProductToken&) = delete;
 
     ProductToken(ProductToken&& other) noexcept
-        : owner_(other.owner_),
+        : incarnation_(other.incarnation_),
           attempt_(other.attempt_),
           serial_(other.serial_),
           valid_(other.valid_)
@@ -782,7 +982,7 @@ public:
     {
       if (this != &other)
       {
-        owner_ = other.owner_;
+        incarnation_ = other.incarnation_;
         attempt_ = other.attempt_;
         serial_ = other.serial_;
         valid_ = other.valid_;
@@ -792,13 +992,16 @@ public:
     }
 
   private:
-    ProductToken(const std::uintptr_t owner,
+    ProductToken(const std::uint64_t incarnation,
                  const AttemptIdentity attempt,
                  const std::uint64_t serial) noexcept
-        : owner_(owner), attempt_(attempt), serial_(serial), valid_(true)
+        : incarnation_(incarnation),
+          attempt_(attempt),
+          serial_(serial),
+          valid_(true)
     {}
 
-    std::uintptr_t owner_ = 0;
+    std::uint64_t incarnation_ = 0;
     AttemptIdentity attempt_{};
     std::uint64_t serial_ = 0;
     bool valid_ = false;
@@ -814,59 +1017,39 @@ public:
     std::optional<ProductToken<DerivedProductKind::solution>> solution{};
   };
 
-  class CandidateHandle
+  /** Pointer-free value; all use is revalidated by a live contract. */
+  class CandidateCapability
   {
   public:
-    template <typename Function>
-    bool Mutate(Function&& function)
-    {
-      return owner_ != nullptr &&
-          owner_->WithCandidate(attempt_, std::forward<Function>(function));
-    }
-
-    bool Copy(state_slot& copy) const
-    {
-      return owner_ != nullptr && owner_->CopyCandidate(attempt_, copy);
-    }
-
-    AttemptIdentity attempt() const noexcept { return attempt_; }
+    CandidateCapability() noexcept = default;
 
   private:
-    CandidateHandle(PersistentRunContract* owner,
-                    const AttemptIdentity attempt) noexcept
-        : owner_(owner), attempt_(attempt)
+    CandidateCapability(const std::uint64_t incarnation,
+                        const AttemptIdentity attempt,
+                        const std::uint64_t serial) noexcept
+        : incarnation_(incarnation), attempt_(attempt), serial_(serial)
     {}
 
-    PersistentRunContract* owner_ = nullptr;
+    std::uint64_t incarnation_ = 0;
     AttemptIdentity attempt_{};
+    std::uint64_t serial_ = 0;
     friend class PersistentRunContract;
   };
 
-  class PublishedHandle
+  /** Pointer-free publication coordinate; stale publications cannot inspect. */
+  class PublishedCapability
   {
   public:
-    template <typename Function>
-    bool Inspect(Function&& function) const
-    {
-      return owner_ != nullptr && owner_->WithPublished(
-          coordinates_, std::forward<Function>(function));
-    }
-
-    bool Copy(state_slot& copy) const
-    {
-      return owner_ != nullptr && owner_->CopyPublished(coordinates_, copy);
-    }
-
-    StateCoordinates coordinates() const noexcept { return coordinates_; }
+    PublishedCapability() noexcept = default;
 
   private:
-    PublishedHandle(const PersistentRunContract* owner,
-                    const StateCoordinates coordinates) noexcept
-        : owner_(owner), coordinates_(coordinates)
+    PublishedCapability(const std::uint64_t incarnation,
+                        const std::uint64_t serial) noexcept
+        : incarnation_(incarnation), serial_(serial)
     {}
 
-    const PersistentRunContract* owner_ = nullptr;
-    StateCoordinates coordinates_{};
+    std::uint64_t incarnation_ = 0;
+    std::uint64_t serial_ = 0;
     friend class PersistentRunContract;
   };
 
@@ -879,19 +1062,32 @@ public:
         candidate_(std::move(candidate)),
         coordinates_(coordinates),
         resources_(resources),
-        attempt_sequence_(initial_attempt_sequence)
+        attempt_sequence_(initial_attempt_sequence),
+        incarnation_(detail::AcquireContractIncarnation())
   {
-    if (!resources_.Valid())
+    if (incarnation_ == 0)
     {
-      status_ = RunStatus::invalid_request;
-      last_failure_ = FailureReason::invalid_resource_descriptor;
-      storage_valid_ = false;
+      constructor_failure_ = FailureReason::incarnation_exhausted;
+    }
+    else if (!resources_.Valid())
+    {
+      constructor_failure_ = FailureReason::invalid_resource_descriptor;
+    }
+    else if (!std::isfinite(coordinates_.time) ||
+             !std::isfinite(coordinates_.dt))
+    {
+      constructor_failure_ = FailureReason::invalid_dt;
     }
     else if (!StoragePolicy::Disjoint(committed_, candidate_))
     {
-      status_ = RunStatus::invalid_request;
-      last_failure_ = FailureReason::shared_backing_store;
+      constructor_failure_ = FailureReason::shared_backing_store;
       storage_valid_ = false;
+    }
+    if (constructor_failure_ != FailureReason::none)
+    {
+      status_ = RunStatus::invalid_request;
+      last_failure_ = constructor_failure_;
+      RememberFirstFailure(constructor_failure_);
     }
   }
 
@@ -902,26 +1098,98 @@ public:
 
   RunStatus status() const noexcept { return status_; }
   FailureReason last_failure() const noexcept { return last_failure_; }
-  const StateCoordinates& coordinates() const noexcept { return coordinates_; }
+  StateCoordinates coordinates() const noexcept { return coordinates_; }
   const PersistentResourceDescriptor& resources() const noexcept
   {
     return resources_;
   }
   const RunTelemetry& telemetry() const noexcept { return telemetry_; }
 
-  PublishedHandle Old() const noexcept { return {this, coordinates_}; }
-  PublishedHandle Published() const noexcept { return Old(); }
+  /**
+   * Adapter preflight before any attempt transfers occur. A false result means
+   * FinishAttempt will reject that report without mutating transfer totals.
+   */
+  bool CanAccountAttemptTransfers(
+      const TransferAccounting& transfers) const noexcept
+  {
+    return detail::CanAddTransfersExactly(telemetry_.attempted_transfers,
+                                          transfers) &&
+        detail::CanAddTransfersExactly(telemetry_.rolled_back_transfers,
+                                       transfers) &&
+        detail::CanAddTransfersExactly(telemetry_.committed_transfers,
+                                       transfers);
+  }
 
-  std::optional<CandidateHandle> AcquireCandidate(
+  PublishedCapability Old() const noexcept
+  {
+    return {incarnation_, publication_serial_};
+  }
+  PublishedCapability Published() const noexcept { return Old(); }
+
+  bool PublishedCoordinates(const PublishedCapability& capability,
+                            StateCoordinates& copy) const noexcept
+  {
+    if (!ValidPublished(capability)) { return false; }
+    copy = coordinates_;
+    return ValidPublished(capability);
+  }
+
+  bool CopyPublished(const PublishedCapability& capability,
+                     state_slot& copy) const noexcept
+  {
+    if (!ValidPublished(capability)) { return false; }
+    const bool copied = StoragePolicy::CopyOut(committed_, copy);
+    return copied && StoragePolicy::Disjoint(committed_, copy) &&
+        ValidPublished(capability);
+  }
+
+  std::optional<CandidateCapability> AcquireCandidate(
       const AttemptIdentity& attempt) noexcept
   {
-    if (!IsCurrentAttempt(attempt)) { return std::nullopt; }
-    return CandidateHandle{this, attempt};
+    if (!IsCurrentAttempt(attempt))
+    {
+      RejectStaleConsumer();
+      return std::nullopt;
+    }
+    return CandidateCapability{incarnation_, attempt, candidate_serial_};
+  }
+
+  bool StoreCandidate(const CandidateCapability& capability,
+                      const state_slot& value) noexcept
+  {
+    if (!ValidCandidate(capability))
+    {
+      RejectStaleConsumer();
+      return false;
+    }
+    const bool stored = StoragePolicy::StoreCandidate(candidate_, value);
+    const bool disjoint = StoragePolicy::Disjoint(committed_, candidate_) &&
+        StoragePolicy::Disjoint(candidate_, value);
+    if (!stored)
+    {
+      candidate_storage_failure_ = FailureReason::candidate_preparation;
+      return false;
+    }
+    if (!disjoint)
+    {
+      candidate_storage_failure_ = FailureReason::shared_backing_store;
+      return false;
+    }
+    return ValidCandidate(capability);
+  }
+
+  bool CopyCandidate(const CandidateCapability& capability,
+                     state_slot& copy) const noexcept
+  {
+    if (!ValidCandidate(capability)) { return false; }
+    const bool copied = StoragePolicy::CopyOut(candidate_, copy);
+    return copied && StoragePolicy::Disjoint(candidate_, copy) &&
+        ValidCandidate(capability);
   }
 
   bool IsCurrentAttempt(const AttemptIdentity& attempt) const noexcept
   {
-    return active_ && attempt == active_attempt_;
+    return active_ && detail::SameAttempt(attempt, active_attempt_);
   }
 
   template <DerivedProductKind Kind>
@@ -930,8 +1198,7 @@ public:
   {
     if (!IsCurrentAttempt(attempt))
     {
-      telemetry_.stale_consumers_rejected = detail::SaturatingAdd(
-          telemetry_.stale_consumers_rejected, 1);
+      RejectStaleConsumer();
       return std::nullopt;
     }
     constexpr std::size_t index = detail::ProductIndex(Kind);
@@ -943,210 +1210,170 @@ public:
           telemetry_.duplicate_product_issues_rejected, 1);
       return std::nullopt;
     }
+    if (index != issued_product_count_)
+    {
+      telemetry_.out_of_order_product_issues_rejected = detail::SaturatingAdd(
+          telemetry_.out_of_order_product_issues_rejected, 1);
+      return std::nullopt;
+    }
     if (product_serial_ == std::numeric_limits<std::uint64_t>::max())
     {
       return std::nullopt;
     }
     issued_product_mask_ = static_cast<std::uint8_t>(issued_product_mask_ | bit);
+    ++issued_product_count_;
     issued_product_serials_[index] = ++product_serial_;
-    return ProductToken<Kind>{OwnerIdentity(), attempt,
+    return ProductToken<Kind>{incarnation_, attempt,
                               issued_product_serials_[index]};
   }
 
   BeginOutcome BeginStep(const StepRequest& request) noexcept
   {
-    if (status_ != RunStatus::ready && status_ != RunStatus::committed)
-    {
-      return {false, {}, FailureReason::stale_attempt};
-    }
-    if (request.interior_space == InteriorSpace::h1)
-    {
-      status_ = RunStatus::unsupported_h1;
-      last_failure_ = FailureReason::unsupported_h1;
-      return {false, {}, last_failure_};
-    }
-    if (request.interior_space != InteriorSpace::l2)
-    {
-      status_ = RunStatus::invalid_request;
-      last_failure_ = FailureReason::invalid_interior_space;
-      return {false, {}, last_failure_};
-    }
-    if (!storage_valid_ || !resources_.Valid())
-    {
-      status_ = RunStatus::invalid_request;
-      last_failure_ = storage_valid_
-          ? FailureReason::invalid_resource_descriptor
-          : last_failure_;
-      return {false, {}, last_failure_};
-    }
-    if (!std::isfinite(request.dt) || request.dt <= 0.0 ||
-        !std::isfinite(coordinates_.time))
-    {
-      status_ = RunStatus::invalid_request;
-      last_failure_ = FailureReason::invalid_dt;
-      return {false, {}, last_failure_};
-    }
-    const double target_time = coordinates_.time + request.dt;
-    const auto maximum = std::numeric_limits<std::uint64_t>::max();
-    if (!std::isfinite(target_time) || coordinates_.step == maximum ||
-        coordinates_.generation == maximum || attempt_sequence_ == maximum)
-    {
-      status_ = RunStatus::invalid_request;
-      last_failure_ = FailureReason::coordinate_overflow;
-      return {false, {}, last_failure_};
-    }
-
-    pending_dt_ = request.dt;
-    pending_target_time_ = target_time;
-    retry_used_ = false;
-    const AttemptIdentity proposed{attempt_sequence_ + 1,
-                                   coordinates_.step,
-                                   coordinates_.generation,
-                                   0,
-                                   pending_dt_};
-    return PrepareAndAdmit(proposed, false);
+    return PrepareAndAdmit(request, false);
   }
 
   BeginOutcome Retry() noexcept
   {
-    if (status_ != RunStatus::retry_available || retry_used_ || active_)
-    {
-      return {false, {}, FailureReason::retry_exhausted};
-    }
-    if (attempt_sequence_ == std::numeric_limits<std::uint64_t>::max())
-    {
-      status_ = RunStatus::terminal_failure;
-      last_failure_ = FailureReason::coordinate_overflow;
-      return {false, {}, last_failure_};
-    }
-    const AttemptIdentity proposed{attempt_sequence_ + 1,
-                                   coordinates_.step,
-                                   coordinates_.generation,
-                                   1,
-                                   pending_dt_};
-    return PrepareAndAdmit(proposed, true);
+    return PrepareAndAdmit({InteriorSpace::l2, pending_dt_}, true);
   }
 
   AttemptOutcome FinishAttempt(const AttemptIdentity& attempt,
                                const AttemptReport& report,
                                ProductBundle&& products) noexcept
   {
-    if (!IsCurrentAttempt(attempt))
+    const bool current = IsCurrentAttempt(attempt);
+    FailureReason product_reason = FailureReason::stale_attempt;
+    if (current)
     {
-      telemetry_.stale_consumers_rejected = detail::SaturatingAdd(
-          telemetry_.stale_consumers_rejected, 1);
-      return {status_,
-              FailureReason::stale_attempt,
-              false,
-              status_ == RunStatus::retry_available};
-    }
-
-    if (report.originating_failure != FailureReason::none &&
-        telemetry_.first_originating_failure == FailureReason::none)
-    {
-      telemetry_.first_originating_failure = report.originating_failure;
-    }
-
-    const FailureReason product_reason = ValidateAndConsumeProducts(
-        attempt, products);
-    GateReport effective_gates = report.gates;
-    const bool exact_transfers =
-        detail::CanAddTransfersExactly(telemetry_.attempted_transfers,
-                                       report.telemetry.transfers) &&
-        detail::CanAddTransfersExactly(telemetry_.rolled_back_transfers,
-                                       report.telemetry.transfers) &&
-        detail::CanAddTransfersExactly(telemetry_.committed_transfers,
-                                       report.telemetry.transfers);
-    if (!report.telemetry.transfers.complete || !exact_transfers ||
-        !report.telemetry.prohibited.Clean() ||
-        (resources_.reuse.per_step_allocation_required == false &&
-         report.telemetry.transfers.allocation_events != 0))
-    {
-      effective_gates.telemetry = false;
-    }
-    if (!std::isfinite(report.telemetry.true_relative_residual) ||
-        report.telemetry.true_relative_residual >
-            true_relative_residual_limit)
-    {
-      effective_gates.true_residual = false;
-    }
-    if (report.originating_failure != FailureReason::none ||
-        product_reason != FailureReason::none)
-    {
-      effective_gates.success = false;
-    }
-
-    const StateCoordinates target{pending_target_time_,
-                                  coordinates_.step + 1,
-                                  coordinates_.generation + 1,
-                                  report.candidate_cursor,
-                                  pending_dt_};
-    const AttemptCollectiveContext local_context{
-        attempt, coordinates_, target, report.candidate_cursor};
-    const CollectiveGateReport collective = CollectivePolicy::Reduce(
-        local_context, effective_gates, resources_.rank_count);
-    const bool collective_identity =
-        collective.participating_ranks == resources_.rank_count &&
-        collective.context == local_context;
-    const GateReport collective_gates{
-        effective_gates.finite && collective.gates.finite,
-        effective_gates.admissible && collective.gates.admissible,
-        effective_gates.recovery && collective.gates.recovery,
-        effective_gates.true_residual && collective.gates.true_residual,
-        effective_gates.telemetry && collective.gates.telemetry,
-        effective_gates.success && collective.gates.success};
-
-    FailureReason reason = FailureReason::none;
-    if (report.originating_failure != FailureReason::none)
-    {
-      reason = report.originating_failure;
-    }
-    else if (product_reason != FailureReason::none)
-    {
-      reason = product_reason;
-    }
-    else if (!collective_identity)
-    {
-      reason = FailureReason::collective_identity;
+      product_reason = ValidateAndConsumeProducts(attempt, products);
     }
     else
     {
-      reason = detail::FirstFailedGate(collective_gates);
+      InvalidateProducts(products);
+      RejectStaleConsumer();
+    }
+
+    GateReport local_gates = report.gates;
+    const bool exact_transfers =
+        CanAccountAttemptTransfers(report.telemetry.transfers);
+    if (!report.telemetry.transfers.complete || !exact_transfers ||
+        !report.telemetry.prohibited.Clean() ||
+        (!resources_.reuse.per_step_allocation_required &&
+         report.telemetry.transfers.allocation_events != 0))
+    {
+      local_gates.telemetry = false;
+    }
+    if (!std::isfinite(report.telemetry.true_relative_residual) ||
+        report.telemetry.true_relative_residual < 0.0 ||
+        report.telemetry.true_relative_residual >
+            true_relative_residual_limit)
+    {
+      local_gates.true_residual = false;
+    }
+
+    FailureReason storage_reason = candidate_storage_failure_;
+    if (current && storage_reason == FailureReason::none &&
+        !StoragePolicy::Disjoint(committed_, candidate_))
+    {
+      storage_reason = FailureReason::shared_backing_store;
+    }
+    if (current && storage_reason == FailureReason::none &&
+        !StoragePolicy::CanPublish(committed_, candidate_))
+    {
+      storage_reason = FailureReason::publication_precondition;
+    }
+    if (current && storage_reason == FailureReason::none &&
+        publication_serial_ == std::numeric_limits<std::uint64_t>::max())
+    {
+      storage_reason = FailureReason::coordinate_overflow;
+    }
+
+    FailureReason local_reason = FailureReason::none;
+    if (!current)
+    {
+      local_reason = FailureReason::stale_attempt;
+    }
+    else if (report.originating_failure != FailureReason::none)
+    {
+      local_reason = report.originating_failure;
+    }
+    else if (product_reason != FailureReason::none)
+    {
+      local_reason = product_reason;
+    }
+    else if (storage_reason != FailureReason::none)
+    {
+      local_reason = storage_reason;
+    }
+    else
+    {
+      local_reason = detail::FirstFailedGate(local_gates);
+    }
+    if (local_reason != FailureReason::none) { local_gates.success = false; }
+
+    const StateCoordinates target{
+        pending_target_time_,
+        coordinates_.step == std::numeric_limits<std::uint64_t>::max()
+            ? coordinates_.step
+            : coordinates_.step + 1,
+        coordinates_.generation == std::numeric_limits<std::uint64_t>::max()
+            ? coordinates_.generation
+            : coordinates_.generation + 1,
+        report.candidate_cursor,
+        pending_dt_};
+    const AttemptCollectiveContext local_context{
+        attempt, coordinates_, target, report.candidate_cursor};
+    const CollectiveGateReport collective = CollectivePolicy::Reduce(
+        local_context, local_gates, local_reason, resources_.rank_count);
+    const FailureReason reason = ResolveGateCollective(
+        local_context, local_gates, local_reason, collective);
+
+    if (!current && !active_)
+    {
+      RememberFirstFailure(reason);
+      return {status_, reason, false,
+              status_ == RunStatus::retry_available};
     }
 
     AttemptTelemetry attempt_telemetry = report.telemetry;
-    attempt_telemetry.identity = attempt;
+    attempt_telemetry.identity = current ? active_attempt_ : attempt;
     attempt_telemetry.failure_reason = reason;
     attempt_telemetry.validated_product_mask =
         product_reason == FailureReason::none ? required_product_mask : 0;
     telemetry_.last_attempt = attempt_telemetry;
-    detail::AddTransfers(telemetry_.attempted_transfers,
-                         report.telemetry.transfers);
-
-    if (reason != FailureReason::none || !collective_gates.All())
+    if (exact_transfers)
     {
-      return Rollback(attempt, reason, report.telemetry.transfers);
+      detail::AddTransfersExact(telemetry_.attempted_transfers,
+                                report.telemetry.transfers);
+    }
+    else
+    {
+      telemetry_.transfer_accounting_overflow_rejections =
+          detail::SaturatingAdd(
+              telemetry_.transfer_accounting_overflow_rejections, 1);
     }
 
-    if (!StoragePolicy::Disjoint(committed_, candidate_))
+    if (reason != FailureReason::none)
     {
-      return FailInvalidStorage(FailureReason::shared_backing_store);
-    }
-    StoragePolicy::Commit(committed_, candidate_);
-    if (!StoragePolicy::Disjoint(committed_, candidate_))
-    {
-      storage_valid_ = false;
-      return FailInvalidStorage(FailureReason::shared_backing_store);
+      RememberFirstFailure(reason);
+      return Rollback(active_attempt_, reason, report.telemetry.transfers,
+                      exact_transfers);
     }
 
+    // Every fallible validation is complete. Publish is statically noexcept;
+    // its atomic/disjoint semantics are the trusted adapter proof obligation.
+    // Nothing below may reject the commit.
+    StoragePolicy::Publish(committed_, candidate_);
     coordinates_ = target;
+    ++publication_serial_;
     attempt_telemetry.failure_reason = FailureReason::none;
     telemetry_.last_attempt = attempt_telemetry;
     telemetry_.accepted = {true, coordinates_, attempt_telemetry};
-    detail::AddTransfers(telemetry_.committed_transfers,
-                         report.telemetry.transfers);
+    detail::AddTransfersExact(telemetry_.committed_transfers,
+                              report.telemetry.transfers);
     telemetry_.commits = detail::SaturatingAdd(telemetry_.commits, 1);
     active_ = false;
+    candidate_storage_failure_ = FailureReason::none;
     status_ = RunStatus::committed;
     last_failure_ = FailureReason::none;
     return {status_, FailureReason::none, true, false};
@@ -1155,7 +1382,10 @@ public:
   bool TryMakeCheckpoint(CheckpointDescriptor& checkpoint) const noexcept
   {
     if (active_ || !storage_valid_ || !telemetry_.accepted.valid ||
-        telemetry_.accepted.coordinates != coordinates_)
+        !detail::SameCoordinates(telemetry_.accepted.coordinates,
+                                 coordinates_) ||
+        !std::isfinite(coordinates_.time) ||
+        !std::isfinite(coordinates_.dt) || coordinates_.dt <= 0.0)
     {
       return false;
     }
@@ -1182,11 +1412,523 @@ public:
     return true;
   }
 
-  RestartCompatibility CheckRestart(
-      const CheckpointDescriptor& checkpoint,
-      const InteriorState& loaded_interior,
-      const TraceState& loaded_trace) const noexcept
+  RestoreOutcome Restore(const CheckpointDescriptor& checkpoint,
+                         const state_slot& loaded) noexcept
   {
+    const StateHash loaded_interior_hash =
+        StoragePolicy::HashInterior(loaded.interior);
+    const StateHash loaded_trace_hash = StoragePolicy::HashTrace(loaded.trace);
+    RestartCompatibility local_compatibility = ValidateCheckpoint(
+        checkpoint, loaded_interior_hash, loaded_trace_hash);
+    bool preparation_attempted = false;
+    bool candidate_prepared = false;
+    StateHash prepared_interior_hash{};
+    StateHash prepared_trace_hash{};
+    if (local_compatibility == RestartCompatibility::compatible)
+    {
+      if (!StoragePolicy::Disjoint(committed_, candidate_))
+      {
+        local_compatibility = RestartCompatibility::shared_backing_store;
+      }
+      else
+      {
+        preparation_attempted = true;
+        candidate_prepared = StoragePolicy::PrepareRestore(loaded, candidate_);
+        if (!candidate_prepared)
+        {
+          local_compatibility = RestartCompatibility::candidate_preparation;
+        }
+        else
+        {
+          prepared_interior_hash =
+              StoragePolicy::HashInterior(candidate_.interior);
+          prepared_trace_hash = StoragePolicy::HashTrace(candidate_.trace);
+          if (!StoragePolicy::Disjoint(committed_, candidate_) ||
+              !StoragePolicy::Disjoint(candidate_, loaded))
+          {
+            local_compatibility = RestartCompatibility::shared_backing_store;
+          }
+          else if (prepared_interior_hash != checkpoint.interior_hash)
+          {
+            local_compatibility = RestartCompatibility::interior_hash_mismatch;
+          }
+          else if (prepared_trace_hash != checkpoint.trace_hash)
+          {
+            local_compatibility = RestartCompatibility::trace_hash_mismatch;
+          }
+          else if (!StoragePolicy::CanPublish(committed_, candidate_) ||
+                   publication_serial_ ==
+                       std::numeric_limits<std::uint64_t>::max())
+          {
+            local_compatibility =
+                RestartCompatibility::publication_precondition;
+          }
+        }
+      }
+    }
+
+    const FailureReason local_reason =
+        local_compatibility == RestartCompatibility::compatible
+        ? FailureReason::none
+        : FailureReason::restart_incompatible;
+    const RestoreCollectiveContext local_context{checkpoint,
+                                                 loaded_interior_hash,
+                                                 loaded_trace_hash,
+                                                 prepared_interior_hash,
+                                                 prepared_trace_hash,
+                                                 preparation_attempted,
+                                                 candidate_prepared};
+    // Unconditional: corrupt descriptors, buffers, local storage, and busy
+    // status all participate in exactly one restore reduction before publish.
+    const CollectiveRestoreReport collective =
+        CollectivePolicy::ReduceRestore(local_context,
+                                        local_compatibility,
+                                        local_reason,
+                                        resources_.rank_count);
+    const RestartCompatibility compatibility = ResolveRestoreCollective(
+        local_context, local_compatibility, local_reason, collective);
+    if (compatibility != RestartCompatibility::compatible)
+    {
+      if (preparation_attempted) { DiscardPrivateCandidate(); }
+      const FailureReason reason =
+          compatibility == RestartCompatibility::collective_protocol
+          ? FailureReason::collective_protocol
+          : FailureReason::restart_incompatible;
+      RememberFirstFailure(reason);
+      last_failure_ = reason;
+      return {false, compatibility};
+    }
+
+    // Atomic verified restore: every local fallible check and the all-rank
+    // identity/validity decision are complete. Publish is the trusted static
+    // adapter proof obligation and no recoverable check follows it.
+    StoragePolicy::Publish(committed_, candidate_);
+    coordinates_ = checkpoint.coordinates;
+    ++publication_serial_;
+    active_ = false;
+    retry_used_ = false;
+    pending_dt_ = 0.0;
+    pending_target_time_ = 0.0;
+    candidate_storage_failure_ = FailureReason::none;
+    AttemptTelemetry restored{};
+    restored.identity = {0,
+                         coordinates_.step,
+                         coordinates_.generation,
+                         0,
+                         coordinates_.dt};
+    restored.failure_reason = FailureReason::none;
+    telemetry_.accepted = {true, coordinates_, restored};
+    telemetry_.restores = detail::SaturatingAdd(telemetry_.restores, 1);
+    status_ = RunStatus::committed;
+    last_failure_ = FailureReason::none;
+    return {true, RestartCompatibility::compatible};
+  }
+
+private:
+  static constexpr std::uint8_t required_product_mask = 0x0fU;
+
+  bool ValidCandidate(const CandidateCapability& capability) const noexcept
+  {
+    return capability.incarnation_ == incarnation_ &&
+        capability.serial_ == candidate_serial_ &&
+        IsCurrentAttempt(capability.attempt_);
+  }
+
+  bool ValidPublished(const PublishedCapability& capability) const noexcept
+  {
+    return capability.incarnation_ == incarnation_ &&
+        capability.serial_ == publication_serial_;
+  }
+
+  void RejectStaleConsumer() noexcept
+  {
+    telemetry_.stale_consumers_rejected = detail::SaturatingAdd(
+        telemetry_.stale_consumers_rejected, 1);
+  }
+
+  StateCoordinates AdmissionTarget(const double dt) const noexcept
+  {
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    return {coordinates_.time + dt,
+            coordinates_.step == maximum ? maximum : coordinates_.step + 1,
+            coordinates_.generation == maximum
+                ? maximum
+                : coordinates_.generation + 1,
+            coordinates_.cursor,
+            dt};
+  }
+
+  FailureReason ValidateAdmissionRequest(const StepRequest& request,
+                                         const bool retry,
+                                         const StateCoordinates& target) const
+      noexcept
+  {
+    if (retry)
+    {
+      if (status_ != RunStatus::retry_available || retry_used_ || active_)
+      {
+        return FailureReason::retry_exhausted;
+      }
+    }
+    else if (status_ != RunStatus::ready && status_ != RunStatus::committed)
+    {
+      return status_ == RunStatus::unsupported_h1
+          ? FailureReason::unsupported_h1
+          : (constructor_failure_ != FailureReason::none
+                 ? constructor_failure_
+                 : FailureReason::stale_attempt);
+    }
+    if (request.interior_space == InteriorSpace::h1)
+    {
+      return FailureReason::unsupported_h1;
+    }
+    if (request.interior_space != InteriorSpace::l2)
+    {
+      return FailureReason::invalid_interior_space;
+    }
+    if (!storage_valid_ || !resources_.Valid())
+    {
+      return storage_valid_ ? FailureReason::invalid_resource_descriptor
+                            : FailureReason::shared_backing_store;
+    }
+    if (!std::isfinite(request.dt) || request.dt <= 0.0 ||
+        !std::isfinite(coordinates_.time))
+    {
+      return FailureReason::invalid_dt;
+    }
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (!std::isfinite(target.time) || coordinates_.step == maximum ||
+        coordinates_.generation == maximum || attempt_sequence_ == maximum ||
+        candidate_serial_ == maximum)
+    {
+      return FailureReason::coordinate_overflow;
+    }
+    if (!StoragePolicy::Disjoint(committed_, candidate_))
+    {
+      return FailureReason::shared_backing_store;
+    }
+    return FailureReason::none;
+  }
+
+  static RunStatus FailureStatus(const FailureReason reason) noexcept
+  {
+    if (reason == FailureReason::unsupported_h1)
+    {
+      return RunStatus::unsupported_h1;
+    }
+    if (reason == FailureReason::invalid_interior_space ||
+        reason == FailureReason::invalid_dt ||
+        reason == FailureReason::invalid_resource_descriptor ||
+        reason == FailureReason::incarnation_exhausted)
+    {
+      return RunStatus::invalid_request;
+    }
+    return RunStatus::terminal_failure;
+  }
+
+  BeginOutcome PrepareAndAdmit(const StepRequest& request,
+                               const bool retry) noexcept
+  {
+    telemetry_.admissions_started = detail::SaturatingAdd(
+        telemetry_.admissions_started, 1);
+    const std::uint64_t proposed_sequence =
+        attempt_sequence_ == std::numeric_limits<std::uint64_t>::max()
+        ? attempt_sequence_
+        : attempt_sequence_ + 1;
+    const AttemptIdentity proposed{proposed_sequence,
+                                   coordinates_.step,
+                                   coordinates_.generation,
+                                   static_cast<unsigned char>(retry ? 1 : 0),
+                                   request.dt};
+    const StateCoordinates target = AdmissionTarget(request.dt);
+    FailureReason local_reason =
+        ValidateAdmissionRequest(request, retry, target);
+    bool local_prepared = false;
+    if (local_reason == FailureReason::none)
+    {
+      local_prepared = StoragePolicy::PrepareCandidate(committed_, candidate_);
+      if (!local_prepared)
+      {
+        local_reason = FailureReason::candidate_preparation;
+      }
+      else if (!StoragePolicy::Disjoint(committed_, candidate_))
+      {
+        local_reason = FailureReason::shared_backing_store;
+      }
+      else if (!StoragePolicy::CanPublish(committed_, candidate_))
+      {
+        local_reason = FailureReason::publication_precondition;
+      }
+    }
+    local_prepared = local_prepared && local_reason == FailureReason::none;
+
+    // This is deliberately unconditional: every participant reaches exactly
+    // one admission collective even when any local validation/preparation fails.
+    const AttemptCollectiveContext local_context{
+        proposed, coordinates_, target, coordinates_.cursor};
+    const CollectiveAdmissionReport admission = CollectivePolicy::Admit(
+        local_context, local_prepared, local_reason, resources_.rank_count);
+    const FailureReason reason = ResolveAdmissionCollective(
+        local_context, local_prepared, local_reason, admission);
+    if (reason != FailureReason::none)
+    {
+      if (StoragePolicy::Disjoint(committed_, candidate_))
+      {
+        StoragePolicy::DiscardCandidate(candidate_);
+      }
+      else
+      {
+        storage_valid_ = false;
+      }
+      telemetry_.admissions_failed = detail::SaturatingAdd(
+          telemetry_.admissions_failed, 1);
+      active_ = false;
+      status_ = FailureStatus(reason);
+      last_failure_ = reason;
+      RememberFirstFailure(reason);
+      return {false, proposed, reason};
+    }
+
+    pending_dt_ = request.dt;
+    pending_target_time_ = target.time;
+    retry_used_ = retry;
+    active_attempt_ = proposed;
+    attempt_sequence_ = proposed.sequence;
+    ++candidate_serial_;
+    issued_product_mask_ = 0;
+    issued_product_count_ = 0;
+    issued_product_serials_.fill(0);
+    candidate_storage_failure_ = FailureReason::none;
+    active_ = true;
+    status_ = RunStatus::attempt_active;
+    last_failure_ = FailureReason::none;
+    telemetry_.attempts_started =
+        detail::SaturatingAdd(telemetry_.attempts_started, 1);
+    if (retry)
+    {
+      telemetry_.retries_started =
+          detail::SaturatingAdd(telemetry_.retries_started, 1);
+    }
+    return {true, active_attempt_, FailureReason::none};
+  }
+
+  FailureReason ResolveAdmissionCollective(
+      const AttemptCollectiveContext& local_context,
+      const bool local_prepared,
+      const FailureReason local_reason,
+      const CollectiveAdmissionReport& report) const noexcept
+  {
+    const bool identity =
+        report.participating_ranks == resources_.rank_count &&
+        report.identity_consistent && report.failure_consistent &&
+        detail::SameContext(report.context, local_context);
+    const bool truth =
+        report.any_failure ==
+            (report.resolved_reason != FailureReason::none) &&
+        report.any_failure == (report.failure_mask != 0) &&
+        (local_reason == FailureReason::none ||
+         (report.failure_mask & detail::FailureBit(local_reason)) != 0) &&
+        (report.resolved_reason == FailureReason::none ||
+         (report.failure_mask &
+          detail::FailureBit(report.resolved_reason)) != 0) &&
+        !(!local_prepared && report.all_prepared) &&
+        !(local_reason != FailureReason::none && !report.any_failure) &&
+        !(!report.all_prepared && !report.any_failure);
+    if (!identity || !truth) { return FailureReason::collective_protocol; }
+    if (report.any_failure) { return report.resolved_reason; }
+    return report.all_prepared ? FailureReason::none
+                               : FailureReason::collective_protocol;
+  }
+
+  FailureReason ResolveGateCollective(
+      const AttemptCollectiveContext& local_context,
+      const GateReport& local_gates,
+      const FailureReason local_reason,
+      const CollectiveGateReport& report) const noexcept
+  {
+    const bool identity =
+        report.participating_ranks == resources_.rank_count &&
+        report.identity_consistent && report.failure_consistent &&
+        detail::SameContext(report.context, local_context);
+    const bool truth =
+        report.any_failure ==
+            (report.resolved_reason != FailureReason::none) &&
+        report.any_failure == (report.failure_mask != 0) &&
+        (local_reason == FailureReason::none ||
+         (report.failure_mask & detail::FailureBit(local_reason)) != 0) &&
+        (report.resolved_reason == FailureReason::none ||
+         (report.failure_mask &
+          detail::FailureBit(report.resolved_reason)) != 0) &&
+        !(local_reason != FailureReason::none && !report.any_failure) &&
+        detail::GateReductionContainsLocal(local_gates, report.gates) &&
+        !(detail::FirstFailedGate(report.gates) != FailureReason::none &&
+          !report.any_failure);
+    if (!identity || !truth) { return FailureReason::collective_protocol; }
+    return report.any_failure ? report.resolved_reason : FailureReason::none;
+  }
+
+  RestartCompatibility ResolveRestoreCollective(
+      const RestoreCollectiveContext& local_context,
+      const RestartCompatibility local_compatibility,
+      const FailureReason local_reason,
+      const CollectiveRestoreReport& report) const noexcept
+  {
+    const bool identity =
+        report.participating_ranks == resources_.rank_count &&
+        report.identity_consistent && report.failure_consistent &&
+        detail::SameRestoreContext(report.context, local_context);
+    const bool truth =
+        report.any_failure ==
+            (report.resolved_reason != FailureReason::none) &&
+        report.any_failure ==
+            (report.resolved_compatibility !=
+             RestartCompatibility::compatible) &&
+        report.any_failure == (report.failure_mask != 0) &&
+        report.any_failure == (report.compatibility_mask != 0) &&
+        (local_reason == FailureReason::none ||
+         (report.failure_mask & detail::FailureBit(local_reason)) != 0) &&
+        (local_compatibility == RestartCompatibility::compatible ||
+         (report.compatibility_mask &
+          detail::CompatibilityBit(local_compatibility)) != 0) &&
+        (report.resolved_reason == FailureReason::none ||
+         (report.failure_mask &
+          detail::FailureBit(report.resolved_reason)) != 0) &&
+        (report.resolved_compatibility ==
+             RestartCompatibility::compatible ||
+         (report.compatibility_mask &
+          detail::CompatibilityBit(report.resolved_compatibility)) != 0) &&
+        (!report.any_failure ||
+         report.resolved_reason == FailureReason::restart_incompatible);
+    if (!identity || !truth)
+    {
+      return RestartCompatibility::collective_protocol;
+    }
+    return report.any_failure ? report.resolved_compatibility
+                              : RestartCompatibility::compatible;
+  }
+
+  template <DerivedProductKind Kind>
+  FailureReason ValidateToken(ProductToken<Kind>& token,
+                              const AttemptIdentity& attempt) const noexcept
+  {
+    constexpr std::size_t index = detail::ProductIndex(Kind);
+    if (!token.valid_ || token.incarnation_ != incarnation_)
+    {
+      return FailureReason::invalid_product;
+    }
+    if (!detail::SameAttempt(token.attempt_, attempt))
+    {
+      return FailureReason::stale_product;
+    }
+    if (token.serial_ == 0 ||
+        token.serial_ != issued_product_serials_[index])
+    {
+      return FailureReason::invalid_product;
+    }
+    return FailureReason::none;
+  }
+
+  FailureReason ValidateAndConsumeProducts(const AttemptIdentity& attempt,
+                                            ProductBundle& products) noexcept
+  {
+    if (!products.residual || !products.matrix || !products.factor ||
+        !products.solution)
+    {
+      InvalidateProducts(products);
+      return FailureReason::missing_product;
+    }
+    FailureReason reason = ValidateToken(*products.residual, attempt);
+    if (reason == FailureReason::none)
+    {
+      reason = ValidateToken(*products.matrix, attempt);
+    }
+    if (reason == FailureReason::none)
+    {
+      reason = ValidateToken(*products.factor, attempt);
+    }
+    if (reason == FailureReason::none)
+    {
+      reason = ValidateToken(*products.solution, attempt);
+    }
+    if (reason == FailureReason::none &&
+        (issued_product_mask_ != required_product_mask ||
+         issued_product_count_ != 4))
+    {
+      reason = FailureReason::missing_product;
+    }
+    InvalidateProducts(products);
+    return reason;
+  }
+
+  static void InvalidateProducts(ProductBundle& products) noexcept
+  {
+    if (products.residual) { products.residual->valid_ = false; }
+    if (products.matrix) { products.matrix->valid_ = false; }
+    if (products.factor) { products.factor->valid_ = false; }
+    if (products.solution) { products.solution->valid_ = false; }
+  }
+
+  AttemptOutcome Rollback(const AttemptIdentity& attempt,
+                          FailureReason reason,
+                          const TransferAccounting& transfers,
+                          const bool account_transfers) noexcept
+  {
+    if (account_transfers)
+    {
+      detail::AddTransfersExact(telemetry_.rolled_back_transfers, transfers);
+    }
+    telemetry_.attempts_failed =
+        detail::SaturatingAdd(telemetry_.attempts_failed, 1);
+    telemetry_.rollbacks = detail::SaturatingAdd(telemetry_.rollbacks, 1);
+    if (StoragePolicy::Disjoint(committed_, candidate_))
+    {
+      StoragePolicy::DiscardCandidate(candidate_);
+    }
+    else
+    {
+      storage_valid_ = false;
+    }
+    active_ = false;
+    candidate_storage_failure_ = FailureReason::none;
+    if (reason == FailureReason::none) { reason = FailureReason::backend_failure; }
+    last_failure_ = reason;
+    telemetry_.last_attempt.failure_reason = reason;
+    if (attempt.retry_index == 0 && storage_valid_)
+    {
+      status_ = RunStatus::retry_available;
+      return {status_, reason, false, true};
+    }
+    status_ = RunStatus::terminal_failure;
+    return {status_, reason, false, false};
+  }
+
+  void RememberFirstFailure(const FailureReason reason) noexcept
+  {
+    if (reason != FailureReason::none &&
+        telemetry_.first_failure == FailureReason::none)
+    {
+      telemetry_.first_failure = reason;
+    }
+  }
+
+  void DiscardPrivateCandidate() noexcept
+  {
+    if (StoragePolicy::Disjoint(committed_, candidate_))
+    {
+      StoragePolicy::DiscardCandidate(candidate_);
+    }
+    else
+    {
+      storage_valid_ = false;
+    }
+  }
+
+  RestartCompatibility ValidateCheckpoint(
+      const CheckpointDescriptor& checkpoint,
+      const StateHash& loaded_interior_hash,
+      const StateHash& loaded_trace_hash) const noexcept
+  {
+    if (active_) { return RestartCompatibility::contract_busy; }
     if (!checkpoint.successful_commit)
     {
       return RestartCompatibility::no_successful_commit;
@@ -1199,6 +1941,10 @@ public:
     {
       return RestartCompatibility::policy_mismatch;
     }
+    if (!std::isfinite(checkpoint.coordinates.time))
+    {
+      return RestartCompatibility::time_mismatch;
+    }
     if (detail::CoordinateFingerprint(checkpoint.coordinates) !=
         checkpoint.coordinate_fingerprint)
     {
@@ -1209,7 +1955,10 @@ public:
       return RestartCompatibility::cursor_mismatch;
     }
     if (!std::isfinite(checkpoint.dt) || checkpoint.dt <= 0.0 ||
-        checkpoint.dt != checkpoint.coordinates.dt)
+        !std::isfinite(checkpoint.coordinates.dt) ||
+        checkpoint.coordinates.dt <= 0.0 ||
+        detail::DoubleBits(checkpoint.dt) !=
+            detail::DoubleBits(checkpoint.coordinates.dt))
     {
       return RestartCompatibility::dt_mismatch;
     }
@@ -1254,230 +2003,15 @@ public:
     {
       return RestartCompatibility::precision_mismatch;
     }
-    if (StoragePolicy::HashInterior(loaded_interior) !=
-        checkpoint.interior_hash)
+    if (loaded_interior_hash != checkpoint.interior_hash)
     {
       return RestartCompatibility::interior_hash_mismatch;
     }
-    if (StoragePolicy::HashTrace(loaded_trace) != checkpoint.trace_hash)
+    if (loaded_trace_hash != checkpoint.trace_hash)
     {
       return RestartCompatibility::trace_hash_mismatch;
     }
     return RestartCompatibility::compatible;
-  }
-
-private:
-  static constexpr std::uint8_t required_product_mask = 0x0fU;
-
-  std::uintptr_t OwnerIdentity() const noexcept
-  {
-    return reinterpret_cast<std::uintptr_t>(this);
-  }
-
-  template <typename Function>
-  bool WithCandidate(const AttemptIdentity& attempt, Function&& function)
-  {
-    if (!IsCurrentAttempt(attempt))
-    {
-      telemetry_.stale_consumers_rejected = detail::SaturatingAdd(
-          telemetry_.stale_consumers_rejected, 1);
-      return false;
-    }
-    std::forward<Function>(function)(candidate_);
-    if (!StoragePolicy::Disjoint(committed_, candidate_))
-    {
-      storage_valid_ = false;
-      active_ = false;
-      status_ = RunStatus::terminal_failure;
-      last_failure_ = FailureReason::shared_backing_store;
-      return false;
-    }
-    return IsCurrentAttempt(attempt);
-  }
-
-  bool CopyCandidate(const AttemptIdentity& attempt, state_slot& copy) const
-  {
-    if (!IsCurrentAttempt(attempt)) { return false; }
-    copy = candidate_;
-    return IsCurrentAttempt(attempt);
-  }
-
-  template <typename Function>
-  bool WithPublished(const StateCoordinates& coordinates,
-                     Function&& function) const
-  {
-    if (coordinates != coordinates_) { return false; }
-    std::forward<Function>(function)(committed_, coordinates_);
-    return coordinates == coordinates_;
-  }
-
-  bool CopyPublished(const StateCoordinates& coordinates,
-                     state_slot& copy) const
-  {
-    if (coordinates != coordinates_) { return false; }
-    copy = committed_;
-    return coordinates == coordinates_;
-  }
-
-  StateCoordinates AdmissionTarget() const noexcept
-  {
-    return {pending_target_time_,
-            coordinates_.step + 1,
-            coordinates_.generation + 1,
-            coordinates_.cursor,
-            pending_dt_};
-  }
-
-  BeginOutcome PrepareAndAdmit(const AttemptIdentity& proposed,
-                               const bool retry) noexcept
-  {
-    telemetry_.admissions_started = detail::SaturatingAdd(
-        telemetry_.admissions_started, 1);
-    attempt_sequence_ = proposed.sequence;
-    const bool disjoint_before =
-        StoragePolicy::Disjoint(committed_, candidate_);
-    bool local_prepared = false;
-    if (disjoint_before)
-    {
-      local_prepared = StoragePolicy::PrepareCandidate(committed_, candidate_);
-    }
-    const bool disjoint_after =
-        StoragePolicy::Disjoint(committed_, candidate_);
-    local_prepared = local_prepared && disjoint_after;
-
-    const AttemptCollectiveContext local_context{
-        proposed, coordinates_, AdmissionTarget(), coordinates_.cursor};
-    const CollectiveAdmissionReport admission = CollectivePolicy::Admit(
-        local_context, local_prepared, resources_.rank_count);
-    const bool collective_identity =
-        admission.participating_ranks == resources_.rank_count &&
-        admission.context == local_context;
-    if (!local_prepared || !admission.all_prepared || !collective_identity)
-    {
-      if (disjoint_after) { StoragePolicy::DiscardCandidate(candidate_); }
-      telemetry_.admissions_failed = detail::SaturatingAdd(
-          telemetry_.admissions_failed, 1);
-      active_ = false;
-      status_ = RunStatus::terminal_failure;
-      if (!disjoint_before || !disjoint_after)
-      {
-        storage_valid_ = false;
-        last_failure_ = FailureReason::shared_backing_store;
-      }
-      else if (!local_prepared || !admission.all_prepared)
-      {
-        last_failure_ = FailureReason::candidate_preparation;
-      }
-      else
-      {
-        last_failure_ = FailureReason::collective_identity;
-      }
-      return {false, proposed, last_failure_};
-    }
-
-    retry_used_ = retry;
-    active_attempt_ = proposed;
-    issued_product_mask_ = 0;
-    issued_product_serials_.fill(0);
-    active_ = true;
-    status_ = RunStatus::attempt_active;
-    last_failure_ = FailureReason::none;
-    telemetry_.attempts_started =
-        detail::SaturatingAdd(telemetry_.attempts_started, 1);
-    if (retry)
-    {
-      telemetry_.retries_started =
-          detail::SaturatingAdd(telemetry_.retries_started, 1);
-    }
-    return {true, active_attempt_, FailureReason::none};
-  }
-
-  template <DerivedProductKind Kind>
-  FailureReason ValidateToken(ProductToken<Kind>& token,
-                              const AttemptIdentity& attempt) const noexcept
-  {
-    constexpr std::size_t index = detail::ProductIndex(Kind);
-    if (token.attempt_ != attempt) { return FailureReason::stale_product; }
-    if (!token.valid_ || token.owner_ != OwnerIdentity() ||
-        token.serial_ == 0 ||
-        token.serial_ != issued_product_serials_[index])
-    {
-      return FailureReason::invalid_product;
-    }
-    return FailureReason::none;
-  }
-
-  FailureReason ValidateAndConsumeProducts(const AttemptIdentity& attempt,
-                                            ProductBundle& products) noexcept
-  {
-    if (!products.residual || !products.matrix || !products.factor ||
-        !products.solution)
-    {
-      InvalidateProducts(products);
-      return FailureReason::missing_product;
-    }
-    FailureReason reason = ValidateToken(*products.residual, attempt);
-    if (reason == FailureReason::none)
-    {
-      reason = ValidateToken(*products.matrix, attempt);
-    }
-    if (reason == FailureReason::none)
-    {
-      reason = ValidateToken(*products.factor, attempt);
-    }
-    if (reason == FailureReason::none)
-    {
-      reason = ValidateToken(*products.solution, attempt);
-    }
-    if (reason == FailureReason::none &&
-        issued_product_mask_ != required_product_mask)
-    {
-      reason = FailureReason::missing_product;
-    }
-    InvalidateProducts(products);
-    return reason;
-  }
-
-  static void InvalidateProducts(ProductBundle& products) noexcept
-  {
-    if (products.residual) { products.residual->valid_ = false; }
-    if (products.matrix) { products.matrix->valid_ = false; }
-    if (products.factor) { products.factor->valid_ = false; }
-    if (products.solution) { products.solution->valid_ = false; }
-  }
-
-  AttemptOutcome Rollback(const AttemptIdentity& attempt,
-                          FailureReason reason,
-                          const TransferAccounting& transfers) noexcept
-  {
-    detail::AddTransfers(telemetry_.rolled_back_transfers, transfers);
-    telemetry_.attempts_failed =
-        detail::SaturatingAdd(telemetry_.attempts_failed, 1);
-    telemetry_.rollbacks = detail::SaturatingAdd(telemetry_.rollbacks, 1);
-    StoragePolicy::DiscardCandidate(candidate_);
-    active_ = false;
-    if (reason == FailureReason::none) { reason = FailureReason::backend_failure; }
-    last_failure_ = reason;
-    telemetry_.last_attempt.failure_reason = reason;
-    if (attempt.retry_index == 0)
-    {
-      status_ = RunStatus::retry_available;
-      return {status_, last_failure_, false, true};
-    }
-    status_ = RunStatus::terminal_failure;
-    return {status_, last_failure_, false, false};
-  }
-
-  AttemptOutcome FailInvalidStorage(const FailureReason reason) noexcept
-  {
-    active_ = false;
-    status_ = RunStatus::terminal_failure;
-    last_failure_ = reason;
-    telemetry_.last_attempt.failure_reason = reason;
-    telemetry_.attempts_failed =
-        detail::SaturatingAdd(telemetry_.attempts_failed, 1);
-    telemetry_.rollbacks = detail::SaturatingAdd(telemetry_.rollbacks, 1);
-    return {status_, reason, false, false};
   }
 
   state_slot committed_{};
@@ -1487,13 +2021,19 @@ private:
   RunTelemetry telemetry_{};
   RunStatus status_ = RunStatus::ready;
   FailureReason last_failure_ = FailureReason::none;
+  FailureReason constructor_failure_ = FailureReason::none;
+  FailureReason candidate_storage_failure_ = FailureReason::none;
   AttemptIdentity active_attempt_{};
   std::array<std::uint64_t, 4> issued_product_serials_{};
   std::uint64_t attempt_sequence_ = 0;
   std::uint64_t product_serial_ = 0;
+  std::uint64_t incarnation_ = 0;
+  std::uint64_t candidate_serial_ = 0;
+  std::uint64_t publication_serial_ = 1;
   double pending_dt_ = 0.0;
   double pending_target_time_ = 0.0;
   std::uint8_t issued_product_mask_ = 0;
+  std::uint8_t issued_product_count_ = 0;
   bool active_ = false;
   bool retry_used_ = false;
   bool storage_valid_ = true;

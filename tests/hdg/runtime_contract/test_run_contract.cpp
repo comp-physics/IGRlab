@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <initializer_list>
 #include <limits>
+#include <new>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -68,27 +70,56 @@ StateHash Digest(const std::uint8_t seed) noexcept
   return hash;
 }
 
+template <typename Values>
+StateHash ValueHash(const Values& values, const int offset) noexcept
+{
+  StateHash hash{};
+  for (std::size_t i = 0; i < hash.bytes.size(); ++i)
+  {
+    hash.bytes[i] = static_cast<std::uint8_t>(
+        static_cast<int>(values[i % values.size()] * 3.0) +
+        static_cast<int>(i) + offset);
+  }
+  return hash;
+}
+
 struct ArrayStoragePolicy
 {
-  static constexpr bool commit_is_atomic = true;
-  static constexpr bool commit_preserves_disjoint_backing = true;
+  static constexpr bool preparation_preserves_committed = true;
+  static constexpr bool private_copy_is_independent = true;
+  static constexpr bool publish_is_atomic = true;
+  static constexpr bool publish_preserves_disjoint_backing = true;
   static inline std::uint64_t preparations = 0;
+  static inline std::uint64_t restore_preparations = 0;
+  static inline std::uint64_t stores = 0;
+  static inline std::uint64_t copies = 0;
   static inline std::uint64_t discards = 0;
-  static inline std::uint64_t commits = 0;
+  static inline std::uint64_t prepublish_checks = 0;
+  static inline std::uint64_t publications = 0;
   static inline std::uint64_t fail_prepare_call = 0;
+  static inline std::uint64_t fail_restore_call = 0;
+  static inline std::uint64_t fail_store_call = 0;
+  static inline std::uint64_t fail_prepublish_call = 0;
 
   static void Reset() noexcept
   {
     preparations = 0;
+    restore_preparations = 0;
+    stores = 0;
+    copies = 0;
     discards = 0;
-    commits = 0;
+    prepublish_checks = 0;
+    publications = 0;
     fail_prepare_call = 0;
+    fail_restore_call = 0;
+    fail_store_call = 0;
+    fail_prepublish_call = 0;
   }
 
-  static bool Disjoint(const Slot& committed, const Slot& candidate) noexcept
+  static bool Disjoint(const Slot& left, const Slot& right) noexcept
   {
-    return committed.interior.data() != candidate.interior.data() &&
-        committed.trace.data() != candidate.trace.data();
+    return left.interior.data() != right.interior.data() &&
+        left.trace.data() != right.trace.data();
   }
 
   static bool PrepareCandidate(const Slot& committed,
@@ -100,6 +131,29 @@ struct ArrayStoragePolicy
     return true;
   }
 
+  static bool PrepareRestore(const Slot& loaded, Slot& candidate) noexcept
+  {
+    ++restore_preparations;
+    if (restore_preparations == fail_restore_call) { return false; }
+    candidate = loaded;
+    return true;
+  }
+
+  static bool StoreCandidate(Slot& candidate, const Slot& value) noexcept
+  {
+    ++stores;
+    if (stores == fail_store_call) { return false; }
+    candidate = value;
+    return true;
+  }
+
+  static bool CopyOut(const Slot& source, Slot& copy) noexcept
+  {
+    ++copies;
+    copy = source;
+    return true;
+  }
+
   static void DiscardCandidate(Slot& candidate) noexcept
   {
     ++discards;
@@ -107,43 +161,45 @@ struct ArrayStoragePolicy
     candidate.trace.fill(-901.0);
   }
 
-  static void Commit(Slot& committed, Slot& candidate) noexcept
+  static bool CanPublish(const Slot& committed,
+                         const Slot& candidate) noexcept
   {
-    ++commits;
+    ++prepublish_checks;
+    return prepublish_checks != fail_prepublish_call &&
+        Disjoint(committed, candidate);
+  }
+
+  static void Publish(Slot& committed, Slot& candidate) noexcept
+  {
+    ++publications;
     using std::swap;
     swap(committed, candidate);
   }
 
-  template <typename Values>
-  static StateHash Hash(const Values& values, const int offset) noexcept
-  {
-    StateHash hash{};
-    for (std::size_t i = 0; i < hash.bytes.size(); ++i)
-    {
-      hash.bytes[i] = static_cast<std::uint8_t>(
-          static_cast<int>(values[i % values.size()]) +
-          static_cast<int>(i) + offset);
-    }
-    return hash;
-  }
-
   static StateHash HashInterior(const Interior& values) noexcept
   {
-    return Hash(values, 0);
+    return ValueHash(values, 0);
   }
 
   static StateHash HashTrace(const Trace& values) noexcept
   {
-    return Hash(values, 100);
+    return ValueHash(values, 100);
   }
 };
 
 enum class CollectiveFault : unsigned char
 {
   none,
-  admission_remote_preparation,
+  admission_identity_false,
+  admission_failure_consistency_false,
   admission_participants,
-  admission_committed_time,
+  admission_context,
+  admission_remote_failure,
+  admission_hide_local_failure,
+  admission_change_local_failure,
+  finish_identity_false,
+  finish_failure_consistency_false,
+  finish_participants,
   finish_attempt,
   finish_committed_time,
   finish_committed_step,
@@ -156,60 +212,156 @@ enum class CollectiveFault : unsigned char
   finish_target_cursor,
   finish_target_dt,
   finish_candidate_cursor,
-  finish_participants,
-  remote_finite,
-  remote_admissible,
-  remote_recovery,
-  remote_true_residual,
-  remote_telemetry,
-  remote_success
+  finish_remote_failure,
+  finish_hide_local_failure,
+  finish_change_local_failure,
+  restore_identity_false,
+  restore_failure_consistency_false,
+  restore_participants,
+  restore_context,
+  restore_remote_failure,
+  restore_hide_local_failure,
+  restore_change_local_failure
 };
+
+std::uint64_t FailureMask(const FailureReason reason) noexcept
+{
+  return reason == FailureReason::none
+      ? 0
+      : (std::uint64_t{1} << static_cast<unsigned int>(reason));
+}
+
+std::uint64_t CompatibilityMask(
+    const RestartCompatibility compatibility) noexcept
+{
+  return compatibility == RestartCompatibility::compatible
+      ? 0
+      : (std::uint64_t{1} << static_cast<unsigned int>(compatibility));
+}
+
+void FailGateForReason(GateReport& gates,
+                       const FailureReason reason) noexcept
+{
+  switch (reason)
+  {
+    case FailureReason::finite_gate: gates.finite = false; break;
+    case FailureReason::admissibility_gate: gates.admissible = false; break;
+    case FailureReason::recovery_gate: gates.recovery = false; break;
+    case FailureReason::true_residual_gate:
+      gates.true_residual = false;
+      break;
+    case FailureReason::telemetry_gate: gates.telemetry = false; break;
+    case FailureReason::success_gate: gates.success = false; break;
+    default: gates.success = false; break;
+  }
+}
 
 struct TestCollectivePolicy
 {
   static inline CollectiveFault fault = CollectiveFault::none;
+  static inline FailureReason remote_reason = FailureReason::backend_failure;
+  static inline RestartCompatibility remote_compatibility =
+      RestartCompatibility::interior_hash_mismatch;
   static inline std::uint64_t admissions = 0;
   static inline std::uint64_t reductions = 0;
+  static inline std::uint64_t restores = 0;
 
   static void Reset() noexcept
   {
     fault = CollectiveFault::none;
+    remote_reason = FailureReason::backend_failure;
+    remote_compatibility = RestartCompatibility::interior_hash_mismatch;
     admissions = 0;
     reductions = 0;
+    restores = 0;
   }
 
   static CollectiveAdmissionReport Admit(
       const AttemptCollectiveContext& local,
       const bool local_prepared,
+      const FailureReason local_reason,
       const std::uint32_t expected_ranks) noexcept
   {
     ++admissions;
-    CollectiveAdmissionReport report{local, expected_ranks, local_prepared};
-    if (fault == CollectiveFault::admission_remote_preparation)
+    CollectiveAdmissionReport report{local,
+                                     expected_ranks,
+                                     true,
+                                     true,
+                                     local_prepared,
+                                     local_reason != FailureReason::none,
+                                     FailureMask(local_reason),
+                                     local_reason};
+    switch (fault)
     {
-      report.all_prepared = false;
-    }
-    else if (fault == CollectiveFault::admission_participants)
-    {
-      report.participating_ranks = expected_ranks + 1;
-    }
-    else if (fault == CollectiveFault::admission_committed_time)
-    {
-      report.context.committed.time += 1.0;
+      case CollectiveFault::admission_identity_false:
+        report.identity_consistent = false;
+        break;
+      case CollectiveFault::admission_failure_consistency_false:
+        report.failure_consistent = false;
+        report.all_prepared = false;
+        report.any_failure = true;
+        report.failure_mask = FailureMask(remote_reason);
+        report.resolved_reason = remote_reason;
+        break;
+      case CollectiveFault::admission_participants:
+        ++report.participating_ranks;
+        break;
+      case CollectiveFault::admission_context:
+        ++report.context.target.cursor;
+        break;
+      case CollectiveFault::admission_remote_failure:
+        report.all_prepared = false;
+        report.any_failure = true;
+        report.failure_mask = FailureMask(remote_reason);
+        report.resolved_reason = remote_reason;
+        break;
+      case CollectiveFault::admission_hide_local_failure:
+        report.all_prepared = true;
+        report.any_failure = false;
+        report.failure_mask = 0;
+        report.resolved_reason = FailureReason::none;
+        break;
+      case CollectiveFault::admission_change_local_failure:
+        report.all_prepared = false;
+        report.any_failure = true;
+        report.failure_mask = FailureMask(remote_reason);
+        report.resolved_reason = remote_reason;
+        break;
+      default: break;
     }
     return report;
   }
 
   static CollectiveGateReport Reduce(
       const AttemptCollectiveContext& local,
-      const GateReport&,
+      const GateReport& local_gates,
+      const FailureReason local_reason,
       const std::uint32_t expected_ranks) noexcept
   {
     ++reductions;
-    CollectiveGateReport report{
-        local, {true, true, true, true, true, true}, expected_ranks};
+    CollectiveGateReport report{local,
+                                local_gates,
+                                expected_ranks,
+                                true,
+                                true,
+                                local_reason != FailureReason::none,
+                                FailureMask(local_reason),
+                                local_reason};
     switch (fault)
     {
+      case CollectiveFault::finish_identity_false:
+        report.identity_consistent = false;
+        break;
+      case CollectiveFault::finish_failure_consistency_false:
+        report.failure_consistent = false;
+        report.any_failure = true;
+        report.failure_mask = FailureMask(remote_reason);
+        report.resolved_reason = remote_reason;
+        FailGateForReason(report.gates, remote_reason);
+        break;
+      case CollectiveFault::finish_participants:
+        ++report.participating_ranks;
+        break;
       case CollectiveFault::finish_attempt:
         ++report.context.attempt.sequence;
         break;
@@ -246,29 +398,87 @@ struct TestCollectivePolicy
       case CollectiveFault::finish_candidate_cursor:
         ++report.context.candidate_cursor;
         break;
-      case CollectiveFault::finish_participants:
-        report.participating_ranks = expected_ranks + 1;
+      case CollectiveFault::finish_remote_failure:
+        report.any_failure = true;
+        report.failure_mask = FailureMask(remote_reason);
+        report.resolved_reason = remote_reason;
+        FailGateForReason(report.gates, remote_reason);
         break;
-      case CollectiveFault::remote_finite:
-        report.gates.finite = false;
+      case CollectiveFault::finish_hide_local_failure:
+        report.gates = {true, true, true, true, true, true};
+        report.any_failure = false;
+        report.failure_mask = 0;
+        report.resolved_reason = FailureReason::none;
         break;
-      case CollectiveFault::remote_admissible:
-        report.gates.admissible = false;
+      case CollectiveFault::finish_change_local_failure:
+        report.any_failure = true;
+        report.failure_mask = FailureMask(remote_reason);
+        report.resolved_reason = remote_reason;
+        FailGateForReason(report.gates, remote_reason);
         break;
-      case CollectiveFault::remote_recovery:
-        report.gates.recovery = false;
+      default: break;
+    }
+    return report;
+  }
+
+  static CollectiveRestoreReport ReduceRestore(
+      const RestoreCollectiveContext& local,
+      const RestartCompatibility local_compatibility,
+      const FailureReason local_reason,
+      const std::uint32_t expected_ranks) noexcept
+  {
+    ++restores;
+    CollectiveRestoreReport report{
+        local,
+        expected_ranks,
+        true,
+        true,
+        local_reason != FailureReason::none,
+        FailureMask(local_reason),
+        CompatibilityMask(local_compatibility),
+        local_reason,
+        local_compatibility};
+    switch (fault)
+    {
+      case CollectiveFault::restore_identity_false:
+        report.identity_consistent = false;
         break;
-      case CollectiveFault::remote_true_residual:
-        report.gates.true_residual = false;
+      case CollectiveFault::restore_failure_consistency_false:
+        report.failure_consistent = false;
+        report.any_failure = true;
+        report.failure_mask = FailureMask(FailureReason::restart_incompatible);
+        report.compatibility_mask = CompatibilityMask(remote_compatibility);
+        report.resolved_reason = FailureReason::restart_incompatible;
+        report.resolved_compatibility = remote_compatibility;
         break;
-      case CollectiveFault::remote_telemetry:
-        report.gates.telemetry = false;
+      case CollectiveFault::restore_participants:
+        ++report.participating_ranks;
         break;
-      case CollectiveFault::remote_success:
-        report.gates.success = false;
+      case CollectiveFault::restore_context:
+        report.context.loaded_interior_hash.bytes[0] ^= 1U;
         break;
-      default:
+      case CollectiveFault::restore_remote_failure:
+        report.any_failure = true;
+        report.failure_mask = FailureMask(FailureReason::restart_incompatible);
+        report.compatibility_mask = CompatibilityMask(remote_compatibility);
+        report.resolved_reason = FailureReason::restart_incompatible;
+        report.resolved_compatibility = remote_compatibility;
         break;
+      case CollectiveFault::restore_hide_local_failure:
+        report.any_failure = false;
+        report.failure_mask = 0;
+        report.compatibility_mask = 0;
+        report.resolved_reason = FailureReason::none;
+        report.resolved_compatibility = RestartCompatibility::compatible;
+        break;
+      case CollectiveFault::restore_change_local_failure:
+        report.any_failure = true;
+        report.failure_mask = FailureMask(FailureReason::restart_incompatible);
+        report.compatibility_mask = CompatibilityMask(remote_compatibility);
+        report.resolved_reason = FailureReason::restart_incompatible;
+        report.resolved_compatibility = remote_compatibility;
+        break;
+      default: break;
     }
     return report;
   }
@@ -285,12 +495,16 @@ static_assert(!std::is_polymorphic<Selection>::value);
 static_assert(!std::is_polymorphic<Contract>::value);
 static_assert(!std::is_polymorphic<ArrayStoragePolicy>::value);
 static_assert(!std::is_polymorphic<TestCollectivePolicy>::value);
+static_assert(!std::is_copy_constructible<Contract>::value);
+static_assert(!std::is_move_constructible<Contract>::value);
 static_assert(!std::is_default_constructible<
                   Contract::ProductToken<DerivedProductKind::residual>>::value,
               "attempt products must not be forgeable by construction");
 static_assert(!std::is_copy_constructible<
                   Contract::ProductToken<DerivedProductKind::residual>>::value,
               "attempt products must not be duplicable by copying");
+static_assert(!std::is_convertible<Contract::CandidateCapability, Slot*>::value);
+static_assert(!std::is_convertible<Contract::PublishedCapability, Slot*>::value);
 static_assert(std::is_same<decltype(SmoothAdmissionThresholds<double>{}
                                         .minimum_rate.value),
                            double>::value);
@@ -303,6 +517,16 @@ Slot CommittedSlot()
 Slot ScratchSlot()
 {
   return {{{-1.0, -2.0, -3.0, -4.0}}, {{-5.0, -6.0, -7.0}}};
+}
+
+Slot AcceptedSlot()
+{
+  return {{{11.0, 12.0, 13.0, 14.0}}, {{15.0, 16.0, 17.0}}};
+}
+
+Slot OtherSlot()
+{
+  return {{{31.0, 32.0, 33.0, 34.0}}, {{35.0, 36.0, 37.0}}};
 }
 
 StateCoordinates InitialCoordinates()
@@ -324,12 +548,13 @@ PersistentResourceDescriptor Resources()
 
 Contract MakeContract(const StateCoordinates coordinates = InitialCoordinates(),
                       const PersistentResourceDescriptor resources = Resources(),
-                      const std::uint64_t initial_sequence = 0)
+                      const std::uint64_t initial_sequence = 0,
+                      const Slot committed = CommittedSlot(),
+                      const Slot scratch = ScratchSlot())
 {
   ArrayStoragePolicy::Reset();
   TestCollectivePolicy::Reset();
-  return Contract{
-      CommittedSlot(), ScratchSlot(), coordinates, resources, initial_sequence};
+  return Contract{committed, scratch, coordinates, resources, initial_sequence};
 }
 
 AttemptReport PassingReport(const std::uint64_t cursor)
@@ -372,28 +597,95 @@ typename ContractType::ProductBundle IssueAllFor(
   return products;
 }
 
-bool MutateCandidate(Contract& contract,
-                     const AttemptIdentity& attempt,
-                     const Slot& value)
+bool StoreCandidate(Contract& contract,
+                    const AttemptIdentity& attempt,
+                    const Slot& value)
 {
-  auto handle = contract.AcquireCandidate(attempt);
-  return handle && handle->Mutate(
-      [&value](Slot& candidate) noexcept { candidate = value; });
+  const auto capability = contract.AcquireCandidate(attempt);
+  return capability && contract.StoreCandidate(*capability, value);
 }
 
 bool CopyPublished(const Contract& contract, Slot& copy)
 {
-  return contract.Published().Copy(copy);
+  const auto capability = contract.Published();
+  return contract.CopyPublished(capability, copy);
 }
 
-template <typename T>
-std::array<unsigned char, sizeof(T)> ObjectBytes(const T& value)
+bool SameCoordinates(const StateCoordinates& left,
+                     const StateCoordinates& right)
 {
-  static_assert(std::is_trivially_copyable<T>::value,
-                "byte preservation probes require trivial values");
-  std::array<unsigned char, sizeof(T)> bytes{};
-  std::memcpy(bytes.data(), &value, sizeof(T));
-  return bytes;
+  return std::memcmp(&left.time, &right.time, sizeof(double)) == 0 &&
+      left.step == right.step && left.generation == right.generation &&
+      left.cursor == right.cursor &&
+      std::memcmp(&left.dt, &right.dt, sizeof(double)) == 0;
+}
+
+bool SameTransfers(const TransferAccounting& left,
+                   const TransferAccounting& right)
+{
+  return left.host_to_device_bytes == right.host_to_device_bytes &&
+      left.device_to_host_bytes == right.device_to_host_bytes &&
+      left.mpi_staging_bytes == right.mpi_staging_bytes &&
+      left.allocation_events == right.allocation_events &&
+      left.synchronization_events == right.synchronization_events &&
+      left.complete == right.complete;
+}
+
+bool SameAttempt(const AttemptIdentity& left,
+                 const AttemptIdentity& right)
+{
+  return left.sequence == right.sequence &&
+      left.committed_step == right.committed_step &&
+      left.committed_generation == right.committed_generation &&
+      left.retry_index == right.retry_index &&
+      std::memcmp(&left.dt, &right.dt, sizeof(double)) == 0;
+}
+
+bool SameProhibited(const ProhibitedActionAccounting& left,
+                    const ProhibitedActionAccounting& right)
+{
+  return left.dt_change_events == right.dt_change_events &&
+      left.clipping_events == right.clipping_events &&
+      left.solver_substitution_events == right.solver_substitution_events &&
+      left.fallback_events == right.fallback_events &&
+      left.hidden_insertion_events == right.hidden_insertion_events;
+}
+
+bool SameAccepted(const AcceptedTelemetry& left,
+                  const AcceptedTelemetry& right)
+{
+  return left.valid == right.valid &&
+      SameCoordinates(left.coordinates, right.coordinates) &&
+      SameAttempt(left.attempt.identity, right.attempt.identity) &&
+      SameTransfers(left.attempt.transfers, right.attempt.transfers) &&
+      SameProhibited(left.attempt.prohibited, right.attempt.prohibited) &&
+      left.attempt.failure_reason == right.attempt.failure_reason &&
+      left.attempt.validated_product_mask ==
+          right.attempt.validated_product_mask &&
+      std::memcmp(&left.attempt.true_relative_residual,
+                  &right.attempt.true_relative_residual,
+                  sizeof(double)) == 0;
+}
+
+std::uint64_t FrozenCoordinateFingerprint(
+    const StateCoordinates& coordinates) noexcept
+{
+  std::array<std::uint64_t, 5> fields{};
+  std::memcpy(&fields[0], &coordinates.time, sizeof(double));
+  fields[1] = coordinates.step;
+  fields[2] = coordinates.generation;
+  fields[3] = coordinates.cursor;
+  std::memcpy(&fields[4], &coordinates.dt, sizeof(double));
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (const std::uint64_t field : fields)
+  {
+    for (unsigned int shift = 0; shift < 64; shift += 8)
+    {
+      hash ^= static_cast<std::uint8_t>(field >> shift);
+      hash *= 1099511628211ULL;
+    }
+  }
+  return hash;
 }
 
 bool Check(const bool condition, const char* requirement)
@@ -405,7 +697,7 @@ bool Check(const bool condition, const char* requirement)
   return condition;
 }
 
-bool CheckStaticSelectionIdentityAndInvalidRequests()
+bool CheckStaticSelectionAndCollectiveAdmission()
 {
   bool passed = true;
   const RuntimeTupleDescriptor tuple = Selection::Descriptor();
@@ -415,59 +707,101 @@ bool CheckStaticSelectionIdentityAndInvalidRequests()
                      tuple.precision == StableIdentity{"fp64"},
                  "static_owned_outer_selection") && passed;
 
-  std::array<char, 16> local_text{{'t', 'e', 'm', 'p', '.', 'i', 'd'}};
+  std::array<char, 16> caller_text{{'t', 'e', 'm', 'p', '.', 'i', 'd'}};
   const StableIdentity owned = StableIdentity::Copy(
-      std::string_view{local_text.data(), 7});
-  local_text.fill('x');
+      std::string_view{caller_text.data(), 7});
+  caller_text.fill('x');
   passed = Check(owned == StableIdentity{"temp.id"},
                  "text_identity_owns_source_lifetime") && passed;
 
   const SmoothAdmissionThresholds<double> thresholds{};
   passed = Check(!thresholds.minimum_rate.specified &&
                      !thresholds.maximum_conservation_error.specified,
-                 "smooth_thresholds_remain_unset") && passed;
+                 "smooth_thresholds_are_typed_but_uninvented") && passed;
 
+  struct InvalidCase
+  {
+    InteriorSpace space;
+    double dt;
+    FailureReason reason;
+    const char* name;
+  };
+  const std::array<InvalidCase, 6> invalid_requests{{
+      {InteriorSpace::h1,
+       0.125,
+       FailureReason::unsupported_h1,
+       "h1_explicitly_unsupported_after_collective"},
+      {static_cast<InteriorSpace>(255),
+       0.125,
+       FailureReason::invalid_interior_space,
+       "invalid_space_collectively_rejected"},
+      {InteriorSpace::l2,
+       0.0,
+       FailureReason::invalid_dt,
+       "zero_dt_collectively_rejected"},
+      {InteriorSpace::l2,
+       -1.0,
+       FailureReason::invalid_dt,
+       "negative_dt_collectively_rejected"},
+      {InteriorSpace::l2,
+       std::numeric_limits<double>::infinity(),
+       FailureReason::invalid_dt,
+       "infinite_dt_collectively_rejected"},
+      {InteriorSpace::l2,
+       std::numeric_limits<double>::quiet_NaN(),
+       FailureReason::invalid_dt,
+       "nan_dt_collectively_rejected"}}};
+  for (const InvalidCase& invalid : invalid_requests)
   {
     Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::h1, 0.125});
-    passed = Check(!begin.started &&
-                       begin.reason == FailureReason::unsupported_h1 &&
-                       contract.status() == RunStatus::unsupported_h1 &&
-                       ArrayStoragePolicy::preparations == 0 &&
-                       TestCollectivePolicy::admissions == 0,
-                   "h1_explicitly_unsupported") && passed;
-  }
-  {
-    Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep(
-        {static_cast<InteriorSpace>(255), 0.125});
-    passed = Check(!begin.started &&
-                       begin.reason == FailureReason::invalid_interior_space,
-                   "invalid_interior_space_fails_closed") && passed;
-  }
-
-  const std::array<double, 4> invalid_dt{{
-      0.0,
-      -1.0,
-      std::numeric_limits<double>::infinity(),
-      std::numeric_limits<double>::quiet_NaN()}};
-  for (const double dt : invalid_dt)
-  {
-    Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, dt});
-    passed = Check(!begin.started && begin.reason == FailureReason::invalid_dt &&
-                       TestCollectivePolicy::admissions == 0,
-                   "invalid_or_nonfinite_dt_rejected") && passed;
+    const BeginOutcome begin = contract.BeginStep({invalid.space, invalid.dt});
+    passed = Check(!begin.started && begin.reason == invalid.reason &&
+                       TestCollectivePolicy::admissions == 1 &&
+                       ArrayStoragePolicy::preparations == 0,
+                   invalid.name) && passed;
   }
 
   {
     StateCoordinates coordinates = InitialCoordinates();
-    coordinates.step = std::numeric_limits<std::uint64_t>::max();
+    coordinates.time = std::numeric_limits<double>::quiet_NaN();
+    Contract contract = MakeContract(coordinates);
+    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
+    passed = Check(!begin.started && begin.reason == FailureReason::invalid_dt &&
+                       TestCollectivePolicy::admissions == 1,
+                   "nonfinite_internal_time_enters_admission") && passed;
+  }
+  {
+    PersistentResourceDescriptor resources = Resources();
+    resources.reuse.persistent_workspace = false;
+    Contract contract = MakeContract(InitialCoordinates(), resources);
+    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
+    passed = Check(!begin.started &&
+                       begin.reason ==
+                           FailureReason::invalid_resource_descriptor &&
+                       contract.telemetry().first_failure ==
+                           FailureReason::invalid_resource_descriptor &&
+                       TestCollectivePolicy::admissions == 1,
+                   "constructor_failure_is_write_once_and_enters_admission") &&
+        passed;
+  }
+
+  for (const int field : {0, 1})
+  {
+    StateCoordinates coordinates = InitialCoordinates();
+    if (field == 0)
+    {
+      coordinates.step = std::numeric_limits<std::uint64_t>::max();
+    }
+    else
+    {
+      coordinates.generation = std::numeric_limits<std::uint64_t>::max();
+    }
     Contract contract = MakeContract(coordinates);
     const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
     passed = Check(!begin.started &&
-                       begin.reason == FailureReason::coordinate_overflow,
-                   "coordinate_overflow_rejected") && passed;
+                       begin.reason == FailureReason::coordinate_overflow &&
+                       TestCollectivePolicy::admissions == 1,
+                   "coordinate_overflow_enters_admission") && passed;
   }
   {
     Contract contract = MakeContract(
@@ -475,24 +809,32 @@ bool CheckStaticSelectionIdentityAndInvalidRequests()
         std::numeric_limits<std::uint64_t>::max());
     const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
     passed = Check(!begin.started &&
-                       begin.reason == FailureReason::coordinate_overflow,
-                   "attempt_sequence_overflow_rejected") && passed;
+                       begin.reason == FailureReason::coordinate_overflow &&
+                       TestCollectivePolicy::admissions == 1,
+                   "attempt_sequence_overflow_enters_admission") && passed;
   }
   {
-    PersistentResourceDescriptor resources = Resources();
-    resources.reuse.persistent_workspace = false;
-    Contract contract = MakeContract(InitialCoordinates(), resources);
-    passed = Check(contract.status() == RunStatus::invalid_request &&
-                       contract.last_failure() ==
-                           FailureReason::invalid_resource_descriptor,
-                   "invalid_persistent_descriptor_rejected") && passed;
+    StateCoordinates coordinates = InitialCoordinates();
+    coordinates.time = std::numeric_limits<double>::max();
+    Contract contract = MakeContract(coordinates);
+    const BeginOutcome begin = contract.BeginStep(
+        {InteriorSpace::l2, std::numeric_limits<double>::max()});
+    passed = Check(!begin.started &&
+                       begin.reason == FailureReason::coordinate_overflow &&
+                       TestCollectivePolicy::admissions == 1,
+                   "target_time_overflow_enters_admission") && passed;
   }
-  return passed;
-}
-
-bool CheckCollectiveAdmissionAndPreparation()
-{
-  bool passed = true;
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome first =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const BeginOutcome second =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    passed = Check(first.started && !second.started &&
+                       second.reason == FailureReason::stale_attempt &&
+                       TestCollectivePolicy::admissions == 2,
+                   "invalid_local_status_still_enters_admission") && passed;
+  }
   {
     Contract contract = MakeContract();
     ArrayStoragePolicy::fail_prepare_call = 1;
@@ -500,67 +842,99 @@ bool CheckCollectiveAdmissionAndPreparation()
     Slot published{};
     passed = Check(!begin.started &&
                        begin.reason == FailureReason::candidate_preparation &&
-                       contract.status() == RunStatus::terminal_failure &&
                        TestCollectivePolicy::admissions == 1 &&
-                       contract.telemetry().admissions_failed == 1 &&
                        contract.telemetry().attempts_started == 0 &&
                        CopyPublished(contract, published) &&
                        published.interior == CommittedSlot().interior,
-                   "initial_local_prepare_failure_collectively_admitted") &&
-        passed;
+                   "local_prepare_failure_collectively_terminal") && passed;
+  }
+
+  const std::array<FailureReason, 9> remote_preadmission_failures{{
+      FailureReason::stale_attempt,
+      FailureReason::unsupported_h1,
+      FailureReason::invalid_interior_space,
+      FailureReason::invalid_dt,
+      FailureReason::invalid_resource_descriptor,
+      FailureReason::coordinate_overflow,
+      FailureReason::shared_backing_store,
+      FailureReason::candidate_preparation,
+      FailureReason::publication_precondition}};
+  for (const FailureReason reason : remote_preadmission_failures)
+  {
+    Contract contract = MakeContract();
+    TestCollectivePolicy::fault = CollectiveFault::admission_remote_failure;
+    TestCollectivePolicy::remote_reason = reason;
+    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
+    Slot published{};
+    passed = Check(!begin.started && begin.reason == reason &&
+                       TestCollectivePolicy::admissions == 1 &&
+                       contract.telemetry().attempts_started == 0 &&
+                       CopyPublished(contract, published) &&
+                       published.interior == CommittedSlot().interior,
+                   "one_rank_preadmission_failure_is_atomic") && passed;
+  }
+
+  for (const CollectiveFault fault : {
+           CollectiveFault::admission_identity_false,
+           CollectiveFault::admission_failure_consistency_false,
+           CollectiveFault::admission_participants,
+           CollectiveFault::admission_context})
+  {
+    Contract contract = MakeContract();
+    TestCollectivePolicy::fault = fault;
+    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
+    passed = Check(!begin.started &&
+                       begin.reason == FailureReason::collective_protocol &&
+                       TestCollectivePolicy::admissions == 1,
+                   "admission_identity_truth_or_census_mismatch") && passed;
   }
   {
     Contract contract = MakeContract();
     TestCollectivePolicy::fault =
-        CollectiveFault::admission_remote_preparation;
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    passed = Check(!begin.started &&
-                       begin.reason == FailureReason::candidate_preparation &&
-                       ArrayStoragePolicy::preparations == 1 &&
-                       ArrayStoragePolicy::discards == 1 &&
+        CollectiveFault::admission_hide_local_failure;
+    const BeginOutcome first =
+        contract.BeginStep({InteriorSpace::h1, 0.125});
+    passed = Check(!first.started &&
+                       first.reason == FailureReason::collective_protocol &&
                        TestCollectivePolicy::admissions == 1,
-                   "remote_prepare_failure_atomic_before_activation") && passed;
+                   "admission_cannot_hide_local_failure_truth") && passed;
   }
   {
     Contract contract = MakeContract();
-    TestCollectivePolicy::fault = CollectiveFault::admission_participants;
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
+    TestCollectivePolicy::fault =
+        CollectiveFault::admission_change_local_failure;
+    TestCollectivePolicy::remote_reason = FailureReason::backend_failure;
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::h1, 0.125});
     passed = Check(!begin.started &&
-                       begin.reason == FailureReason::collective_identity &&
-                       contract.telemetry().attempts_started == 0,
-                   "admission_participant_mismatch") && passed;
+                       begin.reason == FailureReason::collective_protocol &&
+                       TestCollectivePolicy::admissions == 1,
+                   "admission_cannot_substitute_local_failure_bit") && passed;
   }
   {
     Contract contract = MakeContract();
-    TestCollectivePolicy::fault = CollectiveFault::admission_committed_time;
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    passed = Check(!begin.started &&
-                       begin.reason == FailureReason::collective_identity,
-                   "admission_coordinate_mismatch") && passed;
-  }
-  {
-    Contract contract = MakeContract();
-    BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
     auto products = IssueAll(contract, begin.attempt);
-    AttemptReport report = PassingReport(12);
-    report.gates.finite = false;
+    AttemptReport failed_report = PassingReport(12);
+    failed_report.gates.finite = false;
     const AttemptOutcome failed = contract.FinishAttempt(
-        begin.attempt, report, std::move(products));
+        begin.attempt, failed_report, std::move(products));
     ArrayStoragePolicy::fail_prepare_call = 2;
     const BeginOutcome retry = contract.Retry();
-    passed = Check(begin.started && failed.retry_available && !retry.started &&
+    passed = Check(failed.retry_available && !retry.started &&
                        retry.reason == FailureReason::candidate_preparation &&
                        TestCollectivePolicy::admissions == 2 &&
-                       contract.status() == RunStatus::terminal_failure &&
-                       contract.coordinates() == InitialCoordinates(),
-                   "retry_prepare_failure_collectively_admitted") && passed;
+                       SameCoordinates(contract.coordinates(),
+                                       InitialCoordinates()),
+                   "retry_prepare_failure_collectively_terminal") && passed;
   }
   return passed;
 }
 
 struct BackingState
 {
-  int backing = 0;
+  std::uint64_t backing = 0;
   double value = 0.0;
 };
 
@@ -568,22 +942,30 @@ using BackingSlot = CompleteStateSlot<BackingState, BackingState>;
 
 struct BackingStoragePolicy
 {
-  static constexpr bool commit_is_atomic = true;
-  static constexpr bool commit_preserves_disjoint_backing = true;
+  static constexpr bool preparation_preserves_committed = true;
+  static constexpr bool private_copy_is_independent = true;
+  static constexpr bool publish_is_atomic = true;
+  static constexpr bool publish_preserves_disjoint_backing = true;
   static inline bool alias_on_prepare = false;
-  static inline bool alias_on_commit = false;
+  static inline bool alias_on_store = false;
+  static inline std::uint64_t can_publish_calls = 0;
+  static inline std::uint64_t reject_can_publish_call = 0;
+  static inline std::uint64_t publish_calls = 0;
 
   static void Reset() noexcept
   {
     alias_on_prepare = false;
-    alias_on_commit = false;
+    alias_on_store = false;
+    can_publish_calls = 0;
+    reject_can_publish_call = 0;
+    publish_calls = 0;
   }
 
-  static bool Disjoint(const BackingSlot& committed,
-                       const BackingSlot& candidate) noexcept
+  static bool Disjoint(const BackingSlot& left,
+                       const BackingSlot& right) noexcept
   {
-    return committed.interior.backing != candidate.interior.backing &&
-        committed.trace.backing != candidate.trace.backing;
+    return left.interior.backing != right.interior.backing &&
+        left.trace.backing != right.trace.backing;
   }
 
   static bool PrepareCandidate(const BackingSlot& committed,
@@ -599,23 +981,58 @@ struct BackingStoragePolicy
     return true;
   }
 
-  static void DiscardCandidate(BackingSlot& candidate) noexcept
+  static bool PrepareRestore(const BackingSlot& loaded,
+                             BackingSlot& candidate) noexcept
   {
-    candidate.interior.value = -1.0;
-    candidate.trace.value = -1.0;
+    candidate.interior.value = loaded.interior.value;
+    candidate.trace.value = loaded.trace.value;
+    return true;
   }
 
-  static void Commit(BackingSlot& committed, BackingSlot& candidate) noexcept
+  static bool StoreCandidate(BackingSlot& candidate,
+                             const BackingSlot& value) noexcept
   {
-    if (alias_on_commit)
+    candidate.interior.value = value.interior.value;
+    candidate.trace.value = value.trace.value;
+    if (alias_on_store)
     {
-      candidate.interior.backing = committed.interior.backing;
-      candidate.trace.backing = committed.trace.backing;
-      return;
+      candidate.interior.backing = value.interior.backing;
+      candidate.trace.backing = value.trace.backing;
     }
-    using std::swap;
-    swap(committed.interior.value, candidate.interior.value);
-    swap(committed.trace.value, candidate.trace.value);
+    return true;
+  }
+
+  static bool CopyOut(const BackingSlot& source, BackingSlot& copy) noexcept
+  {
+    copy.interior.value = source.interior.value;
+    copy.trace.value = source.trace.value;
+    return true;
+  }
+
+  static void DiscardCandidate(BackingSlot& candidate) noexcept
+  {
+    candidate.interior.value = -900.0;
+    candidate.trace.value = -901.0;
+  }
+
+  static bool CanPublish(const BackingSlot& committed,
+                         const BackingSlot& candidate) noexcept
+  {
+    ++can_publish_calls;
+    return can_publish_calls != reject_can_publish_call &&
+        Disjoint(committed, candidate);
+  }
+
+  static void Publish(BackingSlot& committed,
+                      BackingSlot& candidate) noexcept
+  {
+    ++publish_calls;
+    // If an invalid policy invocation reached here it would corrupt bytes and
+    // alias backing. The contract test requires rejection before this call.
+    committed.interior.value = 999.0;
+    committed.trace.value = 998.0;
+    candidate.interior.backing = committed.interior.backing;
+    candidate.trace.backing = committed.trace.backing;
   }
 
   static StateHash HashInterior(const BackingState& state) noexcept
@@ -641,96 +1058,163 @@ BackingContract MakeBackingContract(const bool shared = false)
   TestCollectivePolicy::Reset();
   const BackingSlot committed{{1, 10.0}, {2, 20.0}};
   const BackingSlot candidate{
-      {shared ? 1 : 3, -10.0}, {shared ? 2 : 4, -20.0}};
+      {shared ? 1U : 3U, -10.0}, {shared ? 2U : 4U, -20.0}};
   return BackingContract{
       committed, candidate, InitialCoordinates(), Resources()};
 }
 
-bool CheckDisjointStorageAndBoundHandles()
+bool CheckCapabilitiesAndFailureAtomicPublication()
 {
   bool passed = true;
   {
     BackingContract contract = MakeBackingContract(true);
-    passed = Check(contract.status() == RunStatus::invalid_request &&
-                       contract.last_failure() ==
-                           FailureReason::shared_backing_store,
-                   "shared_backing_rejected_at_construction") && passed;
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    passed = Check(!begin.started &&
+                       begin.reason == FailureReason::shared_backing_store &&
+                       TestCollectivePolicy::admissions == 1,
+                   "shared_backing_construction_still_collects_admission") &&
+        passed;
   }
   {
     BackingContract contract = MakeBackingContract();
     BackingStoragePolicy::alias_on_prepare = true;
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
     passed = Check(!begin.started &&
                        begin.reason == FailureReason::shared_backing_store &&
                        TestCollectivePolicy::admissions == 1,
-                   "shared_backing_rejected_after_preparation") && passed;
+                   "shared_backing_after_preparation_rejected") && passed;
   }
   {
     BackingContract contract = MakeBackingContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    auto handle = contract.AcquireCandidate(begin.attempt);
-    passed = Check(handle && handle->Mutate([](BackingSlot& slot) noexcept {
-                     slot.interior.value = 30.0;
-                     slot.trace.value = 40.0;
-                   }),
-                   "backing_candidate_handle_active") && passed;
+    const auto published = contract.Published();
+    BackingSlot before{{91, 0.0}, {92, 0.0}};
+    const bool captured = contract.CopyPublished(published, before);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const auto candidate = contract.AcquireCandidate(begin.attempt);
+    BackingStoragePolicy::alias_on_store = true;
+    const BackingSlot aliased_value{{5, 30.0}, {6, 40.0}};
+    const bool stored = candidate &&
+        contract.StoreCandidate(*candidate, aliased_value);
     auto products = IssueAllFor(contract, begin.attempt);
-    BackingStoragePolicy::alias_on_commit = true;
     const AttemptOutcome outcome = contract.FinishAttempt(
-        begin.attempt, PassingReport(15), std::move(products));
-    passed = Check(!outcome.committed &&
+        begin.attempt, PassingReport(14), std::move(products));
+    BackingSlot after{{93, 0.0}, {94, 0.0}};
+    passed = Check(captured && !stored && !outcome.committed &&
                        outcome.reason == FailureReason::shared_backing_store &&
-                       contract.status() == RunStatus::terminal_failure,
-                   "shared_backing_rejected_after_commit_boundary") && passed;
+                       BackingStoragePolicy::publish_calls == 0 &&
+                       contract.CopyPublished(published, after) &&
+                       before.interior.value == after.interior.value &&
+                       before.trace.value == after.trace.value,
+                   "candidate_input_alias_is_detected_before_publication") &&
+        passed;
   }
   {
     Contract contract = MakeContract();
     const auto old = contract.Old();
-    Slot old_before{};
-    BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    auto retained_candidate = contract.AcquireCandidate(begin.attempt);
-    const Slot accepted{{{21.0, 22.0, 23.0, 24.0}}, {{25.0, 26.0, 27.0}}};
-    passed = Check(old.Copy(old_before) && retained_candidate &&
-                       retained_candidate->Mutate(
-                           [&accepted](Slot& slot) noexcept { slot = accepted; }),
-                   "handles_read_or_mutate_only_while_fresh") && passed;
+    Slot old_copy{};
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const auto candidate = contract.AcquireCandidate(begin.attempt);
+    Slot candidate_copy{};
+    passed = Check(begin.started && candidate &&
+                       contract.CopyPublished(old, old_copy) &&
+                       contract.StoreCandidate(*candidate, AcceptedSlot()) &&
+                       contract.CopyCandidate(*candidate, candidate_copy) &&
+                       candidate_copy.interior == AcceptedSlot().interior,
+                   "pointer_free_capabilities_require_live_contract") && passed;
     auto products = IssueAll(contract, begin.attempt);
     const AttemptOutcome outcome = contract.FinishAttempt(
-        begin.attempt, PassingReport(11), std::move(products));
+        begin.attempt, PassingReport(12), std::move(products));
     Slot stale_copy{};
     Slot fresh_copy{};
-    passed = Check(outcome.committed && !old.Copy(stale_copy) &&
-                       !retained_candidate->Mutate([](Slot& slot) noexcept {
-                         slot.interior.fill(999.0);
-                       }) &&
-                       contract.Published().Copy(fresh_copy) &&
-                       fresh_copy.interior == accepted.interior &&
-                       fresh_copy.trace == accepted.trace,
-                   "retained_old_and_candidate_handles_fail_stale") && passed;
+    StateCoordinates stale_coordinates{};
+    passed = Check(outcome.committed &&
+                       !contract.CopyPublished(old, stale_copy) &&
+                       !contract.PublishedCoordinates(old, stale_coordinates) &&
+                       !contract.StoreCandidate(*candidate, OtherSlot()) &&
+                       CopyPublished(contract, fresh_copy) &&
+                       fresh_copy.interior == AcceptedSlot().interior &&
+                       fresh_copy.trace == AcceptedSlot().trace,
+                   "retained_candidate_and_published_capabilities_go_stale") &&
+        passed;
+    Contract other = MakeContract();
+    passed = Check(!other.CopyPublished(old, stale_copy) &&
+                       !other.StoreCandidate(*candidate, OtherSlot()),
+                   "capabilities_reject_different_live_owner") && passed;
+  }
+  {
+    BackingContract contract = MakeBackingContract();
+    const auto published_before = contract.Published();
+    BackingSlot committed_before{{91, 0.0}, {92, 0.0}};
+    StateCoordinates coordinates_before{};
+    const bool copied_before =
+        contract.CopyPublished(published_before, committed_before) &&
+        contract.PublishedCoordinates(published_before, coordinates_before);
+    const AcceptedTelemetry accepted_before = contract.telemetry().accepted;
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const auto candidate = contract.AcquireCandidate(begin.attempt);
+    const BackingSlot value{{5, 30.0}, {6, 40.0}};
+    const bool stored = candidate && contract.StoreCandidate(*candidate, value);
+    auto products = IssueAllFor(contract, begin.attempt);
+    BackingStoragePolicy::reject_can_publish_call = 2;
+    const AttemptReport report = PassingReport(14);
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        begin.attempt, report, std::move(products));
+    BackingSlot committed_after{{93, 0.0}, {94, 0.0}};
+    const bool copied_after =
+        contract.CopyPublished(published_before, committed_after);
+    passed = Check(copied_before && stored && !outcome.committed &&
+                       outcome.reason ==
+                           FailureReason::publication_precondition &&
+                       outcome.retry_available &&
+                       BackingStoragePolicy::publish_calls == 0 && copied_after &&
+                       committed_after.interior.value ==
+                           committed_before.interior.value &&
+                       committed_after.trace.value ==
+                           committed_before.trace.value &&
+                       SameCoordinates(contract.coordinates(),
+                                       coordinates_before) &&
+                       SameAccepted(contract.telemetry().accepted,
+                                    accepted_before) &&
+                       SameTransfers(contract.telemetry().rolled_back_transfers,
+                                     report.telemetry.transfers) &&
+                       contract.telemetry().committed_transfers
+                               .host_to_device_bytes == 0,
+                   "malicious_publish_rejected_before_any_mutation") && passed;
   }
   return passed;
 }
 
-bool CheckIssuedProductProtocol()
+bool CheckProductProtocolAndIncarnationABA()
 {
   bool passed = true;
   {
     Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    auto residual =
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const auto matrix =
+        contract.IssueProduct<DerivedProductKind::matrix>(begin.attempt);
+    const auto residual =
         contract.IssueProduct<DerivedProductKind::residual>(begin.attempt);
-    auto duplicate =
+    const auto duplicate =
         contract.IssueProduct<DerivedProductKind::residual>(begin.attempt);
-    passed = Check(residual && !duplicate &&
-                       contract.telemetry().duplicate_product_issues_rejected ==
-                           1,
-                   "duplicate_product_issuance_rejected") && passed;
+    passed = Check(!matrix && residual && !duplicate &&
+                       contract.telemetry()
+                               .out_of_order_product_issues_rejected == 1 &&
+                       contract.telemetry()
+                               .duplicate_product_issues_rejected == 1,
+                   "product_issuance_order_and_duplicates_rejected") && passed;
   }
 
   for (std::size_t missing = 0; missing < 4; ++missing)
   {
     Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
     auto products = IssueAll(contract, begin.attempt);
     if (missing == 0) { products.residual.reset(); }
     if (missing == 1) { products.matrix.reset(); }
@@ -740,7 +1224,7 @@ bool CheckIssuedProductProtocol()
         begin.attempt, PassingReport(12), std::move(products));
     passed = Check(!outcome.committed && outcome.retry_available &&
                        outcome.reason == FailureReason::missing_product,
-                   "each_missing_required_product_rejected") && passed;
+                   "each_absent_required_product_is_missing") && passed;
   }
 
   {
@@ -755,52 +1239,212 @@ bool CheckIssuedProductProtocol()
         destination_begin.attempt, PassingReport(12), std::move(foreign));
     passed = Check(!outcome.committed &&
                        outcome.reason == FailureReason::invalid_product,
-                   "cross_contract_forged_products_rejected") && passed;
+                   "foreign_full_bundle_is_invalid_not_missing") && passed;
   }
-
   {
     Contract contract = MakeContract();
-    const BeginOutcome first = contract.BeginStep({InteriorSpace::l2, 0.125});
-    auto stale_products = IssueAll(contract, first.attempt);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto stale = IssueAll(contract, begin.attempt);
     Contract::ProductBundle missing{};
-    const AttemptOutcome first_failure = contract.FinishAttempt(
-        first.attempt, PassingReport(12), std::move(missing));
+    const AttemptOutcome first = contract.FinishAttempt(
+        begin.attempt, PassingReport(12), std::move(missing));
     const BeginOutcome retry = contract.Retry();
-    const AttemptOutcome stale = contract.FinishAttempt(
-        retry.attempt, PassingReport(12), std::move(stale_products));
-    passed = Check(first_failure.retry_available && retry.started &&
-                       !stale.committed &&
-                       stale.reason == FailureReason::stale_product,
-                   "stale_attempt_products_rejected") && passed;
+    const AttemptOutcome second = contract.FinishAttempt(
+        retry.attempt, PassingReport(12), std::move(stale));
+    passed = Check(first.retry_available && retry.started &&
+                       !second.committed &&
+                       second.reason == FailureReason::stale_product,
+                   "prior_attempt_full_bundle_is_stale_not_missing") && passed;
+  }
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto products = IssueAll(contract, begin.attempt);
+    AttemptReport failed = PassingReport(12);
+    failed.gates.finite = false;
+    const AttemptOutcome first = contract.FinishAttempt(
+        begin.attempt, failed, std::move(products));
+    Contract::ProductBundle duplicate_use{};
+    const std::uint64_t rollbacks = contract.telemetry().rollbacks;
+    const AttemptOutcome duplicate = contract.FinishAttempt(
+        begin.attempt, failed, std::move(duplicate_use));
+    passed = Check(first.retry_available && !duplicate.committed &&
+                       duplicate.reason == FailureReason::stale_attempt &&
+                       duplicate.status == RunStatus::retry_available &&
+                       duplicate.retry_available &&
+                       contract.telemetry().rollbacks == rollbacks,
+                   "duplicate_finish_is_stale_and_retry_consistent") && passed;
   }
 
   {
-    Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    auto products = IssueAll(contract, begin.attempt);
-    const AttemptOutcome committed = contract.FinishAttempt(
-        begin.attempt, PassingReport(12), std::move(products));
-    const AttemptOutcome duplicate_use = contract.FinishAttempt(
-        begin.attempt, PassingReport(12), std::move(products));
-    passed = Check(committed.committed && !duplicate_use.committed &&
-                       duplicate_use.reason == FailureReason::stale_attempt &&
-                       contract.telemetry().commits == 1,
-                   "duplicate_product_use_cannot_recommit") && passed;
+    alignas(Contract) std::array<unsigned char, sizeof(Contract)> storage{};
+    ArrayStoragePolicy::Reset();
+    TestCollectivePolicy::Reset();
+    Contract* first = new (storage.data()) Contract{
+        CommittedSlot(), ScratchSlot(), InitialCoordinates(), Resources()};
+    const auto old_published = first->Published();
+    const BeginOutcome first_begin =
+        first->BeginStep({InteriorSpace::l2, 0.125});
+    const auto old_candidate = first->AcquireCandidate(first_begin.attempt);
+    auto old_products = IssueAll(*first, first_begin.attempt);
+    first->~Contract();
+
+    ArrayStoragePolicy::Reset();
+    TestCollectivePolicy::Reset();
+    Contract* second = new (storage.data()) Contract{
+        CommittedSlot(), ScratchSlot(), InitialCoordinates(), Resources()};
+    const BeginOutcome second_begin =
+        second->BeginStep({InteriorSpace::l2, 0.125});
+    Slot copy{};
+    const bool old_candidate_rejected =
+        old_candidate && !second->StoreCandidate(*old_candidate, AcceptedSlot());
+    const bool old_published_rejected =
+        !second->CopyPublished(old_published, copy);
+    const AttemptOutcome outcome = second->FinishAttempt(
+        second_begin.attempt, PassingReport(12), std::move(old_products));
+    passed = Check(old_candidate_rejected && old_published_rejected &&
+                       !outcome.committed &&
+                       outcome.reason == FailureReason::invalid_product,
+                   "same_address_reconstruction_rejects_all_old_capabilities") &&
+        passed;
+    second->~Contract();
   }
   return passed;
 }
 
-bool CheckResidualOriginAndTransferGates()
+enum class RetryFailureCase : unsigned char
+{
+  local_gate,
+  remote_gate,
+  product,
+  backend,
+  collective
+};
+
+bool CheckFirstFailureAcrossSuccessfulRetry()
 {
   bool passed = true;
-  const std::array<double, 3> rejected{{
-      std::numeric_limits<double>::quiet_NaN(),
-      std::numeric_limits<double>::infinity(),
-      1.0001e-10}};
-  for (const double residual : rejected)
+  const std::array<RetryFailureCase, 5> cases{{
+      RetryFailureCase::local_gate,
+      RetryFailureCase::remote_gate,
+      RetryFailureCase::product,
+      RetryFailureCase::backend,
+      RetryFailureCase::collective}};
+  for (const RetryFailureCase failure_case : cases)
   {
     Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidate(contract, begin.attempt, OtherSlot());
+    auto products = IssueAll(contract, begin.attempt);
+    AttemptReport report = PassingReport(12);
+    FailureReason expected = FailureReason::none;
+    if (failure_case == RetryFailureCase::local_gate)
+    {
+      report.gates.finite = false;
+      expected = FailureReason::finite_gate;
+    }
+    else if (failure_case == RetryFailureCase::remote_gate)
+    {
+      TestCollectivePolicy::fault = CollectiveFault::finish_remote_failure;
+      TestCollectivePolicy::remote_reason = FailureReason::admissibility_gate;
+      expected = FailureReason::admissibility_gate;
+    }
+    else if (failure_case == RetryFailureCase::product)
+    {
+      products.solution.reset();
+      expected = FailureReason::missing_product;
+    }
+    else if (failure_case == RetryFailureCase::backend)
+    {
+      report.originating_failure = FailureReason::backend_failure;
+      expected = FailureReason::backend_failure;
+    }
+    else
+    {
+      TestCollectivePolicy::fault = CollectiveFault::finish_identity_false;
+      expected = FailureReason::collective_protocol;
+    }
+    const AttemptOutcome failed = contract.FinishAttempt(
+        begin.attempt, report, std::move(products));
+    TestCollectivePolicy::fault = CollectiveFault::none;
+    const BeginOutcome retry = contract.Retry();
+    const auto retry_candidate = contract.AcquireCandidate(retry.attempt);
+    Slot retry_base{};
+    const bool retry_reuses_committed = retry_candidate &&
+        contract.CopyCandidate(*retry_candidate, retry_base) &&
+        retry_base.interior == CommittedSlot().interior &&
+        retry_base.trace == CommittedSlot().trace;
+    const bool stored = StoreCandidate(contract, retry.attempt, AcceptedSlot());
+    auto retry_products = IssueAll(contract, retry.attempt);
+    const AttemptOutcome accepted = contract.FinishAttempt(
+        retry.attempt, PassingReport(13), std::move(retry_products));
+    const StateCoordinates expected_coordinates{1.125, 5, 8, 13, 0.125};
+    Slot published{};
+    passed = Check(failed.retry_available && failed.reason == expected &&
+                       retry.started && stored && accepted.committed &&
+                       retry_reuses_committed &&
+                       contract.telemetry().first_failure == expected &&
+                       contract.telemetry().attempts_started == 2 &&
+                       contract.telemetry().rollbacks == 1 &&
+                       contract.telemetry().commits == 1 &&
+                       SameCoordinates(contract.coordinates(),
+                                       expected_coordinates) &&
+                       CopyPublished(contract, published) &&
+                       published.interior == AcceptedSlot().interior,
+                   "first_resolved_failure_survives_successful_retry") && passed;
+  }
+
+  for (const FailureReason remote : {
+           FailureReason::invalid_product, FailureReason::backend_failure})
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto products = IssueAll(contract, begin.attempt);
+    TestCollectivePolicy::fault = CollectiveFault::finish_remote_failure;
+    TestCollectivePolicy::remote_reason = remote;
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        begin.attempt, PassingReport(12), std::move(products));
+    passed = Check(!outcome.committed && outcome.reason == remote &&
+                       TestCollectivePolicy::reductions == 1,
+                   "one_rank_product_or_backend_failure_reduces_truth") && passed;
+  }
+  return passed;
+}
+
+bool CheckResidualTelemetryAndCollectiveTruth()
+{
+  bool passed = true;
+  for (const double residual : {0.0, Contract::true_relative_residual_limit})
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidate(contract, begin.attempt, AcceptedSlot());
+    auto products = IssueAll(contract, begin.attempt);
+    AttemptReport report = PassingReport(12);
+    report.telemetry.true_relative_residual = residual;
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        begin.attempt, report, std::move(products));
+    passed = Check(outcome.committed,
+                   "closed_nonnegative_true_residual_domain_accepts_bounds") &&
+        passed;
+  }
+
+  const std::array<double, 5> invalid_residuals{{
+      -1.0e-12,
+      -std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(),
+      Contract::true_relative_residual_limit * 1.01}};
+  for (const double residual : invalid_residuals)
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
     auto products = IssueAll(contract, begin.attempt);
     AttemptReport report = PassingReport(12);
     report.telemetry.true_relative_residual = residual;
@@ -808,82 +1452,151 @@ bool CheckResidualOriginAndTransferGates()
         begin.attempt, report, std::move(products));
     passed = Check(!outcome.committed &&
                        outcome.reason == FailureReason::true_residual_gate,
-                   "nonfinite_or_above_limit_true_residual_rejected") && passed;
-  }
-  {
-    Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    auto products = IssueAll(contract, begin.attempt);
-    AttemptReport report = PassingReport(12);
-    report.telemetry.true_relative_residual = 1.0e-10;
-    const AttemptOutcome outcome = contract.FinishAttempt(
-        begin.attempt, report, std::move(products));
-    passed = Check(outcome.committed,
-                   "exact_frozen_true_residual_limit_admitted") && passed;
-  }
-  {
-    Contract contract = MakeContract();
-    BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    auto products = IssueAll(contract, begin.attempt);
-    AttemptReport report = PassingReport(12);
-    report.originating_failure = FailureReason::backend_failure;
-    const AttemptOutcome failed = contract.FinishAttempt(
-        begin.attempt, report, std::move(products));
-    const AttemptOutcome stale_duplicate = contract.FinishAttempt(
-        begin.attempt, report, Contract::ProductBundle{});
-    const BeginOutcome retry = contract.Retry();
-    auto retry_products = IssueAll(contract, retry.attempt);
-    const AttemptOutcome committed = contract.FinishAttempt(
-        retry.attempt, PassingReport(13), std::move(retry_products));
-    passed = Check(!failed.committed && failed.retry_available &&
-                       failed.reason == FailureReason::backend_failure &&
-                       stale_duplicate.status == RunStatus::retry_available &&
-                       stale_duplicate.retry_available &&
-                       stale_duplicate.reason == FailureReason::stale_attempt &&
-                       retry.started && committed.committed &&
-                       contract.telemetry().first_originating_failure ==
-                           FailureReason::backend_failure,
-                   "originating_failure_and_retry_state_preserved") && passed;
-  }
-  {
-    Contract contract = MakeContract();
-    BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    auto products = IssueAll(contract, begin.attempt);
-    AttemptReport huge = PassingReport(12);
-    huge.telemetry.transfers.host_to_device_bytes =
-        std::numeric_limits<std::uint64_t>::max();
-    const AttemptOutcome first = contract.FinishAttempt(
-        begin.attempt, huge, std::move(products));
-    begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    products = IssueAll(contract, begin.attempt);
-    AttemptReport overflow = PassingReport(13);
-    overflow.telemetry.transfers.host_to_device_bytes = 1;
-    const AttemptOutcome second = contract.FinishAttempt(
-        begin.attempt, overflow, std::move(products));
-    passed = Check(first.committed && !second.committed &&
-                       second.reason == FailureReason::telemetry_gate &&
-                       !contract.telemetry().attempted_transfers.complete &&
-                       contract.telemetry().attempted_transfers
-                               .host_to_device_bytes ==
-                           std::numeric_limits<std::uint64_t>::max(),
-                   "transfer_overflow_marks_accounting_inexact") && passed;
-  }
-  {
-    Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    auto products = IssueAll(contract, begin.attempt);
-    AttemptReport report = PassingReport(12);
-    report.telemetry.prohibited = {1, 1, 1, 1, 1};
-    const AttemptOutcome outcome = contract.FinishAttempt(
-        begin.attempt, report, std::move(products));
-    passed = Check(!outcome.committed &&
-                       outcome.reason == FailureReason::telemetry_gate,
-                   "dt_change_clipping_substitution_fallback_insertion_forbidden") &&
+                   "negative_nonfinite_or_above_limit_residual_rejected") &&
         passed;
   }
   {
     Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto products = IssueAll(contract, begin.attempt);
+    AttemptReport report = PassingReport(12);
+    report.gates.true_residual = false;
+    report.telemetry.true_relative_residual = 0.0;
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        begin.attempt, report, std::move(products));
+    passed = Check(!outcome.committed &&
+                       outcome.reason == FailureReason::true_residual_gate,
+                   "oracle_true_residual_gate_is_still_required") && passed;
+  }
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto products = IssueAll(contract, begin.attempt);
+    AttemptReport first = PassingReport(12);
+    first.gates.finite = false;
+    first.telemetry.transfers.host_to_device_bytes =
+        std::numeric_limits<std::uint64_t>::max();
+    const bool boundary_fits =
+        contract.CanAccountAttemptTransfers(first.telemetry.transfers);
+    const AttemptOutcome failed = contract.FinishAttempt(
+        begin.attempt, first, std::move(products));
+    const BeginOutcome retry = contract.Retry();
+    auto retry_products = IssueAll(contract, retry.attempt);
+    AttemptReport overflow = PassingReport(12);
+    overflow.telemetry.transfers = {1, 0, 0, 0, 0, true};
+    const bool overflow_preflight =
+        contract.CanAccountAttemptTransfers(overflow.telemetry.transfers);
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        retry.attempt, overflow, std::move(retry_products));
+    const BeginOutcome exhausted = contract.Retry();
+    passed = Check(boundary_fits && failed.retry_available && retry.started &&
+                       !overflow_preflight &&
+                       !outcome.committed &&
+                       outcome.reason == FailureReason::telemetry_gate &&
+                       !exhausted.started &&
+                       exhausted.reason == FailureReason::retry_exhausted &&
+                       contract.telemetry().attempted_transfers
+                               .host_to_device_bytes ==
+                           std::numeric_limits<std::uint64_t>::max() &&
+                       contract.telemetry().rolled_back_transfers
+                               .host_to_device_bytes ==
+                           std::numeric_limits<std::uint64_t>::max() &&
+                       contract.telemetry().attempted_transfers.complete &&
+                       contract.telemetry().rolled_back_transfers.complete &&
+                       contract.telemetry()
+                               .transfer_accounting_overflow_rejections == 1 &&
+                       ArrayStoragePolicy::publications == 0,
+                   "transfer_overflow_preflight_rejects_without_saturation") &&
+        passed;
+  }
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto products = IssueAll(contract, begin.attempt);
+    AttemptReport report = PassingReport(12);
+    report.originating_failure = FailureReason::backend_failure;
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        begin.attempt, report, std::move(products));
+    passed = Check(!outcome.committed &&
+                       outcome.reason == FailureReason::backend_failure &&
+                       report.gates.All(),
+                   "non_none_origin_fails_closed_with_all_booleans_true") &&
+        passed;
+  }
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome first_begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidate(contract, first_begin.attempt, AcceptedSlot());
+    auto first_products = IssueAll(contract, first_begin.attempt);
+    const AttemptOutcome first = contract.FinishAttempt(
+        first_begin.attempt, PassingReport(20), std::move(first_products));
+    const AcceptedTelemetry accepted_before = contract.telemetry().accepted;
+    const StateCoordinates coordinates_before = contract.coordinates();
+    Slot published_before{};
+    const bool captured = CopyPublished(contract, published_before);
+    const BeginOutcome second_begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidate(contract, second_begin.attempt, OtherSlot());
+    auto second_products = IssueAll(contract, second_begin.attempt);
+    AttemptReport failure = PassingReport(21);
+    failure.gates.recovery = false;
+    const AttemptOutcome second = contract.FinishAttempt(
+        second_begin.attempt, failure, std::move(second_products));
+    Slot published_after{};
+    passed = Check(first.committed && captured && !second.committed &&
+                       second.retry_available &&
+                       SameCoordinates(contract.coordinates(),
+                                       coordinates_before) &&
+                       SameAccepted(contract.telemetry().accepted,
+                                    accepted_before) &&
+                       CopyPublished(contract, published_after) &&
+                       published_after.interior == published_before.interior &&
+                       published_after.trace == published_before.trace,
+                   "failed_later_attempt_preserves_last_accepted_publication") &&
+        passed;
+  }
+
+  for (const int prohibited_field : {0, 1, 2, 3, 4})
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto products = IssueAll(contract, begin.attempt);
+    AttemptReport report = PassingReport(12);
+    if (prohibited_field == 0)
+    {
+      report.telemetry.prohibited.dt_change_events = 1;
+    }
+    else if (prohibited_field == 1)
+    {
+      report.telemetry.prohibited.clipping_events = 1;
+    }
+    else if (prohibited_field == 2)
+    {
+      report.telemetry.prohibited.solver_substitution_events = 1;
+    }
+    else if (prohibited_field == 3)
+    {
+      report.telemetry.prohibited.fallback_events = 1;
+    }
+    else
+    {
+      report.telemetry.prohibited.hidden_insertion_events = 1;
+    }
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        begin.attempt, report, std::move(products));
+    passed = Check(!outcome.committed &&
+                       outcome.reason == FailureReason::telemetry_gate,
+                   "prohibited_recovery_actions_fail_telemetry_gate") && passed;
+  }
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
     auto products = IssueAll(contract, begin.attempt);
     AttemptReport report = PassingReport(12);
     report.telemetry.transfers.allocation_events = 1;
@@ -893,401 +1606,583 @@ bool CheckResidualOriginAndTransferGates()
                        outcome.reason == FailureReason::telemetry_gate,
                    "persistent_run_rejects_per_step_allocation") && passed;
   }
+
+  const std::array<CollectiveFault, 17> identity_faults{{
+      CollectiveFault::finish_identity_false,
+      CollectiveFault::finish_failure_consistency_false,
+      CollectiveFault::finish_participants,
+      CollectiveFault::finish_attempt,
+      CollectiveFault::finish_committed_time,
+      CollectiveFault::finish_committed_step,
+      CollectiveFault::finish_committed_generation,
+      CollectiveFault::finish_committed_cursor,
+      CollectiveFault::finish_committed_dt,
+      CollectiveFault::finish_target_time,
+      CollectiveFault::finish_target_step,
+      CollectiveFault::finish_target_generation,
+      CollectiveFault::finish_target_cursor,
+      CollectiveFault::finish_target_dt,
+      CollectiveFault::finish_candidate_cursor,
+      CollectiveFault::finish_hide_local_failure,
+      CollectiveFault::finish_change_local_failure}};
+  for (const CollectiveFault fault : identity_faults)
   {
     Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
     auto products = IssueAll(contract, begin.attempt);
     AttemptReport report = PassingReport(12);
-    report.telemetry.transfers.complete = false;
+    if (fault == CollectiveFault::finish_hide_local_failure ||
+        fault == CollectiveFault::finish_change_local_failure)
+    {
+      report.gates.finite = false;
+    }
+    TestCollectivePolicy::fault = fault;
     const AttemptOutcome outcome = contract.FinishAttempt(
         begin.attempt, report, std::move(products));
     passed = Check(!outcome.committed &&
-                       outcome.reason == FailureReason::telemetry_gate &&
-                       !contract.telemetry().attempted_transfers.complete &&
-                       !contract.telemetry().rolled_back_transfers.complete,
-                   "incomplete_transfer_accounting_stays_incomplete") && passed;
+                       outcome.reason == FailureReason::collective_protocol,
+                   "complete_finish_context_census_and_truth_are_reduced") &&
+        passed;
   }
   return passed;
 }
 
-bool CheckCollectiveIdentityAndRemoteGates()
+StateHash FrozenAcceptedInteriorHash()
 {
-  struct Case
-  {
-    CollectiveFault fault;
-    FailureReason expected;
-  };
-  const std::array<Case, 19> cases{{
-      {CollectiveFault::finish_attempt, FailureReason::collective_identity},
-      {CollectiveFault::finish_committed_time,
-       FailureReason::collective_identity},
-      {CollectiveFault::finish_committed_step,
-       FailureReason::collective_identity},
-      {CollectiveFault::finish_committed_generation,
-       FailureReason::collective_identity},
-      {CollectiveFault::finish_committed_cursor,
-       FailureReason::collective_identity},
-      {CollectiveFault::finish_committed_dt,
-       FailureReason::collective_identity},
-      {CollectiveFault::finish_target_time, FailureReason::collective_identity},
-      {CollectiveFault::finish_target_step, FailureReason::collective_identity},
-      {CollectiveFault::finish_target_generation,
-       FailureReason::collective_identity},
-      {CollectiveFault::finish_target_cursor,
-       FailureReason::collective_identity},
-      {CollectiveFault::finish_target_dt, FailureReason::collective_identity},
-      {CollectiveFault::finish_candidate_cursor,
-       FailureReason::collective_identity},
-      {CollectiveFault::finish_participants,
-       FailureReason::collective_identity},
-      {CollectiveFault::remote_finite, FailureReason::finite_gate},
-      {CollectiveFault::remote_admissible,
-       FailureReason::admissibility_gate},
-      {CollectiveFault::remote_recovery, FailureReason::recovery_gate},
-      {CollectiveFault::remote_true_residual,
-       FailureReason::true_residual_gate},
-      {CollectiveFault::remote_telemetry, FailureReason::telemetry_gate},
-      {CollectiveFault::remote_success, FailureReason::success_gate}}};
+  StateHash hash{};
+  hash.bytes = {{33, 37, 41, 45, 37, 41, 45, 49,
+                 41, 45, 49, 53, 45, 49, 53, 57,
+                 49, 53, 57, 61, 53, 57, 61, 65,
+                 57, 61, 65, 69, 61, 65, 69, 73}};
+  return hash;
+}
 
+StateHash FrozenAcceptedTraceHash()
+{
+  StateHash hash{};
+  hash.bytes = {{145, 149, 153, 148, 152, 156, 151, 155,
+                 159, 154, 158, 162, 157, 161, 165, 160,
+                 164, 168, 163, 167, 171, 166, 170, 174,
+                 169, 173, 177, 172, 176, 180, 175, 179}};
+  return hash;
+}
+
+bool CreateCheckpoint(CheckpointDescriptor& checkpoint,
+                      Slot& accepted_state)
+{
+  Contract contract = MakeContract();
+  const BeginOutcome begin =
+      contract.BeginStep({InteriorSpace::l2, 0.125});
+  accepted_state = AcceptedSlot();
+  if (!StoreCandidate(contract, begin.attempt, accepted_state)) { return false; }
+  auto products = IssueAll(contract, begin.attempt);
+  const AttemptOutcome outcome = contract.FinishAttempt(
+      begin.attempt, PassingReport(44), std::move(products));
+  return outcome.committed && contract.TryMakeCheckpoint(checkpoint);
+}
+
+template <typename Mutator>
+bool ExpectRestoreFailure(const CheckpointDescriptor& original,
+                          const Slot& loaded,
+                          const RestartCompatibility expected,
+                          Mutator mutate,
+                          const char* requirement)
+{
+  CheckpointDescriptor changed = original;
+  mutate(changed);
+  Contract contract = MakeContract();
+  const auto published = contract.Published();
+  Slot before{};
+  StateCoordinates coordinates_before{};
+  const bool captured = contract.CopyPublished(published, before) &&
+      contract.PublishedCoordinates(published, coordinates_before);
+  const AcceptedTelemetry accepted_before = contract.telemetry().accepted;
+  const RestoreOutcome outcome = contract.Restore(changed, loaded);
+  Slot after{};
+  const bool preserved = contract.CopyPublished(published, after);
+  return Check(captured && !outcome.restored &&
+                   outcome.compatibility == expected && preserved &&
+                   before.interior == after.interior &&
+                   before.trace == after.trace &&
+                   SameCoordinates(contract.coordinates(), coordinates_before) &&
+                   SameAccepted(contract.telemetry().accepted,
+                                accepted_before) &&
+                   TestCollectivePolicy::restores == 1,
+               requirement);
+}
+
+bool CheckAtomicCheckpointRestore()
+{
   bool passed = true;
-  for (const Case& test_case : cases)
   {
     Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    auto products = IssueAll(contract, begin.attempt);
-    TestCollectivePolicy::fault = test_case.fault;
-    const AttemptOutcome outcome = contract.FinishAttempt(
-        begin.attempt, PassingReport(12), std::move(products));
-    passed = Check(begin.started && !outcome.committed &&
-                       outcome.reason == test_case.expected &&
-                       contract.coordinates() == InitialCoordinates() &&
-                       TestCollectivePolicy::reductions == 1,
-                   "independent_collective_context_or_gate_mismatch") && passed;
+    CheckpointDescriptor checkpoint{};
+    passed = Check(!contract.TryMakeCheckpoint(checkpoint),
+                   "checkpoint_requires_successful_committed_state") && passed;
   }
-  return passed;
-}
 
-bool CheckAtomicRetryCommitAndTelemetry()
-{
-  Contract contract = MakeContract();
-  const Slot original = CommittedSlot();
-  const StateCoordinates initial = contract.coordinates();
-  const BeginOutcome first = contract.BeginStep({InteriorSpace::l2, 0.125});
-  auto first_handle = contract.AcquireCandidate(first.attempt);
-  const Slot rejected{{{11.0, 12.0, 13.0, 14.0}}, {{15.0, 16.0, 17.0}}};
-  bool passed = Check(first.started && first_handle &&
-                          first_handle->Mutate(
-                              [&rejected](Slot& slot) noexcept {
-                                slot = rejected;
-                              }),
-                      "first_candidate_prepared") ;
-  auto products = IssueAll(contract, first.attempt);
-  AttemptReport failed_report = PassingReport(99);
-  failed_report.gates.finite = false;
-  failed_report.telemetry.transfers = {10, 20, 3, 0, 1, true};
-  const AttemptOutcome failed = contract.FinishAttempt(
-      first.attempt, failed_report, std::move(products));
-  Slot published{};
-  passed = Check(!failed.committed && failed.retry_available &&
-                     CopyPublished(contract, published) &&
-                     published.interior == original.interior &&
-                     published.trace == original.trace &&
-                     contract.coordinates() == initial &&
-                     !first_handle->Mutate([](Slot& slot) noexcept {
-                       slot.interior.fill(1000.0);
-                     }),
-                 "failed_attempt_discards_private_candidate") && passed;
-
-  const BeginOutcome retry = contract.Retry();
-  Slot retry_copy{};
-  auto retry_handle = contract.AcquireCandidate(retry.attempt);
-  passed = Check(retry.started && retry.attempt.retry_index == 1 &&
-                     retry.attempt.committed_step == first.attempt.committed_step &&
-                     retry.attempt.committed_generation ==
-                         first.attempt.committed_generation &&
-                     retry.attempt.dt == first.attempt.dt && retry_handle &&
-                     retry_handle->Copy(retry_copy) &&
-                     retry_copy.interior == original.interior &&
-                     retry_copy.trace == original.trace,
-                 "retry_uses_identical_commit_and_dt") && passed;
-
-  const Slot accepted{{{21.0, 22.0, 23.0, 24.0}}, {{25.0, 26.0, 27.0}}};
-  if (retry_handle)
-  {
-    passed = Check(retry_handle->Mutate(
-                       [&accepted](Slot& slot) noexcept { slot = accepted; }),
-                   "retry_candidate_mutated") && passed;
-  }
-  products = IssueAll(contract, retry.attempt);
-  const AttemptOutcome committed = contract.FinishAttempt(
-      retry.attempt, PassingReport(11), std::move(products));
-  const StateCoordinates expected{1.125, 5, 8, 11, 0.125};
-  Slot final_state{};
-  passed = Check(committed.committed && CopyPublished(contract, final_state) &&
-                     final_state.interior == accepted.interior &&
-                     final_state.trace == accepted.trace &&
-                     contract.coordinates() == expected &&
-                     contract.telemetry().admissions_started == 2 &&
-                     contract.telemetry().attempts_started == 2 &&
-                     contract.telemetry().attempts_failed == 1 &&
-                     contract.telemetry().rollbacks == 1 &&
-                     contract.telemetry().retries_started == 1 &&
-                     contract.telemetry().commits == 1 &&
-                     contract.telemetry().accepted.valid &&
-                     contract.telemetry().accepted.coordinates == expected &&
-                     contract.telemetry().accepted.attempt
-                             .validated_product_mask == 0x0fU,
-                 "atomic_retry_commit_and_separated_telemetry") && passed;
-  const BeginOutcome second_retry = contract.Retry();
-  passed = Check(!second_retry.started &&
-                     second_retry.reason == FailureReason::retry_exhausted,
-                 "at_most_one_retry") && passed;
-  return passed;
-}
-
-StateHash FrozenInteriorHash()
-{
-  return {{{41, 43, 45, 47, 45, 47, 49, 51,
-            49, 51, 53, 55, 53, 55, 57, 59,
-            57, 59, 61, 63, 61, 63, 65, 67,
-            65, 67, 69, 71, 69, 71, 73, 75}}};
-}
-
-StateHash FrozenTraceHash()
-{
-  return {{{145, 147, 149, 148, 150, 152, 151, 153,
-            155, 154, 156, 158, 157, 159, 161, 160,
-            162, 164, 163, 165, 167, 166, 168, 170,
-            169, 171, 173, 172, 174, 176, 175, 177}}};
-}
-
-bool CheckCheckpointSchemaAndIntegrity()
-{
-  Contract contract = MakeContract();
   CheckpointDescriptor checkpoint{};
-  bool passed = Check(!contract.TryMakeCheckpoint(checkpoint),
-                      "checkpoint_requires_successful_commit");
-  const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-  passed = Check(!contract.TryMakeCheckpoint(checkpoint),
-                 "checkpoint_rejects_active_candidate") && passed;
-  const Slot accepted{{{41.0, 42.0, 43.0, 44.0}}, {{45.0, 46.0, 47.0}}};
-  passed = Check(MutateCandidate(contract, begin.attempt, accepted),
-                 "checkpoint_candidate_mutated") && passed;
-  auto products = IssueAll(contract, begin.attempt);
-  const AttemptOutcome committed = contract.FinishAttempt(
-      begin.attempt, PassingReport(77), std::move(products));
-  passed = Check(committed.committed && contract.TryMakeCheckpoint(checkpoint) &&
-                     checkpoint.schema_version == checkpoint_schema_version &&
+  Slot loaded{};
+  passed = Check(CreateCheckpoint(checkpoint, loaded),
+                 "checkpoint_source_commit_created") && passed;
+  passed = Check(checkpoint.schema_version == checkpoint_schema_version &&
                      checkpoint.successful_commit &&
+                     checkpoint.restart_mode ==
+                         RestartMode::same_backend_rank_partition &&
+                     checkpoint.cursor == 44 && checkpoint.dt == 0.125 &&
+                     checkpoint.mfem_pin == Resources().mfem_pin &&
+                     checkpoint.mesh_hash == Resources().mesh_hash &&
+                     checkpoint.partition_hash == Resources().partition_hash &&
                      checkpoint.topology_hash == Resources().topology_hash &&
-                     checkpoint.cursor == checkpoint.coordinates.cursor &&
-                     checkpoint.dt == checkpoint.coordinates.dt &&
-                     checkpoint.interior_hash == FrozenInteriorHash() &&
-                     checkpoint.trace_hash == FrozenTraceHash(),
-                 "versioned_checkpoint_matches_independent_frozen_hashes") &&
+                     checkpoint.rank_count == Resources().rank_count &&
+                     checkpoint.polynomial_order ==
+                         Resources().polynomial_order &&
+                     checkpoint.layout == Resources().layout &&
+                     checkpoint.precision == Selection::Descriptor().precision &&
+                     checkpoint.interior_hash ==
+                         FrozenAcceptedInteriorHash() &&
+                     checkpoint.trace_hash == FrozenAcceptedTraceHash() &&
+                     checkpoint.coordinate_fingerprint ==
+                         FrozenCoordinateFingerprint(checkpoint.coordinates),
+                 "checkpoint_exact_tuple_topology_coordinates_and_frozen_hashes") &&
       passed;
-  passed = Check(contract.CheckRestart(
-                         checkpoint, accepted.interior, accepted.trace) ==
-                     RestartCompatibility::compatible,
-                 "same_backend_rank_partition_restart_integrity") && passed;
 
-  CheckpointDescriptor changed = checkpoint;
-  changed.schema_version = checkpoint_schema_version + 1;
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::schema_mismatch,
-                 "restart_schema_mismatch") && passed;
-
-  const std::array<int, 5> coordinate_fields{{0, 1, 2, 3, 4}};
-  for (const int field : coordinate_fields)
-  {
-    changed = checkpoint;
-    if (field == 0) { changed.coordinates.time += 1.0; }
-    if (field == 1) { ++changed.coordinates.step; }
-    if (field == 2) { ++changed.coordinates.generation; }
-    if (field == 3) { ++changed.coordinates.cursor; }
-    if (field == 4) { changed.coordinates.dt += 1.0; }
-    passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                         accepted.trace) ==
-                       RestartCompatibility::coordinate_mismatch,
-                   "restart_each_coordinate_field_mismatch") && passed;
-  }
-
-  changed = checkpoint;
-  ++changed.cursor;
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::cursor_mismatch,
-                 "restart_cursor_mirror_mismatch") && passed;
-  changed = checkpoint;
-  changed.dt += 1.0;
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::dt_mismatch,
-                 "restart_dt_mirror_mismatch") && passed;
-  changed = checkpoint;
-  changed.topology_hash = Digest(31);
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::topology_mismatch,
-                 "restart_topology_mismatch") && passed;
-  changed = checkpoint;
-  changed.tuple.backend = StableIdentity{"cuda.rank1"};
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::backend_mismatch,
-                 "restart_backend_mismatch") && passed;
-  changed = checkpoint;
-  changed.tuple.formulation = StableIdentity{"igr.scalar"};
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::tuple_mismatch,
-                 "restart_tuple_mismatch") && passed;
-  changed = checkpoint;
-  changed.mfem_pin = StableIdentity{"different"};
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::mfem_pin_mismatch,
-                 "restart_mfem_mismatch") && passed;
-  changed = checkpoint;
-  changed.rank_count = 2;
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::rank_count_mismatch,
-                 "restart_rank_mismatch") && passed;
-  changed = checkpoint;
-  changed.partition_hash = Digest(21);
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::partition_mismatch,
-                 "restart_partition_mismatch") && passed;
-  changed = checkpoint;
-  changed.mesh_hash = Digest(11);
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::mesh_mismatch,
-                 "restart_mesh_mismatch") && passed;
-  changed = checkpoint;
-  changed.polynomial_order = 4;
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::order_mismatch,
-                 "restart_order_mismatch") && passed;
-  changed = checkpoint;
-  changed.layout = StableIdentity{"other-layout"};
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::layout_mismatch,
-                 "restart_layout_mismatch") && passed;
-  changed = checkpoint;
-  changed.precision = StableIdentity{"fp32"};
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::precision_mismatch,
-                 "restart_precision_mismatch") && passed;
-  changed = checkpoint;
-  changed.interior_hash.bytes[0] ^= 1U;
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::interior_hash_mismatch,
-                 "restart_descriptor_interior_hash_mismatch") && passed;
-  changed = checkpoint;
-  changed.trace_hash.bytes[0] ^= 1U;
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::trace_hash_mismatch,
-                 "restart_descriptor_trace_hash_mismatch") && passed;
-  Interior altered_interior = accepted.interior;
-  altered_interior[0] += 1.0;
-  passed = Check(contract.CheckRestart(checkpoint, altered_interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::interior_hash_mismatch,
-                 "restart_loaded_interior_integrity") && passed;
-  Trace altered_trace = accepted.trace;
-  altered_trace[0] += 1.0;
-  passed = Check(contract.CheckRestart(checkpoint, accepted.interior,
-                                       altered_trace) ==
-                     RestartCompatibility::trace_hash_mismatch,
-                 "restart_loaded_trace_integrity") && passed;
-  changed = checkpoint;
-  changed.successful_commit = false;
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::no_successful_commit,
-                 "restart_requires_successful_commit") && passed;
-  changed = checkpoint;
-  changed.restart_mode = static_cast<RestartMode>(255);
-  passed = Check(contract.CheckRestart(changed, accepted.interior,
-                                       accepted.trace) ==
-                     RestartCompatibility::policy_mismatch,
-                 "restart_policy_explicit") && passed;
-  return passed;
-}
-
-bool CheckAllLocalGatesAndStatePreservation()
-{
-  const std::array<FailureReason, 6> expected{{
-      FailureReason::finite_gate,
-      FailureReason::admissibility_gate,
-      FailureReason::recovery_gate,
-      FailureReason::true_residual_gate,
-      FailureReason::telemetry_gate,
-      FailureReason::success_gate}};
-  bool passed = true;
-  for (std::size_t gate = 0; gate < expected.size(); ++gate)
   {
     Contract contract = MakeContract();
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-    auto products = IssueAll(contract, begin.attempt);
-    AttemptReport report = PassingReport(12);
-    bool* gates[] = {&report.gates.finite,
-                     &report.gates.admissible,
-                     &report.gates.recovery,
-                     &report.gates.true_residual,
-                     &report.gates.telemetry,
-                     &report.gates.success};
-    *gates[gate] = false;
-    const AttemptOutcome outcome = contract.FinishAttempt(
-        begin.attempt, report, std::move(products));
-    passed = Check(!outcome.committed && outcome.reason == expected[gate] &&
-                       contract.coordinates() == InitialCoordinates(),
-                   "every_local_commit_gate_required") && passed;
+    const auto published_before = contract.Published();
+    Slot before{};
+    const bool captured = contract.CopyPublished(published_before, before);
+    TestCollectivePolicy::fault = CollectiveFault::restore_remote_failure;
+    TestCollectivePolicy::remote_compatibility =
+        RestartCompatibility::interior_hash_mismatch;
+    const RestoreOutcome failed = contract.Restore(checkpoint, AcceptedSlot());
+    Slot after{};
+    const bool preserved = contract.CopyPublished(published_before, after);
+    TestCollectivePolicy::fault = CollectiveFault::none;
+    const RestoreOutcome accepted =
+        contract.Restore(checkpoint, AcceptedSlot());
+    passed = Check(captured && !failed.restored &&
+                       failed.compatibility ==
+                           RestartCompatibility::interior_hash_mismatch &&
+                       preserved && before.interior == after.interior &&
+                       before.trace == after.trace && accepted.restored &&
+                       TestCollectivePolicy::restores == 2 &&
+                       contract.telemetry().first_failure ==
+                           FailureReason::restart_incompatible,
+                   "remote_restore_failure_is_atomic_and_persists_first_failure") &&
+        passed;
   }
 
-  Contract contract = MakeContract();
-  BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-  const Slot accepted{{{31.0, 32.0, 33.0, 34.0}}, {{35.0, 36.0, 37.0}}};
-  passed = Check(MutateCandidate(contract, begin.attempt, accepted),
-                 "accepted_candidate_mutated") && passed;
-  auto products = IssueAll(contract, begin.attempt);
-  const AttemptOutcome first = contract.FinishAttempt(
-      begin.attempt, PassingReport(14), std::move(products));
-  Slot committed_copy{};
-  contract.Published().Copy(committed_copy);
-  const auto interior_bytes = ObjectBytes(committed_copy.interior);
-  const auto trace_bytes = ObjectBytes(committed_copy.trace);
-  const StateCoordinates committed_coordinates = contract.coordinates();
+  for (const int failure_point : {0, 1})
+  {
+    Contract contract = MakeContract();
+    const auto published_before = contract.Published();
+    Slot before{};
+    const bool captured = contract.CopyPublished(published_before, before);
+    if (failure_point == 0)
+    {
+      ArrayStoragePolicy::fail_restore_call = 1;
+    }
+    else
+    {
+      ArrayStoragePolicy::fail_prepublish_call = 1;
+    }
+    const RestoreOutcome outcome = contract.Restore(checkpoint, AcceptedSlot());
+    Slot after{};
+    const RestartCompatibility expected = failure_point == 0
+        ? RestartCompatibility::candidate_preparation
+        : RestartCompatibility::publication_precondition;
+    passed = Check(captured && !outcome.restored &&
+                       outcome.compatibility == expected &&
+                       ArrayStoragePolicy::publications == 0 &&
+                       ArrayStoragePolicy::discards == 1 &&
+                       contract.CopyPublished(published_before, after) &&
+                       before.interior == after.interior &&
+                       before.trace == after.trace &&
+                       TestCollectivePolicy::restores == 1,
+                   "restore_prepare_and_publish_preflight_fail_before_mutation") &&
+        passed;
+  }
 
-  begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-  const Slot rejected{{{1000.0, 1000.0, 1000.0, 1000.0}},
-                      {{2000.0, 2000.0, 2000.0}}};
-  passed = Check(MutateCandidate(contract, begin.attempt, rejected),
-                 "rejected_candidate_mutated") && passed;
-  products = IssueAll(contract, begin.attempt);
-  AttemptReport report = PassingReport(99);
-  report.gates.recovery = false;
-  const AttemptOutcome failure = contract.FinishAttempt(
-      begin.attempt, report, std::move(products));
-  Slot after_failure{};
-  contract.Published().Copy(after_failure);
-  passed = Check(first.committed && !failure.committed &&
-                     ObjectBytes(after_failure.interior) == interior_bytes &&
-                     ObjectBytes(after_failure.trace) == trace_bytes &&
-                     contract.coordinates() == committed_coordinates &&
-                     contract.telemetry().accepted.coordinates ==
-                         committed_coordinates,
-                 "failed_attempt_preserves_committed_bytes_and_telemetry") &&
+  for (const CollectiveFault fault : {
+           CollectiveFault::restore_identity_false,
+           CollectiveFault::restore_failure_consistency_false,
+           CollectiveFault::restore_participants,
+           CollectiveFault::restore_context})
+  {
+    Contract contract = MakeContract();
+    const auto published_before = contract.Published();
+    Slot before{};
+    const bool captured = contract.CopyPublished(published_before, before);
+    TestCollectivePolicy::fault = fault;
+    const RestoreOutcome outcome = contract.Restore(checkpoint, AcceptedSlot());
+    Slot after{};
+    passed = Check(captured && !outcome.restored &&
+                       outcome.compatibility ==
+                           RestartCompatibility::collective_protocol &&
+                       contract.CopyPublished(published_before, after) &&
+                       before.interior == after.interior &&
+                       before.trace == after.trace &&
+                       contract.telemetry().first_failure ==
+                           FailureReason::collective_protocol &&
+                       TestCollectivePolicy::restores == 1,
+                   "restore_context_reason_or_census_contradiction_fails_closed") &&
+        passed;
+  }
+
+  for (const CollectiveFault fault : {
+           CollectiveFault::restore_hide_local_failure,
+           CollectiveFault::restore_change_local_failure})
+  {
+    Contract contract = MakeContract();
+    Slot corrupt = AcceptedSlot();
+    corrupt.interior[0] += 1.0;
+    TestCollectivePolicy::fault = fault;
+    TestCollectivePolicy::remote_compatibility =
+        RestartCompatibility::trace_hash_mismatch;
+    const RestoreOutcome outcome = contract.Restore(checkpoint, corrupt);
+    passed = Check(!outcome.restored &&
+                       outcome.compatibility ==
+                           RestartCompatibility::collective_protocol &&
+                       contract.telemetry().first_failure ==
+                           FailureReason::collective_protocol &&
+                       TestCollectivePolicy::restores == 1,
+                   "restore_cannot_omit_or_substitute_local_incompatibility") &&
+        passed;
+  }
+
+  {
+    StateCoordinates wrong_coordinates{8.0, 80, 90, 100, 0.5};
+    Contract restored = MakeContract(
+        wrong_coordinates, Resources(), 0, OtherSlot(), ScratchSlot());
+    const auto pre_restore = restored.Published();
+    const RestoreOutcome outcome = restored.Restore(checkpoint, loaded);
+    loaded = OtherSlot();
+    Slot published{};
+    Slot stale{};
+    const bool copied = CopyPublished(restored, published);
+    const bool stale_rejected = !restored.CopyPublished(pre_restore, stale);
+    const BeginOutcome begin =
+        restored.BeginStep({InteriorSpace::l2, checkpoint.dt});
+    const auto candidate = restored.AcquireCandidate(begin.attempt);
+    Slot candidate_copy{};
+    const bool candidate_matches = candidate &&
+        restored.CopyCandidate(*candidate, candidate_copy) &&
+        candidate_copy.interior == AcceptedSlot().interior &&
+        candidate_copy.trace == AcceptedSlot().trace;
+    passed = Check(outcome.restored && copied && stale_rejected &&
+                       published.interior == AcceptedSlot().interior &&
+                       published.trace == AcceptedSlot().trace &&
+                       SameCoordinates(restored.coordinates(),
+                                       checkpoint.coordinates) &&
+                       candidate_matches,
+                   "restore_atomically_overwrites_wrong_private_state_and_detaches_input") &&
+        passed;
+  }
+
+  Slot substituted = AcceptedSlot();
+  substituted.interior[0] += 1.0;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               substituted,
+               RestartCompatibility::interior_hash_mismatch,
+               [](CheckpointDescriptor&) {},
+               "substituted_interior_buffer_rejected_atomically") &&
       passed;
+  substituted = AcceptedSlot();
+  substituted.trace[0] += 1.0;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               substituted,
+               RestartCompatibility::trace_hash_mismatch,
+               [](CheckpointDescriptor&) {},
+               "substituted_trace_buffer_rejected_atomically") &&
+      passed;
+
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::no_successful_commit,
+               [](CheckpointDescriptor& value) {
+                 value.successful_commit = false;
+               },
+               "altered_checkpoint_success_flag_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::schema_mismatch,
+               [](CheckpointDescriptor& value) { ++value.schema_version; },
+               "altered_checkpoint_schema_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::policy_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.restart_mode = static_cast<RestartMode>(255);
+               },
+               "altered_restart_policy_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::coordinate_mismatch,
+               [](CheckpointDescriptor& value) { value.coordinates.time += 1.0; },
+               "altered_coordinate_time_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::coordinate_mismatch,
+               [](CheckpointDescriptor& value) { ++value.coordinates.step; },
+               "altered_coordinate_step_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::coordinate_mismatch,
+               [](CheckpointDescriptor& value) {
+                 ++value.coordinates.generation;
+               },
+               "altered_coordinate_generation_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::coordinate_mismatch,
+               [](CheckpointDescriptor& value) { ++value.coordinates.cursor; },
+               "altered_coordinate_cursor_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::coordinate_mismatch,
+               [](CheckpointDescriptor& value) { value.coordinates.dt *= 2.0; },
+               "altered_coordinate_dt_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::coordinate_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.coordinate_fingerprint ^= 1U;
+               },
+               "altered_coordinate_fingerprint_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::cursor_mismatch,
+               [](CheckpointDescriptor& value) { ++value.cursor; },
+               "altered_checkpoint_cursor_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::dt_mismatch,
+               [](CheckpointDescriptor& value) { value.dt *= 2.0; },
+               "altered_checkpoint_dt_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::backend_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.tuple.backend = StableIdentity{"cuda.rank1"};
+               },
+               "altered_backend_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::tuple_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.tuple.model = StableIdentity{"other.model"};
+               },
+               "altered_tuple_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::tuple_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.tuple.formulation = StableIdentity{"other.formulation"};
+               },
+               "altered_formulation_tuple_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::tuple_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.tuple.trace = StableIdentity{"other.trace"};
+               },
+               "altered_trace_tuple_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::tuple_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.tuple.stabilization =
+                     StableIdentity{"other.stabilization"};
+               },
+               "altered_stabilization_tuple_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::tuple_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.tuple.time_treatment = StableIdentity{"other.time"};
+               },
+               "altered_time_tuple_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::tuple_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.tuple.precision = StableIdentity{"fp32"};
+               },
+               "altered_tuple_precision_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::mfem_pin_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.mfem_pin = StableIdentity{"wrong-pin"};
+               },
+               "altered_mfem_pin_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::mesh_mismatch,
+               [](CheckpointDescriptor& value) { value.mesh_hash.bytes[0] ^= 1U; },
+               "altered_mesh_hash_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::partition_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.partition_hash.bytes[0] ^= 1U;
+               },
+               "altered_partition_hash_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::topology_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.topology_hash.bytes[0] ^= 1U;
+               },
+               "altered_topology_hash_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::rank_count_mismatch,
+               [](CheckpointDescriptor& value) { ++value.rank_count; },
+               "altered_rank_count_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::order_mismatch,
+               [](CheckpointDescriptor& value) { ++value.polynomial_order; },
+               "altered_order_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::layout_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.layout = StableIdentity{"other.layout"};
+               },
+               "altered_layout_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::precision_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.precision = StableIdentity{"fp32"};
+               },
+               "altered_precision_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::interior_hash_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.interior_hash.bytes[0] ^= 1U;
+               },
+               "altered_interior_hash_rejected") &&
+      passed;
+  passed = ExpectRestoreFailure(
+               checkpoint,
+               AcceptedSlot(),
+               RestartCompatibility::trace_hash_mismatch,
+               [](CheckpointDescriptor& value) {
+                 value.trace_hash.bytes[0] ^= 1U;
+               },
+               "altered_trace_hash_rejected") &&
+      passed;
+
+  for (const double time : {
+           std::numeric_limits<double>::quiet_NaN(),
+           std::numeric_limits<double>::infinity(),
+           -std::numeric_limits<double>::infinity()})
+  {
+    passed = ExpectRestoreFailure(
+                 checkpoint,
+                 AcceptedSlot(),
+                 RestartCompatibility::time_mismatch,
+                 [time](CheckpointDescriptor& value) {
+                   value.coordinates.time = time;
+                   value.coordinate_fingerprint =
+                       FrozenCoordinateFingerprint(value.coordinates);
+                 },
+                 "nonfinite_time_rejected_even_with_recomputed_fingerprint") &&
+        passed;
+  }
+  for (const double dt : {
+           std::numeric_limits<double>::quiet_NaN(),
+           std::numeric_limits<double>::infinity(),
+           -std::numeric_limits<double>::infinity(),
+           0.0,
+           -0.125})
+  {
+    passed = ExpectRestoreFailure(
+                 checkpoint,
+                 AcceptedSlot(),
+                 RestartCompatibility::dt_mismatch,
+                 [dt](CheckpointDescriptor& value) {
+                   value.dt = dt;
+                   value.coordinates.dt = dt;
+                   value.coordinate_fingerprint =
+                       FrozenCoordinateFingerprint(value.coordinates);
+                 },
+                 "checkpoint_dt_must_be_positive_and_finite") && passed;
+  }
+
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const RestoreOutcome busy = contract.Restore(checkpoint, AcceptedSlot());
+    passed = Check(begin.started && !busy.restored &&
+                       busy.compatibility == RestartCompatibility::contract_busy &&
+                       TestCollectivePolicy::restores == 1 &&
+                       contract.telemetry().first_failure ==
+                           FailureReason::restart_incompatible,
+                   "active_attempt_blocks_restore") && passed;
+  }
   return passed;
 }
 
@@ -1296,20 +2191,11 @@ bool CheckAllLocalGatesAndStatePreservation()
 int main()
 {
   bool passed = true;
-  passed = CheckStaticSelectionIdentityAndInvalidRequests() && passed;
-  passed = CheckCollectiveAdmissionAndPreparation() && passed;
-  passed = CheckDisjointStorageAndBoundHandles() && passed;
-  passed = CheckIssuedProductProtocol() && passed;
-  passed = CheckResidualOriginAndTransferGates() && passed;
-  passed = CheckCollectiveIdentityAndRemoteGates() && passed;
-  passed = CheckAtomicRetryCommitAndTelemetry() && passed;
-  passed = CheckCheckpointSchemaAndIntegrity() && passed;
-  passed = CheckAllLocalGatesAndStatePreservation() && passed;
-  if (passed)
-  {
-    std::cout << "PASS hdg_runtime_contract_cxx17"
-              << " admission=collective products=issued residual=1e-10"
-              << " checkpoint=schema1 restart=integrity\n";
-  }
+  passed = CheckStaticSelectionAndCollectiveAdmission() && passed;
+  passed = CheckCapabilitiesAndFailureAtomicPublication() && passed;
+  passed = CheckProductProtocolAndIncarnationABA() && passed;
+  passed = CheckFirstFailureAcrossSuccessfulRetry() && passed;
+  passed = CheckResidualTelemetryAndCollectiveTruth() && passed;
+  passed = CheckAtomicCheckpointRestore() && passed;
   return passed ? 0 : 1;
 }
