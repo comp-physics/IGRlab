@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <vector>
@@ -103,6 +104,108 @@ struct Checks
     std::cerr << "rank " << rank << ": " << message << '\n';
   }
 };
+
+std::string HashHex(const std::array<std::uint8_t, 32>& hash)
+{
+  constexpr char digits[] = "0123456789abcdef";
+  std::string result(hash.size() * 2, '0');
+  for (std::size_t index = 0; index < hash.size(); ++index)
+  {
+    result[2 * index] = digits[hash[index] >> 4U];
+    result[2 * index + 1] = digits[hash[index] & 0x0fU];
+  }
+  return result;
+}
+
+void ReportIndependentChainDiagnostics(
+    const dg_igr_hdg_cpu_test::IndependentOracleResult& oracle,
+    const CpuAttemptEvidence& produced,
+    const int rank)
+{
+  const std::size_t oracle_count = oracle.linearizations.size();
+  const std::size_t produced_count = produced.linearization_chain_count;
+  std::cerr << "rank " << rank
+            << ": independent_chain counts oracle=" << oracle_count
+            << " produced=" << produced_count
+            << " oracle_newton_updates=" << oracle.newton_updates
+            << " produced_newton_updates=" << produced.nonlinear_updates
+            << " count_equal=" << (oracle_count == produced_count)
+            << " oracle_count_matches_updates="
+            << (oracle_count ==
+                static_cast<std::size_t>(oracle.newton_updates))
+            << " produced_count_matches_updates="
+            << (produced_count ==
+                static_cast<std::size_t>(produced.nonlinear_updates))
+            << " multi_update=" << (oracle_count > 1) << '\n';
+
+  const std::size_t common = std::min(oracle_count, produced_count);
+  for (std::size_t index = 0; index < common; ++index)
+  {
+    const dg_igr_hdg_cpu_test::IndependentLinearizationHashes& rebuilt =
+        oracle.linearizations[index];
+    const CpuLinearizationChain& chain =
+        produced.linearization_chains[index];
+    const bool residual_equal =
+        chain.residual_hash.bytes == rebuilt.residual;
+    const bool matrix_equal = chain.matrix_hash.bytes == rebuilt.matrix;
+    const bool factor_equal = chain.factor_hash.bytes == rebuilt.factor;
+    const bool solution_equal = chain.solution_hash.bytes == rebuilt.solution;
+    const bool candidate_equal =
+        chain.candidate_state_hash.bytes == rebuilt.candidate;
+    const bool solve_before_solution =
+        chain.solve_generation < chain.solution_generation;
+    const bool solution_before_recovery =
+        chain.solution_generation < chain.recovery_generation;
+    const bool previous_recovery_before_local = index == 0 ||
+        produced.linearization_chains[index - 1].recovery_generation <
+            chain.local_generation;
+    const bool previous_candidate_before_candidate = index == 0 ||
+        produced.linearization_chains[index - 1].candidate_generation <
+            chain.candidate_generation;
+    std::cerr << "rank " << rank << ": independent_chain[" << index << ']'
+              << " residual_equal=" << residual_equal
+              << " matrix_equal=" << matrix_equal
+              << " factor_equal=" << factor_equal
+              << " solution_equal=" << solution_equal
+              << " candidate_equal=" << candidate_equal
+              << " ordered=" << chain.ordered
+              << " affine=" << chain.affine_consumption_verified
+              << " solve_before_solution=" << solve_before_solution
+              << " solution_before_recovery=" << solution_before_recovery
+              << " previous_recovery_before_local="
+              << previous_recovery_before_local
+              << " previous_candidate_before_candidate="
+              << previous_candidate_before_candidate
+              << " generations={local:" << chain.local_generation
+              << ",condensed:" << chain.condensed_generation
+              << ",solve:" << chain.solve_generation
+              << ",solution:" << chain.solution_generation
+              << ",recovery:" << chain.recovery_generation
+              << ",candidate:" << chain.candidate_generation << "}\n"
+              << "  oracle.residual=" << HashHex(rebuilt.residual) << '\n'
+              << "  produced.residual="
+              << HashHex(chain.residual_hash.bytes) << '\n'
+              << "  oracle.matrix=" << HashHex(rebuilt.matrix) << '\n'
+              << "  produced.matrix=" << HashHex(chain.matrix_hash.bytes)
+              << '\n'
+              << "  oracle.factor=" << HashHex(rebuilt.factor) << '\n'
+              << "  produced.factor=" << HashHex(chain.factor_hash.bytes)
+              << '\n'
+              << "  oracle.solution=" << HashHex(rebuilt.solution) << '\n'
+              << "  produced.solution="
+              << HashHex(chain.solution_hash.bytes) << '\n'
+              << "  oracle.candidate=" << HashHex(rebuilt.candidate) << '\n'
+              << "  produced.candidate="
+              << HashHex(chain.candidate_state_hash.bytes) << '\n';
+  }
+  for (std::size_t index = common;
+       index < std::max(oracle_count, produced_count); ++index)
+  {
+    std::cerr << "rank " << rank << ": independent_chain[" << index << ']'
+              << " oracle_present=" << (index < oracle_count)
+              << " produced_present=" << (index < produced_count) << '\n';
+  }
+}
 
 std::vector<double> CopyView(const CpuCoefficientView view)
 {
@@ -601,6 +704,10 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
         (index == 0 ||
          first_accepted.linearization_chains[index - 1]
                  .candidate_generation < produced.candidate_generation);
+  }
+  if (!independent_chain)
+  {
+    ReportIndependentChainDiagnostics(oracle, first_accepted, rank);
   }
   checks.Require(independent_chain,
                  "independent oracle hashes every ordered Newton product chain");
