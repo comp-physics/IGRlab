@@ -42,6 +42,8 @@ namespace dg::hdg::runtime::cuda_w8a
 struct UmpireDeviceAllocatorPolicy
 {
   static void ResetLedger() noexcept;
+  /** Register MFEM's lazy DEVICE_UMPIRE pool through one recorded MFEM probe. */
+  static bool PrepareDeviceArenaAllocator() noexcept;
   static bool Allocate(std::size_t bytes, std::size_t alignment,
                        CudaAllocationSite site, void*& pointer) noexcept;
   static void Deallocate(void* pointer, CudaAllocationSite site) noexcept;

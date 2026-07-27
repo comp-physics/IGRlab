@@ -271,6 +271,30 @@ struct AuditedAllocator
     ordinal = 0;
   }
 
+  static bool PrepareDeviceArenaAllocator() noexcept
+  {
+    ++w8_owned_allocation_calls;
+    const CudaAllocationLedgerV1 before =
+        UmpireDeviceAllocatorPolicy::Ledger();
+    const bool prepared =
+        UmpireDeviceAllocatorPolicy::PrepareDeviceArenaAllocator();
+    const CudaAllocationLedgerV1 after =
+        UmpireDeviceAllocatorPolicy::Ledger();
+    if (before.overflow || after.overflow || after.count < before.count)
+      return false;
+    const bool exact_probe_delta = after.count == before.count + 2 &&
+        after.observed_count == before.observed_count + 2;
+    for (std::size_t index = before.count; index < after.count; ++index)
+    {
+      const AllocationEventV1& event = after.events[index];
+      Record(event.site, static_cast<std::size_t>(event.bytes),
+             static_cast<std::size_t>(event.alignment),
+             reinterpret_cast<void*>(event.storage_token), event.allocation,
+             event.success, event.generation);
+    }
+    return prepared && exact_probe_delta;
+  }
+
   static void Record(const CudaAllocationSite site, const std::size_t bytes,
                      const std::size_t alignment, void* pointer,
                      const bool allocation, const bool success,
@@ -615,9 +639,47 @@ bool SameLedger(const CudaAllocationLedgerV1& left,
   return true;
 }
 
+bool ExactPreparationProbeEvents(
+    const CudaAllocationLedgerV1& ledger) noexcept
+{
+  const AllocationEventV1* allocation = nullptr;
+  const AllocationEventV1* deallocation = nullptr;
+  for (std::size_t index = 0; index < ledger.count; ++index)
+  {
+    const AllocationEventV1& event = ledger.events[index];
+    if (event.site != CudaAllocationSite::mfem_device_pool_probe) { continue; }
+    if (!event.success || event.bytes != sizeof(std::max_align_t) ||
+        event.alignment != alignof(std::max_align_t) ||
+        event.capacity != sizeof(std::max_align_t) ||
+        event.storage_token == 0 || event.generation == 0 ||
+        event.context.phase != CudaFailurePhase::setup ||
+        event.context.rank < 0)
+    {
+      return false;
+    }
+    if (event.allocation)
+    {
+      if (allocation != nullptr) { return false; }
+      allocation = &event;
+    }
+    else
+    {
+      if (deallocation != nullptr) { return false; }
+      deallocation = &event;
+    }
+  }
+  return allocation != nullptr && deallocation != nullptr &&
+      allocation->ordinal + 1 == deallocation->ordinal &&
+      allocation->storage_token == deallocation->storage_token &&
+      allocation->generation == deallocation->generation &&
+      SameContext(allocation->context, deallocation->context);
+}
+
 bool ExactPolicyLedgers() noexcept
 {
-  return SameLedger(AuditedTransport::Ledger(),
+  return ExactPreparationProbeEvents(AuditedAllocator::Ledger()) &&
+      ExactPreparationProbeEvents(UmpireDeviceAllocatorPolicy::Ledger()) &&
+      SameLedger(AuditedTransport::Ledger(),
                     CudaTransportPolicy::Ledger()) &&
       SameTotals(AuditedTransport::Accounting(),
                  CudaTransportPolicy::Accounting()) &&

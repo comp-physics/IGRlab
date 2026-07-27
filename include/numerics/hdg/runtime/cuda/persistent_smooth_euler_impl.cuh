@@ -10,12 +10,13 @@ static inline void ReportCudaSetupFailure(const int rank,
     std::fprintf(stderr, "CUDA_SETUP_FAIL stage=%s\n", stage);
 }
 
-// Stable private backend-admission mask: bits 0..16 are rank count,
+// Stable private backend-admission mask: bits 0..15 are rank count,
 // cudaSetDevice, cudaGetDevice, selected device zero, MFEM configured,
 // MFEM CUDA allowed, MFEM debug-device disabled, zero incoming HYPRE error,
 // normal Hypre::Init return, zero error captured immediately after Init, Hypre
 // GPU selection, HYPRE memory query, HYPRE execution query, device memory,
-// device execution, zero post-policy HYPRE error, and Umpire pools.
+// device execution, and zero post-policy HYPRE error.  Materialized MFEM and
+// HYPRE Umpire pools are admitted only after their first real allocations.
 enum CudaBackendFailureBit : std::uint64_t
 {
   backend_rank_count_failure = std::uint64_t{1} << 0U,
@@ -33,8 +34,7 @@ enum CudaBackendFailureBit : std::uint64_t
   backend_hypre_execution_query_failure = std::uint64_t{1} << 12U,
   backend_hypre_memory_device_failure = std::uint64_t{1} << 13U,
   backend_hypre_execution_device_failure = std::uint64_t{1} << 14U,
-  backend_hypre_policy_error_failure = std::uint64_t{1} << 15U,
-  backend_umpire_pools_failure = std::uint64_t{1} << 16U
+  backend_hypre_policy_error_failure = std::uint64_t{1} << 15U
 };
 
 static inline void ReportCudaBackendFailure(
@@ -410,6 +410,12 @@ public:
         ? static_cast<std::size_t>(ghost_counts[0] + ghost_counts[1]) *
             sizeof(double)
         : 0;
+    if (!CollectiveContinue(AllocatorPolicy::PrepareDeviceArenaAllocator()))
+    {
+      ReportCudaSetupFailure(evidence.rank,
+                             "prepare-device-arena-allocator");
+      return false;
+    }
     if (!CollectiveContinue(AllocateArenas()))
     {
       ReportCudaSetupFailure(evidence.rank, "allocate-arenas");
@@ -1106,14 +1112,6 @@ private:
         execution_policy == HYPRE_EXEC_DEVICE;
     const HYPRE_Int hypre_policy_error = HYPRE_GetError();
     const bool hypre_policy_error_free = hypre_policy_error == 0;
-    const bool umpire_pools_valid =
-        AllocatorPolicy::DevicePoolPolicyValid();
-
-    evidence.hypre_cuda_umpire_device = local_preinit_valid &&
-        local_hypre_init_valid && hypre_gpu &&
-        hypre_memory_query_valid && hypre_execution_query_valid &&
-        hypre_memory_device && hypre_execution_device &&
-        hypre_policy_error_free && umpire_pools_valid;
     if (!hypre_gpu)
       backend_failure_mask |= backend_hypre_gpu_failure;
     if (!hypre_memory_query_valid)
@@ -1126,8 +1124,6 @@ private:
       backend_failure_mask |= backend_hypre_execution_device_failure;
     if (!hypre_policy_error_free)
       backend_failure_mask |= backend_hypre_policy_error_failure;
-    if (!umpire_pools_valid)
-      backend_failure_mask |= backend_umpire_pools_failure;
 
     const bool local_backend_valid = backend_failure_mask == 0;
     const bool backend_collectively_valid =
