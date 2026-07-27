@@ -107,6 +107,71 @@ struct CudaMpiCollectivePolicy
 namespace detail
 {
 
+// Stable private prestage-denial mask (bit set means the named predicate
+// failed): finite, admissible, recovery, true residual, telemetry,
+// no-fallback, success, not-injected, and the existing collective result.
+enum CudaPrestageFailureBit : std::uint64_t
+{
+  prestage_finite_failure = std::uint64_t{1} << 0U,
+  prestage_admissible_failure = std::uint64_t{1} << 1U,
+  prestage_recovery_failure = std::uint64_t{1} << 2U,
+  prestage_true_residual_failure = std::uint64_t{1} << 3U,
+  prestage_telemetry_failure = std::uint64_t{1} << 4U,
+  prestage_no_fallback_failure = std::uint64_t{1} << 5U,
+  prestage_success_failure = std::uint64_t{1} << 6U,
+  prestage_injected_failure = std::uint64_t{1} << 7U,
+  prestage_collective_failure = std::uint64_t{1} << 8U
+};
+
+inline constexpr std::uint64_t CudaPrestageFailureMask(
+    const bool finite, const bool admissible, const bool recovery,
+    const bool true_residual, const bool telemetry, const bool no_fallback,
+    const bool success, const bool injected,
+    const bool collective_result) noexcept
+{
+  return (!finite ? prestage_finite_failure : 0) |
+      (!admissible ? prestage_admissible_failure : 0) |
+      (!recovery ? prestage_recovery_failure : 0) |
+      (!true_residual ? prestage_true_residual_failure : 0) |
+      (!telemetry ? prestage_telemetry_failure : 0) |
+      (!no_fallback ? prestage_no_fallback_failure : 0) |
+      (!success ? prestage_success_failure : 0) |
+      (injected ? prestage_injected_failure : 0) |
+      (!collective_result ? prestage_collective_failure : 0);
+}
+
+static inline void ReportCudaPrestageDenial(
+    const int rank, const std::uint64_t failure_mask,
+    const FailureReason reason, const CudaFailurePhase phase,
+    const double initial_residual, const double final_residual,
+    const double true_relative_residual, const int nonlinear_updates,
+    const int trace_solves, const CudaTransferTotals& transfers,
+    const std::uint64_t allocation_current,
+    const std::uint64_t allocation_baseline,
+    const std::uint64_t allocation_calls_current,
+    const std::uint64_t allocation_calls_baseline) noexcept
+{
+  std::fprintf(stderr,
+      "CUDA_PRESTAGE_DENY rank=%d mask=0x%llx reason=%u phase=%u "
+      "residuals=%.17g/%.17g/%.17g updates=%d solves=%d "
+      "transfer=%u/%llu/%llu/%llu/%llu/%llu/%llu alloc=%llu/%llu "
+      "calls=%llu/%llu\n",
+      rank, static_cast<unsigned long long>(failure_mask),
+      static_cast<unsigned>(reason), static_cast<unsigned>(phase),
+      initial_residual, final_residual, true_relative_residual,
+      nonlinear_updates, trace_solves, transfers.complete ? 1U : 0U,
+      static_cast<unsigned long long>(transfers.event_count),
+      static_cast<unsigned long long>(transfers.synchronization_events),
+      static_cast<unsigned long long>(transfers.host_to_device_bytes),
+      static_cast<unsigned long long>(transfers.device_to_host_bytes),
+      static_cast<unsigned long long>(transfers.device_to_device_bytes),
+      static_cast<unsigned long long>(transfers.mpi_staging_bytes),
+      static_cast<unsigned long long>(allocation_current),
+      static_cast<unsigned long long>(allocation_baseline),
+      static_cast<unsigned long long>(allocation_calls_current),
+      static_cast<unsigned long long>(allocation_calls_baseline));
+}
+
 enum class CudaCopyOutPurpose : unsigned char
 {
   none,
@@ -1263,10 +1328,30 @@ private:
     }
     if (!staging) { return FinishFrozenFailure(evidence); }
     pending_.staging.emplace(std::move(*staging));
-    pending_.prestage_allowed = numerics_.CollectiveContinue(
-        adjusted.success && !adjusted.injected);
+    const bool local_prestage_allowed =
+        adjusted.success && !adjusted.injected;
+    const bool collective_prestage_allowed =
+        numerics_.CollectiveContinue(local_prestage_allowed);
+    pending_.prestage_allowed = collective_prestage_allowed;
     if (!pending_.prestage_allowed)
     {
+      const CudaReuseEvidence reuse = numerics_.ReuseEvidence();
+      const std::uint64_t failure_mask = detail::CudaPrestageFailureMask(
+          adjusted.finite, adjusted.admissible, adjusted.recovery,
+          adjusted.true_residual, adjusted.telemetry,
+          numerics_.NoFallback(), adjusted.success, adjusted.injected,
+          collective_prestage_allowed);
+      detail::ReportCudaPrestageDenial(
+          numerics_.rank(), failure_mask, adjusted.reason, adjusted.phase,
+          adjusted.initial_residual, adjusted.final_residual,
+          adjusted.true_relative_residual, adjusted.nonlinear_updates,
+          adjusted.trace_solves, totals,
+          reuse.baseline_allocation_events +
+              reuse.post_baseline_allocation_events,
+          reuse.baseline_allocation_events,
+          reuse.baseline_w8_owned_allocation_calls +
+              reuse.post_baseline_w8_owned_allocation_calls,
+          reuse.baseline_w8_owned_allocation_calls);
       pending_.report.gates.success = false;
       if (pending_.report.originating_failure == FailureReason::none)
         pending_.report.originating_failure = FailureReason::backend_failure;

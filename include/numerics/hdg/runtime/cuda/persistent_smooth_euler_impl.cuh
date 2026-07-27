@@ -110,6 +110,21 @@ struct CudaArenaReleasePass
   bool idempotent = false;
 };
 
+static inline void ReportCudaArenaTeardownMarker(
+    const int rank, const char* const stage, const char* const edge,
+    const CudaArenaReleaseState& state,
+    const std::uint64_t failure_mask) noexcept
+{
+  std::fprintf(stderr,
+      "CUDA_TEARDOWN_TRACE rank=%d pass=%u stage=%s edge=%s "
+      "ownership=%u/%u failure=0x%llx complete=%u\n",
+      rank, state.pass_count, stage, edge,
+      static_cast<unsigned>(state.integer),
+      static_cast<unsigned>(state.doubles),
+      static_cast<unsigned long long>(state.failure_history | failure_mask),
+      state.complete ? 1U : 0U);
+}
+
 template <typename Operations>
 CudaArenaReleasePass ReleaseCudaArenas(
     CudaArenaReleaseState& state, Operations& operations) noexcept
@@ -145,7 +160,10 @@ CudaArenaReleasePass ReleaseCudaArenas(
         ? CudaArenaOwnership::owned : CudaArenaOwnership::none;
     state.doubles = operations.HasDoubleArena()
         ? CudaArenaOwnership::owned : CudaArenaOwnership::none;
-    if (!operations.ReleaseVectorAlias())
+    operations.Marker("vector-alias", "before", state,
+                      result.failure_mask);
+    const bool alias_released = operations.ReleaseVectorAlias();
+    if (!alias_released)
     {
       operations.MakeWrappersInert();
       if (state.integer == CudaArenaOwnership::owned)
@@ -154,23 +172,43 @@ CudaArenaReleasePass ReleaseCudaArenas(
         state.doubles = CudaArenaOwnership::mfem_retained;
       result.failure_mask = arena_vector_alias_release_failure;
     }
-    else if (!operations.ReleaseDoubleRegistration())
+    operations.Marker("vector-alias", "after", state,
+                      result.failure_mask);
+    if (alias_released)
     {
-      operations.MakeWrappersInert();
-      if (state.integer == CudaArenaOwnership::owned)
-        state.integer = CudaArenaOwnership::mfem_retained;
-      if (state.doubles == CudaArenaOwnership::owned)
-        state.doubles = CudaArenaOwnership::mfem_retained;
-      result.failure_mask = arena_double_registration_release_failure;
-    }
-    else if (!operations.ReleaseIntegerRegistration())
-    {
-      operations.MakeWrappersInert();
-      if (state.integer == CudaArenaOwnership::owned)
-        state.integer = CudaArenaOwnership::mfem_retained;
-      if (state.doubles == CudaArenaOwnership::owned)
-        state.doubles = CudaArenaOwnership::quarantined;
-      result.failure_mask = arena_integer_registration_release_failure;
+      operations.Marker("double-registration", "before", state,
+                        result.failure_mask);
+      const bool double_registration_released =
+          operations.ReleaseDoubleRegistration();
+      if (!double_registration_released)
+      {
+        operations.MakeWrappersInert();
+        if (state.integer == CudaArenaOwnership::owned)
+          state.integer = CudaArenaOwnership::mfem_retained;
+        if (state.doubles == CudaArenaOwnership::owned)
+          state.doubles = CudaArenaOwnership::mfem_retained;
+        result.failure_mask = arena_double_registration_release_failure;
+      }
+      operations.Marker("double-registration", "after", state,
+                        result.failure_mask);
+      if (double_registration_released)
+      {
+        operations.Marker("integer-registration", "before", state,
+                          result.failure_mask);
+        const bool integer_registration_released =
+            operations.ReleaseIntegerRegistration();
+        if (!integer_registration_released)
+        {
+          operations.MakeWrappersInert();
+          if (state.integer == CudaArenaOwnership::owned)
+            state.integer = CudaArenaOwnership::mfem_retained;
+          if (state.doubles == CudaArenaOwnership::owned)
+            state.doubles = CudaArenaOwnership::quarantined;
+          result.failure_mask = arena_integer_registration_release_failure;
+        }
+        operations.Marker("integer-registration", "after", state,
+                          result.failure_mask);
+      }
     }
     operations.ClearViews();
     state.views_cleared = true;
@@ -196,16 +234,34 @@ CudaArenaReleasePass ReleaseCudaArenas(
   if (state.integer == CudaArenaOwnership::owned ||
       state.integer == CudaArenaOwnership::retryable)
   {
-    if (!release_raw(state.integer, operations.ReleaseIntegerArena(),
+    operations.Marker("integer-raw", "before", state,
+                      result.failure_mask);
+    const CudaRawReleaseResult released = operations.ReleaseIntegerArena();
+    if (!release_raw(state.integer, released,
                      arena_integer_raw_release_failure))
+    {
+      operations.Marker("integer-raw", "after", state,
+                        result.failure_mask);
       return finish();
+    }
+    operations.Marker("integer-raw", "after", state,
+                      result.failure_mask);
   }
   if (state.doubles == CudaArenaOwnership::owned ||
       state.doubles == CudaArenaOwnership::retryable)
   {
-    if (!release_raw(state.doubles, operations.ReleaseDoubleArena(),
+    operations.Marker("double-raw", "before", state,
+                      result.failure_mask);
+    const CudaRawReleaseResult released = operations.ReleaseDoubleArena();
+    if (!release_raw(state.doubles, released,
                      arena_double_raw_release_failure))
+    {
+      operations.Marker("double-raw", "after", state,
+                        result.failure_mask);
       return finish();
+    }
+    operations.Marker("double-raw", "after", state,
+                      result.failure_mask);
   }
   const bool integer_done = state.integer == CudaArenaOwnership::none ||
       state.integer == CudaArenaOwnership::released;
@@ -236,6 +292,32 @@ struct CudaTrueMatrixDeviceView
   double* offd_values = nullptr;
   int diag_nonzeros = 0;
   int offd_nonzeros = 0;
+};
+
+// Allocation-free, fail-neutral setup provenance.  The implementation only
+// samples HYPRE_GetError/cudaPeekAtLastError; it never clears or synchronizes.
+void CudaBeginTrueSystemDiagnostic(int rank) noexcept;
+void CudaEndTrueSystemDiagnostic(bool result) noexcept;
+void CudaTrueSystemDiagnosticMarker(const char* stage, const char* edge,
+                                    bool result,
+                                    std::uint64_t generation = 0) noexcept;
+
+struct CudaTrueSystemDiagnosticScope
+{
+  const char* stage = nullptr;
+  std::uint64_t generation = 0;
+  bool result = false;
+
+  CudaTrueSystemDiagnosticScope(const char* value,
+                                const std::uint64_t value_generation = 0)
+      noexcept : stage(value), generation(value_generation)
+  {
+    CudaTrueSystemDiagnosticMarker(stage, "enter", false, generation);
+  }
+  ~CudaTrueSystemDiagnosticScope() noexcept
+  {
+    CudaTrueSystemDiagnosticMarker(stage, "exit", result, generation);
+  }
 };
 
 struct CudaDeviceView
@@ -539,6 +621,10 @@ public:
     if (first.complete && (!second.complete || !second.idempotent))
       ReportCudaArenaTeardownFailure(
           rank_, arena_idempotent_state_failure);
+    ReportCudaArenaTeardownMarker(
+        rank_, "destructor", "complete", arena_release_state_,
+        first.complete && (!second.complete || !second.idempotent)
+            ? arena_idempotent_state_failure : 0);
   }
 
   CudaPersistentNumerics(const CudaPersistentNumerics&) = delete;
@@ -599,7 +685,10 @@ public:
       ReportCudaSetupFailure(evidence.rank, "upload-topology-state");
       return false;
     }
-    if (!CollectiveContinue(BuildPersistentTrueSystem()))
+    CudaBeginTrueSystemDiagnostic(rank_);
+    const bool true_system_ready = BuildPersistentTrueSystem();
+    CudaEndTrueSystemDiagnostic(true_system_ready);
+    if (!CollectiveContinue(true_system_ready))
     {
       ReportCudaSetupFailure(evidence.rank,
                              "build-persistent-true-system");
@@ -1434,6 +1523,14 @@ private:
     { return owner.integer_arena_ != nullptr; }
     bool HasDoubleArena() const noexcept
     { return owner.double_arena_ != nullptr; }
+
+    void Marker(const char* const stage, const char* const edge,
+                const CudaArenaReleaseState& state,
+                const std::uint64_t failure_mask) const noexcept
+    {
+      ReportCudaArenaTeardownMarker(owner.rank_, stage, edge, state,
+                                    failure_mask);
+    }
 
     bool ReleaseVectorAlias() noexcept
     {
