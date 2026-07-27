@@ -1,5 +1,16 @@
 # Collect all source files (including module subdirectories)
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "*.cpp")
+
+# W8 runtime and auxiliary sources are owned by strict named component targets.
+# Exclude their complete C++ roots unconditionally so neither default-OFF nor
+# feature-ON configurations can double-compile them through igr_mfem's glob.
+file(GLOB_RECURSE _dg_igr_hdg_named_component_cpp CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/runtime/*.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/auxiliary/*.cpp")
+if(_dg_igr_hdg_named_component_cpp)
+    list(REMOVE_ITEM SOURCES ${_dg_igr_hdg_named_component_cpp})
+endif()
+
 if(NOT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT)
     list(REMOVE_ITEM SOURCES
          "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler_mpi.cpp")
@@ -170,4 +181,9 @@ if(DG_IGR_ACCELERATOR_KERNEL_SOURCES)
     message(STATUS
             "DG_IGR accelerator kernel sources (${DG_IGR_ACCELERATOR_LANGUAGE}): "
             "${_dg_igr_accel_sources_abs}")
+endif()
+
+if(DG_IGR_ENABLE_HDG_RUNTIME OR
+   DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
+    add_subdirectory(numerics/hdg/runtime)
 endif()
