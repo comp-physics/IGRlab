@@ -1647,67 +1647,117 @@ int main(int argc, char** argv)
   const bool token_mode = argc == 2 &&
       std::string_view(argv[1]) == "--token-negatives";
   bool pass = true;
-  const auto run_case = [&](const bool local_result)
+  const auto run_case = [&](const char* const case_label,
+                            const bool local_result)
   {
     const bool collective_result = Global(local_result);
+    if (!collective_result)
+    {
+      int rank = 0;
+      MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+      if (rank == 0)
+        std::cerr << "FAILED " << case_label << '\n';
+    }
     pass = pass && collective_result;
   };
-  run_case(HypreIluGenerationSetupRegression());
-  run_case(TicketHighHalfRegression());
-  run_case(DirectSharedContractNegatives());
-  run_case(CollectiveCaseBoundaryRegression());
   if (ranks == 1)
   {
-    run_case(RunConfigConsensusNegative<TestRankOneBackendTag>(1));
+    run_case("rank1.common.hypre-setup-order",
+             HypreIluGenerationSetupRegression());
+    run_case("rank1.common.ticket-high-half",
+             TicketHighHalfRegression());
+    run_case("rank1.common.shared-contract-negatives",
+             DirectSharedContractNegatives());
+    run_case("rank1.common.collective-case-boundary",
+             CollectiveCaseBoundaryRegression());
+    run_case("rank1.config.consensus-negative",
+             RunConfigConsensusNegative<TestRankOneBackendTag>(1));
     if (token_mode)
     {
-      run_case(RunTokenFault<TestRankOneBackendTag>(
-          1, CudaTokenFault::omit_solution, FailureReason::missing_product));
-      run_case(RunTokenFault<TestRankOneBackendTag>(
-          1, CudaTokenFault::stale_attempt,
-          FailureReason::missing_product));
-      run_case(RunTokenFault<TestRankOneBackendTag>(
-          1, CudaTokenFault::issue_matrix_before_residual,
-          FailureReason::none));
+      run_case("rank1.token.omit-solution",
+               RunTokenFault<TestRankOneBackendTag>(
+                   1, CudaTokenFault::omit_solution,
+                   FailureReason::missing_product));
+      run_case("rank1.token.stale-attempt",
+               RunTokenFault<TestRankOneBackendTag>(
+                   1, CudaTokenFault::stale_attempt,
+                   FailureReason::missing_product));
+      run_case("rank1.token.matrix-before-residual",
+               RunTokenFault<TestRankOneBackendTag>(
+                   1, CudaTokenFault::issue_matrix_before_residual,
+                   FailureReason::none));
     }
     else
     {
       CudaSerializedCheckpointV1 checkpoint{};
-      run_case(RunLifecycle<TestRankOneBackendTag>(1, checkpoint));
-      run_case(RunCorruptRestore<TestRankOneBackendTag>(1, checkpoint));
-      run_case(RunFreshRestore<TestRankOneBackendTag>(1, checkpoint));
-      run_case(RunProvisionalRevert<TestRankOneBackendTag>(1));
-      run_case(RunPreparedAbort<TestRankOneBackendTag>(1));
-      run_case(RunStagingFailure<TestRankOneBackendTag>(1));
+      run_case("rank1.lifecycle",
+               RunLifecycle<TestRankOneBackendTag>(1, checkpoint));
+      run_case("rank1.restore.corrupt",
+               RunCorruptRestore<TestRankOneBackendTag>(1, checkpoint));
+      run_case("rank1.restore.fresh",
+               RunFreshRestore<TestRankOneBackendTag>(1, checkpoint));
+      run_case("rank1.provisional-revert",
+               RunProvisionalRevert<TestRankOneBackendTag>(1));
+      run_case("rank1.prepared-abort",
+               RunPreparedAbort<TestRankOneBackendTag>(1));
+      run_case("rank1.staging-failure",
+               RunStagingFailure<TestRankOneBackendTag>(1));
     }
   }
   else if (ranks == 2)
   {
-    run_case(RunConfigConsensusNegative<TestRankTwoBackendTag>(2));
+    run_case("rank2.common.hypre-setup-order",
+             HypreIluGenerationSetupRegression());
+    run_case("rank2.common.ticket-high-half",
+             TicketHighHalfRegression());
+    run_case("rank2.common.shared-contract-negatives",
+             DirectSharedContractNegatives());
+    run_case("rank2.common.collective-case-boundary",
+             CollectiveCaseBoundaryRegression());
+    run_case("rank2.config.consensus-negative",
+             RunConfigConsensusNegative<TestRankTwoBackendTag>(2));
     if (token_mode)
     {
-      run_case(RunTokenFault<TestRankTwoBackendTag>(
-          2, CudaTokenFault::omit_solution, FailureReason::missing_product));
-      run_case(RunTokenFault<TestRankTwoBackendTag>(
-          2, CudaTokenFault::stale_attempt,
-          FailureReason::missing_product));
-      run_case(RunTokenFault<TestRankTwoBackendTag>(
-          2, CudaTokenFault::issue_matrix_before_residual,
-          FailureReason::none));
+      run_case("rank2.token.omit-solution",
+               RunTokenFault<TestRankTwoBackendTag>(
+                   2, CudaTokenFault::omit_solution,
+                   FailureReason::missing_product));
+      run_case("rank2.token.stale-attempt",
+               RunTokenFault<TestRankTwoBackendTag>(
+                   2, CudaTokenFault::stale_attempt,
+                   FailureReason::missing_product));
+      run_case("rank2.token.matrix-before-residual",
+               RunTokenFault<TestRankTwoBackendTag>(
+                   2, CudaTokenFault::issue_matrix_before_residual,
+                   FailureReason::none));
     }
     else
     {
       CudaSerializedCheckpointV1 checkpoint{};
-      run_case(RunLifecycle<TestRankTwoBackendTag>(2, checkpoint));
-      run_case(RunCorruptRestore<TestRankTwoBackendTag>(2, checkpoint));
-      run_case(RunFreshRestore<TestRankTwoBackendTag>(2, checkpoint));
-      run_case(RunProvisionalRevert<TestRankTwoBackendTag>(2));
-      run_case(RunPreparedAbort<TestRankTwoBackendTag>(2));
-      run_case(RunStagingFailure<TestRankTwoBackendTag>(2));
+      run_case("rank2.lifecycle",
+               RunLifecycle<TestRankTwoBackendTag>(2, checkpoint));
+      run_case("rank2.restore.corrupt",
+               RunCorruptRestore<TestRankTwoBackendTag>(2, checkpoint));
+      run_case("rank2.restore.fresh",
+               RunFreshRestore<TestRankTwoBackendTag>(2, checkpoint));
+      run_case("rank2.provisional-revert",
+               RunProvisionalRevert<TestRankTwoBackendTag>(2));
+      run_case("rank2.prepared-abort",
+               RunPreparedAbort<TestRankTwoBackendTag>(2));
+      run_case("rank2.staging-failure",
+               RunStagingFailure<TestRankTwoBackendTag>(2));
     }
   }
   else
   {
+    run_case("unsupported.common.hypre-setup-order",
+             HypreIluGenerationSetupRegression());
+    run_case("unsupported.common.ticket-high-half",
+             TicketHighHalfRegression());
+    run_case("unsupported.common.shared-contract-negatives",
+             DirectSharedContractNegatives());
+    run_case("unsupported.common.collective-case-boundary",
+             CollectiveCaseBoundaryRegression());
     pass = false;
   }
 
