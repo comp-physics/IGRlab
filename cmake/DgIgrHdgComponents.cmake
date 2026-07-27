@@ -76,6 +76,100 @@ function(dg_igr_add_hdg_cxx17_component)
   endif()
 endfunction()
 
+function(_dg_igr_hdg_require_hypre_cuda_umpire_config)
+  set(_dg_igr_hdg_mfem_include_dirs ${MFEM_INCLUDE_DIRS})
+  get_target_property(_dg_igr_hdg_mfem_target_include_dirs
+                      mfem INTERFACE_INCLUDE_DIRECTORIES)
+  if(_dg_igr_hdg_mfem_target_include_dirs AND
+     NOT _dg_igr_hdg_mfem_target_include_dirs MATCHES "-NOTFOUND$")
+    list(APPEND _dg_igr_hdg_mfem_include_dirs
+         ${_dg_igr_hdg_mfem_target_include_dirs})
+  endif()
+  list(REMOVE_DUPLICATES _dg_igr_hdg_mfem_include_dirs)
+
+  set(_dg_igr_hdg_hypre_configs "")
+  set(_dg_igr_hdg_considered_include_dirs "")
+  foreach(_dg_igr_hdg_include_dir IN LISTS _dg_igr_hdg_mfem_include_dirs)
+    if(_dg_igr_hdg_include_dir MATCHES
+       "^\\$<BUILD_INTERFACE:([^>]+)>$")
+      set(_dg_igr_hdg_include_dir "${CMAKE_MATCH_1}")
+    elseif(_dg_igr_hdg_include_dir MATCHES
+           "^\\$<INSTALL_INTERFACE:([^>]+)>$")
+      set(_dg_igr_hdg_include_dir "${CMAKE_MATCH_1}")
+    elseif(_dg_igr_hdg_include_dir MATCHES "\\$<")
+      continue()
+    endif()
+    if(NOT IS_ABSOLUTE "${_dg_igr_hdg_include_dir}")
+      continue()
+    endif()
+
+    get_filename_component(_dg_igr_hdg_include_dir
+                           "${_dg_igr_hdg_include_dir}" REALPATH)
+    list(APPEND _dg_igr_hdg_considered_include_dirs
+         "${_dg_igr_hdg_include_dir}")
+    set(_dg_igr_hdg_hypre_config
+        "${_dg_igr_hdg_include_dir}/HYPRE_config.h")
+    if(EXISTS "${_dg_igr_hdg_hypre_config}" AND
+       NOT IS_DIRECTORY "${_dg_igr_hdg_hypre_config}")
+      get_filename_component(_dg_igr_hdg_hypre_config
+                             "${_dg_igr_hdg_hypre_config}" REALPATH)
+      list(APPEND _dg_igr_hdg_hypre_configs
+           "${_dg_igr_hdg_hypre_config}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES _dg_igr_hdg_considered_include_dirs)
+  list(REMOVE_DUPLICATES _dg_igr_hdg_hypre_configs)
+
+  list(LENGTH _dg_igr_hdg_hypre_configs _dg_igr_hdg_hypre_config_count)
+  if(_dg_igr_hdg_hypre_config_count EQUAL 0)
+    message(FATAL_ERROR
+            "HDG CUDA components could not resolve HYPRE_config.h from the discovered MFEM INTERFACE_INCLUDE_DIRECTORIES/MFEM_INCLUDE_DIRS: ${_dg_igr_hdg_considered_include_dirs}")
+  elseif(NOT _dg_igr_hdg_hypre_config_count EQUAL 1)
+    message(FATAL_ERROR
+            "HDG CUDA components found ambiguous HYPRE_config.h headers in the discovered MFEM include interface: ${_dg_igr_hdg_hypre_configs}")
+  endif()
+
+  list(GET _dg_igr_hdg_hypre_configs 0 _dg_igr_hdg_hypre_config)
+  set(_dg_igr_hdg_hypre_read_probe
+      "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/dg_igr_hypre_config_read_probe.h")
+  file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles")
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E copy
+            "${_dg_igr_hdg_hypre_config}"
+            "${_dg_igr_hdg_hypre_read_probe}"
+    RESULT_VARIABLE _dg_igr_hdg_hypre_read_result
+    ERROR_VARIABLE _dg_igr_hdg_hypre_read_error
+    OUTPUT_QUIET)
+  if(NOT _dg_igr_hdg_hypre_read_result EQUAL 0)
+    file(REMOVE "${_dg_igr_hdg_hypre_read_probe}")
+    string(STRIP "${_dg_igr_hdg_hypre_read_error}"
+                 _dg_igr_hdg_hypre_read_error)
+    message(FATAL_ERROR
+            "HDG CUDA components require a readable HYPRE_config.h; failed to read '${_dg_igr_hdg_hypre_config}': ${_dg_igr_hdg_hypre_read_error}")
+  endif()
+  file(READ "${_dg_igr_hdg_hypre_read_probe}"
+       _dg_igr_hdg_hypre_config_content)
+  file(REMOVE "${_dg_igr_hdg_hypre_read_probe}")
+  string(REPLACE "\r\n" "\n" _dg_igr_hdg_hypre_config_content
+                 "${_dg_igr_hdg_hypre_config_content}")
+  string(REPLACE "\r" "\n" _dg_igr_hdg_hypre_config_content
+                 "${_dg_igr_hdg_hypre_config_content}")
+
+  foreach(_dg_igr_hdg_hypre_macro
+          HYPRE_USING_CUDA
+          HYPRE_USING_UMPIRE
+          HYPRE_USING_UMPIRE_DEVICE)
+    string(REGEX MATCH
+           "(^|\n)[ \t]*#[ \t]*define[ \t]+${_dg_igr_hdg_hypre_macro}[ \t]+1[ \t]*(\n|$)"
+           _dg_igr_hdg_hypre_macro_definition
+           "${_dg_igr_hdg_hypre_config_content}")
+    if(NOT _dg_igr_hdg_hypre_macro_definition)
+      message(FATAL_ERROR
+              "HDG CUDA components require '${_dg_igr_hdg_hypre_config}' to contain an explicit '#define ${_dg_igr_hdg_hypre_macro} 1' line.")
+    endif()
+  endforeach()
+endfunction()
+
 function(dg_igr_require_hdg_cuda17_profile)
   if(NOT MFEM_USE_CUDA OR MFEM_USE_HIP)
     message(FATAL_ERROR
@@ -101,6 +195,7 @@ function(dg_igr_require_hdg_cuda17_profile)
     message(FATAL_ERROR
             "HDG CUDA components require HYPRE in mfem's exported link interface.")
   endif()
+  _dg_igr_hdg_require_hypre_cuda_umpire_config()
 
   if(NOT DG_IGR_EXPECT_CUDA_ARCH)
     message(FATAL_ERROR
