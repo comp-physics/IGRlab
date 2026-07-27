@@ -25,42 +25,43 @@ namespace
 {
 using namespace dg::hdg::runtime;
 using namespace dg::hdg::runtime::cuda_w8a;
+namespace cuda_detail = dg::hdg::runtime::cuda_w8a::detail;
 
-constexpr detail::CudaHypreSetupOrderEvidence ExactHypreSetup(
+constexpr cuda_detail::CudaHypreSetupOrderEvidence ExactHypreSetup(
     const std::uint64_t generation, const bool include_mult) noexcept
 {
-  detail::CudaHypreSetupOrderEvidence evidence{};
+  cuda_detail::CudaHypreSetupOrderEvidence evidence{};
   evidence.matrix_generation = generation;
-  evidence.Record(detail::CudaHypreSetupAction::bind_preconditioner);
-  evidence.Record(detail::CudaHypreSetupAction::set_operator);
-  evidence.Record(detail::CudaHypreSetupAction::ilu_type0);
-  evidence.Record(detail::CudaHypreSetupAction::ilu_fill0);
-  evidence.Record(detail::CudaHypreSetupAction::ilu_reorder0);
-  evidence.Record(detail::CudaHypreSetupAction::ilu_maxiter1);
-  evidence.Record(detail::CudaHypreSetupAction::ilu_tol0);
-  evidence.Record(detail::CudaHypreSetupAction::ilu_print0);
-  evidence.Record(detail::CudaHypreSetupAction::rebind_preconditioner);
-  evidence.Record(detail::CudaHypreSetupAction::gmres_settings);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::bind_preconditioner);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::set_operator);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_type0);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_fill0);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_reorder0);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_maxiter1);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_tol0);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_print0);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::rebind_preconditioner);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::gmres_settings);
   if (include_mult)
-    evidence.Record(detail::CudaHypreSetupAction::mult);
+    evidence.Record(cuda_detail::CudaHypreSetupAction::mult);
   return evidence;
 }
 
-constexpr detail::CudaHypreSetupOrderEvidence LegacyPreOperatorIluSetup(
+constexpr cuda_detail::CudaHypreSetupOrderEvidence LegacyPreOperatorIluSetup(
     const std::uint64_t generation) noexcept
 {
-  detail::CudaHypreSetupOrderEvidence evidence{};
+  cuda_detail::CudaHypreSetupOrderEvidence evidence{};
   evidence.matrix_generation = generation;
-  evidence.Record(detail::CudaHypreSetupAction::ilu_type0);
-  evidence.Record(detail::CudaHypreSetupAction::ilu_fill0);
-  evidence.Record(detail::CudaHypreSetupAction::ilu_reorder0);
-  evidence.Record(detail::CudaHypreSetupAction::ilu_maxiter1);
-  evidence.Record(detail::CudaHypreSetupAction::ilu_tol0);
-  evidence.Record(detail::CudaHypreSetupAction::ilu_print0);
-  evidence.Record(detail::CudaHypreSetupAction::gmres_settings);
-  evidence.Record(detail::CudaHypreSetupAction::bind_preconditioner);
-  evidence.Record(detail::CudaHypreSetupAction::set_operator);
-  evidence.Record(detail::CudaHypreSetupAction::mult);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_type0);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_fill0);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_reorder0);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_maxiter1);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_tol0);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::ilu_print0);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::gmres_settings);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::bind_preconditioner);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::set_operator);
+  evidence.Record(cuda_detail::CudaHypreSetupAction::mult);
   return evidence;
 }
 
@@ -112,25 +113,25 @@ constexpr auto wrong_attempt_high_words = TicketWords(
 constexpr auto wrong_generation_high_words = TicketWords(
     CudaFailurePhase::trace_solve, synthetic_attempt,
     synthetic_generation ^ (std::uint64_t{1} << 32U), 0);
-static_assert(detail::CudaTicketWordsValid(
+static_assert(cuda_detail::CudaTicketWordsValid(
     exact_ticket_words, CudaFailurePhase::trace_solve, synthetic_attempt,
     synthetic_generation, 0));
-static_assert(!detail::CudaTicketWordsValid(
+static_assert(!cuda_detail::CudaTicketWordsValid(
     wrong_attempt_high_words, CudaFailurePhase::trace_solve,
     synthetic_attempt, synthetic_generation, 0));
-static_assert(!detail::CudaTicketWordsValid(
+static_assert(!cuda_detail::CudaTicketWordsValid(
     wrong_generation_high_words, CudaFailurePhase::trace_solve,
     synthetic_attempt, synthetic_generation, 0));
 
 bool TicketHighHalfRegression() noexcept
 {
-  return detail::CudaTicketWordsValid(
+  return cuda_detail::CudaTicketWordsValid(
              exact_ticket_words, CudaFailurePhase::trace_solve,
              synthetic_attempt, synthetic_generation, 0) &&
-      !detail::CudaTicketWordsValid(
+      !cuda_detail::CudaTicketWordsValid(
           wrong_attempt_high_words, CudaFailurePhase::trace_solve,
           synthetic_attempt, synthetic_generation, 0) &&
-      !detail::CudaTicketWordsValid(
+      !cuda_detail::CudaTicketWordsValid(
           wrong_generation_high_words, CudaFailurePhase::trace_solve,
           synthetic_attempt, synthetic_generation, 0);
 }
