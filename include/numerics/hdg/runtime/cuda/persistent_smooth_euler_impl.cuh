@@ -10,11 +10,10 @@ static inline void ReportCudaSetupFailure(const int rank,
     std::fprintf(stderr, "CUDA_SETUP_FAIL stage=%s\n", stage);
 }
 
-// Stable private backend-admission mask: bits 0..18 are rank count,
+// Stable private backend-admission mask: bits 0..16 are rank count,
 // cudaSetDevice, cudaGetDevice, selected device zero, MFEM configured,
 // MFEM CUDA allowed, MFEM debug-device disabled, zero incoming HYPRE error,
-// zero post-clear pre-init error, normal Hypre::Init return, zero error
-// captured immediately after Init, zero post-clear policy-start error, Hypre
+// normal Hypre::Init return, zero error captured immediately after Init, Hypre
 // GPU selection, HYPRE memory query, HYPRE execution query, device memory,
 // device execution, zero post-policy HYPRE error, and Umpire pools.
 enum CudaBackendFailureBit : std::uint64_t
@@ -27,17 +26,15 @@ enum CudaBackendFailureBit : std::uint64_t
   backend_mfem_cuda_failure = std::uint64_t{1} << 5U,
   backend_mfem_debug_failure = std::uint64_t{1} << 6U,
   backend_hypre_incoming_error_failure = std::uint64_t{1} << 7U,
-  backend_hypre_preinit_reset_failure = std::uint64_t{1} << 8U,
-  backend_hypre_initialize_return_failure = std::uint64_t{1} << 9U,
-  backend_hypre_initialize_error_failure = std::uint64_t{1} << 10U,
-  backend_hypre_policy_reset_failure = std::uint64_t{1} << 11U,
-  backend_hypre_gpu_failure = std::uint64_t{1} << 12U,
-  backend_hypre_memory_query_failure = std::uint64_t{1} << 13U,
-  backend_hypre_execution_query_failure = std::uint64_t{1} << 14U,
-  backend_hypre_memory_device_failure = std::uint64_t{1} << 15U,
-  backend_hypre_execution_device_failure = std::uint64_t{1} << 16U,
-  backend_hypre_policy_error_failure = std::uint64_t{1} << 17U,
-  backend_umpire_pools_failure = std::uint64_t{1} << 18U
+  backend_hypre_initialize_return_failure = std::uint64_t{1} << 8U,
+  backend_hypre_initialize_error_failure = std::uint64_t{1} << 9U,
+  backend_hypre_gpu_failure = std::uint64_t{1} << 10U,
+  backend_hypre_memory_query_failure = std::uint64_t{1} << 11U,
+  backend_hypre_execution_query_failure = std::uint64_t{1} << 12U,
+  backend_hypre_memory_device_failure = std::uint64_t{1} << 13U,
+  backend_hypre_execution_device_failure = std::uint64_t{1} << 14U,
+  backend_hypre_policy_error_failure = std::uint64_t{1} << 15U,
+  backend_umpire_pools_failure = std::uint64_t{1} << 16U
 };
 
 static inline void ReportCudaBackendFailure(
@@ -1049,19 +1046,13 @@ private:
     // Capture a stale flag before clearing it.  HYPRE_ClearAllErrors() returns
     // zero after the clear and is therefore never used as prior-error evidence.
     const HYPRE_Int hypre_incoming_error = HYPRE_GetError();
-    (void)HYPRE_ClearAllErrors();
-    const HYPRE_Int hypre_preinit_reset_error = HYPRE_GetError();
     const bool hypre_incoming_error_free = hypre_incoming_error == 0;
-    const bool hypre_preinit_reset_clean = hypre_preinit_reset_error == 0;
     if (!hypre_incoming_error_free)
       backend_failure_mask |= backend_hypre_incoming_error_failure;
-    if (!hypre_preinit_reset_clean)
-      backend_failure_mask |= backend_hypre_preinit_reset_failure;
+    (void)HYPRE_ClearAllErrors();
 
-    // No rank calls Hypre::Init unless every rank arrived with a clean flag and
-    // observed a clean post-clear state.
-    const bool local_preinit_valid =
-        hypre_incoming_error_free && hypre_preinit_reset_clean;
+    // No rank calls Hypre::Init unless every rank arrived with a clean flag.
+    const bool local_preinit_valid = hypre_incoming_error_free;
     const bool preinit_collectively_valid =
         CollectiveContinue(local_preinit_valid);
     if (!preinit_collectively_valid)
@@ -1102,8 +1093,6 @@ private:
     // Init's zero error was recorded before this reset.  From this point all
     // ranks execute the same policy/query/pool sequence unconditionally.
     (void)HYPRE_ClearAllErrors();
-    const HYPRE_Int hypre_policy_start_error = HYPRE_GetError();
-    const bool hypre_policy_start_clean = hypre_policy_start_error == 0;
     HYPRE_MemoryLocation memory_location = HYPRE_MEMORY_UNDEFINED;
     HYPRE_ExecutionPolicy execution_policy = HYPRE_EXEC_UNDEFINED;
     const bool hypre_gpu = mfem::HypreUsingGPU();
@@ -1121,12 +1110,10 @@ private:
         AllocatorPolicy::DevicePoolPolicyValid();
 
     evidence.hypre_cuda_umpire_device = local_preinit_valid &&
-        local_hypre_init_valid && hypre_policy_start_clean && hypre_gpu &&
+        local_hypre_init_valid && hypre_gpu &&
         hypre_memory_query_valid && hypre_execution_query_valid &&
         hypre_memory_device && hypre_execution_device &&
         hypre_policy_error_free && umpire_pools_valid;
-    if (!hypre_policy_start_clean)
-      backend_failure_mask |= backend_hypre_policy_reset_failure;
     if (!hypre_gpu)
       backend_failure_mask |= backend_hypre_gpu_failure;
     if (!hypre_memory_query_valid)
