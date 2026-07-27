@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -31,6 +32,8 @@ CudaAllocationLedgerV1 allocation_ledger{};
 thread_local CudaPolicyContext transport_context{};
 thread_local CudaTransferLedgerV1 transport_ledger{};
 thread_local CudaTransferTotals transport_attempt_totals{};
+thread_local bool true_system_diagnostic_active = false;
+thread_local int true_system_diagnostic_rank = -1;
 
 bool Copy(void* destination, const void* source, const std::size_t bytes,
           const cudaMemcpyKind kind) noexcept
@@ -512,10 +515,28 @@ bool CudaTransportPolicy::HostToDevice(
     const std::size_t source_capacity,
     const std::size_t destination_capacity) noexcept
 {
+  const bool trace_touch = true_system_diagnostic_active &&
+      category == CudaTransferCategory::initial_state &&
+      site == CudaTransferSite::initial_trace_upload;
+  const bool sparse_staging = true_system_diagnostic_active &&
+      category == CudaTransferCategory::topology &&
+      site == CudaTransferSite::map_upload;
+  if (trace_touch)
+    detail::CudaTrueSystemDiagnosticMarker(
+        "trace-device-touch", "enter", false);
+  if (sparse_staging)
+    detail::CudaTrueSystemDiagnosticMarker(
+        "sparse-staging", "enter", false);
   const bool success = Copy(destination, source, bytes, cudaMemcpyHostToDevice);
   RecordTransfer(CudaTransferDirection::host_to_device, category, site,
                  source, destination, bytes, source_capacity,
                  destination_capacity, success);
+  if (trace_touch)
+    detail::CudaTrueSystemDiagnosticMarker(
+        "trace-device-touch", "exit", success);
+  if (sparse_staging)
+    detail::CudaTrueSystemDiagnosticMarker(
+        "sparse-staging", "exit", success);
   return success;
 }
 
@@ -525,10 +546,19 @@ bool CudaTransportPolicy::DeviceToHost(
     const std::size_t source_capacity,
     const std::size_t destination_capacity) noexcept
 {
+  const bool true_structure_copy = true_system_diagnostic_active &&
+      category == CudaTransferCategory::topology &&
+      site == CudaTransferSite::map_upload;
+  if (true_structure_copy)
+    detail::CudaTrueSystemDiagnosticMarker(
+        "true-structure-copy", "enter", false);
   const bool success = Copy(destination, source, bytes, cudaMemcpyDeviceToHost);
   RecordTransfer(CudaTransferDirection::device_to_host, category, site,
                  source, destination, bytes, source_capacity,
                  destination_capacity, success);
+  if (true_structure_copy)
+    detail::CudaTrueSystemDiagnosticMarker(
+        "true-structure-copy", "exit", success);
   return success;
 }
 
@@ -551,14 +581,31 @@ bool CudaTransportPolicy::RecordMpiStaging(
     const void* destination, const std::size_t source_capacity,
     const std::size_t destination_capacity, const bool success) noexcept
 {
+  const bool sparse_staging = true_system_diagnostic_active &&
+      category == CudaTransferCategory::topology &&
+      site == CudaTransferSite::map_upload;
+  if (sparse_staging)
+    detail::CudaTrueSystemDiagnosticMarker(
+        "sparse-staging-mpi", "enter", false);
   RecordTransfer(CudaTransferDirection::mpi_host_staging, category, site,
                  source, destination, bytes, source_capacity,
                  destination_capacity, success);
+  if (sparse_staging)
+    detail::CudaTrueSystemDiagnosticMarker(
+        "sparse-staging-mpi", "exit", success);
   return success;
 }
 
-bool CudaTransportPolicy::Synchronize(const CudaTransferSite) noexcept
+bool CudaTransportPolicy::Synchronize(const CudaTransferSite site) noexcept
 {
+  const bool true_system_sync = true_system_diagnostic_active &&
+      (site == CudaTransferSite::map_upload ||
+       site == CudaTransferSite::initial_trace_upload);
+  const char* const sync_stage = site == CudaTransferSite::map_upload
+      ? "true-structure-sync" : "sparse-staging-sync";
+  if (true_system_sync)
+    detail::CudaTrueSystemDiagnosticMarker(
+        sync_stage, "enter", false);
   const bool success = cudaDeviceSynchronize() == cudaSuccess;
   if (transport_ledger.totals.synchronization_events !=
       std::numeric_limits<std::uint64_t>::max())
@@ -574,6 +621,9 @@ bool CudaTransportPolicy::Synchronize(const CudaTransferSite) noexcept
       transport_ledger.totals.complete && success;
   transport_attempt_totals.complete =
       transport_attempt_totals.complete && success;
+  if (true_system_sync)
+    detail::CudaTrueSystemDiagnosticMarker(
+        sync_stage, "exit", success);
   return success;
 }
 
@@ -703,11 +753,43 @@ CollectiveRestoreReport CudaMpiCollectivePolicy::ReduceRestore(
 
 namespace detail
 {
+void CudaTrueSystemDiagnosticMarker(
+    const char* const stage, const char* const edge, const bool result,
+    const std::uint64_t generation) noexcept
+{
+  if (!true_system_diagnostic_active) { return; }
+  const int hypre_error = HYPRE_GetError();
+  const cudaError_t cuda_error = cudaPeekAtLastError();
+  std::fprintf(stderr,
+      "CUDA_TRUE_SYSTEM rank=%d stage=%s edge=%s result=%u "
+      "generation=%llu hypre=%d cuda=%d\n",
+      true_system_diagnostic_rank, stage, edge, result ? 1U : 0U,
+      static_cast<unsigned long long>(generation), hypre_error,
+      static_cast<int>(cuda_error));
+}
+
+void CudaBeginTrueSystemDiagnostic(const int rank) noexcept
+{
+  true_system_diagnostic_rank = rank;
+  true_system_diagnostic_active = true;
+  CudaTrueSystemDiagnosticMarker("parallel-assemble", "enter", false);
+}
+
+void CudaEndTrueSystemDiagnostic(const bool result) noexcept
+{
+  CudaTrueSystemDiagnosticMarker("build-persistent-true-system", "exit",
+                                 result);
+  true_system_diagnostic_active = false;
+  true_system_diagnostic_rank = -1;
+}
+
 bool CudaGetTrueMatrixStructure(
     mfem::HypreParMatrix& matrix, const std::int64_t*, const int owned_count,
     CudaTrueMatrixStructure& structure, CudaCopyOutFunction copy_out,
     CudaSynchronizeFunction synchronize) noexcept
 {
+  CudaTrueSystemDiagnosticMarker("parallel-assemble", "exit", true);
+  CudaTrueSystemDiagnosticScope diagnostic("true-structure");
   try
   {
     matrix.HypreReadWrite();
@@ -774,6 +856,7 @@ bool CudaGetTrueMatrixStructure(
       if (column < 0 || column >= offd_column_count) { return false; }
       structure.offd_columns[entry] = offd_global[column];
     }
+    diagnostic.result = true;
     return true;
   }
   catch (...) { return false; }
@@ -782,6 +865,7 @@ bool CudaGetTrueMatrixStructure(
 bool CudaGetTrueMatrixDeviceView(mfem::HypreParMatrix& matrix,
                                  CudaTrueMatrixDeviceView& view) noexcept
 {
+  CudaTrueSystemDiagnosticScope diagnostic("true-device-view");
   hypre_ParCSRMatrix* raw = matrix;
   auto* diag = hypre_ParCSRMatrixDiag(raw);
   auto* offd = hypre_ParCSRMatrixOffd(raw);
@@ -789,8 +873,9 @@ bool CudaGetTrueMatrixDeviceView(mfem::HypreParMatrix& matrix,
   view.offd_values = hypre_CSRMatrixData(offd);
   view.diag_nonzeros = hypre_CSRMatrixNumNonzeros(diag);
   view.offd_nonzeros = hypre_CSRMatrixNumNonzeros(offd);
-  return view.diag_values != nullptr &&
+  diagnostic.result = view.diag_values != nullptr &&
       (view.offd_nonzeros == 0 || view.offd_values != nullptr);
+  return diagnostic.result;
 }
 
 bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
@@ -801,6 +886,8 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   CudaHypreSetupOrderEvidence& evidence)
     noexcept
 {
+  CudaTrueSystemDiagnosticScope diagnostic("object-configure",
+                                           matrix_generation);
   evidence = {};
   evidence.matrix_generation = matrix_generation;
   try
@@ -838,7 +925,9 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
     gmres.SetPrintLevel(0);
     gmres.SetZeroInitialIterate();
     evidence.Record(CudaHypreSetupAction::gmres_settings);
-    return evidence.ConfigurationExactForGeneration(matrix_generation);
+    diagnostic.result =
+        evidence.ConfigurationExactForGeneration(matrix_generation);
+    return diagnostic.result;
   }
   catch (...) { return false; }
 }
@@ -847,18 +936,20 @@ bool CudaHypreDevicePolicyValid(mfem::HypreParMatrix& matrix,
                                 mfem::HypreParVector& rhs,
                                 mfem::HypreParVector& solution) noexcept
 {
+  CudaTrueSystemDiagnosticScope diagnostic("hypre-vector-touch");
   hypre_ParCSRMatrix* a = matrix;
   hypre_ParVector* b = rhs;
   hypre_ParVector* x = solution;
   const auto am = hypre_ParCSRMatrixMemoryLocation(a);
   const auto bm = hypre_ParVectorMemoryLocation(b);
   const auto xm = hypre_ParVectorMemoryLocation(x);
-  return UmpireDeviceAllocatorPolicy::DevicePoolPolicyValid() &&
+  diagnostic.result = UmpireDeviceAllocatorPolicy::DevicePoolPolicyValid() &&
       am == HYPRE_MEMORY_DEVICE && bm == HYPRE_MEMORY_DEVICE &&
       xm == HYPRE_MEMORY_DEVICE &&
       hypre_GetExecPolicy1(am) == HYPRE_EXEC_DEVICE &&
       hypre_GetExecPolicy2(am, bm) == HYPRE_EXEC_DEVICE &&
       hypre_GetExecPolicy2(am, xm) == HYPRE_EXEC_DEVICE;
+  return diagnostic.result;
 }
 
 bool CudaRefreshFactorAndSolve(
@@ -868,6 +959,7 @@ bool CudaRefreshFactorAndSolve(
     const std::uint64_t matrix_generation,
     CudaSolveDiagnostics& diagnostics) noexcept
 {
+  CudaTrueSystemDiagnosticScope diagnostic("warm-solve", matrix_generation);
   diagnostics = {};
   diagnostics.matrix_generation = matrix_generation;
   CudaHypreSetupOrderEvidence setup_order{};
@@ -902,8 +994,9 @@ bool CudaRefreshFactorAndSolve(
     diagnostics.finite = std::isfinite(diagnostics.reported_residual);
     diagnostics.converged = diagnostics.finite &&
         diagnostics.reported_residual <= 1.0e-10;
-    return diagnostics.device_policy && diagnostics.configured_ilu0 &&
-        diagnostics.converged;
+    diagnostic.result = diagnostics.device_policy &&
+        diagnostics.configured_ilu0 && diagnostics.converged;
+    return diagnostic.result;
   }
   catch (...) { return false; }
 }
