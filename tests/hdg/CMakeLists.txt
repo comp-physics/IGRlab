@@ -165,6 +165,10 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     TIMEOUT 30)
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/runtime_contract/CMakeLists.txt")
+  add_subdirectory(runtime_contract)
+endif()
+
 # CPU core, trace, device, and formulation tests remain independently
 # registerable even when the accelerator-only oracle below is unavailable.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/core/CMakeLists.txt")
