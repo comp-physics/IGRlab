@@ -67,6 +67,8 @@ bool Finite(const std::vector<double>& values) noexcept
                      [](const double value) { return Finite(value); });
 }
 
+StateHash HashBytes(const void*, std::size_t) noexcept;
+
 bool Finite(const mfem::Vector& values) noexcept
 {
   const double* data = values.HostRead();
@@ -76,6 +78,15 @@ bool Finite(const mfem::Vector& values) noexcept
     if (!Finite(data[index])) { return false; }
   }
   return true;
+}
+
+StateHash HashVector(const mfem::Vector& values) noexcept
+{
+  const double* data = values.HostRead();
+  return data || values.Size() == 0
+      ? HashBytes(data, static_cast<std::size_t>(values.Size()) *
+                            sizeof(double))
+      : StateHash{};
 }
 
 int ByNodes(const int scalar, const int scalar_count,
@@ -428,6 +439,34 @@ StateHash HashPair(const StateHash& left, const StateHash& right) noexcept
   return HashBytes(bytes.data(), bytes.size());
 }
 
+StateHash RankCommonHash(const std::vector<double>& values) noexcept
+{
+  int ranks = 0;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS ||
+      (ranks != 1 && ranks != 2))
+  {
+    return {};
+  }
+  std::array<std::uint8_t, 40> local{};
+  const std::uint64_t size = static_cast<std::uint64_t>(values.size());
+  for (unsigned int byte = 0; byte < 8; ++byte)
+  {
+    local[byte] = static_cast<std::uint8_t>(size >> (8U * byte));
+  }
+  const StateHash local_hash = HashDoubles(values);
+  std::copy(local_hash.bytes.begin(), local_hash.bytes.end(),
+            local.begin() + 8);
+  std::array<std::array<std::uint8_t, 40>, 2> rank_ordered{};
+  if (MPI_Allgather(local.data(), static_cast<int>(local.size()), MPI_BYTE,
+                    rank_ordered.data(), static_cast<int>(local.size()),
+                    MPI_BYTE, MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return {};
+  }
+  return HashBytes(rank_ordered.data(),
+                   static_cast<std::size_t>(ranks) * local.size());
+}
+
 std::uint64_t FailureMask(const FailureReason reason) noexcept
 {
   const unsigned int value = static_cast<unsigned int>(reason);
@@ -535,6 +574,61 @@ struct CpuSlotCell
 namespace
 {
 
+struct CpuOwnedAllocationLedger
+{
+  std::array<CpuOwnedAllocationEvent, 96> events{};
+  std::size_t count = 0;
+  std::size_t baseline = 0;
+  bool sealed = false;
+
+  bool Observe(const CpuOwnedAllocationSite site,
+               const std::size_t bytes,
+               const std::size_t alignment,
+               const std::size_t capacity,
+               const void* token) noexcept
+  {
+    if (!token || bytes == 0 || alignment == 0 || count >= events.size())
+    {
+      return false;
+    }
+    events[count] = {site, static_cast<std::uint64_t>(count + 1), bytes,
+                     alignment, capacity,
+                     reinterpret_cast<std::uintptr_t>(token)};
+    ++count;
+    return true;
+  }
+
+  void Seal() noexcept
+  {
+    baseline = count;
+    sealed = true;
+  }
+
+  std::uint64_t EventsAfterBaseline() const noexcept
+  {
+    return sealed && count >= baseline
+        ? static_cast<std::uint64_t>(count - baseline)
+        : 0;
+  }
+};
+
+template <typename T>
+bool ResizeOwned(std::vector<T>& values,
+                 const std::size_t size,
+                 const CpuOwnedAllocationSite site,
+                 CpuOwnedAllocationLedger& ledger)
+{
+  const T* before = values.data();
+  const std::size_t before_capacity = values.capacity();
+  values.resize(size);
+  if (values.data() != before || values.capacity() != before_capacity)
+  {
+    return ledger.Observe(site, values.capacity() * sizeof(T), alignof(T),
+                          values.capacity(), values.data());
+  }
+  return true;
+}
+
 bool ValidSlot(const CpuStateSlot& slot) noexcept
 {
   return slot.interior.cell && slot.trace.cell &&
@@ -559,12 +653,24 @@ bool CopySlot(const CpuStateSlot& source, CpuStateSlot& destination) noexcept
 }
 
 CpuStateSlot MakeSlot(const std::size_t interior_size,
-                      const std::size_t trace_size)
+                      const std::size_t trace_size,
+                      CpuOwnedAllocationLedger& ledger)
 {
   auto cell = std::make_shared<CpuSlotCell>();
   cell->backing = std::make_unique<CpuSlotStorage>();
-  cell->backing->interior.resize(interior_size);
-  cell->backing->trace.resize(trace_size);
+  if (!ledger.Observe(CpuOwnedAllocationSite::slot_backing,
+                      sizeof(CpuSlotStorage), alignof(CpuSlotStorage), 1,
+                      cell->backing.get()))
+  {
+    throw std::bad_alloc();
+  }
+  if (!ResizeOwned(cell->backing->interior, interior_size,
+                   CpuOwnedAllocationSite::slot_interior, ledger) ||
+      !ResizeOwned(cell->backing->trace, trace_size,
+                   CpuOwnedAllocationSite::slot_trace, ledger))
+  {
+    throw std::bad_alloc();
+  }
   return {{cell}, {cell}};
 }
 
@@ -614,11 +720,10 @@ bool CpuStateStoragePolicy::CopyOut(
 
 void CpuStateStoragePolicy::DiscardCandidate(CpuStateSlot& candidate) noexcept
 {
-  CpuSlotStorage* storage = Storage(candidate);
-  if (!storage) { return; }
-  const double invalid = std::numeric_limits<double>::quiet_NaN();
-  std::fill(storage->interior.begin(), storage->interior.end(), invalid);
-  std::fill(storage->trace.begin(), storage->trace.end(), invalid);
+  // Candidate authority is invalidated by its attempt-qualified generation.
+  // Discard is intentionally byte preserving: poisoning is neither authority
+  // revocation nor evidence of it, and it obscures exact rollback audits.
+  (void)candidate;
 }
 
 bool CpuStateStoragePolicy::CanPublish(
@@ -634,6 +739,13 @@ void CpuStateStoragePolicy::Publish(
 {
   // The sole publication mutation: one ownership-handle swap publishes both
   // interior and true-trace coefficient arrays together.
+  committed.interior.cell->backing.swap(candidate.interior.cell->backing);
+}
+
+void CpuStateStoragePolicy::RevertPublish(
+    CpuStateSlot& committed, CpuStateSlot& candidate) noexcept
+{
+  // The complete-backing exchange is its own exact byte inverse.
   committed.interior.cell->backing.swap(candidate.interior.cell->backing);
 }
 
@@ -653,13 +765,13 @@ StateHash CpuStateStoragePolicy::HashInterior(
     const CpuInteriorState& state) noexcept
 {
   if (!state.cell || !state.cell->backing) { return {}; }
-  return HashDoubles(state.cell->backing->interior);
+  return RankCommonHash(state.cell->backing->interior);
 }
 
 StateHash CpuStateStoragePolicy::HashTrace(const CpuTraceState& state) noexcept
 {
   if (!state.cell || !state.cell->backing) { return {}; }
-  return HashDoubles(state.cell->backing->trace);
+  return RankCommonHash(state.cell->backing->trace);
 }
 
 CpuCoefficientView CpuCheckpoint::interior() const noexcept
@@ -678,6 +790,58 @@ CpuCoefficientView CpuCheckpoint::trace() const noexcept
                                       storage->trace.size(),
                                       storage->trace.capacity()}
                  : CpuCoefficientView{};
+}
+
+bool ImportCpuCheckpoint(const CheckpointDescriptor& descriptor,
+                         const double* local_interior,
+                         const std::size_t local_interior_size,
+                         const double* local_true_trace,
+                         const std::size_t local_true_trace_size,
+                         CpuCheckpoint& checkpoint) noexcept
+{
+  if (checkpoint.valid || !descriptor.successful_commit ||
+      (!local_interior && local_interior_size != 0) ||
+      (!local_true_trace && local_true_trace_size != 0))
+  {
+    return false;
+  }
+  try
+  {
+    CpuOwnedAllocationLedger checkpoint_allocations;
+    CpuStateSlot imported = MakeSlot(local_interior_size,
+                                     local_true_trace_size,
+                                     checkpoint_allocations);
+    CpuSlotStorage* storage = Storage(imported);
+    if (!storage) { return false; }
+    if (local_interior_size != 0)
+    {
+      std::memcpy(storage->interior.data(), local_interior,
+                  local_interior_size * sizeof(double));
+    }
+    if (local_true_trace_size != 0)
+    {
+      std::memcpy(storage->trace.data(), local_true_trace,
+                  local_true_trace_size * sizeof(double));
+    }
+    const bool local_ok = Finite(storage->interior) && Finite(storage->trace) &&
+        CpuStateStoragePolicy::HashInterior(imported.interior) ==
+            descriptor.interior_hash &&
+        CpuStateStoragePolicy::HashTrace(imported.trace) ==
+            descriptor.trace_hash;
+    if (!AllRanks(local_ok)) { return false; }
+    checkpoint.descriptor = descriptor;
+    checkpoint.state = std::move(imported);
+    checkpoint.owned_allocation_event_count = checkpoint_allocations.count;
+    std::copy_n(checkpoint_allocations.events.begin(),
+                checkpoint_allocations.count,
+                checkpoint.owned_allocation_events.begin());
+    checkpoint.valid = true;
+    return true;
+  }
+  catch (...)
+  {
+    return false;
+  }
 }
 
 CollectiveAdmissionReport CpuWorldCollectivePolicy::Admit(
@@ -798,7 +962,8 @@ struct LocalSystem
   std::vector<double> f;
   std::vector<double> g;
 
-  void Allocate(const int batch_count, const int ni, const int nt)
+  bool Allocate(const int batch_count, const int ni, const int nt,
+                CpuOwnedAllocationLedger& ledger)
   {
     elements = batch_count;
     interior_dofs = ni;
@@ -806,14 +971,22 @@ struct LocalSystem
     const std::size_t batches = static_cast<std::size_t>(elements);
     const std::size_t interior = static_cast<std::size_t>(ni);
     const std::size_t trace = static_cast<std::size_t>(nt);
-    residual_interior.resize(batches * interior);
-    residual_trace.resize(batches * trace);
-    a.resize(batches * interior * interior);
-    b.resize(batches * interior * trace);
-    c.resize(batches * trace * interior);
-    d.resize(batches * trace * trace);
-    f.resize(batches * interior);
-    g.resize(batches * trace);
+    return ResizeOwned(residual_interior, batches * interior,
+                       CpuOwnedAllocationSite::local_system_vector, ledger) &&
+        ResizeOwned(residual_trace, batches * trace,
+                    CpuOwnedAllocationSite::local_system_vector, ledger) &&
+        ResizeOwned(a, batches * interior * interior,
+                    CpuOwnedAllocationSite::local_system_vector, ledger) &&
+        ResizeOwned(b, batches * interior * trace,
+                    CpuOwnedAllocationSite::local_system_vector, ledger) &&
+        ResizeOwned(c, batches * trace * interior,
+                    CpuOwnedAllocationSite::local_system_vector, ledger) &&
+        ResizeOwned(d, batches * trace * trace,
+                    CpuOwnedAllocationSite::local_system_vector, ledger) &&
+        ResizeOwned(f, batches * interior,
+                    CpuOwnedAllocationSite::local_system_vector, ledger) &&
+        ResizeOwned(g, batches * trace,
+                    CpuOwnedAllocationSite::local_system_vector, ledger);
   }
 
   void Zero() noexcept
@@ -942,11 +1115,75 @@ int CellIndex(const double coordinate) noexcept
 
 struct detail::CpuNumericsCore::Implementation
 {
+  enum class ArtifactStage : unsigned char
+  {
+    local,
+    condensed,
+    solve,
+    solution,
+    recovery
+  };
+  struct ArtifactCapability
+  {
+    ArtifactCapability() noexcept = default;
+    ArtifactCapability(const std::uint64_t sequence,
+                       const std::uint64_t cursor,
+                       const std::uint64_t artifact_generation,
+                       const ArtifactStage artifact_stage) noexcept
+        : attempt_sequence(sequence), candidate_cursor(cursor),
+          generation(artifact_generation), stage(artifact_stage), valid(true)
+    {}
+    ArtifactCapability(const ArtifactCapability&) = delete;
+    ArtifactCapability& operator=(const ArtifactCapability&) = delete;
+    ArtifactCapability(ArtifactCapability&& other) noexcept
+    {
+      MoveFrom(other);
+    }
+    ArtifactCapability& operator=(ArtifactCapability&& other) noexcept
+    {
+      if (this != &other) { MoveFrom(other); }
+      return *this;
+    }
+    std::uint64_t attempt_sequence = 0;
+    std::uint64_t candidate_cursor = 0;
+    std::uint64_t generation = 0;
+    ArtifactStage stage = ArtifactStage::local;
+    bool valid = false;
+  private:
+    void MoveFrom(ArtifactCapability& other) noexcept
+    {
+      attempt_sequence = other.attempt_sequence;
+      candidate_cursor = other.candidate_cursor;
+      generation = other.generation;
+      stage = other.stage;
+      valid = other.valid;
+      other.valid = false;
+    }
+  };
+  struct SparseSchurTerm
+  {
+    std::size_t schur_index = 0;
+    int data_index = -1;
+    double sign = 1.0;
+    bool offdiagonal = false;
+  };
+  struct SparseOutgoingTerm
+  {
+    std::size_t schur_index = 0;
+    double sign = 1.0;
+  };
+  struct SparseIncomingSlot
+  {
+    int data_index = -1;
+    bool offdiagonal = false;
+  };
+
   CpuPersistentConfig config{};
   RuntimeTupleDescriptor tuple{};
   int rank = -1;
   int ranks = 0;
   bool initialized = false;
+  CpuOwnedAllocationLedger allocations{};
 
   std::unique_ptr<mfem::ParMesh> mesh;
   std::unique_ptr<mfem::L2_FECollection> interior_collection;
@@ -957,7 +1194,6 @@ struct detail::CpuNumericsCore::Implementation
 
   CpuStateSlot committed_slot{};
   CpuStateSlot candidate_slot{};
-  CpuStateSlot checkpoint_slot{};
   std::vector<double> first_iterate_interior;
   std::vector<double> first_iterate_trace;
 
@@ -1010,8 +1246,11 @@ struct detail::CpuNumericsCore::Implementation
   mfem::SparseMatrix true_diagonal_view;
   mfem::SparseMatrix true_offdiagonal_view;
   HYPRE_BigInt* true_offdiagonal_columns = nullptr;
-  std::vector<double> local_global_matrix;
-  std::vector<double> global_matrix;
+  std::vector<SparseSchurTerm> owned_schur_terms;
+  std::vector<SparseOutgoingTerm> outgoing_schur_terms;
+  std::vector<SparseIncomingSlot> incoming_schur_slots;
+  std::vector<double> outgoing_schur_values;
+  std::vector<double> incoming_schur_values;
   std::unique_ptr<mfem::HypreParVector> hypre_rhs;
   std::unique_ptr<mfem::HypreParVector> hypre_solution;
   std::unique_ptr<mfem::HypreParVector> hypre_residual;
@@ -1023,8 +1262,35 @@ struct detail::CpuNumericsCore::Implementation
   StateCoordinates entry_coordinates{};
   StateHash entry_interior_hash{};
   StateHash entry_trace_hash{};
+  std::uint64_t next_artifact_generation = 1;
+  std::uint64_t next_candidate_generation = 1;
+  std::uint64_t active_candidate_generation = 0;
+  StateHash active_candidate_state_hash{};
+  bool publication_chain_authority = false;
 
   bool CollectiveAll(const bool local) const noexcept { return AllRanks(local); }
+
+  bool ConsumeArtifact(ArtifactCapability&& capability,
+                       const ArtifactStage expected_stage,
+                       const AttemptIdentity& attempt,
+                       const std::uint64_t expected_generation) noexcept
+  {
+    const bool accepted = capability.valid &&
+        capability.stage == expected_stage &&
+        capability.attempt_sequence == attempt.sequence &&
+        capability.candidate_cursor == attempt.sequence &&
+        capability.generation == expected_generation;
+    capability.valid = false;
+    return accepted;
+  }
+
+  template <typename T>
+  bool ObserveWrapper(const std::unique_ptr<T>& value) noexcept
+  {
+    return value && allocations.Observe(CpuOwnedAllocationSite::mfem_wrapper,
+                                         sizeof(T), alignof(T), 1,
+                                         value.get());
+  }
 
   CpuSlotStorage* Committed() noexcept { return Storage(committed_slot); }
   const CpuSlotStorage* Committed() const noexcept
@@ -1183,17 +1449,28 @@ struct detail::CpuNumericsCore::Implementation
   {
     try
     {
-      interior_global_ids.resize(
-          static_cast<std::size_t>(interior_space->GetVSize()));
+      if (!ResizeOwned(interior_global_ids,
+                       static_cast<std::size_t>(interior_space->GetVSize()),
+                       CpuOwnedAllocationSite::topology_vector,
+                       allocations))
+      {
+        return false;
+      }
       for (int local = 0; local < interior_space->GetVSize(); ++local)
       {
         interior_global_ids[static_cast<std::size_t>(local)] =
             static_cast<std::uint64_t>(
                 interior_space->GetGlobalTDofNumber(local));
       }
-      trace_canonical_ids.assign(
-          static_cast<std::size_t>(trace_space->GetTrueVSize()),
-          std::numeric_limits<std::uint64_t>::max());
+      if (!ResizeOwned(trace_canonical_ids,
+                       static_cast<std::size_t>(trace_space->GetTrueVSize()),
+                       CpuOwnedAllocationSite::topology_vector,
+                       allocations))
+      {
+        return false;
+      }
+      std::fill(trace_canonical_ids.begin(), trace_canonical_ids.end(),
+                std::numeric_limits<std::uint64_t>::max());
       for (int face = 0; face < mesh->GetNumFaces(); ++face)
       {
         const mfem::FiniteElement* finite_element =
@@ -1291,11 +1568,22 @@ struct detail::CpuNumericsCore::Implementation
       scalar_trace_dofs = 2;
       local_trace = first_faces.Size() * scalar_trace_dofs *
           cpu_conserved_components;
-      element_interior_vdofs.resize(
-          static_cast<std::size_t>(mesh->GetNE()) * local_interior);
-      element_faces.resize(static_cast<std::size_t>(mesh->GetNE()) * 4);
-      signed_trace_dofs.resize(
-          static_cast<std::size_t>(mesh->GetNE()) * local_trace);
+      if (!ResizeOwned(element_interior_vdofs,
+                       static_cast<std::size_t>(mesh->GetNE()) *
+                           local_interior,
+                       CpuOwnedAllocationSite::topology_vector,
+                       allocations) ||
+          !ResizeOwned(element_faces,
+                       static_cast<std::size_t>(mesh->GetNE()) * 4,
+                       CpuOwnedAllocationSite::topology_vector,
+                       allocations) ||
+          !ResizeOwned(signed_trace_dofs,
+                       static_cast<std::size_t>(mesh->GetNE()) * local_trace,
+                       CpuOwnedAllocationSite::topology_vector,
+                       allocations))
+      {
+        return false;
+      }
       for (int element = 0; element < mesh->GetNE(); ++element)
       {
         mfem::Array<int> vdofs;
@@ -1427,22 +1715,250 @@ struct detail::CpuNumericsCore::Implementation
     return true;
   }
 
+  bool FindOwnedTrueEntry(const std::uint64_t global_row,
+                          const std::uint64_t global_column,
+                          int& data_index,
+                          bool& offdiagonal) noexcept
+  {
+    const HYPRE_BigInt* row_starts = true_matrix->GetRowStarts();
+    int* diagonal_i = true_diagonal_view.GetI();
+    int* diagonal_j = true_diagonal_view.GetJ();
+    int* offdiagonal_i = true_offdiagonal_view.GetI();
+    int* offdiagonal_j = true_offdiagonal_view.GetJ();
+    if (!row_starts || !diagonal_i || !diagonal_j || !offdiagonal_i)
+    {
+      return false;
+    }
+    const HYPRE_BigInt row_begin = HYPRE_AssumedPartitionCheck()
+        ? row_starts[0] : row_starts[rank];
+    const HYPRE_BigInt row_end = row_begin + true_diagonal_view.Height();
+    if (global_row < static_cast<std::uint64_t>(row_begin) ||
+        global_row >= static_cast<std::uint64_t>(row_end))
+    {
+      return false;
+    }
+    const int local_row = static_cast<int>(global_row - row_begin);
+    if (global_column >= static_cast<std::uint64_t>(row_begin) &&
+        global_column < static_cast<std::uint64_t>(row_end))
+    {
+      const int local_column = static_cast<int>(global_column - row_begin);
+      for (int entry = diagonal_i[local_row];
+           entry < diagonal_i[local_row + 1]; ++entry)
+      {
+        if (diagonal_j[entry] == local_column)
+        {
+          data_index = entry;
+          offdiagonal = false;
+          return true;
+        }
+      }
+      return false;
+    }
+    if (!offdiagonal_j || !true_offdiagonal_columns) { return false; }
+    for (int entry = offdiagonal_i[local_row];
+         entry < offdiagonal_i[local_row + 1]; ++entry)
+    {
+      if (static_cast<std::uint64_t>(
+              true_offdiagonal_columns[offdiagonal_j[entry]]) ==
+          global_column)
+      {
+        data_index = entry;
+        offdiagonal = true;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool BuildSparseSchurPlan() noexcept
+  {
+    try
+    {
+      std::size_t owned_count = 0;
+      std::size_t outgoing_count = 0;
+      for (int element = 0; element < mesh->GetNE(); ++element)
+        for (int row = 0; row < local_trace; ++row)
+        {
+          double sign = 1.0;
+          const int row_dof = Decode(signed_trace_dofs[
+              static_cast<std::size_t>(element) * local_trace + row], sign);
+          if (row_dof < 0 || row_dof >= static_cast<int>(
+                  exchange_plan.map.dofs.entries.size()))
+          {
+            return false;
+          }
+          const auto& row_entry = exchange_plan.map.dofs.entries[
+              static_cast<std::size_t>(row_dof)];
+          const std::size_t count = static_cast<std::size_t>(local_trace);
+          if (row_entry.owner_rank == rank) { owned_count += count; }
+          else { outgoing_count += count; }
+        }
+      if (!ResizeOwned(owned_schur_terms, owned_count,
+                       CpuOwnedAllocationSite::sparse_exchange_graph,
+                       allocations) ||
+          !ResizeOwned(outgoing_schur_terms, outgoing_count,
+                       CpuOwnedAllocationSite::sparse_exchange_graph,
+                       allocations))
+      {
+        return false;
+      }
+      std::vector<std::array<std::uint64_t, 2>> outgoing_keys(outgoing_count);
+      std::size_t owned_cursor = 0;
+      std::size_t outgoing_cursor = 0;
+      for (int element = 0; element < mesh->GetNE(); ++element)
+        for (int row = 0; row < local_trace; ++row)
+        {
+          double row_sign = 1.0;
+          const int row_dof = Decode(signed_trace_dofs[
+              static_cast<std::size_t>(element) * local_trace + row],
+                                     row_sign);
+          const auto& row_entry = exchange_plan.map.dofs.entries[
+              static_cast<std::size_t>(row_dof)];
+          for (int column = 0; column < local_trace; ++column)
+          {
+            double column_sign = 1.0;
+            const int column_dof = Decode(signed_trace_dofs[
+                static_cast<std::size_t>(element) * local_trace + column],
+                                          column_sign);
+            if (column_dof < 0 || column_dof >= static_cast<int>(
+                    exchange_plan.map.dofs.entries.size()))
+            {
+              return false;
+            }
+            const auto& column_entry = exchange_plan.map.dofs.entries[
+                static_cast<std::size_t>(column_dof)];
+            const std::size_t schur_index =
+                static_cast<std::size_t>(element) * local_trace * local_trace +
+                static_cast<std::size_t>(row) * local_trace + column;
+            const double sign = row_sign * column_sign;
+            if (row_entry.owner_rank == rank)
+            {
+              int data_index = -1;
+              bool offdiagonal = false;
+              if (!FindOwnedTrueEntry(row_entry.global_true_dof,
+                                      column_entry.global_true_dof,
+                                      data_index, offdiagonal))
+              {
+                return false;
+              }
+              owned_schur_terms[owned_cursor++] =
+                  {schur_index, data_index, sign, offdiagonal};
+            }
+            else
+            {
+              outgoing_schur_terms[outgoing_cursor] = {schur_index, sign};
+              outgoing_keys[outgoing_cursor] = {
+                  static_cast<std::uint64_t>(row_entry.global_true_dof),
+                  static_cast<std::uint64_t>(column_entry.global_true_dof)};
+              ++outgoing_cursor;
+            }
+          }
+        }
+      if (owned_cursor != owned_count || outgoing_cursor != outgoing_count)
+      {
+        return false;
+      }
+
+      std::size_t incoming_count = 0;
+      std::vector<std::array<std::uint64_t, 2>> incoming_keys;
+      if (ranks == 2)
+      {
+        const int peer = 1 - rank;
+        unsigned long long send_count =
+            static_cast<unsigned long long>(outgoing_count);
+        unsigned long long receive_count = 0;
+        if (MPI_Sendrecv(&send_count, 1, MPI_UNSIGNED_LONG_LONG, peer, 810,
+                         &receive_count, 1, MPI_UNSIGNED_LONG_LONG, peer, 810,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE) != MPI_SUCCESS ||
+            receive_count > static_cast<unsigned long long>(
+                std::numeric_limits<int>::max()))
+        {
+          return false;
+        }
+        incoming_count = static_cast<std::size_t>(receive_count);
+        incoming_keys.resize(incoming_count);
+        if (MPI_Sendrecv(outgoing_keys.data(),
+                         static_cast<int>(outgoing_count * 2),
+                         MPI_UINT64_T, peer, 811,
+                         incoming_keys.data(),
+                         static_cast<int>(incoming_count * 2),
+                         MPI_UINT64_T, peer, 811,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE) != MPI_SUCCESS)
+        {
+          return false;
+        }
+      }
+      else if (outgoing_count != 0)
+      {
+        return false;
+      }
+      if (!ResizeOwned(incoming_schur_slots, incoming_count,
+                       CpuOwnedAllocationSite::sparse_exchange_graph,
+                       allocations) ||
+          !ResizeOwned(outgoing_schur_values, outgoing_count,
+                       CpuOwnedAllocationSite::sparse_exchange_buffer,
+                       allocations) ||
+          !ResizeOwned(incoming_schur_values, incoming_count,
+                       CpuOwnedAllocationSite::sparse_exchange_buffer,
+                       allocations))
+      {
+        return false;
+      }
+      for (std::size_t index = 0; index < incoming_count; ++index)
+      {
+        int data_index = -1;
+        bool offdiagonal = false;
+        if (!FindOwnedTrueEntry(incoming_keys[index][0], incoming_keys[index][1],
+                                data_index, offdiagonal))
+        {
+          return false;
+        }
+        incoming_schur_slots[index] = {data_index, offdiagonal};
+      }
+      return true;
+    }
+    catch (...)
+    {
+      return false;
+    }
+  }
+
   bool AllocateWorkspace() noexcept
   {
     try
     {
-      current_system.Allocate(mesh->GetNE(), local_interior, local_trace);
-      trial_system.Allocate(mesh->GetNE(), local_interior, local_trace);
+      if (!current_system.Allocate(mesh->GetNE(), local_interior, local_trace,
+                                   allocations) ||
+          !trial_system.Allocate(mesh->GetNE(), local_interior, local_trace,
+                                 allocations))
+      {
+        return false;
+      }
       const std::size_t batches = static_cast<std::size_t>(mesh->GetNE());
       const std::size_t ni = static_cast<std::size_t>(local_interior);
       const std::size_t nt = static_cast<std::size_t>(local_trace);
-      schur.resize(batches * nt * nt);
-      reduced_rhs.resize(batches * nt);
-      local_trace_increment.resize(batches * nt);
-      recovered_interior.resize(batches * ni);
-      grid_interior_increment.resize(
-          static_cast<std::size_t>(interior_space->GetVSize()));
-      interior_census.resize(grid_interior_increment.size());
+      if (!ResizeOwned(schur, batches * nt * nt,
+                       CpuOwnedAllocationSite::condensation_vector,
+                       allocations) ||
+          !ResizeOwned(reduced_rhs, batches * nt,
+                       CpuOwnedAllocationSite::condensation_vector,
+                       allocations) ||
+          !ResizeOwned(local_trace_increment, batches * nt,
+                       CpuOwnedAllocationSite::recovery_vector,
+                       allocations) ||
+          !ResizeOwned(recovered_interior, batches * ni,
+                       CpuOwnedAllocationSite::recovery_vector,
+                       allocations) ||
+          !ResizeOwned(grid_interior_increment,
+                       static_cast<std::size_t>(interior_space->GetVSize()),
+                       CpuOwnedAllocationSite::recovery_vector,
+                       allocations) ||
+          !ResizeOwned(interior_census, grid_interior_increment.size(),
+                       CpuOwnedAllocationSite::recovery_vector,
+                       allocations))
+      {
+        return false;
+      }
 
       old_interior = std::make_unique<mfem::ParGridFunction>(
           interior_space.get());
@@ -1452,6 +1968,12 @@ struct detail::CpuNumericsCore::Implementation
           interior_space.get());
       iterate_trace = std::make_unique<mfem::ParGridFunction>(trace_space.get());
       trial_trace = std::make_unique<mfem::ParGridFunction>(trace_space.get());
+      if (!ObserveWrapper(old_interior) || !ObserveWrapper(iterate_interior) ||
+          !ObserveWrapper(trial_interior) || !ObserveWrapper(iterate_trace) ||
+          !ObserveWrapper(trial_trace))
+      {
+        return false;
+      }
       iterate_true_trace.SetSize(trace_space->GetTrueVSize());
       trial_true_trace.SetSize(trace_space->GetTrueVSize());
       true_increment.SetSize(trace_space->GetTrueVSize());
@@ -1480,6 +2002,7 @@ struct detail::CpuNumericsCore::Implementation
 
       local_matrix = std::make_unique<mfem::SparseMatrix>(
           trace_space->GetVSize());
+      if (!ObserveWrapper(local_matrix)) { return false; }
       mfem::DenseMatrix graph_pattern(local_trace);
       for (int element = 0; element < mesh->GetNE(); ++element)
       {
@@ -1507,7 +2030,9 @@ struct detail::CpuNumericsCore::Implementation
       local_matrix->Finalize(0, false);
       parallel_form =
           std::make_unique<mfem::ParBilinearForm>(trace_space.get());
+      if (!ObserveWrapper(parallel_form)) { return false; }
       true_matrix.reset(parallel_form->ParallelAssemble(local_matrix.get()));
+      if (!ObserveWrapper(true_matrix)) { return false; }
       if (!true_matrix ||
           true_matrix->Height() != trace_space->GetTrueVSize() ||
           true_matrix->GetGlobalNumRows() != trace_space->GlobalTrueVSize() ||
@@ -1518,10 +2043,7 @@ struct detail::CpuNumericsCore::Implementation
       true_matrix->GetDiag(true_diagonal_view);
       true_matrix->GetOffd(true_offdiagonal_view,
                            true_offdiagonal_columns);
-      const std::size_t global_trace = static_cast<std::size_t>(
-          trace_space->GlobalTrueVSize());
-      local_global_matrix.resize(global_trace * global_trace);
-      global_matrix.resize(global_trace * global_trace);
+      if (!BuildSparseSchurPlan()) { return false; }
       *local_matrix = 0.0;
       if (!PrimeCondensationWorkspace()) { return false; }
       hypre_rhs = std::make_unique<mfem::HypreParVector>(trace_space.get());
@@ -1537,6 +2059,12 @@ struct detail::CpuNumericsCore::Implementation
       ilu->SetLocalReordering(0);
       ilu->SetPrintLevel(0);
       gmres = std::make_unique<mfem::HypreGMRES>(MPI_COMM_WORLD);
+      if (!ObserveWrapper(hypre_rhs) || !ObserveWrapper(hypre_solution) ||
+          !ObserveWrapper(hypre_residual) || !ObserveWrapper(ilu) ||
+          !ObserveWrapper(gmres))
+      {
+        return false;
+      }
       gmres->SetTol(1.0e-12);
       gmres->SetAbsTol(0.0);
       const int global_trace_size =
@@ -1570,7 +2098,9 @@ struct detail::CpuNumericsCore::Implementation
         bytes(trial_system.g) + bytes(schur) + bytes(reduced_rhs) +
         bytes(local_trace_increment) + bytes(recovered_interior) +
         bytes(grid_interior_increment) + bytes(interior_census) +
-        bytes(local_global_matrix) + bytes(global_matrix);
+        bytes(owned_schur_terms) + bytes(outgoing_schur_terms) +
+        bytes(incoming_schur_slots) + bytes(outgoing_schur_values) +
+        bytes(incoming_schur_values);
   }
 
   bool Assemble(const mfem::ParGridFunction& current_interior,
@@ -2064,104 +2594,70 @@ struct detail::CpuNumericsCore::Implementation
                                    element_trace_dofs_workspace,
                                    local_schur_workspace, 1);
       }
-      const int global_trace =
-          static_cast<int>(trace_space->GlobalTrueVSize());
-      if (!true_matrix || global_trace <= 0 ||
-          local_global_matrix.size() !=
-              static_cast<std::size_t>(global_trace) * global_trace ||
-          global_matrix.size() != local_global_matrix.size())
-      {
-        return false;
-      }
-      std::fill(local_global_matrix.begin(), local_global_matrix.end(), 0.0);
-      for (int element = 0; element < system.elements; ++element)
-        for (int row = 0; row < local_trace; ++row)
-        {
-          double row_sign = 1.0;
-          const int row_dof = Decode(signed_trace_dofs[
-              static_cast<std::size_t>(element) * local_trace + row],
-                                     row_sign);
-          if (row_dof < 0 || row_dof >=
-                  static_cast<int>(exchange_plan.map.dofs.entries.size()))
-          {
-            return false;
-          }
-          const std::uint64_t global_row =
-              exchange_plan.map.dofs.entries[
-                  static_cast<std::size_t>(row_dof)].global_true_dof;
-          for (int column = 0; column < local_trace; ++column)
-          {
-            double column_sign = 1.0;
-            const int column_dof = Decode(signed_trace_dofs[
-                static_cast<std::size_t>(element) * local_trace + column],
-                                          column_sign);
-            if (column_dof < 0 || column_dof >= static_cast<int>(
-                    exchange_plan.map.dofs.entries.size()))
-            {
-              return false;
-            }
-            const std::uint64_t global_column =
-                exchange_plan.map.dofs.entries[
-                    static_cast<std::size_t>(column_dof)].global_true_dof;
-            local_global_matrix[
-                static_cast<std::size_t>(global_row) * global_trace +
-                global_column] += row_sign * column_sign * schur[
-                    static_cast<std::size_t>(element) * local_trace *
-                        local_trace +
-                    static_cast<std::size_t>(row) * local_trace + column];
-          }
-        }
-      if (local_global_matrix.size() >
-              static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-          MPI_Allreduce(local_global_matrix.data(), global_matrix.data(),
-                        static_cast<int>(local_global_matrix.size()),
-                        MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS ||
-          !Finite(global_matrix))
-      {
-        return false;
-      }
-
+      if (!true_matrix) { return false; }
       true_matrix->HostReadWrite();
       true_matrix->GetDiag(true_diagonal_view);
       true_matrix->GetOffd(true_offdiagonal_view,
                            true_offdiagonal_columns);
-      const HYPRE_BigInt* row_starts = true_matrix->GetRowStarts();
-      int* diagonal_i = true_diagonal_view.GetI();
-      int* diagonal_j = true_diagonal_view.GetJ();
       double* diagonal_data = true_diagonal_view.GetData();
-      int* offdiagonal_i = true_offdiagonal_view.GetI();
-      int* offdiagonal_j = true_offdiagonal_view.GetJ();
       double* offdiagonal_data = true_offdiagonal_view.GetData();
-      if (!row_starts || !diagonal_i || !diagonal_j || !diagonal_data ||
-          !offdiagonal_i ||
+      if (!diagonal_data ||
           (true_offdiagonal_view.NumNonZeroElems() != 0 &&
-           (!offdiagonal_j || !offdiagonal_data ||
-            !true_offdiagonal_columns)))
+           !offdiagonal_data))
       {
         return false;
       }
-      const HYPRE_BigInt row_begin = HYPRE_AssumedPartitionCheck()
-          ? row_starts[0] : row_starts[rank];
-      for (int row = 0; row < true_diagonal_view.Height(); ++row)
+      std::fill(diagonal_data,
+                diagonal_data + true_diagonal_view.NumNonZeroElems(), 0.0);
+      if (offdiagonal_data)
       {
-        const std::size_t global_row =
-            static_cast<std::size_t>(row_begin + row);
-        for (int entry = diagonal_i[row]; entry < diagonal_i[row + 1];
-             ++entry)
+        std::fill(offdiagonal_data,
+                  offdiagonal_data + true_offdiagonal_view.NumNonZeroElems(),
+                  0.0);
+      }
+      for (const SparseSchurTerm& term : owned_schur_terms)
+      {
+        if (term.schur_index >= schur.size() || term.data_index < 0)
         {
-          const std::size_t global_column =
-              static_cast<std::size_t>(row_begin + diagonal_j[entry]);
-          diagonal_data[entry] =
-              global_matrix[global_row * global_trace + global_column];
+          return false;
         }
-        for (int entry = offdiagonal_i[row];
-             entry < offdiagonal_i[row + 1]; ++entry)
+        double* destination = term.offdiagonal ? offdiagonal_data
+                                               : diagonal_data;
+        if (!destination) { return false; }
+        destination[term.data_index] += term.sign * schur[term.schur_index];
+      }
+      for (std::size_t index = 0; index < outgoing_schur_terms.size(); ++index)
+      {
+        const SparseOutgoingTerm& term = outgoing_schur_terms[index];
+        if (term.schur_index >= schur.size()) { return false; }
+        outgoing_schur_values[index] = term.sign * schur[term.schur_index];
+      }
+      if (ranks == 2)
+      {
+        const int peer = 1 - rank;
+        if (MPI_Sendrecv(outgoing_schur_values.data(),
+                         static_cast<int>(outgoing_schur_values.size()),
+                         MPI_DOUBLE, peer, 812,
+                         incoming_schur_values.data(),
+                         static_cast<int>(incoming_schur_values.size()),
+                         MPI_DOUBLE, peer, 812, MPI_COMM_WORLD,
+                         MPI_STATUS_IGNORE) != MPI_SUCCESS)
         {
-          const std::size_t global_column = static_cast<std::size_t>(
-              true_offdiagonal_columns[offdiagonal_j[entry]]);
-          offdiagonal_data[entry] =
-              global_matrix[global_row * global_trace + global_column];
+          return false;
         }
+      }
+      if (!Finite(outgoing_schur_values) || !Finite(incoming_schur_values))
+      {
+        return false;
+      }
+      for (std::size_t index = 0; index < incoming_schur_slots.size(); ++index)
+      {
+        const SparseIncomingSlot& slot = incoming_schur_slots[index];
+        if (slot.data_index < 0) { return false; }
+        double* destination = slot.offdiagonal ? offdiagonal_data
+                                               : diagonal_data;
+        if (!destination) { return false; }
+        destination[slot.data_index] += incoming_schur_values[index];
       }
       true_matrix->HypreRead();
       trace_space->Dof_TrueDof_Matrix()->MultTranspose(
@@ -2393,7 +2889,11 @@ bool AssignGridFunction(mfem::ParGridFunction& destination,
 
 detail::CpuNumericsCore::CpuNumericsCore()
     : implementation_(std::make_unique<Implementation>())
-{}
+{
+  (void)implementation_->allocations.Observe(
+      CpuOwnedAllocationSite::core_wrapper, sizeof(Implementation),
+      alignof(Implementation), 1, implementation_.get());
+}
 
 detail::CpuNumericsCore::~CpuNumericsCore() = default;
 detail::CpuNumericsCore::CpuNumericsCore(CpuNumericsCore&&) noexcept = default;
@@ -2450,9 +2950,14 @@ bool detail::CpuNumericsCore::Initialize(
     state.trace_space = std::make_unique<mfem::ParFiniteElementSpace>(
         state.mesh.get(), state.trace_collection.get(),
         cpu_conserved_components, mfem::Ordering::byNODES);
+    local_ok = state.ObserveWrapper(state.mesh) &&
+        state.ObserveWrapper(state.interior_collection) &&
+        state.ObserveWrapper(state.trace_collection) &&
+        state.ObserveWrapper(state.interior_space) &&
+        state.ObserveWrapper(state.trace_space);
     state.interior_space->ExchangeFaceNbrData();
     state.trace_space->ExchangeFaceNbrData();
-    local_ok = state.mesh->GetNE() > 0 &&
+    local_ok = local_ok && state.mesh->GetNE() > 0 &&
         state.interior_space->GetVSize() > 0 &&
         state.trace_space->GetVSize() > 0 &&
         state.trace_space->GetTrueVSize() > 0 &&
@@ -2465,6 +2970,7 @@ bool detail::CpuNumericsCore::Initialize(
     local_ok = false;
   }
   if (!AllRanks(local_ok)) { return false; }
+
   local_ok = state.BuildTopology();
   if (!AllRanks(local_ok)) { return false; }
 
@@ -2474,12 +2980,17 @@ bool detail::CpuNumericsCore::Initialize(
         static_cast<std::size_t>(state.interior_space->GetVSize());
     const std::size_t trace_size =
         static_cast<std::size_t>(state.trace_space->GetTrueVSize());
-    state.committed_slot = MakeSlot(interior_size, trace_size);
-    state.candidate_slot = MakeSlot(interior_size, trace_size);
-    state.checkpoint_slot = MakeSlot(interior_size, trace_size);
-    state.first_iterate_interior.resize(interior_size);
-    state.first_iterate_trace.resize(trace_size);
-    local_ok = state.AllocateWorkspace();
+    state.committed_slot = MakeSlot(interior_size, trace_size,
+                                    state.allocations);
+    state.candidate_slot = MakeSlot(interior_size, trace_size,
+                                    state.allocations);
+    local_ok = ResizeOwned(state.first_iterate_interior, interior_size,
+                           CpuOwnedAllocationSite::recovery_vector,
+                           state.allocations) &&
+        ResizeOwned(state.first_iterate_trace, trace_size,
+                    CpuOwnedAllocationSite::recovery_vector,
+                    state.allocations) &&
+        state.AllocateWorkspace();
   }
   catch (...)
   {
@@ -2534,13 +3045,59 @@ bool detail::CpuNumericsCore::Initialize(
         state.ProjectTrace(*state.trial_trace, state.trial_true_trace, true) &&
         state.LoadTrace(state.trial_true_trace, *state.trial_trace) &&
         Copy(state.trial_true_trace, state.first_iterate_trace) &&
-        CopySlot(state.committed_slot, state.candidate_slot) &&
-        CopySlot(state.committed_slot, state.checkpoint_slot);
+        CopySlot(state.committed_slot, state.candidate_slot);
   }
   catch (...)
   {
     local_ok = false;
   }
+  if (!AllRanks(local_ok)) { return false; }
+
+  // Prove the exact storage semantics required by the accepted two-phase
+  // contract using distinct old/new bytes, then restore the initialization
+  // state before the contract observes either slot.
+  const StateHash old_interior = HashDoubles(state.Committed()->interior);
+  const StateHash old_trace = HashDoubles(state.Committed()->trace);
+  const std::uintptr_t committed_backing_before =
+      reinterpret_cast<std::uintptr_t>(
+          state.committed_slot.interior.cell->backing.get());
+  const std::uintptr_t candidate_backing_before =
+      reinterpret_cast<std::uintptr_t>(
+          state.candidate_slot.interior.cell->backing.get());
+  std::copy(state.first_iterate_interior.begin(),
+            state.first_iterate_interior.end(),
+            state.Candidate()->interior.begin());
+  std::copy(state.first_iterate_trace.begin(), state.first_iterate_trace.end(),
+            state.Candidate()->trace.begin());
+  const StateHash new_interior = HashDoubles(state.Candidate()->interior);
+  const StateHash new_trace = HashDoubles(state.Candidate()->trace);
+  CpuStateStoragePolicy::Publish(state.committed_slot, state.candidate_slot);
+  const bool complete_exchange =
+      HashDoubles(state.Committed()->interior) == new_interior &&
+      HashDoubles(state.Committed()->trace) == new_trace;
+  const bool candidate_retains_old =
+      HashDoubles(state.Candidate()->interior) == old_interior &&
+      HashDoubles(state.Candidate()->trace) == old_trace;
+  const bool disjoint_after_publish = CpuStateStoragePolicy::Disjoint(
+      state.committed_slot, state.candidate_slot);
+  CpuStateStoragePolicy::RevertPublish(state.committed_slot,
+                                       state.candidate_slot);
+  const bool exact_inverse =
+      HashDoubles(state.Committed()->interior) == old_interior &&
+      HashDoubles(state.Committed()->trace) == old_trace &&
+      HashDoubles(state.Candidate()->interior) == new_interior &&
+      HashDoubles(state.Candidate()->trace) == new_trace &&
+      reinterpret_cast<std::uintptr_t>(
+          state.committed_slot.interior.cell->backing.get()) ==
+          committed_backing_before &&
+      reinterpret_cast<std::uintptr_t>(
+          state.candidate_slot.interior.cell->backing.get()) ==
+          candidate_backing_before;
+  const bool disjoint_after_revert = CpuStateStoragePolicy::Disjoint(
+      state.committed_slot, state.candidate_slot);
+  local_ok = complete_exchange && candidate_retains_old && exact_inverse &&
+      disjoint_after_publish && disjoint_after_revert &&
+      CopySlot(state.committed_slot, state.candidate_slot);
   if (!AllRanks(local_ok)) { return false; }
 
   const StateHash local_mesh = HashBytes(
@@ -2609,10 +3166,31 @@ bool detail::CpuNumericsCore::Initialize(
   state.evidence.storage.trace_size = state.Committed()->trace.size();
   state.evidence.storage.trace_capacity = state.Committed()->trace.capacity();
   state.evidence.storage.workspace_bytes = state.WorkspaceBytes();
+  state.evidence.storage.sparse_owned_term_capacity =
+      state.owned_schur_terms.capacity();
+  state.evidence.storage.sparse_outgoing_term_capacity =
+      state.outgoing_schur_terms.capacity();
+  state.evidence.storage.sparse_incoming_slot_capacity =
+      state.incoming_schur_slots.capacity();
+  state.evidence.storage.true_diagonal_nnz = static_cast<std::size_t>(
+      state.true_diagonal_view.NumNonZeroElems());
+  state.evidence.storage.true_offdiagonal_nnz = static_cast<std::size_t>(
+      state.true_offdiagonal_view.NumNonZeroElems());
+  state.evidence.storage.sparse_owned_term_token =
+      reinterpret_cast<std::uintptr_t>(state.owned_schur_terms.data());
+  state.evidence.storage.sparse_outgoing_term_token =
+      reinterpret_cast<std::uintptr_t>(state.outgoing_schur_terms.data());
+  state.evidence.storage.sparse_incoming_slot_token =
+      reinterpret_cast<std::uintptr_t>(state.incoming_schur_slots.data());
   state.evidence.storage.topology_generation = 1;
   state.evidence.storage.storage_generation = 1;
-  state.evidence.storage.allocation_baseline = 1;
-  state.evidence.storage.allocation_events_after_baseline = 0;
+  state.evidence.storage.publish_is_complete_slot_exchange =
+      complete_exchange;
+  state.evidence.storage.candidate_retains_exact_old_state_after_publish =
+      candidate_retains_old;
+  state.evidence.storage.revert_publish_is_exact_byte_inverse = exact_inverse;
+  state.evidence.storage.publish_and_revert_preserve_disjoint_backing =
+      disjoint_after_publish && disjoint_after_revert;
 
   state.initialized = true;
   initialized.committed = state.committed_slot;
@@ -2631,6 +3209,9 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   CpuNumericalResult result;
   CpuAttemptEvidence& evidence = state.active_evidence;
   evidence = {};
+  state.active_candidate_generation = 0;
+  state.active_candidate_state_hash = {};
+  state.publication_chain_authority = false;
   evidence.identity = attempt;
   evidence.entry_coordinates = coordinates;
   evidence.candidate_cursor = attempt.sequence;
@@ -2654,6 +3235,8 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     evidence.recovery_gate = false;
     evidence.nonlinear_gate = false;
     evidence.true_residual_gate = false;
+    evidence.transfers.allocation_events =
+        state.allocations.EventsAfterBaseline();
     result.evidence = evidence;
     result.gates = {false, false, false, false, true, false};
     result.originating_failure = FailureReason::backend_failure;
@@ -2717,11 +3300,14 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   }
   evidence.initial_nonlinear_residual = residual;
   evidence.final_nonlinear_residual = residual;
-  evidence.products[0] = {DerivedProductKind::residual, attempt.sequence,
-                          attempt.sequence,
-                          HashPair(HashDoubles(state.current_system.residual_interior),
-                                   HashDoubles(state.current_system.residual_trace)),
-                          true};
+  StateHash current_residual_hash = HashPair(
+      HashDoubles(state.current_system.residual_interior),
+      HashDoubles(state.current_system.residual_trace));
+  std::uint64_t current_local_generation =
+      state.next_artifact_generation++;
+  Implementation::ArtifactCapability current_local_capability{
+      attempt.sequence, attempt.sequence, current_local_generation,
+      Implementation::ArtifactStage::local};
 
   int updates = 0;
   bool recovered = false;
@@ -2733,6 +3319,20 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     {
       break;
     }
+    if (evidence.linearization_chain_count >=
+        evidence.linearization_chains.size())
+    {
+      return fail(CpuFailurePhase::condensation);
+    }
+    CpuLinearizationChain& chain = evidence.linearization_chains[
+        evidence.linearization_chain_count];
+    chain.local_generation = current_local_generation;
+    chain.residual_hash = current_residual_hash;
+    const bool consumed_local = state.ConsumeArtifact(
+        std::move(current_local_capability),
+        Implementation::ArtifactStage::local, attempt,
+        chain.local_generation);
+    if (!consumed_local) { return fail(CpuFailurePhase::condensation); }
     if (!state.EnterPhase(injection, CpuFailurePhase::condensation))
     {
       return fail(CpuFailurePhase::condensation,
@@ -2745,11 +3345,16 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     }
     ++evidence.work.complete_condensations;
     state.CompletePhase();
-    if (!evidence.products[1].produced)
-    {
-      evidence.products[1] = {DerivedProductKind::matrix, attempt.sequence,
-                              attempt.sequence, matrix_hash, true};
-    }
+    chain.condensed_generation = state.next_artifact_generation++;
+    chain.matrix_hash = matrix_hash;
+    Implementation::ArtifactCapability condensed_capability{
+        attempt.sequence, attempt.sequence, chain.condensed_generation,
+        Implementation::ArtifactStage::condensed};
+    const bool consumed_condensed = state.ConsumeArtifact(
+        std::move(condensed_capability),
+        Implementation::ArtifactStage::condensed, attempt,
+        chain.condensed_generation);
+    if (!consumed_condensed) { return fail(CpuFailurePhase::trace_solve); }
 
     if (!state.EnterPhase(injection, CpuFailurePhase::trace_solve))
     {
@@ -2768,13 +3373,25 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     maximum_true_residual = std::max(maximum_true_residual, true_residual);
     ++evidence.work.complete_trace_solves;
     state.CompletePhase();
-    if (!evidence.products[2].produced)
-    {
-      evidence.products[2] = {DerivedProductKind::factor, attempt.sequence,
-                              attempt.sequence, factor_hash, true};
-      evidence.products[3] = {DerivedProductKind::solution, attempt.sequence,
-                              attempt.sequence, solution_hash, true};
-    }
+    chain.solve_generation = state.next_artifact_generation++;
+    chain.factor_hash = factor_hash;
+    Implementation::ArtifactCapability solve_capability{
+        attempt.sequence, attempt.sequence, chain.solve_generation,
+        Implementation::ArtifactStage::solve};
+    const bool consumed_solve = state.ConsumeArtifact(
+        std::move(solve_capability), Implementation::ArtifactStage::solve,
+        attempt, chain.solve_generation);
+    if (!consumed_solve) { return fail(CpuFailurePhase::recovery); }
+    chain.solution_generation = state.next_artifact_generation++;
+    chain.solution_hash = solution_hash;
+    Implementation::ArtifactCapability solution_capability{
+        attempt.sequence, attempt.sequence, chain.solution_generation,
+        Implementation::ArtifactStage::solution};
+    const bool consumed_solution = state.ConsumeArtifact(
+        std::move(solution_capability),
+        Implementation::ArtifactStage::solution, attempt,
+        chain.solution_generation);
+    if (!consumed_solution) { return fail(CpuFailurePhase::recovery); }
 
     if (!state.EnterPhase(injection, CpuFailurePhase::recovery))
     {
@@ -2785,6 +3402,25 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     ++evidence.work.complete_recoveries;
     state.CompletePhase();
     recovered = true;
+    chain.recovery_generation = state.next_artifact_generation++;
+    Implementation::ArtifactCapability recovery_capability{
+        attempt.sequence, attempt.sequence, chain.recovery_generation,
+        Implementation::ArtifactStage::recovery};
+    const bool consumed_recovery = state.ConsumeArtifact(
+        std::move(recovery_capability),
+        Implementation::ArtifactStage::recovery, attempt,
+        chain.recovery_generation);
+    chain.ordered = chain.local_generation < chain.condensed_generation &&
+        chain.condensed_generation < chain.solve_generation &&
+        chain.solve_generation < chain.solution_generation &&
+        chain.solution_generation < chain.recovery_generation;
+    chain.affine_consumption_verified = consumed_local &&
+        consumed_condensed && consumed_solve && consumed_solution &&
+        consumed_recovery;
+    if (!chain.affine_consumption_verified)
+    {
+      return fail(CpuFailurePhase::recovery);
+    }
 
     bool accepted = false;
     for (int trial = 0;
@@ -2827,6 +3463,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
         evidence.minimum_density = density;
         evidence.minimum_pressure = pressure;
         evidence.maximum_wave_speed = wave;
+        chain.candidate_generation = state.next_candidate_generation++;
+        chain.candidate_state_hash = HashPair(
+            HashVector(*state.iterate_interior),
+            HashVector(state.iterate_true_trace));
         accepted = true;
         break;
       }
@@ -2834,6 +3474,14 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     if (!accepted) { return fail(CpuFailurePhase::recovery); }
     ++updates;
     ++evidence.work.accepted_newton_updates;
+    ++evidence.linearization_chain_count;
+    current_local_generation = state.next_artifact_generation++;
+    current_local_capability = Implementation::ArtifactCapability{
+        attempt.sequence, attempt.sequence, current_local_generation,
+        Implementation::ArtifactStage::local};
+    current_residual_hash = HashPair(
+        HashDoubles(state.current_system.residual_interior),
+        HashDoubles(state.current_system.residual_trace));
   }
 
   evidence.nonlinear_updates = updates;
@@ -2847,6 +3495,44 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     return fail(CpuFailurePhase::recovery);
   }
   if (!state.StoreCandidate()) { return fail(CpuFailurePhase::recovery); }
+  if (evidence.linearization_chain_count == 0)
+  {
+    return fail(CpuFailurePhase::recovery);
+  }
+  const std::size_t retained_index = evidence.linearization_chain_count - 1;
+  CpuLinearizationChain& retained =
+      evidence.linearization_chains[retained_index];
+  const StateHash stored_candidate_hash = HashPair(
+      HashDoubles(state.Candidate()->interior),
+      HashDoubles(state.Candidate()->trace));
+  if (!retained.ordered ||
+      retained.candidate_state_hash != stored_candidate_hash)
+  {
+    return fail(CpuFailurePhase::recovery);
+  }
+  retained.retained_for_publication = true;
+  evidence.retained_linearization_chain = retained_index;
+  evidence.candidate_generation = retained.candidate_generation;
+  state.active_candidate_generation = retained.candidate_generation;
+  state.active_candidate_state_hash = stored_candidate_hash;
+  state.publication_chain_authority = true;
+  evidence.products[0] = {DerivedProductKind::residual, attempt.sequence,
+                          attempt.sequence, retained.residual_hash,
+                          stored_candidate_hash, retained.local_generation,
+                          retained.candidate_generation, true};
+  evidence.products[1] = {DerivedProductKind::matrix, attempt.sequence,
+                          attempt.sequence, retained.matrix_hash,
+                          stored_candidate_hash,
+                          retained.condensed_generation,
+                          retained.candidate_generation, true};
+  evidence.products[2] = {DerivedProductKind::factor, attempt.sequence,
+                          attempt.sequence, retained.factor_hash,
+                          stored_candidate_hash, retained.solve_generation,
+                          retained.candidate_generation, true};
+  evidence.products[3] = {DerivedProductKind::solution, attempt.sequence,
+                          attempt.sequence, retained.solution_hash,
+                          stored_candidate_hash, retained.solution_generation,
+                          retained.candidate_generation, true};
 
   if (!state.EnterPhase(injection,
                         CpuFailurePhase::after_recovery_before_commit))
@@ -2883,6 +3569,12 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       state.config.true_residual_tolerance;
   evidence.status = CpuAttemptStatus::success;
   evidence.failure_phase = CpuFailurePhase::none;
+  evidence.transfers.allocation_events =
+      state.allocations.EventsAfterBaseline();
+  if (evidence.transfers.allocation_events != 0)
+  {
+    return fail(CpuFailurePhase::terminal_evidence);
+  }
   result.evidence = evidence;
   result.gates = {evidence.finite_gate, evidence.admissibility_gate,
                   evidence.recovery_gate, evidence.true_residual_gate,
@@ -2910,9 +3602,16 @@ void detail::CpuNumericsCore::Complete(
   if (outcome.committed)
   {
     attempt.status = CpuAttemptStatus::success;
-    state.evidence.accepted = {true, coordinates,
-                               attempt.committed_interior_after,
-                               attempt.committed_trace_after, attempt};
+    state.evidence.accepted.valid = true;
+    state.evidence.accepted.coordinates = coordinates;
+    state.evidence.accepted.interior_hash =
+        attempt.committed_interior_after;
+    state.evidence.accepted.trace_hash = attempt.committed_trace_after;
+    state.evidence.accepted.rank_common_interior_hash =
+        CpuStateStoragePolicy::HashInterior(state.committed_slot.interior);
+    state.evidence.accepted.rank_common_trace_hash =
+        CpuStateStoragePolicy::HashTrace(state.committed_slot.trace);
+    state.evidence.accepted.attempt = attempt;
     ++state.evidence.commits;
   }
   else
@@ -2931,7 +3630,8 @@ void detail::CpuNumericsCore::Complete(
   ++state.evidence.attempts;
   if (attempt.identity.retry_index == 1) { ++state.evidence.retries; }
   state.evidence.last_attempt = attempt;
-  state.evidence.storage.allocation_events_after_baseline = 0;
+  state.evidence.storage.allocation_events_after_baseline =
+      state.allocations.EventsAfterBaseline();
 }
 
 bool detail::CpuNumericsCore::CaptureCheckpoint(
@@ -2939,13 +3639,29 @@ bool detail::CpuNumericsCore::CaptureCheckpoint(
     CpuCheckpoint& checkpoint) noexcept
 {
   Implementation& state = *implementation_;
-  if (!state.initialized || !descriptor.successful_commit) { return false; }
-  if (!ValidSlot(checkpoint.state))
+  if (!state.initialized || !descriptor.successful_commit || checkpoint.valid)
   {
-    checkpoint.state = state.checkpoint_slot;
+    return false;
   }
-  if (!CopySlot(state.committed_slot, checkpoint.state)) { return false; }
+  CpuStateSlot snapshot;
+  CpuOwnedAllocationLedger checkpoint_allocations;
+  try
+  {
+    snapshot = MakeSlot(state.Committed()->interior.size(),
+                        state.Committed()->trace.size(),
+                        checkpoint_allocations);
+  }
+  catch (...)
+  {
+    return false;
+  }
+  if (!CopySlot(state.committed_slot, snapshot)) { return false; }
   checkpoint.descriptor = descriptor;
+  checkpoint.state = std::move(snapshot);
+  checkpoint.owned_allocation_event_count = checkpoint_allocations.count;
+  std::copy_n(checkpoint_allocations.events.begin(),
+              checkpoint_allocations.count,
+              checkpoint.owned_allocation_events.begin());
   checkpoint.valid = true;
   return true;
 }
@@ -2963,9 +3679,15 @@ void detail::CpuNumericsCore::CompleteRestore(
   restored.committed_interior_after = HashDoubles(state.Committed()->interior);
   restored.committed_trace_after = HashDoubles(state.Committed()->trace);
   restored.committed = true;
-  state.evidence.accepted = {true, coordinates,
-                             restored.committed_interior_after,
-                             restored.committed_trace_after, restored};
+  state.evidence.accepted.valid = true;
+  state.evidence.accepted.coordinates = coordinates;
+  state.evidence.accepted.interior_hash = restored.committed_interior_after;
+  state.evidence.accepted.trace_hash = restored.committed_trace_after;
+  state.evidence.accepted.rank_common_interior_hash =
+      CpuStateStoragePolicy::HashInterior(state.committed_slot.interior);
+  state.evidence.accepted.rank_common_trace_hash =
+      CpuStateStoragePolicy::HashTrace(state.committed_slot.trace);
+  state.evidence.accepted.attempt = restored;
   state.evidence.last_attempt = restored;
 }
 
@@ -2979,6 +3701,7 @@ CpuStateSnapshot detail::CpuNumericsCore::Snapshot(
   if (!storage) { return snapshot; }
   snapshot.interior_hash = HashDoubles(storage->interior);
   snapshot.trace_hash = HashDoubles(storage->trace);
+  snapshot.state_hash = HashPair(snapshot.interior_hash, snapshot.trace_hash);
   snapshot.interior = {storage->interior.data(), storage->interior.size(),
                        storage->interior.capacity()};
   snapshot.trace = {storage->trace.data(), storage->trace.size(),
@@ -2996,6 +3719,7 @@ CpuStateSnapshot detail::CpuNumericsCore::CandidateSnapshot(
   if (!storage) { return snapshot; }
   snapshot.interior_hash = HashDoubles(storage->interior);
   snapshot.trace_hash = HashDoubles(storage->trace);
+  snapshot.state_hash = HashPair(snapshot.interior_hash, snapshot.trace_hash);
   snapshot.interior = {storage->interior.data(), storage->interior.size(),
                        storage->interior.capacity()};
   snapshot.trace = {storage->trace.data(), storage->trace.size(),
@@ -3009,6 +3733,87 @@ void detail::CpuNumericsCore::MarkPreparedFailure(
   implementation_->active_evidence.failure_phase = phase;
   implementation_->active_evidence.failure_source_rank = source_rank;
   implementation_->active_evidence.status = CpuAttemptStatus::runtime_failure;
+}
+
+void detail::CpuNumericsCore::MarkPreparedFailure(
+    const CpuFailurePhase phase, const int source_rank,
+    const CpuAttemptStatus status) noexcept
+{
+  implementation_->active_evidence.failure_phase = phase;
+  implementation_->active_evidence.failure_source_rank = source_rank;
+  implementation_->active_evidence.status = status;
+}
+
+bool detail::CpuNumericsCore::AuthorizePublicationChain(
+    const AttemptIdentity& attempt,
+    const std::uint64_t candidate_generation,
+    const StateHash& candidate_state_hash) noexcept
+{
+  Implementation& state = *implementation_;
+  if (!state.publication_chain_authority ||
+      state.active_candidate_generation != candidate_generation ||
+      state.active_candidate_state_hash != candidate_state_hash ||
+      !::dg::hdg::runtime::detail::SameAttempt(
+          state.active_evidence.identity, attempt) ||
+      state.active_evidence.linearization_chain_count == 0)
+  {
+    return false;
+  }
+  const CpuLinearizationChain& retained =
+      state.active_evidence.linearization_chains[
+          state.active_evidence.retained_linearization_chain];
+  if (!retained.ordered || !retained.retained_for_publication ||
+      retained.candidate_generation != candidate_generation ||
+      retained.candidate_state_hash != candidate_state_hash)
+  {
+    return false;
+  }
+  state.publication_chain_authority = false;
+  return true;
+}
+
+bool detail::CpuNumericsCore::CandidateGenerationActive(
+    const std::uint64_t generation) const noexcept
+{
+  const Implementation& state = *implementation_;
+  return generation != 0 && state.active_candidate_generation == generation;
+}
+
+void detail::CpuNumericsCore::InvalidateCandidateGeneration() noexcept
+{
+  Implementation& state = *implementation_;
+  if (state.active_candidate_generation != 0)
+  {
+    state.active_evidence.candidate_generation_invalidated = true;
+  }
+  state.active_candidate_generation = 0;
+  state.active_candidate_state_hash = {};
+  state.publication_chain_authority = false;
+}
+
+bool detail::CpuNumericsCore::ObserveOwnedAllocation(
+    const CpuOwnedAllocationSite site, const std::size_t bytes,
+    const std::size_t alignment, const std::size_t capacity,
+    const void* token) noexcept
+{
+  return implementation_->allocations.Observe(site, bytes, alignment,
+                                               capacity, token);
+}
+
+void detail::CpuNumericsCore::SealOwnedAllocationBaseline() noexcept
+{
+  Implementation& state = *implementation_;
+  state.allocations.Seal();
+  CpuStorageEvidence& storage = state.evidence.storage;
+  storage.allocation_baseline = state.allocations.baseline;
+  storage.allocation_events_after_baseline =
+      state.allocations.EventsAfterBaseline();
+  storage.owned_allocation_event_count = state.allocations.count;
+  std::copy_n(state.allocations.events.begin(), state.allocations.count,
+              storage.owned_allocation_events.begin());
+  storage.selected_owned_allocation_stream_complete = true;
+  storage.opaque_mfem_hypre_allocations_unobserved = true;
+  storage.opaque_standard_library_control_blocks_unobserved = true;
 }
 
 const CpuRunEvidence& detail::CpuNumericsCore::evidence() const noexcept

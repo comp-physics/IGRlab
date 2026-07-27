@@ -76,6 +76,20 @@ static_assert(cpu_polynomial_order == 1 &&
                   cpu_assembly_quadrature_order == 11 &&
                   cpu_backward_euler_dt == 0.05,
               "bounded CPU tuple constants");
+static_assert(!std::is_copy_constructible<CpuPreparedStep>::value &&
+                  std::is_move_constructible<CpuPreparedStep>::value &&
+                  !std::is_copy_constructible<CpuPreparedCommit>::value &&
+                  !std::is_copy_constructible<CpuProvisionalCommit>::value &&
+                  !std::is_copy_constructible<
+                      CpuCandidateConsumeCapability>::value,
+              "CPU authorities are affine values, never pointer aliases");
+static_assert(CpuStateStoragePolicy::publish_is_complete_slot_exchange &&
+                  CpuStateStoragePolicy::
+                      candidate_retains_exact_old_state_after_publish &&
+                  CpuStateStoragePolicy::revert_publish_is_exact_byte_inverse &&
+                  CpuStateStoragePolicy::
+                      publish_and_revert_preserve_disjoint_backing,
+              "two-phase reversible storage attestations are exact");
 
 struct Checks
 {
@@ -269,9 +283,13 @@ void CheckPhaseRankInjection(Checks& checks, const int ranks)
                          exit.interior_hash == entry.interior_hash &&
                          exit.trace_hash == entry.trace_hash &&
                          exit.coordinates.step == 1 &&
-                         adapter.evidence().last_attempt.failure_source_rank ==
+                     adapter.evidence().last_attempt.failure_source_rank ==
                              source_rank &&
-                         adapter.evidence().last_attempt.failure_phase == phase,
+                         adapter.evidence().last_attempt.failure_phase == phase &&
+                         (adapter.evidence().last_attempt.
+                                  candidate_generation == 0 ||
+                          adapter.evidence().last_attempt.
+                              candidate_generation_invalidated),
                      "phase/rank rollback must preserve committed bytes and IDs");
     }
 }
@@ -287,17 +305,15 @@ void CheckOuterStageAbort(Checks& checks, const int ranks)
   {
     PersistentSmoothEulerCpuAdapter<Selection> adapter;
     checks.Require(adapter.Initialize(), "outer-stage abort setup");
-    checks.Require(adapter.Advance().committed,
-                   "outer-stage abort prefix step 1");
     const CpuStateSnapshot entry = adapter.Snapshot();
     const std::vector<double> interior = CopyView(entry.interior);
     const std::vector<double> trace = CopyView(entry.trace);
     CpuPreparedStep prepared;
     checks.Require(adapter.PrepareAdvance(prepared) &&
                        prepared.numerically_ready &&
-                       prepared.entry_coordinates.step == 1 &&
-                       NearTime(prepared.target_coordinates.time, 0.10) &&
-                       prepared.target_coordinates.step == 2,
+                       prepared.entry_coordinates.step == 0 &&
+                       NearTime(prepared.target_coordinates.time, 0.05) &&
+                       prepared.target_coordinates.step == 1,
                    "outer stage must receive a qualified numerical snapshot");
     const AttemptOutcome failure = adapter.AbortPrepared(
         prepared, phase, ranks == 1 ? 0 : 1);
@@ -305,10 +321,180 @@ void CheckOuterStageAbort(Checks& checks, const int ranks)
     checks.Require(!failure.committed && failure.retry_available &&
                        ByteEqual(exit.interior, interior) &&
                        ByteEqual(exit.trace, trace) &&
-                       exit.coordinates.step == 1 &&
-                       adapter.evidence().last_attempt.failure_phase == phase,
+                       exit.coordinates.step == 0 &&
+                       adapter.evidence().last_attempt.failure_phase == phase &&
+                       adapter.evidence().last_attempt.status ==
+                           CpuAttemptStatus::injected_failure,
                    "prepublication outer-stage abort must roll back naturally");
+    checks.Require(adapter.PrepareRetry(prepared),
+                   "staging abort exposes exactly one retry");
+    checks.Require(adapter.FinalizePrepared(prepared).committed,
+                   "staging abort retry must commit the original step 1");
   }
+}
+
+template <typename Selection>
+void CheckTwoPhaseAndAffineAuthorities(Checks& checks)
+{
+  PersistentSmoothEulerCpuAdapter<Selection> adapter;
+  checks.Require(adapter.Initialize(), "two-phase adapter setup");
+  const CpuStateSnapshot old = adapter.Snapshot();
+  const std::vector<double> old_interior = CopyView(old.interior);
+  const std::vector<double> old_trace = CopyView(old.trace);
+
+  CpuPreparedStep staging;
+  checks.Require(adapter.PrepareAdvance(staging) && staging.numerically_ready,
+                 "freeze numerical candidate");
+  auto consume = adapter.AcquirePreparedCandidate(staging);
+  checks.Require(consume.has_value(), "acquire affine candidate capability");
+  CpuCandidateConsumeCapability moved_consume;
+  if (consume) { moved_consume = std::move(*consume); }
+  CpuStateSnapshot ignored;
+  checks.Require(consume &&
+                     !adapter.ConsumePreparedCandidate(std::move(*consume),
+                                                       ignored) &&
+                     adapter.ConsumePreparedCandidate(
+                         std::move(moved_consume), ignored),
+                 "moved candidate authority rejects old value exactly once");
+
+  auto stale_after_revert = adapter.AcquirePreparedCandidate(staging);
+  CpuPreparedCommit prepared;
+  checks.Require(adapter.PrepareCommit(staging, prepared) && prepared.valid,
+                 "FreezeCandidate to PrepareCommit binding");
+  CpuProvisionalCommit provisional;
+  checks.Require(adapter.CommitPrepared(prepared, provisional) &&
+                     provisional.valid,
+                 "PrepareCommit to provisional slot exchange");
+  const CpuStateSnapshot logical_old = adapter.LogicalPublishedSnapshot();
+  CpuCheckpoint premature_checkpoint;
+  checks.Require(ByteEqual(logical_old.interior, old_interior) &&
+                     ByteEqual(logical_old.trace, old_trace) &&
+                     logical_old.coordinates.step == 0 &&
+                     !adapter.CaptureCheckpoint(premature_checkpoint),
+                 "provisional exchange retains old logical publication");
+  const AttemptOutcome reverted = adapter.RevertCommit(
+      provisional, CpuFailurePhase::commit, 0);
+  const RunTelemetry* reverted_telemetry = adapter.contract_telemetry();
+  checks.Require(!reverted.committed && reverted.retry_available &&
+                     ByteEqual(adapter.Snapshot().interior, old_interior) &&
+                     ByteEqual(adapter.Snapshot().trace, old_trace) &&
+                     adapter.RevertCommit(provisional,
+                                          CpuFailurePhase::commit, 0).reason ==
+                         FailureReason::stale_attempt &&
+                     stale_after_revert &&
+                     !adapter.ConsumePreparedCandidate(
+                         std::move(*stale_after_revert), ignored) &&
+                     reverted_telemetry && reverted_telemetry->rollbacks == 1 &&
+                     reverted_telemetry->commits == 0 &&
+                     reverted_telemetry->attempted_transfers.complete &&
+                     reverted_telemetry->rolled_back_transfers.complete &&
+                     reverted_telemetry->attempted_transfers.allocation_events ==
+                         0 &&
+                     reverted_telemetry->rolled_back_transfers
+                             .allocation_events == 0,
+                 "provisional failure exactly reverts and invalidates lineage");
+  CpuPreparedStep retry;
+  checks.Require(adapter.PrepareRetry(retry) &&
+                     adapter.FinalizePrepared(retry).committed,
+                 "reverted step retries and finalizes once");
+
+  PersistentSmoothEulerCpuAdapter<Selection> finalized;
+  checks.Require(finalized.Initialize(), "finalize visibility setup");
+  const std::vector<double> finalized_old =
+      CopyView(finalized.Snapshot().interior);
+  CpuPreparedStep finalize_staging;
+  CpuPreparedCommit finalize_prepared;
+  CpuProvisionalCommit finalize_provisional;
+  checks.Require(finalized.PrepareAdvance(finalize_staging) &&
+                     finalized.PrepareCommit(finalize_staging,
+                                             finalize_prepared) &&
+                     finalized.CommitPrepared(finalize_prepared,
+                                               finalize_provisional) &&
+                     ByteEqual(finalized.LogicalPublishedSnapshot().interior,
+                               finalized_old),
+                 "old publication remains logical through provisional phase");
+  CpuProvisionalCommit moved_provisional{std::move(finalize_provisional)};
+  checks.Require(finalized.FinalizeCommit(finalize_provisional).reason ==
+                         FailureReason::stale_attempt &&
+                     finalized.FinalizeCommit(moved_provisional).committed &&
+                     finalized.coordinates().step == 1 &&
+                     !ByteEqual(finalized.LogicalPublishedSnapshot().interior,
+                                finalized_old),
+                 "FinalizeCommit alone advances logical publication and move authority");
+
+  PersistentSmoothEulerCpuAdapter<Selection> first;
+  PersistentSmoothEulerCpuAdapter<Selection> second;
+  checks.Require(first.Initialize() && second.Initialize(),
+                 "cross-owner adapter setup");
+  CpuPreparedStep first_staging;
+  CpuPreparedStep second_staging;
+  checks.Require(first.PrepareAdvance(first_staging) &&
+                     second.PrepareAdvance(second_staging),
+                 "cross-owner candidates frozen");
+  CpuPreparedStep moved_staging{std::move(first_staging)};
+  CpuPreparedCommit rejected;
+  checks.Require(!first.PrepareCommit(first_staging, rejected) &&
+                     !second.PrepareCommit(moved_staging, rejected),
+                 "moved-from and cross-owner staging authorities fail closed");
+  CpuPreparedCommit first_prepared;
+  checks.Require(first.PrepareCommit(moved_staging, first_prepared),
+                 "foreign rejection does not consume live owner token");
+  const AttemptOutcome first_abort = first.AbortPrepared(
+      first_prepared, CpuFailurePhase::output_staging, 0);
+  checks.Require(first_abort.retry_available &&
+                     first.AbortPrepared(first_prepared,
+                                         CpuFailurePhase::output_staging,
+                                         0).reason ==
+                         FailureReason::stale_attempt,
+                 "prepared authority is single-use and stale after abort");
+  const AttemptOutcome second_abort = second.AbortPrepared(
+      second_staging, CpuFailurePhase::checkpoint_staging, 0);
+  checks.Require(second_abort.retry_available,
+                 "independent frozen owner remains abortable");
+}
+
+template <typename Selection>
+void CheckCheckpointImportAndIndependence(
+    PersistentSmoothEulerCpuAdapter<Selection>& source,
+    const CpuCheckpoint& checkpoint,
+    Checks& checks,
+    const int ranks)
+{
+  const std::vector<double> interior = CopyView(checkpoint.interior());
+  const std::vector<double> trace = CopyView(checkpoint.trace());
+  unsigned long long local_size =
+      static_cast<unsigned long long>(interior.size() + trace.size());
+  unsigned long long minimum_size = 0;
+  unsigned long long maximum_size = 0;
+  MPI_Allreduce(&local_size, &minimum_size, 1, MPI_UNSIGNED_LONG_LONG,
+                MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(&local_size, &maximum_size, 1, MPI_UNSIGNED_LONG_LONG,
+                MPI_MAX, MPI_COMM_WORLD);
+  checks.Require(ranks == 1 || minimum_size != maximum_size,
+                 "rank2 checkpoint exercise uses unequal local payload sizes");
+
+  CpuCheckpoint imported;
+  checks.Require(ImportCpuCheckpoint(
+                     checkpoint.descriptor, interior.data(), interior.size(),
+                     trace.data(), trace.size(), imported) && imported.valid &&
+                     imported.owned_allocation_event_count == 3 &&
+                     imported.interior().data != checkpoint.interior().data &&
+                     imported.trace().data != checkpoint.trace().data,
+                 "serialized payload imports into an independent opaque slot");
+  PersistentSmoothEulerCpuAdapter<Selection> fresh;
+  checks.Require(fresh.Initialize(), "fresh-process import adapter setup");
+  const RestoreOutcome restored = fresh.Restore(imported);
+  checks.Require(restored.restored && fresh.coordinates().step == 1 &&
+                     ByteEqual(fresh.Snapshot().interior, interior) &&
+                     ByteEqual(fresh.Snapshot().trace, trace),
+                 "unequal rank-local payloads restore under rank-common identity");
+
+  CpuCheckpoint later;
+  checks.Require(source.CaptureCheckpoint(later) && later.valid &&
+                     later.interior().data != checkpoint.interior().data &&
+                     ByteEqual(checkpoint.interior(), interior) &&
+                     ByteEqual(checkpoint.trace(), trace),
+                 "each checkpoint owns an immutable independent snapshot");
 }
 
 template <typename Selection>
@@ -338,10 +524,36 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                          initial.storage.interior_capacity &&
                      initial.storage.trace_size ==
                          initial.storage.trace_capacity &&
+                     initial.storage.sparse_owned_term_capacity > 0 &&
+                     initial.storage.true_diagonal_nnz > 0 &&
+                     initial.storage.sparse_owned_term_token != 0 &&
                      initial.storage.topology_generation == 1 &&
                      initial.storage.storage_generation == 1 &&
-                     initial.storage.allocation_events_after_baseline == 0,
+                     initial.storage.allocation_baseline > 0 &&
+                     initial.storage.owned_allocation_event_count ==
+                         initial.storage.allocation_baseline &&
+                     initial.storage.selected_owned_allocation_stream_complete &&
+                     initial.storage.opaque_mfem_hypre_allocations_unobserved &&
+                     initial.storage
+                         .opaque_standard_library_control_blocks_unobserved &&
+                     initial.storage.allocation_events_after_baseline == 0 &&
+                     initial.storage.publish_is_complete_slot_exchange &&
+                     initial.storage
+                         .candidate_retains_exact_old_state_after_publish &&
+                     initial.storage.revert_publish_is_exact_byte_inverse &&
+                     initial.storage
+                         .publish_and_revert_preserve_disjoint_backing,
                  "complete slots/workspace must be preallocated");
+  for (std::size_t index = 0;
+       index < initial.storage.owned_allocation_event_count; ++index)
+  {
+    const CpuOwnedAllocationEvent& event =
+        initial.storage.owned_allocation_events[index];
+    checks.Require(event.ordinal == index + 1 && event.bytes > 0 &&
+                       event.alignment > 0 && event.capacity > 0 &&
+                       event.backing_token != 0,
+                   "observed W8 allocation event metadata is exact");
+  }
 
   CpuPreparedStep first;
   checks.Require(adapter.PrepareAdvance(first) && first.valid &&
@@ -361,6 +573,37 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                  "independent oracle must match the production candidate");
   checks.Require(adapter.FinalizePrepared(first).committed,
                  "step 1 commit");
+  const CpuAttemptEvidence first_accepted =
+      adapter.evidence().accepted.attempt;
+  bool independent_chain = oracle.linearizations.size() ==
+          first_accepted.linearization_chain_count &&
+      oracle.linearizations.size() ==
+          static_cast<std::size_t>(oracle.newton_updates) &&
+      oracle.linearizations.size() > 1;
+  for (std::size_t index = 0;
+       index < oracle.linearizations.size() && independent_chain; ++index)
+  {
+    const dg_igr_hdg_cpu_test::IndependentLinearizationHashes& rebuilt =
+        oracle.linearizations[index];
+    const CpuLinearizationChain& produced =
+        first_accepted.linearization_chains[index];
+    independent_chain = produced.residual_hash.bytes == rebuilt.residual &&
+        produced.matrix_hash.bytes == rebuilt.matrix &&
+        produced.factor_hash.bytes == rebuilt.factor &&
+        produced.solution_hash.bytes == rebuilt.solution &&
+        produced.candidate_state_hash.bytes == rebuilt.candidate &&
+        produced.ordered && produced.affine_consumption_verified &&
+        produced.solve_generation < produced.solution_generation &&
+        produced.solution_generation < produced.recovery_generation &&
+        (index == 0 ||
+         first_accepted.linearization_chains[index - 1]
+                 .recovery_generation < produced.local_generation) &&
+        (index == 0 ||
+         first_accepted.linearization_chains[index - 1]
+                 .candidate_generation < produced.candidate_generation);
+  }
+  checks.Require(independent_chain,
+                 "independent oracle hashes every ordered Newton product chain");
   checks.Require(NearTime(adapter.coordinates().time, 0.05) &&
                      adapter.coordinates().step == 1 &&
                      adapter.coordinates().generation == 1 &&
@@ -368,7 +611,8 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                  "step 1 coordinates");
   CpuCheckpoint checkpoint;
   checks.Require(adapter.CaptureCheckpoint(checkpoint) && checkpoint.valid &&
-                     checkpoint.descriptor.coordinates.step == 1,
+                     checkpoint.descriptor.coordinates.step == 1 &&
+                     checkpoint.owned_allocation_event_count == 3,
                  "in-memory committed checkpoint capture");
 
   const CpuStateSnapshot before_failure = adapter.Snapshot();
@@ -419,7 +663,68 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                      terminal.accepted.attempt.nonlinear_gate &&
                      terminal.accepted.attempt.true_residual_gate,
                  "status/census/admissibility parity");
+  std::array<StateHash, 2> common_interior{};
+  std::array<StateHash, 2> common_trace{};
+  std::array<StateHash, 2> local_interior_hashes{};
+  std::array<StateHash, 2> local_trace_hashes{};
+  MPI_Allgather(terminal.accepted.rank_common_interior_hash.bytes.data(), 32,
+                MPI_BYTE, common_interior.data(), 32, MPI_BYTE,
+                communicator);
+  MPI_Allgather(terminal.accepted.rank_common_trace_hash.bytes.data(), 32,
+                MPI_BYTE, common_trace.data(), 32, MPI_BYTE, communicator);
+  MPI_Allgather(terminal.accepted.interior_hash.bytes.data(), 32, MPI_BYTE,
+                local_interior_hashes.data(), 32, MPI_BYTE, communicator);
+  MPI_Allgather(terminal.accepted.trace_hash.bytes.data(), 32, MPI_BYTE,
+                local_trace_hashes.data(), 32, MPI_BYTE, communicator);
+  checks.Require(common_interior[0] == common_interior[ranks - 1] &&
+                     common_trace[0] == common_trace[ranks - 1] &&
+                     (ranks == 1 ||
+                      local_interior_hashes[0] != local_interior_hashes[1] ||
+                      local_trace_hashes[0] != local_trace_hashes[1]),
+                 "checkpoint identity is rank-common while local hashes remain local");
   const CpuAttemptEvidence& accepted = terminal.accepted.attempt;
+  bool chain_coherent = accepted.linearization_chain_count ==
+      static_cast<std::size_t>(accepted.nonlinear_updates) &&
+      accepted.linearization_chain_count > 1 &&
+      accepted.retained_linearization_chain + 1 ==
+          accepted.linearization_chain_count;
+  std::uint64_t prior_generation = 0;
+  std::uint64_t prior_candidate_generation = 0;
+  for (std::size_t index = 0;
+       index < accepted.linearization_chain_count; ++index)
+  {
+    const CpuLinearizationChain& chain = accepted.linearization_chains[index];
+    chain_coherent = chain_coherent && chain.ordered &&
+        chain.affine_consumption_verified &&
+        chain.local_generation > prior_generation &&
+        chain.local_generation < chain.condensed_generation &&
+        chain.condensed_generation < chain.solve_generation &&
+        chain.solve_generation < chain.solution_generation &&
+        chain.solution_generation < chain.recovery_generation &&
+        chain.candidate_generation > prior_candidate_generation &&
+        chain.residual_hash != StateHash{} && chain.matrix_hash != StateHash{} &&
+        chain.factor_hash != StateHash{} && chain.solution_hash != StateHash{} &&
+        chain.candidate_state_hash != StateHash{} &&
+        (chain.retained_for_publication ==
+         (index == accepted.retained_linearization_chain));
+    prior_generation = chain.recovery_generation;
+    prior_candidate_generation = chain.candidate_generation;
+  }
+  const CpuLinearizationChain& retained =
+      accepted.linearization_chains[accepted.retained_linearization_chain];
+  const bool products_bind_retained_chain =
+      accepted.products[0].payload_hash == retained.residual_hash &&
+      accepted.products[0].linearization_generation ==
+          retained.local_generation &&
+      accepted.products[1].payload_hash == retained.matrix_hash &&
+      accepted.products[1].linearization_generation ==
+          retained.condensed_generation &&
+      accepted.products[2].payload_hash == retained.factor_hash &&
+      accepted.products[2].linearization_generation ==
+          retained.solve_generation &&
+      accepted.products[3].payload_hash == retained.solution_hash &&
+      accepted.products[3].linearization_generation ==
+          retained.solution_generation;
   checks.Require(accepted.work.complete_assemblies ==
                          1 + accepted.work.trial_reassemblies &&
                      accepted.work.complete_condensations ==
@@ -444,8 +749,16 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                                        product.attempt_sequence ==
                                            accepted.identity.sequence &&
                                        product.candidate_cursor ==
-                                           accepted.candidate_cursor;
-                                 }),
+                                           accepted.candidate_cursor &&
+                                       product.candidate_generation ==
+                                           accepted.candidate_generation &&
+                                       product.candidate_state_hash ==
+                                           accepted.linearization_chains[
+                                               accepted
+                                                   .retained_linearization_chain]
+                                               .candidate_state_hash;
+                                 }) && chain_coherent &&
+                     products_bind_retained_chain,
                  "Newton census and attempt-qualified product order");
   const RunTelemetry* telemetry = adapter.contract_telemetry();
   checks.Require(telemetry && telemetry->attempts_started == 4 &&
@@ -466,6 +779,18 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                          initial.storage.interior_capacity &&
                      terminal.storage.trace_capacity ==
                          initial.storage.trace_capacity &&
+                     terminal.storage.sparse_owned_term_capacity ==
+                         initial.storage.sparse_owned_term_capacity &&
+                     terminal.storage.sparse_outgoing_term_capacity ==
+                         initial.storage.sparse_outgoing_term_capacity &&
+                     terminal.storage.sparse_incoming_slot_capacity ==
+                         initial.storage.sparse_incoming_slot_capacity &&
+                     terminal.storage.sparse_owned_term_token ==
+                         initial.storage.sparse_owned_term_token &&
+                     terminal.storage.sparse_outgoing_term_token ==
+                         initial.storage.sparse_outgoing_term_token &&
+                     terminal.storage.sparse_incoming_slot_token ==
+                         initial.storage.sparse_incoming_slot_token &&
                      terminal.storage.allocation_events_after_baseline == 0,
                  "stable storage IDs/capacities and no post-baseline allocation");
 
@@ -493,9 +818,11 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                  "uninterrupted/restarted committed state equivalence");
 
   CheckCanonicalIds(adapter, checks, communicator);
+  CheckCheckpointImportAndIndependence(adapter, checkpoint, checks, ranks);
   CheckProductNegatives<Selection>(checks);
   CheckPhaseRankInjection<Selection>(checks, ranks);
   CheckOuterStageAbort<Selection>(checks, ranks);
+  CheckTwoPhaseAndAffineAuthorities<Selection>(checks);
 
   int global_failures = 0;
   MPI_Allreduce(&checks.failures, &global_failures, 1, MPI_INT, MPI_SUM,

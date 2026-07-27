@@ -1,39 +1,33 @@
-# Minimal shared runtime ABI request from the CPU persistent adapter
+# CPU binding to the frozen shared two-phase runtime ABI
 
-This leaf deliberately defines only `CpuFailurePhase`, CPU configuration,
-CPU evidence, and CPU injection types. It does not define the canonical
-`ConventionalEulerSmoothPersistentV1Tag`, a shared `FailurePhase`, or any
-cross-backend run/evidence DTO.
+This leaf deliberately defines only CPU-qualified phase, configuration,
+evidence, injection, and affine facade-handle types. It does not define the
+canonical `ConventionalEulerSmoothPersistentV1Tag`, a common `FailurePhase`,
+or cross-backend run/evidence DTOs.
 
-The accepted `PersistentRunContract::FinishAttempt` validates and publishes
-the active state internally through a trusted `noexcept` handle swap. That is
-sufficient for the CPU facade's explicit sequence:
+The facade is source-bound to the accepted `PersistentRunContract` bytes at
+commit `c87984feab42a519b7bb4e186e0c224c58a2f71f`. Its narrow bind points are:
 
-1. `PrepareAdvance` or `PrepareRetry` runs assembly through diagnostics and
-   exposes an attempt-qualified, read-only numerical candidate with entry and
-   proposed target coordinates plus coefficient hashes.
-2. An outer owner may stage checkpoint/output/history bytes from that view.
-3. A checkpoint-staging, output-staging, or proposed-commit failure calls
-   `AbortPrepared`, which enters `FinishAttempt` with a failure and rolls the
-   candidate back without publication.
-4. Successful staging calls `FinalizePrepared`, which enters
-   `FinishAttempt` and publishes.
+1. numerical completion and ordered product issuance precede
+   `FreezeCandidate`;
+2. fallible checkpoint/output staging precedes `PrepareCommit`;
+3. the facade retains the move-only `StagingToken`, `PreparedCommitToken`, and
+   `ProvisionalCommitToken` internally and exposes only move-only numeric CPU
+   handles with owner-incarnation and candidate-generation identity;
+4. `CommitPrepared` performs the reversible whole-slot exchange while the old
+   logical publication remains visible;
+5. `FinalizeCommit` is the sole logical success transition;
+6. `AbortPrepared` rolls back without exchange, and `RevertCommit` invokes the
+   exact self-inverse exchange before ordinary rollback.
 
-It is not sufficient for a fallible operation after state publication. The
-minimal future shared extension is therefore one common two-phase commit
-capability, not a second CPU publication protocol:
-
-- `ValidateAttempt(...) -> PreparedCommitCapability` performs all current
-  `FinishAttempt` validation and product consumption without calling
-  `StoragePolicy::Publish`;
-- `AbortPrepared(capability, reason)` invalidates the prepared capability and
-  rolls back the candidate; and
-- `PublishPrepared(capability) noexcept` performs the existing handle swap,
-  coordinate/telemetry publication, and no later recoverable work.
-
-The outer lifecycle must complete fallible history append and checkpoint/VTK
-staging between validation and `PublishPrepared`. A true failure after
-`PublishPrepared` cannot satisfy the card's natural `Commit` rollback rule and
-must not be simulated as postcommit staging. A coordinator-owned shared phase
-enum can accompany that extension so CPU/CUDA/CLI/I/O use one spelling; this
-leaf requests no broader DTO hierarchy or virtual interface.
+No additional shared commit primitive is requested. The only future common
+ABI request remains a coordinator-owned phase/disposition vocabulary so CPU,
+CUDA, CLI, and I/O can share spellings without duplicating unqualified DTOs.
+The CPU facade's allocation ledger intentionally covers selected W8-owned
+persistent object and vector-backing allocations only; opaque MFEM/HYPRE
+internals and standard-library shared-ownership control blocks are explicitly
+unobserved. Their census must be supplied by a future instrumented shared
+build policy if the campaign requires it.
+Active-run baseline/reuse events and independently owned checkpoint snapshot
+events are separate observed domains; checkpoint allocation is never reported
+as a zero-event numerical attempt.

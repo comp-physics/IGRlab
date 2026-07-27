@@ -2,15 +2,27 @@
 
 #include <mpi.h>
 
+#include <array>
+#include <cstdint>
 #include <vector>
 
 namespace dg_igr_hdg_cpu_test
 {
 
+struct IndependentLinearizationHashes
+{
+  std::array<std::uint8_t, 32> residual{};
+  std::array<std::uint8_t, 32> matrix{};
+  std::array<std::uint8_t, 32> factor{};
+  std::array<std::uint8_t, 32> solution{};
+  std::array<std::uint8_t, 32> candidate{};
+};
+
 struct IndependentOracleResult
 {
   std::vector<double> interior;
   std::vector<double> true_trace;
+  std::vector<IndependentLinearizationHashes> linearizations;
   double initial_residual = 0.0;
   double final_residual = 0.0;
   double maximum_true_residual = 0.0;

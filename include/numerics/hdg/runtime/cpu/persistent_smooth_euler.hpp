@@ -16,9 +16,11 @@
 #include <mpi.h>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <type_traits>
@@ -137,7 +139,55 @@ struct CpuProductRecord
   std::uint64_t attempt_sequence = 0;
   std::uint64_t candidate_cursor = 0;
   StateHash payload_hash{};
+  StateHash candidate_state_hash{};
+  std::uint64_t linearization_generation = 0;
+  std::uint64_t candidate_generation = 0;
   bool produced = false;
+};
+
+struct CpuLinearizationChain
+{
+  std::uint64_t local_generation = 0;
+  std::uint64_t condensed_generation = 0;
+  std::uint64_t solve_generation = 0;
+  std::uint64_t solution_generation = 0;
+  std::uint64_t recovery_generation = 0;
+  std::uint64_t candidate_generation = 0;
+  StateHash residual_hash{};
+  StateHash matrix_hash{};
+  StateHash factor_hash{};
+  StateHash solution_hash{};
+  StateHash candidate_state_hash{};
+  bool ordered = false;
+  bool affine_consumption_verified = false;
+  bool retained_for_publication = false;
+};
+
+enum class CpuOwnedAllocationSite : unsigned char
+{
+  slot_cell,
+  slot_backing,
+  slot_interior,
+  slot_trace,
+  topology_vector,
+  local_system_vector,
+  condensation_vector,
+  recovery_vector,
+  sparse_exchange_graph,
+  sparse_exchange_buffer,
+  mfem_wrapper,
+  core_wrapper,
+  contract_wrapper
+};
+
+struct CpuOwnedAllocationEvent
+{
+  CpuOwnedAllocationSite site = CpuOwnedAllocationSite::slot_cell;
+  std::uint64_t ordinal = 0;
+  std::size_t bytes = 0;
+  std::size_t alignment = 0;
+  std::size_t capacity = 0;
+  std::uintptr_t backing_token = 0;
 };
 
 struct CpuWorkCensus
@@ -161,10 +211,27 @@ struct CpuStorageEvidence
   std::size_t trace_size = 0;
   std::size_t trace_capacity = 0;
   std::size_t workspace_bytes = 0;
+  std::size_t sparse_owned_term_capacity = 0;
+  std::size_t sparse_outgoing_term_capacity = 0;
+  std::size_t sparse_incoming_slot_capacity = 0;
+  std::size_t true_diagonal_nnz = 0;
+  std::size_t true_offdiagonal_nnz = 0;
+  std::uintptr_t sparse_owned_term_token = 0;
+  std::uintptr_t sparse_outgoing_term_token = 0;
+  std::uintptr_t sparse_incoming_slot_token = 0;
   std::uint64_t topology_generation = 0;
   std::uint64_t storage_generation = 0;
   std::uint64_t allocation_baseline = 0;
   std::uint64_t allocation_events_after_baseline = 0;
+  std::array<CpuOwnedAllocationEvent, 96> owned_allocation_events{};
+  std::size_t owned_allocation_event_count = 0;
+  bool selected_owned_allocation_stream_complete = false;
+  bool opaque_mfem_hypre_allocations_unobserved = true;
+  bool opaque_standard_library_control_blocks_unobserved = true;
+  bool publish_is_complete_slot_exchange = false;
+  bool candidate_retains_exact_old_state_after_publish = false;
+  bool revert_publish_is_exact_byte_inverse = false;
+  bool publish_and_revert_preserve_disjoint_backing = false;
 };
 
 struct CpuAttemptEvidence
@@ -191,6 +258,12 @@ struct CpuAttemptEvidence
   StateHash committed_interior_after{};
   StateHash committed_trace_after{};
   std::array<CpuProductRecord, 4> products{};
+  std::array<CpuLinearizationChain, cpu_maximum_newton_updates>
+      linearization_chains{};
+  std::size_t linearization_chain_count = 0;
+  std::size_t retained_linearization_chain = 0;
+  std::uint64_t candidate_generation = 0;
+  bool candidate_generation_invalidated = false;
   std::array<CpuTrialEvidence,
              cpu_maximum_newton_updates * cpu_maximum_line_search_trials>
       trials{};
@@ -213,6 +286,8 @@ struct CpuAcceptedEvidence
   StateCoordinates coordinates{};
   StateHash interior_hash{};
   StateHash trace_hash{};
+  StateHash rank_common_interior_hash{};
+  StateHash rank_common_trace_hash{};
   CpuAttemptEvidence attempt{};
 };
 
@@ -248,9 +323,13 @@ struct CpuStateSnapshot
   StateCoordinates coordinates{};
   StateHash interior_hash{};
   StateHash trace_hash{};
+  StateHash state_hash{};
   CpuCoefficientView interior{};
   CpuCoefficientView trace{};
 };
+
+template <typename Selection>
+class PersistentSmoothEulerCpuAdapter;
 
 /**
  * Attempt-qualified numerical candidate exposed only between Prepare* and
@@ -259,6 +338,16 @@ struct CpuStateSnapshot
  */
 struct CpuPreparedStep
 {
+  CpuPreparedStep() noexcept = default;
+  CpuPreparedStep(const CpuPreparedStep&) = delete;
+  CpuPreparedStep& operator=(const CpuPreparedStep&) = delete;
+  CpuPreparedStep(CpuPreparedStep&& other) noexcept { MoveFrom(other); }
+  CpuPreparedStep& operator=(CpuPreparedStep&& other) noexcept
+  {
+    if (this != &other) { MoveFrom(other); }
+    return *this;
+  }
+
   AttemptIdentity identity{};
   std::uint64_t candidate_cursor = 0;
   StateCoordinates entry_coordinates{};
@@ -267,9 +356,165 @@ struct CpuPreparedStep
   CpuCoefficientView trace{};
   StateHash interior_hash{};
   StateHash trace_hash{};
+  std::uint64_t candidate_generation = 0;
   CpuFailurePhase failure_phase = CpuFailurePhase::none;
   bool numerically_ready = false;
   bool valid = false;
+
+  void Invalidate() noexcept
+  {
+    owner_incarnation = 0;
+    authority_serial = 0;
+    valid = false;
+  }
+
+private:
+  std::uint64_t owner_incarnation = 0;
+  std::uint64_t authority_serial = 0;
+  void MoveFrom(CpuPreparedStep& other) noexcept
+  {
+    identity = other.identity;
+    candidate_cursor = other.candidate_cursor;
+    entry_coordinates = other.entry_coordinates;
+    target_coordinates = other.target_coordinates;
+    interior = other.interior;
+    trace = other.trace;
+    interior_hash = other.interior_hash;
+    trace_hash = other.trace_hash;
+    candidate_generation = other.candidate_generation;
+    owner_incarnation = other.owner_incarnation;
+    authority_serial = other.authority_serial;
+    failure_phase = other.failure_phase;
+    numerically_ready = other.numerically_ready;
+    valid = other.valid;
+    other.Invalidate();
+  }
+  template <typename Selection>
+  friend class PersistentSmoothEulerCpuAdapter;
+};
+
+struct CpuPreparedCommit
+{
+  CpuPreparedCommit() noexcept = default;
+  CpuPreparedCommit(const CpuPreparedCommit&) = delete;
+  CpuPreparedCommit& operator=(const CpuPreparedCommit&) = delete;
+  CpuPreparedCommit(CpuPreparedCommit&& other) noexcept { MoveFrom(other); }
+  CpuPreparedCommit& operator=(CpuPreparedCommit&& other) noexcept
+  {
+    if (this != &other) { MoveFrom(other); }
+    return *this;
+  }
+  CheckpointDescriptor future_checkpoint{};
+  std::uint64_t candidate_generation = 0;
+  bool valid = false;
+  void Invalidate() noexcept
+  {
+    owner_incarnation = 0;
+    authority_serial = 0;
+    valid = false;
+  }
+private:
+  std::uint64_t owner_incarnation = 0;
+  std::uint64_t authority_serial = 0;
+  void MoveFrom(CpuPreparedCommit& other) noexcept
+  {
+    future_checkpoint = other.future_checkpoint;
+    owner_incarnation = other.owner_incarnation;
+    authority_serial = other.authority_serial;
+    candidate_generation = other.candidate_generation;
+    valid = other.valid;
+    other.Invalidate();
+  }
+  template <typename Selection>
+  friend class PersistentSmoothEulerCpuAdapter;
+};
+
+struct CpuProvisionalCommit
+{
+  CpuProvisionalCommit() noexcept = default;
+  CpuProvisionalCommit(const CpuProvisionalCommit&) = delete;
+  CpuProvisionalCommit& operator=(const CpuProvisionalCommit&) = delete;
+  CpuProvisionalCommit(CpuProvisionalCommit&& other) noexcept
+  {
+    MoveFrom(other);
+  }
+  CpuProvisionalCommit& operator=(CpuProvisionalCommit&& other) noexcept
+  {
+    if (this != &other) { MoveFrom(other); }
+    return *this;
+  }
+  std::uint64_t candidate_generation = 0;
+  bool valid = false;
+  void Invalidate() noexcept
+  {
+    owner_incarnation = 0;
+    authority_serial = 0;
+    valid = false;
+  }
+private:
+  std::uint64_t owner_incarnation = 0;
+  std::uint64_t authority_serial = 0;
+  void MoveFrom(CpuProvisionalCommit& other) noexcept
+  {
+    owner_incarnation = other.owner_incarnation;
+    authority_serial = other.authority_serial;
+    candidate_generation = other.candidate_generation;
+    valid = other.valid;
+    other.Invalidate();
+  }
+  template <typename Selection>
+  friend class PersistentSmoothEulerCpuAdapter;
+};
+
+struct CpuCandidateConsumeCapability
+{
+  CpuCandidateConsumeCapability() noexcept = default;
+  CpuCandidateConsumeCapability(const CpuCandidateConsumeCapability&) = delete;
+  CpuCandidateConsumeCapability& operator=(
+      const CpuCandidateConsumeCapability&) = delete;
+  CpuCandidateConsumeCapability(CpuCandidateConsumeCapability&& other) noexcept
+  {
+    MoveFrom(other);
+  }
+  CpuCandidateConsumeCapability& operator=(
+      CpuCandidateConsumeCapability&& other) noexcept
+  {
+    if (this != &other) { MoveFrom(other); }
+    return *this;
+  }
+  void Invalidate() noexcept
+  {
+    owner_incarnation = 0;
+    candidate_generation = 0;
+    authority_serial = 0;
+    valid = false;
+  }
+private:
+  std::uint64_t owner_incarnation = 0;
+  std::uint64_t candidate_generation = 0;
+  std::uint64_t authority_serial = 0;
+public:
+  bool valid = false;
+private:
+  CpuCandidateConsumeCapability(const std::uint64_t owner,
+                                const std::uint64_t generation,
+                                const std::uint64_t serial,
+                                const bool is_valid) noexcept
+      : owner_incarnation(owner),
+        candidate_generation(generation),
+        authority_serial(serial),
+        valid(is_valid)
+  {}
+  void MoveFrom(CpuCandidateConsumeCapability& other) noexcept
+  {
+    owner_incarnation = other.owner_incarnation;
+    candidate_generation = other.candidate_generation;
+    authority_serial = other.authority_serial;
+    valid = other.valid;
+    other.Invalidate();
+  }
+  template <typename Selection>
+  friend class PersistentSmoothEulerCpuAdapter;
 };
 
 struct CpuSlotCell;
@@ -293,6 +538,10 @@ struct CpuStateStoragePolicy
   static constexpr bool private_copy_is_independent = true;
   static constexpr bool publish_is_atomic = true;
   static constexpr bool publish_preserves_disjoint_backing = true;
+  static constexpr bool publish_is_complete_slot_exchange = true;
+  static constexpr bool candidate_retains_exact_old_state_after_publish = true;
+  static constexpr bool revert_publish_is_exact_byte_inverse = true;
+  static constexpr bool publish_and_revert_preserve_disjoint_backing = true;
 
   static bool PrepareCandidate(const CpuStateSlot&, CpuStateSlot&) noexcept;
   static bool PrepareRestore(const CpuStateSlot&, CpuStateSlot&) noexcept;
@@ -301,6 +550,7 @@ struct CpuStateStoragePolicy
   static void DiscardCandidate(CpuStateSlot&) noexcept;
   static bool CanPublish(const CpuStateSlot&, const CpuStateSlot&) noexcept;
   static void Publish(CpuStateSlot&, CpuStateSlot&) noexcept;
+  static void RevertPublish(CpuStateSlot&, CpuStateSlot&) noexcept;
   static bool Disjoint(const CpuStateSlot&, const CpuStateSlot&) noexcept;
   static StateHash HashInterior(const CpuInteriorState&) noexcept;
   static StateHash HashTrace(const CpuTraceState&) noexcept;
@@ -326,13 +576,32 @@ struct CpuWorldCollectivePolicy
 
 struct CpuCheckpoint
 {
+  CpuCheckpoint() noexcept = default;
+  CpuCheckpoint(const CpuCheckpoint&) = delete;
+  CpuCheckpoint& operator=(const CpuCheckpoint&) = delete;
+  CpuCheckpoint(CpuCheckpoint&&) noexcept = default;
+  CpuCheckpoint& operator=(CpuCheckpoint&&) noexcept = default;
   CheckpointDescriptor descriptor{};
   CpuStateSlot state{};
+  std::array<CpuOwnedAllocationEvent, 4> owned_allocation_events{};
+  std::size_t owned_allocation_event_count = 0;
   bool valid = false;
 
   CpuCoefficientView interior() const noexcept;
   CpuCoefficientView trace() const noexcept;
 };
+
+/**
+ * Collective fresh-process import.  Each rank supplies its own rank-local
+ * payload; descriptor identity is rank-common and is revalidated before the
+ * independently allocated checkpoint becomes valid.
+ */
+bool ImportCpuCheckpoint(const CheckpointDescriptor&,
+                         const double* local_interior,
+                         std::size_t local_interior_size,
+                         const double* local_true_trace,
+                         std::size_t local_true_trace_size,
+                         CpuCheckpoint&) noexcept;
 
 namespace detail
 {
@@ -379,6 +648,18 @@ public:
   CpuStateSnapshot Snapshot(const StateCoordinates&) const noexcept;
   CpuStateSnapshot CandidateSnapshot(const StateCoordinates&) const noexcept;
   void MarkPreparedFailure(CpuFailurePhase, int) noexcept;
+  void MarkPreparedFailure(CpuFailurePhase, int, CpuAttemptStatus) noexcept;
+  bool AuthorizePublicationChain(const AttemptIdentity&,
+                                 std::uint64_t candidate_generation,
+                                 const StateHash& candidate_state_hash) noexcept;
+  bool CandidateGenerationActive(std::uint64_t) const noexcept;
+  void InvalidateCandidateGeneration() noexcept;
+  bool ObserveOwnedAllocation(CpuOwnedAllocationSite,
+                              std::size_t bytes,
+                              std::size_t alignment,
+                              std::size_t capacity,
+                              const void* token) noexcept;
+  void SealOwnedAllocationBaseline() noexcept;
   const CpuRunEvidence& evidence() const noexcept;
   bool ExportCanonicalCommitted(CpuCanonicalEntry*, std::size_t,
                                 std::size_t&) const noexcept;
@@ -422,6 +703,9 @@ public:
   bool Initialize(const CpuPersistentConfig& config = MakeCpuSmokeConfig())
       noexcept
   {
+    static_assert(::dg::hdg::runtime::detail::SupportsTwoPhaseSlotExchange<
+                      CpuStateStoragePolicy, CpuStateSlot>::value,
+                  "CPU facade requires the frozen reversible-slot contract");
     if (contract_) { return false; }
     const RuntimeTupleDescriptor tuple = Selection::Descriptor();
     const StableIdentity selected_experiment =
@@ -444,6 +728,17 @@ public:
       contract_.reset();
       return false;
     }
+    facade_incarnation_ = NextFacadeIncarnation();
+    if (facade_incarnation_ == 0 ||
+        !core_.ObserveOwnedAllocation(CpuOwnedAllocationSite::contract_wrapper,
+                                      sizeof(contract_type),
+                                      alignof(contract_type), 1,
+                                      contract_.get()))
+    {
+      contract_.reset();
+      return false;
+    }
+    core_.SealOwnedAllocationBaseline();
     return contract_->status() == RunStatus::ready;
   }
 
@@ -451,8 +746,8 @@ public:
       CpuPreparedStep& prepared,
       const CpuFailureInjection& injection = CpuFailureInjection{}) noexcept
   {
-    prepared = {};
-    if (!contract_ || prepared_active_) { return false; }
+    prepared = CpuPreparedStep{};
+    if (!contract_ || FacadeBusy()) { return false; }
     const BeginOutcome begin = contract_->BeginStep(
         {InteriorSpace::l2, cpu_backward_euler_dt});
     return begin.started && PrepareStarted(begin, injection, prepared);
@@ -460,63 +755,170 @@ public:
 
   bool PrepareRetry(CpuPreparedStep& prepared) noexcept
   {
-    prepared = {};
-    if (!contract_ || prepared_active_) { return false; }
+    prepared = CpuPreparedStep{};
+    if (!contract_ || FacadeBusy()) { return false; }
     const BeginOutcome begin = contract_->Retry();
-    if (!begin.started) { return false; }
-    CpuFailureInjection disabled{};
-    return PrepareStarted(begin, disabled, prepared);
+    return begin.started && PrepareStarted(begin, {}, prepared);
   }
 
-  AttemptOutcome AbortPrepared(CpuPreparedStep& prepared,
+  std::optional<CpuCandidateConsumeCapability> AcquirePreparedCandidate(
+      const CpuPreparedStep& prepared) noexcept
+  {
+    if (!MatchesStaging(prepared) ||
+        !core_.CandidateGenerationActive(prepared.candidate_generation))
+    {
+      return std::nullopt;
+    }
+    return CpuCandidateConsumeCapability{facade_incarnation_,
+                                         prepared.candidate_generation,
+                                         NextAuthoritySerial(), true};
+  }
+
+  bool ConsumePreparedCandidate(CpuCandidateConsumeCapability&& capability,
+                                CpuStateSnapshot& snapshot) noexcept
+  {
+    if (!capability.valid ||
+        capability.owner_incarnation != facade_incarnation_ ||
+        capability.authority_serial == 0 ||
+        !core_.CandidateGenerationActive(capability.candidate_generation))
+    {
+      return false;
+    }
+    capability.Invalidate();
+    snapshot = core_.CandidateSnapshot(coordinates());
+    return snapshot.state_hash != StateHash{};
+  }
+
+  bool PrepareCommit(CpuPreparedStep& staging,
+                     CpuPreparedCommit& prepared) noexcept
+  {
+    prepared = CpuPreparedCommit{};
+    if (!MatchesStaging(staging) || !staging_token_) { return false; }
+    const AttemptReport report = PreparedReport();
+    auto next = contract_->PrepareCommit(std::move(*staging_token_), report,
+                                         std::move(prepared_products_));
+    staging_token_.reset();
+    staging.Invalidate();
+    staging_active_ = false;
+    if (!next)
+    {
+      last_transition_outcome_ = CurrentFailureOutcome();
+      CompleteAttempt(last_transition_outcome_);
+      return false;
+    }
+    prepared_token_.emplace(std::move(*next));
+    prepared.future_checkpoint = prepared_token_->future_checkpoint();
+    prepared.owner_incarnation = facade_incarnation_;
+    prepared.authority_serial = active_authority_serial_;
+    prepared.candidate_generation = active_candidate_generation_;
+    prepared.valid = true;
+    commit_prepared_active_ = true;
+    return true;
+  }
+
+  bool CommitPrepared(CpuPreparedCommit& prepared,
+                      CpuProvisionalCommit& provisional) noexcept
+  {
+    provisional = CpuProvisionalCommit{};
+    if (!MatchesPreparedCommit(prepared) || !prepared_token_) { return false; }
+    auto next = contract_->CommitPrepared(std::move(*prepared_token_));
+    prepared_token_.reset();
+    prepared.Invalidate();
+    commit_prepared_active_ = false;
+    if (!next) { return false; }
+    provisional_token_.emplace(std::move(*next));
+    provisional.owner_incarnation = facade_incarnation_;
+    provisional.authority_serial = active_authority_serial_;
+    provisional.candidate_generation = active_candidate_generation_;
+    provisional.valid = true;
+    provisional_active_ = true;
+    return true;
+  }
+
+  AttemptOutcome FinalizeCommit(CpuProvisionalCommit& provisional) noexcept
+  {
+    if (!MatchesProvisional(provisional) || !provisional_token_)
+    {
+      return StaleOutcome();
+    }
+    const AttemptOutcome outcome =
+        contract_->FinalizeCommit(std::move(*provisional_token_));
+    provisional_token_.reset();
+    provisional.Invalidate();
+    provisional_active_ = false;
+    CompleteAttempt(outcome);
+    return outcome;
+  }
+
+  AttemptOutcome AbortPrepared(CpuPreparedCommit& prepared,
                                const CpuFailurePhase phase,
                                const int source_rank = -1) noexcept
   {
-    if (!MatchesPrepared(prepared))
+    if (!MatchesPreparedCommit(prepared) || !prepared_token_)
     {
-      return {status(), FailureReason::stale_attempt, false,
-              status() == RunStatus::retry_available};
+      return StaleOutcome();
     }
-    prepared_numerical_.originating_failure = FailureReason::backend_failure;
-    prepared_numerical_.gates.success = false;
-    prepared_numerical_.evidence.failure_phase = phase;
-    prepared_numerical_.evidence.failure_source_rank = source_rank;
-    core_.MarkPreparedFailure(phase, source_rank);
-    return FinishPrepared(prepared);
+    MarkFacadeFailure(phase, source_rank);
+    const AttemptOutcome outcome = contract_->AbortPrepared(
+        std::move(*prepared_token_), FailureReason::backend_failure);
+    prepared_token_.reset();
+    prepared.Invalidate();
+    commit_prepared_active_ = false;
+    CompleteAttempt(outcome);
+    return outcome;
   }
 
-  AttemptOutcome FinalizePrepared(CpuPreparedStep& prepared) noexcept
+  AttemptOutcome RevertCommit(CpuProvisionalCommit& provisional,
+                              const CpuFailurePhase phase,
+                              const int source_rank = -1) noexcept
   {
-    if (!MatchesPrepared(prepared))
+    if (!MatchesProvisional(provisional) || !provisional_token_)
     {
-      return {status(), FailureReason::stale_attempt, false,
-              status() == RunStatus::retry_available};
+      return StaleOutcome();
     }
-    return FinishPrepared(prepared);
+    MarkFacadeFailure(phase, source_rank);
+    const AttemptOutcome outcome = contract_->RevertCommit(
+        std::move(*provisional_token_), FailureReason::backend_failure);
+    provisional_token_.reset();
+    provisional.Invalidate();
+    provisional_active_ = false;
+    CompleteAttempt(outcome);
+    return outcome;
+  }
+
+  AttemptOutcome AbortPrepared(CpuPreparedStep& staging,
+                               const CpuFailurePhase phase,
+                               const int source_rank = -1) noexcept
+  {
+    if (!MatchesStaging(staging)) { return StaleOutcome(); }
+    MarkFacadeFailure(phase, source_rank);
+    CpuPreparedCommit prepared;
+    if (!PrepareCommit(staging, prepared)) { return last_transition_outcome_; }
+    return AbortPrepared(prepared, phase, source_rank);
+  }
+
+  AttemptOutcome FinalizePrepared(CpuPreparedStep& staging) noexcept
+  {
+    if (!MatchesStaging(staging)) { return StaleOutcome(); }
+    CpuPreparedCommit prepared;
+    if (!PrepareCommit(staging, prepared)) { return last_transition_outcome_; }
+    CpuProvisionalCommit provisional;
+    if (!CommitPrepared(prepared, provisional)) { return StaleOutcome(); }
+    return FinalizeCommit(provisional);
   }
 
   AttemptOutcome Advance(
       const CpuFailureInjection& injection = CpuFailureInjection{}) noexcept
   {
     CpuPreparedStep prepared;
-    if (!PrepareAdvance(prepared, injection))
-    {
-      return {status(), contract_ ? contract_->last_failure()
-                                  : FailureReason::backend_failure,
-              false, status() == RunStatus::retry_available};
-    }
+    if (!PrepareAdvance(prepared, injection)) { return CurrentFailureOutcome(); }
     return FinalizePrepared(prepared);
   }
 
   AttemptOutcome Retry() noexcept
   {
     CpuPreparedStep prepared;
-    if (!PrepareRetry(prepared))
-    {
-      return {status(), contract_ ? contract_->last_failure()
-                                  : FailureReason::backend_failure,
-              false, false};
-    }
+    if (!PrepareRetry(prepared)) { return CurrentFailureOutcome(); }
     return FinalizePrepared(prepared);
   }
 
@@ -524,8 +926,8 @@ public:
   {
     if (!contract_) { return false; }
     CheckpointDescriptor descriptor;
-    if (!contract_->TryMakeCheckpoint(descriptor)) { return false; }
-    return core_.CaptureCheckpoint(descriptor, checkpoint);
+    return contract_->TryMakeCheckpoint(descriptor) &&
+        core_.CaptureCheckpoint(descriptor, checkpoint);
   }
 
   RestoreOutcome Restore(const CpuCheckpoint& checkpoint) noexcept
@@ -545,24 +947,24 @@ public:
   {
     return contract_ ? contract_->status() : RunStatus::invalid_request;
   }
-
   StateCoordinates coordinates() const noexcept
   {
     return contract_ ? contract_->coordinates() : StateCoordinates{};
   }
-
   const RunTelemetry* contract_telemetry() const noexcept
   {
     return contract_ ? &contract_->telemetry() : nullptr;
   }
-
   const CpuRunEvidence& evidence() const noexcept { return core_.evidence(); }
-
   CpuStateSnapshot Snapshot() const noexcept
   {
     return core_.Snapshot(coordinates());
   }
-
+  CpuStateSnapshot LogicalPublishedSnapshot() const noexcept
+  {
+    return provisional_active_ ? core_.CandidateSnapshot(coordinates())
+                               : core_.Snapshot(coordinates());
+  }
   bool ExportCanonicalCommitted(CpuCanonicalEntry* entries,
                                 const std::size_t capacity,
                                 std::size_t& written) const noexcept
@@ -571,14 +973,97 @@ public:
   }
 
 private:
+  static std::uint64_t NextFacadeIncarnation() noexcept
+  {
+    static std::atomic<std::uint64_t> next{1};
+    const std::uint64_t value = next.fetch_add(1, std::memory_order_relaxed);
+    return value == 0 ? 0 : value;
+  }
+  std::uint64_t NextAuthoritySerial() noexcept
+  {
+    if (next_authority_serial_ == 0 ||
+        next_authority_serial_ == std::numeric_limits<std::uint64_t>::max())
+    {
+      return 0;
+    }
+    return next_authority_serial_++;
+  }
+  bool FacadeBusy() const noexcept
+  {
+    return staging_active_ || commit_prepared_active_ || provisional_active_;
+  }
+  AttemptOutcome StaleOutcome() const noexcept
+  {
+    return {status(), FailureReason::stale_attempt, false,
+            status() == RunStatus::retry_available};
+  }
+  AttemptOutcome CurrentFailureOutcome() const noexcept
+  {
+    return {status(), contract_ ? contract_->last_failure()
+                                : FailureReason::backend_failure,
+            false, status() == RunStatus::retry_available};
+  }
+  void ResetProductBundle() noexcept
+  {
+    prepared_products_.residual.reset();
+    prepared_products_.matrix.reset();
+    prepared_products_.factor.reset();
+    prepared_products_.solution.reset();
+  }
+  bool IssuePreparedProducts(const BeginOutcome& begin,
+                             const CpuStateSnapshot& candidate,
+                             const CpuProductFault fault) noexcept
+  {
+    ResetProductBundle();
+    if (!core_.AuthorizePublicationChain(begin.attempt,
+                                          active_candidate_generation_,
+                                          candidate.state_hash))
+    {
+      return prepared_numerical_.originating_failure != FailureReason::none;
+    }
+    if (fault == CpuProductFault::out_of_order_matrix)
+    {
+      (void)contract_->template IssueProduct<DerivedProductKind::matrix>(
+          begin.attempt);
+      prepared_numerical_.originating_failure = FailureReason::invalid_product;
+    }
+    prepared_products_.residual =
+        contract_->template IssueProduct<DerivedProductKind::residual>(
+            begin.attempt);
+    if (fault == CpuProductFault::duplicate_residual)
+    {
+      (void)contract_->template IssueProduct<DerivedProductKind::residual>(
+          begin.attempt);
+      prepared_numerical_.originating_failure = FailureReason::invalid_product;
+    }
+    prepared_products_.matrix =
+        contract_->template IssueProduct<DerivedProductKind::matrix>(
+            begin.attempt);
+    prepared_products_.factor =
+        contract_->template IssueProduct<DerivedProductKind::factor>(
+            begin.attempt);
+    if (fault != CpuProductFault::missing_solution)
+    {
+      prepared_products_.solution =
+          contract_->template IssueProduct<DerivedProductKind::solution>(
+              begin.attempt);
+    }
+    if (fault != CpuProductFault::none)
+    {
+      prepared_numerical_.originating_failure = FailureReason::invalid_product;
+      MarkFacadeFailure(CpuFailurePhase::diagnostics, -1);
+    }
+    return true;
+  }
   bool PrepareStarted(const BeginOutcome& begin,
                       const CpuFailureInjection& injection,
                       CpuPreparedStep& prepared) noexcept
   {
     const StateCoordinates entry = contract_->coordinates();
-    const auto capability = contract_->AcquireCandidate(begin.attempt);
     detail::CpuNumericalResult numerical;
-    if (!capability)
+    const auto capability = contract_->AcquireCandidate(begin.attempt);
+    if (capability) { numerical = core_.Execute(begin.attempt, entry, injection); }
+    else
     {
       numerical.originating_failure = FailureReason::stale_attempt;
       numerical.evidence.identity = begin.attempt;
@@ -586,122 +1071,119 @@ private:
       numerical.evidence.candidate_cursor = begin.attempt.sequence;
       numerical.evidence.transfers.complete = true;
     }
-    else
-    {
-      numerical = core_.Execute(begin.attempt, entry, injection);
-    }
-
     prepared_begin_ = begin;
     prepared_numerical_ = numerical;
-    prepared_product_fault_ = injection.product_fault;
-    prepared_active_ = true;
+    active_candidate_generation_ = numerical.evidence.candidate_generation;
+    active_authority_serial_ = NextAuthoritySerial();
     const CpuStateSnapshot candidate = core_.CandidateSnapshot(entry);
+    if (active_authority_serial_ == 0 ||
+        !IssuePreparedProducts(begin, candidate, injection.product_fault))
+    {
+      prepared_numerical_.originating_failure = FailureReason::backend_failure;
+      prepared_numerical_.gates.success = false;
+    }
+    auto frozen = contract_->FreezeCandidate(begin.attempt,
+                                              begin.attempt.sequence);
+    if (!frozen)
+    {
+      core_.InvalidateCandidateGeneration();
+      return false;
+    }
+    staging_token_.emplace(std::move(*frozen));
+    staging_active_ = true;
     prepared.identity = begin.attempt;
     prepared.candidate_cursor = begin.attempt.sequence;
-    prepared.entry_coordinates = entry;
-    prepared.target_coordinates = {
-        entry.time + cpu_backward_euler_dt,
-        entry.step + 1,
-        entry.generation + 1,
-        begin.attempt.sequence,
-        cpu_backward_euler_dt};
+    prepared.entry_coordinates = staging_token_->entry_coordinates();
+    prepared.target_coordinates = staging_token_->target_coordinates();
     prepared.interior = candidate.interior;
     prepared.trace = candidate.trace;
     prepared.interior_hash = candidate.interior_hash;
     prepared.trace_hash = candidate.trace_hash;
+    prepared.candidate_generation = active_candidate_generation_;
+    prepared.owner_incarnation = facade_incarnation_;
+    prepared.authority_serial = active_authority_serial_;
     prepared.failure_phase = numerical.evidence.failure_phase;
     prepared.numerically_ready = numerical.originating_failure ==
             FailureReason::none && numerical.gates.All();
     prepared.valid = true;
     return true;
   }
-
-  bool MatchesPrepared(const CpuPreparedStep& prepared) const noexcept
+  bool MatchesStaging(const CpuPreparedStep& prepared) const noexcept
   {
-    return prepared_active_ && prepared.valid && prepared_begin_.started &&
+    return staging_active_ && prepared.valid && prepared_begin_.started &&
+        prepared.owner_incarnation == facade_incarnation_ &&
+        prepared.authority_serial == active_authority_serial_ &&
+        prepared.candidate_generation == active_candidate_generation_ &&
         ::dg::hdg::runtime::detail::SameAttempt(prepared.identity,
-                                                prepared_begin_.attempt) &&
-        prepared.candidate_cursor == prepared_begin_.attempt.sequence;
+                                                prepared_begin_.attempt);
   }
-
-  AttemptOutcome FinishPrepared(CpuPreparedStep& prepared) noexcept
+  bool MatchesPreparedCommit(const CpuPreparedCommit& prepared) const noexcept
   {
-    const BeginOutcome begin = prepared_begin_;
-    detail::CpuNumericalResult numerical = prepared_numerical_;
-
-    typename contract_type::ProductBundle bundle;
-    const CpuProductFault fault = prepared_product_fault_;
-    if (fault != CpuProductFault::none)
-    {
-      numerical.evidence.status = CpuAttemptStatus::runtime_failure;
-      numerical.evidence.failure_phase = CpuFailurePhase::diagnostics;
-      core_.MarkPreparedFailure(CpuFailurePhase::diagnostics, -1);
-    }
-    if (fault == CpuProductFault::out_of_order_matrix)
-    {
-      (void)contract_->template IssueProduct<DerivedProductKind::matrix>(
-          begin.attempt);
-      numerical.originating_failure = FailureReason::invalid_product;
-    }
-
-    if (numerical.evidence.products[0].produced)
-    {
-      bundle.residual =
-          contract_->template IssueProduct<DerivedProductKind::residual>(
-              begin.attempt);
-      if (fault == CpuProductFault::duplicate_residual)
-      {
-        (void)contract_->template IssueProduct<DerivedProductKind::residual>(
-            begin.attempt);
-        numerical.originating_failure = FailureReason::invalid_product;
-      }
-    }
-    if (numerical.evidence.products[1].produced)
-    {
-      bundle.matrix =
-          contract_->template IssueProduct<DerivedProductKind::matrix>(
-              begin.attempt);
-    }
-    if (numerical.evidence.products[2].produced)
-    {
-      bundle.factor =
-          contract_->template IssueProduct<DerivedProductKind::factor>(
-              begin.attempt);
-    }
-    if (numerical.evidence.products[3].produced &&
-        fault != CpuProductFault::missing_solution)
-    {
-      bundle.solution =
-          contract_->template IssueProduct<DerivedProductKind::solution>(
-              begin.attempt);
-    }
-
+    return commit_prepared_active_ && prepared.valid &&
+        prepared.owner_incarnation == facade_incarnation_ &&
+        prepared.authority_serial == active_authority_serial_ &&
+        prepared.candidate_generation == active_candidate_generation_;
+  }
+  bool MatchesProvisional(const CpuProvisionalCommit& provisional) const noexcept
+  {
+    return provisional_active_ && provisional.valid &&
+        provisional.owner_incarnation == facade_incarnation_ &&
+        provisional.authority_serial == active_authority_serial_ &&
+        provisional.candidate_generation == active_candidate_generation_;
+  }
+  AttemptReport PreparedReport() const noexcept
+  {
     AttemptReport report;
-    report.gates = numerical.gates;
-    report.telemetry.identity = begin.attempt;
-    report.telemetry.transfers = numerical.evidence.transfers;
-    report.telemetry.prohibited = numerical.evidence.prohibited;
+    report.gates = prepared_numerical_.gates;
+    report.telemetry.identity = prepared_begin_.attempt;
+    report.telemetry.transfers = prepared_numerical_.evidence.transfers;
+    report.telemetry.prohibited = prepared_numerical_.evidence.prohibited;
     report.telemetry.true_relative_residual =
-        numerical.evidence.maximum_true_relative_residual;
-    report.candidate_cursor = begin.attempt.sequence;
-    report.originating_failure = numerical.originating_failure;
-    const AttemptOutcome outcome = contract_->FinishAttempt(
-        begin.attempt, report, std::move(bundle));
+        prepared_numerical_.evidence.maximum_true_relative_residual;
+    report.candidate_cursor = prepared_begin_.attempt.sequence;
+    report.originating_failure = prepared_numerical_.originating_failure;
+    return report;
+  }
+  void MarkFacadeFailure(const CpuFailurePhase phase,
+                         const int source_rank) noexcept
+  {
+    prepared_numerical_.originating_failure = FailureReason::backend_failure;
+    prepared_numerical_.gates.success = false;
+    prepared_numerical_.evidence.failure_phase = phase;
+    prepared_numerical_.evidence.failure_source_rank = source_rank;
+    const CpuAttemptStatus disposition = source_rank >= 0
+        ? CpuAttemptStatus::injected_failure
+        : CpuAttemptStatus::runtime_failure;
+    core_.MarkPreparedFailure(phase, source_rank, disposition);
+  }
+  void CompleteAttempt(const AttemptOutcome& outcome) noexcept
+  {
+    core_.InvalidateCandidateGeneration();
     core_.Complete(outcome, contract_->coordinates(), contract_->telemetry());
-    prepared = {};
     prepared_begin_ = {};
     prepared_numerical_ = {};
-    prepared_product_fault_ = CpuProductFault::none;
-    prepared_active_ = false;
-    return outcome;
+    active_candidate_generation_ = 0;
+    active_authority_serial_ = 0;
+    ResetProductBundle();
   }
 
   detail::CpuNumericsCore core_{};
   std::unique_ptr<contract_type> contract_{};
   BeginOutcome prepared_begin_{};
   detail::CpuNumericalResult prepared_numerical_{};
-  CpuProductFault prepared_product_fault_ = CpuProductFault::none;
-  bool prepared_active_ = false;
+  typename contract_type::ProductBundle prepared_products_{};
+  std::optional<typename contract_type::StagingToken> staging_token_{};
+  std::optional<typename contract_type::PreparedCommitToken> prepared_token_{};
+  std::optional<typename contract_type::ProvisionalCommitToken>
+      provisional_token_{};
+  AttemptOutcome last_transition_outcome_{};
+  std::uint64_t facade_incarnation_ = 0;
+  std::uint64_t next_authority_serial_ = 1;
+  std::uint64_t active_authority_serial_ = 0;
+  std::uint64_t active_candidate_generation_ = 0;
+  bool staging_active_ = false;
+  bool commit_prepared_active_ = false;
+  bool provisional_active_ = false;
 };
 
 } // namespace dg::hdg::runtime::cpu
