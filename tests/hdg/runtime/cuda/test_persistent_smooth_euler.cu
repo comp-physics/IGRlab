@@ -398,6 +398,7 @@ struct AuditedTransport
 {
   inline static CudaTransferLedgerV1 ledger{};
   inline static CudaTransferTotals attempt_totals{};
+  inline static std::uint64_t successful_synchronization_events = 0;
   inline static bool fail_checkpoint_trace_once = false;
 
   static void ResetLedger() noexcept
@@ -405,6 +406,7 @@ struct AuditedTransport
     audit_context = {};
     ledger = {};
     attempt_totals = {};
+    successful_synchronization_events = 0;
     fail_checkpoint_trace_once = false;
     CudaTransportPolicy::ResetLedger();
   }
@@ -541,6 +543,9 @@ struct AuditedTransport
   static bool Synchronize(const CudaTransferSite site) noexcept
   {
     const bool success = CudaTransportPolicy::Synchronize(site);
+    if (success && successful_synchronization_events !=
+                       std::numeric_limits<std::uint64_t>::max())
+      ++successful_synchronization_events;
     if (ledger.totals.synchronization_events !=
         std::numeric_limits<std::uint64_t>::max())
       ++ledger.totals.synchronization_events;
@@ -558,6 +563,8 @@ struct AuditedTransport
 
   static CudaTransferTotals Accounting() noexcept { return attempt_totals; }
   static CudaTransferLedgerV1 Ledger() noexcept { return ledger; }
+  static std::uint64_t SuccessfulSynchronizationEvents() noexcept
+  { return successful_synchronization_events; }
 };
 
 bool SameContext(const CudaPolicyContext& left,
@@ -820,6 +827,7 @@ enum : std::uint64_t
 struct CheckpointDiagnosticV1
 {
   std::uint64_t failure_mask=0, substage_mask=0, event_count=0, sync_delta=0;
+  std::uint64_t sync_success_delta=0;
   StateHash interior{}, trace{};
   bool mirror=false;
 };
@@ -828,7 +836,9 @@ CheckpointDiagnosticV1 BuildCheckpointDiagnosticV1(
     bool staged, const CudaSerializedCheckpointV1& c,
     const CudaPrecommitSnapshot& s, int ranks, int rank,
     const CudaTransferLedgerV1& before,
-    const CudaTransferLedgerV1& after, bool mirror) noexcept
+    const CudaTransferLedgerV1& after,
+    const std::uint64_t before_sync_successes,
+    const std::uint64_t after_sync_successes, bool mirror) noexcept
 {
   CheckpointDiagnosticV1 d{}; d.mirror=mirror;
   const bool ic=c.interior_count<=c.interior.size();
@@ -846,9 +856,23 @@ CheckpointDiagnosticV1 BuildCheckpointDiagnosticV1(
       c.staging_range.begin_ordinal,c.staging_range.end_ordinal);
   bool event_ok[4]={}; unsigned seen[4]={}; bool shape=true;
   const std::uint64_t first=before.observed_count+1;
-  d.sync_delta=after.totals.synchronization_events>=
-      before.totals.synchronization_events?
-      after.totals.synchronization_events-before.totals.synchronization_events:0;
+  const std::uint64_t before_sync_calls=
+      before.totals.synchronization_events;
+  const std::uint64_t after_sync_calls=after.totals.synchronization_events;
+  bool sync_audit_valid=after_sync_calls>=before_sync_calls&&
+      after_sync_successes>=before_sync_successes&&
+      before_sync_successes<=before_sync_calls&&
+      after_sync_successes<=after_sync_calls;
+  if(sync_audit_valid)
+  {
+    d.sync_delta=after_sync_calls-before_sync_calls;
+    d.sync_success_delta=after_sync_successes-before_sync_successes;
+    sync_audit_valid=d.sync_success_delta<=d.sync_delta;
+  }
+  const bool first_sync=sync_audit_valid&&d.sync_delta>=1&&
+      d.sync_success_delta>=1;
+  const bool second_sync=sync_audit_valid&&d.sync_delta>=2&&
+      d.sync_success_delta>=2;
   for(std::size_t i=0;i<after.count;++i)
   {
     const auto& e=after.events[i]; if(e.ordinal<first)continue;
@@ -905,17 +929,14 @@ CheckpointDiagnosticV1 BuildCheckpointDiagnosticV1(
   fail(ih,ckpt_recomputed_interior_hash); fail(th,ckpt_recomputed_trace_hash);
   fail(bounds,ckpt_range_bounds); fail(digest,ckpt_range_digest);
   fail(mirror,ckpt_ledger_mirror); fail(shape,ckpt_event_shape_context);
-  // Report the first inferred failed substage.  In particular, two recorded
-  // synchronization calls are not success evidence: four successful copies
-  // followed by an incomplete transport total identifies the second sync.
+  // Report the first inferred failed substage from this staging call only.
+  // Lifetime transfer completeness may already be false from an older stage.
   if(!event_ok[0])d.substage_mask=ckpt_sub_d2d_interior;
   else if(!event_ok[1])d.substage_mask=ckpt_sub_d2d_trace;
-  else if(seen[2]==0&&seen[3]==0&&d.sync_delta==1&&
-          !after.totals.complete)d.substage_mask=ckpt_sub_first_sync;
+  else if(!first_sync)d.substage_mask=ckpt_sub_first_sync;
   else if(!event_ok[2])d.substage_mask=ckpt_sub_d2h_interior;
   else if(!event_ok[3])d.substage_mask=ckpt_sub_d2h_trace;
-  else if(d.sync_delta<2||!after.totals.complete)
-    d.substage_mask=ckpt_sub_second_sync;
+  else if(!second_sync)d.substage_mask=ckpt_sub_second_sync;
   else if(!ih)d.substage_mask=ckpt_sub_host_interior_hash;
   else if(!th)d.substage_mask=ckpt_sub_host_trace_hash;
   else if(!staged)d.substage_mask=ckpt_sub_collective_return;
@@ -958,7 +979,8 @@ void ReportCheckpointDiagnosticV1(const char* id,int rank,bool retry,
     <<after.dropped_count<<'/'<<after.overflow<<"/0x"<<std::hex
     <<after.ordered_digest<<std::dec<<" attempt="<<totals.event_count<<'/'
     <<totals.synchronization_events<<'/'<<totals.complete<<" stage="
-    <<d.event_count<<'/'<<d.sync_delta<<" mirror="<<d.mirror<<'\n';
+    <<d.event_count<<'/'<<d.sync_delta<<'/'<<d.sync_success_delta
+    <<" mirror="<<d.mirror<<'\n';
   std::size_t n=0;const auto first=c.staging_range.begin_ordinal?
       c.staging_range.begin_ordinal:before.observed_count+1;
   const auto last=c.staging_range.end_ordinal>=first?
@@ -983,11 +1005,16 @@ template <typename Engine> bool StagePreparedCheckpointDiagnosed(Engine& e,
     const char* id,int rank) noexcept
 {
   const auto before=AuditedTransport::Ledger();
+  const auto before_sync_successes=
+      AuditedTransport::SuccessfulSynchronizationEvents();
   const bool staged=e.StagePreparedCheckpoint(c,evidence);
   const auto after=AuditedTransport::Ledger();
+  const auto after_sync_successes=
+      AuditedTransport::SuccessfulSynchronizationEvents();
   if(!staged){const bool mirror=ExactPolicyLedgers();
     const auto d=BuildCheckpointDiagnosticV1(
-      staged,c,s,ranks,rank,before,after,mirror);
+      staged,c,s,ranks,rank,before,after,before_sync_successes,
+      after_sync_successes,mirror);
     ReportCheckpointDiagnosticV1(id,rank,retry,target,c,s,before,after,
       AuditedTransport::Accounting(),d);}
   return staged;
@@ -1036,6 +1063,8 @@ struct CheckpointDiagnosticFixtureV1
   CudaPrecommitSnapshot snapshot{};
   CudaTransferLedgerV1 before{};
   CudaTransferLedgerV1 after{};
+  std::uint64_t before_sync_successes = 0;
+  std::uint64_t after_sync_successes = 0;
   bool staged = true;
   bool mirror = true;
 };
@@ -1056,6 +1085,8 @@ void InitializeCheckpointDiagnosticFixture(
   fixture.snapshot = {};
   fixture.staged = true;
   fixture.mirror = true;
+  fixture.before_sync_successes = 0;
+  fixture.after_sync_successes = 2;
   fixture.before.totals = {};
   fixture.before.count = 0;
   fixture.before.observed_count = 0;
@@ -1160,13 +1191,17 @@ void InitializeCheckpointDiagnosticFixture(
 void RestrictCheckpointFixtureToD2D(
     CheckpointDiagnosticFixtureV1& fixture) noexcept
 {
+  fixture.staged = false;
+  fixture.checkpoint.checkpoint_staged = false;
   fixture.after.count = 2;
   fixture.after.observed_count = 2;
   fixture.after.totals.device_to_host_bytes = 0;
   fixture.after.totals.synchronization_events = 1;
+  fixture.after_sync_successes = 0;
   fixture.after.totals.event_count = 2;
   fixture.after.totals.complete = false;
   fixture.checkpoint.staging_range.end_ordinal = 2;
+  fixture.checkpoint.staging_range.complete = false;
   fixture.checkpoint.staging_range.ordered_digest =
       IndependentCheckpointRangeDigest(fixture.after, 1, 2);
 }
@@ -1179,11 +1214,13 @@ bool CheckpointDiagnosticExactFixtures() noexcept
   {
     return BuildCheckpointDiagnosticV1(
         fixture->staged, fixture->checkpoint, fixture->snapshot, 1, 0,
-        fixture->before, fixture->after, fixture->mirror);
+        fixture->before, fixture->after, fixture->before_sync_successes,
+        fixture->after_sync_successes, fixture->mirror);
   };
   const CheckpointDiagnosticV1 baseline = diagnose();
   if (baseline.failure_mask != 0 || baseline.substage_mask != 0 ||
-      baseline.event_count != 4 || baseline.sync_delta != 2)
+      baseline.event_count != 4 || baseline.sync_delta != 2 ||
+      baseline.sync_success_delta != 2)
     return false;
 
   for (unsigned bit = 0; bit < 20; ++bit)
@@ -1248,7 +1285,9 @@ bool CheckpointDiagnosticExactFixtures() noexcept
         break;
       case 5:
         fixture->staged = false;
+        fixture->checkpoint.checkpoint_staged = false;
         fixture->after.totals.complete = false;
+        fixture->after_sync_successes = 1;
         break;
       case 6: fixture->checkpoint.interior[0] += 1.0; break;
       case 7: fixture->checkpoint.owned_true_trace[0] += 1.0; break;
@@ -1256,6 +1295,30 @@ bool CheckpointDiagnosticExactFixtures() noexcept
       case 9: fixture->checkpoint.staging_range.complete = false; break;
     }
     if (diagnose().substage_mask != (std::uint64_t{1} << bit))
+      return false;
+  }
+
+  // A prior lifetime failure must not shadow a clean current stage.  The
+  // current stage contributes exactly two calls and two successes.
+  const std::array<std::uint64_t, 5> contaminated_expected{{
+      0, std::uint64_t{1} << 6, std::uint64_t{1} << 7,
+      std::uint64_t{1} << 8, std::uint64_t{1} << 9}};
+  for (std::size_t fault = 0; fault < contaminated_expected.size(); ++fault)
+  {
+    InitializeCheckpointDiagnosticFixture(*fixture);
+    fixture->before.totals.complete = false;
+    fixture->after.totals.complete = false;
+    fixture->before.totals.synchronization_events = 5;
+    fixture->after.totals.synchronization_events = 7;
+    fixture->before_sync_successes = 4;
+    fixture->after_sync_successes = 6;
+    if (fault == 1) fixture->checkpoint.interior[0] += 1.0;
+    if (fault == 2) fixture->checkpoint.owned_true_trace[0] += 1.0;
+    if (fault == 3) fixture->staged = false;
+    if (fault == 4) fixture->checkpoint.staging_range.complete = false;
+    const CheckpointDiagnosticV1 diagnostic = diagnose();
+    if (diagnostic.substage_mask != contaminated_expected[fault] ||
+        diagnostic.sync_delta != 2 || diagnostic.sync_success_delta != 2)
       return false;
   }
   return true;
@@ -1931,10 +1994,14 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
 
   const CudaTransferLedgerV1 checkpoint_ledger_before =
       AuditedTransport::Ledger();
+  const std::uint64_t checkpoint_sync_successes_before =
+      AuditedTransport::SuccessfulSynchronizationEvents();
   const bool checkpoint_stage_return =
       engine.StagePreparedCheckpoint(checkpoint, evidence);
   const CudaTransferLedgerV1 checkpoint_ledger_after =
       AuditedTransport::Ledger();
+  const std::uint64_t checkpoint_sync_successes_after =
+      AuditedTransport::SuccessfulSynchronizationEvents();
   const bool checkpoint_ledger_mirror = ExactPolicyLedgers();
   const bool checkpoint_stage_failed =
       !checkpoint_stage_return ||
@@ -1962,6 +2029,7 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
     const CheckpointDiagnosticV1 diagnostic = BuildCheckpointDiagnosticV1(
         checkpoint_stage_return, checkpoint, snapshot, ranks, rank,
         checkpoint_ledger_before, checkpoint_ledger_after,
+        checkpoint_sync_successes_before, checkpoint_sync_successes_after,
         checkpoint_ledger_mirror);
     ReportCheckpointDiagnosticV1(
         case_id, rank, retry, target_step, checkpoint, snapshot,
