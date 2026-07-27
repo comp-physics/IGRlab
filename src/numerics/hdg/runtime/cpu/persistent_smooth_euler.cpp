@@ -1043,6 +1043,24 @@ bool Copy(const mfem::Vector& source,
   return Finite(destination);
 }
 
+template <std::size_t Capacity>
+bool CaptureFixed(const mfem::Vector& source,
+                  std::array<double, Capacity>& destination,
+                  std::size_t& size) noexcept
+{
+  if (source.Size() < 0 ||
+      static_cast<std::size_t>(source.Size()) > destination.size())
+  {
+    return false;
+  }
+  size = static_cast<std::size_t>(source.Size());
+  const double* values = source.HostRead();
+  if (!values && size != 0) { return false; }
+  if (size != 0) { std::copy_n(values, size, destination.begin()); }
+  return std::all_of(destination.begin(), destination.begin() + size,
+                     [](const double value) { return Finite(value); });
+}
+
 StateHash HashSystemMatrix(const LocalSystem& system) noexcept
 {
   StateHash value = HashDoubles(system.a);
@@ -1264,6 +1282,9 @@ struct detail::CpuNumericsCore::Implementation
   StateHash entry_trace_hash{};
   std::uint64_t next_artifact_generation = 1;
   std::uint64_t next_candidate_generation = 1;
+  std::uint64_t next_matrix_refresh_generation = 1;
+  std::uint64_t pending_factor_setup_generation = 0;
+  std::uint64_t complete_factor_setup_generation = 0;
   std::uint64_t active_candidate_generation = 0;
   StateHash active_candidate_state_hash{};
   bool publication_chain_authority = false;
@@ -1290,6 +1311,38 @@ struct detail::CpuNumericsCore::Implementation
     return value && allocations.Observe(CpuOwnedAllocationSite::mfem_wrapper,
                                          sizeof(T), alignof(T), 1,
                                          value.get());
+  }
+
+  void ApplyFrozenIluSettings() noexcept
+  {
+    ilu->SetType(0);
+    ilu->SetLevelOfFill(0);
+    ilu->SetMaxIter(1);
+    ilu->SetTol(0.0);
+    ilu->SetLocalReordering(0);
+    ilu->SetPrintLevel(0);
+  }
+
+  bool RebindTraceSolverAfterMatrixRefresh() noexcept
+  {
+    pending_factor_setup_generation = 0;
+    if (!true_matrix || !gmres || !ilu) { return false; }
+    try
+    {
+      // SetOperator invalidates GMRES setup.  For an already-bound HypreILU,
+      // pinned MFEM recreates the HYPRE object with defaults here, so the
+      // frozen type/fill/iteration/tolerance/reordering/print settings must be
+      // reapplied before its callbacks are rebound and Mult performs setup.
+      gmres->SetOperator(*true_matrix);
+      ApplyFrozenIluSettings();
+      gmres->SetPreconditioner(*ilu);
+      pending_factor_setup_generation = next_matrix_refresh_generation++;
+      return true;
+    }
+    catch (...)
+    {
+      return false;
+    }
   }
 
   CpuSlotStorage* Committed() noexcept { return Storage(committed_slot); }
@@ -1665,6 +1718,8 @@ struct detail::CpuNumericsCore::Implementation
 
   bool PrimeHypreWorkspace() noexcept
   {
+    // This allocation/setup prime is deliberately outside the scientific
+    // factor-setup generation and census; every Newton matrix is rebound later.
     true_matrix->HostReadWrite();
     true_matrix->GetDiag(true_diagonal_view);
     true_matrix->GetOffd(true_offdiagonal_view,
@@ -2052,12 +2107,7 @@ struct detail::CpuNumericsCore::Implementation
       hypre_residual =
           std::make_unique<mfem::HypreParVector>(trace_space.get());
       ilu = std::make_unique<mfem::HypreILU>();
-      ilu->SetType(0);
-      ilu->SetLevelOfFill(0);
-      ilu->SetMaxIter(1);
-      ilu->SetTol(0.0);
-      ilu->SetLocalReordering(0);
-      ilu->SetPrintLevel(0);
+      ApplyFrozenIluSettings();
       gmres = std::make_unique<mfem::HypreGMRES>(MPI_COMM_WORLD);
       if (!ObserveWrapper(hypre_rhs) || !ObserveWrapper(hypre_solution) ||
           !ObserveWrapper(hypre_residual) || !ObserveWrapper(ilu) ||
@@ -2539,8 +2589,10 @@ struct detail::CpuNumericsCore::Implementation
   }
 
   bool CondenseAndAssemble(const LocalSystem& system,
-                           StateHash& matrix_hash) noexcept
+                           StateHash& matrix_hash,
+                           std::uint64_t& matrix_refresh_generation) noexcept
   {
+    matrix_refresh_generation = 0;
     try
     {
       const LocalBlockShape shape{
@@ -2660,6 +2712,8 @@ struct detail::CpuNumericsCore::Implementation
         destination[slot.data_index] += incoming_schur_values[index];
       }
       true_matrix->HypreRead();
+      if (!RebindTraceSolverAfterMatrixRefresh()) { return false; }
+      matrix_refresh_generation = pending_factor_setup_generation;
       trace_space->Dof_TrueDof_Matrix()->MultTranspose(
           local_trace_rhs, true_trace_rhs);
       matrix_hash = HashPair(HashSystemMatrix(system), HashDoubles(schur));
@@ -2671,12 +2725,25 @@ struct detail::CpuNumericsCore::Implementation
     }
   }
 
-  bool SolveTrace(double& true_relative_residual, int& iterations,
+  bool SolveTrace(const std::uint64_t expected_matrix_refresh_generation,
+                  double& true_relative_residual, int& iterations,
                   StateHash& factor_hash,
-                  StateHash& solution_hash) noexcept
+                  StateHash& solution_hash,
+                  std::uint64_t& factor_setup_generation,
+                  bool& factor_setup_current) noexcept
   {
+    factor_setup_generation = 0;
+    factor_setup_current = false;
     try
     {
+      if (expected_matrix_refresh_generation == 0 ||
+          pending_factor_setup_generation !=
+              expected_matrix_refresh_generation ||
+          complete_factor_setup_generation >=
+              expected_matrix_refresh_generation)
+      {
+        return false;
+      }
       const double* rhs_source = true_trace_rhs.HostRead();
       double* rhs_destination = hypre_rhs->HostWrite();
       if ((!rhs_source || !rhs_destination) && true_trace_rhs.Size() != 0)
@@ -2687,15 +2754,22 @@ struct detail::CpuNumericsCore::Implementation
                   static_cast<std::size_t>(true_trace_rhs.Size()) *
                       sizeof(double));
       *hypre_solution = 0.0;
-      const std::array<char, 20> factor_identity{{
-          'h','y','p','r','e','-','i','l','u','0','-','t','y','p','e','0',
-          '-','p','1','\0'}};
-      factor_hash = HashPair(HashDoubles(schur),
-                             HashBytes(factor_identity.data(),
-                                       factor_identity.size()));
       gmres->Mult(*hypre_rhs, *hypre_solution);
+      complete_factor_setup_generation = pending_factor_setup_generation;
+      pending_factor_setup_generation = 0;
+      factor_setup_generation = complete_factor_setup_generation;
+      factor_setup_current = factor_setup_generation ==
+          expected_matrix_refresh_generation;
+      if (!factor_setup_current) { return false; }
       gmres->GetNumIterations(iterations);
       if (iterations <= 0) { return false; }
+      // This attests the exact Schur input and frozen ILU configuration only;
+      // HYPRE does not expose stable factor bytes for hashing.
+      constexpr std::string_view factor_input_config{
+          "hypre-ilu:t0:f0:i1:tol0:r0:p0"};
+      factor_hash = HashPair(
+          HashDoubles(schur),
+          HashBytes(factor_input_config.data(), factor_input_config.size()));
       true_matrix->Mult(*hypre_solution, *hypre_residual);
       *hypre_residual -= *hypre_rhs;
       const double residual_squared = mfem::InnerProduct(
@@ -3326,6 +3400,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     }
     CpuLinearizationChain& chain = evidence.linearization_chains[
         evidence.linearization_chain_count];
+    chain.newton_update = updates;
     chain.local_generation = current_local_generation;
     chain.residual_hash = current_residual_hash;
     const bool consumed_local = state.ConsumeArtifact(
@@ -3339,7 +3414,8 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
                   CpuAttemptStatus::injected_failure);
     }
     StateHash matrix_hash{};
-    if (!state.CondenseAndAssemble(state.current_system, matrix_hash))
+    if (!state.CondenseAndAssemble(state.current_system, matrix_hash,
+                                   chain.matrix_refresh_generation))
     {
       return fail(CpuFailurePhase::condensation);
     }
@@ -3364,11 +3440,21 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     double true_residual = 0.0;
     int linear_iterations = 0;
     StateHash factor_hash{}, solution_hash{};
-    if (!state.SolveTrace(true_residual, linear_iterations, factor_hash,
-                          solution_hash))
+    const bool trace_solved = state.SolveTrace(
+        chain.matrix_refresh_generation, true_residual, linear_iterations,
+        factor_hash, solution_hash, chain.factor_setup_generation,
+        chain.factor_setup_current);
+    if (chain.factor_setup_current)
+    {
+      ++evidence.work.complete_factor_setups;
+    }
+    if (!trace_solved ||
+        !CaptureFixed(state.true_increment, chain.true_trace_increment,
+                      chain.true_trace_increment_size))
     {
       return fail(CpuFailurePhase::trace_solve);
     }
+    chain.true_relative_residual = true_residual;
     evidence.linear_iterations += linear_iterations;
     maximum_true_residual = std::max(maximum_true_residual, true_residual);
     ++evidence.work.complete_trace_solves;
@@ -3467,6 +3553,16 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
         chain.candidate_state_hash = HashPair(
             HashVector(*state.iterate_interior),
             HashVector(state.iterate_true_trace));
+        chain.accepted_trial_index = trial;
+        if (!CaptureFixed(*state.iterate_interior,
+                          chain.accepted_candidate_interior,
+                          chain.accepted_candidate_interior_size) ||
+            !CaptureFixed(state.iterate_true_trace,
+                          chain.accepted_candidate_true_trace,
+                          chain.accepted_candidate_true_trace_size))
+        {
+          return fail(CpuFailurePhase::recovery);
+        }
         accepted = true;
         break;
       }
@@ -3490,7 +3586,14 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   const bool nonlinear_converged = updates > 0 &&
       residual <= state.config.nonlinear_tolerance *
           (1.0 + evidence.initial_nonlinear_residual);
-  if (!nonlinear_converged || !recovered)
+  const bool factor_setup_census_exact =
+      evidence.work.complete_factor_setups ==
+          evidence.work.complete_trace_solves &&
+      evidence.work.complete_factor_setups ==
+          evidence.work.accepted_newton_updates &&
+      evidence.work.complete_factor_setups ==
+          static_cast<std::uint64_t>(updates);
+  if (!nonlinear_converged || !recovered || !factor_setup_census_exact)
   {
     return fail(CpuFailurePhase::recovery);
   }

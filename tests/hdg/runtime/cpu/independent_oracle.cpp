@@ -5,11 +5,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace dg_igr_hdg_cpu_test
@@ -875,9 +877,71 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
       return false;
     }
     result.analytic_source_flux_jacobian = true;
-    result.signed_maps_rebuilt = std::any_of(
-        system.signed_trace.begin(), system.signed_trace.end(),
-        [](const int dof) { return dof < 0; }) || ranks == 1;
+    const bool local_extent_valid = system.signed_trace.size() ==
+        static_cast<std::size_t>(system.elements) * system.nt;
+    const bool local_entries_valid = local_extent_valid &&
+        std::all_of(system.signed_trace.begin(), system.signed_trace.end(),
+                    [&](const int signed_dof)
+                    {
+                      double sign = 1.0;
+                      const int local_dof = Decode(signed_dof, sign);
+                      return local_dof >= 0 &&
+                          local_dof < trace_space.GetVSize() &&
+                          (sign == 1.0 || sign == -1.0);
+                    });
+    std::vector<int> rebuilt_signed_trace(system.signed_trace.size(), 0);
+    bool local_permutation_rebuilt = local_extent_valid;
+    for (int element = 0;
+         element < mesh.GetNE() && local_permutation_rebuilt; ++element)
+    {
+      mfem::Array<int> faces, orientations;
+      mesh.GetElementEdges(element, faces, orientations);
+      int offset = 0;
+      for (int local_face = 0;
+           local_face < faces.Size() && local_permutation_rebuilt; ++local_face)
+      {
+        mfem::Array<int> face_vdofs;
+        trace_space.GetFaceVDofs(faces[local_face], face_vdofs);
+        local_permutation_rebuilt = offset + face_vdofs.Size() <= system.nt;
+        if (local_permutation_rebuilt)
+        {
+          std::copy(face_vdofs.begin(), face_vdofs.end(),
+                    rebuilt_signed_trace.begin() +
+                        static_cast<std::ptrdiff_t>(element * system.nt +
+                                                    offset));
+          offset += face_vdofs.Size();
+        }
+      }
+      local_permutation_rebuilt = local_permutation_rebuilt &&
+          offset == system.nt;
+    }
+    local_permutation_rebuilt = local_permutation_rebuilt &&
+        rebuilt_signed_trace == system.signed_trace;
+    const std::uint64_t local_negative_signed_trace_dofs =
+        static_cast<std::uint64_t>(std::count_if(
+            system.signed_trace.begin(), system.signed_trace.end(),
+            [](const int signed_dof) { return signed_dof < 0; }));
+    const std::array<int, 3> local_map_flags{{
+        local_extent_valid ? 1 : 0,
+        local_entries_valid ? 1 : 0,
+        local_permutation_rebuilt ? 1 : 0}};
+    std::array<int, 3> global_map_flags{};
+    if (MPI_Allreduce(local_map_flags.data(), global_map_flags.data(),
+                      static_cast<int>(global_map_flags.size()), MPI_INT,
+                      MPI_MIN, communicator) != MPI_SUCCESS ||
+        MPI_Allreduce(&local_negative_signed_trace_dofs,
+                      &result.negative_signed_trace_dofs, 1, MPI_UINT64_T,
+                      MPI_SUM, communicator) != MPI_SUCCESS)
+    {
+      return false;
+    }
+    result.signed_map_extent_valid = global_map_flags[0] == 1;
+    result.signed_map_entries_valid = global_map_flags[1] == 1;
+    result.signed_map_permutation_rebuilt = global_map_flags[2] == 1;
+    const bool signed_map_structure_valid =
+        result.signed_map_extent_valid && result.signed_map_entries_valid &&
+        result.signed_map_permutation_rebuilt;
+    if (!signed_map_structure_valid) { return false; }
     double residual = ResidualNorm(communicator, trace_space, system);
     result.initial_residual = residual;
 
@@ -889,6 +953,9 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
         break;
       }
       IndependentLinearizationHashes linearization{};
+      IndependentNewtonStepEvidence step{};
+      step.update_index = update;
+      step.base_residual = residual;
       linearization.residual = OracleHashPair(
           OracleHashDoubles(system.ri), OracleHashDoubles(system.rt));
       Condensed condensed;
@@ -897,13 +964,6 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
       linearization.matrix = OracleHashPair(
           OracleHashSystemMatrix(system),
           OracleHashDoubles(condensed.schur));
-      const std::array<char, 20> factor_identity{{
-          'h','y','p','r','e','-','i','l','u','0','-','t','y','p','e','0',
-          '-','p','1','\0'}};
-      linearization.factor = OracleHashPair(
-          OracleHashDoubles(condensed.schur),
-          OracleHashBytes(factor_identity.data(), factor_identity.size()));
-
       mfem::SparseMatrix local_matrix(trace_space.GetVSize());
       mfem::Vector local_rhs(trace_space.GetVSize());
       mfem::Vector true_rhs_values(trace_space.GetTrueVSize());
@@ -963,7 +1023,17 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
       gmres.SetPreconditioner(ilu);
       gmres.SetOperator(*true_matrix);
       gmres.Mult(true_rhs, true_solution);
+      constexpr std::string_view factor_input_config{
+          "hypre-ilu:t0:f0:i1:tol0:r0:p0"};
+      linearization.factor = OracleHashPair(
+          OracleHashDoubles(condensed.schur),
+          OracleHashBytes(factor_input_config.data(),
+                          factor_input_config.size()));
       linearization.solution = OracleHashVector(true_solution);
+      const double* true_solution_values = true_solution.HostRead();
+      step.true_trace_increment.assign(
+          true_solution_values,
+          true_solution_values + true_solution.Size());
       true_matrix->Mult(true_solution, true_residual);
       true_residual -= true_rhs;
       const double true_relative = std::sqrt(mfem::InnerProduct(
@@ -972,6 +1042,7 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
                        communicator, true_rhs, true_rhs)), 1.0e-300);
       result.maximum_true_residual =
           std::max(result.maximum_true_residual, true_relative);
+      step.true_relative_residual = true_relative;
       result.true_residual_rebuilt = std::isfinite(true_relative) &&
           true_relative <= 1.0e-10;
       if (!result.true_residual_rebuilt) { return false; }
@@ -1039,6 +1110,7 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
       bool accepted = false;
       for (int trial = 0; trial < 13; ++trial)
       {
+        ++step.attempted_trials;
         const double alpha = std::ldexp(1.0, -trial);
         mfem::ParGridFunction candidate_interior(&interior_space);
         mfem::ParGridFunction candidate_trace(&trace_space);
@@ -1076,7 +1148,21 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
           linearization.candidate = OracleHashPair(
               OracleHashVector(current_interior),
               OracleHashVector(current_true_trace));
+          step.accepted_trial_index = trial;
+          step.accepted_alpha = alpha;
+          step.accepted_candidate_residual = candidate_residual;
+          step.armijo_satisfied = candidate_residual <=
+              (1.0 - 1.0e-4 * alpha) * step.base_residual;
+          const double* candidate_interior_values = current_interior.HostRead();
+          step.accepted_candidate_interior.assign(
+              candidate_interior_values,
+              candidate_interior_values + current_interior.Size());
+          const double* candidate_true_values = current_true_trace.HostRead();
+          step.accepted_candidate_true_trace.assign(
+              candidate_true_values,
+              candidate_true_values + current_true_trace.Size());
           result.linearizations.push_back(linearization);
+          result.newton_steps.push_back(step);
           accepted = true;
           break;
         }
@@ -1094,12 +1180,28 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
     result.true_trace.assign(current_true_trace.HostRead(),
                              current_true_trace.HostRead() +
                                  current_true_trace.Size());
+    const int local_signed_map_used = result.newton_updates > 0 &&
+            result.global_ptsp_rebuilt && result.true_residual_rebuilt &&
+            result.distribute_rebuilt && result.recovery_rebuilt
+        ? 1 : 0;
+    int global_signed_map_used = 0;
+    if (MPI_Allreduce(&local_signed_map_used, &global_signed_map_used, 1,
+                      MPI_INT, MPI_MIN, communicator) != MPI_SUCCESS)
+    {
+      return false;
+    }
+    result.signed_map_used = global_signed_map_used == 1;
+    result.signed_maps_rebuilt =
+        signed_map_structure_valid && result.signed_map_used;
     result.passed = result.mesh_rebuilt &&
         result.analytic_source_flux_jacobian && result.signed_maps_rebuilt &&
         result.local_schur_rebuilt && result.global_ptsp_rebuilt &&
         result.true_residual_rebuilt && result.distribute_rebuilt &&
         result.recovery_rebuilt && result.admissible &&
         result.newton_updates > 0 &&
+        result.newton_steps.size() ==
+            static_cast<std::size_t>(result.newton_updates) &&
+        result.linearizations.size() == result.newton_steps.size() &&
         result.final_residual <= 1.0e-10 * (1.0 + result.initial_residual);
     return result.passed;
   }
