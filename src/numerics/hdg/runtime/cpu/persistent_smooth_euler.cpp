@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -546,6 +547,21 @@ bool AllRanks(const bool local) noexcept
                        MPI_COMM_WORLD) == MPI_SUCCESS && reduced == 1;
 }
 
+std::atomic<unsigned int> collective_test_fault{
+    static_cast<unsigned int>(detail::CpuCollectiveTestFault::none)};
+std::atomic<int> collective_test_fault_rank{-1};
+
+bool ConsumeCollectiveTestFault(
+    const detail::CpuCollectiveTestFault expected, const int rank) noexcept
+{
+  unsigned int armed = static_cast<unsigned int>(expected);
+  const bool selected = collective_test_fault.compare_exchange_strong(
+      armed, static_cast<unsigned int>(detail::CpuCollectiveTestFault::none),
+      std::memory_order_relaxed);
+  return selected && collective_test_fault_rank.load(std::memory_order_relaxed) ==
+      rank;
+}
+
 struct CpuCheckpointImportAdmission
 {
   CheckpointDescriptor descriptor{};
@@ -590,6 +606,22 @@ std::uint64_t SumU64(const std::uint64_t local) noexcept
 }
 
 } // namespace
+
+void detail::ArmCpuCollectiveTestFault(
+    const detail::CpuCollectiveTestFault fault, const int target_rank) noexcept
+{
+  collective_test_fault_rank.store(target_rank, std::memory_order_relaxed);
+  collective_test_fault.store(static_cast<unsigned int>(fault),
+                              std::memory_order_relaxed);
+}
+
+void detail::ResetCpuCollectiveTestFault() noexcept
+{
+  collective_test_fault.store(
+      static_cast<unsigned int>(detail::CpuCollectiveTestFault::none),
+      std::memory_order_relaxed);
+  collective_test_fault_rank.store(-1, std::memory_order_relaxed);
+}
 
 struct CpuSlotStorage
 {
@@ -920,11 +952,13 @@ CollectiveAdmissionReport CpuWorldCollectivePolicy::Admit(
   int all_prepared = 0;
   unsigned long long local_mask = FailureMask(reason);
   unsigned long long global_mask = 0;
-  const bool reductions =
-      MPI_Allreduce(&local_prepared, &all_prepared, 1, MPI_INT, MPI_MIN,
-                    MPI_COMM_WORLD) == MPI_SUCCESS &&
-      MPI_Allreduce(&local_mask, &global_mask, 1, MPI_UNSIGNED_LONG_LONG,
-                    MPI_BOR, MPI_COMM_WORLD) == MPI_SUCCESS;
+  const int prepared_status = MPI_Allreduce(
+      &local_prepared, &all_prepared, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  const int failure_status = MPI_Allreduce(
+      &local_mask, &global_mask, 1, MPI_UNSIGNED_LONG_LONG, MPI_BOR,
+      MPI_COMM_WORLD);
+  const bool reductions = prepared_status == MPI_SUCCESS &&
+      failure_status == MPI_SUCCESS;
   report.failure_consistent = reductions &&
       report.participating_ranks == expected_ranks;
   report.all_prepared = all_prepared == 1;
@@ -954,11 +988,14 @@ CollectiveGateReport CpuWorldCollectivePolicy::Reduce(
   std::array<int, 6> reduced{};
   unsigned long long local_mask = FailureMask(reason);
   unsigned long long global_mask = 0;
-  const bool reductions =
-      MPI_Allreduce(local.data(), reduced.data(), static_cast<int>(local.size()),
-                    MPI_INT, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS &&
-      MPI_Allreduce(&local_mask, &global_mask, 1, MPI_UNSIGNED_LONG_LONG,
-                    MPI_BOR, MPI_COMM_WORLD) == MPI_SUCCESS;
+  const int gates_status = MPI_Allreduce(
+      local.data(), reduced.data(), static_cast<int>(local.size()), MPI_INT,
+      MPI_MIN, MPI_COMM_WORLD);
+  const int failure_status = MPI_Allreduce(
+      &local_mask, &global_mask, 1, MPI_UNSIGNED_LONG_LONG, MPI_BOR,
+      MPI_COMM_WORLD);
+  const bool reductions = gates_status == MPI_SUCCESS &&
+      failure_status == MPI_SUCCESS;
   report.failure_consistent = reductions &&
       report.participating_ranks == expected_ranks;
   report.gates = {reduced[0] == 1, reduced[1] == 1, reduced[2] == 1,
@@ -985,13 +1022,14 @@ CollectiveRestoreReport CpuWorldCollectivePolicy::ReduceRestore(
   unsigned long long global_failure = 0;
   unsigned long long local_compatibility = CompatibilityMask(compatibility);
   unsigned long long global_compatibility = 0;
-  const bool reductions =
-      MPI_Allreduce(&local_failure, &global_failure, 1,
-                    MPI_UNSIGNED_LONG_LONG, MPI_BOR,
-                    MPI_COMM_WORLD) == MPI_SUCCESS &&
-      MPI_Allreduce(&local_compatibility, &global_compatibility, 1,
-                    MPI_UNSIGNED_LONG_LONG, MPI_BOR,
-                    MPI_COMM_WORLD) == MPI_SUCCESS;
+  const int failure_status = MPI_Allreduce(
+      &local_failure, &global_failure, 1, MPI_UNSIGNED_LONG_LONG, MPI_BOR,
+      MPI_COMM_WORLD);
+  const int compatibility_status = MPI_Allreduce(
+      &local_compatibility, &global_compatibility, 1, MPI_UNSIGNED_LONG_LONG,
+      MPI_BOR, MPI_COMM_WORLD);
+  const bool reductions = failure_status == MPI_SUCCESS &&
+      compatibility_status == MPI_SUCCESS;
   report.failure_consistent = reductions &&
       report.participating_ranks == expected_ranks;
   report.failure_mask = static_cast<std::uint64_t>(global_failure);
@@ -1397,7 +1435,6 @@ struct detail::CpuNumericsCore::Implementation
       gmres->SetOperator(*true_matrix);
       ApplyFrozenIluSettings();
       gmres->SetPreconditioner(*ilu);
-      pending_factor_setup_generation = next_matrix_refresh_generation++;
       return true;
     }
     catch (...)
@@ -1425,11 +1462,12 @@ struct detail::CpuNumericsCore::Implementation
                           injection.source_rank,
                           static_cast<int>(injection.target_step)};
     std::array<int, 4> minimum{}, maximum{};
-    const bool reduced =
-        MPI_Allreduce(local, minimum.data(), 4, MPI_INT, MPI_MIN,
-                      MPI_COMM_WORLD) == MPI_SUCCESS &&
-        MPI_Allreduce(local, maximum.data(), 4, MPI_INT, MPI_MAX,
-                      MPI_COMM_WORLD) == MPI_SUCCESS;
+    const int minimum_status = MPI_Allreduce(
+        local, minimum.data(), 4, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    const int maximum_status = MPI_Allreduce(
+        local, maximum.data(), 4, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    const bool reduced = minimum_status == MPI_SUCCESS &&
+        maximum_status == MPI_SUCCESS;
     const bool identical = minimum == maximum;
     const bool phase_in_range =
         static_cast<int>(injection.phase) >=
@@ -1482,25 +1520,33 @@ struct detail::CpuNumericsCore::Implementation
                     mfem::Vector& true_trace,
                     const bool perturbed) noexcept
   {
+    bool local_projection_ready = true;
     try
     {
       local_trace = 0.0;
-      for (int face = 0; face < mesh->GetNumFaces(); ++face)
+      for (int face = 0;
+           face < mesh->GetNumFaces() && local_projection_ready; ++face)
       {
         const mfem::FiniteElement* finite_element =
             trace_space->GetFaceElement(face);
         mfem::ElementTransformation* transformation =
             mesh->GetFaceTransformation(face);
-        if (!finite_element || !transformation) { return false; }
+        if (!finite_element || !transformation)
+        {
+          local_projection_ready = false;
+          break;
+        }
         mfem::Array<int> vdofs;
         trace_space->GetFaceVDofs(face, vdofs);
         const int scalar_dofs = finite_element->GetDof();
         if (vdofs.Size() != scalar_dofs * cpu_conserved_components)
         {
-          return false;
+          local_projection_ready = false;
+          break;
         }
         const mfem::IntegrationRule& nodes = finite_element->GetNodes();
-        for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+        for (int scalar = 0;
+             scalar < scalar_dofs && local_projection_ready; ++scalar)
         {
           mfem::Vector physical(cpu_dimension);
           transformation->Transform(nodes.IntPoint(scalar), physical);
@@ -1508,55 +1554,98 @@ struct detail::CpuNumericsCore::Implementation
           const bool ok = perturbed
               ? PerturbedConservative(physical[0], physical[1], state)
               : ManufacturedConservative(physical[0], physical[1], state);
-          if (!ok) { return false; }
-          for (int component = 0; component < cpu_conserved_components;
+          if (!ok)
+          {
+            local_projection_ready = false;
+            break;
+          }
+          for (int component = 0;
+               component < cpu_conserved_components && local_projection_ready;
                ++component)
           {
             double sign = 1.0;
             const int dof = Decode(
                 vdofs[ByNodes(scalar, scalar_dofs, component)], sign);
-            if (dof < 0 || dof >= local_trace.Size()) { return false; }
+            if (dof < 0 || dof >= local_trace.Size())
+            {
+              local_projection_ready = false;
+              break;
+            }
             local_trace[dof] = sign * state[component];
           }
         }
       }
-      local_trace.ParallelProject(true_trace);
-      return Finite(true_trace);
     }
     catch (...)
     {
-      return false;
+      local_projection_ready = false;
     }
+    if (!CollectiveAll(local_projection_ready)) { return false; }
+
+    bool true_projection_ready = true;
+    try
+    {
+      local_trace.ParallelProject(true_trace);
+      true_projection_ready = Finite(true_trace);
+    }
+    catch (...)
+    {
+      true_projection_ready = false;
+    }
+    return CollectiveAll(true_projection_ready);
   }
 
   bool LoadTrace(const mfem::Vector& true_values,
                  mfem::ParGridFunction& local_values) noexcept
   {
+    bool local_prepared = true;
     try
     {
       trace_distribution_workspace = 0.0;
-      if (!exchange_plan.Distribute(*trace_space, true_values,
-                                    trace_distribution_workspace))
-      {
-        return false;
-      }
+      local_prepared = !ConsumeCollectiveTestFault(
+          detail::CpuCollectiveTestFault::trace_load_preparation, rank);
+    }
+    catch (...)
+    {
+      local_prepared = false;
+    }
+    if (!CollectiveAll(local_prepared)) { return false; }
+
+    bool distributed = false;
+    try
+    {
+      distributed = exchange_plan.Distribute(
+          *trace_space, true_values, trace_distribution_workspace);
+    }
+    catch (...)
+    {
+      distributed = false;
+    }
+    if (!CollectiveAll(distributed)) { return false; }
+
+    bool local_copied = true;
+    try
+    {
       const double* source = trace_distribution_workspace.HostRead();
       double* destination = local_values.HostWrite();
       if ((!source || !destination) &&
           trace_distribution_workspace.Size() != 0)
       {
-        return false;
+        local_copied = false;
       }
-      std::memcpy(destination, source,
-                  static_cast<std::size_t>(
-                      trace_distribution_workspace.Size()) *
-                      sizeof(double));
-      return true;
+      if (local_copied)
+      {
+        std::memcpy(destination, source,
+                    static_cast<std::size_t>(
+                        trace_distribution_workspace.Size()) *
+                        sizeof(double));
+      }
     }
     catch (...)
     {
-      return false;
+      local_copied = false;
     }
+    return CollectiveAll(local_copied);
   }
 
   bool BuildCanonicalIds() noexcept
@@ -2501,10 +2590,19 @@ struct detail::CpuNumericsCore::Implementation
 
   double ResidualNorm(const LocalSystem& system) noexcept
   {
+    const double invalid = std::numeric_limits<double>::quiet_NaN();
+    double local_interior_squared = 0.0;
+    bool local_prepared = true;
     try
     {
+      local_prepared = system.elements == mesh->GetNE() &&
+          system.trace_dofs == local_trace &&
+          signed_trace_dofs.size() ==
+              static_cast<std::size_t>(system.elements * system.trace_dofs) &&
+          system.residual_trace.size() == signed_trace_dofs.size();
       local_trace_residual = 0.0;
-      for (int element = 0; element < system.elements; ++element)
+      for (int element = 0; element < system.elements && local_prepared;
+           ++element)
         for (int local = 0; local < system.trace_dofs; ++local)
         {
           double sign = 1.0;
@@ -2513,32 +2611,61 @@ struct detail::CpuNumericsCore::Implementation
                                  sign);
           if (dof < 0 || dof >= local_trace_residual.Size())
           {
-            return std::numeric_limits<double>::quiet_NaN();
+            local_prepared = false;
+            break;
           }
           local_trace_residual[dof] += sign * system.residual_trace[
               static_cast<std::size_t>(element) * system.trace_dofs + local];
         }
-      trace_space->Dof_TrueDof_Matrix()->MultTranspose(
-          local_trace_residual, true_trace_residual);
-      double local_interior_squared = 0.0;
       for (const double value : system.residual_interior)
       {
         local_interior_squared += value * value;
       }
-      double global_interior_squared = 0.0;
-      if (MPI_Allreduce(&local_interior_squared, &global_interior_squared, 1,
-                        MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS)
-      {
-        return std::numeric_limits<double>::quiet_NaN();
-      }
-      const double trace_squared = mfem::InnerProduct(
-          MPI_COMM_WORLD, true_trace_residual, true_trace_residual);
-      return std::sqrt(global_interior_squared + trace_squared);
+      local_prepared = local_prepared && Finite(local_trace_residual) &&
+          Finite(local_interior_squared) &&
+          trace_space && trace_space->Dof_TrueDof_Matrix() &&
+          !ConsumeCollectiveTestFault(
+              detail::CpuCollectiveTestFault::residual_map_preparation, rank);
     }
     catch (...)
     {
-      return std::numeric_limits<double>::quiet_NaN();
+      local_prepared = false;
     }
+    if (!CollectiveAll(local_prepared)) { return invalid; }
+
+    bool projection_ready = true;
+    try
+    {
+      trace_space->Dof_TrueDof_Matrix()->MultTranspose(
+          local_trace_residual, true_trace_residual);
+      projection_ready = Finite(true_trace_residual);
+    }
+    catch (...)
+    {
+      projection_ready = false;
+    }
+    if (!CollectiveAll(projection_ready)) { return invalid; }
+
+    double global_interior_squared = 0.0;
+    const int interior_status = MPI_Allreduce(
+        &local_interior_squared, &global_interior_squared, 1, MPI_DOUBLE,
+        MPI_SUM, MPI_COMM_WORLD);
+    double trace_squared = invalid;
+    bool trace_reduced = true;
+    try
+    {
+      trace_squared = mfem::InnerProduct(
+          MPI_COMM_WORLD, true_trace_residual, true_trace_residual);
+    }
+    catch (...)
+    {
+      trace_reduced = false;
+    }
+    const bool reduced = interior_status == MPI_SUCCESS && trace_reduced &&
+        Finite(global_interior_squared) && Finite(trace_squared) &&
+        global_interior_squared >= 0.0 && trace_squared >= 0.0;
+    if (!CollectiveAll(reduced)) { return invalid; }
+    return std::sqrt(global_interior_squared + trace_squared);
   }
 
   bool CheckState(const State& state, double& minimum_density,
@@ -2632,18 +2759,20 @@ struct detail::CpuNumericsCore::Implementation
     }
     int valid = local_ok ? 1 : 0;
     int global_valid = 0;
-    if (MPI_Allreduce(&valid, &global_valid, 1, MPI_INT, MPI_MIN,
-                      MPI_COMM_WORLD) != MPI_SUCCESS)
-    {
-      return false;
-    }
-    MPI_Allreduce(&local_density, &minimum_density, 1, MPI_DOUBLE, MPI_MIN,
-                  MPI_COMM_WORLD);
-    MPI_Allreduce(&local_pressure, &minimum_pressure, 1, MPI_DOUBLE, MPI_MIN,
-                  MPI_COMM_WORLD);
-    MPI_Allreduce(&local_wave, &maximum_wave_speed, 1, MPI_DOUBLE, MPI_MAX,
-                  MPI_COMM_WORLD);
-    return global_valid == 1 && Finite(minimum_density) &&
+    const int valid_status = MPI_Allreduce(
+        &valid, &global_valid, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    const int density_status = MPI_Allreduce(
+        &local_density, &minimum_density, 1, MPI_DOUBLE, MPI_MIN,
+        MPI_COMM_WORLD);
+    const int pressure_status = MPI_Allreduce(
+        &local_pressure, &minimum_pressure, 1, MPI_DOUBLE, MPI_MIN,
+        MPI_COMM_WORLD);
+    const int wave_status = MPI_Allreduce(
+        &local_wave, &maximum_wave_speed, 1, MPI_DOUBLE, MPI_MAX,
+        MPI_COMM_WORLD);
+    return valid_status == MPI_SUCCESS && density_status == MPI_SUCCESS &&
+        pressure_status == MPI_SUCCESS && wave_status == MPI_SUCCESS &&
+        global_valid == 1 && Finite(minimum_density) &&
         Finite(minimum_pressure) && Finite(maximum_wave_speed) &&
         minimum_density >= density_gate && minimum_pressure >= pressure_gate &&
         maximum_wave_speed < cpu_fixed_tau;
@@ -2654,136 +2783,189 @@ struct detail::CpuNumericsCore::Implementation
                            std::uint64_t& matrix_refresh_generation) noexcept
   {
     matrix_refresh_generation = 0;
+    double* diagonal_data = nullptr;
+    double* offdiagonal_data = nullptr;
+    bool outgoing_ready = false;
     try
     {
-      const LocalBlockShape shape{
-          local_interior / cpu_conserved_components,
-          local_trace / cpu_conserved_components,
-          cpu_conserved_components, cpu_conserved_components};
-      const core::LocalSystemBatchView input{
-          shape,
-          AsConst(View(system.a.data(), system.elements, local_interior,
-                       local_interior)),
-          AsConst(View(system.b.data(), system.elements, local_interior,
-                       local_trace)),
-          AsConst(View(system.c.data(), system.elements, local_trace,
-                       local_interior)),
-          AsConst(View(system.d.data(), system.elements, local_trace,
-                       local_trace)),
-          AsConst(View(system.f.data(), system.elements, local_interior, 1)),
-          AsConst(View(system.g.data(), system.elements, local_trace, 1))};
-      if (condensation.Condense(
-              input,
-              {View(schur.data(), system.elements, local_trace, local_trace),
-               View(reduced_rhs.data(), system.elements, local_trace, 1)}) !=
-              core::Status::success ||
-          !Finite(schur) || !Finite(reduced_rhs))
+      const auto prepare_outgoing = [&]() -> bool
       {
-        return false;
-      }
+        const LocalBlockShape shape{
+            local_interior / cpu_conserved_components,
+            local_trace / cpu_conserved_components,
+            cpu_conserved_components, cpu_conserved_components};
+        const core::LocalSystemBatchView input{
+            shape,
+            AsConst(View(system.a.data(), system.elements, local_interior,
+                         local_interior)),
+            AsConst(View(system.b.data(), system.elements, local_interior,
+                         local_trace)),
+            AsConst(View(system.c.data(), system.elements, local_trace,
+                         local_interior)),
+            AsConst(View(system.d.data(), system.elements, local_trace,
+                         local_trace)),
+            AsConst(View(system.f.data(), system.elements, local_interior, 1)),
+            AsConst(View(system.g.data(), system.elements, local_trace, 1))};
+        if (condensation.Condense(
+                input,
+                {View(schur.data(), system.elements, local_trace, local_trace),
+                 View(reduced_rhs.data(), system.elements, local_trace, 1)}) !=
+                core::Status::success ||
+            !Finite(schur) || !Finite(reduced_rhs))
+        {
+          return false;
+        }
 
-      *local_matrix = 0.0;
-      local_trace_rhs = 0.0;
-      for (int element = 0; element < system.elements; ++element)
-      {
-        for (int row = 0; row < local_trace; ++row)
+        *local_matrix = 0.0;
+        local_trace_rhs = 0.0;
+        for (int element = 0; element < system.elements; ++element)
         {
-          const int signed_dof = signed_trace_dofs[
-              static_cast<std::size_t>(element) * local_trace + row];
-          element_trace_dofs_workspace[row] = signed_dof;
-          double sign = 1.0;
-          const int dof = Decode(signed_dof, sign);
-          if (dof < 0 || dof >= local_trace_rhs.Size()) { return false; }
-          local_trace_rhs[dof] += sign * reduced_rhs[
-              static_cast<std::size_t>(element) * local_trace + row];
-          for (int column = 0; column < local_trace; ++column)
+          for (int row = 0; row < local_trace; ++row)
           {
-            local_schur_workspace(row, column) = schur[
-                static_cast<std::size_t>(element) * local_trace * local_trace +
-                static_cast<std::size_t>(row) * local_trace + column];
+            const int signed_dof = signed_trace_dofs[
+                static_cast<std::size_t>(element) * local_trace + row];
+            element_trace_dofs_workspace[row] = signed_dof;
+            double sign = 1.0;
+            const int dof = Decode(signed_dof, sign);
+            if (dof < 0 || dof >= local_trace_rhs.Size()) { return false; }
+            local_trace_rhs[dof] += sign * reduced_rhs[
+                static_cast<std::size_t>(element) * local_trace + row];
+            for (int column = 0; column < local_trace; ++column)
+            {
+              local_schur_workspace(row, column) = schur[
+                  static_cast<std::size_t>(element) * local_trace *
+                      local_trace +
+                  static_cast<std::size_t>(row) * local_trace + column];
+            }
           }
+          local_matrix->AddSubMatrix(element_trace_dofs_workspace,
+                                     element_trace_dofs_workspace,
+                                     local_schur_workspace, 1);
         }
-        local_matrix->AddSubMatrix(element_trace_dofs_workspace,
-                                   element_trace_dofs_workspace,
-                                   local_schur_workspace, 1);
-      }
-      if (!true_matrix) { return false; }
-      true_matrix->HostReadWrite();
-      true_matrix->GetDiag(true_diagonal_view);
-      true_matrix->GetOffd(true_offdiagonal_view,
-                           true_offdiagonal_columns);
-      double* diagonal_data = true_diagonal_view.GetData();
-      double* offdiagonal_data = true_offdiagonal_view.GetData();
-      if (!diagonal_data ||
-          (true_offdiagonal_view.NumNonZeroElems() != 0 &&
-           !offdiagonal_data))
-      {
-        return false;
-      }
-      std::fill(diagonal_data,
-                diagonal_data + true_diagonal_view.NumNonZeroElems(), 0.0);
-      if (offdiagonal_data)
-      {
-        std::fill(offdiagonal_data,
-                  offdiagonal_data + true_offdiagonal_view.NumNonZeroElems(),
-                  0.0);
-      }
-      for (const SparseSchurTerm& term : owned_schur_terms)
-      {
-        if (term.schur_index >= schur.size() || term.data_index < 0)
+        if (!true_matrix) { return false; }
+        true_matrix->HostReadWrite();
+        true_matrix->GetDiag(true_diagonal_view);
+        true_matrix->GetOffd(true_offdiagonal_view,
+                             true_offdiagonal_columns);
+        diagonal_data = true_diagonal_view.GetData();
+        offdiagonal_data = true_offdiagonal_view.GetData();
+        if (!diagonal_data ||
+            (true_offdiagonal_view.NumNonZeroElems() != 0 &&
+             !offdiagonal_data))
         {
           return false;
         }
-        double* destination = term.offdiagonal ? offdiagonal_data
-                                               : diagonal_data;
-        if (!destination) { return false; }
-        destination[term.data_index] += term.sign * schur[term.schur_index];
-      }
-      for (std::size_t index = 0; index < outgoing_schur_terms.size(); ++index)
-      {
-        const SparseOutgoingTerm& term = outgoing_schur_terms[index];
-        if (term.schur_index >= schur.size()) { return false; }
-        outgoing_schur_values[index] = term.sign * schur[term.schur_index];
-      }
-      if (ranks == 2)
-      {
-        const int peer = 1 - rank;
-        if (MPI_Sendrecv(outgoing_schur_values.data(),
-                         static_cast<int>(outgoing_schur_values.size()),
-                         MPI_DOUBLE, peer, 812,
-                         incoming_schur_values.data(),
-                         static_cast<int>(incoming_schur_values.size()),
-                         MPI_DOUBLE, peer, 812, MPI_COMM_WORLD,
-                         MPI_STATUS_IGNORE) != MPI_SUCCESS)
+        std::fill(diagonal_data,
+                  diagonal_data + true_diagonal_view.NumNonZeroElems(), 0.0);
+        if (offdiagonal_data)
         {
-          return false;
+          std::fill(offdiagonal_data,
+                    offdiagonal_data + true_offdiagonal_view.NumNonZeroElems(),
+                    0.0);
         }
-      }
-      if (!Finite(outgoing_schur_values) || !Finite(incoming_schur_values))
-      {
-        return false;
-      }
-      for (std::size_t index = 0; index < incoming_schur_slots.size(); ++index)
-      {
-        const SparseIncomingSlot& slot = incoming_schur_slots[index];
-        if (slot.data_index < 0) { return false; }
-        double* destination = slot.offdiagonal ? offdiagonal_data
-                                               : diagonal_data;
-        if (!destination) { return false; }
-        destination[slot.data_index] += incoming_schur_values[index];
-      }
-      true_matrix->HypreRead();
-      if (!RebindTraceSolverAfterMatrixRefresh()) { return false; }
-      matrix_refresh_generation = pending_factor_setup_generation;
-      trace_space->Dof_TrueDof_Matrix()->MultTranspose(
-          local_trace_rhs, true_trace_rhs);
-      matrix_hash = HashPair(HashSystemMatrix(system), HashDoubles(schur));
-      return Finite(true_trace_rhs);
+        for (const SparseSchurTerm& term : owned_schur_terms)
+        {
+          if (term.schur_index >= schur.size() || term.data_index < 0)
+          {
+            return false;
+          }
+          double* destination = term.offdiagonal ? offdiagonal_data
+                                                 : diagonal_data;
+          if (!destination) { return false; }
+          destination[term.data_index] += term.sign * schur[term.schur_index];
+        }
+        for (std::size_t index = 0; index < outgoing_schur_terms.size();
+             ++index)
+        {
+          const SparseOutgoingTerm& term = outgoing_schur_terms[index];
+          if (term.schur_index >= schur.size()) { return false; }
+          outgoing_schur_values[index] = term.sign * schur[term.schur_index];
+        }
+        return outgoing_schur_values.size() <=
+                   static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
+            incoming_schur_values.size() <=
+                   static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
+            Finite(outgoing_schur_values) &&
+            !ConsumeCollectiveTestFault(
+                detail::CpuCollectiveTestFault::
+                    condensation_outgoing_preparation,
+                rank);
+      };
+      outgoing_ready = prepare_outgoing();
     }
     catch (...)
     {
-      return false;
+      outgoing_ready = false;
     }
+    if (!CollectiveAll(outgoing_ready)) { return false; }
+
+    bool exchange_ready = true;
+    if (ranks == 2)
+    {
+      const int peer = 1 - rank;
+      exchange_ready = MPI_Sendrecv(
+          outgoing_schur_values.data(),
+          static_cast<int>(outgoing_schur_values.size()), MPI_DOUBLE, peer, 812,
+          incoming_schur_values.data(),
+          static_cast<int>(incoming_schur_values.size()), MPI_DOUBLE, peer, 812,
+          MPI_COMM_WORLD, MPI_STATUS_IGNORE) == MPI_SUCCESS;
+    }
+    if (!CollectiveAll(exchange_ready)) { return false; }
+
+    bool incoming_ready = false;
+    try
+    {
+      const auto apply_incoming = [&]() -> bool
+      {
+        if (!Finite(incoming_schur_values)) { return false; }
+        for (std::size_t index = 0; index < incoming_schur_slots.size();
+             ++index)
+        {
+          const SparseIncomingSlot& slot = incoming_schur_slots[index];
+          if (slot.data_index < 0) { return false; }
+          double* destination = slot.offdiagonal ? offdiagonal_data
+                                                 : diagonal_data;
+          if (!destination) { return false; }
+          destination[slot.data_index] += incoming_schur_values[index];
+        }
+        return true;
+      };
+      incoming_ready = apply_incoming();
+    }
+    catch (...)
+    {
+      incoming_ready = false;
+    }
+    if (!CollectiveAll(incoming_ready)) { return false; }
+
+    bool solver_binding_ready = true;
+    try
+    {
+      true_matrix->HypreRead();
+      solver_binding_ready = RebindTraceSolverAfterMatrixRefresh();
+    }
+    catch (...)
+    {
+      solver_binding_ready = false;
+    }
+    if (!CollectiveAll(solver_binding_ready)) { return false; }
+    pending_factor_setup_generation = next_matrix_refresh_generation++;
+    matrix_refresh_generation = pending_factor_setup_generation;
+
+    bool true_assembly_ready = true;
+    try
+    {
+      trace_space->Dof_TrueDof_Matrix()->MultTranspose(
+          local_trace_rhs, true_trace_rhs);
+      true_assembly_ready = Finite(true_trace_rhs);
+    }
+    catch (...)
+    {
+      true_assembly_ready = false;
+    }
+    if (!CollectiveAll(true_assembly_ready)) { return false; }
+    matrix_hash = HashPair(HashSystemMatrix(system), HashDoubles(schur));
+    return true;
   }
 
   bool SolveTrace(const std::uint64_t expected_matrix_refresh_generation,
@@ -2795,6 +2977,7 @@ struct detail::CpuNumericsCore::Implementation
   {
     factor_setup_generation = 0;
     factor_setup_current = false;
+    bool rhs_ready = true;
     try
     {
       if (expected_matrix_refresh_generation == 0 ||
@@ -2803,99 +2986,185 @@ struct detail::CpuNumericsCore::Implementation
           complete_factor_setup_generation >=
               expected_matrix_refresh_generation)
       {
-        return false;
+        rhs_ready = false;
       }
       const double* rhs_source = true_trace_rhs.HostRead();
       double* rhs_destination = hypre_rhs->HostWrite();
       if ((!rhs_source || !rhs_destination) && true_trace_rhs.Size() != 0)
       {
-        return false;
+        rhs_ready = false;
       }
-      std::memcpy(rhs_destination, rhs_source,
-                  static_cast<std::size_t>(true_trace_rhs.Size()) *
-                      sizeof(double));
-      *hypre_solution = 0.0;
+      if (rhs_ready)
+      {
+        std::memcpy(rhs_destination, rhs_source,
+                    static_cast<std::size_t>(true_trace_rhs.Size()) *
+                        sizeof(double));
+        *hypre_solution = 0.0;
+      }
+    }
+    catch (...)
+    {
+      rhs_ready = false;
+    }
+    if (!CollectiveAll(rhs_ready)) { return false; }
+
+    bool solved = true;
+    try
+    {
       gmres->Mult(*hypre_rhs, *hypre_solution);
-      complete_factor_setup_generation = pending_factor_setup_generation;
-      pending_factor_setup_generation = 0;
-      factor_setup_generation = complete_factor_setup_generation;
+      factor_setup_generation = pending_factor_setup_generation;
       factor_setup_current = factor_setup_generation ==
           expected_matrix_refresh_generation;
-      if (!factor_setup_current) { return false; }
       gmres->GetNumIterations(iterations);
-      if (iterations <= 0) { return false; }
-      // This attests the exact Schur input and frozen ILU configuration only;
-      // HYPRE does not expose stable factor bytes for hashing.
-      constexpr std::string_view factor_input_config{
-          "hypre-ilu:t0:f0:i1:tol0:r0:p0"};
-      factor_hash = HashPair(
-          HashDoubles(schur),
-          HashBytes(factor_input_config.data(), factor_input_config.size()));
+      solved = factor_setup_current && iterations > 0;
+    }
+    catch (...)
+    {
+      solved = false;
+    }
+    if (!CollectiveAll(solved)) { return false; }
+    complete_factor_setup_generation = factor_setup_generation;
+    pending_factor_setup_generation = 0;
+
+    // This attests the exact Schur input and frozen ILU configuration only;
+    // HYPRE does not expose stable factor bytes for hashing.
+    constexpr std::string_view factor_input_config{
+        "hypre-ilu:t0:f0:i1:tol0:r0:p0"};
+    factor_hash = HashPair(
+        HashDoubles(schur),
+        HashBytes(factor_input_config.data(), factor_input_config.size()));
+
+    bool residual_ready = true;
+    try
+    {
       true_matrix->Mult(*hypre_solution, *hypre_residual);
       *hypre_residual -= *hypre_rhs;
-      const double residual_squared = mfem::InnerProduct(
+      residual_ready = Finite(*hypre_residual) && Finite(*hypre_rhs);
+    }
+    catch (...)
+    {
+      residual_ready = false;
+    }
+    if (!CollectiveAll(residual_ready)) { return false; }
+
+    double residual_squared = std::numeric_limits<double>::quiet_NaN();
+    double rhs_squared = std::numeric_limits<double>::quiet_NaN();
+    bool residual_reduced = true;
+    bool rhs_reduced = true;
+    try
+    {
+      residual_squared = mfem::InnerProduct(
           MPI_COMM_WORLD, *hypre_residual, *hypre_residual);
-      const double rhs_squared = mfem::InnerProduct(
+    }
+    catch (...)
+    {
+      residual_reduced = false;
+    }
+    try
+    {
+      rhs_squared = mfem::InnerProduct(
           MPI_COMM_WORLD, *hypre_rhs, *hypre_rhs);
+    }
+    catch (...)
+    {
+      rhs_reduced = false;
+    }
+    bool solution_ready = residual_reduced && rhs_reduced &&
+        Finite(residual_squared) && Finite(rhs_squared) &&
+        residual_squared >= 0.0 && rhs_squared >= 0.0;
+    try
+    {
       true_relative_residual = std::sqrt(residual_squared) /
           std::max(std::sqrt(rhs_squared), 1.0e-300);
       const double* solution = hypre_solution->HostRead();
       double* increment = true_increment.HostWrite();
       if ((!solution || !increment) && true_increment.Size() != 0)
       {
-        return false;
+        solution_ready = false;
       }
-      std::memcpy(increment, solution,
-                  static_cast<std::size_t>(true_increment.Size()) *
-                      sizeof(double));
-      solution_hash = HashBytes(solution,
-                                static_cast<std::size_t>(true_increment.Size()) *
-                                    sizeof(double));
-      return Finite(true_relative_residual) &&
+      if (solution_ready)
+      {
+        std::memcpy(increment, solution,
+                    static_cast<std::size_t>(true_increment.Size()) *
+                        sizeof(double));
+        solution_hash = HashBytes(
+            solution, static_cast<std::size_t>(true_increment.Size()) *
+                          sizeof(double));
+      }
+      solution_ready = solution_ready && Finite(true_relative_residual) &&
           true_relative_residual <= config.true_residual_tolerance;
     }
     catch (...)
     {
-      return false;
+      solution_ready = false;
     }
+    return CollectiveAll(solution_ready);
   }
 
   bool Recover() noexcept
   {
+    bool distribution_prepared = true;
     try
     {
       distributed_increment = 0.0;
-      if (!exchange_plan.Distribute(*trace_space, true_increment,
-                                    distributed_increment))
-      {
-        return false;
-      }
+    }
+    catch (...)
+    {
+      distribution_prepared = false;
+    }
+    if (!CollectiveAll(distribution_prepared)) { return false; }
+
+    bool distributed_ready = false;
+    try
+    {
+      distributed_ready = exchange_plan.Distribute(
+          *trace_space, true_increment, distributed_increment);
+    }
+    catch (...)
+    {
+      distributed_ready = false;
+    }
+    if (!CollectiveAll(distributed_ready)) { return false; }
+
+    bool local_recovery_ready = true;
+    try
+    {
       const double* distributed = distributed_increment.HostRead();
-      if (!distributed) { return false; }
-      for (int element = 0; element < mesh->GetNE(); ++element)
+      if (!distributed && distributed_increment.Size() != 0)
+      {
+        local_recovery_ready = false;
+      }
+      for (int element = 0;
+           element < mesh->GetNE() && local_recovery_ready; ++element)
         for (int local = 0; local < local_trace; ++local)
         {
           double sign = 1.0;
           const int dof = Decode(signed_trace_dofs[
               static_cast<std::size_t>(element) * local_trace + local], sign);
-          if (dof < 0 || dof >= distributed_increment.Size()) { return false; }
+          if (dof < 0 || dof >= distributed_increment.Size())
+          {
+            local_recovery_ready = false;
+            break;
+          }
           local_trace_increment[
               static_cast<std::size_t>(element) * local_trace + local] =
               sign * distributed[dof];
         }
-      if (condensation.Recover(
+      if (local_recovery_ready &&
+          (condensation.Recover(
               AsConst(View(local_trace_increment.data(), mesh->GetNE(),
                            local_trace, 1)),
               View(recovered_interior.data(), mesh->GetNE(), local_interior,
                    1)) != core::Status::success ||
-          !Finite(recovered_interior))
+           !Finite(recovered_interior)))
       {
-        return false;
+        local_recovery_ready = false;
       }
       std::fill(grid_interior_increment.begin(),
                 grid_interior_increment.end(), 0.0);
       std::fill(interior_census.begin(), interior_census.end(), 0);
-      for (int element = 0; element < mesh->GetNE(); ++element)
+      for (int element = 0;
+           element < mesh->GetNE() && local_recovery_ready; ++element)
         for (int local = 0; local < local_interior; ++local)
         {
           double sign = 1.0;
@@ -2905,25 +3174,29 @@ struct detail::CpuNumericsCore::Implementation
           if (dof < 0 ||
               dof >= static_cast<int>(grid_interior_increment.size()))
           {
-            return false;
+            local_recovery_ready = false;
+            break;
           }
           grid_interior_increment[static_cast<std::size_t>(dof)] = sign *
               recovered_interior[
                   static_cast<std::size_t>(element) * local_interior + local];
           ++interior_census[static_cast<std::size_t>(dof)];
         }
-      return std::all_of(interior_census.begin(), interior_census.end(),
-                         [](const int count) { return count == 1; }) &&
+      local_recovery_ready = local_recovery_ready &&
+          std::all_of(interior_census.begin(), interior_census.end(),
+                      [](const int count) { return count == 1; }) &&
           Finite(grid_interior_increment);
     }
     catch (...)
     {
-      return false;
+      local_recovery_ready = false;
     }
+    return CollectiveAll(local_recovery_ready);
   }
 
   bool MakeTrial(const double alpha) noexcept
   {
+    bool local_trial_ready = true;
     try
     {
       const double* interior = iterate_interior->HostRead();
@@ -2933,27 +3206,31 @@ struct detail::CpuNumericsCore::Implementation
       double* trace_trial = trial_true_trace.HostWrite();
       if (!interior || !trial || !trace_values || !trace_delta || !trace_trial)
       {
-        return false;
+        local_trial_ready = false;
       }
-      for (int index = 0; index < iterate_interior->Size(); ++index)
+      for (int index = 0;
+           index < iterate_interior->Size() && local_trial_ready; ++index)
       {
         trial[index] = interior[index] + alpha *
             grid_interior_increment[static_cast<std::size_t>(index)];
       }
-      for (int index = 0; index < iterate_true_trace.Size(); ++index)
+      for (int index = 0;
+           index < iterate_true_trace.Size() && local_trial_ready; ++index)
       {
         trace_trial[index] = trace_values[index] + alpha * trace_delta[index];
       }
-      return LoadTrace(trial_true_trace, *trial_trace);
     }
     catch (...)
     {
-      return false;
+      local_trial_ready = false;
     }
+    if (!CollectiveAll(local_trial_ready)) { return false; }
+    return LoadTrace(trial_true_trace, *trial_trace);
   }
 
   bool AcceptTrial() noexcept
   {
+    bool local_accept_ready = true;
     try
     {
       const double* interior = trial_interior->HostRead();
@@ -2962,22 +3239,34 @@ struct detail::CpuNumericsCore::Implementation
       double* next_trace = iterate_true_trace.HostWrite();
       if (!interior || !next_interior || !trace_values || !next_trace)
       {
-        return false;
+        local_accept_ready = false;
       }
-      std::memcpy(next_interior, interior,
-                  static_cast<std::size_t>(iterate_interior->Size()) *
-                      sizeof(double));
-      std::memcpy(next_trace, trace_values,
-                  static_cast<std::size_t>(iterate_true_trace.Size()) *
-                      sizeof(double));
-      if (!LoadTrace(iterate_true_trace, *iterate_trace)) { return false; }
-      CopySystem(trial_system, current_system);
-      return true;
+      if (local_accept_ready)
+      {
+        std::memcpy(next_interior, interior,
+                    static_cast<std::size_t>(iterate_interior->Size()) *
+                        sizeof(double));
+        std::memcpy(next_trace, trace_values,
+                    static_cast<std::size_t>(iterate_true_trace.Size()) *
+                        sizeof(double));
+      }
     }
     catch (...)
     {
-      return false;
+      local_accept_ready = false;
     }
+    if (!CollectiveAll(local_accept_ready)) { return false; }
+    if (!LoadTrace(iterate_true_trace, *iterate_trace)) { return false; }
+    bool copied = true;
+    try
+    {
+      CopySystem(trial_system, current_system);
+    }
+    catch (...)
+    {
+      copied = false;
+    }
+    return CollectiveAll(copied);
   }
 
   bool StoreCandidate() noexcept
@@ -3170,22 +3459,38 @@ bool detail::CpuNumericsCore::Initialize(
         cpu_conserved_components, perturbed_function);
     state.old_interior->ProjectCoefficient(exact_coefficient);
     state.trial_interior->ProjectCoefficient(perturbed_coefficient);
-    local_ok = Copy(*state.old_interior,
-                    state.Committed()->interior) &&
-        Copy(*state.trial_interior, state.first_iterate_interior) &&
-        state.ProjectTrace(*state.iterate_trace, state.iterate_true_trace,
-                           false) &&
-        state.LoadTrace(state.iterate_true_trace, *state.iterate_trace) &&
-        Copy(state.iterate_true_trace, state.Committed()->trace) &&
-        state.ProjectTrace(*state.trial_trace, state.trial_true_trace, true) &&
-        state.LoadTrace(state.trial_true_trace, *state.trial_trace) &&
-        Copy(state.trial_true_trace, state.first_iterate_trace) &&
-        CopySlot(state.committed_slot, state.candidate_slot);
+    local_ok = true;
   }
   catch (...)
   {
     local_ok = false;
   }
+  if (!AllRanks(local_ok)) { return false; }
+
+  local_ok = Copy(*state.old_interior, state.Committed()->interior) &&
+      Copy(*state.trial_interior, state.first_iterate_interior);
+  if (!AllRanks(local_ok)) { return false; }
+  if (!state.ProjectTrace(*state.iterate_trace, state.iterate_true_trace,
+                          false))
+  {
+    return false;
+  }
+  if (!state.LoadTrace(state.iterate_true_trace, *state.iterate_trace))
+  {
+    return false;
+  }
+  local_ok = Copy(state.iterate_true_trace, state.Committed()->trace);
+  if (!AllRanks(local_ok)) { return false; }
+  if (!state.ProjectTrace(*state.trial_trace, state.trial_true_trace, true))
+  {
+    return false;
+  }
+  if (!state.LoadTrace(state.trial_true_trace, *state.trial_trace))
+  {
+    return false;
+  }
+  local_ok = Copy(state.trial_true_trace, state.first_iterate_trace) &&
+      CopySlot(state.committed_slot, state.candidate_slot);
   if (!AllRanks(local_ok)) { return false; }
 
   // Prove the exact storage semantics required by the accepted two-phase
@@ -3378,41 +3683,54 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     return result;
   };
 
-  if (!state.initialized ||
-      !state.InjectionArguments(injection, coordinates.step + 1) ||
-      !state.Committed() || !state.Candidate() ||
-      state.Candidate()->interior != state.Committed()->interior ||
-      state.Candidate()->trace != state.Committed()->trace)
+  const bool local_entry_ready = state.initialized && state.Committed() &&
+      state.Candidate() &&
+      state.Candidate()->interior == state.Committed()->interior &&
+      state.Candidate()->trace == state.Committed()->trace;
+  if (!state.CollectiveAll(local_entry_ready))
+  {
+    return fail(CpuFailurePhase::setup, CpuAttemptStatus::invalid_request);
+  }
+  const bool injection_ready =
+      state.InjectionArguments(injection, coordinates.step + 1);
+  if (!state.CollectiveAll(injection_ready))
   {
     return fail(CpuFailurePhase::setup, CpuAttemptStatus::invalid_request);
   }
 
-  bool local_ok = AssignGridFunction(*state.old_interior,
-                                     state.Committed()->interior);
+  const bool old_assigned = AssignGridFunction(
+      *state.old_interior, state.Committed()->interior);
+  bool iterate_assigned = false;
+  bool trace_assigned = false;
   if (coordinates.step == 0)
   {
-    local_ok = local_ok && AssignGridFunction(
-        *state.iterate_interior, state.first_iterate_interior) &&
-        Assign(state.iterate_true_trace, state.first_iterate_trace);
+    iterate_assigned = AssignGridFunction(
+        *state.iterate_interior, state.first_iterate_interior);
+    trace_assigned = Assign(
+        state.iterate_true_trace, state.first_iterate_trace);
   }
   else
   {
-    local_ok = local_ok && AssignGridFunction(
-        *state.iterate_interior, state.Committed()->interior) &&
-        Assign(state.iterate_true_trace, state.Committed()->trace);
+    iterate_assigned = AssignGridFunction(
+        *state.iterate_interior, state.Committed()->interior);
+    trace_assigned = Assign(
+        state.iterate_true_trace, state.Committed()->trace);
   }
-  local_ok = local_ok &&
-      state.LoadTrace(state.iterate_true_trace, *state.iterate_trace);
-  if (!state.CollectiveAll(local_ok))
+  if (!state.CollectiveAll(old_assigned && iterate_assigned && trace_assigned))
   {
     return fail(CpuFailurePhase::setup);
   }
+  const bool trace_loaded =
+      state.LoadTrace(state.iterate_true_trace, *state.iterate_trace);
+  if (!state.CollectiveAll(trace_loaded)) { return fail(CpuFailurePhase::setup); }
 
   double initial_density = 0.0;
   double initial_pressure = 0.0;
   double initial_wave = 0.0;
-  if (!state.Prescreen(*state.iterate_interior, *state.iterate_trace,
-                       initial_density, initial_pressure, initial_wave))
+  const bool initial_prescreen = state.Prescreen(
+      *state.iterate_interior, *state.iterate_trace, initial_density,
+      initial_pressure, initial_wave);
+  if (!state.CollectiveAll(initial_prescreen))
   {
     return fail(CpuFailurePhase::assembly);
   }
@@ -3421,8 +3739,12 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     return fail(CpuFailurePhase::assembly,
                 CpuAttemptStatus::injected_failure);
   }
-  if (!state.Assemble(*state.iterate_interior, *state.iterate_trace,
-                      state.current_system))
+  bool assembled = state.Assemble(
+      *state.iterate_interior, *state.iterate_trace, state.current_system);
+  const bool assembly_fault = ConsumeCollectiveTestFault(
+      detail::CpuCollectiveTestFault::assembly_completion, state.rank);
+  assembled = assembled && !assembly_fault;
+  if (!state.CollectiveAll(assembled))
   {
     return fail(CpuFailurePhase::assembly);
   }
@@ -3454,8 +3776,9 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     {
       break;
     }
-    if (evidence.linearization_chain_count >=
-        evidence.linearization_chains.size())
+    const bool chain_capacity_available =
+        evidence.linearization_chain_count < evidence.linearization_chains.size();
+    if (!state.CollectiveAll(chain_capacity_available))
     {
       return fail(CpuFailurePhase::condensation);
     }
@@ -3468,7 +3791,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
         std::move(current_local_capability),
         Implementation::ArtifactStage::local, attempt,
         chain.local_generation);
-    if (!consumed_local) { return fail(CpuFailurePhase::condensation); }
+    if (!state.CollectiveAll(consumed_local))
+    {
+      return fail(CpuFailurePhase::condensation);
+    }
     if (!state.EnterPhase(injection, CpuFailurePhase::condensation))
     {
       return fail(CpuFailurePhase::condensation,
@@ -3491,7 +3817,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
         std::move(condensed_capability),
         Implementation::ArtifactStage::condensed, attempt,
         chain.condensed_generation);
-    if (!consumed_condensed) { return fail(CpuFailurePhase::trace_solve); }
+    if (!state.CollectiveAll(consumed_condensed))
+    {
+      return fail(CpuFailurePhase::trace_solve);
+    }
 
     if (!state.EnterPhase(injection, CpuFailurePhase::trace_solve))
     {
@@ -3509,9 +3838,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     {
       ++evidence.work.complete_factor_setups;
     }
-    if (!trace_solved ||
-        !CaptureFixed(state.true_increment, chain.true_trace_increment,
-                      chain.true_trace_increment_size))
+    const bool increment_captured = trace_solved && CaptureFixed(
+        state.true_increment, chain.true_trace_increment,
+        chain.true_trace_increment_size);
+    if (!state.CollectiveAll(increment_captured))
     {
       return fail(CpuFailurePhase::trace_solve);
     }
@@ -3528,7 +3858,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     const bool consumed_solve = state.ConsumeArtifact(
         std::move(solve_capability), Implementation::ArtifactStage::solve,
         attempt, chain.solve_generation);
-    if (!consumed_solve) { return fail(CpuFailurePhase::recovery); }
+    if (!state.CollectiveAll(consumed_solve))
+    {
+      return fail(CpuFailurePhase::recovery);
+    }
     chain.solution_generation = state.next_artifact_generation++;
     chain.solution_hash = solution_hash;
     Implementation::ArtifactCapability solution_capability{
@@ -3538,7 +3871,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
         std::move(solution_capability),
         Implementation::ArtifactStage::solution, attempt,
         chain.solution_generation);
-    if (!consumed_solution) { return fail(CpuFailurePhase::recovery); }
+    if (!state.CollectiveAll(consumed_solution))
+    {
+      return fail(CpuFailurePhase::recovery);
+    }
 
     if (!state.EnterPhase(injection, CpuFailurePhase::recovery))
     {
@@ -3564,7 +3900,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     chain.affine_consumption_verified = consumed_local &&
         consumed_condensed && consumed_solve && consumed_solution &&
         consumed_recovery;
-    if (!chain.affine_consumption_verified)
+    if (!state.CollectiveAll(chain.affine_consumption_verified))
     {
       return fail(CpuFailurePhase::recovery);
     }
@@ -3585,14 +3921,17 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       double density = 0.0;
       double pressure = 0.0;
       double wave = 0.0;
-      trial_evidence.prescreen_passed = state.Prescreen(
+      const bool trial_prescreen = state.Prescreen(
           *state.trial_interior, *state.trial_trace, density, pressure, wave);
+      trial_evidence.prescreen_passed =
+          state.CollectiveAll(trial_prescreen);
       trial_evidence.minimum_density = density;
       trial_evidence.minimum_pressure = pressure;
       trial_evidence.maximum_wave_speed = wave;
       if (!trial_evidence.prescreen_passed) { continue; }
-      if (!state.Assemble(*state.trial_interior, *state.trial_trace,
-                          state.trial_system))
+      const bool trial_assembled = state.Assemble(
+          *state.trial_interior, *state.trial_trace, state.trial_system);
+      if (!state.CollectiveAll(trial_assembled))
       {
         return fail(CpuFailurePhase::assembly);
       }
@@ -3615,12 +3954,13 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
             HashVector(*state.iterate_interior),
             HashVector(state.iterate_true_trace));
         chain.accepted_trial_index = trial;
-        if (!CaptureFixed(*state.iterate_interior,
-                          chain.accepted_candidate_interior,
-                          chain.accepted_candidate_interior_size) ||
-            !CaptureFixed(state.iterate_true_trace,
-                          chain.accepted_candidate_true_trace,
-                          chain.accepted_candidate_true_trace_size))
+        const bool candidate_captured = CaptureFixed(
+            *state.iterate_interior, chain.accepted_candidate_interior,
+            chain.accepted_candidate_interior_size) &&
+            CaptureFixed(state.iterate_true_trace,
+                         chain.accepted_candidate_true_trace,
+                         chain.accepted_candidate_true_trace_size);
+        if (!state.CollectiveAll(candidate_captured))
         {
           return fail(CpuFailurePhase::recovery);
         }
@@ -3628,7 +3968,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
         break;
       }
     }
-    if (!accepted) { return fail(CpuFailurePhase::recovery); }
+    if (!state.CollectiveAll(accepted))
+    {
+      return fail(CpuFailurePhase::recovery);
+    }
     ++updates;
     ++evidence.work.accepted_newton_updates;
     ++evidence.linearization_chain_count;
@@ -3654,12 +3997,17 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
           evidence.work.accepted_newton_updates &&
       evidence.work.complete_factor_setups ==
           static_cast<std::uint64_t>(updates);
-  if (!nonlinear_converged || !recovered || !factor_setup_census_exact)
+  if (!state.CollectiveAll(
+          nonlinear_converged && recovered && factor_setup_census_exact))
   {
     return fail(CpuFailurePhase::recovery);
   }
-  if (!state.StoreCandidate()) { return fail(CpuFailurePhase::recovery); }
-  if (evidence.linearization_chain_count == 0)
+  const bool candidate_stored = state.StoreCandidate();
+  if (!state.CollectiveAll(candidate_stored))
+  {
+    return fail(CpuFailurePhase::recovery);
+  }
+  if (!state.CollectiveAll(evidence.linearization_chain_count != 0))
   {
     return fail(CpuFailurePhase::recovery);
   }
@@ -3669,8 +4017,9 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   const StateHash stored_candidate_hash = HashPair(
       HashDoubles(state.Candidate()->interior),
       HashDoubles(state.Candidate()->trace));
-  if (!retained.ordered ||
-      retained.candidate_state_hash != stored_candidate_hash)
+  const bool retained_candidate_valid = retained.ordered &&
+      retained.candidate_state_hash == stored_candidate_hash;
+  if (!state.CollectiveAll(retained_candidate_valid))
   {
     return fail(CpuFailurePhase::recovery);
   }
@@ -3713,8 +4062,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   double final_density = 0.0;
   double final_pressure = 0.0;
   double final_wave = 0.0;
-  if (!state.Prescreen(*state.iterate_interior, *state.iterate_trace,
-                       final_density, final_pressure, final_wave))
+  const bool final_prescreen = state.Prescreen(
+      *state.iterate_interior, *state.iterate_trace, final_density,
+      final_pressure, final_wave);
+  if (!state.CollectiveAll(final_prescreen))
   {
     return fail(CpuFailurePhase::diagnostics);
   }
