@@ -779,6 +779,38 @@ bool SameCoordinates(const StateCoordinates& left,
       std::memcmp(&left.dt, &right.dt, sizeof(double)) == 0;
 }
 
+inline constexpr FailureReason checkpoint_cleanup_reason =
+    FailureReason::backend_failure;
+inline constexpr CudaFailurePhase checkpoint_cleanup_phase =
+    CudaFailurePhase::diagnostics;
+
+struct CheckpointPostconditionConsensus
+{
+  bool local_failure = false;
+  bool reduction_complete = false;
+  bool cleanup_required = true;
+  int failing_ranks = -1;
+  FailureReason cleanup_reason = checkpoint_cleanup_reason;
+  CudaFailurePhase cleanup_phase = checkpoint_cleanup_phase;
+};
+
+CheckpointPostconditionConsensus AgreeCheckpointPostconditionFailure(
+    const bool local_failure, const int ranks) noexcept
+{
+  CheckpointPostconditionConsensus result{};
+  result.local_failure = local_failure;
+  const int local_count = local_failure ? 1 : 0;
+  int failing_ranks = 0;
+  result.reduction_complete = MPI_Allreduce(
+      &local_count, &failing_ranks, 1, MPI_INT, MPI_SUM,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool count_valid = result.reduction_complete &&
+      failing_ranks >= 0 && failing_ranks <= ranks;
+  result.failing_ranks = count_valid ? failing_ranks : -1;
+  result.cleanup_required = !count_valid || failing_ranks != 0;
+  return result;
+}
+
 std::uint64_t RangeDigest(const CudaTransferLedgerV1& ledger,
                           const std::uint64_t begin,
                           const std::uint64_t end) noexcept
@@ -1004,12 +1036,13 @@ void ReportCheckpointDiagnosticV1(const char* id,int rank,bool retry,
 template <typename Engine> bool CleanupUnexpectedFrozenAuthority(
     Engine& engine, CudaSerializedCheckpointV1& checkpoint,
     CudaStepEvidence& evidence, const CudaPrecommitSnapshot& snapshot,
-    const char* const id, const int rank) noexcept
+    const char* const id, const int rank,
+    const FailureReason cleanup_reason,
+    const CudaFailurePhase cleanup_phase) noexcept
 {
   const auto* contract = engine.contract();
   const FailureReason original_reason = evidence.contract_reason;
-  const FailureReason cleanup_reason = original_reason == FailureReason::none
-      ? FailureReason::backend_failure : original_reason;
+  const CudaFailurePhase original_phase = evidence.phase;
   const bool cleanup_return = engine.AbortPrepared(
       checkpoint, cleanup_reason, evidence);
   const bool cleanup_valid = cleanup_return && contract != nullptr &&
@@ -1021,10 +1054,13 @@ template <typename Engine> bool CleanupUnexpectedFrozenAuthority(
       !checkpoint.output_staged && !checkpoint.successful_commit;
   std::fprintf(stderr,
       "CUDA_AFFINE_CLEANUP case=%s rank=%d return=%u valid=%u "
-      "reason=%u phase=%u coordinates=%u bytes=%u flags=%u/%u/%u/%u\n",
+      "original=%u/%u cleanup=%u/%u coordinates=%u bytes=%u "
+      "flags=%u/%u/%u/%u\n",
       id != nullptr ? id : "null", rank, cleanup_return ? 1U : 0U,
       cleanup_valid ? 1U : 0U, static_cast<unsigned>(original_reason),
-      static_cast<unsigned>(evidence.phase),
+      static_cast<unsigned>(original_phase),
+      static_cast<unsigned>(cleanup_reason),
+      static_cast<unsigned>(cleanup_phase),
       evidence.coordinates_preserved ? 1U : 0U,
       evidence.committed_bytes_preserved ? 1U : 0U,
       checkpoint.candidate_frozen ? 1U : 0U,
@@ -1053,7 +1089,9 @@ template <typename Engine> bool StagePreparedCheckpointDiagnosed(Engine& e,
     ReportCheckpointDiagnosticV1(id,rank,retry,target,c,s,before,after,
       AuditedTransport::Accounting(),d);
     if(cleanup_on_failure)
-      (void)CleanupUnexpectedFrozenAuthority(e,c,evidence,s,id,rank);}
+      (void)CleanupUnexpectedFrozenAuthority(
+          e,c,evidence,s,id,rank,checkpoint_cleanup_reason,
+          checkpoint_cleanup_phase);}
   return staged;
 }
 
@@ -2043,7 +2081,7 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
   const std::uint64_t checkpoint_sync_successes_after =
       AuditedTransport::SuccessfulSynchronizationEvents();
   const bool checkpoint_ledger_mirror = ExactPolicyLedgers();
-  const bool checkpoint_stage_failed =
+  const bool local_checkpoint_stage_failed =
       !checkpoint_stage_return ||
       checkpoint.schema != 1 || checkpoint.rank_count != ranks ||
       checkpoint.attempt.sequence != snapshot.attempt.sequence ||
@@ -2064,19 +2102,37 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
       checkpoint.trace_source_token == 0 ||
       !ValidRange(checkpoint.staging_range, checkpoint_ledger_after) ||
       !checkpoint_ledger_mirror;
-  if (checkpoint_stage_failed)
+  const CheckpointPostconditionConsensus checkpoint_consensus =
+      AgreeCheckpointPostconditionFailure(
+          local_checkpoint_stage_failed, ranks);
+  if (checkpoint_consensus.cleanup_required)
   {
-    const CheckpointDiagnosticV1 diagnostic = BuildCheckpointDiagnosticV1(
-        checkpoint_stage_return, checkpoint, snapshot, ranks, rank,
-        checkpoint_ledger_before, checkpoint_ledger_after,
-        checkpoint_sync_successes_before, checkpoint_sync_successes_after,
-        checkpoint_ledger_mirror);
-    ReportCheckpointDiagnosticV1(
-        case_id, rank, retry, target_step, checkpoint, snapshot,
-        checkpoint_ledger_before, checkpoint_ledger_after,
-        AuditedTransport::Accounting(), diagnostic);
+    if (local_checkpoint_stage_failed)
+    {
+      const CheckpointDiagnosticV1 diagnostic = BuildCheckpointDiagnosticV1(
+          checkpoint_stage_return, checkpoint, snapshot, ranks, rank,
+          checkpoint_ledger_before, checkpoint_ledger_after,
+          checkpoint_sync_successes_before, checkpoint_sync_successes_after,
+          checkpoint_ledger_mirror);
+      ReportCheckpointDiagnosticV1(
+          case_id, rank, retry, target_step, checkpoint, snapshot,
+          checkpoint_ledger_before, checkpoint_ledger_after,
+          AuditedTransport::Accounting(), diagnostic);
+    }
+    std::fprintf(stderr,
+        "CUDA_CKPT_CONSENSUS case=%s rank=%d local=%u reduced=%u "
+        "failing_ranks=%d cleanup=%u reason=%u phase=%u\n",
+        case_id != nullptr ? case_id : "null", rank,
+        local_checkpoint_stage_failed ? 1U : 0U,
+        checkpoint_consensus.reduction_complete ? 1U : 0U,
+        checkpoint_consensus.failing_ranks,
+        checkpoint_consensus.cleanup_required ? 1U : 0U,
+        static_cast<unsigned>(checkpoint_consensus.cleanup_reason),
+        static_cast<unsigned>(checkpoint_consensus.cleanup_phase));
     (void)CleanupUnexpectedFrozenAuthority(
-        engine, checkpoint, evidence, snapshot, case_id, rank);
+        engine, checkpoint, evidence, snapshot, case_id, rank,
+        checkpoint_consensus.cleanup_reason,
+        checkpoint_consensus.cleanup_phase);
     ReportCommitFailure(rank, "checkpoint-stage", retry, target_step);
     return false;
   }
@@ -2793,9 +2849,20 @@ bool Global(const bool local) noexcept
 bool CollectiveCaseBoundaryRegression(const int rank, const int ranks) noexcept
 {
   if (ranks == 1) { return true; }
-  const bool rank_local_failure_rejected = !Global(rank == 0);
+  if (ranks != 2) { return false; }
+  const bool rank_zero_only_failure = rank == 0;
+  const CheckpointPostconditionConsensus decision =
+      AgreeCheckpointPostconditionFailure(rank_zero_only_failure, ranks);
+  const bool traversed_cleanup_boundary = decision.cleanup_required &&
+      decision.reduction_complete && decision.failing_ranks == 1 &&
+      decision.local_failure == rank_zero_only_failure &&
+      decision.cleanup_reason == checkpoint_cleanup_reason &&
+      decision.cleanup_phase == checkpoint_cleanup_phase;
+  const bool both_ranks_traversed_cleanup_boundary =
+      Global(traversed_cleanup_boundary);
   const bool all_ranks_reenter_next_boundary = Global(true);
-  return rank_local_failure_rejected && all_ranks_reenter_next_boundary;
+  return both_ranks_traversed_cleanup_boundary &&
+      all_ranks_reenter_next_boundary;
 }
 
 bool PrestageFailureMaskExactFixtures() noexcept
