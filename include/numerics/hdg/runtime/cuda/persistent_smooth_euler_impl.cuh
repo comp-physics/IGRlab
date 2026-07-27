@@ -105,12 +105,106 @@ struct CudaMeshShape
   int vector_receive_count = 0;
 };
 
+enum class CudaHypreSetupAction : std::uint8_t
+{
+  bind_preconditioner,
+  set_operator,
+  ilu_type0,
+  ilu_fill0,
+  ilu_reorder0,
+  ilu_maxiter1,
+  ilu_tol0,
+  ilu_print0,
+  rebind_preconditioner,
+  gmres_settings,
+  mult
+};
+
+struct CudaHypreSetupOrderEvidence
+{
+  inline static constexpr std::size_t configured_action_count = 10;
+  inline static constexpr std::size_t solved_action_count = 11;
+
+  std::uint64_t matrix_generation = 0;
+  std::array<CudaHypreSetupAction, solved_action_count> actions{};
+  std::size_t action_count = 0;
+  bool overflow = false;
+
+  constexpr bool Record(const CudaHypreSetupAction action) noexcept
+  {
+    if (action_count >= actions.size())
+    {
+      overflow = true;
+      return false;
+    }
+    actions[action_count++] = action;
+    return true;
+  }
+
+  constexpr bool ConfigurationExactForGeneration(
+      const std::uint64_t expected_generation) const noexcept
+  {
+    return action_count == configured_action_count &&
+        PrefixExactForGeneration(expected_generation);
+  }
+
+  constexpr bool SolveExactForGeneration(
+      const std::uint64_t expected_generation) const noexcept
+  {
+    return action_count == solved_action_count &&
+        PrefixExactForGeneration(expected_generation) &&
+        actions[configured_action_count] == CudaHypreSetupAction::mult;
+  }
+
+private:
+  constexpr bool PrefixExactForGeneration(
+      const std::uint64_t expected_generation) const noexcept
+  {
+    constexpr std::array<CudaHypreSetupAction, configured_action_count>
+        expected{{
+          CudaHypreSetupAction::bind_preconditioner,
+          CudaHypreSetupAction::set_operator,
+          CudaHypreSetupAction::ilu_type0,
+          CudaHypreSetupAction::ilu_fill0,
+          CudaHypreSetupAction::ilu_reorder0,
+          CudaHypreSetupAction::ilu_maxiter1,
+          CudaHypreSetupAction::ilu_tol0,
+          CudaHypreSetupAction::ilu_print0,
+          CudaHypreSetupAction::rebind_preconditioner,
+          CudaHypreSetupAction::gmres_settings}};
+    if (overflow || matrix_generation != expected_generation ||
+        action_count < expected.size())
+      return false;
+    for (std::size_t action = 0; action < expected.size(); ++action)
+      if (actions[action] != expected[action]) { return false; }
+    return true;
+  }
+};
+
+constexpr bool CudaTicketWordsValid(
+    const std::array<int, 8>& words, const CudaFailurePhase phase,
+    const std::uint64_t attempt, const std::uint64_t generation,
+    const int device) noexcept
+{
+  return words[0] == 1 && words[1] == 1200 && words[2] == device &&
+      words[3] == static_cast<int>(phase) &&
+      static_cast<std::uint32_t>(words[4]) ==
+          static_cast<std::uint32_t>(attempt) &&
+      static_cast<std::uint32_t>(words[5]) ==
+          static_cast<std::uint32_t>(attempt >> 32U) &&
+      static_cast<std::uint32_t>(words[6]) ==
+          static_cast<std::uint32_t>(generation) &&
+      static_cast<std::uint32_t>(words[7]) ==
+          static_cast<std::uint32_t>(generation >> 32U);
+}
+
 struct CudaSolveDiagnostics
 {
   bool device_policy = false;
   bool configured_ilu0 = false;
   bool converged = false;
   bool finite = false;
+  std::uint64_t matrix_generation = 0;
   int iterations = 0;
   double reported_residual = std::numeric_limits<double>::infinity();
 };
@@ -131,13 +225,17 @@ bool CudaGetTrueMatrixDeviceView(mfem::HypreParMatrix& matrix,
 bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   mfem::HypreILU& ilu,
                                   mfem::HypreGMRES& gmres,
-                                  int ranks) noexcept;
+                                  int ranks,
+                                  std::uint64_t matrix_generation,
+                                  CudaHypreSetupOrderEvidence& evidence)
+    noexcept;
 bool CudaRefreshFactorAndSolve(mfem::HypreParMatrix& matrix,
                                mfem::HypreParVector& rhs,
                                mfem::HypreParVector& solution,
                                mfem::HypreILU& ilu,
                                mfem::HypreGMRES& gmres,
                                int ranks,
+                               std::uint64_t matrix_generation,
                                CudaSolveDiagnostics& diagnostics) noexcept;
 bool CudaHypreDevicePolicyValid(mfem::HypreParMatrix& matrix,
                                 mfem::HypreParVector& rhs,
@@ -293,6 +391,8 @@ public:
                         WorkspaceBytes()};
     tuple_ = tuple;
     baseline_allocations_ = AllocatorPolicy::AllocationEvents();
+    baseline_w8_owned_allocation_calls_ =
+        AllocatorPolicy::W8OwnedAllocationCalls();
     initialized_ = true;
     evidence.rank = rank_;
     evidence.ranks = ranks_;
@@ -473,6 +573,11 @@ public:
     value.baseline_allocation_events = baseline_allocations_;
     value.post_baseline_allocation_events =
         AllocatorPolicy::AllocationEvents() - baseline_allocations_;
+    value.baseline_w8_owned_allocation_calls =
+        baseline_w8_owned_allocation_calls_;
+    value.post_baseline_w8_owned_allocation_calls =
+        AllocatorPolicy::W8OwnedAllocationCalls() -
+        baseline_w8_owned_allocation_calls_;
     value.persistent_graph = true_matrix_ && local_trace_matrix_;
     value.persistent_slots = committed_slot_.interior.coefficients !=
             candidate_slot_.interior.coefficients &&
@@ -565,7 +670,8 @@ public:
         result.reason = FailureReason::true_residual_gate;
         return result;
       }
-      const bool solve_ok = SolveTrueSystem(result.true_relative_residual);
+      const bool solve_ok =
+          SolveTrueSystem(result.true_relative_residual, generation);
       if (!CollectiveContinue(solve_ok))
       {
         result.reason = FailureReason::true_residual_gate;
@@ -716,8 +822,8 @@ public:
       result.reason = FailureReason::true_residual_gate;
       return result;
     }
-    const bool coherent_solve_ok =
-        SolveTrueSystem(result.true_relative_residual);
+    const bool coherent_solve_ok = SolveTrueSystem(
+        result.true_relative_residual, last_product_generation);
     if (!CollectiveContinue(coherent_solve_ok))
     {
       result.reason = FailureReason::true_residual_gate;
@@ -746,6 +852,8 @@ public:
     result.true_residual = std::isfinite(result.true_relative_residual) &&
         result.true_relative_residual <= 1.0e-10;
     result.telemetry = DeviceResident() && NoFallback() &&
+        AllocatorPolicy::W8OwnedAllocationCalls() ==
+            baseline_w8_owned_allocation_calls_ &&
         AllocatorPolicy::AllocationEvents() == baseline_allocations_;
     result.success = result.finite && result.admissible && result.recovery &&
         result.true_residual && result.telemetry;
@@ -829,10 +937,11 @@ private:
         !mfem::Device::Allows(mfem::Backend::DEBUG_DEVICE) &&
         AllocatorPolicy::DevicePoolPolicyValid();
     if (!CollectiveContinue(local_device_valid)) { return false; }
-    cudaUUID_t uuid{};
-    const bool uuid_ready = cudaDeviceGetUuid(&uuid, device_) == cudaSuccess;
+    cudaDeviceProp properties{};
+    const bool uuid_ready =
+        cudaGetDeviceProperties(&properties, device_) == cudaSuccess;
     if (!CollectiveContinue(uuid_ready)) { return false; }
-    std::memcpy(gpu_uuid_.data(), uuid.bytes, gpu_uuid_.size());
+    std::memcpy(gpu_uuid_.data(), properties.uuid.bytes, gpu_uuid_.size());
     std::array<unsigned char, 32> gathered{};
     if (ranks_ == 2)
     {
@@ -962,7 +1071,8 @@ private:
   bool AssembleTrueVector(const double* element_values,
                           double* true_values) noexcept;
   bool AssembleTrueSystem() noexcept;
-  bool SolveTrueSystem(double& true_relative_residual) noexcept;
+  bool SolveTrueSystem(double& true_relative_residual,
+                       std::uint64_t matrix_generation) noexcept;
   bool AssembleAndNorm(state_slot& workspace, double& norm) noexcept;
   bool CopyBase(state_slot& workspace) noexcept;
   bool RestoreBase(state_slot& workspace) noexcept;
@@ -1036,6 +1146,7 @@ private:
   std::uint64_t current_generation_ = 0;
   std::uint64_t linear_generation_ = 0;
   std::uint64_t baseline_allocations_ = 0;
+  std::uint64_t baseline_w8_owned_allocation_calls_ = 0;
   std::size_t host_exchange_bytes_ = 0;
   std::array<CudaDeviceTicket, maximum_device_tickets> tickets_{};
   std::size_t ticket_count_ = 0;
