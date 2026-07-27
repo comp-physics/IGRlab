@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -775,33 +776,138 @@ bool ExactFailedStagingEvidence(const CudaStepEvidence& evidence,
   return failed_checkpoint_trace_events == 1;
 }
 
-bool SetupValid(const CudaRunEvidence& setup, const int ranks) noexcept
+// Stable SetupValid failure-mask mapping for this private diagnostic TU:
+// bits 0..15 respectively cover status, origin, ranks, device, MFEM, HYPRE,
+// same-GPU, trace semantics, host staging, no fallback, reuse booleans,
+// nonzero tokens, distinct slots, post-baseline counts, scope flags, and the
+// independent policy ledgers.
+enum SetupFailureBit : std::uint64_t
 {
-  return setup.status == CudaRunStatus::ready &&
-      setup.setup_origin == FailureReason::none && setup.ranks == ranks &&
-      setup.device == 0 && setup.mfem_device_valid &&
-      setup.hypre_cuda_umpire_device && setup.same_physical_gpu &&
-      setup.signed_owner_ghost_semantics &&
-      (ranks == 1 || setup.host_staged_rank2) &&
-      setup.no_host_solver_fallback && setup.reuse.persistent_graph &&
-      setup.reuse.persistent_slots && setup.reuse.persistent_workspace &&
-      setup.reuse.topology_token != 0 &&
-      setup.reuse.double_arena_token != 0 &&
-      setup.reuse.integer_arena_token != 0 &&
-      setup.reuse.matrix_token != 0 && setup.reuse.factor_token != 0 &&
-      setup.reuse.workspace_token != 0 &&
-      setup.reuse.interior_slot_tokens[0] != 0 &&
-      setup.reuse.interior_slot_tokens[1] != 0 &&
-      setup.reuse.interior_slot_tokens[0] !=
-          setup.reuse.interior_slot_tokens[1] &&
-      setup.reuse.trace_slot_tokens[0] != 0 &&
-      setup.reuse.trace_slot_tokens[1] != 0 &&
-      setup.reuse.trace_slot_tokens[0] != setup.reuse.trace_slot_tokens[1] &&
-      setup.reuse.post_baseline_allocation_events == 0 &&
-      setup.reuse.post_baseline_w8_owned_allocation_calls == 0 &&
-      setup.reuse.observes_w8_owned_calls_and_pool_growth_only &&
-      !setup.reuse.opaque_pool_reuse_churn_observed &&
-      ExactPolicyLedgers();
+  setup_status_failure = std::uint64_t{1} << 0U,
+  setup_origin_failure = std::uint64_t{1} << 1U,
+  setup_ranks_failure = std::uint64_t{1} << 2U,
+  setup_device_failure = std::uint64_t{1} << 3U,
+  setup_mfem_failure = std::uint64_t{1} << 4U,
+  setup_hypre_failure = std::uint64_t{1} << 5U,
+  setup_same_gpu_failure = std::uint64_t{1} << 6U,
+  setup_trace_semantics_failure = std::uint64_t{1} << 7U,
+  setup_host_staging_failure = std::uint64_t{1} << 8U,
+  setup_no_fallback_failure = std::uint64_t{1} << 9U,
+  setup_reuse_booleans_failure = std::uint64_t{1} << 10U,
+  setup_tokens_failure = std::uint64_t{1} << 11U,
+  setup_distinct_slots_failure = std::uint64_t{1} << 12U,
+  setup_post_baseline_counts_failure = std::uint64_t{1} << 13U,
+  setup_scope_flags_failure = std::uint64_t{1} << 14U,
+  setup_policy_ledgers_failure = std::uint64_t{1} << 15U
+};
+
+bool SetupValid(const CudaRunEvidence& setup, const int ranks,
+                std::uint64_t& failure_mask) noexcept
+{
+  failure_mask = 0;
+  if (!(setup.status == CudaRunStatus::ready))
+    failure_mask |= setup_status_failure;
+  if (!(setup.setup_origin == FailureReason::none))
+    failure_mask |= setup_origin_failure;
+  if (!(setup.ranks == ranks))
+    failure_mask |= setup_ranks_failure;
+  if (!(setup.device == 0))
+    failure_mask |= setup_device_failure;
+  if (!setup.mfem_device_valid)
+    failure_mask |= setup_mfem_failure;
+  if (!setup.hypre_cuda_umpire_device)
+    failure_mask |= setup_hypre_failure;
+  if (!setup.same_physical_gpu)
+    failure_mask |= setup_same_gpu_failure;
+  if (!setup.signed_owner_ghost_semantics)
+    failure_mask |= setup_trace_semantics_failure;
+  if (!(ranks == 1 || setup.host_staged_rank2))
+    failure_mask |= setup_host_staging_failure;
+  if (!setup.no_host_solver_fallback)
+    failure_mask |= setup_no_fallback_failure;
+  if (!(setup.reuse.persistent_graph && setup.reuse.persistent_slots &&
+        setup.reuse.persistent_workspace))
+  {
+    failure_mask |= setup_reuse_booleans_failure;
+  }
+  if (!(setup.reuse.topology_token != 0 &&
+        setup.reuse.double_arena_token != 0 &&
+        setup.reuse.integer_arena_token != 0 &&
+        setup.reuse.matrix_token != 0 && setup.reuse.factor_token != 0 &&
+        setup.reuse.workspace_token != 0 &&
+        setup.reuse.interior_slot_tokens[0] != 0 &&
+        setup.reuse.interior_slot_tokens[1] != 0 &&
+        setup.reuse.trace_slot_tokens[0] != 0 &&
+        setup.reuse.trace_slot_tokens[1] != 0))
+  {
+    failure_mask |= setup_tokens_failure;
+  }
+  if (!(setup.reuse.interior_slot_tokens[0] !=
+            setup.reuse.interior_slot_tokens[1] &&
+        setup.reuse.trace_slot_tokens[0] !=
+            setup.reuse.trace_slot_tokens[1]))
+  {
+    failure_mask |= setup_distinct_slots_failure;
+  }
+  if (!(setup.reuse.post_baseline_allocation_events == 0 &&
+        setup.reuse.post_baseline_w8_owned_allocation_calls == 0))
+  {
+    failure_mask |= setup_post_baseline_counts_failure;
+  }
+  if (!(setup.reuse.observes_w8_owned_calls_and_pool_growth_only &&
+        !setup.reuse.opaque_pool_reuse_churn_observed))
+  {
+    failure_mask |= setup_scope_flags_failure;
+  }
+  if (!ExactPolicyLedgers())
+    failure_mask |= setup_policy_ledgers_failure;
+  return failure_mask == 0;
+}
+
+void ReportSetupFailure(const char* const context, const bool initialized,
+                        const std::uint64_t failure_mask,
+                        const CudaRunEvidence& setup,
+                        const int expected_ranks) noexcept
+{
+  int rank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if (rank != 0) { return; }
+  std::cerr << "SETUP_FAIL initialized=" << (initialized ? 1 : 0)
+            << " mask=0x" << std::hex << failure_mask << std::dec
+            << " context=" << context
+            << " status=" << static_cast<int>(setup.status)
+            << " origin=" << static_cast<int>(setup.setup_origin)
+            << " ranks=" << setup.ranks
+            << " expected_ranks=" << expected_ranks
+            << " device=" << setup.device
+            << " flags=" << (setup.mfem_device_valid ? 1 : 0)
+            << (setup.hypre_cuda_umpire_device ? 1 : 0)
+            << (setup.same_physical_gpu ? 1 : 0)
+            << (setup.signed_owner_ghost_semantics ? 1 : 0)
+            << (setup.host_staged_rank2 ? 1 : 0)
+            << (setup.no_host_solver_fallback ? 1 : 0)
+            << " reuse=" << (setup.reuse.persistent_graph ? 1 : 0)
+            << (setup.reuse.persistent_slots ? 1 : 0)
+            << (setup.reuse.persistent_workspace ? 1 : 0)
+            << " post_counts="
+            << setup.reuse.post_baseline_allocation_events << ','
+            << setup.reuse.post_baseline_w8_owned_allocation_calls
+            << " scope="
+            << (setup.reuse.observes_w8_owned_calls_and_pool_growth_only
+                    ? 1 : 0)
+            << (setup.reuse.opaque_pool_reuse_churn_observed ? 1 : 0)
+            << " tokens=topology:0x" << std::hex
+            << setup.reuse.topology_token
+            << ",double:0x" << setup.reuse.double_arena_token
+            << ",integer:0x" << setup.reuse.integer_arena_token
+            << ",matrix:0x" << setup.reuse.matrix_token
+            << ",factor:0x" << setup.reuse.factor_token
+            << ",workspace:0x" << setup.reuse.workspace_token
+            << ",interior0:0x" << setup.reuse.interior_slot_tokens[0]
+            << ",interior1:0x" << setup.reuse.interior_slot_tokens[1]
+            << ",trace0:0x" << setup.reuse.trace_slot_tokens[0]
+            << ",trace1:0x" << setup.reuse.trace_slot_tokens[1]
+            << std::dec << '\n';
 }
 
 CudaConfig Config(const int ranks, const bool oracle = false) noexcept
@@ -817,6 +923,22 @@ template <typename Backend>
 using TestEngine = PersistentCudaSmoothEulerEngine<
     TestSelection<Backend>, AuditedAllocator, AuditedTransport,
     CudaMpiCollectivePolicy>;
+
+template <typename Engine>
+bool InitializePositive(Engine& engine, CudaRunEvidence& setup,
+                        const int ranks,
+                        const char* const context) noexcept
+{
+  const bool initialized = engine.Initialize(setup);
+  std::uint64_t failure_mask = 0;
+  const bool setup_valid = SetupValid(setup, ranks, failure_mask);
+  if (!initialized || !setup_valid)
+  {
+    ReportSetupFailure(context, initialized, failure_mask, setup, ranks);
+    return false;
+  }
+  return true;
+}
 
 template <typename Backend>
 bool RunConfigConsensusNegative(const int ranks) noexcept
@@ -904,6 +1026,31 @@ bool OracleIdentity(const CudaOraclePod& pod,
       pod.product_generation != 0 && pod.dt == fixed_dt;
 }
 
+void ReportCommitFailure(const char* const stage, const bool retry,
+                         const std::uint64_t target_step) noexcept
+{
+  int rank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if (rank == 0)
+  {
+    std::cerr << "COMMIT_FAIL stage=" << stage
+              << " target=" << target_step
+              << " retry=" << (retry ? 1 : 0) << '\n';
+  }
+}
+
+void ReportTokenFailure(const char* const stage,
+                        const CudaTokenFault fault) noexcept
+{
+  int rank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if (rank == 0)
+  {
+    std::cerr << "TOKEN_FAIL stage=" << stage
+              << " fault=" << static_cast<int>(fault) << '\n';
+  }
+}
+
 template <typename Engine>
 bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
                              const std::uint64_t target_step,
@@ -919,11 +1066,16 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
   CudaPrecommitSnapshot snapshot{};
   CudaStepEvidence evidence{};
   const auto* contract = engine.contract();
-  if (contract == nullptr) { return false; }
+  if (contract == nullptr)
+  {
+    ReportCommitFailure("contract", retry, target_step);
+    return false;
+  }
   const StateCoordinates old_coordinates = contract->coordinates();
   const auto old_publication = contract->Published();
   StateCoordinates visible{};
-  if (!engine.PrepareStep(retry, snapshot, evidence) ||
+  const bool prepare_step_failed =
+      !engine.PrepareStep(retry, snapshot, evidence) ||
       !snapshot.numerical_candidate_ready ||
       snapshot.attempt.retry_index != (retry ? 1 : 0) ||
       snapshot.target.step != target_step ||
@@ -933,13 +1085,16 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
       !snapshot.staging_must_precede_finalize ||
       !snapshot.finalize_has_no_fallible_posthook ||
       !contract->PublishedCoordinates(old_publication, visible) ||
-      !SameCoordinates(visible, old_coordinates) || !ExactPolicyLedgers())
+      !SameCoordinates(visible, old_coordinates) || !ExactPolicyLedgers();
+  if (prepare_step_failed)
   {
+    ReportCommitFailure("prepare-step", retry, target_step);
     return false;
   }
   if (captured != nullptr) { *captured = snapshot; }
 
-  if (!engine.StagePreparedCheckpoint(checkpoint, evidence) ||
+  const bool checkpoint_stage_failed =
+      !engine.StagePreparedCheckpoint(checkpoint, evidence) ||
       checkpoint.schema != 1 || checkpoint.rank_count != ranks ||
       checkpoint.attempt.sequence != snapshot.attempt.sequence ||
       checkpoint.facade_incarnation == 0 ||
@@ -958,23 +1113,29 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
       checkpoint.interior_source_token == 0 ||
       checkpoint.trace_source_token == 0 ||
       !ValidRange(checkpoint.staging_range, AuditedTransport::Ledger()) ||
-      !ExactPolicyLedgers())
+      !ExactPolicyLedgers();
+  if (checkpoint_stage_failed)
   {
+    ReportCommitFailure("checkpoint-stage", retry, target_step);
     return false;
   }
 
   auto staged_oracle = std::make_unique<CudaOraclePod>();
-  if (!engine.StagePreparedOracle(*staged_oracle, evidence) ||
+  const bool oracle_output_stage_failed =
+      !engine.StagePreparedOracle(*staged_oracle, evidence) ||
       !OracleIdentity(*staged_oracle, snapshot, ranks) ||
       !cuda_w8a_test_oracle::Verify(*staged_oracle) ||
       (mutate_oracle && !VerifyOracleAndMutations(*staged_oracle)) ||
       !engine.MarkOutputStaged(checkpoint) || !checkpoint.output_staged ||
-      checkpoint.successful_commit || !ExactPolicyLedgers())
+      checkpoint.successful_commit || !ExactPolicyLedgers();
+  if (oracle_output_stage_failed)
   {
+    ReportCommitFailure("oracle/output-stage", retry, target_step);
     return false;
   }
 
-  if (!engine.PrepareCommit(checkpoint, evidence) || evidence.committed ||
+  const bool prepare_commit_failed =
+      !engine.PrepareCommit(checkpoint, evidence) || evidence.committed ||
       !SameCoordinates(contract->coordinates(), old_coordinates) ||
       !contract->PublishedCoordinates(old_publication, visible) ||
       !SameCoordinates(visible, old_coordinates) ||
@@ -982,12 +1143,15 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
       checkpoint.successful_commit ||
       !SameCoordinates(contract->coordinates(), old_coordinates) ||
       !contract->PublishedCoordinates(old_publication, visible) ||
-      !SameCoordinates(visible, old_coordinates) || !ExactPolicyLedgers())
+      !SameCoordinates(visible, old_coordinates) || !ExactPolicyLedgers();
+  if (prepare_commit_failed)
   {
+    ReportCommitFailure("prepare/commit", retry, target_step);
     return false;
   }
 
-  if (!engine.FinalizeCommit(checkpoint, evidence) ||
+  const bool finalize_failed =
+      !engine.FinalizeCommit(checkpoint, evidence) ||
       !checkpoint.successful_commit || !evidence.committed ||
       evidence.retry_available || !evidence.collective_consensus ||
       evidence.contract_reason != FailureReason::none ||
@@ -1000,23 +1164,29 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
       !evidence.products.CoupledAndOrdered() || !evidence.no_fallback ||
       !evidence.device_resident ||
       AuditedAllocator::AllocationEvents() != allocation_baseline ||
-      !ExactAttemptEvidence(evidence, ranks))
+      !ExactAttemptEvidence(evidence, ranks);
+  if (finalize_failed)
   {
+    ReportCommitFailure("finalize", retry, target_step);
     return false;
   }
 
   auto exported = std::make_unique<CudaOraclePod>();
-  return engine.ExportOracle(*exported) &&
+  const bool export_valid = engine.ExportOracle(*exported) &&
       OracleIdentity(*exported, snapshot, ranks) &&
       cuda_w8a_test_oracle::Verify(*exported) &&
       AuditedAllocator::W8OwnedAllocationCalls() ==
           owned_allocation_calls &&
       ExactPolicyLedgers();
+  if (!export_valid)
+    ReportCommitFailure("export", retry, target_step);
+  return export_valid;
 }
 
 template <typename Backend>
 bool RunLifecycle(const int ranks,
-                  CudaSerializedCheckpointV1& final_checkpoint) noexcept
+                  CudaSerializedCheckpointV1& final_checkpoint,
+                  const char* const context) noexcept
 {
   CudaConfig config = Config(ranks, true);
   config.injection.enabled = true;
@@ -1026,7 +1196,7 @@ bool RunLifecycle(const int ranks,
   const bool result = [&]() noexcept
   {
     CudaRunEvidence setup{};
-    if (!engine->Initialize(setup) || !SetupValid(setup, ranks))
+    if (!InitializePositive(*engine, setup, ranks, context))
       return false;
     const std::uint64_t allocations = setup.reuse.baseline_allocation_events;
     CudaSerializedCheckpointV1 checkpoint{};
@@ -1096,13 +1266,14 @@ bool RunLifecycle(const int ranks,
 
 template <typename Backend>
 bool RunCorruptRestore(const int ranks,
-                       const CudaSerializedCheckpointV1& checkpoint) noexcept
+                       const CudaSerializedCheckpointV1& checkpoint,
+                       const char* const context) noexcept
 {
   auto engine = std::make_unique<TestEngine<Backend>>(Config(ranks));
   const bool result = [&]() noexcept
   {
     CudaRunEvidence setup{};
-    if (!engine->Initialize(setup) || !SetupValid(setup, ranks))
+    if (!InitializePositive(*engine, setup, ranks, context))
       return false;
     CudaSerializedCheckpointV1 corrupt = checkpoint;
     if (corrupt.interior_count == 0) { return false; }
@@ -1127,13 +1298,14 @@ bool RunCorruptRestore(const int ranks,
 
 template <typename Backend>
 bool RunFreshRestore(const int ranks,
-                     const CudaSerializedCheckpointV1& checkpoint) noexcept
+                     const CudaSerializedCheckpointV1& checkpoint,
+                     const char* const context) noexcept
 {
   auto engine = std::make_unique<TestEngine<Backend>>(Config(ranks, true));
   const bool result = [&]() noexcept
   {
     CudaRunEvidence setup{};
-    if (!engine->Initialize(setup) || !SetupValid(setup, ranks))
+    if (!InitializePositive(*engine, setup, ranks, context))
       return false;
     const auto* pristine_contract = engine->contract();
     if (pristine_contract == nullptr) { return false; }
@@ -1201,13 +1373,14 @@ bool RunFreshRestore(const int ranks,
 }
 
 template <typename Backend>
-bool RunProvisionalRevert(const int ranks) noexcept
+bool RunProvisionalRevert(const int ranks,
+                          const char* const context) noexcept
 {
   auto engine = std::make_unique<TestEngine<Backend>>(Config(ranks, true));
   const bool result = [&]() noexcept
   {
     CudaRunEvidence setup{};
-    if (!engine->Initialize(setup) || !SetupValid(setup, ranks))
+    if (!InitializePositive(*engine, setup, ranks, context))
       return false;
     const auto* contract = engine->contract();
     if (contract == nullptr) { return false; }
@@ -1258,13 +1431,14 @@ bool RunProvisionalRevert(const int ranks) noexcept
 }
 
 template <typename Backend>
-bool RunPreparedAbort(const int ranks) noexcept
+bool RunPreparedAbort(const int ranks,
+                      const char* const context) noexcept
 {
   auto engine = std::make_unique<TestEngine<Backend>>(Config(ranks, true));
   const bool result = [&]() noexcept
   {
     CudaRunEvidence setup{};
-    if (!engine->Initialize(setup) || !SetupValid(setup, ranks))
+    if (!InitializePositive(*engine, setup, ranks, context))
       return false;
     const auto* contract = engine->contract();
     if (contract == nullptr) { return false; }
@@ -1309,13 +1483,14 @@ bool RunPreparedAbort(const int ranks) noexcept
 }
 
 template <typename Backend>
-bool RunStagingFailure(const int ranks) noexcept
+bool RunStagingFailure(const int ranks,
+                       const char* const context) noexcept
 {
   auto engine = std::make_unique<TestEngine<Backend>>(Config(ranks, true));
   const bool result = [&]() noexcept
   {
     CudaRunEvidence setup{};
-    if (!engine->Initialize(setup) || !SetupValid(setup, ranks))
+    if (!InitializePositive(*engine, setup, ranks, context))
       return false;
     const auto* contract = engine->contract();
     if (contract == nullptr) { return false; }
@@ -1357,7 +1532,8 @@ bool RunStagingFailure(const int ranks) noexcept
 
 template <typename Backend>
 bool RunTokenFault(const int ranks, const CudaTokenFault fault,
-                   const FailureReason expected) noexcept
+                   const FailureReason expected,
+                   const char* const context) noexcept
 {
   CudaConfig config = Config(ranks, true);
   config.injection.token_fault = fault;
@@ -1365,33 +1541,39 @@ bool RunTokenFault(const int ranks, const CudaTokenFault fault,
   const bool result = [&]() noexcept
   {
     CudaRunEvidence setup{};
-    if (!engine->Initialize(setup) || !SetupValid(setup, ranks))
+    if (!InitializePositive(*engine, setup, ranks, context))
       return false;
     if (fault == CudaTokenFault::issue_matrix_before_residual)
     {
       CudaSerializedCheckpointV1 checkpoint{};
-      return CommitSuccessfulAttempt(
-                 *engine, false, 1, ranks,
-                 setup.reuse.baseline_allocation_events, checkpoint, true) &&
+      const bool final_valid = CommitSuccessfulAttempt(
+          *engine, false, 1, ranks,
+          setup.reuse.baseline_allocation_events, checkpoint, true) &&
           engine->contract()->telemetry()
                   .out_of_order_product_issues_rejected == 1;
+      if (!final_valid)
+        ReportTokenFailure("final", fault);
+      return final_valid;
     }
 
     CudaPrecommitSnapshot snapshot{};
     CudaStepEvidence evidence{};
     CudaSerializedCheckpointV1 checkpoint{};
     auto oracle = std::make_unique<CudaOraclePod>();
-    if (!engine->PrepareStep(false, snapshot, evidence) ||
+    const bool precommit_failed =
+        !engine->PrepareStep(false, snapshot, evidence) ||
         !engine->StagePreparedCheckpoint(checkpoint, evidence) ||
         !engine->StagePreparedOracle(*oracle, evidence) ||
-        !engine->MarkOutputStaged(checkpoint))
+        !engine->MarkOutputStaged(checkpoint);
+    if (precommit_failed)
     {
+      ReportTokenFailure("precommit", fault);
       return false;
     }
     const bool progressed_to_rollback =
         engine->PrepareCommit(checkpoint, evidence);
     const auto* contract = engine->contract();
-    return progressed_to_rollback && contract != nullptr &&
+    const bool final_valid = progressed_to_rollback && contract != nullptr &&
         evidence.contract_reason == expected && evidence.retry_available &&
         !evidence.committed && evidence.coordinates_preserved &&
         evidence.committed_bytes_preserved &&
@@ -1403,6 +1585,9 @@ bool RunTokenFault(const int ranks, const CudaTokenFault fault,
         AuditedAllocator::AllocationEvents() ==
             setup.reuse.baseline_allocation_events &&
         ExactAttemptEvidence(evidence, ranks);
+    if (!final_valid)
+      ReportTokenFailure("final", fault);
+    return final_valid;
   }();
   engine.reset();
   return result && ExactPolicyLedgers();
@@ -1677,31 +1862,40 @@ int main(int argc, char** argv)
       run_case("rank1.token.omit-solution",
                RunTokenFault<TestRankOneBackendTag>(
                    1, CudaTokenFault::omit_solution,
-                   FailureReason::missing_product));
+                   FailureReason::missing_product,
+                   "rank1.token.omit-solution"));
       run_case("rank1.token.stale-attempt",
                RunTokenFault<TestRankOneBackendTag>(
                    1, CudaTokenFault::stale_attempt,
-                   FailureReason::missing_product));
+                   FailureReason::missing_product,
+                   "rank1.token.stale-attempt"));
       run_case("rank1.token.matrix-before-residual",
                RunTokenFault<TestRankOneBackendTag>(
                    1, CudaTokenFault::issue_matrix_before_residual,
-                   FailureReason::none));
+                   FailureReason::none,
+                   "rank1.token.matrix-before-residual"));
     }
     else
     {
       CudaSerializedCheckpointV1 checkpoint{};
       run_case("rank1.lifecycle",
-               RunLifecycle<TestRankOneBackendTag>(1, checkpoint));
+               RunLifecycle<TestRankOneBackendTag>(
+                   1, checkpoint, "rank1.lifecycle"));
       run_case("rank1.restore.corrupt",
-               RunCorruptRestore<TestRankOneBackendTag>(1, checkpoint));
+               RunCorruptRestore<TestRankOneBackendTag>(
+                   1, checkpoint, "rank1.restore.corrupt"));
       run_case("rank1.restore.fresh",
-               RunFreshRestore<TestRankOneBackendTag>(1, checkpoint));
+               RunFreshRestore<TestRankOneBackendTag>(
+                   1, checkpoint, "rank1.restore.fresh"));
       run_case("rank1.provisional-revert",
-               RunProvisionalRevert<TestRankOneBackendTag>(1));
+               RunProvisionalRevert<TestRankOneBackendTag>(
+                   1, "rank1.provisional-revert"));
       run_case("rank1.prepared-abort",
-               RunPreparedAbort<TestRankOneBackendTag>(1));
+               RunPreparedAbort<TestRankOneBackendTag>(
+                   1, "rank1.prepared-abort"));
       run_case("rank1.staging-failure",
-               RunStagingFailure<TestRankOneBackendTag>(1));
+               RunStagingFailure<TestRankOneBackendTag>(
+                   1, "rank1.staging-failure"));
     }
   }
   else if (ranks == 2)
@@ -1721,31 +1915,40 @@ int main(int argc, char** argv)
       run_case("rank2.token.omit-solution",
                RunTokenFault<TestRankTwoBackendTag>(
                    2, CudaTokenFault::omit_solution,
-                   FailureReason::missing_product));
+                   FailureReason::missing_product,
+                   "rank2.token.omit-solution"));
       run_case("rank2.token.stale-attempt",
                RunTokenFault<TestRankTwoBackendTag>(
                    2, CudaTokenFault::stale_attempt,
-                   FailureReason::missing_product));
+                   FailureReason::missing_product,
+                   "rank2.token.stale-attempt"));
       run_case("rank2.token.matrix-before-residual",
                RunTokenFault<TestRankTwoBackendTag>(
                    2, CudaTokenFault::issue_matrix_before_residual,
-                   FailureReason::none));
+                   FailureReason::none,
+                   "rank2.token.matrix-before-residual"));
     }
     else
     {
       CudaSerializedCheckpointV1 checkpoint{};
       run_case("rank2.lifecycle",
-               RunLifecycle<TestRankTwoBackendTag>(2, checkpoint));
+               RunLifecycle<TestRankTwoBackendTag>(
+                   2, checkpoint, "rank2.lifecycle"));
       run_case("rank2.restore.corrupt",
-               RunCorruptRestore<TestRankTwoBackendTag>(2, checkpoint));
+               RunCorruptRestore<TestRankTwoBackendTag>(
+                   2, checkpoint, "rank2.restore.corrupt"));
       run_case("rank2.restore.fresh",
-               RunFreshRestore<TestRankTwoBackendTag>(2, checkpoint));
+               RunFreshRestore<TestRankTwoBackendTag>(
+                   2, checkpoint, "rank2.restore.fresh"));
       run_case("rank2.provisional-revert",
-               RunProvisionalRevert<TestRankTwoBackendTag>(2));
+               RunProvisionalRevert<TestRankTwoBackendTag>(
+                   2, "rank2.provisional-revert"));
       run_case("rank2.prepared-abort",
-               RunPreparedAbort<TestRankTwoBackendTag>(2));
+               RunPreparedAbort<TestRankTwoBackendTag>(
+                   2, "rank2.prepared-abort"));
       run_case("rank2.staging-failure",
-               RunStagingFailure<TestRankTwoBackendTag>(2));
+               RunStagingFailure<TestRankTwoBackendTag>(
+                   2, "rank2.staging-failure"));
     }
   }
   else
