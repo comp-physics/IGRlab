@@ -287,6 +287,64 @@ void ObserveHighwater(std::atomic<std::size_t>& endpoint,
 }
 } // namespace
 
+bool UmpireDeviceAllocatorPolicy::PrepareDeviceArenaAllocator() noexcept
+{
+  ++w8_owned_allocation_calls;
+  constexpr std::size_t probe_bytes = sizeof(std::max_align_t);
+  constexpr std::size_t probe_alignment = alignof(std::max_align_t);
+  mfem::Memory<std::max_align_t> probe{};
+  void* device_pointer = nullptr;
+  bool allocation_succeeded = false;
+  bool deallocation_succeeded = false;
+  try
+  {
+    // Exercise MFEM's public lazy device-memory path.  This deliberately does
+    // not create an Umpire QuickPool or touch HYPRE's independently lazy pool.
+    probe.New(1, mfem::MemoryType::DEVICE_UMPIRE);
+    device_pointer = probe.Write(mfem::MemoryClass::DEVICE, 1);
+    allocation_succeeded = device_pointer != nullptr &&
+        reinterpret_cast<std::uintptr_t>(device_pointer) % probe_alignment ==
+            0 &&
+        probe.DeviceIsValid();
+  }
+  catch (...) {}
+
+  if (allocation_succeeded) { ++allocation_events; }
+  RecordAllocation(CudaAllocationSite::mfem_device_pool_probe, probe_bytes,
+                   probe_alignment, device_pointer, true,
+                   allocation_succeeded);
+  const std::uint64_t allocation_generation_value = allocation_succeeded
+      ? allocation_generation.load() : 0;
+
+  try
+  {
+    probe.Delete();
+    deallocation_succeeded = true;
+  }
+  catch (...) {}
+  if (device_pointer != nullptr)
+  {
+    if (deallocation_succeeded) { ++deallocation_events; }
+    RecordAllocation(CudaAllocationSite::mfem_device_pool_probe, probe_bytes,
+                     probe_alignment, device_pointer, false,
+                     deallocation_succeeded,
+                     allocation_generation_value);
+  }
+  if (!allocation_succeeded || !deallocation_succeeded) { return false; }
+
+#if defined(MFEM_USE_UMPIRE)
+  try
+  {
+    auto& manager = umpire::ResourceManager::getInstance();
+    const char* name = mfem::MemoryManager::GetUmpireDeviceAllocatorName();
+    return name != nullptr && name[0] != '\0' && manager.isAllocator(name);
+  }
+  catch (...) { return false; }
+#else
+  return false;
+#endif
+}
+
 bool UmpireDeviceAllocatorPolicy::Allocate(
     const std::size_t bytes, const std::size_t alignment,
     const CudaAllocationSite site, void*& pointer) noexcept

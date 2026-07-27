@@ -112,6 +112,7 @@ struct CudaConfig
 
 enum class CudaAllocationSite : unsigned char
 {
+  mfem_device_pool_probe,
   persistent_double_arena,
   persistent_integer_arena
 };
