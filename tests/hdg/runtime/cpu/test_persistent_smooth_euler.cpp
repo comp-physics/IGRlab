@@ -534,6 +534,85 @@ bool ByteEqual(const CpuCoefficientView view,
                    values.size() * sizeof(double)) == 0);
 }
 
+struct CpuCheckpointObservation
+{
+  std::array<unsigned char, sizeof(CheckpointDescriptor)> descriptor_bytes{};
+  std::array<unsigned char,
+             sizeof(std::array<CpuOwnedAllocationEvent, 4>)> event_bytes{};
+  std::vector<double> interior;
+  std::vector<double> trace;
+  const double* interior_data = nullptr;
+  const double* trace_data = nullptr;
+  std::size_t interior_capacity = 0;
+  std::size_t trace_capacity = 0;
+  std::size_t event_count = 0;
+  bool valid = false;
+};
+
+CpuCheckpointObservation ObserveCheckpoint(const CpuCheckpoint& checkpoint)
+{
+  CpuCheckpointObservation observation;
+  std::memcpy(observation.descriptor_bytes.data(), &checkpoint.descriptor,
+              sizeof(checkpoint.descriptor));
+  std::memcpy(observation.event_bytes.data(),
+              checkpoint.owned_allocation_events.data(),
+              sizeof(checkpoint.owned_allocation_events));
+  const CpuCoefficientView interior = checkpoint.interior();
+  const CpuCoefficientView trace = checkpoint.trace();
+  observation.interior = CopyView(interior);
+  observation.trace = CopyView(trace);
+  observation.interior_data = interior.data;
+  observation.trace_data = trace.data;
+  observation.interior_capacity = interior.capacity;
+  observation.trace_capacity = trace.capacity;
+  observation.event_count = checkpoint.owned_allocation_event_count;
+  observation.valid = checkpoint.valid;
+  return observation;
+}
+
+bool CheckpointUnchanged(const CpuCheckpoint& checkpoint,
+                         const CpuCheckpointObservation& before)
+{
+  const CpuCoefficientView interior = checkpoint.interior();
+  const CpuCoefficientView trace = checkpoint.trace();
+  return checkpoint.valid == before.valid &&
+      checkpoint.owned_allocation_event_count == before.event_count &&
+      std::memcmp(&checkpoint.descriptor, before.descriptor_bytes.data(),
+                  sizeof(checkpoint.descriptor)) == 0 &&
+      std::memcmp(checkpoint.owned_allocation_events.data(),
+                  before.event_bytes.data(),
+                  sizeof(checkpoint.owned_allocation_events)) == 0 &&
+      interior.data == before.interior_data &&
+      trace.data == before.trace_data &&
+      interior.capacity == before.interior_capacity &&
+      trace.capacity == before.trace_capacity &&
+      ByteEqual(interior, before.interior) && ByteEqual(trace, before.trace);
+}
+
+bool CollectivelyFalse(const bool local, MPI_Comm communicator)
+{
+  int value = local ? 1 : 0;
+  int minimum = 1;
+  int maximum = 1;
+  const int minimum_status = MPI_Allreduce(
+      &value, &minimum, 1, MPI_INT, MPI_MIN, communicator);
+  const int maximum_status = MPI_Allreduce(
+      &value, &maximum, 1, MPI_INT, MPI_MAX, communicator);
+  return minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS &&
+      minimum == 0 && maximum == 0;
+}
+
+void SeedInvalidCheckpoint(CpuCheckpoint& checkpoint,
+                           const CheckpointDescriptor& descriptor)
+{
+  checkpoint.descriptor = descriptor;
+  checkpoint.descriptor.cursor ^= std::uint64_t{0x5a5a};
+  checkpoint.owned_allocation_event_count = 1;
+  checkpoint.owned_allocation_events[0] = {
+      CpuOwnedAllocationSite::slot_cell, 77, 88, 8, 11, 99};
+  checkpoint.valid = false;
+}
+
 bool NearTime(const double left, const double right)
 {
   return std::abs(left - right) <=
@@ -869,10 +948,102 @@ void CheckTwoPhaseAndAffineAuthorities(Checks& checks)
 }
 
 template <typename Selection>
+void CheckAsymmetricCheckpointImportFailures(
+    const CpuCheckpoint& checkpoint,
+    const std::vector<double>& interior,
+    const std::vector<double>& trace,
+    Checks& checks,
+    MPI_Comm communicator,
+    const int rank,
+    const int ranks)
+{
+  if (ranks != 2) { return; }
+  checks.Require(!interior.empty() && !trace.empty(),
+                 "rank2 asymmetric import payloads are nonempty");
+
+  auto require_collective_failure =
+      [&](const CheckpointDescriptor& descriptor,
+          const double* interior_data,
+          const std::size_t interior_size,
+          const double* trace_data,
+          const std::size_t trace_size,
+          CpuCheckpoint& output,
+          const char* message)
+      {
+        const CpuCheckpointObservation before = ObserveCheckpoint(output);
+        const bool imported = ImportCpuCheckpoint(
+            descriptor, interior_data, interior_size, trace_data, trace_size,
+            output);
+        checks.Require(CollectivelyFalse(imported, communicator) &&
+                           CheckpointUnchanged(output, before),
+                       message);
+      };
+
+  CpuCheckpoint preexisting;
+  checks.Require(ImportCpuCheckpoint(
+                     checkpoint.descriptor, interior.data(), interior.size(),
+                     trace.data(), trace.size(), preexisting),
+                 "rank2 asymmetric import pre-valid seed");
+  if (rank == 1) { preexisting = CpuCheckpoint{}; }
+  require_collective_failure(
+      checkpoint.descriptor, interior.data(), interior.size(), trace.data(),
+      trace.size(), preexisting,
+      "one-rank pre-valid output fails collectively without mutation");
+
+  CpuCheckpoint output;
+  SeedInvalidCheckpoint(output, checkpoint.descriptor);
+  CheckpointDescriptor unsuccessful = checkpoint.descriptor;
+  if (rank == 1) { unsuccessful.successful_commit = false; }
+  require_collective_failure(
+      unsuccessful, interior.data(), interior.size(), trace.data(),
+      trace.size(), output,
+      "one-rank unsuccessful descriptor fails admission collectively");
+
+  output = CpuCheckpoint{};
+  SeedInvalidCheckpoint(output, checkpoint.descriptor);
+  CheckpointDescriptor mismatched = checkpoint.descriptor;
+  if (rank == 1) { mismatched.coordinate_fingerprint ^= std::uint64_t{1}; }
+  require_collective_failure(
+      mismatched, interior.data(), interior.size(), trace.data(), trace.size(),
+      output, "one-rank descriptor identity mismatch fails collectively");
+
+  output = CpuCheckpoint{};
+  SeedInvalidCheckpoint(output, checkpoint.descriptor);
+  const double* asymmetric_interior = rank == 1 ? nullptr : interior.data();
+  require_collective_failure(
+      checkpoint.descriptor, asymmetric_interior, interior.size(), trace.data(),
+      trace.size(), output,
+      "one-rank null pointer with nonzero size fails admission collectively");
+
+  output = CpuCheckpoint{};
+  SeedInvalidCheckpoint(output, checkpoint.descriptor);
+  const std::size_t asymmetric_size =
+      rank == 1 && !interior.empty() ? interior.size() - 1 : interior.size();
+  require_collective_failure(
+      checkpoint.descriptor, interior.data(), asymmetric_size, trace.data(),
+      trace.size(), output,
+      "one-rank serialized size mismatch fails final hash consensus");
+
+  output = CpuCheckpoint{};
+  SeedInvalidCheckpoint(output, checkpoint.descriptor);
+  std::vector<double> nonfinite_interior = interior;
+  if (rank == 1 && !nonfinite_interior.empty())
+  {
+    nonfinite_interior[0] = std::numeric_limits<double>::quiet_NaN();
+  }
+  require_collective_failure(
+      checkpoint.descriptor, nonfinite_interior.data(),
+      nonfinite_interior.size(), trace.data(), trace.size(), output,
+      "one-rank NaN fails finite consensus before collective hashes");
+}
+
+template <typename Selection>
 void CheckCheckpointImportAndIndependence(
     PersistentSmoothEulerCpuAdapter<Selection>& source,
     const CpuCheckpoint& checkpoint,
     Checks& checks,
+    MPI_Comm communicator,
+    const int rank,
     const int ranks)
 {
   const std::vector<double> interior = CopyView(checkpoint.interior());
@@ -887,6 +1058,9 @@ void CheckCheckpointImportAndIndependence(
                 MPI_MAX, MPI_COMM_WORLD);
   checks.Require(ranks == 1 || minimum_size != maximum_size,
                  "rank2 checkpoint exercise uses unequal local payload sizes");
+
+  CheckAsymmetricCheckpointImportFailures<Selection>(
+      checkpoint, interior, trace, checks, communicator, rank, ranks);
 
   CpuCheckpoint imported;
   checks.Require(ImportCpuCheckpoint(
@@ -903,6 +1077,9 @@ void CheckCheckpointImportAndIndependence(
                      ByteEqual(fresh.Snapshot().interior, interior) &&
                      ByteEqual(fresh.Snapshot().trace, trace),
                  "unequal rank-local payloads restore under rank-common identity");
+  checks.Require(fresh.Advance().committed &&
+                     fresh.coordinates().step == 2,
+                 "successful re-entry import restores and continues collectively");
 
   CpuCheckpoint later;
   checks.Require(source.CaptureCheckpoint(later) && later.valid &&
@@ -1355,7 +1532,8 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                  "uninterrupted/restarted committed state equivalence");
 
   CheckCanonicalIds(adapter, checks, communicator);
-  CheckCheckpointImportAndIndependence(adapter, checkpoint, checks, ranks);
+  CheckCheckpointImportAndIndependence(
+      adapter, checkpoint, checks, communicator, rank, ranks);
   CheckProductNegatives<Selection>(checks);
   CheckPhaseRankInjection<Selection>(checks, ranks);
   CheckOuterStageAbort<Selection>(checks, ranks);
