@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -39,32 +40,48 @@ namespace dg::hdg::runtime::cuda_w8a
 /** Production W8-owned allocator. All explicit device allocation is routed here. */
 struct UmpireDeviceAllocatorPolicy
 {
+  static void ResetLedger() noexcept;
   static bool Allocate(std::size_t bytes, std::size_t alignment,
                        CudaAllocationSite site, void*& pointer) noexcept;
   static void Deallocate(void* pointer, CudaAllocationSite site) noexcept;
   static std::uint64_t AllocationEvents() noexcept;
   static std::uint64_t DeallocationEvents() noexcept;
   static bool DevicePoolPolicyValid() noexcept;
+  static CudaAllocationLedgerV1 Ledger() noexcept;
 };
 
 /** Production W8-owned transport. All explicit CUDA copies route here. */
 struct CudaTransportPolicy
 {
+  static void ResetLedger() noexcept;
   static void BeginAttempt(const CudaPolicyContext& context) noexcept;
   static void SetPhase(CudaFailurePhase phase, std::uint64_t generation) noexcept;
   static bool HostToDevice(void* destination, const void* source,
                            std::size_t bytes, CudaTransferCategory category,
-                           CudaTransferSite site) noexcept;
+                           CudaTransferSite site,
+                           std::size_t source_capacity = 0,
+                           std::size_t destination_capacity = 0) noexcept;
   static bool DeviceToHost(void* destination, const void* source,
                            std::size_t bytes, CudaTransferCategory category,
-                           CudaTransferSite site) noexcept;
+                           CudaTransferSite site,
+                           std::size_t source_capacity = 0,
+                           std::size_t destination_capacity = 0) noexcept;
   static bool DeviceToDevice(void* destination, const void* source,
                              std::size_t bytes, CudaTransferCategory category,
-                             CudaTransferSite site) noexcept;
-  static void RecordMpiStaging(std::size_t bytes,
-                               CudaTransferSite site) noexcept;
+                             CudaTransferSite site,
+                             std::size_t source_capacity = 0,
+                             std::size_t destination_capacity = 0) noexcept;
+  static bool RecordMpiStaging(std::size_t bytes,
+                               CudaTransferCategory category,
+                               CudaTransferSite site,
+                               const void* source,
+                               const void* destination,
+                               std::size_t source_capacity,
+                               std::size_t destination_capacity,
+                               bool success) noexcept;
   static bool Synchronize(CudaTransferSite site) noexcept;
   static CudaTransferTotals Accounting() noexcept;
+  static CudaTransferLedgerV1 Ledger() noexcept;
 };
 
 /** Real rank-1/rank-2 reduction policy consumed by PersistentRunContract. */
@@ -84,6 +101,13 @@ struct CudaMpiCollectivePolicy
 
 namespace detail
 {
+
+enum class CudaCopyOutPurpose : unsigned char
+{
+  none,
+  attempt_seed,
+  checkpoint_staging
+};
 
 inline bool SameRange(const double* first, std::size_t first_count,
                       const double* second, std::size_t second_count) noexcept
@@ -105,6 +129,10 @@ struct CudaContractStoragePolicy
   static constexpr bool private_copy_is_independent = true;
   static constexpr bool publish_is_atomic = true;
   static constexpr bool publish_preserves_disjoint_backing = true;
+  static constexpr bool publish_is_complete_slot_exchange = true;
+  static constexpr bool candidate_retains_exact_old_state_after_publish = true;
+  static constexpr bool revert_publish_is_exact_byte_inverse = true;
+  static constexpr bool publish_and_revert_preserve_disjoint_backing = true;
 
   static bool CopyInterior(CudaInteriorState& destination,
                            const CudaInteriorState& source,
@@ -120,6 +148,7 @@ struct CudaContractStoragePolicy
       return false;
     }
     destination.hash = source.hash;
+    destination.local_hash = source.local_hash;
     destination.generation = source.generation;
     destination.mfem_device_valid = source.mfem_device_valid;
     return true;
@@ -139,6 +168,7 @@ struct CudaContractStoragePolicy
       return false;
     }
     destination.hash = source.hash;
+    destination.local_hash = source.local_hash;
     destination.generation = source.generation;
     destination.mfem_device_valid = source.mfem_device_valid;
     return true;
@@ -147,44 +177,87 @@ struct CudaContractStoragePolicy
   static bool PrepareCandidate(const state_slot& committed,
                                state_slot& candidate) noexcept
   {
-    return CopyInterior(candidate.interior, committed.interior,
-                        CudaTransferCategory::state_prepare,
-                        CudaTransferSite::candidate_prepare_interior) &&
-        CopyTrace(candidate.trace, committed.trace,
-                  CudaTransferCategory::state_prepare,
-                  CudaTransferSite::candidate_prepare_trace);
+    const bool interior = CopyInterior(
+        candidate.interior, committed.interior,
+        CudaTransferCategory::attempt_history,
+        CudaTransferSite::attempt_seed_interior);
+    const bool trace = CopyTrace(candidate.trace, committed.trace,
+        CudaTransferCategory::attempt_history,
+        CudaTransferSite::attempt_seed_trace);
+    const bool synchronized =
+        TransportPolicy::Synchronize(CudaTransferSite::attempt_seed_trace);
+    return interior && trace && synchronized;
   }
 
   static bool PrepareRestore(const state_slot& loaded,
                              state_slot& candidate) noexcept
   {
-    return CopyInterior(candidate.interior, loaded.interior,
-                        CudaTransferCategory::state_store,
-                        CudaTransferSite::candidate_store_interior) &&
-        CopyTrace(candidate.trace, loaded.trace,
-                  CudaTransferCategory::state_store,
-                  CudaTransferSite::candidate_store_trace);
+    const bool interior = CopyInterior(
+        candidate.interior, loaded.interior,
+        CudaTransferCategory::checkpoint_restore_materialization,
+        CudaTransferSite::checkpoint_materialize_interior);
+    const bool trace = CopyTrace(
+        candidate.trace, loaded.trace,
+        CudaTransferCategory::checkpoint_restore_materialization,
+        CudaTransferSite::checkpoint_materialize_trace);
+    const bool synchronized = TransportPolicy::Synchronize(
+        CudaTransferSite::checkpoint_materialize_trace);
+    return interior && trace && synchronized;
   }
 
   static bool StoreCandidate(state_slot& candidate,
                              const state_slot& value) noexcept
   {
-    return CopyInterior(candidate.interior, value.interior,
-                        CudaTransferCategory::state_store,
-                        CudaTransferSite::candidate_store_interior) &&
-        CopyTrace(candidate.trace, value.trace,
-                  CudaTransferCategory::state_store,
-                  CudaTransferSite::candidate_store_trace);
+    const bool interior = CopyInterior(
+        candidate.interior, value.interior,
+        CudaTransferCategory::attempt_history,
+        CudaTransferSite::candidate_finalize_interior);
+    const bool trace = CopyTrace(
+        candidate.trace, value.trace,
+        CudaTransferCategory::attempt_history,
+        CudaTransferSite::candidate_finalize_trace);
+    const bool synchronized = TransportPolicy::Synchronize(
+        CudaTransferSite::candidate_finalize_trace);
+    return interior && trace && synchronized;
   }
 
   static bool CopyOut(const state_slot& source, state_slot& copy) noexcept
   {
-    return CopyInterior(copy.interior, source.interior,
-                        CudaTransferCategory::state_copy_out,
-                        CudaTransferSite::published_copy_interior) &&
-        CopyTrace(copy.trace, source.trace,
-                  CudaTransferCategory::state_copy_out,
-                  CudaTransferSite::published_copy_trace);
+    const CudaCopyOutPurpose purpose = copy_out_purpose_;
+    copy_out_purpose_ = CudaCopyOutPurpose::none;
+    if (purpose == CudaCopyOutPurpose::attempt_seed)
+    {
+      const bool interior = CopyInterior(
+          copy.interior, source.interior,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::attempt_seed_interior);
+      const bool trace = CopyTrace(
+          copy.trace, source.trace, CudaTransferCategory::attempt_history,
+          CudaTransferSite::attempt_seed_trace);
+      const bool synchronized =
+          TransportPolicy::Synchronize(CudaTransferSite::attempt_seed_trace);
+      return interior && trace && synchronized;
+    }
+    if (purpose == CudaCopyOutPurpose::checkpoint_staging)
+    {
+      const bool interior = CopyInterior(
+          copy.interior, source.interior,
+          CudaTransferCategory::checkpoint_candidate_staging,
+          CudaTransferSite::checkpoint_stage_interior);
+      const bool trace = CopyTrace(
+          copy.trace, source.trace,
+          CudaTransferCategory::checkpoint_candidate_staging,
+          CudaTransferSite::checkpoint_stage_trace);
+      const bool synchronized = TransportPolicy::Synchronize(
+          CudaTransferSite::checkpoint_stage_trace);
+      return interior && trace && synchronized;
+    }
+    return false;
+  }
+
+  static void SetCopyOutPurpose(const CudaCopyOutPurpose purpose) noexcept
+  {
+    copy_out_purpose_ = purpose;
   }
 
   static void DiscardCandidate(state_slot& candidate) noexcept
@@ -193,6 +266,8 @@ struct CudaContractStoragePolicy
     candidate.trace.generation = 0;
     candidate.interior.hash = {};
     candidate.trace.hash = {};
+    candidate.interior.local_hash = {};
+    candidate.trace.local_hash = {};
   }
 
   static bool CanPublish(const state_slot& committed,
@@ -211,6 +286,13 @@ struct CudaContractStoragePolicy
   {
     using std::swap;
     swap(committed, candidate); // noexcept handle publication; payloads stay put
+  }
+
+  static void RevertPublish(state_slot& committed,
+                            state_slot& candidate) noexcept
+  {
+    using std::swap;
+    swap(committed, candidate);
   }
 
   static bool Disjoint(const state_slot& first,
@@ -232,6 +314,11 @@ struct CudaContractStoragePolicy
   {
     return state.hash;
   }
+
+private:
+  inline static thread_local CudaCopyOutPurpose copy_out_purpose_ =
+      CudaCopyOutPurpose::none;
+
 };
 
 struct CudaNumericalResult
@@ -244,6 +331,7 @@ struct CudaNumericalResult
   bool telemetry = false;
   bool success = false;
   bool injected = false;
+  int injection_source_rank = -1;
   CudaFailurePhase phase = CudaFailurePhase::setup;
   FailureReason reason = FailureReason::backend_failure;
   CudaProductEvidence products{};
@@ -261,6 +349,12 @@ inline bool ExactId(const StableIdentity& actual,
                     const std::string_view expected) noexcept
 {
   return actual == StableIdentity::Copy(expected);
+}
+
+inline std::uint64_t AcquireCudaFacadeIncarnation() noexcept
+{
+  static std::atomic<std::uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
 }
 
 template <typename Selection>
@@ -300,7 +394,8 @@ public:
   using state_slot = typename contract_type::state_slot;
 
   explicit PersistentCudaSmoothEulerEngine(const CudaConfig& config) noexcept
-      : config_(config)
+      : config_(config), facade_incarnation_(
+            detail::AcquireCudaFacadeIncarnation())
   {
     static_assert(!std::is_polymorphic<Selection>::value,
                   "CUDA selection must remain static");
@@ -308,6 +403,27 @@ public:
                   "CUDA allocator policy must remain static");
     static_assert(!std::is_polymorphic<TransportPolicy>::value,
                   "CUDA transport policy must remain static");
+    static_assert(!std::is_copy_constructible<
+                      typename contract_type::StagingToken>::value &&
+                      std::is_move_constructible<
+                          typename contract_type::StagingToken>::value &&
+                      !std::is_move_assignable<
+                          typename contract_type::StagingToken>::value,
+                  "staging authority must remain affine");
+    static_assert(!std::is_copy_constructible<
+                      typename contract_type::PreparedCommitToken>::value &&
+                      std::is_move_constructible<
+                          typename contract_type::PreparedCommitToken>::value &&
+                      !std::is_move_assignable<
+                          typename contract_type::PreparedCommitToken>::value,
+                  "prepared-commit authority must remain affine");
+    static_assert(!std::is_copy_constructible<
+                      typename contract_type::ProvisionalCommitToken>::value &&
+                      std::is_move_constructible<
+                          typename contract_type::ProvisionalCommitToken>::value &&
+                      !std::is_move_assignable<
+                          typename contract_type::ProvisionalCommitToken>::value,
+                  "provisional-commit authority must remain affine");
   }
 
   PersistentCudaSmoothEulerEngine(const PersistentCudaSmoothEulerEngine&) =
@@ -318,7 +434,13 @@ public:
   bool Initialize(CudaRunEvidence& evidence) noexcept
   {
     evidence = {};
-    if (!ValidateConfig() ||
+    AllocatorPolicy::ResetLedger();
+    const int local_config = ValidateConfig() ? 1 : 0;
+    int global_config = 0;
+    const bool config_agreed = MPI_Allreduce(
+        &local_config, &global_config, 1, MPI_INT, MPI_MIN,
+        MPI_COMM_WORLD) == MPI_SUCCESS && global_config == 1;
+    if (!config_agreed || facade_incarnation_ == 0 ||
         !numerics_.Initialize(config_, evidence, Selection::Descriptor()))
     {
       evidence.status = CudaRunStatus::setup_failure;
@@ -339,76 +461,321 @@ public:
     return true;
   }
 
-  /**
-   * Complete all fallible numerical work and expose immutable candidate
-   * coordinates/hashes without publishing contract state.  Shared output and
-   * checkpoint staging must occur after this call and before FinalizePrepared.
-   */
+  /** Complete numerical work, freeze the contract candidate, and retain the
+   * affine staging token internally.  No rank may stage before the final
+   * all-rank prestaging agreement in this call. */
   bool PrepareStep(const bool retry, CudaPrecommitSnapshot& snapshot,
                    CudaStepEvidence& evidence) noexcept
   {
     snapshot = {};
     if (pending_.active || !initialized_) { return false; }
     if (!PreparePending(retry, evidence)) { return false; }
+    if (!pending_.staging) { return false; }
     snapshot.attempt = pending_.attempt;
-    snapshot.committed = evidence.before;
-    snapshot.target = {evidence.before.time + config_.dt,
-                       evidence.before.step + 1,
-                       evidence.before.generation + 1,
-                       pending_.attempt.sequence,
-                       config_.dt};
-    snapshot.candidate_interior_hash =
-        pending_.candidate_interior_hash;
+    snapshot.committed = pending_.staging->entry_coordinates();
+    snapshot.target = pending_.staging->target_coordinates();
+    snapshot.candidate_interior_hash = pending_.candidate_interior_hash;
     snapshot.candidate_trace_hash = pending_.candidate_trace_hash;
+    snapshot.candidate_local_interior_hash =
+        pending_.candidate_local_interior_hash;
+    snapshot.candidate_local_trace_hash =
+        pending_.candidate_local_trace_hash;
     snapshot.products = pending_.numerical.products;
-    snapshot.interior_coefficients =
-        numerics_.WorkspaceSlot().interior.count;
+    snapshot.interior_coefficients = numerics_.WorkspaceSlot().interior.count;
     snapshot.true_trace_coefficients = numerics_.WorkspaceSlot().trace.count;
     snapshot.completed_phase = pending_.numerical.phase;
     snapshot.numerical_candidate_ready = pending_.numerical.candidate_ready;
     return true;
   }
 
-  /** Record that checkpoint and output artifacts are staged and immutable. */
-  bool MarkPreparedStagingReady(const AttemptIdentity& attempt) noexcept
+  /** Token-validated candidate copy followed by real D2H checkpoint staging. */
+  bool StagePreparedCheckpoint(CudaSerializedCheckpointV1& checkpoint,
+                               CudaStepEvidence& evidence) noexcept
   {
-    if (!pending_.active || !contract_->IsCurrentAttempt(attempt))
+    checkpoint = {};
+    if (!pending_.active || !pending_.staging ||
+        !pending_.prestage_allowed)
       return false;
-    pending_.staging_ready = true;
+    checkpoint.attempt = pending_.attempt;
+    checkpoint.facade_incarnation = facade_incarnation_;
+    checkpoint.descriptor = pending_.staging->future_checkpoint();
+    checkpoint.candidate_frozen = true;
+    const std::uint64_t staging_begin =
+        TransportPolicy::Ledger().observed_count + 1;
+    storage_policy::SetCopyOutPurpose(
+        detail::CudaCopyOutPurpose::checkpoint_staging);
+    state_slot& staging_slot = numerics_.WorkspaceSlot();
+    const bool token_copy = contract_->CopyPrepared(
+        *pending_.staging, staging_slot);
+    storage_policy::SetCopyOutPurpose(detail::CudaCopyOutPurpose::none);
+    const bool local_staged = token_copy &&
+        numerics_.StageCheckpoint(staging_slot, checkpoint);
+    const bool all_staged = numerics_.CollectiveContinue(local_staged);
+    pending_.checkpoint_staged = all_staged;
+    if (!all_staged)
+    {
+      pending_.prestage_allowed = false;
+      pending_.report.originating_failure = FailureReason::backend_failure;
+      pending_.report.gates.success = false;
+    }
+    UpdateAttemptEvidence(pending_.evidence);
+    const CudaTransferLedgerV1 ledger = TransportPolicy::Ledger();
+    checkpoint.staging_range.begin_ordinal = staging_begin;
+    checkpoint.staging_range.end_ordinal = ledger.observed_count;
+    checkpoint.staging_range.ordered_digest = RangeDigest(
+        ledger, staging_begin, ledger.observed_count);
+    checkpoint.staging_range.complete = all_staged && !ledger.overflow &&
+        ledger.observed_count + 1 >= staging_begin;
+    evidence = pending_.evidence;
+    return all_staged;
+  }
+
+  /** Freeze the independent oracle bytes during the same candidate epoch. */
+  bool StagePreparedOracle(CudaOraclePod& pod,
+                           CudaStepEvidence& evidence) noexcept
+  {
+    pod = {};
+    if (!pending_.active || !pending_.staging ||
+        !pending_.prestage_allowed || !pending_.checkpoint_staged)
+      return false;
+    const bool local_export = numerics_.ExportOracle(pod);
+    const bool all_exported = numerics_.CollectiveContinue(local_export);
+    pending_.oracle_staged = all_exported;
+    if (all_exported)
+    {
+      pending_.oracle = pod;
+      pending_.has_oracle = true;
+    }
+    else
+    {
+      pending_.prestage_allowed = false;
+      pending_.report.originating_failure = FailureReason::backend_failure;
+      pending_.report.gates.success = false;
+    }
+    UpdateAttemptEvidence(pending_.evidence);
+    evidence = pending_.evidence;
+    return all_exported;
+  }
+
+  /** A caller invokes this only after its output artifact is staged. */
+  bool MarkOutputStaged(CudaSerializedCheckpointV1& checkpoint) noexcept
+  {
+    if (!pending_.active || !pending_.staging ||
+        !pending_.prestage_allowed || !pending_.checkpoint_staged ||
+        checkpoint.facade_incarnation != facade_incarnation_ ||
+        checkpoint.attempt.sequence != pending_.attempt.sequence ||
+        !dg::hdg::runtime::detail::SameCheckpoint(
+            checkpoint.descriptor, pending_.staging->future_checkpoint()))
+      return false;
+    checkpoint.output_staged = true;
+    pending_.output_staged = true;
     return true;
   }
 
-  /** Abort already-staged outer artifacts, then consume the live attempt by rollback. */
-  bool AbortPrepared(const FailureReason reason,
+  /** Consume StagingToken and retain PreparedCommitToken internally. */
+  bool PrepareCommit(CudaSerializedCheckpointV1& checkpoint,
                      CudaStepEvidence& evidence) noexcept
   {
-    if (!pending_.active) { return false; }
-    // Non-source ranks pass none while participating in the same collective
-    // abort. A source rank supplies the concrete staging failure.
-    if (reason != FailureReason::none)
+    const bool local_staging = pending_.active && pending_.staging.has_value();
+    if (!numerics_.CollectiveContinue(local_staging))
+      return RetainAffineProtocolFailure(evidence);
+    const bool success_path = pending_.prestage_allowed &&
+        pending_.checkpoint_staged && pending_.output_staged &&
+        (!config_.capture_oracle || pending_.oracle_staged);
+    if (!success_path &&
+        pending_.report.originating_failure == FailureReason::none)
     {
-      pending_.report.originating_failure = reason;
+      pending_.report.originating_failure = FailureReason::backend_failure;
       pending_.report.gates.success = false;
     }
-    return CompletePrepared(evidence);
+    const bool copies_complete = TransportPolicy::Synchronize(
+        CudaTransferSite::checkpoint_stage_trace);
+    if (!numerics_.CollectiveContinue(copies_complete))
+    {
+      pending_.report.originating_failure = FailureReason::backend_failure;
+      pending_.report.gates.success = false;
+    }
+    UpdateAttemptEvidence(pending_.evidence);
+    UpdateSharedAccounting();
+    auto prepared = contract_->PrepareCommit(
+        std::move(*pending_.staging), pending_.report,
+        std::move(pending_.bundle));
+    pending_.staging.reset();
+    if (!prepared)
+    {
+      const AttemptOutcome outcome{
+          contract_->status(), contract_->last_failure(), false,
+          contract_->status() == RunStatus::retry_available};
+      FinishOutcome(outcome, pending_.evidence);
+      evidence = pending_.evidence;
+      AbortStagedArtifacts(checkpoint);
+      ClearConsumedPending();
+      return outcome.retry_available;
+    }
+    pending_.prepared_checkpoint = prepared->checkpoint_descriptor();
+    pending_.prepared.emplace(std::move(*prepared));
+    evidence = pending_.evidence;
+    return true;
   }
 
-  /**
-   * Publish contract state only after every fallible outer staging operation
-   * has succeeded.  There is intentionally no fallible post-finalize hook.
-   * A true atomic state+artifact Commit failure remains impossible until the
-   * CudaFutureSharedAbiRequest contract extension is coordinator-owned.
-   */
-  bool FinalizePrepared(CudaStepEvidence& evidence) noexcept
+  /** Reversible whole-slot exchange; old logical publication remains visible. */
+  bool CommitPrepared(CudaSerializedCheckpointV1& checkpoint,
+                      CudaStepEvidence& evidence) noexcept
   {
-    return pending_.active && pending_.staging_ready &&
-        CompletePrepared(evidence);
+    const bool local_prepared = pending_.active && pending_.prepared.has_value();
+    if (!numerics_.CollectiveContinue(local_prepared))
+      return RetainAffineProtocolFailure(evidence);
+    const bool branch_agreed = numerics_.CollectiveContinue(
+        pending_.checkpoint_staged && pending_.output_staged);
+    if (!branch_agreed)
+      return AbortPrepared(checkpoint, FailureReason::collective_protocol,
+                           evidence);
+    auto provisional = contract_->CommitPrepared(std::move(*pending_.prepared));
+    pending_.prepared.reset();
+    if (!provisional) { return false; }
+    pending_.provisional.emplace(std::move(*provisional));
+    evidence = pending_.evidence;
+    return true;
   }
 
-  bool ExportOracle(CudaOraclePod& pod) noexcept
+  /** Sole logical publication boundary; no fallible CUDA or staging hook follows. */
+  bool FinalizeCommit(CudaSerializedCheckpointV1& checkpoint,
+                      CudaStepEvidence& evidence) noexcept
   {
-    return initialized_ && numerics_.ExportOracle(pod);
+    const bool local_provisional =
+        pending_.active && pending_.provisional.has_value();
+    if (!numerics_.CollectiveContinue(local_provisional))
+      return RetainAffineProtocolFailure(evidence);
+    const bool local_artifacts_publishable = checkpoint.checkpoint_staged &&
+        checkpoint.output_staged &&
+        checkpoint.facade_incarnation == facade_incarnation_ &&
+        checkpoint.attempt.sequence == pending_.attempt.sequence &&
+        dg::hdg::runtime::detail::SameCheckpoint(
+            checkpoint.descriptor, pending_.prepared_checkpoint);
+    if (!numerics_.CollectiveContinue(local_artifacts_publishable))
+    {
+      return RevertCommit(checkpoint, FailureReason::collective_protocol,
+                          evidence);
+    }
+    if (!local_artifacts_publishable)
+      return false;
+    const AttemptOutcome outcome =
+        contract_->FinalizeCommit(std::move(*pending_.provisional));
+    pending_.provisional.reset();
+    checkpoint.successful_commit = outcome.committed;
+    FinishOutcome(outcome, pending_.evidence);
+    if (pending_.has_oracle)
+    {
+      last_oracle_ = pending_.oracle;
+      last_oracle_valid_ = true;
+    }
+    evidence = pending_.evidence;
+    ClearConsumedPending();
+    return outcome.committed;
   }
+
+  /** FailureReason::none is normalized to backend_failure and cannot commit. */
+  bool AbortPrepared(CudaSerializedCheckpointV1& checkpoint,
+                     FailureReason reason,
+                     CudaStepEvidence& evidence) noexcept
+  {
+    if (reason == FailureReason::none) { reason = FailureReason::backend_failure; }
+    const int local_phase = !pending_.active ? 0 :
+        (pending_.staging ? 1 : (pending_.prepared ? 2 : 0));
+    int agreed_phase = 0;
+    FailureReason agreed_reason = FailureReason::collective_protocol;
+    if (!CollectiveAffineDecision(local_phase, reason, agreed_phase,
+                                  agreed_reason))
+      return RetainAffineProtocolFailure(evidence);
+    reason = agreed_reason;
+    pending_.prestage_allowed = false;
+    pending_.report.originating_failure = reason;
+    pending_.report.gates.success = false;
+    if (agreed_phase == 1) { return PrepareCommit(checkpoint, evidence); }
+    if (agreed_phase != 2) { return RetainAffineProtocolFailure(evidence); }
+    const AttemptOutcome outcome =
+        contract_->AbortPrepared(std::move(*pending_.prepared), reason);
+    pending_.prepared.reset();
+    FinishOutcome(outcome, pending_.evidence);
+    evidence = pending_.evidence;
+    AbortStagedArtifacts(checkpoint);
+    ClearConsumedPending();
+    return outcome.retry_available;
+  }
+
+  bool RevertCommit(CudaSerializedCheckpointV1& checkpoint,
+                    FailureReason reason,
+                    CudaStepEvidence& evidence) noexcept
+  {
+    if (reason == FailureReason::none) { reason = FailureReason::backend_failure; }
+    const int local_phase = pending_.active && pending_.provisional ? 3 : 0;
+    int agreed_phase = 0;
+    FailureReason agreed_reason = FailureReason::collective_protocol;
+    if (!CollectiveAffineDecision(local_phase, reason, agreed_phase,
+                                  agreed_reason) || agreed_phase != 3)
+      return RetainAffineProtocolFailure(evidence);
+    reason = agreed_reason;
+    const AttemptOutcome outcome =
+        contract_->RevertCommit(std::move(*pending_.provisional), reason);
+    pending_.provisional.reset();
+    AbortStagedArtifacts(checkpoint);
+    FinishOutcome(outcome, pending_.evidence);
+    evidence = pending_.evidence;
+    ClearConsumedPending();
+    return outcome.retry_available;
+  }
+
+  /** Deserialize rank-local bytes, recompute device hashes, then restore. */
+  bool Restore(const CudaSerializedCheckpointV1& checkpoint,
+               CudaStepEvidence& evidence) noexcept
+  {
+    evidence = {};
+    if (!initialized_ || pending_.active) { return false; }
+    evidence.before = contract_->coordinates();
+    CudaPolicyContext context{};
+    context.target_step = checkpoint.descriptor.coordinates.step;
+    context.generation = checkpoint.descriptor.coordinates.generation;
+    context.rank = numerics_.rank();
+    context.phase = CudaFailurePhase::setup;
+    evidence.transfer_range.begin_ordinal =
+        TransportPolicy::Ledger().observed_count + 1;
+    TransportPolicy::BeginAttempt(context);
+    state_slot& loaded = numerics_.WorkspaceSlot();
+    const bool imported = numerics_.ImportCheckpoint(checkpoint, loaded);
+    if (!imported)
+    {
+      evidence.status = CudaRunStatus::runtime_failure;
+      evidence.contract_reason = FailureReason::restart_incompatible;
+      UpdateAttemptEvidence(evidence);
+      return false;
+    }
+    const RestoreOutcome restored =
+        contract_->Restore(checkpoint.descriptor, loaded);
+    evidence.after = contract_->coordinates();
+    evidence.after_interior_hash = loaded.interior.hash;
+    evidence.after_trace_hash = loaded.trace.hash;
+    evidence.committed = restored.restored;
+    evidence.collective_consensus = restored.compatibility !=
+        RestartCompatibility::collective_protocol;
+    evidence.contract_reason = restored.restored ? FailureReason::none :
+        FailureReason::restart_incompatible;
+    evidence.status = restored.restored ? CudaRunStatus::committed :
+        CudaRunStatus::runtime_failure;
+    UpdateAttemptEvidence(evidence);
+    return restored.restored;
+  }
+
+  bool ExportOracle(CudaOraclePod& pod) const noexcept
+  {
+    if (!last_oracle_valid_) { return false; }
+    pod = last_oracle_;
+    return true;
+  }
+
+  CudaTransferLedgerV1 TransferLedger() const noexcept
+  { return TransportPolicy::Ledger(); }
+  CudaAllocationLedgerV1 AllocationLedger() const noexcept
+  { return AllocatorPolicy::Ledger(); }
 
   const contract_type* contract() const noexcept
   {
@@ -416,6 +783,162 @@ public:
   }
 
 private:
+  static void AbortStagedArtifacts(
+      CudaSerializedCheckpointV1& checkpoint) noexcept
+  {
+    checkpoint.candidate_frozen = false;
+    checkpoint.checkpoint_staged = false;
+    checkpoint.output_staged = false;
+    checkpoint.successful_commit = false;
+  }
+
+  bool CollectiveAffineDecision(const int local_phase,
+                                FailureReason local_reason,
+                                int& agreed_phase,
+                                FailureReason& agreed_reason) const noexcept
+  {
+    const auto reason_value = static_cast<unsigned>(local_reason);
+    if (reason_value == static_cast<unsigned>(FailureReason::none) ||
+        reason_value >= static_cast<unsigned>(FailureReason::count))
+      local_reason = FailureReason::collective_protocol;
+    const int local[2] = {local_phase, static_cast<int>(local_reason)};
+    int minimum[2] = {local[0], local[1]};
+    int maximum[2] = {local[0], local[1]};
+    const bool minimum_ready = MPI_Allreduce(
+        local, minimum, 2, MPI_INT, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        local, maximum, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+    int ranks = 0;
+    const bool size_ready =
+        MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS;
+    const bool agreed = minimum_ready && maximum_ready && size_ready &&
+        ranks == config_.expected_rank_count && minimum[0] == maximum[0] &&
+        minimum[1] == maximum[1] && minimum[0] != 0;
+    agreed_phase = agreed ? minimum[0] : 0;
+    agreed_reason = agreed ? static_cast<FailureReason>(minimum[1]) :
+        FailureReason::collective_protocol;
+    return agreed;
+  }
+
+  bool RetainAffineProtocolFailure(CudaStepEvidence& evidence) noexcept
+  {
+    if (pending_.active)
+    {
+      pending_.evidence.status = CudaRunStatus::terminal_failure;
+      pending_.evidence.contract_reason = FailureReason::collective_protocol;
+      pending_.evidence.collective_consensus = false;
+      UpdateAttemptEvidence(pending_.evidence);
+      evidence = pending_.evidence;
+    }
+    else
+    {
+      evidence.status = CudaRunStatus::terminal_failure;
+      evidence.contract_reason = FailureReason::collective_protocol;
+      evidence.collective_consensus = false;
+    }
+    // No frozen/prepared/provisional token is dropped or consumed here.  The
+    // facade becomes unusable until destroyed because c879 has no mixed-phase
+    // collective abort authority.
+    initialized_ = false;
+    return false;
+  }
+
+  static TransferAccounting ProjectSharedAccounting(
+      const CudaTransferTotals& totals,
+      const std::uint64_t allocation_events = 0) noexcept
+  {
+    // The frozen shared ABI has no D2D/event-count fields.  This is the exact
+    // representable projection only; the CUDA ledger/totals remain
+    // authoritative for D2D bytes and every event identity.
+    return {totals.host_to_device_bytes,
+            totals.device_to_host_bytes,
+            totals.mpi_staging_bytes,
+            allocation_events,
+            totals.synchronization_events,
+            totals.complete};
+  }
+
+  void UpdateSharedAccounting() noexcept
+  {
+    const std::uint64_t allocations = AllocatorPolicy::AllocationEvents() -
+        pending_.allocation_begin;
+    pending_.report.telemetry.transfers = ProjectSharedAccounting(
+        TransportPolicy::Accounting(), allocations);
+  }
+
+  static std::uint64_t RangeDigest(const CudaTransferLedgerV1& ledger,
+                                   const std::uint64_t begin,
+                                   const std::uint64_t end) noexcept
+  {
+    std::uint64_t digest = 1469598103934665603ULL;
+    for (std::size_t index = 0; index < ledger.count; ++index)
+    {
+      const TransferEventV1& event = ledger.events[index];
+      if (event.ordinal < begin || event.ordinal > end) { continue; }
+      digest ^= event.endpoint_token;
+      digest *= 1099511628211ULL;
+    }
+    return digest;
+  }
+
+  void UpdateAttemptEvidence(CudaStepEvidence& evidence) const noexcept
+  {
+    const CudaTransferLedgerV1 ledger = TransportPolicy::Ledger();
+    evidence.transfers = TransportPolicy::Accounting();
+    if (evidence.transfer_range.begin_ordinal == 0)
+      evidence.transfer_range.begin_ordinal = pending_.ledger_begin;
+    evidence.transfer_range.end_ordinal = ledger.observed_count;
+    evidence.transfer_range.ordered_digest = RangeDigest(
+        ledger, evidence.transfer_range.begin_ordinal,
+        evidence.transfer_range.end_ordinal);
+    evidence.transfer_range.complete = !ledger.overflow &&
+        evidence.transfers.complete &&
+        evidence.transfer_range.end_ordinal + 1 >=
+            evidence.transfer_range.begin_ordinal;
+  }
+
+  void FinishOutcome(const AttemptOutcome& outcome,
+                     CudaStepEvidence& evidence) noexcept
+  {
+    evidence.contract_reason = outcome.reason;
+    evidence.after = contract_->coordinates();
+    evidence.committed = outcome.committed;
+    evidence.retry_available = outcome.retry_available;
+    evidence.collective_consensus =
+        outcome.reason != FailureReason::collective_protocol;
+    evidence.after_interior_hash = outcome.committed
+        ? pending_.candidate_interior_hash : evidence.before_interior_hash;
+    evidence.after_trace_hash = outcome.committed
+        ? pending_.candidate_trace_hash : evidence.before_trace_hash;
+    evidence.committed_bytes_preserved = outcome.committed ||
+        (evidence.before_interior_hash == evidence.after_interior_hash &&
+         evidence.before_trace_hash == evidence.after_trace_hash);
+    evidence.coordinates_preserved = outcome.committed ||
+        (evidence.before.time == evidence.after.time &&
+         evidence.before.step == evidence.after.step &&
+         evidence.before.generation == evidence.after.generation &&
+         evidence.before.cursor == evidence.after.cursor);
+    evidence.status = outcome.committed ? CudaRunStatus::committed :
+        (outcome.retry_available ? CudaRunStatus::retry_available :
+         (pending_.numerical.injected ? CudaRunStatus::injected_failure :
+                                       CudaRunStatus::terminal_failure));
+    UpdateAttemptEvidence(evidence);
+  }
+
+  void ClearConsumedPending() noexcept
+  {
+    // Call only after the live affine token has been consumed.
+    pending_.staging.reset();
+    pending_.prepared.reset();
+    pending_.provisional.reset();
+    pending_.active = false;
+    pending_.prestage_allowed = false;
+    pending_.checkpoint_staged = false;
+    pending_.oracle_staged = false;
+    pending_.output_staged = false;
+    pending_.has_oracle = false;
+  }
+
   bool ValidateConfig() const noexcept
   {
     return config_.experiment == StableIdentity::Copy(experiment_id) &&
@@ -447,6 +970,8 @@ private:
     context.generation = evidence.before.generation + 1;
     context.rank = numerics_.rank();
     TransportPolicy::BeginAttempt(context);
+    pending_.ledger_begin = TransportPolicy::Ledger().observed_count + 1;
+    pending_.allocation_begin = AllocatorPolicy::AllocationEvents();
     const BeginOutcome begin = retry ? contract_->Retry() :
         contract_->BeginStep({InteriorSpace::l2, config_.dt});
     evidence.attempt = begin.attempt;
@@ -464,7 +989,11 @@ private:
     }
 
     state_slot& workspace = numerics_.WorkspaceSlot();
-    if (!contract_->CopyPublished(contract_->Published(), workspace) ||
+    storage_policy::SetCopyOutPurpose(detail::CudaCopyOutPurpose::attempt_seed);
+    const bool seed_ready = contract_->CopyPublished(
+        contract_->Published(), workspace);
+    storage_policy::SetCopyOutPurpose(detail::CudaCopyOutPurpose::none);
+    if (!numerics_.CollectiveContinue(seed_ready) ||
         !numerics_.PrepareAttempt(begin.attempt, workspace,
                                   evidence.before.step == 0 && !retry))
     {
@@ -479,15 +1008,22 @@ private:
     typename contract_type::ProductBundle bundle{};
     detail::CudaNumericalResult adjusted = numerical;
     IssueProducts(begin.attempt, adjusted, bundle);
+    bool stored = false;
     if (adjusted.candidate_ready)
     {
       const auto capability = contract_->AcquireCandidate(begin.attempt);
-      if (!capability || !contract_->StoreCandidate(*capability, workspace))
+      stored = capability && contract_->StoreCandidate(*capability, workspace);
+      if (!stored)
       {
         adjusted.success = false;
         adjusted.telemetry = false;
         adjusted.reason = FailureReason::candidate_preparation;
       }
+    }
+    if (!numerics_.CollectiveContinue(adjusted.candidate_ready && stored))
+    {
+      return FinishBackendFailure(begin.attempt, evidence,
+                                  CudaFailurePhase::after_recovery_before_commit);
     }
 
     const CudaTransferTotals totals = TransportPolicy::Accounting();
@@ -499,28 +1035,23 @@ private:
                     adjusted.telemetry && numerics_.NoFallback(),
                     adjusted.success};
     report.telemetry.identity = begin.attempt;
-    report.telemetry.transfers = {
-        totals.host_to_device_bytes,
-        totals.device_to_host_bytes,
-        totals.mpi_staging_bytes,
-        0,
-        totals.synchronization_events,
-        totals.complete};
+    report.telemetry.transfers = ProjectSharedAccounting(totals);
     report.telemetry.prohibited.fallback_events =
         numerics_.NoFallback() ? 0 : 1;
     report.telemetry.true_relative_residual = adjusted.true_relative_residual;
     report.candidate_cursor = begin.attempt.sequence;
-    report.originating_failure = adjusted.injected
-        ? FailureReason::backend_failure
-        : adjusted.reason;
+    report.originating_failure = adjusted.success ? FailureReason::none :
+        adjusted.reason;
     pending_.active = true;
-    pending_.staging_ready = false;
+    pending_.prestage_allowed = false;
     pending_.attempt = begin.attempt;
     pending_.report = report;
     pending_.bundle = std::move(bundle);
     pending_.numerical = adjusted;
     pending_.candidate_interior_hash = workspace.interior.hash;
     pending_.candidate_trace_hash = workspace.trace.hash;
+    pending_.candidate_local_interior_hash = workspace.interior.local_hash;
+    pending_.candidate_local_trace_hash = workspace.trace.local_hash;
     evidence.phase = adjusted.phase;
     evidence.contract_reason = adjusted.reason;
     evidence.after = evidence.before;
@@ -531,12 +1062,7 @@ private:
     evidence.true_relative_residual = adjusted.true_relative_residual;
     evidence.nonlinear_updates = adjusted.nonlinear_updates;
     evidence.trace_solves = adjusted.trace_solves;
-    evidence.source_rank =
-        config_.injection.enabled &&
-                config_.injection.target_step == evidence.before.step + 1 &&
-                begin.attempt.retry_index == 0
-            ? config_.injection.source_rank
-            : -1;
+    evidence.source_rank = adjusted.injection_source_rank;
     evidence.device_ticket_count = numerics_.TicketCount();
     std::copy_n(numerics_.Tickets().begin(), evidence.device_ticket_count,
                 evidence.device_tickets.begin());
@@ -547,59 +1073,42 @@ private:
     evidence.device_resident = numerics_.DeviceResident();
     evidence.status = CudaRunStatus::ready;
     pending_.evidence = evidence;
-    return true;
-  }
-
-  bool CompletePrepared(CudaStepEvidence& evidence) noexcept
-  {
-    if (!pending_.active) { return false; }
-    const detail::CudaNumericalResult numerical = pending_.numerical;
-    state_slot& workspace = numerics_.WorkspaceSlot();
-    // The numerical candidate has already been copied into the contract's
-    // private candidate slot. Restore this facade workspace to the published
-    // state before the irreversible FinishAttempt boundary. That makes the
-    // rollback audit copy part of the attempt telemetry and leaves no
-    // fallible post-publication transfer.
-    if (!contract_->CopyPublished(contract_->Published(), workspace))
+    auto staging = contract_->FreezeCandidate(begin.attempt,
+                                               report.candidate_cursor);
+    const bool frozen = static_cast<bool>(staging);
+    int frozen_ranks = 0;
+    const bool frozen_census = numerics_.CollectiveCount(frozen, frozen_ranks);
+    if (!frozen_census ||
+        (frozen_ranks != 0 && frozen_ranks != config_.expected_rank_count))
     {
-      pending_.report.originating_failure = FailureReason::backend_failure;
+      // The shared c879 API has no phase-polymorphic collective abort.  Retain
+      // any live affine authority; dropping it or entering different rollback
+      // APIs would be incorrect.  CudaFutureSharedAbiRequest records the exact
+      // minimal extension required for this terminal protocol condition.
+      if (staging) { pending_.staging.emplace(std::move(*staging)); }
+      pending_.report.originating_failure = FailureReason::collective_protocol;
       pending_.report.gates.success = false;
+      pending_.evidence.status = CudaRunStatus::terminal_failure;
+      pending_.evidence.contract_reason = FailureReason::collective_protocol;
+      pending_.evidence.collective_consensus = false;
+      UpdateAttemptEvidence(pending_.evidence);
+      evidence = pending_.evidence;
+      initialized_ = false;
+      return false;
     }
-    const CudaTransferTotals totals = TransportPolicy::Accounting();
-    pending_.report.telemetry.transfers = {
-        totals.host_to_device_bytes,
-        totals.device_to_host_bytes,
-        totals.mpi_staging_bytes,
-        0,
-        totals.synchronization_events,
-        totals.complete};
-    pending_.evidence.transfers = totals;
-    const AttemptOutcome outcome = contract_->FinishAttempt(
-        pending_.attempt, pending_.report, std::move(pending_.bundle));
+    if (!staging) { return FinishFrozenFailure(evidence); }
+    pending_.staging.emplace(std::move(*staging));
+    pending_.prestage_allowed = numerics_.CollectiveContinue(
+        adjusted.success && !adjusted.injected);
+    if (!pending_.prestage_allowed)
+    {
+      pending_.report.gates.success = false;
+      if (pending_.report.originating_failure == FailureReason::none)
+        pending_.report.originating_failure = FailureReason::backend_failure;
+    }
+    UpdateAttemptEvidence(pending_.evidence);
     evidence = pending_.evidence;
-    pending_.active = false;
-    evidence.contract_reason = outcome.reason;
-    evidence.after = contract_->coordinates();
-    evidence.committed = outcome.committed;
-    evidence.retry_available = outcome.retry_available;
-    evidence.collective_consensus = outcome.reason !=
-        FailureReason::collective_protocol;
-    evidence.after_interior_hash = outcome.committed
-        ? pending_.candidate_interior_hash : workspace.interior.hash;
-    evidence.after_trace_hash = outcome.committed
-        ? pending_.candidate_trace_hash : workspace.trace.hash;
-    evidence.committed_bytes_preserved = outcome.committed ||
-        (evidence.before_interior_hash == evidence.after_interior_hash &&
-         evidence.before_trace_hash == evidence.after_trace_hash);
-    evidence.coordinates_preserved = outcome.committed ||
-        (evidence.before.time == evidence.after.time &&
-         evidence.before.step == evidence.after.step &&
-         evidence.before.generation == evidence.after.generation);
-    evidence.status = outcome.committed ? CudaRunStatus::committed :
-        (outcome.retry_available ? CudaRunStatus::retry_available :
-         (numerical.injected ? CudaRunStatus::injected_failure :
-                               CudaRunStatus::terminal_failure));
-    return outcome.committed || outcome.retry_available;
+    return true;
   }
 
   void IssueProducts(const AttemptIdentity& attempt,
@@ -640,13 +1149,15 @@ private:
     AttemptReport report{};
     report.gates = {};
     report.telemetry.identity = attempt;
-    report.telemetry.transfers.complete = true;
+    report.telemetry.transfers = ProjectSharedAccounting(
+        TransportPolicy::Accounting(),
+        AllocatorPolicy::AllocationEvents() - pending_.allocation_begin);
     report.telemetry.true_relative_residual =
         std::numeric_limits<double>::infinity();
     report.candidate_cursor = attempt.sequence;
     report.originating_failure = FailureReason::backend_failure;
     pending_.active = true;
-    pending_.staging_ready = false;
+    pending_.prestage_allowed = false;
     pending_.attempt = attempt;
     pending_.report = report;
     pending_.bundle = {};
@@ -657,28 +1168,63 @@ private:
     evidence.contract_reason = FailureReason::backend_failure;
     evidence.after = evidence.before;
     pending_.evidence = evidence;
-    return true;
+    const AttemptOutcome outcome = contract_->FinishAttempt(
+        attempt, report, std::move(pending_.bundle));
+    FinishOutcome(outcome, pending_.evidence);
+    evidence = pending_.evidence;
+    ClearConsumedPending();
+    return false;
+  }
+
+  bool FinishFrozenFailure(CudaStepEvidence& evidence) noexcept
+  {
+    pending_.report.originating_failure = FailureReason::collective_protocol;
+    pending_.report.gates.success = false;
+    UpdateSharedAccounting();
+    const AttemptOutcome outcome = contract_->FinishAttempt(
+        pending_.attempt, pending_.report, std::move(pending_.bundle));
+    FinishOutcome(outcome, pending_.evidence);
+    evidence = pending_.evidence;
+    ClearConsumedPending();
+    return false;
   }
 
   struct PendingAttempt
   {
     bool active = false;
-    bool staging_ready = false;
+    bool prestage_allowed = false;
+    bool checkpoint_staged = false;
+    bool oracle_staged = false;
+    bool output_staged = false;
+    bool has_oracle = false;
     AttemptIdentity attempt{};
     AttemptReport report{};
     typename contract_type::ProductBundle bundle{};
+    std::optional<typename contract_type::StagingToken> staging{};
+    std::optional<typename contract_type::PreparedCommitToken> prepared{};
+    std::optional<typename contract_type::ProvisionalCommitToken>
+        provisional{};
     detail::CudaNumericalResult numerical{};
     CudaStepEvidence evidence{};
     StateHash candidate_interior_hash{};
     StateHash candidate_trace_hash{};
+    StateHash candidate_local_interior_hash{};
+    StateHash candidate_local_trace_hash{};
+    CheckpointDescriptor prepared_checkpoint{};
+    std::uint64_t ledger_begin = 0;
+    std::uint64_t allocation_begin = 0;
+    CudaOraclePod oracle{};
   };
 
   CudaConfig config_{};
   detail::CudaPersistentNumerics<AllocatorPolicy, TransportPolicy> numerics_{};
   std::optional<contract_type> contract_{};
   PendingAttempt pending_{};
+  CudaOraclePod last_oracle_{};
   std::uint64_t next_attempt_sequence_ = 0;
+  std::uint64_t facade_incarnation_ = 0;
   bool initialized_ = false;
+  bool last_oracle_valid_ = false;
 };
 
 } // namespace dg::hdg::runtime::cuda_w8a

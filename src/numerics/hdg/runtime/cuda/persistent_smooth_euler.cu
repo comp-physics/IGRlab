@@ -24,8 +24,12 @@ std::atomic<std::uint64_t> deallocation_events{0};
 std::atomic<std::uint64_t> allocator_growth_events{0};
 std::atomic<std::size_t> mfem_highwater{0};
 std::atomic<std::size_t> hypre_highwater{0};
+std::atomic<std::uint64_t> allocation_ordinal{0};
+std::atomic<std::uint64_t> allocation_generation{0};
+CudaAllocationLedgerV1 allocation_ledger{};
 thread_local CudaPolicyContext transport_context{};
-thread_local CudaTransferTotals transport_totals{};
+thread_local CudaTransferLedgerV1 transport_ledger{};
+thread_local CudaTransferTotals transport_attempt_totals{};
 
 bool Copy(void* destination, const void* source, const std::size_t bytes,
           const cudaMemcpyKind kind) noexcept
@@ -33,6 +37,164 @@ bool Copy(void* destination, const void* source, const std::size_t bytes,
   return bytes == 0 || (destination != nullptr && source != nullptr &&
       cudaMemcpyAsync(destination, source, bytes, kind, nullptr) ==
           cudaSuccess);
+}
+
+template <typename T>
+void MixScalar(std::uint64_t& hash, T value) noexcept;
+
+std::uint64_t EndpointToken(const CudaTransferDirection direction,
+                            const CudaTransferCategory category,
+                            const CudaTransferSite site,
+                            const CudaPolicyContext& context,
+                            const std::uint64_t ordinal,
+                            const std::uintptr_t source,
+                            const std::uintptr_t destination,
+                            const std::size_t bytes,
+                            const std::size_t source_capacity,
+                            const std::size_t destination_capacity,
+                            const bool success) noexcept
+{
+  std::uint64_t token = 1469598103934665603ULL;
+  MixScalar(token, direction);
+  MixScalar(token, category);
+  MixScalar(token, site);
+  MixScalar(token, context.attempt_sequence);
+  MixScalar(token, context.target_step);
+  MixScalar(token, context.generation);
+  MixScalar(token, context.rank);
+  MixScalar(token, context.phase);
+  MixScalar(token, ordinal);
+  MixScalar(token, source);
+  MixScalar(token, destination);
+  MixScalar(token, bytes);
+  MixScalar(token, source_capacity);
+  MixScalar(token, destination_capacity);
+  MixScalar(token, success);
+  return token;
+}
+
+void RecordTransfer(const CudaTransferDirection direction,
+                    const CudaTransferCategory category,
+                    const CudaTransferSite site,
+                    const void* source,
+                    const void* destination,
+                    const std::size_t bytes,
+                    const std::size_t source_capacity,
+                    const std::size_t destination_capacity,
+                    const bool success) noexcept
+{
+  CudaTransferTotals& totals = transport_ledger.totals;
+  if (transport_ledger.observed_count ==
+      std::numeric_limits<std::uint64_t>::max())
+  {
+    transport_ledger.overflow = true;
+    transport_ledger.totals.complete = false;
+    transport_attempt_totals.complete = false;
+    return;
+  }
+  const std::uint64_t ordinal = ++transport_ledger.observed_count;
+  const auto account = [&](CudaTransferTotals& value)
+  {
+    if (value.event_count == std::numeric_limits<std::uint64_t>::max())
+    {
+      value.complete = false;
+      return;
+    }
+    ++value.event_count;
+    value.complete = value.complete && success;
+    if (!success) { return; }
+    auto add = [&](std::uint64_t& endpoint)
+    {
+      if (bytes > std::numeric_limits<std::uint64_t>::max() - endpoint)
+      {
+        value.complete = false;
+        return;
+      }
+      endpoint += static_cast<std::uint64_t>(bytes);
+    };
+    if (direction == CudaTransferDirection::host_to_device)
+      add(value.host_to_device_bytes);
+    else if (direction == CudaTransferDirection::device_to_host)
+      add(value.device_to_host_bytes);
+    else if (direction == CudaTransferDirection::device_to_device)
+      add(value.device_to_device_bytes);
+    else
+      add(value.mpi_staging_bytes);
+  };
+  account(totals);
+  account(transport_attempt_totals);
+  if (transport_ledger.count >= transport_ledger.events.size())
+  {
+    transport_ledger.overflow = true;
+    ++transport_ledger.dropped_count;
+    totals.complete = false;
+    transport_attempt_totals.complete = false;
+    return;
+  }
+  const std::size_t index = transport_ledger.count++;
+  const auto source_token = reinterpret_cast<std::uintptr_t>(source);
+  const auto destination_token = reinterpret_cast<std::uintptr_t>(destination);
+  const std::size_t exact_source_capacity =
+      source_capacity == 0 ? bytes : source_capacity;
+  const std::size_t exact_destination_capacity =
+      destination_capacity == 0 ? bytes : destination_capacity;
+  transport_ledger.events[index] = {
+      ordinal, direction, category, site, transport_context,
+      static_cast<std::uint64_t>(bytes), source_token,
+      destination_token,
+      static_cast<std::uint64_t>(exact_source_capacity),
+      static_cast<std::uint64_t>(exact_destination_capacity),
+      EndpointToken(direction, category, site, transport_context, ordinal,
+                    source_token, destination_token, bytes,
+                    exact_source_capacity, exact_destination_capacity,
+                    success),
+      success};
+  transport_ledger.ordered_digest ^=
+      transport_ledger.events[index].endpoint_token;
+  transport_ledger.ordered_digest *= 1099511628211ULL;
+}
+
+void RecordAllocation(const CudaAllocationSite site,
+                      const std::size_t bytes,
+                      const std::size_t alignment,
+                      void* pointer,
+                      const bool allocation,
+                      const bool success,
+                      const std::uint64_t retained_generation = 0) noexcept
+{
+  ++allocation_ledger.observed_count;
+  if (allocation_ledger.count >= allocation_ledger.events.size())
+  {
+    allocation_ledger.overflow = true;
+    ++allocation_ledger.dropped_count;
+    return;
+  }
+  const std::size_t index = allocation_ledger.count++;
+  const std::uint64_t ordinal = ++allocation_ordinal;
+  const std::uint64_t generation = allocation && success
+      ? ++allocation_generation : retained_generation;
+  allocation_ledger.events[index] = {
+      ordinal, site, transport_context, static_cast<std::uint64_t>(bytes),
+      static_cast<std::uint64_t>(alignment),
+      static_cast<std::uint64_t>(bytes),
+      reinterpret_cast<std::uintptr_t>(pointer), generation, allocation,
+      success};
+  std::uint64_t event_digest = 1469598103934665603ULL;
+  MixScalar(event_digest, ordinal);
+  MixScalar(event_digest, site);
+  MixScalar(event_digest, transport_context.attempt_sequence);
+  MixScalar(event_digest, transport_context.target_step);
+  MixScalar(event_digest, transport_context.generation);
+  MixScalar(event_digest, transport_context.rank);
+  MixScalar(event_digest, transport_context.phase);
+  MixScalar(event_digest, bytes);
+  MixScalar(event_digest, alignment);
+  MixScalar(event_digest, reinterpret_cast<std::uintptr_t>(pointer));
+  MixScalar(event_digest, generation);
+  MixScalar(event_digest, allocation);
+  MixScalar(event_digest, success);
+  allocation_ledger.ordered_digest ^= event_digest;
+  allocation_ledger.ordered_digest *= 1099511628211ULL;
 }
 
 void Mix(std::uint64_t& hash, const void* data, const std::size_t size) noexcept
@@ -106,6 +268,14 @@ bool ReduceMask(const std::uint64_t local, std::uint64_t& global) noexcept
                        MPI_COMM_WORLD) == MPI_SUCCESS;
 }
 
+bool AllRanksReady(const bool local) noexcept
+{
+  const int local_value = local ? 1 : 0;
+  int global_value = 0;
+  return MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN,
+                       MPI_COMM_WORLD) == MPI_SUCCESS && global_value == 1;
+}
+
 void ObserveHighwater(std::atomic<std::size_t>& endpoint,
                       const std::size_t current) noexcept
 {
@@ -118,32 +288,70 @@ void ObserveHighwater(std::atomic<std::size_t>& endpoint,
 
 bool UmpireDeviceAllocatorPolicy::Allocate(
     const std::size_t bytes, const std::size_t alignment,
-    const CudaAllocationSite, void*& pointer) noexcept
+    const CudaAllocationSite site, void*& pointer) noexcept
 {
   pointer = nullptr;
-  if (bytes == 0 || alignment > alignof(std::max_align_t)) { return false; }
+  if (bytes == 0 || alignment == 0 ||
+      (alignment & (alignment - 1)) != 0 ||
+      alignment > alignof(std::max_align_t))
+  {
+    RecordAllocation(site, bytes, alignment, nullptr, true, false);
+    return false;
+  }
 #if defined(MFEM_USE_UMPIRE) && defined(HYPRE_USING_UMPIRE)
   try
   {
     auto& manager = umpire::ResourceManager::getInstance();
     const char* name = mfem::MemoryManager::GetUmpireDeviceAllocatorName();
     if (name == nullptr || name[0] == '\0' || !manager.isAllocator(name))
+    {
+      RecordAllocation(site, bytes, alignment, nullptr, true, false);
       return false;
+    }
     pointer = manager.getAllocator(name).allocate(bytes);
+    if (pointer != nullptr &&
+        reinterpret_cast<std::uintptr_t>(pointer) % alignment != 0)
+    {
+      manager.getAllocator(name).deallocate(pointer);
+      pointer = nullptr;
+    }
     if (pointer != nullptr) { ++allocation_events; }
+    RecordAllocation(site, bytes, alignment, pointer, true,
+                     pointer != nullptr);
     return pointer != nullptr;
   }
-  catch (...) { return false; }
+  catch (...)
+  {
+    RecordAllocation(site, bytes, alignment, nullptr, true, false);
+    return false;
+  }
 #else
   (void)bytes;
+  RecordAllocation(site, bytes, alignment, nullptr, true, false);
   return false;
 #endif
 }
 
 void UmpireDeviceAllocatorPolicy::Deallocate(
-    void* pointer, const CudaAllocationSite) noexcept
+    void* pointer, const CudaAllocationSite site) noexcept
 {
   if (pointer == nullptr) { return; }
+  std::uint64_t original_bytes = 0;
+  std::uint64_t original_alignment = 0;
+  std::uint64_t original_generation = 0;
+  const auto token = reinterpret_cast<std::uintptr_t>(pointer);
+  for (std::size_t index = allocation_ledger.count; index > 0; --index)
+  {
+    const AllocationEventV1& event = allocation_ledger.events[index - 1];
+    if (event.allocation && event.success && event.storage_token == token)
+    {
+      original_bytes = event.bytes;
+      original_alignment = event.alignment;
+      original_generation = event.generation;
+      break;
+    }
+  }
+  bool success = false;
 #if defined(MFEM_USE_UMPIRE) && defined(HYPRE_USING_UMPIRE)
   try
   {
@@ -153,10 +361,20 @@ void UmpireDeviceAllocatorPolicy::Deallocate(
     {
       manager.getAllocator(name).deallocate(pointer);
       ++deallocation_events;
+      success = true;
     }
   }
   catch (...) {}
 #endif
+  RecordAllocation(site, static_cast<std::size_t>(original_bytes),
+                   static_cast<std::size_t>(original_alignment), pointer,
+                   false, success, original_generation);
+}
+
+void UmpireDeviceAllocatorPolicy::ResetLedger() noexcept
+{
+  allocation_ledger = {};
+  allocation_ordinal = 0;
 }
 
 std::uint64_t UmpireDeviceAllocatorPolicy::AllocationEvents() noexcept
@@ -199,11 +417,23 @@ bool UmpireDeviceAllocatorPolicy::DevicePoolPolicyValid() noexcept
 #endif
 }
 
+CudaAllocationLedgerV1 UmpireDeviceAllocatorPolicy::Ledger() noexcept
+{
+  return allocation_ledger;
+}
+
+void CudaTransportPolicy::ResetLedger() noexcept
+{
+  transport_context = {};
+  transport_ledger = {};
+  transport_attempt_totals = {};
+}
+
 void CudaTransportPolicy::BeginAttempt(
     const CudaPolicyContext& context) noexcept
 {
   transport_context = context;
-  transport_totals = {};
+  transport_attempt_totals = {};
 }
 
 void CudaTransportPolicy::SetPhase(const CudaFailurePhase phase,
@@ -215,54 +445,80 @@ void CudaTransportPolicy::SetPhase(const CudaFailurePhase phase,
 
 bool CudaTransportPolicy::HostToDevice(
     void* destination, const void* source, const std::size_t bytes,
-    const CudaTransferCategory, const CudaTransferSite) noexcept
+    const CudaTransferCategory category, const CudaTransferSite site,
+    const std::size_t source_capacity,
+    const std::size_t destination_capacity) noexcept
 {
   const bool success = Copy(destination, source, bytes, cudaMemcpyHostToDevice);
-  transport_totals.host_to_device_bytes += success ? bytes : 0;
-  ++transport_totals.event_count;
-  transport_totals.complete = transport_totals.complete && success;
+  RecordTransfer(CudaTransferDirection::host_to_device, category, site,
+                 source, destination, bytes, source_capacity,
+                 destination_capacity, success);
   return success;
 }
 
 bool CudaTransportPolicy::DeviceToHost(
     void* destination, const void* source, const std::size_t bytes,
-    const CudaTransferCategory, const CudaTransferSite) noexcept
+    const CudaTransferCategory category, const CudaTransferSite site,
+    const std::size_t source_capacity,
+    const std::size_t destination_capacity) noexcept
 {
   const bool success = Copy(destination, source, bytes, cudaMemcpyDeviceToHost);
-  transport_totals.device_to_host_bytes += success ? bytes : 0;
-  ++transport_totals.event_count;
-  transport_totals.complete = transport_totals.complete && success;
+  RecordTransfer(CudaTransferDirection::device_to_host, category, site,
+                 source, destination, bytes, source_capacity,
+                 destination_capacity, success);
   return success;
 }
 
 bool CudaTransportPolicy::DeviceToDevice(
     void* destination, const void* source, const std::size_t bytes,
-    const CudaTransferCategory, const CudaTransferSite) noexcept
+    const CudaTransferCategory category, const CudaTransferSite site,
+    const std::size_t source_capacity,
+    const std::size_t destination_capacity) noexcept
 {
   const bool success = Copy(destination, source, bytes, cudaMemcpyDeviceToDevice);
-  transport_totals.device_to_device_bytes += success ? bytes : 0;
-  ++transport_totals.event_count;
-  transport_totals.complete = transport_totals.complete && success;
+  RecordTransfer(CudaTransferDirection::device_to_device, category, site,
+                 source, destination, bytes, source_capacity,
+                 destination_capacity, success);
   return success;
 }
 
-void CudaTransportPolicy::RecordMpiStaging(
-    const std::size_t bytes, const CudaTransferSite) noexcept
+bool CudaTransportPolicy::RecordMpiStaging(
+    const std::size_t bytes, const CudaTransferCategory category,
+    const CudaTransferSite site, const void* source,
+    const void* destination, const std::size_t source_capacity,
+    const std::size_t destination_capacity, const bool success) noexcept
 {
-  transport_totals.mpi_staging_bytes += bytes;
-  ++transport_totals.event_count;
+  RecordTransfer(CudaTransferDirection::mpi_host_staging, category, site,
+                 source, destination, bytes, source_capacity,
+                 destination_capacity, success);
+  return success;
 }
 
 bool CudaTransportPolicy::Synchronize(const CudaTransferSite) noexcept
 {
   const bool success = cudaDeviceSynchronize() == cudaSuccess;
-  ++transport_totals.synchronization_events;
-  transport_totals.complete = transport_totals.complete && success;
+  if (transport_ledger.totals.synchronization_events !=
+      std::numeric_limits<std::uint64_t>::max())
+    ++transport_ledger.totals.synchronization_events;
+  else
+    transport_ledger.totals.complete = false;
+  if (transport_attempt_totals.synchronization_events !=
+      std::numeric_limits<std::uint64_t>::max())
+    ++transport_attempt_totals.synchronization_events;
+  else
+    transport_attempt_totals.complete = false;
+  transport_ledger.totals.complete =
+      transport_ledger.totals.complete && success;
+  transport_attempt_totals.complete =
+      transport_attempt_totals.complete && success;
   return success;
 }
 
 CudaTransferTotals CudaTransportPolicy::Accounting() noexcept
-{ return transport_totals; }
+{ return transport_attempt_totals; }
+
+CudaTransferLedgerV1 CudaTransportPolicy::Ledger() noexcept
+{ return transport_ledger; }
 
 CollectiveAdmissionReport CudaMpiCollectivePolicy::Admit(
     const AttemptCollectiveContext& context, const bool prepared,
@@ -332,25 +588,53 @@ CollectiveRestoreReport CudaMpiCollectivePolicy::ReduceRestore(
   report.identity_consistent = CollectiveHashConsensus(
       ContextHash(context), expected, report.participating_ranks);
   const auto index = static_cast<unsigned>(compatibility);
-  const std::uint64_t local_compatibility = index < 64 ? 1ULL << index : 0;
+  const int local_invalid =
+      index >= static_cast<unsigned>(RestartCompatibility::count) ? 1 : 0;
+  int any_invalid = local_invalid;
+  const bool invalid_reduced = MPI_Allreduce(
+      &local_invalid, &any_invalid, 1, MPI_INT, MPI_MAX,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  const std::uint64_t local_compatibility =
+      compatibility == RestartCompatibility::compatible ? 0ULL :
+      (index < static_cast<unsigned>(RestartCompatibility::count) &&
+       index < 64 ? 1ULL << index : 0ULL);
   const bool compatibility_reduced =
       ReduceMask(local_compatibility, report.compatibility_mask);
   const bool failure_reduced = ReduceMask(FailureBit(reason),
                                           report.failure_mask);
-  report.failure_consistent = compatibility_reduced && failure_reduced;
-  report.any_failure = compatibility != RestartCompatibility::compatible ||
+  report.failure_consistent = compatibility_reduced && failure_reduced &&
+      invalid_reduced;
+  report.any_failure = any_invalid != 0 || !report.identity_consistent ||
+      !report.failure_consistent || report.compatibility_mask != 0 ||
       report.failure_mask != 0;
   report.resolved_reason = !report.identity_consistent ||
           !report.failure_consistent
       ? FailureReason::collective_protocol
       : FirstFailure(report.failure_mask);
-  report.resolved_compatibility = compatibility;
-  if (report.compatibility_mask == 0 ||
-      (report.compatibility_mask & (report.compatibility_mask - 1)) != 0)
+  report.resolved_compatibility = RestartCompatibility::compatible;
+  if (any_invalid != 0)
   {
     report.resolved_compatibility = RestartCompatibility::collective_protocol;
     report.resolved_reason = FailureReason::collective_protocol;
   }
+  else if (report.compatibility_mask != 0 &&
+      (report.compatibility_mask & (report.compatibility_mask - 1)) == 0)
+  {
+    for (unsigned bit = 1;
+         bit < static_cast<unsigned>(RestartCompatibility::count) && bit < 64;
+         ++bit)
+      if ((report.compatibility_mask & (1ULL << bit)) != 0)
+        report.resolved_compatibility =
+            static_cast<RestartCompatibility>(bit);
+  }
+  else if (report.compatibility_mask != 0)
+  {
+    report.resolved_compatibility = RestartCompatibility::collective_protocol;
+    report.resolved_reason = FailureReason::collective_protocol;
+  }
+  if (report.any_failure &&
+      report.resolved_reason == FailureReason::none)
+    report.resolved_reason = FailureReason::restart_incompatible;
   return report;
 }
 
@@ -380,34 +664,46 @@ bool CudaGetTrueMatrixStructure(
     const HYPRE_Int* oi = hypre_CSRMatrixI(offd);
     const HYPRE_Int* oj = hypre_CSRMatrixJ(offd);
     const HYPRE_BigInt* cmap = hypre_ParCSRMatrixColMapOffd(raw);
-    if (copy_out == nullptr || synchronize == nullptr ||
-        !copy_out(structure.diag_offsets.data(), di,
-                  (owned_count + 1) * sizeof(HYPRE_Int),
-                  CudaTransferCategory::topology,
-                  CudaTransferSite::map_upload) ||
-        !copy_out(structure.diag_columns.data(), dj,
-                  structure.diag_nonzeros * sizeof(HYPRE_Int),
-                  CudaTransferCategory::topology,
-                  CudaTransferSite::map_upload) ||
-        !copy_out(structure.offd_offsets.data(), oi,
-                  (owned_count + 1) * sizeof(HYPRE_Int),
-                  CudaTransferCategory::topology,
-                  CudaTransferSite::map_upload) ||
-        !synchronize(CudaTransferSite::map_upload))
+    if (copy_out == nullptr || synchronize == nullptr) { return false; }
+    const std::size_t offset_bytes =
+        static_cast<std::size_t>(owned_count + 1) * sizeof(HYPRE_Int);
+    const std::size_t diag_column_bytes =
+        static_cast<std::size_t>(structure.diag_nonzeros) * sizeof(HYPRE_Int);
+    const bool diag_offsets_copied = copy_out(
+        structure.diag_offsets.data(), di, offset_bytes,
+        CudaTransferCategory::topology, CudaTransferSite::map_upload,
+        offset_bytes, structure.diag_offsets.size() * sizeof(HYPRE_Int));
+    const bool diag_columns_copied = copy_out(
+        structure.diag_columns.data(), dj, diag_column_bytes,
+        CudaTransferCategory::topology, CudaTransferSite::map_upload,
+        diag_column_bytes, structure.diag_columns.size() * sizeof(HYPRE_Int));
+    const bool offd_offsets_copied = copy_out(
+        structure.offd_offsets.data(), oi, offset_bytes,
+        CudaTransferCategory::topology, CudaTransferSite::map_upload,
+        offset_bytes, structure.offd_offsets.size() * sizeof(HYPRE_Int));
+    const bool first_synchronized = synchronize(CudaTransferSite::map_upload);
+    if (!diag_offsets_copied || !diag_columns_copied ||
+        !offd_offsets_copied || !first_synchronized)
       return false;
     std::array<HYPRE_Int, maximum_true_matrix_entries> offd_columns{};
     std::array<HYPRE_BigInt, maximum_true_matrix_entries> offd_global{};
     const int offd_column_count = hypre_CSRMatrixNumCols(offd);
-    if (offd_column_count > maximum_true_matrix_entries ||
-        !copy_out(offd_columns.data(), oj,
-                  structure.offd_nonzeros * sizeof(HYPRE_Int),
-                  CudaTransferCategory::topology,
-                  CudaTransferSite::map_upload) ||
-        !copy_out(offd_global.data(), cmap,
-                  offd_column_count * sizeof(HYPRE_BigInt),
-                  CudaTransferCategory::topology,
-                  CudaTransferSite::map_upload) ||
-        !synchronize(CudaTransferSite::map_upload))
+    if (offd_column_count > maximum_true_matrix_entries) { return false; }
+    const std::size_t offd_column_bytes =
+        static_cast<std::size_t>(structure.offd_nonzeros) * sizeof(HYPRE_Int);
+    const std::size_t offd_global_bytes =
+        static_cast<std::size_t>(offd_column_count) * sizeof(HYPRE_BigInt);
+    const bool offd_columns_copied = copy_out(
+        offd_columns.data(), oj, offd_column_bytes,
+        CudaTransferCategory::topology, CudaTransferSite::map_upload,
+        offd_column_bytes, offd_columns.size() * sizeof(HYPRE_Int));
+    const bool offd_global_copied = copy_out(
+        offd_global.data(), cmap, offd_global_bytes,
+        CudaTransferCategory::topology, CudaTransferSite::map_upload,
+        offd_global_bytes, offd_global.size() * sizeof(HYPRE_BigInt));
+    const bool second_synchronized = synchronize(CudaTransferSite::map_upload);
+    if (!offd_columns_copied || !offd_global_copied ||
+        !second_synchronized)
       return false;
     for (int entry = 0; entry < structure.offd_nonzeros; ++entry)
     {
@@ -486,13 +782,25 @@ bool CudaRefreshFactorAndSolve(
     CudaSolveDiagnostics& diagnostics) noexcept
 {
   diagnostics = {};
+  bool policy_ready = false;
   try
   {
-    if (!CudaHypreDevicePolicyValid(matrix, rhs, solution) ||
-        !CudaConfigurePersistentHypre(matrix, ilu, gmres, ranks))
-      return false;
+    policy_ready = CudaHypreDevicePolicyValid(matrix, rhs, solution) &&
+        CudaConfigurePersistentHypre(matrix, ilu, gmres, ranks);
+  }
+  catch (...) { policy_ready = false; }
+  if (!AllRanksReady(policy_ready)) { return false; }
+  bool vectors_ready = false;
+  try
+  {
     solution = 0.0;
     solution.HypreReadWrite();
+    vectors_ready = true;
+  }
+  catch (...) { vectors_ready = false; }
+  if (!AllRanksReady(vectors_ready)) { return false; }
+  try
+  {
     gmres.Mult(rhs, solution);
     diagnostics.device_policy =
         CudaHypreDevicePolicyValid(matrix, rhs, solution);

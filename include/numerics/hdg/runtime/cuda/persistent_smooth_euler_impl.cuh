@@ -117,7 +117,7 @@ struct CudaSolveDiagnostics
 
 using CudaCopyOutFunction = bool (*)(
     void*, const void*, std::size_t, CudaTransferCategory,
-    CudaTransferSite) noexcept;
+    CudaTransferSite, std::size_t, std::size_t) noexcept;
 using CudaSynchronizeFunction = bool (*)(CudaTransferSite) noexcept;
 
 bool CudaGetTrueMatrixStructure(mfem::HypreParMatrix& matrix,
@@ -237,28 +237,48 @@ public:
   bool Initialize(const CudaConfig& config, CudaRunEvidence& evidence,
                   const RuntimeTupleDescriptor& tuple) noexcept
   {
+    TransportPolicy::ResetLedger();
     CudaPolicyContext setup{};
     setup.phase = CudaFailurePhase::setup;
     TransportPolicy::BeginAttempt(setup);
-    if (!ConfigureDeviceAndRanks(config, evidence) ||
-        !BuildTopology(config) || !AllocateArenas() ||
-        !BindArenaViews() || !UploadTopologyAndState() ||
-        !BuildPersistentTrueSystem() || !BindStateSlots() ||
-        !VerifyResidencyAndTicket(evidence))
-    {
+    if (!CollectiveContinue(ConfigureDeviceAndRanks(config, evidence)))
       return false;
-    }
+    setup.rank = rank_;
+    TransportPolicy::BeginAttempt(setup);
+    if (!CollectiveContinue(BuildTopology(config))) { return false; }
+    const int local_ghost_count =
+        static_cast<int>(exchange_plan_.map.GhostCount());
+    std::array<int, 2> ghost_counts{};
+    const bool ghost_census_ready = MPI_Allgather(
+        &local_ghost_count, 1, MPI_INT, ghost_counts.data(), 1, MPI_INT,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    if (!CollectiveContinue(ghost_census_ready)) { return false; }
+    host_exchange_bytes_ = ranks_ == 2
+        ? static_cast<std::size_t>(ghost_counts[0] + ghost_counts[1]) *
+            sizeof(double)
+        : 0;
+    if (!CollectiveContinue(AllocateArenas())) { return false; }
+    if (!CollectiveContinue(BindArenaViews())) { return false; }
+    if (!CollectiveContinue(UploadTopologyAndState())) { return false; }
+    if (!CollectiveContinue(BuildPersistentTrueSystem())) { return false; }
+    if (!CollectiveContinue(BindStateSlots())) { return false; }
+    if (!CollectiveContinue(VerifyResidencyAndTicket(evidence)))
+      return false;
     resources_.mfem_pin = StableIdentity::Copy(
         "d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec");
-    resources_.mesh_hash = HashHostBytes(element_coordinate_keys_.data(),
+    local_mesh_hash_ = HashHostBytes(element_coordinate_keys_.data(),
         static_cast<std::size_t>(shape_.elements) * dimension *
             sizeof(std::int64_t));
-    resources_.partition_hash = HashHostBytes(owned_global_true_.data(),
+    local_partition_hash_ = HashHostBytes(owned_global_true_.data(),
         static_cast<std::size_t>(shape_.true_trace_count) *
             sizeof(std::int64_t));
-    resources_.topology_hash = HashHostBytes(signed_element_trace_.data(),
+    local_topology_hash_ = HashHostBytes(signed_element_trace_.data(),
         static_cast<std::size_t>(shape_.elements) * trace_dofs_per_element *
             sizeof(int));
+    if (!AggregateHash(local_mesh_hash_, resources_.mesh_hash) ||
+        !AggregateHash(local_partition_hash_, resources_.partition_hash) ||
+        !AggregateHash(local_topology_hash_, resources_.topology_hash))
+      return false;
     resources_.rank_count = static_cast<std::uint32_t>(ranks_);
     resources_.polynomial_order = polynomial_order;
     resources_.layout = StableIdentity::Copy("mfem.byNODES.vdim4.p1.n3");
@@ -297,9 +317,144 @@ public:
   int rank() const noexcept { return rank_; }
   bool NoFallback() const noexcept { return no_fallback_; }
   bool DeviceResident() const noexcept { return device_resident_; }
+  const StateHash& LocalMeshHash() const noexcept { return local_mesh_hash_; }
+  const StateHash& LocalPartitionHash() const noexcept
+  { return local_partition_hash_; }
+  const StateHash& LocalTopologyHash() const noexcept
+  { return local_topology_hash_; }
   const std::array<CudaDeviceTicket, maximum_device_tickets>& Tickets()
       const noexcept { return tickets_; }
   std::size_t TicketCount() const noexcept { return ticket_count_; }
+
+  bool CollectiveContinue(const bool local) const noexcept
+  {
+    int local_value = local ? 1 : 0;
+    int global_value = 0;
+    return MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN,
+                         MPI_COMM_WORLD) == MPI_SUCCESS && global_value == 1;
+  }
+
+  bool CollectiveCount(const bool local, int& count) const noexcept
+  {
+    const int local_value = local ? 1 : 0;
+    count = 0;
+    return MPI_Allreduce(&local_value, &count, 1, MPI_INT, MPI_SUM,
+                         MPI_COMM_WORLD) == MPI_SUCCESS;
+  }
+
+  bool StageCheckpoint(const state_slot& frozen,
+                       CudaSerializedCheckpointV1& checkpoint) noexcept
+  {
+    if (frozen.interior.coefficients == nullptr ||
+        frozen.trace.coefficients == nullptr ||
+        frozen.interior.count > checkpoint.interior.size() ||
+        frozen.trace.count > checkpoint.owned_true_trace.size())
+      return false;
+    checkpoint.source_rank = rank_;
+    checkpoint.rank_count = ranks_;
+    checkpoint.local_mesh_hash = local_mesh_hash_;
+    checkpoint.local_partition_hash = local_partition_hash_;
+    checkpoint.local_topology_hash = local_topology_hash_;
+    checkpoint.local_interior_hash = frozen.interior.local_hash;
+    checkpoint.local_trace_hash = frozen.trace.local_hash;
+    checkpoint.interior_count = frozen.interior.count;
+    checkpoint.owned_true_trace_count = frozen.trace.count;
+    checkpoint.interior_source_token = frozen.interior.storage_token;
+    checkpoint.trace_source_token = frozen.trace.storage_token;
+    checkpoint.staging_generation = frozen.interior.generation;
+    const bool interior_copied = TransportPolicy::DeviceToHost(
+            checkpoint.interior.data(), frozen.interior.coefficients,
+            frozen.interior.count * sizeof(double),
+            CudaTransferCategory::checkpoint_candidate_staging,
+            CudaTransferSite::checkpoint_stage_interior,
+            frozen.interior.count * sizeof(double),
+            checkpoint.interior.size() * sizeof(double));
+    const bool trace_copied = TransportPolicy::DeviceToHost(
+            checkpoint.owned_true_trace.data(), frozen.trace.coefficients,
+            frozen.trace.count * sizeof(double),
+            CudaTransferCategory::checkpoint_candidate_staging,
+            CudaTransferSite::checkpoint_stage_trace,
+            frozen.trace.count * sizeof(double),
+            checkpoint.owned_true_trace.size() * sizeof(double));
+    const bool synchronized =
+        TransportPolicy::Synchronize(CudaTransferSite::checkpoint_stage_trace);
+    const bool copied = interior_copied && trace_copied && synchronized;
+    if (!copied) { return false; }
+    const StateHash interior = HashHostBytes(
+        checkpoint.interior.data(),
+        frozen.interior.count * sizeof(double));
+    const StateHash trace = HashHostBytes(
+        checkpoint.owned_true_trace.data(),
+        frozen.trace.count * sizeof(double));
+    checkpoint.checkpoint_staged = interior == frozen.interior.local_hash &&
+        trace == frozen.trace.local_hash;
+    return checkpoint.checkpoint_staged;
+  }
+
+  bool ImportCheckpoint(const CudaSerializedCheckpointV1& checkpoint,
+                        state_slot& loaded) noexcept
+  {
+    const bool local_descriptor_valid = checkpoint.schema == 1 &&
+        checkpoint.successful_commit &&
+        checkpoint.rank_count == ranks_ && checkpoint.source_rank == rank_ &&
+        checkpoint.local_mesh_hash == local_mesh_hash_ &&
+        checkpoint.local_partition_hash == local_partition_hash_ &&
+        checkpoint.local_topology_hash == local_topology_hash_ &&
+        checkpoint.interior_count == loaded.interior.count &&
+        checkpoint.owned_true_trace_count == loaded.trace.count &&
+        checkpoint.interior_count <= checkpoint.interior.size() &&
+        checkpoint.owned_true_trace_count <=
+            checkpoint.owned_true_trace.size();
+    if (!CollectiveContinue(local_descriptor_valid)) { return false; }
+    const StateHash host_interior = HashHostBytes(
+        checkpoint.interior.data(),
+        checkpoint.interior_count * sizeof(double));
+    const StateHash host_trace = HashHostBytes(
+        checkpoint.owned_true_trace.data(),
+        checkpoint.owned_true_trace_count * sizeof(double));
+    const bool host_hashes_valid =
+        host_interior == checkpoint.local_interior_hash &&
+        host_trace == checkpoint.local_trace_hash;
+    if (!CollectiveContinue(host_hashes_valid)) { return false; }
+    const bool interior_copied = TransportPolicy::HostToDevice(
+            loaded.interior.coefficients, checkpoint.interior.data(),
+            checkpoint.interior_count * sizeof(double),
+            CudaTransferCategory::checkpoint_restore_import,
+            CudaTransferSite::checkpoint_import_interior,
+            checkpoint.interior.size() * sizeof(double),
+            loaded.interior.count * sizeof(double));
+    const bool trace_copied = TransportPolicy::HostToDevice(
+            loaded.trace.coefficients, checkpoint.owned_true_trace.data(),
+            checkpoint.owned_true_trace_count * sizeof(double),
+            CudaTransferCategory::checkpoint_restore_import,
+            CudaTransferSite::checkpoint_import_trace,
+            checkpoint.owned_true_trace.size() * sizeof(double),
+            loaded.trace.count * sizeof(double));
+    const bool synchronized =
+        TransportPolicy::Synchronize(CudaTransferSite::checkpoint_import_trace);
+    const bool copied = interior_copied && trace_copied && synchronized;
+    if (!CollectiveContinue(copied)) { return false; }
+    StateHash copied_interior{};
+    StateHash copied_trace{};
+    const bool local_hash_ready = HashState(
+        loaded.interior.coefficients, shape_.interior_count,
+        copied_interior) &&
+        HashState(loaded.trace.coefficients, shape_.true_trace_count,
+                  copied_trace);
+    const bool copied_hashes_valid = local_hash_ready &&
+        copied_interior == host_interior && copied_trace == host_trace;
+    if (!CollectiveContinue(copied_hashes_valid)) { return false; }
+    loaded.interior.local_hash = copied_interior;
+    loaded.trace.local_hash = copied_trace;
+    if (!AggregateHash(copied_interior, loaded.interior.hash) ||
+        !AggregateHash(copied_trace, loaded.trace.hash))
+      return false;
+    loaded.interior.generation = checkpoint.descriptor.coordinates.generation;
+    loaded.trace.generation = checkpoint.descriptor.coordinates.generation;
+    return CollectiveContinue(
+        loaded.interior.hash == checkpoint.descriptor.interior_hash &&
+        loaded.trace.hash == checkpoint.descriptor.trace_hash);
+  }
 
   CudaReuseEvidence ReuseEvidence() const noexcept
   {
@@ -333,32 +488,33 @@ public:
     current_generation_ = attempt.committed_generation + 1;
     ticket_count_ = 0;
     TransportPolicy::SetPhase(CudaFailurePhase::setup, current_generation_);
-    if (!TransportPolicy::DeviceToDevice(
+    bool local_ready = TransportPolicy::DeviceToDevice(
             view_.old_interior, workspace.interior.coefficients,
             workspace.interior.count * sizeof(double),
-            CudaTransferCategory::state_prepare,
-            CudaTransferSite::candidate_prepare_interior))
-      return false;
+            CudaTransferCategory::attempt_history,
+            CudaTransferSite::attempt_seed_interior);
     if (first_step)
     {
-      if (!TransportPolicy::DeviceToDevice(
+      const bool interior_ready = TransportPolicy::DeviceToDevice(
               workspace.interior.coefficients,
               view_.initial_current_interior,
               workspace.interior.count * sizeof(double),
-              CudaTransferCategory::state_prepare,
-              CudaTransferSite::candidate_prepare_interior) ||
-          !TransportPolicy::DeviceToDevice(
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::attempt_seed_interior);
+      const bool trace_ready = TransportPolicy::DeviceToDevice(
               workspace.trace.coefficients,
               view_.initial_current_true_trace,
               workspace.trace.count * sizeof(double),
-              CudaTransferCategory::state_prepare,
-              CudaTransferSite::candidate_prepare_trace))
-      {
-        return false;
-      }
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::attempt_seed_trace);
+      local_ready = local_ready && interior_ready && trace_ready;
       workspace.interior.generation = current_generation_;
       workspace.trace.generation = current_generation_;
     }
+    const bool synchronized =
+        TransportPolicy::Synchronize(CudaTransferSite::attempt_seed_trace);
+    local_ready = local_ready && synchronized;
+    if (!CollectiveContinue(local_ready)) { return false; }
     return DistributeCurrentTrace(workspace.trace.coefficients);
   }
 
@@ -368,7 +524,9 @@ public:
   {
     CudaNumericalResult result{};
     result.phase = CudaFailurePhase::assembly;
-    if (!initialized_ || !Ticket(CudaFailurePhase::assembly) ||
+    const bool assembly_ticket = initialized_ &&
+        Ticket(CudaFailurePhase::assembly);
+    if (!CollectiveContinue(assembly_ticket) ||
         !AssembleAndNorm(workspace, result.initial_residual))
     {
       result.reason = FailureReason::finite_gate;
@@ -383,10 +541,12 @@ public:
     {
       if (result.nonlinear_updates >= 2 && result.final_residual <= target)
         break;
-      if (!CopyBase(workspace) || !Ticket(CudaFailurePhase::condensation) ||
-          !CudaLaunchCondensation(view_, shape_) ||
-          !TransportPolicy::Synchronize(CudaTransferSite::scalar_status) ||
-          !StatusPassed())
+      const bool condensed = CopyBase(workspace) &&
+          Ticket(CudaFailurePhase::condensation) &&
+          CudaLaunchCondensation(view_, shape_) &&
+          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+          StatusPassed();
+      if (!CollectiveContinue(condensed))
       {
         result.phase = CudaFailurePhase::condensation;
         result.reason = FailureReason::backend_failure;
@@ -394,17 +554,31 @@ public:
       }
       const std::uint64_t generation = ++linear_generation_;
       result.phase = CudaFailurePhase::trace_solve;
-      if (!AssembleTrueSystem() || !Ticket(CudaFailurePhase::trace_solve) ||
-          !SolveTrueSystem(result.true_relative_residual))
+      if (!AssembleTrueSystem())
+      {
+        result.reason = FailureReason::true_residual_gate;
+        return result;
+      }
+      const bool solve_ticket = Ticket(CudaFailurePhase::trace_solve);
+      if (!CollectiveContinue(solve_ticket))
+      {
+        result.reason = FailureReason::true_residual_gate;
+        return result;
+      }
+      const bool solve_ok = SolveTrueSystem(result.true_relative_residual);
+      if (!CollectiveContinue(solve_ok))
       {
         result.reason = FailureReason::true_residual_gate;
         return result;
       }
       ++result.trace_solves;
-      if (!DistributeTraceIncrement() || !Ticket(CudaFailurePhase::recovery) ||
-          !CudaLaunchRecover(view_, shape_) ||
-          !TransportPolicy::Synchronize(CudaTransferSite::scalar_status) ||
-          !StatusPassed())
+      const bool trace_distributed = DistributeTraceIncrement();
+      const bool recovered = trace_distributed &&
+          Ticket(CudaFailurePhase::recovery) &&
+          CudaLaunchRecover(view_, shape_) &&
+          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+          StatusPassed();
+      if (!CollectiveContinue(recovered))
       {
         result.phase = CudaFailurePhase::recovery;
         result.reason = FailureReason::recovery_gate;
@@ -415,19 +589,30 @@ public:
       for (int trial = 0; trial <= 12; ++trial)
       {
         const double alpha = std::ldexp(1.0, -trial);
-        if (!CudaLaunchTrial(view_, shape_, alpha) ||
-            !TransportPolicy::Synchronize(CudaTransferSite::scalar_status))
+        const bool trial_ready = CudaLaunchTrial(view_, shape_, alpha) &&
+            TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+            SwapTrialIntoWorkspace(workspace);
+        if (!CollectiveContinue(trial_ready))
         {
-          RestoreBase(workspace);
+          if (!CollectiveContinue(RestoreBase(workspace)))
+          {
+            result.reason = FailureReason::backend_failure;
+            return result;
+          }
           continue;
         }
-        SwapTrialIntoWorkspace(workspace);
-        if (!DistributeCurrentTrace(workspace.trace.coefficients) ||
-            !CudaLaunchAdmissibility(view_, shape_) ||
-            !TransportPolicy::Synchronize(CudaTransferSite::scalar_status) ||
-            !StatusPassed())
+        const bool trial_admissible =
+            DistributeCurrentTrace(workspace.trace.coefficients) &&
+            CudaLaunchAdmissibility(view_, shape_) &&
+            TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+            StatusPassed();
+        if (!CollectiveContinue(trial_admissible))
         {
-          RestoreBase(workspace);
+          if (!CollectiveContinue(RestoreBase(workspace)))
+          {
+            result.reason = FailureReason::backend_failure;
+            return result;
+          }
           continue;
         }
         double trial_residual = std::numeric_limits<double>::infinity();
@@ -445,7 +630,11 @@ public:
           accepted = true;
           break;
         }
-        RestoreBase(workspace);
+        if (!CollectiveContinue(RestoreBase(workspace)))
+        {
+          result.reason = FailureReason::backend_failure;
+          return result;
+        }
       }
       if (!accepted)
       {
@@ -454,11 +643,106 @@ public:
       }
     }
     result.phase = CudaFailurePhase::after_recovery_before_commit;
-    result.admissible = result.nonlinear_updates >= 2 &&
-        result.final_residual <= target && CudaLaunchAdmissibility(view_, shape_) &&
+    result.recovery = last_product_generation != 0;
+    result.candidate_ready = result.recovery;
+    result.products = {last_product_generation,
+                       last_product_generation,
+                       last_product_generation,
+                       last_product_generation,
+                       0};
+    workspace.interior.generation = current_generation_;
+    workspace.trace.generation = current_generation_;
+
+    // The prescribed injection is agreed before admissibility, hashing,
+    // telemetry, or oracle export.  Exactly one principal source is exposed;
+    // every rank takes the same rollback branch.
+    const int injection_fields[3] = {
+        config.injection.enabled ? 1 : 0,
+        static_cast<int>(config.injection.target_step),
+        config.injection.source_rank};
+    int injection_min[3] = {};
+    int injection_max[3] = {};
+    const bool injection_protocol = MPI_Allreduce(
+            injection_fields, injection_min, 3, MPI_INT, MPI_MIN,
+            MPI_COMM_WORLD) == MPI_SUCCESS &&
+        MPI_Allreduce(injection_fields, injection_max, 3, MPI_INT, MPI_MAX,
+                      MPI_COMM_WORLD) == MPI_SUCCESS &&
+        std::equal(std::begin(injection_min), std::end(injection_min),
+                   std::begin(injection_max));
+    const bool injection_active = injection_protocol &&
+        injection_min[0] == 1 &&
+        static_cast<std::uint64_t>(injection_min[1]) ==
+            attempt.committed_step + 1 && attempt.retry_index == 0;
+    const int local_claim = injection_active &&
+        rank_ == injection_min[2] ? 1 : 0;
+    int claims = 0;
+    const bool claims_reduced = MPI_Allreduce(
+        &local_claim, &claims, 1, MPI_INT, MPI_SUM,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    if (!injection_protocol || !claims_reduced ||
+        (injection_active && claims != 1))
+    {
+      result.success = false;
+      result.reason = FailureReason::collective_protocol;
+      result.injection_source_rank = -1;
+      return result;
+    }
+    if (injection_active)
+    {
+      result.injected = true;
+      result.success = false;
+      result.reason = FailureReason::backend_failure;
+      result.injection_source_rank = injection_min[2];
+      return result;
+    }
+
+    // Freeze one coherent accepted linearization: A/B/C/D, Schur/RHS,
+    // solution, and recovery all describe the same candidate generation.
+    const bool coherent_base = result.nonlinear_updates >= 2 &&
+        result.final_residual <= target && CopyBase(workspace) &&
+        Ticket(CudaFailurePhase::condensation) &&
+        CudaLaunchCondensation(view_, shape_) &&
         TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
         StatusPassed();
-    result.recovery = last_product_generation != 0;
+    if (!CollectiveContinue(coherent_base) || !AssembleTrueSystem())
+    {
+      result.reason = FailureReason::backend_failure;
+      return result;
+    }
+    last_product_generation = ++linear_generation_;
+    const bool coherent_ticket = Ticket(CudaFailurePhase::trace_solve);
+    if (!CollectiveContinue(coherent_ticket))
+    {
+      result.reason = FailureReason::true_residual_gate;
+      return result;
+    }
+    const bool coherent_solve_ok =
+        SolveTrueSystem(result.true_relative_residual);
+    if (!CollectiveContinue(coherent_solve_ok))
+    {
+      result.reason = FailureReason::true_residual_gate;
+      return result;
+    }
+    const bool coherent_solve = DistributeTraceIncrement() &&
+        Ticket(CudaFailurePhase::recovery) &&
+        CudaLaunchRecover(view_, shape_) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+        StatusPassed();
+    if (!CollectiveContinue(coherent_solve))
+    {
+      result.reason = FailureReason::recovery_gate;
+      return result;
+    }
+    ++result.trace_solves;
+    result.products = {last_product_generation,
+                       last_product_generation,
+                       last_product_generation,
+                       last_product_generation,
+                       0};
+    const bool local_admissible = CudaLaunchAdmissibility(view_, shape_) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+        StatusPassed();
+    result.admissible = CollectiveContinue(local_admissible);
     result.true_residual = std::isfinite(result.true_relative_residual) &&
         result.true_relative_residual <= 1.0e-10;
     result.telemetry = DeviceResident() && NoFallback() &&
@@ -467,28 +751,11 @@ public:
         result.true_residual && result.telemetry;
     result.reason = result.success ? FailureReason::none :
         FailureReason::success_gate;
-    result.products = {last_product_generation,
-                       last_product_generation,
-                       last_product_generation,
-                       last_product_generation,
-                       0};
-    result.candidate_ready = result.recovery;
-    workspace.interior.generation = current_generation_;
-    workspace.trace.generation = current_generation_;
     if (!UpdateStateHashes(workspace))
     {
       result.success = false;
       result.telemetry = false;
       result.reason = FailureReason::telemetry_gate;
-    }
-    const bool local_injection = config.injection.enabled &&
-        config.injection.target_step == attempt.committed_step + 1 &&
-        config.injection.source_rank == rank_ && attempt.retry_index == 0;
-    if (local_injection)
-    {
-      result.injected = true;
-      result.success = false;
-      result.reason = FailureReason::backend_failure;
     }
     if (config.capture_oracle)
     {
@@ -553,18 +820,18 @@ private:
   {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks_);
-    if (ranks_ != config.expected_rank_count ||
-        cudaSetDevice(config.requested_device) != cudaSuccess ||
-        cudaGetDevice(&device_) != cudaSuccess || device_ != 0 ||
-        !mfem::Device::IsConfigured() ||
-        !mfem::Device::Allows(mfem::Backend::CUDA_MASK) ||
-        mfem::Device::Allows(mfem::Backend::DEBUG_DEVICE) ||
-        !AllocatorPolicy::DevicePoolPolicyValid())
-    {
-      return false;
-    }
+    const bool local_device_valid =
+        ranks_ == config.expected_rank_count &&
+        cudaSetDevice(config.requested_device) == cudaSuccess &&
+        cudaGetDevice(&device_) == cudaSuccess && device_ == 0 &&
+        mfem::Device::IsConfigured() &&
+        mfem::Device::Allows(mfem::Backend::CUDA_MASK) &&
+        !mfem::Device::Allows(mfem::Backend::DEBUG_DEVICE) &&
+        AllocatorPolicy::DevicePoolPolicyValid();
+    if (!CollectiveContinue(local_device_valid)) { return false; }
     cudaUUID_t uuid{};
-    if (cudaDeviceGetUuid(&uuid, device_) != cudaSuccess) { return false; }
+    const bool uuid_ready = cudaDeviceGetUuid(&uuid, device_) == cudaSuccess;
+    if (!CollectiveContinue(uuid_ready)) { return false; }
     std::memcpy(gpu_uuid_.data(), uuid.bytes, gpu_uuid_.size());
     std::array<unsigned char, 32> gathered{};
     if (ranks_ == 2)
@@ -669,11 +936,16 @@ private:
     void* integers = nullptr;
     if (!AllocatorPolicy::Allocate(
             persistent_double_capacity * sizeof(double), alignof(double),
-            CudaAllocationSite::persistent_double_arena, doubles) ||
-        !AllocatorPolicy::Allocate(
+            CudaAllocationSite::persistent_double_arena, doubles))
+      return false;
+    if (!AllocatorPolicy::Allocate(
             persistent_integer_capacity * sizeof(int), alignof(std::uint64_t),
             CudaAllocationSite::persistent_integer_arena, integers))
+    {
+      AllocatorPolicy::Deallocate(
+          doubles, CudaAllocationSite::persistent_double_arena);
       return false;
+    }
     double_arena_ = static_cast<double*>(doubles);
     integer_arena_ = static_cast<int*>(integers);
     return double_arena_ != nullptr && integer_arena_ != nullptr;
@@ -693,10 +965,12 @@ private:
   bool SolveTrueSystem(double& true_relative_residual) noexcept;
   bool AssembleAndNorm(state_slot& workspace, double& norm) noexcept;
   bool CopyBase(state_slot& workspace) noexcept;
-  void RestoreBase(state_slot& workspace) noexcept;
-  void SwapTrialIntoWorkspace(state_slot& workspace) noexcept;
+  bool RestoreBase(state_slot& workspace) noexcept;
+  bool SwapTrialIntoWorkspace(state_slot& workspace) noexcept;
   bool UpdateStateHashes(state_slot& workspace) noexcept;
   bool HashState(const double* values, int count, StateHash& hash) noexcept;
+  bool AggregateHash(const StateHash& local, StateHash& aggregate) const
+      noexcept;
   std::size_t WorkspaceBytes() const noexcept;
   void CaptureOracleMetadata(const AttemptIdentity& attempt,
                              std::uint64_t generation) noexcept;
@@ -725,6 +999,9 @@ private:
   std::array<unsigned char, 16> gpu_uuid_{};
   RuntimeTupleDescriptor tuple_{};
   PersistentResourceDescriptor resources_{};
+  StateHash local_mesh_hash_{};
+  StateHash local_partition_hash_{};
+  StateHash local_topology_hash_{};
   CudaMeshShape shape_{};
   CudaDeviceView view_{};
   CudaTrueMatrixStructure true_structure_{};
@@ -759,6 +1036,7 @@ private:
   std::uint64_t current_generation_ = 0;
   std::uint64_t linear_generation_ = 0;
   std::uint64_t baseline_allocations_ = 0;
+  std::size_t host_exchange_bytes_ = 0;
   std::array<CudaDeviceTicket, maximum_device_tickets> tickets_{};
   std::size_t ticket_count_ = 0;
   CudaOraclePod oracle_{};

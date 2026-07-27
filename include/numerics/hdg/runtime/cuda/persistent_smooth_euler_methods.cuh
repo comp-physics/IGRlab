@@ -479,58 +479,69 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildPersistentTrueSystem() noexcept
 {
+  bool local_objects_ready = false;
   try
   {
     mfem::ParBilinearForm form(&*trace_space_);
     true_matrix_.reset(form.ParallelAssemble(&*local_trace_matrix_));
-    if (!true_matrix_ ||
-        !CudaGetTrueMatrixStructure(*true_matrix_, owned_global_true_.data(),
-                                    shape_.true_trace_count, true_structure_,
-                                    &TransportPolicy::DeviceToHost,
-                                    &TransportPolicy::Synchronize) ||
-        !CudaGetTrueMatrixDeviceView(*true_matrix_, true_device_))
-      return false;
-    trace_slots_[0].emplace(trace_space_.operator->());
-    trace_slots_[1].emplace(trace_space_.operator->());
-    hypre_rhs_.emplace(*true_matrix_);
-    hypre_solution_.emplace(*true_matrix_);
-    hypre_action_.emplace(*true_matrix_);
-    ilu_.emplace();
-    gmres_.emplace(*true_matrix_);
-    if (!CudaConfigurePersistentHypre(*true_matrix_, *ilu_, *gmres_, ranks_))
-      return false;
-    for (auto& slot : trace_slots_)
+    local_objects_ready = true_matrix_ &&
+        CudaGetTrueMatrixStructure(*true_matrix_, owned_global_true_.data(),
+                                   shape_.true_trace_count, true_structure_,
+                                   &TransportPolicy::DeviceToHost,
+                                   &TransportPolicy::Synchronize) &&
+        CudaGetTrueMatrixDeviceView(*true_matrix_, true_device_);
+    if (local_objects_ready)
     {
-      slot->UseDevice(true);
-      slot->HypreReadWrite();
-      double* data = static_cast<mfem::Vector&>(*slot).ReadWrite();
-      if (!TransportPolicy::HostToDevice(
-              data, host_exact_true_trace_.data(),
-              static_cast<std::size_t>(shape_.true_trace_count) *
-                  sizeof(double),
-              CudaTransferCategory::initial_state,
-              CudaTransferSite::initial_trace_upload))
-        return false;
+      trace_slots_[0].emplace(trace_space_.operator->());
+      trace_slots_[1].emplace(trace_space_.operator->());
+      hypre_rhs_.emplace(*true_matrix_);
+      hypre_solution_.emplace(*true_matrix_);
+      hypre_action_.emplace(*true_matrix_);
+      ilu_.emplace();
+      gmres_.emplace(*true_matrix_);
+      local_objects_ready = CudaConfigurePersistentHypre(
+          *true_matrix_, *ilu_, *gmres_, ranks_);
     }
-    hypre_rhs_->UseDevice(true);
-    hypre_solution_->UseDevice(true);
-    hypre_action_->UseDevice(true);
-    hypre_rhs_->HypreReadWrite();
-    hypre_solution_->HypreReadWrite();
-    hypre_action_->HypreReadWrite();
-    view_.true_rhs_scratch =
-        static_cast<mfem::Vector&>(*hypre_rhs_).ReadWrite();
-    view_.true_solution =
-        static_cast<mfem::Vector&>(*hypre_solution_).ReadWrite();
-    owned_stage_.SetSize(shape_.true_trace_count);
-    local_stage_.SetSize(shape_.local_trace_count);
+    if (local_objects_ready)
+    {
+      for (auto& slot : trace_slots_)
+      {
+        slot->UseDevice(true);
+        slot->HypreReadWrite();
+        double* data = static_cast<mfem::Vector&>(*slot).ReadWrite();
+        local_objects_ready = local_objects_ready &&
+            TransportPolicy::HostToDevice(
+                data, host_exact_true_trace_.data(),
+                static_cast<std::size_t>(shape_.true_trace_count) *
+                    sizeof(double),
+                CudaTransferCategory::initial_state,
+                CudaTransferSite::initial_trace_upload);
+      }
+    }
+    if (local_objects_ready)
+    {
+      hypre_rhs_->UseDevice(true);
+      hypre_solution_->UseDevice(true);
+      hypre_action_->UseDevice(true);
+      hypre_rhs_->HypreReadWrite();
+      hypre_solution_->HypreReadWrite();
+      hypre_action_->HypreReadWrite();
+      view_.true_rhs_scratch =
+          static_cast<mfem::Vector&>(*hypre_rhs_).ReadWrite();
+      view_.true_solution =
+          static_cast<mfem::Vector&>(*hypre_solution_).ReadWrite();
+      owned_stage_.SetSize(shape_.true_trace_count);
+      local_stage_.SetSize(shape_.local_trace_count);
+    }
   }
   catch (...)
   {
-    return false;
+    local_objects_ready = false;
   }
-  if (!BuildSparseStagingPlan() ||
-      !TransportPolicy::Synchronize(CudaTransferSite::initial_trace_upload))
+  if (!CollectiveContinue(local_objects_ready)) { return false; }
+  const bool staging_ready = BuildSparseStagingPlan() &&
+      TransportPolicy::Synchronize(CudaTransferSite::initial_trace_upload);
+  if (!CollectiveContinue(staging_ready))
     return false;
   // Warm the persistent Krylov/factor workspaces before the allocation
   // baseline. The topology matrix is deliberately diagonally dominant here;
@@ -538,9 +549,10 @@ BuildPersistentTrueSystem() noexcept
   *hypre_rhs_ = 0.0;
   *hypre_solution_ = 0.0;
   CudaSolveDiagnostics warm{};
-  return CudaRefreshFactorAndSolve(
+  const bool warmed = CudaRefreshFactorAndSolve(
       *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_, ranks_,
       warm) && warm.device_policy && warm.configured_ilu0;
+  return CollectiveContinue(warmed);
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -586,6 +598,7 @@ BuildSparseStagingPlan() noexcept
     return false;
   };
 
+  bool local_plan_valid = true;
   for (int element = 0; element < shape_.elements; ++element)
     for (int row = 0; row < trace_dofs_per_element; ++row)
     {
@@ -600,12 +613,18 @@ BuildSparseStagingPlan() noexcept
       if (row_owner == rank_)
       {
         const int true_row = find_row(row_global);
-        if (true_row < 0) { return false; }
-        host_vector_owned_source_[static_cast<std::size_t>(
-            shape_.vector_owned_count)] = vector_source;
-        host_vector_owned_target_[static_cast<std::size_t>(
-            shape_.vector_owned_count)] = true_row;
-        ++shape_.vector_owned_count;
+        if (true_row < 0)
+        {
+          local_plan_valid = false;
+        }
+        else
+        {
+          host_vector_owned_source_[static_cast<std::size_t>(
+              shape_.vector_owned_count)] = vector_source;
+          host_vector_owned_target_[static_cast<std::size_t>(
+              shape_.vector_owned_count)] = true_row;
+          ++shape_.vector_owned_count;
+        }
       }
       else
       {
@@ -630,14 +649,19 @@ BuildSparseStagingPlan() noexcept
         {
           int section = -1, target = -1;
           if (!find_target(row_global, column_global, section, target))
-            return false;
-          host_matrix_owned_source_[static_cast<std::size_t>(
-              shape_.matrix_owned_count)] = source;
-          host_matrix_owned_section_[static_cast<std::size_t>(
-              shape_.matrix_owned_count)] = section;
-          host_matrix_owned_target_[static_cast<std::size_t>(
-              shape_.matrix_owned_count)] = target;
-          ++shape_.matrix_owned_count;
+          {
+            local_plan_valid = false;
+          }
+          else
+          {
+            host_matrix_owned_source_[static_cast<std::size_t>(
+                shape_.matrix_owned_count)] = source;
+            host_matrix_owned_section_[static_cast<std::size_t>(
+                shape_.matrix_owned_count)] = section;
+            host_matrix_owned_target_[static_cast<std::size_t>(
+                shape_.matrix_owned_count)] = target;
+            ++shape_.matrix_owned_count;
+          }
         }
         else
         {
@@ -652,53 +676,92 @@ BuildSparseStagingPlan() noexcept
       }
     }
 
+  if (!CollectiveContinue(local_plan_valid)) { return false; }
   if (ranks_ == 2)
   {
     const int peer = 1 - rank_;
-    if (MPI_Sendrecv(&shape_.matrix_send_count, 1, MPI_INT, peer, 4101,
+    const bool matrix_count_ok = MPI_Sendrecv(
+                     &shape_.matrix_send_count, 1, MPI_INT, peer, 4101,
                      &shape_.matrix_receive_count, 1, MPI_INT, peer, 4101,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) != MPI_SUCCESS ||
-        MPI_Sendrecv(&shape_.vector_send_count, 1, MPI_INT, peer, 4102,
-                     &shape_.vector_receive_count, 1, MPI_INT, peer, 4102,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) != MPI_SUCCESS ||
-        shape_.matrix_receive_count > maximum_exchange_entries ||
-        shape_.vector_receive_count >
-            maximum_rank_elements * trace_dofs_per_element)
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) == MPI_SUCCESS;
+    const bool matrix_count_recorded = TransportPolicy::RecordMpiStaging(
+            2 * sizeof(int), CudaTransferCategory::topology,
+            CudaTransferSite::map_upload, &shape_.matrix_send_count,
+            &shape_.matrix_receive_count, sizeof(int), sizeof(int),
+            matrix_count_ok);
+    if (!CollectiveContinue(matrix_count_ok && matrix_count_recorded))
       return false;
-    if (MPI_Sendrecv(matrix_send_keys_.data(), 2 * shape_.matrix_send_count,
+    const bool vector_count_ok = MPI_Sendrecv(
+                     &shape_.vector_send_count, 1, MPI_INT, peer, 4102,
+                     &shape_.vector_receive_count, 1, MPI_INT, peer, 4102,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) == MPI_SUCCESS;
+    const bool vector_count_recorded = TransportPolicy::RecordMpiStaging(
+            2 * sizeof(int), CudaTransferCategory::topology,
+            CudaTransferSite::map_upload, &shape_.vector_send_count,
+            &shape_.vector_receive_count, sizeof(int), sizeof(int),
+            vector_count_ok);
+    if (!CollectiveContinue(vector_count_ok && vector_count_recorded))
+      return false;
+    const bool counts_valid =
+        shape_.matrix_receive_count <= maximum_exchange_entries &&
+        shape_.vector_receive_count <=
+            maximum_rank_elements * trace_dofs_per_element;
+    if (!CollectiveContinue(counts_valid))
+      return false;
+    const bool matrix_keys_ok = MPI_Sendrecv(
+                     matrix_send_keys_.data(), 2 * shape_.matrix_send_count,
                      MPI_INT64_T, peer, 4103,
                      matrix_receive_keys_.data(),
                      2 * shape_.matrix_receive_count, MPI_INT64_T,
                      peer, 4103, MPI_COMM_WORLD,
-                     MPI_STATUS_IGNORE) != MPI_SUCCESS ||
-        MPI_Sendrecv(vector_send_keys_.data(), shape_.vector_send_count,
+                     MPI_STATUS_IGNORE) == MPI_SUCCESS;
+    const std::size_t matrix_key_bytes = 2 * static_cast<std::size_t>(
+        shape_.matrix_send_count + shape_.matrix_receive_count) *
+        sizeof(std::int64_t);
+    const bool matrix_keys_recorded = TransportPolicy::RecordMpiStaging(
+            matrix_key_bytes, CudaTransferCategory::topology,
+            CudaTransferSite::map_upload, matrix_send_keys_.data(),
+            matrix_receive_keys_.data(),
+            matrix_send_keys_.size() * sizeof(std::int64_t),
+            matrix_receive_keys_.size() * sizeof(std::int64_t),
+            matrix_keys_ok);
+    if (!CollectiveContinue(matrix_keys_ok && matrix_keys_recorded))
+      return false;
+    const bool vector_keys_ok = MPI_Sendrecv(
+                     vector_send_keys_.data(), shape_.vector_send_count,
                      MPI_INT64_T, peer, 4104,
                      vector_receive_keys_.data(), shape_.vector_receive_count,
                      MPI_INT64_T, peer, 4104, MPI_COMM_WORLD,
-                     MPI_STATUS_IGNORE) != MPI_SUCCESS)
+                     MPI_STATUS_IGNORE) == MPI_SUCCESS;
+    const std::size_t vector_key_bytes = static_cast<std::size_t>(
+        shape_.vector_send_count + shape_.vector_receive_count) *
+        sizeof(std::int64_t);
+    const bool vector_keys_recorded = TransportPolicy::RecordMpiStaging(
+            vector_key_bytes, CudaTransferCategory::topology,
+            CudaTransferSite::map_upload, vector_send_keys_.data(),
+            vector_receive_keys_.data(),
+            vector_send_keys_.size() * sizeof(std::int64_t),
+            vector_receive_keys_.size() * sizeof(std::int64_t),
+            vector_keys_ok);
+    if (!CollectiveContinue(vector_keys_ok && vector_keys_recorded))
       return false;
+    bool local_receive_valid = true;
     for (int entry = 0; entry < shape_.matrix_receive_count; ++entry)
-      if (!find_target(matrix_receive_keys_[2 * static_cast<std::size_t>(entry)],
-                       matrix_receive_keys_[2 * static_cast<std::size_t>(entry) + 1],
-                       host_matrix_receive_section_[static_cast<std::size_t>(entry)],
-                       host_matrix_receive_target_[static_cast<std::size_t>(entry)]))
-        return false;
+      local_receive_valid = find_target(
+          matrix_receive_keys_[2 * static_cast<std::size_t>(entry)],
+          matrix_receive_keys_[2 * static_cast<std::size_t>(entry) + 1],
+          host_matrix_receive_section_[static_cast<std::size_t>(entry)],
+          host_matrix_receive_target_[static_cast<std::size_t>(entry)]) &&
+          local_receive_valid;
     for (int entry = 0; entry < shape_.vector_receive_count; ++entry)
     {
       const int target = find_row(
           vector_receive_keys_[static_cast<std::size_t>(entry)]);
-      if (target < 0) { return false; }
-      host_vector_receive_target_[static_cast<std::size_t>(entry)] = target;
+      local_receive_valid = target >= 0 && local_receive_valid;
+      if (target >= 0)
+        host_vector_receive_target_[static_cast<std::size_t>(entry)] = target;
     }
-    TransportPolicy::RecordMpiStaging(
-        4 * sizeof(int) +
-            2 * static_cast<std::size_t>(shape_.matrix_send_count +
-                                         shape_.matrix_receive_count) *
-                sizeof(std::int64_t) +
-            static_cast<std::size_t>(shape_.vector_send_count +
-                                     shape_.vector_receive_count) *
-                sizeof(std::int64_t),
-        CudaTransferSite::map_upload);
+    if (!CollectiveContinue(local_receive_valid)) { return false; }
   }
 
   const auto upload = [](int* destination, const int* source, int count)
@@ -707,7 +770,8 @@ BuildSparseStagingPlan() noexcept
         destination, source, static_cast<std::size_t>(count) * sizeof(int),
         CudaTransferCategory::topology, CudaTransferSite::map_upload);
   };
-  return upload(view_.matrix_owned_source, host_matrix_owned_source_.data(),
+  const bool uploaded = upload(
+                view_.matrix_owned_source, host_matrix_owned_source_.data(),
                 shape_.matrix_owned_count) &&
       upload(view_.matrix_owned_section, host_matrix_owned_section_.data(),
              shape_.matrix_owned_count) &&
@@ -728,6 +792,7 @@ BuildSparseStagingPlan() noexcept
              shape_.vector_send_count) &&
       upload(view_.vector_receive_target, host_vector_receive_target_.data(),
              shape_.vector_receive_count);
+  return CollectiveContinue(uploaded);
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -738,41 +803,35 @@ BindStateSlots() noexcept
   double* trace1 = static_cast<mfem::Vector&>(*trace_slots_[1]).ReadWrite();
   committed_slot_.interior = {view_.slot_interior[0],
                               static_cast<std::size_t>(shape_.interior_count),
-                              {}, 0,
+                              {}, {}, 0,
                               reinterpret_cast<std::uintptr_t>(
                                   view_.slot_interior[0]), true};
   candidate_slot_.interior = {view_.slot_interior[1],
                               static_cast<std::size_t>(shape_.interior_count),
-                              {}, 0,
+                              {}, {}, 0,
                               reinterpret_cast<std::uintptr_t>(
                                   view_.slot_interior[1]), true};
   committed_slot_.trace = {trace0,
                            static_cast<std::size_t>(shape_.true_trace_count),
-                           {}, 0, reinterpret_cast<std::uintptr_t>(trace0),
+                           {}, {}, 0, reinterpret_cast<std::uintptr_t>(trace0),
                            reinterpret_cast<std::uintptr_t>(&*trace_slots_[0]),
                            true, true};
   candidate_slot_.trace = {trace1,
                            static_cast<std::size_t>(shape_.true_trace_count),
-                           {}, 0, reinterpret_cast<std::uintptr_t>(trace1),
+                           {}, {}, 0, reinterpret_cast<std::uintptr_t>(trace1),
                            reinterpret_cast<std::uintptr_t>(&*trace_slots_[1]),
                            true, true};
   workspace_slot_.interior = {view_.work_interior,
                               static_cast<std::size_t>(shape_.interior_count),
-                              {}, 0,
+                              {}, {}, 0,
                               reinterpret_cast<std::uintptr_t>(
                                   view_.work_interior), true};
   workspace_slot_.trace = {
       view_.work_true_trace,
-      static_cast<std::size_t>(shape_.true_trace_count), {}, 0,
+      static_cast<std::size_t>(shape_.true_trace_count), {}, {}, 0,
       reinterpret_cast<std::uintptr_t>(view_.work_true_trace), 0, false, true};
-  return HashState(committed_slot_.interior.coefficients,
-                   shape_.interior_count, committed_slot_.interior.hash) &&
-      HashState(candidate_slot_.interior.coefficients, shape_.interior_count,
-                candidate_slot_.interior.hash) &&
-      HashState(committed_slot_.trace.coefficients, shape_.true_trace_count,
-                committed_slot_.trace.hash) &&
-      HashState(candidate_slot_.trace.coefficients, shape_.true_trace_count,
-                candidate_slot_.trace.hash);
+  return UpdateStateHashes(committed_slot_) &&
+      UpdateStateHashes(candidate_slot_);
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -839,28 +898,35 @@ bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 DistributeCurrentTrace(const double* true_values) noexcept
 {
   if (ranks_ == 1)
-    return CudaLaunchGatherLocalTrace(
+    return CollectiveContinue(CudaLaunchGatherLocalTrace(
         view_.signed_element_trace,
         shape_.elements * trace_dofs_per_element, true_values,
         view_.current_local_trace) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status));
   double* owned_host = owned_stage_.HostWrite();
-  if (!TransportPolicy::DeviceToHost(
+  const bool staged_out = TransportPolicy::DeviceToHost(
           owned_host, true_values,
           static_cast<std::size_t>(shape_.true_trace_count) * sizeof(double),
           CudaTransferCategory::host_staged_trace_exchange,
-          CudaTransferSite::trace_solution_stage_out) ||
-      !TransportPolicy::Synchronize(
-          CudaTransferSite::trace_solution_stage_out) ||
-      !exchange_plan_.Distribute(*trace_space_, owned_stage_, local_stage_))
+          CudaTransferSite::trace_solution_stage_out) &&
+      TransportPolicy::Synchronize(
+          CudaTransferSite::trace_solution_stage_out);
+  if (!CollectiveContinue(staged_out))
     return false;
+  const bool distributed =
+      exchange_plan_.Distribute(*trace_space_, owned_stage_, local_stage_);
   const std::size_t local_bytes =
       static_cast<std::size_t>(shape_.local_trace_count) * sizeof(double);
-  TransportPolicy::RecordMpiStaging(
-      static_cast<std::size_t>(shape_.true_trace_count) * sizeof(double) +
-          local_bytes,
-      CudaTransferSite::trace_ghost_stage_in);
-  return TransportPolicy::HostToDevice(
+  const std::size_t owned_bytes =
+      static_cast<std::size_t>(shape_.true_trace_count) * sizeof(double);
+  const bool staging_recorded = TransportPolicy::RecordMpiStaging(
+      host_exchange_bytes_,
+      CudaTransferCategory::host_staged_trace_exchange,
+      CudaTransferSite::trace_ghost_stage_in, owned_host,
+      local_stage_.HostRead(), owned_bytes, local_bytes, distributed);
+  if (!CollectiveContinue(distributed && staging_recorded))
+    return false;
+  const bool local_ready = TransportPolicy::HostToDevice(
              view_.distributed_local_trace, local_stage_.HostRead(), local_bytes,
              CudaTransferCategory::host_staged_trace_exchange,
              CudaTransferSite::trace_ghost_stage_in) &&
@@ -869,6 +935,7 @@ DistributeCurrentTrace(const double* true_values) noexcept
           shape_.elements * trace_dofs_per_element,
           view_.distributed_local_trace, view_.current_local_trace) &&
       TransportPolicy::Synchronize(CudaTransferSite::trace_ghost_stage_in);
+  return CollectiveContinue(local_ready);
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -878,48 +945,55 @@ DistributeTraceIncrement() noexcept
   const double* solution =
       static_cast<const mfem::Vector&>(*hypre_solution_).Read();
   if (ranks_ == 1)
-    return CudaLaunchGatherLocalTrace(
+    return CollectiveContinue(CudaLaunchGatherLocalTrace(
         view_.signed_element_trace,
         shape_.elements * trace_dofs_per_element, solution,
         view_.trace_increment_local) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status));
   double* owned_host = owned_stage_.HostWrite();
-  if (!TransportPolicy::DeviceToHost(
+  const bool staged_out = TransportPolicy::DeviceToHost(
           owned_host, solution,
           static_cast<std::size_t>(shape_.true_trace_count) * sizeof(double),
           CudaTransferCategory::host_staged_trace_exchange,
-          CudaTransferSite::trace_solution_stage_out) ||
-      !TransportPolicy::Synchronize(
-          CudaTransferSite::trace_solution_stage_out) ||
-      !exchange_plan_.Distribute(*trace_space_, owned_stage_, local_stage_))
+          CudaTransferSite::trace_solution_stage_out) &&
+      TransportPolicy::Synchronize(
+          CudaTransferSite::trace_solution_stage_out);
+  if (!CollectiveContinue(staged_out))
     return false;
+  const bool distributed =
+      exchange_plan_.Distribute(*trace_space_, owned_stage_, local_stage_);
   // local_stage is in local physical signed coefficients. Gather the element
   // side orientation in a second device kernel from the local array.
   const std::size_t local_bytes =
       static_cast<std::size_t>(shape_.local_trace_count) * sizeof(double);
-  if (!TransportPolicy::HostToDevice(
+  const std::size_t owned_bytes =
+      static_cast<std::size_t>(shape_.true_trace_count) * sizeof(double);
+  const bool staging_recorded = TransportPolicy::RecordMpiStaging(
+      host_exchange_bytes_,
+      CudaTransferCategory::host_staged_trace_exchange,
+      CudaTransferSite::trace_ghost_stage_in, owned_host,
+      local_stage_.HostRead(), owned_bytes, local_bytes, distributed);
+  if (!CollectiveContinue(distributed && staging_recorded)) { return false; }
+  const bool local_ready = TransportPolicy::HostToDevice(
           view_.distributed_local_trace, local_stage_.HostRead(), local_bytes,
           CudaTransferCategory::host_staged_trace_exchange,
-          CudaTransferSite::trace_ghost_stage_in) ||
-      !CudaLaunchGatherLocalTrace(
+          CudaTransferSite::trace_ghost_stage_in) &&
+      CudaLaunchGatherLocalTrace(
           view_.signed_element_trace,
           shape_.elements * trace_dofs_per_element,
-          view_.distributed_local_trace, view_.trace_increment_local))
-    return false;
-  TransportPolicy::RecordMpiStaging(
-      static_cast<std::size_t>(shape_.true_trace_count) * sizeof(double) +
-          local_bytes,
-      CudaTransferSite::trace_ghost_stage_in);
-  return TransportPolicy::Synchronize(CudaTransferSite::trace_ghost_stage_in);
+          view_.distributed_local_trace, view_.trace_increment_local) &&
+      TransportPolicy::Synchronize(CudaTransferSite::trace_ghost_stage_in);
+  return CollectiveContinue(local_ready);
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleTrueVector(const double* element_values, double* true_values) noexcept
 {
-  if (!CudaLaunchAssembleOwnedVector(view_, shape_, element_values,
-                                     true_values) ||
-      !CudaLaunchGatherRemoteVector(view_, shape_, element_values))
+  const bool local_gather = CudaLaunchAssembleOwnedVector(
+      view_, shape_, element_values, true_values) &&
+      CudaLaunchGatherRemoteVector(view_, shape_, element_values);
+  if (!CollectiveContinue(local_gather))
     return false;
   if (ranks_ == 2)
   {
@@ -928,36 +1002,48 @@ AssembleTrueVector(const double* element_values, double* true_values) noexcept
         static_cast<std::size_t>(shape_.vector_send_count) * sizeof(double);
     const std::size_t receive_bytes =
         static_cast<std::size_t>(shape_.vector_receive_count) * sizeof(double);
-    if (!TransportPolicy::DeviceToHost(
+    const bool staged_out = TransportPolicy::DeviceToHost(
             vector_send_host_.data(), view_.remote_vector_send, send_bytes,
             CudaTransferCategory::host_staged_trace_exchange,
-            CudaTransferSite::rhs_remote_gather) ||
-        !TransportPolicy::Synchronize(CudaTransferSite::rhs_remote_gather) ||
-        MPI_Sendrecv(vector_send_host_.data(), shape_.vector_send_count,
+            CudaTransferSite::rhs_remote_gather) &&
+        TransportPolicy::Synchronize(CudaTransferSite::rhs_remote_gather);
+    if (!CollectiveContinue(staged_out)) { return false; }
+    const bool exchanged = MPI_Sendrecv(
+                     vector_send_host_.data(), shape_.vector_send_count,
                      MPI_DOUBLE, peer, 4201, vector_receive_host_.data(),
                      shape_.vector_receive_count, MPI_DOUBLE, peer, 4201,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) != MPI_SUCCESS ||
-        !TransportPolicy::HostToDevice(
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) == MPI_SUCCESS;
+    const bool exchange_recorded = TransportPolicy::RecordMpiStaging(
+            send_bytes + receive_bytes,
+            CudaTransferCategory::host_staged_trace_exchange,
+            CudaTransferSite::rhs_remote_gather,
+            vector_send_host_.data(), vector_receive_host_.data(),
+            vector_send_host_.size() * sizeof(double),
+            vector_receive_host_.size() * sizeof(double), exchanged);
+    if (!CollectiveContinue(exchanged && exchange_recorded))
+      return false;
+    const bool scattered = TransportPolicy::HostToDevice(
             view_.remote_vector_receive, vector_receive_host_.data(),
             receive_bytes,
             CudaTransferCategory::host_staged_trace_exchange,
-            CudaTransferSite::rhs_remote_scatter) ||
-        !CudaLaunchScatterRemoteVector(view_, shape_, true_values))
+            CudaTransferSite::rhs_remote_scatter) &&
+        CudaLaunchScatterRemoteVector(view_, shape_, true_values);
+    if (!CollectiveContinue(scattered))
       return false;
-    TransportPolicy::RecordMpiStaging(send_bytes + receive_bytes,
-                                      CudaTransferSite::rhs_remote_scatter);
   }
-  return TransportPolicy::Synchronize(CudaTransferSite::rhs_remote_scatter);
+  return CollectiveContinue(
+      TransportPolicy::Synchronize(CudaTransferSite::rhs_remote_scatter));
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleTrueSystem() noexcept
 {
-  if (!CudaLaunchZeroTrueSystem(true_device_, view_.true_rhs_scratch,
-                                shape_.true_trace_count) ||
-      !CudaLaunchAssembleOwnedMatrix(view_, true_device_, shape_) ||
-      !CudaLaunchGatherRemoteMatrix(view_, shape_))
+  const bool local_gather = CudaLaunchZeroTrueSystem(
+      true_device_, view_.true_rhs_scratch, shape_.true_trace_count) &&
+      CudaLaunchAssembleOwnedMatrix(view_, true_device_, shape_) &&
+      CudaLaunchGatherRemoteMatrix(view_, shape_);
+  if (!CollectiveContinue(local_gather))
     return false;
   if (ranks_ == 2)
   {
@@ -966,31 +1052,41 @@ AssembleTrueSystem() noexcept
         static_cast<std::size_t>(shape_.matrix_send_count) * sizeof(double);
     const std::size_t receive_bytes =
         static_cast<std::size_t>(shape_.matrix_receive_count) * sizeof(double);
-    if (!TransportPolicy::DeviceToHost(
+    const bool staged_out = TransportPolicy::DeviceToHost(
             matrix_send_host_.data(), view_.remote_matrix_send, send_bytes,
             CudaTransferCategory::host_staged_trace_exchange,
-            CudaTransferSite::matrix_remote_gather) ||
-        !TransportPolicy::Synchronize(CudaTransferSite::matrix_remote_gather) ||
-        MPI_Sendrecv(matrix_send_host_.data(), shape_.matrix_send_count,
+            CudaTransferSite::matrix_remote_gather) &&
+        TransportPolicy::Synchronize(CudaTransferSite::matrix_remote_gather);
+    if (!CollectiveContinue(staged_out)) { return false; }
+    const bool exchanged = MPI_Sendrecv(
+                     matrix_send_host_.data(), shape_.matrix_send_count,
                      MPI_DOUBLE, peer, 4202, matrix_receive_host_.data(),
                      shape_.matrix_receive_count, MPI_DOUBLE, peer, 4202,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) != MPI_SUCCESS ||
-        !TransportPolicy::HostToDevice(
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) == MPI_SUCCESS;
+    const bool exchange_recorded = TransportPolicy::RecordMpiStaging(
+            send_bytes + receive_bytes,
+            CudaTransferCategory::host_staged_trace_exchange,
+            CudaTransferSite::matrix_remote_gather,
+            matrix_send_host_.data(), matrix_receive_host_.data(),
+            matrix_send_host_.size() * sizeof(double),
+            matrix_receive_host_.size() * sizeof(double), exchanged);
+    if (!CollectiveContinue(exchanged && exchange_recorded))
+      return false;
+    const bool scattered = TransportPolicy::HostToDevice(
             view_.remote_matrix_receive, matrix_receive_host_.data(),
             receive_bytes,
             CudaTransferCategory::host_staged_trace_exchange,
-            CudaTransferSite::matrix_remote_scatter) ||
-        !CudaLaunchScatterRemoteMatrix(view_, true_device_, shape_))
+            CudaTransferSite::matrix_remote_scatter) &&
+        CudaLaunchScatterRemoteMatrix(view_, true_device_, shape_);
+    if (!CollectiveContinue(scattered))
       return false;
-    TransportPolicy::RecordMpiStaging(send_bytes + receive_bytes,
-                                      CudaTransferSite::matrix_remote_scatter);
   }
   if (!AssembleTrueVector(view_.condensed_rhs, view_.true_rhs_scratch))
     return false;
   true_matrix_->HypreRead();
   hypre_rhs_->HypreRead();
-  return CudaHypreDevicePolicyValid(*true_matrix_, *hypre_rhs_,
-                                    *hypre_solution_);
+  return CollectiveContinue(CudaHypreDevicePolicyValid(
+      *true_matrix_, *hypre_rhs_, *hypre_solution_));
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -998,11 +1094,12 @@ bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 SolveTrueSystem(double& true_relative_residual) noexcept
 {
   CudaSolveDiagnostics diagnostics{};
-  if (!CudaRefreshFactorAndSolve(*true_matrix_, *hypre_rhs_,
-                                 *hypre_solution_, *ilu_, *gmres_, ranks_,
-                                 diagnostics) ||
-      !diagnostics.device_policy || !diagnostics.configured_ilu0 ||
-      !diagnostics.converged || !diagnostics.finite)
+  const bool local_solve = CudaRefreshFactorAndSolve(
+          *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
+          ranks_, diagnostics) &&
+      diagnostics.device_policy && diagnostics.configured_ilu0 &&
+      diagnostics.converged && diagnostics.finite;
+  if (!CollectiveContinue(local_solve))
     return false;
   true_matrix_->Mult(*hypre_solution_, *hypre_action_);
   *hypre_action_ -= *hypre_rhs_;
@@ -1021,20 +1118,24 @@ bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleAndNorm(state_slot&, double& norm) noexcept
 {
   TransportPolicy::SetPhase(CudaFailurePhase::assembly, current_generation_);
-  if (!CudaLaunchAssembly(view_, shape_, fixed_dt) ||
-      !TransportPolicy::Synchronize(CudaTransferSite::scalar_status) ||
-      !StatusPassed() ||
-      !AssembleTrueVector(view_.residual_g, view_.true_residual) ||
-      !CudaLaunchLocalSquaredNorm(view_.residual_r, shape_.interior_count,
-                                  view_.true_residual,
-                                  shape_.true_trace_count, view_.scalar))
+  const bool local_assembly = CudaLaunchAssembly(view_, shape_, fixed_dt) &&
+      TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+      StatusPassed();
+  if (!CollectiveContinue(local_assembly) ||
+      !AssembleTrueVector(view_.residual_g, view_.true_residual))
+    return false;
+  const bool norm_launched = CudaLaunchLocalSquaredNorm(
+      view_.residual_r, shape_.interior_count, view_.true_residual,
+      shape_.true_trace_count, view_.scalar);
+  if (!CollectiveContinue(norm_launched))
     return false;
   double local_squared = 0.0;
-  if (!TransportPolicy::DeviceToHost(
+  const bool scalar_ready = TransportPolicy::DeviceToHost(
           &local_squared, view_.scalar, sizeof(double),
           CudaTransferCategory::scalar_diagnostic,
-          CudaTransferSite::scalar_status) ||
-      !TransportPolicy::Synchronize(CudaTransferSite::scalar_status))
+          CudaTransferSite::scalar_status) &&
+      TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+  if (!CollectiveContinue(scalar_ready))
     return false;
   double global_squared = local_squared;
   if (ranks_ > 1 && MPI_Allreduce(&local_squared, &global_squared, 1,
@@ -1049,60 +1150,69 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 CopyBase(state_slot& workspace) noexcept
 {
-  return TransportPolicy::DeviceToDevice(
+  const bool interior = TransportPolicy::DeviceToDevice(
              view_.base_interior, workspace.interior.coefficients,
              workspace.interior.count * sizeof(double),
-             CudaTransferCategory::state_prepare,
-             CudaTransferSite::candidate_prepare_interior) &&
-      TransportPolicy::DeviceToDevice(
+             CudaTransferCategory::attempt_history,
+             CudaTransferSite::nonlinear_base_interior);
+  const bool trace = TransportPolicy::DeviceToDevice(
           view_.base_true_trace, workspace.trace.coefficients,
           workspace.trace.count * sizeof(double),
-          CudaTransferCategory::state_prepare,
-          CudaTransferSite::candidate_prepare_trace) &&
-      TransportPolicy::DeviceToDevice(
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_trace);
+  const bool local_trace = TransportPolicy::DeviceToDevice(
           view_.base_local_trace, view_.current_local_trace,
           static_cast<std::size_t>(shape_.elements) *
               trace_dofs_per_element * sizeof(double),
-          CudaTransferCategory::state_prepare,
-          CudaTransferSite::candidate_prepare_trace);
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_local_trace);
+  const bool synchronized = TransportPolicy::Synchronize(
+      CudaTransferSite::nonlinear_base_local_trace);
+  return interior && trace && local_trace && synchronized;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
-void CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 RestoreBase(state_slot& workspace) noexcept
 {
-  (void)TransportPolicy::DeviceToDevice(
+  const bool interior = TransportPolicy::DeviceToDevice(
       workspace.interior.coefficients, view_.base_interior,
       workspace.interior.count * sizeof(double),
-      CudaTransferCategory::state_prepare,
-      CudaTransferSite::candidate_prepare_interior);
-  (void)TransportPolicy::DeviceToDevice(
+      CudaTransferCategory::attempt_history,
+      CudaTransferSite::nonlinear_restore_interior);
+  const bool trace = TransportPolicy::DeviceToDevice(
       workspace.trace.coefficients, view_.base_true_trace,
       workspace.trace.count * sizeof(double),
-      CudaTransferCategory::state_prepare,
-      CudaTransferSite::candidate_prepare_trace);
-  (void)TransportPolicy::DeviceToDevice(
+      CudaTransferCategory::attempt_history,
+      CudaTransferSite::nonlinear_restore_trace);
+  const bool local_trace = TransportPolicy::DeviceToDevice(
       view_.current_local_trace, view_.base_local_trace,
       static_cast<std::size_t>(shape_.elements) *
           trace_dofs_per_element * sizeof(double),
-      CudaTransferCategory::state_prepare,
-      CudaTransferSite::candidate_prepare_trace);
+      CudaTransferCategory::attempt_history,
+      CudaTransferSite::nonlinear_restore_local_trace);
+  const bool synchronized = TransportPolicy::Synchronize(
+      CudaTransferSite::nonlinear_restore_local_trace);
+  return interior && trace && local_trace && synchronized;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
-void CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 SwapTrialIntoWorkspace(state_slot& workspace) noexcept
 {
-  (void)TransportPolicy::DeviceToDevice(
+  const bool interior = TransportPolicy::DeviceToDevice(
       workspace.interior.coefficients, view_.trial_interior,
       workspace.interior.count * sizeof(double),
-      CudaTransferCategory::state_store,
-      CudaTransferSite::candidate_store_interior);
-  (void)TransportPolicy::DeviceToDevice(
+      CudaTransferCategory::attempt_history,
+      CudaTransferSite::nonlinear_accept_interior);
+  const bool trace = TransportPolicy::DeviceToDevice(
       workspace.trace.coefficients, view_.trial_true_trace,
       workspace.trace.count * sizeof(double),
-      CudaTransferCategory::state_store,
-      CudaTransferSite::candidate_store_trace);
+      CudaTransferCategory::attempt_history,
+      CudaTransferSite::nonlinear_accept_trace);
+  const bool synchronized =
+      TransportPolicy::Synchronize(CudaTransferSite::nonlinear_accept_trace);
+  return interior && trace && synchronized;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -1127,10 +1237,30 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 UpdateStateHashes(state_slot& workspace) noexcept
 {
-  return HashState(workspace.interior.coefficients, shape_.interior_count,
-                   workspace.interior.hash) &&
+  const bool local_ready = HashState(
+      workspace.interior.coefficients, shape_.interior_count,
+      workspace.interior.local_hash) &&
       HashState(workspace.trace.coefficients, shape_.true_trace_count,
-                workspace.trace.hash);
+                workspace.trace.local_hash);
+  if (!CollectiveContinue(local_ready)) { return false; }
+  return AggregateHash(workspace.interior.local_hash,
+                       workspace.interior.hash) &&
+      AggregateHash(workspace.trace.local_hash, workspace.trace.hash);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+AggregateHash(const StateHash& local, StateHash& aggregate) const noexcept
+{
+  std::array<unsigned char, 2 * 32> pieces{};
+  if (ranks_ < 1 || ranks_ > 2 ||
+      MPI_Allgather(local.bytes.data(), 32, MPI_UNSIGNED_CHAR,
+                    pieces.data(), 32, MPI_UNSIGNED_CHAR,
+                    MPI_COMM_WORLD) != MPI_SUCCESS)
+    return false;
+  aggregate = HashHostBytes(
+      pieces.data(), static_cast<std::size_t>(ranks_) * 32);
+  return true;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>

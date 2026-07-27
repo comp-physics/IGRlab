@@ -27,6 +27,48 @@ inline bool Close(const double a, const double b, const double scale = 1.0)
           std::max({scale, std::abs(a), std::abs(b)});
 }
 
+inline bool AllRanks(const bool local)
+{
+  const int local_value = local ? 1 : 0;
+  int global_value = 0;
+  return MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN,
+                       MPI_COMM_WORLD) == MPI_SUCCESS && global_value == 1;
+}
+
+inline bool ValidShape(const CudaOraclePod& p)
+{
+  if (p.schema != 1 || (p.ranks != 1 && p.ranks != 2) || p.rank < 0 ||
+      p.rank >= p.ranks || p.elements <= 0 ||
+      p.elements > maximum_rank_elements ||
+      p.interior_count != p.elements * interior_dofs_per_element ||
+      p.local_trace_count <= 0 ||
+      p.local_trace_count > maximum_local_trace_dofs ||
+      p.true_trace_count <= 0 ||
+      p.true_trace_count > maximum_true_trace_dofs ||
+      p.global_true_trace_count <= 0 ||
+      p.global_true_trace_count > maximum_true_trace_dofs ||
+      p.volume_points <= 0 || p.volume_points > maximum_volume_points ||
+      p.face_points <= 0 || p.face_points > maximum_face_points ||
+      p.true_csr_rows != p.true_trace_count ||
+      p.true_csr_nonzeros < 0 ||
+      p.true_csr_nonzeros > maximum_true_matrix_entries ||
+      p.true_csr_offsets[0] != 0 ||
+      p.true_csr_offsets[p.true_csr_rows] != p.true_csr_nonzeros)
+  {
+    return false;
+  }
+  for (int row = 0; row < p.true_csr_rows; ++row)
+  {
+    if (p.true_csr_offsets[row] < 0 ||
+        p.true_csr_offsets[row] > p.true_csr_offsets[row + 1] ||
+        p.true_csr_offsets[row + 1] > p.true_csr_nonzeros)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 inline bool Flux(const double* u, const double nx, const double ny,
                  double* flux, double* jacobian)
 {
@@ -90,9 +132,226 @@ inline bool Solve(std::array<double,16*33>& rhs,std::array<double,256> a)
 inline bool VerifyCondensationRecovery(const CudaOraclePod& p)
 {for(int e=0;e<p.elements;++e){std::array<double,256>a{};std::array<double,16*33>w{};for(int i=0;i<256;++i)a[i]=p.a[e*256+i];for(int r=0;r<16;++r){for(int c=0;c<32;++c)w[r*33+c]=p.b[(e*16+r)*32+c];w[r*33+32]=p.f[e*16+r];}if(!Solve(w,a))return false;for(int r=0;r<32;++r){double rhs=p.g[e*32+r];for(int k=0;k<16;++k)rhs-=p.c[(e*32+r)*16+k]*w[k*33+32];if(!Close(rhs,p.condensed_rhs[e*32+r]))return false;for(int col=0;col<32;++col){double x=p.d[(e*32+r)*32+col];for(int k=0;k<16;++k)x-=p.c[(e*32+r)*16+k]*w[k*33+col];if(!Close(x,p.schur[(e*32+r)*32+col]))return false;}}std::array<double,16*33> recovery_rhs{};for(int r=0;r<16;++r){double x=p.f[e*16+r];for(int c=0;c<32;++c)x-=p.b[(e*16+r)*32+c]*p.local_trace_increment[e*32+c];recovery_rhs[r*33]=x;}if(!Solve(recovery_rhs,a))return false;for(int r=0;r<16;++r)if(!Close(recovery_rhs[r*33],p.recovered_increment[e*16+r]))return false;}return true;}
 
+inline bool SolveTrueDofs(
+    const int count,
+    std::array<double, maximum_true_matrix_entries>& matrix,
+    std::array<double, maximum_true_trace_dofs>& rhs)
+{
+  for (int column = 0; column < count; ++column)
+  {
+    int pivot = column;
+    for (int row = column + 1; row < count; ++row)
+      if (std::abs(matrix[row * count + column]) >
+          std::abs(matrix[pivot * count + column]))
+        pivot = row;
+    if (!(std::abs(matrix[pivot * count + column]) > 1.0e-14))
+      return false;
+    if (pivot != column)
+    {
+      for (int entry = 0; entry < count; ++entry)
+        std::swap(matrix[column * count + entry],
+                  matrix[pivot * count + entry]);
+      std::swap(rhs[column], rhs[pivot]);
+    }
+    for (int row = column + 1; row < count; ++row)
+    {
+      const double multiplier = matrix[row * count + column] /
+          matrix[column * count + column];
+      for (int entry = column; entry < count; ++entry)
+        matrix[row * count + entry] -=
+            multiplier * matrix[column * count + entry];
+      rhs[row] -= multiplier * rhs[column];
+    }
+  }
+  for (int row = count - 1; row >= 0; --row)
+  {
+    for (int column = row + 1; column < count; ++column)
+      rhs[row] -= matrix[row * count + column] * rhs[column];
+    rhs[row] /= matrix[row * count + row];
+  }
+  return true;
+}
+
 inline bool VerifySignsAndTrueResidual(const CudaOraclePod& p)
-{for(int e=0;e<p.elements;++e)for(int local=0;local<32;++local){const int encoded=p.signed_element_trace[e*32+local];const double sign=encoded>=0?1.0:-1.0;const int dof=encoded>=0?encoded:-1-encoded;if(dof<0||dof>=p.local_trace_count||!Close(p.current_local_trace[e*32+local],sign*p.distributed_local_trace[dof]))return false;}std::array<double,maximum_true_trace_dofs> local_solution{},global_solution{},local_trace{},global_trace{};std::array<int,maximum_true_trace_dofs> local_owner{},global_owner{};for(int i=0;i<p.true_trace_count;++i){const auto global=p.owned_global_true[i];if(global<0||global>=p.global_true_trace_count)return false;local_solution[global]=p.true_solution[i];local_trace[global]=p.current_true_trace[i];local_owner[global]=1;}if(MPI_Allreduce(local_solution.data(),global_solution.data(),p.global_true_trace_count,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD)!=MPI_SUCCESS||MPI_Allreduce(local_trace.data(),global_trace.data(),p.global_true_trace_count,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD)!=MPI_SUCCESS||MPI_Allreduce(local_owner.data(),global_owner.data(),p.global_true_trace_count,MPI_INT,MPI_SUM,MPI_COMM_WORLD)!=MPI_SUCCESS)return false;for(int i=0;i<p.global_true_trace_count;++i)if(global_owner[i]!=1)return false;for(int local=0;local<p.local_trace_count;++local){const auto global=p.local_to_global_true[local];if(global<0||global>=p.global_true_trace_count||!Close(p.distributed_local_trace[local],global_trace[global]))return false;}double residual2=0,rhs2=0;for(int row=0;row<p.true_csr_rows;++row){double value=-p.true_rhs[row];for(int entry=p.true_csr_offsets[row];entry<p.true_csr_offsets[row+1];++entry){const auto global=p.true_csr_columns[entry];if(global<0||global>=p.global_true_trace_count)return false;value+=p.true_csr_values[entry]*global_solution[global];}residual2+=value*value;rhs2+=p.true_rhs[row]*p.true_rhs[row];}double local_norms[2]={residual2,rhs2},global_norms[2]={};if(MPI_Allreduce(local_norms,global_norms,2,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD)!=MPI_SUCCESS)return false;return std::sqrt(global_norms[0])/std::max(std::sqrt(global_norms[1]),1e-300)<=1e-9;}
+{
+  const int count = p.global_true_trace_count;
+  std::array<double, maximum_true_matrix_entries> local_matrix{};
+  std::array<double, maximum_true_matrix_entries> global_matrix{};
+  std::array<double, maximum_true_trace_dofs> local_rhs{};
+  std::array<double, maximum_true_trace_dofs> global_rhs{};
+  std::array<double, maximum_true_trace_dofs> local_solution{};
+  std::array<double, maximum_true_trace_dofs> global_solution{};
+  std::array<double, maximum_true_trace_dofs> local_trace{};
+  std::array<double, maximum_true_trace_dofs> global_trace{};
+  std::array<int, maximum_true_trace_dofs> local_owner{};
+  std::array<int, maximum_true_trace_dofs> global_owner{};
+
+  const bool local_assembly_valid = [&]()
+  {
+    for (int element = 0; element < p.elements; ++element)
+    {
+      for (int row = 0; row < trace_dofs_per_element; ++row)
+      {
+        const int encoded_row =
+            p.signed_element_trace[element * trace_dofs_per_element + row];
+        if (encoded_row == std::numeric_limits<int>::min()) { return false; }
+        const double row_sign = encoded_row >= 0 ? 1.0 : -1.0;
+        const int local_row = encoded_row >= 0
+            ? encoded_row : -(encoded_row + 1);
+        if (local_row < 0 || local_row >= p.local_trace_count)
+          return false;
+        const std::int64_t global_row = p.local_to_global_true[local_row];
+        if (global_row < 0 || global_row >= count ||
+            !Close(p.current_local_trace[
+                       element * trace_dofs_per_element + row],
+                   row_sign * p.distributed_local_trace[local_row]))
+          return false;
+        local_rhs[static_cast<std::size_t>(global_row)] +=
+            row_sign * p.condensed_rhs[
+                element * trace_dofs_per_element + row];
+        for (int column = 0; column < trace_dofs_per_element; ++column)
+        {
+          const int encoded_column = p.signed_element_trace[
+              element * trace_dofs_per_element + column];
+          if (encoded_column == std::numeric_limits<int>::min())
+            return false;
+          const double column_sign = encoded_column >= 0 ? 1.0 : -1.0;
+          const int local_column = encoded_column >= 0
+              ? encoded_column : -(encoded_column + 1);
+          if (local_column < 0 || local_column >= p.local_trace_count)
+            return false;
+          const std::int64_t global_column =
+              p.local_to_global_true[local_column];
+          if (global_column < 0 || global_column >= count) { return false; }
+          local_matrix[static_cast<std::size_t>(global_row) * count +
+                       static_cast<std::size_t>(global_column)] +=
+              row_sign * column_sign * p.schur[
+                  (element * trace_dofs_per_element + row) *
+                      trace_dofs_per_element + column];
+        }
+      }
+    }
+    for (int local = 0; local < p.true_trace_count; ++local)
+    {
+      const std::int64_t global = p.owned_global_true[local];
+      if (global < 0 || global >= count) { return false; }
+      local_solution[static_cast<std::size_t>(global)] = p.true_solution[local];
+      local_trace[static_cast<std::size_t>(global)] =
+          p.current_true_trace[local];
+      ++local_owner[static_cast<std::size_t>(global)];
+    }
+    return true;
+  }();
+  if (!AllRanks(local_assembly_valid)) { return false; }
+
+  const bool matrix_reduced = MPI_Allreduce(
+      local_matrix.data(), global_matrix.data(), count * count, MPI_DOUBLE,
+      MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool rhs_reduced = MPI_Allreduce(
+      local_rhs.data(), global_rhs.data(), count, MPI_DOUBLE, MPI_SUM,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool solution_reduced = MPI_Allreduce(
+      local_solution.data(), global_solution.data(), count, MPI_DOUBLE, MPI_SUM,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool trace_reduced = MPI_Allreduce(
+      local_trace.data(), global_trace.data(), count, MPI_DOUBLE, MPI_SUM,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool owner_reduced = MPI_Allreduce(
+      local_owner.data(), global_owner.data(), count, MPI_INT, MPI_SUM,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  if (!AllRanks(matrix_reduced && rhs_reduced && solution_reduced &&
+                trace_reduced && owner_reduced))
+    return false;
+
+  const bool local_result = [&]()
+  {
+    for (int global = 0; global < count; ++global)
+      if (global_owner[global] != 1) { return false; }
+    for (int local = 0; local < p.local_trace_count; ++local)
+    {
+      const std::int64_t global = p.local_to_global_true[local];
+      if (global < 0 || global >= count ||
+          !Close(p.distributed_local_trace[local],
+                 global_trace[static_cast<std::size_t>(global)]))
+        return false;
+    }
+
+    std::array<double, maximum_true_trace_dofs> production_row{};
+    for (int local_row = 0; local_row < p.true_csr_rows; ++local_row)
+    {
+      production_row.fill(0.0);
+      const std::int64_t global_row = p.owned_global_true[local_row];
+      if (global_row < 0 || global_row >= count ||
+          !Close(p.true_rhs[local_row],
+                 global_rhs[static_cast<std::size_t>(global_row)]))
+        return false;
+      for (int entry = p.true_csr_offsets[local_row];
+           entry < p.true_csr_offsets[local_row + 1]; ++entry)
+      {
+        const std::int64_t global_column = p.true_csr_columns[entry];
+        if (global_column < 0 || global_column >= count) { return false; }
+        production_row[static_cast<std::size_t>(global_column)] +=
+            p.true_csr_values[entry];
+      }
+      for (int global_column = 0; global_column < count; ++global_column)
+        if (!Close(production_row[global_column],
+                   global_matrix[static_cast<std::size_t>(global_row) * count +
+                                 global_column]))
+          return false;
+    }
+
+    auto oracle_matrix = global_matrix;
+    auto oracle_solution = global_rhs;
+    if (!SolveTrueDofs(count, oracle_matrix, oracle_solution)) { return false; }
+    double residual_squared = 0.0;
+    double rhs_squared = 0.0;
+    for (int row = 0; row < count; ++row)
+    {
+      if (!Close(oracle_solution[row], global_solution[row], 10.0))
+        return false;
+      double residual = -global_rhs[row];
+      for (int column = 0; column < count; ++column)
+        residual += global_matrix[row * count + column] *
+            global_solution[column];
+      residual_squared += residual * residual;
+      rhs_squared += global_rhs[row] * global_rhs[row];
+    }
+    return std::sqrt(residual_squared) /
+        std::max(std::sqrt(rhs_squared), 1.0e-300) <= 1.0e-9;
+  }();
+  return AllRanks(local_result);
+}
 
 inline bool Verify(const CudaOraclePod& p)
-{return p.schema==1&&p.dt==fixed_dt&&VerifyPhysics(p)&&VerifyCondensationRecovery(p)&&VerifySignsAndTrueResidual(p);}
+{
+  int communicator_size = 0;
+  const bool size_ready =
+      MPI_Comm_size(MPI_COMM_WORLD, &communicator_size) == MPI_SUCCESS;
+  int count_min = p.global_true_trace_count;
+  int count_max = p.global_true_trace_count;
+  const bool count_min_ready = MPI_Allreduce(
+      &p.global_true_trace_count, &count_min, 1, MPI_INT, MPI_MIN,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool count_max_ready = MPI_Allreduce(
+      &p.global_true_trace_count, &count_max, 1, MPI_INT, MPI_MAX,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  std::uint64_t identity[2] = {p.attempt_sequence, p.product_generation};
+  std::uint64_t identity_min[2] = {};
+  std::uint64_t identity_max[2] = {};
+  const bool identity_min_ready = MPI_Allreduce(
+      identity, identity_min, 2, MPI_UINT64_T, MPI_MIN,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool identity_max_ready = MPI_Allreduce(
+      identity, identity_max, 2, MPI_UINT64_T, MPI_MAX,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool identity_consistent = size_ready && count_min_ready &&
+      count_max_ready && identity_min_ready && identity_max_ready &&
+      ValidShape(p) && p.ranks == communicator_size && p.dt == fixed_dt &&
+      count_min == count_max && identity_min[0] == identity_max[0] &&
+      identity_min[1] == identity_max[1];
+  if (!AllRanks(identity_consistent)) { return false; }
+  if (!AllRanks(VerifyPhysics(p))) { return false; }
+  if (!AllRanks(VerifyCondensationRecovery(p))) { return false; }
+  return VerifySignsAndTrueResidual(p);
+}
 } // namespace cuda_w8a_test_oracle

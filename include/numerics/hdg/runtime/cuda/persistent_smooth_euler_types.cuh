@@ -50,6 +50,8 @@ inline constexpr int maximum_true_matrix_entries = 20736;
 inline constexpr int maximum_exchange_entries = maximum_local_matrix_entries;
 inline constexpr int maximum_attempt_records = 8;
 inline constexpr int maximum_device_tickets = 128;
+inline constexpr int maximum_transfer_events = 16384;
+inline constexpr int maximum_allocation_events = 64;
 inline constexpr int assembly_quadrature_order = 11;
 
 enum class CudaFailurePhase : unsigned char
@@ -126,9 +128,10 @@ enum class CudaTransferCategory : unsigned char
 {
   topology,
   initial_state,
-  state_prepare,
-  state_store,
-  state_copy_out,
+  attempt_history,
+  checkpoint_candidate_staging,
+  checkpoint_restore_import,
+  checkpoint_restore_materialization,
   scalar_diagnostic,
   host_staged_trace_exchange,
   oracle_export
@@ -139,12 +142,24 @@ enum class CudaTransferSite : unsigned char
   topology_upload,
   initial_interior_upload,
   initial_trace_upload,
-  candidate_prepare_interior,
-  candidate_prepare_trace,
-  candidate_store_interior,
-  candidate_store_trace,
-  published_copy_interior,
-  published_copy_trace,
+  attempt_seed_interior,
+  attempt_seed_trace,
+  nonlinear_base_interior,
+  nonlinear_base_trace,
+  nonlinear_base_local_trace,
+  nonlinear_restore_interior,
+  nonlinear_restore_trace,
+  nonlinear_restore_local_trace,
+  nonlinear_accept_interior,
+  nonlinear_accept_trace,
+  candidate_finalize_interior,
+  candidate_finalize_trace,
+  checkpoint_stage_interior,
+  checkpoint_stage_trace,
+  checkpoint_import_interior,
+  checkpoint_import_trace,
+  checkpoint_materialize_interior,
+  checkpoint_materialize_trace,
   quadrature_upload,
   map_upload,
   matrix_remote_gather,
@@ -167,8 +182,10 @@ struct CudaPolicyContext
   CudaFailurePhase phase = CudaFailurePhase::setup;
 };
 
-struct CudaTransferEvent
+/** Fixed-schema production transfer event; no pointer conveys authority. */
+struct TransferEventV1
 {
+  std::uint64_t ordinal = 0;
   CudaTransferDirection direction = CudaTransferDirection::host_to_device;
   CudaTransferCategory category = CudaTransferCategory::topology;
   CudaTransferSite site = CudaTransferSite::topology_upload;
@@ -176,17 +193,29 @@ struct CudaTransferEvent
   std::uint64_t bytes = 0;
   std::uintptr_t source_token = 0;
   std::uintptr_t destination_token = 0;
+  std::uint64_t source_capacity = 0;
+  std::uint64_t destination_capacity = 0;
+  std::uint64_t endpoint_token = 0;
+  bool success = false;
 };
 
-struct CudaAllocationEvent
+/** Fixed-schema production allocation event. */
+struct AllocationEventV1
 {
+  std::uint64_t ordinal = 0;
   CudaAllocationSite site = CudaAllocationSite::persistent_double_arena;
+  CudaPolicyContext context{};
   std::uint64_t bytes = 0;
   std::uint64_t alignment = 0;
+  std::uint64_t capacity = 0;
   std::uintptr_t storage_token = 0;
   std::uint64_t generation = 0;
   bool allocation = true;
+  bool success = false;
 };
+
+using CudaTransferEvent = TransferEventV1;
+using CudaAllocationEvent = AllocationEventV1;
 
 struct CudaDeviceTicket
 {
@@ -243,6 +272,40 @@ struct CudaTransferTotals
   bool complete = true;
 };
 
+struct CudaTransferLedgerV1
+{
+  std::uint32_t schema = 1;
+  std::uint32_t capacity = maximum_transfer_events;
+  CudaTransferTotals totals{};
+  std::array<TransferEventV1, maximum_transfer_events> events{};
+  /** Number retained in events; never exceeds events.size(). */
+  std::size_t count = 0;
+  std::uint64_t observed_count = 0;
+  std::uint64_t dropped_count = 0;
+  std::uint64_t ordered_digest = 1469598103934665603ULL;
+  bool overflow = false;
+};
+
+struct CudaAllocationLedgerV1
+{
+  std::uint32_t schema = 1;
+  std::uint32_t capacity = maximum_allocation_events;
+  std::array<AllocationEventV1, maximum_allocation_events> events{};
+  std::size_t count = 0;
+  std::uint64_t observed_count = 0;
+  std::uint64_t dropped_count = 0;
+  std::uint64_t ordered_digest = 1469598103934665603ULL;
+  bool overflow = false;
+};
+
+struct CudaTransferLedgerRangeV1
+{
+  std::uint64_t begin_ordinal = 0;
+  std::uint64_t end_ordinal = 0;
+  std::uint64_t ordered_digest = 0;
+  bool complete = false;
+};
+
 struct CudaStepEvidence
 {
   CudaRunStatus status = CudaRunStatus::ready;
@@ -257,6 +320,7 @@ struct CudaStepEvidence
   StateHash after_trace_hash{};
   CudaProductEvidence products{};
   CudaTransferTotals transfers{};
+  CudaTransferLedgerRangeV1 transfer_range{};
   double initial_residual = std::numeric_limits<double>::infinity();
   double final_residual = std::numeric_limits<double>::infinity();
   double true_relative_residual = std::numeric_limits<double>::infinity();
@@ -282,6 +346,8 @@ struct CudaPrecommitSnapshot
   StateCoordinates target{};
   StateHash candidate_interior_hash{};
   StateHash candidate_trace_hash{};
+  StateHash candidate_local_interior_hash{};
+  StateHash candidate_local_trace_hash{};
   CudaProductEvidence products{};
   std::size_t interior_coefficients = 0;
   std::size_t true_trace_coefficients = 0;
@@ -290,6 +356,40 @@ struct CudaPrecommitSnapshot
   bool numerical_candidate_ready = false;
   bool staging_must_precede_finalize = true;
   bool finalize_has_no_fallible_posthook = true;
+};
+
+/**
+ * Rank-local numerical payload plus rank-common checkpoint identity.
+ * The descriptor is produced by the frozen contract token.  Only FinalizeCommit
+ * seals successful_commit for durable use; provisional exchange is reversible.
+ */
+struct CudaSerializedCheckpointV1
+{
+  std::uint32_t schema = 1;
+  int source_rank = -1;
+  int rank_count = 0;
+  AttemptIdentity attempt{};
+  /** Correlates one live facade staging transaction; never contract authority. */
+  std::uint64_t facade_incarnation = 0;
+  CheckpointDescriptor descriptor{};
+  StateHash local_mesh_hash{};
+  StateHash local_partition_hash{};
+  StateHash local_topology_hash{};
+  StateHash local_interior_hash{};
+  StateHash local_trace_hash{};
+  std::uint64_t interior_count = 0;
+  std::uint64_t owned_true_trace_count = 0;
+  std::uintptr_t interior_source_token = 0;
+  std::uintptr_t trace_source_token = 0;
+  std::uint64_t staging_generation = 0;
+  std::array<double,
+             maximum_rank_elements * interior_dofs_per_element> interior{};
+  std::array<double, maximum_true_trace_dofs> owned_true_trace{};
+  CudaTransferLedgerRangeV1 staging_range{};
+  bool candidate_frozen = false;
+  bool checkpoint_staged = false;
+  bool output_staged = false;
+  bool successful_commit = false;
 };
 
 struct CudaRunEvidence
@@ -409,6 +509,7 @@ struct CudaInteriorState
   double* coefficients = nullptr;
   std::size_t count = 0;
   StateHash hash{};
+  StateHash local_hash{};
   std::uint64_t generation = 0;
   std::uintptr_t storage_token = 0;
   bool mfem_device_valid = false;
@@ -419,6 +520,7 @@ struct CudaTrueTraceState
   double* coefficients = nullptr;
   std::size_t count = 0;
   StateHash hash{};
+  StateHash local_hash{};
   std::uint64_t generation = 0;
   std::uintptr_t storage_token = 0;
   std::uintptr_t mfem_owner_token = 0;
@@ -433,23 +535,40 @@ struct CudaFutureSharedAbiRequest
   // define either name in this slice.
   static constexpr std::string_view phase_enum = "FailurePhase";
   static constexpr std::string_view state_export = "PersistentStateExportV1";
-  // Exact minimal lifecycle extension required by the card's outer commit:
-  // (1) FinishAttempt validation/reduction without publication returns an
-  // attempt-bound PendingPublicationCapability; (2) CommitPrepared consumes
-  // it and invokes one caller-supplied noexcept static publication policy that
-  // publishes state/cursors and makes already-staged artifacts eligible as a
-  // single non-recoverable boundary. AbortPrepared consumes the same
-  // capability and retains the existing rollback path.
+  // Frozen at c87984fe: the shared affine lifecycle now provides the exact
+  // reversible state boundary used here.
   static constexpr std::string_view prepare_finish =
-      "PrepareFinishAttempt -> PendingPublicationCapability";
+      "FreezeCandidate -> PrepareCommit";
   static constexpr std::string_view commit_prepared =
-      "CommitPrepared<NoexceptStaticPublicationPolicy>";
-  static constexpr std::string_view abort_prepared = "AbortPrepared";
+      "CommitPrepared -> FinalizeCommit/RevertCommit";
+  static constexpr std::string_view abort_prepared =
+      "AbortPrepared";
+  // Minimal remaining projection: shared TransferAccounting needs exact D2D
+  // bytes, transfer event count, and an immutable ordered-ledger digest.  The
+  // CUDA-owned V1 ledger remains authoritative until that ABI is accepted.
+  static constexpr std::string_view transfer_accounting =
+      "device_to_device_bytes + transfer_event_count + ordered_ledger_digest";
+  // Checkpoint descriptors deliberately carry rank-common aggregate hashes;
+  // this leaf separately serializes each local piece hash and payload.
+  static constexpr std::string_view checkpoint_local_piece =
+      "RankLocalCheckpointPieceV1";
+  // FreezeCandidate is rank-local and returns optional authority.  If a
+  // collective census ever observes a mixed frozen/unfrozen result, no current
+  // shared operation can roll both phases back without dropping a live token.
+  static constexpr std::string_view mixed_freeze_abort =
+      "AbortFrozenCollective(optional<StagingToken>&&, FailureReason)";
 };
 
 static_assert(std::is_standard_layout<CudaOraclePod>::value &&
                   std::is_trivially_copyable<CudaOraclePod>::value,
               "independent CUDA oracle seam must remain POD");
+static_assert(std::is_standard_layout<TransferEventV1>::value &&
+                  std::is_trivially_copyable<TransferEventV1>::value &&
+                  std::is_standard_layout<AllocationEventV1>::value &&
+                  std::is_trivially_copyable<AllocationEventV1>::value &&
+                  std::is_standard_layout<CudaSerializedCheckpointV1>::value &&
+                  std::is_trivially_copyable<CudaSerializedCheckpointV1>::value,
+              "CUDA accounting and checkpoint schemas must remain POD");
 static_assert(!std::is_polymorphic<CudaConfig>::value &&
                   !std::is_polymorphic<CudaRunEvidence>::value,
               "CUDA W8A runtime values must use static dispatch");
