@@ -288,7 +288,7 @@ function(dg_igr_add_hdg_cuda17_component)
                         CUDA_EXTENSIONS OFF
                         CUDA_ARCHITECTURES 120
                         CUDA_SEPARABLE_COMPILATION ON
-                        CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+                        CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
   target_include_directories("${HDG_TARGET}" PUBLIC
                              "${PROJECT_SOURCE_DIR}/include")
   target_compile_options("${HDG_TARGET}" PRIVATE

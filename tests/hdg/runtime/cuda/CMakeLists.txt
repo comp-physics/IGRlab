@@ -29,6 +29,13 @@ set_target_properties(dg_igr_hdg_runtime_cuda_w8a_leaf
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+get_target_property(_dg_igr_hdg_cuda_leaf_resolve
+  dg_igr_hdg_runtime_cuda_w8a_leaf CUDA_RESOLVE_DEVICE_SYMBOLS)
+if(NOT _dg_igr_hdg_cuda_leaf_resolve STREQUAL "ON")
+  message(FATAL_ERROR
+    "dg_igr_hdg_runtime_cuda_w8a_leaf must own final CUDA device linking.")
+endif()
+
 add_test(
   NAME dg_igr_hdg_runtime_cuda_w8a_rank1
   COMMAND dg_igr_hdg_runtime_cuda_w8a_leaf)
