@@ -569,6 +569,189 @@ using Contract = PersistentRunContract<Selection,
                                        ArrayStoragePolicy,
                                        TestCollectivePolicy>;
 
+struct TwoPhaseArrayStoragePolicy : ArrayStoragePolicy
+{
+  static constexpr bool publish_is_complete_slot_exchange = true;
+  static constexpr bool candidate_retains_exact_old_state_after_publish = true;
+  static constexpr bool revert_publish_is_exact_byte_inverse = true;
+  static constexpr bool publish_and_revert_preserve_disjoint_backing = true;
+  static inline std::uint64_t reversions = 0;
+  static inline Slot* live_candidate = nullptr;
+  static inline Slot reverted_committed{};
+  static inline Slot reverted_candidate{};
+
+  static void Reset() noexcept
+  {
+    ArrayStoragePolicy::Reset();
+    reversions = 0;
+    live_candidate = nullptr;
+    reverted_committed = {};
+    reverted_candidate = {};
+  }
+
+  static bool PrepareCandidate(const Slot& committed,
+                               Slot& candidate) noexcept
+  {
+    live_candidate = &candidate;
+    return ArrayStoragePolicy::PrepareCandidate(committed, candidate);
+  }
+
+  static bool StoreCandidate(Slot& candidate, const Slot& value) noexcept
+  {
+    live_candidate = &candidate;
+    return ArrayStoragePolicy::StoreCandidate(candidate, value);
+  }
+
+  static void RevertPublish(Slot& committed, Slot& candidate) noexcept
+  {
+    ++reversions;
+    using std::swap;
+    swap(committed, candidate);
+    reverted_committed = committed;
+    reverted_candidate = candidate;
+  }
+};
+
+struct FalseTwoPhaseAttestationPolicy : ArrayStoragePolicy
+{
+  static constexpr bool publish_is_complete_slot_exchange = true;
+  static constexpr bool candidate_retains_exact_old_state_after_publish = true;
+  static constexpr bool revert_publish_is_exact_byte_inverse = false;
+  static constexpr bool publish_and_revert_preserve_disjoint_backing = true;
+  static void RevertPublish(Slot&, Slot&) noexcept {}
+};
+
+template <int FalseIndex>
+struct FalseAttestationMatrixPolicy : ArrayStoragePolicy
+{
+  static constexpr bool publish_is_complete_slot_exchange = FalseIndex != 0;
+  static constexpr bool candidate_retains_exact_old_state_after_publish =
+      FalseIndex != 1;
+  static constexpr bool revert_publish_is_exact_byte_inverse =
+      FalseIndex != 2;
+  static constexpr bool publish_and_revert_preserve_disjoint_backing =
+      FalseIndex != 3;
+  static void RevertPublish(Slot&, Slot&) noexcept {}
+};
+
+struct MissingRevertPolicy : ArrayStoragePolicy
+{
+  static constexpr bool publish_is_complete_slot_exchange = true;
+  static constexpr bool candidate_retains_exact_old_state_after_publish = true;
+  static constexpr bool revert_publish_is_exact_byte_inverse = true;
+  static constexpr bool publish_and_revert_preserve_disjoint_backing = true;
+};
+
+struct MissingAttestationPolicy : ArrayStoragePolicy
+{
+  static constexpr bool publish_is_complete_slot_exchange = true;
+  static constexpr bool candidate_retains_exact_old_state_after_publish = true;
+  static constexpr bool revert_publish_is_exact_byte_inverse = true;
+  static void RevertPublish(Slot&, Slot&) noexcept {}
+};
+
+struct ThrowingRevertPolicy : ArrayStoragePolicy
+{
+  static constexpr bool publish_is_complete_slot_exchange = true;
+  static constexpr bool candidate_retains_exact_old_state_after_publish = true;
+  static constexpr bool revert_publish_is_exact_byte_inverse = true;
+  static constexpr bool publish_and_revert_preserve_disjoint_backing = true;
+  static void RevertPublish(Slot&, Slot&) {}
+};
+
+struct OverloadedRevertPolicy : ArrayStoragePolicy
+{
+  static constexpr bool publish_is_complete_slot_exchange = true;
+  static constexpr bool candidate_retains_exact_old_state_after_publish = true;
+  static constexpr bool revert_publish_is_exact_byte_inverse = true;
+  static constexpr bool publish_and_revert_preserve_disjoint_backing = true;
+  static void RevertPublish(Slot&, Slot&) noexcept {}
+  static void RevertPublish(Slot&, const Slot&) noexcept {}
+};
+
+struct WrongAttestationTypePolicy : ArrayStoragePolicy
+{
+  static constexpr int publish_is_complete_slot_exchange = 1;
+  static constexpr bool candidate_retains_exact_old_state_after_publish = true;
+  static constexpr bool revert_publish_is_exact_byte_inverse = true;
+  static constexpr bool publish_and_revert_preserve_disjoint_backing = true;
+  static void RevertPublish(Slot&, Slot&) noexcept {}
+};
+
+using TwoPhaseContract = PersistentRunContract<Selection,
+                                               Interior,
+                                               Trace,
+                                               TwoPhaseArrayStoragePolicy,
+                                               TestCollectivePolicy>;
+using FalseTwoPhaseContract = PersistentRunContract<
+    Selection,
+    Interior,
+    Trace,
+    FalseTwoPhaseAttestationPolicy,
+    TestCollectivePolicy>;
+using ThrowingRevertContract = PersistentRunContract<Selection,
+                                                     Interior,
+                                                     Trace,
+                                                     ThrowingRevertPolicy,
+                                                     TestCollectivePolicy>;
+using OverloadedRevertContract = PersistentRunContract<Selection,
+                                                       Interior,
+                                                       Trace,
+                                                       OverloadedRevertPolicy,
+                                                       TestCollectivePolicy>;
+using WrongAttestationContract = PersistentRunContract<
+    Selection,
+    Interior,
+    Trace,
+    WrongAttestationTypePolicy,
+    TestCollectivePolicy>;
+template <int FalseIndex>
+using FalseAttestationMatrixContract = PersistentRunContract<
+    Selection,
+    Interior,
+    Trace,
+    FalseAttestationMatrixPolicy<FalseIndex>,
+    TestCollectivePolicy>;
+using MissingRevertContract = PersistentRunContract<Selection,
+                                                    Interior,
+                                                    Trace,
+                                                    MissingRevertPolicy,
+                                                    TestCollectivePolicy>;
+using MissingAttestationContract = PersistentRunContract<
+    Selection,
+    Interior,
+    Trace,
+    MissingAttestationPolicy,
+    TestCollectivePolicy>;
+
+template <typename ContractType, typename = void>
+struct HasTwoPhaseCommitApi : std::false_type
+{};
+
+template <typename ContractType>
+struct HasTwoPhaseCommitApi<
+    ContractType,
+    std::void_t<
+        decltype(std::declval<ContractType&>().FreezeCandidate(
+            std::declval<const AttemptIdentity&>(), std::uint64_t{})),
+        decltype(std::declval<const ContractType&>().CopyPrepared(
+            std::declval<const typename ContractType::StagingToken&>(),
+            std::declval<typename ContractType::state_slot&>())),
+        decltype(std::declval<ContractType&>().PrepareCommit(
+            std::declval<typename ContractType::StagingToken&&>(),
+            std::declval<const AttemptReport&>(),
+            std::declval<typename ContractType::ProductBundle&&>())),
+        decltype(std::declval<ContractType&>().CommitPrepared(
+            std::declval<typename ContractType::PreparedCommitToken&&>())),
+        decltype(std::declval<ContractType&>().FinalizeCommit(
+            std::declval<typename ContractType::ProvisionalCommitToken&&>())),
+        decltype(std::declval<ContractType&>().AbortPrepared(
+            std::declval<typename ContractType::PreparedCommitToken&&>())),
+        decltype(std::declval<ContractType&>().RevertCommit(
+            std::declval<typename ContractType::ProvisionalCommitToken&&>()))>>
+    : std::true_type
+{};
+
 static_assert(Selection::interior_space == InteriorSpace::l2);
 static_assert(!std::is_polymorphic<Selection>::value);
 static_assert(!std::is_polymorphic<Contract>::value);
@@ -584,6 +767,64 @@ static_assert(!std::is_copy_constructible<
               "attempt products must not be duplicable by copying");
 static_assert(!std::is_convertible<Contract::CandidateCapability, Slot*>::value);
 static_assert(!std::is_convertible<Contract::PublishedCapability, Slot*>::value);
+static_assert(HasTwoPhaseCommitApi<TwoPhaseContract>::value);
+static_assert(!HasTwoPhaseCommitApi<Contract>::value,
+              "legacy storage policies expose no two-phase members");
+static_assert(!HasTwoPhaseCommitApi<FalseTwoPhaseContract>::value);
+static_assert(!HasTwoPhaseCommitApi<ThrowingRevertContract>::value);
+static_assert(!HasTwoPhaseCommitApi<OverloadedRevertContract>::value);
+static_assert(!HasTwoPhaseCommitApi<WrongAttestationContract>::value);
+static_assert(!HasTwoPhaseCommitApi<FalseAttestationMatrixContract<0>>::value);
+static_assert(!HasTwoPhaseCommitApi<FalseAttestationMatrixContract<1>>::value);
+static_assert(!HasTwoPhaseCommitApi<FalseAttestationMatrixContract<2>>::value);
+static_assert(!HasTwoPhaseCommitApi<FalseAttestationMatrixContract<3>>::value);
+static_assert(!HasTwoPhaseCommitApi<MissingRevertContract>::value);
+static_assert(!HasTwoPhaseCommitApi<MissingAttestationContract>::value);
+static_assert(std::is_same<
+                  decltype(std::declval<FalseTwoPhaseContract&>().BeginStep(
+                      std::declval<const StepRequest&>())),
+                  BeginOutcome>::value);
+static_assert(std::is_same<
+                  decltype(std::declval<ThrowingRevertContract&>().BeginStep(
+                      std::declval<const StepRequest&>())),
+                  BeginOutcome>::value);
+static_assert(std::is_same<
+                  decltype(std::declval<OverloadedRevertContract&>().BeginStep(
+                      std::declval<const StepRequest&>())),
+                  BeginOutcome>::value);
+static_assert(std::is_same<
+                  decltype(std::declval<WrongAttestationContract&>().BeginStep(
+                      std::declval<const StepRequest&>())),
+                  BeginOutcome>::value);
+static_assert(detail::SupportsTwoPhaseSlotExchange<
+                  TwoPhaseArrayStoragePolicy,
+                  Slot>::value);
+static_assert(!detail::SupportsTwoPhaseSlotExchange<ArrayStoragePolicy,
+                                                    Slot>::value);
+static_assert(!std::is_default_constructible<
+                  TwoPhaseContract::StagingToken>::value);
+static_assert(!std::is_copy_constructible<
+                  TwoPhaseContract::StagingToken>::value);
+static_assert(std::is_move_constructible<
+                  TwoPhaseContract::StagingToken>::value);
+static_assert(!std::is_move_assignable<
+                  TwoPhaseContract::StagingToken>::value);
+static_assert(!std::is_default_constructible<
+                  TwoPhaseContract::PreparedCommitToken>::value);
+static_assert(!std::is_copy_constructible<
+                  TwoPhaseContract::PreparedCommitToken>::value);
+static_assert(std::is_move_constructible<
+                  TwoPhaseContract::PreparedCommitToken>::value);
+static_assert(!std::is_move_assignable<
+                  TwoPhaseContract::PreparedCommitToken>::value);
+static_assert(!std::is_default_constructible<
+                  TwoPhaseContract::ProvisionalCommitToken>::value);
+static_assert(!std::is_copy_constructible<
+                  TwoPhaseContract::ProvisionalCommitToken>::value);
+static_assert(std::is_move_constructible<
+                  TwoPhaseContract::ProvisionalCommitToken>::value);
+static_assert(!std::is_move_assignable<
+                  TwoPhaseContract::ProvisionalCommitToken>::value);
 static_assert(static_cast<unsigned int>(FailureReason::count) < 64);
 static_assert(static_cast<unsigned int>(RestartCompatibility::count) < 64);
 static_assert(FailureMask(static_cast<FailureReason>(255)) == 0);
@@ -661,6 +902,19 @@ Contract MakeContract(const StateCoordinates coordinates = InitialCoordinates(),
   return Contract{committed, scratch, coordinates, resources, initial_sequence};
 }
 
+TwoPhaseContract MakeTwoPhaseContract(
+    const StateCoordinates coordinates = InitialCoordinates(),
+    const PersistentResourceDescriptor resources = Resources(),
+    const std::uint64_t initial_sequence = 0,
+    const Slot committed = CommittedSlot(),
+    const Slot scratch = ScratchSlot())
+{
+  TwoPhaseArrayStoragePolicy::Reset();
+  TestCollectivePolicy::Reset();
+  return TwoPhaseContract{
+      committed, scratch, coordinates, resources, initial_sequence};
+}
+
 AttemptReport PassingReport(const std::uint64_t cursor)
 {
   AttemptReport report{};
@@ -709,7 +963,24 @@ bool StoreCandidate(Contract& contract,
   return capability && contract.StoreCandidate(*capability, value);
 }
 
+template <typename ContractType>
+bool StoreCandidateFor(ContractType& contract,
+                       const AttemptIdentity& attempt,
+                       const typename ContractType::state_slot& value)
+{
+  const auto capability = contract.AcquireCandidate(attempt);
+  return capability && contract.StoreCandidate(*capability, value);
+}
+
 bool CopyPublished(const Contract& contract, Slot& copy)
+{
+  const auto capability = contract.Published();
+  return contract.CopyPublished(capability, copy);
+}
+
+template <typename ContractType>
+bool CopyPublishedFor(const ContractType& contract,
+                      typename ContractType::state_slot& copy)
 {
   const auto capability = contract.Published();
   return contract.CopyPublished(capability, copy);
@@ -722,6 +993,11 @@ bool SameCoordinates(const StateCoordinates& left,
       left.step == right.step && left.generation == right.generation &&
       left.cursor == right.cursor &&
       std::memcmp(&left.dt, &right.dt, sizeof(double)) == 0;
+}
+
+bool SameSlotBytes(const Slot& left, const Slot& right)
+{
+  return std::memcmp(&left, &right, sizeof(Slot)) == 0;
 }
 
 bool SameTransfers(const TransferAccounting& left,
@@ -1909,6 +2185,707 @@ bool CheckResidualTelemetryAndCollectiveTruth()
   return passed;
 }
 
+bool CheckTwoPhaseDetectionLegacyAndReentrantAdmission()
+{
+  bool passed = true;
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const bool stored = StoreCandidate(contract, begin.attempt, AcceptedSlot());
+    auto products = IssueAll(contract, begin.attempt);
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        begin.attempt, PassingReport(12), std::move(products));
+    passed = Check(begin.started && stored && outcome.committed &&
+                       TestCollectivePolicy::reductions == 1 &&
+                       ArrayStoragePolicy::publications == 1 &&
+                       contract.telemetry().commits == 1,
+                   "legacy_policy_keeps_one_reduce_immediate_finish") &&
+        passed;
+  }
+
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const auto candidate = contract.AcquireCandidate(begin.attempt);
+    const bool stored = candidate &&
+        contract.StoreCandidate(*candidate, AcceptedSlot());
+    const std::uint64_t discards_before = ArrayStoragePolicy::discards;
+    const BeginOutcome nested_begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const BeginOutcome nested_retry = contract.Retry();
+    CheckpointDescriptor ignored_checkpoint{};
+    const RestoreOutcome nested_restore =
+        contract.Restore(ignored_checkpoint, OtherSlot());
+    Slot candidate_after{};
+    const bool candidate_preserved = candidate &&
+        contract.CopyCandidate(*candidate, candidate_after);
+    auto products = IssueAll(contract, begin.attempt);
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        begin.attempt, PassingReport(12), std::move(products));
+    passed = Check(
+                 begin.started && stored && !nested_begin.started &&
+                     nested_begin.reason == FailureReason::stale_attempt &&
+                     !nested_retry.started &&
+                     nested_retry.reason == FailureReason::retry_exhausted &&
+                     !nested_restore.restored &&
+                     nested_restore.compatibility ==
+                         RestartCompatibility::contract_busy &&
+                     candidate_preserved &&
+                     SameSlotBytes(candidate_after, AcceptedSlot()) &&
+                     ArrayStoragePolicy::discards == discards_before &&
+                     TestCollectivePolicy::admissions == 3 &&
+                     TestCollectivePolicy::restores == 1 &&
+                     outcome.committed &&
+                     TestCollectivePolicy::reductions == 1,
+                 "reentrant_admission_and_restore_preserve_live_mutable_candidate") &&
+        passed;
+  }
+  return passed;
+}
+
+bool CheckTwoPhaseFreezePrepareCommitFinalize()
+{
+  bool passed = true;
+  TwoPhaseContract contract = MakeTwoPhaseContract();
+  const auto old = contract.Published();
+  Slot old_before{};
+  StateCoordinates old_coordinates{};
+  const bool old_captured = contract.CopyPublished(old, old_before) &&
+      contract.PublishedCoordinates(old, old_coordinates);
+  const BeginOutcome begin =
+      contract.BeginStep({InteriorSpace::l2, 0.125});
+  const auto mutable_capability = contract.AcquireCandidate(begin.attempt);
+  const bool stored = mutable_capability &&
+      contract.StoreCandidate(*mutable_capability, AcceptedSlot());
+  auto products = IssueAllFor(contract, begin.attempt);
+
+  const RunTelemetry telemetry_before_freeze = contract.telemetry();
+  const StateCoordinates coordinates_before_freeze = contract.coordinates();
+  const std::uint64_t reductions_before = TestCollectivePolicy::reductions;
+  const std::uint64_t publications_before = ArrayStoragePolicy::publications;
+  auto staging = contract.FreezeCandidate(begin.attempt, 12);
+  const CheckpointDescriptor future = staging
+      ? staging->future_checkpoint()
+      : CheckpointDescriptor{};
+  const StateCoordinates expected_target{1.125, 5, 8, 12, 0.125};
+  Slot frozen_copy{};
+  const bool copied_frozen = staging &&
+      staging->CopyPrepared(frozen_copy);
+  CheckpointDescriptor premature_checkpoint{};
+  const bool premature_checkpoint_rejected =
+      !contract.TryMakeCheckpoint(premature_checkpoint);
+
+  const auto blocked_acquire = contract.AcquireCandidate(begin.attempt);
+  const bool blocked_store = mutable_capability &&
+      !contract.StoreCandidate(*mutable_capability, OtherSlot());
+  Slot blocked_copy{};
+  const bool blocked_candidate_copy = mutable_capability &&
+      !contract.CopyCandidate(*mutable_capability, blocked_copy);
+  const auto blocked_product =
+      contract.IssueProduct<DerivedProductKind::residual>(begin.attempt);
+
+  passed = Check(
+               old_captured && begin.started && stored && staging &&
+                   copied_frozen && SameSlotBytes(frozen_copy, AcceptedSlot()) &&
+                   !blocked_acquire && blocked_store &&
+                   blocked_candidate_copy && !blocked_product &&
+                   premature_checkpoint_rejected &&
+                   staging->entry_coordinates().step ==
+                       coordinates_before_freeze.step &&
+                   SameCoordinates(staging->target_coordinates(),
+                                   expected_target) &&
+                   staging->interior_hash() ==
+                       ArrayStoragePolicy::HashInterior(
+                           AcceptedSlot().interior) &&
+                   staging->trace_hash() ==
+                       ArrayStoragePolicy::HashTrace(AcceptedSlot().trace) &&
+                   future.successful_commit && future.cursor == 12 &&
+                   SameCoordinates(future.coordinates, expected_target) &&
+                   TestCollectivePolicy::reductions == reductions_before &&
+                   ArrayStoragePolicy::publications == publications_before &&
+                   SameCoordinates(contract.coordinates(),
+                                   coordinates_before_freeze) &&
+                   contract.status() == RunStatus::attempt_active &&
+                   SameTransfers(contract.telemetry().attempted_transfers,
+                                 telemetry_before_freeze.attempted_transfers) &&
+                   SameTransfers(contract.telemetry().rolled_back_transfers,
+                                 telemetry_before_freeze.rolled_back_transfers) &&
+                   SameTransfers(contract.telemetry().committed_transfers,
+                                 telemetry_before_freeze.committed_transfers),
+               "freeze_is_zero_effect_and_blocks_mutation_product_checkpoint") &&
+      passed;
+
+  if (!staging) { return passed; }
+  TwoPhaseContract::StagingToken moved_staging{std::move(*staging)};
+  Slot moved_from_copy{};
+  const bool moved_from_rejected =
+      !contract.CopyPrepared(*staging, moved_from_copy);
+  const AttemptReport report = PassingReport(12);
+  auto prepared = contract.PrepareCommit(
+      std::move(moved_staging), report, std::move(products));
+  const CheckpointDescriptor prepared_descriptor = prepared
+      ? prepared->checkpoint_descriptor()
+      : CheckpointDescriptor{};
+  Slot old_after_prepare{};
+  StateCoordinates coordinates_after_prepare{};
+  const bool old_visible_after_prepare =
+      contract.CopyPublished(old, old_after_prepare) &&
+      contract.PublishedCoordinates(old, coordinates_after_prepare);
+  passed = Check(
+               moved_from_rejected && prepared &&
+                   TestCollectivePolicy::reductions == reductions_before + 1 &&
+                   ArrayStoragePolicy::publications == publications_before &&
+                   old_visible_after_prepare &&
+                   SameSlotBytes(old_before, old_after_prepare) &&
+                   SameCoordinates(old_coordinates, coordinates_after_prepare) &&
+                   SameCoordinates(contract.coordinates(), old_coordinates) &&
+                   contract.status() == RunStatus::attempt_active &&
+                   contract.telemetry().commits == 0 &&
+                   !contract.telemetry().accepted.valid &&
+                   SameTransfers(contract.telemetry().attempted_transfers,
+                                 report.telemetry.transfers) &&
+                   contract.telemetry().rolled_back_transfers
+                           .host_to_device_bytes == 0 &&
+                   contract.telemetry().committed_transfers
+                           .host_to_device_bytes == 0,
+               "prepare_reduces_accounts_once_without_publication_or_success") &&
+      passed;
+  if (!prepared) { return passed; }
+
+  const std::uint64_t prepublish_checks_before =
+      ArrayStoragePolicy::prepublish_checks;
+  const std::uint64_t discards_before = ArrayStoragePolicy::discards;
+  auto provisional = contract.CommitPrepared(std::move(*prepared));
+  auto duplicate_exchange =
+      contract.CommitPrepared(std::move(*prepared));
+  Slot old_during_provisional{};
+  StateCoordinates coordinates_during_provisional{};
+  const bool old_visible_during_provisional =
+      contract.CopyPublished(old, old_during_provisional) &&
+      contract.PublishedCoordinates(old, coordinates_during_provisional);
+  passed = Check(
+               provisional && !duplicate_exchange &&
+                   old_visible_during_provisional &&
+                   SameSlotBytes(old_before, old_during_provisional) &&
+                   SameCoordinates(old_coordinates,
+                                   coordinates_during_provisional) &&
+                   SameCoordinates(contract.coordinates(), old_coordinates) &&
+                   ArrayStoragePolicy::publications == publications_before + 1 &&
+                   ArrayStoragePolicy::prepublish_checks ==
+                       prepublish_checks_before &&
+                   ArrayStoragePolicy::discards == discards_before &&
+                   contract.telemetry().commits == 0 &&
+                   !contract.telemetry().accepted.valid &&
+                   contract.telemetry().committed_transfers
+                           .host_to_device_bytes == 0 &&
+                   contract.status() == RunStatus::attempt_active &&
+                   !contract.TryMakeCheckpoint(premature_checkpoint),
+               "provisional_exchange_preserves_all_old_public_state") &&
+      passed;
+  if (!provisional) { return passed; }
+
+  const AttemptOutcome finalized =
+      contract.FinalizeCommit(std::move(*provisional));
+  const std::uint64_t commits_after_finalize = contract.telemetry().commits;
+  const TransferAccounting committed_after_finalize =
+      contract.telemetry().committed_transfers;
+  const AttemptOutcome duplicate_finalize =
+      contract.FinalizeCommit(std::move(*provisional));
+  Slot published_after{};
+  Slot stale_old{};
+  CheckpointDescriptor final_checkpoint{};
+  const bool final_checkpoint_created =
+      contract.TryMakeCheckpoint(final_checkpoint);
+  passed = Check(
+               finalized.committed &&
+                   finalized.status == RunStatus::committed &&
+                   duplicate_finalize.reason == FailureReason::stale_attempt &&
+                   !duplicate_finalize.committed &&
+                   contract.telemetry().commits == commits_after_finalize &&
+                   commits_after_finalize == 1 &&
+                   SameTransfers(committed_after_finalize,
+                                 report.telemetry.transfers) &&
+                   SameTransfers(contract.telemetry().committed_transfers,
+                                 committed_after_finalize) &&
+                   SameCoordinates(contract.coordinates(), expected_target) &&
+                   !contract.CopyPublished(old, stale_old) &&
+                   CopyPublishedFor(contract, published_after) &&
+                   SameSlotBytes(published_after, AcceptedSlot()) &&
+                   final_checkpoint_created &&
+                   detail::SameCheckpoint(future, prepared_descriptor) &&
+                   detail::SameCheckpoint(future, final_checkpoint),
+               "finalize_is_sole_exactly_once_logical_success_and_descriptor_match") &&
+      passed;
+  return passed;
+}
+
+bool CheckTwoPhasePrepareFailuresAbortAndRevert()
+{
+  bool passed = true;
+  for (const bool remote_failure : {false, true})
+  {
+    TwoPhaseContract contract = MakeTwoPhaseContract();
+    const auto old = contract.Published();
+    Slot old_before{};
+    const bool captured = contract.CopyPublished(old, old_before);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const bool stored =
+        StoreCandidateFor(contract, begin.attempt, AcceptedSlot());
+    auto products = IssueAllFor(contract, begin.attempt);
+    auto staging = contract.FreezeCandidate(begin.attempt, 12);
+    AttemptReport report = PassingReport(12);
+    FailureReason expected = FailureReason::backend_failure;
+    if (remote_failure)
+    {
+      TestCollectivePolicy::fault = CollectiveFault::finish_remote_failure;
+      TestCollectivePolicy::remote_reason =
+          FailureReason::admissibility_gate;
+      expected = FailureReason::admissibility_gate;
+    }
+    else
+    {
+      report.originating_failure = FailureReason::backend_failure;
+    }
+    auto prepared = staging
+        ? contract.PrepareCommit(
+              std::move(*staging), report, std::move(products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    Slot old_after{};
+    passed = Check(
+                 captured && begin.started && stored && staging && !prepared &&
+                     contract.status() == RunStatus::retry_available &&
+                     contract.last_failure() == expected &&
+                     TestCollectivePolicy::reductions == 1 &&
+                     ArrayStoragePolicy::publications == 0 &&
+                     contract.telemetry().attempts_failed == 1 &&
+                     contract.telemetry().rollbacks == 1 &&
+                     SameTransfers(contract.telemetry().attempted_transfers,
+                                   report.telemetry.transfers) &&
+                     SameTransfers(contract.telemetry().rolled_back_transfers,
+                                   report.telemetry.transfers) &&
+                     contract.telemetry().committed_transfers
+                             .host_to_device_bytes == 0 &&
+                     contract.CopyPublished(old, old_after) &&
+                     SameSlotBytes(old_before, old_after) &&
+                     SameCoordinates(contract.coordinates(),
+                                     InitialCoordinates()),
+                 remote_failure
+                     ? "remote_prepare_failure_uses_ordinary_rollback_retry"
+                     : "originating_backend_prepare_failure_uses_ordinary_rollback_retry") &&
+        passed;
+  }
+
+  {
+    TwoPhaseContract contract = MakeTwoPhaseContract();
+    const auto old = contract.Published();
+    Slot old_before{};
+    const bool captured = contract.CopyPublished(old, old_before);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const bool stored =
+        StoreCandidateFor(contract, begin.attempt, AcceptedSlot());
+    auto products = IssueAllFor(contract, begin.attempt);
+    auto staging = contract.FreezeCandidate(begin.attempt, 12);
+    const AttemptReport report = PassingReport(12);
+    auto prepared = staging
+        ? contract.PrepareCommit(
+              std::move(*staging), report, std::move(products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    const AttemptOutcome aborted = prepared
+        ? contract.AbortPrepared(
+              std::move(*prepared), FailureReason::backend_failure)
+        : AttemptOutcome{};
+    const std::uint64_t rollbacks_after_abort =
+        contract.telemetry().rollbacks;
+    const AttemptOutcome duplicate_abort = prepared
+        ? contract.AbortPrepared(std::move(*prepared))
+        : AttemptOutcome{};
+    Slot old_after{};
+    const BeginOutcome retry = contract.Retry();
+    const auto retry_candidate = contract.AcquireCandidate(retry.attempt);
+    Slot retry_base{};
+    const bool retry_uses_old = retry_candidate &&
+        contract.CopyCandidate(*retry_candidate, retry_base);
+    passed = Check(
+                 captured && begin.started && stored && staging && prepared &&
+                     aborted.retry_available && !aborted.committed &&
+                     duplicate_abort.reason == FailureReason::stale_attempt &&
+                     contract.telemetry().rollbacks == rollbacks_after_abort &&
+                     rollbacks_after_abort == 1 &&
+                     TestCollectivePolicy::reductions == 1 &&
+                     ArrayStoragePolicy::publications == 0 &&
+                     SameTransfers(contract.telemetry().attempted_transfers,
+                                   report.telemetry.transfers) &&
+                     SameTransfers(contract.telemetry().rolled_back_transfers,
+                                   report.telemetry.transfers) &&
+                     contract.telemetry().committed_transfers
+                             .host_to_device_bytes == 0 &&
+                     contract.CopyPublished(old, old_after) &&
+                     SameSlotBytes(old_before, old_after) && retry.started &&
+                     retry_uses_old && SameSlotBytes(retry_base, old_before),
+                 "abort_prepared_rolls_back_accounts_once_and_retries_old") &&
+        passed;
+  }
+
+  {
+    TwoPhaseContract contract = MakeTwoPhaseContract();
+    const auto old = contract.Published();
+    Slot old_before{};
+    const bool captured = contract.CopyPublished(old, old_before);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const bool stored =
+        StoreCandidateFor(contract, begin.attempt, AcceptedSlot());
+    auto products = IssueAllFor(contract, begin.attempt);
+    auto staging = contract.FreezeCandidate(begin.attempt, 12);
+    const AttemptReport report = PassingReport(12);
+    auto prepared = staging
+        ? contract.PrepareCommit(
+              std::move(*staging), report, std::move(products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    auto provisional = prepared
+        ? contract.CommitPrepared(std::move(*prepared))
+        : std::optional<TwoPhaseContract::ProvisionalCommitToken>{};
+    Slot old_provisional{};
+    const bool old_still_visible = provisional &&
+        contract.CopyPublished(old, old_provisional);
+    const AttemptOutcome reverted = provisional
+        ? contract.RevertCommit(
+              std::move(*provisional), FailureReason::backend_failure)
+        : AttemptOutcome{};
+    const std::uint64_t reversions_after =
+        TwoPhaseArrayStoragePolicy::reversions;
+    const std::uint64_t rollbacks_after = contract.telemetry().rollbacks;
+    const AttemptOutcome duplicate_revert = provisional
+        ? contract.RevertCommit(std::move(*provisional))
+        : AttemptOutcome{};
+    Slot old_after{};
+    passed = Check(
+                 captured && begin.started && stored && staging && prepared &&
+                     provisional && old_still_visible &&
+                     SameSlotBytes(old_before, old_provisional) &&
+                     reverted.retry_available && !reverted.committed &&
+                     duplicate_revert.reason == FailureReason::stale_attempt &&
+                     TwoPhaseArrayStoragePolicy::reversions ==
+                         reversions_after &&
+                     reversions_after == 1 &&
+                     contract.telemetry().rollbacks == rollbacks_after &&
+                     rollbacks_after == 1 &&
+                     ArrayStoragePolicy::publications == 1 &&
+                     SameSlotBytes(
+                         TwoPhaseArrayStoragePolicy::reverted_committed,
+                         old_before) &&
+                     SameSlotBytes(
+                         TwoPhaseArrayStoragePolicy::reverted_candidate,
+                         AcceptedSlot()) &&
+                     contract.CopyPublished(old, old_after) &&
+                     SameSlotBytes(old_before, old_after) &&
+                     SameCoordinates(contract.coordinates(),
+                                     InitialCoordinates()) &&
+                     SameTransfers(contract.telemetry().attempted_transfers,
+                                   report.telemetry.transfers) &&
+                     SameTransfers(contract.telemetry().rolled_back_transfers,
+                                   report.telemetry.transfers) &&
+                     contract.telemetry().committed_transfers
+                             .host_to_device_bytes == 0,
+                 "revert_inverse_precedes_exact_once_ordinary_rollback") &&
+        passed;
+  }
+  return passed;
+}
+
+bool CheckTwoPhaseBindingsTamperAndOverflow()
+{
+  bool passed = true;
+  {
+    TwoPhaseContract contract = MakeTwoPhaseContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(contract, begin.attempt, AcceptedSlot());
+    auto products = IssueAllFor(contract, begin.attempt);
+    auto staging = contract.FreezeCandidate(begin.attempt, 12);
+    auto prepared = staging
+        ? contract.PrepareCommit(
+              std::move(*staging), PassingReport(13), std::move(products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    passed = Check(staging && !prepared &&
+                       contract.last_failure() == FailureReason::stale_attempt &&
+                       contract.status() == RunStatus::retry_available &&
+                       TestCollectivePolicy::reductions == 1 &&
+                       ArrayStoragePolicy::publications == 0,
+                   "frozen_target_and_report_cursor_are_exactly_bound") &&
+        passed;
+  }
+
+  {
+    TwoPhaseContract contract = MakeTwoPhaseContract();
+    const auto old = contract.Published();
+    Slot old_before{};
+    const bool captured = contract.CopyPublished(old, old_before);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(contract, begin.attempt, AcceptedSlot());
+    auto products = IssueAllFor(contract, begin.attempt);
+    auto staging = contract.FreezeCandidate(begin.attempt, 12);
+    if (TwoPhaseArrayStoragePolicy::live_candidate)
+    {
+      TwoPhaseArrayStoragePolicy::live_candidate->interior[0] += 1.0;
+    }
+    Slot tampered_copy{};
+    const bool copy_rejected = staging &&
+        !contract.CopyPrepared(*staging, tampered_copy);
+    auto prepared = staging
+        ? contract.PrepareCommit(
+              std::move(*staging), PassingReport(12), std::move(products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    Slot old_after{};
+    passed = Check(captured && staging && copy_rejected && !prepared &&
+                       contract.last_failure() ==
+                           FailureReason::candidate_preparation &&
+                       contract.status() == RunStatus::retry_available &&
+                       ArrayStoragePolicy::publications == 0 &&
+                       contract.CopyPublished(old, old_after) &&
+                       SameSlotBytes(old_before, old_after),
+                   "frozen_candidate_hash_tamper_fails_before_publication") &&
+        passed;
+  }
+
+  {
+    TwoPhaseContract contract = MakeTwoPhaseContract();
+    const BeginOutcome first =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto first_products = IssueAllFor(contract, first.attempt);
+    AttemptReport boundary = PassingReport(12);
+    boundary.gates.finite = false;
+    boundary.telemetry.transfers.host_to_device_bytes =
+        std::numeric_limits<std::uint64_t>::max();
+    const AttemptOutcome failed = contract.FinishAttempt(
+        first.attempt, boundary, std::move(first_products));
+    const BeginOutcome retry = contract.Retry();
+    StoreCandidateFor(contract, retry.attempt, AcceptedSlot());
+    auto retry_products = IssueAllFor(contract, retry.attempt);
+    auto staging = contract.FreezeCandidate(retry.attempt, 12);
+    AttemptReport overflow = PassingReport(12);
+    overflow.telemetry.transfers = {1, 0, 0, 0, 0, true};
+    auto prepared = staging
+        ? contract.PrepareCommit(
+              std::move(*staging), overflow, std::move(retry_products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    passed = Check(failed.retry_available && retry.started && staging &&
+                       !prepared &&
+                       contract.last_failure() == FailureReason::telemetry_gate &&
+                       contract.status() == RunStatus::terminal_failure &&
+                       contract.telemetry().attempted_transfers
+                               .host_to_device_bytes ==
+                           std::numeric_limits<std::uint64_t>::max() &&
+                       contract.telemetry().rolled_back_transfers
+                               .host_to_device_bytes ==
+                           std::numeric_limits<std::uint64_t>::max() &&
+                       contract.telemetry()
+                               .transfer_accounting_overflow_rejections == 1 &&
+                       ArrayStoragePolicy::publications == 0,
+                   "two_phase_transfer_overflow_fails_without_saturation") &&
+        passed;
+  }
+  return passed;
+}
+
+bool CheckTwoPhaseTokenOwnershipABAAndBusyReentrancy()
+{
+  bool passed = true;
+  {
+    TwoPhaseContract first = MakeTwoPhaseContract();
+    const BeginOutcome first_begin =
+        first.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(first, first_begin.attempt, AcceptedSlot());
+    auto first_staging = first.FreezeCandidate(first_begin.attempt, 12);
+
+    TwoPhaseContract second = MakeTwoPhaseContract();
+    const BeginOutcome second_begin =
+        second.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(second, second_begin.attempt, OtherSlot());
+    auto products = IssueAllFor(second, second_begin.attempt);
+    auto second_staging = second.FreezeCandidate(second_begin.attempt, 13);
+    Slot foreign_copy{};
+    const bool foreign_copy_rejected = first_staging &&
+        !second.CopyPrepared(*first_staging, foreign_copy);
+    auto foreign_prepare = first_staging
+        ? second.PrepareCommit(std::move(*first_staging),
+                               PassingReport(13),
+                               std::move(products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    Slot first_after_foreign{};
+    const bool first_token_survives_foreign_owner = first_staging &&
+        first.CopyPrepared(*first_staging, first_after_foreign);
+    auto prepared = second_staging
+        ? second.PrepareCommit(std::move(*second_staging),
+                               PassingReport(13),
+                               std::move(products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    const AttemptOutcome aborted = prepared
+        ? second.AbortPrepared(std::move(*prepared))
+        : AttemptOutcome{};
+    passed = Check(
+                 first_staging && second_staging && foreign_copy_rejected &&
+                     !foreign_prepare && first_token_survives_foreign_owner &&
+                     SameSlotBytes(first_after_foreign, AcceptedSlot()) &&
+                     prepared && aborted.retry_available &&
+                     TestCollectivePolicy::reductions == 1 &&
+                     ArrayStoragePolicy::publications == 0,
+                 "cross_owner_tokens_fail_closed_without_consuming_live_owner") &&
+        passed;
+  }
+
+  {
+    alignas(TwoPhaseContract)
+        std::array<unsigned char, sizeof(TwoPhaseContract)> storage{};
+    TwoPhaseArrayStoragePolicy::Reset();
+    TestCollectivePolicy::Reset();
+    TwoPhaseContract* first = new (storage.data()) TwoPhaseContract{
+        CommittedSlot(), ScratchSlot(), InitialCoordinates(), Resources()};
+    const BeginOutcome first_begin =
+        first->BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(*first, first_begin.attempt, AcceptedSlot());
+    auto old_staging = first->FreezeCandidate(first_begin.attempt, 12);
+    first->~TwoPhaseContract();
+
+    TwoPhaseArrayStoragePolicy::Reset();
+    TestCollectivePolicy::Reset();
+    TwoPhaseContract* second = new (storage.data()) TwoPhaseContract{
+        CommittedSlot(), ScratchSlot(), InitialCoordinates(), Resources()};
+    const BeginOutcome second_begin =
+        second->BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(*second, second_begin.attempt, OtherSlot());
+    auto new_staging = second->FreezeCandidate(second_begin.attempt, 12);
+    Slot stale_copy{};
+    Slot fresh_copy{};
+    const bool stale_rejected = old_staging &&
+        !second->CopyPrepared(*old_staging, stale_copy);
+    const bool fresh_accepted = new_staging &&
+        second->CopyPrepared(*new_staging, fresh_copy);
+    passed = Check(old_staging && new_staging && stale_rejected &&
+                       fresh_accepted && SameSlotBytes(fresh_copy, OtherSlot()),
+                   "same_address_incarnation_aba_rejects_old_staging_token") &&
+        passed;
+    second->~TwoPhaseContract();
+  }
+
+  for (const bool provisional_phase : {false, true})
+  {
+    TwoPhaseContract contract = MakeTwoPhaseContract();
+    const auto old = contract.Published();
+    Slot old_before{};
+    StateCoordinates coordinates_before{};
+    const bool captured = contract.CopyPublished(old, old_before) &&
+        contract.PublishedCoordinates(old, coordinates_before);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const auto retained_candidate = contract.AcquireCandidate(begin.attempt);
+    const bool stored = retained_candidate &&
+        contract.StoreCandidate(*retained_candidate, AcceptedSlot());
+    auto products = IssueAllFor(contract, begin.attempt);
+    auto staging = contract.FreezeCandidate(begin.attempt, 12);
+    auto prepared = staging
+        ? contract.PrepareCommit(std::move(*staging),
+                                 PassingReport(12),
+                                 std::move(products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    std::optional<TwoPhaseContract::ProvisionalCommitToken> provisional{};
+    if (provisional_phase && prepared)
+    {
+      auto exchanged = contract.CommitPrepared(std::move(*prepared));
+      if (exchanged) { provisional.emplace(std::move(*exchanged)); }
+    }
+
+    const std::uint64_t admissions_before =
+        TestCollectivePolicy::admissions;
+    const std::uint64_t reductions_before =
+        TestCollectivePolicy::reductions;
+    const std::uint64_t publications_before =
+        ArrayStoragePolicy::publications;
+    const std::uint64_t discards_before = ArrayStoragePolicy::discards;
+    const std::uint64_t commits_before = contract.telemetry().commits;
+    const AcceptedTelemetry accepted_before = contract.telemetry().accepted;
+    const TransferAccounting committed_before =
+        contract.telemetry().committed_transfers;
+
+    const BeginOutcome nested_begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    const BeginOutcome nested_retry = contract.Retry();
+    TwoPhaseContract::ProductBundle legacy_products{};
+    const AttemptOutcome nested_finish = contract.FinishAttempt(
+        begin.attempt, PassingReport(12), std::move(legacy_products));
+    const bool blocked_store = retained_candidate &&
+        !contract.StoreCandidate(*retained_candidate, OtherSlot());
+    const auto blocked_acquire = contract.AcquireCandidate(begin.attempt);
+    Slot blocked_candidate_copy{};
+    const bool blocked_copy = retained_candidate &&
+        !contract.CopyCandidate(*retained_candidate, blocked_candidate_copy);
+    const auto blocked_product =
+        contract.IssueProduct<DerivedProductKind::residual>(begin.attempt);
+    CheckpointDescriptor busy_checkpoint{};
+    const bool blocked_checkpoint =
+        !contract.TryMakeCheckpoint(busy_checkpoint);
+    const RestoreOutcome nested_restore =
+        contract.Restore(CheckpointDescriptor{}, OtherSlot());
+    Slot old_after{};
+    StateCoordinates coordinates_after{};
+    const bool old_preserved = contract.CopyPublished(old, old_after) &&
+        contract.PublishedCoordinates(old, coordinates_after);
+
+    passed = Check(
+                 captured && begin.started && stored && staging && prepared &&
+                     (!provisional_phase || provisional) &&
+                     !nested_begin.started && !nested_retry.started &&
+                     nested_finish.reason == FailureReason::stale_attempt &&
+                     blocked_store && !blocked_acquire && blocked_copy &&
+                     !blocked_product && blocked_checkpoint &&
+                     !nested_restore.restored &&
+                     nested_restore.compatibility ==
+                         RestartCompatibility::contract_busy &&
+                     old_preserved && SameSlotBytes(old_before, old_after) &&
+                     SameCoordinates(coordinates_before, coordinates_after) &&
+                     SameCoordinates(contract.coordinates(),
+                                     coordinates_before) &&
+                     TestCollectivePolicy::admissions == admissions_before &&
+                     TestCollectivePolicy::reductions == reductions_before &&
+                     ArrayStoragePolicy::publications == publications_before &&
+                     ArrayStoragePolicy::discards == discards_before &&
+                     ArrayStoragePolicy::restore_preparations == 0 &&
+                     contract.status() == RunStatus::attempt_active &&
+                     contract.telemetry().commits == commits_before &&
+                     SameAccepted(contract.telemetry().accepted,
+                                  accepted_before) &&
+                     SameTransfers(contract.telemetry().committed_transfers,
+                                   committed_before),
+                 provisional_phase
+                     ? "provisional_reentrant_apis_preserve_both_live_slots"
+                     : "prepared_reentrant_apis_preserve_both_live_slots") &&
+        passed;
+
+    if (provisional_phase && provisional)
+    {
+      const AttemptOutcome reverted =
+          contract.RevertCommit(std::move(*provisional));
+      passed = Check(reverted.retry_available,
+                     "provisional_reentrant_regression_can_still_revert") &&
+          passed;
+    }
+    else if (prepared)
+    {
+      const AttemptOutcome aborted =
+          contract.AbortPrepared(std::move(*prepared));
+      passed = Check(aborted.retry_available,
+                     "prepared_reentrant_regression_can_still_abort") &&
+          passed;
+    }
+  }
+  return passed;
+}
+
 StateHash FrozenAcceptedInteriorHash()
 {
   StateHash hash{};
@@ -2745,6 +3722,11 @@ int main()
   passed = CheckStaleFinishIsolation() && passed;
   passed = CheckFirstFailureAcrossSuccessfulRetry() && passed;
   passed = CheckResidualTelemetryAndCollectiveTruth() && passed;
+  passed = CheckTwoPhaseDetectionLegacyAndReentrantAdmission() && passed;
+  passed = CheckTwoPhaseFreezePrepareCommitFinalize() && passed;
+  passed = CheckTwoPhasePrepareFailuresAbortAndRevert() && passed;
+  passed = CheckTwoPhaseBindingsTamperAndOverflow() && passed;
+  passed = CheckTwoPhaseTokenOwnershipABAAndBusyReentrancy() && passed;
   passed = CheckExternalEnumAndMaskDomains() && passed;
   passed = CheckAtomicCheckpointRestore() && passed;
   return passed ? 0 : 1;
