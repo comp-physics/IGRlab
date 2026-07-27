@@ -3,6 +3,13 @@
 namespace detail
 {
 
+static inline void ReportCudaSetupFailure(const int rank,
+                                          const char* const stage) noexcept
+{
+  if (rank == 0)
+    std::fprintf(stderr, "CUDA_SETUP_FAIL stage=%s\n", stage);
+}
+
 inline constexpr std::size_t persistent_double_capacity = 220000;
 inline constexpr std::size_t persistent_integer_capacity = 120000;
 
@@ -340,28 +347,63 @@ public:
     setup.phase = CudaFailurePhase::setup;
     TransportPolicy::BeginAttempt(setup);
     if (!CollectiveContinue(ConfigureDeviceAndRanks(config, evidence)))
+    {
+      ReportCudaSetupFailure(evidence.rank, "configure-device-ranks");
       return false;
+    }
     setup.rank = rank_;
     TransportPolicy::BeginAttempt(setup);
-    if (!CollectiveContinue(BuildTopology(config))) { return false; }
+    if (!CollectiveContinue(BuildTopology(config)))
+    {
+      ReportCudaSetupFailure(evidence.rank, "build-topology");
+      return false;
+    }
     const int local_ghost_count =
         static_cast<int>(exchange_plan_.map.GhostCount());
     std::array<int, 2> ghost_counts{};
     const bool ghost_census_ready = MPI_Allgather(
         &local_ghost_count, 1, MPI_INT, ghost_counts.data(), 1, MPI_INT,
         MPI_COMM_WORLD) == MPI_SUCCESS;
-    if (!CollectiveContinue(ghost_census_ready)) { return false; }
+    if (!CollectiveContinue(ghost_census_ready))
+    {
+      ReportCudaSetupFailure(evidence.rank, "ghost-census");
+      return false;
+    }
     host_exchange_bytes_ = ranks_ == 2
         ? static_cast<std::size_t>(ghost_counts[0] + ghost_counts[1]) *
             sizeof(double)
         : 0;
-    if (!CollectiveContinue(AllocateArenas())) { return false; }
-    if (!CollectiveContinue(BindArenaViews())) { return false; }
-    if (!CollectiveContinue(UploadTopologyAndState())) { return false; }
-    if (!CollectiveContinue(BuildPersistentTrueSystem())) { return false; }
-    if (!CollectiveContinue(BindStateSlots())) { return false; }
-    if (!CollectiveContinue(VerifyResidencyAndTicket(evidence)))
+    if (!CollectiveContinue(AllocateArenas()))
+    {
+      ReportCudaSetupFailure(evidence.rank, "allocate-arenas");
       return false;
+    }
+    if (!CollectiveContinue(BindArenaViews()))
+    {
+      ReportCudaSetupFailure(evidence.rank, "bind-arena-views");
+      return false;
+    }
+    if (!CollectiveContinue(UploadTopologyAndState()))
+    {
+      ReportCudaSetupFailure(evidence.rank, "upload-topology-state");
+      return false;
+    }
+    if (!CollectiveContinue(BuildPersistentTrueSystem()))
+    {
+      ReportCudaSetupFailure(evidence.rank,
+                             "build-persistent-true-system");
+      return false;
+    }
+    if (!CollectiveContinue(BindStateSlots()))
+    {
+      ReportCudaSetupFailure(evidence.rank, "bind-state-slots");
+      return false;
+    }
+    if (!CollectiveContinue(VerifyResidencyAndTicket(evidence)))
+    {
+      ReportCudaSetupFailure(evidence.rank, "residency-ticket");
+      return false;
+    }
     resources_.mfem_pin = StableIdentity::Copy(
         "d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec");
     local_mesh_hash_ = HashHostBytes(element_coordinate_keys_.data(),
@@ -376,7 +418,10 @@ public:
     if (!AggregateHash(local_mesh_hash_, resources_.mesh_hash) ||
         !AggregateHash(local_partition_hash_, resources_.partition_hash) ||
         !AggregateHash(local_topology_hash_, resources_.topology_hash))
+    {
+      ReportCudaSetupFailure(evidence.rank, "aggregate-hashes");
       return false;
+    }
     resources_.rank_count = static_cast<std::uint32_t>(ranks_);
     resources_.polynomial_order = polynomial_order;
     resources_.layout = StableIdentity::Copy("mfem.byNODES.vdim4.p1.n3");
