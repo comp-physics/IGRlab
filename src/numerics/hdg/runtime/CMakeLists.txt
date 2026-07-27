@@ -1,29 +1,38 @@
 include("${PROJECT_SOURCE_DIR}/cmake/DgIgrHdgComponents.cmake")
 
 file(GLOB_RECURSE _dg_igr_hdg_runtime_common_sources CONFIGURE_DEPENDS
-     "${CMAKE_CURRENT_SOURCE_DIR}/common/*.cpp"
-     "${CMAKE_CURRENT_SOURCE_DIR}/shared/*.cpp"
-     "${CMAKE_CURRENT_SOURCE_DIR}/cli/*.cpp"
-     "${CMAKE_CURRENT_SOURCE_DIR}/io/*.cpp")
+     "${CMAKE_CURRENT_SOURCE_DIR}/common/*.cpp")
 file(GLOB_RECURSE _dg_igr_hdg_runtime_cpu_sources CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/cpu/*.cpp")
 file(GLOB_RECURSE _dg_igr_hdg_runtime_cuda_sources CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/cuda/*.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/cuda/*.cu")
-file(GLOB_RECURSE _dg_igr_hdg_runtime_app_sources CONFIGURE_DEPENDS
-     "${CMAKE_CURRENT_SOURCE_DIR}/app/*.cpp")
 file(GLOB_RECURSE _dg_igr_hdg_runtime_all_cpp CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 file(GLOB_RECURSE _dg_igr_hdg_runtime_all_cuda CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/*.cu")
+
+if(_dg_igr_hdg_runtime_cuda_sources)
+  set(_dg_igr_hdg_runtime_cuda_expected_source
+      "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu")
+  list(LENGTH _dg_igr_hdg_runtime_cuda_sources
+       _dg_igr_hdg_runtime_cuda_source_count)
+  list(FIND _dg_igr_hdg_runtime_cuda_sources
+       "${_dg_igr_hdg_runtime_cuda_expected_source}"
+       _dg_igr_hdg_runtime_cuda_expected_index)
+  if(NOT _dg_igr_hdg_runtime_cuda_source_count EQUAL 1 OR
+     _dg_igr_hdg_runtime_cuda_expected_index EQUAL -1)
+    message(FATAL_ERROR
+            "The frozen W8A CUDA component requires exactly cuda/persistent_smooth_euler.cu.")
+  endif()
+endif()
 
 set(_dg_igr_hdg_runtime_unclassified_cpp
     ${_dg_igr_hdg_runtime_all_cpp})
 list(REMOVE_ITEM _dg_igr_hdg_runtime_unclassified_cpp
      ${_dg_igr_hdg_runtime_common_sources}
      ${_dg_igr_hdg_runtime_cpu_sources}
-     ${_dg_igr_hdg_runtime_cuda_sources}
-     ${_dg_igr_hdg_runtime_app_sources})
+     ${_dg_igr_hdg_runtime_cuda_sources})
 set(_dg_igr_hdg_runtime_unclassified_cuda
     ${_dg_igr_hdg_runtime_all_cuda})
 list(REMOVE_ITEM _dg_igr_hdg_runtime_unclassified_cuda
@@ -36,22 +45,24 @@ if(_dg_igr_hdg_runtime_unclassified_cpp OR
 endif()
 
 if(DG_IGR_ENABLE_HDG_RUNTIME)
-  if(TARGET dg_igr_hdg_runtime OR TARGET dg_igr_hdg)
+  if(TARGET dg_igr_hdg_runtime_components OR
+     TARGET dg_igr_hdg_runtime OR TARGET dg_igr_hdg)
     message(FATAL_ERROR
-            "Canonical HDG runtime or executable target name is already in use.")
+            "Canonical HDG component, future runtime, or executable target name is already in use.")
   endif()
 
-  add_library(dg_igr_hdg_runtime INTERFACE)
+  add_library(dg_igr_hdg_runtime_components INTERFACE)
 
   dg_igr_add_hdg_cxx17_component(
     TARGET dg_igr_hdg_runtime_common
+    STANDARD_LIBRARY_ONLY
     SOURCES ${_dg_igr_hdg_runtime_common_sources})
   dg_igr_add_hdg_cxx17_component(
     TARGET dg_igr_hdg_runtime_cpu
     SOURCES ${_dg_igr_hdg_runtime_cpu_sources}
     PUBLIC_LINK_LIBRARIES dg_igr_hdg_runtime_common)
 
-  target_link_libraries(dg_igr_hdg_runtime INTERFACE
+  target_link_libraries(dg_igr_hdg_runtime_components INTERFACE
                         dg_igr_hdg_runtime_common
                         dg_igr_hdg_runtime_cpu)
 
@@ -60,24 +71,15 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
       TARGET dg_igr_hdg_runtime_cuda
       SOURCES ${_dg_igr_hdg_runtime_cuda_sources}
       PUBLIC_LINK_LIBRARIES dg_igr_hdg_runtime_common)
-    target_link_libraries(dg_igr_hdg_runtime INTERFACE
+    target_link_libraries(dg_igr_hdg_runtime_components INTERFACE
                           dg_igr_hdg_runtime_cuda)
   elseif(_dg_igr_hdg_runtime_cuda_sources)
     message(STATUS
             "HDG CUDA sources are reserved but not built by the requested CPU profile.")
   endif()
 
-  if(_dg_igr_hdg_runtime_app_sources)
-    add_executable(dg_igr_hdg ${_dg_igr_hdg_runtime_app_sources})
-    set_target_properties(dg_igr_hdg PROPERTIES
-                          CXX_STANDARD "${CMAKE_CXX_STANDARD}"
-                          CXX_STANDARD_REQUIRED ON
-                          CXX_EXTENSIONS OFF)
-    target_link_libraries(dg_igr_hdg PRIVATE dg_igr_hdg_runtime)
-  else()
-    message(STATUS
-            "dg_igr_hdg: target name reserved; no executable sources are present.")
-  endif()
+  message(STATUS
+          "dg_igr_hdg_runtime: target name reserved for the accepted CLI slice; component libraries only.")
 endif()
 
 if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)

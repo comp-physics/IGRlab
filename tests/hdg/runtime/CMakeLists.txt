@@ -16,8 +16,12 @@ function(_dg_igr_require_hdg_cxx17_target target)
 endfunction()
 
 if(DG_IGR_ENABLE_HDG_RUNTIME)
-  if(NOT TARGET dg_igr_hdg_runtime)
-    message(FATAL_ERROR "Required HDG aggregate target is missing.")
+  if(NOT TARGET dg_igr_hdg_runtime_components)
+    message(FATAL_ERROR "Required HDG component aggregate target is missing.")
+  endif()
+  if(TARGET dg_igr_hdg_runtime)
+    message(FATAL_ERROR
+            "dg_igr_hdg_runtime must wait for the accepted CLI slice.")
   endif()
   _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_common)
   _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_cpu)
@@ -32,16 +36,30 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
                         dg_igr_hdg_runtime_cuda CUDA_EXTENSIONS)
     get_target_property(_dg_igr_hdg_cuda_separable
                         dg_igr_hdg_runtime_cuda CUDA_SEPARABLE_COMPILATION)
+    get_target_property(_dg_igr_hdg_cuda_resolve
+                        dg_igr_hdg_runtime_cuda CUDA_RESOLVE_DEVICE_SYMBOLS)
+    get_target_property(_dg_igr_hdg_cuda_architectures
+                        dg_igr_hdg_runtime_cuda CUDA_ARCHITECTURES)
     if(NOT _dg_igr_hdg_cuda_standard STREQUAL "17" OR
        NOT _dg_igr_hdg_cuda_required OR
        _dg_igr_hdg_cuda_extensions OR
-       NOT _dg_igr_hdg_cuda_separable)
+       NOT _dg_igr_hdg_cuda_separable OR
+       NOT _dg_igr_hdg_cuda_resolve OR
+       NOT _dg_igr_hdg_cuda_architectures STREQUAL "120")
       message(FATAL_ERROR
-              "dg_igr_hdg_runtime_cuda is not a strict separable CUDA17 component.")
+              "dg_igr_hdg_runtime_cuda is not the strict native-SM120 separable CUDA17 component.")
     endif()
   elseif(TARGET dg_igr_hdg_runtime_cuda)
     message(FATAL_ERROR
             "dg_igr_hdg_runtime_cuda must exist only for a valid CUDA profile.")
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/common/CMakeLists.txt")
+    add_subdirectory(common)
+  endif()
+  add_subdirectory(cpu)
+  if(MFEM_USE_CUDA)
+    add_subdirectory(cuda)
   endif()
 endif()
 

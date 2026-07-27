@@ -28,7 +28,7 @@ function(_dg_igr_hdg_registration_anchor target extension language output_var)
 endfunction()
 
 function(dg_igr_add_hdg_cxx17_component)
-  set(_dg_igr_hdg_options "")
+  set(_dg_igr_hdg_options STANDARD_LIBRARY_ONLY)
   set(_dg_igr_hdg_one_value TARGET)
   set(_dg_igr_hdg_multi_value
       SOURCES PUBLIC_LINK_LIBRARIES PRIVATE_LINK_LIBRARIES)
@@ -39,7 +39,7 @@ function(dg_igr_add_hdg_cxx17_component)
                         ${ARGN})
   if(HDG_UNPARSED_ARGUMENTS OR NOT HDG_TARGET)
     message(FATAL_ERROR
-            "dg_igr_add_hdg_cxx17_component requires TARGET and accepts only SOURCES/PUBLIC_LINK_LIBRARIES/PRIVATE_LINK_LIBRARIES.")
+            "dg_igr_add_hdg_cxx17_component requires TARGET and accepts only STANDARD_LIBRARY_ONLY/SOURCES/PUBLIC_LINK_LIBRARIES/PRIVATE_LINK_LIBRARIES.")
   endif()
 
   set(_dg_igr_hdg_cxx_targets
@@ -65,14 +65,22 @@ function(dg_igr_add_hdg_cxx17_component)
                         CXX_EXTENSIONS OFF)
   target_include_directories("${HDG_TARGET}" PUBLIC
                              "${PROJECT_SOURCE_DIR}/include")
-  target_link_libraries("${HDG_TARGET}" PUBLIC igr_mfem)
-  if(HDG_PUBLIC_LINK_LIBRARIES)
-    target_link_libraries("${HDG_TARGET}" PUBLIC
-                          ${HDG_PUBLIC_LINK_LIBRARIES})
-  endif()
-  if(HDG_PRIVATE_LINK_LIBRARIES)
-    target_link_libraries("${HDG_TARGET}" PRIVATE
-                          ${HDG_PRIVATE_LINK_LIBRARIES})
+  if(HDG_STANDARD_LIBRARY_ONLY)
+    if(NOT HDG_TARGET STREQUAL "dg_igr_hdg_runtime_common" OR
+       HDG_PUBLIC_LINK_LIBRARIES OR HDG_PRIVATE_LINK_LIBRARIES)
+      message(FATAL_ERROR
+              "STANDARD_LIBRARY_ONLY is reserved for dependency-free dg_igr_hdg_runtime_common and forbids link libraries.")
+    endif()
+  else()
+    target_link_libraries("${HDG_TARGET}" PUBLIC igr_mfem)
+    if(HDG_PUBLIC_LINK_LIBRARIES)
+      target_link_libraries("${HDG_TARGET}" PUBLIC
+                            ${HDG_PUBLIC_LINK_LIBRARIES})
+    endif()
+    if(HDG_PRIVATE_LINK_LIBRARIES)
+      target_link_libraries("${HDG_TARGET}" PRIVATE
+                            ${HDG_PRIVATE_LINK_LIBRARIES})
+    endif()
   endif()
 endfunction()
 
@@ -208,6 +216,10 @@ function(dg_igr_require_hdg_cuda17_profile)
     message(FATAL_ERROR
             "HDG CUDA expected architecture must be numeric or sm_<num>.")
   endif()
+  if(NOT _dg_igr_hdg_expected_arch STREQUAL "120")
+    message(FATAL_ERROR
+            "The frozen W8A HDG CUDA component requires native architecture 120.")
+  endif()
   if(NOT CMAKE_CUDA_ARCHITECTURES)
     message(FATAL_ERROR
             "HDG CUDA components require a concrete native CMAKE_CUDA_ARCHITECTURES value.")
@@ -274,8 +286,9 @@ function(dg_igr_add_hdg_cuda17_component)
                         CUDA_STANDARD 17
                         CUDA_STANDARD_REQUIRED ON
                         CUDA_EXTENSIONS OFF
-                        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-                        CUDA_SEPARABLE_COMPILATION ON)
+                        CUDA_ARCHITECTURES 120
+                        CUDA_SEPARABLE_COMPILATION ON
+                        CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   target_include_directories("${HDG_TARGET}" PUBLIC
                              "${PROJECT_SOURCE_DIR}/include")
   target_compile_options("${HDG_TARGET}" PRIVATE
