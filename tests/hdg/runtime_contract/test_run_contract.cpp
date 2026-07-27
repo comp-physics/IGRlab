@@ -752,6 +752,18 @@ struct HasTwoPhaseCommitApi<
     : std::true_type
 {};
 
+template <typename Token, typename SlotType, typename = void>
+struct HasTokenSelfCopyPrepared : std::false_type
+{};
+
+template <typename Token, typename SlotType>
+struct HasTokenSelfCopyPrepared<
+    Token,
+    SlotType,
+    std::void_t<decltype(std::declval<const Token&>().CopyPrepared(
+        std::declval<SlotType&>()))>> : std::true_type
+{};
+
 static_assert(Selection::interior_space == InteriorSpace::l2);
 static_assert(!std::is_polymorphic<Selection>::value);
 static_assert(!std::is_polymorphic<Contract>::value);
@@ -809,6 +821,10 @@ static_assert(std::is_move_constructible<
                   TwoPhaseContract::StagingToken>::value);
 static_assert(!std::is_move_assignable<
                   TwoPhaseContract::StagingToken>::value);
+static_assert(!HasTokenSelfCopyPrepared<
+                  TwoPhaseContract::StagingToken,
+                  Slot>::value,
+              "staging tokens must not dereference retained owners");
 static_assert(!std::is_default_constructible<
                   TwoPhaseContract::PreparedCommitToken>::value);
 static_assert(!std::is_copy_constructible<
@@ -1044,6 +1060,41 @@ bool SameAccepted(const AcceptedTelemetry& left,
           right.attempt.validated_product_mask &&
       std::memcmp(&left.attempt.true_relative_residual,
                   &right.attempt.true_relative_residual,
+                  sizeof(double)) == 0;
+}
+
+bool SameCommitAccounting(const RunTelemetry& left,
+                          const RunTelemetry& right)
+{
+  return left.admissions_started == right.admissions_started &&
+      left.admissions_failed == right.admissions_failed &&
+      left.attempts_started == right.attempts_started &&
+      left.attempts_failed == right.attempts_failed &&
+      left.rollbacks == right.rollbacks &&
+      left.retries_started == right.retries_started &&
+      left.commits == right.commits && left.restores == right.restores &&
+      left.duplicate_product_issues_rejected ==
+          right.duplicate_product_issues_rejected &&
+      left.out_of_order_product_issues_rejected ==
+          right.out_of_order_product_issues_rejected &&
+      left.transfer_accounting_overflow_rejections ==
+          right.transfer_accounting_overflow_rejections &&
+      SameTransfers(left.attempted_transfers, right.attempted_transfers) &&
+      SameTransfers(left.rolled_back_transfers,
+                    right.rolled_back_transfers) &&
+      SameTransfers(left.committed_transfers, right.committed_transfers) &&
+      SameAccepted(left.accepted, right.accepted) &&
+      SameAttempt(left.last_attempt.identity, right.last_attempt.identity) &&
+      SameTransfers(left.last_attempt.transfers,
+                    right.last_attempt.transfers) &&
+      SameProhibited(left.last_attempt.prohibited,
+                     right.last_attempt.prohibited) &&
+      left.last_attempt.failure_reason == right.last_attempt.failure_reason &&
+      left.last_attempt.validated_product_mask ==
+          right.last_attempt.validated_product_mask &&
+      left.first_failure == right.first_failure &&
+      std::memcmp(&left.last_attempt.true_relative_residual,
+                  &right.last_attempt.true_relative_residual,
                   sizeof(double)) == 0;
 }
 
@@ -2272,7 +2323,7 @@ bool CheckTwoPhaseFreezePrepareCommitFinalize()
   const StateCoordinates expected_target{1.125, 5, 8, 12, 0.125};
   Slot frozen_copy{};
   const bool copied_frozen = staging &&
-      staging->CopyPrepared(frozen_copy);
+      contract.CopyPrepared(*staging, frozen_copy);
   CheckpointDescriptor premature_checkpoint{};
   const bool premature_checkpoint_rejected =
       !contract.TryMakeCheckpoint(premature_checkpoint);
@@ -2706,15 +2757,15 @@ bool CheckTwoPhaseTokenOwnershipABAAndBusyReentrancy()
     TwoPhaseContract second = MakeTwoPhaseContract();
     const BeginOutcome second_begin =
         second.BeginStep({InteriorSpace::l2, 0.125});
-    StoreCandidateFor(second, second_begin.attempt, OtherSlot());
+    StoreCandidateFor(second, second_begin.attempt, AcceptedSlot());
     auto products = IssueAllFor(second, second_begin.attempt);
-    auto second_staging = second.FreezeCandidate(second_begin.attempt, 13);
+    auto second_staging = second.FreezeCandidate(second_begin.attempt, 12);
     Slot foreign_copy{};
     const bool foreign_copy_rejected = first_staging &&
         !second.CopyPrepared(*first_staging, foreign_copy);
     auto foreign_prepare = first_staging
         ? second.PrepareCommit(std::move(*first_staging),
-                               PassingReport(13),
+                               PassingReport(12),
                                std::move(products))
         : std::optional<TwoPhaseContract::PreparedCommitToken>{};
     Slot first_after_foreign{};
@@ -2722,7 +2773,7 @@ bool CheckTwoPhaseTokenOwnershipABAAndBusyReentrancy()
         first.CopyPrepared(*first_staging, first_after_foreign);
     auto prepared = second_staging
         ? second.PrepareCommit(std::move(*second_staging),
-                               PassingReport(13),
+                               PassingReport(12),
                                std::move(products))
         : std::optional<TwoPhaseContract::PreparedCommitToken>{};
     const AttemptOutcome aborted = prepared
@@ -2740,6 +2791,234 @@ bool CheckTwoPhaseTokenOwnershipABAAndBusyReentrancy()
   }
 
   {
+    TwoPhaseContract first = MakeTwoPhaseContract();
+    const BeginOutcome first_begin =
+        first.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(first, first_begin.attempt, AcceptedSlot());
+    auto first_products = IssueAllFor(first, first_begin.attempt);
+    auto first_staging = first.FreezeCandidate(first_begin.attempt, 12);
+    Slot first_candidate{};
+    const bool first_candidate_captured = first_staging &&
+        first.CopyPrepared(*first_staging, first_candidate);
+    auto first_prepared = first_staging
+        ? first.PrepareCommit(std::move(*first_staging),
+                              PassingReport(12),
+                              std::move(first_products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+
+    TwoPhaseContract second = MakeTwoPhaseContract();
+    const BeginOutcome second_begin =
+        second.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(second, second_begin.attempt, AcceptedSlot());
+    auto second_products = IssueAllFor(second, second_begin.attempt);
+    auto second_staging = second.FreezeCandidate(second_begin.attempt, 12);
+    Slot second_candidate{};
+    const bool second_candidate_captured = second_staging &&
+        second.CopyPrepared(*second_staging, second_candidate);
+    auto second_prepared = second_staging
+        ? second.PrepareCommit(std::move(*second_staging),
+                               PassingReport(12),
+                               std::move(second_products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    const bool exact_prepared_checkpoint = first_prepared && second_prepared &&
+        detail::SameCheckpoint(first_prepared->checkpoint_descriptor(),
+                               second_prepared->checkpoint_descriptor());
+    const auto first_published = first.Published();
+    const auto second_published = second.Published();
+    Slot first_published_before{};
+    Slot second_published_before{};
+    const bool published_captured =
+        first.CopyPublished(first_published, first_published_before) &&
+        second.CopyPublished(second_published, second_published_before);
+
+    const RunTelemetry first_accounting = first.telemetry();
+    const RunTelemetry second_accounting = second.telemetry();
+    const StateCoordinates first_coordinates = first.coordinates();
+    const StateCoordinates second_coordinates = second.coordinates();
+    const RunStatus first_status = first.status();
+    const RunStatus second_status = second.status();
+    const FailureReason first_failure = first.last_failure();
+    const FailureReason second_failure = second.last_failure();
+    const std::uint64_t publications = ArrayStoragePolicy::publications;
+    const std::uint64_t discards = ArrayStoragePolicy::discards;
+    const std::uint64_t stores = ArrayStoragePolicy::stores;
+    const std::uint64_t preparations = ArrayStoragePolicy::preparations;
+    const std::uint64_t restore_preparations =
+        ArrayStoragePolicy::restore_preparations;
+    const std::uint64_t copies = ArrayStoragePolicy::copies;
+    const std::uint64_t prepublish_checks =
+        ArrayStoragePolicy::prepublish_checks;
+    const std::uint64_t reversions =
+        TwoPhaseArrayStoragePolicy::reversions;
+    auto rejected = first_prepared
+        ? second.CommitPrepared(std::move(*first_prepared))
+        : std::optional<TwoPhaseContract::ProvisionalCommitToken>{};
+    const bool rejection_is_inert =
+        !rejected && SameCommitAccounting(first.telemetry(), first_accounting) &&
+        SameCommitAccounting(second.telemetry(), second_accounting) &&
+        first.telemetry().stale_consumers_rejected ==
+            first_accounting.stale_consumers_rejected &&
+        second.telemetry().stale_consumers_rejected ==
+            second_accounting.stale_consumers_rejected + 1 &&
+        SameCoordinates(first.coordinates(), first_coordinates) &&
+        SameCoordinates(second.coordinates(), second_coordinates) &&
+        first.status() == first_status && second.status() == second_status &&
+        first.last_failure() == first_failure &&
+        second.last_failure() == second_failure &&
+        ArrayStoragePolicy::publications == publications &&
+        ArrayStoragePolicy::discards == discards &&
+        ArrayStoragePolicy::stores == stores &&
+        ArrayStoragePolicy::preparations == preparations &&
+        ArrayStoragePolicy::restore_preparations == restore_preparations &&
+        ArrayStoragePolicy::copies == copies &&
+        ArrayStoragePolicy::prepublish_checks == prepublish_checks &&
+        TwoPhaseArrayStoragePolicy::reversions == reversions;
+    Slot first_published_after{};
+    Slot second_published_after{};
+    const bool published_is_unchanged =
+        first.CopyPublished(first_published, first_published_after) &&
+        second.CopyPublished(second_published, second_published_after) &&
+        SameSlotBytes(first_published_before, first_published_after) &&
+        SameSlotBytes(second_published_before, second_published_after);
+    auto first_provisional = first_prepared
+        ? first.CommitPrepared(std::move(*first_prepared))
+        : std::optional<TwoPhaseContract::ProvisionalCommitToken>{};
+    auto second_provisional = second_prepared
+        ? second.CommitPrepared(std::move(*second_prepared))
+        : std::optional<TwoPhaseContract::ProvisionalCommitToken>{};
+    const AttemptOutcome first_reverted = first_provisional
+        ? first.RevertCommit(std::move(*first_provisional))
+        : AttemptOutcome{};
+    const AttemptOutcome second_reverted = second_provisional
+        ? second.RevertCommit(std::move(*second_provisional))
+        : AttemptOutcome{};
+    passed = Check(
+                 first_prepared && second_prepared &&
+                     first_candidate_captured && second_candidate_captured &&
+                     SameSlotBytes(first_candidate, second_candidate) &&
+                     SameAttempt(first_begin.attempt, second_begin.attempt) &&
+                     exact_prepared_checkpoint && published_captured &&
+                     rejection_is_inert && published_is_unchanged &&
+                     first_provisional &&
+                     second_provisional && first_reverted.retry_available &&
+                     second_reverted.retry_available,
+                 "prepared_cross_owner_rejects_without_mutation_or_authority_consumption") &&
+        passed;
+  }
+
+  {
+    TwoPhaseContract first = MakeTwoPhaseContract();
+    const BeginOutcome first_begin =
+        first.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(first, first_begin.attempt, AcceptedSlot());
+    auto first_products = IssueAllFor(first, first_begin.attempt);
+    auto first_staging = first.FreezeCandidate(first_begin.attempt, 12);
+    auto first_prepared = first_staging
+        ? first.PrepareCommit(std::move(*first_staging),
+                              PassingReport(12),
+                              std::move(first_products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    const CheckpointDescriptor first_checkpoint = first_prepared
+        ? first_prepared->checkpoint_descriptor()
+        : CheckpointDescriptor{};
+    auto first_provisional = first_prepared
+        ? first.CommitPrepared(std::move(*first_prepared))
+        : std::optional<TwoPhaseContract::ProvisionalCommitToken>{};
+
+    TwoPhaseContract second = MakeTwoPhaseContract();
+    const BeginOutcome second_begin =
+        second.BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(second, second_begin.attempt, AcceptedSlot());
+    auto second_products = IssueAllFor(second, second_begin.attempt);
+    auto second_staging = second.FreezeCandidate(second_begin.attempt, 12);
+    auto second_prepared = second_staging
+        ? second.PrepareCommit(std::move(*second_staging),
+                               PassingReport(12),
+                               std::move(second_products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    const CheckpointDescriptor second_checkpoint = second_prepared
+        ? second_prepared->checkpoint_descriptor()
+        : CheckpointDescriptor{};
+    const bool exact_prepared_checkpoint = first_prepared && second_prepared &&
+        detail::SameCheckpoint(first_checkpoint, second_checkpoint);
+    auto second_provisional = second_prepared
+        ? second.CommitPrepared(std::move(*second_prepared))
+        : std::optional<TwoPhaseContract::ProvisionalCommitToken>{};
+    const auto first_published = first.Published();
+    const auto second_published = second.Published();
+    Slot first_published_before{};
+    Slot second_published_before{};
+    const bool published_captured =
+        first.CopyPublished(first_published, first_published_before) &&
+        second.CopyPublished(second_published, second_published_before);
+
+    const RunTelemetry first_accounting = first.telemetry();
+    const RunTelemetry second_accounting = second.telemetry();
+    const StateCoordinates first_coordinates = first.coordinates();
+    const StateCoordinates second_coordinates = second.coordinates();
+    const RunStatus first_status = first.status();
+    const RunStatus second_status = second.status();
+    const FailureReason first_failure = first.last_failure();
+    const FailureReason second_failure = second.last_failure();
+    const std::uint64_t publications = ArrayStoragePolicy::publications;
+    const std::uint64_t discards = ArrayStoragePolicy::discards;
+    const std::uint64_t stores = ArrayStoragePolicy::stores;
+    const std::uint64_t preparations = ArrayStoragePolicy::preparations;
+    const std::uint64_t restore_preparations =
+        ArrayStoragePolicy::restore_preparations;
+    const std::uint64_t copies = ArrayStoragePolicy::copies;
+    const std::uint64_t prepublish_checks =
+        ArrayStoragePolicy::prepublish_checks;
+    const std::uint64_t reversions =
+        TwoPhaseArrayStoragePolicy::reversions;
+    const AttemptOutcome rejected = first_provisional
+        ? second.FinalizeCommit(std::move(*first_provisional))
+        : AttemptOutcome{};
+    const bool rejection_is_inert =
+        rejected.reason == FailureReason::stale_attempt &&
+        SameCommitAccounting(first.telemetry(), first_accounting) &&
+        SameCommitAccounting(second.telemetry(), second_accounting) &&
+        first.telemetry().stale_consumers_rejected ==
+            first_accounting.stale_consumers_rejected &&
+        second.telemetry().stale_consumers_rejected ==
+            second_accounting.stale_consumers_rejected + 1 &&
+        SameCoordinates(first.coordinates(), first_coordinates) &&
+        SameCoordinates(second.coordinates(), second_coordinates) &&
+        first.status() == first_status && second.status() == second_status &&
+        first.last_failure() == first_failure &&
+        second.last_failure() == second_failure &&
+        ArrayStoragePolicy::publications == publications &&
+        ArrayStoragePolicy::discards == discards &&
+        ArrayStoragePolicy::stores == stores &&
+        ArrayStoragePolicy::preparations == preparations &&
+        ArrayStoragePolicy::restore_preparations == restore_preparations &&
+        ArrayStoragePolicy::copies == copies &&
+        ArrayStoragePolicy::prepublish_checks == prepublish_checks &&
+        TwoPhaseArrayStoragePolicy::reversions == reversions;
+    Slot first_published_after{};
+    Slot second_published_after{};
+    const bool published_is_unchanged =
+        first.CopyPublished(first_published, first_published_after) &&
+        second.CopyPublished(second_published, second_published_after) &&
+        SameSlotBytes(first_published_before, first_published_after) &&
+        SameSlotBytes(second_published_before, second_published_after);
+    const AttemptOutcome first_finalized = first_provisional
+        ? first.FinalizeCommit(std::move(*first_provisional))
+        : AttemptOutcome{};
+    const AttemptOutcome second_finalized = second_provisional
+        ? second.FinalizeCommit(std::move(*second_provisional))
+        : AttemptOutcome{};
+    passed = Check(first_provisional && second_provisional &&
+                       SameAttempt(first_begin.attempt, second_begin.attempt) &&
+                       exact_prepared_checkpoint && published_captured &&
+                       rejection_is_inert && published_is_unchanged &&
+                       first_finalized.committed &&
+                       second_finalized.committed,
+                   "provisional_cross_owner_rejects_without_mutation_or_authority_consumption") &&
+        passed;
+  }
+
+  {
     alignas(TwoPhaseContract)
         std::array<unsigned char, sizeof(TwoPhaseContract)> storage{};
     TwoPhaseArrayStoragePolicy::Reset();
@@ -2750,6 +3029,18 @@ bool CheckTwoPhaseTokenOwnershipABAAndBusyReentrancy()
         first->BeginStep({InteriorSpace::l2, 0.125});
     StoreCandidateFor(*first, first_begin.attempt, AcceptedSlot());
     auto old_staging = first->FreezeCandidate(first_begin.attempt, 12);
+    Slot old_frozen_copy{};
+    const bool old_frozen_captured = old_staging &&
+        first->CopyPrepared(*old_staging, old_frozen_copy);
+    const StateCoordinates old_entry = old_staging
+        ? old_staging->entry_coordinates()
+        : StateCoordinates{};
+    const StateCoordinates old_target = old_staging
+        ? old_staging->target_coordinates()
+        : StateCoordinates{};
+    const CheckpointDescriptor old_checkpoint = old_staging
+        ? old_staging->checkpoint_descriptor()
+        : CheckpointDescriptor{};
     first->~TwoPhaseContract();
 
     TwoPhaseArrayStoragePolicy::Reset();
@@ -2758,17 +3049,275 @@ bool CheckTwoPhaseTokenOwnershipABAAndBusyReentrancy()
         CommittedSlot(), ScratchSlot(), InitialCoordinates(), Resources()};
     const BeginOutcome second_begin =
         second->BeginStep({InteriorSpace::l2, 0.125});
-    StoreCandidateFor(*second, second_begin.attempt, OtherSlot());
+    StoreCandidateFor(*second, second_begin.attempt, AcceptedSlot());
     auto new_staging = second->FreezeCandidate(second_begin.attempt, 12);
+    const bool exact_attempt = SameAttempt(first_begin.attempt,
+                                           second_begin.attempt);
+    const bool exact_entry = old_staging && new_staging &&
+        SameCoordinates(old_entry, new_staging->entry_coordinates());
+    const bool exact_target = old_staging && new_staging &&
+        SameCoordinates(old_target, new_staging->target_coordinates());
+    const bool exact_checkpoint = old_staging && new_staging &&
+        detail::SameCheckpoint(old_checkpoint,
+                               new_staging->checkpoint_descriptor());
     Slot stale_copy{};
     Slot fresh_copy{};
     const bool stale_rejected = old_staging &&
         !second->CopyPrepared(*old_staging, stale_copy);
     const bool fresh_accepted = new_staging &&
         second->CopyPrepared(*new_staging, fresh_copy);
-    passed = Check(old_staging && new_staging && stale_rejected &&
-                       fresh_accepted && SameSlotBytes(fresh_copy, OtherSlot()),
+    passed = Check(old_staging && new_staging && old_frozen_captured &&
+                       exact_attempt && exact_entry && exact_target &&
+                       exact_checkpoint && stale_rejected && fresh_accepted &&
+                       SameSlotBytes(old_frozen_copy, fresh_copy) &&
+                       SameSlotBytes(fresh_copy, AcceptedSlot()),
                    "same_address_incarnation_aba_rejects_old_staging_token") &&
+        passed;
+    second->~TwoPhaseContract();
+  }
+
+  {
+    alignas(TwoPhaseContract)
+        std::array<unsigned char, sizeof(TwoPhaseContract)> storage{};
+    TwoPhaseArrayStoragePolicy::Reset();
+    TestCollectivePolicy::Reset();
+    TwoPhaseContract* first = new (storage.data()) TwoPhaseContract{
+        CommittedSlot(), ScratchSlot(), InitialCoordinates(), Resources()};
+    const BeginOutcome first_begin =
+        first->BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(*first, first_begin.attempt, AcceptedSlot());
+    auto first_products = IssueAllFor(*first, first_begin.attempt);
+    auto first_staging = first->FreezeCandidate(first_begin.attempt, 12);
+    Slot first_candidate{};
+    const bool first_candidate_captured = first_staging &&
+        first->CopyPrepared(*first_staging, first_candidate);
+    const StateCoordinates first_entry = first_staging
+        ? first_staging->entry_coordinates()
+        : StateCoordinates{};
+    const StateCoordinates first_target = first_staging
+        ? first_staging->target_coordinates()
+        : StateCoordinates{};
+    const CheckpointDescriptor first_checkpoint = first_staging
+        ? first_staging->checkpoint_descriptor()
+        : CheckpointDescriptor{};
+    auto old_prepared = first_staging
+        ? first->PrepareCommit(std::move(*first_staging),
+                               PassingReport(12),
+                               std::move(first_products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    first->~TwoPhaseContract();
+
+    TwoPhaseArrayStoragePolicy::Reset();
+    TestCollectivePolicy::Reset();
+    TwoPhaseContract* second = new (storage.data()) TwoPhaseContract{
+        CommittedSlot(), ScratchSlot(), InitialCoordinates(), Resources()};
+    const BeginOutcome second_begin =
+        second->BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(*second, second_begin.attempt, AcceptedSlot());
+    auto second_products = IssueAllFor(*second, second_begin.attempt);
+    auto second_staging = second->FreezeCandidate(second_begin.attempt, 12);
+    Slot second_candidate{};
+    const bool second_candidate_captured = second_staging &&
+        second->CopyPrepared(*second_staging, second_candidate);
+    const bool exact_entry = second_staging &&
+        SameCoordinates(first_entry, second_staging->entry_coordinates());
+    const bool exact_target = second_staging &&
+        SameCoordinates(first_target, second_staging->target_coordinates());
+    const bool exact_checkpoint = second_staging &&
+        detail::SameCheckpoint(first_checkpoint,
+                               second_staging->checkpoint_descriptor());
+    auto new_prepared = second_staging
+        ? second->PrepareCommit(std::move(*second_staging),
+                                PassingReport(12),
+                                std::move(second_products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    const bool exact_prepared_checkpoint = new_prepared &&
+        detail::SameCheckpoint(first_checkpoint,
+                               new_prepared->checkpoint_descriptor());
+    const auto published = second->Published();
+    Slot published_before{};
+    const bool published_captured =
+        second->CopyPublished(published, published_before);
+
+    const RunTelemetry accounting_before = second->telemetry();
+    const StateCoordinates coordinates_before = second->coordinates();
+    const RunStatus status_before = second->status();
+    const FailureReason failure_before = second->last_failure();
+    const std::uint64_t publications = ArrayStoragePolicy::publications;
+    const std::uint64_t discards = ArrayStoragePolicy::discards;
+    const std::uint64_t stores = ArrayStoragePolicy::stores;
+    const std::uint64_t preparations = ArrayStoragePolicy::preparations;
+    const std::uint64_t restore_preparations =
+        ArrayStoragePolicy::restore_preparations;
+    const std::uint64_t copies = ArrayStoragePolicy::copies;
+    const std::uint64_t prepublish_checks =
+        ArrayStoragePolicy::prepublish_checks;
+    const std::uint64_t reversions =
+        TwoPhaseArrayStoragePolicy::reversions;
+    auto stale_exchange = old_prepared
+        ? second->CommitPrepared(std::move(*old_prepared))
+        : std::optional<TwoPhaseContract::ProvisionalCommitToken>{};
+    const bool stale_rejection_is_inert =
+        !stale_exchange &&
+        SameCommitAccounting(second->telemetry(), accounting_before) &&
+        second->telemetry().stale_consumers_rejected ==
+            accounting_before.stale_consumers_rejected + 1 &&
+        SameCoordinates(second->coordinates(), coordinates_before) &&
+        second->status() == status_before &&
+        second->last_failure() == failure_before &&
+        ArrayStoragePolicy::publications == publications &&
+        ArrayStoragePolicy::discards == discards &&
+        ArrayStoragePolicy::stores == stores &&
+        ArrayStoragePolicy::preparations == preparations &&
+        ArrayStoragePolicy::restore_preparations == restore_preparations &&
+        ArrayStoragePolicy::copies == copies &&
+        ArrayStoragePolicy::prepublish_checks == prepublish_checks &&
+        TwoPhaseArrayStoragePolicy::reversions == reversions;
+    Slot published_after{};
+    const bool published_is_unchanged =
+        second->CopyPublished(published, published_after) &&
+        SameSlotBytes(published_before, published_after);
+    auto live_exchange = new_prepared
+        ? second->CommitPrepared(std::move(*new_prepared))
+        : std::optional<TwoPhaseContract::ProvisionalCommitToken>{};
+    const AttemptOutcome cleanup = live_exchange
+        ? second->RevertCommit(std::move(*live_exchange))
+        : AttemptOutcome{};
+    passed = Check(
+                 old_prepared && new_prepared && first_candidate_captured &&
+                     second_candidate_captured &&
+                     SameSlotBytes(first_candidate, second_candidate) &&
+                     SameAttempt(first_begin.attempt, second_begin.attempt) &&
+                     exact_entry && exact_target && exact_checkpoint &&
+                     exact_prepared_checkpoint && published_captured &&
+                     stale_rejection_is_inert && published_is_unchanged &&
+                     live_exchange &&
+                     cleanup.retry_available,
+                 "same_address_incarnation_aba_rejects_old_prepared_authority_only") &&
+        passed;
+    second->~TwoPhaseContract();
+  }
+
+  {
+    alignas(TwoPhaseContract)
+        std::array<unsigned char, sizeof(TwoPhaseContract)> storage{};
+    TwoPhaseArrayStoragePolicy::Reset();
+    TestCollectivePolicy::Reset();
+    TwoPhaseContract* first = new (storage.data()) TwoPhaseContract{
+        CommittedSlot(), ScratchSlot(), InitialCoordinates(), Resources()};
+    const BeginOutcome first_begin =
+        first->BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(*first, first_begin.attempt, AcceptedSlot());
+    auto first_products = IssueAllFor(*first, first_begin.attempt);
+    auto first_staging = first->FreezeCandidate(first_begin.attempt, 12);
+    Slot first_candidate{};
+    const bool first_candidate_captured = first_staging &&
+        first->CopyPrepared(*first_staging, first_candidate);
+    const StateCoordinates first_entry = first_staging
+        ? first_staging->entry_coordinates()
+        : StateCoordinates{};
+    const StateCoordinates first_target = first_staging
+        ? first_staging->target_coordinates()
+        : StateCoordinates{};
+    const CheckpointDescriptor first_checkpoint = first_staging
+        ? first_staging->checkpoint_descriptor()
+        : CheckpointDescriptor{};
+    auto first_prepared = first_staging
+        ? first->PrepareCommit(std::move(*first_staging),
+                               PassingReport(12),
+                               std::move(first_products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    auto old_provisional = first_prepared
+        ? first->CommitPrepared(std::move(*first_prepared))
+        : std::optional<TwoPhaseContract::ProvisionalCommitToken>{};
+    first->~TwoPhaseContract();
+
+    TwoPhaseArrayStoragePolicy::Reset();
+    TestCollectivePolicy::Reset();
+    TwoPhaseContract* second = new (storage.data()) TwoPhaseContract{
+        CommittedSlot(), ScratchSlot(), InitialCoordinates(), Resources()};
+    const BeginOutcome second_begin =
+        second->BeginStep({InteriorSpace::l2, 0.125});
+    StoreCandidateFor(*second, second_begin.attempt, AcceptedSlot());
+    auto second_products = IssueAllFor(*second, second_begin.attempt);
+    auto second_staging = second->FreezeCandidate(second_begin.attempt, 12);
+    Slot second_candidate{};
+    const bool second_candidate_captured = second_staging &&
+        second->CopyPrepared(*second_staging, second_candidate);
+    const bool exact_entry = second_staging &&
+        SameCoordinates(first_entry, second_staging->entry_coordinates());
+    const bool exact_target = second_staging &&
+        SameCoordinates(first_target, second_staging->target_coordinates());
+    const bool exact_checkpoint = second_staging &&
+        detail::SameCheckpoint(first_checkpoint,
+                               second_staging->checkpoint_descriptor());
+    auto second_prepared = second_staging
+        ? second->PrepareCommit(std::move(*second_staging),
+                                PassingReport(12),
+                                std::move(second_products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    const bool exact_prepared_checkpoint = second_prepared &&
+        detail::SameCheckpoint(first_checkpoint,
+                               second_prepared->checkpoint_descriptor());
+    auto new_provisional = second_prepared
+        ? second->CommitPrepared(std::move(*second_prepared))
+        : std::optional<TwoPhaseContract::ProvisionalCommitToken>{};
+    const auto published = second->Published();
+    Slot published_before{};
+    const bool published_captured =
+        second->CopyPublished(published, published_before);
+
+    const RunTelemetry accounting_before = second->telemetry();
+    const StateCoordinates coordinates_before = second->coordinates();
+    const RunStatus status_before = second->status();
+    const FailureReason failure_before = second->last_failure();
+    const std::uint64_t publications = ArrayStoragePolicy::publications;
+    const std::uint64_t discards = ArrayStoragePolicy::discards;
+    const std::uint64_t stores = ArrayStoragePolicy::stores;
+    const std::uint64_t preparations = ArrayStoragePolicy::preparations;
+    const std::uint64_t restore_preparations =
+        ArrayStoragePolicy::restore_preparations;
+    const std::uint64_t copies = ArrayStoragePolicy::copies;
+    const std::uint64_t prepublish_checks =
+        ArrayStoragePolicy::prepublish_checks;
+    const std::uint64_t reversions =
+        TwoPhaseArrayStoragePolicy::reversions;
+    const AttemptOutcome stale_finalize = old_provisional
+        ? second->FinalizeCommit(std::move(*old_provisional))
+        : AttemptOutcome{};
+    const bool stale_rejection_is_inert =
+        stale_finalize.reason == FailureReason::stale_attempt &&
+        SameCommitAccounting(second->telemetry(), accounting_before) &&
+        second->telemetry().stale_consumers_rejected ==
+            accounting_before.stale_consumers_rejected + 1 &&
+        SameCoordinates(second->coordinates(), coordinates_before) &&
+        second->status() == status_before &&
+        second->last_failure() == failure_before &&
+        ArrayStoragePolicy::publications == publications &&
+        ArrayStoragePolicy::discards == discards &&
+        ArrayStoragePolicy::stores == stores &&
+        ArrayStoragePolicy::preparations == preparations &&
+        ArrayStoragePolicy::restore_preparations == restore_preparations &&
+        ArrayStoragePolicy::copies == copies &&
+        ArrayStoragePolicy::prepublish_checks == prepublish_checks &&
+        TwoPhaseArrayStoragePolicy::reversions == reversions;
+    Slot published_after{};
+    const bool published_is_unchanged =
+        second->CopyPublished(published, published_after) &&
+        SameSlotBytes(published_before, published_after);
+    const AttemptOutcome live_finalize = new_provisional
+        ? second->FinalizeCommit(std::move(*new_provisional))
+        : AttemptOutcome{};
+    passed = Check(
+                 old_provisional && new_provisional &&
+                     first_candidate_captured && second_candidate_captured &&
+                     SameSlotBytes(first_candidate, second_candidate) &&
+                     SameAttempt(first_begin.attempt, second_begin.attempt) &&
+                     exact_entry && exact_target && exact_checkpoint &&
+                     exact_prepared_checkpoint && published_captured &&
+                     stale_rejection_is_inert && published_is_unchanged &&
+                     live_finalize.committed,
+                 "same_address_incarnation_aba_rejects_old_provisional_authority_only") &&
         passed;
     second->~TwoPhaseContract();
   }

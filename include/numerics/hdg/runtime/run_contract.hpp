@@ -1175,17 +1175,6 @@ public:
     {
       return checkpoint_;
     }
-    template <
-        typename Policy = StoragePolicy,
-        std::enable_if_t<
-            std::is_same<Policy, StoragePolicy>::value &&
-                detail::SupportsTwoPhaseSlotExchange<Policy,
-                                                     state_slot>::value,
-            int> = 0>
-    bool CopyPrepared(state_slot& copy) const noexcept
-    {
-      return owner_ && owner_->template CopyPrepared<Policy>(*this, copy);
-    }
 
   private:
     StagingToken(const PersistentRunContract* owner,
