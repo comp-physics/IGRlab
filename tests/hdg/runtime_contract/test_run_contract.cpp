@@ -1,6 +1,7 @@
 #include "numerics/hdg/runtime/run_contract.hpp"
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -197,6 +198,8 @@ enum class CollectiveFault : unsigned char
   admission_remote_failure,
   admission_hide_local_failure,
   admission_change_local_failure,
+  admission_invalid_resolved_reason,
+  admission_unknown_failure_mask,
   finish_identity_false,
   finish_failure_consistency_false,
   finish_participants,
@@ -215,29 +218,43 @@ enum class CollectiveFault : unsigned char
   finish_remote_failure,
   finish_hide_local_failure,
   finish_change_local_failure,
+  finish_invalid_resolved_reason,
+  finish_unknown_failure_mask,
   restore_identity_false,
   restore_failure_consistency_false,
   restore_participants,
   restore_context,
   restore_remote_failure,
   restore_hide_local_failure,
-  restore_change_local_failure
+  restore_change_local_failure,
+  restore_invalid_resolved_reason,
+  restore_invalid_resolved_compatibility,
+  restore_unknown_failure_mask,
+  restore_unknown_compatibility_mask
 };
 
-std::uint64_t FailureMask(const FailureReason reason) noexcept
+constexpr std::uint64_t FailureMask(const FailureReason reason) noexcept
 {
-  return reason == FailureReason::none
-      ? 0
-      : (std::uint64_t{1} << static_cast<unsigned int>(reason));
+  const unsigned int value = static_cast<unsigned int>(reason);
+  return value != 0 &&
+          value < static_cast<unsigned int>(FailureReason::count) && value < 64
+      ? (std::uint64_t{1} << value)
+      : 0;
 }
 
-std::uint64_t CompatibilityMask(
+constexpr std::uint64_t CompatibilityMask(
     const RestartCompatibility compatibility) noexcept
 {
-  return compatibility == RestartCompatibility::compatible
-      ? 0
-      : (std::uint64_t{1} << static_cast<unsigned int>(compatibility));
+  const unsigned int value = static_cast<unsigned int>(compatibility);
+  return value != 0 &&
+          value < static_cast<unsigned int>(RestartCompatibility::count) &&
+          value < 64
+      ? (std::uint64_t{1} << value)
+      : 0;
 }
+
+constexpr std::uint64_t unknown_collective_mask_bit =
+    std::uint64_t{1} << 63;
 
 void FailGateForReason(GateReport& gates,
                        const FailureReason reason) noexcept
@@ -262,6 +279,10 @@ struct TestCollectivePolicy
   static inline FailureReason remote_reason = FailureReason::backend_failure;
   static inline RestartCompatibility remote_compatibility =
       RestartCompatibility::interior_hash_mismatch;
+  static inline FailureReason injected_reason =
+      static_cast<FailureReason>(255);
+  static inline RestartCompatibility injected_compatibility =
+      static_cast<RestartCompatibility>(255);
   static inline std::uint64_t admissions = 0;
   static inline std::uint64_t reductions = 0;
   static inline std::uint64_t restores = 0;
@@ -271,6 +292,8 @@ struct TestCollectivePolicy
     fault = CollectiveFault::none;
     remote_reason = FailureReason::backend_failure;
     remote_compatibility = RestartCompatibility::interior_hash_mismatch;
+    injected_reason = static_cast<FailureReason>(255);
+    injected_compatibility = static_cast<RestartCompatibility>(255);
     admissions = 0;
     reductions = 0;
     restores = 0;
@@ -325,6 +348,19 @@ struct TestCollectivePolicy
         report.all_prepared = false;
         report.any_failure = true;
         report.failure_mask = FailureMask(remote_reason);
+        report.resolved_reason = remote_reason;
+        break;
+      case CollectiveFault::admission_invalid_resolved_reason:
+        report.all_prepared = false;
+        report.any_failure = true;
+        report.failure_mask = FailureMask(remote_reason);
+        report.resolved_reason = injected_reason;
+        break;
+      case CollectiveFault::admission_unknown_failure_mask:
+        report.all_prepared = false;
+        report.any_failure = true;
+        report.failure_mask =
+            FailureMask(remote_reason) | unknown_collective_mask_bit;
         report.resolved_reason = remote_reason;
         break;
       default: break;
@@ -416,6 +452,19 @@ struct TestCollectivePolicy
         report.resolved_reason = remote_reason;
         FailGateForReason(report.gates, remote_reason);
         break;
+      case CollectiveFault::finish_invalid_resolved_reason:
+        report.any_failure = true;
+        report.failure_mask = FailureMask(remote_reason);
+        report.resolved_reason = injected_reason;
+        FailGateForReason(report.gates, remote_reason);
+        break;
+      case CollectiveFault::finish_unknown_failure_mask:
+        report.any_failure = true;
+        report.failure_mask =
+            FailureMask(remote_reason) | unknown_collective_mask_bit;
+        report.resolved_reason = remote_reason;
+        FailGateForReason(report.gates, remote_reason);
+        break;
       default: break;
     }
     return report;
@@ -478,6 +527,36 @@ struct TestCollectivePolicy
         report.resolved_reason = FailureReason::restart_incompatible;
         report.resolved_compatibility = remote_compatibility;
         break;
+      case CollectiveFault::restore_invalid_resolved_reason:
+        report.any_failure = true;
+        report.failure_mask = FailureMask(FailureReason::restart_incompatible);
+        report.compatibility_mask = CompatibilityMask(remote_compatibility);
+        report.resolved_reason = injected_reason;
+        report.resolved_compatibility = remote_compatibility;
+        break;
+      case CollectiveFault::restore_invalid_resolved_compatibility:
+        report.any_failure = true;
+        report.failure_mask = FailureMask(FailureReason::restart_incompatible);
+        report.compatibility_mask = CompatibilityMask(remote_compatibility);
+        report.resolved_reason = FailureReason::restart_incompatible;
+        report.resolved_compatibility = injected_compatibility;
+        break;
+      case CollectiveFault::restore_unknown_failure_mask:
+        report.any_failure = true;
+        report.failure_mask = FailureMask(FailureReason::restart_incompatible) |
+            unknown_collective_mask_bit;
+        report.compatibility_mask = CompatibilityMask(remote_compatibility);
+        report.resolved_reason = FailureReason::restart_incompatible;
+        report.resolved_compatibility = remote_compatibility;
+        break;
+      case CollectiveFault::restore_unknown_compatibility_mask:
+        report.any_failure = true;
+        report.failure_mask = FailureMask(FailureReason::restart_incompatible);
+        report.compatibility_mask = CompatibilityMask(remote_compatibility) |
+            unknown_collective_mask_bit;
+        report.resolved_reason = FailureReason::restart_incompatible;
+        report.resolved_compatibility = remote_compatibility;
+        break;
       default: break;
     }
     return report;
@@ -505,6 +584,31 @@ static_assert(!std::is_copy_constructible<
               "attempt products must not be duplicable by copying");
 static_assert(!std::is_convertible<Contract::CandidateCapability, Slot*>::value);
 static_assert(!std::is_convertible<Contract::PublishedCapability, Slot*>::value);
+static_assert(static_cast<unsigned int>(FailureReason::count) < 64);
+static_assert(static_cast<unsigned int>(RestartCompatibility::count) < 64);
+static_assert(FailureMask(static_cast<FailureReason>(255)) == 0);
+static_assert(FailureMask(FailureReason::count) == 0);
+static_assert(FailureMask(static_cast<FailureReason>(
+                  static_cast<unsigned int>(FailureReason::count) + 1U)) == 0);
+static_assert(CompatibilityMask(static_cast<RestartCompatibility>(255)) == 0);
+static_assert(CompatibilityMask(RestartCompatibility::count) == 0);
+static_assert(CompatibilityMask(static_cast<RestartCompatibility>(
+                  static_cast<unsigned int>(RestartCompatibility::count) +
+                  1U)) == 0);
+static_assert(detail::FailureBit(static_cast<FailureReason>(255)) == 0);
+static_assert(detail::FailureBit(FailureReason::count) == 0);
+static_assert(detail::FailureBit(static_cast<FailureReason>(
+                  static_cast<unsigned int>(FailureReason::count) + 1U)) == 0);
+static_assert(detail::CompatibilityBit(
+                  static_cast<RestartCompatibility>(255)) == 0);
+static_assert(
+    detail::CompatibilityBit(RestartCompatibility::count) == 0);
+static_assert(detail::CompatibilityBit(static_cast<RestartCompatibility>(
+                  static_cast<unsigned int>(RestartCompatibility::count) +
+                  1U)) == 0);
+static_assert(!detail::HasOnlyNamedFailureBits(unknown_collective_mask_bit));
+static_assert(
+    !detail::HasOnlyNamedCompatibilityBits(unknown_collective_mask_bit));
 static_assert(std::is_same<decltype(SmoothAdmissionThresholds<double>{}
                                         .minimum_rate.value),
                            double>::value);
@@ -948,6 +1052,7 @@ struct BackingStoragePolicy
   static constexpr bool publish_preserves_disjoint_backing = true;
   static inline bool alias_on_prepare = false;
   static inline bool alias_on_store = false;
+  static inline std::uint64_t restore_preparations = 0;
   static inline std::uint64_t can_publish_calls = 0;
   static inline std::uint64_t reject_can_publish_call = 0;
   static inline std::uint64_t publish_calls = 0;
@@ -956,6 +1061,7 @@ struct BackingStoragePolicy
   {
     alias_on_prepare = false;
     alias_on_store = false;
+    restore_preparations = 0;
     can_publish_calls = 0;
     reject_can_publish_call = 0;
     publish_calls = 0;
@@ -984,6 +1090,7 @@ struct BackingStoragePolicy
   static bool PrepareRestore(const BackingSlot& loaded,
                              BackingSlot& candidate) noexcept
   {
+    ++restore_preparations;
     candidate.interior.value = loaded.interior.value;
     candidate.trace.value = loaded.trace.value;
     return true;
@@ -1310,6 +1417,160 @@ bool CheckProductProtocolAndIncarnationABA()
                    "same_address_reconstruction_rejects_all_old_capabilities") &&
         passed;
     second->~Contract();
+  }
+  return passed;
+}
+
+bool CheckStaleFinishIsolation()
+{
+  bool passed = true;
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome initial =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto initial_products = IssueAll(contract, initial.attempt);
+    AttemptReport initial_failure = PassingReport(12);
+    initial_failure.gates.finite = false;
+    const AttemptOutcome failed = contract.FinishAttempt(
+        initial.attempt, initial_failure, std::move(initial_products));
+    const BeginOutcome retry = contract.Retry();
+    const bool stored =
+        StoreCandidate(contract, retry.attempt, AcceptedSlot());
+    const auto retry_capability = contract.AcquireCandidate(retry.attempt);
+    Slot candidate_before{};
+    const bool candidate_captured = retry_capability &&
+        contract.CopyCandidate(*retry_capability, candidate_before);
+    auto retry_products = IssueAll(contract, retry.attempt);
+    const auto published_capability = contract.Published();
+    Slot published_before{};
+    const bool published_captured =
+        contract.CopyPublished(published_capability, published_before);
+    const StateCoordinates coordinates_before = contract.coordinates();
+    const AcceptedTelemetry accepted_before = contract.telemetry().accepted;
+    const TransferAccounting attempted_before =
+        contract.telemetry().attempted_transfers;
+    const TransferAccounting rolled_back_before =
+        contract.telemetry().rolled_back_transfers;
+    const TransferAccounting committed_before =
+        contract.telemetry().committed_transfers;
+    const std::uint64_t rollbacks_before = contract.telemetry().rollbacks;
+
+    AttemptReport stale_report = PassingReport(99);
+    stale_report.telemetry.transfers = {300, 400, 50, 0, 20, true};
+    Contract::ProductBundle stale_products{};
+    const AttemptOutcome stale = contract.FinishAttempt(
+        initial.attempt, stale_report, std::move(stale_products));
+    Slot candidate_after{};
+    Slot published_after{};
+    const bool candidate_preserved = retry_capability &&
+        contract.CopyCandidate(*retry_capability, candidate_after);
+    const bool retry_still_current =
+        contract.IsCurrentAttempt(retry.attempt);
+    const bool published_preserved =
+        contract.CopyPublished(published_capability, published_after);
+
+    AttemptReport retry_report = PassingReport(13);
+    retry_report.telemetry.transfers = {7, 8, 9, 0, 3, true};
+    const AttemptOutcome committed = contract.FinishAttempt(
+        retry.attempt, retry_report, std::move(retry_products));
+    const StateCoordinates expected_coordinates{1.125, 5, 8, 13, 0.125};
+    passed = Check(
+                 failed.retry_available && retry.started && stored &&
+                     candidate_captured && published_captured &&
+                     !stale.committed &&
+                     stale.status == RunStatus::attempt_active &&
+                     stale.reason == FailureReason::stale_attempt &&
+                     !stale.retry_available &&
+                     contract.telemetry().rollbacks == rollbacks_before &&
+                     retry_still_current &&
+                     candidate_preserved &&
+                     candidate_after.interior == candidate_before.interior &&
+                     candidate_after.trace == candidate_before.trace &&
+                     published_preserved &&
+                     published_after.interior == published_before.interior &&
+                     published_after.trace == published_before.trace &&
+                     SameCoordinates(coordinates_before,
+                                     InitialCoordinates()) &&
+                     SameAccepted(accepted_before, AcceptedTelemetry{}) &&
+                     SameTransfers(attempted_before,
+                                   initial_failure.telemetry.transfers) &&
+                     SameTransfers(rolled_back_before,
+                                   initial_failure.telemetry.transfers) &&
+                     committed_before.host_to_device_bytes == 0 &&
+                     committed.committed &&
+                     SameCoordinates(contract.coordinates(),
+                                     expected_coordinates) &&
+                     contract.telemetry().attempted_transfers
+                             .host_to_device_bytes == 37 &&
+                     contract.telemetry().attempted_transfers
+                             .device_to_host_bytes == 48 &&
+                     contract.telemetry().attempted_transfers
+                             .mpi_staging_bytes == 14 &&
+                     contract.telemetry().attempted_transfers
+                             .synchronization_events == 5 &&
+                     SameTransfers(contract.telemetry().rolled_back_transfers,
+                                   initial_failure.telemetry.transfers) &&
+                     SameTransfers(contract.telemetry().committed_transfers,
+                                   retry_report.telemetry.transfers),
+                 "stale_finish_preserves_live_retry_and_excludes_stale_transfers") &&
+        passed;
+  }
+
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome initial =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto initial_products = IssueAll(contract, initial.attempt);
+    AttemptReport initial_failure = PassingReport(12);
+    initial_failure.gates.finite = false;
+    const AttemptOutcome failed = contract.FinishAttempt(
+        initial.attempt, initial_failure, std::move(initial_products));
+    const BeginOutcome retry = contract.Retry();
+    const bool stored = StoreCandidate(contract, retry.attempt, OtherSlot());
+    const TransferAccounting attempted_before =
+        contract.telemetry().attempted_transfers;
+    const TransferAccounting rolled_back_before =
+        contract.telemetry().rolled_back_transfers;
+    const TransferAccounting committed_before =
+        contract.telemetry().committed_transfers;
+    const AcceptedTelemetry accepted_before = contract.telemetry().accepted;
+    const StateCoordinates coordinates_before = contract.coordinates();
+    Slot published_before{};
+    const bool published_captured = CopyPublished(contract, published_before);
+
+    TestCollectivePolicy::fault = CollectiveFault::finish_identity_false;
+    AttemptReport stale_report = PassingReport(99);
+    stale_report.telemetry.transfers = {900, 800, 70, 0, 60, true};
+    Contract::ProductBundle stale_products{};
+    const AttemptOutcome mixed = contract.FinishAttempt(
+        initial.attempt, stale_report, std::move(stale_products));
+    Slot published_after{};
+    passed = Check(
+                 failed.retry_available && retry.started && stored &&
+                     published_captured && !mixed.committed &&
+                     mixed.status == RunStatus::terminal_failure &&
+                     mixed.reason == FailureReason::collective_protocol &&
+                     !mixed.retry_available &&
+                     !contract.IsCurrentAttempt(retry.attempt) &&
+                     SameAttempt(contract.telemetry().last_attempt.identity,
+                                 retry.attempt) &&
+                     contract.telemetry().last_attempt.failure_reason ==
+                         FailureReason::collective_protocol &&
+                     SameTransfers(contract.telemetry().attempted_transfers,
+                                   attempted_before) &&
+                     SameTransfers(contract.telemetry().rolled_back_transfers,
+                                   rolled_back_before) &&
+                     SameTransfers(contract.telemetry().committed_transfers,
+                                   committed_before) &&
+                     SameAccepted(contract.telemetry().accepted,
+                                  accepted_before) &&
+                     SameCoordinates(contract.coordinates(),
+                                     coordinates_before) &&
+                     CopyPublished(contract, published_after) &&
+                     published_after.interior == published_before.interior &&
+                     published_after.trace == published_before.trace,
+                 "mixed_stale_current_finish_aborts_retry_without_transfer_misattribution") &&
+        passed;
   }
   return passed;
 }
@@ -1682,6 +1943,148 @@ bool CreateCheckpoint(CheckpointDescriptor& checkpoint,
   return outcome.committed && contract.TryMakeCheckpoint(checkpoint);
 }
 
+bool CheckExternalEnumAndMaskDomains()
+{
+  bool passed = true;
+  const std::array<FailureReason, 3> invalid_failure_reasons{{
+      static_cast<FailureReason>(255),
+      FailureReason::count,
+      static_cast<FailureReason>(
+          static_cast<unsigned int>(FailureReason::count) + 1U)}};
+  const std::array<RestartCompatibility, 3> invalid_compatibilities{{
+      static_cast<RestartCompatibility>(255),
+      RestartCompatibility::count,
+      static_cast<RestartCompatibility>(
+          static_cast<unsigned int>(RestartCompatibility::count) + 1U)}};
+
+  for (const FailureReason invalid : invalid_failure_reasons)
+  {
+    Contract contract = MakeContract();
+    TestCollectivePolicy::fault =
+        CollectiveFault::admission_invalid_resolved_reason;
+    TestCollectivePolicy::injected_reason = invalid;
+    const BeginOutcome outcome =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    passed = Check(!outcome.started &&
+                       outcome.reason == FailureReason::collective_protocol &&
+                       TestCollectivePolicy::admissions == 1 &&
+                       contract.telemetry().first_failure ==
+                           FailureReason::collective_protocol,
+                   "admission_invalid_reduced_reason_fails_closed") && passed;
+  }
+  {
+    Contract contract = MakeContract();
+    TestCollectivePolicy::fault =
+        CollectiveFault::admission_unknown_failure_mask;
+    const BeginOutcome outcome =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    passed = Check(!outcome.started &&
+                       outcome.reason == FailureReason::collective_protocol &&
+                       TestCollectivePolicy::admissions == 1,
+                   "admission_unknown_failure_mask_fails_closed") && passed;
+  }
+
+  for (const FailureReason invalid : invalid_failure_reasons)
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto products = IssueAll(contract, begin.attempt);
+    AttemptReport report = PassingReport(12);
+    report.originating_failure = invalid;
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        begin.attempt, report, std::move(products));
+    passed = Check(!outcome.committed &&
+                       outcome.reason == FailureReason::collective_protocol &&
+                       outcome.retry_available &&
+                       TestCollectivePolicy::reductions == 1,
+                   "finish_invalid_originating_reason_fails_closed") && passed;
+  }
+  for (const FailureReason invalid : invalid_failure_reasons)
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto products = IssueAll(contract, begin.attempt);
+    TestCollectivePolicy::fault =
+        CollectiveFault::finish_invalid_resolved_reason;
+    TestCollectivePolicy::injected_reason = invalid;
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        begin.attempt, PassingReport(12), std::move(products));
+    passed = Check(!outcome.committed &&
+                       outcome.reason == FailureReason::collective_protocol &&
+                       TestCollectivePolicy::reductions == 1,
+                   "finish_invalid_reduced_reason_fails_closed") && passed;
+  }
+  {
+    Contract contract = MakeContract();
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, 0.125});
+    auto products = IssueAll(contract, begin.attempt);
+    TestCollectivePolicy::fault =
+        CollectiveFault::finish_unknown_failure_mask;
+    const AttemptOutcome outcome = contract.FinishAttempt(
+        begin.attempt, PassingReport(12), std::move(products));
+    passed = Check(!outcome.committed &&
+                       outcome.reason == FailureReason::collective_protocol &&
+                       TestCollectivePolicy::reductions == 1,
+                   "finish_unknown_failure_mask_fails_closed") && passed;
+  }
+
+  CheckpointDescriptor checkpoint{};
+  Slot loaded{};
+  const bool checkpoint_created = CreateCheckpoint(checkpoint, loaded);
+  passed = Check(checkpoint_created,
+                 "enum_domain_checkpoint_fixture_created") && passed;
+  if (!checkpoint_created) { return passed; }
+
+  for (const FailureReason invalid : invalid_failure_reasons)
+  {
+    Contract contract = MakeContract();
+    TestCollectivePolicy::fault =
+        CollectiveFault::restore_invalid_resolved_reason;
+    TestCollectivePolicy::injected_reason = invalid;
+    const RestoreOutcome outcome = contract.Restore(checkpoint, loaded);
+    passed = Check(!outcome.restored &&
+                       outcome.compatibility ==
+                           RestartCompatibility::collective_protocol &&
+                       TestCollectivePolicy::restores == 1 &&
+                       ArrayStoragePolicy::publications == 0,
+                   "restore_invalid_reduced_reason_fails_closed") && passed;
+  }
+  for (const RestartCompatibility invalid : invalid_compatibilities)
+  {
+    Contract contract = MakeContract();
+    TestCollectivePolicy::fault =
+        CollectiveFault::restore_invalid_resolved_compatibility;
+    TestCollectivePolicy::injected_compatibility = invalid;
+    const RestoreOutcome outcome = contract.Restore(checkpoint, loaded);
+    passed = Check(!outcome.restored &&
+                       outcome.compatibility ==
+                           RestartCompatibility::collective_protocol &&
+                       TestCollectivePolicy::restores == 1 &&
+                       ArrayStoragePolicy::publications == 0,
+                   "restore_invalid_reduced_compatibility_fails_closed") &&
+        passed;
+  }
+  for (const CollectiveFault fault : {
+           CollectiveFault::restore_unknown_failure_mask,
+           CollectiveFault::restore_unknown_compatibility_mask})
+  {
+    Contract contract = MakeContract();
+    TestCollectivePolicy::fault = fault;
+    const RestoreOutcome outcome = contract.Restore(checkpoint, loaded);
+    passed = Check(!outcome.restored &&
+                       outcome.compatibility ==
+                           RestartCompatibility::collective_protocol &&
+                       TestCollectivePolicy::restores == 1 &&
+                       ArrayStoragePolicy::publications == 0,
+                   "restore_unknown_collective_mask_bit_fails_closed") &&
+        passed;
+  }
+  return passed;
+}
+
 template <typename Mutator>
 bool ExpectRestoreFailure(const CheckpointDescriptor& original,
                           const Slot& loaded,
@@ -1747,6 +2150,151 @@ bool CheckAtomicCheckpointRestore()
                          FrozenCoordinateFingerprint(checkpoint.coordinates),
                  "checkpoint_exact_tuple_topology_coordinates_and_frozen_hashes") &&
       passed;
+
+  for (const int invalid_field : {0, 1, 2, 3})
+  {
+    PersistentResourceDescriptor resources = Resources();
+    CheckpointDescriptor matching = checkpoint;
+    if (invalid_field == 0)
+    {
+      resources.rank_count = 0;
+      matching.rank_count = 0;
+    }
+    else if (invalid_field == 1)
+    {
+      resources.mfem_pin = StableIdentity{""};
+      matching.mfem_pin = resources.mfem_pin;
+    }
+    else if (invalid_field == 2)
+    {
+      resources.layout = StableIdentity{""};
+      matching.layout = resources.layout;
+    }
+    else
+    {
+      resources.reuse.persistent_workspace = false;
+    }
+    Contract contract = MakeContract(InitialCoordinates(), resources);
+    const auto published_before = contract.Published();
+    Slot before{};
+    const bool captured = contract.CopyPublished(published_before, before);
+    const StateCoordinates coordinates_before = contract.coordinates();
+    const AcceptedTelemetry accepted_before = contract.telemetry().accepted;
+    const RestoreOutcome outcome = contract.Restore(matching, loaded);
+    Slot after{};
+    passed = Check(
+                 captured && !outcome.restored &&
+                     outcome.compatibility ==
+                         RestartCompatibility::policy_mismatch &&
+                     contract.status() == RunStatus::invalid_request &&
+                     contract.telemetry().first_failure ==
+                         FailureReason::invalid_resource_descriptor &&
+                     TestCollectivePolicy::restores == 1 &&
+                     ArrayStoragePolicy::restore_preparations == 0 &&
+                     ArrayStoragePolicy::publications == 0 &&
+                     ArrayStoragePolicy::discards == 0 &&
+                     SameCoordinates(contract.coordinates(),
+                                     coordinates_before) &&
+                     SameAccepted(contract.telemetry().accepted,
+                                  accepted_before) &&
+                     contract.CopyPublished(published_before, after) &&
+                     after.interior == before.interior &&
+                     after.trace == before.trace,
+                 "invalid_resources_cannot_be_rehabilitated_by_matching_restore") &&
+        passed;
+  }
+
+  {
+    StateCoordinates invalid_coordinates = InitialCoordinates();
+    invalid_coordinates.time = std::numeric_limits<double>::quiet_NaN();
+    Contract contract = MakeContract(invalid_coordinates);
+    const StateCoordinates coordinates_before = contract.coordinates();
+    const AcceptedTelemetry accepted_before = contract.telemetry().accepted;
+    const RestoreOutcome outcome = contract.Restore(checkpoint, loaded);
+    passed = Check(!outcome.restored &&
+                       outcome.compatibility ==
+                           RestartCompatibility::policy_mismatch &&
+                       contract.status() == RunStatus::invalid_request &&
+                       contract.telemetry().first_failure ==
+                           FailureReason::invalid_dt &&
+                       TestCollectivePolicy::restores == 1 &&
+                       ArrayStoragePolicy::restore_preparations == 0 &&
+                       ArrayStoragePolicy::publications == 0 &&
+                       SameCoordinates(contract.coordinates(),
+                                       coordinates_before) &&
+                       SameAccepted(contract.telemetry().accepted,
+                                    accepted_before),
+                   "invalid_constructor_coordinates_cannot_be_restored") &&
+        passed;
+  }
+
+  {
+    const std::uint64_t saved_incarnation =
+        detail::next_contract_incarnation.load(std::memory_order_relaxed);
+    detail::next_contract_incarnation.store(
+        std::numeric_limits<std::uint64_t>::max(),
+        std::memory_order_relaxed);
+    ArrayStoragePolicy::Reset();
+    TestCollectivePolicy::Reset();
+    Contract contract{
+        CommittedSlot(), ScratchSlot(), InitialCoordinates(), Resources()};
+    detail::next_contract_incarnation.store(saved_incarnation,
+                                            std::memory_order_relaxed);
+    const StateCoordinates coordinates_before = contract.coordinates();
+    const AcceptedTelemetry accepted_before = contract.telemetry().accepted;
+    const RestoreOutcome outcome = contract.Restore(checkpoint, loaded);
+    passed = Check(!outcome.restored &&
+                       outcome.compatibility ==
+                           RestartCompatibility::policy_mismatch &&
+                       contract.status() == RunStatus::invalid_request &&
+                       contract.telemetry().first_failure ==
+                           FailureReason::incarnation_exhausted &&
+                       TestCollectivePolicy::restores == 1 &&
+                       ArrayStoragePolicy::restore_preparations == 0 &&
+                       ArrayStoragePolicy::publications == 0 &&
+                       SameCoordinates(contract.coordinates(),
+                                       coordinates_before) &&
+                       SameAccepted(contract.telemetry().accepted,
+                                    accepted_before),
+                   "invalid_incarnation_cannot_be_restored") && passed;
+  }
+
+  {
+    BackingContract contract = MakeBackingContract(true);
+    BackingSlot backing_loaded{{5, 11.0}, {6, 15.0}};
+    CheckpointDescriptor matching = checkpoint;
+    matching.interior_hash =
+        BackingStoragePolicy::HashInterior(backing_loaded.interior);
+    matching.trace_hash =
+        BackingStoragePolicy::HashTrace(backing_loaded.trace);
+    const auto published_before = contract.Published();
+    BackingSlot before{{91, 0.0}, {92, 0.0}};
+    const bool captured = contract.CopyPublished(published_before, before);
+    const StateCoordinates coordinates_before = contract.coordinates();
+    const AcceptedTelemetry accepted_before = contract.telemetry().accepted;
+    const RestoreOutcome outcome = contract.Restore(matching, backing_loaded);
+    BackingSlot after{{93, 0.0}, {94, 0.0}};
+    passed = Check(
+                 captured && !outcome.restored &&
+                     outcome.compatibility ==
+                         RestartCompatibility::policy_mismatch &&
+                     contract.status() == RunStatus::invalid_request &&
+                     contract.telemetry().first_failure ==
+                         FailureReason::shared_backing_store &&
+                     TestCollectivePolicy::restores == 1 &&
+                     BackingStoragePolicy::restore_preparations == 0 &&
+                     BackingStoragePolicy::can_publish_calls == 0 &&
+                     BackingStoragePolicy::publish_calls == 0 &&
+                     SameCoordinates(contract.coordinates(),
+                                     coordinates_before) &&
+                     SameAccepted(contract.telemetry().accepted,
+                                  accepted_before) &&
+                     contract.CopyPublished(published_before, after) &&
+                     after.interior.value == before.interior.value &&
+                     after.trace.value == before.trace.value,
+                 "invalid_shared_storage_construction_cannot_be_restored") &&
+        passed;
+  }
 
   {
     Contract contract = MakeContract();
@@ -2194,8 +2742,10 @@ int main()
   passed = CheckStaticSelectionAndCollectiveAdmission() && passed;
   passed = CheckCapabilitiesAndFailureAtomicPublication() && passed;
   passed = CheckProductProtocolAndIncarnationABA() && passed;
+  passed = CheckStaleFinishIsolation() && passed;
   passed = CheckFirstFailureAcrossSuccessfulRetry() && passed;
   passed = CheckResidualTelemetryAndCollectiveTruth() && passed;
+  passed = CheckExternalEnumAndMaskDomains() && passed;
   passed = CheckAtomicCheckpointRestore() && passed;
   return passed ? 0 : 1;
 }

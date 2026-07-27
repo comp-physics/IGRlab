@@ -81,7 +81,8 @@ enum class FailureReason : unsigned char
   telemetry_gate,
   success_gate,
   backend_failure,
-  retry_exhausted
+  retry_exhausted,
+  count
 };
 
 enum class DerivedProductKind : unsigned char
@@ -123,7 +124,8 @@ enum class RestartCompatibility : unsigned char
   shared_backing_store,
   publication_precondition,
   collective_protocol,
-  policy_mismatch
+  policy_mismatch,
+  count
 };
 
 /** Fixed-capacity owned identity. No descriptor retains caller text storage. */
@@ -604,10 +606,13 @@ struct AttemptOutcome
 namespace detail
 {
 
-static_assert(static_cast<unsigned int>(FailureReason::retry_exhausted) < 64,
+static_assert(static_cast<unsigned int>(FailureReason::none) == 0,
+              "failure truth masks reserve zero for no failure");
+static_assert(static_cast<unsigned int>(FailureReason::count) < 64,
               "failure truth mask must represent every FailureReason");
-static_assert(static_cast<unsigned int>(RestartCompatibility::policy_mismatch) <
-                  64,
+static_assert(static_cast<unsigned int>(RestartCompatibility::compatible) == 0,
+              "restore truth masks reserve zero for compatibility");
+static_assert(static_cast<unsigned int>(RestartCompatibility::count) < 64,
               "restore truth mask must represent every incompatibility");
 
 inline std::atomic<std::uint64_t> next_contract_incarnation{1};
@@ -664,19 +669,71 @@ inline bool SameContext(const AttemptCollectiveContext& left,
       left.candidate_cursor == right.candidate_cursor;
 }
 
+constexpr bool IsNamedFailureReason(const FailureReason reason) noexcept
+{
+  return static_cast<unsigned int>(reason) <
+      static_cast<unsigned int>(FailureReason::count);
+}
+
+constexpr bool IsNamedRestartCompatibility(
+    const RestartCompatibility compatibility) noexcept
+{
+  return static_cast<unsigned int>(compatibility) <
+      static_cast<unsigned int>(RestartCompatibility::count);
+}
+
 constexpr std::uint64_t FailureBit(const FailureReason reason) noexcept
 {
-  return reason == FailureReason::none
-      ? 0
-      : (std::uint64_t{1} << static_cast<unsigned int>(reason));
+  const unsigned int value = static_cast<unsigned int>(reason);
+  return IsNamedFailureReason(reason) && value != 0 && value < 64
+      ? (std::uint64_t{1} << value)
+      : 0;
 }
 
 constexpr std::uint64_t CompatibilityBit(
     const RestartCompatibility compatibility) noexcept
 {
-  return compatibility == RestartCompatibility::compatible
-      ? 0
-      : (std::uint64_t{1} << static_cast<unsigned int>(compatibility));
+  const unsigned int value = static_cast<unsigned int>(compatibility);
+  return IsNamedRestartCompatibility(compatibility) && value != 0 &&
+          value < 64
+      ? (std::uint64_t{1} << value)
+      : 0;
+}
+
+constexpr std::uint64_t NamedFailureMask() noexcept
+{
+  std::uint64_t mask = 0;
+  for (unsigned int value = 1;
+       value < static_cast<unsigned int>(FailureReason::count) && value < 64;
+       ++value)
+  {
+    mask |= std::uint64_t{1} << value;
+  }
+  return mask;
+}
+
+constexpr std::uint64_t NamedCompatibilityMask() noexcept
+{
+  std::uint64_t mask = 0;
+  for (unsigned int value = 1;
+       value < static_cast<unsigned int>(RestartCompatibility::count) &&
+           value < 64;
+       ++value)
+  {
+    mask |= std::uint64_t{1} << value;
+  }
+  return mask;
+}
+
+constexpr bool HasOnlyNamedFailureBits(const std::uint64_t mask) noexcept
+{
+  return (mask & ~NamedFailureMask()) == 0;
+}
+
+constexpr bool HasOnlyNamedCompatibilityBits(
+    const std::uint64_t mask) noexcept
+{
+  return (mask & ~NamedCompatibilityMask()) == 0;
 }
 
 inline bool SameCheckpoint(const CheckpointDescriptor& left,
@@ -1242,6 +1299,8 @@ public:
                                ProductBundle&& products) noexcept
   {
     const bool current = IsCurrentAttempt(attempt);
+    const bool originating_reason_valid =
+        detail::IsNamedFailureReason(report.originating_failure);
     FailureReason product_reason = FailureReason::stale_attempt;
     if (current)
     {
@@ -1289,7 +1348,11 @@ public:
     }
 
     FailureReason local_reason = FailureReason::none;
-    if (!current)
+    if (!originating_reason_valid)
+    {
+      local_reason = FailureReason::collective_protocol;
+    }
+    else if (!current)
     {
       local_reason = FailureReason::stale_attempt;
     }
@@ -1328,9 +1391,21 @@ public:
     const FailureReason reason = ResolveGateCollective(
         local_context, local_gates, local_reason, collective);
 
-    if (!current && !active_)
+    if (!current)
     {
       RememberFirstFailure(reason);
+      if (active_ && reason != FailureReason::stale_attempt)
+      {
+        // A mixed stale/current identity or any contradictory collective
+        // truth aborts the live attempt, but the stale caller's telemetry and
+        // transfers never become attributes of that newer attempt.
+        AttemptTelemetry active_failure{};
+        active_failure.identity = active_attempt_;
+        active_failure.transfers.complete = true;
+        active_failure.failure_reason = reason;
+        telemetry_.last_attempt = active_failure;
+        return Rollback(active_attempt_, reason, TransferAccounting{}, false);
+      }
       return {status_, reason, false,
               status_ == RunStatus::retry_available};
     }
@@ -1718,6 +1793,10 @@ private:
       const FailureReason local_reason,
       const CollectiveAdmissionReport& report) const noexcept
   {
+    const bool domains = detail::IsNamedFailureReason(local_reason) &&
+        detail::IsNamedFailureReason(report.resolved_reason) &&
+        detail::HasOnlyNamedFailureBits(report.failure_mask);
+    if (!domains) { return FailureReason::collective_protocol; }
     const bool identity =
         report.participating_ranks == resources_.rank_count &&
         report.identity_consistent && report.failure_consistent &&
@@ -1746,6 +1825,10 @@ private:
       const FailureReason local_reason,
       const CollectiveGateReport& report) const noexcept
   {
+    const bool domains = detail::IsNamedFailureReason(local_reason) &&
+        detail::IsNamedFailureReason(report.resolved_reason) &&
+        detail::HasOnlyNamedFailureBits(report.failure_mask);
+    if (!domains) { return FailureReason::collective_protocol; }
     const bool identity =
         report.participating_ranks == resources_.rank_count &&
         report.identity_consistent && report.failure_consistent &&
@@ -1773,6 +1856,14 @@ private:
       const FailureReason local_reason,
       const CollectiveRestoreReport& report) const noexcept
   {
+    const bool domains =
+        detail::IsNamedRestartCompatibility(local_compatibility) &&
+        detail::IsNamedFailureReason(local_reason) &&
+        detail::IsNamedRestartCompatibility(report.resolved_compatibility) &&
+        detail::IsNamedFailureReason(report.resolved_reason) &&
+        detail::HasOnlyNamedFailureBits(report.failure_mask) &&
+        detail::HasOnlyNamedCompatibilityBits(report.compatibility_mask);
+    if (!domains) { return RestartCompatibility::collective_protocol; }
     const bool identity =
         report.participating_ranks == resources_.rank_count &&
         report.identity_consistent && report.failure_consistent &&
@@ -1904,10 +1995,13 @@ private:
 
   void RememberFirstFailure(const FailureReason reason) noexcept
   {
-    if (reason != FailureReason::none &&
+    const FailureReason named_reason = detail::IsNamedFailureReason(reason)
+        ? reason
+        : FailureReason::collective_protocol;
+    if (named_reason != FailureReason::none &&
         telemetry_.first_failure == FailureReason::none)
     {
-      telemetry_.first_failure = reason;
+      telemetry_.first_failure = named_reason;
     }
   }
 
@@ -1928,6 +2022,14 @@ private:
       const StateHash& loaded_interior_hash,
       const StateHash& loaded_trace_hash) const noexcept
   {
+    if (!detail::IsNamedFailureReason(constructor_failure_) ||
+        constructor_failure_ != FailureReason::none || incarnation_ == 0 ||
+        !storage_valid_ || !resources_.Valid() ||
+        !Selection::Descriptor().Valid() ||
+        !StoragePolicy::Disjoint(committed_, candidate_))
+    {
+      return RestartCompatibility::policy_mismatch;
+    }
     if (active_) { return RestartCompatibility::contract_busy; }
     if (!checkpoint.successful_commit)
     {
