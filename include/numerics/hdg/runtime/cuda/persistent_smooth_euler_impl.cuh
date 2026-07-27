@@ -1,0 +1,834 @@
+/* Included by persistent_smooth_euler.cuh inside dg::hdg::runtime::cuda_w8a. */
+
+namespace detail
+{
+
+inline constexpr std::size_t persistent_double_capacity = 220000;
+inline constexpr std::size_t persistent_integer_capacity = 120000;
+
+struct CudaTrueMatrixStructure
+{
+  int rows = 0;
+  int diag_nonzeros = 0;
+  int offd_nonzeros = 0;
+  std::array<int, maximum_true_trace_dofs + 1> diag_offsets{};
+  std::array<int, maximum_true_matrix_entries> diag_columns{};
+  std::array<int, maximum_true_trace_dofs + 1> offd_offsets{};
+  std::array<std::int64_t, maximum_true_matrix_entries> offd_columns{};
+};
+
+struct CudaTrueMatrixDeviceView
+{
+  double* diag_values = nullptr;
+  double* offd_values = nullptr;
+  int diag_nonzeros = 0;
+  int offd_nonzeros = 0;
+};
+
+struct CudaDeviceView
+{
+  double* slot_interior[2]{};
+  double* old_interior = nullptr;
+  double* work_interior = nullptr;
+  double* initial_current_interior = nullptr;
+  double* base_interior = nullptr;
+  double* trial_interior = nullptr;
+  double* delta_interior = nullptr;
+  double* recovered_interior = nullptr;
+  double* work_true_trace = nullptr;
+  double* initial_current_true_trace = nullptr;
+  double* base_true_trace = nullptr;
+  double* trial_true_trace = nullptr;
+  double* distributed_local_trace = nullptr;
+  double* current_local_trace = nullptr;
+  double* base_local_trace = nullptr;
+  double* trace_increment_local = nullptr;
+  double* residual_r = nullptr;
+  double* residual_g = nullptr;
+  double* a = nullptr;
+  double* b = nullptr;
+  double* c = nullptr;
+  double* d = nullptr;
+  double* f = nullptr;
+  double* g = nullptr;
+  double* lu = nullptr;
+  double* pivots = nullptr;
+  double* solve_workspace = nullptr;
+  double* schur = nullptr;
+  double* condensed_rhs = nullptr;
+  double* true_residual = nullptr;
+  double* true_rhs_scratch = nullptr;
+  double* true_solution = nullptr;
+  double* remote_matrix_send = nullptr;
+  double* remote_matrix_receive = nullptr;
+  double* remote_vector_send = nullptr;
+  double* remote_vector_receive = nullptr;
+  double* volume_shape = nullptr;
+  double* volume_derivative = nullptr;
+  double* volume_weight = nullptr;
+  double* volume_position = nullptr;
+  double* face_interior_shape = nullptr;
+  double* face_trace_shape = nullptr;
+  double* face_weight = nullptr;
+  double* face_normal = nullptr;
+  double* status = nullptr;
+  double* scalar = nullptr;
+  std::uint64_t* hash_words = nullptr;
+  int* ticket_words = nullptr;
+  int* signed_element_trace = nullptr;
+  int* matrix_owned_source = nullptr;
+  int* matrix_owned_section = nullptr;
+  int* matrix_owned_target = nullptr;
+  int* matrix_send_source = nullptr;
+  int* matrix_receive_section = nullptr;
+  int* matrix_receive_target = nullptr;
+  int* vector_owned_source = nullptr;
+  int* vector_owned_target = nullptr;
+  int* vector_send_source = nullptr;
+  int* vector_receive_target = nullptr;
+};
+
+struct CudaMeshShape
+{
+  int elements = 0;
+  int interior_count = 0;
+  int local_trace_count = 0;
+  int true_trace_count = 0;
+  int global_true_trace_count = 0;
+  int volume_points = 0;
+  int face_points = 0;
+  int matrix_owned_count = 0;
+  int matrix_send_count = 0;
+  int matrix_receive_count = 0;
+  int vector_owned_count = 0;
+  int vector_send_count = 0;
+  int vector_receive_count = 0;
+};
+
+struct CudaSolveDiagnostics
+{
+  bool device_policy = false;
+  bool configured_ilu0 = false;
+  bool converged = false;
+  bool finite = false;
+  int iterations = 0;
+  double reported_residual = std::numeric_limits<double>::infinity();
+};
+
+using CudaCopyOutFunction = bool (*)(
+    void*, const void*, std::size_t, CudaTransferCategory,
+    CudaTransferSite) noexcept;
+using CudaSynchronizeFunction = bool (*)(CudaTransferSite) noexcept;
+
+bool CudaGetTrueMatrixStructure(mfem::HypreParMatrix& matrix,
+                                const std::int64_t* owned_global,
+                                int owned_count,
+                                CudaTrueMatrixStructure& structure,
+                                CudaCopyOutFunction copy_out,
+                                CudaSynchronizeFunction synchronize) noexcept;
+bool CudaGetTrueMatrixDeviceView(mfem::HypreParMatrix& matrix,
+                                 CudaTrueMatrixDeviceView& view) noexcept;
+bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
+                                  mfem::HypreILU& ilu,
+                                  mfem::HypreGMRES& gmres,
+                                  int ranks) noexcept;
+bool CudaRefreshFactorAndSolve(mfem::HypreParMatrix& matrix,
+                               mfem::HypreParVector& rhs,
+                               mfem::HypreParVector& solution,
+                               mfem::HypreILU& ilu,
+                               mfem::HypreGMRES& gmres,
+                               int ranks,
+                               CudaSolveDiagnostics& diagnostics) noexcept;
+bool CudaHypreDevicePolicyValid(mfem::HypreParMatrix& matrix,
+                                mfem::HypreParVector& rhs,
+                                mfem::HypreParVector& solution) noexcept;
+
+bool CudaLaunchTicket(int* words, CudaFailurePhase phase,
+                      std::uint64_t attempt, std::uint64_t generation,
+                      int device) noexcept;
+bool CudaLaunchGatherLocalTrace(const int* signed_map, int count,
+                                const double* true_trace,
+                                double* local_trace) noexcept;
+bool CudaLaunchAdmissibility(const CudaDeviceView& view,
+                             const CudaMeshShape& shape) noexcept;
+bool CudaLaunchAssembly(const CudaDeviceView& view,
+                        const CudaMeshShape& shape, double dt) noexcept;
+bool CudaLaunchCondensation(const CudaDeviceView& view,
+                            const CudaMeshShape& shape) noexcept;
+bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& matrix,
+                              double* rhs, int rhs_count) noexcept;
+bool CudaLaunchAssembleOwnedMatrix(const CudaDeviceView& view,
+                                   const CudaTrueMatrixDeviceView& matrix,
+                                   const CudaMeshShape& shape) noexcept;
+bool CudaLaunchGatherRemoteMatrix(const CudaDeviceView& view,
+                                  const CudaMeshShape& shape) noexcept;
+bool CudaLaunchScatterRemoteMatrix(const CudaDeviceView& view,
+                                   const CudaTrueMatrixDeviceView& matrix,
+                                   const CudaMeshShape& shape) noexcept;
+bool CudaLaunchAssembleOwnedVector(const CudaDeviceView& view,
+                                   const CudaMeshShape& shape,
+                                   const double* element_vector,
+                                   double* true_vector) noexcept;
+bool CudaLaunchGatherRemoteVector(const CudaDeviceView& view,
+                                  const CudaMeshShape& shape,
+                                  const double* element_vector) noexcept;
+bool CudaLaunchScatterRemoteVector(const CudaDeviceView& view,
+                                   const CudaMeshShape& shape,
+                                   double* true_vector) noexcept;
+bool CudaLaunchRecover(const CudaDeviceView& view,
+                       const CudaMeshShape& shape) noexcept;
+bool CudaLaunchTrial(const CudaDeviceView& view,
+                     const CudaMeshShape& shape, double alpha) noexcept;
+bool CudaLaunchLocalSquaredNorm(const double* first, int first_count,
+                                const double* second, int second_count,
+                                double* result) noexcept;
+bool CudaLaunchHash(const double* values, int count,
+                    std::uint64_t* words) noexcept;
+
+inline StateHash HashHostBytes(const void* data, const std::size_t bytes) noexcept
+{
+  StateHash result{};
+  const auto* input = static_cast<const unsigned char*>(data);
+  std::array<std::uint64_t, 4> hash{{
+      1469598103934665603ULL,
+      1099511628211ULL ^ 0x9e3779b97f4a7c15ULL,
+      1469598103934665603ULL ^ 0xd6e8feb86659fd93ULL,
+      1099511628211ULL ^ 0xa0761d6478bd642fULL}};
+  for (std::size_t i = 0; i < bytes; ++i)
+  {
+    for (std::size_t lane = 0; lane < hash.size(); ++lane)
+    {
+      hash[lane] ^= static_cast<std::uint64_t>(input[i] + 17U * lane);
+      hash[lane] *= 1099511628211ULL + 2ULL * lane;
+    }
+  }
+  std::memcpy(result.bytes.data(), hash.data(), sizeof(hash));
+  return result;
+}
+
+template <typename T>
+inline T* TakeArena(T*& cursor, std::size_t count) noexcept
+{
+  T* result = cursor;
+  cursor += count;
+  return result;
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+class CudaPersistentNumerics
+{
+public:
+  using state_slot = CompleteStateSlot<CudaInteriorState, CudaTrueTraceState>;
+
+  CudaPersistentNumerics() noexcept = default;
+  ~CudaPersistentNumerics()
+  {
+    if (integer_arena_ != nullptr)
+      AllocatorPolicy::Deallocate(integer_arena_,
+                                  CudaAllocationSite::persistent_integer_arena);
+    if (double_arena_ != nullptr)
+      AllocatorPolicy::Deallocate(double_arena_,
+                                  CudaAllocationSite::persistent_double_arena);
+  }
+
+  CudaPersistentNumerics(const CudaPersistentNumerics&) = delete;
+  CudaPersistentNumerics& operator=(const CudaPersistentNumerics&) = delete;
+
+  bool Initialize(const CudaConfig& config, CudaRunEvidence& evidence,
+                  const RuntimeTupleDescriptor& tuple) noexcept
+  {
+    CudaPolicyContext setup{};
+    setup.phase = CudaFailurePhase::setup;
+    TransportPolicy::BeginAttempt(setup);
+    if (!ConfigureDeviceAndRanks(config, evidence) ||
+        !BuildTopology(config) || !AllocateArenas() ||
+        !BindArenaViews() || !UploadTopologyAndState() ||
+        !BuildPersistentTrueSystem() || !BindStateSlots() ||
+        !VerifyResidencyAndTicket(evidence))
+    {
+      return false;
+    }
+    resources_.mfem_pin = StableIdentity::Copy(
+        "d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec");
+    resources_.mesh_hash = HashHostBytes(element_coordinate_keys_.data(),
+        static_cast<std::size_t>(shape_.elements) * dimension *
+            sizeof(std::int64_t));
+    resources_.partition_hash = HashHostBytes(owned_global_true_.data(),
+        static_cast<std::size_t>(shape_.true_trace_count) *
+            sizeof(std::int64_t));
+    resources_.topology_hash = HashHostBytes(signed_element_trace_.data(),
+        static_cast<std::size_t>(shape_.elements) * trace_dofs_per_element *
+            sizeof(int));
+    resources_.rank_count = static_cast<std::uint32_t>(ranks_);
+    resources_.polynomial_order = polynomial_order;
+    resources_.layout = StableIdentity::Copy("mfem.byNODES.vdim4.p1.n3");
+    resources_.reuse = {true,
+                        true,
+                        true,
+                        false,
+                        1,
+                        1,
+                        persistent_double_capacity * sizeof(double) +
+                            persistent_integer_capacity * sizeof(int),
+                        WorkspaceBytes()};
+    tuple_ = tuple;
+    baseline_allocations_ = AllocatorPolicy::AllocationEvents();
+    initialized_ = true;
+    evidence.rank = rank_;
+    evidence.ranks = ranks_;
+    evidence.device = device_;
+    evidence.physical_gpu_uuid = gpu_uuid_;
+    evidence.same_physical_gpu = same_physical_gpu_;
+    evidence.mfem_device_valid = device_resident_;
+    evidence.hypre_cuda_umpire_device = hypre_policy_valid_;
+    evidence.signed_owner_ghost_semantics = signed_owner_ghost_valid_;
+    evidence.host_staged_rank2 = ranks_ == 1 || host_staged_rank2_;
+    evidence.no_host_solver_fallback = no_fallback_;
+    return true;
+  }
+
+  state_slot CommittedSlot() const noexcept { return committed_slot_; }
+  state_slot CandidateSlot() const noexcept { return candidate_slot_; }
+  state_slot& WorkspaceSlot() noexcept { return workspace_slot_; }
+  const PersistentResourceDescriptor& Resources() const noexcept
+  {
+    return resources_;
+  }
+  int rank() const noexcept { return rank_; }
+  bool NoFallback() const noexcept { return no_fallback_; }
+  bool DeviceResident() const noexcept { return device_resident_; }
+  const std::array<CudaDeviceTicket, maximum_device_tickets>& Tickets()
+      const noexcept { return tickets_; }
+  std::size_t TicketCount() const noexcept { return ticket_count_; }
+
+  CudaReuseEvidence ReuseEvidence() const noexcept
+  {
+    CudaReuseEvidence value{};
+    value.topology_token = reinterpret_cast<std::uintptr_t>(&resources_);
+    value.double_arena_token = reinterpret_cast<std::uintptr_t>(double_arena_);
+    value.integer_arena_token = reinterpret_cast<std::uintptr_t>(integer_arena_);
+    value.matrix_token = reinterpret_cast<std::uintptr_t>(true_matrix_.get());
+    value.factor_token = reinterpret_cast<std::uintptr_t>(
+        ilu_ ? static_cast<HYPRE_Solver>(*ilu_) : nullptr);
+    value.workspace_token = reinterpret_cast<std::uintptr_t>(view_.a);
+    value.interior_slot_tokens = {{committed_slot_.interior.storage_token,
+                                   candidate_slot_.interior.storage_token}};
+    value.trace_slot_tokens = {{committed_slot_.trace.storage_token,
+                                candidate_slot_.trace.storage_token}};
+    value.baseline_allocation_events = baseline_allocations_;
+    value.post_baseline_allocation_events =
+        AllocatorPolicy::AllocationEvents() - baseline_allocations_;
+    value.persistent_graph = true_matrix_ && local_trace_matrix_;
+    value.persistent_slots = committed_slot_.interior.coefficients !=
+            candidate_slot_.interior.coefficients &&
+        committed_slot_.trace.coefficients != candidate_slot_.trace.coefficients;
+    value.persistent_workspace = view_.a != nullptr && view_.schur != nullptr;
+    return value;
+  }
+
+  bool PrepareAttempt(const AttemptIdentity& attempt, state_slot& workspace,
+                      const bool first_step) noexcept
+  {
+    current_attempt_ = attempt;
+    current_generation_ = attempt.committed_generation + 1;
+    ticket_count_ = 0;
+    TransportPolicy::SetPhase(CudaFailurePhase::setup, current_generation_);
+    if (!TransportPolicy::DeviceToDevice(
+            view_.old_interior, workspace.interior.coefficients,
+            workspace.interior.count * sizeof(double),
+            CudaTransferCategory::state_prepare,
+            CudaTransferSite::candidate_prepare_interior))
+      return false;
+    if (first_step)
+    {
+      if (!TransportPolicy::DeviceToDevice(
+              workspace.interior.coefficients,
+              view_.initial_current_interior,
+              workspace.interior.count * sizeof(double),
+              CudaTransferCategory::state_prepare,
+              CudaTransferSite::candidate_prepare_interior) ||
+          !TransportPolicy::DeviceToDevice(
+              workspace.trace.coefficients,
+              view_.initial_current_true_trace,
+              workspace.trace.count * sizeof(double),
+              CudaTransferCategory::state_prepare,
+              CudaTransferSite::candidate_prepare_trace))
+      {
+        return false;
+      }
+      workspace.interior.generation = current_generation_;
+      workspace.trace.generation = current_generation_;
+    }
+    return DistributeCurrentTrace(workspace.trace.coefficients);
+  }
+
+  CudaNumericalResult Execute(const CudaConfig& config,
+                              const AttemptIdentity& attempt,
+                              state_slot& workspace) noexcept
+  {
+    CudaNumericalResult result{};
+    result.phase = CudaFailurePhase::assembly;
+    if (!initialized_ || !Ticket(CudaFailurePhase::assembly) ||
+        !AssembleAndNorm(workspace, result.initial_residual))
+    {
+      result.reason = FailureReason::finite_gate;
+      return result;
+    }
+    result.finite = std::isfinite(result.initial_residual) &&
+        result.initial_residual > 1.0e-8;
+    result.final_residual = result.initial_residual;
+    const double target = 1.0e-10 * (1.0 + result.initial_residual);
+    std::uint64_t last_product_generation = 0;
+    for (int iteration = 0; iteration < 20; ++iteration)
+    {
+      if (result.nonlinear_updates >= 2 && result.final_residual <= target)
+        break;
+      if (!CopyBase(workspace) || !Ticket(CudaFailurePhase::condensation) ||
+          !CudaLaunchCondensation(view_, shape_) ||
+          !TransportPolicy::Synchronize(CudaTransferSite::scalar_status) ||
+          !StatusPassed())
+      {
+        result.phase = CudaFailurePhase::condensation;
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      const std::uint64_t generation = ++linear_generation_;
+      result.phase = CudaFailurePhase::trace_solve;
+      if (!AssembleTrueSystem() || !Ticket(CudaFailurePhase::trace_solve) ||
+          !SolveTrueSystem(result.true_relative_residual))
+      {
+        result.reason = FailureReason::true_residual_gate;
+        return result;
+      }
+      ++result.trace_solves;
+      if (!DistributeTraceIncrement() || !Ticket(CudaFailurePhase::recovery) ||
+          !CudaLaunchRecover(view_, shape_) ||
+          !TransportPolicy::Synchronize(CudaTransferSite::scalar_status) ||
+          !StatusPassed())
+      {
+        result.phase = CudaFailurePhase::recovery;
+        result.reason = FailureReason::recovery_gate;
+        return result;
+      }
+      last_product_generation = generation;
+      bool accepted = false;
+      for (int trial = 0; trial <= 12; ++trial)
+      {
+        const double alpha = std::ldexp(1.0, -trial);
+        if (!CudaLaunchTrial(view_, shape_, alpha) ||
+            !TransportPolicy::Synchronize(CudaTransferSite::scalar_status))
+        {
+          RestoreBase(workspace);
+          continue;
+        }
+        SwapTrialIntoWorkspace(workspace);
+        if (!DistributeCurrentTrace(workspace.trace.coefficients) ||
+            !CudaLaunchAdmissibility(view_, shape_) ||
+            !TransportPolicy::Synchronize(CudaTransferSite::scalar_status) ||
+            !StatusPassed())
+        {
+          RestoreBase(workspace);
+          continue;
+        }
+        double trial_residual = std::numeric_limits<double>::infinity();
+        if (!AssembleAndNorm(workspace, trial_residual) ||
+            !std::isfinite(trial_residual))
+        {
+          result.reason = FailureReason::finite_gate;
+          return result;
+        }
+        if (trial_residual <=
+            (1.0 - 1.0e-4 * alpha) * result.final_residual)
+        {
+          result.final_residual = trial_residual;
+          ++result.nonlinear_updates;
+          accepted = true;
+          break;
+        }
+        RestoreBase(workspace);
+      }
+      if (!accepted)
+      {
+        result.reason = FailureReason::admissibility_gate;
+        return result;
+      }
+    }
+    result.phase = CudaFailurePhase::after_recovery_before_commit;
+    result.admissible = result.nonlinear_updates >= 2 &&
+        result.final_residual <= target && CudaLaunchAdmissibility(view_, shape_) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+        StatusPassed();
+    result.recovery = last_product_generation != 0;
+    result.true_residual = std::isfinite(result.true_relative_residual) &&
+        result.true_relative_residual <= 1.0e-10;
+    result.telemetry = DeviceResident() && NoFallback() &&
+        AllocatorPolicy::AllocationEvents() == baseline_allocations_;
+    result.success = result.finite && result.admissible && result.recovery &&
+        result.true_residual && result.telemetry;
+    result.reason = result.success ? FailureReason::none :
+        FailureReason::success_gate;
+    result.products = {last_product_generation,
+                       last_product_generation,
+                       last_product_generation,
+                       last_product_generation,
+                       0};
+    result.candidate_ready = result.recovery;
+    workspace.interior.generation = current_generation_;
+    workspace.trace.generation = current_generation_;
+    if (!UpdateStateHashes(workspace))
+    {
+      result.success = false;
+      result.telemetry = false;
+      result.reason = FailureReason::telemetry_gate;
+    }
+    const bool local_injection = config.injection.enabled &&
+        config.injection.target_step == attempt.committed_step + 1 &&
+        config.injection.source_rank == rank_ && attempt.retry_index == 0;
+    if (local_injection)
+    {
+      result.injected = true;
+      result.success = false;
+      result.reason = FailureReason::backend_failure;
+    }
+    if (config.capture_oracle)
+    {
+      CaptureOracleMetadata(attempt, last_product_generation);
+    }
+    return result;
+  }
+
+  bool ExportOracle(CudaOraclePod& pod) noexcept
+  {
+    if (!initialized_ || !oracle_captured_) { return false; }
+    pod = oracle_;
+    TransportPolicy::SetPhase(CudaFailurePhase::terminal_evidence,
+                              current_generation_);
+    return ExportArray(pod.old_interior.data(), view_.old_interior,
+                       shape_.interior_count) &&
+        ExportArray(pod.current_interior.data(), view_.work_interior,
+                    shape_.interior_count) &&
+        ExportArray(pod.current_local_trace.data(), view_.current_local_trace,
+                    shape_.elements * trace_dofs_per_element) &&
+        ExportArray(pod.distributed_local_trace.data(),
+                    ranks_ == 1 ? view_.work_true_trace :
+                                  view_.distributed_local_trace,
+                    shape_.local_trace_count) &&
+        ExportArray(pod.current_true_trace.data(), view_.work_true_trace,
+                    shape_.true_trace_count) &&
+        ExportArray(pod.residual_r.data(), view_.residual_r,
+                    shape_.interior_count) &&
+        ExportArray(pod.residual_g.data(), view_.residual_g,
+                    shape_.elements * trace_dofs_per_element) &&
+        ExportArray(pod.a.data(), view_.a,
+                    shape_.elements * interior_dofs_per_element *
+                        interior_dofs_per_element) &&
+        ExportArray(pod.b.data(), view_.b,
+                    shape_.elements * interior_dofs_per_element *
+                        trace_dofs_per_element) &&
+        ExportArray(pod.c.data(), view_.c,
+                    shape_.elements * trace_dofs_per_element *
+                        interior_dofs_per_element) &&
+        ExportArray(pod.d.data(), view_.d,
+                    shape_.elements * trace_dofs_per_element *
+                        trace_dofs_per_element) &&
+        ExportArray(pod.f.data(), view_.f, shape_.interior_count) &&
+        ExportArray(pod.g.data(), view_.g,
+                    shape_.elements * trace_dofs_per_element) &&
+        ExportArray(pod.schur.data(), view_.schur,
+                    shape_.elements * trace_dofs_per_element *
+                        trace_dofs_per_element) &&
+        ExportArray(pod.condensed_rhs.data(), view_.condensed_rhs,
+                    shape_.elements * trace_dofs_per_element) &&
+        ExportArray(pod.local_trace_increment.data(),
+                    view_.trace_increment_local,
+                    shape_.elements * trace_dofs_per_element) &&
+        ExportArray(pod.recovered_increment.data(), view_.recovered_interior,
+                    shape_.interior_count) &&
+        ExportTrueSystem(pod);
+  }
+
+private:
+  bool ConfigureDeviceAndRanks(const CudaConfig& config,
+                               CudaRunEvidence& evidence) noexcept
+  {
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks_);
+    if (ranks_ != config.expected_rank_count ||
+        cudaSetDevice(config.requested_device) != cudaSuccess ||
+        cudaGetDevice(&device_) != cudaSuccess || device_ != 0 ||
+        !mfem::Device::IsConfigured() ||
+        !mfem::Device::Allows(mfem::Backend::CUDA_MASK) ||
+        mfem::Device::Allows(mfem::Backend::DEBUG_DEVICE) ||
+        !AllocatorPolicy::DevicePoolPolicyValid())
+    {
+      return false;
+    }
+    cudaUUID_t uuid{};
+    if (cudaDeviceGetUuid(&uuid, device_) != cudaSuccess) { return false; }
+    std::memcpy(gpu_uuid_.data(), uuid.bytes, gpu_uuid_.size());
+    std::array<unsigned char, 32> gathered{};
+    if (ranks_ == 2)
+    {
+      if (MPI_Allgather(gpu_uuid_.data(), 16, MPI_UNSIGNED_CHAR,
+                        gathered.data(), 16, MPI_UNSIGNED_CHAR,
+                        MPI_COMM_WORLD) != MPI_SUCCESS)
+        return false;
+      same_physical_gpu_ =
+          std::equal(gathered.begin(), gathered.begin() + 16,
+                     gathered.begin() + 16);
+      host_staged_rank2_ = config.require_host_staged_rank2;
+    }
+    else
+    {
+      same_physical_gpu_ = true;
+      host_staged_rank2_ = false;
+    }
+    evidence.same_physical_gpu = same_physical_gpu_;
+    return same_physical_gpu_;
+  }
+
+  bool BuildTopology(const CudaConfig&) noexcept
+  {
+    try
+    {
+      mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+          elements_per_direction, elements_per_direction,
+          mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+      // MFEM owns this setup-only container and the mapping allocation.
+      std::vector<mfem::Vector> translations(2, mfem::Vector(dimension));
+      translations[0][0] = 1.0;
+      translations[1][1] = 1.0;
+      serial_mesh_ = mfem::Mesh::MakePeriodic(
+          original, original.CreatePeriodicVertexMapping(translations));
+      std::array<int, elements_per_direction * elements_per_direction>
+          partition{};
+      for (int element = 0; element < static_cast<int>(partition.size());
+           ++element)
+        partition[static_cast<std::size_t>(element)] =
+            element * ranks_ / static_cast<int>(partition.size());
+      mesh_.emplace(MPI_COMM_WORLD, serial_mesh_, partition.data());
+      interior_collection_.emplace(
+          polynomial_order, dimension, mfem::BasisType::GaussLegendre,
+          mfem::FiniteElement::VALUE);
+      trace_collection_.emplace(
+          polynomial_order, dimension, mfem::FiniteElement::VALUE,
+          mfem::BasisType::GaussLegendre);
+      interior_space_.emplace(&*mesh_, &*interior_collection_,
+                              conserved_components, mfem::Ordering::byNODES);
+      trace_space_.emplace(&*mesh_, &*trace_collection_, conserved_components,
+                           mfem::Ordering::byNODES);
+      interior_space_->ExchangeFaceNbrData();
+      trace_space_->ExchangeFaceNbrData();
+      if (!dg::hdg::trace::BuildDGInterfaceTraceExchangePlan(
+              *trace_space_, exchange_plan_))
+        return false;
+    }
+    catch (...)
+    {
+      return false;
+    }
+    shape_.elements = mesh_->GetNE();
+    shape_.interior_count = shape_.elements * interior_dofs_per_element;
+    shape_.local_trace_count = trace_space_->GetVSize();
+    shape_.true_trace_count = trace_space_->GetTrueVSize();
+    shape_.global_true_trace_count = static_cast<int>(
+        exchange_plan_.map.dofs.global_true_dof_count);
+    const mfem::FiniteElement* fe = interior_space_->GetFE(0);
+    mfem::Array<int> first_faces, first_orientations;
+    mesh_->GetElementEdges(0, first_faces, first_orientations);
+    const mfem::FiniteElement* face_fe =
+        trace_space_->GetFaceElement(first_faces[0]);
+    if (shape_.elements <= 0 || shape_.elements > maximum_rank_elements ||
+        shape_.local_trace_count <= 0 ||
+        shape_.local_trace_count > maximum_local_trace_dofs ||
+        shape_.true_trace_count <= 0 ||
+        shape_.true_trace_count > maximum_true_trace_dofs || fe == nullptr ||
+        face_fe == nullptr || fe->GetDof() != scalar_dofs_per_element ||
+        face_fe->GetDof() != scalar_dofs_per_face ||
+        interior_space_->GetOrdering() != mfem::Ordering::byNODES ||
+        trace_space_->GetOrdering() != mfem::Ordering::byNODES)
+      return false;
+    shape_.volume_points = mfem::IntRules.Get(
+        fe->GetGeomType(), assembly_quadrature_order).GetNPoints();
+    shape_.face_points = mfem::IntRules.Get(
+        face_fe->GetGeomType(), assembly_quadrature_order).GetNPoints();
+    if (shape_.volume_points > maximum_volume_points ||
+        shape_.face_points > maximum_face_points)
+      return false;
+    return BuildHostGeometryAndMaps() && BuildLocalTraceGraph();
+  }
+
+  bool BuildHostGeometryAndMaps() noexcept;
+  bool BuildLocalTraceGraph() noexcept;
+  bool BuildPersistentTrueSystem() noexcept;
+  bool BuildSparseStagingPlan() noexcept;
+
+  bool AllocateArenas() noexcept
+  {
+    void* doubles = nullptr;
+    void* integers = nullptr;
+    if (!AllocatorPolicy::Allocate(
+            persistent_double_capacity * sizeof(double), alignof(double),
+            CudaAllocationSite::persistent_double_arena, doubles) ||
+        !AllocatorPolicy::Allocate(
+            persistent_integer_capacity * sizeof(int), alignof(std::uint64_t),
+            CudaAllocationSite::persistent_integer_arena, integers))
+      return false;
+    double_arena_ = static_cast<double*>(doubles);
+    integer_arena_ = static_cast<int*>(integers);
+    return double_arena_ != nullptr && integer_arena_ != nullptr;
+  }
+
+  bool BindArenaViews() noexcept;
+  bool UploadTopologyAndState() noexcept;
+  bool BindStateSlots() noexcept;
+  bool VerifyResidencyAndTicket(CudaRunEvidence& evidence) noexcept;
+  bool Ticket(CudaFailurePhase phase) noexcept;
+  bool StatusPassed() noexcept;
+  bool DistributeCurrentTrace(const double* true_values) noexcept;
+  bool DistributeTraceIncrement() noexcept;
+  bool AssembleTrueVector(const double* element_values,
+                          double* true_values) noexcept;
+  bool AssembleTrueSystem() noexcept;
+  bool SolveTrueSystem(double& true_relative_residual) noexcept;
+  bool AssembleAndNorm(state_slot& workspace, double& norm) noexcept;
+  bool CopyBase(state_slot& workspace) noexcept;
+  void RestoreBase(state_slot& workspace) noexcept;
+  void SwapTrialIntoWorkspace(state_slot& workspace) noexcept;
+  bool UpdateStateHashes(state_slot& workspace) noexcept;
+  bool HashState(const double* values, int count, StateHash& hash) noexcept;
+  std::size_t WorkspaceBytes() const noexcept;
+  void CaptureOracleMetadata(const AttemptIdentity& attempt,
+                             std::uint64_t generation) noexcept;
+  bool ExportTrueSystem(CudaOraclePod& pod) noexcept;
+
+  bool ExportArray(double* destination, const double* source,
+                   const int count) noexcept
+  {
+    return count >= 0 && TransportPolicy::DeviceToHost(
+        destination, source, static_cast<std::size_t>(count) * sizeof(double),
+        CudaTransferCategory::oracle_export, CudaTransferSite::oracle_export) &&
+        TransportPolicy::Synchronize(CudaTransferSite::oracle_export);
+  }
+
+  bool initialized_ = false;
+  bool same_physical_gpu_ = false;
+  bool host_staged_rank2_ = false;
+  bool signed_owner_ghost_valid_ = false;
+  bool device_resident_ = false;
+  bool hypre_policy_valid_ = false;
+  bool no_fallback_ = true;
+  bool oracle_captured_ = false;
+  int rank_ = -1;
+  int ranks_ = 0;
+  int device_ = -1;
+  std::array<unsigned char, 16> gpu_uuid_{};
+  RuntimeTupleDescriptor tuple_{};
+  PersistentResourceDescriptor resources_{};
+  CudaMeshShape shape_{};
+  CudaDeviceView view_{};
+  CudaTrueMatrixStructure true_structure_{};
+  CudaTrueMatrixDeviceView true_device_{};
+  double* double_arena_ = nullptr;
+  int* integer_arena_ = nullptr;
+  mfem::Memory<double> double_memory_{};
+  mfem::Memory<int> integer_memory_{};
+  mfem::Vector double_arena_vector_{};
+  mfem::Array<int> integer_arena_array_{};
+  mfem::Mesh serial_mesh_{};
+  std::optional<mfem::ParMesh> mesh_{};
+  std::optional<mfem::L2_FECollection> interior_collection_{};
+  std::optional<mfem::DG_Interface_FECollection> trace_collection_{};
+  std::optional<mfem::ParFiniteElementSpace> interior_space_{};
+  std::optional<mfem::ParFiniteElementSpace> trace_space_{};
+  dg::hdg::trace::DGInterfaceTraceExchangePlan exchange_plan_{};
+  std::optional<mfem::SparseMatrix> local_trace_matrix_{};
+  std::unique_ptr<mfem::HypreParMatrix> true_matrix_{};
+  std::array<std::optional<mfem::HypreParVector>, 2> trace_slots_{};
+  std::optional<mfem::HypreParVector> hypre_rhs_{};
+  std::optional<mfem::HypreParVector> hypre_solution_{};
+  std::optional<mfem::HypreParVector> hypre_action_{};
+  std::optional<mfem::HypreILU> ilu_{};
+  std::optional<mfem::HypreGMRES> gmres_{};
+  mfem::Vector owned_stage_{};
+  mfem::Vector local_stage_{};
+  state_slot committed_slot_{};
+  state_slot candidate_slot_{};
+  state_slot workspace_slot_{};
+  AttemptIdentity current_attempt_{};
+  std::uint64_t current_generation_ = 0;
+  std::uint64_t linear_generation_ = 0;
+  std::uint64_t baseline_allocations_ = 0;
+  std::array<CudaDeviceTicket, maximum_device_tickets> tickets_{};
+  std::size_t ticket_count_ = 0;
+  CudaOraclePod oracle_{};
+
+  std::array<int, maximum_rank_elements * trace_dofs_per_element>
+      signed_element_trace_{};
+  std::array<std::int64_t, maximum_local_trace_dofs> local_global_true_{};
+  std::array<int, maximum_local_trace_dofs> local_owner_{};
+  std::array<int, maximum_local_trace_dofs> local_true_index_{};
+  std::array<std::int64_t, maximum_true_trace_dofs> owned_global_true_{};
+  std::array<std::int64_t, maximum_rank_elements * dimension>
+      element_coordinate_keys_{};
+  std::array<double, maximum_rank_elements * maximum_volume_points *
+                         scalar_dofs_per_element>
+      host_volume_shape_{};
+  std::array<double, maximum_rank_elements * maximum_volume_points *
+                         scalar_dofs_per_element * dimension>
+      host_volume_derivative_{};
+  std::array<double, maximum_rank_elements * maximum_volume_points>
+      host_volume_weight_{};
+  std::array<double, maximum_rank_elements * maximum_volume_points * dimension>
+      host_volume_position_{};
+  std::array<double, maximum_rank_elements * faces_per_element *
+                         maximum_face_points * scalar_dofs_per_element>
+      host_face_interior_shape_{};
+  std::array<double, maximum_rank_elements * faces_per_element *
+                         maximum_face_points * scalar_dofs_per_face>
+      host_face_trace_shape_{};
+  std::array<double, maximum_rank_elements * faces_per_element *
+                         maximum_face_points>
+      host_face_weight_{};
+  std::array<double, maximum_rank_elements * faces_per_element *
+                         maximum_face_points * dimension>
+      host_face_normal_{};
+  std::array<double, maximum_rank_elements * interior_dofs_per_element>
+      host_exact_interior_{};
+  std::array<double, maximum_rank_elements * interior_dofs_per_element>
+      host_perturbed_interior_{};
+  std::array<double, maximum_true_trace_dofs> host_exact_true_trace_{};
+  std::array<double, maximum_true_trace_dofs> host_perturbed_true_trace_{};
+  std::array<int, maximum_local_matrix_entries> host_matrix_owned_source_{};
+  std::array<int, maximum_local_matrix_entries> host_matrix_owned_section_{};
+  std::array<int, maximum_local_matrix_entries> host_matrix_owned_target_{};
+  std::array<int, maximum_exchange_entries> host_matrix_send_source_{};
+  std::array<int, maximum_exchange_entries> host_matrix_receive_section_{};
+  std::array<int, maximum_exchange_entries> host_matrix_receive_target_{};
+  std::array<int, maximum_rank_elements * trace_dofs_per_element>
+      host_vector_owned_source_{};
+  std::array<int, maximum_rank_elements * trace_dofs_per_element>
+      host_vector_owned_target_{};
+  std::array<int, maximum_rank_elements * trace_dofs_per_element>
+      host_vector_send_source_{};
+  std::array<int, maximum_rank_elements * trace_dofs_per_element>
+      host_vector_receive_target_{};
+  std::array<std::int64_t, maximum_exchange_entries * 2> matrix_send_keys_{};
+  std::array<std::int64_t, maximum_exchange_entries * 2> matrix_receive_keys_{};
+  std::array<std::int64_t,
+             maximum_rank_elements * trace_dofs_per_element>
+      vector_send_keys_{};
+  std::array<std::int64_t,
+             maximum_rank_elements * trace_dofs_per_element>
+      vector_receive_keys_{};
+  std::array<double, maximum_exchange_entries> matrix_send_host_{};
+  std::array<double, maximum_exchange_entries> matrix_receive_host_{};
+  std::array<double, maximum_rank_elements * trace_dofs_per_element>
+      vector_send_host_{};
+  std::array<double, maximum_rank_elements * trace_dofs_per_element>
+      vector_receive_host_{};
+};
+
+} // namespace detail
+
+#include "numerics/hdg/runtime/cuda/persistent_smooth_euler_methods.cuh"
