@@ -12,6 +12,11 @@ target_link_libraries(dg_igr_hdg_runtime_cuda_w8a_leaf
     mfem
     MPI::MPI_CXX)
 
+target_compile_options(dg_igr_hdg_runtime_cuda_w8a_leaf
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+
 set_target_properties(dg_igr_hdg_runtime_cuda_w8a_leaf
   PROPERTIES
     CXX_STANDARD 17
