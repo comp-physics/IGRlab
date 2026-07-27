@@ -12,21 +12,6 @@ file(GLOB_RECURSE _dg_igr_hdg_runtime_all_cpp CONFIGURE_DEPENDS
 file(GLOB_RECURSE _dg_igr_hdg_runtime_all_cuda CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/*.cu")
 
-if(_dg_igr_hdg_runtime_cuda_sources)
-  set(_dg_igr_hdg_runtime_cuda_expected_source
-      "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu")
-  list(LENGTH _dg_igr_hdg_runtime_cuda_sources
-       _dg_igr_hdg_runtime_cuda_source_count)
-  list(FIND _dg_igr_hdg_runtime_cuda_sources
-       "${_dg_igr_hdg_runtime_cuda_expected_source}"
-       _dg_igr_hdg_runtime_cuda_expected_index)
-  if(NOT _dg_igr_hdg_runtime_cuda_source_count EQUAL 1 OR
-     _dg_igr_hdg_runtime_cuda_expected_index EQUAL -1)
-    message(FATAL_ERROR
-            "The frozen W8A CUDA component requires exactly cuda/persistent_smooth_euler.cu.")
-  endif()
-endif()
-
 set(_dg_igr_hdg_runtime_unclassified_cpp
     ${_dg_igr_hdg_runtime_all_cpp})
 list(REMOVE_ITEM _dg_igr_hdg_runtime_unclassified_cpp
@@ -45,6 +30,21 @@ if(_dg_igr_hdg_runtime_unclassified_cpp OR
 endif()
 
 if(DG_IGR_ENABLE_HDG_RUNTIME)
+  if(MFEM_USE_CUDA)
+    set(_dg_igr_hdg_runtime_cuda_expected_source
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu")
+    list(LENGTH _dg_igr_hdg_runtime_cuda_sources
+         _dg_igr_hdg_runtime_cuda_source_count)
+    list(FIND _dg_igr_hdg_runtime_cuda_sources
+         "${_dg_igr_hdg_runtime_cuda_expected_source}"
+         _dg_igr_hdg_runtime_cuda_expected_index)
+    if(NOT _dg_igr_hdg_runtime_cuda_source_count EQUAL 1 OR
+       _dg_igr_hdg_runtime_cuda_expected_index EQUAL -1)
+      message(FATAL_ERROR
+              "The frozen W8A CUDA component requires exactly cuda/persistent_smooth_euler.cu.")
+    endif()
+  endif()
+
   if(TARGET dg_igr_hdg_runtime_components OR
      TARGET dg_igr_hdg_runtime OR TARGET dg_igr_hdg)
     message(FATAL_ERROR
