@@ -12,6 +12,8 @@ RUN_SMOKE=0
 CALIPER=0
 HDG_EULER_EXPERIMENT="OFF"
 HDG_EULER_DEVICE_EXPERIMENT="OFF"
+HDG_RUNTIME="OFF"
+HDG_AUXILIARY_EXPERIMENT="OFF"
 SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
 CUDA_ARCH_WAS_SET=0
 PRINT_PLAN=0
@@ -30,6 +32,9 @@ Options:
                     Enable the CPU-only experimental HDG Euler path.
   --hdg-euler-device-experiment
                     Enable the experimental HDG Euler CPU-fallback/device path.
+  --hdg-runtime     Enable the persistent HDG runtime component seam.
+  --hdg-auxiliary-experiment
+                    Enable the CPU-only experimental HDG auxiliary seam.
   -j, --jobs N      Parallel build jobs (default: NPROC or 4).
   --mfem-jobs N     Parallel MFEM build jobs (default: --jobs value).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
@@ -58,6 +63,8 @@ while (($#)); do
     --caliper) CALIPER=1 ;;
     --hdg-euler-experiment) HDG_EULER_EXPERIMENT="ON" ;;
     --hdg-euler-device-experiment) HDG_EULER_DEVICE_EXPERIMENT="ON" ;;
+    --hdg-runtime) HDG_RUNTIME="ON" ;;
+    --hdg-auxiliary-experiment) HDG_AUXILIARY_EXPERIMENT="ON" ;;
     --cuda-arch)
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
       SPACK_CUDA_ARCH="$2"
@@ -92,6 +99,10 @@ fi
 
 if [[ "${MODE}" == "gpu" && "${HDG_EULER_EXPERIMENT}" == "ON" ]]; then
   echo "ERROR: --hdg-euler-experiment is only valid with --cpu-only." >&2
+  exit 2
+fi
+if [[ "${MODE}" != "cpu" && "${HDG_AUXILIARY_EXPERIMENT}" == "ON" ]]; then
+  echo "ERROR: --hdg-auxiliary-experiment is only valid with --cpu-only." >&2
   exit 2
 fi
 [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] || {
@@ -168,6 +179,7 @@ fi
 
 echo "[build-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH} mfem_cuda_archs=${MFEM_CUDA_ARCHS} app_cuda_archs=${APP_CUDA_ARCHS} app_jobs=${JOBS} mfem_jobs=${MFEM_JOBS}"
 echo "[build-plan] env=${SPACK_ENV} app_build=${APP_BUILD} app_install=${APP_INSTALL}"
+echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT}"
 
 if ((PRINT_PLAN)); then
   exit 0
@@ -221,7 +233,7 @@ if ((CLEAN)); then
   rm -rf "${APP_BUILD}" "${APP_INSTALL}"
 fi
 
-echo "[build] configuring app (${MODE}, hdg_euler_experiment=${HDG_EULER_EXPERIMENT}, hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT})"
+echo "[build] configuring app (${MODE}, hdg_runtime=${HDG_RUNTIME}, hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT}, hdg_euler_experiment=${HDG_EULER_EXPERIMENT}, hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT})"
 app_cmake_args=(
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   -DCMAKE_CXX_COMPILER="${MPI_PREFIX}/bin/mpicxx"
@@ -230,6 +242,8 @@ app_cmake_args=(
   -DZLIB_ROOT="${SPACK_VIEW}"
   -DDG_IGR_ENABLE_HDG_EULER_EXPERIMENT="${HDG_EULER_EXPERIMENT}"
   -DDG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT="${HDG_EULER_DEVICE_EXPERIMENT}"
+  -DDG_IGR_ENABLE_HDG_RUNTIME="${HDG_RUNTIME}"
+  -DDG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT="${HDG_AUXILIARY_EXPERIMENT}"
 )
 if ((CALIPER)); then
   app_cmake_args+=(
@@ -297,4 +311,4 @@ if ((RUN_SMOKE)); then
     "${smoke_exe}" "${smoke_args[@]}"
 fi
 
-echo "[build] complete: profile=${PROFILE} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} build=${APP_BUILD} install=${APP_INSTALL}"
+echo "[build] complete: profile=${PROFILE} hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} build=${APP_BUILD} install=${APP_INSTALL}"

@@ -13,6 +13,12 @@ option(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT
 option(DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT
        "Build the default-off smooth-Euler HDG CPU-fallback/device experiment."
        OFF)
+option(DG_IGR_ENABLE_HDG_RUNTIME
+       "Build the default-off persistent HDG runtime component seam."
+       OFF)
+option(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT
+       "Build the default-off CPU-only HDG auxiliary experiment seam."
+       OFF)
 option(DG_IGR_ENABLE_OBSERVABILITY
        "Compile the core observability contract (runtime remains default-off)."
        OFF)
@@ -59,6 +65,19 @@ if(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT AND
    (MFEM_USE_CUDA OR MFEM_USE_HIP))
     message(FATAL_ERROR
             "DG_IGR_ENABLE_HDG_EULER_EXPERIMENT=ON requires a non-CUDA, non-HIP MFEM.")
+endif()
+if(DG_IGR_ENABLE_HDG_RUNTIME AND NOT MFEM_USE_MPI)
+    message(FATAL_ERROR
+            "DG_IGR_ENABLE_HDG_RUNTIME=ON requires an MPI/HYPRE-enabled MFEM profile.")
+endif()
+if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_HIP)
+    message(FATAL_ERROR
+            "DG_IGR_ENABLE_HDG_RUNTIME=ON has no HIP backend; use the CPU or CUDA profile.")
+endif()
+if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT AND
+   (MFEM_USE_CUDA OR MFEM_USE_HIP))
+    message(FATAL_ERROR
+            "DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT=ON requires a CPU-only MFEM profile.")
 endif()
 find_package(ZLIB REQUIRED)
 
