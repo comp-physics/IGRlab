@@ -47,6 +47,175 @@ static inline void ReportCudaBackendFailure(
   }
 }
 
+// Private teardown diagnostics.  MFEM's DEVICE_UMPIRE Wrap(..., own=false)
+// still owns a MemoryManager registration, while the raw device allocation
+// remains policy-owned.  These bits therefore describe failures to release
+// MFEM bookkeeping before the policy is allowed to deallocate either arena.
+enum CudaArenaTeardownFailureBit : std::uint64_t
+{
+  arena_vector_alias_release_failure = std::uint64_t{1} << 0U,
+  arena_double_registration_release_failure = std::uint64_t{1} << 1U,
+  arena_integer_registration_release_failure = std::uint64_t{1} << 2U,
+  arena_integer_raw_release_failure = std::uint64_t{1} << 3U,
+  arena_double_raw_release_failure = std::uint64_t{1} << 4U,
+  arena_raw_release_quarantined = std::uint64_t{1} << 5U,
+  arena_idempotent_state_failure = std::uint64_t{1} << 6U
+};
+
+static inline void ReportCudaArenaTeardownFailure(
+    const int rank, const std::uint64_t failure_mask) noexcept
+{
+  if (rank == 0)
+  {
+    std::fprintf(stderr, "CUDA_TEARDOWN_FAIL rank0_mask=0x%llx\n",
+                 static_cast<unsigned long long>(failure_mask));
+  }
+}
+
+enum class CudaArenaOwnership : unsigned char
+{
+  none,
+  owned,
+  released,
+  mfem_retained,
+  retryable,
+  quarantined
+};
+
+enum class CudaRawReleaseResult : unsigned char
+{
+  released,
+  retryable,
+  quarantined
+};
+
+struct CudaArenaReleaseState
+{
+  CudaArenaOwnership integer = CudaArenaOwnership::none;
+  CudaArenaOwnership doubles = CudaArenaOwnership::none;
+  std::uint64_t failure_history = 0;
+  unsigned pass_count = 0;
+  bool wrappers_attempted = false;
+  bool views_cleared = false;
+  bool complete = false;
+};
+
+struct CudaArenaReleasePass
+{
+  CudaArenaOwnership integer = CudaArenaOwnership::none;
+  CudaArenaOwnership doubles = CudaArenaOwnership::none;
+  std::uint64_t failure_mask = 0;
+  unsigned pass = 0;
+  bool complete = false;
+  bool idempotent = false;
+};
+
+template <typename Operations>
+CudaArenaReleasePass ReleaseCudaArenas(
+    CudaArenaReleaseState& state, Operations& operations) noexcept
+{
+  CudaArenaReleasePass result{};
+  result.pass = ++state.pass_count;
+  auto finish = [&]() noexcept
+  {
+    result.integer = state.integer;
+    result.doubles = state.doubles;
+    result.complete = state.complete;
+    state.failure_history |= result.failure_mask;
+    return result;
+  };
+  if (state.complete)
+  {
+    result.idempotent = true;
+    return finish();
+  }
+  if (state.integer == CudaArenaOwnership::mfem_retained ||
+      state.doubles == CudaArenaOwnership::mfem_retained ||
+      state.integer == CudaArenaOwnership::quarantined ||
+      state.doubles == CudaArenaOwnership::quarantined)
+  {
+    result.idempotent = true;
+    return finish();
+  }
+
+  if (!state.wrappers_attempted)
+  {
+    state.wrappers_attempted = true;
+    state.integer = operations.HasIntegerArena()
+        ? CudaArenaOwnership::owned : CudaArenaOwnership::none;
+    state.doubles = operations.HasDoubleArena()
+        ? CudaArenaOwnership::owned : CudaArenaOwnership::none;
+    if (!operations.ReleaseVectorAlias())
+    {
+      operations.MakeWrappersInert();
+      if (state.integer == CudaArenaOwnership::owned)
+        state.integer = CudaArenaOwnership::mfem_retained;
+      if (state.doubles == CudaArenaOwnership::owned)
+        state.doubles = CudaArenaOwnership::mfem_retained;
+      result.failure_mask = arena_vector_alias_release_failure;
+    }
+    else if (!operations.ReleaseDoubleRegistration())
+    {
+      operations.MakeWrappersInert();
+      if (state.integer == CudaArenaOwnership::owned)
+        state.integer = CudaArenaOwnership::mfem_retained;
+      if (state.doubles == CudaArenaOwnership::owned)
+        state.doubles = CudaArenaOwnership::mfem_retained;
+      result.failure_mask = arena_double_registration_release_failure;
+    }
+    else if (!operations.ReleaseIntegerRegistration())
+    {
+      operations.MakeWrappersInert();
+      if (state.integer == CudaArenaOwnership::owned)
+        state.integer = CudaArenaOwnership::mfem_retained;
+      if (state.doubles == CudaArenaOwnership::owned)
+        state.doubles = CudaArenaOwnership::quarantined;
+      result.failure_mask = arena_integer_registration_release_failure;
+    }
+    operations.ClearViews();
+    state.views_cleared = true;
+    if (result.failure_mask != 0) { return finish(); }
+  }
+
+  auto release_raw = [&](CudaArenaOwnership& ownership,
+                         const CudaRawReleaseResult release,
+                         const std::uint64_t failure_bit) noexcept
+  {
+    if (release == CudaRawReleaseResult::released)
+    {
+      ownership = CudaArenaOwnership::released;
+      return true;
+    }
+    ownership = release == CudaRawReleaseResult::retryable
+        ? CudaArenaOwnership::retryable : CudaArenaOwnership::quarantined;
+    result.failure_mask |= failure_bit;
+    if (release == CudaRawReleaseResult::quarantined)
+      result.failure_mask |= arena_raw_release_quarantined;
+    return false;
+  };
+  if (state.integer == CudaArenaOwnership::owned ||
+      state.integer == CudaArenaOwnership::retryable)
+  {
+    if (!release_raw(state.integer, operations.ReleaseIntegerArena(),
+                     arena_integer_raw_release_failure))
+      return finish();
+  }
+  if (state.doubles == CudaArenaOwnership::owned ||
+      state.doubles == CudaArenaOwnership::retryable)
+  {
+    if (!release_raw(state.doubles, operations.ReleaseDoubleArena(),
+                     arena_double_raw_release_failure))
+      return finish();
+  }
+  const bool integer_done = state.integer == CudaArenaOwnership::none ||
+      state.integer == CudaArenaOwnership::released;
+  const bool double_done = state.doubles == CudaArenaOwnership::none ||
+      state.doubles == CudaArenaOwnership::released;
+  state.complete = integer_done && double_done && state.views_cleared;
+  result.complete = state.complete;
+  return finish();
+}
+
 inline constexpr std::size_t persistent_double_capacity = 220000;
 inline constexpr std::size_t persistent_integer_capacity = 120000;
 
@@ -363,14 +532,13 @@ public:
   using state_slot = CompleteStateSlot<CudaInteriorState, CudaTrueTraceState>;
 
   CudaPersistentNumerics() noexcept = default;
-  ~CudaPersistentNumerics()
+  ~CudaPersistentNumerics() noexcept
   {
-    if (integer_arena_ != nullptr)
-      AllocatorPolicy::Deallocate(integer_arena_,
-                                  CudaAllocationSite::persistent_integer_arena);
-    if (double_arena_ != nullptr)
-      AllocatorPolicy::Deallocate(double_arena_,
-                                  CudaAllocationSite::persistent_double_arena);
+    const CudaArenaReleasePass first = ReleaseArenas();
+    const CudaArenaReleasePass second = ReleaseArenas();
+    if (first.complete && (!second.complete || !second.idempotent))
+      ReportCudaArenaTeardownFailure(
+          rank_, arena_idempotent_state_failure);
   }
 
   CudaPersistentNumerics(const CudaPersistentNumerics&) = delete;
@@ -1247,13 +1415,106 @@ private:
             persistent_integer_capacity * sizeof(int), alignof(std::uint64_t),
             CudaAllocationSite::persistent_integer_arena, integers))
     {
-      AllocatorPolicy::Deallocate(
-          doubles, CudaAllocationSite::persistent_double_arena);
+      // Retain the local token until the common release path observes an exact
+      // successful deallocation.  A failed cleanup is quarantined, never lost.
+      double_arena_ = static_cast<double*>(doubles);
+      (void)ReleaseArenas();
       return false;
     }
     double_arena_ = static_cast<double*>(doubles);
     integer_arena_ = static_cast<int*>(integers);
     return double_arena_ != nullptr && integer_arena_ != nullptr;
+  }
+
+  struct ArenaReleaseOperations
+  {
+    CudaPersistentNumerics& owner;
+
+    bool HasIntegerArena() const noexcept
+    { return owner.integer_arena_ != nullptr; }
+    bool HasDoubleArena() const noexcept
+    { return owner.double_arena_ != nullptr; }
+
+    bool ReleaseVectorAlias() noexcept
+    {
+      try
+      {
+        owner.double_arena_vector_.Destroy();
+        return owner.double_arena_vector_.Size() == 0 &&
+            owner.double_arena_vector_.GetMemory().Empty();
+      }
+      catch (...) { return false; }
+    }
+    bool ReleaseDoubleRegistration() noexcept
+    {
+      try
+      {
+        owner.double_memory_.Delete();
+        return owner.double_memory_.Empty();
+      }
+      catch (...) { return false; }
+    }
+    bool ReleaseIntegerRegistration() noexcept
+    {
+      try
+      {
+        owner.integer_memory_.Delete();
+        return owner.integer_memory_.Empty();
+      }
+      catch (...) { return false; }
+    }
+    void MakeWrappersInert() noexcept
+    {
+      // Reset never unregisters.  It only prevents member destruction from
+      // retrying Delete after a caught failure; MFEM retains the registration.
+      owner.double_arena_vector_.GetMemory().Reset();
+      owner.double_memory_.Reset();
+      owner.integer_memory_.Reset();
+    }
+    void ClearViews() noexcept
+    {
+      owner.view_ = {};
+      owner.committed_slot_ = {};
+      owner.candidate_slot_ = {};
+      owner.workspace_slot_ = {};
+    }
+
+    CudaRawReleaseResult ReleaseIntegerArena() noexcept
+    { return ReleaseRaw(owner.integer_arena_,
+                        CudaAllocationSite::persistent_integer_arena); }
+    CudaRawReleaseResult ReleaseDoubleArena() noexcept
+    { return ReleaseRaw(owner.double_arena_,
+                        CudaAllocationSite::persistent_double_arena); }
+
+    template <typename T>
+    CudaRawReleaseResult ReleaseRaw(
+        T*& pointer, const CudaAllocationSite site) noexcept
+    {
+      if (pointer == nullptr) { return CudaRawReleaseResult::released; }
+      const std::uint64_t before = AllocatorPolicy::DeallocationEvents();
+      const bool released = AllocatorPolicy::Deallocate(pointer, site);
+      const std::uint64_t after = AllocatorPolicy::DeallocationEvents();
+      if (released &&
+          before != std::numeric_limits<std::uint64_t>::max() &&
+          after == before + 1)
+      {
+        pointer = nullptr;
+        return CudaRawReleaseResult::released;
+      }
+      // The policy attempted the call but did not attest its completion.  The
+      // token remains owned and is quarantined from automatic retry.
+      return CudaRawReleaseResult::quarantined;
+    }
+  };
+
+  CudaArenaReleasePass ReleaseArenas() noexcept
+  {
+    ArenaReleaseOperations operations{*this};
+    const CudaArenaReleasePass result =
+        ReleaseCudaArenas(arena_release_state_, operations);
+    if (result.failure_mask != 0)
+      ReportCudaArenaTeardownFailure(rank_, result.failure_mask);
+    return result;
   }
 
   bool BindArenaViews() noexcept;
@@ -1314,6 +1575,7 @@ private:
   CudaTrueMatrixDeviceView true_device_{};
   double* double_arena_ = nullptr;
   int* integer_arena_ = nullptr;
+  CudaArenaReleaseState arena_release_state_{};
   mfem::Memory<double> double_memory_{};
   mfem::Memory<int> integer_memory_{};
   mfem::Vector double_arena_vector_{};
