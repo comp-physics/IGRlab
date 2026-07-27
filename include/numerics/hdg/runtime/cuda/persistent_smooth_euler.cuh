@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -450,6 +451,9 @@ public:
       evidence.setup_origin = descriptor_consensus
           ? FailureReason::backend_failure
           : FailureReason::collective_protocol;
+      detail::ReportCudaSetupFailure(
+          evidence.rank, descriptor_consensus
+              ? "config-validity" : "descriptor-consensus");
       return false;
     }
     AllocatorPolicy::ResetLedger();
@@ -457,6 +461,7 @@ public:
     {
       evidence.status = CudaRunStatus::setup_failure;
       evidence.setup_origin = FailureReason::backend_failure;
+      detail::ReportCudaSetupFailure(evidence.rank, "numerics-initialize");
       return false;
     }
     StateCoordinates initial{};
@@ -467,6 +472,7 @@ public:
     {
       evidence.status = CudaRunStatus::setup_failure;
       evidence.setup_origin = contract_->last_failure();
+      detail::ReportCudaSetupFailure(evidence.rank, "contract-ready");
       return false;
     }
     initialized_ = true;
