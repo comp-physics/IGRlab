@@ -21,7 +21,9 @@
  * semantic atomicity/deep-copy behavior cannot be proved by the C++ type
  * system. This contract enforces its void-noexcept type, orders every
  * detectable precondition before it, and performs no recoverable check after
- * it.
+ * it; and (4) the optional two-phase API exists only for policies that exactly
+ * attest a reversible complete-slot exchange and provide one unambiguous
+ * void-noexcept RevertPublish inverse.
  */
 
 #include <array>
@@ -862,6 +864,49 @@ inline bool GateReductionContainsLocal(const GateReport& local,
       !(!local.success && reduced.success);
 }
 
+/**
+ * Exact opt-in for the reversible slot-exchange protocol.  Keeping this a
+ * detection trait (rather than class-level static assertions) is deliberate:
+ * legacy policies and near-miss policies retain the complete one-phase API.
+ */
+template <typename Policy, typename Slot, typename = void>
+struct SupportsTwoPhaseSlotExchange : std::false_type
+{};
+
+template <typename Policy, typename Slot>
+struct SupportsTwoPhaseSlotExchange<
+    Policy,
+    Slot,
+    std::void_t<
+        decltype(Policy::publish_is_complete_slot_exchange),
+        decltype(Policy::candidate_retains_exact_old_state_after_publish),
+        decltype(Policy::revert_publish_is_exact_byte_inverse),
+        decltype(Policy::publish_and_revert_preserve_disjoint_backing),
+        decltype(&Policy::RevertPublish)>>
+    : std::integral_constant<
+          bool,
+          std::is_same<
+              decltype(Policy::publish_is_complete_slot_exchange),
+              const bool>::value &&
+              Policy::publish_is_complete_slot_exchange &&
+              std::is_same<
+                  decltype(
+                      Policy::candidate_retains_exact_old_state_after_publish),
+                  const bool>::value &&
+              Policy::candidate_retains_exact_old_state_after_publish &&
+              std::is_same<
+                  decltype(Policy::revert_publish_is_exact_byte_inverse),
+                  const bool>::value &&
+              Policy::revert_publish_is_exact_byte_inverse &&
+              std::is_same<
+                  decltype(
+                      Policy::publish_and_revert_preserve_disjoint_backing),
+                  const bool>::value &&
+              Policy::publish_and_revert_preserve_disjoint_backing &&
+              std::is_same<decltype(&Policy::RevertPublish),
+                           void (*)(Slot&, Slot&) noexcept>::value>
+{};
+
 } // namespace detail
 
 /**
@@ -869,12 +914,14 @@ inline bool GateReductionContainsLocal(const GateReport& local,
  *
  * StoragePolicy supplies static, noexcept preparation, private-copy,
  * disjointness, hash, publication-preflight, and publication operations.
- * Publish is the sole mutation of committed storage. Its semantic atomicity
- * and disjointness preservation are explicit trusted adapter attestations;
- * the contract mechanically enforces only its void-noexcept type and that all
- * detectable fallible checks precede it. CollectivePolicy supplies static
- * admission, finish, and restore reductions. Neither policy uses dynamic
- * dispatch.
+ * Publish is the sole forward mutation of committed storage; an exactly
+ * detected two-phase policy may additionally supply its nofail RevertPublish
+ * inverse. Their exchange, inverse, byte-retention, and disjointness semantics
+ * are explicit trusted adapter attestations. The contract mechanically
+ * enforces the exact function types, orders every detectable fallible check
+ * before exchange, and performs no recoverable check after it.
+ * CollectivePolicy supplies static admission, finish, and restore reductions.
+ * Neither policy uses dynamic dispatch.
  */
 template <typename Selection,
           typename InteriorState,
@@ -889,6 +936,15 @@ public:
   static constexpr double true_relative_residual_limit = 1.0e-10;
 
 private:
+  enum class AttemptPhase : unsigned char
+  {
+    idle,
+    mutable_candidate,
+    frozen,
+    prepared,
+    provisional
+  };
+
   using prepare_result = decltype(StoragePolicy::PrepareCandidate(
       std::declval<const state_slot&>(), std::declval<state_slot&>()));
   using restore_prepare_result = decltype(StoragePolicy::PrepareRestore(
@@ -1074,6 +1130,193 @@ public:
     std::optional<ProductToken<DerivedProductKind::solution>> solution{};
   };
 
+  /** Read-only authority over one exactly frozen candidate generation. */
+  class StagingToken
+  {
+  public:
+    StagingToken() = delete;
+    StagingToken(const StagingToken&) = delete;
+    StagingToken& operator=(const StagingToken&) = delete;
+    StagingToken& operator=(StagingToken&&) = delete;
+
+    StagingToken(StagingToken&& other) noexcept
+        : owner_(other.owner_),
+          incarnation_(other.incarnation_),
+          attempt_(other.attempt_),
+          candidate_serial_(other.candidate_serial_),
+          bound_phase_(other.bound_phase_),
+          entry_(other.entry_),
+          target_(other.target_),
+          interior_hash_(other.interior_hash_),
+          trace_hash_(other.trace_hash_),
+          checkpoint_(other.checkpoint_),
+          valid_(other.valid_)
+    {
+      other.valid_ = false;
+    }
+
+    ~StagingToken() noexcept = default;
+
+    const StateCoordinates& entry_coordinates() const noexcept
+    {
+      return entry_;
+    }
+    const StateCoordinates& target_coordinates() const noexcept
+    {
+      return target_;
+    }
+    const StateHash& interior_hash() const noexcept { return interior_hash_; }
+    const StateHash& trace_hash() const noexcept { return trace_hash_; }
+    const CheckpointDescriptor& checkpoint_descriptor() const noexcept
+    {
+      return checkpoint_;
+    }
+    const CheckpointDescriptor& future_checkpoint() const noexcept
+    {
+      return checkpoint_;
+    }
+
+  private:
+    StagingToken(const PersistentRunContract* owner,
+                 const std::uint64_t incarnation,
+                 const AttemptIdentity attempt,
+                 const std::uint64_t candidate_serial,
+                 const StateCoordinates entry,
+                 const StateCoordinates target,
+                 const StateHash interior_hash,
+                 const StateHash trace_hash,
+                 const CheckpointDescriptor checkpoint) noexcept
+        : owner_(owner),
+          incarnation_(incarnation),
+          attempt_(attempt),
+          candidate_serial_(candidate_serial),
+          bound_phase_(AttemptPhase::frozen),
+          entry_(entry),
+          target_(target),
+          interior_hash_(interior_hash),
+          trace_hash_(trace_hash),
+          checkpoint_(checkpoint),
+          valid_(true)
+    {}
+
+    const PersistentRunContract* owner_ = nullptr;
+    std::uint64_t incarnation_ = 0;
+    AttemptIdentity attempt_{};
+    std::uint64_t candidate_serial_ = 0;
+    AttemptPhase bound_phase_ = AttemptPhase::idle;
+    StateCoordinates entry_{};
+    StateCoordinates target_{};
+    StateHash interior_hash_{};
+    StateHash trace_hash_{};
+    CheckpointDescriptor checkpoint_{};
+    bool valid_ = false;
+
+    friend class PersistentRunContract;
+  };
+
+  /** Single-use authority to perform the nofail reversible slot exchange. */
+  class PreparedCommitToken
+  {
+  public:
+    PreparedCommitToken() = delete;
+    PreparedCommitToken(const PreparedCommitToken&) = delete;
+    PreparedCommitToken& operator=(const PreparedCommitToken&) = delete;
+    PreparedCommitToken& operator=(PreparedCommitToken&&) = delete;
+
+    PreparedCommitToken(PreparedCommitToken&& other) noexcept
+        : owner_(other.owner_),
+          incarnation_(other.incarnation_),
+          attempt_(other.attempt_),
+          candidate_serial_(other.candidate_serial_),
+          bound_phase_(other.bound_phase_),
+          checkpoint_(other.checkpoint_),
+          valid_(other.valid_)
+    {
+      other.valid_ = false;
+    }
+
+    ~PreparedCommitToken() noexcept = default;
+
+    const CheckpointDescriptor& checkpoint_descriptor() const noexcept
+    {
+      return checkpoint_;
+    }
+    const CheckpointDescriptor& future_checkpoint() const noexcept
+    {
+      return checkpoint_;
+    }
+
+  private:
+    PreparedCommitToken(const PersistentRunContract* owner,
+                        const std::uint64_t incarnation,
+                        const AttemptIdentity attempt,
+                        const std::uint64_t candidate_serial,
+                        const CheckpointDescriptor checkpoint) noexcept
+        : owner_(owner),
+          incarnation_(incarnation),
+          attempt_(attempt),
+          candidate_serial_(candidate_serial),
+          bound_phase_(AttemptPhase::prepared),
+          checkpoint_(checkpoint),
+          valid_(true)
+    {}
+
+    const PersistentRunContract* owner_ = nullptr;
+    std::uint64_t incarnation_ = 0;
+    AttemptIdentity attempt_{};
+    std::uint64_t candidate_serial_ = 0;
+    AttemptPhase bound_phase_ = AttemptPhase::idle;
+    CheckpointDescriptor checkpoint_{};
+    bool valid_ = false;
+
+    friend class PersistentRunContract;
+  };
+
+  /** Single-use authority to finalize or exactly revert one exchanged slot. */
+  class ProvisionalCommitToken
+  {
+  public:
+    ProvisionalCommitToken() = delete;
+    ProvisionalCommitToken(const ProvisionalCommitToken&) = delete;
+    ProvisionalCommitToken& operator=(const ProvisionalCommitToken&) = delete;
+    ProvisionalCommitToken& operator=(ProvisionalCommitToken&&) = delete;
+
+    ProvisionalCommitToken(ProvisionalCommitToken&& other) noexcept
+        : owner_(other.owner_),
+          incarnation_(other.incarnation_),
+          attempt_(other.attempt_),
+          candidate_serial_(other.candidate_serial_),
+          bound_phase_(other.bound_phase_),
+          valid_(other.valid_)
+    {
+      other.valid_ = false;
+    }
+
+    ~ProvisionalCommitToken() noexcept = default;
+
+  private:
+    ProvisionalCommitToken(const PersistentRunContract* owner,
+                           const std::uint64_t incarnation,
+                           const AttemptIdentity attempt,
+                           const std::uint64_t candidate_serial) noexcept
+        : owner_(owner),
+          incarnation_(incarnation),
+          attempt_(attempt),
+          candidate_serial_(candidate_serial),
+          bound_phase_(AttemptPhase::provisional),
+          valid_(true)
+    {}
+
+    const PersistentRunContract* owner_ = nullptr;
+    std::uint64_t incarnation_ = 0;
+    AttemptIdentity attempt_{};
+    std::uint64_t candidate_serial_ = 0;
+    AttemptPhase bound_phase_ = AttemptPhase::idle;
+    bool valid_ = false;
+
+    friend class PersistentRunContract;
+  };
+
   /** Pointer-free value; all use is revalidated by a live contract. */
   class CandidateCapability
   {
@@ -1164,7 +1407,8 @@ public:
 
   /**
    * Adapter preflight before any attempt transfers occur. A false result means
-   * FinishAttempt will reject that report without mutating transfer totals.
+   * FinishAttempt or PrepareCommit will reject that report without mutating
+   * any overflowing transfer total.
    */
   bool CanAccountAttemptTransfers(
       const TransferAccounting& transfers) const noexcept
@@ -1195,8 +1439,9 @@ public:
                      state_slot& copy) const noexcept
   {
     if (!ValidPublished(capability)) { return false; }
-    const bool copied = StoragePolicy::CopyOut(committed_, copy);
-    return copied && StoragePolicy::Disjoint(committed_, copy) &&
+    const state_slot& published = PublishedSlot();
+    const bool copied = StoragePolicy::CopyOut(published, copy);
+    return copied && StoragePolicy::Disjoint(published, copy) &&
         ValidPublished(capability);
   }
 
@@ -1246,7 +1491,8 @@ public:
 
   bool IsCurrentAttempt(const AttemptIdentity& attempt) const noexcept
   {
-    return active_ && detail::SameAttempt(attempt, active_attempt_);
+    return phase_ == AttemptPhase::mutable_candidate &&
+        SameLiveAttempt(attempt);
   }
 
   template <DerivedProductKind Kind>
@@ -1284,13 +1530,362 @@ public:
                               issued_product_serials_[index]};
   }
 
+  template <
+      typename Policy = StoragePolicy,
+      std::enable_if_t<
+          std::is_same<Policy, StoragePolicy>::value &&
+              detail::SupportsTwoPhaseSlotExchange<Policy,
+                                                   state_slot>::value,
+          int> = 0>
+  std::optional<StagingToken> FreezeCandidate(
+      const AttemptIdentity& attempt,
+      const std::uint64_t candidate_cursor) noexcept
+  {
+    if (phase_ != AttemptPhase::mutable_candidate ||
+        !SameLiveAttempt(attempt) ||
+        candidate_storage_failure_ != FailureReason::none ||
+        !StoragePolicy::Disjoint(committed_, candidate_))
+    {
+      RejectStaleConsumer();
+      return std::nullopt;
+    }
+    const RuntimeTupleDescriptor tuple = Selection::Descriptor();
+    if (!tuple.Valid()) { return std::nullopt; }
+
+    const StateCoordinates entry = coordinates_;
+    const StateCoordinates target = PendingTarget(candidate_cursor);
+    const StateHash interior_hash =
+        StoragePolicy::HashInterior(candidate_.interior);
+    const StateHash trace_hash = StoragePolicy::HashTrace(candidate_.trace);
+    const CheckpointDescriptor checkpoint{
+        checkpoint_schema_version,
+        true,
+        RestartMode::same_backend_rank_partition,
+        tuple,
+        resources_.mfem_pin,
+        resources_.mesh_hash,
+        resources_.partition_hash,
+        resources_.topology_hash,
+        resources_.rank_count,
+        resources_.polynomial_order,
+        resources_.layout,
+        tuple.precision,
+        candidate_cursor,
+        pending_dt_,
+        target,
+        detail::CoordinateFingerprint(target),
+        interior_hash,
+        trace_hash};
+
+    phase_ = AttemptPhase::frozen;
+    return StagingToken{this,
+                        incarnation_,
+                        active_attempt_,
+                        candidate_serial_,
+                        entry,
+                        target,
+                        interior_hash,
+                        trace_hash,
+                        checkpoint};
+  }
+
+  template <
+      typename Policy = StoragePolicy,
+      std::enable_if_t<
+          std::is_same<Policy, StoragePolicy>::value &&
+              detail::SupportsTwoPhaseSlotExchange<Policy,
+                                                   state_slot>::value,
+          int> = 0>
+  bool CopyPrepared(const StagingToken& token,
+                    state_slot& copy) const noexcept
+  {
+    if (!ValidStagingToken(token) || !FrozenCandidateMatches(token))
+    {
+      return false;
+    }
+    const bool copied = StoragePolicy::CopyOut(candidate_, copy);
+    return copied && StoragePolicy::Disjoint(candidate_, copy) &&
+        StoragePolicy::Disjoint(committed_, copy) &&
+        ValidStagingToken(token) && FrozenCandidateMatches(token);
+  }
+
+  template <
+      typename Policy = StoragePolicy,
+      std::enable_if_t<
+          std::is_same<Policy, StoragePolicy>::value &&
+              detail::SupportsTwoPhaseSlotExchange<Policy,
+                                                   state_slot>::value,
+          int> = 0>
+  std::optional<PreparedCommitToken> PrepareCommit(
+      StagingToken&& token,
+      const AttemptReport& report,
+      ProductBundle&& products) noexcept
+  {
+    if (!ValidStagingToken(token))
+    {
+      RejectStaleConsumer();
+      return std::nullopt;
+    }
+
+    token.valid_ = false;
+    const AttemptIdentity attempt = token.attempt_;
+    const bool current = SameLiveAttempt(attempt);
+    const bool originating_reason_valid =
+        detail::IsNamedFailureReason(report.originating_failure);
+    FailureReason product_reason = FailureReason::stale_attempt;
+    if (current)
+    {
+      product_reason = ValidateAndConsumeProducts(attempt, products);
+    }
+    else
+    {
+      InvalidateProducts(products);
+      RejectStaleConsumer();
+    }
+
+    GateReport local_gates = report.gates;
+    const bool exact_transfers =
+        CanAccountAttemptTransfers(report.telemetry.transfers);
+    if (!report.telemetry.transfers.complete || !exact_transfers ||
+        !report.telemetry.prohibited.Clean() ||
+        (!resources_.reuse.per_step_allocation_required &&
+         report.telemetry.transfers.allocation_events != 0))
+    {
+      local_gates.telemetry = false;
+    }
+    if (!std::isfinite(report.telemetry.true_relative_residual) ||
+        report.telemetry.true_relative_residual < 0.0 ||
+        report.telemetry.true_relative_residual >
+            true_relative_residual_limit)
+    {
+      local_gates.true_residual = false;
+    }
+
+    FailureReason storage_reason = candidate_storage_failure_;
+    if (current && storage_reason == FailureReason::none &&
+        (!detail::SameCoordinates(coordinates_, token.entry_) ||
+         !detail::SameCoordinates(PendingTarget(token.target_.cursor),
+                                  token.target_) ||
+         report.candidate_cursor != token.target_.cursor))
+    {
+      storage_reason = FailureReason::stale_attempt;
+    }
+    if (current && storage_reason == FailureReason::none &&
+        !StoragePolicy::Disjoint(committed_, candidate_))
+    {
+      storage_reason = FailureReason::shared_backing_store;
+    }
+    if (current && storage_reason == FailureReason::none &&
+        (StoragePolicy::HashInterior(candidate_.interior) !=
+             token.interior_hash_ ||
+         StoragePolicy::HashTrace(candidate_.trace) != token.trace_hash_))
+    {
+      storage_reason = FailureReason::candidate_preparation;
+    }
+    if (current && storage_reason == FailureReason::none &&
+        !StoragePolicy::CanPublish(committed_, candidate_))
+    {
+      storage_reason = FailureReason::publication_precondition;
+    }
+    if (current && storage_reason == FailureReason::none &&
+        publication_serial_ == std::numeric_limits<std::uint64_t>::max())
+    {
+      storage_reason = FailureReason::coordinate_overflow;
+    }
+
+    FailureReason local_reason = FailureReason::none;
+    if (!originating_reason_valid)
+    {
+      local_reason = FailureReason::collective_protocol;
+    }
+    else if (!current)
+    {
+      local_reason = FailureReason::stale_attempt;
+    }
+    else if (report.originating_failure != FailureReason::none)
+    {
+      local_reason = report.originating_failure;
+    }
+    else if (product_reason != FailureReason::none)
+    {
+      local_reason = product_reason;
+    }
+    else if (storage_reason != FailureReason::none)
+    {
+      local_reason = storage_reason;
+    }
+    else
+    {
+      local_reason = detail::FirstFailedGate(local_gates);
+    }
+    if (local_reason != FailureReason::none) { local_gates.success = false; }
+
+    const AttemptCollectiveContext local_context{
+        attempt, token.entry_, token.target_, token.target_.cursor};
+    const CollectiveGateReport collective = CollectivePolicy::Reduce(
+        local_context, local_gates, local_reason, resources_.rank_count);
+    const FailureReason reason = ResolveGateCollective(
+        local_context, local_gates, local_reason, collective);
+
+    AttemptTelemetry attempt_telemetry = report.telemetry;
+    attempt_telemetry.identity = current ? active_attempt_ : attempt;
+    attempt_telemetry.failure_reason = reason;
+    attempt_telemetry.validated_product_mask =
+        product_reason == FailureReason::none ? required_product_mask : 0;
+    telemetry_.last_attempt = attempt_telemetry;
+    if (exact_transfers)
+    {
+      detail::AddTransfersExact(telemetry_.attempted_transfers,
+                                report.telemetry.transfers);
+    }
+    else
+    {
+      telemetry_.transfer_accounting_overflow_rejections =
+          detail::SaturatingAdd(
+              telemetry_.transfer_accounting_overflow_rejections, 1);
+    }
+
+    if (reason != FailureReason::none)
+    {
+      RememberFirstFailure(reason);
+      Rollback(active_attempt_, reason, report.telemetry.transfers,
+               exact_transfers);
+      return std::nullopt;
+    }
+
+    prepared_target_ = token.target_;
+    prepared_telemetry_ = attempt_telemetry;
+    prepared_transfers_ = report.telemetry.transfers;
+    prepared_checkpoint_ = token.checkpoint_;
+    phase_ = AttemptPhase::prepared;
+    return PreparedCommitToken{
+        this,
+        incarnation_,
+        active_attempt_,
+        candidate_serial_,
+        prepared_checkpoint_};
+  }
+
+  template <
+      typename Policy = StoragePolicy,
+      std::enable_if_t<
+          std::is_same<Policy, StoragePolicy>::value &&
+              detail::SupportsTwoPhaseSlotExchange<Policy,
+                                                   state_slot>::value,
+          int> = 0>
+  std::optional<ProvisionalCommitToken> CommitPrepared(
+      PreparedCommitToken&& token) noexcept
+  {
+    if (!ValidPreparedToken(token))
+    {
+      RejectStaleConsumer();
+      return std::nullopt;
+    }
+    token.valid_ = false;
+    StoragePolicy::Publish(committed_, candidate_);
+    phase_ = AttemptPhase::provisional;
+    return ProvisionalCommitToken{
+        this, incarnation_, active_attempt_, candidate_serial_};
+  }
+
+  template <
+      typename Policy = StoragePolicy,
+      std::enable_if_t<
+          std::is_same<Policy, StoragePolicy>::value &&
+              detail::SupportsTwoPhaseSlotExchange<Policy,
+                                                   state_slot>::value,
+          int> = 0>
+  AttemptOutcome FinalizeCommit(ProvisionalCommitToken&& token) noexcept
+  {
+    if (!ValidProvisionalToken(token))
+    {
+      RejectStaleConsumer();
+      return {status_, FailureReason::stale_attempt, false, false};
+    }
+    token.valid_ = false;
+
+    coordinates_ = prepared_target_;
+    ++publication_serial_;
+    prepared_telemetry_.failure_reason = FailureReason::none;
+    telemetry_.last_attempt = prepared_telemetry_;
+    telemetry_.accepted = {true, coordinates_, prepared_telemetry_};
+    detail::AddTransfersExact(telemetry_.committed_transfers,
+                              prepared_transfers_);
+    telemetry_.commits = detail::SaturatingAdd(telemetry_.commits, 1);
+    active_ = false;
+    phase_ = AttemptPhase::idle;
+    candidate_storage_failure_ = FailureReason::none;
+    status_ = RunStatus::committed;
+    last_failure_ = FailureReason::none;
+    ClearPreparedCommit();
+    return {status_, FailureReason::none, true, false};
+  }
+
+  template <
+      typename Policy = StoragePolicy,
+      std::enable_if_t<
+          std::is_same<Policy, StoragePolicy>::value &&
+              detail::SupportsTwoPhaseSlotExchange<Policy,
+                                                   state_slot>::value,
+          int> = 0>
+  AttemptOutcome AbortPrepared(
+      PreparedCommitToken&& token,
+      FailureReason reason = FailureReason::backend_failure) noexcept
+  {
+    if (!ValidPreparedToken(token))
+    {
+      RejectStaleConsumer();
+      return {status_, FailureReason::stale_attempt, false, false};
+    }
+    token.valid_ = false;
+    reason = NormalizeRollbackReason(reason);
+    RememberFirstFailure(reason);
+    telemetry_.last_attempt.failure_reason = reason;
+    return Rollback(active_attempt_, reason, prepared_transfers_, true);
+  }
+
+  template <
+      typename Policy = StoragePolicy,
+      std::enable_if_t<
+          std::is_same<Policy, StoragePolicy>::value &&
+              detail::SupportsTwoPhaseSlotExchange<Policy,
+                                                   state_slot>::value,
+          int> = 0>
+  AttemptOutcome RevertCommit(
+      ProvisionalCommitToken&& token,
+      FailureReason reason = FailureReason::backend_failure) noexcept
+  {
+    if (!ValidProvisionalToken(token))
+    {
+      RejectStaleConsumer();
+      return {status_, FailureReason::stale_attempt, false, false};
+    }
+    token.valid_ = false;
+    Policy::RevertPublish(committed_, candidate_);
+    phase_ = AttemptPhase::prepared;
+    reason = NormalizeRollbackReason(reason);
+    RememberFirstFailure(reason);
+    telemetry_.last_attempt.failure_reason = reason;
+    return Rollback(active_attempt_, reason, prepared_transfers_, true);
+  }
+
   BeginOutcome BeginStep(const StepRequest& request) noexcept
   {
+    if (TwoPhaseCommitBusy())
+    {
+      RejectStaleConsumer();
+      return {false, active_attempt_, FailureReason::stale_attempt};
+    }
     return PrepareAndAdmit(request, false);
   }
 
   BeginOutcome Retry() noexcept
   {
+    if (TwoPhaseCommitBusy())
+    {
+      RejectStaleConsumer();
+      return {false, active_attempt_, FailureReason::retry_exhausted};
+    }
     return PrepareAndAdmit({InteriorSpace::l2, pending_dt_}, true);
   }
 
@@ -1298,6 +1893,12 @@ public:
                                const AttemptReport& report,
                                ProductBundle&& products) noexcept
   {
+    if (TwoPhaseCommitBusy())
+    {
+      InvalidateProducts(products);
+      RejectStaleConsumer();
+      return {status_, FailureReason::stale_attempt, false, false};
+    }
     const bool current = IsCurrentAttempt(attempt);
     const bool originating_reason_valid =
         detail::IsNamedFailureReason(report.originating_failure);
@@ -1448,6 +2049,7 @@ public:
                               report.telemetry.transfers);
     telemetry_.commits = detail::SaturatingAdd(telemetry_.commits, 1);
     active_ = false;
+    phase_ = AttemptPhase::idle;
     candidate_storage_failure_ = FailureReason::none;
     status_ = RunStatus::committed;
     last_failure_ = FailureReason::none;
@@ -1581,6 +2183,7 @@ public:
     coordinates_ = checkpoint.coordinates;
     ++publication_serial_;
     active_ = false;
+    phase_ = AttemptPhase::idle;
     retry_used_ = false;
     pending_dt_ = 0.0;
     pending_target_time_ = 0.0;
@@ -1601,6 +2204,101 @@ public:
 
 private:
   static constexpr std::uint8_t required_product_mask = 0x0fU;
+
+  bool SameLiveAttempt(const AttemptIdentity& attempt) const noexcept
+  {
+    return active_ && detail::SameAttempt(attempt, active_attempt_);
+  }
+
+  bool TwoPhaseCommitBusy() const noexcept
+  {
+    return phase_ == AttemptPhase::frozen ||
+        phase_ == AttemptPhase::prepared ||
+        phase_ == AttemptPhase::provisional;
+  }
+
+  StateCoordinates PendingTarget(const std::uint64_t cursor) const noexcept
+  {
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    return {pending_target_time_,
+            coordinates_.step == maximum ? maximum : coordinates_.step + 1,
+            coordinates_.generation == maximum
+                ? maximum
+                : coordinates_.generation + 1,
+            cursor,
+            pending_dt_};
+  }
+
+  const state_slot& PublishedSlot() const noexcept
+  {
+    return phase_ == AttemptPhase::provisional ? candidate_ : committed_;
+  }
+
+  bool ValidStagingToken(const StagingToken& token) const noexcept
+  {
+    return token.valid_ && token.owner_ == this &&
+        token.incarnation_ == incarnation_ &&
+        token.candidate_serial_ == candidate_serial_ &&
+        token.bound_phase_ == AttemptPhase::frozen &&
+        phase_ == AttemptPhase::frozen &&
+        SameLiveAttempt(token.attempt_);
+  }
+
+  bool FrozenCandidateMatches(const StagingToken& token) const noexcept
+  {
+    return token.owner_ == this && token.incarnation_ == incarnation_ &&
+        token.candidate_serial_ == candidate_serial_ &&
+        token.bound_phase_ == AttemptPhase::frozen &&
+        phase_ == AttemptPhase::frozen &&
+        SameLiveAttempt(token.attempt_) &&
+        detail::SameCoordinates(coordinates_, token.entry_) &&
+        detail::SameCoordinates(PendingTarget(token.target_.cursor),
+                                token.target_) &&
+        StoragePolicy::Disjoint(committed_, candidate_) &&
+        StoragePolicy::HashInterior(candidate_.interior) ==
+            token.interior_hash_ &&
+        StoragePolicy::HashTrace(candidate_.trace) == token.trace_hash_;
+  }
+
+  bool ValidPreparedToken(const PreparedCommitToken& token) const noexcept
+  {
+    return token.valid_ && token.owner_ == this &&
+        token.incarnation_ == incarnation_ &&
+        token.candidate_serial_ == candidate_serial_ &&
+        token.bound_phase_ == AttemptPhase::prepared &&
+        phase_ == AttemptPhase::prepared &&
+        SameLiveAttempt(token.attempt_);
+  }
+
+  bool ValidProvisionalToken(
+      const ProvisionalCommitToken& token) const noexcept
+  {
+    return token.valid_ && token.owner_ == this &&
+        token.incarnation_ == incarnation_ &&
+        token.candidate_serial_ == candidate_serial_ &&
+        token.bound_phase_ == AttemptPhase::provisional &&
+        phase_ == AttemptPhase::provisional &&
+        SameLiveAttempt(token.attempt_);
+  }
+
+  static FailureReason NormalizeRollbackReason(
+      const FailureReason reason) noexcept
+  {
+    if (!detail::IsNamedFailureReason(reason))
+    {
+      return FailureReason::collective_protocol;
+    }
+    return reason == FailureReason::none ? FailureReason::backend_failure
+                                         : reason;
+  }
+
+  void ClearPreparedCommit() noexcept
+  {
+    prepared_target_ = {};
+    prepared_telemetry_ = {};
+    prepared_transfers_ = {};
+    prepared_checkpoint_ = {};
+  }
 
   bool ValidCandidate(const CandidateCapability& capability) const noexcept
   {
@@ -1704,6 +2402,7 @@ private:
   BeginOutcome PrepareAndAdmit(const StepRequest& request,
                                const bool retry) noexcept
   {
+    const bool preserve_live_attempt = active_;
     telemetry_.admissions_started = detail::SaturatingAdd(
         telemetry_.admissions_started, 1);
     const std::uint64_t proposed_sequence =
@@ -1719,8 +2418,10 @@ private:
     FailureReason local_reason =
         ValidateAdmissionRequest(request, retry, target);
     bool local_prepared = false;
+    bool preparation_attempted = false;
     if (local_reason == FailureReason::none)
     {
+      preparation_attempted = true;
       local_prepared = StoragePolicy::PrepareCandidate(committed_, candidate_);
       if (!local_prepared)
       {
@@ -1747,20 +2448,26 @@ private:
         local_context, local_prepared, local_reason, admission);
     if (reason != FailureReason::none)
     {
-      if (StoragePolicy::Disjoint(committed_, candidate_))
+      if (preparation_attempted &&
+          StoragePolicy::Disjoint(committed_, candidate_))
       {
         StoragePolicy::DiscardCandidate(candidate_);
       }
-      else
+      else if (preparation_attempted)
       {
         storage_valid_ = false;
       }
       telemetry_.admissions_failed = detail::SaturatingAdd(
           telemetry_.admissions_failed, 1);
+      RememberFirstFailure(reason);
+      if (preserve_live_attempt)
+      {
+        return {false, proposed, reason};
+      }
       active_ = false;
+      phase_ = AttemptPhase::idle;
       status_ = FailureStatus(reason);
       last_failure_ = reason;
-      RememberFirstFailure(reason);
       return {false, proposed, reason};
     }
 
@@ -1775,6 +2482,7 @@ private:
     issued_product_serials_.fill(0);
     candidate_storage_failure_ = FailureReason::none;
     active_ = true;
+    phase_ = AttemptPhase::mutable_candidate;
     status_ = RunStatus::attempt_active;
     last_failure_ = FailureReason::none;
     telemetry_.attempts_started =
@@ -1980,7 +2688,9 @@ private:
       storage_valid_ = false;
     }
     active_ = false;
+    phase_ = AttemptPhase::idle;
     candidate_storage_failure_ = FailureReason::none;
+    ClearPreparedCommit();
     if (reason == FailureReason::none) { reason = FailureReason::backend_failure; }
     last_failure_ = reason;
     telemetry_.last_attempt.failure_reason = reason;
@@ -2121,7 +2831,12 @@ private:
   StateCoordinates coordinates_{};
   PersistentResourceDescriptor resources_{};
   RunTelemetry telemetry_{};
+  StateCoordinates prepared_target_{};
+  AttemptTelemetry prepared_telemetry_{};
+  TransferAccounting prepared_transfers_{};
+  CheckpointDescriptor prepared_checkpoint_{};
   RunStatus status_ = RunStatus::ready;
+  AttemptPhase phase_ = AttemptPhase::idle;
   FailureReason last_failure_ = FailureReason::none;
   FailureReason constructor_failure_ = FailureReason::none;
   FailureReason candidate_storage_failure_ = FailureReason::none;
