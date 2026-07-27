@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -348,13 +349,12 @@ struct AuditedAllocator
     return success;
   }
 
-  static void Deallocate(void* pointer,
+  static bool Deallocate(void* pointer,
                          const CudaAllocationSite site) noexcept
   {
     if (pointer == nullptr)
     {
-      UmpireDeviceAllocatorPolicy::Deallocate(pointer, site);
-      return;
+      return UmpireDeviceAllocatorPolicy::Deallocate(pointer, site);
     }
     const auto token = reinterpret_cast<std::uintptr_t>(pointer);
     std::uint64_t bytes = 0;
@@ -373,12 +373,14 @@ struct AuditedAllocator
     }
     const std::uint64_t before =
         UmpireDeviceAllocatorPolicy::DeallocationEvents();
-    UmpireDeviceAllocatorPolicy::Deallocate(pointer, site);
-    const bool success =
+    const bool policy_success =
+        UmpireDeviceAllocatorPolicy::Deallocate(pointer, site);
+    const bool success = policy_success &&
         UmpireDeviceAllocatorPolicy::DeallocationEvents() == before + 1;
     Record(site, static_cast<std::size_t>(bytes),
            static_cast<std::size_t>(alignment), pointer, false, success,
            retained_generation);
+    return success;
   }
 
   static std::uint64_t AllocationEvents() noexcept
@@ -815,9 +817,6 @@ enum : std::uint64_t
   ckpt_sub_host_trace_hash=1ULL<<7, ckpt_sub_collective_return=1ULL<<8,
   ckpt_sub_range_seal=1ULL<<9
 };
-constexpr std::uint64_t checkpoint_failure_all_v1=(1ULL<<20)-1;
-constexpr std::uint64_t checkpoint_substage_all_v1=(1ULL<<10)-1;
-
 struct CheckpointDiagnosticV1
 {
   std::uint64_t failure_mask=0, substage_mask=0, event_count=0, sync_delta=0;
@@ -838,10 +837,8 @@ CheckpointDiagnosticV1 BuildCheckpointDiagnosticV1(
       c.interior_count*sizeof(double));
   if(tc)d.trace=cuda_detail::HashHostBytes(c.owned_true_trace.data(),
       c.owned_true_trace_count*sizeof(double));
-  const bool ih=ic&&d.interior==c.local_interior_hash&&
-      d.interior==s.candidate_local_interior_hash;
-  const bool th=tc&&d.trace==c.local_trace_hash&&
-      d.trace==s.candidate_local_trace_hash;
+  const bool ih=ic&&d.interior==c.local_interior_hash;
+  const bool th=tc&&d.trace==c.local_trace_hash;
   const bool bounds=c.staging_range.begin_ordinal!=0&&
       c.staging_range.complete&&c.staging_range.end_ordinal<=after.observed_count&&
       c.staging_range.end_ordinal>=c.staging_range.begin_ordinal-1;
@@ -908,17 +905,21 @@ CheckpointDiagnosticV1 BuildCheckpointDiagnosticV1(
   fail(ih,ckpt_recomputed_interior_hash); fail(th,ckpt_recomputed_trace_hash);
   fail(bounds,ckpt_range_bounds); fail(digest,ckpt_range_digest);
   fail(mirror,ckpt_ledger_mirror); fail(shape,ckpt_event_shape_context);
-  if(!event_ok[0])d.substage_mask|=ckpt_sub_d2d_interior;
-  if(!event_ok[1])d.substage_mask|=ckpt_sub_d2d_trace;
-  if(d.sync_delta<1||(event_ok[0]&&event_ok[1]&&!event_ok[2]&&!event_ok[3]))
-    d.substage_mask|=ckpt_sub_first_sync;
-  if(!event_ok[2])d.substage_mask|=ckpt_sub_d2h_interior;
-  if(!event_ok[3])d.substage_mask|=ckpt_sub_d2h_trace;
-  if(d.sync_delta<2)d.substage_mask|=ckpt_sub_second_sync;
-  if(!ih)d.substage_mask|=ckpt_sub_host_interior_hash;
-  if(!th)d.substage_mask|=ckpt_sub_host_trace_hash;
-  if(!staged)d.substage_mask|=ckpt_sub_collective_return;
-  if(!bounds||!digest)d.substage_mask|=ckpt_sub_range_seal;
+  // Report the first inferred failed substage.  In particular, two recorded
+  // synchronization calls are not success evidence: four successful copies
+  // followed by an incomplete transport total identifies the second sync.
+  if(!event_ok[0])d.substage_mask=ckpt_sub_d2d_interior;
+  else if(!event_ok[1])d.substage_mask=ckpt_sub_d2d_trace;
+  else if(seen[2]==0&&seen[3]==0&&d.sync_delta==1&&
+          !after.totals.complete)d.substage_mask=ckpt_sub_first_sync;
+  else if(!event_ok[2])d.substage_mask=ckpt_sub_d2h_interior;
+  else if(!event_ok[3])d.substage_mask=ckpt_sub_d2h_trace;
+  else if(d.sync_delta<2||!after.totals.complete)
+    d.substage_mask=ckpt_sub_second_sync;
+  else if(!ih)d.substage_mask=ckpt_sub_host_interior_hash;
+  else if(!th)d.substage_mask=ckpt_sub_host_trace_hash;
+  else if(!staged)d.substage_mask=ckpt_sub_collective_return;
+  else if(!bounds||!digest)d.substage_mask=ckpt_sub_range_seal;
   return d;
 }
 
@@ -930,12 +931,12 @@ void PrintCheckpointHash(std::ostream& out,const StateHash& h) noexcept
   out.flags(flags); out.fill(fill);
 }
 
-void ReportCheckpointDiagnosticV1(const char* id,bool retry,std::uint64_t target,
+void ReportCheckpointDiagnosticV1(const char* id,int rank,bool retry,
+    std::uint64_t target,
     const CudaSerializedCheckpointV1& c,const CudaPrecommitSnapshot& s,
     const CudaTransferLedgerV1& before,const CudaTransferLedgerV1& after,
     const CudaTransferTotals& totals,const CheckpointDiagnosticV1& d) noexcept
 {
-  int rank=-1;MPI_Comm_rank(MPI_COMM_WORLD,&rank);
   std::cerr<<"CKPT_DIAG v=1 case="<<(id?id:"null")<<" rank="<<rank
     <<" retry="<<retry<<" target="<<target<<" fail_mask=0x"<<std::hex
     <<d.failure_mask<<" substage_mask=0x"<<d.substage_mask<<std::dec
@@ -979,31 +980,285 @@ void ReportCheckpointDiagnosticV1(const char* id,bool retry,std::uint64_t target
 template <typename Engine> bool StagePreparedCheckpointDiagnosed(Engine& e,
     CudaSerializedCheckpointV1& c,CudaStepEvidence& evidence,
     const CudaPrecommitSnapshot& s,int ranks,bool retry,std::uint64_t target,
-    const char* id) noexcept
+    const char* id,int rank) noexcept
 {
   const auto before=AuditedTransport::Ledger();
   const bool staged=e.StagePreparedCheckpoint(c,evidence);
   const auto after=AuditedTransport::Ledger();
-  if(!staged){int rank=-1;MPI_Comm_rank(MPI_COMM_WORLD,&rank);
-    const bool mirror=ExactPolicyLedgers();const auto d=BuildCheckpointDiagnosticV1(
+  if(!staged){const bool mirror=ExactPolicyLedgers();
+    const auto d=BuildCheckpointDiagnosticV1(
       staged,c,s,ranks,rank,before,after,mirror);
-    ReportCheckpointDiagnosticV1(id,retry,target,c,s,before,after,
+    ReportCheckpointDiagnosticV1(id,rank,retry,target,c,s,before,after,
       AuditedTransport::Accounting(),d);}
   return staged;
 }
 
-bool CheckpointDiagnosticNonVacuity() noexcept
+StateHash IndependentCheckpointHash(const void* data,
+                                    const std::size_t bytes) noexcept
 {
-  CudaSerializedCheckpointV1 c{};c.schema=0;CudaPrecommitSnapshot s{};
-  s.attempt.sequence=s.target.step=s.target.generation=1;
-  s.interior_coefficients=s.true_trace_coefficients=1;
-  s.candidate_interior_hash.bytes[0]=1;s.candidate_trace_hash.bytes[0]=2;
-  s.candidate_local_interior_hash.bytes[0]=3;
-  s.candidate_local_trace_hash.bytes[0]=4;
-  CudaTransferLedgerV1 ledger{};
-  const auto d=BuildCheckpointDiagnosticV1(false,c,s,1,0,ledger,ledger,false);
-  return d.failure_mask==checkpoint_failure_all_v1&&
-      d.substage_mask==checkpoint_substage_all_v1;
+  StateHash result{};
+  const auto* input = static_cast<const unsigned char*>(data);
+  std::array<std::uint64_t, 4> hash{{
+      1469598103934665603ULL,
+      1099511628211ULL ^ 0x9e3779b97f4a7c15ULL,
+      1469598103934665603ULL ^ 0xd6e8feb86659fd93ULL,
+      1099511628211ULL ^ 0xa0761d6478bd642fULL}};
+  for (std::size_t index = 0; index < bytes; ++index)
+  {
+    for (std::size_t lane = 0; lane < hash.size(); ++lane)
+    {
+      hash[lane] ^= static_cast<std::uint64_t>(input[index] + 17U * lane);
+      hash[lane] *= 1099511628211ULL + 2ULL * lane;
+    }
+  }
+  std::memcpy(result.bytes.data(), hash.data(), sizeof(hash));
+  return result;
+}
+
+std::uint64_t IndependentCheckpointRangeDigest(
+    const CudaTransferLedgerV1& ledger, const std::uint64_t begin,
+    const std::uint64_t end) noexcept
+{
+  std::uint64_t digest = fnv_offset;
+  for (std::size_t index = 0; index < ledger.count; ++index)
+  {
+    const TransferEventV1& event = ledger.events[index];
+    if (event.ordinal < begin || event.ordinal > end) { continue; }
+    digest ^= event.endpoint_token;
+    digest *= fnv_prime;
+  }
+  return digest;
+}
+
+struct CheckpointDiagnosticFixtureV1
+{
+  CudaSerializedCheckpointV1 checkpoint{};
+  CudaPrecommitSnapshot snapshot{};
+  CudaTransferLedgerV1 before{};
+  CudaTransferLedgerV1 after{};
+  bool staged = true;
+  bool mirror = true;
+};
+
+void RefreshCheckpointEventEndpoint(TransferEventV1& event) noexcept
+{
+  event.endpoint_token = IndependentEndpointToken(
+      event.direction, event.category, event.site, event.context,
+      event.ordinal, event.source_token, event.destination_token,
+      event.bytes, event.source_capacity, event.destination_capacity,
+      event.success);
+}
+
+void InitializeCheckpointDiagnosticFixture(
+    CheckpointDiagnosticFixtureV1& fixture) noexcept
+{
+  fixture.checkpoint = {};
+  fixture.snapshot = {};
+  fixture.staged = true;
+  fixture.mirror = true;
+  fixture.before.totals = {};
+  fixture.before.count = 0;
+  fixture.before.observed_count = 0;
+  fixture.before.dropped_count = 0;
+  fixture.before.ordered_digest = fnv_offset;
+  fixture.before.overflow = false;
+  fixture.after.totals = {};
+  fixture.after.count = 0;
+  fixture.after.observed_count = 0;
+  fixture.after.dropped_count = 0;
+  fixture.after.ordered_digest = fnv_offset;
+  fixture.after.overflow = false;
+  auto& checkpoint = fixture.checkpoint;
+  auto& snapshot = fixture.snapshot;
+  auto& after = fixture.after;
+  snapshot.attempt.sequence = 7;
+  snapshot.target.step = 1;
+  snapshot.target.generation = 1;
+  snapshot.interior_coefficients = 1;
+  snapshot.true_trace_coefficients = 1;
+  snapshot.candidate_interior_hash.bytes[0] = 0x31;
+  snapshot.candidate_trace_hash.bytes[0] = 0x32;
+  checkpoint.schema = 1;
+  checkpoint.source_rank = 0;
+  checkpoint.rank_count = 1;
+  checkpoint.attempt.sequence = snapshot.attempt.sequence;
+  checkpoint.facade_incarnation = 9;
+  checkpoint.descriptor.interior_hash = snapshot.candidate_interior_hash;
+  checkpoint.descriptor.trace_hash = snapshot.candidate_trace_hash;
+  checkpoint.interior_count = 1;
+  checkpoint.owned_true_trace_count = 1;
+  checkpoint.interior_source_token = 0x1000;
+  checkpoint.trace_source_token = 0x2000;
+  checkpoint.staging_generation = snapshot.target.generation;
+  checkpoint.interior[0] = 1.25;
+  checkpoint.owned_true_trace[0] = -2.5;
+  checkpoint.local_interior_hash = IndependentCheckpointHash(
+      checkpoint.interior.data(), sizeof(double));
+  checkpoint.local_trace_hash = IndependentCheckpointHash(
+      checkpoint.owned_true_trace.data(), sizeof(double));
+  snapshot.candidate_local_interior_hash = checkpoint.local_interior_hash;
+  snapshot.candidate_local_trace_hash = checkpoint.local_trace_hash;
+  checkpoint.candidate_frozen = true;
+  checkpoint.checkpoint_staged = true;
+
+  const std::array<CudaTransferDirection, 4> directions{{
+      CudaTransferDirection::device_to_device,
+      CudaTransferDirection::device_to_device,
+      CudaTransferDirection::device_to_host,
+      CudaTransferDirection::device_to_host}};
+  const std::array<CudaTransferSite, 4> sites{{
+      CudaTransferSite::checkpoint_stage_interior,
+      CudaTransferSite::checkpoint_stage_trace,
+      CudaTransferSite::checkpoint_stage_interior,
+      CudaTransferSite::checkpoint_stage_trace}};
+  for (std::size_t index = 0; index < directions.size(); ++index)
+  {
+    TransferEventV1& event = after.events[index];
+    event = {};
+    const bool interior = (index & 1U) == 0;
+    const bool device_to_host = index >= 2;
+    const std::uintptr_t token = interior
+        ? checkpoint.interior_source_token : checkpoint.trace_source_token;
+    const std::uintptr_t host = interior
+        ? reinterpret_cast<std::uintptr_t>(checkpoint.interior.data())
+        : reinterpret_cast<std::uintptr_t>(
+              checkpoint.owned_true_trace.data());
+    event.ordinal = index + 1;
+    event.direction = directions[index];
+    event.category = CudaTransferCategory::checkpoint_candidate_staging;
+    event.site = sites[index];
+    event.context.attempt_sequence = snapshot.attempt.sequence;
+    event.context.target_step = snapshot.target.step;
+    event.context.generation = snapshot.target.generation;
+    event.context.rank = 0;
+    event.context.phase = CudaFailurePhase::after_recovery_before_commit;
+    event.bytes = sizeof(double);
+    event.source_token = device_to_host ? token : 0x3000 + index;
+    event.destination_token = device_to_host ? host : token;
+    event.source_capacity = sizeof(double);
+    event.destination_capacity = device_to_host
+        ? (interior ? checkpoint.interior.size()
+                    : checkpoint.owned_true_trace.size()) * sizeof(double)
+        : sizeof(double);
+    event.success = true;
+    RefreshCheckpointEventEndpoint(event);
+  }
+  after.count = 4;
+  after.observed_count = 4;
+  after.totals.device_to_device_bytes = 2 * sizeof(double);
+  after.totals.device_to_host_bytes = 2 * sizeof(double);
+  after.totals.synchronization_events = 2;
+  after.totals.event_count = 4;
+  after.totals.complete = true;
+  checkpoint.staging_range.begin_ordinal = 1;
+  checkpoint.staging_range.end_ordinal = 4;
+  checkpoint.staging_range.ordered_digest =
+      IndependentCheckpointRangeDigest(after, 1, 4);
+  checkpoint.staging_range.complete = true;
+}
+
+void RestrictCheckpointFixtureToD2D(
+    CheckpointDiagnosticFixtureV1& fixture) noexcept
+{
+  fixture.after.count = 2;
+  fixture.after.observed_count = 2;
+  fixture.after.totals.device_to_host_bytes = 0;
+  fixture.after.totals.synchronization_events = 1;
+  fixture.after.totals.event_count = 2;
+  fixture.after.totals.complete = false;
+  fixture.checkpoint.staging_range.end_ordinal = 2;
+  fixture.checkpoint.staging_range.ordered_digest =
+      IndependentCheckpointRangeDigest(fixture.after, 1, 2);
+}
+
+bool CheckpointDiagnosticExactFixtures() noexcept
+{
+  auto fixture = std::make_unique<CheckpointDiagnosticFixtureV1>();
+  InitializeCheckpointDiagnosticFixture(*fixture);
+  auto diagnose = [&]() noexcept
+  {
+    return BuildCheckpointDiagnosticV1(
+        fixture->staged, fixture->checkpoint, fixture->snapshot, 1, 0,
+        fixture->before, fixture->after, fixture->mirror);
+  };
+  const CheckpointDiagnosticV1 baseline = diagnose();
+  if (baseline.failure_mask != 0 || baseline.substage_mask != 0 ||
+      baseline.event_count != 4 || baseline.sync_delta != 2)
+    return false;
+
+  for (unsigned bit = 0; bit < 20; ++bit)
+  {
+    InitializeCheckpointDiagnosticFixture(*fixture);
+    auto& checkpoint = fixture->checkpoint;
+    auto& snapshot = fixture->snapshot;
+    switch (bit)
+    {
+      case 0: fixture->staged = false; break;
+      case 1: checkpoint.schema = 0; break;
+      case 2: checkpoint.source_rank = -1; break;
+      case 3: ++checkpoint.attempt.sequence; break;
+      case 4: checkpoint.facade_incarnation = 0; break;
+      case 5: checkpoint.output_staged = true; break;
+      case 6: ++snapshot.candidate_interior_hash.bytes[0]; break;
+      case 7: ++snapshot.candidate_trace_hash.bytes[0]; break;
+      case 8: ++snapshot.candidate_local_interior_hash.bytes[0]; break;
+      case 9: ++snapshot.candidate_local_trace_hash.bytes[0]; break;
+      case 10: ++snapshot.interior_coefficients; break;
+      case 11: ++snapshot.true_trace_coefficients; break;
+      case 12: ++checkpoint.staging_generation; break;
+      case 13:
+        checkpoint.trace_source_token = checkpoint.interior_source_token;
+        fixture->after.events[1].destination_token =
+            checkpoint.trace_source_token;
+        fixture->after.events[3].source_token = checkpoint.trace_source_token;
+        RefreshCheckpointEventEndpoint(fixture->after.events[1]);
+        RefreshCheckpointEventEndpoint(fixture->after.events[3]);
+        checkpoint.staging_range.ordered_digest =
+            IndependentCheckpointRangeDigest(fixture->after, 1, 4);
+        break;
+      case 14: checkpoint.interior[0] += 1.0; break;
+      case 15: checkpoint.owned_true_trace[0] += 1.0; break;
+      case 16: checkpoint.staging_range.complete = false; break;
+      case 17: checkpoint.staging_range.ordered_digest ^= 1; break;
+      case 18: fixture->mirror = false; break;
+      case 19:
+        fixture->after.events[0].endpoint_token = 0;
+        checkpoint.staging_range.ordered_digest =
+            IndependentCheckpointRangeDigest(fixture->after, 1, 4);
+        break;
+    }
+    if (diagnose().failure_mask != (std::uint64_t{1} << bit))
+      return false;
+  }
+
+  for (unsigned bit = 0; bit < 10; ++bit)
+  {
+    InitializeCheckpointDiagnosticFixture(*fixture);
+    switch (bit)
+    {
+      case 0:
+      case 1:
+      case 3:
+      case 4:
+        fixture->after.events[bit < 2 ? bit : bit - 1].success = false;
+        fixture->after.totals.complete = false;
+        break;
+      case 2:
+        RestrictCheckpointFixtureToD2D(*fixture);
+        break;
+      case 5:
+        fixture->staged = false;
+        fixture->after.totals.complete = false;
+        break;
+      case 6: fixture->checkpoint.interior[0] += 1.0; break;
+      case 7: fixture->checkpoint.owned_true_trace[0] += 1.0; break;
+      case 8: fixture->staged = false; break;
+      case 9: fixture->checkpoint.staging_range.complete = false; break;
+    }
+    if (diagnose().substage_mask != (std::uint64_t{1} << bit))
+      return false;
+  }
+  return true;
 }
 
 bool ExactTickets(const CudaStepEvidence& evidence) noexcept
@@ -1216,9 +1471,7 @@ void ReportSetupFailure(const char* const context, const bool initialized,
                         const CudaRunEvidence& setup,
                         const int expected_ranks) noexcept
 {
-  int rank = -1;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  if (rank != 0) { return; }
+  if (setup.rank != 0) { return; }
   std::cerr << "SETUP_FAIL initialized=" << (initialized ? 1 : 0)
             << " mask=0x" << std::hex << failure_mask << std::dec
             << " context=" << context
@@ -1283,6 +1536,182 @@ bool InitializePositive(Engine& engine, CudaRunEvidence& setup,
   {
     ReportSetupFailure(context, initialized, failure_mask, setup, ranks);
     return false;
+  }
+  return true;
+}
+
+enum class ArenaReleaseFault : unsigned char
+{
+  none,
+  vector_alias,
+  double_registration,
+  integer_registration,
+  integer_raw_retryable,
+  double_raw_retryable,
+  integer_raw_quarantined,
+  double_raw_quarantined
+};
+
+struct ArenaReleaseFixtureOperations
+{
+  bool integer_present = true;
+  bool double_present = true;
+  ArenaReleaseFault fault = ArenaReleaseFault::none;
+  bool fault_consumed = false;
+  bool wrappers_inert = false;
+  bool views_cleared = false;
+  std::array<unsigned char, 12> calls{};
+  std::size_t call_count = 0;
+
+  void Record(const unsigned char call) noexcept
+  { if (call_count < calls.size()) calls[call_count++] = call; }
+  bool FailOnce(const ArenaReleaseFault selected) noexcept
+  {
+    if (fault != selected || fault_consumed) { return false; }
+    fault_consumed = true;
+    return true;
+  }
+  bool HasIntegerArena() const noexcept { return integer_present; }
+  bool HasDoubleArena() const noexcept { return double_present; }
+  bool ReleaseVectorAlias() noexcept
+  { Record(1); return !FailOnce(ArenaReleaseFault::vector_alias); }
+  bool ReleaseDoubleRegistration() noexcept
+  { Record(2); return !FailOnce(ArenaReleaseFault::double_registration); }
+  bool ReleaseIntegerRegistration() noexcept
+  { Record(3); return !FailOnce(ArenaReleaseFault::integer_registration); }
+  void MakeWrappersInert() noexcept
+  { Record(4); wrappers_inert = true; }
+  void ClearViews() noexcept
+  { Record(5); views_cleared = true; }
+  cuda_detail::CudaRawReleaseResult ReleaseIntegerArena() noexcept
+  {
+    Record(6);
+    if (FailOnce(ArenaReleaseFault::integer_raw_retryable))
+      return cuda_detail::CudaRawReleaseResult::retryable;
+    if (FailOnce(ArenaReleaseFault::integer_raw_quarantined))
+      return cuda_detail::CudaRawReleaseResult::quarantined;
+    integer_present = false;
+    return cuda_detail::CudaRawReleaseResult::released;
+  }
+  cuda_detail::CudaRawReleaseResult ReleaseDoubleArena() noexcept
+  {
+    Record(7);
+    if (FailOnce(ArenaReleaseFault::double_raw_retryable))
+      return cuda_detail::CudaRawReleaseResult::retryable;
+    if (FailOnce(ArenaReleaseFault::double_raw_quarantined))
+      return cuda_detail::CudaRawReleaseResult::quarantined;
+    double_present = false;
+    return cuda_detail::CudaRawReleaseResult::released;
+  }
+};
+
+bool ExactArenaReleaseCalls(const ArenaReleaseFixtureOperations& operations,
+                            const std::initializer_list<unsigned char> expected)
+    noexcept
+{
+  if (operations.call_count != expected.size()) { return false; }
+  std::size_t index = 0;
+  for (const unsigned char call : expected)
+    if (operations.calls[index++] != call) { return false; }
+  return true;
+}
+
+bool ArenaReleaseStateMachineFixtures() noexcept
+{
+  using cuda_detail::CudaArenaOwnership;
+  using cuda_detail::CudaArenaReleaseState;
+  using cuda_detail::ReleaseCudaArenas;
+  {
+    CudaArenaReleaseState state{};
+    ArenaReleaseFixtureOperations operations{};
+    const auto first = ReleaseCudaArenas(state, operations);
+    const std::size_t first_calls = operations.call_count;
+    const auto second = ReleaseCudaArenas(state, operations);
+    if (!first.complete || first.failure_mask != 0 || first.pass != 1 ||
+        first.integer != CudaArenaOwnership::released ||
+        first.doubles != CudaArenaOwnership::released ||
+        !second.complete || !second.idempotent || second.pass != 2 ||
+        operations.call_count != first_calls ||
+        !ExactArenaReleaseCalls(operations, {1, 2, 3, 5, 6, 7}))
+      return false;
+  }
+  const std::array<ArenaReleaseFault, 3> wrapper_faults{{
+      ArenaReleaseFault::vector_alias,
+      ArenaReleaseFault::double_registration,
+      ArenaReleaseFault::integer_registration}};
+  for (std::size_t index = 0; index < wrapper_faults.size(); ++index)
+  {
+    CudaArenaReleaseState state{};
+    ArenaReleaseFixtureOperations operations{};
+    operations.fault = wrapper_faults[index];
+    const auto first = ReleaseCudaArenas(state, operations);
+    const std::size_t first_calls = operations.call_count;
+    const auto second = ReleaseCudaArenas(state, operations);
+    const std::uint64_t expected = std::uint64_t{1} << index;
+    const bool integer_retained =
+        first.integer == CudaArenaOwnership::mfem_retained;
+    const bool double_disposed = index < 2
+        ? first.doubles == CudaArenaOwnership::mfem_retained
+        : first.doubles == CudaArenaOwnership::quarantined;
+    if (first.complete || first.failure_mask != expected ||
+        !integer_retained || !double_disposed || !operations.wrappers_inert ||
+        !operations.views_cleared || !second.idempotent || second.complete ||
+        operations.call_count != first_calls)
+      return false;
+  }
+  const std::array<ArenaReleaseFault, 2> retryable_faults{{
+      ArenaReleaseFault::integer_raw_retryable,
+      ArenaReleaseFault::double_raw_retryable}};
+  for (std::size_t index = 0; index < retryable_faults.size(); ++index)
+  {
+    CudaArenaReleaseState state{};
+    ArenaReleaseFixtureOperations operations{};
+    operations.fault = retryable_faults[index];
+    const auto first = ReleaseCudaArenas(state, operations);
+    const std::size_t first_calls = operations.call_count;
+    const auto second = ReleaseCudaArenas(state, operations);
+    const std::uint64_t expected = std::uint64_t{1} << (index + 3);
+    if (first.complete || first.failure_mask != expected ||
+        !second.complete || second.idempotent || second.failure_mask != 0 ||
+        operations.call_count != first_calls + (index == 0 ? 2 : 1))
+      return false;
+  }
+  const std::array<ArenaReleaseFault, 2> quarantine_faults{{
+      ArenaReleaseFault::integer_raw_quarantined,
+      ArenaReleaseFault::double_raw_quarantined}};
+  for (std::size_t index = 0; index < quarantine_faults.size(); ++index)
+  {
+    CudaArenaReleaseState state{};
+    ArenaReleaseFixtureOperations operations{};
+    operations.fault = quarantine_faults[index];
+    const auto first = ReleaseCudaArenas(state, operations);
+    const std::size_t first_calls = operations.call_count;
+    const auto second = ReleaseCudaArenas(state, operations);
+    const std::uint64_t expected =
+        (std::uint64_t{1} << (index + 3)) |
+        cuda_detail::arena_raw_release_quarantined;
+    if (first.complete || first.failure_mask != expected ||
+        !second.idempotent || second.complete ||
+        operations.call_count != first_calls)
+      return false;
+  }
+  {
+    CudaArenaReleaseState state{};
+    ArenaReleaseFixtureOperations operations{};
+    operations.integer_present = false;
+    operations.fault = ArenaReleaseFault::double_raw_retryable;
+    const auto first = ReleaseCudaArenas(state, operations);
+    const std::size_t first_calls = operations.call_count;
+    const auto second = ReleaseCudaArenas(state, operations);
+    const std::size_t second_calls = operations.call_count;
+    const auto third = ReleaseCudaArenas(state, operations);
+    if (first.complete ||
+        first.failure_mask != cuda_detail::arena_double_raw_release_failure ||
+        first.integer != CudaArenaOwnership::none || !second.complete ||
+        second.failure_mask != 0 || third.pass != 3 || !third.idempotent ||
+        operations.call_count != second_calls || second_calls != first_calls + 1 ||
+        !ExactArenaReleaseCalls(operations, {1, 2, 3, 5, 7, 7}))
+      return false;
   }
   return true;
 }
@@ -1354,11 +1783,9 @@ bool RunArenaTeardown(const int ranks, const char* const context) noexcept
 }
 
 template <typename Backend>
-bool RunConfigConsensusNegative(const int ranks) noexcept
+bool RunConfigConsensusNegative(const int ranks, const int rank) noexcept
 {
   if (ranks != 2) { return true; }
-  int rank = -1;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   CudaConfig config = Config(ranks, rank != 0);
   config.injection.enabled = true;
   config.injection.target_step = 2;
@@ -1429,21 +1856,18 @@ bool VerifyOracleAndMutations(const CudaOraclePod& pod) noexcept
 
 bool OracleIdentity(const CudaOraclePod& pod,
                     const CudaPrecommitSnapshot& snapshot,
-                    const int ranks) noexcept
+                    const int ranks, const int rank) noexcept
 {
-  int rank = -1;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   return pod.rank == rank && pod.ranks == ranks &&
       pod.attempt_sequence == snapshot.attempt.sequence &&
       pod.product_generation == snapshot.products.residual_generation &&
       pod.product_generation != 0 && pod.dt == fixed_dt;
 }
 
-void ReportCommitFailure(const char* const stage, const bool retry,
+void ReportCommitFailure(const int rank, const char* const stage,
+                         const bool retry,
                          const std::uint64_t target_step) noexcept
 {
-  int rank = -1;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   if (rank == 0)
   {
     std::cerr << "COMMIT_FAIL stage=" << stage
@@ -1452,11 +1876,9 @@ void ReportCommitFailure(const char* const stage, const bool retry,
   }
 }
 
-void ReportTokenFailure(const char* const stage,
+void ReportTokenFailure(const int rank, const char* const stage,
                         const CudaTokenFault fault) noexcept
 {
-  int rank = -1;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   if (rank == 0)
   {
     std::cerr << "TOKEN_FAIL stage=" << stage
@@ -1467,7 +1889,7 @@ void ReportTokenFailure(const char* const stage,
 template <typename Engine>
 bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
                              const std::uint64_t target_step,
-                             const int ranks,
+                             const int ranks, const int rank,
                              const std::uint64_t allocation_baseline,
                              CudaSerializedCheckpointV1& checkpoint,
                              const bool mutate_oracle = false,
@@ -1482,7 +1904,7 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
   const auto* contract = engine.contract();
   if (contract == nullptr)
   {
-    ReportCommitFailure("contract", retry, target_step);
+    ReportCommitFailure(rank, "contract", retry, target_step);
     return false;
   }
   const StateCoordinates old_coordinates = contract->coordinates();
@@ -1502,7 +1924,7 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
       !SameCoordinates(visible, old_coordinates) || !ExactPolicyLedgers();
   if (prepare_step_failed)
   {
-    ReportCommitFailure("prepare-step", retry, target_step);
+    ReportCommitFailure(rank, "prepare-step", retry, target_step);
     return false;
   }
   if (captured != nullptr) { *captured = snapshot; }
@@ -1537,31 +1959,29 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
       !checkpoint_ledger_mirror;
   if (checkpoint_stage_failed)
   {
-    int rank = -1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     const CheckpointDiagnosticV1 diagnostic = BuildCheckpointDiagnosticV1(
         checkpoint_stage_return, checkpoint, snapshot, ranks, rank,
         checkpoint_ledger_before, checkpoint_ledger_after,
         checkpoint_ledger_mirror);
     ReportCheckpointDiagnosticV1(
-        case_id, retry, target_step, checkpoint, snapshot,
+        case_id, rank, retry, target_step, checkpoint, snapshot,
         checkpoint_ledger_before, checkpoint_ledger_after,
         AuditedTransport::Accounting(), diagnostic);
-    ReportCommitFailure("checkpoint-stage", retry, target_step);
+    ReportCommitFailure(rank, "checkpoint-stage", retry, target_step);
     return false;
   }
 
   auto staged_oracle = std::make_unique<CudaOraclePod>();
   const bool oracle_output_stage_failed =
       !engine.StagePreparedOracle(*staged_oracle, evidence) ||
-      !OracleIdentity(*staged_oracle, snapshot, ranks) ||
+      !OracleIdentity(*staged_oracle, snapshot, ranks, rank) ||
       !cuda_w8a_test_oracle::Verify(*staged_oracle) ||
       (mutate_oracle && !VerifyOracleAndMutations(*staged_oracle)) ||
       !engine.MarkOutputStaged(checkpoint) || !checkpoint.output_staged ||
       checkpoint.successful_commit || !ExactPolicyLedgers();
   if (oracle_output_stage_failed)
   {
-    ReportCommitFailure("oracle/output-stage", retry, target_step);
+    ReportCommitFailure(rank, "oracle/output-stage", retry, target_step);
     return false;
   }
 
@@ -1577,7 +1997,7 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
       !SameCoordinates(visible, old_coordinates) || !ExactPolicyLedgers();
   if (prepare_commit_failed)
   {
-    ReportCommitFailure("prepare/commit", retry, target_step);
+    ReportCommitFailure(rank, "prepare/commit", retry, target_step);
     return false;
   }
 
@@ -1598,19 +2018,19 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
       !ExactAttemptEvidence(evidence, ranks);
   if (finalize_failed)
   {
-    ReportCommitFailure("finalize", retry, target_step);
+    ReportCommitFailure(rank, "finalize", retry, target_step);
     return false;
   }
 
   auto exported = std::make_unique<CudaOraclePod>();
   const bool export_valid = engine.ExportOracle(*exported) &&
-      OracleIdentity(*exported, snapshot, ranks) &&
+      OracleIdentity(*exported, snapshot, ranks, rank) &&
       cuda_w8a_test_oracle::Verify(*exported) &&
       AuditedAllocator::W8OwnedAllocationCalls() ==
           owned_allocation_calls &&
       ExactPolicyLedgers();
   if (!export_valid)
-    ReportCommitFailure("export", retry, target_step);
+    ReportCommitFailure(rank, "export", retry, target_step);
   return export_valid;
 }
 
@@ -1631,7 +2051,8 @@ bool RunLifecycle(const int ranks,
       return false;
     const std::uint64_t allocations = setup.reuse.baseline_allocation_events;
     CudaSerializedCheckpointV1 checkpoint{};
-    if (!CommitSuccessfulAttempt(*engine, false, 1, ranks, allocations,
+    if (!CommitSuccessfulAttempt(*engine, false, 1, ranks, setup.rank,
+                                 allocations,
                                  checkpoint, false, nullptr, context))
     {
       return false;
@@ -1675,9 +2096,11 @@ bool RunLifecycle(const int ranks,
       return false;
     }
 
-    if (!CommitSuccessfulAttempt(*engine, true, 2, ranks, allocations,
+    if (!CommitSuccessfulAttempt(*engine, true, 2, ranks, setup.rank,
+                                 allocations,
                                  checkpoint, false, nullptr, context) ||
-        !CommitSuccessfulAttempt(*engine, false, 3, ranks, allocations,
+        !CommitSuccessfulAttempt(*engine, false, 3, ranks, setup.rank,
+                                 allocations,
                                  final_checkpoint, true, nullptr, context))
     {
       return false;
@@ -1777,7 +2200,7 @@ bool RunFreshRestore(const int ranks,
     CudaSerializedCheckpointV1 continued_checkpoint{};
     CudaPrecommitSnapshot continued{};
     if (!CommitSuccessfulAttempt(
-            *engine, false, restored.step + 1, ranks,
+            *engine, false, restored.step + 1, ranks, setup.rank,
             setup.reuse.baseline_allocation_events, continued_checkpoint,
             false, &continued, context))
     {
@@ -1825,7 +2248,7 @@ bool RunProvisionalRevert(const int ranks,
     if (!engine->PrepareStep(false, snapshot, evidence)) { return false; }
     if (!StagePreparedCheckpointDiagnosed(
             *engine, checkpoint, evidence, snapshot, ranks, false, 1,
-            context) ||
+            context, setup.rank) ||
         !engine->StagePreparedOracle(*oracle, evidence) ||
         !cuda_w8a_test_oracle::Verify(*oracle) ||
         !engine->MarkOutputStaged(checkpoint) ||
@@ -1855,7 +2278,8 @@ bool RunProvisionalRevert(const int ranks,
     }
     CudaOraclePod unavailable{};
     if (engine->ExportOracle(unavailable)) { return false; }
-    return CommitSuccessfulAttempt(*engine, true, 1, ranks, allocations,
+    return CommitSuccessfulAttempt(*engine, true, 1, ranks, setup.rank,
+                                   allocations,
                                    checkpoint, true, nullptr, context) &&
         engine->contract()->telemetry().commits == 1;
   }();
@@ -1885,7 +2309,7 @@ bool RunPreparedAbort(const int ranks,
     if (!engine->PrepareStep(false, snapshot, evidence)) { return false; }
     if (!StagePreparedCheckpointDiagnosed(
             *engine, checkpoint, evidence, snapshot, ranks, false, 1,
-            context) ||
+            context, setup.rank) ||
         !engine->StagePreparedOracle(*oracle, evidence) ||
         !cuda_w8a_test_oracle::Verify(*oracle) ||
         !engine->MarkOutputStaged(checkpoint) ||
@@ -1909,7 +2333,8 @@ bool RunPreparedAbort(const int ranks,
     {
       return false;
     }
-    return CommitSuccessfulAttempt(*engine, true, 1, ranks, allocations,
+    return CommitSuccessfulAttempt(*engine, true, 1, ranks, setup.rank,
+                                   allocations,
                                    checkpoint, true, nullptr, context) &&
         engine->contract()->telemetry().commits == 1;
   }();
@@ -1938,7 +2363,8 @@ bool RunStagingFailure(const int ranks,
     if (!engine->PrepareStep(false, snapshot, evidence)) { return false; }
     AuditedTransport::fail_checkpoint_trace_once = true;
     const bool staged = StagePreparedCheckpointDiagnosed(
-        *engine, checkpoint, evidence, snapshot, ranks, false, 1, context);
+        *engine, checkpoint, evidence, snapshot, ranks, false, 1, context,
+        setup.rank);
     if (staged ||
         AuditedTransport::fail_checkpoint_trace_once ||
         checkpoint.checkpoint_staged || checkpoint.output_staged ||
@@ -1959,7 +2385,8 @@ bool RunStagingFailure(const int ranks,
     {
       return false;
     }
-    return CommitSuccessfulAttempt(*engine, true, 1, ranks, allocations,
+    return CommitSuccessfulAttempt(*engine, true, 1, ranks, setup.rank,
+                                   allocations,
                                    checkpoint, true, nullptr, context) &&
         engine->contract()->telemetry().commits == 1;
   }();
@@ -1984,13 +2411,13 @@ bool RunTokenFault(const int ranks, const CudaTokenFault fault,
     {
       CudaSerializedCheckpointV1 checkpoint{};
       const bool final_valid = CommitSuccessfulAttempt(
-          *engine, false, 1, ranks,
+          *engine, false, 1, ranks, setup.rank,
           setup.reuse.baseline_allocation_events, checkpoint, true, nullptr,
           context) &&
           engine->contract()->telemetry()
                   .out_of_order_product_issues_rejected == 1;
       if (!final_valid)
-        ReportTokenFailure("final", fault);
+        ReportTokenFailure(setup.rank, "final", fault);
       return final_valid;
     }
 
@@ -2000,18 +2427,18 @@ bool RunTokenFault(const int ranks, const CudaTokenFault fault,
     auto oracle = std::make_unique<CudaOraclePod>();
     if (!engine->PrepareStep(false, snapshot, evidence))
     {
-      ReportTokenFailure("precommit", fault);
+      ReportTokenFailure(setup.rank, "precommit", fault);
       return false;
     }
     const bool precommit_failed =
         !StagePreparedCheckpointDiagnosed(
             *engine, checkpoint, evidence, snapshot, ranks, false, 1,
-            context) ||
+            context, setup.rank) ||
         !engine->StagePreparedOracle(*oracle, evidence) ||
         !engine->MarkOutputStaged(checkpoint);
     if (precommit_failed)
     {
-      ReportTokenFailure("precommit", fault);
+      ReportTokenFailure(setup.rank, "precommit", fault);
       return false;
     }
     const bool progressed_to_rollback =
@@ -2030,7 +2457,7 @@ bool RunTokenFault(const int ranks, const CudaTokenFault fault,
             setup.reuse.baseline_allocation_events &&
         ExactAttemptEvidence(evidence, ranks);
     if (!final_valid)
-      ReportTokenFailure("final", fault);
+      ReportTokenFailure(setup.rank, "final", fault);
     return final_valid;
   }();
   engine.reset();
@@ -2253,12 +2680,8 @@ bool Global(const bool local) noexcept
                        MPI_COMM_WORLD) == MPI_SUCCESS && all == 1;
 }
 
-bool CollectiveCaseBoundaryRegression() noexcept
+bool CollectiveCaseBoundaryRegression(const int rank, const int ranks) noexcept
 {
-  int rank = -1;
-  int ranks = 0;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
   if (ranks == 1) { return true; }
   const bool rank_local_failure_rejected = !Global(rank == 0);
   const bool all_ranks_reenter_next_boundary = Global(true);
@@ -2271,7 +2694,9 @@ int main(int argc, char** argv)
   mfem::Mpi::Init(argc, argv);
   mfem::Device device("cuda");
   (void)device;
+  int rank = 0;
   int ranks = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
   const bool token_mode = argc == 2 &&
       std::string_view(argv[1]) == "--token-negatives";
@@ -2282,8 +2707,6 @@ int main(int argc, char** argv)
     const bool collective_result = Global(local_result);
     if (!collective_result)
     {
-      int rank = 0;
-      MPI_Comm_rank(MPI_COMM_WORLD, &rank);
       if (rank == 0)
         std::cerr << "FAILED " << case_label << '\n';
     }
@@ -2298,11 +2721,9 @@ int main(int argc, char** argv)
     run_case("rank1.common.shared-contract-negatives",
              DirectSharedContractNegatives());
     run_case("rank1.common.collective-case-boundary",
-             CollectiveCaseBoundaryRegression());
-    run_case("rank1.common.checkpoint-diagnostic-v1",
-             CheckpointDiagnosticNonVacuity());
+             CollectiveCaseBoundaryRegression(rank, ranks));
     run_case("rank1.config.consensus-negative",
-             RunConfigConsensusNegative<TestRankOneBackendTag>(1));
+             RunConfigConsensusNegative<TestRankOneBackendTag>(1, rank));
     if (token_mode)
     {
       run_case("rank1.token.omit-solution",
@@ -2323,9 +2744,6 @@ int main(int argc, char** argv)
     }
     else
     {
-      run_case("rank1.teardown.idempotent",
-               RunArenaTeardown<TestRankOneBackendTag>(
-                   1, "rank1.teardown.idempotent"));
       CudaSerializedCheckpointV1 checkpoint{};
       run_case("rank1.lifecycle",
                RunLifecycle<TestRankOneBackendTag>(
@@ -2346,6 +2764,13 @@ int main(int argc, char** argv)
                RunStagingFailure<TestRankOneBackendTag>(
                    1, "rank1.staging-failure"));
     }
+    run_case("rank1.diagnostic.checkpoint-v1-exact",
+             CheckpointDiagnosticExactFixtures());
+    run_case("rank1.teardown.state-machine",
+             ArenaReleaseStateMachineFixtures());
+    run_case("rank1.teardown.idempotent",
+             RunArenaTeardown<TestRankOneBackendTag>(
+                 1, "rank1.teardown.idempotent"));
   }
   else if (ranks == 2)
   {
@@ -2356,11 +2781,9 @@ int main(int argc, char** argv)
     run_case("rank2.common.shared-contract-negatives",
              DirectSharedContractNegatives());
     run_case("rank2.common.collective-case-boundary",
-             CollectiveCaseBoundaryRegression());
-    run_case("rank2.common.checkpoint-diagnostic-v1",
-             CheckpointDiagnosticNonVacuity());
+             CollectiveCaseBoundaryRegression(rank, ranks));
     run_case("rank2.config.consensus-negative",
-             RunConfigConsensusNegative<TestRankTwoBackendTag>(2));
+             RunConfigConsensusNegative<TestRankTwoBackendTag>(2, rank));
     if (token_mode)
     {
       run_case("rank2.token.omit-solution",
@@ -2401,6 +2824,13 @@ int main(int argc, char** argv)
                RunStagingFailure<TestRankTwoBackendTag>(
                    2, "rank2.staging-failure"));
     }
+    run_case("rank2.diagnostic.checkpoint-v1-exact",
+             CheckpointDiagnosticExactFixtures());
+    run_case("rank2.teardown.state-machine",
+             ArenaReleaseStateMachineFixtures());
+    run_case("rank2.teardown.idempotent",
+             RunArenaTeardown<TestRankTwoBackendTag>(
+                 2, "rank2.teardown.idempotent"));
   }
   else
   {
@@ -2411,16 +2841,16 @@ int main(int argc, char** argv)
     run_case("unsupported.common.shared-contract-negatives",
              DirectSharedContractNegatives());
     run_case("unsupported.common.collective-case-boundary",
-             CollectiveCaseBoundaryRegression());
-    run_case("unsupported.common.checkpoint-diagnostic-v1",
-             CheckpointDiagnosticNonVacuity());
+             CollectiveCaseBoundaryRegression(rank, ranks));
+    run_case("unsupported.diagnostic.checkpoint-v1-exact",
+             CheckpointDiagnosticExactFixtures());
+    run_case("unsupported.teardown.state-machine",
+             ArenaReleaseStateMachineFixtures());
     pass = false;
   }
 
   if (!Global(pass))
   {
-    int rank = 0;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     if (rank == 0)
       std::cerr << "persistent CUDA W8A leaf audit failed\n";
     return 1;

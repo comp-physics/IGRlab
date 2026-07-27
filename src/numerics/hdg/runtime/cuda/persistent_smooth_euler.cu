@@ -392,10 +392,10 @@ bool UmpireDeviceAllocatorPolicy::Allocate(
 #endif
 }
 
-void UmpireDeviceAllocatorPolicy::Deallocate(
+bool UmpireDeviceAllocatorPolicy::Deallocate(
     void* pointer, const CudaAllocationSite site) noexcept
 {
-  if (pointer == nullptr) { return; }
+  if (pointer == nullptr) { return true; }
   std::uint64_t original_bytes = 0;
   std::uint64_t original_alignment = 0;
   std::uint64_t original_generation = 0;
@@ -429,6 +429,7 @@ void UmpireDeviceAllocatorPolicy::Deallocate(
   RecordAllocation(site, static_cast<std::size_t>(original_bytes),
                    static_cast<std::size_t>(original_alignment), pointer,
                    false, success, original_generation);
+  return success;
 }
 
 void UmpireDeviceAllocatorPolicy::ResetLedger() noexcept

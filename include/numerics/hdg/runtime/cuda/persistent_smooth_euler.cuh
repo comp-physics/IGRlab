@@ -46,7 +46,8 @@ struct UmpireDeviceAllocatorPolicy
   static bool PrepareDeviceArenaAllocator() noexcept;
   static bool Allocate(std::size_t bytes, std::size_t alignment,
                        CudaAllocationSite site, void*& pointer) noexcept;
-  static void Deallocate(void* pointer, CudaAllocationSite site) noexcept;
+  /** Return true only when the policy attests the exact release completed. */
+  static bool Deallocate(void* pointer, CudaAllocationSite site) noexcept;
   static std::uint64_t AllocationEvents() noexcept;
   static std::uint64_t W8OwnedAllocationCalls() noexcept;
   static std::uint64_t DeallocationEvents() noexcept;
