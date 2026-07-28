@@ -1666,6 +1666,10 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
                          uninterrupted_checkpoint.valid &&
                          uninterrupted_checkpoint.descriptor.coordinates.step ==
                              cpu_functional_checkpoint_step &&
+                         uninterrupted_checkpoint.descriptor.polynomial_order ==
+                             cpu_functional_polynomial_order &&
+                         uninterrupted_checkpoint.descriptor.layout.view() ==
+                             cpu_detail::cpu_runtime_layout_identity &&
                          NearTime(uninterrupted_checkpoint.descriptor
                                       .coordinates.time,
                                   0.5) &&
@@ -2034,6 +2038,10 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
   CpuCheckpoint checkpoint;
   checks.Require(adapter.CaptureCheckpoint(checkpoint) && checkpoint.valid &&
                      checkpoint.descriptor.coordinates.step == 1 &&
+                     checkpoint.descriptor.polynomial_order ==
+                         cpu_smoke_polynomial_order &&
+                     checkpoint.descriptor.layout.view() ==
+                         cpu_detail::cpu_runtime_layout_identity &&
                      checkpoint.owned_allocation_event_count == 3,
                  "in-memory committed checkpoint capture");
 

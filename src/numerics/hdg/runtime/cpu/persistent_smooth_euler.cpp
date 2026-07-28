@@ -39,8 +39,6 @@ constexpr std::string_view expected_time = "backward_euler";
 constexpr std::string_view expected_precision = "fp64";
 constexpr std::string_view expected_mfem_pin =
     "d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec";
-constexpr std::string_view expected_layout =
-    "mfem.l2_byNODES+mfem.true_trace_byNODES.p1.n3";
 
 using State = std::array<double, cpu_conserved_components>;
 using Matrix4 =
@@ -4104,7 +4102,8 @@ bool detail::CpuNumericsCore::Initialize(
   resources.topology_hash = topology_hash;
   resources.rank_count = static_cast<std::uint32_t>(state.ranks);
   resources.polynomial_order = config.polynomial_order;
-  resources.layout = StableIdentity::Copy(expected_layout);
+  resources.layout =
+      StableIdentity::Copy(detail::cpu_runtime_layout_identity);
   const std::size_t state_bytes =
       (state.Committed()->interior.capacity() +
        state.Committed()->trace.capacity()) * sizeof(double);

@@ -27,6 +27,14 @@
 namespace dg::hdg::runtime::cpu
 {
 
+namespace detail
+{
+
+inline constexpr std::string_view cpu_runtime_layout_identity =
+    "l2-interior.true-trace-owned.component-major.v1";
+
+} // namespace detail
+
 inline constexpr int cpu_dimension = 2;
 inline constexpr int cpu_conserved_components = 4;
 inline constexpr int cpu_smoke_polynomial_order = 1;
