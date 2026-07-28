@@ -548,13 +548,22 @@ BuildPersistentTrueSystem() noexcept
   // Warm the persistent Krylov/factor workspaces before the allocation
   // baseline. The topology matrix is deliberately diagonally dominant here;
   // each real generation overwrites only its already-fixed numerical values.
-  *hypre_rhs_ = 0.0;
+  // A deterministic nonzero RHS forces the setup path to materialize the
+  // persistent solver workspace instead of accepting an identity no-op.
+  *hypre_rhs_ = 1.0;
   *hypre_solution_ = 0.0;
   CudaSolveDiagnostics warm{};
-  const bool warmed = CudaRefreshFactorAndSolve(
+  const bool warm_solved = CudaRefreshFactorAndSolve(
       *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_, ranks_,
-      0, warm) && warm.device_policy && warm.configured_ilu0 &&
+      0, warm);
+  const bool warmed = warm_solved && warm.device_policy &&
+      warm.configured_ilu0 &&
       warm.matrix_generation == 0;
+  if (warm_solved)
+  {
+    *hypre_rhs_ = 0.0;
+    *hypre_solution_ = 0.0;
+  }
   return CollectiveContinue(warmed);
 }
 

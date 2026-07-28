@@ -7,6 +7,7 @@
 #include <umpire/ResourceManager.hpp>
 #include <umpire/Umpire.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -753,6 +754,20 @@ CollectiveRestoreReport CudaMpiCollectivePolicy::ReduceRestore(
 
 namespace detail
 {
+bool CudaCopyHypreBigIntHost(
+    HYPRE_BigInt* const destination,
+    const std::size_t destination_capacity,
+    const HYPRE_BigInt* const source, const int count) noexcept
+{
+  if (count < 0) { return false; }
+  const std::size_t exact_count = static_cast<std::size_t>(count);
+  if (exact_count > destination_capacity) { return false; }
+  if (exact_count == 0) { return true; }
+  if (destination == nullptr || source == nullptr) { return false; }
+  std::copy_n(source, exact_count, destination);
+  return true;
+}
+
 void CudaTrueSystemDiagnosticMarker(
     const char* const stage, const char* const edge, const bool result,
     const std::uint64_t generation) noexcept
@@ -796,14 +811,17 @@ bool CudaGetTrueMatrixStructure(
     hypre_ParCSRMatrix* raw = matrix;
     auto* diag = hypre_ParCSRMatrixDiag(raw);
     auto* offd = hypre_ParCSRMatrixOffd(raw);
+    const HYPRE_Int diag_nonzeros = hypre_CSRMatrixNumNonzeros(diag);
+    const HYPRE_Int offd_nonzeros = hypre_CSRMatrixNumNonzeros(offd);
+    if (owned_count < 0 || owned_count > maximum_true_trace_dofs ||
+        diag_nonzeros < 0 || offd_nonzeros < 0 ||
+        diag_nonzeros > maximum_true_matrix_entries ||
+        offd_nonzeros > maximum_true_matrix_entries - diag_nonzeros)
+      return false;
     structure = {};
     structure.rows = owned_count;
-    structure.diag_nonzeros = hypre_CSRMatrixNumNonzeros(diag);
-    structure.offd_nonzeros = hypre_CSRMatrixNumNonzeros(offd);
-    if (owned_count > maximum_true_trace_dofs ||
-        structure.diag_nonzeros + structure.offd_nonzeros >
-            maximum_true_matrix_entries)
-      return false;
+    structure.diag_nonzeros = static_cast<int>(diag_nonzeros);
+    structure.offd_nonzeros = static_cast<int>(offd_nonzeros);
     const HYPRE_Int* di = hypre_CSRMatrixI(diag);
     const HYPRE_Int* dj = hypre_CSRMatrixJ(diag);
     const HYPRE_Int* oi = hypre_CSRMatrixI(offd);
@@ -832,20 +850,25 @@ bool CudaGetTrueMatrixStructure(
       return false;
     std::array<HYPRE_Int, maximum_true_matrix_entries> offd_columns{};
     std::array<HYPRE_BigInt, maximum_true_matrix_entries> offd_global{};
-    const int offd_column_count = hypre_CSRMatrixNumCols(offd);
-    if (offd_column_count > maximum_true_matrix_entries) { return false; }
+    const HYPRE_Int raw_offd_column_count = hypre_CSRMatrixNumCols(offd);
+    if (raw_offd_column_count < 0 ||
+        raw_offd_column_count > maximum_true_matrix_entries)
+      return false;
+    const int offd_column_count = static_cast<int>(raw_offd_column_count);
+    if ((structure.offd_nonzeros > 0 && offd_column_count == 0) ||
+        (offd_column_count > 0 && cmap == nullptr))
+      return false;
     const std::size_t offd_column_bytes =
         static_cast<std::size_t>(structure.offd_nonzeros) * sizeof(HYPRE_Int);
-    const std::size_t offd_global_bytes =
-        static_cast<std::size_t>(offd_column_count) * sizeof(HYPRE_BigInt);
     const bool offd_columns_copied = copy_out(
         offd_columns.data(), oj, offd_column_bytes,
         CudaTransferCategory::topology, CudaTransferSite::map_upload,
         offd_column_bytes, offd_columns.size() * sizeof(HYPRE_Int));
-    const bool offd_global_copied = copy_out(
-        offd_global.data(), cmap, offd_global_bytes,
-        CudaTransferCategory::topology, CudaTransferSite::map_upload,
-        offd_global_bytes, offd_global.size() * sizeof(HYPRE_BigInt));
+    // HYPRE 3.1 keeps col_map_offd in host storage even when the CSR J arrays
+    // are device resident.  This checked host copy intentionally emits no
+    // audited CUDA transfer event.
+    const bool offd_global_copied = CudaCopyHypreBigIntHost(
+        offd_global.data(), offd_global.size(), cmap, offd_column_count);
     const bool second_synchronized = synchronize(CudaTransferSite::map_upload);
     if (!offd_columns_copied || !offd_global_copied ||
         !second_synchronized)

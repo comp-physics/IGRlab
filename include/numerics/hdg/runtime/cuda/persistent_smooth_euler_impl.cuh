@@ -509,6 +509,10 @@ using CudaCopyOutFunction = bool (*)(
     CudaTransferSite, std::size_t, std::size_t) noexcept;
 using CudaSynchronizeFunction = bool (*)(CudaTransferSite) noexcept;
 
+bool CudaCopyHypreBigIntHost(HYPRE_BigInt* destination,
+                             std::size_t destination_capacity,
+                             const HYPRE_BigInt* source,
+                             int count) noexcept;
 bool CudaGetTrueMatrixStructure(mfem::HypreParMatrix& matrix,
                                 const std::int64_t* owned_global,
                                 int owned_count,

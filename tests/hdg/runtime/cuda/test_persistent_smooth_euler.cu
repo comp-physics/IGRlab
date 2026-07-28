@@ -770,6 +770,72 @@ bool ExactPolicyLedgers() noexcept
                  UmpireDeviceAllocatorPolicy::Ledger());
 }
 
+template <typename T>
+bool BitwiseUnchanged(const T& before, const T& after) noexcept
+{
+  static_assert(std::is_trivially_copyable<T>::value,
+                "ledger snapshots must be byte-comparable");
+  return std::memcmp(&before, &after, sizeof(T)) == 0;
+}
+
+bool HypreHostColumnMapCopyFixtures() noexcept
+{
+  const CudaAllocationLedgerV1 audited_allocation_before =
+      AuditedAllocator::Ledger();
+  const CudaAllocationLedgerV1 production_allocation_before =
+      UmpireDeviceAllocatorPolicy::Ledger();
+  const auto audited_transfer_before =
+      std::make_unique<CudaTransferLedgerV1>(AuditedTransport::Ledger());
+  const auto production_transfer_before =
+      std::make_unique<CudaTransferLedgerV1>(CudaTransportPolicy::Ledger());
+  const CudaTransferTotals audited_totals_before =
+      AuditedTransport::Accounting();
+  const CudaTransferTotals production_totals_before =
+      CudaTransportPolicy::Accounting();
+
+  HYPRE_BigInt scalar = 19;
+  const std::array<HYPRE_BigInt, 3> source{{
+      std::numeric_limits<HYPRE_BigInt>::min() + 31,
+      -17,
+      std::numeric_limits<HYPRE_BigInt>::max() - 31}};
+  constexpr HYPRE_BigInt tail_sentinel = 0x5a5a5a5a;
+  std::array<HYPRE_BigInt, 4> destination{{
+      tail_sentinel, tail_sentinel, tail_sentinel, tail_sentinel}};
+  const bool cases_exact =
+      cuda_detail::CudaCopyHypreBigIntHost(nullptr, 0, nullptr, 0) &&
+      !cuda_detail::CudaCopyHypreBigIntHost(&scalar, 1, nullptr, 1) &&
+      !cuda_detail::CudaCopyHypreBigIntHost(nullptr, 1, &scalar, 1) &&
+      !cuda_detail::CudaCopyHypreBigIntHost(&scalar, 1, &scalar, -1) &&
+      !cuda_detail::CudaCopyHypreBigIntHost(
+          destination.data(), 2, source.data(), 3) &&
+      cuda_detail::CudaCopyHypreBigIntHost(
+          destination.data(), destination.size(), source.data(), 3) &&
+      destination[0] == source[0] && destination[1] == source[1] &&
+      destination[2] == source[2] && destination[3] == tail_sentinel;
+
+  const CudaAllocationLedgerV1 audited_allocation_after =
+      AuditedAllocator::Ledger();
+  const CudaAllocationLedgerV1 production_allocation_after =
+      UmpireDeviceAllocatorPolicy::Ledger();
+  const auto audited_transfer_after =
+      std::make_unique<CudaTransferLedgerV1>(AuditedTransport::Ledger());
+  const auto production_transfer_after =
+      std::make_unique<CudaTransferLedgerV1>(CudaTransportPolicy::Ledger());
+  return cases_exact &&
+      BitwiseUnchanged(audited_allocation_before,
+                       audited_allocation_after) &&
+      BitwiseUnchanged(production_allocation_before,
+                       production_allocation_after) &&
+      BitwiseUnchanged(*audited_transfer_before,
+                       *audited_transfer_after) &&
+      BitwiseUnchanged(*production_transfer_before,
+                       *production_transfer_after) &&
+      BitwiseUnchanged(audited_totals_before,
+                       AuditedTransport::Accounting()) &&
+      BitwiseUnchanged(production_totals_before,
+                       CudaTransportPolicy::Accounting());
+}
+
 bool SameCoordinates(const StateCoordinates& left,
                      const StateCoordinates& right) noexcept
 {
@@ -2846,6 +2912,67 @@ bool Global(const bool local) noexcept
                        MPI_COMM_WORLD) == MPI_SUCCESS && all == 1;
 }
 
+constexpr bool ExpectedNegativeHypreStateAuthorized(
+    const int hypre_error, const cudaError_t cuda_error) noexcept
+{
+  return hypre_error == HYPRE_ERROR_GENERIC && cuda_error == cudaSuccess;
+}
+
+constexpr bool CleanHypreCudaStateAuthorized(
+    const int hypre_error, const cudaError_t cuda_error) noexcept
+{
+  return hypre_error == 0 && cuda_error == cudaSuccess;
+}
+
+bool ExpectedNegativeHypreAuthorizationFixtures() noexcept
+{
+  return ExpectedNegativeHypreStateAuthorized(
+             HYPRE_ERROR_GENERIC, cudaSuccess) &&
+      !ExpectedNegativeHypreStateAuthorized(0, cudaSuccess) &&
+      !ExpectedNegativeHypreStateAuthorized(
+          HYPRE_ERROR_MEMORY, cudaSuccess) &&
+      !ExpectedNegativeHypreStateAuthorized(HYPRE_ERROR_ARG, cudaSuccess) &&
+      !ExpectedNegativeHypreStateAuthorized(
+          HYPRE_ERROR_CONV, cudaSuccess) &&
+      !ExpectedNegativeHypreStateAuthorized(
+          HYPRE_ERROR_GENERIC | HYPRE_ERROR_MEMORY, cudaSuccess) &&
+      !ExpectedNegativeHypreStateAuthorized(
+          HYPRE_ERROR_GENERIC, cudaErrorInvalidValue) &&
+      !ExpectedNegativeHypreStateAuthorized(
+          HYPRE_ERROR_GENERIC, cudaErrorMemoryAllocation) &&
+      !ExpectedNegativeHypreStateAuthorized(
+          HYPRE_ERROR_GENERIC, cudaErrorUnknown);
+}
+
+template <typename Backend>
+bool RunRankTwoConfigConsensusBoundary(const int ranks,
+                                       const int rank) noexcept
+{
+  // Three collective gates keep every rank on one path: clean admission,
+  // exact expected-negative authorization, then exact post-clear admission.
+  if (ranks != 2) { return false; }
+  const int incoming_hypre = HYPRE_GetError();
+  const cudaError_t incoming_cuda = cudaPeekAtLastError();
+  const bool clean_prestate = Global(CleanHypreCudaStateAuthorized(
+      incoming_hypre, incoming_cuda));
+  if (!clean_prestate) { return false; }
+
+  const bool intended_negative =
+      RunConfigConsensusNegative<Backend>(ranks, rank);
+  const int negative_hypre = HYPRE_GetError();
+  const cudaError_t negative_cuda = cudaPeekAtLastError();
+  const bool negative_authorized = Global(
+      intended_negative && ExpectedNegativeHypreStateAuthorized(
+          negative_hypre, negative_cuda));
+  if (!negative_authorized) { return false; }
+
+  const HYPRE_Int clear_return = HYPRE_ClearError(HYPRE_ERROR_GENERIC);
+  const int cleared_hypre = HYPRE_GetError();
+  const cudaError_t cleared_cuda = cudaPeekAtLastError();
+  return Global(clear_return == 0 && CleanHypreCudaStateAuthorized(
+      cleared_hypre, cleared_cuda));
+}
+
 bool CollectiveCaseBoundaryRegression(const int rank, const int ranks) noexcept
 {
   if (ranks == 1) { return true; }
@@ -2941,6 +3068,7 @@ int main(int argc, char** argv)
         std::cerr << "FAILED " << case_label << '\n';
     }
     pass = pass && collective_result;
+    return collective_result;
   };
 #define run_case(case_label, ...) \
   run_case_impl(case_label, [&]() noexcept { return (__VA_ARGS__); })
@@ -2954,6 +3082,10 @@ int main(int argc, char** argv)
              DirectSharedContractNegatives());
     run_case("rank1.common.collective-case-boundary",
              CollectiveCaseBoundaryRegression(rank, ranks));
+    run_case("rank1.common.host-offd-map-copy",
+             HypreHostColumnMapCopyFixtures());
+    run_case("rank1.common.hypre-negative-authorization",
+             ExpectedNegativeHypreAuthorizationFixtures());
     run_case("rank1.config.consensus-negative",
              RunConfigConsensusNegative<TestRankOneBackendTag>(1, rank));
     if (token_mode)
@@ -3016,57 +3148,66 @@ int main(int argc, char** argv)
              DirectSharedContractNegatives());
     run_case("rank2.common.collective-case-boundary",
              CollectiveCaseBoundaryRegression(rank, ranks));
-    run_case("rank2.config.consensus-negative",
-             RunConfigConsensusNegative<TestRankTwoBackendTag>(2, rank));
-    if (token_mode)
+    run_case("rank2.common.host-offd-map-copy",
+             HypreHostColumnMapCopyFixtures());
+    run_case("rank2.common.hypre-negative-authorization",
+             ExpectedNegativeHypreAuthorizationFixtures());
+    const bool config_boundary_clean =
+        run_case("rank2.config.consensus-negative",
+                 RunRankTwoConfigConsensusBoundary<TestRankTwoBackendTag>(
+                     2, rank));
+    if (config_boundary_clean)
     {
-      run_case("rank2.token.omit-solution",
-               RunTokenFault<TestRankTwoBackendTag>(
-                   2, CudaTokenFault::omit_solution,
-                   FailureReason::missing_product,
-                   "rank2.token.omit-solution"));
-      run_case("rank2.token.stale-attempt",
-               RunTokenFault<TestRankTwoBackendTag>(
-                   2, CudaTokenFault::stale_attempt,
-                   FailureReason::missing_product,
-                   "rank2.token.stale-attempt"));
-      run_case("rank2.token.matrix-before-residual",
-               RunTokenFault<TestRankTwoBackendTag>(
-                   2, CudaTokenFault::issue_matrix_before_residual,
-                   FailureReason::none,
-                   "rank2.token.matrix-before-residual"));
+      if (token_mode)
+      {
+        run_case("rank2.token.omit-solution",
+                 RunTokenFault<TestRankTwoBackendTag>(
+                     2, CudaTokenFault::omit_solution,
+                     FailureReason::missing_product,
+                     "rank2.token.omit-solution"));
+        run_case("rank2.token.stale-attempt",
+                 RunTokenFault<TestRankTwoBackendTag>(
+                     2, CudaTokenFault::stale_attempt,
+                     FailureReason::missing_product,
+                     "rank2.token.stale-attempt"));
+        run_case("rank2.token.matrix-before-residual",
+                 RunTokenFault<TestRankTwoBackendTag>(
+                     2, CudaTokenFault::issue_matrix_before_residual,
+                     FailureReason::none,
+                     "rank2.token.matrix-before-residual"));
+      }
+      else
+      {
+        CudaSerializedCheckpointV1 checkpoint{};
+        run_case("rank2.lifecycle",
+                 RunLifecycle<TestRankTwoBackendTag>(
+                     2, checkpoint, "rank2.lifecycle"));
+        run_case("rank2.restore.corrupt",
+                 RunCorruptRestore<TestRankTwoBackendTag>(
+                     2, checkpoint, "rank2.restore.corrupt"));
+        run_case("rank2.restore.fresh",
+                 RunFreshRestore<TestRankTwoBackendTag>(
+                     2, checkpoint, "rank2.restore.fresh"));
+        run_case("rank2.provisional-revert",
+                 RunProvisionalRevert<TestRankTwoBackendTag>(
+                     2, "rank2.provisional-revert"));
+        run_case("rank2.prepared-abort",
+                 RunPreparedAbort<TestRankTwoBackendTag>(
+                     2, "rank2.prepared-abort"));
+        run_case("rank2.staging-failure",
+                 RunStagingFailure<TestRankTwoBackendTag>(
+                     2, "rank2.staging-failure"));
+      }
+      run_case("rank2.diagnostic.checkpoint-v1-exact",
+               CheckpointDiagnosticExactFixtures());
+      run_case("rank2.diagnostic.prestage-mask-exact",
+               PrestageFailureMaskExactFixtures());
+      run_case("rank2.teardown.state-machine",
+               ArenaReleaseStateMachineFixtures());
+      run_case("rank2.teardown.idempotent",
+               RunArenaTeardown<TestRankTwoBackendTag>(
+                   2, "rank2.teardown.idempotent"));
     }
-    else
-    {
-      CudaSerializedCheckpointV1 checkpoint{};
-      run_case("rank2.lifecycle",
-               RunLifecycle<TestRankTwoBackendTag>(
-                   2, checkpoint, "rank2.lifecycle"));
-      run_case("rank2.restore.corrupt",
-               RunCorruptRestore<TestRankTwoBackendTag>(
-                   2, checkpoint, "rank2.restore.corrupt"));
-      run_case("rank2.restore.fresh",
-               RunFreshRestore<TestRankTwoBackendTag>(
-                   2, checkpoint, "rank2.restore.fresh"));
-      run_case("rank2.provisional-revert",
-               RunProvisionalRevert<TestRankTwoBackendTag>(
-                   2, "rank2.provisional-revert"));
-      run_case("rank2.prepared-abort",
-               RunPreparedAbort<TestRankTwoBackendTag>(
-                   2, "rank2.prepared-abort"));
-      run_case("rank2.staging-failure",
-               RunStagingFailure<TestRankTwoBackendTag>(
-                   2, "rank2.staging-failure"));
-    }
-    run_case("rank2.diagnostic.checkpoint-v1-exact",
-             CheckpointDiagnosticExactFixtures());
-    run_case("rank2.diagnostic.prestage-mask-exact",
-             PrestageFailureMaskExactFixtures());
-    run_case("rank2.teardown.state-machine",
-             ArenaReleaseStateMachineFixtures());
-    run_case("rank2.teardown.idempotent",
-             RunArenaTeardown<TestRankTwoBackendTag>(
-                 2, "rank2.teardown.idempotent"));
   }
   else
   {
@@ -3078,6 +3219,10 @@ int main(int argc, char** argv)
              DirectSharedContractNegatives());
     run_case("unsupported.common.collective-case-boundary",
              CollectiveCaseBoundaryRegression(rank, ranks));
+    run_case("unsupported.common.host-offd-map-copy",
+             HypreHostColumnMapCopyFixtures());
+    run_case("unsupported.common.hypre-negative-authorization",
+             ExpectedNegativeHypreAuthorizationFixtures());
     run_case("unsupported.diagnostic.checkpoint-v1-exact",
              CheckpointDiagnosticExactFixtures());
     run_case("unsupported.diagnostic.prestage-mask-exact",
