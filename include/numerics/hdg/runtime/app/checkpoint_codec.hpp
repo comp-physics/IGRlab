@@ -30,6 +30,8 @@ inline constexpr std::uint32_t application_checkpoint_max_rank_count_v1 = 2;
 inline constexpr std::uint32_t euler_state_component_count_v1 = 4;
 inline constexpr std::uint64_t fp64_coefficient_bytes_v1 = 8;
 inline constexpr std::string_view no_physical_gpu_uuid_v1 = "none";
+inline constexpr std::string_view checkpoint_partition_layout_rule_id_v1 =
+    "periodic-cartesian.contiguous-element.min-adjacent-face-owner.v1";
 
 static_assert(sizeof(double) == fp64_coefficient_bytes_v1 &&
                   std::numeric_limits<double>::is_iec559 &&
@@ -95,6 +97,23 @@ struct CheckpointRuntimeIdentityV1
   StateHash ownership_hash{};
 };
 
+struct RankCoefficientExtentsV1
+{
+  std::uint64_t interior_dofs_per_component = 0;
+  std::uint64_t interior_coefficient_count = 0;
+  std::uint64_t trace_dofs_per_component = 0;
+  std::uint64_t trace_coefficient_count = 0;
+};
+
+struct ScenarioCoefficientExtentsV1
+{
+  std::uint32_t rank_count = 0;
+  std::array<RankCoefficientExtentsV1,
+             application_checkpoint_max_rank_count_v1> ranks{};
+  std::uint64_t aggregate_interior_coefficient_count = 0;
+  std::uint64_t aggregate_trace_coefficient_count = 0;
+};
+
 enum class CheckpointCodecStatus : std::uint8_t
 {
   ok = 0,
@@ -123,6 +142,13 @@ enum class CheckpointCodecStatus : std::uint8_t
   size_overflow
 };
 
+template <typename Selection,
+          typename InteriorState,
+          typename TraceState,
+          typename StoragePolicy,
+          typename CollectivePolicy>
+struct RankCommittedContractViewV1;
+
 class CapturedCheckpointV1 final
 {
 public:
@@ -131,9 +157,11 @@ public:
   CapturedCheckpointV1& operator=(const CapturedCheckpointV1&) = default;
   CapturedCheckpointV1& operator=(CapturedCheckpointV1&&) = default;
 
-  const CheckpointDescriptor& descriptor() const noexcept
+  std::uint32_t rank_count() const noexcept { return rank_count_; }
+  const CheckpointDescriptor& rank_descriptor(
+      const std::size_t rank) const noexcept
   {
-    return descriptor_;
+    return rank_descriptors_[rank];
   }
   const ValidatedApplicationConfig& config() const noexcept { return config_; }
   const CheckpointRuntimeIdentityV1& runtime_identity() const noexcept
@@ -142,15 +170,21 @@ public:
   }
 
 private:
-  CapturedCheckpointV1(CheckpointDescriptor descriptor,
-                       ValidatedApplicationConfig config,
-                       CheckpointRuntimeIdentityV1 runtime_identity) noexcept
-      : descriptor_(descriptor),
+  CapturedCheckpointV1(
+      std::array<CheckpointDescriptor,
+                 application_checkpoint_max_rank_count_v1> rank_descriptors,
+      std::uint32_t rank_count,
+      ValidatedApplicationConfig config,
+      CheckpointRuntimeIdentityV1 runtime_identity) noexcept
+      : rank_descriptors_(rank_descriptors),
+        rank_count_(rank_count),
         config_(config),
         runtime_identity_(runtime_identity)
   {}
 
-  CheckpointDescriptor descriptor_{};
+  std::array<CheckpointDescriptor, application_checkpoint_max_rank_count_v1>
+      rank_descriptors_{};
+  std::uint32_t rank_count_ = 0;
   ValidatedApplicationConfig config_;
   CheckpointRuntimeIdentityV1 runtime_identity_{};
 
@@ -160,11 +194,12 @@ private:
             typename StoragePolicy,
             typename CollectivePolicy>
   friend std::optional<CapturedCheckpointV1> CaptureCheckpointV1(
-      const PersistentRunContract<Selection,
-                                  InteriorState,
-                                  TraceState,
-                                  StoragePolicy,
-                                  CollectivePolicy>&,
+      const RankCommittedContractViewV1<Selection,
+                                        InteriorState,
+                                        TraceState,
+                                        StoragePolicy,
+                                        CollectivePolicy>*,
+      std::size_t,
       const ValidatedApplicationConfig&,
       const CheckpointRuntimeIdentityV1&) noexcept;
 };
@@ -172,6 +207,28 @@ private:
 bool ValidCheckpointRuntimeIdentityV1(
     const ValidatedApplicationConfig& config,
     const CheckpointRuntimeIdentityV1& identity) noexcept;
+bool ScenarioCheckpointTimeMatchesV1(
+    double time,
+    const ValidatedApplicationConfig& config) noexcept;
+bool DeriveScenarioCoefficientExtentsV1(
+    const ValidatedApplicationConfig& config,
+    std::uint32_t rank_count,
+    ScenarioCoefficientExtentsV1& extents) noexcept;
+
+template <typename Selection,
+          typename InteriorState,
+          typename TraceState,
+          typename StoragePolicy,
+          typename CollectivePolicy>
+struct RankCommittedContractViewV1
+{
+  std::uint32_t rank = 0;
+  const PersistentRunContract<Selection,
+                              InteriorState,
+                              TraceState,
+                              StoragePolicy,
+                              CollectivePolicy>* contract = nullptr;
+};
 
 template <typename Selection,
           typename InteriorState,
@@ -179,45 +236,87 @@ template <typename Selection,
           typename StoragePolicy,
           typename CollectivePolicy>
 std::optional<CapturedCheckpointV1> CaptureCheckpointV1(
-    const PersistentRunContract<Selection,
-                                InteriorState,
-                                TraceState,
-                                StoragePolicy,
-                                CollectivePolicy>& contract,
+    const RankCommittedContractViewV1<Selection,
+                                      InteriorState,
+                                      TraceState,
+                                      StoragePolicy,
+                                      CollectivePolicy>* rank_contracts,
+    const std::size_t rank_count,
     const ValidatedApplicationConfig& config,
     const CheckpointRuntimeIdentityV1& runtime_identity) noexcept
 {
-  CheckpointDescriptor descriptor{};
-  const StateCoordinates coordinates = contract.coordinates();
-  const RunTelemetry& telemetry = contract.telemetry();
-  const auto published = contract.Published();
-  StateCoordinates published_coordinates{};
+  using Contract = PersistentRunContract<Selection,
+                                         InteriorState,
+                                         TraceState,
+                                         StoragePolicy,
+                                         CollectivePolicy>;
   if (!ValidCheckpointRuntimeIdentityV1(config, runtime_identity) ||
-      contract.status() != RunStatus::committed ||
-      !telemetry.accepted.valid ||
-      telemetry.commits < config.checkpoint_step() ||
-      !contract.PublishedCoordinates(published, published_coordinates) ||
-      !::dg::hdg::runtime::detail::SameCoordinates(
-          coordinates, published_coordinates) ||
-      coordinates.step != config.checkpoint_step() ||
-      coordinates.generation != config.checkpoint_step() ||
-      coordinates.cursor != config.checkpoint_step() ||
-      coordinates.dt != config.dt() ||
-      contract.resources().rank_count !=
-          config.deferred_runtime().required_mpi_rank_count ||
-      contract.resources().polynomial_order != config.polynomial_order() ||
-      contract.resources().layout != config.layout_id() ||
-      !contract.TryMakeCheckpoint(descriptor) ||
-      descriptor.tuple != config.tuple() ||
-      descriptor.rank_count !=
-          config.deferred_runtime().required_mpi_rank_count ||
-      descriptor.polynomial_order != config.polynomial_order() ||
-      descriptor.coordinates.step != config.checkpoint_step() ||
-      descriptor.coordinates.cursor != config.checkpoint_step())
+      rank_contracts == nullptr || rank_count == 0 ||
+      rank_count > application_checkpoint_max_rank_count_v1 ||
+      rank_count != config.deferred_runtime().required_mpi_rank_count)
   {
     return std::nullopt;
   }
-  return CapturedCheckpointV1(descriptor, config, runtime_identity);
+  std::array<CheckpointDescriptor, application_checkpoint_max_rank_count_v1>
+      descriptors{};
+  for (std::size_t rank = 0; rank < rank_count; ++rank)
+  {
+    const Contract* contract = rank_contracts[rank].contract;
+    if (rank_contracts[rank].rank != rank || contract == nullptr)
+    {
+      return std::nullopt;
+    }
+    for (std::size_t prior = 0; prior < rank; ++prior)
+    {
+      if (rank_contracts[prior].contract == contract) { return std::nullopt; }
+    }
+    const StateCoordinates coordinates = contract->coordinates();
+    const RunTelemetry& telemetry = contract->telemetry();
+    const auto published = contract->Published();
+    StateCoordinates published_coordinates{};
+    CheckpointDescriptor descriptor{};
+    if (contract->status() != RunStatus::committed ||
+        !telemetry.accepted.valid ||
+        telemetry.commits < config.checkpoint_step() ||
+        !contract->PublishedCoordinates(published, published_coordinates) ||
+        !::dg::hdg::runtime::detail::SameCoordinates(
+            coordinates, published_coordinates) ||
+        coordinates.step != config.checkpoint_step() ||
+        coordinates.generation != config.checkpoint_step() ||
+        coordinates.cursor != config.checkpoint_step() ||
+        coordinates.dt != config.dt() ||
+        !ScenarioCheckpointTimeMatchesV1(coordinates.time, config) ||
+        contract->resources().rank_count != rank_count ||
+        contract->resources().polynomial_order != config.polynomial_order() ||
+        contract->resources().layout != config.layout_id() ||
+        !contract->TryMakeCheckpoint(descriptor) ||
+        descriptor.tuple != config.tuple() ||
+        descriptor.rank_count != rank_count ||
+        descriptor.polynomial_order != config.polynomial_order() ||
+        descriptor.coordinates.step != config.checkpoint_step() ||
+        descriptor.coordinates.cursor != config.checkpoint_step() ||
+        !ScenarioCheckpointTimeMatchesV1(descriptor.coordinates.time, config))
+    {
+      return std::nullopt;
+    }
+    if (rank != 0)
+    {
+      CheckpointDescriptor common = descriptor;
+      CheckpointDescriptor first = descriptors[0];
+      common.interior_hash = {};
+      common.trace_hash = {};
+      first.interior_hash = {};
+      first.trace_hash = {};
+      if (!::dg::hdg::runtime::detail::SameCheckpoint(first, common))
+      {
+        return std::nullopt;
+      }
+    }
+    descriptors[rank] = descriptor;
+  }
+  return CapturedCheckpointV1(
+      descriptors, static_cast<std::uint32_t>(rank_count), config,
+      runtime_identity);
 }
 
 struct DecodedCheckpointMetadataV1
@@ -228,6 +327,7 @@ struct DecodedCheckpointMetadataV1
   StableIdentity scenario_id{};
   StableIdentity checkpoint_id{};
   StableIdentity physical_gpu_uuid{};
+  StableIdentity partition_layout_rule_id{};
   StateHash scientific_config_sha256{};
   StateHash run_config_sha256{};
   StateHash ownership_hash{};

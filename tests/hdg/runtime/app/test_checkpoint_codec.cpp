@@ -206,19 +206,46 @@ void AppendU64(std::vector<std::uint8_t>& bytes, const std::uint64_t value)
   }
 }
 
-template <std::size_t Size>
 StateHash OracleCoefficientHash(
-    const std::array<double, Size>& values) noexcept
+    const std::vector<double>& values) noexcept
 {
-  std::array<std::uint8_t, Size * 8> bytes{};
-  std::size_t offset = 0;
+  OracleSha256 hash;
+  std::array<std::uint8_t, 8> bytes{};
   for (const double value : values)
   {
     const std::uint64_t bits = OracleBits(value);
-    for (unsigned int shift = 0; shift < 64; shift += 8)
+    for (std::size_t index = 0; index < bytes.size(); ++index)
     {
-      bytes[offset++] = static_cast<std::uint8_t>(bits >> shift);
+      bytes[index] = static_cast<std::uint8_t>(bits >> (8U * index));
     }
+    hash.Update(bytes.data(), bytes.size());
+  }
+  return hash.Finalize();
+}
+
+struct OracleRankTuple
+{
+  std::uint32_t rank = 0;
+  std::uint64_t byte_count = 0;
+  StateHash local_hash{};
+};
+
+StateHash OracleManifestHash(const std::uint8_t kind,
+                             const OracleRankTuple* ranks,
+                             const std::size_t rank_count)
+{
+  const std::array<std::uint8_t, 25> domain{{
+      'D', 'G', 'I', 'G', 'R', '-', 'H', 'D', 'G', '-', 'R', 'A', 'N',
+      'K', '-', 'P', 'A', 'Y', 'L', 'O', 'A', 'D', '-', 'V', '1'}};
+  std::vector<std::uint8_t> bytes(domain.begin(), domain.end());
+  bytes.push_back(kind);
+  AppendU32(bytes, static_cast<std::uint32_t>(rank_count));
+  for (std::size_t index = 0; index < rank_count; ++index)
+  {
+    AppendU32(bytes, ranks[index].rank);
+    AppendU64(bytes, ranks[index].byte_count);
+    bytes.insert(bytes.end(), ranks[index].local_hash.bytes.begin(),
+                 ranks[index].local_hash.bytes.end());
   }
   return OracleHash(bytes.data(), bytes.size());
 }
@@ -227,16 +254,8 @@ StateHash OracleManifestHash(const std::uint8_t kind,
                              const std::uint64_t byte_count,
                              const StateHash& local_hash)
 {
-  const std::array<std::uint8_t, 25> domain{{
-      'D', 'G', 'I', 'G', 'R', '-', 'H', 'D', 'G', '-', 'R', 'A', 'N',
-      'K', '-', 'P', 'A', 'Y', 'L', 'O', 'A', 'D', '-', 'V', '1'}};
-  std::vector<std::uint8_t> bytes(domain.begin(), domain.end());
-  bytes.push_back(kind);
-  AppendU32(bytes, 1);
-  AppendU32(bytes, 0);
-  AppendU64(bytes, byte_count);
-  bytes.insert(bytes.end(), local_hash.bytes.begin(), local_hash.bytes.end());
-  return OracleHash(bytes.data(), bytes.size());
+  const OracleRankTuple rank{0, byte_count, local_hash};
+  return OracleManifestHash(kind, &rank, 1);
 }
 
 std::string Hex(const StateHash& hash)
@@ -269,7 +288,7 @@ std::vector<std::uint8_t> HexBytes(const std::string_view text)
   return bytes;
 }
 
-using State = std::array<double, 4>;
+using State = std::vector<double>;
 using Slot = CompleteStateSlot<State, State>;
 
 struct TestStoragePolicy
@@ -356,11 +375,28 @@ struct TestCollectivePolicy
   }
 };
 
-using Contract = PersistentRunContract<CpuSerialRuntimeSelection,
-                                       State,
-                                       State,
-                                       TestStoragePolicy,
-                                       TestCollectivePolicy>;
+using SerialContract = PersistentRunContract<CpuSerialRuntimeSelection,
+                                             State,
+                                             State,
+                                             TestStoragePolicy,
+                                             TestCollectivePolicy>;
+using Rank2Contract = PersistentRunContract<CpuRank2RuntimeSelection,
+                                            State,
+                                            State,
+                                            TestStoragePolicy,
+                                            TestCollectivePolicy>;
+using SerialContractView = RankCommittedContractViewV1<
+    CpuSerialRuntimeSelection,
+    State,
+    State,
+    TestStoragePolicy,
+    TestCollectivePolicy>;
+using Rank2ContractView = RankCommittedContractViewV1<
+    CpuRank2RuntimeSelection,
+    State,
+    State,
+    TestStoragePolicy,
+    TestCollectivePolicy>;
 
 StateHash FilledHash(const std::uint8_t first) noexcept
 {
@@ -372,14 +408,14 @@ StateHash FilledHash(const std::uint8_t first) noexcept
   return hash;
 }
 
-PersistentResourceDescriptor TestResources()
+PersistentResourceDescriptor TestResources(const std::uint32_t rank_count)
 {
   PersistentResourceDescriptor resources{};
   resources.mfem_pin = StableIdentity::Copy("d9d6526cc1749980");
   resources.mesh_hash = FilledHash(0x10);
   resources.partition_hash = FilledHash(0x30);
   resources.topology_hash = FilledHash(0x50);
-  resources.rank_count = 1;
+  resources.rank_count = rank_count;
   resources.polynomial_order = 1;
   resources.layout = StableIdentity::Copy(
       smooth_periodic_euler_v1_layout_id);
@@ -394,18 +430,21 @@ CheckpointRuntimeIdentityV1 TestRuntimeIdentity()
   return identity;
 }
 
-ApplicationValidation TestValidation()
+ApplicationValidation TestValidation(const std::string_view backend)
 {
   ApplicationOptionsView options;
+  options.backend_id = backend;
   options.scientific_config_sha256 = FilledHash(0x90);
   options.run_config_sha256 = FilledHash(0xb0);
   return ValidateApplicationOptions(options);
 }
 
-Contract::ProductBundle IssueAll(Contract& contract,
-                                 const AttemptIdentity& attempt)
+template <typename ContractType>
+typename ContractType::ProductBundle IssueAll(
+    ContractType& contract,
+    const AttemptIdentity& attempt)
 {
-  Contract::ProductBundle products{};
+  typename ContractType::ProductBundle products{};
   products.residual =
       contract.IssueProduct<DerivedProductKind::residual>(attempt);
   products.matrix = contract.IssueProduct<DerivedProductKind::matrix>(attempt);
@@ -415,7 +454,8 @@ Contract::ProductBundle IssueAll(Contract& contract,
   return products;
 }
 
-bool AdvanceOneCommit(Contract& contract)
+template <typename ContractType>
+bool AdvanceOneCommit(ContractType& contract)
 {
   const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.05});
   if (!begin.started) { return false; }
@@ -430,15 +470,64 @@ bool AdvanceOneCommit(Contract& contract)
 
 struct CoefficientFixture
 {
-  State interior{{1.0, -2.0, 3.5, -0.0}};
-  State trace{{5.0, 6.25, -7.5, 8.0}};
+  State interior{};
+  State trace{};
+
+  CoefficientFixture() : interior(144), trace(144)
+  {
+    for (std::size_t index = 0; index < interior.size(); ++index)
+    {
+      interior[index] = static_cast<double>(index + 1);
+      trace[index] = static_cast<double>(1001 + index);
+    }
+  }
 
   std::array<StagedStateViewV1, 1> Views() const noexcept
   {
     return {{{0,
-              {interior.data(), 4, 4, 1,
+              {interior.data(), interior.size(), 4, 36,
                CoefficientOrderingV1::component_major},
-              {trace.data(), 4, 4, 1,
+              {trace.data(), trace.size(), 4, 36,
+               CoefficientOrderingV1::component_major}}}};
+  }
+};
+
+struct Rank2CoefficientFixture
+{
+  std::array<State, 2> interior{{State(80), State(64)}};
+  std::array<State, 2> trace{{State(112), State(32)}};
+
+  Rank2CoefficientFixture()
+  {
+    for (std::size_t index = 0; index < interior[0].size(); ++index)
+    {
+      interior[0][index] = static_cast<double>(index + 1);
+    }
+    for (std::size_t index = 0; index < trace[0].size(); ++index)
+    {
+      trace[0][index] = static_cast<double>(1001 + index);
+    }
+    for (std::size_t index = 0; index < interior[1].size(); ++index)
+    {
+      interior[1][index] = static_cast<double>(2001 + index);
+    }
+    for (std::size_t index = 0; index < trace[1].size(); ++index)
+    {
+      trace[1][index] = static_cast<double>(3001 + index);
+    }
+  }
+
+  std::array<StagedStateViewV1, 2> Views() const noexcept
+  {
+    return {{{0,
+              {interior[0].data(), interior[0].size(), 4, 20,
+               CoefficientOrderingV1::component_major},
+              {trace[0].data(), trace[0].size(), 4, 28,
+               CoefficientOrderingV1::component_major}},
+             {1,
+              {interior[1].data(), interior[1].size(), 4, 16,
+               CoefficientOrderingV1::component_major},
+              {trace[1].data(), trace[1].size(), 4, 8,
                CoefficientOrderingV1::component_major}}}};
   }
 };
@@ -451,9 +540,12 @@ std::optional<CapturedCheckpointV1> MakeCapture(
 {
   const Slot committed{fixture.interior, fixture.trace};
   Slot candidate{};
-  Contract contract(committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
+  SerialContract contract(
+      committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
   if (!AdvanceOneCommit(contract)) { return std::nullopt; }
-  return CaptureCheckpointV1(contract, config, runtime);
+  const std::array<SerialContractView, 1> contracts{{{0, &contract}}};
+  return CaptureCheckpointV1(contracts.data(), contracts.size(), config,
+                             runtime);
 }
 
 bool EncodeFixture(const CoefficientFixture& fixture,
@@ -503,6 +595,24 @@ void WriteU64(std::vector<std::uint8_t>& bytes,
   }
 }
 
+std::uint64_t OracleCoordinateFingerprint(
+    const StateCoordinates& coordinates) noexcept
+{
+  const std::array<std::uint64_t, 5> fields{{
+      OracleBits(coordinates.time), coordinates.step,
+      coordinates.generation, coordinates.cursor, OracleBits(coordinates.dt)}};
+  std::uint64_t hash = UINT64_C(1469598103934665603);
+  for (const std::uint64_t field : fields)
+  {
+    for (unsigned int shift = 0; shift < 64; shift += 8)
+    {
+      hash ^= static_cast<std::uint8_t>(field >> shift);
+      hash *= UINT64_C(1099511628211);
+    }
+  }
+  return hash;
+}
+
 bool Seal(std::vector<std::uint8_t>& bytes)
 {
   if (bytes.size() < 32) { return false; }
@@ -521,10 +631,15 @@ struct LayoutOffsets
 {
   std::vector<NamedOffset> exact_fields{};
   std::size_t descriptor_interior_hash = 0;
+  std::size_t descriptor_coordinate_time = 0;
+  std::size_t descriptor_coordinate_fingerprint = 0;
   std::size_t manifest_rank_count = 0;
   std::size_t aggregate_interior_count = 0;
   std::size_t rank_record = 0;
+  std::size_t interior_component_count = 0;
   std::size_t interior_coefficient_count = 0;
+  std::size_t interior_dofs_per_component = 0;
+  std::size_t interior_byte_count = 0;
   std::size_t interior_hash = 0;
   std::size_t payload = 0;
 };
@@ -581,6 +696,8 @@ LayoutOffsets Locate(const std::vector<std::uint8_t>& bytes)
   offset += 8;
   offset = IdentityField(bytes, offset, "runtime.gpu-uuid",
                          layout.exact_fields);
+  offset = IdentityField(bytes, offset, "runtime.partition-layout-rule",
+                         layout.exact_fields);
   layout.exact_fields.push_back({"runtime.ownership-hash", offset});
   offset += 32;
 
@@ -616,6 +733,14 @@ LayoutOffsets Locate(const std::vector<std::uint8_t>& bytes)
                            "descriptor.coord-dt", "descriptor.fingerprint"})
   {
     layout.exact_fields.push_back({name, offset});
+    if (std::string_view{name} == "descriptor.time-coordinate")
+    {
+      layout.descriptor_coordinate_time = offset;
+    }
+    if (std::string_view{name} == "descriptor.fingerprint")
+    {
+      layout.descriptor_coordinate_fingerprint = offset;
+    }
     offset += 8;
   }
   layout.descriptor_interior_hash = offset;
@@ -635,27 +760,27 @@ LayoutOffsets Locate(const std::vector<std::uint8_t>& bytes)
   layout.rank_record = offset;
   layout.exact_fields.push_back({"rank.rank", offset});
   offset += 4;
-  const auto block = [&](const char* prefix) {
+  const auto block = [&](const char* prefix, const bool interior) {
     layout.exact_fields.push_back({prefix, offset});
+    if (interior) { layout.interior_component_count = offset; }
     offset += 4;
     layout.exact_fields.push_back({"rank.coefficient-count", offset});
-    if (layout.interior_coefficient_count == 0)
-    {
-      layout.interior_coefficient_count = offset;
-    }
+    if (interior) { layout.interior_coefficient_count = offset; }
     offset += 8;
     layout.exact_fields.push_back({"rank.dofs-per-component", offset});
+    if (interior) { layout.interior_dofs_per_component = offset; }
     offset += 8;
     layout.exact_fields.push_back({"rank.ordering", offset});
     offset += 1;
     layout.exact_fields.push_back({"rank.byte-count", offset});
+    if (interior) { layout.interior_byte_count = offset; }
     offset += 8;
     layout.exact_fields.push_back({"rank.local-hash", offset});
-    if (layout.interior_hash == 0) { layout.interior_hash = offset; }
+    if (interior) { layout.interior_hash = offset; }
     offset += 32;
   };
-  block("rank.interior-components");
-  block("rank.trace-components");
+  block("rank.interior-components", true);
+  block("rank.trace-components", false);
   layout.payload = offset;
   return layout;
 }
@@ -688,8 +813,8 @@ bool SameDescriptorIndependent(const CheckpointDescriptor& left,
 
 struct DecodeSentinel
 {
-  State interior{{101.0, 102.0, 103.0, 104.0}};
-  State trace{{201.0, 202.0, 203.0, 204.0}};
+  State interior = State(144, 101.0);
+  State trace = State(144, 201.0);
   DecodedCheckpointMetadataV1 metadata{};
 
   DecodeSentinel()
@@ -701,6 +826,8 @@ struct DecodeSentinel
     metadata.scenario_id = StableIdentity::Copy("sentinel-scenario");
     metadata.checkpoint_id = StableIdentity::Copy("sentinel-checkpoint");
     metadata.physical_gpu_uuid = StableIdentity::Copy("sentinel-gpu");
+    metadata.partition_layout_rule_id =
+        StableIdentity::Copy("sentinel-partition-rule");
     metadata.scientific_config_sha256 = FilledHash(0xd0);
     metadata.run_config_sha256 = FilledHash(0xe0);
     metadata.ownership_hash = FilledHash(0xf0);
@@ -714,9 +841,30 @@ struct DecodeSentinel
   std::array<RankStateBufferV1, 1> Buffers() noexcept
   {
     return {{{0,
-              {interior.data(), interior.size(), interior.size(), 4, 1,
+              {interior.data(), interior.size(), interior.size(), 4, 36,
                CoefficientOrderingV1::component_major},
-              {trace.data(), trace.size(), trace.size(), 4, 1,
+              {trace.data(), trace.size(), trace.size(), 4, 36,
+               CoefficientOrderingV1::component_major}}}};
+  }
+};
+
+struct Rank2DecodeOutput
+{
+  std::array<State, 2> interior{{State(80, -1.0), State(64, -1.0)}};
+  std::array<State, 2> trace{{State(112, -1.0), State(32, -1.0)}};
+  DecodedCheckpointMetadataV1 metadata{};
+
+  std::array<RankStateBufferV1, 2> Buffers() noexcept
+  {
+    return {{{0,
+              {interior[0].data(), interior[0].size(), interior[0].size(), 4,
+               20, CoefficientOrderingV1::component_major},
+              {trace[0].data(), trace[0].size(), trace[0].size(), 4, 28,
+               CoefficientOrderingV1::component_major}},
+             {1,
+              {interior[1].data(), interior[1].size(), interior[1].size(), 4,
+               16, CoefficientOrderingV1::component_major},
+              {trace[1].data(), trace[1].size(), trace[1].size(), 4, 8,
                CoefficientOrderingV1::component_major}}}};
   }
 };
@@ -729,6 +877,7 @@ bool SameMetadata(const DecodedCheckpointMetadataV1& left,
       left.scenario_id == right.scenario_id &&
       left.checkpoint_id == right.checkpoint_id &&
       left.physical_gpu_uuid == right.physical_gpu_uuid &&
+      left.partition_layout_rule_id == right.partition_layout_rule_id &&
       left.scientific_config_sha256 == right.scientific_config_sha256 &&
       left.run_config_sha256 == right.run_config_sha256 &&
       left.ownership_hash == right.ownership_hash &&
@@ -750,35 +899,155 @@ bool SentinelUnchanged(const DecodeSentinel& value,
 // Filled from an independent fieldwise Python oracle after the format is
 // frozen.  The literal includes every artifact byte and the final SHA-256.
 constexpr std::string_view golden_artifact_hex =
-    "44474947522d4844472d4d454d56310001000000dc0400000000000033006578702e6864672e65756c65722e"
-    "636f6e76656e74696f6e616c2e736d6f6f74685f70657273697374656e742e7738612e76312100636f6e7665"
-    "6e74696f6e616c2d736d6f6f74682d70657273697374656e742d763109005738412d534d4f4b453400636865"
-    "636b706f696e742e6864672e65756c65722e736d6f6f74682d706572696f6469632e736d6f6b652e73746570"
-    "2d312e76311700706572696f6469632d63617274657369616e2d717561641f00736f757263652e65756c6572"
-    "2e736d6f6f74682e616e616c797469632e76312900666c75782e6864672e636f6e76656e74696f6e616c2e66"
-    "697865642d7363616c61722d7461752e76310e006261636b776172645f65756c65722f006c322d696e746572"
-    "696f722e747275652d74726163652d6f776e65642e636f6d706f6e656e742d6d616a6f722e76319091929394"
-    "95969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0"
-    "c1c2c3c4c5c6c7c8c9cacbcccdcecf000003000000010000000b000000100000001400000015000000666666"
-    "666666f63f00000000000004409a9999999999a93f0300000000000000333333333333c33f00000000000000"
-    "0001000000000000000300000000000000010000000000000000000100000000000000020000000000000008"
-    "000001000000314b4f4d5341385704006e6f6e65707172737475767778797a7b7c7d7e7f8081828384858687"
-    "88898a8b8c8d8e8f010000000100150065756c65722e636f6d707265737369626c652e326410006864672e63"
-    "6f6e76656e74696f6e616c17006d66656d2e64675f696e746572666163652e747261636509007461752e6669"
-    "7865640e006261636b776172645f65756c65720a006370752e73657269616c04006670363410006439643635"
-    "3236636331373439393830101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30"
-    "3132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c"
-    "5d5e5f606162636465666768696a6b6c6d6e6f01000000010000002f006c322d696e746572696f722e747275"
-    "652d74726163652d6f776e65642e636f6d706f6e656e742d6d616a6f722e7631040066703634010000000000"
-    "00009a9999999999a93f9a9999999999a93f0100000000000000010000000000000001000000000000009a99"
-    "99999999a93f12e4ea20d43b982f66d70231bb8654d88e509ef55a64a36059cd1bbf1f33b6197de3a4acacc1"
-    "5098bfb3882f02ddf0634171bd039abb25ef0c9e9d9c287ca402234a394184a57d4301000000040000000000"
-    "0000040000000000000000000000040000000400000000000000010000000000000000200000000000000063"
-    "b84f617d28be16889d09da2bf88a144d908cdc462a176953c8c67191d6835904000000040000000000000001"
-    "00000000000000002000000000000000b0c0959fdf6d33e5435ebb3bb41ea582d274b360e1597fdd886ac1eb"
-    "eb361f36000000000000f03f00000000000000c00000000000000c4000000000000000800000000000001440"
-    "00000000000019400000000000001ec0000000000000204066f62405b9fe6f9de15874ce90826cabfa8b5d0b"
-    "3d7676b5e434dbcec0cae25c";
+    "44474947522d4844472d4d454d56310001000000de0d00000000000033006578702e6864672e65756c65722e636f6e76"
+    "656e74696f6e616c2e736d6f6f74685f70657273697374656e742e7738612e76312100636f6e76656e74696f6e616c2d"
+    "736d6f6f74682d70657273697374656e742d763109005738412d534d4f4b453400636865636b706f696e742e6864672e"
+    "65756c65722e736d6f6f74682d706572696f6469632e736d6f6b652e737465702d312e76311700706572696f6469632d"
+    "63617274657369616e2d717561641f00736f757263652e65756c65722e736d6f6f74682e616e616c797469632e763129"
+    "00666c75782e6864672e636f6e76656e74696f6e616c2e66697865642d7363616c61722d7461752e76310e006261636b"
+    "776172645f65756c65722f006c322d696e746572696f722e747275652d74726163652d6f776e65642e636f6d706f6e65"
+    "6e742d6d616a6f722e7631909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4"
+    "b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf000003000000010000000b00000010000000140000"
+    "0015000000666666666666f63f00000000000004409a9999999999a93f0300000000000000333333333333c33f000000"
+    "000000000001000000000000000300000000000000010000000000000000000100000000000000020000000000000008"
+    "000001000000314b4f4d5341385704006e6f6e654000706572696f6469632d63617274657369616e2e636f6e74696775"
+    "6f75732d656c656d656e742e6d696e2d61646a6163656e742d666163652d6f776e65722e763170717273747576777879"
+    "7a7b7c7d7e7f808182838485868788898a8b8c8d8e8f010000000100150065756c65722e636f6d707265737369626c65"
+    "2e326410006864672e636f6e76656e74696f6e616c17006d66656d2e64675f696e746572666163652e74726163650900"
+    "7461752e66697865640e006261636b776172645f65756c65720a006370752e73657269616c0400667036341000643964"
+    "36353236636331373439393830101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132"
+    "333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162"
+    "636465666768696a6b6c6d6e6f01000000010000002f006c322d696e746572696f722e747275652d74726163652d6f77"
+    "6e65642e636f6d706f6e656e742d6d616a6f722e763104006670363401000000000000009a9999999999a93f9a999999"
+    "9999a93f0100000000000000010000000000000001000000000000009a9999999999a93f12e4ea20d43b982fe0dae187"
+    "1c4c4e987465c19e3e4a5accf48be2b532aeb1d1de1621432dc7d0edf963c248575b26fe92bc5ae29a5ac6d027732c1a"
+    "5c68f5deb8130641ecb1ae28010000009000000000000000900000000000000000000000040000009000000000000000"
+    "240000000000000000800400000000000005bccc0bd8f36d56256ec2b51f43394c5657b3d503feb5c83f60b42ffb384b"
+    "e00400000090000000000000002400000000000000008004000000000000cfd19833fb0bbcdacb37ece36935eabdc4c7"
+    "510b69246bd5866599a659882126000000000000f03f0000000000000040000000000000084000000000000010400000"
+    "00000000144000000000000018400000000000001c400000000000002040000000000000224000000000000024400000"
+    "00000000264000000000000028400000000000002a400000000000002c400000000000002e4000000000000030400000"
+    "000000003140000000000000324000000000000033400000000000003440000000000000354000000000000036400000"
+    "000000003740000000000000384000000000000039400000000000003a400000000000003b400000000000003c400000"
+    "000000003d400000000000003e400000000000003f400000000000004040000000000080404000000000000041400000"
+    "000000804140000000000000424000000000008042400000000000004340000000000080434000000000000044400000"
+    "000000804440000000000000454000000000008045400000000000004640000000000080464000000000000047400000"
+    "00000080474000000000000048400000000000804840000000000000494000000000008049400000000000004a400000"
+    "000000804a400000000000004b400000000000804b400000000000004c400000000000804c400000000000004d400000"
+    "000000804d400000000000004e400000000000804e400000000000004f400000000000804f4000000000000050400000"
+    "00000040504000000000008050400000000000c050400000000000005140000000000040514000000000008051400000"
+    "000000c051400000000000005240000000000040524000000000008052400000000000c0524000000000000053400000"
+    "00000040534000000000008053400000000000c053400000000000005440000000000040544000000000008054400000"
+    "000000c054400000000000005540000000000040554000000000008055400000000000c0554000000000000056400000"
+    "00000040564000000000008056400000000000c056400000000000005740000000000040574000000000008057400000"
+    "000000c057400000000000005840000000000040584000000000008058400000000000c0584000000000000059400000"
+    "00000040594000000000008059400000000000c059400000000000005a400000000000405a400000000000805a400000"
+    "000000c05a400000000000005b400000000000405b400000000000805b400000000000c05b400000000000005c400000"
+    "000000405c400000000000805c400000000000c05c400000000000005d400000000000405d400000000000805d400000"
+    "000000c05d400000000000005e400000000000405e400000000000805e400000000000c05e400000000000005f400000"
+    "000000405f400000000000805f400000000000c05f400000000000006040000000000020604000000000004060400000"
+    "00000060604000000000008060400000000000a060400000000000c060400000000000e0604000000000000061400000"
+    "0000002061400000000000406140000000000060614000000000008061400000000000a061400000000000c061400000"
+    "000000e0614000000000000062400000000000488f400000000000508f400000000000588f400000000000608f400000"
+    "000000688f400000000000708f400000000000788f400000000000808f400000000000888f400000000000908f400000"
+    "000000988f400000000000a08f400000000000a88f400000000000b08f400000000000b88f400000000000c08f400000"
+    "000000c88f400000000000d08f400000000000d88f400000000000e08f400000000000e88f400000000000f08f400000"
+    "000000f88f4000000000000090400000000000049040000000000008904000000000000c904000000000001090400000"
+    "000000149040000000000018904000000000001c90400000000000209040000000000024904000000000002890400000"
+    "0000002c904000000000003090400000000000349040000000000038904000000000003c904000000000004090400000"
+    "000000449040000000000048904000000000004c90400000000000509040000000000054904000000000005890400000"
+    "0000005c904000000000006090400000000000649040000000000068904000000000006c904000000000007090400000"
+    "000000749040000000000078904000000000007c90400000000000809040000000000084904000000000008890400000"
+    "0000008c904000000000009090400000000000949040000000000098904000000000009c90400000000000a090400000"
+    "000000a490400000000000a890400000000000ac90400000000000b090400000000000b490400000000000b890400000"
+    "000000bc90400000000000c090400000000000c490400000000000c890400000000000cc90400000000000d090400000"
+    "000000d490400000000000d890400000000000dc90400000000000e090400000000000e490400000000000e890400000"
+    "000000ec90400000000000f090400000000000f490400000000000f890400000000000fc904000000000000091400000"
+    "000000049140000000000008914000000000000c91400000000000109140000000000014914000000000001891400000"
+    "0000001c914000000000002091400000000000249140000000000028914000000000002c914000000000003091400000"
+    "000000349140000000000038914000000000003c91400000000000409140000000000044914000000000004891400000"
+    "0000004c914000000000005091400000000000549140000000000058914000000000005c914000000000006091400000"
+    "000000649140000000000068914000000000006c91400000000000709140000000000074914000000000007891400000"
+    "0000007c914000000000008091400000000000849140000000000088914000000000008c914000000000009091400000"
+    "000000949140000000000098914000000000009c91400000000000a091400000000000a491400000000000a891400000"
+    "000000ac91400000000000b091400000000000b491400000000000b891400000000000bc91400000000000c091400000"
+    "000000c491400000000000c891400000000000cc91400000000000d091400000000000d491400000000000d891400000"
+    "000000dc91400000000000e09140b13e2e869287ea62be89252fb3e7c91e87c01291bea201f462e9c8780cfc120a";
+
+ScenarioCoefficientExtentsV1 IndependentExtents(
+    const std::uint32_t n,
+    const std::uint32_t polynomial_order,
+    const std::uint32_t rank_count)
+{
+  ScenarioCoefficientExtentsV1 result{};
+  result.rank_count = rank_count;
+  const std::uint64_t elements =
+      static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(n);
+  const auto owner = [elements, rank_count](
+                         const std::uint64_t element) noexcept {
+    return static_cast<std::uint32_t>(element * rank_count / elements);
+  };
+  std::array<std::uint64_t, application_checkpoint_max_rank_count_v1>
+      element_counts{};
+  std::array<std::uint64_t, application_checkpoint_max_rank_count_v1>
+      face_counts{};
+  for (std::uint64_t element = 0; element < elements; ++element)
+  {
+    ++element_counts[owner(element)];
+  }
+  for (std::uint64_t face = 0; face < 2 * elements; ++face)
+  {
+    const bool vertical = face < elements;
+    const std::uint64_t local = vertical ? face : face - elements;
+    const std::uint64_t row = local / n;
+    const std::uint64_t column = local % n;
+    const std::uint64_t first = row * n + column;
+    const std::uint64_t second = vertical
+        ? row * n + (column + n - 1) % n
+        : ((row + n - 1) % n) * n + column;
+    ++face_counts[std::min(owner(first), owner(second))];
+  }
+  const std::uint64_t p1 = static_cast<std::uint64_t>(polynomial_order) + 1;
+  for (std::uint32_t rank = 0; rank < rank_count; ++rank)
+  {
+    RankCoefficientExtentsV1& extents = result.ranks[rank];
+    extents.interior_dofs_per_component = element_counts[rank] * p1 * p1;
+    extents.interior_coefficient_count =
+        extents.interior_dofs_per_component * 4;
+    extents.trace_dofs_per_component = face_counts[rank] * p1;
+    extents.trace_coefficient_count = extents.trace_dofs_per_component * 4;
+    result.aggregate_interior_coefficient_count +=
+        extents.interior_coefficient_count;
+    result.aggregate_trace_coefficient_count += extents.trace_coefficient_count;
+  }
+  return result;
+}
+
+bool SameExtents(const ScenarioCoefficientExtentsV1& left,
+                 const ScenarioCoefficientExtentsV1& right) noexcept
+{
+  if (left.rank_count != right.rank_count ||
+      left.aggregate_interior_coefficient_count !=
+          right.aggregate_interior_coefficient_count ||
+      left.aggregate_trace_coefficient_count !=
+          right.aggregate_trace_coefficient_count)
+  {
+    return false;
+  }
+  for (std::uint32_t rank = 0; rank < left.rank_count; ++rank)
+  {
+    const RankCoefficientExtentsV1& a = left.ranks[rank];
+    const RankCoefficientExtentsV1& b = right.ranks[rank];
+    if (a.interior_dofs_per_component != b.interior_dofs_per_component ||
+        a.interior_coefficient_count != b.interior_coefficient_count ||
+        a.trace_dofs_per_component != b.trace_dofs_per_component ||
+        a.trace_coefficient_count != b.trace_coefficient_count)
+    {
+      return false;
+    }
+  }
+  return true;
+}
 
 bool CheckIndependentOracle()
 {
@@ -790,22 +1059,82 @@ bool CheckIndependentOracle()
       "independent_sha256_matches_hard_coded_FIPS_vector");
 }
 
+bool CheckExactScenarioExtents()
+{
+  const ApplicationValidation serial_validation =
+      TestValidation(CpuSerialBackendTag::id);
+  const ApplicationValidation rank2_validation =
+      TestValidation(CpuRank2BackendTag::id);
+  const ValidatedApplicationConfig* serial = serial_validation.config();
+  const ValidatedApplicationConfig* rank2 = rank2_validation.config();
+  bool passed = Check(serial != nullptr && rank2 != nullptr,
+                      "rank1_and_rank2_static_configs_validate");
+  if (serial == nullptr || rank2 == nullptr) { return false; }
+
+  const ScenarioCoefficientExtentsV1 serial_oracle =
+      IndependentExtents(3, 1, 1);
+  const ScenarioCoefficientExtentsV1 rank2_oracle =
+      IndependentExtents(3, 1, 2);
+  passed = Check(
+               serial_oracle.ranks[0].interior_coefficient_count == 144 &&
+                   serial_oracle.ranks[0].trace_coefficient_count == 144 &&
+                   rank2_oracle.ranks[0].interior_coefficient_count == 80 &&
+                   rank2_oracle.ranks[1].interior_coefficient_count == 64 &&
+                   rank2_oracle.ranks[0].trace_coefficient_count == 112 &&
+                   rank2_oracle.ranks[1].trace_coefficient_count == 32,
+               "independent_periodic_partition_extents_are_exact") &&
+      passed;
+  ScenarioCoefficientExtentsV1 serial_actual{};
+  ScenarioCoefficientExtentsV1 rank2_actual{};
+  passed = Check(
+               DeriveScenarioCoefficientExtentsV1(*serial, 1,
+                                                  serial_actual) &&
+                   DeriveScenarioCoefficientExtentsV1(*rank2, 2,
+                                                      rank2_actual) &&
+                   SameExtents(serial_actual, serial_oracle) &&
+                   SameExtents(rank2_actual, rank2_oracle),
+               "codec_extents_match_independent_face_enumeration") &&
+      passed;
+  return passed;
+}
+
 bool CheckLiveCaptureAndRepeatableEncode()
 {
   const CoefficientFixture fixture;
-  const PersistentResourceDescriptor resources = TestResources();
+  const PersistentResourceDescriptor resources = TestResources(1);
   const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
-  const ApplicationValidation validation = TestValidation();
+  const ApplicationValidation validation =
+      TestValidation(CpuSerialBackendTag::id);
   const ValidatedApplicationConfig* config = validation.config();
   bool passed = Check(config != nullptr, "checkpoint_static_config_valid");
   if (config == nullptr) { return false; }
 
   const Slot committed{fixture.interior, fixture.trace};
   Slot candidate{};
-  Contract uncommitted(
+  SerialContract uncommitted(
       committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
-  passed = Check(!CaptureCheckpointV1(uncommitted, *config, runtime),
+  const std::array<SerialContractView, 1> uncommitted_view{{
+      {0, &uncommitted}}};
+  passed = Check(!CaptureCheckpointV1(uncommitted_view.data(),
+                                      uncommitted_view.size(), *config,
+                                      runtime),
                  "uncommitted_contract_cannot_be_captured") &&
+      passed;
+  const std::array<SerialContractView, 1> null_view{{{0, nullptr}}};
+  passed = Check(!CaptureCheckpointV1(null_view.data(), null_view.size(),
+                                      *config, runtime),
+                 "missing_live_contract_cannot_be_captured") &&
+      passed;
+  Slot wrong_time_candidate{};
+  SerialContract wrong_time(
+      committed, wrong_time_candidate, {0.1, 0, 0, 0, 0.05}, resources);
+  const std::array<SerialContractView, 1> wrong_time_view{{
+      {0, &wrong_time}}};
+  passed = Check(AdvanceOneCommit(wrong_time) &&
+                     !CaptureCheckpointV1(wrong_time_view.data(),
+                                          wrong_time_view.size(), *config,
+                                          runtime),
+                 "live_contract_with_wrong_finite_checkpoint_time_rejected") &&
       passed;
   CheckpointRuntimeIdentityV1 invalid_runtime{};
   passed = Check(!ValidCheckpointRuntimeIdentityV1(*config, invalid_runtime),
@@ -831,12 +1160,112 @@ bool CheckLiveCaptureAndRepeatableEncode()
   return passed;
 }
 
+bool CheckRank2CaptureAndAllRankEvidence()
+{
+  Rank2CoefficientFixture fixture;
+  const PersistentResourceDescriptor resources = TestResources(2);
+  const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
+  const ApplicationValidation validation =
+      TestValidation(CpuRank2BackendTag::id);
+  const ValidatedApplicationConfig* config = validation.config();
+  if (config == nullptr) { return Check(false, "rank2_static_config_valid"); }
+
+  const Slot committed0{fixture.interior[0], fixture.trace[0]};
+  const Slot committed1{fixture.interior[1], fixture.trace[1]};
+  Slot candidate0{};
+  Slot candidate1{};
+  Rank2Contract contract0(
+      committed0, candidate0, {0.0, 0, 0, 0, 0.05}, resources);
+  Rank2Contract contract1(
+      committed1, candidate1, {0.0, 0, 0, 0, 0.05}, resources);
+  bool passed = Check(AdvanceOneCommit(contract0) &&
+                          AdvanceOneCommit(contract1),
+                      "rank2_live_contracts_commit");
+  const std::array<Rank2ContractView, 2> valid{{
+      {0, &contract0}, {1, &contract1}}};
+  const std::array<Rank2ContractView, 2> duplicate{{
+      {0, &contract0}, {1, &contract0}}};
+  const std::array<Rank2ContractView, 2> out_of_order{{
+      {1, &contract0}, {0, &contract1}}};
+  const std::array<Rank2ContractView, 2> missing{{
+      {0, &contract0}, {1, nullptr}}};
+  passed = Check(!CaptureCheckpointV1(valid.data(), 1, *config, runtime),
+                 "rank2_capture_rejects_missing_rank_record") &&
+      passed;
+  passed = Check(!CaptureCheckpointV1(duplicate.data(), duplicate.size(),
+                                      *config, runtime),
+                 "rank2_capture_rejects_duplicate_live_contract") &&
+      passed;
+  passed = Check(!CaptureCheckpointV1(out_of_order.data(),
+                                      out_of_order.size(), *config, runtime),
+                 "rank2_capture_rejects_out_of_order_rank_records") &&
+      passed;
+  passed = Check(!CaptureCheckpointV1(missing.data(), missing.size(), *config,
+                                      runtime),
+                 "rank2_capture_rejects_non_live_rank_record") &&
+      passed;
+  PersistentResourceDescriptor incompatible_resources = resources;
+  incompatible_resources.mesh_hash.bytes[0] ^= 1U;
+  Slot incompatible_candidate{};
+  Rank2Contract incompatible_contract(
+      committed1, incompatible_candidate, {0.0, 0, 0, 0, 0.05},
+      incompatible_resources);
+  const std::array<Rank2ContractView, 2> incompatible{{
+      {0, &contract0}, {1, &incompatible_contract}}};
+  passed = Check(AdvanceOneCommit(incompatible_contract) &&
+                     !CaptureCheckpointV1(incompatible.data(),
+                                          incompatible.size(), *config,
+                                          runtime),
+                 "rank2_capture_rejects_non_common_descriptor") &&
+      passed;
+
+  const auto capture = CaptureCheckpointV1(valid.data(), valid.size(),
+                                            *config, runtime);
+  passed = Check(capture.has_value() && capture->rank_count() == 2,
+                 "rank2_capture_retains_one_descriptor_per_rank") &&
+      passed;
+  if (!capture) { return false; }
+  auto views = fixture.Views();
+  std::vector<std::uint8_t> encoded;
+  passed = Check(EncodeCheckpointV1(*capture, views.data(), views.size(),
+                                    encoded) == CheckpointCodecStatus::ok,
+                 "rank2_exact_extent_fixture_encodes") &&
+      passed;
+
+  Rank2DecodeOutput output;
+  auto buffers = output.Buffers();
+  passed = Check(DecodeCheckpointV1(
+                         {encoded.data(), encoded.size()}, *config, resources,
+                         runtime, buffers.data(), buffers.size(),
+                         output.metadata) == CheckpointCodecStatus::ok &&
+                     output.interior == fixture.interior &&
+                     output.trace == fixture.trace &&
+                     output.metadata.rank_count == 2 &&
+                     output.metadata.aggregate_interior_coefficients == 144 &&
+                     output.metadata.aggregate_true_trace_coefficients == 144,
+                 "rank2_exact_extents_round_trip") &&
+      passed;
+
+  fixture.interior[0][0] += 0.25;
+  views = fixture.Views();
+  std::vector<std::uint8_t> unchanged{{0xaa, 0xbb}};
+  passed = Check(
+               EncodeCheckpointV1(*capture, views.data(), views.size(),
+                                  unchanged) ==
+                       CheckpointCodecStatus::local_payload_hash_mismatch &&
+                   unchanged == std::vector<std::uint8_t>({0xaa, 0xbb}),
+               "non_injection_source_rank_payload_requires_own_live_hash") &&
+      passed;
+  return passed;
+}
+
 bool CheckGoldenRoundTrip()
 {
   const CoefficientFixture fixture;
-  const PersistentResourceDescriptor resources = TestResources();
+  const PersistentResourceDescriptor resources = TestResources(1);
   const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
-  const ApplicationValidation validation = TestValidation();
+  const ApplicationValidation validation =
+      TestValidation(CpuSerialBackendTag::id);
   const ValidatedApplicationConfig* config = validation.config();
   if (config == nullptr) { return Check(false, "golden_static_config"); }
   std::vector<std::uint8_t> encoded;
@@ -856,18 +1285,29 @@ bool CheckGoldenRoundTrip()
   const StateHash expected_trace = OracleCoefficientHash(fixture.trace);
   passed = Check(
                Hex(expected_interior) ==
-                       "63b84f617d28be16889d09da2bf88a144d908cdc462a176953c8c67191d68359" &&
+                       "05bccc0bd8f36d56256ec2b51f43394c"
+                       "5657b3d503feb5c83f60b42ffb384be0" &&
                    Hex(expected_trace) ==
-                       "b0c0959fdf6d33e5435ebb3bb41ea582d274b360e1597fdd886ac1ebeb361f36",
+                       "cfd19833fb0bbcdacb37ece36935eabd"
+                       "c4c7510b69246bd5866599a659882126",
                "hard_coded_local_payload_digests") &&
       passed;
   const LayoutOffsets layout = Locate(encoded);
-  const std::vector<std::uint8_t> expected_payload = HexBytes(
-      "000000000000f03f00000000000000c00000000000000c40"
-      "000000000000008000000000000014400000000000001940"
-      "0000000000001ec00000000000002040");
-  passed = Check(std::equal(expected_payload.begin(), expected_payload.end(),
-                           encoded.begin() + layout.payload),
+  std::vector<std::uint8_t> expected_payload;
+  expected_payload.reserve((fixture.interior.size() + fixture.trace.size()) *
+                           sizeof(double));
+  for (const State* state : {&fixture.interior, &fixture.trace})
+  {
+    for (const double value : *state)
+    {
+      AppendU64(expected_payload, OracleBits(value));
+    }
+  }
+  passed = Check(layout.payload + expected_payload.size() + 32 ==
+                         encoded.size() &&
+                     std::equal(expected_payload.begin(),
+                                expected_payload.end(),
+                                encoded.begin() + layout.payload),
                  "all_FP64_coefficients_are_hard_coded_little_endian") &&
       passed;
 
@@ -882,14 +1322,16 @@ bool CheckGoldenRoundTrip()
   CheckpointDescriptor expected_descriptor{};
   const Slot committed{fixture.interior, fixture.trace};
   Slot candidate{};
-  Contract contract(committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
+  SerialContract contract(
+      committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
   passed = Check(AdvanceOneCommit(contract) &&
                      contract.TryMakeCheckpoint(expected_descriptor),
                  "independent_expected_descriptor_available") &&
       passed;
   expected_descriptor.interior_hash =
-      OracleManifestHash(1, 32, expected_interior);
-  expected_descriptor.trace_hash = OracleManifestHash(2, 32, expected_trace);
+      OracleManifestHash(1, 1152, expected_interior);
+  expected_descriptor.trace_hash =
+      OracleManifestHash(2, 1152, expected_trace);
   passed = Check(
                output.interior == fixture.interior &&
                    output.trace == fixture.trace &&
@@ -901,6 +1343,8 @@ bool CheckGoldenRoundTrip()
                    output.metadata.checkpoint_id == config->checkpoint_id() &&
                    output.metadata.physical_gpu_uuid ==
                        runtime.physical_gpu_uuid &&
+                   output.metadata.partition_layout_rule_id.view() ==
+                       checkpoint_partition_layout_rule_id_v1 &&
                    output.metadata.scientific_config_sha256 ==
                        config->scientific_config_sha256() &&
                    output.metadata.run_config_sha256 ==
@@ -908,12 +1352,22 @@ bool CheckGoldenRoundTrip()
                    output.metadata.ownership_hash == runtime.ownership_hash &&
                    output.metadata.mesh_n == 3 &&
                    output.metadata.rank_count == 1 &&
-                   output.metadata.aggregate_interior_coefficients == 4 &&
-                   output.metadata.aggregate_true_trace_coefficients == 4 &&
+                   output.metadata.aggregate_interior_coefficients == 144 &&
+                   output.metadata.aggregate_true_trace_coefficients == 144 &&
                    Hex(output.metadata.artifact_hash) ==
-                       "66f62405b9fe6f9de15874ce90826cab"
-                       "fa8b5d0b3d7676b5e434dbcec0cae25c",
+                       "b13e2e869287ea62be89252fb3e7c91e"
+                       "87c01291bea201f462e9c8780cfc120a",
                "all_identity_descriptor_count_and_buffer_fields_decode") &&
+      passed;
+
+  CheckpointDescriptor wrong_time = expected_descriptor;
+  wrong_time.coordinates.time = 0.1;
+  wrong_time.coordinate_fingerprint =
+      OracleCoordinateFingerprint(wrong_time.coordinates);
+  passed = Check(ValidateSameTupleRestartV1(
+                         wrong_time, *config, resources, runtime, runtime) ==
+                         CheckpointCodecStatus::invalid_descriptor,
+                 "restart_validation_rejects_correlated_wrong_finite_time") &&
       passed;
   return passed;
 }
@@ -922,9 +1376,10 @@ bool CheckEncoderControls()
 {
   const CoefficientFixture fixture;
   auto views = fixture.Views();
-  const PersistentResourceDescriptor resources = TestResources();
+  const PersistentResourceDescriptor resources = TestResources(1);
   const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
-  const ApplicationValidation validation = TestValidation();
+  const ApplicationValidation validation =
+      TestValidation(CpuSerialBackendTag::id);
   const ValidatedApplicationConfig* config = validation.config();
   if (config == nullptr) { return Check(false, "encoder_static_config"); }
   const auto capture = MakeCapture(*config, resources, runtime, fixture);
@@ -946,7 +1401,7 @@ bool CheckEncoderControls()
   expect_failure(invalid, CheckpointCodecStatus::invalid_coefficient_schema,
                  "encoder_component_schema_failure_atomic");
   invalid = views;
-  invalid[0].interior.coefficient_count = 5;
+  invalid[0].interior.coefficient_count = 140;
   expect_failure(invalid, CheckpointCodecStatus::coefficient_count_mismatch,
                  "encoder_exact_count_failure_atomic");
   invalid = views;
@@ -969,9 +1424,10 @@ bool CheckEncoderControls()
 bool CheckDecodeMutationCensusAndAtomicity()
 {
   const CoefficientFixture fixture;
-  const PersistentResourceDescriptor resources = TestResources();
+  const PersistentResourceDescriptor resources = TestResources(1);
   const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
-  const ApplicationValidation validation = TestValidation();
+  const ApplicationValidation validation =
+      TestValidation(CpuSerialBackendTag::id);
   const ValidatedApplicationConfig* config = validation.config();
   if (config == nullptr) { return Check(false, "mutation_static_config"); }
   std::vector<std::uint8_t> encoded;
@@ -1044,8 +1500,8 @@ bool CheckDecodeMutationCensusAndAtomicity()
     static_cast<void>(Seal(damaged));
     expect_any_failure(damaged, field.name);
   }
-  passed = Check(layout.exact_fields.size() == 83,
-                 "frozen_exact_field_mutation_census_is_83") &&
+  passed = Check(layout.exact_fields.size() == 84,
+                 "frozen_exact_field_mutation_census_is_84") &&
       passed;
 
   damaged = encoded;
@@ -1070,20 +1526,57 @@ bool CheckDecodeMutationCensusAndAtomicity()
   damaged = encoded;
   WriteU64(damaged, layout.payload, UINT64_C(0x7ff8000000000000));
   const StateHash nan_local =
-      OracleHash(damaged.data() + layout.payload, 32);
+      OracleHash(damaged.data() + layout.payload, 1152);
   std::copy(nan_local.bytes.begin(), nan_local.bytes.end(),
             damaged.begin() + layout.interior_hash);
-  const StateHash nan_aggregate = OracleManifestHash(1, 32, nan_local);
+  const StateHash nan_aggregate = OracleManifestHash(1, 1152, nan_local);
   std::copy(nan_aggregate.bytes.begin(), nan_aggregate.bytes.end(),
             damaged.begin() + layout.descriptor_interior_hash);
   static_cast<void>(Seal(damaged));
   expect_failure(damaged, CheckpointCodecStatus::noncanonical_fp64,
                  "nonfinite_FP64_rejected_in_first_pass");
 
+  damaged = encoded;
+  const StateCoordinates wrong_coordinates{0.1, 1, 1, 1, 0.05};
+  WriteU64(damaged, layout.descriptor_coordinate_time,
+           OracleBits(wrong_coordinates.time));
+  WriteU64(damaged, layout.descriptor_coordinate_fingerprint,
+           OracleCoordinateFingerprint(wrong_coordinates));
+  static_cast<void>(Seal(damaged));
+  expect_failure(damaged, CheckpointCodecStatus::invalid_descriptor,
+                 "correlated_wrong_finite_checkpoint_time_rejected");
+
+  damaged = encoded;
+  constexpr std::uint64_t shortened_count = 140;
+  constexpr std::uint64_t shortened_dofs = 35;
+  constexpr std::uint64_t shortened_bytes = shortened_count * sizeof(double);
+  const std::size_t removed_begin =
+      layout.payload + static_cast<std::size_t>(shortened_bytes);
+  const std::size_t removed_end = layout.payload + 144 * sizeof(double);
+  damaged.erase(damaged.begin() + removed_begin,
+                damaged.begin() + removed_end);
+  WriteU64(damaged, 20, damaged.size());
+  WriteU64(damaged, layout.aggregate_interior_count, shortened_count);
+  WriteU64(damaged, layout.interior_coefficient_count, shortened_count);
+  WriteU64(damaged, layout.interior_dofs_per_component, shortened_dofs);
+  WriteU64(damaged, layout.interior_byte_count, shortened_bytes);
+  const StateHash shortened_local =
+      OracleHash(damaged.data() + layout.payload, shortened_bytes);
+  std::copy(shortened_local.bytes.begin(), shortened_local.bytes.end(),
+            damaged.begin() + layout.interior_hash);
+  const StateHash shortened_aggregate =
+      OracleManifestHash(1, shortened_bytes, shortened_local);
+  std::copy(shortened_aggregate.bytes.begin(),
+            shortened_aggregate.bytes.end(),
+            damaged.begin() + layout.descriptor_interior_hash);
+  static_cast<void>(Seal(damaged));
+  expect_failure(damaged, CheckpointCodecStatus::coefficient_count_mismatch,
+                 "correlated_count_payload_and_hash_mutation_rejected");
+
   DecodeSentinel capacity_output;
   const DecodeSentinel original = capacity_output;
   auto short_buffers = capacity_output.Buffers();
-  short_buffers[0].interior.capacity = 3;
+  short_buffers[0].interior.capacity = 143;
   passed = Check(DecodeCheckpointV1(
                          {encoded.data(), encoded.size()}, *config, resources,
                          runtime, short_buffers.data(), short_buffers.size(),
@@ -1115,7 +1608,9 @@ int main()
 {
   bool passed = true;
   passed = CheckIndependentOracle() && passed;
+  passed = CheckExactScenarioExtents() && passed;
   passed = CheckLiveCaptureAndRepeatableEncode() && passed;
+  passed = CheckRank2CaptureAndAllRankEvidence() && passed;
   passed = CheckGoldenRoundTrip() && passed;
   passed = CheckEncoderControls() && passed;
   passed = CheckDecodeMutationCensusAndAtomicity() && passed;

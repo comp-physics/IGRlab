@@ -221,7 +221,9 @@ private:
   std::size_t offset_ = 0;
 };
 
-bool DescriptorStructurallyValid(const CheckpointDescriptor& value) noexcept
+bool DescriptorStructurallyValid(
+    const CheckpointDescriptor& value,
+    const ValidatedApplicationConfig& config) noexcept
 {
   return value.schema_version == checkpoint_schema_version &&
       value.successful_commit &&
@@ -241,6 +243,7 @@ bool DescriptorStructurallyValid(const CheckpointDescriptor& value) noexcept
       value.coordinate_fingerprint ==
           ::dg::hdg::runtime::detail::CoordinateFingerprint(
               value.coordinates) &&
+      ScenarioCheckpointTimeMatchesV1(value.coordinates.time, config) &&
       NonzeroHash(value.interior_hash) && NonzeroHash(value.trace_hash);
 }
 
@@ -568,18 +571,21 @@ struct RankMetadata
 
 CheckpointCodecStatus ValidateBlockView(
     const Fp64CoefficientViewV1& block,
+    const std::uint64_t expected_dofs_per_component,
+    const std::uint64_t exact_coefficient_count,
     BlockMetadata& metadata) noexcept
 {
   std::uint64_t expected_count = 0;
   std::uint64_t byte_count = 0;
   if (block.data == nullptr || block.coefficient_count == 0 ||
       block.component_count != euler_state_component_count_v1 ||
-      block.dofs_per_component == 0 ||
       block.ordering != CoefficientOrderingV1::component_major)
   {
     return CheckpointCodecStatus::invalid_coefficient_schema;
   }
-  if (!Multiply(block.component_count, block.dofs_per_component,
+  if (block.dofs_per_component != expected_dofs_per_component ||
+      block.coefficient_count != exact_coefficient_count ||
+      !Multiply(block.component_count, block.dofs_per_component,
                 expected_count) ||
       expected_count != block.coefficient_count ||
       !Multiply(block.coefficient_count, fp64_coefficient_bytes_v1,
@@ -621,6 +627,7 @@ CheckpointCodecStatus InspectRanks(
     const StagedStateViewV1* ranks,
     const std::size_t rank_count,
     const std::uint32_t expected_rank_count,
+    const ScenarioCoefficientExtentsV1& extents,
     std::array<RankMetadata, application_checkpoint_max_rank_count_v1>&
         metadata,
     std::uint64_t& total_interior,
@@ -642,10 +649,17 @@ CheckpointCodecStatus InspectRanks(
     }
     RankMetadata candidate{};
     candidate.rank = ranks[index].rank;
-    CheckpointCodecStatus status =
-        ValidateBlockView(ranks[index].interior, candidate.interior);
+    CheckpointCodecStatus status = ValidateBlockView(
+        ranks[index].interior,
+        extents.ranks[index].interior_dofs_per_component,
+        extents.ranks[index].interior_coefficient_count,
+        candidate.interior);
     if (status != CheckpointCodecStatus::ok) { return status; }
-    status = ValidateBlockView(ranks[index].owned_true_trace, candidate.trace);
+    status = ValidateBlockView(
+        ranks[index].owned_true_trace,
+        extents.ranks[index].trace_dofs_per_component,
+        extents.ranks[index].trace_coefficient_count,
+        candidate.trace);
     if (status != CheckpointCodecStatus::ok) { return status; }
     if (!Add(total_interior, candidate.interior.coefficient_count,
              total_interior) ||
@@ -712,17 +726,20 @@ bool ReadBlockMetadata(Reader& reader, BlockMetadata& block) noexcept
 }
 
 CheckpointCodecStatus ValidateBlockMetadata(
-    const BlockMetadata& block) noexcept
+    const BlockMetadata& block,
+    const std::uint64_t expected_dofs_per_component,
+    const std::uint64_t exact_coefficient_count) noexcept
 {
   std::uint64_t expected_count = 0;
   std::uint64_t expected_bytes = 0;
   if (block.component_count != euler_state_component_count_v1 ||
-      block.dofs_per_component == 0 ||
       block.ordering != CoefficientOrderingV1::component_major)
   {
     return CheckpointCodecStatus::invalid_coefficient_schema;
   }
-  if (!Multiply(block.component_count, block.dofs_per_component,
+  if (block.dofs_per_component != expected_dofs_per_component ||
+      block.coefficient_count != exact_coefficient_count ||
+      !Multiply(block.component_count, block.dofs_per_component,
                 expected_count) ||
       expected_count != block.coefficient_count ||
       !Multiply(block.coefficient_count, fp64_coefficient_bytes_v1,
@@ -827,6 +844,96 @@ bool ValidCheckpointRuntimeIdentityV1(
   return false;
 }
 
+bool ScenarioCheckpointTimeMatchesV1(
+    const double time,
+    const ValidatedApplicationConfig& config) noexcept
+{
+  if (!std::isfinite(time) || !std::isfinite(config.dt())) { return false; }
+  const double expected =
+      static_cast<double>(config.checkpoint_step()) * config.dt();
+  if (!std::isfinite(expected)) { return false; }
+  const double scale = std::max(1.0, std::abs(expected));
+  return std::abs(time - expected) <=
+      8.0 * std::numeric_limits<double>::epsilon() * scale;
+}
+
+bool DeriveScenarioCoefficientExtentsV1(
+    const ValidatedApplicationConfig& config,
+    const std::uint32_t rank_count,
+    ScenarioCoefficientExtentsV1& extents) noexcept
+{
+  if (rank_count == 0 ||
+      rank_count > application_checkpoint_max_rank_count_v1 ||
+      rank_count != config.deferred_runtime().required_mpi_rank_count ||
+      config.mesh_n() == 0 || config.polynomial_order() < 0)
+  {
+    return false;
+  }
+  std::uint64_t element_count = 0;
+  if (!codec_detail::Multiply(config.mesh_n(), config.mesh_n(),
+                              element_count) ||
+      element_count == 0)
+  {
+    return false;
+  }
+  std::array<std::uint64_t, application_checkpoint_max_rank_count_v1>
+      owned_elements{};
+  std::array<std::uint64_t, application_checkpoint_max_rank_count_v1>
+      owned_faces{};
+  const auto element_rank = [rank_count, element_count](
+                                const std::uint64_t element) noexcept {
+    return static_cast<std::uint32_t>((element * rank_count) / element_count);
+  };
+  for (std::uint64_t element = 0; element < element_count; ++element)
+  {
+    ++owned_elements[element_rank(element)];
+  }
+  const std::uint64_t n = config.mesh_n();
+  for (std::uint64_t y = 0; y < n; ++y)
+  {
+    for (std::uint64_t x = 0; x < n; ++x)
+    {
+      const std::uint64_t element = y * n + x;
+      const std::uint64_t left = y * n + (x + n - 1) % n;
+      const std::uint64_t below = ((y + n - 1) % n) * n + x;
+      ++owned_faces[std::min(element_rank(left), element_rank(element))];
+      ++owned_faces[std::min(element_rank(below), element_rank(element))];
+    }
+  }
+
+  ScenarioCoefficientExtentsV1 candidate{};
+  candidate.rank_count = rank_count;
+  const std::uint64_t p1 =
+      static_cast<std::uint64_t>(config.polynomial_order() + 1);
+  std::uint64_t interior_basis = 0;
+  if (!codec_detail::Multiply(p1, p1, interior_basis)) { return false; }
+  for (std::uint32_t rank = 0; rank < rank_count; ++rank)
+  {
+    RankCoefficientExtentsV1& value = candidate.ranks[rank];
+    if (!codec_detail::Multiply(owned_elements[rank], interior_basis,
+                                value.interior_dofs_per_component) ||
+        !codec_detail::Multiply(value.interior_dofs_per_component,
+                                euler_state_component_count_v1,
+                                value.interior_coefficient_count) ||
+        !codec_detail::Multiply(owned_faces[rank], p1,
+                                value.trace_dofs_per_component) ||
+        !codec_detail::Multiply(value.trace_dofs_per_component,
+                                euler_state_component_count_v1,
+                                value.trace_coefficient_count) ||
+        !codec_detail::Add(candidate.aggregate_interior_coefficient_count,
+                           value.interior_coefficient_count,
+                           candidate.aggregate_interior_coefficient_count) ||
+        !codec_detail::Add(candidate.aggregate_trace_coefficient_count,
+                           value.trace_coefficient_count,
+                           candidate.aggregate_trace_coefficient_count))
+    {
+      return false;
+    }
+  }
+  extents = candidate;
+  return true;
+}
+
 CheckpointCodecStatus ValidateSameTupleRestartV1(
     const CheckpointDescriptor& checkpoint,
     const ValidatedApplicationConfig& expected_config,
@@ -834,7 +941,8 @@ CheckpointCodecStatus ValidateSameTupleRestartV1(
     const CheckpointRuntimeIdentityV1& expected_runtime_identity,
     const CheckpointRuntimeIdentityV1& artifact_runtime_identity) noexcept
 {
-  if (!codec_detail::DescriptorStructurallyValid(checkpoint) ||
+  if (!codec_detail::DescriptorStructurallyValid(checkpoint,
+                                                 expected_config) ||
       !expected_resources.Valid())
   {
     return CheckpointCodecStatus::invalid_descriptor;
@@ -866,7 +974,10 @@ CheckpointCodecStatus ValidateSameTupleRestartV1(
       checkpoint.precision != expected_config.tuple().precision ||
       checkpoint.coordinates.step != expected_config.checkpoint_step() ||
       checkpoint.coordinates.cursor != expected_config.checkpoint_step() ||
-      DoubleBits(checkpoint.dt) != DoubleBits(expected_config.dt()))
+      !ScenarioCheckpointTimeMatchesV1(checkpoint.coordinates.time,
+                                       expected_config) ||
+      codec_detail::DoubleBits(checkpoint.dt) !=
+          codec_detail::DoubleBits(expected_config.dt()))
   {
     return CheckpointCodecStatus::resource_mismatch;
   }
@@ -885,8 +996,10 @@ CheckpointCodecStatus EncodeCheckpointV1(
     const ValidatedApplicationConfig& config = checkpoint.config();
     const CheckpointRuntimeIdentityV1& runtime =
         checkpoint.runtime_identity();
-    const CheckpointDescriptor& captured_descriptor = checkpoint.descriptor();
-    if (!DescriptorStructurallyValid(captured_descriptor) ||
+    const CheckpointDescriptor& captured_descriptor =
+        checkpoint.rank_descriptor(0);
+    if (checkpoint.rank_count() != rank_count ||
+        !DescriptorStructurallyValid(captured_descriptor, config) ||
         !ValidCheckpointRuntimeIdentityV1(config, runtime) ||
         captured_descriptor.tuple != config.tuple() ||
         captured_descriptor.rank_count !=
@@ -896,23 +1009,35 @@ CheckpointCodecStatus EncodeCheckpointV1(
     {
       return CheckpointCodecStatus::invalid_descriptor;
     }
+    ScenarioCoefficientExtentsV1 extents{};
+    if (!DeriveScenarioCoefficientExtentsV1(
+            config, captured_descriptor.rank_count, extents))
+    {
+      return CheckpointCodecStatus::invalid_descriptor;
+    }
 
     std::array<RankMetadata, application_checkpoint_max_rank_count_v1>
         metadata{};
     std::uint64_t interior_count = 0;
     std::uint64_t trace_count = 0;
     CheckpointCodecStatus status = InspectRanks(
-        ranks, rank_count, captured_descriptor.rank_count, metadata,
+        ranks, rank_count, captured_descriptor.rank_count, extents, metadata,
         interior_count, trace_count);
     if (status != CheckpointCodecStatus::ok) { return status; }
-    const std::uint32_t source_rank =
-        config.deferred_runtime().required_injected_source_rank;
-    if (source_rank >= rank_count ||
-        metadata[source_rank].interior.hash !=
-            captured_descriptor.interior_hash ||
-        metadata[source_rank].trace.hash != captured_descriptor.trace_hash)
+    if (interior_count != extents.aggregate_interior_coefficient_count ||
+        trace_count != extents.aggregate_trace_coefficient_count)
     {
-      return CheckpointCodecStatus::local_payload_hash_mismatch;
+      return CheckpointCodecStatus::coefficient_count_mismatch;
+    }
+    for (std::size_t rank = 0; rank < rank_count; ++rank)
+    {
+      const CheckpointDescriptor& live = checkpoint.rank_descriptor(rank);
+      if (!DescriptorStructurallyValid(live, config) ||
+          metadata[rank].interior.hash != live.interior_hash ||
+          metadata[rank].trace.hash != live.trace_hash)
+      {
+        return CheckpointCodecStatus::local_payload_hash_mismatch;
+      }
     }
     RankPayloadHashV1 aggregate_interior{};
     RankPayloadHashV1 aggregate_trace{};
@@ -929,8 +1054,11 @@ CheckpointCodecStatus EncodeCheckpointV1(
     writer.Bytes(magic.data(), magic.size());
     writer.UnsignedLittleEndian(application_checkpoint_codec_version_v1);
     writer.UnsignedLittleEndian(std::uint64_t{0});
+    const StableIdentity partition_layout_rule =
+        StableIdentity::Copy(checkpoint_partition_layout_rule_id_v1);
     if (!WriteConfig(writer, config) ||
-        !writer.Identity(runtime.physical_gpu_uuid))
+        !writer.Identity(runtime.physical_gpu_uuid) ||
+        !writer.Identity(partition_layout_rule))
     {
       return CheckpointCodecStatus::invalid_config_identity;
     }
@@ -1031,9 +1159,11 @@ CheckpointCodecStatus DecodeCheckpointV1(
   if (!reader.Skip(prefix_size)) { return CheckpointCodecStatus::truncated; }
   ArtifactConfig artifact_config{};
   CheckpointRuntimeIdentityV1 artifact_runtime{};
+  StableIdentity artifact_partition_layout_rule{};
   CheckpointDescriptor descriptor{};
   if (!ReadConfig(reader, artifact_config) ||
       !reader.Identity(artifact_runtime.physical_gpu_uuid) ||
+      !reader.Identity(artifact_partition_layout_rule) ||
       !reader.Hash(artifact_runtime.ownership_hash) ||
       !ReadDescriptor(reader, descriptor))
   {
@@ -1043,7 +1173,9 @@ CheckpointCodecStatus DecodeCheckpointV1(
   {
     return CheckpointCodecStatus::invalid_config_identity;
   }
-  if (!DescriptorStructurallyValid(descriptor))
+  if (artifact_partition_layout_rule.view() !=
+          checkpoint_partition_layout_rule_id_v1 ||
+      !DescriptorStructurallyValid(descriptor, expected_config))
   {
     return CheckpointCodecStatus::invalid_descriptor;
   }
@@ -1072,6 +1204,12 @@ CheckpointCodecStatus DecodeCheckpointV1(
   {
     return CheckpointCodecStatus::output_buffer_mismatch;
   }
+  ScenarioCoefficientExtentsV1 extents{};
+  if (!DeriveScenarioCoefficientExtentsV1(expected_config, rank_count,
+                                          extents))
+  {
+    return CheckpointCodecStatus::invalid_descriptor;
+  }
   const std::uint64_t metadata_bytes =
       static_cast<std::uint64_t>(rank_count) * rank_record_size;
   if (metadata_bytes > reader.Remaining())
@@ -1096,9 +1234,13 @@ CheckpointCodecStatus DecodeCheckpointV1(
     {
       return CheckpointCodecStatus::invalid_rank_manifest;
     }
-    status = ValidateBlockMetadata(rank.interior);
+    status = ValidateBlockMetadata(
+        rank.interior, extents.ranks[index].interior_dofs_per_component,
+        extents.ranks[index].interior_coefficient_count);
     if (status != CheckpointCodecStatus::ok) { return status; }
-    status = ValidateBlockMetadata(rank.trace);
+    status = ValidateBlockMetadata(
+        rank.trace, extents.ranks[index].trace_dofs_per_component,
+        extents.ranks[index].trace_coefficient_count);
     if (status != CheckpointCodecStatus::ok) { return status; }
     if (!Add(expected_payload_bytes, rank.interior.byte_count,
              expected_payload_bytes) ||
@@ -1118,7 +1260,10 @@ CheckpointCodecStatus DecodeCheckpointV1(
     }
   }
   if (summed_interior != aggregate_interior_count ||
-      summed_trace != aggregate_trace_count)
+      summed_trace != aggregate_trace_count ||
+      aggregate_interior_count !=
+          extents.aggregate_interior_coefficient_count ||
+      aggregate_trace_count != extents.aggregate_trace_coefficient_count)
   {
     return CheckpointCodecStatus::coefficient_count_mismatch;
   }
@@ -1155,6 +1300,8 @@ CheckpointCodecStatus DecodeCheckpointV1(
   candidate_metadata.scenario_id = artifact_config.scenario_id;
   candidate_metadata.checkpoint_id = artifact_config.checkpoint_id;
   candidate_metadata.physical_gpu_uuid = artifact_runtime.physical_gpu_uuid;
+  candidate_metadata.partition_layout_rule_id =
+      artifact_partition_layout_rule;
   candidate_metadata.scientific_config_sha256 =
       artifact_config.scientific_config_sha256;
   candidate_metadata.run_config_sha256 = artifact_config.run_config_sha256;
