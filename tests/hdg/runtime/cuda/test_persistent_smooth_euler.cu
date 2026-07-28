@@ -2296,6 +2296,110 @@ bool SamePersistentIdentity(const CudaReuseEvidence& initial,
       current.persistent_workspace;
 }
 
+void ReportFunctionalReferenceTerminalDiagnostic(
+    const int rank, const int ranks, const bool contract_present,
+    const std::uint64_t step, const std::uint64_t cursor,
+    const std::uint64_t commits, const CudaReuseEvidence& initial,
+    const CudaReuseEvidence& current,
+    const bool persistent_identity_exact) noexcept
+{
+  const bool topology_nonzero = initial.topology_token != 0;
+  const bool topology_same =
+      initial.topology_token == current.topology_token;
+  const bool double_arena_same =
+      initial.double_arena_token == current.double_arena_token;
+  const bool integer_arena_same =
+      initial.integer_arena_token == current.integer_arena_token;
+  const bool matrix_same = initial.matrix_token == current.matrix_token;
+  const bool factor_same = initial.factor_token == current.factor_token;
+  const bool workspace_same =
+      initial.workspace_token == current.workspace_token;
+  const bool interior_slots_same =
+      (initial.interior_slot_tokens == current.interior_slot_tokens) ||
+      (initial.interior_slot_tokens[0] == current.interior_slot_tokens[1] &&
+       initial.interior_slot_tokens[1] == current.interior_slot_tokens[0]);
+  const bool trace_slots_same =
+      (initial.trace_slot_tokens == current.trace_slot_tokens) ||
+      (initial.trace_slot_tokens[0] == current.trace_slot_tokens[1] &&
+       initial.trace_slot_tokens[1] == current.trace_slot_tokens[0]);
+  const bool allocation_calls_exact =
+      current.post_baseline_w8_owned_allocation_calls == 0;
+  const std::uint64_t allocation_event_limit = ranks == 2 ? 1 : 0;
+  const bool allocation_events_exact =
+      current.post_baseline_allocation_events <= allocation_event_limit;
+
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_REFERENCE_TERMINAL rank=%d ranks=%d contract=%u "
+      "step=%llu/%llu:%u cursor=%llu/%llu:%u commits=%llu/%llu:%u\n",
+      rank, ranks, contract_present ? 1U : 0U,
+      static_cast<unsigned long long>(step),
+      static_cast<unsigned long long>(functional_accepted_steps),
+      step == functional_accepted_steps ? 1U : 0U,
+      static_cast<unsigned long long>(cursor),
+      static_cast<unsigned long long>(functional_accepted_steps),
+      cursor == functional_accepted_steps ? 1U : 0U,
+      static_cast<unsigned long long>(commits),
+      static_cast<unsigned long long>(functional_accepted_steps),
+      commits == functional_accepted_steps ? 1U : 0U);
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_REFERENCE_IDENTITY rank=%d ranks=%d "
+      "topology_nonzero=%u topology_same=%u topology=0x%llx/0x%llx "
+      "double_same=%u double=0x%llx/0x%llx "
+      "integer_same=%u integer=0x%llx/0x%llx "
+      "matrix_same=%u matrix=0x%llx/0x%llx "
+      "factor_same=%u factor=0x%llx/0x%llx "
+      "workspace_same=%u workspace=0x%llx/0x%llx\n",
+      rank, ranks, topology_nonzero ? 1U : 0U,
+      topology_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.topology_token),
+      static_cast<unsigned long long>(current.topology_token),
+      double_arena_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.double_arena_token),
+      static_cast<unsigned long long>(current.double_arena_token),
+      integer_arena_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.integer_arena_token),
+      static_cast<unsigned long long>(current.integer_arena_token),
+      matrix_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.matrix_token),
+      static_cast<unsigned long long>(current.matrix_token),
+      factor_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.factor_token),
+      static_cast<unsigned long long>(current.factor_token),
+      workspace_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.workspace_token),
+      static_cast<unsigned long long>(current.workspace_token));
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_REFERENCE_REUSE rank=%d ranks=%d "
+      "interior_slots_same=%u interior=0x%llx,0x%llx/0x%llx,0x%llx "
+      "trace_slots_same=%u trace=0x%llx,0x%llx/0x%llx,0x%llx "
+      "allocation_calls=%llu/0:%u allocation_events=%llu/%llu:%u "
+      "scope_only=%u churn_absent=%u persistent_graph=%u "
+      "persistent_slots=%u persistent_workspace=%u identity=%u\n",
+      rank, ranks, interior_slots_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.interior_slot_tokens[0]),
+      static_cast<unsigned long long>(initial.interior_slot_tokens[1]),
+      static_cast<unsigned long long>(current.interior_slot_tokens[0]),
+      static_cast<unsigned long long>(current.interior_slot_tokens[1]),
+      trace_slots_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.trace_slot_tokens[0]),
+      static_cast<unsigned long long>(initial.trace_slot_tokens[1]),
+      static_cast<unsigned long long>(current.trace_slot_tokens[0]),
+      static_cast<unsigned long long>(current.trace_slot_tokens[1]),
+      static_cast<unsigned long long>(
+          current.post_baseline_w8_owned_allocation_calls),
+      allocation_calls_exact ? 1U : 0U,
+      static_cast<unsigned long long>(
+          current.post_baseline_allocation_events),
+      static_cast<unsigned long long>(allocation_event_limit),
+      allocation_events_exact ? 1U : 0U,
+      current.observes_w8_owned_calls_and_pool_growth_only ? 1U : 0U,
+      !current.opaque_pool_reuse_churn_observed ? 1U : 0U,
+      current.persistent_graph ? 1U : 0U,
+      current.persistent_slots ? 1U : 0U,
+      current.persistent_workspace ? 1U : 0U,
+      persistent_identity_exact ? 1U : 0U);
+}
+
 template <typename Backend>
 using TestEngine = PersistentCudaSmoothEulerEngine<
     TestSelection<Backend>, AuditedAllocator, AuditedTransport,
@@ -3482,12 +3586,29 @@ bool RunFunctionalTrajectory(const int ranks, const char* const context)
         return false;
     }
     const auto* contract = reference->contract();
-    if (!CollectivelyExact(contract != nullptr &&
-            contract->coordinates().step == functional_accepted_steps &&
-            contract->coordinates().cursor == functional_accepted_steps &&
-            contract->telemetry().commits == functional_accepted_steps &&
-            SamePersistentIdentity(
-                setup.reuse, reference->ReuseEvidence(), ranks)))
+    const CudaReuseEvidence current_reuse = reference->ReuseEvidence();
+    const bool contract_present = contract != nullptr;
+    const std::uint64_t terminal_step =
+        contract_present ? contract->coordinates().step : 0;
+    const std::uint64_t terminal_cursor =
+        contract_present ? contract->coordinates().cursor : 0;
+    const std::uint64_t terminal_commits =
+        contract_present ? contract->telemetry().commits : 0;
+    const bool persistent_identity_exact =
+        SamePersistentIdentity(setup.reuse, current_reuse, ranks);
+    const bool reference_terminal_local = contract_present &&
+        terminal_step == functional_accepted_steps &&
+        terminal_cursor == functional_accepted_steps &&
+        terminal_commits == functional_accepted_steps &&
+        persistent_identity_exact;
+    const bool reference_terminal_collective =
+        CollectivelyExact(reference_terminal_local);
+    if (!reference_terminal_collective)
+      ReportFunctionalReferenceTerminalDiagnostic(
+          setup.rank, ranks, contract_present, terminal_step,
+          terminal_cursor, terminal_commits, setup.reuse, current_reuse,
+          persistent_identity_exact);
+    if (!reference_terminal_collective)
       return false;
     reference_interior = step.descriptor.interior_hash;
     reference_trace = step.descriptor.trace_hash;
