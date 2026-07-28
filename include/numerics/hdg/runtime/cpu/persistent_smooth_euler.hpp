@@ -2,7 +2,7 @@
 
 /**
  * @file numerics/hdg/runtime/cpu/persistent_smooth_euler.hpp
- * @brief Bounded p=1/N=3 persistent conventional Euler HDG CPU adapter.
+ * @brief Bounded smoke and functional conventional Euler HDG CPU adapter.
  *
  * The caller supplies the complete static Selection.  This CPU leaf does not
  * define the campaign's canonical case tag or any cross-backend DTO.  Its
@@ -29,9 +29,23 @@ namespace dg::hdg::runtime::cpu
 
 inline constexpr int cpu_dimension = 2;
 inline constexpr int cpu_conserved_components = 4;
-inline constexpr int cpu_polynomial_order = 1;
-inline constexpr int cpu_elements_per_direction = 3;
-inline constexpr int cpu_assembly_quadrature_order = 11;
+inline constexpr int cpu_smoke_polynomial_order = 1;
+inline constexpr int cpu_smoke_elements_per_direction = 3;
+inline constexpr int cpu_smoke_assembly_quadrature_order = 11;
+inline constexpr int cpu_functional_polynomial_order = 2;
+inline constexpr int cpu_functional_minimum_elements_per_direction = 3;
+inline constexpr int cpu_functional_principal_elements_per_direction = 6;
+inline constexpr int cpu_functional_maximum_elements_per_direction = 12;
+inline constexpr int cpu_functional_assembly_quadrature_order = 14;
+inline constexpr std::uint64_t cpu_functional_accepted_steps = 20;
+inline constexpr std::uint64_t cpu_functional_checkpoint_step = 10;
+inline constexpr std::uint64_t cpu_functional_retry_target_step = 14;
+// Retained smoke aliases preserve the accepted p1/N3 source contract.
+inline constexpr int cpu_polynomial_order = cpu_smoke_polynomial_order;
+inline constexpr int cpu_elements_per_direction =
+    cpu_smoke_elements_per_direction;
+inline constexpr int cpu_assembly_quadrature_order =
+    cpu_smoke_assembly_quadrature_order;
 inline constexpr double cpu_backward_euler_dt = 0.05;
 inline constexpr double cpu_gamma = 1.4;
 inline constexpr double cpu_fixed_tau = 2.5;
@@ -40,12 +54,21 @@ inline constexpr int cpu_maximum_line_search_trials = 13;
 inline constexpr double cpu_armijo_constant = 1.0e-4;
 inline constexpr double cpu_nonlinear_tolerance = 1.0e-10;
 inline constexpr std::size_t cpu_maximum_local_interior_coefficients =
-    cpu_elements_per_direction * cpu_elements_per_direction *
-    (cpu_polynomial_order + 1) * (cpu_polynomial_order + 1) *
+    cpu_functional_principal_elements_per_direction *
+    cpu_functional_principal_elements_per_direction *
+    (cpu_functional_polynomial_order + 1) *
+    (cpu_functional_polynomial_order + 1) *
     cpu_conserved_components;
 inline constexpr std::size_t cpu_maximum_local_true_trace_coefficients =
-    2 * cpu_elements_per_direction * cpu_elements_per_direction *
-    (cpu_polynomial_order + 1) * cpu_conserved_components;
+    2 * cpu_functional_principal_elements_per_direction *
+    cpu_functional_principal_elements_per_direction *
+    (cpu_functional_polynomial_order + 1) * cpu_conserved_components;
+
+enum class CpuScenario : unsigned char
+{
+  smoke,
+  functional
+};
 
 /** CPU-local phase vocabulary pending a coordinator-owned shared ABI. */
 enum class CpuFailurePhase : unsigned char
@@ -88,6 +111,7 @@ struct CpuPersistentConfig
 {
   StableIdentity experiment{};
   StableIdentity source{};
+  CpuScenario scenario = CpuScenario::smoke;
   int polynomial_order = cpu_polynomial_order;
   int elements_per_direction = cpu_elements_per_direction;
   int assembly_quadrature_order = cpu_assembly_quadrature_order;
@@ -101,6 +125,8 @@ struct CpuPersistentConfig
 };
 
 CpuPersistentConfig MakeCpuSmokeConfig() noexcept;
+CpuPersistentConfig MakeCpuFunctionalConfig(int elements_per_direction)
+    noexcept;
 
 struct CpuFailureInjection
 {
@@ -174,6 +200,8 @@ struct CpuLinearizationChain
   std::size_t true_trace_increment_size = 0;
   std::size_t accepted_candidate_interior_size = 0;
   std::size_t accepted_candidate_true_trace_size = 0;
+  bool true_trace_increment_capture_complete = false;
+  bool accepted_candidate_capture_complete = false;
   std::uint64_t matrix_refresh_generation = 0;
   std::uint64_t factor_setup_generation = 0;
   double true_relative_residual = 0.0;
@@ -314,6 +342,31 @@ struct CpuAcceptedEvidence
   CpuAttemptEvidence attempt{};
 };
 
+/** Compact, allocation-free accepted-step history for persistent runs. */
+struct CpuAcceptedStepEvidence
+{
+  bool valid = false;
+  StateCoordinates coordinates{};
+  StateHash interior_hash{};
+  StateHash trace_hash{};
+  double initial_nonlinear_residual = 0.0;
+  double final_nonlinear_residual = 0.0;
+  double maximum_true_relative_residual = 0.0;
+  double minimum_density = 0.0;
+  double minimum_pressure = 0.0;
+  double maximum_wave_speed = 0.0;
+  std::uint64_t attempt_sequence = 0;
+  std::uint64_t post_baseline_allocation_events = 0;
+  int nonlinear_updates = 0;
+  int linear_iterations = 0;
+  CpuWorkCensus work{};
+  TransferAccounting transfers{0, 0, 0, 0, 0, true};
+  bool finite_gate = false;
+  bool admissibility_gate = false;
+  bool nonlinear_gate = false;
+  bool true_residual_gate = false;
+};
+
 struct CpuRunEvidence
 {
   RuntimeTupleDescriptor tuple{};
@@ -323,6 +376,10 @@ struct CpuRunEvidence
   int ranks = 0;
   int local_elements = 0;
   int global_elements = 0;
+  int polynomial_order = 0;
+  int elements_per_direction = 0;
+  int assembly_quadrature_order = 0;
+  double dt = 0.0;
   std::uint64_t local_owned_interior_coefficients = 0;
   std::uint64_t global_owned_interior_coefficients = 0;
   std::uint64_t local_owned_true_trace_coefficients = 0;
@@ -332,9 +389,15 @@ struct CpuRunEvidence
   StateHash mesh_hash{};
   StateHash partition_hash{};
   StateHash topology_hash{};
+  StateHash initial_interior_hash{};
+  StateHash initial_trace_hash{};
   CpuStorageEvidence storage{};
   CpuAttemptEvidence last_attempt{};
   CpuAcceptedEvidence accepted{};
+  std::array<CpuAcceptedStepEvidence, cpu_functional_accepted_steps>
+      accepted_steps{};
+  std::size_t accepted_step_count = 0;
+  std::uint64_t topology_builds = 0;
   std::uint64_t attempts = 0;
   std::uint64_t failed_attempts = 0;
   std::uint64_t retries = 0;

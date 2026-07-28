@@ -842,6 +842,18 @@ CpuPersistentConfig MakeCpuSmokeConfig() noexcept
   return config;
 }
 
+CpuPersistentConfig MakeCpuFunctionalConfig(
+    const int elements_per_direction) noexcept
+{
+  CpuPersistentConfig config = MakeCpuSmokeConfig();
+  config.scenario = CpuScenario::functional;
+  config.polynomial_order = cpu_functional_polynomial_order;
+  config.elements_per_direction = elements_per_direction;
+  config.assembly_quadrature_order =
+      cpu_functional_assembly_quadrature_order;
+  return config;
+}
+
 bool CpuStateStoragePolicy::PrepareCandidate(
     const CpuStateSlot& committed, CpuStateSlot& candidate) noexcept
 {
@@ -1230,19 +1242,32 @@ bool Copy(const mfem::Vector& source,
 template <std::size_t Capacity>
 bool CaptureFixed(const mfem::Vector& source,
                   std::array<double, Capacity>& destination,
-                  std::size_t& size) noexcept
+                  std::size_t& size,
+                  bool& complete) noexcept
 {
-  if (source.Size() < 0 ||
-      static_cast<std::size_t>(source.Size()) > destination.size())
+  size = 0;
+  complete = false;
+  if (source.Size() < 0)
   {
     return false;
   }
-  size = static_cast<std::size_t>(source.Size());
   const double* values = source.HostRead();
-  if (!values && size != 0) { return false; }
+  const std::size_t source_size = static_cast<std::size_t>(source.Size());
+  if (!values && source_size != 0) { return false; }
+  if (source_size != 0 &&
+      !std::all_of(values, values + source_size,
+                   [](const double value) { return Finite(value); }))
+  {
+    return false;
+  }
+  // Full per-linearization coefficients are retained for the smoke and
+  // principal N=6 cases.  The N=12 convergence leaf retains complete hashes
+  // and final snapshots without inflating every adapter by O(N^2*Newton).
+  if (source_size > destination.size()) { return true; }
+  size = source_size;
   if (size != 0) { std::copy_n(values, size, destination.begin()); }
-  return std::all_of(destination.begin(), destination.begin() + size,
-                     [](const double value) { return Finite(value); });
+  complete = true;
+  return true;
 }
 
 StateHash HashSystemMatrix(const LocalSystem& system) noexcept
@@ -1255,13 +1280,27 @@ StateHash HashSystemMatrix(const LocalSystem& system) noexcept
 
 bool ExactConfig(const CpuPersistentConfig& config) noexcept
 {
+  const bool smoke = config.scenario == CpuScenario::smoke &&
+      config.polynomial_order == cpu_smoke_polynomial_order &&
+      config.elements_per_direction == cpu_smoke_elements_per_direction &&
+      config.assembly_quadrature_order ==
+          cpu_smoke_assembly_quadrature_order;
+  const bool functional_shape =
+      config.elements_per_direction ==
+          cpu_functional_minimum_elements_per_direction ||
+      config.elements_per_direction ==
+          cpu_functional_principal_elements_per_direction ||
+      config.elements_per_direction ==
+          cpu_functional_maximum_elements_per_direction;
+  const bool functional = config.scenario == CpuScenario::functional &&
+      config.polynomial_order == cpu_functional_polynomial_order &&
+      functional_shape && config.assembly_quadrature_order ==
+          cpu_functional_assembly_quadrature_order;
   return config.experiment.valid() && config.experiment ==
           StableIdentity::Copy(expected_experiment) &&
       config.source.valid() && config.source ==
           StableIdentity::Copy(expected_source) &&
-      config.polynomial_order == cpu_polynomial_order &&
-      config.elements_per_direction == cpu_elements_per_direction &&
-      config.assembly_quadrature_order == cpu_assembly_quadrature_order &&
+      (smoke || functional) &&
       ::dg::hdg::runtime::detail::DoubleBits(config.dt) ==
           ::dg::hdg::runtime::detail::DoubleBits(cpu_backward_euler_dt) &&
       config.maximum_newton_updates == cpu_maximum_newton_updates &&
@@ -1273,6 +1312,32 @@ bool ExactConfig(const CpuPersistentConfig& config) noexcept
       ::dg::hdg::runtime::detail::DoubleBits(config.true_residual_tolerance) ==
           ::dg::hdg::runtime::detail::DoubleBits(cpu_nonlinear_tolerance) &&
       config.allow_one_retry;
+}
+
+bool ExactRankShape(const CpuPersistentConfig& config,
+                    const int ranks) noexcept
+{
+  return ranks == 1 ||
+      (ranks == 2 &&
+       (config.scenario == CpuScenario::smoke ||
+        config.elements_per_direction ==
+            cpu_functional_principal_elements_per_direction));
+}
+
+bool ExactConfigConsensus(const CpuPersistentConfig& config) noexcept
+{
+  const std::array<int, 4> local{{static_cast<int>(config.scenario),
+                                  config.polynomial_order,
+                                  config.elements_per_direction,
+                                  config.assembly_quadrature_order}};
+  std::array<int, 4> minimum{}, maximum{};
+  return MPI_Allreduce(local.data(), minimum.data(),
+                       static_cast<int>(local.size()), MPI_INT, MPI_MIN,
+                       MPI_COMM_WORLD) == MPI_SUCCESS &&
+      MPI_Allreduce(local.data(), maximum.data(),
+                    static_cast<int>(local.size()), MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD) == MPI_SUCCESS &&
+      minimum == maximum;
 }
 
 bool ExactTuple(const RuntimeTupleDescriptor& tuple,
@@ -1295,22 +1360,24 @@ StateHash HashTopologyIntegers(const std::vector<int>& values) noexcept
   return HashBytes(values.data(), values.size() * sizeof(int));
 }
 
-int PeriodicIndex(const double coordinate) noexcept
+int PeriodicIndex(const double coordinate,
+                  const int elements_per_direction) noexcept
 {
   int value = static_cast<int>(std::llround(
-      coordinate * cpu_elements_per_direction));
-  value %= cpu_elements_per_direction;
-  if (value < 0) { value += cpu_elements_per_direction; }
+      coordinate * elements_per_direction));
+  value %= elements_per_direction;
+  if (value < 0) { value += elements_per_direction; }
   return value;
 }
 
-int CellIndex(const double coordinate) noexcept
+int CellIndex(const double coordinate,
+              const int elements_per_direction) noexcept
 {
   double periodic = coordinate - std::floor(coordinate);
   int value = static_cast<int>(std::floor(
-      periodic * cpu_elements_per_direction + 64.0 *
+      periodic * elements_per_direction + 64.0 *
           std::numeric_limits<double>::epsilon()));
-  return std::max(0, std::min(cpu_elements_per_direction - 1, value));
+  return std::max(0, std::min(elements_per_direction - 1, value));
 }
 
 } // namespace
@@ -1768,42 +1835,62 @@ struct detail::CpuNumericsCore::Implementation
             trace_space->GetFaceElement(face);
         mfem::ElementTransformation* transformation =
             mesh->GetFaceTransformation(face);
-        if (!finite_element || !transformation || finite_element->GetDof() != 2)
+        if (!finite_element || !transformation ||
+            finite_element->GetDof() != scalar_trace_dofs ||
+            scalar_trace_dofs < 2 || scalar_trace_dofs > 3)
         {
           return false;
         }
         mfem::Array<int> vdofs;
         trace_space->GetFaceVDofs(face, vdofs);
         const mfem::IntegrationRule& nodes = finite_element->GetNodes();
-        std::array<mfem::Vector, 2> physical{{mfem::Vector(cpu_dimension),
-                                              mfem::Vector(cpu_dimension)}};
-        transformation->Transform(nodes.IntPoint(0), physical[0]);
-        transformation->Transform(nodes.IntPoint(1), physical[1]);
-        const bool vertical =
-            std::abs(physical[0][0] - physical[1][0]) < 1.0e-12;
-        const double fixed = vertical
-            ? 0.5 * (physical[0][0] + physical[1][0])
-            : 0.5 * (physical[0][1] + physical[1][1]);
-        const double varying0 = vertical ? physical[0][1] : physical[0][0];
-        const double varying1 = vertical ? physical[1][1] : physical[1][0];
-        const int fixed_index = PeriodicIndex(fixed);
-        const int cell_index = CellIndex(std::min(varying0, varying1));
-        const int face_index = vertical
-            ? fixed_index * cpu_elements_per_direction + cell_index
-            : cpu_elements_per_direction * cpu_elements_per_direction +
-                fixed_index * cpu_elements_per_direction + cell_index;
-        for (int scalar = 0; scalar < 2; ++scalar)
+        std::array<double, 3> x{}, y{};
+        for (int scalar = 0; scalar < scalar_trace_dofs; ++scalar)
         {
-          const int canonical_scalar =
-              (scalar == 0 ? varying0 : varying1) <=
-                      (scalar == 0 ? varying1 : varying0)
-                  ? 0 : 1;
+          mfem::Vector physical(cpu_dimension);
+          transformation->Transform(nodes.IntPoint(scalar), physical);
+          x[static_cast<std::size_t>(scalar)] = physical[0];
+          y[static_cast<std::size_t>(scalar)] = physical[1];
+        }
+        const bool vertical =
+            std::abs(x[0] - x[static_cast<std::size_t>(
+                scalar_trace_dofs - 1)]) < 1.0e-12;
+        double fixed = 0.0;
+        std::array<double, 3> varying{};
+        double minimum_varying = std::numeric_limits<double>::infinity();
+        for (int scalar = 0; scalar < scalar_trace_dofs; ++scalar)
+        {
+          const std::size_t index = static_cast<std::size_t>(scalar);
+          fixed += vertical ? x[index] : y[index];
+          varying[index] = vertical ? y[index] : x[index];
+          minimum_varying = std::min(minimum_varying, varying[index]);
+        }
+        fixed /= static_cast<double>(scalar_trace_dofs);
+        const int fixed_index = PeriodicIndex(
+            fixed, config.elements_per_direction);
+        const int cell_index = CellIndex(
+            minimum_varying, config.elements_per_direction);
+        const int face_index = vertical
+            ? fixed_index * config.elements_per_direction + cell_index
+            : config.elements_per_direction * config.elements_per_direction +
+                fixed_index * config.elements_per_direction + cell_index;
+        for (int scalar = 0; scalar < scalar_trace_dofs; ++scalar)
+        {
+          int canonical_scalar = 0;
+          for (int other = 0; other < scalar_trace_dofs; ++other)
+          {
+            if (varying[static_cast<std::size_t>(other)] <
+                varying[static_cast<std::size_t>(scalar)])
+            {
+              ++canonical_scalar;
+            }
+          }
           for (int component = 0; component < cpu_conserved_components;
                ++component)
           {
             double sign = 1.0;
             const int local_dof = Decode(
-                vdofs[ByNodes(scalar, 2, component)], sign);
+                vdofs[ByNodes(scalar, scalar_trace_dofs, component)], sign);
             if (local_dof < 0 ||
                 local_dof >= static_cast<int>(
                     exchange_plan->map.dofs.entries.size()))
@@ -1815,7 +1902,8 @@ struct detail::CpuNumericsCore::Implementation
                     static_cast<std::size_t>(local_dof)];
             if (entry.ownership != Ownership::owned) { continue; }
             const std::uint64_t canonical =
-                (static_cast<std::uint64_t>(face_index * 2 + canonical_scalar) *
+                (static_cast<std::uint64_t>(
+                     face_index * scalar_trace_dofs + canonical_scalar) *
                      cpu_conserved_components +
                  static_cast<std::uint64_t>(component));
             std::uint64_t& stored = trace_canonical_ids[
@@ -1848,7 +1936,10 @@ struct detail::CpuNumericsCore::Implementation
     try
     {
       const mfem::FiniteElement* interior = interior_space->GetFE(0);
-      if (!interior || interior->GetDof() != 4 || mesh->GetNE() <= 0)
+      const int expected_interior_dofs =
+          (config.polynomial_order + 1) * (config.polynomial_order + 1);
+      if (!interior || interior->GetDof() != expected_interior_dofs ||
+          mesh->GetNE() <= 0)
       {
         return false;
       }
@@ -1857,7 +1948,7 @@ struct detail::CpuNumericsCore::Implementation
       mfem::Array<int> first_faces, first_orientations;
       mesh->GetElementEdges(0, first_faces, first_orientations);
       if (first_faces.Size() != 4) { return false; }
-      scalar_trace_dofs = 2;
+      scalar_trace_dofs = config.polynomial_order + 1;
       local_trace = first_faces.Size() * scalar_trace_dofs *
           cpu_conserved_components;
       if (!ResizeOwned(element_interior_vdofs,
@@ -3674,11 +3765,14 @@ bool detail::CpuNumericsCore::AdmitInitialization(
   int ranks = 0;
   MPI_Initialized(&mpi_initialized);
   MPI_Finalized(&mpi_finalized);
+  const bool config_consensus = mpi_initialized != 0 && mpi_finalized == 0
+      ? ExactConfigConsensus(config) : false;
   const bool local_ready = facade_empty && incarnation_ != 0 &&
       state.incarnation == incarnation_ && !state.initialized &&
       mpi_initialized != 0 && mpi_finalized == 0 &&
       MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS &&
       (ranks == 1 || ranks == 2) && ExactConfig(config) &&
+      ExactRankShape(config, ranks) && config_consensus &&
       ExactTuple(tuple, ranks);
   return AllRanks(local_ready);
 }
@@ -3713,10 +3807,13 @@ bool detail::CpuNumericsCore::Initialize(
   int mpi_finalized = 0;
   MPI_Initialized(&mpi_initialized);
   MPI_Finalized(&mpi_finalized);
+  const bool config_consensus = mpi_initialized != 0 && mpi_finalized == 0
+      ? ExactConfigConsensus(config) : false;
   bool local_ok = mpi_initialized != 0 && mpi_finalized == 0 &&
       MPI_Comm_rank(MPI_COMM_WORLD, &state.rank) == MPI_SUCCESS &&
       MPI_Comm_size(MPI_COMM_WORLD, &state.ranks) == MPI_SUCCESS &&
       (state.ranks == 1 || state.ranks == 2) && ExactConfig(config) &&
+      ExactRankShape(config, state.ranks) && config_consensus &&
       ExactTuple(tuple, state.ranks);
   if (!AllRanks(local_ok)) { return false; }
   state.config = config;
@@ -3727,7 +3824,7 @@ bool detail::CpuNumericsCore::Initialize(
   try
   {
     mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
-        cpu_elements_per_direction, cpu_elements_per_direction,
+        config.elements_per_direction, config.elements_per_direction,
         mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
     std::vector<mfem::Vector> translations(2, mfem::Vector(cpu_dimension));
     translations[0][0] = 1.0;
@@ -3760,11 +3857,12 @@ bool detail::CpuNumericsCore::Initialize(
   try
   {
     state.interior_collection = std::make_unique<mfem::L2_FECollection>(
-        cpu_polynomial_order, cpu_dimension, mfem::BasisType::GaussLegendre,
+        config.polynomial_order, cpu_dimension, mfem::BasisType::GaussLegendre,
         mfem::FiniteElement::VALUE);
     state.trace_collection =
         std::make_unique<mfem::DG_Interface_FECollection>(
-            cpu_polynomial_order, cpu_dimension, mfem::FiniteElement::VALUE,
+            config.polynomial_order, cpu_dimension,
+            mfem::FiniteElement::VALUE,
             mfem::BasisType::GaussLegendre);
     local_ok = state.ObserveWrapper(state.interior_collection) &&
         state.ObserveWrapper(state.trace_collection);
@@ -3986,8 +4084,10 @@ bool detail::CpuNumericsCore::Initialize(
       CopySlot(state.committed_slot, state.candidate_slot);
   if (!AllRanks(local_ok)) { return false; }
 
+  const std::array<int, 2> mesh_identity{{config.polynomial_order,
+                                          config.elements_per_direction}};
   const StateHash local_mesh = HashBytes(
-      &cpu_elements_per_direction, sizeof(cpu_elements_per_direction));
+      mesh_identity.data(), mesh_identity.size() * sizeof(int));
   const StateHash local_partition = HashTopologyIntegers(partition);
   const StateHash local_topology = HashPair(
       HashTopologyIntegers(state.signed_trace_dofs),
@@ -4003,7 +4103,7 @@ bool detail::CpuNumericsCore::Initialize(
   resources.partition_hash = partition_hash;
   resources.topology_hash = topology_hash;
   resources.rank_count = static_cast<std::uint32_t>(state.ranks);
-  resources.polynomial_order = cpu_polynomial_order;
+  resources.polynomial_order = config.polynomial_order;
   resources.layout = StableIdentity::Copy(expected_layout);
   const std::size_t state_bytes =
       (state.Committed()->interior.capacity() +
@@ -4020,6 +4120,11 @@ bool detail::CpuNumericsCore::Initialize(
   state.evidence.local_elements = state.mesh->GetNE();
   state.evidence.global_elements = static_cast<int>(SumU64(
       static_cast<std::uint64_t>(state.mesh->GetNE())));
+  state.evidence.polynomial_order = config.polynomial_order;
+  state.evidence.elements_per_direction = config.elements_per_direction;
+  state.evidence.assembly_quadrature_order =
+      config.assembly_quadrature_order;
+  state.evidence.dt = config.dt;
   state.evidence.local_owned_interior_coefficients =
       state.Committed()->interior.size();
   state.evidence.global_owned_interior_coefficients = SumU64(
@@ -4029,7 +4134,8 @@ bool detail::CpuNumericsCore::Initialize(
   state.evidence.global_owned_true_trace_coefficients = SumU64(
       state.evidence.local_owned_true_trace_coefficients);
   state.evidence.unique_periodic_faces =
-      2U * cpu_elements_per_direction * cpu_elements_per_direction;
+      2U * static_cast<std::uint64_t>(config.elements_per_direction) *
+      static_cast<std::uint64_t>(config.elements_per_direction);
   state.evidence.negative_signed_trace_dofs = SumU64(
       static_cast<std::uint64_t>(std::count_if(
           state.signed_trace_dofs.begin(), state.signed_trace_dofs.end(),
@@ -4037,6 +4143,9 @@ bool detail::CpuNumericsCore::Initialize(
   state.evidence.mesh_hash = mesh_hash;
   state.evidence.partition_hash = partition_hash;
   state.evidence.topology_hash = topology_hash;
+  state.evidence.initial_interior_hash = old_interior;
+  state.evidence.initial_trace_hash = old_trace;
+  state.evidence.topology_builds = 1;
   const std::uintptr_t first_token = reinterpret_cast<std::uintptr_t>(
       state.committed_slot.interior.cell->backing.get());
   const std::uintptr_t second_token = reinterpret_cast<std::uintptr_t>(
@@ -4132,7 +4241,9 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   const bool local_entry_ready = state.initialized && state.Committed() &&
       state.Candidate() &&
       state.Candidate()->interior == state.Committed()->interior &&
-      state.Candidate()->trace == state.Committed()->trace;
+      state.Candidate()->trace == state.Committed()->trace &&
+      (state.config.scenario != CpuScenario::functional ||
+       coordinates.step < cpu_functional_accepted_steps);
   if (!state.CollectiveAll(local_entry_ready))
   {
     return fail(CpuFailurePhase::setup, CpuAttemptStatus::invalid_request);
@@ -4287,7 +4398,8 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     }
     const bool increment_captured = trace_solved && CaptureFixed(
         state.true_increment, chain.true_trace_increment,
-        chain.true_trace_increment_size);
+        chain.true_trace_increment_size,
+        chain.true_trace_increment_capture_complete);
     if (!state.CollectiveAll(increment_captured))
     {
       return fail(CpuFailurePhase::trace_solve);
@@ -4401,12 +4513,18 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
             HashVector(*state.iterate_interior),
             HashVector(state.iterate_true_trace));
         chain.accepted_trial_index = trial;
+        bool interior_capture_complete = false;
+        bool trace_capture_complete = false;
         const bool candidate_captured = CaptureFixed(
             *state.iterate_interior, chain.accepted_candidate_interior,
-            chain.accepted_candidate_interior_size) &&
+            chain.accepted_candidate_interior_size,
+            interior_capture_complete) &&
             CaptureFixed(state.iterate_true_trace,
                          chain.accepted_candidate_true_trace,
-                         chain.accepted_candidate_true_trace_size);
+                         chain.accepted_candidate_true_trace_size,
+                         trace_capture_complete);
+        chain.accepted_candidate_capture_complete =
+            interior_capture_complete && trace_capture_complete;
         if (!state.CollectiveAll(candidate_captured))
         {
           return fail(CpuFailurePhase::recovery);
@@ -4574,6 +4692,34 @@ void detail::CpuNumericsCore::Complete(
     state.evidence.accepted.rank_common_trace_hash =
         CpuStateStoragePolicy::HashTrace(state.committed_slot.trace);
     state.evidence.accepted.attempt = attempt;
+    if (state.evidence.accepted_step_count <
+        state.evidence.accepted_steps.size())
+    {
+      CpuAcceptedStepEvidence& step = state.evidence.accepted_steps[
+          state.evidence.accepted_step_count++];
+      step.valid = true;
+      step.coordinates = coordinates;
+      step.interior_hash = attempt.committed_interior_after;
+      step.trace_hash = attempt.committed_trace_after;
+      step.initial_nonlinear_residual = attempt.initial_nonlinear_residual;
+      step.final_nonlinear_residual = attempt.final_nonlinear_residual;
+      step.maximum_true_relative_residual =
+          attempt.maximum_true_relative_residual;
+      step.minimum_density = attempt.minimum_density;
+      step.minimum_pressure = attempt.minimum_pressure;
+      step.maximum_wave_speed = attempt.maximum_wave_speed;
+      step.attempt_sequence = attempt.identity.sequence;
+      step.post_baseline_allocation_events =
+          attempt.transfers.allocation_events;
+      step.nonlinear_updates = attempt.nonlinear_updates;
+      step.linear_iterations = attempt.linear_iterations;
+      step.work = attempt.work;
+      step.transfers = attempt.transfers;
+      step.finite_gate = attempt.finite_gate;
+      step.admissibility_gate = attempt.admissibility_gate;
+      step.nonlinear_gate = attempt.nonlinear_gate;
+      step.true_residual_gate = attempt.true_residual_gate;
+    }
     ++state.evidence.commits;
   }
   else

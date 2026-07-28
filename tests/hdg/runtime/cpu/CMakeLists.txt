@@ -45,3 +45,29 @@ set_tests_properties(hdg_runtime_cpu_rank2
     PROCESSORS 2
     RESOURCE_LOCK hdg_runtime_cpu
     TIMEOUT 1800)
+
+foreach(_n IN ITEMS 3 6 12)
+  add_test(
+    NAME hdg_runtime_cpu_functional_serial_n${_n}
+    COMMAND dg_igr_hdg_runtime_cpu_test --functional-n ${_n})
+  set_tests_properties(hdg_runtime_cpu_functional_serial_n${_n}
+    PROPERTIES
+      PROCESSORS 1
+      RESOURCE_LOCK hdg_runtime_cpu
+      TIMEOUT 3600)
+endforeach()
+
+add_test(
+  NAME hdg_runtime_cpu_functional_rank2_n6
+  COMMAND
+    "${MPIEXEC_EXECUTABLE}"
+    "${MPIEXEC_NUMPROC_FLAG}" 2
+    ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_hdg_runtime_cpu_test>
+    --functional-n 6
+    ${MPIEXEC_POSTFLAGS})
+set_tests_properties(hdg_runtime_cpu_functional_rank2_n6
+  PROPERTIES
+    PROCESSORS 2
+    RESOURCE_LOCK hdg_runtime_cpu
+    TIMEOUT 3600)
