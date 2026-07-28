@@ -2181,6 +2181,12 @@ public:
     // adapter proof obligation and no recoverable check follows it.
     StoragePolicy::Publish(committed_, candidate_);
     coordinates_ = checkpoint.coordinates;
+    // The persisted cursor is also an external attempt frontier. Preserve any
+    // larger live history while preventing a restarted identity from reuse.
+    if (attempt_sequence_ < coordinates_.cursor)
+    {
+      attempt_sequence_ = coordinates_.cursor;
+    }
     ++publication_serial_;
     active_ = false;
     phase_ = AttemptPhase::idle;

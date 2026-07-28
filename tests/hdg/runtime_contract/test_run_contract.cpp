@@ -3641,6 +3641,218 @@ bool ExpectRestoreFailure(const CheckpointDescriptor& original,
                requirement);
 }
 
+bool CheckRestoreAttemptFrontierAndAuthorities(
+    const CheckpointDescriptor& checkpoint,
+    const Slot& loaded)
+{
+  bool passed = true;
+  const std::uint64_t next_checkpoint_cursor = checkpoint.cursor + 1;
+
+  {
+    TwoPhaseContract contract = MakeTwoPhaseContract();
+    const RestoreOutcome restored = contract.Restore(checkpoint, loaded);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, checkpoint.dt});
+    const bool stored = begin.started &&
+        StoreCandidateFor(contract, begin.attempt, OtherSlot());
+    auto products = IssueAllFor(contract, begin.attempt);
+    auto staging = contract.FreezeCandidate(begin.attempt,
+                                             begin.attempt.sequence);
+    const bool staging_target_is_next = staging &&
+        staging->entry_coordinates().cursor == checkpoint.cursor &&
+        staging->target_coordinates().cursor == next_checkpoint_cursor;
+    auto prepared = staging
+        ? contract.PrepareCommit(std::move(*staging),
+                                 PassingReport(begin.attempt.sequence),
+                                 std::move(products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    const bool prepared_target_is_next = prepared &&
+        prepared->checkpoint_descriptor().cursor == next_checkpoint_cursor &&
+        prepared->checkpoint_descriptor().coordinates.cursor ==
+            next_checkpoint_cursor;
+    const AttemptOutcome aborted = prepared
+        ? contract.AbortPrepared(std::move(*prepared))
+        : AttemptOutcome{};
+    passed = Check(
+                 restored.restored && begin.started && stored && staging &&
+                     prepared &&
+                     begin.attempt.sequence == next_checkpoint_cursor &&
+                     staging_target_is_next && prepared_target_is_next &&
+                     aborted.retry_available,
+                 "restored_cursor_sets_next_attempt_and_prepare_target_frontier") &&
+        passed;
+  }
+
+  {
+    const std::uint64_t newer_frontier = checkpoint.cursor + 20;
+    Contract contract = MakeContract(InitialCoordinates(),
+                                     Resources(),
+                                     newer_frontier);
+    const RestoreOutcome restored = contract.Restore(checkpoint, loaded);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, checkpoint.dt});
+    passed = Check(restored.restored && begin.started &&
+                       begin.attempt.sequence == newer_frontier + 1 &&
+                       contract.coordinates().cursor == checkpoint.cursor,
+                   "older_restore_never_decreases_newer_attempt_frontier") &&
+        passed;
+  }
+
+  {
+    const std::uint64_t frontier_before_rejection = checkpoint.cursor + 20;
+    Contract contract = MakeContract(InitialCoordinates(),
+                                     Resources(),
+                                     frontier_before_rejection);
+    Slot corrupt = loaded;
+    corrupt.trace[0] += 1.0;
+    const RestoreOutcome rejected = contract.Restore(checkpoint, corrupt);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, checkpoint.dt});
+    passed = Check(
+                 !rejected.restored &&
+                     rejected.compatibility ==
+                         RestartCompatibility::trace_hash_mismatch &&
+                     begin.started &&
+                     begin.attempt.sequence == frontier_before_rejection + 1 &&
+                     SameCoordinates(contract.coordinates(),
+                                     InitialCoordinates()) &&
+                     ArrayStoragePolicy::publications == 0 &&
+                     TestCollectivePolicy::restores == 1,
+                 "rejected_restore_does_not_mutate_attempt_frontier") &&
+        passed;
+  }
+
+  {
+    const std::uint64_t initial_frontier = checkpoint.cursor + 16;
+    TwoPhaseContract contract = MakeTwoPhaseContract(
+        InitialCoordinates(), Resources(), initial_frontier);
+    const auto old_published = contract.Published();
+    const BeginOutcome first =
+        contract.BeginStep({InteriorSpace::l2, checkpoint.dt});
+    auto stale_products = IssueAllFor(contract, first.attempt);
+    TwoPhaseContract::ProductBundle missing_products{};
+    const AttemptOutcome failed = contract.FinishAttempt(
+        first.attempt,
+        PassingReport(first.attempt.sequence),
+        std::move(missing_products));
+    const BeginOutcome retry = contract.Retry();
+    const auto old_candidate = contract.AcquireCandidate(retry.attempt);
+    const bool retry_stored = old_candidate &&
+        contract.StoreCandidate(*old_candidate, OtherSlot());
+    auto retry_products = IssueAllFor(contract, retry.attempt);
+    auto old_staging = contract.FreezeCandidate(retry.attempt,
+                                                 retry.attempt.sequence);
+    auto old_prepared = old_staging
+        ? contract.PrepareCommit(std::move(*old_staging),
+                                 PassingReport(retry.attempt.sequence),
+                                 std::move(retry_products))
+        : std::optional<TwoPhaseContract::PreparedCommitToken>{};
+    const AttemptOutcome aborted = old_prepared
+        ? contract.AbortPrepared(std::move(*old_prepared))
+        : AttemptOutcome{};
+    const RestoreOutcome restored = contract.Restore(checkpoint, loaded);
+    const auto restored_published = contract.Published();
+    Slot restored_copy{};
+    const bool restored_publication_valid =
+        contract.CopyPublished(restored_published, restored_copy) &&
+        SameSlotBytes(restored_copy, loaded);
+    const StateCoordinates restored_coordinates = contract.coordinates();
+    const RunStatus restored_status = contract.status();
+    const FailureReason restored_failure = contract.last_failure();
+    const std::uint64_t stale_rejections =
+        contract.telemetry().stale_consumers_rejected;
+    const std::uint64_t publications = ArrayStoragePolicy::publications;
+    const std::uint64_t stores = ArrayStoragePolicy::stores;
+    const std::uint64_t copies = ArrayStoragePolicy::copies;
+    Slot stale_copy{};
+    const bool stale_publication_rejected =
+        !contract.CopyPublished(old_published, stale_copy);
+    const bool moved_staging_rejected = old_staging &&
+        !contract.CopyPrepared(*old_staging, stale_copy);
+    const bool old_candidate_rejected = old_candidate &&
+        !contract.StoreCandidate(*old_candidate, AcceptedSlot());
+    auto stale_exchange = old_prepared
+        ? contract.CommitPrepared(std::move(*old_prepared))
+        : std::optional<TwoPhaseContract::ProvisionalCommitToken>{};
+    const bool stale_authorities_are_inert =
+        restored_publication_valid && stale_publication_rejected &&
+        moved_staging_rejected && old_candidate_rejected && !stale_exchange &&
+        SameCoordinates(contract.coordinates(), restored_coordinates) &&
+        contract.status() == restored_status &&
+        contract.last_failure() == restored_failure &&
+        contract.telemetry().stale_consumers_rejected ==
+            stale_rejections + 2 &&
+        ArrayStoragePolicy::publications == publications &&
+        ArrayStoragePolicy::stores == stores &&
+        ArrayStoragePolicy::copies == copies;
+    const BeginOutcome after_restore =
+        contract.BeginStep({InteriorSpace::l2, checkpoint.dt});
+    const auto fresh_candidate =
+        contract.AcquireCandidate(after_restore.attempt);
+    const bool fresh_stored = fresh_candidate &&
+        contract.StoreCandidate(*fresh_candidate, OtherSlot());
+    const AttemptOutcome stale_product = contract.FinishAttempt(
+        after_restore.attempt,
+        PassingReport(after_restore.attempt.sequence),
+        std::move(stale_products));
+    passed = Check(
+                 first.started &&
+                     first.attempt.sequence == initial_frontier + 1 &&
+                     failed.retry_available &&
+                     failed.reason == FailureReason::missing_product &&
+                     retry.started && retry_stored && old_staging &&
+                     old_prepared && !aborted.retry_available &&
+                     restored.restored && stale_authorities_are_inert &&
+                     after_restore.started && fresh_stored &&
+                     after_restore.attempt.sequence ==
+                         retry.attempt.sequence + 1 &&
+                     !stale_product.committed &&
+                     stale_product.reason == FailureReason::stale_product &&
+                     ArrayStoragePolicy::publications == publications,
+                 "restore_preserves_authority_staleness_without_aba") &&
+        passed;
+  }
+
+  {
+    const std::uint64_t maximum =
+        std::numeric_limits<std::uint64_t>::max();
+    CheckpointDescriptor maximum_cursor = checkpoint;
+    maximum_cursor.cursor = maximum;
+    maximum_cursor.coordinates.cursor = maximum;
+    maximum_cursor.coordinate_fingerprint =
+        FrozenCoordinateFingerprint(maximum_cursor.coordinates);
+    Contract contract = MakeContract();
+    const RestoreOutcome restored = contract.Restore(maximum_cursor, loaded);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, checkpoint.dt});
+    passed = Check(restored.restored && !begin.started &&
+                       begin.reason == FailureReason::coordinate_overflow &&
+                       begin.attempt.sequence == maximum &&
+                       contract.coordinates().cursor == maximum &&
+                       TestCollectivePolicy::admissions == 1,
+                   "maximum_restored_cursor_fails_closed_without_wraparound") &&
+        passed;
+  }
+
+  {
+    const std::uint64_t maximum =
+        std::numeric_limits<std::uint64_t>::max();
+    Contract contract = MakeContract(InitialCoordinates(),
+                                     Resources(),
+                                     maximum);
+    const RestoreOutcome restored = contract.Restore(checkpoint, loaded);
+    const BeginOutcome begin =
+        contract.BeginStep({InteriorSpace::l2, checkpoint.dt});
+    passed = Check(restored.restored && !begin.started &&
+                       begin.reason == FailureReason::coordinate_overflow &&
+                       begin.attempt.sequence == maximum &&
+                       contract.coordinates().cursor == checkpoint.cursor,
+                   "maximum_live_attempt_frontier_survives_older_restore") &&
+        passed;
+  }
+  return passed;
+}
+
 bool CheckAtomicCheckpointRestore()
 {
   bool passed = true;
@@ -3675,6 +3887,8 @@ bool CheckAtomicCheckpointRestore()
                      checkpoint.coordinate_fingerprint ==
                          FrozenCoordinateFingerprint(checkpoint.coordinates),
                  "checkpoint_exact_tuple_topology_coordinates_and_frozen_hashes") &&
+      passed;
+  passed = CheckRestoreAttemptFrontierAndAuthorities(checkpoint, loaded) &&
       passed;
 
   for (const int invalid_field : {0, 1, 2, 3})
