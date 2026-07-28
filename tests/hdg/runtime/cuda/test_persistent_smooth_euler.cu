@@ -2,7 +2,9 @@
 #include "persistent_smooth_euler_oracle.cuh"
 
 #include <HYPRE_utilities.h>
+#include <_hypre_utilities.h>
 #include <mfem.hpp>
+#include <umpire/ResourceManager.hpp>
 
 #include <algorithm>
 #include <array>
@@ -402,6 +404,8 @@ struct AuditedTransport
   inline static CudaTransferTotals attempt_totals{};
   inline static std::uint64_t successful_synchronization_events = 0;
   inline static bool fail_checkpoint_trace_once = false;
+  inline static bool fail_oracle_export_once = false;
+  inline static std::uint64_t injected_oracle_export_failures = 0;
 
   static void ResetLedger() noexcept
   {
@@ -410,6 +414,8 @@ struct AuditedTransport
     attempt_totals = {};
     successful_synchronization_events = 0;
     fail_checkpoint_trace_once = false;
+    fail_oracle_export_once = false;
+    injected_oracle_export_failures = 0;
     CudaTransportPolicy::ResetLedger();
   }
 
@@ -504,6 +510,14 @@ struct AuditedTransport
       actual_destination = nullptr;
       fail_checkpoint_trace_once = false;
     }
+    else if (fail_oracle_export_once &&
+             category == CudaTransferCategory::oracle_export &&
+             site == CudaTransferSite::oracle_export)
+    {
+      actual_destination = nullptr;
+      fail_oracle_export_once = false;
+      ++injected_oracle_export_failures;
+    }
     const bool success = CudaTransportPolicy::DeviceToHost(
         actual_destination, source, bytes, category, site, source_capacity,
         destination_capacity);
@@ -564,10 +578,71 @@ struct AuditedTransport
   }
 
   static CudaTransferTotals Accounting() noexcept { return attempt_totals; }
-  static CudaTransferLedgerV1 Ledger() noexcept { return ledger; }
+  static const CudaTransferLedgerV1& Ledger() noexcept { return ledger; }
   static std::uint64_t SuccessfulSynchronizationEvents() noexcept
   { return successful_synchronization_events; }
 };
+
+struct AllocatorHighWaterSample
+{
+  std::size_t mfem = 0;
+  std::size_t hypre = 0;
+  const char* mfem_identity = "unavailable";
+  const char* hypre_identity = "unavailable";
+  bool valid = false;
+};
+
+AllocatorHighWaterSample SampleAllocatorHighWater() noexcept
+{
+  AllocatorHighWaterSample sample{};
+#if defined(MFEM_USE_UMPIRE) && defined(HYPRE_USING_UMPIRE)
+  try
+  {
+    auto& manager = umpire::ResourceManager::getInstance();
+    const char* const mfem_name =
+        mfem::MemoryManager::GetUmpireDeviceAllocatorName();
+    const char* const hypre_name =
+        hypre_HandleUmpireDevicePoolName(hypre_handle());
+    if (mfem_name == nullptr || hypre_name == nullptr ||
+        !manager.isAllocator(mfem_name) || !manager.isAllocator(hypre_name))
+      return sample;
+    sample.mfem_identity = mfem_name;
+    sample.hypre_identity = hypre_name;
+    sample.mfem = manager.getAllocator(mfem_name).getHighWatermark();
+    sample.hypre = manager.getAllocator(hypre_name).getHighWatermark();
+    sample.valid = true;
+  }
+  catch (...) {}
+#endif
+  return sample;
+}
+
+bool InitialAllocationSampleExact(const std::uint64_t baseline,
+                                  const std::uint64_t sample) noexcept
+{
+  return sample == baseline ||
+      (baseline != std::numeric_limits<std::uint64_t>::max() &&
+       sample == baseline + 1);
+}
+
+bool CollectivelyExact(const bool local) noexcept
+{
+  const int local_value = local ? 1 : 0;
+  int global_value = 0;
+  return MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN,
+                       MPI_COMM_WORLD) == MPI_SUCCESS && global_value == 1;
+}
+
+bool CollectivelyExactAllocatorState(
+    const std::uint64_t allocations,
+    const std::uint64_t owned_allocation_calls,
+    const std::uint64_t deallocation_events) noexcept
+{
+  return CollectivelyExact(
+      AuditedAllocator::AllocationEvents() == allocations &&
+      AuditedAllocator::W8OwnedAllocationCalls() == owned_allocation_calls &&
+      AuditedAllocator::DeallocationEvents() == deallocation_events);
+}
 
 bool SameContext(const CudaPolicyContext& left,
                  const CudaPolicyContext& right) noexcept
@@ -760,14 +835,27 @@ bool ExactArenaEventPair(const CudaAllocationLedgerV1& ledger,
 
 bool ExactPolicyLedgers() noexcept
 {
-  return ExactPreparationProbeEvents(AuditedAllocator::Ledger()) &&
+  const auto marker = [](const char* const stage) noexcept
+  {
+    std::fprintf(stderr,
+                 "CUDA_INIT_PROBE stage=policy-ledgers edge=%s result=1\n",
+                 stage);
+    return true;
+  };
+  return marker("enter") &&
+      ExactPreparationProbeEvents(AuditedAllocator::Ledger()) &&
+      marker("audited-preparation-probe") &&
       ExactPreparationProbeEvents(UmpireDeviceAllocatorPolicy::Ledger()) &&
+      marker("production-preparation-probe") &&
       SameLedger(AuditedTransport::Ledger(),
-                    CudaTransportPolicy::Ledger()) &&
+                 CudaTransportPolicy::Ledger()) &&
+      marker("transfer-ledger-mirror") &&
       SameTotals(AuditedTransport::Accounting(),
                  CudaTransportPolicy::Accounting()) &&
+      marker("transfer-totals-mirror") &&
       SameLedger(AuditedAllocator::Ledger(),
-                 UmpireDeviceAllocatorPolicy::Ledger());
+                 UmpireDeviceAllocatorPolicy::Ledger()) &&
+      marker("allocation-ledger-mirror");
 }
 
 bool HypreHostColumnMapCopyFixtures() noexcept
@@ -884,6 +972,16 @@ bool ValidRange(const CudaTransferLedgerRangeV1& range,
                 const CudaTransferLedgerV1& ledger) noexcept
 {
   return range.begin_ordinal != 0 && range.complete &&
+      range.end_ordinal <= ledger.observed_count &&
+      range.end_ordinal + 1 >= range.begin_ordinal &&
+      range.ordered_digest ==
+          RangeDigest(ledger, range.begin_ordinal, range.end_ordinal);
+}
+
+bool ExactRecordedRange(const CudaTransferLedgerRangeV1& range,
+                        const CudaTransferLedgerV1& ledger) noexcept
+{
+  return range.begin_ordinal != 0 &&
       range.end_ordinal <= ledger.observed_count &&
       range.end_ordinal + 1 >= range.begin_ordinal &&
       range.ordered_digest ==
@@ -1087,41 +1185,277 @@ void ReportCheckpointDiagnosticV1(const char* id,int rank,bool retry,
       <<std::dec<<" success="<<e.success<<'\n';++n;}
 }
 
-template <typename Engine> bool CleanupUnexpectedFrozenAuthority(
+enum class AffineLocalPhase : int
+{
+  unknown = 0,
+  staging = 1,
+  prepared = 2,
+  provisional = 3,
+  consumed = 4
+};
+
+enum class AffineExitAction : unsigned char
+{
+  terminal_no_cleanup,
+  abort_prepared,
+  revert_commit,
+  verify_consumed
+};
+
+struct AffinePhaseCensus
+{
+  AffineLocalPhase local = AffineLocalPhase::unknown;
+  int minimum = 0;
+  int maximum = 0;
+  int ranks = 0;
+  bool complete = false;
+  AffineExitAction action = AffineExitAction::terminal_no_cleanup;
+};
+
+AffineExitAction SelectAffineExitAction(
+    const int minimum, const int maximum, const int observed_ranks,
+    const int expected_ranks, const bool reductions_complete) noexcept
+{
+  if (!reductions_complete || observed_ranks != expected_ranks ||
+      minimum != maximum)
+    return AffineExitAction::terminal_no_cleanup;
+  if (minimum == static_cast<int>(AffineLocalPhase::staging) ||
+      minimum == static_cast<int>(AffineLocalPhase::prepared))
+    return AffineExitAction::abort_prepared;
+  if (minimum == static_cast<int>(AffineLocalPhase::provisional))
+    return AffineExitAction::revert_commit;
+  if (minimum == static_cast<int>(AffineLocalPhase::consumed))
+    return AffineExitAction::verify_consumed;
+  return AffineExitAction::terminal_no_cleanup;
+}
+
+AffinePhaseCensus CensusAffinePhase(
+    const AffineLocalPhase local, const int expected_ranks) noexcept
+{
+  AffinePhaseCensus census{};
+  census.local = local;
+  const int local_value = static_cast<int>(local);
+  census.minimum = local_value;
+  census.maximum = local_value;
+  const bool minimum_ready = MPI_Allreduce(
+      &local_value, &census.minimum, 1, MPI_INT, MPI_MIN,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool maximum_ready = MPI_Allreduce(
+      &local_value, &census.maximum, 1, MPI_INT, MPI_MAX,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool size_ready =
+      MPI_Comm_size(MPI_COMM_WORLD, &census.ranks) == MPI_SUCCESS;
+  census.complete = minimum_ready && maximum_ready && size_ready;
+  census.action = SelectAffineExitAction(
+      census.minimum, census.maximum, census.ranks, expected_ranks,
+      census.complete);
+  return census;
+}
+
+bool MixedPreparedProvisionalCensusFixture(
+    const int rank, const int ranks) noexcept
+{
+  if (ranks != 2 || (rank != 0 && rank != 1)) { return false; }
+  const AffineLocalPhase local = rank == 0
+      ? AffineLocalPhase::prepared : AffineLocalPhase::provisional;
+  const AffinePhaseCensus census = CensusAffinePhase(local, ranks);
+  const bool exact = census.complete && census.ranks == 2 &&
+      census.minimum == static_cast<int>(AffineLocalPhase::prepared) &&
+      census.maximum == static_cast<int>(AffineLocalPhase::provisional) &&
+      census.action == AffineExitAction::terminal_no_cleanup;
+  std::fprintf(stderr,
+      "CUDA_AFFINE_SYNTHETIC rank=%d case=mixed-prepared-provisional "
+      "local=%d minimum=%d maximum=%d action=%u cleanup_called=0 "
+      "local_result=%s\n",
+      rank, static_cast<int>(local), census.minimum, census.maximum,
+      static_cast<unsigned>(census.action), exact ? "PASS" : "FAIL");
+  return exact;
+}
+
+AffineLocalPhase PhaseAfterPrepareStep(
+    const bool returned, const CudaStepEvidence& evidence) noexcept
+{
+  if (returned) { return AffineLocalPhase::staging; }
+  if (evidence.status == CudaRunStatus::retry_available ||
+      evidence.status == CudaRunStatus::committed)
+    return AffineLocalPhase::consumed;
+  return AffineLocalPhase::unknown;
+}
+
+AffineLocalPhase PhaseAfterPrepareCommit(
+    const bool returned, const CudaStepEvidence& evidence) noexcept
+{
+  if (evidence.status == CudaRunStatus::retry_available ||
+      evidence.status == CudaRunStatus::committed)
+    return AffineLocalPhase::consumed;
+  if (returned) { return AffineLocalPhase::prepared; }
+  return AffineLocalPhase::unknown;
+}
+
+AffineLocalPhase PhaseAfterCommitPrepared(
+    const bool returned, const CudaStepEvidence& evidence) noexcept
+{
+  if (returned && evidence.status != CudaRunStatus::retry_available)
+    return AffineLocalPhase::provisional;
+  if (evidence.status == CudaRunStatus::retry_available ||
+      evidence.status == CudaRunStatus::committed)
+    return AffineLocalPhase::consumed;
+  return AffineLocalPhase::unknown;
+}
+
+AffineLocalPhase PhaseAfterFinalizeCommit(
+    const CudaStepEvidence& evidence) noexcept
+{
+  if (evidence.status == CudaRunStatus::retry_available ||
+      evidence.status == CudaRunStatus::committed)
+    return AffineLocalPhase::consumed;
+  return AffineLocalPhase::unknown;
+}
+
+template <typename Engine> bool ApplyUniformAffineCleanup(
     Engine& engine, CudaSerializedCheckpointV1& checkpoint,
     CudaStepEvidence& evidence, const CudaPrecommitSnapshot& snapshot,
     const char* const id, const int rank,
     const FailureReason cleanup_reason,
-    const CudaFailurePhase cleanup_phase) noexcept
+    const CudaFailurePhase cleanup_phase,
+    const AffineExitAction cleanup_action) noexcept
 {
   const auto* contract = engine.contract();
   const FailureReason original_reason = evidence.contract_reason;
   const CudaFailurePhase original_phase = evidence.phase;
-  const bool cleanup_return = engine.AbortPrepared(
-      checkpoint, cleanup_reason, evidence);
-  const bool cleanup_valid = cleanup_return && contract != nullptr &&
+  const std::uint64_t allocations_before =
+      AuditedAllocator::AllocationEvents();
+  const std::uint64_t owned_calls_before =
+      AuditedAllocator::W8OwnedAllocationCalls();
+  const std::uint64_t deallocations_before =
+      AuditedAllocator::DeallocationEvents();
+  const std::uint64_t commits_before = contract == nullptr
+      ? std::numeric_limits<std::uint64_t>::max()
+      : contract->telemetry().commits;
+  const bool cleanup_return = cleanup_action ==
+          AffineExitAction::revert_commit
+      ? engine.RevertCommit(checkpoint, cleanup_reason, evidence)
+      : engine.AbortPrepared(checkpoint, cleanup_reason, evidence);
+  const bool policy_ledgers_exact = ExactPolicyLedgers();
+  const bool allocator_exact =
+      AuditedAllocator::AllocationEvents() == allocations_before &&
+      AuditedAllocator::W8OwnedAllocationCalls() == owned_calls_before &&
+      AuditedAllocator::DeallocationEvents() == deallocations_before;
+  const bool transfer_evidence_exact =
+      SameTotals(evidence.transfers, AuditedTransport::Accounting()) &&
+      evidence.transfer_range.complete == evidence.transfers.complete &&
+      ExactRecordedRange(
+          evidence.transfer_range, AuditedTransport::Ledger());
+  const bool cleanup_valid_local = cleanup_return && contract != nullptr &&
+      evidence.status == CudaRunStatus::retry_available &&
+      evidence.contract_reason == cleanup_reason &&
+      evidence.collective_consensus ==
+          (cleanup_reason != FailureReason::collective_protocol) &&
       evidence.retry_available && !evidence.committed &&
       evidence.coordinates_preserved && evidence.committed_bytes_preserved &&
+      evidence.before_interior_hash == evidence.after_interior_hash &&
+      evidence.before_trace_hash == evidence.after_trace_hash &&
       SameCoordinates(evidence.after, snapshot.committed) &&
       SameCoordinates(contract->coordinates(), snapshot.committed) &&
+      contract->status() == RunStatus::retry_available &&
+      contract->telemetry().commits == commits_before &&
       !checkpoint.candidate_frozen && !checkpoint.checkpoint_staged &&
-      !checkpoint.output_staged && !checkpoint.successful_commit;
+      !checkpoint.output_staged && !checkpoint.successful_commit &&
+      allocator_exact && transfer_evidence_exact && policy_ledgers_exact;
+  const bool cleanup_valid_collective =
+      CollectivelyExact(cleanup_valid_local);
   std::fprintf(stderr,
-      "CUDA_AFFINE_CLEANUP case=%s rank=%d return=%u valid=%u "
+      "CUDA_AFFINE_CLEANUP case=%s rank=%d mode=%u return=%u "
+      "local=%u collective=%u "
       "original=%u/%u cleanup=%u/%u coordinates=%u bytes=%u "
-      "flags=%u/%u/%u/%u\n",
-      id != nullptr ? id : "null", rank, cleanup_return ? 1U : 0U,
-      cleanup_valid ? 1U : 0U, static_cast<unsigned>(original_reason),
+      "hashes=%u allocator=%u ledgers=%u flags=%u/%u/%u/%u\n",
+      id != nullptr ? id : "null", rank,
+      static_cast<unsigned>(cleanup_action), cleanup_return ? 1U : 0U,
+      cleanup_valid_local ? 1U : 0U,
+      cleanup_valid_collective ? 1U : 0U,
+      static_cast<unsigned>(original_reason),
       static_cast<unsigned>(original_phase),
       static_cast<unsigned>(cleanup_reason),
       static_cast<unsigned>(cleanup_phase),
       evidence.coordinates_preserved ? 1U : 0U,
       evidence.committed_bytes_preserved ? 1U : 0U,
+      evidence.before_interior_hash == evidence.after_interior_hash &&
+              evidence.before_trace_hash == evidence.after_trace_hash
+          ? 1U : 0U,
+      allocator_exact ? 1U : 0U,
+      transfer_evidence_exact && policy_ledgers_exact ? 1U : 0U,
       checkpoint.candidate_frozen ? 1U : 0U,
       checkpoint.checkpoint_staged ? 1U : 0U,
       checkpoint.output_staged ? 1U : 0U,
       checkpoint.successful_commit ? 1U : 0U);
-  return cleanup_valid;
+  return cleanup_valid_collective;
+}
+
+template <typename Engine> bool ResolveUnexpectedAffineExit(
+    Engine& engine, CudaSerializedCheckpointV1& checkpoint,
+    CudaStepEvidence& evidence, const CudaPrecommitSnapshot& snapshot,
+    const char* const id, const int ranks, const int rank,
+    const FailureReason cleanup_reason,
+    const CudaFailurePhase cleanup_phase,
+    const AffineLocalPhase local_phase) noexcept
+{
+  const AffinePhaseCensus census = CensusAffinePhase(local_phase, ranks);
+  std::fprintf(stderr,
+      "CUDA_AFFINE_CENSUS case=%s rank=%d local=%d minimum=%d "
+      "maximum=%d ranks=%d/%d complete=%u action=%u "
+      "reason=%u phase=%u flags=%u/%u/%u/%u\n",
+      id != nullptr ? id : "null", rank,
+      static_cast<int>(census.local), census.minimum, census.maximum,
+      census.ranks, ranks, census.complete ? 1U : 0U,
+      static_cast<unsigned>(census.action),
+      static_cast<unsigned>(cleanup_reason),
+      static_cast<unsigned>(cleanup_phase),
+      checkpoint.candidate_frozen ? 1U : 0U,
+      checkpoint.checkpoint_staged ? 1U : 0U,
+      checkpoint.output_staged ? 1U : 0U,
+      checkpoint.successful_commit ? 1U : 0U);
+  if (census.action == AffineExitAction::terminal_no_cleanup)
+  {
+    evidence.status = CudaRunStatus::terminal_failure;
+    evidence.phase = CudaFailurePhase::terminal_evidence;
+    evidence.contract_reason = FailureReason::collective_protocol;
+    evidence.collective_consensus = false;
+    std::fprintf(stderr,
+        "CUDA_AFFINE_TERMINAL case=%s rank=%d cleanup_called=0 "
+        "destroy_engine=1 status=%u reason=%u\n",
+        id != nullptr ? id : "null", rank,
+        static_cast<unsigned>(evidence.status),
+        static_cast<unsigned>(evidence.contract_reason));
+    return false;
+  }
+  if (census.action == AffineExitAction::verify_consumed)
+  {
+    const auto* contract = engine.contract();
+    const bool retry_consumed = contract != nullptr &&
+        contract->status() == RunStatus::retry_available &&
+        evidence.status == CudaRunStatus::retry_available &&
+        evidence.retry_available && !evidence.committed &&
+        !checkpoint.candidate_frozen && !checkpoint.checkpoint_staged &&
+        !checkpoint.output_staged && !checkpoint.successful_commit;
+    const bool commit_consumed = contract != nullptr &&
+        contract->status() == RunStatus::committed &&
+        evidence.status == CudaRunStatus::committed &&
+        evidence.committed && !evidence.retry_available &&
+        checkpoint.successful_commit;
+    const bool consumed_local = retry_consumed || commit_consumed;
+    const bool consumed_collective = CollectivelyExact(consumed_local);
+    std::fprintf(stderr,
+        "CUDA_AFFINE_CONSUMED case=%s rank=%d retry=%u commit=%u "
+        "cleanup_called=0 local=%s collective=%s\n",
+        id != nullptr ? id : "null", rank,
+        retry_consumed ? 1U : 0U, commit_consumed ? 1U : 0U,
+        consumed_local ? "PASS" : "FAIL",
+        consumed_collective ? "PASS" : "FAIL");
+    return consumed_collective;
+  }
+  return ApplyUniformAffineCleanup(
+      engine, checkpoint, evidence, snapshot, id, rank, cleanup_reason,
+      cleanup_phase, census.action);
 }
 
 template <typename Engine> bool StagePreparedCheckpointDiagnosed(Engine& e,
@@ -1136,17 +1470,24 @@ template <typename Engine> bool StagePreparedCheckpointDiagnosed(Engine& e,
   const auto after=AuditedTransport::Ledger();
   const auto after_sync_successes=
       AuditedTransport::SuccessfulSynchronizationEvents();
-  if(!staged){const bool mirror=ExactPolicyLedgers();
+  const CheckpointPostconditionConsensus consensus =
+      AgreeCheckpointPostconditionFailure(!staged, ranks);
+  if(consensus.cleanup_required)
+  {
+    const bool mirror=ExactPolicyLedgers();
     const auto d=BuildCheckpointDiagnosticV1(
       staged,c,s,ranks,rank,before,after,before_sync_successes,
       after_sync_successes,mirror);
     ReportCheckpointDiagnosticV1(id,rank,retry,target,c,s,before,after,
       AuditedTransport::Accounting(),d);
     if(cleanup_on_failure)
-      (void)CleanupUnexpectedFrozenAuthority(
-          e,c,evidence,s,id,rank,checkpoint_cleanup_reason,
-          checkpoint_cleanup_phase);}
-  return staged;
+      (void)ResolveUnexpectedAffineExit(
+          e,c,evidence,s,id,ranks,rank,checkpoint_cleanup_reason,
+          checkpoint_cleanup_phase,
+          AffineLocalPhase::staging);
+    return false;
+  }
+  return true;
 }
 
 StateHash IndependentCheckpointHash(const void* data,
@@ -1486,7 +1827,7 @@ bool ExactTickets(const CudaStepEvidence& evidence) noexcept
 bool ExactAttemptEvidence(const CudaStepEvidence& evidence,
                           const int ranks) noexcept
 {
-  const CudaTransferLedgerV1 ledger = AuditedTransport::Ledger();
+  const CudaTransferLedgerV1& ledger = AuditedTransport::Ledger();
   if (!ExactPolicyLedgers() || !ExactTickets(evidence) ||
       !SameTotals(evidence.transfers, AuditedTransport::Accounting()) ||
       !ValidRange(evidence.transfer_range, ledger) ||
@@ -1519,7 +1860,7 @@ bool ExactAttemptEvidence(const CudaStepEvidence& evidence,
 bool ExactFailedStagingEvidence(const CudaStepEvidence& evidence,
                                 const int ranks) noexcept
 {
-  const CudaTransferLedgerV1 ledger = AuditedTransport::Ledger();
+  const CudaTransferLedgerV1& ledger = AuditedTransport::Ledger();
   if (!ExactPolicyLedgers() || !ExactTickets(evidence) ||
       !SameTotals(evidence.transfers, AuditedTransport::Accounting()) ||
       evidence.transfer_range.begin_ordinal == 0 ||
@@ -1598,6 +1939,9 @@ enum SetupFailureBit : std::uint64_t
 bool SetupValid(const CudaRunEvidence& setup, const int ranks,
                 std::uint64_t& failure_mask) noexcept
 {
+  std::fprintf(stderr,
+      "CUDA_INIT_PROBE rank=%d stage=setup-valid edge=enter result=0\n",
+      setup.rank);
   failure_mask = 0;
   if (!(setup.status == CudaRunStatus::ready))
     failure_mask |= setup_status_failure;
@@ -1653,8 +1997,27 @@ bool SetupValid(const CudaRunEvidence& setup, const int ranks,
   {
     failure_mask |= setup_scope_flags_failure;
   }
-  if (!ExactPolicyLedgers())
+  std::fprintf(stderr,
+      "CUDA_INIT_PROBE rank=%d stage=setup-valid-scalars edge=after "
+      "result=%u mask=0x%llx\n",
+      setup.rank, failure_mask == 0 ? 1U : 0U,
+      static_cast<unsigned long long>(failure_mask));
+  std::fprintf(stderr,
+      "CUDA_INIT_PROBE rank=%d stage=setup-valid-ledgers edge=before "
+      "result=0\n",
+      setup.rank);
+  const bool policy_ledgers_exact = ExactPolicyLedgers();
+  std::fprintf(stderr,
+      "CUDA_INIT_PROBE rank=%d stage=setup-valid-ledgers edge=after "
+      "result=%u\n",
+      setup.rank, policy_ledgers_exact ? 1U : 0U);
+  if (!policy_ledgers_exact)
     failure_mask |= setup_policy_ledgers_failure;
+  std::fprintf(stderr,
+      "CUDA_INIT_PROBE rank=%d stage=setup-valid edge=return result=%u "
+      "mask=0x%llx\n",
+      setup.rank, failure_mask == 0 ? 1U : 0U,
+      static_cast<unsigned long long>(failure_mask));
   return failure_mask == 0;
 }
 
@@ -1716,17 +2079,70 @@ using TestEngine = PersistentCudaSmoothEulerEngine<
     TestSelection<Backend>, AuditedAllocator, AuditedTransport,
     CudaMpiCollectivePolicy>;
 
+std::uint64_t numerical_engine_initialization_count = 0;
+
+std::uint64_t RecordNumericalEngineInitialization(
+    const char* const context) noexcept
+{
+  if (numerical_engine_initialization_count !=
+      std::numeric_limits<std::uint64_t>::max())
+  {
+    ++numerical_engine_initialization_count;
+  }
+  std::fprintf(stderr,
+      "CUDA_ENGINE_INIT_ORDINAL context=%s ordinal=%llu\n",
+      context != nullptr ? context : "null",
+      static_cast<unsigned long long>(
+          numerical_engine_initialization_count));
+  return numerical_engine_initialization_count;
+}
+
 template <typename Engine>
 bool InitializePositive(Engine& engine, CudaRunEvidence& setup,
                         const int ranks,
-                        const char* const context) noexcept
+                        const char* const context,
+                        std::uint64_t* const initialization_ordinal = nullptr)
+    noexcept
 {
+  const std::uint64_t ordinal =
+      RecordNumericalEngineInitialization(context);
+  if (initialization_ordinal != nullptr)
+    *initialization_ordinal = ordinal;
+  std::fprintf(stderr,
+      "CUDA_INIT_PROBE stage=engine-initialize edge=before context=%s "
+      "result=0\n",
+      context != nullptr ? context : "null");
   const bool initialized = engine.Initialize(setup);
+  std::fprintf(stderr,
+      "CUDA_INIT_PROBE rank=%d stage=engine-initialize edge=after "
+      "context=%s result=%u\n",
+      setup.rank, context != nullptr ? context : "null",
+      initialized ? 1U : 0U);
   std::uint64_t failure_mask = 0;
+  std::fprintf(stderr,
+      "CUDA_INIT_PROBE rank=%d stage=setup-valid-call edge=before "
+      "context=%s result=0\n",
+      setup.rank, context != nullptr ? context : "null");
   const bool setup_valid = SetupValid(setup, ranks, failure_mask);
-  if (!initialized || !setup_valid)
+  std::fprintf(stderr,
+      "CUDA_INIT_PROBE rank=%d stage=setup-valid-call edge=after "
+      "context=%s result=%u mask=0x%llx\n",
+      setup.rank, context != nullptr ? context : "null",
+      setup_valid ? 1U : 0U,
+      static_cast<unsigned long long>(failure_mask));
+  const bool initialized_local = initialized && setup_valid;
+  const bool initialized_collective = CollectivelyExact(initialized_local);
+  std::fprintf(stderr,
+      "CUDA_INIT_CONSENSUS rank=%d context=%s initialized=%u setup=%u "
+      "local=%s collective=%s\n",
+      setup.rank, context != nullptr ? context : "null",
+      initialized ? 1U : 0U, setup_valid ? 1U : 0U,
+      initialized_local ? "PASS" : "FAIL",
+      initialized_collective ? "PASS" : "FAIL");
+  if (!initialized_collective)
   {
-    ReportSetupFailure(context, initialized, failure_mask, setup, ranks);
+    if (!initialized_local)
+      ReportSetupFailure(context, initialized, failure_mask, setup, ranks);
     return false;
   }
   return true;
@@ -1980,7 +2396,20 @@ bool RunArenaTeardown(const int ranks, const char* const context) noexcept
 template <typename Backend>
 bool RunConfigConsensusNegative(const int ranks, const int rank) noexcept
 {
-  if (ranks != 2) { return true; }
+  if (ranks == 1)
+  {
+    const bool local_na = rank == 0 && HYPRE_GetError() == 0 &&
+        cudaPeekAtLastError() == cudaSuccess;
+    const bool collective_na = CollectivelyExact(local_na);
+    std::fprintf(stderr,
+        "CUDA_EXPECTED_NEGATIVE case=rank1.config.consensus-negative "
+        "rank=%d applicability=N/A expected=collective-config-mismatch "
+        "local=%s collective=%s\n",
+        rank, local_na ? "PASS" : "FAIL",
+        collective_na ? "PASS" : "FAIL");
+    return collective_na;
+  }
+  if (ranks != 2) { return false; }
   CudaConfig config = Config(ranks, rank != 0);
   config.injection.enabled = true;
   config.injection.target_step = 2;
@@ -1998,14 +2427,30 @@ bool RunConfigConsensusNegative(const int ranks, const int rank) noexcept
       AuditedTransport::Accounting();
   auto engine = std::make_unique<TestEngine<Backend>>(config);
   CudaRunEvidence evidence{};
+  (void)RecordNumericalEngineInitialization(
+      "rank2.config.consensus-negative");
   const bool initialized = engine->Initialize(evidence);
-  return !initialized && evidence.status == CudaRunStatus::setup_failure &&
+  const bool local_exact =
+      !initialized && evidence.status == CudaRunStatus::setup_failure &&
       evidence.setup_origin == FailureReason::collective_protocol &&
       AuditedAllocator::W8OwnedAllocationCalls() == owned_before &&
       AuditedAllocator::DeallocationEvents() == deallocations_before &&
       SameLedger(allocation_before, AuditedAllocator::Ledger()) &&
       SameLedger(transfer_before, AuditedTransport::Ledger()) &&
       SameTotals(transfer_totals_before, AuditedTransport::Accounting());
+  const bool collective_exact = CollectivelyExact(local_exact);
+  std::fprintf(stderr,
+      "CUDA_EXPECTED_NEGATIVE case=rank2.config.consensus-negative "
+      "rank=%d applicability=APPLIES expected_reason=%u actual_reason=%u "
+      "expected_status=%u actual_status=%u initialized=%u "
+      "local=%s collective=%s\n",
+      rank, static_cast<unsigned>(FailureReason::collective_protocol),
+      static_cast<unsigned>(evidence.setup_origin),
+      static_cast<unsigned>(CudaRunStatus::setup_failure),
+      static_cast<unsigned>(evidence.status), initialized ? 1U : 0U,
+      local_exact ? "PASS" : "FAIL",
+      collective_exact ? "PASS" : "FAIL");
+  return collective_exact;
 }
 
 using AffineContract = typename TestEngine<TestRankOneBackendTag>::contract_type;
@@ -2084,6 +2529,258 @@ void ReportTokenFailure(const int rank, const char* const stage,
   }
 }
 
+void ReportExpectedNegativeEvidence(
+    const char* const case_id, const int rank, const char* const stage,
+    const FailureReason expected_reason, const CudaRunStatus expected_status,
+    const CudaStepEvidence& evidence, const bool local_exact,
+    const bool collective_exact,
+    const CudaSerializedCheckpointV1* const checkpoint = nullptr) noexcept
+{
+  std::fprintf(stderr,
+      "CUDA_EXPECTED_NEGATIVE case=%s rank=%d stage=%s "
+      "expected_reason=%u actual_reason=%u expected_status=%u "
+      "actual_status=%u committed=%u retry=%u coordinates=%u bytes=%u "
+      "flags=%u/%u/%u/%u local=%s collective=%s\n",
+      case_id != nullptr ? case_id : "null", rank,
+      stage != nullptr ? stage : "null",
+      static_cast<unsigned>(expected_reason),
+      static_cast<unsigned>(evidence.contract_reason),
+      static_cast<unsigned>(expected_status),
+      static_cast<unsigned>(evidence.status), evidence.committed ? 1U : 0U,
+      evidence.retry_available ? 1U : 0U,
+      evidence.coordinates_preserved ? 1U : 0U,
+      evidence.committed_bytes_preserved ? 1U : 0U,
+      checkpoint != nullptr && checkpoint->candidate_frozen ? 1U : 0U,
+      checkpoint != nullptr && checkpoint->checkpoint_staged ? 1U : 0U,
+      checkpoint != nullptr && checkpoint->output_staged ? 1U : 0U,
+      checkpoint != nullptr && checkpoint->successful_commit ? 1U : 0U,
+      local_exact ? "PASS" : "FAIL",
+      collective_exact ? "PASS" : "FAIL");
+}
+
+void ReportAttemptTelemetryEvidence(
+    const char* const case_id, const int rank, const char* const stage,
+    const FailureReason expected_reason, const RunStatus expected_status,
+    const AttemptTelemetry& attempt, const AcceptedTelemetry& accepted,
+    const RunStatus actual_status, const std::uint64_t commits,
+    const std::uint64_t out_of_order_rejections,
+    const bool local_exact, const bool collective_exact) noexcept
+{
+  std::fprintf(stderr,
+      "CUDA_ATTEMPT_TELEMETRY case=%s rank=%d stage=%s "
+      "expected_reason=%u actual_reason=%u expected_status=%u "
+      "actual_status=%u accepted=%u attempt=%llu/%llu "
+      "accepted_attempt=%llu/%llu product_mask=0x%x/0x%x "
+      "commits=%llu out_of_order_rejections=%llu local=%s collective=%s\n",
+      case_id != nullptr ? case_id : "null", rank,
+      stage != nullptr ? stage : "null",
+      static_cast<unsigned>(expected_reason),
+      static_cast<unsigned>(attempt.failure_reason),
+      static_cast<unsigned>(expected_status),
+      static_cast<unsigned>(actual_status), accepted.valid ? 1U : 0U,
+      static_cast<unsigned long long>(attempt.identity.sequence),
+      static_cast<unsigned long long>(attempt.identity.committed_step),
+      static_cast<unsigned long long>(accepted.attempt.identity.sequence),
+      static_cast<unsigned long long>(
+          accepted.attempt.identity.committed_step),
+      static_cast<unsigned>(attempt.validated_product_mask),
+      static_cast<unsigned>(accepted.attempt.validated_product_mask),
+      static_cast<unsigned long long>(commits),
+      static_cast<unsigned long long>(out_of_order_rejections),
+      local_exact ? "PASS" : "FAIL",
+      collective_exact ? "PASS" : "FAIL");
+}
+
+struct OracleOutputTestSeam
+{
+  int checkpoint_mismatch_rank = -1;
+};
+
+struct FrozenStageResult
+{
+  bool passed = false;
+  bool cleanup_exact = false;
+};
+
+template <typename Engine>
+FrozenStageResult StageOracleOutputCollective(
+    Engine& engine, CudaSerializedCheckpointV1& checkpoint,
+    CudaStepEvidence& evidence, const CudaPrecommitSnapshot& snapshot,
+    const int ranks, const int rank, const bool retry,
+    const std::uint64_t target_step, const bool mutate_oracle,
+    const char* const case_id,
+    const OracleOutputTestSeam seam = {}) noexcept
+{
+  auto staged_oracle = std::make_unique<CudaOraclePod>();
+  const auto report_stage =
+      [&](const char* const stage, const bool local_exact,
+          const bool collective_exact) noexcept
+  {
+    std::fprintf(stderr,
+        "CUDA_ORACLE_STAGE case=%s rank=%d target=%llu stage=%s "
+        "local=%u collective=%u pod_rank=%d pod_ranks=%d "
+        "attempt=%llu/%llu product=%llu/%llu dt=%.17g/%.17g "
+        "output=%u committed=%u\n",
+        case_id != nullptr ? case_id : "null", rank,
+        static_cast<unsigned long long>(target_step), stage,
+        local_exact ? 1U : 0U, collective_exact ? 1U : 0U,
+        staged_oracle->rank, staged_oracle->ranks,
+        static_cast<unsigned long long>(staged_oracle->attempt_sequence),
+        static_cast<unsigned long long>(snapshot.attempt.sequence),
+        static_cast<unsigned long long>(staged_oracle->product_generation),
+        static_cast<unsigned long long>(
+            snapshot.products.residual_generation),
+        staged_oracle->dt, fixed_dt, checkpoint.output_staged ? 1U : 0U,
+        checkpoint.successful_commit ? 1U : 0U);
+  };
+  const auto fail_and_cleanup =
+      [&](const char* const stage,
+          const FailureReason reason) noexcept -> FrozenStageResult
+  {
+    const bool cleanup_exact = ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        reason, CudaFailurePhase::diagnostics,
+        AffineLocalPhase::staging);
+    ReportCommitFailure(rank, stage, retry, target_step);
+    return {false, cleanup_exact};
+  };
+
+  // StagePreparedCheckpoint consensus immediately precedes this call and
+  // proves the facade's public staging preconditions common across ranks.
+  const bool oracle_stage_return =
+      engine.StagePreparedOracle(*staged_oracle, evidence);
+  const bool oracle_stage_collective =
+      CollectivelyExact(oracle_stage_return);
+  report_stage(
+      "stage-prepared-oracle", oracle_stage_return,
+      oracle_stage_collective);
+  if (!oracle_stage_collective)
+    return fail_and_cleanup("oracle/output-stage", FailureReason::backend_failure);
+
+  const bool oracle_identity_exact =
+      OracleIdentity(*staged_oracle, snapshot, ranks, rank);
+  const bool oracle_identity_collective =
+      CollectivelyExact(oracle_identity_exact);
+  report_stage(
+      "oracle-identity", oracle_identity_exact,
+      oracle_identity_collective);
+  if (!oracle_identity_collective)
+    return fail_and_cleanup("oracle/output-stage", FailureReason::backend_failure);
+
+  const bool independent_oracle_exact =
+      cuda_w8a_test_oracle::Verify(*staged_oracle);
+  const bool independent_oracle_collective =
+      CollectivelyExact(independent_oracle_exact);
+  report_stage(
+      "independent-verify", independent_oracle_exact,
+      independent_oracle_collective);
+  if (!independent_oracle_collective)
+  {
+    const bool shape_exact =
+        cuda_w8a_test_oracle::ValidShape(*staged_oracle);
+    const bool shape_collective = CollectivelyExact(shape_exact);
+    bool count_collective = false;
+    bool physics_exact = false;
+    bool physics_collective = false;
+    bool condensation_exact = false;
+    bool condensation_collective = false;
+    bool signs_residual_exact = false;
+    bool signs_residual_collective = false;
+    if (shape_collective)
+    {
+      int global_count_min = staged_oracle->global_true_trace_count;
+      int global_count_max = staged_oracle->global_true_trace_count;
+      const bool count_min_ready = MPI_Allreduce(
+          &staged_oracle->global_true_trace_count, &global_count_min,
+          1, MPI_INT, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+      const bool count_max_ready = MPI_Allreduce(
+          &staged_oracle->global_true_trace_count, &global_count_max,
+          1, MPI_INT, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+      count_collective = CollectivelyExact(
+          count_min_ready && count_max_ready &&
+          global_count_min == global_count_max);
+      physics_exact =
+          cuda_w8a_test_oracle::VerifyPhysics(*staged_oracle);
+      physics_collective = CollectivelyExact(physics_exact);
+      condensation_exact =
+          cuda_w8a_test_oracle::VerifyCondensationRecovery(*staged_oracle);
+      condensation_collective = CollectivelyExact(condensation_exact);
+      if (count_collective && physics_collective &&
+          condensation_collective)
+      {
+        signs_residual_exact =
+            cuda_w8a_test_oracle::VerifySignsAndTrueResidual(
+                *staged_oracle);
+        signs_residual_collective =
+            CollectivelyExact(signs_residual_exact);
+      }
+    }
+    std::fprintf(stderr,
+        "CUDA_ORACLE_COMPONENTS case=%s rank=%d target=%llu "
+        "shape=%u/%u count=%u physics=%u/%u condensation=%u/%u "
+        "signs_residual=%u/%u global_true=%d local_true=%d\n",
+        case_id != nullptr ? case_id : "null", rank,
+        static_cast<unsigned long long>(target_step),
+        shape_exact ? 1U : 0U, shape_collective ? 1U : 0U,
+        count_collective ? 1U : 0U,
+        physics_exact ? 1U : 0U, physics_collective ? 1U : 0U,
+        condensation_exact ? 1U : 0U,
+        condensation_collective ? 1U : 0U,
+        signs_residual_exact ? 1U : 0U,
+        signs_residual_collective ? 1U : 0U,
+        staged_oracle->global_true_trace_count,
+        staged_oracle->true_trace_count);
+    return fail_and_cleanup("oracle/output-stage", FailureReason::backend_failure);
+  }
+
+  const bool mutation_gate_exact =
+      !mutate_oracle || VerifyOracleAndMutations(*staged_oracle);
+  const bool mutation_gate_collective =
+      CollectivelyExact(mutation_gate_exact);
+  report_stage(
+      "mutation-gate", mutation_gate_exact, mutation_gate_collective);
+  if (!mutation_gate_collective)
+    return fail_and_cleanup("oracle/output-stage", FailureReason::backend_failure);
+
+  if (rank == seam.checkpoint_mismatch_rank)
+    checkpoint.descriptor.interior_hash.bytes[0] ^= 1U;
+  const bool mark_output_staged_return =
+      engine.MarkOutputStaged(checkpoint);
+  const bool output_staged_exact = checkpoint.output_staged;
+  const bool successful_commit_clear = !checkpoint.successful_commit;
+  const bool output_state_collective = CollectivelyExact(
+      mark_output_staged_return && output_staged_exact &&
+      successful_commit_clear);
+  report_stage(
+      "mark-output-staged", mark_output_staged_return,
+      output_state_collective);
+  std::fprintf(stderr,
+      "CUDA_ORACLE_OUTPUT_FLAGS case=%s rank=%d target=%llu "
+      "mark=%u output=%u commit_clear=%u collective=%u\n",
+      case_id != nullptr ? case_id : "null", rank,
+      static_cast<unsigned long long>(target_step),
+      mark_output_staged_return ? 1U : 0U,
+      output_staged_exact ? 1U : 0U,
+      successful_commit_clear ? 1U : 0U,
+      output_state_collective ? 1U : 0U);
+  if (!output_state_collective)
+  {
+    const FailureReason reason = seam.checkpoint_mismatch_rank >= 0
+        ? FailureReason::collective_protocol : FailureReason::backend_failure;
+    return fail_and_cleanup("oracle/output-stage", reason);
+  }
+
+  const bool oracle_policy_ledgers_exact = ExactPolicyLedgers();
+  const bool oracle_policy_ledgers_collective =
+      CollectivelyExact(oracle_policy_ledgers_exact);
+  report_stage(
+      "policy-ledgers", oracle_policy_ledgers_exact,
+      oracle_policy_ledgers_collective);
+  if (!oracle_policy_ledgers_collective)
+    return fail_and_cleanup("oracle/output-stage", FailureReason::backend_failure);
+  return {true, true};
+}
+
 template <typename Engine>
 bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
                              const std::uint64_t target_step,
@@ -2092,15 +2789,19 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
                              CudaSerializedCheckpointV1& checkpoint,
                              const bool mutate_oracle = false,
                              CudaPrecommitSnapshot* captured = nullptr,
-                             const char* const case_id = "unspecified")
+                             const char* const case_id = "unspecified",
+                             const bool allow_initial_shared_growth = false)
     noexcept
 {
   const std::uint64_t owned_allocation_calls =
       AuditedAllocator::W8OwnedAllocationCalls();
+  const std::uint64_t deallocation_events =
+      AuditedAllocator::DeallocationEvents();
   CudaPrecommitSnapshot snapshot{};
   CudaStepEvidence evidence{};
   const auto* contract = engine.contract();
-  if (contract == nullptr)
+  const bool contract_collective = CollectivelyExact(contract != nullptr);
+  if (!contract_collective)
   {
     ReportCommitFailure(rank, "contract", retry, target_step);
     return false;
@@ -2108,20 +2809,40 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
   const StateCoordinates old_coordinates = contract->coordinates();
   const auto old_publication = contract->Published();
   StateCoordinates visible{};
-  const bool prepare_step_failed =
-      !engine.PrepareStep(retry, snapshot, evidence) ||
-      !snapshot.numerical_candidate_ready ||
-      snapshot.attempt.retry_index != (retry ? 1 : 0) ||
-      snapshot.target.step != target_step ||
-      snapshot.target.generation != old_coordinates.generation + 1 ||
-      !SameCoordinates(snapshot.committed, old_coordinates) ||
-      !snapshot.products.CoupledAndOrdered() ||
-      !snapshot.staging_must_precede_finalize ||
-      !snapshot.finalize_has_no_fallible_posthook ||
-      !contract->PublishedCoordinates(old_publication, visible) ||
-      !SameCoordinates(visible, old_coordinates) || !ExactPolicyLedgers();
-  if (prepare_step_failed)
+  const bool prepare_step_return =
+      engine.PrepareStep(retry, snapshot, evidence);
+  const std::uint64_t accepted_allocation_events =
+      AuditedAllocator::AllocationEvents();
+  const bool local_allocation_sample_exact = allow_initial_shared_growth
+      ? InitialAllocationSampleExact(allocation_baseline,
+                                     accepted_allocation_events)
+      : accepted_allocation_events == allocation_baseline;
+  const bool collective_allocation_sample_exact =
+      CollectivelyExact(local_allocation_sample_exact &&
+          AuditedAllocator::W8OwnedAllocationCalls() ==
+              owned_allocation_calls &&
+          AuditedAllocator::DeallocationEvents() == deallocation_events);
+  const bool prepare_policy_ledgers_exact = ExactPolicyLedgers();
+  const bool prepare_step_local = prepare_step_return &&
+      snapshot.numerical_candidate_ready &&
+      snapshot.attempt.retry_index == (retry ? 1 : 0) &&
+      snapshot.target.step == target_step &&
+      snapshot.target.generation == old_coordinates.generation + 1 &&
+      SameCoordinates(snapshot.committed, old_coordinates) &&
+      snapshot.products.CoupledAndOrdered() &&
+      snapshot.staging_must_precede_finalize &&
+      snapshot.finalize_has_no_fallible_posthook &&
+      contract->PublishedCoordinates(old_publication, visible) &&
+      SameCoordinates(visible, old_coordinates) &&
+      collective_allocation_sample_exact && prepare_policy_ledgers_exact;
+  const bool prepare_step_collective =
+      CollectivelyExact(prepare_step_local);
+  if (!prepare_step_collective)
   {
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        PhaseAfterPrepareStep(prepare_step_return, evidence));
     ReportCommitFailure(rank, "prepare-step", retry, target_step);
     return false;
   }
@@ -2186,81 +2907,173 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
         checkpoint_consensus.cleanup_required ? 1U : 0U,
         static_cast<unsigned>(checkpoint_consensus.cleanup_reason),
         static_cast<unsigned>(checkpoint_consensus.cleanup_phase));
-    (void)CleanupUnexpectedFrozenAuthority(
-        engine, checkpoint, evidence, snapshot, case_id, rank,
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
         checkpoint_consensus.cleanup_reason,
-        checkpoint_consensus.cleanup_phase);
+        checkpoint_consensus.cleanup_phase,
+        AffineLocalPhase::staging);
     ReportCommitFailure(rank, "checkpoint-stage", retry, target_step);
     return false;
   }
 
-  auto staged_oracle = std::make_unique<CudaOraclePod>();
-  const bool oracle_output_stage_failed =
-      !engine.StagePreparedOracle(*staged_oracle, evidence) ||
-      !OracleIdentity(*staged_oracle, snapshot, ranks, rank) ||
-      !cuda_w8a_test_oracle::Verify(*staged_oracle) ||
-      (mutate_oracle && !VerifyOracleAndMutations(*staged_oracle)) ||
-      !engine.MarkOutputStaged(checkpoint) || !checkpoint.output_staged ||
-      checkpoint.successful_commit || !ExactPolicyLedgers();
-  if (oracle_output_stage_failed)
+  const FrozenStageResult oracle_output = StageOracleOutputCollective(
+      engine, checkpoint, evidence, snapshot, ranks, rank, retry,
+      target_step, mutate_oracle, case_id);
+  if (!oracle_output.passed)
+    return false;
+
+  const bool prepare_commit_return =
+      engine.PrepareCommit(checkpoint, evidence);
+  const bool prepare_commit_return_collective =
+      CollectivelyExact(prepare_commit_return);
+  if (!prepare_commit_return_collective)
   {
-    ReportCommitFailure(rank, "oracle/output-stage", retry, target_step);
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        PhaseAfterPrepareCommit(prepare_commit_return, evidence));
+    ReportCommitFailure(rank, "prepare-commit", retry, target_step);
+    return false;
+  }
+  const bool prepare_commit_local =
+      evidence.status == CudaRunStatus::ready && !evidence.committed &&
+      checkpoint.candidate_frozen && checkpoint.checkpoint_staged &&
+      checkpoint.output_staged && !checkpoint.successful_commit &&
+      SameCoordinates(contract->coordinates(), old_coordinates) &&
+      contract->PublishedCoordinates(old_publication, visible) &&
+      SameCoordinates(visible, old_coordinates);
+  const bool prepare_commit_collective =
+      CollectivelyExact(prepare_commit_local);
+  if (!prepare_commit_collective)
+  {
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        PhaseAfterPrepareCommit(prepare_commit_return, evidence));
+    ReportCommitFailure(rank, "prepare-commit", retry, target_step);
     return false;
   }
 
-  const bool prepare_commit_failed =
-      !engine.PrepareCommit(checkpoint, evidence) || evidence.committed ||
-      !SameCoordinates(contract->coordinates(), old_coordinates) ||
-      !contract->PublishedCoordinates(old_publication, visible) ||
-      !SameCoordinates(visible, old_coordinates) ||
-      !engine.CommitPrepared(checkpoint, evidence) || evidence.committed ||
-      checkpoint.successful_commit ||
-      !SameCoordinates(contract->coordinates(), old_coordinates) ||
-      !contract->PublishedCoordinates(old_publication, visible) ||
-      !SameCoordinates(visible, old_coordinates) || !ExactPolicyLedgers();
-  if (prepare_commit_failed)
+  const bool commit_prepared_return =
+      engine.CommitPrepared(checkpoint, evidence);
+  const bool commit_prepared_return_collective =
+      CollectivelyExact(commit_prepared_return);
+  if (!commit_prepared_return_collective)
   {
-    ReportCommitFailure(rank, "prepare/commit", retry, target_step);
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        PhaseAfterCommitPrepared(commit_prepared_return, evidence));
+    ReportCommitFailure(rank, "commit-prepared", retry, target_step);
+    return false;
+  }
+  const bool commit_policy_ledgers_exact = ExactPolicyLedgers();
+  const bool commit_prepared_local =
+      evidence.status == CudaRunStatus::ready && !evidence.committed &&
+      checkpoint.candidate_frozen && checkpoint.checkpoint_staged &&
+      checkpoint.output_staged && !checkpoint.successful_commit &&
+      SameCoordinates(contract->coordinates(), old_coordinates) &&
+      contract->PublishedCoordinates(old_publication, visible) &&
+      SameCoordinates(visible, old_coordinates) &&
+      commit_policy_ledgers_exact;
+  const bool commit_prepared_collective =
+      CollectivelyExact(commit_prepared_local);
+  if (!commit_prepared_collective)
+  {
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        PhaseAfterCommitPrepared(commit_prepared_return, evidence));
+    ReportCommitFailure(rank, "commit-prepared", retry, target_step);
     return false;
   }
 
-  const bool finalize_failed =
-      !engine.FinalizeCommit(checkpoint, evidence) ||
-      !checkpoint.successful_commit || !evidence.committed ||
-      evidence.retry_available || !evidence.collective_consensus ||
-      evidence.contract_reason != FailureReason::none ||
-      evidence.status != CudaRunStatus::committed ||
-      evidence.after.step != target_step ||
-      evidence.after.generation != target_step ||
-      std::abs(evidence.after.time - fixed_dt * target_step) > 1.0e-14 ||
-      !SameCoordinates(contract->coordinates(), snapshot.target) ||
-      contract->PublishedCoordinates(old_publication, visible) ||
-      !evidence.products.CoupledAndOrdered() || !evidence.no_fallback ||
-      !evidence.device_resident ||
-      AuditedAllocator::AllocationEvents() != allocation_baseline ||
-      !ExactAttemptEvidence(evidence, ranks);
-  if (finalize_failed)
+  const bool finalize_return = engine.FinalizeCommit(checkpoint, evidence);
+  const bool finalize_return_collective =
+      CollectivelyExact(finalize_return);
+  const bool collective_allocation_plateau_exact =
+      CollectivelyExactAllocatorState(accepted_allocation_events,
+                                      owned_allocation_calls,
+                                      deallocation_events);
+  const bool finalize_evidence_exact = ExactAttemptEvidence(evidence, ranks);
+  const bool finalize_local = finalize_return_collective &&
+      checkpoint.successful_commit && evidence.committed &&
+      !evidence.retry_available && evidence.collective_consensus &&
+      evidence.contract_reason == FailureReason::none &&
+      evidence.status == CudaRunStatus::committed &&
+      evidence.after.step == target_step &&
+      evidence.after.generation == target_step &&
+      std::abs(evidence.after.time - fixed_dt * target_step) <= 1.0e-14 &&
+      SameCoordinates(contract->coordinates(), snapshot.target) &&
+      !contract->PublishedCoordinates(old_publication, visible) &&
+      evidence.products.CoupledAndOrdered() && evidence.no_fallback &&
+      evidence.device_resident && collective_allocation_plateau_exact &&
+      finalize_evidence_exact;
+  const bool finalize_collective = CollectivelyExact(finalize_local);
+  if (!finalize_collective)
   {
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        PhaseAfterFinalizeCommit(evidence));
     ReportCommitFailure(rank, "finalize", retry, target_step);
     return false;
   }
 
   auto exported = std::make_unique<CudaOraclePod>();
-  const bool export_valid = engine.ExportOracle(*exported) &&
-      OracleIdentity(*exported, snapshot, ranks, rank) &&
-      cuda_w8a_test_oracle::Verify(*exported) &&
-      AuditedAllocator::W8OwnedAllocationCalls() ==
-          owned_allocation_calls &&
-      ExactPolicyLedgers();
-  if (!export_valid)
+  const bool export_return = engine.ExportOracle(*exported);
+  const bool export_return_collective = CollectivelyExact(export_return);
+  if (!export_return_collective)
+  {
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        AffineLocalPhase::consumed);
     ReportCommitFailure(rank, "export", retry, target_step);
-  return export_valid;
+    return false;
+  }
+  const bool export_identity_local =
+      OracleIdentity(*exported, snapshot, ranks, rank);
+  const bool export_identity_collective =
+      CollectivelyExact(export_identity_local);
+  if (!export_identity_collective)
+  {
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        AffineLocalPhase::consumed);
+    ReportCommitFailure(rank, "export", retry, target_step);
+    return false;
+  }
+  const bool export_oracle_exact =
+      cuda_w8a_test_oracle::Verify(*exported);
+  const bool export_oracle_collective =
+      CollectivelyExact(export_oracle_exact);
+  const bool export_allocator_state_exact =
+      CollectivelyExactAllocatorState(accepted_allocation_events,
+                                      owned_allocation_calls,
+                                      deallocation_events);
+  const bool export_policy_ledgers_exact = ExactPolicyLedgers();
+  const bool export_local = export_oracle_collective &&
+      export_allocator_state_exact && export_policy_ledgers_exact;
+  const bool export_collective = CollectivelyExact(export_local);
+  if (!export_collective)
+  {
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        AffineLocalPhase::consumed);
+    ReportCommitFailure(rank, "export", retry, target_step);
+  }
+  return export_collective;
 }
 
 template <typename Backend>
 bool RunLifecycle(const int ranks,
                   CudaSerializedCheckpointV1& final_checkpoint,
-                  const char* const context) noexcept
+                  const char* const context,
+                  const std::uint64_t expected_initialization_ordinal = 0)
+    noexcept
 {
   CudaConfig config = Config(ranks, true);
   config.injection.enabled = true;
@@ -2270,70 +3083,301 @@ bool RunLifecycle(const int ranks,
   const bool result = [&]() noexcept
   {
     CudaRunEvidence setup{};
-    if (!InitializePositive(*engine, setup, ranks, context))
+    std::uint64_t initialization_ordinal = 0;
+    if (!InitializePositive(
+            *engine, setup, ranks, context, &initialization_ordinal))
       return false;
+    const bool initialization_ordinal_collective = CollectivelyExact(
+        expected_initialization_ordinal == 0 ||
+        initialization_ordinal == expected_initialization_ordinal);
+    std::fprintf(stderr,
+        "CUDA_ENGINE_INIT_QUALIFICATION rank=%d context=%s "
+        "expected=%llu actual=%llu local=%s collective=%s\n",
+        setup.rank, context != nullptr ? context : "null",
+        static_cast<unsigned long long>(expected_initialization_ordinal),
+        static_cast<unsigned long long>(initialization_ordinal),
+        (expected_initialization_ordinal == 0 ||
+         initialization_ordinal == expected_initialization_ordinal)
+            ? "PASS" : "FAIL",
+        initialization_ordinal_collective ? "PASS" : "FAIL");
+    if (!initialization_ordinal_collective) { return false; }
     const std::uint64_t allocations = setup.reuse.baseline_allocation_events;
+    const std::uint64_t owned_allocation_calls =
+        setup.reuse.baseline_w8_owned_allocation_calls;
+    const std::uint64_t owned_deallocation_events =
+        AuditedAllocator::DeallocationEvents();
+    const AllocatorHighWaterSample initial_high_water =
+        SampleAllocatorHighWater();
+    std::uint64_t plateau_allocations = allocations;
+    AllocatorHighWaterSample plateau_high_water{};
+    std::uint64_t credited_plateau_cycles = 0;
+    const auto credited_allocation_cycle =
+        [&](const std::uint64_t cycle) noexcept
+    {
+      const std::uint64_t current_allocations =
+          AuditedAllocator::AllocationEvents();
+      const std::uint64_t current_owned_calls =
+          AuditedAllocator::W8OwnedAllocationCalls();
+      const std::uint64_t current_deallocations =
+          AuditedAllocator::DeallocationEvents();
+      const AllocatorHighWaterSample current_high_water =
+          SampleAllocatorHighWater();
+      const bool mfem_nonnegative =
+          current_high_water.mfem >= initial_high_water.mfem;
+      const bool hypre_nonnegative =
+          current_high_water.hypre >= initial_high_water.hypre;
+      const bool allocation_nonnegative = current_allocations >= allocations;
+      const bool owned_nonnegative =
+          current_owned_calls >= owned_allocation_calls;
+      const bool deallocation_nonnegative =
+          current_deallocations >= owned_deallocation_events;
+      const std::size_t mfem_delta = mfem_nonnegative
+          ? current_high_water.mfem - initial_high_water.mfem : 0;
+      const std::size_t hypre_delta = hypre_nonnegative
+          ? current_high_water.hypre - initial_high_water.hypre : 0;
+      const std::uint64_t allocation_delta = allocation_nonnegative
+          ? current_allocations - allocations : 0;
+      const std::uint64_t owned_delta = owned_nonnegative
+          ? current_owned_calls - owned_allocation_calls : 0;
+      const std::uint64_t deallocation_delta = deallocation_nonnegative
+          ? current_deallocations - owned_deallocation_events : 0;
+      const bool identities_stable = initial_high_water.valid &&
+          current_high_water.valid &&
+          std::strcmp(initial_high_water.mfem_identity,
+                      current_high_water.mfem_identity) == 0 &&
+          std::strcmp(initial_high_water.hypre_identity,
+                      current_high_water.hypre_identity) == 0;
+      const char* origin = "invalid";
+      if (cycle != 1)
+        origin = "plateau";
+      else if (mfem_delta == 0 && hypre_delta == 0)
+        origin = "none";
+      else if (mfem_delta != 0 && hypre_delta == 0)
+        origin = "mfem";
+      else if (mfem_delta == 0 && hypre_delta != 0)
+        origin = "hypre";
+      bool exact = initial_high_water.valid && current_high_water.valid &&
+          identities_stable && mfem_nonnegative && hypre_nonnegative &&
+          allocation_nonnegative && owned_nonnegative &&
+          deallocation_nonnegative &&
+          current_owned_calls == owned_allocation_calls &&
+          current_deallocations == owned_deallocation_events;
+      if (cycle == 1)
+      {
+        const bool counter_matches_pools = allocation_delta == 0
+            ? mfem_delta == 0 && hypre_delta == 0
+            : (mfem_delta != 0) != (hypre_delta != 0);
+        exact = exact && std::strcmp(origin, "invalid") != 0 &&
+            counter_matches_pools &&
+            InitialAllocationSampleExact(allocations, current_allocations) &&
+            (ranks == 2 || current_allocations == allocations);
+        if (exact)
+        {
+          plateau_allocations = current_allocations;
+          plateau_high_water = current_high_water;
+        }
+      }
+      else
+      {
+        exact = exact && current_allocations == plateau_allocations &&
+            current_high_water.mfem == plateau_high_water.mfem &&
+            current_high_water.hypre == plateau_high_water.hypre &&
+            std::strcmp(current_high_water.mfem_identity,
+                        plateau_high_water.mfem_identity) == 0 &&
+            std::strcmp(current_high_water.hypre_identity,
+                        plateau_high_water.hypre_identity) == 0;
+      }
+      const int local_exact = exact ? 1 : 0;
+      int global_exact = 0;
+      const bool collective_exact = MPI_Allreduce(
+          &local_exact, &global_exact, 1, MPI_INT, MPI_MIN,
+          MPI_COMM_WORLD) == MPI_SUCCESS && global_exact == 1;
+      if (cycle > 1 && collective_exact) { ++credited_plateau_cycles; }
+      std::fprintf(stderr,
+          "CUDA_ALLOCATION_PLATEAU rank=%d cycle=%llu origin=%s "
+          "mfem_id=%s/%s mfem=%zu/%zu/%zu "
+          "hypre_id=%s/%s hypre=%zu/%zu/%zu "
+          "composite=%llu/%llu/%llu owned=%llu/%llu/%llu "
+          "dealloc=%llu/%llu/%llu nonnegative=%u/%u/%u/%u/%u "
+          "local=%s collective=%s\n",
+          setup.rank, static_cast<unsigned long long>(cycle),
+          origin, initial_high_water.mfem_identity,
+          current_high_water.mfem_identity,
+          initial_high_water.mfem, current_high_water.mfem, mfem_delta,
+          initial_high_water.hypre_identity,
+          current_high_water.hypre_identity,
+          initial_high_water.hypre, current_high_water.hypre, hypre_delta,
+          static_cast<unsigned long long>(allocations),
+          static_cast<unsigned long long>(current_allocations),
+          static_cast<unsigned long long>(allocation_delta),
+          static_cast<unsigned long long>(owned_allocation_calls),
+          static_cast<unsigned long long>(current_owned_calls),
+          static_cast<unsigned long long>(owned_delta),
+          static_cast<unsigned long long>(owned_deallocation_events),
+          static_cast<unsigned long long>(current_deallocations),
+          static_cast<unsigned long long>(deallocation_delta),
+          mfem_nonnegative ? 1U : 0U, hypre_nonnegative ? 1U : 0U,
+          allocation_nonnegative ? 1U : 0U,
+          owned_nonnegative ? 1U : 0U,
+          deallocation_nonnegative ? 1U : 0U,
+          exact ? "PASS" : "FAIL",
+          collective_exact ? "PASS" : "FAIL");
+      return collective_exact;
+    };
     CudaSerializedCheckpointV1 checkpoint{};
-    if (!CommitSuccessfulAttempt(*engine, false, 1, ranks, setup.rank,
-                                 allocations,
-                                 checkpoint, false, nullptr, context))
+    const bool initial_commit_exact = CollectivelyExact(
+        CommitSuccessfulAttempt(*engine, false, 1, ranks, setup.rank,
+                                allocations, checkpoint, false, nullptr,
+                                context, ranks == 2));
+    if (!initial_commit_exact || !credited_allocation_cycle(1))
     {
       return false;
     }
 
     const auto* contract = engine->contract();
-    if (contract == nullptr) { return false; }
+    const bool contract_collective = CollectivelyExact(contract != nullptr);
+    if (!contract_collective) { return false; }
     const StateCoordinates old_coordinates = contract->coordinates();
     const auto old_publication = contract->Published();
     CudaPrecommitSnapshot failed_snapshot{};
     CudaStepEvidence failed{};
-    if (!engine->PrepareStep(false, failed_snapshot, failed) ||
-        failed_snapshot.target.step != 2 ||
-        failed.phase != CudaFailurePhase::after_recovery_before_commit ||
-        failed.source_rank != ranks - 1 ||
-        failed_snapshot.attempt.retry_index != 0 ||
-        !failed_snapshot.numerical_candidate_ready)
+    CudaSerializedCheckpointV1 prohibited_checkpoint{};
+    const bool prepare_return =
+        engine->PrepareStep(false, failed_snapshot, failed);
+    const bool prepare_post_local = prepare_return &&
+        failed_snapshot.target.step == 2 &&
+        failed.phase == CudaFailurePhase::after_recovery_before_commit &&
+        failed.source_rank == ranks - 1 &&
+        failed_snapshot.attempt.retry_index == 0 &&
+        failed_snapshot.numerical_candidate_ready;
+    const bool prepare_collective = CollectivelyExact(prepare_post_local);
+    if (!prepare_collective)
     {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, prohibited_checkpoint, failed, failed_snapshot,
+          "lifecycle-injected-prepare", ranks, setup.rank,
+          FailureReason::backend_failure,
+          CudaFailurePhase::after_recovery_before_commit,
+          PhaseAfterPrepareStep(prepare_return, failed));
       return false;
     }
-    CudaSerializedCheckpointV1 prohibited_checkpoint{};
-    if (engine->StagePreparedCheckpoint(prohibited_checkpoint, failed) ||
-        prohibited_checkpoint.checkpoint_staged ||
-        !engine->AbortPrepared(prohibited_checkpoint, FailureReason::none,
-                               failed) ||
-        failed.committed || !failed.retry_available ||
-        failed.contract_reason != FailureReason::backend_failure ||
-        failed.status != CudaRunStatus::retry_available ||
-        failed.source_rank != ranks - 1 || !failed.collective_consensus ||
-        !failed.committed_bytes_preserved || !failed.coordinates_preserved ||
-        !SameCoordinates(contract->coordinates(), old_coordinates))
+    const bool stage_return = StagePreparedCheckpointDiagnosed(
+        *engine, prohibited_checkpoint, failed, failed_snapshot, ranks,
+        false, 2, "lifecycle-injected-stage", setup.rank, false);
+    const bool stage_failure_local = !stage_return &&
+        !prohibited_checkpoint.candidate_frozen &&
+        !prohibited_checkpoint.checkpoint_staged &&
+        !prohibited_checkpoint.output_staged &&
+        !prohibited_checkpoint.successful_commit;
+    const bool stage_failure_collective =
+        CollectivelyExact(stage_failure_local);
+    if (!stage_failure_collective)
     {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, prohibited_checkpoint, failed, failed_snapshot,
+          "lifecycle-injected-stage", ranks, setup.rank,
+          FailureReason::backend_failure,
+          CudaFailurePhase::after_recovery_before_commit,
+          AffineLocalPhase::staging);
+      return false;
+    }
+    const bool cleanup_exact = ResolveUnexpectedAffineExit(
+        *engine, prohibited_checkpoint, failed, failed_snapshot,
+        "lifecycle-injected-stage", ranks, setup.rank,
+        FailureReason::backend_failure,
+        CudaFailurePhase::after_recovery_before_commit,
+        AffineLocalPhase::staging);
+    const bool failure_post_local = cleanup_exact && !failed.committed &&
+        failed.retry_available &&
+        failed.contract_reason == FailureReason::backend_failure &&
+        failed.status == CudaRunStatus::retry_available &&
+        failed.source_rank == ranks - 1 && failed.collective_consensus &&
+        failed.committed_bytes_preserved && failed.coordinates_preserved &&
+        SameCoordinates(contract->coordinates(), old_coordinates) &&
+        ExactAttemptEvidence(failed, ranks);
+    const bool failure_post_collective =
+        CollectivelyExact(failure_post_local);
+    ReportExpectedNegativeEvidence(
+        context, setup.rank, "lifecycle-injected-stage",
+        FailureReason::backend_failure, CudaRunStatus::retry_available,
+        failed, failure_post_local, failure_post_collective,
+        &prohibited_checkpoint);
+    if (!failure_post_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, prohibited_checkpoint, failed, failed_snapshot,
+          "lifecycle-injected-postcondition", ranks, setup.rank,
+          FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics, AffineLocalPhase::consumed);
       return false;
     }
     StateCoordinates visible{};
-    if (!contract->PublishedCoordinates(old_publication, visible) ||
-        !SameCoordinates(visible, old_coordinates) ||
-        AuditedAllocator::AllocationEvents() != allocations ||
-        !ExactAttemptEvidence(failed, ranks))
+    const bool failed_allocation_state_exact =
+        CollectivelyExactAllocatorState(
+            plateau_allocations, owned_allocation_calls,
+            owned_deallocation_events);
+    const bool failed_publication_local =
+        contract->PublishedCoordinates(old_publication, visible) &&
+        SameCoordinates(visible, old_coordinates) &&
+        failed_allocation_state_exact && ExactPolicyLedgers();
+    const bool failed_publication_collective =
+        CollectivelyExact(failed_publication_local);
+    if (!failed_publication_collective ||
+        !failure_post_collective)
     {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, prohibited_checkpoint, failed, failed_snapshot,
+          "lifecycle-injected-publication", ranks, setup.rank,
+          FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics, AffineLocalPhase::consumed);
       return false;
     }
 
-    if (!CommitSuccessfulAttempt(*engine, true, 2, ranks, setup.rank,
-                                 allocations,
-                                 checkpoint, false, nullptr, context) ||
-        !CommitSuccessfulAttempt(*engine, false, 3, ranks, setup.rank,
-                                 allocations,
-                                 final_checkpoint, true, nullptr, context))
+    const bool retry_commit_exact = CollectivelyExact(
+        CommitSuccessfulAttempt(*engine, true, 2, ranks, setup.rank,
+                                allocations, checkpoint, false, nullptr,
+                                context, ranks == 2));
+    if (!retry_commit_exact || !credited_allocation_cycle(2))
     {
       return false;
     }
+    const bool third_commit_exact = CollectivelyExact(
+        CommitSuccessfulAttempt(*engine, false, 3, ranks, setup.rank,
+                                allocations, final_checkpoint, true, nullptr,
+                                context, ranks == 2));
+    if (!third_commit_exact || !credited_allocation_cycle(3))
+    {
+      return false;
+    }
+    if (ranks == 2)
+    {
+      for (std::uint64_t target_step = 4; target_step <= 21; ++target_step)
+      {
+        CudaSerializedCheckpointV1 continued_checkpoint{};
+        const bool continued_commit_exact = CollectivelyExact(
+            CommitSuccessfulAttempt(
+                *engine, false, target_step, ranks, setup.rank, allocations,
+                continued_checkpoint, false, nullptr, context,
+                ranks == 2));
+        if (!continued_commit_exact ||
+            !credited_allocation_cycle(target_step))
+        {
+          return false;
+        }
+        final_checkpoint = continued_checkpoint;
+      }
+    }
     contract = engine->contract();
-    return contract != nullptr && contract->coordinates().step == 3 &&
-        contract->coordinates().generation == 3 &&
-        contract->coordinates().cursor == 4 &&
-        std::abs(contract->coordinates().time - 0.15) <= 1.0e-14 &&
-        contract->telemetry().commits == 3 &&
+    const std::uint64_t expected_step = ranks == 2 ? 21 : 3;
+    const std::uint64_t expected_cursor = ranks == 2 ? 22 : 4;
+    return contract != nullptr &&
+        contract->coordinates().step == expected_step &&
+        contract->coordinates().generation == expected_step &&
+        contract->coordinates().cursor == expected_cursor &&
+        std::abs(contract->coordinates().time -
+                 fixed_dt * static_cast<double>(expected_step)) <= 1.0e-14 &&
+        contract->telemetry().commits == expected_step &&
+        (ranks != 2 || credited_plateau_cycles >= 20) &&
         contract->telemetry().last_attempt.prohibited.fallback_events == 0 &&
         final_checkpoint.successful_commit && ExactPolicyLedgers();
   }();
@@ -2352,22 +3396,39 @@ bool RunCorruptRestore(const int ranks,
     CudaRunEvidence setup{};
     if (!InitializePositive(*engine, setup, ranks, context))
       return false;
+    const std::uint64_t owned_allocation_calls =
+        setup.reuse.baseline_w8_owned_allocation_calls;
+    const std::uint64_t deallocation_events =
+        AuditedAllocator::DeallocationEvents();
     CudaSerializedCheckpointV1 corrupt = checkpoint;
-    if (corrupt.interior_count == 0) { return false; }
+    const bool corrupt_shape_collective =
+        CollectivelyExact(corrupt.interior_count != 0);
+    if (!corrupt_shape_collective) { return false; }
     corrupt.interior[0] += 1.0 + std::abs(corrupt.interior[0]);
     CudaStepEvidence evidence{};
     const auto* contract = engine->contract();
-    const StateCoordinates before = contract == nullptr
-        ? StateCoordinates{} : contract->coordinates();
-    return contract != nullptr && !engine->Restore(corrupt, evidence) &&
+    const bool contract_collective = CollectivelyExact(contract != nullptr);
+    if (!contract_collective) { return false; }
+    const StateCoordinates before = contract->coordinates();
+    const bool restore_return = engine->Restore(corrupt, evidence);
+    const bool allocation_state_exact = CollectivelyExactAllocatorState(
+        setup.reuse.baseline_allocation_events, owned_allocation_calls,
+        deallocation_events);
+    const bool restore_local = !restore_return &&
         evidence.contract_reason == FailureReason::restart_incompatible &&
         evidence.status == CudaRunStatus::runtime_failure &&
         !evidence.committed &&
         SameCoordinates(contract->coordinates(), before) &&
-        AuditedAllocator::AllocationEvents() ==
-            setup.reuse.baseline_allocation_events &&
+        allocation_state_exact &&
         ValidRange(evidence.transfer_range, AuditedTransport::Ledger()) &&
         ExactPolicyLedgers();
+    const bool restore_collective = CollectivelyExact(restore_local);
+    ReportExpectedNegativeEvidence(
+        context, setup.rank, "corrupt-restore",
+        FailureReason::restart_incompatible,
+        CudaRunStatus::runtime_failure, evidence, restore_local,
+        restore_collective, &corrupt);
+    return restore_collective;
   }();
   engine.reset();
   return result && ExactPolicyLedgers();
@@ -2384,40 +3445,45 @@ bool RunFreshRestore(const int ranks,
     CudaRunEvidence setup{};
     if (!InitializePositive(*engine, setup, ranks, context))
       return false;
+    const std::uint64_t owned_allocation_calls =
+        setup.reuse.baseline_w8_owned_allocation_calls;
+    const std::uint64_t deallocation_events =
+        AuditedAllocator::DeallocationEvents();
     const auto* pristine_contract = engine->contract();
-    if (pristine_contract == nullptr) { return false; }
+    const bool pristine_contract_collective =
+        CollectivelyExact(pristine_contract != nullptr);
+    if (!pristine_contract_collective) { return false; }
     const auto stale_pre_restore_publication =
         pristine_contract->Published();
     const CheckpointDescriptor source_descriptor = checkpoint.descriptor;
     CudaStepEvidence evidence{};
-    if (!engine->Restore(checkpoint, evidence) || !evidence.committed ||
-        evidence.status != CudaRunStatus::committed ||
-        evidence.contract_reason != FailureReason::none ||
-        evidence.after_interior_hash != checkpoint.descriptor.interior_hash ||
-        evidence.after_trace_hash != checkpoint.descriptor.trace_hash ||
-        !SameCoordinates(evidence.after,
-                         checkpoint.descriptor.coordinates) ||
-        !ValidRange(evidence.transfer_range, AuditedTransport::Ledger()) ||
-        AuditedAllocator::AllocationEvents() !=
-            setup.reuse.baseline_allocation_events ||
-        AuditedAllocator::W8OwnedAllocationCalls() !=
-            setup.reuse.baseline_w8_owned_allocation_calls ||
-        !ExactPolicyLedgers())
-    {
-      return false;
-    }
+    const bool restore_return = engine->Restore(checkpoint, evidence);
+    const bool allocation_state_exact = CollectivelyExactAllocatorState(
+        setup.reuse.baseline_allocation_events, owned_allocation_calls,
+        deallocation_events);
+    const bool restore_post_local = restore_return && evidence.committed &&
+        evidence.status == CudaRunStatus::committed &&
+        evidence.contract_reason == FailureReason::none &&
+        evidence.after_interior_hash == checkpoint.descriptor.interior_hash &&
+        evidence.after_trace_hash == checkpoint.descriptor.trace_hash &&
+        SameCoordinates(evidence.after, checkpoint.descriptor.coordinates) &&
+        ValidRange(evidence.transfer_range, AuditedTransport::Ledger()) &&
+        allocation_state_exact && ExactPolicyLedgers();
+    const bool restore_post_collective =
+        CollectivelyExact(restore_post_local);
+    if (!restore_post_collective) { return false; }
     const auto* contract = engine->contract();
     StateCoordinates stale_visible{};
-    if (contract == nullptr ||
-        !SameCoordinates(contract->coordinates(),
-                         checkpoint.descriptor.coordinates) ||
-        contract->PublishedCoordinates(stale_pre_restore_publication,
-                                       stale_visible) ||
-        !dg::hdg::runtime::detail::SameCheckpoint(
-            source_descriptor, checkpoint.descriptor))
-    {
-      return false;
-    }
+    const bool restored_contract_local = contract != nullptr &&
+        SameCoordinates(contract->coordinates(),
+                        checkpoint.descriptor.coordinates) &&
+        !contract->PublishedCoordinates(stale_pre_restore_publication,
+                                        stale_visible) &&
+        dg::hdg::runtime::detail::SameCheckpoint(
+            source_descriptor, checkpoint.descriptor);
+    const bool restored_contract_collective =
+        CollectivelyExact(restored_contract_local);
+    if (!restored_contract_collective) { return false; }
     const StateCoordinates restored = contract->coordinates();
     const auto restored_publication = contract->Published();
     CudaSerializedCheckpointV1 continued_checkpoint{};
@@ -2430,7 +3496,7 @@ bool RunFreshRestore(const int ranks,
       return false;
     }
     contract = engine->contract();
-    return contract != nullptr &&
+    const bool continuation_local = contract != nullptr &&
         continued.attempt.sequence > restored.cursor &&
         continued.attempt.committed_step == restored.step &&
         continued.attempt.committed_generation == restored.generation &&
@@ -2444,6 +3510,7 @@ bool RunFreshRestore(const int ranks,
         !contract->PublishedCoordinates(restored_publication, stale_visible) &&
         dg::hdg::runtime::detail::SameCheckpoint(
             source_descriptor, checkpoint.descriptor);
+    return CollectivelyExact(continuation_local);
   }();
   engine.reset();
   return result && ExactPolicyLedgers();
@@ -2460,51 +3527,156 @@ bool RunProvisionalRevert(const int ranks,
     if (!InitializePositive(*engine, setup, ranks, context))
       return false;
     const auto* contract = engine->contract();
-    if (contract == nullptr) { return false; }
+    if (!CollectivelyExact(contract != nullptr)) { return false; }
     const std::uint64_t allocations = setup.reuse.baseline_allocation_events;
+    const std::uint64_t owned_allocation_calls =
+        setup.reuse.baseline_w8_owned_allocation_calls;
+    const std::uint64_t deallocation_events =
+        AuditedAllocator::DeallocationEvents();
     const StateCoordinates old_coordinates = contract->coordinates();
     const auto old_publication = contract->Published();
     CudaPrecommitSnapshot snapshot{};
     CudaStepEvidence evidence{};
     CudaSerializedCheckpointV1 checkpoint{};
-    auto oracle = std::make_unique<CudaOraclePod>();
-    if (!engine->PrepareStep(false, snapshot, evidence)) { return false; }
-    if (!StagePreparedCheckpointDiagnosed(
-            *engine, checkpoint, evidence, snapshot, ranks, false, 1,
-            context, setup.rank) ||
-        !engine->StagePreparedOracle(*oracle, evidence) ||
-        !cuda_w8a_test_oracle::Verify(*oracle) ||
-        !engine->MarkOutputStaged(checkpoint) ||
-        !engine->PrepareCommit(checkpoint, evidence) ||
-        !engine->CommitPrepared(checkpoint, evidence) ||
-        checkpoint.successful_commit ||
-        !SameCoordinates(contract->coordinates(), old_coordinates))
+    const bool prepare_return = engine->PrepareStep(false, snapshot, evidence);
+    const bool prepare_local = prepare_return &&
+        snapshot.target.step == 1 && snapshot.numerical_candidate_ready &&
+        SameCoordinates(snapshot.committed, old_coordinates);
+    const bool prepare_collective = CollectivelyExact(prepare_local);
+    const bool prepare_allocator_collective =
+        CollectivelyExactAllocatorState(
+            allocations, owned_allocation_calls, deallocation_events);
+    if (!prepare_collective || !prepare_allocator_collective)
     {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterPrepareStep(prepare_return, evidence));
+      return false;
+    }
+    const bool checkpoint_collective = StagePreparedCheckpointDiagnosed(
+        *engine, checkpoint, evidence, snapshot, ranks, false, 1,
+        context, setup.rank);
+    if (!checkpoint_collective) { return false; }
+    const FrozenStageResult oracle_output = StageOracleOutputCollective(
+        *engine, checkpoint, evidence, snapshot, ranks, setup.rank, false,
+        1, false, context);
+    if (!oracle_output.passed) { return false; }
+
+    const bool prepare_commit_return =
+        engine->PrepareCommit(checkpoint, evidence);
+    const bool prepare_commit_collective =
+        CollectivelyExact(prepare_commit_return);
+    if (!prepare_commit_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterPrepareCommit(prepare_commit_return, evidence));
+      return false;
+    }
+    const bool prepared_state_local = checkpoint.candidate_frozen &&
+        checkpoint.checkpoint_staged && checkpoint.output_staged &&
+        !checkpoint.successful_commit && !evidence.committed &&
+        SameCoordinates(contract->coordinates(), old_coordinates);
+    const bool prepared_state_collective =
+        CollectivelyExact(prepared_state_local);
+    if (!prepared_state_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterPrepareCommit(prepare_commit_return, evidence));
+      return false;
+    }
+
+    const bool commit_prepared_return =
+        engine->CommitPrepared(checkpoint, evidence);
+    const bool commit_prepared_collective =
+        CollectivelyExact(commit_prepared_return);
+    if (!commit_prepared_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterCommitPrepared(commit_prepared_return, evidence));
+      return false;
+    }
+    const bool provisional_state_local = !checkpoint.successful_commit &&
+        SameCoordinates(contract->coordinates(), old_coordinates);
+    const bool provisional_state_collective =
+        CollectivelyExact(provisional_state_local);
+    if (!provisional_state_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterCommitPrepared(commit_prepared_return, evidence));
       return false;
     }
     StateCoordinates visible{};
-    if (!contract->PublishedCoordinates(old_publication, visible) ||
-        !SameCoordinates(visible, old_coordinates) ||
-        !engine->RevertCommit(checkpoint, FailureReason::backend_failure,
-                              evidence) ||
-        evidence.committed || !evidence.retry_available ||
-        !evidence.coordinates_preserved || !evidence.committed_bytes_preserved ||
-        checkpoint.candidate_frozen || checkpoint.checkpoint_staged ||
-        checkpoint.output_staged ||
-        checkpoint.successful_commit ||
-        !SameCoordinates(contract->coordinates(), old_coordinates) ||
-        !contract->PublishedCoordinates(old_publication, visible) ||
-        !SameCoordinates(visible, old_coordinates) ||
-        !ExactAttemptEvidence(evidence, ranks))
+    const bool provisional_publication_local =
+        contract->PublishedCoordinates(old_publication, visible) &&
+        SameCoordinates(visible, old_coordinates);
+    const bool provisional_publication_collective =
+        CollectivelyExact(provisional_publication_local);
+    if (!provisional_publication_collective)
     {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics, AffineLocalPhase::provisional);
+      return false;
+    }
+    const bool cleanup_exact = ResolveUnexpectedAffineExit(
+        *engine, checkpoint, evidence, snapshot, context, ranks,
+        setup.rank, FailureReason::backend_failure,
+        CudaFailurePhase::diagnostics, AffineLocalPhase::provisional);
+    const bool revert_local = cleanup_exact &&
+        contract->PublishedCoordinates(old_publication, visible) &&
+        SameCoordinates(visible, old_coordinates) &&
+        ExactAttemptEvidence(evidence, ranks);
+    const bool revert_collective = CollectivelyExact(revert_local);
+    ReportExpectedNegativeEvidence(
+        context, setup.rank, "revert-provisional",
+        FailureReason::backend_failure, CudaRunStatus::retry_available,
+        evidence, revert_local, revert_collective, &checkpoint);
+    const bool revert_allocator_collective =
+        CollectivelyExactAllocatorState(
+            allocations, owned_allocation_calls, deallocation_events);
+    if (!revert_collective || !revert_allocator_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics, AffineLocalPhase::consumed);
       return false;
     }
     CudaOraclePod unavailable{};
-    if (engine->ExportOracle(unavailable)) { return false; }
-    return CommitSuccessfulAttempt(*engine, true, 1, ranks, setup.rank,
-                                   allocations,
-                                   checkpoint, true, nullptr, context) &&
-        engine->contract()->telemetry().commits == 1;
+    const bool unavailable_local = !engine->ExportOracle(unavailable);
+    const bool unavailable_collective = CollectivelyExact(unavailable_local);
+    if (!unavailable_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics, AffineLocalPhase::consumed);
+      return false;
+    }
+    const bool retry_commit = CommitSuccessfulAttempt(
+        *engine, true, 1, ranks, setup.rank, allocations, checkpoint, true,
+        nullptr, context);
+    const bool retry_commit_collective = CollectivelyExact(retry_commit);
+    const auto* final_contract = engine->contract();
+    const bool telemetry_collective = CollectivelyExact(
+        final_contract != nullptr &&
+        final_contract->telemetry().commits == 1);
+    return retry_commit_collective && telemetry_collective;
   }();
   engine.reset();
   return result && ExactPolicyLedgers();
@@ -2521,45 +3693,115 @@ bool RunPreparedAbort(const int ranks,
     if (!InitializePositive(*engine, setup, ranks, context))
       return false;
     const auto* contract = engine->contract();
-    if (contract == nullptr) { return false; }
+    if (!CollectivelyExact(contract != nullptr)) { return false; }
     const std::uint64_t allocations = setup.reuse.baseline_allocation_events;
+    const std::uint64_t owned_allocation_calls =
+        setup.reuse.baseline_w8_owned_allocation_calls;
+    const std::uint64_t deallocation_events =
+        AuditedAllocator::DeallocationEvents();
     const StateCoordinates old_coordinates = contract->coordinates();
     const auto old_publication = contract->Published();
     CudaPrecommitSnapshot snapshot{};
     CudaStepEvidence evidence{};
     CudaSerializedCheckpointV1 checkpoint{};
-    auto oracle = std::make_unique<CudaOraclePod>();
-    if (!engine->PrepareStep(false, snapshot, evidence)) { return false; }
-    if (!StagePreparedCheckpointDiagnosed(
-            *engine, checkpoint, evidence, snapshot, ranks, false, 1,
-            context, setup.rank) ||
-        !engine->StagePreparedOracle(*oracle, evidence) ||
-        !cuda_w8a_test_oracle::Verify(*oracle) ||
-        !engine->MarkOutputStaged(checkpoint) ||
-        !engine->PrepareCommit(checkpoint, evidence) || evidence.committed ||
-        !engine->AbortPrepared(checkpoint, FailureReason::backend_failure,
-                               evidence) ||
-        evidence.committed || !evidence.retry_available ||
-        !evidence.coordinates_preserved || !evidence.committed_bytes_preserved ||
-        checkpoint.candidate_frozen || checkpoint.checkpoint_staged ||
-        checkpoint.output_staged || checkpoint.successful_commit ||
-        !SameCoordinates(contract->coordinates(), old_coordinates) ||
-        AuditedAllocator::AllocationEvents() != allocations ||
-        !ExactAttemptEvidence(evidence, ranks))
+    const bool prepare_return = engine->PrepareStep(false, snapshot, evidence);
+    const bool prepare_local = prepare_return &&
+        snapshot.target.step == 1 && snapshot.numerical_candidate_ready &&
+        SameCoordinates(snapshot.committed, old_coordinates);
+    const bool prepare_collective = CollectivelyExact(prepare_local);
+    const bool prepare_allocator_collective =
+        CollectivelyExactAllocatorState(
+            allocations, owned_allocation_calls, deallocation_events);
+    if (!prepare_collective || !prepare_allocator_collective)
     {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterPrepareStep(prepare_return, evidence));
+      return false;
+    }
+    const bool checkpoint_collective = StagePreparedCheckpointDiagnosed(
+        *engine, checkpoint, evidence, snapshot, ranks, false, 1,
+        context, setup.rank);
+    if (!checkpoint_collective) { return false; }
+    const FrozenStageResult oracle_output = StageOracleOutputCollective(
+        *engine, checkpoint, evidence, snapshot, ranks, setup.rank, false,
+        1, false, context);
+    if (!oracle_output.passed) { return false; }
+    const bool prepare_commit_return =
+        engine->PrepareCommit(checkpoint, evidence);
+    const bool prepare_commit_collective =
+        CollectivelyExact(prepare_commit_return);
+    if (!prepare_commit_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterPrepareCommit(prepare_commit_return, evidence));
+      return false;
+    }
+    const bool prepared_local = !evidence.committed &&
+        checkpoint.candidate_frozen && checkpoint.checkpoint_staged &&
+        checkpoint.output_staged && !checkpoint.successful_commit &&
+        SameCoordinates(contract->coordinates(), old_coordinates);
+    const bool prepared_collective = CollectivelyExact(prepared_local);
+    if (!prepared_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterPrepareCommit(prepare_commit_return, evidence));
+      return false;
+    }
+    const bool cleanup_exact = ResolveUnexpectedAffineExit(
+        *engine, checkpoint, evidence, snapshot, context, ranks,
+        setup.rank, FailureReason::backend_failure,
+        CudaFailurePhase::diagnostics, AffineLocalPhase::prepared);
+    const bool abort_local = cleanup_exact &&
+        SameCoordinates(contract->coordinates(), old_coordinates) &&
+        ExactAttemptEvidence(evidence, ranks);
+    const bool abort_collective = CollectivelyExact(abort_local);
+    ReportExpectedNegativeEvidence(
+        context, setup.rank, "abort-prepared",
+        FailureReason::backend_failure, CudaRunStatus::retry_available,
+        evidence, abort_local, abort_collective, &checkpoint);
+    const bool abort_allocator_collective =
+        CollectivelyExactAllocatorState(
+            allocations, owned_allocation_calls, deallocation_events);
+    if (!abort_collective || !abort_allocator_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics, AffineLocalPhase::consumed);
       return false;
     }
     StateCoordinates visible{};
-    if (!contract->PublishedCoordinates(old_publication, visible) ||
-        !SameCoordinates(visible, old_coordinates) ||
-        contract->telemetry().commits != 0)
+    const bool publication_local =
+        contract->PublishedCoordinates(old_publication, visible) &&
+        SameCoordinates(visible, old_coordinates) &&
+        contract->telemetry().commits == 0;
+    const bool publication_collective = CollectivelyExact(publication_local);
+    if (!publication_collective)
     {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics, AffineLocalPhase::consumed);
       return false;
     }
-    return CommitSuccessfulAttempt(*engine, true, 1, ranks, setup.rank,
-                                   allocations,
-                                   checkpoint, true, nullptr, context) &&
-        engine->contract()->telemetry().commits == 1;
+    const bool retry_commit = CommitSuccessfulAttempt(
+        *engine, true, 1, ranks, setup.rank, allocations, checkpoint, true,
+        nullptr, context);
+    const bool retry_commit_collective = CollectivelyExact(retry_commit);
+    const auto* final_contract = engine->contract();
+    const bool telemetry_collective = CollectivelyExact(
+        final_contract != nullptr &&
+        final_contract->telemetry().commits == 1);
+    return retry_commit_collective && telemetry_collective;
   }();
   engine.reset();
   return result && ExactPolicyLedgers();
@@ -2576,42 +3818,316 @@ bool RunStagingFailure(const int ranks,
     if (!InitializePositive(*engine, setup, ranks, context))
       return false;
     const auto* contract = engine->contract();
-    if (contract == nullptr) { return false; }
+    if (!CollectivelyExact(contract != nullptr)) { return false; }
     const std::uint64_t allocations = setup.reuse.baseline_allocation_events;
+    const std::uint64_t owned_allocation_calls =
+        setup.reuse.baseline_w8_owned_allocation_calls;
+    const std::uint64_t deallocation_events =
+        AuditedAllocator::DeallocationEvents();
     const StateCoordinates old_coordinates = contract->coordinates();
     const auto old_publication = contract->Published();
     CudaPrecommitSnapshot snapshot{};
     CudaStepEvidence evidence{};
     CudaSerializedCheckpointV1 checkpoint{};
-    if (!engine->PrepareStep(false, snapshot, evidence)) { return false; }
+    const bool prepare_return = engine->PrepareStep(false, snapshot, evidence);
+    const bool prepare_local = prepare_return &&
+        snapshot.target.step == 1 && snapshot.numerical_candidate_ready &&
+        SameCoordinates(snapshot.committed, old_coordinates);
+    const bool prepare_collective = CollectivelyExact(prepare_local);
+    const bool prepare_allocator_collective =
+        CollectivelyExactAllocatorState(
+            allocations, owned_allocation_calls, deallocation_events);
+    if (!prepare_collective || !prepare_allocator_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterPrepareStep(prepare_return, evidence));
+      return false;
+    }
     AuditedTransport::fail_checkpoint_trace_once = true;
     const bool staged = StagePreparedCheckpointDiagnosed(
         *engine, checkpoint, evidence, snapshot, ranks, false, 1, context,
         setup.rank, false);
-    if (staged ||
-        AuditedTransport::fail_checkpoint_trace_once ||
-        checkpoint.checkpoint_staged || checkpoint.output_staged ||
-        checkpoint.successful_commit || checkpoint.staging_range.complete ||
-        !engine->AbortPrepared(checkpoint, FailureReason::none, evidence) ||
-        checkpoint.candidate_frozen || checkpoint.checkpoint_staged ||
-        checkpoint.output_staged || checkpoint.successful_commit ||
-        !SameCoordinates(contract->coordinates(), old_coordinates) ||
-        AuditedAllocator::AllocationEvents() != allocations ||
-        !ExactFailedStagingEvidence(evidence, ranks))
+    const bool staging_failure_local = !staged &&
+        !AuditedTransport::fail_checkpoint_trace_once &&
+        !checkpoint.checkpoint_staged && !checkpoint.output_staged &&
+        !checkpoint.successful_commit && !checkpoint.staging_range.complete;
+    const bool staging_failure_collective =
+        CollectivelyExact(staging_failure_local);
+    if (!staging_failure_collective)
     {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics, AffineLocalPhase::staging);
+      return false;
+    }
+    const bool cleanup_exact = ResolveUnexpectedAffineExit(
+        *engine, checkpoint, evidence, snapshot, context, ranks,
+        setup.rank, FailureReason::backend_failure,
+        CudaFailurePhase::diagnostics, AffineLocalPhase::staging);
+    const bool failed_staging_local = cleanup_exact &&
+        SameCoordinates(contract->coordinates(), old_coordinates) &&
+        ExactFailedStagingEvidence(evidence, ranks);
+    const bool failed_staging_collective =
+        CollectivelyExact(failed_staging_local);
+    ReportExpectedNegativeEvidence(
+        context, setup.rank, "checkpoint-staging",
+        FailureReason::backend_failure, CudaRunStatus::retry_available,
+        evidence, failed_staging_local, failed_staging_collective,
+        &checkpoint);
+    const bool failure_allocator_collective =
+        CollectivelyExactAllocatorState(
+            allocations, owned_allocation_calls, deallocation_events);
+    if (!failed_staging_collective || !failure_allocator_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics, AffineLocalPhase::consumed);
       return false;
     }
     StateCoordinates visible{};
-    if (!contract->PublishedCoordinates(old_publication, visible) ||
-        !SameCoordinates(visible, old_coordinates) ||
-        contract->telemetry().commits != 0)
+    const bool publication_local =
+        contract->PublishedCoordinates(old_publication, visible) &&
+        SameCoordinates(visible, old_coordinates) &&
+        contract->telemetry().commits == 0;
+    const bool publication_collective = CollectivelyExact(publication_local);
+    if (!publication_collective)
     {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics, AffineLocalPhase::consumed);
       return false;
     }
-    return CommitSuccessfulAttempt(*engine, true, 1, ranks, setup.rank,
-                                   allocations,
-                                   checkpoint, true, nullptr, context) &&
-        engine->contract()->telemetry().commits == 1;
+    const bool retry_commit = CommitSuccessfulAttempt(
+        *engine, true, 1, ranks, setup.rank, allocations, checkpoint, true,
+        nullptr, context);
+    const bool retry_commit_collective = CollectivelyExact(retry_commit);
+    const auto* final_contract = engine->contract();
+    const bool telemetry_collective = CollectivelyExact(
+        final_contract != nullptr &&
+        final_contract->telemetry().commits == 1);
+    return retry_commit_collective && telemetry_collective;
+  }();
+  engine.reset();
+  return result && ExactPolicyLedgers();
+}
+
+enum class FrozenAuthorityNegative : unsigned char
+{
+  oracle_export,
+  output_mark,
+  finalize_descriptor
+};
+
+template <typename Backend>
+bool RunFrozenAuthorityNegative(const int ranks, const int rank,
+                                const FrozenAuthorityNegative negative,
+                                const char* const context) noexcept
+{
+  auto engine = std::make_unique<TestEngine<Backend>>(Config(ranks, true));
+  const bool result = [&]() noexcept
+  {
+    CudaRunEvidence setup{};
+    if (!InitializePositive(*engine, setup, ranks, context))
+      return false;
+    const auto* contract = engine->contract();
+    if (!CollectivelyExact(contract != nullptr)) { return false; }
+    const std::uint64_t allocations =
+        setup.reuse.baseline_allocation_events;
+    const std::uint64_t owned_allocation_calls =
+        setup.reuse.baseline_w8_owned_allocation_calls;
+    const std::uint64_t deallocation_events =
+        AuditedAllocator::DeallocationEvents();
+    const StateCoordinates old_coordinates = contract->coordinates();
+    const auto old_publication = contract->Published();
+    CudaPrecommitSnapshot snapshot{};
+    CudaStepEvidence evidence{};
+    CudaSerializedCheckpointV1 checkpoint{};
+
+    const bool prepare_return = engine->PrepareStep(false, snapshot, evidence);
+    const bool prepare_local = prepare_return &&
+        snapshot.target.step == 1 && snapshot.numerical_candidate_ready &&
+        SameCoordinates(snapshot.committed, old_coordinates);
+    const bool prepare_collective = CollectivelyExact(prepare_local);
+    const bool prepare_allocator_collective =
+        CollectivelyExactAllocatorState(
+            allocations, owned_allocation_calls, deallocation_events);
+    if (!prepare_collective || !prepare_allocator_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterPrepareStep(prepare_return, evidence));
+      return false;
+    }
+
+    const bool checkpoint_collective = StagePreparedCheckpointDiagnosed(
+        *engine, checkpoint, evidence, snapshot, ranks, false, 1,
+        context, setup.rank);
+    if (!checkpoint_collective) { return false; }
+
+    const int source_rank = ranks - 1;
+    if (negative == FrozenAuthorityNegative::oracle_export &&
+        rank == source_rank)
+    {
+      AuditedTransport::fail_oracle_export_once = true;
+    }
+    const OracleOutputTestSeam seam{
+        negative == FrozenAuthorityNegative::output_mark ? source_rank : -1};
+    const FrozenStageResult oracle_output = StageOracleOutputCollective(
+        *engine, checkpoint, evidence, snapshot, ranks, setup.rank, false,
+        1, false, context, seam);
+
+    bool negative_collective = false;
+    if (negative == FrozenAuthorityNegative::oracle_export ||
+        negative == FrozenAuthorityNegative::output_mark)
+    {
+      const FailureReason expected_reason =
+          negative == FrozenAuthorityNegative::oracle_export
+          ? FailureReason::backend_failure
+          : FailureReason::collective_protocol;
+      const std::uint64_t expected_injections =
+          negative == FrozenAuthorityNegative::oracle_export &&
+              rank == source_rank
+          ? 1 : 0;
+      StateCoordinates visible{};
+      const bool negative_local = !oracle_output.passed &&
+          oracle_output.cleanup_exact &&
+          AuditedTransport::injected_oracle_export_failures ==
+              expected_injections &&
+          !AuditedTransport::fail_oracle_export_once &&
+          evidence.contract_reason == expected_reason &&
+          evidence.status == CudaRunStatus::retry_available &&
+          evidence.retry_available && !evidence.committed &&
+          evidence.coordinates_preserved &&
+          evidence.committed_bytes_preserved &&
+          !checkpoint.candidate_frozen &&
+          !checkpoint.checkpoint_staged && !checkpoint.output_staged &&
+          !checkpoint.successful_commit &&
+          SameCoordinates(contract->coordinates(), old_coordinates) &&
+          contract->PublishedCoordinates(old_publication, visible) &&
+          SameCoordinates(visible, old_coordinates) &&
+          (negative == FrozenAuthorityNegative::oracle_export ||
+           ExactAttemptEvidence(evidence, ranks)) &&
+          ExactPolicyLedgers();
+      negative_collective = CollectivelyExact(negative_local);
+      ReportExpectedNegativeEvidence(
+          context, setup.rank,
+          negative == FrozenAuthorityNegative::oracle_export
+              ? "source-rank-oracle-export" : "output-mark-mismatch",
+          expected_reason, CudaRunStatus::retry_available, evidence,
+          negative_local, negative_collective, &checkpoint);
+    }
+    else
+    {
+      if (!oracle_output.passed) { return false; }
+      const bool prepare_commit_return =
+          engine->PrepareCommit(checkpoint, evidence);
+      const bool prepare_commit_collective =
+          CollectivelyExact(prepare_commit_return);
+      if (!prepare_commit_collective)
+      {
+        (void)ResolveUnexpectedAffineExit(
+            *engine, checkpoint, evidence, snapshot, context, ranks,
+            setup.rank, FailureReason::backend_failure,
+            CudaFailurePhase::diagnostics,
+            PhaseAfterPrepareCommit(prepare_commit_return, evidence));
+        return false;
+      }
+      const bool prepared_local = checkpoint.candidate_frozen &&
+          checkpoint.checkpoint_staged && checkpoint.output_staged &&
+          !checkpoint.successful_commit && !evidence.committed;
+      const bool prepared_collective = CollectivelyExact(prepared_local);
+      if (!prepared_collective)
+      {
+        (void)ResolveUnexpectedAffineExit(
+            *engine, checkpoint, evidence, snapshot, context, ranks,
+            setup.rank, FailureReason::backend_failure,
+            CudaFailurePhase::diagnostics,
+            PhaseAfterPrepareCommit(prepare_commit_return, evidence));
+        return false;
+      }
+      const bool commit_prepared_return =
+          engine->CommitPrepared(checkpoint, evidence);
+      const bool commit_prepared_collective =
+          CollectivelyExact(commit_prepared_return);
+      if (!commit_prepared_collective)
+      {
+        (void)ResolveUnexpectedAffineExit(
+            *engine, checkpoint, evidence, snapshot, context, ranks,
+            setup.rank, FailureReason::backend_failure,
+            CudaFailurePhase::diagnostics,
+            PhaseAfterCommitPrepared(commit_prepared_return, evidence));
+        return false;
+      }
+      if (rank == source_rank)
+        checkpoint.descriptor.trace_hash.bytes[0] ^= 1U;
+      const bool finalize_return =
+          engine->FinalizeCommit(checkpoint, evidence);
+      const bool finalize_return_collective =
+          CollectivelyExact(finalize_return);
+      const bool finalize_affine_exit = ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::collective_protocol,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterFinalizeCommit(evidence));
+      StateCoordinates visible{};
+      const bool finalize_local = finalize_return_collective &&
+          finalize_affine_exit &&
+          evidence.contract_reason == FailureReason::collective_protocol &&
+          evidence.status == CudaRunStatus::retry_available &&
+          evidence.retry_available && !evidence.committed &&
+          evidence.coordinates_preserved &&
+          evidence.committed_bytes_preserved &&
+          evidence.before_interior_hash == evidence.after_interior_hash &&
+          evidence.before_trace_hash == evidence.after_trace_hash &&
+          !checkpoint.candidate_frozen &&
+          !checkpoint.checkpoint_staged && !checkpoint.output_staged &&
+          !checkpoint.successful_commit &&
+          SameCoordinates(contract->coordinates(), old_coordinates) &&
+          contract->PublishedCoordinates(old_publication, visible) &&
+          SameCoordinates(visible, old_coordinates) &&
+          ExactAttemptEvidence(evidence, ranks) && ExactPolicyLedgers();
+      negative_collective = CollectivelyExact(finalize_local);
+      ReportExpectedNegativeEvidence(
+          context, setup.rank, "finalize-descriptor-mismatch",
+          FailureReason::collective_protocol,
+          CudaRunStatus::retry_available, evidence, finalize_local,
+          negative_collective, &checkpoint);
+    }
+    const bool failure_allocator_collective =
+        CollectivelyExactAllocatorState(
+            allocations, owned_allocation_calls, deallocation_events);
+    if (!negative_collective || !failure_allocator_collective)
+    {
+      if (negative_collective)
+      {
+        (void)ResolveUnexpectedAffineExit(
+            *engine, checkpoint, evidence, snapshot, context, ranks,
+            setup.rank, FailureReason::backend_failure,
+            CudaFailurePhase::diagnostics,
+            AffineLocalPhase::consumed);
+      }
+      return false;
+    }
+
+    CudaSerializedCheckpointV1 retry_checkpoint{};
+    const bool retry_return = CommitSuccessfulAttempt(
+        *engine, true, 1, ranks, setup.rank, allocations, retry_checkpoint,
+        true, nullptr, context, ranks == 2);
+    const bool retry_collective = CollectivelyExact(retry_return);
+    const auto* final_contract = engine->contract();
+    const bool final_collective = CollectivelyExact(
+        final_contract != nullptr &&
+        final_contract->telemetry().commits == 1 &&
+        retry_checkpoint.successful_commit && ExactPolicyLedgers());
+    return retry_collective && final_collective;
   }();
   engine.reset();
   return result && ExactPolicyLedgers();
@@ -2623,6 +4139,7 @@ bool RunTokenFault(const int ranks, const CudaTokenFault fault,
                    const char* const context) noexcept
 {
   CudaConfig config = Config(ranks, true);
+  config.injection.source_rank = ranks - 1;
   config.injection.token_fault = fault;
   auto engine = std::make_unique<TestEngine<Backend>>(config);
   const bool result = [&]() noexcept
@@ -2630,44 +4147,115 @@ bool RunTokenFault(const int ranks, const CudaTokenFault fault,
     CudaRunEvidence setup{};
     if (!InitializePositive(*engine, setup, ranks, context))
       return false;
+    const std::uint64_t owned_allocation_calls =
+        setup.reuse.baseline_w8_owned_allocation_calls;
+    const std::uint64_t deallocation_events =
+        AuditedAllocator::DeallocationEvents();
     if (fault == CudaTokenFault::issue_matrix_before_residual)
     {
       CudaSerializedCheckpointV1 checkpoint{};
-      const bool final_valid = CommitSuccessfulAttempt(
+      const bool commit_return = CommitSuccessfulAttempt(
           *engine, false, 1, ranks, setup.rank,
           setup.reuse.baseline_allocation_events, checkpoint, true, nullptr,
-          context) &&
-          engine->contract()->telemetry()
-                  .out_of_order_product_issues_rejected == 1;
-      if (!final_valid)
+          context);
+      const bool commit_collective = CollectivelyExact(commit_return);
+      const auto* contract = engine->contract();
+      const RunTelemetry telemetry = contract == nullptr
+          ? RunTelemetry{} : contract->telemetry();
+      const bool final_local = commit_collective && contract != nullptr &&
+          contract->status() == RunStatus::committed &&
+          telemetry.last_attempt.failure_reason == expected &&
+          telemetry.accepted.valid &&
+          telemetry.accepted.attempt.failure_reason == expected &&
+          dg::hdg::runtime::detail::SameAttempt(
+              telemetry.last_attempt.identity,
+              telemetry.accepted.attempt.identity) &&
+          dg::hdg::runtime::detail::SameAttempt(
+              telemetry.last_attempt.identity, checkpoint.attempt) &&
+          SameCoordinates(
+              telemetry.accepted.coordinates,
+              checkpoint.descriptor.coordinates) &&
+          telemetry.last_attempt.validated_product_mask == 0x0fU &&
+          telemetry.accepted.attempt.validated_product_mask == 0x0fU &&
+          telemetry.commits == 1 &&
+          telemetry.out_of_order_product_issues_rejected == 1 &&
+          telemetry.last_attempt.prohibited.fallback_events == 0 &&
+          checkpoint.successful_commit;
+      const bool final_collective = CollectivelyExact(final_local);
+      if (contract != nullptr)
+      {
+        ReportAttemptTelemetryEvidence(
+            context, setup.rank, "matrix-before-residual",
+            expected, RunStatus::committed, telemetry.last_attempt,
+            telemetry.accepted, contract->status(), telemetry.commits,
+            telemetry.out_of_order_product_issues_rejected,
+            final_local, final_collective);
+      }
+      if (!final_collective)
         ReportTokenFailure(setup.rank, "final", fault);
-      return final_valid;
+      return final_collective;
     }
 
     CudaPrecommitSnapshot snapshot{};
     CudaStepEvidence evidence{};
     CudaSerializedCheckpointV1 checkpoint{};
-    auto oracle = std::make_unique<CudaOraclePod>();
-    if (!engine->PrepareStep(false, snapshot, evidence))
+    const bool prepare_return = engine->PrepareStep(false, snapshot, evidence);
+    const bool prepare_local = prepare_return &&
+        snapshot.target.step == 1 && snapshot.numerical_candidate_ready;
+    const bool prepare_collective = CollectivelyExact(prepare_local);
+    if (!prepare_collective)
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics,
+          PhaseAfterPrepareStep(prepare_return, evidence));
+      ReportTokenFailure(setup.rank, "precommit", fault);
+      return false;
+    }
+    if (!CollectivelyExactAllocatorState(
+            setup.reuse.baseline_allocation_events,
+            owned_allocation_calls, deallocation_events))
+    {
+      (void)ResolveUnexpectedAffineExit(
+          *engine, checkpoint, evidence, snapshot, context, ranks,
+          setup.rank, FailureReason::backend_failure,
+          CudaFailurePhase::diagnostics, AffineLocalPhase::staging);
+      ReportTokenFailure(setup.rank, "allocation-plateau", fault);
+      return false;
+    }
+    const bool checkpoint_collective = StagePreparedCheckpointDiagnosed(
+        *engine, checkpoint, evidence, snapshot, ranks, false, 1,
+        context, setup.rank);
+    if (!checkpoint_collective)
     {
       ReportTokenFailure(setup.rank, "precommit", fault);
       return false;
     }
-    const bool precommit_failed =
-        !StagePreparedCheckpointDiagnosed(
-            *engine, checkpoint, evidence, snapshot, ranks, false, 1,
-            context, setup.rank) ||
-        !engine->StagePreparedOracle(*oracle, evidence) ||
-        !engine->MarkOutputStaged(checkpoint);
-    if (precommit_failed)
+    const FrozenStageResult oracle_output = StageOracleOutputCollective(
+        *engine, checkpoint, evidence, snapshot, ranks, setup.rank, false,
+        1, false, context);
+    if (!oracle_output.passed)
     {
       ReportTokenFailure(setup.rank, "precommit", fault);
       return false;
     }
     const bool progressed_to_rollback =
         engine->PrepareCommit(checkpoint, evidence);
+    const bool rollback_return_collective =
+        CollectivelyExact(progressed_to_rollback);
+    const bool affine_exit_exact = ResolveUnexpectedAffineExit(
+        *engine, checkpoint, evidence, snapshot, context, ranks,
+        setup.rank, expected, CudaFailurePhase::diagnostics,
+        PhaseAfterPrepareCommit(progressed_to_rollback, evidence));
     const auto* contract = engine->contract();
-    const bool final_valid = progressed_to_rollback && contract != nullptr &&
+    const bool collective_allocation_plateau_exact =
+        CollectivelyExactAllocatorState(
+            setup.reuse.baseline_allocation_events,
+            owned_allocation_calls, deallocation_events);
+    const bool final_local = rollback_return_collective &&
+        affine_exit_exact &&
+        contract != nullptr &&
         evidence.contract_reason == expected && evidence.retry_available &&
         !evidence.committed && evidence.coordinates_preserved &&
         evidence.committed_bytes_preserved &&
@@ -2676,12 +4264,18 @@ bool RunTokenFault(const int ranks, const CudaTokenFault fault,
         contract->status() == RunStatus::retry_available &&
         contract->telemetry().commits == 0 &&
         contract->telemetry().last_attempt.prohibited.fallback_events == 0 &&
-        AuditedAllocator::AllocationEvents() ==
-            setup.reuse.baseline_allocation_events &&
-        ExactAttemptEvidence(evidence, ranks);
-    if (!final_valid)
+        collective_allocation_plateau_exact &&
+        ExactAttemptEvidence(evidence, ranks) && ExactPolicyLedgers();
+    const bool final_collective = CollectivelyExact(final_local);
+    ReportExpectedNegativeEvidence(
+        context, setup.rank, "prepare-commit-token-fault", expected,
+        CudaRunStatus::retry_available, evidence, final_local,
+        final_collective, &checkpoint);
+    if (!final_collective)
+    {
       ReportTokenFailure(setup.rank, "final", fault);
-    return final_valid;
+    }
+    return final_collective;
   }();
   engine.reset();
   return result && ExactPolicyLedgers();
@@ -3001,14 +4595,35 @@ bool PrestageFailureMaskExactFixtures() noexcept
   return true;
 }
 
-void ReportRankTwoCaseBoundary(const int rank, const char* const label,
-                               const char* const edge) noexcept
+bool ReportCaseBoundary(const int rank, const int ranks,
+                        const char* const label,
+                        const char* const edge) noexcept
 {
   const int hypre_error = HYPRE_GetError();
   const cudaError_t cuda_error = cudaPeekAtLastError();
+  const CudaAllocationLedgerV1 allocation = AuditedAllocator::Ledger();
+  const CudaTransferLedgerV1& transfer = AuditedTransport::Ledger();
+  const bool ledger_mirrors_exact = SameLedger(
+          allocation, UmpireDeviceAllocatorPolicy::Ledger()) &&
+      SameLedger(transfer, CudaTransportPolicy::Ledger()) &&
+      SameTotals(AuditedTransport::Accounting(),
+                 CudaTransportPolicy::Accounting());
+  const bool local_exact = ranks >= 1 &&
+      CleanHypreCudaStateAuthorized(hypre_error, cuda_error) &&
+      ledger_mirrors_exact;
+  const bool collective_exact = Global(local_exact);
   std::fprintf(stderr,
-      "CUDA_RANK2_BOUNDARY rank=%d case=%s edge=%s hypre=%d cuda=%d\n",
-      rank, label, edge, hypre_error, static_cast<int>(cuda_error));
+      "CUDA_CASE_BOUNDARY rank=%d ranks=%d case=%s edge=%s "
+      "hypre=%d cuda=%d allocation=%zu/%llu transfer=%zu/%llu "
+      "local=%s collective=%s\n",
+      rank, ranks, label, edge, hypre_error, static_cast<int>(cuda_error),
+      allocation.count,
+      static_cast<unsigned long long>(allocation.observed_count),
+      transfer.count,
+      static_cast<unsigned long long>(transfer.observed_count),
+      local_exact ? "PASS" : "FAIL",
+      collective_exact ? "PASS" : "FAIL");
+  return collective_exact;
 }
 } // namespace
 
@@ -3027,12 +4642,20 @@ int main(int argc, char** argv)
   const auto run_case_impl = [&](const char* const case_label,
                                  auto&& case_body)
   {
-    if (ranks == 2)
-      ReportRankTwoCaseBoundary(rank, case_label, "before");
-    const bool local_result = case_body();
-    if (ranks == 2)
-      ReportRankTwoCaseBoundary(rank, case_label, "after");
-    const bool collective_result = Global(local_result);
+    const bool before_collective =
+        ReportCaseBoundary(rank, ranks, case_label, "before");
+    const bool local_result = before_collective && case_body();
+    const bool body_collective = Global(local_result);
+    const bool after_collective =
+        ReportCaseBoundary(rank, ranks, case_label, "after");
+    const bool collective_result = Global(
+        before_collective && body_collective && after_collective);
+    std::fprintf(stderr,
+        "CUDA_CASE_RESULT rank=%d ranks=%d case=%s local=%s "
+        "body_collective=%s collective=%s\n",
+        rank, ranks, case_label, local_result ? "PASS" : "FAIL",
+        body_collective ? "PASS" : "FAIL",
+        collective_result ? "PASS" : "FAIL");
     if (!collective_result)
     {
       if (rank == 0)
@@ -3059,6 +4682,18 @@ int main(int argc, char** argv)
              CleanHypreCudaAuthorizationFixtures());
     run_case("rank1.config.consensus-negative",
              RunConfigConsensusNegative<TestRankOneBackendTag>(1, rank));
+    run_case("rank1.negative.oracle-export",
+             RunFrozenAuthorityNegative<TestRankOneBackendTag>(
+                 1, rank, FrozenAuthorityNegative::oracle_export,
+                 "rank1.negative.oracle-export"));
+    run_case("rank1.negative.output-mark",
+             RunFrozenAuthorityNegative<TestRankOneBackendTag>(
+                 1, rank, FrozenAuthorityNegative::output_mark,
+                 "rank1.negative.output-mark"));
+    run_case("rank1.negative.finalize-descriptor",
+             RunFrozenAuthorityNegative<TestRankOneBackendTag>(
+                 1, rank, FrozenAuthorityNegative::finalize_descriptor,
+                 "rank1.negative.finalize-descriptor"));
     if (token_mode)
     {
       run_case("rank1.token.omit-solution",
@@ -3123,42 +4758,65 @@ int main(int argc, char** argv)
              HypreHostColumnMapCopyFixtures());
     run_case("rank2.common.hypre-clean-authorization",
              CleanHypreCudaAuthorizationFixtures());
-    const bool config_boundary_clean =
+    run_case("rank2.common.mixed-affine-census",
+             MixedPreparedProvisionalCensusFixture(rank, ranks));
+    CudaSerializedCheckpointV1 qualification_checkpoint{};
+    const char* const qualification_context = token_mode
+        ? "rank2.token.allocation-plateau" : "rank2.lifecycle";
+    const bool allocation_plateau_qualified =
+        run_case(qualification_context,
+                 RunLifecycle<TestRankTwoBackendTag>(
+                     2, qualification_checkpoint, qualification_context, 1));
+    const bool config_boundary_clean = allocation_plateau_qualified &&
         run_case("rank2.config.consensus-negative",
                  RunRankTwoConfigConsensusBoundary<TestRankTwoBackendTag>(
                      2, rank));
     if (config_boundary_clean)
     {
+      run_case("rank2.negative.oracle-export",
+               RunFrozenAuthorityNegative<TestRankTwoBackendTag>(
+                   2, rank, FrozenAuthorityNegative::oracle_export,
+                   "rank2.negative.oracle-export"));
+      run_case("rank2.negative.output-mark",
+               RunFrozenAuthorityNegative<TestRankTwoBackendTag>(
+                   2, rank, FrozenAuthorityNegative::output_mark,
+                   "rank2.negative.output-mark"));
+      run_case("rank2.negative.finalize-descriptor",
+               RunFrozenAuthorityNegative<TestRankTwoBackendTag>(
+                   2, rank, FrozenAuthorityNegative::finalize_descriptor,
+                   "rank2.negative.finalize-descriptor"));
       if (token_mode)
       {
-        run_case("rank2.token.omit-solution",
-                 RunTokenFault<TestRankTwoBackendTag>(
-                     2, CudaTokenFault::omit_solution,
-                     FailureReason::missing_product,
-                     "rank2.token.omit-solution"));
-        run_case("rank2.token.stale-attempt",
-                 RunTokenFault<TestRankTwoBackendTag>(
-                     2, CudaTokenFault::stale_attempt,
-                     FailureReason::missing_product,
-                     "rank2.token.stale-attempt"));
-        run_case("rank2.token.matrix-before-residual",
-                 RunTokenFault<TestRankTwoBackendTag>(
-                     2, CudaTokenFault::issue_matrix_before_residual,
-                     FailureReason::none,
-                     "rank2.token.matrix-before-residual"));
+        if (allocation_plateau_qualified)
+        {
+          run_case("rank2.token.omit-solution",
+                   RunTokenFault<TestRankTwoBackendTag>(
+                       2, CudaTokenFault::omit_solution,
+                       FailureReason::missing_product,
+                       "rank2.token.omit-solution"));
+          run_case("rank2.token.stale-attempt",
+                   RunTokenFault<TestRankTwoBackendTag>(
+                       2, CudaTokenFault::stale_attempt,
+                       FailureReason::missing_product,
+                       "rank2.token.stale-attempt"));
+          run_case("rank2.token.matrix-before-residual",
+                   RunTokenFault<TestRankTwoBackendTag>(
+                       2,
+                       CudaTokenFault::issue_matrix_before_residual,
+                       FailureReason::none,
+                       "rank2.token.matrix-before-residual"));
+        }
       }
       else
       {
-        CudaSerializedCheckpointV1 checkpoint{};
-        run_case("rank2.lifecycle",
-                 RunLifecycle<TestRankTwoBackendTag>(
-                     2, checkpoint, "rank2.lifecycle"));
         run_case("rank2.restore.corrupt",
                  RunCorruptRestore<TestRankTwoBackendTag>(
-                     2, checkpoint, "rank2.restore.corrupt"));
+                     2, qualification_checkpoint,
+                     "rank2.restore.corrupt"));
         run_case("rank2.restore.fresh",
                  RunFreshRestore<TestRankTwoBackendTag>(
-                     2, checkpoint, "rank2.restore.fresh"));
+                     2, qualification_checkpoint,
+                     "rank2.restore.fresh"));
         run_case("rank2.provisional-revert",
                  RunProvisionalRevert<TestRankTwoBackendTag>(
                      2, "rank2.provisional-revert"));
