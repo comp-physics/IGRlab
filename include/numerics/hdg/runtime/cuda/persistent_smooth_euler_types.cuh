@@ -2,7 +2,7 @@
 
 /**
  * @file numerics/hdg/runtime/cuda/persistent_smooth_euler_types.cuh
- * @brief CUDA-qualified value types for the bounded W8A persistent smoke path.
+ * @brief CUDA-qualified values for bounded W8A smoke/functional paths.
  *
  * This header intentionally does not define a canonical formulation tag,
  * common FailurePhase, or cross-backend DTO.  The caller supplies Selection;
@@ -24,12 +24,23 @@ namespace dg::hdg::runtime::cuda_w8a
 
 inline constexpr std::string_view experiment_id =
     "exp.hdg.euler.conventional.smooth_persistent.w8a.v1";
-inline constexpr int polynomial_order = 1;
-inline constexpr int elements_per_direction = 3;
+inline constexpr int smoke_polynomial_order = 1;
+inline constexpr int smoke_elements_per_direction = 3;
+inline constexpr int functional_polynomial_order = 2;
+inline constexpr int functional_elements_per_direction = 6;
+// Retained spellings keep the admitted p1/N3 tests source-compatible.
+inline constexpr int polynomial_order = smoke_polynomial_order;
+inline constexpr int elements_per_direction = smoke_elements_per_direction;
 inline constexpr double fixed_dt = 0.05;
-inline constexpr int accepted_steps = 3;
+inline constexpr int smoke_accepted_steps = 3;
+inline constexpr int functional_accepted_steps = 20;
+inline constexpr int functional_checkpoint_step = 10;
+inline constexpr int functional_injected_step = 14;
+inline constexpr int accepted_steps = smoke_accepted_steps;
 inline constexpr int conserved_components = 4;
 inline constexpr int dimension = 2;
+// p1 values are retained for the Admission-02 oracle fixtures.  Runtime
+// kernels use the counts carried by CudaMeshShape; storage uses the maxima.
 inline constexpr int scalar_dofs_per_element = 4;
 inline constexpr int scalar_dofs_per_face = 2;
 inline constexpr int faces_per_element = 4;
@@ -37,22 +48,33 @@ inline constexpr int interior_dofs_per_element =
     conserved_components * scalar_dofs_per_element;
 inline constexpr int trace_dofs_per_element =
     faces_per_element * conserved_components * scalar_dofs_per_face;
-inline constexpr int maximum_rank_elements = 9;
-inline constexpr int maximum_local_trace_dofs = 144;
-inline constexpr int maximum_true_trace_dofs = 144;
+inline constexpr int maximum_scalar_dofs_per_element = 9;
+inline constexpr int maximum_scalar_dofs_per_face = 3;
+inline constexpr int maximum_interior_dofs_per_element =
+    conserved_components * maximum_scalar_dofs_per_element;
+inline constexpr int maximum_trace_dofs_per_element =
+    faces_per_element * conserved_components * maximum_scalar_dofs_per_face;
+inline constexpr int maximum_rank_elements = 36;
+inline constexpr int maximum_local_trace_dofs = 864;
+inline constexpr int maximum_true_trace_dofs = 864;
 inline constexpr int maximum_element_trace_dofs =
-    maximum_rank_elements * trace_dofs_per_element;
-inline constexpr int maximum_volume_points = 36;
-inline constexpr int maximum_face_points = 6;
+    maximum_rank_elements * maximum_trace_dofs_per_element;
+inline constexpr int maximum_volume_points = 64;
+inline constexpr int maximum_face_points = 8;
 inline constexpr int maximum_local_matrix_entries =
-    maximum_rank_elements * trace_dofs_per_element * trace_dofs_per_element;
-inline constexpr int maximum_true_matrix_entries = 20736;
+    maximum_rank_elements * maximum_trace_dofs_per_element *
+        maximum_trace_dofs_per_element;
+inline constexpr int maximum_true_matrix_entries =
+    maximum_local_matrix_entries;
+inline constexpr int maximum_global_dense_entries =
+    maximum_true_trace_dofs * maximum_true_trace_dofs;
 inline constexpr int maximum_exchange_entries = maximum_local_matrix_entries;
 inline constexpr int maximum_attempt_records = 8;
 inline constexpr int maximum_device_tickets = 128;
 inline constexpr int maximum_transfer_events = 16384;
 inline constexpr int maximum_allocation_events = 64;
 inline constexpr int assembly_quadrature_order = 11;
+inline constexpr int functional_assembly_quadrature_order = 14;
 
 enum class CudaFailurePhase : unsigned char
 {
@@ -391,7 +413,8 @@ struct CudaSerializedCheckpointV1
   std::uintptr_t trace_source_token = 0;
   std::uint64_t staging_generation = 0;
   std::array<double,
-             maximum_rank_elements * interior_dofs_per_element> interior{};
+             maximum_rank_elements * maximum_interior_dofs_per_element>
+      interior{};
   std::array<double, maximum_true_trace_dofs> owned_true_trace{};
   CudaTransferLedgerRangeV1 staging_range{};
   bool candidate_frozen = false;
@@ -439,12 +462,16 @@ struct CudaOraclePod
   int global_true_trace_count = 0;
   int volume_points = 0;
   int face_points = 0;
+  int scalar_interior_dofs = 0;
+  int scalar_face_dofs = 0;
+  int interior_dofs = 0;
+  int trace_dofs = 0;
   int true_csr_rows = 0;
   int true_csr_nonzeros = 0;
   std::uint64_t attempt_sequence = 0;
   std::uint64_t product_generation = 0;
   double dt = fixed_dt;
-  std::array<int, maximum_rank_elements * trace_dofs_per_element>
+  std::array<int, maximum_rank_elements * maximum_trace_dofs_per_element>
       signed_element_trace{};
   std::array<std::int64_t, maximum_local_trace_dofs> local_to_global_true{};
   std::array<std::int64_t, maximum_true_trace_dofs> owned_global_true{};
@@ -457,20 +484,20 @@ struct CudaOraclePod
   std::array<double, maximum_true_trace_dofs> true_solution{};
   std::array<double, maximum_true_trace_dofs> current_true_trace{};
   std::array<double, maximum_rank_elements * maximum_volume_points *
-                         scalar_dofs_per_element>
+                         maximum_scalar_dofs_per_element>
       volume_shape{};
   std::array<double, maximum_rank_elements * maximum_volume_points *
-                         scalar_dofs_per_element * dimension>
+                         maximum_scalar_dofs_per_element * dimension>
       volume_derivative{};
   std::array<double, maximum_rank_elements * maximum_volume_points>
       volume_weight{};
   std::array<double, maximum_rank_elements * maximum_volume_points * dimension>
       volume_position{};
   std::array<double, maximum_rank_elements * faces_per_element *
-                         maximum_face_points * scalar_dofs_per_element>
+                         maximum_face_points * maximum_scalar_dofs_per_element>
       face_interior_shape{};
   std::array<double, maximum_rank_elements * faces_per_element *
-                         maximum_face_points * scalar_dofs_per_face>
+                         maximum_face_points * maximum_scalar_dofs_per_face>
       face_trace_shape{};
   std::array<double, maximum_rank_elements * faces_per_element *
                          maximum_face_points>
@@ -478,38 +505,40 @@ struct CudaOraclePod
   std::array<double, maximum_rank_elements * faces_per_element *
                          maximum_face_points * dimension>
       face_normal{};
-  std::array<double, maximum_rank_elements * interior_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
       old_interior{};
-  std::array<double, maximum_rank_elements * interior_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
       current_interior{};
   std::array<double, maximum_element_trace_dofs> current_local_trace{};
   std::array<double, maximum_local_trace_dofs> distributed_local_trace{};
-  std::array<double, maximum_rank_elements * interior_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
       residual_r{};
-  std::array<double, maximum_rank_elements * trace_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_trace_dofs_per_element>
       residual_g{};
-  std::array<double, maximum_rank_elements * interior_dofs_per_element *
-                         interior_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element *
+                         maximum_interior_dofs_per_element>
       a{};
-  std::array<double, maximum_rank_elements * interior_dofs_per_element *
-                         trace_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element *
+                         maximum_trace_dofs_per_element>
       b{};
-  std::array<double, maximum_rank_elements * trace_dofs_per_element *
-                         interior_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_trace_dofs_per_element *
+                         maximum_interior_dofs_per_element>
       c{};
-  std::array<double, maximum_rank_elements * trace_dofs_per_element *
-                         trace_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_trace_dofs_per_element *
+                         maximum_trace_dofs_per_element>
       d{};
-  std::array<double, maximum_rank_elements * interior_dofs_per_element> f{};
-  std::array<double, maximum_rank_elements * trace_dofs_per_element> g{};
-  std::array<double, maximum_rank_elements * trace_dofs_per_element *
-                         trace_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
+      f{};
+  std::array<double, maximum_rank_elements * maximum_trace_dofs_per_element>
+      g{};
+  std::array<double, maximum_rank_elements * maximum_trace_dofs_per_element *
+                         maximum_trace_dofs_per_element>
       schur{};
-  std::array<double, maximum_rank_elements * trace_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_trace_dofs_per_element>
       condensed_rhs{};
-  std::array<double, maximum_rank_elements * trace_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_trace_dofs_per_element>
       local_trace_increment{};
-  std::array<double, maximum_rank_elements * interior_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
       recovered_increment{};
 };
 

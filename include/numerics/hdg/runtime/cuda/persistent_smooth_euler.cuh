@@ -2,7 +2,7 @@
 
 /**
  * @file numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh
- * @brief Persistent conventional smooth-Euler CUDA smoke engine.
+ * @brief Persistent conventional smooth-Euler CUDA smoke/functional engine.
  *
  * Numerical provenance: the pointwise Euler flux/source, W7 weak signs,
  * A/B/C/D condensation, HypreGMRES+HypreILU(0), and recovery equations are a
@@ -908,6 +908,9 @@ public:
   CudaAllocationLedgerV1 AllocationLedger() const noexcept
   { return AllocatorPolicy::Ledger(); }
 
+  CudaReuseEvidence ReuseEvidence() const noexcept
+  { return numerics_.ReuseEvidence(); }
+
   const contract_type* contract() const noexcept
   {
     return contract_ ? &*contract_ : nullptr;
@@ -1073,9 +1076,15 @@ private:
 
   bool ValidateConfig() const noexcept
   {
+    const bool smoke_shape = config_.order == smoke_polynomial_order &&
+        config_.mesh_n == smoke_elements_per_direction;
+    const bool functional_shape =
+        config_.order == functional_polynomial_order &&
+        config_.mesh_n == functional_elements_per_direction;
+    const std::uint64_t injected_step = functional_shape
+        ? functional_injected_step : 2;
     return config_.experiment == StableIdentity::Copy(experiment_id) &&
-        config_.order == polynomial_order &&
-        config_.mesh_n == elements_per_direction &&
+        (smoke_shape || functional_shape) &&
         std::isfinite(config_.dt) &&
         std::memcmp(&config_.dt, &fixed_dt, sizeof(double)) == 0 &&
         config_.requested_device == 0 &&
@@ -1086,7 +1095,7 @@ private:
         (!config_.injection.enabled ||
          (config_.injection.phase ==
               CudaFailurePhase::after_recovery_before_commit &&
-          config_.injection.target_step == 2 &&
+          config_.injection.target_step == injected_step &&
           config_.injection.source_rank >= 0 &&
           config_.injection.source_rank < config_.expected_rank_count)) &&
         detail::ExactSelection<Selection>(config_);
