@@ -748,9 +748,7 @@ public:
     }
     resources_.rank_count = static_cast<std::uint32_t>(ranks_);
     resources_.polynomial_order = static_cast<std::uint32_t>(config.order);
-    resources_.layout = config.order == functional_polynomial_order
-        ? StableIdentity::Copy("mfem.byNODES.vdim4.p2.n6")
-        : StableIdentity::Copy("mfem.byNODES.vdim4.p1.n3");
+    resources_.layout = StableIdentity::Copy(runtime_layout_id);
     resources_.reuse = {true,
                         true,
                         true,

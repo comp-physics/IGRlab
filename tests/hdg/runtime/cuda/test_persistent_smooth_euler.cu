@@ -3143,6 +3143,10 @@ bool CommitFunctionalAttempt(
       snapshot.products.CoupledAndOrdered() &&
       std::isfinite(evidence.initial_residual) &&
       std::isfinite(evidence.final_residual) &&
+      evidence.nonlinear_updates > 0 &&
+      evidence.nonlinear_updates <= 20 &&
+      evidence.final_residual <=
+          1.0e-10 * (1.0 + evidence.initial_residual) &&
       std::isfinite(evidence.true_relative_residual) &&
       evidence.true_relative_residual <= 1.0e-10 &&
       evidence.no_fallback && evidence.device_resident &&
@@ -3171,6 +3175,7 @@ bool CommitFunctionalAttempt(
       checkpoint.interior_count == snapshot.interior_coefficients &&
       checkpoint.owned_true_trace_count ==
           snapshot.true_trace_coefficients &&
+      ExactId(checkpoint.descriptor.layout, runtime_layout_id) &&
       checkpoint.staging_generation == snapshot.target.generation &&
       ValidRange(checkpoint.staging_range, AuditedTransport::Ledger()) &&
       ExactPolicyLedgers();

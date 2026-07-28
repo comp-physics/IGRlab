@@ -24,6 +24,8 @@ namespace dg::hdg::runtime::cuda_w8a
 
 inline constexpr std::string_view experiment_id =
     "exp.hdg.euler.conventional.smooth_persistent.w8a.v1";
+inline constexpr std::string_view runtime_layout_id =
+    "l2-interior.true-trace-owned.component-major.v1";
 inline constexpr int smoke_polynomial_order = 1;
 inline constexpr int smoke_elements_per_direction = 3;
 inline constexpr int functional_polynomial_order = 2;
