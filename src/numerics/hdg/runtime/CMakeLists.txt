@@ -2,6 +2,8 @@ include("${PROJECT_SOURCE_DIR}/cmake/DgIgrHdgComponents.cmake")
 
 file(GLOB_RECURSE _dg_igr_hdg_runtime_common_sources CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/common/*.cpp")
+file(GLOB_RECURSE _dg_igr_hdg_runtime_app_sources CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/app/*.cpp")
 file(GLOB_RECURSE _dg_igr_hdg_runtime_cpu_sources CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/cpu/*.cpp")
 file(GLOB_RECURSE _dg_igr_hdg_runtime_cuda_sources CONFIGURE_DEPENDS
@@ -16,6 +18,7 @@ set(_dg_igr_hdg_runtime_unclassified_cpp
     ${_dg_igr_hdg_runtime_all_cpp})
 list(REMOVE_ITEM _dg_igr_hdg_runtime_unclassified_cpp
      ${_dg_igr_hdg_runtime_common_sources}
+     ${_dg_igr_hdg_runtime_app_sources}
      ${_dg_igr_hdg_runtime_cpu_sources}
      ${_dg_igr_hdg_runtime_cuda_sources})
 set(_dg_igr_hdg_runtime_unclassified_cuda
@@ -57,6 +60,35 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     TARGET dg_igr_hdg_runtime_common
     STANDARD_LIBRARY_ONLY
     SOURCES ${_dg_igr_hdg_runtime_common_sources})
+
+  set(_dg_igr_hdg_runtime_app_expected_sources
+      "${CMAKE_CURRENT_SOURCE_DIR}/app/application_contract.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/app/checkpoint_codec.cpp")
+  list(SORT _dg_igr_hdg_runtime_app_sources)
+  list(SORT _dg_igr_hdg_runtime_app_expected_sources)
+  if(NOT _dg_igr_hdg_runtime_app_sources STREQUAL
+     _dg_igr_hdg_runtime_app_expected_sources)
+    message(FATAL_ERROR
+            "The frozen W8A application contract requires exactly application_contract.cpp and checkpoint_codec.cpp.")
+  endif()
+  add_library(dg_igr_hdg_runtime_app_contract STATIC
+              ${_dg_igr_hdg_runtime_app_sources})
+  set_target_properties(dg_igr_hdg_runtime_app_contract PROPERTIES
+                        CXX_STANDARD 17
+                        CXX_STANDARD_REQUIRED ON
+                        CXX_EXTENSIONS OFF)
+  target_include_directories(dg_igr_hdg_runtime_app_contract PUBLIC
+                             "${PROJECT_SOURCE_DIR}/include")
+  target_compile_definitions(dg_igr_hdg_runtime_app_contract PUBLIC
+    DG_IGR_HDG_APP_HAS_CPU_SERIAL=1
+    DG_IGR_HDG_APP_HAS_CPU_RANK2=1
+    DG_IGR_HDG_APP_HAS_CUDA_RANK1=$<BOOL:${MFEM_USE_CUDA}>
+    DG_IGR_HDG_APP_HAS_CUDA_RANK2=$<BOOL:${MFEM_USE_CUDA}>)
+  target_compile_options(dg_igr_hdg_runtime_app_contract PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+  target_link_libraries(dg_igr_hdg_runtime_app_contract
+                        PUBLIC dg_igr_hdg_runtime_common)
+
   dg_igr_add_hdg_cxx17_component(
     TARGET dg_igr_hdg_runtime_cpu
     SOURCES ${_dg_igr_hdg_runtime_cpu_sources}
@@ -64,6 +96,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
 
   target_link_libraries(dg_igr_hdg_runtime_components INTERFACE
                         dg_igr_hdg_runtime_common
+                        dg_igr_hdg_runtime_app_contract
                         dg_igr_hdg_runtime_cpu)
 
   if(MFEM_USE_CUDA)
