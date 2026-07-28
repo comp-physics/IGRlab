@@ -2284,7 +2284,7 @@ bool SamePersistentIdentity(const CudaReuseEvidence& initial,
       initial.double_arena_token == current.double_arena_token &&
       initial.integer_arena_token == current.integer_arena_token &&
       initial.matrix_token == current.matrix_token &&
-      initial.factor_token == current.factor_token &&
+      initial.factor_token != 0 && current.factor_token != 0 &&
       initial.workspace_token == current.workspace_token &&
       same_interior_slots && same_trace_slots &&
       current.post_baseline_w8_owned_allocation_calls == 0 &&
@@ -2301,7 +2301,8 @@ void ReportFunctionalReferenceTerminalDiagnostic(
     const std::uint64_t step, const std::uint64_t cursor,
     const std::uint64_t commits, const CudaReuseEvidence& initial,
     const CudaReuseEvidence& current,
-    const bool persistent_identity_exact) noexcept
+    const bool persistent_identity_exact,
+    const bool terminal_local, const bool terminal_collective) noexcept
 {
   const bool topology_nonzero = initial.topology_token != 0;
   const bool topology_same =
@@ -2311,7 +2312,12 @@ void ReportFunctionalReferenceTerminalDiagnostic(
   const bool integer_arena_same =
       initial.integer_arena_token == current.integer_arena_token;
   const bool matrix_same = initial.matrix_token == current.matrix_token;
-  const bool factor_same = initial.factor_token == current.factor_token;
+  const bool initial_factor_available = initial.factor_token != 0;
+  const bool current_factor_available = current.factor_token != 0;
+  const bool factor_handle_same =
+      initial.factor_token == current.factor_token;
+  const bool factor_handle_recreated = initial_factor_available &&
+      current_factor_available && !factor_handle_same;
   const bool workspace_same =
       initial.workspace_token == current.workspace_token;
   const bool interior_slots_same =
@@ -2330,7 +2336,8 @@ void ReportFunctionalReferenceTerminalDiagnostic(
 
   std::fprintf(stderr,
       "CUDA_FUNCTIONAL_REFERENCE_TERMINAL rank=%d ranks=%d contract=%u "
-      "step=%llu/%llu:%u cursor=%llu/%llu:%u commits=%llu/%llu:%u\n",
+      "step=%llu/%llu:%u cursor=%llu/%llu:%u commits=%llu/%llu:%u "
+      "local=%s collective=%s\n",
       rank, ranks, contract_present ? 1U : 0U,
       static_cast<unsigned long long>(step),
       static_cast<unsigned long long>(functional_accepted_steps),
@@ -2340,14 +2347,17 @@ void ReportFunctionalReferenceTerminalDiagnostic(
       cursor == functional_accepted_steps ? 1U : 0U,
       static_cast<unsigned long long>(commits),
       static_cast<unsigned long long>(functional_accepted_steps),
-      commits == functional_accepted_steps ? 1U : 0U);
+      commits == functional_accepted_steps ? 1U : 0U,
+      terminal_local ? "PASS" : "FAIL",
+      terminal_collective ? "PASS" : "FAIL");
   std::fprintf(stderr,
       "CUDA_FUNCTIONAL_REFERENCE_IDENTITY rank=%d ranks=%d "
       "topology_nonzero=%u topology_same=%u topology=0x%llx/0x%llx "
       "double_same=%u double=0x%llx/0x%llx "
       "integer_same=%u integer=0x%llx/0x%llx "
       "matrix_same=%u matrix=0x%llx/0x%llx "
-      "factor_same=%u factor=0x%llx/0x%llx "
+      "factor_available=%u/%u factor_handle_same=%u "
+      "factor_handle_recreated=%u factor=0x%llx/0x%llx "
       "workspace_same=%u workspace=0x%llx/0x%llx\n",
       rank, ranks, topology_nonzero ? 1U : 0U,
       topology_same ? 1U : 0U,
@@ -2362,7 +2372,10 @@ void ReportFunctionalReferenceTerminalDiagnostic(
       matrix_same ? 1U : 0U,
       static_cast<unsigned long long>(initial.matrix_token),
       static_cast<unsigned long long>(current.matrix_token),
-      factor_same ? 1U : 0U,
+      initial_factor_available ? 1U : 0U,
+      current_factor_available ? 1U : 0U,
+      factor_handle_same ? 1U : 0U,
+      factor_handle_recreated ? 1U : 0U,
       static_cast<unsigned long long>(initial.factor_token),
       static_cast<unsigned long long>(current.factor_token),
       workspace_same ? 1U : 0U,
@@ -2398,6 +2411,20 @@ void ReportFunctionalReferenceTerminalDiagnostic(
       current.persistent_slots ? 1U : 0U,
       current.persistent_workspace ? 1U : 0U,
       persistent_identity_exact ? 1U : 0U);
+  const char* const factor_handle_class =
+      !initial_factor_available || !current_factor_available
+      ? "unavailable"
+      : (factor_handle_recreated
+         ? "opaque-hypre-recreated" : "opaque-hypre-same-observation");
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_REFERENCE_CLASSIFICATION rank=%d ranks=%d "
+      "terminal_local=%s terminal_collective=%s w8_identity=%s "
+      "factor_handle_class=%s factor_storage_class=opaque-shared-pool "
+      "performance_claim=BLOCKED profile_claim=BLOCKED "
+      "tensor_claim=BLOCKED\n",
+      rank, ranks, terminal_local ? "PASS" : "FAIL",
+      terminal_collective ? "PASS" : "FAIL",
+      persistent_identity_exact ? "PASS" : "FAIL", factor_handle_class);
 }
 
 template <typename Backend>
@@ -3603,11 +3630,11 @@ bool RunFunctionalTrajectory(const int ranks, const char* const context)
         persistent_identity_exact;
     const bool reference_terminal_collective =
         CollectivelyExact(reference_terminal_local);
-    if (!reference_terminal_collective)
-      ReportFunctionalReferenceTerminalDiagnostic(
-          setup.rank, ranks, contract_present, terminal_step,
-          terminal_cursor, terminal_commits, setup.reuse, current_reuse,
-          persistent_identity_exact);
+    ReportFunctionalReferenceTerminalDiagnostic(
+        setup.rank, ranks, contract_present, terminal_step,
+        terminal_cursor, terminal_commits, setup.reuse, current_reuse,
+        persistent_identity_exact, reference_terminal_local,
+        reference_terminal_collective);
     if (!reference_terminal_collective)
       return false;
     reference_interior = step.descriptor.interior_hash;
