@@ -16,7 +16,9 @@ namespace codec_detail
 
 constexpr std::array<std::uint8_t, 16> magic{{
     'D', 'G', 'I', 'G', 'R', '-', 'H', 'D', 'G', '-', 'M', 'E', 'M', 'V',
-    '1', 0}};
+    '2', 0}};
+constexpr std::uint8_t restart_delta_schema_v2 = 1;
+constexpr std::uint8_t restart_delta_field_count_v2 = 6;
 constexpr std::size_t checksum_size = StateHash{}.bytes.size();
 constexpr std::size_t total_size_offset = magic.size() + sizeof(std::uint32_t);
 constexpr std::size_t prefix_size =
@@ -49,6 +51,31 @@ bool Multiply(const std::uint64_t left,
   }
   result = left * right;
   return true;
+}
+
+struct AddressRange
+{
+  std::uintptr_t begin = 0;
+  std::uintptr_t end = 0;
+};
+
+bool MakeAddressRange(const void* data,
+                      const std::size_t size,
+                      AddressRange& range) noexcept
+{
+  if (data == nullptr || size == 0) { return false; }
+  const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(data);
+  if (size > std::numeric_limits<std::uintptr_t>::max() - begin)
+  {
+    return false;
+  }
+  range = {begin, begin + size};
+  return true;
+}
+
+bool Overlaps(const AddressRange left, const AddressRange right) noexcept
+{
+  return left.begin < right.end && right.begin < left.end;
 }
 
 bool NonzeroHash(const StateHash& hash) noexcept
@@ -353,9 +380,11 @@ struct ArtifactConfig
   StableIdentity time_rule_id{};
   StableIdentity layout_id{};
   StateHash scientific_config_sha256{};
-  StateHash run_config_sha256{};
+  StateHash writer_run_config_sha256{};
   ApplicationScenarioV1 scenario = ApplicationScenarioV1::unknown;
+  ApplicationBackend backend = ApplicationBackend::unknown;
   InteriorSpace interior_space = InteriorSpace::l2;
+  DeferredRuntimePredicatesV1 deferred{};
   std::uint32_t mesh_n = 0;
   int polynomial_order = -1;
   int q_a = 0;
@@ -368,13 +397,25 @@ struct ArtifactConfig
   std::uint64_t accepted_steps = 0;
   double final_time = 0.0;
   std::array<std::uint64_t, 3> output_steps{};
-  std::uint64_t checkpoint_step = 0;
+  std::uint64_t scenario_checkpoint_step = 0;
+  ApplicationRunRoleV1 run_role =
+      ApplicationRunRoleV1::uninterrupted_reference;
+  struct Path
+  {
+    bool present = false;
+    StableIdentity identity{};
+  };
+  Path output_directory{};
+  Path evidence_directory{};
+  ValidationCaptureModeV1 validation_capture = ValidationCaptureModeV1::none;
+  Path checkpoint_out{};
+  OptionalCheckpointStepV1 checkpoint_step{};
+  Path restart_from{};
+  StopAfterCheckpointV1 stop_after_checkpoint = StopAfterCheckpointV1::no;
+  FailureInjectionControlV1 injection{};
   RestartMode restart_mode = RestartMode::same_backend_rank_partition;
   RestartTrajectoryModeV1 restart_trajectory =
       RestartTrajectoryModeV1::uninterrupted_and_split_same_tuple;
-  std::uint64_t failure_committed_step = 0;
-  std::uint64_t failure_target_step = 0;
-  FailurePhase failure_phase = FailurePhase::Setup;
   RollbackObligationV1 rollback_obligation =
       RollbackObligationV1::collective_exact_complete_state;
   DeferredSourceRankRuleV1 source_rank_rule =
@@ -382,6 +423,164 @@ struct ArtifactConfig
   std::uint32_t retry_limit = 0;
   std::uint64_t seed = 0;
 };
+
+template <typename Path>
+bool WritePath(Writer& writer, const Path& path)
+{
+  writer.U8(path.present() ? 1U : 0U);
+  return !path.present() || writer.Identity(path.identity());
+}
+
+bool ReadPath(Reader& reader, ArtifactConfig::Path& path) noexcept
+{
+  std::uint8_t present = 0;
+  if (!reader.U8(present) || present > 1) { return false; }
+  path.present = present != 0;
+  return !path.present || reader.Identity(path.identity);
+}
+
+template <typename Path>
+bool SamePath(const ArtifactConfig::Path& artifact,
+              const Path& expected) noexcept
+{
+  return artifact.present == expected.present() &&
+      (!artifact.present || artifact.identity == expected.identity());
+}
+
+struct RestartDeltaManifestV2
+{
+  std::uint8_t schema = 0;
+  std::uint8_t count = 0;
+  std::uint8_t role_field = 0;
+  ApplicationRunRoleV1 writer_role =
+      ApplicationRunRoleV1::uninterrupted_reference;
+  ApplicationRunRoleV1 reader_role =
+      ApplicationRunRoleV1::uninterrupted_reference;
+  std::uint8_t binding_field = 0;
+  std::uint8_t checkpoint_binding = 0;
+  std::uint8_t checkpoint_step_field = 0;
+  OptionalCheckpointStepV1 writer_checkpoint_step{};
+  OptionalCheckpointStepV1 reader_checkpoint_step{};
+  std::uint8_t stop_field = 0;
+  StopAfterCheckpointV1 writer_stop = StopAfterCheckpointV1::no;
+  StopAfterCheckpointV1 reader_stop = StopAfterCheckpointV1::no;
+  std::uint8_t injection_field = 0;
+  FailureInjectionControlV1 writer_injection{};
+  FailureInjectionControlV1 reader_injection{};
+  std::uint8_t retry_field = 0;
+  std::uint32_t writer_retry = 0;
+  std::uint32_t reader_retry = 0;
+};
+
+void WriteInjection(Writer& writer,
+                    const FailureInjectionControlV1 value)
+{
+  writer.U8(static_cast<std::uint8_t>(value.mode));
+  writer.U8(static_cast<std::uint8_t>(value.phase));
+  writer.UnsignedLittleEndian(value.target_step);
+  writer.UnsignedLittleEndian(value.source_rank);
+}
+
+bool ReadInjection(Reader& reader,
+                   FailureInjectionControlV1& value) noexcept
+{
+  std::uint8_t mode = 0;
+  std::uint8_t phase = 0;
+  if (!reader.U8(mode) || !reader.U8(phase) ||
+      !reader.UnsignedLittleEndian(value.target_step) ||
+      !reader.UnsignedLittleEndian(value.source_rank))
+  {
+    return false;
+  }
+  value.mode = static_cast<FailureInjectionModeV1>(mode);
+  value.phase = static_cast<FailurePhase>(phase);
+  return true;
+}
+
+void WriteOptionalStep(Writer& writer,
+                       const OptionalCheckpointStepV1 value)
+{
+  writer.U8(value.present ? 1U : 0U);
+  writer.UnsignedLittleEndian(value.value);
+}
+
+bool ReadOptionalStep(Reader& reader,
+                      OptionalCheckpointStepV1& value) noexcept
+{
+  std::uint8_t present = 0;
+  if (!reader.U8(present) || present > 1 ||
+      !reader.UnsignedLittleEndian(value.value))
+  {
+    return false;
+  }
+  value.present = present != 0;
+  return value.present || value.value == 0;
+}
+
+void WriteRestartDeltaManifestV2(
+    Writer& writer,
+    const ValidatedApplicationConfig& writer_config)
+{
+  const FailureInjectionControlV1 reader_injection{
+      FailureInjectionModeV1::prescribed,
+      smooth_periodic_euler_v1_failure_phase,
+      writer_config.scenario() == ApplicationScenarioV1::smoke
+          ? smooth_periodic_euler_v1_smoke_failure_target_step
+          : smooth_periodic_euler_v1_functional_failure_target_step,
+      writer_config.deferred_runtime().required_injected_source_rank};
+  writer.U8(restart_delta_schema_v2);
+  writer.U8(restart_delta_field_count_v2);
+  writer.U8(1);
+  writer.U8(static_cast<std::uint8_t>(ApplicationRunRoleV1::split_writer));
+  writer.U8(static_cast<std::uint8_t>(ApplicationRunRoleV1::split_reader));
+  writer.U8(2);
+  writer.U8(1); // checkpoint-out identity becomes restart-from identity
+  writer.U8(3);
+  WriteOptionalStep(writer, OptionalCheckpointStepV1::Present(
+                                writer_config.scenario_checkpoint_step()));
+  WriteOptionalStep(writer, {});
+  writer.U8(4);
+  writer.U8(static_cast<std::uint8_t>(StopAfterCheckpointV1::yes));
+  writer.U8(static_cast<std::uint8_t>(StopAfterCheckpointV1::no));
+  writer.U8(5);
+  WriteInjection(writer, {});
+  WriteInjection(writer, reader_injection);
+  writer.U8(6);
+  writer.UnsignedLittleEndian(std::uint32_t{0});
+  writer.UnsignedLittleEndian(smooth_periodic_euler_v1_retry_limit);
+}
+
+bool ReadRestartDeltaManifestV2(
+    Reader& reader,
+    RestartDeltaManifestV2& value) noexcept
+{
+  std::uint8_t writer_role = 0;
+  std::uint8_t reader_role = 0;
+  std::uint8_t writer_stop = 0;
+  std::uint8_t reader_stop = 0;
+  if (!reader.U8(value.schema) || !reader.U8(value.count) ||
+      !reader.U8(value.role_field) || !reader.U8(writer_role) ||
+      !reader.U8(reader_role) || !reader.U8(value.binding_field) ||
+      !reader.U8(value.checkpoint_binding) ||
+      !reader.U8(value.checkpoint_step_field) ||
+      !ReadOptionalStep(reader, value.writer_checkpoint_step) ||
+      !ReadOptionalStep(reader, value.reader_checkpoint_step) ||
+      !reader.U8(value.stop_field) || !reader.U8(writer_stop) ||
+      !reader.U8(reader_stop) || !reader.U8(value.injection_field) ||
+      !ReadInjection(reader, value.writer_injection) ||
+      !ReadInjection(reader, value.reader_injection) ||
+      !reader.U8(value.retry_field) ||
+      !reader.UnsignedLittleEndian(value.writer_retry) ||
+      !reader.UnsignedLittleEndian(value.reader_retry))
+  {
+    return false;
+  }
+  value.writer_role = static_cast<ApplicationRunRoleV1>(writer_role);
+  value.reader_role = static_cast<ApplicationRunRoleV1>(reader_role);
+  value.writer_stop = static_cast<StopAfterCheckpointV1>(writer_stop);
+  value.reader_stop = static_cast<StopAfterCheckpointV1>(reader_stop);
+  return true;
+}
 
 bool WriteConfig(Writer& writer, const ValidatedApplicationConfig& config)
 {
@@ -400,7 +599,15 @@ bool WriteConfig(Writer& writer, const ValidatedApplicationConfig& config)
   writer.Hash(config.scientific_config_sha256());
   writer.Hash(config.run_config_sha256());
   writer.U8(static_cast<std::uint8_t>(config.scenario()));
+  writer.U8(static_cast<std::uint8_t>(config.backend()));
   writer.U8(static_cast<std::uint8_t>(config.interior_space()));
+  writer.UnsignedLittleEndian(
+      config.deferred_runtime().required_mpi_rank_count);
+  writer.U8(static_cast<std::uint8_t>(config.deferred_runtime().gpu_rule));
+  writer.U8(static_cast<std::uint8_t>(
+      config.deferred_runtime().source_rank_rule));
+  writer.UnsignedLittleEndian(
+      config.deferred_runtime().required_injected_source_rank);
   writer.UnsignedLittleEndian(config.mesh_n());
   writer.UnsignedLittleEndian(
       static_cast<std::uint32_t>(config.polynomial_order()));
@@ -417,12 +624,21 @@ bool WriteConfig(Writer& writer, const ValidatedApplicationConfig& config)
   {
     writer.UnsignedLittleEndian(step);
   }
-  writer.UnsignedLittleEndian(config.checkpoint_step());
+  writer.UnsignedLittleEndian(config.scenario_checkpoint_step());
+  writer.U8(static_cast<std::uint8_t>(config.run_role()));
+  if (!WritePath(writer, config.output_directory()) ||
+      !WritePath(writer, config.evidence_directory()))
+  {
+    return false;
+  }
+  writer.U8(static_cast<std::uint8_t>(config.validation_capture()));
+  if (!WritePath(writer, config.checkpoint_out())) { return false; }
+  WriteOptionalStep(writer, config.checkpoint_step());
+  if (!WritePath(writer, config.restart_from())) { return false; }
+  writer.U8(static_cast<std::uint8_t>(config.stop_after_checkpoint()));
+  WriteInjection(writer, config.injection());
   writer.U8(static_cast<std::uint8_t>(config.restart_mode()));
   writer.U8(static_cast<std::uint8_t>(config.restart_trajectory()));
-  writer.UnsignedLittleEndian(config.injected_failure_committed_step());
-  writer.UnsignedLittleEndian(config.injected_failure_target_step());
-  writer.U8(static_cast<std::uint8_t>(config.injected_failure_phase()));
   writer.U8(static_cast<std::uint8_t>(config.rollback_obligation()));
   writer.U8(static_cast<std::uint8_t>(config.source_rank_rule()));
   writer.UnsignedLittleEndian(config.retry_limit());
@@ -434,7 +650,10 @@ bool ReadConfig(Reader& reader, ArtifactConfig& value) noexcept
 {
   ArtifactConfig candidate{};
   std::uint8_t scenario = 0;
+  std::uint8_t backend = 0;
   std::uint8_t interior_space = 0;
+  std::uint8_t gpu_rule = 0;
+  std::uint8_t deferred_source_rule = 0;
   std::uint32_t polynomial_order = 0;
   std::uint32_t q_a = 0;
   std::uint32_t q_e = 0;
@@ -446,7 +665,9 @@ bool ReadConfig(Reader& reader, ArtifactConfig& value) noexcept
   std::uint64_t final_time = 0;
   std::uint8_t restart = 0;
   std::uint8_t trajectory = 0;
-  std::uint8_t failure_phase = 0;
+  std::uint8_t run_role = 0;
+  std::uint8_t capture = 0;
+  std::uint8_t stop = 0;
   std::uint8_t rollback = 0;
   std::uint8_t source_rule = 0;
   if (!reader.Identity(candidate.card_id) ||
@@ -459,8 +680,14 @@ bool ReadConfig(Reader& reader, ArtifactConfig& value) noexcept
       !reader.Identity(candidate.time_rule_id) ||
       !reader.Identity(candidate.layout_id) ||
       !reader.Hash(candidate.scientific_config_sha256) ||
-      !reader.Hash(candidate.run_config_sha256) || !reader.U8(scenario) ||
+      !reader.Hash(candidate.writer_run_config_sha256) ||
+      !reader.U8(scenario) || !reader.U8(backend) ||
       !reader.U8(interior_space) ||
+      !reader.UnsignedLittleEndian(
+          candidate.deferred.required_mpi_rank_count) ||
+      !reader.U8(gpu_rule) || !reader.U8(deferred_source_rule) ||
+      !reader.UnsignedLittleEndian(
+          candidate.deferred.required_injected_source_rank) ||
       !reader.UnsignedLittleEndian(candidate.mesh_n) ||
       !reader.UnsignedLittleEndian(polynomial_order) ||
       !reader.UnsignedLittleEndian(q_a) ||
@@ -479,11 +706,15 @@ bool ReadConfig(Reader& reader, ArtifactConfig& value) noexcept
   {
     if (!reader.UnsignedLittleEndian(step)) { return false; }
   }
-  if (!reader.UnsignedLittleEndian(candidate.checkpoint_step) ||
+  if (!reader.UnsignedLittleEndian(candidate.scenario_checkpoint_step) ||
+      !reader.U8(run_role) || !ReadPath(reader, candidate.output_directory) ||
+      !ReadPath(reader, candidate.evidence_directory) ||
+      !reader.U8(capture) || !ReadPath(reader, candidate.checkpoint_out) ||
+      !ReadOptionalStep(reader, candidate.checkpoint_step) ||
+      !ReadPath(reader, candidate.restart_from) || !reader.U8(stop) ||
+      !ReadInjection(reader, candidate.injection) ||
       !reader.U8(restart) || !reader.U8(trajectory) ||
-      !reader.UnsignedLittleEndian(candidate.failure_committed_step) ||
-      !reader.UnsignedLittleEndian(candidate.failure_target_step) ||
-      !reader.U8(failure_phase) || !reader.U8(rollback) ||
+      !reader.U8(rollback) ||
       !reader.U8(source_rule) ||
       !reader.UnsignedLittleEndian(candidate.retry_limit) ||
       !reader.UnsignedLittleEndian(candidate.seed))
@@ -491,7 +722,11 @@ bool ReadConfig(Reader& reader, ArtifactConfig& value) noexcept
     return false;
   }
   candidate.scenario = static_cast<ApplicationScenarioV1>(scenario);
+  candidate.backend = static_cast<ApplicationBackend>(backend);
   candidate.interior_space = static_cast<InteriorSpace>(interior_space);
+  candidate.deferred.gpu_rule = static_cast<DeferredGpuRuleV1>(gpu_rule);
+  candidate.deferred.source_rank_rule =
+      static_cast<DeferredSourceRankRuleV1>(deferred_source_rule);
   candidate.polynomial_order = abi_detail::DecodeInt32(polynomial_order);
   candidate.q_a = abi_detail::DecodeInt32(q_a);
   candidate.q_e = abi_detail::DecodeInt32(q_e);
@@ -501,10 +736,14 @@ bool ReadConfig(Reader& reader, ArtifactConfig& value) noexcept
   candidate.tau = BitsDouble(tau);
   candidate.dt = BitsDouble(dt);
   candidate.final_time = BitsDouble(final_time);
+  candidate.run_role = static_cast<ApplicationRunRoleV1>(run_role);
+  candidate.validation_capture =
+      static_cast<ValidationCaptureModeV1>(capture);
+  candidate.stop_after_checkpoint =
+      static_cast<StopAfterCheckpointV1>(stop);
   candidate.restart_mode = static_cast<RestartMode>(restart);
   candidate.restart_trajectory =
       static_cast<RestartTrajectoryModeV1>(trajectory);
-  candidate.failure_phase = static_cast<FailurePhase>(failure_phase);
   candidate.rollback_obligation =
       static_cast<RollbackObligationV1>(rollback);
   candidate.source_rank_rule =
@@ -513,9 +752,13 @@ bool ReadConfig(Reader& reader, ArtifactConfig& value) noexcept
   return true;
 }
 
-bool ConfigMatches(const ArtifactConfig& value,
-                   const ValidatedApplicationConfig& expected) noexcept
+bool ConfigMatchesSplitRestart(
+    const ArtifactConfig& value,
+    const RestartDeltaManifestV2& delta,
+    const ValidatedApplicationConfig& expected) noexcept
 {
+  StateHash derived_writer_run_hash{};
+  const FailureInjectionControlV1 canonical_off{};
   return value.card_id == expected.card_id() &&
       value.case_id == expected.case_id() &&
       value.scenario_id == expected.scenario_id() &&
@@ -526,9 +769,21 @@ bool ConfigMatches(const ArtifactConfig& value,
       value.time_rule_id == expected.time_rule_id() &&
       value.layout_id == expected.layout_id() &&
       value.scientific_config_sha256 == expected.scientific_config_sha256() &&
-      value.run_config_sha256 == expected.run_config_sha256() &&
+      NonzeroHash(value.writer_run_config_sha256) &&
+      NonzeroHash(expected.run_config_sha256()) &&
+      value.writer_run_config_sha256 != expected.run_config_sha256() &&
+      DeriveSplitWriterRunConfigHashV1(expected, derived_writer_run_hash) &&
+      value.writer_run_config_sha256 == derived_writer_run_hash &&
       value.scenario == expected.scenario() &&
+      value.backend == expected.backend() &&
       value.interior_space == expected.interior_space() &&
+      value.deferred.required_mpi_rank_count ==
+          expected.deferred_runtime().required_mpi_rank_count &&
+      value.deferred.gpu_rule == expected.deferred_runtime().gpu_rule &&
+      value.deferred.source_rank_rule ==
+          expected.deferred_runtime().source_rank_rule &&
+      value.deferred.required_injected_source_rank ==
+          expected.deferred_runtime().required_injected_source_rank &&
       value.mesh_n == expected.mesh_n() &&
       value.polynomial_order == expected.polynomial_order() &&
       value.q_a == expected.q_a() && value.q_e == expected.q_e() &&
@@ -539,17 +794,48 @@ bool ConfigMatches(const ArtifactConfig& value,
       value.accepted_steps == expected.accepted_steps() &&
       DoubleBits(value.final_time) == DoubleBits(expected.final_time()) &&
       value.output_steps == expected.output_steps() &&
-      value.checkpoint_step == expected.checkpoint_step() &&
+      value.scenario_checkpoint_step == expected.scenario_checkpoint_step() &&
+      value.run_role == ApplicationRunRoleV1::split_writer &&
+      expected.run_role() == ApplicationRunRoleV1::split_reader &&
+      SamePath(value.output_directory, expected.output_directory()) &&
+      SamePath(value.evidence_directory, expected.evidence_directory()) &&
+      value.validation_capture == expected.validation_capture() &&
+      value.checkpoint_out.present && !value.restart_from.present &&
+      !expected.checkpoint_out().present() && expected.restart_from().present() &&
+      value.checkpoint_out.identity == expected.restart_from().identity() &&
+      value.checkpoint_step.present &&
+      value.checkpoint_step.value == expected.scenario_checkpoint_step() &&
+      !expected.checkpoint_step().present &&
+      value.stop_after_checkpoint == StopAfterCheckpointV1::yes &&
+      expected.stop_after_checkpoint() == StopAfterCheckpointV1::no &&
+      value.injection == canonical_off &&
+      expected.injection().mode == FailureInjectionModeV1::prescribed &&
       value.restart_mode == expected.restart_mode() &&
       value.restart_trajectory == expected.restart_trajectory() &&
-      value.failure_committed_step ==
-          expected.injected_failure_committed_step() &&
-      value.failure_target_step == expected.injected_failure_target_step() &&
-      value.failure_phase == expected.injected_failure_phase() &&
       value.rollback_obligation == expected.rollback_obligation() &&
       value.source_rank_rule == expected.source_rank_rule() &&
-      value.retry_limit == expected.retry_limit() &&
-      value.seed == expected.seed();
+      value.retry_limit == 0 &&
+      expected.retry_limit() == smooth_periodic_euler_v1_retry_limit &&
+      value.seed == expected.seed() &&
+      delta.schema == restart_delta_schema_v2 &&
+      delta.count == restart_delta_field_count_v2 &&
+      delta.role_field == 1 &&
+      delta.writer_role == value.run_role &&
+      delta.reader_role == expected.run_role() &&
+      delta.binding_field == 2 && delta.checkpoint_binding == 1 &&
+      delta.checkpoint_step_field == 3 &&
+      delta.writer_checkpoint_step.present &&
+      delta.writer_checkpoint_step.value == value.checkpoint_step.value &&
+      !delta.reader_checkpoint_step.present &&
+      delta.reader_checkpoint_step.value == 0 &&
+      delta.stop_field == 4 &&
+      delta.writer_stop == value.stop_after_checkpoint &&
+      delta.reader_stop == expected.stop_after_checkpoint() &&
+      delta.injection_field == 5 &&
+      delta.writer_injection == value.injection &&
+      delta.reader_injection == expected.injection() &&
+      delta.retry_field == 6 && delta.writer_retry == value.retry_limit &&
+      delta.reader_retry == expected.retry_limit();
 }
 
 struct BlockMetadata
@@ -821,6 +1107,58 @@ bool BufferMatches(const Fp64CoefficientBufferV1& buffer,
       buffer.ordering == metadata.ordering;
 }
 
+bool DecodeDestinationsAreDisjoint(
+    const ConstByteView encoded,
+    const RankStateBufferV1* rank_buffers,
+    const std::uint32_t rank_count,
+    const std::array<RankMetadata, application_checkpoint_max_rank_count_v1>&
+        metadata,
+    const DecodedCheckpointMetadataV1& output_metadata) noexcept
+{
+  AddressRange encoded_range{};
+  AddressRange metadata_range{};
+  if (!MakeAddressRange(encoded.data, encoded.size, encoded_range) ||
+      !MakeAddressRange(&output_metadata, sizeof(output_metadata),
+                        metadata_range) ||
+      Overlaps(encoded_range, metadata_range))
+  {
+    return false;
+  }
+
+  std::array<AddressRange, 2 * application_checkpoint_max_rank_count_v1>
+      outputs{};
+  std::size_t output_count = 0;
+  for (std::uint32_t rank = 0; rank < rank_count; ++rank)
+  {
+    const std::array<const Fp64CoefficientBufferV1*, 2> blocks{{
+        &rank_buffers[rank].interior,
+        &rank_buffers[rank].owned_true_trace}};
+    const std::array<const BlockMetadata*, 2> block_metadata{{
+        &metadata[rank].interior, &metadata[rank].trace}};
+    for (std::size_t block = 0; block < blocks.size(); ++block)
+    {
+      std::uint64_t byte_count = 0;
+      if (!Multiply(block_metadata[block]->coefficient_count,
+                    fp64_coefficient_bytes_v1, byte_count) ||
+          byte_count > std::numeric_limits<std::size_t>::max() ||
+          !MakeAddressRange(
+              blocks[block]->data, static_cast<std::size_t>(byte_count),
+              outputs[output_count]) ||
+          Overlaps(outputs[output_count], encoded_range) ||
+          Overlaps(outputs[output_count], metadata_range))
+      {
+        return false;
+      }
+      for (std::size_t prior = 0; prior < output_count; ++prior)
+      {
+        if (Overlaps(outputs[output_count], outputs[prior])) { return false; }
+      }
+      ++output_count;
+    }
+  }
+  return true;
+}
+
 } // namespace codec_detail
 
 bool ValidCheckpointRuntimeIdentityV1(
@@ -850,7 +1188,7 @@ bool ScenarioCheckpointTimeMatchesV1(
 {
   if (!std::isfinite(time) || !std::isfinite(config.dt())) { return false; }
   const double expected =
-      static_cast<double>(config.checkpoint_step()) * config.dt();
+      static_cast<double>(config.scenario_checkpoint_step()) * config.dt();
   if (!std::isfinite(expected)) { return false; }
   const double scale = std::max(1.0, std::abs(expected));
   return std::abs(time - expected) <=
@@ -972,8 +1310,10 @@ CheckpointCodecStatus ValidateSameTupleRestartV1(
       checkpoint.layout != expected_resources.layout ||
       checkpoint.layout != expected_config.layout_id() ||
       checkpoint.precision != expected_config.tuple().precision ||
-      checkpoint.coordinates.step != expected_config.checkpoint_step() ||
-      checkpoint.coordinates.cursor != expected_config.checkpoint_step() ||
+      checkpoint.coordinates.step !=
+          expected_config.scenario_checkpoint_step() ||
+      checkpoint.coordinates.cursor !=
+          expected_config.scenario_checkpoint_step() ||
       !ScenarioCheckpointTimeMatchesV1(checkpoint.coordinates.time,
                                        expected_config) ||
       codec_detail::DoubleBits(checkpoint.dt) !=
@@ -1005,7 +1345,9 @@ CheckpointCodecStatus EncodeCheckpointV1(
         captured_descriptor.rank_count !=
             config.deferred_runtime().required_mpi_rank_count ||
         captured_descriptor.polynomial_order != config.polynomial_order() ||
-        captured_descriptor.coordinates.step != config.checkpoint_step())
+        captured_descriptor.coordinates.step !=
+            config.scenario_checkpoint_step() ||
+        config.run_role() != ApplicationRunRoleV1::split_writer)
     {
       return CheckpointCodecStatus::invalid_descriptor;
     }
@@ -1052,12 +1394,16 @@ CheckpointCodecStatus EncodeCheckpointV1(
 
     Writer writer;
     writer.Bytes(magic.data(), magic.size());
-    writer.UnsignedLittleEndian(application_checkpoint_codec_version_v1);
+    writer.UnsignedLittleEndian(application_checkpoint_codec_version_v2);
     writer.UnsignedLittleEndian(std::uint64_t{0});
     const StableIdentity partition_layout_rule =
         StableIdentity::Copy(checkpoint_partition_layout_rule_id_v1);
-    if (!WriteConfig(writer, config) ||
-        !writer.Identity(runtime.physical_gpu_uuid) ||
+    if (!WriteConfig(writer, config))
+    {
+      return CheckpointCodecStatus::invalid_config_identity;
+    }
+    WriteRestartDeltaManifestV2(writer, config);
+    if (!writer.Identity(runtime.physical_gpu_uuid) ||
         !writer.Identity(partition_layout_rule))
     {
       return CheckpointCodecStatus::invalid_config_identity;
@@ -1119,6 +1465,16 @@ CheckpointCodecStatus DecodeCheckpointV1(
 {
   using namespace codec_detail;
   if (!encoded.Valid()) { return CheckpointCodecStatus::invalid_argument; }
+  AddressRange encoded_range{};
+  AddressRange output_metadata_range{};
+  if (encoded.size != 0 &&
+      (!MakeAddressRange(encoded.data, encoded.size, encoded_range) ||
+       !MakeAddressRange(&output_metadata, sizeof(output_metadata),
+                         output_metadata_range) ||
+       Overlaps(encoded_range, output_metadata_range)))
+  {
+    return CheckpointCodecStatus::output_buffer_overlap;
+  }
   if (encoded.size < prefix_size + checksum_size)
   {
     return CheckpointCodecStatus::truncated;
@@ -1135,7 +1491,7 @@ CheckpointCodecStatus DecodeCheckpointV1(
   {
     return CheckpointCodecStatus::truncated;
   }
-  if (version != application_checkpoint_codec_version_v1)
+  if (version != application_checkpoint_codec_version_v2)
   {
     return CheckpointCodecStatus::unsupported_version;
   }
@@ -1158,10 +1514,12 @@ CheckpointCodecStatus DecodeCheckpointV1(
   Reader reader(encoded.data, content_size);
   if (!reader.Skip(prefix_size)) { return CheckpointCodecStatus::truncated; }
   ArtifactConfig artifact_config{};
+  RestartDeltaManifestV2 restart_delta{};
   CheckpointRuntimeIdentityV1 artifact_runtime{};
   StableIdentity artifact_partition_layout_rule{};
   CheckpointDescriptor descriptor{};
   if (!ReadConfig(reader, artifact_config) ||
+      !ReadRestartDeltaManifestV2(reader, restart_delta) ||
       !reader.Identity(artifact_runtime.physical_gpu_uuid) ||
       !reader.Identity(artifact_partition_layout_rule) ||
       !reader.Hash(artifact_runtime.ownership_hash) ||
@@ -1169,7 +1527,8 @@ CheckpointCodecStatus DecodeCheckpointV1(
   {
     return CheckpointCodecStatus::truncated;
   }
-  if (!ConfigMatches(artifact_config, expected_config))
+  if (!ConfigMatchesSplitRestart(artifact_config, restart_delta,
+                                 expected_config))
   {
     return CheckpointCodecStatus::invalid_config_identity;
   }
@@ -1259,6 +1618,11 @@ CheckpointCodecStatus DecodeCheckpointV1(
       return CheckpointCodecStatus::output_buffer_mismatch;
     }
   }
+  if (!DecodeDestinationsAreDisjoint(encoded, rank_buffers, rank_count,
+                                     metadata, output_metadata))
+  {
+    return CheckpointCodecStatus::output_buffer_overlap;
+  }
   if (summed_interior != aggregate_interior_count ||
       summed_trace != aggregate_trace_count ||
       aggregate_interior_count !=
@@ -1302,9 +1666,13 @@ CheckpointCodecStatus DecodeCheckpointV1(
   candidate_metadata.physical_gpu_uuid = artifact_runtime.physical_gpu_uuid;
   candidate_metadata.partition_layout_rule_id =
       artifact_partition_layout_rule;
+  candidate_metadata.writer_run_role = artifact_config.run_role;
   candidate_metadata.scientific_config_sha256 =
       artifact_config.scientific_config_sha256;
-  candidate_metadata.run_config_sha256 = artifact_config.run_config_sha256;
+  candidate_metadata.writer_run_config_sha256 =
+      artifact_config.writer_run_config_sha256;
+  candidate_metadata.reader_run_config_sha256 =
+      expected_config.run_config_sha256();
   candidate_metadata.ownership_hash = artifact_runtime.ownership_hash;
   candidate_metadata.mesh_n = artifact_config.mesh_n;
   candidate_metadata.rank_count = rank_count;

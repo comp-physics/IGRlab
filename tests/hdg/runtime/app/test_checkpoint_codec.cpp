@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -22,10 +23,11 @@ using namespace dg::hdg::runtime::app;
 
 static_assert(__cplusplus == DG_IGR_HDG_RUNTIME_EXPECTED_CPLUSPLUS,
               "checkpoint codec test must compile in strict C++17");
-static_assert(application_checkpoint_max_rank_count_v1 == 2 &&
+static_assert(application_checkpoint_codec_version_v2 == 2 &&
+                  application_checkpoint_max_rank_count_v1 == 2 &&
                   euler_state_component_count_v1 == 4 &&
                   fp64_coefficient_bytes_v1 == 8,
-              "v1 rank, component, and binary64 bounds are exact");
+              "v2 version and rank, component, binary64 bounds are exact");
 static_assert(!std::is_default_constructible<CapturedCheckpointV1>::value &&
                   std::is_copy_constructible<CapturedCheckpointV1>::value,
               "capture is live-contract-originated but repeatably encodable");
@@ -430,12 +432,35 @@ CheckpointRuntimeIdentityV1 TestRuntimeIdentity()
   return identity;
 }
 
-ApplicationValidation TestValidation(const std::string_view backend)
+ApplicationOptionsView TestOptions(const std::string_view backend)
 {
   ApplicationOptionsView options;
   options.backend_id = backend;
-  options.scientific_config_sha256 = FilledHash(0x90);
-  options.run_config_sha256 = FilledHash(0xb0);
+  return options;
+}
+
+ApplicationValidation TestValidation(const std::string_view backend)
+{
+  ApplicationOptionsView options = TestOptions(backend);
+  options.run_role = ApplicationRunRoleV1::split_writer;
+  options.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+  return ValidateApplicationOptions(options);
+}
+
+ApplicationValidation TestReaderValidation(const std::string_view backend)
+{
+  ApplicationOptionsView options = TestOptions(backend);
+  const std::string_view artifact = options.checkpoint_out.canonical;
+  options.run_role = ApplicationRunRoleV1::split_reader;
+  options.checkpoint_out = {};
+  options.checkpoint_step = {};
+  options.restart_from = CheckpointArtifactPathV1::Present(artifact);
+  options.injection = {
+      FailureInjectionModeV1::prescribed,
+      smooth_periodic_euler_v1_failure_phase,
+      smooth_periodic_euler_v1_smoke_failure_target_step,
+      backend == CpuRank2BackendTag::id ? 1U : 0U};
+  options.retry_limit = smooth_periodic_euler_v1_retry_limit;
   return ValidateApplicationOptions(options);
 }
 
@@ -597,6 +622,201 @@ void WriteU64(std::vector<std::uint8_t>& bytes,
   }
 }
 
+void AppendU16(std::vector<std::uint8_t>& bytes, const std::uint16_t value)
+{
+  bytes.push_back(static_cast<std::uint8_t>(value));
+  bytes.push_back(static_cast<std::uint8_t>(value >> 8U));
+}
+
+void AppendHash(std::vector<std::uint8_t>& bytes, const StateHash& hash)
+{
+  bytes.insert(bytes.end(), hash.bytes.begin(), hash.bytes.end());
+}
+
+void AppendIdentity(std::vector<std::uint8_t>& bytes,
+                    const StableIdentity& identity)
+{
+  AppendU16(bytes, static_cast<std::uint16_t>(identity.size()));
+  const auto* first = reinterpret_cast<const std::uint8_t*>(identity.data());
+  bytes.insert(bytes.end(), first, first + identity.size());
+}
+
+template <typename Path>
+void AppendPath(std::vector<std::uint8_t>& bytes, const Path& path)
+{
+  bytes.push_back(path.present() ? 1U : 0U);
+  if (path.present()) { AppendIdentity(bytes, path.identity()); }
+}
+
+void AppendOptionalStep(std::vector<std::uint8_t>& bytes,
+                        const OptionalCheckpointStepV1 step)
+{
+  bytes.push_back(step.present ? 1U : 0U);
+  AppendU64(bytes, step.value);
+}
+
+void AppendInjection(std::vector<std::uint8_t>& bytes,
+                     const FailureInjectionControlV1 injection)
+{
+  bytes.push_back(static_cast<std::uint8_t>(injection.mode));
+  bytes.push_back(static_cast<std::uint8_t>(injection.phase));
+  AppendU64(bytes, injection.target_step);
+  AppendU32(bytes, injection.source_rank);
+}
+
+void AppendDescriptor(std::vector<std::uint8_t>& bytes,
+                      const CheckpointDescriptor& descriptor)
+{
+  AppendU32(bytes, descriptor.schema_version);
+  bytes.push_back(descriptor.successful_commit ? 1U : 0U);
+  bytes.push_back(static_cast<std::uint8_t>(descriptor.restart_mode));
+  for (const StableIdentity* identity :
+       {&descriptor.tuple.model, &descriptor.tuple.formulation,
+        &descriptor.tuple.trace, &descriptor.tuple.stabilization,
+        &descriptor.tuple.time_treatment, &descriptor.tuple.backend,
+        &descriptor.tuple.precision, &descriptor.mfem_pin})
+  {
+    AppendIdentity(bytes, *identity);
+  }
+  AppendHash(bytes, descriptor.mesh_hash);
+  AppendHash(bytes, descriptor.partition_hash);
+  AppendHash(bytes, descriptor.topology_hash);
+  AppendU32(bytes, descriptor.rank_count);
+  AppendU32(bytes, static_cast<std::uint32_t>(descriptor.polynomial_order));
+  AppendIdentity(bytes, descriptor.layout);
+  AppendIdentity(bytes, descriptor.precision);
+  AppendU64(bytes, descriptor.cursor);
+  AppendU64(bytes, OracleBits(descriptor.dt));
+  AppendU64(bytes, OracleBits(descriptor.coordinates.time));
+  AppendU64(bytes, descriptor.coordinates.step);
+  AppendU64(bytes, descriptor.coordinates.generation);
+  AppendU64(bytes, descriptor.coordinates.cursor);
+  AppendU64(bytes, OracleBits(descriptor.coordinates.dt));
+  AppendU64(bytes, descriptor.coordinate_fingerprint);
+  AppendHash(bytes, descriptor.interior_hash);
+  AppendHash(bytes, descriptor.trace_hash);
+}
+
+std::vector<std::uint8_t> IndependentGoldenV2(
+    const ValidatedApplicationConfig& config,
+    const CheckpointRuntimeIdentityV1& runtime,
+    const CheckpointDescriptor& descriptor,
+    const CoefficientFixture& fixture)
+{
+  const std::array<std::uint8_t, 16> magic{{
+      'D', 'G', 'I', 'G', 'R', '-', 'H', 'D', 'G', '-', 'M', 'E', 'M', 'V',
+      '2', 0}};
+  std::vector<std::uint8_t> bytes(magic.begin(), magic.end());
+  AppendU32(bytes, application_checkpoint_codec_version_v2);
+  AppendU64(bytes, 0);
+  for (const StableIdentity* identity :
+       {&config.card_id(), &config.case_id(), &config.scenario_id(),
+        &config.checkpoint_id(), &config.mesh_family_id(), &config.source_id(),
+        &config.flux_id(), &config.time_rule_id(), &config.layout_id()})
+  {
+    AppendIdentity(bytes, *identity);
+  }
+  AppendHash(bytes, config.scientific_config_sha256());
+  AppendHash(bytes, config.run_config_sha256());
+  bytes.push_back(static_cast<std::uint8_t>(config.scenario()));
+  bytes.push_back(static_cast<std::uint8_t>(config.backend()));
+  bytes.push_back(static_cast<std::uint8_t>(config.interior_space()));
+  AppendU32(bytes, config.deferred_runtime().required_mpi_rank_count);
+  bytes.push_back(static_cast<std::uint8_t>(
+      config.deferred_runtime().gpu_rule));
+  bytes.push_back(static_cast<std::uint8_t>(
+      config.deferred_runtime().source_rank_rule));
+  AppendU32(bytes,
+            config.deferred_runtime().required_injected_source_rank);
+  AppendU32(bytes, config.mesh_n());
+  AppendU32(bytes, static_cast<std::uint32_t>(config.polynomial_order()));
+  AppendU32(bytes, static_cast<std::uint32_t>(config.q_a()));
+  AppendU32(bytes, static_cast<std::uint32_t>(config.q_e()));
+  AppendU32(bytes, static_cast<std::uint32_t>(config.q_e4()));
+  AppendU32(bytes, static_cast<std::uint32_t>(config.q_o()));
+  AppendU64(bytes, OracleBits(config.gamma()));
+  AppendU64(bytes, OracleBits(config.tau()));
+  AppendU64(bytes, OracleBits(config.dt()));
+  AppendU64(bytes, config.accepted_steps());
+  AppendU64(bytes, OracleBits(config.final_time()));
+  for (const std::uint64_t step : config.output_steps())
+  {
+    AppendU64(bytes, step);
+  }
+  AppendU64(bytes, config.scenario_checkpoint_step());
+  bytes.push_back(static_cast<std::uint8_t>(config.run_role()));
+  AppendPath(bytes, config.output_directory());
+  AppendPath(bytes, config.evidence_directory());
+  bytes.push_back(static_cast<std::uint8_t>(config.validation_capture()));
+  AppendPath(bytes, config.checkpoint_out());
+  AppendOptionalStep(bytes, config.checkpoint_step());
+  AppendPath(bytes, config.restart_from());
+  bytes.push_back(static_cast<std::uint8_t>(config.stop_after_checkpoint()));
+  AppendInjection(bytes, config.injection());
+  bytes.push_back(static_cast<std::uint8_t>(config.restart_mode()));
+  bytes.push_back(static_cast<std::uint8_t>(config.restart_trajectory()));
+  bytes.push_back(static_cast<std::uint8_t>(config.rollback_obligation()));
+  bytes.push_back(static_cast<std::uint8_t>(config.source_rank_rule()));
+  AppendU32(bytes, config.retry_limit());
+  AppendU64(bytes, config.seed());
+
+  bytes.push_back(1); // v2 restart-delta schema
+  bytes.push_back(6); // exact field count
+  bytes.push_back(1);
+  bytes.push_back(static_cast<std::uint8_t>(ApplicationRunRoleV1::split_writer));
+  bytes.push_back(static_cast<std::uint8_t>(ApplicationRunRoleV1::split_reader));
+  bytes.push_back(2);
+  bytes.push_back(1);
+  bytes.push_back(3);
+  AppendOptionalStep(bytes, OptionalCheckpointStepV1::Present(
+                                config.scenario_checkpoint_step()));
+  AppendOptionalStep(bytes, {});
+  bytes.push_back(4);
+  bytes.push_back(static_cast<std::uint8_t>(StopAfterCheckpointV1::yes));
+  bytes.push_back(static_cast<std::uint8_t>(StopAfterCheckpointV1::no));
+  bytes.push_back(5);
+  AppendInjection(bytes, {});
+  AppendInjection(bytes,
+                  {FailureInjectionModeV1::prescribed,
+                   smooth_periodic_euler_v1_failure_phase,
+                   smooth_periodic_euler_v1_smoke_failure_target_step,
+                   config.deferred_runtime().required_injected_source_rank});
+  bytes.push_back(6);
+  AppendU32(bytes, 0);
+  AppendU32(bytes, smooth_periodic_euler_v1_retry_limit);
+
+  AppendIdentity(bytes, runtime.physical_gpu_uuid);
+  AppendIdentity(bytes,
+                 StableIdentity::Copy(checkpoint_partition_layout_rule_id_v1));
+  AppendHash(bytes, runtime.ownership_hash);
+  AppendDescriptor(bytes, descriptor);
+  AppendU32(bytes, 1);
+  AppendU64(bytes, fixture.interior.size());
+  AppendU64(bytes, fixture.trace.size());
+  const StateHash interior_hash = OracleCoefficientHash(fixture.interior);
+  const StateHash trace_hash = OracleCoefficientHash(fixture.trace);
+  AppendU32(bytes, 0);
+  for (const auto& block :
+       std::array<std::pair<const State*, StateHash>, 2>{{
+           {&fixture.interior, interior_hash}, {&fixture.trace, trace_hash}}})
+  {
+    AppendU32(bytes, 4);
+    AppendU64(bytes, block.first->size());
+    AppendU64(bytes, block.first->size() / 4);
+    bytes.push_back(
+        static_cast<std::uint8_t>(CoefficientOrderingV1::component_major));
+    AppendU64(bytes, block.first->size() * sizeof(double));
+    AppendHash(bytes, block.second);
+  }
+  for (const State* state : {&fixture.interior, &fixture.trace})
+  {
+    for (const double value : *state) { AppendU64(bytes, OracleBits(value)); }
+  }
+  WriteU64(bytes, 20, bytes.size() + StateHash{}.bytes.size());
+  AppendHash(bytes, OracleHash(bytes.data(), bytes.size()));
+  return bytes;
+}
+
 std::uint64_t OracleCoordinateFingerprint(
     const StateCoordinates& coordinates) noexcept
 {
@@ -632,6 +852,8 @@ struct NamedOffset
 struct LayoutOffsets
 {
   std::vector<NamedOffset> exact_fields{};
+  std::size_t config_run_hash = 0;
+  std::size_t output_directory_identity = 0;
   std::size_t descriptor_interior_hash = 0;
   std::size_t descriptor_coordinate_time = 0;
   std::size_t descriptor_coordinate_fingerprint = 0;
@@ -657,6 +879,16 @@ std::size_t IdentityField(const std::vector<std::uint8_t>& bytes,
   return offset + 2 + size;
 }
 
+std::size_t PathField(const std::vector<std::uint8_t>& bytes,
+                      std::size_t offset,
+                      const char* name,
+                      std::vector<NamedOffset>& fields)
+{
+  fields.push_back({name, offset});
+  const bool present = bytes[offset++] != 0;
+  return present ? IdentityField(bytes, offset, name, fields) : offset;
+}
+
 LayoutOffsets Locate(const std::vector<std::uint8_t>& bytes)
 {
   LayoutOffsets layout{};
@@ -671,23 +903,51 @@ LayoutOffsets Locate(const std::vector<std::uint8_t>& bytes)
   for (const char* name : {"config.scientific-sha", "config.run-sha"})
   {
     layout.exact_fields.push_back({name, offset});
+    if (std::string_view{name} == "config.run-sha")
+    {
+      layout.config_run_hash = offset;
+    }
     offset += 32;
   }
-  const std::array<std::pair<const char*, std::size_t>, 24> config_scalars{{
-      {"config.scenario-enum", 1}, {"config.interior-space", 1},
-      {"config.mesh-n", 4},
+  const std::array<std::pair<const char*, std::size_t>, 23> config_scalars{{
+      {"config.scenario-enum", 1}, {"config.backend", 1},
+      {"config.interior-space", 1}, {"config.deferred-ranks", 4},
+      {"config.deferred-gpu", 1}, {"config.deferred-source-rule", 1},
+      {"config.deferred-source-rank", 4}, {"config.mesh-n", 4},
       {"config.p", 4},             {"config.qA", 4},
       {"config.qE", 4},            {"config.qE4", 4},
       {"config.qO", 4},            {"config.gamma", 8},
       {"config.tau", 8},           {"config.dt", 8},
       {"config.steps", 8},         {"config.final-time", 8},
       {"config.output-0", 8},      {"config.output-1", 8},
-      {"config.output-2", 8},      {"config.checkpoint-step", 8},
-      {"config.restart", 1},       {"config.trajectory", 1},
-      {"config.failure-commit", 8},{"config.failure-target", 8},
-      {"config.failure-phase", 1}, {"config.rollback", 1},
-      {"config.source-rule", 1}}};
+      {"config.output-2", 8},      {"config.scenario-checkpoint-step", 8},
+      {"config.writer-role", 1}}};
   for (const auto& field : config_scalars)
+  {
+    layout.exact_fields.push_back({field.first, offset});
+    offset += field.second;
+  }
+  layout.output_directory_identity = offset + 3;
+  offset = PathField(bytes, offset, "config.output-directory",
+                     layout.exact_fields);
+  offset = PathField(bytes, offset, "config.evidence-directory",
+                     layout.exact_fields);
+  layout.exact_fields.push_back({"config.capture", offset++});
+  offset = PathField(bytes, offset, "config.checkpoint-out",
+                     layout.exact_fields);
+  layout.exact_fields.push_back({"config.checkpoint-step-present", offset});
+  ++offset;
+  layout.exact_fields.push_back({"config.checkpoint-step-value", offset});
+  offset += 8;
+  offset = PathField(bytes, offset, "config.restart-from",
+                     layout.exact_fields);
+  layout.exact_fields.push_back({"config.stop", offset++});
+  for (const auto& field :
+       std::array<std::pair<const char*, std::size_t>, 8>{{
+           {"config.injection-mode", 1}, {"config.injection-phase", 1},
+           {"config.injection-target", 8}, {"config.injection-source", 4},
+           {"config.restart", 1}, {"config.trajectory", 1},
+           {"config.rollback", 1}, {"config.source-rule", 1}}})
   {
     layout.exact_fields.push_back({field.first, offset});
     offset += field.second;
@@ -696,6 +956,32 @@ LayoutOffsets Locate(const std::vector<std::uint8_t>& bytes)
   offset += 4;
   layout.exact_fields.push_back({"config.seed", offset});
   offset += 8;
+
+  for (const auto& field :
+       std::array<std::pair<const char*, std::size_t>, 26>{{
+           {"delta.schema", 1}, {"delta.count", 1},
+           {"delta.role-field", 1}, {"delta.writer-role", 1},
+           {"delta.reader-role", 1}, {"delta.binding-field", 1},
+           {"delta.binding", 1}, {"delta.checkpoint-field", 1},
+           {"delta.writer-step-present", 1}, {"delta.writer-step", 8},
+           {"delta.reader-step-present", 1}, {"delta.reader-step", 8},
+           {"delta.stop-field", 1}, {"delta.writer-stop", 1},
+           {"delta.reader-stop", 1}, {"delta.injection-field", 1},
+           {"delta.writer-injection-mode", 1},
+           {"delta.writer-injection-phase", 1},
+           {"delta.writer-injection-target", 8},
+           {"delta.writer-injection-source", 4},
+           {"delta.reader-injection-mode", 1},
+           {"delta.reader-injection-phase", 1},
+           {"delta.reader-injection-target", 8},
+           {"delta.reader-injection-source", 4},
+           {"delta.retry-field", 1}, {"delta.writer-retry", 4}}})
+  {
+    layout.exact_fields.push_back({field.first, offset});
+    offset += field.second;
+  }
+  layout.exact_fields.push_back({"delta.reader-retry", offset});
+  offset += 4;
   offset = IdentityField(bytes, offset, "runtime.gpu-uuid",
                          layout.exact_fields);
   offset = IdentityField(bytes, offset, "runtime.partition-layout-rule",
@@ -831,7 +1117,8 @@ struct DecodeSentinel
     metadata.partition_layout_rule_id =
         StableIdentity::Copy("sentinel-partition-rule");
     metadata.scientific_config_sha256 = FilledHash(0xd0);
-    metadata.run_config_sha256 = FilledHash(0xe0);
+    metadata.writer_run_config_sha256 = FilledHash(0xe0);
+    metadata.reader_run_config_sha256 = FilledHash(0xe8);
     metadata.ownership_hash = FilledHash(0xf0);
     metadata.mesh_n = 99;
     metadata.rank_count = 88;
@@ -880,8 +1167,10 @@ bool SameMetadata(const DecodedCheckpointMetadataV1& left,
       left.checkpoint_id == right.checkpoint_id &&
       left.physical_gpu_uuid == right.physical_gpu_uuid &&
       left.partition_layout_rule_id == right.partition_layout_rule_id &&
+      left.writer_run_role == right.writer_run_role &&
       left.scientific_config_sha256 == right.scientific_config_sha256 &&
-      left.run_config_sha256 == right.run_config_sha256 &&
+      left.writer_run_config_sha256 == right.writer_run_config_sha256 &&
+      left.reader_run_config_sha256 == right.reader_run_config_sha256 &&
       left.ownership_hash == right.ownership_hash &&
       left.mesh_n == right.mesh_n && left.rank_count == right.rank_count &&
       left.aggregate_interior_coefficients ==
@@ -898,9 +1187,9 @@ bool SentinelUnchanged(const DecodeSentinel& value,
       SameMetadata(value.metadata, original.metadata);
 }
 
-// Filled from an independent fieldwise Python oracle after the format is
-// frozen.  The literal includes every artifact byte and the final SHA-256.
-constexpr std::string_view golden_artifact_hex =
+// Historical full-stream draft fixture retained to prove that v2 does not
+// silently accept the superseded v1 wire identity.
+constexpr std::string_view rejected_v1_artifact_hex =
     "44474947522d4844472d4d454d56310001000000de0d00000000000033006578702e6864672e65756c65722e636f6e76"
     "656e74696f6e616c2e736d6f6f74685f70657273697374656e742e7738612e76312100636f6e76656e74696f6e616c2d"
     "736d6f6f74682d70657273697374656e742d763109005738412d534d4f4b453400636865636b706f696e742e6864672e"
@@ -1169,8 +1458,15 @@ bool CheckRank2CaptureAndAllRankEvidence()
   const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
   const ApplicationValidation validation =
       TestValidation(CpuRank2BackendTag::id);
+  const ApplicationValidation reader_validation =
+      TestReaderValidation(CpuRank2BackendTag::id);
   const ValidatedApplicationConfig* config = validation.config();
-  if (config == nullptr) { return Check(false, "rank2_static_config_valid"); }
+  const ValidatedApplicationConfig* reader_config =
+      reader_validation.config();
+  if (config == nullptr || reader_config == nullptr)
+  {
+    return Check(false, "rank2_static_config_valid");
+  }
 
   const Slot committed0{fixture.interior[0], fixture.trace[0]};
   const Slot committed1{fixture.interior[1], fixture.trace[1]};
@@ -1237,7 +1533,8 @@ bool CheckRank2CaptureAndAllRankEvidence()
   Rank2DecodeOutput output;
   auto buffers = output.Buffers();
   passed = Check(DecodeCheckpointV1(
-                         {encoded.data(), encoded.size()}, *config, resources,
+                         {encoded.data(), encoded.size()}, *reader_config,
+                         resources,
                          runtime, buffers.data(), buffers.size(),
                          output.metadata) == CheckpointCodecStatus::ok &&
                      output.interior == fixture.interior &&
@@ -1268,23 +1565,45 @@ bool CheckGoldenRoundTrip()
   const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
   const ApplicationValidation validation =
       TestValidation(CpuSerialBackendTag::id);
+  const ApplicationValidation reader_validation =
+      TestReaderValidation(CpuSerialBackendTag::id);
   const ValidatedApplicationConfig* config = validation.config();
-  if (config == nullptr) { return Check(false, "golden_static_config"); }
+  const ValidatedApplicationConfig* reader_config =
+      reader_validation.config();
+  if (config == nullptr || reader_config == nullptr)
+  {
+    return Check(false, "golden_static_config");
+  }
   std::vector<std::uint8_t> encoded;
   bool passed = Check(EncodeFixture(fixture, *config, resources, runtime,
                                     encoded),
                       "golden_fixture_encodes");
-  const std::vector<std::uint8_t> golden = HexBytes(golden_artifact_hex);
+  const StateHash expected_interior = OracleCoefficientHash(fixture.interior);
+  const StateHash expected_trace = OracleCoefficientHash(fixture.trace);
+  CheckpointDescriptor expected_descriptor{};
+  const Slot committed{fixture.interior, fixture.trace};
+  Slot candidate{};
+  SerialContract contract(
+      committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
+  passed = Check(AdvanceOneCommit(contract) &&
+                     contract.TryMakeCheckpoint(expected_descriptor),
+                 "independent_expected_descriptor_available") &&
+      passed;
+  expected_descriptor.interior_hash =
+      OracleManifestHash(1, 1152, expected_interior);
+  expected_descriptor.trace_hash =
+      OracleManifestHash(2, 1152, expected_trace);
+  const std::vector<std::uint8_t> golden = IndependentGoldenV2(
+      *config, runtime, expected_descriptor, fixture);
   passed = Check(!golden.empty() && encoded == golden,
-                 "entire_artifact_matches_hard_coded_golden_stream") &&
+                 "entire_v2_artifact_matches_independent_fieldwise_golden") &&
       passed;
   passed = Check(encoded.size() > 64 && encoded[0] == 'D' &&
-                     encoded[16] == 1 && ReadU64(encoded, 20) == encoded.size(),
+                     encoded[14] == '2' && encoded[16] == 2 &&
+                     ReadU64(encoded, 20) == encoded.size(),
                  "independent_header_field_decode") &&
       passed;
 
-  const StateHash expected_interior = OracleCoefficientHash(fixture.interior);
-  const StateHash expected_trace = OracleCoefficientHash(fixture.trace);
   passed = Check(
                Hex(expected_interior) ==
                        "05bccc0bd8f36d56256ec2b51f43394c"
@@ -1316,24 +1635,12 @@ bool CheckGoldenRoundTrip()
   DecodeSentinel output;
   auto buffers = output.Buffers();
   passed = Check(DecodeCheckpointV1(
-                         {encoded.data(), encoded.size()}, *config, resources,
+                         {encoded.data(), encoded.size()}, *reader_config,
+                         resources,
                          runtime, buffers.data(), buffers.size(),
                          output.metadata) == CheckpointCodecStatus::ok,
                  "golden_artifact_decodes_into_preallocated_buffers") &&
       passed;
-  CheckpointDescriptor expected_descriptor{};
-  const Slot committed{fixture.interior, fixture.trace};
-  Slot candidate{};
-  SerialContract contract(
-      committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
-  passed = Check(AdvanceOneCommit(contract) &&
-                     contract.TryMakeCheckpoint(expected_descriptor),
-                 "independent_expected_descriptor_available") &&
-      passed;
-  expected_descriptor.interior_hash =
-      OracleManifestHash(1, 1152, expected_interior);
-  expected_descriptor.trace_hash =
-      OracleManifestHash(2, 1152, expected_trace);
   passed = Check(
                output.interior == fixture.interior &&
                    output.trace == fixture.trace &&
@@ -1349,16 +1656,21 @@ bool CheckGoldenRoundTrip()
                        checkpoint_partition_layout_rule_id_v1 &&
                    output.metadata.scientific_config_sha256 ==
                        config->scientific_config_sha256() &&
-                   output.metadata.run_config_sha256 ==
+                   output.metadata.writer_run_role ==
+                       ApplicationRunRoleV1::split_writer &&
+                   output.metadata.writer_run_config_sha256 ==
                        config->run_config_sha256() &&
+                   output.metadata.reader_run_config_sha256 ==
+                       reader_config->run_config_sha256() &&
+                   output.metadata.writer_run_config_sha256 !=
+                       output.metadata.reader_run_config_sha256 &&
                    output.metadata.ownership_hash == runtime.ownership_hash &&
                    output.metadata.mesh_n == 3 &&
                    output.metadata.rank_count == 1 &&
                    output.metadata.aggregate_interior_coefficients == 144 &&
                    output.metadata.aggregate_true_trace_coefficients == 144 &&
-                   Hex(output.metadata.artifact_hash) ==
-                       "b13e2e869287ea62be89252fb3e7c91e"
-                       "87c01291bea201f462e9c8780cfc120a",
+                   output.metadata.artifact_hash ==
+                       OracleHash(golden.data(), golden.size() - 32),
                "all_identity_descriptor_count_and_buffer_fields_decode") &&
       passed;
 
@@ -1367,7 +1679,8 @@ bool CheckGoldenRoundTrip()
   wrong_time.coordinate_fingerprint =
       OracleCoordinateFingerprint(wrong_time.coordinates);
   passed = Check(ValidateSameTupleRestartV1(
-                         wrong_time, *config, resources, runtime, runtime) ==
+                         wrong_time, *reader_config, resources, runtime,
+                         runtime) ==
                          CheckpointCodecStatus::invalid_descriptor,
                  "restart_validation_rejects_correlated_wrong_finite_time") &&
       passed;
@@ -1430,8 +1743,15 @@ bool CheckDecodeMutationCensusAndAtomicity()
   const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
   const ApplicationValidation validation =
       TestValidation(CpuSerialBackendTag::id);
+  const ApplicationValidation reader_validation =
+      TestReaderValidation(CpuSerialBackendTag::id);
   const ValidatedApplicationConfig* config = validation.config();
-  if (config == nullptr) { return Check(false, "mutation_static_config"); }
+  const ValidatedApplicationConfig* reader_config =
+      reader_validation.config();
+  if (config == nullptr || reader_config == nullptr)
+  {
+    return Check(false, "mutation_static_config");
+  }
   std::vector<std::uint8_t> encoded;
   if (!EncodeFixture(fixture, *config, resources, runtime, encoded))
   {
@@ -1446,7 +1766,7 @@ bool CheckDecodeMutationCensusAndAtomicity()
     const DecodeSentinel original = output;
     auto buffers = output.Buffers();
     const CheckpointCodecStatus status = DecodeCheckpointV1(
-        {bytes.data(), bytes.size()}, *config, resources, runtime,
+        {bytes.data(), bytes.size()}, *reader_config, resources, runtime,
         buffers.data(), buffers.size(), output.metadata);
     passed = Check(status == expected && SentinelUnchanged(output, original),
                    name) &&
@@ -1458,7 +1778,7 @@ bool CheckDecodeMutationCensusAndAtomicity()
     const DecodeSentinel original = output;
     auto buffers = output.Buffers();
     const CheckpointCodecStatus status = DecodeCheckpointV1(
-        {bytes.data(), bytes.size()}, *config, resources, runtime,
+        {bytes.data(), bytes.size()}, *reader_config, resources, runtime,
         buffers.data(), buffers.size(), output.metadata);
     passed = Check(status != CheckpointCodecStatus::ok &&
                        SentinelUnchanged(output, original),
@@ -1470,8 +1790,11 @@ bool CheckDecodeMutationCensusAndAtomicity()
   damaged[0] ^= 1U;
   expect_failure(damaged, CheckpointCodecStatus::invalid_magic,
                  "magic_mutation_is_failure_atomic");
+  expect_failure(HexBytes(rejected_v1_artifact_hex),
+                 CheckpointCodecStatus::invalid_magic,
+                 "draft_v1_magic_is_rejected");
   damaged = encoded;
-  damaged[16] = 2;
+  damaged[16] = 1;
   expect_failure(damaged, CheckpointCodecStatus::unsupported_version,
                  "version_mutation_is_failure_atomic");
   damaged = encoded;
@@ -1502,9 +1825,34 @@ bool CheckDecodeMutationCensusAndAtomicity()
     static_cast<void>(Seal(damaged));
     expect_any_failure(damaged, field.name);
   }
-  passed = Check(layout.exact_fields.size() == 84,
-                 "frozen_exact_field_mutation_census_is_84") &&
+  passed = Check(layout.exact_fields.size() == 129,
+                 "frozen_v2_exact_field_mutation_census_is_129") &&
       passed;
+
+  ApplicationOptionsView correlated_options =
+      TestOptions(CpuSerialBackendTag::id);
+  correlated_options.run_role = ApplicationRunRoleV1::split_writer;
+  correlated_options.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+  correlated_options.output_directory =
+      OutputDirectoryPathV1::Present("w8a/result");
+  const ApplicationValidation correlated_validation =
+      ValidateApplicationOptions(correlated_options);
+  const ValidatedApplicationConfig* correlated_config =
+      correlated_validation.config();
+  if (correlated_config == nullptr)
+  {
+    return Check(false, "correlated_writer_config_valid");
+  }
+  damaged = encoded;
+  const std::string_view correlated_path = "w8a/result";
+  std::copy(correlated_path.begin(), correlated_path.end(),
+            damaged.begin() + layout.output_directory_identity);
+  std::copy(correlated_config->run_config_sha256().bytes.begin(),
+            correlated_config->run_config_sha256().bytes.end(),
+            damaged.begin() + layout.config_run_hash);
+  static_cast<void>(Seal(damaged));
+  expect_failure(damaged, CheckpointCodecStatus::invalid_config_identity,
+                 "correlated_config_rehash_and_reseal_rejected");
 
   damaged = encoded;
   WriteU32(damaged, layout.manifest_rank_count,
@@ -1580,7 +1928,8 @@ bool CheckDecodeMutationCensusAndAtomicity()
   auto short_buffers = capacity_output.Buffers();
   short_buffers[0].interior.capacity = 143;
   passed = Check(DecodeCheckpointV1(
-                         {encoded.data(), encoded.size()}, *config, resources,
+                         {encoded.data(), encoded.size()}, *reader_config,
+                         resources,
                          runtime, short_buffers.data(), short_buffers.size(),
                          capacity_output.metadata) ==
                          CheckpointCodecStatus::output_buffer_mismatch &&
@@ -1594,13 +1943,109 @@ bool CheckDecodeMutationCensusAndAtomicity()
   const DecodeSentinel runtime_original = runtime_output;
   auto runtime_buffers = runtime_output.Buffers();
   passed = Check(DecodeCheckpointV1(
-                         {encoded.data(), encoded.size()}, *config, resources,
+                         {encoded.data(), encoded.size()}, *reader_config,
+                         resources,
                          wrong_runtime, runtime_buffers.data(),
                          runtime_buffers.size(), runtime_output.metadata) ==
                          CheckpointCodecStatus::invalid_runtime_identity &&
                      SentinelUnchanged(runtime_output, runtime_original),
                  "ownership_identity_checked_before_any_output_write") &&
       passed;
+
+  DecodeSentinel input_alias_output;
+  const DecodeSentinel input_alias_original = input_alias_output;
+  const std::vector<std::uint8_t> encoded_before_alias = encoded;
+  auto input_alias_buffers = input_alias_output.Buffers();
+  input_alias_buffers[0].interior.data =
+      reinterpret_cast<double*>(encoded.data());
+  passed = Check(DecodeCheckpointV1(
+                         {encoded.data(), encoded.size()}, *reader_config,
+                         resources, runtime, input_alias_buffers.data(),
+                         input_alias_buffers.size(),
+                         input_alias_output.metadata) ==
+                         CheckpointCodecStatus::output_buffer_overlap &&
+                     encoded == encoded_before_alias &&
+                     SentinelUnchanged(input_alias_output,
+                                       input_alias_original),
+                 "encoded_input_output_alias_rejected") &&
+      passed;
+
+  DecodeSentinel metadata_output_alias;
+  const DecodeSentinel metadata_output_original = metadata_output_alias;
+  auto metadata_output_buffers = metadata_output_alias.Buffers();
+  metadata_output_buffers[0].interior.data =
+      reinterpret_cast<double*>(&metadata_output_alias.metadata);
+  passed = Check(DecodeCheckpointV1(
+                         {encoded.data(), encoded.size()}, *reader_config,
+                         resources, runtime, metadata_output_buffers.data(),
+                         metadata_output_buffers.size(),
+                         metadata_output_alias.metadata) ==
+                         CheckpointCodecStatus::output_buffer_overlap &&
+                     SentinelUnchanged(metadata_output_alias,
+                                       metadata_output_original),
+                 "metadata_output_alias_rejected") &&
+      passed;
+
+  DecodeSentinel output_alias;
+  const DecodeSentinel output_alias_original = output_alias;
+  State overlapping_storage(288, -7.0);
+  const State overlapping_original = overlapping_storage;
+  auto output_alias_buffers = output_alias.Buffers();
+  output_alias_buffers[0].interior.data = overlapping_storage.data();
+  output_alias_buffers[0].owned_true_trace.data =
+      overlapping_storage.data() + 72;
+  passed = Check(DecodeCheckpointV1(
+                         {encoded.data(), encoded.size()}, *reader_config,
+                         resources, runtime, output_alias_buffers.data(),
+                         output_alias_buffers.size(), output_alias.metadata) ==
+                         CheckpointCodecStatus::output_buffer_overlap &&
+                     overlapping_storage == overlapping_original &&
+                     SentinelUnchanged(output_alias, output_alias_original),
+                 "partially_overlapping_outputs_rejected") &&
+      passed;
+
+  DecodeSentinel overflow_output;
+  const DecodeSentinel overflow_original = overflow_output;
+  auto overflow_buffers = overflow_output.Buffers();
+  overflow_buffers[0].interior.data = reinterpret_cast<double*>(
+      std::numeric_limits<std::uintptr_t>::max() - 7U);
+  passed = Check(DecodeCheckpointV1(
+                         {encoded.data(), encoded.size()}, *reader_config,
+                         resources, runtime, overflow_buffers.data(),
+                         overflow_buffers.size(), overflow_output.metadata) ==
+                         CheckpointCodecStatus::output_buffer_overlap &&
+                     SentinelUnchanged(overflow_output, overflow_original),
+                 "synthetic_output_address_overflow_rejected") &&
+      passed;
+
+  const std::size_t alias_words =
+      (encoded.size() + sizeof(std::max_align_t) - 1) /
+          sizeof(std::max_align_t) +
+      1;
+  std::vector<std::max_align_t> metadata_input_storage(alias_words);
+  auto* metadata_input_bytes = reinterpret_cast<std::uint8_t*>(
+      metadata_input_storage.data());
+  std::memcpy(metadata_input_bytes, encoded.data(), encoded.size());
+  auto* overlapping_metadata =
+      ::new (static_cast<void*>(metadata_input_bytes))
+          DecodedCheckpointMetadataV1{};
+  overlapping_metadata->card_id = StableIdentity::Copy("alias-sentinel");
+  const DecodedCheckpointMetadataV1 overlapping_metadata_original =
+      *overlapping_metadata;
+  DecodeSentinel metadata_input_output;
+  auto metadata_input_buffers = metadata_input_output.Buffers();
+  passed = Check(DecodeCheckpointV1(
+                         {metadata_input_bytes, encoded.size()},
+                         *reader_config, resources, runtime,
+                         metadata_input_buffers.data(),
+                         metadata_input_buffers.size(),
+                         *overlapping_metadata) ==
+                         CheckpointCodecStatus::output_buffer_overlap &&
+                     SameMetadata(*overlapping_metadata,
+                                  overlapping_metadata_original),
+                 "metadata_encoded_input_alias_rejected_before_parse") &&
+      passed;
+  overlapping_metadata->~DecodedCheckpointMetadataV1();
   return passed;
 }
 

@@ -1,6 +1,7 @@
 #include "numerics/hdg/runtime/app/application_contract.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 
@@ -22,10 +23,164 @@ namespace dg::hdg::runtime::app
 namespace
 {
 
-bool NonzeroHash(const StateHash& hash) noexcept
+class CanonicalHashWriter final
 {
-  return std::any_of(hash.bytes.begin(), hash.bytes.end(),
-                     [](const std::uint8_t value) { return value != 0; });
+public:
+  bool U8(const std::uint8_t value) noexcept
+  {
+    return hash_.Update(&value, sizeof(value));
+  }
+
+  template <typename Unsigned>
+  bool UnsignedLittleEndian(const Unsigned value) noexcept
+  {
+    static_assert(std::is_unsigned<Unsigned>::value,
+                  "canonical application hashing requires unsigned fields");
+    std::array<std::uint8_t, sizeof(Unsigned)> bytes{};
+    for (std::size_t index = 0; index < bytes.size(); ++index)
+    {
+      bytes[index] = static_cast<std::uint8_t>(value >> (8U * index));
+    }
+    return hash_.Update(bytes.data(), bytes.size());
+  }
+
+  bool Text(const std::string_view value) noexcept
+  {
+    return value.size() <= std::numeric_limits<std::uint32_t>::max() &&
+        UnsignedLittleEndian(static_cast<std::uint32_t>(value.size())) &&
+        hash_.Update(value);
+  }
+
+  bool Hash(const StateHash& value) noexcept
+  {
+    return hash_.Update(value.bytes.data(), value.bytes.size());
+  }
+
+  bool Finalize(StateHash& value) noexcept
+  {
+    Sha256Digest digest{};
+    if (!hash_.Finalize(digest)) { return false; }
+    value.bytes = digest;
+    return true;
+  }
+
+private:
+  Sha256 hash_{};
+};
+
+struct ApplicationConfigHashes
+{
+  StateHash scientific{};
+  StateHash run{};
+};
+
+template <typename Path>
+bool CanonicalPathViewValid(const Path& path) noexcept
+{
+  const StableIdentity copied = StableIdentity::Copy(path.canonical);
+  return path.present
+      ? copied.valid() && !copied.empty()
+      : path.canonical.empty();
+}
+
+template <typename Path>
+bool HashPath(CanonicalHashWriter& writer,
+              const std::string_view domain,
+              const Path& path) noexcept
+{
+  return writer.Text(domain) && writer.U8(path.present ? 1U : 0U) &&
+      (!path.present || writer.Text(path.canonical));
+}
+
+bool HashTuple(CanonicalHashWriter& writer,
+               const RuntimeTupleDescriptor& tuple) noexcept
+{
+  return writer.Text(tuple.model.view()) &&
+      writer.Text(tuple.formulation.view()) &&
+      writer.Text(tuple.trace.view()) &&
+      writer.Text(tuple.stabilization.view()) &&
+      writer.Text(tuple.time_treatment.view()) &&
+      writer.Text(tuple.backend.view()) && writer.Text(tuple.precision.view());
+}
+
+bool ComputeApplicationConfigHashes(
+    const ApplicationOptionsView& options,
+    const ApplicationScenarioV1 scenario,
+    const ApplicationBackend backend,
+    const RuntimeTupleDescriptor& tuple,
+    const DeferredRuntimePredicatesV1& deferred,
+    ApplicationConfigHashes& hashes) noexcept
+{
+  CanonicalHashWriter scientific;
+  if (!scientific.Text("DGIGR-HDG-W8A-SCIENTIFIC-CONFIG-V1") ||
+      !scientific.Text(options.card_id) || !scientific.Text(options.case_id) ||
+      !scientific.U8(static_cast<std::uint8_t>(scenario)) ||
+      !scientific.U8(static_cast<std::uint8_t>(options.interior_space)) ||
+      !scientific.Text(options.mesh_family_id) ||
+      !scientific.UnsignedLittleEndian(
+          static_cast<std::uint32_t>(options.polynomial_order)) ||
+      !scientific.UnsignedLittleEndian(options.mesh_n) ||
+      !scientific.UnsignedLittleEndian(
+          ::dg::hdg::runtime::detail::DoubleBits(options.dt)) ||
+      !scientific.UnsignedLittleEndian(options.accepted_steps) ||
+      !scientific.UnsignedLittleEndian(
+          ::dg::hdg::runtime::detail::DoubleBits(options.final_time)) ||
+      !scientific.U8(static_cast<std::uint8_t>(backend)) ||
+      !scientific.UnsignedLittleEndian(deferred.required_mpi_rank_count) ||
+      !scientific.U8(static_cast<std::uint8_t>(deferred.gpu_rule)) ||
+      !scientific.UnsignedLittleEndian(
+          ::dg::hdg::runtime::detail::DoubleBits(options.gamma)) ||
+      !scientific.UnsignedLittleEndian(
+          ::dg::hdg::runtime::detail::DoubleBits(options.tau)) ||
+      !scientific.UnsignedLittleEndian(
+          static_cast<std::uint32_t>(options.q_a)) ||
+      !scientific.UnsignedLittleEndian(
+          static_cast<std::uint32_t>(options.q_e)) ||
+      !scientific.UnsignedLittleEndian(
+          static_cast<std::uint32_t>(options.q_e4)) ||
+      !scientific.UnsignedLittleEndian(
+          static_cast<std::uint32_t>(options.q_o)) ||
+      !scientific.Text(options.source_id) ||
+      !scientific.Text(options.flux_id) ||
+      !scientific.Text(options.time_rule_id) ||
+      !scientific.Text(options.layout_id) || !HashTuple(scientific, tuple) ||
+      !scientific.Finalize(hashes.scientific))
+  {
+    return false;
+  }
+
+  CanonicalHashWriter run;
+  if (!run.Text("DGIGR-HDG-W8A-RUN-CONFIG-V1") ||
+      !run.Hash(hashes.scientific) ||
+      !run.U8(static_cast<std::uint8_t>(options.run_role)) ||
+      !HashPath(run, "output-directory", options.output_directory) ||
+      !HashPath(run, "evidence-directory", options.evidence_directory) ||
+      !run.U8(static_cast<std::uint8_t>(options.validation_capture)) ||
+      !HashPath(run, "checkpoint-artifact-out", options.checkpoint_out) ||
+      !run.U8(options.checkpoint_step.present ? 1U : 0U) ||
+      (options.checkpoint_step.present &&
+       !run.UnsignedLittleEndian(options.checkpoint_step.value)) ||
+      !HashPath(run, "checkpoint-artifact-restart", options.restart_from) ||
+      !run.U8(static_cast<std::uint8_t>(options.stop_after_checkpoint)) ||
+      !run.U8(static_cast<std::uint8_t>(options.injection.mode)) ||
+      !run.U8(static_cast<std::uint8_t>(options.injection.phase)) ||
+      !run.UnsignedLittleEndian(options.injection.target_step) ||
+      !run.UnsignedLittleEndian(options.injection.source_rank) ||
+      !run.U8(static_cast<std::uint8_t>(options.restart_mode)) ||
+      !run.U8(static_cast<std::uint8_t>(options.restart_trajectory)) ||
+      !run.U8(static_cast<std::uint8_t>(options.rollback_obligation)) ||
+      !run.U8(static_cast<std::uint8_t>(options.source_rank_rule)) ||
+      !run.UnsignedLittleEndian(options.retry_limit) ||
+      !run.UnsignedLittleEndian(options.seed) ||
+      !run.Text(options.checkpoint_id))
+  {
+    return false;
+  }
+  for (const std::uint64_t step : options.output_steps)
+  {
+    if (!run.UnsignedLittleEndian(step)) { return false; }
+  }
+  return run.Finalize(hashes.run);
 }
 
 bool ExactFrozenTuple(const ApplicationOptionsView& options) noexcept
@@ -111,6 +266,171 @@ bool ExactEndTime(const ApplicationOptionsView& options) noexcept
       8.0 * std::numeric_limits<double>::epsilon() * scale;
 }
 
+bool CanonicalOffInjection(
+    const FailureInjectionControlV1& injection) noexcept
+{
+  return injection.mode == FailureInjectionModeV1::off &&
+      injection.phase == FailurePhase::Setup && injection.target_step == 0 &&
+      injection.source_rank == 0;
+}
+
+bool FocusedInjectionPhase(const FailurePhase phase) noexcept
+{
+  switch (phase)
+  {
+    case FailurePhase::Assembly:
+    case FailurePhase::Condensation:
+    case FailurePhase::TraceSolve:
+    case FailurePhase::Recovery:
+    case FailurePhase::Diagnostics:
+    case FailurePhase::CheckpointStaging:
+    case FailurePhase::OutputStaging:
+    case FailurePhase::AfterRecoveryBeforeCommit: return true;
+    case FailurePhase::Setup:
+    case FailurePhase::Commit:
+    case FailurePhase::RollbackAudit:
+    case FailurePhase::TerminalEvidence: return false;
+  }
+  return false;
+}
+
+std::uint64_t ScenarioCheckpointStep(
+    const ApplicationScenarioV1 scenario) noexcept
+{
+  return scenario == ApplicationScenarioV1::smoke
+      ? smooth_periodic_euler_v1_smoke_checkpoint_step
+      : smooth_periodic_euler_v1_functional_checkpoint_step;
+}
+
+std::uint64_t ScenarioFailureTarget(
+    const ApplicationScenarioV1 scenario) noexcept
+{
+  return scenario == ApplicationScenarioV1::smoke
+      ? smooth_periodic_euler_v1_smoke_failure_target_step
+      : smooth_periodic_euler_v1_functional_failure_target_step;
+}
+
+std::uint64_t ScenarioSeed(const ApplicationScenarioV1 scenario) noexcept
+{
+  return scenario == ApplicationScenarioV1::smoke
+      ? smooth_periodic_euler_v1_smoke_seed
+      : smooth_periodic_euler_v1_functional_seed;
+}
+
+ApplicationRejection ValidateRoleControls(
+    const ApplicationOptionsView& options,
+    const ApplicationScenarioV1 scenario,
+    const ApplicationBackend backend,
+    const DeferredRuntimePredicatesV1& deferred) noexcept
+{
+  if (!CanonicalPathViewValid(options.output_directory) ||
+      !CanonicalPathViewValid(options.evidence_directory) ||
+      !CanonicalPathViewValid(options.checkpoint_out) ||
+      !CanonicalPathViewValid(options.restart_from) ||
+      !options.output_directory.present)
+  {
+    return ApplicationRejection::invalid_path_identity;
+  }
+  if ((options.validation_capture != ValidationCaptureModeV1::none &&
+       options.validation_capture != ValidationCaptureModeV1::persistent_v1) ||
+      (options.validation_capture == ValidationCaptureModeV1::persistent_v1) !=
+          options.evidence_directory.present)
+  {
+    return ApplicationRejection::invalid_validation_capture;
+  }
+  if (!options.checkpoint_step.present && options.checkpoint_step.value != 0)
+  {
+    return ApplicationRejection::invalid_checkpoint_control;
+  }
+  if (options.stop_after_checkpoint != StopAfterCheckpointV1::no &&
+      options.stop_after_checkpoint != StopAfterCheckpointV1::yes)
+  {
+    return ApplicationRejection::invalid_stop_control;
+  }
+  if (options.injection.mode != FailureInjectionModeV1::off &&
+      options.injection.mode != FailureInjectionModeV1::prescribed)
+  {
+    return ApplicationRejection::invalid_injection_control;
+  }
+
+  const std::uint64_t checkpoint_step = ScenarioCheckpointStep(scenario);
+  const std::uint64_t seed = ScenarioSeed(scenario);
+  const bool writes_checkpoint = options.checkpoint_out.present &&
+      options.checkpoint_step.present &&
+      options.checkpoint_step.value == checkpoint_step &&
+      !options.restart_from.present;
+  const bool reads_checkpoint = !options.checkpoint_out.present &&
+      !options.checkpoint_step.present && options.restart_from.present;
+  const bool off = CanonicalOffInjection(options.injection);
+  const bool prescribed_principal =
+      options.injection.mode == FailureInjectionModeV1::prescribed &&
+      options.injection.phase == smooth_periodic_euler_v1_failure_phase &&
+      options.injection.target_step == ScenarioFailureTarget(scenario) &&
+      options.injection.source_rank == deferred.required_injected_source_rank;
+
+  switch (options.run_role)
+  {
+    case ApplicationRunRoleV1::uninterrupted_reference:
+      if (!writes_checkpoint ||
+          options.stop_after_checkpoint != StopAfterCheckpointV1::no ||
+          !off || options.retry_limit != 0 || options.seed != seed)
+      {
+        return ApplicationRejection::invalid_run_role;
+      }
+      return ApplicationRejection::none;
+    case ApplicationRunRoleV1::split_writer:
+      if (!writes_checkpoint ||
+          options.stop_after_checkpoint != StopAfterCheckpointV1::yes ||
+          !off || options.retry_limit != 0 || options.seed != seed)
+      {
+        return ApplicationRejection::invalid_run_role;
+      }
+      return ApplicationRejection::none;
+    case ApplicationRunRoleV1::split_reader:
+      if (!reads_checkpoint ||
+          options.stop_after_checkpoint != StopAfterCheckpointV1::no ||
+          !prescribed_principal ||
+          options.retry_limit != smooth_periodic_euler_v1_retry_limit ||
+          options.seed != seed)
+      {
+        return ApplicationRejection::invalid_run_role;
+      }
+      return ApplicationRejection::none;
+    case ApplicationRunRoleV1::focused_terminal_injection:
+    {
+      const bool rank_valid = deferred.required_mpi_rank_count == 1
+          ? options.injection.source_rank == 0
+          : options.injection.source_rank < deferred.required_mpi_rank_count;
+      const bool staging =
+          options.injection.phase == FailurePhase::CheckpointStaging ||
+          options.injection.phase == FailurePhase::OutputStaging;
+      const std::uint64_t target = staging ? checkpoint_step : 2;
+      if (scenario != ApplicationScenarioV1::smoke || !writes_checkpoint ||
+          options.stop_after_checkpoint != StopAfterCheckpointV1::no ||
+          options.injection.mode != FailureInjectionModeV1::prescribed ||
+          !FocusedInjectionPhase(options.injection.phase) ||
+          options.injection.target_step != target || !rank_valid ||
+          options.retry_limit != 0 || options.seed != seed)
+      {
+        return ApplicationRejection::invalid_run_role;
+      }
+      return ApplicationRejection::none;
+    }
+    case ApplicationRunRoleV1::alternate_seed_reference:
+      if (scenario != ApplicationScenarioV1::functional ||
+          backend != ApplicationBackend::cpu_serial || options.mesh_n != 6 ||
+          !writes_checkpoint ||
+          options.stop_after_checkpoint != StopAfterCheckpointV1::no ||
+          !off || options.retry_limit != 0 ||
+          options.seed != smooth_periodic_euler_v1_alternate_functional_seed)
+      {
+        return ApplicationRejection::invalid_run_role;
+      }
+      return ApplicationRejection::none;
+  }
+  return ApplicationRejection::invalid_run_role;
+}
+
 ApplicationRejection ValidateSmoke(
     const ApplicationOptionsView& options) noexcept
 {
@@ -140,26 +460,10 @@ ApplicationRejection ValidateSmoke(
   {
     return ApplicationRejection::invalid_output_schedule;
   }
-  if (options.checkpoint_step !=
-      smooth_periodic_euler_v1_smoke_checkpoint_step)
-  {
-    return ApplicationRejection::invalid_checkpoint_schedule;
-  }
   if (options.checkpoint_id !=
       smooth_periodic_euler_v1_smoke_checkpoint_id)
   {
     return ApplicationRejection::invalid_checkpoint_identity;
-  }
-  if (options.injected_failure_committed_step !=
-          smooth_periodic_euler_v1_smoke_failure_committed_step ||
-      options.injected_failure_target_step !=
-          smooth_periodic_euler_v1_smoke_failure_target_step)
-  {
-    return ApplicationRejection::invalid_failure_injection;
-  }
-  if (options.seed != smooth_periodic_euler_v1_smoke_seed)
-  {
-    return ApplicationRejection::invalid_seed;
   }
   return ApplicationRejection::none;
 }
@@ -203,26 +507,10 @@ ApplicationRejection ValidateFunctional(
   {
     return ApplicationRejection::invalid_output_schedule;
   }
-  if (options.checkpoint_step !=
-      smooth_periodic_euler_v1_functional_checkpoint_step)
-  {
-    return ApplicationRejection::invalid_checkpoint_schedule;
-  }
   if (options.checkpoint_id !=
       smooth_periodic_euler_v1_functional_checkpoint_id)
   {
     return ApplicationRejection::invalid_checkpoint_identity;
-  }
-  if (options.injected_failure_committed_step !=
-          smooth_periodic_euler_v1_functional_failure_committed_step ||
-      options.injected_failure_target_step !=
-          smooth_periodic_euler_v1_functional_failure_target_step)
-  {
-    return ApplicationRejection::invalid_failure_injection;
-  }
-  if (options.seed != smooth_periodic_euler_v1_functional_seed)
-  {
-    return ApplicationRejection::invalid_seed;
   }
   return ApplicationRejection::none;
 }
@@ -260,21 +548,36 @@ ValidatedApplicationConfig::ValidatedApplicationConfig(
       accepted_steps_(options.accepted_steps),
       final_time_(options.final_time),
       output_steps_(options.output_steps),
+      scenario_checkpoint_step_(ScenarioCheckpointStep(scenario)),
+      run_role_(options.run_role),
+      output_directory_(options.output_directory.present,
+                        options.output_directory.canonical),
+      evidence_directory_(options.evidence_directory.present,
+                          options.evidence_directory.canonical),
+      validation_capture_(options.validation_capture),
+      checkpoint_out_(options.checkpoint_out.present,
+                      options.checkpoint_out.canonical),
       checkpoint_step_(options.checkpoint_step),
+      restart_from_(options.restart_from.present,
+                    options.restart_from.canonical),
+      stop_after_checkpoint_(options.stop_after_checkpoint),
+      injection_(options.injection),
       restart_mode_(options.restart_mode),
       restart_trajectory_(options.restart_trajectory),
-      injected_failure_committed_step_(
-          options.injected_failure_committed_step),
-      injected_failure_target_step_(options.injected_failure_target_step),
-      injected_failure_phase_(options.injected_failure_phase),
       rollback_obligation_(options.rollback_obligation),
       source_rank_rule_(options.source_rank_rule),
       retry_limit_(options.retry_limit),
       seed_(options.seed),
-      scientific_config_sha256_(options.scientific_config_sha256),
-      run_config_sha256_(options.run_config_sha256),
       deferred_runtime_(deferred)
-{}
+{
+  ApplicationConfigHashes hashes{};
+  if (ComputeApplicationConfigHashes(options, scenario, backend, tuple,
+                                     deferred, hashes))
+  {
+    scientific_config_sha256_ = hashes.scientific;
+    run_config_sha256_ = hashes.run;
+  }
+}
 
 ApplicationScenarioV1 ParseApplicationScenario(
     const std::string_view id) noexcept
@@ -374,11 +677,6 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::invalid_scientific_identity);
   }
-  if (!NonzeroHash(options.scientific_config_sha256) ||
-      !NonzeroHash(options.run_config_sha256))
-  {
-    return reject(ApplicationRejection::invalid_config_hash);
-  }
   if (options.dt != smooth_periodic_euler_v1_dt)
   {
     return reject(ApplicationRejection::invalid_dt);
@@ -400,11 +698,6 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::invalid_restart_trajectory);
   }
-  if (options.injected_failure_phase !=
-      smooth_periodic_euler_v1_failure_phase)
-  {
-    return reject(ApplicationRejection::invalid_failure_phase);
-  }
   if (options.rollback_obligation !=
       RollbackObligationV1::collective_exact_complete_state)
   {
@@ -415,17 +708,99 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::invalid_source_rank_rule);
   }
-  if (options.retry_limit != smooth_periodic_euler_v1_retry_limit)
-  {
-    return reject(ApplicationRejection::invalid_retry_limit);
-  }
   const RuntimeTupleDescriptor tuple = TupleForBackend(backend);
   if (!tuple.Valid())
   {
     return reject(ApplicationRejection::unknown_tuple);
   }
-  return ApplicationValidation(ValidatedApplicationConfig(
-      options, scenario, backend, tuple, DeferredForBackend(backend)));
+  const DeferredRuntimePredicatesV1 deferred = DeferredForBackend(backend);
+  const ApplicationRejection role_rejection =
+      ValidateRoleControls(options, scenario, backend, deferred);
+  if (role_rejection != ApplicationRejection::none)
+  {
+    return reject(role_rejection);
+  }
+  ApplicationConfigHashes hashes{};
+  if (!ComputeApplicationConfigHashes(options, scenario, backend, tuple,
+                                      deferred, hashes) ||
+      hashes.scientific == StateHash{} || hashes.run == StateHash{})
+  {
+    return reject(ApplicationRejection::invalid_config_hash);
+  }
+  return ApplicationValidation(
+      ValidatedApplicationConfig(options, scenario, backend, tuple, deferred));
+}
+
+bool DeriveSplitWriterRunConfigHashV1(
+    const ValidatedApplicationConfig& split_reader,
+    StateHash& writer_run_config_sha256) noexcept
+{
+  if (split_reader.run_role() != ApplicationRunRoleV1::split_reader ||
+      !split_reader.restart_from().present())
+  {
+    return false;
+  }
+
+  ApplicationOptionsView writer{};
+  writer.card_id = split_reader.card_id().view();
+  writer.case_id = split_reader.case_id().view();
+  writer.scenario_id = split_reader.scenario_id().view();
+  writer.model_id = split_reader.tuple().model.view();
+  writer.formulation_id = split_reader.tuple().formulation.view();
+  writer.trace_id = split_reader.tuple().trace.view();
+  writer.stabilization_id = split_reader.tuple().stabilization.view();
+  writer.time_treatment_id = split_reader.tuple().time_treatment.view();
+  writer.backend_id = split_reader.tuple().backend.view();
+  writer.precision_id = split_reader.tuple().precision.view();
+  writer.mesh_family_id = split_reader.mesh_family_id().view();
+  writer.source_id = split_reader.source_id().view();
+  writer.flux_id = split_reader.flux_id().view();
+  writer.time_rule_id = split_reader.time_rule_id().view();
+  writer.layout_id = split_reader.layout_id().view();
+  writer.interior_space = split_reader.interior_space();
+  writer.polynomial_order = split_reader.polynomial_order();
+  writer.mesh_n = split_reader.mesh_n();
+  writer.q_a = split_reader.q_a();
+  writer.q_e = split_reader.q_e();
+  writer.q_e4 = split_reader.q_e4();
+  writer.q_o = split_reader.q_o();
+  writer.gamma = split_reader.gamma();
+  writer.tau = split_reader.tau();
+  writer.dt = split_reader.dt();
+  writer.accepted_steps = split_reader.accepted_steps();
+  writer.final_time = split_reader.final_time();
+  writer.output_steps = split_reader.output_steps();
+  writer.checkpoint_id = split_reader.checkpoint_id().view();
+  writer.run_role = ApplicationRunRoleV1::split_writer;
+  writer.output_directory = OutputDirectoryPathV1::Present(
+      split_reader.output_directory().identity().view());
+  writer.evidence_directory = EvidenceDirectoryPathV1::Present(
+      split_reader.evidence_directory().identity().view());
+  writer.validation_capture = split_reader.validation_capture();
+  writer.checkpoint_out = CheckpointArtifactPathV1::Present(
+      split_reader.restart_from().identity().view());
+  writer.checkpoint_step = OptionalCheckpointStepV1::Present(
+      split_reader.scenario_checkpoint_step());
+  writer.restart_from = {};
+  writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+  writer.injection = {};
+  writer.restart_mode = split_reader.restart_mode();
+  writer.restart_trajectory = split_reader.restart_trajectory();
+  writer.rollback_obligation = split_reader.rollback_obligation();
+  writer.source_rank_rule = split_reader.source_rank_rule();
+  writer.retry_limit = 0;
+  writer.seed = split_reader.seed();
+
+  ApplicationConfigHashes hashes{};
+  if (!ComputeApplicationConfigHashes(
+          writer, split_reader.scenario(), split_reader.backend(),
+          split_reader.tuple(), split_reader.deferred_runtime(), hashes) ||
+      hashes.scientific != split_reader.scientific_config_sha256())
+  {
+    return false;
+  }
+  writer_run_config_sha256 = hashes.run;
+  return true;
 }
 
 } // namespace dg::hdg::runtime::app

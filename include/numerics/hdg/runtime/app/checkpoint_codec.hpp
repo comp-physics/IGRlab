@@ -25,7 +25,7 @@
 namespace dg::hdg::runtime::app
 {
 
-inline constexpr std::uint32_t application_checkpoint_codec_version_v1 = 1;
+inline constexpr std::uint32_t application_checkpoint_codec_version_v2 = 2;
 inline constexpr std::uint32_t application_checkpoint_max_rank_count_v1 = 2;
 inline constexpr std::uint32_t euler_state_component_count_v1 = 4;
 inline constexpr std::uint64_t fp64_coefficient_bytes_v1 = 8;
@@ -38,7 +38,7 @@ static_assert(sizeof(double) == fp64_coefficient_bytes_v1 &&
                   std::numeric_limits<double>::radix == 2 &&
                   std::numeric_limits<double>::digits == 53 &&
                   std::numeric_limits<double>::max_exponent == 1024,
-              "checkpoint v1 requires IEEE-754 binary64 double");
+              "checkpoint v2 requires IEEE-754 binary64 double");
 
 struct ConstByteView
 {
@@ -137,6 +137,7 @@ enum class CheckpointCodecStatus : std::uint8_t
   restart_tuple_mismatch,
   resource_mismatch,
   output_buffer_mismatch,
+  output_buffer_overlap,
   allocation_failure,
   trailing_bytes,
   size_overflow
@@ -277,13 +278,13 @@ std::optional<CapturedCheckpointV1> CaptureCheckpointV1(
     CheckpointDescriptor descriptor{};
     if (contract->status() != RunStatus::committed ||
         !telemetry.accepted.valid ||
-        telemetry.commits < config.checkpoint_step() ||
+        telemetry.commits < config.scenario_checkpoint_step() ||
         !contract->PublishedCoordinates(published, published_coordinates) ||
         !::dg::hdg::runtime::detail::SameCoordinates(
             coordinates, published_coordinates) ||
-        coordinates.step != config.checkpoint_step() ||
-        coordinates.generation != config.checkpoint_step() ||
-        coordinates.cursor != config.checkpoint_step() ||
+        coordinates.step != config.scenario_checkpoint_step() ||
+        coordinates.generation != config.scenario_checkpoint_step() ||
+        coordinates.cursor != config.scenario_checkpoint_step() ||
         coordinates.dt != config.dt() ||
         !ScenarioCheckpointTimeMatchesV1(coordinates.time, config) ||
         contract->resources().rank_count != rank_count ||
@@ -293,8 +294,8 @@ std::optional<CapturedCheckpointV1> CaptureCheckpointV1(
         descriptor.tuple != config.tuple() ||
         descriptor.rank_count != rank_count ||
         descriptor.polynomial_order != config.polynomial_order() ||
-        descriptor.coordinates.step != config.checkpoint_step() ||
-        descriptor.coordinates.cursor != config.checkpoint_step() ||
+        descriptor.coordinates.step != config.scenario_checkpoint_step() ||
+        descriptor.coordinates.cursor != config.scenario_checkpoint_step() ||
         !ScenarioCheckpointTimeMatchesV1(descriptor.coordinates.time, config))
     {
       return std::nullopt;
@@ -328,8 +329,11 @@ struct DecodedCheckpointMetadataV1
   StableIdentity checkpoint_id{};
   StableIdentity physical_gpu_uuid{};
   StableIdentity partition_layout_rule_id{};
+  ApplicationRunRoleV1 writer_run_role =
+      ApplicationRunRoleV1::uninterrupted_reference;
   StateHash scientific_config_sha256{};
-  StateHash run_config_sha256{};
+  StateHash writer_run_config_sha256{};
+  StateHash reader_run_config_sha256{};
   StateHash ownership_hash{};
   std::uint32_t mesh_n = 0;
   std::uint32_t rank_count = 0;

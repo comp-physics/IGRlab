@@ -90,6 +90,9 @@ inline constexpr std::uint64_t
     smooth_periodic_euler_v1_functional_failure_target_step = 14;
 inline constexpr std::uint64_t smooth_periodic_euler_v1_functional_seed =
     UINT64_C(0x57384146554e4331);
+inline constexpr std::uint64_t
+    smooth_periodic_euler_v1_alternate_functional_seed =
+        UINT64_C(0xc90f38ff2a043f24);
 
 inline constexpr FailurePhase smooth_periodic_euler_v1_failure_phase =
     FailurePhase::AfterRecoveryBeforeCommit;
@@ -110,6 +113,136 @@ enum class ApplicationBackend : std::uint8_t
   cuda_rank2_one_gpu_host_staged = 3,
   unknown = 255
 };
+
+enum class ApplicationRunRoleV1 : std::uint8_t
+{
+  uninterrupted_reference = 0,
+  split_writer = 1,
+  split_reader = 2,
+  focused_terminal_injection = 3,
+  alternate_seed_reference = 4
+};
+
+enum class ValidationCaptureModeV1 : std::uint8_t
+{
+  none = 0,
+  persistent_v1 = 1
+};
+
+enum class StopAfterCheckpointV1 : std::uint8_t
+{
+  no = 0,
+  yes = 1
+};
+
+enum class FailureInjectionModeV1 : std::uint8_t
+{
+  off = 0,
+  prescribed = 1
+};
+
+struct FailureInjectionControlV1
+{
+  FailureInjectionModeV1 mode = FailureInjectionModeV1::off;
+  FailurePhase phase = FailurePhase::Setup;
+  std::uint64_t target_step = 0;
+  std::uint32_t source_rank = 0;
+};
+
+constexpr bool operator==(const FailureInjectionControlV1& left,
+                          const FailureInjectionControlV1& right) noexcept
+{
+  return left.mode == right.mode && left.phase == right.phase &&
+      left.target_step == right.target_step &&
+      left.source_rank == right.source_rank;
+}
+
+constexpr bool operator!=(const FailureInjectionControlV1& left,
+                          const FailureInjectionControlV1& right) noexcept
+{
+  return !(left == right);
+}
+
+struct OutputDirectoryPathV1
+{
+  bool present = false;
+  std::string_view canonical{};
+
+  static constexpr OutputDirectoryPathV1 Present(
+      const std::string_view value) noexcept
+  {
+    return {true, value};
+  }
+};
+
+struct EvidenceDirectoryPathV1
+{
+  bool present = false;
+  std::string_view canonical{};
+
+  static constexpr EvidenceDirectoryPathV1 Present(
+      const std::string_view value) noexcept
+  {
+    return {true, value};
+  }
+};
+
+struct CheckpointArtifactPathV1
+{
+  bool present = false;
+  std::string_view canonical{};
+
+  static constexpr CheckpointArtifactPathV1 Present(
+      const std::string_view value) noexcept
+  {
+    return {true, value};
+  }
+};
+
+struct OptionalCheckpointStepV1
+{
+  bool present = false;
+  std::uint64_t value = 0;
+
+  static constexpr OptionalCheckpointStepV1 Present(
+      const std::uint64_t step) noexcept
+  {
+    return {true, step};
+  }
+};
+
+template <typename Domain>
+class CanonicalPathIdentityV1 final
+{
+public:
+  constexpr CanonicalPathIdentityV1() noexcept = default;
+  constexpr bool present() const noexcept { return present_; }
+  constexpr const StableIdentity& identity() const noexcept
+  {
+    return identity_;
+  }
+
+private:
+  constexpr CanonicalPathIdentityV1(const bool present,
+                                    const std::string_view canonical) noexcept
+      : present_(present), identity_(StableIdentity::Copy(canonical))
+  {}
+
+  bool present_ = false;
+  StableIdentity identity_{};
+
+  friend class ValidatedApplicationConfig;
+};
+
+struct OutputDirectoryPathDomainV1;
+struct EvidenceDirectoryPathDomainV1;
+struct CheckpointArtifactPathDomainV1;
+using OutputDirectoryIdentityV1 =
+    CanonicalPathIdentityV1<OutputDirectoryPathDomainV1>;
+using EvidenceDirectoryIdentityV1 =
+    CanonicalPathIdentityV1<EvidenceDirectoryPathDomainV1>;
+using CheckpointArtifactIdentityV1 =
+    CanonicalPathIdentityV1<CheckpointArtifactPathDomainV1>;
 
 enum class RollbackObligationV1 : std::uint8_t
 {
@@ -165,6 +298,12 @@ enum class ApplicationRejection : std::uint8_t
   invalid_checkpoint_identity,
   invalid_restart_mode,
   invalid_restart_trajectory,
+  invalid_run_role,
+  invalid_path_identity,
+  invalid_validation_capture,
+  invalid_checkpoint_control,
+  invalid_stop_control,
+  invalid_injection_control,
   invalid_failure_injection,
   invalid_failure_phase,
   invalid_rollback_obligation,
@@ -205,26 +344,34 @@ struct ApplicationOptionsView
   double final_time = smooth_periodic_euler_v1_smoke_final_time;
   std::array<std::uint64_t, 3> output_steps =
       smooth_periodic_euler_v1_smoke_output_steps;
-  std::uint64_t checkpoint_step =
-      smooth_periodic_euler_v1_smoke_checkpoint_step;
   std::string_view checkpoint_id =
       smooth_periodic_euler_v1_smoke_checkpoint_id;
+  ApplicationRunRoleV1 run_role =
+      ApplicationRunRoleV1::uninterrupted_reference;
+  OutputDirectoryPathV1 output_directory =
+      OutputDirectoryPathV1::Present("w8a/output");
+  EvidenceDirectoryPathV1 evidence_directory =
+      EvidenceDirectoryPathV1::Present("w8a/evidence");
+  ValidationCaptureModeV1 validation_capture =
+      ValidationCaptureModeV1::persistent_v1;
+  CheckpointArtifactPathV1 checkpoint_out =
+      CheckpointArtifactPathV1::Present("w8a/checkpoint");
+  OptionalCheckpointStepV1 checkpoint_step =
+      OptionalCheckpointStepV1::Present(
+          smooth_periodic_euler_v1_smoke_checkpoint_step);
+  CheckpointArtifactPathV1 restart_from{};
+  StopAfterCheckpointV1 stop_after_checkpoint =
+      StopAfterCheckpointV1::no;
+  FailureInjectionControlV1 injection{};
   RestartMode restart_mode = RestartMode::same_backend_rank_partition;
   RestartTrajectoryModeV1 restart_trajectory =
       RestartTrajectoryModeV1::uninterrupted_and_split_same_tuple;
-  std::uint64_t injected_failure_committed_step =
-      smooth_periodic_euler_v1_smoke_failure_committed_step;
-  std::uint64_t injected_failure_target_step =
-      smooth_periodic_euler_v1_smoke_failure_target_step;
-  FailurePhase injected_failure_phase = smooth_periodic_euler_v1_failure_phase;
   RollbackObligationV1 rollback_obligation =
       RollbackObligationV1::collective_exact_complete_state;
   DeferredSourceRankRuleV1 source_rank_rule =
       DeferredSourceRankRuleV1::rank_zero_for_rank1_rank_one_for_rank2;
-  std::uint32_t retry_limit = smooth_periodic_euler_v1_retry_limit;
+  std::uint32_t retry_limit = 0;
   std::uint64_t seed = smooth_periodic_euler_v1_smoke_seed;
-  StateHash scientific_config_sha256{};
-  StateHash run_config_sha256{};
 };
 
 class ValidatedApplicationConfig final
@@ -271,23 +418,44 @@ public:
   {
     return output_steps_;
   }
-  std::uint64_t checkpoint_step() const noexcept { return checkpoint_step_; }
+  std::uint64_t scenario_checkpoint_step() const noexcept
+  {
+    return scenario_checkpoint_step_;
+  }
+  ApplicationRunRoleV1 run_role() const noexcept { return run_role_; }
+  const OutputDirectoryIdentityV1& output_directory() const noexcept
+  {
+    return output_directory_;
+  }
+  const EvidenceDirectoryIdentityV1& evidence_directory() const noexcept
+  {
+    return evidence_directory_;
+  }
+  ValidationCaptureModeV1 validation_capture() const noexcept
+  {
+    return validation_capture_;
+  }
+  const CheckpointArtifactIdentityV1& checkpoint_out() const noexcept
+  {
+    return checkpoint_out_;
+  }
+  OptionalCheckpointStepV1 checkpoint_step() const noexcept
+  {
+    return checkpoint_step_;
+  }
+  const CheckpointArtifactIdentityV1& restart_from() const noexcept
+  {
+    return restart_from_;
+  }
+  StopAfterCheckpointV1 stop_after_checkpoint() const noexcept
+  {
+    return stop_after_checkpoint_;
+  }
+  FailureInjectionControlV1 injection() const noexcept { return injection_; }
   RestartMode restart_mode() const noexcept { return restart_mode_; }
   RestartTrajectoryModeV1 restart_trajectory() const noexcept
   {
     return restart_trajectory_;
-  }
-  std::uint64_t injected_failure_committed_step() const noexcept
-  {
-    return injected_failure_committed_step_;
-  }
-  std::uint64_t injected_failure_target_step() const noexcept
-  {
-    return injected_failure_target_step_;
-  }
-  FailurePhase injected_failure_phase() const noexcept
-  {
-    return injected_failure_phase_;
   }
   RollbackObligationV1 rollback_obligation() const noexcept
   {
@@ -344,13 +512,22 @@ private:
   std::uint64_t accepted_steps_ = 0;
   double final_time_ = 0.0;
   std::array<std::uint64_t, 3> output_steps_{};
-  std::uint64_t checkpoint_step_ = 0;
+  std::uint64_t scenario_checkpoint_step_ = 0;
+  ApplicationRunRoleV1 run_role_ =
+      ApplicationRunRoleV1::uninterrupted_reference;
+  OutputDirectoryIdentityV1 output_directory_{};
+  EvidenceDirectoryIdentityV1 evidence_directory_{};
+  ValidationCaptureModeV1 validation_capture_ =
+      ValidationCaptureModeV1::none;
+  CheckpointArtifactIdentityV1 checkpoint_out_{};
+  OptionalCheckpointStepV1 checkpoint_step_{};
+  CheckpointArtifactIdentityV1 restart_from_{};
+  StopAfterCheckpointV1 stop_after_checkpoint_ =
+      StopAfterCheckpointV1::no;
+  FailureInjectionControlV1 injection_{};
   RestartMode restart_mode_ = RestartMode::same_backend_rank_partition;
   RestartTrajectoryModeV1 restart_trajectory_ =
       RestartTrajectoryModeV1::uninterrupted_and_split_same_tuple;
-  std::uint64_t injected_failure_committed_step_ = 0;
-  std::uint64_t injected_failure_target_step_ = 0;
-  FailurePhase injected_failure_phase_ = FailurePhase::Setup;
   RollbackObligationV1 rollback_obligation_ =
       RollbackObligationV1::collective_exact_complete_state;
   DeferredSourceRankRuleV1 source_rank_rule_ =
@@ -396,6 +573,9 @@ ApplicationBackend ParseApplicationBackend(std::string_view id) noexcept;
 bool CompiledBackendAvailable(ApplicationBackend backend) noexcept;
 ApplicationValidation ValidateApplicationOptions(
     const ApplicationOptionsView& options) noexcept;
+bool DeriveSplitWriterRunConfigHashV1(
+    const ValidatedApplicationConfig& split_reader,
+    StateHash& writer_run_config_sha256) noexcept;
 
 template <typename BackendTag>
 struct IsFrozenApplicationBackend : std::false_type

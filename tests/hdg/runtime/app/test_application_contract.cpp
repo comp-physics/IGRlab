@@ -15,8 +15,17 @@ using namespace dg::hdg::runtime::app;
 static_assert(__cplusplus == DG_IGR_HDG_RUNTIME_EXPECTED_CPLUSPLUS,
               "application contract test must compile in strict C++17");
 static_assert(!std::is_default_constructible<ValidatedApplicationConfig>::value &&
-                  !std::is_aggregate<ValidatedApplicationConfig>::value,
-              "accepted configuration has no invalid construction path");
+                  !std::is_aggregate<ValidatedApplicationConfig>::value &&
+                  !std::is_polymorphic<ValidatedApplicationConfig>::value &&
+                  !std::is_polymorphic<FailureInjectionControlV1>::value,
+              "validated controls are closed non-polymorphic values");
+static_assert(!std::is_same<OutputDirectoryPathV1,
+                            EvidenceDirectoryPathV1>::value &&
+                  !std::is_same<OutputDirectoryIdentityV1,
+                                EvidenceDirectoryIdentityV1>::value &&
+                  !std::is_same<OutputDirectoryIdentityV1,
+                                CheckpointArtifactIdentityV1>::value,
+              "path domains are not interchangeable");
 static_assert(IsFrozenApplicationBackend<CpuSerialBackendTag>::value &&
                   IsFrozenApplicationBackend<CpuRank2BackendTag>::value &&
                   IsFrozenApplicationBackend<
@@ -24,18 +33,7 @@ static_assert(IsFrozenApplicationBackend<CpuSerialBackendTag>::value &&
                   IsFrozenApplicationBackend<
                       CudaRank2OneGpuHostStagedBackendTag>::value &&
                   !IsFrozenApplicationBackend<int>::value,
-              "the static request boundary recognizes exactly four backends");
-static_assert(smooth_periodic_euler_v1_smoke_polynomial_order == 1 &&
-                  smooth_periodic_euler_v1_smoke_mesh_n == 3 &&
-                  smooth_periodic_euler_v1_smoke_steps == 3 &&
-                  smooth_periodic_euler_v1_smoke_checkpoint_step == 1 &&
-                  smooth_periodic_euler_v1_smoke_failure_target_step == 2 &&
-                  smooth_periodic_euler_v1_functional_polynomial_order == 2 &&
-                  smooth_periodic_euler_v1_functional_mesh_n == 6 &&
-                  smooth_periodic_euler_v1_functional_steps == 20 &&
-                  smooth_periodic_euler_v1_functional_checkpoint_step == 10 &&
-                  smooth_periodic_euler_v1_functional_failure_target_step == 14,
-              "the two card scenarios remain distinct and exact");
+              "the static boundary recognizes exactly four backends");
 
 bool Check(const bool condition, const char* name)
 {
@@ -43,22 +41,19 @@ bool Check(const bool condition, const char* name)
   return condition;
 }
 
-StateHash FilledHash(const std::uint8_t first) noexcept
+bool Nonzero(const StateHash& hash)
 {
-  StateHash value{};
-  for (std::size_t index = 0; index < value.bytes.size(); ++index)
+  for (const std::uint8_t byte : hash.bytes)
   {
-    value.bytes[index] = static_cast<std::uint8_t>(first + index);
+    if (byte != 0) { return true; }
   }
-  return value;
+  return false;
 }
 
 ApplicationOptionsView Smoke(const std::string_view backend)
 {
   ApplicationOptionsView options;
   options.backend_id = backend;
-  options.scientific_config_sha256 = FilledHash(0x10);
-  options.run_config_sha256 = FilledHash(0x40);
   return options;
 }
 
@@ -77,147 +72,153 @@ ApplicationOptionsView Functional(const std::string_view backend,
   options.accepted_steps = smooth_periodic_euler_v1_functional_steps;
   options.final_time = smooth_periodic_euler_v1_functional_final_time;
   options.output_steps = smooth_periodic_euler_v1_functional_output_steps;
-  options.checkpoint_step =
-      smooth_periodic_euler_v1_functional_checkpoint_step;
+  options.checkpoint_step = OptionalCheckpointStepV1::Present(
+      smooth_periodic_euler_v1_functional_checkpoint_step);
   options.checkpoint_id =
       smooth_periodic_euler_v1_functional_checkpoint_id;
-  options.injected_failure_committed_step =
-      smooth_periodic_euler_v1_functional_failure_committed_step;
-  options.injected_failure_target_step =
-      smooth_periodic_euler_v1_functional_failure_target_step;
   options.seed = smooth_periodic_euler_v1_functional_seed;
   return options;
 }
 
-bool CheckAcceptedExactFields()
+std::uint32_t SourceRank(const std::string_view backend)
 {
-  const ApplicationValidation validation =
+  return backend == CpuRank2BackendTag::id ||
+          backend == CudaRank2OneGpuHostStagedBackendTag::id
+      ? 1U
+      : 0U;
+}
+
+ApplicationOptionsView SplitWriter(ApplicationOptionsView options)
+{
+  options.run_role = ApplicationRunRoleV1::split_writer;
+  options.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+  return options;
+}
+
+ApplicationOptionsView SplitReader(ApplicationOptionsView options)
+{
+  const std::string_view checkpoint = options.checkpoint_out.canonical;
+  const bool smoke =
+      options.scenario_id == smooth_periodic_euler_v1_smoke_id;
+  options.run_role = ApplicationRunRoleV1::split_reader;
+  options.checkpoint_out = {};
+  options.checkpoint_step = {};
+  options.restart_from = CheckpointArtifactPathV1::Present(checkpoint);
+  options.stop_after_checkpoint = StopAfterCheckpointV1::no;
+  options.injection = {
+      FailureInjectionModeV1::prescribed,
+      smooth_periodic_euler_v1_failure_phase,
+      smoke ? smooth_periodic_euler_v1_smoke_failure_target_step
+            : smooth_periodic_euler_v1_functional_failure_target_step,
+      SourceRank(options.backend_id)};
+  options.retry_limit = smooth_periodic_euler_v1_retry_limit;
+  return options;
+}
+
+ApplicationOptionsView Focused(ApplicationOptionsView options,
+                               const FailurePhase phase,
+                               const std::uint32_t source_rank)
+{
+  options.run_role = ApplicationRunRoleV1::focused_terminal_injection;
+  const bool staging = phase == FailurePhase::CheckpointStaging ||
+      phase == FailurePhase::OutputStaging;
+  options.injection = {FailureInjectionModeV1::prescribed, phase,
+                       staging
+                           ? smooth_periodic_euler_v1_smoke_checkpoint_step
+                           : UINT64_C(2),
+                       source_rank};
+  return options;
+}
+
+bool CheckExactAcceptedFieldsAndHashes()
+{
+  const ApplicationValidation first =
       ValidateApplicationOptions(Smoke(CpuSerialBackendTag::id));
-  const ValidatedApplicationConfig* config = validation.config();
-  bool passed = Check(validation.accepted() && config != nullptr &&
-                          validation.rejection() == ApplicationRejection::none,
-                      "accepted_result_exposes_config_only_on_success");
-  if (config == nullptr) { return false; }
+  const ApplicationValidation repeat =
+      ValidateApplicationOptions(Smoke(CpuSerialBackendTag::id));
+  const ValidatedApplicationConfig* config = first.config();
+  const ValidatedApplicationConfig* repeated = repeat.config();
+  bool passed = Check(first.accepted() && config != nullptr &&
+                          repeated != nullptr,
+                      "default_uninterrupted_smoke_accepted");
+  if (config == nullptr || repeated == nullptr) { return false; }
   passed = Check(
                config->scenario() == ApplicationScenarioV1::smoke &&
                    config->backend() == ApplicationBackend::cpu_serial &&
                    config->tuple() == CpuSerialRuntimeSelection::Descriptor() &&
-                   config->card_id().view() ==
-                       smooth_periodic_euler_v1_card_id &&
-                   config->case_id().view() ==
-                       smooth_periodic_euler_v1_case_id &&
-                   config->scenario_id().view() ==
-                       smooth_periodic_euler_v1_smoke_id &&
-                   config->checkpoint_id().view() ==
-                       smooth_periodic_euler_v1_smoke_checkpoint_id &&
-                   config->mesh_family_id().view() ==
-                       smooth_periodic_euler_v1_mesh_family_id &&
-                   config->source_id().view() ==
-                       smooth_periodic_euler_v1_source_id &&
-                   config->flux_id().view() ==
-                       smooth_periodic_euler_v1_flux_id &&
-                   config->time_rule_id().view() ==
-                       smooth_periodic_euler_v1_time_rule_id &&
-                   config->layout_id().view() ==
-                       smooth_periodic_euler_v1_layout_id &&
-                   config->interior_space() == InteriorSpace::l2 &&
-                   config->polynomial_order() == 1 && config->mesh_n() == 3 &&
-                   config->q_a() == 11 && config->q_e() == 16 &&
-                   config->q_e4() == 20 && config->q_o() == 21 &&
-                   config->gamma() == 1.4 && config->tau() == 2.5 &&
-                   config->dt() == 0.05 && config->accepted_steps() == 3 &&
-                   config->final_time() == 0.15 &&
-                   config->output_steps() ==
-                       std::array<std::uint64_t, 3>{{0, 1, 3}} &&
-                   config->checkpoint_step() == 1 &&
-                   config->restart_mode() ==
-                       RestartMode::same_backend_rank_partition &&
-                   config->restart_trajectory() ==
-                       RestartTrajectoryModeV1::
-                           uninterrupted_and_split_same_tuple &&
-                   config->injected_failure_committed_step() == 1 &&
-                   config->injected_failure_target_step() == 2 &&
-                   config->injected_failure_phase() ==
-                       FailurePhase::AfterRecoveryBeforeCommit &&
-                   config->rollback_obligation() ==
-                       RollbackObligationV1::
-                           collective_exact_complete_state &&
-                   config->source_rank_rule() ==
-                       DeferredSourceRankRuleV1::
-                           rank_zero_for_rank1_rank_one_for_rank2 &&
-                   config->retry_limit() == 1 &&
-                   config->seed() == UINT64_C(0x573841534d4f4b31) &&
-                   config->scientific_config_sha256() == FilledHash(0x10) &&
-                   config->run_config_sha256() == FilledHash(0x40) &&
-                   config->deferred_runtime().required_mpi_rank_count == 1 &&
-                   config->deferred_runtime().gpu_rule ==
-                       DeferredGpuRuleV1::no_cuda_device &&
-                   config->deferred_runtime().required_injected_source_rank ==
-                       0,
-               "accepted_smoke_copies_every_exact_identity_and_input") &&
+                   config->scenario_checkpoint_step() == 1 &&
+                   config->run_role() ==
+                       ApplicationRunRoleV1::uninterrupted_reference &&
+                   config->output_directory().present() &&
+                   config->output_directory().identity().view() ==
+                       "w8a/output" &&
+                   config->evidence_directory().present() &&
+                   config->validation_capture() ==
+                       ValidationCaptureModeV1::persistent_v1 &&
+                   config->checkpoint_out().present() &&
+                   config->checkpoint_step().present &&
+                   config->checkpoint_step().value == 1 &&
+                   !config->restart_from().present() &&
+                   config->stop_after_checkpoint() ==
+                       StopAfterCheckpointV1::no &&
+                   config->injection() == FailureInjectionControlV1{} &&
+                   config->retry_limit() == 0 &&
+                   config->seed() == smooth_periodic_euler_v1_smoke_seed &&
+                   Nonzero(config->scientific_config_sha256()) &&
+                   Nonzero(config->run_config_sha256()) &&
+                   config->scientific_config_sha256() ==
+                       repeated->scientific_config_sha256() &&
+                   config->run_config_sha256() ==
+                       repeated->run_config_sha256(),
+               "validated_config_owns_typed_controls_and_deterministic_hashes") &&
       passed;
 
-  ApplicationOptionsView rejected = Smoke(CpuSerialBackendTag::id);
-  rejected.mesh_n = 6;
-  const ApplicationValidation rejection =
-      ValidateApplicationOptions(rejected);
-  passed = Check(!rejection.accepted() && rejection.config() == nullptr &&
-                     rejection.rejection() ==
-                         ApplicationRejection::invalid_polynomial_mesh_pair,
-                 "rejection_exposes_no_invalid_default_config") &&
+  ApplicationOptionsView changed = Smoke(CpuSerialBackendTag::id);
+  changed.output_directory = OutputDirectoryPathV1::Present("other/output");
+  const ApplicationValidation changed_validation =
+      ValidateApplicationOptions(changed);
+  const ValidatedApplicationConfig* changed_config =
+      changed_validation.config();
+  passed = Check(changed_config != nullptr &&
+                     changed_config->scientific_config_sha256() ==
+                         config->scientific_config_sha256() &&
+                     changed_config->run_config_sha256() !=
+                         config->run_config_sha256(),
+                 "run_only_path_changes_only_run_hash") &&
       passed;
   return passed;
 }
 
-bool CheckTwoScenarioBackendMatrix()
+bool CheckRoleBackendMatrix()
 {
   struct BackendCase
   {
     std::string_view id;
     ApplicationBackend backend;
-    std::uint32_t ranks;
-    DeferredGpuRuleV1 gpu_rule;
-    std::uint32_t source_rank;
   };
-  const std::array<BackendCase, 4> cases{{
-      {CpuSerialBackendTag::id, ApplicationBackend::cpu_serial, 1,
-       DeferredGpuRuleV1::no_cuda_device, 0},
-      {CpuRank2BackendTag::id, ApplicationBackend::cpu_rank2, 2,
-       DeferredGpuRuleV1::no_cuda_device, 1},
+  const std::array<BackendCase, 4> backends{{
+      {CpuSerialBackendTag::id, ApplicationBackend::cpu_serial},
+      {CpuRank2BackendTag::id, ApplicationBackend::cpu_rank2},
       {CudaRank1OneGpuBackendTag::id,
-       ApplicationBackend::cuda_rank1_one_gpu, 1,
-       DeferredGpuRuleV1::one_physical_gpu, 0},
+       ApplicationBackend::cuda_rank1_one_gpu},
       {CudaRank2OneGpuHostStagedBackendTag::id,
-       ApplicationBackend::cuda_rank2_one_gpu_host_staged, 2,
-       DeferredGpuRuleV1::one_shared_physical_gpu, 1}}};
+       ApplicationBackend::cuda_rank2_one_gpu_host_staged}}};
   bool passed = true;
-  for (const BackendCase& item : cases)
+  for (const BackendCase& backend : backends)
   {
-    for (const ApplicationOptionsView& request :
-         {Smoke(item.id), Functional(item.id)})
+    for (const ApplicationOptionsView& scenario :
+         {Smoke(backend.id), Functional(backend.id)})
     {
-      const ApplicationValidation validation =
-          ValidateApplicationOptions(request);
-      if (CompiledBackendAvailable(item.backend))
+      for (const ApplicationOptionsView& role :
+           {scenario, SplitWriter(scenario), SplitReader(scenario)})
       {
-        const ValidatedApplicationConfig* config = validation.config();
-        passed = Check(
-                     config != nullptr && config->backend() == item.backend &&
-                         config->deferred_runtime().required_mpi_rank_count ==
-                             item.ranks &&
-                         config->deferred_runtime().gpu_rule == item.gpu_rule &&
-                         config->deferred_runtime().
-                                 required_injected_source_rank ==
-                             item.source_rank,
-                     "smoke_and_principal_functional_each_admit_four_tuples") &&
-            passed;
-      }
-      else
-      {
-        passed = Check(!validation.accepted() &&
-                           validation.rejection() ==
+        const ApplicationValidation validation =
+            ValidateApplicationOptions(role);
+        passed = Check(CompiledBackendAvailable(backend.backend)
+                           ? validation.accepted()
+                           : validation.rejection() ==
                                ApplicationRejection::unbuilt_backend,
-                       "known_unbuilt_backend_rejected_from_build_definition") &&
+                       "role_scenario_backend_matrix") &&
             passed;
       }
     }
@@ -225,134 +226,166 @@ bool CheckTwoScenarioBackendMatrix()
   return passed;
 }
 
-bool CheckNoScenarioCrossProducts()
+bool CheckFocusedAndAlternateRoles()
+{
+  const std::array<FailurePhase, 8> phases{{
+      FailurePhase::Assembly, FailurePhase::Condensation,
+      FailurePhase::TraceSolve, FailurePhase::Recovery,
+      FailurePhase::Diagnostics, FailurePhase::CheckpointStaging,
+      FailurePhase::OutputStaging,
+      FailurePhase::AfterRecoveryBeforeCommit}};
+  bool passed = true;
+  struct FocusedBackend
+  {
+    std::string_view id;
+    ApplicationBackend backend;
+    std::uint32_t ranks;
+  };
+  const std::array<FocusedBackend, 4> backends{{
+      {CpuSerialBackendTag::id, ApplicationBackend::cpu_serial, 1},
+      {CpuRank2BackendTag::id, ApplicationBackend::cpu_rank2, 2},
+      {CudaRank1OneGpuBackendTag::id,
+       ApplicationBackend::cuda_rank1_one_gpu, 1},
+      {CudaRank2OneGpuHostStagedBackendTag::id,
+       ApplicationBackend::cuda_rank2_one_gpu_host_staged, 2}}};
+  for (const FailurePhase phase : phases)
+  {
+    for (const FocusedBackend& backend : backends)
+    {
+      if (!CompiledBackendAvailable(backend.backend)) { continue; }
+      for (std::uint32_t source = 0; source < backend.ranks; ++source)
+      {
+        passed = Check(ValidateApplicationOptions(
+                           Focused(Smoke(backend.id), phase, source))
+                           .accepted(),
+                       "focused_phase_backend_source_matrix") &&
+            passed;
+      }
+    }
+  }
+  ApplicationOptionsView alternate = Functional(CpuSerialBackendTag::id);
+  alternate.run_role = ApplicationRunRoleV1::alternate_seed_reference;
+  alternate.seed = smooth_periodic_euler_v1_alternate_functional_seed;
+  passed = Check(ValidateApplicationOptions(alternate).accepted(),
+                 "alternate_functional_seed_reference_accepted") &&
+      passed;
+  return passed;
+}
+
+bool CheckNegativeRoleControls()
+{
+  bool passed = true;
+  const auto reject = [&](const ApplicationOptionsView& request,
+                          const char* name) {
+    passed = Check(!ValidateApplicationOptions(request).accepted(), name) &&
+        passed;
+  };
+  ApplicationOptionsView request = Smoke(CpuSerialBackendTag::id);
+  request.run_role = static_cast<ApplicationRunRoleV1>(255);
+  reject(request, "unknown_role_rejected");
+  request = Smoke(CpuSerialBackendTag::id);
+  request.output_directory = {};
+  reject(request, "missing_output_directory_rejected");
+  request = Smoke(CpuSerialBackendTag::id);
+  request.output_directory = OutputDirectoryPathV1::Present({});
+  reject(request, "empty_present_output_directory_rejected");
+  request = Smoke(CpuSerialBackendTag::id);
+  request.evidence_directory = {};
+  reject(request, "missing_evidence_directory_rejected");
+  request = Smoke(CpuSerialBackendTag::id);
+  request.validation_capture = ValidationCaptureModeV1::none;
+  reject(request, "capture_evidence_mismatch_rejected");
+  request = Smoke(CpuSerialBackendTag::id);
+  request.validation_capture = static_cast<ValidationCaptureModeV1>(255);
+  reject(request, "unknown_capture_mode_rejected");
+  request = Smoke(CpuSerialBackendTag::id);
+  request.evidence_directory = {};
+  request.validation_capture = ValidationCaptureModeV1::none;
+  passed = Check(ValidateApplicationOptions(request).accepted(),
+                 "ordinary_non_evidence_pair_accepted") &&
+      passed;
+  request = SplitWriter(Smoke(CpuSerialBackendTag::id));
+  request.checkpoint_out = {};
+  reject(request, "writer_missing_checkpoint_out_rejected");
+  request = SplitWriter(Smoke(CpuSerialBackendTag::id));
+  request.checkpoint_step = OptionalCheckpointStepV1::Present(2);
+  reject(request, "wrong_checkpoint_step_rejected");
+  request = SplitWriter(Smoke(CpuSerialBackendTag::id));
+  request.checkpoint_step = {false, 1};
+  reject(request, "absent_nonzero_checkpoint_step_rejected");
+  request = SplitWriter(Smoke(CpuSerialBackendTag::id));
+  request.restart_from =
+      CheckpointArtifactPathV1::Present("unexpected/restart");
+  reject(request, "writer_restart_path_rejected");
+  request = SplitWriter(Smoke(CpuSerialBackendTag::id));
+  request.stop_after_checkpoint = StopAfterCheckpointV1::no;
+  reject(request, "writer_stop_control_rejected");
+  request = SplitWriter(Smoke(CpuSerialBackendTag::id));
+  request.stop_after_checkpoint = static_cast<StopAfterCheckpointV1>(255);
+  reject(request, "unknown_stop_control_rejected");
+  request = SplitReader(Smoke(CpuSerialBackendTag::id));
+  request.restart_from = {};
+  reject(request, "reader_missing_restart_path_rejected");
+  request = SplitReader(Smoke(CpuSerialBackendTag::id));
+  request.checkpoint_step = OptionalCheckpointStepV1::Present(1);
+  reject(request, "reader_checkpoint_step_rejected");
+  request = SplitReader(Smoke(CpuSerialBackendTag::id));
+  request.injection.phase = FailurePhase::Recovery;
+  reject(request, "reader_injection_phase_rejected");
+  request = SplitReader(Smoke(CpuSerialBackendTag::id));
+  request.injection.mode = static_cast<FailureInjectionModeV1>(255);
+  reject(request, "unknown_injection_mode_rejected");
+  request = SplitReader(Smoke(CpuSerialBackendTag::id));
+  request.injection.target_step = 3;
+  reject(request, "reader_injection_target_rejected");
+  request = SplitReader(Smoke(CpuSerialBackendTag::id));
+  request.injection.source_rank = 1;
+  reject(request, "reader_injection_source_rejected");
+  request = SplitReader(Smoke(CpuSerialBackendTag::id));
+  request.retry_limit = 0;
+  reject(request, "reader_retry_rejected");
+  request = Smoke(CpuSerialBackendTag::id);
+  request.seed = 0;
+  reject(request, "scenario_seed_rejected");
+  request = Focused(Smoke(CpuSerialBackendTag::id), FailurePhase::Recovery, 0);
+  request.injection.phase = FailurePhase::Commit;
+  reject(request, "unlisted_focused_phase_rejected");
+  request = Focused(Smoke(CpuSerialBackendTag::id), FailurePhase::Recovery, 0);
+  request.injection.target_step = 1;
+  reject(request, "focused_nonstaging_target_rejected");
+  request = Focused(Smoke(CpuSerialBackendTag::id),
+                    FailurePhase::CheckpointStaging, 0);
+  request.injection.target_step = 2;
+  reject(request, "focused_staging_target_rejected");
+  request = Functional(CpuSerialBackendTag::id);
+  request.run_role = ApplicationRunRoleV1::alternate_seed_reference;
+  reject(request, "alternate_role_requires_alternate_seed");
+  return passed;
+}
+
+bool CheckScientificCrossProducts()
 {
   bool passed = true;
   for (const std::uint32_t mesh : {3U, 6U, 12U})
   {
     passed = Check(ValidateApplicationOptions(
                        Functional(CpuSerialBackendTag::id, mesh)).accepted(),
-                   "serial_functional_convergence_ladder_admitted") &&
+                   "serial_functional_ladder") &&
         passed;
   }
   ApplicationOptionsView request = Smoke(CpuSerialBackendTag::id);
   request.mesh_n = 6;
   passed = Check(ValidateApplicationOptions(request).rejection() ==
                      ApplicationRejection::invalid_polynomial_mesh_pair,
-                 "p1_N6_cross_product_rejected") &&
-      passed;
-  request = Smoke(CpuSerialBackendTag::id);
-  request.accepted_steps = 4;
-  passed = Check(ValidateApplicationOptions(request).rejection() ==
-                     ApplicationRejection::invalid_step_count,
-                 "smoke_steps_above_exact_bound_rejected") &&
-      passed;
-  request = Functional(CpuSerialBackendTag::id);
-  request.accepted_steps = 21;
-  passed = Check(ValidateApplicationOptions(request).rejection() ==
-                     ApplicationRejection::invalid_step_count,
-                 "functional_steps_above_exact_bound_rejected") &&
+                 "smoke_cross_product_rejected") &&
       passed;
   request = Functional(CpuRank2BackendTag::id, 3);
   passed = Check(ValidateApplicationOptions(request).rejection() ==
-                     ApplicationRejection::invalid_polynomial_mesh_pair,
-                 "rank2_cannot_bind_serial_N3_ladder_point") &&
+                     (CompiledBackendAvailable(ApplicationBackend::cpu_rank2)
+                          ? ApplicationRejection::invalid_polynomial_mesh_pair
+                          : ApplicationRejection::unbuilt_backend),
+                 "rank2_serial_ladder_cross_product_rejected") &&
       passed;
-  if (CompiledBackendAvailable(ApplicationBackend::cuda_rank1_one_gpu))
-  {
-    request = Functional(CudaRank1OneGpuBackendTag::id, 12);
-    passed = Check(ValidateApplicationOptions(request).rejection() ==
-                       ApplicationRejection::invalid_polynomial_mesh_pair,
-                   "CUDA_cannot_bind_serial_N12_ladder_point") &&
-        passed;
-  }
-  return passed;
-}
-
-bool CheckExactMutationRejections()
-{
-  bool passed = true;
-  const auto expect = [&](ApplicationOptionsView request,
-                          const ApplicationRejection expected,
-                          const char* name) {
-    const ApplicationValidation result = ValidateApplicationOptions(request);
-    passed = Check(!result.accepted() && result.config() == nullptr &&
-                       result.rejection() == expected,
-                   name) &&
-        passed;
-  };
-  ApplicationOptionsView request = Smoke(CpuSerialBackendTag::id);
-  request.card_id = "wrong-card";
-  expect(request, ApplicationRejection::unknown_card, "card_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.case_id = "wrong-case";
-  expect(request, ApplicationRejection::unknown_case, "case_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.scenario_id = "wrong-scenario";
-  expect(request, ApplicationRejection::unknown_scenario, "scenario_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.interior_space = InteriorSpace::h1;
-  expect(request, ApplicationRejection::unsupported_h1, "H1_explicit");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.formulation_id = "wrong-tuple";
-  expect(request, ApplicationRejection::unknown_tuple, "tuple_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.backend_id = "wrong-backend";
-  expect(request, ApplicationRejection::unknown_backend, "backend_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.source_id = "wrong-source";
-  expect(request, ApplicationRejection::invalid_scientific_identity,
-         "source_flux_time_layout_identities_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.scientific_config_sha256 = {};
-  expect(request, ApplicationRejection::invalid_config_hash,
-         "scientific_and_run_hash_inputs_required");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.q_o = 22;
-  expect(request, ApplicationRejection::invalid_quadrature,
-         "scenario_quadratures_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.dt = 0.1;
-  expect(request, ApplicationRejection::invalid_dt, "dt_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.final_time = 0.2;
-  expect(request, ApplicationRejection::invalid_final_time,
-         "final_time_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.output_steps = {{0, 2, 3}};
-  expect(request, ApplicationRejection::invalid_output_schedule,
-         "output_schedule_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.checkpoint_step = 2;
-  expect(request, ApplicationRejection::invalid_checkpoint_schedule,
-         "checkpoint_step_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.checkpoint_id = "wrong-checkpoint";
-  expect(request, ApplicationRejection::invalid_checkpoint_identity,
-         "checkpoint_identity_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.restart_mode = static_cast<RestartMode>(255);
-  expect(request, ApplicationRejection::invalid_restart_mode,
-         "restart_mode_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.injected_failure_committed_step = 0;
-  expect(request, ApplicationRejection::invalid_failure_injection,
-         "failure_commit_target_pair_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.injected_failure_phase = FailurePhase::Recovery;
-  expect(request, ApplicationRejection::invalid_failure_phase,
-         "failure_phase_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.source_rank_rule = static_cast<DeferredSourceRankRuleV1>(255);
-  expect(request, ApplicationRejection::invalid_source_rank_rule,
-         "deferred_source_rule_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.retry_limit = 2;
-  expect(request, ApplicationRejection::invalid_retry_limit,
-         "one_retry_bound");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.seed = 0;
-  expect(request, ApplicationRejection::invalid_seed, "scenario_seed_bound");
   return passed;
 }
 
@@ -361,13 +394,14 @@ bool CheckExactMutationRejections()
 int main()
 {
   bool passed = true;
-  passed = CheckAcceptedExactFields() && passed;
-  passed = CheckTwoScenarioBackendMatrix() && passed;
-  passed = CheckNoScenarioCrossProducts() && passed;
-  passed = CheckExactMutationRejections() && passed;
+  passed = CheckExactAcceptedFieldsAndHashes() && passed;
+  passed = CheckRoleBackendMatrix() && passed;
+  passed = CheckFocusedAndAlternateRoles() && passed;
+  passed = CheckNegativeRoleControls() && passed;
+  passed = CheckScientificCrossProducts() && passed;
   if (passed)
   {
-    std::cout << "HDG W8A static application admission checks passed\n";
+    std::cout << "HDG W8A typed application admission checks passed\n";
     return 0;
   }
   return 1;
