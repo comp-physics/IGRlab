@@ -545,9 +545,11 @@ BuildPersistentTrueSystem() noexcept
       TransportPolicy::Synchronize(CudaTransferSite::initial_trace_upload);
   if (!CollectiveContinue(staging_ready))
     return false;
-  // Warm the persistent Krylov/factor workspaces before the allocation
-  // baseline. The topology matrix is deliberately diagonally dominant here;
-  // each real generation overwrites only its already-fixed numerical values.
+  // Materialize the exact Krylov/factor allocation footprint before the
+  // allocation baseline. The topology matrix is deliberately diagonally
+  // dominant here; each real generation overwrites only its already-fixed
+  // numerical values. The warmed solver objects are retired below so their
+  // released pool blocks back the subsequently recreated persistent pair.
   // A deterministic nonzero RHS forces the setup path to materialize the
   // persistent solver workspace instead of accepting an identity no-op.
   *hypre_rhs_ = 1.0;
@@ -559,12 +561,52 @@ BuildPersistentTrueSystem() noexcept
   const bool warmed = warm_solved && warm.device_policy &&
       warm.configured_ilu0 &&
       warm.matrix_generation == 0;
-  if (warm_solved)
+  if (!CollectiveContinue(warmed)) { return false; }
+
+  bool warm_state_zeroed = false;
+  try
   {
     *hypre_rhs_ = 0.0;
     *hypre_solution_ = 0.0;
+    warm_state_zeroed = true;
   }
-  return CollectiveContinue(warmed);
+  catch (...) { warm_state_zeroed = false; }
+  ReportCudaWarmLifetimeMarker(
+      rank_, "warm-synchronization", "before", false);
+  const bool warm_synchronized = warm_state_zeroed &&
+      TransportPolicy::Synchronize(CudaTransferSite::initial_trace_upload);
+  ReportCudaWarmLifetimeMarker(
+      rank_, "warm-synchronization", "after", warm_synchronized);
+  if (!CollectiveContinue(warm_synchronized)) { return false; }
+
+  ReportCudaWarmLifetimeMarker(
+      rank_, "gmres-retirement", "before", false);
+  gmres_.reset();
+  ReportCudaWarmLifetimeMarker(
+      rank_, "gmres-retirement", "after", !gmres_);
+  ReportCudaWarmLifetimeMarker(
+      rank_, "ilu-retirement", "before", false);
+  ilu_.reset();
+  ReportCudaWarmLifetimeMarker(
+      rank_, "ilu-retirement", "after", !ilu_);
+
+  bool persistent_configured = false;
+  ReportCudaWarmLifetimeMarker(
+      rank_, "persistent-recreation-configuration", "before", false);
+  try
+  {
+    ilu_.emplace();
+    gmres_.emplace(*true_matrix_);
+    CudaHypreSetupOrderEvidence persistent_setup{};
+    persistent_configured = CudaConfigurePersistentHypre(
+        *true_matrix_, *ilu_, *gmres_, ranks_, 0, persistent_setup) &&
+        persistent_setup.ConfigurationExactForGeneration(0);
+  }
+  catch (...) { persistent_configured = false; }
+  ReportCudaWarmLifetimeMarker(
+      rank_, "persistent-recreation-configuration", "after",
+      persistent_configured);
+  return CollectiveContinue(persistent_configured);
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>

@@ -10,6 +10,18 @@ static inline void ReportCudaSetupFailure(const int rank,
     std::fprintf(stderr, "CUDA_SETUP_FAIL stage=%s\n", stage);
 }
 
+// Allocation-free lifetime markers for the isolated HYPRE warm setup.  These
+// deliberately do not inspect or mutate CUDA/HYPRE error state and must never
+// add an allocator/high-water sample of their own.
+static inline void ReportCudaWarmLifetimeMarker(
+    const int rank, const char* const stage, const char* const edge,
+    const bool result) noexcept
+{
+  std::fprintf(stderr,
+      "CUDA_WARM_LIFETIME rank=%d stage=%s edge=%s result=%u\n",
+      rank, stage, edge, result ? 1U : 0U);
+}
+
 // Stable private backend-admission mask: bits 0..15 are rank count,
 // cudaSetDevice, cudaGetDevice, selected device zero, MFEM configured,
 // MFEM CUDA allowed, MFEM debug-device disabled, zero incoming HYPRE error,
@@ -739,7 +751,11 @@ public:
                             persistent_integer_capacity * sizeof(int),
                         WorkspaceBytes()};
     tuple_ = tuple;
+    ReportCudaWarmLifetimeMarker(
+        rank_, "baseline-high-water-sampling", "before", false);
     baseline_allocations_ = AllocatorPolicy::AllocationEvents();
+    ReportCudaWarmLifetimeMarker(
+        rank_, "baseline-high-water-sampling", "after", true);
     baseline_w8_owned_allocation_calls_ =
         AllocatorPolicy::W8OwnedAllocationCalls();
     initialized_ = true;
@@ -920,8 +936,14 @@ public:
     value.trace_slot_tokens = {{committed_slot_.trace.storage_token,
                                 candidate_slot_.trace.storage_token}};
     value.baseline_allocation_events = baseline_allocations_;
+    ReportCudaWarmLifetimeMarker(
+        rank_, "reuse-evidence-sampling", "before", false);
+    const std::uint64_t current_allocation_events =
+        AllocatorPolicy::AllocationEvents();
+    ReportCudaWarmLifetimeMarker(
+        rank_, "reuse-evidence-sampling", "after", true);
     value.post_baseline_allocation_events =
-        AllocatorPolicy::AllocationEvents() - baseline_allocations_;
+        current_allocation_events - baseline_allocations_;
     value.baseline_w8_owned_allocation_calls =
         baseline_w8_owned_allocation_calls_;
     value.post_baseline_w8_owned_allocation_calls =
