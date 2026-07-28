@@ -529,6 +529,114 @@ using CudaCopyOutFunction = bool (*)(
     CudaTransferSite, std::size_t, std::size_t) noexcept;
 using CudaSynchronizeFunction = bool (*)(CudaTransferSite) noexcept;
 
+#if defined(__CUDACC__)
+// Retained element factors are private CUDA implementation details.  Keeping
+// these operations static and inline lets the production kernels and the CUDA
+// leaf's test-only device seam exercise exactly the same ordering without
+// adding an application ABI surface.
+static __device__ inline bool CudaFactorRetained(
+    double* lu, double* pivots, const int rows)
+{
+  double scale = 0.0;
+  for (int entry = 0; entry < rows * rows; ++entry)
+    scale = fmax(scale, fabs(lu[entry]));
+  for (int column = 0; column < rows; ++column)
+  {
+    int pivot = column;
+    for (int row = column + 1; row < rows; ++row)
+      if (fabs(lu[row * rows + column]) >
+          fabs(lu[pivot * rows + column]))
+        pivot = row;
+    pivots[column] = pivot;
+    if (!(fabs(lu[pivot * rows + column]) >
+          64.0 * 2.2204460492503131e-16 * scale))
+      return false;
+    if (pivot != column)
+    {
+      for (int entry = 0; entry < rows; ++entry)
+      {
+        const double value = lu[column * rows + entry];
+        lu[column * rows + entry] = lu[pivot * rows + entry];
+        lu[pivot * rows + entry] = value;
+      }
+    }
+    for (int row = column + 1; row < rows; ++row)
+    {
+      lu[row * rows + column] /= lu[column * rows + column];
+      for (int entry = column + 1; entry < rows; ++entry)
+        lu[row * rows + entry] -=
+            lu[row * rows + column] * lu[column * rows + entry];
+    }
+  }
+  return true;
+}
+
+static __device__ inline void CudaSolveRetained(
+    const double* lu, const double* pivots, const int rows,
+    double* rhs, const int columns)
+{
+  // Complete row swaps move previously stored lower columns.  Apply the
+  // retained permutation sequence before forward substitution so a delayed
+  // pivot cannot permute an already-eliminated right-hand side.
+  for (int row = 0; row < rows; ++row)
+  {
+    const int pivot = static_cast<int>(pivots[row]);
+    if (pivot != row)
+    {
+      for (int column = 0; column < columns; ++column)
+      {
+        const double value = rhs[row * columns + column];
+        rhs[row * columns + column] = rhs[pivot * columns + column];
+        rhs[pivot * columns + column] = value;
+      }
+    }
+  }
+  for (int column = 0; column < rows; ++column)
+    for (int row = column + 1; row < rows; ++row)
+      for (int rhs_column = 0; rhs_column < columns; ++rhs_column)
+        rhs[row * columns + rhs_column] -=
+            lu[row * rows + column] *
+            rhs[column * columns + rhs_column];
+  for (int row = rows - 1; row >= 0; --row)
+  {
+    for (int rhs_column = 0; rhs_column < columns; ++rhs_column)
+    {
+      for (int column = row + 1; column < rows; ++column)
+        rhs[row * columns + rhs_column] -=
+            lu[row * rows + column] *
+            rhs[column * columns + rhs_column];
+      rhs[row * columns + rhs_column] /= lu[row * rows + row];
+    }
+  }
+}
+
+static __device__ inline bool CudaFactorSolveRetained(
+    double* lu, double* pivots, const int rows,
+    double* rhs, const int columns)
+{
+  if (!CudaFactorRetained(lu, pivots, rows)) { return false; }
+  CudaSolveRetained(lu, pivots, rows, rhs, columns);
+  return true;
+}
+
+static __device__ inline void CudaRecoverRetained(
+    const double* lu, const double* pivots, const int interior_rows,
+    const double* coupling, const int trace_rows,
+    const double* trace_increment, const double* interior_rhs,
+    double* recovered)
+{
+  for (int row = 0; row < interior_rows; ++row)
+  {
+    double value = interior_rhs[row];
+    for (int column = 0; column < trace_rows; ++column)
+      value -= coupling[row * trace_rows + column] *
+          trace_increment[column];
+    recovered[row] = value;
+  }
+  CudaSolveRetained(lu, pivots, interior_rows, recovered, 1);
+}
+#endif
+
 bool CudaCopyHypreBigIntHost(HYPRE_BigInt* destination,
                              std::size_t destination_capacity,
                              const HYPRE_BigInt* source,

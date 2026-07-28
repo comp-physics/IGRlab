@@ -1320,29 +1320,6 @@ __global__ void AssemblyKernel(CudaDeviceView v, CudaMeshShape s,
   for(int i=0;i<nt;++i) v.g[e_t+i]=-v.residual_g[e_t+i];
 }
 
-__device__ bool FactorSolve(double* lu, double* pivots, const int n,
-                            double* rhs, const int columns)
-{
-  double scale=0; for(int i=0;i<n*n;++i) scale=fmax(scale,fabs(lu[i]));
-  for(int k=0;k<n;++k)
-  {
-    int pivot=k; for(int r=k+1;r<n;++r)
-      if(fabs(lu[r*n+k])>fabs(lu[pivot*n+k])) pivot=r;
-    pivots[k]=pivot;
-    if(!(fabs(lu[pivot*n+k])>64.0*2.2204460492503131e-16*scale)) return false;
-    if(pivot!=k) for(int c=0;c<n;++c)
-    {double x=lu[k*n+c];lu[k*n+c]=lu[pivot*n+c];lu[pivot*n+c]=x;}
-    for(int r=k+1;r<n;++r){lu[r*n+k]/=lu[k*n+k];for(int c=k+1;c<n;++c)lu[r*n+c]-=lu[r*n+k]*lu[k*n+c];}
-  }
-  // Factorization swaps complete LU rows, including previously stored lower
-  // columns.  Apply the retained pivot sequence completely before forward
-  // substitution so delayed pivots cannot permute an already-eliminated RHS.
-  for(int k=0;k<n;++k){const int p=static_cast<int>(pivots[k]);if(p!=k)for(int c=0;c<columns;++c){double x=rhs[k*columns+c];rhs[k*columns+c]=rhs[p*columns+c];rhs[p*columns+c]=x;}}
-  for(int k=0;k<n;++k)for(int r=k+1;r<n;++r)for(int c=0;c<columns;++c)rhs[r*columns+c]-=lu[r*n+k]*rhs[k*columns+c];
-  for(int k=n-1;k>=0;--k)for(int c=0;c<columns;++c){for(int j=k+1;j<n;++j)rhs[k*columns+c]-=lu[k*n+j]*rhs[j*columns+c];rhs[k*columns+c]/=lu[k*n+k];}
-  return true;
-}
-
 __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;
@@ -1355,7 +1332,7 @@ __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
   double* w=v.solve_workspace+static_cast<std::size_t>(e)*ni*cols;
   for(int i=0;i<ni*ni;++i)lu[i]=v.a[ao+i];
   for(int r=0;r<ni;++r){for(int c=0;c<nt;++c)w[r*cols+c]=v.b[bo+r*nt+c];w[r*cols+nt]=v.f[e*ni+r];}
-  if(!FactorSolve(lu,p,ni,w,cols)){v.status[e]=-1;return;}
+  if(!CudaFactorSolveRetained(lu,p,ni,w,cols)){v.status[e]=-1;return;}
   for(int r=0;r<nt;++r){double rhs=v.g[e*nt+r];for(int k=0;k<ni;++k)rhs-=v.c[co+r*ni+k]*w[k*cols+nt];v.condensed_rhs[e*nt+r]=rhs;for(int c=0;c<nt;++c){double x=v.d[so+r*nt+c];for(int k=0;k<ni;++k)x-=v.c[co+r*ni+k]*w[k*cols+c];v.schur[so+r*nt+c]=x;}}
   v.status[e]=1;
 }
@@ -1386,7 +1363,14 @@ __global__ void ScatterRemoteVectorKernel(CudaDeviceView v,double* truth,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(truth+v.vector_receive_target[i],v.remote_vector_receive[i]);}
 
 __global__ void RecoverKernel(CudaDeviceView v,CudaMeshShape s)
-{const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;const int ni=s.interior_dofs,nt=s.trace_dofs;double* x=v.recovered_interior+e*ni;for(int r=0;r<ni;++r){double q=v.f[e*ni+r];for(int c=0;c<nt;++c)q-=v.b[(e*ni+r)*nt+c]*v.trace_increment_local[e*nt+c];x[r]=q;}double* lu=v.lu+e*ni*ni;double* p=v.pivots+e*ni;for(int k=0;k<ni;++k){const int pivot=static_cast<int>(p[k]);if(pivot!=k){double q=x[k];x[k]=x[pivot];x[pivot]=q;}}for(int k=0;k<ni;++k)for(int r=k+1;r<ni;++r)x[r]-=lu[r*ni+k]*x[k];for(int k=ni-1;k>=0;--k){for(int j=k+1;j<ni;++j)x[k]-=lu[k*ni+j]*x[j];x[k]/=lu[k*ni+k];}v.status[e]=1;}
+{
+  const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs;
+  CudaRecoverRetained(v.lu+e*ni*ni,v.pivots+e*ni,ni,
+                      v.b+e*ni*nt,nt,v.trace_increment_local+e*nt,
+                      v.f+e*ni,v.recovered_interior+e*ni);
+  v.status[e]=1;
+}
 __global__ void TrialKernel(CudaDeviceView v,CudaMeshShape s,double alpha)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<s.interior_count)v.trial_interior[i]=v.base_interior[i]+alpha*v.recovered_interior[i];if(i<s.true_trace_count)v.trial_true_trace[i]=v.base_true_trace[i]+alpha*v.true_solution[i];}
 __global__ void NormKernel(const double* a,int an,const double* b,int bn,double* out)

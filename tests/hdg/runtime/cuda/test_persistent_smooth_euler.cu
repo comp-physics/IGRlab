@@ -144,6 +144,187 @@ bool TicketHighHalfRegression() noexcept
           synthetic_attempt, synthetic_generation, 0);
 }
 
+struct RetainedSolveDeviceEvidence
+{
+  int factor_solve_ok;
+  int recovery_exercised;
+  double pivots[3];
+  double multiple_rhs[6];
+  double recovery[3];
+  double old_interleaved_rhs[6];
+};
+
+__device__ RetainedSolveDeviceEvidence retained_solve_device_evidence;
+
+__global__ void RetainedSolveTestSeamKernel()
+{
+  if (blockIdx.x != 0 || threadIdx.x != 0) { return; }
+  RetainedSolveDeviceEvidence* const evidence =
+      &retained_solve_device_evidence;
+  evidence->factor_solve_ok = 0;
+  evidence->recovery_exercised = 0;
+  for (int entry = 0; entry < 3; ++entry)
+  {
+    evidence->pivots[entry] = -1.0;
+    evidence->recovery[entry] = 0.0;
+  }
+  for (int entry = 0; entry < 6; ++entry)
+  {
+    evidence->multiple_rhs[entry] = 0.0;
+    evidence->old_interleaved_rhs[entry] = 0.0;
+  }
+
+  double lu[9] = {4.0, 0.0, 0.0,
+                  2.0, 1.0, 2.0,
+                  1.0, 4.0, 1.0};
+  double rhs[6] = {4.0, -8.0,
+                   10.0, 5.0,
+                   12.0, 6.0};
+  evidence->factor_solve_ok = cuda_detail::CudaFactorSolveRetained(
+      lu, evidence->pivots, 3, rhs, 2) ? 1 : 0;
+  if (evidence->factor_solve_ok == 0) { return; }
+  for (int entry = 0; entry < 6; ++entry)
+    evidence->multiple_rhs[entry] = rhs[entry];
+
+  const double coupling[6] = {1.0, 2.0,
+                              -1.0, 3.0,
+                              2.0, -2.0};
+  const double trace_increment[2] = {2.0, -1.0};
+  const double interior_rhs[3] = {8.0, 0.0, 5.0};
+  cuda_detail::CudaRecoverRetained(
+      lu, evidence->pivots, 3, coupling, 2, trace_increment,
+      interior_rhs, evidence->recovery);
+  evidence->recovery_exercised = 1;
+
+  const double original_rhs[6] = {4.0, -8.0,
+                                  10.0, 5.0,
+                                  12.0, 6.0};
+  for (int entry = 0; entry < 6; ++entry)
+    evidence->old_interleaved_rhs[entry] = original_rhs[entry];
+  // Active negative control: this is the rejected ordering that interleaves
+  // each retained pivot with forward elimination.
+  for (int column = 0; column < 3; ++column)
+  {
+    const int pivot = static_cast<int>(evidence->pivots[column]);
+    if (pivot != column)
+    {
+      for (int rhs_column = 0; rhs_column < 2; ++rhs_column)
+      {
+        const double value =
+            evidence->old_interleaved_rhs[column * 2 + rhs_column];
+        evidence->old_interleaved_rhs[column * 2 + rhs_column] =
+            evidence->old_interleaved_rhs[pivot * 2 + rhs_column];
+        evidence->old_interleaved_rhs[pivot * 2 + rhs_column] = value;
+      }
+    }
+    for (int row = column + 1; row < 3; ++row)
+      for (int rhs_column = 0; rhs_column < 2; ++rhs_column)
+        evidence->old_interleaved_rhs[row * 2 + rhs_column] -=
+            lu[row * 3 + column] *
+            evidence->old_interleaved_rhs[column * 2 + rhs_column];
+  }
+  for (int row = 2; row >= 0; --row)
+  {
+    for (int rhs_column = 0; rhs_column < 2; ++rhs_column)
+    {
+      for (int column = row + 1; column < 3; ++column)
+        evidence->old_interleaved_rhs[row * 2 + rhs_column] -=
+            lu[row * 3 + column] *
+            evidence->old_interleaved_rhs[column * 2 + rhs_column];
+      evidence->old_interleaved_rhs[row * 2 + rhs_column] /=
+          lu[row * 3 + row];
+    }
+  }
+}
+
+bool RetainedMultipleRhsSolutionsExact(const double* const solutions) noexcept
+{
+  constexpr double exact[6] = {1.0, -2.0,
+                               2.0, 1.0,
+                               3.0, 4.0};
+  for (int entry = 0; entry < 6; ++entry)
+    if (solutions[entry] != exact[entry]) { return false; }
+  return true;
+}
+
+bool RetainedMultipleRhsResidualsExact(const double* const solutions) noexcept
+{
+  constexpr double matrix[9] = {4.0, 0.0, 0.0,
+                                2.0, 1.0, 2.0,
+                                1.0, 4.0, 1.0};
+  constexpr double rhs[6] = {4.0, -8.0,
+                             10.0, 5.0,
+                             12.0, 6.0};
+  for (int row = 0; row < 3; ++row)
+  {
+    for (int rhs_column = 0; rhs_column < 2; ++rhs_column)
+    {
+      double product = 0.0;
+      for (int column = 0; column < 3; ++column)
+        product += matrix[row * 3 + column] *
+            solutions[column * 2 + rhs_column];
+      if (product != rhs[row * 2 + rhs_column])
+        return false;
+    }
+  }
+  return true;
+}
+
+bool RetainedRecoveryExact(const double* const recovery) noexcept
+{
+  constexpr double matrix[9] = {4.0, 0.0, 0.0,
+                                2.0, 1.0, 2.0,
+                                1.0, 4.0, 1.0};
+  constexpr double coupling[6] = {1.0, 2.0,
+                                  -1.0, 3.0,
+                                  2.0, -2.0};
+  constexpr double trace_increment[2] = {2.0, -1.0};
+  constexpr double interior_rhs[3] = {8.0, 0.0, 5.0};
+  constexpr double exact[3] = {2.0, -1.0, 1.0};
+  for (int row = 0; row < 3; ++row)
+  {
+    if (recovery[row] != exact[row]) { return false; }
+    double effective_rhs = interior_rhs[row];
+    for (int column = 0; column < 2; ++column)
+      effective_rhs -= coupling[row * 2 + column] *
+          trace_increment[column];
+    double product = 0.0;
+    for (int column = 0; column < 3; ++column)
+      product += matrix[row * 3 + column] * recovery[column];
+    if (product != effective_rhs) { return false; }
+  }
+  return true;
+}
+
+bool RetainedDelayedPivotRegression() noexcept
+{
+  RetainedSolveDeviceEvidence evidence{};
+  RetainedSolveTestSeamKernel<<<1, 1>>>();
+  const bool launch_exact = cudaPeekAtLastError() == cudaSuccess;
+  const bool synchronized = launch_exact &&
+      cudaDeviceSynchronize() == cudaSuccess;
+  const bool copied = synchronized &&
+      cudaMemcpyFromSymbol(&evidence, retained_solve_device_evidence,
+                           sizeof(RetainedSolveDeviceEvidence)) ==
+          cudaSuccess;
+  if (!copied) { return false; }
+
+  const bool delayed_pivot_observed =
+      evidence.pivots[0] == 0.0 && evidence.pivots[1] == 2.0 &&
+      evidence.pivots[1] != 1.0 && evidence.pivots[2] == 2.0;
+  const bool exact_multiple_solutions =
+      RetainedMultipleRhsSolutionsExact(evidence.multiple_rhs);
+  const bool exact_multiple_residuals =
+      RetainedMultipleRhsResidualsExact(evidence.multiple_rhs);
+  const bool old_ordering_rejected =
+      !RetainedMultipleRhsSolutionsExact(evidence.old_interleaved_rhs) &&
+      !RetainedMultipleRhsResidualsExact(evidence.old_interleaved_rhs);
+  return evidence.factor_solve_ok == 1 &&
+      evidence.recovery_exercised == 1 && delayed_pivot_observed &&
+      exact_multiple_solutions && exact_multiple_residuals &&
+      RetainedRecoveryExact(evidence.recovery) && old_ordering_rejected;
+}
+
 struct TestModelTag
 {
   inline static constexpr std::string_view id = "euler.compressible.2d";
@@ -5023,6 +5204,8 @@ int main(int argc, char** argv)
              HypreIluGenerationSetupRegression());
     run_case("rank1.common.ticket-high-half",
              TicketHighHalfRegression());
+    run_case("rank1.common.retained-delayed-pivot",
+             RetainedDelayedPivotRegression());
     run_case("rank1.common.shared-contract-negatives",
              DirectSharedContractNegatives());
     run_case("rank1.common.collective-case-boundary",
@@ -5101,6 +5284,8 @@ int main(int argc, char** argv)
              HypreIluGenerationSetupRegression());
     run_case("rank2.common.ticket-high-half",
              TicketHighHalfRegression());
+    run_case("rank2.common.retained-delayed-pivot",
+             RetainedDelayedPivotRegression());
     run_case("rank2.common.shared-contract-negatives",
              DirectSharedContractNegatives());
     run_case("rank2.common.collective-case-boundary",
