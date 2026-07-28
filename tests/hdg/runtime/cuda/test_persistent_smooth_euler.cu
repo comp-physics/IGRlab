@@ -3356,7 +3356,7 @@ bool CommitFunctionalAttempt(
       checkpoint.interior_count == snapshot.interior_coefficients &&
       checkpoint.owned_true_trace_count ==
           snapshot.true_trace_coefficients &&
-      ExactId(checkpoint.descriptor.layout, runtime_layout_id) &&
+      checkpoint.descriptor.layout.view() == runtime_layout_id &&
       checkpoint.staging_generation == snapshot.target.generation &&
       ValidRange(checkpoint.staging_range, AuditedTransport::Ledger()) &&
       ExactPolicyLedgers();
