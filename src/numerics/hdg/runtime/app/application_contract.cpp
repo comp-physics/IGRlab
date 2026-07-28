@@ -774,8 +774,10 @@ bool DeriveSplitWriterRunConfigHashV1(
   writer.run_role = ApplicationRunRoleV1::split_writer;
   writer.output_directory = OutputDirectoryPathV1::Present(
       split_reader.output_directory().identity().view());
-  writer.evidence_directory = EvidenceDirectoryPathV1::Present(
-      split_reader.evidence_directory().identity().view());
+  writer.evidence_directory = split_reader.evidence_directory().present()
+      ? EvidenceDirectoryPathV1::Present(
+            split_reader.evidence_directory().identity().view())
+      : EvidenceDirectoryPathV1{};
   writer.validation_capture = split_reader.validation_capture();
   writer.checkpoint_out = CheckpointArtifactPathV1::Present(
       split_reader.restart_from().identity().view());

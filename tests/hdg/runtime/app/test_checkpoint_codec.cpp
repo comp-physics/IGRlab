@@ -410,7 +410,9 @@ StateHash FilledHash(const std::uint8_t first) noexcept
   return hash;
 }
 
-PersistentResourceDescriptor TestResources(const std::uint32_t rank_count)
+PersistentResourceDescriptor TestResources(
+    const std::uint32_t rank_count,
+    const int polynomial_order = 1)
 {
   PersistentResourceDescriptor resources{};
   resources.mfem_pin = StableIdentity::Copy("d9d6526cc1749980");
@@ -418,7 +420,7 @@ PersistentResourceDescriptor TestResources(const std::uint32_t rank_count)
   resources.partition_hash = FilledHash(0x30);
   resources.topology_hash = FilledHash(0x50);
   resources.rank_count = rank_count;
-  resources.polynomial_order = 1;
+  resources.polynomial_order = polynomial_order;
   resources.layout = StableIdentity::Copy(
       smooth_periodic_euler_v1_layout_id);
   resources.reuse = {true, true, true, false, 1, 1, 128, 64};
@@ -432,24 +434,57 @@ CheckpointRuntimeIdentityV1 TestRuntimeIdentity()
   return identity;
 }
 
-ApplicationOptionsView TestOptions(const std::string_view backend)
+ApplicationOptionsView TestOptions(const std::string_view backend,
+                                   const bool persistent = true)
 {
   ApplicationOptionsView options;
   options.backend_id = backend;
+  if (!persistent)
+  {
+    options.evidence_directory = {};
+    options.validation_capture = ValidationCaptureModeV1::none;
+  }
   return options;
 }
 
-ApplicationValidation TestValidation(const std::string_view backend)
+ApplicationOptionsView FunctionalTestOptions(
+    const std::string_view backend,
+    const bool persistent = true)
 {
-  ApplicationOptionsView options = TestOptions(backend);
+  ApplicationOptionsView options = TestOptions(backend, persistent);
+  options.scenario_id = smooth_periodic_euler_v1_functional_id;
+  options.polynomial_order =
+      smooth_periodic_euler_v1_functional_polynomial_order;
+  options.mesh_n = smooth_periodic_euler_v1_functional_mesh_n;
+  options.q_a = smooth_periodic_euler_v1_functional_q_a;
+  options.q_e = smooth_periodic_euler_v1_functional_q_e;
+  options.q_e4 = smooth_periodic_euler_v1_functional_q_e4;
+  options.q_o = smooth_periodic_euler_v1_functional_q_o;
+  options.accepted_steps = smooth_periodic_euler_v1_functional_steps;
+  options.final_time = smooth_periodic_euler_v1_functional_final_time;
+  options.output_steps = smooth_periodic_euler_v1_functional_output_steps;
+  options.checkpoint_id =
+      smooth_periodic_euler_v1_functional_checkpoint_id;
+  options.checkpoint_step = OptionalCheckpointStepV1::Present(
+      smooth_periodic_euler_v1_functional_checkpoint_step);
+  options.seed = smooth_periodic_euler_v1_functional_seed;
+  return options;
+}
+
+ApplicationValidation TestValidation(const std::string_view backend,
+                                     const bool persistent = true)
+{
+  ApplicationOptionsView options = TestOptions(backend, persistent);
   options.run_role = ApplicationRunRoleV1::split_writer;
   options.stop_after_checkpoint = StopAfterCheckpointV1::yes;
   return ValidateApplicationOptions(options);
 }
 
-ApplicationValidation TestReaderValidation(const std::string_view backend)
+ApplicationValidation TestReaderValidation(
+    const std::string_view backend,
+    const bool persistent = true)
 {
-  ApplicationOptionsView options = TestOptions(backend);
+  ApplicationOptionsView options = TestOptions(backend, persistent);
   const std::string_view artifact = options.checkpoint_out.canonical;
   options.run_role = ApplicationRunRoleV1::split_reader;
   options.checkpoint_out = {};
@@ -461,6 +496,33 @@ ApplicationValidation TestReaderValidation(const std::string_view backend)
       smooth_periodic_euler_v1_smoke_failure_target_step,
       backend == CpuRank2BackendTag::id ? 1U : 0U};
   options.retry_limit = smooth_periodic_euler_v1_retry_limit;
+  return ValidateApplicationOptions(options);
+}
+
+ApplicationValidation FunctionalTestValidation(
+    const bool reader)
+{
+  ApplicationOptionsView options =
+      FunctionalTestOptions(CpuSerialBackendTag::id);
+  const std::string_view artifact = options.checkpoint_out.canonical;
+  if (reader)
+  {
+    options.run_role = ApplicationRunRoleV1::split_reader;
+    options.checkpoint_out = {};
+    options.checkpoint_step = {};
+    options.restart_from = CheckpointArtifactPathV1::Present(artifact);
+    options.injection = {
+        FailureInjectionModeV1::prescribed,
+        smooth_periodic_euler_v1_failure_phase,
+        smooth_periodic_euler_v1_functional_failure_target_step,
+        0};
+    options.retry_limit = smooth_periodic_euler_v1_retry_limit;
+  }
+  else
+  {
+    options.run_role = ApplicationRunRoleV1::split_writer;
+    options.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+  }
   return ValidateApplicationOptions(options);
 }
 
@@ -490,9 +552,19 @@ bool AdvanceOneCommit(ContractType& contract)
   report.gates = {true, true, true, true, true, true};
   report.telemetry.transfers = {0, 0, 0, 0, 0, true};
   report.telemetry.true_relative_residual = 0.0;
-  report.candidate_cursor = 1;
+  report.candidate_cursor = begin.attempt.sequence;
   return contract.FinishAttempt(begin.attempt, report,
                                 IssueAll(contract, begin.attempt)).committed;
+}
+
+template <typename ContractType>
+bool AdvanceCommits(ContractType& contract, const std::uint64_t count)
+{
+  for (std::uint64_t commit = 0; commit < count; ++commit)
+  {
+    if (!AdvanceOneCommit(contract)) { return false; }
+  }
+  return true;
 }
 
 struct CoefficientFixture
@@ -559,20 +631,58 @@ struct Rank2CoefficientFixture
   }
 };
 
+struct FunctionalCoefficientFixture
+{
+  State interior = State(1296);
+  State trace = State(864);
+
+  FunctionalCoefficientFixture()
+  {
+    for (std::size_t index = 0; index < interior.size(); ++index)
+    {
+      interior[index] = static_cast<double>(4001 + index);
+    }
+    for (std::size_t index = 0; index < trace.size(); ++index)
+    {
+      trace[index] = static_cast<double>(8001 + index);
+    }
+  }
+
+  std::array<StagedStateViewV1, 1> Views() const noexcept
+  {
+    return {{{0,
+              {interior.data(), interior.size(), 4, 324,
+               CoefficientOrderingV1::component_major},
+              {trace.data(), trace.size(), 4, 216,
+               CoefficientOrderingV1::component_major}}}};
+  }
+};
+
+template <typename Fixture>
+std::optional<CapturedCheckpointV1> MakeSerialCapture(
+    const ValidatedApplicationConfig& config,
+    const PersistentResourceDescriptor& resources,
+    const CheckpointRuntimeIdentityV1& runtime,
+    const Fixture& fixture,
+    const std::uint64_t commits)
+{
+  const Slot committed{fixture.interior, fixture.trace};
+  Slot candidate{};
+  SerialContract contract(
+      committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
+  if (!AdvanceCommits(contract, commits)) { return std::nullopt; }
+  const std::array<SerialContractView, 1> contracts{{{0, &contract}}};
+  return CaptureCheckpointV1(contracts.data(), contracts.size(), config,
+                             runtime);
+}
+
 std::optional<CapturedCheckpointV1> MakeCapture(
     const ValidatedApplicationConfig& config,
     const PersistentResourceDescriptor& resources,
     const CheckpointRuntimeIdentityV1& runtime,
     const CoefficientFixture& fixture)
 {
-  const Slot committed{fixture.interior, fixture.trace};
-  Slot candidate{};
-  SerialContract contract(
-      committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
-  if (!AdvanceOneCommit(contract)) { return std::nullopt; }
-  const std::array<SerialContractView, 1> contracts{{{0, &contract}}};
-  return CaptureCheckpointV1(contracts.data(), contracts.size(), config,
-                             runtime);
+  return MakeSerialCapture(config, resources, runtime, fixture, 1);
 }
 
 bool EncodeFixture(const CoefficientFixture& fixture,
@@ -1558,6 +1668,171 @@ bool CheckRank2CaptureAndAllRankEvidence()
   return passed;
 }
 
+bool CheckNonEvidenceSplitRoundTrip()
+{
+  const CoefficientFixture fixture;
+  const PersistentResourceDescriptor resources = TestResources(1);
+  const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
+  const ApplicationValidation writer_validation =
+      TestValidation(CpuSerialBackendTag::id, false);
+  const ApplicationValidation reader_validation =
+      TestReaderValidation(CpuSerialBackendTag::id, false);
+  const ValidatedApplicationConfig* writer = writer_validation.config();
+  const ValidatedApplicationConfig* reader = reader_validation.config();
+  bool passed = Check(writer != nullptr && reader != nullptr,
+                      "non_evidence_split_configs_validate");
+  if (writer == nullptr || reader == nullptr) { return false; }
+
+  StateHash derived_writer_hash{};
+  passed = Check(
+               writer->validation_capture() == ValidationCaptureModeV1::none &&
+                   reader->validation_capture() ==
+                       ValidationCaptureModeV1::none &&
+                   !writer->evidence_directory().present() &&
+                   !reader->evidence_directory().present() &&
+                   DeriveSplitWriterRunConfigHashV1(*reader,
+                                                    derived_writer_hash) &&
+                   derived_writer_hash == writer->run_config_sha256() &&
+                   writer->run_config_sha256() !=
+                       reader->run_config_sha256() &&
+                   writer->scientific_config_sha256() ==
+                       reader->scientific_config_sha256(),
+               "absent_evidence_presence_preserved_in_writer_hash") &&
+      passed;
+
+  std::vector<std::uint8_t> encoded;
+  passed = Check(EncodeFixture(fixture, *writer, resources, runtime, encoded),
+                 "non_evidence_split_writer_encodes") &&
+      passed;
+  DecodeSentinel output;
+  auto buffers = output.Buffers();
+  passed = Check(
+               DecodeCheckpointV1(
+                   {encoded.data(), encoded.size()}, *reader, resources,
+                   runtime, buffers.data(), buffers.size(), output.metadata) ==
+                       CheckpointCodecStatus::ok &&
+                   output.interior == fixture.interior &&
+                   output.trace == fixture.trace &&
+                   output.metadata.scientific_config_sha256 ==
+                       reader->scientific_config_sha256() &&
+                   output.metadata.writer_run_config_sha256 ==
+                       writer->run_config_sha256() &&
+                   output.metadata.reader_run_config_sha256 ==
+                       reader->run_config_sha256() &&
+                   output.metadata.descriptor.coordinates.step == 1 &&
+                   output.metadata.descriptor.coordinates.time == 0.05,
+               "non_evidence_writer_reader_codec_round_trip") &&
+      passed;
+  return passed;
+}
+
+bool CheckFunctionalSplitRoundTrip()
+{
+  const FunctionalCoefficientFixture fixture;
+  const PersistentResourceDescriptor resources = TestResources(1, 2);
+  const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
+  const ApplicationValidation writer_validation =
+      FunctionalTestValidation(false);
+  const ApplicationValidation reader_validation =
+      FunctionalTestValidation(true);
+  const ValidatedApplicationConfig* writer = writer_validation.config();
+  const ValidatedApplicationConfig* reader = reader_validation.config();
+  bool passed = Check(writer != nullptr && reader != nullptr,
+                      "functional_split_configs_validate");
+  if (writer == nullptr || reader == nullptr) { return false; }
+
+  StateHash derived_writer_hash{};
+  ScenarioCoefficientExtentsV1 extents{};
+  passed = Check(
+               writer->scenario() == ApplicationScenarioV1::functional &&
+                   writer->polynomial_order() == 2 && writer->mesh_n() == 6 &&
+                   writer->run_role() == ApplicationRunRoleV1::split_writer &&
+                   reader->run_role() == ApplicationRunRoleV1::split_reader &&
+                   writer->checkpoint_out().present() &&
+                   reader->restart_from().present() &&
+                   writer->checkpoint_out().identity() ==
+                       reader->restart_from().identity() &&
+                   writer->checkpoint_step().present &&
+                   writer->checkpoint_step().value == 10 &&
+                   !reader->checkpoint_step().present &&
+                   writer->stop_after_checkpoint() ==
+                       StopAfterCheckpointV1::yes &&
+                   reader->stop_after_checkpoint() ==
+                       StopAfterCheckpointV1::no &&
+                   writer->injection() == FailureInjectionControlV1{} &&
+                   reader->injection() ==
+                       FailureInjectionControlV1{
+                           FailureInjectionModeV1::prescribed,
+                           smooth_periodic_euler_v1_failure_phase,
+                           smooth_periodic_euler_v1_functional_failure_target_step,
+                           0} &&
+                   writer->retry_limit() == 0 && reader->retry_limit() == 1 &&
+                   DeriveSplitWriterRunConfigHashV1(*reader,
+                                                    derived_writer_hash) &&
+                   derived_writer_hash == writer->run_config_sha256() &&
+                   writer->run_config_sha256() !=
+                       reader->run_config_sha256() &&
+                   writer->scientific_config_sha256() ==
+                       reader->scientific_config_sha256() &&
+                   DeriveScenarioCoefficientExtentsV1(*reader, 1, extents) &&
+                   extents.ranks[0].interior_dofs_per_component == 324 &&
+                   extents.ranks[0].interior_coefficient_count == 1296 &&
+                   extents.ranks[0].trace_dofs_per_component == 216 &&
+                   extents.ranks[0].trace_coefficient_count == 864,
+               "functional_exact_six_delta_hash_and_extent_contract") &&
+      passed;
+
+  const auto capture = MakeSerialCapture(
+      *writer, resources, runtime, fixture,
+      smooth_periodic_euler_v1_functional_checkpoint_step);
+  passed = Check(capture.has_value(),
+                 "functional_step10_live_capture") &&
+      passed;
+  if (!capture) { return false; }
+  const auto views = fixture.Views();
+  std::vector<std::uint8_t> encoded;
+  passed = Check(EncodeCheckpointV1(*capture, views.data(), views.size(),
+                                    encoded) == CheckpointCodecStatus::ok,
+                 "functional_step10_checkpoint_encodes") &&
+      passed;
+
+  State decoded_interior(fixture.interior.size(), -1.0);
+  State decoded_trace(fixture.trace.size(), -1.0);
+  RankStateBufferV1 buffer{
+      0,
+      {decoded_interior.data(), decoded_interior.size(),
+       decoded_interior.size(), 4, 324,
+       CoefficientOrderingV1::component_major},
+      {decoded_trace.data(), decoded_trace.size(), decoded_trace.size(), 4,
+       216, CoefficientOrderingV1::component_major}};
+  DecodedCheckpointMetadataV1 metadata{};
+  passed = Check(
+               DecodeCheckpointV1(
+                   {encoded.data(), encoded.size()}, *reader, resources,
+                   runtime, &buffer, 1, metadata) ==
+                       CheckpointCodecStatus::ok &&
+                   decoded_interior == fixture.interior &&
+                   decoded_trace == fixture.trace &&
+                   metadata.mesh_n == 6 &&
+                   metadata.descriptor.polynomial_order == 2 &&
+                   metadata.descriptor.coordinates.step == 10 &&
+                   metadata.descriptor.coordinates.generation == 10 &&
+                   metadata.descriptor.coordinates.cursor == 10 &&
+                   ScenarioCheckpointTimeMatchesV1(
+                       metadata.descriptor.coordinates.time, *reader) &&
+                   metadata.aggregate_interior_coefficients == 1296 &&
+                   metadata.aggregate_true_trace_coefficients == 864 &&
+                   metadata.scientific_config_sha256 ==
+                       reader->scientific_config_sha256() &&
+                   metadata.writer_run_config_sha256 ==
+                       writer->run_config_sha256() &&
+                   metadata.reader_run_config_sha256 ==
+                       reader->run_config_sha256(),
+               "functional_step10_target14_delta_round_trip") &&
+      passed;
+  return passed;
+}
+
 bool CheckGoldenRoundTrip()
 {
   const CoefficientFixture fixture;
@@ -2058,6 +2333,8 @@ int main()
   passed = CheckExactScenarioExtents() && passed;
   passed = CheckLiveCaptureAndRepeatableEncode() && passed;
   passed = CheckRank2CaptureAndAllRankEvidence() && passed;
+  passed = CheckNonEvidenceSplitRoundTrip() && passed;
+  passed = CheckFunctionalSplitRoundTrip() && passed;
   passed = CheckGoldenRoundTrip() && passed;
   passed = CheckEncoderControls() && passed;
   passed = CheckDecodeMutationCensusAndAtomicity() && passed;
