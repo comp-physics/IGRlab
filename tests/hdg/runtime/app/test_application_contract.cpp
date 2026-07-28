@@ -193,7 +193,7 @@ bool CheckTwoScenarioBackendMatrix()
   bool passed = true;
   for (const BackendCase& item : cases)
   {
-    for (const ApplicationOptionsView request :
+    for (const ApplicationOptionsView& request :
          {Smoke(item.id), Functional(item.id)})
     {
       const ApplicationValidation validation =

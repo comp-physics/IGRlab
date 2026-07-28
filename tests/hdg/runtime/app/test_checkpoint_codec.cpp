@@ -446,11 +446,13 @@ typename ContractType::ProductBundle IssueAll(
 {
   typename ContractType::ProductBundle products{};
   products.residual =
-      contract.IssueProduct<DerivedProductKind::residual>(attempt);
-  products.matrix = contract.IssueProduct<DerivedProductKind::matrix>(attempt);
-  products.factor = contract.IssueProduct<DerivedProductKind::factor>(attempt);
+      contract.template IssueProduct<DerivedProductKind::residual>(attempt);
+  products.matrix =
+      contract.template IssueProduct<DerivedProductKind::matrix>(attempt);
+  products.factor =
+      contract.template IssueProduct<DerivedProductKind::factor>(attempt);
   products.solution =
-      contract.IssueProduct<DerivedProductKind::solution>(attempt);
+      contract.template IssueProduct<DerivedProductKind::solution>(attempt);
   return products;
 }
 
