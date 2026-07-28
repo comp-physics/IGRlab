@@ -79,6 +79,13 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
                         CXX_EXTENSIONS OFF)
   target_include_directories(dg_igr_hdg_runtime_app_contract PUBLIC
                              "${PROJECT_SOURCE_DIR}/include")
+  target_compile_definitions(dg_igr_hdg_runtime_app_contract PUBLIC
+    DG_IGR_HDG_APP_HAS_CPU_SERIAL=1
+    DG_IGR_HDG_APP_HAS_CPU_RANK2=1
+    DG_IGR_HDG_APP_HAS_CUDA_RANK1=$<BOOL:${MFEM_USE_CUDA}>
+    DG_IGR_HDG_APP_HAS_CUDA_RANK2=$<BOOL:${MFEM_USE_CUDA}>)
+  target_compile_options(dg_igr_hdg_runtime_app_contract PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
   target_link_libraries(dg_igr_hdg_runtime_app_contract
                         PUBLIC dg_igr_hdg_runtime_common)
 
