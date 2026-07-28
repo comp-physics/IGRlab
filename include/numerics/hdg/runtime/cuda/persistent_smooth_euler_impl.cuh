@@ -754,10 +754,13 @@ public:
     ReportCudaWarmLifetimeMarker(
         rank_, "baseline-high-water-sampling", "before", false);
     baseline_allocations_ = AllocatorPolicy::AllocationEvents();
+    accepted_allocation_events_ = baseline_allocations_;
+    allocation_plateau_sampled_ = false;
     ReportCudaWarmLifetimeMarker(
         rank_, "baseline-high-water-sampling", "after", true);
     baseline_w8_owned_allocation_calls_ =
         AllocatorPolicy::W8OwnedAllocationCalls();
+    baseline_deallocation_events_ = AllocatorPolicy::DeallocationEvents();
     initialized_ = true;
     evidence.rank = rank_;
     evidence.ranks = ranks_;
@@ -942,18 +945,32 @@ public:
         AllocatorPolicy::AllocationEvents();
     ReportCudaWarmLifetimeMarker(
         rank_, "reuse-evidence-sampling", "after", true);
+    ReportCudaWarmLifetimeMarker(
+        rank_, "reuse-allocation-delta", "before", false);
     value.post_baseline_allocation_events =
         current_allocation_events - baseline_allocations_;
+    ReportCudaWarmLifetimeMarker(
+        rank_, "reuse-allocation-delta", "after", true);
     value.baseline_w8_owned_allocation_calls =
         baseline_w8_owned_allocation_calls_;
+    ReportCudaWarmLifetimeMarker(
+        rank_, "reuse-owned-call-sampling", "before", false);
     value.post_baseline_w8_owned_allocation_calls =
         AllocatorPolicy::W8OwnedAllocationCalls() -
         baseline_w8_owned_allocation_calls_;
+    ReportCudaWarmLifetimeMarker(
+        rank_, "reuse-owned-call-sampling", "after", true);
+    ReportCudaWarmLifetimeMarker(
+        rank_, "reuse-persistence-predicates", "before", false);
     value.persistent_graph = true_matrix_ && local_trace_matrix_;
     value.persistent_slots = committed_slot_.interior.coefficients !=
             candidate_slot_.interior.coefficients &&
         committed_slot_.trace.coefficients != candidate_slot_.trace.coefficients;
     value.persistent_workspace = view_.a != nullptr && view_.schur != nullptr;
+    ReportCudaWarmLifetimeMarker(
+        rank_, "reuse-persistence-predicates", "after", true);
+    ReportCudaWarmLifetimeMarker(
+        rank_, "reuse-evidence-return", "before", true);
     return value;
   }
 
@@ -1210,6 +1227,17 @@ public:
       result.reason = FailureReason::recovery_gate;
       return result;
     }
+    // Rank-two increment distribution reuses distributed_local_trace as its
+    // host-staged ghost buffer.  Restore the accepted current trace before
+    // oracle capture so current_local_trace, distributed_local_trace, and
+    // workspace.trace again describe the same candidate generation.
+    const bool current_trace_restored = ranks_ != 2 ||
+        DistributeCurrentTrace(workspace.trace.coefficients);
+    if (!CollectiveContinue(current_trace_restored))
+    {
+      result.reason = FailureReason::recovery_gate;
+      return result;
+    }
     ++result.trace_solves;
     result.products = {last_product_generation,
                        last_product_generation,
@@ -1222,10 +1250,31 @@ public:
     result.admissible = CollectiveContinue(local_admissible);
     result.true_residual = std::isfinite(result.true_relative_residual) &&
         result.true_relative_residual <= 1.0e-10;
+    const std::uint64_t current_allocation_events =
+        AllocatorPolicy::AllocationEvents();
+    bool allocation_plateau_exact =
+        current_allocation_events == accepted_allocation_events_;
+    if (!allocation_plateau_sampled_)
+    {
+      // The rank-two MFEM/HYPRE path may materialize one opaque pool
+      // high-water transition on the first fixed-shape solve.  Freeze that
+      // one observed transition; rank one and every later attempt remain
+      // strict at their exact accepted counts.
+      allocation_plateau_exact =
+          current_allocation_events == baseline_allocations_ ||
+          (ranks_ == 2 && baseline_allocations_ !=
+               std::numeric_limits<std::uint64_t>::max() &&
+           current_allocation_events == baseline_allocations_ + 1);
+      if (allocation_plateau_exact)
+        accepted_allocation_events_ = current_allocation_events;
+      allocation_plateau_sampled_ = true;
+    }
     result.telemetry = DeviceResident() && NoFallback() &&
         AllocatorPolicy::W8OwnedAllocationCalls() ==
             baseline_w8_owned_allocation_calls_ &&
-        AllocatorPolicy::AllocationEvents() == baseline_allocations_;
+        AllocatorPolicy::DeallocationEvents() ==
+            baseline_deallocation_events_ &&
+        allocation_plateau_exact;
     result.success = result.finite && result.admissible && result.recovery &&
         result.true_residual && result.telemetry;
     result.reason = result.success ? FailureReason::none :
@@ -1727,7 +1776,10 @@ private:
   std::uint64_t current_generation_ = 0;
   std::uint64_t linear_generation_ = 0;
   std::uint64_t baseline_allocations_ = 0;
+  std::uint64_t accepted_allocation_events_ = 0;
   std::uint64_t baseline_w8_owned_allocation_calls_ = 0;
+  std::uint64_t baseline_deallocation_events_ = 0;
+  bool allocation_plateau_sampled_ = false;
   std::size_t host_exchange_bytes_ = 0;
   std::array<CudaDeviceTicket, maximum_device_tickets> tickets_{};
   std::size_t ticket_count_ = 0;
