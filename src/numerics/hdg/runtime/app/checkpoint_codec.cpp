@@ -15,15 +15,17 @@ namespace codec_detail
 {
 
 constexpr std::array<std::uint8_t, 16> magic{{
-    'D', 'G', 'I', 'G', 'R', '-', 'H', 'D', 'G', '-', 'C', 'K', 'P', 'T',
+    'D', 'G', 'I', 'G', 'R', '-', 'H', 'D', 'G', '-', 'M', 'E', 'M', 'V',
     '1', 0}};
 constexpr std::size_t checksum_size = StateHash{}.bytes.size();
 constexpr std::size_t total_size_offset = magic.size() + sizeof(std::uint32_t);
+constexpr std::size_t prefix_size =
+    magic.size() + sizeof(std::uint32_t) + sizeof(std::uint64_t);
+constexpr std::size_t block_metadata_size =
+    sizeof(std::uint32_t) + sizeof(std::uint64_t) + sizeof(std::uint64_t) +
+    sizeof(std::uint8_t) + sizeof(std::uint64_t) + StateHash{}.bytes.size();
 constexpr std::size_t rank_record_size =
-    sizeof(std::uint32_t) +
-    2 * (sizeof(std::uint32_t) + sizeof(std::uint64_t) +
-         sizeof(std::uint64_t) + sizeof(std::uint8_t) +
-         sizeof(std::uint64_t) + StateHash{}.bytes.size());
+    sizeof(std::uint32_t) + 2 * block_metadata_size;
 
 bool Add(const std::uint64_t left,
          const std::uint64_t right,
@@ -52,7 +54,7 @@ bool Multiply(const std::uint64_t left,
 bool NonzeroHash(const StateHash& hash) noexcept
 {
   return std::any_of(hash.bytes.begin(), hash.bytes.end(),
-                     [](const std::uint8_t byte) { return byte != 0; });
+                     [](const std::uint8_t value) { return value != 0; });
 }
 
 std::uint64_t DoubleBits(const double value) noexcept
@@ -186,9 +188,8 @@ public:
     {
       return false;
     }
-    const std::string_view view{
-        reinterpret_cast<const char*>(data_ + offset_), length};
-    const StableIdentity candidate = StableIdentity::Copy(view);
+    const StableIdentity candidate = StableIdentity::Copy(std::string_view{
+        reinterpret_cast<const char*>(data_ + offset_), length});
     if (!candidate.valid() || candidate.empty()) { return false; }
     offset_ += length;
     identity = candidate;
@@ -202,6 +203,7 @@ public:
     return true;
   }
 
+  std::size_t offset() const noexcept { return offset_; }
   std::size_t Remaining() const noexcept
   {
     return offset_ <= size_ ? size_ - offset_ : 0;
@@ -231,13 +233,15 @@ bool DescriptorStructurallyValid(const CheckpointDescriptor& value) noexcept
       !value.layout.empty() && value.precision.valid() &&
       !value.precision.empty() && value.precision == value.tuple.precision &&
       value.cursor == value.coordinates.cursor &&
+      value.coordinates.generation == value.coordinates.step &&
       std::isfinite(value.coordinates.time) && std::isfinite(value.dt) &&
       value.dt > 0.0 && std::isfinite(value.coordinates.dt) &&
       value.coordinates.dt > 0.0 &&
       DoubleBits(value.dt) == DoubleBits(value.coordinates.dt) &&
       value.coordinate_fingerprint ==
           ::dg::hdg::runtime::detail::CoordinateFingerprint(
-              value.coordinates);
+              value.coordinates) &&
+      NonzeroHash(value.interior_hash) && NonzeroHash(value.trace_hash);
 }
 
 bool WriteDescriptor(Writer& writer, const CheckpointDescriptor& value)
@@ -334,6 +338,217 @@ bool ReadDescriptor(Reader& reader, CheckpointDescriptor& value) noexcept
   return true;
 }
 
+struct ArtifactConfig
+{
+  StableIdentity card_id{};
+  StableIdentity case_id{};
+  StableIdentity scenario_id{};
+  StableIdentity checkpoint_id{};
+  StableIdentity mesh_family_id{};
+  StableIdentity source_id{};
+  StableIdentity flux_id{};
+  StableIdentity time_rule_id{};
+  StableIdentity layout_id{};
+  StateHash scientific_config_sha256{};
+  StateHash run_config_sha256{};
+  ApplicationScenarioV1 scenario = ApplicationScenarioV1::unknown;
+  InteriorSpace interior_space = InteriorSpace::l2;
+  std::uint32_t mesh_n = 0;
+  int polynomial_order = -1;
+  int q_a = 0;
+  int q_e = 0;
+  int q_e4 = 0;
+  int q_o = 0;
+  double gamma = 0.0;
+  double tau = 0.0;
+  double dt = 0.0;
+  std::uint64_t accepted_steps = 0;
+  double final_time = 0.0;
+  std::array<std::uint64_t, 3> output_steps{};
+  std::uint64_t checkpoint_step = 0;
+  RestartMode restart_mode = RestartMode::same_backend_rank_partition;
+  RestartTrajectoryModeV1 restart_trajectory =
+      RestartTrajectoryModeV1::uninterrupted_and_split_same_tuple;
+  std::uint64_t failure_committed_step = 0;
+  std::uint64_t failure_target_step = 0;
+  FailurePhase failure_phase = FailurePhase::Setup;
+  RollbackObligationV1 rollback_obligation =
+      RollbackObligationV1::collective_exact_complete_state;
+  DeferredSourceRankRuleV1 source_rank_rule =
+      DeferredSourceRankRuleV1::rank_zero_for_rank1_rank_one_for_rank2;
+  std::uint32_t retry_limit = 0;
+  std::uint64_t seed = 0;
+};
+
+bool WriteConfig(Writer& writer, const ValidatedApplicationConfig& config)
+{
+  if (!writer.Identity(config.card_id()) ||
+      !writer.Identity(config.case_id()) ||
+      !writer.Identity(config.scenario_id()) ||
+      !writer.Identity(config.checkpoint_id()) ||
+      !writer.Identity(config.mesh_family_id()) ||
+      !writer.Identity(config.source_id()) ||
+      !writer.Identity(config.flux_id()) ||
+      !writer.Identity(config.time_rule_id()) ||
+      !writer.Identity(config.layout_id()))
+  {
+    return false;
+  }
+  writer.Hash(config.scientific_config_sha256());
+  writer.Hash(config.run_config_sha256());
+  writer.U8(static_cast<std::uint8_t>(config.scenario()));
+  writer.U8(static_cast<std::uint8_t>(config.interior_space()));
+  writer.UnsignedLittleEndian(config.mesh_n());
+  writer.UnsignedLittleEndian(
+      static_cast<std::uint32_t>(config.polynomial_order()));
+  writer.UnsignedLittleEndian(static_cast<std::uint32_t>(config.q_a()));
+  writer.UnsignedLittleEndian(static_cast<std::uint32_t>(config.q_e()));
+  writer.UnsignedLittleEndian(static_cast<std::uint32_t>(config.q_e4()));
+  writer.UnsignedLittleEndian(static_cast<std::uint32_t>(config.q_o()));
+  writer.UnsignedLittleEndian(DoubleBits(config.gamma()));
+  writer.UnsignedLittleEndian(DoubleBits(config.tau()));
+  writer.UnsignedLittleEndian(DoubleBits(config.dt()));
+  writer.UnsignedLittleEndian(config.accepted_steps());
+  writer.UnsignedLittleEndian(DoubleBits(config.final_time()));
+  for (const std::uint64_t step : config.output_steps())
+  {
+    writer.UnsignedLittleEndian(step);
+  }
+  writer.UnsignedLittleEndian(config.checkpoint_step());
+  writer.U8(static_cast<std::uint8_t>(config.restart_mode()));
+  writer.U8(static_cast<std::uint8_t>(config.restart_trajectory()));
+  writer.UnsignedLittleEndian(config.injected_failure_committed_step());
+  writer.UnsignedLittleEndian(config.injected_failure_target_step());
+  writer.U8(static_cast<std::uint8_t>(config.injected_failure_phase()));
+  writer.U8(static_cast<std::uint8_t>(config.rollback_obligation()));
+  writer.U8(static_cast<std::uint8_t>(config.source_rank_rule()));
+  writer.UnsignedLittleEndian(config.retry_limit());
+  writer.UnsignedLittleEndian(config.seed());
+  return true;
+}
+
+bool ReadConfig(Reader& reader, ArtifactConfig& value) noexcept
+{
+  ArtifactConfig candidate{};
+  std::uint8_t scenario = 0;
+  std::uint8_t interior_space = 0;
+  std::uint32_t polynomial_order = 0;
+  std::uint32_t q_a = 0;
+  std::uint32_t q_e = 0;
+  std::uint32_t q_e4 = 0;
+  std::uint32_t q_o = 0;
+  std::uint64_t gamma = 0;
+  std::uint64_t tau = 0;
+  std::uint64_t dt = 0;
+  std::uint64_t final_time = 0;
+  std::uint8_t restart = 0;
+  std::uint8_t trajectory = 0;
+  std::uint8_t failure_phase = 0;
+  std::uint8_t rollback = 0;
+  std::uint8_t source_rule = 0;
+  if (!reader.Identity(candidate.card_id) ||
+      !reader.Identity(candidate.case_id) ||
+      !reader.Identity(candidate.scenario_id) ||
+      !reader.Identity(candidate.checkpoint_id) ||
+      !reader.Identity(candidate.mesh_family_id) ||
+      !reader.Identity(candidate.source_id) ||
+      !reader.Identity(candidate.flux_id) ||
+      !reader.Identity(candidate.time_rule_id) ||
+      !reader.Identity(candidate.layout_id) ||
+      !reader.Hash(candidate.scientific_config_sha256) ||
+      !reader.Hash(candidate.run_config_sha256) || !reader.U8(scenario) ||
+      !reader.U8(interior_space) ||
+      !reader.UnsignedLittleEndian(candidate.mesh_n) ||
+      !reader.UnsignedLittleEndian(polynomial_order) ||
+      !reader.UnsignedLittleEndian(q_a) ||
+      !reader.UnsignedLittleEndian(q_e) ||
+      !reader.UnsignedLittleEndian(q_e4) ||
+      !reader.UnsignedLittleEndian(q_o) ||
+      !reader.UnsignedLittleEndian(gamma) ||
+      !reader.UnsignedLittleEndian(tau) ||
+      !reader.UnsignedLittleEndian(dt) ||
+      !reader.UnsignedLittleEndian(candidate.accepted_steps) ||
+      !reader.UnsignedLittleEndian(final_time))
+  {
+    return false;
+  }
+  for (std::uint64_t& step : candidate.output_steps)
+  {
+    if (!reader.UnsignedLittleEndian(step)) { return false; }
+  }
+  if (!reader.UnsignedLittleEndian(candidate.checkpoint_step) ||
+      !reader.U8(restart) || !reader.U8(trajectory) ||
+      !reader.UnsignedLittleEndian(candidate.failure_committed_step) ||
+      !reader.UnsignedLittleEndian(candidate.failure_target_step) ||
+      !reader.U8(failure_phase) || !reader.U8(rollback) ||
+      !reader.U8(source_rule) ||
+      !reader.UnsignedLittleEndian(candidate.retry_limit) ||
+      !reader.UnsignedLittleEndian(candidate.seed))
+  {
+    return false;
+  }
+  candidate.scenario = static_cast<ApplicationScenarioV1>(scenario);
+  candidate.interior_space = static_cast<InteriorSpace>(interior_space);
+  candidate.polynomial_order = abi_detail::DecodeInt32(polynomial_order);
+  candidate.q_a = abi_detail::DecodeInt32(q_a);
+  candidate.q_e = abi_detail::DecodeInt32(q_e);
+  candidate.q_e4 = abi_detail::DecodeInt32(q_e4);
+  candidate.q_o = abi_detail::DecodeInt32(q_o);
+  candidate.gamma = BitsDouble(gamma);
+  candidate.tau = BitsDouble(tau);
+  candidate.dt = BitsDouble(dt);
+  candidate.final_time = BitsDouble(final_time);
+  candidate.restart_mode = static_cast<RestartMode>(restart);
+  candidate.restart_trajectory =
+      static_cast<RestartTrajectoryModeV1>(trajectory);
+  candidate.failure_phase = static_cast<FailurePhase>(failure_phase);
+  candidate.rollback_obligation =
+      static_cast<RollbackObligationV1>(rollback);
+  candidate.source_rank_rule =
+      static_cast<DeferredSourceRankRuleV1>(source_rule);
+  value = candidate;
+  return true;
+}
+
+bool ConfigMatches(const ArtifactConfig& value,
+                   const ValidatedApplicationConfig& expected) noexcept
+{
+  return value.card_id == expected.card_id() &&
+      value.case_id == expected.case_id() &&
+      value.scenario_id == expected.scenario_id() &&
+      value.checkpoint_id == expected.checkpoint_id() &&
+      value.mesh_family_id == expected.mesh_family_id() &&
+      value.source_id == expected.source_id() &&
+      value.flux_id == expected.flux_id() &&
+      value.time_rule_id == expected.time_rule_id() &&
+      value.layout_id == expected.layout_id() &&
+      value.scientific_config_sha256 == expected.scientific_config_sha256() &&
+      value.run_config_sha256 == expected.run_config_sha256() &&
+      value.scenario == expected.scenario() &&
+      value.interior_space == expected.interior_space() &&
+      value.mesh_n == expected.mesh_n() &&
+      value.polynomial_order == expected.polynomial_order() &&
+      value.q_a == expected.q_a() && value.q_e == expected.q_e() &&
+      value.q_e4 == expected.q_e4() && value.q_o == expected.q_o() &&
+      DoubleBits(value.gamma) == DoubleBits(expected.gamma()) &&
+      DoubleBits(value.tau) == DoubleBits(expected.tau()) &&
+      DoubleBits(value.dt) == DoubleBits(expected.dt()) &&
+      value.accepted_steps == expected.accepted_steps() &&
+      DoubleBits(value.final_time) == DoubleBits(expected.final_time()) &&
+      value.output_steps == expected.output_steps() &&
+      value.checkpoint_step == expected.checkpoint_step() &&
+      value.restart_mode == expected.restart_mode() &&
+      value.restart_trajectory == expected.restart_trajectory() &&
+      value.failure_committed_step ==
+          expected.injected_failure_committed_step() &&
+      value.failure_target_step == expected.injected_failure_target_step() &&
+      value.failure_phase == expected.injected_failure_phase() &&
+      value.rollback_obligation == expected.rollback_obligation() &&
+      value.source_rank_rule == expected.source_rank_rule() &&
+      value.retry_limit == expected.retry_limit() &&
+      value.seed == expected.seed();
+}
+
 struct BlockMetadata
 {
   std::uint32_t component_count = 0;
@@ -357,7 +572,7 @@ CheckpointCodecStatus ValidateBlockView(
 {
   std::uint64_t expected_count = 0;
   std::uint64_t byte_count = 0;
-  if ((block.coefficient_count != 0 && block.data == nullptr) ||
+  if (block.data == nullptr || block.coefficient_count == 0 ||
       block.component_count != euler_state_component_count_v1 ||
       block.dofs_per_component == 0 ||
       block.ordering != CoefficientOrderingV1::component_major)
@@ -530,10 +745,9 @@ void WriteCoefficientBlock(Writer& writer,
   }
 }
 
-CheckpointCodecStatus DecodeCoefficientBlock(
+CheckpointCodecStatus PreflightCoefficientBlock(
     Reader& reader,
-    const BlockMetadata& metadata,
-    DecodedCoefficientBlockV1& block) noexcept
+    const BlockMetadata& metadata) noexcept
 {
   Sha256 hash;
   std::array<std::uint8_t, 8> bytes{};
@@ -549,216 +763,118 @@ CheckpointCodecStatus DecodeCoefficientBlock(
     {
       bits |= static_cast<std::uint64_t>(bytes[byte]) << (8U * byte);
     }
-    const double value = BitsDouble(bits);
-    if (!std::isfinite(value))
+    if (!std::isfinite(BitsDouble(bits)))
     {
       return CheckpointCodecStatus::noncanonical_fp64;
     }
-    block.coefficients[static_cast<std::size_t>(index)] = value;
   }
   Sha256Digest digest{};
   if (!hash.Finalize(digest) || digest != metadata.hash.bytes)
   {
     return CheckpointCodecStatus::local_payload_hash_mismatch;
   }
-  block.component_count = metadata.component_count;
-  block.dofs_per_component = metadata.dofs_per_component;
-  block.ordering = metadata.ordering;
-  block.payload_hash = metadata.hash;
   return CheckpointCodecStatus::ok;
+}
+
+void CopyCoefficientBlock(Reader& reader,
+                          const BlockMetadata& metadata,
+                          double* destination) noexcept
+{
+  std::array<std::uint8_t, 8> bytes{};
+  for (std::uint64_t index = 0; index < metadata.coefficient_count; ++index)
+  {
+    static_cast<void>(reader.Bytes(bytes.data(), bytes.size()));
+    std::uint64_t bits = 0;
+    for (std::size_t byte = 0; byte < bytes.size(); ++byte)
+    {
+      bits |= static_cast<std::uint64_t>(bytes[byte]) << (8U * byte);
+    }
+    destination[index] = BitsDouble(bits);
+  }
+}
+
+bool BufferMatches(const Fp64CoefficientBufferV1& buffer,
+                   const BlockMetadata& metadata) noexcept
+{
+  return buffer.data != nullptr &&
+      buffer.capacity >= metadata.coefficient_count &&
+      buffer.coefficient_count == metadata.coefficient_count &&
+      buffer.component_count == metadata.component_count &&
+      buffer.dofs_per_component == metadata.dofs_per_component &&
+      buffer.ordering == metadata.ordering;
 }
 
 } // namespace codec_detail
 
-struct PublicationAccessV1
+bool ValidCheckpointRuntimeIdentityV1(
+    const ValidatedApplicationConfig& config,
+    const CheckpointRuntimeIdentityV1& identity) noexcept
 {
-  static const CheckpointDescriptor& Descriptor(
-      const CheckpointContractEvidenceV1& value) noexcept
+  if (!identity.physical_gpu_uuid.valid() ||
+      identity.physical_gpu_uuid.empty() ||
+      !codec_detail::NonzeroHash(identity.ownership_hash))
   {
-    return value.descriptor_;
+    return false;
   }
-  static const CheckpointDescriptor& Descriptor(
-      const DurableRankTemporariesV1& value) noexcept
+  switch (config.deferred_runtime().gpu_rule)
   {
-    return value.descriptor_;
+    case DeferredGpuRuleV1::no_cuda_device:
+      return identity.physical_gpu_uuid.view() == no_physical_gpu_uuid_v1;
+    case DeferredGpuRuleV1::one_physical_gpu:
+    case DeferredGpuRuleV1::one_shared_physical_gpu:
+      return identity.physical_gpu_uuid.view() != no_physical_gpu_uuid_v1;
   }
-  static const CheckpointDescriptor& Descriptor(
-      const PublishedCheckpointManifestV1& value) noexcept
-  {
-    return value.validated_.temporaries_.descriptor_;
-  }
-  static const CheckpointContractEvidenceV1& Evidence(
-      const PublishedCheckpointManifestV1& value) noexcept
-  {
-    return value.validated_.temporaries_.evidence_;
-  }
-  static const RankTemporaryPublicationFactsV1& TemporaryFacts(
-      const PublishedCheckpointManifestV1& value) noexcept
-  {
-    return value.validated_.temporaries_.facts_;
-  }
-  static const CollectiveManifestValidationFactsV1& ValidationFacts(
-      const PublishedCheckpointManifestV1& value) noexcept
-  {
-    return value.validated_.facts_;
-  }
-  static const AtomicManifestPublicationFactsV1& PublicationFacts(
-      const PublishedCheckpointManifestV1& value) noexcept
-  {
-    return value.facts_;
-  }
-  static std::uint64_t InteriorCount(
-      const PublishedCheckpointManifestV1& value) noexcept
-  {
-    return value.validated_.temporaries_.interior_coefficients_;
-  }
-  static std::uint64_t TraceCount(
-      const PublishedCheckpointManifestV1& value) noexcept
-  {
-    return value.validated_.temporaries_.trace_coefficients_;
-  }
-  static DurableRankTemporariesV1 Durable(
-      CheckpointContractEvidenceV1 evidence,
-      const CheckpointDescriptor descriptor,
-      const RankTemporaryPublicationFactsV1 facts,
-      const std::uint64_t interior,
-      const std::uint64_t trace) noexcept
-  {
-    return DurableRankTemporariesV1(std::move(evidence), descriptor, facts,
-                                    interior, trace);
-  }
-  static ValidatedCheckpointManifestV1 Validated(
-      DurableRankTemporariesV1 temporaries,
-      const CollectiveManifestValidationFactsV1 facts) noexcept
-  {
-    return ValidatedCheckpointManifestV1(std::move(temporaries), facts);
-  }
-  static PublishedCheckpointManifestV1 Published(
-      ValidatedCheckpointManifestV1 validated,
-      const AtomicManifestPublicationFactsV1 facts) noexcept
-  {
-    return PublishedCheckpointManifestV1(std::move(validated), facts);
-  }
-  static const StableIdentity& Card(
-      const CheckpointContractEvidenceV1& evidence) noexcept
-  {
-    return evidence.card_id_;
-  }
-  static const StableIdentity& Case(
-      const CheckpointContractEvidenceV1& evidence) noexcept
-  {
-    return evidence.case_id_;
-  }
-  static const StableIdentity& Checkpoint(
-      const CheckpointContractEvidenceV1& evidence) noexcept
-  {
-    return evidence.checkpoint_id_;
-  }
-};
-
-PublicationTransitionV1<DurableRankTemporariesV1>
-RecordDurableRankTemporariesV1(
-    CheckpointContractEvidenceV1&& evidence,
-    const RankTemporaryPublicationFactsV1& facts,
-    const StagedStateViewV1* ranks,
-    const std::size_t rank_count)
-{
-  using namespace codec_detail;
-  PublicationTransitionV1<DurableRankTemporariesV1> result{};
-  const CheckpointDescriptor& contract_descriptor =
-      PublicationAccessV1::Descriptor(evidence);
-  if (!DescriptorStructurallyValid(contract_descriptor) ||
-      contract_descriptor.coordinates.step !=
-          smooth_periodic_euler_v1_checkpoint_step ||
-      contract_descriptor.coordinate_fingerprint == 0)
-  {
-    result.status = CheckpointCodecStatus::invalid_descriptor;
-    return result;
-  }
-  if (facts.participating_ranks != contract_descriptor.rank_count ||
-      facts.source_rank != smooth_periodic_euler_v1_source_rank ||
-      !NonzeroHash(facts.temporary_file_set_hash) ||
-      !facts.all_rank_temporaries_created_exclusive ||
-      !facts.all_rank_temporaries_synced ||
-      !facts.collective_temporary_consensus)
-  {
-    result.status = CheckpointCodecStatus::invalid_publication_state;
-    return result;
-  }
-  std::array<RankMetadata, application_checkpoint_max_rank_count_v1> metadata{};
-  std::uint64_t interior_count = 0;
-  std::uint64_t trace_count = 0;
-  result.status = InspectRanks(ranks, rank_count, contract_descriptor.rank_count,
-                               metadata, interior_count, trace_count);
-  if (result.status != CheckpointCodecStatus::ok) { return result; }
-  if (metadata[0].interior.hash != contract_descriptor.interior_hash ||
-      metadata[0].trace.hash != contract_descriptor.trace_hash)
-  {
-    result.status = CheckpointCodecStatus::local_payload_hash_mismatch;
-    return result;
-  }
-  RankPayloadHashV1 aggregate_interior{};
-  RankPayloadHashV1 aggregate_trace{};
-  if (!AggregateHashes(metadata, rank_count, aggregate_interior,
-                       aggregate_trace))
-  {
-    result.status = CheckpointCodecStatus::aggregate_payload_hash_mismatch;
-    return result;
-  }
-  CheckpointDescriptor manifest_descriptor = contract_descriptor;
-  manifest_descriptor.interior_hash = aggregate_interior.hash;
-  manifest_descriptor.trace_hash = aggregate_trace.hash;
-  result.status = CheckpointCodecStatus::ok;
-  result.authority.emplace(PublicationAccessV1::Durable(
-      std::move(evidence), manifest_descriptor, facts, interior_count,
-      trace_count));
-  return result;
+  return false;
 }
 
-PublicationTransitionV1<ValidatedCheckpointManifestV1>
-ValidateCollectiveCheckpointManifestV1(
-    DurableRankTemporariesV1&& temporaries,
-    const CollectiveManifestValidationFactsV1& facts) noexcept
+CheckpointCodecStatus ValidateSameTupleRestartV1(
+    const CheckpointDescriptor& checkpoint,
+    const ValidatedApplicationConfig& expected_config,
+    const PersistentResourceDescriptor& expected_resources,
+    const CheckpointRuntimeIdentityV1& expected_runtime_identity,
+    const CheckpointRuntimeIdentityV1& artifact_runtime_identity) noexcept
 {
-  PublicationTransitionV1<ValidatedCheckpointManifestV1> result{};
-  const CheckpointDescriptor& descriptor =
-      PublicationAccessV1::Descriptor(temporaries);
-  if (facts.participating_ranks != descriptor.rank_count ||
-      !facts.descriptor_consensus || !facts.rank_manifest_consensus ||
-      !facts.payload_hash_consensus)
+  if (!codec_detail::DescriptorStructurallyValid(checkpoint) ||
+      !expected_resources.Valid())
   {
-    result.status = CheckpointCodecStatus::invalid_publication_state;
-    return result;
+    return CheckpointCodecStatus::invalid_descriptor;
   }
-  result.status = CheckpointCodecStatus::ok;
-  result.authority.emplace(
-      PublicationAccessV1::Validated(std::move(temporaries), facts));
-  return result;
-}
-
-PublicationTransitionV1<PublishedCheckpointManifestV1>
-PublishCheckpointManifestV1(
-    ValidatedCheckpointManifestV1&& validated,
-    const AtomicManifestPublicationFactsV1& facts) noexcept
-{
-  PublicationTransitionV1<PublishedCheckpointManifestV1> result{};
-  if (facts.source_rank != smooth_periodic_euler_v1_source_rank ||
-      !facts.manifest_created_exclusive || !facts.manifest_synced ||
-      !facts.atomic_rename_complete ||
-      !facts.publication_directory_synced ||
-      !facts.collective_visibility_consensus)
+  if (checkpoint.tuple != expected_config.tuple())
   {
-    result.status = CheckpointCodecStatus::invalid_publication_state;
-    return result;
+    return CheckpointCodecStatus::restart_tuple_mismatch;
   }
-  result.status = CheckpointCodecStatus::ok;
-  result.authority.emplace(
-      PublicationAccessV1::Published(std::move(validated), facts));
-  return result;
+  if (!ValidCheckpointRuntimeIdentityV1(expected_config,
+                                        expected_runtime_identity) ||
+      expected_runtime_identity.physical_gpu_uuid !=
+          artifact_runtime_identity.physical_gpu_uuid ||
+      expected_runtime_identity.ownership_hash !=
+          artifact_runtime_identity.ownership_hash)
+  {
+    return CheckpointCodecStatus::invalid_runtime_identity;
+  }
+  if (checkpoint.mfem_pin != expected_resources.mfem_pin ||
+      checkpoint.mesh_hash != expected_resources.mesh_hash ||
+      checkpoint.partition_hash != expected_resources.partition_hash ||
+      checkpoint.topology_hash != expected_resources.topology_hash ||
+      checkpoint.rank_count != expected_resources.rank_count ||
+      checkpoint.rank_count !=
+          expected_config.deferred_runtime().required_mpi_rank_count ||
+      checkpoint.polynomial_order != expected_resources.polynomial_order ||
+      checkpoint.polynomial_order != expected_config.polynomial_order() ||
+      checkpoint.layout != expected_resources.layout ||
+      checkpoint.layout != expected_config.layout_id() ||
+      checkpoint.precision != expected_config.tuple().precision ||
+      checkpoint.coordinates.step != expected_config.checkpoint_step() ||
+      checkpoint.coordinates.cursor != expected_config.checkpoint_step() ||
+      DoubleBits(checkpoint.dt) != DoubleBits(expected_config.dt()))
+  {
+    return CheckpointCodecStatus::resource_mismatch;
+  }
+  return CheckpointCodecStatus::ok;
 }
 
 CheckpointCodecStatus EncodeCheckpointV1(
-    const PublishedCheckpointManifestV1& publication,
+    const CapturedCheckpointV1& checkpoint,
     const StagedStateViewV1* ranks,
     const std::size_t rank_count,
     std::vector<std::uint8_t>& encoded)
@@ -766,79 +882,62 @@ CheckpointCodecStatus EncodeCheckpointV1(
   using namespace codec_detail;
   try
   {
-    const CheckpointDescriptor& descriptor =
-        PublicationAccessV1::Descriptor(publication);
-    const CheckpointContractEvidenceV1& evidence =
-        PublicationAccessV1::Evidence(publication);
-    const RankTemporaryPublicationFactsV1& temporary =
-        PublicationAccessV1::TemporaryFacts(publication);
-    const CollectiveManifestValidationFactsV1& validation =
-        PublicationAccessV1::ValidationFacts(publication);
-    const AtomicManifestPublicationFactsV1& published =
-        PublicationAccessV1::PublicationFacts(publication);
-    if (!DescriptorStructurallyValid(descriptor) ||
-        temporary.participating_ranks != descriptor.rank_count ||
-        validation.participating_ranks != descriptor.rank_count ||
-        temporary.source_rank != smooth_periodic_euler_v1_source_rank ||
-        published.source_rank != smooth_periodic_euler_v1_source_rank)
+    const ValidatedApplicationConfig& config = checkpoint.config();
+    const CheckpointRuntimeIdentityV1& runtime =
+        checkpoint.runtime_identity();
+    const CheckpointDescriptor& captured_descriptor = checkpoint.descriptor();
+    if (!DescriptorStructurallyValid(captured_descriptor) ||
+        !ValidCheckpointRuntimeIdentityV1(config, runtime) ||
+        captured_descriptor.tuple != config.tuple() ||
+        captured_descriptor.rank_count !=
+            config.deferred_runtime().required_mpi_rank_count ||
+        captured_descriptor.polynomial_order != config.polynomial_order() ||
+        captured_descriptor.coordinates.step != config.checkpoint_step())
     {
-      return CheckpointCodecStatus::invalid_publication_state;
+      return CheckpointCodecStatus::invalid_descriptor;
     }
+
     std::array<RankMetadata, application_checkpoint_max_rank_count_v1>
         metadata{};
     std::uint64_t interior_count = 0;
     std::uint64_t trace_count = 0;
     CheckpointCodecStatus status = InspectRanks(
-        ranks, rank_count, descriptor.rank_count, metadata, interior_count,
-        trace_count);
+        ranks, rank_count, captured_descriptor.rank_count, metadata,
+        interior_count, trace_count);
     if (status != CheckpointCodecStatus::ok) { return status; }
-    if (interior_count != PublicationAccessV1::InteriorCount(publication) ||
-        trace_count != PublicationAccessV1::TraceCount(publication))
+    const std::uint32_t source_rank =
+        config.deferred_runtime().required_injected_source_rank;
+    if (source_rank >= rank_count ||
+        metadata[source_rank].interior.hash !=
+            captured_descriptor.interior_hash ||
+        metadata[source_rank].trace.hash != captured_descriptor.trace_hash)
     {
-      return CheckpointCodecStatus::coefficient_count_mismatch;
+      return CheckpointCodecStatus::local_payload_hash_mismatch;
     }
     RankPayloadHashV1 aggregate_interior{};
     RankPayloadHashV1 aggregate_trace{};
     if (!AggregateHashes(metadata, rank_count, aggregate_interior,
-                         aggregate_trace) ||
-        aggregate_interior.hash != descriptor.interior_hash ||
-        aggregate_trace.hash != descriptor.trace_hash)
+                         aggregate_trace))
     {
       return CheckpointCodecStatus::aggregate_payload_hash_mismatch;
     }
+    CheckpointDescriptor descriptor = captured_descriptor;
+    descriptor.interior_hash = aggregate_interior.hash;
+    descriptor.trace_hash = aggregate_trace.hash;
 
     Writer writer;
     writer.Bytes(magic.data(), magic.size());
     writer.UnsignedLittleEndian(application_checkpoint_codec_version_v1);
     writer.UnsignedLittleEndian(std::uint64_t{0});
-    writer.U8(static_cast<std::uint8_t>(
-        PublicationPhaseV1::manifest_atomically_published));
-    writer.UnsignedLittleEndian(descriptor.coordinate_fingerprint);
-    writer.Hash(temporary.temporary_file_set_hash);
-    writer.Hash(temporary.previous_manifest_hash);
-    writer.UnsignedLittleEndian(temporary.participating_ranks);
-    writer.UnsignedLittleEndian(temporary.source_rank);
-    for (const bool flag :
-         {temporary.all_rank_temporaries_created_exclusive,
-          temporary.all_rank_temporaries_synced,
-          temporary.collective_temporary_consensus,
-          validation.descriptor_consensus,
-          validation.rank_manifest_consensus,
-          validation.payload_hash_consensus,
-          published.manifest_created_exclusive,
-          published.manifest_synced,
-          published.atomic_rename_complete,
-          published.publication_directory_synced,
-          published.collective_visibility_consensus})
+    if (!WriteConfig(writer, config) ||
+        !writer.Identity(runtime.physical_gpu_uuid))
     {
-      writer.U8(flag ? 1U : 0U);
+      return CheckpointCodecStatus::invalid_config_identity;
     }
-    if (!writer.Identity(PublicationAccessV1::Card(evidence)) ||
-        !writer.Identity(PublicationAccessV1::Case(evidence)) ||
-        !writer.Identity(PublicationAccessV1::Checkpoint(evidence)) ||
-        !WriteDescriptor(writer, descriptor))
+    writer.Hash(runtime.ownership_hash);
+    if (!WriteDescriptor(writer, descriptor))
     {
-      return CheckpointCodecStatus::invalid_checkpoint_identity;
+      return CheckpointCodecStatus::invalid_descriptor;
     }
     writer.UnsignedLittleEndian(static_cast<std::uint32_t>(rank_count));
     writer.UnsignedLittleEndian(interior_count);
@@ -881,45 +980,16 @@ CheckpointCodecStatus EncodeCheckpointV1(
   }
 }
 
-CheckpointCodecStatus ValidateSameTupleRestartV1(
-    const CheckpointDescriptor& checkpoint,
-    const ValidatedApplicationConfig& expected_config,
-    const PersistentResourceDescriptor& expected_resources) noexcept
-{
-  if (!codec_detail::DescriptorStructurallyValid(checkpoint) ||
-      !expected_resources.Valid())
-  {
-    return CheckpointCodecStatus::invalid_descriptor;
-  }
-  if (checkpoint.tuple != expected_config.tuple())
-  {
-    return CheckpointCodecStatus::restart_tuple_mismatch;
-  }
-  if (checkpoint.mfem_pin != expected_resources.mfem_pin ||
-      checkpoint.mesh_hash != expected_resources.mesh_hash ||
-      checkpoint.partition_hash != expected_resources.partition_hash ||
-      checkpoint.topology_hash != expected_resources.topology_hash ||
-      checkpoint.rank_count != expected_resources.rank_count ||
-      checkpoint.rank_count != expected_config.mpi_rank_count() ||
-      checkpoint.polynomial_order != expected_resources.polynomial_order ||
-      checkpoint.polynomial_order != expected_config.polynomial_order() ||
-      checkpoint.layout != expected_resources.layout ||
-      checkpoint.precision != expected_config.tuple().precision)
-  {
-    return CheckpointCodecStatus::resource_mismatch;
-  }
-  return CheckpointCodecStatus::ok;
-}
-
 CheckpointCodecStatus DecodeCheckpointV1(
     const ConstByteView encoded,
     const ValidatedApplicationConfig& expected_config,
     const PersistentResourceDescriptor& expected_resources,
-    DecodedCheckpointV1& checkpoint)
+    const CheckpointRuntimeIdentityV1& expected_runtime_identity,
+    RankStateBufferV1* rank_buffers,
+    const std::size_t rank_buffer_count,
+    DecodedCheckpointMetadataV1& output_metadata)
 {
   using namespace codec_detail;
-  constexpr std::size_t prefix_size =
-      magic.size() + sizeof(std::uint32_t) + sizeof(std::uint64_t);
   if (!encoded.Valid()) { return CheckpointCodecStatus::invalid_argument; }
   if (encoded.size < prefix_size + checksum_size)
   {
@@ -959,58 +1029,27 @@ CheckpointCodecStatus DecodeCheckpointV1(
 
   Reader reader(encoded.data, content_size);
   if (!reader.Skip(prefix_size)) { return CheckpointCodecStatus::truncated; }
-  std::uint8_t phase = 0;
-  PublicationAuditV1 publication{};
-  std::array<std::uint8_t, 11> flags{};
-  if (!reader.U8(phase) ||
-      !reader.UnsignedLittleEndian(publication.transaction_id) ||
-      !reader.Hash(publication.temporary_file_set_hash) ||
-      !reader.Hash(publication.previous_manifest_hash) ||
-      !reader.UnsignedLittleEndian(publication.participating_ranks) ||
-      !reader.UnsignedLittleEndian(publication.source_rank))
-  {
-    return CheckpointCodecStatus::truncated;
-  }
-  for (std::uint8_t& flag : flags)
-  {
-    if (!reader.U8(flag)) { return CheckpointCodecStatus::truncated; }
-  }
-  publication.phase = static_cast<PublicationPhaseV1>(phase);
-  if (publication.phase !=
-          PublicationPhaseV1::manifest_atomically_published ||
-      publication.transaction_id == 0 ||
-      publication.source_rank != smooth_periodic_euler_v1_source_rank ||
-      !NonzeroHash(publication.temporary_file_set_hash) ||
-      std::any_of(flags.begin(), flags.end(),
-                  [](const std::uint8_t flag) { return flag != 1; }))
-  {
-    return CheckpointCodecStatus::unpublished_artifact;
-  }
-
-  StableIdentity card_id{};
-  StableIdentity case_id{};
-  StableIdentity checkpoint_id{};
+  ArtifactConfig artifact_config{};
+  CheckpointRuntimeIdentityV1 artifact_runtime{};
   CheckpointDescriptor descriptor{};
-  if (!reader.Identity(card_id) || !reader.Identity(case_id) ||
-      !reader.Identity(checkpoint_id) ||
+  if (!ReadConfig(reader, artifact_config) ||
+      !reader.Identity(artifact_runtime.physical_gpu_uuid) ||
+      !reader.Hash(artifact_runtime.ownership_hash) ||
       !ReadDescriptor(reader, descriptor))
   {
     return CheckpointCodecStatus::truncated;
+  }
+  if (!ConfigMatches(artifact_config, expected_config))
+  {
+    return CheckpointCodecStatus::invalid_config_identity;
   }
   if (!DescriptorStructurallyValid(descriptor))
   {
     return CheckpointCodecStatus::invalid_descriptor;
   }
-  if (card_id != expected_config.card_id() ||
-      case_id != expected_config.case_id() ||
-      checkpoint_id != expected_config.checkpoint_id() ||
-      descriptor.coordinates.step != expected_config.checkpoint_step() ||
-      descriptor.coordinates.cursor != expected_config.checkpoint_step())
-  {
-    return CheckpointCodecStatus::invalid_checkpoint_identity;
-  }
   CheckpointCodecStatus status = ValidateSameTupleRestartV1(
-      descriptor, expected_config, expected_resources);
+      descriptor, expected_config, expected_resources,
+      expected_runtime_identity, artifact_runtime);
   if (status != CheckpointCodecStatus::ok) { return status; }
 
   std::uint32_t rank_count = 0;
@@ -1025,9 +1064,13 @@ CheckpointCodecStatus DecodeCheckpointV1(
   if (rank_count == 0 ||
       rank_count > application_checkpoint_max_rank_count_v1 ||
       rank_count != descriptor.rank_count ||
-      rank_count != publication.participating_ranks)
+      rank_count != expected_config.deferred_runtime().required_mpi_rank_count)
   {
     return CheckpointCodecStatus::rank_tuple_mismatch;
+  }
+  if (rank_buffers == nullptr || rank_buffer_count != rank_count)
+  {
+    return CheckpointCodecStatus::output_buffer_mismatch;
   }
   const std::uint64_t metadata_bytes =
       static_cast<std::uint64_t>(rank_count) * rank_record_size;
@@ -1067,6 +1110,12 @@ CheckpointCodecStatus DecodeCheckpointV1(
     {
       return CheckpointCodecStatus::size_overflow;
     }
+    if (rank_buffers[index].rank != index ||
+        !BufferMatches(rank_buffers[index].interior, rank.interior) ||
+        !BufferMatches(rank_buffers[index].owned_true_trace, rank.trace))
+    {
+      return CheckpointCodecStatus::output_buffer_mismatch;
+    }
   }
   if (summed_interior != aggregate_interior_count ||
       summed_trace != aggregate_trace_count)
@@ -1079,7 +1128,6 @@ CheckpointCodecStatus DecodeCheckpointV1(
         ? CheckpointCodecStatus::truncated
         : CheckpointCodecStatus::trailing_bytes;
   }
-
   RankPayloadHashV1 aggregate_interior{};
   RankPayloadHashV1 aggregate_trace{};
   if (!AggregateHashes(metadata, rank_count, aggregate_interior,
@@ -1090,52 +1138,45 @@ CheckpointCodecStatus DecodeCheckpointV1(
     return CheckpointCodecStatus::aggregate_payload_hash_mismatch;
   }
 
-  DecodedCheckpointV1 candidate{};
-  try
-  {
-    candidate.ranks.resize(rank_count);
-    for (std::uint32_t index = 0; index < rank_count; ++index)
-    {
-      candidate.ranks[index].interior.coefficients.resize(
-          static_cast<std::size_t>(metadata[index].interior.coefficient_count));
-      candidate.ranks[index].owned_true_trace.coefficients.resize(
-          static_cast<std::size_t>(metadata[index].trace.coefficient_count));
-    }
-  }
-  catch (const std::bad_alloc&)
-  {
-    return CheckpointCodecStatus::allocation_failure;
-  }
-  catch (const std::length_error&)
-  {
-    return CheckpointCodecStatus::allocation_failure;
-  }
+  const std::size_t payload_offset = reader.offset();
   for (std::uint32_t index = 0; index < rank_count; ++index)
   {
-    candidate.ranks[index].rank = metadata[index].rank;
-    status = DecodeCoefficientBlock(reader, metadata[index].interior,
-                                    candidate.ranks[index].interior);
-    if (status != CheckpointCodecStatus::ok)
-    {
-      return status;
-    }
-    status = DecodeCoefficientBlock(reader, metadata[index].trace,
-                                    candidate.ranks[index].owned_true_trace);
-    if (status != CheckpointCodecStatus::ok)
-    {
-      return status;
-    }
+    status = PreflightCoefficientBlock(reader, metadata[index].interior);
+    if (status != CheckpointCodecStatus::ok) { return status; }
+    status = PreflightCoefficientBlock(reader, metadata[index].trace);
+    if (status != CheckpointCodecStatus::ok) { return status; }
   }
   if (!reader.AtEnd()) { return CheckpointCodecStatus::trailing_bytes; }
-  candidate.descriptor = descriptor;
-  candidate.card_id = card_id;
-  candidate.case_id = case_id;
-  candidate.checkpoint_id = checkpoint_id;
-  candidate.publication = publication;
-  candidate.aggregate_interior_coefficients = aggregate_interior_count;
-  candidate.aggregate_true_trace_coefficients = aggregate_trace_count;
-  candidate.artifact_hash.bytes = checksum;
-  checkpoint = std::move(candidate);
+
+  DecodedCheckpointMetadataV1 candidate_metadata{};
+  candidate_metadata.descriptor = descriptor;
+  candidate_metadata.card_id = artifact_config.card_id;
+  candidate_metadata.case_id = artifact_config.case_id;
+  candidate_metadata.scenario_id = artifact_config.scenario_id;
+  candidate_metadata.checkpoint_id = artifact_config.checkpoint_id;
+  candidate_metadata.physical_gpu_uuid = artifact_runtime.physical_gpu_uuid;
+  candidate_metadata.scientific_config_sha256 =
+      artifact_config.scientific_config_sha256;
+  candidate_metadata.run_config_sha256 = artifact_config.run_config_sha256;
+  candidate_metadata.ownership_hash = artifact_runtime.ownership_hash;
+  candidate_metadata.mesh_n = artifact_config.mesh_n;
+  candidate_metadata.rank_count = rank_count;
+  candidate_metadata.aggregate_interior_coefficients =
+      aggregate_interior_count;
+  candidate_metadata.aggregate_true_trace_coefficients =
+      aggregate_trace_count;
+  candidate_metadata.artifact_hash.bytes = checksum;
+
+  Reader payload(encoded.data + payload_offset,
+                 static_cast<std::size_t>(expected_payload_bytes));
+  for (std::uint32_t index = 0; index < rank_count; ++index)
+  {
+    CopyCoefficientBlock(payload, metadata[index].interior,
+                         rank_buffers[index].interior.data);
+    CopyCoefficientBlock(payload, metadata[index].trace,
+                         rank_buffers[index].owned_true_trace.data);
+  }
+  output_metadata = candidate_metadata;
   return CheckpointCodecStatus::ok;
 }
 

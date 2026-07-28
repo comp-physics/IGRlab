@@ -2,12 +2,14 @@
 
 /**
  * @file numerics/hdg/runtime/app/checkpoint_codec.hpp
- * @brief Explicit little-endian W8A FP64 checkpoint/manifest contract.
+ * @brief Canonical in-memory W8A FP64 checkpoint artifact codec.
  *
- * Durable state is encoded coefficient-by-coefficient; no object bytes or
- * pointers are serialized.  Publication authority is affine and can begin
- * only from a live PersistentRunContract that reports a successful committed
- * checkpoint at the frozen checkpoint coordinate.
+ * This slice performs no filesystem I/O and makes no durability/publication
+ * claim.  The later single-owner checkpoint I/O implementation must create
+ * rank temporaries exclusively, fsync every temporary, reach collective
+ * manifest consensus, publish with a final atomic rename, fsync the parent
+ * directory, and establish collective visibility.  No caller boolean in this
+ * API stands in for any of those operations.
  */
 
 #include "numerics/hdg/runtime/app/application_contract.hpp"
@@ -18,7 +20,6 @@
 #include <limits>
 #include <optional>
 #include <type_traits>
-#include <utility>
 #include <vector>
 
 namespace dg::hdg::runtime::app
@@ -28,6 +29,7 @@ inline constexpr std::uint32_t application_checkpoint_codec_version_v1 = 1;
 inline constexpr std::uint32_t application_checkpoint_max_rank_count_v1 = 2;
 inline constexpr std::uint32_t euler_state_component_count_v1 = 4;
 inline constexpr std::uint64_t fp64_coefficient_bytes_v1 = 8;
+inline constexpr std::string_view no_physical_gpu_uuid_v1 = "none";
 
 static_assert(sizeof(double) == fp64_coefficient_bytes_v1 &&
                   std::numeric_limits<double>::is_iec559 &&
@@ -48,7 +50,6 @@ enum class CoefficientOrderingV1 : std::uint8_t
   component_major = 0
 };
 
-/** Non-owning typed view; count must equal components*dofs-per-component. */
 struct Fp64CoefficientViewV1
 {
   const double* data = nullptr;
@@ -65,11 +66,33 @@ struct StagedStateViewV1
   Fp64CoefficientViewV1 owned_true_trace{};
 };
 
-enum class PublicationPhaseV1 : std::uint8_t
+/** Exact caller-owned decode destination; the codec never allocates it. */
+struct Fp64CoefficientBufferV1
 {
-  rank_temporaries_durable = 0,
-  collective_manifest_validated = 1,
-  manifest_atomically_published = 2
+  double* data = nullptr;
+  std::uint64_t capacity = 0;
+  std::uint64_t coefficient_count = 0;
+  std::uint32_t component_count = 0;
+  std::uint64_t dofs_per_component = 0;
+  CoefficientOrderingV1 ordering = CoefficientOrderingV1::component_major;
+};
+
+struct RankStateBufferV1
+{
+  std::uint32_t rank = 0;
+  Fp64CoefficientBufferV1 interior{};
+  Fp64CoefficientBufferV1 owned_true_trace{};
+};
+
+/**
+ * Runtime identity supplied by the future backend after resource discovery.
+ * It is checkpoint metadata, not application admission or execution authority.
+ */
+struct CheckpointRuntimeIdentityV1
+{
+  StableIdentity physical_gpu_uuid =
+      StableIdentity::Copy(no_physical_gpu_uuid_v1);
+  StateHash ownership_hash{};
 };
 
 enum class CheckpointCodecStatus : std::uint8_t
@@ -78,8 +101,8 @@ enum class CheckpointCodecStatus : std::uint8_t
   invalid_argument,
   invalid_descriptor,
   invalid_checkpoint_identity,
-  invalid_publication_state,
-  unpublished_artifact,
+  invalid_config_identity,
+  invalid_runtime_identity,
   unsupported_version,
   truncated,
   length_mismatch,
@@ -94,276 +117,129 @@ enum class CheckpointCodecStatus : std::uint8_t
   aggregate_payload_hash_mismatch,
   restart_tuple_mismatch,
   resource_mismatch,
+  output_buffer_mismatch,
   allocation_failure,
   trailing_bytes,
   size_overflow
 };
 
-struct RankTemporaryPublicationFactsV1
-{
-  std::uint32_t participating_ranks = 0;
-  std::uint32_t source_rank = 0;
-  StateHash temporary_file_set_hash{};
-  StateHash previous_manifest_hash{};
-  bool all_rank_temporaries_created_exclusive = false;
-  bool all_rank_temporaries_synced = false;
-  bool collective_temporary_consensus = false;
-};
-
-struct CollectiveManifestValidationFactsV1
-{
-  std::uint32_t participating_ranks = 0;
-  bool descriptor_consensus = false;
-  bool rank_manifest_consensus = false;
-  bool payload_hash_consensus = false;
-};
-
-struct AtomicManifestPublicationFactsV1
-{
-  std::uint32_t source_rank = 0;
-  bool manifest_created_exclusive = false;
-  bool manifest_synced = false;
-  bool atomic_rename_complete = false;
-  bool publication_directory_synced = false;
-  bool collective_visibility_consensus = false;
-};
-
-class CheckpointContractEvidenceV1 final
+class CapturedCheckpointV1 final
 {
 public:
-  CheckpointContractEvidenceV1(const CheckpointContractEvidenceV1&) = delete;
-  CheckpointContractEvidenceV1& operator=(
-      const CheckpointContractEvidenceV1&) = delete;
-  CheckpointContractEvidenceV1(CheckpointContractEvidenceV1&&) = default;
-  CheckpointContractEvidenceV1& operator=(CheckpointContractEvidenceV1&&) =
-      default;
+  CapturedCheckpointV1(const CapturedCheckpointV1&) = default;
+  CapturedCheckpointV1(CapturedCheckpointV1&&) = default;
+  CapturedCheckpointV1& operator=(const CapturedCheckpointV1&) = default;
+  CapturedCheckpointV1& operator=(CapturedCheckpointV1&&) = default;
+
+  const CheckpointDescriptor& descriptor() const noexcept
+  {
+    return descriptor_;
+  }
+  const ValidatedApplicationConfig& config() const noexcept { return config_; }
+  const CheckpointRuntimeIdentityV1& runtime_identity() const noexcept
+  {
+    return runtime_identity_;
+  }
 
 private:
-  CheckpointContractEvidenceV1(CheckpointDescriptor descriptor,
-                               StableIdentity card_id,
-                               StableIdentity case_id,
-                               StableIdentity checkpoint_id) noexcept
+  CapturedCheckpointV1(CheckpointDescriptor descriptor,
+                       ValidatedApplicationConfig config,
+                       CheckpointRuntimeIdentityV1 runtime_identity) noexcept
       : descriptor_(descriptor),
-        card_id_(card_id),
-        case_id_(case_id),
-        checkpoint_id_(checkpoint_id)
+        config_(config),
+        runtime_identity_(runtime_identity)
   {}
 
   CheckpointDescriptor descriptor_{};
-  StableIdentity card_id_{};
-  StableIdentity case_id_{};
-  StableIdentity checkpoint_id_{};
+  ValidatedApplicationConfig config_;
+  CheckpointRuntimeIdentityV1 runtime_identity_{};
 
   template <typename Selection,
             typename InteriorState,
             typename TraceState,
             typename StoragePolicy,
             typename CollectivePolicy>
-  friend std::optional<CheckpointContractEvidenceV1>
-  CaptureCheckpointContractEvidenceV1(
+  friend std::optional<CapturedCheckpointV1> CaptureCheckpointV1(
       const PersistentRunContract<Selection,
                                   InteriorState,
                                   TraceState,
                                   StoragePolicy,
                                   CollectivePolicy>&,
-      const ValidatedApplicationConfig&) noexcept;
-  friend class DurableRankTemporariesV1;
-  friend struct PublicationAccessV1;
+      const ValidatedApplicationConfig&,
+      const CheckpointRuntimeIdentityV1&) noexcept;
 };
+
+bool ValidCheckpointRuntimeIdentityV1(
+    const ValidatedApplicationConfig& config,
+    const CheckpointRuntimeIdentityV1& identity) noexcept;
 
 template <typename Selection,
           typename InteriorState,
           typename TraceState,
           typename StoragePolicy,
           typename CollectivePolicy>
-std::optional<CheckpointContractEvidenceV1>
-CaptureCheckpointContractEvidenceV1(
+std::optional<CapturedCheckpointV1> CaptureCheckpointV1(
     const PersistentRunContract<Selection,
                                 InteriorState,
                                 TraceState,
                                 StoragePolicy,
                                 CollectivePolicy>& contract,
-    const ValidatedApplicationConfig& config) noexcept
+    const ValidatedApplicationConfig& config,
+    const CheckpointRuntimeIdentityV1& runtime_identity) noexcept
 {
   CheckpointDescriptor descriptor{};
   const StateCoordinates coordinates = contract.coordinates();
   const RunTelemetry& telemetry = contract.telemetry();
-  const typename PersistentRunContract<Selection,
-                                       InteriorState,
-                                       TraceState,
-                                       StoragePolicy,
-                                       CollectivePolicy>::PublishedCapability
-      published = contract.Published();
+  const auto published = contract.Published();
   StateCoordinates published_coordinates{};
-  if (contract.status() != RunStatus::committed ||
+  if (!ValidCheckpointRuntimeIdentityV1(config, runtime_identity) ||
+      contract.status() != RunStatus::committed ||
       !telemetry.accepted.valid ||
-      telemetry.commits < smooth_periodic_euler_v1_checkpoint_step ||
+      telemetry.commits < config.checkpoint_step() ||
       !contract.PublishedCoordinates(published, published_coordinates) ||
       !::dg::hdg::runtime::detail::SameCoordinates(
           coordinates, published_coordinates) ||
       coordinates.step != config.checkpoint_step() ||
       coordinates.generation != config.checkpoint_step() ||
-      coordinates.step != smooth_periodic_euler_v1_checkpoint_step ||
       coordinates.cursor != config.checkpoint_step() ||
       coordinates.dt != config.dt() ||
-      contract.resources().rank_count != config.mpi_rank_count() ||
+      contract.resources().rank_count !=
+          config.deferred_runtime().required_mpi_rank_count ||
+      contract.resources().polynomial_order != config.polynomial_order() ||
+      contract.resources().layout != config.layout_id() ||
       !contract.TryMakeCheckpoint(descriptor) ||
       descriptor.tuple != config.tuple() ||
+      descriptor.rank_count !=
+          config.deferred_runtime().required_mpi_rank_count ||
       descriptor.polynomial_order != config.polynomial_order() ||
-      descriptor.rank_count != config.mpi_rank_count() ||
       descriptor.coordinates.step != config.checkpoint_step() ||
       descriptor.coordinates.cursor != config.checkpoint_step())
   {
     return std::nullopt;
   }
-  return CheckpointContractEvidenceV1(
-      descriptor, config.card_id(), config.case_id(), config.checkpoint_id());
+  return CapturedCheckpointV1(descriptor, config, runtime_identity);
 }
 
-class DurableRankTemporariesV1 final
-{
-public:
-  DurableRankTemporariesV1(const DurableRankTemporariesV1&) = delete;
-  DurableRankTemporariesV1& operator=(const DurableRankTemporariesV1&) =
-      delete;
-  DurableRankTemporariesV1(DurableRankTemporariesV1&&) = default;
-  DurableRankTemporariesV1& operator=(DurableRankTemporariesV1&&) = default;
-
-private:
-  DurableRankTemporariesV1(CheckpointContractEvidenceV1 evidence,
-                           CheckpointDescriptor descriptor,
-                           RankTemporaryPublicationFactsV1 facts,
-                           std::uint64_t interior_coefficients,
-                           std::uint64_t trace_coefficients) noexcept
-      : evidence_(std::move(evidence)),
-        descriptor_(descriptor),
-        facts_(facts),
-        interior_coefficients_(interior_coefficients),
-        trace_coefficients_(trace_coefficients)
-  {}
-
-  CheckpointContractEvidenceV1 evidence_;
-  CheckpointDescriptor descriptor_{};
-  RankTemporaryPublicationFactsV1 facts_{};
-  std::uint64_t interior_coefficients_ = 0;
-  std::uint64_t trace_coefficients_ = 0;
-
-  friend struct PublicationAccessV1;
-};
-
-class ValidatedCheckpointManifestV1 final
-{
-public:
-  ValidatedCheckpointManifestV1(const ValidatedCheckpointManifestV1&) =
-      delete;
-  ValidatedCheckpointManifestV1& operator=(
-      const ValidatedCheckpointManifestV1&) = delete;
-  ValidatedCheckpointManifestV1(ValidatedCheckpointManifestV1&&) = default;
-  ValidatedCheckpointManifestV1& operator=(ValidatedCheckpointManifestV1&&) =
-      default;
-
-private:
-  ValidatedCheckpointManifestV1(
-      DurableRankTemporariesV1 temporaries,
-      CollectiveManifestValidationFactsV1 facts) noexcept
-      : temporaries_(std::move(temporaries)), facts_(facts)
-  {}
-
-  DurableRankTemporariesV1 temporaries_;
-  CollectiveManifestValidationFactsV1 facts_{};
-
-  friend struct PublicationAccessV1;
-};
-
-class PublishedCheckpointManifestV1 final
-{
-public:
-  PublishedCheckpointManifestV1(const PublishedCheckpointManifestV1&) =
-      delete;
-  PublishedCheckpointManifestV1& operator=(
-      const PublishedCheckpointManifestV1&) = delete;
-  PublishedCheckpointManifestV1(PublishedCheckpointManifestV1&&) = default;
-  PublishedCheckpointManifestV1& operator=(PublishedCheckpointManifestV1&&) =
-      default;
-
-private:
-  PublishedCheckpointManifestV1(
-      ValidatedCheckpointManifestV1 validated,
-      AtomicManifestPublicationFactsV1 facts) noexcept
-      : validated_(std::move(validated)), facts_(facts)
-  {}
-
-  ValidatedCheckpointManifestV1 validated_;
-  AtomicManifestPublicationFactsV1 facts_{};
-
-  friend struct PublicationAccessV1;
-};
-
-template <typename Authority>
-struct PublicationTransitionV1
-{
-  CheckpointCodecStatus status = CheckpointCodecStatus::invalid_argument;
-  std::optional<Authority> authority{};
-};
-
-PublicationTransitionV1<DurableRankTemporariesV1>
-RecordDurableRankTemporariesV1(
-    CheckpointContractEvidenceV1&& evidence,
-    const RankTemporaryPublicationFactsV1& facts,
-    const StagedStateViewV1* ranks,
-    std::size_t rank_count);
-
-PublicationTransitionV1<ValidatedCheckpointManifestV1>
-ValidateCollectiveCheckpointManifestV1(
-    DurableRankTemporariesV1&& temporaries,
-    const CollectiveManifestValidationFactsV1& facts) noexcept;
-
-PublicationTransitionV1<PublishedCheckpointManifestV1>
-PublishCheckpointManifestV1(
-    ValidatedCheckpointManifestV1&& validated,
-    const AtomicManifestPublicationFactsV1& facts) noexcept;
-
-struct PublicationAuditV1
-{
-  PublicationPhaseV1 phase = PublicationPhaseV1::rank_temporaries_durable;
-  std::uint64_t transaction_id = 0;
-  StateHash temporary_file_set_hash{};
-  StateHash previous_manifest_hash{};
-  std::uint32_t participating_ranks = 0;
-  std::uint32_t source_rank = 0;
-};
-
-struct DecodedCoefficientBlockV1
-{
-  std::uint32_t component_count = 0;
-  std::uint64_t dofs_per_component = 0;
-  CoefficientOrderingV1 ordering = CoefficientOrderingV1::component_major;
-  StateHash payload_hash{};
-  std::vector<double> coefficients{};
-};
-
-struct DecodedRankStateV1
-{
-  std::uint32_t rank = 0;
-  DecodedCoefficientBlockV1 interior{};
-  DecodedCoefficientBlockV1 owned_true_trace{};
-};
-
-struct DecodedCheckpointV1
+struct DecodedCheckpointMetadataV1
 {
   CheckpointDescriptor descriptor{};
   StableIdentity card_id{};
   StableIdentity case_id{};
+  StableIdentity scenario_id{};
   StableIdentity checkpoint_id{};
-  PublicationAuditV1 publication{};
-  std::vector<DecodedRankStateV1> ranks{};
+  StableIdentity physical_gpu_uuid{};
+  StateHash scientific_config_sha256{};
+  StateHash run_config_sha256{};
+  StateHash ownership_hash{};
+  std::uint32_t mesh_n = 0;
+  std::uint32_t rank_count = 0;
   std::uint64_t aggregate_interior_coefficients = 0;
   std::uint64_t aggregate_true_trace_coefficients = 0;
   StateHash artifact_hash{};
 };
 
 CheckpointCodecStatus EncodeCheckpointV1(
-    const PublishedCheckpointManifestV1& publication,
+    const CapturedCheckpointV1& checkpoint,
     const StagedStateViewV1* ranks,
     std::size_t rank_count,
     std::vector<std::uint8_t>& encoded);
@@ -372,20 +248,23 @@ CheckpointCodecStatus DecodeCheckpointV1(
     ConstByteView encoded,
     const ValidatedApplicationConfig& expected_config,
     const PersistentResourceDescriptor& expected_resources,
-    DecodedCheckpointV1& checkpoint);
+    const CheckpointRuntimeIdentityV1& expected_runtime_identity,
+    RankStateBufferV1* rank_buffers,
+    std::size_t rank_buffer_count,
+    DecodedCheckpointMetadataV1& metadata);
 
 CheckpointCodecStatus ValidateSameTupleRestartV1(
     const CheckpointDescriptor& checkpoint,
     const ValidatedApplicationConfig& expected_config,
-    const PersistentResourceDescriptor& expected_resources) noexcept;
+    const PersistentResourceDescriptor& expected_resources,
+    const CheckpointRuntimeIdentityV1& expected_runtime_identity,
+    const CheckpointRuntimeIdentityV1& artifact_runtime_identity) noexcept;
 
-static_assert(!std::is_default_constructible<CheckpointContractEvidenceV1>::value,
-              "contract checkpoint evidence cannot be fabricated");
-static_assert(!std::is_default_constructible<PublishedCheckpointManifestV1>::value,
-              "published authority cannot be fabricated");
-static_assert(!std::is_copy_constructible<PublishedCheckpointManifestV1>::value,
-              "published authority is affine");
-static_assert(!std::is_polymorphic<PublishedCheckpointManifestV1>::value,
-              "publication protocol uses static dispatch");
+static_assert(!std::is_default_constructible<CapturedCheckpointV1>::value,
+              "checkpoint capture must originate from a live contract");
+static_assert(std::is_copy_constructible<CapturedCheckpointV1>::value,
+              "committed in-memory checkpoints may be re-encoded");
+static_assert(!std::is_polymorphic<CapturedCheckpointV1>::value,
+              "checkpoint capture uses static dispatch");
 
 } // namespace dg::hdg::runtime::app

@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -27,12 +26,9 @@ static_assert(application_checkpoint_max_rank_count_v1 == 2 &&
                   euler_state_component_count_v1 == 4 &&
                   fp64_coefficient_bytes_v1 == 8,
               "v1 rank, component, and binary64 bounds are exact");
-static_assert(!std::is_default_constructible<CheckpointContractEvidenceV1>::value &&
-                  !std::is_default_constructible<
-                      PublishedCheckpointManifestV1>::value &&
-                  !std::is_copy_constructible<
-                      PublishedCheckpointManifestV1>::value,
-              "checkpoint and publication authority cannot be forged");
+static_assert(!std::is_default_constructible<CapturedCheckpointV1>::value &&
+                  std::is_copy_constructible<CapturedCheckpointV1>::value,
+              "capture is live-contract-originated but repeatably encodable");
 
 bool Check(const bool condition, const char* name)
 {
@@ -211,11 +207,19 @@ void AppendU64(std::vector<std::uint8_t>& bytes, const std::uint64_t value)
 }
 
 template <std::size_t Size>
-StateHash OracleCoefficientHash(const std::array<double, Size>& values)
+StateHash OracleCoefficientHash(
+    const std::array<double, Size>& values) noexcept
 {
-  std::vector<std::uint8_t> bytes;
-  bytes.reserve(Size * 8);
-  for (const double value : values) { AppendU64(bytes, OracleBits(value)); }
+  std::array<std::uint8_t, Size * 8> bytes{};
+  std::size_t offset = 0;
+  for (const double value : values)
+  {
+    const std::uint64_t bits = OracleBits(value);
+    for (unsigned int shift = 0; shift < 64; shift += 8)
+    {
+      bytes[offset++] = static_cast<std::uint8_t>(bits >> shift);
+    }
+  }
   return OracleHash(bytes.data(), bytes.size());
 }
 
@@ -377,15 +381,24 @@ PersistentResourceDescriptor TestResources()
   resources.topology_hash = FilledHash(0x50);
   resources.rank_count = 1;
   resources.polynomial_order = 1;
-  resources.layout = StableIdentity::Copy("l2-interior.true-trace-owned.v1");
+  resources.layout = StableIdentity::Copy(
+      smooth_periodic_euler_v1_layout_id);
   resources.reuse = {true, true, true, false, 1, 1, 128, 64};
   return resources;
+}
+
+CheckpointRuntimeIdentityV1 TestRuntimeIdentity()
+{
+  CheckpointRuntimeIdentityV1 identity{};
+  identity.ownership_hash = FilledHash(0x70);
+  return identity;
 }
 
 ApplicationValidation TestValidation()
 {
   ApplicationOptionsView options;
-  options.backend_id = CpuSerialBackendTag::id;
+  options.scientific_config_sha256 = FilledHash(0x90);
+  options.run_config_sha256 = FilledHash(0xb0);
   return ValidateApplicationOptions(options);
 }
 
@@ -402,22 +415,17 @@ Contract::ProductBundle IssueAll(Contract& contract,
   return products;
 }
 
-bool AdvanceTenCommits(Contract& contract)
+bool AdvanceOneCommit(Contract& contract)
 {
-  for (std::uint64_t step = 1; step <= 10; ++step)
-  {
-    const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.05});
-    if (!begin.started) { return false; }
-    AttemptReport report{};
-    report.gates = {true, true, true, true, true, true};
-    report.telemetry.transfers = {0, 0, 0, 0, 0, true};
-    report.telemetry.true_relative_residual = 0.0;
-    report.candidate_cursor = step;
-    const AttemptOutcome outcome = contract.FinishAttempt(
-        begin.attempt, report, IssueAll(contract, begin.attempt));
-    if (!outcome.committed) { return false; }
-  }
-  return true;
+  const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.05});
+  if (!begin.started) { return false; }
+  AttemptReport report{};
+  report.gates = {true, true, true, true, true, true};
+  report.telemetry.transfers = {0, 0, 0, 0, 0, true};
+  report.telemetry.true_relative_residual = 0.0;
+  report.candidate_cursor = 1;
+  return contract.FinishAttempt(begin.attempt, report,
+                                IssueAll(contract, begin.attempt)).committed;
 }
 
 struct CoefficientFixture
@@ -435,47 +443,30 @@ struct CoefficientFixture
   }
 };
 
-std::optional<PublishedCheckpointManifestV1> MakePublished(
+std::optional<CapturedCheckpointV1> MakeCapture(
     const ValidatedApplicationConfig& config,
-    const std::array<StagedStateViewV1, 1>& ranks,
-    const PersistentResourceDescriptor& resources)
+    const PersistentResourceDescriptor& resources,
+    const CheckpointRuntimeIdentityV1& runtime,
+    const CoefficientFixture& fixture)
 {
-  const Slot committed{{{1.0, -2.0, 3.5, -0.0}},
-                       {{5.0, 6.25, -7.5, 8.0}}};
+  const Slot committed{fixture.interior, fixture.trace};
   Slot candidate{};
   Contract contract(committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
-  if (!AdvanceTenCommits(contract)) { return std::nullopt; }
-  auto evidence = CaptureCheckpointContractEvidenceV1(contract, config);
-  if (!evidence) { return std::nullopt; }
-  RankTemporaryPublicationFactsV1 temporary{};
-  temporary.participating_ranks = 1;
-  temporary.source_rank = 0;
-  temporary.temporary_file_set_hash = FilledHash(0x70);
-  temporary.previous_manifest_hash = FilledHash(0x90);
-  temporary.all_rank_temporaries_created_exclusive = true;
-  temporary.all_rank_temporaries_synced = true;
-  temporary.collective_temporary_consensus = true;
-  auto durable = RecordDurableRankTemporariesV1(
-      std::move(*evidence), temporary, ranks.data(), ranks.size());
-  if (durable.status != CheckpointCodecStatus::ok || !durable.authority)
-  {
-    return std::nullopt;
-  }
-  CollectiveManifestValidationFactsV1 collective{1, true, true, true};
-  auto validated = ValidateCollectiveCheckpointManifestV1(
-      std::move(*durable.authority), collective);
-  if (validated.status != CheckpointCodecStatus::ok || !validated.authority)
-  {
-    return std::nullopt;
-  }
-  AtomicManifestPublicationFactsV1 atomic{0, true, true, true, true, true};
-  auto published =
-      PublishCheckpointManifestV1(std::move(*validated.authority), atomic);
-  if (published.status != CheckpointCodecStatus::ok || !published.authority)
-  {
-    return std::nullopt;
-  }
-  return std::move(*published.authority);
+  if (!AdvanceOneCommit(contract)) { return std::nullopt; }
+  return CaptureCheckpointV1(contract, config, runtime);
+}
+
+bool EncodeFixture(const CoefficientFixture& fixture,
+                   const ValidatedApplicationConfig& config,
+                   const PersistentResourceDescriptor& resources,
+                   const CheckpointRuntimeIdentityV1& runtime,
+                   std::vector<std::uint8_t>& encoded)
+{
+  const auto views = fixture.Views();
+  const auto capture = MakeCapture(config, resources, runtime, fixture);
+  return capture &&
+      EncodeCheckpointV1(*capture, views.data(), views.size(), encoded) ==
+      CheckpointCodecStatus::ok;
 }
 
 std::uint64_t ReadU64(const std::vector<std::uint8_t>& bytes,
@@ -520,54 +511,152 @@ bool Seal(std::vector<std::uint8_t>& bytes)
   return true;
 }
 
-std::size_t SkipIdentity(const std::vector<std::uint8_t>& bytes,
-                         std::size_t offset)
+struct NamedOffset
 {
-  const std::uint16_t size = static_cast<std::uint16_t>(bytes[offset]) |
-      static_cast<std::uint16_t>(bytes[offset + 1] << 8U);
-  return offset + 2 + size;
-}
+  const char* name = nullptr;
+  std::size_t offset = 0;
+};
 
 struct LayoutOffsets
 {
-  std::size_t descriptor_start = 0;
+  std::vector<NamedOffset> exact_fields{};
   std::size_t descriptor_interior_hash = 0;
-  std::size_t descriptor_trace_hash = 0;
   std::size_t manifest_rank_count = 0;
+  std::size_t aggregate_interior_count = 0;
   std::size_t rank_record = 0;
   std::size_t interior_coefficient_count = 0;
   std::size_t interior_hash = 0;
-  std::size_t trace_hash = 0;
   std::size_t payload = 0;
 };
 
+std::size_t IdentityField(const std::vector<std::uint8_t>& bytes,
+                          std::size_t offset,
+                          const char* name,
+                          std::vector<NamedOffset>& fields)
+{
+  const std::uint16_t size = static_cast<std::uint16_t>(bytes[offset]) |
+      static_cast<std::uint16_t>(bytes[offset + 1] << 8U);
+  fields.push_back({name, offset + 2});
+  return offset + 2 + size;
+}
+
 LayoutOffsets Locate(const std::vector<std::uint8_t>& bytes)
 {
-  std::size_t offset = 120;
-  offset = SkipIdentity(bytes, offset);
-  offset = SkipIdentity(bytes, offset);
-  offset = SkipIdentity(bytes, offset);
   LayoutOffsets layout{};
-  layout.descriptor_start = offset;
-  offset += 6;
-  for (int identity = 0; identity < 8; ++identity)
+  std::size_t offset = 28;
+  for (const char* name :
+       {"config.card", "config.case", "config.scenario",
+        "config.checkpoint", "config.mesh-family", "config.source",
+        "config.flux", "config.time-rule", "config.layout"})
   {
-    offset = SkipIdentity(bytes, offset);
+    offset = IdentityField(bytes, offset, name, layout.exact_fields);
   }
-  offset += 3 * 32 + 4 + 4;
-  offset = SkipIdentity(bytes, offset);
-  offset = SkipIdentity(bytes, offset);
-  offset += 8 + 8 + 5 * 8 + 8;
+  for (const char* name : {"config.scientific-sha", "config.run-sha"})
+  {
+    layout.exact_fields.push_back({name, offset});
+    offset += 32;
+  }
+  const std::array<std::pair<const char*, std::size_t>, 24> config_scalars{{
+      {"config.scenario-enum", 1}, {"config.interior-space", 1},
+      {"config.mesh-n", 4},
+      {"config.p", 4},             {"config.qA", 4},
+      {"config.qE", 4},            {"config.qE4", 4},
+      {"config.qO", 4},            {"config.gamma", 8},
+      {"config.tau", 8},           {"config.dt", 8},
+      {"config.steps", 8},         {"config.final-time", 8},
+      {"config.output-0", 8},      {"config.output-1", 8},
+      {"config.output-2", 8},      {"config.checkpoint-step", 8},
+      {"config.restart", 1},       {"config.trajectory", 1},
+      {"config.failure-commit", 8},{"config.failure-target", 8},
+      {"config.failure-phase", 1}, {"config.rollback", 1},
+      {"config.source-rule", 1}}};
+  for (const auto& field : config_scalars)
+  {
+    layout.exact_fields.push_back({field.first, offset});
+    offset += field.second;
+  }
+  layout.exact_fields.push_back({"config.retry", offset});
+  offset += 4;
+  layout.exact_fields.push_back({"config.seed", offset});
+  offset += 8;
+  offset = IdentityField(bytes, offset, "runtime.gpu-uuid",
+                         layout.exact_fields);
+  layout.exact_fields.push_back({"runtime.ownership-hash", offset});
+  offset += 32;
+
+  layout.exact_fields.push_back({"descriptor.schema", offset});
+  offset += 4;
+  layout.exact_fields.push_back({"descriptor.success", offset++});
+  layout.exact_fields.push_back({"descriptor.restart", offset++});
+  for (const char* name :
+       {"descriptor.model", "descriptor.formulation", "descriptor.trace",
+        "descriptor.stabilization", "descriptor.time", "descriptor.backend",
+        "descriptor.precision", "descriptor.mfem-pin"})
+  {
+    offset = IdentityField(bytes, offset, name, layout.exact_fields);
+  }
+  for (const char* name : {"descriptor.mesh-hash",
+                           "descriptor.partition-hash",
+                           "descriptor.topology-hash"})
+  {
+    layout.exact_fields.push_back({name, offset});
+    offset += 32;
+  }
+  layout.exact_fields.push_back({"descriptor.rank-count", offset});
+  offset += 4;
+  layout.exact_fields.push_back({"descriptor.p", offset});
+  offset += 4;
+  offset = IdentityField(bytes, offset, "descriptor.layout",
+                         layout.exact_fields);
+  offset = IdentityField(bytes, offset, "descriptor.precision-repeat",
+                         layout.exact_fields);
+  for (const char* name : {"descriptor.cursor", "descriptor.dt",
+                           "descriptor.time-coordinate", "descriptor.step",
+                           "descriptor.generation", "descriptor.coord-cursor",
+                           "descriptor.coord-dt", "descriptor.fingerprint"})
+  {
+    layout.exact_fields.push_back({name, offset});
+    offset += 8;
+  }
   layout.descriptor_interior_hash = offset;
-  layout.descriptor_trace_hash = offset + 32;
-  offset += 64;
+  layout.exact_fields.push_back({"descriptor.interior-hash", offset});
+  offset += 32;
+  layout.exact_fields.push_back({"descriptor.trace-hash", offset});
+  offset += 32;
+
   layout.manifest_rank_count = offset;
-  offset += 4 + 8 + 8;
+  layout.exact_fields.push_back({"manifest.rank-count", offset});
+  offset += 4;
+  layout.aggregate_interior_count = offset;
+  layout.exact_fields.push_back({"manifest.interior-count", offset});
+  offset += 8;
+  layout.exact_fields.push_back({"manifest.trace-count", offset});
+  offset += 8;
   layout.rank_record = offset;
-  layout.interior_coefficient_count = offset + 4 + 4;
-  layout.interior_hash = offset + 4 + 4 + 8 + 8 + 1 + 8;
-  layout.trace_hash = offset + 4 + 61 + 4 + 8 + 8 + 1 + 8;
-  layout.payload = offset + 126;
+  layout.exact_fields.push_back({"rank.rank", offset});
+  offset += 4;
+  const auto block = [&](const char* prefix) {
+    layout.exact_fields.push_back({prefix, offset});
+    offset += 4;
+    layout.exact_fields.push_back({"rank.coefficient-count", offset});
+    if (layout.interior_coefficient_count == 0)
+    {
+      layout.interior_coefficient_count = offset;
+    }
+    offset += 8;
+    layout.exact_fields.push_back({"rank.dofs-per-component", offset});
+    offset += 8;
+    layout.exact_fields.push_back({"rank.ordering", offset});
+    offset += 1;
+    layout.exact_fields.push_back({"rank.byte-count", offset});
+    offset += 8;
+    layout.exact_fields.push_back({"rank.local-hash", offset});
+    if (layout.interior_hash == 0) { layout.interior_hash = offset; }
+    offset += 32;
+  };
+  block("rank.interior-components");
+  block("rank.trace-components");
+  layout.payload = offset;
   return layout;
 }
 
@@ -597,51 +686,99 @@ bool SameDescriptorIndependent(const CheckpointDescriptor& left,
       left.trace_hash == right.trace_hash;
 }
 
-DecodedCheckpointV1 SentinelOutput()
+struct DecodeSentinel
 {
-  DecodedCheckpointV1 sentinel{};
-  sentinel.card_id = StableIdentity::Copy("sentinel-card");
-  sentinel.aggregate_interior_coefficients = 999;
-  sentinel.ranks.resize(1);
-  sentinel.ranks[0].rank = 77;
-  sentinel.ranks[0].interior.coefficients = {123.0};
-  return sentinel;
+  State interior{{101.0, 102.0, 103.0, 104.0}};
+  State trace{{201.0, 202.0, 203.0, 204.0}};
+  DecodedCheckpointMetadataV1 metadata{};
+
+  DecodeSentinel()
+  {
+    metadata.descriptor.schema_version = 77;
+    metadata.descriptor.mfem_pin = StableIdentity::Copy("sentinel-mfem");
+    metadata.card_id = StableIdentity::Copy("sentinel-card");
+    metadata.case_id = StableIdentity::Copy("sentinel-case");
+    metadata.scenario_id = StableIdentity::Copy("sentinel-scenario");
+    metadata.checkpoint_id = StableIdentity::Copy("sentinel-checkpoint");
+    metadata.physical_gpu_uuid = StableIdentity::Copy("sentinel-gpu");
+    metadata.scientific_config_sha256 = FilledHash(0xd0);
+    metadata.run_config_sha256 = FilledHash(0xe0);
+    metadata.ownership_hash = FilledHash(0xf0);
+    metadata.mesh_n = 99;
+    metadata.rank_count = 88;
+    metadata.aggregate_interior_coefficients = 77;
+    metadata.aggregate_true_trace_coefficients = 66;
+    metadata.artifact_hash = FilledHash(0xa0);
+  }
+
+  std::array<RankStateBufferV1, 1> Buffers() noexcept
+  {
+    return {{{0,
+              {interior.data(), interior.size(), interior.size(), 4, 1,
+               CoefficientOrderingV1::component_major},
+              {trace.data(), trace.size(), trace.size(), 4, 1,
+               CoefficientOrderingV1::component_major}}}};
+  }
+};
+
+bool SameMetadata(const DecodedCheckpointMetadataV1& left,
+                  const DecodedCheckpointMetadataV1& right)
+{
+  return SameDescriptorIndependent(left.descriptor, right.descriptor) &&
+      left.card_id == right.card_id && left.case_id == right.case_id &&
+      left.scenario_id == right.scenario_id &&
+      left.checkpoint_id == right.checkpoint_id &&
+      left.physical_gpu_uuid == right.physical_gpu_uuid &&
+      left.scientific_config_sha256 == right.scientific_config_sha256 &&
+      left.run_config_sha256 == right.run_config_sha256 &&
+      left.ownership_hash == right.ownership_hash &&
+      left.mesh_n == right.mesh_n && left.rank_count == right.rank_count &&
+      left.aggregate_interior_coefficients ==
+          right.aggregate_interior_coefficients &&
+      left.aggregate_true_trace_coefficients ==
+          right.aggregate_true_trace_coefficients &&
+      left.artifact_hash == right.artifact_hash;
 }
 
-bool SentinelUnchanged(const DecodedCheckpointV1& value)
+bool SentinelUnchanged(const DecodeSentinel& value,
+                       const DecodeSentinel& original)
 {
-  return value.card_id.view() == "sentinel-card" &&
-      value.aggregate_interior_coefficients == 999 &&
-      value.ranks.size() == 1 && value.ranks[0].rank == 77 &&
-      value.ranks[0].interior.coefficients == std::vector<double>{123.0};
+  return value.interior == original.interior && value.trace == original.trace &&
+      SameMetadata(value.metadata, original.metadata);
 }
 
-// Filled after independent format derivation; this literal is the entire v1
-// artifact, including its final SHA-256 checksum.
+// Filled from an independent fieldwise Python oracle after the format is
+// frozen.  The literal includes every artifact byte and the final SHA-256.
 constexpr std::string_view golden_artifact_hex =
-    "44474947522d4844472d434b5054310001000000890300000000000002480f00ba88f27202707172"
-    "737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a"
-    "9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf01000000000000000101010101010101010101"
-    "33006578702e6864672e65756c65722e636f6e76656e74696f6e616c2e736d6f6f74685f70657273"
-    "697374656e742e7738612e76312100636f6e76656e74696f6e616c2d736d6f6f74682d7065727369"
-    "7374656e742d76312f00636865636b706f696e742e6864672e65756c65722e736d6f6f74682d7065"
-    "72696f6469632e737465702d31302e7631010000000100150065756c65722e636f6d707265737369"
-    "626c652e326410006864672e636f6e76656e74696f6e616c17006d66656d2e64675f696e74657266"
-    "6163652e747261636509007461752e66697865640e006261636b776172645f65756c65720a006370"
-    "752e73657269616c0400667036341000643964363532366363313734393938301011121314151617"
-    "18191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
-    "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f6061626364656667"
-    "68696a6b6c6d6e6f01000000010000001f006c322d696e746572696f722e747275652d7472616365"
-    "2d6f776e65642e76310400667036340a000000000000009a9999999999a93fffffffffffffdf3f0a"
-    "000000000000000a000000000000000a000000000000009a9999999999a93f480f00ba88f2720266"
-    "d70231bb8654d88e509ef55a64a36059cd1bbf1f33b6197de3a4acacc15098bfb3882f02ddf06341"
-    "71bd039abb25ef0c9e9d9c287ca402234a394184a57d430100000004000000000000000400000000"
-    "00000000000000040000000400000000000000010000000000000000200000000000000063b84f61"
-    "7d28be16889d09da2bf88a144d908cdc462a176953c8c67191d68359040000000400000000000000"
-    "0100000000000000002000000000000000b0c0959fdf6d33e5435ebb3bb41ea582d274b360e1597f"
-    "dd886ac1ebeb361f36000000000000f03f00000000000000c00000000000000c4000000000000000"
-    "80000000000000144000000000000019400000000000001ec0000000000000204021007369ba0487"
-    "fcf180ef5aa01463e0de33e7a13bee4e7fcf98266ee35adad8";
+    "44474947522d4844472d4d454d56310001000000dc0400000000000033006578702e6864672e65756c65722e"
+    "636f6e76656e74696f6e616c2e736d6f6f74685f70657273697374656e742e7738612e76312100636f6e7665"
+    "6e74696f6e616c2d736d6f6f74682d70657273697374656e742d763109005738412d534d4f4b453400636865"
+    "636b706f696e742e6864672e65756c65722e736d6f6f74682d706572696f6469632e736d6f6b652e73746570"
+    "2d312e76311700706572696f6469632d63617274657369616e2d717561641f00736f757263652e65756c6572"
+    "2e736d6f6f74682e616e616c797469632e76312900666c75782e6864672e636f6e76656e74696f6e616c2e66"
+    "697865642d7363616c61722d7461752e76310e006261636b776172645f65756c65722f006c322d696e746572"
+    "696f722e747275652d74726163652d6f776e65642e636f6d706f6e656e742d6d616a6f722e76319091929394"
+    "95969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0"
+    "c1c2c3c4c5c6c7c8c9cacbcccdcecf000003000000010000000b000000100000001400000015000000666666"
+    "666666f63f00000000000004409a9999999999a93f0300000000000000333333333333c33f00000000000000"
+    "0001000000000000000300000000000000010000000000000000000100000000000000020000000000000008"
+    "000001000000314b4f4d5341385704006e6f6e65707172737475767778797a7b7c7d7e7f8081828384858687"
+    "88898a8b8c8d8e8f010000000100150065756c65722e636f6d707265737369626c652e326410006864672e63"
+    "6f6e76656e74696f6e616c17006d66656d2e64675f696e746572666163652e747261636509007461752e6669"
+    "7865640e006261636b776172645f65756c65720a006370752e73657269616c04006670363410006439643635"
+    "3236636331373439393830101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30"
+    "3132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c"
+    "5d5e5f606162636465666768696a6b6c6d6e6f01000000010000002f006c322d696e746572696f722e747275"
+    "652d74726163652d6f776e65642e636f6d706f6e656e742d6d616a6f722e7631040066703634010000000000"
+    "00009a9999999999a93f9a9999999999a93f0100000000000000010000000000000001000000000000009a99"
+    "99999999a93f12e4ea20d43b982f66d70231bb8654d88e509ef55a64a36059cd1bbf1f33b6197de3a4acacc1"
+    "5098bfb3882f02ddf0634171bd039abb25ef0c9e9d9c287ca402234a394184a57d4301000000040000000000"
+    "0000040000000000000000000000040000000400000000000000010000000000000000200000000000000063"
+    "b84f617d28be16889d09da2bf88a144d908cdc462a176953c8c67191d6835904000000040000000000000001"
+    "00000000000000002000000000000000b0c0959fdf6d33e5435ebb3bb41ea582d274b360e1597fdd886ac1eb"
+    "eb361f36000000000000f03f00000000000000c00000000000000c4000000000000000800000000000001440"
+    "00000000000019400000000000001ec0000000000000204066f62405b9fe6f9de15874ce90826cabfa8b5d0b"
+    "3d7676b5e434dbcec0cae25c";
 
 bool CheckIndependentOracle()
 {
@@ -653,123 +790,65 @@ bool CheckIndependentOracle()
       "independent_sha256_matches_hard_coded_FIPS_vector");
 }
 
-bool CheckPublicationAuthority()
+bool CheckLiveCaptureAndRepeatableEncode()
 {
   const CoefficientFixture fixture;
-  const auto ranks = fixture.Views();
   const PersistentResourceDescriptor resources = TestResources();
+  const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
   const ApplicationValidation validation = TestValidation();
-  bool passed = Check(validation.accepted(), "publication_config_valid");
+  const ValidatedApplicationConfig* config = validation.config();
+  bool passed = Check(config != nullptr, "checkpoint_static_config_valid");
+  if (config == nullptr) { return false; }
 
   const Slot committed{fixture.interior, fixture.trace};
   Slot candidate{};
   Contract uncommitted(
       committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
-  passed = Check(!CaptureCheckpointContractEvidenceV1(
-                         uncommitted, validation.config()),
-                 "uncommitted_contract_cannot_issue_checkpoint_evidence") &&
+  passed = Check(!CaptureCheckpointV1(uncommitted, *config, runtime),
+                 "uncommitted_contract_cannot_be_captured") &&
+      passed;
+  CheckpointRuntimeIdentityV1 invalid_runtime{};
+  passed = Check(!ValidCheckpointRuntimeIdentityV1(*config, invalid_runtime),
+                 "runtime_identity_requires_ownership_hash") &&
       passed;
 
-  Contract contract(committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
-  passed = Check(AdvanceTenCommits(contract),
-                 "contract_reaches_successful_step10_commit") &&
+  const auto capture = MakeCapture(*config, resources, runtime, fixture);
+  passed = Check(capture.has_value(),
+                 "successful_live_step1_commit_is_captured") &&
       passed;
-  auto evidence =
-      CaptureCheckpointContractEvidenceV1(contract, validation.config());
-  passed = Check(evidence.has_value(),
-                 "successful_live_contract_issues_affine_evidence") &&
-      passed;
-  if (!evidence) { return false; }
-
-  RankTemporaryPublicationFactsV1 temporary{};
-  temporary.participating_ranks = 1;
-  temporary.source_rank = 0;
-  temporary.temporary_file_set_hash = FilledHash(0x70);
-  temporary.previous_manifest_hash = FilledHash(0x90);
-  auto rejected = RecordDurableRankTemporariesV1(
-      std::move(*evidence), temporary, ranks.data(), ranks.size());
-  passed = Check(rejected.status ==
-                         CheckpointCodecStatus::invalid_publication_state &&
-                     !rejected.authority,
-                 "temporary_files_must_be_exclusive_durable_collective") &&
-      passed;
-  temporary.all_rank_temporaries_created_exclusive = true;
-  temporary.all_rank_temporaries_synced = true;
-  temporary.collective_temporary_consensus = true;
-  auto durable = RecordDurableRankTemporariesV1(
-      std::move(*evidence), temporary, ranks.data(), ranks.size());
-  passed = Check(durable.status == CheckpointCodecStatus::ok &&
-                     durable.authority.has_value(),
-                 "durable_rank_temporaries_recorded") &&
-      passed;
-  if (!durable.authority) { return false; }
-
-  CollectiveManifestValidationFactsV1 collective{1, true, true, false};
-  auto invalid_collective = ValidateCollectiveCheckpointManifestV1(
-      std::move(*durable.authority), collective);
-  passed = Check(invalid_collective.status ==
-                         CheckpointCodecStatus::invalid_publication_state &&
-                     !invalid_collective.authority,
-                 "manifest_requires_payload_hash_consensus") &&
-      passed;
-  collective.payload_hash_consensus = true;
-  auto validated = ValidateCollectiveCheckpointManifestV1(
-      std::move(*durable.authority), collective);
-  passed = Check(validated.status == CheckpointCodecStatus::ok &&
-                     validated.authority.has_value(),
-                 "collective_manifest_validation_recorded") &&
-      passed;
-  if (!validated.authority) { return false; }
-
-  AtomicManifestPublicationFactsV1 atomic{0, true, true, false, true, true};
-  auto invalid_publish = PublishCheckpointManifestV1(
-      std::move(*validated.authority), atomic);
-  passed = Check(invalid_publish.status ==
-                         CheckpointCodecStatus::invalid_publication_state &&
-                     !invalid_publish.authority,
-                 "manifest_requires_atomic_rename") &&
-      passed;
-  atomic.atomic_rename_complete = true;
-  auto published = PublishCheckpointManifestV1(
-      std::move(*validated.authority), atomic);
-  passed = Check(published.status == CheckpointCodecStatus::ok &&
-                     published.authority.has_value(),
-                 "source_rank_zero_atomic_publication_recorded") &&
+  if (!capture) { return false; }
+  const CapturedCheckpointV1 copy = *capture;
+  const auto views = fixture.Views();
+  std::vector<std::uint8_t> first;
+  std::vector<std::uint8_t> second;
+  passed = Check(EncodeCheckpointV1(*capture, views.data(), views.size(),
+                                    first) == CheckpointCodecStatus::ok &&
+                     EncodeCheckpointV1(copy, views.data(), views.size(),
+                                        second) == CheckpointCodecStatus::ok &&
+                     first == second,
+                 "committed_capture_can_be_reencoded_without_affine_authority") &&
       passed;
   return passed;
-}
-
-bool EncodeFixture(const CoefficientFixture& fixture,
-                   const ValidatedApplicationConfig& config,
-                   const PersistentResourceDescriptor& resources,
-                   std::vector<std::uint8_t>& encoded)
-{
-  const auto ranks = fixture.Views();
-  auto published = MakePublished(config, ranks, resources);
-  return published &&
-      EncodeCheckpointV1(*published, ranks.data(), ranks.size(), encoded) ==
-      CheckpointCodecStatus::ok;
 }
 
 bool CheckGoldenRoundTrip()
 {
   const CoefficientFixture fixture;
-  const auto ranks = fixture.Views();
   const PersistentResourceDescriptor resources = TestResources();
+  const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
   const ApplicationValidation validation = TestValidation();
+  const ValidatedApplicationConfig* config = validation.config();
+  if (config == nullptr) { return Check(false, "golden_static_config"); }
   std::vector<std::uint8_t> encoded;
-  bool passed = Check(validation.accepted() &&
-                          EncodeFixture(fixture, validation.config(),
-                                        resources, encoded),
+  bool passed = Check(EncodeFixture(fixture, *config, resources, runtime,
+                                    encoded),
                       "golden_fixture_encodes");
   const std::vector<std::uint8_t> golden = HexBytes(golden_artifact_hex);
   passed = Check(!golden.empty() && encoded == golden,
                  "entire_artifact_matches_hard_coded_golden_stream") &&
       passed;
   passed = Check(encoded.size() > 64 && encoded[0] == 'D' &&
-                     encoded[16] == 1 && ReadU64(encoded, 20) == encoded.size() &&
-                     encoded[28] == static_cast<std::uint8_t>(
-                         PublicationPhaseV1::manifest_atomically_published),
+                     encoded[16] == 1 && ReadU64(encoded, 20) == encoded.size(),
                  "independent_header_field_decode") &&
       passed;
 
@@ -792,129 +871,163 @@ bool CheckGoldenRoundTrip()
                  "all_FP64_coefficients_are_hard_coded_little_endian") &&
       passed;
 
-  DecodedCheckpointV1 decoded;
-  passed = Check(DecodeCheckpointV1({encoded.data(), encoded.size()},
-                                    validation.config(), resources,
-                                    decoded) == CheckpointCodecStatus::ok,
-                 "golden_artifact_decodes") &&
+  DecodeSentinel output;
+  auto buffers = output.Buffers();
+  passed = Check(DecodeCheckpointV1(
+                         {encoded.data(), encoded.size()}, *config, resources,
+                         runtime, buffers.data(), buffers.size(),
+                         output.metadata) == CheckpointCodecStatus::ok,
+                 "golden_artifact_decodes_into_preallocated_buffers") &&
       passed;
-  CheckpointDescriptor contract_descriptor{};
+  CheckpointDescriptor expected_descriptor{};
   const Slot committed{fixture.interior, fixture.trace};
   Slot candidate{};
   Contract contract(committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
-  passed = Check(AdvanceTenCommits(contract) &&
-                     contract.TryMakeCheckpoint(contract_descriptor),
+  passed = Check(AdvanceOneCommit(contract) &&
+                     contract.TryMakeCheckpoint(expected_descriptor),
                  "independent_expected_descriptor_available") &&
       passed;
-  contract_descriptor.interior_hash =
+  expected_descriptor.interior_hash =
       OracleManifestHash(1, 32, expected_interior);
-  contract_descriptor.trace_hash = OracleManifestHash(2, 32, expected_trace);
+  expected_descriptor.trace_hash = OracleManifestHash(2, 32, expected_trace);
   passed = Check(
-               SameDescriptorIndependent(decoded.descriptor,
-                                         contract_descriptor) &&
-                   decoded.card_id.view() ==
-                       smooth_periodic_euler_v1_card_id &&
-                   decoded.case_id.view() ==
-                       smooth_periodic_euler_v1_case_id &&
-                   decoded.checkpoint_id.view() ==
-                       smooth_periodic_euler_v1_checkpoint_id &&
-                   decoded.publication.phase ==
-                       PublicationPhaseV1::manifest_atomically_published &&
-                   decoded.publication.source_rank == 0 &&
-                   decoded.publication.participating_ranks == 1 &&
-                   decoded.aggregate_interior_coefficients == 4 &&
-                   decoded.aggregate_true_trace_coefficients == 4 &&
-                   Hex(decoded.artifact_hash) ==
-                       "21007369ba0487fcf180ef5aa01463e0"
-                       "de33e7a13bee4e7fcf98266ee35adad8" &&
-                   decoded.ranks.size() == 1 &&
-                   decoded.ranks[0].interior.component_count == 4 &&
-                   decoded.ranks[0].interior.dofs_per_component == 1 &&
-                   decoded.ranks[0].interior.coefficients ==
-                       std::vector<double>(fixture.interior.begin(),
-                                           fixture.interior.end()) &&
-                   decoded.ranks[0].owned_true_trace.coefficients ==
-                       std::vector<double>(fixture.trace.begin(),
-                                           fixture.trace.end()),
-               "every_descriptor_publication_schema_and_payload_field_decodes") &&
+               output.interior == fixture.interior &&
+                   output.trace == fixture.trace &&
+                   SameDescriptorIndependent(output.metadata.descriptor,
+                                             expected_descriptor) &&
+                   output.metadata.card_id == config->card_id() &&
+                   output.metadata.case_id == config->case_id() &&
+                   output.metadata.scenario_id == config->scenario_id() &&
+                   output.metadata.checkpoint_id == config->checkpoint_id() &&
+                   output.metadata.physical_gpu_uuid ==
+                       runtime.physical_gpu_uuid &&
+                   output.metadata.scientific_config_sha256 ==
+                       config->scientific_config_sha256() &&
+                   output.metadata.run_config_sha256 ==
+                       config->run_config_sha256() &&
+                   output.metadata.ownership_hash == runtime.ownership_hash &&
+                   output.metadata.mesh_n == 3 &&
+                   output.metadata.rank_count == 1 &&
+                   output.metadata.aggregate_interior_coefficients == 4 &&
+                   output.metadata.aggregate_true_trace_coefficients == 4 &&
+                   Hex(output.metadata.artifact_hash) ==
+                       "66f62405b9fe6f9de15874ce90826cab"
+                       "fa8b5d0b3d7676b5e434dbcec0cae25c",
+               "all_identity_descriptor_count_and_buffer_fields_decode") &&
       passed;
   return passed;
 }
 
-bool CheckEncoderMutationControls()
+bool CheckEncoderControls()
 {
   const CoefficientFixture fixture;
-  auto ranks = fixture.Views();
+  auto views = fixture.Views();
   const PersistentResourceDescriptor resources = TestResources();
+  const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
   const ApplicationValidation validation = TestValidation();
-  bool passed = Check(validation.accepted(), "encoder_control_config");
-  auto published = MakePublished(validation.config(), ranks, resources);
-  passed = Check(published.has_value(), "encoder_control_publication") && passed;
-  if (!published) { return false; }
-
+  const ValidatedApplicationConfig* config = validation.config();
+  if (config == nullptr) { return Check(false, "encoder_static_config"); }
+  const auto capture = MakeCapture(*config, resources, runtime, fixture);
+  if (!capture) { return Check(false, "encoder_live_capture"); }
+  bool passed = true;
   const auto expect_failure = [&](const std::array<StagedStateViewV1, 1>& value,
                                   const CheckpointCodecStatus expected,
                                   const char* name) {
     std::vector<std::uint8_t> output{{0xaa, 0xbb}};
     const CheckpointCodecStatus status = EncodeCheckpointV1(
-        *published, value.data(), value.size(), output);
+        *capture, value.data(), value.size(), output);
     passed = Check(status == expected &&
                        output == std::vector<std::uint8_t>({0xaa, 0xbb}),
                    name) &&
         passed;
   };
-  auto invalid = ranks;
+  auto invalid = views;
   invalid[0].interior.component_count = 3;
   expect_failure(invalid, CheckpointCodecStatus::invalid_coefficient_schema,
-                 "component_count_rejected_atomically");
-  invalid = ranks;
+                 "encoder_component_schema_failure_atomic");
+  invalid = views;
   invalid[0].interior.coefficient_count = 5;
   expect_failure(invalid, CheckpointCodecStatus::coefficient_count_mismatch,
-                 "coefficient_count_rejected_atomically");
-  invalid = ranks;
+                 "encoder_exact_count_failure_atomic");
+  invalid = views;
   invalid[0].interior.ordering = static_cast<CoefficientOrderingV1>(255);
   expect_failure(invalid, CheckpointCodecStatus::invalid_coefficient_schema,
-                 "coefficient_order_rejected_atomically");
-  invalid = ranks;
+                 "encoder_order_failure_atomic");
+  invalid = views;
   invalid[0].rank = 1;
   expect_failure(invalid, CheckpointCodecStatus::invalid_rank_manifest,
-                 "rank_order_rejected_atomically");
+                 "encoder_rank_order_failure_atomic");
   State nonfinite = fixture.interior;
   nonfinite[0] = std::numeric_limits<double>::infinity();
-  invalid = ranks;
+  invalid = views;
   invalid[0].interior.data = nonfinite.data();
   expect_failure(invalid, CheckpointCodecStatus::noncanonical_fp64,
-                 "nonfinite_FP64_rejected_atomically");
+                 "encoder_nonfinite_failure_atomic");
   return passed;
 }
 
-bool CheckDecodeFailureAtomicityAndBounds()
+bool CheckDecodeMutationCensusAndAtomicity()
 {
   const CoefficientFixture fixture;
   const PersistentResourceDescriptor resources = TestResources();
+  const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
   const ApplicationValidation validation = TestValidation();
+  const ValidatedApplicationConfig* config = validation.config();
+  if (config == nullptr) { return Check(false, "mutation_static_config"); }
   std::vector<std::uint8_t> encoded;
-  if (!validation.accepted() ||
-      !EncodeFixture(fixture, validation.config(), resources, encoded))
+  if (!EncodeFixture(fixture, *config, resources, runtime, encoded))
   {
-    return Check(false, "decode_control_fixture");
+    return Check(false, "mutation_control_fixture");
   }
   const LayoutOffsets layout = Locate(encoded);
   bool passed = true;
   const auto expect_failure = [&](std::vector<std::uint8_t> bytes,
                                   const CheckpointCodecStatus expected,
                                   const char* name) {
-    DecodedCheckpointV1 output = SentinelOutput();
+    DecodeSentinel output;
+    const DecodeSentinel original = output;
+    auto buffers = output.Buffers();
     const CheckpointCodecStatus status = DecodeCheckpointV1(
-        {bytes.data(), bytes.size()}, validation.config(), resources, output);
-    passed = Check(status == expected && SentinelUnchanged(output), name) &&
+        {bytes.data(), bytes.size()}, *config, resources, runtime,
+        buffers.data(), buffers.size(), output.metadata);
+    passed = Check(status == expected && SentinelUnchanged(output, original),
+                   name) &&
+        passed;
+  };
+  const auto expect_any_failure = [&](std::vector<std::uint8_t> bytes,
+                                      const char* name) {
+    DecodeSentinel output;
+    const DecodeSentinel original = output;
+    auto buffers = output.Buffers();
+    const CheckpointCodecStatus status = DecodeCheckpointV1(
+        {bytes.data(), bytes.size()}, *config, resources, runtime,
+        buffers.data(), buffers.size(), output.metadata);
+    passed = Check(status != CheckpointCodecStatus::ok &&
+                       SentinelUnchanged(output, original),
+                   name) &&
         passed;
   };
 
   std::vector<std::uint8_t> damaged = encoded;
-  damaged[layout.payload] ^= 1U;
+  damaged[0] ^= 1U;
+  expect_failure(damaged, CheckpointCodecStatus::invalid_magic,
+                 "magic_mutation_is_failure_atomic");
+  damaged = encoded;
+  damaged[16] = 2;
+  expect_failure(damaged, CheckpointCodecStatus::unsupported_version,
+                 "version_mutation_is_failure_atomic");
+  damaged = encoded;
+  WriteU64(damaged, 20, encoded.size() + 1);
+  expect_failure(damaged, CheckpointCodecStatus::truncated,
+                 "declared_large_length_is_failure_atomic");
+  damaged = encoded;
+  WriteU64(damaged, 20, encoded.size() - 1);
+  expect_failure(damaged, CheckpointCodecStatus::length_mismatch,
+                 "declared_short_length_is_failure_atomic");
+  damaged = encoded;
+  damaged.back() ^= 1U;
   expect_failure(damaged, CheckpointCodecStatus::checksum_mismatch,
-                 "checksum_corruption_is_failure_atomic");
+                 "checksum_mutation_is_failure_atomic");
   damaged = encoded;
   damaged.pop_back();
   expect_failure(damaged, CheckpointCodecStatus::truncated,
@@ -922,33 +1035,40 @@ bool CheckDecodeFailureAtomicityAndBounds()
   damaged = encoded;
   damaged.push_back(0);
   expect_failure(damaged, CheckpointCodecStatus::length_mismatch,
-                 "trailing_bytes_are_failure_atomic");
+                 "trailing_artifact_byte_is_failure_atomic");
+
+  for (const NamedOffset& field : layout.exact_fields)
+  {
+    damaged = encoded;
+    damaged[field.offset] ^= 1U;
+    static_cast<void>(Seal(damaged));
+    expect_any_failure(damaged, field.name);
+  }
+  passed = Check(layout.exact_fields.size() == 83,
+                 "frozen_exact_field_mutation_census_is_83") &&
+      passed;
+
   damaged = encoded;
   WriteU32(damaged, layout.manifest_rank_count,
            std::numeric_limits<std::uint32_t>::max());
   static_cast<void>(Seal(damaged));
   expect_failure(damaged, CheckpointCodecStatus::rank_tuple_mismatch,
-                 "huge_rank_count_rejected_before_allocation");
+                 "oversized_rank_count_rejected_before_output_write");
   damaged = encoded;
   WriteU64(damaged, layout.interior_coefficient_count,
            std::numeric_limits<std::uint64_t>::max());
   static_cast<void>(Seal(damaged));
   expect_failure(damaged, CheckpointCodecStatus::coefficient_count_mismatch,
-                 "huge_coefficient_count_rejected_before_allocation");
+                 "oversized_block_count_rejected_before_output_write");
   damaged = encoded;
-  WriteU64(damaged, layout.manifest_rank_count + 4,
+  WriteU64(damaged, layout.aggregate_interior_count,
            std::numeric_limits<std::uint64_t>::max());
   static_cast<void>(Seal(damaged));
   expect_failure(damaged, CheckpointCodecStatus::coefficient_count_mismatch,
-                 "huge_aggregate_count_rejected_before_allocation");
-  damaged = encoded;
-  damaged[layout.payload] ^= 1U;
-  static_cast<void>(Seal(damaged));
-  expect_failure(damaged, CheckpointCodecStatus::local_payload_hash_mismatch,
-                 "payload_hash_mismatch_is_failure_atomic");
+                 "oversized_aggregate_count_rejected_before_output_write");
 
   damaged = encoded;
-  WriteU64(damaged, layout.payload, 0x7ff8000000000000ULL);
+  WriteU64(damaged, layout.payload, UINT64_C(0x7ff8000000000000));
   const StateHash nan_local =
       OracleHash(damaged.data() + layout.payload, 32);
   std::copy(nan_local.bytes.begin(), nan_local.bytes.end(),
@@ -958,67 +1078,33 @@ bool CheckDecodeFailureAtomicityAndBounds()
             damaged.begin() + layout.descriptor_interior_hash);
   static_cast<void>(Seal(damaged));
   expect_failure(damaged, CheckpointCodecStatus::noncanonical_fp64,
-                 "noncanonical_FP64_decode_is_failure_atomic");
+                 "nonfinite_FP64_rejected_in_first_pass");
 
-  for (std::size_t flag = 0; flag < 11; ++flag)
-  {
-    damaged = encoded;
-    damaged[109 + flag] = 0;
-    static_cast<void>(Seal(damaged));
-    expect_failure(damaged, CheckpointCodecStatus::unpublished_artifact,
-                   "every_publication_protocol_flag_is_required");
-  }
-  damaged = encoded;
-  damaged[28] = 0;
-  static_cast<void>(Seal(damaged));
-  expect_failure(damaged, CheckpointCodecStatus::unpublished_artifact,
-                 "published_phase_is_required");
-  damaged = encoded;
-  WriteU64(damaged, 29, 0);
-  static_cast<void>(Seal(damaged));
-  expect_failure(damaged, CheckpointCodecStatus::unpublished_artifact,
-                 "transaction_identity_is_required");
-  damaged = encoded;
-  std::fill_n(damaged.begin() + 37, 32, 0);
-  static_cast<void>(Seal(damaged));
-  expect_failure(damaged, CheckpointCodecStatus::unpublished_artifact,
-                 "temporary_file_set_identity_is_required");
-  damaged = encoded;
-  WriteU32(damaged, 101, 2);
-  static_cast<void>(Seal(damaged));
-  expect_failure(damaged, CheckpointCodecStatus::rank_tuple_mismatch,
-                 "publication_rank_count_must_match_descriptor");
-  damaged = encoded;
-  WriteU32(damaged, 105, 1);
-  static_cast<void>(Seal(damaged));
-  expect_failure(damaged, CheckpointCodecStatus::unpublished_artifact,
-                 "source_rank_zero_is_required");
+  DecodeSentinel capacity_output;
+  const DecodeSentinel original = capacity_output;
+  auto short_buffers = capacity_output.Buffers();
+  short_buffers[0].interior.capacity = 3;
+  passed = Check(DecodeCheckpointV1(
+                         {encoded.data(), encoded.size()}, *config, resources,
+                         runtime, short_buffers.data(), short_buffers.size(),
+                         capacity_output.metadata) ==
+                         CheckpointCodecStatus::output_buffer_mismatch &&
+                     SentinelUnchanged(capacity_output, original),
+                 "preallocated_capacity_checked_before_any_output_write") &&
+      passed;
 
-  damaged = encoded;
-  damaged[122] ^= 1U;
-  static_cast<void>(Seal(damaged));
-  expect_failure(damaged, CheckpointCodecStatus::invalid_checkpoint_identity,
-                 "card_identity_corruption_is_failure_atomic");
-  damaged = encoded;
-  WriteU32(damaged, layout.descriptor_start, 2);
-  static_cast<void>(Seal(damaged));
-  expect_failure(damaged, CheckpointCodecStatus::invalid_descriptor,
-                 "descriptor_schema_corruption_is_failure_atomic");
-  damaged = encoded;
-  damaged[layout.descriptor_interior_hash - 1] ^= 1U;
-  static_cast<void>(Seal(damaged));
-  expect_failure(damaged, CheckpointCodecStatus::invalid_descriptor,
-                 "coordinate_fingerprint_corruption_is_failure_atomic");
-
-  PersistentResourceDescriptor wrong_resources = resources;
-  wrong_resources.partition_hash.bytes[0] ^= 1U;
-  DecodedCheckpointV1 output = SentinelOutput();
-  passed = Check(DecodeCheckpointV1({encoded.data(), encoded.size()},
-                                    validation.config(), wrong_resources,
-                                    output) ==
-                         CheckpointCodecStatus::resource_mismatch &&
-                     SentinelUnchanged(output),
-                 "same_tuple_resource_mismatch_precedes_allocation") &&
+  CheckpointRuntimeIdentityV1 wrong_runtime = runtime;
+  wrong_runtime.ownership_hash.bytes[0] ^= 1U;
+  DecodeSentinel runtime_output;
+  const DecodeSentinel runtime_original = runtime_output;
+  auto runtime_buffers = runtime_output.Buffers();
+  passed = Check(DecodeCheckpointV1(
+                         {encoded.data(), encoded.size()}, *config, resources,
+                         wrong_runtime, runtime_buffers.data(),
+                         runtime_buffers.size(), runtime_output.metadata) ==
+                         CheckpointCodecStatus::invalid_runtime_identity &&
+                     SentinelUnchanged(runtime_output, runtime_original),
+                 "ownership_identity_checked_before_any_output_write") &&
       passed;
   return passed;
 }
@@ -1029,13 +1115,13 @@ int main()
 {
   bool passed = true;
   passed = CheckIndependentOracle() && passed;
-  passed = CheckPublicationAuthority() && passed;
+  passed = CheckLiveCaptureAndRepeatableEncode() && passed;
   passed = CheckGoldenRoundTrip() && passed;
-  passed = CheckEncoderMutationControls() && passed;
-  passed = CheckDecodeFailureAtomicityAndBounds() && passed;
+  passed = CheckEncoderControls() && passed;
+  passed = CheckDecodeMutationCensusAndAtomicity() && passed;
   if (passed)
   {
-    std::cout << "HDG W8A checkpoint codec checks passed\n";
+    std::cout << "HDG W8A in-memory checkpoint codec checks passed\n";
     return 0;
   }
   return 1;
