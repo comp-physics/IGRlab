@@ -770,14 +770,6 @@ bool ExactPolicyLedgers() noexcept
                  UmpireDeviceAllocatorPolicy::Ledger());
 }
 
-template <typename T>
-bool BitwiseUnchanged(const T& before, const T& after) noexcept
-{
-  static_assert(std::is_trivially_copyable<T>::value,
-                "ledger snapshots must be byte-comparable");
-  return std::memcmp(&before, &after, sizeof(T)) == 0;
-}
-
 bool HypreHostColumnMapCopyFixtures() noexcept
 {
   const CudaAllocationLedgerV1 audited_allocation_before =
@@ -822,18 +814,14 @@ bool HypreHostColumnMapCopyFixtures() noexcept
   const auto production_transfer_after =
       std::make_unique<CudaTransferLedgerV1>(CudaTransportPolicy::Ledger());
   return cases_exact &&
-      BitwiseUnchanged(audited_allocation_before,
-                       audited_allocation_after) &&
-      BitwiseUnchanged(production_allocation_before,
-                       production_allocation_after) &&
-      BitwiseUnchanged(*audited_transfer_before,
-                       *audited_transfer_after) &&
-      BitwiseUnchanged(*production_transfer_before,
-                       *production_transfer_after) &&
-      BitwiseUnchanged(audited_totals_before,
-                       AuditedTransport::Accounting()) &&
-      BitwiseUnchanged(production_totals_before,
-                       CudaTransportPolicy::Accounting());
+      SameLedger(audited_allocation_before, audited_allocation_after) &&
+      SameLedger(production_allocation_before,
+                 production_allocation_after) &&
+      SameLedger(*audited_transfer_before, *audited_transfer_after) &&
+      SameLedger(*production_transfer_before, *production_transfer_after) &&
+      SameTotals(audited_totals_before, AuditedTransport::Accounting()) &&
+      SameTotals(production_totals_before,
+                 CudaTransportPolicy::Accounting());
 }
 
 bool SameCoordinates(const StateCoordinates& left,
@@ -2001,20 +1989,23 @@ bool RunConfigConsensusNegative(const int ranks, const int rank) noexcept
       ? CudaTokenFault::omit_solution : CudaTokenFault::stale_attempt;
   const std::uint64_t owned_before =
       AuditedAllocator::W8OwnedAllocationCalls();
-  const std::uint64_t observed_before =
-      AuditedAllocator::AllocationEvents();
+  const std::uint64_t deallocations_before =
+      AuditedAllocator::DeallocationEvents();
   const CudaAllocationLedgerV1 allocation_before =
       AuditedAllocator::Ledger();
   const CudaTransferLedgerV1 transfer_before = AuditedTransport::Ledger();
+  const CudaTransferTotals transfer_totals_before =
+      AuditedTransport::Accounting();
   auto engine = std::make_unique<TestEngine<Backend>>(config);
   CudaRunEvidence evidence{};
   const bool initialized = engine->Initialize(evidence);
   return !initialized && evidence.status == CudaRunStatus::setup_failure &&
       evidence.setup_origin == FailureReason::collective_protocol &&
       AuditedAllocator::W8OwnedAllocationCalls() == owned_before &&
-      AuditedAllocator::AllocationEvents() == observed_before &&
-      SameLedger(AuditedAllocator::Ledger(), allocation_before) &&
-      SameLedger(AuditedTransport::Ledger(), transfer_before);
+      AuditedAllocator::DeallocationEvents() == deallocations_before &&
+      SameLedger(allocation_before, AuditedAllocator::Ledger()) &&
+      SameLedger(transfer_before, AuditedTransport::Ledger()) &&
+      SameTotals(transfer_totals_before, AuditedTransport::Accounting());
 }
 
 using AffineContract = typename TestEngine<TestRankOneBackendTag>::contract_type;
@@ -2912,44 +2903,32 @@ bool Global(const bool local) noexcept
                        MPI_COMM_WORLD) == MPI_SUCCESS && all == 1;
 }
 
-constexpr bool ExpectedNegativeHypreStateAuthorized(
-    const int hypre_error, const cudaError_t cuda_error) noexcept
-{
-  return hypre_error == HYPRE_ERROR_GENERIC && cuda_error == cudaSuccess;
-}
-
 constexpr bool CleanHypreCudaStateAuthorized(
     const int hypre_error, const cudaError_t cuda_error) noexcept
 {
   return hypre_error == 0 && cuda_error == cudaSuccess;
 }
 
-bool ExpectedNegativeHypreAuthorizationFixtures() noexcept
+bool CleanHypreCudaAuthorizationFixtures() noexcept
 {
-  return ExpectedNegativeHypreStateAuthorized(
-             HYPRE_ERROR_GENERIC, cudaSuccess) &&
-      !ExpectedNegativeHypreStateAuthorized(0, cudaSuccess) &&
-      !ExpectedNegativeHypreStateAuthorized(
-          HYPRE_ERROR_MEMORY, cudaSuccess) &&
-      !ExpectedNegativeHypreStateAuthorized(HYPRE_ERROR_ARG, cudaSuccess) &&
-      !ExpectedNegativeHypreStateAuthorized(
-          HYPRE_ERROR_CONV, cudaSuccess) &&
-      !ExpectedNegativeHypreStateAuthorized(
+  return CleanHypreCudaStateAuthorized(0, cudaSuccess) &&
+      !CleanHypreCudaStateAuthorized(HYPRE_ERROR_GENERIC, cudaSuccess) &&
+      !CleanHypreCudaStateAuthorized(HYPRE_ERROR_MEMORY, cudaSuccess) &&
+      !CleanHypreCudaStateAuthorized(HYPRE_ERROR_ARG, cudaSuccess) &&
+      !CleanHypreCudaStateAuthorized(HYPRE_ERROR_CONV, cudaSuccess) &&
+      !CleanHypreCudaStateAuthorized(
           HYPRE_ERROR_GENERIC | HYPRE_ERROR_MEMORY, cudaSuccess) &&
-      !ExpectedNegativeHypreStateAuthorized(
-          HYPRE_ERROR_GENERIC, cudaErrorInvalidValue) &&
-      !ExpectedNegativeHypreStateAuthorized(
-          HYPRE_ERROR_GENERIC, cudaErrorMemoryAllocation) &&
-      !ExpectedNegativeHypreStateAuthorized(
-          HYPRE_ERROR_GENERIC, cudaErrorUnknown);
+      !CleanHypreCudaStateAuthorized(0, cudaErrorInvalidValue) &&
+      !CleanHypreCudaStateAuthorized(0, cudaErrorMemoryAllocation) &&
+      !CleanHypreCudaStateAuthorized(0, cudaErrorUnknown);
 }
 
 template <typename Backend>
 bool RunRankTwoConfigConsensusBoundary(const int ranks,
                                        const int rank) noexcept
 {
-  // Three collective gates keep every rank on one path: clean admission,
-  // exact expected-negative authorization, then exact post-clear admission.
+  // Both collective gates require an exactly clean process-global backend.
+  // A stateful negative terminates this process lane before positive cases.
   if (ranks != 2) { return false; }
   const int incoming_hypre = HYPRE_GetError();
   const cudaError_t incoming_cuda = cudaPeekAtLastError();
@@ -2959,18 +2938,10 @@ bool RunRankTwoConfigConsensusBoundary(const int ranks,
 
   const bool intended_negative =
       RunConfigConsensusNegative<Backend>(ranks, rank);
-  const int negative_hypre = HYPRE_GetError();
-  const cudaError_t negative_cuda = cudaPeekAtLastError();
-  const bool negative_authorized = Global(
-      intended_negative && ExpectedNegativeHypreStateAuthorized(
-          negative_hypre, negative_cuda));
-  if (!negative_authorized) { return false; }
-
-  const HYPRE_Int clear_return = HYPRE_ClearError(HYPRE_ERROR_GENERIC);
-  const int cleared_hypre = HYPRE_GetError();
-  const cudaError_t cleared_cuda = cudaPeekAtLastError();
-  return Global(clear_return == 0 && CleanHypreCudaStateAuthorized(
-      cleared_hypre, cleared_cuda));
+  const int outgoing_hypre = HYPRE_GetError();
+  const cudaError_t outgoing_cuda = cudaPeekAtLastError();
+  return Global(intended_negative && CleanHypreCudaStateAuthorized(
+      outgoing_hypre, outgoing_cuda));
 }
 
 bool CollectiveCaseBoundaryRegression(const int rank, const int ranks) noexcept
@@ -3084,8 +3055,8 @@ int main(int argc, char** argv)
              CollectiveCaseBoundaryRegression(rank, ranks));
     run_case("rank1.common.host-offd-map-copy",
              HypreHostColumnMapCopyFixtures());
-    run_case("rank1.common.hypre-negative-authorization",
-             ExpectedNegativeHypreAuthorizationFixtures());
+    run_case("rank1.common.hypre-clean-authorization",
+             CleanHypreCudaAuthorizationFixtures());
     run_case("rank1.config.consensus-negative",
              RunConfigConsensusNegative<TestRankOneBackendTag>(1, rank));
     if (token_mode)
@@ -3150,8 +3121,8 @@ int main(int argc, char** argv)
              CollectiveCaseBoundaryRegression(rank, ranks));
     run_case("rank2.common.host-offd-map-copy",
              HypreHostColumnMapCopyFixtures());
-    run_case("rank2.common.hypre-negative-authorization",
-             ExpectedNegativeHypreAuthorizationFixtures());
+    run_case("rank2.common.hypre-clean-authorization",
+             CleanHypreCudaAuthorizationFixtures());
     const bool config_boundary_clean =
         run_case("rank2.config.consensus-negative",
                  RunRankTwoConfigConsensusBoundary<TestRankTwoBackendTag>(
@@ -3221,8 +3192,8 @@ int main(int argc, char** argv)
              CollectiveCaseBoundaryRegression(rank, ranks));
     run_case("unsupported.common.host-offd-map-copy",
              HypreHostColumnMapCopyFixtures());
-    run_case("unsupported.common.hypre-negative-authorization",
-             ExpectedNegativeHypreAuthorizationFixtures());
+    run_case("unsupported.common.hypre-clean-authorization",
+             CleanHypreCudaAuthorizationFixtures());
     run_case("unsupported.diagnostic.checkpoint-v1-exact",
              CheckpointDiagnosticExactFixtures());
     run_case("unsupported.diagnostic.prestage-mask-exact",
