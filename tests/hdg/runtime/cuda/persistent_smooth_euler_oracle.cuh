@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <vector>
 #include <mpi.h>
 
 namespace cuda_w8a_test_oracle
@@ -37,10 +38,25 @@ inline bool AllRanks(const bool local)
 
 inline bool ValidShape(const CudaOraclePod& p)
 {
+  const bool smoke_shape = p.scalar_interior_dofs == 4 &&
+      p.scalar_face_dofs == 2 && p.interior_dofs == 16 &&
+      p.trace_dofs == 32;
+  const bool functional_shape = p.scalar_interior_dofs == 9 &&
+      p.scalar_face_dofs == 3 && p.interior_dofs == 36 &&
+      p.trace_dofs == 48;
   if (p.schema != 1 || (p.ranks != 1 && p.ranks != 2) || p.rank < 0 ||
       p.rank >= p.ranks || p.elements <= 0 ||
-      p.elements > maximum_rank_elements ||
-      p.interior_count != p.elements * interior_dofs_per_element ||
+      p.elements > maximum_rank_elements || p.scalar_interior_dofs <= 0 ||
+      p.scalar_interior_dofs > maximum_scalar_dofs_per_element ||
+      p.scalar_face_dofs <= 0 ||
+      p.scalar_face_dofs > maximum_scalar_dofs_per_face ||
+      p.interior_dofs != conserved_components * p.scalar_interior_dofs ||
+      p.trace_dofs != faces_per_element * conserved_components *
+          p.scalar_face_dofs ||
+      (!smoke_shape && !functional_shape) ||
+      p.interior_dofs > maximum_interior_dofs_per_element ||
+      p.trace_dofs > maximum_trace_dofs_per_element ||
+      p.interior_count != p.elements * p.interior_dofs ||
       p.local_trace_count <= 0 ||
       p.local_trace_count > maximum_local_trace_dofs ||
       p.true_trace_count <= 0 ||
@@ -105,37 +121,48 @@ inline bool VerifyPhysics(const CudaOraclePod& p)
 {
   for(int e=0;e<p.elements;++e)
   {
-    std::array<double,interior_dofs_per_element> r{};
-    std::array<double,trace_dofs_per_element> g{};
-    std::array<double,interior_dofs_per_element*interior_dofs_per_element> a{};
-    std::array<double,interior_dofs_per_element*trace_dofs_per_element> b{};
-    std::array<double,trace_dofs_per_element*interior_dofs_per_element> c{};
-    std::array<double,trace_dofs_per_element*trace_dofs_per_element> d{};
-    const int ei=e*16,et=e*32;
+    std::array<double,maximum_interior_dofs_per_element> r{};
+    std::array<double,maximum_trace_dofs_per_element> g{};
+    std::array<double,maximum_interior_dofs_per_element*
+                          maximum_interior_dofs_per_element> a{};
+    std::array<double,maximum_interior_dofs_per_element*
+                          maximum_trace_dofs_per_element> b{};
+    std::array<double,maximum_trace_dofs_per_element*
+                          maximum_interior_dofs_per_element> c{};
+    std::array<double,maximum_trace_dofs_per_element*
+                          maximum_trace_dofs_per_element> d{};
+    const int si=p.scalar_interior_dofs,sf=p.scalar_face_dofs;
+    const int ni=p.interior_dofs,nt=p.trace_dofs;
+    const int ei=e*ni,et=e*nt;
     for(int q=0;q<p.volume_points;++q)
-    {const int qp=e*p.volume_points+q;double u[4]={},old[4]={};for(int n=0;n<4;++n)for(int k=0;k<4;++k){const double phi=p.volume_shape[qp*4+n];u[k]+=phi*p.current_interior[ei+Nodal(n,4,k)];old[k]+=phi*p.old_interior[ei+Nodal(n,4,k)];}double src[4],fx[4],fy[4],jx[16],jy[16];if(!Source(p.volume_position[qp*2],p.volume_position[qp*2+1],src)||!Flux(u,1,0,fx,jx)||!Flux(u,0,1,fy,jy))return false;const double w=p.volume_weight[qp];for(int rn=0;rn<4;++rn){const double phi=p.volume_shape[qp*4+rn],dx=p.volume_derivative[(qp*4+rn)*2],dy=p.volume_derivative[(qp*4+rn)*2+1];for(int rc=0;rc<4;++rc){const int lr=Nodal(rn,4,rc);r[lr]+=w*(phi*(u[rc]-old[rc])/p.dt-dx*fx[rc]-dy*fy[rc]-phi*src[rc]);for(int cn=0;cn<4;++cn)for(int cc=0;cc<4;++cc){const int lc=Nodal(cn,4,cc);a[lr*16+lc]+=w*((rc==cc?phi*p.volume_shape[qp*4+cn]/p.dt:0)-(dx*jx[rc*4+cc]+dy*jy[rc*4+cc])*p.volume_shape[qp*4+cn]);}}}}
+    {const int qp=e*p.volume_points+q;double u[4]={},old[4]={};for(int n=0;n<si;++n)for(int k=0;k<4;++k){const double phi=p.volume_shape[qp*si+n];u[k]+=phi*p.current_interior[ei+Nodal(n,si,k)];old[k]+=phi*p.old_interior[ei+Nodal(n,si,k)];}double src[4],fx[4],fy[4],jx[16],jy[16];if(!Source(p.volume_position[qp*2],p.volume_position[qp*2+1],src)||!Flux(u,1,0,fx,jx)||!Flux(u,0,1,fy,jy))return false;const double w=p.volume_weight[qp];for(int rn=0;rn<si;++rn){const double phi=p.volume_shape[qp*si+rn],dx=p.volume_derivative[(qp*si+rn)*2],dy=p.volume_derivative[(qp*si+rn)*2+1];for(int rc=0;rc<4;++rc){const int lr=Nodal(rn,si,rc);r[lr]+=w*(phi*(u[rc]-old[rc])/p.dt-dx*fx[rc]-dy*fy[rc]-phi*src[rc]);for(int cn=0;cn<si;++cn)for(int cc=0;cc<4;++cc){const int lc=Nodal(cn,si,cc);a[lr*ni+lc]+=w*((rc==cc?phi*p.volume_shape[qp*si+cn]/p.dt:0)-(dx*jx[rc*4+cc]+dy*jy[rc*4+cc])*p.volume_shape[qp*si+cn]);}}}}
     for(int face=0;face<4;++face)for(int q=0;q<p.face_points;++q)
-    {const int qp=(e*4+face)*p.face_points+q,to=face*8;double u[4]={},l[4]={};for(int n=0;n<4;++n)for(int k=0;k<4;++k)u[k]+=p.face_interior_shape[qp*4+n]*p.current_interior[ei+Nodal(n,4,k)];for(int n=0;n<2;++n)for(int k=0;k<4;++k)l[k]+=p.face_trace_shape[qp*2+n]*p.current_local_trace[et+to+Nodal(n,2,k)];double flux[4],jac[16];if(!Flux(l,p.face_normal[qp*2],p.face_normal[qp*2+1],flux,jac))return false;const double w=p.face_weight[qp];for(int rn=0;rn<4;++rn){const double rp=p.face_interior_shape[qp*4+rn];for(int rc=0;rc<4;++rc){const int lr=Nodal(rn,4,rc);r[lr]+=w*rp*(flux[rc]+tau*(u[rc]-l[rc]));for(int cn=0;cn<4;++cn)a[lr*16+Nodal(cn,4,rc)]+=w*rp*tau*p.face_interior_shape[qp*4+cn];for(int cn=0;cn<2;++cn)for(int cc=0;cc<4;++cc)b[lr*32+to+Nodal(cn,2,cc)]+=w*rp*p.face_trace_shape[qp*2+cn]*(jac[rc*4+cc]-(rc==cc?tau:0));}}for(int rn=0;rn<2;++rn){const double rp=p.face_trace_shape[qp*2+rn];for(int rc=0;rc<4;++rc){const int lr=to+Nodal(rn,2,rc);g[lr]+=w*rp*(flux[rc]+tau*(u[rc]-l[rc]));for(int cn=0;cn<4;++cn)c[lr*16+Nodal(cn,4,rc)]+=w*rp*tau*p.face_interior_shape[qp*4+cn];for(int cn=0;cn<2;++cn)for(int cc=0;cc<4;++cc)d[lr*32+to+Nodal(cn,2,cc)]+=w*rp*p.face_trace_shape[qp*2+cn]*(jac[rc*4+cc]-(rc==cc?tau:0));}}}
-    for(int i=0;i<16;++i)if(!Close(r[i],p.residual_r[ei+i])||!Close(-r[i],p.f[ei+i]))return false;
-    for(int i=0;i<32;++i)if(!Close(g[i],p.residual_g[et+i])||!Close(-g[i],p.g[et+i]))return false;
-    const std::size_t ao=static_cast<std::size_t>(e)*256,bo=static_cast<std::size_t>(e)*512,co=static_cast<std::size_t>(e)*512,doff=static_cast<std::size_t>(e)*1024;
-    for(int i=0;i<256;++i)if(!Close(a[i],p.a[ao+i]))return false;
-    for(int i=0;i<512;++i)if(!Close(b[i],p.b[bo+i])||!Close(c[i],p.c[co+i]))return false;
-    for(int i=0;i<1024;++i)if(!Close(d[i],p.d[doff+i]))return false;
+    {const int qp=(e*4+face)*p.face_points+q,to=face*4*sf;double u[4]={},l[4]={};for(int n=0;n<si;++n)for(int k=0;k<4;++k)u[k]+=p.face_interior_shape[qp*si+n]*p.current_interior[ei+Nodal(n,si,k)];for(int n=0;n<sf;++n)for(int k=0;k<4;++k)l[k]+=p.face_trace_shape[qp*sf+n]*p.current_local_trace[et+to+Nodal(n,sf,k)];double flux[4],jac[16];if(!Flux(l,p.face_normal[qp*2],p.face_normal[qp*2+1],flux,jac))return false;const double w=p.face_weight[qp];for(int rn=0;rn<si;++rn){const double rp=p.face_interior_shape[qp*si+rn];for(int rc=0;rc<4;++rc){const int lr=Nodal(rn,si,rc);r[lr]+=w*rp*(flux[rc]+tau*(u[rc]-l[rc]));for(int cn=0;cn<si;++cn)a[lr*ni+Nodal(cn,si,rc)]+=w*rp*tau*p.face_interior_shape[qp*si+cn];for(int cn=0;cn<sf;++cn)for(int cc=0;cc<4;++cc)b[lr*nt+to+Nodal(cn,sf,cc)]+=w*rp*p.face_trace_shape[qp*sf+cn]*(jac[rc*4+cc]-(rc==cc?tau:0));}}for(int rn=0;rn<sf;++rn){const double rp=p.face_trace_shape[qp*sf+rn];for(int rc=0;rc<4;++rc){const int lr=to+Nodal(rn,sf,rc);g[lr]+=w*rp*(flux[rc]+tau*(u[rc]-l[rc]));for(int cn=0;cn<si;++cn)c[lr*ni+Nodal(cn,si,rc)]+=w*rp*tau*p.face_interior_shape[qp*si+cn];for(int cn=0;cn<sf;++cn)for(int cc=0;cc<4;++cc)d[lr*nt+to+Nodal(cn,sf,cc)]+=w*rp*p.face_trace_shape[qp*sf+cn]*(jac[rc*4+cc]-(rc==cc?tau:0));}}}
+    for(int i=0;i<ni;++i)if(!Close(r[i],p.residual_r[ei+i])||!Close(-r[i],p.f[ei+i]))return false;
+    for(int i=0;i<nt;++i)if(!Close(g[i],p.residual_g[et+i])||!Close(-g[i],p.g[et+i]))return false;
+    const std::size_t ao=static_cast<std::size_t>(e)*ni*ni,bo=static_cast<std::size_t>(e)*ni*nt,co=static_cast<std::size_t>(e)*nt*ni,doff=static_cast<std::size_t>(e)*nt*nt;
+    for(int i=0;i<ni*ni;++i)if(!Close(a[i],p.a[ao+i]))return false;
+    for(int i=0;i<ni*nt;++i)if(!Close(b[i],p.b[bo+i]))return false;
+    for(int i=0;i<nt*ni;++i)if(!Close(c[i],p.c[co+i]))return false;
+    for(int i=0;i<nt*nt;++i)if(!Close(d[i],p.d[doff+i]))return false;
   }
   return true;
 }
 
-inline bool Solve(std::array<double,16*33>& rhs,std::array<double,256> a)
-{for(int k=0;k<16;++k){int pivot=k;for(int r=k+1;r<16;++r)if(std::abs(a[r*16+k])>std::abs(a[pivot*16+k]))pivot=r;if(!(std::abs(a[pivot*16+k])>1e-14))return false;if(pivot!=k){for(int c=0;c<16;++c)std::swap(a[k*16+c],a[pivot*16+c]);for(int c=0;c<33;++c)std::swap(rhs[k*33+c],rhs[pivot*33+c]);}for(int r=k+1;r<16;++r){const double m=a[r*16+k]/a[k*16+k];for(int c=k;c<16;++c)a[r*16+c]-=m*a[k*16+c];for(int c=0;c<33;++c)rhs[r*33+c]-=m*rhs[k*33+c];}}for(int k=15;k>=0;--k)for(int c=0;c<33;++c){for(int j=k+1;j<16;++j)rhs[k*33+c]-=a[k*16+j]*rhs[j*33+c];rhs[k*33+c]/=a[k*16+k];}return true;}
+inline bool Solve(std::array<double,maximum_interior_dofs_per_element*
+                                      (maximum_trace_dofs_per_element+1)>& rhs,
+                  std::array<double,maximum_interior_dofs_per_element*
+                                      maximum_interior_dofs_per_element> a,
+                  const int n,const int columns)
+{for(int k=0;k<n;++k){int pivot=k;for(int r=k+1;r<n;++r)if(std::abs(a[r*n+k])>std::abs(a[pivot*n+k]))pivot=r;if(!(std::abs(a[pivot*n+k])>1e-14))return false;if(pivot!=k){for(int c=0;c<n;++c)std::swap(a[k*n+c],a[pivot*n+c]);for(int c=0;c<columns;++c)std::swap(rhs[k*columns+c],rhs[pivot*columns+c]);}for(int r=k+1;r<n;++r){const double m=a[r*n+k]/a[k*n+k];for(int c=k;c<n;++c)a[r*n+c]-=m*a[k*n+c];for(int c=0;c<columns;++c)rhs[r*columns+c]-=m*rhs[k*columns+c];}}for(int k=n-1;k>=0;--k)for(int c=0;c<columns;++c){for(int j=k+1;j<n;++j)rhs[k*columns+c]-=a[k*n+j]*rhs[j*columns+c];rhs[k*columns+c]/=a[k*n+k];}return true;}
 
 inline bool VerifyCondensationRecovery(const CudaOraclePod& p)
-{for(int e=0;e<p.elements;++e){std::array<double,256>a{};std::array<double,16*33>w{};for(int i=0;i<256;++i)a[i]=p.a[e*256+i];for(int r=0;r<16;++r){for(int c=0;c<32;++c)w[r*33+c]=p.b[(e*16+r)*32+c];w[r*33+32]=p.f[e*16+r];}if(!Solve(w,a))return false;for(int r=0;r<32;++r){double rhs=p.g[e*32+r];for(int k=0;k<16;++k)rhs-=p.c[(e*32+r)*16+k]*w[k*33+32];if(!Close(rhs,p.condensed_rhs[e*32+r]))return false;for(int col=0;col<32;++col){double x=p.d[(e*32+r)*32+col];for(int k=0;k<16;++k)x-=p.c[(e*32+r)*16+k]*w[k*33+col];if(!Close(x,p.schur[(e*32+r)*32+col]))return false;}}std::array<double,16*33> recovery_rhs{};for(int r=0;r<16;++r){double x=p.f[e*16+r];for(int c=0;c<32;++c)x-=p.b[(e*16+r)*32+c]*p.local_trace_increment[e*32+c];recovery_rhs[r*33]=x;}if(!Solve(recovery_rhs,a))return false;for(int r=0;r<16;++r)if(!Close(recovery_rhs[r*33],p.recovered_increment[e*16+r]))return false;}return true;}
+{const int ni=p.interior_dofs,nt=p.trace_dofs,columns=nt+1;for(int e=0;e<p.elements;++e){std::array<double,maximum_interior_dofs_per_element*maximum_interior_dofs_per_element>a{};std::array<double,maximum_interior_dofs_per_element*(maximum_trace_dofs_per_element+1)>w{};for(int i=0;i<ni*ni;++i)a[i]=p.a[e*ni*ni+i];for(int r=0;r<ni;++r){for(int c=0;c<nt;++c)w[r*columns+c]=p.b[(e*ni+r)*nt+c];w[r*columns+nt]=p.f[e*ni+r];}if(!Solve(w,a,ni,columns))return false;for(int r=0;r<nt;++r){double rhs=p.g[e*nt+r];for(int k=0;k<ni;++k)rhs-=p.c[(e*nt+r)*ni+k]*w[k*columns+nt];if(!Close(rhs,p.condensed_rhs[e*nt+r]))return false;for(int col=0;col<nt;++col){double x=p.d[(e*nt+r)*nt+col];for(int k=0;k<ni;++k)x-=p.c[(e*nt+r)*ni+k]*w[k*columns+col];if(!Close(x,p.schur[(e*nt+r)*nt+col]))return false;}}std::array<double,maximum_interior_dofs_per_element*(maximum_trace_dofs_per_element+1)>recovery_rhs{};for(int r=0;r<ni;++r){double x=p.f[e*ni+r];for(int c=0;c<nt;++c)x-=p.b[(e*ni+r)*nt+c]*p.local_trace_increment[e*nt+c];recovery_rhs[r]=x;}if(!Solve(recovery_rhs,a,ni,1))return false;for(int r=0;r<ni;++r)if(!Close(recovery_rhs[r],p.recovered_increment[e*ni+r]))return false;}return true;}
 
 inline bool SolveTrueDofs(
     const int count,
-    std::array<double, maximum_true_matrix_entries>& matrix,
-    std::array<double, maximum_true_trace_dofs>& rhs)
+    std::vector<double>& matrix,
+    std::vector<double>& rhs)
 {
   for (int column = 0; column < count; ++column)
   {
@@ -175,25 +202,25 @@ inline bool SolveTrueDofs(
 inline bool VerifySignsAndTrueResidual(const CudaOraclePod& p)
 {
   const int count = p.global_true_trace_count;
-  std::array<double, maximum_true_matrix_entries> local_matrix{};
-  std::array<double, maximum_true_matrix_entries> global_matrix{};
-  std::array<double, maximum_true_trace_dofs> local_rhs{};
-  std::array<double, maximum_true_trace_dofs> global_rhs{};
-  std::array<double, maximum_true_trace_dofs> local_solution{};
-  std::array<double, maximum_true_trace_dofs> global_solution{};
-  std::array<double, maximum_true_trace_dofs> local_trace{};
-  std::array<double, maximum_true_trace_dofs> global_trace{};
-  std::array<int, maximum_true_trace_dofs> local_owner{};
-  std::array<int, maximum_true_trace_dofs> global_owner{};
+  std::vector<double> local_matrix(static_cast<std::size_t>(count) * count);
+  std::vector<double> global_matrix(static_cast<std::size_t>(count) * count);
+  std::vector<double> local_rhs(static_cast<std::size_t>(count));
+  std::vector<double> global_rhs(static_cast<std::size_t>(count));
+  std::vector<double> local_solution(static_cast<std::size_t>(count));
+  std::vector<double> global_solution(static_cast<std::size_t>(count));
+  std::vector<double> local_trace(static_cast<std::size_t>(count));
+  std::vector<double> global_trace(static_cast<std::size_t>(count));
+  std::vector<int> local_owner(static_cast<std::size_t>(count));
+  std::vector<int> global_owner(static_cast<std::size_t>(count));
 
   const bool local_assembly_valid = [&]()
   {
     for (int element = 0; element < p.elements; ++element)
     {
-      for (int row = 0; row < trace_dofs_per_element; ++row)
+      for (int row = 0; row < p.trace_dofs; ++row)
       {
         const int encoded_row =
-            p.signed_element_trace[element * trace_dofs_per_element + row];
+            p.signed_element_trace[element * p.trace_dofs + row];
         if (encoded_row == std::numeric_limits<int>::min()) { return false; }
         const double row_sign = encoded_row >= 0 ? 1.0 : -1.0;
         const int local_row = encoded_row >= 0
@@ -203,16 +230,16 @@ inline bool VerifySignsAndTrueResidual(const CudaOraclePod& p)
         const std::int64_t global_row = p.local_to_global_true[local_row];
         if (global_row < 0 || global_row >= count ||
             !Close(p.current_local_trace[
-                       element * trace_dofs_per_element + row],
+                       element * p.trace_dofs + row],
                    row_sign * p.distributed_local_trace[local_row]))
           return false;
         local_rhs[static_cast<std::size_t>(global_row)] +=
             row_sign * p.condensed_rhs[
-                element * trace_dofs_per_element + row];
-        for (int column = 0; column < trace_dofs_per_element; ++column)
+                element * p.trace_dofs + row];
+        for (int column = 0; column < p.trace_dofs; ++column)
         {
           const int encoded_column = p.signed_element_trace[
-              element * trace_dofs_per_element + column];
+              element * p.trace_dofs + column];
           if (encoded_column == std::numeric_limits<int>::min())
             return false;
           const double column_sign = encoded_column >= 0 ? 1.0 : -1.0;
@@ -226,8 +253,7 @@ inline bool VerifySignsAndTrueResidual(const CudaOraclePod& p)
           local_matrix[static_cast<std::size_t>(global_row) * count +
                        static_cast<std::size_t>(global_column)] +=
               row_sign * column_sign * p.schur[
-                  (element * trace_dofs_per_element + row) *
-                      trace_dofs_per_element + column];
+                  (element * p.trace_dofs + row) * p.trace_dofs + column];
         }
       }
     }
@@ -276,10 +302,10 @@ inline bool VerifySignsAndTrueResidual(const CudaOraclePod& p)
         return false;
     }
 
-    std::array<double, maximum_true_trace_dofs> production_row{};
+    std::vector<double> production_row(static_cast<std::size_t>(count));
     for (int local_row = 0; local_row < p.true_csr_rows; ++local_row)
     {
-      production_row.fill(0.0);
+      std::fill(production_row.begin(), production_row.end(), 0.0);
       const std::int64_t global_row = p.owned_global_true[local_row];
       if (global_row < 0 || global_row >= count ||
           !Close(p.true_rhs[local_row],

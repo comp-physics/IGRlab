@@ -284,8 +284,11 @@ CudaArenaReleasePass ReleaseCudaArenas(
   return finish();
 }
 
-inline constexpr std::size_t persistent_double_capacity = 220000;
-inline constexpr std::size_t persistent_integer_capacity = 120000;
+// One fixed-capacity allocation per arena covers both the admitted p1/N3
+// smoke shape and the p2/N6 functional shape.  The arena is partitioned once
+// during Initialize and never resized during a process segment.
+inline constexpr std::size_t persistent_double_capacity = 1000000;
+inline constexpr std::size_t persistent_integer_capacity = 600000;
 
 struct CudaTrueMatrixStructure
 {
@@ -398,6 +401,11 @@ struct CudaDeviceView
 struct CudaMeshShape
 {
   int elements = 0;
+  int scalar_interior_dofs = 0;
+  int scalar_face_dofs = 0;
+  int interior_dofs = 0;
+  int trace_dofs = 0;
+  int assembly_order = 0;
   int interior_count = 0;
   int local_trace_count = 0;
   int true_trace_count = 0;
@@ -520,6 +528,114 @@ using CudaCopyOutFunction = bool (*)(
     void*, const void*, std::size_t, CudaTransferCategory,
     CudaTransferSite, std::size_t, std::size_t) noexcept;
 using CudaSynchronizeFunction = bool (*)(CudaTransferSite) noexcept;
+
+#if defined(__CUDACC__)
+// Retained element factors are private CUDA implementation details.  Keeping
+// these operations static and inline lets the production kernels and the CUDA
+// leaf's test-only device seam exercise exactly the same ordering without
+// adding an application ABI surface.
+static __device__ inline bool CudaFactorRetained(
+    double* lu, double* pivots, const int rows)
+{
+  double scale = 0.0;
+  for (int entry = 0; entry < rows * rows; ++entry)
+    scale = fmax(scale, fabs(lu[entry]));
+  for (int column = 0; column < rows; ++column)
+  {
+    int pivot = column;
+    for (int row = column + 1; row < rows; ++row)
+      if (fabs(lu[row * rows + column]) >
+          fabs(lu[pivot * rows + column]))
+        pivot = row;
+    pivots[column] = pivot;
+    if (!(fabs(lu[pivot * rows + column]) >
+          64.0 * 2.2204460492503131e-16 * scale))
+      return false;
+    if (pivot != column)
+    {
+      for (int entry = 0; entry < rows; ++entry)
+      {
+        const double value = lu[column * rows + entry];
+        lu[column * rows + entry] = lu[pivot * rows + entry];
+        lu[pivot * rows + entry] = value;
+      }
+    }
+    for (int row = column + 1; row < rows; ++row)
+    {
+      lu[row * rows + column] /= lu[column * rows + column];
+      for (int entry = column + 1; entry < rows; ++entry)
+        lu[row * rows + entry] -=
+            lu[row * rows + column] * lu[column * rows + entry];
+    }
+  }
+  return true;
+}
+
+static __device__ inline void CudaSolveRetained(
+    const double* lu, const double* pivots, const int rows,
+    double* rhs, const int columns)
+{
+  // Complete row swaps move previously stored lower columns.  Apply the
+  // retained permutation sequence before forward substitution so a delayed
+  // pivot cannot permute an already-eliminated right-hand side.
+  for (int row = 0; row < rows; ++row)
+  {
+    const int pivot = static_cast<int>(pivots[row]);
+    if (pivot != row)
+    {
+      for (int column = 0; column < columns; ++column)
+      {
+        const double value = rhs[row * columns + column];
+        rhs[row * columns + column] = rhs[pivot * columns + column];
+        rhs[pivot * columns + column] = value;
+      }
+    }
+  }
+  for (int column = 0; column < rows; ++column)
+    for (int row = column + 1; row < rows; ++row)
+      for (int rhs_column = 0; rhs_column < columns; ++rhs_column)
+        rhs[row * columns + rhs_column] -=
+            lu[row * rows + column] *
+            rhs[column * columns + rhs_column];
+  for (int row = rows - 1; row >= 0; --row)
+  {
+    for (int rhs_column = 0; rhs_column < columns; ++rhs_column)
+    {
+      for (int column = row + 1; column < rows; ++column)
+        rhs[row * columns + rhs_column] -=
+            lu[row * rows + column] *
+            rhs[column * columns + rhs_column];
+      rhs[row * columns + rhs_column] /= lu[row * rows + row];
+    }
+  }
+}
+
+static __device__ inline bool CudaFactorSolveRetained(
+    double* lu, double* pivots, const int rows,
+    double* rhs, const int columns)
+{
+  if (!CudaFactorRetained(lu, pivots, rows)) { return false; }
+  CudaSolveRetained(lu, pivots, rows, rhs, columns);
+  return true;
+}
+
+static __device__ inline void CudaRecoverRetained(
+    const double* lu, const double* pivots, const int interior_rows,
+    const double* coupling, const int trace_rows,
+    const double* trace_increment, const double* interior_rhs,
+    double* recovered)
+{
+  for (int row = 0; row < interior_rows; ++row)
+  {
+    double value = interior_rhs[row];
+    for (int column = 0; column < trace_rows; ++column)
+      value -= coupling[row * trace_rows + column] *
+          trace_increment[column];
+    recovered[row] = value;
+  }
+  CudaSolveRetained(lu, pivots, interior_rows, recovered, 1);
+}
+#endif
 
 bool CudaCopyHypreBigIntHost(HYPRE_BigInt* destination,
                              std::size_t destination_capacity,
@@ -729,7 +845,7 @@ public:
         static_cast<std::size_t>(shape_.true_trace_count) *
             sizeof(std::int64_t));
     local_topology_hash_ = HashHostBytes(signed_element_trace_.data(),
-        static_cast<std::size_t>(shape_.elements) * trace_dofs_per_element *
+        static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs *
             sizeof(int));
     if (!AggregateHash(local_mesh_hash_, resources_.mesh_hash) ||
         !AggregateHash(local_partition_hash_, resources_.partition_hash) ||
@@ -739,8 +855,8 @@ public:
       return false;
     }
     resources_.rank_count = static_cast<std::uint32_t>(ranks_);
-    resources_.polynomial_order = polynomial_order;
-    resources_.layout = StableIdentity::Copy("mfem.byNODES.vdim4.p1.n3");
+    resources_.polynomial_order = static_cast<std::uint32_t>(config.order);
+    resources_.layout = StableIdentity::Copy(runtime_layout_id);
     resources_.reuse = {true,
                         true,
                         true,
@@ -1303,7 +1419,7 @@ public:
         ExportArray(pod.current_interior.data(), view_.work_interior,
                     shape_.interior_count) &&
         ExportArray(pod.current_local_trace.data(), view_.current_local_trace,
-                    shape_.elements * trace_dofs_per_element) &&
+                    shape_.elements * shape_.trace_dofs) &&
         ExportArray(pod.distributed_local_trace.data(),
                     ranks_ == 1 ? view_.work_true_trace :
                                   view_.distributed_local_trace,
@@ -1313,30 +1429,30 @@ public:
         ExportArray(pod.residual_r.data(), view_.residual_r,
                     shape_.interior_count) &&
         ExportArray(pod.residual_g.data(), view_.residual_g,
-                    shape_.elements * trace_dofs_per_element) &&
+                    shape_.elements * shape_.trace_dofs) &&
         ExportArray(pod.a.data(), view_.a,
-                    shape_.elements * interior_dofs_per_element *
-                        interior_dofs_per_element) &&
+                    shape_.elements * shape_.interior_dofs *
+                        shape_.interior_dofs) &&
         ExportArray(pod.b.data(), view_.b,
-                    shape_.elements * interior_dofs_per_element *
-                        trace_dofs_per_element) &&
+                    shape_.elements * shape_.interior_dofs *
+                        shape_.trace_dofs) &&
         ExportArray(pod.c.data(), view_.c,
-                    shape_.elements * trace_dofs_per_element *
-                        interior_dofs_per_element) &&
+                    shape_.elements * shape_.trace_dofs *
+                        shape_.interior_dofs) &&
         ExportArray(pod.d.data(), view_.d,
-                    shape_.elements * trace_dofs_per_element *
-                        trace_dofs_per_element) &&
+                    shape_.elements * shape_.trace_dofs *
+                        shape_.trace_dofs) &&
         ExportArray(pod.f.data(), view_.f, shape_.interior_count) &&
         ExportArray(pod.g.data(), view_.g,
-                    shape_.elements * trace_dofs_per_element) &&
+                    shape_.elements * shape_.trace_dofs) &&
         ExportArray(pod.schur.data(), view_.schur,
-                    shape_.elements * trace_dofs_per_element *
-                        trace_dofs_per_element) &&
+                    shape_.elements * shape_.trace_dofs *
+                        shape_.trace_dofs) &&
         ExportArray(pod.condensed_rhs.data(), view_.condensed_rhs,
-                    shape_.elements * trace_dofs_per_element) &&
+                    shape_.elements * shape_.trace_dofs) &&
         ExportArray(pod.local_trace_increment.data(),
                     view_.trace_increment_local,
-                    shape_.elements * trace_dofs_per_element) &&
+                    shape_.elements * shape_.trace_dofs) &&
         ExportArray(pod.recovered_increment.data(), view_.recovered_interior,
                     shape_.interior_count) &&
         ExportTrueSystem(pod);
@@ -1491,12 +1607,12 @@ private:
     return same_physical_gpu_;
   }
 
-  bool BuildTopology(const CudaConfig&) noexcept
+  bool BuildTopology(const CudaConfig& config) noexcept
   {
     try
     {
       mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
-          elements_per_direction, elements_per_direction,
+          config.mesh_n, config.mesh_n,
           mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
       // MFEM owns this setup-only container and the mapping allocation.
       std::vector<mfem::Vector> translations(2, mfem::Vector(dimension));
@@ -1504,18 +1620,18 @@ private:
       translations[1][1] = 1.0;
       serial_mesh_ = mfem::Mesh::MakePeriodic(
           original, original.CreatePeriodicVertexMapping(translations));
-      std::array<int, elements_per_direction * elements_per_direction>
-          partition{};
-      for (int element = 0; element < static_cast<int>(partition.size());
+      std::array<int, maximum_rank_elements> partition{};
+      const int global_elements = config.mesh_n * config.mesh_n;
+      for (int element = 0; element < global_elements;
            ++element)
         partition[static_cast<std::size_t>(element)] =
-            element * ranks_ / static_cast<int>(partition.size());
+            element * ranks_ / global_elements;
       mesh_.emplace(MPI_COMM_WORLD, serial_mesh_, partition.data());
       interior_collection_.emplace(
-          polynomial_order, dimension, mfem::BasisType::GaussLegendre,
+          config.order, dimension, mfem::BasisType::GaussLegendre,
           mfem::FiniteElement::VALUE);
       trace_collection_.emplace(
-          polynomial_order, dimension, mfem::FiniteElement::VALUE,
+          config.order, dimension, mfem::FiniteElement::VALUE,
           mfem::BasisType::GaussLegendre);
       interior_space_.emplace(&*mesh_, &*interior_collection_,
                               conserved_components, mfem::Ordering::byNODES);
@@ -1532,7 +1648,6 @@ private:
       return false;
     }
     shape_.elements = mesh_->GetNE();
-    shape_.interior_count = shape_.elements * interior_dofs_per_element;
     shape_.local_trace_count = trace_space_->GetVSize();
     shape_.true_trace_count = trace_space_->GetTrueVSize();
     shape_.global_true_trace_count = static_cast<int>(
@@ -1542,20 +1657,33 @@ private:
     mesh_->GetElementEdges(0, first_faces, first_orientations);
     const mfem::FiniteElement* face_fe =
         trace_space_->GetFaceElement(first_faces[0]);
+    shape_.scalar_interior_dofs = fe == nullptr ? 0 : fe->GetDof();
+    shape_.scalar_face_dofs = face_fe == nullptr ? 0 : face_fe->GetDof();
+    shape_.interior_dofs =
+        conserved_components * shape_.scalar_interior_dofs;
+    shape_.trace_dofs = faces_per_element * conserved_components *
+        shape_.scalar_face_dofs;
+    shape_.assembly_order = config.order == functional_polynomial_order
+        ? functional_assembly_quadrature_order : assembly_quadrature_order;
+    shape_.interior_count = shape_.elements * shape_.interior_dofs;
     if (shape_.elements <= 0 || shape_.elements > maximum_rank_elements ||
         shape_.local_trace_count <= 0 ||
         shape_.local_trace_count > maximum_local_trace_dofs ||
         shape_.true_trace_count <= 0 ||
         shape_.true_trace_count > maximum_true_trace_dofs || fe == nullptr ||
-        face_fe == nullptr || fe->GetDof() != scalar_dofs_per_element ||
-        face_fe->GetDof() != scalar_dofs_per_face ||
+        face_fe == nullptr || shape_.scalar_interior_dofs <= 0 ||
+        shape_.scalar_interior_dofs > maximum_scalar_dofs_per_element ||
+        shape_.scalar_face_dofs <= 0 ||
+        shape_.scalar_face_dofs > maximum_scalar_dofs_per_face ||
+        shape_.interior_dofs > maximum_interior_dofs_per_element ||
+        shape_.trace_dofs > maximum_trace_dofs_per_element ||
         interior_space_->GetOrdering() != mfem::Ordering::byNODES ||
         trace_space_->GetOrdering() != mfem::Ordering::byNODES)
       return false;
     shape_.volume_points = mfem::IntRules.Get(
-        fe->GetGeomType(), assembly_quadrature_order).GetNPoints();
+        fe->GetGeomType(), shape_.assembly_order).GetNPoints();
     shape_.face_points = mfem::IntRules.Get(
-        face_fe->GetGeomType(), assembly_quadrature_order).GetNPoints();
+        face_fe->GetGeomType(), shape_.assembly_order).GetNPoints();
     if (shape_.volume_points > maximum_volume_points ||
         shape_.face_points > maximum_face_points)
       return false;
@@ -1785,7 +1913,7 @@ private:
   std::size_t ticket_count_ = 0;
   CudaOraclePod oracle_{};
 
-  std::array<int, maximum_rank_elements * trace_dofs_per_element>
+  std::array<int, maximum_rank_elements * maximum_trace_dofs_per_element>
       signed_element_trace_{};
   std::array<std::int64_t, maximum_local_trace_dofs> local_global_true_{};
   std::array<int, maximum_local_trace_dofs> local_owner_{};
@@ -1794,20 +1922,20 @@ private:
   std::array<std::int64_t, maximum_rank_elements * dimension>
       element_coordinate_keys_{};
   std::array<double, maximum_rank_elements * maximum_volume_points *
-                         scalar_dofs_per_element>
+                         maximum_scalar_dofs_per_element>
       host_volume_shape_{};
   std::array<double, maximum_rank_elements * maximum_volume_points *
-                         scalar_dofs_per_element * dimension>
+                         maximum_scalar_dofs_per_element * dimension>
       host_volume_derivative_{};
   std::array<double, maximum_rank_elements * maximum_volume_points>
       host_volume_weight_{};
   std::array<double, maximum_rank_elements * maximum_volume_points * dimension>
       host_volume_position_{};
   std::array<double, maximum_rank_elements * faces_per_element *
-                         maximum_face_points * scalar_dofs_per_element>
+                         maximum_face_points * maximum_scalar_dofs_per_element>
       host_face_interior_shape_{};
   std::array<double, maximum_rank_elements * faces_per_element *
-                         maximum_face_points * scalar_dofs_per_face>
+                         maximum_face_points * maximum_scalar_dofs_per_face>
       host_face_trace_shape_{};
   std::array<double, maximum_rank_elements * faces_per_element *
                          maximum_face_points>
@@ -1815,9 +1943,9 @@ private:
   std::array<double, maximum_rank_elements * faces_per_element *
                          maximum_face_points * dimension>
       host_face_normal_{};
-  std::array<double, maximum_rank_elements * interior_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
       host_exact_interior_{};
-  std::array<double, maximum_rank_elements * interior_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
       host_perturbed_interior_{};
   std::array<double, maximum_true_trace_dofs> host_exact_true_trace_{};
   std::array<double, maximum_true_trace_dofs> host_perturbed_true_trace_{};
@@ -1827,27 +1955,27 @@ private:
   std::array<int, maximum_exchange_entries> host_matrix_send_source_{};
   std::array<int, maximum_exchange_entries> host_matrix_receive_section_{};
   std::array<int, maximum_exchange_entries> host_matrix_receive_target_{};
-  std::array<int, maximum_rank_elements * trace_dofs_per_element>
+  std::array<int, maximum_rank_elements * maximum_trace_dofs_per_element>
       host_vector_owned_source_{};
-  std::array<int, maximum_rank_elements * trace_dofs_per_element>
+  std::array<int, maximum_rank_elements * maximum_trace_dofs_per_element>
       host_vector_owned_target_{};
-  std::array<int, maximum_rank_elements * trace_dofs_per_element>
+  std::array<int, maximum_rank_elements * maximum_trace_dofs_per_element>
       host_vector_send_source_{};
-  std::array<int, maximum_rank_elements * trace_dofs_per_element>
+  std::array<int, maximum_rank_elements * maximum_trace_dofs_per_element>
       host_vector_receive_target_{};
   std::array<std::int64_t, maximum_exchange_entries * 2> matrix_send_keys_{};
   std::array<std::int64_t, maximum_exchange_entries * 2> matrix_receive_keys_{};
   std::array<std::int64_t,
-             maximum_rank_elements * trace_dofs_per_element>
+             maximum_rank_elements * maximum_trace_dofs_per_element>
       vector_send_keys_{};
   std::array<std::int64_t,
-             maximum_rank_elements * trace_dofs_per_element>
+             maximum_rank_elements * maximum_trace_dofs_per_element>
       vector_receive_keys_{};
   std::array<double, maximum_exchange_entries> matrix_send_host_{};
   std::array<double, maximum_exchange_entries> matrix_receive_host_{};
-  std::array<double, maximum_rank_elements * trace_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_trace_dofs_per_element>
       vector_send_host_{};
-  std::array<double, maximum_rank_elements * trace_dofs_per_element>
+  std::array<double, maximum_rank_elements * maximum_trace_dofs_per_element>
       vector_receive_host_{};
 };
 
