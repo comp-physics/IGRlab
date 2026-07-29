@@ -3725,7 +3725,8 @@ bool CommitFunctionalAttempt(
     const int ranks, const int rank,
     CudaSerializedCheckpointV1& checkpoint,
     const FunctionalOracleLane lane, FunctionalOracleCensus& census,
-    const char* const case_id) noexcept
+    const char* const case_id,
+    CudaOraclePod* const accepted_oracle = nullptr) noexcept
 {
   CudaPrecommitSnapshot snapshot{};
   CudaStepEvidence evidence{};
@@ -3903,6 +3904,7 @@ bool CommitFunctionalAttempt(
                         target_step);
     return false;
   }
+  if (accepted_oracle != nullptr) { *accepted_oracle = *published; }
   census.Credit(lane, retry, mutation_required);
   return true;
 }
@@ -3910,22 +3912,65 @@ bool CommitFunctionalAttempt(
 template <typename Engine>
 bool InjectFunctionalRollback(
     Engine& engine, const int ranks, const int rank,
+    const CudaOraclePod& accepted_oracle,
     const char* const case_id) noexcept
 {
   const auto* contract = engine.contract();
   if (!CollectivelyExact(contract != nullptr)) { return false; }
   const StateCoordinates before = contract->coordinates();
+  const RunTelemetry& telemetry = contract->telemetry();
   const auto publication = contract->Published();
   auto published_before = std::make_unique<CudaOraclePod>();
   const bool prior_export = engine.ExportOracle(*published_before);
   const bool prior_export_collective = CollectivelyExact(prior_export);
   if (!prior_export_collective) { return false; }
-  const bool prior_metadata_exact =
-      published_before->product_generation == before.generation &&
+  const bool prior_contract_binding = telemetry.accepted.valid &&
+      SameCoordinates(telemetry.accepted.coordinates, before) &&
+      before.step == functional_injected_step - 1 &&
+      before.generation == functional_injected_step - 1 &&
+      telemetry.accepted.attempt.identity.sequence ==
+          published_before->attempt_sequence &&
+      telemetry.accepted.attempt.identity.committed_step == before.step - 1 &&
+      telemetry.accepted.attempt.identity.committed_generation ==
+          before.generation - 1 &&
+      telemetry.accepted.attempt.identity.retry_index == 0 &&
+      std::memcmp(&telemetry.accepted.attempt.identity.dt, &before.dt,
+                  sizeof(double)) == 0 &&
+      telemetry.accepted.attempt.failure_reason == FailureReason::none &&
+      telemetry.accepted.attempt.validated_product_mask == 0x0fU &&
+      std::isfinite(
+          telemetry.accepted.attempt.true_relative_residual) &&
+      telemetry.accepted.attempt.true_relative_residual <= 1.0e-10 &&
+      telemetry.accepted.attempt.prohibited.Clean();
+  const bool prior_publication_continuity =
+      SameOraclePodSemantic(*published_before, accepted_oracle);
+  const bool prior_metadata_exact = prior_contract_binding &&
+      prior_publication_continuity &&
+      published_before->product_generation != 0 &&
       ExactOracleShape(
           *published_before, FunctionalOracleShape(ranks, rank));
-  if (!CollectivelyExact(prior_metadata_exact) ||
-      !cuda_w8a_test_oracle::Verify(*published_before))
+  const bool prior_verify = prior_metadata_exact &&
+      cuda_w8a_test_oracle::Verify(*published_before);
+  const bool prior_collective = CollectivelyExact(prior_verify);
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_PRIOR_ORACLE_BINDING case=%s rank=%d ranks=%d "
+      "step=%llu generation=%llu accepted_attempt=%llu/%llu "
+      "oracle_attempt=%llu product_generation=%llu contract=%u "
+      "continuity=%u metadata=%u verify=%u collective=%s\n",
+      case_id != nullptr ? case_id : "null", rank, ranks,
+      static_cast<unsigned long long>(before.step),
+      static_cast<unsigned long long>(before.generation),
+      static_cast<unsigned long long>(
+          telemetry.accepted.attempt.identity.sequence),
+      static_cast<unsigned long long>(
+          telemetry.accepted.attempt.identity.committed_step),
+      static_cast<unsigned long long>(published_before->attempt_sequence),
+      static_cast<unsigned long long>(published_before->product_generation),
+      prior_contract_binding ? 1U : 0U,
+      prior_publication_continuity ? 1U : 0U,
+      prior_metadata_exact ? 1U : 0U, prior_verify ? 1U : 0U,
+      prior_collective ? "PASS" : "FAIL");
+  if (!prior_collective)
     return false;
   CudaPrecommitSnapshot snapshot{};
   CudaStepEvidence evidence{};
@@ -3969,13 +4014,7 @@ bool InjectFunctionalRollback(
   const bool visible_during_collective =
       CollectivelyExact(visible_during_return);
   const bool prior_identity_preserved = visible_during_return &&
-      visible_during->schema == published_before->schema &&
-      visible_during->rank == published_before->rank &&
-      visible_during->ranks == published_before->ranks &&
-      visible_during->elements == published_before->elements &&
-      visible_during->attempt_sequence == published_before->attempt_sequence &&
-      visible_during->product_generation ==
-          published_before->product_generation &&
+      SameOraclePodSemantic(*visible_during, *published_before) &&
       visible_during->attempt_sequence != snapshot.attempt.sequence &&
       visible_during->product_generation !=
           snapshot.products.residual_generation &&
@@ -4008,14 +4047,7 @@ bool InjectFunctionalRollback(
   const bool after_export = engine.ExportOracle(*published_after);
   const bool after_export_collective = CollectivelyExact(after_export);
   const bool prior_publication_retained = after_export &&
-      published_after->schema == published_before->schema &&
-      published_after->rank == published_before->rank &&
-      published_after->ranks == published_before->ranks &&
-      published_after->elements == published_before->elements &&
-      published_after->attempt_sequence ==
-          published_before->attempt_sequence &&
-      published_after->product_generation ==
-          published_before->product_generation &&
+      SameOraclePodSemantic(*published_after, *published_before) &&
       ExactOracleShape(
           *published_after, FunctionalOracleShape(ranks, rank));
   const bool prior_publication_collective =
@@ -4161,15 +4193,18 @@ bool RunFunctionalTrajectory(const int ranks, const char* const context)
   if (!CollectivelyExact(restore_local)) { return false; }
 
   CudaSerializedCheckpointV1 final_checkpoint{};
+  auto accepted_reader_oracle = std::make_unique<CudaOraclePod>();
   for (std::uint64_t target = functional_checkpoint_step + 1;
        target < functional_injected_step; ++target)
   {
     if (!CommitFunctionalAttempt(
             *reader, false, target, ranks, setup.rank, final_checkpoint,
-            FunctionalOracleLane::restored_reader, oracle_census, context))
+            FunctionalOracleLane::restored_reader, oracle_census, context,
+            accepted_reader_oracle.get()))
       return false;
   }
-  if (!InjectFunctionalRollback(*reader, ranks, setup.rank, context) ||
+  if (!InjectFunctionalRollback(
+          *reader, ranks, setup.rank, *accepted_reader_oracle, context) ||
       !CommitFunctionalAttempt(
           *reader, true, functional_injected_step, ranks, setup.rank,
           final_checkpoint, FunctionalOracleLane::restored_reader,
