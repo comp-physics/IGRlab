@@ -3949,14 +3949,21 @@ bool InjectFunctionalRollback(
       published_before->product_generation != 0 &&
       ExactOracleShape(
           *published_before, FunctionalOracleShape(ranks, rank));
-  const bool prior_verify = prior_metadata_exact &&
-      cuda_w8a_test_oracle::Verify(*published_before);
-  const bool prior_collective = CollectivelyExact(prior_verify);
+  // Verify enters MPI collectives.  Normalize every rank-local prerequisite
+  // before entry, then normalize the verifier result as a separate phase.
+  const bool prior_metadata_collective =
+      CollectivelyExact(prior_metadata_exact);
+  const bool prior_verify_local = prior_metadata_collective
+      ? cuda_w8a_test_oracle::Verify(*published_before) : false;
+  const bool prior_verify_collective =
+      CollectivelyExact(prior_verify_local);
+  const bool prior_collective =
+      prior_metadata_collective && prior_verify_collective;
   std::fprintf(stderr,
       "CUDA_FUNCTIONAL_PRIOR_ORACLE_BINDING case=%s rank=%d ranks=%d "
       "step=%llu generation=%llu accepted_attempt=%llu/%llu "
       "oracle_attempt=%llu product_generation=%llu contract=%u "
-      "continuity=%u metadata=%u verify=%u collective=%s\n",
+      "continuity=%u metadata=%u/%u verify=%u/%u overall=%s\n",
       case_id != nullptr ? case_id : "null", rank, ranks,
       static_cast<unsigned long long>(before.step),
       static_cast<unsigned long long>(before.generation),
@@ -3968,7 +3975,10 @@ bool InjectFunctionalRollback(
       static_cast<unsigned long long>(published_before->product_generation),
       prior_contract_binding ? 1U : 0U,
       prior_publication_continuity ? 1U : 0U,
-      prior_metadata_exact ? 1U : 0U, prior_verify ? 1U : 0U,
+      prior_metadata_exact ? 1U : 0U,
+      prior_metadata_collective ? 1U : 0U,
+      prior_verify_local ? 1U : 0U,
+      prior_verify_collective ? 1U : 0U,
       prior_collective ? "PASS" : "FAIL");
   if (!prior_collective)
     return false;
@@ -4026,11 +4036,14 @@ bool InjectFunctionalRollback(
            snapshot.products.residual_generation);
   const bool prior_identity_collective =
       CollectivelyExact(prior_identity_preserved);
-  const bool visible_during_verify = visible_during_collective &&
-      prior_identity_collective
+  const bool visible_during_verify_entry =
+      visible_during_collective && prior_identity_collective;
+  const bool visible_during_verify_local = visible_during_verify_entry
       ? cuda_w8a_test_oracle::Verify(*visible_during) : false;
+  const bool visible_during_verify_collective =
+      CollectivelyExact(visible_during_verify_local);
   const bool visible_during_exact = visible_during_collective &&
-      prior_identity_collective && visible_during_verify;
+      prior_identity_collective && visible_during_verify_collective;
   const bool staging_ledgers_exact =
       SameLedger(allocation_before, AuditedAllocator::Ledger()) &&
       SameLedger(*transfer_before, AuditedTransport::Ledger()) &&
@@ -4052,15 +4065,18 @@ bool InjectFunctionalRollback(
           *published_after, FunctionalOracleShape(ranks, rank));
   const bool prior_publication_collective =
       CollectivelyExact(prior_publication_retained);
-  const bool published_after_verify = after_export_collective &&
-      prior_publication_collective
+  const bool published_after_verify_entry =
+      after_export_collective && prior_publication_collective;
+  const bool published_after_verify_local = published_after_verify_entry
       ? cuda_w8a_test_oracle::Verify(*published_after) : false;
+  const bool published_after_verify_collective =
+      CollectivelyExact(published_after_verify_local);
   StateCoordinates visible{};
   const bool exact_local = staging_rejected && rolled_back &&
       oracle_staging_rejected && prohibited_oracle_clear &&
       !candidate_exported && visible_during_exact &&
       staging_ledgers_exact && after_export_collective &&
-      prior_publication_collective && published_after_verify &&
+      prior_publication_collective && published_after_verify_collective &&
       evidence.status == CudaRunStatus::retry_available &&
       evidence.retry_available && !evidence.committed &&
       evidence.coordinates_preserved && evidence.committed_bytes_preserved &&
@@ -4087,7 +4103,8 @@ bool InjectFunctionalRollback(
       prohibited.checkpoint_staged ? 1U : 0U,
       prohibited.output_staged ? 1U : 0U,
       prohibited.successful_commit ? 1U : 0U,
-      (prior_publication_collective && published_after_verify) ? 1U : 0U,
+      (prior_publication_collective &&
+       published_after_verify_collective) ? 1U : 0U,
       exact_local ? "PASS" : "FAIL",
       exact_collective ? "PASS" : "FAIL");
   return exact_collective;
