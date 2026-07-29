@@ -9,6 +9,13 @@
 namespace dg_igr_hdg_cpu_test
 {
 
+struct IndependentOracleConfig
+{
+  int polynomial_order = 1;
+  int elements_per_direction = 3;
+  int assembly_quadrature_order = 11;
+};
+
 struct IndependentLinearizationHashes
 {
   std::array<std::uint8_t, 32> residual{};
@@ -35,6 +42,8 @@ struct IndependentNewtonStepEvidence
 
 struct IndependentOracleResult
 {
+  std::vector<double> initial_interior;
+  std::vector<double> initial_true_trace;
   std::vector<double> interior;
   std::vector<double> true_trace;
   std::vector<IndependentLinearizationHashes> linearizations;
@@ -60,7 +69,12 @@ struct IndependentOracleResult
   bool passed = false;
 };
 
-/** Independent test-local p1/N3 first-step oracle; no production helpers. */
+/** Independent test-local first-step oracle; no production helpers. */
+bool RunIndependentFirstStep(MPI_Comm communicator,
+                             const IndependentOracleConfig& config,
+                             IndependentOracleResult& result);
+
+/** Retained accepted p1/N3 smoke entry. */
 bool RunIndependentFirstStep(MPI_Comm communicator,
                              IndependentOracleResult& result);
 

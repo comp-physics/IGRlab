@@ -78,10 +78,19 @@ static_assert(cpu_polynomial_order == 1 &&
                   cpu_elements_per_direction == 3 &&
                   cpu_assembly_quadrature_order == 11 &&
                   cpu_backward_euler_dt == 0.05,
-              "bounded CPU tuple constants");
-static_assert(cpu_maximum_local_interior_coefficients == 144 &&
-                  cpu_maximum_local_true_trace_coefficients == 144,
-              "p1/N3 rank1/rank2 chain capture capacities are exact");
+              "accepted smoke aliases remain exact");
+static_assert(cpu_functional_polynomial_order == 2 &&
+                  cpu_functional_minimum_elements_per_direction == 3 &&
+                  cpu_functional_principal_elements_per_direction == 6 &&
+                  cpu_functional_maximum_elements_per_direction == 12 &&
+                  cpu_functional_assembly_quadrature_order == 14 &&
+                  cpu_functional_accepted_steps == 20 &&
+                  cpu_functional_checkpoint_step == 10 &&
+                  cpu_functional_retry_target_step == 14,
+              "functional CPU tuple constants remain card exact");
+static_assert(cpu_maximum_local_interior_coefficients == 1296 &&
+                  cpu_maximum_local_true_trace_coefficients == 864,
+              "p2/N6 principal chain capture capacities are exact");
 static_assert(!std::is_copy_constructible<CpuPreparedStep>::value &&
                   std::is_move_constructible<CpuPreparedStep>::value &&
                   !std::is_copy_constructible<CpuPreparedCommit>::value &&
@@ -1453,6 +1462,353 @@ void CheckCheckpointImportAndIndependence(
                  "each checkpoint owns an immutable independent snapshot");
 }
 
+struct StoredCpuState
+{
+  StateCoordinates coordinates{};
+  StateHash interior_hash{};
+  StateHash trace_hash{};
+  std::vector<double> interior;
+  std::vector<double> trace;
+};
+
+StoredCpuState StoreState(const CpuStateSnapshot& snapshot)
+{
+  StoredCpuState stored;
+  stored.coordinates = snapshot.coordinates;
+  stored.interior_hash = snapshot.interior_hash;
+  stored.trace_hash = snapshot.trace_hash;
+  stored.interior = CopyView(snapshot.interior);
+  stored.trace = CopyView(snapshot.trace);
+  return stored;
+}
+
+bool StorageUnchanged(const CpuStorageEvidence& initial,
+                      const CpuStorageEvidence& current) noexcept
+{
+  return current.committed_storage_token == initial.committed_storage_token &&
+      current.candidate_storage_token == initial.candidate_storage_token &&
+      current.interior_capacity == initial.interior_capacity &&
+      current.trace_capacity == initial.trace_capacity &&
+      current.workspace_bytes == initial.workspace_bytes &&
+      current.sparse_owned_term_capacity ==
+          initial.sparse_owned_term_capacity &&
+      current.sparse_outgoing_term_capacity ==
+          initial.sparse_outgoing_term_capacity &&
+      current.sparse_incoming_slot_capacity ==
+          initial.sparse_incoming_slot_capacity &&
+      current.sparse_owned_term_token == initial.sparse_owned_term_token &&
+      current.sparse_outgoing_term_token ==
+          initial.sparse_outgoing_term_token &&
+      current.sparse_incoming_slot_token ==
+          initial.sparse_incoming_slot_token &&
+      current.topology_generation == initial.topology_generation &&
+      current.storage_generation == initial.storage_generation &&
+      current.allocation_events_after_baseline == 0;
+}
+
+bool AcceptedStepPasses(const CpuAcceptedStepEvidence& step,
+                        const std::uint64_t expected_step) noexcept
+{
+  return step.valid && step.coordinates.step == expected_step &&
+      step.coordinates.generation == expected_step &&
+      NearTime(step.coordinates.time,
+               static_cast<double>(expected_step) * cpu_backward_euler_dt) &&
+      step.attempt_sequence != 0 &&
+      step.post_baseline_allocation_events == 0 &&
+      step.nonlinear_updates > 0 && step.linear_iterations >= 0 &&
+      step.work.complete_assemblies ==
+          1 + step.work.trial_reassemblies &&
+      step.work.complete_condensations ==
+          step.work.accepted_newton_updates &&
+      step.work.complete_factor_setups == step.work.complete_trace_solves &&
+      step.work.complete_trace_solves == step.work.accepted_newton_updates &&
+      step.work.complete_recoveries == step.work.accepted_newton_updates &&
+      step.transfers.host_to_device_bytes == 0 &&
+      step.transfers.device_to_host_bytes == 0 &&
+      step.transfers.mpi_staging_bytes == 0 &&
+      step.transfers.allocation_events == 0 && step.transfers.complete &&
+      step.transfers.synchronization_events == 0 &&
+      std::isfinite(step.initial_nonlinear_residual) &&
+      std::isfinite(step.final_nonlinear_residual) &&
+      step.final_nonlinear_residual <= cpu_nonlinear_tolerance *
+          (1.0 + step.initial_nonlinear_residual) &&
+      std::isfinite(step.maximum_true_relative_residual) &&
+      step.maximum_true_relative_residual <= cpu_nonlinear_tolerance &&
+      std::isfinite(step.minimum_density) && step.minimum_density >= 1.0e-8 &&
+      std::isfinite(step.minimum_pressure) &&
+      step.minimum_pressure >= 1.0e-8 &&
+      std::isfinite(step.maximum_wave_speed) &&
+      step.maximum_wave_speed < cpu_fixed_tau && step.finite_gate &&
+      step.admissibility_gate && step.nonlinear_gate &&
+      step.true_residual_gate;
+}
+
+template <typename Selection>
+int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
+                       const int elements_per_direction)
+{
+  Checks checks{rank, 0};
+  const CpuPersistentConfig config =
+      MakeCpuFunctionalConfig(elements_per_direction);
+  dg_igr_hdg_cpu_test::IndependentOracleConfig oracle_config;
+  oracle_config.polynomial_order = cpu_functional_polynomial_order;
+  oracle_config.elements_per_direction = elements_per_direction;
+  oracle_config.assembly_quadrature_order =
+      cpu_functional_assembly_quadrature_order;
+  dg_igr_hdg_cpu_test::IndependentOracleResult oracle;
+  checks.Require(dg_igr_hdg_cpu_test::RunIndependentFirstStep(
+                     communicator, oracle_config, oracle) && oracle.passed,
+                 "functional first-step independent oracle");
+
+  PersistentSmoothEulerCpuAdapter<Selection> uninterrupted;
+  checks.Require(uninterrupted.Initialize(config),
+                 "functional uninterrupted initialization");
+  const CpuRunEvidence& initialized = uninterrupted.evidence();
+  const CpuStorageEvidence uninterrupted_storage = initialized.storage;
+  const std::uint64_t n = static_cast<std::uint64_t>(elements_per_direction);
+  const std::uint64_t expected_interior =
+      n * n * 9U * static_cast<std::uint64_t>(cpu_conserved_components);
+  const std::uint64_t expected_trace =
+      2U * n * n * 3U * static_cast<std::uint64_t>(
+          cpu_conserved_components);
+  checks.Require(initialized.polynomial_order ==
+                         cpu_functional_polynomial_order &&
+                     initialized.elements_per_direction ==
+                         elements_per_direction &&
+                     initialized.assembly_quadrature_order ==
+                         cpu_functional_assembly_quadrature_order &&
+                     initialized.dt == cpu_backward_euler_dt &&
+                     initialized.global_elements == elements_per_direction *
+                         elements_per_direction &&
+                     initialized.global_owned_interior_coefficients ==
+                         expected_interior &&
+                     initialized.global_owned_true_trace_coefficients ==
+                         expected_trace &&
+                     initialized.unique_periodic_faces == 2U * n * n &&
+                     initialized.initial_interior_hash != StateHash{} &&
+                     initialized.initial_trace_hash != StateHash{} &&
+                     initialized.topology_builds == 1 &&
+                     initialized.accepted_step_count == 0 &&
+                     initialized.storage.allocation_events_after_baseline == 0,
+                 "functional shape/topology/initial-state evidence");
+
+  std::array<StoredCpuState, cpu_functional_accepted_steps + 1> reference{};
+  reference[0] = StoreState(uninterrupted.Snapshot());
+  checks.Require(CloseVectors(uninterrupted.Snapshot().interior,
+                              oracle.initial_interior,
+                              4096.0 *
+                                  std::numeric_limits<double>::epsilon(),
+                              4096.0 *
+                                  std::numeric_limits<double>::epsilon()) &&
+                     CloseVectors(uninterrupted.Snapshot().trace,
+                                  oracle.initial_true_trace,
+                                  4096.0 *
+                                      std::numeric_limits<double>::epsilon(),
+                                  4096.0 *
+                                      std::numeric_limits<double>::epsilon()),
+                 "functional initial projections match independent oracle");
+  CpuPreparedStep first;
+  checks.Require(uninterrupted.PrepareAdvance(first) && first.valid &&
+                     first.numerically_ready &&
+                     CloseVectors(first.interior, oracle.interior, 1.0e-8,
+                                  2.0e-8) &&
+                     CloseVectors(first.trace, oracle.true_trace, 1.0e-8,
+                                  2.0e-8),
+                 "functional production first step matches independent oracle");
+  checks.Require(uninterrupted.FinalizePrepared(first).committed,
+                 "functional uninterrupted step 1");
+  reference[1] = StoreState(uninterrupted.Snapshot());
+  const CpuAttemptEvidence& functional_first =
+      uninterrupted.evidence().accepted.attempt;
+  bool capture_policy_exact = functional_first.linearization_chain_count > 0;
+  for (std::size_t index = 0;
+       index < functional_first.linearization_chain_count; ++index)
+  {
+    const CpuLinearizationChain& chain =
+        functional_first.linearization_chains[index];
+    const bool principal_capture = elements_per_direction <=
+        cpu_functional_principal_elements_per_direction;
+    capture_policy_exact = capture_policy_exact &&
+        (principal_capture
+             ? chain.true_trace_increment_capture_complete &&
+                   chain.accepted_candidate_capture_complete
+             : !chain.true_trace_increment_capture_complete &&
+                   !chain.accepted_candidate_capture_complete &&
+                   chain.true_trace_increment_size == 0 &&
+                   chain.accepted_candidate_interior_size == 0 &&
+                   chain.accepted_candidate_true_trace_size == 0);
+  }
+  checks.Require(AcceptedStepPasses(
+                     uninterrupted.evidence().accepted_steps[0], 1) &&
+                     capture_policy_exact,
+                 "functional step-1 residual/admissibility/accounting gates");
+
+  CpuCheckpoint uninterrupted_checkpoint;
+  for (std::uint64_t step = 2; step <= cpu_functional_accepted_steps; ++step)
+  {
+    checks.Require(uninterrupted.Advance().committed,
+                   "functional uninterrupted accepted step");
+    reference[static_cast<std::size_t>(step)] =
+        StoreState(uninterrupted.Snapshot());
+    const CpuRunEvidence& evidence = uninterrupted.evidence();
+    checks.Require(evidence.accepted_step_count == step &&
+                       AcceptedStepPasses(
+                           evidence.accepted_steps[
+                               static_cast<std::size_t>(step - 1)],
+                           step) &&
+                       StorageUnchanged(uninterrupted_storage,
+                                        evidence.storage),
+                   "functional uninterrupted history and persistent reuse");
+    if (step == cpu_functional_checkpoint_step)
+    {
+      checks.Require(uninterrupted.CaptureCheckpoint(
+                         uninterrupted_checkpoint) &&
+                         uninterrupted_checkpoint.valid &&
+                         uninterrupted_checkpoint.descriptor.coordinates.step ==
+                             cpu_functional_checkpoint_step &&
+                         uninterrupted_checkpoint.descriptor.polynomial_order ==
+                             cpu_functional_polynomial_order &&
+                         uninterrupted_checkpoint.descriptor.layout.view() ==
+                             cpu_detail::cpu_runtime_layout_identity &&
+                         NearTime(uninterrupted_checkpoint.descriptor
+                                      .coordinates.time,
+                                  0.5) &&
+                         ByteEqual(uninterrupted_checkpoint.interior(),
+                                   reference[10].interior) &&
+                         ByteEqual(uninterrupted_checkpoint.trace(),
+                                   reference[10].trace),
+                     "functional uninterrupted exact step-10 checkpoint bridge");
+    }
+  }
+  const CpuRunEvidence& uninterrupted_terminal = uninterrupted.evidence();
+  checks.Require(uninterrupted_terminal.attempts == 20 &&
+                     uninterrupted_terminal.failed_attempts == 0 &&
+                     uninterrupted_terminal.retries == 0 &&
+                     uninterrupted_terminal.commits == 20 &&
+                     uninterrupted_terminal.accepted_step_count == 20 &&
+                     uninterrupted.coordinates().step == 20 &&
+                     uninterrupted.coordinates().generation == 20 &&
+                     uninterrupted.coordinates().cursor == 20 &&
+                     NearTime(uninterrupted.coordinates().time, 1.0),
+                 "functional uninterrupted terminal census");
+
+  CpuCheckpoint split_checkpoint;
+  {
+    PersistentSmoothEulerCpuAdapter<Selection> writer;
+    checks.Require(writer.Initialize(config),
+                   "functional split-writer initialization");
+    for (std::uint64_t step = 1; step <= cpu_functional_checkpoint_step;
+         ++step)
+    {
+      checks.Require(writer.Advance().committed,
+                     "functional split-writer accepted step");
+    }
+    const CpuStateSnapshot writer_state = writer.Snapshot();
+    const bool checkpoint_captured =
+        writer.CaptureCheckpoint(split_checkpoint);
+    checks.Require(writer.coordinates().step == 10 &&
+                       writer.coordinates().generation == 10 &&
+                       writer.coordinates().cursor == 10 &&
+                       ByteEqual(writer_state.interior,
+                                 reference[10].interior) &&
+                       ByteEqual(writer_state.trace, reference[10].trace) &&
+                       writer.evidence().accepted_step_count == 10 &&
+                       checkpoint_captured &&
+                       split_checkpoint.valid &&
+                       ByteEqual(split_checkpoint.interior(),
+                                 reference[10].interior) &&
+                       ByteEqual(split_checkpoint.trace(),
+                                 reference[10].trace),
+                   "functional split writer reproduces exact step-10 bridge");
+  }
+
+  PersistentSmoothEulerCpuAdapter<Selection> reader;
+  checks.Require(reader.Initialize(config),
+                 "functional split-reader initialization");
+  const CpuStorageEvidence reader_storage = reader.evidence().storage;
+  const RestoreOutcome restored = reader.Restore(split_checkpoint);
+  checks.Require(restored.restored && reader.coordinates().step == 10 &&
+                     reader.coordinates().generation == 10 &&
+                     reader.coordinates().cursor == 10 &&
+                     NearTime(reader.coordinates().time, 0.5),
+                 "functional split-reader exact step-10 restore");
+  for (std::uint64_t step = 11; step <= cpu_functional_accepted_steps; ++step)
+  {
+    if (step == cpu_functional_retry_target_step)
+    {
+      const StoredCpuState before = StoreState(reader.Snapshot());
+      CpuFailureInjection injection;
+      injection.phase = CpuFailurePhase::after_recovery_before_commit;
+      injection.target_step = cpu_functional_retry_target_step;
+      injection.source_rank = ranks == 1 ? 0 : 1;
+      CpuPreparedStep failed_candidate;
+      checks.Require(reader.PrepareAdvance(failed_candidate, injection) &&
+                         !failed_candidate.numerically_ready,
+                     "functional prescribed step-14 failure reaches rollback");
+      const AttemptOutcome failure =
+          reader.FinalizePrepared(failed_candidate);
+      const CpuStateSnapshot rolled_back = reader.Snapshot();
+      checks.Require(!failure.committed && failure.retry_available &&
+                         ByteEqual(rolled_back.interior, before.interior) &&
+                         ByteEqual(rolled_back.trace, before.trace) &&
+                         rolled_back.interior_hash == before.interior_hash &&
+                         rolled_back.trace_hash == before.trace_hash &&
+                         rolled_back.coordinates.step == 13 &&
+                         reader.evidence().last_attempt.rollback_byte_equal &&
+                         reader.evidence().last_attempt.failure_phase ==
+                             CpuFailurePhase::after_recovery_before_commit,
+                     "functional step-14 rollback is byte-atomic");
+      checks.Require(reader.Retry().committed,
+                     "functional prescribed step-14 retry");
+    }
+    else
+    {
+      checks.Require(reader.Advance().committed,
+                     "functional split-reader accepted step");
+    }
+    const CpuStateSnapshot actual = reader.Snapshot();
+    const StoredCpuState& expected = reference[static_cast<std::size_t>(step)];
+    const CpuRunEvidence& evidence = reader.evidence();
+    const std::size_t local_history = static_cast<std::size_t>(step - 11);
+    checks.Require(CloseVectors(actual.interior, expected.interior,
+                                4096.0 *
+                                    std::numeric_limits<double>::epsilon(),
+                                4096.0 *
+                                    std::numeric_limits<double>::epsilon()) &&
+                       CloseVectors(actual.trace, expected.trace,
+                                    4096.0 *
+                                        std::numeric_limits<double>::epsilon(),
+                                    4096.0 *
+                                        std::numeric_limits<double>::epsilon()) &&
+                       evidence.accepted_step_count == local_history + 1 &&
+                       AcceptedStepPasses(
+                           evidence.accepted_steps[local_history], step) &&
+                       StorageUnchanged(reader_storage, evidence.storage),
+                   "functional restart/retry trajectory and reuse equivalence");
+  }
+  checks.Require(reader.coordinates().step == 20 &&
+                     reader.coordinates().generation == 20 &&
+                     reader.coordinates().cursor == 21 &&
+                     NearTime(reader.coordinates().time, 1.0) &&
+                     reader.evidence().attempts == 11 &&
+                     reader.evidence().failed_attempts == 1 &&
+                     reader.evidence().retries == 1 &&
+                     reader.evidence().commits == 10 &&
+                     reader.evidence().accepted_step_count == 10,
+                 "functional split/retry terminal census");
+
+  int global_failures = 0;
+  MPI_Allreduce(&checks.failures, &global_failures, 1, MPI_INT, MPI_SUM,
+                communicator);
+  if (rank == 0 && global_failures == 0)
+  {
+    std::cout << "persistent CPU functional leaf passed source candidate "
+              << "checks: ranks=" << ranks
+              << " p=2 N=" << elements_per_direction << '\n';
+  }
+  return global_failures == 0 ? 0 : 1;
+}
+
 template <typename Selection>
 int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
 {
@@ -1472,7 +1828,8 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
 
   PersistentSmoothEulerCpuAdapter<Selection> adapter;
   checks.Require(adapter.Initialize(), "persistent adapter initialization");
-  const CpuRunEvidence initial = adapter.evidence();
+  const CpuRunEvidence& initial = adapter.evidence();
+  const CpuStorageEvidence initial_storage = initial.storage;
   checks.Require(initial.tuple.model.view() == "euler.compressible.2d" &&
                      initial.tuple.formulation.view() == "hdg.conventional" &&
                      initial.tuple.trace.view() ==
@@ -1536,7 +1893,7 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                  "independent oracle must match the production candidate");
   checks.Require(adapter.FinalizePrepared(first).committed,
                  "step 1 commit");
-  const CpuAttemptEvidence first_accepted =
+  const CpuAttemptEvidence& first_accepted =
       adapter.evidence().accepted.attempt;
   bool independent_chain = oracle.passed &&
       oracle.linearizations.size() == oracle.newton_steps.size() &&
@@ -1681,6 +2038,10 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
   CpuCheckpoint checkpoint;
   checks.Require(adapter.CaptureCheckpoint(checkpoint) && checkpoint.valid &&
                      checkpoint.descriptor.coordinates.step == 1 &&
+                     checkpoint.descriptor.polynomial_order ==
+                         cpu_smoke_polynomial_order &&
+                     checkpoint.descriptor.layout.view() ==
+                         cpu_detail::cpu_runtime_layout_identity &&
                      checkpoint.owned_allocation_event_count == 3,
                  "in-memory committed checkpoint capture");
 
@@ -1766,6 +2127,8 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
     const CpuLinearizationChain& chain = accepted.linearization_chains[index];
     chain_coherent = chain_coherent && chain.ordered &&
         chain.affine_consumption_verified &&
+        chain.true_trace_increment_capture_complete &&
+        chain.accepted_candidate_capture_complete &&
         chain.factor_setup_current &&
         chain.matrix_refresh_generation == chain.factor_setup_generation &&
         chain.factor_setup_generation >
@@ -1857,25 +2220,25 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                      telemetry->committed_transfers.allocation_events == 0,
                  "contract census and CPU zero-transfer/allocation accounting");
   checks.Require(terminal.storage.committed_storage_token ==
-                         initial.storage.committed_storage_token &&
+                         initial_storage.committed_storage_token &&
                      terminal.storage.candidate_storage_token ==
-                         initial.storage.candidate_storage_token &&
+                         initial_storage.candidate_storage_token &&
                      terminal.storage.interior_capacity ==
-                         initial.storage.interior_capacity &&
+                         initial_storage.interior_capacity &&
                      terminal.storage.trace_capacity ==
-                         initial.storage.trace_capacity &&
+                         initial_storage.trace_capacity &&
                      terminal.storage.sparse_owned_term_capacity ==
-                         initial.storage.sparse_owned_term_capacity &&
+                         initial_storage.sparse_owned_term_capacity &&
                      terminal.storage.sparse_outgoing_term_capacity ==
-                         initial.storage.sparse_outgoing_term_capacity &&
+                         initial_storage.sparse_outgoing_term_capacity &&
                      terminal.storage.sparse_incoming_slot_capacity ==
-                         initial.storage.sparse_incoming_slot_capacity &&
+                         initial_storage.sparse_incoming_slot_capacity &&
                      terminal.storage.sparse_owned_term_token ==
-                         initial.storage.sparse_owned_term_token &&
+                         initial_storage.sparse_owned_term_token &&
                      terminal.storage.sparse_outgoing_term_token ==
-                         initial.storage.sparse_outgoing_term_token &&
+                         initial_storage.sparse_outgoing_term_token &&
                      terminal.storage.sparse_incoming_slot_token ==
-                         initial.storage.sparse_incoming_slot_token &&
+                         initial_storage.sparse_incoming_slot_token &&
                      terminal.storage.allocation_events_after_baseline == 0,
                  "stable storage IDs/capacities and no post-baseline allocation");
 
@@ -1931,13 +2294,37 @@ int main(int argc, char** argv)
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
   int result = 75;
-  if (ranks == 1)
+  int functional_n = 0;
+  const bool functional_request = argc == 3 &&
+      std::string_view{argv[1]} == "--functional-n";
+  if (functional_request)
+  {
+    const std::string_view value{argv[2]};
+    if (value == "3") { functional_n = 3; }
+    else if (value == "6") { functional_n = 6; }
+    else if (value == "12") { functional_n = 12; }
+  }
+  if (argc == 1 && ranks == 1)
   {
     result = RunTuple<SerialSelection>(MPI_COMM_WORLD, rank, ranks);
   }
-  else if (ranks == 2)
+  else if (argc == 1 && ranks == 2)
   {
     result = RunTuple<Rank2Selection>(MPI_COMM_WORLD, rank, ranks);
+  }
+  else if (functional_request && functional_n != 0 && ranks == 1)
+  {
+    result = RunFunctionalTuple<SerialSelection>(
+        MPI_COMM_WORLD, rank, ranks, functional_n);
+  }
+  else if (functional_request && functional_n == 6 && ranks == 2)
+  {
+    result = RunFunctionalTuple<Rank2Selection>(
+        MPI_COMM_WORLD, rank, ranks, functional_n);
+  }
+  else
+  {
+    result = 64;
   }
   MPI_Finalize();
   return result;
