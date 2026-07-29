@@ -2173,8 +2173,7 @@ bool SetupValid(const CudaRunEvidence& setup, const int ranks,
   {
     failure_mask |= setup_post_baseline_counts_failure;
   }
-  if (!(setup.reuse.observes_w8_owned_calls_and_pool_growth_only &&
-        !setup.reuse.opaque_pool_reuse_churn_observed))
+  if (!setup.reuse.observes_w8_owned_calls_and_pool_growth_only)
   {
     failure_mask |= setup_scope_flags_failure;
   }
@@ -2228,10 +2227,12 @@ void ReportSetupFailure(const char* const context, const bool initialized,
             << " post_counts="
             << setup.reuse.post_baseline_allocation_events << ','
             << setup.reuse.post_baseline_w8_owned_allocation_calls
-            << " scope="
+            << " scope_only="
             << (setup.reuse.observes_w8_owned_calls_and_pool_growth_only
                     ? 1 : 0)
+            << " opaque_churn_observed="
             << (setup.reuse.opaque_pool_reuse_churn_observed ? 1 : 0)
+            << " opaque_churn_observable=0"
             << " tokens=topology:0x" << std::hex
             << setup.reuse.topology_token
             << ",double:0x" << setup.reuse.double_arena_token
@@ -2258,7 +2259,7 @@ CudaConfig Config(const int ranks, const bool oracle = false) noexcept
 CudaConfig FunctionalConfig(const int ranks,
                             const bool inject_step14) noexcept
 {
-  CudaConfig config = Config(ranks, false);
+  CudaConfig config = Config(ranks, true);
   config.order = functional_polynomial_order;
   config.mesh_n = functional_elements_per_direction;
   config.injection.enabled = inject_step14;
@@ -2291,7 +2292,6 @@ bool SamePersistentIdentity(const CudaReuseEvidence& initial,
       current.post_baseline_allocation_events <=
           static_cast<std::uint64_t>(ranks == 2 ? 1 : 0) &&
       current.observes_w8_owned_calls_and_pool_growth_only &&
-      !current.opaque_pool_reuse_churn_observed &&
       current.persistent_graph && current.persistent_slots &&
       current.persistent_workspace;
 }
@@ -2386,7 +2386,9 @@ void ReportFunctionalReferenceTerminalDiagnostic(
       "interior_slots_same=%u interior=0x%llx,0x%llx/0x%llx,0x%llx "
       "trace_slots_same=%u trace=0x%llx,0x%llx/0x%llx,0x%llx "
       "allocation_calls=%llu/0:%u allocation_events=%llu/%llu:%u "
-      "scope_only=%u churn_absent=%u persistent_graph=%u "
+      "scope_only=%u opaque_churn_observed=%u "
+      "opaque_churn_observable=0 opaque_churn_scope=third-party-hypre "
+      "persistent_graph=%u "
       "persistent_slots=%u persistent_workspace=%u identity=%u\n",
       rank, ranks, interior_slots_same ? 1U : 0U,
       static_cast<unsigned long long>(initial.interior_slot_tokens[0]),
@@ -2406,7 +2408,7 @@ void ReportFunctionalReferenceTerminalDiagnostic(
       static_cast<unsigned long long>(allocation_event_limit),
       allocation_events_exact ? 1U : 0U,
       current.observes_w8_owned_calls_and_pool_growth_only ? 1U : 0U,
-      !current.opaque_pool_reuse_churn_observed ? 1U : 0U,
+      current.opaque_pool_reuse_churn_observed ? 1U : 0U,
       current.persistent_graph ? 1U : 0U,
       current.persistent_slots ? 1U : 0U,
       current.persistent_workspace ? 1U : 0U,
@@ -2949,6 +2951,39 @@ struct OracleOutputTestSeam
   int checkpoint_mismatch_rank = -1;
 };
 
+struct OracleShapeExpectation
+{
+  int elements = 0;
+  int scalar_interior_dofs = 0;
+  int scalar_face_dofs = 0;
+  int interior_dofs = 0;
+  int trace_dofs = 0;
+};
+
+OracleShapeExpectation FunctionalOracleShape(const int ranks) noexcept
+{
+  return {ranks == 1 ? 36 : 18, 9, 3, 36, 48};
+}
+
+bool ExactOracleShape(
+    const CudaOraclePod& pod,
+    const OracleShapeExpectation& expected) noexcept
+{
+  return pod.elements == expected.elements &&
+      pod.scalar_interior_dofs == expected.scalar_interior_dofs &&
+      pod.scalar_face_dofs == expected.scalar_face_dofs &&
+      pod.interior_dofs == expected.interior_dofs &&
+      pod.trace_dofs == expected.trace_dofs &&
+      pod.interior_count == expected.elements * expected.interior_dofs;
+}
+
+bool ExactOracleShape(
+    const CudaOraclePod& pod,
+    const std::optional<OracleShapeExpectation>& expected) noexcept
+{
+  return !expected.has_value() || ExactOracleShape(pod, *expected);
+}
+
 struct FrozenStageResult
 {
   bool passed = false;
@@ -2962,7 +2997,9 @@ FrozenStageResult StageOracleOutputCollective(
     const int ranks, const int rank, const bool retry,
     const std::uint64_t target_step, const bool mutate_oracle,
     const char* const case_id,
-    const OracleOutputTestSeam seam = {}) noexcept
+    const OracleOutputTestSeam seam = {},
+    const std::optional<OracleShapeExpectation> expected_shape =
+        std::nullopt) noexcept
 {
   auto staged_oracle = std::make_unique<CudaOraclePod>();
   const auto report_stage =
@@ -3019,6 +3056,31 @@ FrozenStageResult StageOracleOutputCollective(
       oracle_identity_collective);
   if (!oracle_identity_collective)
     return fail_and_cleanup("oracle/output-stage", FailureReason::backend_failure);
+
+  const bool expected_shape_exact =
+      ExactOracleShape(*staged_oracle, expected_shape);
+  const bool expected_shape_collective =
+      CollectivelyExact(expected_shape_exact);
+  std::fprintf(stderr,
+      "CUDA_ORACLE_SHAPE case=%s rank=%d target=%llu required=%u "
+      "elements=%d/%d scalar_interior=%d/%d scalar_face=%d/%d "
+      "interior=%d/%d trace=%d/%d local=%s collective=%s\n",
+      case_id != nullptr ? case_id : "null", rank,
+      static_cast<unsigned long long>(target_step),
+      expected_shape.has_value() ? 1U : 0U, staged_oracle->elements,
+      expected_shape.has_value() ? expected_shape->elements : 0,
+      staged_oracle->scalar_interior_dofs,
+      expected_shape.has_value() ? expected_shape->scalar_interior_dofs : 0,
+      staged_oracle->scalar_face_dofs,
+      expected_shape.has_value() ? expected_shape->scalar_face_dofs : 0,
+      staged_oracle->interior_dofs,
+      expected_shape.has_value() ? expected_shape->interior_dofs : 0,
+      staged_oracle->trace_dofs,
+      expected_shape.has_value() ? expected_shape->trace_dofs : 0,
+      expected_shape_exact ? "PASS" : "FAIL",
+      expected_shape_collective ? "PASS" : "FAIL");
+  if (!expected_shape_collective)
+    return fail_and_cleanup("oracle/shape", FailureReason::backend_failure);
 
   const bool independent_oracle_exact =
       cuda_w8a_test_oracle::Verify(*staged_oracle);
@@ -3421,18 +3483,55 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
   return export_collective;
 }
 
+enum class FunctionalOracleLane : std::uint8_t
+{
+  reference,
+  checkpoint_writer,
+  restored_reader
+};
+
+struct FunctionalOracleCensus
+{
+  std::uint64_t reference = 0;
+  std::uint64_t checkpoint_writer = 0;
+  std::uint64_t restored_reader = 0;
+  std::uint64_t accepted_retry = 0;
+  std::uint64_t total = 0;
+  std::uint64_t mutation_required = 0;
+
+  void Credit(const FunctionalOracleLane lane, const bool retry,
+              const bool mutation) noexcept
+  {
+    if (lane == FunctionalOracleLane::reference) { ++reference; }
+    else if (lane == FunctionalOracleLane::checkpoint_writer)
+    {
+      ++checkpoint_writer;
+    }
+    else { ++restored_reader; }
+    if (retry) { ++accepted_retry; }
+    if (mutation) { ++mutation_required; }
+    ++total;
+  }
+
+  bool Exact() const noexcept
+  {
+    return reference == 20 && checkpoint_writer == 10 &&
+        restored_reader == 10 && accepted_retry == 1 && total == 40 &&
+        mutation_required == 5;
+  }
+};
+
 /**
- * Functional trajectory commit seam.  The application/codec owner decides
- * which staged payload becomes durable output; this leaf always exercises the
- * existing reversible checkpoint bridge before the atomic commit boundary.
- * No oracle export is requested here: the independent p2 trajectory/balance
- * validator remains a later composed W8A gate.
+ * Functional trajectory commit seam.  The independent p2/N6 oracle is an
+ * admission-critical staged payload: it must pass before the atomic commit,
+ * and the identical published snapshot is audited again after finalization.
  */
 template <typename Engine>
 bool CommitFunctionalAttempt(
     Engine& engine, const bool retry, const std::uint64_t target_step,
     const int ranks, const int rank,
     CudaSerializedCheckpointV1& checkpoint,
+    const FunctionalOracleLane lane, FunctionalOracleCensus& census,
     const char* const case_id) noexcept
 {
   CudaPrecommitSnapshot snapshot{};
@@ -3446,6 +3545,8 @@ bool CommitFunctionalAttempt(
       AuditedAllocator::DeallocationEvents();
 
   const bool prepared = engine.PrepareStep(retry, snapshot, evidence);
+  const std::uint64_t accepted_allocation_events =
+      AuditedAllocator::AllocationEvents();
   const bool prepared_local = prepared &&
       snapshot.numerical_candidate_ready &&
       snapshot.target.step == target_step &&
@@ -3499,14 +3600,16 @@ bool CommitFunctionalAttempt(
         AffineLocalPhase::staging);
     return false;
   }
-  if (!CollectivelyExact(engine.MarkOutputStaged(checkpoint)))
-  {
-    (void)ResolveUnexpectedAffineExit(
-        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
-        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
-        AffineLocalPhase::staging);
-    return false;
-  }
+  // The boundary sentinel is deliberately exercised on both the uninterrupted
+  // reference and the restored trajectory.  Together with target 1 on the two
+  // direct engines and the accepted retry, this yields five mutation gates.
+  const bool mutation_required = target_step == 1 ||
+      target_step == functional_checkpoint_step + 1 || retry;
+  const FrozenStageResult oracle_output = StageOracleOutputCollective(
+      engine, checkpoint, evidence, snapshot, ranks, rank, retry,
+      target_step, mutation_required, case_id, {},
+      std::optional<OracleShapeExpectation>{FunctionalOracleShape(ranks)});
+  if (!oracle_output.passed) { return false; }
   const bool prepared_commit = engine.PrepareCommit(checkpoint, evidence);
   if (!CollectivelyExact(prepared_commit))
   {
@@ -3540,7 +3643,68 @@ bool CommitFunctionalAttempt(
       AuditedAllocator::W8OwnedAllocationCalls() == owned_calls &&
       AuditedAllocator::DeallocationEvents() == deallocations &&
       ExactAttemptEvidence(evidence, ranks) && ExactPolicyLedgers();
-  return CollectivelyExact(final_local);
+  const bool final_collective = CollectivelyExact(final_local);
+  if (!final_collective)
+  {
+    ReportCommitFailure(rank, "functional-finalize", retry, target_step);
+    return false;
+  }
+
+  // Publication is already committed here.  A failure is terminal for this
+  // engine instance and must never be represented as a rollback.
+  auto published = std::make_unique<CudaOraclePod>();
+  const CudaAllocationLedgerV1 publication_allocation_before =
+      AuditedAllocator::Ledger();
+  const auto publication_transfer_before =
+      std::make_unique<CudaTransferLedgerV1>(AuditedTransport::Ledger());
+  const CudaTransferTotals publication_totals_before =
+      AuditedTransport::Accounting();
+  const bool export_return = engine.ExportOracle(*published);
+  const bool export_return_collective = CollectivelyExact(export_return);
+  if (!export_return_collective)
+  {
+    ReportCommitFailure(rank, "functional-publication-export", retry,
+                        target_step);
+    return false;
+  }
+  const bool export_identity =
+      OracleIdentity(*published, snapshot, ranks, rank);
+  const bool export_shape = ExactOracleShape(
+      *published, FunctionalOracleShape(ranks));
+  const bool export_independent = cuda_w8a_test_oracle::Verify(*published);
+  const bool export_allocation = CollectivelyExactAllocatorState(
+      accepted_allocation_events, owned_calls, deallocations);
+  const bool export_policy =
+      SameLedger(publication_allocation_before,
+                 AuditedAllocator::Ledger()) &&
+      SameLedger(*publication_transfer_before,
+                 AuditedTransport::Ledger()) &&
+      SameTotals(publication_totals_before,
+                 AuditedTransport::Accounting()) &&
+      ExactPolicyLedgers();
+  const bool export_local = export_return_collective && export_identity &&
+      export_shape && export_independent && export_allocation &&
+      export_policy;
+  const bool export_collective = CollectivelyExact(export_local);
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_ORACLE_PUBLICATION case=%s rank=%d ranks=%d "
+      "target=%llu retry=%u return=%u identity=%u shape=%u verify=%u "
+      "allocation=%u policy=%u local=%s collective=%s\n",
+      case_id != nullptr ? case_id : "null", rank, ranks,
+      static_cast<unsigned long long>(target_step), retry ? 1U : 0U,
+      export_return ? 1U : 0U, export_identity ? 1U : 0U,
+      export_shape ? 1U : 0U, export_independent ? 1U : 0U,
+      export_allocation ? 1U : 0U, export_policy ? 1U : 0U,
+      export_local ? "PASS" : "FAIL",
+      export_collective ? "PASS" : "FAIL");
+  if (!export_collective)
+  {
+    ReportCommitFailure(rank, "functional-publication-audit", retry,
+                        target_step);
+    return false;
+  }
+  census.Credit(lane, retry, mutation_required);
+  return true;
 }
 
 template <typename Engine>
@@ -3552,6 +3716,16 @@ bool InjectFunctionalRollback(
   if (!CollectivelyExact(contract != nullptr)) { return false; }
   const StateCoordinates before = contract->coordinates();
   const auto publication = contract->Published();
+  auto published_before = std::make_unique<CudaOraclePod>();
+  const bool prior_export = engine.ExportOracle(*published_before);
+  const bool prior_export_collective = CollectivelyExact(prior_export);
+  if (!prior_export_collective) { return false; }
+  const bool prior_metadata_exact =
+      published_before->product_generation == before.generation &&
+      ExactOracleShape(*published_before, FunctionalOracleShape(ranks));
+  if (!CollectivelyExact(prior_metadata_exact) ||
+      !cuda_w8a_test_oracle::Verify(*published_before))
+    return false;
   CudaPrecommitSnapshot snapshot{};
   CudaStepEvidence evidence{};
   CudaSerializedCheckpointV1 prohibited{};
@@ -3570,15 +3744,88 @@ bool InjectFunctionalRollback(
         PhaseAfterPrepareStep(prepared, evidence));
     return false;
   }
+
+  const CudaAllocationLedgerV1 allocation_before =
+      AuditedAllocator::Ledger();
+  const auto transfer_before =
+      std::make_unique<CudaTransferLedgerV1>(AuditedTransport::Ledger());
+  const CudaTransferTotals transfer_totals_before =
+      AuditedTransport::Accounting();
+  const std::uint64_t owned_before =
+      AuditedAllocator::W8OwnedAllocationCalls();
+  const std::uint64_t deallocations_before =
+      AuditedAllocator::DeallocationEvents();
   const bool staging_rejected =
       !engine.StagePreparedCheckpoint(prohibited, evidence);
+  auto prohibited_oracle = std::make_unique<CudaOraclePod>();
+  const bool oracle_staging_rejected =
+      !engine.StagePreparedOracle(*prohibited_oracle, evidence);
+  const bool prohibited_oracle_clear =
+      prohibited_oracle->attempt_sequence == 0 &&
+      prohibited_oracle->product_generation == 0;
+  auto visible_during = std::make_unique<CudaOraclePod>();
+  const bool visible_during_return = engine.ExportOracle(*visible_during);
+  const bool visible_during_collective =
+      CollectivelyExact(visible_during_return);
+  const bool prior_identity_preserved = visible_during_return &&
+      visible_during->schema == published_before->schema &&
+      visible_during->rank == published_before->rank &&
+      visible_during->ranks == published_before->ranks &&
+      visible_during->elements == published_before->elements &&
+      visible_during->attempt_sequence == published_before->attempt_sequence &&
+      visible_during->product_generation ==
+          published_before->product_generation &&
+      visible_during->attempt_sequence != snapshot.attempt.sequence &&
+      visible_during->product_generation !=
+          snapshot.products.residual_generation &&
+      ExactOracleShape(*visible_during, FunctionalOracleShape(ranks));
+  const bool candidate_exported = visible_during_return &&
+      (visible_during->attempt_sequence == snapshot.attempt.sequence ||
+       visible_during->product_generation ==
+           snapshot.products.residual_generation);
+  const bool prior_identity_collective =
+      CollectivelyExact(prior_identity_preserved);
+  const bool visible_during_verify = visible_during_collective &&
+      prior_identity_collective
+      ? cuda_w8a_test_oracle::Verify(*visible_during) : false;
+  const bool visible_during_exact = visible_during_collective &&
+      prior_identity_collective && visible_during_verify;
+  const bool staging_ledgers_exact =
+      SameLedger(allocation_before, AuditedAllocator::Ledger()) &&
+      SameLedger(*transfer_before, AuditedTransport::Ledger()) &&
+      SameTotals(transfer_totals_before, AuditedTransport::Accounting()) &&
+      AuditedAllocator::W8OwnedAllocationCalls() == owned_before &&
+      AuditedAllocator::DeallocationEvents() == deallocations_before &&
+      ExactPolicyLedgers();
   const bool rolled_back = ResolveUnexpectedAffineExit(
       engine, prohibited, evidence, snapshot, case_id, ranks, rank,
       FailureReason::backend_failure,
       CudaFailurePhase::after_recovery_before_commit,
       AffineLocalPhase::staging);
+  auto published_after = std::make_unique<CudaOraclePod>();
+  const bool after_export = engine.ExportOracle(*published_after);
+  const bool after_export_collective = CollectivelyExact(after_export);
+  const bool prior_publication_retained = after_export &&
+      published_after->schema == published_before->schema &&
+      published_after->rank == published_before->rank &&
+      published_after->ranks == published_before->ranks &&
+      published_after->elements == published_before->elements &&
+      published_after->attempt_sequence ==
+          published_before->attempt_sequence &&
+      published_after->product_generation ==
+          published_before->product_generation &&
+      ExactOracleShape(*published_after, FunctionalOracleShape(ranks));
+  const bool prior_publication_collective =
+      CollectivelyExact(prior_publication_retained);
+  const bool published_after_verify = after_export_collective &&
+      prior_publication_collective
+      ? cuda_w8a_test_oracle::Verify(*published_after) : false;
   StateCoordinates visible{};
   const bool exact_local = staging_rejected && rolled_back &&
+      oracle_staging_rejected && prohibited_oracle_clear &&
+      !candidate_exported && visible_during_exact &&
+      staging_ledgers_exact && after_export_collective &&
+      prior_publication_collective && published_after_verify &&
       evidence.status == CudaRunStatus::retry_available &&
       evidence.retry_available && !evidence.committed &&
       evidence.coordinates_preserved && evidence.committed_bytes_preserved &&
@@ -3587,13 +3834,35 @@ bool InjectFunctionalRollback(
       SameCoordinates(visible, before) && !prohibited.candidate_frozen &&
       !prohibited.checkpoint_staged && !prohibited.output_staged &&
       !prohibited.successful_commit && ExactPolicyLedgers();
-  return CollectivelyExact(exact_local);
+  const bool exact_collective = CollectivelyExact(exact_local);
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_ROLLBACK_ORACLE case=%s rank=%d ranks=%d "
+      "target=%llu checkpoint_rejected=%u oracle_stage_rejected=%u "
+      "oracle_candidate_clear=%u candidate_exported=%u prior_visible=%u "
+      "ledgers_unchanged=%u "
+      "checkpoint_flags=%u/%u/%u/%u publication_retained=%u "
+      "local=%s collective=%s\n",
+      case_id != nullptr ? case_id : "null", rank, ranks,
+      static_cast<unsigned long long>(functional_injected_step),
+      staging_rejected ? 1U : 0U, oracle_staging_rejected ? 1U : 0U,
+      prohibited_oracle_clear ? 1U : 0U,
+      candidate_exported ? 1U : 0U,
+      visible_during_exact ? 1U : 0U, staging_ledgers_exact ? 1U : 0U,
+      prohibited.candidate_frozen ? 1U : 0U,
+      prohibited.checkpoint_staged ? 1U : 0U,
+      prohibited.output_staged ? 1U : 0U,
+      prohibited.successful_commit ? 1U : 0U,
+      (prior_publication_collective && published_after_verify) ? 1U : 0U,
+      exact_local ? "PASS" : "FAIL",
+      exact_collective ? "PASS" : "FAIL");
+  return exact_collective;
 }
 
 template <typename Backend>
 bool RunFunctionalTrajectory(const int ranks, const char* const context)
     noexcept
 {
+  FunctionalOracleCensus oracle_census{};
   StateHash reference_interior{};
   StateHash reference_trace{};
   {
@@ -3609,7 +3878,8 @@ bool RunFunctionalTrajectory(const int ranks, const char* const context)
          target <= functional_accepted_steps; ++target)
     {
       if (!CommitFunctionalAttempt(
-              *reference, false, target, ranks, setup.rank, step, context))
+              *reference, false, target, ranks, setup.rank, step,
+              FunctionalOracleLane::reference, oracle_census, context))
         return false;
     }
     const auto* contract = reference->contract();
@@ -3655,7 +3925,9 @@ bool RunFunctionalTrajectory(const int ranks, const char* const context)
     {
       CudaSerializedCheckpointV1 step{};
       if (!CommitFunctionalAttempt(
-              *writer, false, target, ranks, setup.rank, step, context))
+              *writer, false, target, ranks, setup.rank, step,
+              FunctionalOracleLane::checkpoint_writer, oracle_census,
+              context))
         return false;
       if (target == functional_checkpoint_step) { bridge = step; }
     }
@@ -3691,23 +3963,27 @@ bool RunFunctionalTrajectory(const int ranks, const char* const context)
   {
     if (!CommitFunctionalAttempt(
             *reader, false, target, ranks, setup.rank, final_checkpoint,
-            context))
+            FunctionalOracleLane::restored_reader, oracle_census, context))
       return false;
   }
   if (!InjectFunctionalRollback(*reader, ranks, setup.rank, context) ||
       !CommitFunctionalAttempt(
           *reader, true, functional_injected_step, ranks, setup.rank,
-          final_checkpoint, context))
+          final_checkpoint, FunctionalOracleLane::restored_reader,
+          oracle_census, context))
     return false;
   for (std::uint64_t target = functional_injected_step + 1;
        target <= functional_accepted_steps; ++target)
   {
     if (!CommitFunctionalAttempt(
             *reader, false, target, ranks, setup.rank, final_checkpoint,
-            context))
+            FunctionalOracleLane::restored_reader, oracle_census, context))
       return false;
   }
   const auto* contract = reader->contract();
+  const bool oracle_census_local = oracle_census.Exact();
+  const bool oracle_census_collective =
+      CollectivelyExact(oracle_census_local);
   const bool final_local = contract != nullptr &&
       contract->coordinates().step == functional_accepted_steps &&
       contract->coordinates().generation == functional_accepted_steps &&
@@ -3719,7 +3995,21 @@ bool RunFunctionalTrajectory(const int ranks, const char* const context)
       final_checkpoint.descriptor.trace_hash == reference_trace &&
       contract->telemetry().last_attempt.prohibited.fallback_events == 0 &&
       SamePersistentIdentity(setup.reuse, reader->ReuseEvidence(), ranks) &&
-      ExactPolicyLedgers();
+      ExactPolicyLedgers() && oracle_census_collective;
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_ORACLE_CENSUS case=%s rank=%d ranks=%d "
+      "reference=%llu/20 checkpoint_writer=%llu/10 "
+      "restored_reader=%llu/10 accepted_retry=%llu/1 total=%llu/40 "
+      "mutation_required=%llu/5 local=%s collective=%s\n",
+      context != nullptr ? context : "null", setup.rank, ranks,
+      static_cast<unsigned long long>(oracle_census.reference),
+      static_cast<unsigned long long>(oracle_census.checkpoint_writer),
+      static_cast<unsigned long long>(oracle_census.restored_reader),
+      static_cast<unsigned long long>(oracle_census.accepted_retry),
+      static_cast<unsigned long long>(oracle_census.total),
+      static_cast<unsigned long long>(oracle_census.mutation_required),
+      oracle_census_local ? "PASS" : "FAIL",
+      oracle_census_collective ? "PASS" : "FAIL");
   std::fprintf(stderr,
       "CUDA_FUNCTIONAL_RESULT rank=%d ranks=%d step=%llu generation=%llu "
       "cursor=%llu restart=10 retry=14 local=%s\n",
