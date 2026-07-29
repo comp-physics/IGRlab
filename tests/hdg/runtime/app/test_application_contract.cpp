@@ -54,6 +54,9 @@ ApplicationOptionsView Smoke(const std::string_view backend)
 {
   ApplicationOptionsView options;
   options.backend_id = backend;
+  options.device_id = backend == CudaRank1OneGpuBackendTag::id ||
+          backend == CudaRank2OneGpuHostStagedBackendTag::id
+      ? 0 : -1;
   return options;
 }
 

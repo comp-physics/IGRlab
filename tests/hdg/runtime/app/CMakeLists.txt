@@ -1,6 +1,9 @@
 foreach(_dg_igr_hdg_app_test IN ITEMS
         application_contract
-        checkpoint_codec)
+        checkpoint_codec
+        command_line
+        durable_io
+        scientific_contract)
   set(_dg_igr_hdg_app_target
       "dg_igr_hdg_runtime_app_${_dg_igr_hdg_app_test}_test")
   add_executable("${_dg_igr_hdg_app_target}"
@@ -23,3 +26,12 @@ foreach(_dg_igr_hdg_app_test IN ITEMS
       LABELS "hdg;runtime;app;contract;cpu"
       TIMEOUT 30)
 endforeach()
+
+add_test(NAME dg_igr_hdg_runtime_app_cli_process_cpu
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
+    "-DHDG_RUNTIME_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cli-process-output"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_process.cmake")
+set_tests_properties(dg_igr_hdg_runtime_app_cli_process_cpu PROPERTIES
+  LABELS "hdg;runtime;app;cli;cpu"
+  TIMEOUT 30)

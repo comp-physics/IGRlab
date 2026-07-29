@@ -134,7 +134,8 @@ public:
     Bytes(hash.bytes.data(), hash.bytes.size());
   }
 
-  bool Identity(const StableIdentity& identity)
+  template <std::size_t Capacity>
+  bool Identity(const StableId<Capacity>& identity)
   {
     if (!identity.valid() || identity.empty() ||
         identity.size() > std::numeric_limits<std::uint16_t>::max())
@@ -208,15 +209,17 @@ public:
     return Bytes(hash.bytes.data(), hash.bytes.size());
   }
 
-  bool Identity(StableIdentity& identity) noexcept
+  template <std::size_t Capacity>
+  bool Identity(StableId<Capacity>& identity) noexcept
   {
     std::uint16_t length = 0;
     if (!UnsignedLittleEndian(length) || length == 0 || !Available(length))
     {
       return false;
     }
-    const StableIdentity candidate = StableIdentity::Copy(std::string_view{
-        reinterpret_cast<const char*>(data_ + offset_), length});
+    const StableId<Capacity> candidate = StableId<Capacity>::Copy(
+        std::string_view{reinterpret_cast<const char*>(data_ + offset_),
+                         length});
     if (!candidate.valid() || candidate.empty()) { return false; }
     offset_ += length;
     identity = candidate;
@@ -403,7 +406,7 @@ struct ArtifactConfig
   struct Path
   {
     bool present = false;
-    StableIdentity identity{};
+    StableId<512> identity{};
   };
   Path output_directory{};
   Path evidence_directory{};
@@ -1180,6 +1183,57 @@ bool ValidCheckpointRuntimeIdentityV1(
       return identity.physical_gpu_uuid.view() != no_physical_gpu_uuid_v1;
   }
   return false;
+}
+
+std::optional<CapturedCheckpointV1> CaptureCheckpointPiecesV1(
+    const CheckpointDescriptor* rank_descriptors,
+    const std::size_t rank_count,
+    const ValidatedApplicationConfig& config,
+    const CheckpointRuntimeIdentityV1& runtime_identity) noexcept
+{
+  if (rank_descriptors == nullptr || rank_count == 0 ||
+      rank_count > application_checkpoint_max_rank_count_v1 ||
+      rank_count != config.deferred_runtime().required_mpi_rank_count ||
+      config.run_role() != ApplicationRunRoleV1::split_writer ||
+      !ValidCheckpointRuntimeIdentityV1(config, runtime_identity))
+  {
+    return std::nullopt;
+  }
+  std::array<CheckpointDescriptor, application_checkpoint_max_rank_count_v1>
+      descriptors{};
+  for (std::size_t rank = 0; rank < rank_count; ++rank)
+  {
+    const CheckpointDescriptor& descriptor = rank_descriptors[rank];
+    if (!codec_detail::DescriptorStructurallyValid(descriptor, config) ||
+        descriptor.tuple != config.tuple() ||
+        descriptor.rank_count != rank_count ||
+        descriptor.polynomial_order != config.polynomial_order() ||
+        descriptor.coordinates.step != config.scenario_checkpoint_step() ||
+        descriptor.coordinates.generation !=
+            config.scenario_checkpoint_step() ||
+        descriptor.coordinates.cursor != config.scenario_checkpoint_step() ||
+        !ScenarioCheckpointTimeMatchesV1(descriptor.coordinates.time, config))
+    {
+      return std::nullopt;
+    }
+    if (rank != 0)
+    {
+      CheckpointDescriptor common = descriptor;
+      CheckpointDescriptor first = descriptors[0];
+      common.interior_hash = {};
+      common.trace_hash = {};
+      first.interior_hash = {};
+      first.trace_hash = {};
+      if (!::dg::hdg::runtime::detail::SameCheckpoint(first, common))
+      {
+        return std::nullopt;
+      }
+    }
+    descriptors[rank] = descriptor;
+  }
+  return CapturedCheckpointV1(
+      descriptors, static_cast<std::uint32_t>(rank_count), config,
+      runtime_identity);
 }
 
 bool ScenarioCheckpointTimeMatchesV1(
