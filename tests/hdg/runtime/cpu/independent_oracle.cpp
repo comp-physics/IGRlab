@@ -21,9 +21,6 @@ namespace
 
 constexpr int dim = 2;
 constexpr int components = 4;
-constexpr int order = 1;
-constexpr int mesh_n = 3;
-constexpr int qa = 11;
 constexpr double gamma_value = 1.4;
 constexpr double tau = 2.5;
 constexpr double dt = 0.05;
@@ -363,14 +360,23 @@ bool Assemble(mfem::ParMesh& mesh,
               const mfem::ParGridFunction& old_interior,
               const mfem::ParGridFunction& current_interior,
               const mfem::ParGridFunction& current_trace,
+              const int assembly_quadrature_order,
               System& system)
 {
   system = {};
   system.elements = mesh.GetNE();
   const mfem::FiniteElement* first = interior_space.GetFE(0);
-  if (!first || first->GetDof() != 4) { return false; }
+  if (!first || first->GetDof() <= 0) { return false; }
+  mfem::Array<int> first_faces, first_orientations;
+  mesh.GetElementEdges(0, first_faces, first_orientations);
+  if (first_faces.Size() != 4) { return false; }
+  const mfem::FiniteElement* first_trace =
+      trace_space.GetFaceElement(first_faces[0]);
+  if (!first_trace || first_trace->GetDof() <= 0) { return false; }
+  const int scalar_interior_dofs = first->GetDof();
+  const int scalar_trace_dofs = first_trace->GetDof();
   system.ni = first->GetDof() * components;
-  system.nt = 4 * 2 * components;
+  system.nt = first_faces.Size() * scalar_trace_dofs * components;
   const std::size_t e = static_cast<std::size_t>(system.elements);
   const std::size_t ni = static_cast<std::size_t>(system.ni);
   const std::size_t nt = static_cast<std::size_t>(system.nt);
@@ -388,10 +394,16 @@ bool Assemble(mfem::ParMesh& mesh,
         mesh.GetElementTransformation(element);
     mfem::Array<int> interior_vdofs;
     interior_space.GetElementVDofs(element, interior_vdofs);
+    if (!finite_element || !transformation ||
+        finite_element->GetDof() != scalar_interior_dofs ||
+        interior_vdofs.Size() != system.ni)
+    {
+      return false;
+    }
     const mfem::IntegrationRule& rule = mfem::IntRules.Get(
-        finite_element->GetGeomType(), qa);
-    mfem::Vector shape(4), physical(dim);
-    mfem::DenseMatrix derivative(4, dim);
+        finite_element->GetGeomType(), assembly_quadrature_order);
+    mfem::Vector shape(scalar_interior_dofs), physical(dim);
+    mfem::DenseMatrix derivative(scalar_interior_dofs, dim);
     for (int q = 0; q < rule.GetNPoints(); ++q)
     {
       const mfem::IntegrationPoint& point = rule.IntPoint(q);
@@ -411,22 +423,22 @@ bool Assemble(mfem::ParMesh& mesh,
         return false;
       }
       const double weight = point.weight * transformation->Weight();
-      for (int row = 0; row < 4; ++row)
+      for (int row = 0; row < scalar_interior_dofs; ++row)
       {
         for (int rc = 0; rc < components; ++rc)
         {
-          const int lr = ByNodes(row, 4, rc);
+          const int lr = ByNodes(row, scalar_interior_dofs, rc);
           system.ri[static_cast<std::size_t>(element) * ni + lr] += weight *
               (shape[row] * (u[rc] - uold[rc]) / dt -
                derivative(row, 0) * fx[rc] - derivative(row, 1) * fy[rc] -
                shape[row] * source[rc]);
         }
-        for (int column = 0; column < 4; ++column)
+        for (int column = 0; column < scalar_interior_dofs; ++column)
           for (int rc = 0; rc < components; ++rc)
             for (int cc = 0; cc < components; ++cc)
             {
-              const int lr = ByNodes(row, 4, rc);
-              const int lc = ByNodes(column, 4, cc);
+              const int lr = ByNodes(row, scalar_interior_dofs, rc);
+              const int lc = ByNodes(column, scalar_interior_dofs, cc);
               const double mass = rc == cc
                   ? shape[row] * shape[column] / dt : 0.0;
               const double volume =
@@ -450,13 +462,21 @@ bool Assemble(mfem::ParMesh& mesh,
       const mfem::FiniteElement* trace_element = trace_space.GetFaceElement(face);
       mfem::Array<int> trace_vdofs;
       trace_space.GetFaceVDofs(face, trace_vdofs);
+      if (!transformations || !transformations->Face || !trace_element ||
+          trace_element->GetDof() != scalar_trace_dofs ||
+          trace_vdofs.Size() != scalar_trace_dofs * components ||
+          trace_offset + trace_vdofs.Size() > system.nt)
+      {
+        return false;
+      }
       std::copy(trace_vdofs.begin(), trace_vdofs.end(),
                 system.signed_trace.begin() +
                     static_cast<std::size_t>(element) * nt + trace_offset);
       const bool first_side = transformations->Elem1No == element;
       const mfem::IntegrationRule& face_rule =
-          mfem::IntRules.Get(trace_element->GetGeomType(), qa);
-      mfem::Vector ishape(4), tshape(2);
+          mfem::IntRules.Get(trace_element->GetGeomType(),
+                             assembly_quadrature_order);
+      mfem::Vector ishape(scalar_interior_dofs), tshape(scalar_trace_dofs);
       for (int q = 0; q < face_rule.GetNPoints(); ++q)
       {
         const mfem::IntegrationPoint& point = face_rule.IntPoint(q);
@@ -485,57 +505,63 @@ bool Assemble(mfem::ParMesh& mesh,
           fhat[c] += tau * (ui[c] - lambda[c]);
         }
         const double weight = point.weight * transformations->Face->Weight();
-        for (int row = 0; row < 4; ++row)
+        for (int row = 0; row < scalar_interior_dofs; ++row)
           for (int c = 0; c < components; ++c)
           {
             system.ri[static_cast<std::size_t>(element) * ni +
-                      ByNodes(row, 4, c)] += weight * ishape[row] * fhat[c];
+                      ByNodes(row, scalar_interior_dofs, c)] +=
+                weight * ishape[row] * fhat[c];
           }
-        for (int row = 0; row < 2; ++row)
+        for (int row = 0; row < scalar_trace_dofs; ++row)
           for (int c = 0; c < components; ++c)
           {
             system.rt[static_cast<std::size_t>(element) * nt + trace_offset +
-                      ByNodes(row, 2, c)] += weight * tshape[row] * fhat[c];
+                      ByNodes(row, scalar_trace_dofs, c)] +=
+                weight * tshape[row] * fhat[c];
           }
-        for (int row = 0; row < 4; ++row)
-          for (int column = 0; column < 4; ++column)
+        for (int row = 0; row < scalar_interior_dofs; ++row)
+          for (int column = 0; column < scalar_interior_dofs; ++column)
             for (int c = 0; c < components; ++c)
             {
-              const int lr = ByNodes(row, 4, c);
-              const int lc = ByNodes(column, 4, c);
+              const int lr = ByNodes(row, scalar_interior_dofs, c);
+              const int lc = ByNodes(column, scalar_interior_dofs, c);
               system.a[static_cast<std::size_t>(element) * ni * ni +
                        static_cast<std::size_t>(lr) * ni + lc] +=
                   weight * ishape[row] * tau * ishape[column];
             }
-        for (int row = 0; row < 4; ++row)
-          for (int column = 0; column < 2; ++column)
+        for (int row = 0; row < scalar_interior_dofs; ++row)
+          for (int column = 0; column < scalar_trace_dofs; ++column)
             for (int rc = 0; rc < components; ++rc)
               for (int cc = 0; cc < components; ++cc)
               {
-                const int lr = ByNodes(row, 4, rc);
-                const int lc = trace_offset + ByNodes(column, 2, cc);
+                const int lr = ByNodes(row, scalar_interior_dofs, rc);
+                const int lc = trace_offset +
+                    ByNodes(column, scalar_trace_dofs, cc);
                 system.b[static_cast<std::size_t>(element) * ni * nt +
                          static_cast<std::size_t>(lr) * nt + lc] +=
                     weight * ishape[row] * tshape[column] *
                     (jl[rc][cc] - (rc == cc ? tau : 0.0));
               }
-        for (int row = 0; row < 2; ++row)
-          for (int column = 0; column < 4; ++column)
+        for (int row = 0; row < scalar_trace_dofs; ++row)
+          for (int column = 0; column < scalar_interior_dofs; ++column)
             for (int c = 0; c < components; ++c)
             {
-              const int lr = trace_offset + ByNodes(row, 2, c);
-              const int lc = ByNodes(column, 4, c);
+              const int lr = trace_offset +
+                  ByNodes(row, scalar_trace_dofs, c);
+              const int lc = ByNodes(column, scalar_interior_dofs, c);
               system.c[static_cast<std::size_t>(element) * nt * ni +
                        static_cast<std::size_t>(lr) * ni + lc] +=
                   weight * tshape[row] * tau * ishape[column];
             }
-        for (int row = 0; row < 2; ++row)
-          for (int column = 0; column < 2; ++column)
+        for (int row = 0; row < scalar_trace_dofs; ++row)
+          for (int column = 0; column < scalar_trace_dofs; ++column)
             for (int rc = 0; rc < components; ++rc)
               for (int cc = 0; cc < components; ++cc)
               {
-                const int lr = trace_offset + ByNodes(row, 2, rc);
-                const int lc = trace_offset + ByNodes(column, 2, cc);
+                const int lr = trace_offset +
+                    ByNodes(row, scalar_trace_dofs, rc);
+                const int lc = trace_offset +
+                    ByNodes(column, scalar_trace_dofs, cc);
                 system.d[static_cast<std::size_t>(element) * nt * nt +
                          static_cast<std::size_t>(lr) * nt + lc] +=
                     weight * tshape[row] * tshape[column] *
@@ -544,6 +570,7 @@ bool Assemble(mfem::ParMesh& mesh,
       }
       trace_offset += trace_vdofs.Size();
     }
+    if (trace_offset != system.nt) { return false; }
   }
   system.f.resize(system.ri.size());
   system.g.resize(system.rt.size());
@@ -753,7 +780,8 @@ bool Admissible(mfem::ParMesh& mesh,
                 mfem::ParFiniteElementSpace& interior_space,
                 mfem::ParFiniteElementSpace& trace_space,
                 const mfem::ParGridFunction& interior,
-                const mfem::ParGridFunction& trace)
+                const mfem::ParGridFunction& trace,
+                const int assembly_quadrature_order)
 {
   bool local_ok = true;
   for (int element = 0; element < mesh.GetNE() && local_ok; ++element)
@@ -762,7 +790,8 @@ bool Admissible(mfem::ParMesh& mesh,
     mfem::Array<int> vdofs;
     interior_space.GetElementVDofs(element, vdofs);
     const mfem::IntegrationRule& rule =
-        mfem::IntRules.Get(finite_element->GetGeomType(), qa);
+        mfem::IntRules.Get(finite_element->GetGeomType(),
+                           assembly_quadrature_order);
     mfem::Vector shape(finite_element->GetDof());
     for (int q = 0; q < rule.GetNPoints() && local_ok; ++q)
     {
@@ -785,7 +814,8 @@ bool Admissible(mfem::ParMesh& mesh,
     mfem::Array<int> vdofs;
     trace_space.GetFaceVDofs(face, vdofs);
     const mfem::IntegrationRule& rule =
-        mfem::IntRules.Get(finite_element->GetGeomType(), qa);
+        mfem::IntRules.Get(finite_element->GetGeomType(),
+                           assembly_quadrature_order);
     mfem::Vector shape(finite_element->GetDof());
     for (int q = 0; q < rule.GetNPoints() && local_ok; ++q)
     {
@@ -811,16 +841,31 @@ bool Admissible(mfem::ParMesh& mesh,
 } // namespace
 
 bool RunIndependentFirstStep(MPI_Comm communicator,
+                             const IndependentOracleConfig& config,
                              IndependentOracleResult& result)
 {
   result = {};
   int ranks = 0;
   MPI_Comm_size(communicator, &ranks);
-  if (ranks != 1 && ranks != 2) { return false; }
+  const bool functional_mesh = config.elements_per_direction == 3 ||
+      config.elements_per_direction == 6 ||
+      config.elements_per_direction == 12;
+  const bool smoke = config.polynomial_order == 1 &&
+      config.elements_per_direction == 3 &&
+      config.assembly_quadrature_order == 11;
+  const bool functional = config.polynomial_order == 2 &&
+      functional_mesh && config.assembly_quadrature_order == 14;
+  if ((ranks != 1 && ranks != 2) || (!smoke && !functional) ||
+      (ranks == 2 && config.polynomial_order == 2 &&
+       config.elements_per_direction != 6))
+  {
+    return false;
+  }
   try
   {
     mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
-        mesh_n, mesh_n, mfem::Element::QUADRILATERAL, false,
+        config.elements_per_direction, config.elements_per_direction,
+        mfem::Element::QUADRILATERAL, false,
         1.0, 1.0, false);
     std::vector<mfem::Vector> translations(2, mfem::Vector(dim));
     translations[0][0] = 1.0;
@@ -830,10 +875,10 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
     std::vector<int> partition = Partition(periodic, ranks);
     mfem::ParMesh mesh(communicator, periodic, partition.data());
     mfem::L2_FECollection interior_collection(
-        order, dim, mfem::BasisType::GaussLegendre,
+        config.polynomial_order, dim, mfem::BasisType::GaussLegendre,
         mfem::FiniteElement::VALUE);
     mfem::DG_Interface_FECollection trace_collection(
-        order, dim, mfem::FiniteElement::VALUE,
+        config.polynomial_order, dim, mfem::FiniteElement::VALUE,
         mfem::BasisType::GaussLegendre);
     mfem::ParFiniteElementSpace interior_space(
         &mesh, &interior_collection, components, mfem::Ordering::byNODES);
@@ -845,7 +890,9 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
 
     mfem::ParGridFunction old_interior(&interior_space);
     mfem::ParGridFunction current_interior(&interior_space);
+    mfem::ParGridFunction exact_trace(&trace_space);
     mfem::ParGridFunction current_trace(&trace_space);
+    mfem::Vector exact_true_trace(trace_space.GetTrueVSize());
     mfem::Vector current_true_trace(trace_space.GetTrueVSize());
     auto exact = [](const mfem::Vector& point, mfem::Vector& values)
     {
@@ -864,15 +911,23 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
         components, perturbed);
     old_interior.ProjectCoefficient(exact_coefficient);
     current_interior.ProjectCoefficient(perturbed_coefficient);
-    if (!ProjectTrace(mesh, trace_space, current_trace,
+    if (!ProjectTrace(mesh, trace_space, exact_trace,
+                      exact_true_trace, false) ||
+        !ProjectTrace(mesh, trace_space, current_trace,
                       current_true_trace, true))
     {
       return false;
     }
+    result.initial_interior.assign(
+        old_interior.HostRead(), old_interior.HostRead() + old_interior.Size());
+    result.initial_true_trace.assign(
+        exact_true_trace.HostRead(),
+        exact_true_trace.HostRead() + exact_true_trace.Size());
 
     System system;
     if (!Assemble(mesh, interior_space, trace_space, old_interior,
-                  current_interior, current_trace, system))
+                  current_interior, current_trace,
+                  config.assembly_quadrature_order, system))
     {
       return false;
     }
@@ -1126,13 +1181,15 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
         }
         candidate_trace.Distribute(candidate_true);
         if (!Admissible(mesh, interior_space, trace_space,
-                        candidate_interior, candidate_trace))
+                        candidate_interior, candidate_trace,
+                        config.assembly_quadrature_order))
         {
           continue;
         }
         System candidate_system;
         if (!Assemble(mesh, interior_space, trace_space, old_interior,
-                      candidate_interior, candidate_trace, candidate_system))
+                      candidate_interior, candidate_trace,
+                      config.assembly_quadrature_order, candidate_system))
         {
           return false;
         }
@@ -1173,7 +1230,8 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
 
     result.final_residual = residual;
     result.admissible = Admissible(mesh, interior_space, trace_space,
-                                   current_interior, current_trace);
+                                   current_interior, current_trace,
+                                   config.assembly_quadrature_order);
     result.interior.assign(current_interior.HostRead(),
                            current_interior.HostRead() +
                                current_interior.Size());
@@ -1210,6 +1268,13 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
     result.passed = false;
     return false;
   }
+}
+
+bool RunIndependentFirstStep(MPI_Comm communicator,
+                             IndependentOracleResult& result)
+{
+  return RunIndependentFirstStep(
+      communicator, IndependentOracleConfig{}, result);
 }
 
 } // namespace dg_igr_hdg_cpu_test

@@ -59,10 +59,23 @@ add_test(
     $<TARGET_FILE:dg_igr_hdg_runtime_cuda_w8a_leaf>
     --token-negatives
     ${MPIEXEC_POSTFLAGS})
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_w8a_functional_rank1
+  COMMAND dg_igr_hdg_runtime_cuda_w8a_leaf --functional)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_w8a_functional_rank2_host_staged
+  COMMAND
+    "${MPIEXEC_EXECUTABLE}"
+    "${MPIEXEC_NUMPROC_FLAG}" 2
+    ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_hdg_runtime_cuda_w8a_leaf>
+    --functional
+    ${MPIEXEC_POSTFLAGS})
 
 set_tests_properties(
   dg_igr_hdg_runtime_cuda_w8a_rank1
   dg_igr_hdg_runtime_cuda_w8a_rank1_token_negatives
+  dg_igr_hdg_runtime_cuda_w8a_functional_rank1
   PROPERTIES
     PROCESSORS 1
     RESOURCE_LOCK dg_igr_sm120
@@ -70,6 +83,7 @@ set_tests_properties(
 set_tests_properties(
   dg_igr_hdg_runtime_cuda_w8a_rank2_host_staged
   dg_igr_hdg_runtime_cuda_w8a_rank2_host_staged_token_negatives
+  dg_igr_hdg_runtime_cuda_w8a_functional_rank2_host_staged
   PROPERTIES
     PROCESSORS 2
     RESOURCE_LOCK dg_igr_sm120

@@ -144,6 +144,187 @@ bool TicketHighHalfRegression() noexcept
           synthetic_attempt, synthetic_generation, 0);
 }
 
+struct RetainedSolveDeviceEvidence
+{
+  int factor_solve_ok;
+  int recovery_exercised;
+  double pivots[3];
+  double multiple_rhs[6];
+  double recovery[3];
+  double old_interleaved_rhs[6];
+};
+
+__device__ RetainedSolveDeviceEvidence retained_solve_device_evidence;
+
+__global__ void RetainedSolveTestSeamKernel()
+{
+  if (blockIdx.x != 0 || threadIdx.x != 0) { return; }
+  RetainedSolveDeviceEvidence* const evidence =
+      &retained_solve_device_evidence;
+  evidence->factor_solve_ok = 0;
+  evidence->recovery_exercised = 0;
+  for (int entry = 0; entry < 3; ++entry)
+  {
+    evidence->pivots[entry] = -1.0;
+    evidence->recovery[entry] = 0.0;
+  }
+  for (int entry = 0; entry < 6; ++entry)
+  {
+    evidence->multiple_rhs[entry] = 0.0;
+    evidence->old_interleaved_rhs[entry] = 0.0;
+  }
+
+  double lu[9] = {4.0, 0.0, 0.0,
+                  2.0, 1.0, 2.0,
+                  1.0, 4.0, 1.0};
+  double rhs[6] = {4.0, -8.0,
+                   10.0, 5.0,
+                   12.0, 6.0};
+  evidence->factor_solve_ok = cuda_detail::CudaFactorSolveRetained(
+      lu, evidence->pivots, 3, rhs, 2) ? 1 : 0;
+  if (evidence->factor_solve_ok == 0) { return; }
+  for (int entry = 0; entry < 6; ++entry)
+    evidence->multiple_rhs[entry] = rhs[entry];
+
+  const double coupling[6] = {1.0, 2.0,
+                              -1.0, 3.0,
+                              2.0, -2.0};
+  const double trace_increment[2] = {2.0, -1.0};
+  const double interior_rhs[3] = {8.0, 0.0, 5.0};
+  cuda_detail::CudaRecoverRetained(
+      lu, evidence->pivots, 3, coupling, 2, trace_increment,
+      interior_rhs, evidence->recovery);
+  evidence->recovery_exercised = 1;
+
+  const double original_rhs[6] = {4.0, -8.0,
+                                  10.0, 5.0,
+                                  12.0, 6.0};
+  for (int entry = 0; entry < 6; ++entry)
+    evidence->old_interleaved_rhs[entry] = original_rhs[entry];
+  // Active negative control: this is the rejected ordering that interleaves
+  // each retained pivot with forward elimination.
+  for (int column = 0; column < 3; ++column)
+  {
+    const int pivot = static_cast<int>(evidence->pivots[column]);
+    if (pivot != column)
+    {
+      for (int rhs_column = 0; rhs_column < 2; ++rhs_column)
+      {
+        const double value =
+            evidence->old_interleaved_rhs[column * 2 + rhs_column];
+        evidence->old_interleaved_rhs[column * 2 + rhs_column] =
+            evidence->old_interleaved_rhs[pivot * 2 + rhs_column];
+        evidence->old_interleaved_rhs[pivot * 2 + rhs_column] = value;
+      }
+    }
+    for (int row = column + 1; row < 3; ++row)
+      for (int rhs_column = 0; rhs_column < 2; ++rhs_column)
+        evidence->old_interleaved_rhs[row * 2 + rhs_column] -=
+            lu[row * 3 + column] *
+            evidence->old_interleaved_rhs[column * 2 + rhs_column];
+  }
+  for (int row = 2; row >= 0; --row)
+  {
+    for (int rhs_column = 0; rhs_column < 2; ++rhs_column)
+    {
+      for (int column = row + 1; column < 3; ++column)
+        evidence->old_interleaved_rhs[row * 2 + rhs_column] -=
+            lu[row * 3 + column] *
+            evidence->old_interleaved_rhs[column * 2 + rhs_column];
+      evidence->old_interleaved_rhs[row * 2 + rhs_column] /=
+          lu[row * 3 + row];
+    }
+  }
+}
+
+bool RetainedMultipleRhsSolutionsExact(const double* const solutions) noexcept
+{
+  constexpr double exact[6] = {1.0, -2.0,
+                               2.0, 1.0,
+                               3.0, 4.0};
+  for (int entry = 0; entry < 6; ++entry)
+    if (solutions[entry] != exact[entry]) { return false; }
+  return true;
+}
+
+bool RetainedMultipleRhsResidualsExact(const double* const solutions) noexcept
+{
+  constexpr double matrix[9] = {4.0, 0.0, 0.0,
+                                2.0, 1.0, 2.0,
+                                1.0, 4.0, 1.0};
+  constexpr double rhs[6] = {4.0, -8.0,
+                             10.0, 5.0,
+                             12.0, 6.0};
+  for (int row = 0; row < 3; ++row)
+  {
+    for (int rhs_column = 0; rhs_column < 2; ++rhs_column)
+    {
+      double product = 0.0;
+      for (int column = 0; column < 3; ++column)
+        product += matrix[row * 3 + column] *
+            solutions[column * 2 + rhs_column];
+      if (product != rhs[row * 2 + rhs_column])
+        return false;
+    }
+  }
+  return true;
+}
+
+bool RetainedRecoveryExact(const double* const recovery) noexcept
+{
+  constexpr double matrix[9] = {4.0, 0.0, 0.0,
+                                2.0, 1.0, 2.0,
+                                1.0, 4.0, 1.0};
+  constexpr double coupling[6] = {1.0, 2.0,
+                                  -1.0, 3.0,
+                                  2.0, -2.0};
+  constexpr double trace_increment[2] = {2.0, -1.0};
+  constexpr double interior_rhs[3] = {8.0, 0.0, 5.0};
+  constexpr double exact[3] = {2.0, -1.0, 1.0};
+  for (int row = 0; row < 3; ++row)
+  {
+    if (recovery[row] != exact[row]) { return false; }
+    double effective_rhs = interior_rhs[row];
+    for (int column = 0; column < 2; ++column)
+      effective_rhs -= coupling[row * 2 + column] *
+          trace_increment[column];
+    double product = 0.0;
+    for (int column = 0; column < 3; ++column)
+      product += matrix[row * 3 + column] * recovery[column];
+    if (product != effective_rhs) { return false; }
+  }
+  return true;
+}
+
+bool RetainedDelayedPivotRegression() noexcept
+{
+  RetainedSolveDeviceEvidence evidence{};
+  RetainedSolveTestSeamKernel<<<1, 1>>>();
+  const bool launch_exact = cudaPeekAtLastError() == cudaSuccess;
+  const bool synchronized = launch_exact &&
+      cudaDeviceSynchronize() == cudaSuccess;
+  const bool copied = synchronized &&
+      cudaMemcpyFromSymbol(&evidence, retained_solve_device_evidence,
+                           sizeof(RetainedSolveDeviceEvidence)) ==
+          cudaSuccess;
+  if (!copied) { return false; }
+
+  const bool delayed_pivot_observed =
+      evidence.pivots[0] == 0.0 && evidence.pivots[1] == 2.0 &&
+      evidence.pivots[1] != 1.0 && evidence.pivots[2] == 2.0;
+  const bool exact_multiple_solutions =
+      RetainedMultipleRhsSolutionsExact(evidence.multiple_rhs);
+  const bool exact_multiple_residuals =
+      RetainedMultipleRhsResidualsExact(evidence.multiple_rhs);
+  const bool old_ordering_rejected =
+      !RetainedMultipleRhsSolutionsExact(evidence.old_interleaved_rhs) &&
+      !RetainedMultipleRhsResidualsExact(evidence.old_interleaved_rhs);
+  return evidence.factor_solve_ok == 1 &&
+      evidence.recovery_exercised == 1 && delayed_pivot_observed &&
+      exact_multiple_solutions && exact_multiple_residuals &&
+      RetainedRecoveryExact(evidence.recovery) && old_ordering_rejected;
+}
+
 struct TestModelTag
 {
   inline static constexpr std::string_view id = "euler.compressible.2d";
@@ -1992,8 +2173,7 @@ bool SetupValid(const CudaRunEvidence& setup, const int ranks,
   {
     failure_mask |= setup_post_baseline_counts_failure;
   }
-  if (!(setup.reuse.observes_w8_owned_calls_and_pool_growth_only &&
-        !setup.reuse.opaque_pool_reuse_churn_observed))
+  if (!setup.reuse.observes_w8_owned_calls_and_pool_growth_only)
   {
     failure_mask |= setup_scope_flags_failure;
   }
@@ -2047,10 +2227,12 @@ void ReportSetupFailure(const char* const context, const bool initialized,
             << " post_counts="
             << setup.reuse.post_baseline_allocation_events << ','
             << setup.reuse.post_baseline_w8_owned_allocation_calls
-            << " scope="
+            << " scope_only="
             << (setup.reuse.observes_w8_owned_calls_and_pool_growth_only
                     ? 1 : 0)
+            << " opaque_churn_observed="
             << (setup.reuse.opaque_pool_reuse_churn_observed ? 1 : 0)
+            << " opaque_churn_observable=0"
             << " tokens=topology:0x" << std::hex
             << setup.reuse.topology_token
             << ",double:0x" << setup.reuse.double_arena_token
@@ -2072,6 +2254,179 @@ CudaConfig Config(const int ranks, const bool oracle = false) noexcept
   config.require_host_staged_rank2 = ranks == 2;
   config.capture_oracle = oracle;
   return config;
+}
+
+CudaConfig FunctionalConfig(const int ranks,
+                            const bool inject_step14) noexcept
+{
+  CudaConfig config = Config(ranks, true);
+  config.order = functional_polynomial_order;
+  config.mesh_n = functional_elements_per_direction;
+  config.injection.enabled = inject_step14;
+  config.injection.target_step = functional_injected_step;
+  config.injection.source_rank = ranks - 1;
+  return config;
+}
+
+bool SamePersistentIdentity(const CudaReuseEvidence& initial,
+                            const CudaReuseEvidence& current,
+                            const int ranks) noexcept
+{
+  const bool same_interior_slots =
+      (initial.interior_slot_tokens == current.interior_slot_tokens) ||
+      (initial.interior_slot_tokens[0] == current.interior_slot_tokens[1] &&
+       initial.interior_slot_tokens[1] == current.interior_slot_tokens[0]);
+  const bool same_trace_slots =
+      (initial.trace_slot_tokens == current.trace_slot_tokens) ||
+      (initial.trace_slot_tokens[0] == current.trace_slot_tokens[1] &&
+       initial.trace_slot_tokens[1] == current.trace_slot_tokens[0]);
+  return initial.topology_token != 0 &&
+      initial.topology_token == current.topology_token &&
+      initial.double_arena_token == current.double_arena_token &&
+      initial.integer_arena_token == current.integer_arena_token &&
+      initial.matrix_token == current.matrix_token &&
+      initial.factor_token != 0 && current.factor_token != 0 &&
+      initial.workspace_token == current.workspace_token &&
+      same_interior_slots && same_trace_slots &&
+      current.post_baseline_w8_owned_allocation_calls == 0 &&
+      current.post_baseline_allocation_events <=
+          static_cast<std::uint64_t>(ranks == 2 ? 1 : 0) &&
+      current.observes_w8_owned_calls_and_pool_growth_only &&
+      current.persistent_graph && current.persistent_slots &&
+      current.persistent_workspace;
+}
+
+void ReportFunctionalReferenceTerminalDiagnostic(
+    const int rank, const int ranks, const bool contract_present,
+    const std::uint64_t step, const std::uint64_t cursor,
+    const std::uint64_t commits, const CudaReuseEvidence& initial,
+    const CudaReuseEvidence& current,
+    const bool persistent_identity_exact,
+    const bool terminal_local, const bool terminal_collective) noexcept
+{
+  const bool topology_nonzero = initial.topology_token != 0;
+  const bool topology_same =
+      initial.topology_token == current.topology_token;
+  const bool double_arena_same =
+      initial.double_arena_token == current.double_arena_token;
+  const bool integer_arena_same =
+      initial.integer_arena_token == current.integer_arena_token;
+  const bool matrix_same = initial.matrix_token == current.matrix_token;
+  const bool initial_factor_available = initial.factor_token != 0;
+  const bool current_factor_available = current.factor_token != 0;
+  const bool factor_handle_same =
+      initial.factor_token == current.factor_token;
+  const bool factor_handle_recreated = initial_factor_available &&
+      current_factor_available && !factor_handle_same;
+  const bool workspace_same =
+      initial.workspace_token == current.workspace_token;
+  const bool interior_slots_same =
+      (initial.interior_slot_tokens == current.interior_slot_tokens) ||
+      (initial.interior_slot_tokens[0] == current.interior_slot_tokens[1] &&
+       initial.interior_slot_tokens[1] == current.interior_slot_tokens[0]);
+  const bool trace_slots_same =
+      (initial.trace_slot_tokens == current.trace_slot_tokens) ||
+      (initial.trace_slot_tokens[0] == current.trace_slot_tokens[1] &&
+       initial.trace_slot_tokens[1] == current.trace_slot_tokens[0]);
+  const bool allocation_calls_exact =
+      current.post_baseline_w8_owned_allocation_calls == 0;
+  const std::uint64_t allocation_event_limit = ranks == 2 ? 1 : 0;
+  const bool allocation_events_exact =
+      current.post_baseline_allocation_events <= allocation_event_limit;
+
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_REFERENCE_TERMINAL rank=%d ranks=%d contract=%u "
+      "step=%llu/%llu:%u cursor=%llu/%llu:%u commits=%llu/%llu:%u "
+      "local=%s collective=%s\n",
+      rank, ranks, contract_present ? 1U : 0U,
+      static_cast<unsigned long long>(step),
+      static_cast<unsigned long long>(functional_accepted_steps),
+      step == functional_accepted_steps ? 1U : 0U,
+      static_cast<unsigned long long>(cursor),
+      static_cast<unsigned long long>(functional_accepted_steps),
+      cursor == functional_accepted_steps ? 1U : 0U,
+      static_cast<unsigned long long>(commits),
+      static_cast<unsigned long long>(functional_accepted_steps),
+      commits == functional_accepted_steps ? 1U : 0U,
+      terminal_local ? "PASS" : "FAIL",
+      terminal_collective ? "PASS" : "FAIL");
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_REFERENCE_IDENTITY rank=%d ranks=%d "
+      "topology_nonzero=%u topology_same=%u topology=0x%llx/0x%llx "
+      "double_same=%u double=0x%llx/0x%llx "
+      "integer_same=%u integer=0x%llx/0x%llx "
+      "matrix_same=%u matrix=0x%llx/0x%llx "
+      "factor_available=%u/%u factor_handle_same=%u "
+      "factor_handle_recreated=%u factor=0x%llx/0x%llx "
+      "workspace_same=%u workspace=0x%llx/0x%llx\n",
+      rank, ranks, topology_nonzero ? 1U : 0U,
+      topology_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.topology_token),
+      static_cast<unsigned long long>(current.topology_token),
+      double_arena_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.double_arena_token),
+      static_cast<unsigned long long>(current.double_arena_token),
+      integer_arena_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.integer_arena_token),
+      static_cast<unsigned long long>(current.integer_arena_token),
+      matrix_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.matrix_token),
+      static_cast<unsigned long long>(current.matrix_token),
+      initial_factor_available ? 1U : 0U,
+      current_factor_available ? 1U : 0U,
+      factor_handle_same ? 1U : 0U,
+      factor_handle_recreated ? 1U : 0U,
+      static_cast<unsigned long long>(initial.factor_token),
+      static_cast<unsigned long long>(current.factor_token),
+      workspace_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.workspace_token),
+      static_cast<unsigned long long>(current.workspace_token));
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_REFERENCE_REUSE rank=%d ranks=%d "
+      "interior_slots_same=%u interior=0x%llx,0x%llx/0x%llx,0x%llx "
+      "trace_slots_same=%u trace=0x%llx,0x%llx/0x%llx,0x%llx "
+      "allocation_calls=%llu/0:%u allocation_events=%llu/%llu:%u "
+      "scope_only=%u opaque_churn_observed=%u "
+      "opaque_churn_observable=0 opaque_churn_scope=third-party-hypre "
+      "persistent_graph=%u "
+      "persistent_slots=%u persistent_workspace=%u identity=%u\n",
+      rank, ranks, interior_slots_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.interior_slot_tokens[0]),
+      static_cast<unsigned long long>(initial.interior_slot_tokens[1]),
+      static_cast<unsigned long long>(current.interior_slot_tokens[0]),
+      static_cast<unsigned long long>(current.interior_slot_tokens[1]),
+      trace_slots_same ? 1U : 0U,
+      static_cast<unsigned long long>(initial.trace_slot_tokens[0]),
+      static_cast<unsigned long long>(initial.trace_slot_tokens[1]),
+      static_cast<unsigned long long>(current.trace_slot_tokens[0]),
+      static_cast<unsigned long long>(current.trace_slot_tokens[1]),
+      static_cast<unsigned long long>(
+          current.post_baseline_w8_owned_allocation_calls),
+      allocation_calls_exact ? 1U : 0U,
+      static_cast<unsigned long long>(
+          current.post_baseline_allocation_events),
+      static_cast<unsigned long long>(allocation_event_limit),
+      allocation_events_exact ? 1U : 0U,
+      current.observes_w8_owned_calls_and_pool_growth_only ? 1U : 0U,
+      current.opaque_pool_reuse_churn_observed ? 1U : 0U,
+      current.persistent_graph ? 1U : 0U,
+      current.persistent_slots ? 1U : 0U,
+      current.persistent_workspace ? 1U : 0U,
+      persistent_identity_exact ? 1U : 0U);
+  const char* const factor_handle_class =
+      !initial_factor_available || !current_factor_available
+      ? "unavailable"
+      : (factor_handle_recreated
+         ? "opaque-hypre-recreated" : "opaque-hypre-same-observation");
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_REFERENCE_CLASSIFICATION rank=%d ranks=%d "
+      "terminal_local=%s terminal_collective=%s w8_identity=%s "
+      "factor_handle_class=%s factor_storage_class=opaque-shared-pool "
+      "performance_claim=BLOCKED profile_claim=BLOCKED "
+      "tensor_claim=BLOCKED\n",
+      rank, ranks, terminal_local ? "PASS" : "FAIL",
+      terminal_collective ? "PASS" : "FAIL",
+      persistent_identity_exact ? "PASS" : "FAIL", factor_handle_class);
 }
 
 template <typename Backend>
@@ -2596,6 +2951,213 @@ struct OracleOutputTestSeam
   int checkpoint_mismatch_rank = -1;
 };
 
+struct OracleShapeExpectation
+{
+  int elements = 0;
+  int local_trace_count = 0;
+  int true_trace_count = 0;
+  int global_true_trace_count = 0;
+  int volume_points = 0;
+  int face_points = 0;
+  int scalar_interior_dofs = 0;
+  int scalar_face_dofs = 0;
+  int interior_dofs = 0;
+  int trace_dofs = 0;
+  int true_csr_nonzeros = 0;
+};
+
+// Independent p2/N6 periodic test topology.  The 6x6 mesh has 2*N*N=72
+// unique periodic faces and 12 component face dofs per face.  The contiguous
+// two-rank element partition is a 3x6 strip: 18 periodic vertical faces plus
+// 24 horizontal/interface faces are locally visible.  Pinned MFEM makes rank
+// zero the shared {0,1} group master, so it owns 30 private plus 12 shared
+// faces while rank one owns its 30 private faces.  MFEM's order-14 Gauss rule
+// has eight points in one dimension, hence 8x8 volume and 8-point face
+// quadrature.  Each trace row couples through its two adjacent quads to seven
+// distinct faces, i.e. 7*12=84 structural columns per row.  That CSR census is
+// deliberately pinned to this dense local graph and MFEM/HYPRE assembly; it is
+// not asserted as a backend-portable mesh-only invariant.
+inline constexpr int functional_test_n = 6;
+inline constexpr int functional_test_order = 2;
+inline constexpr int functional_test_components = 4;
+inline constexpr int functional_test_faces_per_element = 4;
+inline constexpr int functional_test_scalar_face_dofs =
+    functional_test_order + 1;
+inline constexpr int functional_test_scalar_interior_dofs =
+    (functional_test_order + 1) * (functional_test_order + 1);
+inline constexpr int functional_test_interior_dofs =
+    functional_test_components * functional_test_scalar_interior_dofs;
+inline constexpr int functional_test_element_trace_dofs =
+    functional_test_faces_per_element * functional_test_components *
+    functional_test_scalar_face_dofs;
+inline constexpr int functional_test_face_component_dofs =
+    functional_test_components * functional_test_scalar_face_dofs;
+inline constexpr int functional_test_rank1_elements =
+    functional_test_n * functional_test_n;
+inline constexpr int functional_test_rank2_elements =
+    functional_test_rank1_elements / 2;
+inline constexpr int functional_test_global_faces =
+    2 * functional_test_n * functional_test_n;
+inline constexpr int functional_test_global_true_trace =
+    functional_test_global_faces * functional_test_face_component_dofs;
+inline constexpr int functional_test_rank2_rows = functional_test_n / 2;
+inline constexpr int functional_test_rank2_local_faces =
+    functional_test_rank2_rows * functional_test_n +
+    (functional_test_rank2_rows + 1) * functional_test_n;
+inline constexpr int functional_test_rank2_local_trace =
+    functional_test_rank2_local_faces * functional_test_face_component_dofs;
+inline constexpr int functional_test_rank2_private_faces =
+    functional_test_rank2_local_faces - 2 * functional_test_n;
+inline constexpr int functional_test_rank2_master_true_trace =
+    functional_test_rank2_local_trace;
+inline constexpr int functional_test_rank2_nonmaster_true_trace =
+    functional_test_rank2_private_faces * functional_test_face_component_dofs;
+inline constexpr int functional_test_coupled_faces_per_row = 7;
+inline constexpr int functional_test_csr_columns_per_row =
+    functional_test_coupled_faces_per_row *
+    functional_test_face_component_dofs;
+inline constexpr int functional_test_rank1_csr_nonzeros =
+    functional_test_global_true_trace * functional_test_csr_columns_per_row;
+inline constexpr int functional_test_rank2_master_csr_nonzeros =
+    functional_test_rank2_master_true_trace *
+    functional_test_csr_columns_per_row;
+inline constexpr int functional_test_rank2_nonmaster_csr_nonzeros =
+    functional_test_rank2_nonmaster_true_trace *
+    functional_test_csr_columns_per_row;
+inline constexpr int functional_test_assembly_order =
+    3 * functional_test_order + 8;
+inline constexpr int functional_test_quadrature_1d =
+    functional_test_assembly_order / 2 + 1;
+inline constexpr int functional_test_volume_points =
+    functional_test_quadrature_1d * functional_test_quadrature_1d;
+inline constexpr int functional_test_face_points =
+    functional_test_quadrature_1d;
+static_assert(functional_test_n == functional_elements_per_direction &&
+              functional_test_order == functional_polynomial_order &&
+              functional_test_components == conserved_components &&
+              functional_test_faces_per_element == faces_per_element &&
+              functional_test_assembly_order ==
+                  functional_assembly_quadrature_order &&
+              functional_test_scalar_interior_dofs == 9 &&
+              functional_test_scalar_face_dofs == 3 &&
+              functional_test_interior_dofs == 36 &&
+              functional_test_element_trace_dofs == 48 &&
+              functional_test_rank1_elements == 36 &&
+              functional_test_rank2_elements == 18 &&
+              functional_test_global_true_trace == 864 &&
+              functional_test_rank2_local_faces == 42 &&
+              functional_test_rank2_local_trace == 504 &&
+              functional_test_rank2_private_faces == 30 &&
+              functional_test_rank2_master_true_trace == 504 &&
+              functional_test_rank2_nonmaster_true_trace == 360 &&
+              functional_test_csr_columns_per_row == 84 &&
+              functional_test_rank1_csr_nonzeros == 72576 &&
+              functional_test_rank2_master_csr_nonzeros == 42336 &&
+              functional_test_rank2_nonmaster_csr_nonzeros == 30240 &&
+              functional_test_volume_points == 64 &&
+              functional_test_face_points == 8);
+
+OracleShapeExpectation FunctionalOracleShape(
+    const int communicator_ranks, const int local_rank) noexcept
+{
+  return {
+      communicator_ranks == 1 ? functional_test_rank1_elements :
+                                functional_test_rank2_elements,
+      communicator_ranks == 1 ? functional_test_global_true_trace :
+                                functional_test_rank2_local_trace,
+      communicator_ranks == 1 ? functional_test_global_true_trace :
+          (local_rank == 0 ? functional_test_rank2_master_true_trace :
+                             functional_test_rank2_nonmaster_true_trace),
+      functional_test_global_true_trace,
+      functional_test_volume_points,
+      functional_test_face_points,
+      functional_test_scalar_interior_dofs,
+      functional_test_scalar_face_dofs,
+      functional_test_interior_dofs,
+      functional_test_element_trace_dofs,
+      communicator_ranks == 1 ? functional_test_rank1_csr_nonzeros :
+          (local_rank == 0 ? functional_test_rank2_master_csr_nonzeros :
+                             functional_test_rank2_nonmaster_csr_nonzeros)};
+}
+
+bool ExactOracleShape(
+    const CudaOraclePod& pod,
+    const OracleShapeExpectation& expected) noexcept
+{
+  return pod.elements == expected.elements &&
+      pod.local_trace_count == expected.local_trace_count &&
+      pod.true_trace_count == expected.true_trace_count &&
+      pod.global_true_trace_count == expected.global_true_trace_count &&
+      pod.volume_points == expected.volume_points &&
+      pod.face_points == expected.face_points &&
+      pod.scalar_interior_dofs == expected.scalar_interior_dofs &&
+      pod.scalar_face_dofs == expected.scalar_face_dofs &&
+      pod.interior_dofs == expected.interior_dofs &&
+      pod.trace_dofs == expected.trace_dofs &&
+      pod.interior_count == expected.elements * expected.interior_dofs &&
+      pod.true_csr_rows == expected.true_trace_count &&
+      pod.true_csr_nonzeros == expected.true_csr_nonzeros;
+}
+
+bool SameOraclePodSemantic(const CudaOraclePod& left,
+                           const CudaOraclePod& right) noexcept
+{
+  return left.schema == right.schema && left.rank == right.rank &&
+      left.ranks == right.ranks && left.elements == right.elements &&
+      left.interior_count == right.interior_count &&
+      left.local_trace_count == right.local_trace_count &&
+      left.true_trace_count == right.true_trace_count &&
+      left.global_true_trace_count == right.global_true_trace_count &&
+      left.volume_points == right.volume_points &&
+      left.face_points == right.face_points &&
+      left.scalar_interior_dofs == right.scalar_interior_dofs &&
+      left.scalar_face_dofs == right.scalar_face_dofs &&
+      left.interior_dofs == right.interior_dofs &&
+      left.trace_dofs == right.trace_dofs &&
+      left.true_csr_rows == right.true_csr_rows &&
+      left.true_csr_nonzeros == right.true_csr_nonzeros &&
+      left.attempt_sequence == right.attempt_sequence &&
+      left.product_generation == right.product_generation &&
+      left.dt == right.dt &&
+      left.signed_element_trace == right.signed_element_trace &&
+      left.local_to_global_true == right.local_to_global_true &&
+      left.owned_global_true == right.owned_global_true &&
+      left.element_coordinate_keys == right.element_coordinate_keys &&
+      left.true_csr_offsets == right.true_csr_offsets &&
+      left.true_csr_columns == right.true_csr_columns &&
+      left.true_csr_values == right.true_csr_values &&
+      left.true_rhs == right.true_rhs &&
+      left.true_solution == right.true_solution &&
+      left.current_true_trace == right.current_true_trace &&
+      left.volume_shape == right.volume_shape &&
+      left.volume_derivative == right.volume_derivative &&
+      left.volume_weight == right.volume_weight &&
+      left.volume_position == right.volume_position &&
+      left.face_interior_shape == right.face_interior_shape &&
+      left.face_trace_shape == right.face_trace_shape &&
+      left.face_weight == right.face_weight &&
+      left.face_normal == right.face_normal &&
+      left.old_interior == right.old_interior &&
+      left.current_interior == right.current_interior &&
+      left.current_local_trace == right.current_local_trace &&
+      left.distributed_local_trace == right.distributed_local_trace &&
+      left.residual_r == right.residual_r &&
+      left.residual_g == right.residual_g && left.a == right.a &&
+      left.b == right.b && left.c == right.c && left.d == right.d &&
+      left.f == right.f && left.g == right.g &&
+      left.schur == right.schur &&
+      left.condensed_rhs == right.condensed_rhs &&
+      left.local_trace_increment == right.local_trace_increment &&
+      left.recovered_increment == right.recovered_increment;
+}
+
+bool ExactOracleShape(
+    const CudaOraclePod& pod,
+    const std::optional<OracleShapeExpectation>& expected) noexcept
+{
+  return !expected.has_value() || ExactOracleShape(pod, *expected);
+}
+
 struct FrozenStageResult
 {
   bool passed = false;
@@ -2609,7 +3171,10 @@ FrozenStageResult StageOracleOutputCollective(
     const int ranks, const int rank, const bool retry,
     const std::uint64_t target_step, const bool mutate_oracle,
     const char* const case_id,
-    const OracleOutputTestSeam seam = {}) noexcept
+    const OracleOutputTestSeam seam = {},
+    const std::optional<OracleShapeExpectation> expected_shape =
+        std::nullopt,
+    CudaOraclePod* const preserved_oracle = nullptr) noexcept
 {
   auto staged_oracle = std::make_unique<CudaOraclePod>();
   const auto report_stage =
@@ -2666,6 +3231,48 @@ FrozenStageResult StageOracleOutputCollective(
       oracle_identity_collective);
   if (!oracle_identity_collective)
     return fail_and_cleanup("oracle/output-stage", FailureReason::backend_failure);
+
+  const bool expected_shape_exact =
+      ExactOracleShape(*staged_oracle, expected_shape);
+  const bool expected_shape_collective =
+      CollectivelyExact(expected_shape_exact);
+  std::fprintf(stderr,
+      "CUDA_ORACLE_SHAPE case=%s rank=%d target=%llu required=%u "
+      "elements=%d/%d local_trace=%d/%d true_trace=%d/%d "
+      "global_true=%d/%d volume_points=%d/%d face_points=%d/%d "
+      "scalar_interior=%d/%d scalar_face=%d/%d interior=%d/%d "
+      "trace=%d/%d true_rows=%d/%d true_nnz=%d/%d "
+      "local=%s collective=%s\n",
+      case_id != nullptr ? case_id : "null", rank,
+      static_cast<unsigned long long>(target_step),
+      expected_shape.has_value() ? 1U : 0U, staged_oracle->elements,
+      expected_shape.has_value() ? expected_shape->elements : 0,
+      staged_oracle->local_trace_count,
+      expected_shape.has_value() ? expected_shape->local_trace_count : 0,
+      staged_oracle->true_trace_count,
+      expected_shape.has_value() ? expected_shape->true_trace_count : 0,
+      staged_oracle->global_true_trace_count,
+      expected_shape.has_value() ? expected_shape->global_true_trace_count : 0,
+      staged_oracle->volume_points,
+      expected_shape.has_value() ? expected_shape->volume_points : 0,
+      staged_oracle->face_points,
+      expected_shape.has_value() ? expected_shape->face_points : 0,
+      staged_oracle->scalar_interior_dofs,
+      expected_shape.has_value() ? expected_shape->scalar_interior_dofs : 0,
+      staged_oracle->scalar_face_dofs,
+      expected_shape.has_value() ? expected_shape->scalar_face_dofs : 0,
+      staged_oracle->interior_dofs,
+      expected_shape.has_value() ? expected_shape->interior_dofs : 0,
+      staged_oracle->trace_dofs,
+      expected_shape.has_value() ? expected_shape->trace_dofs : 0,
+      staged_oracle->true_csr_rows,
+      expected_shape.has_value() ? expected_shape->true_trace_count : 0,
+      staged_oracle->true_csr_nonzeros,
+      expected_shape.has_value() ? expected_shape->true_csr_nonzeros : 0,
+      expected_shape_exact ? "PASS" : "FAIL",
+      expected_shape_collective ? "PASS" : "FAIL");
+  if (!expected_shape_collective)
+    return fail_and_cleanup("oracle/shape", FailureReason::backend_failure);
 
   const bool independent_oracle_exact =
       cuda_w8a_test_oracle::Verify(*staged_oracle);
@@ -2778,6 +3385,7 @@ FrozenStageResult StageOracleOutputCollective(
       oracle_policy_ledgers_collective);
   if (!oracle_policy_ledgers_collective)
     return fail_and_cleanup("oracle/output-stage", FailureReason::backend_failure);
+  if (preserved_oracle != nullptr) { *preserved_oracle = *staged_oracle; }
   return {true, true};
 }
 
@@ -3066,6 +3674,609 @@ bool CommitSuccessfulAttempt(Engine& engine, const bool retry,
     ReportCommitFailure(rank, "export", retry, target_step);
   }
   return export_collective;
+}
+
+enum class FunctionalOracleLane : std::uint8_t
+{
+  reference,
+  checkpoint_writer,
+  restored_reader
+};
+
+struct FunctionalOracleCensus
+{
+  std::uint64_t reference = 0;
+  std::uint64_t checkpoint_writer = 0;
+  std::uint64_t restored_reader = 0;
+  std::uint64_t accepted_retry = 0;
+  std::uint64_t total = 0;
+  std::uint64_t mutation_required = 0;
+
+  void Credit(const FunctionalOracleLane lane, const bool retry,
+              const bool mutation) noexcept
+  {
+    if (lane == FunctionalOracleLane::reference) { ++reference; }
+    else if (lane == FunctionalOracleLane::checkpoint_writer)
+    {
+      ++checkpoint_writer;
+    }
+    else { ++restored_reader; }
+    if (retry) { ++accepted_retry; }
+    if (mutation) { ++mutation_required; }
+    ++total;
+  }
+
+  bool Exact() const noexcept
+  {
+    return reference == 20 && checkpoint_writer == 10 &&
+        restored_reader == 10 && accepted_retry == 1 && total == 40 &&
+        mutation_required == 5;
+  }
+};
+
+/**
+ * Functional trajectory commit seam.  The independent p2/N6 oracle is an
+ * admission-critical staged payload: it must pass before the atomic commit,
+ * and the identical published snapshot is audited again after finalization.
+ */
+template <typename Engine>
+bool CommitFunctionalAttempt(
+    Engine& engine, const bool retry, const std::uint64_t target_step,
+    const int ranks, const int rank,
+    CudaSerializedCheckpointV1& checkpoint,
+    const FunctionalOracleLane lane, FunctionalOracleCensus& census,
+    const char* const case_id,
+    CudaOraclePod* const accepted_oracle = nullptr) noexcept
+{
+  CudaPrecommitSnapshot snapshot{};
+  CudaStepEvidence evidence{};
+  const auto* contract = engine.contract();
+  if (!CollectivelyExact(contract != nullptr)) { return false; }
+  const StateCoordinates before = contract->coordinates();
+  const std::uint64_t owned_calls =
+      AuditedAllocator::W8OwnedAllocationCalls();
+  const std::uint64_t deallocations =
+      AuditedAllocator::DeallocationEvents();
+
+  const bool prepared = engine.PrepareStep(retry, snapshot, evidence);
+  const std::uint64_t accepted_allocation_events =
+      AuditedAllocator::AllocationEvents();
+  const bool prepared_local = prepared &&
+      snapshot.numerical_candidate_ready &&
+      snapshot.target.step == target_step &&
+      snapshot.target.generation == before.generation + 1 &&
+      snapshot.attempt.retry_index == (retry ? 1U : 0U) &&
+      SameCoordinates(snapshot.committed, before) &&
+      snapshot.products.CoupledAndOrdered() &&
+      std::isfinite(evidence.initial_residual) &&
+      std::isfinite(evidence.final_residual) &&
+      evidence.nonlinear_updates > 0 &&
+      evidence.nonlinear_updates <= 20 &&
+      evidence.final_residual <=
+          1.0e-10 * (1.0 + evidence.initial_residual) &&
+      std::isfinite(evidence.true_relative_residual) &&
+      evidence.true_relative_residual <= 1.0e-10 &&
+      evidence.no_fallback && evidence.device_resident &&
+      AuditedAllocator::W8OwnedAllocationCalls() == owned_calls &&
+      AuditedAllocator::DeallocationEvents() == deallocations &&
+      ExactPolicyLedgers();
+  if (!CollectivelyExact(prepared_local))
+  {
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        PhaseAfterPrepareStep(prepared, evidence));
+    return false;
+  }
+
+  const bool staged = engine.StagePreparedCheckpoint(checkpoint, evidence);
+  const bool staged_local = staged && checkpoint.candidate_frozen &&
+      checkpoint.checkpoint_staged && !checkpoint.output_staged &&
+      !checkpoint.successful_commit &&
+      checkpoint.descriptor.interior_hash ==
+          snapshot.candidate_interior_hash &&
+      checkpoint.descriptor.trace_hash == snapshot.candidate_trace_hash &&
+      checkpoint.local_interior_hash ==
+          snapshot.candidate_local_interior_hash &&
+      checkpoint.local_trace_hash == snapshot.candidate_local_trace_hash &&
+      checkpoint.interior_count == snapshot.interior_coefficients &&
+      checkpoint.owned_true_trace_count ==
+          snapshot.true_trace_coefficients &&
+      checkpoint.descriptor.layout.view() == runtime_layout_id &&
+      checkpoint.staging_generation == snapshot.target.generation &&
+      ValidRange(checkpoint.staging_range, AuditedTransport::Ledger()) &&
+      ExactPolicyLedgers();
+  if (!CollectivelyExact(staged_local))
+  {
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        AffineLocalPhase::staging);
+    return false;
+  }
+  // The boundary sentinel is deliberately exercised on both the uninterrupted
+  // reference and the restored trajectory.  Together with target 1 on the two
+  // direct engines and the accepted retry, this yields five mutation gates.
+  const bool mutation_required = target_step == 1 ||
+      target_step == functional_checkpoint_step + 1 || retry;
+  auto staged_oracle = std::make_unique<CudaOraclePod>();
+  const FrozenStageResult oracle_output = StageOracleOutputCollective(
+      engine, checkpoint, evidence, snapshot, ranks, rank, retry,
+      target_step, mutation_required, case_id, {},
+      std::optional<OracleShapeExpectation>{
+          FunctionalOracleShape(ranks, rank)},
+      staged_oracle.get());
+  if (!oracle_output.passed) { return false; }
+  const bool prepared_commit = engine.PrepareCommit(checkpoint, evidence);
+  if (!CollectivelyExact(prepared_commit))
+  {
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        PhaseAfterPrepareCommit(prepared_commit, evidence));
+    return false;
+  }
+  const bool commit_prepared = engine.CommitPrepared(checkpoint, evidence);
+  if (!CollectivelyExact(commit_prepared))
+  {
+    (void)ResolveUnexpectedAffineExit(
+        engine, checkpoint, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure, CudaFailurePhase::diagnostics,
+        PhaseAfterCommitPrepared(commit_prepared, evidence));
+    return false;
+  }
+  const bool finalized = engine.FinalizeCommit(checkpoint, evidence);
+  const bool final_local = finalized && checkpoint.successful_commit &&
+      evidence.committed && !evidence.retry_available &&
+      evidence.collective_consensus &&
+      evidence.contract_reason == FailureReason::none &&
+      evidence.status == CudaRunStatus::committed &&
+      evidence.after.step == target_step &&
+      evidence.after.generation == target_step &&
+      std::abs(evidence.after.time - fixed_dt * target_step) <= 1.0e-14 &&
+      SameCoordinates(contract->coordinates(), snapshot.target) &&
+      evidence.products.CoupledAndOrdered() && evidence.no_fallback &&
+      evidence.device_resident &&
+      AuditedAllocator::W8OwnedAllocationCalls() == owned_calls &&
+      AuditedAllocator::DeallocationEvents() == deallocations &&
+      ExactAttemptEvidence(evidence, ranks) && ExactPolicyLedgers();
+  const bool final_collective = CollectivelyExact(final_local);
+  if (!final_collective)
+  {
+    ReportCommitFailure(rank, "functional-finalize", retry, target_step);
+    return false;
+  }
+
+  // Publication is already committed here.  A failure is terminal for this
+  // engine instance and must never be represented as a rollback.
+  auto published = std::make_unique<CudaOraclePod>();
+  const CudaAllocationLedgerV1 publication_allocation_before =
+      AuditedAllocator::Ledger();
+  const auto publication_transfer_before =
+      std::make_unique<CudaTransferLedgerV1>(AuditedTransport::Ledger());
+  const CudaTransferTotals publication_totals_before =
+      AuditedTransport::Accounting();
+  const bool export_return = engine.ExportOracle(*published);
+  const bool export_return_collective = CollectivelyExact(export_return);
+  if (!export_return_collective)
+  {
+    ReportCommitFailure(rank, "functional-publication-export", retry,
+                        target_step);
+    return false;
+  }
+  const bool export_identity =
+      OracleIdentity(*published, snapshot, ranks, rank);
+  const bool export_shape = ExactOracleShape(
+      *published, FunctionalOracleShape(ranks, rank));
+  const bool export_independent = cuda_w8a_test_oracle::Verify(*published);
+  const bool export_semantic_identity =
+      SameOraclePodSemantic(*staged_oracle, *published);
+  const bool export_allocation = CollectivelyExactAllocatorState(
+      accepted_allocation_events, owned_calls, deallocations);
+  const bool export_policy =
+      SameLedger(publication_allocation_before,
+                 AuditedAllocator::Ledger()) &&
+      SameLedger(*publication_transfer_before,
+                 AuditedTransport::Ledger()) &&
+      SameTotals(publication_totals_before,
+                 AuditedTransport::Accounting()) &&
+      ExactPolicyLedgers();
+  const bool export_local = export_return_collective && export_identity &&
+      export_shape && export_independent && export_semantic_identity &&
+      export_allocation && export_policy;
+  const bool export_collective = CollectivelyExact(export_local);
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_ORACLE_PUBLICATION case=%s rank=%d ranks=%d "
+      "target=%llu retry=%u return=%u identity=%u shape=%u verify=%u "
+      "semantic_identity=%u allocation=%u policy=%u local=%s "
+      "collective=%s\n",
+      case_id != nullptr ? case_id : "null", rank, ranks,
+      static_cast<unsigned long long>(target_step), retry ? 1U : 0U,
+      export_return ? 1U : 0U, export_identity ? 1U : 0U,
+      export_shape ? 1U : 0U, export_independent ? 1U : 0U,
+      export_semantic_identity ? 1U : 0U,
+      export_allocation ? 1U : 0U, export_policy ? 1U : 0U,
+      export_local ? "PASS" : "FAIL",
+      export_collective ? "PASS" : "FAIL");
+  if (!export_collective)
+  {
+    ReportCommitFailure(rank, "functional-publication-audit", retry,
+                        target_step);
+    return false;
+  }
+  if (accepted_oracle != nullptr) { *accepted_oracle = *published; }
+  census.Credit(lane, retry, mutation_required);
+  return true;
+}
+
+template <typename Engine>
+bool InjectFunctionalRollback(
+    Engine& engine, const int ranks, const int rank,
+    const CudaOraclePod& accepted_oracle,
+    const char* const case_id) noexcept
+{
+  const auto* contract = engine.contract();
+  if (!CollectivelyExact(contract != nullptr)) { return false; }
+  const StateCoordinates before = contract->coordinates();
+  const RunTelemetry& telemetry = contract->telemetry();
+  const auto publication = contract->Published();
+  auto published_before = std::make_unique<CudaOraclePod>();
+  const bool prior_export = engine.ExportOracle(*published_before);
+  const bool prior_export_collective = CollectivelyExact(prior_export);
+  if (!prior_export_collective) { return false; }
+  const bool prior_contract_binding = telemetry.accepted.valid &&
+      SameCoordinates(telemetry.accepted.coordinates, before) &&
+      before.step == functional_injected_step - 1 &&
+      before.generation == functional_injected_step - 1 &&
+      telemetry.accepted.attempt.identity.sequence ==
+          published_before->attempt_sequence &&
+      telemetry.accepted.attempt.identity.committed_step == before.step - 1 &&
+      telemetry.accepted.attempt.identity.committed_generation ==
+          before.generation - 1 &&
+      telemetry.accepted.attempt.identity.retry_index == 0 &&
+      std::memcmp(&telemetry.accepted.attempt.identity.dt, &before.dt,
+                  sizeof(double)) == 0 &&
+      telemetry.accepted.attempt.failure_reason == FailureReason::none &&
+      telemetry.accepted.attempt.validated_product_mask == 0x0fU &&
+      std::isfinite(
+          telemetry.accepted.attempt.true_relative_residual) &&
+      telemetry.accepted.attempt.true_relative_residual <= 1.0e-10 &&
+      telemetry.accepted.attempt.prohibited.Clean();
+  const bool prior_publication_continuity =
+      SameOraclePodSemantic(*published_before, accepted_oracle);
+  const bool prior_metadata_exact = prior_contract_binding &&
+      prior_publication_continuity &&
+      published_before->product_generation != 0 &&
+      ExactOracleShape(
+          *published_before, FunctionalOracleShape(ranks, rank));
+  // Verify enters MPI collectives.  Normalize every rank-local prerequisite
+  // before entry, then normalize the verifier result as a separate phase.
+  const bool prior_metadata_collective =
+      CollectivelyExact(prior_metadata_exact);
+  const bool prior_verify_local = prior_metadata_collective
+      ? cuda_w8a_test_oracle::Verify(*published_before) : false;
+  const bool prior_verify_collective =
+      CollectivelyExact(prior_verify_local);
+  const bool prior_collective =
+      prior_metadata_collective && prior_verify_collective;
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_PRIOR_ORACLE_BINDING case=%s rank=%d ranks=%d "
+      "step=%llu generation=%llu accepted_attempt=%llu/%llu "
+      "oracle_attempt=%llu product_generation=%llu contract=%u "
+      "continuity=%u metadata=%u/%u verify=%u/%u overall=%s\n",
+      case_id != nullptr ? case_id : "null", rank, ranks,
+      static_cast<unsigned long long>(before.step),
+      static_cast<unsigned long long>(before.generation),
+      static_cast<unsigned long long>(
+          telemetry.accepted.attempt.identity.sequence),
+      static_cast<unsigned long long>(
+          telemetry.accepted.attempt.identity.committed_step),
+      static_cast<unsigned long long>(published_before->attempt_sequence),
+      static_cast<unsigned long long>(published_before->product_generation),
+      prior_contract_binding ? 1U : 0U,
+      prior_publication_continuity ? 1U : 0U,
+      prior_metadata_exact ? 1U : 0U,
+      prior_metadata_collective ? 1U : 0U,
+      prior_verify_local ? 1U : 0U,
+      prior_verify_collective ? 1U : 0U,
+      prior_collective ? "PASS" : "FAIL");
+  if (!prior_collective)
+    return false;
+  CudaPrecommitSnapshot snapshot{};
+  CudaStepEvidence evidence{};
+  CudaSerializedCheckpointV1 prohibited{};
+  const bool prepared = engine.PrepareStep(false, snapshot, evidence);
+  const bool injected_local = prepared &&
+      snapshot.target.step == functional_injected_step &&
+      snapshot.numerical_candidate_ready &&
+      evidence.phase == CudaFailurePhase::after_recovery_before_commit &&
+      evidence.source_rank == ranks - 1;
+  if (!CollectivelyExact(injected_local))
+  {
+    (void)ResolveUnexpectedAffineExit(
+        engine, prohibited, evidence, snapshot, case_id, ranks, rank,
+        FailureReason::backend_failure,
+        CudaFailurePhase::after_recovery_before_commit,
+        PhaseAfterPrepareStep(prepared, evidence));
+    return false;
+  }
+
+  const CudaAllocationLedgerV1 allocation_before =
+      AuditedAllocator::Ledger();
+  const auto transfer_before =
+      std::make_unique<CudaTransferLedgerV1>(AuditedTransport::Ledger());
+  const CudaTransferTotals transfer_totals_before =
+      AuditedTransport::Accounting();
+  const std::uint64_t owned_before =
+      AuditedAllocator::W8OwnedAllocationCalls();
+  const std::uint64_t deallocations_before =
+      AuditedAllocator::DeallocationEvents();
+  const bool staging_rejected =
+      !engine.StagePreparedCheckpoint(prohibited, evidence);
+  auto prohibited_oracle = std::make_unique<CudaOraclePod>();
+  const bool oracle_staging_rejected =
+      !engine.StagePreparedOracle(*prohibited_oracle, evidence);
+  const bool prohibited_oracle_clear =
+      prohibited_oracle->attempt_sequence == 0 &&
+      prohibited_oracle->product_generation == 0;
+  auto visible_during = std::make_unique<CudaOraclePod>();
+  const bool visible_during_return = engine.ExportOracle(*visible_during);
+  const bool visible_during_collective =
+      CollectivelyExact(visible_during_return);
+  const bool prior_identity_preserved = visible_during_return &&
+      SameOraclePodSemantic(*visible_during, *published_before) &&
+      visible_during->attempt_sequence != snapshot.attempt.sequence &&
+      visible_during->product_generation !=
+          snapshot.products.residual_generation &&
+      ExactOracleShape(
+          *visible_during, FunctionalOracleShape(ranks, rank));
+  const bool candidate_exported = visible_during_return &&
+      (visible_during->attempt_sequence == snapshot.attempt.sequence ||
+       visible_during->product_generation ==
+           snapshot.products.residual_generation);
+  const bool prior_identity_collective =
+      CollectivelyExact(prior_identity_preserved);
+  const bool visible_during_verify_entry =
+      visible_during_collective && prior_identity_collective;
+  const bool visible_during_verify_local = visible_during_verify_entry
+      ? cuda_w8a_test_oracle::Verify(*visible_during) : false;
+  const bool visible_during_verify_collective =
+      CollectivelyExact(visible_during_verify_local);
+  const bool visible_during_exact = visible_during_collective &&
+      prior_identity_collective && visible_during_verify_collective;
+  const bool staging_ledgers_exact =
+      SameLedger(allocation_before, AuditedAllocator::Ledger()) &&
+      SameLedger(*transfer_before, AuditedTransport::Ledger()) &&
+      SameTotals(transfer_totals_before, AuditedTransport::Accounting()) &&
+      AuditedAllocator::W8OwnedAllocationCalls() == owned_before &&
+      AuditedAllocator::DeallocationEvents() == deallocations_before &&
+      ExactPolicyLedgers();
+  const bool rolled_back = ResolveUnexpectedAffineExit(
+      engine, prohibited, evidence, snapshot, case_id, ranks, rank,
+      FailureReason::backend_failure,
+      CudaFailurePhase::after_recovery_before_commit,
+      AffineLocalPhase::staging);
+  auto published_after = std::make_unique<CudaOraclePod>();
+  const bool after_export = engine.ExportOracle(*published_after);
+  const bool after_export_collective = CollectivelyExact(after_export);
+  const bool prior_publication_retained = after_export &&
+      SameOraclePodSemantic(*published_after, *published_before) &&
+      ExactOracleShape(
+          *published_after, FunctionalOracleShape(ranks, rank));
+  const bool prior_publication_collective =
+      CollectivelyExact(prior_publication_retained);
+  const bool published_after_verify_entry =
+      after_export_collective && prior_publication_collective;
+  const bool published_after_verify_local = published_after_verify_entry
+      ? cuda_w8a_test_oracle::Verify(*published_after) : false;
+  const bool published_after_verify_collective =
+      CollectivelyExact(published_after_verify_local);
+  StateCoordinates visible{};
+  const bool exact_local = staging_rejected && rolled_back &&
+      oracle_staging_rejected && prohibited_oracle_clear &&
+      !candidate_exported && visible_during_exact &&
+      staging_ledgers_exact && after_export_collective &&
+      prior_publication_collective && published_after_verify_collective &&
+      evidence.status == CudaRunStatus::retry_available &&
+      evidence.retry_available && !evidence.committed &&
+      evidence.coordinates_preserved && evidence.committed_bytes_preserved &&
+      SameCoordinates(contract->coordinates(), before) &&
+      contract->PublishedCoordinates(publication, visible) &&
+      SameCoordinates(visible, before) && !prohibited.candidate_frozen &&
+      !prohibited.checkpoint_staged && !prohibited.output_staged &&
+      !prohibited.successful_commit && ExactPolicyLedgers();
+  const bool exact_collective = CollectivelyExact(exact_local);
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_ROLLBACK_ORACLE case=%s rank=%d ranks=%d "
+      "target=%llu checkpoint_rejected=%u oracle_stage_rejected=%u "
+      "oracle_candidate_clear=%u candidate_exported=%u prior_visible=%u "
+      "ledgers_unchanged=%u "
+      "checkpoint_flags=%u/%u/%u/%u publication_retained=%u "
+      "local=%s collective=%s\n",
+      case_id != nullptr ? case_id : "null", rank, ranks,
+      static_cast<unsigned long long>(functional_injected_step),
+      staging_rejected ? 1U : 0U, oracle_staging_rejected ? 1U : 0U,
+      prohibited_oracle_clear ? 1U : 0U,
+      candidate_exported ? 1U : 0U,
+      visible_during_exact ? 1U : 0U, staging_ledgers_exact ? 1U : 0U,
+      prohibited.candidate_frozen ? 1U : 0U,
+      prohibited.checkpoint_staged ? 1U : 0U,
+      prohibited.output_staged ? 1U : 0U,
+      prohibited.successful_commit ? 1U : 0U,
+      (prior_publication_collective &&
+       published_after_verify_collective) ? 1U : 0U,
+      exact_local ? "PASS" : "FAIL",
+      exact_collective ? "PASS" : "FAIL");
+  return exact_collective;
+}
+
+template <typename Backend>
+bool RunFunctionalTrajectory(const int ranks, const char* const context)
+    noexcept
+{
+  FunctionalOracleCensus oracle_census{};
+  StateHash reference_interior{};
+  StateHash reference_trace{};
+  {
+    auto reference = std::make_unique<TestEngine<Backend>>(
+        FunctionalConfig(ranks, false));
+    CudaRunEvidence setup{};
+    if (!InitializePositive(*reference, setup, ranks, context) ||
+        !setup.reuse.persistent_graph || !setup.reuse.persistent_slots ||
+        !setup.reuse.persistent_workspace)
+      return false;
+    CudaSerializedCheckpointV1 step{};
+    for (std::uint64_t target = 1;
+         target <= functional_accepted_steps; ++target)
+    {
+      if (!CommitFunctionalAttempt(
+              *reference, false, target, ranks, setup.rank, step,
+              FunctionalOracleLane::reference, oracle_census, context))
+        return false;
+    }
+    const auto* contract = reference->contract();
+    const CudaReuseEvidence current_reuse = reference->ReuseEvidence();
+    const bool contract_present = contract != nullptr;
+    const std::uint64_t terminal_step =
+        contract_present ? contract->coordinates().step : 0;
+    const std::uint64_t terminal_cursor =
+        contract_present ? contract->coordinates().cursor : 0;
+    const std::uint64_t terminal_commits =
+        contract_present ? contract->telemetry().commits : 0;
+    const bool persistent_identity_exact =
+        SamePersistentIdentity(setup.reuse, current_reuse, ranks);
+    const bool reference_terminal_local = contract_present &&
+        terminal_step == functional_accepted_steps &&
+        terminal_cursor == functional_accepted_steps &&
+        terminal_commits == functional_accepted_steps &&
+        persistent_identity_exact;
+    const bool reference_terminal_collective =
+        CollectivelyExact(reference_terminal_local);
+    ReportFunctionalReferenceTerminalDiagnostic(
+        setup.rank, ranks, contract_present, terminal_step,
+        terminal_cursor, terminal_commits, setup.reuse, current_reuse,
+        persistent_identity_exact, reference_terminal_local,
+        reference_terminal_collective);
+    if (!reference_terminal_collective)
+      return false;
+    reference_interior = step.descriptor.interior_hash;
+    reference_trace = step.descriptor.trace_hash;
+  }
+
+  CudaSerializedCheckpointV1 bridge{};
+  {
+    auto writer = std::make_unique<TestEngine<Backend>>(
+        FunctionalConfig(ranks, true));
+    CudaRunEvidence setup{};
+    if (!InitializePositive(*writer, setup, ranks, context) ||
+        !setup.reuse.persistent_graph || !setup.reuse.persistent_slots ||
+        !setup.reuse.persistent_workspace)
+      return false;
+    for (std::uint64_t target = 1;
+         target <= functional_checkpoint_step; ++target)
+    {
+      CudaSerializedCheckpointV1 step{};
+      if (!CommitFunctionalAttempt(
+              *writer, false, target, ranks, setup.rank, step,
+              FunctionalOracleLane::checkpoint_writer, oracle_census,
+              context))
+        return false;
+      if (target == functional_checkpoint_step) { bridge = step; }
+    }
+    const bool bridge_local = bridge.successful_commit &&
+        bridge.descriptor.coordinates.step == functional_checkpoint_step &&
+        bridge.descriptor.coordinates.generation ==
+            functional_checkpoint_step &&
+        std::abs(bridge.descriptor.coordinates.time - 0.5) <= 1.0e-14 &&
+        SamePersistentIdentity(setup.reuse, writer->ReuseEvidence(), ranks);
+    if (!CollectivelyExact(bridge_local)) { return false; }
+  }
+
+  auto reader = std::make_unique<TestEngine<Backend>>(
+      FunctionalConfig(ranks, true));
+  CudaRunEvidence setup{};
+  if (!InitializePositive(*reader, setup, ranks, context) ||
+      !setup.reuse.persistent_graph || !setup.reuse.persistent_slots ||
+      !setup.reuse.persistent_workspace)
+    return false;
+  CudaStepEvidence restored{};
+  const bool restore_local = reader->Restore(bridge, restored) &&
+      restored.committed &&
+      restored.after.step == functional_checkpoint_step &&
+      restored.after.generation == functional_checkpoint_step &&
+      restored.after.cursor == functional_checkpoint_step &&
+      restored.after_interior_hash == bridge.descriptor.interior_hash &&
+      restored.after_trace_hash == bridge.descriptor.trace_hash;
+  if (!CollectivelyExact(restore_local)) { return false; }
+
+  CudaSerializedCheckpointV1 final_checkpoint{};
+  auto accepted_reader_oracle = std::make_unique<CudaOraclePod>();
+  for (std::uint64_t target = functional_checkpoint_step + 1;
+       target < functional_injected_step; ++target)
+  {
+    if (!CommitFunctionalAttempt(
+            *reader, false, target, ranks, setup.rank, final_checkpoint,
+            FunctionalOracleLane::restored_reader, oracle_census, context,
+            accepted_reader_oracle.get()))
+      return false;
+  }
+  if (!InjectFunctionalRollback(
+          *reader, ranks, setup.rank, *accepted_reader_oracle, context) ||
+      !CommitFunctionalAttempt(
+          *reader, true, functional_injected_step, ranks, setup.rank,
+          final_checkpoint, FunctionalOracleLane::restored_reader,
+          oracle_census, context))
+    return false;
+  for (std::uint64_t target = functional_injected_step + 1;
+       target <= functional_accepted_steps; ++target)
+  {
+    if (!CommitFunctionalAttempt(
+            *reader, false, target, ranks, setup.rank, final_checkpoint,
+            FunctionalOracleLane::restored_reader, oracle_census, context))
+      return false;
+  }
+  const auto* contract = reader->contract();
+  const bool oracle_census_local = oracle_census.Exact();
+  const bool oracle_census_collective =
+      CollectivelyExact(oracle_census_local);
+  const bool final_local = contract != nullptr &&
+      contract->coordinates().step == functional_accepted_steps &&
+      contract->coordinates().generation == functional_accepted_steps &&
+      contract->coordinates().cursor == functional_accepted_steps + 1 &&
+      std::abs(contract->coordinates().time - 1.0) <= 1.0e-14 &&
+      contract->telemetry().commits == functional_checkpoint_step &&
+      final_checkpoint.successful_commit &&
+      final_checkpoint.descriptor.interior_hash == reference_interior &&
+      final_checkpoint.descriptor.trace_hash == reference_trace &&
+      contract->telemetry().last_attempt.prohibited.fallback_events == 0 &&
+      SamePersistentIdentity(setup.reuse, reader->ReuseEvidence(), ranks) &&
+      ExactPolicyLedgers() && oracle_census_collective;
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_ORACLE_CENSUS case=%s rank=%d ranks=%d "
+      "reference=%llu/20 checkpoint_writer=%llu/10 "
+      "restored_reader=%llu/10 accepted_retry=%llu/1 total=%llu/40 "
+      "mutation_required=%llu/5 local=%s collective=%s\n",
+      context != nullptr ? context : "null", setup.rank, ranks,
+      static_cast<unsigned long long>(oracle_census.reference),
+      static_cast<unsigned long long>(oracle_census.checkpoint_writer),
+      static_cast<unsigned long long>(oracle_census.restored_reader),
+      static_cast<unsigned long long>(oracle_census.accepted_retry),
+      static_cast<unsigned long long>(oracle_census.total),
+      static_cast<unsigned long long>(oracle_census.mutation_required),
+      oracle_census_local ? "PASS" : "FAIL",
+      oracle_census_collective ? "PASS" : "FAIL");
+  std::fprintf(stderr,
+      "CUDA_FUNCTIONAL_RESULT rank=%d ranks=%d step=%llu generation=%llu "
+      "cursor=%llu restart=10 retry=14 local=%s\n",
+      setup.rank, ranks,
+      static_cast<unsigned long long>(
+          contract == nullptr ? 0 : contract->coordinates().step),
+      static_cast<unsigned long long>(
+          contract == nullptr ? 0 : contract->coordinates().generation),
+      static_cast<unsigned long long>(
+          contract == nullptr ? 0 : contract->coordinates().cursor),
+      final_local ? "PASS" : "FAIL");
+  return CollectivelyExact(final_local);
 }
 
 template <typename Backend>
@@ -4638,6 +5849,8 @@ int main(int argc, char** argv)
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
   const bool token_mode = argc == 2 &&
       std::string_view(argv[1]) == "--token-negatives";
+  const bool functional_mode = argc == 2 &&
+      std::string_view(argv[1]) == "--functional";
   bool pass = true;
   const auto run_case_impl = [&](const char* const case_label,
                                  auto&& case_body)
@@ -4666,12 +5879,26 @@ int main(int argc, char** argv)
   };
 #define run_case(case_label, ...) \
   run_case_impl(case_label, [&]() noexcept { return (__VA_ARGS__); })
-  if (ranks == 1)
+  if (functional_mode && ranks == 1)
+  {
+    run_case("rank1.functional.p2-n6-step20-restart-retry",
+             RunFunctionalTrajectory<TestRankOneBackendTag>(
+                 1, "rank1.functional.p2-n6-step20-restart-retry"));
+  }
+  else if (functional_mode && ranks == 2)
+  {
+    run_case("rank2.functional.p2-n6-step20-restart-retry",
+             RunFunctionalTrajectory<TestRankTwoBackendTag>(
+                 2, "rank2.functional.p2-n6-step20-restart-retry"));
+  }
+  else if (ranks == 1)
   {
     run_case("rank1.common.hypre-setup-order",
              HypreIluGenerationSetupRegression());
     run_case("rank1.common.ticket-high-half",
              TicketHighHalfRegression());
+    run_case("rank1.common.retained-delayed-pivot",
+             RetainedDelayedPivotRegression());
     run_case("rank1.common.shared-contract-negatives",
              DirectSharedContractNegatives());
     run_case("rank1.common.collective-case-boundary",
@@ -4750,6 +5977,8 @@ int main(int argc, char** argv)
              HypreIluGenerationSetupRegression());
     run_case("rank2.common.ticket-high-half",
              TicketHighHalfRegression());
+    run_case("rank2.common.retained-delayed-pivot",
+             RetainedDelayedPivotRegression());
     run_case("rank2.common.shared-contract-negatives",
              DirectSharedContractNegatives());
     run_case("rank2.common.collective-case-boundary",

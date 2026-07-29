@@ -1173,33 +1173,40 @@ __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
   const int element = blockIdx.x * blockDim.x + threadIdx.x;
   if (element >= shape.elements) return;
   view.status[element] = 1.0;
-  const int ni0 = element * interior_dofs_per_element;
-  const int nt0 = element * trace_dofs_per_element;
+  const int ni0 = element * shape.interior_dofs;
+  const int nt0 = element * shape.trace_dofs;
   for (int q = 0; q < shape.volume_points; ++q)
   {
     const int qp = element * shape.volume_points + q;
     double state[4] = {};
-    for (int scalar = 0; scalar < scalar_dofs_per_element; ++scalar)
+    for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
       for (int component = 0; component < 4; ++component)
-        state[component] += view.volume_shape[qp*scalar_dofs_per_element+scalar] *
-            view.work_interior[ni0+ByNodes(scalar,scalar_dofs_per_element,component)];
+        state[component] +=
+            view.volume_shape[qp * shape.scalar_interior_dofs + scalar] *
+            view.work_interior[ni0 + ByNodes(
+                scalar, shape.scalar_interior_dofs, component)];
     if (!Admissible(state)) { view.status[element] = -1.0; return; }
   }
   for (int face = 0; face < faces_per_element; ++face)
     for (int q = 0; q < shape.face_points; ++q)
     {
       const int qp = (element*faces_per_element+face)*shape.face_points+q;
-      const int offset = face*conserved_components*scalar_dofs_per_face;
+      const int offset =
+          face * conserved_components * shape.scalar_face_dofs;
       double interior[4] = {}, trace[4] = {};
-      for (int scalar = 0; scalar < scalar_dofs_per_element; ++scalar)
+      for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
         for (int component = 0; component < 4; ++component)
           interior[component] +=
-              view.face_interior_shape[qp*scalar_dofs_per_element+scalar] *
-              view.work_interior[ni0+ByNodes(scalar,4,component)];
-      for (int scalar = 0; scalar < scalar_dofs_per_face; ++scalar)
+              view.face_interior_shape[
+                  qp * shape.scalar_interior_dofs + scalar] *
+              view.work_interior[ni0 + ByNodes(
+                  scalar, shape.scalar_interior_dofs, component)];
+      for (int scalar = 0; scalar < shape.scalar_face_dofs; ++scalar)
         for (int component = 0; component < 4; ++component)
-          trace[component] += view.face_trace_shape[qp*2+scalar] *
-              view.current_local_trace[nt0+offset+ByNodes(scalar,2,component)];
+          trace[component] +=
+              view.face_trace_shape[qp * shape.scalar_face_dofs + scalar] *
+              view.current_local_trace[nt0 + offset + ByNodes(
+                  scalar, shape.scalar_face_dofs, component)];
       if (!Admissible(interior) || !Admissible(trace))
       { view.status[element] = -2.0; return; }
     }
@@ -1212,7 +1219,8 @@ __global__ void AssemblyKernel(CudaDeviceView v, CudaMeshShape s,
 {
   const int e = blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= s.elements) return;
-  const int ni = interior_dofs_per_element, nt = trace_dofs_per_element;
+  const int ni = s.interior_dofs, nt = s.trace_dofs;
+  const int si = s.scalar_interior_dofs, sf = s.scalar_face_dofs;
   const int e_i = e*ni, e_t = e*nt;
   const std::size_t ao = static_cast<std::size_t>(e)*ni*ni;
   const std::size_t bo = static_cast<std::size_t>(e)*ni*nt;
@@ -1230,30 +1238,31 @@ __global__ void AssemblyKernel(CudaDeviceView v, CudaMeshShape s,
     const int qp=e*s.volume_points+q;
     const double w=v.volume_weight[qp];
     double state[4]={}, old[4]={};
-    for(int a=0;a<4;++a) for(int k=0;k<4;++k)
+    for(int a=0;a<si;++a) for(int k=0;k<4;++k)
     {
-      const double phi=v.volume_shape[qp*4+a];
-      state[k]+=phi*v.work_interior[e_i+ByNodes(a,4,k)];
-      old[k]+=phi*v.old_interior[e_i+ByNodes(a,4,k)];
+      const double phi=v.volume_shape[qp*si+a];
+      state[k]+=phi*v.work_interior[e_i+ByNodes(a,si,k)];
+      old[k]+=phi*v.old_interior[e_i+ByNodes(a,si,k)];
     }
     double source[4], fx[4], fy[4], jx[16], jy[16];
     if (!(w>0) || !Source(v.volume_position[qp*2],v.volume_position[qp*2+1],source) ||
         !FluxJacobian(state,1,0,fx,jx) || !FluxJacobian(state,0,1,fy,jy))
     { v.status[e]=-1; return; }
-    for(int row=0;row<4;++row)
+    for(int row=0;row<si;++row)
     {
-      const double phi=v.volume_shape[qp*4+row];
-      const double dx=v.volume_derivative[(qp*4+row)*2];
-      const double dy=v.volume_derivative[(qp*4+row)*2+1];
+      const double phi=v.volume_shape[qp*si+row];
+      const double dx=v.volume_derivative[(qp*si+row)*2];
+      const double dy=v.volume_derivative[(qp*si+row)*2+1];
       for(int rc=0;rc<4;++rc)
       {
-        const int lr=ByNodes(row,4,rc);
+        const int lr=ByNodes(row,si,rc);
         v.residual_r[e_i+lr]+=w*(phi*(state[rc]-old[rc])/dt-dx*fx[rc]-dy*fy[rc]-phi*source[rc]);
-        for(int col=0;col<4;++col) for(int cc=0;cc<4;++cc)
+        for(int col=0;col<si;++col) for(int cc=0;cc<4;++cc)
         {
-          const int lc=ByNodes(col,4,cc);
-          const double mass=rc==cc?phi*v.volume_shape[qp*4+col]/dt:0;
-          const double flux=-(dx*jx[rc*4+cc]+dy*jy[rc*4+cc])*v.volume_shape[qp*4+col];
+          const int lc=ByNodes(col,si,cc);
+          const double mass=rc==cc?phi*v.volume_shape[qp*si+col]/dt:0;
+          const double flux=-(dx*jx[rc*4+cc]+dy*jy[rc*4+cc])*
+              v.volume_shape[qp*si+col];
           v.a[ao+lr*ni+lc]+=w*(mass+flux);
         }
       }
@@ -1262,40 +1271,47 @@ __global__ void AssemblyKernel(CudaDeviceView v, CudaMeshShape s,
   for(int face=0;face<4;++face) for(int q=0;q<s.face_points;++q)
   {
     const int qp=(e*4+face)*s.face_points+q;
-    const int to=face*8; const double w=v.face_weight[qp];
+    const int to=face*conserved_components*sf;
+    const double w=v.face_weight[qp];
     double u[4]={}, l[4]={};
-    for(int a=0;a<4;++a) for(int k=0;k<4;++k)
-      u[k]+=v.face_interior_shape[qp*4+a]*v.work_interior[e_i+ByNodes(a,4,k)];
-    for(int a=0;a<2;++a) for(int k=0;k<4;++k)
-      l[k]+=v.face_trace_shape[qp*2+a]*v.current_local_trace[e_t+to+ByNodes(a,2,k)];
+    for(int a=0;a<si;++a) for(int k=0;k<4;++k)
+      u[k]+=v.face_interior_shape[qp*si+a]*
+          v.work_interior[e_i+ByNodes(a,si,k)];
+    for(int a=0;a<sf;++a) for(int k=0;k<4;++k)
+      l[k]+=v.face_trace_shape[qp*sf+a]*
+          v.current_local_trace[e_t+to+ByNodes(a,sf,k)];
     double flux[4], jac[16];
     if(!(w>0)||!FluxJacobian(l,v.face_normal[qp*2],v.face_normal[qp*2+1],flux,jac))
     {v.status[e]=-2;return;}
-    for(int row=0;row<4;++row)
+    for(int row=0;row<si;++row)
     {
-      const double rp=v.face_interior_shape[qp*4+row];
+      const double rp=v.face_interior_shape[qp*si+row];
       for(int rc=0;rc<4;++rc)
       {
-        const int lr=ByNodes(row,4,rc);
+        const int lr=ByNodes(row,si,rc);
         v.residual_r[e_i+lr]+=w*rp*(flux[rc]+cuda_tau*(u[rc]-l[rc]));
-        for(int col=0;col<4;++col)
-          v.a[ao+lr*ni+ByNodes(col,4,rc)]+=w*rp*cuda_tau*v.face_interior_shape[qp*4+col];
-        for(int col=0;col<2;++col) for(int cc=0;cc<4;++cc)
-          v.b[bo+lr*nt+to+ByNodes(col,2,cc)]+=w*rp*v.face_trace_shape[qp*2+col]*
+        for(int col=0;col<si;++col)
+          v.a[ao+lr*ni+ByNodes(col,si,rc)]+=w*rp*cuda_tau*
+              v.face_interior_shape[qp*si+col];
+        for(int col=0;col<sf;++col) for(int cc=0;cc<4;++cc)
+          v.b[bo+lr*nt+to+ByNodes(col,sf,cc)]+=w*rp*
+              v.face_trace_shape[qp*sf+col]*
               (jac[rc*4+cc]-(rc==cc?cuda_tau:0));
       }
     }
-    for(int row=0;row<2;++row)
+    for(int row=0;row<sf;++row)
     {
-      const double rp=v.face_trace_shape[qp*2+row];
+      const double rp=v.face_trace_shape[qp*sf+row];
       for(int rc=0;rc<4;++rc)
       {
-        const int lr=to+ByNodes(row,2,rc);
+        const int lr=to+ByNodes(row,sf,rc);
         v.residual_g[e_t+lr]+=w*rp*(flux[rc]+cuda_tau*(u[rc]-l[rc]));
-        for(int col=0;col<4;++col)
-          v.c[co+lr*ni+ByNodes(col,4,rc)]+=w*rp*cuda_tau*v.face_interior_shape[qp*4+col];
-        for(int col=0;col<2;++col) for(int cc=0;cc<4;++cc)
-          v.d[doff+lr*nt+to+ByNodes(col,2,cc)]+=w*rp*v.face_trace_shape[qp*2+col]*
+        for(int col=0;col<si;++col)
+          v.c[co+lr*ni+ByNodes(col,si,rc)]+=w*rp*cuda_tau*
+              v.face_interior_shape[qp*si+col];
+        for(int col=0;col<sf;++col) for(int cc=0;cc<4;++cc)
+          v.d[doff+lr*nt+to+ByNodes(col,sf,cc)]+=w*rp*
+              v.face_trace_shape[qp*sf+col]*
               (jac[rc*4+cc]-(rc==cc?cuda_tau:0));
       }
     }
@@ -1304,29 +1320,10 @@ __global__ void AssemblyKernel(CudaDeviceView v, CudaMeshShape s,
   for(int i=0;i<nt;++i) v.g[e_t+i]=-v.residual_g[e_t+i];
 }
 
-__device__ bool FactorSolve(double* lu, double* pivots, const int n,
-                            double* rhs, const int columns)
-{
-  double scale=0; for(int i=0;i<n*n;++i) scale=fmax(scale,fabs(lu[i]));
-  for(int k=0;k<n;++k)
-  {
-    int pivot=k; for(int r=k+1;r<n;++r)
-      if(fabs(lu[r*n+k])>fabs(lu[pivot*n+k])) pivot=r;
-    pivots[k]=pivot;
-    if(!(fabs(lu[pivot*n+k])>64.0*2.2204460492503131e-16*scale)) return false;
-    if(pivot!=k) for(int c=0;c<n;++c)
-    {double x=lu[k*n+c];lu[k*n+c]=lu[pivot*n+c];lu[pivot*n+c]=x;}
-    for(int r=k+1;r<n;++r){lu[r*n+k]/=lu[k*n+k];for(int c=k+1;c<n;++c)lu[r*n+c]-=lu[r*n+k]*lu[k*n+c];}
-  }
-  for(int k=0;k<n;++k){const int p=static_cast<int>(pivots[k]);if(p!=k)for(int c=0;c<columns;++c){double x=rhs[k*columns+c];rhs[k*columns+c]=rhs[p*columns+c];rhs[p*columns+c]=x;}for(int r=k+1;r<n;++r)for(int c=0;c<columns;++c)rhs[r*columns+c]-=lu[r*n+k]*rhs[k*columns+c];}
-  for(int k=n-1;k>=0;--k)for(int c=0;c<columns;++c){for(int j=k+1;j<n;++j)rhs[k*columns+c]-=lu[k*n+j]*rhs[j*columns+c];rhs[k*columns+c]/=lu[k*n+k];}
-  return true;
-}
-
 __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;
-  constexpr int ni=16,nt=32,cols=33;
+  const int ni=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
   const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
   const std::size_t bo=static_cast<std::size_t>(e)*ni*nt;
   const std::size_t co=static_cast<std::size_t>(e)*nt*ni;
@@ -1335,7 +1332,7 @@ __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
   double* w=v.solve_workspace+static_cast<std::size_t>(e)*ni*cols;
   for(int i=0;i<ni*ni;++i)lu[i]=v.a[ao+i];
   for(int r=0;r<ni;++r){for(int c=0;c<nt;++c)w[r*cols+c]=v.b[bo+r*nt+c];w[r*cols+nt]=v.f[e*ni+r];}
-  if(!FactorSolve(lu,p,ni,w,cols)){v.status[e]=-1;return;}
+  if(!CudaFactorSolveRetained(lu,p,ni,w,cols)){v.status[e]=-1;return;}
   for(int r=0;r<nt;++r){double rhs=v.g[e*nt+r];for(int k=0;k<ni;++k)rhs-=v.c[co+r*ni+k]*w[k*cols+nt];v.condensed_rhs[e*nt+r]=rhs;for(int c=0;c<nt;++c){double x=v.d[so+r*nt+c];for(int k=0;k<ni;++k)x-=v.c[co+r*ni+k]*w[k*cols+c];v.schur[so+r*nt+c]=x;}}
   v.status[e]=1;
 }
@@ -1343,28 +1340,37 @@ __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
 __global__ void ZeroSystemKernel(CudaTrueMatrixDeviceView m,double* rhs,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<m.diag_nonzeros)m.diag_values[i]=0;if(i<m.offd_nonzeros)m.offd_values[i]=0;if(i<n)rhs[i]=0;}
 
-__device__ double SignedMatrixValue(CudaDeviceView v,const int source)
-{const int e=source/(32*32),rem=source-e*32*32,r=rem/32,c=rem-r*32;double rs,cs;Decode(v.signed_element_trace[e*32+r],rs);Decode(v.signed_element_trace[e*32+c],cs);return rs*cs*v.schur[source];}
-__device__ double SignedVectorValue(CudaDeviceView v,const double* values,const int source)
-{const int e=source/32,r=source-e*32;double sign;Decode(v.signed_element_trace[e*32+r],sign);return sign*values[source];}
+__device__ double SignedMatrixValue(CudaDeviceView v,CudaMeshShape s,
+                                    const int source)
+{const int stride=s.trace_dofs,e=source/(stride*stride),rem=source-e*stride*stride,r=rem/stride,c=rem-r*stride;double rs,cs;Decode(v.signed_element_trace[e*stride+r],rs);Decode(v.signed_element_trace[e*stride+c],cs);return rs*cs*v.schur[source];}
+__device__ double SignedVectorValue(CudaDeviceView v,CudaMeshShape s,
+                                    const double* values,const int source)
+{const int stride=s.trace_dofs,e=source/stride,r=source-e*stride;double sign;Decode(v.signed_element_trace[e*stride+r],sign);return sign*values[source];}
 
-__global__ void OwnedMatrixKernel(CudaDeviceView v,CudaTrueMatrixDeviceView m,int n)
-{const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;double value=SignedMatrixValue(v,v.matrix_owned_source[i]);if(v.matrix_owned_section[i]==0)atomicAdd(m.diag_values+v.matrix_owned_target[i],value);else atomicAdd(m.offd_values+v.matrix_owned_target[i],value);}
-__global__ void GatherRemoteMatrixKernel(CudaDeviceView v,int n)
-{const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)v.remote_matrix_send[i]=SignedMatrixValue(v,v.matrix_send_source[i]);}
+__global__ void OwnedMatrixKernel(CudaDeviceView v,CudaTrueMatrixDeviceView m,CudaMeshShape s,int n)
+{const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;double value=SignedMatrixValue(v,s,v.matrix_owned_source[i]);if(v.matrix_owned_section[i]==0)atomicAdd(m.diag_values+v.matrix_owned_target[i],value);else atomicAdd(m.offd_values+v.matrix_owned_target[i],value);}
+__global__ void GatherRemoteMatrixKernel(CudaDeviceView v,CudaMeshShape s,int n)
+{const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)v.remote_matrix_send[i]=SignedMatrixValue(v,s,v.matrix_send_source[i]);}
 __global__ void ScatterRemoteMatrixKernel(CudaDeviceView v,CudaTrueMatrixDeviceView m,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;if(v.matrix_receive_section[i]==0)atomicAdd(m.diag_values+v.matrix_receive_target[i],v.remote_matrix_receive[i]);else atomicAdd(m.offd_values+v.matrix_receive_target[i],v.remote_matrix_receive[i]);}
-__global__ void OwnedVectorKernel(CudaDeviceView v,const double* values,double* truth,int n)
-{const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(truth+v.vector_owned_target[i],SignedVectorValue(v,values,v.vector_owned_source[i]));}
+__global__ void OwnedVectorKernel(CudaDeviceView v,CudaMeshShape s,const double* values,double* truth,int n)
+{const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(truth+v.vector_owned_target[i],SignedVectorValue(v,s,values,v.vector_owned_source[i]));}
 __global__ void ZeroVectorKernel(double* values,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)values[i]=0;}
-__global__ void GatherRemoteVectorKernel(CudaDeviceView v,const double* values,int n)
-{const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)v.remote_vector_send[i]=SignedVectorValue(v,values,v.vector_send_source[i]);}
+__global__ void GatherRemoteVectorKernel(CudaDeviceView v,CudaMeshShape s,const double* values,int n)
+{const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)v.remote_vector_send[i]=SignedVectorValue(v,s,values,v.vector_send_source[i]);}
 __global__ void ScatterRemoteVectorKernel(CudaDeviceView v,double* truth,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(truth+v.vector_receive_target[i],v.remote_vector_receive[i]);}
 
 __global__ void RecoverKernel(CudaDeviceView v,CudaMeshShape s)
-{const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;constexpr int ni=16,nt=32;double* x=v.recovered_interior+e*ni;for(int r=0;r<ni;++r){double q=v.f[e*ni+r];for(int c=0;c<nt;++c)q-=v.b[(e*ni+r)*nt+c]*v.trace_increment_local[e*nt+c];x[r]=q;}double* lu=v.lu+e*ni*ni;double* p=v.pivots+e*ni;for(int k=0;k<ni;++k){const int pivot=static_cast<int>(p[k]);if(pivot!=k){double q=x[k];x[k]=x[pivot];x[pivot]=q;}for(int r=k+1;r<ni;++r)x[r]-=lu[r*ni+k]*x[k];}for(int k=ni-1;k>=0;--k){for(int j=k+1;j<ni;++j)x[k]-=lu[k*ni+j]*x[j];x[k]/=lu[k*ni+k];}v.status[e]=1;}
+{
+  const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs;
+  CudaRecoverRetained(v.lu+e*ni*ni,v.pivots+e*ni,ni,
+                      v.b+e*ni*nt,nt,v.trace_increment_local+e*nt,
+                      v.f+e*ni,v.recovered_interior+e*ni);
+  v.status[e]=1;
+}
 __global__ void TrialKernel(CudaDeviceView v,CudaMeshShape s,double alpha)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<s.interior_count)v.trial_interior[i]=v.base_interior[i]+alpha*v.recovered_interior[i];if(i<s.true_trace_count)v.trial_true_trace[i]=v.base_true_trace[i]+alpha*v.true_solution[i];}
 __global__ void NormKernel(const double* a,int an,const double* b,int bn,double* out)
@@ -1389,15 +1395,15 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s) noex
 bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& m,double* rhs,int n) noexcept
 {const int count=std::max(std::max(m.diag_nonzeros,m.offd_nonzeros),n);ZeroSystemKernel<<<Blocks(count),128>>>(m,rhs,n);return LaunchOk();}
 bool CudaLaunchAssembleOwnedMatrix(const CudaDeviceView& v,const CudaTrueMatrixDeviceView& m,const CudaMeshShape& s) noexcept
-{OwnedMatrixKernel<<<Blocks(s.matrix_owned_count),128>>>(v,m,s.matrix_owned_count);return LaunchOk();}
+{OwnedMatrixKernel<<<Blocks(s.matrix_owned_count),128>>>(v,m,s,s.matrix_owned_count);return LaunchOk();}
 bool CudaLaunchGatherRemoteMatrix(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
-{if(s.matrix_send_count)GatherRemoteMatrixKernel<<<Blocks(s.matrix_send_count),128>>>(v,s.matrix_send_count);return LaunchOk();}
+{if(s.matrix_send_count)GatherRemoteMatrixKernel<<<Blocks(s.matrix_send_count),128>>>(v,s,s.matrix_send_count);return LaunchOk();}
 bool CudaLaunchScatterRemoteMatrix(const CudaDeviceView& v,const CudaTrueMatrixDeviceView& m,const CudaMeshShape& s) noexcept
 {if(s.matrix_receive_count)ScatterRemoteMatrixKernel<<<Blocks(s.matrix_receive_count),128>>>(v,m,s.matrix_receive_count);return LaunchOk();}
 bool CudaLaunchAssembleOwnedVector(const CudaDeviceView& v,const CudaMeshShape& s,const double* values,double* truth) noexcept
-{ZeroVectorKernel<<<Blocks(s.true_trace_count),128>>>(truth,s.true_trace_count);OwnedVectorKernel<<<Blocks(s.vector_owned_count),128>>>(v,values,truth,s.vector_owned_count);return LaunchOk();}
+{ZeroVectorKernel<<<Blocks(s.true_trace_count),128>>>(truth,s.true_trace_count);OwnedVectorKernel<<<Blocks(s.vector_owned_count),128>>>(v,s,values,truth,s.vector_owned_count);return LaunchOk();}
 bool CudaLaunchGatherRemoteVector(const CudaDeviceView& v,const CudaMeshShape& s,const double* values) noexcept
-{if(s.vector_send_count)GatherRemoteVectorKernel<<<Blocks(s.vector_send_count),128>>>(v,values,s.vector_send_count);return LaunchOk();}
+{if(s.vector_send_count)GatherRemoteVectorKernel<<<Blocks(s.vector_send_count),128>>>(v,s,values,s.vector_send_count);return LaunchOk();}
 bool CudaLaunchScatterRemoteVector(const CudaDeviceView& v,const CudaMeshShape& s,double* truth) noexcept
 {if(s.vector_receive_count)ScatterRemoteVectorKernel<<<Blocks(s.vector_receive_count),128>>>(v,truth,s.vector_receive_count);return LaunchOk();}
 bool CudaLaunchRecover(const CudaDeviceView& v,const CudaMeshShape& s) noexcept

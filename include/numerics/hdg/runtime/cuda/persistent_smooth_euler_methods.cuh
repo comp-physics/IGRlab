@@ -82,8 +82,8 @@ BuildHostGeometryAndMaps() noexcept
           static_cast<std::int64_t>(std::llround(periodic * 1.0e12));
     }
     const mfem::IntegrationRule& nodes = fe->GetNodes();
-    if (nodes.GetNPoints() != scalar_dofs_per_element) { return false; }
-    for (int scalar = 0; scalar < scalar_dofs_per_element; ++scalar)
+    if (nodes.GetNPoints() != shape_.scalar_interior_dofs) { return false; }
+    for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
     {
       mfem::Vector physical(dimension);
       transformation->Transform(nodes.IntPoint(scalar), physical);
@@ -92,17 +92,17 @@ BuildHostGeometryAndMaps() noexcept
       CudaPerturbedState(physical[0], physical[1], perturbed);
       for (int component = 0; component < conserved_components; ++component)
       {
-        const int local = scalar + scalar_dofs_per_element * component;
+        const int local = scalar + shape_.scalar_interior_dofs * component;
         const std::size_t index = static_cast<std::size_t>(element) *
-                                      interior_dofs_per_element + local;
+                                      shape_.interior_dofs + local;
         host_exact_interior_[index] = exact[component];
         host_perturbed_interior_[index] = perturbed[component];
       }
     }
     const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
-        fe->GetGeomType(), assembly_quadrature_order);
-    mfem::Vector shape(scalar_dofs_per_element), physical(dimension);
-    mfem::DenseMatrix derivative(scalar_dofs_per_element, dimension);
+        fe->GetGeomType(), shape_.assembly_order);
+    mfem::Vector shape(shape_.scalar_interior_dofs), physical(dimension);
+    mfem::DenseMatrix derivative(shape_.scalar_interior_dofs, dimension);
     for (int q = 0; q < shape_.volume_points; ++q)
     {
       const mfem::IntegrationPoint& point = volume_rule.IntPoint(q);
@@ -117,13 +117,13 @@ BuildHostGeometryAndMaps() noexcept
       for (int direction = 0; direction < dimension; ++direction)
         host_volume_position_[quadrature * dimension + direction] =
             physical[direction];
-      for (int scalar = 0; scalar < scalar_dofs_per_element; ++scalar)
+      for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
       {
-        host_volume_shape_[quadrature * scalar_dofs_per_element + scalar] =
+        host_volume_shape_[quadrature * shape_.scalar_interior_dofs + scalar] =
             shape[scalar];
         for (int direction = 0; direction < dimension; ++direction)
           host_volume_derivative_[
-              (quadrature * scalar_dofs_per_element + scalar) * dimension +
+              (quadrature * shape_.scalar_interior_dofs + scalar) * dimension +
               direction] = derivative(scalar, direction);
       }
     }
@@ -141,12 +141,12 @@ BuildHostGeometryAndMaps() noexcept
       mfem::Array<int> vdofs;
       trace_space_->GetFaceVDofs(face, vdofs);
       if (ft == nullptr || ft->Face == nullptr || trace_fe == nullptr ||
-          vdofs.Size() != conserved_components * scalar_dofs_per_face)
+          vdofs.Size() != conserved_components * shape_.scalar_face_dofs)
         return false;
       const bool element_one = ft->Elem1No == element;
       if (!element_one && ft->Elem2No != element) { return false; }
       const mfem::IntegrationRule& face_nodes = trace_fe->GetNodes();
-      for (int scalar = 0; scalar < scalar_dofs_per_face; ++scalar)
+      for (int scalar = 0; scalar < shape_.scalar_face_dofs; ++scalar)
       {
         mfem::Vector face_physical(dimension);
         ft->Face->Transform(face_nodes.IntPoint(scalar), face_physical);
@@ -155,12 +155,12 @@ BuildHostGeometryAndMaps() noexcept
         CudaPerturbedState(face_physical[0], face_physical[1], perturbed);
         for (int component = 0; component < conserved_components; ++component)
         {
-          const int local = scalar + scalar_dofs_per_face * component;
+          const int local = scalar + shape_.scalar_face_dofs * component;
           double sign = 1.0;
           const int dof = CudaDecodeSigned(vdofs[local], sign);
           if (dof < 0 || dof >= shape_.local_trace_count) { return false; }
           const std::size_t map_index = static_cast<std::size_t>(element) *
-                  trace_dofs_per_element + trace_offset + local;
+                  shape_.trace_dofs + trace_offset + local;
           signed_element_trace_[map_index] = vdofs[local];
           const double exact_value = sign * exact[component];
           const double perturbed_value = sign * perturbed[component];
@@ -176,9 +176,9 @@ BuildHostGeometryAndMaps() noexcept
         }
       }
       const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
-          trace_fe->GetGeomType(), assembly_quadrature_order);
-      mfem::Vector interior_shape(scalar_dofs_per_element);
-      mfem::Vector trace_shape(scalar_dofs_per_face);
+          trace_fe->GetGeomType(), shape_.assembly_order);
+      mfem::Vector interior_shape(shape_.scalar_interior_dofs);
+      mfem::Vector trace_shape(shape_.scalar_face_dofs);
       for (int q = 0; q < shape_.face_points; ++q)
       {
         const mfem::IntegrationPoint& point = face_rule.IntPoint(q);
@@ -204,17 +204,17 @@ BuildHostGeometryAndMaps() noexcept
         for (int direction = 0; direction < dimension; ++direction)
           host_face_normal_[quadrature * dimension + direction] =
               side * scaled_normal[direction] / normal_norm;
-        for (int scalar = 0; scalar < scalar_dofs_per_element; ++scalar)
+        for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
           host_face_interior_shape_[
-              quadrature * scalar_dofs_per_element + scalar] =
+              quadrature * shape_.scalar_interior_dofs + scalar] =
               interior_shape[scalar];
-        for (int scalar = 0; scalar < scalar_dofs_per_face; ++scalar)
-          host_face_trace_shape_[quadrature * scalar_dofs_per_face + scalar] =
+        for (int scalar = 0; scalar < shape_.scalar_face_dofs; ++scalar)
+          host_face_trace_shape_[quadrature * shape_.scalar_face_dofs + scalar] =
               trace_shape[scalar];
       }
       trace_offset += vdofs.Size();
     }
-    if (trace_offset != trace_dofs_per_element) { return false; }
+    if (trace_offset != shape_.trace_dofs) { return false; }
   }
   for (int local = 0; local < shape_.local_trace_count; ++local)
     if (assigned[static_cast<std::size_t>(local)] == 0) { return false; }
@@ -260,19 +260,19 @@ BuildLocalTraceGraph() noexcept
   {
     local_trace_matrix_.emplace(shape_.local_trace_count);
     for (int element = 0; element < shape_.elements; ++element)
-      for (int row = 0; row < trace_dofs_per_element; ++row)
+      for (int row = 0; row < shape_.trace_dofs; ++row)
       {
         double row_sign = 1.0;
         const int local_row = CudaDecodeSigned(
             signed_element_trace_[static_cast<std::size_t>(element) *
-                                      trace_dofs_per_element + row],
+                                      shape_.trace_dofs + row],
             row_sign);
-        for (int column = 0; column < trace_dofs_per_element; ++column)
+        for (int column = 0; column < shape_.trace_dofs; ++column)
         {
           double column_sign = 1.0;
           const int local_column = CudaDecodeSigned(
               signed_element_trace_[static_cast<std::size_t>(element) *
-                                        trace_dofs_per_element + column],
+                                        shape_.trace_dofs + column],
               column_sign);
           local_trace_matrix_->Add(local_row, local_column,
                                    row_sign * column_sign);
@@ -306,15 +306,15 @@ BindArenaViews() noexcept
     return result;
   };
   constexpr std::size_t max_i =
-      maximum_rank_elements * interior_dofs_per_element;
+      maximum_rank_elements * maximum_interior_dofs_per_element;
   constexpr std::size_t max_lt = maximum_local_trace_dofs;
   constexpr std::size_t max_tt = maximum_true_trace_dofs;
   constexpr std::size_t max_er =
-      maximum_rank_elements * trace_dofs_per_element;
+      maximum_rank_elements * maximum_trace_dofs_per_element;
   constexpr std::size_t max_a = maximum_rank_elements *
-      interior_dofs_per_element * interior_dofs_per_element;
+      maximum_interior_dofs_per_element * maximum_interior_dofs_per_element;
   constexpr std::size_t max_b = maximum_rank_elements *
-      interior_dofs_per_element * trace_dofs_per_element;
+      maximum_interior_dofs_per_element * maximum_trace_dofs_per_element;
   constexpr std::size_t max_d = maximum_local_matrix_entries;
   view_.slot_interior[0] = take_d(max_i);
   view_.slot_interior[1] = take_d(max_i);
@@ -344,7 +344,8 @@ BindArenaViews() noexcept
   view_.lu = take_d(max_a);
   view_.pivots = take_d(max_i);
   view_.solve_workspace = take_d(maximum_rank_elements *
-      interior_dofs_per_element * (trace_dofs_per_element + 1));
+      maximum_interior_dofs_per_element *
+          (maximum_trace_dofs_per_element + 1));
   view_.schur = take_d(max_d);
   view_.condensed_rhs = take_d(max_er);
   view_.true_residual = take_d(max_tt);
@@ -353,16 +354,18 @@ BindArenaViews() noexcept
   view_.remote_vector_send = take_d(max_er);
   view_.remote_vector_receive = take_d(max_er);
   view_.volume_shape = take_d(maximum_rank_elements * maximum_volume_points *
-                              scalar_dofs_per_element);
+                              maximum_scalar_dofs_per_element);
   view_.volume_derivative = take_d(maximum_rank_elements *
-      maximum_volume_points * scalar_dofs_per_element * dimension);
+      maximum_volume_points * maximum_scalar_dofs_per_element * dimension);
   view_.volume_weight = take_d(maximum_rank_elements * maximum_volume_points);
   view_.volume_position = take_d(maximum_rank_elements *
                                  maximum_volume_points * dimension);
   view_.face_interior_shape = take_d(maximum_rank_elements *
-      faces_per_element * maximum_face_points * scalar_dofs_per_element);
+      faces_per_element * maximum_face_points *
+          maximum_scalar_dofs_per_element);
   view_.face_trace_shape = take_d(maximum_rank_elements * faces_per_element *
-                                  maximum_face_points * scalar_dofs_per_face);
+                                  maximum_face_points *
+                                      maximum_scalar_dofs_per_face);
   view_.face_weight = take_d(maximum_rank_elements * faces_per_element *
                              maximum_face_points);
   view_.face_normal = take_d(maximum_rank_elements * faces_per_element *
@@ -379,7 +382,7 @@ BindArenaViews() noexcept
   view_.ticket_words = i;
   i += 8;
   view_.signed_element_trace = TakeArena(i,
-      maximum_rank_elements * trace_dofs_per_element);
+      maximum_rank_elements * maximum_trace_dofs_per_element);
   view_.matrix_owned_source = TakeArena(i, maximum_local_matrix_entries);
   view_.matrix_owned_section = TakeArena(i, maximum_local_matrix_entries);
   view_.matrix_owned_target = TakeArena(i, maximum_local_matrix_entries);
@@ -438,15 +441,15 @@ UploadTopologyAndState() noexcept
           CudaTransferSite::initial_trace_upload) ||
       !h2d(view_.signed_element_trace, signed_element_trace_.data(),
            static_cast<std::size_t>(shape_.elements) *
-               trace_dofs_per_element * sizeof(int),
+               shape_.trace_dofs * sizeof(int),
            CudaTransferSite::map_upload) ||
       !h2d(view_.volume_shape, host_volume_shape_.data(),
            static_cast<std::size_t>(shape_.elements) * shape_.volume_points *
-               scalar_dofs_per_element * sizeof(double),
+               shape_.scalar_interior_dofs * sizeof(double),
            CudaTransferSite::quadrature_upload) ||
       !h2d(view_.volume_derivative, host_volume_derivative_.data(),
            static_cast<std::size_t>(shape_.elements) * shape_.volume_points *
-               scalar_dofs_per_element * dimension * sizeof(double),
+               shape_.scalar_interior_dofs * dimension * sizeof(double),
            CudaTransferSite::quadrature_upload) ||
       !h2d(view_.volume_weight, host_volume_weight_.data(),
            static_cast<std::size_t>(shape_.elements) * shape_.volume_points *
@@ -457,11 +460,12 @@ UploadTopologyAndState() noexcept
            CudaTransferSite::quadrature_upload) ||
       !h2d(view_.face_interior_shape, host_face_interior_shape_.data(),
            static_cast<std::size_t>(shape_.elements) * faces_per_element *
-               shape_.face_points * scalar_dofs_per_element * sizeof(double),
+               shape_.face_points * shape_.scalar_interior_dofs *
+                   sizeof(double),
            CudaTransferSite::quadrature_upload) ||
       !h2d(view_.face_trace_shape, host_face_trace_shape_.data(),
            static_cast<std::size_t>(shape_.elements) * faces_per_element *
-               shape_.face_points * scalar_dofs_per_face * sizeof(double),
+               shape_.face_points * shape_.scalar_face_dofs * sizeof(double),
            CudaTransferSite::quadrature_upload) ||
       !h2d(view_.face_weight, host_face_weight_.data(),
            static_cast<std::size_t>(shape_.elements) * faces_per_element *
@@ -654,16 +658,16 @@ BuildSparseStagingPlan() noexcept
 
   bool local_plan_valid = true;
   for (int element = 0; element < shape_.elements; ++element)
-    for (int row = 0; row < trace_dofs_per_element; ++row)
+    for (int row = 0; row < shape_.trace_dofs; ++row)
     {
       double row_sign = 1.0;
       const int row_local = CudaDecodeSigned(
           signed_element_trace_[static_cast<std::size_t>(element) *
-                                    trace_dofs_per_element + row], row_sign);
+                                    shape_.trace_dofs + row], row_sign);
       const std::int64_t row_global =
           local_global_true_[static_cast<std::size_t>(row_local)];
       const int row_owner = local_owner_[static_cast<std::size_t>(row_local)];
-      const int vector_source = element * trace_dofs_per_element + row;
+      const int vector_source = element * shape_.trace_dofs + row;
       if (row_owner == rank_)
       {
         const int true_row = find_row(row_global);
@@ -688,17 +692,17 @@ BuildSparseStagingPlan() noexcept
             row_global;
         ++shape_.vector_send_count;
       }
-      for (int column = 0; column < trace_dofs_per_element; ++column)
+      for (int column = 0; column < shape_.trace_dofs; ++column)
       {
         double column_sign = 1.0;
         const int column_local = CudaDecodeSigned(
             signed_element_trace_[static_cast<std::size_t>(element) *
-                                      trace_dofs_per_element + column],
+                                      shape_.trace_dofs + column],
             column_sign);
         const std::int64_t column_global =
             local_global_true_[static_cast<std::size_t>(column_local)];
-        const int source = (element * trace_dofs_per_element + row) *
-                               trace_dofs_per_element + column;
+        const int source = (element * shape_.trace_dofs + row) *
+                               shape_.trace_dofs + column;
         if (row_owner == rank_)
         {
           int section = -1, target = -1;
@@ -759,7 +763,7 @@ BuildSparseStagingPlan() noexcept
     const bool counts_valid =
         shape_.matrix_receive_count <= maximum_exchange_entries &&
         shape_.vector_receive_count <=
-            maximum_rank_elements * trace_dofs_per_element;
+            maximum_rank_elements * maximum_trace_dofs_per_element;
     if (!CollectiveContinue(counts_valid))
       return false;
     const bool matrix_keys_ok = MPI_Sendrecv(
@@ -950,7 +954,7 @@ DistributeCurrentTrace(const double* true_values) noexcept
   if (ranks_ == 1)
     return CollectiveContinue(CudaLaunchGatherLocalTrace(
         view_.signed_element_trace,
-        shape_.elements * trace_dofs_per_element, true_values,
+        shape_.elements * shape_.trace_dofs, true_values,
         view_.current_local_trace) &&
         TransportPolicy::Synchronize(CudaTransferSite::scalar_status));
   double* owned_host = owned_stage_.HostWrite();
@@ -982,7 +986,7 @@ DistributeCurrentTrace(const double* true_values) noexcept
              CudaTransferSite::trace_ghost_stage_in) &&
       CudaLaunchGatherLocalTrace(
           view_.signed_element_trace,
-          shape_.elements * trace_dofs_per_element,
+          shape_.elements * shape_.trace_dofs,
           view_.distributed_local_trace, view_.current_local_trace) &&
       TransportPolicy::Synchronize(CudaTransferSite::trace_ghost_stage_in);
   return CollectiveContinue(local_ready);
@@ -997,7 +1001,7 @@ DistributeTraceIncrement() noexcept
   if (ranks_ == 1)
     return CollectiveContinue(CudaLaunchGatherLocalTrace(
         view_.signed_element_trace,
-        shape_.elements * trace_dofs_per_element, solution,
+        shape_.elements * shape_.trace_dofs, solution,
         view_.trace_increment_local) &&
         TransportPolicy::Synchronize(CudaTransferSite::scalar_status));
   double* owned_host = owned_stage_.HostWrite();
@@ -1030,7 +1034,7 @@ DistributeTraceIncrement() noexcept
           CudaTransferSite::trace_ghost_stage_in) &&
       CudaLaunchGatherLocalTrace(
           view_.signed_element_trace,
-          shape_.elements * trace_dofs_per_element,
+          shape_.elements * shape_.trace_dofs,
           view_.distributed_local_trace, view_.trace_increment_local) &&
       TransportPolicy::Synchronize(CudaTransferSite::trace_ghost_stage_in);
   return CollectiveContinue(local_ready);
@@ -1215,7 +1219,7 @@ CopyBase(state_slot& workspace) noexcept
   const bool local_trace = TransportPolicy::DeviceToDevice(
           view_.base_local_trace, view_.current_local_trace,
           static_cast<std::size_t>(shape_.elements) *
-              trace_dofs_per_element * sizeof(double),
+              shape_.trace_dofs * sizeof(double),
           CudaTransferCategory::attempt_history,
           CudaTransferSite::nonlinear_base_local_trace);
   const bool synchronized = TransportPolicy::Synchronize(
@@ -1240,7 +1244,7 @@ RestoreBase(state_slot& workspace) noexcept
   const bool local_trace = TransportPolicy::DeviceToDevice(
       view_.current_local_trace, view_.base_local_trace,
       static_cast<std::size_t>(shape_.elements) *
-          trace_dofs_per_element * sizeof(double),
+          shape_.trace_dofs * sizeof(double),
       CudaTransferCategory::attempt_history,
       CudaTransferSite::nonlinear_restore_local_trace);
   const bool synchronized = TransportPolicy::Synchronize(
@@ -1320,7 +1324,7 @@ std::size_t CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 WorkspaceBytes() const noexcept
 {
   return (persistent_double_capacity -
-          2 * maximum_rank_elements * interior_dofs_per_element -
+          2 * maximum_rank_elements * maximum_interior_dofs_per_element -
           2 * maximum_true_trace_dofs) * sizeof(double) +
       persistent_integer_capacity * sizeof(int);
 }
@@ -1340,10 +1344,14 @@ CaptureOracleMetadata(const AttemptIdentity& attempt,
   oracle_.global_true_trace_count = shape_.global_true_trace_count;
   oracle_.volume_points = shape_.volume_points;
   oracle_.face_points = shape_.face_points;
+  oracle_.scalar_interior_dofs = shape_.scalar_interior_dofs;
+  oracle_.scalar_face_dofs = shape_.scalar_face_dofs;
+  oracle_.interior_dofs = shape_.interior_dofs;
+  oracle_.trace_dofs = shape_.trace_dofs;
   oracle_.attempt_sequence = attempt.sequence;
   oracle_.product_generation = generation;
   std::copy_n(signed_element_trace_.begin(),
-              shape_.elements * trace_dofs_per_element,
+              shape_.elements * shape_.trace_dofs,
               oracle_.signed_element_trace.begin());
   std::copy_n(local_global_true_.begin(), shape_.local_trace_count,
               oracle_.local_to_global_true.begin());
