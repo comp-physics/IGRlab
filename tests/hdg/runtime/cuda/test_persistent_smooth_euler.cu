@@ -2954,15 +2954,130 @@ struct OracleOutputTestSeam
 struct OracleShapeExpectation
 {
   int elements = 0;
+  int local_trace_count = 0;
+  int true_trace_count = 0;
+  int global_true_trace_count = 0;
+  int volume_points = 0;
+  int face_points = 0;
   int scalar_interior_dofs = 0;
   int scalar_face_dofs = 0;
   int interior_dofs = 0;
   int trace_dofs = 0;
+  int true_csr_nonzeros = 0;
 };
 
-OracleShapeExpectation FunctionalOracleShape(const int ranks) noexcept
+// Independent p2/N6 periodic test topology.  The 6x6 mesh has 2*N*N=72
+// unique periodic faces and 12 component face dofs per face.  The contiguous
+// two-rank element partition is a 3x6 strip: 18 periodic vertical faces plus
+// 24 horizontal/interface faces are locally visible.  Pinned MFEM makes rank
+// zero the shared {0,1} group master, so it owns 30 private plus 12 shared
+// faces while rank one owns its 30 private faces.  MFEM's order-14 Gauss rule
+// has eight points in one dimension, hence 8x8 volume and 8-point face
+// quadrature.  Each trace row couples through its two adjacent quads to seven
+// distinct faces, i.e. 7*12=84 structural columns per row.  That CSR census is
+// deliberately pinned to this dense local graph and MFEM/HYPRE assembly; it is
+// not asserted as a backend-portable mesh-only invariant.
+inline constexpr int functional_test_n = 6;
+inline constexpr int functional_test_order = 2;
+inline constexpr int functional_test_components = 4;
+inline constexpr int functional_test_faces_per_element = 4;
+inline constexpr int functional_test_scalar_face_dofs =
+    functional_test_order + 1;
+inline constexpr int functional_test_scalar_interior_dofs =
+    (functional_test_order + 1) * (functional_test_order + 1);
+inline constexpr int functional_test_interior_dofs =
+    functional_test_components * functional_test_scalar_interior_dofs;
+inline constexpr int functional_test_element_trace_dofs =
+    functional_test_faces_per_element * functional_test_components *
+    functional_test_scalar_face_dofs;
+inline constexpr int functional_test_face_component_dofs =
+    functional_test_components * functional_test_scalar_face_dofs;
+inline constexpr int functional_test_rank1_elements =
+    functional_test_n * functional_test_n;
+inline constexpr int functional_test_rank2_elements =
+    functional_test_rank1_elements / 2;
+inline constexpr int functional_test_global_faces =
+    2 * functional_test_n * functional_test_n;
+inline constexpr int functional_test_global_true_trace =
+    functional_test_global_faces * functional_test_face_component_dofs;
+inline constexpr int functional_test_rank2_rows = functional_test_n / 2;
+inline constexpr int functional_test_rank2_local_faces =
+    functional_test_rank2_rows * functional_test_n +
+    (functional_test_rank2_rows + 1) * functional_test_n;
+inline constexpr int functional_test_rank2_local_trace =
+    functional_test_rank2_local_faces * functional_test_face_component_dofs;
+inline constexpr int functional_test_rank2_private_faces =
+    functional_test_rank2_local_faces - 2 * functional_test_n;
+inline constexpr int functional_test_rank2_master_true_trace =
+    functional_test_rank2_local_trace;
+inline constexpr int functional_test_rank2_nonmaster_true_trace =
+    functional_test_rank2_private_faces * functional_test_face_component_dofs;
+inline constexpr int functional_test_coupled_faces_per_row = 7;
+inline constexpr int functional_test_csr_columns_per_row =
+    functional_test_coupled_faces_per_row *
+    functional_test_face_component_dofs;
+inline constexpr int functional_test_rank1_csr_nonzeros =
+    functional_test_global_true_trace * functional_test_csr_columns_per_row;
+inline constexpr int functional_test_rank2_master_csr_nonzeros =
+    functional_test_rank2_master_true_trace *
+    functional_test_csr_columns_per_row;
+inline constexpr int functional_test_rank2_nonmaster_csr_nonzeros =
+    functional_test_rank2_nonmaster_true_trace *
+    functional_test_csr_columns_per_row;
+inline constexpr int functional_test_assembly_order =
+    3 * functional_test_order + 8;
+inline constexpr int functional_test_quadrature_1d =
+    functional_test_assembly_order / 2 + 1;
+inline constexpr int functional_test_volume_points =
+    functional_test_quadrature_1d * functional_test_quadrature_1d;
+inline constexpr int functional_test_face_points =
+    functional_test_quadrature_1d;
+static_assert(functional_test_n == functional_elements_per_direction &&
+              functional_test_order == functional_polynomial_order &&
+              functional_test_components == conserved_components &&
+              functional_test_faces_per_element == faces_per_element &&
+              functional_test_assembly_order ==
+                  functional_assembly_quadrature_order &&
+              functional_test_scalar_interior_dofs == 9 &&
+              functional_test_scalar_face_dofs == 3 &&
+              functional_test_interior_dofs == 36 &&
+              functional_test_element_trace_dofs == 48 &&
+              functional_test_rank1_elements == 36 &&
+              functional_test_rank2_elements == 18 &&
+              functional_test_global_true_trace == 864 &&
+              functional_test_rank2_local_faces == 42 &&
+              functional_test_rank2_local_trace == 504 &&
+              functional_test_rank2_private_faces == 30 &&
+              functional_test_rank2_master_true_trace == 504 &&
+              functional_test_rank2_nonmaster_true_trace == 360 &&
+              functional_test_csr_columns_per_row == 84 &&
+              functional_test_rank1_csr_nonzeros == 72576 &&
+              functional_test_rank2_master_csr_nonzeros == 42336 &&
+              functional_test_rank2_nonmaster_csr_nonzeros == 30240 &&
+              functional_test_volume_points == 64 &&
+              functional_test_face_points == 8);
+
+OracleShapeExpectation FunctionalOracleShape(
+    const int communicator_ranks, const int local_rank) noexcept
 {
-  return {ranks == 1 ? 36 : 18, 9, 3, 36, 48};
+  return {
+      communicator_ranks == 1 ? functional_test_rank1_elements :
+                                functional_test_rank2_elements,
+      communicator_ranks == 1 ? functional_test_global_true_trace :
+                                functional_test_rank2_local_trace,
+      communicator_ranks == 1 ? functional_test_global_true_trace :
+          (local_rank == 0 ? functional_test_rank2_master_true_trace :
+                             functional_test_rank2_nonmaster_true_trace),
+      functional_test_global_true_trace,
+      functional_test_volume_points,
+      functional_test_face_points,
+      functional_test_scalar_interior_dofs,
+      functional_test_scalar_face_dofs,
+      functional_test_interior_dofs,
+      functional_test_element_trace_dofs,
+      communicator_ranks == 1 ? functional_test_rank1_csr_nonzeros :
+          (local_rank == 0 ? functional_test_rank2_master_csr_nonzeros :
+                             functional_test_rank2_nonmaster_csr_nonzeros)};
 }
 
 bool ExactOracleShape(
@@ -2970,11 +3085,70 @@ bool ExactOracleShape(
     const OracleShapeExpectation& expected) noexcept
 {
   return pod.elements == expected.elements &&
+      pod.local_trace_count == expected.local_trace_count &&
+      pod.true_trace_count == expected.true_trace_count &&
+      pod.global_true_trace_count == expected.global_true_trace_count &&
+      pod.volume_points == expected.volume_points &&
+      pod.face_points == expected.face_points &&
       pod.scalar_interior_dofs == expected.scalar_interior_dofs &&
       pod.scalar_face_dofs == expected.scalar_face_dofs &&
       pod.interior_dofs == expected.interior_dofs &&
       pod.trace_dofs == expected.trace_dofs &&
-      pod.interior_count == expected.elements * expected.interior_dofs;
+      pod.interior_count == expected.elements * expected.interior_dofs &&
+      pod.true_csr_rows == expected.true_trace_count &&
+      pod.true_csr_nonzeros == expected.true_csr_nonzeros;
+}
+
+bool SameOraclePodSemantic(const CudaOraclePod& left,
+                           const CudaOraclePod& right) noexcept
+{
+  return left.schema == right.schema && left.rank == right.rank &&
+      left.ranks == right.ranks && left.elements == right.elements &&
+      left.interior_count == right.interior_count &&
+      left.local_trace_count == right.local_trace_count &&
+      left.true_trace_count == right.true_trace_count &&
+      left.global_true_trace_count == right.global_true_trace_count &&
+      left.volume_points == right.volume_points &&
+      left.face_points == right.face_points &&
+      left.scalar_interior_dofs == right.scalar_interior_dofs &&
+      left.scalar_face_dofs == right.scalar_face_dofs &&
+      left.interior_dofs == right.interior_dofs &&
+      left.trace_dofs == right.trace_dofs &&
+      left.true_csr_rows == right.true_csr_rows &&
+      left.true_csr_nonzeros == right.true_csr_nonzeros &&
+      left.attempt_sequence == right.attempt_sequence &&
+      left.product_generation == right.product_generation &&
+      left.dt == right.dt &&
+      left.signed_element_trace == right.signed_element_trace &&
+      left.local_to_global_true == right.local_to_global_true &&
+      left.owned_global_true == right.owned_global_true &&
+      left.element_coordinate_keys == right.element_coordinate_keys &&
+      left.true_csr_offsets == right.true_csr_offsets &&
+      left.true_csr_columns == right.true_csr_columns &&
+      left.true_csr_values == right.true_csr_values &&
+      left.true_rhs == right.true_rhs &&
+      left.true_solution == right.true_solution &&
+      left.current_true_trace == right.current_true_trace &&
+      left.volume_shape == right.volume_shape &&
+      left.volume_derivative == right.volume_derivative &&
+      left.volume_weight == right.volume_weight &&
+      left.volume_position == right.volume_position &&
+      left.face_interior_shape == right.face_interior_shape &&
+      left.face_trace_shape == right.face_trace_shape &&
+      left.face_weight == right.face_weight &&
+      left.face_normal == right.face_normal &&
+      left.old_interior == right.old_interior &&
+      left.current_interior == right.current_interior &&
+      left.current_local_trace == right.current_local_trace &&
+      left.distributed_local_trace == right.distributed_local_trace &&
+      left.residual_r == right.residual_r &&
+      left.residual_g == right.residual_g && left.a == right.a &&
+      left.b == right.b && left.c == right.c && left.d == right.d &&
+      left.f == right.f && left.g == right.g &&
+      left.schur == right.schur &&
+      left.condensed_rhs == right.condensed_rhs &&
+      left.local_trace_increment == right.local_trace_increment &&
+      left.recovered_increment == right.recovered_increment;
 }
 
 bool ExactOracleShape(
@@ -2999,7 +3173,8 @@ FrozenStageResult StageOracleOutputCollective(
     const char* const case_id,
     const OracleOutputTestSeam seam = {},
     const std::optional<OracleShapeExpectation> expected_shape =
-        std::nullopt) noexcept
+        std::nullopt,
+    CudaOraclePod* const preserved_oracle = nullptr) noexcept
 {
   auto staged_oracle = std::make_unique<CudaOraclePod>();
   const auto report_stage =
@@ -3063,12 +3238,25 @@ FrozenStageResult StageOracleOutputCollective(
       CollectivelyExact(expected_shape_exact);
   std::fprintf(stderr,
       "CUDA_ORACLE_SHAPE case=%s rank=%d target=%llu required=%u "
-      "elements=%d/%d scalar_interior=%d/%d scalar_face=%d/%d "
-      "interior=%d/%d trace=%d/%d local=%s collective=%s\n",
+      "elements=%d/%d local_trace=%d/%d true_trace=%d/%d "
+      "global_true=%d/%d volume_points=%d/%d face_points=%d/%d "
+      "scalar_interior=%d/%d scalar_face=%d/%d interior=%d/%d "
+      "trace=%d/%d true_rows=%d/%d true_nnz=%d/%d "
+      "local=%s collective=%s\n",
       case_id != nullptr ? case_id : "null", rank,
       static_cast<unsigned long long>(target_step),
       expected_shape.has_value() ? 1U : 0U, staged_oracle->elements,
       expected_shape.has_value() ? expected_shape->elements : 0,
+      staged_oracle->local_trace_count,
+      expected_shape.has_value() ? expected_shape->local_trace_count : 0,
+      staged_oracle->true_trace_count,
+      expected_shape.has_value() ? expected_shape->true_trace_count : 0,
+      staged_oracle->global_true_trace_count,
+      expected_shape.has_value() ? expected_shape->global_true_trace_count : 0,
+      staged_oracle->volume_points,
+      expected_shape.has_value() ? expected_shape->volume_points : 0,
+      staged_oracle->face_points,
+      expected_shape.has_value() ? expected_shape->face_points : 0,
       staged_oracle->scalar_interior_dofs,
       expected_shape.has_value() ? expected_shape->scalar_interior_dofs : 0,
       staged_oracle->scalar_face_dofs,
@@ -3077,6 +3265,10 @@ FrozenStageResult StageOracleOutputCollective(
       expected_shape.has_value() ? expected_shape->interior_dofs : 0,
       staged_oracle->trace_dofs,
       expected_shape.has_value() ? expected_shape->trace_dofs : 0,
+      staged_oracle->true_csr_rows,
+      expected_shape.has_value() ? expected_shape->true_trace_count : 0,
+      staged_oracle->true_csr_nonzeros,
+      expected_shape.has_value() ? expected_shape->true_csr_nonzeros : 0,
       expected_shape_exact ? "PASS" : "FAIL",
       expected_shape_collective ? "PASS" : "FAIL");
   if (!expected_shape_collective)
@@ -3193,6 +3385,7 @@ FrozenStageResult StageOracleOutputCollective(
       oracle_policy_ledgers_collective);
   if (!oracle_policy_ledgers_collective)
     return fail_and_cleanup("oracle/output-stage", FailureReason::backend_failure);
+  if (preserved_oracle != nullptr) { *preserved_oracle = *staged_oracle; }
   return {true, true};
 }
 
@@ -3605,10 +3798,13 @@ bool CommitFunctionalAttempt(
   // direct engines and the accepted retry, this yields five mutation gates.
   const bool mutation_required = target_step == 1 ||
       target_step == functional_checkpoint_step + 1 || retry;
+  auto staged_oracle = std::make_unique<CudaOraclePod>();
   const FrozenStageResult oracle_output = StageOracleOutputCollective(
       engine, checkpoint, evidence, snapshot, ranks, rank, retry,
       target_step, mutation_required, case_id, {},
-      std::optional<OracleShapeExpectation>{FunctionalOracleShape(ranks)});
+      std::optional<OracleShapeExpectation>{
+          FunctionalOracleShape(ranks, rank)},
+      staged_oracle.get());
   if (!oracle_output.passed) { return false; }
   const bool prepared_commit = engine.PrepareCommit(checkpoint, evidence);
   if (!CollectivelyExact(prepared_commit))
@@ -3670,8 +3866,10 @@ bool CommitFunctionalAttempt(
   const bool export_identity =
       OracleIdentity(*published, snapshot, ranks, rank);
   const bool export_shape = ExactOracleShape(
-      *published, FunctionalOracleShape(ranks));
+      *published, FunctionalOracleShape(ranks, rank));
   const bool export_independent = cuda_w8a_test_oracle::Verify(*published);
+  const bool export_semantic_identity =
+      SameOraclePodSemantic(*staged_oracle, *published);
   const bool export_allocation = CollectivelyExactAllocatorState(
       accepted_allocation_events, owned_calls, deallocations);
   const bool export_policy =
@@ -3683,17 +3881,19 @@ bool CommitFunctionalAttempt(
                  AuditedTransport::Accounting()) &&
       ExactPolicyLedgers();
   const bool export_local = export_return_collective && export_identity &&
-      export_shape && export_independent && export_allocation &&
-      export_policy;
+      export_shape && export_independent && export_semantic_identity &&
+      export_allocation && export_policy;
   const bool export_collective = CollectivelyExact(export_local);
   std::fprintf(stderr,
       "CUDA_FUNCTIONAL_ORACLE_PUBLICATION case=%s rank=%d ranks=%d "
       "target=%llu retry=%u return=%u identity=%u shape=%u verify=%u "
-      "allocation=%u policy=%u local=%s collective=%s\n",
+      "semantic_identity=%u allocation=%u policy=%u local=%s "
+      "collective=%s\n",
       case_id != nullptr ? case_id : "null", rank, ranks,
       static_cast<unsigned long long>(target_step), retry ? 1U : 0U,
       export_return ? 1U : 0U, export_identity ? 1U : 0U,
       export_shape ? 1U : 0U, export_independent ? 1U : 0U,
+      export_semantic_identity ? 1U : 0U,
       export_allocation ? 1U : 0U, export_policy ? 1U : 0U,
       export_local ? "PASS" : "FAIL",
       export_collective ? "PASS" : "FAIL");
@@ -3722,7 +3922,8 @@ bool InjectFunctionalRollback(
   if (!prior_export_collective) { return false; }
   const bool prior_metadata_exact =
       published_before->product_generation == before.generation &&
-      ExactOracleShape(*published_before, FunctionalOracleShape(ranks));
+      ExactOracleShape(
+          *published_before, FunctionalOracleShape(ranks, rank));
   if (!CollectivelyExact(prior_metadata_exact) ||
       !cuda_w8a_test_oracle::Verify(*published_before))
     return false;
@@ -3778,7 +3979,8 @@ bool InjectFunctionalRollback(
       visible_during->attempt_sequence != snapshot.attempt.sequence &&
       visible_during->product_generation !=
           snapshot.products.residual_generation &&
-      ExactOracleShape(*visible_during, FunctionalOracleShape(ranks));
+      ExactOracleShape(
+          *visible_during, FunctionalOracleShape(ranks, rank));
   const bool candidate_exported = visible_during_return &&
       (visible_during->attempt_sequence == snapshot.attempt.sequence ||
        visible_during->product_generation ==
@@ -3814,7 +4016,8 @@ bool InjectFunctionalRollback(
           published_before->attempt_sequence &&
       published_after->product_generation ==
           published_before->product_generation &&
-      ExactOracleShape(*published_after, FunctionalOracleShape(ranks));
+      ExactOracleShape(
+          *published_after, FunctionalOracleShape(ranks, rank));
   const bool prior_publication_collective =
       CollectivelyExact(prior_publication_retained);
   const bool published_after_verify = after_export_collective &&
