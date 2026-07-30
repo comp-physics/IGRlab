@@ -121,6 +121,72 @@ function(run_private_final_sync_failure prefix)
   set(${prefix}_error "${error}" PARENT_SCOPE)
 endfunction()
 
+function(run_private_post_publication_failure prefix fault)
+  if(HDG_RUNTIME_RANKS EQUAL 1)
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E env
+        "DG_IGR_HDG_TEST_POST_PUBLICATION_FAILURE=${fault}"
+        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+      RESULT_VARIABLE status
+      OUTPUT_VARIABLE output
+      ERROR_VARIABLE error)
+  else()
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E env
+        "DG_IGR_HDG_TEST_POST_PUBLICATION_FAILURE=${fault}"
+        "${HDG_RUNTIME_MPIEXEC}" "${HDG_RUNTIME_NUMPROC_FLAG}" 2
+        ${HDG_RUNTIME_MPIEXEC_PREFLAGS}
+        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+        ${HDG_RUNTIME_MPIEXEC_POSTFLAGS}
+      RESULT_VARIABLE status
+      OUTPUT_VARIABLE output
+      ERROR_VARIABLE error)
+  endif()
+  set(${prefix}_status "${status}" PARENT_SCOPE)
+  set(${prefix}_output "${output}" PARENT_SCOPE)
+  set(${prefix}_error "${error}" PARENT_SCOPE)
+endfunction()
+
+function(run_private_post_publication_failure_no_retry prefix fault)
+  if(HDG_RUNTIME_RANKS EQUAL 1)
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E env
+        "DG_IGR_HDG_TEST_POST_PUBLICATION_FAILURE=${fault}"
+        DG_IGR_HDG_TEST_POST_PUBLICATION_RETRY=0
+        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+      RESULT_VARIABLE status
+      OUTPUT_VARIABLE output
+      ERROR_VARIABLE error)
+  else()
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E env
+        "DG_IGR_HDG_TEST_POST_PUBLICATION_FAILURE=${fault}"
+        DG_IGR_HDG_TEST_POST_PUBLICATION_RETRY=0
+        "${HDG_RUNTIME_MPIEXEC}" "${HDG_RUNTIME_NUMPROC_FLAG}" 2
+        ${HDG_RUNTIME_MPIEXEC_PREFLAGS}
+        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+        ${HDG_RUNTIME_MPIEXEC_POSTFLAGS}
+      RESULT_VARIABLE status
+      OUTPUT_VARIABLE output
+      ERROR_VARIABLE error)
+  endif()
+  set(${prefix}_status "${status}" PARENT_SCOPE)
+  set(${prefix}_output "${output}" PARENT_SCOPE)
+  set(${prefix}_error "${error}" PARENT_SCOPE)
+endfunction()
+
+function(replace_cli_option output input option value)
+  set(arguments ${${input}})
+  list(FIND arguments "${option}" option_index)
+  if(option_index LESS 0)
+    message(FATAL_ERROR "CLI option is unavailable: ${option}")
+  endif()
+  math(EXPR value_index "${option_index} + 1")
+  list(REMOVE_AT arguments ${value_index})
+  list(INSERT arguments ${value_index} "${value}")
+  set(${output} ${arguments} PARENT_SCOPE)
+endfunction()
+
 function(require_regular_file path label)
   if(NOT EXISTS "${path}" OR IS_DIRECTORY "${path}")
     message(FATAL_ERROR "missing ${label}: ${path}")
@@ -463,6 +529,190 @@ file(READ "${HDG_RUNTIME_TEST_OUTPUT}/run-metadata.json" smoke_metadata)
 if(NOT smoke_metadata MATCHES "\"status\": \"Success\"" OR
    NOT smoke_metadata MATCHES "\"committed_step\": 3")
   message(FATAL_ERROR "three-step CLI smoke metadata is not truthful")
+endif()
+
+# A restart is authorized by the current generation marker and its complete
+# manifest, not merely by bytes that happen to decode as a checkpoint.
+math(EXPR required_reader_source "${HDG_RUNTIME_RANKS} - 1")
+set(manifest_failure_cases corrupt malformed missing extra)
+foreach(case IN LISTS manifest_failure_cases)
+  set(case_output "${HDG_RUNTIME_TEST_OUTPUT}-manifest-${case}")
+  set(case_checkpoint "${case_output}.checkpoint")
+  file(REMOVE_RECURSE "${case_output}")
+  file(REMOVE "${case_checkpoint}")
+  replace_cli_option(case_writer common_arguments --output-dir
+                     "${case_output}")
+  replace_cli_option(case_writer case_writer --checkpoint-out
+                     "${case_checkpoint}")
+  replace_cli_option(case_writer case_writer --stop-after-checkpoint true)
+  run_runtime(case_writer_run "--space" "l2" ${case_writer})
+  if(NOT case_writer_run_status EQUAL 0 OR
+     NOT case_writer_run_output MATCHES
+         "status=Success.*step=1.*retries=0" OR
+     NOT case_writer_run_error STREQUAL "")
+    message(FATAL_ERROR
+      "manifest-authority writer failed for ${case}: ${case_writer_run_status};${case_writer_run_output};${case_writer_run_error}")
+  endif()
+  file(READ_SYMLINK "${case_output}/.dg-igr-current" current_target)
+  set(case_generation "${case_output}/${current_target}")
+  if(case STREQUAL "corrupt")
+    file(APPEND "${case_generation}/checkpoint.v2" "corrupt")
+  elseif(case STREQUAL "malformed")
+    file(WRITE "${case_generation}/manifest.v1" "not-a-generation-manifest\n")
+  elseif(case STREQUAL "missing")
+    file(REMOVE "${case_generation}/manifest.v1")
+  elseif(case STREQUAL "extra")
+    file(WRITE "${case_generation}/unlisted.bin" "extra")
+  endif()
+  replace_cli_option(case_reader case_writer --stop-after-checkpoint false)
+  replace_cli_option(case_reader case_reader --checkpoint-out none)
+  replace_cli_option(case_reader case_reader --checkpoint-step none)
+  replace_cli_option(case_reader case_reader --restart-from
+                     "${case_checkpoint}")
+  replace_cli_option(case_reader case_reader --max-retries 1)
+  replace_cli_option(case_reader case_reader --inject-failure
+                     "AfterRecoveryBeforeCommit:2:${required_reader_source}")
+  run_runtime(case_reader_run "--space" "l2" ${case_reader})
+  if(NOT case_reader_run_status EQUAL 66 OR
+     NOT case_reader_run_error MATCHES "reason=restart_incompatible")
+    message(FATAL_ERROR
+      "restart accepted ${case} generation authority: args=${case_reader};${case_reader_run_status};${case_reader_run_output};${case_reader_run_error}")
+  endif()
+endforeach()
+
+set(authority_output "${HDG_RUNTIME_TEST_OUTPUT}-restart-authority")
+set(authority_checkpoint "${authority_output}.checkpoint")
+set(ordinary_checkpoint "${authority_output}.ordinary")
+set(stale_checkpoint "${authority_output}.stale")
+file(REMOVE_RECURSE "${authority_output}")
+file(REMOVE "${authority_checkpoint}" "${ordinary_checkpoint}"
+            "${stale_checkpoint}")
+replace_cli_option(authority_writer common_arguments --output-dir
+                   "${authority_output}")
+replace_cli_option(authority_writer authority_writer --checkpoint-out
+                   "${authority_checkpoint}")
+replace_cli_option(authority_writer authority_writer --stop-after-checkpoint
+                   true)
+run_runtime(authority_writer_run "--space" "l2" ${authority_writer})
+if(NOT authority_writer_run_status EQUAL 0 OR
+   NOT authority_writer_run_output MATCHES "status=Success.*step=1")
+  message(FATAL_ERROR
+    "restart-authority writer failed: ${authority_writer_run_status};${authority_writer_run_output};${authority_writer_run_error}")
+endif()
+file(READ_SYMLINK "${authority_output}/.dg-igr-current"
+                  authority_old_target)
+set(authority_old_generation
+    "${authority_output}/${authority_old_target}")
+file(COPY_FILE "${authority_checkpoint}" "${ordinary_checkpoint}")
+replace_cli_option(unauthorized_reader authority_writer
+                   --stop-after-checkpoint false)
+replace_cli_option(unauthorized_reader unauthorized_reader
+                   --checkpoint-out none)
+replace_cli_option(unauthorized_reader unauthorized_reader
+                   --checkpoint-step none)
+replace_cli_option(unauthorized_reader unauthorized_reader --restart-from
+                   "${ordinary_checkpoint}")
+replace_cli_option(unauthorized_reader unauthorized_reader --max-retries 1)
+replace_cli_option(unauthorized_reader unauthorized_reader --inject-failure
+                   "AfterRecoveryBeforeCommit:2:${required_reader_source}")
+run_runtime(unauthorized_run "--space" "l2" ${unauthorized_reader})
+if(NOT unauthorized_run_status EQUAL 66 OR
+   NOT unauthorized_run_error MATCHES "reason=restart_incompatible")
+  message(FATAL_ERROR
+    "ordinary checkpoint copy bypassed generation authority: ${unauthorized_run_status};${unauthorized_run_output};${unauthorized_run_error}")
+endif()
+
+replace_cli_option(valid_reader unauthorized_reader --restart-from
+                   "${authority_checkpoint}")
+run_runtime(valid_reader_run "--space" "l2" ${valid_reader})
+if(NOT valid_reader_run_status EQUAL 0 OR
+   NOT valid_reader_run_output MATCHES "status=Success.*step=3.*retries=1" OR
+   NOT valid_reader_run_error STREQUAL "")
+  message(FATAL_ERROR
+    "current manifest-valid checkpoint was rejected: ${valid_reader_run_status};${valid_reader_run_output};${valid_reader_run_error}")
+endif()
+file(CREATE_LINK "${authority_old_generation}/checkpoint.v2"
+                 "${stale_checkpoint}" SYMBOLIC)
+foreach(path IN ITEMS
+    "${authority_old_generation}/checkpoint.v2" "${stale_checkpoint}")
+  replace_cli_option(stale_reader valid_reader --restart-from "${path}")
+  run_runtime(stale_reader_run "--space" "l2" ${stale_reader})
+  if(NOT stale_reader_run_status EQUAL 66 OR
+     NOT stale_reader_run_error MATCHES "reason=restart_incompatible")
+    message(FATAL_ERROR
+      "stale/direct checkpoint bypassed current authority: ${path};${stale_reader_run_status};${stale_reader_run_output};${stale_reader_run_error}")
+  endif()
+endforeach()
+
+# Publication remains provisional through the final collective readiness
+# boundary. Every admitted source rank must restore disk and memory, then retry
+# exactly once without duplicating or losing a logical commit.
+math(EXPR maximum_post_publication_source "${HDG_RUNTIME_RANKS} - 1")
+foreach(phase IN ITEMS after-marker before-finalize)
+  foreach(source RANGE 0 ${maximum_post_publication_source})
+    set(post_output
+        "${HDG_RUNTIME_TEST_OUTPUT}-post-${phase}-rank${source}")
+    set(post_checkpoint "${post_output}.checkpoint")
+    file(REMOVE_RECURSE "${post_output}")
+    file(REMOVE "${post_checkpoint}")
+    replace_cli_option(post_arguments common_arguments --output-dir
+                       "${post_output}")
+    replace_cli_option(post_arguments post_arguments --checkpoint-out
+                       "${post_checkpoint}")
+    run_private_post_publication_failure(
+      post_run "${phase}:3:${source}" "--space" "l2" ${post_arguments})
+    if(NOT post_run_status EQUAL 0 OR
+       NOT post_run_output MATCHES "status=Success.*step=3.*retries=1" OR
+       NOT post_run_error STREQUAL "")
+      message(FATAL_ERROR
+        "post-publication ${phase}/rank${source} retry failed: ${post_run_status};${post_run_output};${post_run_error}")
+    endif()
+    file(GLOB post_states "${post_output}/state-step-*.vtk")
+    list(LENGTH post_states post_state_count)
+    file(READ "${post_output}/run-metadata.json" post_metadata)
+    if(NOT post_state_count EQUAL 3 OR
+       NOT post_metadata MATCHES "\"committed_step\": 3" OR
+       NOT post_metadata MATCHES "\"retries\": 1")
+      message(FATAL_ERROR
+        "post-publication ${phase}/rank${source} duplicated or lost a commit")
+    endif()
+  endforeach()
+endforeach()
+
+# With retry disabled, the previous marker must remain restartable by a later
+# process. This observes the restored authority before any retry publishes.
+set(no_retry_output "${HDG_RUNTIME_TEST_OUTPUT}-post-no-retry")
+set(no_retry_checkpoint "${no_retry_output}.checkpoint")
+file(REMOVE_RECURSE "${no_retry_output}")
+file(REMOVE "${no_retry_checkpoint}")
+replace_cli_option(no_retry_arguments common_arguments --output-dir
+                   "${no_retry_output}")
+replace_cli_option(no_retry_arguments no_retry_arguments --checkpoint-out
+                   "${no_retry_checkpoint}")
+run_private_post_publication_failure_no_retry(
+  no_retry_run "after-marker:3:${maximum_post_publication_source}"
+  "--space" "l2" ${no_retry_arguments})
+if(NOT no_retry_run_status EQUAL 70 OR
+   NOT no_retry_run_error MATCHES "step=2" OR
+   NOT EXISTS "${no_retry_output}/.dg-igr-current" OR
+   EXISTS "${no_retry_output}/state-step-000003.vtk")
+  message(FATAL_ERROR
+    "post-publication failure did not restore prior marker: ${no_retry_run_status};${no_retry_run_output};${no_retry_run_error}")
+endif()
+replace_cli_option(recovery_reader no_retry_arguments --checkpoint-out none)
+replace_cli_option(recovery_reader recovery_reader --checkpoint-step none)
+replace_cli_option(recovery_reader recovery_reader --restart-from
+                   "${no_retry_checkpoint}")
+replace_cli_option(recovery_reader recovery_reader --max-retries 1)
+replace_cli_option(recovery_reader recovery_reader --inject-failure
+                   "AfterRecoveryBeforeCommit:2:${required_reader_source}")
+run_runtime(recovery_reader_run "--space" "l2" ${recovery_reader})
+if(NOT recovery_reader_run_status EQUAL 0 OR
+   NOT recovery_reader_run_output MATCHES
+       "status=Success.*step=3.*retries=1" OR
+   NOT recovery_reader_run_error STREQUAL "")
+  message(FATAL_ERROR
+    "restored prior generation was not restartable: ${recovery_reader_run_status};${recovery_reader_run_output};${recovery_reader_run_error}")
 endif()
 
 set(injection_phases Assembly Condensation TraceSolve Recovery Diagnostics

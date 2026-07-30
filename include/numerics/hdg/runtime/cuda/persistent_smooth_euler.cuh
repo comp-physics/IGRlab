@@ -726,7 +726,7 @@ public:
     return true;
   }
 
-  /** Sole logical publication boundary; no fallible CUDA or staging hook follows. */
+  /** Sole logical publication boundary; validation failure remains reversible. */
   bool FinalizeCommit(CudaSerializedCheckpointV1& checkpoint,
                       CudaStepEvidence& evidence) noexcept
   {
@@ -745,8 +745,7 @@ public:
       return RevertCommit(checkpoint, FailureReason::collective_protocol,
                           evidence);
     }
-    if (!local_artifacts_publishable)
-      return false;
+    if (!local_artifacts_publishable) return false;
     const AttemptOutcome outcome =
         contract_->FinalizeCommit(std::move(*pending_.provisional));
     pending_.provisional.reset();

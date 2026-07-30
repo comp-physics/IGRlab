@@ -33,6 +33,16 @@ DurableIoStatus ReadDurableFile(const std::filesystem::path& path,
                                 std::vector<std::uint8_t>& bytes,
                                 std::string& detail) noexcept;
 
+namespace detail
+{
+/** Internal restart authority; ordinary or stale checkpoint paths fail. */
+DurableIoStatus ReadCurrentGenerationArtifact(
+    const std::filesystem::path& path,
+    std::size_t maximum_bytes,
+    std::vector<std::uint8_t>& bytes,
+    std::string& detail) noexcept;
+}
+
 DurableIoStatus PublishDurableFile(const std::filesystem::path& path,
                                    const std::uint8_t* bytes,
                                    std::size_t byte_count,

@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <sys/wait.h>
 #include <type_traits>
@@ -38,6 +39,13 @@ std::string ReadText(const std::filesystem::path& path)
   if (ReadDurableFile(path, 4096, bytes, detail) != DurableIoStatus::ok)
     return {};
   return {bytes.begin(), bytes.end()};
+}
+
+std::string ReadPlainText(const std::filesystem::path& path)
+{
+  std::ifstream input(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>{input},
+          std::istreambuf_iterator<char>{}};
 }
 
 bool StageText(DurableGenerationTransactionV1& transaction,
@@ -162,7 +170,7 @@ bool ManifestCorruptionCase(const std::filesystem::path& root,
       break;
     case 1:
     {
-      std::string text = ReadText(manifest);
+      std::string text = ReadPlainText(manifest);
       const std::string record = "artifact\tstate.vtk\t9\t";
       const std::size_t position = text.find(record);
       if (position != std::string::npos)
@@ -182,12 +190,89 @@ bool ManifestCorruptionCase(const std::filesystem::path& root,
       corrupted = std::filesystem::remove(
           generation / "state.vtk", error) && !error;
       break;
+    case 5:
+      corrupted = std::filesystem::remove(manifest, error) && !error;
+      break;
     default: return false;
   }
   if (!corrupted) return false;
+  std::vector<std::uint8_t> restart;
+  const bool restart_rejected = detail::ReadCurrentGenerationArtifact(
+      checkpoint, 4096, restart, detail) == DurableIoStatus::verify_failed;
   DurableGenerationTransactionV1 probe;
-  return probe.Begin(output, 1, detail) == DurableIoStatus::verify_failed &&
+  return restart_rejected &&
+      probe.Begin(output, 1, detail) == DurableIoStatus::verify_failed &&
       !probe.active() && !probe.published();
+}
+
+bool RestartAuthorityCase(const std::filesystem::path& root,
+                          std::string& detail)
+{
+  const auto case_root = root / "restart-authority";
+  const auto output = case_root / "output";
+  const auto checkpoint = case_root / "restart.checkpoint";
+  const auto ordinary = case_root / "ordinary.checkpoint";
+  const auto stale = case_root / "stale.checkpoint";
+  std::error_code error;
+  std::filesystem::create_directories(output, error);
+  if (error || !CommitGeneration(output, checkpoint, 0, "old", detail))
+    return false;
+  const auto old_generation = CurrentGeneration(output);
+  std::vector<std::uint8_t> bytes;
+  const bool old_authorized = detail::ReadCurrentGenerationArtifact(
+      checkpoint, 4096, bytes, detail) == DurableIoStatus::ok &&
+      std::string{bytes.begin(), bytes.end()} == "checkpoint-old";
+  const bool direct_rejected = detail::ReadCurrentGenerationArtifact(
+      old_generation / "checkpoint.v2", 4096, bytes, detail) ==
+          DurableIoStatus::verify_failed;
+  const bool ordinary_written = WriteText(ordinary, "checkpoint-old");
+  const bool ordinary_rejected = ordinary_written &&
+      detail::ReadCurrentGenerationArtifact(
+          ordinary, 4096, bytes, detail) == DurableIoStatus::verify_failed;
+  if (!CommitGeneration(output, checkpoint, 1, "new", detail)) return false;
+  std::filesystem::create_symlink(
+      old_generation / "checkpoint.v2", stale, error);
+  const bool stale_rejected = !error &&
+      detail::ReadCurrentGenerationArtifact(
+          stale, 4096, bytes, detail) == DurableIoStatus::verify_failed;
+  const bool current_authorized = detail::ReadCurrentGenerationArtifact(
+      checkpoint, 4096, bytes, detail) == DurableIoStatus::ok &&
+      std::string{bytes.begin(), bytes.end()} == "checkpoint-new";
+  return old_authorized && direct_rejected && ordinary_rejected &&
+      stale_rejected && current_authorized;
+}
+
+bool PublishedGenerationRevertCase(const std::filesystem::path& root,
+                                   std::string& detail)
+{
+  const auto case_root = root / "published-revert";
+  const auto output = case_root / "output";
+  const auto checkpoint = case_root / "restart.checkpoint";
+  std::error_code error;
+  std::filesystem::create_directories(output, error);
+  if (error || !CommitGeneration(output, checkpoint, 0, "old", detail))
+    return false;
+  DurableGenerationTransactionV1 transaction;
+  const bool staged =
+      transaction.Begin(output, 1, detail) == DurableIoStatus::ok &&
+      StageText(transaction, "state.vtk", "state-new", detail) &&
+      StageText(transaction, "checkpoint.v2", "checkpoint-new", detail) &&
+      StageText(transaction, "run-metadata.json", "metadata-new", detail) &&
+      transaction.AddAlias(checkpoint, "checkpoint.v2", detail) ==
+          DurableIoStatus::ok;
+  if (!staged || transaction.Publish(detail) != DurableIoStatus::ok ||
+      !transaction.published() || ReadText(checkpoint) != "checkpoint-new")
+    return false;
+  if (transaction.Revert(detail) != DurableIoStatus::ok ||
+      transaction.published() || transaction.active())
+    return false;
+  std::vector<std::uint8_t> bytes;
+  return ReadText(output / "state.vtk") == "state-old" &&
+      ReadText(checkpoint) == "checkpoint-old" &&
+      ReadText(output / "run-metadata.json") == "metadata-old" &&
+      detail::ReadCurrentGenerationArtifact(
+          checkpoint, 4096, bytes, detail) == DurableIoStatus::ok &&
+      std::string{bytes.begin(), bytes.end()} == "checkpoint-old";
 }
 
 bool FinalSyncFailureCase(const std::filesystem::path& root,
@@ -323,13 +408,18 @@ int main()
                                     static_cast<int>(index), detail),
                    "generation_process_death_is_atomic") && passed;
   }
-  for (int kind = 0; kind < 5; ++kind)
+  for (int kind = 0; kind < 6; ++kind)
   {
     passed = Check(ManifestCorruptionCase(root, kind, detail),
                    "generation_manifest_integrity_is_fail_closed") && passed;
   }
   passed = Check(FinalSyncFailureCase(root, detail),
                  "final_directory_sync_failure_preserves_previous_generation") &&
+      passed;
+  passed = Check(RestartAuthorityCase(root, detail),
+                 "restart_requires_current_manifest_authority") && passed;
+  passed = Check(PublishedGenerationRevertCase(root, detail),
+                 "published_generation_remains_reversible_until_commit") &&
       passed;
   std::filesystem::remove_all(root, error);
   if (passed) std::cout << "HDG runtime durable I/O PASS\n";

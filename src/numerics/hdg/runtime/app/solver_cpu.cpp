@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -122,6 +123,70 @@ bool CollectiveAll(const bool local, const MPI_Comm communicator) noexcept
   int reduced = 0;
   return MPI_Allreduce(&value, &reduced, 1, MPI_INT, MPI_MIN,
                        communicator) == MPI_SUCCESS && reduced == 1;
+}
+
+enum class PostPublicationFault : unsigned char
+{
+  after_marker,
+  before_finalize
+};
+
+bool ConsumePostPublicationFault(const PostPublicationFault expected,
+                                 const std::uint64_t step,
+                                 const int rank,
+                                 int& source_rank) noexcept
+{
+  source_rank = -1;
+  static bool marker_consumed = false;
+  static bool finalize_consumed = false;
+  bool& consumed = expected == PostPublicationFault::after_marker
+      ? marker_consumed : finalize_consumed;
+  if (consumed) return false;
+  const char* const raw =
+      std::getenv("DG_IGR_HDG_TEST_POST_PUBLICATION_FAILURE");
+  if (raw == nullptr) return false;
+  const std::string_view value{raw};
+  const std::string_view phase = expected == PostPublicationFault::after_marker
+      ? std::string_view{"after-marker"}
+      : std::string_view{"before-finalize"};
+  if (value.size() <= phase.size() + 2 ||
+      value.substr(0, phase.size()) != phase ||
+      value[phase.size()] != ':')
+    return false;
+  const std::size_t separator = value.find(':', phase.size() + 1);
+  if (separator == std::string_view::npos) return false;
+  std::uint64_t selected_step = 0;
+  int selected_rank = -1;
+  const auto step_result = std::from_chars(
+      value.data() + phase.size() + 1, value.data() + separator,
+      selected_step);
+  const auto rank_result = std::from_chars(
+      value.data() + separator + 1, value.data() + value.size(),
+      selected_rank);
+  if (step_result.ec != std::errc{} ||
+      step_result.ptr != value.data() + separator ||
+      rank_result.ec != std::errc{} ||
+      rank_result.ptr != value.data() + value.size() ||
+      selected_step != step || selected_rank != rank)
+  {
+    if (step_result.ec == std::errc{} &&
+        step_result.ptr == value.data() + separator &&
+        rank_result.ec == std::errc{} &&
+        rank_result.ptr == value.data() + value.size() &&
+        selected_step == step)
+      source_rank = selected_rank;
+    return false;
+  }
+  source_rank = selected_rank;
+  consumed = true;
+  return true;
+}
+
+bool PostPublicationFaultAllowsRetry() noexcept
+{
+  const char* const raw =
+      std::getenv("DG_IGR_HDG_TEST_POST_PUBLICATION_RETRY");
+  return raw == nullptr || std::string_view{raw} == "1";
 }
 
 std::string Hex(const StateHash& hash)
@@ -589,7 +654,7 @@ bool RestoreCheckpoint(const ValidatedApplicationConfig& config,
     try
     {
       std::vector<std::uint8_t> encoded;
-      decoded = ReadDurableFile(
+      decoded = detail::ReadCurrentGenerationArtifact(
                     std::string{config.restart_from().identity().view()},
                     64U * 1024U * 1024U, encoded, detail) ==
           DurableIoStatus::ok;
@@ -994,6 +1059,7 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
   while (result.failure_class == ApplicationRunResult::FailureClass::none &&
          adapter.coordinates().step < stop_step)
   {
+    bool private_post_publication_retry = false;
     const std::uint64_t target = adapter.coordinates().step + 1;
     CpuFailureInjection injection{};
     if (!retrying &&
@@ -1153,8 +1219,8 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
                   transaction, context, detail);
               if (!published)
               {
-                const bool cleaned = transaction.published()
-                    ? true : RevertTransaction(transaction, context, detail);
+                const bool cleaned =
+                    RevertTransaction(transaction, context, detail);
                 outcome = adapter.RevertCommit(
                     provisional,
                     cleaned ? CpuFailurePhase::output_staging
@@ -1162,14 +1228,46 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
               }
               else
               {
-                outcome = adapter.FinalizeCommit(provisional);
-                if (!outcome.committed)
+                int marker_source_rank = -1;
+                int finalize_source_rank = -1;
+                const bool marker_acknowledged = CollectiveAll(
+                    !ConsumePostPublicationFault(
+                        PostPublicationFault::after_marker, target,
+                        context.rank(), marker_source_rank),
+                    context.communicator());
+                const bool finalize_ready = marker_acknowledged &&
+                    CollectiveAll(
+                        !ConsumePostPublicationFault(
+                            PostPublicationFault::before_finalize, target,
+                            context.rank(), finalize_source_rank),
+                        context.communicator());
+                if (!finalize_ready)
                 {
-                  const bool cleaned = transaction.published()
-                      ? true : RevertTransaction(transaction, context, detail);
-                  if (!cleaned)
-                    outcome = {RunStatus::terminal_failure,
-                               FailureReason::backend_failure, false, false};
+                  const bool cleaned =
+                      RevertTransaction(transaction, context, detail);
+                  outcome = adapter.RevertCommit(
+                      provisional,
+                      cleaned ? (marker_acknowledged
+                                     ? CpuFailurePhase::commit
+                                     : CpuFailurePhase::output_staging)
+                              : CpuFailurePhase::rollback_audit,
+                      marker_acknowledged ? finalize_source_rank
+                                          : marker_source_rank);
+                  private_post_publication_retry = cleaned &&
+                      PostPublicationFaultAllowsRetry() &&
+                      result.retries == 0;
+                }
+                else
+                {
+                  outcome = adapter.FinalizeCommit(provisional);
+                  if (!outcome.committed)
+                  {
+                    const bool cleaned =
+                        RevertTransaction(transaction, context, detail);
+                    if (!cleaned)
+                      outcome = {RunStatus::terminal_failure,
+                                 FailureReason::backend_failure, false, false};
+                  }
                 }
               }
             }
@@ -1178,7 +1276,8 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
       }
     }
     if (!outcome.committed && outcome.retry_available &&
-        result.retries < config.retry_limit())
+        (result.retries < config.retry_limit() ||
+         private_post_publication_retry))
     {
       AppendCpuFailureProvenance(adapter.evidence().last_attempt, detail);
       ++result.retries;

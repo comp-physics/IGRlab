@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -49,6 +50,70 @@ bool CollectiveAll(const bool local, const MPI_Comm communicator) noexcept
   int reduced = 0;
   return MPI_Allreduce(&value, &reduced, 1, MPI_INT, MPI_MIN, communicator) ==
           MPI_SUCCESS && reduced == 1;
+}
+
+enum class PostPublicationFault : unsigned char
+{
+  after_marker,
+  before_finalize
+};
+
+bool ConsumePostPublicationFault(const PostPublicationFault expected,
+                                 const std::uint64_t step,
+                                 const int rank,
+                                 int& source_rank) noexcept
+{
+  source_rank = -1;
+  static bool marker_consumed = false;
+  static bool finalize_consumed = false;
+  bool& consumed = expected == PostPublicationFault::after_marker
+      ? marker_consumed : finalize_consumed;
+  if (consumed) return false;
+  const char* const raw =
+      std::getenv("DG_IGR_HDG_TEST_POST_PUBLICATION_FAILURE");
+  if (raw == nullptr) return false;
+  const std::string_view value{raw};
+  const std::string_view phase = expected == PostPublicationFault::after_marker
+      ? std::string_view{"after-marker"}
+      : std::string_view{"before-finalize"};
+  if (value.size() <= phase.size() + 2 ||
+      value.substr(0, phase.size()) != phase ||
+      value[phase.size()] != ':')
+    return false;
+  const std::size_t separator = value.find(':', phase.size() + 1);
+  if (separator == std::string_view::npos) return false;
+  std::uint64_t selected_step = 0;
+  int selected_rank = -1;
+  const auto step_result = std::from_chars(
+      value.data() + phase.size() + 1, value.data() + separator,
+      selected_step);
+  const auto rank_result = std::from_chars(
+      value.data() + separator + 1, value.data() + value.size(),
+      selected_rank);
+  if (step_result.ec != std::errc{} ||
+      step_result.ptr != value.data() + separator ||
+      rank_result.ec != std::errc{} ||
+      rank_result.ptr != value.data() + value.size() ||
+      selected_step != step || selected_rank != rank)
+  {
+    if (step_result.ec == std::errc{} &&
+        step_result.ptr == value.data() + separator &&
+        rank_result.ec == std::errc{} &&
+        rank_result.ptr == value.data() + value.size() &&
+        selected_step == step)
+      source_rank = selected_rank;
+    return false;
+  }
+  source_rank = selected_rank;
+  consumed = true;
+  return true;
+}
+
+bool PostPublicationFaultAllowsRetry() noexcept
+{
+  const char* const raw =
+      std::getenv("DG_IGR_HDG_TEST_POST_PUBLICATION_RETRY");
+  return raw == nullptr || std::string_view{raw} == "1";
 }
 
 std::string StepName(const std::uint64_t step)
@@ -595,7 +660,7 @@ bool RestoreCheckpoint(const ValidatedApplicationConfig& config,
     try
     {
       std::vector<std::uint8_t> encoded;
-      decoded = ReadDurableFile(
+      decoded = detail::ReadCurrentGenerationArtifact(
           std::string{config.restart_from().identity().view()},
           64U * 1024U * 1024U, encoded, detail) == DurableIoStatus::ok;
       for (int rank = 0; decoded && rank < context.ranks(); ++rank)
@@ -1166,8 +1231,8 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
           transaction, context, detail);
       if (!published)
       {
-        const bool cleaned = transaction.published()
-            ? true : RevertTransaction(transaction, context, detail);
+        const bool cleaned = RevertTransaction(
+            transaction, context, detail);
         const bool retry_available = engine->RevertCommit(
             checkpoint, FailureReason::backend_failure, evidence);
         if (cleaned && retry_available &&
@@ -1183,10 +1248,64 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
         detail = "CUDA artifact publication failed";
         break;
       }
-      if (!engine->FinalizeCommit(checkpoint, evidence))
+      int marker_source_rank = -1;
+      int finalize_source_rank = -1;
+      const bool marker_acknowledged = CollectiveAll(
+          !ConsumePostPublicationFault(
+              PostPublicationFault::after_marker, target, context.rank(),
+              marker_source_rank), context.communicator());
+      const bool finalize_fault = marker_acknowledged &&
+          ConsumePostPublicationFault(
+              PostPublicationFault::before_finalize, target, context.rank(),
+              finalize_source_rank);
+      if (finalize_fault) checkpoint.descriptor.trace_hash.bytes[0] ^= 1U;
+      const bool finalize_ready = marker_acknowledged;
+      if (!finalize_ready)
       {
-        const bool cleaned = transaction.published()
-            ? true : RevertTransaction(transaction, context, detail);
+        const bool cleaned = RevertTransaction(
+            transaction, context, detail);
+        const bool retry_available = engine->RevertCommit(
+            checkpoint, FailureReason::backend_failure, evidence);
+        const bool private_retry = cleaned &&
+            PostPublicationFaultAllowsRetry() && result.retries == 0;
+        if (cleaned && retry_available &&
+            (result.retries < config.retry_limit() || private_retry))
+        {
+          ++result.retries;
+          retry = true;
+          continue;
+        }
+        result.status = RunStatus::terminal_failure;
+        result.reason = FailureReason::backend_failure;
+        result.failure_class = cleaned
+            ? ApplicationRunResult::FailureClass::backend
+            : ApplicationRunResult::FailureClass::filesystem;
+        const int source_rank = marker_acknowledged
+            ? finalize_source_rank : marker_source_rank;
+        detail = (marker_acknowledged
+            ? "CUDA finalization readiness failure did not retry"
+            : "CUDA post-publication acknowledgement failure did not retry") +
+            std::string{" source_rank="} + std::to_string(source_rank);
+        break;
+      }
+      const bool finalize_resolved =
+          engine->FinalizeCommit(checkpoint, evidence);
+      if (!finalize_resolved || !evidence.committed)
+      {
+        const bool cleaned = RevertTransaction(
+            transaction, context, detail);
+        const bool retry_available = evidence.retry_available ||
+            engine->RevertCommit(
+                checkpoint, FailureReason::backend_failure, evidence);
+        const bool private_retry = cleaned && finalize_source_rank >= 0 &&
+            PostPublicationFaultAllowsRetry() && result.retries == 0;
+        if (cleaned && retry_available &&
+            (result.retries < config.retry_limit() || private_retry))
+        {
+          ++result.retries;
+          retry = true;
+          continue;
+        }
         result.status = RunStatus::terminal_failure;
         result.reason = evidence.contract_reason == FailureReason::none
             ? FailureReason::backend_failure : evidence.contract_reason;

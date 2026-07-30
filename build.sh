@@ -22,6 +22,8 @@ MFEM_REUSE_ROOT=""
 MFEM_REUSE_BUILD=""
 MFEM_REUSE_STATE="disabled"
 MFEM_REUSE_ABI=""
+SPACK_MANIFEST_SHA256=""
+SPACK_LOCK_SHA256=""
 
 usage() {
   cat <<'EOF'
@@ -382,6 +384,19 @@ validate_reused_mfem() {
   [[ -d "${SPACK_ENV}" && -f "${SPACK_ENV}/spack.yaml" &&
      -f "${SPACK_ENV}/spack.lock" ]] || {
     echo "ERROR: selected Spack environment is missing its manifest or lock: ${SPACK_ENV}" >&2
+    exit 3
+  }
+  command -v sha256sum >/dev/null 2>&1 || {
+    echo "ERROR: --reuse-mfem-root requires sha256sum for environment identity." >&2
+    exit 3
+  }
+  SPACK_MANIFEST_SHA256="$(sha256sum "${SPACK_ENV}/spack.yaml" | \
+    cut -d' ' -f1)"
+  SPACK_LOCK_SHA256="$(sha256sum "${SPACK_ENV}/spack.lock" | \
+    cut -d' ' -f1)"
+  [[ "${SPACK_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${SPACK_LOCK_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "ERROR: selected Spack manifest/lock hashes are malformed." >&2
     exit 3
   }
   [[ -d "${SPACK_ENV}/.spack-env/view" ]] || {
@@ -822,6 +837,7 @@ echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUX
 echo "[build-plan] mfem_reuse_root=${MFEM_REUSE_ROOT:-none} mfem_reuse_build=${MFEM_REUSE_BUILD:-none} mfem_install=${MFEM_INSTALL} mfem_reuse_state=${MFEM_REUSE_STATE}"
 if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
   echo "[build-plan] mfem_reuse_abi=${MFEM_REUSE_ABI}"
+  echo "[build-plan] spack_manifest_sha256=${SPACK_MANIFEST_SHA256} spack_lock_sha256=${SPACK_LOCK_SHA256}"
 fi
 
 if ((PRINT_PLAN)); then

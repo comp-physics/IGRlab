@@ -55,6 +55,67 @@ DurableIoStatus SyncDirectory(const std::filesystem::path& directory,
   return DurableIoStatus::ok;
 }
 
+DurableIoStatus ReadFileUnchecked(const std::filesystem::path& path,
+                                  const std::size_t maximum_bytes,
+                                  std::vector<std::uint8_t>& bytes,
+                                  std::string& detail) noexcept
+{
+  bytes.clear();
+  try
+  {
+    std::error_code error;
+    const std::uintmax_t size = std::filesystem::file_size(path, error);
+    if (error)
+    {
+      detail = "file_size: " + error.message();
+      return DurableIoStatus::read_failed;
+    }
+    if (size > maximum_bytes || size > bytes.max_size())
+    {
+      detail = "file exceeds admitted size";
+      return DurableIoStatus::too_large;
+    }
+    bytes.resize(static_cast<std::size_t>(size));
+    const int descriptor = ::open(path.c_str(), O_RDONLY);
+    if (descriptor < 0)
+    {
+      detail = ErrorText("open", errno);
+      bytes.clear();
+      return DurableIoStatus::open_failed;
+    }
+    std::size_t read = 0;
+    while (read < bytes.size())
+    {
+      const ssize_t count = ::read(descriptor, bytes.data() + read,
+                                   bytes.size() - read);
+      if (count < 0 && errno == EINTR) { continue; }
+      if (count <= 0)
+      {
+        const int saved = errno;
+        (void)::close(descriptor);
+        detail = count == 0 ? "unexpected end of file"
+                            : ErrorText("read", saved);
+        bytes.clear();
+        return DurableIoStatus::read_failed;
+      }
+      read += static_cast<std::size_t>(count);
+    }
+    if (::close(descriptor) != 0)
+    {
+      detail = ErrorText("close", errno);
+      bytes.clear();
+      return DurableIoStatus::read_failed;
+    }
+    return DurableIoStatus::ok;
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    bytes.clear();
+    return DurableIoStatus::read_failed;
+  }
+}
+
 DurableIoStatus WriteAndVerify(const std::filesystem::path& path,
                                const std::uint8_t* bytes,
                                const std::size_t byte_count,
@@ -102,7 +163,8 @@ DurableIoStatus WriteAndVerify(const std::filesystem::path& path,
     return DurableIoStatus::sync_failed;
   }
   std::vector<std::uint8_t> verified;
-  DurableIoStatus status = ReadDurableFile(path, byte_count, verified, detail);
+  DurableIoStatus status = ReadFileUnchecked(
+      path, byte_count, verified, detail);
   if (status != DurableIoStatus::ok || verified.size() != byte_count ||
       !std::equal(verified.begin(), verified.end(), bytes))
   {
@@ -248,7 +310,7 @@ DurableIoStatus VerifyGenerationManifest(
       return DurableIoStatus::verify_failed;
     }
     std::vector<std::uint8_t> manifest_bytes;
-    DurableIoStatus status = ReadDurableFile(
+    DurableIoStatus status = ReadFileUnchecked(
         manifest_path, maximum_manifest_bytes, manifest_bytes, detail);
     if (status != DurableIoStatus::ok) return status;
     const std::string manifest{
@@ -338,8 +400,8 @@ DurableIoStatus VerifyGenerationManifest(
         return DurableIoStatus::verify_failed;
       }
       std::vector<std::uint8_t> bytes;
-      status = ReadDurableFile(member.path(), maximum_artifact_bytes,
-                               bytes, detail);
+      status = ReadFileUnchecked(member.path(), maximum_artifact_bytes,
+                                 bytes, detail);
       if (status != DurableIoStatus::ok) return status;
       if (bytes.size() != found->second.bytes ||
           Hex(ComputeSha256(bytes.data(), bytes.size())) !=
@@ -359,6 +421,83 @@ DurableIoStatus VerifyGenerationManifest(
   catch (const std::exception& error)
   {
     detail = error.what();
+    return DurableIoStatus::verify_failed;
+  }
+}
+
+DurableIoStatus ReadAuthorizedGenerationArtifact(
+    const std::filesystem::path& requested,
+    const std::filesystem::path& authority_path,
+    const std::size_t maximum_bytes,
+    std::vector<std::uint8_t>& bytes,
+    std::string& detail) noexcept
+{
+  try
+  {
+    if (authority_path.parent_path().filename() != ".dg-igr-current" ||
+        !SafeRelativeName(authority_path.filename().string()))
+    {
+      detail = "generation artifact request does not pass through the current marker";
+      return DurableIoStatus::verify_failed;
+    }
+    const std::filesystem::path marker = authority_path.parent_path();
+    const std::filesystem::path output_root = marker.parent_path();
+    const std::filesystem::path generations_root =
+        output_root / ".dg-igr-generations";
+    std::error_code error;
+    const auto marker_status = std::filesystem::symlink_status(marker, error);
+    if (error || !std::filesystem::is_symlink(marker_status))
+    {
+      detail = "current generation marker is missing or not a symbolic link";
+      return DurableIoStatus::verify_failed;
+    }
+    const std::filesystem::path marker_target =
+        std::filesystem::read_symlink(marker, error);
+    if (error || marker_target.empty() || marker_target.is_absolute())
+    {
+      detail = "current generation marker target is invalid";
+      return DurableIoStatus::verify_failed;
+    }
+    const std::filesystem::path current =
+        (output_root / marker_target).lexically_normal();
+    if (current.parent_path() != generations_root ||
+        !std::filesystem::is_directory(current, error) || error)
+    {
+      detail = "current generation marker does not name an immutable generation";
+      return DurableIoStatus::verify_failed;
+    }
+    DurableIoStatus status = VerifyGenerationManifest(current, detail);
+    if (status != DurableIoStatus::ok) return status;
+    const std::filesystem::path expected =
+        current / authority_path.filename();
+    if (std::filesystem::symlink_status(expected, error).type() !=
+            std::filesystem::file_type::regular || error)
+    {
+      detail = "current generation does not contain the requested artifact";
+      return DurableIoStatus::verify_failed;
+    }
+    const std::filesystem::path resolved_requested =
+        std::filesystem::canonical(requested, error);
+    if (error)
+    {
+      detail = "generation artifact request cannot be resolved: " +
+          error.message();
+      return DurableIoStatus::verify_failed;
+    }
+    const std::filesystem::path resolved_expected =
+        std::filesystem::canonical(expected, error);
+    if (error || resolved_requested != resolved_expected)
+    {
+      detail = "generation artifact request is stale or not authorized by the current marker";
+      return DurableIoStatus::verify_failed;
+    }
+    return ReadFileUnchecked(
+        resolved_expected, maximum_bytes, bytes, detail);
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    bytes.clear();
     return DurableIoStatus::verify_failed;
   }
 }
@@ -442,61 +581,49 @@ DurableIoStatus ReadDurableFile(const std::filesystem::path& path,
                                 std::vector<std::uint8_t>& bytes,
                                 std::string& detail) noexcept
 {
+  return ReadFileUnchecked(path, maximum_bytes, bytes, detail);
+}
+
+namespace detail
+{
+DurableIoStatus ReadCurrentGenerationArtifact(
+    const std::filesystem::path& path,
+    const std::size_t maximum_bytes,
+    std::vector<std::uint8_t>& bytes,
+    std::string& detail) noexcept
+{
   bytes.clear();
   try
   {
+    const std::filesystem::path requested =
+        std::filesystem::absolute(path).lexically_normal();
+    std::filesystem::path authority_path = requested;
     std::error_code error;
-    const std::uintmax_t size = std::filesystem::file_size(path, error);
-    if (error)
+    const auto requested_status =
+        std::filesystem::symlink_status(requested, error);
+    if (!error && std::filesystem::is_symlink(requested_status))
     {
-      detail = "file_size: " + error.message();
-      return DurableIoStatus::read_failed;
-    }
-    if (size > maximum_bytes || size > bytes.max_size())
-    {
-      detail = "file exceeds admitted size";
-      return DurableIoStatus::too_large;
-    }
-    bytes.resize(static_cast<std::size_t>(size));
-    const int descriptor = ::open(path.c_str(), O_RDONLY);
-    if (descriptor < 0)
-    {
-      detail = ErrorText("open", errno);
-      bytes.clear();
-      return DurableIoStatus::open_failed;
-    }
-    std::size_t read = 0;
-    while (read < bytes.size())
-    {
-      const ssize_t count = ::read(descriptor, bytes.data() + read,
-                                   bytes.size() - read);
-      if (count < 0 && errno == EINTR) { continue; }
-      if (count <= 0)
+      std::filesystem::path target =
+          std::filesystem::read_symlink(requested, error);
+      if (error)
       {
-        const int saved = errno;
-        (void)::close(descriptor);
-        detail = count == 0 ? "unexpected end of file"
-                            : ErrorText("read", saved);
-        bytes.clear();
-        return DurableIoStatus::read_failed;
+        detail = "read restart artifact alias: " + error.message();
+        return DurableIoStatus::verify_failed;
       }
-      read += static_cast<std::size_t>(count);
+      if (!target.is_absolute()) target = requested.parent_path() / target;
+      authority_path = target.lexically_normal();
     }
-    if (::close(descriptor) != 0)
-    {
-      detail = ErrorText("close", errno);
-      bytes.clear();
-      return DurableIoStatus::read_failed;
-    }
-    return DurableIoStatus::ok;
+    return ReadAuthorizedGenerationArtifact(
+        requested, authority_path, maximum_bytes, bytes, detail);
   }
   catch (const std::exception& error)
   {
     detail = error.what();
     bytes.clear();
-    return DurableIoStatus::read_failed;
+    return DurableIoStatus::verify_failed;
   }
 }
+} // namespace detail
 
 DurableIoStatus PublishDurableFile(const std::filesystem::path& path,
                                    const std::uint8_t* bytes,
@@ -973,7 +1100,7 @@ DurableIoStatus DurableGenerationTransactionV1::Publish(
     for (const auto& artifact : artifacts)
     {
       std::vector<std::uint8_t> bytes;
-      DurableIoStatus read = ReadDurableFile(
+      DurableIoStatus read = ReadFileUnchecked(
           artifact, 256U * 1024U * 1024U, bytes, detail);
       if (read != DurableIoStatus::ok) return read;
       manifest << "artifact\t" << artifact.filename().string() << '\t'
@@ -1085,14 +1212,16 @@ DurableIoStatus DurableGenerationTransactionV1::Publish(
 DurableIoStatus DurableGenerationTransactionV1::Revert(
     std::string& detail) noexcept
 {
-  if (published_)
-  {
-    detail = "a committed generation cannot be reverted";
-    return DurableIoStatus::invalid_path;
-  }
   try
   {
     std::error_code error;
+    if (published_)
+    {
+      const DurableIoStatus restored = RestoreGenerationMarker(
+          output_root_, previous_marker_target_, detail);
+      if (restored != DurableIoStatus::ok) return restored;
+      published_ = false;
+    }
     for (auto path = created_aliases_.rbegin();
          path != created_aliases_.rend(); ++path)
     {
