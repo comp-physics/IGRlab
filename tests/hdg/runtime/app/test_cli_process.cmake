@@ -193,6 +193,21 @@ function(require_regular_file path label)
   endif()
 endfunction()
 
+function(require_manifest_artifact generation artifact label)
+  set(artifact_path "${generation}/${artifact}")
+  set(manifest_path "${generation}/manifest.v1")
+  require_regular_file("${artifact_path}" "${label} artifact")
+  require_regular_file("${manifest_path}" "${label} manifest")
+  file(READ "${manifest_path}" manifest)
+  string(ASCII 9 tab)
+  string(FIND "${manifest}" "artifact${tab}${artifact}${tab}"
+              artifact_record)
+  if(artifact_record LESS 0)
+    message(FATAL_ERROR
+      "${label} is not authorized by its generation manifest: ${artifact_path}")
+  endif()
+endfunction()
+
 function(validate_physical_vtk path mesh_n label)
   file(READ "${path}" vtk)
   file(STRINGS "${path}" vtk_lines)
@@ -555,8 +570,22 @@ foreach(case IN LISTS manifest_failure_cases)
   endif()
   file(READ_SYMLINK "${case_output}/.dg-igr-current" current_target)
   set(case_generation "${case_output}/${current_target}")
+  set(case_generation_checkpoint
+      "${case_generation}/restart-checkpoint.v2")
+  require_manifest_artifact(
+    "${case_generation}" "restart-checkpoint.v2"
+    "manifest-authority ${case} checkpoint")
   if(case STREQUAL "corrupt")
-    file(APPEND "${case_generation}/checkpoint.v2" "corrupt")
+    file(SIZE "${case_generation_checkpoint}" checkpoint_size_before)
+    file(SHA256 "${case_generation_checkpoint}" checkpoint_sha_before)
+    file(APPEND "${case_generation_checkpoint}" "corrupt")
+    file(SIZE "${case_generation_checkpoint}" checkpoint_size_after)
+    file(SHA256 "${case_generation_checkpoint}" checkpoint_sha_after)
+    if(checkpoint_size_after LESS_EQUAL checkpoint_size_before OR
+       checkpoint_sha_after STREQUAL checkpoint_sha_before)
+      message(FATAL_ERROR
+        "real manifest-listed checkpoint was not corrupted fail-closed")
+    endif()
   elseif(case STREQUAL "malformed")
     file(WRITE "${case_generation}/manifest.v1" "not-a-generation-manifest\n")
   elseif(case STREQUAL "missing")
@@ -603,6 +632,11 @@ file(READ_SYMLINK "${authority_output}/.dg-igr-current"
                   authority_old_target)
 set(authority_old_generation
     "${authority_output}/${authority_old_target}")
+set(authority_old_checkpoint
+    "${authority_old_generation}/restart-checkpoint.v2")
+require_manifest_artifact(
+  "${authority_old_generation}" "restart-checkpoint.v2"
+  "formerly current restart checkpoint")
 file(COPY_FILE "${authority_checkpoint}" "${ordinary_checkpoint}")
 replace_cli_option(unauthorized_reader authority_writer
                    --stop-after-checkpoint false)
@@ -631,10 +665,18 @@ if(NOT valid_reader_run_status EQUAL 0 OR
   message(FATAL_ERROR
     "current manifest-valid checkpoint was rejected: ${valid_reader_run_status};${valid_reader_run_output};${valid_reader_run_error}")
 endif()
-file(CREATE_LINK "${authority_old_generation}/checkpoint.v2"
+file(READ_SYMLINK "${authority_output}/.dg-igr-current"
+                  authority_new_target)
+if(authority_new_target STREQUAL authority_old_target)
+  message(FATAL_ERROR
+    "restart-authority fixture did not make the prior generation stale")
+endif()
+require_regular_file("${authority_old_checkpoint}"
+                     "formerly current restart checkpoint")
+file(CREATE_LINK "${authority_old_checkpoint}"
                  "${stale_checkpoint}" SYMBOLIC)
 foreach(path IN ITEMS
-    "${authority_old_generation}/checkpoint.v2" "${stale_checkpoint}")
+    "${authority_old_checkpoint}" "${stale_checkpoint}")
   replace_cli_option(stale_reader valid_reader --restart-from "${path}")
   run_runtime(stale_reader_run "--space" "l2" ${stale_reader})
   if(NOT stale_reader_run_status EQUAL 66 OR
