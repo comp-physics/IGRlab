@@ -54,6 +54,9 @@ ApplicationOptionsView Smoke(const std::string_view backend)
 {
   ApplicationOptionsView options;
   options.backend_id = backend;
+  options.device_id = backend == CudaRank1OneGpuBackendTag::id ||
+          backend == CudaRank2OneGpuHostStagedBackendTag::id
+      ? 0 : -1;
   return options;
 }
 
@@ -127,6 +130,7 @@ ApplicationOptionsView Focused(ApplicationOptionsView options,
                            ? smooth_periodic_euler_v1_smoke_checkpoint_step
                            : UINT64_C(2),
                        source_rank};
+  options.retry_limit = smooth_periodic_euler_v1_retry_limit;
   return options;
 }
 
@@ -152,9 +156,9 @@ bool CheckExactAcceptedFieldsAndHashes()
                    config->output_directory().present() &&
                    config->output_directory().identity().view() ==
                        "w8a/output" &&
-                   config->evidence_directory().present() &&
+                   !config->evidence_directory().present() &&
                    config->validation_capture() ==
-                       ValidationCaptureModeV1::persistent_v1 &&
+                       ValidationCaptureModeV1::none &&
                    config->checkpoint_out().present() &&
                    config->checkpoint_step().present &&
                    config->checkpoint_step().value == 1 &&
@@ -290,19 +294,16 @@ bool CheckNegativeRoleControls()
   request.output_directory = OutputDirectoryPathV1::Present({});
   reject(request, "empty_present_output_directory_rejected");
   request = Smoke(CpuSerialBackendTag::id);
-  request.evidence_directory = {};
-  reject(request, "missing_evidence_directory_rejected");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.validation_capture = ValidationCaptureModeV1::none;
-  reject(request, "capture_evidence_mismatch_rejected");
+  request.evidence_directory =
+      EvidenceDirectoryPathV1::Present("unaccepted/evidence");
+  request.validation_capture = ValidationCaptureModeV1::persistent_v1;
+  reject(request, "application_capture_pair_rejected");
   request = Smoke(CpuSerialBackendTag::id);
   request.validation_capture = static_cast<ValidationCaptureModeV1>(255);
   reject(request, "unknown_capture_mode_rejected");
   request = Smoke(CpuSerialBackendTag::id);
-  request.evidence_directory = {};
-  request.validation_capture = ValidationCaptureModeV1::none;
   passed = Check(ValidateApplicationOptions(request).accepted(),
-                 "ordinary_non_evidence_pair_accepted") &&
+                 "external_evidence_default_accepted") &&
       passed;
   request = SplitWriter(Smoke(CpuSerialBackendTag::id));
   request.checkpoint_out = {};
@@ -347,6 +348,9 @@ bool CheckNegativeRoleControls()
   request = Smoke(CpuSerialBackendTag::id);
   request.seed = 0;
   reject(request, "scenario_seed_rejected");
+  request = Focused(Smoke(CpuSerialBackendTag::id), FailurePhase::Recovery, 0);
+  request.retry_limit = 0;
+  reject(request, "focused_retry_required");
   request = Focused(Smoke(CpuSerialBackendTag::id), FailurePhase::Recovery, 0);
   request.injection.phase = FailurePhase::Commit;
   reject(request, "unlisted_focused_phase_rejected");

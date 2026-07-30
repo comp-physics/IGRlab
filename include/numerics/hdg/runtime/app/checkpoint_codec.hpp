@@ -203,6 +203,10 @@ private:
       std::size_t,
       const ValidatedApplicationConfig&,
       const CheckpointRuntimeIdentityV1&) noexcept;
+  friend std::optional<CapturedCheckpointV1> CaptureCheckpointPiecesV1(
+      const CheckpointDescriptor*, std::size_t,
+      const ValidatedApplicationConfig&,
+      const CheckpointRuntimeIdentityV1&) noexcept;
 };
 
 bool ValidCheckpointRuntimeIdentityV1(
@@ -215,6 +219,13 @@ bool DeriveScenarioCoefficientExtentsV1(
     const ValidatedApplicationConfig& config,
     std::uint32_t rank_count,
     ScenarioCoefficientExtentsV1& extents) noexcept;
+
+/** App-owned capture bridge for public rank-local CPU/CUDA checkpoint pieces. */
+std::optional<CapturedCheckpointV1> CaptureCheckpointPiecesV1(
+    const CheckpointDescriptor* rank_descriptors,
+    std::size_t rank_count,
+    const ValidatedApplicationConfig& config,
+    const CheckpointRuntimeIdentityV1& runtime_identity) noexcept;
 
 template <typename Selection,
           typename InteriorState,

@@ -17,6 +17,13 @@ HDG_AUXILIARY_EXPERIMENT="OFF"
 SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
 CUDA_ARCH_WAS_SET=0
 PRINT_PLAN=0
+MFEM_REUSE_REQUEST=""
+MFEM_REUSE_ROOT=""
+MFEM_REUSE_BUILD=""
+MFEM_REUSE_STATE="disabled"
+MFEM_REUSE_ABI=""
+SPACK_MANIFEST_SHA256=""
+SPACK_LOCK_SHA256=""
 
 usage() {
   cat <<'EOF'
@@ -38,6 +45,9 @@ Options:
   -j, --jobs N      Parallel build jobs (default: NPROC or 4).
   --mfem-jobs N     Parallel MFEM build jobs (default: --jobs value).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
+  --reuse-mfem-root DIR
+                    Reuse a validated, read-only MFEM build/install rooted at
+                    DIR instead of invoking build_mfem_tpl.sh.
   --print-plan      Validate and print the resolved build policy, then exit.
   --clean           Rebuild the selected mode from clean caches (default).
   --no-clean        Reuse existing build and install directories.
@@ -81,6 +91,11 @@ while (($#)); do
       MFEM_JOBS="$2"
       shift
       ;;
+    --reuse-mfem-root)
+      [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+      MFEM_REUSE_REQUEST="$2"
+      shift
+      ;;
     --print-plan) PRINT_PLAN=1 ;;
     --clean) CLEAN=1 ;;
     --no-clean) CLEAN=0 ;;
@@ -92,6 +107,634 @@ while (($#)); do
   esac
   shift
 done
+
+cache_value() {
+  local cache="$1"
+  local key="$2"
+  sed -n "s/^${key}:[^=]*=//p" "${cache}" | tail -n 1
+}
+
+config_value() {
+  local config="$1"
+  local key="$2"
+  sed -n \
+    -e "s|^set(${key} \"\(.*\)\")$|\1|p" \
+    -e "s|^set(${key} \([^)]*\))$|\1|p" \
+    "${config}" | tail -n 1
+}
+
+canonical_existing_path() {
+  local path="$1"
+  [[ -n "${path}" && -e "${path}" ]] || return 1
+  realpath -e -- "${path}"
+}
+
+spack_identity() {
+  local package="$1"
+  local prefix_variable="$2"
+  local hash_variable="$3"
+  local compiler_variable="$4"
+  local prefix records hash compiler line_count
+  prefix="$(SPACK_COLOR=never spack -e "${SPACK_ENV}" location -i \
+      "${package}" 2>/dev/null)" || {
+    echo "ERROR: active Spack environment has no unique installed ${package}." >&2
+    exit 3
+  }
+  records="$(SPACK_COLOR=never spack -e "${SPACK_ENV}" find \
+      --format '{hash}|{compiler.name}@{compiler.version}' \
+      "${package}" 2>/dev/null)" || {
+    echo "ERROR: active Spack environment has no concrete ${package} identity." >&2
+    exit 3
+  }
+  line_count="$(printf '%s\n' "${records}" | sed '/^$/d' | wc -l)"
+  [[ "${line_count}" == "1" ]] || {
+    echo "ERROR: active Spack environment has ambiguous ${package} identities." >&2
+    exit 3
+  }
+  hash="${records%%|*}"
+  compiler="${records#*|}"
+  [[ "${hash}" =~ ^[a-z0-9]{32}$ && -n "${compiler}" ]] || {
+    echo "ERROR: active Spack ${package} identity is malformed." >&2
+    exit 3
+  }
+  prefix="$(canonical_existing_path "${prefix}")" || {
+    echo "ERROR: active Spack ${package} prefix is missing or moved." >&2
+    exit 3
+  }
+  printf -v "${prefix_variable}" '%s' "${prefix}"
+  printf -v "${hash_variable}" '%s' "${hash}"
+  printf -v "${compiler_variable}" '%s' "${compiler}"
+}
+
+spack_dependency_hash() {
+  local package="$1"
+  local dependency="$2"
+  local records line_count
+  records="$(SPACK_COLOR=never spack -e "${SPACK_ENV}" find \
+      --format "{^${dependency}.hash}" "${package}" 2>/dev/null)" || {
+    echo "ERROR: active Spack ${package} has no ${dependency} dependency identity." >&2
+    exit 3
+  }
+  line_count="$(printf '%s\n' "${records}" | sed '/^$/d' | wc -l)"
+  [[ "${line_count}" == "1" && "${records}" =~ ^[a-z0-9]{32}$ ]] || {
+    echo "ERROR: active Spack ${package}->${dependency} identity is missing or ambiguous." >&2
+    exit 3
+  }
+  printf '%s' "${records}"
+}
+
+assert_reuse_fixture_rejected() {
+  local expected="$1"
+  shift
+  local output status
+  set +e
+  output="$("$@" 2>&1)"
+  status=$?
+  set -e
+  [[ ${status} -eq 3 && "${output}" == *"${expected}"* ]] || {
+    echo "ERROR: reuse fixture expected '${expected}' with exit 3; exit=${status} output=${output}" >&2
+    exit 3
+  }
+}
+
+make_reuse_fixture() {
+  local label="$1"
+  local source_root="$2"
+  local fixture="${DG_IGR_REUSE_FIXTURE_ROOT}/${label}"
+  local build_name install_name source_build source_install
+  git -c advice.detachedHead=false clone --quiet --shared \
+    "${source_root}" "${fixture}"
+  git -c advice.detachedHead=false -C "${fixture}" checkout --quiet \
+    --detach "$(git -C "${source_root}" rev-parse HEAD)"
+  if [[ "${MODE}" == "gpu" ]]; then
+    build_name="build-gpu-sm${SPACK_CUDA_ARCH}"
+    install_name="install-gpu-sm${SPACK_CUDA_ARCH}"
+  elif ((CALIPER)); then
+    build_name="build-cpu-caliper"
+    install_name="install-cpu-caliper"
+  else
+    build_name="build-cpu"
+    install_name="install-cpu"
+  fi
+  source_build="${source_root}/${build_name}"
+  source_install="${source_root}/${install_name}"
+  mkdir -p "${fixture}/${build_name}" \
+           "${fixture}/${install_name}/lib/cmake/mfem" \
+           "${fixture}/${install_name}/lib"
+  cp "${source_build}/CMakeCache.txt" \
+     "${fixture}/${build_name}/CMakeCache.txt"
+  cp "${source_install}/lib/cmake/mfem/MFEMConfig.cmake" \
+     "${fixture}/${install_name}/lib/cmake/mfem/MFEMConfig.cmake"
+  ln -s "${source_install}/lib/libmfem.a" \
+        "${fixture}/${install_name}/lib/libmfem.a"
+  sed -i -e "s|${source_root}|${fixture}|g" \
+    "${fixture}/${build_name}/CMakeCache.txt"
+  DG_IGR_REUSE_FIXTURE="${fixture}"
+  DG_IGR_REUSE_FIXTURE_CACHE="${fixture}/${build_name}/CMakeCache.txt"
+}
+
+run_reuse_compatibility_fixtures() {
+  local source_root="${MFEM_REUSE_ROOT}"
+  local -a mode_args=(--cpu-only)
+  if [[ "${MODE}" == "gpu" ]]; then
+    mode_args=(--gpu --cuda-arch "${SPACK_CUDA_ARCH}")
+  elif ((CALIPER)); then
+    mode_args=(--cpu-only --caliper)
+  fi
+  DG_IGR_REUSE_FIXTURE_ROOT="$(mktemp -d \
+    "${TMPDIR:-/tmp}/dg-igr-reuse-fixtures.XXXXXX")"
+  export DG_IGR_REUSE_FIXTURE_ROOT
+  trap 'rm -rf -- "${DG_IGR_REUSE_FIXTURE_ROOT}"' EXIT
+
+  make_reuse_fixture compiler "${source_root}"
+  sed -i \
+    's|^CMAKE_CXX_COMPILER:[^=]*=.*$|CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/g++|' \
+    "${DG_IGR_REUSE_FIXTURE_CACHE}"
+  assert_reuse_fixture_rejected "C++/MPI wrapper mismatch" \
+    env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+    bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+    --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+    --no-deps --no-tests --print-plan
+
+  make_reuse_fixture hypre "${source_root}"
+  sed -i 's|^HYPRE_DIR:[^=]*=.*$|HYPRE_DIR:PATH=/usr|' \
+    "${DG_IGR_REUSE_FIXTURE_CACHE}"
+  assert_reuse_fixture_rejected "HYPRE root mismatch" \
+    env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+    bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+    --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+    --no-deps --no-tests --print-plan
+
+  make_reuse_fixture raja "${source_root}"
+  sed -i 's|^MFEM_USE_RAJA:[^=]*=.*$|MFEM_USE_RAJA:BOOL=ON|' \
+    "${DG_IGR_REUSE_FIXTURE_CACHE}"
+  assert_reuse_fixture_rejected "RAJA disabled" \
+    env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+    bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+    --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+    --no-deps --no-tests --print-plan
+
+  if [[ "${MODE}" == "gpu" ]]; then
+    make_reuse_fixture umpire "${source_root}"
+    sed -i 's|^UMPIRE_DIR:[^=]*=.*$|UMPIRE_DIR:PATH=/usr|' \
+      "${DG_IGR_REUSE_FIXTURE_CACHE}"
+    assert_reuse_fixture_rejected "Umpire root mismatch" \
+      env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+      bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+      --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+      --no-deps --no-tests --print-plan
+
+    make_reuse_fixture cuda "${source_root}"
+    sed -i 's|^CUDAToolkit_ROOT:[^=]*=.*$|CUDAToolkit_ROOT:PATH=/usr|' \
+      "${DG_IGR_REUSE_FIXTURE_CACHE}"
+    assert_reuse_fixture_rejected "CUDA toolkit/compiler mismatch" \
+      env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+      bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+      --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+      --no-deps --no-tests --print-plan
+  fi
+
+  rm -rf -- "${DG_IGR_REUSE_FIXTURE_ROOT}"
+  trap - EXIT
+  unset DG_IGR_REUSE_FIXTURE_ROOT DG_IGR_REUSE_FIXTURE \
+        DG_IGR_REUSE_FIXTURE_CACHE
+  echo "[reuse-fixtures] positive and negative compatibility cases passed"
+}
+
+is_cmake_true() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  [[ "${value}" == "1" || "${value}" == "ON" ||
+     "${value}" == "TRUE" || "${value}" == "YES" ]]
+}
+
+is_cmake_false() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  [[ "${value}" == "0" || "${value}" == "OFF" ||
+     "${value}" == "FALSE" || "${value}" == "NO" ]]
+}
+
+validate_reused_mfem() {
+  local requested="$1"
+  local root expected_pin root_head root_top tracked_status
+  local build_name install_name build install cache config archive
+  local cache_home cache_prefix canonical_home canonical_prefix
+  local mpi_enabled cuda_enabled raja_enabled umpire_enabled configured_archs
+  local cache_cxx cache_mpi_cxx config_cxx expected_mpicxx expected_mpicc
+  local c_command cxx_command compiler_name compiler_version
+  local mpi_prefix mpi_hash mpi_compiler hypre_prefix hypre_hash hypre_compiler
+  local hypre_mpi_hash raja_state umpire_state
+  local cuda_prefix cuda_hash cuda_compiler umpire_prefix umpire_hash
+  local umpire_compiler hypre_cuda_hash hypre_umpire_hash umpire_cuda_hash
+  local cache_hypre cache_umpire cache_cuda cache_cuda_compiler
+  local spack_view view_mpicc view_mpicxx view_hypre_header
+  local view_hypre_library view_library_candidate view_nvcc view_umpire_config
+  local cuda_metadata_records cuda_metadata_count cuda_metadata
+  local metadata_cuda metadata_cuda_root cuda_host_compiler
+  local cuda_host_compiler_id cuda_host_compiler_version
+
+  command -v realpath >/dev/null 2>&1 || {
+    echo "ERROR: --reuse-mfem-root requires realpath." >&2
+    exit 3
+  }
+  [[ -d "${requested}" ]] || {
+    echo "ERROR: reused MFEM root does not exist or is not a directory: ${requested}" >&2
+    exit 3
+  }
+  root="$(realpath -e -- "${requested}")" || {
+    echo "ERROR: unable to canonicalize reused MFEM root: ${requested}" >&2
+    exit 3
+  }
+  expected_pin="$(git -C "${SCRIPT_DIR}" rev-parse HEAD:tpl/mfem 2>/dev/null)" || {
+    echo "ERROR: current application HEAD has no readable tpl/mfem gitlink." >&2
+    exit 3
+  }
+  root_top="$(git -C "${root}" rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "ERROR: reused MFEM root is not a Git checkout: ${root}" >&2
+    exit 3
+  }
+  root_top="$(realpath -e -- "${root_top}")"
+  [[ "${root_top}" == "${root}" ]] || {
+    echo "ERROR: reused MFEM root is not the checkout top level: root=${root} top=${root_top}" >&2
+    exit 3
+  }
+  root_head="$(git -C "${root}" rev-parse HEAD 2>/dev/null)" || {
+    echo "ERROR: reused MFEM root has no readable HEAD: ${root}" >&2
+    exit 3
+  }
+  [[ "${root_head}" == "${expected_pin}" ]] || {
+    echo "ERROR: reused MFEM pin mismatch: expected=${expected_pin} actual=${root_head}" >&2
+    exit 3
+  }
+  tracked_status="$(GIT_OPTIONAL_LOCKS=0 git -C "${root}" status --porcelain=v1 --untracked-files=no)" || {
+    echo "ERROR: unable to inspect reused MFEM tracked state: ${root}" >&2
+    exit 3
+  }
+  [[ -z "${tracked_status}" ]] || {
+    echo "ERROR: reused MFEM tracked source/index is dirty: ${root}" >&2
+    printf '%s\n' "${tracked_status}" >&2
+    exit 3
+  }
+
+  command -v spack >/dev/null 2>&1 || {
+    echo "ERROR: --reuse-mfem-root requires Spack metadata; source setup-env.sh first." >&2
+    exit 3
+  }
+  [[ -d "${SPACK_ENV}" && -f "${SPACK_ENV}/spack.yaml" &&
+     -f "${SPACK_ENV}/spack.lock" ]] || {
+    echo "ERROR: selected Spack environment is missing its manifest or lock: ${SPACK_ENV}" >&2
+    exit 3
+  }
+  command -v sha256sum >/dev/null 2>&1 || {
+    echo "ERROR: --reuse-mfem-root requires sha256sum for environment identity." >&2
+    exit 3
+  }
+  SPACK_MANIFEST_SHA256="$(sha256sum "${SPACK_ENV}/spack.yaml" | \
+    cut -d' ' -f1)"
+  SPACK_LOCK_SHA256="$(sha256sum "${SPACK_ENV}/spack.lock" | \
+    cut -d' ' -f1)"
+  [[ "${SPACK_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${SPACK_LOCK_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "ERROR: selected Spack manifest/lock hashes are malformed." >&2
+    exit 3
+  }
+  [[ -d "${SPACK_ENV}/.spack-env/view" ]] || {
+    echo "ERROR: selected Spack environment view is unavailable: ${SPACK_ENV}/.spack-env/view" >&2
+    exit 3
+  }
+  spack_view="$(realpath -e -- "${SPACK_ENV}/.spack-env/view")" || {
+    echo "ERROR: selected Spack environment view is missing or moved." >&2
+    exit 3
+  }
+
+  if [[ "${MODE}" == "gpu" ]]; then
+    build_name="build-gpu-sm${SPACK_CUDA_ARCH}"
+    install_name="install-gpu-sm${SPACK_CUDA_ARCH}"
+  elif ((CALIPER)); then
+    build_name="build-cpu-caliper"
+    install_name="install-cpu-caliper"
+  else
+    build_name="build-cpu"
+    install_name="install-cpu"
+  fi
+  build="${root}/${build_name}"
+  install="${root}/${install_name}"
+  cache="${build}/CMakeCache.txt"
+  config="${install}/lib/cmake/mfem/MFEMConfig.cmake"
+  archive="${install}/lib/libmfem.a"
+  [[ -f "${cache}" ]] || {
+    echo "ERROR: reused MFEM CMake cache is missing: ${cache}" >&2
+    exit 3
+  }
+  [[ -f "${config}" ]] || {
+    echo "ERROR: reused MFEM package config is missing: ${config}" >&2
+    exit 3
+  }
+  [[ -f "${archive}" ]] || {
+    echo "ERROR: reused MFEM archive is missing: ${archive}" >&2
+    exit 3
+  }
+
+  cache_home="$(cache_value "${cache}" CMAKE_HOME_DIRECTORY)"
+  cache_prefix="$(cache_value "${cache}" CMAKE_INSTALL_PREFIX)"
+  [[ -n "${cache_home}" && -d "${cache_home}" ]] || {
+    echo "ERROR: reused MFEM cache has a missing or moved home directory: ${cache_home:-<missing>}" >&2
+    exit 3
+  }
+  [[ -n "${cache_prefix}" && -d "${cache_prefix}" ]] || {
+    echo "ERROR: reused MFEM cache has a missing or moved install prefix: ${cache_prefix:-<missing>}" >&2
+    exit 3
+  }
+  canonical_home="$(realpath -e -- "${cache_home}")"
+  canonical_prefix="$(realpath -e -- "${cache_prefix}")"
+  [[ "${canonical_home}" == "${root}" ]] || {
+    echo "ERROR: reused MFEM cache home mismatch: expected=${root} actual=${canonical_home}" >&2
+    exit 3
+  }
+  [[ "${canonical_prefix}" == "${install}" ]] || {
+    echo "ERROR: reused MFEM install-prefix mismatch: expected=${install} actual=${canonical_prefix}" >&2
+    exit 3
+  }
+
+  mpi_enabled="$(cache_value "${cache}" MFEM_USE_MPI)"
+  cuda_enabled="$(cache_value "${cache}" MFEM_USE_CUDA)"
+  raja_enabled="$(cache_value "${cache}" MFEM_USE_RAJA)"
+  umpire_enabled="$(cache_value "${cache}" MFEM_USE_UMPIRE)"
+  is_cmake_true "${mpi_enabled}" || {
+    echo "ERROR: reused MFEM cache does not enable MPI: ${mpi_enabled:-<missing>}" >&2
+    exit 3
+  }
+  grep -Eqi '^set\(MFEM_USE_MPI (1|ON|TRUE|YES)\)$' "${config}" || {
+    echo "ERROR: reused MFEM package config does not report MPI enabled: ${config}" >&2
+    exit 3
+  }
+  is_cmake_false "${raja_enabled}" || {
+    echo "ERROR: reused MFEM cache must report RAJA disabled for this profile: ${raja_enabled:-<missing>}" >&2
+    exit 3
+  }
+  grep -Eqi '^set\(MFEM_USE_RAJA (0|OFF|FALSE|NO)\)$' "${config}" || {
+    echo "ERROR: reused MFEM package config does not report RAJA disabled: ${config}" >&2
+    exit 3
+  }
+
+  spack_identity openmpi mpi_prefix mpi_hash mpi_compiler
+  spack_identity hypre hypre_prefix hypre_hash hypre_compiler
+  hypre_mpi_hash="$(spack_dependency_hash hypre mpi)"
+  [[ "${hypre_mpi_hash}" == "${mpi_hash}" ]] || {
+    echo "ERROR: active Spack HYPRE/MPI concretization mismatch: hypre-mpi=${hypre_mpi_hash} mpi=${mpi_hash}" >&2
+    exit 3
+  }
+  [[ "${hypre_compiler}" == "${mpi_compiler}" ]] || {
+    echo "ERROR: active Spack HYPRE/MPI compiler mismatch: hypre=${hypre_compiler} mpi=${mpi_compiler}" >&2
+    exit 3
+  }
+  cache_hypre="$(canonical_existing_path "$(cache_value "${cache}" HYPRE_DIR)")" || {
+    echo "ERROR: reused MFEM HYPRE cache root is missing or moved." >&2
+    exit 3
+  }
+  [[ "${cache_hypre}" == "${hypre_prefix}" ]] || {
+    echo "ERROR: reused MFEM HYPRE root mismatch: expected=${hypre_prefix} actual=${cache_hypre}" >&2
+    exit 3
+  }
+
+  expected_mpicc="$(canonical_existing_path "${mpi_prefix}/bin/mpicc")" || {
+    echo "ERROR: active Spack MPI C wrapper is unavailable." >&2
+    exit 3
+  }
+  expected_mpicxx="$(canonical_existing_path "${mpi_prefix}/bin/mpicxx")" || {
+    echo "ERROR: active Spack MPI C++ wrapper is unavailable." >&2
+    exit 3
+  }
+  view_mpicc="$(canonical_existing_path "${spack_view}/bin/mpicc")" || {
+    echo "ERROR: selected Spack view has no usable MPI C wrapper." >&2
+    exit 3
+  }
+  view_mpicxx="$(canonical_existing_path "${spack_view}/bin/mpicxx")" || {
+    echo "ERROR: selected Spack view has no usable MPI C++ wrapper." >&2
+    exit 3
+  }
+  [[ "${view_mpicc}" == "${expected_mpicc}" &&
+     "${view_mpicxx}" == "${expected_mpicxx}" ]] || {
+    echo "ERROR: selected Spack view MPI wrappers do not match its concrete OpenMPI prefix." >&2
+    exit 3
+  }
+  view_hypre_header="$(canonical_existing_path "${spack_view}/include/HYPRE.h")" || {
+    echo "ERROR: selected Spack view has no usable HYPRE header." >&2
+    exit 3
+  }
+  view_hypre_library=""
+  for view_library_candidate in \
+      "${spack_view}/lib/libHYPRE.so" \
+      "${spack_view}/lib64/libHYPRE.so"; do
+    if [[ -e "${view_library_candidate}" ]]; then
+      view_hypre_library="$(canonical_existing_path "${view_library_candidate}")"
+      break
+    fi
+  done
+  [[ -n "${view_hypre_library}" ]] || {
+    echo "ERROR: selected Spack view has no usable HYPRE library." >&2
+    exit 3
+  }
+  case "${view_hypre_header}" in
+    "${hypre_prefix}"/*) ;;
+    *)
+      echo "ERROR: selected Spack view HYPRE header does not match its concrete HYPRE prefix." >&2
+      exit 3
+      ;;
+  esac
+  case "${view_hypre_library}" in
+    "${hypre_prefix}"/*) ;;
+    *)
+      echo "ERROR: selected Spack view HYPRE library does not match its concrete HYPRE prefix." >&2
+      exit 3
+      ;;
+  esac
+  cache_cxx="$(canonical_existing_path "$(cache_value "${cache}" CMAKE_CXX_COMPILER)")" || {
+    echo "ERROR: reused MFEM C++ compiler identity is missing or moved." >&2
+    exit 3
+  }
+  cache_mpi_cxx="$(canonical_existing_path "$(cache_value "${cache}" MPI_CXX_COMPILER)")" || {
+    echo "ERROR: reused MFEM MPI C++ compiler identity is missing or moved." >&2
+    exit 3
+  }
+  config_cxx="$(canonical_existing_path "$(config_value "${config}" MFEM_CXX_COMPILER)")" || {
+    echo "ERROR: reused MFEM package C++ compiler identity is missing or moved." >&2
+    exit 3
+  }
+  [[ "${cache_cxx}" == "${expected_mpicxx}" &&
+     "${cache_mpi_cxx}" == "${expected_mpicxx}" &&
+     "${config_cxx}" == "${expected_mpicxx}" ]] || {
+    echo "ERROR: reused MFEM C++/MPI wrapper mismatch with active Spack MPI." >&2
+    exit 3
+  }
+  c_command="$("${mpi_prefix}/bin/mpicc" --showme:command 2>/dev/null)" || {
+    echo "ERROR: active Spack MPI C compiler identity is unavailable." >&2
+    exit 3
+  }
+  cxx_command="$("${mpi_prefix}/bin/mpicxx" --showme:command 2>/dev/null)" || {
+    echo "ERROR: active Spack MPI C++ compiler identity is unavailable." >&2
+    exit 3
+  }
+  [[ "${mpi_compiler}" =~ ^([^@]+)@(.+)$ ]] || {
+    echo "ERROR: active Spack compiler identity is malformed: ${mpi_compiler}" >&2
+    exit 3
+  }
+  compiler_name="${BASH_REMATCH[1]}"
+  compiler_version="${BASH_REMATCH[2]}"
+  [[ "${compiler_name}" == "gcc" && -x "${c_command}" &&
+     -x "${cxx_command}" &&
+     "$("${c_command}" -dumpfullversion)" == "${compiler_version}" &&
+     "$("${cxx_command}" -dumpfullversion)" == "${compiler_version}" ]] || {
+    echo "ERROR: active Spack MPI C/C++ compiler commands do not match ${mpi_compiler}." >&2
+    exit 3
+  }
+  raja_state="off"
+  if [[ "${MODE}" == "gpu" ]]; then
+    is_cmake_true "${cuda_enabled}" || {
+      echo "ERROR: reused GPU MFEM cache does not enable CUDA: ${cuda_enabled:-<missing>}" >&2
+      exit 3
+    }
+    is_cmake_true "${umpire_enabled}" || {
+      echo "ERROR: reused GPU MFEM cache does not enable Umpire: ${umpire_enabled:-<missing>}" >&2
+      exit 3
+    }
+    configured_archs="$(cache_value "${cache}" CMAKE_CUDA_ARCHITECTURES)"
+    [[ "${configured_archs}" == "${MFEM_CUDA_ARCHS}" ]] || {
+      echo "ERROR: reused GPU MFEM architecture mismatch: expected=${MFEM_CUDA_ARCHS} actual=${configured_archs:-<missing>}" >&2
+      exit 3
+    }
+    grep -Eqi '^set\(MFEM_USE_CUDA (1|ON|TRUE|YES)\)$' "${config}" || {
+      echo "ERROR: reused GPU MFEM package config does not report CUDA enabled: ${config}" >&2
+      exit 3
+    }
+    grep -Eqi '^set\(MFEM_USE_UMPIRE (1|ON|TRUE|YES)\)$' "${config}" || {
+      echo "ERROR: reused GPU MFEM package config does not report Umpire enabled: ${config}" >&2
+      exit 3
+    }
+    spack_identity cuda cuda_prefix cuda_hash cuda_compiler
+    spack_identity umpire umpire_prefix umpire_hash umpire_compiler
+    cache_cuda="$(canonical_existing_path "$(cache_value "${cache}" CUDAToolkit_ROOT)")" || {
+      echo "ERROR: reused MFEM CUDA toolkit root is missing or moved." >&2
+      exit 3
+    }
+    cache_cuda_compiler="$(canonical_existing_path "$(cache_value "${cache}" CMAKE_CUDA_COMPILER)")" || {
+      echo "ERROR: reused MFEM CUDA compiler identity is missing or moved." >&2
+      exit 3
+    }
+    cache_umpire="$(canonical_existing_path "$(cache_value "${cache}" UMPIRE_DIR)")" || {
+      echo "ERROR: reused MFEM Umpire root is missing or moved." >&2
+      exit 3
+    }
+    [[ "${cache_cuda}" == "${cuda_prefix}" &&
+       "${cache_cuda_compiler}" == "$(canonical_existing_path "${cuda_prefix}/bin/nvcc")" ]] || {
+      echo "ERROR: reused MFEM CUDA toolkit/compiler mismatch with active Spack CUDA." >&2
+      exit 3
+    }
+    [[ "${cache_umpire}" == "${umpire_prefix}" ]] || {
+      echo "ERROR: reused MFEM Umpire root mismatch: expected=${umpire_prefix} actual=${cache_umpire}" >&2
+      exit 3
+    }
+    view_nvcc="$(canonical_existing_path "${spack_view}/bin/nvcc")" || {
+      echo "ERROR: selected GPU Spack view has no usable CUDA compiler." >&2
+      exit 3
+    }
+    view_umpire_config="$(canonical_existing_path \
+      "${spack_view}/lib/cmake/umpire/umpire-config.cmake")" || {
+      echo "ERROR: selected GPU Spack view has no usable Umpire package config." >&2
+      exit 3
+    }
+    [[ "${view_nvcc}" == "$(canonical_existing_path "${cuda_prefix}/bin/nvcc")" ]] || {
+      echo "ERROR: selected GPU Spack view CUDA compiler does not match its concrete CUDA prefix." >&2
+      exit 3
+    }
+    case "${view_umpire_config}" in
+      "${umpire_prefix}"/*) ;;
+      *)
+        echo "ERROR: selected GPU Spack view Umpire config does not match its concrete Umpire prefix." >&2
+        exit 3
+        ;;
+    esac
+    cuda_metadata_records="$(find "${build}/CMakeFiles" -mindepth 2 \
+      -maxdepth 2 -type f -name CMakeCUDACompiler.cmake -print)"
+    cuda_metadata_count="$(printf '%s\n' "${cuda_metadata_records}" | \
+      sed '/^$/d' | wc -l)"
+    [[ "${cuda_metadata_count}" == "1" ]] || {
+      echo "ERROR: reused MFEM CUDA host-compiler metadata is missing or ambiguous." >&2
+      exit 3
+    }
+    cuda_metadata="$(canonical_existing_path "${cuda_metadata_records}")" || {
+      echo "ERROR: reused MFEM CUDA compiler metadata is missing or moved." >&2
+      exit 3
+    }
+    metadata_cuda="$(canonical_existing_path \
+      "$(config_value "${cuda_metadata}" CMAKE_CUDA_COMPILER)")" || {
+      echo "ERROR: reused MFEM CUDA metadata has no usable CUDA compiler." >&2
+      exit 3
+    }
+    metadata_cuda_root="$(canonical_existing_path \
+      "$(config_value "${cuda_metadata}" CMAKE_CUDA_COMPILER_TOOLKIT_ROOT)")" || {
+      echo "ERROR: reused MFEM CUDA metadata has no usable toolkit root." >&2
+      exit 3
+    }
+    cuda_host_compiler="$(canonical_existing_path \
+      "$(config_value "${cuda_metadata}" CMAKE_CUDA_HOST_COMPILER)")" || {
+      echo "ERROR: reused MFEM CUDA metadata has no usable host compiler." >&2
+      exit 3
+    }
+    cuda_host_compiler_id="$(config_value \
+      "${cuda_metadata}" CMAKE_CUDA_HOST_COMPILER_ID)"
+    cuda_host_compiler_version="$(config_value \
+      "${cuda_metadata}" CMAKE_CUDA_HOST_COMPILER_VERSION)"
+    [[ "${metadata_cuda}" == "${cache_cuda_compiler}" &&
+       "${metadata_cuda_root}" == "${cuda_prefix}" &&
+       "${cuda_host_compiler}" == "${expected_mpicxx}" &&
+       "${cuda_host_compiler_id}" == "GNU" &&
+       "${cuda_host_compiler_version}" == "${compiler_version}" ]] || {
+      echo "ERROR: reused MFEM CUDA host/compiler metadata does not match the active Spack compiler/toolkit." >&2
+      exit 3
+    }
+    [[ "${umpire_compiler}" == "${mpi_compiler}" ]] || {
+      echo "ERROR: active Spack Umpire compiler mismatch: umpire=${umpire_compiler} mpi=${mpi_compiler}" >&2
+      exit 3
+    }
+    hypre_cuda_hash="$(spack_dependency_hash hypre cuda)"
+    hypre_umpire_hash="$(spack_dependency_hash hypre umpire)"
+    umpire_cuda_hash="$(spack_dependency_hash umpire cuda)"
+    [[ "${hypre_cuda_hash}" == "${cuda_hash}" &&
+       "${hypre_umpire_hash}" == "${umpire_hash}" &&
+       "${umpire_cuda_hash}" == "${cuda_hash}" ]] || {
+      echo "ERROR: active Spack HYPRE/Umpire/CUDA dependency identities disagree." >&2
+      exit 3
+    }
+    umpire_state="${umpire_hash}"
+    MFEM_REUSE_ABI="compiler=${mpi_compiler};mpi=${mpi_hash};hypre=${hypre_hash};raja=${raja_state};umpire=${umpire_state};cuda=${cuda_hash};arch=${configured_archs}"
+  else
+    is_cmake_false "${cuda_enabled}" || {
+      echo "ERROR: reused CPU MFEM cache does not report CUDA disabled: ${cuda_enabled:-<missing>}" >&2
+      exit 3
+    }
+    is_cmake_false "${umpire_enabled}" || {
+      echo "ERROR: reused CPU MFEM cache does not report Umpire disabled: ${umpire_enabled:-<missing>}" >&2
+      exit 3
+    }
+    grep -Eqi '^set\(MFEM_USE_CUDA (0|OFF|FALSE|NO)\)$' "${config}" || {
+      echo "ERROR: reused CPU MFEM package config does not report CUDA disabled: ${config}" >&2
+      exit 3
+    }
+    grep -Eqi '^set\(MFEM_USE_UMPIRE (0|OFF|FALSE|NO)\)$' "${config}" || {
+      echo "ERROR: reused CPU MFEM package config does not report Umpire disabled: ${config}" >&2
+      exit 3
+    }
+    umpire_state="off"
+    MFEM_REUSE_ABI="compiler=${mpi_compiler};mpi=${mpi_hash};hypre=${hypre_hash};raja=${raja_state};umpire=${umpire_state};cuda=off;arch=none"
+  fi
+
+  MFEM_REUSE_ROOT="${root}"
+  MFEM_REUSE_BUILD="${build}"
+  MFEM_REUSE_STATE="validated-read-only"
+  MFEM_INSTALL="${install}"
+}
 
 if [[ -z "${MFEM_JOBS}" ]]; then
   MFEM_JOBS="${JOBS}"
@@ -177,9 +820,25 @@ else
   APP_CUDA_ARCHS="none"
 fi
 
+if [[ -n "${MFEM_REUSE_REQUEST}" ]]; then
+  validate_reused_mfem "${MFEM_REUSE_REQUEST}"
+fi
+if [[ "${DG_IGR_RUN_REUSE_FIXTURES:-0}" == "1" ]]; then
+  [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]] || {
+    echo "ERROR: reuse compatibility fixtures require a validated reuse root." >&2
+    exit 3
+  }
+  run_reuse_compatibility_fixtures
+fi
+
 echo "[build-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH} mfem_cuda_archs=${MFEM_CUDA_ARCHS} app_cuda_archs=${APP_CUDA_ARCHS} app_jobs=${JOBS} mfem_jobs=${MFEM_JOBS}"
 echo "[build-plan] env=${SPACK_ENV} app_build=${APP_BUILD} app_install=${APP_INSTALL}"
 echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT}"
+echo "[build-plan] mfem_reuse_root=${MFEM_REUSE_ROOT:-none} mfem_reuse_build=${MFEM_REUSE_BUILD:-none} mfem_install=${MFEM_INSTALL} mfem_reuse_state=${MFEM_REUSE_STATE}"
+if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
+  echo "[build-plan] mfem_reuse_abi=${MFEM_REUSE_ABI}"
+  echo "[build-plan] spack_manifest_sha256=${SPACK_MANIFEST_SHA256} spack_lock_sha256=${SPACK_LOCK_SHA256}"
+fi
 
 if ((PRINT_PLAN)); then
   exit 0
@@ -224,8 +883,15 @@ if ((CLEAN)); then
 else
   mfem_args+=(--no-clean)
 fi
-DG_IGR_SPACK_ENV="${SPACK_ENV}" CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
-  "${SCRIPT_DIR}/build_mfem_tpl.sh" "${mfem_args[@]}"
+if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
+  echo "[mfem] reuse validated: root=${MFEM_REUSE_ROOT} build=${MFEM_REUSE_BUILD} install=${MFEM_INSTALL}"
+  export DG_IGR_TEST_REUSE_MFEM_ROOT="${MFEM_REUSE_ROOT}"
+  export DG_IGR_TEST_REUSE_SPACK_ENV="${SPACK_ENV}"
+  export DG_IGR_TEST_REUSE_MODE="${MODE}"
+else
+  DG_IGR_SPACK_ENV="${SPACK_ENV}" CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+    "${SCRIPT_DIR}/build_mfem_tpl.sh" "${mfem_args[@]}"
+fi
 
 CMAKE_BIN="$(spack -e "${SPACK_ENV}" location -i cmake)/bin/cmake"
 MPI_PREFIX="$(spack -e "${SPACK_ENV}" location -i openmpi)"

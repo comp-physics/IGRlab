@@ -77,7 +77,7 @@ struct ApplicationConfigHashes
 template <typename Path>
 bool CanonicalPathViewValid(const Path& path) noexcept
 {
-  const StableIdentity copied = StableIdentity::Copy(path.canonical);
+  const StableId<512> copied = StableId<512>::Copy(path.canonical);
   return path.present
       ? copied.valid() && !copied.empty()
       : path.canonical.empty();
@@ -126,6 +126,7 @@ bool ComputeApplicationConfigHashes(
       !scientific.UnsignedLittleEndian(
           ::dg::hdg::runtime::detail::DoubleBits(options.final_time)) ||
       !scientific.U8(static_cast<std::uint8_t>(backend)) ||
+      !scientific.U8(static_cast<std::uint8_t>(options.device_id + 1)) ||
       !scientific.UnsignedLittleEndian(deferred.required_mpi_rank_count) ||
       !scientific.U8(static_cast<std::uint8_t>(deferred.gpu_rule)) ||
       !scientific.UnsignedLittleEndian(
@@ -331,10 +332,8 @@ ApplicationRejection ValidateRoleControls(
   {
     return ApplicationRejection::invalid_path_identity;
   }
-  if ((options.validation_capture != ValidationCaptureModeV1::none &&
-       options.validation_capture != ValidationCaptureModeV1::persistent_v1) ||
-      (options.validation_capture == ValidationCaptureModeV1::persistent_v1) !=
-          options.evidence_directory.present)
+  if (options.validation_capture != ValidationCaptureModeV1::none ||
+      options.evidence_directory.present)
   {
     return ApplicationRejection::invalid_validation_capture;
   }
@@ -410,7 +409,8 @@ ApplicationRejection ValidateRoleControls(
           options.injection.mode != FailureInjectionModeV1::prescribed ||
           !FocusedInjectionPhase(options.injection.phase) ||
           options.injection.target_step != target || !rank_valid ||
-          options.retry_limit != 0 || options.seed != seed)
+          options.retry_limit != smooth_periodic_euler_v1_retry_limit ||
+          options.seed != seed)
       {
         return ApplicationRejection::invalid_run_role;
       }
@@ -525,6 +525,7 @@ ValidatedApplicationConfig::ValidatedApplicationConfig(
     const DeferredRuntimePredicatesV1 deferred) noexcept
     : scenario_(scenario),
       backend_(backend),
+      device_id_(options.device_id),
       tuple_(tuple),
       card_id_(StableIdentity::Copy(options.card_id)),
       case_id_(StableIdentity::Copy(options.case_id)),
@@ -669,6 +670,13 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::unknown_backend);
   }
+  const bool cpu_backend = backend == ApplicationBackend::cpu_serial ||
+      backend == ApplicationBackend::cpu_rank2;
+  if ((cpu_backend && options.device_id != -1) ||
+      (!cpu_backend && options.device_id != 0))
+  {
+    return reject(ApplicationRejection::invalid_device);
+  }
   if (!CompiledBackendAvailable(backend))
   {
     return reject(ApplicationRejection::unbuilt_backend);
@@ -751,6 +759,7 @@ bool DeriveSplitWriterRunConfigHashV1(
   writer.stabilization_id = split_reader.tuple().stabilization.view();
   writer.time_treatment_id = split_reader.tuple().time_treatment.view();
   writer.backend_id = split_reader.tuple().backend.view();
+  writer.device_id = split_reader.device_id();
   writer.precision_id = split_reader.tuple().precision.view();
   writer.mesh_family_id = split_reader.mesh_family_id().view();
   writer.source_id = split_reader.source_id().view();

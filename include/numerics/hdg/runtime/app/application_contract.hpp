@@ -217,7 +217,7 @@ class CanonicalPathIdentityV1 final
 public:
   constexpr CanonicalPathIdentityV1() noexcept = default;
   constexpr bool present() const noexcept { return present_; }
-  constexpr const StableIdentity& identity() const noexcept
+  constexpr const StableId<512>& identity() const noexcept
   {
     return identity_;
   }
@@ -225,11 +225,11 @@ public:
 private:
   constexpr CanonicalPathIdentityV1(const bool present,
                                     const std::string_view canonical) noexcept
-      : present_(present), identity_(StableIdentity::Copy(canonical))
+      : present_(present), identity_(StableId<512>::Copy(canonical))
   {}
 
   bool present_ = false;
-  StableIdentity identity_{};
+  StableId<512> identity_{};
 
   friend class ValidatedApplicationConfig;
 };
@@ -285,6 +285,7 @@ enum class ApplicationRejection : std::uint8_t
   unsupported_h1,
   invalid_interior_space,
   unknown_backend,
+  invalid_device,
   unbuilt_backend,
   invalid_scientific_identity,
   invalid_config_hash,
@@ -324,6 +325,7 @@ struct ApplicationOptionsView
   std::string_view stabilization_id = FixedScalarTauTag::id;
   std::string_view time_treatment_id = BackwardEulerRuntimeTag::id;
   std::string_view backend_id = CpuSerialBackendTag::id;
+  int device_id = -1;
   std::string_view precision_id = Fp64RuntimeTag::id;
   std::string_view mesh_family_id = smooth_periodic_euler_v1_mesh_family_id;
   std::string_view source_id = smooth_periodic_euler_v1_source_id;
@@ -350,10 +352,10 @@ struct ApplicationOptionsView
       ApplicationRunRoleV1::uninterrupted_reference;
   OutputDirectoryPathV1 output_directory =
       OutputDirectoryPathV1::Present("w8a/output");
-  EvidenceDirectoryPathV1 evidence_directory =
-      EvidenceDirectoryPathV1::Present("w8a/evidence");
-  ValidationCaptureModeV1 validation_capture =
-      ValidationCaptureModeV1::persistent_v1;
+  // Reserved checkpoint-ABI fields. W8A external evidence is owned by the
+  // development runner, so the application admits only the disabled values.
+  EvidenceDirectoryPathV1 evidence_directory{};
+  ValidationCaptureModeV1 validation_capture = ValidationCaptureModeV1::none;
   CheckpointArtifactPathV1 checkpoint_out =
       CheckpointArtifactPathV1::Present("w8a/checkpoint");
   OptionalCheckpointStepV1 checkpoint_step =
@@ -386,6 +388,7 @@ public:
 
   ApplicationScenarioV1 scenario() const noexcept { return scenario_; }
   ApplicationBackend backend() const noexcept { return backend_; }
+  int device_id() const noexcept { return device_id_; }
   const RuntimeTupleDescriptor& tuple() const noexcept { return tuple_; }
   const StableIdentity& card_id() const noexcept { return card_id_; }
   const StableIdentity& case_id() const noexcept { return case_id_; }
@@ -489,6 +492,7 @@ private:
 
   ApplicationScenarioV1 scenario_ = ApplicationScenarioV1::unknown;
   ApplicationBackend backend_ = ApplicationBackend::unknown;
+  int device_id_ = -1;
   RuntimeTupleDescriptor tuple_{};
   StableIdentity card_id_{};
   StableIdentity case_id_{};
@@ -597,10 +601,22 @@ struct IsFrozenApplicationBackend<CudaRank2OneGpuHostStagedBackendTag>
 
 struct ApplicationRunResult
 {
+  enum class FailureClass : std::uint8_t
+  {
+    none = 0,
+    configuration,
+    checkpoint_data,
+    filesystem,
+    backend,
+    scientific,
+    injected
+  };
+
   RunStatus status = RunStatus::invalid_request;
   FailureReason reason = FailureReason::invalid_resource_descriptor;
   StateCoordinates coordinates{};
   std::uint32_t retries = 0;
+  FailureClass failure_class = FailureClass::configuration;
 };
 
 // Opaque contexts are constructed only by the later single-owner executable.

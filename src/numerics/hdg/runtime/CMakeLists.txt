@@ -4,6 +4,8 @@ file(GLOB_RECURSE _dg_igr_hdg_runtime_common_sources CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/common/*.cpp")
 file(GLOB_RECURSE _dg_igr_hdg_runtime_app_sources CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/app/*.cpp")
+file(GLOB_RECURSE _dg_igr_hdg_runtime_app_cuda_sources CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/app/*.cu")
 file(GLOB_RECURSE _dg_igr_hdg_runtime_cpu_sources CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/cpu/*.cpp")
 file(GLOB_RECURSE _dg_igr_hdg_runtime_cuda_sources CONFIGURE_DEPENDS
@@ -24,7 +26,8 @@ list(REMOVE_ITEM _dg_igr_hdg_runtime_unclassified_cpp
 set(_dg_igr_hdg_runtime_unclassified_cuda
     ${_dg_igr_hdg_runtime_all_cuda})
 list(REMOVE_ITEM _dg_igr_hdg_runtime_unclassified_cuda
-     ${_dg_igr_hdg_runtime_cuda_sources})
+     ${_dg_igr_hdg_runtime_cuda_sources}
+     ${_dg_igr_hdg_runtime_app_cuda_sources})
 if(_dg_igr_hdg_runtime_unclassified_cpp OR
    _dg_igr_hdg_runtime_unclassified_cuda)
   message(FATAL_ERROR
@@ -61,18 +64,26 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     STANDARD_LIBRARY_ONLY
     SOURCES ${_dg_igr_hdg_runtime_common_sources})
 
-  set(_dg_igr_hdg_runtime_app_expected_sources
+  set(_dg_igr_hdg_runtime_app_contract_sources
       "${CMAKE_CURRENT_SOURCE_DIR}/app/application_contract.cpp"
-      "${CMAKE_CURRENT_SOURCE_DIR}/app/checkpoint_codec.cpp")
+      "${CMAKE_CURRENT_SOURCE_DIR}/app/checkpoint_codec.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/app/command_line.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/app/durable_io.cpp")
+  set(_dg_igr_hdg_runtime_app_executable_sources
+      "${CMAKE_CURRENT_SOURCE_DIR}/app/main.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/app/solver_cpu.cpp")
+  set(_dg_igr_hdg_runtime_app_expected_sources
+      ${_dg_igr_hdg_runtime_app_contract_sources}
+      ${_dg_igr_hdg_runtime_app_executable_sources})
   list(SORT _dg_igr_hdg_runtime_app_sources)
   list(SORT _dg_igr_hdg_runtime_app_expected_sources)
   if(NOT _dg_igr_hdg_runtime_app_sources STREQUAL
      _dg_igr_hdg_runtime_app_expected_sources)
     message(FATAL_ERROR
-            "The frozen W8A application contract requires exactly application_contract.cpp and checkpoint_codec.cpp.")
+            "The frozen W8A application slice source inventory drifted.")
   endif()
   add_library(dg_igr_hdg_runtime_app_contract STATIC
-              ${_dg_igr_hdg_runtime_app_sources})
+              ${_dg_igr_hdg_runtime_app_contract_sources})
   set_target_properties(dg_igr_hdg_runtime_app_contract PROPERTIES
                         CXX_STANDARD 17
                         CXX_STANDARD_REQUIRED ON
@@ -111,8 +122,47 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
             "HDG CUDA sources are reserved but not built by the requested CPU profile.")
   endif()
 
-  message(STATUS
-          "dg_igr_hdg_runtime: target name reserved for the accepted CLI slice; component libraries only.")
+  if(MFEM_USE_CUDA)
+    set(_dg_igr_hdg_runtime_expected_app_cuda_source
+        "${CMAKE_CURRENT_SOURCE_DIR}/app/solver_cuda.cu")
+    if(NOT _dg_igr_hdg_runtime_app_cuda_sources STREQUAL
+       _dg_igr_hdg_runtime_expected_app_cuda_source)
+      message(FATAL_ERROR
+              "The CUDA application slice requires exactly app/solver_cuda.cu.")
+    endif()
+    list(APPEND _dg_igr_hdg_runtime_app_executable_sources
+         ${_dg_igr_hdg_runtime_app_cuda_sources})
+  elseif(_dg_igr_hdg_runtime_app_cuda_sources)
+    message(STATUS
+            "HDG application CUDA source is reserved but not built by the CPU profile.")
+  endif()
+
+  add_executable(dg_igr_hdg_runtime
+                 ${_dg_igr_hdg_runtime_app_executable_sources})
+  target_include_directories(dg_igr_hdg_runtime PRIVATE
+                             "${PROJECT_SOURCE_DIR}/include")
+  target_link_libraries(dg_igr_hdg_runtime PRIVATE
+                        dg_igr_hdg_runtime_app_contract
+                        dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
+  target_compile_options(dg_igr_hdg_runtime PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_hdg_runtime PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
+  if(MFEM_USE_CUDA)
+    target_link_libraries(dg_igr_hdg_runtime PRIVATE
+                          dg_igr_hdg_runtime_cuda)
+    set_target_properties(dg_igr_hdg_runtime PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_EXTENSIONS OFF
+      CUDA_ARCHITECTURES 120
+      CUDA_SEPARABLE_COMPILATION ON
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  endif()
 endif()
 
 if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)

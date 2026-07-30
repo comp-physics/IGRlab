@@ -131,6 +131,7 @@ struct CudaConfig
   int expected_rank_count = 1;
   bool require_host_staged_rank2 = false;
   bool capture_oracle = false;
+  bool force_private_scientific_gate_failure = false;
   CudaInjection injection{};
 };
 

@@ -1,6 +1,7 @@
 #include "independent_oracle.hpp"
 #include "numerics/hdg/runtime/cpu/persistent_smooth_euler.hpp"
 
+#include <mfem.hpp>
 #include <mpi.h>
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -140,6 +142,40 @@ bool HashNonZero(const std::array<std::uint8_t, 32>& hash) noexcept
 {
   return std::any_of(hash.begin(), hash.end(),
                      [](const std::uint8_t byte) { return byte != 0; });
+}
+
+std::uint64_t IndependentRankOrderedStateIdentity(
+    const CpuStateSnapshot& snapshot, const bool perturb_rank_one,
+    const MPI_Comm communicator)
+{
+  int rank = 0;
+  int ranks = 0;
+  MPI_Comm_rank(communicator, &rank);
+  MPI_Comm_size(communicator, &ranks);
+  auto mix = [](std::uint64_t& hash, const void* data,
+                const std::size_t bytes)
+  {
+    const auto* source = static_cast<const unsigned char*>(data);
+    for (std::size_t index = 0; index < bytes; ++index)
+    {
+      hash ^= source[index];
+      hash *= 1099511628211ULL;
+    }
+  };
+  std::uint64_t local = 1469598103934665603ULL;
+  mix(local, &snapshot.interior.size, sizeof(snapshot.interior.size));
+  mix(local, snapshot.interior.data,
+      snapshot.interior.size * sizeof(double));
+  mix(local, &snapshot.trace.size, sizeof(snapshot.trace.size));
+  mix(local, snapshot.trace.data, snapshot.trace.size * sizeof(double));
+  if (perturb_rank_one && rank == 1) local ^= 0x9e3779b97f4a7c15ULL;
+  std::array<std::uint64_t, 2> ordered{};
+  MPI_Allgather(&local, 1, MPI_UINT64_T, ordered.data(), 1, MPI_UINT64_T,
+                communicator);
+  std::uint64_t global = 1469598103934665603ULL;
+  mix(global, ordered.data(), static_cast<std::size_t>(ranks) *
+                                  sizeof(std::uint64_t));
+  return global;
 }
 
 double RelativeScalarDifference(const double left,
@@ -1162,6 +1198,37 @@ void CheckPhaseRankInjection(Checks& checks, const int ranks)
 }
 
 template <typename Selection>
+void CheckNaturalFailurePrecedesLaterInjection(Checks& checks,
+                                               const int ranks)
+{
+  PersistentSmoothEulerCpuAdapter<Selection> adapter;
+  checks.Require(adapter.Initialize(), "first-fired failure setup");
+  cpu_detail::ArmCpuCollectiveTestFault(
+      cpu_detail::CpuCollectiveTestFault::assembly_completion,
+      ranks - 1, adapter);
+  CpuFailureInjection later_injection;
+  later_injection.phase = CpuFailurePhase::recovery;
+  later_injection.target_step = 1;
+  later_injection.source_rank = ranks - 1;
+  CpuPreparedStep prepared;
+  checks.Require(adapter.PrepareAdvance(prepared, later_injection) &&
+                     !prepared.numerically_ready,
+                 "natural failure precedes configured later phase");
+  const AttemptOutcome outcome = adapter.FinalizePrepared(prepared);
+  const CpuAttemptEvidence& evidence = adapter.evidence().last_attempt;
+  checks.Require(!outcome.committed && outcome.retry_available &&
+                     evidence.status == CpuAttemptStatus::runtime_failure &&
+                     evidence.failure_phase == CpuFailurePhase::assembly &&
+                     evidence.failure_source_rank == -1,
+                 "first actual failure owns classification and provenance");
+  CpuPreparedStep retry;
+  checks.Require(adapter.PrepareRetry(retry) &&
+                     adapter.FinalizePrepared(retry).committed,
+                 "natural failure retains one retry");
+  cpu_detail::ResetCpuCollectiveTestFault();
+}
+
+template <typename Selection>
 void CheckOuterStageAbort(Checks& checks, const int ranks)
 {
   const std::array<CpuFailurePhase, 3> phases{{
@@ -1201,7 +1268,176 @@ void CheckOuterStageAbort(Checks& checks, const int ranks)
 }
 
 template <typename Selection>
-void CheckTwoPhaseAndAffineAuthorities(Checks& checks)
+void CheckLiveOutputAuthority(Checks& checks)
+{
+  PersistentSmoothEulerCpuAdapter<Selection> output_owner;
+  checks.Require(output_owner.Initialize(), "live-output rejection setup");
+  CpuPreparedStep live_output;
+  checks.Require(output_owner.PrepareAdvance(live_output) &&
+                     !output_owner.PrepareAdvance(live_output) &&
+                     live_output.valid &&
+                     output_owner.AbortPrepared(
+                         live_output, CpuFailurePhase::output_staging, 0)
+                         .retry_available,
+                 "PrepareAdvance rejects and preserves a live output handle");
+}
+
+template <typename Selection>
+void CheckForeignLiveOutputAuthorities(Checks& checks, const int ranks)
+{
+  PersistentSmoothEulerCpuAdapter<Selection> advance_owner;
+  PersistentSmoothEulerCpuAdapter<Selection> foreign_advance_owner;
+  CpuPreparedStep foreign_advance;
+  CpuPreparedStep advance;
+  checks.Require(advance_owner.Initialize() &&
+                     foreign_advance_owner.Initialize() &&
+                     foreign_advance_owner.PrepareAdvance(foreign_advance) &&
+                     !advance_owner.PrepareAdvance(foreign_advance) &&
+                     foreign_advance.valid &&
+                     advance_owner.PrepareAdvance(advance),
+                 "PrepareAdvance rejects a foreign live output before begin");
+  checks.Require(
+      foreign_advance_owner.AbortPrepared(
+          foreign_advance, CpuFailurePhase::output_staging, ranks - 1)
+              .retry_available &&
+          advance_owner.AbortPrepared(
+              advance, CpuFailurePhase::output_staging, ranks - 1)
+              .retry_available,
+      "PrepareAdvance rejection preserves both original authorities");
+
+  PersistentSmoothEulerCpuAdapter<Selection> retry_owner;
+  PersistentSmoothEulerCpuAdapter<Selection> foreign_retry_owner;
+  CpuPreparedStep failed;
+  CpuPreparedStep foreign_retry;
+  checks.Require(retry_owner.Initialize() &&
+                     retry_owner.PrepareAdvance(failed) &&
+                     retry_owner.AbortPrepared(
+                         failed, CpuFailurePhase::output_staging, ranks - 1)
+                         .retry_available &&
+                     foreign_retry_owner.Initialize() &&
+                     foreign_retry_owner.PrepareAdvance(foreign_retry) &&
+                     !retry_owner.PrepareRetry(foreign_retry) &&
+                     foreign_retry.valid,
+                 "PrepareRetry rejects a foreign live output before retry");
+  CpuPreparedStep retry;
+  checks.Require(
+      retry_owner.PrepareRetry(retry) &&
+          retry_owner.FinalizePrepared(retry).committed &&
+          foreign_retry_owner.AbortPrepared(
+              foreign_retry, CpuFailurePhase::output_staging, ranks - 1)
+              .retry_available,
+      "PrepareRetry rejection preserves both original authorities");
+}
+
+template <typename Selection>
+void CheckFinalizePreparedCommitRejection(Checks& checks, const int ranks)
+{
+  PersistentSmoothEulerCpuAdapter<Selection> adapter;
+  checks.Require(adapter.Initialize(), "FinalizePrepared rejection setup");
+  cpu_detail::ArmCpuCollectiveTestFault(
+      cpu_detail::CpuCollectiveTestFault::commit_prepared_rejection,
+      ranks - 1, adapter);
+  CpuPreparedStep staging;
+  checks.Require(adapter.PrepareAdvance(staging) && staging.numerically_ready,
+                 "FinalizePrepared rejection freezes candidate");
+  const AttemptOutcome rejected = adapter.FinalizePrepared(staging);
+  checks.Require(!rejected.committed && rejected.retry_available &&
+                     rejected.reason == FailureReason::backend_failure &&
+                     adapter.last_transition_outcome().reason ==
+                         FailureReason::backend_failure &&
+                     adapter.evidence().last_attempt.failure_phase ==
+                         CpuFailurePhase::commit,
+                 "FinalizePrepared returns recorded CommitPrepared outcome");
+  CpuPreparedStep retry;
+  checks.Require(adapter.PrepareRetry(retry) &&
+                     adapter.FinalizePrepared(retry).committed,
+                 "CommitPrepared rejection retains one retry");
+  cpu_detail::ResetCpuCollectiveTestFault();
+}
+
+template <typename Selection>
+void CheckLiveMoveDestination(Checks& checks)
+{
+  PersistentSmoothEulerCpuAdapter<Selection> move_left_owner;
+  PersistentSmoothEulerCpuAdapter<Selection> move_right_owner;
+  CpuPreparedStep move_left;
+  CpuPreparedStep move_right;
+  checks.Require(move_left_owner.Initialize() && move_right_owner.Initialize() &&
+                     move_left_owner.PrepareAdvance(move_left) &&
+                     move_right_owner.PrepareAdvance(move_right),
+                 "live move-destination setup");
+  move_left = std::move(move_right);
+  checks.Require(move_left.valid && move_right.valid &&
+                     move_left_owner.AbortPrepared(
+                         move_left, CpuFailurePhase::output_staging, 0)
+                         .retry_available &&
+                     move_right_owner.AbortPrepared(
+                         move_right, CpuFailurePhase::output_staging, 0)
+                         .retry_available,
+                 "move assignment rejects a live destination without consumption");
+}
+
+template <typename Selection>
+void CheckLiveCommitDestinations(Checks& checks)
+{
+  PersistentSmoothEulerCpuAdapter<Selection> source_owner;
+  CpuPreparedStep source_staging;
+  checks.Require(source_owner.Initialize() &&
+                     source_owner.PrepareAdvance(source_staging),
+                 "live commit source setup");
+  {
+    PersistentSmoothEulerCpuAdapter<Selection> destination_owner;
+    CpuPreparedStep destination_staging;
+    CpuPreparedCommit live_prepared_destination;
+    checks.Require(destination_owner.Initialize() &&
+                       destination_owner.PrepareAdvance(destination_staging) &&
+                       destination_owner.PrepareCommit(
+                           destination_staging, live_prepared_destination) &&
+                       !source_owner.PrepareCommit(
+                           source_staging, live_prepared_destination) &&
+                       live_prepared_destination.valid,
+                   "PrepareCommit rejects a live destination authority");
+    checks.Require(destination_owner.AbortPrepared(
+                       live_prepared_destination,
+                       CpuFailurePhase::output_staging, 0).retry_available,
+                   "rejected prepared destination remains consumable by owner");
+  }
+  CpuPreparedCommit source_prepared;
+  checks.Require(source_owner.PrepareCommit(source_staging, source_prepared),
+                 "rejected PrepareCommit preserves source staging");
+  {
+    PersistentSmoothEulerCpuAdapter<Selection> provisional_owner;
+    CpuPreparedStep provisional_staging;
+    CpuPreparedCommit provisional_prepared;
+    CpuProvisionalCommit live_provisional_destination;
+    checks.Require(provisional_owner.Initialize() &&
+                       provisional_owner.PrepareAdvance(provisional_staging) &&
+                       provisional_owner.PrepareCommit(
+                           provisional_staging, provisional_prepared) &&
+                       provisional_owner.CommitPrepared(
+                           provisional_prepared,
+                           live_provisional_destination) &&
+                       !source_owner.CommitPrepared(
+                           source_prepared, live_provisional_destination) &&
+                       source_prepared.valid &&
+                       live_provisional_destination.valid,
+                   "CommitPrepared rejects a live provisional destination");
+    checks.Require(provisional_owner.RevertCommit(
+                       live_provisional_destination,
+                       CpuFailurePhase::commit, 0).retry_available,
+                   "rejected provisional destination remains owner-consumable");
+  }
+  CpuProvisionalCommit source_provisional;
+  checks.Require(source_owner.CommitPrepared(source_prepared,
+                                             source_provisional) &&
+                     source_owner.RevertCommit(
+                         source_provisional, CpuFailurePhase::commit, 0)
+                         .retry_available,
+                 "rejected CommitPrepared preserves prepared source");
+}
+
+template <typename Selection>
+void CheckTwoPhaseAndAffineAuthorities(Checks& checks, const int ranks)
 {
   PersistentSmoothEulerCpuAdapter<Selection> adapter;
   checks.Require(adapter.Initialize(), "two-phase adapter setup");
@@ -1298,9 +1534,16 @@ void CheckTwoPhaseAndAffineAuthorities(Checks& checks)
   checks.Require(first.PrepareAdvance(first_staging) &&
                      second.PrepareAdvance(second_staging),
                  "cross-owner candidates frozen");
+  const CheckpointDescriptor moved_checkpoint =
+      first_staging.future_checkpoint;
+  const StateHash moved_state_hash = first_staging.state_hash;
   CpuPreparedStep moved_staging{std::move(first_staging)};
   CpuPreparedCommit rejected;
-  checks.Require(!first.PrepareCommit(first_staging, rejected) &&
+  checks.Require(!first_staging.valid && moved_staging.valid &&
+                     moved_staging.future_checkpoint.coordinate_fingerprint ==
+                         moved_checkpoint.coordinate_fingerprint &&
+                     moved_staging.state_hash == moved_state_hash &&
+                     !first.PrepareCommit(first_staging, rejected) &&
                      !second.PrepareCommit(moved_staging, rejected),
                  "moved-from and cross-owner staging authorities fail closed");
   CpuPreparedCommit first_prepared;
@@ -1318,6 +1561,11 @@ void CheckTwoPhaseAndAffineAuthorities(Checks& checks)
       second_staging, CpuFailurePhase::checkpoint_staging, 0);
   checks.Require(second_abort.retry_available,
                  "independent frozen owner remains abortable");
+  CheckLiveOutputAuthority<Selection>(checks);
+  CheckForeignLiveOutputAuthorities<Selection>(checks, ranks);
+  CheckFinalizePreparedCommitRejection<Selection>(checks, ranks);
+  CheckLiveMoveDestination<Selection>(checks);
+  CheckLiveCommitDestinations<Selection>(checks);
 }
 
 template <typename Selection>
@@ -1543,6 +1791,228 @@ bool AcceptedStepPasses(const CpuAcceptedStepEvidence& step,
       step.true_residual_gate;
 }
 
+struct CommittedScientificEvaluation
+{
+  double state_l2_error = std::numeric_limits<double>::infinity();
+  double maximum_conservation_error =
+      std::numeric_limits<double>::infinity();
+  double minimum_density = -std::numeric_limits<double>::infinity();
+  double minimum_pressure = -std::numeric_limits<double>::infinity();
+  bool discrete_oracle_match = false;
+  bool coordinate_oracle_match = false;
+  bool independent_true_residual = false;
+  bool passed = false;
+};
+
+void ManufacturedTestState(const double x, const double y,
+                           std::array<double, 4>& state) noexcept
+{
+  constexpr double pi_value = 3.141592653589793238462643383279502884;
+  const double sx = std::sin(2.0 * pi_value * x);
+  const double sy = std::sin(2.0 * pi_value * y);
+  const double cx = std::cos(2.0 * pi_value * x);
+  const double cy = std::cos(2.0 * pi_value * y);
+  const double rho = 1.0 + 0.1 * sx * sy;
+  const double u = 0.35 + 0.05 * cx * sy;
+  const double v = -0.20 + 0.05 * sx * cy;
+  const double pressure = 1.0 + 0.1 * cx * cy;
+  state = {{rho, rho * u, rho * v,
+            pressure / 0.4 + 0.5 * rho * (u * u + v * v)}};
+}
+
+CommittedScientificEvaluation EvaluateCommittedScientificState(
+    const CpuStateSnapshot& snapshot,
+    const int elements_per_direction,
+    const dg_igr_hdg_cpu_test::IndependentOracleResult& oracle,
+    const MPI_Comm communicator)
+{
+  CommittedScientificEvaluation evaluation;
+  int rank = 0;
+  int ranks = 0;
+  MPI_Comm_rank(communicator, &rank);
+  MPI_Comm_size(communicator, &ranks);
+  bool local_oracle = CloseVectors(snapshot.interior, oracle.interior,
+                                   1.0e-8, 2.0e-8) &&
+      CloseVectors(snapshot.trace, oracle.true_trace, 1.0e-8, 2.0e-8);
+  int oracle_match = local_oracle ? 1 : 0;
+  MPI_Allreduce(MPI_IN_PLACE, &oracle_match, 1, MPI_INT, MPI_MIN,
+                communicator);
+  evaluation.discrete_oracle_match = oracle_match == 1;
+  evaluation.coordinate_oracle_match =
+      oracle.accepted_step == snapshot.coordinates.step &&
+      NearTime(oracle.accepted_time, snapshot.coordinates.time);
+  evaluation.independent_true_residual = oracle.passed &&
+      std::isfinite(oracle.maximum_true_residual) &&
+      oracle.maximum_true_residual <= independent_true_residual_limit;
+
+  const bool exported = snapshot.interior.size <= static_cast<std::size_t>(
+      std::numeric_limits<int>::max()) &&
+      (snapshot.interior.size == 0 || snapshot.interior.data != nullptr);
+  int export_ok = exported ? 1 : 0;
+  MPI_Allreduce(MPI_IN_PLACE, &export_ok, 1, MPI_INT, MPI_MIN, communicator);
+  if (export_ok != 1) return evaluation;
+  const int local_count = static_cast<int>(snapshot.interior.size);
+  std::array<int, 2> counts{};
+  MPI_Gather(&local_count, 1, MPI_INT, counts.data(), 1, MPI_INT, 0,
+             communicator);
+  std::array<int, 2> displacements{};
+  int total_bytes = 0;
+  if (rank == 0)
+  {
+    for (int source = 0; source < ranks; ++source)
+    {
+      displacements[static_cast<std::size_t>(source)] = total_bytes;
+      total_bytes += counts[static_cast<std::size_t>(source)];
+    }
+  }
+  std::vector<double> global(
+      rank == 0 ? static_cast<std::size_t>(total_bytes) : 0);
+  MPI_Gatherv(snapshot.interior.data, local_count, MPI_DOUBLE, global.data(),
+              counts.data(), displacements.data(), MPI_DOUBLE, 0,
+              communicator);
+
+  if (rank == 0)
+  {
+    try
+    {
+      mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+          elements_per_direction, elements_per_direction,
+          mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+      std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+      translations[0][0] = 1.0;
+      translations[1][1] = 1.0;
+      mfem::Mesh mesh = mfem::Mesh::MakePeriodic(
+          original, original.CreatePeriodicVertexMapping(translations));
+      mfem::L2_FECollection collection(
+          cpu_functional_polynomial_order, 2,
+          mfem::BasisType::GaussLegendre, mfem::FiniteElement::VALUE);
+      mfem::FiniteElementSpace space(
+          &mesh, &collection, 4, mfem::Ordering::byNODES);
+      mfem::GridFunction field(&space);
+      field = 0.0;
+      const int global_elements =
+          elements_per_direction * elements_per_direction;
+      const int scalar_dofs =
+          (cpu_functional_polynomial_order + 1) *
+          (cpu_functional_polynomial_order + 1);
+      for (int source = 0; source < ranks; ++source)
+      {
+        const int expected_elements =
+            (global_elements * (source + 1) + ranks - 1) / ranks -
+            (global_elements * source + ranks - 1) / ranks;
+        if (counts[static_cast<std::size_t>(source)] !=
+            expected_elements * scalar_dofs * 4)
+          throw std::runtime_error("scientific state census is invalid");
+      }
+      std::array<int, 2> local_elements{};
+      for (int element = 0; element < global_elements; ++element)
+      {
+        const int owner = element * ranks / global_elements;
+        const int local_element =
+            local_elements[static_cast<std::size_t>(owner)]++;
+        const int local_scalar_dofs =
+            counts[static_cast<std::size_t>(owner)] / 4;
+        mfem::Array<int> vector_dofs;
+        space.GetElementVDofs(element, vector_dofs);
+        if (vector_dofs.Size() != scalar_dofs * 4)
+          throw std::runtime_error(
+              "scientific element map extent is invalid");
+        for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+          for (int component = 0; component < 4; ++component)
+          {
+            const int source =
+                displacements[static_cast<std::size_t>(owner)] +
+                component * local_scalar_dofs +
+                local_element * scalar_dofs + scalar;
+            const int encoded = vector_dofs[
+                scalar + component * scalar_dofs];
+            const int destination = encoded >= 0 ? encoded : -1 - encoded;
+            const double sign = encoded >= 0 ? 1.0 : -1.0;
+            if (source < 0 ||
+                source >= displacements[static_cast<std::size_t>(owner)] +
+                    counts[static_cast<std::size_t>(owner)] ||
+                destination < 0 || destination >= field.Size())
+              throw std::runtime_error("scientific state map is out of range");
+            field[destination] = sign *
+                global[static_cast<std::size_t>(source)];
+          }
+      }
+
+      long double error_squared = 0.0L;
+      std::array<long double, 4> numerical_integral{};
+      std::array<long double, 4> exact_integral{};
+      double minimum_density = std::numeric_limits<double>::infinity();
+      double minimum_pressure = std::numeric_limits<double>::infinity();
+      for (int element = 0; element < mesh.GetNE(); ++element)
+      {
+        const mfem::FiniteElement* finite_element = space.GetFE(element);
+        mfem::ElementTransformation* transformation =
+            mesh.GetElementTransformation(element);
+        if (finite_element == nullptr || transformation == nullptr)
+          throw std::runtime_error("scientific FE topology is unavailable");
+        const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+            finite_element->GetGeomType(), 26);
+        for (int point = 0; point < rule.GetNPoints(); ++point)
+        {
+          const mfem::IntegrationPoint& integration = rule.IntPoint(point);
+          transformation->SetIntPoint(&integration);
+          mfem::Vector physical(2);
+          transformation->Transform(integration, physical);
+          mfem::Vector numerical(4);
+          field.GetVectorValue(element, integration, numerical);
+          std::array<double, 4> exact{};
+          ManufacturedTestState(physical[0], physical[1], exact);
+          const long double weight = static_cast<long double>(
+              integration.weight * transformation->Weight());
+          for (int component = 0; component < 4; ++component)
+          {
+            const long double difference =
+                static_cast<long double>(numerical[component] -
+                                         exact[component]);
+            error_squared += weight * difference * difference;
+            numerical_integral[static_cast<std::size_t>(component)] +=
+                weight * numerical[component];
+            exact_integral[static_cast<std::size_t>(component)] +=
+                weight * exact[static_cast<std::size_t>(component)];
+          }
+          const double rho = numerical[0];
+          const double pressure = 0.4 *
+              (numerical[3] - 0.5 *
+                  (numerical[1] * numerical[1] +
+                   numerical[2] * numerical[2]) / rho);
+          minimum_density = std::min(minimum_density, rho);
+          minimum_pressure = std::min(minimum_pressure, pressure);
+        }
+      }
+      evaluation.state_l2_error = std::sqrt(
+          static_cast<double>(error_squared));
+      evaluation.maximum_conservation_error = 0.0;
+      for (std::size_t component = 0; component < 4; ++component)
+        evaluation.maximum_conservation_error = std::max(
+            evaluation.maximum_conservation_error,
+            std::abs(static_cast<double>(numerical_integral[component] -
+                                         exact_integral[component])));
+      evaluation.minimum_density = minimum_density;
+      evaluation.minimum_pressure = minimum_pressure;
+    }
+    catch (...) {}
+  }
+  MPI_Bcast(&evaluation.state_l2_error, 1, MPI_DOUBLE, 0, communicator);
+  MPI_Bcast(&evaluation.maximum_conservation_error, 1, MPI_DOUBLE, 0,
+            communicator);
+  MPI_Bcast(&evaluation.minimum_density, 1, MPI_DOUBLE, 0, communicator);
+  MPI_Bcast(&evaluation.minimum_pressure, 1, MPI_DOUBLE, 0, communicator);
+  evaluation.passed = evaluation.discrete_oracle_match &&
+      evaluation.coordinate_oracle_match &&
+      evaluation.independent_true_residual &&
+      std::isfinite(evaluation.state_l2_error) &&
+      evaluation.state_l2_error > 0.0 &&
+      evaluation.maximum_conservation_error <= 5.0e-11 &&
+      evaluation.minimum_density >= 1.0e-8 &&
+      evaluation.minimum_pressure >= 1.0e-8;
+  return evaluation;
+}
+
 template <typename Selection>
 int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
                        const int elements_per_direction)
@@ -1555,7 +2025,9 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
   oracle_config.elements_per_direction = elements_per_direction;
   oracle_config.assembly_quadrature_order =
       cpu_functional_assembly_quadrature_order;
-  dg_igr_hdg_cpu_test::IndependentOracleResult oracle;
+  std::array<dg_igr_hdg_cpu_test::IndependentOracleResult,
+             cpu_functional_accepted_steps + 1> step_oracles{};
+  dg_igr_hdg_cpu_test::IndependentOracleResult& oracle = step_oracles[1];
   checks.Require(dg_igr_hdg_cpu_test::RunIndependentFirstStep(
                      communicator, oracle_config, oracle) && oracle.passed,
                  "functional first-step independent oracle");
@@ -1618,6 +2090,10 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
   checks.Require(uninterrupted.FinalizePrepared(first).committed,
                  "functional uninterrupted step 1");
   reference[1] = StoreState(uninterrupted.Snapshot());
+  const CommittedScientificEvaluation first_scientific =
+      EvaluateCommittedScientificState(
+          uninterrupted.Snapshot(), elements_per_direction, oracle,
+          communicator);
   const CpuAttemptEvidence& functional_first =
       uninterrupted.evidence().accepted.attempt;
   bool capture_policy_exact = functional_first.linearization_chain_count > 0;
@@ -1638,20 +2114,34 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
                    chain.accepted_candidate_interior_size == 0 &&
                    chain.accepted_candidate_true_trace_size == 0);
   }
-  checks.Require(AcceptedStepPasses(
+  checks.Require(first_scientific.passed && AcceptedStepPasses(
                      uninterrupted.evidence().accepted_steps[0], 1) &&
                      capture_policy_exact,
-                 "functional step-1 residual/admissibility/accounting gates");
+                 "functional step-1 solver-linked scientific/accounting gates");
 
   CpuCheckpoint uninterrupted_checkpoint;
   for (std::uint64_t step = 2; step <= cpu_functional_accepted_steps; ++step)
   {
+    dg_igr_hdg_cpu_test::IndependentOracleResult& step_oracle =
+        step_oracles[static_cast<std::size_t>(step)];
+    const StoredCpuState& previous =
+        reference[static_cast<std::size_t>(step - 1)];
+    checks.Require(dg_igr_hdg_cpu_test::RunIndependentStep(
+                       communicator, oracle_config, step,
+                       previous.interior, previous.trace, step_oracle) &&
+                       step_oracle.passed,
+                   "functional current-step independent oracle");
     checks.Require(uninterrupted.Advance().committed,
                    "functional uninterrupted accepted step");
     reference[static_cast<std::size_t>(step)] =
         StoreState(uninterrupted.Snapshot());
+    const CommittedScientificEvaluation scientific =
+        EvaluateCommittedScientificState(
+            uninterrupted.Snapshot(), elements_per_direction, step_oracle,
+            communicator);
     const CpuRunEvidence& evidence = uninterrupted.evidence();
-    checks.Require(evidence.accepted_step_count == step &&
+    checks.Require(scientific.passed &&
+                       evidence.accepted_step_count == step &&
                        AcceptedStepPasses(
                            evidence.accepted_steps[
                                static_cast<std::size_t>(step - 1)],
@@ -1659,6 +2149,23 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
                        StorageUnchanged(uninterrupted_storage,
                                         evidence.storage),
                    "functional uninterrupted history and persistent reuse");
+    if (step == 2)
+    {
+      StoredCpuState perturbed = reference[2];
+      if (rank == 0 && !perturbed.interior.empty())
+        perturbed.interior[0] += 1.0e-4;
+      CpuStateSnapshot perturbed_snapshot = uninterrupted.Snapshot();
+      perturbed_snapshot.interior = {
+          perturbed.interior.data(), perturbed.interior.size(),
+          perturbed.interior.capacity()};
+      const CommittedScientificEvaluation rejected =
+          EvaluateCommittedScientificState(
+              perturbed_snapshot, elements_per_direction, step_oracle,
+              communicator);
+      checks.Require(!rejected.passed &&
+                         !rejected.discrete_oracle_match,
+                     "later committed-state perturbation fails all-step oracle gate");
+    }
     if (step == cpu_functional_checkpoint_step)
     {
       checks.Require(uninterrupted.CaptureCheckpoint(
@@ -1702,6 +2209,12 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
     {
       checks.Require(writer.Advance().committed,
                      "functional split-writer accepted step");
+      const CommittedScientificEvaluation scientific =
+          EvaluateCommittedScientificState(
+              writer.Snapshot(), elements_per_direction,
+              step_oracles[static_cast<std::size_t>(step)], communicator);
+      checks.Require(scientific.passed,
+                     "functional split-writer all-step scientific gate");
     }
     const CpuStateSnapshot writer_state = writer.Snapshot();
     const bool checkpoint_captured =
@@ -1767,10 +2280,15 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
                      "functional split-reader accepted step");
     }
     const CpuStateSnapshot actual = reader.Snapshot();
+    const CommittedScientificEvaluation scientific =
+        EvaluateCommittedScientificState(
+            reader.Snapshot(), elements_per_direction,
+            step_oracles[static_cast<std::size_t>(step)], communicator);
     const StoredCpuState& expected = reference[static_cast<std::size_t>(step)];
     const CpuRunEvidence& evidence = reader.evidence();
     const std::size_t local_history = static_cast<std::size_t>(step - 11);
-    checks.Require(CloseVectors(actual.interior, expected.interior,
+    checks.Require(scientific.passed &&
+                       CloseVectors(actual.interior, expected.interior,
                                 4096.0 *
                                     std::numeric_limits<double>::epsilon(),
                                 4096.0 *
@@ -2085,6 +2603,20 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                      adapter.coordinates().cursor == 4,
                  "three commits and four attempts coordinates");
 
+  if (ranks == 2)
+  {
+    const CpuStateSnapshot identity_state = adapter.Snapshot();
+    const std::uint64_t global_identity =
+        IndependentRankOrderedStateIdentity(identity_state, false,
+                                            communicator);
+    const std::uint64_t rank_one_perturbed_identity =
+        IndependentRankOrderedStateIdentity(identity_state, true,
+                                            communicator);
+    checks.Require(global_identity != 0 &&
+                       rank_one_perturbed_identity != global_identity,
+                   "rank1-only perturbation invalidates global state identity");
+  }
+
   const CpuRunEvidence& terminal = adapter.evidence();
   checks.Require(terminal.attempts == 4 && terminal.failed_attempts == 1 &&
                      terminal.retries == 1 && terminal.commits == 3 &&
@@ -2270,8 +2802,9 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
       adapter, checkpoint, checks, communicator, rank, ranks);
   CheckProductNegatives<Selection>(checks);
   CheckPhaseRankInjection<Selection>(checks, ranks);
+  CheckNaturalFailurePrecedesLaterInjection<Selection>(checks, ranks);
   CheckOuterStageAbort<Selection>(checks, ranks);
-  CheckTwoPhaseAndAffineAuthorities<Selection>(checks);
+  CheckTwoPhaseAndAffineAuthorities<Selection>(checks, ranks);
 
   int global_failures = 0;
   MPI_Allreduce(&checks.failures, &global_failures, 1, MPI_INT, MPI_SUM,
@@ -2282,6 +2815,72 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
               << ranks << '\n';
   }
   return global_failures == 0 ? 0 : 1;
+}
+
+int RunSolverLinkedConvergence(const MPI_Comm communicator, const int rank)
+{
+  Checks checks{rank, 0};
+  const std::array<int, 3> meshes{{3, 6, 12}};
+  std::array<double, 3> errors{};
+  for (std::size_t index = 0; index < meshes.size(); ++index)
+  {
+    dg_igr_hdg_cpu_test::IndependentOracleConfig oracle_config;
+    oracle_config.polynomial_order = cpu_functional_polynomial_order;
+    oracle_config.elements_per_direction = meshes[index];
+    oracle_config.assembly_quadrature_order =
+        cpu_functional_assembly_quadrature_order;
+    PersistentSmoothEulerCpuAdapter<SerialSelection> adapter;
+    bool all_steps_admitted = adapter.Initialize(
+        MakeCpuFunctionalConfig(meshes[index]));
+    StoredCpuState previous;
+    if (all_steps_admitted) previous = StoreState(adapter.Snapshot());
+    CommittedScientificEvaluation evaluation;
+    for (std::uint64_t step = 1;
+         step <= cpu_functional_accepted_steps && all_steps_admitted; ++step)
+    {
+      dg_igr_hdg_cpu_test::IndependentOracleResult oracle;
+      const bool oracle_ready = step == 1
+          ? dg_igr_hdg_cpu_test::RunIndependentFirstStep(
+                communicator, oracle_config, oracle)
+          : dg_igr_hdg_cpu_test::RunIndependentStep(
+                communicator, oracle_config, step, previous.interior,
+                previous.trace, oracle);
+      const bool advanced = oracle_ready && oracle.passed &&
+          adapter.Advance().committed;
+      if (advanced)
+      {
+        evaluation = EvaluateCommittedScientificState(
+            adapter.Snapshot(), meshes[index], oracle, communicator);
+        const CpuRunEvidence& evidence = adapter.evidence();
+        all_steps_admitted = evaluation.passed &&
+            evidence.accepted_step_count == step &&
+            AcceptedStepPasses(
+                evidence.accepted_steps[static_cast<std::size_t>(step - 1)],
+                step);
+        previous = StoreState(adapter.Snapshot());
+      }
+      else
+      {
+        all_steps_admitted = false;
+      }
+    }
+    checks.Require(all_steps_admitted,
+                   "solver-linked convergence all-step states are admitted");
+    errors[index] = evaluation.state_l2_error;
+  }
+  const double rate_36 = std::log2(errors[0] / errors[1]);
+  const double rate_612 = std::log2(errors[1] / errors[2]);
+  checks.Require(std::isfinite(errors[0]) &&
+                     std::isfinite(errors[1]) &&
+                     std::isfinite(errors[2]) && errors[0] > errors[1] &&
+                     errors[1] > errors[2] && errors[2] > 0.0 &&
+                     rate_36 >= 2.25 && rate_612 >= 2.25,
+                 "committed solver N3/N6/N12 spatial order");
+  if (rank == 0 && checks.failures == 0)
+    std::cout << "solver-linked convergence PASS errors="
+              << errors[0] << ',' << errors[1] << ',' << errors[2]
+              << " rates=" << rate_36 << ',' << rate_612 << '\n';
+  return checks.failures == 0 ? 0 : 1;
 }
 
 } // namespace
@@ -2297,6 +2896,8 @@ int main(int argc, char** argv)
   int functional_n = 0;
   const bool functional_request = argc == 3 &&
       std::string_view{argv[1]} == "--functional-n";
+  const bool convergence_request = argc == 2 &&
+      std::string_view{argv[1]} == "--scientific-convergence";
   if (functional_request)
   {
     const std::string_view value{argv[2]};
@@ -2321,6 +2922,10 @@ int main(int argc, char** argv)
   {
     result = RunFunctionalTuple<Rank2Selection>(
         MPI_COMM_WORLD, rank, ranks, functional_n);
+  }
+  else if (convergence_request && ranks == 1)
+  {
+    result = RunSolverLinkedConvergence(MPI_COMM_WORLD, rank);
   }
   else
   {

@@ -4646,6 +4646,8 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   evidence.nonlinear_gate = nonlinear_converged;
   evidence.true_residual_gate = maximum_true_residual <=
       state.config.true_residual_tolerance;
+  if (state.config.force_private_scientific_gate_failure)
+    evidence.true_residual_gate = false;
   evidence.status = CpuAttemptStatus::success;
   evidence.failure_phase = CpuFailurePhase::none;
   evidence.transfers.allocation_events =
@@ -4935,6 +4937,40 @@ bool detail::CpuNumericsCore::ExportCanonicalCommitted(
   written = 0;
   const Implementation& state = *implementation_;
   const CpuSlotStorage* storage = state.Committed();
+  if (!storage || !entries) { return false; }
+  const std::size_t required =
+      storage->interior.size() + storage->trace.size();
+  if (capacity < required ||
+      state.interior_global_ids.size() != storage->interior.size() ||
+      state.trace_canonical_ids.size() != storage->trace.size())
+  {
+    return false;
+  }
+  for (std::size_t index = 0; index < storage->interior.size(); ++index)
+  {
+    entries[written++] = {state.interior_global_ids[index],
+                          storage->interior[index]};
+  }
+  constexpr std::uint64_t trace_prefix = std::uint64_t{1} << 63;
+  for (std::size_t index = 0; index < storage->trace.size(); ++index)
+  {
+    entries[written++] = {trace_prefix | state.trace_canonical_ids[index],
+                          storage->trace[index]};
+  }
+  std::sort(entries, entries + written,
+            [](const CpuCanonicalEntry& left,
+               const CpuCanonicalEntry& right)
+            { return left.global_id < right.global_id; });
+  return true;
+}
+
+bool detail::CpuNumericsCore::ExportCanonicalCandidate(
+    CpuCanonicalEntry* entries, const std::size_t capacity,
+    std::size_t& written) const noexcept
+{
+  written = 0;
+  const Implementation& state = *implementation_;
+  const CpuSlotStorage* storage = state.Candidate();
   if (!storage || !entries) { return false; }
   const std::size_t required =
       storage->interior.size() + storage->trace.size();

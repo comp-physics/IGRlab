@@ -58,6 +58,15 @@ foreach(_n IN ITEMS 3 6 12)
 endforeach()
 
 add_test(
+  NAME hdg_runtime_cpu_solver_linked_convergence
+  COMMAND dg_igr_hdg_runtime_cpu_test --scientific-convergence)
+set_tests_properties(hdg_runtime_cpu_solver_linked_convergence
+  PROPERTIES
+    PROCESSORS 1
+    RESOURCE_LOCK hdg_runtime_cpu
+    TIMEOUT 3600)
+
+add_test(
   NAME hdg_runtime_cpu_functional_rank2_n6
   COMMAND
     "${MPIEXEC_EXECUTABLE}"

@@ -130,6 +130,7 @@ struct CpuPersistentConfig
   double nonlinear_tolerance = cpu_nonlinear_tolerance;
   double true_residual_tolerance = cpu_nonlinear_tolerance;
   bool allow_one_retry = true;
+  bool force_private_scientific_gate_failure = false;
 };
 
 CpuPersistentConfig MakeCpuSmokeConfig() noexcept;
@@ -438,7 +439,7 @@ struct CpuPreparedStep
   CpuPreparedStep(CpuPreparedStep&& other) noexcept { MoveFrom(other); }
   CpuPreparedStep& operator=(CpuPreparedStep&& other) noexcept
   {
-    if (this != &other) { MoveFrom(other); }
+    if (this != &other && !valid) { MoveFrom(other); }
     return *this;
   }
 
@@ -446,10 +447,12 @@ struct CpuPreparedStep
   std::uint64_t candidate_cursor = 0;
   StateCoordinates entry_coordinates{};
   StateCoordinates target_coordinates{};
+  CheckpointDescriptor future_checkpoint{};
   CpuCoefficientView interior{};
   CpuCoefficientView trace{};
   StateHash interior_hash{};
   StateHash trace_hash{};
+  StateHash state_hash{};
   std::uint64_t candidate_generation = 0;
   CpuFailurePhase failure_phase = CpuFailurePhase::none;
   bool numerically_ready = false;
@@ -457,6 +460,19 @@ struct CpuPreparedStep
 
   void Invalidate() noexcept
   {
+    identity = {};
+    candidate_cursor = 0;
+    entry_coordinates = {};
+    target_coordinates = {};
+    future_checkpoint = {};
+    interior = {};
+    trace = {};
+    interior_hash = {};
+    trace_hash = {};
+    state_hash = {};
+    candidate_generation = 0;
+    failure_phase = CpuFailurePhase::none;
+    numerically_ready = false;
     owner_incarnation = 0;
     authority_serial = 0;
     valid = false;
@@ -471,10 +487,12 @@ private:
     candidate_cursor = other.candidate_cursor;
     entry_coordinates = other.entry_coordinates;
     target_coordinates = other.target_coordinates;
+    future_checkpoint = other.future_checkpoint;
     interior = other.interior;
     trace = other.trace;
     interior_hash = other.interior_hash;
     trace_hash = other.trace_hash;
+    state_hash = other.state_hash;
     candidate_generation = other.candidate_generation;
     owner_incarnation = other.owner_incarnation;
     authority_serial = other.authority_serial;
@@ -495,7 +513,7 @@ struct CpuPreparedCommit
   CpuPreparedCommit(CpuPreparedCommit&& other) noexcept { MoveFrom(other); }
   CpuPreparedCommit& operator=(CpuPreparedCommit&& other) noexcept
   {
-    if (this != &other) { MoveFrom(other); }
+    if (this != &other && !valid) { MoveFrom(other); }
     return *this;
   }
   CheckpointDescriptor future_checkpoint{};
@@ -503,6 +521,8 @@ struct CpuPreparedCommit
   bool valid = false;
   void Invalidate() noexcept
   {
+    future_checkpoint = {};
+    candidate_generation = 0;
     owner_incarnation = 0;
     authority_serial = 0;
     valid = false;
@@ -534,13 +554,14 @@ struct CpuProvisionalCommit
   }
   CpuProvisionalCommit& operator=(CpuProvisionalCommit&& other) noexcept
   {
-    if (this != &other) { MoveFrom(other); }
+    if (this != &other && !valid) { MoveFrom(other); }
     return *this;
   }
   std::uint64_t candidate_generation = 0;
   bool valid = false;
   void Invalidate() noexcept
   {
+    candidate_generation = 0;
     owner_incarnation = 0;
     authority_serial = 0;
     valid = false;
@@ -573,7 +594,7 @@ struct CpuCandidateConsumeCapability
   CpuCandidateConsumeCapability& operator=(
       CpuCandidateConsumeCapability&& other) noexcept
   {
-    if (this != &other) { MoveFrom(other); }
+    if (this != &other && !valid) { MoveFrom(other); }
     return *this;
   }
   void Invalidate() noexcept
@@ -719,7 +740,8 @@ enum class CpuCollectiveTestFault : unsigned char
   initialization_between_sparse_exchanges,
   initialization_before_gmres_prime,
   initialization_facade_readiness,
-  initialization_facade_readiness_reset_refusal
+  initialization_facade_readiness_reset_refusal,
+  commit_prepared_rejection
 };
 
 struct CpuCollectiveTestConsumptionEvidence
@@ -821,6 +843,8 @@ public:
   void SealOwnedAllocationBaseline() noexcept;
   const CpuRunEvidence& evidence() const noexcept;
   bool ExportCanonicalCommitted(CpuCanonicalEntry*, std::size_t,
+                                std::size_t&) const noexcept;
+  bool ExportCanonicalCandidate(CpuCanonicalEntry*, std::size_t,
                                 std::size_t&) const noexcept;
 
 private:
@@ -937,6 +961,7 @@ public:
       CpuPreparedStep& prepared,
       const CpuFailureInjection& injection = CpuFailureInjection{}) noexcept
   {
+    if (prepared.valid) { return false; }
     prepared = CpuPreparedStep{};
     if (!contract_ || FacadeBusy()) { return false; }
     const BeginOutcome begin = contract_->BeginStep(
@@ -946,6 +971,7 @@ public:
 
   bool PrepareRetry(CpuPreparedStep& prepared) noexcept
   {
+    if (prepared.valid) { return false; }
     prepared = CpuPreparedStep{};
     if (!contract_ || FacadeBusy()) { return false; }
     const BeginOutcome begin = contract_->Retry();
@@ -983,6 +1009,7 @@ public:
   bool PrepareCommit(CpuPreparedStep& staging,
                      CpuPreparedCommit& prepared) noexcept
   {
+    if (prepared.valid) { return false; }
     prepared = CpuPreparedCommit{};
     if (!MatchesStaging(staging) || !staging_token_) { return false; }
     const AttemptReport report = PreparedReport();
@@ -1010,13 +1037,30 @@ public:
   bool CommitPrepared(CpuPreparedCommit& prepared,
                       CpuProvisionalCommit& provisional) noexcept
   {
+    if (provisional.valid) { return false; }
     provisional = CpuProvisionalCommit{};
     if (!MatchesPreparedCommit(prepared) || !prepared_token_) { return false; }
     auto next = contract_->CommitPrepared(std::move(*prepared_token_));
     prepared_token_.reset();
     prepared.Invalidate();
     commit_prepared_active_ = false;
-    if (!next) { return false; }
+    if (!next)
+    {
+      last_transition_outcome_ = CurrentFailureOutcome();
+      CompleteAttempt(last_transition_outcome_);
+      return false;
+    }
+    const bool commit_rejection = core_.ConsumeCollectiveTestFault(
+        detail::CpuCollectiveTestFault::commit_prepared_rejection);
+    if (!core_.CollectiveAll(!commit_rejection))
+    {
+      MarkFacadeFailure(CpuFailurePhase::commit, -1);
+      const AttemptOutcome outcome = contract_->RevertCommit(
+          std::move(*next), FailureReason::backend_failure);
+      last_transition_outcome_ = outcome;
+      CompleteAttempt(outcome);
+      return false;
+    }
     provisional_token_.emplace(std::move(*next));
     provisional.owner_incarnation = facade_incarnation_;
     provisional.authority_serial = active_authority_serial_;
@@ -1038,6 +1082,7 @@ public:
     provisional.Invalidate();
     provisional_active_ = false;
     CompleteAttempt(outcome);
+    last_transition_outcome_ = outcome;
     return outcome;
   }
 
@@ -1056,6 +1101,7 @@ public:
     prepared.Invalidate();
     commit_prepared_active_ = false;
     CompleteAttempt(outcome);
+    last_transition_outcome_ = outcome;
     return outcome;
   }
 
@@ -1074,6 +1120,7 @@ public:
     provisional.Invalidate();
     provisional_active_ = false;
     CompleteAttempt(outcome);
+    last_transition_outcome_ = outcome;
     return outcome;
   }
 
@@ -1094,7 +1141,10 @@ public:
     CpuPreparedCommit prepared;
     if (!PrepareCommit(staging, prepared)) { return last_transition_outcome_; }
     CpuProvisionalCommit provisional;
-    if (!CommitPrepared(prepared, provisional)) { return StaleOutcome(); }
+    if (!CommitPrepared(prepared, provisional))
+    {
+      return last_transition_outcome_;
+    }
     return FinalizeCommit(provisional);
   }
 
@@ -1146,6 +1196,10 @@ public:
   {
     return contract_ ? &contract_->telemetry() : nullptr;
   }
+  AttemptOutcome last_transition_outcome() const noexcept
+  {
+    return last_transition_outcome_;
+  }
   const CpuRunEvidence& evidence() const noexcept { return core_.evidence(); }
   CpuStateSnapshot Snapshot() const noexcept
   {
@@ -1161,6 +1215,12 @@ public:
                                 std::size_t& written) const noexcept
   {
     return core_.ExportCanonicalCommitted(entries, capacity, written);
+  }
+  bool ExportCanonicalCandidate(CpuCanonicalEntry* entries,
+                                const std::size_t capacity,
+                                std::size_t& written) const noexcept
+  {
+    return core_.ExportCanonicalCandidate(entries, capacity, written);
   }
 
 private:
@@ -1312,10 +1372,12 @@ private:
     prepared.candidate_cursor = begin.attempt.sequence;
     prepared.entry_coordinates = staging_token_->entry_coordinates();
     prepared.target_coordinates = staging_token_->target_coordinates();
+    prepared.future_checkpoint = staging_token_->future_checkpoint();
     prepared.interior = candidate.interior;
     prepared.trace = candidate.trace;
     prepared.interior_hash = candidate.interior_hash;
     prepared.trace_hash = candidate.trace_hash;
+    prepared.state_hash = candidate.state_hash;
     prepared.candidate_generation = active_candidate_generation_;
     prepared.owner_incarnation = facade_incarnation_;
     prepared.authority_serial = active_authority_serial_;

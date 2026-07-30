@@ -52,6 +52,8 @@ struct IndependentOracleResult
   double final_residual = 0.0;
   double maximum_true_residual = 0.0;
   int newton_updates = 0;
+  std::uint64_t accepted_step = 0;
+  double accepted_time = 0.0;
   std::uint64_t negative_signed_trace_dofs = 0;
   bool mesh_rebuilt = false;
   bool analytic_source_flux_jacobian = false;
@@ -68,6 +70,19 @@ struct IndependentOracleResult
   bool admissible = false;
   bool passed = false;
 };
+
+/**
+ * Independent test-local one-step oracle starting from the supplied previous
+ * accepted state. Step one uses the frozen analytic/perturbed initial pair and
+ * therefore requires empty previous-state vectors.
+ */
+bool RunIndependentStep(
+    MPI_Comm communicator,
+    const IndependentOracleConfig& config,
+    std::uint64_t accepted_step,
+    const std::vector<double>& previous_interior,
+    const std::vector<double>& previous_true_trace,
+    IndependentOracleResult& result);
 
 /** Independent test-local first-step oracle; no production helpers. */
 bool RunIndependentFirstStep(MPI_Comm communicator,
