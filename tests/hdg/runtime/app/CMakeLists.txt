@@ -30,6 +30,7 @@ endforeach()
 add_test(NAME dg_igr_hdg_runtime_app_cli_process_cpu
   COMMAND "${CMAKE_COMMAND}"
     "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
+    "-DHDG_RUNTIME_BUILD_DRIVER=${CMAKE_SOURCE_DIR}/build.sh"
     "-DHDG_RUNTIME_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cli-process-output"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_process.cmake")
 add_test(NAME dg_igr_hdg_runtime_app_cli_process_cpu_rank2
@@ -85,6 +86,7 @@ if(MFEM_USE_CUDA)
   add_test(NAME dg_igr_hdg_runtime_app_cli_process_cuda_rank1
     COMMAND "${CMAKE_COMMAND}"
       "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
+      "-DHDG_RUNTIME_BUILD_DRIVER=${CMAKE_SOURCE_DIR}/build.sh"
       "-DHDG_RUNTIME_SCIENTIFIC_TEST=$<TARGET_FILE:dg_igr_hdg_runtime_app_scientific_contract_test>"
       "-DHDG_RUNTIME_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cli-process-cuda-rank1"
       -DHDG_RUNTIME_RANKS=1

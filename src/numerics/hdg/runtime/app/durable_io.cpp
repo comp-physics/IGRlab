@@ -5,10 +5,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fcntl.h>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <system_error>
 #include <unistd.h>
@@ -186,6 +189,230 @@ void CrashAt(const DurableGenerationCrashBoundaryV1 selected,
              const DurableGenerationCrashBoundaryV1 reached) noexcept
 {
   if (selected == reached) ::_exit(86);
+}
+
+bool ParseUnsigned(const std::string_view text,
+                   std::uint64_t& value) noexcept
+{
+  if (text.empty()) return false;
+  value = 0;
+  const auto converted = std::from_chars(
+      text.data(), text.data() + text.size(), value);
+  return converted.ec == std::errc{} &&
+      converted.ptr == text.data() + text.size();
+}
+
+bool LowerHexDigest(const std::string_view text) noexcept
+{
+  return text.size() == 64 &&
+      std::all_of(text.begin(), text.end(), [](const char value)
+      {
+        return (value >= '0' && value <= '9') ||
+            (value >= 'a' && value <= 'f');
+      });
+}
+
+std::vector<std::string_view> TabFields(const std::string_view line)
+{
+  std::vector<std::string_view> fields;
+  std::size_t begin = 0;
+  while (begin <= line.size())
+  {
+    const std::size_t tab = line.find('\t', begin);
+    if (tab == std::string_view::npos)
+    {
+      fields.push_back(line.substr(begin));
+      break;
+    }
+    fields.push_back(line.substr(begin, tab - begin));
+    begin = tab + 1;
+  }
+  return fields;
+}
+
+DurableIoStatus VerifyGenerationManifest(
+    const std::filesystem::path& generation,
+    std::string& detail) noexcept
+{
+  try
+  {
+    constexpr std::size_t maximum_manifest_bytes = 1024U * 1024U;
+    constexpr std::size_t maximum_artifact_bytes =
+        256U * 1024U * 1024U;
+    const std::filesystem::path manifest_path = generation / "manifest.v1";
+    std::error_code error;
+    if (std::filesystem::symlink_status(manifest_path, error).type() !=
+            std::filesystem::file_type::regular || error)
+    {
+      detail = "generation manifest is missing or not a regular file";
+      return DurableIoStatus::verify_failed;
+    }
+    std::vector<std::uint8_t> manifest_bytes;
+    DurableIoStatus status = ReadDurableFile(
+        manifest_path, maximum_manifest_bytes, manifest_bytes, detail);
+    if (status != DurableIoStatus::ok) return status;
+    const std::string manifest{
+        manifest_bytes.begin(), manifest_bytes.end()};
+    std::istringstream input{manifest};
+    std::string line;
+    if (!std::getline(input, line) ||
+        line != "DG_IGR_DURABLE_GENERATION_V1")
+    {
+      detail = "generation manifest header is malformed";
+      return DurableIoStatus::verify_failed;
+    }
+    if (!std::getline(input, line))
+    {
+      detail = "generation manifest has no generation identity";
+      return DurableIoStatus::verify_failed;
+    }
+    const std::vector<std::string_view> generation_fields = TabFields(line);
+    std::uint64_t generation_number = 0;
+    if (generation_fields.size() != 2 ||
+        generation_fields[0] != "generation" ||
+        !ParseUnsigned(generation_fields[1], generation_number))
+    {
+      detail = "generation manifest identity is malformed";
+      return DurableIoStatus::verify_failed;
+    }
+    const std::string expected_prefix =
+        "generation-" + std::to_string(generation_number) + '-';
+    const std::string directory_name = generation.filename().string();
+    if (directory_name.rfind(expected_prefix, 0) != 0)
+    {
+      detail = "generation manifest identity does not match its directory";
+      return DurableIoStatus::verify_failed;
+    }
+
+    struct ArtifactIdentity
+    {
+      std::size_t bytes = 0;
+      std::string digest{};
+    };
+    std::map<std::string, ArtifactIdentity> expected;
+    while (std::getline(input, line))
+    {
+      if (line.empty())
+      {
+        detail = "generation manifest contains an empty record";
+        return DurableIoStatus::verify_failed;
+      }
+      const std::vector<std::string_view> fields = TabFields(line);
+      std::uint64_t byte_count = 0;
+      if (fields.size() != 4 || fields[0] != "artifact" ||
+          !SafeRelativeName(fields[1]) || fields[1] == "manifest.v1" ||
+          !ParseUnsigned(fields[2], byte_count) ||
+          byte_count > maximum_artifact_bytes ||
+          !LowerHexDigest(fields[3]))
+      {
+        detail = "generation manifest artifact record is malformed";
+        return DurableIoStatus::verify_failed;
+      }
+      const auto inserted = expected.emplace(
+          std::string{fields[1]}, ArtifactIdentity{
+              static_cast<std::size_t>(byte_count), std::string{fields[3]}});
+      if (!inserted.second)
+      {
+        detail = "generation manifest contains a duplicate artifact";
+        return DurableIoStatus::verify_failed;
+      }
+    }
+    if (expected.empty())
+    {
+      detail = "generation manifest contains no artifacts";
+      return DurableIoStatus::verify_failed;
+    }
+
+    std::size_t actual_count = 0;
+    for (const auto& member : std::filesystem::directory_iterator(generation))
+    {
+      if (member.path().filename() == "manifest.v1") continue;
+      ++actual_count;
+      const std::string name = member.path().filename().string();
+      const auto found = expected.find(name);
+      if (member.symlink_status().type() !=
+              std::filesystem::file_type::regular ||
+          found == expected.end())
+      {
+        detail = "generation contains an unmanifested or non-file artifact";
+        return DurableIoStatus::verify_failed;
+      }
+      std::vector<std::uint8_t> bytes;
+      status = ReadDurableFile(member.path(), maximum_artifact_bytes,
+                               bytes, detail);
+      if (status != DurableIoStatus::ok) return status;
+      if (bytes.size() != found->second.bytes ||
+          Hex(ComputeSha256(bytes.data(), bytes.size())) !=
+              found->second.digest)
+      {
+        detail = "generation artifact length or digest mismatch: " + name;
+        return DurableIoStatus::verify_failed;
+      }
+    }
+    if (actual_count != expected.size())
+    {
+      detail = "generation is missing a manifested artifact";
+      return DurableIoStatus::verify_failed;
+    }
+    return DurableIoStatus::ok;
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    return DurableIoStatus::verify_failed;
+  }
+}
+
+bool InjectFinalDirectorySyncFailure() noexcept
+{
+  const char* const value =
+      std::getenv("DG_IGR_HDG_TEST_FINAL_DIRECTORY_SYNC_FAILURE");
+  return value != nullptr && std::string_view{value} == "1";
+}
+
+DurableIoStatus RestoreGenerationMarker(
+    const std::filesystem::path& output_root,
+    const std::filesystem::path& previous_target,
+    std::string& detail) noexcept
+{
+  try
+  {
+    const std::filesystem::path marker = output_root / ".dg-igr-current";
+    const std::filesystem::path temporary = TemporarySibling(marker);
+    std::error_code error;
+    std::filesystem::remove(temporary, error);
+    error.clear();
+    if (previous_target.empty())
+    {
+      if (!std::filesystem::remove(marker, error) && error)
+      {
+        detail = "remove failed generation marker: " + error.message();
+        return DurableIoStatus::cleanup_failed;
+      }
+    }
+    else
+    {
+      std::filesystem::create_symlink(previous_target, temporary, error);
+      if (error)
+      {
+        detail = "create previous generation marker: " + error.message();
+        return DurableIoStatus::cleanup_failed;
+      }
+      if (::rename(temporary.c_str(), marker.c_str()) != 0)
+      {
+        const int saved = errno;
+        std::filesystem::remove(temporary, error);
+        detail = ErrorText("restore previous generation marker", saved);
+        return DurableIoStatus::cleanup_failed;
+      }
+    }
+    return SyncDirectory(output_root, detail);
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    return DurableIoStatus::cleanup_failed;
+  }
 }
 
 } // namespace
@@ -615,13 +842,14 @@ DurableIoStatus DurableGenerationTransactionV1::Begin(
       const auto current = (output_root_ / target).lexically_normal();
       if (error || current.parent_path() != generations_root_ ||
           !std::filesystem::is_directory(current, error) || error ||
-          !std::filesystem::is_regular_file(current / "manifest.v1", error) ||
-          error)
+          VerifyGenerationManifest(current, detail) != DurableIoStatus::ok)
       {
-        detail = "generation marker does not name a complete generation";
+        if (detail.empty())
+          detail = "generation marker does not name a complete generation";
         BestEffortCleanup();
         return DurableIoStatus::verify_failed;
       }
+      previous_marker_target_ = target;
       for (const auto& member : std::filesystem::directory_iterator(current))
       {
         if (member.path().filename() == "manifest.v1") continue;
@@ -816,11 +1044,36 @@ DurableIoStatus DurableGenerationTransactionV1::Publish(
       detail = ErrorText("replace generation marker", saved);
       return DurableIoStatus::rename_failed;
     }
-    published_ = true;
-    active_ = false;
     CrashAt(test_crash_boundary_,
             DurableGenerationCrashBoundaryV1::after_marker_rename);
-    return SyncDirectory(output_root_, detail);
+    if (InjectFinalDirectorySyncFailure())
+    {
+      detail = "injected final output-directory sync failure";
+      status = DurableIoStatus::sync_failed;
+    }
+    else
+    {
+      status = SyncDirectory(output_root_, detail);
+    }
+    if (status != DurableIoStatus::ok)
+    {
+      if (detail.empty()) detail = "injected final output-directory sync failure";
+      const std::string publication_detail = detail;
+      std::string restore_detail;
+      const DurableIoStatus restored = RestoreGenerationMarker(
+          output_root_, previous_marker_target_, restore_detail);
+      if (restored != DurableIoStatus::ok)
+      {
+        detail = publication_detail + "; marker restore failed: " +
+            restore_detail;
+        return DurableIoStatus::cleanup_failed;
+      }
+      detail = publication_detail;
+      return status;
+    }
+    published_ = true;
+    active_ = false;
+    return DurableIoStatus::ok;
   }
   catch (const std::exception& error)
   {
@@ -870,6 +1123,7 @@ DurableIoStatus DurableGenerationTransactionV1::Revert(
     generation_renamed_ = false;
     staging_path_.clear();
     final_generation_path_.clear();
+    previous_marker_target_.clear();
     aliases_.clear();
     return DurableIoStatus::ok;
   }

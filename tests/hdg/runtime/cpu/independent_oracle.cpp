@@ -840,9 +840,13 @@ bool Admissible(mfem::ParMesh& mesh,
 
 } // namespace
 
-bool RunIndependentFirstStep(MPI_Comm communicator,
-                             const IndependentOracleConfig& config,
-                             IndependentOracleResult& result)
+bool RunIndependentStep(
+    MPI_Comm communicator,
+    const IndependentOracleConfig& config,
+    const std::uint64_t accepted_step,
+    const std::vector<double>& previous_interior,
+    const std::vector<double>& previous_true_trace,
+    IndependentOracleResult& result)
 {
   result = {};
   int ranks = 0;
@@ -855,7 +859,11 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
       config.assembly_quadrature_order == 11;
   const bool functional = config.polynomial_order == 2 &&
       functional_mesh && config.assembly_quadrature_order == 14;
+  const bool first_step = accepted_step == 1;
   if ((ranks != 1 && ranks != 2) || (!smoke && !functional) ||
+      accepted_step == 0 || accepted_step > 20 ||
+      (first_step && (!previous_interior.empty() ||
+                      !previous_true_trace.empty())) ||
       (ranks == 2 && config.polynomial_order == 2 &&
        config.elements_per_direction != 6))
   {
@@ -909,15 +917,43 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
     mfem::VectorFunctionCoefficient exact_coefficient(components, exact);
     mfem::VectorFunctionCoefficient perturbed_coefficient(
         components, perturbed);
-    old_interior.ProjectCoefficient(exact_coefficient);
-    current_interior.ProjectCoefficient(perturbed_coefficient);
-    if (!ProjectTrace(mesh, trace_space, exact_trace,
-                      exact_true_trace, false) ||
-        !ProjectTrace(mesh, trace_space, current_trace,
-                      current_true_trace, true))
+    if (first_step)
     {
-      return false;
+      old_interior.ProjectCoefficient(exact_coefficient);
+      current_interior.ProjectCoefficient(perturbed_coefficient);
+      if (!ProjectTrace(mesh, trace_space, exact_trace,
+                        exact_true_trace, false) ||
+          !ProjectTrace(mesh, trace_space, current_trace,
+                        current_true_trace, true))
+      {
+        return false;
+      }
     }
+    else
+    {
+      if (previous_interior.size() !=
+              static_cast<std::size_t>(interior_space.GetVSize()) ||
+          previous_true_trace.size() !=
+              static_cast<std::size_t>(trace_space.GetTrueVSize()))
+      {
+        return false;
+      }
+      std::memcpy(old_interior.HostWrite(), previous_interior.data(),
+                  previous_interior.size() * sizeof(double));
+      std::memcpy(current_interior.HostWrite(), previous_interior.data(),
+                  previous_interior.size() * sizeof(double));
+      exact_true_trace.SetSize(trace_space.GetTrueVSize());
+      current_true_trace.SetSize(trace_space.GetTrueVSize());
+      std::memcpy(exact_true_trace.HostWrite(), previous_true_trace.data(),
+                  previous_true_trace.size() * sizeof(double));
+      std::memcpy(current_true_trace.HostWrite(),
+                  previous_true_trace.data(),
+                  previous_true_trace.size() * sizeof(double));
+      exact_trace.Distribute(exact_true_trace);
+      current_trace.Distribute(current_true_trace);
+    }
+    result.accepted_step = accepted_step;
+    result.accepted_time = static_cast<double>(accepted_step) * dt;
     result.initial_interior.assign(
         old_interior.HostRead(), old_interior.HostRead() + old_interior.Size());
     result.initial_true_trace.assign(
@@ -1268,6 +1304,13 @@ bool RunIndependentFirstStep(MPI_Comm communicator,
     result.passed = false;
     return false;
   }
+}
+
+bool RunIndependentFirstStep(MPI_Comm communicator,
+                             const IndependentOracleConfig& config,
+                             IndependentOracleResult& result)
+{
+  return RunIndependentStep(communicator, config, 1, {}, {}, result);
 }
 
 bool RunIndependentFirstStep(MPI_Comm communicator,

@@ -7,6 +7,40 @@ if(NOT DEFINED HDG_RUNTIME_RANKS)
   set(HDG_RUNTIME_RANKS 1)
 endif()
 
+if(HDG_RUNTIME_RANKS EQUAL 1 AND
+   NOT HDG_RUNTIME_FUNCTIONAL AND
+   DEFINED HDG_RUNTIME_BUILD_DRIVER AND
+   NOT "$ENV{DG_IGR_TEST_REUSE_MFEM_ROOT}" STREQUAL "" AND
+   NOT "$ENV{DG_IGR_TEST_REUSE_SPACK_ENV}" STREQUAL "" AND
+   NOT "$ENV{DG_IGR_TEST_REUSE_MODE}" STREQUAL "")
+  if("$ENV{DG_IGR_TEST_REUSE_MODE}" STREQUAL "gpu")
+    set(reuse_mode_args --gpu --cuda-arch 120)
+  elseif("$ENV{DG_IGR_TEST_REUSE_MODE}" STREQUAL "cpu")
+    set(reuse_mode_args --cpu-only)
+  else()
+    message(FATAL_ERROR "invalid reuse-fixture mode")
+  endif()
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E env
+      DG_IGR_RUN_REUSE_FIXTURES=1
+      "DG_IGR_SPACK_ENV=$ENV{DG_IGR_TEST_REUSE_SPACK_ENV}"
+      bash "${HDG_RUNTIME_BUILD_DRIVER}" ${reuse_mode_args}
+      --reuse-mfem-root "$ENV{DG_IGR_TEST_REUSE_MFEM_ROOT}"
+      --no-deps --no-tests --print-plan
+    RESULT_VARIABLE reuse_fixture_status
+    OUTPUT_VARIABLE reuse_fixture_output
+    ERROR_VARIABLE reuse_fixture_error)
+  if(NOT reuse_fixture_status EQUAL 0 OR
+     NOT reuse_fixture_output MATCHES
+         "reuse-fixtures.*compatibility cases passed" OR
+     NOT reuse_fixture_output MATCHES
+         "mfem_reuse_state=validated-read-only" OR
+     NOT reuse_fixture_error STREQUAL "")
+    message(FATAL_ERROR
+      "MFEM/Spack reuse compatibility fixtures failed: ${reuse_fixture_status};${reuse_fixture_output};${reuse_fixture_error}")
+  endif()
+endif()
+
 function(run_runtime prefix)
   if(HDG_RUNTIME_RANKS EQUAL 1)
     execute_process(
@@ -48,6 +82,32 @@ function(run_private_scientific_gate prefix)
     execute_process(
       COMMAND "${CMAKE_COMMAND}" -E env
         DG_IGR_HDG_TEST_SCIENTIFIC_GATE_FAILURE=1
+        "${HDG_RUNTIME_MPIEXEC}" "${HDG_RUNTIME_NUMPROC_FLAG}" 2
+        ${HDG_RUNTIME_MPIEXEC_PREFLAGS}
+        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+        ${HDG_RUNTIME_MPIEXEC_POSTFLAGS}
+      RESULT_VARIABLE status
+      OUTPUT_VARIABLE output
+      ERROR_VARIABLE error)
+  endif()
+  set(${prefix}_status "${status}" PARENT_SCOPE)
+  set(${prefix}_output "${output}" PARENT_SCOPE)
+  set(${prefix}_error "${error}" PARENT_SCOPE)
+endfunction()
+
+function(run_private_final_sync_failure prefix)
+  if(HDG_RUNTIME_RANKS EQUAL 1)
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E env
+        DG_IGR_HDG_TEST_FINAL_DIRECTORY_SYNC_FAILURE=1
+        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+      RESULT_VARIABLE status
+      OUTPUT_VARIABLE output
+      ERROR_VARIABLE error)
+  else()
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E env
+        DG_IGR_HDG_TEST_FINAL_DIRECTORY_SYNC_FAILURE=1
         "${HDG_RUNTIME_MPIEXEC}" "${HDG_RUNTIME_NUMPROC_FLAG}" 2
         ${HDG_RUNTIME_MPIEXEC_PREFLAGS}
         "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
@@ -355,6 +415,21 @@ if(NOT scientific_status EQUAL 71 OR
    NOT scientific_error MATCHES "reason=true_residual_gate")
   message(FATAL_ERROR
     "private scientific gate did not produce exit 71: ${scientific_status};${scientific_output};${scientific_error}")
+endif()
+
+file(REMOVE_RECURSE "${HDG_RUNTIME_TEST_OUTPUT}")
+file(REMOVE "${HDG_RUNTIME_TEST_OUTPUT}.checkpoint")
+
+run_private_final_sync_failure(
+  final_sync "--space" "l2" ${common_arguments})
+if(NOT final_sync_status EQUAL 70 OR
+   NOT final_sync_error MATCHES
+       "status=RuntimeFailure.*reason=backend_failure.*step=0" OR
+   EXISTS "${HDG_RUNTIME_TEST_OUTPUT}/.dg-igr-current" OR
+   EXISTS "${HDG_RUNTIME_TEST_OUTPUT}/state-step-000000.vtk" OR
+   EXISTS "${HDG_RUNTIME_TEST_OUTPUT}.checkpoint")
+  message(FATAL_ERROR
+    "final directory-sync failure committed logical state: ${final_sync_status};${final_sync_output};${final_sync_error}")
 endif()
 
 file(REMOVE_RECURSE "${HDG_RUNTIME_TEST_OUTPUT}")

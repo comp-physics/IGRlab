@@ -1799,6 +1799,7 @@ struct CommittedScientificEvaluation
   double minimum_density = -std::numeric_limits<double>::infinity();
   double minimum_pressure = -std::numeric_limits<double>::infinity();
   bool discrete_oracle_match = false;
+  bool coordinate_oracle_match = false;
   bool independent_true_residual = false;
   bool passed = false;
 };
@@ -1819,9 +1820,8 @@ void ManufacturedTestState(const double x, const double y,
             pressure / 0.4 + 0.5 * rho * (u * u + v * v)}};
 }
 
-template <typename Selection>
 CommittedScientificEvaluation EvaluateCommittedScientificState(
-    const PersistentSmoothEulerCpuAdapter<Selection>& adapter,
+    const CpuStateSnapshot& snapshot,
     const int elements_per_direction,
     const dg_igr_hdg_cpu_test::IndependentOracleResult& oracle,
     const MPI_Comm communicator)
@@ -1831,7 +1831,6 @@ CommittedScientificEvaluation EvaluateCommittedScientificState(
   int ranks = 0;
   MPI_Comm_rank(communicator, &rank);
   MPI_Comm_size(communicator, &ranks);
-  const CpuStateSnapshot snapshot = adapter.Snapshot();
   bool local_oracle = CloseVectors(snapshot.interior, oracle.interior,
                                    1.0e-8, 2.0e-8) &&
       CloseVectors(snapshot.trace, oracle.true_trace, 1.0e-8, 2.0e-8);
@@ -1839,6 +1838,9 @@ CommittedScientificEvaluation EvaluateCommittedScientificState(
   MPI_Allreduce(MPI_IN_PLACE, &oracle_match, 1, MPI_INT, MPI_MIN,
                 communicator);
   evaluation.discrete_oracle_match = oracle_match == 1;
+  evaluation.coordinate_oracle_match =
+      oracle.accepted_step == snapshot.coordinates.step &&
+      NearTime(oracle.accepted_time, snapshot.coordinates.time);
   evaluation.independent_true_residual = oracle.passed &&
       std::isfinite(oracle.maximum_true_residual) &&
       oracle.maximum_true_residual <= independent_true_residual_limit;
@@ -2000,7 +2002,9 @@ CommittedScientificEvaluation EvaluateCommittedScientificState(
             communicator);
   MPI_Bcast(&evaluation.minimum_density, 1, MPI_DOUBLE, 0, communicator);
   MPI_Bcast(&evaluation.minimum_pressure, 1, MPI_DOUBLE, 0, communicator);
-  evaluation.passed = evaluation.independent_true_residual &&
+  evaluation.passed = evaluation.discrete_oracle_match &&
+      evaluation.coordinate_oracle_match &&
+      evaluation.independent_true_residual &&
       std::isfinite(evaluation.state_l2_error) &&
       evaluation.state_l2_error > 0.0 &&
       evaluation.maximum_conservation_error <= 5.0e-11 &&
@@ -2021,7 +2025,9 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
   oracle_config.elements_per_direction = elements_per_direction;
   oracle_config.assembly_quadrature_order =
       cpu_functional_assembly_quadrature_order;
-  dg_igr_hdg_cpu_test::IndependentOracleResult oracle;
+  std::array<dg_igr_hdg_cpu_test::IndependentOracleResult,
+             cpu_functional_accepted_steps + 1> step_oracles{};
+  dg_igr_hdg_cpu_test::IndependentOracleResult& oracle = step_oracles[1];
   checks.Require(dg_igr_hdg_cpu_test::RunIndependentFirstStep(
                      communicator, oracle_config, oracle) && oracle.passed,
                  "functional first-step independent oracle");
@@ -2086,7 +2092,8 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
   reference[1] = StoreState(uninterrupted.Snapshot());
   const CommittedScientificEvaluation first_scientific =
       EvaluateCommittedScientificState(
-          uninterrupted, elements_per_direction, oracle, communicator);
+          uninterrupted.Snapshot(), elements_per_direction, oracle,
+          communicator);
   const CpuAttemptEvidence& functional_first =
       uninterrupted.evidence().accepted.attempt;
   bool capture_policy_exact = functional_first.linearization_chain_count > 0;
@@ -2115,13 +2122,23 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
   CpuCheckpoint uninterrupted_checkpoint;
   for (std::uint64_t step = 2; step <= cpu_functional_accepted_steps; ++step)
   {
+    dg_igr_hdg_cpu_test::IndependentOracleResult& step_oracle =
+        step_oracles[static_cast<std::size_t>(step)];
+    const StoredCpuState& previous =
+        reference[static_cast<std::size_t>(step - 1)];
+    checks.Require(dg_igr_hdg_cpu_test::RunIndependentStep(
+                       communicator, oracle_config, step,
+                       previous.interior, previous.trace, step_oracle) &&
+                       step_oracle.passed,
+                   "functional current-step independent oracle");
     checks.Require(uninterrupted.Advance().committed,
                    "functional uninterrupted accepted step");
     reference[static_cast<std::size_t>(step)] =
         StoreState(uninterrupted.Snapshot());
     const CommittedScientificEvaluation scientific =
         EvaluateCommittedScientificState(
-            uninterrupted, elements_per_direction, oracle, communicator);
+            uninterrupted.Snapshot(), elements_per_direction, step_oracle,
+            communicator);
     const CpuRunEvidence& evidence = uninterrupted.evidence();
     checks.Require(scientific.passed &&
                        evidence.accepted_step_count == step &&
@@ -2132,6 +2149,23 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
                        StorageUnchanged(uninterrupted_storage,
                                         evidence.storage),
                    "functional uninterrupted history and persistent reuse");
+    if (step == 2)
+    {
+      StoredCpuState perturbed = reference[2];
+      if (rank == 0 && !perturbed.interior.empty())
+        perturbed.interior[0] += 1.0e-4;
+      CpuStateSnapshot perturbed_snapshot = uninterrupted.Snapshot();
+      perturbed_snapshot.interior = {
+          perturbed.interior.data(), perturbed.interior.size(),
+          perturbed.interior.capacity()};
+      const CommittedScientificEvaluation rejected =
+          EvaluateCommittedScientificState(
+              perturbed_snapshot, elements_per_direction, step_oracle,
+              communicator);
+      checks.Require(!rejected.passed &&
+                         !rejected.discrete_oracle_match,
+                     "later committed-state perturbation fails all-step oracle gate");
+    }
     if (step == cpu_functional_checkpoint_step)
     {
       checks.Require(uninterrupted.CaptureCheckpoint(
@@ -2175,6 +2209,12 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
     {
       checks.Require(writer.Advance().committed,
                      "functional split-writer accepted step");
+      const CommittedScientificEvaluation scientific =
+          EvaluateCommittedScientificState(
+              writer.Snapshot(), elements_per_direction,
+              step_oracles[static_cast<std::size_t>(step)], communicator);
+      checks.Require(scientific.passed,
+                     "functional split-writer all-step scientific gate");
     }
     const CpuStateSnapshot writer_state = writer.Snapshot();
     const bool checkpoint_captured =
@@ -2242,7 +2282,8 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
     const CpuStateSnapshot actual = reader.Snapshot();
     const CommittedScientificEvaluation scientific =
         EvaluateCommittedScientificState(
-            reader, elements_per_direction, oracle, communicator);
+            reader.Snapshot(), elements_per_direction,
+            step_oracles[static_cast<std::size_t>(step)], communicator);
     const StoredCpuState& expected = reference[static_cast<std::size_t>(step)];
     const CpuRunEvidence& evidence = reader.evidence();
     const std::size_t local_history = static_cast<std::size_t>(step - 11);
@@ -2788,20 +2829,43 @@ int RunSolverLinkedConvergence(const MPI_Comm communicator, const int rank)
     oracle_config.elements_per_direction = meshes[index];
     oracle_config.assembly_quadrature_order =
         cpu_functional_assembly_quadrature_order;
-    dg_igr_hdg_cpu_test::IndependentOracleResult oracle;
-    const bool oracle_ready =
-        dg_igr_hdg_cpu_test::RunIndependentFirstStep(
-            communicator, oracle_config, oracle) && oracle.passed;
     PersistentSmoothEulerCpuAdapter<SerialSelection> adapter;
-    const bool advanced = adapter.Initialize(
-        MakeCpuFunctionalConfig(meshes[index])) &&
-        adapter.Advance().committed;
+    bool all_steps_admitted = adapter.Initialize(
+        MakeCpuFunctionalConfig(meshes[index]));
+    StoredCpuState previous;
+    if (all_steps_admitted) previous = StoreState(adapter.Snapshot());
     CommittedScientificEvaluation evaluation;
-    if (oracle_ready && advanced)
-      evaluation = EvaluateCommittedScientificState(
-          adapter, meshes[index], oracle, communicator);
-    checks.Require(oracle_ready && advanced && evaluation.passed,
-                   "solver-linked convergence state is admitted");
+    for (std::uint64_t step = 1;
+         step <= cpu_functional_accepted_steps && all_steps_admitted; ++step)
+    {
+      dg_igr_hdg_cpu_test::IndependentOracleResult oracle;
+      const bool oracle_ready = step == 1
+          ? dg_igr_hdg_cpu_test::RunIndependentFirstStep(
+                communicator, oracle_config, oracle)
+          : dg_igr_hdg_cpu_test::RunIndependentStep(
+                communicator, oracle_config, step, previous.interior,
+                previous.trace, oracle);
+      const bool advanced = oracle_ready && oracle.passed &&
+          adapter.Advance().committed;
+      if (advanced)
+      {
+        evaluation = EvaluateCommittedScientificState(
+            adapter.Snapshot(), meshes[index], oracle, communicator);
+        const CpuRunEvidence& evidence = adapter.evidence();
+        all_steps_admitted = evaluation.passed &&
+            evidence.accepted_step_count == step &&
+            AcceptedStepPasses(
+                evidence.accepted_steps[static_cast<std::size_t>(step - 1)],
+                step);
+        previous = StoreState(adapter.Snapshot());
+      }
+      else
+      {
+        all_steps_admitted = false;
+      }
+    }
+    checks.Require(all_steps_admitted,
+                   "solver-linked convergence all-step states are admitted");
     errors[index] = evaluation.state_l2_error;
   }
   const double rate_36 = std::log2(errors[0] / errors[1]);

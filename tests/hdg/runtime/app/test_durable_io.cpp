@@ -1,7 +1,9 @@
 #include "numerics/hdg/runtime/app/durable_io.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <sys/wait.h>
@@ -101,12 +103,130 @@ bool ProcessDeathCase(const std::filesystem::path& root,
   if (::waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
       WEXITSTATUS(status) != 86)
     return false;
-  const bool committed = boundary ==
-      DurableGenerationCrashBoundaryV1::after_marker_rename;
-  const std::string suffix = committed ? "new" : "old";
-  return ReadText(output / "state.vtk") == "state-" + suffix &&
-      ReadText(checkpoint) == "checkpoint-" + suffix &&
-      ReadText(output / "run-metadata.json") == "metadata-" + suffix;
+  const auto complete = [&](const std::string_view suffix)
+  {
+    const std::string owned_suffix{suffix};
+    return ReadText(output / "state.vtk") == "state-" + owned_suffix &&
+        ReadText(checkpoint) == "checkpoint-" + owned_suffix &&
+        ReadText(output / "run-metadata.json") ==
+            "metadata-" + owned_suffix;
+  };
+  if (boundary == DurableGenerationCrashBoundaryV1::after_marker_rename)
+  {
+    // The atomic rename may be visible even though the containing directory
+    // was not durably synced. Either complete generation is valid recovery;
+    // a partial mix is not.
+    return complete("old") || complete("new");
+  }
+  return complete("old");
+}
+
+std::filesystem::path CurrentGeneration(
+    const std::filesystem::path& output)
+{
+  std::error_code error;
+  const auto target = std::filesystem::read_symlink(
+      output / ".dg-igr-current", error);
+  return error ? std::filesystem::path{} :
+                 (output / target).lexically_normal();
+}
+
+bool WriteText(const std::filesystem::path& path,
+               const std::string_view text)
+{
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output.write(text.data(), static_cast<std::streamsize>(text.size()));
+  return output.good();
+}
+
+bool ManifestCorruptionCase(const std::filesystem::path& root,
+                            const int kind,
+                            std::string& detail)
+{
+  const auto case_root = root / ("manifest-" + std::to_string(kind));
+  const auto output = case_root / "output";
+  const auto checkpoint = case_root / "restart.checkpoint";
+  std::error_code error;
+  std::filesystem::create_directories(output, error);
+  if (error || !CommitGeneration(output, checkpoint, 0, "old", detail))
+    return false;
+  const auto generation = CurrentGeneration(output);
+  if (generation.empty()) return false;
+  const auto manifest = generation / "manifest.v1";
+  bool corrupted = false;
+  switch (kind)
+  {
+    case 0:
+      // Preserve the recorded length while changing the digest.
+      corrupted = WriteText(generation / "state.vtk", "state-bad");
+      break;
+    case 1:
+    {
+      std::string text = ReadText(manifest);
+      const std::string record = "artifact\tstate.vtk\t9\t";
+      const std::size_t position = text.find(record);
+      if (position != std::string::npos)
+      {
+        text.replace(position, record.size(), "artifact\tstate.vtk\t8\t");
+        corrupted = WriteText(manifest, text);
+      }
+      break;
+    }
+    case 2:
+      corrupted = WriteText(manifest, "not-a-generation-manifest\n");
+      break;
+    case 3:
+      corrupted = WriteText(generation / "extra.bin", "extra");
+      break;
+    case 4:
+      corrupted = std::filesystem::remove(
+          generation / "state.vtk", error) && !error;
+      break;
+    default: return false;
+  }
+  if (!corrupted) return false;
+  DurableGenerationTransactionV1 probe;
+  return probe.Begin(output, 1, detail) == DurableIoStatus::verify_failed &&
+      !probe.active() && !probe.published();
+}
+
+bool FinalSyncFailureCase(const std::filesystem::path& root,
+                          std::string& detail)
+{
+  const auto case_root = root / "final-sync-failure";
+  const auto output = case_root / "output";
+  const auto checkpoint = case_root / "restart.checkpoint";
+  std::error_code error;
+  std::filesystem::create_directories(output, error);
+  if (error || !CommitGeneration(output, checkpoint, 0, "old", detail))
+    return false;
+
+  DurableGenerationTransactionV1 transaction;
+  const bool staged =
+      transaction.Begin(output, 1, detail) == DurableIoStatus::ok &&
+      StageText(transaction, "state.vtk", "state-new", detail) &&
+      StageText(transaction, "checkpoint.v2", "checkpoint-new", detail) &&
+      StageText(transaction, "run-metadata.json", "metadata-new", detail) &&
+      transaction.AddAlias(checkpoint, "checkpoint.v2", detail) ==
+          DurableIoStatus::ok;
+  if (!staged || ::setenv(
+          "DG_IGR_HDG_TEST_FINAL_DIRECTORY_SYNC_FAILURE", "1", 1) != 0)
+    return false;
+  const DurableIoStatus status = transaction.Publish(detail);
+  const int unset_status = ::unsetenv(
+      "DG_IGR_HDG_TEST_FINAL_DIRECTORY_SYNC_FAILURE");
+  const bool publication_rejected = status == DurableIoStatus::sync_failed &&
+      !transaction.published() && transaction.active();
+  const bool previous_authoritative =
+      ReadText(output / "state.vtk") == "state-old" &&
+      ReadText(checkpoint) == "checkpoint-old" &&
+      ReadText(output / "run-metadata.json") == "metadata-old";
+  const bool reverted = transaction.Revert(detail) == DurableIoStatus::ok;
+  DurableGenerationTransactionV1 probe;
+  const bool reopen = probe.Begin(output, 2, detail) == DurableIoStatus::ok &&
+      probe.Revert(detail) == DurableIoStatus::ok;
+  return unset_status == 0 && publication_rejected &&
+      previous_authoritative && reverted && reopen;
 }
 } // namespace
 
@@ -203,6 +323,14 @@ int main()
                                     static_cast<int>(index), detail),
                    "generation_process_death_is_atomic") && passed;
   }
+  for (int kind = 0; kind < 5; ++kind)
+  {
+    passed = Check(ManifestCorruptionCase(root, kind, detail),
+                   "generation_manifest_integrity_is_fail_closed") && passed;
+  }
+  passed = Check(FinalSyncFailureCase(root, detail),
+                 "final_directory_sync_failure_preserves_previous_generation") &&
+      passed;
   std::filesystem::remove_all(root, error);
   if (passed) std::cout << "HDG runtime durable I/O PASS\n";
   return passed ? 0 : 1;

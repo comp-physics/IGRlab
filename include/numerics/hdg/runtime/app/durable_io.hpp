@@ -136,6 +136,7 @@ private:
   std::filesystem::path generations_root_{};
   std::filesystem::path staging_path_{};
   std::filesystem::path final_generation_path_{};
+  std::filesystem::path previous_marker_target_{};
   std::vector<Alias> aliases_{};
   std::vector<std::filesystem::path> created_aliases_{};
   std::uint64_t generation_ = 0;

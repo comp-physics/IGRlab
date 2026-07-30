@@ -793,7 +793,7 @@ bool PublishRootTransaction(DurableGenerationTransactionV1& transaction,
     if (transaction.staged())
     {
       const DurableIoStatus status = transaction.Publish(detail);
-      local = status == DurableIoStatus::ok || transaction.published();
+      local = status == DurableIoStatus::ok;
     }
     else
       local = transaction.Revert(detail) == DurableIoStatus::ok;
