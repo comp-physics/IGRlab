@@ -130,6 +130,7 @@ ApplicationOptionsView Focused(ApplicationOptionsView options,
                            ? smooth_periodic_euler_v1_smoke_checkpoint_step
                            : UINT64_C(2),
                        source_rank};
+  options.retry_limit = smooth_periodic_euler_v1_retry_limit;
   return options;
 }
 
@@ -347,6 +348,9 @@ bool CheckNegativeRoleControls()
   request = Smoke(CpuSerialBackendTag::id);
   request.seed = 0;
   reject(request, "scenario_seed_rejected");
+  request = Focused(Smoke(CpuSerialBackendTag::id), FailurePhase::Recovery, 0);
+  request.retry_limit = 0;
+  reject(request, "focused_retry_required");
   request = Focused(Smoke(CpuSerialBackendTag::id), FailurePhase::Recovery, 0);
   request.injection.phase = FailurePhase::Commit;
   reject(request, "unlisted_focused_phase_rejected");

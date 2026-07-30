@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <iomanip>
@@ -124,6 +125,73 @@ cuda::CudaFailurePhase ToCudaPhase(const FailurePhase phase) noexcept
   return cuda::CudaFailurePhase::terminal_evidence;
 }
 
+const char* CudaPhaseName(const cuda::CudaFailurePhase phase) noexcept
+{
+  switch (phase)
+  {
+    case cuda::CudaFailurePhase::setup: return "Setup";
+    case cuda::CudaFailurePhase::assembly: return "Assembly";
+    case cuda::CudaFailurePhase::condensation: return "Condensation";
+    case cuda::CudaFailurePhase::trace_solve: return "TraceSolve";
+    case cuda::CudaFailurePhase::recovery: return "Recovery";
+    case cuda::CudaFailurePhase::after_recovery_before_commit:
+      return "AfterRecoveryBeforeCommit";
+    case cuda::CudaFailurePhase::diagnostics: return "Diagnostics";
+    case cuda::CudaFailurePhase::rollback_audit: return "RollbackAudit";
+    case cuda::CudaFailurePhase::terminal_evidence: return "TerminalEvidence";
+  }
+  return "Unknown";
+}
+
+const char* ApplicationPhaseName(const FailurePhase phase) noexcept
+{
+  switch (phase)
+  {
+    case FailurePhase::Setup: return "Setup";
+    case FailurePhase::Assembly: return "Assembly";
+    case FailurePhase::Condensation: return "Condensation";
+    case FailurePhase::TraceSolve: return "TraceSolve";
+    case FailurePhase::Recovery: return "Recovery";
+    case FailurePhase::Diagnostics: return "Diagnostics";
+    case FailurePhase::CheckpointStaging: return "CheckpointStaging";
+    case FailurePhase::OutputStaging: return "OutputStaging";
+    case FailurePhase::AfterRecoveryBeforeCommit:
+      return "AfterRecoveryBeforeCommit";
+    case FailurePhase::Commit: return "Commit";
+    case FailurePhase::RollbackAudit: return "RollbackAudit";
+    case FailurePhase::TerminalEvidence: return "TerminalEvidence";
+  }
+  return "Unknown";
+}
+
+void AppendCudaFailureProvenance(const cuda::CudaStepEvidence& evidence,
+                                 std::string& detail)
+{
+  if (!detail.empty()) detail += "; ";
+  detail += "phase=";
+  detail += CudaPhaseName(evidence.phase);
+  detail += " source_rank=" + std::to_string(evidence.source_rank);
+}
+
+void AppendApplicationFailureProvenance(const FailurePhase phase,
+                                        const int source_rank,
+                                        std::string& detail)
+{
+  if (!detail.empty()) detail += "; ";
+  detail += "phase=";
+  detail += ApplicationPhaseName(phase);
+  detail += " source_rank=" + std::to_string(source_rank);
+}
+
+bool ScientificFailureReason(const FailureReason reason) noexcept
+{
+  return reason == FailureReason::finite_gate ||
+      reason == FailureReason::admissibility_gate ||
+      reason == FailureReason::recovery_gate ||
+      reason == FailureReason::true_residual_gate ||
+      reason == FailureReason::success_gate;
+}
+
 cuda::CudaConfig MakeCudaConfig(const ValidatedApplicationConfig& config)
 {
   cuda::CudaConfig numerical{};
@@ -136,8 +204,17 @@ cuda::CudaConfig MakeCudaConfig(const ValidatedApplicationConfig& config)
       static_cast<int>(config.deferred_runtime().required_mpi_rank_count);
   numerical.require_host_staged_rank2 = numerical.expected_rank_count == 2;
   numerical.capture_oracle = false;
+  const char* const scientific_test =
+      std::getenv("DG_IGR_HDG_TEST_SCIENTIFIC_GATE_FAILURE");
+  numerical.force_private_scientific_gate_failure =
+      scientific_test != nullptr && std::string_view{scientific_test} == "1";
   if (config.injection().mode == FailureInjectionModeV1::prescribed &&
-      config.injection().phase == FailurePhase::AfterRecoveryBeforeCommit)
+      (config.injection().phase == FailurePhase::Assembly ||
+       config.injection().phase == FailurePhase::Condensation ||
+       config.injection().phase == FailurePhase::TraceSolve ||
+       config.injection().phase == FailurePhase::Recovery ||
+       config.injection().phase == FailurePhase::Diagnostics ||
+       config.injection().phase == FailurePhase::AfterRecoveryBeforeCommit))
   {
     numerical.injection = {
         ToCudaPhase(config.injection().phase),
@@ -185,35 +262,165 @@ bool GatherCheckpoints(const cuda::CudaSerializedCheckpointV1& local,
   return true;
 }
 
-std::string InitialVtk(const ValidatedApplicationConfig& config)
+struct RankStateIdentityBlock
 {
-  const int n = static_cast<int>(config.mesh_n());
-  const int points = n * n;
-  std::ostringstream output;
-  output << std::setprecision(17)
-      << "# vtk DataFile Version 3.0\n"
-      << "DG-IGR HDG exact initial visualization\nASCII\n"
-      << "DATASET POLYDATA\nPOINTS " << points << " double\n";
-  for (int j = 0; j < n; ++j)
-    for (int i = 0; i < n; ++i)
-      output << (i + 0.5) / n << ' ' << (j + 0.5) / n << " 0\n";
-  output << "VERTICES " << points << ' ' << 2 * points << "\n";
-  for (int point = 0; point < points; ++point) output << "1 " << point << '\n';
-  output << "POINT_DATA " << points
-         << "\nSCALARS density double 1\nLOOKUP_TABLE default\n";
-  constexpr double pi = 3.141592653589793238462643383279502884;
-  for (int j = 0; j < n; ++j)
-    for (int i = 0; i < n; ++i)
-    {
-      const double x = (i + 0.5) / n;
-      const double y = (j + 0.5) / n;
-      output << 1.0 + 0.1 * std::sin(2.0 * pi * x) *
-                              std::sin(2.0 * pi * y) << '\n';
-    }
-  return output.str();
+  std::uint64_t interior_count = 0;
+  std::uint64_t trace_count = 0;
+  StateHash interior{};
+  StateHash trace{};
+};
+
+bool GlobalCudaStateIdentity(
+    const cuda::CudaSerializedCheckpointV1& local,
+    const CudaApplicationContextV1& context,
+    StateHash& identity, std::string& detail) noexcept
+{
+  static_assert(std::is_trivially_copyable<RankStateIdentityBlock>::value,
+                "rank state identity is MPI-byte transportable");
+  const RankStateIdentityBlock block{
+      local.interior_count, local.owned_true_trace_count,
+      local.local_interior_hash, local.local_trace_hash};
+  std::array<RankStateIdentityBlock, 2> rank_ordered{};
+  const bool gathered = MPI_Allgather(
+      &block, static_cast<int>(sizeof(block)), MPI_BYTE,
+      rank_ordered.data(), static_cast<int>(sizeof(block)), MPI_BYTE,
+      context.communicator()) == MPI_SUCCESS;
+  if (!CollectiveAll(gathered, context.communicator()))
+  {
+    detail = "rank-ordered CUDA state identity gather failed";
+    return false;
+  }
+  identity.bytes = ComputeSha256(
+      rank_ordered.data(), static_cast<std::size_t>(context.ranks()) *
+          sizeof(RankStateIdentityBlock));
+  return identity != StateHash{};
 }
 
-bool CandidateVtk(const cuda::CudaSerializedCheckpointV1& local,
+bool MakePhysicalVtk(
+    const ValidatedApplicationConfig& config,
+    const std::vector<cuda::CudaSerializedCheckpointV1>* rank_states,
+    std::string& vtk, std::string& detail)
+{
+  try
+  {
+    const int n = static_cast<int>(config.mesh_n());
+    mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+        n, n, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+    std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+    translations[0][0] = 1.0;
+    translations[1][1] = 1.0;
+    mfem::Mesh mesh = mfem::Mesh::MakePeriodic(
+        original, original.CreatePeriodicVertexMapping(translations));
+    mfem::L2_FECollection collection(
+        config.polynomial_order(), 2, mfem::BasisType::GaussLegendre,
+        mfem::FiniteElement::VALUE);
+    mfem::FiniteElementSpace space(
+        &mesh, &collection, 4, mfem::Ordering::byNODES);
+    mfem::GridFunction field(&space);
+    field = 0.0;
+    if (rank_states == nullptr)
+    {
+      auto exact = [](const mfem::Vector& point, mfem::Vector& state)
+      {
+        state.SetSize(4);
+        double values[4]{};
+        cuda::detail::CudaManufacturedState(point[0], point[1], values);
+        for (int component = 0; component < 4; ++component)
+          state[component] = values[component];
+      };
+      mfem::VectorFunctionCoefficient coefficient(4, exact);
+      field.ProjectCoefficient(coefficient);
+    }
+    else
+    {
+      double* const field_values = field.HostWrite();
+      if (field_values == nullptr && field.Size() != 0)
+      {
+        detail = "CUDA VTK host field storage is unavailable";
+        return false;
+      }
+      std::fill_n(field_values, field.Size(), 0.0);
+      const int ranks = static_cast<int>(rank_states->size());
+      if (ranks != 1 && ranks != 2)
+      {
+        detail = "CUDA VTK rank count is invalid";
+        return false;
+      }
+      const int global_elements = n * n;
+      std::array<int, 2> local_elements{};
+      for (int element = 0; element < global_elements; ++element)
+      {
+        const int owner = element * ranks / global_elements;
+        const auto& source = (*rank_states)[static_cast<std::size_t>(owner)];
+        const mfem::FiniteElement* finite_element = space.GetFE(element);
+        if (finite_element == nullptr)
+        {
+          detail = "CUDA VTK finite element is unavailable";
+          return false;
+        }
+        const int scalar_dofs = finite_element->GetDof();
+        const int element_dofs = 4 * scalar_dofs;
+        const std::size_t source_offset = static_cast<std::size_t>(
+            local_elements[static_cast<std::size_t>(owner)]++) *
+            static_cast<std::size_t>(element_dofs);
+        if (source_offset + static_cast<std::size_t>(element_dofs) >
+            source.interior_count)
+        {
+          detail = "CUDA VTK rank-local state extent is incomplete";
+          return false;
+        }
+        mfem::Array<int> vector_dofs;
+        space.GetElementVDofs(element, vector_dofs);
+        if (vector_dofs.Size() != element_dofs)
+        {
+          detail = "CUDA VTK element map extent is invalid";
+          return false;
+        }
+        for (int component = 0; component < 4; ++component)
+          for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+          {
+            const int local = scalar + component * scalar_dofs;
+            const int encoded = vector_dofs[local];
+            const int destination = encoded >= 0 ? encoded : -1 - encoded;
+            const double sign = encoded >= 0 ? 1.0 : -1.0;
+            field_values[destination] = sign * source.interior[
+                source_offset + static_cast<std::size_t>(local)];
+          }
+      }
+      for (int rank = 0; rank < ranks; ++rank)
+      {
+        const auto& source = (*rank_states)[static_cast<std::size_t>(rank)];
+        const int expected_elements =
+            (global_elements * (rank + 1) + ranks - 1) / ranks -
+            (global_elements * rank + ranks - 1) / ranks;
+        const std::size_t expected = static_cast<std::size_t>(
+            expected_elements * 4 *
+            (config.polynomial_order() + 1) *
+            (config.polynomial_order() + 1));
+        if (source.source_rank != rank || source.rank_count != ranks ||
+            source.interior_count != expected)
+        {
+          detail = "CUDA VTK rank-ordered state census is invalid";
+          return false;
+        }
+      }
+    }
+    std::ostringstream output;
+    output << std::setprecision(17);
+    mesh.PrintVTK(output, 1, 1);
+    field.SaveVTK(output, "conservative", 1);
+    vtk = output.str();
+    return output.good();
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    return false;
+  }
+}
+
+bool CandidateVtk(const ValidatedApplicationConfig& config,
+                  const cuda::CudaSerializedCheckpointV1& local,
                   const CudaApplicationContextV1& context,
                   std::string& vtk, std::string& detail)
 {
@@ -221,49 +428,7 @@ bool CandidateVtk(const cuda::CudaSerializedCheckpointV1& local,
   if (!GatherCheckpoints(local, context, ranks, detail)) return false;
   bool built = true;
   if (context.rank() == 0)
-  {
-    try
-    {
-      std::uint64_t dofs = 0;
-      for (const auto& rank : ranks)
-      {
-        if (rank.interior_count % 4 != 0)
-        {
-          detail = "CUDA component-major checkpoint extent is invalid";
-          built = false;
-          break;
-        }
-        dofs += rank.interior_count / 4;
-      }
-      if (built)
-      {
-        std::ostringstream output;
-        output << std::setprecision(17)
-            << "# vtk DataFile Version 3.0\n"
-            << "DG-IGR HDG committed coefficient visualization\nASCII\n"
-            << "DATASET POLYDATA\nPOINTS " << dofs << " double\n";
-        for (std::uint64_t point = 0; point < dofs; ++point)
-          output << point << " 0 0\n";
-        output << "VERTICES " << dofs << ' ' << 2 * dofs << "\n";
-        for (std::uint64_t point = 0; point < dofs; ++point)
-          output << "1 " << point << '\n';
-        output << "POINT_DATA " << dofs
-               << "\nFIELD conservative 1\nU 4 " << dofs << " double\n";
-        for (const auto& rank : ranks)
-        {
-          const std::uint64_t local_dofs = rank.interior_count / 4;
-          for (std::uint64_t dof = 0; dof < local_dofs; ++dof)
-            output << rank.interior[dof] << ' '
-                   << rank.interior[local_dofs + dof] << ' '
-                   << rank.interior[2 * local_dofs + dof] << ' '
-                   << rank.interior[3 * local_dofs + dof] << '\n';
-        }
-        vtk = output.str();
-        built = output.good();
-      }
-    }
-    catch (...) { built = false; }
-  }
+    built = MakePhysicalVtk(config, &ranks, vtk, detail);
   return CollectiveAll(built, context.communicator());
 }
 
@@ -321,42 +486,70 @@ bool EncodeCheckpoint(const ValidatedApplicationConfig& config,
   return CollectiveAll(encoded_ok, context.communicator());
 }
 
-bool StageRootFile(DurableStagedFileV1& file,
-                   const std::filesystem::path& path,
+bool StageRootArtifact(DurableGenerationTransactionV1& transaction,
+                   const std::string_view logical_name,
                    const std::vector<std::uint8_t>& bytes,
                    const CudaApplicationContextV1& context,
                    std::string& detail)
 {
   bool local = true;
   if (context.rank() == 0)
-    local = file.Stage(path, bytes.data(), bytes.size(), detail) ==
+    local = transaction.Stage(logical_name, bytes.data(), bytes.size(), detail) ==
         DurableIoStatus::ok;
   return CollectiveAll(local, context.communicator());
 }
 
-bool PublishRootFile(DurableStagedFileV1& file,
+bool BeginRootTransaction(DurableGenerationTransactionV1& transaction,
+                     const std::filesystem::path& output_directory,
+                     const std::uint64_t generation,
                      const CudaApplicationContextV1& context,
                      std::string& detail)
 {
   bool local = true;
-  if (context.rank() == 0 && file.staged())
-    local = file.Publish(detail) == DurableIoStatus::ok;
+  if (context.rank() == 0)
+    local = transaction.Begin(output_directory, generation, detail) ==
+        DurableIoStatus::ok;
   return CollectiveAll(local, context.communicator());
 }
 
-bool RevertTransaction(DurableStagedFileV1& vtk,
-                       DurableStagedFileV1& checkpoint,
-                       DurableStagedFileV1& metadata,
+bool AddRootAlias(DurableGenerationTransactionV1& transaction,
+                  const std::filesystem::path& alias_path,
+                  const std::string_view logical_name,
+                  const CudaApplicationContextV1& context,
+                  std::string& detail)
+{
+  bool local = true;
+  if (context.rank() == 0)
+    local = transaction.AddAlias(alias_path, logical_name, detail) ==
+        DurableIoStatus::ok;
+  return CollectiveAll(local, context.communicator());
+}
+
+bool PublishRootTransaction(DurableGenerationTransactionV1& transaction,
+                            const CudaApplicationContextV1& context,
+                            std::string& detail)
+{
+  bool local = true;
+  if (context.rank() == 0)
+  {
+    if (transaction.staged())
+    {
+      const DurableIoStatus status = transaction.Publish(detail);
+      local = status == DurableIoStatus::ok || transaction.published();
+    }
+    else
+      local = transaction.Revert(detail) == DurableIoStatus::ok;
+  }
+  return CollectiveAll(local, context.communicator());
+}
+
+bool RevertTransaction(DurableGenerationTransactionV1& transaction,
                        const CudaApplicationContextV1& context,
                        std::string& detail)
 {
   bool local = true;
   if (context.rank() == 0)
-  {
-    local = vtk.Revert(detail) == DurableIoStatus::ok;
-    local = checkpoint.Revert(detail) == DurableIoStatus::ok && local;
-    local = metadata.Revert(detail) == DurableIoStatus::ok && local;
-  }
+    local = transaction.Revert(detail) == DurableIoStatus::ok;
   return CollectiveAll(local, context.communicator());
 }
 
@@ -549,7 +742,7 @@ std::optional<ValidatedApplicationConfig> CheckpointWriterConfig(
     const ValidatedApplicationConfig& config)
 {
   if (!config.checkpoint_out().present()) return std::nullopt;
-  if (config.run_role() != ApplicationRunRoleV1::uninterrupted_reference)
+  if (config.run_role() == ApplicationRunRoleV1::split_writer)
     return config;
   ApplicationOptionsView writer = request;
   writer.run_role = ApplicationRunRoleV1::split_writer;
@@ -570,6 +763,7 @@ std::string Metadata(const ValidatedApplicationConfig& config,
                      const cuda::CudaRunEvidence& setup,
                      const StateHash& final_interior,
                      const StateHash& final_trace,
+                     const StateHash& global_state,
                      const std::string& detail)
 {
   std::ostringstream output;
@@ -587,6 +781,7 @@ std::string Metadata(const ValidatedApplicationConfig& config,
       << "  \"final_interior_sha256\": \"" << Hex(final_interior)
       << "\",\n"
       << "  \"final_trace_sha256\": \"" << Hex(final_trace) << "\",\n"
+      << "  \"global_state_sha256\": \"" << Hex(global_state) << "\",\n"
       << "  \"diagnostic\": \"" << detail << "\"\n}\n";
   return output.str();
 }
@@ -682,28 +877,29 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
         engine->contract() != nullptr &&
         engine->contract()->coordinates().step == 0 && OutputStep(config, 0))
     {
-      DurableStagedFileV1 initial_file;
+      DurableGenerationTransactionV1 initial_transaction;
       std::vector<std::uint8_t> initial_bytes;
       bool initial_ready = true;
       if (context.rank() == 0)
       {
         try
         {
-          const std::string initial = InitialVtk(config);
-          initial_bytes.assign(initial.begin(), initial.end());
+          std::string initial;
+          initial_ready = MakePhysicalVtk(config, nullptr, initial, detail);
+          if (initial_ready)
+            initial_bytes.assign(initial.begin(), initial.end());
         }
         catch (...) { initial_ready = false; }
       }
       initial_ready = CollectiveAll(initial_ready, context.communicator()) &&
-          StageRootFile(initial_file, output_directory / StepName(0),
-                        initial_bytes, context, detail) &&
-          PublishRootFile(initial_file, context, detail);
+          BeginRootTransaction(initial_transaction, output_directory, 0,
+                               context, detail) &&
+          StageRootArtifact(initial_transaction, StepName(0), initial_bytes,
+                            context, detail) &&
+          PublishRootTransaction(initial_transaction, context, detail);
       if (!initial_ready)
       {
-        bool cleaned = true;
-        if (context.rank() == 0)
-          cleaned = initial_file.Revert(detail) == DurableIoStatus::ok;
-        (void)CollectiveAll(cleaned, context.communicator());
+        (void)RevertTransaction(initial_transaction, context, detail);
         result.status = RunStatus::terminal_failure;
         result.reason = FailureReason::backend_failure;
         result.failure_class = ApplicationRunResult::FailureClass::filesystem;
@@ -727,10 +923,29 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
       retry = false;
       if (!prepared)
       {
+        const bool numerical_injection_fired =
+            config.injection().mode == FailureInjectionModeV1::prescribed &&
+            config.injection().target_step == target &&
+            evidence.phase == ToCudaPhase(config.injection().phase) &&
+            evidence.source_rank ==
+                static_cast<int>(config.injection().source_rank);
+        if (evidence.retry_available &&
+            result.retries < config.retry_limit())
+        {
+          if (numerical_injection_fired)
+            AppendCudaFailureProvenance(evidence, detail);
+          ++result.retries;
+          retry = true;
+          continue;
+        }
         result.status = RunStatus::terminal_failure;
         result.reason = evidence.contract_reason == FailureReason::none
             ? FailureReason::backend_failure : evidence.contract_reason;
-        result.failure_class = ApplicationRunResult::FailureClass::backend;
+        result.failure_class = numerical_injection_fired
+            ? ApplicationRunResult::FailureClass::injected
+            : (ScientificFailureReason(result.reason)
+                   ? ApplicationRunResult::FailureClass::scientific
+                   : ApplicationRunResult::FailureClass::backend);
         detail = "CUDA candidate preparation failed";
         break;
       }
@@ -739,17 +954,17 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
           config.injection().target_step == target;
       const FailurePhase injection_phase = inject_now
           ? config.injection().phase : FailurePhase::Setup;
-      DurableStagedFileV1 vtk_file;
-      DurableStagedFileV1 checkpoint_file;
-      DurableStagedFileV1 metadata_file;
+      DurableGenerationTransactionV1 transaction;
       std::vector<std::uint8_t> vtk_bytes;
       std::vector<std::uint8_t> checkpoint_bytes;
       std::vector<std::uint8_t> metadata_bytes;
-      bool staged = injection_phase != FailurePhase::CheckpointStaging &&
+      bool staged = BeginRootTransaction(
+          transaction, output_directory, target, context, detail) &&
+          injection_phase != FailurePhase::CheckpointStaging &&
           engine->StagePreparedCheckpoint(checkpoint, evidence);
       std::string vtk;
       if (staged && OutputStep(config, target))
-        staged = CandidateVtk(checkpoint, context, vtk, detail);
+        staged = CandidateVtk(config, checkpoint, context, vtk, detail);
       if (staged && context.rank() == 0 && !vtk.empty())
       {
         try { vtk_bytes.assign(vtk.begin(), vtk.end()); }
@@ -757,29 +972,46 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
       }
       staged = CollectiveAll(staged, context.communicator());
       if (staged && OutputStep(config, target))
-        staged = StageRootFile(vtk_file, output_directory / StepName(target),
-                               vtk_bytes, context, detail);
+        staged = StageRootArtifact(transaction, StepName(target), vtk_bytes,
+                                   context, detail);
       if (staged && config.checkpoint_out().present() &&
           target == config.scenario_checkpoint_step())
       {
         staged = checkpoint_writer && EncodeCheckpoint(
             *checkpoint_writer, checkpoint, setup,
             engine->contract()->resources(), context, checkpoint_bytes,
-            detail) && StageRootFile(
-                checkpoint_file,
-                std::string{config.checkpoint_out().identity().view()},
-                checkpoint_bytes, context, detail);
+            detail) && StageRootArtifact(
+                transaction, "restart-checkpoint.v2", checkpoint_bytes,
+                context, detail) && AddRootAlias(
+                    transaction,
+                    std::string{config.checkpoint_out().identity().view()},
+                    "restart-checkpoint.v2", context, detail);
       }
       if (injection_phase == FailurePhase::OutputStaging) staged = false;
       if (staged) staged = engine->MarkOutputStaged(checkpoint);
       if (!staged)
       {
-        const bool cleaned = RevertTransaction(
-            vtk_file, checkpoint_file, metadata_file, context, detail);
+        const bool cleaned = RevertTransaction(transaction, context, detail);
+        const FailureReason abort_reason =
+            evidence.contract_reason == FailureReason::none
+            ? FailureReason::backend_failure : evidence.contract_reason;
         const bool retry_available = cleaned && engine->AbortPrepared(
-            checkpoint, FailureReason::backend_failure, evidence);
+            checkpoint, abort_reason, evidence);
+        const bool numerical_injection_fired = inject_now &&
+            evidence.phase == ToCudaPhase(config.injection().phase) &&
+            evidence.source_rank ==
+                static_cast<int>(config.injection().source_rank);
+        const bool outer_stage_injection_fired = inject_now &&
+            (injection_phase == FailurePhase::CheckpointStaging ||
+             injection_phase == FailurePhase::OutputStaging);
         if (retry_available && result.retries < config.retry_limit())
         {
+          if (numerical_injection_fired)
+            AppendCudaFailureProvenance(evidence, detail);
+          else if (outer_stage_injection_fired)
+            AppendApplicationFailureProvenance(
+                injection_phase,
+                static_cast<int>(config.injection().source_rank), detail);
           ++result.retries;
           retry = true;
           continue;
@@ -787,17 +1019,19 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
         result.status = RunStatus::terminal_failure;
         result.reason = evidence.contract_reason == FailureReason::none
             ? FailureReason::backend_failure : evidence.contract_reason;
-        result.failure_class = inject_now
+        result.failure_class = numerical_injection_fired ||
+                outer_stage_injection_fired
             ? ApplicationRunResult::FailureClass::injected
-            : (cleaned ? ApplicationRunResult::FailureClass::backend
+            : (cleaned ? (ScientificFailureReason(result.reason)
+                              ? ApplicationRunResult::FailureClass::scientific
+                              : ApplicationRunResult::FailureClass::backend)
                        : ApplicationRunResult::FailureClass::filesystem);
         if (detail.empty()) detail = "CUDA attempt rolled back before commit";
         break;
       }
       if (!engine->PrepareCommit(checkpoint, evidence))
       {
-        const bool cleaned = RevertTransaction(
-            vtk_file, checkpoint_file, metadata_file, context, detail);
+        const bool cleaned = RevertTransaction(transaction, context, detail);
         if (cleaned && evidence.retry_available &&
             result.retries < config.retry_limit())
         {
@@ -809,7 +1043,9 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
         result.reason = evidence.contract_reason == FailureReason::none
             ? FailureReason::backend_failure : evidence.contract_reason;
         result.failure_class = cleaned
-            ? ApplicationRunResult::FailureClass::backend
+            ? (ScientificFailureReason(result.reason)
+                   ? ApplicationRunResult::FailureClass::scientific
+                   : ApplicationRunResult::FailureClass::backend)
             : ApplicationRunResult::FailureClass::filesystem;
         detail = "CUDA prepare-commit failed";
         break;
@@ -823,31 +1059,31 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
         anticipated.reason = FailureReason::none;
         anticipated.failure_class = ApplicationRunResult::FailureClass::none;
         anticipated.coordinates = snapshot.target;
-        bool metadata_ready = true;
+        StateHash global_state{};
+        bool metadata_ready = GlobalCudaStateIdentity(
+            checkpoint, context, global_state, detail);
         if (context.rank() == 0)
         {
           try
           {
             const std::string metadata = Metadata(
                 config, anticipated, setup, snapshot.candidate_interior_hash,
-                snapshot.candidate_trace_hash, detail);
+                snapshot.candidate_trace_hash, global_state, detail);
             metadata_bytes.assign(metadata.begin(), metadata.end());
           }
           catch (...) { metadata_ready = false; }
         }
         metadata_ready = CollectiveAll(metadata_ready,
                                        context.communicator()) &&
-            StageRootFile(metadata_file,
-                          output_directory /
-                              (config.run_role() ==
-                                       ApplicationRunRoleV1::split_writer
-                                   ? "run-metadata-checkpoint.json"
-                                   : "run-metadata.json"),
+            StageRootArtifact(transaction,
+                          config.run_role() ==
+                                  ApplicationRunRoleV1::split_writer
+                              ? "run-metadata-checkpoint.json"
+                              : "run-metadata.json",
                           metadata_bytes, context, detail);
         if (!metadata_ready)
         {
-          const bool cleaned = RevertTransaction(
-              vtk_file, checkpoint_file, metadata_file, context, detail);
+          const bool cleaned = RevertTransaction(transaction, context, detail);
           const bool retry_available = cleaned && engine->AbortPrepared(
               checkpoint, FailureReason::backend_failure, evidence);
           if (retry_available && result.retries < config.retry_limit())
@@ -869,8 +1105,7 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
       if (injection_phase == FailurePhase::Commit ||
           injection_phase == FailurePhase::TerminalEvidence)
       {
-        const bool cleaned = RevertTransaction(
-            vtk_file, checkpoint_file, metadata_file, context, detail);
+        const bool cleaned = RevertTransaction(transaction, context, detail);
         const bool retry_available = cleaned && engine->AbortPrepared(
             checkpoint, FailureReason::backend_failure, evidence);
         if (retry_available && result.retries < config.retry_limit())
@@ -888,8 +1123,7 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
 
       if (!engine->CommitPrepared(checkpoint, evidence))
       {
-        const bool cleaned = RevertTransaction(
-            vtk_file, checkpoint_file, metadata_file, context, detail);
+        const bool cleaned = RevertTransaction(transaction, context, detail);
         if (cleaned && evidence.retry_available &&
             result.retries < config.retry_limit())
         {
@@ -901,7 +1135,9 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
         result.reason = evidence.contract_reason == FailureReason::none
             ? FailureReason::backend_failure : evidence.contract_reason;
         result.failure_class = cleaned
-            ? ApplicationRunResult::FailureClass::backend
+            ? (ScientificFailureReason(result.reason)
+                   ? ApplicationRunResult::FailureClass::scientific
+                   : ApplicationRunResult::FailureClass::backend)
             : ApplicationRunResult::FailureClass::filesystem;
         detail = "CUDA provisional commit failed";
         break;
@@ -909,9 +1145,7 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
 
       if (injection_phase == FailurePhase::RollbackAudit)
       {
-        (void)PublishRootFile(vtk_file, context, detail);
-        const bool cleaned = RevertTransaction(
-            vtk_file, checkpoint_file, metadata_file, context, detail);
+        const bool cleaned = RevertTransaction(transaction, context, detail);
         const bool retry_available = engine->RevertCommit(
             checkpoint, FailureReason::backend_failure, evidence);
         if (cleaned && retry_available &&
@@ -928,13 +1162,12 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
         break;
       }
 
-      const bool published = PublishRootFile(vtk_file, context, detail) &&
-          PublishRootFile(checkpoint_file, context, detail) &&
-          PublishRootFile(metadata_file, context, detail);
+      const bool published = PublishRootTransaction(
+          transaction, context, detail);
       if (!published)
       {
-        const bool cleaned = RevertTransaction(
-            vtk_file, checkpoint_file, metadata_file, context, detail);
+        const bool cleaned = transaction.published()
+            ? true : RevertTransaction(transaction, context, detail);
         const bool retry_available = engine->RevertCommit(
             checkpoint, FailureReason::backend_failure, evidence);
         if (cleaned && retry_available &&
@@ -952,13 +1185,15 @@ ApplicationRunResult RunCuda(const ApplicationOptionsView& request,
       }
       if (!engine->FinalizeCommit(checkpoint, evidence))
       {
-        const bool cleaned = RevertTransaction(
-            vtk_file, checkpoint_file, metadata_file, context, detail);
+        const bool cleaned = transaction.published()
+            ? true : RevertTransaction(transaction, context, detail);
         result.status = RunStatus::terminal_failure;
         result.reason = evidence.contract_reason == FailureReason::none
             ? FailureReason::backend_failure : evidence.contract_reason;
         result.failure_class = cleaned
-            ? ApplicationRunResult::FailureClass::backend
+            ? (ScientificFailureReason(result.reason)
+                   ? ApplicationRunResult::FailureClass::scientific
+                   : ApplicationRunResult::FailureClass::backend)
             : ApplicationRunResult::FailureClass::filesystem;
         detail = "CUDA logical finalization failed";
         break;

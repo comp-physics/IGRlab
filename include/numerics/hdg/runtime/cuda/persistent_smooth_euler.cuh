@@ -1094,8 +1094,14 @@ private:
     const bool functional_shape =
         config_.order == functional_polynomial_order &&
         config_.mesh_n == functional_elements_per_direction;
-    const std::uint64_t injected_step = functional_shape
-        ? functional_injected_step : 2;
+    const bool numerical_injection_phase =
+        config_.injection.phase == CudaFailurePhase::assembly ||
+        config_.injection.phase == CudaFailurePhase::condensation ||
+        config_.injection.phase == CudaFailurePhase::trace_solve ||
+        config_.injection.phase == CudaFailurePhase::recovery ||
+        config_.injection.phase == CudaFailurePhase::diagnostics ||
+        config_.injection.phase ==
+            CudaFailurePhase::after_recovery_before_commit;
     return config_.experiment == StableIdentity::Copy(experiment_id) &&
         (smoke_shape || functional_shape) &&
         std::isfinite(config_.dt) &&
@@ -1106,9 +1112,8 @@ private:
         (config_.expected_rank_count == 1 ||
          config_.require_host_staged_rank2) &&
         (!config_.injection.enabled ||
-         (config_.injection.phase ==
-              CudaFailurePhase::after_recovery_before_commit &&
-          config_.injection.target_step == injected_step &&
+         (numerical_injection_phase &&
+          config_.injection.target_step != 0 &&
           config_.injection.source_rank >= 0 &&
           config_.injection.source_rank < config_.expected_rank_count)) &&
         detail::ExactSelection<Selection>(config_);
@@ -1260,19 +1265,20 @@ private:
     typename contract_type::ProductBundle bundle{};
     detail::CudaNumericalResult adjusted = numerical;
     IssueProducts(begin.attempt, adjusted, bundle);
-    bool stored = false;
-    if (adjusted.candidate_ready)
+    if (!numerics_.CollectiveContinue(adjusted.candidate_ready))
     {
-      const auto capability = contract_->AcquireCandidate(begin.attempt);
-      stored = capability && contract_->StoreCandidate(*capability, workspace);
-      if (!stored)
-      {
-        adjusted.success = false;
-        adjusted.telemetry = false;
-        adjusted.reason = FailureReason::candidate_preparation;
-      }
+      return FinishNumericalFailure(begin.attempt, adjusted, evidence);
     }
-    if (!numerics_.CollectiveContinue(adjusted.candidate_ready && stored))
+    bool stored = false;
+    const auto capability = contract_->AcquireCandidate(begin.attempt);
+    stored = capability && contract_->StoreCandidate(*capability, workspace);
+    if (!stored)
+    {
+      adjusted.success = false;
+      adjusted.telemetry = false;
+      adjusted.reason = FailureReason::candidate_preparation;
+    }
+    if (!numerics_.CollectiveContinue(stored))
     {
       return FinishBackendFailure(begin.attempt, evidence,
                                   CudaFailurePhase::after_recovery_before_commit);
@@ -1446,6 +1452,60 @@ private:
     evidence.status = CudaRunStatus::ready;
     evidence.contract_reason = FailureReason::backend_failure;
     evidence.after = evidence.before;
+    pending_.evidence = evidence;
+    const AttemptOutcome outcome = contract_->FinishAttempt(
+        attempt, report, std::move(pending_.bundle));
+    FinishOutcome(outcome, pending_.evidence);
+    evidence = pending_.evidence;
+    ClearConsumedPending();
+    return false;
+  }
+
+  bool FinishNumericalFailure(
+      const AttemptIdentity& attempt,
+      const detail::CudaNumericalResult& numerical,
+      CudaStepEvidence& evidence) noexcept
+  {
+    const CudaTransferTotals totals = TransportPolicy::Accounting();
+    const FailureReason reason = numerical.reason == FailureReason::none
+        ? FailureReason::backend_failure : numerical.reason;
+    AttemptReport report{};
+    report.gates = {numerical.finite, numerical.admissible,
+                    numerical.recovery, numerical.true_residual,
+                    numerical.telemetry && numerics_.NoFallback(), false};
+    report.telemetry.identity = attempt;
+    report.telemetry.transfers = ProjectSharedAccounting(
+        totals, AllocatorPolicy::W8OwnedAllocationCalls() -
+                    pending_.w8_owned_allocation_begin);
+    report.telemetry.prohibited.fallback_events =
+        numerics_.NoFallback() ? 0 : 1;
+    report.telemetry.true_relative_residual =
+        numerical.true_relative_residual;
+    report.candidate_cursor = attempt.sequence;
+    report.originating_failure = reason;
+    pending_.active = true;
+    pending_.prestage_allowed = false;
+    pending_.attempt = attempt;
+    pending_.report = report;
+    pending_.bundle = {};
+    pending_.numerical = numerical;
+    evidence.phase = numerical.phase;
+    evidence.contract_reason = reason;
+    evidence.after = evidence.before;
+    evidence.products = numerical.products;
+    evidence.transfers = totals;
+    evidence.initial_residual = numerical.initial_residual;
+    evidence.final_residual = numerical.final_residual;
+    evidence.true_relative_residual = numerical.true_relative_residual;
+    evidence.nonlinear_updates = numerical.nonlinear_updates;
+    evidence.trace_solves = numerical.trace_solves;
+    evidence.source_rank = numerical.injection_source_rank;
+    evidence.device_ticket_count = numerics_.TicketCount();
+    std::copy_n(numerics_.Tickets().begin(), evidence.device_ticket_count,
+                evidence.device_tickets.begin());
+    evidence.no_fallback = numerics_.NoFallback();
+    evidence.device_resident = numerics_.DeviceResident();
+    evidence.status = CudaRunStatus::ready;
     pending_.evidence = evidence;
     const AttemptOutcome outcome = contract_->FinishAttempt(
         attempt, report, std::move(pending_.bundle));

@@ -35,9 +35,64 @@ function(run_runtime prefix)
   set(${prefix}_error "${error}" PARENT_SCOPE)
 endfunction()
 
+function(run_private_scientific_gate prefix)
+  if(HDG_RUNTIME_RANKS EQUAL 1)
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E env
+        DG_IGR_HDG_TEST_SCIENTIFIC_GATE_FAILURE=1
+        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+      RESULT_VARIABLE status
+      OUTPUT_VARIABLE output
+      ERROR_VARIABLE error)
+  else()
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E env
+        DG_IGR_HDG_TEST_SCIENTIFIC_GATE_FAILURE=1
+        "${HDG_RUNTIME_MPIEXEC}" "${HDG_RUNTIME_NUMPROC_FLAG}" 2
+        ${HDG_RUNTIME_MPIEXEC_PREFLAGS}
+        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+        ${HDG_RUNTIME_MPIEXEC_POSTFLAGS}
+      RESULT_VARIABLE status
+      OUTPUT_VARIABLE output
+      ERROR_VARIABLE error)
+  endif()
+  set(${prefix}_status "${status}" PARENT_SCOPE)
+  set(${prefix}_output "${output}" PARENT_SCOPE)
+  set(${prefix}_error "${error}" PARENT_SCOPE)
+endfunction()
+
 function(require_regular_file path label)
   if(NOT EXISTS "${path}" OR IS_DIRECTORY "${path}")
     message(FATAL_ERROR "missing ${label}: ${path}")
+  endif()
+endfunction()
+
+function(validate_physical_vtk path mesh_n label)
+  file(READ "${path}" vtk)
+  file(STRINGS "${path}" vtk_lines)
+  math(EXPR elements "${mesh_n} * ${mesh_n}")
+  math(EXPR points "4 * ${elements}")
+  string(FIND "${vtk}" "0 0 0" origin_position)
+  string(FIND "${vtk}" "1 1 0" corner_position)
+  if(NOT vtk MATCHES "DATASET UNSTRUCTURED_GRID" OR
+     NOT vtk MATCHES "POINTS ${points} double" OR
+     NOT vtk MATCHES "CELLS ${elements} " OR
+     NOT vtk MATCHES "SCALARS conservative0 double 1" OR
+     NOT vtk MATCHES "SCALARS conservative1 double 1" OR
+     NOT vtk MATCHES "SCALARS conservative2 double 1" OR
+     NOT vtk MATCHES "SCALARS conservative3 double 1" OR
+     origin_position LESS 0 OR corner_position LESS 0)
+    message(FATAL_ERROR "${label} is not a physical four-component FE VTK")
+  endif()
+  list(FIND vtk_lines "SCALARS conservative0 double 1" density_header)
+  list(FIND vtk_lines "SCALARS conservative3 double 1" energy_header)
+  math(EXPR density_index "${density_header} + 2")
+  math(EXPR energy_index "${energy_header} + 2")
+  list(GET vtk_lines ${density_index} density)
+  list(GET vtk_lines ${energy_index} energy)
+  if(density STREQUAL "" OR energy STREQUAL "" OR
+     density LESS_EQUAL 0.0 OR energy LESS_EQUAL 0.0)
+    message(FATAL_ERROR "${label} has invalid selected conservative values")
   endif()
 endfunction()
 
@@ -122,6 +177,15 @@ if(HDG_RUNTIME_FUNCTIONAL)
   foreach(path IN LISTS functional_publications)
     require_regular_file("${path}" "functional publication")
   endforeach()
+  validate_physical_vtk(
+    "${reference_directory}/state-step-000000.vtk" 6
+    "functional initial generation")
+  validate_physical_vtk(
+    "${reference_directory}/state-step-000010.vtk" 6
+    "functional intermediate generation")
+  validate_physical_vtk(
+    "${reference_directory}/state-step-000020.vtk" 6
+    "functional final generation")
 
   file(SHA256 "${reference_directory}/state-step-000020.vtk" reference_vtk_hash)
   file(SHA256 "${reader_directory}/state-step-000020.vtk" reader_vtk_hash)
@@ -169,6 +233,48 @@ if(HDG_RUNTIME_FUNCTIONAL)
      NOT state_parity OR NOT reader_metadata MATCHES "\"status\": \"Success\"" OR
      NOT reader_metadata MATCHES "\"retries\": 1")
     message(FATAL_ERROR "functional restart/retry parity contract failed")
+  endif()
+  if(HDG_RUNTIME_BACKEND STREQUAL "cuda")
+    if(NOT DEFINED HDG_RUNTIME_SCIENTIFIC_TEST)
+      message(FATAL_ERROR "CUDA field parity comparator is unavailable")
+    endif()
+    set(cpu_directory "${HDG_RUNTIME_TEST_OUTPUT}-cpu-parity")
+    set(cpu_checkpoint "${HDG_RUNTIME_TEST_OUTPUT}-cpu-parity.checkpoint")
+    file(REMOVE_RECURSE "${cpu_directory}")
+    file(REMOVE "${cpu_checkpoint}")
+    set(cpu_functional_common ${functional_common})
+    list(FIND cpu_functional_common --backend backend_option_index)
+    list(FIND cpu_functional_common --device-id device_option_index)
+    math(EXPR backend_value_index "${backend_option_index} + 1")
+    math(EXPR device_value_index "${device_option_index} + 1")
+    list(REMOVE_AT cpu_functional_common ${backend_value_index})
+    list(INSERT cpu_functional_common ${backend_value_index} cpu)
+    list(REMOVE_AT cpu_functional_common ${device_value_index})
+    list(INSERT cpu_functional_common ${device_value_index} none)
+    run_runtime(cpu_reference ${cpu_functional_common}
+      --output-dir "${cpu_directory}"
+      --checkpoint-out "${cpu_checkpoint}" --checkpoint-step 10
+      --stop-after-checkpoint false --restart-from none
+      --max-retries 0 --inject-failure off)
+    if(NOT cpu_reference_status EQUAL 0 OR
+       NOT cpu_reference_output MATCHES "status=Success.*step=20" OR
+       NOT cpu_reference_error STREQUAL "")
+      message(FATAL_ERROR
+        "CPU parity trajectory failed: ${cpu_reference_status};${cpu_reference_output};${cpu_reference_error}")
+    endif()
+    foreach(step IN ITEMS 000000 000010 000020)
+      execute_process(
+        COMMAND "${HDG_RUNTIME_SCIENTIFIC_TEST}" --compare-vtk
+          "${cpu_directory}/state-step-${step}.vtk"
+          "${reference_directory}/state-step-${step}.vtk" 2e-8
+        RESULT_VARIABLE compare_status
+        OUTPUT_VARIABLE compare_output
+        ERROR_VARIABLE compare_error)
+      if(NOT compare_status EQUAL 0 OR NOT compare_error STREQUAL "")
+        message(FATAL_ERROR
+          "CPU-CUDA globally ordered field parity failed at ${step}: ${compare_output};${compare_error}")
+      endif()
+    endforeach()
   endif()
   return()
 endif()
@@ -244,6 +350,16 @@ endif()
 file(REMOVE_RECURSE "${HDG_RUNTIME_TEST_OUTPUT}")
 file(REMOVE "${HDG_RUNTIME_TEST_OUTPUT}.checkpoint")
 
+run_private_scientific_gate(scientific "--space" "l2" ${common_arguments})
+if(NOT scientific_status EQUAL 71 OR
+   NOT scientific_error MATCHES "reason=true_residual_gate")
+  message(FATAL_ERROR
+    "private scientific gate did not produce exit 71: ${scientific_status};${scientific_output};${scientific_error}")
+endif()
+
+file(REMOVE_RECURSE "${HDG_RUNTIME_TEST_OUTPUT}")
+file(REMOVE "${HDG_RUNTIME_TEST_OUTPUT}.checkpoint")
+
 run_runtime(smoke "--space" "l2" ${common_arguments})
 if(NOT smoke_status EQUAL 0 OR
    NOT smoke_output MATCHES "status=Success.*step=3.*retries=0" OR
@@ -259,8 +375,65 @@ foreach(path IN ITEMS
     "${HDG_RUNTIME_TEST_OUTPUT}.checkpoint")
   require_regular_file("${path}" "smoke publication")
 endforeach()
+validate_physical_vtk(
+  "${HDG_RUNTIME_TEST_OUTPUT}/state-step-000000.vtk" 3
+  "smoke initial generation")
+validate_physical_vtk(
+  "${HDG_RUNTIME_TEST_OUTPUT}/state-step-000001.vtk" 3
+  "smoke intermediate generation")
+validate_physical_vtk(
+  "${HDG_RUNTIME_TEST_OUTPUT}/state-step-000003.vtk" 3
+  "smoke final generation")
 file(READ "${HDG_RUNTIME_TEST_OUTPUT}/run-metadata.json" smoke_metadata)
 if(NOT smoke_metadata MATCHES "\"status\": \"Success\"" OR
    NOT smoke_metadata MATCHES "\"committed_step\": 3")
   message(FATAL_ERROR "three-step CLI smoke metadata is not truthful")
 endif()
+
+set(injection_phases Assembly Condensation TraceSolve Recovery Diagnostics
+                     CheckpointStaging OutputStaging
+                     AfterRecoveryBeforeCommit)
+math(EXPR maximum_injection_source "${HDG_RUNTIME_RANKS} - 1")
+foreach(phase IN LISTS injection_phases)
+  if(phase STREQUAL "CheckpointStaging" OR phase STREQUAL "OutputStaging")
+    set(injection_step 1)
+  else()
+    set(injection_step 2)
+  endif()
+  foreach(source RANGE 0 ${maximum_injection_source})
+    file(REMOVE_RECURSE "${HDG_RUNTIME_TEST_OUTPUT}")
+    file(REMOVE "${HDG_RUNTIME_TEST_OUTPUT}.checkpoint")
+    set(injected_arguments ${common_arguments})
+    list(FIND injected_arguments --max-retries retry_option_index)
+    list(FIND injected_arguments --inject-failure injection_option_index)
+    if(retry_option_index LESS 0 OR injection_option_index LESS 0)
+      message(FATAL_ERROR "focused injection controls are unavailable")
+    endif()
+    math(EXPR retry_value_index "${retry_option_index} + 1")
+    math(EXPR injection_value_index "${injection_option_index} + 1")
+    list(REMOVE_AT injected_arguments ${retry_value_index})
+    list(INSERT injected_arguments ${retry_value_index} 1)
+    list(REMOVE_AT injected_arguments ${injection_value_index})
+    list(INSERT injected_arguments ${injection_value_index}
+         "${phase}:${injection_step}:${source}")
+    run_runtime(injected "--space" "l2" ${injected_arguments})
+    if(NOT injected_status EQUAL 0 OR
+       NOT injected_output MATCHES
+           "status=Success.*step=3.*retries=1.*phase=${phase} source_rank=${source}" OR
+       NOT injected_error STREQUAL "")
+      message(FATAL_ERROR
+        "focused ${phase}/rank${source} retry failed: ${injected_status};${injected_output};${injected_error}")
+    endif()
+    file(GLOB injected_states
+         "${HDG_RUNTIME_TEST_OUTPUT}/state-step-*.vtk")
+    list(LENGTH injected_states injected_state_count)
+    file(READ "${HDG_RUNTIME_TEST_OUTPUT}/run-metadata.json"
+         injected_metadata)
+    if(NOT injected_state_count EQUAL 3 OR
+       NOT injected_metadata MATCHES "\"committed_step\": 3" OR
+       NOT injected_metadata MATCHES "\"retries\": 1")
+      message(FATAL_ERROR
+        "focused ${phase}/rank${source} duplicated or lost a commit")
+    endif()
+  endforeach()
+endforeach()

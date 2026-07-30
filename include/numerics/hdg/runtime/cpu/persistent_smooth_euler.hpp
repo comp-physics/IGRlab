@@ -130,6 +130,7 @@ struct CpuPersistentConfig
   double nonlinear_tolerance = cpu_nonlinear_tolerance;
   double true_residual_tolerance = cpu_nonlinear_tolerance;
   bool allow_one_retry = true;
+  bool force_private_scientific_gate_failure = false;
 };
 
 CpuPersistentConfig MakeCpuSmokeConfig() noexcept;
@@ -739,7 +740,8 @@ enum class CpuCollectiveTestFault : unsigned char
   initialization_between_sparse_exchanges,
   initialization_before_gmres_prime,
   initialization_facade_readiness,
-  initialization_facade_readiness_reset_refusal
+  initialization_facade_readiness_reset_refusal,
+  commit_prepared_rejection
 };
 
 struct CpuCollectiveTestConsumptionEvidence
@@ -959,6 +961,7 @@ public:
       CpuPreparedStep& prepared,
       const CpuFailureInjection& injection = CpuFailureInjection{}) noexcept
   {
+    if (prepared.valid) { return false; }
     prepared = CpuPreparedStep{};
     if (!contract_ || FacadeBusy()) { return false; }
     const BeginOutcome begin = contract_->BeginStep(
@@ -968,6 +971,7 @@ public:
 
   bool PrepareRetry(CpuPreparedStep& prepared) noexcept
   {
+    if (prepared.valid) { return false; }
     prepared = CpuPreparedStep{};
     if (!contract_ || FacadeBusy()) { return false; }
     const BeginOutcome begin = contract_->Retry();
@@ -1044,6 +1048,17 @@ public:
     {
       last_transition_outcome_ = CurrentFailureOutcome();
       CompleteAttempt(last_transition_outcome_);
+      return false;
+    }
+    const bool commit_rejection = core_.ConsumeCollectiveTestFault(
+        detail::CpuCollectiveTestFault::commit_prepared_rejection);
+    if (!core_.CollectiveAll(!commit_rejection))
+    {
+      MarkFacadeFailure(CpuFailurePhase::commit, -1);
+      const AttemptOutcome outcome = contract_->RevertCommit(
+          std::move(*next), FailureReason::backend_failure);
+      last_transition_outcome_ = outcome;
+      CompleteAttempt(outcome);
       return false;
     }
     provisional_token_.emplace(std::move(*next));
@@ -1126,7 +1141,10 @@ public:
     CpuPreparedCommit prepared;
     if (!PrepareCommit(staging, prepared)) { return last_transition_outcome_; }
     CpuProvisionalCommit provisional;
-    if (!CommitPrepared(prepared, provisional)) { return StaleOutcome(); }
+    if (!CommitPrepared(prepared, provisional))
+    {
+      return last_transition_outcome_;
+    }
     return FinalizeCommit(provisional);
   }
 

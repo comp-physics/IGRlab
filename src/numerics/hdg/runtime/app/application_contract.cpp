@@ -409,7 +409,8 @@ ApplicationRejection ValidateRoleControls(
           options.injection.mode != FailureInjectionModeV1::prescribed ||
           !FocusedInjectionPhase(options.injection.phase) ||
           options.injection.target_step != target || !rank_valid ||
-          options.retry_limit != 0 || options.seed != seed)
+          options.retry_limit != smooth_periodic_euler_v1_retry_limit ||
+          options.seed != seed)
       {
         return ApplicationRejection::invalid_run_role;
       }

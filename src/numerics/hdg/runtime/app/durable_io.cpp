@@ -1,11 +1,15 @@
 #include "numerics/hdg/runtime/app/durable_io.hpp"
 
+#include "numerics/hdg/runtime/sha256.hpp"
+
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <exception>
 #include <fcntl.h>
 #include <limits>
+#include <sstream>
 #include <system_error>
 #include <unistd.h>
 
@@ -111,6 +115,77 @@ std::filesystem::path TemporarySibling(const std::filesystem::path& path)
   temporary += ".tmp.";
   temporary += std::to_string(static_cast<long long>(::getpid()));
   return temporary;
+}
+
+std::string Hex(const Sha256Digest& hash)
+{
+  static constexpr char digits[] = "0123456789abcdef";
+  std::string text(64, '0');
+  for (std::size_t index = 0; index < hash.size(); ++index)
+  {
+    text[2 * index] = digits[hash[index] >> 4U];
+    text[2 * index + 1] = digits[hash[index] & 0xfU];
+  }
+  return text;
+}
+
+bool SameSymlink(const std::filesystem::path& path,
+                 const std::filesystem::path& expected) noexcept
+{
+  try
+  {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    return !error && std::filesystem::is_symlink(status) &&
+        std::filesystem::read_symlink(path, error) == expected && !error;
+  }
+  catch (...) { return false; }
+}
+
+DurableIoStatus EnsureSymlink(const std::filesystem::path& path,
+                              const std::filesystem::path& target,
+                              bool& created,
+                              std::string& detail) noexcept
+{
+  created = false;
+  try
+  {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (!error && status.type() != std::filesystem::file_type::not_found)
+    {
+      if (SameSymlink(path, target)) return DurableIoStatus::ok;
+      detail = "artifact alias already exists with a different target";
+      return DurableIoStatus::already_exists;
+    }
+    error.clear();
+    const auto parent = path.has_parent_path()
+        ? path.parent_path() : std::filesystem::path{"."};
+    if (!std::filesystem::is_directory(parent, error) || error)
+    {
+      detail = "artifact alias parent is unavailable";
+      return DurableIoStatus::invalid_path;
+    }
+    std::filesystem::create_symlink(target, path, error);
+    if (error)
+    {
+      detail = "create artifact alias: " + error.message();
+      return DurableIoStatus::create_failed;
+    }
+    created = true;
+    return SyncDirectory(parent, detail);
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    return DurableIoStatus::create_failed;
+  }
+}
+
+void CrashAt(const DurableGenerationCrashBoundaryV1 selected,
+             const DurableGenerationCrashBoundaryV1 reached) noexcept
+{
+  if (selected == reached) ::_exit(86);
 }
 
 } // namespace
@@ -469,6 +544,347 @@ void DurableStagedFileV1::BestEffortDiscardTemporary() noexcept
   std::filesystem::remove(temporary_path_, ignored);
   staged_ = false;
   temporary_path_.clear();
+}
+
+DurableGenerationTransactionV1::~DurableGenerationTransactionV1()
+{
+  BestEffortCleanup();
+}
+
+DurableIoStatus DurableGenerationTransactionV1::Begin(
+    const std::filesystem::path& output_root,
+    const std::uint64_t generation, std::string& detail) noexcept
+{
+  if (active_ || published_ || output_root.empty())
+  {
+    detail = "invalid generation transaction state/root";
+    return DurableIoStatus::invalid_path;
+  }
+  try
+  {
+    std::error_code error;
+    if (!std::filesystem::is_directory(output_root, error) || error)
+    {
+      detail = "generation output root must already exist";
+      return DurableIoStatus::invalid_path;
+    }
+    output_root_ = std::filesystem::absolute(output_root).lexically_normal();
+    generations_root_ = output_root_ / ".dg-igr-generations";
+    if (!std::filesystem::exists(generations_root_, error))
+    {
+      const DurableIoStatus made =
+          CreateDurableDirectory(generations_root_, detail);
+      if (made != DurableIoStatus::ok) return made;
+    }
+    else if (!std::filesystem::is_directory(generations_root_, error) || error)
+    {
+      detail = "generation root is not a directory";
+      return DurableIoStatus::invalid_path;
+    }
+
+    static std::atomic<unsigned long long> sequence{0};
+    const auto ordinal = sequence.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream name;
+    name << "generation-" << generation << '-' <<
+        static_cast<long long>(::getpid()) << '-' << ordinal;
+    final_generation_path_ = generations_root_ / name.str();
+    staging_path_ = generations_root_ / (".tmp-" + name.str());
+    if (std::filesystem::exists(final_generation_path_, error) ||
+        std::filesystem::exists(staging_path_, error))
+    {
+      detail = "generation path already exists";
+      return DurableIoStatus::already_exists;
+    }
+    if (!std::filesystem::create_directory(staging_path_, error) || error)
+    {
+      detail = "create generation staging directory: " + error.message();
+      return DurableIoStatus::create_failed;
+    }
+
+    const std::filesystem::path marker = output_root_ / ".dg-igr-current";
+    const auto marker_status = std::filesystem::symlink_status(marker, error);
+    if (!error && marker_status.type() != std::filesystem::file_type::not_found)
+    {
+      if (!std::filesystem::is_symlink(marker_status))
+      {
+        detail = "generation marker is not a symbolic link";
+        BestEffortCleanup();
+        return DurableIoStatus::verify_failed;
+      }
+      const auto target = std::filesystem::read_symlink(marker, error);
+      const auto current = (output_root_ / target).lexically_normal();
+      if (error || current.parent_path() != generations_root_ ||
+          !std::filesystem::is_directory(current, error) || error ||
+          !std::filesystem::is_regular_file(current / "manifest.v1", error) ||
+          error)
+      {
+        detail = "generation marker does not name a complete generation";
+        BestEffortCleanup();
+        return DurableIoStatus::verify_failed;
+      }
+      for (const auto& member : std::filesystem::directory_iterator(current))
+      {
+        if (member.path().filename() == "manifest.v1") continue;
+        if (!member.is_regular_file())
+        {
+          detail = "current generation contains a non-file artifact";
+          BestEffortCleanup();
+          return DurableIoStatus::verify_failed;
+        }
+        std::filesystem::create_hard_link(
+            member.path(), staging_path_ / member.path().filename(), error);
+        if (error)
+        {
+          detail = "clone current generation artifact: " + error.message();
+          BestEffortCleanup();
+          return DurableIoStatus::create_failed;
+        }
+      }
+    }
+    else if (error && error != std::errc::no_such_file_or_directory)
+    {
+      detail = "inspect generation marker: " + error.message();
+      BestEffortCleanup();
+      return DurableIoStatus::read_failed;
+    }
+    generation_ = generation;
+    active_ = true;
+    return DurableIoStatus::ok;
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    BestEffortCleanup();
+    return DurableIoStatus::create_failed;
+  }
+}
+
+DurableIoStatus DurableGenerationTransactionV1::Stage(
+    const std::string_view logical_name, const std::uint8_t* bytes,
+    const std::size_t byte_count, std::string& detail) noexcept
+{
+  if (!active_ || published_ || !SafeRelativeName(logical_name) ||
+      logical_name == "manifest.v1" || logical_name == ".dg-igr-current")
+  {
+    detail = "invalid generation artifact name/state";
+    return DurableIoStatus::invalid_path;
+  }
+  try
+  {
+    const std::filesystem::path artifact =
+        staging_path_ / std::string{logical_name};
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(artifact, error);
+    if (!error && status.type() != std::filesystem::file_type::not_found &&
+        (!std::filesystem::remove(artifact, error) || error))
+    {
+      detail = "replace staged generation artifact: " + error.message();
+      return DurableIoStatus::cleanup_failed;
+    }
+    const DurableIoStatus written =
+        WriteAndVerify(artifact, bytes, byte_count, detail);
+    if (written == DurableIoStatus::ok) staged_ = true;
+    return written;
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    return DurableIoStatus::write_failed;
+  }
+}
+
+DurableIoStatus DurableGenerationTransactionV1::AddAlias(
+    const std::filesystem::path& alias_path,
+    const std::string_view logical_name, std::string& detail) noexcept
+{
+  if (!active_ || alias_path.empty() || !SafeRelativeName(logical_name) ||
+      !std::filesystem::is_regular_file(
+          staging_path_ / std::string{logical_name}))
+  {
+    detail = "invalid generation alias";
+    return DurableIoStatus::invalid_path;
+  }
+  try
+  {
+    const auto absolute_alias =
+        std::filesystem::absolute(alias_path).lexically_normal();
+    const auto target = output_root_ / ".dg-igr-current" /
+        std::string{logical_name};
+    for (const Alias& alias : aliases_)
+      if (alias.path == absolute_alias)
+        return alias.target == target ? DurableIoStatus::ok
+                                      : DurableIoStatus::already_exists;
+    aliases_.push_back({absolute_alias, target});
+    return DurableIoStatus::ok;
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    return DurableIoStatus::invalid_path;
+  }
+}
+
+DurableIoStatus DurableGenerationTransactionV1::Publish(
+    std::string& detail) noexcept
+{
+  if (!active_ || published_ || !staged_)
+  {
+    detail = "generation transaction is not publishable";
+    return DurableIoStatus::invalid_path;
+  }
+  try
+  {
+    std::vector<std::filesystem::path> artifacts;
+    for (const auto& member : std::filesystem::directory_iterator(staging_path_))
+      if (member.is_regular_file() && member.path().filename() != "manifest.v1")
+        artifacts.push_back(member.path());
+    std::sort(artifacts.begin(), artifacts.end());
+    std::ostringstream manifest;
+    manifest << "DG_IGR_DURABLE_GENERATION_V1\n"
+             << "generation\t" << generation_ << '\n';
+    for (const auto& artifact : artifacts)
+    {
+      std::vector<std::uint8_t> bytes;
+      DurableIoStatus read = ReadDurableFile(
+          artifact, 256U * 1024U * 1024U, bytes, detail);
+      if (read != DurableIoStatus::ok) return read;
+      manifest << "artifact\t" << artifact.filename().string() << '\t'
+               << bytes.size() << '\t'
+               << Hex(ComputeSha256(bytes.data(), bytes.size())) << '\n';
+    }
+    const std::string manifest_text = manifest.str();
+    DurableIoStatus status = WriteAndVerify(
+        staging_path_ / "manifest.v1",
+        reinterpret_cast<const std::uint8_t*>(manifest_text.data()),
+        manifest_text.size(), detail);
+    if (status != DurableIoStatus::ok) return status;
+    status = SyncDirectory(staging_path_, detail);
+    if (status != DurableIoStatus::ok) return status;
+    CrashAt(test_crash_boundary_,
+            DurableGenerationCrashBoundaryV1::after_manifest);
+
+    if (::rename(staging_path_.c_str(), final_generation_path_.c_str()) != 0)
+    {
+      detail = ErrorText("rename immutable generation", errno);
+      return DurableIoStatus::rename_failed;
+    }
+    generation_renamed_ = true;
+    staging_path_.clear();
+    status = SyncDirectory(generations_root_, detail);
+    if (status != DurableIoStatus::ok) return status;
+    CrashAt(test_crash_boundary_,
+            DurableGenerationCrashBoundaryV1::after_generation_rename);
+
+    for (const auto& artifact : artifacts)
+    {
+      const auto logical = artifact.filename();
+      bool created = false;
+      status = EnsureSymlink(output_root_ / logical,
+                             std::filesystem::path{".dg-igr-current"} /
+                                 logical,
+                             created, detail);
+      if (status != DurableIoStatus::ok) return status;
+      if (created) created_aliases_.push_back(output_root_ / logical);
+    }
+    for (const Alias& alias : aliases_)
+    {
+      bool created = false;
+      status = EnsureSymlink(alias.path, alias.target, created, detail);
+      if (status != DurableIoStatus::ok) return status;
+      if (created) created_aliases_.push_back(alias.path);
+    }
+    CrashAt(test_crash_boundary_,
+            DurableGenerationCrashBoundaryV1::after_aliases);
+
+    const std::filesystem::path marker = output_root_ / ".dg-igr-current";
+    const std::filesystem::path temporary = TemporarySibling(marker);
+    std::error_code error;
+    std::filesystem::remove(temporary, error);
+    error.clear();
+    const auto relative_target = std::filesystem::path{
+        ".dg-igr-generations"} / final_generation_path_.filename();
+    std::filesystem::create_symlink(relative_target, temporary, error);
+    if (error)
+    {
+      detail = "create generation marker: " + error.message();
+      return DurableIoStatus::create_failed;
+    }
+    if (::rename(temporary.c_str(), marker.c_str()) != 0)
+    {
+      const int saved = errno;
+      std::filesystem::remove(temporary, error);
+      detail = ErrorText("replace generation marker", saved);
+      return DurableIoStatus::rename_failed;
+    }
+    published_ = true;
+    active_ = false;
+    CrashAt(test_crash_boundary_,
+            DurableGenerationCrashBoundaryV1::after_marker_rename);
+    return SyncDirectory(output_root_, detail);
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    return DurableIoStatus::write_failed;
+  }
+}
+
+DurableIoStatus DurableGenerationTransactionV1::Revert(
+    std::string& detail) noexcept
+{
+  if (published_)
+  {
+    detail = "a committed generation cannot be reverted";
+    return DurableIoStatus::invalid_path;
+  }
+  try
+  {
+    std::error_code error;
+    for (auto path = created_aliases_.rbegin();
+         path != created_aliases_.rend(); ++path)
+    {
+      if (!std::filesystem::remove(*path, error) && error)
+      {
+        detail = "remove uncommitted artifact alias: " + error.message();
+        return DurableIoStatus::cleanup_failed;
+      }
+      error.clear();
+    }
+    created_aliases_.clear();
+    const auto remove = generation_renamed_ ? final_generation_path_
+                                            : staging_path_;
+    if (!remove.empty() && std::filesystem::exists(remove, error))
+    {
+      error.clear();
+      std::filesystem::remove_all(remove, error);
+      if (error)
+      {
+        detail = "remove uncommitted generation: " + error.message();
+        return DurableIoStatus::cleanup_failed;
+      }
+      const DurableIoStatus sync = SyncDirectory(generations_root_, detail);
+      if (sync != DurableIoStatus::ok) return sync;
+    }
+    active_ = false;
+    staged_ = false;
+    generation_renamed_ = false;
+    staging_path_.clear();
+    final_generation_path_.clear();
+    aliases_.clear();
+    return DurableIoStatus::ok;
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    return DurableIoStatus::cleanup_failed;
+  }
+}
+
+void DurableGenerationTransactionV1::BestEffortCleanup() noexcept
+{
+  if (published_ || (!active_ && !generation_renamed_)) return;
+  std::string ignored;
+  (void)Revert(ignored);
 }
 
 AtomicOutputDirectory::~AtomicOutputDirectory() { BestEffortCleanup(); }

@@ -1130,7 +1130,56 @@ public:
                               state_slot& workspace) noexcept
   {
     CudaNumericalResult result{};
+    // The application may perform unrelated MFEM output work between solver
+    // attempts, and MFEM/HYPRE may grow their opaque shared Umpire pool while
+    // doing so.  Admit no growth caused by a warm solver attempt.  The first
+    // completed attempt alone may materialize one backend pool block; retain
+    // the lifetime-wide counter separately so this remains functionality
+    // evidence and never becomes a performance claim.
+    accepted_allocation_events_ = AllocatorPolicy::AllocationEvents();
+    const bool numerical_injection_phase =
+        config.injection.phase == CudaFailurePhase::assembly ||
+        config.injection.phase == CudaFailurePhase::condensation ||
+        config.injection.phase == CudaFailurePhase::trace_solve ||
+        config.injection.phase == CudaFailurePhase::recovery ||
+        config.injection.phase ==
+            CudaFailurePhase::after_recovery_before_commit ||
+        config.injection.phase == CudaFailurePhase::diagnostics;
+    const bool injection_config_valid = !config.injection.enabled ||
+        (numerical_injection_phase && config.injection.target_step != 0 &&
+         config.injection.source_rank >= 0 &&
+         config.injection.source_rank < ranks_);
+    if (!CollectiveContinue(injection_config_valid))
+    {
+      result.phase = CudaFailurePhase::setup;
+      result.reason = FailureReason::collective_protocol;
+      return result;
+    }
+    const bool injection_active = config.injection.enabled &&
+        config.injection.target_step == attempt.committed_step + 1 &&
+        attempt.retry_index == 0;
+    bool injection_protocol_failure = false;
+    const auto inject_at = [&](const CudaFailurePhase phase) noexcept
+    {
+      result.phase = phase;
+      if (!injection_active || config.injection.phase != phase) return false;
+      const int local_claim = rank_ == config.injection.source_rank ? 1 : 0;
+      int claims = 0;
+      if (MPI_Allreduce(&local_claim, &claims, 1, MPI_INT, MPI_SUM,
+                        MPI_COMM_WORLD) != MPI_SUCCESS || claims != 1)
+      {
+        injection_protocol_failure = true;
+        result.reason = FailureReason::collective_protocol;
+        result.injection_source_rank = -1;
+        return true;
+      }
+      result.injected = true;
+      result.reason = FailureReason::backend_failure;
+      result.injection_source_rank = config.injection.source_rank;
+      return true;
+    };
     result.phase = CudaFailurePhase::assembly;
+    if (inject_at(CudaFailurePhase::assembly)) { return result; }
     const bool assembly_ticket = initialized_ &&
         Ticket(CudaFailurePhase::assembly);
     if (!CollectiveContinue(assembly_ticket) ||
@@ -1148,6 +1197,7 @@ public:
     {
       if (result.nonlinear_updates >= 2 && result.final_residual <= target)
         break;
+      if (inject_at(CudaFailurePhase::condensation)) { return result; }
       const bool condensed = CopyBase(workspace) &&
           Ticket(CudaFailurePhase::condensation) &&
           CudaLaunchCondensation(view_, shape_) &&
@@ -1161,6 +1211,7 @@ public:
       }
       const std::uint64_t generation = ++linear_generation_;
       result.phase = CudaFailurePhase::trace_solve;
+      if (inject_at(CudaFailurePhase::trace_solve)) { return result; }
       if (!AssembleTrueSystem())
       {
         result.reason = FailureReason::true_residual_gate;
@@ -1181,6 +1232,7 @@ public:
       }
       ++result.trace_solves;
       const bool trace_distributed = DistributeTraceIncrement();
+      if (inject_at(CudaFailurePhase::recovery)) { return result; }
       const bool recovered = trace_distributed &&
           Ticket(CudaFailurePhase::recovery) &&
           CudaLaunchRecover(view_, shape_) &&
@@ -1261,48 +1313,8 @@ public:
     workspace.interior.generation = current_generation_;
     workspace.trace.generation = current_generation_;
 
-    // The prescribed injection is agreed before admissibility, hashing,
-    // telemetry, or oracle export.  Exactly one principal source is exposed;
-    // every rank takes the same rollback branch.
-    const int injection_fields[3] = {
-        config.injection.enabled ? 1 : 0,
-        static_cast<int>(config.injection.target_step),
-        config.injection.source_rank};
-    int injection_min[3] = {};
-    int injection_max[3] = {};
-    const bool injection_protocol = MPI_Allreduce(
-            injection_fields, injection_min, 3, MPI_INT, MPI_MIN,
-            MPI_COMM_WORLD) == MPI_SUCCESS &&
-        MPI_Allreduce(injection_fields, injection_max, 3, MPI_INT, MPI_MAX,
-                      MPI_COMM_WORLD) == MPI_SUCCESS &&
-        std::equal(std::begin(injection_min), std::end(injection_min),
-                   std::begin(injection_max));
-    const bool injection_active = injection_protocol &&
-        injection_min[0] == 1 &&
-        static_cast<std::uint64_t>(injection_min[1]) ==
-            attempt.committed_step + 1 && attempt.retry_index == 0;
-    const int local_claim = injection_active &&
-        rank_ == injection_min[2] ? 1 : 0;
-    int claims = 0;
-    const bool claims_reduced = MPI_Allreduce(
-        &local_claim, &claims, 1, MPI_INT, MPI_SUM,
-        MPI_COMM_WORLD) == MPI_SUCCESS;
-    if (!injection_protocol || !claims_reduced ||
-        (injection_active && claims != 1))
-    {
-      result.success = false;
-      result.reason = FailureReason::collective_protocol;
-      result.injection_source_rank = -1;
+    if (inject_at(CudaFailurePhase::after_recovery_before_commit))
       return result;
-    }
-    if (injection_active)
-    {
-      result.injected = true;
-      result.success = false;
-      result.reason = FailureReason::backend_failure;
-      result.injection_source_rank = injection_min[2];
-      return result;
-    }
 
     // Freeze one coherent accepted linearization: A/B/C/D, Schur/RHS,
     // solution, and recovery all describe the same candidate generation.
@@ -1364,6 +1376,9 @@ public:
     result.admissible = CollectiveContinue(local_admissible);
     result.true_residual = std::isfinite(result.true_relative_residual) &&
         result.true_relative_residual <= 1.0e-10;
+    if (config.force_private_scientific_gate_failure)
+      result.true_residual = false;
+    if (inject_at(CudaFailurePhase::diagnostics)) { return result; }
     const std::uint64_t current_allocation_events =
         AllocatorPolicy::AllocationEvents();
     bool allocation_plateau_exact =
@@ -1375,10 +1390,10 @@ public:
       // one observed transition; rank one and every later attempt remain
       // strict at their exact accepted counts.
       allocation_plateau_exact =
-          current_allocation_events == baseline_allocations_ ||
-          (ranks_ == 2 && baseline_allocations_ !=
+          current_allocation_events == accepted_allocation_events_ ||
+          (accepted_allocation_events_ !=
                std::numeric_limits<std::uint64_t>::max() &&
-           current_allocation_events == baseline_allocations_ + 1);
+           current_allocation_events == accepted_allocation_events_ + 1);
       if (allocation_plateau_exact)
         accepted_allocation_events_ = current_allocation_events;
       allocation_plateau_sampled_ = true;
@@ -1392,7 +1407,8 @@ public:
     result.success = result.finite && result.admissible && result.recovery &&
         result.true_residual && result.telemetry;
     result.reason = result.success ? FailureReason::none :
-        FailureReason::success_gate;
+        (!result.true_residual ? FailureReason::true_residual_gate
+                              : FailureReason::success_gate);
     if (!UpdateStateHashes(workspace))
     {
       result.success = false;
@@ -1403,6 +1419,7 @@ public:
     {
       CaptureOracleMetadata(attempt, last_product_generation);
     }
+    (void)injection_protocol_failure;
     return result;
   }
 

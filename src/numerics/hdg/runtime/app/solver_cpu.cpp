@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <iomanip>
@@ -31,6 +32,8 @@ using cpu::CpuCheckpoint;
 using cpu::CpuCoefficientView;
 using cpu::CpuFailureInjection;
 using cpu::CpuFailurePhase;
+using cpu::CpuAttemptEvidence;
+using cpu::CpuAttemptStatus;
 using cpu::CpuPersistentConfig;
 using cpu::CpuRunEvidence;
 using cpu::CpuStateSnapshot;
@@ -56,6 +59,46 @@ CpuFailurePhase ToCpuPhase(const FailurePhase phase) noexcept
       return CpuFailurePhase::terminal_evidence;
   }
   return CpuFailurePhase::terminal_evidence;
+}
+
+const char* CpuPhaseName(const CpuFailurePhase phase) noexcept
+{
+  switch (phase)
+  {
+    case CpuFailurePhase::none: return "None";
+    case CpuFailurePhase::setup: return "Setup";
+    case CpuFailurePhase::assembly: return "Assembly";
+    case CpuFailurePhase::condensation: return "Condensation";
+    case CpuFailurePhase::trace_solve: return "TraceSolve";
+    case CpuFailurePhase::recovery: return "Recovery";
+    case CpuFailurePhase::diagnostics: return "Diagnostics";
+    case CpuFailurePhase::checkpoint_staging: return "CheckpointStaging";
+    case CpuFailurePhase::output_staging: return "OutputStaging";
+    case CpuFailurePhase::after_recovery_before_commit:
+      return "AfterRecoveryBeforeCommit";
+    case CpuFailurePhase::commit: return "Commit";
+    case CpuFailurePhase::rollback_audit: return "RollbackAudit";
+    case CpuFailurePhase::terminal_evidence: return "TerminalEvidence";
+  }
+  return "Unknown";
+}
+
+void AppendCpuFailureProvenance(const CpuAttemptEvidence& attempt,
+                                std::string& detail)
+{
+  if (!detail.empty()) detail += "; ";
+  detail += "phase=";
+  detail += CpuPhaseName(attempt.failure_phase);
+  detail += " source_rank=" + std::to_string(attempt.failure_source_rank);
+}
+
+bool ScientificFailureReason(const FailureReason reason) noexcept
+{
+  return reason == FailureReason::finite_gate ||
+      reason == FailureReason::admissibility_gate ||
+      reason == FailureReason::recovery_gate ||
+      reason == FailureReason::true_residual_gate ||
+      reason == FailureReason::success_gate;
 }
 
 constexpr std::string_view mfem_pin =
@@ -108,119 +151,70 @@ std::string StepName(const std::uint64_t step)
   return name.str();
 }
 
-template <typename Adapter>
-bool GatherCanonical(const CpuStateSnapshot& snapshot,
-                     const Adapter& adapter,
-                     const bool candidate,
-                     const MpiApplicationContextV1& context,
-                     std::vector<CpuCanonicalEntry>& global,
-                     std::string& detail)
+bool GatherPhysicalInterior(const CpuCoefficientView& interior,
+                            const MpiApplicationContextV1& context,
+                            std::array<int, 2>& counts,
+                            std::array<int, 2>& displacements,
+                            std::vector<double>& global,
+                            std::string& detail)
 {
-  const std::size_t local_capacity = snapshot.interior.size + snapshot.trace.size;
-  std::vector<CpuCanonicalEntry> local;
-  std::size_t local_written = 0;
-  bool exported = false;
-  try
+  const bool local_valid = interior.size <= static_cast<std::size_t>(
+      std::numeric_limits<int>::max()) &&
+      (interior.size == 0 || interior.data != nullptr);
+  if (!CollectiveAll(local_valid, context.communicator()))
   {
-    local.resize(local_capacity);
-    exported = (candidate
-        ? adapter.ExportCanonicalCandidate(local.data(), local.size(),
-                                           local_written)
-        : adapter.ExportCanonicalCommitted(local.data(), local.size(),
-                                           local_written)) &&
-        local_written == local.size();
-  }
-  catch (...) { exported = false; }
-  if (!CollectiveAll(exported, context.communicator()))
-  {
-    detail = "canonical committed-state export failed";
+    detail = "VTK rank-local interior extent is invalid";
     return false;
   }
-  const bool local_range = local_written <= static_cast<std::size_t>(
-      std::numeric_limits<int>::max() / sizeof(CpuCanonicalEntry));
-  if (!CollectiveAll(local_range, context.communicator()))
-  {
-    detail = "canonical export exceeds MPI count range";
-    return false;
-  }
-  const int local_bytes = static_cast<int>(local_written *
-                                           sizeof(CpuCanonicalEntry));
-  std::array<int, 2> byte_counts{};
+  const int local_count = static_cast<int>(interior.size);
   const bool count_gathered = MPI_Gather(
-      &local_bytes, 1, MPI_INT, byte_counts.data(), 1, MPI_INT, 0,
+      &local_count, 1, MPI_INT, counts.data(), 1, MPI_INT, 0,
       context.communicator()) == MPI_SUCCESS;
   if (!CollectiveAll(count_gathered, context.communicator()))
   {
-    detail = "MPI_Gather canonical counts failed";
+    detail = "MPI_Gather VTK interior counts failed";
     return false;
   }
-  std::array<int, 2> displacements{};
-  int total_bytes = 0;
+  int total = 0;
   bool root_valid = true;
   if (context.rank() == 0)
   {
     for (int rank = 0; rank < context.ranks(); ++rank)
     {
-      displacements[static_cast<std::size_t>(rank)] = total_bytes;
-      if (byte_counts[static_cast<std::size_t>(rank)] < 0 ||
-          total_bytes > std::numeric_limits<int>::max() -
-              byte_counts[static_cast<std::size_t>(rank)])
+      displacements[static_cast<std::size_t>(rank)] = total;
+      if (counts[static_cast<std::size_t>(rank)] < 0 ||
+          total > std::numeric_limits<int>::max() -
+              counts[static_cast<std::size_t>(rank)])
       {
-        detail = "canonical aggregate exceeds MPI count range";
+        detail = "VTK aggregate interior extent exceeds MPI range";
         root_valid = false;
         break;
       }
-      total_bytes += byte_counts[static_cast<std::size_t>(rank)];
+      total += counts[static_cast<std::size_t>(rank)];
     }
     if (root_valid)
     {
-      try
-      {
-        global.resize(static_cast<std::size_t>(total_bytes) /
-                      sizeof(CpuCanonicalEntry));
-      }
+      try { global.resize(static_cast<std::size_t>(total)); }
       catch (...) { root_valid = false; }
     }
   }
-  const bool range_ok = CollectiveAll(
-      context.rank() != 0 ||
-          (root_valid && total_bytes %
-              static_cast<int>(sizeof(CpuCanonicalEntry)) == 0),
-      context.communicator());
-  if (!range_ok) { return false; }
+  if (!CollectiveAll(root_valid, context.communicator())) return false;
   const int gather = MPI_Gatherv(
-      local.data(), local_bytes, MPI_BYTE, global.data(), byte_counts.data(),
-      displacements.data(), MPI_BYTE, 0, context.communicator());
+      interior.data, local_count, MPI_DOUBLE, global.data(), counts.data(),
+      displacements.data(), MPI_DOUBLE, 0, context.communicator());
   if (!CollectiveAll(gather == MPI_SUCCESS, context.communicator()))
   {
-    detail = "MPI_Gatherv canonical state failed";
+    detail = "MPI_Gatherv VTK interior state failed";
     return false;
   }
-  bool sorted = true;
-  if (context.rank() == 0)
-  {
-    try
-    {
-      std::sort(global.begin(), global.end(),
-                [](const auto& left, const auto& right)
-                { return left.global_id < right.global_id; });
-      for (std::size_t index = 1; index < global.size(); ++index)
-      {
-        if (global[index - 1].global_id >= global[index].global_id)
-        {
-          detail = "canonical global IDs are not unique";
-          sorted = false;
-          break;
-        }
-      }
-    }
-    catch (...) { sorted = false; }
-  }
-  return CollectiveAll(sorted, context.communicator());
+  return true;
 }
 
 bool MakeVtk(const ValidatedApplicationConfig& config,
-             const std::vector<CpuCanonicalEntry>& entries,
+             const int ranks,
+             const std::array<int, 2>& counts,
+             const std::array<int, 2>& displacements,
+             const std::vector<double>& gathered,
              std::string& vtk,
              std::string& detail)
 {
@@ -243,23 +237,58 @@ bool MakeVtk(const ValidatedApplicationConfig& config,
                                    mfem::Ordering::byNODES);
     mfem::GridFunction field(&space);
     field = 0.0;
-    constexpr std::uint64_t trace_prefix = std::uint64_t{1} << 63U;
-    std::size_t interior = 0;
-    for (const CpuCanonicalEntry& entry : entries)
+    const int global_elements = static_cast<int>(config.mesh_n() *
+                                                  config.mesh_n());
+    const int scalar_dofs = (config.polynomial_order() + 1) *
+                            (config.polynomial_order() + 1);
+    for (int rank = 0; rank < ranks; ++rank)
     {
-      if ((entry.global_id & trace_prefix) != 0) { continue; }
-      if (entry.global_id >= static_cast<std::uint64_t>(field.Size()))
+      const int expected_elements =
+          (global_elements * (rank + 1) + ranks - 1) / ranks -
+          (global_elements * rank + ranks - 1) / ranks;
+      if (counts[static_cast<std::size_t>(rank)] !=
+          expected_elements * scalar_dofs * 4)
       {
-        detail = "canonical interior ID exceeds reconstructed L2 space";
+        detail = "rank-ordered VTK state census is invalid";
         return false;
       }
-      field[static_cast<int>(entry.global_id)] = entry.value;
-      ++interior;
     }
-    if (interior != static_cast<std::size_t>(field.Size()))
+    std::array<int, 2> local_elements{};
+    for (int element = 0; element < global_elements; ++element)
     {
-      detail = "canonical interior coverage is incomplete";
-      return false;
+      const int owner = element * ranks / global_elements;
+      const int local_element =
+          local_elements[static_cast<std::size_t>(owner)]++;
+      const int local_scalar_dofs =
+          counts[static_cast<std::size_t>(owner)] / 4;
+      mfem::Array<int> vector_dofs;
+      space.GetElementVDofs(element, vector_dofs);
+      if (vector_dofs.Size() != scalar_dofs * 4)
+      {
+        detail = "rank-ordered VTK element map extent is invalid";
+        return false;
+      }
+      for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+        for (int component = 0; component < 4; ++component)
+        {
+          const int source = displacements[static_cast<std::size_t>(owner)] +
+              component * local_scalar_dofs +
+              local_element * scalar_dofs + scalar;
+          const int encoded = vector_dofs[
+              scalar + component * scalar_dofs];
+          const int destination = encoded >= 0 ? encoded : -1 - encoded;
+          const double sign = encoded >= 0 ? 1.0 : -1.0;
+          if (source < 0 ||
+              source >= displacements[static_cast<std::size_t>(owner)] +
+                  counts[static_cast<std::size_t>(owner)] ||
+              destination < 0 || destination >= field.Size())
+          {
+            detail = "rank-ordered VTK element map is out of range";
+            return false;
+          }
+          field[destination] = sign *
+              gathered[static_cast<std::size_t>(source)];
+        }
     }
     std::ostringstream output;
     output << std::setprecision(17);
@@ -275,19 +304,18 @@ bool MakeVtk(const ValidatedApplicationConfig& config,
   }
 }
 
-template <typename Adapter>
 bool StageStateVtk(const ValidatedApplicationConfig& config,
                    const CpuStateSnapshot& snapshot,
-                   const bool candidate,
-                   const Adapter& adapter,
-                   const std::filesystem::path& output_directory,
                    const MpiApplicationContextV1& context,
-                   DurableStagedFileV1& staged,
+                   DurableGenerationTransactionV1& transaction,
                    std::vector<std::uint8_t>& payload,
                    std::string& detail)
 {
-  std::vector<CpuCanonicalEntry> global;
-  if (!GatherCanonical(snapshot, adapter, candidate, context, global, detail))
+  std::array<int, 2> counts{};
+  std::array<int, 2> displacements{};
+  std::vector<double> global;
+  if (!GatherPhysicalInterior(snapshot.interior, context, counts,
+                              displacements, global, detail))
   {
     return false;
   }
@@ -297,12 +325,13 @@ bool StageStateVtk(const ValidatedApplicationConfig& config,
     try
     {
       std::string vtk;
-      staged_ok = MakeVtk(config, global, vtk, detail);
+      staged_ok = MakeVtk(config, context.ranks(), counts, displacements,
+                          global, vtk, detail);
       if (staged_ok)
       {
         payload.assign(vtk.begin(), vtk.end());
-        staged_ok = staged.Stage(
-            output_directory / StepName(snapshot.coordinates.step),
+        staged_ok = transaction.Stage(
+            StepName(snapshot.coordinates.step),
             payload.data(), payload.size(), detail) == DurableIoStatus::ok;
       }
     }
@@ -362,6 +391,24 @@ bool CpuContractPayloadHash(const double* values, const std::size_t count,
       rank_ordered.data(),
       static_cast<std::size_t>(context.ranks()) * local.size());
   return aggregate != StateHash{};
+}
+
+bool GlobalCpuStateIdentity(const CpuStateSnapshot& snapshot,
+                            const MpiApplicationContextV1& context,
+                            StateHash& identity) noexcept
+{
+  StateHash interior{};
+  StateHash trace{};
+  if (!CpuContractPayloadHash(snapshot.interior.data, snapshot.interior.size,
+                              context, interior) ||
+      !CpuContractPayloadHash(snapshot.trace.data, snapshot.trace.size,
+                              context, trace))
+    return false;
+  std::array<std::uint8_t, 64> ordered{};
+  std::copy(interior.bytes.begin(), interior.bytes.end(), ordered.begin());
+  std::copy(trace.bytes.begin(), trace.bytes.end(), ordered.begin() + 32);
+  identity.bytes = ComputeSha256(ordered.data(), ordered.size());
+  return identity != StateHash{};
 }
 
 bool GatherDoubles(const double* local, const std::size_t local_count,
@@ -432,7 +479,7 @@ bool StageCheckpoint(const ValidatedApplicationConfig& config,
                      const CpuCoefficientView& local_trace,
                      const CpuRunEvidence& evidence,
                      const MpiApplicationContextV1& context,
-                     DurableStagedFileV1& staged,
+                     DurableGenerationTransactionV1& transaction,
                      std::vector<std::uint8_t>& encoded,
                      std::string& detail)
 {
@@ -500,9 +547,11 @@ bool StageCheckpoint(const ValidatedApplicationConfig& config,
                                static_cast<std::size_t>(context.ranks()), encoded)
           : CheckpointCodecStatus::invalid_descriptor;
       staged_ok = codec == CheckpointCodecStatus::ok &&
-          staged.Stage(std::string{config.checkpoint_out().identity().view()},
-                       encoded.data(), encoded.size(), detail) ==
-              DurableIoStatus::ok;
+          transaction.Stage("restart-checkpoint.v2", encoded.data(),
+                            encoded.size(), detail) == DurableIoStatus::ok &&
+          transaction.AddAlias(
+              std::string{config.checkpoint_out().identity().view()},
+              "restart-checkpoint.v2", detail) == DurableIoStatus::ok;
       if (!staged_ok && detail.empty())
       {
         detail = "checkpoint encode failed with status " +
@@ -703,7 +752,7 @@ std::optional<ValidatedApplicationConfig> CheckpointWriterConfig(
     const ValidatedApplicationConfig& config)
 {
   if (!config.checkpoint_out().present()) { return std::nullopt; }
-  if (config.run_role() != ApplicationRunRoleV1::uninterrupted_reference)
+  if (config.run_role() == ApplicationRunRoleV1::split_writer)
   {
     return config;
   }
@@ -721,31 +770,44 @@ std::optional<ValidatedApplicationConfig> CheckpointWriterConfig(
       : std::nullopt;
 }
 
-bool PublishRootFile(DurableStagedFileV1& file,
-                     const MpiApplicationContextV1& context,
-                     std::string& detail)
+bool BeginRootTransaction(DurableGenerationTransactionV1& transaction,
+                          const std::filesystem::path& output_directory,
+                          const std::uint64_t generation,
+                          const MpiApplicationContextV1& context,
+                          std::string& detail)
 {
   bool local = true;
-  if (context.rank() == 0 && file.staged())
+  if (context.rank() == 0)
+    local = transaction.Begin(output_directory, generation, detail) ==
+        DurableIoStatus::ok;
+  return CollectiveAll(local, context.communicator());
+}
+
+bool PublishRootTransaction(DurableGenerationTransactionV1& transaction,
+                            const MpiApplicationContextV1& context,
+                            std::string& detail)
+{
+  bool local = true;
+  if (context.rank() == 0)
   {
-    local = file.Publish(detail) == DurableIoStatus::ok;
+    if (transaction.staged())
+    {
+      const DurableIoStatus status = transaction.Publish(detail);
+      local = status == DurableIoStatus::ok || transaction.published();
+    }
+    else
+      local = transaction.Revert(detail) == DurableIoStatus::ok;
   }
   return CollectiveAll(local, context.communicator());
 }
 
-bool RevertTransaction(DurableStagedFileV1& vtk,
-                       DurableStagedFileV1& checkpoint,
-                       DurableStagedFileV1& metadata,
+bool RevertTransaction(DurableGenerationTransactionV1& transaction,
                        const MpiApplicationContextV1& context,
                        std::string& detail)
 {
   bool local = true;
   if (context.rank() == 0)
-  {
-    local = vtk.Revert(detail) == DurableIoStatus::ok;
-    local = checkpoint.Revert(detail) == DurableIoStatus::ok && local;
-    local = metadata.Revert(detail) == DurableIoStatus::ok && local;
-  }
+    local = transaction.Revert(detail) == DurableIoStatus::ok;
   return CollectiveAll(local, context.communicator());
 }
 
@@ -848,6 +910,10 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
   // The persistent numerical core must retain its one-retry rollback seam;
   // the application contract independently decides whether a run may use it.
   numerical.allow_one_retry = true;
+  const char* const scientific_test =
+      std::getenv("DG_IGR_HDG_TEST_SCIENTIFIC_GATE_FAILURE");
+  if (scientific_test != nullptr && std::string_view{scientific_test} == "1")
+    numerical.force_private_scientific_gate_failure = true;
   const bool initialized = adapter.Initialize(numerical);
   if (!CollectiveAll(initialized, context.communicator()))
   {
@@ -890,9 +956,13 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
         result.failure_class = ApplicationRunResult::FailureClass::checkpoint_data;
       }
     }
-    if (result.failure_class == ApplicationRunResult::FailureClass::none)
+    if (result.failure_class == ApplicationRunResult::FailureClass::none &&
+        !GlobalCpuStateIdentity(adapter.Snapshot(), context, initial_hash))
     {
-      initial_hash = adapter.Snapshot().state_hash;
+      detail = "rank-ordered initial state identity failed";
+      result.status = RunStatus::terminal_failure;
+      result.reason = FailureReason::backend_failure;
+      result.failure_class = ApplicationRunResult::FailureClass::backend;
     }
   }
 
@@ -900,19 +970,17 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
       adapter.coordinates().step == 0 &&
       OutputStep(config, adapter.coordinates().step))
   {
-    DurableStagedFileV1 initial_vtk;
+    DurableGenerationTransactionV1 initial_transaction;
     std::vector<std::uint8_t> initial_vtk_bytes;
-    const bool staged = StageStateVtk(
-        config, adapter.Snapshot(), false, adapter, output_directory, context,
-        initial_vtk, initial_vtk_bytes, detail);
-    const bool published = staged &&
-        PublishRootFile(initial_vtk, context, detail);
+    const bool staged = BeginRootTransaction(
+        initial_transaction, output_directory, 0, context, detail) &&
+        StageStateVtk(config, adapter.Snapshot(), context, initial_transaction,
+                      initial_vtk_bytes, detail);
+    const bool published = staged && PublishRootTransaction(
+        initial_transaction, context, detail);
     if (!published)
     {
-      bool cleaned = true;
-      if (context.rank() == 0)
-        cleaned = initial_vtk.Revert(detail) == DurableIoStatus::ok;
-      (void)CollectiveAll(cleaned, context.communicator());
+      (void)RevertTransaction(initial_transaction, context, detail);
       result.status = RunStatus::terminal_failure;
       result.reason = FailureReason::backend_failure;
       result.failure_class = ApplicationRunResult::FailureClass::filesystem;
@@ -958,35 +1026,36 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
       outcome = adapter.FinalizePrepared(staging);
     else
     {
-      DurableStagedFileV1 vtk_file;
-      DurableStagedFileV1 checkpoint_file;
-      DurableStagedFileV1 metadata_file;
+      DurableGenerationTransactionV1 transaction;
       std::vector<std::uint8_t> vtk_bytes;
       std::vector<std::uint8_t> checkpoint_bytes;
       std::vector<std::uint8_t> metadata_bytes;
-      bool staged = true;
+      bool staged = BeginRootTransaction(
+          transaction, output_directory, target, context, detail);
       CpuFailurePhase staging_failure_phase = CpuFailurePhase::output_staging;
+      const bool injected_outer_stage =
+          injection.phase == CpuFailurePhase::checkpoint_staging ||
+          injection.phase == CpuFailurePhase::output_staging;
       const CpuStateSnapshot candidate{
           staging.target_coordinates, staging.interior_hash,
           staging.trace_hash, staging.state_hash, staging.interior,
           staging.trace};
-      if (OutputStep(config, target))
-        staged = StageStateVtk(config, candidate, true, adapter,
-                               output_directory, context, vtk_file,
+      if (!injected_outer_stage && OutputStep(config, target))
+        staged = StageStateVtk(config, candidate, context, transaction,
                                vtk_bytes, detail);
-      if (staged && config.checkpoint_out().present() &&
+      if (!injected_outer_stage && staged &&
+          config.checkpoint_out().present() &&
           target == config.scenario_checkpoint_step())
       {
         staging_failure_phase = CpuFailurePhase::checkpoint_staging;
         staged = checkpoint_writer && StageCheckpoint(
             *checkpoint_writer, staging.future_checkpoint, staging.interior,
-            staging.trace, adapter.evidence(), context, checkpoint_file,
+            staging.trace, adapter.evidence(), context, transaction,
             checkpoint_bytes, detail);
       }
       if (!staged)
       {
-        const bool cleaned = RevertTransaction(
-            vtk_file, checkpoint_file, metadata_file, context, detail);
+        const bool cleaned = RevertTransaction(transaction, context, detail);
         outcome = adapter.AbortPrepared(
             staging, cleaned ? staging_failure_phase
                              : CpuFailurePhase::rollback_audit, -1);
@@ -994,8 +1063,7 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
       else if (injection.phase == CpuFailurePhase::checkpoint_staging ||
                injection.phase == CpuFailurePhase::output_staging)
       {
-        const bool cleaned = RevertTransaction(
-            vtk_file, checkpoint_file, metadata_file, context, detail);
+        const bool cleaned = RevertTransaction(transaction, context, detail);
         outcome = adapter.AbortPrepared(
             staging, cleaned ? injection.phase
                              : CpuFailurePhase::rollback_audit,
@@ -1006,8 +1074,7 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
         cpu::CpuPreparedCommit commit;
         if (!adapter.PrepareCommit(staging, commit))
         {
-          const bool cleaned = RevertTransaction(
-              vtk_file, checkpoint_file, metadata_file, context, detail);
+          const bool cleaned = RevertTransaction(transaction, context, detail);
           outcome = adapter.last_transition_outcome();
           if (!cleaned)
             outcome = {RunStatus::terminal_failure,
@@ -1024,20 +1091,21 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
             anticipated.failure_class =
                 ApplicationRunResult::FailureClass::none;
             anticipated.coordinates = candidate.coordinates;
-            bool metadata_staged = true;
+            StateHash terminal_identity{};
+            bool metadata_staged = GlobalCpuStateIdentity(
+                candidate, context, terminal_identity);
             if (context.rank() == 0)
             {
               try
               {
                 const std::string metadata = Metadata(
                     config, anticipated, adapter.evidence(), initial_hash,
-                    candidate.state_hash, detail);
+                    terminal_identity, detail);
                 metadata_bytes.assign(metadata.begin(), metadata.end());
-                metadata_staged = metadata_file.Stage(
-                    output_directory /
-                        (config.run_role() == ApplicationRunRoleV1::split_writer
-                             ? "run-metadata-checkpoint.json"
-                             : "run-metadata.json"),
+                metadata_staged = transaction.Stage(
+                    config.run_role() == ApplicationRunRoleV1::split_writer
+                        ? "run-metadata-checkpoint.json"
+                        : "run-metadata.json",
                     metadata_bytes.data(), metadata_bytes.size(), detail) ==
                     DurableIoStatus::ok;
               }
@@ -1049,8 +1117,8 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
               injection.phase == CpuFailurePhase::terminal_evidence ||
               injection.phase == CpuFailurePhase::commit)
           {
-            const bool cleaned = RevertTransaction(
-                vtk_file, checkpoint_file, metadata_file, context, detail);
+            const bool cleaned = RevertTransaction(transaction, context,
+                                                   detail);
             const CpuFailurePhase phase = !staged
                 ? CpuFailurePhase::terminal_evidence : injection.phase;
             outcome = adapter.AbortPrepared(
@@ -1062,8 +1130,8 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
             cpu::CpuProvisionalCommit provisional;
             if (!adapter.CommitPrepared(commit, provisional))
             {
-              const bool cleaned = RevertTransaction(
-                  vtk_file, checkpoint_file, metadata_file, context, detail);
+              const bool cleaned = RevertTransaction(transaction, context,
+                                                     detail);
               outcome = adapter.last_transition_outcome();
               if (!cleaned)
                 outcome = {RunStatus::terminal_failure,
@@ -1071,30 +1139,22 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
             }
             else if (injection.phase == CpuFailurePhase::rollback_audit)
             {
-              const bool partially_published =
-                  PublishRootFile(vtk_file, context, detail) &&
-                  PublishRootFile(checkpoint_file, context, detail) &&
-                  PublishRootFile(metadata_file, context, detail);
-              const bool cleaned = RevertTransaction(
-                  vtk_file, checkpoint_file, metadata_file, context, detail);
+              const bool cleaned = RevertTransaction(transaction, context,
+                                                     detail);
               outcome = adapter.RevertCommit(
                   provisional,
-                  !cleaned ? CpuFailurePhase::rollback_audit
-                           : (partially_published
-                                  ? injection.phase
-                                  : CpuFailurePhase::output_staging),
+                  cleaned ? injection.phase
+                          : CpuFailurePhase::rollback_audit,
                   injection.source_rank);
             }
             else
             {
-              const bool published =
-                  PublishRootFile(vtk_file, context, detail) &&
-                  PublishRootFile(checkpoint_file, context, detail) &&
-                  PublishRootFile(metadata_file, context, detail);
+              const bool published = PublishRootTransaction(
+                  transaction, context, detail);
               if (!published)
               {
-                const bool cleaned = RevertTransaction(
-                    vtk_file, checkpoint_file, metadata_file, context, detail);
+                const bool cleaned = transaction.published()
+                    ? true : RevertTransaction(transaction, context, detail);
                 outcome = adapter.RevertCommit(
                     provisional,
                     cleaned ? CpuFailurePhase::output_staging
@@ -1105,9 +1165,8 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
                 outcome = adapter.FinalizeCommit(provisional);
                 if (!outcome.committed)
                 {
-                  const bool cleaned = RevertTransaction(
-                      vtk_file, checkpoint_file, metadata_file, context,
-                      detail);
+                  const bool cleaned = transaction.published()
+                      ? true : RevertTransaction(transaction, context, detail);
                   if (!cleaned)
                     outcome = {RunStatus::terminal_failure,
                                FailureReason::backend_failure, false, false};
@@ -1121,6 +1180,7 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
     if (!outcome.committed && outcome.retry_available &&
         result.retries < config.retry_limit())
     {
+      AppendCpuFailureProvenance(adapter.evidence().last_attempt, detail);
       ++result.retries;
       retrying = true;
       continue;
@@ -1129,11 +1189,26 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
     {
       result.status = outcome.status;
       result.reason = outcome.reason;
-      result.failure_class = config.injection().mode ==
-              FailureInjectionModeV1::prescribed
+      const CpuAttemptEvidence& failed = adapter.evidence().last_attempt;
+      const bool prescribed_failure_fired =
+          config.injection().mode == FailureInjectionModeV1::prescribed &&
+          failed.status == CpuAttemptStatus::injected_failure &&
+          failed.failure_phase == ToCpuPhase(config.injection().phase) &&
+          failed.failure_source_rank ==
+              static_cast<int>(config.injection().source_rank);
+      const bool scientific_failure = ScientificFailureReason(outcome.reason) ||
+          (failed.status == CpuAttemptStatus::success &&
+           failed.failure_phase == CpuFailurePhase::none &&
+           (!failed.finite_gate || !failed.admissibility_gate ||
+            !failed.recovery_gate || !failed.nonlinear_gate ||
+            !failed.true_residual_gate));
+      result.failure_class = prescribed_failure_fired
           ? ApplicationRunResult::FailureClass::injected
-          : ApplicationRunResult::FailureClass::backend;
+          : (scientific_failure
+                 ? ApplicationRunResult::FailureClass::scientific
+                 : ApplicationRunResult::FailureClass::backend);
       if (detail.empty()) detail = "persistent advance did not commit";
+      AppendCpuFailureProvenance(failed, detail);
       break;
     }
     retrying = false;

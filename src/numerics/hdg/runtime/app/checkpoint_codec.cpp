@@ -1211,7 +1211,6 @@ std::optional<CapturedCheckpointV1> CaptureCheckpointPiecesV1(
         descriptor.coordinates.step != config.scenario_checkpoint_step() ||
         descriptor.coordinates.generation !=
             config.scenario_checkpoint_step() ||
-        descriptor.coordinates.cursor != config.scenario_checkpoint_step() ||
         !ScenarioCheckpointTimeMatchesV1(descriptor.coordinates.time, config))
     {
       return std::nullopt;

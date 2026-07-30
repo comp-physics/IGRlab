@@ -74,6 +74,79 @@ private:
   bool published_ = false;
 };
 
+enum class DurableGenerationCrashBoundaryV1 : unsigned char
+{
+  none,
+  after_manifest,
+  after_generation_rename,
+  after_aliases,
+  after_marker_rename
+};
+
+/**
+ * A private application artifact transaction.
+ *
+ * Every generation is immutable.  Logical artifact paths are stable symbolic
+ * links through one atomic `.dg-igr-current` marker, so readers observe the
+ * previous complete generation until the marker changes to the next complete
+ * generation.
+ */
+class DurableGenerationTransactionV1 final
+{
+public:
+  DurableGenerationTransactionV1() = default;
+  ~DurableGenerationTransactionV1();
+  DurableGenerationTransactionV1(
+      const DurableGenerationTransactionV1&) = delete;
+  DurableGenerationTransactionV1& operator=(
+      const DurableGenerationTransactionV1&) = delete;
+
+  DurableIoStatus Begin(const std::filesystem::path& output_root,
+                        std::uint64_t generation,
+                        std::string& detail) noexcept;
+  DurableIoStatus Stage(std::string_view logical_name,
+                        const std::uint8_t* bytes,
+                        std::size_t byte_count,
+                        std::string& detail) noexcept;
+  DurableIoStatus AddAlias(const std::filesystem::path& alias_path,
+                           std::string_view logical_name,
+                           std::string& detail) noexcept;
+  DurableIoStatus Publish(std::string& detail) noexcept;
+  DurableIoStatus Revert(std::string& detail) noexcept;
+
+  bool active() const noexcept { return active_; }
+  bool staged() const noexcept { return staged_; }
+  bool published() const noexcept { return published_; }
+
+  // Used only by the durable-I/O subprocess tests.
+  void SetCrashBoundaryForTest(
+      DurableGenerationCrashBoundaryV1 boundary) noexcept
+  { test_crash_boundary_ = boundary; }
+
+private:
+  struct Alias
+  {
+    std::filesystem::path path{};
+    std::filesystem::path target{};
+  };
+
+  void BestEffortCleanup() noexcept;
+
+  std::filesystem::path output_root_{};
+  std::filesystem::path generations_root_{};
+  std::filesystem::path staging_path_{};
+  std::filesystem::path final_generation_path_{};
+  std::vector<Alias> aliases_{};
+  std::vector<std::filesystem::path> created_aliases_{};
+  std::uint64_t generation_ = 0;
+  bool active_ = false;
+  bool staged_ = false;
+  bool generation_renamed_ = false;
+  bool published_ = false;
+  DurableGenerationCrashBoundaryV1 test_crash_boundary_ =
+      DurableGenerationCrashBoundaryV1::none;
+};
+
 class AtomicOutputDirectory final
 {
 public:

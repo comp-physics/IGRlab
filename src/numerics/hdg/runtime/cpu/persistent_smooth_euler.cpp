@@ -4646,6 +4646,8 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   evidence.nonlinear_gate = nonlinear_converged;
   evidence.true_residual_gate = maximum_true_residual <=
       state.config.true_residual_tolerance;
+  if (state.config.force_private_scientific_gate_failure)
+    evidence.true_residual_gate = false;
   evidence.status = CpuAttemptStatus::success;
   evidence.failure_phase = CpuFailurePhase::none;
   evidence.transfers.allocation_events =
