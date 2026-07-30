@@ -35,12 +35,28 @@ std::vector<std::string> SmokeArguments()
       "--mesh-n", "3", "--order", "1", "--dt", "0.05",
       "--steps", "3", "--final-time", "0.15", "--backend", "cpu",
       "--device-id", "none", "--output-dir", "w8a-test-output",
-      "--output-steps", "0,1,3", "--evidence-dir", "none",
-      "--validation-capture", "none", "--checkpoint-out",
+      "--output-steps", "0,1,3", "--checkpoint-out",
       "w8a-test-checkpoint", "--checkpoint-step", "1",
       "--stop-after-checkpoint", "false", "--restart-from", "none",
       "--max-retries", "0", "--inject-failure", "off", "--seed",
       "0x573841534d4f4b31"};
+}
+
+std::vector<std::string> Rank2ReaderArguments(const std::string& backend,
+                                              const std::string& device)
+{
+  return {"dg_igr_hdg_runtime",
+      "--card", "exp.hdg.euler.conventional.smooth_persistent.w8a.v1",
+      "--case", "conventional-smooth-persistent-v1",
+      "--space", "l2", "--mesh-family", "periodic-cartesian-quad",
+      "--mesh-n", "6", "--order", "2", "--dt", "0.05",
+      "--steps", "20", "--final-time", "1.0", "--backend", backend,
+      "--device-id", device, "--output-dir", "w8a-rank2-reader",
+      "--output-steps", "0,10,20", "--checkpoint-out", "none",
+      "--checkpoint-step", "none", "--stop-after-checkpoint", "false",
+      "--restart-from", "w8a-rank2-checkpoint", "--max-retries", "1",
+      "--inject-failure", "AfterRecoveryBeforeCommit:14:1", "--seed",
+      "0x57384146554e4331"};
 }
 
 ParsedCommandLine Parse(std::vector<std::string> values)
@@ -62,6 +78,26 @@ bool DirectAndNegativeControls()
                      valid.options.output_steps ==
                          smooth_periodic_euler_v1_smoke_output_steps,
                  "complete_direct_smoke") && passed;
+
+  const ParsedCommandLine cpu_rank2 =
+      Parse(Rank2ReaderArguments("cpu", "none"));
+  const ParsedCommandLine cuda_rank2 =
+      Parse(Rank2ReaderArguments("cuda", "0"));
+  passed = Check(cpu_rank2.status == CommandLineStatus::run &&
+                     cpu_rank2.options.backend_id == CpuRank2BackendTag::id &&
+                     cpu_rank2.options.injection.source_rank == 1,
+                 "rank2_reader_cpu_backend_fallback") && passed;
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK2
+  passed = Check(cuda_rank2.status == CommandLineStatus::run &&
+                     cuda_rank2.options.backend_id ==
+                         CudaRank2OneGpuHostStagedBackendTag::id,
+                 "rank2_reader_cuda_backend_fallback") && passed;
+#else
+  passed = Check(cuda_rank2.status == CommandLineStatus::rejected &&
+                     cuda_rank2.rejection ==
+                         ApplicationRejection::unbuilt_backend,
+                 "rank2_reader_cuda_unbuilt_backend") && passed;
+#endif
 
   auto h1 = SmokeArguments();
   h1[6] = "h1";
@@ -98,7 +134,8 @@ bool HelpAndConfig()
   PrintCommandLineHelp(text);
   passed = Check(help.status == CommandLineStatus::help &&
                      text.str().find("--config") != std::string::npos &&
-                     text.str().find("--validation-capture") != std::string::npos &&
+                     text.str().find("--validation-capture") == std::string::npos &&
+                     text.str().find("--evidence-dir") == std::string::npos &&
                      text.str().find("AfterRecoveryBeforeCommit") !=
                          std::string::npos,
                  "help_complete") && passed;

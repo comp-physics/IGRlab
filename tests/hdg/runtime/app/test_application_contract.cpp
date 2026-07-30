@@ -155,9 +155,9 @@ bool CheckExactAcceptedFieldsAndHashes()
                    config->output_directory().present() &&
                    config->output_directory().identity().view() ==
                        "w8a/output" &&
-                   config->evidence_directory().present() &&
+                   !config->evidence_directory().present() &&
                    config->validation_capture() ==
-                       ValidationCaptureModeV1::persistent_v1 &&
+                       ValidationCaptureModeV1::none &&
                    config->checkpoint_out().present() &&
                    config->checkpoint_step().present &&
                    config->checkpoint_step().value == 1 &&
@@ -293,19 +293,16 @@ bool CheckNegativeRoleControls()
   request.output_directory = OutputDirectoryPathV1::Present({});
   reject(request, "empty_present_output_directory_rejected");
   request = Smoke(CpuSerialBackendTag::id);
-  request.evidence_directory = {};
-  reject(request, "missing_evidence_directory_rejected");
-  request = Smoke(CpuSerialBackendTag::id);
-  request.validation_capture = ValidationCaptureModeV1::none;
-  reject(request, "capture_evidence_mismatch_rejected");
+  request.evidence_directory =
+      EvidenceDirectoryPathV1::Present("unaccepted/evidence");
+  request.validation_capture = ValidationCaptureModeV1::persistent_v1;
+  reject(request, "application_capture_pair_rejected");
   request = Smoke(CpuSerialBackendTag::id);
   request.validation_capture = static_cast<ValidationCaptureModeV1>(255);
   reject(request, "unknown_capture_mode_rejected");
   request = Smoke(CpuSerialBackendTag::id);
-  request.evidence_directory = {};
-  request.validation_capture = ValidationCaptureModeV1::none;
   passed = Check(ValidateApplicationOptions(request).accepted(),
-                 "ordinary_non_evidence_pair_accepted") &&
+                 "external_evidence_default_accepted") &&
       passed;
   request = SplitWriter(Smoke(CpuSerialBackendTag::id));
   request.checkpoint_out = {};

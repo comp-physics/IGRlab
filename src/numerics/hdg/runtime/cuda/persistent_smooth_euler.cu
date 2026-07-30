@@ -772,15 +772,10 @@ void CudaTrueSystemDiagnosticMarker(
     const char* const stage, const char* const edge, const bool result,
     const std::uint64_t generation) noexcept
 {
-  if (!true_system_diagnostic_active) { return; }
-  const int hypre_error = HYPRE_GetError();
-  const cudaError_t cuda_error = cudaPeekAtLastError();
-  std::fprintf(stderr,
-      "CUDA_TRUE_SYSTEM rank=%d stage=%s edge=%s result=%u "
-      "generation=%llu hypre=%d cuda=%d\n",
-      true_system_diagnostic_rank, stage, edge, result ? 1U : 0U,
-      static_cast<unsigned long long>(generation), hypre_error,
-      static_cast<int>(cuda_error));
+  (void)stage;
+  (void)edge;
+  (void)result;
+  (void)generation;
 }
 
 void CudaBeginTrueSystemDiagnostic(const int rank) noexcept

@@ -256,6 +256,221 @@ DurableIoStatus PublishDurableFile(const std::filesystem::path& path,
   }
 }
 
+DurableIoStatus CreateDurableDirectory(const std::filesystem::path& path,
+                                       std::string& detail) noexcept
+{
+  if (path.empty() || path.filename().empty())
+  {
+    detail = "empty directory publication path";
+    return DurableIoStatus::invalid_path;
+  }
+  try
+  {
+    const std::filesystem::path parent = path.has_parent_path()
+        ? path.parent_path() : std::filesystem::path{"."};
+    std::error_code error;
+    if (!std::filesystem::is_directory(parent, error) || error)
+    {
+      detail = "directory parent must already exist";
+      return DurableIoStatus::invalid_path;
+    }
+    if (std::filesystem::exists(path, error) || error)
+    {
+      detail = "directory publication path already exists";
+      return DurableIoStatus::already_exists;
+    }
+    if (!std::filesystem::create_directory(path, error) || error)
+    {
+      detail = "create durable directory: " + error.message();
+      return DurableIoStatus::create_failed;
+    }
+    return SyncDirectory(parent, detail);
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    return DurableIoStatus::create_failed;
+  }
+}
+
+DurableIoStatus DiscardDurableDirectoryIfEmpty(
+    const std::filesystem::path& path, std::string& detail) noexcept
+{
+  if (path.empty() || path.filename().empty())
+  {
+    detail = "empty directory cleanup path";
+    return DurableIoStatus::invalid_path;
+  }
+  try
+  {
+    std::error_code error;
+    if (!std::filesystem::exists(path, error))
+    {
+      return error ? DurableIoStatus::cleanup_failed : DurableIoStatus::ok;
+    }
+    if (!std::filesystem::is_directory(path, error) || error)
+    {
+      detail = "directory cleanup target is not a directory";
+      return DurableIoStatus::invalid_path;
+    }
+    if (!std::filesystem::is_empty(path, error) || error)
+    {
+      if (error)
+      {
+        detail = "inspect directory cleanup target: " + error.message();
+        return DurableIoStatus::cleanup_failed;
+      }
+      return DurableIoStatus::ok;
+    }
+    if (!std::filesystem::remove(path, error) || error)
+    {
+      detail = "remove empty durable directory: " + error.message();
+      return DurableIoStatus::cleanup_failed;
+    }
+    const std::filesystem::path parent = path.has_parent_path()
+        ? path.parent_path() : std::filesystem::path{"."};
+    return SyncDirectory(parent, detail);
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    return DurableIoStatus::cleanup_failed;
+  }
+}
+
+DurableStagedFileV1::~DurableStagedFileV1()
+{
+  BestEffortDiscardTemporary();
+}
+
+DurableIoStatus DurableStagedFileV1::Stage(
+    const std::filesystem::path& final_path, const std::uint8_t* bytes,
+    const std::size_t byte_count, std::string& detail) noexcept
+{
+  if (staged_ || published_ || final_path.empty() ||
+      final_path.filename().empty())
+  {
+    detail = "invalid staged-file state/path";
+    return DurableIoStatus::invalid_path;
+  }
+  try
+  {
+    const std::filesystem::path parent = final_path.has_parent_path()
+        ? final_path.parent_path() : std::filesystem::path{"."};
+    std::error_code error;
+    if (!std::filesystem::is_directory(parent, error) || error)
+    {
+      detail = "staged-file parent must already exist";
+      return DurableIoStatus::invalid_path;
+    }
+    if (std::filesystem::exists(final_path, error) || error)
+    {
+      detail = "staged-file final path already exists";
+      return DurableIoStatus::already_exists;
+    }
+    final_path_ = final_path;
+    temporary_path_ = TemporarySibling(final_path);
+    if (std::filesystem::exists(temporary_path_, error) || error)
+    {
+      detail = "staged-file temporary path already exists";
+      final_path_.clear();
+      temporary_path_.clear();
+      return DurableIoStatus::already_exists;
+    }
+    const DurableIoStatus status =
+        WriteAndVerify(temporary_path_, bytes, byte_count, detail);
+    if (status != DurableIoStatus::ok)
+    {
+      std::filesystem::remove(temporary_path_, error);
+      final_path_.clear();
+      temporary_path_.clear();
+      return status;
+    }
+    staged_ = true;
+    return DurableIoStatus::ok;
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    std::error_code ignored;
+    if (!temporary_path_.empty())
+      std::filesystem::remove(temporary_path_, ignored);
+    final_path_.clear();
+    temporary_path_.clear();
+    staged_ = false;
+    return DurableIoStatus::write_failed;
+  }
+}
+
+DurableIoStatus DurableStagedFileV1::Publish(std::string& detail) noexcept
+{
+  if (!staged_ || published_)
+  {
+    detail = "staged file is not publishable";
+    return DurableIoStatus::invalid_path;
+  }
+  if (::link(temporary_path_.c_str(), final_path_.c_str()) != 0)
+  {
+    const int saved = errno;
+    detail = ErrorText("link staged publication", saved);
+    return saved == EEXIST ? DurableIoStatus::already_exists
+                           : DurableIoStatus::rename_failed;
+  }
+  published_ = true;
+  if (::unlink(temporary_path_.c_str()) != 0)
+  {
+    detail = ErrorText("unlink staged temporary", errno);
+    return DurableIoStatus::rename_failed;
+  }
+  staged_ = false;
+  temporary_path_.clear();
+  const std::filesystem::path parent = final_path_.has_parent_path()
+      ? final_path_.parent_path() : std::filesystem::path{"."};
+  return SyncDirectory(parent, detail);
+}
+
+DurableIoStatus DurableStagedFileV1::Revert(std::string& detail) noexcept
+{
+  if (!staged_ && !published_) { return DurableIoStatus::ok; }
+  try
+  {
+    std::error_code error;
+    if (staged_ && !temporary_path_.empty() &&
+        !std::filesystem::remove(temporary_path_, error) && error)
+    {
+      detail = "remove staged temporary: " + error.message();
+      return DurableIoStatus::cleanup_failed;
+    }
+    staged_ = false;
+    temporary_path_.clear();
+    if (published_ &&
+        (!std::filesystem::remove(final_path_, error) || error))
+    {
+      detail = "remove reverted publication: " + error.message();
+      return DurableIoStatus::cleanup_failed;
+    }
+    const std::filesystem::path parent = final_path_.has_parent_path()
+        ? final_path_.parent_path() : std::filesystem::path{"."};
+    published_ = false;
+    final_path_.clear();
+    return SyncDirectory(parent, detail);
+  }
+  catch (const std::exception& error)
+  {
+    detail = error.what();
+    return DurableIoStatus::cleanup_failed;
+  }
+}
+
+void DurableStagedFileV1::BestEffortDiscardTemporary() noexcept
+{
+  if (!staged_ || temporary_path_.empty()) { return; }
+  std::error_code ignored;
+  std::filesystem::remove(temporary_path_, ignored);
+  staged_ = false;
+  temporary_path_.clear();
+}
+
 AtomicOutputDirectory::~AtomicOutputDirectory() { BestEffortCleanup(); }
 
 DurableIoStatus AtomicOutputDirectory::Begin(

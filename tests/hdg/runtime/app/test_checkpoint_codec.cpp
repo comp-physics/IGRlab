@@ -435,7 +435,7 @@ CheckpointRuntimeIdentityV1 TestRuntimeIdentity()
 }
 
 ApplicationOptionsView TestOptions(const std::string_view backend,
-                                   const bool persistent = true)
+                                   const bool persistent = false)
 {
   ApplicationOptionsView options;
   options.backend_id = backend;
@@ -452,7 +452,7 @@ ApplicationOptionsView TestOptions(const std::string_view backend,
 
 ApplicationOptionsView FunctionalTestOptions(
     const std::string_view backend,
-    const bool persistent = true)
+    const bool persistent = false)
 {
   ApplicationOptionsView options = TestOptions(backend, persistent);
   options.scenario_id = smooth_periodic_euler_v1_functional_id;
@@ -475,7 +475,7 @@ ApplicationOptionsView FunctionalTestOptions(
 }
 
 ApplicationValidation TestValidation(const std::string_view backend,
-                                     const bool persistent = true)
+                                     const bool persistent = false)
 {
   ApplicationOptionsView options = TestOptions(backend, persistent);
   options.run_role = ApplicationRunRoleV1::split_writer;
@@ -485,7 +485,7 @@ ApplicationValidation TestValidation(const std::string_view backend,
 
 ApplicationValidation TestReaderValidation(
     const std::string_view backend,
-    const bool persistent = true)
+    const bool persistent = false)
 {
   ApplicationOptionsView options = TestOptions(backend, persistent);
   const std::string_view artifact = options.checkpoint_out.canonical;
@@ -746,8 +746,9 @@ void AppendHash(std::vector<std::uint8_t>& bytes, const StateHash& hash)
   bytes.insert(bytes.end(), hash.bytes.begin(), hash.bytes.end());
 }
 
+template <std::size_t Capacity>
 void AppendIdentity(std::vector<std::uint8_t>& bytes,
-                    const StableIdentity& identity)
+                    const StableId<Capacity>& identity)
 {
   AppendU16(bytes, static_cast<std::uint16_t>(identity.size()));
   const auto* first = reinterpret_cast<const std::uint8_t*>(identity.data());
@@ -2103,8 +2104,8 @@ bool CheckDecodeMutationCensusAndAtomicity()
     static_cast<void>(Seal(damaged));
     expect_any_failure(damaged, field.name);
   }
-  passed = Check(layout.exact_fields.size() == 129,
-                 "frozen_v2_exact_field_mutation_census_is_129") &&
+  passed = Check(layout.exact_fields.size() == 128,
+                 "frozen_v2_disabled_capture_mutation_census_is_128") &&
       passed;
 
   ApplicationOptionsView correlated_options =

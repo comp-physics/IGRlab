@@ -1201,6 +1201,102 @@ void CheckOuterStageAbort(Checks& checks, const int ranks)
 }
 
 template <typename Selection>
+void CheckLiveOutputAuthority(Checks& checks)
+{
+  PersistentSmoothEulerCpuAdapter<Selection> output_owner;
+  checks.Require(output_owner.Initialize(), "live-output rejection setup");
+  CpuPreparedStep live_output;
+  checks.Require(output_owner.PrepareAdvance(live_output) &&
+                     !output_owner.PrepareAdvance(live_output) &&
+                     live_output.valid &&
+                     output_owner.AbortPrepared(
+                         live_output, CpuFailurePhase::output_staging, 0)
+                         .retry_available,
+                 "PrepareAdvance rejects and preserves a live output handle");
+}
+
+template <typename Selection>
+void CheckLiveMoveDestination(Checks& checks)
+{
+  PersistentSmoothEulerCpuAdapter<Selection> move_left_owner;
+  PersistentSmoothEulerCpuAdapter<Selection> move_right_owner;
+  CpuPreparedStep move_left;
+  CpuPreparedStep move_right;
+  checks.Require(move_left_owner.Initialize() && move_right_owner.Initialize() &&
+                     move_left_owner.PrepareAdvance(move_left) &&
+                     move_right_owner.PrepareAdvance(move_right),
+                 "live move-destination setup");
+  move_left = std::move(move_right);
+  checks.Require(move_left.valid && move_right.valid &&
+                     move_left_owner.AbortPrepared(
+                         move_left, CpuFailurePhase::output_staging, 0)
+                         .retry_available &&
+                     move_right_owner.AbortPrepared(
+                         move_right, CpuFailurePhase::output_staging, 0)
+                         .retry_available,
+                 "move assignment rejects a live destination without consumption");
+}
+
+template <typename Selection>
+void CheckLiveCommitDestinations(Checks& checks)
+{
+  PersistentSmoothEulerCpuAdapter<Selection> source_owner;
+  CpuPreparedStep source_staging;
+  checks.Require(source_owner.Initialize() &&
+                     source_owner.PrepareAdvance(source_staging),
+                 "live commit source setup");
+  {
+    PersistentSmoothEulerCpuAdapter<Selection> destination_owner;
+    CpuPreparedStep destination_staging;
+    CpuPreparedCommit live_prepared_destination;
+    checks.Require(destination_owner.Initialize() &&
+                       destination_owner.PrepareAdvance(destination_staging) &&
+                       destination_owner.PrepareCommit(
+                           destination_staging, live_prepared_destination) &&
+                       !source_owner.PrepareCommit(
+                           source_staging, live_prepared_destination) &&
+                       live_prepared_destination.valid,
+                   "PrepareCommit rejects a live destination authority");
+    checks.Require(destination_owner.AbortPrepared(
+                       live_prepared_destination,
+                       CpuFailurePhase::output_staging, 0).retry_available,
+                   "rejected prepared destination remains consumable by owner");
+  }
+  CpuPreparedCommit source_prepared;
+  checks.Require(source_owner.PrepareCommit(source_staging, source_prepared),
+                 "rejected PrepareCommit preserves source staging");
+  {
+    PersistentSmoothEulerCpuAdapter<Selection> provisional_owner;
+    CpuPreparedStep provisional_staging;
+    CpuPreparedCommit provisional_prepared;
+    CpuProvisionalCommit live_provisional_destination;
+    checks.Require(provisional_owner.Initialize() &&
+                       provisional_owner.PrepareAdvance(provisional_staging) &&
+                       provisional_owner.PrepareCommit(
+                           provisional_staging, provisional_prepared) &&
+                       provisional_owner.CommitPrepared(
+                           provisional_prepared,
+                           live_provisional_destination) &&
+                       !source_owner.CommitPrepared(
+                           source_prepared, live_provisional_destination) &&
+                       source_prepared.valid &&
+                       live_provisional_destination.valid,
+                   "CommitPrepared rejects a live provisional destination");
+    checks.Require(provisional_owner.RevertCommit(
+                       live_provisional_destination,
+                       CpuFailurePhase::commit, 0).retry_available,
+                   "rejected provisional destination remains owner-consumable");
+  }
+  CpuProvisionalCommit source_provisional;
+  checks.Require(source_owner.CommitPrepared(source_prepared,
+                                             source_provisional) &&
+                     source_owner.RevertCommit(
+                         source_provisional, CpuFailurePhase::commit, 0)
+                         .retry_available,
+                 "rejected CommitPrepared preserves prepared source");
+}
+
+template <typename Selection>
 void CheckTwoPhaseAndAffineAuthorities(Checks& checks)
 {
   PersistentSmoothEulerCpuAdapter<Selection> adapter;
@@ -1298,9 +1394,16 @@ void CheckTwoPhaseAndAffineAuthorities(Checks& checks)
   checks.Require(first.PrepareAdvance(first_staging) &&
                      second.PrepareAdvance(second_staging),
                  "cross-owner candidates frozen");
+  const CheckpointDescriptor moved_checkpoint =
+      first_staging.future_checkpoint;
+  const StateHash moved_state_hash = first_staging.state_hash;
   CpuPreparedStep moved_staging{std::move(first_staging)};
   CpuPreparedCommit rejected;
-  checks.Require(!first.PrepareCommit(first_staging, rejected) &&
+  checks.Require(!first_staging.valid && moved_staging.valid &&
+                     moved_staging.future_checkpoint.coordinate_fingerprint ==
+                         moved_checkpoint.coordinate_fingerprint &&
+                     moved_staging.state_hash == moved_state_hash &&
+                     !first.PrepareCommit(first_staging, rejected) &&
                      !second.PrepareCommit(moved_staging, rejected),
                  "moved-from and cross-owner staging authorities fail closed");
   CpuPreparedCommit first_prepared;
@@ -1318,6 +1421,9 @@ void CheckTwoPhaseAndAffineAuthorities(Checks& checks)
       second_staging, CpuFailurePhase::checkpoint_staging, 0);
   checks.Require(second_abort.retry_available,
                  "independent frozen owner remains abortable");
+  CheckLiveOutputAuthority<Selection>(checks);
+  CheckLiveMoveDestination<Selection>(checks);
+  CheckLiveCommitDestinations<Selection>(checks);
 }
 
 template <typename Selection>

@@ -18,11 +18,10 @@ namespace
 using Setting = std::pair<std::string, std::string>;
 using Settings = std::vector<Setting>;
 
-constexpr std::array<std::string_view, 22> required_keys{{
+constexpr std::array<std::string_view, 20> required_keys{{
     "card", "case", "space", "mesh-family", "mesh-n", "order", "dt",
     "steps", "final-time", "backend", "device-id", "output-dir",
-    "output-steps", "evidence-dir", "validation-capture",
-    "checkpoint-out", "checkpoint-step", "stop-after-checkpoint",
+    "output-steps", "checkpoint-out", "checkpoint-step", "stop-after-checkpoint",
     "restart-from", "max-retries", "inject-failure", "seed"}};
 
 bool KnownKey(const std::string_view key) noexcept
@@ -316,7 +315,7 @@ ParsedCommandLine ParseCommandLine(const int argc,
   ApplicationOptionsView options{};
   std::string_view card, case_id, space, mesh_family, mesh_n, order, dt,
       steps, final_time, backend, device, output_dir, output_steps,
-      evidence_dir, capture, checkpoint_out, checkpoint_step, stop,
+      checkpoint_out, checkpoint_step, stop,
       restart_from, retries, injection, seed;
 #define DG_IGR_FIND(name, key) if (!Find(*settings, key, name)) { parsed.diagnostic = "ConfigurationError: missing required value"; return parsed; }
   DG_IGR_FIND(card, "card")
@@ -332,8 +331,6 @@ ParsedCommandLine ParseCommandLine(const int argc,
   DG_IGR_FIND(device, "device-id")
   DG_IGR_FIND(output_dir, "output-dir")
   DG_IGR_FIND(output_steps, "output-steps")
-  DG_IGR_FIND(evidence_dir, "evidence-dir")
-  DG_IGR_FIND(capture, "validation-capture")
   DG_IGR_FIND(checkpoint_out, "checkpoint-out")
   DG_IGR_FIND(checkpoint_step, "checkpoint-step")
   DG_IGR_FIND(stop, "stop-after-checkpoint")
@@ -430,14 +427,6 @@ ParsedCommandLine ParseCommandLine(const int argc,
     return parsed;
   }
   options.output_directory = OutputDirectoryPathV1::Present(output_dir);
-  if (evidence_dir == "none") options.evidence_directory = {};
-  else if (ValidArtifactPath(evidence_dir))
-    options.evidence_directory = EvidenceDirectoryPathV1::Present(evidence_dir);
-  else { parsed.diagnostic = "ConfigurationError: invalid evidence path"; return parsed; }
-  if (capture == "none") options.validation_capture = ValidationCaptureModeV1::none;
-  else if (capture == "persistent-v1")
-    options.validation_capture = ValidationCaptureModeV1::persistent_v1;
-  else { parsed.diagnostic = "ConfigurationError: invalid validation capture"; return parsed; }
 
   if (checkpoint_out == "none") options.checkpoint_out = {};
   else if (ValidArtifactPath(checkpoint_out))
@@ -480,7 +469,32 @@ ParsedCommandLine ParseCommandLine(const int argc,
   else
     options.run_role = ApplicationRunRoleV1::uninterrupted_reference;
 
-  const ApplicationValidation validation = ValidateApplicationOptions(options);
+  ApplicationValidation validation = ValidateApplicationOptions(options);
+  if (!validation.accepted() && parsed.requested_backend == RequestedBackend::cpu)
+  {
+    ApplicationOptionsView rank2 = options;
+    rank2.backend_id = CpuRank2BackendTag::id;
+    const ApplicationValidation rank2_validation =
+        ValidateApplicationOptions(rank2);
+    if (rank2_validation.accepted())
+    {
+      options = rank2;
+      validation = rank2_validation;
+    }
+  }
+  else if (!validation.accepted() &&
+           parsed.requested_backend == RequestedBackend::cuda)
+  {
+    ApplicationOptionsView rank2 = options;
+    rank2.backend_id = CudaRank2OneGpuHostStagedBackendTag::id;
+    const ApplicationValidation rank2_validation =
+        ValidateApplicationOptions(rank2);
+    if (rank2_validation.accepted())
+    {
+      options = rank2;
+      validation = rank2_validation;
+    }
+  }
   parsed.options = options;
   if (!validation.accepted())
   {
@@ -506,7 +520,6 @@ void PrintCommandLineHelp(std::ostream& output)
       "  --order 1|2 --dt 0.05 --steps 3|20 --final-time 0.15|1.0\n"
       "  --backend cpu|cuda --device-id none|0\n"
       "  --output-dir PATH --output-steps 0,1,3|0,10,20\n"
-      "  --evidence-dir PATH|none --validation-capture persistent-v1|none\n"
       "  --checkpoint-out PATH|none --checkpoint-step 1|10|none\n"
       "  --stop-after-checkpoint true|false --restart-from PATH|none\n"
       "  --max-retries 0|1\n"

@@ -352,10 +352,10 @@ struct ApplicationOptionsView
       ApplicationRunRoleV1::uninterrupted_reference;
   OutputDirectoryPathV1 output_directory =
       OutputDirectoryPathV1::Present("w8a/output");
-  EvidenceDirectoryPathV1 evidence_directory =
-      EvidenceDirectoryPathV1::Present("w8a/evidence");
-  ValidationCaptureModeV1 validation_capture =
-      ValidationCaptureModeV1::persistent_v1;
+  // Reserved checkpoint-ABI fields. W8A external evidence is owned by the
+  // development runner, so the application admits only the disabled values.
+  EvidenceDirectoryPathV1 evidence_directory{};
+  ValidationCaptureModeV1 validation_capture = ValidationCaptureModeV1::none;
   CheckpointArtifactPathV1 checkpoint_out =
       CheckpointArtifactPathV1::Present("w8a/checkpoint");
   OptionalCheckpointStepV1 checkpoint_step =

@@ -17,6 +17,10 @@ HDG_AUXILIARY_EXPERIMENT="OFF"
 SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
 CUDA_ARCH_WAS_SET=0
 PRINT_PLAN=0
+MFEM_REUSE_REQUEST=""
+MFEM_REUSE_ROOT=""
+MFEM_REUSE_BUILD=""
+MFEM_REUSE_STATE="disabled"
 
 usage() {
   cat <<'EOF'
@@ -38,6 +42,9 @@ Options:
   -j, --jobs N      Parallel build jobs (default: NPROC or 4).
   --mfem-jobs N     Parallel MFEM build jobs (default: --jobs value).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
+  --reuse-mfem-root DIR
+                    Reuse a validated, read-only MFEM build/install rooted at
+                    DIR instead of invoking build_mfem_tpl.sh.
   --print-plan      Validate and print the resolved build policy, then exit.
   --clean           Rebuild the selected mode from clean caches (default).
   --no-clean        Reuse existing build and install directories.
@@ -81,6 +88,11 @@ while (($#)); do
       MFEM_JOBS="$2"
       shift
       ;;
+    --reuse-mfem-root)
+      [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+      MFEM_REUSE_REQUEST="$2"
+      shift
+      ;;
     --print-plan) PRINT_PLAN=1 ;;
     --clean) CLEAN=1 ;;
     --no-clean) CLEAN=0 ;;
@@ -92,6 +104,183 @@ while (($#)); do
   esac
   shift
 done
+
+cache_value() {
+  local cache="$1"
+  local key="$2"
+  sed -n "s/^${key}:[^=]*=//p" "${cache}" | tail -n 1
+}
+
+is_cmake_true() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  [[ "${value}" == "1" || "${value}" == "ON" ||
+     "${value}" == "TRUE" || "${value}" == "YES" ]]
+}
+
+is_cmake_false() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  [[ "${value}" == "0" || "${value}" == "OFF" ||
+     "${value}" == "FALSE" || "${value}" == "NO" ]]
+}
+
+validate_reused_mfem() {
+  local requested="$1"
+  local root expected_pin root_head root_top tracked_status
+  local build_name install_name build install cache config archive
+  local cache_home cache_prefix canonical_home canonical_prefix
+  local mpi_enabled cuda_enabled umpire_enabled configured_archs
+
+  command -v realpath >/dev/null 2>&1 || {
+    echo "ERROR: --reuse-mfem-root requires realpath." >&2
+    exit 3
+  }
+  [[ -d "${requested}" ]] || {
+    echo "ERROR: reused MFEM root does not exist or is not a directory: ${requested}" >&2
+    exit 3
+  }
+  root="$(realpath -e -- "${requested}")" || {
+    echo "ERROR: unable to canonicalize reused MFEM root: ${requested}" >&2
+    exit 3
+  }
+  expected_pin="$(git -C "${SCRIPT_DIR}" rev-parse HEAD:tpl/mfem 2>/dev/null)" || {
+    echo "ERROR: current application HEAD has no readable tpl/mfem gitlink." >&2
+    exit 3
+  }
+  root_top="$(git -C "${root}" rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "ERROR: reused MFEM root is not a Git checkout: ${root}" >&2
+    exit 3
+  }
+  root_top="$(realpath -e -- "${root_top}")"
+  [[ "${root_top}" == "${root}" ]] || {
+    echo "ERROR: reused MFEM root is not the checkout top level: root=${root} top=${root_top}" >&2
+    exit 3
+  }
+  root_head="$(git -C "${root}" rev-parse HEAD 2>/dev/null)" || {
+    echo "ERROR: reused MFEM root has no readable HEAD: ${root}" >&2
+    exit 3
+  }
+  [[ "${root_head}" == "${expected_pin}" ]] || {
+    echo "ERROR: reused MFEM pin mismatch: expected=${expected_pin} actual=${root_head}" >&2
+    exit 3
+  }
+  tracked_status="$(GIT_OPTIONAL_LOCKS=0 git -C "${root}" status --porcelain=v1 --untracked-files=no)" || {
+    echo "ERROR: unable to inspect reused MFEM tracked state: ${root}" >&2
+    exit 3
+  }
+  [[ -z "${tracked_status}" ]] || {
+    echo "ERROR: reused MFEM tracked source/index is dirty: ${root}" >&2
+    printf '%s\n' "${tracked_status}" >&2
+    exit 3
+  }
+
+  if [[ "${MODE}" == "gpu" ]]; then
+    build_name="build-gpu-sm${SPACK_CUDA_ARCH}"
+    install_name="install-gpu-sm${SPACK_CUDA_ARCH}"
+  elif ((CALIPER)); then
+    build_name="build-cpu-caliper"
+    install_name="install-cpu-caliper"
+  else
+    build_name="build-cpu"
+    install_name="install-cpu"
+  fi
+  build="${root}/${build_name}"
+  install="${root}/${install_name}"
+  cache="${build}/CMakeCache.txt"
+  config="${install}/lib/cmake/mfem/MFEMConfig.cmake"
+  archive="${install}/lib/libmfem.a"
+  [[ -f "${cache}" ]] || {
+    echo "ERROR: reused MFEM CMake cache is missing: ${cache}" >&2
+    exit 3
+  }
+  [[ -f "${config}" ]] || {
+    echo "ERROR: reused MFEM package config is missing: ${config}" >&2
+    exit 3
+  }
+  [[ -f "${archive}" ]] || {
+    echo "ERROR: reused MFEM archive is missing: ${archive}" >&2
+    exit 3
+  }
+
+  cache_home="$(cache_value "${cache}" CMAKE_HOME_DIRECTORY)"
+  cache_prefix="$(cache_value "${cache}" CMAKE_INSTALL_PREFIX)"
+  [[ -n "${cache_home}" && -d "${cache_home}" ]] || {
+    echo "ERROR: reused MFEM cache has a missing or moved home directory: ${cache_home:-<missing>}" >&2
+    exit 3
+  }
+  [[ -n "${cache_prefix}" && -d "${cache_prefix}" ]] || {
+    echo "ERROR: reused MFEM cache has a missing or moved install prefix: ${cache_prefix:-<missing>}" >&2
+    exit 3
+  }
+  canonical_home="$(realpath -e -- "${cache_home}")"
+  canonical_prefix="$(realpath -e -- "${cache_prefix}")"
+  [[ "${canonical_home}" == "${root}" ]] || {
+    echo "ERROR: reused MFEM cache home mismatch: expected=${root} actual=${canonical_home}" >&2
+    exit 3
+  }
+  [[ "${canonical_prefix}" == "${install}" ]] || {
+    echo "ERROR: reused MFEM install-prefix mismatch: expected=${install} actual=${canonical_prefix}" >&2
+    exit 3
+  }
+
+  mpi_enabled="$(cache_value "${cache}" MFEM_USE_MPI)"
+  cuda_enabled="$(cache_value "${cache}" MFEM_USE_CUDA)"
+  umpire_enabled="$(cache_value "${cache}" MFEM_USE_UMPIRE)"
+  is_cmake_true "${mpi_enabled}" || {
+    echo "ERROR: reused MFEM cache does not enable MPI: ${mpi_enabled:-<missing>}" >&2
+    exit 3
+  }
+  grep -Eqi '^set\(MFEM_USE_MPI (1|ON|TRUE|YES)\)$' "${config}" || {
+    echo "ERROR: reused MFEM package config does not report MPI enabled: ${config}" >&2
+    exit 3
+  }
+  if [[ "${MODE}" == "gpu" ]]; then
+    is_cmake_true "${cuda_enabled}" || {
+      echo "ERROR: reused GPU MFEM cache does not enable CUDA: ${cuda_enabled:-<missing>}" >&2
+      exit 3
+    }
+    is_cmake_true "${umpire_enabled}" || {
+      echo "ERROR: reused GPU MFEM cache does not enable Umpire: ${umpire_enabled:-<missing>}" >&2
+      exit 3
+    }
+    configured_archs="$(cache_value "${cache}" CMAKE_CUDA_ARCHITECTURES)"
+    [[ "${configured_archs}" == "${MFEM_CUDA_ARCHS}" ]] || {
+      echo "ERROR: reused GPU MFEM architecture mismatch: expected=${MFEM_CUDA_ARCHS} actual=${configured_archs:-<missing>}" >&2
+      exit 3
+    }
+    grep -Eqi '^set\(MFEM_USE_CUDA (1|ON|TRUE|YES)\)$' "${config}" || {
+      echo "ERROR: reused GPU MFEM package config does not report CUDA enabled: ${config}" >&2
+      exit 3
+    }
+    grep -Eqi '^set\(MFEM_USE_UMPIRE (1|ON|TRUE|YES)\)$' "${config}" || {
+      echo "ERROR: reused GPU MFEM package config does not report Umpire enabled: ${config}" >&2
+      exit 3
+    }
+  else
+    is_cmake_false "${cuda_enabled}" || {
+      echo "ERROR: reused CPU MFEM cache does not report CUDA disabled: ${cuda_enabled:-<missing>}" >&2
+      exit 3
+    }
+    is_cmake_false "${umpire_enabled}" || {
+      echo "ERROR: reused CPU MFEM cache does not report Umpire disabled: ${umpire_enabled:-<missing>}" >&2
+      exit 3
+    }
+    grep -Eqi '^set\(MFEM_USE_CUDA (0|OFF|FALSE|NO)\)$' "${config}" || {
+      echo "ERROR: reused CPU MFEM package config does not report CUDA disabled: ${config}" >&2
+      exit 3
+    }
+    grep -Eqi '^set\(MFEM_USE_UMPIRE (0|OFF|FALSE|NO)\)$' "${config}" || {
+      echo "ERROR: reused CPU MFEM package config does not report Umpire disabled: ${config}" >&2
+      exit 3
+    }
+  fi
+
+  MFEM_REUSE_ROOT="${root}"
+  MFEM_REUSE_BUILD="${build}"
+  MFEM_REUSE_STATE="validated-read-only"
+  MFEM_INSTALL="${install}"
+}
 
 if [[ -z "${MFEM_JOBS}" ]]; then
   MFEM_JOBS="${JOBS}"
@@ -177,9 +366,14 @@ else
   APP_CUDA_ARCHS="none"
 fi
 
+if [[ -n "${MFEM_REUSE_REQUEST}" ]]; then
+  validate_reused_mfem "${MFEM_REUSE_REQUEST}"
+fi
+
 echo "[build-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH} mfem_cuda_archs=${MFEM_CUDA_ARCHS} app_cuda_archs=${APP_CUDA_ARCHS} app_jobs=${JOBS} mfem_jobs=${MFEM_JOBS}"
 echo "[build-plan] env=${SPACK_ENV} app_build=${APP_BUILD} app_install=${APP_INSTALL}"
 echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT}"
+echo "[build-plan] mfem_reuse_root=${MFEM_REUSE_ROOT:-none} mfem_reuse_build=${MFEM_REUSE_BUILD:-none} mfem_install=${MFEM_INSTALL} mfem_reuse_state=${MFEM_REUSE_STATE}"
 
 if ((PRINT_PLAN)); then
   exit 0
@@ -224,8 +418,12 @@ if ((CLEAN)); then
 else
   mfem_args+=(--no-clean)
 fi
-DG_IGR_SPACK_ENV="${SPACK_ENV}" CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
-  "${SCRIPT_DIR}/build_mfem_tpl.sh" "${mfem_args[@]}"
+if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
+  echo "[mfem] reuse validated: root=${MFEM_REUSE_ROOT} build=${MFEM_REUSE_BUILD} install=${MFEM_INSTALL}"
+else
+  DG_IGR_SPACK_ENV="${SPACK_ENV}" CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+    "${SCRIPT_DIR}/build_mfem_tpl.sh" "${mfem_args[@]}"
+fi
 
 CMAKE_BIN="$(spack -e "${SPACK_ENV}" location -i cmake)/bin/cmake"
 MPI_PREFIX="$(spack -e "${SPACK_ENV}" location -i openmpi)"

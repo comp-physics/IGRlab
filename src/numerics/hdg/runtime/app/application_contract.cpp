@@ -332,10 +332,8 @@ ApplicationRejection ValidateRoleControls(
   {
     return ApplicationRejection::invalid_path_identity;
   }
-  if ((options.validation_capture != ValidationCaptureModeV1::none &&
-       options.validation_capture != ValidationCaptureModeV1::persistent_v1) ||
-      (options.validation_capture == ValidationCaptureModeV1::persistent_v1) !=
-          options.evidence_directory.present)
+  if (options.validation_capture != ValidationCaptureModeV1::none ||
+      options.evidence_directory.present)
   {
     return ApplicationRejection::invalid_validation_capture;
   }

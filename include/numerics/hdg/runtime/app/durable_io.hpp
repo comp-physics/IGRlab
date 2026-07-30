@@ -38,6 +38,42 @@ DurableIoStatus PublishDurableFile(const std::filesystem::path& path,
                                    std::size_t byte_count,
                                    std::string& detail) noexcept;
 
+DurableIoStatus CreateDurableDirectory(const std::filesystem::path& path,
+                                       std::string& detail) noexcept;
+
+/** Remove a task-created directory only while it is still empty. */
+DurableIoStatus DiscardDurableDirectoryIfEmpty(
+    const std::filesystem::path& path, std::string& detail) noexcept;
+
+/** One reversible, verified file publication used by the solver transaction. */
+class DurableStagedFileV1 final
+{
+public:
+  DurableStagedFileV1() = default;
+  ~DurableStagedFileV1();
+  DurableStagedFileV1(const DurableStagedFileV1&) = delete;
+  DurableStagedFileV1& operator=(const DurableStagedFileV1&) = delete;
+
+  DurableIoStatus Stage(const std::filesystem::path& final_path,
+                        const std::uint8_t* bytes,
+                        std::size_t byte_count,
+                        std::string& detail) noexcept;
+  DurableIoStatus Publish(std::string& detail) noexcept;
+  DurableIoStatus Revert(std::string& detail) noexcept;
+  bool staged() const noexcept { return staged_; }
+  bool published() const noexcept { return published_; }
+  const std::filesystem::path& final_path() const noexcept
+  { return final_path_; }
+
+private:
+  void BestEffortDiscardTemporary() noexcept;
+
+  std::filesystem::path final_path_{};
+  std::filesystem::path temporary_path_{};
+  bool staged_ = false;
+  bool published_ = false;
+};
+
 class AtomicOutputDirectory final
 {
 public:

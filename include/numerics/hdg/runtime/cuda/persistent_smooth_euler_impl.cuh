@@ -17,9 +17,10 @@ static inline void ReportCudaWarmLifetimeMarker(
     const int rank, const char* const stage, const char* const edge,
     const bool result) noexcept
 {
-  std::fprintf(stderr,
-      "CUDA_WARM_LIFETIME rank=%d stage=%s edge=%s result=%u\n",
-      rank, stage, edge, result ? 1U : 0U);
+  (void)rank;
+  (void)stage;
+  (void)edge;
+  (void)result;
 }
 
 // Stable private backend-admission mask: bits 0..15 are rank count,
@@ -127,14 +128,11 @@ static inline void ReportCudaArenaTeardownMarker(
     const CudaArenaReleaseState& state,
     const std::uint64_t failure_mask) noexcept
 {
-  std::fprintf(stderr,
-      "CUDA_TEARDOWN_TRACE rank=%d pass=%u stage=%s edge=%s "
-      "ownership=%u/%u failure=0x%llx complete=%u\n",
-      rank, state.pass_count, stage, edge,
-      static_cast<unsigned>(state.integer),
-      static_cast<unsigned>(state.doubles),
-      static_cast<unsigned long long>(state.failure_history | failure_mask),
-      state.complete ? 1U : 0U);
+  (void)rank;
+  (void)stage;
+  (void)edge;
+  (void)state;
+  (void)failure_mask;
 }
 
 template <typename Operations>

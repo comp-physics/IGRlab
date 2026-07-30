@@ -911,6 +911,19 @@ public:
   CudaReuseEvidence ReuseEvidence() const noexcept
   { return numerics_.ReuseEvidence(); }
 
+  bool LocalCheckpointIdentity(CudaSerializedCheckpointV1& identity) const
+      noexcept
+  {
+    identity = {};
+    if (!initialized_ || pending_.active) { return false; }
+    identity.source_rank = numerics_.rank();
+    identity.rank_count = config_.expected_rank_count;
+    identity.local_mesh_hash = numerics_.LocalMeshHash();
+    identity.local_partition_hash = numerics_.LocalPartitionHash();
+    identity.local_topology_hash = numerics_.LocalTopologyHash();
+    return true;
+  }
+
   const contract_type* contract() const noexcept
   {
     return contract_ ? &*contract_ : nullptr;
@@ -1350,17 +1363,23 @@ private:
           adjusted.true_residual, adjusted.telemetry,
           numerics_.NoFallback(), adjusted.success, adjusted.injected,
           collective_prestage_allowed);
-      detail::ReportCudaPrestageDenial(
-          numerics_.rank(), failure_mask, adjusted.reason, adjusted.phase,
-          adjusted.initial_residual, adjusted.final_residual,
-          adjusted.true_relative_residual, adjusted.nonlinear_updates,
-          adjusted.trace_solves, totals,
-          reuse.baseline_allocation_events +
-              reuse.post_baseline_allocation_events,
-          reuse.baseline_allocation_events,
-          reuse.baseline_w8_owned_allocation_calls +
-              reuse.post_baseline_w8_owned_allocation_calls,
-          reuse.baseline_w8_owned_allocation_calls);
+      // A requested one-shot injection is an expected rollback stimulus, not
+      // a terminal backend diagnostic.  Its durable observability is the
+      // retry/status evidence returned by the engine and application.
+      if (!adjusted.injected)
+      {
+        detail::ReportCudaPrestageDenial(
+            numerics_.rank(), failure_mask, adjusted.reason, adjusted.phase,
+            adjusted.initial_residual, adjusted.final_residual,
+            adjusted.true_relative_residual, adjusted.nonlinear_updates,
+            adjusted.trace_solves, totals,
+            reuse.baseline_allocation_events +
+                reuse.post_baseline_allocation_events,
+            reuse.baseline_allocation_events,
+            reuse.baseline_w8_owned_allocation_calls +
+                reuse.post_baseline_w8_owned_allocation_calls,
+            reuse.baseline_w8_owned_allocation_calls);
+      }
       pending_.report.gates.success = false;
       if (pending_.report.originating_failure == FailureReason::none)
         pending_.report.originating_failure = FailureReason::backend_failure;
