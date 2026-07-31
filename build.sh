@@ -22,6 +22,16 @@ TEMP_ROOT_SOURCE=""
 MFEM_REUSE_REQUEST=""
 MFEM_REUSE_STATE="disabled"
 MFEM_REUSE_ABI=""
+MFEM_REUSE_TRANSACTION_STATE="disabled"
+MFEM_REUSE_PRE_SOURCE_ROOT=""
+MFEM_REUSE_PRE_BUILD=""
+MFEM_REUSE_PRE_INSTALL=""
+MFEM_REUSE_PRE_MANIFEST_SHA256=""
+MFEM_REUSE_PRE_LOCK_SHA256=""
+MFEM_REUSE_PRE_ABI=""
+MFEM_REUSE_POST_MANIFEST_SHA256=""
+MFEM_REUSE_POST_LOCK_SHA256=""
+MFEM_REUSE_POST_ABI=""
 MFEM_TUPLE_STATE="unresolved"
 MFEM_SOURCE_ROOT=""
 MFEM_BUILD=""
@@ -445,7 +455,9 @@ assert_reuse_fixture_accepted() {
      "${output}" == *"mfem_source=${expected_source}"* &&
      "${output}" == *"mfem_build=${expected_build}"* &&
      "${output}" == *"mfem_install=${expected_install}"* &&
-     "${output}" == *"temp_source=${expected_temp_source}"* ]] || {
+     "${output}" == *"temp_source=${expected_temp_source}"* &&
+     "${output}" == *"mfem_reuse_transaction_state=pre-dependency-validated"* &&
+     "${output}" != *"mfem_reuse_post_"* ]] || {
     echo "ERROR: reuse fixture expected an exact-source plan; exit=${status} output=${output}" >&2
     exit 3
   }
@@ -585,6 +597,34 @@ run_reuse_compatibility_fixtures() {
     --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
     --no-deps --no-tests --print-plan
 
+  make_reuse_fixture caliper-mode "${source_root}"
+  if ((CALIPER)); then
+    sed -i 's|^MFEM_USE_CALIPER:[^=]*=.*$|MFEM_USE_CALIPER:BOOL=OFF|' \
+      "${DG_IGR_REUSE_FIXTURE_CACHE}"
+    assert_reuse_fixture_rejected "does not enable Caliper" \
+      env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+      bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+      --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+      --no-deps --no-tests --print-plan
+
+    make_reuse_fixture caliper-prefix "${source_root}"
+    sed -i 's|^CMAKE_PREFIX_PATH:[^=]*=.*$|CMAKE_PREFIX_PATH:PATH=/usr|' \
+      "${DG_IGR_REUSE_FIXTURE_CACHE}"
+    assert_reuse_fixture_rejected "CMAKE_PREFIX_PATH does not match" \
+      env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+      bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+      --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+      --no-deps --no-tests --print-plan
+  else
+    sed -i 's|^MFEM_USE_CALIPER:[^=]*=.*$|MFEM_USE_CALIPER:BOOL=ON|' \
+      "${DG_IGR_REUSE_FIXTURE_CACHE}"
+    assert_reuse_fixture_rejected "does not explicitly disable Caliper" \
+      env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+      bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+      --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+      --no-deps --no-tests --print-plan
+  fi
+
   if [[ "${MODE}" == "gpu" ]]; then
     make_reuse_fixture umpire "${source_root}"
     sed -i 's|^UMPIRE_DIR:[^=]*=.*$|UMPIRE_DIR:PATH=/usr|' \
@@ -631,15 +671,18 @@ validate_reused_mfem() {
   local root build install cache config archive
   local cache_home cache_prefix canonical_home canonical_prefix
   local mpi_enabled cuda_enabled raja_enabled umpire_enabled configured_archs
+  local caliper_enabled caliper_config_enabled cache_cmake_prefix_path
   local cache_cxx cache_mpi_cxx config_cxx expected_mpicxx expected_mpicc
   local c_command cxx_command compiler_name compiler_version
   local mpi_prefix mpi_hash mpi_compiler hypre_prefix hypre_hash hypre_compiler
-  local hypre_mpi_hash raja_state umpire_state
+  local hypre_mpi_hash raja_state umpire_state caliper_state
+  local caliper_prefix caliper_hash caliper_compiler caliper_mpi_hash
   local cuda_prefix cuda_hash cuda_compiler umpire_prefix umpire_hash
   local umpire_compiler hypre_cuda_hash hypre_umpire_hash umpire_cuda_hash
   local cache_hypre cache_umpire cache_cuda cache_cuda_compiler
   local spack_view view_mpicc view_mpicxx view_hypre_header
   local view_hypre_library view_library_candidate view_nvcc view_umpire_config
+  local view_caliper_config
   local cuda_metadata_records cuda_metadata_count cuda_metadata
   local metadata_cuda metadata_cuda_root cuda_host_compiler
   local cuda_host_compiler_id cuda_host_compiler_version
@@ -721,6 +764,8 @@ validate_reused_mfem() {
   cuda_enabled="$(cache_value "${cache}" MFEM_USE_CUDA)"
   raja_enabled="$(cache_value "${cache}" MFEM_USE_RAJA)"
   umpire_enabled="$(cache_value "${cache}" MFEM_USE_UMPIRE)"
+  caliper_enabled="$(cache_value "${cache}" MFEM_USE_CALIPER)"
+  caliper_config_enabled="$(config_value "${config}" MFEM_USE_CALIPER)"
   is_cmake_true "${mpi_enabled}" || {
     echo "ERROR: reused MFEM cache does not enable MPI: ${mpi_enabled:-<missing>}" >&2
     exit 3
@@ -737,6 +782,34 @@ validate_reused_mfem() {
     echo "ERROR: reused MFEM package config does not report RAJA disabled: ${config}" >&2
     exit 3
   }
+  if ((CALIPER)); then
+    is_cmake_true "${caliper_enabled}" || {
+      echo "ERROR: reused Caliper MFEM cache does not enable Caliper: ${caliper_enabled:-<missing>}" >&2
+      exit 3
+    }
+    is_cmake_true "${caliper_config_enabled}" || {
+      echo "ERROR: reused Caliper MFEM package config does not report Caliper enabled: ${caliper_config_enabled:-<missing>}" >&2
+      exit 3
+    }
+    cache_cmake_prefix_path="$(canonical_existing_path \
+      "$(cache_value "${cache}" CMAKE_PREFIX_PATH)")" || {
+      echo "ERROR: reused Caliper MFEM CMAKE_PREFIX_PATH is missing or moved." >&2
+      exit 3
+    }
+    [[ "${cache_cmake_prefix_path}" == "${spack_view}" ]] || {
+      echo "ERROR: reused Caliper MFEM CMAKE_PREFIX_PATH does not match the selected Spack view: expected=${spack_view} actual=${cache_cmake_prefix_path}" >&2
+      exit 3
+    }
+  else
+    is_cmake_false "${caliper_enabled}" || {
+      echo "ERROR: reused non-Caliper MFEM cache does not explicitly disable Caliper: ${caliper_enabled:-<missing>}" >&2
+      exit 3
+    }
+    is_cmake_false "${caliper_config_enabled}" || {
+      echo "ERROR: reused non-Caliper MFEM package config does not explicitly disable Caliper: ${caliper_config_enabled:-<missing>}" >&2
+      exit 3
+    }
+  fi
 
   spack_identity openmpi mpi_prefix mpi_hash mpi_compiler
   spack_identity hypre hypre_prefix hypre_hash hypre_compiler
@@ -749,6 +822,32 @@ validate_reused_mfem() {
     echo "ERROR: active Spack HYPRE/MPI compiler mismatch: hypre=${hypre_compiler} mpi=${mpi_compiler}" >&2
     exit 3
   }
+  caliper_state="off"
+  if ((CALIPER)); then
+    spack_identity caliper caliper_prefix caliper_hash caliper_compiler
+    [[ "${caliper_compiler}" == "${mpi_compiler}" ]] || {
+      echo "ERROR: active Spack Caliper/MPI compiler mismatch: caliper=${caliper_compiler} mpi=${mpi_compiler}" >&2
+      exit 3
+    }
+    caliper_mpi_hash="$(spack_dependency_hash caliper mpi)"
+    [[ "${caliper_mpi_hash}" == "${mpi_hash}" ]] || {
+      echo "ERROR: active Spack Caliper/MPI concretization mismatch: caliper-mpi=${caliper_mpi_hash} mpi=${mpi_hash}" >&2
+      exit 3
+    }
+    view_caliper_config="$(canonical_existing_path \
+      "${spack_view}/share/cmake/caliper/caliper-config.cmake")" || {
+      echo "ERROR: selected Caliper Spack view has no usable package config." >&2
+      exit 3
+    }
+    case "${view_caliper_config}" in
+      "${caliper_prefix}"/*) ;;
+      *)
+        echo "ERROR: selected Spack view Caliper config does not match its concrete Caliper prefix." >&2
+        exit 3
+        ;;
+    esac
+    caliper_state="${caliper_hash}"
+  fi
   cache_hypre="$(canonical_existing_path "$(cache_value "${cache}" HYPRE_DIR)")" || {
     echo "ERROR: reused MFEM HYPRE cache root is missing or moved." >&2
     exit 3
@@ -968,7 +1067,7 @@ validate_reused_mfem() {
       exit 3
     }
     umpire_state="${umpire_hash}"
-    MFEM_REUSE_ABI="compiler=${mpi_compiler};mpi=${mpi_hash};hypre=${hypre_hash};raja=${raja_state};umpire=${umpire_state};cuda=${cuda_hash};arch=${configured_archs}"
+    MFEM_REUSE_ABI="compiler=${mpi_compiler};mpi=${mpi_hash};hypre=${hypre_hash};raja=${raja_state};umpire=${umpire_state};caliper=${caliper_state};cuda=${cuda_hash};arch=${configured_archs}"
   else
     is_cmake_false "${cuda_enabled}" || {
       echo "ERROR: reused CPU MFEM cache does not report CUDA disabled: ${cuda_enabled:-<missing>}" >&2
@@ -987,7 +1086,7 @@ validate_reused_mfem() {
       exit 3
     }
     umpire_state="off"
-    MFEM_REUSE_ABI="compiler=${mpi_compiler};mpi=${mpi_hash};hypre=${hypre_hash};raja=${raja_state};umpire=${umpire_state};cuda=off;arch=none"
+    MFEM_REUSE_ABI="compiler=${mpi_compiler};mpi=${mpi_hash};hypre=${hypre_hash};raja=${raja_state};umpire=${umpire_state};caliper=${caliper_state};cuda=off;arch=none"
   fi
 
   MFEM_SOURCE_ROOT="${root}"
@@ -995,6 +1094,58 @@ validate_reused_mfem() {
   MFEM_INSTALL="${install}"
   MFEM_REUSE_STATE="validated-read-only"
   MFEM_TUPLE_STATE="reuse-source-build-install-validated"
+}
+
+freeze_reuse_pre_dependency_identity() {
+  [[ "${MFEM_REUSE_STATE}" == "validated-read-only" &&
+     "${MFEM_TUPLE_STATE}" == "reuse-source-build-install-validated" &&
+     "${SPACK_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${SPACK_LOCK_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     -n "${MFEM_REUSE_ABI}" ]] || {
+    echo "ERROR: cannot freeze an incomplete pre-dependency MFEM reuse identity." >&2
+    exit 3
+  }
+  MFEM_REUSE_PRE_SOURCE_ROOT="${MFEM_SOURCE_ROOT}"
+  MFEM_REUSE_PRE_BUILD="${MFEM_BUILD}"
+  MFEM_REUSE_PRE_INSTALL="${MFEM_INSTALL}"
+  MFEM_REUSE_PRE_MANIFEST_SHA256="${SPACK_MANIFEST_SHA256}"
+  MFEM_REUSE_PRE_LOCK_SHA256="${SPACK_LOCK_SHA256}"
+  MFEM_REUSE_PRE_ABI="${MFEM_REUSE_ABI}"
+  MFEM_REUSE_TRANSACTION_STATE="pre-dependency-validated"
+}
+
+revalidate_reused_mfem_after_dependencies() {
+  local frozen_source="${MFEM_REUSE_PRE_SOURCE_ROOT}"
+  local frozen_build="${MFEM_REUSE_PRE_BUILD}"
+  local frozen_install="${MFEM_REUSE_PRE_INSTALL}"
+
+  [[ "${MFEM_REUSE_TRANSACTION_STATE}" == \
+     "pre-dependency-validated" && -n "${frozen_source}" ]] || {
+    echo "ERROR: MFEM reuse post-dependency validation has no frozen pre-dependency identity." >&2
+    exit 3
+  }
+  validate_reused_mfem "${frozen_source}"
+  [[ "${MFEM_SOURCE_ROOT}" == "${frozen_source}" &&
+     "${MFEM_BUILD}" == "${frozen_build}" &&
+     "${MFEM_INSTALL}" == "${frozen_install}" ]] || {
+    echo "ERROR: MFEM reuse source/build/install tuple changed across dependency installation." >&2
+    echo "       pre=${frozen_source}|${frozen_build}|${frozen_install}" >&2
+    echo "       post=${MFEM_SOURCE_ROOT}|${MFEM_BUILD}|${MFEM_INSTALL}" >&2
+    exit 3
+  }
+  [[ "${MFEM_REUSE_ABI}" == "${MFEM_REUSE_PRE_ABI}" ]] || {
+    echo "ERROR: MFEM reuse ABI changed across dependency installation." >&2
+    echo "       pre=${MFEM_REUSE_PRE_ABI}" >&2
+    echo "       post=${MFEM_REUSE_ABI}" >&2
+    exit 3
+  }
+  MFEM_REUSE_POST_MANIFEST_SHA256="${SPACK_MANIFEST_SHA256}"
+  MFEM_REUSE_POST_LOCK_SHA256="${SPACK_LOCK_SHA256}"
+  MFEM_REUSE_POST_ABI="${MFEM_REUSE_ABI}"
+  MFEM_REUSE_TRANSACTION_STATE="post-dependency-validated"
+  echo "[reuse-transaction] mfem_reuse_transaction_state=${MFEM_REUSE_TRANSACTION_STATE} phase=post-dependency state=validated mfem_source=${MFEM_SOURCE_ROOT} mfem_build=${MFEM_BUILD} mfem_install=${MFEM_INSTALL}"
+  echo "[reuse-transaction] mfem_reuse_post_abi=${MFEM_REUSE_POST_ABI}"
+  echo "[reuse-transaction] spack_post_manifest_sha256=${MFEM_REUSE_POST_MANIFEST_SHA256} spack_post_lock_sha256=${MFEM_REUSE_POST_LOCK_SHA256}"
 }
 
 if [[ -z "${MFEM_JOBS}" ]]; then
@@ -1088,6 +1239,7 @@ fi
 
 if [[ -n "${MFEM_REUSE_REQUEST}" ]]; then
   validate_reused_mfem "${MFEM_REUSE_REQUEST}"
+  freeze_reuse_pre_dependency_identity
 else
   validate_mfem_source_checkout "${SCRIPT_DIR}/tpl/mfem" "local"
   MFEM_BUILD="${MFEM_SOURCE_ROOT}/${MFEM_BUILD_NAME}"
@@ -1111,6 +1263,9 @@ echo "[build-plan] mfem_source_pin=${MFEM_SOURCE_PIN} fem_picojson_blob=${MFEM_P
 if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
   echo "[build-plan] mfem_reuse_abi=${MFEM_REUSE_ABI}"
   echo "[build-plan] spack_manifest_sha256=${SPACK_MANIFEST_SHA256} spack_lock_sha256=${SPACK_LOCK_SHA256}"
+  echo "[build-plan] mfem_reuse_transaction_state=${MFEM_REUSE_TRANSACTION_STATE}"
+  echo "[build-plan] mfem_reuse_pre_abi=${MFEM_REUSE_PRE_ABI}"
+  echo "[build-plan] spack_pre_manifest_sha256=${MFEM_REUSE_PRE_MANIFEST_SHA256} spack_pre_lock_sha256=${MFEM_REUSE_PRE_LOCK_SHA256}"
 fi
 
 if ((PRINT_PLAN)); then
@@ -1130,6 +1285,9 @@ if ((INSTALL_DEPS)); then
     spack -e "${SPACK_ENV}" concretize -f
   fi
   spack -e "${SPACK_ENV}" install
+  if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
+    revalidate_reused_mfem_after_dependencies
+  fi
 fi
 
 SPACK_VIEW="${SPACK_ENV}/.spack-env/view"

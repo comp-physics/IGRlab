@@ -44,14 +44,113 @@ assert_adjacent_args() {
   fail "helper arguments do not contain adjacent '${first} ${second}'"
 }
 
+assert_reuse_transaction_order() {
+  local path="$1"
+  local install_line revalidate_line view_line
+  install_line="$(grep -nFx '  spack -e "${SPACK_ENV}" install' \
+    "${path}" | cut -d: -f1 || true)"
+  revalidate_line="$(grep -nFx \
+    '    revalidate_reused_mfem_after_dependencies' \
+    "${path}" | cut -d: -f1 || true)"
+  view_line="$(grep -nFx 'SPACK_VIEW="${SPACK_ENV}/.spack-env/view"' \
+    "${path}" | cut -d: -f1 || true)"
+  [[ "${install_line}" =~ ^[0-9]+$ &&
+     "${revalidate_line}" =~ ^[0-9]+$ &&
+     "${view_line}" =~ ^[0-9]+$ &&
+     ${install_line} -lt ${revalidate_line} &&
+     ${revalidate_line} -lt ${view_line} ]] || {
+    fail "reuse revalidation must occur once after dependency install and before SPACK_VIEW"
+  }
+}
+
 [[ -f "${BUILD_DRIVER}" ]] || fail "missing build driver: ${BUILD_DRIVER}"
 [[ -f "${MFEM_DRIVER}" ]] || fail "missing MFEM driver: ${MFEM_DRIVER}"
+
+if [[ -n "${DG_IGR_TEST_REUSE_MFEM_ROOT:-}" ]]; then
+  mfem_source="${DG_IGR_TEST_REUSE_MFEM_ROOT}"
+else
+  mfem_source="${REPO_ROOT}/tpl/mfem"
+fi
+[[ -e "${mfem_source}/.git" ]] || {
+  fail "MFEM source is not initialized: ${mfem_source}"
+}
+mfem_source="$(realpath -e -- "${mfem_source}")"
+mfem_source_top="$(git -C "${mfem_source}" rev-parse --show-toplevel)"
+mfem_source_top="$(realpath -e -- "${mfem_source_top}")"
+[[ "${mfem_source_top}" == "${mfem_source}" ]] || {
+  fail "MFEM source is not the checkout top level: ${mfem_source}"
+}
+real_mfem_gitlink="$(git -C "${REPO_ROOT}" rev-parse HEAD:tpl/mfem)"
+real_mfem_head="$(git -C "${mfem_source}" rev-parse HEAD)"
+[[ "${real_mfem_head}" == "${real_mfem_gitlink}" ]] || {
+  fail "MFEM source/gitlink mismatch: source=${real_mfem_head} gitlink=${real_mfem_gitlink}"
+}
+real_mfem_status="$(GIT_OPTIONAL_LOCKS=0 git -C "${mfem_source}" \
+  status --porcelain=v1 --untracked-files=no)"
+[[ -z "${real_mfem_status}" ]] || {
+  fail "MFEM source has tracked changes: ${real_mfem_status}"
+}
 
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/dg_igr_cuda_policy.XXXXXX")"
 cleanup() {
   rm -rf -- "${tmp_root}"
 }
 trap cleanup EXIT
+
+fixture_root="${tmp_root}/fixture"
+fixture_mfem="${fixture_root}/tpl/mfem"
+fake_bin="${tmp_root}/fake-bin"
+mkdir -p "${fixture_root}/spack-envs/cuda-sm120/.spack-env/view" \
+         "${fixture_root}/tpl" "${fake_bin}"
+git -c advice.detachedHead=false clone --quiet --shared --no-checkout \
+  "${mfem_source}" "${fixture_mfem}"
+git -c advice.detachedHead=false -C "${fixture_mfem}" checkout --quiet \
+  --detach "${real_mfem_gitlink}"
+git -C "${fixture_root}" init --quiet
+git -C "${fixture_root}" -c advice.addEmbeddedRepo=false add -- tpl/mfem
+git -C "${fixture_root}" \
+  -c user.name=dg-igr-fixture \
+  -c user.email=dg-igr-fixture@example.invalid \
+  -c commit.gpgSign=false \
+  -c core.hooksPath=/dev/null \
+  commit --quiet -m "fixture: record exact MFEM gitlink"
+
+fixture_mfem_gitlink="$(git -C "${fixture_root}" rev-parse HEAD:tpl/mfem)"
+fixture_mfem_head="$(git -C "${fixture_mfem}" rev-parse HEAD)"
+fixture_mfem_status="$(GIT_OPTIONAL_LOCKS=0 git -C "${fixture_mfem}" \
+  status --porcelain=v1 --untracked-files=no)"
+fixture_mfem_entry="$(git -C "${fixture_root}" ls-tree HEAD -- tpl/mfem)"
+[[ "${fixture_mfem_gitlink}" == "${real_mfem_gitlink}" ]] || {
+  fail "fixture gitlink mismatch: fixture=${fixture_mfem_gitlink} real=${real_mfem_gitlink}"
+}
+[[ "${fixture_mfem_head}" == "${real_mfem_gitlink}" ]] || {
+  fail "fixture MFEM HEAD mismatch: fixture=${fixture_mfem_head} real=${real_mfem_gitlink}"
+}
+[[ -z "${fixture_mfem_status}" ]] || {
+  fail "fixture MFEM source has tracked changes: ${fixture_mfem_status}"
+}
+[[ "${fixture_mfem_entry}" == \
+   "160000 commit ${real_mfem_gitlink}"$'\t'"tpl/mfem" ]] || {
+  fail "fixture tpl/mfem is not the exact gitlink: ${fixture_mfem_entry}"
+}
+
+cp "${BUILD_DRIVER}" "${fixture_root}/build.sh"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '{' \
+  '  printf "MFEM_SRC=%s\\n" "${MFEM_SRC:?}"' \
+  '  printf "MFEM_BUILD=%s\\n" "${MFEM_BUILD:?}"' \
+  '  printf "MFEM_INSTALL=%s\\n" "${MFEM_INSTALL:?}"' \
+  '  printf "%s\\n" "$@"' \
+  '} >"${FAKE_HELPER_LOG:?}"' \
+  'exit 77' >"${fixture_root}/build_mfem_tpl.sh"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'printf "spack-called\\n" >>"${FAKE_SPACK_LOG:?}"' \
+  'exit 78' >"${fake_bin}/spack"
+chmod +x "${fixture_root}/build_mfem_tpl.sh" "${fake_bin}/spack"
 
 clean_env=(
   env
@@ -62,9 +161,11 @@ clean_env=(
   -u DG_IGR_SPACK_ENV
 )
 
-# The canonical sm120 plan keeps the dependency profile and project sources
-# native while compiling only MFEM through compatibility PTX.
-plan="$("${clean_env[@]}" bash "${BUILD_DRIVER}" \
+# The synthetic exact-source composition exercises normal-mode source
+# validation even when the application worktree's submodule is uninitialized.
+# The canonical sm120 plan keeps dependencies and project sources native while
+# compiling only MFEM through compatibility PTX.
+plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
   --gpu --cuda-arch 120 -j 16 --print-plan)"
 assert_contains "${plan}" "profile=cuda-sm120"
 assert_contains "${plan}" "dependency_cuda_arch=120"
@@ -73,33 +174,17 @@ assert_contains "${plan}" "app_cuda_archs=120"
 assert_contains "${plan}" "app_jobs=16"
 assert_contains "${plan}" "mfem_jobs=16"
 
-plan="$("${clean_env[@]}" bash "${BUILD_DRIVER}" \
+plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
   --gpu --cuda-arch 120 -j 16 --mfem-jobs 7 --print-plan)"
 assert_contains "${plan}" "app_jobs=16"
 assert_contains "${plan}" "mfem_jobs=7"
 
 # CUDA-specific variables remain inert on the CPU path.
 plan="$(CUDA_ARCHS=120 MFEM_CUDA_ARCHS=120 APP_CUDA_ARCHS=80-virtual \
-  bash "${BUILD_DRIVER}" --cpu-only -j 9 --print-plan)"
+  bash "${fixture_root}/build.sh" --cpu-only -j 9 --print-plan)"
 assert_contains "${plan}" "mode=cpu profile=cpu dependency_cuda_arch=none"
 assert_contains "${plan}" "mfem_cuda_archs=none app_cuda_archs=none"
 assert_contains "${plan}" "app_jobs=9 mfem_jobs=9"
-
-fixture_root="${tmp_root}/fixture"
-fake_bin="${tmp_root}/fake-bin"
-mkdir -p "${fixture_root}/spack-envs/cuda-sm120/.spack-env/view" "${fake_bin}"
-cp "${BUILD_DRIVER}" "${fixture_root}/build.sh"
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  'printf "%s\\n" "$@" >"${FAKE_HELPER_LOG:?}"' \
-  'exit 77' >"${fixture_root}/build_mfem_tpl.sh"
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  'printf "spack-called\\n" >>"${FAKE_SPACK_LOG:?}"' \
-  'exit 78' >"${fake_bin}/spack"
-chmod +x "${fixture_root}/build_mfem_tpl.sh" "${fake_bin}/spack"
 
 # Unsafe architecture selections must fail before dependency, helper, or cache
 # actions even without --print-plan.
@@ -202,10 +287,20 @@ env -u CUDA_ARCHS -u MFEM_CUDA_ARCHS -u APP_CUDA_ARCHS -u SPACK_CUDA_ARCH \
 forward_rc=$?
 set -e
 [[ ${forward_rc} -eq 77 ]] || fail "fake-helper forwarding exited ${forward_rc}, expected 77"
+forwarded_log="$(<"${tmp_root}/forwarded-args.log")"
+assert_contains "${forwarded_log}" "MFEM_SRC=${fixture_mfem}"
+assert_contains "${forwarded_log}" \
+  "MFEM_BUILD=${fixture_mfem}/build-gpu-sm120"
+assert_contains "${forwarded_log}" \
+  "MFEM_INSTALL=${fixture_mfem}/install-gpu-sm120"
 assert_adjacent_args "${tmp_root}/forwarded-args.log" "--jobs" "7"
 assert_adjacent_args "${tmp_root}/forwarded-args.log" "--cuda-arch" "120"
 assert_adjacent_args "${tmp_root}/forwarded-args.log" "--cuda-codegen" "80-virtual"
 assert_not_exists "${tmp_root}/forwarded-spack.log"
+
+# The reuse tuple is revalidated only after a real dependency install and
+# before any view export or build consumer can observe the transition.
+assert_reuse_transaction_order "${BUILD_DRIVER}"
 
 # Keep the application-level fallback and gate native to the selected profile.
 if grep -Fq 'set(_dg_igr_default_cuda_arch "80-virtual")' "${REPO_ROOT}/CMakeLists.txt"; then
