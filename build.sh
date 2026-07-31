@@ -17,11 +17,20 @@ HDG_AUXILIARY_EXPERIMENT="OFF"
 SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
 CUDA_ARCH_WAS_SET=0
 PRINT_PLAN=0
+TEMP_ROOT=""
+TEMP_ROOT_SOURCE=""
 MFEM_REUSE_REQUEST=""
-MFEM_REUSE_ROOT=""
-MFEM_REUSE_BUILD=""
 MFEM_REUSE_STATE="disabled"
 MFEM_REUSE_ABI=""
+MFEM_TUPLE_STATE="unresolved"
+MFEM_SOURCE_ROOT=""
+MFEM_BUILD=""
+MFEM_INSTALL=""
+MFEM_BUILD_NAME=""
+MFEM_INSTALL_NAME=""
+MFEM_SOURCE_PIN=""
+MFEM_PICOJSON_BLOB=""
+MFEM_TINYXML2_BLOB=""
 SPACK_MANIFEST_SHA256=""
 SPACK_LOCK_SHA256=""
 
@@ -58,7 +67,7 @@ Options:
 
 Environment overrides:
   DG_IGR_SPACK_ENV, SPACK_CUDA_ARCH, MFEM_CUDA_ARCHS, APP_CUDA_ARCHS,
-  CMAKE_BUILD_TYPE, DG_IGR_ACCELERATOR_KERNEL_SOURCES
+  CMAKE_BUILD_TYPE, DG_IGR_ACCELERATOR_KERNEL_SOURCES, TMPDIR
 
 CUDA_ARCHS is intentionally rejected in GPU mode. Use MFEM_CUDA_ARCHS and
 APP_CUDA_ARCHS so MFEM compatibility code generation cannot be confused with
@@ -129,6 +138,210 @@ canonical_existing_path() {
   realpath -e -- "${path}"
 }
 
+preflight_temp_root() {
+  local requested probe_dir regular_probe fifo_probe probe_error cleanup_error
+
+  command -v realpath >/dev/null 2>&1 || {
+    echo "ERROR: temporary-directory preflight requires realpath." >&2
+    exit 3
+  }
+  command -v mktemp >/dev/null 2>&1 || {
+    echo "ERROR: temporary-directory preflight requires mktemp." >&2
+    exit 3
+  }
+  command -v mkfifo >/dev/null 2>&1 || {
+    echo "ERROR: temporary-directory preflight requires mkfifo." >&2
+    exit 3
+  }
+
+  if [[ -n "${TMPDIR:-}" ]]; then
+    requested="${TMPDIR}"
+    TEMP_ROOT_SOURCE="environment:TMPDIR"
+  else
+    requested="/tmp"
+    if [[ -n "${TMPDIR+x}" ]]; then
+      TEMP_ROOT_SOURCE="default:/tmp:TMPDIR-empty"
+    else
+      TEMP_ROOT_SOURCE="default:/tmp:TMPDIR-unset"
+    fi
+  fi
+  [[ -d "${requested}" ]] || {
+    echo "ERROR: selected temporary root is not a directory: ${requested}" >&2
+    exit 3
+  }
+  TEMP_ROOT="$(realpath -e -- "${requested}")" || {
+    echo "ERROR: unable to canonicalize selected temporary root: ${requested}" >&2
+    exit 3
+  }
+  [[ -d "${TEMP_ROOT}" ]] || {
+    echo "ERROR: canonical temporary root is not a directory: ${TEMP_ROOT}" >&2
+    exit 3
+  }
+
+  export TMPDIR="${TEMP_ROOT}"
+  export TEMP="${TEMP_ROOT}"
+  export TMP="${TEMP_ROOT}"
+
+  probe_dir="$(mktemp -d -- \
+    "${TEMP_ROOT}/dg-igr-build-temp-preflight.XXXXXXXX")" || {
+    echo "ERROR: selected temporary root cannot create a unique directory: ${TEMP_ROOT}" >&2
+    exit 3
+  }
+  regular_probe="${probe_dir}/regular-file"
+  fifo_probe="${probe_dir}/fifo"
+  probe_error=""
+  cleanup_error=0
+
+  if ! (umask 077; : >"${regular_probe}"); then
+    probe_error="cannot create a regular file"
+  elif [[ ! -f "${regular_probe}" ]]; then
+    probe_error="regular-file probe did not create a regular file"
+  elif ! mkfifo -m 600 -- "${fifo_probe}"; then
+    probe_error="cannot create a FIFO"
+  elif [[ ! -p "${fifo_probe}" ]]; then
+    probe_error="FIFO probe did not create a FIFO"
+  fi
+
+  rm -f -- "${regular_probe}" "${fifo_probe}" || cleanup_error=1
+  rmdir -- "${probe_dir}" || cleanup_error=1
+  if [[ -n "${probe_error}" ]]; then
+    echo "ERROR: selected temporary root ${probe_error}: ${TEMP_ROOT}" >&2
+    exit 3
+  fi
+  if ((cleanup_error)); then
+    echo "ERROR: unable to remove temporary preflight directory: ${probe_dir}" >&2
+    exit 3
+  fi
+}
+
+validate_mfem_source_checkout() {
+  local requested="$1"
+  local source_kind="$2"
+  local root root_top root_head expected_pin tracked_status
+  local header header_blob header_type actual_blob
+
+  [[ -d "${requested}" ]] || {
+    echo "ERROR: ${source_kind} MFEM source is not initialized: ${requested}" >&2
+    exit 3
+  }
+  [[ -e "${requested}/.git" ]] || {
+    echo "ERROR: ${source_kind} MFEM source has no checkout metadata and is not initialized: ${requested}" >&2
+    exit 3
+  }
+  root="$(realpath -e -- "${requested}")" || {
+    echo "ERROR: unable to canonicalize ${source_kind} MFEM source: ${requested}" >&2
+    exit 3
+  }
+  expected_pin="$(git -C "${SCRIPT_DIR}" rev-parse HEAD:tpl/mfem 2>/dev/null)" || {
+    echo "ERROR: current application HEAD has no readable tpl/mfem gitlink." >&2
+    exit 3
+  }
+  root_top="$(git -C "${root}" rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "ERROR: ${source_kind} MFEM source is not a Git checkout: ${root}" >&2
+    exit 3
+  }
+  root_top="$(realpath -e -- "${root_top}")"
+  [[ "${root_top}" == "${root}" ]] || {
+    echo "ERROR: ${source_kind} MFEM source is not the checkout top level: root=${root} top=${root_top}" >&2
+    exit 3
+  }
+  root_head="$(git -C "${root}" rev-parse HEAD 2>/dev/null)" || {
+    echo "ERROR: ${source_kind} MFEM source has no readable HEAD: ${root}" >&2
+    exit 3
+  }
+  [[ "${root_head}" == "${expected_pin}" ]] || {
+    echo "ERROR: ${source_kind} MFEM pin mismatch: expected=${expected_pin} actual=${root_head}" >&2
+    exit 3
+  }
+
+  for header in fem/picojson.h general/tinyxml2.h; do
+    header_blob="$(git -C "${root}" rev-parse \
+      "${expected_pin}:${header}" 2>/dev/null)" || {
+      echo "ERROR: MFEM source header is not tracked at the pinned commit: ${header}" >&2
+      exit 3
+    }
+    header_type="$(git -C "${root}" cat-file -t "${header_blob}" 2>/dev/null)" || {
+      echo "ERROR: MFEM source header object is unreadable: path=${header} blob=${header_blob}" >&2
+      exit 3
+    }
+    [[ "${header_type}" == "blob" ]] || {
+      echo "ERROR: MFEM source header is not a blob: path=${header} type=${header_type}" >&2
+      exit 3
+    }
+    [[ -f "${root}/${header}" ]] || {
+      echo "ERROR: MFEM source header is missing: ${root}/${header}" >&2
+      exit 3
+    }
+    actual_blob="$(git -C "${root}" hash-object --no-filters -- "${header}")" || {
+      echo "ERROR: unable to hash MFEM source header: ${root}/${header}" >&2
+      exit 3
+    }
+    [[ "${actual_blob}" == "${header_blob}" ]] || {
+      echo "ERROR: MFEM source header identity mismatch: path=${root}/${header} expected_blob=${header_blob} actual_blob=${actual_blob}" >&2
+      exit 3
+    }
+    case "${header}" in
+      fem/picojson.h) MFEM_PICOJSON_BLOB="${header_blob}" ;;
+      general/tinyxml2.h) MFEM_TINYXML2_BLOB="${header_blob}" ;;
+    esac
+  done
+
+  tracked_status="$(GIT_OPTIONAL_LOCKS=0 git -C "${root}" status \
+    --porcelain=v1 --untracked-files=no)" || {
+    echo "ERROR: unable to inspect ${source_kind} MFEM tracked state: ${root}" >&2
+    exit 3
+  }
+  [[ -z "${tracked_status}" ]] || {
+    echo "ERROR: ${source_kind} MFEM tracked source/index is dirty: ${root}" >&2
+    printf '%s\n' "${tracked_status}" >&2
+    exit 3
+  }
+
+  MFEM_SOURCE_ROOT="${root}"
+  MFEM_SOURCE_PIN="${expected_pin}"
+}
+
+validate_local_mfem_artifacts() {
+  local cache config archive cache_home cache_prefix
+  local canonical_home canonical_prefix
+
+  validate_mfem_source_checkout "${MFEM_SOURCE_ROOT}" "local"
+  cache="${MFEM_BUILD}/CMakeCache.txt"
+  config="${MFEM_INSTALL}/lib/cmake/mfem/MFEMConfig.cmake"
+  archive="${MFEM_INSTALL}/lib/libmfem.a"
+  [[ -f "${cache}" ]] || {
+    echo "ERROR: local MFEM CMake cache is missing after helper success: ${cache}" >&2
+    exit 3
+  }
+  [[ -f "${config}" ]] || {
+    echo "ERROR: local MFEM package config is missing after helper success: ${config}" >&2
+    exit 3
+  }
+  [[ -f "${archive}" ]] || {
+    echo "ERROR: local MFEM archive is missing after helper success: ${archive}" >&2
+    exit 3
+  }
+  cache_home="$(cache_value "${cache}" CMAKE_HOME_DIRECTORY)"
+  cache_prefix="$(cache_value "${cache}" CMAKE_INSTALL_PREFIX)"
+  canonical_home="$(canonical_existing_path "${cache_home}")" || {
+    echo "ERROR: local MFEM cache source identity is missing or moved: ${cache_home:-<missing>}" >&2
+    exit 3
+  }
+  canonical_prefix="$(canonical_existing_path "${cache_prefix}")" || {
+    echo "ERROR: local MFEM cache install identity is missing or moved: ${cache_prefix:-<missing>}" >&2
+    exit 3
+  }
+  [[ "${canonical_home}" == "${MFEM_SOURCE_ROOT}" &&
+     "${canonical_prefix}" == "${MFEM_INSTALL}" ]] || {
+    echo "ERROR: local MFEM cache does not match the selected source/install tuple." >&2
+    echo "       source expected=${MFEM_SOURCE_ROOT} actual=${canonical_home}" >&2
+    echo "       install expected=${MFEM_INSTALL} actual=${canonical_prefix}" >&2
+    exit 3
+  }
+  MFEM_TUPLE_STATE="local-source-build-install-validated"
+  echo "[mfem] tuple validated: source=${MFEM_SOURCE_ROOT} build=${MFEM_BUILD} install=${MFEM_INSTALL}"
+}
+
 spack_identity() {
   local package="$1"
   local prefix_variable="$2"
@@ -197,44 +410,76 @@ assert_reuse_fixture_rejected() {
   }
 }
 
+assert_pre_spack_fixture_rejected() {
+  local expected="$1"
+  local sentinel="$2"
+  shift 2
+  local output status
+  [[ ! -e "${sentinel}" ]] || {
+    echo "ERROR: pre-Spack fixture sentinel already exists: ${sentinel}" >&2
+    exit 3
+  }
+  set +e
+  output="$("$@" 2>&1)"
+  status=$?
+  set -e
+  [[ ${status} -eq 3 && "${output}" == *"${expected}"* &&
+     ! -e "${sentinel}" ]] || {
+    echo "ERROR: pre-Spack fixture expected '${expected}' with exit 3 and no Spack call; exit=${status} output=${output}" >&2
+    exit 3
+  }
+}
+
+assert_reuse_fixture_accepted() {
+  local expected_source="$1"
+  local expected_build="$2"
+  local expected_install="$3"
+  local expected_temp_source="$4"
+  shift 4
+  local output status
+  set +e
+  output="$("$@" 2>&1)"
+  status=$?
+  set -e
+  [[ ${status} -eq 0 &&
+     "${output}" == *"mfem_source=${expected_source}"* &&
+     "${output}" == *"mfem_build=${expected_build}"* &&
+     "${output}" == *"mfem_install=${expected_install}"* &&
+     "${output}" == *"temp_source=${expected_temp_source}"* ]] || {
+    echo "ERROR: reuse fixture expected an exact-source plan; exit=${status} output=${output}" >&2
+    exit 3
+  }
+}
+
 make_reuse_fixture() {
   local label="$1"
   local source_root="$2"
   local fixture="${DG_IGR_REUSE_FIXTURE_ROOT}/${label}"
-  local build_name install_name source_build source_install
+  local source_build source_install
   git -c advice.detachedHead=false clone --quiet --shared \
     "${source_root}" "${fixture}"
   git -c advice.detachedHead=false -C "${fixture}" checkout --quiet \
     --detach "$(git -C "${source_root}" rev-parse HEAD)"
-  if [[ "${MODE}" == "gpu" ]]; then
-    build_name="build-gpu-sm${SPACK_CUDA_ARCH}"
-    install_name="install-gpu-sm${SPACK_CUDA_ARCH}"
-  elif ((CALIPER)); then
-    build_name="build-cpu-caliper"
-    install_name="install-cpu-caliper"
-  else
-    build_name="build-cpu"
-    install_name="install-cpu"
-  fi
-  source_build="${source_root}/${build_name}"
-  source_install="${source_root}/${install_name}"
-  mkdir -p "${fixture}/${build_name}" \
-           "${fixture}/${install_name}/lib/cmake/mfem" \
-           "${fixture}/${install_name}/lib"
+  source_build="${source_root}/${MFEM_BUILD_NAME}"
+  source_install="${source_root}/${MFEM_INSTALL_NAME}"
+  mkdir -p "${fixture}/${MFEM_BUILD_NAME}" \
+           "${fixture}/${MFEM_INSTALL_NAME}/lib/cmake/mfem" \
+           "${fixture}/${MFEM_INSTALL_NAME}/lib"
   cp "${source_build}/CMakeCache.txt" \
-     "${fixture}/${build_name}/CMakeCache.txt"
+     "${fixture}/${MFEM_BUILD_NAME}/CMakeCache.txt"
   cp "${source_install}/lib/cmake/mfem/MFEMConfig.cmake" \
-     "${fixture}/${install_name}/lib/cmake/mfem/MFEMConfig.cmake"
+     "${fixture}/${MFEM_INSTALL_NAME}/lib/cmake/mfem/MFEMConfig.cmake"
   ln -s "${source_install}/lib/libmfem.a" \
-        "${fixture}/${install_name}/lib/libmfem.a"
+        "${fixture}/${MFEM_INSTALL_NAME}/lib/libmfem.a"
   sed -i -e "s|${source_root}|${fixture}|g" \
-    "${fixture}/${build_name}/CMakeCache.txt"
+    "${fixture}/${MFEM_BUILD_NAME}/CMakeCache.txt"
   DG_IGR_REUSE_FIXTURE="${fixture}"
-  DG_IGR_REUSE_FIXTURE_CACHE="${fixture}/${build_name}/CMakeCache.txt"
+  DG_IGR_REUSE_FIXTURE_CACHE="${fixture}/${MFEM_BUILD_NAME}/CMakeCache.txt"
 }
 
 run_reuse_compatibility_fixtures() {
-  local source_root="${MFEM_REUSE_ROOT}"
+  local source_root="${MFEM_SOURCE_ROOT}"
+  local fake_spack_dir bad_temp_root sentinel
   local -a mode_args=(--cpu-only)
   if [[ "${MODE}" == "gpu" ]]; then
     mode_args=(--gpu --cuda-arch "${SPACK_CUDA_ARCH}")
@@ -245,6 +490,72 @@ run_reuse_compatibility_fixtures() {
     "${TMPDIR:-/tmp}/dg-igr-reuse-fixtures.XXXXXX")"
   export DG_IGR_REUSE_FIXTURE_ROOT
   trap 'rm -rf -- "${DG_IGR_REUSE_FIXTURE_ROOT}"' EXIT
+
+  fake_spack_dir="${DG_IGR_REUSE_FIXTURE_ROOT}/fake-spack-bin"
+  mkdir -p "${fake_spack_dir}"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    ': >"${DG_IGR_FAKE_SPACK_SENTINEL:?}"' \
+    'exit 99' >"${fake_spack_dir}/spack"
+  chmod +x "${fake_spack_dir}/spack"
+
+  bad_temp_root="${DG_IGR_REUSE_FIXTURE_ROOT}/not-a-directory"
+  : >"${bad_temp_root}"
+  sentinel="${DG_IGR_REUSE_FIXTURE_ROOT}/temp-spack-called"
+  assert_pre_spack_fixture_rejected \
+    "selected temporary root is not a directory" "${sentinel}" \
+    env TMPDIR="${bad_temp_root}" PATH="${fake_spack_dir}:${PATH}" \
+    DG_IGR_FAKE_SPACK_SENTINEL="${sentinel}" \
+    DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+    bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+    --reuse-mfem-root "${source_root}" --no-deps --no-tests --print-plan
+
+  sentinel="${DG_IGR_REUSE_FIXTURE_ROOT}/source-spack-called"
+  assert_pre_spack_fixture_rejected \
+    "MFEM source has no checkout metadata" "${sentinel}" \
+    env PATH="${fake_spack_dir}:${PATH}" \
+    DG_IGR_FAKE_SPACK_SENTINEL="${sentinel}" \
+    DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+    bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+    --reuse-mfem-root "${source_root}/fem" \
+    --no-deps --no-tests --print-plan
+
+  make_reuse_fixture exact-source "${source_root}"
+  assert_reuse_fixture_accepted \
+    "${DG_IGR_REUSE_FIXTURE}" \
+    "${DG_IGR_REUSE_FIXTURE}/${MFEM_BUILD_NAME}" \
+    "${DG_IGR_REUSE_FIXTURE}/${MFEM_INSTALL_NAME}" \
+    "default:/tmp:TMPDIR-empty" \
+    env TMPDIR= DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+    bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+    --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+    --no-deps --no-tests --print-plan
+
+  make_reuse_fixture missing-header "${source_root}"
+  rm -f -- "${DG_IGR_REUSE_FIXTURE}/fem/picojson.h"
+  sentinel="${DG_IGR_REUSE_FIXTURE_ROOT}/missing-header-spack-called"
+  assert_pre_spack_fixture_rejected \
+    "MFEM source header is missing" "${sentinel}" \
+    env PATH="${fake_spack_dir}:${PATH}" \
+    DG_IGR_FAKE_SPACK_SENTINEL="${sentinel}" \
+    DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+    bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+    --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+    --no-deps --no-tests --print-plan
+
+  make_reuse_fixture modified-header "${source_root}"
+  printf '\n// reuse-fixture modification\n' >> \
+    "${DG_IGR_REUSE_FIXTURE}/general/tinyxml2.h"
+  sentinel="${DG_IGR_REUSE_FIXTURE_ROOT}/modified-header-spack-called"
+  assert_pre_spack_fixture_rejected \
+    "MFEM source header identity mismatch" "${sentinel}" \
+    env PATH="${fake_spack_dir}:${PATH}" \
+    DG_IGR_FAKE_SPACK_SENTINEL="${sentinel}" \
+    DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+    bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
+    --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+    --no-deps --no-tests --print-plan
 
   make_reuse_fixture compiler "${source_root}"
   sed -i \
@@ -298,7 +609,7 @@ run_reuse_compatibility_fixtures() {
   trap - EXIT
   unset DG_IGR_REUSE_FIXTURE_ROOT DG_IGR_REUSE_FIXTURE \
         DG_IGR_REUSE_FIXTURE_CACHE
-  echo "[reuse-fixtures] positive and negative compatibility cases passed"
+  echo "[reuse-fixtures] exact-source, header, and compatibility cases passed"
 }
 
 is_cmake_true() {
@@ -317,8 +628,7 @@ is_cmake_false() {
 
 validate_reused_mfem() {
   local requested="$1"
-  local root expected_pin root_head root_top tracked_status
-  local build_name install_name build install cache config archive
+  local root build install cache config archive
   local cache_home cache_prefix canonical_home canonical_prefix
   local mpi_enabled cuda_enabled raja_enabled umpire_enabled configured_archs
   local cache_cxx cache_mpi_cxx config_cxx expected_mpicxx expected_mpicc
@@ -334,48 +644,8 @@ validate_reused_mfem() {
   local metadata_cuda metadata_cuda_root cuda_host_compiler
   local cuda_host_compiler_id cuda_host_compiler_version
 
-  command -v realpath >/dev/null 2>&1 || {
-    echo "ERROR: --reuse-mfem-root requires realpath." >&2
-    exit 3
-  }
-  [[ -d "${requested}" ]] || {
-    echo "ERROR: reused MFEM root does not exist or is not a directory: ${requested}" >&2
-    exit 3
-  }
-  root="$(realpath -e -- "${requested}")" || {
-    echo "ERROR: unable to canonicalize reused MFEM root: ${requested}" >&2
-    exit 3
-  }
-  expected_pin="$(git -C "${SCRIPT_DIR}" rev-parse HEAD:tpl/mfem 2>/dev/null)" || {
-    echo "ERROR: current application HEAD has no readable tpl/mfem gitlink." >&2
-    exit 3
-  }
-  root_top="$(git -C "${root}" rev-parse --show-toplevel 2>/dev/null)" || {
-    echo "ERROR: reused MFEM root is not a Git checkout: ${root}" >&2
-    exit 3
-  }
-  root_top="$(realpath -e -- "${root_top}")"
-  [[ "${root_top}" == "${root}" ]] || {
-    echo "ERROR: reused MFEM root is not the checkout top level: root=${root} top=${root_top}" >&2
-    exit 3
-  }
-  root_head="$(git -C "${root}" rev-parse HEAD 2>/dev/null)" || {
-    echo "ERROR: reused MFEM root has no readable HEAD: ${root}" >&2
-    exit 3
-  }
-  [[ "${root_head}" == "${expected_pin}" ]] || {
-    echo "ERROR: reused MFEM pin mismatch: expected=${expected_pin} actual=${root_head}" >&2
-    exit 3
-  }
-  tracked_status="$(GIT_OPTIONAL_LOCKS=0 git -C "${root}" status --porcelain=v1 --untracked-files=no)" || {
-    echo "ERROR: unable to inspect reused MFEM tracked state: ${root}" >&2
-    exit 3
-  }
-  [[ -z "${tracked_status}" ]] || {
-    echo "ERROR: reused MFEM tracked source/index is dirty: ${root}" >&2
-    printf '%s\n' "${tracked_status}" >&2
-    exit 3
-  }
+  validate_mfem_source_checkout "${requested}" "reused"
+  root="${MFEM_SOURCE_ROOT}"
 
   command -v spack >/dev/null 2>&1 || {
     echo "ERROR: --reuse-mfem-root requires Spack metadata; source setup-env.sh first." >&2
@@ -408,18 +678,8 @@ validate_reused_mfem() {
     exit 3
   }
 
-  if [[ "${MODE}" == "gpu" ]]; then
-    build_name="build-gpu-sm${SPACK_CUDA_ARCH}"
-    install_name="install-gpu-sm${SPACK_CUDA_ARCH}"
-  elif ((CALIPER)); then
-    build_name="build-cpu-caliper"
-    install_name="install-cpu-caliper"
-  else
-    build_name="build-cpu"
-    install_name="install-cpu"
-  fi
-  build="${root}/${build_name}"
-  install="${root}/${install_name}"
+  build="${root}/${MFEM_BUILD_NAME}"
+  install="${root}/${MFEM_INSTALL_NAME}"
   cache="${build}/CMakeCache.txt"
   config="${install}/lib/cmake/mfem/MFEMConfig.cmake"
   archive="${install}/lib/libmfem.a"
@@ -730,10 +990,11 @@ validate_reused_mfem() {
     MFEM_REUSE_ABI="compiler=${mpi_compiler};mpi=${mpi_hash};hypre=${hypre_hash};raja=${raja_state};umpire=${umpire_state};cuda=off;arch=none"
   fi
 
-  MFEM_REUSE_ROOT="${root}"
-  MFEM_REUSE_BUILD="${build}"
-  MFEM_REUSE_STATE="validated-read-only"
+  MFEM_SOURCE_ROOT="${root}"
+  MFEM_BUILD="${build}"
   MFEM_INSTALL="${install}"
+  MFEM_REUSE_STATE="validated-read-only"
+  MFEM_TUPLE_STATE="reuse-source-build-install-validated"
 }
 
 if [[ -z "${MFEM_JOBS}" ]]; then
@@ -774,12 +1035,15 @@ if [[ "${MODE}" == "gpu" && -n "${CUDA_ARCHS+x}" ]]; then
   exit 2
 fi
 
+preflight_temp_root
+
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 if [[ "${MODE}" == "gpu" ]]; then
   PROFILE="cuda-sm${SPACK_CUDA_ARCH}"
   DEPENDENCY_CUDA_ARCH="${SPACK_CUDA_ARCH}"
   SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/${PROFILE}}"
-  MFEM_INSTALL="${SCRIPT_DIR}/tpl/mfem/install-gpu-sm${SPACK_CUDA_ARCH}"
+  MFEM_BUILD_NAME="build-gpu-sm${SPACK_CUDA_ARCH}"
+  MFEM_INSTALL_NAME="install-gpu-sm${SPACK_CUDA_ARCH}"
   APP_BUILD="${SCRIPT_DIR}/build-gpu-sm${SPACK_CUDA_ARCH}"
   APP_INSTALL="${SCRIPT_DIR}/install-gpu-sm${SPACK_CUDA_ARCH}"
   EXPECTED_MFEM_CUDA_ARCHS="${SPACK_CUDA_ARCH}"
@@ -806,13 +1070,15 @@ else
   if ((CALIPER)); then
     PROFILE="cpu-caliper"
     SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu-caliper}"
-    MFEM_INSTALL="${SCRIPT_DIR}/tpl/mfem/install-cpu-caliper"
+    MFEM_BUILD_NAME="build-cpu-caliper"
+    MFEM_INSTALL_NAME="install-cpu-caliper"
     APP_BUILD="${SCRIPT_DIR}/build-cpu-caliper"
     APP_INSTALL="${SCRIPT_DIR}/install-cpu-caliper"
   else
     PROFILE="cpu"
     SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu}"
-    MFEM_INSTALL="${SCRIPT_DIR}/tpl/mfem/install-cpu"
+    MFEM_BUILD_NAME="build-cpu"
+    MFEM_INSTALL_NAME="install-cpu"
     APP_BUILD="${SCRIPT_DIR}/build-cpu"
     APP_INSTALL="${SCRIPT_DIR}/install-cpu"
   fi
@@ -822,6 +1088,11 @@ fi
 
 if [[ -n "${MFEM_REUSE_REQUEST}" ]]; then
   validate_reused_mfem "${MFEM_REUSE_REQUEST}"
+else
+  validate_mfem_source_checkout "${SCRIPT_DIR}/tpl/mfem" "local"
+  MFEM_BUILD="${MFEM_SOURCE_ROOT}/${MFEM_BUILD_NAME}"
+  MFEM_INSTALL="${MFEM_SOURCE_ROOT}/${MFEM_INSTALL_NAME}"
+  MFEM_TUPLE_STATE="local-source-validated-artifacts-planned"
 fi
 if [[ "${DG_IGR_RUN_REUSE_FIXTURES:-0}" == "1" ]]; then
   [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]] || {
@@ -833,8 +1104,10 @@ fi
 
 echo "[build-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH} mfem_cuda_archs=${MFEM_CUDA_ARCHS} app_cuda_archs=${APP_CUDA_ARCHS} app_jobs=${JOBS} mfem_jobs=${MFEM_JOBS}"
 echo "[build-plan] env=${SPACK_ENV} app_build=${APP_BUILD} app_install=${APP_INSTALL}"
+echo "[build-plan] temp_root=${TEMP_ROOT} temp_source=${TEMP_ROOT_SOURCE} temp_env=TMPDIR,TEMP,TMP"
 echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT}"
-echo "[build-plan] mfem_reuse_root=${MFEM_REUSE_ROOT:-none} mfem_reuse_build=${MFEM_REUSE_BUILD:-none} mfem_install=${MFEM_INSTALL} mfem_reuse_state=${MFEM_REUSE_STATE}"
+echo "[build-plan] mfem_source=${MFEM_SOURCE_ROOT} mfem_build=${MFEM_BUILD} mfem_install=${MFEM_INSTALL} mfem_tuple_state=${MFEM_TUPLE_STATE} mfem_reuse_state=${MFEM_REUSE_STATE}"
+echo "[build-plan] mfem_source_pin=${MFEM_SOURCE_PIN} fem_picojson_blob=${MFEM_PICOJSON_BLOB} general_tinyxml2_blob=${MFEM_TINYXML2_BLOB}"
 if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
   echo "[build-plan] mfem_reuse_abi=${MFEM_REUSE_ABI}"
   echo "[build-plan] spack_manifest_sha256=${SPACK_MANIFEST_SHA256} spack_lock_sha256=${SPACK_LOCK_SHA256}"
@@ -884,13 +1157,16 @@ else
   mfem_args+=(--no-clean)
 fi
 if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
-  echo "[mfem] reuse validated: root=${MFEM_REUSE_ROOT} build=${MFEM_REUSE_BUILD} install=${MFEM_INSTALL}"
-  export DG_IGR_TEST_REUSE_MFEM_ROOT="${MFEM_REUSE_ROOT}"
+  echo "[mfem] reuse validated: source=${MFEM_SOURCE_ROOT} build=${MFEM_BUILD} install=${MFEM_INSTALL}"
+  export DG_IGR_TEST_REUSE_MFEM_ROOT="${MFEM_SOURCE_ROOT}"
   export DG_IGR_TEST_REUSE_SPACK_ENV="${SPACK_ENV}"
   export DG_IGR_TEST_REUSE_MODE="${MODE}"
 else
   DG_IGR_SPACK_ENV="${SPACK_ENV}" CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+    MFEM_SRC="${MFEM_SOURCE_ROOT}" MFEM_BUILD="${MFEM_BUILD}" \
+    MFEM_INSTALL="${MFEM_INSTALL}" \
     "${SCRIPT_DIR}/build_mfem_tpl.sh" "${mfem_args[@]}"
+  validate_local_mfem_artifacts
 fi
 
 CMAKE_BIN="$(spack -e "${SPACK_ENV}" location -i cmake)/bin/cmake"
@@ -905,6 +1181,7 @@ app_cmake_args=(
   -DCMAKE_CXX_COMPILER="${MPI_PREFIX}/bin/mpicxx"
   -DCMAKE_INSTALL_PREFIX="${APP_INSTALL}"
   -DMFEM_DIR="${MFEM_INSTALL}/lib/cmake/mfem"
+  -DDG_IGR_MFEM_SOURCE_ROOT:PATH="${MFEM_SOURCE_ROOT}"
   -DZLIB_ROOT="${SPACK_VIEW}"
   -DDG_IGR_ENABLE_HDG_EULER_EXPERIMENT="${HDG_EULER_EXPERIMENT}"
   -DDG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT="${HDG_EULER_DEVICE_EXPERIMENT}"

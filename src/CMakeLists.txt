@@ -1,4 +1,21 @@
 # Collect all source files (including module subdirectories)
+set(DG_IGR_MFEM_SOURCE_ROOT
+    "${CMAKE_SOURCE_DIR}/tpl/mfem"
+    CACHE PATH
+    "Exact MFEM source checkout supplying source-internal headers.")
+foreach(_dg_igr_mfem_source_header IN ITEMS
+        fem/picojson.h
+        general/tinyxml2.h)
+    if(NOT EXISTS
+       "${DG_IGR_MFEM_SOURCE_ROOT}/${_dg_igr_mfem_source_header}" OR
+       IS_DIRECTORY
+       "${DG_IGR_MFEM_SOURCE_ROOT}/${_dg_igr_mfem_source_header}")
+        message(FATAL_ERROR
+                "Required MFEM source header is missing: "
+                "${DG_IGR_MFEM_SOURCE_ROOT}/${_dg_igr_mfem_source_header}")
+    endif()
+endforeach()
+
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "*.cpp")
 
 # W8 runtime and auxiliary sources are owned by strict named component targets.
@@ -107,8 +124,8 @@ target_include_directories(igr_mfem PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
 target_include_directories(igr_mfem PRIVATE
-    ${CMAKE_SOURCE_DIR}/tpl/mfem/fem
-    ${CMAKE_SOURCE_DIR}/tpl/mfem/general
+    ${DG_IGR_MFEM_SOURCE_ROOT}/fem
+    ${DG_IGR_MFEM_SOURCE_ROOT}/general
 )
 target_compile_definitions(igr_mfem PUBLIC
     DG_IGR_ENABLE_OBSERVABILITY=$<BOOL:${DG_IGR_ENABLE_OBSERVABILITY}>
