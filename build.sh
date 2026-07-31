@@ -55,8 +55,8 @@ Options:
   --mfem-jobs N     Parallel MFEM build jobs (default: --jobs value).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
   --reuse-mfem-root DIR
-                    Reuse a validated, read-only MFEM build/install rooted at
-                    DIR instead of invoking build_mfem_tpl.sh.
+                    Reuse a validated, read-only MFEM source/build/install
+                    tuple rooted at DIR instead of invoking build_mfem_tpl.sh.
   --print-plan      Validate and print the resolved build policy, then exit.
   --clean           Rebuild the selected mode from clean caches (default).
   --no-clean        Reuse existing build and install directories.
