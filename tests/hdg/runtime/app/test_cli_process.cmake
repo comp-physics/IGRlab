@@ -12,11 +12,31 @@ if(HDG_RUNTIME_RANKS EQUAL 1 AND
    DEFINED HDG_RUNTIME_BUILD_DRIVER AND
    NOT "$ENV{DG_IGR_TEST_REUSE_MFEM_ROOT}" STREQUAL "" AND
    NOT "$ENV{DG_IGR_TEST_REUSE_SPACK_ENV}" STREQUAL "" AND
-   NOT "$ENV{DG_IGR_TEST_REUSE_MODE}" STREQUAL "")
+   NOT "$ENV{DG_IGR_TEST_REUSE_MODE}" STREQUAL "" AND
+   NOT "$ENV{DG_IGR_TEST_REUSE_PROFILE}" STREQUAL "" AND
+   NOT "$ENV{DG_IGR_TEST_REUSE_CALIPER}" STREQUAL "" AND
+   NOT "$ENV{DG_IGR_TEST_REUSE_CUDA_ARCH}" STREQUAL "")
   if("$ENV{DG_IGR_TEST_REUSE_MODE}" STREQUAL "gpu")
-    set(reuse_mode_args --gpu --cuda-arch 120)
+    if(NOT "$ENV{DG_IGR_TEST_REUSE_CALIPER}" STREQUAL "0" OR
+       NOT "$ENV{DG_IGR_TEST_REUSE_CUDA_ARCH}" MATCHES "^[0-9]+$" OR
+       NOT "$ENV{DG_IGR_TEST_REUSE_PROFILE}" STREQUAL
+           "cuda-sm$ENV{DG_IGR_TEST_REUSE_CUDA_ARCH}")
+      message(FATAL_ERROR "inconsistent GPU reuse-fixture profile")
+    endif()
+    set(reuse_mode_args --gpu --cuda-arch
+      "$ENV{DG_IGR_TEST_REUSE_CUDA_ARCH}")
   elseif("$ENV{DG_IGR_TEST_REUSE_MODE}" STREQUAL "cpu")
-    set(reuse_mode_args --cpu-only)
+    if(NOT "$ENV{DG_IGR_TEST_REUSE_CUDA_ARCH}" STREQUAL "none")
+      message(FATAL_ERROR "inconsistent CPU reuse-fixture CUDA profile")
+    elseif("$ENV{DG_IGR_TEST_REUSE_PROFILE}" STREQUAL "cpu" AND
+           "$ENV{DG_IGR_TEST_REUSE_CALIPER}" STREQUAL "0")
+      set(reuse_mode_args --cpu-only)
+    elseif("$ENV{DG_IGR_TEST_REUSE_PROFILE}" STREQUAL "cpu-caliper" AND
+           "$ENV{DG_IGR_TEST_REUSE_CALIPER}" STREQUAL "1")
+      set(reuse_mode_args --cpu-only --caliper)
+    else()
+      message(FATAL_ERROR "inconsistent CPU reuse-fixture profile")
+    endif()
   else()
     message(FATAL_ERROR "invalid reuse-fixture mode")
   endif()

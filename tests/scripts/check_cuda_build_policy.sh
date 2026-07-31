@@ -63,6 +63,67 @@ assert_reuse_transaction_order() {
   }
 }
 
+assert_reuse_identity_policy() {
+  local driver="$1"
+  local record="$2"
+  local record_sha
+  local altered_record altered_sha
+  local expected
+
+  for expected in \
+      'cmake_install.cmake' \
+      'CMakeFiles/cmake.check_cache' \
+      'MFEMTargets.cmake' \
+      'MFEMTargets-${targets_config_suffix}.cmake' \
+      'CMakeCXXCompiler.cmake' \
+      'require_exact_mfem_directory' \
+      'require_exact_mfem_file' \
+      'write_local_mfem_identity_stamp' \
+      'verify_reviewed_mfem_admission' \
+      'mfem_reviewed_admission_record_matches' \
+      'MFEM_REUSE_POST_MANIFEST_SHA256' \
+      'MFEM_REUSE_PRE_MANIFEST_SHA256' \
+      'MFEM_REUSE_POST_LOCK_SHA256' \
+      'MFEM_REUSE_PRE_LOCK_SHA256' \
+      'export DG_IGR_TEST_REUSE_PROFILE="${PROFILE}"' \
+      'export DG_IGR_TEST_REUSE_CALIPER="${CALIPER}"' \
+      'export DG_IGR_TEST_REUSE_CUDA_ARCH="${DEPENDENCY_CUDA_ARCH}"'; do
+    grep -Fq "${expected}" "${driver}" || {
+      fail "reuse identity policy is missing '${expected}'"
+    }
+  done
+  if grep -Fq 'make_reuse_fixture' "${driver}" ||
+     grep -Fq 'DG_IGR_REUSE_FIXTURE_CACHE' "${driver}" ||
+     grep -Fq 'cp "${source_build}/CMakeCache.txt"' "${driver}"; then
+    fail "reuse fixtures still reconstruct an accepted MFEM tuple"
+  fi
+
+  [[ -f "${record}" && ! -L "${record}" ]] || {
+    fail "reviewed MFEM admission record is missing or symlinked: ${record}"
+  }
+  record_sha="$(sha256sum "${record}" | cut -d' ' -f1)"
+  [[ "${record_sha}" == \
+     "d4e0f68d795d30ecb3e403f797ecf4ccd4ec8ed79ba5746a997f68bd6eae98ec" ]] || {
+    fail "reviewed MFEM admission record hash mismatch: ${record_sha}"
+  }
+  grep -Fq \
+    'MFEM_REVIEWED_ADMISSION_SHA256="d4e0f68d795d30ecb3e403f797ecf4ccd4ec8ed79ba5746a997f68bd6eae98ec"' \
+    "${driver}" || fail "build driver does not pin the reviewed admission hash"
+  altered_record="${tmp_root}/altered-reviewed-mfem-admission.json"
+  sed 's/"version": "1"/"version": "0"/' \
+    "${record}" >"${altered_record}"
+  altered_sha="$(sha256sum "${altered_record}" | cut -d' ' -f1)"
+  [[ "${altered_sha}" != "${record_sha}" ]] || {
+    fail "reviewed MFEM admission mismatch fixture retained the admitted hash"
+  }
+  grep -Fq \
+    '"claim": "current tuple observed, independently reviewed, prospectively admitted for reuse; raw W8A ledgers are corroboration, not retroactive immutable proof"' \
+    "${record}" || fail "reviewed MFEM admission claim changed"
+  grep -Fq \
+    '"sealed_dev3_cpu_manifest_sha256": "008605ffe7d0192689a6dcdcebfcee7fcac4ead307ff6c6403ee36731ce2d59d"' \
+    "${record}" || fail "reviewed MFEM admission lost the DEV-3 anchor"
+}
+
 [[ -f "${BUILD_DRIVER}" ]] || fail "missing build driver: ${BUILD_DRIVER}"
 [[ -f "${MFEM_DRIVER}" ]] || fail "missing MFEM driver: ${MFEM_DRIVER}"
 
@@ -189,6 +250,20 @@ assert_contains "${plan}" "app_jobs=9 mfem_jobs=9"
 # Unsafe architecture selections must fail before dependency, helper, or cache
 # actions even without --print-plan.
 set +e
+reject_output="$(PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/empty-reuse-helper.log" \
+  FAKE_SPACK_LOG="${tmp_root}/empty-reuse-spack.log" \
+  bash "${fixture_root}/build.sh" --reuse-mfem-root '' \
+    --no-deps --no-tests --print-plan 2>&1)"
+reject_rc=$?
+set -e
+[[ ${reject_rc} -eq 2 ]] || fail "empty reuse root exited ${reject_rc}, expected 2"
+assert_contains "${reject_output}" \
+  "--reuse-mfem-root requires a non-empty value"
+assert_not_exists "${tmp_root}/empty-reuse-helper.log"
+assert_not_exists "${tmp_root}/empty-reuse-spack.log"
+
+set +e
 reject_output="$(env -u CUDA_ARCHS -u APP_CUDA_ARCHS -u SPACK_CUDA_ARCH \
   PATH="${fake_bin}:/usr/bin:/bin" \
   FAKE_HELPER_LOG="${tmp_root}/unsafe-mfem-helper.log" \
@@ -301,6 +376,18 @@ assert_not_exists "${tmp_root}/forwarded-spack.log"
 # The reuse tuple is revalidated only after a real dependency install and
 # before any view export or build consumer can observe the transition.
 assert_reuse_transaction_order "${BUILD_DRIVER}"
+assert_reuse_identity_policy "${BUILD_DRIVER}" \
+  "${REPO_ROOT}/cmake/mfem-reuse-identities/cpu-w8a-d9d6526-973e5abc.json"
+
+reuse_fixture_cmake="${REPO_ROOT}/tests/hdg/runtime/app/test_cli_process.cmake"
+grep -Fq 'set(reuse_mode_args --cpu-only --caliper)' \
+  "${reuse_fixture_cmake}" || fail "Caliper reuse fixtures are not propagated"
+grep -Fq '"$ENV{DG_IGR_TEST_REUSE_CUDA_ARCH}"' \
+  "${reuse_fixture_cmake}" || fail "selected reuse CUDA architecture is not propagated"
+if grep -Fq 'set(reuse_mode_args --gpu --cuda-arch 120)' \
+    "${reuse_fixture_cmake}"; then
+  fail "reuse fixture still hardcodes CUDA architecture 120"
+fi
 
 # Keep the application-level fallback and gate native to the selected profile.
 if grep -Fq 'set(_dg_igr_default_cuda_arch "80-virtual")' "${REPO_ROOT}/CMakeLists.txt"; then

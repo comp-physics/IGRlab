@@ -29,6 +29,16 @@ MFEM_REUSE_PRE_INSTALL=""
 MFEM_REUSE_PRE_MANIFEST_SHA256=""
 MFEM_REUSE_PRE_LOCK_SHA256=""
 MFEM_REUSE_PRE_ABI=""
+MFEM_REUSE_PRE_IDENTITY_SHA256=""
+MFEM_REUSE_PRE_TRUST_MODE=""
+MFEM_REUSE_PRE_CACHE_SHA256=""
+MFEM_REUSE_PRE_CONFIG_SHA256=""
+MFEM_REUSE_PRE_ARCHIVE_SHA256=""
+MFEM_REUSE_PRE_TARGETS_SHA256=""
+MFEM_REUSE_PRE_TARGETS_CONFIG_SHA256=""
+MFEM_REUSE_PRE_COMPILER_METADATA_SHA256=""
+MFEM_REUSE_PRE_INSTALL_SCRIPT_SHA256=""
+MFEM_REUSE_PRE_CHECK_CACHE_SHA256=""
 MFEM_REUSE_POST_MANIFEST_SHA256=""
 MFEM_REUSE_POST_LOCK_SHA256=""
 MFEM_REUSE_POST_ABI=""
@@ -43,6 +53,44 @@ MFEM_PICOJSON_BLOB=""
 MFEM_TINYXML2_BLOB=""
 SPACK_MANIFEST_SHA256=""
 SPACK_LOCK_SHA256=""
+MFEM_IDENTITY_STAMP_NAME="dg-igr-mfem-identity-v1.txt"
+MFEM_IDENTITY_STAMP=""
+MFEM_IDENTITY_STAMP_SHA256=""
+MFEM_IDENTITY_TRUST_MODE=""
+MFEM_REVIEWED_ADMISSION_RECORD="${SCRIPT_DIR}/cmake/mfem-reuse-identities/cpu-w8a-d9d6526-973e5abc.json"
+MFEM_REVIEWED_ADMISSION_SHA256="d4e0f68d795d30ecb3e403f797ecf4ccd4ec8ed79ba5746a997f68bd6eae98ec"
+MFEM_IDENTITY_CACHE_SHA256=""
+MFEM_IDENTITY_CONFIG_SHA256=""
+MFEM_IDENTITY_ARCHIVE_SHA256=""
+MFEM_IDENTITY_TARGETS_SHA256=""
+MFEM_IDENTITY_TARGETS_CONFIG_PATH=""
+MFEM_IDENTITY_TARGETS_CONFIG_SHA256=""
+MFEM_IDENTITY_COMPILER_METADATA_PATH=""
+MFEM_IDENTITY_COMPILER_METADATA_SHA256=""
+MFEM_IDENTITY_INSTALL_SCRIPT_SHA256=""
+MFEM_IDENTITY_CHECK_CACHE_SHA256=""
+MFEM_IDENTITY_BUILD_TYPE=""
+MFEM_IDENTITY_OPENMP_STATE=""
+MFEM_IDENTITY_METIS_STATE=""
+MFEM_IDENTITY_CALIPER_STATE=""
+MFEM_IDENTITY_COMPILER=""
+MFEM_IDENTITY_MPI_SPEC=""
+MFEM_IDENTITY_MPI_HASH=""
+MFEM_IDENTITY_MPI_PREFIX=""
+MFEM_IDENTITY_HYPRE_SPEC=""
+MFEM_IDENTITY_HYPRE_HASH=""
+MFEM_IDENTITY_HYPRE_PREFIX=""
+MFEM_IDENTITY_METIS_SPEC=""
+MFEM_IDENTITY_METIS_HASH=""
+MFEM_IDENTITY_METIS_PREFIX=""
+MFEM_IDENTITY_RAJA_STATE=""
+MFEM_IDENTITY_UMPIRE_SPEC=""
+MFEM_IDENTITY_UMPIRE_HASH=""
+MFEM_IDENTITY_CALIPER_SPEC=""
+MFEM_IDENTITY_CALIPER_HASH=""
+MFEM_IDENTITY_CUDA_SPEC=""
+MFEM_IDENTITY_CUDA_HASH=""
+MFEM_IDENTITY_CUDA_COMPILER=""
 
 usage() {
   cat <<'EOF'
@@ -112,6 +160,10 @@ while (($#)); do
       ;;
     --reuse-mfem-root)
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+      [[ -n "$2" ]] || {
+        echo "ERROR: --reuse-mfem-root requires a non-empty value" >&2
+        exit 2
+      }
       MFEM_REUSE_REQUEST="$2"
       shift
       ;;
@@ -146,6 +198,385 @@ canonical_existing_path() {
   local path="$1"
   [[ -n "${path}" && -e "${path}" ]] || return 1
   realpath -e -- "${path}"
+}
+
+require_exact_mfem_directory() {
+  local path="$1"
+  local description="$2"
+  local canonical
+
+  [[ -d "${path}" && ! -L "${path}" ]] || {
+    echo "ERROR: ${description} is missing or is not a non-symlink directory: ${path}" >&2
+    exit 3
+  }
+  canonical="$(realpath -e -- "${path}")" || {
+    echo "ERROR: unable to canonicalize ${description}: ${path}" >&2
+    exit 3
+  }
+  [[ "${canonical}" == "${path}" ]] || {
+    echo "ERROR: ${description} is not at its exact canonical path: expected=${path} actual=${canonical}" >&2
+    exit 3
+  }
+}
+
+require_exact_mfem_file() {
+  local path="$1"
+  local description="$2"
+  local missing_context="${3:-}"
+  local canonical
+
+  [[ -f "${path}" ]] || {
+    echo "ERROR: ${description} is missing${missing_context}: ${path}" >&2
+    exit 3
+  }
+  [[ ! -L "${path}" ]] || {
+    echo "ERROR: ${description} is not a regular non-symlink file: ${path}" >&2
+    exit 3
+  }
+  canonical="$(realpath -e -- "${path}")" || {
+    echo "ERROR: unable to canonicalize ${description}: ${path}" >&2
+    exit 3
+  }
+  [[ "${canonical}" == "${path}" ]] || {
+    echo "ERROR: ${description} is not at its exact canonical path: expected=${path} actual=${canonical}" >&2
+    exit 3
+  }
+}
+
+render_mfem_identity_payload() {
+  printf '%s\n' \
+    "schema=dg-igr-mfem-identity" \
+    "version=1" \
+    "mfem_pin=${MFEM_SOURCE_PIN}" \
+    "source_root=${MFEM_SOURCE_ROOT}" \
+    "build_root=${MFEM_BUILD}" \
+    "install_root=${MFEM_INSTALL}" \
+    "mode=${MODE}" \
+    "profile=${PROFILE}" \
+    "build_type=${MFEM_IDENTITY_BUILD_TYPE}" \
+    "mfem_use_openmp=${MFEM_IDENTITY_OPENMP_STATE}" \
+    "mfem_use_metis=${MFEM_IDENTITY_METIS_STATE}" \
+    "mfem_use_caliper=${MFEM_IDENTITY_CALIPER_STATE}" \
+    "compiler=${MFEM_IDENTITY_COMPILER}" \
+    "mpi_spec=${MFEM_IDENTITY_MPI_SPEC}" \
+    "mpi_hash=${MFEM_IDENTITY_MPI_HASH}" \
+    "mpi_prefix=${MFEM_IDENTITY_MPI_PREFIX}" \
+    "hypre_spec=${MFEM_IDENTITY_HYPRE_SPEC}" \
+    "hypre_hash=${MFEM_IDENTITY_HYPRE_HASH}" \
+    "hypre_prefix=${MFEM_IDENTITY_HYPRE_PREFIX}" \
+    "metis_spec=${MFEM_IDENTITY_METIS_SPEC}" \
+    "metis_hash=${MFEM_IDENTITY_METIS_HASH}" \
+    "metis_prefix=${MFEM_IDENTITY_METIS_PREFIX}" \
+    "raja_state=${MFEM_IDENTITY_RAJA_STATE}" \
+    "umpire_spec=${MFEM_IDENTITY_UMPIRE_SPEC}" \
+    "umpire_hash=${MFEM_IDENTITY_UMPIRE_HASH}" \
+    "caliper_spec=${MFEM_IDENTITY_CALIPER_SPEC}" \
+    "caliper_hash=${MFEM_IDENTITY_CALIPER_HASH}" \
+    "cuda_spec=${MFEM_IDENTITY_CUDA_SPEC}" \
+    "cuda_hash=${MFEM_IDENTITY_CUDA_HASH}" \
+    "cuda_compiler=${MFEM_IDENTITY_CUDA_COMPILER}" \
+    "dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH}" \
+    "mfem_cuda_archs=${MFEM_CUDA_ARCHS}" \
+    "cmake_cache_sha256=${MFEM_IDENTITY_CACHE_SHA256}" \
+    "mfem_config_sha256=${MFEM_IDENTITY_CONFIG_SHA256}" \
+    "mfem_targets_sha256=${MFEM_IDENTITY_TARGETS_SHA256}" \
+    "mfem_targets_config_path=${MFEM_IDENTITY_TARGETS_CONFIG_PATH}" \
+    "mfem_targets_config_sha256=${MFEM_IDENTITY_TARGETS_CONFIG_SHA256}" \
+    "mfem_archive_sha256=${MFEM_IDENTITY_ARCHIVE_SHA256}" \
+    "compiler_metadata_path=${MFEM_IDENTITY_COMPILER_METADATA_PATH}" \
+    "compiler_metadata_sha256=${MFEM_IDENTITY_COMPILER_METADATA_SHA256}" \
+    "cmake_install_sha256=${MFEM_IDENTITY_INSTALL_SCRIPT_SHA256}" \
+    "cmake_check_cache_sha256=${MFEM_IDENTITY_CHECK_CACHE_SHA256}" \
+    "reuse_abi=${MFEM_REUSE_ABI}"
+}
+
+mfem_identity_stamp_matches() {
+  local stamp="$1"
+  local expected_payload="$2"
+  local actual_payload
+
+  [[ -f "${stamp}" && ! -L "${stamp}" ]] || return 1
+  actual_payload="$(<"${stamp}")" || return 1
+  [[ "${actual_payload}" == "${expected_payload}" ]]
+}
+
+mfem_reviewed_admission_record_matches() {
+  local record="$1"
+  local actual_sha
+
+  [[ -f "${record}" && ! -L "${record}" ]] || return 1
+  actual_sha="$(sha256sum "${record}" | cut -d' ' -f1)" || return 1
+  [[ "${actual_sha}" == "${MFEM_REVIEWED_ADMISSION_SHA256}" ]]
+}
+
+hash_mfem_identity_artifacts() {
+  local cache="$1"
+  local config="$2"
+  local archive="$3"
+  local targets="$4"
+  local targets_config="$5"
+  local compiler_metadata="$6"
+  local install_script="$7"
+  local check_cache="$8"
+
+  MFEM_IDENTITY_CACHE_SHA256="$(sha256sum "${cache}" | cut -d' ' -f1)"
+  MFEM_IDENTITY_CONFIG_SHA256="$(sha256sum "${config}" | cut -d' ' -f1)"
+  MFEM_IDENTITY_ARCHIVE_SHA256="$(sha256sum "${archive}" | cut -d' ' -f1)"
+  MFEM_IDENTITY_TARGETS_SHA256="$(sha256sum "${targets}" | cut -d' ' -f1)"
+  MFEM_IDENTITY_TARGETS_CONFIG_PATH="${targets_config}"
+  MFEM_IDENTITY_TARGETS_CONFIG_SHA256="$(sha256sum \
+    "${targets_config}" | cut -d' ' -f1)"
+  MFEM_IDENTITY_COMPILER_METADATA_PATH="${compiler_metadata}"
+  MFEM_IDENTITY_COMPILER_METADATA_SHA256="$(sha256sum \
+    "${compiler_metadata}" | cut -d' ' -f1)"
+  MFEM_IDENTITY_INSTALL_SCRIPT_SHA256="$(sha256sum \
+    "${install_script}" | cut -d' ' -f1)"
+  MFEM_IDENTITY_CHECK_CACHE_SHA256="$(sha256sum \
+    "${check_cache}" | cut -d' ' -f1)"
+  [[ "${MFEM_IDENTITY_CACHE_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${MFEM_IDENTITY_CONFIG_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${MFEM_IDENTITY_ARCHIVE_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${MFEM_IDENTITY_TARGETS_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${MFEM_IDENTITY_TARGETS_CONFIG_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${MFEM_IDENTITY_COMPILER_METADATA_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${MFEM_IDENTITY_INSTALL_SCRIPT_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${MFEM_IDENTITY_CHECK_CACHE_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "ERROR: MFEM artifact identity hashes are malformed." >&2
+    exit 3
+  }
+}
+
+verify_mfem_identity_stamp() {
+  local expected_payload actual_stamp_sha drift=0
+
+  if [[ "${MFEM_REUSE_TRANSACTION_STATE}" == \
+        "pre-dependency-validated" ]]; then
+    actual_stamp_sha="$(sha256sum "${MFEM_IDENTITY_STAMP}" | cut -d' ' -f1)"
+    if [[ "${actual_stamp_sha}" != "${MFEM_REUSE_PRE_IDENTITY_SHA256}" ]]; then
+      echo "ERROR: generated MFEM identity stamp changed across dependency installation." >&2
+      echo "       pre=${MFEM_REUSE_PRE_IDENTITY_SHA256}" >&2
+      echo "       post=${actual_stamp_sha:-<missing>}" >&2
+      drift=1
+    fi
+    local label pre_hash post_hash
+    while IFS='|' read -r label pre_hash post_hash; do
+      if [[ "${pre_hash}" != "${post_hash}" ]]; then
+        echo "ERROR: MFEM ${label} changed across dependency installation." >&2
+        echo "       pre=${pre_hash}" >&2
+        echo "       post=${post_hash}" >&2
+        drift=1
+      fi
+    done <<EOF
+CMake cache|${MFEM_REUSE_PRE_CACHE_SHA256}|${MFEM_IDENTITY_CACHE_SHA256}
+package config|${MFEM_REUSE_PRE_CONFIG_SHA256}|${MFEM_IDENTITY_CONFIG_SHA256}
+archive|${MFEM_REUSE_PRE_ARCHIVE_SHA256}|${MFEM_IDENTITY_ARCHIVE_SHA256}
+targets|${MFEM_REUSE_PRE_TARGETS_SHA256}|${MFEM_IDENTITY_TARGETS_SHA256}
+configuration targets|${MFEM_REUSE_PRE_TARGETS_CONFIG_SHA256}|${MFEM_IDENTITY_TARGETS_CONFIG_SHA256}
+compiler metadata|${MFEM_REUSE_PRE_COMPILER_METADATA_SHA256}|${MFEM_IDENTITY_COMPILER_METADATA_SHA256}
+CMake install provenance|${MFEM_REUSE_PRE_INSTALL_SCRIPT_SHA256}|${MFEM_IDENTITY_INSTALL_SCRIPT_SHA256}
+CMake cache provenance|${MFEM_REUSE_PRE_CHECK_CACHE_SHA256}|${MFEM_IDENTITY_CHECK_CACHE_SHA256}
+EOF
+    if ((drift)); then
+      exit 3
+    fi
+    MFEM_IDENTITY_STAMP_SHA256="${actual_stamp_sha}"
+    MFEM_IDENTITY_TRUST_MODE="generated-stamp-v1"
+    return
+  fi
+
+  expected_payload="$(render_mfem_identity_payload)"
+  mfem_identity_stamp_matches "${MFEM_IDENTITY_STAMP}" \
+    "${expected_payload}" || {
+    echo "ERROR: reused MFEM identity stamp does not match the exact source, artifacts, features, or Spack ABI: ${MFEM_IDENTITY_STAMP}" >&2
+    exit 3
+  }
+  MFEM_IDENTITY_STAMP_SHA256="$(sha256sum "${MFEM_IDENTITY_STAMP}" | \
+    cut -d' ' -f1)"
+  [[ "${MFEM_IDENTITY_STAMP_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "ERROR: reused MFEM identity stamp hash is malformed." >&2
+    exit 3
+  }
+  MFEM_IDENTITY_TRUST_MODE="generated-stamp-v1"
+}
+
+write_local_mfem_identity_stamp() {
+  local stamp_tmp
+
+  stamp_tmp="$(mktemp -- \
+    "${MFEM_BUILD}/.${MFEM_IDENTITY_STAMP_NAME}.XXXXXXXX")" || {
+    echo "ERROR: unable to create the local MFEM identity stamp transaction." >&2
+    exit 3
+  }
+  if ! render_mfem_identity_payload >"${stamp_tmp}"; then
+    rm -f -- "${stamp_tmp}"
+    echo "ERROR: unable to render the local MFEM identity stamp." >&2
+    exit 3
+  fi
+  if ! chmod 0444 "${stamp_tmp}" ||
+     ! mv -f -- "${stamp_tmp}" "${MFEM_IDENTITY_STAMP}"; then
+    rm -f -- "${stamp_tmp}"
+    echo "ERROR: unable to atomically publish the local MFEM identity stamp: ${MFEM_IDENTITY_STAMP}" >&2
+    exit 3
+  fi
+  require_exact_mfem_file \
+    "${MFEM_IDENTITY_STAMP}" "local MFEM identity stamp after helper success"
+  verify_mfem_identity_stamp
+  echo "[mfem] identity stamp published: path=${MFEM_IDENTITY_STAMP} sha256=${MFEM_IDENTITY_STAMP_SHA256}"
+}
+
+reviewed_admission_value() {
+  local key="$1"
+  local values count
+
+  values="$(sed -nE \
+    "s/^[[:space:]]*\"${key}\":[[:space:]]*\"([^\"]*)\",?[[:space:]]*$/\\1/p" \
+    "${MFEM_REVIEWED_ADMISSION_RECORD}")"
+  count="$(printf '%s\n' "${values}" | sed '/^$/d' | wc -l)"
+  [[ "${count}" == "1" && -n "${values}" ]] || {
+    echo "ERROR: reviewed MFEM admission field is missing or ambiguous: ${key}" >&2
+    exit 3
+  }
+  printf '%s' "${values}"
+}
+
+reviewed_admission_expect() {
+  local key="$1"
+  local actual="$2"
+  local expected
+
+  expected="$(reviewed_admission_value "${key}")"
+  [[ "${actual}" == "${expected}" ]] || {
+    echo "ERROR: reviewed MFEM admission mismatch for ${key}." >&2
+    echo "       expected=${expected}" >&2
+    echo "       actual=${actual:-<missing>}" >&2
+    exit 3
+  }
+}
+
+verify_reviewed_mfem_admission() {
+  local record_sha source_tree build_rel install_rel
+  local claim post_dependency_revalidation=0
+
+  require_exact_mfem_file \
+    "${MFEM_REVIEWED_ADMISSION_RECORD}" "reviewed MFEM admission record"
+  record_sha="$(sha256sum "${MFEM_REVIEWED_ADMISSION_RECORD}" | cut -d' ' -f1)"
+  mfem_reviewed_admission_record_matches \
+    "${MFEM_REVIEWED_ADMISSION_RECORD}" || {
+    echo "ERROR: reviewed MFEM admission record hash mismatch: expected=${MFEM_REVIEWED_ADMISSION_SHA256} actual=${record_sha:-<missing>}" >&2
+    exit 3
+  }
+  [[ "${MFEM_SOURCE_ROOT}" == \
+     "$(reviewed_admission_value source_root)" ]] || return 1
+
+  source_tree="$(git -C "${MFEM_SOURCE_ROOT}" rev-parse HEAD^{tree} \
+    2>/dev/null)" || {
+    echo "ERROR: unable to resolve reviewed MFEM source tree." >&2
+    exit 3
+  }
+  build_rel="${MFEM_BUILD#"${MFEM_SOURCE_ROOT}/"}"
+  install_rel="${MFEM_INSTALL#"${MFEM_SOURCE_ROOT}/"}"
+  claim="current tuple observed, independently reviewed, prospectively admitted for reuse; raw W8A ledgers are corroboration, not retroactive immutable proof"
+  if [[ "${MFEM_REUSE_TRANSACTION_STATE}" == \
+        "pre-dependency-validated" ]]; then
+    post_dependency_revalidation=1
+  fi
+
+  reviewed_admission_expect schema \
+    "dg-igr-reviewed-mfem-reuse-admission"
+  reviewed_admission_expect version "1"
+  reviewed_admission_expect trust_mode "prospective-reviewed-admission"
+  reviewed_admission_expect claim "${claim}"
+  reviewed_admission_expect source_root "${MFEM_SOURCE_ROOT}"
+  reviewed_admission_expect build_root "${MFEM_BUILD}"
+  reviewed_admission_expect install_root "${MFEM_INSTALL}"
+  reviewed_admission_expect source_commit "${MFEM_SOURCE_PIN}"
+  reviewed_admission_expect source_tree "${source_tree}"
+  reviewed_admission_expect mode "${MODE}"
+  reviewed_admission_expect profile "${PROFILE}"
+  reviewed_admission_expect build_type "${MFEM_IDENTITY_BUILD_TYPE}"
+  reviewed_admission_expect mfem_use_openmp \
+    "${MFEM_IDENTITY_OPENMP_STATE}"
+  reviewed_admission_expect mfem_use_metis "${MFEM_IDENTITY_METIS_STATE}"
+  reviewed_admission_expect mfem_use_caliper \
+    "${MFEM_IDENTITY_CALIPER_STATE}"
+  reviewed_admission_expect mfem_use_raja "OFF"
+  if [[ "${MFEM_IDENTITY_UMPIRE_HASH}" == "off" ]]; then
+    reviewed_admission_expect mfem_use_umpire "OFF"
+  else
+    reviewed_admission_expect mfem_use_umpire "ON"
+  fi
+  if [[ "${MFEM_IDENTITY_CUDA_HASH}" == "off" ]]; then
+    reviewed_admission_expect mfem_use_cuda "OFF"
+  else
+    reviewed_admission_expect mfem_use_cuda "ON"
+  fi
+  reviewed_admission_expect dependency_cuda_arch "${DEPENDENCY_CUDA_ARCH}"
+  reviewed_admission_expect mfem_cuda_archs "${MFEM_CUDA_ARCHS}"
+  if ((post_dependency_revalidation == 0)); then
+    reviewed_admission_expect compiler "${MFEM_IDENTITY_COMPILER}"
+    reviewed_admission_expect mpi_spec "${MFEM_IDENTITY_MPI_SPEC}"
+    reviewed_admission_expect mpi_hash "${MFEM_IDENTITY_MPI_HASH}"
+    reviewed_admission_expect mpi_prefix "${MFEM_IDENTITY_MPI_PREFIX}"
+    reviewed_admission_expect hypre_spec "${MFEM_IDENTITY_HYPRE_SPEC}"
+    reviewed_admission_expect hypre_hash "${MFEM_IDENTITY_HYPRE_HASH}"
+    reviewed_admission_expect hypre_prefix "${MFEM_IDENTITY_HYPRE_PREFIX}"
+    reviewed_admission_expect metis_spec "${MFEM_IDENTITY_METIS_SPEC}"
+    reviewed_admission_expect metis_hash "${MFEM_IDENTITY_METIS_HASH}"
+    reviewed_admission_expect metis_prefix "${MFEM_IDENTITY_METIS_PREFIX}"
+    reviewed_admission_expect spack_manifest_sha256 \
+      "${SPACK_MANIFEST_SHA256}"
+    reviewed_admission_expect spack_lock_sha256 "${SPACK_LOCK_SHA256}"
+  fi
+  reviewed_admission_expect cmake_cache_path \
+    "${build_rel}/CMakeCache.txt"
+  reviewed_admission_expect cmake_cache_sha256 \
+    "${MFEM_IDENTITY_CACHE_SHA256}"
+  reviewed_admission_expect cmake_install_path \
+    "${build_rel}/cmake_install.cmake"
+  reviewed_admission_expect cmake_install_sha256 \
+    "${MFEM_IDENTITY_INSTALL_SCRIPT_SHA256}"
+  reviewed_admission_expect cmake_check_cache_path \
+    "${build_rel}/CMakeFiles/cmake.check_cache"
+  reviewed_admission_expect cmake_check_cache_sha256 \
+    "${MFEM_IDENTITY_CHECK_CACHE_SHA256}"
+  reviewed_admission_expect compiler_metadata_path \
+    "${MFEM_IDENTITY_COMPILER_METADATA_PATH#"${MFEM_SOURCE_ROOT}/"}"
+  reviewed_admission_expect compiler_metadata_sha256 \
+    "${MFEM_IDENTITY_COMPILER_METADATA_SHA256}"
+  reviewed_admission_expect mfem_config_path \
+    "${install_rel}/lib/cmake/mfem/MFEMConfig.cmake"
+  reviewed_admission_expect mfem_config_sha256 \
+    "${MFEM_IDENTITY_CONFIG_SHA256}"
+  reviewed_admission_expect mfem_targets_path \
+    "${install_rel}/lib/cmake/mfem/MFEMTargets.cmake"
+  reviewed_admission_expect mfem_targets_sha256 \
+    "${MFEM_IDENTITY_TARGETS_SHA256}"
+  reviewed_admission_expect mfem_targets_release_path \
+    "${MFEM_IDENTITY_TARGETS_CONFIG_PATH#"${MFEM_SOURCE_ROOT}/"}"
+  reviewed_admission_expect mfem_targets_release_sha256 \
+    "${MFEM_IDENTITY_TARGETS_CONFIG_SHA256}"
+  reviewed_admission_expect mfem_archive_path \
+    "${install_rel}/lib/libmfem.a"
+  reviewed_admission_expect mfem_archive_sha256 \
+    "${MFEM_IDENTITY_ARCHIVE_SHA256}"
+  reviewed_admission_expect journal_commit \
+    "85f48b3bdc3b4fd29263c83bd2768be0764814dd"
+  reviewed_admission_expect journal_tree \
+    "caf56d5e06ccd0a23b9483d12d0fea3d1f06e3de"
+  reviewed_admission_expect journal_receipt_path \
+    "evidence/receipts/2026-07-30-w8a-functional-admission.md"
+  reviewed_admission_expect journal_receipt_blob \
+    "7f76c37336323ff448c8cc2a6340f3b8379ee872"
+  reviewed_admission_expect journal_receipt_sha256 \
+    "4c00ae91974bb5a111b24f313a13a0ddf19ca91d06cf443c08096340202b150e"
+  reviewed_admission_expect sealed_dev3_cpu_manifest_sha256 \
+    "008605ffe7d0192689a6dcdcebfcee7fcac4ead307ff6c6403ee36731ce2d59d"
+  reviewed_admission_expect shared_spack_authority_ledger_sha256 \
+    "5ef52a45844fe2414ef28bd4067ad0de7c7bc860efc64d40dfc5a2b440736ea0"
+
+  MFEM_IDENTITY_TRUST_MODE="reviewed-admission-v1"
+  MFEM_IDENTITY_STAMP_SHA256="${record_sha}"
+  echo "[mfem] reviewed reuse admission: claim=${claim} record=${MFEM_REVIEWED_ADMISSION_RECORD} sha256=${record_sha}"
 }
 
 preflight_temp_root() {
@@ -312,25 +743,32 @@ validate_mfem_source_checkout() {
 }
 
 validate_local_mfem_artifacts() {
-  local cache config archive cache_home cache_prefix
+  local cache install_script check_cache config archive
+  local cache_home cache_prefix
   local canonical_home canonical_prefix
 
   validate_mfem_source_checkout "${MFEM_SOURCE_ROOT}" "local"
   cache="${MFEM_BUILD}/CMakeCache.txt"
+  install_script="${MFEM_BUILD}/cmake_install.cmake"
+  check_cache="${MFEM_BUILD}/CMakeFiles/cmake.check_cache"
   config="${MFEM_INSTALL}/lib/cmake/mfem/MFEMConfig.cmake"
   archive="${MFEM_INSTALL}/lib/libmfem.a"
-  [[ -f "${cache}" ]] || {
-    echo "ERROR: local MFEM CMake cache is missing after helper success: ${cache}" >&2
-    exit 3
-  }
-  [[ -f "${config}" ]] || {
-    echo "ERROR: local MFEM package config is missing after helper success: ${config}" >&2
-    exit 3
-  }
-  [[ -f "${archive}" ]] || {
-    echo "ERROR: local MFEM archive is missing after helper success: ${archive}" >&2
-    exit 3
-  }
+  require_exact_mfem_directory \
+    "${MFEM_BUILD}" "local MFEM build directory after helper success"
+  require_exact_mfem_file \
+    "${cache}" "local MFEM CMake cache" " after helper success"
+  require_exact_mfem_file \
+    "${install_script}" "local MFEM CMake install provenance" \
+    " after helper success"
+  require_exact_mfem_file \
+    "${check_cache}" "local MFEM CMake cache provenance" \
+    " after helper success"
+  require_exact_mfem_directory \
+    "${MFEM_INSTALL}" "local MFEM install directory after helper success"
+  require_exact_mfem_file \
+    "${config}" "local MFEM package config" " after helper success"
+  require_exact_mfem_file \
+    "${archive}" "local MFEM archive" " after helper success"
   cache_home="$(cache_value "${cache}" CMAKE_HOME_DIRECTORY)"
   cache_prefix="$(cache_value "${cache}" CMAKE_INSTALL_PREFIX)"
   canonical_home="$(canonical_existing_path "${cache_home}")" || {
@@ -348,6 +786,10 @@ validate_local_mfem_artifacts() {
     echo "       install expected=${MFEM_INSTALL} actual=${canonical_prefix}" >&2
     exit 3
   }
+  validate_reused_mfem "${MFEM_SOURCE_ROOT}" "create" "local"
+  write_local_mfem_identity_stamp
+  MFEM_REUSE_STATE="disabled"
+  MFEM_REUSE_ABI=""
   MFEM_TUPLE_STATE="local-source-build-install-validated"
   echo "[mfem] tuple validated: source=${MFEM_SOURCE_ROOT} build=${MFEM_BUILD} install=${MFEM_INSTALL}"
 }
@@ -406,20 +848,6 @@ spack_dependency_hash() {
   printf '%s' "${records}"
 }
 
-assert_reuse_fixture_rejected() {
-  local expected="$1"
-  shift
-  local output status
-  set +e
-  output="$("$@" 2>&1)"
-  status=$?
-  set -e
-  [[ ${status} -eq 3 && "${output}" == *"${expected}"* ]] || {
-    echo "ERROR: reuse fixture expected '${expected}' with exit 3; exit=${status} output=${output}" >&2
-    exit 3
-  }
-}
-
 assert_pre_spack_fixture_rejected() {
   local expected="$1"
   local sentinel="$2"
@@ -456,6 +884,7 @@ assert_reuse_fixture_accepted() {
      "${output}" == *"mfem_build=${expected_build}"* &&
      "${output}" == *"mfem_install=${expected_install}"* &&
      "${output}" == *"temp_source=${expected_temp_source}"* &&
+     "${output}" == *"mfem_identity_trust_mode="* &&
      "${output}" == *"mfem_reuse_transaction_state=pre-dependency-validated"* &&
      "${output}" != *"mfem_reuse_post_"* ]] || {
     echo "ERROR: reuse fixture expected an exact-source plan; exit=${status} output=${output}" >&2
@@ -463,30 +892,67 @@ assert_reuse_fixture_accepted() {
   }
 }
 
-make_reuse_fixture() {
+assert_identity_stamp_payload_rejected() {
+  local label="$1"
+  local stamp="$2"
+  local expected_payload="$3"
+
+  if mfem_identity_stamp_matches "${stamp}" "${expected_payload}"; then
+    echo "ERROR: MFEM identity stamp fixture unexpectedly accepted ${label}." >&2
+    exit 3
+  fi
+}
+
+run_identity_stamp_negative_fixtures() {
+  local expected_payload mismatched_stamp hash_stamp hash_payload
+  local mismatched_admission zero_hash
+
+  expected_payload="$(render_mfem_identity_payload)"
+  assert_identity_stamp_payload_rejected missing-stamp \
+    "${DG_IGR_REUSE_FIXTURE_ROOT}/missing-identity-stamp" \
+    "${expected_payload}"
+
+  mismatched_stamp="${DG_IGR_REUSE_FIXTURE_ROOT}/mismatched-identity-stamp"
+  printf '%s\n' \
+    'schema=dg-igr-mfem-identity' \
+    'version=0' >"${mismatched_stamp}"
+  assert_identity_stamp_payload_rejected mismatched-stamp \
+    "${mismatched_stamp}" "${expected_payload}"
+
+  zero_hash="0000000000000000000000000000000000000000000000000000000000000000"
+  hash_payload="${expected_payload/cmake_cache_sha256=${MFEM_IDENTITY_CACHE_SHA256}/cmake_cache_sha256=${zero_hash}}"
+  [[ "${hash_payload}" != "${expected_payload}" ]] || {
+    echo "ERROR: MFEM identity hash fixture could not alter the expected payload." >&2
+    exit 3
+  }
+  hash_stamp="${DG_IGR_REUSE_FIXTURE_ROOT}/mismatched-hash-identity-stamp"
+  printf '%s\n' "${hash_payload}" >"${hash_stamp}"
+  assert_identity_stamp_payload_rejected mismatched-artifact-hash \
+    "${hash_stamp}" "${expected_payload}"
+
+  if mfem_reviewed_admission_record_matches \
+      "${DG_IGR_REUSE_FIXTURE_ROOT}/missing-reviewed-admission"; then
+    echo "ERROR: missing reviewed MFEM admission fixture was accepted." >&2
+    exit 3
+  fi
+  mismatched_admission="${DG_IGR_REUSE_FIXTURE_ROOT}/mismatched-reviewed-admission.json"
+  printf '%s\n' '{"schema":"dg-igr-reviewed-mfem-reuse-admission","version":"0"}' \
+    >"${mismatched_admission}"
+  if mfem_reviewed_admission_record_matches "${mismatched_admission}"; then
+    echo "ERROR: mismatched reviewed MFEM admission fixture was accepted." >&2
+    exit 3
+  fi
+}
+
+make_mfem_source_fixture() {
   local label="$1"
   local source_root="$2"
   local fixture="${DG_IGR_REUSE_FIXTURE_ROOT}/${label}"
-  local source_build source_install
   git -c advice.detachedHead=false clone --quiet --shared \
     "${source_root}" "${fixture}"
   git -c advice.detachedHead=false -C "${fixture}" checkout --quiet \
     --detach "$(git -C "${source_root}" rev-parse HEAD)"
-  source_build="${source_root}/${MFEM_BUILD_NAME}"
-  source_install="${source_root}/${MFEM_INSTALL_NAME}"
-  mkdir -p "${fixture}/${MFEM_BUILD_NAME}" \
-           "${fixture}/${MFEM_INSTALL_NAME}/lib/cmake/mfem" \
-           "${fixture}/${MFEM_INSTALL_NAME}/lib"
-  cp "${source_build}/CMakeCache.txt" \
-     "${fixture}/${MFEM_BUILD_NAME}/CMakeCache.txt"
-  cp "${source_install}/lib/cmake/mfem/MFEMConfig.cmake" \
-     "${fixture}/${MFEM_INSTALL_NAME}/lib/cmake/mfem/MFEMConfig.cmake"
-  ln -s "${source_install}/lib/libmfem.a" \
-        "${fixture}/${MFEM_INSTALL_NAME}/lib/libmfem.a"
-  sed -i -e "s|${source_root}|${fixture}|g" \
-    "${fixture}/${MFEM_BUILD_NAME}/CMakeCache.txt"
   DG_IGR_REUSE_FIXTURE="${fixture}"
-  DG_IGR_REUSE_FIXTURE_CACHE="${fixture}/${MFEM_BUILD_NAME}/CMakeCache.txt"
 }
 
 run_reuse_compatibility_fixtures() {
@@ -512,6 +978,8 @@ run_reuse_compatibility_fixtures() {
     'exit 99' >"${fake_spack_dir}/spack"
   chmod +x "${fake_spack_dir}/spack"
 
+  run_identity_stamp_negative_fixtures
+
   bad_temp_root="${DG_IGR_REUSE_FIXTURE_ROOT}/not-a-directory"
   : >"${bad_temp_root}"
   sentinel="${DG_IGR_REUSE_FIXTURE_ROOT}/temp-spack-called"
@@ -533,18 +1001,17 @@ run_reuse_compatibility_fixtures() {
     --reuse-mfem-root "${source_root}/fem" \
     --no-deps --no-tests --print-plan
 
-  make_reuse_fixture exact-source "${source_root}"
   assert_reuse_fixture_accepted \
-    "${DG_IGR_REUSE_FIXTURE}" \
-    "${DG_IGR_REUSE_FIXTURE}/${MFEM_BUILD_NAME}" \
-    "${DG_IGR_REUSE_FIXTURE}/${MFEM_INSTALL_NAME}" \
+    "${source_root}" \
+    "${source_root}/${MFEM_BUILD_NAME}" \
+    "${source_root}/${MFEM_INSTALL_NAME}" \
     "default:/tmp:TMPDIR-empty" \
     env TMPDIR= DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
     bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
-    --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
+    --reuse-mfem-root "${source_root}" \
     --no-deps --no-tests --print-plan
 
-  make_reuse_fixture missing-header "${source_root}"
+  make_mfem_source_fixture missing-header "${source_root}"
   rm -f -- "${DG_IGR_REUSE_FIXTURE}/fem/picojson.h"
   sentinel="${DG_IGR_REUSE_FIXTURE_ROOT}/missing-header-spack-called"
   assert_pre_spack_fixture_rejected \
@@ -556,7 +1023,7 @@ run_reuse_compatibility_fixtures() {
     --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
     --no-deps --no-tests --print-plan
 
-  make_reuse_fixture modified-header "${source_root}"
+  make_mfem_source_fixture modified-header "${source_root}"
   printf '\n// reuse-fixture modification\n' >> \
     "${DG_IGR_REUSE_FIXTURE}/general/tinyxml2.h"
   sentinel="${DG_IGR_REUSE_FIXTURE_ROOT}/modified-header-spack-called"
@@ -569,86 +1036,24 @@ run_reuse_compatibility_fixtures() {
     --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
     --no-deps --no-tests --print-plan
 
-  make_reuse_fixture compiler "${source_root}"
-  sed -i \
-    's|^CMAKE_CXX_COMPILER:[^=]*=.*$|CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/g++|' \
-    "${DG_IGR_REUSE_FIXTURE_CACHE}"
-  assert_reuse_fixture_rejected "C++/MPI wrapper mismatch" \
-    env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+  make_mfem_source_fixture symlinked-cache "${source_root}"
+  mkdir -p "${DG_IGR_REUSE_FIXTURE}/${MFEM_BUILD_NAME}"
+  ln -s "${source_root}/${MFEM_BUILD_NAME}/CMakeCache.txt" \
+    "${DG_IGR_REUSE_FIXTURE}/${MFEM_BUILD_NAME}/CMakeCache.txt"
+  sentinel="${DG_IGR_REUSE_FIXTURE_ROOT}/symlinked-cache-spack-called"
+  assert_pre_spack_fixture_rejected \
+    "reused MFEM CMake cache is not a regular non-symlink file" \
+    "${sentinel}" \
+    env PATH="${fake_spack_dir}:${PATH}" \
+    DG_IGR_FAKE_SPACK_SENTINEL="${sentinel}" \
+    DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
     bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
     --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
     --no-deps --no-tests --print-plan
-
-  make_reuse_fixture hypre "${source_root}"
-  sed -i 's|^HYPRE_DIR:[^=]*=.*$|HYPRE_DIR:PATH=/usr|' \
-    "${DG_IGR_REUSE_FIXTURE_CACHE}"
-  assert_reuse_fixture_rejected "HYPRE root mismatch" \
-    env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
-    bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
-    --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
-    --no-deps --no-tests --print-plan
-
-  make_reuse_fixture raja "${source_root}"
-  sed -i 's|^MFEM_USE_RAJA:[^=]*=.*$|MFEM_USE_RAJA:BOOL=ON|' \
-    "${DG_IGR_REUSE_FIXTURE_CACHE}"
-  assert_reuse_fixture_rejected "RAJA disabled" \
-    env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
-    bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
-    --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
-    --no-deps --no-tests --print-plan
-
-  make_reuse_fixture caliper-mode "${source_root}"
-  if ((CALIPER)); then
-    sed -i 's|^MFEM_USE_CALIPER:[^=]*=.*$|MFEM_USE_CALIPER:BOOL=OFF|' \
-      "${DG_IGR_REUSE_FIXTURE_CACHE}"
-    assert_reuse_fixture_rejected "does not enable Caliper" \
-      env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
-      bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
-      --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
-      --no-deps --no-tests --print-plan
-
-    make_reuse_fixture caliper-prefix "${source_root}"
-    sed -i 's|^CMAKE_PREFIX_PATH:[^=]*=.*$|CMAKE_PREFIX_PATH:PATH=/usr|' \
-      "${DG_IGR_REUSE_FIXTURE_CACHE}"
-    assert_reuse_fixture_rejected "CMAKE_PREFIX_PATH does not match" \
-      env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
-      bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
-      --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
-      --no-deps --no-tests --print-plan
-  else
-    sed -i 's|^MFEM_USE_CALIPER:[^=]*=.*$|MFEM_USE_CALIPER:BOOL=ON|' \
-      "${DG_IGR_REUSE_FIXTURE_CACHE}"
-    assert_reuse_fixture_rejected "does not explicitly disable Caliper" \
-      env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
-      bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
-      --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
-      --no-deps --no-tests --print-plan
-  fi
-
-  if [[ "${MODE}" == "gpu" ]]; then
-    make_reuse_fixture umpire "${source_root}"
-    sed -i 's|^UMPIRE_DIR:[^=]*=.*$|UMPIRE_DIR:PATH=/usr|' \
-      "${DG_IGR_REUSE_FIXTURE_CACHE}"
-    assert_reuse_fixture_rejected "Umpire root mismatch" \
-      env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
-      bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
-      --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
-      --no-deps --no-tests --print-plan
-
-    make_reuse_fixture cuda "${source_root}"
-    sed -i 's|^CUDAToolkit_ROOT:[^=]*=.*$|CUDAToolkit_ROOT:PATH=/usr|' \
-      "${DG_IGR_REUSE_FIXTURE_CACHE}"
-    assert_reuse_fixture_rejected "CUDA toolkit/compiler mismatch" \
-      env DG_IGR_RUN_REUSE_FIXTURES=0 DG_IGR_SPACK_ENV="${SPACK_ENV}" \
-      bash "${SCRIPT_DIR}/build.sh" "${mode_args[@]}" \
-      --reuse-mfem-root "${DG_IGR_REUSE_FIXTURE}" \
-      --no-deps --no-tests --print-plan
-  fi
 
   rm -rf -- "${DG_IGR_REUSE_FIXTURE_ROOT}"
   trap - EXIT
-  unset DG_IGR_REUSE_FIXTURE_ROOT DG_IGR_REUSE_FIXTURE \
-        DG_IGR_REUSE_FIXTURE_CACHE
+  unset DG_IGR_REUSE_FIXTURE_ROOT DG_IGR_REUSE_FIXTURE
   echo "[reuse-fixtures] exact-source, header, and compatibility cases passed"
 }
 
@@ -668,27 +1073,85 @@ is_cmake_false() {
 
 validate_reused_mfem() {
   local requested="$1"
-  local root build install cache config archive
+  local stamp_policy="${2:-require}"
+  local source_kind="${3:-reused}"
+  local root build install cache install_script check_cache config archive
+  local targets targets_config targets_config_suffix compiler_metadata_records
+  local compiler_metadata_count compiler_metadata
   local cache_home cache_prefix canonical_home canonical_prefix
-  local mpi_enabled cuda_enabled raja_enabled umpire_enabled configured_archs
+  local cache_build_type mpi_enabled openmp_enabled metis_enabled
+  local openmp_config_enabled metis_config_enabled
+  local cuda_enabled raja_enabled umpire_enabled configured_archs
   local caliper_enabled caliper_config_enabled cache_cmake_prefix_path
   local cache_cxx cache_mpi_cxx config_cxx expected_mpicxx expected_mpicc
   local c_command cxx_command compiler_name compiler_version
+  local mpi_spec hypre_spec metis_spec caliper_spec umpire_spec cuda_spec
   local mpi_prefix mpi_hash mpi_compiler hypre_prefix hypre_hash hypre_compiler
   local hypre_mpi_hash raja_state umpire_state caliper_state
+  local metis_prefix metis_hash metis_compiler cache_metis
   local caliper_prefix caliper_hash caliper_compiler caliper_mpi_hash
   local cuda_prefix cuda_hash cuda_compiler umpire_prefix umpire_hash
   local umpire_compiler hypre_cuda_hash hypre_umpire_hash umpire_cuda_hash
   local cache_hypre cache_umpire cache_cuda cache_cuda_compiler
   local spack_view view_mpicc view_mpicxx view_hypre_header
   local view_hypre_library view_library_candidate view_nvcc view_umpire_config
-  local view_caliper_config
+  local view_caliper_config view_metis_header view_metis_library
   local cuda_metadata_records cuda_metadata_count cuda_metadata
   local metadata_cuda metadata_cuda_root cuda_host_compiler
   local cuda_host_compiler_id cuda_host_compiler_version
 
-  validate_mfem_source_checkout "${requested}" "reused"
+  [[ "${stamp_policy}" == "require" || "${stamp_policy}" == "create" ]] || {
+    echo "ERROR: internal MFEM identity stamp policy is invalid: ${stamp_policy}" >&2
+    exit 3
+  }
+  validate_mfem_source_checkout "${requested}" "${source_kind}"
   root="${MFEM_SOURCE_ROOT}"
+  build="${root}/${MFEM_BUILD_NAME}"
+  install="${root}/${MFEM_INSTALL_NAME}"
+  cache="${build}/CMakeCache.txt"
+  install_script="${build}/cmake_install.cmake"
+  check_cache="${build}/CMakeFiles/cmake.check_cache"
+  MFEM_IDENTITY_STAMP="${build}/${MFEM_IDENTITY_STAMP_NAME}"
+  config="${install}/lib/cmake/mfem/MFEMConfig.cmake"
+  targets="${install}/lib/cmake/mfem/MFEMTargets.cmake"
+  targets_config_suffix="$(printf '%s' "${CMAKE_BUILD_TYPE}" | \
+    tr '[:upper:]' '[:lower:]')"
+  [[ "${targets_config_suffix}" =~ ^[a-z0-9_+-]+$ ]] || {
+    echo "ERROR: requested MFEM build type cannot name installed target provenance: ${CMAKE_BUILD_TYPE}" >&2
+    exit 3
+  }
+  targets_config="${install}/lib/cmake/mfem/MFEMTargets-${targets_config_suffix}.cmake"
+  archive="${install}/lib/libmfem.a"
+  require_exact_mfem_directory \
+    "${build}" "reused MFEM build directory"
+  require_exact_mfem_file "${cache}" "reused MFEM CMake cache"
+  require_exact_mfem_file \
+    "${install_script}" "reused MFEM CMake install provenance"
+  require_exact_mfem_file \
+    "${check_cache}" "reused MFEM CMake cache provenance"
+  compiler_metadata_records="$(find "${build}/CMakeFiles" -mindepth 2 \
+    -maxdepth 2 -type f -name CMakeCXXCompiler.cmake -print)"
+  compiler_metadata_count="$(printf '%s\n' "${compiler_metadata_records}" | \
+    sed '/^$/d' | wc -l)"
+  [[ "${compiler_metadata_count}" == "1" ]] || {
+    echo "ERROR: reused MFEM C++ compiler metadata is missing or ambiguous." >&2
+    exit 3
+  }
+  compiler_metadata="${compiler_metadata_records}"
+  require_exact_mfem_file \
+    "${compiler_metadata}" "reused MFEM C++ compiler metadata"
+  if [[ "${stamp_policy}" == "require" &&
+        ( -e "${MFEM_IDENTITY_STAMP}" || -L "${MFEM_IDENTITY_STAMP}" ) ]]; then
+    require_exact_mfem_file \
+      "${MFEM_IDENTITY_STAMP}" "reused MFEM identity stamp"
+  fi
+  require_exact_mfem_directory \
+    "${install}" "reused MFEM install directory"
+  require_exact_mfem_file "${config}" "reused MFEM package config"
+  require_exact_mfem_file "${targets}" "reused MFEM targets provenance"
+  require_exact_mfem_file \
+    "${targets_config}" "reused MFEM configuration-targets provenance"
+  require_exact_mfem_file "${archive}" "reused MFEM archive"
 
   command -v spack >/dev/null 2>&1 || {
     echo "ERROR: --reuse-mfem-root requires Spack metadata; source setup-env.sh first." >&2
@@ -721,24 +1184,6 @@ validate_reused_mfem() {
     exit 3
   }
 
-  build="${root}/${MFEM_BUILD_NAME}"
-  install="${root}/${MFEM_INSTALL_NAME}"
-  cache="${build}/CMakeCache.txt"
-  config="${install}/lib/cmake/mfem/MFEMConfig.cmake"
-  archive="${install}/lib/libmfem.a"
-  [[ -f "${cache}" ]] || {
-    echo "ERROR: reused MFEM CMake cache is missing: ${cache}" >&2
-    exit 3
-  }
-  [[ -f "${config}" ]] || {
-    echo "ERROR: reused MFEM package config is missing: ${config}" >&2
-    exit 3
-  }
-  [[ -f "${archive}" ]] || {
-    echo "ERROR: reused MFEM archive is missing: ${archive}" >&2
-    exit 3
-  }
-
   cache_home="$(cache_value "${cache}" CMAKE_HOME_DIRECTORY)"
   cache_prefix="$(cache_value "${cache}" CMAKE_INSTALL_PREFIX)"
   [[ -n "${cache_home}" && -d "${cache_home}" ]] || {
@@ -760,18 +1205,43 @@ validate_reused_mfem() {
     exit 3
   }
 
+  cache_build_type="$(cache_value "${cache}" CMAKE_BUILD_TYPE)"
   mpi_enabled="$(cache_value "${cache}" MFEM_USE_MPI)"
+  openmp_enabled="$(cache_value "${cache}" MFEM_USE_OPENMP)"
+  metis_enabled="$(cache_value "${cache}" MFEM_USE_METIS)"
+  openmp_config_enabled="$(config_value "${config}" MFEM_USE_OPENMP)"
+  metis_config_enabled="$(config_value "${config}" MFEM_USE_METIS)"
   cuda_enabled="$(cache_value "${cache}" MFEM_USE_CUDA)"
   raja_enabled="$(cache_value "${cache}" MFEM_USE_RAJA)"
   umpire_enabled="$(cache_value "${cache}" MFEM_USE_UMPIRE)"
   caliper_enabled="$(cache_value "${cache}" MFEM_USE_CALIPER)"
   caliper_config_enabled="$(config_value "${config}" MFEM_USE_CALIPER)"
+  [[ "${cache_build_type}" == "${CMAKE_BUILD_TYPE}" ]] || {
+    echo "ERROR: reused MFEM build type mismatch: expected=${CMAKE_BUILD_TYPE} actual=${cache_build_type:-<missing>}" >&2
+    exit 3
+  }
   is_cmake_true "${mpi_enabled}" || {
     echo "ERROR: reused MFEM cache does not enable MPI: ${mpi_enabled:-<missing>}" >&2
     exit 3
   }
   grep -Eqi '^set\(MFEM_USE_MPI (1|ON|TRUE|YES)\)$' "${config}" || {
     echo "ERROR: reused MFEM package config does not report MPI enabled: ${config}" >&2
+    exit 3
+  }
+  is_cmake_false "${openmp_enabled}" || {
+    echo "ERROR: reused MFEM cache does not explicitly disable OpenMP: ${openmp_enabled:-<missing>}" >&2
+    exit 3
+  }
+  is_cmake_false "${openmp_config_enabled}" || {
+    echo "ERROR: reused MFEM package config does not explicitly disable OpenMP: ${openmp_config_enabled:-<missing>}" >&2
+    exit 3
+  }
+  is_cmake_true "${metis_enabled}" || {
+    echo "ERROR: reused MFEM cache does not enable METIS: ${metis_enabled:-<missing>}" >&2
+    exit 3
+  }
+  is_cmake_true "${metis_config_enabled}" || {
+    echo "ERROR: reused MFEM package config does not report METIS enabled: ${metis_config_enabled:-<missing>}" >&2
     exit 3
   }
   is_cmake_false "${raja_enabled}" || {
@@ -811,9 +1281,21 @@ validate_reused_mfem() {
     }
   fi
 
-  spack_identity openmpi mpi_prefix mpi_hash mpi_compiler
-  spack_identity hypre hypre_prefix hypre_hash hypre_compiler
-  hypre_mpi_hash="$(spack_dependency_hash hypre mpi)"
+  metis_spec="metis"
+  caliper_spec="off"
+  umpire_spec="off"
+  cuda_spec="off"
+  if [[ "${MODE}" == "gpu" ]]; then
+    mpi_spec="openmpi+cuda"
+    hypre_spec="hypre@develop+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
+  else
+    mpi_spec="openmpi~cuda"
+    hypre_spec="hypre+mpi~cuda"
+  fi
+  spack_identity "${mpi_spec}" mpi_prefix mpi_hash mpi_compiler
+  spack_identity "${hypre_spec}" hypre_prefix hypre_hash hypre_compiler
+  spack_identity "${metis_spec}" metis_prefix metis_hash metis_compiler
+  hypre_mpi_hash="$(spack_dependency_hash "${hypre_spec}" mpi)"
   [[ "${hypre_mpi_hash}" == "${mpi_hash}" ]] || {
     echo "ERROR: active Spack HYPRE/MPI concretization mismatch: hypre-mpi=${hypre_mpi_hash} mpi=${mpi_hash}" >&2
     exit 3
@@ -822,14 +1304,21 @@ validate_reused_mfem() {
     echo "ERROR: active Spack HYPRE/MPI compiler mismatch: hypre=${hypre_compiler} mpi=${mpi_compiler}" >&2
     exit 3
   }
+  [[ "${metis_compiler}" == "${mpi_compiler}" ]] || {
+    echo "ERROR: active Spack METIS/MPI compiler mismatch: metis=${metis_compiler} mpi=${mpi_compiler}" >&2
+    exit 3
+  }
   caliper_state="off"
+  caliper_hash="off"
   if ((CALIPER)); then
-    spack_identity caliper caliper_prefix caliper_hash caliper_compiler
+    caliper_spec="caliper+mpi~cuda"
+    spack_identity "${caliper_spec}" \
+      caliper_prefix caliper_hash caliper_compiler
     [[ "${caliper_compiler}" == "${mpi_compiler}" ]] || {
       echo "ERROR: active Spack Caliper/MPI compiler mismatch: caliper=${caliper_compiler} mpi=${mpi_compiler}" >&2
       exit 3
     }
-    caliper_mpi_hash="$(spack_dependency_hash caliper mpi)"
+    caliper_mpi_hash="$(spack_dependency_hash "${caliper_spec}" mpi)"
     [[ "${caliper_mpi_hash}" == "${mpi_hash}" ]] || {
       echo "ERROR: active Spack Caliper/MPI concretization mismatch: caliper-mpi=${caliper_mpi_hash} mpi=${mpi_hash}" >&2
       exit 3
@@ -854,6 +1343,14 @@ validate_reused_mfem() {
   }
   [[ "${cache_hypre}" == "${hypre_prefix}" ]] || {
     echo "ERROR: reused MFEM HYPRE root mismatch: expected=${hypre_prefix} actual=${cache_hypre}" >&2
+    exit 3
+  }
+  cache_metis="$(canonical_existing_path "$(cache_value "${cache}" METIS_DIR)")" || {
+    echo "ERROR: reused MFEM METIS cache root is missing or moved." >&2
+    exit 3
+  }
+  [[ "${cache_metis}" == "${metis_prefix}" ]] || {
+    echo "ERROR: reused MFEM METIS root mismatch: expected=${metis_prefix} actual=${cache_metis}" >&2
     exit 3
   }
 
@@ -909,6 +1406,41 @@ validate_reused_mfem() {
       exit 3
       ;;
   esac
+  view_metis_header="$(canonical_existing_path \
+    "${spack_view}/include/metis.h")" || {
+    echo "ERROR: selected Spack view has no usable METIS header." >&2
+    exit 3
+  }
+  view_metis_library=""
+  for view_library_candidate in \
+      "${spack_view}/lib/libmetis.so" \
+      "${spack_view}/lib64/libmetis.so" \
+      "${spack_view}/lib/libmetis.a" \
+      "${spack_view}/lib64/libmetis.a"; do
+    if [[ -e "${view_library_candidate}" ]]; then
+      view_metis_library="$(canonical_existing_path \
+        "${view_library_candidate}")"
+      break
+    fi
+  done
+  [[ -n "${view_metis_library}" ]] || {
+    echo "ERROR: selected Spack view has no usable METIS library." >&2
+    exit 3
+  }
+  case "${view_metis_header}" in
+    "${metis_prefix}"/*) ;;
+    *)
+      echo "ERROR: selected Spack view METIS header does not match its concrete METIS prefix." >&2
+      exit 3
+      ;;
+  esac
+  case "${view_metis_library}" in
+    "${metis_prefix}"/*) ;;
+    *)
+      echo "ERROR: selected Spack view METIS library does not match its concrete METIS prefix." >&2
+      exit 3
+      ;;
+  esac
   cache_cxx="$(canonical_existing_path "$(cache_value "${cache}" CMAKE_CXX_COMPILER)")" || {
     echo "ERROR: reused MFEM C++ compiler identity is missing or moved." >&2
     exit 3
@@ -949,6 +1481,10 @@ validate_reused_mfem() {
     exit 3
   }
   raja_state="off"
+  umpire_state="off"
+  umpire_hash="off"
+  cuda_hash="off"
+  configured_archs="none"
   if [[ "${MODE}" == "gpu" ]]; then
     is_cmake_true "${cuda_enabled}" || {
       echo "ERROR: reused GPU MFEM cache does not enable CUDA: ${cuda_enabled:-<missing>}" >&2
@@ -971,8 +1507,11 @@ validate_reused_mfem() {
       echo "ERROR: reused GPU MFEM package config does not report Umpire enabled: ${config}" >&2
       exit 3
     }
-    spack_identity cuda cuda_prefix cuda_hash cuda_compiler
-    spack_identity umpire umpire_prefix umpire_hash umpire_compiler
+    cuda_spec="cuda"
+    umpire_spec="umpire"
+    spack_identity "${cuda_spec}" cuda_prefix cuda_hash cuda_compiler
+    spack_identity "${umpire_spec}" \
+      umpire_prefix umpire_hash umpire_compiler
     cache_cuda="$(canonical_existing_path "$(cache_value "${cache}" CUDAToolkit_ROOT)")" || {
       echo "ERROR: reused MFEM CUDA toolkit root is missing or moved." >&2
       exit 3
@@ -1057,9 +1596,9 @@ validate_reused_mfem() {
       echo "ERROR: active Spack Umpire compiler mismatch: umpire=${umpire_compiler} mpi=${mpi_compiler}" >&2
       exit 3
     }
-    hypre_cuda_hash="$(spack_dependency_hash hypre cuda)"
-    hypre_umpire_hash="$(spack_dependency_hash hypre umpire)"
-    umpire_cuda_hash="$(spack_dependency_hash umpire cuda)"
+    hypre_cuda_hash="$(spack_dependency_hash "${hypre_spec}" cuda)"
+    hypre_umpire_hash="$(spack_dependency_hash "${hypre_spec}" umpire)"
+    umpire_cuda_hash="$(spack_dependency_hash "${umpire_spec}" cuda)"
     [[ "${hypre_cuda_hash}" == "${cuda_hash}" &&
        "${hypre_umpire_hash}" == "${umpire_hash}" &&
        "${umpire_cuda_hash}" == "${cuda_hash}" ]] || {
@@ -1067,7 +1606,6 @@ validate_reused_mfem() {
       exit 3
     }
     umpire_state="${umpire_hash}"
-    MFEM_REUSE_ABI="compiler=${mpi_compiler};mpi=${mpi_hash};hypre=${hypre_hash};raja=${raja_state};umpire=${umpire_state};caliper=${caliper_state};cuda=${cuda_hash};arch=${configured_archs}"
   else
     is_cmake_false "${cuda_enabled}" || {
       echo "ERROR: reused CPU MFEM cache does not report CUDA disabled: ${cuda_enabled:-<missing>}" >&2
@@ -1085,13 +1623,54 @@ validate_reused_mfem() {
       echo "ERROR: reused CPU MFEM package config does not report Umpire disabled: ${config}" >&2
       exit 3
     }
-    umpire_state="off"
-    MFEM_REUSE_ABI="compiler=${mpi_compiler};mpi=${mpi_hash};hypre=${hypre_hash};raja=${raja_state};umpire=${umpire_state};caliper=${caliper_state};cuda=off;arch=none"
   fi
 
   MFEM_SOURCE_ROOT="${root}"
   MFEM_BUILD="${build}"
   MFEM_INSTALL="${install}"
+  MFEM_REUSE_ABI="build_type=${cache_build_type};openmp=off;metis=${metis_hash};compiler=${mpi_compiler};mpi_spec=${mpi_spec};mpi=${mpi_hash};hypre_spec=${hypre_spec};hypre=${hypre_hash};raja=${raja_state};umpire_spec=${umpire_spec};umpire=${umpire_state};caliper_spec=${caliper_spec};caliper=${caliper_state};cuda_spec=${cuda_spec};cuda=${cuda_hash};dependency_arch=${DEPENDENCY_CUDA_ARCH};mfem_arch=${configured_archs}"
+  MFEM_IDENTITY_BUILD_TYPE="${cache_build_type}"
+  MFEM_IDENTITY_OPENMP_STATE="OFF"
+  MFEM_IDENTITY_METIS_STATE="ON"
+  if ((CALIPER)); then
+    MFEM_IDENTITY_CALIPER_STATE="ON"
+  else
+    MFEM_IDENTITY_CALIPER_STATE="OFF"
+  fi
+  MFEM_IDENTITY_COMPILER="${mpi_compiler}"
+  MFEM_IDENTITY_MPI_SPEC="${mpi_spec}"
+  MFEM_IDENTITY_MPI_HASH="${mpi_hash}"
+  MFEM_IDENTITY_MPI_PREFIX="${mpi_prefix}"
+  MFEM_IDENTITY_HYPRE_SPEC="${hypre_spec}"
+  MFEM_IDENTITY_HYPRE_HASH="${hypre_hash}"
+  MFEM_IDENTITY_HYPRE_PREFIX="${hypre_prefix}"
+  MFEM_IDENTITY_METIS_SPEC="${metis_spec}"
+  MFEM_IDENTITY_METIS_HASH="${metis_hash}"
+  MFEM_IDENTITY_METIS_PREFIX="${metis_prefix}"
+  MFEM_IDENTITY_RAJA_STATE="${raja_state}"
+  MFEM_IDENTITY_UMPIRE_SPEC="${umpire_spec}"
+  MFEM_IDENTITY_UMPIRE_HASH="${umpire_hash}"
+  MFEM_IDENTITY_CALIPER_SPEC="${caliper_spec}"
+  MFEM_IDENTITY_CALIPER_HASH="${caliper_hash}"
+  MFEM_IDENTITY_CUDA_SPEC="${cuda_spec}"
+  MFEM_IDENTITY_CUDA_HASH="${cuda_hash}"
+  if [[ "${MODE}" == "gpu" ]]; then
+    MFEM_IDENTITY_CUDA_COMPILER="${cuda_compiler}"
+  else
+    MFEM_IDENTITY_CUDA_COMPILER="off"
+  fi
+  hash_mfem_identity_artifacts \
+    "${cache}" "${config}" "${archive}" "${targets}" \
+    "${targets_config}" "${compiler_metadata}" "${install_script}" \
+    "${check_cache}"
+  if [[ "${stamp_policy}" == "require" ]]; then
+    if [[ -e "${MFEM_IDENTITY_STAMP}" || -L "${MFEM_IDENTITY_STAMP}" ]]; then
+      verify_mfem_identity_stamp
+    elif ! verify_reviewed_mfem_admission; then
+      echo "ERROR: reused MFEM identity stamp is missing and no exact reviewed admission matches: ${MFEM_IDENTITY_STAMP}" >&2
+      exit 3
+    fi
+  fi
   MFEM_REUSE_STATE="validated-read-only"
   MFEM_TUPLE_STATE="reuse-source-build-install-validated"
 }
@@ -1101,6 +1680,10 @@ freeze_reuse_pre_dependency_identity() {
      "${MFEM_TUPLE_STATE}" == "reuse-source-build-install-validated" &&
      "${SPACK_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ &&
      "${SPACK_LOCK_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${MFEM_IDENTITY_STAMP_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${MFEM_IDENTITY_CACHE_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${MFEM_IDENTITY_CONFIG_SHA256}" =~ ^[0-9a-f]{64}$ &&
+     "${MFEM_IDENTITY_ARCHIVE_SHA256}" =~ ^[0-9a-f]{64}$ &&
      -n "${MFEM_REUSE_ABI}" ]] || {
     echo "ERROR: cannot freeze an incomplete pre-dependency MFEM reuse identity." >&2
     exit 3
@@ -1111,6 +1694,16 @@ freeze_reuse_pre_dependency_identity() {
   MFEM_REUSE_PRE_MANIFEST_SHA256="${SPACK_MANIFEST_SHA256}"
   MFEM_REUSE_PRE_LOCK_SHA256="${SPACK_LOCK_SHA256}"
   MFEM_REUSE_PRE_ABI="${MFEM_REUSE_ABI}"
+  MFEM_REUSE_PRE_IDENTITY_SHA256="${MFEM_IDENTITY_STAMP_SHA256}"
+  MFEM_REUSE_PRE_TRUST_MODE="${MFEM_IDENTITY_TRUST_MODE}"
+  MFEM_REUSE_PRE_CACHE_SHA256="${MFEM_IDENTITY_CACHE_SHA256}"
+  MFEM_REUSE_PRE_CONFIG_SHA256="${MFEM_IDENTITY_CONFIG_SHA256}"
+  MFEM_REUSE_PRE_ARCHIVE_SHA256="${MFEM_IDENTITY_ARCHIVE_SHA256}"
+  MFEM_REUSE_PRE_TARGETS_SHA256="${MFEM_IDENTITY_TARGETS_SHA256}"
+  MFEM_REUSE_PRE_TARGETS_CONFIG_SHA256="${MFEM_IDENTITY_TARGETS_CONFIG_SHA256}"
+  MFEM_REUSE_PRE_COMPILER_METADATA_SHA256="${MFEM_IDENTITY_COMPILER_METADATA_SHA256}"
+  MFEM_REUSE_PRE_INSTALL_SCRIPT_SHA256="${MFEM_IDENTITY_INSTALL_SCRIPT_SHA256}"
+  MFEM_REUSE_PRE_CHECK_CACHE_SHA256="${MFEM_IDENTITY_CHECK_CACHE_SHA256}"
   MFEM_REUSE_TRANSACTION_STATE="pre-dependency-validated"
 }
 
@@ -1118,6 +1711,7 @@ revalidate_reused_mfem_after_dependencies() {
   local frozen_source="${MFEM_REUSE_PRE_SOURCE_ROOT}"
   local frozen_build="${MFEM_REUSE_PRE_BUILD}"
   local frozen_install="${MFEM_REUSE_PRE_INSTALL}"
+  local drift=0
 
   [[ "${MFEM_REUSE_TRANSACTION_STATE}" == \
      "pre-dependency-validated" && -n "${frozen_source}" ]] || {
@@ -1125,23 +1719,48 @@ revalidate_reused_mfem_after_dependencies() {
     exit 3
   }
   validate_reused_mfem "${frozen_source}"
-  [[ "${MFEM_SOURCE_ROOT}" == "${frozen_source}" &&
-     "${MFEM_BUILD}" == "${frozen_build}" &&
-     "${MFEM_INSTALL}" == "${frozen_install}" ]] || {
-    echo "ERROR: MFEM reuse source/build/install tuple changed across dependency installation." >&2
-    echo "       pre=${frozen_source}|${frozen_build}|${frozen_install}" >&2
-    echo "       post=${MFEM_SOURCE_ROOT}|${MFEM_BUILD}|${MFEM_INSTALL}" >&2
-    exit 3
-  }
-  [[ "${MFEM_REUSE_ABI}" == "${MFEM_REUSE_PRE_ABI}" ]] || {
-    echo "ERROR: MFEM reuse ABI changed across dependency installation." >&2
-    echo "       pre=${MFEM_REUSE_PRE_ABI}" >&2
-    echo "       post=${MFEM_REUSE_ABI}" >&2
-    exit 3
-  }
   MFEM_REUSE_POST_MANIFEST_SHA256="${SPACK_MANIFEST_SHA256}"
   MFEM_REUSE_POST_LOCK_SHA256="${SPACK_LOCK_SHA256}"
   MFEM_REUSE_POST_ABI="${MFEM_REUSE_ABI}"
+  if [[ "${MFEM_SOURCE_ROOT}" != "${frozen_source}" ||
+        "${MFEM_BUILD}" != "${frozen_build}" ||
+        "${MFEM_INSTALL}" != "${frozen_install}" ]]; then
+    echo "ERROR: MFEM reuse source/build/install tuple changed across dependency installation." >&2
+    echo "       pre=${frozen_source}|${frozen_build}|${frozen_install}" >&2
+    echo "       post=${MFEM_SOURCE_ROOT}|${MFEM_BUILD}|${MFEM_INSTALL}" >&2
+    drift=1
+  fi
+  if [[ "${MFEM_REUSE_POST_ABI}" != "${MFEM_REUSE_PRE_ABI}" ]]; then
+    echo "ERROR: MFEM reuse ABI changed across dependency installation." >&2
+    echo "       pre=${MFEM_REUSE_PRE_ABI}" >&2
+    echo "       post=${MFEM_REUSE_POST_ABI}" >&2
+    drift=1
+  fi
+  if [[ "${MFEM_IDENTITY_TRUST_MODE}" != "${MFEM_REUSE_PRE_TRUST_MODE}" ||
+        "${MFEM_IDENTITY_STAMP_SHA256}" != \
+        "${MFEM_REUSE_PRE_IDENTITY_SHA256}" ]]; then
+    echo "ERROR: MFEM reuse trust anchor changed across dependency installation." >&2
+    echo "       pre=${MFEM_REUSE_PRE_TRUST_MODE}|${MFEM_REUSE_PRE_IDENTITY_SHA256}" >&2
+    echo "       post=${MFEM_IDENTITY_TRUST_MODE}|${MFEM_IDENTITY_STAMP_SHA256}" >&2
+    drift=1
+  fi
+  if [[ "${MFEM_REUSE_POST_MANIFEST_SHA256}" != \
+        "${MFEM_REUSE_PRE_MANIFEST_SHA256}" ]]; then
+    echo "ERROR: Spack manifest changed across MFEM reuse dependency installation." >&2
+    echo "       pre=${MFEM_REUSE_PRE_MANIFEST_SHA256}" >&2
+    echo "       post=${MFEM_REUSE_POST_MANIFEST_SHA256}" >&2
+    drift=1
+  fi
+  if [[ "${MFEM_REUSE_POST_LOCK_SHA256}" != \
+        "${MFEM_REUSE_PRE_LOCK_SHA256}" ]]; then
+    echo "ERROR: Spack lock changed across MFEM reuse dependency installation." >&2
+    echo "       pre=${MFEM_REUSE_PRE_LOCK_SHA256}" >&2
+    echo "       post=${MFEM_REUSE_POST_LOCK_SHA256}" >&2
+    drift=1
+  fi
+  if ((drift)); then
+    exit 3
+  fi
   MFEM_REUSE_TRANSACTION_STATE="post-dependency-validated"
   echo "[reuse-transaction] mfem_reuse_transaction_state=${MFEM_REUSE_TRANSACTION_STATE} phase=post-dependency state=validated mfem_source=${MFEM_SOURCE_ROOT} mfem_build=${MFEM_BUILD} mfem_install=${MFEM_INSTALL}"
   echo "[reuse-transaction] mfem_reuse_post_abi=${MFEM_REUSE_POST_ABI}"
@@ -1262,6 +1881,7 @@ echo "[build-plan] mfem_source=${MFEM_SOURCE_ROOT} mfem_build=${MFEM_BUILD} mfem
 echo "[build-plan] mfem_source_pin=${MFEM_SOURCE_PIN} fem_picojson_blob=${MFEM_PICOJSON_BLOB} general_tinyxml2_blob=${MFEM_TINYXML2_BLOB}"
 if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
   echo "[build-plan] mfem_reuse_abi=${MFEM_REUSE_ABI}"
+  echo "[build-plan] mfem_identity_trust_mode=${MFEM_IDENTITY_TRUST_MODE} mfem_identity_sha256=${MFEM_IDENTITY_STAMP_SHA256}"
   echo "[build-plan] spack_manifest_sha256=${SPACK_MANIFEST_SHA256} spack_lock_sha256=${SPACK_LOCK_SHA256}"
   echo "[build-plan] mfem_reuse_transaction_state=${MFEM_REUSE_TRANSACTION_STATE}"
   echo "[build-plan] mfem_reuse_pre_abi=${MFEM_REUSE_PRE_ABI}"
@@ -1319,6 +1939,9 @@ if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
   export DG_IGR_TEST_REUSE_MFEM_ROOT="${MFEM_SOURCE_ROOT}"
   export DG_IGR_TEST_REUSE_SPACK_ENV="${SPACK_ENV}"
   export DG_IGR_TEST_REUSE_MODE="${MODE}"
+  export DG_IGR_TEST_REUSE_PROFILE="${PROFILE}"
+  export DG_IGR_TEST_REUSE_CALIPER="${CALIPER}"
+  export DG_IGR_TEST_REUSE_CUDA_ARCH="${DEPENDENCY_CUDA_ARCH}"
 else
   DG_IGR_SPACK_ENV="${SPACK_ENV}" CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
     MFEM_SRC="${MFEM_SOURCE_ROOT}" MFEM_BUILD="${MFEM_BUILD}" \
