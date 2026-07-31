@@ -174,6 +174,10 @@ if((DG_IGR_ENABLE_HDG_RUNTIME OR
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/CMakeLists.txt")
   add_subdirectory(runtime)
 endif()
+if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/auxiliary/CMakeLists.txt")
+  add_subdirectory(auxiliary)
+endif()
 
 # CPU core, trace, device, and formulation tests remain independently
 # registerable even when the accelerator-only oracle below is unavailable.
