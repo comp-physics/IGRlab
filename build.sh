@@ -57,8 +57,12 @@ MFEM_IDENTITY_STAMP_NAME="dg-igr-mfem-identity-v1.txt"
 MFEM_IDENTITY_STAMP=""
 MFEM_IDENTITY_STAMP_SHA256=""
 MFEM_IDENTITY_TRUST_MODE=""
-MFEM_REVIEWED_ADMISSION_RECORD="${SCRIPT_DIR}/cmake/mfem-reuse-identities/cpu-w8a-d9d6526-973e5abc.json"
-MFEM_REVIEWED_ADMISSION_SHA256="d4e0f68d795d30ecb3e403f797ecf4ccd4ec8ed79ba5746a997f68bd6eae98ec"
+MFEM_REVIEWED_ADMISSION_RECORD=""
+MFEM_REVIEWED_ADMISSION_SHA256=""
+MFEM_CPU_REVIEWED_ADMISSION_RECORD="${SCRIPT_DIR}/cmake/mfem-reuse-identities/cpu-w8a-d9d6526-973e5abc.json"
+MFEM_CPU_REVIEWED_ADMISSION_SHA256="d4e0f68d795d30ecb3e403f797ecf4ccd4ec8ed79ba5746a997f68bd6eae98ec"
+MFEM_GPU_SM120_REVIEWED_ADMISSION_RECORD="${SCRIPT_DIR}/cmake/mfem-reuse-identities/gpu-w8a-d9d6526-345d64a2.json"
+MFEM_GPU_SM120_REVIEWED_ADMISSION_SHA256="00559ec1cdd0ad5728a0ff92a165fdbf7d757da6f9c672153d8a665cc9e489a9"
 MFEM_IDENTITY_CACHE_SHA256=""
 MFEM_IDENTITY_CONFIG_SHA256=""
 MFEM_IDENTITY_ARCHIVE_SHA256=""
@@ -86,11 +90,17 @@ MFEM_IDENTITY_METIS_PREFIX=""
 MFEM_IDENTITY_RAJA_STATE=""
 MFEM_IDENTITY_UMPIRE_SPEC=""
 MFEM_IDENTITY_UMPIRE_HASH=""
+MFEM_IDENTITY_UMPIRE_PREFIX=""
 MFEM_IDENTITY_CALIPER_SPEC=""
 MFEM_IDENTITY_CALIPER_HASH=""
 MFEM_IDENTITY_CUDA_SPEC=""
 MFEM_IDENTITY_CUDA_HASH=""
+MFEM_IDENTITY_CUDA_PREFIX=""
 MFEM_IDENTITY_CUDA_COMPILER=""
+MFEM_IDENTITY_CUDA_COMPILER_METADATA_PATH=""
+MFEM_IDENTITY_CUDA_COMPILER_METADATA_SHA256=""
+MFEM_IDENTITY_INSTALL_MANIFEST_PATH=""
+MFEM_IDENTITY_INSTALL_MANIFEST_SHA256=""
 
 usage() {
   cat <<'EOF'
@@ -300,13 +310,50 @@ mfem_identity_stamp_matches() {
   [[ "${actual_payload}" == "${expected_payload}" ]]
 }
 
-mfem_reviewed_admission_record_matches() {
+mfem_admission_record_matches() {
   local record="$1"
+  local expected_sha="$2"
   local actual_sha
 
   [[ -f "${record}" && ! -L "${record}" ]] || return 1
   actual_sha="$(sha256sum "${record}" | cut -d' ' -f1)" || return 1
-  [[ "${actual_sha}" == "${MFEM_REVIEWED_ADMISSION_SHA256}" ]]
+  [[ "${actual_sha}" == "${expected_sha}" ]]
+}
+
+mfem_reviewed_admission_record_matches() {
+  mfem_admission_record_matches "$1" \
+    "${MFEM_REVIEWED_ADMISSION_SHA256}"
+}
+
+reviewed_admission_route() {
+  local route_mode="$1"
+  local route_profile="$2"
+
+  case "${route_mode}:${route_profile}" in
+    cpu:cpu)
+      printf '%s|%s\n' \
+        "${MFEM_CPU_REVIEWED_ADMISSION_RECORD}" \
+        "${MFEM_CPU_REVIEWED_ADMISSION_SHA256}"
+      ;;
+    gpu:cuda-sm120)
+      printf '%s|%s\n' \
+        "${MFEM_GPU_SM120_REVIEWED_ADMISSION_RECORD}" \
+        "${MFEM_GPU_SM120_REVIEWED_ADMISSION_SHA256}"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+select_reviewed_admission_route() {
+  local route
+
+  MFEM_REVIEWED_ADMISSION_RECORD=""
+  MFEM_REVIEWED_ADMISSION_SHA256=""
+  route="$(reviewed_admission_route "${MODE}" "${PROFILE}")" || return 1
+  IFS='|' read -r MFEM_REVIEWED_ADMISSION_RECORD \
+    MFEM_REVIEWED_ADMISSION_SHA256 <<<"${route}"
+  [[ -n "${MFEM_REVIEWED_ADMISSION_RECORD}" &&
+     "${MFEM_REVIEWED_ADMISSION_SHA256}" =~ ^[0-9a-f]{64}$ ]]
 }
 
 hash_mfem_identity_artifacts() {
@@ -457,6 +504,11 @@ verify_reviewed_mfem_admission() {
   local record_sha source_tree build_rel install_rel
   local claim post_dependency_revalidation=0
 
+  [[ -n "${MFEM_REVIEWED_ADMISSION_RECORD}" &&
+     "${MFEM_REVIEWED_ADMISSION_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "ERROR: no prospective MFEM reuse admission is pinned for mode=${MODE} profile=${PROFILE}." >&2
+    return 1
+  }
   require_exact_mfem_file \
     "${MFEM_REVIEWED_ADMISSION_RECORD}" "reviewed MFEM admission record"
   record_sha="$(sha256sum "${MFEM_REVIEWED_ADMISSION_RECORD}" | cut -d' ' -f1)"
@@ -523,6 +575,14 @@ verify_reviewed_mfem_admission() {
     reviewed_admission_expect metis_spec "${MFEM_IDENTITY_METIS_SPEC}"
     reviewed_admission_expect metis_hash "${MFEM_IDENTITY_METIS_HASH}"
     reviewed_admission_expect metis_prefix "${MFEM_IDENTITY_METIS_PREFIX}"
+    if [[ "${MODE}" == "gpu" ]]; then
+      reviewed_admission_expect umpire_spec "${MFEM_IDENTITY_UMPIRE_SPEC}"
+      reviewed_admission_expect umpire_hash "${MFEM_IDENTITY_UMPIRE_HASH}"
+      reviewed_admission_expect umpire_prefix "${MFEM_IDENTITY_UMPIRE_PREFIX}"
+      reviewed_admission_expect cuda_spec "${MFEM_IDENTITY_CUDA_SPEC}"
+      reviewed_admission_expect cuda_hash "${MFEM_IDENTITY_CUDA_HASH}"
+      reviewed_admission_expect cuda_prefix "${MFEM_IDENTITY_CUDA_PREFIX}"
+    fi
     reviewed_admission_expect spack_manifest_sha256 \
       "${SPACK_MANIFEST_SHA256}"
     reviewed_admission_expect spack_lock_sha256 "${SPACK_LOCK_SHA256}"
@@ -543,6 +603,16 @@ verify_reviewed_mfem_admission() {
     "${MFEM_IDENTITY_COMPILER_METADATA_PATH#"${MFEM_SOURCE_ROOT}/"}"
   reviewed_admission_expect compiler_metadata_sha256 \
     "${MFEM_IDENTITY_COMPILER_METADATA_SHA256}"
+  if [[ "${MODE}" == "gpu" ]]; then
+    reviewed_admission_expect cuda_compiler_metadata_path \
+      "${MFEM_IDENTITY_CUDA_COMPILER_METADATA_PATH#"${MFEM_SOURCE_ROOT}/"}"
+    reviewed_admission_expect cuda_compiler_metadata_sha256 \
+      "${MFEM_IDENTITY_CUDA_COMPILER_METADATA_SHA256}"
+    reviewed_admission_expect install_manifest_path \
+      "${MFEM_IDENTITY_INSTALL_MANIFEST_PATH#"${MFEM_SOURCE_ROOT}/"}"
+    reviewed_admission_expect install_manifest_sha256 \
+      "${MFEM_IDENTITY_INSTALL_MANIFEST_SHA256}"
+  fi
   reviewed_admission_expect mfem_config_path \
     "${install_rel}/lib/cmake/mfem/MFEMConfig.cmake"
   reviewed_admission_expect mfem_config_sha256 \
@@ -569,8 +639,13 @@ verify_reviewed_mfem_admission() {
     "7f76c37336323ff448c8cc2a6340f3b8379ee872"
   reviewed_admission_expect journal_receipt_sha256 \
     "4c00ae91974bb5a111b24f313a13a0ddf19ca91d06cf443c08096340202b150e"
-  reviewed_admission_expect sealed_dev3_cpu_manifest_sha256 \
-    "008605ffe7d0192689a6dcdcebfcee7fcac4ead307ff6c6403ee36731ce2d59d"
+  if [[ "${MODE}" == "gpu" ]]; then
+    reviewed_admission_expect sealed_dev3_gpu_manifest_sha256 \
+      "ccb280318581f926b2bb65d98581868a29075ae4ba4f1ddf15eb24cf8939c059"
+  else
+    reviewed_admission_expect sealed_dev3_cpu_manifest_sha256 \
+      "008605ffe7d0192689a6dcdcebfcee7fcac4ead307ff6c6403ee36731ce2d59d"
+  fi
   reviewed_admission_expect shared_spack_authority_ledger_sha256 \
     "5ef52a45844fe2414ef28bd4067ad0de7c7bc860efc64d40dfc5a2b440736ea0"
 
@@ -903,11 +978,84 @@ assert_identity_stamp_payload_rejected() {
   fi
 }
 
+assert_reviewed_admission_route() {
+  local route_mode="$1"
+  local route_profile="$2"
+  local expected_record="$3"
+  local expected_sha="$4"
+  local actual
+
+  actual="$(reviewed_admission_route \
+    "${route_mode}" "${route_profile}")" || {
+    echo "ERROR: reviewed MFEM admission route fixture rejected mode=${route_mode} profile=${route_profile}." >&2
+    exit 3
+  }
+  [[ "${actual}" == "${expected_record}|${expected_sha}" ]] || {
+    echo "ERROR: reviewed MFEM admission route fixture mismatch for mode=${route_mode} profile=${route_profile}." >&2
+    echo "       expected=${expected_record}|${expected_sha}" >&2
+    echo "       actual=${actual}" >&2
+    exit 3
+  }
+}
+
+assert_reviewed_admission_route_rejected() {
+  local route_mode="$1"
+  local route_profile="$2"
+  local actual
+
+  if actual="$(reviewed_admission_route \
+      "${route_mode}" "${route_profile}")"; then
+    echo "ERROR: reviewed MFEM admission route fixture accepted wrong mode/profile=${route_mode}/${route_profile}: ${actual}" >&2
+    exit 3
+  fi
+}
+
+run_reviewed_admission_route_fixtures() {
+  local zero_hash
+
+  zero_hash="0000000000000000000000000000000000000000000000000000000000000000"
+  assert_reviewed_admission_route cpu cpu \
+    "${MFEM_CPU_REVIEWED_ADMISSION_RECORD}" \
+    "${MFEM_CPU_REVIEWED_ADMISSION_SHA256}"
+  assert_reviewed_admission_route gpu cuda-sm120 \
+    "${MFEM_GPU_SM120_REVIEWED_ADMISSION_RECORD}" \
+    "${MFEM_GPU_SM120_REVIEWED_ADMISSION_SHA256}"
+  assert_reviewed_admission_route_rejected gpu cpu
+  assert_reviewed_admission_route_rejected cpu cuda-sm120
+  assert_reviewed_admission_route_rejected gpu cuda-sm90
+
+  mfem_admission_record_matches \
+    "${MFEM_CPU_REVIEWED_ADMISSION_RECORD}" \
+    "${MFEM_CPU_REVIEWED_ADMISSION_SHA256}" || {
+    echo "ERROR: pinned CPU reviewed MFEM admission fixture failed." >&2
+    exit 3
+  }
+  mfem_admission_record_matches \
+    "${MFEM_GPU_SM120_REVIEWED_ADMISSION_RECORD}" \
+    "${MFEM_GPU_SM120_REVIEWED_ADMISSION_SHA256}" || {
+    echo "ERROR: pinned GPU reviewed MFEM admission fixture failed." >&2
+    exit 3
+  }
+  if mfem_admission_record_matches \
+      "${MFEM_GPU_SM120_REVIEWED_ADMISSION_RECORD}" "${zero_hash}"; then
+    echo "ERROR: wrong-hash reviewed MFEM admission fixture was accepted." >&2
+    exit 3
+  fi
+  if mfem_admission_record_matches \
+      "${DG_IGR_REUSE_FIXTURE_ROOT}/missing-reviewed-admission" \
+      "${MFEM_GPU_SM120_REVIEWED_ADMISSION_SHA256}"; then
+    echo "ERROR: missing reviewed MFEM admission fixture was accepted." >&2
+    exit 3
+  fi
+  echo "[reuse-fixtures] CPU/GPU admission routing and negative cases passed"
+}
+
 run_identity_stamp_negative_fixtures() {
   local expected_payload mismatched_stamp hash_stamp hash_payload
   local mismatched_admission zero_hash
 
   expected_payload="$(render_mfem_identity_payload)"
+  run_reviewed_admission_route_fixtures
   assert_identity_stamp_payload_rejected missing-stamp \
     "${DG_IGR_REUSE_FIXTURE_ROOT}/missing-identity-stamp" \
     "${expected_payload}"
@@ -1075,7 +1223,8 @@ validate_reused_mfem() {
   local requested="$1"
   local stamp_policy="${2:-require}"
   local source_kind="${3:-reused}"
-  local root build install cache install_script check_cache config archive
+  local root build install cache install_script check_cache install_manifest
+  local config archive
   local targets targets_config targets_config_suffix compiler_metadata_records
   local compiler_metadata_count compiler_metadata
   local cache_home cache_prefix canonical_home canonical_prefix
@@ -1565,6 +1714,20 @@ validate_reused_mfem() {
       echo "ERROR: reused MFEM CUDA compiler metadata is missing or moved." >&2
       exit 3
     }
+    install_manifest="${build}/install_manifest.txt"
+    require_exact_mfem_file \
+      "${install_manifest}" "reused MFEM install manifest"
+    MFEM_IDENTITY_CUDA_COMPILER_METADATA_PATH="${cuda_metadata}"
+    MFEM_IDENTITY_CUDA_COMPILER_METADATA_SHA256="$(sha256sum \
+      "${cuda_metadata}" | cut -d' ' -f1)"
+    MFEM_IDENTITY_INSTALL_MANIFEST_PATH="${install_manifest}"
+    MFEM_IDENTITY_INSTALL_MANIFEST_SHA256="$(sha256sum \
+      "${install_manifest}" | cut -d' ' -f1)"
+    [[ "${MFEM_IDENTITY_CUDA_COMPILER_METADATA_SHA256}" =~ ^[0-9a-f]{64}$ &&
+       "${MFEM_IDENTITY_INSTALL_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+      echo "ERROR: reused MFEM GPU provenance hashes are malformed." >&2
+      exit 3
+    }
     metadata_cuda="$(canonical_existing_path \
       "$(config_value "${cuda_metadata}" CMAKE_CUDA_COMPILER)")" || {
       echo "ERROR: reused MFEM CUDA metadata has no usable CUDA compiler." >&2
@@ -1650,13 +1813,20 @@ validate_reused_mfem() {
   MFEM_IDENTITY_RAJA_STATE="${raja_state}"
   MFEM_IDENTITY_UMPIRE_SPEC="${umpire_spec}"
   MFEM_IDENTITY_UMPIRE_HASH="${umpire_hash}"
+  if [[ "${MODE}" == "gpu" ]]; then
+    MFEM_IDENTITY_UMPIRE_PREFIX="${umpire_prefix}"
+  else
+    MFEM_IDENTITY_UMPIRE_PREFIX="off"
+  fi
   MFEM_IDENTITY_CALIPER_SPEC="${caliper_spec}"
   MFEM_IDENTITY_CALIPER_HASH="${caliper_hash}"
   MFEM_IDENTITY_CUDA_SPEC="${cuda_spec}"
   MFEM_IDENTITY_CUDA_HASH="${cuda_hash}"
   if [[ "${MODE}" == "gpu" ]]; then
+    MFEM_IDENTITY_CUDA_PREFIX="${cuda_prefix}"
     MFEM_IDENTITY_CUDA_COMPILER="${cuda_compiler}"
   else
+    MFEM_IDENTITY_CUDA_PREFIX="off"
     MFEM_IDENTITY_CUDA_COMPILER="off"
   fi
   hash_mfem_identity_artifacts \
@@ -1857,6 +2027,7 @@ else
 fi
 
 if [[ -n "${MFEM_REUSE_REQUEST}" ]]; then
+  select_reviewed_admission_route || true
   validate_reused_mfem "${MFEM_REUSE_REQUEST}"
   freeze_reuse_pre_dependency_identity
 else
