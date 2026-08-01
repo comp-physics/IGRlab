@@ -80,3 +80,62 @@ set_tests_properties(hdg_runtime_cpu_functional_rank2_n6
     PROCESSORS 2
     RESOURCE_LOCK hdg_runtime_cpu
     TIMEOUT 3600)
+
+if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
+  add_library(dg_igr_hdg_sc25_scalar_igr_strict_cxx17 OBJECT
+    "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/cpu/persistent_sc25_scalar_igr.cpp")
+  target_include_directories(dg_igr_hdg_sc25_scalar_igr_strict_cxx17
+    PRIVATE "${PROJECT_SOURCE_DIR}/include")
+  target_link_libraries(dg_igr_hdg_sc25_scalar_igr_strict_cxx17
+    PRIVATE mfem MPI::MPI_CXX)
+  target_compile_options(dg_igr_hdg_sc25_scalar_igr_strict_cxx17 PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror;-pedantic-errors>)
+  set_target_properties(dg_igr_hdg_sc25_scalar_igr_strict_cxx17 PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
+
+  add_executable(dg_igr_hdg_sc25_scalar_igr_cpu_test
+    sc25_scalar_igr_independent_oracle.cpp
+    test_persistent_sc25_scalar_igr.cpp)
+
+  target_include_directories(dg_igr_hdg_sc25_scalar_igr_cpu_test
+    PRIVATE
+      "${PROJECT_SOURCE_DIR}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}")
+
+  target_link_libraries(dg_igr_hdg_sc25_scalar_igr_cpu_test
+    PRIVATE
+      dg_igr_hdg_runtime_cpu
+      dg_igr_hdg_auxiliary_cpu
+      mfem
+      MPI::MPI_CXX)
+
+  target_compile_options(dg_igr_hdg_sc25_scalar_igr_cpu_test
+    PRIVATE
+      $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+
+  set_target_properties(dg_igr_hdg_sc25_scalar_igr_cpu_test
+    PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF)
+
+  add_test(
+    NAME hdg_sc25_scalar_igr_cpu_rank1_foundation
+    COMMAND dg_igr_hdg_sc25_scalar_igr_cpu_test)
+  set_tests_properties(hdg_sc25_scalar_igr_cpu_rank1_foundation
+    PROPERTIES
+      PROCESSORS 1
+      RESOURCE_LOCK hdg_sc25_scalar_igr_cpu
+      TIMEOUT 1800)
+
+  add_test(
+    NAME hdg_sc25_scalar_igr_cpu_rank1_trajectory
+    COMMAND dg_igr_hdg_sc25_scalar_igr_cpu_test --trajectory)
+  set_tests_properties(hdg_sc25_scalar_igr_cpu_rank1_trajectory
+    PROPERTIES
+      PROCESSORS 1
+      RESOURCE_LOCK hdg_sc25_scalar_igr_cpu
+      TIMEOUT 3600)
+endif()
