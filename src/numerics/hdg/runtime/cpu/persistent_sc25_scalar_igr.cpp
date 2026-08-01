@@ -4400,6 +4400,7 @@ bool PersistentTrajectoryImplementation::SolveTrueSystem(
     *true_solution = 0.0;
     ConfigureCoupledIlu(*ilu);
     HYPRE_ClearAllErrors();
+    true_matrix->HypreRead();
     true_rhs->HypreRead();
     true_solution->HypreReadWrite();
     const int setup_status = HYPRE_ParCSRGMRESSetup(
@@ -7565,6 +7566,7 @@ bool PersistentRank2TrajectoryImplementation::SolveTrueSystem(
       *true_solution = 0.0;
       ConfigureCoupledIlu(*ilu);
       HYPRE_ClearAllErrors();
+      true_matrix->HypreRead();
       true_rhs->HypreRead();
       true_solution->HypreReadWrite();
     }
@@ -9613,6 +9615,7 @@ bool PersistentSc25ScalarIgrCpuFoundation::RunCoupledOperatorFixture(
     gmres.SetOperator(*true_matrix);
     ConfigureCoupledIlu(ilu);
     diagnostic.Set("trace-solve", "hypre-setup");
+    true_matrix->HypreRead();
     hypre_rhs.HypreRead();
     hypre_solution.HypreReadWrite();
     const int setup_status = HYPRE_ParCSRGMRESSetup(
@@ -9639,15 +9642,19 @@ bool PersistentSc25ScalarIgrCpuFoundation::RunCoupledOperatorFixture(
     diagnostic.iteration_query_reached = true;
     diagnostic.iterations = iterations;
     diagnostic.Set("trace-solve", "true-residual");
-    mfem::Vector residual(coupled_fixture_true_trace_unknowns);
-    true_matrix->Mult(hypre_solution, residual);
-    residual -= *true_rhs;
+    mfem::HypreParVector residual(hypre_rhs);
+    if (true_matrix->Mult(hypre_solution, residual, 1.0, -1.0) != 0)
+    {
+      return false;
+    }
+    const double* residual_values = residual.HostRead();
+    const double* rhs_values = hypre_rhs.HostRead();
     double local_residual_square = 0.0;
     double local_rhs_square = 0.0;
     for (int entry = 0; entry < residual.Size(); ++entry)
     {
-      local_residual_square += residual[entry] * residual[entry];
-      local_rhs_square += (*true_rhs)[entry] * (*true_rhs)[entry];
+      local_residual_square += residual_values[entry] * residual_values[entry];
+      local_rhs_square += rhs_values[entry] * rhs_values[entry];
     }
     double residual_square = 0.0;
     double rhs_square = 0.0;

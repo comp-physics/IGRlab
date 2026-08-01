@@ -35,7 +35,8 @@ if(_dg_igr_hdg_runtime_unclassified_cpp OR
           "${_dg_igr_hdg_runtime_unclassified_cpp};${_dg_igr_hdg_runtime_unclassified_cuda}")
 endif()
 
-if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
+if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT OR
+   (DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA))
   file(GLOB_RECURSE _dg_igr_hdg_auxiliary_sources CONFIGURE_DEPENDS
        "${CMAKE_CURRENT_SOURCE_DIR}/../auxiliary/*.cpp")
   dg_igr_add_hdg_cxx17_component(
@@ -45,17 +46,15 @@ endif()
 
 if(DG_IGR_ENABLE_HDG_RUNTIME)
   if(MFEM_USE_CUDA)
-    set(_dg_igr_hdg_runtime_cuda_expected_source
+    set(_dg_igr_hdg_runtime_cuda_expected_sources
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/hdg_sc25_periodic_v3_device.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu")
-    list(LENGTH _dg_igr_hdg_runtime_cuda_sources
-         _dg_igr_hdg_runtime_cuda_source_count)
-    list(FIND _dg_igr_hdg_runtime_cuda_sources
-         "${_dg_igr_hdg_runtime_cuda_expected_source}"
-         _dg_igr_hdg_runtime_cuda_expected_index)
-    if(NOT _dg_igr_hdg_runtime_cuda_source_count EQUAL 1 OR
-       _dg_igr_hdg_runtime_cuda_expected_index EQUAL -1)
+    list(SORT _dg_igr_hdg_runtime_cuda_sources)
+    list(SORT _dg_igr_hdg_runtime_cuda_expected_sources)
+    if(NOT _dg_igr_hdg_runtime_cuda_sources STREQUAL
+       _dg_igr_hdg_runtime_cuda_expected_sources)
       message(FATAL_ERROR
-              "The frozen W8A CUDA component requires exactly cuda/persistent_smooth_euler.cu.")
+              "The frozen W8A+W8B CUDA component requires exactly persistent_smooth_euler.cu and hdg_sc25_periodic_v3_device.cu.")
     endif()
   endif()
 
@@ -153,7 +152,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   target_link_libraries(dg_igr_hdg_runtime PRIVATE
                         dg_igr_hdg_runtime_app_contract
                         dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
-  if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
+  if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT OR MFEM_USE_CUDA)
     target_link_libraries(dg_igr_hdg_runtime PRIVATE dg_igr_hdg_auxiliary_cpu)
   endif()
   target_compile_options(dg_igr_hdg_runtime PRIVATE
