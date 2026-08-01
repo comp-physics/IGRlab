@@ -89,6 +89,67 @@ function(run_runtime prefix)
   set(${prefix}_error "${error}" PARENT_SCOPE)
 endfunction()
 
+function(run_serial_runtime prefix)
+  execute_process(
+    COMMAND "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+    RESULT_VARIABLE status
+    OUTPUT_VARIABLE output
+    ERROR_VARIABLE error)
+  set(${prefix}_status "${status}" PARENT_SCOPE)
+  set(${prefix}_output "${output}" PARENT_SCOPE)
+  set(${prefix}_error "${error}" PARENT_SCOPE)
+endfunction()
+
+function(run_private_scalar_finalize_preparation_failure prefix)
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E env
+      DG_IGR_HDG_TEST_SCALAR_FINALIZE_PREPARATION_FAILURE=8:1
+      "${HDG_RUNTIME_MPIEXEC}" "${HDG_RUNTIME_NUMPROC_FLAG}" 2
+      ${HDG_RUNTIME_MPIEXEC_PREFLAGS}
+      "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+      ${HDG_RUNTIME_MPIEXEC_POSTFLAGS}
+    TIMEOUT 180
+    RESULT_VARIABLE status
+    OUTPUT_VARIABLE output
+    ERROR_VARIABLE error)
+  set(${prefix}_status "${status}" PARENT_SCOPE)
+  set(${prefix}_output "${output}" PARENT_SCOPE)
+  set(${prefix}_error "${error}" PARENT_SCOPE)
+endfunction()
+
+function(run_private_scalar_restart_preparation_failure prefix)
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E env
+      DG_IGR_HDG_TEST_SCALAR_RESTART_PREPARATION_FAILURE=10:1
+      "${HDG_RUNTIME_MPIEXEC}" "${HDG_RUNTIME_NUMPROC_FLAG}" 2
+      ${HDG_RUNTIME_MPIEXEC_PREFLAGS}
+      "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+      ${HDG_RUNTIME_MPIEXEC_POSTFLAGS}
+    TIMEOUT 180
+    RESULT_VARIABLE status
+    OUTPUT_VARIABLE output
+    ERROR_VARIABLE error)
+  set(${prefix}_status "${status}" PARENT_SCOPE)
+  set(${prefix}_output "${output}" PARENT_SCOPE)
+  set(${prefix}_error "${error}" PARENT_SCOPE)
+endfunction()
+
+function(run_private_scalar_preparation_failure prefix environment value)
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E env "${environment}=${value}"
+      "${HDG_RUNTIME_MPIEXEC}" "${HDG_RUNTIME_NUMPROC_FLAG}" 2
+      ${HDG_RUNTIME_MPIEXEC_PREFLAGS}
+      "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+      ${HDG_RUNTIME_MPIEXEC_POSTFLAGS}
+    TIMEOUT 180
+    RESULT_VARIABLE status
+    OUTPUT_VARIABLE output
+    ERROR_VARIABLE error)
+  set(${prefix}_status "${status}" PARENT_SCOPE)
+  set(${prefix}_output "${output}" PARENT_SCOPE)
+  set(${prefix}_error "${error}" PARENT_SCOPE)
+endfunction()
+
 function(run_private_scientific_gate prefix)
   if(HDG_RUNTIME_RANKS EQUAL 1)
     execute_process(
@@ -257,6 +318,22 @@ function(validate_physical_vtk path mesh_n label)
   endif()
 endfunction()
 
+function(validate_scalar_igr_vtk path mesh_n label)
+  file(READ "${path}" vtk)
+  math(EXPR elements "${mesh_n} * ${mesh_n}")
+  math(EXPR points "4 * ${elements}")
+  if(NOT vtk MATCHES "DATASET UNSTRUCTURED_GRID" OR
+     NOT vtk MATCHES "POINTS ${points} double" OR
+     NOT vtk MATCHES "CELLS ${elements} " OR
+     NOT vtk MATCHES "SCALARS U0 double 1" OR
+     NOT vtk MATCHES "SCALARS U3 double 1" OR
+     NOT vtk MATCHES "SCALARS Sigma double 1" OR
+     NOT vtk MATCHES "VECTORS z double")
+    message(FATAL_ERROR
+      "${label} is not a physical scalar-IGR U/Sigma/z FE VTK")
+  endif()
+endfunction()
+
 if(HDG_RUNTIME_FUNCTIONAL)
   if(NOT DEFINED HDG_RUNTIME_BACKEND)
     set(HDG_RUNTIME_BACKEND cpu)
@@ -278,21 +355,77 @@ if(HDG_RUNTIME_FUNCTIONAL)
                       "${reader_directory}")
   file(REMOVE "${reference_checkpoint}" "${split_checkpoint}")
 
-  set(functional_common
-    --card exp.hdg.euler.conventional.smooth_persistent.w8a.v1
-    --case conventional-smooth-persistent-v1
-    --space l2 --mesh-family periodic-cartesian-quad --mesh-n 6 --order 2
-    --dt 0.05 --steps 20 --final-time 1.0
-    --backend "${HDG_RUNTIME_BACKEND}" --device-id "${runtime_device}"
-    --output-steps 0,10,20 --seed 0x57384146554e4331)
+  if(HDG_RUNTIME_SCALAR_IGR)
+    set(functional_common
+      --card exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3
+      --case sc25-periodic-smooth-persistent-v3
+      --space l2 --mesh-family periodic-cartesian-quad --mesh-n 8 --order 1
+      --dt 0.000244140625 --steps 20 --final-time 0.0048828125
+      --backend "${HDG_RUNTIME_BACKEND}" --device-id "${runtime_device}"
+      --output-steps 0,10,20 --seed 0x5738425343323553)
+    set(functional_mesh_n 8)
+    set(functional_injection_step 7)
+    set(reference_retry_limit 1)
+    set(reference_injection
+        "AfterRecoveryBeforeCommit:${functional_injection_step}:${injection_rank}")
+    set(writer_retry_limit 1)
+    set(writer_injection "${reference_injection}")
+    set(reader_retry_limit 0)
+    set(reader_injection off)
+    set(reference_expected_retries 1)
+    set(writer_expected_retries 1)
+    set(reader_expected_retries 1)
+  else()
+    set(functional_common
+      --card exp.hdg.euler.conventional.smooth_persistent.w8a.v1
+      --case conventional-smooth-persistent-v1
+      --space l2 --mesh-family periodic-cartesian-quad --mesh-n 6 --order 2
+      --dt 0.05 --steps 20 --final-time 1.0
+      --backend "${HDG_RUNTIME_BACKEND}" --device-id "${runtime_device}"
+      --output-steps 0,10,20 --seed 0x57384146554e4331)
+    set(functional_mesh_n 6)
+    set(functional_injection_step 14)
+    set(reference_retry_limit 0)
+    set(reference_injection off)
+    set(writer_retry_limit 0)
+    set(writer_injection off)
+    set(reader_retry_limit 1)
+    set(reader_injection
+        "AfterRecoveryBeforeCommit:${functional_injection_step}:${injection_rank}")
+    set(reference_expected_retries 0)
+    set(writer_expected_retries 0)
+    set(reader_expected_retries 1)
+  endif()
+
+  if(HDG_RUNTIME_SCALAR_IGR)
+    set(h1_directory "${HDG_RUNTIME_TEST_OUTPUT}-h1")
+    set(h1_checkpoint "${HDG_RUNTIME_TEST_OUTPUT}-h1.checkpoint")
+    file(REMOVE_RECURSE "${h1_directory}")
+    file(REMOVE "${h1_checkpoint}")
+    replace_cli_option(h1_arguments functional_common --space h1)
+    run_runtime(h1 ${h1_arguments}
+      --output-dir "${h1_directory}"
+      --checkpoint-out "${h1_checkpoint}" --checkpoint-step 10
+      --stop-after-checkpoint false --restart-from none
+      --max-retries "${reference_retry_limit}"
+      --inject-failure "${reference_injection}")
+    if(NOT h1_status EQUAL 65 OR
+       NOT h1_error MATCHES "unsupported_h1" OR
+       EXISTS "${h1_directory}" OR EXISTS "${h1_checkpoint}")
+      message(FATAL_ERROR
+        "scalar-IGR H1 rejection had side effects: ${h1_status};${h1_output};${h1_error}")
+    endif()
+  endif()
 
   run_runtime(reference ${functional_common}
     --output-dir "${reference_directory}"
     --checkpoint-out "${reference_checkpoint}" --checkpoint-step 10
     --stop-after-checkpoint false --restart-from none
-    --max-retries 0 --inject-failure off)
+    --max-retries "${reference_retry_limit}"
+    --inject-failure "${reference_injection}")
   if(NOT reference_status EQUAL 0 OR
-     NOT reference_output MATCHES "status=Success.*step=20.*retries=0" OR
+     NOT reference_output MATCHES
+         "status=Success.*step=20.*retries=${reference_expected_retries}" OR
      NOT reference_error STREQUAL "")
     message(FATAL_ERROR
       "functional uninterrupted run failed: ${reference_status};${reference_output};${reference_error}")
@@ -302,9 +435,11 @@ if(HDG_RUNTIME_FUNCTIONAL)
     --output-dir "${writer_directory}"
     --checkpoint-out "${split_checkpoint}" --checkpoint-step 10
     --stop-after-checkpoint true --restart-from none
-    --max-retries 0 --inject-failure off)
+    --max-retries "${writer_retry_limit}"
+    --inject-failure "${writer_injection}")
   if(NOT writer_status EQUAL 0 OR
-     NOT writer_output MATCHES "status=Success.*step=10.*retries=0" OR
+     NOT writer_output MATCHES
+         "status=Success.*step=10.*retries=${writer_expected_retries}" OR
      NOT writer_error STREQUAL "")
     message(FATAL_ERROR
       "functional split writer failed: ${writer_status};${writer_output};${writer_error}")
@@ -314,10 +449,11 @@ if(HDG_RUNTIME_FUNCTIONAL)
     --output-dir "${reader_directory}"
     --checkpoint-out none --checkpoint-step none
     --stop-after-checkpoint false --restart-from "${split_checkpoint}"
-    --max-retries 1
-    --inject-failure "AfterRecoveryBeforeCommit:14:${injection_rank}")
+    --max-retries "${reader_retry_limit}"
+    --inject-failure "${reader_injection}")
   if(NOT reader_status EQUAL 0 OR
-     NOT reader_output MATCHES "status=Success.*step=20.*retries=1" OR
+     NOT reader_output MATCHES
+         "status=Success.*step=20.*retries=${reader_expected_retries}" OR
      NOT reader_error STREQUAL "")
     message(FATAL_ERROR
       "functional split reader/retry failed: ${reader_status};${reader_output};${reader_error}")
@@ -338,20 +474,49 @@ if(HDG_RUNTIME_FUNCTIONAL)
   foreach(path IN LISTS functional_publications)
     require_regular_file("${path}" "functional publication")
   endforeach()
-  validate_physical_vtk(
-    "${reference_directory}/state-step-000000.vtk" 6
-    "functional initial generation")
-  validate_physical_vtk(
-    "${reference_directory}/state-step-000010.vtk" 6
-    "functional intermediate generation")
-  validate_physical_vtk(
-    "${reference_directory}/state-step-000020.vtk" 6
-    "functional final generation")
+  if(HDG_RUNTIME_SCALAR_IGR)
+    validate_scalar_igr_vtk(
+      "${reference_directory}/state-step-000000.vtk" ${functional_mesh_n}
+      "functional initial generation")
+    validate_scalar_igr_vtk(
+      "${reference_directory}/state-step-000010.vtk" ${functional_mesh_n}
+      "functional intermediate generation")
+    validate_scalar_igr_vtk(
+      "${reference_directory}/state-step-000020.vtk" ${functional_mesh_n}
+      "functional final generation")
+  else()
+    validate_physical_vtk(
+      "${reference_directory}/state-step-000000.vtk" ${functional_mesh_n}
+      "functional initial generation")
+    validate_physical_vtk(
+      "${reference_directory}/state-step-000010.vtk" ${functional_mesh_n}
+      "functional intermediate generation")
+    validate_physical_vtk(
+      "${reference_directory}/state-step-000020.vtk" ${functional_mesh_n}
+      "functional final generation")
+  endif()
 
-  file(SHA256 "${reference_directory}/state-step-000020.vtk" reference_vtk_hash)
-  file(SHA256 "${reader_directory}/state-step-000020.vtk" reader_vtk_hash)
   file(READ "${reference_directory}/run-metadata.json" reference_metadata)
   file(READ "${reader_directory}/run-metadata.json" reader_metadata)
+  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2)
+    file(READ "${writer_directory}/run-metadata-checkpoint.json"
+         writer_metadata)
+    foreach(injection_metadata IN ITEMS reference_metadata writer_metadata)
+      if(NOT "${${injection_metadata}}" MATCHES
+             "\"injection_configured_source_rank\": 1" OR
+         NOT "${${injection_metadata}}" MATCHES
+             "\"injection_observed_origin_rank\": 1" OR
+         NOT "${${injection_metadata}}" MATCHES
+             "\"injection_local_count\": 1" OR
+         NOT "${${injection_metadata}}" MATCHES
+             "\"injection_non_origin_local_count\": 0" OR
+         NOT "${${injection_metadata}}" MATCHES
+             "\"injection_collective_decisions\": 1")
+        message(FATAL_ERROR
+          "scalar-IGR source-rank injection audit is invalid")
+      endif()
+    endforeach()
+  endif()
   set(state_parity FALSE)
   if(HDG_RUNTIME_BACKEND STREQUAL "cuda")
     string(REGEX MATCH
@@ -390,10 +555,256 @@ if(HDG_RUNTIME_FUNCTIONAL)
       set(state_parity TRUE)
     endif()
   endif()
-  if(reference_vtk_hash STREQUAL "" OR reader_vtk_hash STREQUAL "" OR
+  if(HDG_RUNTIME_SCALAR_IGR)
+    if(NOT DEFINED HDG_RUNTIME_SCALAR_VTK_TEST)
+      message(FATAL_ERROR "scalar-IGR physical VTK comparator is unavailable")
+    endif()
+    # MFEM's element-coloring diagnostic is not stable across independent
+    # processes. Compare exact global coordinates and every U/Sigma/z value;
+    # the metadata state digest below separately requires byte identity.
+    execute_process(
+      COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk
+        "${reference_directory}/state-step-000020.vtk"
+        "${reader_directory}/state-step-000020.vtk" 1e-15
+      RESULT_VARIABLE restart_vtk_compare_status)
+    set(restart_vtk_identity TRUE)
+  else()
+    if(NOT DEFINED HDG_RUNTIME_SCIENTIFIC_TEST)
+      message(FATAL_ERROR "physical VTK comparator is unavailable")
+    endif()
+    execute_process(
+      COMMAND "${HDG_RUNTIME_SCIENTIFIC_TEST}" --compare-vtk
+        "${reference_directory}/state-step-000020.vtk"
+        "${reader_directory}/state-step-000020.vtk" 1e-15
+      RESULT_VARIABLE restart_vtk_compare_status)
+    set(restart_vtk_identity TRUE)
+  endif()
+  if(NOT restart_vtk_identity OR NOT restart_vtk_compare_status EQUAL 0 OR
      NOT state_parity OR NOT reader_metadata MATCHES "\"status\": \"Success\"" OR
      NOT reader_metadata MATCHES "\"retries\": 1")
     message(FATAL_ERROR "functional restart/retry parity contract failed")
+  endif()
+  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2)
+    if(NOT DEFINED HDG_RUNTIME_SCALAR_VTK_TEST)
+      message(FATAL_ERROR "scalar-IGR physical VTK comparator is unavailable")
+    endif()
+    set(serial_oracle_directory
+        "${HDG_RUNTIME_TEST_OUTPUT}-independent-serial-oracle")
+    set(serial_oracle_checkpoint
+        "${HDG_RUNTIME_TEST_OUTPUT}-independent-serial-oracle.checkpoint")
+    file(REMOVE_RECURSE "${serial_oracle_directory}")
+    file(REMOVE "${serial_oracle_checkpoint}")
+    run_serial_runtime(serial_oracle ${functional_common}
+      --output-dir "${serial_oracle_directory}"
+      --checkpoint-out "${serial_oracle_checkpoint}" --checkpoint-step 10
+      --stop-after-checkpoint false --restart-from none
+      --max-retries 1 --inject-failure "AfterRecoveryBeforeCommit:7:0")
+    if(NOT serial_oracle_status EQUAL 0 OR
+       NOT serial_oracle_output MATCHES "status=Success.*step=20.*retries=1" OR
+       NOT serial_oracle_error STREQUAL "")
+      message(FATAL_ERROR
+        "scalar-IGR independent serial oracle failed: ${serial_oracle_status};${serial_oracle_output};${serial_oracle_error}")
+    endif()
+    foreach(initial_vtk IN ITEMS
+        "${serial_oracle_directory}/state-step-000000.vtk"
+        "${reference_directory}/state-step-000000.vtk")
+      execute_process(
+        COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}"
+          --validate-scalar-initial-vtk "${initial_vtk}" 2e-11
+        RESULT_VARIABLE scalar_initial_oracle_status
+        OUTPUT_VARIABLE scalar_initial_oracle_output
+        ERROR_VARIABLE scalar_initial_oracle_error)
+      if(NOT scalar_initial_oracle_status EQUAL 0)
+        message(FATAL_ERROR
+          "scalar-IGR independent topology/physics oracle failed for ${initial_vtk}: ${scalar_initial_oracle_output};${scalar_initial_oracle_error}")
+      endif()
+    endforeach()
+    foreach(step IN ITEMS 000000 000010 000020)
+      execute_process(
+        COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk
+          "${serial_oracle_directory}/state-step-${step}.vtk"
+          "${reference_directory}/state-step-${step}.vtk"
+          2e-11
+        RESULT_VARIABLE scalar_element_oracle_status
+        OUTPUT_VARIABLE scalar_element_oracle_output
+        ERROR_VARIABLE scalar_element_oracle_error)
+      if(NOT scalar_element_oracle_status EQUAL 0)
+        message(FATAL_ERROR
+          "scalar-IGR rank2 x-slab element/value oracle failed at ${step}: ${scalar_element_oracle_output};${scalar_element_oracle_error}")
+      endif()
+    endforeach()
+
+    set(initial_pack_negative_directory
+        "${HDG_RUNTIME_TEST_OUTPUT}-initial-pack-negative")
+    set(initial_pack_negative_checkpoint
+        "${HDG_RUNTIME_TEST_OUTPUT}-initial-pack-negative.checkpoint")
+    file(REMOVE_RECURSE "${initial_pack_negative_directory}")
+    file(REMOVE "${initial_pack_negative_checkpoint}")
+    run_private_scalar_preparation_failure(initial_pack_negative
+      DG_IGR_HDG_TEST_SCALAR_INITIAL_PACK_FAILURE 0:1
+      ${functional_common}
+      --output-dir "${initial_pack_negative_directory}"
+      --checkpoint-out "${initial_pack_negative_checkpoint}"
+      --checkpoint-step 10 --stop-after-checkpoint false --restart-from none
+      --max-retries 1 --inject-failure "AfterRecoveryBeforeCommit:7:1")
+    file(GLOB initial_pack_negative_states
+         "${initial_pack_negative_directory}/state-step-*.vtk")
+    file(GLOB initial_pack_negative_generations
+         "${initial_pack_negative_directory}/.dg-igr-generations/generation-*")
+    if(NOT initial_pack_negative_status EQUAL 72 OR
+       NOT initial_pack_negative_error MATCHES
+           "initial pack failure source_rank=1" OR
+       initial_pack_negative_states OR initial_pack_negative_generations OR
+       EXISTS "${initial_pack_negative_directory}/.dg-igr-current" OR
+       EXISTS "${initial_pack_negative_directory}/run-metadata.json" OR
+       EXISTS "${initial_pack_negative_checkpoint}")
+      message(FATAL_ERROR
+        "scalar-IGR asymmetric initial-pack consensus failed: ${initial_pack_negative_status};${initial_pack_negative_output};${initial_pack_negative_error}")
+    endif()
+
+    set(candidate_pack_negative_directory
+        "${HDG_RUNTIME_TEST_OUTPUT}-candidate-pack-negative")
+    set(candidate_pack_negative_checkpoint
+        "${HDG_RUNTIME_TEST_OUTPUT}-candidate-pack-negative.checkpoint")
+    file(REMOVE_RECURSE "${candidate_pack_negative_directory}")
+    file(REMOVE "${candidate_pack_negative_checkpoint}")
+    run_private_scalar_preparation_failure(candidate_pack_negative
+      DG_IGR_HDG_TEST_SCALAR_CANDIDATE_PACK_FAILURE 8:1
+      ${functional_common}
+      --output-dir "${candidate_pack_negative_directory}"
+      --checkpoint-out "${candidate_pack_negative_checkpoint}"
+      --checkpoint-step 10 --stop-after-checkpoint false --restart-from none
+      --max-retries 1 --inject-failure "AfterRecoveryBeforeCommit:7:1")
+    file(GLOB candidate_pack_negative_states
+         "${candidate_pack_negative_directory}/state-step-*.vtk")
+    list(LENGTH candidate_pack_negative_states
+         candidate_pack_negative_state_count)
+    file(READ_SYMLINK
+         "${candidate_pack_negative_directory}/.dg-igr-current"
+         candidate_pack_negative_current)
+    if(NOT candidate_pack_negative_status EQUAL 72 OR
+       NOT candidate_pack_negative_error MATCHES
+           "candidate pack failure source_rank=1" OR
+       NOT candidate_pack_negative_state_count EQUAL 1 OR
+       NOT candidate_pack_negative_current MATCHES "generation-0-" OR
+       NOT EXISTS
+           "${candidate_pack_negative_directory}/state-step-000000.vtk" OR
+       EXISTS "${candidate_pack_negative_directory}/state-step-000010.vtk" OR
+       EXISTS "${candidate_pack_negative_directory}/run-metadata.json" OR
+       EXISTS "${candidate_pack_negative_checkpoint}")
+      message(FATAL_ERROR
+        "scalar-IGR asymmetric candidate-pack rollback failed: ${candidate_pack_negative_status};${candidate_pack_negative_output};${candidate_pack_negative_error}")
+    endif()
+
+    set(metadata_negative_directory
+        "${HDG_RUNTIME_TEST_OUTPUT}-metadata-preparation-negative")
+    set(metadata_negative_checkpoint
+        "${HDG_RUNTIME_TEST_OUTPUT}-metadata-preparation-negative.checkpoint")
+    file(REMOVE_RECURSE "${metadata_negative_directory}")
+    file(REMOVE "${metadata_negative_checkpoint}")
+    run_private_scalar_preparation_failure(metadata_negative
+      DG_IGR_HDG_TEST_SCALAR_METADATA_PREPARATION_FAILURE 20:0
+      ${functional_common}
+      --output-dir "${metadata_negative_directory}"
+      --checkpoint-out "${metadata_negative_checkpoint}"
+      --checkpoint-step 10 --stop-after-checkpoint false --restart-from none
+      --max-retries 1 --inject-failure "AfterRecoveryBeforeCommit:7:1")
+    file(GLOB metadata_negative_states
+         "${metadata_negative_directory}/state-step-*.vtk")
+    list(LENGTH metadata_negative_states metadata_negative_state_count)
+    file(READ_SYMLINK "${metadata_negative_directory}/.dg-igr-current"
+         metadata_negative_current)
+    if(NOT metadata_negative_status EQUAL 72 OR
+       NOT metadata_negative_error MATCHES
+           "metadata preparation failure source_rank=0" OR
+       NOT metadata_negative_state_count EQUAL 2 OR
+       NOT metadata_negative_current MATCHES "generation-10-" OR
+       NOT EXISTS "${metadata_negative_directory}/state-step-000000.vtk" OR
+       NOT EXISTS "${metadata_negative_directory}/state-step-000010.vtk" OR
+       NOT EXISTS "${metadata_negative_checkpoint}" OR
+       EXISTS "${metadata_negative_directory}/state-step-000020.vtk" OR
+       EXISTS "${metadata_negative_directory}/run-metadata.json")
+      message(FATAL_ERROR
+        "scalar-IGR root metadata rollback failed: ${metadata_negative_status};${metadata_negative_output};${metadata_negative_error}")
+    endif()
+
+    set(finalize_negative_directory
+        "${HDG_RUNTIME_TEST_OUTPUT}-finalize-preparation-negative")
+    set(finalize_negative_checkpoint
+        "${HDG_RUNTIME_TEST_OUTPUT}-finalize-preparation-negative.checkpoint")
+    file(REMOVE_RECURSE "${finalize_negative_directory}")
+    file(REMOVE "${finalize_negative_checkpoint}")
+    run_private_scalar_finalize_preparation_failure(finalize_negative
+      ${functional_common}
+      --output-dir "${finalize_negative_directory}"
+      --checkpoint-out "${finalize_negative_checkpoint}" --checkpoint-step 10
+      --stop-after-checkpoint false --restart-from none
+      --max-retries 1 --inject-failure "AfterRecoveryBeforeCommit:7:1")
+    file(GLOB finalize_negative_states
+         "${finalize_negative_directory}/state-step-*.vtk")
+    list(LENGTH finalize_negative_states finalize_negative_state_count)
+    if(NOT finalize_negative_status EQUAL 72 OR
+       NOT finalize_negative_error MATCHES
+           "finalize preparation failure source_rank=1" OR
+       NOT finalize_negative_state_count EQUAL 1 OR
+       NOT EXISTS "${finalize_negative_directory}/state-step-000000.vtk" OR
+       EXISTS "${finalize_negative_directory}/state-step-000010.vtk" OR
+       EXISTS "${finalize_negative_directory}/run-metadata.json" OR
+       EXISTS "${finalize_negative_checkpoint}")
+      message(FATAL_ERROR
+        "scalar-IGR asymmetric finalize-preparation rollback failed: ${finalize_negative_status};${finalize_negative_output};${finalize_negative_error}")
+    endif()
+
+    set(restart_negative_directory
+        "${HDG_RUNTIME_TEST_OUTPUT}-restart-preparation-negative")
+    set(restart_negative_checkpoint
+        "${HDG_RUNTIME_TEST_OUTPUT}-restart-preparation-negative.checkpoint")
+    file(REMOVE_RECURSE "${restart_negative_directory}")
+    file(REMOVE "${restart_negative_checkpoint}")
+    run_runtime(restart_negative_writer ${functional_common}
+      --output-dir "${restart_negative_directory}"
+      --checkpoint-out "${restart_negative_checkpoint}" --checkpoint-step 10
+      --stop-after-checkpoint true --restart-from none
+      --max-retries 1 --inject-failure "AfterRecoveryBeforeCommit:7:1")
+    if(NOT restart_negative_writer_status EQUAL 0)
+      message(FATAL_ERROR
+        "scalar-IGR restart-preparation fixture writer failed")
+    endif()
+    file(SHA256 "${restart_negative_checkpoint}" restart_checkpoint_before)
+    file(SHA256 "${restart_negative_directory}/state-step-000010.vtk"
+         restart_state_before)
+    file(READ_SYMLINK "${restart_negative_directory}/.dg-igr-current"
+         restart_current_before)
+    file(GLOB restart_generations_before
+         "${restart_negative_directory}/.dg-igr-generations/generation-*")
+    list(LENGTH restart_generations_before restart_generation_count_before)
+    run_private_scalar_restart_preparation_failure(restart_negative
+      ${functional_common}
+      --output-dir "${restart_negative_directory}"
+      --checkpoint-out none --checkpoint-step none
+      --stop-after-checkpoint false
+      --restart-from "${restart_negative_checkpoint}"
+      --max-retries 0 --inject-failure off)
+    file(SHA256 "${restart_negative_checkpoint}" restart_checkpoint_after)
+    file(SHA256 "${restart_negative_directory}/state-step-000010.vtk"
+         restart_state_after)
+    file(READ_SYMLINK "${restart_negative_directory}/.dg-igr-current"
+         restart_current_after)
+    file(GLOB restart_generations_after
+         "${restart_negative_directory}/.dg-igr-generations/generation-*")
+    list(LENGTH restart_generations_after restart_generation_count_after)
+    if(NOT restart_negative_status EQUAL 66 OR
+       NOT restart_negative_error MATCHES
+           "restart preparation failure source_rank=1" OR
+       NOT restart_checkpoint_before STREQUAL restart_checkpoint_after OR
+       NOT restart_state_before STREQUAL restart_state_after OR
+       NOT restart_current_before STREQUAL restart_current_after OR
+       NOT restart_generation_count_before EQUAL restart_generation_count_after OR
+       EXISTS "${restart_negative_directory}/state-step-000020.vtk" OR
+       EXISTS "${restart_negative_directory}/run-metadata.json")
+      message(FATAL_ERROR
+        "scalar-IGR asymmetric restart-preparation rollback failed: ${restart_negative_status};${restart_negative_output};${restart_negative_error}")
+    endif()
   endif()
   if(HDG_RUNTIME_BACKEND STREQUAL "cuda")
     if(NOT DEFINED HDG_RUNTIME_SCIENTIFIC_TEST)

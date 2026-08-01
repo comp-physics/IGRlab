@@ -25,6 +25,7 @@
 #include <memory>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace dg::hdg::runtime::cpu::sc25
@@ -897,6 +898,97 @@ struct PersistentRank2TrajectoryImplementation;
 class PersistentSc25ScalarIgrCpuFoundation final
 {
 public:
+  class Rank1Transaction final
+  {
+  public:
+    Rank1Transaction() noexcept = default;
+    Rank1Transaction(const Rank1Transaction&) = delete;
+    Rank1Transaction& operator=(const Rank1Transaction&) = delete;
+    Rank1Transaction(Rank1Transaction&& other) noexcept
+        : owner_(other.owner_),
+          serial_(other.serial_),
+          valid_(other.valid_),
+          provisionally_installed_(other.provisionally_installed_),
+          candidate_state_(std::move(other.candidate_state_)),
+          future_checkpoint_(std::move(other.future_checkpoint_))
+    {
+      other.owner_ = nullptr;
+      other.serial_ = 0;
+      other.valid_ = false;
+      other.provisionally_installed_ = false;
+    }
+    Rank1Transaction& operator=(Rank1Transaction&&) = delete;
+
+    bool valid() const noexcept { return valid_; }
+    bool provisionally_installed() const noexcept
+    {
+      return provisionally_installed_;
+    }
+    const PersistentTrajectoryState& candidate_state() const noexcept
+    {
+      return candidate_state_;
+    }
+    const PersistentTrajectoryCheckpoint& future_checkpoint() const noexcept
+    {
+      return future_checkpoint_;
+    }
+
+  private:
+    const PersistentSc25ScalarIgrCpuFoundation* owner_ = nullptr;
+    std::uint64_t serial_ = 0;
+    bool valid_ = false;
+    bool provisionally_installed_ = false;
+    PersistentTrajectoryState candidate_state_{};
+    PersistentTrajectoryCheckpoint future_checkpoint_{};
+    friend class PersistentSc25ScalarIgrCpuFoundation;
+  };
+
+  class Rank2Transaction final
+  {
+  public:
+    Rank2Transaction() noexcept = default;
+    Rank2Transaction(const Rank2Transaction&) = delete;
+    Rank2Transaction& operator=(const Rank2Transaction&) = delete;
+    Rank2Transaction(Rank2Transaction&& other) noexcept
+        : owner_(other.owner_),
+          serial_(other.serial_),
+          valid_(other.valid_),
+          provisionally_installed_(other.provisionally_installed_),
+          candidate_state_(std::move(other.candidate_state_)),
+          future_checkpoint_(std::move(other.future_checkpoint_))
+    {
+      other.owner_ = nullptr;
+      other.serial_ = 0;
+      other.valid_ = false;
+      other.provisionally_installed_ = false;
+    }
+    Rank2Transaction& operator=(Rank2Transaction&&) = delete;
+
+    bool valid() const noexcept { return valid_; }
+    bool provisionally_installed() const noexcept
+    {
+      return provisionally_installed_;
+    }
+    const PersistentRank2TrajectoryState& candidate_state() const noexcept
+    {
+      return candidate_state_;
+    }
+    const PersistentRank2TrajectoryCheckpoint& future_checkpoint()
+        const noexcept
+    {
+      return future_checkpoint_;
+    }
+
+  private:
+    const PersistentSc25ScalarIgrCpuFoundation* owner_ = nullptr;
+    std::uint64_t serial_ = 0;
+    bool valid_ = false;
+    bool provisionally_installed_ = false;
+    PersistentRank2TrajectoryState candidate_state_{};
+    PersistentRank2TrajectoryCheckpoint future_checkpoint_{};
+    friend class PersistentSc25ScalarIgrCpuFoundation;
+  };
+
   ~PersistentSc25ScalarIgrCpuFoundation() noexcept;
   PersistentSc25ScalarIgrCpuFoundation(
       PersistentSc25ScalarIgrCpuFoundation&&) noexcept;
@@ -958,9 +1050,30 @@ public:
       TrajectoryFailureInjection injection =
           TrajectoryFailureInjection::none) noexcept;
 
+  /**
+   * Complete all fallible numerical work and freeze one immutable candidate.
+   * The published state, coordinates, status, counters, and evidence remain
+   * byte-identical until InstallPersistentTrajectoryTransaction is called.
+   */
+  TrajectoryStatus PreparePersistentTrajectoryTransaction(
+      Rank1Transaction& output,
+      TrajectoryFailureInjection injection =
+          TrajectoryFailureInjection::none) noexcept;
+  bool InstallPersistentTrajectoryTransaction(
+      Rank1Transaction& transaction) noexcept;
+  bool RevertPersistentTrajectoryTransaction(
+      Rank1Transaction&& transaction) noexcept;
+  bool FinalizePersistentTrajectoryTransaction(
+      Rank1Transaction&& transaction) noexcept;
+
   bool CopyPublishedTrajectoryState(
       PersistentTrajectoryState& output) const noexcept;
   bool CaptureTrajectoryCheckpoint(
+      PersistentTrajectoryCheckpoint& output) const noexcept;
+  /** Internal v3 app-codec bridge; rebuilds all private checkpoint truth. */
+  bool ImportTrajectoryCheckpoint(
+      const StateCoordinates& coordinates,
+      const PersistentTrajectoryState& state,
       PersistentTrajectoryCheckpoint& output) const noexcept;
   TrajectoryStatus RestoreTrajectoryCheckpoint(
       const PersistentTrajectoryCheckpoint& checkpoint) noexcept;
@@ -971,12 +1084,29 @@ public:
   TrajectoryStatus AdvancePersistentRank2Trajectory(
       TrajectoryFailureInjection injection =
           TrajectoryFailureInjection::none) noexcept;
+  TrajectoryStatus PreparePersistentRank2TrajectoryTransaction(
+      Rank2Transaction& output,
+      TrajectoryFailureInjection injection =
+          TrajectoryFailureInjection::none) noexcept;
+  bool InstallPersistentRank2TrajectoryTransaction(
+      Rank2Transaction& transaction) noexcept;
+  bool RevertPersistentRank2TrajectoryTransaction(
+      Rank2Transaction&& transaction) noexcept;
+  bool FinalizePersistentRank2TrajectoryTransaction(
+      Rank2Transaction&& transaction) noexcept;
   bool CopyPublishedRank2TrajectoryState(
       PersistentRank2TrajectoryState& output) const noexcept;
   bool CaptureRank2TrajectoryCheckpoint(
       PersistentRank2TrajectoryCheckpoint& output) const noexcept;
+  /** Collective internal v3 app-codec bridge for the exact two shards. */
+  bool ImportRank2TrajectoryCheckpoint(
+      const StateCoordinates& coordinates,
+      const PersistentRank2TrajectoryState& state,
+      PersistentRank2TrajectoryCheckpoint& output) const noexcept;
   TrajectoryStatus RestoreRank2TrajectoryCheckpoint(
       const PersistentRank2TrajectoryCheckpoint& checkpoint) noexcept;
+  bool CopyPersistentResourceDescriptor(
+      PersistentResourceDescriptor& output) const noexcept;
   const PersistentRank2TrajectoryEvidence& rank2_trajectory_evidence()
       const noexcept;
 

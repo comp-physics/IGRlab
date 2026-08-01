@@ -17,6 +17,9 @@
 #ifndef DG_IGR_HDG_APP_HAS_CUDA_RANK2
 #error "build-owned CUDA rank-2 availability definition is required"
 #endif
+#ifndef DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
+#error "build-owned scalar-IGR CPU availability definition is required"
+#endif
 
 namespace dg::hdg::runtime::app
 {
@@ -112,7 +115,10 @@ bool ComputeApplicationConfigHashes(
     ApplicationConfigHashes& hashes) noexcept
 {
   CanonicalHashWriter scientific;
-  if (!scientific.Text("DGIGR-HDG-W8A-SCIENTIFIC-CONFIG-V1") ||
+  if (!scientific.Text(
+          scenario == ApplicationScenarioV1::scalar_igr_sc25_v3
+              ? "DGIGR-HDG-W8B-SCALAR-IGR-SCIENTIFIC-CONFIG-V1"
+              : "DGIGR-HDG-W8A-SCIENTIFIC-CONFIG-V1") ||
       !scientific.Text(options.card_id) || !scientific.Text(options.case_id) ||
       !scientific.U8(static_cast<std::uint8_t>(scenario)) ||
       !scientific.U8(static_cast<std::uint8_t>(options.interior_space)) ||
@@ -151,7 +157,10 @@ bool ComputeApplicationConfigHashes(
   }
 
   CanonicalHashWriter run;
-  if (!run.Text("DGIGR-HDG-W8A-RUN-CONFIG-V1") ||
+  if (!run.Text(
+          scenario == ApplicationScenarioV1::scalar_igr_sc25_v3
+              ? "DGIGR-HDG-W8B-SCALAR-IGR-RUN-CONFIG-V1"
+              : "DGIGR-HDG-W8A-RUN-CONFIG-V1") ||
       !run.Hash(hashes.scientific) ||
       !run.U8(static_cast<std::uint8_t>(options.run_role)) ||
       !HashPath(run, "output-directory", options.output_directory) ||
@@ -186,16 +195,34 @@ bool ComputeApplicationConfigHashes(
 
 bool ExactFrozenTuple(const ApplicationOptionsView& options) noexcept
 {
-  return options.model_id == EulerCompressible2dTag::id &&
+  const bool conventional =
+      options.card_id == smooth_periodic_euler_v1_card_id &&
+      options.model_id == EulerCompressible2dTag::id &&
       options.formulation_id == ConventionalHdgTag::id &&
       options.trace_id == MfemDgInterfaceTraceTag::id &&
       options.stabilization_id == FixedScalarTauTag::id &&
-      options.time_treatment_id == BackwardEulerRuntimeTag::id &&
-      options.precision_id == Fp64RuntimeTag::id;
+      options.time_treatment_id == BackwardEulerRuntimeTag::id;
+  const bool scalar = options.card_id == scalar_igr_sc25_v3_card_id &&
+      options.model_id == TracedScalarSc25ProjectionV3Tag::id &&
+      options.formulation_id == FullyHybridizedScalarSc25V3Tag::id &&
+      options.trace_id == DualConservativeScalarTraceV1Tag::id &&
+      options.stabilization_id == W7Tau25DensityHeightP2V3Tag::id &&
+      options.time_treatment_id == BackwardEulerMonolithicV1Tag::id;
+  return (conventional || scalar) && options.precision_id == Fp64RuntimeTag::id;
 }
 
 bool ExactScientificIdentities(const ApplicationOptionsView& options) noexcept
 {
+  if (options.card_id == scalar_igr_sc25_v3_card_id)
+  {
+    return options.mesh_family_id == smooth_periodic_euler_v1_mesh_family_id &&
+        options.source_id == scalar_igr_sc25_v3_source_id &&
+        options.flux_id == scalar_igr_sc25_v3_flux_id &&
+        options.time_rule_id == BackwardEulerMonolithicV1Tag::id &&
+        options.layout_id == scalar_igr_sc25_v3_layout_id &&
+        options.gamma == smooth_periodic_euler_v1_gamma &&
+        options.tau == smooth_periodic_euler_v1_tau;
+  }
   return options.mesh_family_id ==
           smooth_periodic_euler_v1_mesh_family_id &&
       options.source_id == smooth_periodic_euler_v1_source_id &&
@@ -207,8 +234,23 @@ bool ExactScientificIdentities(const ApplicationOptionsView& options) noexcept
 }
 
 RuntimeTupleDescriptor TupleForBackend(
-    const ApplicationBackend backend) noexcept
+    const ApplicationBackend backend, const bool scalar) noexcept
 {
+  if (scalar)
+  {
+    switch (backend)
+    {
+      case ApplicationBackend::cpu_serial:
+        return ScalarIgrCpuSerialRuntimeSelection::Descriptor();
+      case ApplicationBackend::cpu_rank2:
+        return ScalarIgrCpuRank2RuntimeSelection::Descriptor();
+      case ApplicationBackend::cuda_rank1_one_gpu:
+        return ScalarIgrCudaRank1RuntimeSelection::Descriptor();
+      case ApplicationBackend::cuda_rank2_one_gpu_host_staged:
+        return ScalarIgrCudaRank2RuntimeSelection::Descriptor();
+      case ApplicationBackend::unknown: return {};
+    }
+  }
   switch (backend)
   {
     case ApplicationBackend::cpu_serial:
@@ -298,6 +340,8 @@ bool FocusedInjectionPhase(const FailurePhase phase) noexcept
 std::uint64_t ScenarioCheckpointStep(
     const ApplicationScenarioV1 scenario) noexcept
 {
+  if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
+    return scalar_igr_sc25_v3_checkpoint_step;
   return scenario == ApplicationScenarioV1::smoke
       ? smooth_periodic_euler_v1_smoke_checkpoint_step
       : smooth_periodic_euler_v1_functional_checkpoint_step;
@@ -306,6 +350,8 @@ std::uint64_t ScenarioCheckpointStep(
 std::uint64_t ScenarioFailureTarget(
     const ApplicationScenarioV1 scenario) noexcept
 {
+  if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
+    return scalar_igr_sc25_v3_failure_target_step;
   return scenario == ApplicationScenarioV1::smoke
       ? smooth_periodic_euler_v1_smoke_failure_target_step
       : smooth_periodic_euler_v1_functional_failure_target_step;
@@ -313,6 +359,8 @@ std::uint64_t ScenarioFailureTarget(
 
 std::uint64_t ScenarioSeed(const ApplicationScenarioV1 scenario) noexcept
 {
+  if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
+    return scalar_igr_sc25_v3_seed;
   return scenario == ApplicationScenarioV1::smoke
       ? smooth_periodic_euler_v1_smoke_seed
       : smooth_periodic_euler_v1_functional_seed;
@@ -366,13 +414,17 @@ ApplicationRejection ValidateRoleControls(
       options.injection.phase == smooth_periodic_euler_v1_failure_phase &&
       options.injection.target_step == ScenarioFailureTarget(scenario) &&
       options.injection.source_rank == deferred.required_injected_source_rank;
+  const bool scalar = scenario == ApplicationScenarioV1::scalar_igr_sc25_v3;
 
   switch (options.run_role)
   {
     case ApplicationRunRoleV1::uninterrupted_reference:
       if (!writes_checkpoint ||
           options.stop_after_checkpoint != StopAfterCheckpointV1::no ||
-          !off || options.retry_limit != 0 || options.seed != seed)
+          (scalar ? (!prescribed_principal ||
+                     options.retry_limit != scalar_igr_sc25_v3_retry_limit)
+                  : (!off || options.retry_limit != 0)) ||
+          options.seed != seed)
       {
         return ApplicationRejection::invalid_run_role;
       }
@@ -380,7 +432,10 @@ ApplicationRejection ValidateRoleControls(
     case ApplicationRunRoleV1::split_writer:
       if (!writes_checkpoint ||
           options.stop_after_checkpoint != StopAfterCheckpointV1::yes ||
-          !off || options.retry_limit != 0 || options.seed != seed)
+          (scalar ? (!prescribed_principal ||
+                     options.retry_limit != scalar_igr_sc25_v3_retry_limit)
+                  : (!off || options.retry_limit != 0)) ||
+          options.seed != seed)
       {
         return ApplicationRejection::invalid_run_role;
       }
@@ -388,8 +443,10 @@ ApplicationRejection ValidateRoleControls(
     case ApplicationRunRoleV1::split_reader:
       if (!reads_checkpoint ||
           options.stop_after_checkpoint != StopAfterCheckpointV1::no ||
-          !prescribed_principal ||
-          options.retry_limit != smooth_periodic_euler_v1_retry_limit ||
+          (scalar ? (!off || options.retry_limit != 0)
+                  : (!prescribed_principal ||
+                     options.retry_limit !=
+                         smooth_periodic_euler_v1_retry_limit)) ||
           options.seed != seed)
       {
         return ApplicationRejection::invalid_run_role;
@@ -515,6 +572,29 @@ ApplicationRejection ValidateFunctional(
   return ApplicationRejection::none;
 }
 
+ApplicationRejection ValidateScalarIgr(
+    const ApplicationOptionsView& options) noexcept
+{
+  if (options.polynomial_order != scalar_igr_sc25_v3_polynomial_order ||
+      options.mesh_n != scalar_igr_sc25_v3_mesh_n)
+    return ApplicationRejection::invalid_polynomial_mesh_pair;
+  if (options.q_a != scalar_igr_sc25_v3_q_a ||
+      options.q_e != scalar_igr_sc25_v3_q_e ||
+      options.q_e4 != scalar_igr_sc25_v3_q_e4 ||
+      options.q_o != scalar_igr_sc25_v3_q_o)
+    return ApplicationRejection::invalid_quadrature;
+  if (options.accepted_steps != scalar_igr_sc25_v3_steps)
+    return ApplicationRejection::invalid_step_count;
+  if (options.final_time != scalar_igr_sc25_v3_final_time ||
+      !ExactEndTime(options))
+    return ApplicationRejection::invalid_final_time;
+  if (options.output_steps != scalar_igr_sc25_v3_output_steps)
+    return ApplicationRejection::invalid_output_schedule;
+  if (options.checkpoint_id != scalar_igr_sc25_v3_checkpoint_id)
+    return ApplicationRejection::invalid_checkpoint_identity;
+  return ApplicationRejection::none;
+}
+
 } // namespace
 
 ValidatedApplicationConfig::ValidatedApplicationConfig(
@@ -591,6 +671,10 @@ ApplicationScenarioV1 ParseApplicationScenario(
   {
     return ApplicationScenarioV1::functional;
   }
+  if (id == scalar_igr_sc25_v3_scenario_id)
+  {
+    return ApplicationScenarioV1::scalar_igr_sc25_v3;
+  }
   return ApplicationScenarioV1::unknown;
 }
 
@@ -638,11 +722,13 @@ ApplicationValidation ValidateApplicationOptions(
   const auto reject = [](const ApplicationRejection reason) noexcept {
     return ApplicationValidation(reason);
   };
-  if (options.card_id != smooth_periodic_euler_v1_card_id)
+  const bool scalar = options.card_id == scalar_igr_sc25_v3_card_id;
+  if (!scalar && options.card_id != smooth_periodic_euler_v1_card_id)
   {
     return reject(ApplicationRejection::unknown_card);
   }
-  if (options.case_id != smooth_periodic_euler_v1_case_id)
+  if (options.case_id != (scalar ? scalar_igr_sc25_v3_case_id
+                                 : smooth_periodic_euler_v1_case_id))
   {
     return reject(ApplicationRejection::unknown_case);
   }
@@ -681,18 +767,27 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::unbuilt_backend);
   }
+  if (scalar &&
+      ((backend != ApplicationBackend::cpu_serial &&
+        backend != ApplicationBackend::cpu_rank2) ||
+       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU != 1))
+  {
+    return reject(ApplicationRejection::unbuilt_backend);
+  }
   if (!ExactScientificIdentities(options))
   {
     return reject(ApplicationRejection::invalid_scientific_identity);
   }
-  if (options.dt != smooth_periodic_euler_v1_dt)
+  if (options.dt != (scalar ? scalar_igr_sc25_v3_dt
+                            : smooth_periodic_euler_v1_dt))
   {
     return reject(ApplicationRejection::invalid_dt);
   }
-  const ApplicationRejection scenario_rejection =
-      scenario == ApplicationScenarioV1::smoke
-      ? ValidateSmoke(options)
-      : ValidateFunctional(options, backend);
+  const ApplicationRejection scenario_rejection = scalar
+      ? ValidateScalarIgr(options)
+      : (scenario == ApplicationScenarioV1::smoke
+             ? ValidateSmoke(options)
+             : ValidateFunctional(options, backend));
   if (scenario_rejection != ApplicationRejection::none)
   {
     return reject(scenario_rejection);
@@ -716,7 +811,7 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::invalid_source_rank_rule);
   }
-  const RuntimeTupleDescriptor tuple = TupleForBackend(backend);
+  const RuntimeTupleDescriptor tuple = TupleForBackend(backend, scalar);
   if (!tuple.Valid())
   {
     return reject(ApplicationRejection::unknown_tuple);
@@ -794,12 +889,19 @@ bool DeriveSplitWriterRunConfigHashV1(
       split_reader.scenario_checkpoint_step());
   writer.restart_from = {};
   writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
-  writer.injection = {};
+  writer.injection = split_reader.scalar_igr()
+      ? FailureInjectionControlV1{
+            FailureInjectionModeV1::prescribed,
+            smooth_periodic_euler_v1_failure_phase,
+            scalar_igr_sc25_v3_failure_target_step,
+            split_reader.deferred_runtime().required_injected_source_rank}
+      : FailureInjectionControlV1{};
   writer.restart_mode = split_reader.restart_mode();
   writer.restart_trajectory = split_reader.restart_trajectory();
   writer.rollback_obligation = split_reader.rollback_obligation();
   writer.source_rank_rule = split_reader.source_rank_rule();
-  writer.retry_limit = 0;
+  writer.retry_limit = split_reader.scalar_igr()
+      ? scalar_igr_sc25_v3_retry_limit : 0;
   writer.seed = split_reader.seed();
 
   ApplicationConfigHashes hashes{};

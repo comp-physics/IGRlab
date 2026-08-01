@@ -229,6 +229,25 @@ void SelectScenario(ApplicationOptionsView& options,
       : smooth_periodic_euler_v1_smoke_checkpoint_id;
 }
 
+void SelectScalarIgrScenario(ApplicationOptionsView& options) noexcept
+{
+  options.scenario_id = scalar_igr_sc25_v3_scenario_id;
+  options.model_id = TracedScalarSc25ProjectionV3Tag::id;
+  options.formulation_id = FullyHybridizedScalarSc25V3Tag::id;
+  options.trace_id = DualConservativeScalarTraceV1Tag::id;
+  options.stabilization_id = W7Tau25DensityHeightP2V3Tag::id;
+  options.time_treatment_id = BackwardEulerMonolithicV1Tag::id;
+  options.source_id = scalar_igr_sc25_v3_source_id;
+  options.flux_id = scalar_igr_sc25_v3_flux_id;
+  options.time_rule_id = BackwardEulerMonolithicV1Tag::id;
+  options.layout_id = scalar_igr_sc25_v3_layout_id;
+  options.q_a = scalar_igr_sc25_v3_q_a;
+  options.q_e = scalar_igr_sc25_v3_q_e;
+  options.q_e4 = scalar_igr_sc25_v3_q_e4;
+  options.q_o = scalar_igr_sc25_v3_q_o;
+  options.checkpoint_id = scalar_igr_sc25_v3_checkpoint_id;
+}
+
 bool LoadConfigFile(const std::string_view path, Settings& settings) noexcept
 {
   try
@@ -346,7 +365,8 @@ ParsedCommandLine ParseCommandLine(const int argc,
   if (space == "l2") options.interior_space = InteriorSpace::l2;
   else if (space == "h1") options.interior_space = InteriorSpace::h1;
   else { parsed.diagnostic = "ConfigurationError: --space must be l2 or h1"; return parsed; }
-  if (options.card_id != smooth_periodic_euler_v1_card_id)
+  const bool scalar_igr = options.card_id == scalar_igr_sc25_v3_card_id;
+  if (!scalar_igr && options.card_id != smooth_periodic_euler_v1_card_id)
   {
     parsed.status = CommandLineStatus::rejected;
     parsed.rejection = ApplicationRejection::unknown_card;
@@ -354,7 +374,8 @@ ParsedCommandLine ParseCommandLine(const int argc,
     parsed.options = options;
     return parsed;
   }
-  if (options.case_id != smooth_periodic_euler_v1_case_id)
+  if (options.case_id != (scalar_igr ? scalar_igr_sc25_v3_case_id
+                                     : smooth_periodic_euler_v1_case_id))
   {
     parsed.status = CommandLineStatus::rejected;
     parsed.rejection = ApplicationRejection::unknown_case;
@@ -383,7 +404,9 @@ ParsedCommandLine ParseCommandLine(const int argc,
     return parsed;
   }
   options.mesh_n = static_cast<std::uint32_t>(mesh);
-  if (options.accepted_steps == smooth_periodic_euler_v1_smoke_steps)
+  if (scalar_igr && options.accepted_steps == scalar_igr_sc25_v3_steps)
+    SelectScalarIgrScenario(options);
+  else if (options.accepted_steps == smooth_periodic_euler_v1_smoke_steps)
     SelectScenario(options, ApplicationScenarioV1::smoke);
   else if (options.accepted_steps == smooth_periodic_euler_v1_functional_steps)
     SelectScenario(options, ApplicationScenarioV1::functional);
@@ -462,7 +485,8 @@ ParsedCommandLine ParseCommandLine(const int argc,
     options.run_role = ApplicationRunRoleV1::split_reader;
   else if (stop_value)
     options.run_role = ApplicationRunRoleV1::split_writer;
-  else if (options.injection.mode == FailureInjectionModeV1::prescribed)
+  else if (options.injection.mode == FailureInjectionModeV1::prescribed &&
+           options.card_id != scalar_igr_sc25_v3_card_id)
     options.run_role = ApplicationRunRoleV1::focused_terminal_injection;
   else if (options.seed == smooth_periodic_euler_v1_alternate_functional_seed)
     options.run_role = ApplicationRunRoleV1::alternate_seed_reference;
@@ -514,10 +538,11 @@ void PrintCommandLineHelp(std::ostream& output)
       "Usage: dg_igr_hdg_runtime --config FILE\n"
       "   or: dg_igr_hdg_runtime [every value option below exactly once]\n\n"
       "  --card exp.hdg.euler.conventional.smooth_persistent.w8a.v1\n"
-      "  --case conventional-smooth-persistent-v1\n"
+      "         exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3\n"
+      "  --case conventional-smooth-persistent-v1|sc25-periodic-smooth-persistent-v3\n"
       "  --space l2|h1                    (h1 reports UnsupportedDiscretization)\n"
-      "  --mesh-family periodic-cartesian-quad --mesh-n 3|6|12\n"
-      "  --order 1|2 --dt 0.05 --steps 3|20 --final-time 0.15|1.0\n"
+      "  --mesh-family periodic-cartesian-quad --mesh-n 3|6|8|12\n"
+      "  --order 1|2 --dt 0.05|0.000244140625 --steps 3|20\n"
       "  --backend cpu|cuda --device-id none|0\n"
       "  --output-dir PATH --output-steps 0,1,3|0,10,20\n"
       "  --checkpoint-out PATH|none --checkpoint-step 1|10|none\n"

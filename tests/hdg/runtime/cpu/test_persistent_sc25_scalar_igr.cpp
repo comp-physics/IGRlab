@@ -120,6 +120,46 @@ bool EqualRank2Hashes(const sc25::Rank2TrajectoryStateHashes& left,
       left.shard == right.shard;
 }
 
+bool EqualTrajectoryEvidenceBytes(
+    const sc25::PersistentTrajectoryEvidence& left,
+    const sc25::PersistentTrajectoryEvidence& right) noexcept
+{
+  static_assert(std::is_trivially_copyable<
+                    sc25::PersistentTrajectoryEvidence>::value,
+                "rank1 transaction evidence must be byte-comparable");
+  return std::memcmp(&left, &right, sizeof(left)) == 0;
+}
+
+bool EqualRank2EvidenceBoundary(
+    const sc25::PersistentRank2TrajectoryEvidence& left,
+    const sc25::PersistentRank2TrajectoryEvidence& right) noexcept
+{
+  return left.status == right.status &&
+      left.first_failure == right.first_failure &&
+      std::memcmp(&left.census, &right.census, sizeof(left.census)) == 0 &&
+      dg::hdg::runtime::detail::SameCoordinates(
+          left.coordinates, right.coordinates) &&
+      left.accepted_steps == right.accepted_steps &&
+      left.attempted_steps == right.attempted_steps &&
+      left.retry_attempts == right.retry_attempts &&
+      left.attempt_count == right.attempt_count &&
+      left.step_evidence_count == right.step_evidence_count &&
+      left.topology_generation == right.topology_generation &&
+      left.storage_generation == right.storage_generation &&
+      left.solver_generation == right.solver_generation &&
+      left.detected_w8_owned_boundary_identity_changes ==
+          right.detected_w8_owned_boundary_identity_changes &&
+      left.w8_device_transfer_calls == right.w8_device_transfer_calls &&
+      left.w8_owned_boundary_identity_hash ==
+          right.w8_owned_boundary_identity_hash &&
+      left.w8_owned_boundary_object_count ==
+          right.w8_owned_boundary_object_count &&
+      left.w8_owned_boundary_buffer_count ==
+          right.w8_owned_boundary_buffer_count &&
+      left.opaque_mfem_hypre_observed ==
+          right.opaque_mfem_hypre_observed;
+}
+
 int GeometricPeerElement(
     sc25::PersistentSc25ScalarIgrCpuFoundation& local,
     const int local_element,
@@ -381,6 +421,124 @@ int RunTrajectoryHarness()
               << static_cast<int>(initialization) << '\n';
     return 1;
   }
+
+  {
+    std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> owner =
+        CreatePersistentFoundation();
+    if (!owner || owner->InitializePersistentTrajectory() !=
+                      sc25::TrajectoryStatus::ready)
+    {
+      fail("rank1 transaction foundation initialization");
+    }
+    else
+    {
+      sc25::PersistentTrajectoryState step0_state;
+      const auto step0_evidence =
+          std::make_unique<sc25::PersistentTrajectoryEvidence>(
+              owner->trajectory_evidence());
+      sc25::PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction invalid;
+      if (!owner->CopyPublishedTrajectoryState(step0_state) ||
+          owner->InstallPersistentTrajectoryTransaction(invalid))
+      {
+        fail("rank1 invalid transaction token rejection");
+      }
+      sc25::PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction prepared;
+      const sc25::TrajectoryStatus prepared_status =
+          owner->PreparePersistentTrajectoryTransaction(prepared);
+      sc25::PersistentTrajectoryState after_prepare;
+      if (!Accepted(prepared_status) || !prepared.valid() ||
+          prepared.provisionally_installed() ||
+          prepared.future_checkpoint().descriptor.coordinates.step != 1 ||
+          EqualStateBytes(prepared.candidate_state(), step0_state) ||
+          !owner->CopyPublishedTrajectoryState(after_prepare) ||
+          !EqualStateBytes(after_prepare, step0_state) ||
+          !EqualTrajectoryEvidenceBytes(owner->trajectory_evidence(),
+                                        *step0_evidence))
+      {
+        fail("rank1 prepare preserves exact step0 publication/evidence");
+      }
+      sc25::PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction live(
+          std::move(prepared));
+      if (prepared.valid() ||
+          owner->InstallPersistentTrajectoryTransaction(prepared) ||
+          !owner->InstallPersistentTrajectoryTransaction(live) ||
+          !live.provisionally_installed())
+      {
+        fail("rank1 move-only stale token and provisional install");
+      }
+      sc25::PersistentTrajectoryState installed;
+      if (!owner->CopyPublishedTrajectoryState(installed) ||
+          !EqualStateBytes(installed, live.candidate_state()) ||
+          owner->trajectory_evidence().coordinates.step != 1)
+      {
+        fail("rank1 provisional candidate publication");
+      }
+      if (!owner->RevertPersistentTrajectoryTransaction(std::move(live)) ||
+          live.valid() ||
+          owner->RevertPersistentTrajectoryTransaction(std::move(live)))
+      {
+        fail("rank1 exact revert and stale reuse rejection");
+      }
+      sc25::PersistentTrajectoryState after_revert;
+      if (!owner->CopyPublishedTrajectoryState(after_revert) ||
+          !EqualStateBytes(after_revert, step0_state) ||
+          !EqualTrajectoryEvidenceBytes(owner->trajectory_evidence(),
+                                        *step0_evidence))
+      {
+        fail("rank1 revert restores exact step0 state/evidence bytes");
+      }
+
+      sc25::PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction
+          finalized_transaction;
+      if (!Accepted(owner->PreparePersistentTrajectoryTransaction(
+              finalized_transaction)) ||
+          !owner->InstallPersistentTrajectoryTransaction(
+              finalized_transaction))
+      {
+        fail("rank1 second transaction prepare/install");
+      }
+      const dg::hdg::runtime::StateHash future_manifest =
+          finalized_transaction.future_checkpoint().canonical_manifest_hash;
+      if (!owner->FinalizePersistentTrajectoryTransaction(
+              std::move(finalized_transaction)) ||
+          finalized_transaction.valid() ||
+          owner->FinalizePersistentTrajectoryTransaction(
+              std::move(finalized_transaction)))
+      {
+        fail("rank1 finalize and stale reuse rejection");
+      }
+      sc25::PersistentTrajectoryCheckpoint finalized;
+      if (!owner->CaptureTrajectoryCheckpoint(finalized) ||
+          finalized.canonical_manifest_hash != future_manifest ||
+          owner->trajectory_evidence().coordinates.step != 1)
+      {
+        fail("rank1 finalized checkpoint equals frozen future checkpoint");
+      }
+      sc25::PersistentTrajectoryCheckpoint imported;
+      dg::hdg::runtime::PersistentResourceDescriptor resources;
+      if (!owner->CopyPersistentResourceDescriptor(resources) ||
+          !owner->ImportTrajectoryCheckpoint(
+              finalized.descriptor.coordinates, finalized.state, imported) ||
+          imported.canonical_manifest_hash !=
+              finalized.canonical_manifest_hash ||
+          imported.raw_field_hashes.interior !=
+              finalized.raw_field_hashes.interior ||
+          imported.raw_field_hashes.trace !=
+              finalized.raw_field_hashes.trace)
+      {
+        fail("rank1 exact app-codec checkpoint import");
+      }
+      dg::hdg::runtime::StateCoordinates corrupt_coordinates =
+          finalized.descriptor.coordinates;
+      ++corrupt_coordinates.cursor;
+      if (owner->ImportTrajectoryCheckpoint(
+              corrupt_coordinates, finalized.state, imported))
+      {
+        fail("rank1 mismatched-coordinate import rejection");
+      }
+    }
+  }
+
   sc25::PersistentTrajectoryCheckpoint checkpoint10;
   for (int step = 1; step <= sc25::persistent_required_steps; ++step)
   {
@@ -805,6 +963,126 @@ int RunRank2TrajectoryHarness()
       !EqualRank2StateBytes(initialized, initialized_again))
   {
     fail("rank2 initialization reentry byte stability");
+  }
+
+  {
+    std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> owner =
+        CreateRank2Foundation();
+    if (!collectively_require(
+            owner && owner->InitializePersistentRank2Trajectory() ==
+                         sc25::TrajectoryStatus::ready,
+            "rank2 transaction foundation initialization"))
+      return 1;
+    sc25::PersistentRank2TrajectoryState step0_state;
+    const auto step0_evidence =
+        std::make_unique<sc25::PersistentRank2TrajectoryEvidence>(
+            owner->rank2_trajectory_evidence());
+    sc25::PersistentSc25ScalarIgrCpuFoundation::Rank2Transaction invalid;
+    if (!collectively_require(
+            owner->CopyPublishedRank2TrajectoryState(step0_state) &&
+                !owner->InstallPersistentRank2TrajectoryTransaction(invalid),
+            "rank2 invalid transaction token rejection"))
+      return 1;
+    sc25::PersistentSc25ScalarIgrCpuFoundation::Rank2Transaction prepared;
+    const sc25::TrajectoryStatus prepared_status =
+        owner->PreparePersistentRank2TrajectoryTransaction(prepared);
+    sc25::PersistentRank2TrajectoryState after_prepare;
+    if (!collectively_require(
+            Accepted(prepared_status) && prepared.valid() &&
+                !prepared.provisionally_installed() &&
+                prepared.future_checkpoint().descriptor.coordinates.step ==
+                    1 &&
+                !EqualRank2StateBytes(prepared.candidate_state(),
+                                      step0_state) &&
+                owner->CopyPublishedRank2TrajectoryState(after_prepare) &&
+                EqualRank2StateBytes(after_prepare, step0_state) &&
+                EqualRank2EvidenceBoundary(
+                    owner->rank2_trajectory_evidence(), *step0_evidence),
+            "rank2 prepare preserves exact step0 publication/evidence"))
+      return 1;
+    sc25::PersistentSc25ScalarIgrCpuFoundation::Rank2Transaction live(
+        std::move(prepared));
+    if (!collectively_require(
+            !prepared.valid() &&
+                !owner->InstallPersistentRank2TrajectoryTransaction(
+                    prepared) &&
+                owner->InstallPersistentRank2TrajectoryTransaction(live) &&
+                live.provisionally_installed(),
+            "rank2 move-only stale token and provisional install"))
+      return 1;
+    sc25::PersistentRank2TrajectoryState installed;
+    if (!collectively_require(
+            owner->CopyPublishedRank2TrajectoryState(installed) &&
+                EqualRank2StateBytes(installed, live.candidate_state()) &&
+                owner->rank2_trajectory_evidence().coordinates.step == 1,
+            "rank2 provisional candidate publication"))
+      return 1;
+    if (!collectively_require(
+            owner->RevertPersistentRank2TrajectoryTransaction(
+                std::move(live)) &&
+                !live.valid() &&
+                !owner->RevertPersistentRank2TrajectoryTransaction(
+                    std::move(live)),
+            "rank2 exact revert and stale reuse rejection"))
+      return 1;
+    sc25::PersistentRank2TrajectoryState after_revert;
+    if (!collectively_require(
+            owner->CopyPublishedRank2TrajectoryState(after_revert) &&
+                EqualRank2StateBytes(after_revert, step0_state) &&
+                EqualRank2EvidenceBoundary(
+                    owner->rank2_trajectory_evidence(), *step0_evidence),
+            "rank2 revert restores exact step0 state/evidence"))
+      return 1;
+
+    sc25::PersistentSc25ScalarIgrCpuFoundation::Rank2Transaction
+        finalized_transaction;
+    if (!collectively_require(
+            Accepted(owner->PreparePersistentRank2TrajectoryTransaction(
+                finalized_transaction)) &&
+                owner->InstallPersistentRank2TrajectoryTransaction(
+                    finalized_transaction),
+            "rank2 second transaction prepare/install"))
+      return 1;
+    const dg::hdg::runtime::StateHash future_manifest =
+        finalized_transaction.future_checkpoint().canonical_manifest_hash;
+    if (!collectively_require(
+            owner->FinalizePersistentRank2TrajectoryTransaction(
+                std::move(finalized_transaction)) &&
+                !finalized_transaction.valid() &&
+                !owner->FinalizePersistentRank2TrajectoryTransaction(
+                    std::move(finalized_transaction)),
+            "rank2 finalize and stale reuse rejection"))
+      return 1;
+    sc25::PersistentRank2TrajectoryCheckpoint finalized;
+    if (!collectively_require(
+            owner->CaptureRank2TrajectoryCheckpoint(finalized) &&
+                finalized.canonical_manifest_hash == future_manifest &&
+                owner->rank2_trajectory_evidence().coordinates.step == 1,
+            "rank2 finalized checkpoint equals frozen future checkpoint"))
+      return 1;
+    sc25::PersistentRank2TrajectoryCheckpoint imported;
+    dg::hdg::runtime::PersistentResourceDescriptor resources;
+    if (!collectively_require(
+            owner->CopyPersistentResourceDescriptor(resources) &&
+                owner->ImportRank2TrajectoryCheckpoint(
+                    finalized.descriptor.coordinates, finalized.state,
+                    imported) &&
+                imported.canonical_manifest_hash ==
+                    finalized.canonical_manifest_hash &&
+                imported.raw_field_hashes.interior ==
+                    finalized.raw_field_hashes.interior &&
+                imported.raw_field_hashes.trace ==
+                    finalized.raw_field_hashes.trace,
+            "rank2 exact app-codec checkpoint import"))
+      return 1;
+    dg::hdg::runtime::StateCoordinates corrupt_coordinates =
+        finalized.descriptor.coordinates;
+    if (rank == 1) ++corrupt_coordinates.cursor;
+    if (!collectively_require(
+            !owner->ImportRank2TrajectoryCheckpoint(
+                corrupt_coordinates, finalized.state, imported),
+            "rank2 collective mismatched-coordinate import rejection"))
+      return 1;
   }
 
   sc25::PersistentRank2TrajectoryCheckpoint checkpoint10;

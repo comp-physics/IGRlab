@@ -83,6 +83,46 @@ ApplicationOptionsView Functional(const std::string_view backend,
   return options;
 }
 
+ApplicationOptionsView ScalarIgr(const std::string_view backend)
+{
+  ApplicationOptionsView options = Smoke(backend);
+  options.card_id = scalar_igr_sc25_v3_card_id;
+  options.case_id = scalar_igr_sc25_v3_case_id;
+  options.scenario_id = scalar_igr_sc25_v3_scenario_id;
+  options.model_id = TracedScalarSc25ProjectionV3Tag::id;
+  options.formulation_id = FullyHybridizedScalarSc25V3Tag::id;
+  options.trace_id = DualConservativeScalarTraceV1Tag::id;
+  options.stabilization_id = W7Tau25DensityHeightP2V3Tag::id;
+  options.time_treatment_id = BackwardEulerMonolithicV1Tag::id;
+  options.source_id = scalar_igr_sc25_v3_source_id;
+  options.flux_id = scalar_igr_sc25_v3_flux_id;
+  options.time_rule_id = BackwardEulerMonolithicV1Tag::id;
+  options.layout_id = scalar_igr_sc25_v3_layout_id;
+  options.polynomial_order = scalar_igr_sc25_v3_polynomial_order;
+  options.mesh_n = scalar_igr_sc25_v3_mesh_n;
+  options.q_a = scalar_igr_sc25_v3_q_a;
+  options.q_e = scalar_igr_sc25_v3_q_e;
+  options.q_e4 = scalar_igr_sc25_v3_q_e4;
+  options.q_o = scalar_igr_sc25_v3_q_o;
+  options.dt = scalar_igr_sc25_v3_dt;
+  options.accepted_steps = scalar_igr_sc25_v3_steps;
+  options.final_time = scalar_igr_sc25_v3_final_time;
+  options.output_steps = scalar_igr_sc25_v3_output_steps;
+  options.checkpoint_id = scalar_igr_sc25_v3_checkpoint_id;
+  options.checkpoint_step =
+      OptionalCheckpointStepV1::Present(scalar_igr_sc25_v3_checkpoint_step);
+  options.injection = {
+      FailureInjectionModeV1::prescribed,
+      smooth_periodic_euler_v1_failure_phase,
+      scalar_igr_sc25_v3_failure_target_step,
+      backend == CpuRank2BackendTag::id ||
+              backend == CudaRank2OneGpuHostStagedBackendTag::id
+          ? 1U : 0U};
+  options.retry_limit = scalar_igr_sc25_v3_retry_limit;
+  options.seed = scalar_igr_sc25_v3_seed;
+  return options;
+}
+
 std::uint32_t SourceRank(const std::string_view backend)
 {
   return backend == CpuRank2BackendTag::id ||
@@ -103,18 +143,21 @@ ApplicationOptionsView SplitReader(ApplicationOptionsView options)
   const std::string_view checkpoint = options.checkpoint_out.canonical;
   const bool smoke =
       options.scenario_id == smooth_periodic_euler_v1_smoke_id;
+  const bool scalar = options.card_id == scalar_igr_sc25_v3_card_id;
   options.run_role = ApplicationRunRoleV1::split_reader;
   options.checkpoint_out = {};
   options.checkpoint_step = {};
   options.restart_from = CheckpointArtifactPathV1::Present(checkpoint);
   options.stop_after_checkpoint = StopAfterCheckpointV1::no;
-  options.injection = {
-      FailureInjectionModeV1::prescribed,
-      smooth_periodic_euler_v1_failure_phase,
-      smoke ? smooth_periodic_euler_v1_smoke_failure_target_step
-            : smooth_periodic_euler_v1_functional_failure_target_step,
-      SourceRank(options.backend_id)};
-  options.retry_limit = smooth_periodic_euler_v1_retry_limit;
+  options.injection = scalar
+      ? FailureInjectionControlV1{}
+      : FailureInjectionControlV1{
+            FailureInjectionModeV1::prescribed,
+            smooth_periodic_euler_v1_failure_phase,
+            smoke ? smooth_periodic_euler_v1_smoke_failure_target_step
+                  : smooth_periodic_euler_v1_functional_failure_target_step,
+            SourceRank(options.backend_id)};
+  options.retry_limit = scalar ? 0 : smooth_periodic_euler_v1_retry_limit;
   return options;
 }
 
@@ -393,6 +436,101 @@ bool CheckScientificCrossProducts()
   return passed;
 }
 
+bool CheckScalarIgrMatrix()
+{
+  bool passed = true;
+  const auto expected = [](const ApplicationBackend backend) {
+    return CompiledBackendAvailable(backend) &&
+        DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1;
+  };
+  for (const auto& item : std::array<std::pair<std::string_view,
+                                               ApplicationBackend>, 2>{{
+           {CpuSerialBackendTag::id, ApplicationBackend::cpu_serial},
+           {CpuRank2BackendTag::id, ApplicationBackend::cpu_rank2}}})
+  {
+    const ApplicationValidation validation =
+        ValidateApplicationOptions(ScalarIgr(item.first));
+    passed = Check(expected(item.second) ? validation.accepted()
+                                        : validation.rejection() ==
+                                              ApplicationRejection::unbuilt_backend,
+                   "scalar_igr_cpu_static_matrix") && passed;
+    if (validation.accepted())
+      passed = Check(validation.config()->scalar_igr() &&
+                         validation.config()->scenario() ==
+                             ApplicationScenarioV1::scalar_igr_sc25_v3,
+                     "scalar_igr_exact_scenario") && passed;
+  }
+  for (const std::string_view backend :
+       {CudaRank1OneGpuBackendTag::id,
+        CudaRank2OneGpuHostStagedBackendTag::id})
+    passed = Check(ValidateApplicationOptions(ScalarIgr(backend)).rejection() ==
+                       ApplicationRejection::unbuilt_backend,
+                   "scalar_igr_cuda_slot_explicitly_unbuilt") && passed;
+  ApplicationOptionsView h1 = ScalarIgr(CpuSerialBackendTag::id);
+  h1.interior_space = InteriorSpace::h1;
+  passed = Check(ValidateApplicationOptions(h1).rejection() ==
+                     ApplicationRejection::unsupported_h1,
+                 "scalar_igr_h1_honest_rejection") && passed;
+
+  const ApplicationOptionsView scalar_reference =
+      ScalarIgr(CpuSerialBackendTag::id);
+  passed = Check(
+               ValidateApplicationOptions(
+                   SplitWriter(scalar_reference)).accepted() &&
+                   ValidateApplicationOptions(
+                       SplitReader(scalar_reference)).accepted(),
+               "scalar_igr_writer_reader_role_matrix") && passed;
+
+  ApplicationOptionsView scalar_with_conventional_reference_controls =
+      scalar_reference;
+  scalar_with_conventional_reference_controls.injection = {};
+  scalar_with_conventional_reference_controls.retry_limit = 0;
+  passed = Check(
+               ValidateApplicationOptions(
+                   scalar_with_conventional_reference_controls).rejection() ==
+                   ApplicationRejection::invalid_run_role,
+               "scalar_igr_rejects_conventional_reference_controls") &&
+      passed;
+
+  ApplicationOptionsView scalar_with_conventional_reader_controls =
+      SplitReader(scalar_reference);
+  scalar_with_conventional_reader_controls.injection = {
+      FailureInjectionModeV1::prescribed,
+      smooth_periodic_euler_v1_failure_phase,
+      smooth_periodic_euler_v1_functional_failure_target_step,
+      0};
+  scalar_with_conventional_reader_controls.retry_limit =
+      smooth_periodic_euler_v1_retry_limit;
+  passed = Check(
+               ValidateApplicationOptions(
+                   scalar_with_conventional_reader_controls).rejection() ==
+                   ApplicationRejection::invalid_run_role,
+               "scalar_igr_rejects_conventional_reader_controls") && passed;
+
+  ApplicationOptionsView conventional_with_scalar_writer_controls =
+      SplitWriter(Functional(CpuSerialBackendTag::id));
+  conventional_with_scalar_writer_controls.injection =
+      scalar_reference.injection;
+  conventional_with_scalar_writer_controls.retry_limit =
+      scalar_igr_sc25_v3_retry_limit;
+  passed = Check(
+               ValidateApplicationOptions(
+                   conventional_with_scalar_writer_controls).rejection() ==
+                   ApplicationRejection::invalid_run_role,
+               "conventional_rejects_scalar_writer_controls") && passed;
+
+  ApplicationOptionsView conventional_with_scalar_reader_controls =
+      SplitReader(Functional(CpuSerialBackendTag::id));
+  conventional_with_scalar_reader_controls.injection = {};
+  conventional_with_scalar_reader_controls.retry_limit = 0;
+  passed = Check(
+               ValidateApplicationOptions(
+                   conventional_with_scalar_reader_controls).rejection() ==
+                   ApplicationRejection::invalid_run_role,
+               "conventional_rejects_scalar_reader_controls") && passed;
+  return passed;
+}
+
 } // namespace
 
 int main()
@@ -403,6 +541,7 @@ int main()
   passed = CheckFocusedAndAlternateRoles() && passed;
   passed = CheckNegativeRoleControls() && passed;
   passed = CheckScientificCrossProducts() && passed;
+  passed = CheckScalarIgrMatrix() && passed;
   if (passed)
   {
     std::cout << "HDG W8A typed application admission checks passed\n";

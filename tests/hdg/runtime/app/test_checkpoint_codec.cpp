@@ -399,6 +399,30 @@ using Rank2ContractView = RankCommittedContractViewV1<
     State,
     TestStoragePolicy,
     TestCollectivePolicy>;
+using ScalarSerialContract = PersistentRunContract<
+    ScalarIgrCpuSerialRuntimeSelection,
+    State,
+    State,
+    TestStoragePolicy,
+    TestCollectivePolicy>;
+using ScalarRank2Contract = PersistentRunContract<
+    ScalarIgrCpuRank2RuntimeSelection,
+    State,
+    State,
+    TestStoragePolicy,
+    TestCollectivePolicy>;
+using ScalarSerialContractView = RankCommittedContractViewV1<
+    ScalarIgrCpuSerialRuntimeSelection,
+    State,
+    State,
+    TestStoragePolicy,
+    TestCollectivePolicy>;
+using ScalarRank2ContractView = RankCommittedContractViewV1<
+    ScalarIgrCpuRank2RuntimeSelection,
+    State,
+    State,
+    TestStoragePolicy,
+    TestCollectivePolicy>;
 
 StateHash FilledHash(const std::uint8_t first) noexcept
 {
@@ -412,7 +436,8 @@ StateHash FilledHash(const std::uint8_t first) noexcept
 
 PersistentResourceDescriptor TestResources(
     const std::uint32_t rank_count,
-    const int polynomial_order = 1)
+    const int polynomial_order = 1,
+    const std::string_view layout = smooth_periodic_euler_v1_layout_id)
 {
   PersistentResourceDescriptor resources{};
   resources.mfem_pin = StableIdentity::Copy("d9d6526cc1749980");
@@ -421,8 +446,7 @@ PersistentResourceDescriptor TestResources(
   resources.topology_hash = FilledHash(0x50);
   resources.rank_count = rank_count;
   resources.polynomial_order = polynomial_order;
-  resources.layout = StableIdentity::Copy(
-      smooth_periodic_euler_v1_layout_id);
+  resources.layout = StableIdentity::Copy(layout);
   resources.reuse = {true, true, true, false, 1, 1, 128, 64};
   return resources;
 }
@@ -529,6 +553,66 @@ ApplicationValidation FunctionalTestValidation(
   return ValidateApplicationOptions(options);
 }
 
+ApplicationOptionsView ScalarTestOptions(const std::string_view backend)
+{
+  ApplicationOptionsView options = TestOptions(backend);
+  options.card_id = scalar_igr_sc25_v3_card_id;
+  options.case_id = scalar_igr_sc25_v3_case_id;
+  options.scenario_id = scalar_igr_sc25_v3_scenario_id;
+  options.model_id = TracedScalarSc25ProjectionV3Tag::id;
+  options.formulation_id = FullyHybridizedScalarSc25V3Tag::id;
+  options.trace_id = DualConservativeScalarTraceV1Tag::id;
+  options.stabilization_id = W7Tau25DensityHeightP2V3Tag::id;
+  options.time_treatment_id = BackwardEulerMonolithicV1Tag::id;
+  options.source_id = scalar_igr_sc25_v3_source_id;
+  options.flux_id = scalar_igr_sc25_v3_flux_id;
+  options.time_rule_id = BackwardEulerMonolithicV1Tag::id;
+  options.layout_id = scalar_igr_sc25_v3_layout_id;
+  options.polynomial_order = scalar_igr_sc25_v3_polynomial_order;
+  options.mesh_n = scalar_igr_sc25_v3_mesh_n;
+  options.q_a = scalar_igr_sc25_v3_q_a;
+  options.q_e = scalar_igr_sc25_v3_q_e;
+  options.q_e4 = scalar_igr_sc25_v3_q_e4;
+  options.q_o = scalar_igr_sc25_v3_q_o;
+  options.dt = scalar_igr_sc25_v3_dt;
+  options.accepted_steps = scalar_igr_sc25_v3_steps;
+  options.final_time = scalar_igr_sc25_v3_final_time;
+  options.output_steps = scalar_igr_sc25_v3_output_steps;
+  options.checkpoint_id = scalar_igr_sc25_v3_checkpoint_id;
+  options.checkpoint_step = OptionalCheckpointStepV1::Present(
+      scalar_igr_sc25_v3_checkpoint_step);
+  options.seed = scalar_igr_sc25_v3_seed;
+  return options;
+}
+
+ApplicationValidation ScalarTestValidation(const std::string_view backend,
+                                            const bool reader)
+{
+  ApplicationOptionsView options = ScalarTestOptions(backend);
+  const std::string_view artifact = options.checkpoint_out.canonical;
+  if (reader)
+  {
+    options.run_role = ApplicationRunRoleV1::split_reader;
+    options.checkpoint_out = {};
+    options.checkpoint_step = {};
+    options.restart_from = CheckpointArtifactPathV1::Present(artifact);
+    options.injection = {};
+    options.retry_limit = 0;
+  }
+  else
+  {
+    options.run_role = ApplicationRunRoleV1::split_writer;
+    options.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+    options.injection = {
+        FailureInjectionModeV1::prescribed,
+        smooth_periodic_euler_v1_failure_phase,
+        scalar_igr_sc25_v3_failure_target_step,
+        backend == CpuRank2BackendTag::id ? 1U : 0U};
+    options.retry_limit = scalar_igr_sc25_v3_retry_limit;
+  }
+  return ValidateApplicationOptions(options);
+}
+
 template <typename ContractType>
 typename ContractType::ProductBundle IssueAll(
     ContractType& contract,
@@ -547,9 +631,9 @@ typename ContractType::ProductBundle IssueAll(
 }
 
 template <typename ContractType>
-bool AdvanceOneCommit(ContractType& contract)
+bool AdvanceOneCommit(ContractType& contract, const double dt = 0.05)
 {
-  const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.05});
+  const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, dt});
   if (!begin.started) { return false; }
   AttemptReport report{};
   report.gates = {true, true, true, true, true, true};
@@ -561,11 +645,12 @@ bool AdvanceOneCommit(ContractType& contract)
 }
 
 template <typename ContractType>
-bool AdvanceCommits(ContractType& contract, const std::uint64_t count)
+bool AdvanceCommits(ContractType& contract, const std::uint64_t count,
+                    const double dt = 0.05)
 {
   for (std::uint64_t commit = 0; commit < count; ++commit)
   {
-    if (!AdvanceOneCommit(contract)) { return false; }
+    if (!AdvanceOneCommit(contract, dt)) { return false; }
   }
   return true;
 }
@@ -630,6 +715,64 @@ struct Rank2CoefficientFixture
               {interior[1].data(), interior[1].size(), 4, 16,
                CoefficientOrderingV1::component_major},
               {trace[1].data(), trace[1].size(), 4, 8,
+               CoefficientOrderingV1::component_major}}}};
+  }
+};
+
+struct ScalarCoefficientFixture
+{
+  State interior = State(1792);
+  State trace = State(1280);
+
+  ScalarCoefficientFixture()
+  {
+    for (std::size_t index = 0; index < interior.size(); ++index)
+      interior[index] = static_cast<double>(12001 + index);
+    for (std::size_t index = 0; index < trace.size(); ++index)
+      trace[index] = static_cast<double>(16001 + index);
+  }
+
+  std::array<StagedStateViewV1, 1> Views() const noexcept
+  {
+    return {{{0,
+              {interior.data(), interior.size(),
+               scalar_igr_interior_component_count_v1, 256,
+               CoefficientOrderingV1::component_major},
+              {trace.data(), trace.size(),
+               scalar_igr_trace_component_count_v1, 256,
+               CoefficientOrderingV1::component_major}}}};
+  }
+};
+
+struct ScalarRank2CoefficientFixture
+{
+  std::array<State, 2> interior{{State(896), State(896)}};
+  std::array<State, 2> trace{{State(720), State(560)}};
+
+  ScalarRank2CoefficientFixture()
+  {
+    double value = 20001.0;
+    for (State& field : interior)
+      for (double& coefficient : field) coefficient = value++;
+    for (State& field : trace)
+      for (double& coefficient : field) coefficient = value++;
+  }
+
+  std::array<StagedStateViewV1, 2> Views() const noexcept
+  {
+    return {{{0,
+              {interior[0].data(), interior[0].size(),
+               scalar_igr_interior_component_count_v1, 128,
+               CoefficientOrderingV1::component_major},
+              {trace[0].data(), trace[0].size(),
+               scalar_igr_trace_component_count_v1, 144,
+               CoefficientOrderingV1::component_major}},
+             {1,
+              {interior[1].data(), interior[1].size(),
+               scalar_igr_interior_component_count_v1, 128,
+               CoefficientOrderingV1::component_major},
+              {trace[1].data(), trace[1].size(),
+               scalar_igr_trace_component_count_v1, 112,
                CoefficientOrderingV1::component_major}}}};
   }
 };
@@ -1382,10 +1525,14 @@ constexpr std::string_view rejected_v1_artifact_hex =
 ScenarioCoefficientExtentsV1 IndependentExtents(
     const std::uint32_t n,
     const std::uint32_t polynomial_order,
-    const std::uint32_t rank_count)
+    const std::uint32_t rank_count,
+    const std::uint32_t interior_components = 4,
+    const std::uint32_t trace_components = 4)
 {
   ScenarioCoefficientExtentsV1 result{};
   result.rank_count = rank_count;
+  result.interior_component_count = interior_components;
+  result.trace_component_count = trace_components;
   const std::uint64_t elements =
       static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(n);
   const auto owner = [elements, rank_count](
@@ -1418,9 +1565,10 @@ ScenarioCoefficientExtentsV1 IndependentExtents(
     RankCoefficientExtentsV1& extents = result.ranks[rank];
     extents.interior_dofs_per_component = element_counts[rank] * p1 * p1;
     extents.interior_coefficient_count =
-        extents.interior_dofs_per_component * 4;
+        extents.interior_dofs_per_component * interior_components;
     extents.trace_dofs_per_component = face_counts[rank] * p1;
-    extents.trace_coefficient_count = extents.trace_dofs_per_component * 4;
+    extents.trace_coefficient_count =
+        extents.trace_dofs_per_component * trace_components;
     result.aggregate_interior_coefficient_count +=
         extents.interior_coefficient_count;
     result.aggregate_trace_coefficient_count += extents.trace_coefficient_count;
@@ -1432,6 +1580,8 @@ bool SameExtents(const ScenarioCoefficientExtentsV1& left,
                  const ScenarioCoefficientExtentsV1& right) noexcept
 {
   if (left.rank_count != right.rank_count ||
+      left.interior_component_count != right.interior_component_count ||
+      left.trace_component_count != right.trace_component_count ||
       left.aggregate_interior_coefficient_count !=
           right.aggregate_interior_coefficient_count ||
       left.aggregate_trace_coefficient_count !=
@@ -1480,24 +1630,59 @@ bool CheckExactScenarioExtents()
       IndependentExtents(3, 1, 1);
   const ScenarioCoefficientExtentsV1 rank2_oracle =
       IndependentExtents(3, 1, 2);
+  const ApplicationValidation scalar_serial_validation =
+      ScalarTestValidation(CpuSerialBackendTag::id, false);
+  const ApplicationValidation scalar_rank2_validation =
+      ScalarTestValidation(CpuRank2BackendTag::id, false);
+  const ValidatedApplicationConfig* scalar_serial =
+      scalar_serial_validation.config();
+  const ValidatedApplicationConfig* scalar_rank2 =
+      scalar_rank2_validation.config();
+  passed = Check(scalar_serial != nullptr && scalar_rank2 != nullptr,
+                 "scalar_rank1_and_rank2_static_configs_validate") && passed;
+  if (scalar_serial == nullptr || scalar_rank2 == nullptr) return false;
+  const ScenarioCoefficientExtentsV1 scalar_serial_oracle =
+      IndependentExtents(8, 1, 1, 7, 5);
+  const ScenarioCoefficientExtentsV1 scalar_rank2_oracle =
+      IndependentExtents(8, 1, 2, 7, 5);
   passed = Check(
                serial_oracle.ranks[0].interior_coefficient_count == 144 &&
                    serial_oracle.ranks[0].trace_coefficient_count == 144 &&
                    rank2_oracle.ranks[0].interior_coefficient_count == 80 &&
                    rank2_oracle.ranks[1].interior_coefficient_count == 64 &&
                    rank2_oracle.ranks[0].trace_coefficient_count == 112 &&
-                   rank2_oracle.ranks[1].trace_coefficient_count == 32,
+                   rank2_oracle.ranks[1].trace_coefficient_count == 32 &&
+                   scalar_serial_oracle.ranks[0].interior_coefficient_count ==
+                       1792 &&
+                   scalar_serial_oracle.ranks[0].trace_coefficient_count ==
+                       1280 &&
+                   scalar_rank2_oracle.ranks[0].interior_coefficient_count ==
+                       896 &&
+                   scalar_rank2_oracle.ranks[1].interior_coefficient_count ==
+                       896 &&
+                   scalar_rank2_oracle.ranks[0].trace_coefficient_count ==
+                       720 &&
+                   scalar_rank2_oracle.ranks[1].trace_coefficient_count ==
+                       560,
                "independent_periodic_partition_extents_are_exact") &&
       passed;
   ScenarioCoefficientExtentsV1 serial_actual{};
   ScenarioCoefficientExtentsV1 rank2_actual{};
+  ScenarioCoefficientExtentsV1 scalar_serial_actual{};
+  ScenarioCoefficientExtentsV1 scalar_rank2_actual{};
   passed = Check(
                DeriveScenarioCoefficientExtentsV1(*serial, 1,
                                                   serial_actual) &&
                    DeriveScenarioCoefficientExtentsV1(*rank2, 2,
                                                       rank2_actual) &&
+                   DeriveScenarioCoefficientExtentsV1(*scalar_serial, 1,
+                                                      scalar_serial_actual) &&
+                   DeriveScenarioCoefficientExtentsV1(*scalar_rank2, 2,
+                                                      scalar_rank2_actual) &&
                    SameExtents(serial_actual, serial_oracle) &&
-                   SameExtents(rank2_actual, rank2_oracle),
+                   SameExtents(rank2_actual, rank2_oracle) &&
+                   SameExtents(scalar_serial_actual, scalar_serial_oracle) &&
+                   SameExtents(scalar_rank2_actual, scalar_rank2_oracle),
                "codec_extents_match_independent_face_enumeration") &&
       passed;
   return passed;
@@ -1669,6 +1854,299 @@ bool CheckRank2CaptureAndAllRankEvidence()
                    unchanged == std::vector<std::uint8_t>({0xaa, 0xbb}),
                "non_injection_source_rank_payload_requires_own_live_hash") &&
       passed;
+  return passed;
+}
+
+bool CheckScalarIgrCheckpointSchemaRoundTrip()
+{
+  bool passed = true;
+  const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
+
+  const ApplicationValidation serial_writer_validation =
+      ScalarTestValidation(CpuSerialBackendTag::id, false);
+  const ApplicationValidation serial_reader_validation =
+      ScalarTestValidation(CpuSerialBackendTag::id, true);
+  const ValidatedApplicationConfig* serial_writer =
+      serial_writer_validation.config();
+  const ValidatedApplicationConfig* serial_reader =
+      serial_reader_validation.config();
+  passed = Check(serial_writer != nullptr && serial_reader != nullptr,
+                 "scalar_serial_writer_and_reader_validate") && passed;
+  if (serial_writer == nullptr || serial_reader == nullptr) return false;
+
+  const PersistentResourceDescriptor serial_resources = TestResources(
+      1, scalar_igr_sc25_v3_polynomial_order,
+      scalar_igr_sc25_v3_layout_id);
+  const ScalarCoefficientFixture serial_fixture;
+  const Slot serial_committed{serial_fixture.interior, serial_fixture.trace};
+  Slot serial_candidate{};
+  ScalarSerialContract serial_contract(
+      serial_committed, serial_candidate,
+      {0.0, 0, 0, 0, scalar_igr_sc25_v3_dt}, serial_resources);
+  passed = Check(AdvanceCommits(serial_contract,
+                                scalar_igr_sc25_v3_checkpoint_step,
+                                scalar_igr_sc25_v3_dt),
+                 "scalar_serial_contract_reaches_checkpoint_step") && passed;
+  const std::array<ScalarSerialContractView, 1> serial_contracts{{
+      {0, &serial_contract}}};
+  const auto serial_capture = CaptureCheckpointV1(
+      serial_contracts.data(), serial_contracts.size(), *serial_writer,
+      runtime);
+  std::vector<std::uint8_t> serial_encoded;
+  const auto serial_views = serial_fixture.Views();
+  passed = Check(
+      serial_capture &&
+          EncodeCheckpointV1(*serial_capture, serial_views.data(),
+                             serial_views.size(), serial_encoded) ==
+              CheckpointCodecStatus::ok,
+      "scalar_serial_7_5_checkpoint_encodes") && passed;
+  State serial_interior(serial_fixture.interior.size(), -1.0);
+  State serial_trace(serial_fixture.trace.size(), -1.0);
+  std::array<RankStateBufferV1, 1> serial_buffers{{{
+      0,
+      {serial_interior.data(), serial_interior.size(), serial_interior.size(),
+       scalar_igr_interior_component_count_v1, 256,
+       CoefficientOrderingV1::component_major},
+      {serial_trace.data(), serial_trace.size(), serial_trace.size(),
+       scalar_igr_trace_component_count_v1, 256,
+       CoefficientOrderingV1::component_major}}}};
+  DecodedCheckpointMetadataV1 serial_metadata{};
+  passed = Check(
+      DecodeCheckpointV1({serial_encoded.data(), serial_encoded.size()},
+                         *serial_reader, serial_resources, runtime,
+                         serial_buffers.data(), serial_buffers.size(),
+                         serial_metadata) == CheckpointCodecStatus::ok &&
+          serial_interior == serial_fixture.interior &&
+          serial_trace == serial_fixture.trace &&
+          serial_metadata.aggregate_interior_coefficients == 1792 &&
+          serial_metadata.aggregate_true_trace_coefficients == 1280,
+      "scalar_serial_7_5_checkpoint_round_trip") && passed;
+
+  const auto expect_serial_failure_atomic = [
+      &](const std::vector<std::uint8_t>& bytes,
+          const PersistentResourceDescriptor& resources,
+          const CheckpointCodecStatus expected, const char* label) {
+    std::fill(serial_interior.begin(), serial_interior.end(), -7.0);
+    std::fill(serial_trace.begin(), serial_trace.end(), -7.0);
+    DecodedCheckpointMetadataV1 metadata{};
+    metadata.rank_count = 77;
+    const DecodedCheckpointMetadataV1 original = metadata;
+    const CheckpointCodecStatus status = DecodeCheckpointV1(
+        {bytes.data(), bytes.size()}, *serial_reader, resources, runtime,
+        serial_buffers.data(), serial_buffers.size(), metadata);
+    passed = Check(
+                 status == expected &&
+                     std::all_of(serial_interior.begin(),
+                                 serial_interior.end(),
+                                 [](const double value) {
+                                   return value == -7.0;
+                                 }) &&
+                     std::all_of(serial_trace.begin(), serial_trace.end(),
+                                 [](const double value) {
+                                   return value == -7.0;
+                                 }) &&
+                     SameMetadata(metadata, original),
+                 label) && passed;
+  };
+  std::vector<std::uint8_t> corrupted_serial = serial_encoded;
+  corrupted_serial.back() ^= 1U;
+  expect_serial_failure_atomic(
+      corrupted_serial, serial_resources,
+      CheckpointCodecStatus::checksum_mismatch,
+      "scalar_serial_corruption_is_failure_atomic");
+
+  PersistentResourceDescriptor mismatched_serial_resources = serial_resources;
+  mismatched_serial_resources.mesh_hash.bytes[0] ^= 1U;
+  expect_serial_failure_atomic(
+      serial_encoded, mismatched_serial_resources,
+      CheckpointCodecStatus::resource_mismatch,
+      "scalar_serial_descriptor_resource_mismatch_is_failure_atomic");
+
+  std::vector<std::uint8_t> mismatched_serial_hash = serial_encoded;
+  const LayoutOffsets serial_layout = Locate(mismatched_serial_hash);
+  mismatched_serial_hash[serial_layout.descriptor_interior_hash] ^= 1U;
+  passed = Check(Seal(mismatched_serial_hash),
+                 "scalar_serial_hash_mismatch_fixture_reseals") && passed;
+  expect_serial_failure_atomic(
+      mismatched_serial_hash, serial_resources,
+      CheckpointCodecStatus::aggregate_payload_hash_mismatch,
+      "scalar_serial_descriptor_hash_mismatch_is_failure_atomic");
+
+  const ApplicationValidation rank2_writer_validation =
+      ScalarTestValidation(CpuRank2BackendTag::id, false);
+  const ApplicationValidation rank2_reader_validation =
+      ScalarTestValidation(CpuRank2BackendTag::id, true);
+  const ValidatedApplicationConfig* rank2_writer =
+      rank2_writer_validation.config();
+  const ValidatedApplicationConfig* rank2_reader =
+      rank2_reader_validation.config();
+  passed = Check(rank2_writer != nullptr && rank2_reader != nullptr,
+                 "scalar_rank2_writer_and_reader_validate") && passed;
+  if (rank2_writer == nullptr || rank2_reader == nullptr) return false;
+
+  const PersistentResourceDescriptor rank2_resources = TestResources(
+      2, scalar_igr_sc25_v3_polynomial_order,
+      scalar_igr_sc25_v3_layout_id);
+  const ScalarRank2CoefficientFixture rank2_fixture;
+  std::array<Slot, 2> rank2_committed{{
+      {rank2_fixture.interior[0], rank2_fixture.trace[0]},
+      {rank2_fixture.interior[1], rank2_fixture.trace[1]}}};
+  std::array<Slot, 2> rank2_candidate{};
+  ScalarRank2Contract rank2_contract0(
+      rank2_committed[0], rank2_candidate[0],
+      {0.0, 0, 0, 0, scalar_igr_sc25_v3_dt}, rank2_resources);
+  ScalarRank2Contract rank2_contract1(
+      rank2_committed[1], rank2_candidate[1],
+      {0.0, 0, 0, 0, scalar_igr_sc25_v3_dt}, rank2_resources);
+  passed = Check(
+      AdvanceCommits(rank2_contract0, scalar_igr_sc25_v3_checkpoint_step,
+                     scalar_igr_sc25_v3_dt) &&
+          AdvanceCommits(rank2_contract1,
+                         scalar_igr_sc25_v3_checkpoint_step,
+                         scalar_igr_sc25_v3_dt),
+      "scalar_rank2_contracts_reach_checkpoint_step") && passed;
+  const std::array<ScalarRank2ContractView, 2> rank2_contracts{{
+      {0, &rank2_contract0}, {1, &rank2_contract1}}};
+  const auto rank2_capture = CaptureCheckpointV1(
+      rank2_contracts.data(), rank2_contracts.size(), *rank2_writer,
+      runtime);
+  std::vector<std::uint8_t> rank2_encoded;
+  const auto rank2_views = rank2_fixture.Views();
+  passed = Check(
+      rank2_capture &&
+          EncodeCheckpointV1(*rank2_capture, rank2_views.data(),
+                             rank2_views.size(), rank2_encoded) ==
+              CheckpointCodecStatus::ok,
+      "scalar_rank2_7_5_checkpoint_encodes") && passed;
+  std::array<State, 2> rank2_interior{{State(896, -1.0), State(896, -1.0)}};
+  std::array<State, 2> rank2_trace{{State(720, -1.0), State(560, -1.0)}};
+  std::array<RankStateBufferV1, 2> rank2_buffers{{
+      {0,
+       {rank2_interior[0].data(), rank2_interior[0].size(),
+        rank2_interior[0].size(),
+        scalar_igr_interior_component_count_v1, 128,
+        CoefficientOrderingV1::component_major},
+       {rank2_trace[0].data(), rank2_trace[0].size(),
+        rank2_trace[0].size(),
+        scalar_igr_trace_component_count_v1, 144,
+        CoefficientOrderingV1::component_major}},
+      {1,
+       {rank2_interior[1].data(), rank2_interior[1].size(),
+        rank2_interior[1].size(),
+        scalar_igr_interior_component_count_v1, 128,
+        CoefficientOrderingV1::component_major},
+       {rank2_trace[1].data(), rank2_trace[1].size(),
+        rank2_trace[1].size(),
+        scalar_igr_trace_component_count_v1, 112,
+        CoefficientOrderingV1::component_major}}}};
+  DecodedCheckpointMetadataV1 rank2_metadata{};
+  passed = Check(
+      DecodeCheckpointV1({rank2_encoded.data(), rank2_encoded.size()},
+                         *rank2_reader, rank2_resources, runtime,
+                         rank2_buffers.data(), rank2_buffers.size(),
+                         rank2_metadata) == CheckpointCodecStatus::ok &&
+          rank2_interior == rank2_fixture.interior &&
+          rank2_trace == rank2_fixture.trace &&
+          rank2_metadata.aggregate_interior_coefficients == 1792 &&
+          rank2_metadata.aggregate_true_trace_coefficients == 1280,
+      "scalar_rank2_7_5_checkpoint_round_trip") && passed;
+
+  std::vector<std::uint8_t> mismatched_rank_manifest = rank2_encoded;
+  const LayoutOffsets rank2_layout = Locate(mismatched_rank_manifest);
+  WriteU32(mismatched_rank_manifest, rank2_layout.manifest_rank_count, 1);
+  passed = Check(Seal(mismatched_rank_manifest),
+                 "scalar_rank2_rank_mismatch_fixture_reseals") && passed;
+  const auto rank2_interior_before = rank2_interior;
+  const auto rank2_trace_before = rank2_trace;
+  const DecodedCheckpointMetadataV1 rank2_metadata_before = rank2_metadata;
+  passed = Check(
+               DecodeCheckpointV1(
+                   {mismatched_rank_manifest.data(),
+                    mismatched_rank_manifest.size()},
+                   *rank2_reader, rank2_resources, runtime,
+                   rank2_buffers.data(), rank2_buffers.size(),
+                   rank2_metadata) == CheckpointCodecStatus::rank_tuple_mismatch &&
+                   rank2_interior == rank2_interior_before &&
+                   rank2_trace == rank2_trace_before &&
+                   SameMetadata(rank2_metadata, rank2_metadata_before),
+               "scalar_rank2_manifest_rank_mismatch_is_failure_atomic") &&
+      passed;
+
+  return passed;
+}
+
+bool CheckScalarIgrSemanticInteriorLayout()
+{
+  constexpr std::uint64_t elements = 3;
+  constexpr std::uint64_t nodes = 4;
+  constexpr std::uint64_t dofs = elements * nodes;
+  State blocked(7 * dofs, -1.0);
+  for (std::uint64_t element = 0; element < elements; ++element)
+  {
+    for (std::uint64_t node = 0; node < nodes; ++node)
+    {
+      for (std::uint64_t component = 0; component < 4; ++component)
+        blocked[element * 4 * nodes + component * nodes + node] =
+            100000.0 + 100.0 * element + 10.0 * component + node;
+      blocked[4 * dofs + element * nodes + node] =
+          200000.0 + 100.0 * element + node;
+      for (std::uint64_t component = 0; component < 2; ++component)
+        blocked[5 * dofs + element * 2 * nodes + component * nodes + node] =
+            300000.0 + 100.0 * element + 10.0 * component + node;
+    }
+  }
+
+  State component_major;
+  bool passed = Check(
+      dg::hdg::runtime::app::detail::ScalarIgrFieldBlocksToComponentMajorV1(
+          blocked, nodes, component_major) &&
+          component_major.size() == blocked.size(),
+      "scalar_igr_field_blocks_transpose_accepts_exact_shape");
+  for (std::uint64_t component = 0; component < 7; ++component)
+    for (std::uint64_t element = 0; element < elements; ++element)
+      for (std::uint64_t node = 0; node < nodes; ++node)
+      {
+        const double expected = component < 4
+            ? 100000.0 + 100.0 * element + 10.0 * component + node
+            : component == 4
+                ? 200000.0 + 100.0 * element + node
+                : 300000.0 + 100.0 * element +
+                      10.0 * (component - 5) + node;
+        passed = Check(
+            component_major[component * dofs + element * nodes + node] ==
+                expected,
+            "scalar_igr_true_component_slab_semantics") && passed;
+      }
+
+  State restored;
+  passed = Check(
+      dg::hdg::runtime::app::detail::ScalarIgrComponentMajorToFieldBlocksV1(
+          component_major, nodes, restored) && restored == blocked,
+      "scalar_igr_component_major_inverse_is_exact") && passed;
+
+  State swapped = component_major;
+  for (std::uint64_t index = 0; index < dofs; ++index)
+    std::swap(swapped[index], swapped[dofs + index]);
+  State swapped_restored;
+  passed = Check(
+      dg::hdg::runtime::app::detail::ScalarIgrComponentMajorToFieldBlocksV1(
+          swapped, nodes, swapped_restored) && swapped_restored != blocked &&
+          swapped_restored[0] == blocked[nodes] &&
+          swapped_restored[nodes] == blocked[0],
+      "scalar_igr_component_swap_is_observable") && passed;
+
+  const State sentinel{71.0, 72.0};
+  State rejected = sentinel;
+  State malformed = blocked;
+  malformed.pop_back();
+  passed = Check(
+      !dg::hdg::runtime::app::detail::
+          ScalarIgrFieldBlocksToComponentMajorV1(
+          malformed, nodes, rejected) && rejected == sentinel &&
+      !dg::hdg::runtime::app::detail::
+          ScalarIgrFieldBlocksToComponentMajorV1(
+          blocked, nodes + 1, rejected) && rejected == sentinel,
+      "scalar_igr_layout_boundaries_reject_atomically") && passed;
   return passed;
 }
 
@@ -2337,6 +2815,8 @@ int main()
   passed = CheckExactScenarioExtents() && passed;
   passed = CheckLiveCaptureAndRepeatableEncode() && passed;
   passed = CheckRank2CaptureAndAllRankEvidence() && passed;
+  passed = CheckScalarIgrSemanticInteriorLayout() && passed;
+  passed = CheckScalarIgrCheckpointSchemaRoundTrip() && passed;
   passed = CheckNonEvidenceSplitRoundTrip() && passed;
   passed = CheckFunctionalSplitRoundTrip() && passed;
   passed = CheckGoldenRoundTrip() && passed;

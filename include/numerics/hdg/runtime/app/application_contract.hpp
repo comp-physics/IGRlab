@@ -49,6 +49,37 @@ inline constexpr std::string_view
     smooth_periodic_euler_v1_functional_checkpoint_id =
         "checkpoint.hdg.euler.smooth-periodic.functional.step-10.v1";
 
+inline constexpr std::string_view scalar_igr_sc25_v3_card_id =
+    scalar_igr_persistent_card_id;
+inline constexpr std::string_view scalar_igr_sc25_v3_case_id =
+    scalar_igr_persistent_case_id;
+inline constexpr std::string_view scalar_igr_sc25_v3_scenario_id =
+    "W8B-SC25-N8-K1-20STEP-v1";
+inline constexpr std::string_view scalar_igr_sc25_v3_source_id =
+    "source.sc25.periodic.smooth.v3";
+inline constexpr std::string_view scalar_igr_sc25_v3_flux_id =
+    "flux.hdg.igr.traced-scalar.sc25.v3";
+inline constexpr std::string_view scalar_igr_sc25_v3_layout_id =
+    "mfem.l2.byNODES.U4.Sigma1.z2.separate.v3";
+inline constexpr std::string_view scalar_igr_sc25_v3_checkpoint_id =
+    "checkpoint.hdg.igr.sc25.periodic.step-10.v3";
+inline constexpr int scalar_igr_sc25_v3_polynomial_order = 1;
+inline constexpr std::uint32_t scalar_igr_sc25_v3_mesh_n = 8;
+inline constexpr int scalar_igr_sc25_v3_q_a = 12;
+inline constexpr int scalar_igr_sc25_v3_q_e = 14;
+inline constexpr int scalar_igr_sc25_v3_q_e4 = 16;
+inline constexpr int scalar_igr_sc25_v3_q_o = 18;
+inline constexpr double scalar_igr_sc25_v3_dt = 1.0 / 4096.0;
+inline constexpr std::uint64_t scalar_igr_sc25_v3_steps = 20;
+inline constexpr double scalar_igr_sc25_v3_final_time = 20.0 / 4096.0;
+inline constexpr std::array<std::uint64_t, 3>
+    scalar_igr_sc25_v3_output_steps{{0, 10, 20}};
+inline constexpr std::uint64_t scalar_igr_sc25_v3_checkpoint_step = 10;
+inline constexpr std::uint64_t scalar_igr_sc25_v3_failure_target_step = 7;
+inline constexpr std::uint32_t scalar_igr_sc25_v3_retry_limit = 1;
+inline constexpr std::uint64_t scalar_igr_sc25_v3_seed =
+    UINT64_C(0x5738425343323553);
+
 inline constexpr double smooth_periodic_euler_v1_gamma = 1.4;
 inline constexpr double smooth_periodic_euler_v1_tau = 2.5;
 inline constexpr double smooth_periodic_euler_v1_dt = 0.05;
@@ -102,6 +133,7 @@ enum class ApplicationScenarioV1 : std::uint8_t
 {
   smoke = 0,
   functional = 1,
+  scalar_igr_sc25_v3 = 2,
   unknown = 255
 };
 
@@ -388,6 +420,10 @@ public:
 
   ApplicationScenarioV1 scenario() const noexcept { return scenario_; }
   ApplicationBackend backend() const noexcept { return backend_; }
+  bool scalar_igr() const noexcept
+  {
+    return scenario_ == ApplicationScenarioV1::scalar_igr_sc25_v3;
+  }
   int device_id() const noexcept { return device_id_; }
   const RuntimeTupleDescriptor& tuple() const noexcept { return tuple_; }
   const StableIdentity& card_id() const noexcept { return card_id_; }
