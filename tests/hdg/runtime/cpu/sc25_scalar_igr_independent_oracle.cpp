@@ -2760,10 +2760,11 @@ bool RunIndependentC1Oracle(
     basis = 0.0;
     basis[column] = 1.0;
     assembled_matrix->Mult(basis, action);
+    const double* action_values = action.HostRead();
     for (int row = 0; row < c1_true; ++row)
     {
       production_global_schur[static_cast<std::size_t>(row) * c1_true +
-                              column] = action[row];
+                              column] = action_values[row];
     }
   }
   std::vector<double> production_global_rhs(
