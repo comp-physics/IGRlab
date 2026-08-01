@@ -4877,4 +4877,2092 @@ bool RunIndependentTrajectoryOracle(
   return evidence.failures.empty();
 }
 
+namespace
+{
+
+void Rank2Require(const bool condition, const std::string& message,
+                  IndependentRank2TrajectoryEvidence& evidence)
+{
+  if (!condition) { evidence.failures.push_back(message); }
+}
+
+int ElementAtCenter(mfem::ParMesh& mesh, const double x,
+                    const double y)
+{
+  const mfem::IntegrationPoint& center =
+      mfem::Geometries.GetCenter(mfem::Geometry::SQUARE);
+  mfem::Vector point(sc25::dimension);
+  for (int element = 0; element < mesh.GetNE(); ++element)
+  {
+    mfem::ElementTransformation* transformation =
+        mesh.GetElementTransformation(element);
+    if (!transformation) { continue; }
+    transformation->Transform(center, point);
+    if (std::abs(point[0] - x) <= 1.0e-13 &&
+        std::abs(point[1] - y) <= 1.0e-13)
+    {
+      return element;
+    }
+  }
+  return -1;
+}
+
+struct FaceSample final
+{
+  std::int64_t x = 0;
+  std::int64_t y = 0;
+  std::array<double, sc25::trace_components> values{};
+};
+
+std::int64_t PeriodicCoordinateKey(double value)
+{
+  value -= std::floor(value);
+  if (std::abs(value - 1.0) <= 1.0e-12 ||
+      std::abs(value) <= 1.0e-12)
+  {
+    value = 0.0;
+  }
+  return static_cast<std::int64_t>(std::llround(value * 1.0e12));
+}
+
+bool BuildFaceSamples(
+    sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    const mfem::Vector& true_values, std::vector<FaceSample>& samples)
+{
+  if (!foundation.SetTraceCarrierFromTrueDofs(true_values)) { return false; }
+  mfem::ParMesh* mesh = const_cast<mfem::ParMesh*>(foundation.mesh());
+  const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
+  const sc25::FieldOwnershipView fields = foundation.fields();
+  const mfem::ParFiniteElementSpace* space = spaces.trace_carrier.address;
+  const mfem::ParGridFunction* field = fields.trace_carrier;
+  if (!mesh || !space || !field) { return false; }
+  samples.clear();
+  samples.reserve(static_cast<std::size_t>(2 * mesh->GetNumFaces()));
+  constexpr std::array<double, 2> points = {
+      0.21132486540518711775, 0.78867513459481288225};
+  for (int face = 0; face < mesh->GetNumFaces(); ++face)
+  {
+    const mfem::FiniteElement* finite_element = space->GetFaceElement(face);
+    mfem::ElementTransformation* transformation =
+        mesh->GetFaceTransformation(face);
+    mfem::Array<int> signed_vdofs;
+    space->GetFaceVDofs(face, signed_vdofs);
+    if (!finite_element || !transformation || finite_element->GetDof() != 2 ||
+        signed_vdofs.Size() != 2 * sc25::trace_components)
+    {
+      return false;
+    }
+    for (const double coordinate : points)
+    {
+      mfem::IntegrationPoint ip;
+      ip.Set(coordinate, 0.0, 0.0, 1.0);
+      mfem::Vector shape(2), physical(sc25::dimension);
+      finite_element->CalcShape(ip, shape);
+      transformation->Transform(ip, physical);
+      FaceSample sample;
+      sample.x = PeriodicCoordinateKey(physical[0]);
+      sample.y = PeriodicCoordinateKey(physical[1]);
+      for (int component = 0; component < sc25::trace_components;
+           ++component)
+      {
+        for (int scalar = 0; scalar < 2; ++scalar)
+        {
+          int decoded = -1;
+          int sign = 0;
+          if (!DecodeSignedDof(signed_vdofs[component * 2 + scalar],
+                               decoded, sign) ||
+              decoded < 0 || decoded >= field->Size())
+          {
+            return false;
+          }
+          sample.values[static_cast<std::size_t>(component)] +=
+              shape[scalar] * sign * (*field)[decoded];
+        }
+      }
+      samples.push_back(sample);
+    }
+  }
+  return true;
+}
+
+const FaceSample* FindFaceSample(const std::vector<FaceSample>& samples,
+                                 const FaceSample& target)
+{
+  const auto iterator = std::find_if(
+      samples.begin(), samples.end(), [&target](const FaceSample& candidate)
+      { return candidate.x == target.x && candidate.y == target.y; });
+  return iterator == samples.end() ? nullptr : &*iterator;
+}
+
+double Rank2PeerStateRelativeError(
+    sc25::PersistentSc25ScalarIgrCpuFoundation& rank2,
+    sc25::PersistentSc25ScalarIgrCpuFoundation& rank1_peer,
+    const sc25::PersistentRank2TrajectoryState& local_state,
+    const TrajectoryState& peer_state,
+    IndependentRank2TrajectoryEvidence& evidence,
+    const std::string_view label)
+{
+  mfem::ParMesh* local_mesh = const_cast<mfem::ParMesh*>(rank2.mesh());
+  mfem::ParMesh* peer_mesh = const_cast<mfem::ParMesh*>(rank1_peer.mesh());
+  if (!local_mesh || !peer_mesh)
+  {
+    Rank2Require(false, std::string(label) + " mesh availability", evidence);
+    return std::numeric_limits<double>::infinity();
+  }
+  const mfem::IntegrationPoint& center =
+      mfem::Geometries.GetCenter(mfem::Geometry::SQUARE);
+  mfem::Vector physical(sc25::dimension);
+  double local_error = 0.0;
+  for (int local_element = 0; local_element < local_mesh->GetNE();
+       ++local_element)
+  {
+    mfem::ElementTransformation* transformation =
+        local_mesh->GetElementTransformation(local_element);
+    if (!transformation)
+    {
+      Rank2Require(false, std::string(label) + " element transformation",
+                   evidence);
+      continue;
+    }
+    transformation->Transform(center, physical);
+    const int peer_element =
+        ElementAtCenter(*peer_mesh, physical[0], physical[1]);
+    if (peer_element < 0)
+    {
+      Rank2Require(false, std::string(label) + " geometric element match",
+                   evidence);
+      continue;
+    }
+    const std::size_t local_u = static_cast<std::size_t>(local_element) * 16;
+    const std::size_t peer_u = static_cast<std::size_t>(peer_element) * 16;
+    const std::size_t local_sigma =
+        static_cast<std::size_t>(local_element) * 4;
+    const std::size_t peer_sigma =
+        static_cast<std::size_t>(peer_element) * 4;
+    const std::size_t local_z = static_cast<std::size_t>(local_element) * 8;
+    const std::size_t peer_z = static_cast<std::size_t>(peer_element) * 8;
+    local_error = std::max(
+        local_error,
+        RelativeL2(local_state.u.data() + local_u,
+                   peer_state.u.data() + peer_u, 16));
+    local_error = std::max(
+        local_error,
+        RelativeL2(local_state.sigma.data() + local_sigma,
+                   peer_state.sigma.data() + peer_sigma, 4));
+    local_error = std::max(
+        local_error,
+        RelativeL2(local_state.z.data() + local_z,
+                   peer_state.z.data() + peer_z, 8));
+  }
+
+  mfem::Vector local_true(
+      static_cast<int>(local_state.uhat.size() +
+                       local_state.sigmahat.size()));
+  std::copy(local_state.uhat.begin(), local_state.uhat.end(),
+            local_true.HostWrite());
+  std::copy(local_state.sigmahat.begin(), local_state.sigmahat.end(),
+            local_true.HostWrite() + local_state.uhat.size());
+  mfem::Vector peer_true(sc25::persistent_true_trace_unknowns);
+  std::copy(peer_state.uhat.begin(), peer_state.uhat.end(),
+            peer_true.HostWrite());
+  std::copy(peer_state.sigmahat.begin(), peer_state.sigmahat.end(),
+            peer_true.HostWrite() + peer_state.uhat.size());
+  std::vector<FaceSample> local_samples, peer_samples;
+  if (!BuildFaceSamples(rank2, local_true, local_samples) ||
+      !BuildFaceSamples(rank1_peer, peer_true, peer_samples))
+  {
+    Rank2Require(false, std::string(label) + " trace sampling", evidence);
+    local_error = std::numeric_limits<double>::infinity();
+  }
+  else
+  {
+    for (const FaceSample& sample : local_samples)
+    {
+      const FaceSample* peer = FindFaceSample(peer_samples, sample);
+      if (!peer)
+      {
+        Rank2Require(false, std::string(label) + " physical face match",
+                     evidence);
+        local_error = std::numeric_limits<double>::infinity();
+        continue;
+      }
+      local_error = std::max(
+          local_error,
+          RelativeL2(sample.values.data(), peer->values.data(),
+                     sc25::trace_components));
+    }
+  }
+  double global_error = local_error;
+  if (MPI_Allreduce(&local_error, &global_error, 1, MPI_DOUBLE, MPI_MAX,
+                    MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    Rank2Require(false, std::string(label) + " error reduction", evidence);
+    return std::numeric_limits<double>::infinity();
+  }
+  return global_error;
+}
+
+double Rank2RelativeScalar(const double left, const double right) noexcept
+{
+  return std::abs(left - right) /
+      std::max({1.0, std::abs(left), std::abs(right)});
+}
+
+double PeerStateNorm(const TrajectoryState& state,
+                     const bool trace_only) noexcept
+{
+  long double square = 0.0L;
+  const auto add = [&square](const auto& values)
+  {
+    for (const double value : values)
+    {
+      square += static_cast<long double>(value) * value;
+    }
+  };
+  if (!trace_only)
+  {
+    add(state.u);
+    add(state.sigma);
+    add(state.z);
+  }
+  add(state.uhat);
+  add(state.sigmahat);
+  return std::sqrt(static_cast<double>(square));
+}
+
+bool IndependentlyCheckRank2Restriction(
+    const sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    IndependentRank2TrajectoryEvidence& evidence)
+{
+  const mfem::ParMesh* mesh = foundation.mesh();
+  const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
+  const mfem::ParFiniteElementSpace* carrier = spaces.trace_carrier.address;
+  const mfem::DG_Interface_FECollection* collection =
+      foundation.trace_collection();
+  const auto& production = foundation.element_topology();
+  int rank = -1;
+  int ranks = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  if (!mesh || !carrier || !collection ||
+      production.size() != static_cast<std::size_t>(mesh->GetNE()) ||
+      ranks != 2)
+  {
+    return false;
+  }
+
+  const int local_true_size = carrier->GetTrueVSize();
+  std::array<int, 2> true_sizes{};
+  if (MPI_Allgather(&local_true_size, 1, MPI_INT, true_sizes.data(), 1,
+                    MPI_INT, MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  const std::array<dg::hdg::GlobalIndex, 3> true_offsets = {
+      0, static_cast<dg::hdg::GlobalIndex>(true_sizes[0]),
+      static_cast<dg::hdg::GlobalIndex>(true_sizes[0] + true_sizes[1])};
+  if (true_offsets[2] != sc25::persistent_rank2_global_true_trace_unknowns)
+  {
+    return false;
+  }
+
+  std::vector<int> local_face_ids;
+  local_face_ids.reserve(static_cast<std::size_t>(mesh->GetNumFaces()));
+  std::vector<int> local_face_geometric_owner(
+      static_cast<std::size_t>(mesh->GetNumFaces()), -1);
+  int independently_owned_faces = 0;
+  const mfem::IntegrationPoint& face_center =
+      mfem::Geometries.GetCenter(mfem::Geometry::SEGMENT);
+  mfem::Vector physical(sc25::dimension);
+  mfem::ParMesh* mutable_mesh = const_cast<mfem::ParMesh*>(mesh);
+  for (int face = 0; face < mesh->GetNumFaces(); ++face)
+  {
+    mfem::ElementTransformation* transformation =
+        mutable_mesh->GetFaceTransformation(face);
+    if (!transformation) { return false; }
+    transformation->Transform(face_center, physical);
+    double x = physical[0] - std::floor(physical[0]);
+    double y = physical[1] - std::floor(physical[1]);
+    if (std::abs(x - 1.0) <= 1.0e-12) { x = 0.0; }
+    if (std::abs(y - 1.0) <= 1.0e-12) { y = 0.0; }
+    const double scaled_x = 8.0 * x;
+    const double scaled_y = 8.0 * y;
+    const bool vertical =
+        std::abs(scaled_x - std::round(scaled_x)) <= 1.0e-11;
+    const bool horizontal =
+        std::abs(scaled_y - std::round(scaled_y)) <= 1.0e-11;
+    if (vertical == horizontal) { return false; }
+    int face_id = -1;
+    int geometric_owner = -1;
+    if (vertical)
+    {
+      const int line = static_cast<int>(std::llround(scaled_x)) % 8;
+      const int cell = static_cast<int>(std::floor(scaled_y));
+      const int left_cell = (line + 7) % 8;
+      const int right_cell = line;
+      geometric_owner = std::min(left_cell < 4 ? 0 : 1,
+                                 right_cell < 4 ? 0 : 1);
+      face_id = line * 8 + cell;
+    }
+    else
+    {
+      const int line = static_cast<int>(std::llround(scaled_y)) % 8;
+      const int cell = static_cast<int>(std::floor(scaled_x));
+      geometric_owner = cell < 4 ? 0 : 1;
+      face_id = 64 + line * 8 + cell;
+    }
+    if (face_id < 0 || face_id >= 128 || geometric_owner < 0)
+    {
+      return false;
+    }
+    local_face_ids.push_back(face_id);
+    local_face_geometric_owner[static_cast<std::size_t>(face)] =
+        geometric_owner;
+    independently_owned_faces += geometric_owner == rank ? 1 : 0;
+    mfem::Array<int> face_vdofs;
+    carrier->GetFaceVDofs(face, face_vdofs);
+    if (face_vdofs.Size() != 2 * sc25::trace_components)
+    {
+      return false;
+    }
+    for (int face_row = 0; face_row < face_vdofs.Size(); ++face_row)
+    {
+      int local_vdof = -1;
+      int carrier_sign = 0;
+      if (!DecodeSignedDof(face_vdofs[face_row], local_vdof,
+                           carrier_sign) ||
+          local_vdof < 0 || local_vdof >= carrier->GetVSize())
+      {
+        return false;
+      }
+      const dg::hdg::GlobalIndex global_true_dof =
+          static_cast<dg::hdg::GlobalIndex>(
+              carrier->GetGlobalTDofNumber(local_vdof));
+      const int tdof_owner = global_true_dof >= true_offsets[0] &&
+              global_true_dof < true_offsets[1] ? 0 :
+          global_true_dof >= true_offsets[1] &&
+              global_true_dof < true_offsets[2] ? 1 : -1;
+      Rank2Require(
+          tdof_owner == geometric_owner,
+          "rank2 physical face " + std::to_string(face_id) +
+              " carrier row " + std::to_string(face_row) +
+              " global TDof owner binding geometric=" +
+              std::to_string(geometric_owner) + " mfem=" +
+              std::to_string(tdof_owner), evidence);
+      ++evidence.checked_owner_bound_face_dofs;
+    }
+  }
+  std::sort(local_face_ids.begin(), local_face_ids.end());
+  if (local_face_ids.size() != 72 ||
+      std::adjacent_find(local_face_ids.begin(), local_face_ids.end()) !=
+          local_face_ids.end())
+  {
+    return false;
+  }
+  std::array<int, 144> gathered_face_ids{};
+  if (MPI_Allgather(local_face_ids.data(), 72, MPI_INT,
+                    gathered_face_ids.data(), 72, MPI_INT,
+                    MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  std::array<int, 128> face_multiplicity{};
+  for (const int face_id : gathered_face_ids)
+  {
+    if (face_id < 0 || face_id >= 128) { return false; }
+    ++face_multiplicity[static_cast<std::size_t>(face_id)];
+  }
+  const int global_faces = static_cast<int>(std::count_if(
+      face_multiplicity.begin(), face_multiplicity.end(),
+      [](const int count) { return count != 0; }));
+  const int shared_faces = static_cast<int>(std::count(
+      face_multiplicity.begin(), face_multiplicity.end(), 2));
+  Rank2Require(global_faces == 128 && shared_faces == 16 &&
+                   std::all_of(face_multiplicity.begin(),
+                               face_multiplicity.end(),
+                               [](const int count)
+                               { return count == 1 || count == 2; }),
+               "rank2 independent periodic face census", evidence);
+  evidence.independently_owned_faces = independently_owned_faces;
+  evidence.independently_owned_true_dofs = independently_owned_faces * 10;
+  evidence.independently_global_faces = global_faces;
+
+  std::vector<double> global_x(
+      sc25::persistent_rank2_global_true_trace_unknowns);
+  std::vector<long double> local_pty(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0L);
+  std::vector<long double> global_pty(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0L);
+  std::vector<int> local_coverage(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0);
+  std::vector<int> global_coverage(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0);
+  for (std::size_t entry = 0; entry < global_x.size(); ++entry)
+  {
+    global_x[entry] = 0.125 + static_cast<double>(entry) / 2048.0;
+  }
+  long double local_px_dot_y = 0.0L;
+  for (int element = 0; element < mesh->GetNE(); ++element)
+  {
+    mfem::Array<int> faces, orientations;
+    mesh->GetElementEdges(element, faces, orientations);
+    if (faces.Size() != sc25::faces_per_quadrilateral ||
+        orientations.Size() != faces.Size())
+    {
+      return false;
+    }
+    const sc25::ElementTopology& actual =
+        production[static_cast<std::size_t>(element)];
+    for (int local_face = 0; local_face < faces.Size(); ++local_face)
+    {
+      mfem::Array<int> face_vdofs;
+      carrier->GetFaceVDofs(faces[local_face], face_vdofs);
+      const int* permutation = collection->DofOrderForOrientation(
+          mfem::Geometry::SEGMENT, orientations[local_face]);
+      if (!permutation ||
+          face_vdofs.Size() != 2 * sc25::trace_components)
+      {
+        return false;
+      }
+      for (int component = 0; component < sc25::trace_components;
+           ++component)
+        for (int oriented = 0; oriented < 2; ++oriented)
+        {
+          int canonical = -1;
+          int orientation_sign = 0;
+          int local_vdof = -1;
+          int carrier_sign = 0;
+          if (!DecodeSignedDof(permutation[oriented], canonical,
+                               orientation_sign) ||
+              !DecodeSignedDof(face_vdofs[component * 2 + canonical],
+                               local_vdof, carrier_sign) ||
+              local_vdof < 0 ||
+              local_vdof >= carrier->GetVSize())
+          {
+            return false;
+          }
+          const int sign = orientation_sign * carrier_sign;
+          const int row = component * 8 + local_face * 2 + oriented;
+          const int signed_vdof = sign < 0 ? -1 - local_vdof : local_vdof;
+          const dg::hdg::GlobalIndex global_true_dof =
+              static_cast<dg::hdg::GlobalIndex>(
+                  carrier->GetGlobalTDofNumber(local_vdof));
+          if (global_true_dof < 0 || global_true_dof >= true_offsets[2])
+          {
+            return false;
+          }
+          const dg::hdg::RankIndex owner_rank =
+              global_true_dof < true_offsets[1] ? 0 : 1;
+          const int mfem_local_true_dof =
+              carrier->GetLocalTDofNumber(local_vdof);
+          const dg::hdg::LocalIndex local_true_dof = owner_rank == rank ?
+              static_cast<dg::hdg::LocalIndex>(mfem_local_true_dof) :
+              dg::hdg::invalid_local_index;
+          if ((owner_rank == rank &&
+               (mfem_local_true_dof < 0 ||
+                global_true_dof != true_offsets[rank] +
+                    mfem_local_true_dof)) ||
+              (owner_rank != rank && mfem_local_true_dof >= 0))
+          {
+            return false;
+          }
+          const sc25::TraceRestrictionEntry& item =
+              actual.restriction[static_cast<std::size_t>(row)];
+          Rank2Require(
+              item.element == element && item.local_row == row &&
+                  item.local_face == local_face &&
+                  item.component == component &&
+                  item.oriented_face_dof == oriented &&
+                  item.canonical_face_dof == canonical &&
+                  item.signed_carrier_vdof == signed_vdof &&
+                  item.decoded_carrier_vdof == local_vdof &&
+                  item.sign == sign &&
+                  item.global_true_dof == global_true_dof &&
+                  item.local_true_dof == local_true_dof &&
+                  item.owner_rank == owner_rank,
+              "rank2 independent signed restriction row", evidence);
+          const long double y =
+              0.25L + static_cast<long double>(rank * 1280 +
+                                               element * 40 + row) /
+                  4096.0L;
+          const long double px = static_cast<long double>(sign) *
+              global_x[static_cast<std::size_t>(global_true_dof)];
+          local_px_dot_y += px * y;
+          local_pty[static_cast<std::size_t>(global_true_dof)] +=
+              static_cast<long double>(sign) * y;
+          ++local_coverage[static_cast<std::size_t>(global_true_dof)];
+          ++evidence.checked_restriction_rows;
+        }
+    }
+  }
+  long double global_px_dot_y = 0.0L;
+  if (MPI_Allreduce(&local_px_dot_y, &global_px_dot_y, 1, MPI_LONG_DOUBLE,
+                    MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Allreduce(local_pty.data(), global_pty.data(),
+                    static_cast<int>(global_pty.size()), MPI_LONG_DOUBLE,
+                    MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Allreduce(local_coverage.data(), global_coverage.data(),
+                    static_cast<int>(global_coverage.size()), MPI_INT,
+                    MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  long double global_x_dot_pty = 0.0L;
+  for (std::size_t entry = 0; entry < global_pty.size(); ++entry)
+  {
+    global_x_dot_pty +=
+        static_cast<long double>(global_x[entry]) * global_pty[entry];
+  }
+  const long double adjoint_scale = std::max(
+      1.0L, std::max(std::abs(global_px_dot_y),
+                     std::abs(global_x_dot_pty)));
+  evidence.p_pt_adjoint_relative_error = static_cast<double>(
+      std::abs(global_px_dot_y - global_x_dot_pty) / adjoint_scale);
+  evidence.independently_covered_true_dofs = static_cast<int>(std::count(
+      global_coverage.begin(), global_coverage.end(), 2));
+  Rank2Require(evidence.p_pt_adjoint_relative_error <= 5.0e-15,
+               "rank2 independent P/Pt adjoint action", evidence);
+  Rank2Require(evidence.independently_covered_true_dofs == 1280 &&
+                   std::all_of(global_coverage.begin(), global_coverage.end(),
+                               [](const int count) { return count == 2; }),
+               "rank2 independent true-DOF restriction coverage", evidence);
+  return true;
+}
+
+struct Rank2IndependentContext final
+{
+  std::vector<IndependentElementRestriction> restriction;
+  std::array<int, 2> true_sizes{};
+  std::array<int, 2> true_offsets{};
+};
+
+struct Rank2IndependentAssembly final
+{
+  std::vector<sc25::ElementLinearization> elements;
+  std::vector<double> residual;
+};
+
+bool BuildRank2IndependentContext(
+    const sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    Rank2IndependentContext& context)
+{
+  context = {};
+  const mfem::ParMesh* mesh = foundation.mesh();
+  const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
+  const mfem::ParFiniteElementSpace* carrier =
+      spaces.trace_carrier.address;
+  const mfem::DG_Interface_FECollection* collection =
+      foundation.trace_collection();
+  if (!mesh || !carrier || !collection || mesh->GetNE() != 32)
+  {
+    return false;
+  }
+  const int local_true = carrier->GetTrueVSize();
+  if (MPI_Allgather(&local_true, 1, MPI_INT, context.true_sizes.data(), 1,
+                    MPI_INT, MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  context.true_offsets = {{0, context.true_sizes[0]}};
+  if (context.true_sizes[0] + context.true_sizes[1] !=
+      sc25::persistent_rank2_global_true_trace_unknowns)
+  {
+    return false;
+  }
+  context.restriction.resize(static_cast<std::size_t>(mesh->GetNE()));
+  for (int element = 0; element < mesh->GetNE(); ++element)
+  {
+    IndependentElementRestriction& output =
+        context.restriction[static_cast<std::size_t>(element)];
+    output = {};
+    output.element = element;
+    output.scalar_volume_dofs = c1_ns;
+    output.scalar_face_dofs = c1_face_nodes;
+    output.local_interior_unknowns = c1_ni;
+    output.local_trace_unknowns = c1_nt;
+    mfem::Array<int> faces, orientations;
+    mesh->GetElementEdges(element, faces, orientations);
+    if (faces.Size() != c1_faces_per_element ||
+        orientations.Size() != faces.Size())
+    {
+      return false;
+    }
+    output.faces.assign(faces.begin(), faces.end());
+    output.orientations.assign(orientations.begin(), orientations.end());
+    output.entries.resize(c1_nt);
+    for (int local_face = 0; local_face < faces.Size(); ++local_face)
+    {
+      mfem::Array<int> face_vdofs;
+      carrier->GetFaceVDofs(faces[local_face], face_vdofs);
+      const int* permutation = collection->DofOrderForOrientation(
+          mfem::Geometry::SEGMENT, orientations[local_face]);
+      if (!permutation ||
+          face_vdofs.Size() != c1_face_nodes * c1_trace_components)
+      {
+        return false;
+      }
+      for (int component = 0; component < c1_trace_components; ++component)
+        for (int oriented = 0; oriented < c1_face_nodes; ++oriented)
+        {
+          int canonical = -1;
+          int orientation_sign = 0;
+          int carrier_vdof = -1;
+          int carrier_sign = 0;
+          if (!DecodeSignedDof(permutation[oriented], canonical,
+                               orientation_sign) ||
+              !DecodeSignedDof(
+                  face_vdofs[component * c1_face_nodes + canonical],
+                  carrier_vdof, carrier_sign))
+          {
+            return false;
+          }
+          const auto global_true =
+              carrier->GetGlobalTDofNumber(carrier_vdof);
+          const int owner_rank = global_true < context.true_sizes[0] ? 0 : 1;
+          const int local_tdof = carrier->GetLocalTDofNumber(carrier_vdof);
+          const int sign = orientation_sign * carrier_sign;
+          const int row = component * c1_nf +
+              local_face * c1_face_nodes + oriented;
+          if (carrier_vdof < 0 || carrier_vdof >= carrier->GetVSize() ||
+              global_true < 0 ||
+              global_true >= sc25::persistent_rank2_global_true_trace_unknowns ||
+              sign == 0)
+          {
+            return false;
+          }
+          output.entries[static_cast<std::size_t>(row)] = {
+              element, row, local_face, component, oriented, canonical,
+              sign < 0 ? -1 - carrier_vdof : carrier_vdof, carrier_vdof,
+              sign, static_cast<dg::hdg::GlobalIndex>(global_true),
+              local_tdof >= 0 ?
+                  static_cast<dg::hdg::LocalIndex>(local_tdof) :
+                  dg::hdg::invalid_local_index,
+              static_cast<dg::hdg::RankIndex>(owner_rank)};
+        }
+    }
+  }
+  return true;
+}
+
+bool GatherRank2Trace(
+    const sc25::PersistentRank2TrajectoryState& state,
+    const Rank2IndependentContext& context,
+    std::vector<double>& global_trace)
+{
+  std::vector<double> local(state.uhat.size() + state.sigmahat.size());
+  std::copy(state.uhat.begin(), state.uhat.end(), local.begin());
+  std::copy(state.sigmahat.begin(), state.sigmahat.end(),
+            local.begin() + state.uhat.size());
+  global_trace.assign(sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  const std::array<int, 2> displacements = {{0, context.true_sizes[0]}};
+  int rank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  return rank >= 0 && rank < 2 &&
+      local.size() ==
+          static_cast<std::size_t>(context.true_sizes[rank]) &&
+      MPI_Allgatherv(local.data(), static_cast<int>(local.size()), MPI_DOUBLE,
+                     global_trace.data(), context.true_sizes.data(),
+                     displacements.data(), MPI_DOUBLE,
+                     MPI_COMM_WORLD) == MPI_SUCCESS;
+}
+
+void PackRank2Interior(const sc25::PersistentRank2TrajectoryState& state,
+                       const int element, std::vector<double>& local)
+{
+  local.assign(c1_ni, 0.0);
+  const std::size_t u_base = static_cast<std::size_t>(element) * 16;
+  const std::size_t sigma_base = static_cast<std::size_t>(element) * 4;
+  const std::size_t z_base = static_cast<std::size_t>(element) * 8;
+  std::copy_n(state.u.begin() + u_base, 16, local.begin());
+  std::copy_n(state.sigma.begin() + sigma_base, 4, local.begin() + 16);
+  std::copy_n(state.z.begin() + z_base, 8, local.begin() + 20);
+}
+
+bool AssembleIndependentRank2(
+    const sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    const Rank2IndependentContext& context,
+    const sc25::PersistentRank2TrajectoryState& old_state,
+    const sc25::PersistentRank2TrajectoryState& candidate,
+    Rank2IndependentAssembly& output)
+{
+  output = {};
+  mfem::ParMesh* mesh = const_cast<mfem::ParMesh*>(foundation.mesh());
+  const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
+  const mfem::DG_Interface_FECollection* collection =
+      foundation.trace_collection();
+  int rank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if (!mesh || !spaces.sigma.address || !spaces.trace_carrier.address ||
+      !collection || context.restriction.size() != 32 || rank < 0)
+  {
+    return false;
+  }
+  std::vector<double> old_trace_global, candidate_trace_global;
+  if (!GatherRank2Trace(old_state, context, old_trace_global) ||
+      !GatherRank2Trace(candidate, context, candidate_trace_global))
+  {
+    return false;
+  }
+  output.elements.resize(32);
+  output.residual.assign(
+      sc25::persistent_rank2_local_interior_unknowns +
+          context.true_sizes[static_cast<std::size_t>(rank)],
+      0.0);
+  std::vector<double> local_trace_residual(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  std::vector<double> global_trace_residual(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  for (int element = 0; element < 32; ++element)
+  {
+    const IndependentElementRestriction& map =
+        context.restriction[static_cast<std::size_t>(element)];
+    std::vector<double> old, current_values;
+    PackRank2Interior(old_state, element, old);
+    PackRank2Interior(candidate, element, current_values);
+    std::vector<double> old_trace(c1_nt), trace_values(c1_nt);
+    for (int row = 0; row < c1_nt; ++row)
+    {
+      const IndependentRestrictionEntry& entry =
+          map.entries[static_cast<std::size_t>(row)];
+      old_trace[static_cast<std::size_t>(row)] = entry.sign *
+          old_trace_global[static_cast<std::size_t>(entry.global_true_dof)];
+      trace_values[static_cast<std::size_t>(row)] = entry.sign *
+          candidate_trace_global[
+              static_cast<std::size_t>(entry.global_true_dof)];
+    }
+    std::vector<C1Dual> current(c1_ni), trace(c1_nt);
+    for (int column = 0; column < c1_ni; ++column)
+    {
+      current[static_cast<std::size_t>(column)] = C1Dual::Variable(
+          current_values[static_cast<std::size_t>(column)], column);
+    }
+    for (int column = 0; column < c1_nt; ++column)
+    {
+      trace[static_cast<std::size_t>(column)] = C1Dual::Variable(
+          trace_values[static_cast<std::size_t>(column)], c1_ni + column);
+    }
+    std::vector<C1Dual> local_residual, trace_residual;
+    if (!C1ElementResidual(
+            *mesh, *spaces.sigma.address, *spaces.trace_carrier.address,
+            *collection, map, old, old_trace, current, trace, n8_q12,
+            local_residual, trace_residual))
+    {
+      return false;
+    }
+    sc25::ElementLinearization& block =
+        output.elements[static_cast<std::size_t>(element)];
+    block.element = element;
+    block.local_interior_unknowns = c1_ni;
+    block.local_trace_unknowns = c1_nt;
+    block.a.assign(static_cast<std::size_t>(c1_ni) * c1_ni, 0.0);
+    block.b.assign(static_cast<std::size_t>(c1_ni) * c1_nt, 0.0);
+    block.c.assign(static_cast<std::size_t>(c1_nt) * c1_ni, 0.0);
+    block.d.assign(static_cast<std::size_t>(c1_nt) * c1_nt, 0.0);
+    block.local_residual.resize(c1_ni);
+    block.trace_residual.resize(c1_nt);
+    for (int row = 0; row < c1_ni; ++row)
+    {
+      block.local_residual[static_cast<std::size_t>(row)] =
+          local_residual[static_cast<std::size_t>(row)].value;
+      output.residual[static_cast<std::size_t>(element) * c1_ni + row] =
+          block.local_residual[static_cast<std::size_t>(row)];
+      for (int column = 0; column < c1_ni; ++column)
+      {
+        block.a[static_cast<std::size_t>(row) * c1_ni + column] =
+            local_residual[static_cast<std::size_t>(row)]
+                .derivative[static_cast<std::size_t>(column)];
+      }
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        block.b[static_cast<std::size_t>(row) * c1_nt + column] =
+            local_residual[static_cast<std::size_t>(row)]
+                .derivative[static_cast<std::size_t>(c1_ni + column)];
+      }
+    }
+    for (int row = 0; row < c1_nt; ++row)
+    {
+      block.trace_residual[static_cast<std::size_t>(row)] =
+          trace_residual[static_cast<std::size_t>(row)].value;
+      const IndependentRestrictionEntry& entry =
+          map.entries[static_cast<std::size_t>(row)];
+      local_trace_residual[
+          static_cast<std::size_t>(entry.global_true_dof)] +=
+          entry.sign * block.trace_residual[static_cast<std::size_t>(row)];
+      for (int column = 0; column < c1_ni; ++column)
+      {
+        block.c[static_cast<std::size_t>(row) * c1_ni + column] =
+            trace_residual[static_cast<std::size_t>(row)]
+                .derivative[static_cast<std::size_t>(column)];
+      }
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        block.d[static_cast<std::size_t>(row) * c1_nt + column] =
+            trace_residual[static_cast<std::size_t>(row)]
+                .derivative[static_cast<std::size_t>(c1_ni + column)];
+      }
+    }
+  }
+  if (MPI_Allreduce(local_trace_residual.data(), global_trace_residual.data(),
+                    static_cast<int>(global_trace_residual.size()),
+                    MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  const int offset = context.true_offsets[static_cast<std::size_t>(rank)];
+  std::copy_n(global_trace_residual.begin() + offset,
+              context.true_sizes[static_cast<std::size_t>(rank)],
+              output.residual.begin() +
+                  sc25::persistent_rank2_local_interior_unknowns);
+  return true;
+}
+
+void MakeIndependentAuxiliaryAssembly(Rank2IndependentAssembly& assembly)
+{
+  for (sc25::ElementLinearization& block : assembly.elements)
+  {
+    const auto a = block.a;
+    const auto b = block.b;
+    const auto c = block.c;
+    const auto d = block.d;
+    const auto local = block.local_residual;
+    const auto trace = block.trace_residual;
+    std::fill(block.a.begin(), block.a.end(), 0.0);
+    std::fill(block.b.begin(), block.b.end(), 0.0);
+    std::fill(block.c.begin(), block.c.end(), 0.0);
+    std::fill(block.d.begin(), block.d.end(), 0.0);
+    std::fill(block.local_residual.begin(), block.local_residual.end(), 0.0);
+    std::fill(block.trace_residual.begin(), block.trace_residual.end(), 0.0);
+    for (int row = 0; row < 16; ++row)
+    {
+      block.a[static_cast<std::size_t>(row) * c1_ni + row] = 1.0;
+    }
+    for (int row = 0; row < 32; ++row)
+    {
+      block.d[static_cast<std::size_t>(row) * c1_nt + row] = 1.0;
+    }
+    for (int row = 16; row < c1_ni; ++row)
+    {
+      block.local_residual[static_cast<std::size_t>(row)] =
+          local[static_cast<std::size_t>(row)];
+      for (int column = 16; column < c1_ni; ++column)
+      {
+        block.a[static_cast<std::size_t>(row) * c1_ni + column] =
+            a[static_cast<std::size_t>(row) * c1_ni + column];
+      }
+      for (int column = 32; column < c1_nt; ++column)
+      {
+        block.b[static_cast<std::size_t>(row) * c1_nt + column] =
+            b[static_cast<std::size_t>(row) * c1_nt + column];
+      }
+    }
+    for (int row = 32; row < c1_nt; ++row)
+    {
+      block.trace_residual[static_cast<std::size_t>(row)] =
+          trace[static_cast<std::size_t>(row)];
+      for (int column = 16; column < c1_ni; ++column)
+      {
+        block.c[static_cast<std::size_t>(row) * c1_ni + column] =
+            c[static_cast<std::size_t>(row) * c1_ni + column];
+      }
+      for (int column = 32; column < c1_nt; ++column)
+      {
+        block.d[static_cast<std::size_t>(row) * c1_nt + column] =
+            d[static_cast<std::size_t>(row) * c1_nt + column];
+      }
+    }
+  }
+}
+
+bool ExpectedRank2OperatorVectors(
+    const sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    const Rank2IndependentContext& context,
+    const Rank2IndependentAssembly& assembly,
+    std::vector<double>& residual, std::vector<double>& action_input,
+    std::vector<double>& action_result,
+    std::vector<double>& condensed_rhs)
+{
+  int rank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  mfem::ParMesh* mesh = const_cast<mfem::ParMesh*>(foundation.mesh());
+  if (rank < 0 || rank >= 2 || !mesh || assembly.elements.size() != 32 ||
+      context.restriction.size() != 32)
+  {
+    return false;
+  }
+  const int owned = context.true_sizes[static_cast<std::size_t>(rank)];
+  const int offset = context.true_offsets[static_cast<std::size_t>(rank)];
+  const std::size_t full_size =
+      sc25::persistent_rank2_local_interior_unknowns +
+      static_cast<std::size_t>(owned);
+  residual.assign(full_size, 0.0);
+  action_input.assign(full_size, 0.0);
+  action_result.assign(full_size, 0.0);
+  condensed_rhs.assign(static_cast<std::size_t>(owned), 0.0);
+  std::vector<double> local_trace_residual(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  std::vector<double> local_trace_action(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  std::vector<double> local_trace_rhs(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  std::vector<double> global_trace_residual(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  std::vector<double> global_trace_action(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  std::vector<double> global_trace_rhs(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  const mfem::IntegrationPoint& center =
+      mfem::Geometries.GetCenter(mfem::Geometry::SQUARE);
+  mfem::Vector physical(sc25::dimension);
+  for (int element = 0; element < 32; ++element)
+  {
+    const sc25::ElementLinearization& block =
+        assembly.elements[static_cast<std::size_t>(element)];
+    const IndependentElementRestriction& map =
+        context.restriction[static_cast<std::size_t>(element)];
+    mfem::ElementTransformation* transformation =
+        mesh->GetElementTransformation(element);
+    if (!transformation) { return false; }
+    transformation->Transform(center, physical);
+    const int ex = std::max(0, std::min(
+        sc25::persistent_elements_per_direction - 1,
+        static_cast<int>(std::floor(
+            physical[0] * sc25::persistent_elements_per_direction))));
+    const int ey = std::max(0, std::min(
+        sc25::persistent_elements_per_direction - 1,
+        static_cast<int>(std::floor(
+            physical[1] * sc25::persistent_elements_per_direction))));
+    const int global_element =
+        ey * sc25::persistent_elements_per_direction + ex;
+    const std::size_t base = static_cast<std::size_t>(element) * c1_ni;
+    std::array<double, c1_nt> trace_action{};
+    for (int row = 0; row < c1_nt; ++row)
+    {
+      const IndependentRestrictionEntry& entry =
+          map.entries[static_cast<std::size_t>(row)];
+      const double global_value = -0.015625 +
+          static_cast<double>(entry.global_true_dof + 1) / 131072.0;
+      trace_action[static_cast<std::size_t>(row)] =
+          entry.sign * global_value;
+    }
+    for (int row = 0; row < c1_ni; ++row)
+    {
+      residual[base + row] =
+          block.local_residual[static_cast<std::size_t>(row)];
+      action_input[base + row] = 0.03125 +
+          static_cast<double>(global_element * c1_ni + row + 1) / 65536.0;
+      double value = 0.0;
+      for (int column = 0; column < c1_ni; ++column)
+      {
+        const double action = 0.03125 +
+            static_cast<double>(global_element * c1_ni + column + 1) /
+                65536.0;
+        value += block.a[static_cast<std::size_t>(row) * c1_ni + column] *
+            action;
+      }
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        value += block.b[static_cast<std::size_t>(row) * c1_nt + column] *
+            trace_action[static_cast<std::size_t>(column)];
+      }
+      action_result[base + row] = value;
+    }
+    C1Lu factor;
+    std::vector<double> inverse_residual;
+    if (!factor.Factor(block.a, c1_ni) ||
+        !factor.Solve(block.local_residual, inverse_residual))
+    {
+      return false;
+    }
+    for (int row = 0; row < c1_nt; ++row)
+    {
+      const IndependentRestrictionEntry& entry =
+          map.entries[static_cast<std::size_t>(row)];
+      local_trace_residual[
+          static_cast<std::size_t>(entry.global_true_dof)] +=
+          entry.sign * block.trace_residual[static_cast<std::size_t>(row)];
+      double action = 0.0;
+      for (int column = 0; column < c1_ni; ++column)
+      {
+        const double input = 0.03125 +
+            static_cast<double>(global_element * c1_ni + column + 1) /
+                65536.0;
+        action += block.c[static_cast<std::size_t>(row) * c1_ni + column] *
+            input;
+      }
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        action += block.d[static_cast<std::size_t>(row) * c1_nt + column] *
+            trace_action[static_cast<std::size_t>(column)];
+      }
+      local_trace_action[
+          static_cast<std::size_t>(entry.global_true_dof)] +=
+          entry.sign * action;
+      double rhs = -block.trace_residual[static_cast<std::size_t>(row)];
+      for (int inner = 0; inner < c1_ni; ++inner)
+      {
+        rhs += block.c[static_cast<std::size_t>(row) * c1_ni + inner] *
+            inverse_residual[static_cast<std::size_t>(inner)];
+      }
+      local_trace_rhs[static_cast<std::size_t>(entry.global_true_dof)] +=
+          entry.sign * rhs;
+    }
+  }
+  if (MPI_Allreduce(local_trace_residual.data(), global_trace_residual.data(),
+                    static_cast<int>(global_trace_residual.size()),
+                    MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Allreduce(local_trace_action.data(), global_trace_action.data(),
+                    static_cast<int>(global_trace_action.size()),
+                    MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Allreduce(local_trace_rhs.data(), global_trace_rhs.data(),
+                    static_cast<int>(global_trace_rhs.size()),
+                    MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  for (int row = 0; row < owned; ++row)
+  {
+    const std::size_t target =
+        sc25::persistent_rank2_local_interior_unknowns +
+        static_cast<std::size_t>(row);
+    const int global = offset + row;
+    residual[target] = global_trace_residual[static_cast<std::size_t>(global)];
+    action_input[target] = -0.015625 +
+        static_cast<double>(global + 1) / 131072.0;
+    action_result[target] =
+        global_trace_action[static_cast<std::size_t>(global)];
+    condensed_rhs[static_cast<std::size_t>(row)] =
+        global_trace_rhs[static_cast<std::size_t>(global)];
+  }
+  return true;
+}
+
+bool VerifyRank2SolveAndRecovery(
+    const Rank2IndependentContext& context,
+    const Rank2IndependentAssembly& assembly,
+    const sc25::Rank2TrajectoryNewtonEvidence& item,
+    double& trace_solve_relative_error,
+    double& recovery_relative_error)
+{
+  int rank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if (rank < 0 || rank >= 2 || assembly.elements.size() != 32 ||
+      item.true_trace_solution.size() !=
+          static_cast<std::size_t>(context.true_sizes[rank]))
+  {
+    return false;
+  }
+  std::vector<double> global_solution(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  const std::array<int, 2> displacements = {{0, context.true_sizes[0]}};
+  if (MPI_Allgatherv(
+          item.true_trace_solution.data(),
+          static_cast<int>(item.true_trace_solution.size()), MPI_DOUBLE,
+          global_solution.data(), context.true_sizes.data(),
+          displacements.data(), MPI_DOUBLE, MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  std::vector<double> expected_interior(
+      sc25::persistent_rank2_local_interior_unknowns, 0.0);
+  std::vector<double> reported_interior(
+      sc25::persistent_rank2_local_interior_unknowns, 0.0);
+  std::vector<double> local_condensed_residual(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  std::vector<double> global_condensed_residual(
+      sc25::persistent_rank2_global_true_trace_unknowns, 0.0);
+  long double local_rhs_square = 0.0L;
+  for (const double value : item.condensed_right_hand_side)
+  {
+    local_rhs_square += static_cast<long double>(value) * value;
+  }
+  for (int element = 0; element < 32; ++element)
+  {
+    const sc25::ElementLinearization& block =
+        assembly.elements[static_cast<std::size_t>(element)];
+    const IndependentElementRestriction& map =
+        context.restriction[static_cast<std::size_t>(element)];
+    C1Lu factor;
+    std::vector<double> inverse_residual;
+    if (!factor.Factor(block.a, c1_ni) ||
+        !factor.Solve(block.local_residual, inverse_residual))
+    {
+      return false;
+    }
+    std::vector<double> inverse_b(
+        static_cast<std::size_t>(c1_ni) * c1_nt, 0.0);
+    for (int column = 0; column < c1_nt; ++column)
+    {
+      std::vector<double> rhs(c1_ni), solution;
+      for (int row = 0; row < c1_ni; ++row)
+      {
+        rhs[static_cast<std::size_t>(row)] =
+            block.b[static_cast<std::size_t>(row) * c1_nt + column];
+      }
+      if (!factor.Solve(rhs, solution)) { return false; }
+      for (int row = 0; row < c1_ni; ++row)
+      {
+        inverse_b[static_cast<std::size_t>(row) * c1_nt + column] =
+            solution[static_cast<std::size_t>(row)];
+      }
+    }
+    std::array<double, c1_nt> local_trace_solution{};
+    for (int row = 0; row < c1_nt; ++row)
+    {
+      const IndependentRestrictionEntry& entry =
+          map.entries[static_cast<std::size_t>(row)];
+      local_trace_solution[static_cast<std::size_t>(row)] = entry.sign *
+          global_solution[static_cast<std::size_t>(entry.global_true_dof)];
+    }
+    std::vector<double> recovery_rhs = block.local_residual;
+    for (int row = 0; row < c1_ni; ++row)
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        recovery_rhs[static_cast<std::size_t>(row)] +=
+            block.b[static_cast<std::size_t>(row) * c1_nt + column] *
+            local_trace_solution[static_cast<std::size_t>(column)];
+      }
+    std::vector<double> recovered;
+    if (!factor.Solve(recovery_rhs, recovered)) { return false; }
+    const std::size_t base = static_cast<std::size_t>(element) * c1_ni;
+    for (int row = 0; row < c1_ni; ++row)
+    {
+      expected_interior[base + row] =
+          -recovered[static_cast<std::size_t>(row)];
+    }
+    std::copy_n(item.recovered_increment.u.begin() + element * 16, 16,
+                reported_interior.begin() + base);
+    std::copy_n(item.recovered_increment.sigma.begin() + element * 4, 4,
+                reported_interior.begin() + base + 16);
+    std::copy_n(item.recovered_increment.z.begin() + element * 8, 8,
+                reported_interior.begin() + base + 20);
+    for (int row = 0; row < c1_nt; ++row)
+    {
+      double value = block.trace_residual[static_cast<std::size_t>(row)];
+      for (int inner = 0; inner < c1_ni; ++inner)
+      {
+        value -= block.c[static_cast<std::size_t>(row) * c1_ni + inner] *
+            inverse_residual[static_cast<std::size_t>(inner)];
+      }
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        double schur =
+            block.d[static_cast<std::size_t>(row) * c1_nt + column];
+        for (int inner = 0; inner < c1_ni; ++inner)
+        {
+          schur -= block.c[static_cast<std::size_t>(row) * c1_ni + inner] *
+              inverse_b[static_cast<std::size_t>(inner) * c1_nt + column];
+        }
+        value += schur *
+            local_trace_solution[static_cast<std::size_t>(column)];
+      }
+      const IndependentRestrictionEntry& entry =
+          map.entries[static_cast<std::size_t>(row)];
+      local_condensed_residual[
+          static_cast<std::size_t>(entry.global_true_dof)] +=
+          entry.sign * value;
+    }
+  }
+  if (MPI_Allreduce(local_condensed_residual.data(),
+                    global_condensed_residual.data(),
+                    static_cast<int>(global_condensed_residual.size()),
+                    MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  long double local_solution_residual_square = 0.0L;
+  const int offset = context.true_offsets[static_cast<std::size_t>(rank)];
+  for (int row = 0; row < context.true_sizes[rank]; ++row)
+  {
+    const double value =
+        global_condensed_residual[static_cast<std::size_t>(offset + row)];
+    local_solution_residual_square +=
+        static_cast<long double>(value) * value;
+  }
+  std::array<long double, 2> local_squares = {
+      local_solution_residual_square, local_rhs_square};
+  std::array<long double, 2> global_squares{};
+  if (MPI_Allreduce(local_squares.data(), global_squares.data(), 2,
+                    MPI_LONG_DOUBLE, MPI_SUM,
+                    MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  trace_solve_relative_error = std::sqrt(
+      static_cast<double>(global_squares[0])) /
+      std::max(1.0, std::sqrt(static_cast<double>(global_squares[1])));
+  recovery_relative_error = C1Relative(expected_interior,
+                                       reported_interior);
+  std::vector<double> reported_trace(
+      item.recovered_increment.uhat.size() +
+      item.recovered_increment.sigmahat.size());
+  std::copy(item.recovered_increment.uhat.begin(),
+            item.recovered_increment.uhat.end(), reported_trace.begin());
+  std::copy(item.recovered_increment.sigmahat.begin(),
+            item.recovered_increment.sigmahat.end(),
+            reported_trace.begin() + item.recovered_increment.uhat.size());
+  recovery_relative_error = std::max(
+      recovery_relative_error,
+      C1Relative(item.true_trace_solution, reported_trace));
+  return true;
+}
+
+class Rank2ManifestBuilder final
+{
+public:
+  bool Text(const std::string_view value) noexcept
+  {
+    return U64(value.size()) && hash_.Update(value.data(), value.size());
+  }
+
+  bool U64(const std::uint64_t value) noexcept
+  {
+    std::array<std::uint8_t, 8> bytes{};
+    for (std::size_t i = 0; i < bytes.size(); ++i)
+    {
+      bytes[i] = static_cast<std::uint8_t>(value >> (8 * i));
+    }
+    return hash_.Update(bytes.data(), bytes.size());
+  }
+
+  bool Hash(const dg::hdg::runtime::StateHash& value) noexcept
+  {
+    return hash_.Update(value.bytes.data(), value.bytes.size());
+  }
+
+  dg::hdg::runtime::StateHash Finish() noexcept
+  {
+    dg::hdg::runtime::Sha256Digest digest{};
+    return hash_.Finalize(digest) ? dg::hdg::runtime::StateHash{digest} :
+                                    dg::hdg::runtime::StateHash{};
+  }
+
+private:
+  dg::hdg::runtime::Sha256 hash_;
+};
+
+sc25::Rank2TrajectoryStateHashes IndependentRank2Hashes(
+    const sc25::PersistentRank2TrajectoryState& state) noexcept
+{
+  return {HashOneArray(state.u),
+          HashOneArray(state.sigma),
+          HashOneArray(state.z),
+          HashOneArray(state.uhat),
+          HashOneArray(state.sigmahat),
+          HashArraySequence(state.u, state.sigma, state.z),
+          HashArraySequence(state.uhat, state.sigmahat),
+          HashArraySequence(state.u, state.sigma, state.z, state.uhat,
+                            state.sigmahat)};
+}
+
+} // namespace
+
+bool EvaluateIndependentRank2StateAdmissibilityOracle(
+    sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    const sc25::PersistentRank2TrajectoryState& state,
+    const int quadrature_order)
+{
+  const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
+  const sc25::FieldOwnershipView fields = foundation.fields();
+  mfem::ParMesh* mesh = const_cast<mfem::ParMesh*>(foundation.mesh());
+  if (!mesh || !spaces.u.address || !spaces.trace_carrier.address ||
+      !fields.trace_carrier || mesh->GetNE() != 32)
+  {
+    return false;
+  }
+  mfem::Vector true_state(
+      static_cast<int>(state.uhat.size() + state.sigmahat.size()));
+  std::copy(state.uhat.begin(), state.uhat.end(), true_state.HostWrite());
+  std::copy(state.sigmahat.begin(), state.sigmahat.end(),
+            true_state.HostWrite() + state.uhat.size());
+  if (!foundation.SetTraceCarrierFromTrueDofs(true_state)) { return false; }
+  bool local_admissible = true;
+  const auto sample = [](const std::array<double, sc25::state_components>& u)
+  {
+    double density = 0.0;
+    double pressure = 0.0;
+    double margin = 0.0;
+    return PrimitiveAdmissible(u, density, pressure, margin);
+  };
+  try
+  {
+    for (int element = 0; local_admissible && element < mesh->GetNE();
+         ++element)
+    {
+      const mfem::FiniteElement* finite_element =
+          spaces.u.address->GetFE(element);
+      mfem::ElementTransformation* transformation =
+          mesh->GetElementTransformation(element);
+      if (!finite_element || !transformation ||
+          finite_element->GetDof() != sc25::persistent_scalar_volume_nodes)
+      {
+        local_admissible = false;
+        break;
+      }
+      mfem::Vector shape(sc25::persistent_scalar_volume_nodes);
+      const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), quadrature_order);
+      const std::size_t u_base = static_cast<std::size_t>(element) * 16;
+      for (int point = 0; point < volume_rule.GetNPoints(); ++point)
+      {
+        finite_element->CalcShape(volume_rule.IntPoint(point), shape);
+        std::array<double, sc25::state_components> conservative{};
+        for (int component = 0; component < sc25::state_components;
+             ++component)
+          for (int scalar = 0;
+               scalar < sc25::persistent_scalar_volume_nodes; ++scalar)
+          {
+            conservative[static_cast<std::size_t>(component)] +=
+                shape[scalar] * state.u[
+                    u_base + component *
+                        sc25::persistent_scalar_volume_nodes + scalar];
+          }
+        if (!sample(conservative))
+        {
+          local_admissible = false;
+          break;
+        }
+      }
+      mfem::Array<int> faces, orientations;
+      mesh->GetElementEdges(element, faces, orientations);
+      for (int local_face = 0;
+           local_admissible && local_face < faces.Size(); ++local_face)
+      {
+        const int face = faces[local_face];
+        mfem::FaceElementTransformations* face_transformations =
+            mesh->GetFaceElementTransformations(face);
+        const mfem::FiniteElement* trace_element =
+            spaces.trace_carrier.address->GetFaceElement(face);
+        mfem::Array<int> signed_vdofs;
+        spaces.trace_carrier.address->GetFaceVDofs(face, signed_vdofs);
+        if (!face_transformations || !trace_element ||
+            trace_element->GetDof() != 2 ||
+            signed_vdofs.Size() != 2 * sc25::trace_components)
+        {
+          local_admissible = false;
+          break;
+        }
+        const bool element_one = face_transformations->Elem1No == element;
+        if (!element_one && face_transformations->Elem2No != element)
+        {
+          local_admissible = false;
+          break;
+        }
+        mfem::Vector interior_shape(
+            sc25::persistent_scalar_volume_nodes), trace_shape(2);
+        const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
+            trace_element->GetGeomType(), quadrature_order);
+        for (int point = 0; point < face_rule.GetNPoints(); ++point)
+        {
+          const mfem::IntegrationPoint& ip = face_rule.IntPoint(point);
+          face_transformations->SetAllIntPoints(&ip);
+          const mfem::IntegrationPoint& element_ip = element_one ?
+              face_transformations->GetElement1IntPoint() :
+              face_transformations->GetElement2IntPoint();
+          finite_element->CalcShape(element_ip, interior_shape);
+          trace_element->CalcShape(ip, trace_shape);
+          std::array<double, sc25::state_components> conservative{},
+              trace_state{};
+          for (int component = 0; component < sc25::state_components;
+               ++component)
+          {
+            for (int scalar = 0;
+                 scalar < sc25::persistent_scalar_volume_nodes; ++scalar)
+            {
+              conservative[static_cast<std::size_t>(component)] +=
+                  interior_shape[scalar] * state.u[
+                      u_base + component *
+                          sc25::persistent_scalar_volume_nodes + scalar];
+            }
+            for (int scalar = 0; scalar < 2; ++scalar)
+            {
+              int dof = -1;
+              int sign = 0;
+              if (!DecodeSignedDof(
+                      signed_vdofs[component * 2 + scalar], dof, sign) ||
+                  dof < 0 || dof >= fields.trace_carrier->Size())
+              {
+                local_admissible = false;
+                break;
+              }
+              trace_state[static_cast<std::size_t>(component)] +=
+                  trace_shape[scalar] * sign *
+                  (*fields.trace_carrier)[dof];
+            }
+          }
+          if (!local_admissible || !sample(conservative) ||
+              !sample(trace_state))
+          {
+            local_admissible = false;
+            break;
+          }
+        }
+      }
+    }
+    // Evaluate the independent carrier field on every physical face, not
+    // merely the element-side restriction paths above.
+    for (int face = 0; local_admissible && face < mesh->GetNumFaces(); ++face)
+    {
+      const mfem::FiniteElement* trace_element =
+          spaces.trace_carrier.address->GetFaceElement(face);
+      mfem::Array<int> signed_vdofs;
+      spaces.trace_carrier.address->GetFaceVDofs(face, signed_vdofs);
+      if (!trace_element || trace_element->GetDof() != 2 ||
+          signed_vdofs.Size() != 2 * sc25::trace_components)
+      {
+        local_admissible = false;
+        break;
+      }
+      mfem::Vector shape(2);
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          trace_element->GetGeomType(), quadrature_order);
+      for (int point = 0; point < rule.GetNPoints(); ++point)
+      {
+        trace_element->CalcShape(rule.IntPoint(point), shape);
+        std::array<double, sc25::state_components> trace_state{};
+        for (int component = 0; component < sc25::state_components;
+             ++component)
+          for (int scalar = 0; scalar < 2; ++scalar)
+          {
+            int dof = -1;
+            int sign = 0;
+            if (!DecodeSignedDof(signed_vdofs[component * 2 + scalar],
+                                 dof, sign) ||
+                dof < 0 || dof >= fields.trace_carrier->Size())
+            {
+              local_admissible = false;
+              break;
+            }
+            trace_state[static_cast<std::size_t>(component)] +=
+                shape[scalar] * sign * (*fields.trace_carrier)[dof];
+          }
+        if (!local_admissible || !sample(trace_state))
+        {
+          local_admissible = false;
+          break;
+        }
+      }
+    }
+  }
+  catch (...)
+  {
+    local_admissible = false;
+  }
+  const int local = local_admissible ? 1 : 0;
+  int global = 0;
+  return MPI_Allreduce(&local, &global, 1, MPI_INT, MPI_MIN,
+                       MPI_COMM_WORLD) == MPI_SUCCESS && global == 1;
+}
+
+bool RunIndependentRank2TrajectoryOracle(
+    sc25::PersistentSc25ScalarIgrCpuFoundation& rank2,
+    sc25::PersistentSc25ScalarIgrCpuFoundation& rank1_peer,
+    const sc25::PersistentRank2TrajectoryCheckpoint& checkpoint10,
+    IndependentRank2TrajectoryEvidence& evidence)
+{
+  evidence = {};
+  int rank = -1;
+  int ranks = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  mfem::ParMesh* local_mesh = const_cast<mfem::ParMesh*>(rank2.mesh());
+  mfem::ParMesh* peer_mesh = const_cast<mfem::ParMesh*>(rank1_peer.mesh());
+  const sc25::SpaceOwnershipSnapshot local_spaces = rank2.spaces();
+  const sc25::PersistentRank2TrajectoryEvidence& local_run =
+      rank2.rank2_trajectory_evidence();
+  const sc25::PersistentTrajectoryEvidence& peer_run =
+      rank1_peer.trajectory_evidence();
+  Rank2Require(ranks == 2 && local_mesh && peer_mesh,
+               "rank2 independent communicator", evidence);
+  if (!local_mesh || !peer_mesh) { return false; }
+
+  IndependentTrajectoryEvidence peer_oracle;
+  if (!RunIndependentTrajectoryOracle(rank1_peer, peer_oracle))
+  {
+    for (const std::string& failure : peer_oracle.failures)
+    {
+      Rank2Require(false, "rank1 scientific oracle: " + failure, evidence);
+    }
+  }
+  evidence.independent_rank1_residual_assemblies =
+      peer_oracle.independently_assembled_residuals;
+
+  evidence.checked_local_elements = local_mesh->GetNE();
+  evidence.checked_local_faces = local_mesh->GetNumFaces();
+  Rank2Require(local_mesh->GetNE() == 32 && local_mesh->GetNumFaces() == 72,
+               "rank2 independent local mesh census", evidence);
+  if (!IndependentlyCheckRank2Restriction(rank2, evidence))
+  {
+    Rank2Require(false, "rank2 independent restriction construction",
+                 evidence);
+  }
+  Rank2IndependentContext rank2_context;
+  Rank2Require(BuildRank2IndependentContext(rank2, rank2_context),
+               "rank2 separately authored distributed restriction",
+               evidence);
+  const auto check_operator_vectors =
+      [&](const sc25::Rank2TrajectoryNewtonEvidence& item,
+          const Rank2IndependentAssembly& assembly,
+          const std::string& label)
+  {
+    std::vector<double> expected_residual, expected_action_input,
+        expected_action_result, expected_rhs;
+    const bool expected = ExpectedRank2OperatorVectors(
+        rank2, rank2_context, assembly, expected_residual,
+        expected_action_input, expected_action_result, expected_rhs);
+    Rank2Require(expected, label + " expected operator vectors", evidence);
+    if (!expected) { return; }
+    const std::array<double, 4> discrepancies = {
+        C1Relative(item.nonlinear_residual, expected_residual),
+        C1Relative(item.jacobian_action_input, expected_action_input),
+        C1Relative(item.jacobian_action_result, expected_action_result),
+        C1Relative(item.condensed_right_hand_side, expected_rhs)};
+    for (const double discrepancy : discrepancies)
+    {
+      evidence.maximum_vector_relative_error = std::max(
+          evidence.maximum_vector_relative_error, discrepancy);
+    }
+    Rank2Require(
+        std::all_of(discrepancies.begin(), discrepancies.end(),
+                    [](const double value) { return value <= 5.0e-11; }),
+        label + " independent residual/action/condensed-RHS vectors",
+        evidence);
+    double trace_solve_error = std::numeric_limits<double>::infinity();
+    double recovery_error = std::numeric_limits<double>::infinity();
+    const bool solve_recovery = item.completed &&
+        VerifyRank2SolveAndRecovery(rank2_context, assembly, item,
+                                    trace_solve_error, recovery_error);
+    Rank2Require(solve_recovery,
+                 label + " independent trace solve/recovery", evidence);
+    if (solve_recovery)
+    {
+      evidence.maximum_vector_relative_error = std::max(
+          {evidence.maximum_vector_relative_error, trace_solve_error,
+           recovery_error});
+      Rank2Require(trace_solve_error <= 5.0e-11 &&
+                       recovery_error <= 5.0e-11,
+                   label + " true-trace solution/recovered vector",
+                   evidence);
+    }
+    evidence.checked_vector_records += 6;
+  };
+  const int independently_ghost_true_dofs =
+      evidence.checked_local_faces * 10 - evidence.independently_owned_true_dofs;
+  Rank2Require(
+      local_spaces.trace_carrier.local_true_size ==
+              evidence.independently_owned_true_dofs &&
+          local_spaces.trace_carrier.global_true_size ==
+              sc25::persistent_rank2_global_true_trace_unknowns,
+      "rank2 MFEM true-space census versus independent geometry", evidence);
+  Rank2Require(
+      local_run.census.rank == rank && local_run.census.ranks == ranks &&
+          local_run.census.local_elements == evidence.checked_local_elements &&
+          local_run.census.local_interior_unknowns == 896 &&
+          local_run.census.local_faces == evidence.checked_local_faces &&
+          local_run.census.owned_unique_faces ==
+              evidence.independently_owned_faces &&
+          local_run.census.combined_owned_trace_dofs ==
+              evidence.independently_owned_true_dofs &&
+          local_run.census.combined_ghost_trace_dofs ==
+              independently_ghost_true_dofs &&
+          local_run.census.global_unique_faces ==
+              evidence.independently_global_faces &&
+          local_run.census.global_combined_true_dofs ==
+              evidence.independently_covered_true_dofs,
+      "rank2 published census versus independent reconstruction", evidence);
+
+  const sc25::AuxiliaryInitializationEvidence& local_initialization =
+      local_run.initialization;
+  const sc25::AuxiliaryInitializationEvidence& peer_initialization =
+      peer_run.initialization;
+  Rank2Require(
+      local_initialization.quadrature_order ==
+              peer_initialization.quadrature_order &&
+          local_initialization.trace_restart_dimension ==
+              peer_initialization.trace_restart_dimension &&
+          local_initialization.trace_maximum_iterations ==
+              peer_initialization.trace_maximum_iterations &&
+          local_initialization.ilu_type == peer_initialization.ilu_type &&
+          local_initialization.ilu_level_of_fill ==
+              peer_initialization.ilu_level_of_fill &&
+          local_initialization.ilu_local_reordering ==
+              peer_initialization.ilu_local_reordering &&
+          local_initialization.trace_iterations > 0 &&
+          peer_initialization.trace_iterations > 0,
+      "rank2/rank1 initialization discrete parity local(iter=" +
+          std::to_string(local_initialization.trace_iterations) +
+          ",restart=" +
+          std::to_string(local_initialization.trace_restart_dimension) +
+          ",max=" +
+          std::to_string(local_initialization.trace_maximum_iterations) +
+          ") peer(iter=" +
+          std::to_string(peer_initialization.trace_iterations) +
+          ",restart=" +
+          std::to_string(peer_initialization.trace_restart_dimension) +
+          ",max=" +
+          std::to_string(peer_initialization.trace_maximum_iterations) + ")",
+      evidence);
+  const std::array<double, 11> local_initialization_scalars = {
+      local_initialization.trace_relative_tolerance,
+      local_initialization.trace_absolute_tolerance,
+      local_initialization.trace_true_residual_norm,
+      local_initialization.trace_right_hand_side_norm,
+      local_initialization.residual.r_z_norm,
+      local_initialization.residual.r_z_scale,
+      local_initialization.residual.r_sigma_norm,
+      local_initialization.residual.r_sigma_scale,
+      local_initialization.residual.g_sigma_norm,
+      local_initialization.residual.g_sigma_scale,
+      local_initialization.residual.normalized_maximum};
+  const std::array<double, 11> peer_initialization_scalars = {
+      peer_initialization.trace_relative_tolerance,
+      peer_initialization.trace_absolute_tolerance,
+      peer_initialization.trace_true_residual_norm,
+      peer_initialization.trace_right_hand_side_norm,
+      peer_initialization.residual.r_z_norm,
+      peer_initialization.residual.r_z_scale,
+      peer_initialization.residual.r_sigma_norm,
+      peer_initialization.residual.r_sigma_scale,
+      peer_initialization.residual.g_sigma_norm,
+      peer_initialization.residual.g_sigma_scale,
+      peer_initialization.residual.normalized_maximum};
+  for (std::size_t scalar = 0;
+       scalar < local_initialization_scalars.size(); ++scalar)
+  {
+    evidence.maximum_operator_relative_error = std::max(
+        evidence.maximum_operator_relative_error,
+        Rank2RelativeScalar(local_initialization_scalars[scalar],
+                            peer_initialization_scalars[scalar]));
+  }
+  Rank2Require(evidence.maximum_operator_relative_error <= 5.0e-11,
+               "rank2/rank1 initialization operator parity", evidence);
+  const sc25::Rank2TrajectoryNewtonEvidence& initialization_operator =
+      local_run.initialization_operator;
+  Rank2Require(initialization_operator.attempted &&
+                   initialization_operator.completed &&
+                   initialization_operator.iteration == 0,
+               "rank2 initialization operator record", evidence);
+  Rank2IndependentAssembly initialization_assembly;
+  if (AssembleIndependentRank2(
+          rank2, rank2_context, initialization_operator.entry,
+          initialization_operator.entry, initialization_assembly))
+  {
+    MakeIndependentAuxiliaryAssembly(initialization_assembly);
+    check_operator_vectors(initialization_operator, initialization_assembly,
+                           "rank2 initialization");
+  }
+  else
+  {
+    Rank2Require(false, "rank2 independent initialization assembly",
+                 evidence);
+  }
+  for (int line = 0; line < sc25::persistent_line_search_trials; ++line)
+  {
+    Rank2Require(
+        initialization_operator.trial_visited[static_cast<std::size_t>(line)] ==
+                0 &&
+            std::isinf(initialization_operator.trial_residual_norms[
+                static_cast<std::size_t>(line)]) &&
+            initialization_operator.trial_admissible[
+                static_cast<std::size_t>(line)] == 0 &&
+            initialization_operator.trial_armijo[
+                static_cast<std::size_t>(line)] == 0,
+        "rank2 initialization frozen trial sentinel", evidence);
+  }
+
+  Rank2Require(checkpoint10.shard_rank == rank &&
+                   checkpoint10.descriptor.coordinates.step == 10 &&
+                   checkpoint10.descriptor.coordinates.cursor == 10 &&
+                   checkpoint10.descriptor.coordinates.generation == 10 &&
+                   checkpoint10.descriptor.cursor == 10,
+               "rank2 independent checkpoint cadence", evidence);
+  evidence.checked_checkpoint_cadence = 1;
+
+  int local_total_newton = 0;
+  int local_total_gmres_iterations = 0;
+  int local_total_line_trials = 0;
+  for (int stage_index = 0; stage_index < sc25::persistent_required_steps;
+       ++stage_index)
+  {
+    const sc25::Rank2TrajectoryStageEvidence& local_stage =
+        local_run.stages[static_cast<std::size_t>(stage_index)];
+    const sc25::TrajectoryStepEvidence& peer_stage =
+        peer_run.steps[static_cast<std::size_t>(stage_index)];
+    if (peer_stage.attempt_index < 0 ||
+        peer_stage.attempt_index >= peer_run.attempt_count)
+    {
+      Rank2Require(false, "rank2/rank1 accepted attempt index", evidence);
+      continue;
+    }
+    const sc25::Rank2TrajectoryAttemptEvidence& local_attempt =
+        local_run.attempts[static_cast<std::size_t>(stage_index)];
+    const sc25::TrajectoryAttemptEvidence& peer_attempt =
+        peer_run.attempts[static_cast<std::size_t>(peer_stage.attempt_index)];
+    Rank2Require(
+        local_stage.accepted && peer_stage.accepted &&
+            local_stage.step == peer_stage.step &&
+            Rank2RelativeScalar(local_stage.time, peer_stage.time) == 0.0 &&
+            local_stage.generation == peer_stage.generation &&
+            local_attempt.status == peer_attempt.status &&
+            local_attempt.target_step == peer_attempt.target_step &&
+            local_attempt.retry_index == peer_attempt.retry_index &&
+            local_attempt.newton_iterations ==
+                peer_attempt.newton_iterations,
+        "rank2/rank1 accepted-stage and attempt bijection stage=" +
+            std::to_string(stage_index + 1) + " local(status=" +
+            std::to_string(static_cast<int>(local_attempt.status)) +
+            ",attempted=" +
+            std::to_string(local_attempt.attempted_newton_iterations) +
+            ",completed=" +
+            std::to_string(local_attempt.newton_iterations) +
+            ") peer(status=" +
+            std::to_string(static_cast<int>(peer_attempt.status)) +
+            ",attempted=" +
+            std::to_string(peer_attempt.attempted_newton_iterations) +
+            ",completed=" +
+            std::to_string(peer_attempt.newton_iterations) + ")",
+        evidence);
+    const double entry_error = Rank2PeerStateRelativeError(
+        rank2, rank1_peer, local_attempt.entry_state,
+        peer_attempt.newton[0].entry, evidence, "rank2/rank1 entry state");
+    const double stage_error = Rank2PeerStateRelativeError(
+        rank2, rank1_peer, local_stage.accepted_state,
+        peer_stage.accepted_state, evidence, "rank2/rank1 accepted state");
+    evidence.maximum_peer_relative_error = std::max(
+        {evidence.maximum_peer_relative_error, entry_error, stage_error});
+    Rank2Require(entry_error <= 5.0e-11 && stage_error <= 5.0e-11,
+                 "rank2/rank1 state parity", evidence);
+
+    int peer_gmres_iterations = 0;
+    int peer_line_trials = 0;
+    for (int iteration = 0; iteration < peer_attempt.newton_iterations;
+         ++iteration)
+    {
+      const sc25::TrajectoryNewtonEvidence& peer_newton =
+          peer_attempt.newton[static_cast<std::size_t>(iteration)];
+      const sc25::Rank2TrajectoryNewtonEvidence& local_newton =
+          local_attempt.newton[static_cast<std::size_t>(iteration)];
+      peer_gmres_iterations += peer_newton.trace_iterations;
+      peer_line_trials += peer_newton.accepted_line_search_index + 1;
+      Rank2Require(
+          local_newton.attempted && local_newton.completed &&
+              local_newton.iteration == iteration &&
+              local_newton.trace_iterations >= 0,
+          "rank2 completed Newton record stage=" +
+              std::to_string(stage_index + 1) + " iteration=" +
+              std::to_string(iteration), evidence);
+      const double newton_entry_error = Rank2PeerStateRelativeError(
+          rank2, rank1_peer, local_newton.entry, peer_newton.entry,
+          evidence, "rank2/rank1 Newton entry");
+      const double newton_recovery_error = Rank2PeerStateRelativeError(
+          rank2, rank1_peer, local_newton.recovered_increment,
+          peer_newton.direction, evidence, "rank2/rank1 Newton recovery");
+      evidence.maximum_peer_relative_error = std::max(
+          {evidence.maximum_peer_relative_error, newton_entry_error,
+           newton_recovery_error});
+      Rank2Require(newton_entry_error <= 5.0e-11 &&
+                       newton_recovery_error <= 5.0e-11,
+                   "rank2/rank1 per-Newton state vector parity", evidence);
+      Rank2IndependentAssembly independent_assembly;
+      if (AssembleIndependentRank2(
+              rank2, rank2_context, local_attempt.entry_state,
+              local_newton.entry, independent_assembly))
+      {
+        check_operator_vectors(
+            local_newton, independent_assembly,
+            "rank2 stage " + std::to_string(stage_index + 1) +
+                " Newton " + std::to_string(iteration));
+      }
+      else
+      {
+        Rank2Require(false, "rank2 independent per-Newton assembly",
+                     evidence);
+      }
+      for (int line = 0; line < sc25::persistent_line_search_trials; ++line)
+      {
+        const bool visited =
+            line <= local_newton.accepted_line_search_index;
+        Rank2Require(
+            (local_newton.trial_visited[static_cast<std::size_t>(line)] != 0) ==
+                visited,
+            "rank2 trial visit bijection", evidence);
+        if (visited)
+        {
+          Rank2Require(
+              Rank2RelativeScalar(
+                  local_newton.trial_residual_norms[
+                      static_cast<std::size_t>(line)],
+                  peer_newton.trial_residual_norms[
+                      static_cast<std::size_t>(line)]) <= 5.0e-11 &&
+                  local_newton.trial_admissible[
+                      static_cast<std::size_t>(line)] ==
+                      peer_newton.trial_admissible[
+                          static_cast<std::size_t>(line)] &&
+                  local_newton.trial_armijo[static_cast<std::size_t>(line)] ==
+                      peer_newton.trial_armijo[
+                          static_cast<std::size_t>(line)],
+              "rank2 per-Newton trial scientific parity", evidence);
+        }
+        else
+        {
+          Rank2Require(
+              std::isinf(local_newton.trial_residual_norms[
+                  static_cast<std::size_t>(line)]) &&
+                  local_newton.trial_admissible[
+                      static_cast<std::size_t>(line)] == 0 &&
+                  local_newton.trial_armijo[
+                      static_cast<std::size_t>(line)] == 0,
+              "rank2 frozen unvisited trial sentinel", evidence);
+        }
+        ++evidence.checked_trial_records;
+      }
+      ++evidence.checked_newton_records;
+    }
+    for (int iteration = local_attempt.attempted_newton_iterations;
+         iteration < sc25::persistent_newton_maximum_iterations; ++iteration)
+    {
+      const sc25::Rank2TrajectoryNewtonEvidence& unvisited =
+          local_attempt.newton[static_cast<std::size_t>(iteration)];
+      Rank2Require(!unvisited.attempted && !unvisited.completed &&
+                       unvisited.iteration == -1 &&
+                       std::all_of(
+                           unvisited.trial_residual_norms.begin(),
+                           unvisited.trial_residual_norms.end(),
+                           [](const double value) { return std::isinf(value); }) &&
+                       std::all_of(unvisited.trial_visited.begin(),
+                                   unvisited.trial_visited.end(),
+                                   [](const std::uint8_t value)
+                                   { return value == 0; }),
+                   "rank2 frozen unvisited Newton sentinel", evidence);
+    }
+    Rank2Require(local_attempt.gmres_solves ==
+                         peer_attempt.newton_iterations &&
+                     local_attempt.gmres_iterations > 0 &&
+                     peer_gmres_iterations > 0 &&
+                     local_attempt.line_search_trials == peer_line_trials,
+                 "rank2/rank1 solve and Armijo counter bijection stage=" +
+                     std::to_string(stage_index + 1) + " local(gmres=" +
+                     std::to_string(local_attempt.gmres_iterations) +
+                     ",trials=" +
+                     std::to_string(local_attempt.line_search_trials) +
+                     ") peer(gmres=" +
+                     std::to_string(peer_gmres_iterations) + ",trials=" +
+                     std::to_string(peer_line_trials) + ")",
+                 evidence);
+    if (peer_attempt.newton_iterations > 0)
+    {
+      const sc25::TrajectoryNewtonEvidence& last_newton =
+          peer_attempt.newton[static_cast<std::size_t>(
+              peer_attempt.newton_iterations - 1)];
+      const double direction_error = Rank2PeerStateRelativeError(
+          rank2, rank1_peer, local_attempt.accepted_direction,
+          last_newton.direction, evidence, "rank2/rank1 accepted direction");
+      evidence.maximum_operator_relative_error = std::max(
+          evidence.maximum_operator_relative_error, direction_error);
+      Rank2Require(direction_error <= 5.0e-11,
+                   "rank2/rank1 recovery direction parity", evidence);
+      for (int line = 0; line < sc25::persistent_line_search_trials; ++line)
+      {
+        const bool visited = line <= last_newton.accepted_line_search_index;
+        Rank2Require(
+            (visited &&
+             Rank2RelativeScalar(
+                 local_attempt.trial_residual_norms[
+                     static_cast<std::size_t>(line)],
+                 last_newton.trial_residual_norms[
+                     static_cast<std::size_t>(line)]) <= 5.0e-11 &&
+                 local_attempt.trial_admissible[
+                     static_cast<std::size_t>(line)] ==
+                     last_newton.trial_admissible[
+                         static_cast<std::size_t>(line)] &&
+                 local_attempt.trial_armijo[
+                     static_cast<std::size_t>(line)] ==
+                     last_newton.trial_armijo[
+                         static_cast<std::size_t>(line)]) ||
+                (!visited &&
+                 std::isinf(local_attempt.trial_residual_norms[
+                     static_cast<std::size_t>(line)]) &&
+                 local_attempt.trial_admissible[
+                     static_cast<std::size_t>(line)] == 0 &&
+                 local_attempt.trial_armijo[
+                     static_cast<std::size_t>(line)] == 0),
+            "rank2/rank1 final Newton Armijo parity stage=" +
+                std::to_string(stage_index + 1) + " line=" +
+                std::to_string(line) + " local(residual=" +
+                std::to_string(local_attempt.trial_residual_norms[
+                    static_cast<std::size_t>(line)]) + ",admissible=" +
+                std::to_string(local_attempt.trial_admissible[
+                    static_cast<std::size_t>(line)]) + ",armijo=" +
+                std::to_string(local_attempt.trial_armijo[
+                    static_cast<std::size_t>(line)]) + ") peer(residual=" +
+                std::to_string(last_newton.trial_residual_norms[
+                    static_cast<std::size_t>(line)]) + ",admissible=" +
+                std::to_string(last_newton.trial_admissible[
+                    static_cast<std::size_t>(line)]) + ",armijo=" +
+                std::to_string(last_newton.trial_armijo[
+                    static_cast<std::size_t>(line)]) + ")",
+            evidence);
+      }
+      const std::array<double, 6> local_operator_scalars = {
+          local_attempt.entry_residual_norm,
+          local_attempt.final_residual_norm,
+          local_stage.residual_norm,
+          local_stage.condensed_rhs_norm,
+          local_stage.trace_solution_norm,
+          local_stage.recovery_norm};
+      const std::array<double, 6> peer_operator_scalars = {
+          peer_attempt.entry_residual_norm,
+          peer_attempt.final_residual_norm,
+          peer_attempt.final_residual_norm,
+          last_newton.trace_right_hand_side_norm,
+          PeerStateNorm(last_newton.direction, true),
+          PeerStateNorm(last_newton.direction, false)};
+      for (std::size_t scalar = 0; scalar < local_operator_scalars.size();
+           ++scalar)
+      {
+        evidence.maximum_operator_relative_error = std::max(
+            evidence.maximum_operator_relative_error,
+            Rank2RelativeScalar(local_operator_scalars[scalar],
+                                peer_operator_scalars[scalar]));
+      }
+    }
+    for (int component = 0; component < sc25::state_components; ++component)
+    {
+      evidence.maximum_integral_relative_error = std::max({
+          evidence.maximum_integral_relative_error,
+          Rank2RelativeScalar(
+              local_stage.committed_integrals[static_cast<std::size_t>(component)],
+              peer_stage.committed_integrals[static_cast<std::size_t>(component)]),
+          Rank2RelativeScalar(
+              local_stage.conserved_integrals[static_cast<std::size_t>(component)],
+              peer_stage.accepted_integrals[static_cast<std::size_t>(component)])});
+    }
+    local_total_newton += local_attempt.newton_iterations;
+    local_total_gmres_iterations += local_attempt.gmres_iterations;
+    local_total_line_trials += local_attempt.line_search_trials;
+    ++evidence.checked_attempts;
+    ++evidence.checked_stages;
+  }
+  evidence.maximum_operator_relative_error = std::max(
+      evidence.maximum_operator_relative_error,
+      peer_oracle.maximum_jacobian_action_relative_l2);
+  Rank2Require(evidence.checked_restriction_rows == 1280,
+               "rank2 independent restriction census", evidence);
+  Rank2Require(evidence.checked_owner_bound_face_dofs == 720,
+               "rank2 per-face MFEM TDof owner binding census", evidence);
+  Rank2Require(evidence.checked_stages == 20 &&
+                   evidence.checked_attempts == 20 &&
+                   local_run.attempt_count == peer_run.attempt_count &&
+                   local_run.accepted_steps == peer_run.accepted_steps &&
+                   local_total_newton == peer_oracle.checked_newton_iterations &&
+                   evidence.checked_newton_records == local_total_newton &&
+                   evidence.checked_trial_records ==
+                       sc25::persistent_line_search_trials *
+                           local_total_newton &&
+                   evidence.checked_vector_records ==
+                       6 * (local_total_newton + 1) &&
+                   local_total_line_trials == local_total_newton &&
+                   peer_oracle.checked_line_search_trials ==
+                       sc25::persistent_line_search_trials *
+                           peer_oracle.checked_newton_iterations &&
+                   local_total_gmres_iterations > 0 &&
+                   evidence.independent_rank1_residual_assemblies > 0,
+               "rank2 independent stage census", evidence);
+  Rank2Require(evidence.maximum_operator_relative_error <= 5.0e-11,
+               "rank2/rank1 operator and solver scalar parity", evidence);
+  Rank2Require(evidence.maximum_vector_relative_error <= 5.0e-11,
+               "rank2 independent vector scientific parity", evidence);
+  Rank2Require(evidence.maximum_integral_relative_error <= 5.0e-11,
+               "rank2/rank1 integral parity", evidence);
+  return evidence.failures.empty();
+}
+
+bool RehashIndependentRank2Checkpoint(
+    sc25::PersistentRank2TrajectoryCheckpoint& checkpoint) noexcept
+{
+  checkpoint.raw_field_hashes = IndependentRank2Hashes(checkpoint.state);
+  checkpoint.descriptor.interior_hash =
+      checkpoint.raw_field_hashes.interior;
+  checkpoint.descriptor.trace_hash = checkpoint.raw_field_hashes.trace;
+  Rank2ManifestBuilder builder;
+  const dg::hdg::runtime::CheckpointDescriptor& descriptor =
+      checkpoint.descriptor;
+  const dg::hdg::runtime::RuntimeTupleDescriptor& tuple = descriptor.tuple;
+  const sc25::Rank2TrajectoryStateHashes& hashes =
+      checkpoint.raw_field_hashes;
+  const bool valid = builder.Text(sc25::persistent_checkpoint_manifest_id) &&
+      builder.Text(checkpoint.projection.view()) &&
+      builder.Text(checkpoint.tuple.view()) &&
+      builder.Text(checkpoint.scenario.view()) &&
+      builder.U64(static_cast<std::uint64_t>(checkpoint.shard_rank)) &&
+      builder.U64(descriptor.schema_version) &&
+      builder.U64(descriptor.successful_commit ? 1U : 0U) &&
+      builder.U64(static_cast<std::uint64_t>(descriptor.restart_mode)) &&
+      builder.Text(tuple.model.view()) &&
+      builder.Text(tuple.formulation.view()) &&
+      builder.Text(tuple.trace.view()) &&
+      builder.Text(tuple.stabilization.view()) &&
+      builder.Text(tuple.time_treatment.view()) &&
+      builder.Text(tuple.backend.view()) &&
+      builder.Text(tuple.precision.view()) &&
+      builder.Text(descriptor.mfem_pin.view()) &&
+      builder.Hash(descriptor.mesh_hash) &&
+      builder.Hash(descriptor.partition_hash) &&
+      builder.Hash(descriptor.topology_hash) &&
+      builder.U64(descriptor.rank_count) &&
+      builder.U64(static_cast<std::uint64_t>(descriptor.polynomial_order)) &&
+      builder.Text(descriptor.layout.view()) &&
+      builder.Text(descriptor.precision.view()) &&
+      builder.U64(descriptor.cursor) &&
+      builder.U64(dg::hdg::runtime::detail::DoubleBits(descriptor.dt)) &&
+      builder.U64(dg::hdg::runtime::detail::DoubleBits(
+          descriptor.coordinates.time)) &&
+      builder.U64(descriptor.coordinates.step) &&
+      builder.U64(descriptor.coordinates.generation) &&
+      builder.U64(descriptor.coordinates.cursor) &&
+      builder.U64(dg::hdg::runtime::detail::DoubleBits(
+          descriptor.coordinates.dt)) &&
+      builder.U64(descriptor.coordinate_fingerprint) &&
+      builder.Hash(descriptor.interior_hash) &&
+      builder.Hash(descriptor.trace_hash) &&
+      builder.U64(checkpoint.state.u.size()) &&
+      builder.U64(checkpoint.state.sigma.size()) &&
+      builder.U64(checkpoint.state.z.size()) &&
+      builder.U64(checkpoint.state.uhat.size()) &&
+      builder.U64(checkpoint.state.sigmahat.size()) &&
+      builder.Hash(hashes.u) && builder.Hash(hashes.sigma) &&
+      builder.Hash(hashes.z) && builder.Hash(hashes.uhat) &&
+      builder.Hash(hashes.sigmahat) && builder.Hash(hashes.shard);
+  const dg::hdg::runtime::StateHash local_manifest = valid ? builder.Finish() :
+      dg::hdg::runtime::StateHash{};
+  std::array<std::uint8_t, 64> rank_ordered{};
+  if (local_manifest == dg::hdg::runtime::StateHash{} ||
+      MPI_Allgather(local_manifest.bytes.data(),
+                    static_cast<int>(local_manifest.bytes.size()),
+                    MPI_UINT8_T, rank_ordered.data(),
+                    static_cast<int>(local_manifest.bytes.size()),
+                    MPI_UINT8_T, MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    checkpoint.canonical_manifest_hash = {};
+    return false;
+  }
+  Rank2ManifestBuilder combined;
+  bool combined_valid =
+      combined.Text("HDG-SC25-RANK2-COMBINED-CHECKPOINT-v1") &&
+      combined.U64(2) && combined.U64(local_manifest.bytes.size());
+  for (int rank = 0; combined_valid && rank < 2; ++rank)
+  {
+    dg::hdg::runtime::StateHash shard{};
+    std::copy_n(rank_ordered.begin() +
+                    static_cast<std::ptrdiff_t>(rank) *
+                        local_manifest.bytes.size(),
+                local_manifest.bytes.size(), shard.bytes.begin());
+    combined_valid = combined.U64(static_cast<std::uint64_t>(rank)) &&
+        combined.Hash(shard);
+  }
+  checkpoint.canonical_manifest_hash = combined_valid ? combined.Finish() :
+      dg::hdg::runtime::StateHash{};
+  return checkpoint.canonical_manifest_hash !=
+      dg::hdg::runtime::StateHash{};
+}
+
 } // namespace dg_igr_hdg_sc25_cpu_test

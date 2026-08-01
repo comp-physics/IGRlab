@@ -80,6 +80,32 @@ struct IndependentTrajectoryEvidence final
   std::vector<std::string> failures;
 };
 
+struct IndependentRank2TrajectoryEvidence final
+{
+  int checked_local_elements = 0;
+  int checked_local_faces = 0;
+  int checked_restriction_rows = 0;
+  int checked_owner_bound_face_dofs = 0;
+  int independently_owned_faces = 0;
+  int independently_owned_true_dofs = 0;
+  int independently_global_faces = 0;
+  int independently_covered_true_dofs = 0;
+  int checked_stages = 0;
+  int checked_attempts = 0;
+  int checked_newton_records = 0;
+  int checked_trial_records = 0;
+  int checked_vector_records = 0;
+  int checked_checkpoint_cadence = 0;
+  int independent_rank1_residual_assemblies = 0;
+  double maximum_peer_relative_error = 0.0;
+  double maximum_operator_relative_error = 0.0;
+  double maximum_vector_relative_error = 0.0;
+  double maximum_integral_relative_error = 0.0;
+  double p_pt_adjoint_relative_error = 0.0;
+  double maximum_q12_q14_sensitivity = 0.0;
+  std::vector<std::string> failures;
+};
+
 /**
  * Independently reconstruct MFEM metadata and elementary algebra.  The oracle
  * consumes public state, never production-owned certification booleans.
@@ -107,5 +133,24 @@ bool EvaluateIndependentAuxiliaryResidualOracle(
     const dg::hdg::runtime::cpu::sc25::PersistentTrajectoryState& state,
     int quadrature_order,
     dg::hdg::runtime::cpu::sc25::AuxiliaryResidualMetrics& metrics);
+
+bool EvaluateIndependentRank2StateAdmissibilityOracle(
+    dg::hdg::runtime::cpu::sc25::PersistentSc25ScalarIgrCpuFoundation&
+        foundation,
+    const dg::hdg::runtime::cpu::sc25::PersistentRank2TrajectoryState& state,
+    int quadrature_order);
+
+bool RunIndependentRank2TrajectoryOracle(
+    dg::hdg::runtime::cpu::sc25::PersistentSc25ScalarIgrCpuFoundation&
+        rank2,
+    dg::hdg::runtime::cpu::sc25::PersistentSc25ScalarIgrCpuFoundation&
+        rank1_peer,
+    const dg::hdg::runtime::cpu::sc25::PersistentRank2TrajectoryCheckpoint&
+        checkpoint10,
+    IndependentRank2TrajectoryEvidence& evidence);
+
+bool RehashIndependentRank2Checkpoint(
+    dg::hdg::runtime::cpu::sc25::PersistentRank2TrajectoryCheckpoint&
+        checkpoint) noexcept;
 
 } // namespace dg_igr_hdg_sc25_cpu_test
