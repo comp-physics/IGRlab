@@ -2708,6 +2708,10 @@ struct TrajectoryStoragePolicy final
   static constexpr bool private_copy_is_independent = true;
   static constexpr bool publish_is_atomic = true;
   static constexpr bool publish_preserves_disjoint_backing = true;
+  static constexpr bool publish_is_complete_slot_exchange = true;
+  static constexpr bool candidate_retains_exact_old_state_after_publish = true;
+  static constexpr bool revert_publish_is_exact_byte_inverse = true;
+  static constexpr bool publish_and_revert_preserve_disjoint_backing = true;
 
   static bool PrepareCandidate(const TrajectorySlot& committed,
                                TrajectorySlot& candidate) noexcept
@@ -2744,6 +2748,11 @@ struct TrajectoryStoragePolicy final
   {
     using std::swap;
     swap(committed, candidate);
+  }
+  static void RevertPublish(TrajectorySlot& committed,
+                            TrajectorySlot& candidate) noexcept
+  {
+    Publish(committed, candidate);
   }
   static bool Disjoint(const TrajectorySlot& left,
                        const TrajectorySlot& right) noexcept
@@ -3197,6 +3206,24 @@ struct PersistentTrajectoryImplementation final
   bool initialized = false;
   std::uint64_t matrix_generation = 0;
   bool reuse_baseline_frozen = false;
+  std::optional<TrajectoryContract::PreparedCommitToken>
+      transaction_prepared;
+  std::optional<TrajectoryContract::ProvisionalCommitToken>
+      transaction_provisional;
+  PersistentTrajectoryEvidence transaction_prior_evidence{};
+  PersistentTrajectoryEvidence transaction_candidate_evidence{};
+  TrajectoryStatus transaction_prior_status =
+      TrajectoryStatus::uninitialized;
+  TrajectoryStatus transaction_prior_first_failure =
+      TrajectoryStatus::uninitialized;
+  TrajectoryStatus transaction_candidate_status =
+      TrajectoryStatus::uninitialized;
+  TrajectoryStatus transaction_candidate_first_failure =
+      TrajectoryStatus::uninitialized;
+  PersistentTrajectoryState transaction_candidate_state{};
+  CheckpointDescriptor transaction_future_descriptor{};
+  std::uint64_t active_transaction_serial = 0;
+  std::uint64_t next_transaction_serial = 1;
 
   bool InitializeStorage(
       PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept;
@@ -3237,7 +3264,8 @@ struct PersistentTrajectoryImplementation final
   TrajectoryStatus ExecuteAttempt(
       PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
       const BeginOutcome& begin, TrajectoryFailureInjection injection,
-      TrajectoryAttemptEvidence& attempt) noexcept;
+      TrajectoryAttemptEvidence& attempt,
+      bool prepare_only = false) noexcept;
   TrajectoryStatus Advance(
       PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
       TrajectoryFailureInjection injection) noexcept;
@@ -4963,7 +4991,7 @@ void PersistentTrajectoryImplementation::RefreshEvidence() noexcept
 TrajectoryStatus PersistentTrajectoryImplementation::ExecuteAttempt(
     PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
     const BeginOutcome& begin, const TrajectoryFailureInjection injection,
-    TrajectoryAttemptEvidence& attempt) noexcept
+    TrajectoryAttemptEvidence& attempt, const bool prepare_only) noexcept
 {
   attempt = {};
   attempt.injection = injection;
@@ -5269,10 +5297,42 @@ TrajectoryStatus PersistentTrajectoryImplementation::ExecuteAttempt(
                              telemetry,
                              static_cast<std::uint64_t>(attempt.target_step),
                              originating};
-  const AttemptOutcome outcome = contract->FinishAttempt(
-      begin.attempt, report, std::move(products));
+  AttemptOutcome outcome{};
+  bool prepared = false;
+  if (prepare_only && IsAccepted(result))
+  {
+    auto staging = contract->FreezeCandidate(
+        begin.attempt, static_cast<std::uint64_t>(attempt.target_step));
+    TrajectorySlot prepared_state;
+    if (staging && contract->CopyPrepared(*staging, prepared_state))
+    {
+      transaction_future_descriptor = staging->future_checkpoint();
+      transaction_candidate_state = ToPublicState(prepared_state);
+      auto prepared_token = contract->PrepareCommit(
+          std::move(*staging), report, std::move(products));
+      if (prepared_token)
+      {
+        transaction_prepared.emplace(std::move(*prepared_token));
+        prepared = true;
+      }
+    }
+    if (!prepared)
+    {
+      result = TrajectoryStatus::HdgSc25PublicationFailure;
+    }
+  }
+  else
+  {
+    outcome = contract->FinishAttempt(
+        begin.attempt, report, std::move(products));
+  }
   TrajectorySlot published;
-  if (!contract->CopyPublished(contract->Published(), published))
+  if (prepared)
+  {
+    published = ToSlot(transaction_candidate_state);
+    outcome = {RunStatus::committed, FailureReason::none, true, false};
+  }
+  else if (!contract->CopyPublished(contract->Published(), published))
   {
     result = TrajectoryStatus::HdgSc25PublicationFailure;
   }
@@ -5286,7 +5346,8 @@ TrajectoryStatus PersistentTrajectoryImplementation::ExecuteAttempt(
     result = TrajectoryStatus::HdgSc25PublicationFailure;
   }
   attempt.status = result;
-  attempt.published_coordinates = contract->coordinates();
+  attempt.published_coordinates = prepared
+      ? transaction_future_descriptor.coordinates : contract->coordinates();
   attempt.exit_reuse = ReuseSnapshot(owner);
   return result;
 }
@@ -5420,6 +5481,240 @@ TrajectoryStatus PersistentTrajectoryImplementation::Advance(
   return status;
 }
 
+TrajectoryStatus
+PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
+    Rank1Transaction& output,
+    const TrajectoryFailureInjection injection) noexcept
+{
+  if (output.valid_) return TrajectoryStatus::invalid_configuration;
+  output.owner_ = nullptr;
+  output.serial_ = 0;
+  output.provisionally_installed_ = false;
+  output.candidate_state_ = {};
+  output.future_checkpoint_ = {};
+  if (!implementation_ || !implementation_->trajectory ||
+      !implementation_->trajectory->initialized)
+  {
+    return TrajectoryStatus::uninitialized;
+  }
+  PersistentTrajectoryImplementation& trajectory =
+      *implementation_->trajectory;
+  if (!trajectory.contract || trajectory.active_transaction_serial != 0 ||
+      trajectory.transaction_prepared || trajectory.transaction_provisional ||
+      trajectory.next_transaction_serial == 0 ||
+      trajectory.evidence.attempt_count >=
+          static_cast<int>(trajectory.evidence.attempts.size()) ||
+      trajectory.contract->coordinates().step >= persistent_required_steps)
+  {
+    return TrajectoryStatus::invalid_configuration;
+  }
+
+  TrajectorySlot before;
+  std::array<double, state_components> before_integrals{};
+  if (!trajectory.contract->CopyPublished(
+          trajectory.contract->Published(), before) ||
+      !trajectory.Integrals(*implementation_, before, before_integrals))
+  {
+    return TrajectoryStatus::HdgSc25PublicationFailure;
+  }
+
+  trajectory.transaction_prior_evidence = trajectory.evidence;
+  trajectory.transaction_prior_status = trajectory.status;
+  trajectory.transaction_prior_first_failure = trajectory.first_failure;
+
+  const BeginOutcome begin = trajectory.contract->status() ==
+          RunStatus::retry_available
+      ? trajectory.contract->Retry()
+      : trajectory.contract->BeginStep({InteriorSpace::l2, persistent_dt});
+  const int first_attempt_index = trajectory.evidence.attempt_count++;
+  TrajectoryStatus result = trajectory.ExecuteAttempt(
+      *implementation_, begin, injection,
+      trajectory.evidence.attempts[
+          static_cast<std::size_t>(first_attempt_index)], true);
+  ++trajectory.evidence.attempted_steps;
+  int accepted_attempt_index = first_attempt_index;
+  if (!IsAccepted(result))
+  {
+    trajectory.RememberFailure(result);
+    if (trajectory.contract->status() != RunStatus::retry_available ||
+        trajectory.evidence.attempt_count >=
+            static_cast<int>(trajectory.evidence.attempts.size()))
+    {
+      trajectory.status = TrajectoryStatus::HdgSc25RetryExhausted;
+      trajectory.RememberFailure(trajectory.status);
+      trajectory.RefreshEvidence();
+      return trajectory.status;
+    }
+    const BeginOutcome retry = trajectory.contract->Retry();
+    accepted_attempt_index = trajectory.evidence.attempt_count++;
+    ++trajectory.evidence.retry_attempts;
+    result = trajectory.ExecuteAttempt(
+        *implementation_, retry, TrajectoryFailureInjection::none,
+        trajectory.evidence.attempts[
+            static_cast<std::size_t>(accepted_attempt_index)], true);
+    if (!IsAccepted(result))
+    {
+      trajectory.RememberFailure(result);
+      trajectory.status = TrajectoryStatus::HdgSc25RetryExhausted;
+      trajectory.RememberFailure(trajectory.status);
+      trajectory.RefreshEvidence();
+      return trajectory.status;
+    }
+    result = TrajectoryStatus::HdgSc25AcceptedAfterOneRetry;
+    trajectory.evidence.attempts[
+        static_cast<std::size_t>(accepted_attempt_index)].status = result;
+  }
+
+  const TrajectorySlot accepted = ToSlot(trajectory.transaction_candidate_state);
+  std::array<double, state_components> accepted_integrals{};
+  const StateCoordinates coordinates =
+      trajectory.transaction_future_descriptor.coordinates;
+  if (!trajectory.transaction_prepared ||
+      !trajectory.Integrals(*implementation_, accepted, accepted_integrals) ||
+      coordinates.step == 0 ||
+      coordinates.step > persistent_required_steps ||
+      coordinates.generation != coordinates.step ||
+      coordinates.cursor != coordinates.step ||
+      detail::DoubleBits(coordinates.dt) !=
+          detail::DoubleBits(persistent_dt) ||
+      trajectory.evidence.step_evidence_count < 0 ||
+      trajectory.evidence.step_evidence_count >=
+          static_cast<int>(trajectory.evidence.steps.size()))
+  {
+    return TrajectoryStatus::HdgSc25PublicationFailure;
+  }
+  TrajectoryStepEvidence& step = trajectory.evidence.steps[
+      static_cast<std::size_t>(trajectory.evidence.step_evidence_count)];
+  step.accepted = true;
+  step.step = static_cast<int>(coordinates.step);
+  step.time = coordinates.time;
+  step.dt = coordinates.dt;
+  step.generation = coordinates.generation;
+  step.attempt_index = accepted_attempt_index;
+  step.committed_integrals = before_integrals;
+  step.accepted_integrals = accepted_integrals;
+  step.accepted_state = trajectory.transaction_candidate_state;
+  step.accepted_hashes = HashState(accepted);
+  step.reuse = trajectory.ReuseSnapshot(*implementation_);
+  trajectory.evidence.accepted_steps = static_cast<int>(coordinates.step);
+  ++trajectory.evidence.step_evidence_count;
+  trajectory.status = result;
+  trajectory.evidence.status = result;
+  trajectory.evidence.first_failure = trajectory.first_failure;
+  trajectory.evidence.contract_status = RunStatus::committed;
+  trajectory.evidence.contract_last_failure = FailureReason::none;
+  trajectory.evidence.coordinates = coordinates;
+  trajectory.transaction_candidate_evidence = trajectory.evidence;
+  trajectory.transaction_candidate_status = result;
+  trajectory.transaction_candidate_first_failure = trajectory.first_failure;
+
+  PersistentTrajectoryCheckpoint checkpoint{};
+  checkpoint.descriptor = trajectory.transaction_future_descriptor;
+  checkpoint.state = trajectory.transaction_candidate_state;
+  checkpoint.projection = StableIdentity::Copy(projection_id);
+  checkpoint.tuple = StableIdentity::Copy(cpu_rank1_tuple_id);
+  checkpoint.scenario = StableIdentity::Copy(persistent_fixture_id);
+  checkpoint.raw_field_hashes = HashState(accepted);
+  checkpoint.fields = CheckpointFieldIdentities();
+  checkpoint.canonical_manifest_hash =
+      CanonicalCheckpointManifestHash(checkpoint);
+  if (checkpoint.canonical_manifest_hash == StateHash{})
+  {
+    return TrajectoryStatus::HdgSc25PublicationFailure;
+  }
+
+  const std::uint64_t serial = trajectory.next_transaction_serial++;
+  trajectory.active_transaction_serial = serial;
+  trajectory.evidence = trajectory.transaction_prior_evidence;
+  trajectory.status = trajectory.transaction_prior_status;
+  trajectory.first_failure = trajectory.transaction_prior_first_failure;
+  output.owner_ = this;
+  output.serial_ = serial;
+  output.valid_ = true;
+  output.provisionally_installed_ = false;
+  output.candidate_state_ = trajectory.transaction_candidate_state;
+  output.future_checkpoint_ = checkpoint;
+  return result;
+}
+
+bool PersistentSc25ScalarIgrCpuFoundation::
+InstallPersistentTrajectoryTransaction(Rank1Transaction& transaction) noexcept
+{
+  if (!implementation_ || !implementation_->trajectory ||
+      transaction.owner_ != this || !transaction.valid_ ||
+      transaction.provisionally_installed_)
+    return false;
+  PersistentTrajectoryImplementation& trajectory =
+      *implementation_->trajectory;
+  if (transaction.serial_ == 0 ||
+      transaction.serial_ != trajectory.active_transaction_serial ||
+      !trajectory.transaction_prepared || trajectory.transaction_provisional)
+    return false;
+  auto provisional = trajectory.contract->CommitPrepared(
+      std::move(*trajectory.transaction_prepared));
+  trajectory.transaction_prepared.reset();
+  if (!provisional) return false;
+  trajectory.transaction_provisional.emplace(std::move(*provisional));
+  trajectory.evidence = trajectory.transaction_candidate_evidence;
+  trajectory.status = trajectory.transaction_candidate_status;
+  trajectory.first_failure = trajectory.transaction_candidate_first_failure;
+  transaction.provisionally_installed_ = true;
+  return true;
+}
+
+bool PersistentSc25ScalarIgrCpuFoundation::
+RevertPersistentTrajectoryTransaction(Rank1Transaction&& transaction) noexcept
+{
+  if (!implementation_ || !implementation_->trajectory ||
+      transaction.owner_ != this || !transaction.valid_ ||
+      !transaction.provisionally_installed_)
+    return false;
+  PersistentTrajectoryImplementation& trajectory =
+      *implementation_->trajectory;
+  if (transaction.serial_ == 0 ||
+      transaction.serial_ != trajectory.active_transaction_serial ||
+      !trajectory.transaction_provisional)
+    return false;
+  const AttemptOutcome reverted = trajectory.contract->RevertCommit(
+      std::move(*trajectory.transaction_provisional),
+      FailureReason::backend_failure);
+  trajectory.transaction_provisional.reset();
+  trajectory.evidence = trajectory.transaction_prior_evidence;
+  trajectory.status = trajectory.transaction_prior_status;
+  trajectory.first_failure = trajectory.transaction_prior_first_failure;
+  trajectory.active_transaction_serial = 0;
+  transaction.owner_ = nullptr;
+  transaction.serial_ = 0;
+  transaction.valid_ = false;
+  transaction.provisionally_installed_ = false;
+  return !reverted.committed && reverted.retry_available;
+}
+
+bool PersistentSc25ScalarIgrCpuFoundation::
+FinalizePersistentTrajectoryTransaction(Rank1Transaction&& transaction)
+    noexcept
+{
+  if (!implementation_ || !implementation_->trajectory ||
+      transaction.owner_ != this || !transaction.valid_ ||
+      !transaction.provisionally_installed_)
+    return false;
+  PersistentTrajectoryImplementation& trajectory =
+      *implementation_->trajectory;
+  if (transaction.serial_ == 0 ||
+      transaction.serial_ != trajectory.active_transaction_serial ||
+      !trajectory.transaction_provisional)
+    return false;
+  const AttemptOutcome finalized = trajectory.contract->FinalizeCommit(
+      std::move(*trajectory.transaction_provisional));
+  trajectory.transaction_provisional.reset();
+  trajectory.active_transaction_serial = 0;
+  transaction.owner_ = nullptr;
+  transaction.serial_ = 0;
+  transaction.valid_ = false;
+  transaction.provisionally_installed_ = false;
+  return finalized.committed && finalized.reason == FailureReason::none;
+}
+
 namespace
 {
 
@@ -5502,6 +5797,254 @@ bool SameRank2StateBytes(const PersistentRank2TrajectoryState& left,
   return same(left.u, right.u) && same(left.sigma, right.sigma) &&
       same(left.z, right.z) && same(left.uhat, right.uhat) &&
       same(left.sigmahat, right.sigmahat);
+}
+
+bool Rank2StateStorageCompatible(
+    const PersistentRank2TrajectoryState& destination,
+    const PersistentRank2TrajectoryState& source) noexcept
+{
+  return destination.u.size() == source.u.size() &&
+      destination.sigma.size() == source.sigma.size() &&
+      destination.z.size() == source.z.size() &&
+      destination.uhat.size() == source.uhat.size() &&
+      destination.sigmahat.size() == source.sigmahat.size();
+}
+
+void CopyRank2StateValuesNoAlloc(
+    PersistentRank2TrajectoryState& destination,
+    const PersistentRank2TrajectoryState& source) noexcept
+{
+  std::copy(source.u.begin(), source.u.end(), destination.u.begin());
+  std::copy(source.sigma.begin(), source.sigma.end(),
+            destination.sigma.begin());
+  std::copy(source.z.begin(), source.z.end(), destination.z.begin());
+  std::copy(source.uhat.begin(), source.uhat.end(),
+            destination.uhat.begin());
+  std::copy(source.sigmahat.begin(), source.sigmahat.end(),
+            destination.sigmahat.begin());
+}
+
+bool Rank2NewtonStorageCompatible(
+    const Rank2TrajectoryNewtonEvidence& destination,
+    const Rank2TrajectoryNewtonEvidence& source) noexcept
+{
+  return Rank2StateStorageCompatible(destination.entry, source.entry) &&
+      Rank2StateStorageCompatible(destination.recovered_increment,
+                                  source.recovered_increment) &&
+      destination.nonlinear_residual.size() ==
+          source.nonlinear_residual.size() &&
+      destination.jacobian_action_input.size() ==
+          source.jacobian_action_input.size() &&
+      destination.jacobian_action_result.size() ==
+          source.jacobian_action_result.size() &&
+      destination.condensed_right_hand_side.size() ==
+          source.condensed_right_hand_side.size() &&
+      destination.true_trace_solution.size() ==
+          source.true_trace_solution.size();
+}
+
+void CopyRank2NewtonValuesNoAlloc(
+    Rank2TrajectoryNewtonEvidence& destination,
+    const Rank2TrajectoryNewtonEvidence& source) noexcept
+{
+  destination.attempted = source.attempted;
+  destination.completed = source.completed;
+  destination.iteration = source.iteration;
+  destination.entry_residual_norm = source.entry_residual_norm;
+  destination.accepted_residual_norm = source.accepted_residual_norm;
+  destination.accepted_line_search_index =
+      source.accepted_line_search_index;
+  destination.trace_iterations = source.trace_iterations;
+  destination.trace_true_residual_norm = source.trace_true_residual_norm;
+  destination.trace_right_hand_side_norm =
+      source.trace_right_hand_side_norm;
+  destination.maximum_local_application_residual =
+      source.maximum_local_application_residual;
+  CopyRank2StateValuesNoAlloc(destination.entry, source.entry);
+  CopyRank2StateValuesNoAlloc(destination.recovered_increment,
+                              source.recovered_increment);
+  std::copy(source.nonlinear_residual.begin(),
+            source.nonlinear_residual.end(),
+            destination.nonlinear_residual.begin());
+  std::copy(source.jacobian_action_input.begin(),
+            source.jacobian_action_input.end(),
+            destination.jacobian_action_input.begin());
+  std::copy(source.jacobian_action_result.begin(),
+            source.jacobian_action_result.end(),
+            destination.jacobian_action_result.begin());
+  std::copy(source.condensed_right_hand_side.begin(),
+            source.condensed_right_hand_side.end(),
+            destination.condensed_right_hand_side.begin());
+  std::copy(source.true_trace_solution.begin(),
+            source.true_trace_solution.end(),
+            destination.true_trace_solution.begin());
+  destination.trial_residual_norms = source.trial_residual_norms;
+  destination.trial_visited = source.trial_visited;
+  destination.trial_admissible = source.trial_admissible;
+  destination.trial_armijo = source.trial_armijo;
+}
+
+bool Rank2AttemptStorageCompatible(
+    const Rank2TrajectoryAttemptEvidence& destination,
+    const Rank2TrajectoryAttemptEvidence& source) noexcept
+{
+  if (!Rank2StateStorageCompatible(destination.entry_state,
+                                   source.entry_state) ||
+      !Rank2StateStorageCompatible(destination.accepted_direction,
+                                   source.accepted_direction))
+  {
+    return false;
+  }
+  for (std::size_t i = 0; i < destination.newton.size(); ++i)
+  {
+    if (!Rank2NewtonStorageCompatible(destination.newton[i],
+                                      source.newton[i]))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+void CopyRank2AttemptValuesNoAlloc(
+    Rank2TrajectoryAttemptEvidence& destination,
+    const Rank2TrajectoryAttemptEvidence& source) noexcept
+{
+  destination.status = source.status;
+  destination.injection = source.injection;
+  destination.target_step = source.target_step;
+  destination.retry_index = source.retry_index;
+  destination.attempted_newton_iterations =
+      source.attempted_newton_iterations;
+  destination.newton_iterations = source.newton_iterations;
+  destination.gmres_solves = source.gmres_solves;
+  destination.gmres_iterations = source.gmres_iterations;
+  destination.line_search_trials = source.line_search_trials;
+  destination.dt = source.dt;
+  destination.entry_residual_norm = source.entry_residual_norm;
+  destination.final_residual_norm = source.final_residual_norm;
+  destination.maximum_local_application_residual =
+      source.maximum_local_application_residual;
+  destination.trace_true_residual_norm = source.trace_true_residual_norm;
+  destination.trace_right_hand_side_norm =
+      source.trace_right_hand_side_norm;
+  destination.nonlinear_residual_bound = source.nonlinear_residual_bound;
+  destination.committed_coordinates = source.committed_coordinates;
+  destination.published_coordinates = source.published_coordinates;
+  destination.entry_hashes = source.entry_hashes;
+  destination.candidate_hashes = source.candidate_hashes;
+  destination.published_hashes = source.published_hashes;
+  CopyRank2StateValuesNoAlloc(destination.entry_state, source.entry_state);
+  CopyRank2StateValuesNoAlloc(destination.accepted_direction,
+                              source.accepted_direction);
+  for (std::size_t i = 0; i < destination.newton.size(); ++i)
+  {
+    CopyRank2NewtonValuesNoAlloc(destination.newton[i], source.newton[i]);
+  }
+  destination.trial_residual_norms = source.trial_residual_norms;
+  destination.trial_admissible = source.trial_admissible;
+  destination.trial_armijo = source.trial_armijo;
+}
+
+bool Rank2StageStorageCompatible(
+    const Rank2TrajectoryStageEvidence& destination,
+    const Rank2TrajectoryStageEvidence& source) noexcept
+{
+  return Rank2StateStorageCompatible(destination.accepted_state,
+                                     source.accepted_state);
+}
+
+void CopyRank2StageValuesNoAlloc(
+    Rank2TrajectoryStageEvidence& destination,
+    const Rank2TrajectoryStageEvidence& source) noexcept
+{
+  destination.accepted = source.accepted;
+  destination.step = source.step;
+  destination.time = source.time;
+  destination.generation = source.generation;
+  destination.residual_norm = source.residual_norm;
+  destination.condensed_rhs_norm = source.condensed_rhs_norm;
+  destination.trace_solution_norm = source.trace_solution_norm;
+  destination.recovery_norm = source.recovery_norm;
+  destination.committed_integrals = source.committed_integrals;
+  destination.conserved_integrals = source.conserved_integrals;
+  CopyRank2StateValuesNoAlloc(destination.accepted_state,
+                              source.accepted_state);
+  destination.accepted_hashes = source.accepted_hashes;
+}
+
+bool Rank2EvidenceStorageCompatible(
+    const PersistentRank2TrajectoryEvidence& destination,
+    const PersistentRank2TrajectoryEvidence& source) noexcept
+{
+  if (!Rank2NewtonStorageCompatible(destination.initialization_operator,
+                                    source.initialization_operator))
+  {
+    return false;
+  }
+  for (std::size_t i = 0; i < destination.attempts.size(); ++i)
+  {
+    if (!Rank2AttemptStorageCompatible(destination.attempts[i],
+                                       source.attempts[i]))
+    {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < destination.stages.size(); ++i)
+  {
+    if (!Rank2StageStorageCompatible(destination.stages[i],
+                                     source.stages[i]))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+void CopyRank2EvidenceValuesNoAlloc(
+    PersistentRank2TrajectoryEvidence& destination,
+    const PersistentRank2TrajectoryEvidence& source) noexcept
+{
+  destination.status = source.status;
+  destination.first_failure = source.first_failure;
+  destination.census = source.census;
+  destination.coordinates = source.coordinates;
+  destination.initialization = source.initialization;
+  CopyRank2NewtonValuesNoAlloc(destination.initialization_operator,
+                               source.initialization_operator);
+  destination.accepted_steps = source.accepted_steps;
+  destination.attempted_steps = source.attempted_steps;
+  destination.retry_attempts = source.retry_attempts;
+  destination.attempt_count = source.attempt_count;
+  destination.step_evidence_count = source.step_evidence_count;
+  destination.trace_restart_dimension = source.trace_restart_dimension;
+  destination.trace_maximum_iterations = source.trace_maximum_iterations;
+  destination.ilu_type = source.ilu_type;
+  destination.ilu_level_of_fill = source.ilu_level_of_fill;
+  destination.ilu_local_reordering = source.ilu_local_reordering;
+  destination.topology_generation = source.topology_generation;
+  destination.storage_generation = source.storage_generation;
+  destination.solver_generation = source.solver_generation;
+  destination.detected_w8_owned_boundary_identity_changes =
+      source.detected_w8_owned_boundary_identity_changes;
+  destination.w8_device_transfer_calls = source.w8_device_transfer_calls;
+  destination.w8_owned_boundary_identity_hash =
+      source.w8_owned_boundary_identity_hash;
+  destination.w8_owned_boundary_object_count =
+      source.w8_owned_boundary_object_count;
+  destination.w8_owned_boundary_buffer_count =
+      source.w8_owned_boundary_buffer_count;
+  destination.opaque_mfem_hypre_observed =
+      source.opaque_mfem_hypre_observed;
+  for (std::size_t i = 0; i < destination.attempts.size(); ++i)
+  {
+    CopyRank2AttemptValuesNoAlloc(destination.attempts[i],
+                                  source.attempts[i]);
+  }
+  for (std::size_t i = 0; i < destination.stages.size(); ++i)
+  {
+    CopyRank2StageValuesNoAlloc(destination.stages[i], source.stages[i]);
+  }
 }
 
 Rank2TrajectoryStateHashes HashRank2State(
@@ -5711,6 +6254,21 @@ struct PersistentRank2TrajectoryImplementation final
   TrajectoryStatus status = TrajectoryStatus::uninitialized;
   TrajectoryStatus first_failure = TrajectoryStatus::uninitialized;
   bool initialized = false;
+  PersistentRank2TrajectoryState transaction_prior_state{};
+  PersistentRank2TrajectoryState transaction_state{};
+  PersistentRank2TrajectoryEvidence transaction_prior_evidence{};
+  PersistentRank2TrajectoryEvidence transaction_evidence{};
+  Rank2TrajectoryStageEvidence transaction_prior_pending_stage{};
+  Rank2TrajectoryStageEvidence transaction_pending_stage{};
+  TrajectoryStatus transaction_prior_status =
+      TrajectoryStatus::uninitialized;
+  TrajectoryStatus transaction_status = TrajectoryStatus::uninitialized;
+  TrajectoryStatus transaction_prior_first_failure =
+      TrajectoryStatus::uninitialized;
+  TrajectoryStatus transaction_first_failure =
+      TrajectoryStatus::uninitialized;
+  std::uint64_t active_transaction_serial = 0;
+  std::uint64_t next_transaction_serial = 1;
   StateHash mesh_hash{};
   StateHash partition_hash{};
   StateHash topology_hash{};
@@ -9431,6 +9989,11 @@ bool PersistentSc25ScalarIgrCpuFoundation::CopyPublishedTrajectoryState(
   {
     return false;
   }
+  if (implementation_->trajectory->transaction_provisional)
+  {
+    output = implementation_->trajectory->transaction_candidate_state;
+    return true;
+  }
   TrajectorySlot state;
   if (!implementation_->trajectory->contract->CopyPublished(
           implementation_->trajectory->contract->Published(), state))
@@ -9467,6 +10030,65 @@ bool PersistentSc25ScalarIgrCpuFoundation::CaptureTrajectoryCheckpoint(
   output.fields = CheckpointFieldIdentities();
   output.canonical_manifest_hash =
       CanonicalCheckpointManifestHash(output);
+  return true;
+}
+
+bool PersistentSc25ScalarIgrCpuFoundation::ImportTrajectoryCheckpoint(
+    const StateCoordinates& coordinates,
+    const PersistentTrajectoryState& state,
+    PersistentTrajectoryCheckpoint& output) const noexcept
+{
+  output = {};
+  if (!implementation_ || implementation_->ranks != 1 ||
+      !implementation_->trajectory ||
+      !implementation_->trajectory->contract || coordinates.step == 0 ||
+      coordinates.step > persistent_required_steps ||
+      coordinates.step != coordinates.generation ||
+      coordinates.step != coordinates.cursor ||
+      detail::DoubleBits(coordinates.time) !=
+          detail::DoubleBits(coordinates.step * persistent_dt) ||
+      detail::DoubleBits(coordinates.dt) != detail::DoubleBits(persistent_dt) ||
+      !Finite(state.u) || !Finite(state.sigma) || !Finite(state.z) ||
+      !Finite(state.uhat) || !Finite(state.sigmahat))
+  {
+    return false;
+  }
+  const PersistentResourceDescriptor& resources =
+      implementation_->trajectory->contract->resources();
+  if (!resources.Valid()) return false;
+
+  PersistentTrajectoryCheckpoint candidate{};
+  candidate.projection = StableIdentity::Copy(projection_id);
+  candidate.tuple = StableIdentity::Copy(cpu_rank1_tuple_id);
+  candidate.scenario = StableIdentity::Copy(persistent_fixture_id);
+  candidate.state = state;
+  candidate.raw_field_hashes = HashState(ToSlot(state));
+  candidate.fields = CheckpointFieldIdentities();
+  candidate.descriptor.schema_version = checkpoint_schema_version;
+  candidate.descriptor.successful_commit = true;
+  candidate.descriptor.restart_mode =
+      RestartMode::same_backend_rank_partition;
+  candidate.descriptor.tuple = CpuRank1Selection::Descriptor();
+  candidate.descriptor.mfem_pin = resources.mfem_pin;
+  candidate.descriptor.mesh_hash = resources.mesh_hash;
+  candidate.descriptor.partition_hash = resources.partition_hash;
+  candidate.descriptor.topology_hash = resources.topology_hash;
+  candidate.descriptor.rank_count = resources.rank_count;
+  candidate.descriptor.polynomial_order = resources.polynomial_order;
+  candidate.descriptor.layout = resources.layout;
+  candidate.descriptor.precision = StableIdentity::Copy("Fp64");
+  candidate.descriptor.cursor = coordinates.cursor;
+  candidate.descriptor.dt = persistent_dt;
+  candidate.descriptor.coordinates = coordinates;
+  candidate.descriptor.coordinate_fingerprint =
+      detail::CoordinateFingerprint(coordinates);
+  candidate.descriptor.interior_hash =
+      candidate.raw_field_hashes.interior;
+  candidate.descriptor.trace_hash = candidate.raw_field_hashes.trace;
+  candidate.canonical_manifest_hash =
+      CanonicalCheckpointManifestHash(candidate);
+  if (candidate.canonical_manifest_hash == StateHash{}) return false;
+  output = std::move(candidate);
   return true;
 }
 
@@ -9819,6 +10441,235 @@ PersistentSc25ScalarIgrCpuFoundation::AdvancePersistentRank2Trajectory(
                                                       injection);
 }
 
+TrajectoryStatus
+PersistentSc25ScalarIgrCpuFoundation::
+PreparePersistentRank2TrajectoryTransaction(
+    Rank2Transaction& output,
+    const TrajectoryFailureInjection injection) noexcept
+{
+  if (output.valid_) return TrajectoryStatus::invalid_configuration;
+  output.owner_ = nullptr;
+  output.serial_ = 0;
+  output.provisionally_installed_ = false;
+  output.candidate_state_ = {};
+  output.future_checkpoint_ = {};
+  if (!implementation_ || !implementation_->rank2_trajectory ||
+      !implementation_->rank2_trajectory->initialized)
+    return TrajectoryStatus::uninitialized;
+  PersistentRank2TrajectoryImplementation& trajectory =
+      *implementation_->rank2_trajectory;
+  if (trajectory.active_transaction_serial != 0 ||
+      trajectory.next_transaction_serial == 0 ||
+      trajectory.evidence.coordinates.step >= persistent_required_steps)
+    return TrajectoryStatus::invalid_configuration;
+
+  std::uint64_t prior_object_count = 0;
+  std::uint64_t prior_buffer_count = 0;
+  const StateHash prior_boundary = trajectory.BoundaryHash(
+      *implementation_, prior_object_count, prior_buffer_count);
+  try
+  {
+    trajectory.transaction_prior_state = trajectory.committed;
+    trajectory.transaction_prior_evidence = trajectory.evidence;
+    trajectory.transaction_prior_pending_stage = trajectory.pending_stage;
+  }
+  catch (...)
+  {
+    return TrajectoryStatus::HdgSc25PublicationFailure;
+  }
+  trajectory.transaction_prior_status = trajectory.status;
+  trajectory.transaction_prior_first_failure = trajectory.first_failure;
+  const TrajectoryStatus result = trajectory.Advance(*implementation_,
+                                                      injection);
+  if (!IsAccepted(result)) return result;
+
+  PersistentRank2TrajectoryCheckpoint checkpoint;
+  PersistentRank2TrajectoryState public_candidate;
+  bool prepared = CaptureRank2TrajectoryCheckpoint(checkpoint);
+  try
+  {
+    if (prepared) public_candidate = trajectory.committed;
+  }
+  catch (...)
+  {
+    prepared = false;
+  }
+  prepared = CollectiveAll(implementation_->communicator.value, prepared);
+  try
+  {
+    if (prepared)
+    {
+      trajectory.transaction_state = trajectory.committed;
+      trajectory.transaction_evidence = trajectory.evidence;
+      trajectory.transaction_pending_stage = trajectory.pending_stage;
+      trajectory.transaction_status = trajectory.status;
+      trajectory.transaction_first_failure = trajectory.first_failure;
+    }
+  }
+  catch (...)
+  {
+    prepared = false;
+  }
+
+  const bool restore_storage =
+      Rank2StateStorageCompatible(trajectory.committed,
+                                  trajectory.transaction_prior_state) &&
+      Rank2EvidenceStorageCompatible(
+          trajectory.evidence, trajectory.transaction_prior_evidence) &&
+      Rank2StageStorageCompatible(
+          trajectory.pending_stage,
+          trajectory.transaction_prior_pending_stage);
+  if (restore_storage)
+  {
+    CopyRank2StateValuesNoAlloc(trajectory.committed,
+                                trajectory.transaction_prior_state);
+    CopyRank2EvidenceValuesNoAlloc(
+        trajectory.evidence, trajectory.transaction_prior_evidence);
+    CopyRank2StageValuesNoAlloc(
+        trajectory.pending_stage,
+        trajectory.transaction_prior_pending_stage);
+    trajectory.status = trajectory.transaction_prior_status;
+    trajectory.first_failure = trajectory.transaction_prior_first_failure;
+  }
+  std::uint64_t restored_object_count = 0;
+  std::uint64_t restored_buffer_count = 0;
+  const StateHash restored_boundary = trajectory.BoundaryHash(
+      *implementation_, restored_object_count, restored_buffer_count);
+  const bool restored = restore_storage &&
+      SameRank2StateBytes(trajectory.committed,
+                          trajectory.transaction_prior_state) &&
+      restored_boundary == prior_boundary &&
+      restored_object_count == prior_object_count &&
+      restored_buffer_count == prior_buffer_count;
+  if (!CollectiveAll(implementation_->communicator.value,
+                     prepared && restored))
+  {
+    return TrajectoryStatus::HdgSc25PublicationFailure;
+  }
+
+  const bool install_storage =
+      Rank2StateStorageCompatible(trajectory.committed,
+                                  trajectory.transaction_state) &&
+      Rank2EvidenceStorageCompatible(trajectory.evidence,
+                                     trajectory.transaction_evidence) &&
+      Rank2StageStorageCompatible(trajectory.pending_stage,
+                                  trajectory.transaction_pending_stage) &&
+      Rank2StateStorageCompatible(trajectory.committed,
+                                  trajectory.transaction_prior_state) &&
+      Rank2EvidenceStorageCompatible(
+          trajectory.evidence, trajectory.transaction_prior_evidence) &&
+      Rank2StageStorageCompatible(
+          trajectory.pending_stage,
+          trajectory.transaction_prior_pending_stage);
+  if (!CollectiveAll(implementation_->communicator.value, install_storage))
+  {
+    return TrajectoryStatus::HdgSc25PublicationFailure;
+  }
+
+  const std::uint64_t serial = trajectory.next_transaction_serial++;
+  trajectory.active_transaction_serial = serial;
+  output.owner_ = this;
+  output.serial_ = serial;
+  output.valid_ = true;
+  output.provisionally_installed_ = false;
+  output.candidate_state_ = std::move(public_candidate);
+  output.future_checkpoint_ = std::move(checkpoint);
+  return result;
+}
+
+bool PersistentSc25ScalarIgrCpuFoundation::
+InstallPersistentRank2TrajectoryTransaction(Rank2Transaction& transaction)
+    noexcept
+{
+  if (!implementation_ || !implementation_->rank2_trajectory ||
+      transaction.owner_ != this || !transaction.valid_ ||
+      transaction.provisionally_installed_)
+    return false;
+  PersistentRank2TrajectoryImplementation& trajectory =
+      *implementation_->rank2_trajectory;
+  if (transaction.serial_ == 0 ||
+      transaction.serial_ != trajectory.active_transaction_serial)
+    return false;
+  const bool storage = Rank2StateStorageCompatible(
+                           trajectory.committed,
+                           trajectory.transaction_state) &&
+      Rank2EvidenceStorageCompatible(trajectory.evidence,
+                                     trajectory.transaction_evidence) &&
+      Rank2StageStorageCompatible(trajectory.pending_stage,
+                                  trajectory.transaction_pending_stage);
+  if (!storage) return false;
+  CopyRank2StateValuesNoAlloc(trajectory.committed,
+                              trajectory.transaction_state);
+  CopyRank2EvidenceValuesNoAlloc(trajectory.evidence,
+                                 trajectory.transaction_evidence);
+  CopyRank2StageValuesNoAlloc(trajectory.pending_stage,
+                              trajectory.transaction_pending_stage);
+  trajectory.status = trajectory.transaction_status;
+  trajectory.first_failure = trajectory.transaction_first_failure;
+  transaction.provisionally_installed_ = true;
+  return true;
+}
+
+bool PersistentSc25ScalarIgrCpuFoundation::
+RevertPersistentRank2TrajectoryTransaction(Rank2Transaction&& transaction)
+    noexcept
+{
+  if (!implementation_ || !implementation_->rank2_trajectory ||
+      transaction.owner_ != this || !transaction.valid_ ||
+      !transaction.provisionally_installed_)
+    return false;
+  PersistentRank2TrajectoryImplementation& trajectory =
+      *implementation_->rank2_trajectory;
+  if (transaction.serial_ == 0 ||
+      transaction.serial_ != trajectory.active_transaction_serial)
+    return false;
+  const bool storage = Rank2StateStorageCompatible(
+                           trajectory.committed,
+                           trajectory.transaction_prior_state) &&
+      Rank2EvidenceStorageCompatible(
+          trajectory.evidence, trajectory.transaction_prior_evidence) &&
+      Rank2StageStorageCompatible(
+          trajectory.pending_stage,
+          trajectory.transaction_prior_pending_stage);
+  if (!storage) return false;
+  CopyRank2StateValuesNoAlloc(trajectory.committed,
+                              trajectory.transaction_prior_state);
+  CopyRank2EvidenceValuesNoAlloc(
+      trajectory.evidence, trajectory.transaction_prior_evidence);
+  CopyRank2StageValuesNoAlloc(
+      trajectory.pending_stage,
+      trajectory.transaction_prior_pending_stage);
+  trajectory.status = trajectory.transaction_prior_status;
+  trajectory.first_failure = trajectory.transaction_prior_first_failure;
+  trajectory.active_transaction_serial = 0;
+  transaction.owner_ = nullptr;
+  transaction.serial_ = 0;
+  transaction.valid_ = false;
+  transaction.provisionally_installed_ = false;
+  return true;
+}
+
+bool PersistentSc25ScalarIgrCpuFoundation::
+FinalizePersistentRank2TrajectoryTransaction(Rank2Transaction&& transaction)
+    noexcept
+{
+  if (!implementation_ || !implementation_->rank2_trajectory ||
+      transaction.owner_ != this || !transaction.valid_ ||
+      !transaction.provisionally_installed_)
+    return false;
+  PersistentRank2TrajectoryImplementation& trajectory =
+      *implementation_->rank2_trajectory;
+  if (transaction.serial_ == 0 ||
+      transaction.serial_ != trajectory.active_transaction_serial)
+    return false;
+  trajectory.active_transaction_serial = 0;
+  transaction.owner_ = nullptr;
+  transaction.serial_ = 0;
+  transaction.valid_ = false;
+  transaction.provisionally_installed_ = false;
+  return true;
+}
+
 bool PersistentSc25ScalarIgrCpuFoundation::CopyPublishedRank2TrajectoryState(
     PersistentRank2TrajectoryState& output) const noexcept
 {
@@ -9875,8 +10726,7 @@ bool PersistentSc25ScalarIgrCpuFoundation::CaptureRank2TrajectoryCheckpoint(
     next.descriptor.topology_hash = trajectory.topology_hash;
     next.descriptor.rank_count = 2;
     next.descriptor.polynomial_order = 1;
-    next.descriptor.layout = StableIdentity::Copy(
-        "mfem.l2.dg-interface.byNODES.rank-local-owned-no-ghost.v3");
+    next.descriptor.layout = StableIdentity::Copy(interior_layout_id);
     next.descriptor.precision = StableIdentity::Copy("Fp64");
     next.descriptor.cursor = trajectory.evidence.coordinates.cursor;
     next.descriptor.dt = persistent_dt;
@@ -9918,6 +10768,125 @@ bool PersistentSc25ScalarIgrCpuFoundation::CaptureRank2TrajectoryCheckpoint(
   return true;
 }
 
+bool PersistentSc25ScalarIgrCpuFoundation::ImportRank2TrajectoryCheckpoint(
+    const StateCoordinates& coordinates,
+    const PersistentRank2TrajectoryState& state,
+    PersistentRank2TrajectoryCheckpoint& output) const noexcept
+{
+  output = {};
+  if (!implementation_ || implementation_->ranks != 2 ||
+      !implementation_->rank2_trajectory ||
+      !implementation_->rank2_trajectory->initialized)
+  {
+    return false;
+  }
+  const PersistentRank2TrajectoryImplementation& trajectory =
+      *implementation_->rank2_trajectory;
+  const bool local_valid = coordinates.step > 0 &&
+      coordinates.step <= persistent_required_steps &&
+      coordinates.step == coordinates.generation &&
+      coordinates.step == coordinates.cursor &&
+      detail::DoubleBits(coordinates.time) ==
+          detail::DoubleBits(coordinates.step * persistent_dt) &&
+      detail::DoubleBits(coordinates.dt) == detail::DoubleBits(persistent_dt) &&
+      Rank2StateStorageCompatible(state, trajectory.committed) &&
+      Rank2Finite(state);
+  if (!CollectiveAll(implementation_->communicator.value, local_valid))
+  {
+    return false;
+  }
+
+  PersistentRank2TrajectoryCheckpoint candidate{};
+  bool prepared = true;
+  try
+  {
+    candidate.projection = StableIdentity::Copy(projection_id);
+    candidate.tuple = StableIdentity::Copy(cpu_rank2_tuple_id);
+    candidate.scenario = StableIdentity::Copy(persistent_rank2_fixture_id);
+    candidate.shard_rank = implementation_->rank;
+    candidate.state = state;
+    candidate.raw_field_hashes = HashRank2State(candidate.state);
+    candidate.descriptor.schema_version = checkpoint_schema_version;
+    candidate.descriptor.successful_commit = true;
+    candidate.descriptor.restart_mode =
+        RestartMode::same_backend_rank_partition;
+    candidate.descriptor.tuple = CpuRank2Selection::Descriptor();
+    candidate.descriptor.mfem_pin = StableIdentity::Copy(
+        "mfem-d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec");
+    candidate.descriptor.mesh_hash = trajectory.mesh_hash;
+    candidate.descriptor.partition_hash = trajectory.partition_hash;
+    candidate.descriptor.topology_hash = trajectory.topology_hash;
+    candidate.descriptor.rank_count = 2;
+    candidate.descriptor.polynomial_order = 1;
+    candidate.descriptor.layout = StableIdentity::Copy(interior_layout_id);
+    candidate.descriptor.precision = StableIdentity::Copy("Fp64");
+    candidate.descriptor.cursor = coordinates.cursor;
+    candidate.descriptor.dt = persistent_dt;
+    candidate.descriptor.coordinates = coordinates;
+    candidate.descriptor.coordinate_fingerprint =
+        detail::CoordinateFingerprint(coordinates);
+    candidate.descriptor.interior_hash =
+        candidate.raw_field_hashes.interior;
+    candidate.descriptor.trace_hash = candidate.raw_field_hashes.trace;
+  }
+  catch (...)
+  {
+    prepared = false;
+  }
+  if (!CollectiveAll(implementation_->communicator.value, prepared))
+  {
+    return false;
+  }
+  const StateHash local_manifest = Rank2CheckpointManifestHash(candidate);
+  if (!CollectiveAll(implementation_->communicator.value,
+                     local_manifest != StateHash{}))
+  {
+    return false;
+  }
+  bool combined_valid = false;
+  candidate.canonical_manifest_hash = Rank2CombinedCheckpointManifest(
+      implementation_->communicator.value, local_manifest, combined_valid);
+  const bool complete = combined_valid &&
+      candidate.canonical_manifest_hash != StateHash{};
+  if (!CollectiveAll(implementation_->communicator.value, complete))
+  {
+    return false;
+  }
+  output = std::move(candidate);
+  return true;
+}
+
+bool PersistentSc25ScalarIgrCpuFoundation::CopyPersistentResourceDescriptor(
+    PersistentResourceDescriptor& output) const noexcept
+{
+  output = {};
+  if (!implementation_) return false;
+  if (implementation_->ranks == 1 && implementation_->trajectory &&
+      implementation_->trajectory->contract)
+  {
+    output = implementation_->trajectory->contract->resources();
+    return output.Valid();
+  }
+  if (implementation_->ranks != 2 || !implementation_->rank2_trajectory ||
+      !implementation_->rank2_trajectory->initialized)
+  {
+    return false;
+  }
+  const PersistentRank2TrajectoryImplementation& trajectory =
+      *implementation_->rank2_trajectory;
+  output = {
+      StableIdentity::Copy(
+          "mfem-d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec"),
+      trajectory.mesh_hash,
+      trajectory.partition_hash,
+      trajectory.topology_hash,
+      2,
+      1,
+      StableIdentity::Copy(interior_layout_id),
+      {true, true, true, false, 1, 1, 1, 1}};
+  return output.Valid();
+}
+
 TrajectoryStatus
 PersistentSc25ScalarIgrCpuFoundation::RestoreRank2TrajectoryCheckpoint(
     const PersistentRank2TrajectoryCheckpoint& checkpoint) noexcept
@@ -9955,7 +10924,7 @@ PersistentSc25ScalarIgrCpuFoundation::RestoreRank2TrajectoryCheckpoint(
       checkpoint.descriptor.rank_count == 2 &&
       checkpoint.descriptor.polynomial_order == 1 &&
       checkpoint.descriptor.layout == StableIdentity::Copy(
-          "mfem.l2.dg-interface.byNODES.rank-local-owned-no-ghost.v3") &&
+          interior_layout_id) &&
       checkpoint.descriptor.precision == StableIdentity::Copy("Fp64") &&
       checkpoint.descriptor.cursor ==
           checkpoint.descriptor.coordinates.cursor &&

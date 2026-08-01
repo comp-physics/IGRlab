@@ -35,6 +35,14 @@ if(_dg_igr_hdg_runtime_unclassified_cpp OR
           "${_dg_igr_hdg_runtime_unclassified_cpp};${_dg_igr_hdg_runtime_unclassified_cuda}")
 endif()
 
+if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
+  file(GLOB_RECURSE _dg_igr_hdg_auxiliary_sources CONFIGURE_DEPENDS
+       "${CMAKE_CURRENT_SOURCE_DIR}/../auxiliary/*.cpp")
+  dg_igr_add_hdg_cxx17_component(
+    TARGET dg_igr_hdg_auxiliary_cpu
+    SOURCES ${_dg_igr_hdg_auxiliary_sources})
+endif()
+
 if(DG_IGR_ENABLE_HDG_RUNTIME)
   if(MFEM_USE_CUDA)
     set(_dg_igr_hdg_runtime_cuda_expected_source
@@ -94,7 +102,8 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     DG_IGR_HDG_APP_HAS_CPU_SERIAL=1
     DG_IGR_HDG_APP_HAS_CPU_RANK2=1
     DG_IGR_HDG_APP_HAS_CUDA_RANK1=$<BOOL:${MFEM_USE_CUDA}>
-    DG_IGR_HDG_APP_HAS_CUDA_RANK2=$<BOOL:${MFEM_USE_CUDA}>)
+    DG_IGR_HDG_APP_HAS_CUDA_RANK2=$<BOOL:${MFEM_USE_CUDA}>
+    DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU=$<BOOL:${DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT}>)
   target_compile_options(dg_igr_hdg_runtime_app_contract PRIVATE
     $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
   target_link_libraries(dg_igr_hdg_runtime_app_contract
@@ -144,6 +153,9 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   target_link_libraries(dg_igr_hdg_runtime PRIVATE
                         dg_igr_hdg_runtime_app_contract
                         dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
+  if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
+    target_link_libraries(dg_igr_hdg_runtime PRIVATE dg_igr_hdg_auxiliary_cpu)
+  endif()
   target_compile_options(dg_igr_hdg_runtime PRIVATE
     $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
@@ -163,12 +175,4 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
       CUDA_SEPARABLE_COMPILATION ON
       CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   endif()
-endif()
-
-if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
-  file(GLOB_RECURSE _dg_igr_hdg_auxiliary_sources CONFIGURE_DEPENDS
-       "${CMAKE_CURRENT_SOURCE_DIR}/../auxiliary/*.cpp")
-  dg_igr_add_hdg_cxx17_component(
-    TARGET dg_igr_hdg_auxiliary_cpu
-    SOURCES ${_dg_igr_hdg_auxiliary_sources})
 endif()

@@ -16,6 +16,10 @@ inline constexpr std::string_view conventional_persistent_card_id =
     "exp.hdg.euler.conventional.smooth_persistent.w8a.v1";
 inline constexpr std::string_view conventional_persistent_case_id =
     "conventional-smooth-persistent-v1";
+inline constexpr std::string_view scalar_igr_persistent_card_id =
+    "exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3";
+inline constexpr std::string_view scalar_igr_persistent_case_id =
+    "sc25-periodic-smooth-persistent-v3";
 
 struct ConventionalEulerSmoothPersistentV1Tag
 {
@@ -31,6 +35,32 @@ struct EulerCompressible2dTag
 struct ConventionalHdgTag
 {
   static constexpr std::string_view id = "hdg.conventional";
+};
+
+struct TracedScalarSc25ProjectionV3Tag
+{
+  static constexpr std::string_view id = scalar_igr_persistent_card_id;
+};
+
+struct FullyHybridizedScalarSc25V3Tag
+{
+  static constexpr std::string_view id =
+      "FullyHybridizedScalarPeriodicSc25ProjectionV3";
+};
+
+struct DualConservativeScalarTraceV1Tag
+{
+  static constexpr std::string_view id = "DualConservativeScalarTraceV1";
+};
+
+struct W7Tau25DensityHeightP2V3Tag
+{
+  static constexpr std::string_view id = "W7Tau25.DensityHeightP2.v3";
+};
+
+struct BackwardEulerMonolithicV1Tag
+{
+  static constexpr std::string_view id = "BackwardEulerMonolithicV1";
 };
 
 struct MfemDgInterfaceTraceTag
@@ -93,5 +123,24 @@ using CudaRank1OneGpuRuntimeSelection =
 using CudaRank2OneGpuHostStagedRuntimeSelection =
     ConventionalEulerSmoothPersistentV1Selection<
         CudaRank2OneGpuHostStagedBackendTag>;
+
+template <typename BackendTag>
+using ScalarIgrSc25PersistentV3Selection =
+    StaticRunSelection<TracedScalarSc25ProjectionV3Tag,
+                       FullyHybridizedScalarSc25V3Tag,
+                       DualConservativeScalarTraceV1Tag,
+                       W7Tau25DensityHeightP2V3Tag,
+                       BackwardEulerMonolithicV1Tag,
+                       BackendTag,
+                       Fp64RuntimeTag>;
+
+using ScalarIgrCpuSerialRuntimeSelection =
+    ScalarIgrSc25PersistentV3Selection<CpuSerialBackendTag>;
+using ScalarIgrCpuRank2RuntimeSelection =
+    ScalarIgrSc25PersistentV3Selection<CpuRank2BackendTag>;
+using ScalarIgrCudaRank1RuntimeSelection =
+    ScalarIgrSc25PersistentV3Selection<CudaRank1OneGpuBackendTag>;
+using ScalarIgrCudaRank2RuntimeSelection =
+    ScalarIgrSc25PersistentV3Selection<CudaRank2OneGpuHostStagedBackendTag>;
 
 } // namespace dg::hdg::runtime

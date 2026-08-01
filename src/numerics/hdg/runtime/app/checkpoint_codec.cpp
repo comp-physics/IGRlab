@@ -524,13 +524,24 @@ void WriteRestartDeltaManifestV2(
     Writer& writer,
     const ValidatedApplicationConfig& writer_config)
 {
-  const FailureInjectionControlV1 reader_injection{
+  const bool scalar =
+      writer_config.scenario() == ApplicationScenarioV1::scalar_igr_sc25_v3;
+  const FailureInjectionControlV1 scalar_writer_injection{
+      FailureInjectionModeV1::prescribed,
+      smooth_periodic_euler_v1_failure_phase,
+      scalar_igr_sc25_v3_failure_target_step,
+      writer_config.deferred_runtime().required_injected_source_rank};
+  const FailureInjectionControlV1 conventional_reader_injection{
       FailureInjectionModeV1::prescribed,
       smooth_periodic_euler_v1_failure_phase,
       writer_config.scenario() == ApplicationScenarioV1::smoke
           ? smooth_periodic_euler_v1_smoke_failure_target_step
           : smooth_periodic_euler_v1_functional_failure_target_step,
       writer_config.deferred_runtime().required_injected_source_rank};
+  const FailureInjectionControlV1 writer_injection = scalar
+      ? scalar_writer_injection : FailureInjectionControlV1{};
+  const FailureInjectionControlV1 reader_injection = scalar
+      ? FailureInjectionControlV1{} : conventional_reader_injection;
   writer.U8(restart_delta_schema_v2);
   writer.U8(restart_delta_field_count_v2);
   writer.U8(1);
@@ -546,11 +557,13 @@ void WriteRestartDeltaManifestV2(
   writer.U8(static_cast<std::uint8_t>(StopAfterCheckpointV1::yes));
   writer.U8(static_cast<std::uint8_t>(StopAfterCheckpointV1::no));
   writer.U8(5);
-  WriteInjection(writer, {});
+  WriteInjection(writer, writer_injection);
   WriteInjection(writer, reader_injection);
   writer.U8(6);
-  writer.UnsignedLittleEndian(std::uint32_t{0});
-  writer.UnsignedLittleEndian(smooth_periodic_euler_v1_retry_limit);
+  writer.UnsignedLittleEndian(
+      scalar ? scalar_igr_sc25_v3_retry_limit : std::uint32_t{0});
+  writer.UnsignedLittleEndian(
+      scalar ? std::uint32_t{0} : smooth_periodic_euler_v1_retry_limit);
 }
 
 bool ReadRestartDeltaManifestV2(
@@ -762,6 +775,12 @@ bool ConfigMatchesSplitRestart(
 {
   StateHash derived_writer_run_hash{};
   const FailureInjectionControlV1 canonical_off{};
+  const bool scalar = expected.scalar_igr();
+  const FailureInjectionControlV1 scalar_writer_injection{
+      FailureInjectionModeV1::prescribed,
+      smooth_periodic_euler_v1_failure_phase,
+      scalar_igr_sc25_v3_failure_target_step,
+      expected.deferred_runtime().required_injected_source_rank};
   return value.card_id == expected.card_id() &&
       value.case_id == expected.case_id() &&
       value.scenario_id == expected.scenario_id() &&
@@ -811,14 +830,18 @@ bool ConfigMatchesSplitRestart(
       !expected.checkpoint_step().present &&
       value.stop_after_checkpoint == StopAfterCheckpointV1::yes &&
       expected.stop_after_checkpoint() == StopAfterCheckpointV1::no &&
-      value.injection == canonical_off &&
-      expected.injection().mode == FailureInjectionModeV1::prescribed &&
+      value.injection ==
+          (scalar ? scalar_writer_injection : canonical_off) &&
+      expected.injection() ==
+          (scalar ? canonical_off : delta.reader_injection) &&
       value.restart_mode == expected.restart_mode() &&
       value.restart_trajectory == expected.restart_trajectory() &&
       value.rollback_obligation == expected.rollback_obligation() &&
       value.source_rank_rule == expected.source_rank_rule() &&
-      value.retry_limit == 0 &&
-      expected.retry_limit() == smooth_periodic_euler_v1_retry_limit &&
+      value.retry_limit ==
+          (scalar ? scalar_igr_sc25_v3_retry_limit : 0U) &&
+      expected.retry_limit() ==
+          (scalar ? 0U : smooth_periodic_euler_v1_retry_limit) &&
       value.seed == expected.seed() &&
       delta.schema == restart_delta_schema_v2 &&
       delta.count == restart_delta_field_count_v2 &&
@@ -860,6 +883,7 @@ struct RankMetadata
 
 CheckpointCodecStatus ValidateBlockView(
     const Fp64CoefficientViewV1& block,
+    const std::uint32_t expected_component_count,
     const std::uint64_t expected_dofs_per_component,
     const std::uint64_t exact_coefficient_count,
     BlockMetadata& metadata) noexcept
@@ -867,7 +891,7 @@ CheckpointCodecStatus ValidateBlockView(
   std::uint64_t expected_count = 0;
   std::uint64_t byte_count = 0;
   if (block.data == nullptr || block.coefficient_count == 0 ||
-      block.component_count != euler_state_component_count_v1 ||
+      block.component_count != expected_component_count ||
       block.ordering != CoefficientOrderingV1::component_major)
   {
     return CheckpointCodecStatus::invalid_coefficient_schema;
@@ -940,12 +964,14 @@ CheckpointCodecStatus InspectRanks(
     candidate.rank = ranks[index].rank;
     CheckpointCodecStatus status = ValidateBlockView(
         ranks[index].interior,
+        extents.interior_component_count,
         extents.ranks[index].interior_dofs_per_component,
         extents.ranks[index].interior_coefficient_count,
         candidate.interior);
     if (status != CheckpointCodecStatus::ok) { return status; }
     status = ValidateBlockView(
         ranks[index].owned_true_trace,
+        extents.trace_component_count,
         extents.ranks[index].trace_dofs_per_component,
         extents.ranks[index].trace_coefficient_count,
         candidate.trace);
@@ -1016,12 +1042,13 @@ bool ReadBlockMetadata(Reader& reader, BlockMetadata& block) noexcept
 
 CheckpointCodecStatus ValidateBlockMetadata(
     const BlockMetadata& block,
+    const std::uint32_t expected_component_count,
     const std::uint64_t expected_dofs_per_component,
     const std::uint64_t exact_coefficient_count) noexcept
 {
   std::uint64_t expected_count = 0;
   std::uint64_t expected_bytes = 0;
-  if (block.component_count != euler_state_component_count_v1 ||
+  if (block.component_count != expected_component_count ||
       block.ordering != CoefficientOrderingV1::component_major)
   {
     return CheckpointCodecStatus::invalid_coefficient_schema;
@@ -1248,6 +1275,105 @@ bool ScenarioCheckpointTimeMatchesV1(
       8.0 * std::numeric_limits<double>::epsilon() * scale;
 }
 
+namespace detail
+{
+namespace
+{
+template <bool ToComponentMajor>
+bool TransposeScalarIgrInteriorV1(
+    const std::vector<double>& source,
+    const std::uint64_t scalar_dofs_per_element,
+    std::vector<double>& destination) noexcept
+{
+  constexpr std::uint64_t u_components = 4;
+  constexpr std::uint64_t sigma_components = 1;
+  constexpr std::uint64_t z_components = 2;
+  constexpr std::uint64_t components =
+      u_components + sigma_components + z_components;
+  if (source.empty() || scalar_dofs_per_element == 0 ||
+      source.size() % components != 0)
+    return false;
+  const std::uint64_t dofs_per_component = source.size() / components;
+  if (dofs_per_component % scalar_dofs_per_element != 0)
+    return false;
+  const std::uint64_t elements =
+      dofs_per_component / scalar_dofs_per_element;
+  try
+  {
+    std::vector<double> candidate(source.size(), 0.0);
+    const std::uint64_t u_count = u_components * dofs_per_component;
+    const std::uint64_t sigma_count = dofs_per_component;
+    for (std::uint64_t element = 0; element < elements; ++element)
+    {
+      for (std::uint64_t node = 0; node < scalar_dofs_per_element; ++node)
+      {
+        for (std::uint64_t component = 0; component < u_components;
+             ++component)
+        {
+          const std::uint64_t blocked =
+              element * u_components * scalar_dofs_per_element +
+              component * scalar_dofs_per_element + node;
+          const std::uint64_t component_major =
+              component * dofs_per_component +
+              element * scalar_dofs_per_element + node;
+          if constexpr (ToComponentMajor)
+            candidate[component_major] = source[blocked];
+          else
+            candidate[blocked] = source[component_major];
+        }
+        const std::uint64_t sigma_blocked =
+            u_count + element * scalar_dofs_per_element + node;
+        const std::uint64_t sigma_major =
+            u_components * dofs_per_component +
+            element * scalar_dofs_per_element + node;
+        if constexpr (ToComponentMajor)
+          candidate[sigma_major] = source[sigma_blocked];
+        else
+          candidate[sigma_blocked] = source[sigma_major];
+        for (std::uint64_t component = 0; component < z_components;
+             ++component)
+        {
+          const std::uint64_t blocked =
+              u_count + sigma_count +
+              element * z_components * scalar_dofs_per_element +
+              component * scalar_dofs_per_element + node;
+          const std::uint64_t component_major =
+              (u_components + sigma_components + component) *
+                  dofs_per_component +
+              element * scalar_dofs_per_element + node;
+          if constexpr (ToComponentMajor)
+            candidate[component_major] = source[blocked];
+          else
+            candidate[blocked] = source[component_major];
+        }
+      }
+    }
+    destination = std::move(candidate);
+    return true;
+  }
+  catch (...) { return false; }
+}
+} // namespace
+
+bool ScalarIgrFieldBlocksToComponentMajorV1(
+    const std::vector<double>& field_blocks,
+    const std::uint64_t scalar_dofs_per_element,
+    std::vector<double>& component_major) noexcept
+{
+  return TransposeScalarIgrInteriorV1<true>(
+      field_blocks, scalar_dofs_per_element, component_major);
+}
+
+bool ScalarIgrComponentMajorToFieldBlocksV1(
+    const std::vector<double>& component_major,
+    const std::uint64_t scalar_dofs_per_element,
+    std::vector<double>& field_blocks) noexcept
+{
+  return TransposeScalarIgrInteriorV1<false>(
+      component_major, scalar_dofs_per_element, field_blocks);
+}
+} // namespace detail
+
 bool DeriveScenarioCoefficientExtentsV1(
     const ValidatedApplicationConfig& config,
     const std::uint32_t rank_count,
@@ -1294,6 +1420,13 @@ bool DeriveScenarioCoefficientExtentsV1(
 
   ScenarioCoefficientExtentsV1 candidate{};
   candidate.rank_count = rank_count;
+  const CheckpointCoefficientSchemaV1 schema =
+      CheckpointCoefficientSchema(config);
+  candidate.interior_component_count = schema.interior_component_count;
+  candidate.trace_component_count = schema.trace_component_count;
+  if (schema.interior_component_count == 0 ||
+      schema.trace_component_count == 0)
+    return false;
   const std::uint64_t p1 =
       static_cast<std::uint64_t>(config.polynomial_order() + 1);
   std::uint64_t interior_basis = 0;
@@ -1304,12 +1437,12 @@ bool DeriveScenarioCoefficientExtentsV1(
     if (!codec_detail::Multiply(owned_elements[rank], interior_basis,
                                 value.interior_dofs_per_component) ||
         !codec_detail::Multiply(value.interior_dofs_per_component,
-                                euler_state_component_count_v1,
+                                schema.interior_component_count,
                                 value.interior_coefficient_count) ||
         !codec_detail::Multiply(owned_faces[rank], p1,
                                 value.trace_dofs_per_component) ||
         !codec_detail::Multiply(value.trace_dofs_per_component,
-                                euler_state_component_count_v1,
+                                schema.trace_component_count,
                                 value.trace_coefficient_count) ||
         !codec_detail::Add(candidate.aggregate_interior_coefficient_count,
                            value.interior_coefficient_count,
@@ -1323,6 +1456,18 @@ bool DeriveScenarioCoefficientExtentsV1(
   }
   extents = candidate;
   return true;
+}
+
+CheckpointCoefficientSchemaV1 CheckpointCoefficientSchema(
+    const ValidatedApplicationConfig& config) noexcept
+{
+  return config.scalar_igr()
+      ? CheckpointCoefficientSchemaV1{
+            scalar_igr_interior_component_count_v1,
+            scalar_igr_trace_component_count_v1}
+      : CheckpointCoefficientSchemaV1{
+            euler_state_component_count_v1,
+            euler_state_component_count_v1};
 }
 
 CheckpointCodecStatus ValidateSameTupleRestartV1(
@@ -1647,11 +1792,13 @@ CheckpointCodecStatus DecodeCheckpointV1(
       return CheckpointCodecStatus::invalid_rank_manifest;
     }
     status = ValidateBlockMetadata(
-        rank.interior, extents.ranks[index].interior_dofs_per_component,
+        rank.interior, extents.interior_component_count,
+        extents.ranks[index].interior_dofs_per_component,
         extents.ranks[index].interior_coefficient_count);
     if (status != CheckpointCodecStatus::ok) { return status; }
     status = ValidateBlockMetadata(
-        rank.trace, extents.ranks[index].trace_dofs_per_component,
+        rank.trace, extents.trace_component_count,
+        extents.ranks[index].trace_dofs_per_component,
         extents.ranks[index].trace_coefficient_count);
     if (status != CheckpointCodecStatus::ok) { return status; }
     if (!Add(expected_payload_bytes, rank.interior.byte_count,

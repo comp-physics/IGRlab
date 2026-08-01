@@ -28,6 +28,8 @@ namespace dg::hdg::runtime::app
 inline constexpr std::uint32_t application_checkpoint_codec_version_v2 = 2;
 inline constexpr std::uint32_t application_checkpoint_max_rank_count_v1 = 2;
 inline constexpr std::uint32_t euler_state_component_count_v1 = 4;
+inline constexpr std::uint32_t scalar_igr_interior_component_count_v1 = 7;
+inline constexpr std::uint32_t scalar_igr_trace_component_count_v1 = 5;
 inline constexpr std::uint64_t fp64_coefficient_bytes_v1 = 8;
 inline constexpr std::string_view no_physical_gpu_uuid_v1 = "none";
 inline constexpr std::string_view checkpoint_partition_layout_rule_id_v1 =
@@ -108,10 +110,18 @@ struct RankCoefficientExtentsV1
 struct ScenarioCoefficientExtentsV1
 {
   std::uint32_t rank_count = 0;
+  std::uint32_t interior_component_count = 0;
+  std::uint32_t trace_component_count = 0;
   std::array<RankCoefficientExtentsV1,
              application_checkpoint_max_rank_count_v1> ranks{};
   std::uint64_t aggregate_interior_coefficient_count = 0;
   std::uint64_t aggregate_trace_coefficient_count = 0;
+};
+
+struct CheckpointCoefficientSchemaV1
+{
+  std::uint32_t interior_component_count = 0;
+  std::uint32_t trace_component_count = 0;
 };
 
 enum class CheckpointCodecStatus : std::uint8_t
@@ -219,6 +229,8 @@ bool DeriveScenarioCoefficientExtentsV1(
     const ValidatedApplicationConfig& config,
     std::uint32_t rank_count,
     ScenarioCoefficientExtentsV1& extents) noexcept;
+CheckpointCoefficientSchemaV1 CheckpointCoefficientSchema(
+    const ValidatedApplicationConfig& config) noexcept;
 
 /** App-owned capture bridge for public rank-local CPU/CUDA checkpoint pieces. */
 std::optional<CapturedCheckpointV1> CaptureCheckpointPiecesV1(
@@ -374,6 +386,25 @@ CheckpointCodecStatus ValidateSameTupleRestartV1(
     const PersistentResourceDescriptor& expected_resources,
     const CheckpointRuntimeIdentityV1& expected_runtime_identity,
     const CheckpointRuntimeIdentityV1& artifact_runtime_identity) noexcept;
+
+namespace detail
+{
+/**
+ * Internal W8B adapter between the persistent SC25 field-block layout
+ * [U(element,component,node), Sigma(element,node), z(element,component,node)]
+ * and the checkpoint codec's seven true component-major slabs.  These
+ * helpers are not a checkpoint-schema or application API extension.
+ */
+bool ScalarIgrFieldBlocksToComponentMajorV1(
+    const std::vector<double>& field_blocks,
+    std::uint64_t scalar_dofs_per_element,
+    std::vector<double>& component_major) noexcept;
+
+bool ScalarIgrComponentMajorToFieldBlocksV1(
+    const std::vector<double>& component_major,
+    std::uint64_t scalar_dofs_per_element,
+    std::vector<double>& field_blocks) noexcept;
+} // namespace detail
 
 static_assert(!std::is_default_constructible<CapturedCheckpointV1>::value,
               "checkpoint capture must originate from a live contract");
