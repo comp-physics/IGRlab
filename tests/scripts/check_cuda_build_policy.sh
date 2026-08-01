@@ -63,12 +63,73 @@ assert_reuse_transaction_order() {
   }
 }
 
+assert_reviewed_admission_route() {
+  local driver="$1"
+  local route="$2"
+  local record_reference="$3"
+  local sha_reference="$4"
+  local route_case
+
+  route_case="$(awk -v route="${route}" '
+    $0 == "    " route ")" { capture = 1 }
+    capture { print }
+    capture && $0 == "      ;;" { exit }
+  ' "${driver}")"
+  [[ -n "${route_case}" ]] || {
+    fail "build driver does not define reviewed admission route ${route}"
+  }
+  assert_contains "${route_case}" "${record_reference}"
+  assert_contains "${route_case}" "${sha_reference}"
+}
+
+assert_reviewed_admission_record() {
+  local record="$1"
+  local expected_sha="$2"
+  local route_mode="$3"
+  local route_profile="$4"
+  local anchor_key="$5"
+  local anchor_sha="$6"
+  local label="$7"
+  local record_sha altered_record altered_sha
+
+  [[ -f "${record}" && ! -L "${record}" ]] || {
+    fail "${label} reviewed MFEM admission record is missing or symlinked: ${record}"
+  }
+  record_sha="$(sha256sum "${record}" | cut -d' ' -f1)"
+  [[ "${record_sha}" == "${expected_sha}" ]] || {
+    fail "${label} reviewed MFEM admission record hash mismatch: ${record_sha}"
+  }
+  grep -Fq "\"mode\": \"${route_mode}\"" "${record}" || {
+    fail "${label} reviewed MFEM admission mode is not ${route_mode}"
+  }
+  grep -Fq "\"profile\": \"${route_profile}\"" "${record}" || {
+    fail "${label} reviewed MFEM admission profile is not ${route_profile}"
+  }
+  grep -Fq \
+    '"claim": "current tuple observed, independently reviewed, prospectively admitted for reuse; raw W8A ledgers are corroboration, not retroactive immutable proof"' \
+    "${record}" || fail "${label} reviewed MFEM admission claim changed"
+  grep -Fq "\"${anchor_key}\": \"${anchor_sha}\"" "${record}" || {
+    fail "${label} reviewed MFEM admission lost its DEV-3 anchor"
+  }
+
+  altered_record="${tmp_root}/altered-${label}-reviewed-mfem-admission.json"
+  sed 's/"version": "1"/"version": "0"/' \
+    "${record}" >"${altered_record}"
+  altered_sha="$(sha256sum "${altered_record}" | cut -d' ' -f1)"
+  [[ "${altered_sha}" != "${record_sha}" ]] || {
+    fail "${label} reviewed MFEM admission mismatch fixture retained the admitted hash"
+  }
+}
+
 assert_reuse_identity_policy() {
   local driver="$1"
-  local record="$2"
-  local record_sha
-  local altered_record altered_sha
+  local cpu_record="$2"
+  local gpu_record="$3"
   local expected
+  local cpu_sha gpu_sha
+
+  cpu_sha="d4e0f68d795d30ecb3e403f797ecf4ccd4ec8ed79ba5746a997f68bd6eae98ec"
+  gpu_sha="00559ec1cdd0ad5728a0ff92a165fdbf7d757da6f9c672153d8a665cc9e489a9"
 
   for expected in \
       'cmake_install.cmake' \
@@ -98,30 +159,41 @@ assert_reuse_identity_policy() {
     fail "reuse fixtures still reconstruct an accepted MFEM tuple"
   fi
 
-  [[ -f "${record}" && ! -L "${record}" ]] || {
-    fail "reviewed MFEM admission record is missing or symlinked: ${record}"
-  }
-  record_sha="$(sha256sum "${record}" | cut -d' ' -f1)"
-  [[ "${record_sha}" == \
-     "d4e0f68d795d30ecb3e403f797ecf4ccd4ec8ed79ba5746a997f68bd6eae98ec" ]] || {
-    fail "reviewed MFEM admission record hash mismatch: ${record_sha}"
-  }
   grep -Fq \
-    'MFEM_REVIEWED_ADMISSION_SHA256="d4e0f68d795d30ecb3e403f797ecf4ccd4ec8ed79ba5746a997f68bd6eae98ec"' \
-    "${driver}" || fail "build driver does not pin the reviewed admission hash"
-  altered_record="${tmp_root}/altered-reviewed-mfem-admission.json"
-  sed 's/"version": "1"/"version": "0"/' \
-    "${record}" >"${altered_record}"
-  altered_sha="$(sha256sum "${altered_record}" | cut -d' ' -f1)"
-  [[ "${altered_sha}" != "${record_sha}" ]] || {
-    fail "reviewed MFEM admission mismatch fixture retained the admitted hash"
+    'MFEM_CPU_REVIEWED_ADMISSION_RECORD="${SCRIPT_DIR}/cmake/mfem-reuse-identities/cpu-w8a-d9d6526-973e5abc.json"' \
+    "${driver}" || fail "build driver does not pin the CPU admission record"
+  grep -Fq \
+    "MFEM_CPU_REVIEWED_ADMISSION_SHA256=\"${cpu_sha}\"" \
+    "${driver}" || fail "build driver does not pin the CPU admission hash"
+  grep -Fq \
+    'MFEM_GPU_SM120_REVIEWED_ADMISSION_RECORD="${SCRIPT_DIR}/cmake/mfem-reuse-identities/gpu-w8a-d9d6526-345d64a2.json"' \
+    "${driver}" || fail "build driver does not pin the GPU admission record"
+  grep -Fq \
+    "MFEM_GPU_SM120_REVIEWED_ADMISSION_SHA256=\"${gpu_sha}\"" \
+    "${driver}" || fail "build driver does not pin the GPU admission hash"
+  [[ "${cpu_sha}" != "${gpu_sha}" ]] || {
+    fail "CPU and GPU reviewed MFEM admissions share one hash"
   }
-  grep -Fq \
-    '"claim": "current tuple observed, independently reviewed, prospectively admitted for reuse; raw W8A ledgers are corroboration, not retroactive immutable proof"' \
-    "${record}" || fail "reviewed MFEM admission claim changed"
-  grep -Fq \
-    '"sealed_dev3_cpu_manifest_sha256": "008605ffe7d0192689a6dcdcebfcee7fcac4ead307ff6c6403ee36731ce2d59d"' \
-    "${record}" || fail "reviewed MFEM admission lost the DEV-3 anchor"
+
+  assert_reviewed_admission_route "${driver}" cpu:cpu \
+    '${MFEM_CPU_REVIEWED_ADMISSION_RECORD}' \
+    '${MFEM_CPU_REVIEWED_ADMISSION_SHA256}'
+  assert_reviewed_admission_route "${driver}" gpu:cuda-sm120 \
+    '${MFEM_GPU_SM120_REVIEWED_ADMISSION_RECORD}' \
+    '${MFEM_GPU_SM120_REVIEWED_ADMISSION_SHA256}'
+  grep -Fq 'assert_reviewed_admission_route_rejected gpu cpu' \
+    "${driver}" || fail "reviewed admission routes lost the gpu/cpu negative anchor"
+  grep -Fq 'assert_reviewed_admission_route_rejected cpu cuda-sm120' \
+    "${driver}" || fail "reviewed admission routes lost the cpu/gpu negative anchor"
+  grep -Fq 'assert_reviewed_admission_route_rejected gpu cuda-sm90' \
+    "${driver}" || fail "reviewed admission routes lost the unsupported-profile anchor"
+
+  assert_reviewed_admission_record "${cpu_record}" \
+    "${cpu_sha}" cpu cpu sealed_dev3_cpu_manifest_sha256 \
+    008605ffe7d0192689a6dcdcebfcee7fcac4ead307ff6c6403ee36731ce2d59d cpu
+  assert_reviewed_admission_record "${gpu_record}" \
+    "${gpu_sha}" gpu cuda-sm120 sealed_dev3_gpu_manifest_sha256 \
+    ccb280318581f926b2bb65d98581868a29075ae4ba4f1ddf15eb24cf8939c059 gpu-sm120
 }
 
 [[ -f "${BUILD_DRIVER}" ]] || fail "missing build driver: ${BUILD_DRIVER}"
@@ -377,7 +449,8 @@ assert_not_exists "${tmp_root}/forwarded-spack.log"
 # before any view export or build consumer can observe the transition.
 assert_reuse_transaction_order "${BUILD_DRIVER}"
 assert_reuse_identity_policy "${BUILD_DRIVER}" \
-  "${REPO_ROOT}/cmake/mfem-reuse-identities/cpu-w8a-d9d6526-973e5abc.json"
+  "${REPO_ROOT}/cmake/mfem-reuse-identities/cpu-w8a-d9d6526-973e5abc.json" \
+  "${REPO_ROOT}/cmake/mfem-reuse-identities/gpu-w8a-d9d6526-345d64a2.json"
 
 reuse_fixture_cmake="${REPO_ROOT}/tests/hdg/runtime/app/test_cli_process.cmake"
 grep -Fq 'set(reuse_mode_args --cpu-only --caliper)' \

@@ -34,6 +34,9 @@ static_assert(IsFrozenApplicationBackend<CpuSerialBackendTag>::value &&
                       CudaRank2OneGpuHostStagedBackendTag>::value &&
                   !IsFrozenApplicationBackend<int>::value,
               "the static boundary recognizes exactly four backends");
+static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0 ||
+                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1,
+              "scalar-IGR CPU availability is a build-owned boolean");
 
 bool Check(const bool condition, const char* name)
 {
@@ -466,12 +469,41 @@ bool CheckScalarIgrMatrix()
     passed = Check(ValidateApplicationOptions(ScalarIgr(backend)).rejection() ==
                        ApplicationRejection::unbuilt_backend,
                    "scalar_igr_cuda_slot_explicitly_unbuilt") && passed;
+
   ApplicationOptionsView h1 = ScalarIgr(CpuSerialBackendTag::id);
   h1.interior_space = InteriorSpace::h1;
   passed = Check(ValidateApplicationOptions(h1).rejection() ==
                      ApplicationRejection::unsupported_h1,
                  "scalar_igr_h1_honest_rejection") && passed;
 
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0
+  for (const std::string_view backend :
+       {CpuSerialBackendTag::id, CpuRank2BackendTag::id})
+  {
+    const ApplicationOptionsView scalar_reference = ScalarIgr(backend);
+    ApplicationOptionsView malformed_writer = SplitWriter(scalar_reference);
+    malformed_writer.injection = {};
+    malformed_writer.retry_limit = 0;
+    ApplicationOptionsView malformed_reader = SplitReader(scalar_reference);
+    malformed_reader.injection = {
+        FailureInjectionModeV1::prescribed,
+        smooth_periodic_euler_v1_failure_phase,
+        smooth_periodic_euler_v1_functional_failure_target_step,
+        SourceRank(backend)};
+    malformed_reader.retry_limit = smooth_periodic_euler_v1_retry_limit;
+    for (const ApplicationOptionsView& request :
+         {SplitWriter(scalar_reference), SplitReader(scalar_reference),
+          malformed_writer, malformed_reader})
+    {
+      passed = Check(
+                   ValidateApplicationOptions(request).rejection() ==
+                       ApplicationRejection::unbuilt_backend,
+                   "scalar_igr_unbuilt_cpu_roles_reject_explicitly") &&
+          passed;
+    }
+  }
+  return passed;
+#else
   const ApplicationOptionsView scalar_reference =
       ScalarIgr(CpuSerialBackendTag::id);
   passed = Check(
@@ -529,6 +561,7 @@ bool CheckScalarIgrMatrix()
                    ApplicationRejection::invalid_run_role,
                "conventional_rejects_scalar_reader_controls") && passed;
   return passed;
+#endif
 }
 
 } // namespace

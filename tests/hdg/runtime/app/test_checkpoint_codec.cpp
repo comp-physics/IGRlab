@@ -31,6 +31,9 @@ static_assert(application_checkpoint_codec_version_v2 == 2 &&
 static_assert(!std::is_default_constructible<CapturedCheckpointV1>::value &&
                   std::is_copy_constructible<CapturedCheckpointV1>::value,
               "capture is live-contract-originated but repeatably encodable");
+static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0 ||
+                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1,
+              "scalar-IGR CPU availability is a build-owned boolean");
 
 bool Check(const bool condition, const char* name)
 {
@@ -1634,6 +1637,37 @@ bool CheckExactScenarioExtents()
       ScalarTestValidation(CpuSerialBackendTag::id, false);
   const ApplicationValidation scalar_rank2_validation =
       ScalarTestValidation(CpuRank2BackendTag::id, false);
+
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0
+  passed = Check(
+               scalar_serial_validation.rejection() ==
+                       ApplicationRejection::unbuilt_backend &&
+                   scalar_rank2_validation.rejection() ==
+                       ApplicationRejection::unbuilt_backend,
+               "scalar_rank1_and_rank2_static_configs_reject_unbuilt_profile") &&
+      passed;
+  passed = Check(
+               serial_oracle.ranks[0].interior_coefficient_count == 144 &&
+                   serial_oracle.ranks[0].trace_coefficient_count == 144 &&
+                   rank2_oracle.ranks[0].interior_coefficient_count == 80 &&
+                   rank2_oracle.ranks[1].interior_coefficient_count == 64 &&
+                   rank2_oracle.ranks[0].trace_coefficient_count == 112 &&
+                   rank2_oracle.ranks[1].trace_coefficient_count == 32,
+               "independent_periodic_partition_extents_are_exact") &&
+      passed;
+  ScenarioCoefficientExtentsV1 serial_actual{};
+  ScenarioCoefficientExtentsV1 rank2_actual{};
+  passed = Check(
+               DeriveScenarioCoefficientExtentsV1(*serial, 1,
+                                                  serial_actual) &&
+                   DeriveScenarioCoefficientExtentsV1(*rank2, 2,
+                                                      rank2_actual) &&
+                   SameExtents(serial_actual, serial_oracle) &&
+                   SameExtents(rank2_actual, rank2_oracle),
+               "codec_extents_match_independent_face_enumeration") &&
+      passed;
+  return passed;
+#else
   const ValidatedApplicationConfig* scalar_serial =
       scalar_serial_validation.config();
   const ValidatedApplicationConfig* scalar_rank2 =
@@ -1686,6 +1720,7 @@ bool CheckExactScenarioExtents()
                "codec_extents_match_independent_face_enumeration") &&
       passed;
   return passed;
+#endif
 }
 
 bool CheckLiveCaptureAndRepeatableEncode()
@@ -1860,6 +1895,21 @@ bool CheckRank2CaptureAndAllRankEvidence()
 bool CheckScalarIgrCheckpointSchemaRoundTrip()
 {
   bool passed = true;
+
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0
+  for (const std::string_view backend :
+       {CpuSerialBackendTag::id, CpuRank2BackendTag::id})
+  {
+    passed = Check(
+                 ScalarTestValidation(backend, false).rejection() ==
+                         ApplicationRejection::unbuilt_backend &&
+                     ScalarTestValidation(backend, true).rejection() ==
+                         ApplicationRejection::unbuilt_backend,
+                 "scalar_checkpoint_roles_reject_unbuilt_cpu_profile") &&
+        passed;
+  }
+  return passed;
+#else
   const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
 
   const ApplicationValidation serial_writer_validation =
@@ -2073,6 +2123,7 @@ bool CheckScalarIgrCheckpointSchemaRoundTrip()
       passed;
 
   return passed;
+#endif
 }
 
 bool CheckScalarIgrSemanticInteriorLayout()
