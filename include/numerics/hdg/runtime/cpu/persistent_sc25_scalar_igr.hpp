@@ -2,13 +2,14 @@
 
 /**
  * @file numerics/hdg/runtime/cpu/persistent_sc25_scalar_igr.hpp
- * @brief MFEM-native rank-one foundation for SC25 projection-v3.
+ * @brief MFEM-native CPU rank-one/rank-two leaves for SC25 projection-v3.
  *
  * This default-disabled component owns the C0 field/space/topology foundation,
  * the exact C1 coupled-operator fixture, and the bounded C2 CPU-rank-one
- * persistent trajectory experiment.  C2 is experimental evidence for only
- * the frozen N=8/k=1/20-step tuple; it is not a CLI, output, rank-two, CUDA,
- * supported-method, or broader E2/E3 claim.
+ * persistent trajectory experiment and the bounded CPU-rank-two peer.  These
+ * leaves are experimental evidence for only the frozen N=8/k=1/20-step
+ * tuples; they are not a CLI, output, CUDA, supported-method, or broader
+ * E2/E3 claim.
  */
 
 #include "numerics/hdg/auxiliary/screened_poisson_cpu.hpp"
@@ -35,6 +36,8 @@ inline constexpr std::string_view object_id =
     "FullyHybridizedScalarPeriodicSc25ProjectionV3";
 inline constexpr std::string_view cpu_rank1_tuple_id =
     "HDG-SC25-PER-BE-CPU-R1-FP64-v3";
+inline constexpr std::string_view cpu_rank2_tuple_id =
+    "HDG-SC25-PER-BE-CPU-R2-FP64-v3";
 inline constexpr std::string_view interior_layout_id =
     "mfem.l2.byNODES.U4.Sigma1.z2.separate.v3";
 inline constexpr std::string_view trace_layout_id =
@@ -102,6 +105,8 @@ static_assert(coupled_fixture_elements == 9 &&
 
 inline constexpr std::string_view persistent_fixture_id =
     "C2-MFEM-PERSISTENT-N8-R1-01";
+inline constexpr std::string_view persistent_rank2_fixture_id =
+    "C3-MFEM-PERSISTENT-N8-R2-01";
 inline constexpr std::string_view persistent_checkpoint_manifest_id =
     "HDG-SC25-CHECKPOINT-MANIFEST-v3";
 inline constexpr int persistent_elements_per_direction = 8;
@@ -118,6 +123,16 @@ inline constexpr int persistent_interior_unknowns = 1792;
 inline constexpr int persistent_true_trace_unknowns = 1280;
 inline constexpr int persistent_restriction_rows = 2560;
 inline constexpr int persistent_full_unknowns = 3072;
+inline constexpr int persistent_rank2_local_elements = 32;
+inline constexpr int persistent_rank2_local_interior_unknowns = 896;
+inline constexpr int persistent_rank2_local_faces = 72;
+inline constexpr int persistent_rank2_rank0_scalar_true_dofs = 144;
+inline constexpr int persistent_rank2_rank1_scalar_true_dofs = 112;
+inline constexpr int persistent_rank2_rank0_owned_trace_unknowns = 720;
+inline constexpr int persistent_rank2_rank1_owned_trace_unknowns = 560;
+inline constexpr int persistent_rank2_global_true_trace_unknowns = 1280;
+inline constexpr int persistent_rank2_rank0_ghost_trace_unknowns = 0;
+inline constexpr int persistent_rank2_rank1_ghost_trace_unknowns = 160;
 inline constexpr int persistent_required_steps = 20;
 inline constexpr int persistent_newton_maximum_iterations = 20;
 inline constexpr int persistent_line_search_trials = 13;
@@ -147,7 +162,13 @@ static_assert(persistent_elements ==
                           persistent_sigmahat_unknowns &&
                   persistent_full_unknowns ==
                       persistent_interior_unknowns +
-                          persistent_true_trace_unknowns,
+                          persistent_true_trace_unknowns &&
+                  persistent_rank2_local_interior_unknowns ==
+                      persistent_rank2_local_elements *
+                          coupled_fixture_local_interior_unknowns &&
+                  persistent_rank2_rank0_owned_trace_unknowns +
+                          persistent_rank2_rank1_owned_trace_unknowns ==
+                      persistent_rank2_global_true_trace_unknowns,
               "C2-MFEM-PERSISTENT-N8-R1-01 dimensions must remain exact");
 
 using HdgPublishedScalarPeriodicSc25ProjectionV3Tag =
@@ -166,6 +187,8 @@ struct BackwardEulerMonolithicV1Tag final
 struct Fp64Tag final
 {};
 struct CpuSerialTag final
+{};
+struct CpuMpiRank2Tag final
 {};
 
 struct CpuRank1Selection final
@@ -194,6 +217,33 @@ struct CpuRank1Selection final
 
 static_assert(std::is_empty<CpuRank1Selection>::value,
               "SC25 rank-one selection must remain compile-time only");
+
+struct CpuRank2Selection final
+{
+  using outer_model = HdgPublishedScalarPeriodicSc25ProjectionV3Tag;
+  using source = TracedScalarSc25PeriodicExperimentV1Tag;
+  using auxiliary_model = auxiliary::FullyHybridizedScreenedPoissonV1Tag;
+  using trace = DualConservativeScalarTraceV1Tag;
+  using state_stabilization = W7ScalarTau25StateStabilizationTag;
+  using auxiliary_stabilization = DensityHeightP2TraceStabilizationV2Tag;
+  using time_treatment = BackwardEulerMonolithicV1Tag;
+  using precision = Fp64Tag;
+  using backend = CpuMpiRank2Tag;
+
+  static constexpr RuntimeTupleDescriptor Descriptor() noexcept
+  {
+    return {StableIdentity::Copy(projection_id),
+            StableIdentity::Copy(object_id),
+            StableIdentity::Copy("DualConservativeScalarTraceV1"),
+            StableIdentity::Copy("W7Tau25.DensityHeightP2.v3"),
+            StableIdentity::Copy("BackwardEulerMonolithicV1"),
+            StableIdentity::Copy("CpuMpiRank2"),
+            StableIdentity::Copy("Fp64")};
+  }
+};
+
+static_assert(std::is_empty<CpuRank2Selection>::value,
+              "SC25 rank-two selection must remain compile-time only");
 
 enum class FoundationStatus : std::uint8_t
 {
@@ -654,6 +704,165 @@ struct PersistentTrajectoryEvidence final
   std::array<TrajectoryStepEvidence, persistent_required_steps> steps{};
 };
 
+/** Rank-local committed state. Owned trace values exclude all ghost values. */
+struct PersistentRank2TrajectoryState final
+{
+  std::vector<double> u;
+  std::vector<double> sigma;
+  std::vector<double> z;
+  std::vector<double> uhat;
+  std::vector<double> sigmahat;
+};
+
+struct Rank2OwnershipCensus final
+{
+  int rank = -1;
+  int ranks = 0;
+  int local_elements = 0;
+  int local_interior_unknowns = 0;
+  int local_faces = 0;
+  int owned_unique_faces = 0;
+  int scalar_owned_true_dofs = 0;
+  int combined_owned_trace_dofs = 0;
+  int combined_ghost_trace_dofs = 0;
+  int global_unique_faces = 0;
+  int global_combined_true_dofs = 0;
+};
+
+struct Rank2TrajectoryStateHashes final
+{
+  StateHash u{};
+  StateHash sigma{};
+  StateHash z{};
+  StateHash uhat{};
+  StateHash sigmahat{};
+  StateHash interior{};
+  StateHash trace{};
+  StateHash shard{};
+};
+
+struct PersistentRank2TrajectoryCheckpoint final
+{
+  CheckpointDescriptor descriptor{};
+  PersistentRank2TrajectoryState state{};
+  StableIdentity projection = StableIdentity::Copy(projection_id);
+  StableIdentity tuple = StableIdentity::Copy(cpu_rank2_tuple_id);
+  StableIdentity scenario = StableIdentity::Copy(persistent_rank2_fixture_id);
+  int shard_rank = -1;
+  Rank2TrajectoryStateHashes raw_field_hashes{};
+  StateHash canonical_manifest_hash{};
+};
+
+struct Rank2TrajectoryNewtonEvidence final
+{
+  bool attempted = false;
+  bool completed = false;
+  int iteration = -1;
+  double entry_residual_norm = 0.0;
+  double accepted_residual_norm = 0.0;
+  int accepted_line_search_index = -1;
+  int trace_iterations = -1;
+  double trace_true_residual_norm = 0.0;
+  double trace_right_hand_side_norm = 0.0;
+  double maximum_local_application_residual = 0.0;
+  PersistentRank2TrajectoryState entry{};
+  PersistentRank2TrajectoryState recovered_increment{};
+  /** Rank-local element-interior rows followed by owned true-trace rows. */
+  std::vector<double> nonlinear_residual{};
+  /** A fixed geometry/global-TDof-authored action, independent of Newton. */
+  std::vector<double> jacobian_action_input{};
+  std::vector<double> jacobian_action_result{};
+  /** Owned true-trace vectors in MFEM global-TDof owner order. */
+  std::vector<double> condensed_right_hand_side{};
+  std::vector<double> true_trace_solution{};
+  std::array<double, persistent_line_search_trials> trial_residual_norms{};
+  std::array<std::uint8_t, persistent_line_search_trials> trial_visited{};
+  std::array<std::uint8_t, persistent_line_search_trials> trial_admissible{};
+  std::array<std::uint8_t, persistent_line_search_trials> trial_armijo{};
+};
+
+struct Rank2TrajectoryAttemptEvidence final
+{
+  TrajectoryStatus status = TrajectoryStatus::uninitialized;
+  TrajectoryFailureInjection injection = TrajectoryFailureInjection::none;
+  int target_step = 0;
+  int retry_index = 0;
+  int attempted_newton_iterations = 0;
+  int newton_iterations = 0;
+  int gmres_solves = 0;
+  int gmres_iterations = 0;
+  int line_search_trials = 0;
+  double dt = 0.0;
+  double entry_residual_norm = 0.0;
+  double final_residual_norm = 0.0;
+  double maximum_local_application_residual = 0.0;
+  double trace_true_residual_norm = 0.0;
+  double trace_right_hand_side_norm = 0.0;
+  double nonlinear_residual_bound = 0.0;
+  StateCoordinates committed_coordinates{};
+  StateCoordinates published_coordinates{};
+  Rank2TrajectoryStateHashes entry_hashes{};
+  Rank2TrajectoryStateHashes candidate_hashes{};
+  Rank2TrajectoryStateHashes published_hashes{};
+  PersistentRank2TrajectoryState entry_state{};
+  PersistentRank2TrajectoryState accepted_direction{};
+  std::array<Rank2TrajectoryNewtonEvidence,
+             persistent_newton_maximum_iterations> newton{};
+  /** Compatibility summary of the last completed Newton trial sequence. */
+  std::array<double, persistent_line_search_trials> trial_residual_norms{};
+  std::array<std::uint8_t, persistent_line_search_trials> trial_admissible{};
+  std::array<std::uint8_t, persistent_line_search_trials> trial_armijo{};
+};
+
+struct Rank2TrajectoryStageEvidence final
+{
+  bool accepted = false;
+  int step = 0;
+  double time = 0.0;
+  std::uint64_t generation = 0;
+  double residual_norm = 0.0;
+  double condensed_rhs_norm = 0.0;
+  double trace_solution_norm = 0.0;
+  double recovery_norm = 0.0;
+  std::array<double, state_components> committed_integrals{};
+  std::array<double, state_components> conserved_integrals{};
+  PersistentRank2TrajectoryState accepted_state{};
+  Rank2TrajectoryStateHashes accepted_hashes{};
+};
+
+struct PersistentRank2TrajectoryEvidence final
+{
+  TrajectoryStatus status = TrajectoryStatus::uninitialized;
+  TrajectoryStatus first_failure = TrajectoryStatus::uninitialized;
+  Rank2OwnershipCensus census{};
+  StateCoordinates coordinates{};
+  AuxiliaryInitializationEvidence initialization{};
+  Rank2TrajectoryNewtonEvidence initialization_operator{};
+  int accepted_steps = 0;
+  int attempted_steps = 0;
+  int retry_attempts = 0;
+  int attempt_count = 0;
+  int step_evidence_count = 0;
+  int trace_restart_dimension = 0;
+  int trace_maximum_iterations = 0;
+  int ilu_type = -1;
+  int ilu_level_of_fill = -1;
+  int ilu_local_reordering = -1;
+  std::uint64_t topology_generation = 0;
+  std::uint64_t storage_generation = 0;
+  std::uint64_t solver_generation = 0;
+  std::uint64_t detected_w8_owned_boundary_identity_changes = 0;
+  std::uint64_t w8_device_transfer_calls = 0;
+  StateHash w8_owned_boundary_identity_hash{};
+  std::uint64_t w8_owned_boundary_object_count = 0;
+  std::uint64_t w8_owned_boundary_buffer_count = 0;
+  bool opaque_mfem_hypre_observed = false;
+  std::array<Rank2TrajectoryAttemptEvidence,
+             persistent_required_steps + 4> attempts{};
+  std::array<Rank2TrajectoryStageEvidence,
+             persistent_required_steps> stages{};
+};
+
 double VelocityGradientInvariant(
     const std::array<std::array<double, dimension>, dimension>& gradient)
     noexcept;
@@ -683,6 +892,7 @@ bool CondenseElementLinearization(const ElementLinearization& input,
                                   ElementCondensedBlock& output) noexcept;
 
 struct PersistentTrajectoryImplementation;
+struct PersistentRank2TrajectoryImplementation;
 
 class PersistentSc25ScalarIgrCpuFoundation final
 {
@@ -699,6 +909,9 @@ public:
 
   static FoundationStatus Create(
       MPI_Comm communicator, CpuSerialTag, const FoundationConfig& config,
+      std::unique_ptr<PersistentSc25ScalarIgrCpuFoundation>& output) noexcept;
+  static FoundationStatus Create(
+      MPI_Comm communicator, CpuMpiRank2Tag, const FoundationConfig& config,
       std::unique_ptr<PersistentSc25ScalarIgrCpuFoundation>& output) noexcept;
 
   FoundationStatus status() const noexcept;
@@ -753,8 +966,23 @@ public:
       const PersistentTrajectoryCheckpoint& checkpoint) noexcept;
   const PersistentTrajectoryEvidence& trajectory_evidence() const noexcept;
 
+  /** Initialize only C3-MFEM-PERSISTENT-N8-R2-01 on the frozen x-slab. */
+  TrajectoryStatus InitializePersistentRank2Trajectory() noexcept;
+  TrajectoryStatus AdvancePersistentRank2Trajectory(
+      TrajectoryFailureInjection injection =
+          TrajectoryFailureInjection::none) noexcept;
+  bool CopyPublishedRank2TrajectoryState(
+      PersistentRank2TrajectoryState& output) const noexcept;
+  bool CaptureRank2TrajectoryCheckpoint(
+      PersistentRank2TrajectoryCheckpoint& output) const noexcept;
+  TrajectoryStatus RestoreRank2TrajectoryCheckpoint(
+      const PersistentRank2TrajectoryCheckpoint& checkpoint) noexcept;
+  const PersistentRank2TrajectoryEvidence& rank2_trajectory_evidence()
+      const noexcept;
+
 private:
   friend struct PersistentTrajectoryImplementation;
+  friend struct PersistentRank2TrajectoryImplementation;
   struct Implementation;
   explicit PersistentSc25ScalarIgrCpuFoundation(
       std::unique_ptr<Implementation> implementation) noexcept;

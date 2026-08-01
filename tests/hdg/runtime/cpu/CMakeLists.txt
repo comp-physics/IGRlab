@@ -138,4 +138,19 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
       PROCESSORS 1
       RESOURCE_LOCK hdg_sc25_scalar_igr_cpu
       TIMEOUT 3600)
+
+  add_test(
+    NAME hdg_sc25_scalar_igr_cpu_rank2_trajectory
+    COMMAND
+      "${MPIEXEC_EXECUTABLE}"
+      "${MPIEXEC_NUMPROC_FLAG}" 2
+      ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cpu_test>
+      --rank2-trajectory
+      ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(hdg_sc25_scalar_igr_cpu_rank2_trajectory
+    PROPERTIES
+      PROCESSORS 2
+      RESOURCE_LOCK hdg_sc25_scalar_igr_cpu
+      TIMEOUT 3600)
 endif()

@@ -6,11 +6,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <string_view>
+
+extern "C" void dg_igr_sc25_rank2_test_inject_boundary_drift(
+    int enabled) noexcept;
+extern "C" void dg_igr_sc25_rank2_test_inject_final_install_mismatch(
+    int enabled) noexcept;
 
 namespace
 {
@@ -26,6 +32,38 @@ CreatePersistentFoundation()
   std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> foundation;
   if (sc25::PersistentSc25ScalarIgrCpuFoundation::Create(
           MPI_COMM_WORLD, sc25::CpuSerialTag{}, config, foundation) !=
+          sc25::FoundationStatus::ready)
+  {
+    return {};
+  }
+  return foundation;
+}
+
+std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation>
+CreateRank2Foundation()
+{
+  sc25::FoundationConfig config;
+  config.polynomial_degree = 1;
+  config.elements_per_direction = sc25::persistent_elements_per_direction;
+  std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> foundation;
+  if (sc25::PersistentSc25ScalarIgrCpuFoundation::Create(
+          MPI_COMM_WORLD, sc25::CpuMpiRank2Tag{}, config, foundation) !=
+          sc25::FoundationStatus::ready)
+  {
+    return {};
+  }
+  return foundation;
+}
+
+std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation>
+CreateRank1Peer()
+{
+  sc25::FoundationConfig config;
+  config.polynomial_degree = 1;
+  config.elements_per_direction = sc25::persistent_elements_per_direction;
+  std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> foundation;
+  if (sc25::PersistentSc25ScalarIgrCpuFoundation::Create(
+          MPI_COMM_SELF, sc25::CpuSerialTag{}, config, foundation) !=
           sc25::FoundationStatus::ready)
   {
     return {};
@@ -54,6 +92,66 @@ bool EqualStateBytes(const sc25::PersistentTrajectoryState& left,
       EqualFp64Bytes(left.z, right.z) &&
       EqualFp64Bytes(left.uhat, right.uhat) &&
       EqualFp64Bytes(left.sigmahat, right.sigmahat);
+}
+
+bool EqualRank2StateBytes(const sc25::PersistentRank2TrajectoryState& left,
+                          const sc25::PersistentRank2TrajectoryState& right)
+    noexcept
+{
+  const auto equal = [](const std::vector<double>& a,
+                        const std::vector<double>& b)
+  {
+    return a.size() == b.size() &&
+        (a.empty() ||
+         std::memcmp(a.data(), b.data(), a.size() * sizeof(double)) == 0);
+  };
+  return equal(left.u, right.u) && equal(left.sigma, right.sigma) &&
+      equal(left.z, right.z) && equal(left.uhat, right.uhat) &&
+      equal(left.sigmahat, right.sigmahat);
+}
+
+bool EqualRank2Hashes(const sc25::Rank2TrajectoryStateHashes& left,
+                      const sc25::Rank2TrajectoryStateHashes& right) noexcept
+{
+  return left.u == right.u && left.sigma == right.sigma &&
+      left.z == right.z && left.uhat == right.uhat &&
+      left.sigmahat == right.sigmahat &&
+      left.interior == right.interior && left.trace == right.trace &&
+      left.shard == right.shard;
+}
+
+int GeometricPeerElement(
+    sc25::PersistentSc25ScalarIgrCpuFoundation& local,
+    const int local_element,
+    sc25::PersistentSc25ScalarIgrCpuFoundation& peer)
+{
+  mfem::ParMesh* local_mesh = const_cast<mfem::ParMesh*>(local.mesh());
+  mfem::ParMesh* peer_mesh = const_cast<mfem::ParMesh*>(peer.mesh());
+  if (!local_mesh || !peer_mesh || local_element < 0 ||
+      local_element >= local_mesh->GetNE())
+  {
+    return -1;
+  }
+  const mfem::IntegrationPoint& center =
+      mfem::Geometries.GetCenter(mfem::Geometry::SQUARE);
+  mfem::Vector local_point(sc25::dimension), peer_point(sc25::dimension);
+  mfem::ElementTransformation* local_transformation =
+      local_mesh->GetElementTransformation(local_element);
+  if (!local_transformation) { return -1; }
+  local_transformation->Transform(center, local_point);
+  for (int element = 0; element < peer_mesh->GetNE(); ++element)
+  {
+    mfem::ElementTransformation* peer_transformation =
+        peer_mesh->GetElementTransformation(element);
+    if (!peer_transformation) { continue; }
+    peer_transformation->Transform(center, peer_point);
+    if (std::abs(local_point[0] - peer_point[0]) <= 1.0e-13 &&
+        std::abs(local_point[1] - peer_point[1]) <= 1.0e-13)
+    {
+      return element;
+    }
+  }
+  return -1;
 }
 
 dg::hdg::runtime::StateHash InteriorHash(
@@ -642,6 +740,679 @@ int RunTrajectoryHarness()
   return failures;
 }
 
+int RunRank2TrajectoryHarness()
+{
+  int rank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  int local_failures = 0;
+  const auto fail = [rank, &local_failures](const std::string_view message)
+  {
+    std::cerr << "rank " << rank << ": " << message << '\n';
+    ++local_failures;
+  };
+  const auto collectively_require = [&fail](const bool local,
+                                             const std::string_view message)
+  {
+    const int value = local ? 1 : 0;
+    int global = 0;
+    if (MPI_Allreduce(&value, &global, 1, MPI_INT, MPI_MIN,
+                      MPI_COMM_WORLD) != MPI_SUCCESS ||
+        global == 0)
+    {
+      fail(message);
+      return false;
+    }
+    return true;
+  };
+
+  std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> baseline =
+      CreateRank2Foundation();
+  std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> peer =
+      CreateRank1Peer();
+  if (!collectively_require(baseline && peer,
+                            "rank2/rank1-peer foundation creation"))
+  {
+    return 1;
+  }
+  sc25::PersistentRank2TrajectoryState unpublished;
+  unpublished.u = {1.0, 2.0};
+  unpublished.sigma = {3.0};
+  unpublished.z = {4.0, 5.0};
+  unpublished.uhat = {6.0};
+  unpublished.sigmahat = {7.0};
+  const sc25::PersistentRank2TrajectoryState unpublished_before =
+      unpublished;
+  if (baseline->CopyPublishedRank2TrajectoryState(unpublished) ||
+      !EqualRank2StateBytes(unpublished, unpublished_before))
+  {
+    fail("rank2 unpublished local copy preserves output atomically");
+  }
+  if (!collectively_require(
+          baseline->InitializePersistentRank2Trajectory() ==
+                  sc25::TrajectoryStatus::ready &&
+              peer->InitializePersistentTrajectory() ==
+                  sc25::TrajectoryStatus::ready,
+          "rank2/rank1-peer initialization"))
+  {
+    return 1;
+  }
+  sc25::PersistentRank2TrajectoryState initialized;
+  sc25::PersistentRank2TrajectoryState initialized_again;
+  if (!baseline->CopyPublishedRank2TrajectoryState(initialized) ||
+      baseline->InitializePersistentRank2Trajectory() !=
+          sc25::TrajectoryStatus::ready ||
+      !baseline->CopyPublishedRank2TrajectoryState(initialized_again) ||
+      !EqualRank2StateBytes(initialized, initialized_again))
+  {
+    fail("rank2 initialization reentry byte stability");
+  }
+
+  sc25::PersistentRank2TrajectoryCheckpoint checkpoint10;
+  sc25::PersistentTrajectoryCheckpoint peer_checkpoint10;
+  for (int step = 1; step <= sc25::persistent_required_steps; ++step)
+  {
+    const sc25::TrajectoryStatus rank2_status =
+        baseline->AdvancePersistentRank2Trajectory();
+    const sc25::TrajectoryStatus peer_status =
+        peer->AdvancePersistentTrajectory();
+    if (!collectively_require(Accepted(rank2_status) && Accepted(peer_status),
+                              "rank2/rank1-peer baseline advance"))
+    {
+      return 1;
+    }
+    if (step == 10 &&
+        !collectively_require(
+            baseline->CaptureRank2TrajectoryCheckpoint(checkpoint10) &&
+                peer->CaptureTrajectoryCheckpoint(peer_checkpoint10),
+            "rank2 step-10 checkpoint capture"))
+    {
+      return 1;
+    }
+  }
+  sc25::PersistentRank2TrajectoryState baseline_final;
+  if (!collectively_require(
+          baseline->CopyPublishedRank2TrajectoryState(baseline_final),
+          "rank2 baseline final-state copy"))
+  {
+    return 1;
+  }
+  dg_igr_hdg_sc25_cpu_test::IndependentRank2TrajectoryEvidence oracle;
+  if (!dg_igr_hdg_sc25_cpu_test::RunIndependentRank2TrajectoryOracle(
+          *baseline, *peer, checkpoint10, oracle))
+  {
+    for (const std::string& message : oracle.failures) { fail(message); }
+  }
+  const sc25::PersistentRank2TrajectoryEvidence& baseline_evidence =
+      baseline->rank2_trajectory_evidence();
+  int baseline_newton_iterations = 0;
+  int baseline_gmres_solves = 0;
+  int baseline_gmres_iterations = 0;
+  int baseline_line_search_trials = 0;
+  for (int attempt = 0; attempt < baseline_evidence.attempt_count; ++attempt)
+  {
+    const sc25::Rank2TrajectoryAttemptEvidence& item =
+        baseline_evidence.attempts[static_cast<std::size_t>(attempt)];
+    baseline_newton_iterations += item.newton_iterations;
+    baseline_gmres_solves += item.gmres_solves;
+    baseline_gmres_iterations += item.gmres_iterations;
+    baseline_line_search_trials += item.line_search_trials;
+  }
+  if (baseline_evidence.accepted_steps != 20 ||
+      baseline_evidence.attempted_steps != 20 ||
+      baseline_evidence.retry_attempts != 0 ||
+      baseline_evidence.attempt_count != 20 ||
+      baseline_evidence.step_evidence_count != 20 ||
+      baseline_evidence.trace_restart_dimension != 50 ||
+      baseline_evidence.trace_maximum_iterations != 200 ||
+      baseline_evidence.ilu_type != 0 ||
+      baseline_evidence.ilu_level_of_fill != 0 ||
+      baseline_evidence.ilu_local_reordering != 1 ||
+      baseline_evidence.detected_w8_owned_boundary_identity_changes != 0 ||
+      baseline_evidence.w8_device_transfer_calls != 0 ||
+      baseline_evidence.opaque_mfem_hypre_observed ||
+      baseline_newton_iterations <= 0 ||
+      baseline_gmres_solves != baseline_newton_iterations ||
+      baseline_gmres_iterations <= 0 ||
+      baseline_line_search_trials < baseline_newton_iterations)
+  {
+    fail("rank2 frozen trajectory/reuse evidence");
+  }
+
+  std::array<std::uint8_t, 32> local_manifest =
+      checkpoint10.canonical_manifest_hash.bytes;
+  std::array<std::uint8_t, 64> shard_manifests{};
+  std::array<std::uint8_t, 32> local_shard =
+      checkpoint10.raw_field_hashes.shard.bytes;
+  std::array<std::uint8_t, 64> shard_hashes{};
+  if (MPI_Allgather(local_manifest.data(), 32, MPI_UINT8_T,
+                    shard_manifests.data(), 32, MPI_UINT8_T,
+                    MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Allgather(local_shard.data(), 32, MPI_UINT8_T,
+                    shard_hashes.data(), 32, MPI_UINT8_T,
+                    MPI_COMM_WORLD) != MPI_SUCCESS ||
+      checkpoint10.shard_rank != rank ||
+      std::all_of(local_manifest.begin(), local_manifest.end(),
+                  [](const std::uint8_t value) { return value == 0; }) ||
+      std::memcmp(shard_manifests.data(), shard_manifests.data() + 32, 32) !=
+          0 ||
+      std::memcmp(shard_hashes.data(), shard_hashes.data() + 32, 32) == 0)
+  {
+    fail("rank2 two-shard manifest identity");
+  }
+
+  std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> replay =
+      CreateRank2Foundation();
+  if (!collectively_require(
+          replay && replay->InitializePersistentRank2Trajectory() ==
+                  sc25::TrajectoryStatus::ready &&
+              Accepted(replay->RestoreRank2TrajectoryCheckpoint(checkpoint10)),
+          "rank2 step-10 two-shard restore"))
+  {
+    return 1;
+  }
+  sc25::PersistentRank2TrajectoryState restored;
+  if (!replay->CopyPublishedRank2TrajectoryState(restored) ||
+      !EqualRank2StateBytes(restored, checkpoint10.state) ||
+      replay->rank2_trajectory_evidence().coordinates.step != 10 ||
+      replay->rank2_trajectory_evidence().step_evidence_count != 0 ||
+      replay->rank2_trajectory_evidence().attempt_count != 0 ||
+      replay->rank2_trajectory_evidence().first_failure !=
+          sc25::TrajectoryStatus::uninitialized)
+  {
+    fail("rank2 immediate restored shard equality/evidence reset");
+  }
+  for (int step = 11; step <= sc25::persistent_required_steps; ++step)
+  {
+    if (!collectively_require(
+            Accepted(replay->AdvancePersistentRank2Trajectory()),
+            "rank2 restored trajectory advance"))
+    {
+      return 1;
+    }
+  }
+  sc25::PersistentRank2TrajectoryState replay_final;
+  if (!replay->CopyPublishedRank2TrajectoryState(replay_final) ||
+      !EqualRank2StateBytes(replay_final, baseline_final))
+  {
+    fail("rank2 step-10 bitwise shard replay");
+  }
+
+  constexpr std::array<sc25::TrajectoryFailureInjection, 4> injections = {
+      sc25::TrajectoryFailureInjection::local_factor,
+      sc25::TrajectoryFailureInjection::trace_linear,
+      sc25::TrajectoryFailureInjection::admissibility,
+      sc25::TrajectoryFailureInjection::newton_iteration_limit};
+  for (const sc25::TrajectoryFailureInjection injection : injections)
+  {
+    std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> campaign =
+        CreateRank2Foundation();
+    if (!collectively_require(
+            campaign && campaign->InitializePersistentRank2Trajectory() ==
+                    sc25::TrajectoryStatus::ready,
+            "rank2 failure campaign initialization"))
+    {
+      return 1;
+    }
+    for (int step = 1; step <= 6; ++step)
+    {
+      if (!collectively_require(
+              Accepted(campaign->AdvancePersistentRank2Trajectory()),
+              "rank2 failure campaign prefix"))
+      {
+        return 1;
+      }
+    }
+    sc25::PersistentRank2TrajectoryState before_injection;
+    campaign->CopyPublishedRank2TrajectoryState(before_injection);
+    const sc25::TrajectoryStatus injected_status =
+        campaign->AdvancePersistentRank2Trajectory(
+            rank == 1 ? injection :
+                        sc25::TrajectoryFailureInjection::none);
+    if (!collectively_require(
+            injected_status ==
+                sc25::TrajectoryStatus::HdgSc25AcceptedAfterOneRetry,
+            "rank2 rank1-origin same-dt retry status"))
+    {
+      return 1;
+    }
+    const sc25::PersistentRank2TrajectoryEvidence& campaign_evidence =
+        campaign->rank2_trajectory_evidence();
+    const sc25::Rank2TrajectoryAttemptEvidence& failed_attempt =
+        campaign_evidence.attempts[6];
+    const sc25::Rank2TrajectoryAttemptEvidence& retry_attempt =
+        campaign_evidence.attempts[7];
+    if (failed_attempt.target_step != 7 || failed_attempt.retry_index != 0 ||
+        retry_attempt.target_step != 7 || retry_attempt.retry_index != 1 ||
+        failed_attempt.dt != sc25::persistent_dt ||
+        retry_attempt.dt != sc25::persistent_dt ||
+        !EqualRank2Hashes(failed_attempt.entry_hashes,
+                          failed_attempt.published_hashes) ||
+        !EqualRank2Hashes(failed_attempt.entry_hashes,
+                          retry_attempt.entry_hashes) ||
+        !EqualRank2Hashes(retry_attempt.candidate_hashes,
+                          retry_attempt.published_hashes) ||
+        !EqualRank2StateBytes(
+            campaign_evidence.stages[6].accepted_state,
+            baseline_evidence.stages[6].accepted_state))
+    {
+      fail("rank2 failed-attempt atomicity/retry evidence");
+    }
+    if (rank == 1 && failed_attempt.injection != injection)
+    {
+      fail("rank2 rank1 injection provenance");
+    }
+    if (rank == 0 && failed_attempt.injection !=
+                         sc25::TrajectoryFailureInjection::none)
+    {
+      fail("rank2 rank0 non-injection provenance");
+    }
+    sc25::TrajectoryStatus expected_failure =
+        sc25::TrajectoryStatus::uninitialized;
+    int expected_attempted_newton = 1;
+    int expected_completed_newton = 0;
+    int expected_gmres_solves = 0;
+    int expected_line_trials = 0;
+    if (injection == sc25::TrajectoryFailureInjection::local_factor)
+    {
+      expected_failure =
+          sc25::TrajectoryStatus::HdgSc25InjectedLocalFactorFailure;
+    }
+    else if (injection == sc25::TrajectoryFailureInjection::trace_linear)
+    {
+      expected_failure =
+          sc25::TrajectoryStatus::HdgSc25InjectedTraceLinearFailure;
+    }
+    else if (injection == sc25::TrajectoryFailureInjection::admissibility)
+    {
+      expected_failure =
+          sc25::TrajectoryStatus::HdgSc25InjectedAdmissibilityFailure;
+      expected_completed_newton = 1;
+      expected_gmres_solves = 1;
+      expected_line_trials = sc25::persistent_line_search_trials;
+    }
+    else
+    {
+      expected_failure =
+          sc25::TrajectoryStatus::HdgSc25InjectedNewtonIterationLimit;
+      expected_attempted_newton =
+          sc25::persistent_newton_maximum_iterations;
+    }
+    if (campaign_evidence.first_failure != expected_failure ||
+        failed_attempt.status != expected_failure ||
+        failed_attempt.attempted_newton_iterations !=
+            expected_attempted_newton ||
+        failed_attempt.newton_iterations != expected_completed_newton ||
+        failed_attempt.gmres_solves != expected_gmres_solves ||
+        (expected_gmres_solves == 0 ?
+             failed_attempt.gmres_iterations != 0 :
+             failed_attempt.gmres_iterations <= 0) ||
+        failed_attempt.line_search_trials != expected_line_trials)
+    {
+      fail("rank2 exact injected-attempt status/counters");
+    }
+    int observed_attempted_newton = 0;
+    int observed_completed_newton = 0;
+    int observed_visited_trials = 0;
+    bool exact_newton_trial_layout = true;
+    for (int iteration = 0;
+         iteration < sc25::persistent_newton_maximum_iterations; ++iteration)
+    {
+      const sc25::Rank2TrajectoryNewtonEvidence& newton =
+          failed_attempt.newton[static_cast<std::size_t>(iteration)];
+      observed_attempted_newton += newton.attempted ? 1 : 0;
+      observed_completed_newton += newton.completed ? 1 : 0;
+      exact_newton_trial_layout = exact_newton_trial_layout &&
+          newton.attempted == (iteration < expected_attempted_newton) &&
+          newton.completed == (iteration < expected_completed_newton) &&
+          newton.iteration ==
+              (iteration < expected_attempted_newton ? iteration : -1);
+      for (int line = 0; line < sc25::persistent_line_search_trials; ++line)
+      {
+        const bool expected_visited =
+            injection == sc25::TrajectoryFailureInjection::admissibility &&
+            iteration == 0;
+        const std::size_t line_index = static_cast<std::size_t>(line);
+        observed_visited_trials += newton.trial_visited[line_index] != 0 ?
+            1 : 0;
+        exact_newton_trial_layout = exact_newton_trial_layout &&
+            (newton.trial_visited[line_index] != 0) == expected_visited;
+        if (!expected_visited)
+        {
+          exact_newton_trial_layout = exact_newton_trial_layout &&
+              std::isinf(newton.trial_residual_norms[line_index]) &&
+              newton.trial_admissible[line_index] == 0 &&
+              newton.trial_armijo[line_index] == 0;
+        }
+      }
+    }
+    if (!exact_newton_trial_layout ||
+        observed_attempted_newton != expected_attempted_newton ||
+        observed_completed_newton != expected_completed_newton ||
+        observed_visited_trials != expected_line_trials)
+    {
+      fail("rank2 exact injected 20-Newton/13-trial evidence layout");
+    }
+    if (injection == sc25::TrajectoryFailureInjection::admissibility)
+    {
+      for (int line = 0; line < sc25::persistent_line_search_trials; ++line)
+      {
+        if (!std::isinf(failed_attempt.trial_residual_norms[
+                static_cast<std::size_t>(line)]) ||
+            failed_attempt.newton[0].trial_visited[
+                static_cast<std::size_t>(line)] == 0 ||
+            !std::isinf(failed_attempt.newton[0].trial_residual_norms[
+                static_cast<std::size_t>(line)]) ||
+            failed_attempt.trial_admissible[static_cast<std::size_t>(line)] !=
+                0 ||
+            failed_attempt.newton[0].trial_admissible[
+                static_cast<std::size_t>(line)] != 0 ||
+            failed_attempt.trial_armijo[static_cast<std::size_t>(line)] != 0 ||
+            failed_attempt.newton[0].trial_armijo[
+                static_cast<std::size_t>(line)] != 0)
+        {
+          fail("rank2 exact injected-admissibility trial evidence");
+          break;
+        }
+      }
+    }
+    if (EqualRank2StateBytes(before_injection,
+                             campaign_evidence.stages[6].accepted_state))
+    {
+      fail("rank2 retry failed to publish accepted step");
+    }
+    for (int step = 8; step <= sc25::persistent_required_steps; ++step)
+    {
+      if (!collectively_require(
+              Accepted(campaign->AdvancePersistentRank2Trajectory()),
+              "rank2 failure campaign suffix"))
+      {
+        return 1;
+      }
+    }
+    sc25::PersistentRank2TrajectoryState campaign_final;
+    if (!campaign->CopyPublishedRank2TrajectoryState(campaign_final) ||
+        !EqualRank2StateBytes(campaign_final, baseline_final) ||
+        campaign->rank2_trajectory_evidence().retry_attempts != 1 ||
+        campaign->rank2_trajectory_evidence().attempt_count != 21)
+    {
+      fail("rank2 failure campaign bitwise final parity");
+    }
+    if (!collectively_require(
+            Accepted(campaign->RestoreRank2TrajectoryCheckpoint(checkpoint10)),
+            "rank2 successful restore after injected failure") ||
+        campaign->rank2_trajectory_evidence().first_failure !=
+            sc25::TrajectoryStatus::uninitialized ||
+        campaign->rank2_trajectory_evidence().attempt_count != 0 ||
+        campaign->rank2_trajectory_evidence().step_evidence_count != 0)
+    {
+      fail("rank2 successful restore clears stale failure/attempt evidence");
+    }
+  }
+
+  {
+    std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> drift =
+        CreateRank2Foundation();
+    if (!collectively_require(
+            drift && drift->InitializePersistentRank2Trajectory() ==
+                    sc25::TrajectoryStatus::ready,
+            "rank2 boundary-drift negative initialization"))
+    {
+      return 1;
+    }
+    for (int step = 1; step <= 6; ++step)
+    {
+      if (!collectively_require(
+              Accepted(drift->AdvancePersistentRank2Trajectory()),
+              "rank2 boundary-drift negative prefix"))
+      {
+        return 1;
+      }
+    }
+    sc25::PersistentRank2TrajectoryState before;
+    sc25::PersistentRank2TrajectoryState after;
+    drift->CopyPublishedRank2TrajectoryState(before);
+    const sc25::PersistentRank2TrajectoryEvidence before_evidence =
+        drift->rank2_trajectory_evidence();
+    dg_igr_sc25_rank2_test_inject_boundary_drift(rank == 1 ? 1 : 0);
+    const sc25::TrajectoryStatus status =
+        drift->AdvancePersistentRank2Trajectory();
+    drift->CopyPublishedRank2TrajectoryState(after);
+    const sc25::PersistentRank2TrajectoryEvidence& after_evidence =
+        drift->rank2_trajectory_evidence();
+    const std::uint64_t local_detected =
+        after_evidence.detected_w8_owned_boundary_identity_changes -
+        before_evidence.detected_w8_owned_boundary_identity_changes;
+    std::uint64_t globally_detected = 0;
+    MPI_Allreduce(&local_detected, &globally_detected, 1, MPI_UINT64_T,
+                  MPI_SUM, MPI_COMM_WORLD);
+    if (!collectively_require(
+            status == sc25::TrajectoryStatus::HdgSc25PublicationFailure,
+            "rank2 collective late-publication drift status") ||
+        !EqualRank2StateBytes(before, after) ||
+        after_evidence.coordinates.time != before_evidence.coordinates.time ||
+        after_evidence.coordinates.step != before_evidence.coordinates.step ||
+        after_evidence.coordinates.generation !=
+            before_evidence.coordinates.generation ||
+        after_evidence.coordinates.cursor !=
+            before_evidence.coordinates.cursor ||
+        after_evidence.accepted_steps != before_evidence.accepted_steps ||
+        after_evidence.step_evidence_count !=
+            before_evidence.step_evidence_count ||
+        after_evidence.attempt_count != before_evidence.attempt_count + 1 ||
+        local_detected != static_cast<std::uint64_t>(rank == 1) ||
+        globally_detected != 1)
+    {
+      fail("rank2 late-publication atomicity/deep boundary-drift detection");
+    }
+  }
+
+  {
+    std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> install =
+        CreateRank2Foundation();
+    if (!collectively_require(
+            install && install->InitializePersistentRank2Trajectory() ==
+                    sc25::TrajectoryStatus::ready,
+            "rank2 final-install negative initialization"))
+    {
+      return 1;
+    }
+    sc25::PersistentRank2TrajectoryState before;
+    sc25::PersistentRank2TrajectoryState after;
+    install->CopyPublishedRank2TrajectoryState(before);
+    const sc25::PersistentRank2TrajectoryEvidence before_evidence =
+        install->rank2_trajectory_evidence();
+    dg_igr_sc25_rank2_test_inject_final_install_mismatch(rank == 1 ? 1 : 0);
+    const sc25::TrajectoryStatus status =
+        install->RestoreRank2TrajectoryCheckpoint(checkpoint10);
+    install->CopyPublishedRank2TrajectoryState(after);
+    const sc25::PersistentRank2TrajectoryEvidence& after_evidence =
+        install->rank2_trajectory_evidence();
+    if (!collectively_require(
+            status ==
+                sc25::TrajectoryStatus::HdgSc25RestartValidationFailureHash,
+            "rank2 collective final-install mismatch status") ||
+        !EqualRank2StateBytes(before, after) ||
+        after_evidence.coordinates.time != before_evidence.coordinates.time ||
+        after_evidence.coordinates.step != before_evidence.coordinates.step ||
+        after_evidence.coordinates.generation !=
+            before_evidence.coordinates.generation ||
+        after_evidence.coordinates.cursor !=
+            before_evidence.coordinates.cursor ||
+        after_evidence.accepted_steps != before_evidence.accepted_steps ||
+        after_evidence.attempt_count != before_evidence.attempt_count)
+    {
+      fail("rank2 final-install validation atomicity");
+    }
+  }
+
+  bool local_auxiliary_negative_proof = true;
+  if (rank == 1)
+  {
+    const int peer_element = GeometricPeerElement(*baseline, 0, *peer);
+    sc25::PersistentTrajectoryState corrupted = peer_checkpoint10.state;
+    sc25::AuxiliaryResidualMetrics q12{};
+    sc25::AuxiliaryResidualMetrics q14{};
+    if (peer_element < 0)
+    {
+      local_auxiliary_negative_proof = false;
+    }
+    else
+    {
+      corrupted.sigma[static_cast<std::size_t>(peer_element) *
+                          sc25::persistent_scalar_volume_nodes] += 1.0;
+      local_auxiliary_negative_proof =
+          dg_igr_hdg_sc25_cpu_test::EvaluateIndependentAuxiliaryResidualOracle(
+              *peer, corrupted, sc25::coupled_fixture_quadrature_order,
+              q12) &&
+          dg_igr_hdg_sc25_cpu_test::EvaluateIndependentAuxiliaryResidualOracle(
+              *peer, corrupted,
+              sc25::coupled_fixture_repeat_quadrature_order, q14) &&
+          q12.normalized_maximum > 1.0e-10 &&
+          q14.normalized_maximum > 1.0e-10;
+      oracle.maximum_q12_q14_sensitivity = std::abs(
+          q12.normalized_maximum - q14.normalized_maximum) /
+          std::max({1.0, std::abs(q12.normalized_maximum),
+                    std::abs(q14.normalized_maximum)});
+      local_auxiliary_negative_proof = local_auxiliary_negative_proof &&
+          oracle.maximum_q12_q14_sensitivity <= 1.0e-10;
+    }
+  }
+  if (!collectively_require(local_auxiliary_negative_proof,
+                            "rank2 independent auxiliary q12/q14 negative"))
+  {
+    return 1;
+  }
+
+  const auto rejection_control = [rank, &fail, &collectively_require,
+                                  &checkpoint10](
+                                     const int control)
+  {
+    std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> negative =
+        CreateRank2Foundation();
+    if (!collectively_require(
+            negative && negative->InitializePersistentRank2Trajectory() ==
+                    sc25::TrajectoryStatus::ready,
+            "rank2 restart negative initialization"))
+    {
+      return false;
+    }
+    sc25::PersistentRank2TrajectoryCheckpoint candidate = checkpoint10;
+    sc25::TrajectoryStatus expected =
+        sc25::TrajectoryStatus::HdgSc25RestartValidationFailureIdentity;
+    if (rank == 1)
+    {
+      if (control == 0)
+      {
+        candidate.tuple =
+            dg::hdg::runtime::StableIdentity::Copy(sc25::cpu_rank1_tuple_id);
+      }
+      else if (control == 1)
+      {
+        std::uint8_t* raw = reinterpret_cast<std::uint8_t*>(
+            candidate.state.u.data());
+        raw[0] ^= 1U;
+        expected =
+            sc25::TrajectoryStatus::HdgSc25RestartValidationFailureHash;
+      }
+      else if (control == 2)
+      {
+        candidate.state.u[0] = 0.0;
+        expected = sc25::TrajectoryStatus::
+            HdgSc25RestartValidationFailureAdmissibility;
+      }
+      else
+      {
+        candidate.state.sigma[0] += 1.0;
+        expected = sc25::TrajectoryStatus::
+            HdgSc25RestartValidationFailureAuxResidual;
+      }
+    }
+    else if (control == 1)
+    {
+      expected =
+          sc25::TrajectoryStatus::HdgSc25RestartValidationFailureHash;
+    }
+    else if (control == 2)
+    {
+      expected = sc25::TrajectoryStatus::
+          HdgSc25RestartValidationFailureAdmissibility;
+    }
+    else if (control == 3)
+    {
+      expected =
+          sc25::TrajectoryStatus::HdgSc25RestartValidationFailureAuxResidual;
+    }
+    if (control == 2 &&
+        (dg_igr_hdg_sc25_cpu_test::
+             EvaluateIndependentRank2StateAdmissibilityOracle(
+                 *negative, candidate.state,
+                 sc25::coupled_fixture_quadrature_order) ||
+         dg_igr_hdg_sc25_cpu_test::
+             EvaluateIndependentRank2StateAdmissibilityOracle(
+                 *negative, candidate.state,
+                 sc25::coupled_fixture_repeat_quadrature_order)))
+    {
+      fail("rank2 independent state-admissibility negative proof");
+      return false;
+    }
+    if ((control == 2 || control == 3) &&
+        !dg_igr_hdg_sc25_cpu_test::RehashIndependentRank2Checkpoint(candidate))
+    {
+      fail("rank2 independent combined-manifest rehash");
+      return false;
+    }
+    sc25::PersistentRank2TrajectoryState before;
+    sc25::PersistentRank2TrajectoryState after;
+    negative->CopyPublishedRank2TrajectoryState(before);
+    const sc25::TrajectoryStatus status =
+        negative->RestoreRank2TrajectoryCheckpoint(candidate);
+    negative->CopyPublishedRank2TrajectoryState(after);
+    if (!collectively_require(status == expected,
+                              "rank2 collective restart rejection status") ||
+        !EqualRank2StateBytes(before, after))
+    {
+      fail("rank2 restart rejection atomicity");
+      return false;
+    }
+    return true;
+  };
+  for (int control = 0; control < 4; ++control)
+  {
+    if (!rejection_control(control)) { break; }
+  }
+
+  int global_failures = 0;
+  MPI_Allreduce(&local_failures, &global_failures, 1, MPI_INT, MPI_SUM,
+                MPI_COMM_WORLD);
+  if (global_failures == 0 && rank == 0)
+  {
+    std::cout
+        << "SC25_RANK2_REUSE_SCOPE scope=w8_owned_boundary_census "
+        << "identity_changes="
+        << baseline_evidence.detected_w8_owned_boundary_identity_changes
+        << " w8_device_transfer_calls="
+        << baseline_evidence.w8_device_transfer_calls
+        << " opaque_mfem_hypre_observed="
+        << (baseline_evidence.opaque_mfem_hypre_observed ? 1 : 0) << '\n';
+    std::cout << "SC25_RANK2_RUNTIME mpi_ranks=2 rank2_accepted_steps="
+              << baseline_evidence.accepted_steps
+              << " serial_peer_accepted_steps="
+              << peer->trajectory_evidence().accepted_steps
+              << " gmres_solves=" << baseline_gmres_solves
+              << " gmres_iterations=" << baseline_gmres_iterations
+              << " newton_iterations=" << baseline_newton_iterations
+              << " line_search_trials=" << baseline_line_search_trials
+              << '\n';
+    std::cout << "PASS: " << sc25::persistent_rank2_fixture_id << " ("
+              << oracle.checked_local_elements << " local elements/rank, "
+              << oracle.checked_restriction_rows
+              << " independent restriction rows/rank, "
+              << oracle.checked_stages << " rank1-peer stages, max parity "
+              << oracle.maximum_peer_relative_error << ")\n";
+  }
+  return global_failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -654,7 +1425,24 @@ int main(int argc, char** argv)
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
 
   int failures = 0;
-  if (ranks != 1)
+  const bool rank2_trajectory = argc == 2 &&
+      std::string_view(argv[1]) == "--rank2-trajectory";
+  if (rank2_trajectory)
+  {
+    if (ranks != 2)
+    {
+      if (rank == 0)
+      {
+        std::cerr << "SC25 rank2 harness requires exactly two ranks\n";
+      }
+      failures = 1;
+    }
+    else
+    {
+      failures = RunRank2TrajectoryHarness();
+    }
+  }
+  else if (ranks != 1)
   {
     if (rank == 0) { std::cerr << "SC25 harness requires exactly one rank\n"; }
     failures = 1;
