@@ -4,13 +4,15 @@
  * @file numerics/hdg/runtime/cpu/persistent_sc25_scalar_igr.hpp
  * @brief MFEM-native rank-one foundation for SC25 projection-v3.
  *
- * This default-disabled component owns the C0 field/space/topology foundation
- * and the exact C1 coupled-operator, condensation, true-solve, and recovery
- * fixture.  It does not claim a nonlinear step, trajectory, restart, CLI,
- * output, rank-two, CUDA, or E2/E3 result.
+ * This default-disabled component owns the C0 field/space/topology foundation,
+ * the exact C1 coupled-operator fixture, and the bounded C2 CPU-rank-one
+ * persistent trajectory experiment.  C2 is experimental evidence for only
+ * the frozen N=8/k=1/20-step tuple; it is not a CLI, output, rank-two, CUDA,
+ * supported-method, or broader E2/E3 claim.
  */
 
 #include "numerics/hdg/auxiliary/screened_poisson_cpu.hpp"
+#include "numerics/hdg/runtime/run_contract.hpp"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"
 
 #include <mfem.hpp>
@@ -98,6 +100,56 @@ static_assert(coupled_fixture_elements == 9 &&
                   coupled_fixture_full_unknowns == 432,
               "C1-MFEM-PERIODIC-02 dimensions must remain exact");
 
+inline constexpr std::string_view persistent_fixture_id =
+    "C2-MFEM-PERSISTENT-N8-R1-01";
+inline constexpr std::string_view persistent_checkpoint_manifest_id =
+    "HDG-SC25-CHECKPOINT-MANIFEST-v3";
+inline constexpr int persistent_elements_per_direction = 8;
+inline constexpr int persistent_elements = 64;
+inline constexpr int persistent_unique_faces = 128;
+inline constexpr int persistent_scalar_volume_nodes = 4;
+inline constexpr int persistent_scalar_true_trace_nodes = 256;
+inline constexpr int persistent_u_unknowns = 1024;
+inline constexpr int persistent_sigma_unknowns = 256;
+inline constexpr int persistent_z_unknowns = 512;
+inline constexpr int persistent_uhat_unknowns = 1024;
+inline constexpr int persistent_sigmahat_unknowns = 256;
+inline constexpr int persistent_interior_unknowns = 1792;
+inline constexpr int persistent_true_trace_unknowns = 1280;
+inline constexpr int persistent_restriction_rows = 2560;
+inline constexpr int persistent_full_unknowns = 3072;
+inline constexpr int persistent_required_steps = 20;
+inline constexpr int persistent_newton_maximum_iterations = 20;
+inline constexpr int persistent_line_search_trials = 13;
+inline constexpr int persistent_trace_restart_dimension = 50;
+inline constexpr int persistent_trace_maximum_iterations = 200;
+inline constexpr double persistent_dt = 1.0 / 4096.0;
+static_assert(persistent_elements ==
+                      persistent_elements_per_direction *
+                          persistent_elements_per_direction &&
+                  persistent_u_unknowns ==
+                      persistent_elements * state_components *
+                          persistent_scalar_volume_nodes &&
+                  persistent_sigma_unknowns ==
+                      persistent_elements * persistent_scalar_volume_nodes &&
+                  persistent_z_unknowns ==
+                      persistent_elements * flux_components *
+                          persistent_scalar_volume_nodes &&
+                  persistent_uhat_unknowns ==
+                      state_components * persistent_scalar_true_trace_nodes &&
+                  persistent_sigmahat_unknowns ==
+                      persistent_scalar_true_trace_nodes &&
+                  persistent_interior_unknowns ==
+                      persistent_u_unknowns + persistent_sigma_unknowns +
+                          persistent_z_unknowns &&
+                  persistent_true_trace_unknowns ==
+                      persistent_uhat_unknowns +
+                          persistent_sigmahat_unknowns &&
+                  persistent_full_unknowns ==
+                      persistent_interior_unknowns +
+                          persistent_true_trace_unknowns,
+              "C2-MFEM-PERSISTENT-N8-R1-01 dimensions must remain exact");
+
 using HdgPublishedScalarPeriodicSc25ProjectionV3Tag =
     auxiliary::HdgPublishedScalarPeriodicSc25ProjectionV3Tag;
 using DensityHeightP2TraceStabilizationV2Tag =
@@ -127,6 +179,17 @@ struct CpuRank1Selection final
   using time_treatment = BackwardEulerMonolithicV1Tag;
   using precision = Fp64Tag;
   using backend = CpuSerialTag;
+
+  static constexpr RuntimeTupleDescriptor Descriptor() noexcept
+  {
+    return {StableIdentity::Copy(projection_id),
+            StableIdentity::Copy(object_id),
+            StableIdentity::Copy("DualConservativeScalarTraceV1"),
+            StableIdentity::Copy("W7Tau25.DensityHeightP2.v3"),
+            StableIdentity::Copy("BackwardEulerMonolithicV1"),
+            StableIdentity::Copy("CpuSerial"),
+            StableIdentity::Copy("Fp64")};
+  }
 };
 
 static_assert(std::is_empty<CpuRank1Selection>::value,
@@ -333,6 +396,264 @@ struct CoupledOperatorFixtureSnapshot final
   CoupledTraceSolverEvidence solver;
 };
 
+enum class TrajectoryStatus : std::uint8_t
+{
+  uninitialized,
+  ready,
+  HdgSc25Accepted,
+  HdgSc25AcceptedAfterOneRetry,
+  HdgSc25InjectedLocalFactorFailure,
+  HdgSc25InjectedTraceLinearFailure,
+  HdgSc25InjectedAdmissibilityFailure,
+  HdgSc25InjectedNewtonIterationLimit,
+  HdgSc25AssemblyFailure,
+  HdgSc25LocalFactorFailure,
+  HdgSc25TraceLinearFailure,
+  HdgSc25AdmissibilityFailure,
+  HdgSc25NewtonIterationLimit,
+  HdgSc25NonlinearResidualFailure,
+  HdgSc25ConservationFailure,
+  HdgSc25PublicationFailure,
+  HdgSc25RetryExhausted,
+  HdgSc25RestartValidationFailureIdentity,
+  HdgSc25RestartValidationFailureHash,
+  HdgSc25RestartValidationFailureAdmissibility,
+  HdgSc25RestartValidationFailureAssembly,
+  HdgSc25RestartValidationFailureAuxResidual,
+  invalid_configuration,
+  initialization_failure
+};
+
+enum class TrajectoryFailureInjection : std::uint8_t
+{
+  none,
+  local_factor,
+  trace_linear,
+  admissibility,
+  newton_iteration_limit
+};
+
+enum class TrajectoryAssemblyFailureCause : std::uint8_t
+{
+  none,
+  state_admissibility,
+  invalid_structure,
+  nonfinite_result,
+  exception
+};
+
+struct PersistentTrajectoryState final
+{
+  std::array<double, persistent_u_unknowns> u{};
+  std::array<double, persistent_sigma_unknowns> sigma{};
+  std::array<double, persistent_z_unknowns> z{};
+  std::array<double, persistent_uhat_unknowns> uhat{};
+  std::array<double, persistent_sigmahat_unknowns> sigmahat{};
+};
+
+struct TrajectoryStateHashes final
+{
+  StateHash u{};
+  StateHash sigma{};
+  StateHash z{};
+  StateHash uhat{};
+  StateHash sigmahat{};
+  StateHash interior{};
+  StateHash trace{};
+};
+
+struct TrajectoryCheckpointFieldIdentity final
+{
+  StableIdentity name{};
+  std::uint64_t fp64_entries = 0;
+  std::uint32_t canonical_order = 0;
+};
+
+struct PersistentTrajectoryCheckpoint final
+{
+  CheckpointDescriptor descriptor{};
+  PersistentTrajectoryState state{};
+  StableIdentity projection = StableIdentity::Copy(projection_id);
+  StableIdentity tuple = StableIdentity::Copy(cpu_rank1_tuple_id);
+  StableIdentity scenario = StableIdentity::Copy(persistent_fixture_id);
+  TrajectoryStateHashes raw_field_hashes{};
+  std::array<TrajectoryCheckpointFieldIdentity, 5> fields{};
+  StateHash canonical_manifest_hash{};
+};
+
+struct AuxiliaryResidualMetrics final
+{
+  double r_z_norm = 0.0;
+  double r_z_scale = 0.0;
+  double r_sigma_norm = 0.0;
+  double r_sigma_scale = 0.0;
+  double g_sigma_norm = 0.0;
+  double g_sigma_scale = 0.0;
+  double normalized_maximum = 0.0;
+};
+
+struct AuxiliaryInitializationEvidence final
+{
+  int quadrature_order = 0;
+  int trace_restart_dimension = 0;
+  int trace_maximum_iterations = 0;
+  double trace_relative_tolerance = 0.0;
+  double trace_absolute_tolerance = 0.0;
+  int ilu_type = -1;
+  int ilu_level_of_fill = -1;
+  int ilu_local_reordering = -1;
+  int trace_iterations = -1;
+  double trace_true_residual_norm = 0.0;
+  double trace_right_hand_side_norm = 0.0;
+  AuxiliaryResidualMetrics residual{};
+};
+
+struct TrajectoryReuseSnapshot final
+{
+  /**
+   * Direct W8-owned boundary census only. Equality detects wrapper/buffer
+   * identity, extent, capacity, or generation drift. It does not claim zero
+   * total allocation calls, an allocation plateau, performance, or visibility
+   * into opaque MFEM/HYPRE internals.
+   */
+  std::uintptr_t foundation_handle = 0;
+  std::uintptr_t topology_handle = 0;
+  std::uintptr_t carrier_map_handle = 0;
+  std::uintptr_t contract_handle = 0;
+  std::uintptr_t assembly_state_handle = 0;
+  std::uintptr_t assembly_handle = 0;
+  std::uintptr_t trial_assembly_handle = 0;
+  std::uintptr_t factor_handle = 0;
+  std::uintptr_t workspace_handle = 0;
+  std::uintptr_t quadrature_workspace_handle = 0;
+  std::uintptr_t local_pattern_handle = 0;
+  std::uintptr_t true_matrix_handle = 0;
+  std::uintptr_t true_rhs_handle = 0;
+  std::uintptr_t true_solution_handle = 0;
+  std::uintptr_t ilu_handle = 0;
+  std::uintptr_t gmres_handle = 0;
+  std::uintptr_t true_residual_handle = 0;
+  std::uintptr_t element_to_true_csr_handle = 0;
+  StateHash owned_boundary_identity_hash{};
+  std::uint64_t topology_generation = 0;
+  std::uint64_t storage_generation = 0;
+  std::uint64_t factor_generation = 0;
+  std::uint64_t workspace_generation = 0;
+  std::uint64_t local_pattern_generation = 0;
+  std::uint64_t solver_generation = 0;
+  std::uint64_t w8_owned_boundary_object_count = 0;
+  std::uint64_t w8_owned_boundary_buffer_count = 0;
+  /** MFEM/HYPRE internals are outside this direct W8-owned boundary census. */
+  bool opaque_mfem_hypre_observed = false;
+};
+
+struct TrajectoryNewtonEvidence final
+{
+  int iteration = -1;
+  double entry_residual_norm = 0.0;
+  double accepted_residual_norm = 0.0;
+  int accepted_line_search_index = -1;
+  int trace_iterations = -1;
+  double trace_true_residual_norm = 0.0;
+  double trace_right_hand_side_norm = 0.0;
+  double maximum_local_application_residual = 0.0;
+  PersistentTrajectoryState entry{};
+  PersistentTrajectoryState direction{};
+  std::array<double, persistent_line_search_trials> trial_residual_norms{};
+  std::array<std::uint8_t, persistent_line_search_trials> trial_admissible{};
+  std::array<std::uint8_t, persistent_line_search_trials> trial_armijo{};
+};
+
+struct TrajectoryAttemptEvidence final
+{
+  TrajectoryStatus status = TrajectoryStatus::uninitialized;
+  TrajectoryFailureInjection injection = TrajectoryFailureInjection::none;
+  int target_step = 0;
+  int retry_index = 0;
+  double dt = 0.0;
+  int attempted_newton_iterations = 0;
+  int newton_iterations = 0;
+  double entry_residual_norm = 0.0;
+  double final_residual_norm = 0.0;
+  double nonlinear_residual_bound = 0.0;
+  double maximum_conservation_error = 0.0;
+  double minimum_density = 0.0;
+  double minimum_pressure = 0.0;
+  double minimum_speed_margin = 0.0;
+  StateCoordinates committed_coordinates{};
+  StateCoordinates published_coordinates{};
+  TrajectoryStateHashes entry_hashes{};
+  TrajectoryStateHashes candidate_hashes{};
+  TrajectoryStateHashes published_hashes{};
+  TrajectoryReuseSnapshot entry_reuse{};
+  TrajectoryReuseSnapshot exit_reuse{};
+  std::array<TrajectoryNewtonEvidence,
+             persistent_newton_maximum_iterations> newton{};
+};
+
+struct TrajectoryStepEvidence final
+{
+  bool accepted = false;
+  int step = 0;
+  double time = 0.0;
+  double dt = 0.0;
+  std::uint64_t generation = 0;
+  int attempt_index = -1;
+  std::array<double, state_components> committed_integrals{};
+  std::array<double, state_components> accepted_integrals{};
+  PersistentTrajectoryState accepted_state{};
+  TrajectoryStateHashes accepted_hashes{};
+  TrajectoryReuseSnapshot reuse{};
+};
+
+struct TrajectoryReuseEvidence final
+{
+  TrajectoryReuseSnapshot baseline{};
+  TrajectoryReuseSnapshot current{};
+  std::size_t true_matrix_nonzeros = 0;
+  /** Detected pointer/extent/capacity/generation drift, not allocation calls. */
+  std::uint64_t detected_w8_owned_boundary_identity_changes = 0;
+  std::uint64_t w8_device_transfer_calls = 0;
+  bool opaque_mfem_hypre_observed = false;
+};
+
+struct PersistentTrajectoryEvidence final
+{
+  TrajectoryStatus status = TrajectoryStatus::uninitialized;
+  TrajectoryStatus first_failure = TrajectoryStatus::uninitialized;
+  TrajectoryAssemblyFailureCause first_assembly_failure =
+      TrajectoryAssemblyFailureCause::none;
+  RunStatus contract_status = RunStatus::ready;
+  FailureReason contract_last_failure = FailureReason::none;
+  FailureReason contract_first_failure = FailureReason::none;
+  int accepted_steps = 0;
+  int attempted_steps = 0;
+  int retry_attempts = 0;
+  int attempt_count = 0;
+  /** Number of records stored in steps, not the absolute accepted step. */
+  int step_evidence_count = 0;
+  std::uint64_t checkpoint_step_offset = 0;
+  StateCoordinates continuation_start_coordinates{};
+  PersistentTrajectoryState continuation_start_state{};
+  TrajectoryStateHashes continuation_start_hashes{};
+  bool restored_loaded_state_match = false;
+  bool restored_loaded_coordinates_match = false;
+  bool restored_loaded_hashes_match = false;
+  int trace_restart_dimension = 0;
+  int trace_maximum_iterations = 0;
+  double trace_relative_tolerance = 0.0;
+  double trace_absolute_tolerance = 0.0;
+  int ilu_type = -1;
+  int ilu_level_of_fill = -1;
+  int ilu_local_reordering = -1;
+  StateCoordinates coordinates{};
+  AuxiliaryInitializationEvidence initialization{};
+  TrajectoryReuseEvidence reuse{};
+  std::array<TrajectoryAttemptEvidence,
+             persistent_required_steps + 4> attempts{};
+  std::array<TrajectoryStepEvidence, persistent_required_steps> steps{};
+};
+
 double VelocityGradientInvariant(
     const std::array<std::array<double, dimension>, dimension>& gradient)
     noexcept;
@@ -360,6 +681,8 @@ bool EvaluateAuxiliaryStabilization(
 
 bool CondenseElementLinearization(const ElementLinearization& input,
                                   ElementCondensedBlock& output) noexcept;
+
+struct PersistentTrajectoryImplementation;
 
 class PersistentSc25ScalarIgrCpuFoundation final
 {
@@ -414,7 +737,24 @@ public:
   bool RunCoupledOperatorFixture(
       CoupledOperatorFixtureSnapshot& output) noexcept;
 
+  /** Initialize only C2-MFEM-PERSISTENT-N8-R1-01 on an N=8 foundation. */
+  TrajectoryStatus InitializePersistentTrajectory() noexcept;
+
+  /** Advance one accepted step, owning the single same-dt retry if needed. */
+  TrajectoryStatus AdvancePersistentTrajectory(
+      TrajectoryFailureInjection injection =
+          TrajectoryFailureInjection::none) noexcept;
+
+  bool CopyPublishedTrajectoryState(
+      PersistentTrajectoryState& output) const noexcept;
+  bool CaptureTrajectoryCheckpoint(
+      PersistentTrajectoryCheckpoint& output) const noexcept;
+  TrajectoryStatus RestoreTrajectoryCheckpoint(
+      const PersistentTrajectoryCheckpoint& checkpoint) noexcept;
+  const PersistentTrajectoryEvidence& trajectory_evidence() const noexcept;
+
 private:
+  friend struct PersistentTrajectoryImplementation;
   struct Implementation;
   explicit PersistentSc25ScalarIgrCpuFoundation(
       std::unique_ptr<Implementation> implementation) noexcept;

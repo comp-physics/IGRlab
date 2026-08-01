@@ -1,5 +1,7 @@
 #include "sc25_scalar_igr_independent_oracle.hpp"
 
+#include "numerics/hdg/runtime/sha256.hpp"
+
 #include <mfem.hpp>
 
 #include <algorithm>
@@ -9,6 +11,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -1527,6 +1530,122 @@ static_assert(c1_elements == 9 && c1_faces == 18 && c1_ns == 4 &&
                   c1_element_variables == 68,
               "independent C1-MFEM-PERIODIC-02 dimensions must remain exact");
 
+constexpr int n8_elements = 64;
+constexpr int n8_faces = 128;
+constexpr int n8_true_trace = 1280;
+constexpr int n8_steps = 20;
+constexpr int n8_newton_limit = 20;
+constexpr int n8_line_trials = 13;
+constexpr int n8_q12 = 12;
+constexpr int n8_q14 = 14;
+constexpr int n8_trace_restart_dimension = 50;
+constexpr int n8_trace_maximum_iterations = 200;
+constexpr double n8_dt = 1.0 / 4096.0;
+constexpr double n8_conservation_maximum_tolerance = 1.0e-11;
+constexpr double n8_conservation_negative_offset = 4.0e-11;
+static_assert(sc25::persistent_elements == n8_elements &&
+                  sc25::persistent_unique_faces == n8_faces &&
+                  sc25::persistent_true_trace_unknowns == n8_true_trace &&
+                  sc25::persistent_required_steps == n8_steps &&
+                  sc25::persistent_newton_maximum_iterations ==
+                      n8_newton_limit &&
+                  sc25::persistent_line_search_trials == n8_line_trials &&
+                  sc25::coupled_fixture_quadrature_order == n8_q12 &&
+                  sc25::coupled_fixture_repeat_quadrature_order == n8_q14 &&
+                  sc25::persistent_trace_restart_dimension ==
+                      n8_trace_restart_dimension &&
+                  sc25::persistent_trace_maximum_iterations ==
+                      n8_trace_maximum_iterations &&
+                  sc25::persistent_dt == n8_dt,
+              "independent N8 trajectory constants must detect drift");
+
+bool ConservationMaximumMatches(const double independent_q14,
+                                const double reported_q12) noexcept
+{
+  return std::isfinite(independent_q14) && std::isfinite(reported_q12) &&
+      std::abs(independent_q14 - reported_q12) <=
+          n8_conservation_maximum_tolerance;
+}
+
+constexpr int n8_attempt_capacity = n8_steps + 4;
+
+struct AttemptStepMapping final
+{
+  int step_count = 0;
+  int attempt_count = 0;
+  std::array<int, n8_steps> step_numbers{};
+  std::array<int, n8_steps> step_attempt_indices{};
+  std::array<sc25::TrajectoryStatus, n8_attempt_capacity> attempt_status{};
+  std::array<int, n8_attempt_capacity> attempt_target_steps{};
+};
+
+bool AcceptedAttemptStatus(const sc25::TrajectoryStatus status) noexcept
+{
+  return status == sc25::TrajectoryStatus::HdgSc25Accepted ||
+      status == sc25::TrajectoryStatus::HdgSc25AcceptedAfterOneRetry;
+}
+
+bool ValidAcceptedAttemptStepBijection(
+    const AttemptStepMapping& mapping,
+    const std::uint64_t checkpoint_offset) noexcept
+{
+  if (checkpoint_offset > static_cast<std::uint64_t>(n8_steps) ||
+      mapping.step_count !=
+          n8_steps - static_cast<int>(checkpoint_offset) ||
+      mapping.attempt_count < mapping.step_count ||
+      mapping.attempt_count > n8_attempt_capacity)
+  {
+    return false;
+  }
+  std::array<int, n8_attempt_capacity> use_count{};
+  for (int local_step = 0; local_step < mapping.step_count; ++local_step)
+  {
+    const int expected_step =
+        static_cast<int>(checkpoint_offset) + local_step + 1;
+    const int attempt_index = mapping.step_attempt_indices[
+        static_cast<std::size_t>(local_step)];
+    if (mapping.step_numbers[static_cast<std::size_t>(local_step)] !=
+            expected_step ||
+        attempt_index < 0 || attempt_index >= mapping.attempt_count ||
+        !AcceptedAttemptStatus(mapping.attempt_status[
+            static_cast<std::size_t>(attempt_index)]) ||
+        mapping.attempt_target_steps[
+            static_cast<std::size_t>(attempt_index)] != expected_step)
+    {
+      return false;
+    }
+    ++use_count[static_cast<std::size_t>(attempt_index)];
+  }
+  for (int attempt_index = 0; attempt_index < mapping.attempt_count;
+       ++attempt_index)
+  {
+    const int target_step = mapping.attempt_target_steps[
+        static_cast<std::size_t>(attempt_index)];
+    const bool relevant =
+        target_step > static_cast<int>(checkpoint_offset) &&
+        target_step <= n8_steps;
+    const bool relevant_accepted = relevant && AcceptedAttemptStatus(
+        mapping.attempt_status[static_cast<std::size_t>(attempt_index)]);
+    const int uses = use_count[static_cast<std::size_t>(attempt_index)];
+    if (!relevant_accepted)
+    {
+      if (uses != 0) { return false; }
+      continue;
+    }
+    const int local_step =
+        target_step - static_cast<int>(checkpoint_offset) - 1;
+    if (uses != 1 || local_step < 0 || local_step >= mapping.step_count ||
+        mapping.step_attempt_indices[static_cast<std::size_t>(local_step)] !=
+            attempt_index ||
+        mapping.step_numbers[static_cast<std::size_t>(local_step)] !=
+            target_step)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 struct C1Dual final
 {
   double value = 0.0;
@@ -2787,6 +2906,1973 @@ bool RunIndependentC1Oracle(
   if (evidence.checked_coordinate_directions != c1_full)
   {
     evidence.failures.push_back("C1 coordinate-direction census");
+  }
+  return evidence.failures.empty();
+}
+
+namespace
+{
+
+using TrajectoryState = sc25::PersistentTrajectoryState;
+using TrajectoryHashes = sc25::TrajectoryStateHashes;
+
+void TrajectoryRequire(const bool condition, const std::string& message,
+                       IndependentTrajectoryEvidence& evidence)
+{
+  if (!condition) { evidence.failures.push_back(message); }
+}
+
+template <typename Array>
+dg::hdg::runtime::StateHash HashOneArray(const Array& values) noexcept
+{
+  return {dg::hdg::runtime::ComputeSha256(
+      values.data(), values.size() * sizeof(double))};
+}
+
+template <typename... Arrays>
+dg::hdg::runtime::StateHash HashArraySequence(
+    const Arrays&... arrays) noexcept
+{
+  dg::hdg::runtime::Sha256 hash;
+  const bool updated =
+      (hash.Update(arrays.data(), arrays.size() * sizeof(double)) && ...);
+  dg::hdg::runtime::Sha256Digest digest{};
+  if (!updated || !hash.Finalize(digest)) { return {}; }
+  return {digest};
+}
+
+TrajectoryHashes IndependentHashes(const TrajectoryState& state) noexcept
+{
+  return {HashOneArray(state.u),
+          HashOneArray(state.sigma),
+          HashOneArray(state.z),
+          HashOneArray(state.uhat),
+          HashOneArray(state.sigmahat),
+          HashArraySequence(state.u, state.sigma, state.z),
+          HashArraySequence(state.uhat, state.sigmahat)};
+}
+
+bool HashesEqual(const TrajectoryHashes& left,
+                 const TrajectoryHashes& right) noexcept
+{
+  return left.u == right.u && left.sigma == right.sigma &&
+      left.z == right.z && left.uhat == right.uhat &&
+      left.sigmahat == right.sigmahat &&
+      left.interior == right.interior && left.trace == right.trace;
+}
+
+bool ReuseSnapshotsEqual(const sc25::TrajectoryReuseSnapshot& left,
+                         const sc25::TrajectoryReuseSnapshot& right) noexcept
+{
+  return left.foundation_handle == right.foundation_handle &&
+      left.topology_handle == right.topology_handle &&
+      left.carrier_map_handle == right.carrier_map_handle &&
+      left.contract_handle == right.contract_handle &&
+      left.assembly_state_handle == right.assembly_state_handle &&
+      left.assembly_handle == right.assembly_handle &&
+      left.trial_assembly_handle == right.trial_assembly_handle &&
+      left.factor_handle == right.factor_handle &&
+      left.workspace_handle == right.workspace_handle &&
+      left.quadrature_workspace_handle == right.quadrature_workspace_handle &&
+      left.local_pattern_handle == right.local_pattern_handle &&
+      left.true_matrix_handle == right.true_matrix_handle &&
+      left.true_rhs_handle == right.true_rhs_handle &&
+      left.true_solution_handle == right.true_solution_handle &&
+      left.ilu_handle == right.ilu_handle &&
+      left.gmres_handle == right.gmres_handle &&
+      left.true_residual_handle == right.true_residual_handle &&
+      left.element_to_true_csr_handle == right.element_to_true_csr_handle &&
+      left.owned_boundary_identity_hash ==
+          right.owned_boundary_identity_hash &&
+      left.topology_generation == right.topology_generation &&
+      left.storage_generation == right.storage_generation &&
+      left.factor_generation == right.factor_generation &&
+      left.workspace_generation == right.workspace_generation &&
+      left.local_pattern_generation == right.local_pattern_generation &&
+      left.solver_generation == right.solver_generation &&
+      left.w8_owned_boundary_object_count ==
+          right.w8_owned_boundary_object_count &&
+      left.w8_owned_boundary_buffer_count ==
+          right.w8_owned_boundary_buffer_count &&
+      !left.opaque_mfem_hypre_observed &&
+      !right.opaque_mfem_hypre_observed;
+}
+
+bool FiniteState(const TrajectoryState& state) noexcept
+{
+  const auto finite = [](const auto& values)
+  {
+    return std::all_of(values.begin(), values.end(),
+                       [](const double value) { return std::isfinite(value); });
+  };
+  return finite(state.u) && finite(state.sigma) && finite(state.z) &&
+      finite(state.uhat) && finite(state.sigmahat);
+}
+
+bool PrimitiveAdmissible(
+    const std::array<double, sc25::state_components>& conservative,
+    double& density, double& pressure, double& speed_margin) noexcept
+{
+  density = conservative[0];
+  if (!std::isfinite(density) || density < 1.0e-8) { return false; }
+  const double inverse_density = 1.0 / density;
+  const double velocity_x = conservative[1] * inverse_density;
+  const double velocity_y = conservative[2] * inverse_density;
+  pressure = (sc25::gamma - 1.0) *
+      (conservative[3] -
+       0.5 * (conservative[1] * conservative[1] +
+              conservative[2] * conservative[2]) * inverse_density);
+  if (!std::isfinite(pressure) || pressure < 1.0e-8) { return false; }
+  const double sound = std::sqrt(sc25::gamma * pressure * inverse_density);
+  speed_margin = 2.5 - std::hypot(velocity_x, velocity_y) - sound;
+  return std::isfinite(speed_margin) && speed_margin > 0.0;
+}
+
+bool IndependentVolumeChecks(
+    sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    const TrajectoryState& state,
+    std::array<double, sc25::state_components>& integrals,
+    double& minimum_density, double& minimum_pressure,
+    double& minimum_speed_margin, const int quadrature_order) noexcept
+{
+  integrals.fill(0.0);
+  minimum_density = std::numeric_limits<double>::infinity();
+  minimum_pressure = std::numeric_limits<double>::infinity();
+  minimum_speed_margin = std::numeric_limits<double>::infinity();
+  const mfem::ParFiniteElementSpace* space = foundation.spaces().u.address;
+  mfem::ParMesh* mesh = const_cast<mfem::ParMesh*>(foundation.mesh());
+  if (!space || !mesh || mesh->GetNE() != sc25::persistent_elements)
+  {
+    return false;
+  }
+  try
+  {
+    for (int element = 0; element < sc25::persistent_elements; ++element)
+    {
+      const mfem::FiniteElement* finite_element = space->GetFE(element);
+      mfem::ElementTransformation* transformation =
+          mesh->GetElementTransformation(element);
+      if (!finite_element || !transformation ||
+          finite_element->GetDof() != sc25::persistent_scalar_volume_nodes)
+      {
+        return false;
+      }
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), quadrature_order);
+      mfem::Vector shape(sc25::persistent_scalar_volume_nodes);
+      const std::size_t base = static_cast<std::size_t>(element) *
+          sc25::state_components * sc25::persistent_scalar_volume_nodes;
+      for (int point = 0; point < rule.GetNPoints(); ++point)
+      {
+        const mfem::IntegrationPoint& ip = rule.IntPoint(point);
+        transformation->SetIntPoint(&ip);
+        finite_element->CalcShape(ip, shape);
+        const double weight = ip.weight * transformation->Weight();
+        std::array<double, sc25::state_components> conservative{};
+        for (int component = 0; component < sc25::state_components;
+             ++component)
+          for (int scalar = 0;
+               scalar < sc25::persistent_scalar_volume_nodes; ++scalar)
+          {
+            conservative[component] += shape[scalar] * state.u[
+                base + static_cast<std::size_t>(component) *
+                           sc25::persistent_scalar_volume_nodes + scalar];
+          }
+        double density = 0.0;
+        double pressure = 0.0;
+        double speed_margin = 0.0;
+        if (!PrimitiveAdmissible(conservative, density, pressure,
+                                 speed_margin) ||
+            !std::isfinite(weight) || !(weight > 0.0))
+        {
+          return false;
+        }
+        minimum_density = std::min(minimum_density, density);
+        minimum_pressure = std::min(minimum_pressure, pressure);
+        minimum_speed_margin = std::min(minimum_speed_margin, speed_margin);
+        for (int component = 0; component < sc25::state_components;
+             ++component)
+        {
+          integrals[component] += weight * conservative[component];
+        }
+      }
+    }
+    return std::all_of(integrals.begin(), integrals.end(),
+                       [](const double value) { return std::isfinite(value); });
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+bool IndependentTraceNodeChecks(const TrajectoryState& state,
+                                double& minimum_density,
+                                double& minimum_pressure,
+                                double& minimum_speed_margin) noexcept
+{
+  for (int scalar = 0; scalar < sc25::persistent_scalar_true_trace_nodes;
+       ++scalar)
+  {
+    std::array<double, sc25::state_components> conservative{};
+    for (int component = 0; component < sc25::state_components; ++component)
+    {
+      conservative[component] = state.uhat[
+          static_cast<std::size_t>(component) *
+              sc25::persistent_scalar_true_trace_nodes + scalar];
+    }
+    double density = 0.0;
+    double pressure = 0.0;
+    double speed_margin = 0.0;
+    if (!PrimitiveAdmissible(conservative, density, pressure, speed_margin))
+    {
+      return false;
+    }
+    minimum_density = std::min(minimum_density, density);
+    minimum_pressure = std::min(minimum_pressure, pressure);
+    minimum_speed_margin = std::min(minimum_speed_margin, speed_margin);
+  }
+  return true;
+}
+
+std::array<double, sc25::state_components> IndependentInitialState(
+    const double x, const double y) noexcept
+{
+  constexpr double pi = 3.141592653589793238462643383279502884;
+  const double density = 1.0 + 0.05 * std::sin(2.0 * pi * x) *
+      std::sin(2.0 * pi * y);
+  const double velocity_x = 0.1 * std::sin(2.0 * pi * x);
+  const double velocity_y = 0.1 * std::sin(2.0 * pi * y);
+  return {{density, density * velocity_x, density * velocity_y,
+           1.0 / (frozen_gamma - 1.0) +
+               0.5 * density *
+                   (velocity_x * velocity_x + velocity_y * velocity_y)}};
+}
+
+bool VerifyIndependentInitialL2Projection(
+    sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    const TrajectoryState& state,
+    const int quadrature_order, double& maximum_volume_moment,
+    double& maximum_trace_moment) noexcept
+{
+  const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
+  mfem::ParMesh* mesh = const_cast<mfem::ParMesh*>(foundation.mesh());
+  const mfem::ParFiniteElementSpace* volume_space = spaces.u.address;
+  const mfem::ParFiniteElementSpace* trace_space = spaces.uhat.address;
+  if (!mesh || !volume_space || !trace_space) { return false; }
+  maximum_volume_moment = 0.0;
+  maximum_trace_moment = 0.0;
+  try
+  {
+    constexpr int ns = sc25::persistent_scalar_volume_nodes;
+    constexpr int nf = sc25::coupled_fixture_scalar_face_nodes;
+    for (int element = 0; element < sc25::persistent_elements; ++element)
+    {
+      const mfem::FiniteElement* finite_element =
+          volume_space->GetFE(element);
+      mfem::ElementTransformation* transformation =
+          mesh->GetElementTransformation(element);
+      if (!finite_element || !transformation ||
+          finite_element->GetDof() != ns)
+      {
+        return false;
+      }
+      mfem::Vector shape(ns), point(sc25::dimension);
+      std::array<std::array<long double, ns>, sc25::state_components>
+          moments{};
+      std::array<std::array<long double, ns>, sc25::state_components>
+          scales{};
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), quadrature_order);
+      const std::size_t base = static_cast<std::size_t>(element) *
+          sc25::state_components * ns;
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& ip = rule.IntPoint(q);
+        transformation->SetIntPoint(&ip);
+        finite_element->CalcShape(ip, shape);
+        transformation->Transform(ip, point);
+        const auto exact = IndependentInitialState(point[0], point[1]);
+        const double weight = ip.weight * transformation->Weight();
+        for (int component = 0; component < sc25::state_components;
+             ++component)
+        {
+          double projected = 0.0;
+          for (int scalar = 0; scalar < ns; ++scalar)
+          {
+            projected += shape[scalar] * state.u[
+                base + static_cast<std::size_t>(component) * ns + scalar];
+          }
+          for (int row = 0; row < ns; ++row)
+          {
+            const long double term = static_cast<long double>(weight) *
+                shape[row] * (projected - exact[component]);
+            moments[static_cast<std::size_t>(component)]
+                   [static_cast<std::size_t>(row)] += term;
+            scales[static_cast<std::size_t>(component)]
+                  [static_cast<std::size_t>(row)] += std::abs(
+                      static_cast<long double>(weight) * shape[row] *
+                      (projected + exact[component]));
+          }
+        }
+      }
+      for (int component = 0; component < sc25::state_components;
+           ++component)
+        for (int row = 0; row < ns; ++row)
+        {
+          const long double moment =
+              moments[static_cast<std::size_t>(component)]
+                     [static_cast<std::size_t>(row)];
+          const long double scale =
+              scales[static_cast<std::size_t>(component)]
+                    [static_cast<std::size_t>(row)];
+          maximum_volume_moment = std::max(
+              maximum_volume_moment,
+              static_cast<double>(std::abs(moment) /
+                                  std::max(1.0L, scale)));
+        }
+    }
+
+    for (int face = 0; face < mesh->GetNumFaces(); ++face)
+    {
+      const mfem::FiniteElement* finite_element =
+          trace_space->GetFaceElement(face);
+      mfem::ElementTransformation* transformation =
+          mesh->GetFaceTransformation(face);
+      mfem::Array<int> signed_dofs;
+      trace_space->GetFaceVDofs(face, signed_dofs);
+      if (!finite_element || !transformation ||
+          finite_element->GetDof() != nf ||
+          signed_dofs.Size() != sc25::state_components * nf)
+      {
+        return false;
+      }
+      mfem::Vector shape(nf), point(sc25::dimension);
+      std::array<std::array<long double, nf>, sc25::state_components>
+          moments{};
+      std::array<std::array<long double, nf>, sc25::state_components>
+          scales{};
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), quadrature_order);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& ip = rule.IntPoint(q);
+        transformation->SetIntPoint(&ip);
+        finite_element->CalcShape(ip, shape);
+        transformation->Transform(ip, point);
+        const auto exact = IndependentInitialState(point[0], point[1]);
+        const double weight = ip.weight * transformation->Weight();
+        for (int component = 0; component < sc25::state_components;
+             ++component)
+        {
+          double projected = 0.0;
+          for (int scalar = 0; scalar < nf; ++scalar)
+          {
+            int dof = -1;
+            int sign = 0;
+            if (!DecodeSignedDof(signed_dofs[component * nf + scalar],
+                                 dof, sign))
+            {
+              return false;
+            }
+            const int true_dof = trace_space->GetLocalTDofNumber(dof);
+            if (true_dof < 0 ||
+                true_dof >= sc25::persistent_uhat_unknowns)
+            {
+              return false;
+            }
+            projected += shape[scalar] * sign *
+                state.uhat[static_cast<std::size_t>(true_dof)];
+          }
+          for (int row = 0; row < nf; ++row)
+          {
+            const long double term = static_cast<long double>(weight) *
+                shape[row] * (projected - exact[component]);
+            moments[static_cast<std::size_t>(component)]
+                   [static_cast<std::size_t>(row)] += term;
+            scales[static_cast<std::size_t>(component)]
+                  [static_cast<std::size_t>(row)] += std::abs(
+                      static_cast<long double>(weight) * shape[row] *
+                      (projected + exact[component]));
+          }
+        }
+      }
+      for (int component = 0; component < sc25::state_components;
+           ++component)
+        for (int row = 0; row < nf; ++row)
+        {
+          const long double moment =
+              moments[static_cast<std::size_t>(component)]
+                     [static_cast<std::size_t>(row)];
+          const long double scale =
+              scales[static_cast<std::size_t>(component)]
+                    [static_cast<std::size_t>(row)];
+          maximum_trace_moment = std::max(
+              maximum_trace_moment,
+              static_cast<double>(std::abs(moment) /
+                                  std::max(1.0L, scale)));
+        }
+    }
+  }
+  catch (...)
+  {
+    return false;
+  }
+  return std::isfinite(maximum_volume_moment) &&
+      std::isfinite(maximum_trace_moment);
+}
+
+TrajectoryState ApplyIndependentDirection(
+    const TrajectoryState& entry, const TrajectoryState& direction,
+    const double theta) noexcept
+{
+  TrajectoryState trial = entry;
+  const auto add = [theta](auto& output, const auto& increment)
+  {
+    for (std::size_t i = 0; i < output.size(); ++i)
+    {
+      output[i] += theta * increment[i];
+    }
+  };
+  add(trial.u, direction.u);
+  add(trial.sigma, direction.sigma);
+  add(trial.z, direction.z);
+  add(trial.uhat, direction.uhat);
+  add(trial.sigmahat, direction.sigmahat);
+  return trial;
+}
+
+struct N8OracleContext final
+{
+  std::vector<IndependentElementRestriction> restriction;
+};
+
+double N8TrueValue(const TrajectoryState& state, const int true_dof)
+{
+  return true_dof < sc25::persistent_uhat_unknowns ?
+      state.uhat[static_cast<std::size_t>(true_dof)] :
+      state.sigmahat[static_cast<std::size_t>(
+          true_dof - sc25::persistent_uhat_unknowns)];
+}
+
+void N8PackElement(const TrajectoryState& state, const int element,
+                   std::vector<double>& local)
+{
+  local.assign(c1_ni, 0.0);
+  const std::size_t u_base = static_cast<std::size_t>(element) *
+      sc25::state_components * c1_ns;
+  const std::size_t sigma_base = static_cast<std::size_t>(element) * c1_ns;
+  const std::size_t z_base = static_cast<std::size_t>(element) * 2 * c1_ns;
+  std::copy_n(state.u.begin() + u_base, sc25::state_components * c1_ns,
+              local.begin());
+  std::copy_n(state.sigma.begin() + sigma_base, c1_ns,
+              local.begin() + 4 * c1_ns);
+  std::copy_n(state.z.begin() + z_base, 2 * c1_ns,
+              local.begin() + 5 * c1_ns);
+}
+
+void N8PackTrace(const TrajectoryState& state,
+                 const IndependentElementRestriction& map,
+                 std::vector<double>& trace)
+{
+  trace.assign(c1_nt, 0.0);
+  for (int row = 0; row < c1_nt; ++row)
+  {
+    const IndependentRestrictionEntry& entry =
+        map.entries[static_cast<std::size_t>(row)];
+    trace[static_cast<std::size_t>(row)] =
+        entry.sign * N8TrueValue(state, entry.local_true_dof);
+  }
+}
+
+bool BuildN8OracleContext(
+    const sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    N8OracleContext& context, IndependentTrajectoryEvidence& evidence)
+{
+  context = {};
+  const mfem::ParMesh* mesh = foundation.mesh();
+  const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
+  const mfem::DG_Interface_FECollection* trace_collection =
+      foundation.trace_collection();
+  if (!mesh || !spaces.trace_carrier.address || !trace_collection ||
+      mesh->GetNE() != sc25::persistent_elements ||
+      mesh->GetNumFaces() != sc25::persistent_unique_faces ||
+      spaces.trace_carrier.local_true_size !=
+          sc25::persistent_true_trace_unknowns)
+  {
+    evidence.failures.push_back("N8 independent ownership");
+    return false;
+  }
+  context.restriction.resize(sc25::persistent_elements);
+  std::vector<int> incidence(sc25::persistent_true_trace_unknowns, 0);
+  for (int element = 0; element < sc25::persistent_elements; ++element)
+  {
+    IndependentC0Evidence restriction_evidence;
+    if (!BuildIndependentRestriction(
+            element, 1, *mesh, *trace_collection,
+            *spaces.trace_carrier.address,
+            context.restriction[static_cast<std::size_t>(element)],
+            restriction_evidence))
+    {
+      evidence.failures.push_back("N8 independent restriction " +
+                                  std::to_string(element));
+      return false;
+    }
+    const IndependentElementRestriction& map =
+        context.restriction[static_cast<std::size_t>(element)];
+    if (map.entries.size() != c1_nt) { return false; }
+    for (const IndependentRestrictionEntry& entry : map.entries)
+    {
+      if (entry.local_true_dof < 0 ||
+          entry.local_true_dof >= sc25::persistent_true_trace_unknowns)
+      {
+        return false;
+      }
+      ++incidence[static_cast<std::size_t>(entry.local_true_dof)];
+    }
+  }
+  if (!std::all_of(incidence.begin(), incidence.end(),
+                   [](const int value) { return value == 2; }))
+  {
+    evidence.failures.push_back("N8 independent periodic incidence");
+    return false;
+  }
+  return true;
+}
+
+bool EvaluateIndependentAuxiliaryResidualImpl(
+    sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    const TrajectoryState& state, const int quadrature_order,
+    sc25::AuxiliaryResidualMetrics& metrics)
+{
+  metrics = {};
+  IndependentTrajectoryEvidence context_evidence;
+  N8OracleContext context;
+  if (!BuildN8OracleContext(foundation, context, context_evidence))
+  {
+    return false;
+  }
+  mfem::ParMesh* mesh = const_cast<mfem::ParMesh*>(foundation.mesh());
+  const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
+  const mfem::DG_Interface_FECollection* trace_collection =
+      foundation.trace_collection();
+  if (!mesh || !spaces.sigma.address || !spaces.trace_carrier.address ||
+      !trace_collection)
+  {
+    return false;
+  }
+  constexpr int rz_rows = n8_elements * 2 * c1_ns;
+  constexpr int rsigma_rows = n8_elements * c1_ns;
+  std::array<std::vector<double>, 3> rz_terms;
+  std::array<std::vector<double>, 4> rsigma_terms;
+  for (auto& term : rz_terms) { term.assign(rz_rows, 0.0); }
+  for (auto& term : rsigma_terms) { term.assign(rsigma_rows, 0.0); }
+  std::vector<double> g_sigma(sc25::persistent_sigmahat_unknowns, 0.0);
+  double g_sigma_term_norm_sum = 0.0;
+  try
+  {
+    for (int element = 0; element < n8_elements; ++element)
+    {
+      const IndependentElementRestriction& restriction =
+          context.restriction[static_cast<std::size_t>(element)];
+      std::vector<double> current, trace;
+      N8PackElement(state, element, current);
+      N8PackTrace(state, restriction, trace);
+      const mfem::FiniteElement* finite_element =
+          spaces.sigma.address->GetFE(element);
+      mfem::ElementTransformation* transformation =
+          mesh->GetElementTransformation(element);
+      if (!finite_element || !transformation ||
+          finite_element->GetDof() != c1_ns)
+      {
+        return false;
+      }
+      mfem::Vector shape(c1_ns);
+      mfem::DenseMatrix derivative(c1_ns, c1_dimension);
+      const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), quadrature_order);
+      for (int point = 0; point < volume_rule.GetNPoints(); ++point)
+      {
+        const mfem::IntegrationPoint& ip = volume_rule.IntPoint(point);
+        transformation->SetIntPoint(&ip);
+        finite_element->CalcShape(ip, shape);
+        finite_element->CalcPhysDShape(*transformation, derivative);
+        std::array<double, c1_state_components> conservative{};
+        std::array<std::array<double, c1_dimension>, c1_state_components>
+            conservative_derivative{};
+        for (int component = 0; component < c1_state_components; ++component)
+        {
+          conservative[component] =
+              C1Evaluate(current, component, c1_ns, shape);
+          for (int direction = 0; direction < c1_dimension; ++direction)
+          {
+            conservative_derivative[component][direction] =
+                C1Derivative(current, component, c1_ns, derivative,
+                             direction);
+          }
+        }
+        if (!C1Admissible(conservative)) { return false; }
+        const double sigma = C1Evaluate(current, 4, c1_ns, shape);
+        const std::array<double, c1_dimension> z{{
+            C1Evaluate(current, 5, c1_ns, shape),
+            C1Evaluate(current, 6, c1_ns, shape)}};
+        const double rho = conservative[0];
+        std::array<std::array<double, c1_dimension>, c1_dimension> gradient{};
+        for (int direction = 0; direction < c1_dimension; ++direction)
+        {
+          gradient[0][direction] =
+              conservative_derivative[1][direction] / rho -
+              conservative[1] * conservative_derivative[0][direction] /
+                  (rho * rho);
+          gradient[1][direction] =
+              conservative_derivative[2][direction] / rho -
+              conservative[2] * conservative_derivative[0][direction] /
+                  (rho * rho);
+        }
+        const double trace_gradient = gradient[0][0] + gradient[1][1];
+        const double q = gradient[0][0] * gradient[0][0] +
+            2.0 * gradient[0][1] * gradient[1][0] +
+            gradient[1][1] * gradient[1][1] +
+            trace_gradient * trace_gradient;
+        const double weight = ip.weight * transformation->Weight();
+        if (!std::isfinite(weight) || !(weight > 0.0)) { return false; }
+        for (int scalar = 0; scalar < c1_ns; ++scalar)
+        {
+          for (int direction = 0; direction < c1_dimension; ++direction)
+          {
+            const std::size_t row =
+                static_cast<std::size_t>(element) * 2 * c1_ns +
+                direction * c1_ns + scalar;
+            rz_terms[0][row] += weight * shape[scalar] * rho * z[direction];
+            rz_terms[1][row] +=
+                weight * derivative(scalar, direction) * sigma;
+          }
+          const std::size_t row =
+              static_cast<std::size_t>(element) * c1_ns + scalar;
+          rsigma_terms[0][row] += weight * shape[scalar] * sigma / rho;
+          rsigma_terms[1][row] += 0.1 * weight *
+              (derivative(scalar, 0) * z[0] +
+               derivative(scalar, 1) * z[1]);
+          rsigma_terms[2][row] -=
+              0.1 * weight * shape[scalar] * q;
+        }
+      }
+
+      const double element_measure =
+          C1ElementMeasure(*mesh, element, quadrature_order);
+      for (int local_face = 0; local_face < c1_faces_per_element;
+           ++local_face)
+      {
+        const int face =
+            restriction.faces[static_cast<std::size_t>(local_face)];
+        mfem::FaceElementTransformations* face_transformations =
+            mesh->GetFaceElementTransformations(face);
+        const mfem::FiniteElement* trace_element =
+            spaces.trace_carrier.address->GetFaceElement(face);
+        if (!face_transformations || !face_transformations->Face ||
+            !trace_element || trace_element->GetDof() != c1_face_nodes)
+        {
+          return false;
+        }
+        const bool element_one = face_transformations->Elem1No == element;
+        if (!element_one && face_transformations->Elem2No != element)
+        {
+          return false;
+        }
+        const int* permutation = trace_collection->DofOrderForOrientation(
+            mfem::Geometry::SEGMENT,
+            restriction.orientations[static_cast<std::size_t>(local_face)]);
+        const double face_measure =
+            C1FaceMeasure(*mesh, face, quadrature_order);
+        const double height = element_measure / face_measure;
+        if (!permutation || !(element_measure > 0.0) ||
+            !(face_measure > 0.0) || !(height > 0.0))
+        {
+          return false;
+        }
+        mfem::Vector interior_shape(c1_ns), face_shape(c1_face_nodes),
+            oriented_shape(c1_face_nodes), scaled(c1_dimension);
+        std::array<double, c1_face_nodes> side_g_sigma{};
+        const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
+            trace_element->GetGeomType(), quadrature_order);
+        for (int point = 0; point < face_rule.GetNPoints(); ++point)
+        {
+          const mfem::IntegrationPoint& ip = face_rule.IntPoint(point);
+          face_transformations->SetAllIntPoints(&ip);
+          const mfem::IntegrationPoint& element_ip = element_one ?
+              face_transformations->GetElement1IntPoint() :
+              face_transformations->GetElement2IntPoint();
+          finite_element->CalcShape(element_ip, interior_shape);
+          trace_element->CalcShape(ip, face_shape);
+          for (int scalar = 0; scalar < c1_face_nodes; ++scalar)
+          {
+            int canonical = -1;
+            int sign = 0;
+            if (!DecodeSignedDof(permutation[scalar], canonical, sign) ||
+                canonical >= c1_face_nodes)
+            {
+              return false;
+            }
+            oriented_shape[scalar] = sign * face_shape[canonical];
+          }
+          mfem::CalcOrtho(face_transformations->Face->Jacobian(), scaled);
+          const double normal_norm = scaled.Norml2();
+          const double measure = face_transformations->Face->Weight();
+          if (!(normal_norm > 0.0) || !(measure > 0.0)) { return false; }
+          const double side = element_one ? 1.0 : -1.0;
+          const std::array<double, c1_dimension> normal{{
+              side * scaled[0] / normal_norm,
+              side * scaled[1] / normal_norm}};
+          std::array<double, c1_state_components> conservative{},
+              trace_state{};
+          for (int component = 0; component < c1_state_components;
+               ++component)
+          {
+            conservative[component] =
+                C1Evaluate(current, component, c1_ns, interior_shape);
+            for (int scalar = 0; scalar < c1_face_nodes; ++scalar)
+            {
+              trace_state[component] += trace[
+                  static_cast<std::size_t>(component) * c1_nf +
+                  local_face * c1_face_nodes + scalar] *
+                  oriented_shape[scalar];
+            }
+          }
+          if (!C1Admissible(conservative) || !C1Admissible(trace_state))
+          {
+            return false;
+          }
+          const double sigma =
+              C1Evaluate(current, 4, c1_ns, interior_shape);
+          const std::array<double, c1_dimension> z{{
+              C1Evaluate(current, 5, c1_ns, interior_shape),
+              C1Evaluate(current, 6, c1_ns, interior_shape)}};
+          double sigmahat = 0.0;
+          for (int scalar = 0; scalar < c1_face_nodes; ++scalar)
+          {
+            sigmahat += trace[static_cast<std::size_t>(4) * c1_nf +
+                              local_face * c1_face_nodes + scalar] *
+                oriented_shape[scalar];
+          }
+          const double tau = 4.0 / (trace_state[0] * height);
+          const double auxiliary_flux = z[0] * normal[0] +
+              z[1] * normal[1] - tau * (sigma - sigmahat);
+          const double weight = ip.weight * measure;
+          if (!std::isfinite(tau) || !(tau > 0.0) ||
+              !std::isfinite(auxiliary_flux) || !std::isfinite(weight))
+          {
+            return false;
+          }
+          for (int scalar = 0; scalar < c1_ns; ++scalar)
+          {
+            for (int direction = 0; direction < c1_dimension; ++direction)
+            {
+              const std::size_t row =
+                  static_cast<std::size_t>(element) * 2 * c1_ns +
+                  direction * c1_ns + scalar;
+              rz_terms[2][row] -= weight * interior_shape[scalar] *
+                  normal[direction] * sigmahat;
+            }
+            const std::size_t row =
+                static_cast<std::size_t>(element) * c1_ns + scalar;
+            rsigma_terms[3][row] -= 0.1 * weight *
+                interior_shape[scalar] * auxiliary_flux;
+          }
+          for (int scalar = 0; scalar < c1_face_nodes; ++scalar)
+          {
+            side_g_sigma[static_cast<std::size_t>(scalar)] +=
+                0.1 * weight * oriented_shape[scalar] * auxiliary_flux;
+          }
+        }
+        double side_square = 0.0;
+        for (int scalar = 0; scalar < c1_face_nodes; ++scalar)
+        {
+          const IndependentRestrictionEntry& entry = restriction.entries[
+              static_cast<std::size_t>(32 +
+                  local_face * c1_face_nodes + scalar)];
+          const int true_dof = entry.local_true_dof -
+              sc25::persistent_uhat_unknowns;
+          if (true_dof < 0 ||
+              true_dof >= sc25::persistent_sigmahat_unknowns)
+          {
+            return false;
+          }
+          const double contribution = entry.sign *
+              side_g_sigma[static_cast<std::size_t>(scalar)];
+          g_sigma[static_cast<std::size_t>(true_dof)] += contribution;
+          side_square += contribution * contribution;
+        }
+        g_sigma_term_norm_sum += std::sqrt(side_square);
+      }
+    }
+
+    const auto norm = [](const std::vector<double>& values)
+    {
+      long double square = 0.0L;
+      for (const double value : values)
+      {
+        square += static_cast<long double>(value) * value;
+      }
+      return std::sqrt(static_cast<double>(square));
+    };
+    std::vector<double> r_z(rz_rows, 0.0), r_sigma(rsigma_rows, 0.0);
+    for (std::size_t row = 0; row < r_z.size(); ++row)
+      for (const auto& term : rz_terms) { r_z[row] += term[row]; }
+    for (std::size_t row = 0; row < r_sigma.size(); ++row)
+      for (const auto& term : rsigma_terms) { r_sigma[row] += term[row]; }
+    metrics.r_z_norm = norm(r_z);
+    metrics.r_sigma_norm = norm(r_sigma);
+    metrics.g_sigma_norm = norm(g_sigma);
+    for (const auto& term : rz_terms) { metrics.r_z_scale += norm(term); }
+    for (const auto& term : rsigma_terms)
+    {
+      metrics.r_sigma_scale += norm(term);
+    }
+    metrics.r_z_scale = std::max(1.0, metrics.r_z_scale);
+    metrics.r_sigma_scale = std::max(1.0, metrics.r_sigma_scale);
+    metrics.g_sigma_scale = std::max(1.0, g_sigma_term_norm_sum);
+    metrics.normalized_maximum = std::max({
+        metrics.r_z_norm / metrics.r_z_scale,
+        metrics.r_sigma_norm / metrics.r_sigma_scale,
+        metrics.g_sigma_norm / metrics.g_sigma_scale});
+    return std::isfinite(metrics.r_z_norm) &&
+        std::isfinite(metrics.r_z_scale) &&
+        std::isfinite(metrics.r_sigma_norm) &&
+        std::isfinite(metrics.r_sigma_scale) &&
+        std::isfinite(metrics.g_sigma_norm) &&
+        std::isfinite(metrics.g_sigma_scale) &&
+        std::isfinite(metrics.normalized_maximum);
+  }
+  catch (...)
+  {
+    metrics = {};
+    return false;
+  }
+}
+
+struct N8Assembly final
+{
+  std::vector<sc25::ElementLinearization> elements;
+  std::vector<double> residual;
+};
+
+bool N8ResidualOnly(
+    const sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    const N8OracleContext& context, const TrajectoryState& old_state,
+    const TrajectoryState& candidate, const int quadrature_order,
+    std::vector<double>& residual)
+{
+  residual.assign(sc25::persistent_full_unknowns, 0.0);
+  const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
+  mfem::ParMesh* mesh = const_cast<mfem::ParMesh*>(foundation.mesh());
+  const mfem::DG_Interface_FECollection* trace_collection =
+      foundation.trace_collection();
+  if (!mesh || !spaces.sigma.address || !spaces.trace_carrier.address ||
+      !trace_collection ||
+      context.restriction.size() != sc25::persistent_elements)
+  {
+    return false;
+  }
+  for (int element = 0; element < sc25::persistent_elements; ++element)
+  {
+    std::vector<double> old, old_trace, current, trace;
+    N8PackElement(old_state, element, old);
+    N8PackTrace(old_state,
+                context.restriction[static_cast<std::size_t>(element)],
+                old_trace);
+    N8PackElement(candidate, element, current);
+    const IndependentElementRestriction& map =
+        context.restriction[static_cast<std::size_t>(element)];
+    N8PackTrace(candidate, map, trace);
+    std::vector<double> local_residual, trace_residual;
+    if (!C1ElementResidual(
+            *mesh, *spaces.sigma.address, *spaces.trace_carrier.address,
+            *trace_collection, map, old, old_trace, current, trace,
+            quadrature_order, local_residual, trace_residual))
+    {
+      return false;
+    }
+    std::copy(local_residual.begin(), local_residual.end(),
+              residual.begin() + element * c1_ni);
+    for (int row = 0; row < c1_nt; ++row)
+    {
+      const IndependentRestrictionEntry& entry =
+          map.entries[static_cast<std::size_t>(row)];
+      residual[sc25::persistent_interior_unknowns + entry.local_true_dof] +=
+          entry.sign * trace_residual[static_cast<std::size_t>(row)];
+    }
+  }
+  return std::all_of(residual.begin(), residual.end(),
+                     [](const double value) { return std::isfinite(value); });
+}
+
+bool N8AssembleAnalytic(
+    const sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    const N8OracleContext& context, const TrajectoryState& old_state,
+    const TrajectoryState& candidate, const int quadrature_order,
+    N8Assembly& output)
+{
+  output = {};
+  output.elements.resize(sc25::persistent_elements);
+  output.residual.assign(sc25::persistent_full_unknowns, 0.0);
+  const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
+  mfem::ParMesh* mesh = const_cast<mfem::ParMesh*>(foundation.mesh());
+  const mfem::DG_Interface_FECollection* trace_collection =
+      foundation.trace_collection();
+  if (!mesh || !spaces.sigma.address || !spaces.trace_carrier.address ||
+      !trace_collection ||
+      context.restriction.size() != sc25::persistent_elements)
+  {
+    return false;
+  }
+  for (int element = 0; element < sc25::persistent_elements; ++element)
+  {
+    const IndependentElementRestriction& map =
+        context.restriction[static_cast<std::size_t>(element)];
+    std::vector<double> old, old_trace, current_values, trace_values;
+    N8PackElement(old_state, element, old);
+    N8PackTrace(old_state, map, old_trace);
+    N8PackElement(candidate, element, current_values);
+    N8PackTrace(candidate, map, trace_values);
+    std::vector<C1Dual> current(c1_ni), trace(c1_nt);
+    for (int entry = 0; entry < c1_ni; ++entry)
+    {
+      current[static_cast<std::size_t>(entry)] = C1Dual::Variable(
+          current_values[static_cast<std::size_t>(entry)], entry);
+    }
+    for (int row = 0; row < c1_nt; ++row)
+    {
+      trace[static_cast<std::size_t>(row)] = C1Dual::Variable(
+          trace_values[static_cast<std::size_t>(row)], c1_ni + row);
+    }
+    std::vector<C1Dual> local_residual, trace_residual;
+    if (!C1ElementResidual(
+            *mesh, *spaces.sigma.address, *spaces.trace_carrier.address,
+            *trace_collection, map, old, old_trace, current, trace,
+            quadrature_order, local_residual, trace_residual))
+    {
+      return false;
+    }
+    sc25::ElementLinearization& block =
+        output.elements[static_cast<std::size_t>(element)];
+    block.element = element;
+    block.local_interior_unknowns = c1_ni;
+    block.local_trace_unknowns = c1_nt;
+    block.a.assign(static_cast<std::size_t>(c1_ni) * c1_ni, 0.0);
+    block.b.assign(static_cast<std::size_t>(c1_ni) * c1_nt, 0.0);
+    block.c.assign(static_cast<std::size_t>(c1_nt) * c1_ni, 0.0);
+    block.d.assign(static_cast<std::size_t>(c1_nt) * c1_nt, 0.0);
+    block.local_residual.resize(c1_ni);
+    block.trace_residual.resize(c1_nt);
+    for (int row = 0; row < c1_ni; ++row)
+    {
+      block.local_residual[static_cast<std::size_t>(row)] =
+          local_residual[static_cast<std::size_t>(row)].value;
+      output.residual[static_cast<std::size_t>(element) * c1_ni + row] =
+          block.local_residual[static_cast<std::size_t>(row)];
+      for (int column = 0; column < c1_ni; ++column)
+      {
+        block.a[static_cast<std::size_t>(row) * c1_ni + column] =
+            local_residual[static_cast<std::size_t>(row)]
+                .derivative[static_cast<std::size_t>(column)];
+      }
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        block.b[static_cast<std::size_t>(row) * c1_nt + column] =
+            local_residual[static_cast<std::size_t>(row)]
+                .derivative[static_cast<std::size_t>(c1_ni + column)];
+      }
+    }
+    for (int row = 0; row < c1_nt; ++row)
+    {
+      block.trace_residual[static_cast<std::size_t>(row)] =
+          trace_residual[static_cast<std::size_t>(row)].value;
+      const IndependentRestrictionEntry& row_entry =
+          map.entries[static_cast<std::size_t>(row)];
+      output.residual[sc25::persistent_interior_unknowns +
+                      row_entry.local_true_dof] +=
+          row_entry.sign * block.trace_residual[static_cast<std::size_t>(row)];
+      for (int column = 0; column < c1_ni; ++column)
+      {
+        block.c[static_cast<std::size_t>(row) * c1_ni + column] =
+            trace_residual[static_cast<std::size_t>(row)]
+                .derivative[static_cast<std::size_t>(column)];
+      }
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        block.d[static_cast<std::size_t>(row) * c1_nt + column] =
+            trace_residual[static_cast<std::size_t>(row)]
+                .derivative[static_cast<std::size_t>(c1_ni + column)];
+      }
+    }
+  }
+  return true;
+}
+
+double N8Norm(const std::vector<double>& values)
+{
+  long double square = 0.0L;
+  for (const double value : values)
+  {
+    square += static_cast<long double>(value) * value;
+  }
+  return std::sqrt(static_cast<double>(square));
+}
+
+double N8AssemblyRelative(const N8Assembly& left,
+                          const N8Assembly& right)
+{
+  if (left.elements.size() != right.elements.size())
+  {
+    return std::numeric_limits<double>::infinity();
+  }
+  double maximum = C1Relative(left.residual, right.residual);
+  for (std::size_t element = 0; element < left.elements.size(); ++element)
+  {
+    const sc25::ElementLinearization& a = left.elements[element];
+    const sc25::ElementLinearization& b = right.elements[element];
+    maximum = std::max({maximum, C1Relative(a.a, b.a),
+                        C1Relative(a.b, b.b), C1Relative(a.c, b.c),
+                        C1Relative(a.d, b.d),
+                        C1Relative(a.local_residual, b.local_residual),
+                        C1Relative(a.trace_residual, b.trace_residual)});
+  }
+  return maximum;
+}
+
+bool VerifyN8Direction(
+    const N8OracleContext& context, const N8Assembly& assembly,
+    const TrajectoryState& direction,
+    IndependentTrajectoryEvidence& evidence, const std::string& label)
+{
+  std::vector<double> global_action(sc25::persistent_full_unknowns, 0.0);
+  std::vector<double> global_condensed_action(
+      sc25::persistent_true_trace_unknowns, 0.0);
+  std::vector<double> global_condensed_rhs(
+      sc25::persistent_true_trace_unknowns, 0.0);
+  double maximum_recovery = 0.0;
+  for (int element = 0; element < sc25::persistent_elements; ++element)
+  {
+    const sc25::ElementLinearization& block =
+        assembly.elements[static_cast<std::size_t>(element)];
+    const IndependentElementRestriction& map =
+        context.restriction[static_cast<std::size_t>(element)];
+    std::vector<double> local_direction, trace_direction;
+    N8PackElement(direction, element, local_direction);
+    N8PackTrace(direction, map, trace_direction);
+    for (int row = 0; row < c1_ni; ++row)
+    {
+      double value = block.local_residual[static_cast<std::size_t>(row)];
+      for (int column = 0; column < c1_ni; ++column)
+      {
+        value += block.a[static_cast<std::size_t>(row) * c1_ni + column] *
+            local_direction[static_cast<std::size_t>(column)];
+      }
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        value += block.b[static_cast<std::size_t>(row) * c1_nt + column] *
+            trace_direction[static_cast<std::size_t>(column)];
+      }
+      global_action[static_cast<std::size_t>(element) * c1_ni + row] = value;
+    }
+    for (int row = 0; row < c1_nt; ++row)
+    {
+      double value = block.trace_residual[static_cast<std::size_t>(row)];
+      for (int column = 0; column < c1_ni; ++column)
+      {
+        value += block.c[static_cast<std::size_t>(row) * c1_ni + column] *
+            local_direction[static_cast<std::size_t>(column)];
+      }
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        value += block.d[static_cast<std::size_t>(row) * c1_nt + column] *
+            trace_direction[static_cast<std::size_t>(column)];
+      }
+      const IndependentRestrictionEntry& entry =
+          map.entries[static_cast<std::size_t>(row)];
+      global_action[sc25::persistent_interior_unknowns +
+                    entry.local_true_dof] += entry.sign * value;
+    }
+
+    C1Lu factor;
+    std::vector<double> inverse_residual;
+    if (!factor.Factor(block.a, c1_ni) ||
+        !factor.Solve(block.local_residual, inverse_residual))
+    {
+      evidence.failures.push_back(label + " independent local factor");
+      return false;
+    }
+    std::vector<double> inverse_b(
+        static_cast<std::size_t>(c1_ni) * c1_nt, 0.0);
+    for (int column = 0; column < c1_nt; ++column)
+    {
+      std::vector<double> rhs(c1_ni), solution;
+      for (int row = 0; row < c1_ni; ++row)
+      {
+        rhs[static_cast<std::size_t>(row)] =
+            block.b[static_cast<std::size_t>(row) * c1_nt + column];
+      }
+      if (!factor.Solve(rhs, solution)) { return false; }
+      for (int row = 0; row < c1_ni; ++row)
+      {
+        inverse_b[static_cast<std::size_t>(row) * c1_nt + column] =
+            solution[static_cast<std::size_t>(row)];
+      }
+    }
+    std::vector<double> recovery_rhs = block.local_residual;
+    for (int row = 0; row < c1_ni; ++row)
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        recovery_rhs[static_cast<std::size_t>(row)] +=
+            block.b[static_cast<std::size_t>(row) * c1_nt + column] *
+            trace_direction[static_cast<std::size_t>(column)];
+      }
+    std::vector<double> recovered;
+    if (!factor.Solve(recovery_rhs, recovered)) { return false; }
+    for (int row = 0; row < c1_ni; ++row)
+    {
+      maximum_recovery = std::max(
+          maximum_recovery,
+          std::abs(local_direction[static_cast<std::size_t>(row)] +
+                   recovered[static_cast<std::size_t>(row)]));
+    }
+    for (int row = 0; row < c1_nt; ++row)
+    {
+      double rhs_value = -block.trace_residual[static_cast<std::size_t>(row)];
+      for (int inner = 0; inner < c1_ni; ++inner)
+      {
+        rhs_value += block.c[static_cast<std::size_t>(row) * c1_ni + inner] *
+            inverse_residual[static_cast<std::size_t>(inner)];
+      }
+      double action_value = -rhs_value;
+      for (int column = 0; column < c1_nt; ++column)
+      {
+        double schur =
+            block.d[static_cast<std::size_t>(row) * c1_nt + column];
+        for (int inner = 0; inner < c1_ni; ++inner)
+        {
+          schur -= block.c[static_cast<std::size_t>(row) * c1_ni + inner] *
+              inverse_b[static_cast<std::size_t>(inner) * c1_nt + column];
+        }
+        action_value += schur *
+            trace_direction[static_cast<std::size_t>(column)];
+      }
+      const IndependentRestrictionEntry& entry =
+          map.entries[static_cast<std::size_t>(row)];
+      global_condensed_action[static_cast<std::size_t>(entry.local_true_dof)] +=
+          entry.sign * action_value;
+      global_condensed_rhs[static_cast<std::size_t>(entry.local_true_dof)] +=
+          entry.sign * rhs_value;
+    }
+  }
+  const double action_relative = N8Norm(global_action) /
+      std::max(1.0, N8Norm(assembly.residual));
+  const double condensed_relative = N8Norm(global_condensed_action) /
+      std::max(1.0, N8Norm(global_condensed_rhs));
+  const double independent_condensed_residual =
+      N8Norm(global_condensed_action);
+  const double independent_condensed_rhs = N8Norm(global_condensed_rhs);
+  evidence.maximum_jacobian_action_relative_l2 = std::max(
+      evidence.maximum_jacobian_action_relative_l2, action_relative);
+  evidence.maximum_condensed_action_relative_l2 = std::max(
+      evidence.maximum_condensed_action_relative_l2, condensed_relative);
+  evidence.maximum_recovery_relative_l2 = std::max(
+      evidence.maximum_recovery_relative_l2, maximum_recovery);
+  TrajectoryRequire(action_relative <= 2.0e-11,
+                    label + " independent full Jacobian action", evidence);
+  TrajectoryRequire(condensed_relative <= 2.0e-11,
+                    label + " independent condensed action", evidence);
+  TrajectoryRequire(
+      independent_condensed_residual <=
+          1.0e-14 + 1.0e-12 * independent_condensed_rhs,
+      label + " independent true trace residual bound", evidence);
+  TrajectoryRequire(maximum_recovery <= 2.0e-11,
+                    label + " independent local recovery", evidence);
+  return true;
+}
+
+} // namespace
+
+bool EvaluateIndependentAuxiliaryResidualOracle(
+    sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    const sc25::PersistentTrajectoryState& state,
+    const int quadrature_order,
+    sc25::AuxiliaryResidualMetrics& metrics)
+{
+  return EvaluateIndependentAuxiliaryResidualImpl(
+      foundation, state, quadrature_order, metrics);
+}
+
+bool RunIndependentTrajectoryOracle(
+    sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    IndependentTrajectoryEvidence& evidence)
+{
+  evidence = {};
+  evidence.minimum_density = std::numeric_limits<double>::infinity();
+  evidence.minimum_pressure = std::numeric_limits<double>::infinity();
+  evidence.minimum_speed_margin = std::numeric_limits<double>::infinity();
+  const sc25::PersistentTrajectoryEvidence& run =
+      foundation.trajectory_evidence();
+  TrajectoryRequire(
+      run.status == sc25::TrajectoryStatus::HdgSc25Accepted ||
+          run.status == sc25::TrajectoryStatus::HdgSc25AcceptedAfterOneRetry,
+      "trajectory terminal status", evidence);
+  TrajectoryRequire(run.accepted_steps == sc25::persistent_required_steps,
+                    "trajectory accepted-step count", evidence);
+  const std::uint64_t checkpoint_offset = run.checkpoint_step_offset;
+  const int expected_continuation_steps = checkpoint_offset <= n8_steps ?
+      n8_steps - static_cast<int>(checkpoint_offset) : -1;
+  TrajectoryRequire(
+      checkpoint_offset <= static_cast<std::uint64_t>(n8_steps) &&
+          run.step_evidence_count == expected_continuation_steps,
+      "trajectory honest continuation step-evidence count", evidence);
+  AttemptStepMapping attempt_step_mapping;
+  attempt_step_mapping.step_count = run.step_evidence_count;
+  attempt_step_mapping.attempt_count = run.attempt_count;
+  if (run.step_evidence_count >= 0 &&
+      run.step_evidence_count <= n8_steps)
+  {
+    for (int index = 0; index < run.step_evidence_count; ++index)
+    {
+      attempt_step_mapping.step_numbers[static_cast<std::size_t>(index)] =
+          run.steps[static_cast<std::size_t>(index)].step;
+      attempt_step_mapping.step_attempt_indices[
+          static_cast<std::size_t>(index)] =
+          run.steps[static_cast<std::size_t>(index)].attempt_index;
+    }
+  }
+  if (run.attempt_count >= 0 && run.attempt_count <= n8_attempt_capacity)
+  {
+    for (int index = 0; index < run.attempt_count; ++index)
+    {
+      attempt_step_mapping.attempt_status[static_cast<std::size_t>(index)] =
+          run.attempts[static_cast<std::size_t>(index)].status;
+      attempt_step_mapping.attempt_target_steps[
+          static_cast<std::size_t>(index)] =
+          run.attempts[static_cast<std::size_t>(index)].target_step;
+    }
+  }
+  const bool valid_attempt_step_bijection =
+      ValidAcceptedAttemptStepBijection(attempt_step_mapping,
+                                        checkpoint_offset);
+  TrajectoryRequire(valid_attempt_step_bijection,
+                    "trajectory accepted step/attempt bijection", evidence);
+  if (valid_attempt_step_bijection && attempt_step_mapping.step_count > 0)
+  {
+    AttemptStepMapping failed_substitution = attempt_step_mapping;
+    int failed_attempt_index = -1;
+    for (int index = 0; index < failed_substitution.attempt_count; ++index)
+    {
+      const int target = failed_substitution.attempt_target_steps[
+          static_cast<std::size_t>(index)];
+      if (!AcceptedAttemptStatus(failed_substitution.attempt_status[
+              static_cast<std::size_t>(index)]) &&
+          target > static_cast<int>(checkpoint_offset) &&
+          target <= n8_steps)
+      {
+        failed_attempt_index = index;
+        break;
+      }
+    }
+    if (failed_attempt_index < 0 &&
+        failed_substitution.attempt_count < n8_attempt_capacity)
+    {
+      failed_attempt_index = failed_substitution.attempt_count++;
+      failed_substitution.attempt_status[
+          static_cast<std::size_t>(failed_attempt_index)] =
+          sc25::TrajectoryStatus::HdgSc25InjectedLocalFactorFailure;
+      failed_substitution.attempt_target_steps[
+          static_cast<std::size_t>(failed_attempt_index)] =
+          failed_substitution.step_numbers[0];
+    }
+    const int failed_target = failed_attempt_index >= 0 ?
+        failed_substitution.attempt_target_steps[
+            static_cast<std::size_t>(failed_attempt_index)] : -1;
+    const int failed_local_step =
+        failed_target - static_cast<int>(checkpoint_offset) - 1;
+    if (failed_attempt_index >= 0 && failed_local_step >= 0 &&
+        failed_local_step < failed_substitution.step_count)
+    {
+      failed_substitution.step_attempt_indices[
+          static_cast<std::size_t>(failed_local_step)] =
+          failed_attempt_index;
+      TrajectoryRequire(
+          !ValidAcceptedAttemptStepBijection(failed_substitution,
+                                             checkpoint_offset),
+          "trajectory failed-attempt substitution negative", evidence);
+    }
+    else
+    {
+      TrajectoryRequire(false,
+                        "trajectory failed-attempt negative construction",
+                        evidence);
+    }
+
+    if (attempt_step_mapping.step_count > 1)
+    {
+      AttemptStepMapping duplicate_attempt = attempt_step_mapping;
+      duplicate_attempt.step_attempt_indices[1] =
+          duplicate_attempt.step_attempt_indices[0];
+      TrajectoryRequire(
+          !ValidAcceptedAttemptStepBijection(duplicate_attempt,
+                                             checkpoint_offset),
+          "trajectory duplicate in-range attempt-index negative", evidence);
+    }
+  }
+  TrajectoryRequire(
+      run.continuation_start_coordinates.step == checkpoint_offset &&
+          run.continuation_start_coordinates.generation ==
+              checkpoint_offset &&
+          run.continuation_start_coordinates.cursor == checkpoint_offset &&
+          HashesEqual(IndependentHashes(run.continuation_start_state),
+                      run.continuation_start_hashes),
+      "trajectory continuation start state/coordinates/hashes", evidence);
+  if (checkpoint_offset > 0)
+  {
+    TrajectoryRequire(run.restored_loaded_state_match &&
+                          run.restored_loaded_coordinates_match &&
+                          run.restored_loaded_hashes_match,
+                      "trajectory immediate restored-load equality",
+                      evidence);
+  }
+  TrajectoryRequire(run.coordinates.step == sc25::persistent_required_steps &&
+                        run.coordinates.generation ==
+                            sc25::persistent_required_steps &&
+                        run.coordinates.cursor ==
+                            sc25::persistent_required_steps,
+                    "trajectory terminal coordinates", evidence);
+  TrajectoryRequire(
+      run.coordinates.dt == sc25::persistent_dt &&
+          std::abs(run.coordinates.time -
+                   sc25::persistent_required_steps * sc25::persistent_dt) <=
+              8.0 * std::numeric_limits<double>::epsilon(),
+      "trajectory terminal time", evidence);
+  TrajectoryRequire(run.trace_restart_dimension ==
+                        n8_trace_restart_dimension &&
+                        run.trace_maximum_iterations ==
+                            n8_trace_maximum_iterations &&
+                        run.trace_relative_tolerance == 1.0e-12 &&
+                        run.trace_absolute_tolerance == 1.0e-14,
+                    "trajectory GMRES configuration", evidence);
+  TrajectoryRequire(run.ilu_type == 0 && run.ilu_level_of_fill == 0 &&
+                        run.ilu_local_reordering == 1,
+                    "trajectory ILU(0)/RCM configuration", evidence);
+  const sc25::AuxiliaryInitializationEvidence& initialization =
+      run.initialization;
+  TrajectoryRequire(
+      initialization.quadrature_order ==
+              sc25::coupled_fixture_quadrature_order &&
+          initialization.trace_restart_dimension ==
+              n8_trace_restart_dimension &&
+          initialization.trace_maximum_iterations ==
+              n8_trace_maximum_iterations &&
+          initialization.trace_relative_tolerance == 1.0e-12 &&
+          initialization.trace_absolute_tolerance == 1.0e-14 &&
+          initialization.ilu_type == 0 &&
+          initialization.ilu_level_of_fill == 0 &&
+          initialization.ilu_local_reordering == 1,
+      "trajectory auxiliary initialization configuration", evidence);
+  TrajectoryRequire(
+      initialization.trace_iterations >= 0 &&
+          initialization.trace_iterations <=
+              n8_trace_maximum_iterations &&
+          std::isfinite(initialization.trace_true_residual_norm) &&
+          std::isfinite(initialization.trace_right_hand_side_norm),
+      "trajectory reported auxiliary trace-solve metadata", evidence);
+  TrajectoryRequire(
+      std::isfinite(initialization.residual.r_z_norm) &&
+          std::isfinite(initialization.residual.r_sigma_norm) &&
+          std::isfinite(initialization.residual.g_sigma_norm) &&
+          initialization.residual.r_z_scale >= 1.0 &&
+          initialization.residual.r_sigma_scale >= 1.0 &&
+          initialization.residual.g_sigma_scale >= 1.0 &&
+          std::isfinite(initialization.residual.normalized_maximum) &&
+          initialization.residual.normalized_maximum <= 1.0e-10,
+      "trajectory term-scaled auxiliary initialization residual", evidence);
+  const sc25::TrajectoryReuseEvidence& reuse = run.reuse;
+  const sc25::TrajectoryReuseSnapshot& baseline_reuse = reuse.baseline;
+  TrajectoryRequire(baseline_reuse.topology_handle != 0 &&
+                        baseline_reuse.foundation_handle != 0 &&
+                        baseline_reuse.carrier_map_handle != 0 &&
+                        baseline_reuse.contract_handle != 0 &&
+                        baseline_reuse.assembly_state_handle != 0 &&
+                        baseline_reuse.assembly_handle != 0 &&
+                        baseline_reuse.trial_assembly_handle != 0 &&
+                        baseline_reuse.factor_handle != 0 &&
+                        baseline_reuse.workspace_handle != 0 &&
+                        baseline_reuse.quadrature_workspace_handle != 0 &&
+                        baseline_reuse.local_pattern_handle != 0 &&
+                        baseline_reuse.true_matrix_handle != 0 &&
+                        baseline_reuse.true_rhs_handle != 0 &&
+                        baseline_reuse.true_solution_handle != 0 &&
+                        baseline_reuse.ilu_handle != 0 &&
+                        baseline_reuse.gmres_handle != 0 &&
+                        baseline_reuse.true_residual_handle != 0 &&
+                        baseline_reuse.element_to_true_csr_handle != 0,
+                    "trajectory persistent handles", evidence);
+  TrajectoryRequire(baseline_reuse.topology_generation == 1 &&
+                        baseline_reuse.storage_generation == 1 &&
+                        baseline_reuse.factor_generation == 1 &&
+                        baseline_reuse.workspace_generation == 1 &&
+                        baseline_reuse.local_pattern_generation == 1 &&
+                        baseline_reuse.solver_generation == 1 &&
+                        baseline_reuse.w8_owned_boundary_object_count > 0 &&
+                        baseline_reuse.w8_owned_boundary_buffer_count > 0 &&
+                        reuse.true_matrix_nonzeros > 0,
+                    "trajectory reuse generations", evidence);
+  TrajectoryRequire(ReuseSnapshotsEqual(baseline_reuse, reuse.current),
+                    "trajectory stable owned storage", evidence);
+  sc25::TrajectoryReuseSnapshot handle_drift = baseline_reuse;
+  handle_drift.workspace_handle ^= std::uintptr_t{1};
+  TrajectoryRequire(!ReuseSnapshotsEqual(handle_drift, baseline_reuse),
+                    "trajectory copied handle-drift negative control",
+                    evidence);
+  sc25::TrajectoryReuseSnapshot capacity_hash_drift = baseline_reuse;
+  ++capacity_hash_drift.w8_owned_boundary_buffer_count;
+  capacity_hash_drift.owned_boundary_identity_hash.bytes[0] ^= 0x01U;
+  TrajectoryRequire(
+      !ReuseSnapshotsEqual(capacity_hash_drift, baseline_reuse),
+      "trajectory copied capacity/hash-drift negative control", evidence);
+  sc25::TrajectoryReuseSnapshot generation_drift = baseline_reuse;
+  ++generation_drift.workspace_generation;
+  TrajectoryRequire(!ReuseSnapshotsEqual(generation_drift, baseline_reuse),
+                    "trajectory copied generation-drift negative control",
+                    evidence);
+  TrajectoryRequire(
+      reuse.detected_w8_owned_boundary_identity_changes == 0 &&
+          reuse.w8_device_transfer_calls == 0 &&
+          !reuse.opaque_mfem_hypre_observed,
+      "trajectory W8 boundary-census drift counters", evidence);
+
+  N8OracleContext n8;
+  if (!BuildN8OracleContext(foundation, n8, evidence)) { return false; }
+  sc25::AuxiliaryResidualMetrics auxiliary_q12{}, auxiliary_q14{};
+  const bool auxiliary_q12_valid = EvaluateIndependentAuxiliaryResidualImpl(
+      foundation, run.continuation_start_state, n8_q12, auxiliary_q12);
+  const bool auxiliary_q14_valid = EvaluateIndependentAuxiliaryResidualImpl(
+      foundation, run.continuation_start_state, n8_q14, auxiliary_q14);
+  const std::array<double, 3> auxiliary_normalized_q12{{
+      auxiliary_q12.r_z_norm / auxiliary_q12.r_z_scale,
+      auxiliary_q12.r_sigma_norm / auxiliary_q12.r_sigma_scale,
+      auxiliary_q12.g_sigma_norm / auxiliary_q12.g_sigma_scale}};
+  const std::array<double, 3> auxiliary_normalized_q14{{
+      auxiliary_q14.r_z_norm / auxiliary_q14.r_z_scale,
+      auxiliary_q14.r_sigma_norm / auxiliary_q14.r_sigma_scale,
+      auxiliary_q14.g_sigma_norm / auxiliary_q14.g_sigma_scale}};
+  bool auxiliary_sensitivity = true;
+  for (std::size_t term = 0; term < auxiliary_normalized_q12.size(); ++term)
+  {
+    auxiliary_sensitivity = auxiliary_sensitivity &&
+        std::abs(auxiliary_normalized_q14[term] -
+                 auxiliary_normalized_q12[term]) <= 1.0e-11;
+  }
+  TrajectoryRequire(
+      auxiliary_q12_valid && auxiliary_q14_valid &&
+          auxiliary_q12.normalized_maximum <= 1.0e-10 &&
+          auxiliary_q14.normalized_maximum <= 1.0e-10 &&
+          auxiliary_sensitivity,
+      "trajectory independent q12/q14 term-scaled auxiliary residual",
+      evidence);
+  if (checkpoint_offset == 0)
+  {
+    TrajectoryRequire(
+        std::abs(initialization.residual.normalized_maximum -
+                 auxiliary_q12.normalized_maximum) <= 2.0e-11,
+        "trajectory reported/independent initialization residual",
+        evidence);
+  }
+  if (checkpoint_offset == 0)
+  {
+    double q12_volume_moment = 0.0;
+    double q12_trace_moment = 0.0;
+    double q14_volume_moment = 0.0;
+    double q14_trace_moment = 0.0;
+    const bool q12_projection = VerifyIndependentInitialL2Projection(
+        foundation, run.continuation_start_state, n8_q12,
+        q12_volume_moment, q12_trace_moment);
+    const bool q14_projection = VerifyIndependentInitialL2Projection(
+        foundation, run.continuation_start_state, n8_q14,
+        q14_volume_moment, q14_trace_moment);
+    TrajectoryRequire(
+        q12_projection && q14_projection &&
+            q12_volume_moment <= 2.0e-12 &&
+            q12_trace_moment <= 2.0e-12 &&
+            q14_volume_moment <= 2.0e-12 &&
+            q14_trace_moment <= 2.0e-12 &&
+            std::abs(q14_volume_moment - q12_volume_moment) <= 1.0e-11 &&
+            std::abs(q14_trace_moment - q12_trace_moment) <= 1.0e-11,
+        "trajectory independent q12/q14 initial L2 projections", evidence);
+  }
+
+  std::array<double, sc25::state_components> preceding_integrals{};
+  std::array<double, sc25::state_components> preceding_integrals_q14{};
+  double start_density = 0.0;
+  double start_pressure = 0.0;
+  double start_margin = 0.0;
+  double start_density_q14 = 0.0;
+  double start_pressure_q14 = 0.0;
+  double start_margin_q14 = 0.0;
+  const bool have_preceding = IndependentVolumeChecks(
+      foundation, run.continuation_start_state, preceding_integrals,
+      start_density, start_pressure, start_margin, n8_q12) &&
+      IndependentVolumeChecks(
+          foundation, run.continuation_start_state,
+          preceding_integrals_q14, start_density_q14,
+          start_pressure_q14, start_margin_q14, n8_q14);
+  TrajectoryRequire(have_preceding,
+                    "trajectory independent continuation-start integrals",
+                    evidence);
+  for (int component = 0; component < sc25::state_components; ++component)
+  {
+    TrajectoryRequire(
+        std::abs(preceding_integrals_q14[component] -
+                 preceding_integrals[component]) /
+                std::max(1.0, std::abs(preceding_integrals[component])) <=
+            1.0e-11,
+        "trajectory continuation-start q12/q14 integral sensitivity " +
+            std::to_string(component), evidence);
+  }
+  for (int index = 0; index < run.step_evidence_count; ++index)
+  {
+    const sc25::TrajectoryStepEvidence& step =
+        run.steps[static_cast<std::size_t>(index)];
+    const int expected_step =
+        static_cast<int>(checkpoint_offset) + index + 1;
+    const std::string label =
+        "trajectory step " + std::to_string(expected_step);
+    TrajectoryRequire(step.accepted && step.step == expected_step &&
+                          step.generation ==
+                              static_cast<std::uint64_t>(expected_step) &&
+                          step.dt == n8_dt &&
+                          std::abs(step.time -
+                                   expected_step * n8_dt) <=
+                              8.0 * std::numeric_limits<double>::epsilon(),
+                      label + " coordinates", evidence);
+    TrajectoryRequire(FiniteState(step.accepted_state),
+                      label + " finite state", evidence);
+    std::vector<double> admissibility_residual, admissibility_residual_q14;
+    const bool accepted_q12 = N8ResidualOnly(
+        foundation, n8, step.accepted_state, step.accepted_state, n8_q12,
+        admissibility_residual);
+    const bool accepted_q14 = N8ResidualOnly(
+        foundation, n8, step.accepted_state, step.accepted_state, n8_q14,
+        admissibility_residual_q14);
+    TrajectoryRequire(
+        accepted_q12 && accepted_q14 &&
+            C1Relative(admissibility_residual_q14,
+                       admissibility_residual) <= 1.0e-11,
+        label + " exact volume/side/trace quadrature admissibility", evidence);
+    evidence.independently_assembled_residuals += 2;
+    TrajectoryRequire(
+        HashesEqual(IndependentHashes(step.accepted_state),
+                    step.accepted_hashes),
+        label + " independently reconstructed hashes", evidence);
+    std::array<double, sc25::state_components> integrals{};
+    std::array<double, sc25::state_components> integrals_q14{};
+    double density = 0.0;
+    double pressure = 0.0;
+    double margin = 0.0;
+    double density_q14 = 0.0;
+    double pressure_q14 = 0.0;
+    double margin_q14 = 0.0;
+    const bool volume_valid = IndependentVolumeChecks(
+        foundation, step.accepted_state, integrals, density, pressure, margin,
+        n8_q12);
+    const bool volume_q14_valid = IndependentVolumeChecks(
+        foundation, step.accepted_state, integrals_q14, density_q14,
+        pressure_q14, margin_q14, n8_q14);
+    const bool trace_valid = volume_valid && IndependentTraceNodeChecks(
+        step.accepted_state, density, pressure, margin);
+    TrajectoryRequire(volume_valid && volume_q14_valid && trace_valid,
+                      label + " independent admissibility", evidence);
+    if (volume_valid && trace_valid)
+    {
+      evidence.minimum_density = std::min(evidence.minimum_density, density);
+      evidence.minimum_pressure = std::min(evidence.minimum_pressure, pressure);
+      evidence.minimum_speed_margin =
+          std::min(evidence.minimum_speed_margin, margin);
+    }
+    double q12_conservation_maximum = 0.0;
+    double q14_conservation_maximum = 0.0;
+    for (int component = 0; component < sc25::state_components; ++component)
+    {
+      const double discrepancy =
+          std::abs(integrals[component] - step.accepted_integrals[component]);
+      evidence.maximum_integral_discrepancy =
+          std::max(evidence.maximum_integral_discrepancy, discrepancy);
+      TrajectoryRequire(discrepancy <= 2.0e-12,
+                        label + " independent integral " +
+                            std::to_string(component), evidence);
+      const double quadrature_sensitivity =
+          std::abs(integrals_q14[component] - integrals[component]) /
+          std::max(1.0, std::abs(integrals[component]));
+      TrajectoryRequire(
+          quadrature_sensitivity <= 1.0e-11,
+          label + " q12/q14 integral sensitivity " +
+              std::to_string(component), evidence);
+      const double conservation_error =
+          std::abs(integrals[component] - preceding_integrals[component]);
+      const double conservation_bound =
+          2.0e-10 * std::max(1.0, std::abs(preceding_integrals[component]));
+      TrajectoryRequire(
+          conservation_error <= conservation_bound,
+          label + " independently reconstructed conservation " +
+              std::to_string(component), evidence);
+      q12_conservation_maximum = std::max(
+          q12_conservation_maximum,
+          conservation_error /
+              std::max(1.0, std::abs(preceding_integrals[component])));
+      q14_conservation_maximum = std::max(
+          q14_conservation_maximum,
+          std::abs(integrals_q14[component] -
+                   preceding_integrals_q14[component]) /
+              std::max(1.0, std::abs(preceding_integrals_q14[component])));
+      TrajectoryRequire(
+          std::abs(step.committed_integrals[component] -
+                   preceding_integrals[component]) <= 2.0e-12,
+          label + " committed integral observation " +
+              std::to_string(component), evidence);
+    }
+    const bool attempt_index_valid = step.attempt_index >= 0 &&
+        step.attempt_index < run.attempt_count &&
+        step.attempt_index < n8_attempt_capacity;
+    const bool accepted_attempt_mapping = attempt_index_valid &&
+        AcceptedAttemptStatus(run.attempts[
+            static_cast<std::size_t>(step.attempt_index)].status) &&
+        run.attempts[static_cast<std::size_t>(step.attempt_index)]
+                .target_step == step.step;
+    TrajectoryRequire(accepted_attempt_mapping,
+                      label + " unique accepted-attempt mapping", evidence);
+    if (accepted_attempt_mapping)
+    {
+      const double reported_q12 = run.attempts[
+          static_cast<std::size_t>(step.attempt_index)]
+                                      .maximum_conservation_error;
+      evidence.maximum_conservation_maximum_discrepancy = std::max(
+          evidence.maximum_conservation_maximum_discrepancy,
+          std::max(std::abs(q12_conservation_maximum - reported_q12),
+                   std::abs(q14_conservation_maximum - reported_q12)));
+      TrajectoryRequire(
+          ConservationMaximumMatches(q12_conservation_maximum,
+                                     reported_q12),
+          label + " independent q12/reported-q12 conservation maximum",
+          evidence);
+      TrajectoryRequire(
+          ConservationMaximumMatches(q14_conservation_maximum,
+                                     reported_q12),
+          label + " independent q14/reported-q12 conservation maximum",
+          evidence);
+      const double away_from_q14 = reported_q12 >= q14_conservation_maximum ?
+          reported_q12 + n8_conservation_negative_offset :
+          reported_q12 - n8_conservation_negative_offset;
+      TrajectoryRequire(
+          !ConservationMaximumMatches(q14_conservation_maximum,
+                                      away_from_q14),
+          label + " reported conservation maximum sensitivity", evidence);
+      ++evidence.checked_conservation_maxima;
+    }
+    preceding_integrals = integrals;
+    preceding_integrals_q14 = integrals_q14;
+    TrajectoryRequire(ReuseSnapshotsEqual(step.reuse, baseline_reuse),
+                      label + " stable owned reuse snapshot", evidence);
+    ++evidence.checked_steps;
+  }
+  TrajectoryRequire(
+      evidence.checked_conservation_maxima == expected_continuation_steps,
+      "trajectory conservation-maximum comparison census", evidence);
+
+  TrajectoryRequire(run.attempt_count >= expected_continuation_steps &&
+                        run.attempt_count <= expected_continuation_steps + 1,
+                    "trajectory bounded attempt count", evidence);
+  for (int index = 0; index < run.attempt_count; ++index)
+  {
+    const sc25::TrajectoryAttemptEvidence& attempt =
+        run.attempts[static_cast<std::size_t>(index)];
+    const std::string label = "trajectory attempt " + std::to_string(index);
+    TrajectoryRequire(
+        attempt.target_step > static_cast<int>(checkpoint_offset) &&
+            attempt.target_step <= n8_steps && attempt.dt == n8_dt,
+                      label + " identity", evidence);
+    TrajectoryRequire(attempt.newton_iterations >= 0 &&
+                          attempt.newton_iterations <= n8_newton_limit &&
+                          attempt.attempted_newton_iterations >=
+                              attempt.newton_iterations &&
+                          attempt.attempted_newton_iterations <=
+                              n8_newton_limit,
+                      label + " Newton bound", evidence);
+    TrajectoryRequire(
+        ReuseSnapshotsEqual(attempt.entry_reuse, baseline_reuse) &&
+            ReuseSnapshotsEqual(attempt.exit_reuse, baseline_reuse),
+        label + " stable owned buffers across attempt", evidence);
+    const TrajectoryState* committed = nullptr;
+    const int local_target_index =
+        attempt.target_step - static_cast<int>(checkpoint_offset) - 1;
+    if (local_target_index > 0 &&
+        local_target_index - 1 < run.step_evidence_count)
+    {
+      committed = &run.steps[static_cast<std::size_t>(
+          local_target_index - 1)].accepted_state;
+    }
+    else if (local_target_index == 0)
+    {
+      committed = &run.continuation_start_state;
+    }
+    TrajectoryRequire(committed != nullptr, label + " committed snapshot",
+                      evidence);
+    const bool attempt_accepted = AcceptedAttemptStatus(attempt.status);
+    if (attempt_accepted && local_target_index >= 0 &&
+        local_target_index < run.step_evidence_count)
+    {
+      const sc25::TrajectoryStateHashes& accepted_hashes =
+          run.steps[static_cast<std::size_t>(local_target_index)]
+              .accepted_hashes;
+      TrajectoryRequire(
+          HashesEqual(attempt.candidate_hashes, accepted_hashes) &&
+              HashesEqual(attempt.published_hashes, accepted_hashes),
+          label + " accepted candidate/publication hashes", evidence);
+    }
+    else if (!attempt_accepted)
+    {
+      TrajectoryRequire(
+          HashesEqual(attempt.entry_hashes, attempt.candidate_hashes) &&
+              HashesEqual(attempt.entry_hashes,
+                          attempt.published_hashes),
+          label + " failed-attempt candidate/rollback hashes", evidence);
+    }
+    if (attempt.injection ==
+        sc25::TrajectoryFailureInjection::newton_iteration_limit)
+    {
+      TrajectoryRequire(
+          attempt.status ==
+                  sc25::TrajectoryStatus::
+                      HdgSc25InjectedNewtonIterationLimit &&
+              attempt.attempted_newton_iterations == n8_newton_limit &&
+              attempt.newton_iterations == 0,
+          label + " exact injected Newton-limit counter/status", evidence);
+    }
+    if (committed)
+    {
+      std::vector<double> entry_residual;
+      if (N8ResidualOnly(
+              foundation, n8, *committed, *committed,
+              sc25::coupled_fixture_quadrature_order, entry_residual))
+      {
+        const double oracle_norm = N8Norm(entry_residual);
+        const double discrepancy = std::abs(
+            oracle_norm - attempt.entry_residual_norm) /
+            std::max(1.0, oracle_norm);
+        evidence.maximum_residual_norm_discrepancy = std::max(
+            evidence.maximum_residual_norm_discrepancy, discrepancy);
+        TrajectoryRequire(discrepancy <= 2.0e-11,
+                          label + " independent attempt-entry residual",
+                          evidence);
+      }
+      else
+      {
+        TrajectoryRequire(false, label + " attempt-entry assembly", evidence);
+      }
+      ++evidence.independently_assembled_residuals;
+    }
+    for (int iteration = 0; iteration < attempt.newton_iterations;
+         ++iteration)
+    {
+      const sc25::TrajectoryNewtonEvidence& newton =
+          attempt.newton[static_cast<std::size_t>(iteration)];
+      TrajectoryRequire(newton.iteration == iteration &&
+                            std::isfinite(newton.entry_residual_norm) &&
+                            newton.entry_residual_norm >= 0.0,
+                        label + " Newton record", evidence);
+      if (iteration == 0)
+      {
+        TrajectoryRequire(
+            HashesEqual(IndependentHashes(newton.entry),
+                        attempt.entry_hashes),
+            label + " independently reconstructed entry hashes", evidence);
+      }
+      TrajectoryRequire(
+          newton.trace_iterations >= 0 &&
+              newton.trace_iterations <=
+                  n8_trace_maximum_iterations &&
+              std::isfinite(newton.trace_true_residual_norm) &&
+              std::isfinite(newton.trace_right_hand_side_norm),
+          label + " reported trace solve metadata", evidence);
+      if (committed)
+      {
+        N8Assembly analytic, analytic_q14;
+        std::vector<double> entry_residual, repeat_residual;
+        const bool analytic_ok = N8AssembleAnalytic(
+            foundation, n8, *committed, newton.entry, n8_q12, analytic);
+        const bool analytic_q14_ok = N8AssembleAnalytic(
+            foundation, n8, *committed, newton.entry, n8_q14,
+            analytic_q14);
+        const bool residual_ok = N8ResidualOnly(
+            foundation, n8, *committed, newton.entry,
+            sc25::coupled_fixture_quadrature_order, entry_residual);
+        const bool repeat_ok = N8ResidualOnly(
+            foundation, n8, *committed, newton.entry,
+            sc25::coupled_fixture_repeat_quadrature_order, repeat_residual);
+        TrajectoryRequire(
+            analytic_ok && analytic_q14_ok && residual_ok && repeat_ok,
+                          label + " independent Newton assembly", evidence);
+        evidence.independently_assembled_residuals += 2;
+        if (analytic_ok && analytic_q14_ok && residual_ok && repeat_ok)
+        {
+          const double entry_norm = N8Norm(entry_residual);
+          const double norm_discrepancy =
+              std::abs(entry_norm - newton.entry_residual_norm) /
+              std::max(1.0, entry_norm);
+          evidence.maximum_residual_norm_discrepancy = std::max(
+              evidence.maximum_residual_norm_discrepancy, norm_discrepancy);
+          TrajectoryRequire(C1Relative(analytic.residual, entry_residual) <=
+                                2.0e-11,
+                            label + " analytic/residual-only agreement",
+                            evidence);
+          TrajectoryRequire(C1Relative(repeat_residual, entry_residual) <=
+                                1.0e-11,
+                            label + " quadrature-repeat residual", evidence);
+          TrajectoryRequire(N8AssemblyRelative(analytic_q14, analytic) <=
+                                1.0e-11,
+                            label + " q12/q14 Jacobian/block sensitivity",
+                            evidence);
+          TrajectoryRequire(norm_discrepancy <= 2.0e-11,
+                            label + " independent Newton-entry residual",
+                            evidence);
+          VerifyN8Direction(n8, analytic, newton.direction, evidence, label);
+          VerifyN8Direction(n8, analytic_q14, newton.direction, evidence,
+                            label + " q14");
+        }
+
+        int independent_first_armijo = -1;
+        double independent_accepted_norm =
+            std::numeric_limits<double>::infinity();
+        for (int line = 0; line < sc25::persistent_line_search_trials; ++line)
+        {
+          const double theta = std::ldexp(1.0, -line);
+          const TrajectoryState trial = ApplyIndependentDirection(
+              newton.entry, newton.direction, theta);
+          std::vector<double> trial_residual, trial_residual_q14;
+          const bool independently_admissible = N8ResidualOnly(
+              foundation, n8, *committed, trial, n8_q12, trial_residual);
+          const bool independently_admissible_q14 = N8ResidualOnly(
+              foundation, n8, *committed, trial, n8_q14,
+              trial_residual_q14);
+          evidence.independently_assembled_residuals += 2;
+          TrajectoryRequire(
+              independently_admissible == independently_admissible_q14 &&
+                  (!independently_admissible ||
+                   C1Relative(trial_residual_q14, trial_residual) <=
+                       1.0e-11),
+              label + " trial q12/q14 residual/card sensitivity", evidence);
+          const double trial_norm = independently_admissible ?
+              N8Norm(trial_residual) :
+              std::numeric_limits<double>::infinity();
+          const double entry_norm = analytic_ok ? N8Norm(analytic.residual) :
+              std::numeric_limits<double>::infinity();
+          const bool armijo = independently_admissible &&
+              std::isfinite(trial_norm) &&
+              trial_norm <= (1.0 - 1.0e-4 * theta) * entry_norm;
+          if (independent_first_armijo < 0 && armijo)
+          {
+            independent_first_armijo = line;
+            independent_accepted_norm = trial_norm;
+          }
+          const bool injection_override = attempt.injection ==
+              sc25::TrajectoryFailureInjection::admissibility;
+          if (injection_override)
+          {
+            TrajectoryRequire(
+                newton.trial_admissible[static_cast<std::size_t>(line)] == 0 &&
+                    newton.trial_armijo[static_cast<std::size_t>(line)] == 0,
+                label + " all-trials-inadmissible hook", evidence);
+          }
+          else if (line <= newton.accepted_line_search_index)
+          {
+            TrajectoryRequire(
+                independently_admissible ==
+                    (newton.trial_admissible[static_cast<std::size_t>(line)] !=
+                     0),
+                label + " independent trial admissibility", evidence);
+            const double reported = newton.trial_residual_norms[
+                static_cast<std::size_t>(line)];
+            const double discrepancy = std::abs(reported - trial_norm) /
+                std::max(1.0, trial_norm);
+            evidence.maximum_residual_norm_discrepancy = std::max(
+                evidence.maximum_residual_norm_discrepancy, discrepancy);
+            TrajectoryRequire(discrepancy <= 2.0e-11,
+                              label + " independent trial residual", evidence);
+            TrajectoryRequire(
+                armijo ==
+                    (newton.trial_armijo[static_cast<std::size_t>(line)] != 0),
+                label + " independent Armijo decision", evidence);
+          }
+          ++evidence.checked_line_search_trials;
+        }
+        if (attempt.injection ==
+            sc25::TrajectoryFailureInjection::admissibility)
+        {
+          TrajectoryRequire(newton.accepted_line_search_index == -1,
+                            label + " injected line-search rejection",
+                            evidence);
+        }
+        else
+        {
+          TrajectoryRequire(independent_first_armijo >= 0 &&
+                                newton.accepted_line_search_index ==
+                                    independent_first_armijo,
+                            label + " independently first Armijo trial",
+                            evidence);
+          const double discrepancy =
+              std::abs(newton.accepted_residual_norm -
+                       independent_accepted_norm) /
+              std::max(1.0, independent_accepted_norm);
+          TrajectoryRequire(discrepancy <= 2.0e-11,
+                            label + " independently accepted residual",
+                            evidence);
+        }
+      }
+      ++evidence.checked_newton_iterations;
+    }
+    if (attempt_accepted && committed && local_target_index >= 0 &&
+        local_target_index < run.step_evidence_count)
+    {
+      std::vector<double> independent_attempt_entry;
+      std::vector<double> final_residual, final_residual_q14;
+      const TrajectoryState& accepted_state = run.steps[
+          static_cast<std::size_t>(local_target_index)].accepted_state;
+      const bool entry_ok = N8ResidualOnly(
+          foundation, n8, *committed, *committed, n8_q12,
+          independent_attempt_entry);
+      const bool final_q12 = N8ResidualOnly(
+          foundation, n8, *committed, accepted_state, n8_q12,
+          final_residual);
+      const bool final_q14 = N8ResidualOnly(
+          foundation, n8, *committed, accepted_state, n8_q14,
+          final_residual_q14);
+      if (entry_ok && final_q12 && final_q14)
+      {
+        const double entry_norm = N8Norm(independent_attempt_entry);
+        const double final_norm = N8Norm(final_residual);
+        const double discrepancy =
+            std::abs(final_norm - attempt.final_residual_norm) /
+            std::max(1.0, final_norm);
+        evidence.maximum_residual_norm_discrepancy = std::max(
+            evidence.maximum_residual_norm_discrepancy, discrepancy);
+        TrajectoryRequire(discrepancy <= 2.0e-11,
+                          label + " independent accepted residual", evidence);
+        TrajectoryRequire(
+            C1Relative(final_residual_q14, final_residual) <= 1.0e-11,
+            label + " accepted q12/q14 residual sensitivity", evidence);
+        TrajectoryRequire(
+            final_norm <= 1.0e-12 + 1.0e-10 * entry_norm,
+            label + " independent final nonlinear residual bound", evidence);
+      }
+      else
+      {
+        TrajectoryRequire(false, label + " accepted-state assembly", evidence);
+      }
+      evidence.independently_assembled_residuals += 3;
+    }
+    ++evidence.checked_attempts;
   }
   return evidence.failures.empty();
 }

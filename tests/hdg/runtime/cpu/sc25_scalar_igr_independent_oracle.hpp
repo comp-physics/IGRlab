@@ -60,6 +60,26 @@ struct IndependentC1Evidence final
   std::vector<std::string> failures;
 };
 
+struct IndependentTrajectoryEvidence final
+{
+  int checked_steps = 0;
+  int checked_attempts = 0;
+  int checked_newton_iterations = 0;
+  int checked_line_search_trials = 0;
+  int independently_assembled_residuals = 0;
+  int checked_conservation_maxima = 0;
+  double maximum_integral_discrepancy = 0.0;
+  double maximum_conservation_maximum_discrepancy = 0.0;
+  double maximum_residual_norm_discrepancy = 0.0;
+  double maximum_jacobian_action_relative_l2 = 0.0;
+  double maximum_condensed_action_relative_l2 = 0.0;
+  double maximum_recovery_relative_l2 = 0.0;
+  double minimum_density = 0.0;
+  double minimum_pressure = 0.0;
+  double minimum_speed_margin = 0.0;
+  std::vector<std::string> failures;
+};
+
 /**
  * Independently reconstruct MFEM metadata and elementary algebra.  The oracle
  * consumes public state, never production-owned certification booleans.
@@ -73,5 +93,19 @@ bool RunIndependentC1Oracle(
     dg::hdg::runtime::cpu::sc25::PersistentSc25ScalarIgrCpuFoundation&
         foundation,
     IndependentC1Evidence& evidence);
+
+/** Independently reconstruct trajectory hashes, quadrature admissibility,
+ *  conservation integrals, Newton/Armijo decisions, and reuse invariants. */
+bool RunIndependentTrajectoryOracle(
+    dg::hdg::runtime::cpu::sc25::PersistentSc25ScalarIgrCpuFoundation&
+        foundation,
+    IndependentTrajectoryEvidence& evidence);
+
+bool EvaluateIndependentAuxiliaryResidualOracle(
+    dg::hdg::runtime::cpu::sc25::PersistentSc25ScalarIgrCpuFoundation&
+        foundation,
+    const dg::hdg::runtime::cpu::sc25::PersistentTrajectoryState& state,
+    int quadrature_order,
+    dg::hdg::runtime::cpu::sc25::AuxiliaryResidualMetrics& metrics);
 
 } // namespace dg_igr_hdg_sc25_cpu_test

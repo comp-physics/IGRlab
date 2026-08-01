@@ -1,4 +1,5 @@
 #include "numerics/hdg/runtime/cpu/persistent_sc25_scalar_igr.hpp"
+#include "numerics/hdg/runtime/sha256.hpp"
 
 #include <HYPRE_krylov.h>
 #include <HYPRE_parcsr_ls.h>
@@ -507,6 +508,7 @@ bool CondenseElementLinearization(const ElementLinearization& input,
 
 struct PersistentSc25ScalarIgrCpuFoundation::Implementation
 {
+  ~Implementation() noexcept;
   struct OwnedCommunicator final
   {
     MPI_Comm value = MPI_COMM_NULL;
@@ -549,6 +551,7 @@ struct PersistentSc25ScalarIgrCpuFoundation::Implementation
   std::unique_ptr<mfem::HypreParMatrix> assembled_true_matrix;
   mfem::Vector assembled_true_rhs;
   TraceAssemblyIdentity assembled_identity{};
+  std::unique_ptr<PersistentTrajectoryImplementation> trajectory;
 
   bool BuildMeshAndSpaces() noexcept
   {
@@ -1211,6 +1214,7 @@ namespace
 
 struct CoupledFixturePrivateDiagnostic final
 {
+  const char* fixture_label = "C1-MFEM-PERIODIC-02";
   const char* phase = "precondition";
   const char* substage = "owner-config";
   int element = -1;
@@ -1252,29 +1256,70 @@ struct CoupledFixturePrivateDiagnostic final
       std::numeric_limits<double>::quiet_NaN();
   double local_application_bound =
       std::numeric_limits<double>::quiet_NaN();
-  bool success = false;
+  bool attempt_active = false;
+  bool failure_latched = false;
+  TrajectoryAssemblyFailureCause failure_cause =
+      TrajectoryAssemblyFailureCause::invalid_structure;
+
+  void Begin(const char* next_fixture_label, const char* next_phase,
+             const char* next_substage = "precondition") noexcept
+  {
+    if (failure_latched) { return; }
+    fixture_label = next_fixture_label;
+    attempt_active = true;
+    phase = next_phase;
+    substage = next_substage;
+    element = -1;
+    failure_cause = TrajectoryAssemblyFailureCause::invalid_structure;
+  }
+
+  void SetFailureCause(
+      const TrajectoryAssemblyFailureCause next_cause) noexcept
+  {
+    if (!failure_latched) { failure_cause = next_cause; }
+  }
 
   void Set(const char* next_phase, const char* next_substage,
            const int next_element = -1) noexcept
   {
+    if (failure_latched) { return; }
+    attempt_active = true;
     phase = next_phase;
     substage = next_substage;
     element = next_element;
   }
 
+  void LatchFailure() noexcept
+  {
+    if (attempt_active) { failure_latched = true; }
+    attempt_active = false;
+  }
+
+  void CompleteAttempt() noexcept
+  {
+    if (!failure_latched) { attempt_active = false; }
+  }
+
+  void HandleFailure() noexcept
+  {
+    attempt_active = false;
+    failure_latched = false;
+  }
+
   ~CoupledFixturePrivateDiagnostic() noexcept
   {
-    if (success) { return; }
+    if (!failure_latched && !attempt_active) { return; }
     std::fprintf(
         stderr,
-        "C1-MFEM-PERIODIC-02 diagnostic phase=%s substage=%s element=%d "
+        "%s diagnostic phase=%s substage=%s element=%d "
         "hypre_setup_reached=%d setup_status=%d "
         "hypre_solve_reached=%d solve_status=%d "
         "hypre_query_reached=%d convergence_query_status=%d converged=%d "
         "iteration_query_reached=%d iterations=%d "
         "true_residual_reached=%d true_residual=%.17g rhs=%.17g "
         "bound=%.17g\n",
-        phase, substage, element, hypre_setup_reached ? 1 : 0,
+        fixture_label, phase, substage, element,
+        hypre_setup_reached ? 1 : 0,
         setup_status, hypre_solve_reached ? 1 : 0, solve_status,
         hypre_query_reached ? 1 : 0, convergence_query_status, converged,
         iteration_query_reached ? 1 : 0, iterations,
@@ -1282,14 +1327,14 @@ struct CoupledFixturePrivateDiagnostic final
         right_hand_side_norm, true_residual_bound);
     std::fprintf(
         stderr,
-        "C1-MFEM-PERIODIC-02 local-detail expected_element=%d "
+        "%s local-detail expected_element=%d "
         "actual_element=%d ni=%d nt=%d A=%zu B=%zu C=%zu D=%zu "
         "r_local=%zu r_trace=%zu lu_failure_column=%d "
         "lu_pivot_magnitude=%.17g lu_pivot_threshold=%.17g "
         "lu_reason=%s solve_kind=%s trace_column=%d solve_reached=%d "
         "solve_succeeded=%d application_reached=%d "
         "application_residual=%.17g rhs_norm=%.17g bound=%.17g\n",
-        expected_block_element, actual_block_element,
+        fixture_label, expected_block_element, actual_block_element,
         block_interior_unknowns, block_trace_unknowns, block_a_entries,
         block_b_entries, block_c_entries, block_d_entries,
         block_local_residual_entries, block_trace_residual_entries,
@@ -1319,6 +1364,32 @@ struct CoupledFixtureAssembly final
   std::vector<double> full_residual;
   std::vector<double> full_jacobian;
 };
+
+struct CoupledAssemblyWorkspace final
+{
+  mfem::Vector volume_shape;
+  mfem::DenseMatrix volume_derivative;
+  mfem::Vector face_interior_shape;
+  mfem::Vector face_trace_shape;
+  mfem::Vector face_oriented_shape;
+  mfem::Vector scaled_normal;
+
+  CoupledAssemblyWorkspace()
+      : volume_shape(coupled_fixture_scalar_volume_nodes),
+        volume_derivative(coupled_fixture_scalar_volume_nodes, dimension),
+        face_interior_shape(coupled_fixture_scalar_volume_nodes),
+        face_trace_shape(coupled_fixture_scalar_face_nodes),
+        face_oriented_shape(coupled_fixture_scalar_face_nodes),
+        scaled_normal(dimension)
+  {}
+};
+
+template <typename Value>
+void ResizeAndZero(std::vector<Value>& values, const std::size_t size)
+{
+  if (values.size() != size) { values.resize(size); }
+  std::fill(values.begin(), values.end(), Value{});
+}
 
 double RelativeL2Difference(const std::vector<double>& left,
                             const std::vector<double>& right) noexcept
@@ -1691,10 +1762,11 @@ bool AssembleCoupledFixture(
     const mfem::DG_Interface_FECollection& trace_collection,
     const std::vector<ElementTopology>& topology,
     const CoupledFixtureState& state, const int quadrature_order,
-    CoupledFixtureAssembly& output, const char* phase,
+    const double time_step, const bool assemble_dense_jacobian,
+    CoupledFixtureAssembly& output, CoupledAssemblyWorkspace& workspace,
+    const char* phase,
     CoupledFixturePrivateDiagnostic& diagnostic)
 {
-  output = {};
   diagnostic.Set(phase, "precondition");
   try
   {
@@ -1702,28 +1774,42 @@ bool AssembleCoupledFixture(
     constexpr int nf = coupled_fixture_local_scalar_trace_nodes;
     constexpr int ni = coupled_fixture_local_interior_unknowns;
     constexpr int nt = coupled_fixture_local_trace_unknowns;
-    constexpr int full = coupled_fixture_full_unknowns;
-    if (mesh.GetNE() != coupled_fixture_elements ||
-        mesh.GetNumFaces() != coupled_fixture_unique_faces ||
+    const int elements = mesh.GetNE();
+    const int true_trace = carrier_space.GetTrueVSize();
+    const int global_interior = elements * ni;
+    const int full = global_interior + true_trace;
+    if (elements <= 0 || true_trace <= 0 || !Finite(time_step) ||
+        !(time_step > 0.0) ||
         volume_space.GetVDim() != 1 ||
         carrier_space.GetVDim() != trace_components ||
-        state.old_by_element.size() != coupled_fixture_elements ||
-        state.candidate_by_element.size() != coupled_fixture_elements ||
-        state.old_trace_by_element.size() != coupled_fixture_elements ||
-        state.trace_by_element.size() != coupled_fixture_elements ||
-        topology.size() != coupled_fixture_elements)
+        state.old_by_element.size() != static_cast<std::size_t>(elements) ||
+        state.candidate_by_element.size() !=
+            static_cast<std::size_t>(elements) ||
+        state.old_trace_by_element.size() !=
+            static_cast<std::size_t>(elements) ||
+        state.trace_by_element.size() !=
+            static_cast<std::size_t>(elements) ||
+        topology.size() != static_cast<std::size_t>(elements))
     {
       return false;
     }
-    output.elements.resize(coupled_fixture_elements);
-    output.full_residual.assign(full, 0.0);
-    output.full_jacobian.assign(static_cast<std::size_t>(full) * full, 0.0);
+    output.elements.resize(static_cast<std::size_t>(elements));
+    ResizeAndZero(output.full_residual, static_cast<std::size_t>(full));
+    if (assemble_dense_jacobian)
+    {
+      ResizeAndZero(output.full_jacobian,
+                    static_cast<std::size_t>(full) * full);
+    }
+    else
+    {
+      output.full_jacobian.clear();
+    }
     const auto local_index = [](const int component, const int scalar)
     { return component * ns + scalar; };
     const auto trace_index = [](const int component, const int face_scalar)
     { return component * nf + face_scalar; };
 
-    for (int element = 0; element < coupled_fixture_elements; ++element)
+    for (int element = 0; element < elements; ++element)
     {
       diagnostic.Set(phase, "volume", element);
       const std::vector<double>& old =
@@ -1744,12 +1830,12 @@ bool AssembleCoupledFixture(
       block.element = element;
       block.local_interior_unknowns = ni;
       block.local_trace_unknowns = nt;
-      block.a.assign(static_cast<std::size_t>(ni) * ni, 0.0);
-      block.b.assign(static_cast<std::size_t>(ni) * nt, 0.0);
-      block.c.assign(static_cast<std::size_t>(nt) * ni, 0.0);
-      block.d.assign(static_cast<std::size_t>(nt) * nt, 0.0);
-      block.local_residual.assign(ni, 0.0);
-      block.trace_residual.assign(nt, 0.0);
+      ResizeAndZero(block.a, static_cast<std::size_t>(ni) * ni);
+      ResizeAndZero(block.b, static_cast<std::size_t>(ni) * nt);
+      ResizeAndZero(block.c, static_cast<std::size_t>(nt) * ni);
+      ResizeAndZero(block.d, static_cast<std::size_t>(nt) * nt);
+      ResizeAndZero(block.local_residual, static_cast<std::size_t>(ni));
+      ResizeAndZero(block.trace_residual, static_cast<std::size_t>(nt));
       const mfem::FiniteElement* finite_element = volume_space.GetFE(element);
       mfem::ElementTransformation* element_transformation =
           mesh.GetElementTransformation(element);
@@ -1760,8 +1846,8 @@ bool AssembleCoupledFixture(
       }
       const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
           finite_element->GetGeomType(), quadrature_order);
-      mfem::Vector shape(ns);
-      mfem::DenseMatrix derivative(ns, dimension);
+      mfem::Vector& shape = workspace.volume_shape;
+      mfem::DenseMatrix& derivative = workspace.volume_derivative;
       for (int point = 0; point < volume_rule.GetNPoints(); ++point)
       {
         const mfem::IntegrationPoint& ip = volume_rule.IntPoint(point);
@@ -1785,6 +1871,8 @@ bool AssembleCoupledFixture(
         }
         if (!SampleAdmissible(conservative) || !SampleAdmissible(previous))
         {
+          diagnostic.SetFailureCause(
+              TrajectoryAssemblyFailureCause::state_admissibility);
           return false;
         }
         const double sigma = EvaluateComponent(current, 4, ns, shape);
@@ -1834,7 +1922,7 @@ bool AssembleCoupledFixture(
             block.local_residual[row] += weight *
                 (shape[row_scalar] *
                      (conservative[equation] - previous[equation]) /
-                     coupled_fixture_dt -
+                     time_step -
                  derivative(row_scalar, 0) * flux[0][equation] -
                  derivative(row_scalar, 1) * flux[1][equation]);
             for (int column_scalar = 0; column_scalar < ns; ++column_scalar)
@@ -1843,7 +1931,7 @@ bool AssembleCoupledFixture(
                 const int column = local_index(variable, column_scalar);
                 double value = variable == equation ?
                     shape[row_scalar] * shape[column_scalar] /
-                        coupled_fixture_dt : 0.0;
+                        time_step : 0.0;
                 value -= derivative(row_scalar, 0) *
                     flux_jacobian[0][equation][variable] *
                     shape[column_scalar];
@@ -1986,7 +2074,9 @@ bool AssembleCoupledFixture(
         }
         const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
             trace_element->GetGeomType(), quadrature_order);
-        mfem::Vector interior_shape(ns), trace_shape(2), oriented_shape(2);
+        mfem::Vector& interior_shape = workspace.face_interior_shape;
+        mfem::Vector& trace_shape = workspace.face_trace_shape;
+        mfem::Vector& oriented_shape = workspace.face_oriented_shape;
         for (int point = 0; point < face_rule.GetNPoints(); ++point)
         {
           const mfem::IntegrationPoint& ip = face_rule.IntPoint(point);
@@ -2006,7 +2096,7 @@ bool AssembleCoupledFixture(
             }
             oriented_shape[scalar] = sign * trace_shape[canonical];
           }
-          mfem::Vector scaled(dimension);
+          mfem::Vector& scaled = workspace.scaled_normal;
           mfem::CalcOrtho(face_transformation->Face->Jacobian(), scaled);
           const double norm = scaled.Norml2();
           const double measure = face_transformation->Face->Weight();
@@ -2056,6 +2146,8 @@ bool AssembleCoupledFixture(
               !SampleAdmissible(trace_state) ||
               !SampleAdmissible(previous_trace))
           {
+            diagnostic.SetFailureCause(
+                TrajectoryAssemblyFailureCause::state_admissibility);
             return false;
           }
           State physical_flux{};
@@ -2234,12 +2326,14 @@ bool AssembleCoupledFixture(
           !Finite(block.d) || !Finite(block.local_residual) ||
           !Finite(block.trace_residual))
       {
+        diagnostic.SetFailureCause(
+            TrajectoryAssemblyFailureCause::nonfinite_result);
         return false;
       }
     }
 
     diagnostic.Set(phase, "global-scatter");
-    for (int element = 0; element < coupled_fixture_elements; ++element)
+    for (int element = 0; element < elements; ++element)
     {
       const ElementLinearization& block =
           output.elements[static_cast<std::size_t>(element)];
@@ -2248,7 +2342,8 @@ bool AssembleCoupledFixture(
       for (int row = 0; row < ni; ++row)
       {
         output.full_residual[local_base + row] = block.local_residual[row];
-        for (int column = 0; column < ni; ++column)
+        for (int column = 0; assemble_dense_jacobian && column < ni;
+             ++column)
         {
           output.full_jacobian[
               static_cast<std::size_t>(local_base + row) * full +
@@ -2258,23 +2353,35 @@ bool AssembleCoupledFixture(
         for (int column = 0; column < nt; ++column)
         {
           const TraceRestrictionEntry& entry = map.restriction[column];
-          const int true_column =
-              coupled_fixture_global_interior_unknowns +
-              entry.local_true_dof;
-          output.full_jacobian[
-              static_cast<std::size_t>(local_base + row) * full +
-              true_column] += entry.sign *
-              block.b[static_cast<std::size_t>(row) * nt + column];
+          if (entry.local_true_dof < 0 ||
+              entry.local_true_dof >= true_trace)
+          {
+            return false;
+          }
+          if (assemble_dense_jacobian)
+          {
+            const int true_column =
+                global_interior + entry.local_true_dof;
+            output.full_jacobian[
+                static_cast<std::size_t>(local_base + row) * full +
+                true_column] += entry.sign *
+                block.b[static_cast<std::size_t>(row) * nt + column];
+          }
         }
       }
       for (int row = 0; row < nt; ++row)
       {
         const TraceRestrictionEntry& row_entry = map.restriction[row];
-        const int true_row = coupled_fixture_global_interior_unknowns +
-            row_entry.local_true_dof;
+        if (row_entry.local_true_dof < 0 ||
+            row_entry.local_true_dof >= true_trace)
+        {
+          return false;
+        }
+        const int true_row = global_interior + row_entry.local_true_dof;
         output.full_residual[true_row] +=
             row_entry.sign * block.trace_residual[row];
-        for (int column = 0; column < ni; ++column)
+        for (int column = 0; assemble_dense_jacobian && column < ni;
+             ++column)
         {
           output.full_jacobian[
               static_cast<std::size_t>(true_row) * full +
@@ -2285,21 +2392,36 @@ bool AssembleCoupledFixture(
         {
           const TraceRestrictionEntry& column_entry =
               map.restriction[column];
-          const int true_column =
-              coupled_fixture_global_interior_unknowns +
-              column_entry.local_true_dof;
-          output.full_jacobian[
-              static_cast<std::size_t>(true_row) * full + true_column] +=
-              row_entry.sign * column_entry.sign *
-              block.d[static_cast<std::size_t>(row) * nt + column];
+          if (column_entry.local_true_dof < 0 ||
+              column_entry.local_true_dof >= true_trace)
+          {
+            return false;
+          }
+          if (assemble_dense_jacobian)
+          {
+            const int true_column =
+                global_interior + column_entry.local_true_dof;
+            output.full_jacobian[
+                static_cast<std::size_t>(true_row) * full + true_column] +=
+                row_entry.sign * column_entry.sign *
+                block.d[static_cast<std::size_t>(row) * nt + column];
+          }
         }
       }
     }
-    return Finite(output.full_residual) && Finite(output.full_jacobian);
+    const bool finite = Finite(output.full_residual) &&
+        (!assemble_dense_jacobian || Finite(output.full_jacobian));
+    if (!finite)
+    {
+      diagnostic.SetFailureCause(
+          TrajectoryAssemblyFailureCause::nonfinite_result);
+    }
+    return finite;
   }
   catch (...)
   {
     diagnostic.Set(phase, "exception", diagnostic.element);
+    diagnostic.SetFailureCause(TrajectoryAssemblyFailureCause::exception);
     output = {};
     return false;
   }
@@ -2342,7 +2464,2753 @@ void ConfigureCoupledIlu(mfem::HypreILU& ilu)
   ilu.SetPrintLevel(0);
 }
 
+struct TrajectoryInteriorBacking final
+{
+  std::array<double, persistent_u_unknowns> u{};
+  std::array<double, persistent_sigma_unknowns> sigma{};
+  std::array<double, persistent_z_unknowns> z{};
+};
+
+struct TrajectoryTraceBacking final
+{
+  std::array<double, persistent_uhat_unknowns> uhat{};
+  std::array<double, persistent_sigmahat_unknowns> sigmahat{};
+};
+
+using TrajectorySlot =
+    CompleteStateSlot<TrajectoryInteriorBacking, TrajectoryTraceBacking>;
+
+template <typename... Arrays>
+StateHash HashArrays(const Arrays&... arrays) noexcept
+{
+  Sha256 sha;
+  const bool updated =
+      (sha.Update(arrays.data(), arrays.size() * sizeof(double)) && ...);
+  Sha256Digest digest{};
+  if (!updated || !sha.Finalize(digest)) { return {}; }
+  return {digest};
+}
+
+struct TrajectoryStoragePolicy final
+{
+  static constexpr bool preparation_preserves_committed = true;
+  static constexpr bool private_copy_is_independent = true;
+  static constexpr bool publish_is_atomic = true;
+  static constexpr bool publish_preserves_disjoint_backing = true;
+
+  static bool PrepareCandidate(const TrajectorySlot& committed,
+                               TrajectorySlot& candidate) noexcept
+  {
+    candidate = committed;
+    return true;
+  }
+  static bool PrepareRestore(const TrajectorySlot& loaded,
+                             TrajectorySlot& candidate) noexcept
+  {
+    candidate = loaded;
+    return true;
+  }
+  static bool StoreCandidate(TrajectorySlot& candidate,
+                             const TrajectorySlot& value) noexcept
+  {
+    candidate = value;
+    return true;
+  }
+  static bool CopyOut(const TrajectorySlot& source,
+                      TrajectorySlot& destination) noexcept
+  {
+    destination = source;
+    return true;
+  }
+  static void DiscardCandidate(TrajectorySlot&) noexcept {}
+  static bool CanPublish(const TrajectorySlot& committed,
+                         const TrajectorySlot& candidate) noexcept
+  {
+    return Disjoint(committed, candidate);
+  }
+  static void Publish(TrajectorySlot& committed,
+                      TrajectorySlot& candidate) noexcept
+  {
+    using std::swap;
+    swap(committed, candidate);
+  }
+  static bool Disjoint(const TrajectorySlot& left,
+                       const TrajectorySlot& right) noexcept
+  {
+    return &left != &right && left.interior.u.data() != right.interior.u.data() &&
+        left.trace.uhat.data() != right.trace.uhat.data();
+  }
+  static StateHash HashInterior(
+      const TrajectoryInteriorBacking& state) noexcept
+  {
+    return HashArrays(state.u, state.sigma, state.z);
+  }
+  static StateHash HashTrace(const TrajectoryTraceBacking& state) noexcept
+  {
+    return HashArrays(state.uhat, state.sigmahat);
+  }
+};
+
+struct TrajectorySerialCollectivePolicy final
+{
+  static CollectiveAdmissionReport Admit(
+      const AttemptCollectiveContext& context, const bool prepared,
+      FailureReason reason, const std::uint32_t ranks) noexcept
+  {
+    if (!prepared && reason == FailureReason::none)
+    {
+      reason = FailureReason::candidate_preparation;
+    }
+    return {context,
+            ranks,
+            ranks == 1,
+            ranks == 1,
+            prepared,
+            reason != FailureReason::none,
+            detail::FailureBit(reason),
+            reason};
+  }
+
+  static CollectiveGateReport Reduce(
+      const AttemptCollectiveContext& context, const GateReport& gates,
+      const FailureReason reason, const std::uint32_t ranks) noexcept
+  {
+    return {context,
+            gates,
+            ranks,
+            ranks == 1,
+            ranks == 1,
+            reason != FailureReason::none,
+            detail::FailureBit(reason),
+            reason};
+  }
+
+  static CollectiveRestoreReport ReduceRestore(
+      const RestoreCollectiveContext& context,
+      const RestartCompatibility compatibility,
+      const FailureReason reason, const std::uint32_t ranks) noexcept
+  {
+    return {context,
+            ranks,
+            ranks == 1,
+            ranks == 1,
+            reason != FailureReason::none,
+            detail::FailureBit(reason),
+            detail::CompatibilityBit(compatibility),
+            reason,
+            compatibility};
+  }
+};
+
+using TrajectoryContract =
+    PersistentRunContract<CpuRank1Selection,
+                          TrajectoryInteriorBacking,
+                          TrajectoryTraceBacking,
+                          TrajectoryStoragePolicy,
+                          TrajectorySerialCollectivePolicy>;
+
+TrajectorySlot ToSlot(const PersistentTrajectoryState& state) noexcept
+{
+  TrajectorySlot slot;
+  slot.interior.u = state.u;
+  slot.interior.sigma = state.sigma;
+  slot.interior.z = state.z;
+  slot.trace.uhat = state.uhat;
+  slot.trace.sigmahat = state.sigmahat;
+  return slot;
+}
+
+PersistentTrajectoryState ToPublicState(const TrajectorySlot& slot) noexcept
+{
+  PersistentTrajectoryState state;
+  state.u = slot.interior.u;
+  state.sigma = slot.interior.sigma;
+  state.z = slot.interior.z;
+  state.uhat = slot.trace.uhat;
+  state.sigmahat = slot.trace.sigmahat;
+  return state;
+}
+
+template <std::size_t N>
+bool SameFp64Bytes(const std::array<double, N>& left,
+                   const std::array<double, N>& right) noexcept
+{
+  return std::memcmp(left.data(), right.data(), N * sizeof(double)) == 0;
+}
+
+bool SameTrajectoryStateBytes(const PersistentTrajectoryState& left,
+                              const PersistentTrajectoryState& right) noexcept
+{
+  return SameFp64Bytes(left.u, right.u) &&
+      SameFp64Bytes(left.sigma, right.sigma) &&
+      SameFp64Bytes(left.z, right.z) &&
+      SameFp64Bytes(left.uhat, right.uhat) &&
+      SameFp64Bytes(left.sigmahat, right.sigmahat);
+}
+
+TrajectoryStateHashes HashState(const TrajectorySlot& state) noexcept
+{
+  return {HashArrays(state.interior.u),
+          HashArrays(state.interior.sigma),
+          HashArrays(state.interior.z),
+          HashArrays(state.trace.uhat),
+          HashArrays(state.trace.sigmahat),
+          TrajectoryStoragePolicy::HashInterior(state.interior),
+          TrajectoryStoragePolicy::HashTrace(state.trace)};
+}
+
+std::array<TrajectoryCheckpointFieldIdentity, 5>
+CheckpointFieldIdentities() noexcept
+{
+  return {{{StableIdentity::Copy("U_h.element-component-node"),
+            persistent_u_unknowns, 0},
+           {StableIdentity::Copy("Sigma_h.element-node"),
+            persistent_sigma_unknowns, 1},
+           {StableIdentity::Copy("z_h.element-component-node"),
+            persistent_z_unknowns, 2},
+           {StableIdentity::Copy("Uhat_h.component-true-node"),
+            persistent_uhat_unknowns, 3},
+           {StableIdentity::Copy("Sigmahat_h.true-node"),
+            persistent_sigmahat_unknowns, 4}}};
+}
+
+bool SameFieldIdentity(const TrajectoryCheckpointFieldIdentity& left,
+                       const TrajectoryCheckpointFieldIdentity& right)
+    noexcept
+{
+  return left.name == right.name &&
+      left.fp64_entries == right.fp64_entries &&
+      left.canonical_order == right.canonical_order;
+}
+
+class ManifestHashBuilder final
+{
+public:
+  bool Text(const std::string_view value) noexcept
+  {
+    return U64(value.size()) && hash_.Update(value.data(), value.size());
+  }
+
+  bool U64(const std::uint64_t value) noexcept
+  {
+    std::array<std::uint8_t, 8> bytes{};
+    for (std::size_t i = 0; i < bytes.size(); ++i)
+    {
+      bytes[i] = static_cast<std::uint8_t>(value >> (8 * i));
+    }
+    return hash_.Update(bytes.data(), bytes.size());
+  }
+
+  bool Hash(const StateHash& value) noexcept
+  {
+    return hash_.Update(value.bytes.data(), value.bytes.size());
+  }
+
+  StateHash Finish() noexcept
+  {
+    Sha256Digest digest{};
+    return hash_.Finalize(digest) ? StateHash{digest} : StateHash{};
+  }
+
+private:
+  Sha256 hash_;
+};
+
+StateHash CanonicalCheckpointManifestHash(
+    const PersistentTrajectoryCheckpoint& checkpoint) noexcept
+{
+  ManifestHashBuilder builder;
+  const CheckpointDescriptor& descriptor = checkpoint.descriptor;
+  const RuntimeTupleDescriptor& tuple = descriptor.tuple;
+  bool valid = builder.Text(persistent_checkpoint_manifest_id) &&
+      builder.Text(checkpoint.projection.view()) &&
+      builder.Text(checkpoint.tuple.view()) &&
+      builder.Text(checkpoint.scenario.view()) &&
+      builder.U64(descriptor.schema_version) &&
+      builder.U64(descriptor.successful_commit ? 1U : 0U) &&
+      builder.U64(static_cast<std::uint64_t>(descriptor.restart_mode)) &&
+      builder.Text(tuple.model.view()) &&
+      builder.Text(tuple.formulation.view()) &&
+      builder.Text(tuple.trace.view()) &&
+      builder.Text(tuple.stabilization.view()) &&
+      builder.Text(tuple.time_treatment.view()) &&
+      builder.Text(tuple.backend.view()) &&
+      builder.Text(tuple.precision.view()) &&
+      builder.Text(descriptor.mfem_pin.view()) &&
+      builder.Hash(descriptor.mesh_hash) &&
+      builder.Hash(descriptor.partition_hash) &&
+      builder.Hash(descriptor.topology_hash) &&
+      builder.U64(descriptor.rank_count) &&
+      builder.U64(static_cast<std::uint64_t>(descriptor.polynomial_order)) &&
+      builder.Text(descriptor.layout.view()) &&
+      builder.Text(descriptor.precision.view()) &&
+      builder.U64(descriptor.cursor) &&
+      builder.U64(detail::DoubleBits(descriptor.dt)) &&
+      builder.U64(detail::DoubleBits(descriptor.coordinates.time)) &&
+      builder.U64(descriptor.coordinates.step) &&
+      builder.U64(descriptor.coordinates.generation) &&
+      builder.U64(descriptor.coordinates.cursor) &&
+      builder.U64(detail::DoubleBits(descriptor.coordinates.dt)) &&
+      builder.U64(descriptor.coordinate_fingerprint) &&
+      builder.Hash(descriptor.interior_hash) &&
+      builder.Hash(descriptor.trace_hash);
+  for (const TrajectoryCheckpointFieldIdentity& field : checkpoint.fields)
+  {
+    valid = valid && builder.Text(field.name.view()) &&
+        builder.U64(field.fp64_entries) && builder.U64(field.canonical_order);
+  }
+  const TrajectoryStateHashes& hashes = checkpoint.raw_field_hashes;
+  valid = valid && builder.Hash(hashes.u) && builder.Hash(hashes.sigma) &&
+      builder.Hash(hashes.z) && builder.Hash(hashes.uhat) &&
+      builder.Hash(hashes.sigmahat);
+  return valid ? builder.Finish() : StateHash{};
+}
+
+template <typename Owner>
+bool LiveResourceHashes(
+    const Owner& owner,
+    StateHash& mesh_hash, StateHash& partition_hash,
+    StateHash& topology_hash) noexcept
+{
+  mesh_hash = {};
+  partition_hash = {};
+  topology_hash = {};
+  if (!owner.mesh || !owner.carrier_space ||
+      !owner.carrier_map.IsConsistent() || owner.topology.empty())
+  {
+    return false;
+  }
+  try
+  {
+    ManifestHashBuilder mesh;
+    bool valid = mesh.Text("mfem-live-periodic-mesh-v1") &&
+        mesh.U64(static_cast<std::uint64_t>(owner.mesh->Dimension())) &&
+        mesh.U64(static_cast<std::uint64_t>(owner.mesh->SpaceDimension())) &&
+        mesh.U64(static_cast<std::uint64_t>(owner.mesh->GetNV())) &&
+        mesh.U64(static_cast<std::uint64_t>(owner.mesh->GetNE())) &&
+        mesh.U64(static_cast<std::uint64_t>(owner.mesh->GetNumFaces()));
+    for (int vertex = 0; valid && vertex < owner.mesh->GetNV(); ++vertex)
+    {
+      const double* coordinates = owner.mesh->GetVertex(vertex);
+      if (!coordinates) { return false; }
+      for (int direction = 0; direction < owner.mesh->SpaceDimension();
+           ++direction)
+      {
+        valid = valid && mesh.U64(detail::DoubleBits(
+            coordinates[direction]));
+      }
+    }
+    mfem::Array<int> vertices;
+    for (int element = 0; valid && element < owner.mesh->GetNE(); ++element)
+    {
+      owner.mesh->GetElementVertices(element, vertices);
+      valid = valid && mesh.U64(static_cast<std::uint64_t>(
+          owner.mesh->GetElementBaseGeometry(element))) &&
+          mesh.U64(static_cast<std::uint64_t>(vertices.Size()));
+      for (int vertex : vertices)
+      {
+        valid = valid && mesh.U64(static_cast<std::uint64_t>(vertex));
+      }
+    }
+    for (int face = 0; valid && face < owner.mesh->GetNumFaces(); ++face)
+    {
+      owner.mesh->GetFaceVertices(face, vertices);
+      valid = valid && mesh.U64(static_cast<std::uint64_t>(
+          owner.mesh->GetFaceGeometry(face))) &&
+          mesh.U64(static_cast<std::uint64_t>(vertices.Size()));
+      for (int vertex : vertices)
+      {
+        valid = valid && mesh.U64(static_cast<std::uint64_t>(vertex));
+      }
+    }
+    mesh_hash = valid ? mesh.Finish() : StateHash{};
+
+    ManifestHashBuilder partition;
+    valid = partition.Text("mfem-live-rank-partition-v1") &&
+        partition.U64(static_cast<std::uint64_t>(owner.rank)) &&
+        partition.U64(static_cast<std::uint64_t>(owner.ranks)) &&
+        partition.U64(static_cast<std::uint64_t>(owner.mesh->GetNE())) &&
+        partition.U64(static_cast<std::uint64_t>(
+            owner.carrier_space->GetVSize())) &&
+        partition.U64(static_cast<std::uint64_t>(
+            owner.carrier_space->GetTrueVSize())) &&
+        partition.U64(static_cast<std::uint64_t>(
+            owner.carrier_space->GlobalTrueVSize()));
+    for (int element = 0; valid && element < owner.mesh->GetNE(); ++element)
+    {
+      valid = partition.U64(static_cast<std::uint64_t>(element));
+    }
+    partition_hash = valid ? partition.Finish() : StateHash{};
+
+    ManifestHashBuilder topology;
+    valid = topology.Text("mfem-live-periodic-trace-topology-v1") &&
+        topology.U64(static_cast<std::uint64_t>(
+            owner.carrier_map.vector_dimension)) &&
+        topology.U64(static_cast<std::uint64_t>(owner.carrier_map.ordering)) &&
+        topology.U64(static_cast<std::uint64_t>(
+            owner.carrier_map.dofs.rank)) &&
+        topology.U64(static_cast<std::uint64_t>(
+            owner.carrier_map.dofs.rank_count)) &&
+        topology.U64(static_cast<std::uint64_t>(
+            owner.carrier_map.dofs.local_true_dof_count)) &&
+        topology.U64(static_cast<std::uint64_t>(
+            owner.carrier_map.dofs.global_true_dof_count));
+    for (const trace::TraceMapEntry& entry : owner.carrier_map.dofs.entries)
+    {
+      valid = valid && topology.U64(static_cast<std::uint64_t>(entry.local_dof)) &&
+          topology.U64(static_cast<std::uint64_t>(entry.global_true_dof)) &&
+          topology.U64(static_cast<std::uint64_t>(entry.local_true_dof)) &&
+          topology.U64(static_cast<std::uint64_t>(entry.owner_rank)) &&
+          topology.U64(static_cast<std::uint64_t>(entry.ownership));
+    }
+    for (const trace::DGInterfaceFaceMap& face : owner.carrier_map.faces)
+    {
+      valid = valid && topology.U64(static_cast<std::uint64_t>(face.local_face)) &&
+          topology.U64(static_cast<std::uint64_t>(face.geometry)) &&
+          topology.U64(static_cast<std::uint64_t>(face.signed_local_vdofs.size()));
+      for (const int dof : face.signed_local_vdofs)
+      {
+        valid = valid && topology.U64(static_cast<std::uint64_t>(
+            static_cast<std::int64_t>(dof)));
+      }
+    }
+    for (const ElementTopology& element : owner.topology)
+    {
+      valid = valid && topology.U64(static_cast<std::uint64_t>(element.element)) &&
+          topology.U64(static_cast<std::uint64_t>(element.scalar_volume_dofs)) &&
+          topology.U64(static_cast<std::uint64_t>(element.scalar_face_dofs)) &&
+          topology.U64(static_cast<std::uint64_t>(element.local_interior_unknowns)) &&
+          topology.U64(static_cast<std::uint64_t>(element.local_trace_unknowns));
+      const auto hash_ints = [&topology, &valid](const std::vector<int>& values)
+      {
+        valid = valid && topology.U64(values.size());
+        for (const int value : values)
+        {
+          valid = valid && topology.U64(static_cast<std::uint64_t>(
+              static_cast<std::int64_t>(value)));
+        }
+      };
+      hash_ints(element.volume.u);
+      hash_ints(element.volume.sigma);
+      hash_ints(element.volume.z);
+      hash_ints(element.faces);
+      hash_ints(element.face_orientations);
+      hash_ints(element.signed_trace_vdofs);
+      valid = valid && topology.U64(element.restriction.size());
+      for (const TraceRestrictionEntry& entry : element.restriction)
+      {
+        valid = valid && topology.U64(static_cast<std::uint64_t>(entry.element)) &&
+            topology.U64(static_cast<std::uint64_t>(entry.local_row)) &&
+            topology.U64(static_cast<std::uint64_t>(entry.local_face)) &&
+            topology.U64(static_cast<std::uint64_t>(entry.component)) &&
+            topology.U64(static_cast<std::uint64_t>(entry.oriented_face_dof)) &&
+            topology.U64(static_cast<std::uint64_t>(entry.canonical_face_dof)) &&
+            topology.U64(static_cast<std::uint64_t>(
+                static_cast<std::int64_t>(entry.signed_carrier_vdof))) &&
+            topology.U64(static_cast<std::uint64_t>(entry.decoded_carrier_vdof)) &&
+            topology.U64(static_cast<std::uint64_t>(
+                static_cast<std::int64_t>(entry.sign))) &&
+            topology.U64(static_cast<std::uint64_t>(entry.global_true_dof)) &&
+            topology.U64(static_cast<std::uint64_t>(entry.local_true_dof)) &&
+            topology.U64(static_cast<std::uint64_t>(entry.owner_rank));
+      }
+    }
+    topology_hash = valid ? topology.Finish() : StateHash{};
+    return valid && mesh_hash != StateHash{} &&
+        partition_hash != StateHash{} && topology_hash != StateHash{};
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+TrajectorySlot ApplyDirection(
+    const TrajectorySlot& entry,
+    const PersistentTrajectoryState& direction,
+    double theta) noexcept;
+
+struct RuntimeElementWorkspace final
+{
+  DenseLu factor;
+  ElementCondensedBlock condensed;
+  std::vector<double> inverse_residual;
+  std::vector<double> inverse_b;
+  std::vector<double> rhs;
+  std::vector<double> solution;
+  std::vector<double> recovery_rhs;
+  std::vector<double> recovered;
+
+  void Initialize(const int element)
+  {
+    constexpr int ni = coupled_fixture_local_interior_unknowns;
+    constexpr int nt = coupled_fixture_local_trace_unknowns;
+    factor.size = ni;
+    factor.values.assign(static_cast<std::size_t>(ni) * ni, 0.0);
+    factor.pivots.assign(ni, 0);
+    condensed.element = element;
+    condensed.local_trace_unknowns = nt;
+    condensed.schur.assign(static_cast<std::size_t>(nt) * nt, 0.0);
+    condensed.right_hand_side.assign(nt, 0.0);
+    inverse_residual.assign(ni, 0.0);
+    inverse_b.assign(static_cast<std::size_t>(ni) * nt, 0.0);
+    rhs.assign(ni, 0.0);
+    solution.assign(ni, 0.0);
+    recovery_rhs.assign(ni, 0.0);
+    recovered.assign(ni, 0.0);
+  }
+};
+
 } // namespace
+
+struct PersistentTrajectoryImplementation final
+{
+  std::unique_ptr<TrajectoryContract> contract;
+  CoupledFixtureState assembly_state;
+  CoupledFixtureAssembly assembly;
+  CoupledFixtureAssembly trial_assembly;
+  CoupledAssemblyWorkspace quadrature_workspace;
+  CoupledFixturePrivateDiagnostic diagnostic;
+  std::vector<RuntimeElementWorkspace> elements;
+  std::unique_ptr<mfem::SparseMatrix> local_pattern;
+  std::unique_ptr<mfem::HypreParMatrix> true_matrix;
+  std::unique_ptr<mfem::HypreParVector> true_rhs;
+  std::unique_ptr<mfem::HypreParVector> true_solution;
+  std::unique_ptr<mfem::HypreILU> ilu;
+  std::unique_ptr<mfem::HypreGMRES> gmres;
+  mfem::Vector true_residual;
+  std::vector<int> element_to_true_csr;
+  PersistentTrajectoryEvidence evidence{};
+  TrajectoryStatus status = TrajectoryStatus::uninitialized;
+  TrajectoryStatus first_failure = TrajectoryStatus::uninitialized;
+  bool initialized = false;
+  std::uint64_t matrix_generation = 0;
+  bool reuse_baseline_frozen = false;
+
+  bool InitializeStorage(
+      PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept;
+  bool LoadAssemblyState(
+      const PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+      const TrajectorySlot& old_state,
+      const TrajectorySlot& candidate) noexcept;
+  TrajectoryAssemblyFailureCause Assemble(
+      PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+      const TrajectorySlot& old_state, const TrajectorySlot& candidate,
+      CoupledFixtureAssembly& output) noexcept;
+  bool InitializePhysicalState(
+      PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+      TrajectorySlot& state) noexcept;
+  bool InitializeAuxiliary(
+      PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+      TrajectorySlot& state) noexcept;
+  bool BuildPersistentTraceGraph(
+      PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept;
+  bool Condense(const CoupledFixtureAssembly& system,
+                double& maximum_residual) noexcept;
+  bool AssembleTrueSystem(
+      PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept;
+  bool SolveTrueSystem(int& iterations, double& residual_norm,
+                       double& rhs_norm) noexcept;
+  bool Recover(
+               PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+               const CoupledFixtureAssembly& system,
+               PersistentTrajectoryState& direction,
+               double& maximum_residual) noexcept;
+  bool Integrals(PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+                 const TrajectorySlot& state,
+                 std::array<double, state_components>& values) noexcept;
+  bool AuxiliaryResidualGate(
+      PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+      const TrajectorySlot& state, AuxiliaryResidualMetrics& metrics)
+      noexcept;
+  TrajectoryStatus ExecuteAttempt(
+      PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+      const BeginOutcome& begin, TrajectoryFailureInjection injection,
+      TrajectoryAttemptEvidence& attempt) noexcept;
+  TrajectoryStatus Advance(
+      PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+      TrajectoryFailureInjection injection) noexcept;
+  void RefreshEvidence() noexcept;
+  void RememberFailure(TrajectoryStatus failure) noexcept;
+  void RecordAssemblyFailure(
+      TrajectoryAssemblyFailureCause failure) noexcept;
+  TrajectoryReuseSnapshot ReuseSnapshot(
+      const PersistentSc25ScalarIgrCpuFoundation::Implementation& owner)
+      const noexcept;
+  bool VerifyReuse(
+      const PersistentSc25ScalarIgrCpuFoundation::Implementation& owner)
+      noexcept;
+};
+
+TrajectoryReuseSnapshot PersistentTrajectoryImplementation::ReuseSnapshot(
+    const PersistentSc25ScalarIgrCpuFoundation::Implementation& owner)
+    const noexcept
+{
+  TrajectoryReuseSnapshot snapshot;
+  snapshot.foundation_handle = reinterpret_cast<std::uintptr_t>(&owner);
+  snapshot.topology_handle =
+      reinterpret_cast<std::uintptr_t>(&owner.topology);
+  snapshot.carrier_map_handle =
+      reinterpret_cast<std::uintptr_t>(&owner.carrier_map);
+  snapshot.contract_handle = reinterpret_cast<std::uintptr_t>(contract.get());
+  snapshot.assembly_state_handle =
+      reinterpret_cast<std::uintptr_t>(&assembly_state);
+  snapshot.assembly_handle = reinterpret_cast<std::uintptr_t>(&assembly);
+  snapshot.trial_assembly_handle =
+      reinterpret_cast<std::uintptr_t>(&trial_assembly);
+  snapshot.factor_handle = elements.empty() ? 0 :
+      reinterpret_cast<std::uintptr_t>(&elements.front().factor);
+  snapshot.workspace_handle = reinterpret_cast<std::uintptr_t>(&elements);
+  snapshot.quadrature_workspace_handle =
+      reinterpret_cast<std::uintptr_t>(&quadrature_workspace);
+  snapshot.local_pattern_handle =
+      reinterpret_cast<std::uintptr_t>(local_pattern.get());
+  snapshot.true_matrix_handle =
+      reinterpret_cast<std::uintptr_t>(true_matrix.get());
+  snapshot.true_rhs_handle = reinterpret_cast<std::uintptr_t>(true_rhs.get());
+  snapshot.true_solution_handle =
+      reinterpret_cast<std::uintptr_t>(true_solution.get());
+  snapshot.ilu_handle = reinterpret_cast<std::uintptr_t>(ilu.get());
+  snapshot.gmres_handle = reinterpret_cast<std::uintptr_t>(gmres.get());
+  snapshot.true_residual_handle =
+      reinterpret_cast<std::uintptr_t>(&true_residual);
+  snapshot.element_to_true_csr_handle =
+      reinterpret_cast<std::uintptr_t>(&element_to_true_csr);
+  snapshot.topology_generation = 1;
+  snapshot.storage_generation = 1;
+  snapshot.factor_generation = 1;
+  snapshot.workspace_generation = 1;
+  snapshot.local_pattern_generation = 1;
+  snapshot.solver_generation = 1;
+  snapshot.opaque_mfem_hypre_observed = false;
+
+  Sha256 hash;
+  bool valid = true;
+  std::uint64_t objects = 0;
+  std::uint64_t buffers = 0;
+  const auto add_object = [&hash, &valid, &objects](const void* object)
+  {
+    const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(object);
+    valid = valid && hash.Update(&address, sizeof(address));
+    if (object != nullptr) { ++objects; }
+  };
+  const auto add = [&hash, &valid, &buffers](
+                       const void* data, const std::size_t size,
+                       const std::size_t capacity)
+  {
+    const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(data);
+    valid = valid && hash.Update(&address, sizeof(address)) &&
+        hash.Update(&size, sizeof(size)) &&
+        hash.Update(&capacity, sizeof(capacity));
+    if (data != nullptr) { ++buffers; }
+  };
+  const auto add_vector = [&add](const auto& values)
+  { add(values.data(), values.size(), values.capacity()); };
+  add_object(&owner);
+  add_object(owner.volume_collection.get());
+  add_object(owner.trace_collection.get());
+  add_object(owner.mesh.get());
+  add_object(owner.u_space.get());
+  add_object(owner.sigma_space.get());
+  add_object(owner.z_space.get());
+  add_object(owner.uhat_space.get());
+  add_object(owner.sigmahat_space.get());
+  add_object(owner.carrier_space.get());
+  add_object(owner.u.get());
+  add_object(owner.sigma.get());
+  add_object(owner.z.get());
+  add_object(owner.uhat.get());
+  add_object(owner.sigmahat.get());
+  add_object(owner.carrier.get());
+  add_object(&owner.carrier_map);
+  add_object(&owner.topology);
+  add_object(this);
+  add_object(contract.get());
+  add_object(&assembly_state);
+  add_object(&assembly);
+  add_object(&trial_assembly);
+  add_object(&quadrature_workspace);
+  add_object(&diagnostic);
+  add_object(&elements);
+  add_object(local_pattern.get());
+  add_object(true_matrix.get());
+  add_object(true_rhs.get());
+  add_object(true_solution.get());
+  add_object(ilu.get());
+  add_object(gmres.get());
+  add_object(&true_residual);
+  add_object(&element_to_true_csr);
+  add_object(&evidence);
+
+  add_vector(owner.carrier_map.dofs.entries);
+  add_vector(owner.carrier_map.faces);
+  for (const trace::DGInterfaceFaceMap& face : owner.carrier_map.faces)
+  {
+    add_vector(face.signed_local_vdofs);
+  }
+  add_vector(owner.topology);
+  for (const ElementTopology& topology : owner.topology)
+  {
+    add_vector(topology.volume.u);
+    add_vector(topology.volume.sigma);
+    add_vector(topology.volume.z);
+    add_vector(topology.faces);
+    add_vector(topology.face_orientations);
+    add_vector(topology.signed_trace_vdofs);
+    add_vector(topology.restriction);
+  }
+  const auto add_mfem_vector = [&add](const mfem::Vector* values)
+  {
+    if (values == nullptr)
+    {
+      add(nullptr, 0, 0);
+      return;
+    }
+    add(values->GetData(), static_cast<std::size_t>(values->Size()),
+        static_cast<std::size_t>(values->Size()));
+  };
+  add_mfem_vector(owner.u.get());
+  add_mfem_vector(owner.sigma.get());
+  add_mfem_vector(owner.z.get());
+  add_mfem_vector(owner.uhat.get());
+  add_mfem_vector(owner.sigmahat.get());
+  add_mfem_vector(owner.carrier.get());
+  add_vector(assembly_state.old_by_element);
+  add_vector(assembly_state.candidate_by_element);
+  add_vector(assembly_state.old_trace_by_element);
+  add_vector(assembly_state.trace_by_element);
+  for (const auto& values : assembly_state.old_by_element)
+  {
+    add_vector(values);
+  }
+  for (const auto& values : assembly_state.candidate_by_element)
+  {
+    add_vector(values);
+  }
+  for (const auto& values : assembly_state.old_trace_by_element)
+  {
+    add_vector(values);
+  }
+  for (const auto& values : assembly_state.trace_by_element)
+  {
+    add_vector(values);
+  }
+  const auto add_assembly = [&add_vector](const CoupledFixtureAssembly& value)
+  {
+    add_vector(value.elements);
+    add_vector(value.full_residual);
+    add_vector(value.full_jacobian);
+    for (const ElementLinearization& block : value.elements)
+    {
+      add_vector(block.a);
+      add_vector(block.b);
+      add_vector(block.c);
+      add_vector(block.d);
+      add_vector(block.local_residual);
+      add_vector(block.trace_residual);
+    }
+  };
+  add_assembly(assembly);
+  add_assembly(trial_assembly);
+  add_vector(elements);
+  for (const RuntimeElementWorkspace& element : elements)
+  {
+    add_object(&element);
+    add_object(&element.factor);
+    add_object(&element.condensed);
+    add_vector(element.factor.values);
+    add_vector(element.factor.pivots);
+    add_vector(element.condensed.schur);
+    add_vector(element.condensed.right_hand_side);
+    add_vector(element.inverse_residual);
+    add_vector(element.inverse_b);
+    add_vector(element.rhs);
+    add_vector(element.solution);
+    add_vector(element.recovery_rhs);
+    add_vector(element.recovered);
+  }
+  add_vector(element_to_true_csr);
+  if (local_pattern)
+  {
+    add(local_pattern->GetI(),
+        static_cast<std::size_t>(local_pattern->Height() + 1),
+        static_cast<std::size_t>(local_pattern->Height() + 1));
+    add(local_pattern->GetJ(),
+        static_cast<std::size_t>(local_pattern->NumNonZeroElems()),
+        static_cast<std::size_t>(local_pattern->NumNonZeroElems()));
+    add(local_pattern->GetData(),
+        static_cast<std::size_t>(local_pattern->NumNonZeroElems()),
+        static_cast<std::size_t>(local_pattern->NumNonZeroElems()));
+  }
+  add(quadrature_workspace.volume_shape.GetData(),
+      quadrature_workspace.volume_shape.Size(),
+      quadrature_workspace.volume_shape.Size());
+  add(quadrature_workspace.volume_derivative.GetData(),
+      static_cast<std::size_t>(quadrature_workspace.volume_derivative.Height()) *
+          quadrature_workspace.volume_derivative.Width(),
+      static_cast<std::size_t>(quadrature_workspace.volume_derivative.Height()) *
+          quadrature_workspace.volume_derivative.Width());
+  add(quadrature_workspace.face_interior_shape.GetData(),
+      quadrature_workspace.face_interior_shape.Size(),
+      quadrature_workspace.face_interior_shape.Size());
+  add(quadrature_workspace.face_trace_shape.GetData(),
+      quadrature_workspace.face_trace_shape.Size(),
+      quadrature_workspace.face_trace_shape.Size());
+  add(quadrature_workspace.face_oriented_shape.GetData(),
+      quadrature_workspace.face_oriented_shape.Size(),
+      quadrature_workspace.face_oriented_shape.Size());
+  add(quadrature_workspace.scaled_normal.GetData(),
+      quadrature_workspace.scaled_normal.Size(),
+      quadrature_workspace.scaled_normal.Size());
+  add(true_residual.GetData(), true_residual.Size(), true_residual.Size());
+  const std::array<std::uint64_t, 6> generations{{
+      snapshot.topology_generation,
+      snapshot.storage_generation,
+      snapshot.factor_generation,
+      snapshot.workspace_generation,
+      snapshot.local_pattern_generation,
+      snapshot.solver_generation}};
+  valid = valid && hash.Update(generations.data(), sizeof(generations));
+  Sha256Digest digest{};
+  if (valid && hash.Finalize(digest))
+  {
+    snapshot.owned_boundary_identity_hash = {digest};
+  }
+  snapshot.w8_owned_boundary_object_count = objects;
+  snapshot.w8_owned_boundary_buffer_count = buffers;
+  return snapshot;
+}
+
+namespace
+{
+
+bool SameReuseSnapshot(const TrajectoryReuseSnapshot& left,
+                       const TrajectoryReuseSnapshot& right) noexcept
+{
+  return left.foundation_handle == right.foundation_handle &&
+      left.topology_handle == right.topology_handle &&
+      left.carrier_map_handle == right.carrier_map_handle &&
+      left.contract_handle == right.contract_handle &&
+      left.assembly_state_handle == right.assembly_state_handle &&
+      left.assembly_handle == right.assembly_handle &&
+      left.trial_assembly_handle == right.trial_assembly_handle &&
+      left.factor_handle == right.factor_handle &&
+      left.workspace_handle == right.workspace_handle &&
+      left.quadrature_workspace_handle == right.quadrature_workspace_handle &&
+      left.local_pattern_handle == right.local_pattern_handle &&
+      left.true_matrix_handle == right.true_matrix_handle &&
+      left.true_rhs_handle == right.true_rhs_handle &&
+      left.true_solution_handle == right.true_solution_handle &&
+      left.ilu_handle == right.ilu_handle &&
+      left.gmres_handle == right.gmres_handle &&
+      left.true_residual_handle == right.true_residual_handle &&
+      left.element_to_true_csr_handle == right.element_to_true_csr_handle &&
+      left.owned_boundary_identity_hash ==
+          right.owned_boundary_identity_hash &&
+      left.topology_generation == right.topology_generation &&
+      left.storage_generation == right.storage_generation &&
+      left.factor_generation == right.factor_generation &&
+      left.workspace_generation == right.workspace_generation &&
+      left.local_pattern_generation == right.local_pattern_generation &&
+      left.solver_generation == right.solver_generation &&
+      left.w8_owned_boundary_object_count ==
+          right.w8_owned_boundary_object_count &&
+      left.w8_owned_boundary_buffer_count ==
+          right.w8_owned_boundary_buffer_count &&
+      !left.opaque_mfem_hypre_observed &&
+      !right.opaque_mfem_hypre_observed;
+}
+
+} // namespace
+
+bool PersistentTrajectoryImplementation::VerifyReuse(
+    const PersistentSc25ScalarIgrCpuFoundation::Implementation& owner)
+    noexcept
+{
+  const TrajectoryReuseSnapshot current = ReuseSnapshot(owner);
+  evidence.reuse.current = current;
+  if (!reuse_baseline_frozen) { return true; }
+  if (!SameReuseSnapshot(evidence.reuse.baseline, current))
+  {
+    ++evidence.reuse.detected_w8_owned_boundary_identity_changes;
+    return false;
+  }
+  return true;
+}
+
+bool PersistentTrajectoryImplementation::InitializeStorage(
+    PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept
+{
+  try
+  {
+    if (owner.config.polynomial_degree != 1 ||
+        owner.config.elements_per_direction !=
+            persistent_elements_per_direction ||
+        owner.mesh->GetNE() != persistent_elements ||
+        owner.mesh->GetNumFaces() != persistent_unique_faces ||
+        owner.carrier_space->GetTrueVSize() !=
+            persistent_true_trace_unknowns ||
+        owner.topology.size() != persistent_elements)
+    {
+      return false;
+    }
+    const auto initialize_state = [](CoupledFixtureState& state)
+    {
+      state.old_by_element.resize(persistent_elements);
+      state.candidate_by_element.resize(persistent_elements);
+      state.old_trace_by_element.resize(persistent_elements);
+      state.trace_by_element.resize(persistent_elements);
+      for (int element = 0; element < persistent_elements; ++element)
+      {
+        state.old_by_element[static_cast<std::size_t>(element)].assign(
+            coupled_fixture_local_interior_unknowns, 0.0);
+        state.candidate_by_element[static_cast<std::size_t>(element)].assign(
+            coupled_fixture_local_interior_unknowns, 0.0);
+        state.old_trace_by_element[static_cast<std::size_t>(element)].assign(
+            coupled_fixture_local_trace_unknowns, 0.0);
+        state.trace_by_element[static_cast<std::size_t>(element)].assign(
+            coupled_fixture_local_trace_unknowns, 0.0);
+      }
+    };
+    initialize_state(assembly_state);
+    const auto initialize_assembly = [](CoupledFixtureAssembly& value)
+    {
+      value.elements.resize(persistent_elements);
+      value.full_residual.assign(persistent_full_unknowns, 0.0);
+      for (int element = 0; element < persistent_elements; ++element)
+      {
+        ElementLinearization& block =
+            value.elements[static_cast<std::size_t>(element)];
+        block.element = element;
+        block.local_interior_unknowns =
+            coupled_fixture_local_interior_unknowns;
+        block.local_trace_unknowns = coupled_fixture_local_trace_unknowns;
+        block.a.assign(
+            static_cast<std::size_t>(coupled_fixture_local_interior_unknowns) *
+                coupled_fixture_local_interior_unknowns,
+            0.0);
+        block.b.assign(
+            static_cast<std::size_t>(coupled_fixture_local_interior_unknowns) *
+                coupled_fixture_local_trace_unknowns,
+            0.0);
+        block.c.assign(
+            static_cast<std::size_t>(coupled_fixture_local_trace_unknowns) *
+                coupled_fixture_local_interior_unknowns,
+            0.0);
+        block.d.assign(
+            static_cast<std::size_t>(coupled_fixture_local_trace_unknowns) *
+                coupled_fixture_local_trace_unknowns,
+            0.0);
+        block.local_residual.assign(
+            coupled_fixture_local_interior_unknowns, 0.0);
+        block.trace_residual.assign(coupled_fixture_local_trace_unknowns,
+                                    0.0);
+      }
+    };
+    initialize_assembly(assembly);
+    initialize_assembly(trial_assembly);
+    elements.resize(persistent_elements);
+    for (int element = 0; element < persistent_elements; ++element)
+    {
+      elements[static_cast<std::size_t>(element)].Initialize(element);
+    }
+    element_to_true_csr.assign(
+        static_cast<std::size_t>(persistent_elements) *
+            coupled_fixture_local_trace_unknowns *
+            coupled_fixture_local_trace_unknowns,
+        -1);
+    true_residual.SetSize(persistent_true_trace_unknowns);
+    return true;
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+bool PersistentTrajectoryImplementation::LoadAssemblyState(
+    const PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+    const TrajectorySlot& old_state,
+    const TrajectorySlot& candidate) noexcept
+{
+  constexpr int ns = persistent_scalar_volume_nodes;
+  constexpr int ni = coupled_fixture_local_interior_unknowns;
+  constexpr int nt = coupled_fixture_local_trace_unknowns;
+  try
+  {
+    for (int element = 0; element < persistent_elements; ++element)
+    {
+      std::vector<double>& old =
+          assembly_state.old_by_element[static_cast<std::size_t>(element)];
+      std::vector<double>& current = assembly_state.candidate_by_element[
+          static_cast<std::size_t>(element)];
+      const std::size_t u_base =
+          static_cast<std::size_t>(element) * state_components * ns;
+      const std::size_t sigma_base =
+          static_cast<std::size_t>(element) * ns;
+      const std::size_t z_base =
+          static_cast<std::size_t>(element) * flux_components * ns;
+      std::copy_n(old_state.interior.u.begin() + u_base,
+                  state_components * ns, old.begin());
+      std::copy_n(candidate.interior.u.begin() + u_base,
+                  state_components * ns, current.begin());
+      std::copy_n(old_state.interior.sigma.begin() + sigma_base, ns,
+                  old.begin() + state_components * ns);
+      std::copy_n(candidate.interior.sigma.begin() + sigma_base, ns,
+                  current.begin() + state_components * ns);
+      std::copy_n(old_state.interior.z.begin() + z_base,
+                  flux_components * ns,
+                  old.begin() + (state_components + 1) * ns);
+      std::copy_n(candidate.interior.z.begin() + z_base,
+                  flux_components * ns,
+                  current.begin() + (state_components + 1) * ns);
+      if (old.size() != ni || current.size() != ni) { return false; }
+
+      std::vector<double>& old_trace = assembly_state.old_trace_by_element[
+          static_cast<std::size_t>(element)];
+      std::vector<double>& trace = assembly_state.trace_by_element[
+          static_cast<std::size_t>(element)];
+      const ElementTopology& topology =
+          owner.topology[static_cast<std::size_t>(element)];
+      if (topology.restriction.size() != nt) { return false; }
+      for (int row = 0; row < nt; ++row)
+      {
+        const TraceRestrictionEntry& entry =
+            topology.restriction[static_cast<std::size_t>(row)];
+        const int true_dof = entry.local_true_dof;
+        if (true_dof < 0 || true_dof >= persistent_true_trace_unknowns ||
+            (entry.sign != 1 && entry.sign != -1))
+        {
+          return false;
+        }
+        const auto trace_value = [true_dof](const TrajectorySlot& slot)
+        {
+          return true_dof < persistent_uhat_unknowns
+              ? slot.trace.uhat[static_cast<std::size_t>(true_dof)]
+              : slot.trace.sigmahat[static_cast<std::size_t>(
+                    true_dof - persistent_uhat_unknowns)];
+        };
+        old_trace[static_cast<std::size_t>(row)] =
+            entry.sign * trace_value(old_state);
+        trace[static_cast<std::size_t>(row)] =
+            entry.sign * trace_value(candidate);
+      }
+    }
+    return true;
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+TrajectoryAssemblyFailureCause PersistentTrajectoryImplementation::Assemble(
+    PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+    const TrajectorySlot& old_state, const TrajectorySlot& candidate,
+    CoupledFixtureAssembly& output) noexcept
+{
+  diagnostic.Begin("C2-MFEM-PERSISTENT-N8-R1-01",
+                   "persistent-assembly", "load-state");
+  if (!LoadAssemblyState(owner, old_state, candidate))
+  {
+    diagnostic.LatchFailure();
+    return TrajectoryAssemblyFailureCause::invalid_structure;
+  }
+  if (!AssembleCoupledFixture(
+          *owner.mesh, *owner.sigma_space, *owner.carrier_space,
+          *owner.trace_collection, owner.topology, assembly_state,
+          coupled_fixture_quadrature_order, persistent_dt, false, output,
+          quadrature_workspace, "persistent-assembly", diagnostic))
+  {
+    const TrajectoryAssemblyFailureCause cause = diagnostic.failure_cause;
+    diagnostic.LatchFailure();
+    return cause;
+  }
+  if (output.elements.size() != persistent_elements ||
+      output.full_residual.size() != persistent_full_unknowns)
+  {
+    diagnostic.Set("persistent-assembly", "output-shape");
+    diagnostic.LatchFailure();
+    return TrajectoryAssemblyFailureCause::invalid_structure;
+  }
+  diagnostic.CompleteAttempt();
+  return TrajectoryAssemblyFailureCause::none;
+}
+
+bool PersistentTrajectoryImplementation::InitializePhysicalState(
+    PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+    TrajectorySlot& state) noexcept
+{
+  try
+  {
+    constexpr int ns = persistent_scalar_volume_nodes;
+    constexpr int nf = coupled_fixture_scalar_face_nodes;
+    constexpr int order = coupled_fixture_quadrature_order;
+    state = {};
+    *owner.u = 0.0;
+    for (int element = 0; element < persistent_elements; ++element)
+    {
+      const mfem::FiniteElement* finite_element =
+          owner.u_space->GetFE(element);
+      mfem::ElementTransformation* element_transformation =
+          owner.mesh->GetElementTransformation(element);
+      if (!finite_element || !element_transformation ||
+          finite_element->GetDof() != ns)
+      {
+        return false;
+      }
+      std::vector<double> mass(static_cast<std::size_t>(ns) * ns, 0.0);
+      std::array<std::vector<double>, state_components> rhs;
+      for (auto& values : rhs) { values.assign(ns, 0.0); }
+      mfem::Vector shape(ns), point(dimension);
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), order);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& ip = rule.IntPoint(q);
+        element_transformation->SetIntPoint(&ip);
+        finite_element->CalcShape(ip, shape);
+        element_transformation->Transform(ip, point);
+        const InitialStatePoint value = SmoothInitialState(point[0], point[1]);
+        const double weight = ip.weight * element_transformation->Weight();
+        for (int row = 0; row < ns; ++row)
+        {
+          for (int column = 0; column < ns; ++column)
+          {
+            mass[static_cast<std::size_t>(row) * ns + column] +=
+                weight * shape[row] * shape[column];
+          }
+          for (int component = 0; component < state_components; ++component)
+          {
+            rhs[static_cast<std::size_t>(component)]
+               [static_cast<std::size_t>(row)] +=
+                weight * shape[row] * value.conservative[component];
+          }
+        }
+      }
+      DenseLu factor;
+      if (!factor.Factor(mass, ns)) { return false; }
+      mfem::Vector local(state_components * ns);
+      for (int component = 0; component < state_components; ++component)
+      {
+        std::vector<double> coefficients;
+        if (!factor.Solve(rhs[static_cast<std::size_t>(component)],
+                          coefficients))
+        {
+          return false;
+        }
+        for (int scalar = 0; scalar < ns; ++scalar)
+        {
+          const double coefficient = coefficients[static_cast<std::size_t>(scalar)];
+          state.interior.u[
+              static_cast<std::size_t>(element) * state_components * ns +
+              static_cast<std::size_t>(component) * ns + scalar] = coefficient;
+          local[component * ns + scalar] = coefficient;
+        }
+      }
+      mfem::Array<int> vdofs;
+      mfem::DofTransformation transformation(
+          owner.u_space->GetVDim(), owner.u_space->GetOrdering());
+      owner.u_space->GetElementVDofs(element, vdofs, transformation);
+      if (vdofs.Size() != state_components * ns)
+      {
+        return false;
+      }
+      transformation.TransformPrimal(local);
+      owner.u->SetSubVector(vdofs, local);
+    }
+
+    *owner.uhat = 0.0;
+    std::array<std::uint8_t, persistent_uhat_unknowns> assigned{};
+    for (int face = 0; face < owner.mesh->GetNumFaces(); ++face)
+    {
+      const mfem::FiniteElement* finite_element =
+          owner.uhat_space->GetFaceElement(face);
+      mfem::ElementTransformation* face_transformation =
+          owner.mesh->GetFaceTransformation(face);
+      mfem::Array<int> vdofs;
+      owner.uhat_space->GetFaceVDofs(face, vdofs);
+      if (!finite_element || !face_transformation ||
+          finite_element->GetDof() != nf ||
+          vdofs.Size() != state_components * nf)
+      {
+        return false;
+      }
+      std::vector<double> mass(static_cast<std::size_t>(nf) * nf, 0.0);
+      std::array<std::vector<double>, state_components> rhs;
+      for (auto& values : rhs) { values.assign(nf, 0.0); }
+      mfem::Vector shape(nf), point(dimension);
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), order);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& ip = rule.IntPoint(q);
+        face_transformation->SetIntPoint(&ip);
+        finite_element->CalcShape(ip, shape);
+        face_transformation->Transform(ip, point);
+        const InitialStatePoint value = SmoothInitialState(point[0], point[1]);
+        const double weight = ip.weight * face_transformation->Weight();
+        for (int row = 0; row < nf; ++row)
+        {
+          for (int column = 0; column < nf; ++column)
+          {
+            mass[static_cast<std::size_t>(row) * nf + column] +=
+                weight * shape[row] * shape[column];
+          }
+          for (int component = 0; component < state_components; ++component)
+          {
+            rhs[static_cast<std::size_t>(component)]
+               [static_cast<std::size_t>(row)] +=
+                weight * shape[row] * value.conservative[component];
+          }
+        }
+      }
+      DenseLu factor;
+      if (!factor.Factor(mass, nf)) { return false; }
+      for (int component = 0; component < state_components; ++component)
+      {
+        std::vector<double> coefficients;
+        if (!factor.Solve(rhs[static_cast<std::size_t>(component)],
+                          coefficients))
+        {
+          return false;
+        }
+        for (int scalar = 0; scalar < nf; ++scalar)
+        {
+          int sign = 0;
+          const int dof = DecodeSignedDof(vdofs[component * nf + scalar], sign);
+          const int true_dof = dof >= 0 ?
+              owner.uhat_space->GetLocalTDofNumber(dof) : -1;
+          if (dof < 0 || dof >= owner.uhat->Size() || true_dof < 0 ||
+              true_dof >= persistent_uhat_unknowns || sign == 0)
+          {
+            return false;
+          }
+          const double true_value =
+              sign * coefficients[static_cast<std::size_t>(scalar)];
+          if (assigned[static_cast<std::size_t>(true_dof)] != 0 &&
+              state.trace.uhat[static_cast<std::size_t>(true_dof)] !=
+                  true_value)
+          {
+            return false;
+          }
+          state.trace.uhat[static_cast<std::size_t>(true_dof)] = true_value;
+          assigned[static_cast<std::size_t>(true_dof)] = 1;
+          (*owner.uhat)[dof] =
+              state.trace.uhat[static_cast<std::size_t>(true_dof)];
+        }
+      }
+    }
+    if (!std::all_of(assigned.begin(), assigned.end(),
+                     [](const std::uint8_t value) { return value == 1; }))
+    {
+      return false;
+    }
+    state.interior.sigma.fill(0.0);
+    state.interior.z.fill(0.0);
+    state.trace.sigmahat.fill(0.0);
+    return std::all_of(state.interior.u.begin(), state.interior.u.end(),
+                       [](const double value) { return Finite(value); }) &&
+        std::all_of(state.trace.uhat.begin(), state.trace.uhat.end(),
+                    [](const double value) { return Finite(value); });
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+bool PersistentTrajectoryImplementation::BuildPersistentTraceGraph(
+    PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept
+{
+  try
+  {
+    local_pattern =
+        std::make_unique<mfem::SparseMatrix>(owner.carrier_space->GetVSize());
+    mfem::DenseMatrix seed(coupled_fixture_local_trace_unknowns);
+    for (int row = 0; row < seed.Height(); ++row)
+      for (int column = 0; column < seed.Width(); ++column)
+      {
+        seed(row, column) = 1.0 +
+            1.0e-7 * static_cast<double>(row + 41 * column + 1);
+      }
+    for (const ElementTopology& topology : owner.topology)
+    {
+      mfem::Array<int> signed_dofs(coupled_fixture_local_trace_unknowns);
+      for (int row = 0; row < signed_dofs.Size(); ++row)
+      {
+        signed_dofs[row] = topology.signed_trace_vdofs[
+            static_cast<std::size_t>(row)];
+      }
+      local_pattern->AddSubMatrix(signed_dofs, signed_dofs, seed, 1);
+    }
+    local_pattern->Finalize();
+    mfem::ParBilinearForm form(owner.carrier_space.get());
+    true_matrix.reset(form.ParallelAssemble(local_pattern.get()));
+    if (!true_matrix || true_matrix->Height() !=
+                            persistent_true_trace_unknowns ||
+        true_matrix->Width() != persistent_true_trace_unknowns ||
+        true_matrix->GetGlobalNumRows() != persistent_true_trace_unknowns)
+    {
+      return false;
+    }
+    const int rows = persistent_true_trace_unknowns;
+    const int nonzeros = static_cast<int>(
+        true_matrix->GetDiagMemoryData().Capacity());
+    const HYPRE_Int* offsets = true_matrix->GetDiagMemoryI().Read(
+        mfem::MemoryClass::HOST, rows + 1);
+    const HYPRE_Int* columns = true_matrix->GetDiagMemoryJ().Read(
+        mfem::MemoryClass::HOST, nonzeros);
+    if (offsets == nullptr || columns == nullptr || nonzeros <= 0)
+    {
+      return false;
+    }
+    for (int element = 0; element < persistent_elements; ++element)
+    {
+      const ElementTopology& topology =
+          owner.topology[static_cast<std::size_t>(element)];
+      for (int row = 0; row < coupled_fixture_local_trace_unknowns; ++row)
+        for (int column = 0; column < coupled_fixture_local_trace_unknowns;
+             ++column)
+        {
+          const int true_row = topology.restriction[
+              static_cast<std::size_t>(row)].local_true_dof;
+          const int true_column = topology.restriction[
+              static_cast<std::size_t>(column)].local_true_dof;
+          int found = -1;
+          for (int entry = offsets[true_row]; entry < offsets[true_row + 1];
+               ++entry)
+          {
+            if (columns[entry] == true_column)
+            {
+              found = entry;
+              break;
+            }
+          }
+          if (found < 0) { return false; }
+          element_to_true_csr[
+              (static_cast<std::size_t>(element) *
+                   coupled_fixture_local_trace_unknowns + row) *
+                  coupled_fixture_local_trace_unknowns +
+              column] = found;
+        }
+    }
+    true_matrix->HypreReadWrite();
+    double* data = true_matrix->GetDiagMemoryData().ReadWrite(
+        mfem::MemoryClass::HOST, nonzeros);
+    std::fill(data, data + nonzeros, 0.0);
+    true_rhs = std::make_unique<mfem::HypreParVector>(
+        owner.carrier_space.get());
+    true_solution = std::make_unique<mfem::HypreParVector>(
+        owner.carrier_space.get());
+    *true_rhs = 0.0;
+    *true_solution = 0.0;
+    ilu = std::make_unique<mfem::HypreILU>();
+    gmres = std::make_unique<mfem::HypreGMRES>(owner.communicator.value);
+    ConfigureCoupledIlu(*ilu);
+    gmres->SetTol(1.0e-12);
+    gmres->SetAbsTol(1.0e-14);
+    gmres->SetMaxIter(persistent_trace_maximum_iterations);
+    gmres->SetKDim(persistent_trace_restart_dimension);
+    gmres->SetLogging(1);
+    gmres->SetPrintLevel(0);
+    gmres->SetZeroInitialIterate();
+    gmres->SetPreconditioner(*ilu);
+    gmres->SetOperator(*true_matrix);
+    ConfigureCoupledIlu(*ilu);
+
+    evidence.trace_restart_dimension = persistent_trace_restart_dimension;
+    evidence.trace_maximum_iterations = persistent_trace_maximum_iterations;
+    evidence.trace_relative_tolerance = 1.0e-12;
+    evidence.trace_absolute_tolerance = 1.0e-14;
+    evidence.ilu_type = 0;
+    evidence.ilu_level_of_fill = 0;
+    evidence.ilu_local_reordering = 1;
+    evidence.reuse.true_matrix_nonzeros =
+        static_cast<std::size_t>(nonzeros);
+    evidence.reuse.opaque_mfem_hypre_observed = false;
+    return true;
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+bool PersistentTrajectoryImplementation::InitializeAuxiliary(
+    PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+    TrajectorySlot& state) noexcept
+{
+  try
+  {
+    constexpr int full_ni = coupled_fixture_local_interior_unknowns;
+    constexpr int full_nt = coupled_fixture_local_trace_unknowns;
+    constexpr int aux_ni = 12;
+    constexpr int aux_nt = 8;
+    const TrajectoryStateHashes physical_hashes = HashState(state);
+    if (!true_matrix || !true_rhs || !true_solution || !ilu || !gmres)
+    {
+      return false;
+    }
+    const TrajectoryAssemblyFailureCause assembly_failure =
+        Assemble(owner, state, state, assembly);
+    if (assembly_failure != TrajectoryAssemblyFailureCause::none)
+    {
+      RecordAssemblyFailure(assembly_failure);
+      return false;
+    }
+    for (int element = 0; element < persistent_elements; ++element)
+    {
+      ElementLinearization& target =
+          assembly.elements[static_cast<std::size_t>(element)];
+      std::array<double, aux_ni * aux_ni> aux_a{};
+      std::array<double, aux_ni * aux_nt> aux_b{};
+      std::array<double, aux_nt * aux_ni> aux_c{};
+      std::array<double, aux_nt * aux_nt> aux_d{};
+      std::array<double, aux_ni> aux_local_residual{};
+      std::array<double, aux_nt> aux_trace_residual{};
+      for (int row = 0; row < aux_ni; ++row)
+      {
+        aux_local_residual[static_cast<std::size_t>(row)] =
+            target.local_residual[static_cast<std::size_t>(16 + row)];
+        for (int column = 0; column < aux_ni; ++column)
+        {
+          aux_a[static_cast<std::size_t>(row) * aux_ni + column] =
+              target.a[static_cast<std::size_t>(16 + row) * full_ni +
+                       16 + column];
+        }
+        for (int column = 0; column < aux_nt; ++column)
+        {
+          aux_b[static_cast<std::size_t>(row) * aux_nt + column] =
+              target.b[static_cast<std::size_t>(16 + row) * full_nt +
+                       32 + column];
+        }
+      }
+      for (int row = 0; row < aux_nt; ++row)
+      {
+        aux_trace_residual[static_cast<std::size_t>(row)] =
+            target.trace_residual[static_cast<std::size_t>(32 + row)];
+        for (int column = 0; column < aux_ni; ++column)
+        {
+          aux_c[static_cast<std::size_t>(row) * aux_ni + column] =
+              target.c[static_cast<std::size_t>(32 + row) * full_ni +
+                       16 + column];
+        }
+        for (int column = 0; column < aux_nt; ++column)
+        {
+          aux_d[static_cast<std::size_t>(row) * aux_nt + column] =
+              target.d[static_cast<std::size_t>(32 + row) * full_nt +
+                       32 + column];
+        }
+      }
+      std::fill(target.a.begin(), target.a.end(), 0.0);
+      std::fill(target.b.begin(), target.b.end(), 0.0);
+      std::fill(target.c.begin(), target.c.end(), 0.0);
+      std::fill(target.d.begin(), target.d.end(), 0.0);
+      std::fill(target.local_residual.begin(),
+                target.local_residual.end(), 0.0);
+      std::fill(target.trace_residual.begin(),
+                target.trace_residual.end(), 0.0);
+      for (int row = 0; row < 16; ++row)
+      {
+        target.a[static_cast<std::size_t>(row) * full_ni + row] = 1.0;
+      }
+      for (int row = 0; row < 32; ++row)
+      {
+        target.d[static_cast<std::size_t>(row) * full_nt + row] = 1.0;
+      }
+      for (int row = 0; row < aux_ni; ++row)
+      {
+        target.local_residual[static_cast<std::size_t>(16 + row)] =
+            aux_local_residual[static_cast<std::size_t>(row)];
+        for (int column = 0; column < aux_ni; ++column)
+        {
+          target.a[static_cast<std::size_t>(16 + row) * full_ni +
+                   16 + column] =
+              aux_a[static_cast<std::size_t>(row) * aux_ni + column];
+        }
+        for (int column = 0; column < aux_nt; ++column)
+        {
+          target.b[static_cast<std::size_t>(16 + row) * full_nt +
+                   32 + column] =
+              aux_b[static_cast<std::size_t>(row) * aux_nt + column];
+        }
+      }
+      for (int row = 0; row < aux_nt; ++row)
+      {
+        target.trace_residual[static_cast<std::size_t>(32 + row)] =
+            aux_trace_residual[static_cast<std::size_t>(row)];
+        for (int column = 0; column < aux_ni; ++column)
+        {
+          target.c[static_cast<std::size_t>(32 + row) * full_ni +
+                   16 + column] =
+              aux_c[static_cast<std::size_t>(row) * aux_ni + column];
+        }
+        for (int column = 0; column < aux_nt; ++column)
+        {
+          target.d[static_cast<std::size_t>(32 + row) * full_nt +
+                   32 + column] =
+              aux_d[static_cast<std::size_t>(row) * aux_nt + column];
+        }
+      }
+    }
+    double maximum_local_residual = 0.0;
+    int trace_iterations = -1;
+    double trace_residual_norm = 0.0;
+    double trace_rhs_norm = 0.0;
+    PersistentTrajectoryState direction;
+    if (!Condense(assembly, maximum_local_residual) ||
+        !AssembleTrueSystem(owner) ||
+        !SolveTrueSystem(trace_iterations, trace_residual_norm,
+                         trace_rhs_norm) ||
+        !Recover(owner, assembly, direction, maximum_local_residual))
+    {
+      return false;
+    }
+    const TrajectorySlot solved = ApplyDirection(state, direction, 1.0);
+    if (HashArrays(solved.interior.u) != physical_hashes.u ||
+        HashArrays(solved.trace.uhat) != physical_hashes.uhat)
+    {
+      return false;
+    }
+    state = solved;
+    AuxiliaryResidualMetrics residual;
+    if (!AuxiliaryResidualGate(owner, state, residual) ||
+        residual.normalized_maximum > 1.0e-10)
+    {
+      return false;
+    }
+    evidence.initialization = {
+        coupled_fixture_quadrature_order,
+        persistent_trace_restart_dimension,
+        persistent_trace_maximum_iterations,
+        1.0e-12,
+        1.0e-14,
+        0,
+        0,
+        1,
+        trace_iterations,
+        trace_residual_norm,
+        trace_rhs_norm,
+        residual};
+    return true;
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+bool PersistentTrajectoryImplementation::Condense(
+    const CoupledFixtureAssembly& system,
+    double& maximum_residual) noexcept
+{
+  constexpr int ni = coupled_fixture_local_interior_unknowns;
+  constexpr int nt = coupled_fixture_local_trace_unknowns;
+  maximum_residual = 0.0;
+  if (system.elements.size() != persistent_elements) { return false; }
+  for (int element = 0; element < persistent_elements; ++element)
+  {
+    const ElementLinearization& block =
+        system.elements[static_cast<std::size_t>(element)];
+    RuntimeElementWorkspace& workspace =
+        elements[static_cast<std::size_t>(element)];
+    if (!workspace.factor.Factor(block.a, ni) ||
+        !workspace.factor.Solve(block.local_residual,
+                                workspace.inverse_residual))
+    {
+      return false;
+    }
+    double residual = ApplicationResidual(
+        block.a, ni, workspace.inverse_residual, block.local_residual);
+    maximum_residual = std::max(maximum_residual, residual);
+    if (residual > local_absolute_tolerance +
+            local_relative_tolerance * VectorNorm(block.local_residual))
+    {
+      return false;
+    }
+    for (int trace_column = 0; trace_column < nt; ++trace_column)
+    {
+      for (int row = 0; row < ni; ++row)
+      {
+        workspace.rhs[static_cast<std::size_t>(row)] = block.b[
+            static_cast<std::size_t>(row) * nt + trace_column];
+      }
+      if (!workspace.factor.Solve(workspace.rhs, workspace.solution))
+      {
+        return false;
+      }
+      residual = ApplicationResidual(
+          block.a, ni, workspace.solution, workspace.rhs);
+      maximum_residual = std::max(maximum_residual, residual);
+      if (residual > local_absolute_tolerance +
+              local_relative_tolerance * VectorNorm(workspace.rhs))
+      {
+        return false;
+      }
+      for (int row = 0; row < ni; ++row)
+      {
+        workspace.inverse_b[static_cast<std::size_t>(row) * nt +
+                            trace_column] =
+            workspace.solution[static_cast<std::size_t>(row)];
+      }
+    }
+    ElementCondensedBlock& result = workspace.condensed;
+    result.maximum_local_application_residual = maximum_residual;
+    std::fill(result.schur.begin(), result.schur.end(), 0.0);
+    std::fill(result.right_hand_side.begin(),
+              result.right_hand_side.end(), 0.0);
+    for (int row = 0; row < nt; ++row)
+    {
+      double c_inverse_r = 0.0;
+      for (int inner = 0; inner < ni; ++inner)
+      {
+        c_inverse_r +=
+            block.c[static_cast<std::size_t>(row) * ni + inner] *
+            workspace.inverse_residual[static_cast<std::size_t>(inner)];
+      }
+      result.right_hand_side[static_cast<std::size_t>(row)] =
+          -block.trace_residual[static_cast<std::size_t>(row)] + c_inverse_r;
+      for (int column = 0; column < nt; ++column)
+      {
+        double value = block.d[static_cast<std::size_t>(row) * nt + column];
+        for (int inner = 0; inner < ni; ++inner)
+        {
+          value -= block.c[static_cast<std::size_t>(row) * ni + inner] *
+              workspace.inverse_b[static_cast<std::size_t>(inner) * nt +
+                                  column];
+        }
+        result.schur[static_cast<std::size_t>(row) * nt + column] = value;
+      }
+    }
+    if (!Finite(result.schur) || !Finite(result.right_hand_side))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool PersistentTrajectoryImplementation::AssembleTrueSystem(
+    PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept
+{
+  constexpr int nt = coupled_fixture_local_trace_unknowns;
+  if (!true_matrix || !true_rhs ||
+      owner.topology.size() != persistent_elements)
+  {
+    return false;
+  }
+  try
+  {
+    const int nonzeros = static_cast<int>(
+        true_matrix->GetDiagMemoryData().Capacity());
+    true_matrix->HypreReadWrite();
+    double* matrix_data = true_matrix->GetDiagMemoryData().ReadWrite(
+        mfem::MemoryClass::HOST, nonzeros);
+    std::fill(matrix_data, matrix_data + nonzeros, 0.0);
+    double* rhs = true_rhs->HostWrite();
+    std::fill(rhs, rhs + persistent_true_trace_unknowns, 0.0);
+    for (int element = 0; element < persistent_elements; ++element)
+    {
+      const ElementTopology& topology =
+          owner.topology[static_cast<std::size_t>(element)];
+      const ElementCondensedBlock& block =
+          elements[static_cast<std::size_t>(element)].condensed;
+      for (int row = 0; row < nt; ++row)
+      {
+        const TraceRestrictionEntry& row_entry = topology.restriction[
+            static_cast<std::size_t>(row)];
+        rhs[row_entry.local_true_dof] += row_entry.sign *
+            block.right_hand_side[static_cast<std::size_t>(row)];
+        for (int column = 0; column < nt; ++column)
+        {
+          const TraceRestrictionEntry& column_entry = topology.restriction[
+              static_cast<std::size_t>(column)];
+          const int csr = element_to_true_csr[
+              (static_cast<std::size_t>(element) * nt + row) * nt + column];
+          if (csr < 0 || csr >= nonzeros) { return false; }
+          matrix_data[csr] += row_entry.sign * column_entry.sign *
+              block.schur[static_cast<std::size_t>(row) * nt + column];
+        }
+      }
+    }
+    ++matrix_generation;
+    return std::all_of(matrix_data, matrix_data + nonzeros,
+                       [](const double value) { return Finite(value); }) &&
+        std::all_of(rhs, rhs + persistent_true_trace_unknowns,
+                    [](const double value) { return Finite(value); });
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+bool PersistentTrajectoryImplementation::SolveTrueSystem(
+    int& iterations, double& residual_norm, double& rhs_norm) noexcept
+{
+  iterations = -1;
+  residual_norm = std::numeric_limits<double>::infinity();
+  rhs_norm = std::numeric_limits<double>::infinity();
+  if (!true_matrix || !true_rhs || !true_solution || !ilu || !gmres)
+  {
+    return false;
+  }
+  try
+  {
+    *true_solution = 0.0;
+    ConfigureCoupledIlu(*ilu);
+    HYPRE_ClearAllErrors();
+    true_rhs->HypreRead();
+    true_solution->HypreReadWrite();
+    const int setup_status = HYPRE_ParCSRGMRESSetup(
+        static_cast<HYPRE_Solver>(*gmres), *true_matrix, *true_rhs,
+        *true_solution);
+    const int solve_status = setup_status == 0
+        ? HYPRE_ParCSRGMRESSolve(static_cast<HYPRE_Solver>(*gmres),
+                                *true_matrix, *true_rhs, *true_solution)
+        : -1;
+    HYPRE_Int converged = 0;
+    const int query_status = HYPRE_GMRESGetConverged(
+        static_cast<HYPRE_Solver>(*gmres), &converged);
+    gmres->GetNumIterations(iterations);
+    true_matrix->Mult(*true_solution, true_residual);
+    true_residual -= *true_rhs;
+    residual_norm = true_residual.Norml2();
+    rhs_norm = true_rhs->Norml2();
+    return setup_status == 0 && solve_status == 0 && query_status == 0 &&
+        converged == 1 && iterations >= 0 &&
+        iterations <= persistent_trace_maximum_iterations &&
+        Finite(residual_norm) && Finite(rhs_norm) &&
+        residual_norm <= 1.0e-14 + 1.0e-12 * rhs_norm;
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+bool PersistentTrajectoryImplementation::Recover(
+    PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+    const CoupledFixtureAssembly& system,
+    PersistentTrajectoryState& direction,
+    double& maximum_residual) noexcept
+{
+  constexpr int ns = persistent_scalar_volume_nodes;
+  constexpr int ni = coupled_fixture_local_interior_unknowns;
+  constexpr int nt = coupled_fixture_local_trace_unknowns;
+  direction = {};
+  if (!true_solution || system.elements.size() != persistent_elements)
+  {
+    return false;
+  }
+  const double* trace_increment = true_solution->HostRead();
+  std::copy_n(trace_increment, persistent_uhat_unknowns,
+              direction.uhat.begin());
+  std::copy_n(trace_increment + persistent_uhat_unknowns,
+              persistent_sigmahat_unknowns, direction.sigmahat.begin());
+  for (int element = 0; element < persistent_elements; ++element)
+  {
+    const ElementLinearization& block =
+        system.elements[static_cast<std::size_t>(element)];
+    RuntimeElementWorkspace& workspace =
+        elements[static_cast<std::size_t>(element)];
+    const ElementTopology& topology =
+        owner.topology[static_cast<std::size_t>(element)];
+    workspace.recovery_rhs = block.local_residual;
+    for (int row = 0; row < ni; ++row)
+      for (int column = 0; column < nt; ++column)
+      {
+        const TraceRestrictionEntry& entry =
+            topology.restriction[static_cast<std::size_t>(column)];
+        workspace.recovery_rhs[static_cast<std::size_t>(row)] +=
+            block.b[static_cast<std::size_t>(row) * nt + column] *
+            entry.sign * trace_increment[entry.local_true_dof];
+      }
+    if (!workspace.factor.Solve(workspace.recovery_rhs,
+                                workspace.recovered))
+    {
+      return false;
+    }
+    const double residual = ApplicationResidual(
+        block.a, ni, workspace.recovered, workspace.recovery_rhs);
+    maximum_residual = std::max(maximum_residual, residual);
+    if (residual > local_absolute_tolerance +
+            local_relative_tolerance * VectorNorm(workspace.recovery_rhs))
+    {
+      return false;
+    }
+    const std::size_t u_base =
+        static_cast<std::size_t>(element) * state_components * ns;
+    const std::size_t sigma_base = static_cast<std::size_t>(element) * ns;
+    const std::size_t z_base =
+        static_cast<std::size_t>(element) * flux_components * ns;
+    for (int entry = 0; entry < state_components * ns; ++entry)
+    {
+      direction.u[u_base + entry] =
+          -workspace.recovered[static_cast<std::size_t>(entry)];
+    }
+    for (int entry = 0; entry < ns; ++entry)
+    {
+      direction.sigma[sigma_base + entry] =
+          -workspace.recovered[static_cast<std::size_t>(16 + entry)];
+    }
+    for (int entry = 0; entry < flux_components * ns; ++entry)
+    {
+      direction.z[z_base + entry] =
+          -workspace.recovered[static_cast<std::size_t>(20 + entry)];
+    }
+  }
+  return true;
+}
+
+bool PersistentTrajectoryImplementation::Integrals(
+    PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+    const TrajectorySlot& state,
+    std::array<double, state_components>& values) noexcept
+{
+  values.fill(0.0);
+  try
+  {
+    constexpr int ns = persistent_scalar_volume_nodes;
+    for (int element = 0; element < persistent_elements; ++element)
+    {
+      const mfem::FiniteElement* finite_element =
+          owner.u_space->GetFE(element);
+      mfem::ElementTransformation* transformation =
+          owner.mesh->GetElementTransformation(element);
+      if (!finite_element || !transformation || finite_element->GetDof() != ns)
+      {
+        return false;
+      }
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), coupled_fixture_quadrature_order);
+      mfem::Vector& shape = quadrature_workspace.volume_shape;
+      const std::size_t base =
+          static_cast<std::size_t>(element) * state_components * ns;
+      for (int point = 0; point < rule.GetNPoints(); ++point)
+      {
+        const mfem::IntegrationPoint& ip = rule.IntPoint(point);
+        transformation->SetIntPoint(&ip);
+        finite_element->CalcShape(ip, shape);
+        const double weight = ip.weight * transformation->Weight();
+        for (int component = 0; component < state_components; ++component)
+          for (int scalar = 0; scalar < ns; ++scalar)
+          {
+            values[component] += weight * shape[scalar] *
+                state.interior.u[
+                    base + static_cast<std::size_t>(component) * ns + scalar];
+          }
+      }
+    }
+    return Finite(values);
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+bool PersistentTrajectoryImplementation::AuxiliaryResidualGate(
+    PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+    const TrajectorySlot& state, AuxiliaryResidualMetrics& metrics) noexcept
+{
+  metrics = {};
+  constexpr int ns = persistent_scalar_volume_nodes;
+  constexpr int nf = coupled_fixture_local_scalar_trace_nodes;
+  constexpr int rz_rows = persistent_elements * flux_components * ns;
+  constexpr int rsigma_rows = persistent_elements * ns;
+  std::array<std::array<double, rz_rows>, 3> rz_terms{};
+  std::array<std::array<double, rsigma_rows>, 4> rsigma_terms{};
+  std::array<double, persistent_sigmahat_unknowns> g_sigma{};
+  double g_sigma_term_norm_sum = 0.0;
+  if (!LoadAssemblyState(owner, state, state)) { return false; }
+  try
+  {
+    for (int element = 0; element < persistent_elements; ++element)
+    {
+      const mfem::FiniteElement* finite_element =
+          owner.sigma_space->GetFE(element);
+      mfem::ElementTransformation* transformation =
+          owner.mesh->GetElementTransformation(element);
+      if (!finite_element || !transformation || finite_element->GetDof() != ns)
+      {
+        return false;
+      }
+      const std::vector<double>& current = assembly_state.candidate_by_element[
+          static_cast<std::size_t>(element)];
+      const std::vector<double>& trace = assembly_state.trace_by_element[
+          static_cast<std::size_t>(element)];
+      const ElementTopology& topology =
+          owner.topology[static_cast<std::size_t>(element)];
+      mfem::Vector& shape = quadrature_workspace.volume_shape;
+      mfem::DenseMatrix& derivative = quadrature_workspace.volume_derivative;
+      const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), coupled_fixture_quadrature_order);
+      for (int point = 0; point < volume_rule.GetNPoints(); ++point)
+      {
+        const mfem::IntegrationPoint& ip = volume_rule.IntPoint(point);
+        transformation->SetIntPoint(&ip);
+        finite_element->CalcShape(ip, shape);
+        finite_element->CalcPhysDShape(*transformation, derivative);
+        State conservative{};
+        std::array<std::array<double, dimension>, state_components>
+            conservative_derivative{};
+        for (int component = 0; component < state_components; ++component)
+        {
+          conservative[component] =
+              EvaluateComponent(current, component, ns, shape);
+          for (int direction = 0; direction < dimension; ++direction)
+          {
+            conservative_derivative[component][direction] =
+                EvaluateDerivative(current, component, ns, derivative,
+                                   direction);
+          }
+        }
+        if (!SampleAdmissible(conservative)) { return false; }
+        const double sigma = EvaluateComponent(current, 4, ns, shape);
+        const std::array<double, dimension> z{{
+            EvaluateComponent(current, 5, ns, shape),
+            EvaluateComponent(current, 6, ns, shape)}};
+        const double rho = conservative[0];
+        std::array<std::array<double, dimension>, dimension> gradient{};
+        for (int direction = 0; direction < dimension; ++direction)
+        {
+          gradient[0][direction] =
+              conservative_derivative[1][direction] / rho -
+              conservative[1] * conservative_derivative[0][direction] /
+                  (rho * rho);
+          gradient[1][direction] =
+              conservative_derivative[2][direction] / rho -
+              conservative[2] * conservative_derivative[0][direction] /
+                  (rho * rho);
+        }
+        const double q = VelocityGradientInvariant(gradient);
+        const double weight = ip.weight * transformation->Weight();
+        if (!Finite(weight) || !(weight > 0.0)) { return false; }
+        for (int scalar = 0; scalar < ns; ++scalar)
+        {
+          for (int direction = 0; direction < dimension; ++direction)
+          {
+            const std::size_t row =
+                static_cast<std::size_t>(element) * flux_components * ns +
+                direction * ns + scalar;
+            rz_terms[0][row] += weight * shape[scalar] * rho * z[direction];
+            rz_terms[1][row] +=
+                weight * derivative(scalar, direction) * sigma;
+          }
+          const std::size_t row =
+              static_cast<std::size_t>(element) * ns + scalar;
+          rsigma_terms[0][row] +=
+              weight * shape[scalar] * sigma / rho;
+          rsigma_terms[1][row] += primary_alpha * weight *
+              (derivative(scalar, 0) * z[0] +
+               derivative(scalar, 1) * z[1]);
+          rsigma_terms[2][row] -=
+              primary_alpha * weight * shape[scalar] * q;
+        }
+      }
+
+      const double element_measure = ElementMeasureAtOrder(
+          *owner.mesh, element, coupled_fixture_quadrature_order);
+      for (int local_face = 0; local_face < faces_per_quadrilateral;
+           ++local_face)
+      {
+        const int face = topology.faces[static_cast<std::size_t>(local_face)];
+        mfem::FaceElementTransformations* face_transformation =
+            owner.mesh->GetFaceElementTransformations(face);
+        const mfem::FiniteElement* trace_element =
+            owner.carrier_space->GetFaceElement(face);
+        if (!face_transformation || !face_transformation->Face ||
+            !trace_element || trace_element->GetDof() != 2)
+        {
+          return false;
+        }
+        const bool element_one = face_transformation->Elem1No == element;
+        if (!element_one && face_transformation->Elem2No != element)
+        {
+          return false;
+        }
+        const int* permutation = owner.trace_collection->DofOrderForOrientation(
+            mfem::Geometry::SEGMENT,
+            topology.face_orientations[static_cast<std::size_t>(local_face)]);
+        const double face_measure = FaceMeasureAtOrder(
+            *owner.mesh, face, coupled_fixture_quadrature_order);
+        const double height = element_measure / face_measure;
+        if (!permutation || !(element_measure > 0.0) ||
+            !(face_measure > 0.0) || !(height > 0.0))
+        {
+          return false;
+        }
+        const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
+            trace_element->GetGeomType(), coupled_fixture_quadrature_order);
+        mfem::Vector& interior_shape =
+            quadrature_workspace.face_interior_shape;
+        mfem::Vector& trace_shape = quadrature_workspace.face_trace_shape;
+        mfem::Vector& oriented_shape =
+            quadrature_workspace.face_oriented_shape;
+        mfem::Vector& scaled = quadrature_workspace.scaled_normal;
+        std::array<double, 2> side_g_sigma{};
+        for (int point = 0; point < face_rule.GetNPoints(); ++point)
+        {
+          const mfem::IntegrationPoint& ip = face_rule.IntPoint(point);
+          face_transformation->SetAllIntPoints(&ip);
+          const mfem::IntegrationPoint& element_ip = element_one ?
+              face_transformation->GetElement1IntPoint() :
+              face_transformation->GetElement2IntPoint();
+          finite_element->CalcShape(element_ip, interior_shape);
+          trace_element->CalcShape(ip, trace_shape);
+          for (int scalar = 0; scalar < 2; ++scalar)
+          {
+            int sign = 0;
+            const int canonical = DecodeSignedDof(permutation[scalar], sign);
+            if (canonical < 0 || canonical >= 2 || sign == 0) { return false; }
+            oriented_shape[scalar] = sign * trace_shape[canonical];
+          }
+          mfem::CalcOrtho(face_transformation->Face->Jacobian(), scaled);
+          const double normal_norm = scaled.Norml2();
+          const double measure = face_transformation->Face->Weight();
+          if (!(normal_norm > 0.0) || !(measure > 0.0)) { return false; }
+          const double side = element_one ? 1.0 : -1.0;
+          const std::array<double, dimension> normal{{
+              side * scaled[0] / normal_norm,
+              side * scaled[1] / normal_norm}};
+          State conservative{}, trace_state{};
+          for (int component = 0; component < state_components; ++component)
+          {
+            conservative[component] =
+                EvaluateComponent(current, component, ns, interior_shape);
+            for (int scalar = 0; scalar < 2; ++scalar)
+            {
+              trace_state[component] += trace[
+                  static_cast<std::size_t>(component) * nf +
+                  local_face * 2 + scalar] * oriented_shape[scalar];
+            }
+          }
+          if (!SampleAdmissible(conservative) ||
+              !SampleAdmissible(trace_state))
+          {
+            return false;
+          }
+          const double sigma =
+              EvaluateComponent(current, 4, ns, interior_shape);
+          const std::array<double, dimension> z{{
+              EvaluateComponent(current, 5, ns, interior_shape),
+              EvaluateComponent(current, 6, ns, interior_shape)}};
+          double sigmahat = 0.0;
+          for (int scalar = 0; scalar < 2; ++scalar)
+          {
+            sigmahat += trace[static_cast<std::size_t>(4) * nf +
+                              local_face * 2 + scalar] *
+                oriented_shape[scalar];
+          }
+          const double tau = 4.0 / (trace_state[0] * height);
+          const double auxiliary_flux = z[0] * normal[0] +
+              z[1] * normal[1] - tau * (sigma - sigmahat);
+          const double weight = ip.weight * measure;
+          if (!Finite(tau) || !(tau > 0.0) || !Finite(auxiliary_flux) ||
+              !Finite(weight))
+          {
+            return false;
+          }
+          for (int scalar = 0; scalar < ns; ++scalar)
+          {
+            for (int direction = 0; direction < dimension; ++direction)
+            {
+              const std::size_t row =
+                  static_cast<std::size_t>(element) * flux_components * ns +
+                  direction * ns + scalar;
+              rz_terms[2][row] -= weight * interior_shape[scalar] *
+                  normal[direction] * sigmahat;
+            }
+            const std::size_t row =
+                static_cast<std::size_t>(element) * ns + scalar;
+            rsigma_terms[3][row] -= primary_alpha * weight *
+                interior_shape[scalar] * auxiliary_flux;
+          }
+          for (int scalar = 0; scalar < 2; ++scalar)
+          {
+            side_g_sigma[static_cast<std::size_t>(scalar)] +=
+                primary_alpha * weight * oriented_shape[scalar] *
+                auxiliary_flux;
+          }
+        }
+        double side_square = 0.0;
+        for (int scalar = 0; scalar < 2; ++scalar)
+        {
+          const TraceRestrictionEntry& entry = topology.restriction[
+              static_cast<std::size_t>(32 + local_face * 2 + scalar)];
+          const int true_dof = entry.local_true_dof - persistent_uhat_unknowns;
+          if (true_dof < 0 || true_dof >= persistent_sigmahat_unknowns)
+          {
+            return false;
+          }
+          const double contribution = entry.sign *
+              side_g_sigma[static_cast<std::size_t>(scalar)];
+          g_sigma[static_cast<std::size_t>(true_dof)] += contribution;
+          side_square += contribution * contribution;
+        }
+        g_sigma_term_norm_sum += std::sqrt(side_square);
+      }
+    }
+
+    const auto term_norm = [](const auto& values)
+    {
+      long double square = 0.0L;
+      for (const double value : values) { square += value * value; }
+      return std::sqrt(static_cast<double>(square));
+    };
+    std::array<double, rz_rows> r_z{};
+    std::array<double, rsigma_rows> r_sigma{};
+    for (std::size_t row = 0; row < r_z.size(); ++row)
+      for (const auto& term : rz_terms) { r_z[row] += term[row]; }
+    for (std::size_t row = 0; row < r_sigma.size(); ++row)
+      for (const auto& term : rsigma_terms) { r_sigma[row] += term[row]; }
+    metrics.r_z_norm = term_norm(r_z);
+    metrics.r_sigma_norm = term_norm(r_sigma);
+    metrics.g_sigma_norm = term_norm(g_sigma);
+    metrics.r_z_scale = 0.0;
+    for (const auto& term : rz_terms)
+    {
+      metrics.r_z_scale += term_norm(term);
+    }
+    metrics.r_z_scale = std::max(1.0, metrics.r_z_scale);
+    metrics.r_sigma_scale = 0.0;
+    for (const auto& term : rsigma_terms)
+    {
+      metrics.r_sigma_scale += term_norm(term);
+    }
+    metrics.r_sigma_scale = std::max(1.0, metrics.r_sigma_scale);
+    metrics.g_sigma_scale = std::max(1.0, g_sigma_term_norm_sum);
+    metrics.normalized_maximum = std::max({
+        metrics.r_z_norm / metrics.r_z_scale,
+        metrics.r_sigma_norm / metrics.r_sigma_scale,
+        metrics.g_sigma_norm / metrics.g_sigma_scale});
+    return Finite(metrics.r_z_norm) && Finite(metrics.r_z_scale) &&
+        Finite(metrics.r_sigma_norm) && Finite(metrics.r_sigma_scale) &&
+        Finite(metrics.g_sigma_norm) && Finite(metrics.g_sigma_scale) &&
+        Finite(metrics.normalized_maximum);
+  }
+  catch (...)
+  {
+    metrics = {};
+    return false;
+  }
+}
+
+namespace
+{
+
+double ResidualNorm(const CoupledFixtureAssembly& assembly) noexcept
+{
+  return VectorNorm(assembly.full_residual);
+}
+
+TrajectorySlot ApplyDirection(const TrajectorySlot& entry,
+                              const PersistentTrajectoryState& direction,
+                              const double theta) noexcept
+{
+  TrajectorySlot result = entry;
+  for (std::size_t i = 0; i < result.interior.u.size(); ++i)
+  {
+    result.interior.u[i] += theta * direction.u[i];
+  }
+  for (std::size_t i = 0; i < result.interior.sigma.size(); ++i)
+  {
+    result.interior.sigma[i] += theta * direction.sigma[i];
+  }
+  for (std::size_t i = 0; i < result.interior.z.size(); ++i)
+  {
+    result.interior.z[i] += theta * direction.z[i];
+  }
+  for (std::size_t i = 0; i < result.trace.uhat.size(); ++i)
+  {
+    result.trace.uhat[i] += theta * direction.uhat[i];
+  }
+  for (std::size_t i = 0; i < result.trace.sigmahat.size(); ++i)
+  {
+    result.trace.sigmahat[i] += theta * direction.sigmahat[i];
+  }
+  return result;
+}
+
+void NodalAdmissibilityMetrics(const TrajectorySlot& state,
+                               double& minimum_density,
+                               double& minimum_pressure,
+                               double& minimum_speed_margin) noexcept
+{
+  minimum_density = std::numeric_limits<double>::infinity();
+  minimum_pressure = std::numeric_limits<double>::infinity();
+  minimum_speed_margin = std::numeric_limits<double>::infinity();
+  constexpr int ns = persistent_scalar_volume_nodes;
+  for (int element = 0; element < persistent_elements; ++element)
+    for (int scalar = 0; scalar < ns; ++scalar)
+    {
+      State conservative{};
+      const std::size_t base =
+          static_cast<std::size_t>(element) * state_components * ns;
+      for (int component = 0; component < state_components; ++component)
+      {
+        conservative[component] = state.interior.u[
+            base + static_cast<std::size_t>(component) * ns + scalar];
+      }
+      double pressure = -std::numeric_limits<double>::infinity();
+      std::array<double, dimension> velocity{};
+      if (!Primitive(conservative, pressure, velocity)) { continue; }
+      const double speed = std::hypot(velocity[0], velocity[1]);
+      const double sound = std::sqrt(gamma * pressure / conservative[0]);
+      minimum_density = std::min(minimum_density, conservative[0]);
+      minimum_pressure = std::min(minimum_pressure, pressure);
+      minimum_speed_margin =
+          std::min(minimum_speed_margin, 2.5 - speed - sound);
+    }
+  for (int scalar = 0; scalar < persistent_scalar_true_trace_nodes; ++scalar)
+  {
+    State conservative{};
+    for (int component = 0; component < state_components; ++component)
+    {
+      conservative[component] = state.trace.uhat[
+          static_cast<std::size_t>(component) *
+              persistent_scalar_true_trace_nodes + scalar];
+    }
+    double pressure = -std::numeric_limits<double>::infinity();
+    std::array<double, dimension> velocity{};
+    if (!Primitive(conservative, pressure, velocity)) { continue; }
+    const double speed = std::hypot(velocity[0], velocity[1]);
+    const double sound = std::sqrt(gamma * pressure / conservative[0]);
+    minimum_density = std::min(minimum_density, conservative[0]);
+    minimum_pressure = std::min(minimum_pressure, pressure);
+    minimum_speed_margin =
+        std::min(minimum_speed_margin, 2.5 - speed - sound);
+  }
+}
+
+FailureReason ContractFailure(const TrajectoryStatus status) noexcept
+{
+  switch (status)
+  {
+    case TrajectoryStatus::HdgSc25InjectedAdmissibilityFailure:
+    case TrajectoryStatus::HdgSc25AdmissibilityFailure:
+      return FailureReason::admissibility_gate;
+    case TrajectoryStatus::HdgSc25NonlinearResidualFailure:
+      return FailureReason::true_residual_gate;
+    case TrajectoryStatus::HdgSc25ConservationFailure:
+      return FailureReason::success_gate;
+    case TrajectoryStatus::HdgSc25PublicationFailure:
+      return FailureReason::publication_precondition;
+    default: return FailureReason::backend_failure;
+  }
+}
+
+bool IsAccepted(const TrajectoryStatus status) noexcept
+{
+  return status == TrajectoryStatus::HdgSc25Accepted ||
+      status == TrajectoryStatus::HdgSc25AcceptedAfterOneRetry;
+}
+
+} // namespace
+
+void PersistentTrajectoryImplementation::RememberFailure(
+    const TrajectoryStatus failure) noexcept
+{
+  if (!IsAccepted(failure) && failure != TrajectoryStatus::ready &&
+      failure != TrajectoryStatus::uninitialized &&
+      first_failure == TrajectoryStatus::uninitialized)
+  {
+    first_failure = failure;
+  }
+}
+
+void PersistentTrajectoryImplementation::RecordAssemblyFailure(
+    const TrajectoryAssemblyFailureCause failure) noexcept
+{
+  if (failure != TrajectoryAssemblyFailureCause::none &&
+      evidence.first_assembly_failure ==
+          TrajectoryAssemblyFailureCause::none)
+  {
+    evidence.first_assembly_failure = failure;
+  }
+  // The typed cause is now owned evidence. It is a handled result, so it must
+  // not survive as destructor-style failure output in an otherwise passing
+  // negative-control or rejected-line-search test.
+  diagnostic.HandleFailure();
+}
+
+void PersistentTrajectoryImplementation::RefreshEvidence() noexcept
+{
+  evidence.status = status;
+  evidence.first_failure = first_failure;
+  if (contract)
+  {
+    evidence.contract_status = contract->status();
+    evidence.contract_last_failure = contract->last_failure();
+    evidence.contract_first_failure = contract->telemetry().first_failure;
+    evidence.coordinates = contract->coordinates();
+  }
+}
+
+TrajectoryStatus PersistentTrajectoryImplementation::ExecuteAttempt(
+    PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+    const BeginOutcome& begin, const TrajectoryFailureInjection injection,
+    TrajectoryAttemptEvidence& attempt) noexcept
+{
+  attempt = {};
+  attempt.injection = injection;
+  attempt.target_step = static_cast<int>(begin.attempt.committed_step + 1);
+  attempt.retry_index = begin.attempt.retry_index;
+  attempt.dt = begin.attempt.dt;
+  attempt.committed_coordinates = {
+      begin.attempt.committed_step * persistent_dt,
+      begin.attempt.committed_step,
+      begin.attempt.committed_generation,
+      begin.attempt.committed_step,
+      begin.attempt.committed_step == 0 ? 0.0 : persistent_dt};
+  attempt.entry_reuse = ReuseSnapshot(owner);
+  if (!begin.started || !contract)
+  {
+    attempt.status = TrajectoryStatus::HdgSc25PublicationFailure;
+    return attempt.status;
+  }
+  TrajectorySlot committed;
+  if (!contract->CopyPublished(contract->Published(), committed))
+  {
+    attempt.status = TrajectoryStatus::HdgSc25PublicationFailure;
+    return attempt.status;
+  }
+  TrajectorySlot candidate = committed;
+  attempt.entry_hashes = HashState(committed);
+  std::array<double, state_components> committed_integrals{};
+  if (!Integrals(owner, committed, committed_integrals))
+  {
+    attempt.status = TrajectoryStatus::HdgSc25ConservationFailure;
+  }
+
+  typename TrajectoryContract::ProductBundle products;
+  bool product_residual = false;
+  bool product_matrix = false;
+  bool product_factor = false;
+  bool product_solution = false;
+  bool converged = false;
+  TrajectoryStatus failure = attempt.status ==
+          TrajectoryStatus::HdgSc25ConservationFailure
+      ? attempt.status
+      : TrajectoryStatus::uninitialized;
+  double entry_norm = 0.0;
+  double final_norm = std::numeric_limits<double>::infinity();
+  double nonlinear_bound = std::numeric_limits<double>::infinity();
+
+  for (int iteration = 0;
+       failure == TrajectoryStatus::uninitialized &&
+           iteration < persistent_newton_maximum_iterations;
+       ++iteration)
+  {
+    const TrajectoryAssemblyFailureCause assembly_failure =
+        Assemble(owner, committed, candidate, assembly);
+    if (assembly_failure != TrajectoryAssemblyFailureCause::none)
+    {
+      RecordAssemblyFailure(assembly_failure);
+      failure = assembly_failure ==
+              TrajectoryAssemblyFailureCause::state_admissibility
+          ? TrajectoryStatus::HdgSc25AdmissibilityFailure
+          : TrajectoryStatus::HdgSc25AssemblyFailure;
+      break;
+    }
+    const double residual_norm = ResidualNorm(assembly);
+    if (!Finite(residual_norm))
+    {
+      failure = TrajectoryStatus::HdgSc25NonlinearResidualFailure;
+      break;
+    }
+    attempt.attempted_newton_iterations = iteration + 1;
+    if (iteration == 0)
+    {
+      entry_norm = residual_norm;
+      nonlinear_bound = 1.0e-12 + 1.0e-10 * entry_norm;
+      products.residual = contract->IssueProduct<
+          DerivedProductKind::residual>(begin.attempt);
+      product_residual = products.residual.has_value();
+      if (!product_residual)
+      {
+        failure = TrajectoryStatus::HdgSc25PublicationFailure;
+        break;
+      }
+    }
+    final_norm = residual_norm;
+    if (residual_norm <= nonlinear_bound)
+    {
+      converged = true;
+      attempt.newton_iterations = iteration;
+      break;
+    }
+    if (iteration == 0 &&
+        injection == TrajectoryFailureInjection::newton_iteration_limit)
+    {
+      attempt.attempted_newton_iterations =
+          persistent_newton_maximum_iterations;
+      attempt.newton_iterations = 0;
+      failure = TrajectoryStatus::HdgSc25InjectedNewtonIterationLimit;
+      break;
+    }
+    if (!product_matrix)
+    {
+      products.matrix = contract->IssueProduct<DerivedProductKind::matrix>(
+          begin.attempt);
+      product_matrix = products.matrix.has_value();
+      if (!product_matrix)
+      {
+        failure = TrajectoryStatus::HdgSc25PublicationFailure;
+        break;
+      }
+    }
+    if (iteration == 0 &&
+        injection == TrajectoryFailureInjection::local_factor)
+    {
+      failure = TrajectoryStatus::HdgSc25InjectedLocalFactorFailure;
+      break;
+    }
+    double maximum_local_residual = 0.0;
+    if (!Condense(assembly, maximum_local_residual))
+    {
+      failure = TrajectoryStatus::HdgSc25LocalFactorFailure;
+      break;
+    }
+    if (!product_factor)
+    {
+      products.factor = contract->IssueProduct<DerivedProductKind::factor>(
+          begin.attempt);
+      product_factor = products.factor.has_value();
+      if (!product_factor)
+      {
+        failure = TrajectoryStatus::HdgSc25PublicationFailure;
+        break;
+      }
+    }
+    if (!AssembleTrueSystem(owner))
+    {
+      failure = TrajectoryStatus::HdgSc25TraceLinearFailure;
+      break;
+    }
+    if (iteration == 0 &&
+        injection == TrajectoryFailureInjection::trace_linear)
+    {
+      failure = TrajectoryStatus::HdgSc25InjectedTraceLinearFailure;
+      break;
+    }
+    int trace_iterations = -1;
+    double trace_residual_norm = 0.0;
+    double trace_rhs_norm = 0.0;
+    if (!SolveTrueSystem(trace_iterations, trace_residual_norm,
+                         trace_rhs_norm))
+    {
+      failure = TrajectoryStatus::HdgSc25TraceLinearFailure;
+      break;
+    }
+    PersistentTrajectoryState direction;
+    if (!Recover(owner, assembly, direction, maximum_local_residual))
+    {
+      failure = TrajectoryStatus::HdgSc25LocalFactorFailure;
+      break;
+    }
+    if (!product_solution)
+    {
+      products.solution = contract->IssueProduct<
+          DerivedProductKind::solution>(begin.attempt);
+      product_solution = products.solution.has_value();
+      if (!product_solution)
+      {
+        failure = TrajectoryStatus::HdgSc25PublicationFailure;
+        break;
+      }
+    }
+
+    TrajectoryNewtonEvidence& newton =
+        attempt.newton[static_cast<std::size_t>(iteration)];
+    newton.iteration = iteration;
+    newton.entry_residual_norm = residual_norm;
+    newton.trace_iterations = trace_iterations;
+    newton.trace_true_residual_norm = trace_residual_norm;
+    newton.trace_right_hand_side_norm = trace_rhs_norm;
+    newton.maximum_local_application_residual = maximum_local_residual;
+    newton.entry = ToPublicState(candidate);
+    newton.direction = direction;
+    newton.trial_residual_norms.fill(
+        std::numeric_limits<double>::infinity());
+    bool accepted = false;
+    for (int line = 0; line < persistent_line_search_trials; ++line)
+    {
+      const double theta = std::ldexp(1.0, -line);
+      if (injection == TrajectoryFailureInjection::admissibility)
+      {
+        newton.trial_admissible[static_cast<std::size_t>(line)] = 0;
+        continue;
+      }
+      const TrajectorySlot trial = ApplyDirection(candidate, direction, theta);
+      const TrajectoryAssemblyFailureCause trial_failure =
+          Assemble(owner, committed, trial, trial_assembly);
+      if (trial_failure != TrajectoryAssemblyFailureCause::none)
+      {
+        if (trial_failure ==
+            TrajectoryAssemblyFailureCause::state_admissibility)
+        {
+          diagnostic.HandleFailure();
+          newton.trial_admissible[static_cast<std::size_t>(line)] = 0;
+          continue;
+        }
+        RecordAssemblyFailure(trial_failure);
+        failure = TrajectoryStatus::HdgSc25AssemblyFailure;
+        break;
+      }
+      newton.trial_admissible[static_cast<std::size_t>(line)] = 1;
+      const double trial_norm = ResidualNorm(trial_assembly);
+      newton.trial_residual_norms[static_cast<std::size_t>(line)] = trial_norm;
+      const bool armijo = Finite(trial_norm) &&
+          trial_norm <= (1.0 - 1.0e-4 * theta) * residual_norm;
+      newton.trial_armijo[static_cast<std::size_t>(line)] = armijo ? 1 : 0;
+      if (armijo)
+      {
+        candidate = trial;
+        newton.accepted_line_search_index = line;
+        newton.accepted_residual_norm = trial_norm;
+        accepted = true;
+        break;
+      }
+    }
+    attempt.newton_iterations = iteration + 1;
+    if (failure != TrajectoryStatus::uninitialized) { break; }
+    if (!accepted)
+    {
+      failure = injection == TrajectoryFailureInjection::admissibility
+          ? TrajectoryStatus::HdgSc25InjectedAdmissibilityFailure
+          : TrajectoryStatus::HdgSc25AdmissibilityFailure;
+      break;
+    }
+  }
+
+  if (failure == TrajectoryStatus::uninitialized && !converged)
+  {
+    failure = TrajectoryStatus::HdgSc25NewtonIterationLimit;
+  }
+  attempt.entry_residual_norm = entry_norm;
+  attempt.final_residual_norm = final_norm;
+  attempt.nonlinear_residual_bound = nonlinear_bound;
+
+  GateReport gates{};
+  AttemptTelemetry telemetry{};
+  telemetry.transfers.complete = true;
+  telemetry.true_relative_residual =
+      Finite(final_norm) ? final_norm / std::max(1.0, entry_norm)
+                         : std::numeric_limits<double>::infinity();
+  FailureReason originating = FailureReason::none;
+  TrajectoryStatus result = failure;
+  std::array<double, state_components> accepted_integrals{};
+  if (failure == TrajectoryStatus::uninitialized && !VerifyReuse(owner))
+  {
+    failure = TrajectoryStatus::HdgSc25PublicationFailure;
+    result = failure;
+  }
+  if (failure == TrajectoryStatus::uninitialized && converged)
+  {
+    if (!Integrals(owner, candidate, accepted_integrals))
+    {
+      result = TrajectoryStatus::HdgSc25ConservationFailure;
+    }
+    else
+    {
+      double maximum_conservation = 0.0;
+      for (int component = 0; component < state_components; ++component)
+      {
+        maximum_conservation = std::max(
+            maximum_conservation,
+            std::abs(accepted_integrals[component] -
+                     committed_integrals[component]) /
+                std::max(1.0, std::abs(committed_integrals[component])));
+      }
+      attempt.maximum_conservation_error = maximum_conservation;
+      if (maximum_conservation > 2.0e-10)
+      {
+        result = TrajectoryStatus::HdgSc25ConservationFailure;
+      }
+      else
+      {
+        auto capability = contract->AcquireCandidate(begin.attempt);
+        if (!capability ||
+            !contract->StoreCandidate(*capability, candidate))
+        {
+          result = TrajectoryStatus::HdgSc25PublicationFailure;
+        }
+        else
+        {
+          gates = {true, true, true, true, true, true};
+          result = TrajectoryStatus::HdgSc25Accepted;
+        }
+      }
+    }
+  }
+  if (!IsAccepted(result))
+  {
+    originating = ContractFailure(result);
+  }
+  attempt.candidate_hashes = HashState(candidate);
+  NodalAdmissibilityMetrics(candidate, attempt.minimum_density,
+                            attempt.minimum_pressure,
+                            attempt.minimum_speed_margin);
+  const AttemptReport report{gates,
+                             telemetry,
+                             static_cast<std::uint64_t>(attempt.target_step),
+                             originating};
+  const AttemptOutcome outcome = contract->FinishAttempt(
+      begin.attempt, report, std::move(products));
+  TrajectorySlot published;
+  if (!contract->CopyPublished(contract->Published(), published))
+  {
+    result = TrajectoryStatus::HdgSc25PublicationFailure;
+  }
+  attempt.published_hashes = HashState(published);
+  if (IsAccepted(result) && !outcome.committed)
+  {
+    result = TrajectoryStatus::HdgSc25PublicationFailure;
+  }
+  if (!IsAccepted(result) && outcome.committed)
+  {
+    result = TrajectoryStatus::HdgSc25PublicationFailure;
+  }
+  attempt.status = result;
+  attempt.published_coordinates = contract->coordinates();
+  attempt.exit_reuse = ReuseSnapshot(owner);
+  return result;
+}
+
+TrajectoryStatus PersistentTrajectoryImplementation::Advance(
+    PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
+    const TrajectoryFailureInjection injection) noexcept
+{
+  if (!initialized || !contract ||
+      evidence.attempt_count >= static_cast<int>(evidence.attempts.size()) ||
+      contract->coordinates().step >= persistent_required_steps ||
+      (injection != TrajectoryFailureInjection::none &&
+       contract->coordinates().step + 1 != 7))
+  {
+    status = TrajectoryStatus::invalid_configuration;
+    RememberFailure(status);
+    RefreshEvidence();
+    return status;
+  }
+  TrajectorySlot before;
+  if (!contract->CopyPublished(contract->Published(), before))
+  {
+    status = TrajectoryStatus::HdgSc25PublicationFailure;
+    RememberFailure(status);
+    RefreshEvidence();
+    return status;
+  }
+  std::array<double, state_components> before_integrals{};
+  if (!Integrals(owner, before, before_integrals))
+  {
+    status = TrajectoryStatus::HdgSc25ConservationFailure;
+    RememberFailure(status);
+    RefreshEvidence();
+    return status;
+  }
+
+  const BeginOutcome begin =
+      contract->BeginStep({InteriorSpace::l2, persistent_dt});
+  const int first_attempt_index = evidence.attempt_count++;
+  TrajectoryStatus result = ExecuteAttempt(
+      owner, begin, injection,
+      evidence.attempts[static_cast<std::size_t>(first_attempt_index)]);
+  ++evidence.attempted_steps;
+  int accepted_attempt_index = first_attempt_index;
+  if (!IsAccepted(result))
+  {
+    RememberFailure(result);
+    if (contract->status() != RunStatus::retry_available ||
+        evidence.attempt_count >= static_cast<int>(evidence.attempts.size()))
+    {
+      status = TrajectoryStatus::HdgSc25RetryExhausted;
+      RememberFailure(status);
+      RefreshEvidence();
+      return status;
+    }
+    const BeginOutcome retry = contract->Retry();
+    accepted_attempt_index = evidence.attempt_count++;
+    ++evidence.retry_attempts;
+    result = ExecuteAttempt(
+        owner, retry, TrajectoryFailureInjection::none,
+        evidence.attempts[static_cast<std::size_t>(accepted_attempt_index)]);
+    if (!IsAccepted(result))
+    {
+      RememberFailure(result);
+      status = TrajectoryStatus::HdgSc25RetryExhausted;
+      RememberFailure(status);
+      RefreshEvidence();
+      return status;
+    }
+    result = TrajectoryStatus::HdgSc25AcceptedAfterOneRetry;
+    evidence.attempts[static_cast<std::size_t>(accepted_attempt_index)].status =
+        result;
+  }
+
+  TrajectorySlot accepted;
+  std::array<double, state_components> accepted_integrals{};
+  if (!contract->CopyPublished(contract->Published(), accepted) ||
+      !Integrals(owner, accepted, accepted_integrals))
+  {
+    status = TrajectoryStatus::HdgSc25PublicationFailure;
+    RememberFailure(status);
+    RefreshEvidence();
+    return status;
+  }
+  const StateCoordinates coordinates = contract->coordinates();
+  if (coordinates.step == 0 ||
+      coordinates.step > persistent_required_steps ||
+      coordinates.generation != coordinates.step ||
+      coordinates.cursor != coordinates.step ||
+      detail::DoubleBits(coordinates.dt) !=
+          detail::DoubleBits(persistent_dt))
+  {
+    status = TrajectoryStatus::HdgSc25PublicationFailure;
+    RememberFailure(status);
+    RefreshEvidence();
+    return status;
+  }
+  if (evidence.step_evidence_count < 0 ||
+      evidence.step_evidence_count >=
+          static_cast<int>(evidence.steps.size()))
+  {
+    status = TrajectoryStatus::HdgSc25PublicationFailure;
+    RememberFailure(status);
+    RefreshEvidence();
+    return status;
+  }
+  TrajectoryStepEvidence& step = evidence.steps[
+      static_cast<std::size_t>(evidence.step_evidence_count)];
+  step.accepted = true;
+  step.step = static_cast<int>(coordinates.step);
+  step.time = coordinates.time;
+  step.dt = coordinates.dt;
+  step.generation = coordinates.generation;
+  step.attempt_index = accepted_attempt_index;
+  step.committed_integrals = before_integrals;
+  step.accepted_integrals = accepted_integrals;
+  step.accepted_state = ToPublicState(accepted);
+  step.accepted_hashes = HashState(accepted);
+  step.reuse = ReuseSnapshot(owner);
+  if (!VerifyReuse(owner))
+  {
+    status = TrajectoryStatus::HdgSc25PublicationFailure;
+    RememberFailure(status);
+    RefreshEvidence();
+    return status;
+  }
+  evidence.accepted_steps = static_cast<int>(coordinates.step);
+  ++evidence.step_evidence_count;
+  status = result;
+  RefreshEvidence();
+  return status;
+}
+
+PersistentSc25ScalarIgrCpuFoundation::Implementation::~Implementation()
+    noexcept = default;
 
 bool PersistentSc25ScalarIgrCpuFoundation::RunCoupledOperatorFixture(
     CoupledOperatorFixtureSnapshot& output) noexcept
@@ -2369,11 +5237,13 @@ bool PersistentSc25ScalarIgrCpuFoundation::RunCoupledOperatorFixture(
       return false;
     }
     CoupledFixtureAssembly primary, repeat;
+    CoupledAssemblyWorkspace workspace;
     if (!AssembleCoupledFixture(
             *implementation_->mesh, *implementation_->sigma_space,
             *implementation_->carrier_space,
             *implementation_->trace_collection, implementation_->topology,
-            state, coupled_fixture_quadrature_order, primary,
+            state, coupled_fixture_quadrature_order, coupled_fixture_dt,
+            true, primary, workspace,
             "primary-assembly", diagnostic))
     {
       return false;
@@ -2382,7 +5252,8 @@ bool PersistentSc25ScalarIgrCpuFoundation::RunCoupledOperatorFixture(
             *implementation_->mesh, *implementation_->sigma_space,
             *implementation_->carrier_space,
             *implementation_->trace_collection, implementation_->topology,
-            state, coupled_fixture_repeat_quadrature_order, repeat,
+            state, coupled_fixture_repeat_quadrature_order,
+            coupled_fixture_dt, true, repeat, workspace,
             "repeat-assembly", diagnostic))
     {
       return false;
@@ -2762,7 +5633,15 @@ bool PersistentSc25ScalarIgrCpuFoundation::RunCoupledOperatorFixture(
         Finite(output.recovered_interior_increment) &&
         output.residual_quadrature_repeat_relative_l2 <= 1.0e-11 &&
         output.jacobian_quadrature_repeat_relative_l2 <= 1.0e-11;
-    diagnostic.success = valid;
+    if (valid)
+    {
+      diagnostic.CompleteAttempt();
+    }
+    else
+    {
+      diagnostic.Set("evidence-finalization", "validation");
+      diagnostic.LatchFailure();
+    }
     return valid;
   }
   catch (...)
@@ -2771,6 +5650,387 @@ bool PersistentSc25ScalarIgrCpuFoundation::RunCoupledOperatorFixture(
     output = {};
     return false;
   }
+}
+
+TrajectoryStatus
+PersistentSc25ScalarIgrCpuFoundation::InitializePersistentTrajectory()
+    noexcept
+{
+  if (!implementation_ || implementation_->status != FoundationStatus::ready ||
+      implementation_->rank != 0 || implementation_->ranks != 1 ||
+      implementation_->config.polynomial_degree != 1 ||
+      implementation_->config.elements_per_direction !=
+          persistent_elements_per_direction)
+  {
+    return TrajectoryStatus::invalid_configuration;
+  }
+  if (implementation_->trajectory &&
+      implementation_->trajectory->initialized)
+  {
+    return TrajectoryStatus::ready;
+  }
+  try
+  {
+    auto trajectory = std::make_unique<PersistentTrajectoryImplementation>();
+    if (!trajectory->InitializeStorage(*implementation_))
+    {
+      return TrajectoryStatus::initialization_failure;
+    }
+    TrajectorySlot initial;
+    if (!trajectory->InitializePhysicalState(*implementation_, initial) ||
+        !trajectory->BuildPersistentTraceGraph(*implementation_) ||
+        !trajectory->InitializeAuxiliary(*implementation_, initial))
+    {
+      return TrajectoryStatus::initialization_failure;
+    }
+    StateHash mesh_hash{}, partition_hash{}, topology_hash{};
+    if (!LiveResourceHashes(*implementation_, mesh_hash, partition_hash,
+                            topology_hash))
+    {
+      return TrajectoryStatus::initialization_failure;
+    }
+    const std::size_t persistent_bytes = sizeof(TrajectorySlot) * 2 +
+        sizeof(PersistentTrajectoryEvidence);
+    const std::size_t workspace_bytes =
+        static_cast<std::size_t>(persistent_elements) *
+        (sizeof(RuntimeElementWorkspace) +
+         (coupled_fixture_local_interior_unknowns *
+              coupled_fixture_local_interior_unknowns +
+          2 * coupled_fixture_local_interior_unknowns *
+              coupled_fixture_local_trace_unknowns +
+          2 * coupled_fixture_local_trace_unknowns *
+              coupled_fixture_local_trace_unknowns) *
+             sizeof(double));
+    const PersistentResourceDescriptor resources{
+        StableIdentity::Copy("mfem-d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec"),
+        mesh_hash,
+        partition_hash,
+        topology_hash,
+        1,
+        1,
+        StableIdentity::Copy(interior_layout_id),
+        {true,
+         true,
+         true,
+         false,
+         1,
+         1,
+         persistent_bytes,
+         workspace_bytes}};
+    trajectory->contract = std::make_unique<TrajectoryContract>(
+        initial, initial, StateCoordinates{}, resources);
+    if (trajectory->contract->status() != RunStatus::ready)
+    {
+      return TrajectoryStatus::initialization_failure;
+    }
+    const TrajectoryAssemblyFailureCause initial_assembly_failure =
+        trajectory->Assemble(*implementation_, initial, initial,
+                             trajectory->assembly);
+    if (initial_assembly_failure != TrajectoryAssemblyFailureCause::none)
+    {
+      trajectory->RecordAssemblyFailure(initial_assembly_failure);
+      return TrajectoryStatus::initialization_failure;
+    }
+    double maximum_local_residual = 0.0;
+    if (!trajectory->Condense(trajectory->assembly,
+                              maximum_local_residual) ||
+        !trajectory->AssembleTrueSystem(*implementation_))
+    {
+      return TrajectoryStatus::initialization_failure;
+    }
+    trajectory->evidence.reuse.baseline =
+        trajectory->ReuseSnapshot(*implementation_);
+    trajectory->evidence.reuse.current =
+        trajectory->evidence.reuse.baseline;
+    trajectory->reuse_baseline_frozen = true;
+    if (!trajectory->VerifyReuse(*implementation_))
+    {
+      return TrajectoryStatus::initialization_failure;
+    }
+    trajectory->evidence.checkpoint_step_offset = 0;
+    trajectory->evidence.continuation_start_coordinates = {};
+    trajectory->evidence.continuation_start_state = ToPublicState(initial);
+    trajectory->evidence.continuation_start_hashes = HashState(initial);
+    trajectory->initialized = true;
+    trajectory->status = TrajectoryStatus::ready;
+    trajectory->RefreshEvidence();
+    implementation_->trajectory = std::move(trajectory);
+    return TrajectoryStatus::ready;
+  }
+  catch (...)
+  {
+    return TrajectoryStatus::initialization_failure;
+  }
+}
+
+TrajectoryStatus
+PersistentSc25ScalarIgrCpuFoundation::AdvancePersistentTrajectory(
+    const TrajectoryFailureInjection injection) noexcept
+{
+  if (!implementation_ || !implementation_->trajectory)
+  {
+    return TrajectoryStatus::uninitialized;
+  }
+  return implementation_->trajectory->Advance(*implementation_, injection);
+}
+
+bool PersistentSc25ScalarIgrCpuFoundation::CopyPublishedTrajectoryState(
+    PersistentTrajectoryState& output) const noexcept
+{
+  output = {};
+  if (!implementation_ || !implementation_->trajectory ||
+      !implementation_->trajectory->contract)
+  {
+    return false;
+  }
+  TrajectorySlot state;
+  if (!implementation_->trajectory->contract->CopyPublished(
+          implementation_->trajectory->contract->Published(), state))
+  {
+    return false;
+  }
+  output = ToPublicState(state);
+  return true;
+}
+
+bool PersistentSc25ScalarIgrCpuFoundation::CaptureTrajectoryCheckpoint(
+    PersistentTrajectoryCheckpoint& output) const noexcept
+{
+  output = {};
+  output.projection = StableIdentity::Copy(projection_id);
+  output.tuple = StableIdentity::Copy(cpu_rank1_tuple_id);
+  output.scenario = StableIdentity::Copy(persistent_fixture_id);
+  if (!implementation_ || !implementation_->trajectory ||
+      !implementation_->trajectory->contract ||
+      !implementation_->trajectory->contract->TryMakeCheckpoint(
+          output.descriptor))
+  {
+    return false;
+  }
+  TrajectorySlot state;
+  if (!implementation_->trajectory->contract->CopyPublished(
+          implementation_->trajectory->contract->Published(), state))
+  {
+    output = {};
+    return false;
+  }
+  output.state = ToPublicState(state);
+  output.raw_field_hashes = HashState(state);
+  output.fields = CheckpointFieldIdentities();
+  output.canonical_manifest_hash =
+      CanonicalCheckpointManifestHash(output);
+  return true;
+}
+
+TrajectoryStatus
+PersistentSc25ScalarIgrCpuFoundation::RestoreTrajectoryCheckpoint(
+    const PersistentTrajectoryCheckpoint& checkpoint) noexcept
+{
+  if (!implementation_ || !implementation_->trajectory ||
+      !implementation_->trajectory->contract)
+  {
+    return TrajectoryStatus::uninitialized;
+  }
+  PersistentTrajectoryImplementation& trajectory =
+      *implementation_->trajectory;
+  if (!trajectory.VerifyReuse(*implementation_))
+  {
+    trajectory.status = TrajectoryStatus::HdgSc25PublicationFailure;
+    trajectory.RememberFailure(trajectory.status);
+    trajectory.RefreshEvidence();
+    return trajectory.status;
+  }
+  const PersistentResourceDescriptor& resources =
+      trajectory.contract->resources();
+  StateHash live_mesh_hash{}, live_partition_hash{}, live_topology_hash{};
+  const bool live_resources = LiveResourceHashes(
+      *implementation_, live_mesh_hash, live_partition_hash,
+      live_topology_hash);
+  const std::array<TrajectoryCheckpointFieldIdentity, 5> expected_fields =
+      CheckpointFieldIdentities();
+  const auto hashes_equal = [](const TrajectoryStateHashes& left,
+                               const TrajectoryStateHashes& right)
+  {
+    return left.u == right.u && left.sigma == right.sigma &&
+        left.z == right.z && left.uhat == right.uhat &&
+        left.sigmahat == right.sigmahat &&
+        left.interior == right.interior && left.trace == right.trace;
+  };
+  TrajectoryStatus failure = TrajectoryStatus::uninitialized;
+  if (checkpoint.projection != StableIdentity::Copy(projection_id) ||
+      checkpoint.tuple != StableIdentity::Copy(cpu_rank1_tuple_id) ||
+      checkpoint.scenario != StableIdentity::Copy(persistent_fixture_id) ||
+      checkpoint.descriptor.schema_version != checkpoint_schema_version ||
+      !checkpoint.descriptor.successful_commit ||
+      checkpoint.descriptor.restart_mode !=
+          RestartMode::same_backend_rank_partition ||
+      checkpoint.descriptor.tuple != CpuRank1Selection::Descriptor() ||
+      !live_resources || !resources.Valid() ||
+      checkpoint.descriptor.mfem_pin != resources.mfem_pin ||
+      checkpoint.descriptor.mesh_hash != resources.mesh_hash ||
+      checkpoint.descriptor.partition_hash != resources.partition_hash ||
+      checkpoint.descriptor.topology_hash != resources.topology_hash ||
+      resources.mesh_hash != live_mesh_hash ||
+      resources.partition_hash != live_partition_hash ||
+      resources.topology_hash != live_topology_hash ||
+      checkpoint.descriptor.rank_count != resources.rank_count ||
+      checkpoint.descriptor.polynomial_order != resources.polynomial_order ||
+      checkpoint.descriptor.layout != resources.layout ||
+      checkpoint.descriptor.precision != StableIdentity::Copy("Fp64") ||
+      checkpoint.descriptor.cursor !=
+          checkpoint.descriptor.coordinates.cursor ||
+      detail::DoubleBits(checkpoint.descriptor.dt) !=
+          detail::DoubleBits(persistent_dt) ||
+      checkpoint.descriptor.coordinates.step == 0 ||
+      checkpoint.descriptor.coordinates.step !=
+          checkpoint.descriptor.coordinates.generation ||
+      checkpoint.descriptor.coordinates.step !=
+          checkpoint.descriptor.coordinates.cursor ||
+      detail::DoubleBits(checkpoint.descriptor.coordinates.dt) !=
+          detail::DoubleBits(persistent_dt) ||
+      detail::DoubleBits(checkpoint.descriptor.coordinates.time) !=
+          detail::DoubleBits(checkpoint.descriptor.coordinates.step *
+                             persistent_dt) ||
+      checkpoint.descriptor.coordinate_fingerprint !=
+          detail::CoordinateFingerprint(checkpoint.descriptor.coordinates) ||
+      !resources.reuse.persistent_topology ||
+      !resources.reuse.persistent_complete_state_slots ||
+      !resources.reuse.persistent_workspace ||
+      resources.reuse.per_step_allocation_required ||
+      resources.reuse.topology_generation != 1 ||
+      resources.reuse.storage_generation != 1 ||
+      resources.reuse.persistent_bytes == 0 ||
+      resources.reuse.workspace_bytes == 0)
+  {
+    failure = TrajectoryStatus::HdgSc25RestartValidationFailureIdentity;
+  }
+  else if (!std::equal(
+               checkpoint.fields.begin(), checkpoint.fields.end(),
+               expected_fields.begin(),
+               [](const TrajectoryCheckpointFieldIdentity& left,
+                  const TrajectoryCheckpointFieldIdentity& right)
+               { return SameFieldIdentity(left, right); }))
+  {
+    failure = TrajectoryStatus::HdgSc25RestartValidationFailureIdentity;
+  }
+  else if (CanonicalCheckpointManifestHash(checkpoint) !=
+               checkpoint.canonical_manifest_hash)
+  {
+    failure = TrajectoryStatus::HdgSc25RestartValidationFailureHash;
+  }
+
+  const TrajectorySlot loaded = ToSlot(checkpoint.state);
+  const TrajectoryStateHashes hashes = HashState(loaded);
+  if (failure == TrajectoryStatus::uninitialized &&
+      (!hashes_equal(hashes, checkpoint.raw_field_hashes) ||
+           hashes.interior != checkpoint.descriptor.interior_hash ||
+           hashes.trace != checkpoint.descriptor.trace_hash))
+  {
+    failure = TrajectoryStatus::HdgSc25RestartValidationFailureHash;
+  }
+  if (failure == TrajectoryStatus::uninitialized)
+  {
+    const TrajectoryAssemblyFailureCause assembly_failure =
+        trajectory.Assemble(*implementation_, loaded, loaded,
+                            trajectory.trial_assembly);
+    if (assembly_failure != TrajectoryAssemblyFailureCause::none)
+    {
+      trajectory.RecordAssemblyFailure(assembly_failure);
+      failure = assembly_failure ==
+              TrajectoryAssemblyFailureCause::state_admissibility
+          ? TrajectoryStatus::HdgSc25RestartValidationFailureAdmissibility
+          : TrajectoryStatus::HdgSc25RestartValidationFailureAssembly;
+    }
+  }
+  if (failure == TrajectoryStatus::uninitialized)
+  {
+    AuxiliaryResidualMetrics auxiliary_residual;
+    if (!trajectory.AuxiliaryResidualGate(
+            *implementation_, loaded, auxiliary_residual) ||
+        auxiliary_residual.normalized_maximum > 1.0e-10)
+    {
+      failure =
+          TrajectoryStatus::HdgSc25RestartValidationFailureAuxResidual;
+    }
+  }
+  if (failure != TrajectoryStatus::uninitialized)
+  {
+    if (!trajectory.VerifyReuse(*implementation_))
+    {
+      failure = TrajectoryStatus::HdgSc25PublicationFailure;
+    }
+    trajectory.status = failure;
+    trajectory.RememberFailure(failure);
+    trajectory.RefreshEvidence();
+    return failure;
+  }
+  const RestoreOutcome restored = trajectory.contract->Restore(
+      checkpoint.descriptor, loaded);
+  if (!restored.restored ||
+      restored.compatibility != RestartCompatibility::compatible)
+  {
+    trajectory.status =
+        TrajectoryStatus::HdgSc25RestartValidationFailureIdentity;
+    trajectory.RememberFailure(trajectory.status);
+    trajectory.RefreshEvidence();
+    return trajectory.status;
+  }
+  TrajectorySlot published;
+  const bool copied = trajectory.contract->CopyPublished(
+      trajectory.contract->Published(), published);
+  const StateCoordinates restored_coordinates =
+      trajectory.contract->coordinates();
+  const TrajectoryStateHashes restored_hashes = copied ?
+      HashState(published) : TrajectoryStateHashes{};
+  const bool loaded_state_match = copied && SameTrajectoryStateBytes(
+      ToPublicState(published), checkpoint.state);
+  const bool loaded_coordinates_match = detail::SameCoordinates(
+      restored_coordinates, checkpoint.descriptor.coordinates);
+  const bool loaded_hashes_match = copied &&
+      hashes_equal(restored_hashes, checkpoint.raw_field_hashes);
+  if (!loaded_state_match || !loaded_coordinates_match ||
+      !loaded_hashes_match)
+  {
+    trajectory.status = TrajectoryStatus::HdgSc25PublicationFailure;
+    trajectory.RememberFailure(trajectory.status);
+    trajectory.RefreshEvidence();
+    return trajectory.status;
+  }
+  trajectory.status = TrajectoryStatus::HdgSc25Accepted;
+  trajectory.evidence.attempted_steps = 0;
+  trajectory.evidence.retry_attempts = 0;
+  trajectory.evidence.attempt_count = 0;
+  trajectory.evidence.step_evidence_count = 0;
+  trajectory.evidence.attempts = {};
+  trajectory.evidence.steps = {};
+  trajectory.evidence.accepted_steps =
+      static_cast<int>(checkpoint.descriptor.coordinates.step);
+  trajectory.evidence.checkpoint_step_offset =
+      checkpoint.descriptor.coordinates.step;
+  trajectory.evidence.continuation_start_coordinates = restored_coordinates;
+  trajectory.evidence.continuation_start_state = checkpoint.state;
+  trajectory.evidence.continuation_start_hashes = restored_hashes;
+  trajectory.evidence.restored_loaded_state_match = true;
+  trajectory.evidence.restored_loaded_coordinates_match = true;
+  trajectory.evidence.restored_loaded_hashes_match = true;
+  if (!trajectory.VerifyReuse(*implementation_))
+  {
+    trajectory.status = TrajectoryStatus::HdgSc25PublicationFailure;
+    trajectory.RememberFailure(trajectory.status);
+    trajectory.RefreshEvidence();
+    return trajectory.status;
+  }
+  trajectory.RefreshEvidence();
+  return trajectory.status;
+}
+
+const PersistentTrajectoryEvidence&
+PersistentSc25ScalarIgrCpuFoundation::trajectory_evidence() const noexcept
+{
+  static const PersistentTrajectoryEvidence empty{};
+  return implementation_ && implementation_->trajectory
+      ? implementation_->trajectory->evidence
+      : empty;
 }
 
 } // namespace dg::hdg::runtime::cpu::sc25
