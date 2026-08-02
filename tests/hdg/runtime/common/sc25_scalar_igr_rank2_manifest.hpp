@@ -844,6 +844,8 @@ inline bool ValidCpuManifest(const CpuReferenceManifest& value) noexcept
         record.initialization_operator != (step == 0) ||
         record.operator_iteration < 0 ||
         record.operator_trace_iterations < 0 ||
+        record.operator_trace_iterations >
+            cpu::persistent_trace_maximum_iterations ||
         !std::all_of(operator_scalars.begin(), operator_scalars.end(),
                      [](const double item) { return std::isfinite(item); }) ||
         !valid_state(record.operator_entry) ||

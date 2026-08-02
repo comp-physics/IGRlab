@@ -213,7 +213,7 @@ struct OperatorSnapshotDiagnostics final
   bool observed_initialization = false;
   bool status = false;
   bool target_step = false;
-  bool retry_index = false;
+  bool retry_index_ok = false;
   bool iteration = false;
   bool full_size = false;
   bool owned_size = false;
@@ -222,7 +222,7 @@ struct OperatorSnapshotDiagnostics final
   bool coordinate_generation = false;
   bool coordinate_cursor = false;
   bool coordinate_dt = false;
-  bool trace_iterations = false;
+  bool trace_iterations_in_bounds = false;
   bool metadata = false;
   std::size_t reference_full_size = 0;
   std::size_t reference_owned_size = 0;
@@ -271,7 +271,7 @@ inline OperatorSnapshotDiagnostics DiagnoseOperatorSnapshotParity(
   result.observed_initialization = observed.initialization == (step == 0);
   result.status = observed.status == expected_status;
   result.target_step = observed.target_step == step;
-  result.retry_index = observed.retry_index == 0;
+  result.retry_index_ok = observed.retry_index == 0;
   result.iteration = observed.iteration == reference.operator_iteration;
   result.reference_full_size = full;
   result.reference_owned_size = owned;
@@ -287,15 +287,25 @@ inline OperatorSnapshotDiagnostics DiagnoseOperatorSnapshotParity(
       observed.coordinates.cursor == reference.summary.coordinates.cursor;
   result.coordinate_dt =
       observed.coordinates.dt == reference.summary.coordinates.dt;
-  result.trace_iterations =
-      observed.trace_iterations == reference.operator_trace_iterations;
+  // Host and device HYPRE may cross the convergence threshold on adjacent
+  // Krylov iterations because their reductions, SpMV, and ILU execution
+  // orders differ.  Iteration identity is therefore not a portable
+  // cross-profile oracle.  Each solve must instead satisfy the same governed
+  // ceiling; the recomputed true residual and full solution/vector parity
+  // below remain the scientific admission gates.
+  result.trace_iterations_in_bounds =
+      reference.operator_trace_iterations >= 0 &&
+      reference.operator_trace_iterations <=
+          cpu::persistent_trace_maximum_iterations &&
+      observed.trace_iterations >= 0 &&
+      observed.trace_iterations <= scalar::trace_maximum_iterations;
   result.metadata = result.reference_valid && result.observed_valid &&
       result.reference_initialization && result.observed_initialization &&
-      result.status && result.target_step && result.retry_index &&
+      result.status && result.target_step && result.retry_index_ok &&
       result.iteration && result.full_size && result.owned_size &&
       result.coordinate_time && result.coordinate_step &&
       result.coordinate_generation && result.coordinate_cursor &&
-      result.coordinate_dt && result.trace_iterations;
+      result.coordinate_dt && result.trace_iterations_in_bounds;
 
   const std::array<double, 4> scalar_reference{{
       reference.operator_entry_residual_norm,

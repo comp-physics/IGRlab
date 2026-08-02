@@ -152,10 +152,11 @@ void EmitOperatorSnapshotDiagnostics(
     emit("SC25_R2_OPERATOR_DIFF rank=%d step=%d META pass=%d "
          "ref_valid=%d obs_valid=%d ref_init=%d obs_init=%d "
          "status=%d ref_status=%d obs_status=%d target=%d ref_target=%d "
-         "obs_target=%d retry=%d obs_retry=%d iteration=%d ref_iteration=%d "
+         "obs_target=%d retry_index_ok=%d obs_retry=%d iteration=%d "
+         "ref_iteration=%d "
          "obs_iteration=%d full=%d ref_full=%zu obs_full=%d owned=%d "
-         "ref_owned=%zu obs_owned=%d trace_iterations=%d ref_trace_iterations=%d "
-         "obs_trace_iterations=%d\n",
+         "ref_owned=%zu obs_owned=%d trace_iterations_in_bounds=%d "
+         "ref_trace_iterations=%d obs_trace_iterations=%d\n",
          rank, step, diagnostic.metadata ? 1 : 0,
          diagnostic.reference_valid ? 1 : 0,
          diagnostic.observed_valid ? 1 : 0,
@@ -165,13 +166,13 @@ void EmitOperatorSnapshotDiagnostics(
          step == 0 ? static_cast<int>(scalar::ScalarCudaStatus::ready)
                    : static_cast<int>(scalar::ScalarCudaStatus::accepted),
          static_cast<int>(observed.status), diagnostic.target_step ? 1 : 0,
-         step, observed.target_step, diagnostic.retry_index ? 1 : 0,
+         step, observed.target_step, diagnostic.retry_index_ok ? 1 : 0,
          observed.retry_index, diagnostic.iteration ? 1 : 0,
          reference.operator_iteration, observed.iteration,
          diagnostic.full_size ? 1 : 0, diagnostic.reference_full_size,
          observed.full_vector_size, diagnostic.owned_size ? 1 : 0,
          diagnostic.reference_owned_size, observed.owned_trace_size,
-         diagnostic.trace_iterations ? 1 : 0,
+         diagnostic.trace_iterations_in_bounds ? 1 : 0,
          reference.operator_trace_iterations, observed.trace_iterations);
     emit("SC25_R2_OPERATOR_DIFF rank=%d step=%d COORD "
          "time=%d ref=%.17g obs=%.17g step=%d ref_step=%llu obs_step=%llu "
