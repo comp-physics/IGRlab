@@ -819,18 +819,25 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
         {
           for (int item = 0; item < restore_count; ++item)
           {
-            if (restart->RestoreTrajectoryCheckpoint(cuda_checkpoint10) !=
-                scalar::ScalarCudaStatus::ready)
+            const bool restored_control =
+                restart->RestoreTrajectoryCheckpoint(cuda_checkpoint10) ==
+                scalar::ScalarCudaStatus::ready;
+            if (!CollectiveAll(restored_control))
               return false;
           }
-          if (!CudaAccepted(restart->AdvancePersistentTrajectory()))
+          const bool advanced_control =
+              CudaAccepted(restart->AdvancePersistentTrajectory());
+          if (!CollectiveAll(advanced_control))
             return false;
           const auto& evidence = restart->trajectory_evidence();
-          if (!oracle::CoherentReplayEvidence(evidence, 10) ||
-              evidence.snapshot_count != 1)
+          const bool coherent_control =
+              oracle::CoherentReplayEvidence(evidence, 10) &&
+              evidence.snapshot_count == 1;
+          if (!CollectiveAll(coherent_control))
             return false;
           output_snapshot = evidence.snapshots[0];
-          return restart->CopyPublishedTrajectoryState(output_state);
+          return CollectiveAll(
+              restart->CopyPublishedTrajectoryState(output_state));
         };
 
         cpu::PersistentRank2TrajectoryState repeated_state{};
