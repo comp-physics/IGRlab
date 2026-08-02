@@ -441,18 +441,19 @@ ApplicationRejection ValidateRoleControls(
       options.retry_limit == 0;
   const bool scalar_fault_free = scalar_cuda && off &&
       options.retry_limit == 0;
-  const bool scalar_reference_controls =
+  const bool scalar_writer_controls =
       (prescribed_principal &&
        options.retry_limit == scalar_igr_sc25_v3_retry_limit) ||
-      scalar_scheduled_retry || scalar_terminal_post_publication ||
-      scalar_fault_free;
+      scalar_scheduled_retry || scalar_fault_free;
+  const bool scalar_uninterrupted_controls = scalar_writer_controls ||
+      scalar_terminal_post_publication;
 
   switch (options.run_role)
   {
     case ApplicationRunRoleV1::uninterrupted_reference:
       if (!writes_checkpoint ||
           options.stop_after_checkpoint != StopAfterCheckpointV1::no ||
-          (scalar ? !scalar_reference_controls
+          (scalar ? !scalar_uninterrupted_controls
                   : (!off || options.retry_limit != 0)) ||
           options.seed != seed)
       {
@@ -462,7 +463,7 @@ ApplicationRejection ValidateRoleControls(
     case ApplicationRunRoleV1::split_writer:
       if (!writes_checkpoint ||
           options.stop_after_checkpoint != StopAfterCheckpointV1::yes ||
-          (scalar ? !scalar_reference_controls
+          (scalar ? !scalar_writer_controls
                   : (!off || options.retry_limit != 0)) ||
           options.seed != seed)
       {

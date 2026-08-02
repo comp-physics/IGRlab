@@ -1166,11 +1166,17 @@ bool DirectAndNegativeControls()
   SetOption(terminal_arguments, "--inject-failure",
             "AfterRecoveryBeforeCommit:20:0");
   const ParsedCommandLine terminal = Parse(terminal_arguments);
+  auto terminal_writer_arguments = terminal_arguments;
+  SetOption(terminal_writer_arguments, "--stop-after-checkpoint", "true");
+  const ParsedCommandLine terminal_writer = Parse(terminal_writer_arguments);
   passed = Check(terminal.status == CommandLineStatus::run &&
                      terminal.options.backend_id ==
                          CudaRank1OneGpuBackendTag::id &&
                      terminal.options.injection.target_step == 20 &&
-                     terminal.options.retry_limit == 0,
+                     terminal.options.retry_limit == 0 &&
+                     terminal_writer.status == CommandLineStatus::rejected &&
+                     terminal_writer.rejection ==
+                         ApplicationRejection::invalid_run_role,
                  "scalar_cuda_rank1_step20_cli_contract") && passed;
 #endif
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
@@ -1194,11 +1200,20 @@ bool DirectAndNegativeControls()
   SetOption(rank2_terminal_arguments, "--inject-failure",
             "AfterRecoveryBeforeCommit:20:1");
   const ParsedCommandLine rank2_terminal = Parse(rank2_terminal_arguments);
+  auto rank2_terminal_writer_arguments = rank2_terminal_arguments;
+  SetOption(rank2_terminal_writer_arguments, "--stop-after-checkpoint",
+            "true");
+  const ParsedCommandLine rank2_terminal_writer =
+      Parse(rank2_terminal_writer_arguments);
   passed = Check(rank2_terminal.status == CommandLineStatus::run &&
                      rank2_terminal.options.backend_id ==
                          CudaRank2OneGpuHostStagedBackendTag::id &&
                      rank2_terminal.options.injection.target_step == 20 &&
-                     rank2_terminal.options.retry_limit == 0,
+                     rank2_terminal.options.retry_limit == 0 &&
+                     rank2_terminal_writer.status ==
+                         CommandLineStatus::rejected &&
+                     rank2_terminal_writer.rejection ==
+                         ApplicationRejection::invalid_run_role,
                  "scalar_cuda_rank2_step20_cli_fallback") && passed;
 #endif
   auto scalar_h1_args = ScalarArguments("cpu", "none");

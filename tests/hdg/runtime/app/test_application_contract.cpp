@@ -147,6 +147,19 @@ ApplicationOptionsView SplitWriter(ApplicationOptionsView options)
   return options;
 }
 
+ApplicationOptionsView CanonicalScalarCheckpointWriter(
+    ApplicationOptionsView options)
+{
+  options = SplitWriter(options);
+  options.injection = {
+      FailureInjectionModeV1::prescribed,
+      smooth_periodic_euler_v1_failure_phase,
+      scalar_igr_sc25_v3_failure_target_step,
+      SourceRank(options.backend_id)};
+  options.retry_limit = scalar_igr_sc25_v3_retry_limit;
+  return options;
+}
+
 ApplicationOptionsView SplitReader(ApplicationOptionsView options)
 {
   const std::string_view checkpoint = options.checkpoint_out.canonical;
@@ -488,8 +501,33 @@ bool CheckScalarIgrMatrix()
     ApplicationOptionsView fault_free = ScalarIgr(item.first);
     fault_free.injection = {};
     fault_free.retry_limit = 0;
-    passed = Check(ValidateApplicationOptions(fault_free).accepted(),
-                   "scalar_cuda_fault_free_reference_controls") && passed;
+    const ApplicationValidation fault_free_validation =
+        ValidateApplicationOptions(fault_free);
+    const ApplicationValidation reader_validation =
+        ValidateApplicationOptions(SplitReader(fault_free));
+    StateHash expected_writer_hash{};
+    const bool expected_writer_ready = reader_validation.accepted() &&
+        DeriveSplitWriterRunConfigHashV1(
+            *reader_validation.config(), expected_writer_hash);
+    const auto canonical_writer_hash_matches =
+        [&](const ApplicationOptionsView& live)
+        {
+          const ApplicationValidation normalized =
+              ValidateApplicationOptions(CanonicalScalarCheckpointWriter(live));
+          return expected_writer_ready && normalized.accepted() &&
+              normalized.config()->run_config_sha256() ==
+                  expected_writer_hash;
+        };
+    const ApplicationValidation fault_free_public_writer =
+        ValidateApplicationOptions(SplitWriter(fault_free));
+    passed = Check(
+                 fault_free_validation.accepted() &&
+                     fault_free_public_writer.accepted() &&
+                     fault_free_public_writer.config()->run_config_sha256() !=
+                         expected_writer_hash &&
+                     canonical_writer_hash_matches(fault_free),
+                 "scalar_cuda_fault_free_checkpoint_writer_hash_normalizes") &&
+        passed;
 
     for (std::uint32_t source = 0; source < rank_count; ++source)
     {
@@ -506,7 +544,10 @@ bool CheckScalarIgrMatrix()
                      scheduled_validation.accepted() &&
                          scheduled_validation.config()->injection() ==
                              scheduled.injection &&
-                         scheduled_validation.config()->retry_limit() == 1,
+                         scheduled_validation.config()->retry_limit() == 1 &&
+                         ValidateApplicationOptions(
+                             SplitWriter(scheduled)).accepted() &&
+                         canonical_writer_hash_matches(scheduled),
                      "scalar_cuda_step10_scheduled_boundary_contract") &&
             passed;
       }
@@ -519,12 +560,17 @@ bool CheckScalarIgrMatrix()
       post_publication.retry_limit = 0;
       const ApplicationValidation post_publication_validation =
           ValidateApplicationOptions(post_publication);
+      const ApplicationValidation post_publication_writer_validation =
+          ValidateApplicationOptions(SplitWriter(post_publication));
       passed = Check(
                    post_publication_validation.accepted() &&
                        post_publication_validation.config()->injection() ==
                            post_publication.injection &&
                        post_publication_validation.config()->retry_limit() ==
-                           0,
+                           0 &&
+                       post_publication_writer_validation.rejection() ==
+                           ApplicationRejection::invalid_run_role &&
+                       canonical_writer_hash_matches(post_publication),
                    "scalar_cuda_step20_postpublication_boundary_contract") &&
           passed;
     }

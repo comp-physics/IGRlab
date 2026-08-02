@@ -2564,13 +2564,18 @@ std::optional<ValidatedApplicationConfig> ScalarCheckpointWriterConfig(
     const ValidatedApplicationConfig& config)
 {
   if (!config.checkpoint_out().present()) return std::nullopt;
-  if (config.run_role() == ApplicationRunRoleV1::split_writer) return config;
   ApplicationOptionsView writer = request;
   writer.run_role = ApplicationRunRoleV1::split_writer;
   writer.checkpoint_step = OptionalCheckpointStepV1::Present(
       config.scenario_checkpoint_step());
   writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
   writer.restart_from = {};
+  writer.injection = {
+      FailureInjectionModeV1::prescribed,
+      smooth_periodic_euler_v1_failure_phase,
+      scalar_igr_sc25_v3_failure_target_step,
+      config.deferred_runtime().required_injected_source_rank};
+  writer.retry_limit = scalar_igr_sc25_v3_retry_limit;
   const ApplicationValidation validation = ValidateApplicationOptions(writer);
   return validation.accepted()
       ? std::optional<ValidatedApplicationConfig>{*validation.config()}
