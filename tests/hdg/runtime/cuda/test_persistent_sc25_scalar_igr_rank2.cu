@@ -7,10 +7,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -62,6 +65,213 @@ bool CudaAccepted(const scalar::ScalarCudaStatus status) noexcept
 {
   return status == scalar::ScalarCudaStatus::accepted ||
       status == scalar::ScalarCudaStatus::accepted_after_one_retry;
+}
+
+std::uint64_t DoubleBits(const double value) noexcept
+{
+  std::uint64_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value), "FP64 diagnostic contract");
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+std::uint64_t OrderedDoubleBits(const double value) noexcept
+{
+  constexpr std::uint64_t sign = std::uint64_t{1} << 63U;
+  const std::uint64_t bits = DoubleBits(value);
+  return (bits & sign) != 0 ? ~bits : bits | sign;
+}
+
+void EmitStateByteDiagnostics(
+    const int rank, const int step, const char* const phase,
+    const cpu::PersistentRank2TrajectoryState& reference,
+    const cpu::PersistentRank2TrajectoryState& observed) noexcept
+{
+  struct Member final
+  {
+    const char* name = nullptr;
+    const std::vector<double>* reference = nullptr;
+    const std::vector<double>* observed = nullptr;
+  };
+  const std::array<Member, 5> members{{
+      {"u", &reference.u, &observed.u},
+      {"sigma", &reference.sigma, &observed.sigma},
+      {"z", &reference.z, &observed.z},
+      {"uhat", &reference.uhat, &observed.uhat},
+      {"sigmahat", &reference.sigmahat, &observed.sigmahat}}};
+  const auto emit = [](const char* const format, const auto&... values)
+  {
+    std::array<char, 4096> buffer{};
+    const int produced = std::snprintf(
+        buffer.data(), buffer.size(), format, values...);
+    if (produced <= 0) return;
+    const std::size_t length = std::min(
+        static_cast<std::size_t>(produced), buffer.size() - 1);
+    (void)::write(STDERR_FILENO, buffer.data(), length);
+  };
+
+  for (int turn = 0; turn < 2; ++turn)
+  {
+    (void)MPI_Barrier(MPI_COMM_WORLD);
+    if (rank != turn) continue;
+    for (const Member& member : members)
+    {
+      const auto& left = *member.reference;
+      const auto& right = *member.observed;
+      const std::size_t common = std::min(left.size(), right.size());
+      std::size_t first = common;
+      std::size_t mismatches = left.size() > right.size()
+          ? left.size() - right.size() : right.size() - left.size();
+      std::size_t maximum_absolute_index = 0;
+      std::size_t maximum_ulp_index = 0;
+      double maximum_absolute = 0.0;
+      std::uint64_t maximum_ulp = 0;
+      for (std::size_t index = 0; index < common; ++index)
+      {
+        const std::uint64_t left_bits = DoubleBits(left[index]);
+        const std::uint64_t right_bits = DoubleBits(right[index]);
+        if (left_bits != right_bits)
+        {
+          if (first == common) first = index;
+          ++mismatches;
+        }
+        const double absolute = std::abs(right[index] - left[index]);
+        if (absolute > maximum_absolute)
+        {
+          maximum_absolute = absolute;
+          maximum_absolute_index = index;
+        }
+        const std::uint64_t left_ordered = OrderedDoubleBits(left[index]);
+        const std::uint64_t right_ordered = OrderedDoubleBits(right[index]);
+        const std::uint64_t ulp = left_ordered > right_ordered
+            ? left_ordered - right_ordered : right_ordered - left_ordered;
+        if (ulp > maximum_ulp)
+        {
+          maximum_ulp = ulp;
+          maximum_ulp_index = index;
+        }
+      }
+      const bool first_in_both = first < common;
+      const double first_left = first_in_both ? left[first] : 0.0;
+      const double first_right = first_in_both ? right[first] : 0.0;
+      const std::uint64_t first_left_bits =
+          first_in_both ? DoubleBits(first_left) : 0;
+      const std::uint64_t first_right_bits =
+          first_in_both ? DoubleBits(first_right) : 0;
+      emit("SC25_R2_STATE_DIFF rank=%d phase=%s step=%d member=%s "
+           "exact=%d ref_size=%zu obs_size=%zu mismatches=%zu first=%zu "
+           "ref_bits=%016llx obs_bits=%016llx ref=%.17g obs=%.17g "
+           "max_abs=%.17g max_abs_index=%zu max_ulp=%llu "
+           "max_ulp_index=%zu relative_l2=%.17g\n",
+           rank, phase, step, member.name, mismatches == 0 ? 1 : 0,
+           left.size(), right.size(), mismatches, first,
+           static_cast<unsigned long long>(first_left_bits),
+           static_cast<unsigned long long>(first_right_bits), first_left,
+           first_right, maximum_absolute, maximum_absolute_index,
+           static_cast<unsigned long long>(maximum_ulp), maximum_ulp_index,
+           oracle::RelativeL2(left, right));
+    }
+  }
+  (void)MPI_Barrier(MPI_COMM_WORLD);
+}
+
+void EmitReplaySolverDiagnostics(
+    const int rank, const int step, const int reference_iterations,
+    const double reference_residual,
+    const scalar::ScalarCudaSnapshotEvidence& observed) noexcept
+{
+  std::array<char, 1024> buffer{};
+  for (int turn = 0; turn < 2; ++turn)
+  {
+    (void)MPI_Barrier(MPI_COMM_WORLD);
+    if (rank != turn) continue;
+    const int produced = std::snprintf(
+        buffer.data(), buffer.size(),
+        "SC25_R2_REPLAY_SOLVE rank=%d step=%d ref_iterations=%d "
+        "obs_iterations=%d ref_true_residual=%.17g "
+        "obs_true_residual=%.17g obs_rhs=%.17g\n",
+        rank, step, reference_iterations, observed.trace_iterations,
+        reference_residual, observed.trace_true_residual_norm,
+        observed.trace_right_hand_side_norm);
+    if (produced > 0)
+    {
+      const std::size_t length = std::min(
+          static_cast<std::size_t>(produced), buffer.size() - 1);
+      (void)::write(STDERR_FILENO, buffer.data(), length);
+    }
+  }
+  (void)MPI_Barrier(MPI_COMM_WORLD);
+}
+
+void EmitReplaySnapshotDiagnostics(
+    const int rank, const int step,
+    const scalar::ScalarCudaSnapshotEvidence& reference,
+    const scalar::ScalarCudaSnapshotEvidence& observed) noexcept
+{
+  const bool metadata = reference.valid == observed.valid &&
+      reference.initialization == observed.initialization &&
+      reference.status == observed.status &&
+      oracle::SameCoordinates(reference.coordinates, observed.coordinates) &&
+      reference.target_step == observed.target_step &&
+      reference.retry_index == observed.retry_index &&
+      reference.iteration == observed.iteration &&
+      reference.attempted_newton_iterations ==
+          observed.attempted_newton_iterations &&
+      reference.newton_iterations == observed.newton_iterations &&
+      reference.full_vector_size == observed.full_vector_size &&
+      reference.owned_trace_size == observed.owned_trace_size;
+  const bool solve_scalars =
+      reference.trace_iterations == observed.trace_iterations &&
+      reference.entry_residual_norm == observed.entry_residual_norm &&
+      reference.trace_true_residual_norm ==
+          observed.trace_true_residual_norm &&
+      reference.trace_right_hand_side_norm ==
+          observed.trace_right_hand_side_norm &&
+      reference.maximum_local_application_residual ==
+          observed.maximum_local_application_residual &&
+      reference.paired_local_application_residual ==
+          observed.paired_local_application_residual &&
+      reference.paired_local_right_hand_side_norm ==
+          observed.paired_local_right_hand_side_norm;
+  const std::array<bool, 10> vectors{{
+      reference.nonlinear_residual == observed.nonlinear_residual,
+      reference.jacobian_action_input == observed.jacobian_action_input,
+      reference.jacobian_action_result == observed.jacobian_action_result,
+      reference.condensed_right_hand_side ==
+          observed.condensed_right_hand_side,
+      reference.true_trace_solution == observed.true_trace_solution,
+      reference.entry_interior == observed.entry_interior,
+      reference.entry_trace == observed.entry_trace,
+      reference.recovered_interior == observed.recovered_interior,
+      reference.recovered_trace == observed.recovered_trace,
+      reference.committed_integrals == observed.committed_integrals &&
+          reference.conserved_integrals == observed.conserved_integrals}};
+  std::array<char, 2048> buffer{};
+  for (int turn = 0; turn < 2; ++turn)
+  {
+    (void)MPI_Barrier(MPI_COMM_WORLD);
+    if (rank != turn) continue;
+    const int produced = std::snprintf(
+        buffer.data(), buffer.size(),
+        "SC25_R2_REPLAY_SNAPSHOT rank=%d step=%d exact=%d metadata=%d "
+        "solve_scalars=%d residual=%d action_in=%d action_out=%d rhs=%d "
+        "trace=%d entry_interior=%d entry_trace=%d recovered_interior=%d "
+        "recovered_trace=%d integrals=%d\n",
+        rank, step, oracle::SameSnapshot(reference, observed) ? 1 : 0,
+        metadata ? 1 : 0, solve_scalars ? 1 : 0,
+        vectors[0] ? 1 : 0, vectors[1] ? 1 : 0,
+        vectors[2] ? 1 : 0, vectors[3] ? 1 : 0,
+        vectors[4] ? 1 : 0, vectors[5] ? 1 : 0,
+        vectors[6] ? 1 : 0, vectors[7] ? 1 : 0,
+        vectors[8] ? 1 : 0, vectors[9] ? 1 : 0);
+    if (produced > 0)
+    {
+      const std::size_t length = std::min(
+          static_cast<std::size_t>(produced), buffer.size() - 1);
+      (void)::write(STDERR_FILENO, buffer.data(), length);
+    }
+  }
+  (void)MPI_Barrier(MPI_COMM_WORLD);
 }
 
 std::unique_ptr<scalar::PersistentSc25ScalarIgrCudaRank2> CreateCuda()
@@ -356,6 +566,13 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
              cpu::persistent_required_steps + 1> cpu_states{};
   std::array<cpu::PersistentRank2TrajectoryState,
              cpu::persistent_required_steps + 1> cuda_baseline_states{};
+  std::array<int, cpu::persistent_required_steps + 1>
+      cuda_baseline_trace_iterations{};
+  std::array<double, cpu::persistent_required_steps + 1>
+      cuda_baseline_trace_residuals{};
+  cuda_baseline_trace_iterations.fill(-1);
+  cuda_baseline_trace_residuals.fill(
+      std::numeric_limits<double>::infinity());
   for (std::size_t step = 0; step < cpu_states.size(); ++step)
     cpu_states[step] = cpu_reference.steps[step].state;
   if (!require(manifest::ValidCpuManifest(cpu_reference),
@@ -368,6 +585,9 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
   // its initialization/warm plateau and is reused by every negative campaign.
   const auto negative_evidence_before =
       std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto cuda_baseline_snapshots = std::make_unique<std::array<
+      scalar::ScalarCudaSnapshotEvidence,
+      cpu::persistent_required_steps + 1>>();
 
   auto cuda_owner = CreateCuda();
   if (!require(cuda_owner != nullptr, "CUDA rank-two creation")) return 1;
@@ -403,6 +623,11 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
       std::cerr << "C3: CUDA/accepted-CPU initialization operator evidence\n";
     return 1;
   }
+  cuda_baseline_trace_iterations[0] =
+      initialization_evidence.snapshots[0].trace_iterations;
+  cuda_baseline_trace_residuals[0] =
+      initialization_evidence.snapshots[0].trace_true_residual_norm;
+  (*cuda_baseline_snapshots)[0] = initialization_evidence.snapshots[0];
 
   scalar::PersistentSc25ScalarIgrCudaRank2::Transaction invalid{};
   const bool invalid_installed =
@@ -474,6 +699,14 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
         std::cerr << "C3: CUDA/accepted-CPU per-stage operator evidence\n";
       return 1;
     }
+    cuda_baseline_trace_iterations[static_cast<std::size_t>(step)] =
+        stage_evidence.snapshots[static_cast<std::size_t>(step)]
+            .trace_iterations;
+    cuda_baseline_trace_residuals[static_cast<std::size_t>(step)] =
+        stage_evidence.snapshots[static_cast<std::size_t>(step)]
+            .trace_true_residual_norm;
+    (*cuda_baseline_snapshots)[static_cast<std::size_t>(step)] =
+        stage_evidence.snapshots[static_cast<std::size_t>(step)];
     if (step == 10)
     {
       const bool captured =
@@ -527,6 +760,15 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
               cpu_states[10], cuda_state, 1.0e-10),
           "fresh restored accepted-CPU parity"))
     return 1;
+  if (!CollectiveAll(
+          oracle::SameStateBytes(cuda_baseline_states[10], cuda_state)))
+  {
+    EmitStateByteDiagnostics(
+        rank, 10, "fresh-restore", cuda_baseline_states[10], cuda_state);
+    if (rank == 0)
+      std::cerr << "C3: fresh restore installs exact step-ten bytes\n";
+    return 1;
+  }
   for (int step = 11; step <= cpu::persistent_required_steps; ++step)
   {
     const scalar::ScalarCudaStatus replayed =
@@ -540,10 +782,101 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
                          replay_evidence.snapshots[replay_index], step),
                  "fresh replay appends dense coherent snapshot evidence"))
       return 1;
+    if (!require(restart->CopyPublishedTrajectoryState(cuda_state),
+                 "fresh replay state copy"))
+      return 1;
+    if (!CollectiveAll(oracle::SameStateBytes(
+            cuda_baseline_states[static_cast<std::size_t>(step)],
+            cuda_state)))
+    {
+      EmitStateByteDiagnostics(
+          rank, step, "fresh-replay",
+          cuda_baseline_states[static_cast<std::size_t>(step)], cuda_state);
+      EmitReplaySolverDiagnostics(
+          rank, step,
+          cuda_baseline_trace_iterations[static_cast<std::size_t>(step)],
+          cuda_baseline_trace_residuals[static_cast<std::size_t>(step)],
+          replay_evidence.snapshots[replay_index]);
+      EmitReplaySnapshotDiagnostics(
+          rank, step,
+          (*cuda_baseline_snapshots)[static_cast<std::size_t>(step)],
+          replay_evidence.snapshots[replay_index]);
+      // If the first divergence is step eleven, finish a bounded control
+      // matrix on this already initialized owner.  A2 repeats the same
+      // restore/slot phase as A.  B restores twice before replay, selecting
+      // the physical slot phase of the uninterrupted even-step baseline.
+      // These controls distinguish solve-history nondeterminism from a
+      // ping-pong-address phase effect without another full trajectory.
+      if (step == 11)
+      {
+        const cpu::PersistentRank2TrajectoryState first_state = cuda_state;
+        const scalar::ScalarCudaSnapshotEvidence first_snapshot =
+            replay_evidence.snapshots[replay_index];
+        const auto run_step11_control = [&restart, &cuda_checkpoint10](
+            const int restore_count,
+            cpu::PersistentRank2TrajectoryState& output_state,
+            scalar::ScalarCudaSnapshotEvidence& output_snapshot)
+        {
+          for (int item = 0; item < restore_count; ++item)
+          {
+            if (restart->RestoreTrajectoryCheckpoint(cuda_checkpoint10) !=
+                scalar::ScalarCudaStatus::ready)
+              return false;
+          }
+          if (!CudaAccepted(restart->AdvancePersistentTrajectory()))
+            return false;
+          const auto& evidence = restart->trajectory_evidence();
+          if (!oracle::CoherentReplayEvidence(evidence, 10) ||
+              evidence.snapshot_count != 1)
+            return false;
+          output_snapshot = evidence.snapshots[0];
+          return restart->CopyPublishedTrajectoryState(output_state);
+        };
+
+        cpu::PersistentRank2TrajectoryState repeated_state{};
+        scalar::ScalarCudaSnapshotEvidence repeated_snapshot{};
+        const bool repeated = CollectiveAll(run_step11_control(
+            1, repeated_state, repeated_snapshot));
+        if (repeated)
+        {
+          EmitStateByteDiagnostics(
+              rank, 11, "replay-a-vs-a2", first_state, repeated_state);
+          EmitReplaySnapshotDiagnostics(
+              rank, 11, first_snapshot, repeated_snapshot);
+          EmitReplaySolverDiagnostics(
+              rank, 11, first_snapshot.trace_iterations,
+              first_snapshot.trace_true_residual_norm, repeated_snapshot);
+        }
+
+        cpu::PersistentRank2TrajectoryState flipped_state{};
+        scalar::ScalarCudaSnapshotEvidence flipped_snapshot{};
+        const bool flipped = repeated && CollectiveAll(run_step11_control(
+            2, flipped_state, flipped_snapshot));
+        if (flipped)
+        {
+          EmitStateByteDiagnostics(
+              rank, 11, "baseline-vs-replay-b",
+              cuda_baseline_states[11], flipped_state);
+          EmitReplaySnapshotDiagnostics(
+              rank, 11, (*cuda_baseline_snapshots)[11], flipped_snapshot);
+          EmitReplaySolverDiagnostics(
+              rank, 11, cuda_baseline_trace_iterations[11],
+              cuda_baseline_trace_residuals[11], flipped_snapshot);
+          EmitStateByteDiagnostics(
+              rank, 11, "replay-a-vs-b", first_state, flipped_state);
+          EmitReplaySnapshotDiagnostics(
+              rank, 11, first_snapshot, flipped_snapshot);
+        }
+        if (rank == 0)
+          std::cerr << "SC25_R2_REPLAY_CONTROL repeated="
+                    << (repeated ? 1 : 0) << " flipped="
+                    << (flipped ? 1 : 0) << '\n';
+      }
+      if (rank == 0)
+        std::cerr << "C3: first non-bitwise fresh replay state\n";
+      return 1;
+    }
   }
-  const bool replay_state_copied =
-      restart->CopyPublishedTrajectoryState(cuda_state);
-  if (!require(replay_state_copied, "replay final state copy")) return 1;
   if (!require(oracle::SameStateBytes(cuda_final, cuda_state),
                "bitwise restart continuation"))
     return 1;
