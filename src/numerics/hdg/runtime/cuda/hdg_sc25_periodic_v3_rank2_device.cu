@@ -5207,6 +5207,25 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
     value.status = ScalarCudaStatus::admissibility_failure;
     return value.status;
   }
+  // The persistent rank-two trace is stored redundantly so each rank can
+  // evaluate its local faces without a hot-path ghost exchange.  Establish
+  // that redundancy from the owning true-dof slices once, before the warm
+  // plateau: independently projected ghost copies can otherwise retain
+  // rank-local last-bit differences that a checkpoint restore canonicalizes.
+  if (!value.StageOwnedTrace(
+          value.view.slot_trace[0] + value.owned_true_begin))
+  {
+    value.status = ScalarCudaStatus::transfer_failure;
+    return value.status;
+  }
+  value.view.selected_current_slot = 0;
+  if (!value.LaunchRecover(
+          detail::KernelOperation::install_distributed_trace,
+          cuda_w8a::CudaFailurePhase::setup))
+  {
+    value.status = ScalarCudaStatus::transfer_failure;
+    return value.status;
+  }
   if (!value.LaunchRecover(detail::KernelOperation::copy_slot,
                            cuda_w8a::CudaFailurePhase::setup))
   {
