@@ -150,6 +150,34 @@ function(run_private_scalar_preparation_failure prefix environment value)
   set(${prefix}_error "${error}" PARENT_SCOPE)
 endfunction()
 
+function(run_private_scalar_post_finalize_failure prefix value)
+  if(HDG_RUNTIME_RANKS EQUAL 1)
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E env
+        "DG_IGR_HDG_TEST_SCALAR_POST_FINALIZE_FAILURE=${value}"
+        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+      TIMEOUT 180
+      RESULT_VARIABLE status
+      OUTPUT_VARIABLE output
+      ERROR_VARIABLE error)
+  else()
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E env
+        "DG_IGR_HDG_TEST_SCALAR_POST_FINALIZE_FAILURE=${value}"
+        "${HDG_RUNTIME_MPIEXEC}" "${HDG_RUNTIME_NUMPROC_FLAG}" 2
+        ${HDG_RUNTIME_MPIEXEC_PREFLAGS}
+        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
+        ${HDG_RUNTIME_MPIEXEC_POSTFLAGS}
+      TIMEOUT 180
+      RESULT_VARIABLE status
+      OUTPUT_VARIABLE output
+      ERROR_VARIABLE error)
+  endif()
+  set(${prefix}_status "${status}" PARENT_SCOPE)
+  set(${prefix}_output "${output}" PARENT_SCOPE)
+  set(${prefix}_error "${error}" PARENT_SCOPE)
+endfunction()
+
 function(run_private_scientific_gate prefix)
   if(HDG_RUNTIME_RANKS EQUAL 1)
     execute_process(
@@ -289,6 +317,17 @@ function(require_manifest_artifact generation artifact label)
   endif()
 endfunction()
 
+function(require_exact_logical_artifacts root label)
+  set(expected ${ARGN})
+  file(GLOB observed RELATIVE "${root}" LIST_DIRECTORIES FALSE "${root}/*")
+  list(SORT expected)
+  list(SORT observed)
+  if(NOT observed STREQUAL expected)
+    message(FATAL_ERROR
+      "${label} logical artifact census mismatch: expected=${expected};observed=${observed}")
+  endif()
+endfunction()
+
 function(validate_physical_vtk path mesh_n label)
   file(READ "${path}" vtk)
   file(STRINGS "${path}" vtk_lines)
@@ -359,11 +398,28 @@ function(validate_scalar_cuda_metadata metadata label expected_step)
      NOT metadata MATCHES "\"solver_contract\": true" OR
      NOT metadata MATCHES "\"persistent_reuse\": true" OR
      NOT metadata MATCHES "\"zero_fallback\": true" OR
-     NOT metadata MATCHES "\"zero_post_baseline_allocation\": true" OR
+     NOT metadata MATCHES
+         "\"zero_post_baseline_cuda_umpire_allocation\": true" OR
      NOT metadata MATCHES "\"device_residency\": true" OR
      NOT metadata MATCHES "\"host_staged_same_gpu\": true")
     message(FATAL_ERROR "${label} CUDA scalar-IGR evidence is incomplete")
   endif()
+  string(REGEX MATCH "\"gpu_uuid\": \"GPU-([0-9a-f]+)\""
+         uuid_match "${metadata}")
+  string(LENGTH "${CMAKE_MATCH_1}" uuid_hex_length)
+  if(NOT uuid_hex_length EQUAL 32)
+    message(FATAL_ERROR "${label} CUDA scalar-IGR GPU UUID is not 32 hex digits")
+  endif()
+  foreach(hash_field IN ITEMS initial_state_sha256 final_interior_sha256
+                              final_trace_sha256)
+    string(REGEX MATCH "\"${hash_field}\": \"([0-9a-f]+)\""
+           hash_match "${metadata}")
+    string(LENGTH "${CMAKE_MATCH_1}" hash_length)
+    if(NOT hash_length EQUAL 64)
+      message(FATAL_ERROR
+        "${label} CUDA scalar-IGR ${hash_field} is not 64 hex digits")
+    endif()
+  endforeach()
   foreach(scientific_field IN ITEMS maximum_conservation_error minimum_density
                                     minimum_pressure minimum_speed_margin)
     string(REGEX MATCH
@@ -393,6 +449,8 @@ if(HDG_RUNTIME_FUNCTIONAL)
     set(runtime_device none)
   endif()
   math(EXPR injection_rank "${HDG_RUNTIME_RANKS} - 1")
+  set(baseline_directory "${HDG_RUNTIME_TEST_OUTPUT}-baseline")
+  set(baseline_checkpoint "${HDG_RUNTIME_TEST_OUTPUT}-baseline.checkpoint")
   set(reference_directory "${HDG_RUNTIME_TEST_OUTPUT}-reference")
   # The frozen same-tuple restart contract binds a split trajectory to one
   # durable output identity. The reader resumes publication in that directory.
@@ -400,9 +458,10 @@ if(HDG_RUNTIME_FUNCTIONAL)
   set(reader_directory "${writer_directory}")
   set(reference_checkpoint "${HDG_RUNTIME_TEST_OUTPUT}-reference.checkpoint")
   set(split_checkpoint "${HDG_RUNTIME_TEST_OUTPUT}.checkpoint")
-  file(REMOVE_RECURSE "${reference_directory}" "${writer_directory}"
+  file(REMOVE_RECURSE "${baseline_directory}" "${reference_directory}" "${writer_directory}"
                       "${reader_directory}")
-  file(REMOVE "${reference_checkpoint}" "${split_checkpoint}")
+  file(REMOVE "${baseline_checkpoint}" "${reference_checkpoint}"
+              "${split_checkpoint}")
 
   if(HDG_RUNTIME_SCALAR_IGR)
     set(functional_common
@@ -444,6 +503,20 @@ if(HDG_RUNTIME_FUNCTIONAL)
     set(reference_expected_retries 0)
     set(writer_expected_retries 0)
     set(reader_expected_retries 1)
+  endif()
+
+  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_BACKEND STREQUAL "cuda")
+    run_runtime(baseline ${functional_common}
+      --output-dir "${baseline_directory}"
+      --checkpoint-out "${baseline_checkpoint}" --checkpoint-step 10
+      --stop-after-checkpoint false --restart-from none
+      --max-retries 0 --inject-failure off)
+    if(NOT baseline_status EQUAL 0 OR
+       NOT baseline_output MATCHES "status=Success.*step=20.*retries=0" OR
+       NOT baseline_error STREQUAL "")
+      message(FATAL_ERROR
+        "fault-free CUDA scalar baseline failed: ${baseline_status};${baseline_output};${baseline_error}")
+    endif()
   endif()
 
   if(HDG_RUNTIME_SCALAR_IGR)
@@ -494,6 +567,106 @@ if(HDG_RUNTIME_FUNCTIONAL)
       "functional split writer failed: ${writer_status};${writer_output};${writer_error}")
   endif()
 
+  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2 AND
+     HDG_RUNTIME_BACKEND STREQUAL "cuda")
+    if(NOT DEFINED HDG_RUNTIME_SCALAR_VTK_TEST OR
+       "$ENV{DG_IGR_SC25_R2_HANDOFF_DIR}" STREQUAL "" OR
+       "$ENV{DG_IGR_SC25_R2_RUN_ID}" STREQUAL "" OR
+       "$ENV{DG_IGR_SC25_R2_COMPLETE_SHA256}" STREQUAL "" OR
+       "$ENV{DG_IGR_SC25_R2_RANK0_SHA256}" STREQUAL "" OR
+       "$ENV{DG_IGR_SC25_R2_RANK1_SHA256}" STREQUAL "")
+      message(FATAL_ERROR
+        "rank-2 CUDA scalar artifacts require the hardened CPU handoff consumer inputs")
+    endif()
+    execute_process(
+      COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}"
+        --validate-scalar-rank2-artifacts
+        "$ENV{DG_IGR_SC25_R2_HANDOFF_DIR}"
+        "$ENV{DG_IGR_SC25_R2_RUN_ID}"
+        "$ENV{DG_IGR_SC25_R2_COMPLETE_SHA256}"
+        "$ENV{DG_IGR_SC25_R2_RANK0_SHA256}"
+        "$ENV{DG_IGR_SC25_R2_RANK1_SHA256}"
+        "${writer_directory}" "${split_checkpoint}"
+      RESULT_VARIABLE artifact_binding_status
+      OUTPUT_VARIABLE artifact_binding_output
+      ERROR_VARIABLE artifact_binding_error)
+    if(NOT artifact_binding_status EQUAL 0 OR
+       NOT artifact_binding_output MATCHES
+           "SCALAR_RANK2_ARTIFACT_BINDING_PASS.*vtk0_sha256=[0-9a-f][0-9a-f]+.*vtk10_sha256=[0-9a-f][0-9a-f]+.*checkpoint_sha256=[0-9a-f][0-9a-f]+.*sidecar_sha256=[0-9a-f][0-9a-f]+.*metadata_sha256=[0-9a-f][0-9a-f]+" OR
+       NOT artifact_binding_error STREQUAL "")
+      message(FATAL_ERROR
+        "rank-2 CUDA CLI artifacts were not bound to the CPU manifest: ${artifact_binding_status};${artifact_binding_output};${artifact_binding_error}")
+    endif()
+    foreach(binding_field IN ITEMS vtk0_sha256 vtk10_sha256
+                                   checkpoint_sha256 sidecar_sha256
+                                   metadata_sha256)
+      string(REGEX MATCH "${binding_field}=([0-9a-f]+)"
+             binding_match "${artifact_binding_output}")
+      string(LENGTH "${CMAKE_MATCH_1}" binding_length)
+      if(NOT binding_length EQUAL 64)
+        message(FATAL_ERROR
+          "rank-2 CUDA ${binding_field} binding is not exactly 64 hex digits")
+      endif()
+    endforeach()
+
+    foreach(sidecar_case IN ITEMS count checksum shape)
+      set(sidecar_negative_directory
+          "${HDG_RUNTIME_TEST_OUTPUT}-sidecar-${sidecar_case}")
+      file(REMOVE_RECURSE "${sidecar_negative_directory}")
+      execute_process(
+        COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}"
+          --make-scalar-sidecar-negative "${writer_directory}"
+          "${sidecar_negative_directory}" "${sidecar_case}"
+        RESULT_VARIABLE sidecar_builder_status
+        OUTPUT_VARIABLE sidecar_builder_output
+        ERROR_VARIABLE sidecar_builder_error)
+      if(NOT sidecar_builder_status EQUAL 0 OR
+         NOT sidecar_builder_error STREQUAL "")
+        message(FATAL_ERROR
+          "malformed sidecar ${sidecar_case} fixture failed: ${sidecar_builder_output};${sidecar_builder_error}")
+      endif()
+      set(sidecar_negative_checkpoint
+          "${sidecar_negative_directory}/restart-checkpoint.v2")
+      file(READ_SYMLINK "${sidecar_negative_directory}/.dg-igr-current"
+                        sidecar_current_before)
+      file(SHA256 "${sidecar_negative_checkpoint}"
+                  sidecar_checkpoint_hash_before)
+      file(SHA256
+        "${sidecar_negative_directory}/checkpoint-runtime-identity.v1"
+        sidecar_identity_hash_before)
+      file(GLOB sidecar_generations_before
+        "${sidecar_negative_directory}/.dg-igr-generations/generation-*")
+      list(LENGTH sidecar_generations_before sidecar_generation_count_before)
+      run_runtime(sidecar_negative ${functional_common}
+        --output-dir "${sidecar_negative_directory}"
+        --checkpoint-out none --checkpoint-step none
+        --stop-after-checkpoint false
+        --restart-from "${sidecar_negative_checkpoint}"
+        --max-retries 0 --inject-failure off)
+      file(READ_SYMLINK "${sidecar_negative_directory}/.dg-igr-current"
+                        sidecar_current_after)
+      file(SHA256 "${sidecar_negative_checkpoint}"
+                  sidecar_checkpoint_hash_after)
+      file(SHA256
+        "${sidecar_negative_directory}/checkpoint-runtime-identity.v1"
+        sidecar_identity_hash_after)
+      file(GLOB sidecar_generations_after
+        "${sidecar_negative_directory}/.dg-igr-generations/generation-*")
+      list(LENGTH sidecar_generations_after sidecar_generation_count_after)
+      if(NOT sidecar_negative_status EQUAL 66 OR
+         NOT sidecar_negative_error MATCHES "reason=restart_incompatible" OR
+         NOT sidecar_current_before STREQUAL sidecar_current_after OR
+         NOT sidecar_checkpoint_hash_before STREQUAL
+             sidecar_checkpoint_hash_after OR
+         NOT sidecar_identity_hash_before STREQUAL sidecar_identity_hash_after OR
+         NOT sidecar_generation_count_before EQUAL
+             sidecar_generation_count_after)
+        message(FATAL_ERROR
+          "malformed sidecar ${sidecar_case} did not fail cleanly without drift: ${sidecar_negative_status};${sidecar_negative_output};${sidecar_negative_error}")
+      endif()
+    endforeach()
+  endif()
+
   run_runtime(reader ${functional_common}
     --output-dir "${reader_directory}"
     --checkpoint-out none --checkpoint-step none
@@ -506,6 +679,42 @@ if(HDG_RUNTIME_FUNCTIONAL)
      NOT reader_error STREQUAL "")
     message(FATAL_ERROR
       "functional split reader/retry failed: ${reader_status};${reader_output};${reader_error}")
+  endif()
+
+  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2 AND
+     HDG_RUNTIME_BACKEND STREQUAL "cuda")
+    foreach(trajectory_directory IN ITEMS baseline_directory
+                                          reference_directory writer_directory)
+      execute_process(
+        COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}"
+          --validate-scalar-rank2-artifacts
+          "$ENV{DG_IGR_SC25_R2_HANDOFF_DIR}"
+          "$ENV{DG_IGR_SC25_R2_RUN_ID}"
+          "$ENV{DG_IGR_SC25_R2_COMPLETE_SHA256}"
+          "$ENV{DG_IGR_SC25_R2_RANK0_SHA256}"
+          "$ENV{DG_IGR_SC25_R2_RANK1_SHA256}"
+          "${${trajectory_directory}}" none
+        RESULT_VARIABLE trajectory_binding_status
+        OUTPUT_VARIABLE trajectory_binding_output
+        ERROR_VARIABLE trajectory_binding_error)
+      if(NOT trajectory_binding_status EQUAL 0 OR
+         NOT trajectory_binding_output MATCHES
+             "SCALAR_RANK2_TRAJECTORY_BINDING_PASS.*vtk0_sha256=[0-9a-f]+.*vtk10_sha256=[0-9a-f]+.*vtk20_sha256=[0-9a-f]+.*metadata_sha256=[0-9a-f]+" OR
+         NOT trajectory_binding_error STREQUAL "")
+        message(FATAL_ERROR
+          "rank-2 CUDA trajectory was not bound to CPU steps 0/10/20: ${trajectory_directory};${trajectory_binding_output};${trajectory_binding_error}")
+      endif()
+      foreach(binding_field IN ITEMS vtk0_sha256 vtk10_sha256 vtk20_sha256
+                                     metadata_sha256)
+        string(REGEX MATCH "${binding_field}=([0-9a-f]+)"
+               trajectory_hash_match "${trajectory_binding_output}")
+        string(LENGTH "${CMAKE_MATCH_1}" trajectory_hash_length)
+        if(NOT trajectory_hash_length EQUAL 64)
+          message(FATAL_ERROR
+            "rank-2 CUDA trajectory ${binding_field} is not 64 hex digits")
+        endif()
+      endforeach()
+    endforeach()
   endif()
 
   set(functional_publications
@@ -551,12 +760,13 @@ if(HDG_RUNTIME_FUNCTIONAL)
   file(READ "${reader_directory}/run-metadata.json" reader_metadata)
   if(HDG_RUNTIME_SCALAR_IGR AND
      HDG_RUNTIME_BACKEND STREQUAL "cuda")
+    file(READ "${baseline_directory}/run-metadata.json" baseline_metadata)
+    validate_scalar_cuda_metadata("${baseline_metadata}" "baseline" 20)
     validate_scalar_cuda_metadata("${reference_metadata}" "reference" 20)
     validate_scalar_cuda_metadata("${writer_metadata}" "split writer" 10)
     validate_scalar_cuda_metadata("${reader_metadata}" "split reader" 20)
   endif()
-  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2 AND
-     HDG_RUNTIME_BACKEND STREQUAL "cpu")
+  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2)
     foreach(injection_metadata IN ITEMS reference_metadata writer_metadata)
       if(NOT "${${injection_metadata}}" MATCHES
              "\"injection_configured_source_rank\": 1" OR
@@ -639,6 +849,93 @@ if(HDG_RUNTIME_FUNCTIONAL)
      NOT state_parity OR NOT reader_metadata MATCHES "\"status\": \"Success\"" OR
      NOT reader_metadata MATCHES "\"retries\": 1")
     message(FATAL_ERROR "functional restart/retry parity contract failed")
+  endif()
+  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_BACKEND STREQUAL "cuda")
+    foreach(step IN ITEMS 000000 000010 000020)
+      foreach(candidate_directory IN ITEMS reference_directory reader_directory)
+        execute_process(
+          COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk
+            "${baseline_directory}/state-step-${step}.vtk"
+            "${${candidate_directory}}/state-step-${step}.vtk" 1e-15
+          RESULT_VARIABLE baseline_compare_status
+          OUTPUT_VARIABLE baseline_compare_output
+          ERROR_VARIABLE baseline_compare_error)
+        if(NOT baseline_compare_status EQUAL 0 OR
+           NOT baseline_compare_error STREQUAL "")
+          message(FATAL_ERROR
+            "CUDA scalar injected/split trajectory did not return to the fault-free baseline at ${step}: ${baseline_compare_output};${baseline_compare_error}")
+        endif()
+      endforeach()
+    endforeach()
+    execute_process(
+      COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk
+        "${reference_directory}/state-step-000010.vtk"
+        "${writer_directory}/state-step-000010.vtk" 1e-15
+      RESULT_VARIABLE writer_step10_status
+      OUTPUT_VARIABLE writer_step10_output
+      ERROR_VARIABLE writer_step10_error)
+    if(NOT writer_step10_status EQUAL 0 OR
+       NOT writer_step10_error STREQUAL "")
+      message(FATAL_ERROR
+        "CUDA scalar reference/writer step-10 identity failed: ${writer_step10_output};${writer_step10_error}")
+    endif()
+    foreach(hash_field IN ITEMS final_interior_sha256 final_trace_sha256)
+      string(REGEX MATCH "\"${hash_field}\": \"([0-9a-f]+)\""
+             baseline_hash_match "${baseline_metadata}")
+      set(baseline_hash "${CMAKE_MATCH_1}")
+      string(REGEX MATCH "\"${hash_field}\": \"([0-9a-f]+)\""
+             reference_hash_match "${reference_metadata}")
+      set(reference_hash "${CMAKE_MATCH_1}")
+      string(REGEX MATCH "\"${hash_field}\": \"([0-9a-f]+)\""
+             reader_hash_match "${reader_metadata}")
+      set(reader_hash "${CMAKE_MATCH_1}")
+      if(NOT baseline_hash STREQUAL reference_hash OR
+         NOT baseline_hash STREQUAL reader_hash)
+        message(FATAL_ERROR
+          "CUDA scalar ${hash_field} differs from the fault-free baseline")
+      endif()
+    endforeach()
+    require_exact_logical_artifacts("${baseline_directory}" "baseline"
+      checkpoint-runtime-identity.v1 restart-checkpoint.v2 run-metadata.json
+      state-step-000000.vtk state-step-000010.vtk state-step-000020.vtk)
+    require_exact_logical_artifacts("${reference_directory}" "reference"
+      checkpoint-runtime-identity.v1 restart-checkpoint.v2 run-metadata.json
+      state-step-000000.vtk state-step-000010.vtk state-step-000020.vtk)
+    require_exact_logical_artifacts("${writer_directory}" "split"
+      checkpoint-runtime-identity.v1 restart-checkpoint.v2
+      run-metadata-checkpoint.json run-metadata.json state-step-000000.vtk
+      state-step-000010.vtk state-step-000020.vtk)
+    math(EXPR maximum_compensation_source "${HDG_RUNTIME_RANKS} - 1")
+    foreach(source RANGE 0 ${maximum_compensation_source})
+      set(compensation_directory
+          "${HDG_RUNTIME_TEST_OUTPUT}-post-finalize-rank${source}")
+      set(compensation_checkpoint
+          "${HDG_RUNTIME_TEST_OUTPUT}-post-finalize-rank${source}.checkpoint")
+      file(REMOVE_RECURSE "${compensation_directory}")
+      file(REMOVE "${compensation_checkpoint}")
+      run_private_scalar_post_finalize_failure(
+        compensation "10:${source}" ${functional_common}
+        --output-dir "${compensation_directory}"
+        --checkpoint-out "${compensation_checkpoint}" --checkpoint-step 10
+        --stop-after-checkpoint false --restart-from none
+        --max-retries 0 --inject-failure off)
+      file(READ_SYMLINK "${compensation_directory}/.dg-igr-current"
+                        compensation_current)
+      if(NOT compensation_status EQUAL 72 OR
+         NOT compensation_error MATCHES
+             "post-finalize compensation failure source_rank=${source}" OR
+         NOT compensation_current MATCHES "generation-0-" OR
+         EXISTS "${compensation_checkpoint}" OR
+         EXISTS "${compensation_directory}/state-step-000010.vtk" OR
+         EXISTS "${compensation_directory}/run-metadata.json" OR
+         EXISTS "${compensation_directory}/run-metadata-checkpoint.json")
+        message(FATAL_ERROR
+          "CUDA scalar post-finalize compensation/rank${source} failed: ${compensation_status};${compensation_output};${compensation_error}")
+      endif()
+      require_exact_logical_artifacts(
+        "${compensation_directory}" "post-finalize rank${source}"
+        state-step-000000.vtk)
+    endforeach()
   endif()
   if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2 AND
      HDG_RUNTIME_BACKEND STREQUAL "cpu")
@@ -882,23 +1179,6 @@ if(HDG_RUNTIME_FUNCTIONAL)
           "rank-2 CUDA scalar parity requires the immutable CPU handoff locator and exact hashes")
       endif()
       set(handoff_directory "$ENV{DG_IGR_SC25_R2_HANDOFF_DIR}")
-      set(handoff_complete "${handoff_directory}/COMPLETE.c3m")
-      set(handoff_rank0 "${handoff_directory}/rank-0.c3m")
-      set(handoff_rank1 "${handoff_directory}/rank-1.c3m")
-      foreach(handoff_file IN ITEMS handoff_complete handoff_rank0 handoff_rank1)
-        require_regular_file("${${handoff_file}}" "immutable CPU handoff")
-      endforeach()
-      file(SHA256 "${handoff_complete}" observed_complete_sha256)
-      file(SHA256 "${handoff_rank0}" observed_rank0_sha256)
-      file(SHA256 "${handoff_rank1}" observed_rank1_sha256)
-      if(NOT observed_complete_sha256 STREQUAL
-             "$ENV{DG_IGR_SC25_R2_COMPLETE_SHA256}" OR
-         NOT observed_rank0_sha256 STREQUAL
-             "$ENV{DG_IGR_SC25_R2_RANK0_SHA256}" OR
-         NOT observed_rank1_sha256 STREQUAL
-             "$ENV{DG_IGR_SC25_R2_RANK1_SHA256}")
-        message(FATAL_ERROR "immutable CPU handoff digest mismatch")
-      endif()
       execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env
           "DG_IGR_SC25_R2_HANDOFF_DIR=${handoff_directory}"
@@ -919,14 +1199,6 @@ if(HDG_RUNTIME_FUNCTIONAL)
          NOT manifest_consumer_error STREQUAL "")
         message(FATAL_ERROR
           "immutable CPU producer/CUDA consumer parity failed: ${manifest_consumer_status};${manifest_consumer_output};${manifest_consumer_error}")
-      endif()
-      file(SHA256 "${handoff_complete}" final_complete_sha256)
-      file(SHA256 "${handoff_rank0}" final_rank0_sha256)
-      file(SHA256 "${handoff_rank1}" final_rank1_sha256)
-      if(NOT final_complete_sha256 STREQUAL observed_complete_sha256 OR
-         NOT final_rank0_sha256 STREQUAL observed_rank0_sha256 OR
-         NOT final_rank1_sha256 STREQUAL observed_rank1_sha256)
-        message(FATAL_ERROR "immutable CPU handoff changed during consumption")
       endif()
     else()
       set(cpu_directory "${HDG_RUNTIME_TEST_OUTPUT}-cpu-parity")

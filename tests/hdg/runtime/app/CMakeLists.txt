@@ -10,6 +10,11 @@ foreach(_dg_igr_hdg_app_test IN ITEMS
                  "test_${_dg_igr_hdg_app_test}.cpp")
   target_link_libraries("${_dg_igr_hdg_app_target}"
                         PRIVATE dg_igr_hdg_runtime_app_contract)
+  if(_dg_igr_hdg_app_test STREQUAL "command_line")
+    target_include_directories("${_dg_igr_hdg_app_target}" PRIVATE
+      "${PROJECT_SOURCE_DIR}/tests/hdg/runtime/common")
+    target_link_libraries("${_dg_igr_hdg_app_target}" PRIVATE mfem MPI::MPI_CXX)
+  endif()
   target_compile_definitions("${_dg_igr_hdg_app_target}" PRIVATE
     DG_IGR_HDG_RUNTIME_EXPECTED_CPLUSPLUS=201703L)
   target_compile_options("${_dg_igr_hdg_app_target}" PRIVATE

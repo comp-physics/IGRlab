@@ -27,6 +27,7 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -1639,31 +1640,38 @@ bool SealScalarCheckpoint(ScalarCheckpoint& checkpoint,
                           const ScalarResourceRecord& resources,
                           const CudaApplicationContextV1& context) noexcept
 {
+  bool local_ready = true;
   try
   {
     std::vector<double> component_major;
-    if (!detail::ScalarIgrFieldBlocksToComponentMajorV1(
-            state.interior, scalar::volume_nodes, component_major))
-      return false;
+    local_ready = detail::ScalarIgrFieldBlocksToComponentMajorV1(
+        state.interior, scalar::volume_nodes, component_major);
 #if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
-    checkpoint.interior_component_slabs.resize(component_major.size());
+    if (local_ready)
+      checkpoint.interior_component_slabs.resize(component_major.size());
 #endif
-    if (component_major.size() != checkpoint.interior_component_slabs.size())
-      return false;
-    std::copy(component_major.begin(), component_major.end(),
-              checkpoint.interior_component_slabs.begin());
+    local_ready = local_ready &&
+        component_major.size() == checkpoint.interior_component_slabs.size();
+    if (local_ready)
+      std::copy(component_major.begin(), component_major.end(),
+                checkpoint.interior_component_slabs.begin());
 #if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
-    checkpoint.owned_trace_component_slabs = state.trace;
-    checkpoint.shard_rank = context.rank();
-    checkpoint.owned_scalar_trace_nodes =
-        static_cast<int>(state.trace.size() / scalar::trace_components);
+    if (local_ready)
+    {
+      checkpoint.owned_trace_component_slabs = state.trace;
+      checkpoint.shard_rank = context.rank();
+      checkpoint.owned_scalar_trace_nodes =
+          static_cast<int>(state.trace.size() / scalar::trace_components);
+    }
 #else
-    if (state.trace.size() != checkpoint.trace_component_slabs.size())
-      return false;
-    std::copy(state.trace.begin(), state.trace.end(),
-              checkpoint.trace_component_slabs.begin());
+    local_ready = local_ready &&
+        state.trace.size() == checkpoint.trace_component_slabs.size();
+    if (local_ready)
+      std::copy(state.trace.begin(), state.trace.end(),
+                checkpoint.trace_component_slabs.begin());
 #endif
-    checkpoint.raw_field_hashes = ScalarStateHashes(state);
+    if (local_ready)
+      checkpoint.raw_field_hashes = ScalarStateHashes(state);
     checkpoint.descriptor.schema_version = checkpoint_schema_version;
     checkpoint.descriptor.successful_commit = true;
     checkpoint.descriptor.restart_mode =
@@ -1690,33 +1698,41 @@ bool SealScalarCheckpoint(ScalarCheckpoint& checkpoint,
         checkpoint.raw_field_hashes.interior;
     checkpoint.descriptor.trace_hash = checkpoint.raw_field_hashes.trace;
 #if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
-    checkpoint.shard_manifest_hash = ScalarCheckpointManifest(checkpoint);
-    std::array<StateHash, 2> rank_ordered{};
-    const bool gathered = MPI_Allgather(
-        checkpoint.shard_manifest_hash.bytes.data(), 32, MPI_UINT8_T,
-        rank_ordered.data(), 32, MPI_UINT8_T,
-        context.communicator()) == MPI_SUCCESS;
-    Sha256 combined;
-    Sha256Digest combined_digest{};
-    const std::string_view identity =
-        "HDG-SC25-CUDA-R2-COMBINED-CHECKPOINT-v1";
-    const std::uint64_t rank_count = 2;
-    const bool combined_valid = gathered &&
-        combined.Update(identity.data(), identity.size()) &&
-        combined.Update(&rank_count, sizeof(rank_count)) &&
-        combined.Update(rank_ordered.data(), sizeof(rank_ordered)) &&
-        combined.Finalize(combined_digest);
-    checkpoint.canonical_manifest_hash = combined_valid
-        ? StateHash{combined_digest} : StateHash{};
-    return ScalarCollectiveAll(
-        checkpoint.shard_manifest_hash != StateHash{} && combined_valid,
-        context);
+    if (local_ready)
+      checkpoint.shard_manifest_hash = ScalarCheckpointManifest(checkpoint);
+    local_ready = local_ready && checkpoint.shard_manifest_hash != StateHash{};
 #else
-    checkpoint.canonical_manifest_hash = ScalarCheckpointManifest(checkpoint);
-    return checkpoint.canonical_manifest_hash != StateHash{};
+    if (local_ready)
+      checkpoint.canonical_manifest_hash = ScalarCheckpointManifest(checkpoint);
+    local_ready = local_ready &&
+        checkpoint.canonical_manifest_hash != StateHash{};
 #endif
   }
-  catch (...) { return false; }
+  catch (...) { local_ready = false; }
+  if (!ScalarCollectiveAll(local_ready, context)) return false;
+#if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
+  std::array<StateHash, 2> rank_ordered{};
+  const bool gathered = MPI_Allgather(
+      checkpoint.shard_manifest_hash.bytes.data(), 32, MPI_UINT8_T,
+      rank_ordered.data(), 32, MPI_UINT8_T,
+      context.communicator()) == MPI_SUCCESS;
+  if (!ScalarCollectiveAll(gathered, context)) return false;
+  Sha256 combined;
+  Sha256Digest combined_digest{};
+  const std::string_view identity =
+      "HDG-SC25-CUDA-R2-COMBINED-CHECKPOINT-v1";
+  const std::uint64_t rank_count = 2;
+  const bool combined_valid =
+      combined.Update(identity.data(), identity.size()) &&
+      combined.Update(&rank_count, sizeof(rank_count)) &&
+      combined.Update(rank_ordered.data(), sizeof(rank_ordered)) &&
+      combined.Finalize(combined_digest);
+  checkpoint.canonical_manifest_hash = combined_valid
+      ? StateHash{combined_digest} : StateHash{};
+  return ScalarCollectiveAll(combined_valid, context);
+#else
+  return true;
+#endif
 }
 
 bool ScalarBeginTransaction(DurableGenerationTransactionV1& transaction,
@@ -1786,9 +1802,14 @@ bool GatherScalarVector(const std::vector<double>& local,
                         std::vector<double>& gathered,
                         std::string& detail)
 {
-  if (local.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+  const bool representable =
+      local.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max());
+  const int local_count = representable ? static_cast<int>(local.size()) : 0;
+  if (!ScalarCollectiveAll(representable, context))
+  {
+    detail = "scalar-IGR gather count is not representable";
     return false;
-  const int local_count = static_cast<int>(local.size());
+  }
   const bool count_ready = MPI_Gather(
       &local_count, 1, MPI_INT, counts.data(), 1, MPI_INT, 0,
       context.communicator()) == MPI_SUCCESS;
@@ -1822,9 +1843,10 @@ bool GatherScalarVector(const std::vector<double>& local,
       context.rank() == 0 ? gathered.data() : nullptr, counts.data(),
       displacements.data(), MPI_DOUBLE, 0, context.communicator()) ==
       MPI_SUCCESS;
-  if (!ScalarCollectiveAll(gathered_ok, context))
+  const bool collectively_gathered = ScalarCollectiveAll(gathered_ok, context);
+  if (!collectively_gathered)
     detail = "scalar-IGR payload gather failed";
-  return gathered_ok;
+  return collectively_gathered;
 }
 
 mfem::Mesh MakeScalarCudaMesh(const ValidatedApplicationConfig& config)
@@ -1971,8 +1993,11 @@ bool StageScalarCudaVtk(const ValidatedApplicationConfig& config,
                           gathered, detail))
     return false;
   std::vector<std::uint8_t> bytes;
+  std::string step_name;
   bool ready = true;
-  if (context.rank() == 0)
+  try { step_name = ScalarStepName(state.coordinates.step); }
+  catch (...) { ready = false; }
+  if (context.rank() == 0 && ready)
   {
     try
     {
@@ -1984,22 +2009,27 @@ bool StageScalarCudaVtk(const ValidatedApplicationConfig& config,
     }
     catch (...) { ready = false; }
   }
-  return ScalarCollectiveAll(ready, context) &&
-      ScalarStageArtifact(transaction, ScalarStepName(state.coordinates.step),
-                          bytes, context, detail);
+  ready = ScalarCollectiveAll(ready, context);
+  bool staged = false;
+  if (ready)
+    staged = ScalarStageArtifact(transaction, step_name, bytes, context,
+                                 detail);
+  return ready && staged;
 }
 
 StateHash ScalarAggregateHash(const StateHash& local,
                               const CudaApplicationContextV1& context) noexcept
 {
   std::array<StateHash, 2> rank_ordered{};
-  if (MPI_Allgather(local.bytes.data(), 32, MPI_UINT8_T,
-                    rank_ordered.data(), 32, MPI_UINT8_T,
-                    context.communicator()) != MPI_SUCCESS)
-    return {};
-  return StateHash{ComputeSha256(
+  const bool gathered = MPI_Allgather(
+      local.bytes.data(), 32, MPI_UINT8_T, rank_ordered.data(), 32,
+      MPI_UINT8_T, context.communicator()) == MPI_SUCCESS;
+  if (!ScalarCollectiveAll(gathered, context)) return {};
+  const StateHash aggregate{ComputeSha256(
       rank_ordered.data(), static_cast<std::size_t>(context.ranks()) *
           sizeof(StateHash))};
+  const bool valid = aggregate != StateHash{};
+  return ScalarCollectiveAll(valid, context) ? aggregate : StateHash{};
 }
 
 bool ScalarGpuRecord(const int device,
@@ -2124,17 +2154,82 @@ bool ValidScalarSidecar(const ScalarResourceSidecar& sidecar,
                         const CudaApplicationContextV1& context) noexcept
 {
   const ScalarResourceSidecar expected{};
+  const std::uint32_t required =
+      config.deferred_runtime().required_mpi_rank_count;
+  const bool bounded_header = sidecar.magic == expected.magic &&
+      sidecar.version == 1 && sidecar.rank_count >= 1 &&
+      sidecar.rank_count <= sidecar.ranks.size() &&
+      sidecar.rank_count == required &&
+      sidecar.rank_count == static_cast<std::uint32_t>(context.ranks()) &&
+      sidecar.checksum != StateHash{} &&
+      sidecar.checksum.bytes == ComputeSha256(
+          &sidecar, offsetof(ScalarResourceSidecar, checksum));
+  if (!bounded_header) return false;
+
   ScalarResourceRecord actual{};
   const bool uuid_ready = ScalarGpuRecord(config.device_id(), actual);
-  bool same_uuid = uuid_ready;
+  bool valid = uuid_ready;
   for (std::uint32_t rank = 0; rank < sidecar.rank_count; ++rank)
-    same_uuid = same_uuid && sidecar.ranks[rank].gpu_uuid == actual.gpu_uuid;
-  return sidecar.magic == expected.magic && sidecar.version == 1 &&
-      sidecar.rank_count ==
-          config.deferred_runtime().required_mpi_rank_count &&
-      sidecar.rank_count == static_cast<std::uint32_t>(context.ranks()) &&
-      sidecar.checksum.bytes == ComputeSha256(
-          &sidecar, offsetof(ScalarResourceSidecar, checksum)) && same_uuid;
+  {
+    const ScalarResourceRecord& record =
+        sidecar.ranks[static_cast<std::size_t>(rank)];
+    const CheckpointDescriptor& descriptor = record.private_descriptor;
+#if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
+    const RuntimeTupleDescriptor expected_tuple =
+        scalar::CudaRank2Selection::Descriptor();
+#else
+    const RuntimeTupleDescriptor expected_tuple =
+        scalar::CudaRank1Selection::Descriptor();
+#endif
+    const bool raw_hashes = record.raw_field_hashes.u != StateHash{} &&
+        record.raw_field_hashes.sigma != StateHash{} &&
+        record.raw_field_hashes.z != StateHash{} &&
+        record.raw_field_hashes.uhat != StateHash{} &&
+        record.raw_field_hashes.sigmahat != StateHash{} &&
+        record.raw_field_hashes.interior != StateHash{} &&
+        record.raw_field_hashes.trace != StateHash{};
+    const StateCoordinates& coordinates = descriptor.coordinates;
+    bool record_valid = record.mesh != StateHash{} &&
+        record.partition != StateHash{} && record.topology != StateHash{} &&
+        record.gpu_uuid == actual.gpu_uuid && raw_hashes &&
+        record.canonical_manifest_hash != StateHash{} &&
+        descriptor.schema_version == checkpoint_schema_version &&
+        descriptor.successful_commit &&
+        descriptor.restart_mode == RestartMode::same_backend_rank_partition &&
+        descriptor.tuple == expected_tuple &&
+        descriptor.mfem_pin == StableIdentity::Copy(scalar::mfem_pin) &&
+        descriptor.mesh_hash == record.mesh &&
+        descriptor.partition_hash == record.partition &&
+        descriptor.topology_hash == record.topology &&
+        descriptor.rank_count == sidecar.rank_count &&
+        descriptor.polynomial_order == config.polynomial_order() &&
+        descriptor.layout == StableIdentity::Copy(scalar::interior_layout_id) &&
+        descriptor.precision == StableIdentity::Copy("Fp64") &&
+        descriptor.cursor == coordinates.cursor &&
+        descriptor.dt == coordinates.dt &&
+        descriptor.coordinate_fingerprint ==
+            ::dg::hdg::runtime::detail::CoordinateFingerprint(coordinates) &&
+        coordinates.step == config.scenario_checkpoint_step() &&
+        coordinates.step == coordinates.generation &&
+        coordinates.step == coordinates.cursor &&
+        coordinates.time == static_cast<double>(coordinates.step) * config.dt() &&
+        coordinates.dt == config.dt() &&
+        descriptor.interior_hash == record.raw_field_hashes.interior &&
+        descriptor.trace_hash == record.raw_field_hashes.trace;
+#if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
+    record_valid = record_valid &&
+        record.raw_field_hashes.shard != StateHash{} &&
+        record.shard_manifest_hash != StateHash{};
+#else
+    record_valid = record_valid && record.shard_manifest_hash == StateHash{};
+#endif
+    valid = valid && record_valid;
+  }
+  if (sidecar.rank_count == 2)
+    valid = valid && sidecar.ranks[0].gpu_uuid == sidecar.ranks[1].gpu_uuid &&
+        sidecar.ranks[0].canonical_manifest_hash ==
+            sidecar.ranks[1].canonical_manifest_hash;
+  return valid;
 }
 
 bool StageScalarCudaCheckpoint(
@@ -2145,16 +2240,28 @@ bool StageScalarCudaCheckpoint(
     DurableGenerationTransactionV1& transaction,
     std::string& detail)
 {
-  std::vector<double> local_interior(
-      checkpoint.interior_component_slabs.begin(),
-      checkpoint.interior_component_slabs.end());
+  std::vector<double> local_interior;
   std::vector<double> local_trace;
+  std::string checkpoint_alias;
+  bool locally_prepared = true;
+  try
+  {
+    local_interior.assign(checkpoint.interior_component_slabs.begin(),
+                          checkpoint.interior_component_slabs.end());
 #if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
-  local_trace = checkpoint.owned_trace_component_slabs;
+    local_trace = checkpoint.owned_trace_component_slabs;
 #else
-  local_trace.assign(checkpoint.trace_component_slabs.begin(),
-                     checkpoint.trace_component_slabs.end());
+    local_trace.assign(checkpoint.trace_component_slabs.begin(),
+                       checkpoint.trace_component_slabs.end());
 #endif
+    checkpoint_alias = writer.checkpoint_out().identity().view();
+  }
+  catch (...) { locally_prepared = false; }
+  if (!ScalarCollectiveAll(locally_prepared, context))
+  {
+    detail = "scalar-IGR CUDA checkpoint local preparation failed";
+    return false;
+  }
   const PersistentResourceDescriptor resources =
       ScalarResources(sidecar, writer);
   CheckpointDescriptor local_descriptor = checkpoint.descriptor;
@@ -2180,10 +2287,12 @@ bool StageScalarCudaCheckpoint(
   std::array<int, 2> interior_counts{}, interior_displacements{};
   std::array<int, 2> trace_counts{}, trace_displacements{};
   std::vector<double> interiors, traces;
-  if (!GatherScalarVector(local_interior, context, interior_counts,
-                          interior_displacements, interiors, detail) ||
-      !GatherScalarVector(local_trace, context, trace_counts,
-                          trace_displacements, traces, detail))
+  const bool interiors_ready = GatherScalarVector(
+      local_interior, context, interior_counts, interior_displacements,
+      interiors, detail);
+  const bool traces_ready = GatherScalarVector(
+      local_trace, context, trace_counts, trace_displacements, traces, detail);
+  if (!interiors_ready || !traces_ready)
     return false;
   std::vector<std::uint8_t> encoded;
   bool encoded_ok = true;
@@ -2227,18 +2336,30 @@ bool StageScalarCudaCheckpoint(
     return false;
   }
   std::vector<std::uint8_t> sidecar_bytes;
+  bool sidecar_ready = true;
   if (context.rank() == 0)
   {
-    const auto* begin = reinterpret_cast<const std::uint8_t*>(&sidecar);
-    sidecar_bytes.assign(begin, begin + sizeof(sidecar));
+    try
+    {
+      const auto* begin = reinterpret_cast<const std::uint8_t*>(&sidecar);
+      sidecar_bytes.assign(begin, begin + sizeof(sidecar));
+    }
+    catch (...) { sidecar_ready = false; }
   }
-  return ScalarStageArtifact(transaction, "restart-checkpoint.v2", encoded,
-                             context, detail) &&
-      ScalarAddAlias(transaction,
-                     std::string{writer.checkpoint_out().identity().view()},
-                     "restart-checkpoint.v2", context, detail) &&
-      ScalarStageArtifact(transaction, "checkpoint-runtime-identity.v1",
-                          sidecar_bytes, context, detail);
+  if (!ScalarCollectiveAll(sidecar_ready, context))
+  {
+    detail = "scalar-IGR CUDA checkpoint sidecar serialization failed";
+    return false;
+  }
+  const bool checkpoint_staged = ScalarStageArtifact(
+      transaction, "restart-checkpoint.v2", encoded, context, detail);
+  const bool alias_added = ScalarAddAlias(
+      transaction, checkpoint_alias, "restart-checkpoint.v2", context,
+      detail);
+  const bool sidecar_staged = ScalarStageArtifact(
+      transaction, "checkpoint-runtime-identity.v1", sidecar_bytes, context,
+      detail);
+  return checkpoint_staged && alias_added && sidecar_staged;
 }
 
 bool RestoreScalarCudaCheckpoint(
@@ -2269,18 +2390,21 @@ bool RestoreScalarCudaCheckpoint(
     }
     catch (...) { decoded = false; }
   }
-  decoded = ScalarCollectiveAll(decoded, context) &&
-      MPI_Bcast(&sidecar, static_cast<int>(sizeof(sidecar)), MPI_BYTE, 0,
-                context.communicator()) == MPI_SUCCESS &&
-      ValidScalarSidecar(sidecar, config, context);
+  const bool identity_read = ScalarCollectiveAll(decoded, context);
+  const bool identity_broadcast = MPI_Bcast(
+      &sidecar, static_cast<int>(sizeof(sidecar)), MPI_BYTE, 0,
+      context.communicator()) == MPI_SUCCESS;
+  const bool identity_valid = ValidScalarSidecar(sidecar, config, context);
+  decoded = identity_read && identity_broadcast && identity_valid;
   if (!ScalarCollectiveAll(decoded, context))
   {
     detail = "scalar-IGR CUDA restart resource identity rejected";
     return false;
   }
   ScenarioCoefficientExtentsV1 extents{};
-  if (!DeriveScenarioCoefficientExtentsV1(
-          config, static_cast<std::uint32_t>(context.ranks()), extents))
+  const bool extents_ready = DeriveScenarioCoefficientExtentsV1(
+      config, static_cast<std::uint32_t>(context.ranks()), extents);
+  if (!ScalarCollectiveAll(extents_ready, context))
     return false;
   if (context.rank() == 0)
   {
@@ -2330,43 +2454,81 @@ bool RestoreScalarCudaCheckpoint(
   std::array<int, 2> interior_counts{}, interior_displacements{};
   std::array<int, 2> trace_counts{}, trace_displacements{};
   std::vector<double> flat_interior, flat_trace;
-  if (context.rank() == 0)
+  std::vector<double> local_interior, local_trace;
+  bool prepared = true;
+  try
   {
-    int interior_offset = 0;
-    int trace_offset = 0;
-    for (int rank = 0; rank < context.ranks(); ++rank)
+    if (context.rank() == 0)
     {
-      const std::size_t index = static_cast<std::size_t>(rank);
-      interior_counts[index] = static_cast<int>(interiors[index].size());
-      trace_counts[index] = static_cast<int>(traces[index].size());
-      interior_displacements[index] = interior_offset;
-      trace_displacements[index] = trace_offset;
-      interior_offset += interior_counts[index];
-      trace_offset += trace_counts[index];
-      flat_interior.insert(flat_interior.end(), interiors[index].begin(),
-                           interiors[index].end());
-      flat_trace.insert(flat_trace.end(), traces[index].begin(),
-                        traces[index].end());
+      int interior_offset = 0;
+      int trace_offset = 0;
+      for (int rank = 0; rank < context.ranks(); ++rank)
+      {
+        const std::size_t index = static_cast<std::size_t>(rank);
+        if (interiors[index].size() > static_cast<std::size_t>(
+                std::numeric_limits<int>::max()) ||
+            traces[index].size() > static_cast<std::size_t>(
+                std::numeric_limits<int>::max()))
+          throw std::length_error{"scalar-IGR restart MPI count"};
+        interior_counts[index] = static_cast<int>(interiors[index].size());
+        trace_counts[index] = static_cast<int>(traces[index].size());
+        if (interior_offset > std::numeric_limits<int>::max() -
+                                  interior_counts[index] ||
+            trace_offset > std::numeric_limits<int>::max() -
+                               trace_counts[index])
+          throw std::length_error{"scalar-IGR restart MPI displacement"};
+        interior_displacements[index] = interior_offset;
+        trace_displacements[index] = trace_offset;
+        interior_offset += interior_counts[index];
+        trace_offset += trace_counts[index];
+      }
+      flat_interior.resize(static_cast<std::size_t>(interior_offset));
+      flat_trace.resize(static_cast<std::size_t>(trace_offset));
+      for (int rank = 0; rank < context.ranks(); ++rank)
+      {
+        const std::size_t index = static_cast<std::size_t>(rank);
+        std::copy(interiors[index].begin(), interiors[index].end(),
+                  flat_interior.begin() + interior_displacements[index]);
+        std::copy(traces[index].begin(), traces[index].end(),
+                  flat_trace.begin() + trace_displacements[index]);
+      }
     }
+    const auto& local_shape =
+        extents.ranks[static_cast<std::size_t>(context.rank())];
+    local_interior.resize(local_shape.interior_coefficient_count);
+    local_trace.resize(local_shape.trace_coefficient_count);
   }
-  const auto& shape = extents.ranks[static_cast<std::size_t>(context.rank())];
-  std::vector<double> local_interior(shape.interior_coefficient_count);
-  std::vector<double> local_trace(shape.trace_coefficient_count);
-  const bool scattered = MPI_Scatterv(
+  catch (...) { prepared = false; }
+  if (!ScalarCollectiveAll(prepared, context))
+  {
+    detail = "scalar-IGR CUDA restart flattening preparation failed";
+    return false;
+  }
+  const bool interior_scattered = MPI_Scatterv(
       flat_interior.data(), interior_counts.data(), interior_displacements.data(),
       MPI_DOUBLE, local_interior.data(), static_cast<int>(local_interior.size()),
-      MPI_DOUBLE, 0, context.communicator()) == MPI_SUCCESS &&
-      MPI_Scatterv(flat_trace.data(), trace_counts.data(),
-                   trace_displacements.data(), MPI_DOUBLE, local_trace.data(),
-                   static_cast<int>(local_trace.size()), MPI_DOUBLE, 0,
-                   context.communicator()) == MPI_SUCCESS;
-  if (!ScalarCollectiveAll(scattered, context)) return false;
+      MPI_DOUBLE, 0, context.communicator()) == MPI_SUCCESS;
+  const bool trace_scattered = MPI_Scatterv(
+      flat_trace.data(), trace_counts.data(), trace_displacements.data(),
+      MPI_DOUBLE, local_trace.data(), static_cast<int>(local_trace.size()),
+      MPI_DOUBLE, 0, context.communicator()) == MPI_SUCCESS;
+  if (!ScalarCollectiveAll(interior_scattered && trace_scattered, context))
+    return false;
   ScalarPackedState state;
   state.coordinates = metadata.descriptor.coordinates;
-  if (!detail::ScalarIgrComponentMajorToFieldBlocksV1(
-          local_interior, scalar::volume_nodes, state.interior))
+  bool converted = true;
+  try
+  {
+    converted = detail::ScalarIgrComponentMajorToFieldBlocksV1(
+        local_interior, scalar::volume_nodes, state.interior);
+    if (converted) state.trace = std::move(local_trace);
+  }
+  catch (...) { converted = false; }
+  if (!ScalarCollectiveAll(converted, context))
+  {
+    detail = "scalar-IGR CUDA restart coefficient conversion failed";
     return false;
-  state.trace = std::move(local_trace);
+  }
   ScalarCheckpoint checkpoint{};
   const bool sealed = SealScalarCheckpoint(
       checkpoint, state, sidecar.ranks[static_cast<std::size_t>(context.rank())],
@@ -2428,6 +2590,47 @@ scalar::FailureInjection ScalarNumericalInjection(
       return scalar::FailureInjection::newton_iteration_limit;
     default: return scalar::FailureInjection::none;
   }
+}
+
+bool ConsumeScalarPostFinalizeFault(const std::uint64_t step, const int rank,
+                                    int& source_rank) noexcept
+{
+  static bool consumed = false;
+  source_rank = -1;
+  if (consumed) return false;
+  const char* const raw =
+      std::getenv("DG_IGR_HDG_TEST_SCALAR_POST_FINALIZE_FAILURE");
+  if (raw == nullptr) return false;
+  const std::string_view value{raw};
+  const std::size_t separator = value.find(':');
+  if (separator == std::string_view::npos) return false;
+  std::uint64_t selected_step = 0;
+  int selected_rank = -1;
+  const auto step_result = std::from_chars(
+      value.data(), value.data() + separator, selected_step);
+  const auto rank_result = std::from_chars(
+      value.data() + separator + 1, value.data() + value.size(),
+      selected_rank);
+  if (step_result.ec != std::errc{} ||
+      step_result.ptr != value.data() + separator ||
+      rank_result.ec != std::errc{} ||
+      rank_result.ptr != value.data() + value.size() ||
+      selected_step != step)
+    return false;
+  source_rank = selected_rank;
+  if (rank != selected_rank) return false;
+  consumed = true;
+  return true;
+}
+
+bool ScalarTransactionReady(const ScalarOwner::Transaction& token,
+                            const StateCoordinates& expected) noexcept
+{
+  const StateCoordinates& target = token.target_coordinates();
+  return token.valid() && token.provisionally_installed() &&
+      target.step == expected.step && target.time == expected.time &&
+      target.generation == expected.generation &&
+      target.cursor == expected.cursor && target.dt == expected.dt;
 }
 
 std::string ScalarHex(const StateHash& hash)
@@ -2549,7 +2752,7 @@ std::string ScalarCudaMetadata(
       << (evidence.reuse.unchanged ? "true" : "false") << ",\n"
       << "  \"zero_fallback\": "
       << (evidence.launches.fallback_calls == 0 ? "true" : "false")
-      << ",\n  \"zero_post_baseline_allocation\": "
+      << ",\n  \"zero_post_baseline_cuda_umpire_allocation\": "
       << (allocations ? "true" : "false") << ",\n"
       << "  \"device_residency\": "
       << (residency ? "true" : "false") << ",\n"
@@ -2588,8 +2791,22 @@ ApplicationRunResult RunScalarIgrCuda(
     return result;
   }
   std::string diagnostic;
-  const std::filesystem::path output_directory{
-      std::string{config.output_directory().identity().view()}};
+  std::filesystem::path output_directory;
+  bool request_prepared = true;
+  try
+  {
+    output_directory =
+        std::string{config.output_directory().identity().view()};
+  }
+  catch (...) { request_prepared = false; }
+  if (!ScalarCollectiveAll(request_prepared, context))
+  {
+    result.status = RunStatus::terminal_failure;
+    result.reason = FailureReason::backend_failure;
+    result.failure_class = ApplicationRunResult::FailureClass::backend;
+    context.SetDiagnostic("scalar-IGR CUDA request preparation failed");
+    return result;
+  }
   bool output_ready = true;
   bool output_created = false;
   if (context.rank() == 0)
@@ -2618,7 +2835,18 @@ ApplicationRunResult RunScalarIgrCuda(
     return result;
   }
 
-  mfem::Device device("cuda");
+  std::unique_ptr<mfem::Device> device;
+  bool device_ready = true;
+  try { device = std::make_unique<mfem::Device>("cuda"); }
+  catch (...) { device_ready = false; }
+  if (!ScalarCollectiveAll(device_ready, context))
+  {
+    result.status = RunStatus::terminal_failure;
+    result.reason = FailureReason::backend_failure;
+    result.failure_class = ApplicationRunResult::FailureClass::backend;
+    context.SetDiagnostic("scalar-IGR CUDA MFEM device initialization failed");
+    return result;
+  }
   std::unique_ptr<ScalarVtkWorkspace> vtk_workspace;
   bool vtk_workspace_ready = true;
   if (context.rank() == 0)
@@ -2702,6 +2930,17 @@ ApplicationRunResult RunScalarIgrCuda(
                                                 initial_trace}};
   const StateHash initial_hash{ComputeSha256(initial_parts.data(),
                                               sizeof(initial_parts))};
+  if (!ScalarCollectiveAll(initial_interior != StateHash{} &&
+                               initial_trace != StateHash{} &&
+                               initial_hash != StateHash{},
+                           context))
+  {
+    result.status = RunStatus::terminal_failure;
+    result.reason = FailureReason::backend_failure;
+    result.failure_class = ApplicationRunResult::FailureClass::backend;
+    context.SetDiagnostic("scalar-IGR CUDA initial state hashing failed");
+    return result;
+  }
   if (initial.coordinates.step == 0 && ScalarOutputStep(config, 0))
   {
     DurableGenerationTransactionV1 transaction;
@@ -2718,8 +2957,21 @@ ApplicationRunResult RunScalarIgrCuda(
       result.failure_class = ApplicationRunResult::FailureClass::filesystem;
     }
   }
-  const std::optional<ValidatedApplicationConfig> checkpoint_writer =
-      ScalarCheckpointWriterConfig(request, config);
+  std::optional<ValidatedApplicationConfig> checkpoint_writer;
+  bool checkpoint_writer_ready = true;
+  try { checkpoint_writer = ScalarCheckpointWriterConfig(request, config); }
+  catch (...) { checkpoint_writer_ready = false; }
+  checkpoint_writer_ready = ScalarCollectiveAll(checkpoint_writer_ready &&
+      (!config.checkpoint_out().present() || checkpoint_writer.has_value()),
+      context);
+  if (!checkpoint_writer_ready)
+  {
+    result.status = RunStatus::terminal_failure;
+    result.reason = FailureReason::backend_failure;
+    result.failure_class = ApplicationRunResult::FailureClass::configuration;
+    context.SetDiagnostic("scalar-IGR CUDA checkpoint writer preparation failed");
+    return result;
+  }
   const std::uint64_t stop_step =
       config.run_role() == ApplicationRunRoleV1::split_writer
       ? config.scenario_checkpoint_step() : config.accepted_steps();
@@ -2733,19 +2985,35 @@ ApplicationRunResult RunScalarIgrCuda(
   {
     const StateCoordinates current = owner->trajectory_evidence().coordinates;
     const std::uint64_t target = current.step + 1;
+    const StateCoordinates expected_target{
+        static_cast<double>(target) * config.dt(), target,
+        current.generation + 1, current.cursor + 1, config.dt()};
     const bool prescribed = !injected &&
         config.injection().mode == FailureInjectionModeV1::prescribed &&
         config.injection().target_step == target;
     const bool local_origin = prescribed &&
         context.rank() == static_cast<int>(config.injection().source_rank);
+    const scalar::FailureInjection selected_injection = prescribed
+        ? ScalarNumericalInjection(config.injection().phase)
+        : scalar::FailureInjection::none;
+    const scalar::FailureInjection numerical_injection =
+        local_origin ? selected_injection : scalar::FailureInjection::none;
     if (prescribed)
     {
-      const int local[3] = {local_origin ? 1 : 0,
-                            local_origin ? context.rank() + 1 : 0, 0};
+      const bool local_injected = selected_injection ==
+              scalar::FailureInjection::none
+          ? local_origin
+          : numerical_injection != scalar::FailureInjection::none;
+      const bool non_origin_injected = local_injected &&
+          context.rank() != static_cast<int>(config.injection().source_rank);
+      const int local[3] = {local_injected ? 1 : 0,
+                            local_injected ? context.rank() + 1 : 0,
+                            non_origin_injected ? 1 : 0};
       int global[3] = {};
       const bool reduced = MPI_Allreduce(local, global, 3, MPI_INT, MPI_SUM,
                                          context.communicator()) == MPI_SUCCESS;
-      if (!ScalarCollectiveAll(reduced && global[0] == 1, context))
+      if (!ScalarCollectiveAll(
+              reduced && global[0] == 1 && global[2] == 0, context))
       {
         result.failure_class = ApplicationRunResult::FailureClass::backend;
         diagnostic = "scalar-IGR CUDA injection origin consensus failed";
@@ -2756,34 +3024,24 @@ ApplicationRunResult RunScalarIgrCuda(
       injection.non_origin_local_injection_count += global[2];
       ++injection.collective_decisions;
     }
-    const scalar::FailureInjection selected_injection = prescribed
-        ? ScalarNumericalInjection(config.injection().phase)
-        : scalar::FailureInjection::none;
-    const scalar::FailureInjection numerical_injection =
-        local_origin ? ScalarNumericalInjection(config.injection().phase)
-                     : scalar::FailureInjection::none;
     const bool application_injection = prescribed &&
         selected_injection == scalar::FailureInjection::none;
     const bool requires_finalized_capture =
         ScalarOutputStep(config, target) || target == stop_step;
     ScalarCheckpoint rollback_checkpoint{};
-    bool rollback_checkpoint_ready = true;
-    if (requires_finalized_capture)
+    const bool rollback_checkpoint_ready =
+        owner->CaptureTrajectoryCheckpoint(rollback_checkpoint);
+    if (!ScalarCollectiveAll(rollback_checkpoint_ready, context))
     {
-      rollback_checkpoint_ready =
-          owner->CaptureTrajectoryCheckpoint(rollback_checkpoint);
-      if (!ScalarCollectiveAll(rollback_checkpoint_ready, context))
-      {
-        result.failure_class = ApplicationRunResult::FailureClass::backend;
-        diagnostic = "scalar-IGR CUDA rollback checkpoint capture failed";
-        break;
-      }
+      result.failure_class = ApplicationRunResult::FailureClass::backend;
+      diagnostic = "scalar-IGR CUDA rollback checkpoint capture failed";
+      break;
     }
     typename ScalarOwner::Transaction candidate;
     const scalar::ScalarCudaStatus prepared =
         owner->PreparePersistentTrajectoryTransaction(candidate,
                                                       numerical_injection);
-    if (!ScalarAccepted(prepared))
+    if (!ScalarCollectiveAll(ScalarAccepted(prepared), context))
     {
       injected = injected || prescribed;
       if (prescribed && result.retries < config.retry_limit())
@@ -2808,16 +3066,20 @@ ApplicationRunResult RunScalarIgrCuda(
       break;
     }
     DurableGenerationTransactionV1 transaction;
-    bool staged = ScalarBeginTransaction(transaction, output_directory, target,
-                                         context, diagnostic);
-    bool installed = staged &&
-        owner->InstallPersistentTrajectoryTransaction(candidate);
+    const bool durable_started = requires_finalized_capture;
+    bool staged = !durable_started || ScalarBeginTransaction(
+        transaction, output_directory, target, context, diagnostic);
+    bool installed = owner->InstallPersistentTrajectoryTransaction(candidate);
     installed = ScalarCollectiveAll(installed, context);
+    staged = staged && installed;
     if (installed && application_injection)
     {
-      const bool reverted = ScalarRevert(transaction, context, diagnostic) &&
+      bool durable_reverted = true;
+      if (durable_started)
+        durable_reverted = ScalarRevert(transaction, context, diagnostic);
+      const bool leaf_reverted =
           owner->RevertPersistentTrajectoryTransaction(std::move(candidate));
-      if (!ScalarCollectiveAll(reverted, context))
+      if (!ScalarCollectiveAll(durable_reverted && leaf_reverted, context))
       {
         result.failure_class = ApplicationRunResult::FailureClass::backend;
         diagnostic = "scalar-IGR CUDA injected rollback failed";
@@ -2836,14 +3098,48 @@ ApplicationRunResult RunScalarIgrCuda(
     ScalarCheckpoint private_checkpoint{};
     ScalarResourceSidecar sidecar{};
     bool leaf_finalized = false;
+    bool finalize_attempted = false;
+    bool compensation_injected = false;
     if (installed && requires_finalized_capture)
     {
-      leaf_finalized = owner->FinalizePersistentTrajectoryTransaction(
-          std::move(candidate));
-      staged = staged && ScalarCollectiveAll(leaf_finalized, context) &&
-          owner->CaptureTrajectoryCheckpoint(private_checkpoint) &&
-          PackedFromCheckpoint(private_checkpoint, packed);
-      staged = ScalarCollectiveAll(staged, context);
+      const bool finalize_ready = ScalarCollectiveAll(
+          ScalarTransactionReady(candidate, expected_target), context);
+      if (finalize_ready)
+      {
+        finalize_attempted = true;
+        leaf_finalized = owner->FinalizePersistentTrajectoryTransaction(
+            std::move(candidate));
+        leaf_finalized = ScalarCollectiveAll(leaf_finalized, context);
+      }
+      staged = staged && finalize_ready && leaf_finalized;
+      bool capture_ready = false;
+      if (leaf_finalized)
+        capture_ready = owner->CaptureTrajectoryCheckpoint(private_checkpoint) &&
+            PackedFromCheckpoint(private_checkpoint, packed);
+      capture_ready = ScalarCollectiveAll(capture_ready, context);
+      staged = staged && capture_ready;
+      int local_fault_source = -1;
+      const bool local_compensation_fault = leaf_finalized &&
+          ConsumeScalarPostFinalizeFault(target, context.rank(),
+                                         local_fault_source);
+      const int local_fault[2] = {local_compensation_fault ? 1 : 0,
+                                  local_compensation_fault
+                                      ? context.rank() + 1 : 0};
+      int global_fault[2] = {};
+      const bool fault_reduced = MPI_Allreduce(
+          local_fault, global_fault, 2, MPI_INT, MPI_SUM,
+          context.communicator()) == MPI_SUCCESS;
+      const bool fault_valid = ScalarCollectiveAll(
+          fault_reduced && global_fault[0] <= 1, context);
+      compensation_injected = fault_valid && global_fault[0] == 1;
+      if (!fault_valid || compensation_injected)
+      {
+        staged = false;
+        diagnostic = compensation_injected
+            ? "scalar-IGR CUDA post-finalize compensation failure source_rank=" +
+                  std::to_string(global_fault[1] - 1)
+            : "scalar-IGR CUDA post-finalize fault consensus failed";
+      }
       if (staged && target == config.scenario_checkpoint_step())
         staged = BuildScalarSidecar(
             private_checkpoint, config.device_id(), context, sidecar,
@@ -2865,7 +3161,9 @@ ApplicationRunResult RunScalarIgrCuda(
       const StateHash final_trace = ScalarAggregateHash(final_local.trace,
                                                         context);
       ScalarResourceRecord resource{};
-      bool resource_ready = ScalarGpuRecord(config.device_id(), resource);
+      bool resource_ready = final_interior != StateHash{} &&
+          final_trace != StateHash{} &&
+          ScalarGpuRecord(config.device_id(), resource);
       if (target == config.scenario_checkpoint_step())
         resource = sidecar.ranks[static_cast<std::size_t>(context.rank())];
       ApplicationRunResult anticipated = result;
@@ -2885,39 +3183,59 @@ ApplicationRunResult RunScalarIgrCuda(
         }
         catch (...) { resource_ready = false; }
       }
-      staged = ScalarCollectiveAll(resource_ready, context) &&
-          ScalarStageArtifact(
-              transaction,
-              config.run_role() == ApplicationRunRoleV1::split_writer
-                  ? "run-metadata-checkpoint.json" : "run-metadata.json",
-              metadata, context, diagnostic);
+      resource_ready = ScalarCollectiveAll(resource_ready, context);
+      bool metadata_staged = false;
+      if (resource_ready)
+        metadata_staged = ScalarStageArtifact(
+            transaction,
+            config.run_role() == ApplicationRunRoleV1::split_writer
+                ? "run-metadata-checkpoint.json" : "run-metadata.json",
+            metadata, context, diagnostic);
+      staged = resource_ready && metadata_staged;
     }
-    bool published = staged && ScalarPublish(transaction, context, diagnostic);
+    bool published = staged;
+    if (durable_started && staged)
+      published = ScalarPublish(transaction, context, diagnostic);
     bool committed = published && leaf_finalized;
-    if (published && !leaf_finalized)
-      committed = owner->FinalizePersistentTrajectoryTransaction(
-          std::move(candidate));
+    if (published && !requires_finalized_capture)
+    {
+      const bool finalize_ready = ScalarCollectiveAll(
+          ScalarTransactionReady(candidate, expected_target), context);
+      if (finalize_ready)
+      {
+        finalize_attempted = true;
+        leaf_finalized = owner->FinalizePersistentTrajectoryTransaction(
+            std::move(candidate));
+        leaf_finalized = ScalarCollectiveAll(leaf_finalized, context);
+      }
+      committed = finalize_ready && leaf_finalized;
+    }
     committed = ScalarCollectiveAll(committed, context);
     if (!committed)
     {
-      const bool durable_reverted = ScalarRevert(transaction, context,
-                                                 diagnostic);
+      bool durable_reverted = true;
+      if (durable_started)
+        durable_reverted = ScalarRevert(transaction, context, diagnostic);
       bool leaf_reverted = false;
-      if (leaf_finalized)
+      if (finalize_attempted)
       {
         ScalarCheckpoint restored{};
-        leaf_reverted = rollback_checkpoint_ready &&
-            ScalarRestored(owner->RestoreTrajectoryCheckpoint(
-                rollback_checkpoint)) &&
-            owner->CaptureTrajectoryCheckpoint(restored) &&
+        const bool restore_returned = ScalarRestored(
+            owner->RestoreTrajectoryCheckpoint(rollback_checkpoint));
+        const bool restored_captured =
+            owner->CaptureTrajectoryCheckpoint(restored);
+        leaf_reverted = restore_returned && restored_captured &&
             ScalarCheckpointHashesMatch(rollback_checkpoint, restored);
       }
       else
       {
-        if (!installed)
-          installed = owner->InstallPersistentTrajectoryTransaction(candidate);
-        leaf_reverted = installed &&
-            owner->RevertPersistentTrajectoryTransaction(std::move(candidate));
+        bool cleanup_installed = installed;
+        if (!cleanup_installed)
+          cleanup_installed =
+              owner->InstallPersistentTrajectoryTransaction(candidate);
+        if (cleanup_installed)
+          leaf_reverted = owner->RevertPersistentTrajectoryTransaction(
+              std::move(candidate));
       }
       if (!ScalarCollectiveAll(durable_reverted && leaf_reverted, context))
       {
@@ -2926,6 +3244,11 @@ ApplicationRunResult RunScalarIgrCuda(
         break;
       }
       injected = injected || prescribed;
+      if (compensation_injected)
+      {
+        result.failure_class = ApplicationRunResult::FailureClass::injected;
+        break;
+      }
       if (prescribed && result.retries < config.retry_limit())
       {
         ++result.retries;
