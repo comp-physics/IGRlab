@@ -205,66 +205,210 @@ inline bool SameCoordinates(
     const ::dg::hdg::runtime::StateCoordinates& left,
     const ::dg::hdg::runtime::StateCoordinates& right) noexcept;
 
+struct OperatorSnapshotDiagnostics final
+{
+  bool reference_valid = false;
+  bool observed_valid = false;
+  bool reference_initialization = false;
+  bool observed_initialization = false;
+  bool status = false;
+  bool target_step = false;
+  bool retry_index = false;
+  bool iteration = false;
+  bool full_size = false;
+  bool owned_size = false;
+  bool coordinate_time = false;
+  bool coordinate_step = false;
+  bool coordinate_generation = false;
+  bool coordinate_cursor = false;
+  bool coordinate_dt = false;
+  bool trace_iterations = false;
+  bool metadata = false;
+  std::size_t reference_full_size = 0;
+  std::size_t reference_owned_size = 0;
+  std::array<double, 4> scalar_error{};
+  std::array<bool, 4> scalar_pass{};
+  std::array<double, 5> vector_relative_l2{};
+  std::array<bool, 5> vector_pass{};
+  std::array<double, 5> entry_relative_l2{};
+  std::array<bool, 5> entry_pass{};
+  std::array<double, 5> recovered_relative_l2{};
+  std::array<bool, 5> recovered_pass{};
+  bool paired_residual_finite = false;
+  bool paired_rhs_finite = false;
+  double paired_bound = 0.0;
+  bool paired_pass = false;
+  bool integrals_applicable = false;
+  bool integrals_metadata = false;
+  std::array<double, 2 * scalar::state_components> integral_error{};
+  std::array<bool, 2 * scalar::state_components> integral_pass{};
+  bool pass = false;
+};
+
+inline double ScaledAbsoluteError(const double reference,
+                                  const double observed) noexcept
+{
+  if (!std::isfinite(reference) || !std::isfinite(observed))
+    return std::numeric_limits<double>::infinity();
+  return std::abs(observed - reference) /
+      std::max({1.0, std::abs(reference), std::abs(observed)});
+}
+
+inline OperatorSnapshotDiagnostics DiagnoseOperatorSnapshotParity(
+    const manifest::CpuManifestStep& reference,
+    const scalar::ScalarCudaSnapshotEvidence& observed,
+    const int step, const double tolerance = 1.0e-10) noexcept
+{
+  OperatorSnapshotDiagnostics result{};
+  const std::size_t full = reference.nonlinear_residual.size();
+  const std::size_t owned = reference.condensed_right_hand_side.size();
+  const scalar::ScalarCudaStatus expected_status = step == 0
+      ? scalar::ScalarCudaStatus::ready : scalar::ScalarCudaStatus::accepted;
+  result.reference_valid = reference.operator_valid;
+  result.observed_valid = observed.valid;
+  result.reference_initialization =
+      reference.initialization_operator == (step == 0);
+  result.observed_initialization = observed.initialization == (step == 0);
+  result.status = observed.status == expected_status;
+  result.target_step = observed.target_step == step;
+  result.retry_index = observed.retry_index == 0;
+  result.iteration = observed.iteration == reference.operator_iteration;
+  result.reference_full_size = full;
+  result.reference_owned_size = owned;
+  result.full_size = observed.full_vector_size == static_cast<int>(full);
+  result.owned_size = observed.owned_trace_size == static_cast<int>(owned);
+  result.coordinate_time =
+      observed.coordinates.time == reference.summary.coordinates.time;
+  result.coordinate_step =
+      observed.coordinates.step == reference.summary.coordinates.step;
+  result.coordinate_generation = observed.coordinates.generation ==
+      reference.summary.coordinates.generation;
+  result.coordinate_cursor =
+      observed.coordinates.cursor == reference.summary.coordinates.cursor;
+  result.coordinate_dt =
+      observed.coordinates.dt == reference.summary.coordinates.dt;
+  result.trace_iterations =
+      observed.trace_iterations == reference.operator_trace_iterations;
+  result.metadata = result.reference_valid && result.observed_valid &&
+      result.reference_initialization && result.observed_initialization &&
+      result.status && result.target_step && result.retry_index &&
+      result.iteration && result.full_size && result.owned_size &&
+      result.coordinate_time && result.coordinate_step &&
+      result.coordinate_generation && result.coordinate_cursor &&
+      result.coordinate_dt && result.trace_iterations;
+
+  const std::array<double, 4> scalar_reference{{
+      reference.operator_entry_residual_norm,
+      reference.operator_trace_true_residual_norm,
+      reference.operator_trace_right_hand_side_norm,
+      reference.operator_maximum_local_application_residual}};
+  const std::array<double, 4> scalar_observed{{
+      observed.entry_residual_norm,
+      observed.trace_true_residual_norm,
+      observed.trace_right_hand_side_norm,
+      observed.maximum_local_application_residual}};
+  for (std::size_t item = 0; item < result.scalar_pass.size(); ++item)
+  {
+    result.scalar_error[item] =
+        ScaledAbsoluteError(scalar_reference[item], scalar_observed[item]);
+    result.scalar_pass[item] = Near(scalar_reference[item],
+                                    scalar_observed[item], tolerance);
+  }
+
+  result.vector_relative_l2 = {{
+      ArrayVectorRelativeL2(observed.nonlinear_residual,
+                            reference.nonlinear_residual),
+      ArrayVectorRelativeL2(observed.jacobian_action_input,
+                            reference.jacobian_action_input),
+      ArrayVectorRelativeL2(observed.jacobian_action_result,
+                            reference.jacobian_action_result),
+      ArrayVectorRelativeL2(observed.condensed_right_hand_side,
+                            reference.condensed_right_hand_side),
+      ArrayVectorRelativeL2(observed.true_trace_solution,
+                            reference.true_trace_solution)}};
+
+  const auto state_metrics = [](const auto& interior, const auto& trace,
+                                const cpu::PersistentRank2TrajectoryState& state)
+  {
+    return std::array<double, 5>{{
+        ArrayVectorRelativeL2(interior, state.u, 0),
+        ArrayVectorRelativeL2(interior, state.sigma, 512),
+        ArrayVectorRelativeL2(interior, state.z, 640),
+        ArrayVectorRelativeL2(trace, state.uhat, 0),
+        ArrayVectorRelativeL2(trace, state.sigmahat, state.uhat.size())}};
+  };
+  result.entry_relative_l2 = state_metrics(
+      observed.entry_interior, observed.entry_trace, reference.operator_entry);
+  result.recovered_relative_l2 = state_metrics(
+      observed.recovered_interior, observed.recovered_trace,
+      reference.recovered_increment);
+  for (std::size_t item = 0; item < result.vector_pass.size(); ++item)
+  {
+    result.vector_pass[item] =
+        std::isfinite(result.vector_relative_l2[item]) &&
+        result.vector_relative_l2[item] <= tolerance;
+    result.entry_pass[item] =
+        std::isfinite(result.entry_relative_l2[item]) &&
+        result.entry_relative_l2[item] <= tolerance;
+    result.recovered_pass[item] =
+        std::isfinite(result.recovered_relative_l2[item]) &&
+        result.recovered_relative_l2[item] <= tolerance;
+  }
+
+  result.paired_residual_finite =
+      std::isfinite(observed.paired_local_application_residual);
+  result.paired_rhs_finite =
+      std::isfinite(observed.paired_local_right_hand_side_norm);
+  result.paired_bound = 1.0e-12 + 1.0e-11 *
+      observed.paired_local_right_hand_side_norm;
+  result.paired_pass = result.paired_residual_finite &&
+      result.paired_rhs_finite &&
+      observed.paired_local_application_residual <= result.paired_bound;
+
+  result.integrals_applicable = step > 0;
+  result.integrals_metadata = result.integrals_applicable
+      ? reference.operator_has_integrals : !reference.operator_has_integrals;
+  result.integral_pass.fill(true);
+  if (result.integrals_applicable)
+  {
+    for (int component = 0; component < scalar::state_components; ++component)
+    {
+      const std::size_t committed = static_cast<std::size_t>(component);
+      const std::size_t conserved = committed + scalar::state_components;
+      result.integral_error[committed] = ScaledAbsoluteError(
+          reference.operator_committed_integrals[component],
+          observed.committed_integrals[component]);
+      result.integral_error[conserved] = ScaledAbsoluteError(
+          reference.operator_conserved_integrals[component],
+          observed.conserved_integrals[component]);
+      result.integral_pass[committed] = Near(
+          reference.operator_committed_integrals[component],
+          observed.committed_integrals[component], tolerance);
+      result.integral_pass[conserved] = Near(
+          reference.operator_conserved_integrals[component],
+          observed.conserved_integrals[component], tolerance);
+    }
+  }
+
+  const auto all = [](const auto& values)
+  {
+    return std::all_of(values.begin(), values.end(),
+                       [](const bool value) { return value; });
+  };
+  result.pass = result.metadata && all(result.scalar_pass) &&
+      all(result.vector_pass) && all(result.entry_pass) &&
+      all(result.recovered_pass) && result.paired_pass &&
+      result.integrals_metadata && all(result.integral_pass);
+  return result;
+}
+
 inline bool OperatorSnapshotParity(
     const manifest::CpuManifestStep& reference,
     const scalar::ScalarCudaSnapshotEvidence& observed,
     const int step, const double tolerance = 1.0e-10) noexcept
 {
-  const std::size_t full = reference.nonlinear_residual.size();
-  const std::size_t owned = reference.condensed_right_hand_side.size();
-  const scalar::ScalarCudaStatus expected_status = step == 0
-      ? scalar::ScalarCudaStatus::ready : scalar::ScalarCudaStatus::accepted;
-  const bool metadata = reference.operator_valid && observed.valid &&
-      observed.initialization == (step == 0) &&
-      observed.status == expected_status &&
-      observed.target_step == step && observed.retry_index == 0 &&
-      observed.iteration == reference.operator_iteration &&
-      observed.full_vector_size == static_cast<int>(full) &&
-      observed.owned_trace_size == static_cast<int>(owned) &&
-      SameCoordinates(observed.coordinates, reference.summary.coordinates) &&
-      observed.trace_iterations == reference.operator_trace_iterations;
-  if (!metadata ||
-      !Near(reference.operator_entry_residual_norm,
-            observed.entry_residual_norm, tolerance) ||
-      !Near(reference.operator_trace_true_residual_norm,
-            observed.trace_true_residual_norm, tolerance) ||
-      !Near(reference.operator_trace_right_hand_side_norm,
-            observed.trace_right_hand_side_norm, tolerance) ||
-      !Near(reference.operator_maximum_local_application_residual,
-            observed.maximum_local_application_residual, tolerance) ||
-      ArrayVectorRelativeL2(observed.nonlinear_residual,
-                            reference.nonlinear_residual) > tolerance ||
-      ArrayVectorRelativeL2(observed.jacobian_action_input,
-                            reference.jacobian_action_input) > tolerance ||
-      ArrayVectorRelativeL2(observed.jacobian_action_result,
-                            reference.jacobian_action_result) > tolerance ||
-      ArrayVectorRelativeL2(observed.condensed_right_hand_side,
-                            reference.condensed_right_hand_side) > tolerance ||
-      ArrayVectorRelativeL2(observed.true_trace_solution,
-                            reference.true_trace_solution) > tolerance ||
-      !SnapshotStateParity(observed.entry_interior, observed.entry_trace,
-                           reference.operator_entry, tolerance) ||
-      !SnapshotStateParity(observed.recovered_interior,
-                           observed.recovered_trace,
-                           reference.recovered_increment, tolerance) ||
-      !std::isfinite(observed.paired_local_application_residual) ||
-      !std::isfinite(observed.paired_local_right_hand_side_norm) ||
-      observed.paired_local_application_residual >
-          1.0e-12 + 1.0e-11 *
-              observed.paired_local_right_hand_side_norm)
-    return false;
-  if (step > 0)
-  {
-    for (int component = 0; component < scalar::state_components; ++component)
-    {
-      if (!Near(reference.operator_committed_integrals[component],
-                observed.committed_integrals[component], tolerance) ||
-          !Near(reference.operator_conserved_integrals[component],
-                observed.conserved_integrals[component], tolerance))
-        return false;
-    }
-  }
-  return true;
+  return DiagnoseOperatorSnapshotParity(
+      reference, observed, step, tolerance).pass;
 }
 
 inline bool RuntimeEvidence(const scalar::ScalarCudaEvidence& evidence,

@@ -5,7 +5,9 @@
 
 #include <mfem.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -14,6 +16,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 1200
 #error "HDG-EXP-SCALAR-DEVICE-01 rank-two requires native SM120"
@@ -122,6 +126,145 @@ void EmitHypreAdmission(const int rank, const HypreAdmission& value)
             << " execution_query=" << value.execution_query
             << " execution=" << static_cast<int>(value.execution)
             << " using_gpu=" << (value.using_gpu ? 1 : 0) << '\n';
+}
+
+void EmitOperatorSnapshotDiagnostics(
+    const int rank, const int step,
+    const manifest::CpuManifestStep& reference,
+    const scalar::ScalarCudaSnapshotEvidence& observed,
+    const oracle::OperatorSnapshotDiagnostics& diagnostic) noexcept
+{
+  const auto emit = [](const char* const format, const auto&... values)
+  {
+    std::array<char, 4096> buffer{};
+    const int produced = std::snprintf(
+        buffer.data(), buffer.size(), format, values...);
+    if (produced <= 0) return;
+    const std::size_t length = std::min(
+        static_cast<std::size_t>(produced), buffer.size() - 1);
+    (void)::write(STDERR_FILENO, buffer.data(), length);
+  };
+
+  for (int turn = 0; turn < 2; ++turn)
+  {
+    (void)MPI_Barrier(MPI_COMM_WORLD);
+    if (rank != turn) continue;
+    emit("SC25_R2_OPERATOR_DIFF rank=%d step=%d META pass=%d "
+         "ref_valid=%d obs_valid=%d ref_init=%d obs_init=%d "
+         "status=%d ref_status=%d obs_status=%d target=%d ref_target=%d "
+         "obs_target=%d retry=%d obs_retry=%d iteration=%d ref_iteration=%d "
+         "obs_iteration=%d full=%d ref_full=%zu obs_full=%d owned=%d "
+         "ref_owned=%zu obs_owned=%d trace_iterations=%d ref_trace_iterations=%d "
+         "obs_trace_iterations=%d\n",
+         rank, step, diagnostic.metadata ? 1 : 0,
+         diagnostic.reference_valid ? 1 : 0,
+         diagnostic.observed_valid ? 1 : 0,
+         diagnostic.reference_initialization ? 1 : 0,
+         diagnostic.observed_initialization ? 1 : 0,
+         diagnostic.status ? 1 : 0,
+         step == 0 ? static_cast<int>(scalar::ScalarCudaStatus::ready)
+                   : static_cast<int>(scalar::ScalarCudaStatus::accepted),
+         static_cast<int>(observed.status), diagnostic.target_step ? 1 : 0,
+         step, observed.target_step, diagnostic.retry_index ? 1 : 0,
+         observed.retry_index, diagnostic.iteration ? 1 : 0,
+         reference.operator_iteration, observed.iteration,
+         diagnostic.full_size ? 1 : 0, diagnostic.reference_full_size,
+         observed.full_vector_size, diagnostic.owned_size ? 1 : 0,
+         diagnostic.reference_owned_size, observed.owned_trace_size,
+         diagnostic.trace_iterations ? 1 : 0,
+         reference.operator_trace_iterations, observed.trace_iterations);
+    emit("SC25_R2_OPERATOR_DIFF rank=%d step=%d COORD "
+         "time=%d ref=%.17g obs=%.17g step=%d ref_step=%llu obs_step=%llu "
+         "generation=%d ref_generation=%llu obs_generation=%llu "
+         "cursor=%d ref_cursor=%llu obs_cursor=%llu dt=%d ref_dt=%.17g "
+         "obs_dt=%.17g\n",
+         rank, step, diagnostic.coordinate_time ? 1 : 0,
+         reference.summary.coordinates.time, observed.coordinates.time,
+         diagnostic.coordinate_step ? 1 : 0,
+         static_cast<unsigned long long>(reference.summary.coordinates.step),
+         static_cast<unsigned long long>(observed.coordinates.step),
+         diagnostic.coordinate_generation ? 1 : 0,
+         static_cast<unsigned long long>(
+             reference.summary.coordinates.generation),
+         static_cast<unsigned long long>(observed.coordinates.generation),
+         diagnostic.coordinate_cursor ? 1 : 0,
+         static_cast<unsigned long long>(reference.summary.coordinates.cursor),
+         static_cast<unsigned long long>(observed.coordinates.cursor),
+         diagnostic.coordinate_dt ? 1 : 0,
+         reference.summary.coordinates.dt, observed.coordinates.dt);
+    emit("SC25_R2_OPERATOR_DIFF rank=%d step=%d SCALARS "
+         "entry=(%.17g,%.17g,%.17g,%d) trace_res=(%.17g,%.17g,%.17g,%d) "
+         "trace_rhs=(%.17g,%.17g,%.17g,%d) max_local=(%.17g,%.17g,%.17g,%d) "
+         "paired=(%.17g,%.17g,%.17g,%d,%d,%d)\n",
+         rank, step, reference.operator_entry_residual_norm,
+         observed.entry_residual_norm, diagnostic.scalar_error[0],
+         diagnostic.scalar_pass[0] ? 1 : 0,
+         reference.operator_trace_true_residual_norm,
+         observed.trace_true_residual_norm, diagnostic.scalar_error[1],
+         diagnostic.scalar_pass[1] ? 1 : 0,
+         reference.operator_trace_right_hand_side_norm,
+         observed.trace_right_hand_side_norm, diagnostic.scalar_error[2],
+         diagnostic.scalar_pass[2] ? 1 : 0,
+         reference.operator_maximum_local_application_residual,
+         observed.maximum_local_application_residual,
+         diagnostic.scalar_error[3], diagnostic.scalar_pass[3] ? 1 : 0,
+         observed.paired_local_application_residual,
+         observed.paired_local_right_hand_side_norm, diagnostic.paired_bound,
+         diagnostic.paired_residual_finite ? 1 : 0,
+         diagnostic.paired_rhs_finite ? 1 : 0,
+         diagnostic.paired_pass ? 1 : 0);
+    emit("SC25_R2_OPERATOR_DIFF rank=%d step=%d VECTORS "
+         "residual=(%.17g,%d) action_in=(%.17g,%d) action_out=(%.17g,%d) "
+         "condensed_rhs=(%.17g,%d) true_trace=(%.17g,%d)\n",
+         rank, step, diagnostic.vector_relative_l2[0],
+         diagnostic.vector_pass[0] ? 1 : 0,
+         diagnostic.vector_relative_l2[1],
+         diagnostic.vector_pass[1] ? 1 : 0,
+         diagnostic.vector_relative_l2[2],
+         diagnostic.vector_pass[2] ? 1 : 0,
+         diagnostic.vector_relative_l2[3],
+         diagnostic.vector_pass[3] ? 1 : 0,
+         diagnostic.vector_relative_l2[4],
+         diagnostic.vector_pass[4] ? 1 : 0);
+    emit("SC25_R2_OPERATOR_DIFF rank=%d step=%d STATE "
+         "entry=(%.17g,%d,%.17g,%d,%.17g,%d,%.17g,%d,%.17g,%d) "
+         "recovered=(%.17g,%d,%.17g,%d,%.17g,%d,%.17g,%d,%.17g,%d)\n",
+         rank, step, diagnostic.entry_relative_l2[0],
+         diagnostic.entry_pass[0] ? 1 : 0,
+         diagnostic.entry_relative_l2[1],
+         diagnostic.entry_pass[1] ? 1 : 0,
+         diagnostic.entry_relative_l2[2],
+         diagnostic.entry_pass[2] ? 1 : 0,
+         diagnostic.entry_relative_l2[3],
+         diagnostic.entry_pass[3] ? 1 : 0,
+         diagnostic.entry_relative_l2[4],
+         diagnostic.entry_pass[4] ? 1 : 0,
+         diagnostic.recovered_relative_l2[0],
+         diagnostic.recovered_pass[0] ? 1 : 0,
+         diagnostic.recovered_relative_l2[1],
+         diagnostic.recovered_pass[1] ? 1 : 0,
+         diagnostic.recovered_relative_l2[2],
+         diagnostic.recovered_pass[2] ? 1 : 0,
+         diagnostic.recovered_relative_l2[3],
+         diagnostic.recovered_pass[3] ? 1 : 0,
+         diagnostic.recovered_relative_l2[4],
+         diagnostic.recovered_pass[4] ? 1 : 0);
+    emit("SC25_R2_OPERATOR_DIFF rank=%d step=%d INTEGRALS applicable=%d "
+         "metadata=%d committed=(%.17g,%d,%.17g,%d,%.17g,%d,%.17g,%d) "
+         "conserved=(%.17g,%d,%.17g,%d,%.17g,%d,%.17g,%d) pass=%d\n",
+         rank, step, diagnostic.integrals_applicable ? 1 : 0,
+         diagnostic.integrals_metadata ? 1 : 0,
+         diagnostic.integral_error[0], diagnostic.integral_pass[0] ? 1 : 0,
+         diagnostic.integral_error[1], diagnostic.integral_pass[1] ? 1 : 0,
+         diagnostic.integral_error[2], diagnostic.integral_pass[2] ? 1 : 0,
+         diagnostic.integral_error[3], diagnostic.integral_pass[3] ? 1 : 0,
+         diagnostic.integral_error[4], diagnostic.integral_pass[4] ? 1 : 0,
+         diagnostic.integral_error[5], diagnostic.integral_pass[5] ? 1 : 0,
+         diagnostic.integral_error[6], diagnostic.integral_pass[6] ? 1 : 0,
+         diagnostic.integral_error[7], diagnostic.integral_pass[7] ? 1 : 0,
+         diagnostic.pass ? 1 : 0);
+  }
+  (void)MPI_Barrier(MPI_COMM_WORLD);
 }
 
 bool LoadCpuReferenceManifest(const manifest::DirectoryHandle& directory,
@@ -246,12 +389,19 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
           "CUDA step-zero accepted CPU parity"))
     return 1;
   const auto& initialization_evidence = cuda_owner->trajectory_evidence();
-  if (!require(initialization_evidence.snapshot_count == 1 &&
-                   oracle::OperatorSnapshotParity(
-                       cpu_reference.steps[0],
-                       initialization_evidence.snapshots[0], 0),
-               "CUDA/accepted-CPU initialization operator evidence"))
+  const auto initialization_diagnostic =
+      oracle::DiagnoseOperatorSnapshotParity(
+          cpu_reference.steps[0], initialization_evidence.snapshots[0], 0);
+  if (!CollectiveAll(initialization_evidence.snapshot_count == 1 &&
+                     initialization_diagnostic.pass))
+  {
+    EmitOperatorSnapshotDiagnostics(
+        rank, 0, cpu_reference.steps[0],
+        initialization_evidence.snapshots[0], initialization_diagnostic);
+    if (rank == 0)
+      std::cerr << "C3: CUDA/accepted-CPU initialization operator evidence\n";
     return 1;
+  }
 
   scalar::PersistentSc25ScalarIgrCudaRank2::Transaction invalid{};
   const bool invalid_installed =
@@ -309,13 +459,20 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
             "CUDA/accepted-CPU per-step parity"))
       return 1;
     const auto& stage_evidence = cuda_owner->trajectory_evidence();
-    if (!require(stage_evidence.snapshot_count == step + 1 &&
-                     oracle::OperatorSnapshotParity(
-                         cpu_reference.steps[static_cast<std::size_t>(step)],
-                         stage_evidence.snapshots[static_cast<std::size_t>(step)],
-                         step),
-                 "CUDA/accepted-CPU per-stage operator evidence"))
+    const auto stage_diagnostic = oracle::DiagnoseOperatorSnapshotParity(
+        cpu_reference.steps[static_cast<std::size_t>(step)],
+        stage_evidence.snapshots[static_cast<std::size_t>(step)], step);
+    if (!CollectiveAll(stage_evidence.snapshot_count == step + 1 &&
+                       stage_diagnostic.pass))
+    {
+      EmitOperatorSnapshotDiagnostics(
+          rank, step, cpu_reference.steps[static_cast<std::size_t>(step)],
+          stage_evidence.snapshots[static_cast<std::size_t>(step)],
+          stage_diagnostic);
+      if (rank == 0)
+        std::cerr << "C3: CUDA/accepted-CPU per-stage operator evidence\n";
       return 1;
+    }
     if (step == 10)
     {
       const bool captured =

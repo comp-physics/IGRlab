@@ -5211,7 +5211,7 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
   }
   initialization_snapshot.valid = true;
   initialization_snapshot.status = ScalarCudaStatus::ready;
-  initialization_snapshot.coordinates = {};
+  initialization_snapshot.coordinates = {0.0, 0, 0, 0, fixed_dt};
   initialization_snapshot.trace_iterations = iterations;
   initialization_snapshot.trace_true_residual_norm = residual;
   initialization_snapshot.trace_right_hand_side_norm = rhs;
@@ -5275,7 +5275,7 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
     value.status = ScalarCudaStatus::allocation_failure;
     return value.status;
   }
-  value.coordinates = {};
+  value.coordinates = {0.0, 0, 0, 0, fixed_dt};
   value.evidence.coordinates = value.coordinates;
   value.evidence.reuse = value.ReuseEvidence();
   value.evidence.reuse.unchanged = true;
