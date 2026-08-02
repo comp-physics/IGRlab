@@ -274,75 +274,211 @@ function(require_regular_file path label)
   endif()
 endfunction()
 
-function(require_manifest_artifact generation artifact label)
-  set(artifact_path "${generation}/${artifact}")
-  set(manifest_path "${generation}/manifest.v1")
-  require_regular_file("${artifact_path}" "${label} artifact")
-  require_regular_file("${manifest_path}" "${label} manifest")
-  file(READ "${manifest_path}" manifest)
-  string(ASCII 9 tab)
-  string(FIND "${manifest}" "artifact${tab}${artifact}${tab}"
-              artifact_record)
-  if(artifact_record LESS 0)
+function(require_exact_generation generation_root label expected_generation)
+  set(expected ${ARGN})
+  list(SORT expected)
+  set(expected_members ${expected} manifest.v1)
+  list(SORT expected_members)
+  file(GLOB generation_members RELATIVE "${generation_root}"
+       LIST_DIRECTORIES TRUE "${generation_root}/*" "${generation_root}/.*")
+  list(SORT generation_members)
+  if(NOT "${generation_members}" STREQUAL "${expected_members}")
     message(FATAL_ERROR
-      "${label} is not authorized by its generation manifest: ${artifact_path}")
+      "${label} generation member census mismatch: expected=${expected_members};observed=${generation_members}")
+  endif()
+  foreach(member IN LISTS generation_members)
+    if(IS_DIRECTORY "${generation_root}/${member}" OR
+       IS_SYMLINK "${generation_root}/${member}")
+      message(FATAL_ERROR
+        "${label} generation member is not a regular file: ${member}")
+    endif()
+  endforeach()
+
+  set(manifest_path "${generation_root}/manifest.v1")
+  file(STRINGS "${manifest_path}" manifest_lines ENCODING UTF-8)
+  list(LENGTH manifest_lines manifest_line_count)
+  list(LENGTH expected expected_count)
+  math(EXPR expected_line_count "${expected_count} + 2")
+  if(NOT manifest_line_count EQUAL expected_line_count)
+    message(FATAL_ERROR
+      "${label} manifest record census mismatch: expected=${expected_line_count};observed=${manifest_line_count}")
+  endif()
+  list(GET manifest_lines 0 manifest_header)
+  string(ASCII 9 tab)
+  list(GET manifest_lines 1 manifest_generation)
+  if(NOT manifest_header STREQUAL "DG_IGR_DURABLE_GENERATION_V1" OR
+     NOT manifest_generation STREQUAL
+         "generation${tab}${expected_generation}")
+    message(FATAL_ERROR "${label} manifest header/generation is malformed")
+  endif()
+
+  set(manifest_artifacts)
+  math(EXPR last_manifest_index "${manifest_line_count} - 1")
+  foreach(index RANGE 2 ${last_manifest_index})
+    list(GET manifest_lines ${index} manifest_line)
+    string(REPLACE "${tab}" ";" manifest_fields "${manifest_line}")
+    list(LENGTH manifest_fields manifest_field_count)
+    if(NOT manifest_field_count EQUAL 4)
+      message(FATAL_ERROR "${label} manifest record is malformed")
+    endif()
+    list(GET manifest_fields 0 manifest_kind)
+    list(GET manifest_fields 1 manifest_name)
+    list(GET manifest_fields 2 manifest_bytes)
+    list(GET manifest_fields 3 manifest_sha256)
+    list(FIND expected "${manifest_name}" expected_index)
+    list(FIND manifest_artifacts "${manifest_name}" duplicate_index)
+    string(LENGTH "${manifest_sha256}" manifest_sha256_length)
+    if(NOT manifest_kind STREQUAL "artifact" OR expected_index LESS 0 OR
+       duplicate_index GREATER_EQUAL 0 OR
+       NOT manifest_bytes MATCHES "^(0|[1-9][0-9]*)$" OR
+       NOT manifest_sha256_length EQUAL 64 OR
+       NOT manifest_sha256 MATCHES "^[0-9a-f]+$")
+      message(FATAL_ERROR
+        "${label} manifest has an unauthorized, duplicate, or malformed record: ${manifest_line}")
+    endif()
+    set(artifact_path "${generation_root}/${manifest_name}")
+    file(SIZE "${artifact_path}" artifact_bytes)
+    file(SHA256 "${artifact_path}" artifact_sha256)
+    if(NOT "${manifest_bytes}" STREQUAL "${artifact_bytes}" OR
+       NOT "${manifest_sha256}" STREQUAL "${artifact_sha256}")
+      message(FATAL_ERROR
+        "${label} manifest length/digest mismatch: ${manifest_name}")
+    endif()
+    list(APPEND manifest_artifacts "${manifest_name}")
+  endforeach()
+  list(SORT manifest_artifacts)
+  if(NOT "${manifest_artifacts}" STREQUAL "${expected}")
+    message(FATAL_ERROR
+      "${label} manifest is missing an exact generation member")
   endif()
 endfunction()
 
-function(require_exact_logical_artifacts root label)
-  set(expected ${ARGN})
-  file(GLOB observed RELATIVE "${root}" LIST_DIRECTORIES FALSE "${root}/*")
+function(require_manifest_artifact generation_root artifact label)
+  set(manifest_path "${generation_root}/manifest.v1")
+  set(artifact_path "${generation_root}/${artifact}")
+  require_regular_file("${manifest_path}" "${label} manifest")
+  require_regular_file("${artifact_path}" "${label} artifact")
+  file(STRINGS "${manifest_path}" manifest_lines ENCODING UTF-8)
+  string(ASCII 9 tab)
+  set(matches 0)
+  foreach(manifest_line IN LISTS manifest_lines)
+    string(REPLACE "${tab}" ";" manifest_fields "${manifest_line}")
+    list(LENGTH manifest_fields manifest_field_count)
+    if(manifest_field_count EQUAL 4)
+      list(GET manifest_fields 0 manifest_kind)
+      list(GET manifest_fields 1 manifest_name)
+      if(manifest_kind STREQUAL "artifact" AND
+         manifest_name STREQUAL artifact)
+        list(GET manifest_fields 2 manifest_bytes)
+        list(GET manifest_fields 3 manifest_sha256)
+        file(SIZE "${artifact_path}" artifact_bytes)
+        file(SHA256 "${artifact_path}" artifact_sha256)
+        string(LENGTH "${manifest_sha256}" manifest_sha256_length)
+        if(NOT manifest_bytes MATCHES "^(0|[1-9][0-9]*)$" OR
+           NOT manifest_sha256_length EQUAL 64 OR
+           NOT manifest_sha256 MATCHES "^[0-9a-f]+$" OR
+           NOT "${manifest_bytes}" STREQUAL "${artifact_bytes}" OR
+           NOT "${manifest_sha256}" STREQUAL "${artifact_sha256}")
+          message(FATAL_ERROR "${label} manifest record is invalid")
+        endif()
+        math(EXPR matches "${matches} + 1")
+      endif()
+    endif()
+  endforeach()
+  if(NOT matches EQUAL 1)
+    message(FATAL_ERROR
+      "${label} requires exactly one structurally valid manifest record")
+  endif()
+endfunction()
+
+function(require_exact_logical_artifacts root label expected_step0
+                                           expected_step10)
+  if(NOT ARGC EQUAL 4 AND NOT ARGC EQUAL 5)
+    message(FATAL_ERROR
+      "${label} durable oracle requires step-0/10 and optional step-20 sets")
+  endif()
+  if(ARGC EQUAL 5)
+    set(expected "${ARGV4}")
+    set(expected_generation_count 3)
+  else()
+    set(expected "${expected_step10}")
+    set(expected_generation_count 2)
+  endif()
   list(SORT expected)
+  file(GLOB observed RELATIVE "${root}" LIST_DIRECTORIES FALSE "${root}/*")
   list(SORT observed)
-  if(NOT observed STREQUAL expected)
+  if(NOT "${observed}" STREQUAL "${expected}")
     message(FATAL_ERROR
       "${label} logical artifact census mismatch: expected=${expected};observed=${observed}")
   endif()
+  foreach(artifact IN LISTS observed)
+    if(NOT IS_SYMLINK "${root}/${artifact}")
+      message(FATAL_ERROR "${label} logical artifact is not an alias: ${artifact}")
+    endif()
+    file(READ_SYMLINK "${root}/${artifact}" artifact_target)
+    if(NOT artifact_target STREQUAL ".dg-igr-current/${artifact}")
+      message(FATAL_ERROR
+        "${label} logical alias target is invalid: ${artifact_target}")
+    endif()
+  endforeach()
   file(GLOB hidden RELATIVE "${root}" LIST_DIRECTORIES TRUE "${root}/.*")
   list(SORT hidden)
   set(expected_hidden .dg-igr-current .dg-igr-generations)
-  if(NOT hidden STREQUAL expected_hidden OR
+  if(NOT "${hidden}" STREQUAL "${expected_hidden}" OR
      NOT IS_SYMLINK "${root}/.dg-igr-current" OR
-     NOT IS_DIRECTORY "${root}/.dg-igr-generations")
+     NOT IS_DIRECTORY "${root}/.dg-igr-generations" OR
+     IS_SYMLINK "${root}/.dg-igr-generations")
     message(FATAL_ERROR
       "${label} hidden durable census mismatch: expected=${expected_hidden};observed=${hidden}")
   endif()
-  file(READ_SYMLINK "${root}/.dg-igr-current" current_generation)
-  file(GLOB generations RELATIVE "${root}/.dg-igr-generations"
-       LIST_DIRECTORIES TRUE "${root}/.dg-igr-generations/generation-*")
+
+  set(generations_root "${root}/.dg-igr-generations")
+  file(GLOB generations RELATIVE "${generations_root}"
+       LIST_DIRECTORIES TRUE "${generations_root}/*" "${generations_root}/.*")
   list(SORT generations)
-  if(NOT generations OR
-     NOT current_generation MATCHES "^\\.dg-igr-generations/generation-")
-    message(FATAL_ERROR "${label} durable generation authority is incomplete")
+  list(LENGTH generations generation_count)
+  if(NOT generation_count EQUAL expected_generation_count)
+    message(FATAL_ERROR
+      "${label} immutable generation census mismatch: expected=${expected_generation_count};observed=${generation_count}")
   endif()
-  set(generation_artifacts)
-  foreach(generation IN LISTS generations)
-    set(generation_root "${root}/.dg-igr-generations/${generation}")
-    if(NOT IS_DIRECTORY "${generation_root}")
+  set(expected_steps 0 10 20)
+  foreach(index RANGE 0 2)
+    if(index GREATER_EQUAL expected_generation_count)
+      break()
+    endif()
+    list(GET generations ${index} generation)
+    list(GET expected_steps ${index} expected_generation)
+    if(NOT generation MATCHES
+        "^generation-${expected_generation}-[0-9]+-[0-9]+$")
+      message(FATAL_ERROR
+        "${label} generation identity/order is invalid: ${generation}")
+    endif()
+    set(generation_root "${generations_root}/${generation}")
+    if(NOT IS_DIRECTORY "${generation_root}" OR IS_SYMLINK "${generation_root}")
       message(FATAL_ERROR "${label} generation is not a directory: ${generation}")
     endif()
-    file(GLOB generation_entries RELATIVE "${generation_root}"
-         LIST_DIRECTORIES TRUE "${generation_root}/*")
-    list(FIND generation_entries manifest.v1 manifest_index)
-    if(manifest_index LESS 0)
-      message(FATAL_ERROR "${label} generation lacks manifest: ${generation}")
+    if(index EQUAL 0)
+      set(expected_prefix "${expected_step0}")
+    elseif(index EQUAL 1)
+      set(expected_prefix "${expected_step10}")
+    else()
+      set(expected_prefix "${ARGV4}")
     endif()
-    list(REMOVE_ITEM generation_entries manifest.v1)
-    foreach(artifact IN LISTS generation_entries)
-      if(IS_DIRECTORY "${generation_root}/${artifact}" OR
-         IS_SYMLINK "${generation_root}/${artifact}")
-        message(FATAL_ERROR
-          "${label} generation contains non-regular artifact: ${generation}/${artifact}")
-      endif()
-      list(APPEND generation_artifacts "${artifact}")
-      require_manifest_artifact("${generation_root}" "${artifact}"
-                                "${label} ${generation}")
-    endforeach()
+    require_exact_generation("${generation_root}" "${label} ${generation}"
+                             ${expected_generation} ${expected_prefix})
   endforeach()
-  list(SORT generation_artifacts)
-  if(NOT generation_artifacts STREQUAL expected)
+
+  math(EXPR current_index "${expected_generation_count} - 1")
+  list(GET generations ${current_index} current_generation_name)
+  file(READ_SYMLINK "${root}/.dg-igr-current" current_generation)
+  set(expected_current ".dg-igr-generations/${current_generation_name}")
+  file(REAL_PATH "${root}/.dg-igr-current" resolved_current)
+  file(REAL_PATH "${generations_root}/${current_generation_name}"
+       resolved_expected_current)
+  if(NOT current_generation STREQUAL expected_current OR
+     NOT resolved_current STREQUAL resolved_expected_current)
     message(FATAL_ERROR
-      "${label} hidden-generation artifact census mismatch: expected=${expected};observed=${generation_artifacts}")
+      "${label} current marker does not resolve to the final enumerated generation")
   endif()
 endfunction()
 
@@ -914,16 +1050,219 @@ if(HDG_RUNTIME_FUNCTIONAL)
           "CUDA scalar ${hash_field} differs from the fault-free baseline")
       endif()
     endforeach()
+    set(scalar_step0_artifacts "state-step-000000.vtk")
+    set(scalar_step10_artifacts
+      "checkpoint-runtime-identity.v1;restart-checkpoint.v2;state-step-000000.vtk;state-step-000010.vtk")
+    set(scalar_step20_artifacts
+      "checkpoint-runtime-identity.v1;restart-checkpoint.v2;run-metadata.json;state-step-000000.vtk;state-step-000010.vtk;state-step-000020.vtk")
     require_exact_logical_artifacts("${baseline_directory}" "baseline"
-      checkpoint-runtime-identity.v1 restart-checkpoint.v2 run-metadata.json
-      state-step-000000.vtk state-step-000010.vtk state-step-000020.vtk)
+      "${scalar_step0_artifacts}" "${scalar_step10_artifacts}"
+      "${scalar_step20_artifacts}")
     require_exact_logical_artifacts("${reference_directory}" "reference"
-      checkpoint-runtime-identity.v1 restart-checkpoint.v2 run-metadata.json
-      state-step-000000.vtk state-step-000010.vtk state-step-000020.vtk)
+      "${scalar_step0_artifacts}" "${scalar_step10_artifacts}"
+      "${scalar_step20_artifacts}")
     require_exact_logical_artifacts("${writer_directory}" "split"
-      checkpoint-runtime-identity.v1 restart-checkpoint.v2
-      run-metadata-checkpoint.json run-metadata.json state-step-000000.vtk
-      state-step-000010.vtk state-step-000020.vtk)
+      "${scalar_step0_artifacts}"
+      "checkpoint-runtime-identity.v1;restart-checkpoint.v2;run-metadata-checkpoint.json;state-step-000000.vtk;state-step-000010.vtk"
+      "checkpoint-runtime-identity.v1;restart-checkpoint.v2;run-metadata-checkpoint.json;run-metadata.json;state-step-000000.vtk;state-step-000010.vtk;state-step-000020.vtk")
+
+    foreach(physical_field IN ITEMS physical_cuda_launches
+                                    physical_cuda_transfers
+                                    physical_cuda_owned_allocations
+                                    physical_cuda_observed_allocations)
+      string(REGEX MATCH "\"${physical_field}\": ([0-9]+)"
+             baseline_physical_match "${baseline_metadata}")
+      set(baseline_${physical_field} "${CMAKE_MATCH_1}")
+      if("${baseline_${physical_field}}" STREQUAL "")
+        message(FATAL_ERROR
+          "fault-free baseline lacks ${physical_field} evidence")
+      endif()
+    endforeach()
+
+    # Every admitted scalar-CUDA source rank consumes each scheduled step-10
+    # boundary once. The failed logical attempt is erased, while physical work
+    # remains monotone and the bounded retry returns to the fault-free state.
+    math(EXPR scalar_maximum_source "${HDG_RUNTIME_RANKS} - 1")
+    foreach(campaign_phase IN ITEMS CheckpointStaging OutputStaging
+                                    AfterRecoveryBeforeCommit)
+      if(campaign_phase STREQUAL "CheckpointStaging")
+        set(campaign_boundary checkpoint-staging)
+      elseif(campaign_phase STREQUAL "OutputStaging")
+        set(campaign_boundary output-staging)
+      else()
+        set(campaign_boundary post-publication-pre-finalize)
+      endif()
+      foreach(campaign_source RANGE 0 ${scalar_maximum_source})
+        set(campaign_directory
+          "${HDG_RUNTIME_TEST_OUTPUT}-strong-step10-${campaign_phase}-rank${campaign_source}")
+        set(campaign_checkpoint "${campaign_directory}.checkpoint")
+        file(REMOVE_RECURSE "${campaign_directory}")
+        file(REMOVE "${campaign_checkpoint}")
+        run_runtime(campaign ${functional_common}
+          --output-dir "${campaign_directory}"
+          --checkpoint-out "${campaign_checkpoint}" --checkpoint-step 10
+          --stop-after-checkpoint false --restart-from none
+          --max-retries 1
+          --inject-failure "${campaign_phase}:10:${campaign_source}")
+        if(NOT campaign_status EQUAL 0 OR
+           NOT campaign_output MATCHES
+             "status=Success.*step=20.*retries=1" OR
+           NOT campaign_error STREQUAL "")
+          message(FATAL_ERROR
+            "scalar CUDA ${campaign_phase}/rank${campaign_source} bounded retry failed: ${campaign_status};${campaign_output};${campaign_error}")
+        endif()
+        file(READ "${campaign_directory}/run-metadata.json"
+                  campaign_metadata)
+        if(NOT campaign_metadata MATCHES
+             "\"injection_configured_source_rank\": ${campaign_source}" OR
+           NOT campaign_metadata MATCHES
+             "\"injection_observed_origin_rank\": ${campaign_source}" OR
+           NOT campaign_metadata MATCHES "\"injection_local_count\": 1" OR
+           NOT campaign_metadata MATCHES
+             "\"injection_non_origin_local_count\": 0" OR
+           NOT campaign_metadata MATCHES
+             "\"injection_collective_decisions\": 1" OR
+           NOT campaign_metadata MATCHES
+             "\"injection_consumed_boundary_count\": 1" OR
+           NOT campaign_metadata MATCHES "\"accepted_steps\": 20" OR
+           NOT campaign_metadata MATCHES "\"attempted_steps\": 20" OR
+           NOT campaign_metadata MATCHES "\"retries\": 1" OR
+           NOT campaign_metadata MATCHES
+             "boundary=${campaign_boundary} phase=${campaign_phase} target_step=10 consumed_boundary_count=1 source_rank=${campaign_source}")
+          message(FATAL_ERROR
+            "scalar CUDA ${campaign_phase}/rank${campaign_source} consumption/logical audit is invalid")
+        endif()
+        foreach(physical_field IN ITEMS physical_cuda_launches
+                                        physical_cuda_transfers
+                                        physical_cuda_owned_allocations
+                                        physical_cuda_observed_allocations)
+          string(REGEX MATCH "\"${physical_field}\": ([0-9]+)"
+                 campaign_physical_match "${campaign_metadata}")
+          set(campaign_${physical_field} "${CMAKE_MATCH_1}")
+          if("${campaign_${physical_field}}" STREQUAL "")
+            message(FATAL_ERROR
+              "scalar CUDA campaign lacks ${physical_field} evidence")
+          endif()
+        endforeach()
+        if(NOT campaign_physical_cuda_launches GREATER
+               baseline_physical_cuda_launches OR
+           NOT campaign_physical_cuda_transfers GREATER
+               baseline_physical_cuda_transfers OR
+           NOT campaign_physical_cuda_owned_allocations EQUAL
+               baseline_physical_cuda_owned_allocations OR
+           NOT campaign_physical_cuda_observed_allocations EQUAL
+               baseline_physical_cuda_observed_allocations)
+          message(FATAL_ERROR
+            "scalar CUDA ${campaign_phase}/rank${campaign_source} physical ledger/plateau audit is invalid")
+        endif()
+        foreach(step IN ITEMS 000000 000010 000020)
+          execute_process(
+            COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk
+              "${baseline_directory}/state-step-${step}.vtk"
+              "${campaign_directory}/state-step-${step}.vtk" 1e-15
+            RESULT_VARIABLE campaign_compare_status
+            OUTPUT_VARIABLE campaign_compare_output
+            ERROR_VARIABLE campaign_compare_error)
+          if(NOT campaign_compare_status EQUAL 0 OR
+             NOT campaign_compare_error STREQUAL "")
+            message(FATAL_ERROR
+              "scalar CUDA ${campaign_phase}/rank${campaign_source} state-${step} differs from baseline: ${campaign_compare_output};${campaign_compare_error}")
+          endif()
+        endforeach()
+        foreach(hash_field IN ITEMS final_interior_sha256 final_trace_sha256)
+          string(REGEX MATCH "\"${hash_field}\": \"([0-9a-f]+)\""
+                 baseline_campaign_hash_match "${baseline_metadata}")
+          set(baseline_campaign_hash "${CMAKE_MATCH_1}")
+          string(REGEX MATCH "\"${hash_field}\": \"([0-9a-f]+)\""
+                 campaign_hash_match "${campaign_metadata}")
+          if(NOT baseline_campaign_hash STREQUAL "${CMAKE_MATCH_1}")
+            message(FATAL_ERROR
+              "scalar CUDA ${campaign_phase}/rank${campaign_source} ${hash_field} differs from baseline")
+          endif()
+        endforeach()
+        require_exact_logical_artifacts(
+          "${campaign_directory}"
+          "${campaign_phase}/rank${campaign_source} retry"
+          "${scalar_step0_artifacts}" "${scalar_step10_artifacts}"
+          "${scalar_step20_artifacts}")
+      endforeach()
+    endforeach()
+
+    # A terminal step-20 post-publication fault has no in-process
+    # compensation. It must leave the exact step-10 authority restartable, and
+    # a later split reader alone may publish the final generation.
+    foreach(campaign_source RANGE 0 ${scalar_maximum_source})
+      set(terminal_directory
+        "${HDG_RUNTIME_TEST_OUTPUT}-strong-step20-rank${campaign_source}")
+      set(terminal_checkpoint "${terminal_directory}.checkpoint")
+      file(REMOVE_RECURSE "${terminal_directory}")
+      file(REMOVE "${terminal_checkpoint}")
+      run_runtime(terminal ${functional_common}
+        --output-dir "${terminal_directory}"
+        --checkpoint-out "${terminal_checkpoint}" --checkpoint-step 10
+        --stop-after-checkpoint false --restart-from none
+        --max-retries 0
+        --inject-failure
+          "AfterRecoveryBeforeCommit:20:${campaign_source}")
+      if(NOT terminal_status EQUAL 72 OR
+         NOT terminal_error MATCHES
+           "status=RuntimeFailure.*step=19.*retries=0.*boundary=post-publication-pre-finalize phase=AfterRecoveryBeforeCommit target_step=20 consumed_boundary_count=1 source_rank=${campaign_source}")
+        message(FATAL_ERROR
+          "scalar CUDA terminal post-publication rank${campaign_source} campaign failed: ${terminal_status};${terminal_output};${terminal_error}")
+      endif()
+      require_exact_logical_artifacts(
+        "${terminal_directory}"
+        "terminal post-publication rank${campaign_source} rollback"
+        "${scalar_step0_artifacts}" "${scalar_step10_artifacts}")
+      file(SHA256 "${terminal_checkpoint}" terminal_checkpoint_before)
+      run_runtime(terminal_reader ${functional_common}
+        --output-dir "${terminal_directory}"
+        --checkpoint-out none --checkpoint-step none
+        --stop-after-checkpoint false
+        --restart-from "${terminal_checkpoint}"
+        --max-retries 0 --inject-failure off)
+      file(SHA256 "${terminal_checkpoint}" terminal_checkpoint_after)
+      if(NOT terminal_reader_status EQUAL 0 OR
+         NOT terminal_reader_output MATCHES
+           "status=Success.*step=20.*retries=1" OR
+         NOT terminal_reader_error STREQUAL "" OR
+         NOT terminal_checkpoint_before STREQUAL terminal_checkpoint_after)
+        message(FATAL_ERROR
+          "scalar CUDA terminal rank${campaign_source} restart continuation failed: ${terminal_reader_status};${terminal_reader_output};${terminal_reader_error}")
+      endif()
+      file(READ "${terminal_directory}/run-metadata.json"
+                terminal_reader_metadata)
+      foreach(step IN ITEMS 000000 000010 000020)
+        execute_process(
+          COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk
+            "${baseline_directory}/state-step-${step}.vtk"
+            "${terminal_directory}/state-step-${step}.vtk" 1e-15
+          RESULT_VARIABLE terminal_compare_status
+          OUTPUT_VARIABLE terminal_compare_output
+          ERROR_VARIABLE terminal_compare_error)
+        if(NOT terminal_compare_status EQUAL 0 OR
+           NOT terminal_compare_error STREQUAL "")
+          message(FATAL_ERROR
+            "scalar CUDA terminal rank${campaign_source} restart state-${step} differs from baseline: ${terminal_compare_output};${terminal_compare_error}")
+        endif()
+      endforeach()
+      foreach(hash_field IN ITEMS final_interior_sha256 final_trace_sha256)
+        string(REGEX MATCH "\"${hash_field}\": \"([0-9a-f]+)\""
+               baseline_terminal_hash_match "${baseline_metadata}")
+        set(baseline_terminal_hash "${CMAKE_MATCH_1}")
+        string(REGEX MATCH "\"${hash_field}\": \"([0-9a-f]+)\""
+               terminal_hash_match "${terminal_reader_metadata}")
+        if(NOT baseline_terminal_hash STREQUAL "${CMAKE_MATCH_1}")
+          message(FATAL_ERROR
+            "scalar CUDA terminal rank${campaign_source} ${hash_field} differs from baseline")
+        endif()
+      endforeach()
+      require_exact_logical_artifacts(
+        "${terminal_directory}"
+        "terminal post-publication rank${campaign_source} restart"
+        "${scalar_step0_artifacts}" "${scalar_step10_artifacts}"
+        "${scalar_step20_artifacts}")
+    endforeach()
   endif()
   if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2 AND
      HDG_RUNTIME_BACKEND STREQUAL "cpu")

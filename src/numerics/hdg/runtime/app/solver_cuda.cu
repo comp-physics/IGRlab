@@ -2624,6 +2624,7 @@ struct ScalarInjectionAudit final
   int local_injection_count = 0;
   int non_origin_local_injection_count = 0;
   int collective_decisions = 0;
+  int consumed_boundary_count = 0;
 };
 
 std::string ScalarCudaMetadata(
@@ -2710,8 +2711,19 @@ std::string ScalarCudaMetadata(
       << injection.non_origin_local_injection_count << ",\n"
       << "  \"injection_collective_decisions\": "
       << injection.collective_decisions << ",\n"
+      << "  \"injection_consumed_boundary_count\": "
+      << injection.consumed_boundary_count << ",\n"
       << "  \"accepted_steps\": " << result.coordinates.step << ",\n"
       << "  \"attempted_steps\": " << evidence.attempted_steps << ",\n"
+      << "  \"physical_cuda_launches\": "
+      << evidence.launches.assemble_launches +
+             evidence.launches.condense_launches +
+             evidence.launches.recover_launches
+      << ",\n  \"physical_cuda_transfers\": " << evidence.transfers.count
+      << ",\n  \"physical_cuda_owned_allocations\": "
+      << evidence.allocations.current_owned_calls
+      << ",\n  \"physical_cuda_observed_allocations\": "
+      << evidence.allocations.current_observed_events << ",\n"
       << "  \"maximum_conservation_error\": " << maximum_conservation
       << ",\n  \"minimum_density\": " << minimum_density
       << ",\n  \"minimum_pressure\": " << minimum_pressure
@@ -2963,6 +2975,7 @@ ApplicationRunResult RunScalarIgrCuda(
   if (config.injection().mode == FailureInjectionModeV1::prescribed)
     injection.configured_source_rank =
         static_cast<int>(config.injection().source_rank);
+  std::string consumed_diagnostic;
   bool injected = false;
   while (result.failure_class == ApplicationRunResult::FailureClass::none &&
          owner->trajectory_evidence().coordinates.step < stop_step)
@@ -3051,12 +3064,17 @@ ApplicationRunResult RunScalarIgrCuda(
       staged = ScalarBeginTransaction(
           transaction, output_directory, target, context, diagnostic);
     if (staged && application_injection &&
-        config.injection().phase == FailurePhase::AfterRecoveryBeforeCommit)
+        config.injection().phase == FailurePhase::AfterRecoveryBeforeCommit &&
+        target == scalar_igr_sc25_v3_failure_target_step)
     {
       staged = false;
-      diagnostic = "scalar-IGR CUDA injected pre-stage failure"
-          " phase=AfterRecoveryBeforeCommit source_rank=" +
+      consumed_diagnostic = "scalar-IGR CUDA injected pre-stage failure"
+          " boundary=post-install-pre-stage"
+          " phase=AfterRecoveryBeforeCommit target_step=7"
+          " consumed_boundary_count=1 source_rank=" +
           std::to_string(config.injection().source_rank);
+      diagnostic = consumed_diagnostic;
+      ++injection.consumed_boundary_count;
     }
     ScalarPackedState packed;
     ScalarResourceSidecar sidecar{};
@@ -3071,9 +3089,13 @@ ApplicationRunResult RunScalarIgrCuda(
           config.injection().phase == FailurePhase::CheckpointStaging)
       {
         staged = false;
-        diagnostic = "scalar-IGR CUDA injected checkpoint-staging failure"
-            " phase=CheckpointStaging source_rank=" +
+        consumed_diagnostic =
+            "scalar-IGR CUDA injected checkpoint-staging failure"
+            " boundary=checkpoint-staging phase=CheckpointStaging"
+            " target_step=10 consumed_boundary_count=1 source_rank=" +
             std::to_string(config.injection().source_rank);
+        diagnostic = consumed_diagnostic;
+        ++injection.consumed_boundary_count;
       }
       if (staged && checkpoint_step)
         staged = BuildScalarSidecar(
@@ -3087,9 +3109,12 @@ ApplicationRunResult RunScalarIgrCuda(
         config.injection().phase == FailurePhase::OutputStaging)
     {
       staged = false;
-      diagnostic = "scalar-IGR CUDA injected output-staging failure"
-          " phase=OutputStaging source_rank=" +
+      consumed_diagnostic = "scalar-IGR CUDA injected output-staging failure"
+          " boundary=output-staging phase=OutputStaging"
+          " target_step=10 consumed_boundary_count=1 source_rank=" +
           std::to_string(config.injection().source_rank);
+      diagnostic = consumed_diagnostic;
+      ++injection.consumed_boundary_count;
     }
     if (staged && checkpoint_step)
       staged = checkpoint_writer && StageScalarCudaCheckpoint(
@@ -3120,7 +3145,9 @@ ApplicationRunResult RunScalarIgrCuda(
         {
           const std::string text = ScalarCudaMetadata(
               config, anticipated, staged_evidence, initial_hash,
-              final_interior, final_trace, injection, resource, diagnostic);
+              final_interior, final_trace, injection, resource,
+              consumed_diagnostic.empty() ? diagnostic
+                                          : consumed_diagnostic);
           metadata.assign(text.begin(), text.end());
         }
         catch (...) { resource_ready = false; }
@@ -3140,6 +3167,21 @@ ApplicationRunResult RunScalarIgrCuda(
     bool published = finalize_ready;
     if (durable_started && finalize_ready)
       published = ScalarPublish(transaction, context, diagnostic);
+    if (published && durable_started && application_injection &&
+        config.injection().phase == FailurePhase::AfterRecoveryBeforeCommit &&
+        (target == config.scenario_checkpoint_step() ||
+         target == config.accepted_steps()))
+    {
+      published = false;
+      consumed_diagnostic =
+          "scalar-IGR CUDA injected reversible publication failure"
+          " boundary=post-publication-pre-finalize"
+          " phase=AfterRecoveryBeforeCommit target_step=" +
+          std::to_string(target) + " consumed_boundary_count=1 source_rank=" +
+          std::to_string(config.injection().source_rank);
+      diagnostic = consumed_diagnostic;
+      ++injection.consumed_boundary_count;
+    }
     bool committed = false;
     if (published)
     {

@@ -1130,9 +1130,12 @@ bool RunTransactionNegatives()
     return false;
   }
   scalar::PublishedState reverted{};
+  const scalar::ScalarCudaEvidence& reverted_evidence =
+      owner->trajectory_evidence();
   if (!owner->CopyPublishedTrajectoryState(reverted) ||
       !oracle::SameStateBytes(step0, reverted) ||
-      !SameLogicalEvidence(step0_evidence, owner->trajectory_evidence()))
+      !SameLogicalEvidence(step0_evidence, reverted_evidence) ||
+      !RestorePhysicalEvidenceAdvanced(step0_evidence, reverted_evidence))
   {
     return false;
   }

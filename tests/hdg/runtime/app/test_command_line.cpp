@@ -1040,6 +1040,14 @@ std::vector<std::string> ScalarArguments(const std::string& backend,
       "0x5738425343323553"};
 }
 
+void SetOption(std::vector<std::string>& arguments,
+               const std::string& option, const std::string& value)
+{
+  const auto found = std::find(arguments.begin(), arguments.end(), option);
+  if (found != arguments.end() && found + 1 != arguments.end())
+    *(found + 1) = value;
+}
+
 ParsedCommandLine Parse(std::vector<std::string> values)
 {
   std::vector<const char*> argv;
@@ -1126,6 +1134,72 @@ bool DirectAndNegativeControls()
   passed = Check(scalar_cuda.status == CommandLineStatus::rejected &&
                      scalar_cuda.rejection == ApplicationRejection::unbuilt_backend,
                  "scalar_igr_cuda_explicit_unbuilt") && passed;
+#endif
+  auto scalar_cuda_fault_free_arguments = ScalarArguments("cuda", "0");
+  SetOption(scalar_cuda_fault_free_arguments, "--max-retries", "0");
+  SetOption(scalar_cuda_fault_free_arguments, "--inject-failure", "off");
+  const ParsedCommandLine scalar_cuda_fault_free =
+      Parse(scalar_cuda_fault_free_arguments);
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1
+  passed = Check(scalar_cuda_fault_free.status == CommandLineStatus::run &&
+                     scalar_cuda_fault_free.options.injection.mode ==
+                         FailureInjectionModeV1::off &&
+                     scalar_cuda_fault_free.options.retry_limit == 0,
+                 "scalar_cuda_fault_free_cli_contract") && passed;
+  for (const std::string phase :
+       {"CheckpointStaging", "OutputStaging",
+        "AfterRecoveryBeforeCommit"})
+  {
+    auto scheduled_arguments = ScalarArguments("cuda", "0");
+    SetOption(scheduled_arguments, "--inject-failure",
+              phase + ":10:0");
+    const ParsedCommandLine scheduled = Parse(scheduled_arguments);
+    passed = Check(scheduled.status == CommandLineStatus::run &&
+                       scheduled.options.backend_id ==
+                           CudaRank1OneGpuBackendTag::id &&
+                       scheduled.options.injection.target_step == 10 &&
+                       scheduled.options.injection.source_rank == 0,
+                   "scalar_cuda_rank1_step10_cli_contract") && passed;
+  }
+  auto terminal_arguments = ScalarArguments("cuda", "0");
+  SetOption(terminal_arguments, "--max-retries", "0");
+  SetOption(terminal_arguments, "--inject-failure",
+            "AfterRecoveryBeforeCommit:20:0");
+  const ParsedCommandLine terminal = Parse(terminal_arguments);
+  passed = Check(terminal.status == CommandLineStatus::run &&
+                     terminal.options.backend_id ==
+                         CudaRank1OneGpuBackendTag::id &&
+                     terminal.options.injection.target_step == 20 &&
+                     terminal.options.retry_limit == 0,
+                 "scalar_cuda_rank1_step20_cli_contract") && passed;
+#endif
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
+  for (const std::string phase :
+       {"CheckpointStaging", "OutputStaging",
+        "AfterRecoveryBeforeCommit"})
+  {
+    auto scheduled_arguments = ScalarArguments("cuda", "0");
+    SetOption(scheduled_arguments, "--inject-failure",
+              phase + ":10:1");
+    const ParsedCommandLine scheduled = Parse(scheduled_arguments);
+    passed = Check(scheduled.status == CommandLineStatus::run &&
+                       scheduled.options.backend_id ==
+                           CudaRank2OneGpuHostStagedBackendTag::id &&
+                       scheduled.options.injection.target_step == 10 &&
+                       scheduled.options.injection.source_rank == 1,
+                   "scalar_cuda_rank2_step10_cli_fallback") && passed;
+  }
+  auto rank2_terminal_arguments = ScalarArguments("cuda", "0");
+  SetOption(rank2_terminal_arguments, "--max-retries", "0");
+  SetOption(rank2_terminal_arguments, "--inject-failure",
+            "AfterRecoveryBeforeCommit:20:1");
+  const ParsedCommandLine rank2_terminal = Parse(rank2_terminal_arguments);
+  passed = Check(rank2_terminal.status == CommandLineStatus::run &&
+                     rank2_terminal.options.backend_id ==
+                         CudaRank2OneGpuHostStagedBackendTag::id &&
+                     rank2_terminal.options.injection.target_step == 20 &&
+                     rank2_terminal.options.retry_limit == 0,
+                 "scalar_cuda_rank2_step20_cli_fallback") && passed;
 #endif
   auto scalar_h1_args = ScalarArguments("cpu", "none");
   scalar_h1_args[6] = "h1";

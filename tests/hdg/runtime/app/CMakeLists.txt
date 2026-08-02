@@ -211,4 +211,16 @@ if(MFEM_USE_CUDA)
     dg_igr_hdg_runtime_app_cli_functional_cuda_rank2
     dg_igr_hdg_runtime_app_cli_scalar_igr_cuda_rank2
     PROPERTIES PROCESSORS 2)
+  # The measured pre-repair scalar tests were 277.58s (rank 1) and 916.58s
+  # (rank 2) for about three full-trajectory equivalents. The exact added
+  # campaigns raise those totals to 7.45 and 11.9 equivalents respectively:
+  # 3/6 full scheduled retries plus 1/2 terminal 19-step runs and 1/2
+  # 10-step restart continuations. These rounded bounds retain roughly 2x the
+  # proportional measured time without changing registration or resource use.
+  set_tests_properties(
+    dg_igr_hdg_runtime_app_cli_scalar_igr_cuda_rank1
+    PROPERTIES TIMEOUT 1800)
+  set_tests_properties(
+    dg_igr_hdg_runtime_app_cli_scalar_igr_cuda_rank2
+    PROPERTIES TIMEOUT 7200)
 endif()

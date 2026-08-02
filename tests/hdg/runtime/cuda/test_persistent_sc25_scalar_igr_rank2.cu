@@ -67,6 +67,95 @@ bool CudaAccepted(const scalar::ScalarCudaStatus status) noexcept
       status == scalar::ScalarCudaStatus::accepted_after_one_retry;
 }
 
+bool RollbackPhysicalEvidenceAdvanced(
+    const scalar::ScalarCudaEvidence& before,
+    const scalar::ScalarCudaEvidence& after) noexcept
+{
+  const auto& before_launches = before.launches;
+  const auto& after_launches = after.launches;
+  const bool launches_advanced =
+      after_launches.assemble_launches >=
+          before_launches.assemble_launches &&
+      after_launches.condense_launches >=
+          before_launches.condense_launches &&
+      after_launches.recover_launches >= before_launches.recover_launches &&
+      after_launches.remote_system_exchange_launches >=
+          before_launches.remote_system_exchange_launches &&
+      after_launches.owned_trace_distribution_launches >=
+          before_launches.owned_trace_distribution_launches &&
+      (after_launches.assemble_launches >
+           before_launches.assemble_launches ||
+       after_launches.condense_launches >
+           before_launches.condense_launches ||
+       after_launches.recover_launches > before_launches.recover_launches ||
+       after_launches.remote_system_exchange_launches >
+           before_launches.remote_system_exchange_launches ||
+       after_launches.owned_trace_distribution_launches >
+           before_launches.owned_trace_distribution_launches) &&
+      after_launches.fallback_calls == before_launches.fallback_calls &&
+      after_launches.last_compiled_architecture ==
+          before_launches.last_compiled_architecture &&
+      before_launches.all_launches_completed &&
+      after_launches.all_launches_completed;
+  const auto& before_transfers = before.transfers;
+  const auto& after_transfers = after.transfers;
+  const bool transfers_advanced =
+      after_transfers.schema == before_transfers.schema &&
+      after_transfers.capacity == before_transfers.capacity &&
+      after_transfers.count > before_transfers.count &&
+      after_transfers.observed_count > before_transfers.observed_count &&
+      after_transfers.dropped_count == before_transfers.dropped_count &&
+      !before_transfers.overflow && !after_transfers.overflow &&
+      after_transfers.totals.host_to_device_bytes >=
+          before_transfers.totals.host_to_device_bytes &&
+      after_transfers.totals.device_to_host_bytes >=
+          before_transfers.totals.device_to_host_bytes &&
+      after_transfers.totals.device_to_device_bytes >=
+          before_transfers.totals.device_to_device_bytes &&
+      after_transfers.totals.mpi_staging_bytes >=
+          before_transfers.totals.mpi_staging_bytes &&
+      after_transfers.totals.synchronization_events >=
+          before_transfers.totals.synchronization_events &&
+      after_transfers.totals.event_count >
+          before_transfers.totals.event_count &&
+      before_transfers.totals.complete && after_transfers.totals.complete;
+  const auto& left = before.allocations;
+  const auto& right = after.allocations;
+  const bool allocation_plateau =
+      left.double_arena == right.double_arena &&
+      left.integer_arena == right.integer_arena &&
+      left.true_matrix == right.true_matrix && left.gmres == right.gmres &&
+      left.ilu == right.ilu &&
+      left.current_observed_events == right.current_observed_events &&
+      left.current_owned_calls == right.current_owned_calls &&
+      left.current_deallocations == right.current_deallocations &&
+      left.current_mfem_high_water == right.current_mfem_high_water &&
+      left.current_hypre_high_water == right.current_hypre_high_water &&
+      right.warm_plateau && right.zero_post_baseline_observed_growth &&
+      right.zero_post_baseline_owned_allocation &&
+      right.zero_post_baseline_owned_deallocation &&
+      before.allocation_ledger.schema == after.allocation_ledger.schema &&
+      before.allocation_ledger.capacity == after.allocation_ledger.capacity &&
+      before.allocation_ledger.count == after.allocation_ledger.count &&
+      before.allocation_ledger.observed_count ==
+          after.allocation_ledger.observed_count &&
+      before.allocation_ledger.dropped_count ==
+          after.allocation_ledger.dropped_count &&
+      before.allocation_ledger.ordered_digest ==
+          after.allocation_ledger.ordered_digest &&
+      before.allocation_ledger.overflow == after.allocation_ledger.overflow;
+  return launches_advanced && transfers_advanced && allocation_plateau &&
+      before.reuse.identity_hash == after.reuse.identity_hash &&
+      before.reuse.owner == after.reuse.owner &&
+      before.reuse.workspace == after.reuse.workspace &&
+      before.reuse.unchanged && after.reuse.unchanged &&
+      before.residency.state_device_resident &&
+      after.residency.state_device_resident &&
+      before.residency.host_staged_rank2 && after.residency.host_staged_rank2 &&
+      !before.residency.host_numerical_fallback &&
+      !after.residency.host_numerical_fallback;
+}
+
 std::uint64_t DoubleBits(const double value) noexcept
 {
   std::uint64_t bits = 0;
@@ -692,6 +781,11 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
                    before_prepare_evidence,
                    cuda_owner->trajectory_evidence()),
                "affine revert restores exact logical evidence"))
+    return 1;
+  if (!require(RollbackPhysicalEvidenceAdvanced(
+                   before_prepare_evidence,
+                   cuda_owner->trajectory_evidence()),
+               "affine revert retains monotone physical work at allocation plateau"))
     return 1;
   scalar::PersistentSc25ScalarIgrCudaRank2::Transaction aborted{};
   const bool uninstalled_aborted =

@@ -481,6 +481,79 @@ bool CheckScalarIgrMatrix()
                                : validation.rejection() ==
                                      ApplicationRejection::unbuilt_backend,
                    "scalar_igr_cuda_static_matrix") && passed;
+    if (!item.second) continue;
+
+    const std::uint32_t rank_count =
+        item.first == CudaRank2OneGpuHostStagedBackendTag::id ? 2U : 1U;
+    ApplicationOptionsView fault_free = ScalarIgr(item.first);
+    fault_free.injection = {};
+    fault_free.retry_limit = 0;
+    passed = Check(ValidateApplicationOptions(fault_free).accepted(),
+                   "scalar_cuda_fault_free_reference_controls") && passed;
+
+    for (std::uint32_t source = 0; source < rank_count; ++source)
+    {
+      for (const FailurePhase phase :
+           {FailurePhase::CheckpointStaging, FailurePhase::OutputStaging,
+            FailurePhase::AfterRecoveryBeforeCommit})
+      {
+        ApplicationOptionsView scheduled = ScalarIgr(item.first);
+        scheduled.injection = {FailureInjectionModeV1::prescribed, phase,
+                               scalar_igr_sc25_v3_checkpoint_step, source};
+        const ApplicationValidation scheduled_validation =
+            ValidateApplicationOptions(scheduled);
+        passed = Check(
+                     scheduled_validation.accepted() &&
+                         scheduled_validation.config()->injection() ==
+                             scheduled.injection &&
+                         scheduled_validation.config()->retry_limit() == 1,
+                     "scalar_cuda_step10_scheduled_boundary_contract") &&
+            passed;
+      }
+
+      ApplicationOptionsView post_publication = ScalarIgr(item.first);
+      post_publication.injection = {
+          FailureInjectionModeV1::prescribed,
+          FailurePhase::AfterRecoveryBeforeCommit,
+          scalar_igr_sc25_v3_steps, source};
+      post_publication.retry_limit = 0;
+      const ApplicationValidation post_publication_validation =
+          ValidateApplicationOptions(post_publication);
+      passed = Check(
+                   post_publication_validation.accepted() &&
+                       post_publication_validation.config()->injection() ==
+                           post_publication.injection &&
+                       post_publication_validation.config()->retry_limit() ==
+                           0,
+                   "scalar_cuda_step20_postpublication_boundary_contract") &&
+          passed;
+    }
+
+    ApplicationOptionsView malformed = ScalarIgr(item.first);
+    malformed.injection = {
+        FailureInjectionModeV1::prescribed,
+        FailurePhase::AfterRecoveryBeforeCommit,
+        scalar_igr_sc25_v3_checkpoint_step, rank_count};
+    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
+                       ApplicationRejection::invalid_run_role,
+                   "scalar_cuda_rejects_out_of_range_scheduled_source") &&
+        passed;
+    malformed.injection.source_rank = 0;
+    malformed.retry_limit = 0;
+    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
+                       ApplicationRejection::invalid_run_role,
+                   "scalar_cuda_rejects_terminal_step10_controls") && passed;
+    malformed.injection.target_step = scalar_igr_sc25_v3_steps;
+    malformed.retry_limit = scalar_igr_sc25_v3_retry_limit;
+    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
+                       ApplicationRejection::invalid_run_role,
+                   "scalar_cuda_rejects_retrying_step20_controls") && passed;
+    malformed.injection.phase = FailurePhase::CheckpointStaging;
+    malformed.retry_limit = 0;
+    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
+                       ApplicationRejection::invalid_run_role,
+                   "scalar_cuda_rejects_nonpublication_step20_phase") &&
+        passed;
   }
 
   ApplicationOptionsView h1 = ScalarIgr(CpuSerialBackendTag::id);
