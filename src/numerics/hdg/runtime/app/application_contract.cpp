@@ -20,6 +20,12 @@
 #ifndef DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
 #error "build-owned scalar-IGR CPU availability definition is required"
 #endif
+#ifndef DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1
+#error "build-owned scalar-IGR CUDA rank-1 availability definition is required"
+#endif
+#ifndef DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
+#error "build-owned scalar-IGR CUDA rank-2 availability definition is required"
+#endif
 
 namespace dg::hdg::runtime::app
 {
@@ -767,10 +773,14 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::unbuilt_backend);
   }
-  if (scalar &&
-      ((backend != ApplicationBackend::cpu_serial &&
-        backend != ApplicationBackend::cpu_rank2) ||
-       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU != 1))
+  const bool scalar_backend_available =
+      (backend == ApplicationBackend::cpu_serial ||
+       backend == ApplicationBackend::cpu_rank2)
+          ? DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1
+          : (backend == ApplicationBackend::cuda_rank1_one_gpu
+                 ? DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1
+                 : DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1);
+  if (scalar && !scalar_backend_available)
   {
     return reject(ApplicationRejection::unbuilt_backend);
   }

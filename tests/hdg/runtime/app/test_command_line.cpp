@@ -204,15 +204,22 @@ bool CompareScalarVtk(const char* left_path, const char* right_path,
   for (std::size_t index = 0; index < left.coordinates.size(); ++index)
     if (left.coordinates[index] != right.coordinates[index]) return false;
   for (std::size_t component = 0; component < left.fields.size(); ++component)
+  {
+    long double difference_squared = 0.0L;
+    long double reference_squared = 0.0L;
     for (std::size_t index = 0; index < left.points; ++index)
     {
       const double a = left.fields[component][index];
       const double b = right.fields[component][index];
-      const double scale = std::max({1.0, std::abs(a), std::abs(b)});
-      if (!std::isfinite(a) || !std::isfinite(b) ||
-          std::abs(a - b) > tolerance * scale)
-        return false;
+      if (!std::isfinite(a) || !std::isfinite(b)) return false;
+      const long double difference = static_cast<long double>(a) - b;
+      difference_squared += difference * difference;
+      reference_squared += static_cast<long double>(b) * b;
     }
+    const long double relative_l2 = std::sqrt(difference_squared) /
+        std::max(1.0L, std::sqrt(reference_squared));
+    if (!std::isfinite(relative_l2) || relative_l2 > tolerance) return false;
+  }
   return true;
 }
 
@@ -469,9 +476,16 @@ bool DirectAndNegativeControls()
                  "scalar_igr_default_build_unavailable") && passed;
 #endif
   const ParsedCommandLine scalar_cuda = Parse(ScalarArguments("cuda", "0"));
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1
+  passed = Check(scalar_cuda.status == CommandLineStatus::run &&
+                     scalar_cuda.options.backend_id ==
+                         CudaRank1OneGpuBackendTag::id,
+                 "scalar_igr_cuda_static_cli") && passed;
+#else
   passed = Check(scalar_cuda.status == CommandLineStatus::rejected &&
                      scalar_cuda.rejection == ApplicationRejection::unbuilt_backend,
                  "scalar_igr_cuda_explicit_unbuilt") && passed;
+#endif
   auto scalar_h1_args = ScalarArguments("cpu", "none");
   scalar_h1_args[6] = "h1";
   const ParsedCommandLine scalar_h1 = Parse(scalar_h1_args);

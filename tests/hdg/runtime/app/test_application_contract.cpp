@@ -37,6 +37,12 @@ static_assert(IsFrozenApplicationBackend<CpuSerialBackendTag>::value &&
 static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0 ||
                   DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1,
               "scalar-IGR CPU availability is a build-owned boolean");
+static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 0 ||
+                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1,
+              "scalar-IGR CUDA rank-1 availability is build-owned");
+static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 0 ||
+                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1,
+              "scalar-IGR CUDA rank-2 availability is build-owned");
 
 bool Check(const bool condition, const char* name)
 {
@@ -463,12 +469,19 @@ bool CheckScalarIgrMatrix()
                              ApplicationScenarioV1::scalar_igr_sc25_v3,
                      "scalar_igr_exact_scenario") && passed;
   }
-  for (const std::string_view backend :
-       {CudaRank1OneGpuBackendTag::id,
-        CudaRank2OneGpuHostStagedBackendTag::id})
-    passed = Check(ValidateApplicationOptions(ScalarIgr(backend)).rejection() ==
-                       ApplicationRejection::unbuilt_backend,
-                   "scalar_igr_cuda_slot_explicitly_unbuilt") && passed;
+  for (const auto& item : std::array<std::pair<std::string_view, bool>, 2>{{
+           {CudaRank1OneGpuBackendTag::id,
+            DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1},
+           {CudaRank2OneGpuHostStagedBackendTag::id,
+            DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1}}})
+  {
+    const ApplicationValidation validation =
+        ValidateApplicationOptions(ScalarIgr(item.first));
+    passed = Check(item.second ? validation.accepted()
+                               : validation.rejection() ==
+                                     ApplicationRejection::unbuilt_backend,
+                   "scalar_igr_cuda_static_matrix") && passed;
+  }
 
   ApplicationOptionsView h1 = ScalarIgr(CpuSerialBackendTag::id);
   h1.interior_space = InteriorSpace::h1;

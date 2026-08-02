@@ -334,6 +334,55 @@ function(validate_scalar_igr_vtk path mesh_n label)
   endif()
 endfunction()
 
+function(validate_scalar_cuda_metadata metadata label expected_step)
+  if(HDG_RUNTIME_RANKS EQUAL 1)
+    set(expected_backend "cuda.rank1.one_gpu")
+  else()
+    set(expected_backend "cuda.rank2.one_gpu.host_staged")
+  endif()
+  string(FIND "${metadata}" "\"fields\": [\"U\", \"Sigma\", \"z\"]"
+       fields_offset)
+  if(fields_offset EQUAL -1 OR
+     NOT metadata MATCHES
+         "\"card\": \"exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3\"" OR
+     NOT metadata MATCHES
+         "\"scenario\": \"W8B-SC25-N8-K1-20STEP-v1\"" OR
+     NOT metadata MATCHES "\"backend\": \"${expected_backend}\"" OR
+     NOT metadata MATCHES
+         "\"layout\": \"mfem.l2.byNODES.U4.Sigma1.z2.separate.v3\"" OR
+     NOT metadata MATCHES "\"gpu_uuid\": \"GPU-[0-9a-f]+\"" OR
+     NOT metadata MATCHES "\"committed_step\": ${expected_step}" OR
+     NOT metadata MATCHES "\"accepted_steps\": ${expected_step}" OR
+     NOT metadata MATCHES "\"status\": \"Success\"" OR
+     NOT metadata MATCHES "\"reason\": \"none\"" OR
+     NOT metadata MATCHES "\"trace_residual_gate\": true" OR
+     NOT metadata MATCHES "\"solver_contract\": true" OR
+     NOT metadata MATCHES "\"persistent_reuse\": true" OR
+     NOT metadata MATCHES "\"zero_fallback\": true" OR
+     NOT metadata MATCHES "\"zero_post_baseline_allocation\": true" OR
+     NOT metadata MATCHES "\"device_residency\": true" OR
+     NOT metadata MATCHES "\"host_staged_same_gpu\": true")
+    message(FATAL_ERROR "${label} CUDA scalar-IGR evidence is incomplete")
+  endif()
+  foreach(scientific_field IN ITEMS maximum_conservation_error minimum_density
+                                    minimum_pressure minimum_speed_margin)
+    string(REGEX MATCH
+      "\"${scientific_field}\": ([0-9.eE+-]+)"
+      scientific_match "${metadata}")
+    if(CMAKE_MATCH_1 STREQUAL "")
+      message(FATAL_ERROR
+        "${label} CUDA scalar-IGR ${scientific_field} evidence is missing")
+    endif()
+    set(${scientific_field} "${CMAKE_MATCH_1}")
+  endforeach()
+  if(maximum_conservation_error GREATER 2e-10 OR
+     minimum_density LESS 1e-8 OR minimum_pressure LESS 1e-8 OR
+     minimum_speed_margin LESS 0)
+    message(FATAL_ERROR
+      "${label} CUDA scalar-IGR scientific gate failed: conservation=${maximum_conservation_error};density=${minimum_density};pressure=${minimum_pressure};speed_margin=${minimum_speed_margin}")
+  endif()
+endfunction()
+
 if(HDG_RUNTIME_FUNCTIONAL)
   if(NOT DEFINED HDG_RUNTIME_BACKEND)
     set(HDG_RUNTIME_BACKEND cpu)
@@ -497,10 +546,17 @@ if(HDG_RUNTIME_FUNCTIONAL)
   endif()
 
   file(READ "${reference_directory}/run-metadata.json" reference_metadata)
+  file(READ "${writer_directory}/run-metadata-checkpoint.json"
+       writer_metadata)
   file(READ "${reader_directory}/run-metadata.json" reader_metadata)
-  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2)
-    file(READ "${writer_directory}/run-metadata-checkpoint.json"
-         writer_metadata)
+  if(HDG_RUNTIME_SCALAR_IGR AND
+     HDG_RUNTIME_BACKEND STREQUAL "cuda")
+    validate_scalar_cuda_metadata("${reference_metadata}" "reference" 20)
+    validate_scalar_cuda_metadata("${writer_metadata}" "split writer" 10)
+    validate_scalar_cuda_metadata("${reader_metadata}" "split reader" 20)
+  endif()
+  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2 AND
+     HDG_RUNTIME_BACKEND STREQUAL "cpu")
     foreach(injection_metadata IN ITEMS reference_metadata writer_metadata)
       if(NOT "${${injection_metadata}}" MATCHES
              "\"injection_configured_source_rank\": 1" OR
@@ -584,7 +640,8 @@ if(HDG_RUNTIME_FUNCTIONAL)
      NOT reader_metadata MATCHES "\"retries\": 1")
     message(FATAL_ERROR "functional restart/retry parity contract failed")
   endif()
-  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2)
+  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2 AND
+     HDG_RUNTIME_BACKEND STREQUAL "cpu")
     if(NOT DEFINED HDG_RUNTIME_SCALAR_VTK_TEST)
       message(FATAL_ERROR "scalar-IGR physical VTK comparator is unavailable")
     endif()
@@ -807,46 +864,126 @@ if(HDG_RUNTIME_FUNCTIONAL)
     endif()
   endif()
   if(HDG_RUNTIME_BACKEND STREQUAL "cuda")
-    if(NOT DEFINED HDG_RUNTIME_SCIENTIFIC_TEST)
+    if(HDG_RUNTIME_SCALAR_IGR)
+      if(NOT DEFINED HDG_RUNTIME_SCALAR_VTK_TEST)
+        message(FATAL_ERROR "CUDA scalar field parity comparator is unavailable")
+      endif()
+    elseif(NOT DEFINED HDG_RUNTIME_SCIENTIFIC_TEST)
       message(FATAL_ERROR "CUDA field parity comparator is unavailable")
     endif()
-    set(cpu_directory "${HDG_RUNTIME_TEST_OUTPUT}-cpu-parity")
-    set(cpu_checkpoint "${HDG_RUNTIME_TEST_OUTPUT}-cpu-parity.checkpoint")
-    file(REMOVE_RECURSE "${cpu_directory}")
-    file(REMOVE "${cpu_checkpoint}")
-    set(cpu_functional_common ${functional_common})
-    list(FIND cpu_functional_common --backend backend_option_index)
-    list(FIND cpu_functional_common --device-id device_option_index)
-    math(EXPR backend_value_index "${backend_option_index} + 1")
-    math(EXPR device_value_index "${device_option_index} + 1")
-    list(REMOVE_AT cpu_functional_common ${backend_value_index})
-    list(INSERT cpu_functional_common ${backend_value_index} cpu)
-    list(REMOVE_AT cpu_functional_common ${device_value_index})
-    list(INSERT cpu_functional_common ${device_value_index} none)
-    run_runtime(cpu_reference ${cpu_functional_common}
-      --output-dir "${cpu_directory}"
-      --checkpoint-out "${cpu_checkpoint}" --checkpoint-step 10
-      --stop-after-checkpoint false --restart-from none
-      --max-retries 0 --inject-failure off)
-    if(NOT cpu_reference_status EQUAL 0 OR
-       NOT cpu_reference_output MATCHES "status=Success.*step=20" OR
-       NOT cpu_reference_error STREQUAL "")
-      message(FATAL_ERROR
-        "CPU parity trajectory failed: ${cpu_reference_status};${cpu_reference_output};${cpu_reference_error}")
-    endif()
-    foreach(step IN ITEMS 000000 000010 000020)
-      execute_process(
-        COMMAND "${HDG_RUNTIME_SCIENTIFIC_TEST}" --compare-vtk
-          "${cpu_directory}/state-step-${step}.vtk"
-          "${reference_directory}/state-step-${step}.vtk" 2e-8
-        RESULT_VARIABLE compare_status
-        OUTPUT_VARIABLE compare_output
-        ERROR_VARIABLE compare_error)
-      if(NOT compare_status EQUAL 0 OR NOT compare_error STREQUAL "")
+    if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2)
+      if(NOT DEFINED HDG_RUNTIME_SCALAR_RANK2_MANIFEST_CONSUMER OR
+         "$ENV{DG_IGR_SC25_R2_HANDOFF_DIR}" STREQUAL "" OR
+         "$ENV{DG_IGR_SC25_R2_RUN_ID}" STREQUAL "" OR
+         "$ENV{DG_IGR_SC25_R2_COMPLETE_SHA256}" STREQUAL "" OR
+         "$ENV{DG_IGR_SC25_R2_RANK0_SHA256}" STREQUAL "" OR
+         "$ENV{DG_IGR_SC25_R2_RANK1_SHA256}" STREQUAL "")
         message(FATAL_ERROR
-          "CPU-CUDA globally ordered field parity failed at ${step}: ${compare_output};${compare_error}")
+          "rank-2 CUDA scalar parity requires the immutable CPU handoff locator and exact hashes")
       endif()
-    endforeach()
+      set(handoff_directory "$ENV{DG_IGR_SC25_R2_HANDOFF_DIR}")
+      set(handoff_complete "${handoff_directory}/COMPLETE.c3m")
+      set(handoff_rank0 "${handoff_directory}/rank-0.c3m")
+      set(handoff_rank1 "${handoff_directory}/rank-1.c3m")
+      foreach(handoff_file IN ITEMS handoff_complete handoff_rank0 handoff_rank1)
+        require_regular_file("${${handoff_file}}" "immutable CPU handoff")
+      endforeach()
+      file(SHA256 "${handoff_complete}" observed_complete_sha256)
+      file(SHA256 "${handoff_rank0}" observed_rank0_sha256)
+      file(SHA256 "${handoff_rank1}" observed_rank1_sha256)
+      if(NOT observed_complete_sha256 STREQUAL
+             "$ENV{DG_IGR_SC25_R2_COMPLETE_SHA256}" OR
+         NOT observed_rank0_sha256 STREQUAL
+             "$ENV{DG_IGR_SC25_R2_RANK0_SHA256}" OR
+         NOT observed_rank1_sha256 STREQUAL
+             "$ENV{DG_IGR_SC25_R2_RANK1_SHA256}")
+        message(FATAL_ERROR "immutable CPU handoff digest mismatch")
+      endif()
+      execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env
+          "DG_IGR_SC25_R2_HANDOFF_DIR=${handoff_directory}"
+          "DG_IGR_SC25_R2_RUN_ID=$ENV{DG_IGR_SC25_R2_RUN_ID}"
+          "DG_IGR_SC25_R2_COMPLETE_SHA256=$ENV{DG_IGR_SC25_R2_COMPLETE_SHA256}"
+          "${HDG_RUNTIME_MPIEXEC}" "${HDG_RUNTIME_NUMPROC_FLAG}" 2
+          ${HDG_RUNTIME_MPIEXEC_PREFLAGS}
+          "${HDG_RUNTIME_SCALAR_RANK2_MANIFEST_CONSUMER}"
+          ${HDG_RUNTIME_MPIEXEC_POSTFLAGS}
+        RESULT_VARIABLE manifest_consumer_status
+        OUTPUT_VARIABLE manifest_consumer_output
+        ERROR_VARIABLE manifest_consumer_error)
+      if(NOT manifest_consumer_status EQUAL 0 OR
+         NOT manifest_consumer_output MATCHES
+             "SC25_CUDA_RANK2_C3_PASS.*states=21 steps=20.*host_staged=1.*manifest_unchanged=1" OR
+         NOT manifest_consumer_output MATCHES
+             "SC25_CUDA_RANK2_MANIFEST_CONSUMED" OR
+         NOT manifest_consumer_error STREQUAL "")
+        message(FATAL_ERROR
+          "immutable CPU producer/CUDA consumer parity failed: ${manifest_consumer_status};${manifest_consumer_output};${manifest_consumer_error}")
+      endif()
+      file(SHA256 "${handoff_complete}" final_complete_sha256)
+      file(SHA256 "${handoff_rank0}" final_rank0_sha256)
+      file(SHA256 "${handoff_rank1}" final_rank1_sha256)
+      if(NOT final_complete_sha256 STREQUAL observed_complete_sha256 OR
+         NOT final_rank0_sha256 STREQUAL observed_rank0_sha256 OR
+         NOT final_rank1_sha256 STREQUAL observed_rank1_sha256)
+        message(FATAL_ERROR "immutable CPU handoff changed during consumption")
+      endif()
+    else()
+      set(cpu_directory "${HDG_RUNTIME_TEST_OUTPUT}-cpu-parity")
+      set(cpu_checkpoint "${HDG_RUNTIME_TEST_OUTPUT}-cpu-parity.checkpoint")
+      file(REMOVE_RECURSE "${cpu_directory}")
+      file(REMOVE "${cpu_checkpoint}")
+      set(cpu_functional_common ${functional_common})
+      list(FIND cpu_functional_common --backend backend_option_index)
+      list(FIND cpu_functional_common --device-id device_option_index)
+      math(EXPR backend_value_index "${backend_option_index} + 1")
+      math(EXPR device_value_index "${device_option_index} + 1")
+      list(REMOVE_AT cpu_functional_common ${backend_value_index})
+      list(INSERT cpu_functional_common ${backend_value_index} cpu)
+      list(REMOVE_AT cpu_functional_common ${device_value_index})
+      list(INSERT cpu_functional_common ${device_value_index} none)
+      if(HDG_RUNTIME_SCALAR_IGR)
+        set(cpu_parity_retry_limit 1)
+        set(cpu_parity_injection "${reference_injection}")
+      else()
+        set(cpu_parity_retry_limit 0)
+        set(cpu_parity_injection off)
+      endif()
+      run_runtime(cpu_reference ${cpu_functional_common}
+        --output-dir "${cpu_directory}"
+        --checkpoint-out "${cpu_checkpoint}" --checkpoint-step 10
+        --stop-after-checkpoint false --restart-from none
+        --max-retries "${cpu_parity_retry_limit}"
+        --inject-failure "${cpu_parity_injection}")
+      if(NOT cpu_reference_status EQUAL 0 OR
+         NOT cpu_reference_output MATCHES "status=Success.*step=20" OR
+         NOT cpu_reference_error STREQUAL "")
+        message(FATAL_ERROR
+          "CPU parity trajectory failed: ${cpu_reference_status};${cpu_reference_output};${cpu_reference_error}")
+      endif()
+      foreach(step IN ITEMS 000000 000010 000020)
+        if(HDG_RUNTIME_SCALAR_IGR)
+          set(parity_command "${HDG_RUNTIME_SCALAR_VTK_TEST}"
+              --compare-scalar-vtk)
+          set(parity_tolerance 1e-10)
+        else()
+          set(parity_command "${HDG_RUNTIME_SCIENTIFIC_TEST}" --compare-vtk)
+          set(parity_tolerance 2e-8)
+        endif()
+        execute_process(
+          COMMAND ${parity_command}
+            "${cpu_directory}/state-step-${step}.vtk"
+            "${reference_directory}/state-step-${step}.vtk"
+            "${parity_tolerance}"
+          RESULT_VARIABLE compare_status
+          OUTPUT_VARIABLE compare_output
+          ERROR_VARIABLE compare_error)
+        if(NOT compare_status EQUAL 0 OR NOT compare_error STREQUAL "")
+          message(FATAL_ERROR
+            "CPU-CUDA globally ordered field parity failed at ${step}: ${compare_output};${compare_error}")
+        endif()
+      endforeach()
+    endif()
   endif()
   return()
 endif()
