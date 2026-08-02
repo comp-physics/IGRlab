@@ -32,6 +32,35 @@ foreach(_dg_igr_hdg_app_test IN ITEMS
       TIMEOUT 30)
 endforeach()
 
+if(MFEM_USE_CUDA)
+  add_executable(dg_igr_hdg_runtime_app_static_entry_selector_test
+    test_static_entry_selector.cpp
+    $<TARGET_OBJECTS:dg_igr_hdg_runtime_app_entry>)
+  target_include_directories(
+    dg_igr_hdg_runtime_app_static_entry_selector_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/app")
+  target_link_libraries(
+    dg_igr_hdg_runtime_app_static_entry_selector_test PRIVATE
+    dg_igr_hdg_runtime_app_contract MPI::MPI_CXX)
+  target_compile_definitions(
+    dg_igr_hdg_runtime_app_static_entry_selector_test PRIVATE
+    DG_IGR_HDG_RUNTIME_EXPECTED_CPLUSPLUS=201703L)
+  target_compile_options(
+    dg_igr_hdg_runtime_app_static_entry_selector_test PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+  set_target_properties(
+    dg_igr_hdg_runtime_app_static_entry_selector_test PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
+  add_test(NAME dg_igr_hdg_runtime_app_static_entry_selector_host
+    COMMAND dg_igr_hdg_runtime_app_static_entry_selector_test)
+  set_tests_properties(
+    dg_igr_hdg_runtime_app_static_entry_selector_host PROPERTIES
+    LABELS "hdg;runtime;app;contract;host-only"
+    TIMEOUT 30)
+endif()
+
 add_test(NAME dg_igr_hdg_runtime_app_cli_process_cpu
   COMMAND "${CMAKE_COMMAND}"
     "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"

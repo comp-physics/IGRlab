@@ -1111,6 +1111,42 @@ bool DirectAndNegativeControls()
   duplicate[1] = "--case";
   passed = Check(Parse(duplicate).status == CommandLineStatus::usage_error,
                  "duplicate_missing_census") && passed;
+
+  auto conventional_scalar_case = SmokeArguments();
+  SetOption(conventional_scalar_case, "--case",
+            std::string{scalar_igr_sc25_v3_case_id});
+  const ParsedCommandLine crossed_conventional =
+      Parse(conventional_scalar_case);
+  passed = Check(
+               crossed_conventional.status == CommandLineStatus::rejected &&
+                   crossed_conventional.rejection ==
+                       ApplicationRejection::unknown_case &&
+                   ExitForRejection(crossed_conventional.rejection) ==
+                       ApplicationExit::configuration_error,
+               "conventional_card_scalar_case_cli_rejected") && passed;
+
+  auto scalar_conventional_case = ScalarArguments("cpu", "none");
+  SetOption(scalar_conventional_case, "--case",
+            std::string{smooth_periodic_euler_v1_case_id});
+  const ParsedCommandLine crossed_scalar = Parse(scalar_conventional_case);
+  passed = Check(crossed_scalar.status == CommandLineStatus::rejected &&
+                     crossed_scalar.rejection ==
+                         ApplicationRejection::unknown_case &&
+                     ExitForRejection(crossed_scalar.rejection) ==
+                         ApplicationExit::configuration_error,
+                 "scalar_card_conventional_case_cli_rejected") && passed;
+
+  auto scalar_short = ScalarArguments("cpu", "none");
+  SetOption(scalar_short, "--steps", "3");
+  const ParsedCommandLine scalar_short_result = Parse(scalar_short);
+  passed = Check(
+               scalar_short_result.status == CommandLineStatus::rejected &&
+                   scalar_short_result.rejection ==
+                       ApplicationRejection::unknown_scenario &&
+                   ExitForRejection(scalar_short_result.rejection) ==
+                       ApplicationExit::configuration_error,
+               "scalar_card_three_steps_cli_rejected") && passed;
+
   const ParsedCommandLine scalar_cpu = Parse(ScalarArguments("cpu", "none"));
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
   passed = Check(scalar_cpu.status == CommandLineStatus::run &&
@@ -1299,8 +1335,11 @@ int main(const int argc, const char* const* argv)
     return valid ? 0 : 1;
   }
   if (argc != 1) return 64;
-  const bool passed = DirectAndNegativeControls() && HelpAndConfig() &&
-      Check(HandoffPathNegativeControls(), "handoff_path_negative_controls");
+  bool passed = true;
+  passed = DirectAndNegativeControls() && passed;
+  passed = HelpAndConfig() && passed;
+  passed = Check(HandoffPathNegativeControls(),
+                 "handoff_path_negative_controls") && passed;
   if (passed) std::cout << "HDG runtime CLI contract PASS\n";
   return passed ? 0 : 1;
 }

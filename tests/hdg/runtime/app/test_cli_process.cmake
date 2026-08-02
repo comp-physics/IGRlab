@@ -270,6 +270,23 @@ function(replace_cli_option output input option value)
   set(${output} ${arguments} PARENT_SCOPE)
 endfunction()
 
+function(require_pre_resource_rejection label expected_rejection
+         output_path checkpoint_path)
+  file(REMOVE_RECURSE "${output_path}")
+  file(REMOVE "${checkpoint_path}")
+  execute_process(
+    COMMAND "${HDG_RUNTIME_EXECUTABLE}" --space l2 ${ARGN}
+    RESULT_VARIABLE status
+    OUTPUT_VARIABLE output
+    ERROR_VARIABLE error)
+  if(NOT status EQUAL 64 OR
+     NOT error MATCHES "${expected_rejection}" OR
+     EXISTS "${output_path}" OR EXISTS "${checkpoint_path}")
+    message(FATAL_ERROR
+      "${label} did not reject without artifacts: ${status};${output};${error}")
+  endif()
+endfunction()
+
 function(require_regular_file path label)
   if(NOT EXISTS "${path}" OR IS_DIRECTORY "${path}")
     message(FATAL_ERROR "missing ${label}: ${path}")
@@ -1624,6 +1641,64 @@ set(common_arguments
   --checkpoint-step 1 --stop-after-checkpoint false
   --restart-from none --max-retries 0 --inject-failure off
   --seed 0x573841534d4f4b31)
+
+set(crossed_conventional_arguments ${common_arguments})
+replace_cli_option(crossed_conventional_arguments
+                   crossed_conventional_arguments --case
+                   sc25-periodic-smooth-persistent-v3)
+replace_cli_option(crossed_conventional_arguments
+                   crossed_conventional_arguments --output-dir
+                   "${HDG_RUNTIME_TEST_OUTPUT}-crossed-conventional")
+replace_cli_option(crossed_conventional_arguments
+                   crossed_conventional_arguments --checkpoint-out
+                   "${HDG_RUNTIME_TEST_OUTPUT}-crossed-conventional.checkpoint")
+require_pre_resource_rejection(
+  "conventional-card/scalar-case" unknown_case
+  "${HDG_RUNTIME_TEST_OUTPUT}-crossed-conventional"
+  "${HDG_RUNTIME_TEST_OUTPUT}-crossed-conventional.checkpoint"
+  ${crossed_conventional_arguments})
+
+set(scalar_negative_arguments
+  --card exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3
+  --case sc25-periodic-smooth-persistent-v3
+  --mesh-family periodic-cartesian-quad --mesh-n 8 --order 1
+  --dt 0.000244140625 --steps 20 --final-time 0.0048828125
+  --backend "${HDG_RUNTIME_BACKEND}" --device-id "${runtime_device}"
+  --output-dir "${HDG_RUNTIME_TEST_OUTPUT}-scalar-negative"
+  --output-steps 0,10,20
+  --checkpoint-out "${HDG_RUNTIME_TEST_OUTPUT}-scalar-negative.checkpoint"
+  --checkpoint-step 10 --stop-after-checkpoint false
+  --restart-from none --max-retries 1
+  --inject-failure "AfterRecoveryBeforeCommit:7:0"
+  --seed 0x5738425343323553)
+
+set(crossed_scalar_arguments ${scalar_negative_arguments})
+replace_cli_option(crossed_scalar_arguments crossed_scalar_arguments --case
+                   conventional-smooth-persistent-v1)
+replace_cli_option(crossed_scalar_arguments crossed_scalar_arguments
+                   --output-dir
+                   "${HDG_RUNTIME_TEST_OUTPUT}-crossed-scalar")
+replace_cli_option(crossed_scalar_arguments crossed_scalar_arguments
+                   --checkpoint-out
+                   "${HDG_RUNTIME_TEST_OUTPUT}-crossed-scalar.checkpoint")
+require_pre_resource_rejection(
+  "scalar-card/conventional-case" unknown_case
+  "${HDG_RUNTIME_TEST_OUTPUT}-crossed-scalar"
+  "${HDG_RUNTIME_TEST_OUTPUT}-crossed-scalar.checkpoint"
+  ${crossed_scalar_arguments})
+
+set(scalar_short_arguments ${scalar_negative_arguments})
+replace_cli_option(scalar_short_arguments scalar_short_arguments --steps 3)
+replace_cli_option(scalar_short_arguments scalar_short_arguments --output-dir
+                   "${HDG_RUNTIME_TEST_OUTPUT}-scalar-three-step")
+replace_cli_option(scalar_short_arguments scalar_short_arguments
+                   --checkpoint-out
+                   "${HDG_RUNTIME_TEST_OUTPUT}-scalar-three-step.checkpoint")
+require_pre_resource_rejection(
+  "scalar-card/three-step" unknown_scenario
+  "${HDG_RUNTIME_TEST_OUTPUT}-scalar-three-step"
+  "${HDG_RUNTIME_TEST_OUTPUT}-scalar-three-step.checkpoint"
+  ${scalar_short_arguments})
 
 execute_process(
   COMMAND "${HDG_RUNTIME_EXECUTABLE}" --space h1 ${common_arguments}
