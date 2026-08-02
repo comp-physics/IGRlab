@@ -1,5 +1,7 @@
 #include "numerics/hdg/runtime/app/solver.hpp"
 
+#include "solver_entry_detail.hpp"
+
 #include "numerics/hdg/runtime/app/checkpoint_codec.hpp"
 #include "numerics/hdg/runtime/app/command_line.hpp"
 #include "numerics/hdg/runtime/app/durable_io.hpp"
@@ -2772,7 +2774,14 @@ ApplicationRunResult RunScalarIgrCuda(
     return result;
   }
   const ValidatedApplicationConfig& config = *validation.config();
-  if (!config.scalar_igr() || context.ranks() != (scalar_rank2 ? 2 : 1))
+  if (!config.scalar_igr())
+  {
+    result.status = RunStatus::invalid_request;
+    result.reason = FailureReason::invalid_resource_descriptor;
+    result.failure_class = ApplicationRunResult::FailureClass::configuration;
+    return result;
+  }
+  if (context.ranks() != (scalar_rank2 ? 2 : 1))
   {
     result.status = RunStatus::invalid_request;
     result.reason = FailureReason::invalid_resource_descriptor;
@@ -3248,7 +3257,10 @@ ApplicationRunResult RunScalarIgrCuda(
 ApplicationRunResult RunScalarIgrCudaRank2Adapter(
     const ApplicationOptionsView&, CudaApplicationContextV1&);
 
-ApplicationRunResult RunSmoothPeriodicEulerV1(
+namespace detail
+{
+
+ApplicationRunResult RunSmoothPeriodicEulerV1Downstream(
     CudaRank1OneGpuBackendTag, const ApplicationOptionsView& request,
     CudaApplicationContextV1& context)
 {
@@ -3257,7 +3269,7 @@ ApplicationRunResult RunSmoothPeriodicEulerV1(
   return RunCuda<CudaRank1OneGpuRuntimeSelection>(request, context);
 }
 
-ApplicationRunResult RunSmoothPeriodicEulerV1(
+ApplicationRunResult RunSmoothPeriodicEulerV1Downstream(
     CudaRank2OneGpuHostStagedBackendTag,
     const ApplicationOptionsView& request, CudaApplicationContextV1& context)
 {
@@ -3265,6 +3277,8 @@ ApplicationRunResult RunSmoothPeriodicEulerV1(
     return RunScalarIgrCudaRank2Adapter(request, context);
   return RunCuda<CudaRank2OneGpuHostStagedRuntimeSelection>(request, context);
 }
+
+} // namespace detail
 #else
 ApplicationRunResult RunScalarIgrCudaRank2Adapter(
     const ApplicationOptionsView& request, CudaApplicationContextV1& context)

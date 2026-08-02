@@ -1,5 +1,7 @@
 #include "numerics/hdg/runtime/app/solver.hpp"
 
+#include "solver_entry_detail.hpp"
+
 #include "numerics/hdg/runtime/app/checkpoint_codec.hpp"
 #include "numerics/hdg/runtime/app/command_line.hpp"
 #include "numerics/hdg/runtime/app/durable_io.hpp"
@@ -1854,7 +1856,14 @@ ApplicationRunResult RunScalarIgrCpu(const ApplicationOptionsView& request,
     return result;
   }
   const ValidatedApplicationConfig& config = *validation.config();
-  if (!config.scalar_igr() || context.ranks() != (Rank2 ? 2 : 1))
+  if (!config.scalar_igr())
+  {
+    result.status = RunStatus::invalid_request;
+    result.reason = FailureReason::invalid_resource_descriptor;
+    result.failure_class = ApplicationRunResult::FailureClass::configuration;
+    return result;
+  }
+  if (context.ranks() != (Rank2 ? 2 : 1))
   {
     result.status = RunStatus::invalid_request;
     result.reason = FailureReason::invalid_resource_descriptor;
@@ -2761,27 +2770,10 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
 
 } // namespace
 
-MpiApplicationContextV1::MpiApplicationContextV1(
-    const MPI_Comm communicator) noexcept : communicator_(communicator)
+namespace detail
 {
-  if (communicator_ != MPI_COMM_NULL)
-  {
-    (void)MPI_Comm_rank(communicator_, &rank_);
-    (void)MPI_Comm_size(communicator_, &ranks_);
-  }
-}
 
-CudaApplicationContextV1::CudaApplicationContextV1(
-    const MPI_Comm communicator) noexcept : communicator_(communicator)
-{
-  if (communicator_ != MPI_COMM_NULL)
-  {
-    (void)MPI_Comm_rank(communicator_, &rank_);
-    (void)MPI_Comm_size(communicator_, &ranks_);
-  }
-}
-
-ApplicationRunResult RunSmoothPeriodicEulerV1(
+ApplicationRunResult RunSmoothPeriodicEulerV1Downstream(
     CpuSerialBackendTag, const ApplicationOptionsView& request,
     MpiApplicationContextV1& context)
 {
@@ -2792,7 +2784,7 @@ ApplicationRunResult RunSmoothPeriodicEulerV1(
   return RunCpu<AppCpuSerialSelection>(request, context);
 }
 
-ApplicationRunResult RunSmoothPeriodicEulerV1(
+ApplicationRunResult RunSmoothPeriodicEulerV1Downstream(
     CpuRank2BackendTag, const ApplicationOptionsView& request,
     MpiApplicationContextV1& context)
 {
@@ -2802,6 +2794,8 @@ ApplicationRunResult RunSmoothPeriodicEulerV1(
 #endif
   return RunCpu<AppCpuRank2Selection>(request, context);
 }
+
+} // namespace detail
 
 ApplicationRunResult DispatchApplication(
     const ApplicationOptionsView& request,

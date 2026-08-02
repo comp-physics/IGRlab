@@ -768,6 +768,14 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::unknown_scenario);
   }
+  const bool scenario_belongs_to_card = scalar
+      ? scenario == ApplicationScenarioV1::scalar_igr_sc25_v3
+      : (scenario == ApplicationScenarioV1::smoke ||
+         scenario == ApplicationScenarioV1::functional);
+  if (!scenario_belongs_to_card)
+  {
+    return reject(ApplicationRejection::unknown_scenario);
+  }
   if (options.interior_space == InteriorSpace::h1)
   {
     return reject(ApplicationRejection::unsupported_h1);

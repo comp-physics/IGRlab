@@ -132,6 +132,65 @@ ApplicationOptionsView ScalarIgr(const std::string_view backend)
   return options;
 }
 
+void SelectTuple(ApplicationOptionsView& options, const bool scalar)
+{
+  if (scalar)
+  {
+    options.model_id = TracedScalarSc25ProjectionV3Tag::id;
+    options.formulation_id = FullyHybridizedScalarSc25V3Tag::id;
+    options.trace_id = DualConservativeScalarTraceV1Tag::id;
+    options.stabilization_id = W7Tau25DensityHeightP2V3Tag::id;
+    options.time_treatment_id = BackwardEulerMonolithicV1Tag::id;
+  }
+  else
+  {
+    options.model_id = EulerCompressible2dTag::id;
+    options.formulation_id = ConventionalHdgTag::id;
+    options.trace_id = MfemDgInterfaceTraceTag::id;
+    options.stabilization_id = FixedScalarTauTag::id;
+    options.time_treatment_id = BackwardEulerRuntimeTag::id;
+  }
+}
+
+ApplicationOptionsView RoleForScenario(
+    ApplicationOptionsView options, const ApplicationScenarioV1 scenario,
+    const ApplicationRunRoleV1 role)
+{
+  const std::string_view checkpoint = options.checkpoint_out.canonical;
+  options.run_role = role;
+  if (role == ApplicationRunRoleV1::split_writer)
+  {
+    options.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+    return options;
+  }
+  if (role != ApplicationRunRoleV1::split_reader) return options;
+
+  options.checkpoint_out = {};
+  options.checkpoint_step = {};
+  options.restart_from = CheckpointArtifactPathV1::Present(checkpoint);
+  options.stop_after_checkpoint = StopAfterCheckpointV1::no;
+  if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
+  {
+    options.injection = {};
+    options.retry_limit = 0;
+  }
+  else
+  {
+    options.injection = {
+        FailureInjectionModeV1::prescribed,
+        smooth_periodic_euler_v1_failure_phase,
+        scenario == ApplicationScenarioV1::smoke
+            ? smooth_periodic_euler_v1_smoke_failure_target_step
+            : smooth_periodic_euler_v1_functional_failure_target_step,
+        options.backend_id == CpuRank2BackendTag::id ||
+                options.backend_id ==
+                    CudaRank2OneGpuHostStagedBackendTag::id
+            ? 1U : 0U};
+    options.retry_limit = smooth_periodic_euler_v1_retry_limit;
+  }
+  return options;
+}
+
 std::uint32_t SourceRank(const std::string_view backend)
 {
   return backend == CpuRank2BackendTag::id ||
@@ -458,6 +517,280 @@ bool CheckScientificCrossProducts()
   return passed;
 }
 
+bool CheckCardScenarioTupleClosure()
+{
+  struct BackendRow
+  {
+    std::string_view id;
+    ApplicationBackend backend;
+    bool scalar_available;
+  };
+  const std::array<BackendRow, 4> backends{{
+      {CpuSerialBackendTag::id, ApplicationBackend::cpu_serial,
+       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1},
+      {CpuRank2BackendTag::id, ApplicationBackend::cpu_rank2,
+       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1},
+      {CudaRank1OneGpuBackendTag::id,
+       ApplicationBackend::cuda_rank1_one_gpu,
+       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1},
+      {CudaRank2OneGpuHostStagedBackendTag::id,
+       ApplicationBackend::cuda_rank2_one_gpu_host_staged,
+       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1}}};
+  const std::array<std::string_view, 2> cards{{
+      smooth_periodic_euler_v1_card_id, scalar_igr_sc25_v3_card_id}};
+  const std::array<std::string_view, 2> cases{{
+      smooth_periodic_euler_v1_case_id, scalar_igr_sc25_v3_case_id}};
+  const std::array<std::string_view, 3> scenarios{{
+      smooth_periodic_euler_v1_smoke_id,
+      smooth_periodic_euler_v1_functional_id,
+      scalar_igr_sc25_v3_scenario_id}};
+
+  bool passed = true;
+  std::size_t total_rows = 0;
+  std::size_t coherent = 0;
+  std::size_t incoherent_rejections = 0;
+  std::size_t expected_acceptances = 0;
+  std::size_t observed_acceptances = 0;
+  for (std::size_t card = 0; card < cards.size(); ++card)
+    for (std::size_t case_index = 0; case_index < cases.size(); ++case_index)
+      for (std::size_t tuple = 0; tuple < 2; ++tuple)
+        for (std::size_t scenario = 0; scenario < scenarios.size(); ++scenario)
+          for (const BackendRow& backend : backends)
+          {
+            const bool scalar_card = card == 1;
+            ApplicationOptionsView options = scalar_card
+                ? ScalarIgr(backend.id)
+                : (scenario == 1 ? Functional(backend.id)
+                                 : Smoke(backend.id));
+            options.card_id = cards[card];
+            options.case_id = cases[case_index];
+            options.scenario_id = scenarios[scenario];
+            SelectTuple(options, tuple == 1);
+
+            const bool coherent_row =
+                (!scalar_card && case_index == 0 && tuple == 0 &&
+                 scenario < 2) ||
+                (scalar_card && case_index == 1 && tuple == 1 &&
+                 scenario == 2);
+            const bool available = CompiledBackendAvailable(backend.backend) &&
+                (!scalar_card || backend.scalar_available);
+            const bool expected = coherent_row && available;
+            const ApplicationValidation validation =
+                ValidateApplicationOptions(options);
+            ++total_rows;
+            coherent += coherent_row ? 1U : 0U;
+            expected_acceptances += expected ? 1U : 0U;
+            observed_acceptances += validation.accepted() ? 1U : 0U;
+            incoherent_rejections +=
+                !coherent_row && !validation.accepted() ? 1U : 0U;
+            passed = Check(validation.accepted() == expected,
+                           "card_case_tuple_scenario_backend_row") && passed;
+          }
+  passed = Check(total_rows == 96 && coherent == 12 &&
+                     incoherent_rejections == total_rows - coherent &&
+                     observed_acceptances == expected_acceptances,
+                 "exact_96_row_admission_census") && passed;
+
+  ApplicationOptionsView crossed = Smoke(CpuSerialBackendTag::id);
+  crossed.case_id = scalar_igr_sc25_v3_case_id;
+  passed = Check(ValidateApplicationOptions(crossed).rejection() ==
+                     ApplicationRejection::unknown_case,
+                 "conventional_card_scalar_case_rejected") && passed;
+  crossed = ScalarIgr(CpuSerialBackendTag::id);
+  crossed.case_id = smooth_periodic_euler_v1_case_id;
+  passed = Check(ValidateApplicationOptions(crossed).rejection() ==
+                     ApplicationRejection::unknown_case,
+                 "scalar_card_conventional_case_rejected") && passed;
+  crossed = Smoke(CpuSerialBackendTag::id);
+  SelectTuple(crossed, true);
+  passed = Check(ValidateApplicationOptions(crossed).rejection() ==
+                     ApplicationRejection::unknown_tuple,
+                 "conventional_card_scalar_tuple_rejected") && passed;
+  crossed = ScalarIgr(CpuSerialBackendTag::id);
+  SelectTuple(crossed, false);
+  passed = Check(ValidateApplicationOptions(crossed).rejection() ==
+                     ApplicationRejection::unknown_tuple,
+                 "scalar_card_conventional_tuple_rejected") && passed;
+  return passed;
+}
+
+bool CheckMismatchedScenarioRoleFamilies()
+{
+  ApplicationOptionsView conventional_scalar =
+      Functional(CpuSerialBackendTag::id);
+  conventional_scalar.scenario_id = scalar_igr_sc25_v3_scenario_id;
+  conventional_scalar.checkpoint_step = OptionalCheckpointStepV1::Present(
+      scalar_igr_sc25_v3_checkpoint_step);
+  conventional_scalar.injection = {
+      FailureInjectionModeV1::prescribed,
+      smooth_periodic_euler_v1_failure_phase,
+      scalar_igr_sc25_v3_failure_target_step, 0};
+  conventional_scalar.retry_limit = scalar_igr_sc25_v3_retry_limit;
+  conventional_scalar.seed = scalar_igr_sc25_v3_seed;
+
+  ApplicationOptionsView scalar_smoke =
+      ScalarIgr(CpuSerialBackendTag::id);
+  scalar_smoke.scenario_id = smooth_periodic_euler_v1_smoke_id;
+  scalar_smoke.checkpoint_step = OptionalCheckpointStepV1::Present(
+      smooth_periodic_euler_v1_smoke_checkpoint_step);
+  scalar_smoke.injection = {};
+  scalar_smoke.retry_limit = 0;
+  scalar_smoke.seed = smooth_periodic_euler_v1_smoke_seed;
+
+  ApplicationOptionsView scalar_functional =
+      ScalarIgr(CpuSerialBackendTag::id);
+  scalar_functional.scenario_id = smooth_periodic_euler_v1_functional_id;
+  scalar_functional.injection = {};
+  scalar_functional.retry_limit = 0;
+  scalar_functional.seed = smooth_periodic_euler_v1_functional_seed;
+
+  bool passed = true;
+  const std::array<std::pair<ApplicationOptionsView, ApplicationScenarioV1>, 3>
+      families{{
+          {conventional_scalar,
+           ApplicationScenarioV1::scalar_igr_sc25_v3},
+          {scalar_smoke, ApplicationScenarioV1::smoke},
+          {scalar_functional, ApplicationScenarioV1::functional}}};
+  for (const auto& family : families)
+    for (const ApplicationRunRoleV1 role :
+         {ApplicationRunRoleV1::uninterrupted_reference,
+          ApplicationRunRoleV1::split_writer,
+          ApplicationRunRoleV1::split_reader})
+    {
+      const ApplicationValidation validation = ValidateApplicationOptions(
+          RoleForScenario(family.first, family.second, role));
+      passed = Check(validation.rejection() ==
+                         ApplicationRejection::unknown_scenario,
+                     "mismatched_card_scenario_role_rejected_early") &&
+          passed;
+    }
+  return passed;
+}
+
+bool CheckStaticEntryOffDiagonalMatrix()
+{
+  const auto matches = [](const ApplicationOptionsView& request,
+                          const ApplicationBackend selected_backend,
+                          const RuntimeTupleDescriptor& selected_tuple) {
+    const ApplicationValidation validation =
+        ValidateApplicationOptions(request);
+    return validation.accepted() &&
+        validation.config()->backend() == selected_backend &&
+        validation.config()->tuple() == selected_tuple;
+  };
+  struct Row
+  {
+    ApplicationOptionsView request;
+    ApplicationBackend selected_backend;
+    RuntimeTupleDescriptor selected_tuple;
+  };
+  const std::array<Row, 8> rows{{
+      {Smoke(CudaRank1OneGpuBackendTag::id),
+       ApplicationBackend::cpu_serial,
+       CpuSerialRuntimeSelection::Descriptor()},
+      {Smoke(CpuSerialBackendTag::id),
+       ApplicationBackend::cuda_rank1_one_gpu,
+       CudaRank1OneGpuRuntimeSelection::Descriptor()},
+      {Smoke(CudaRank2OneGpuHostStagedBackendTag::id),
+       ApplicationBackend::cpu_rank2,
+       CpuRank2RuntimeSelection::Descriptor()},
+      {Smoke(CpuRank2BackendTag::id),
+       ApplicationBackend::cuda_rank2_one_gpu_host_staged,
+       CudaRank2OneGpuHostStagedRuntimeSelection::Descriptor()},
+      {ScalarIgr(CudaRank1OneGpuBackendTag::id),
+       ApplicationBackend::cpu_serial,
+       ScalarIgrCpuSerialRuntimeSelection::Descriptor()},
+      {ScalarIgr(CpuSerialBackendTag::id),
+       ApplicationBackend::cuda_rank1_one_gpu,
+       ScalarIgrCudaRank1RuntimeSelection::Descriptor()},
+      {ScalarIgr(CudaRank2OneGpuHostStagedBackendTag::id),
+       ApplicationBackend::cpu_rank2,
+       ScalarIgrCpuRank2RuntimeSelection::Descriptor()},
+      {ScalarIgr(CpuRank2BackendTag::id),
+       ApplicationBackend::cuda_rank2_one_gpu_host_staged,
+       ScalarIgrCudaRank2RuntimeSelection::Descriptor()}}};
+  bool passed = true;
+  for (const Row& row : rows)
+    passed = Check(!matches(row.request, row.selected_backend,
+                            row.selected_tuple),
+                   "same_rank_static_entry_off_diagonal_rejected") && passed;
+  return passed;
+}
+
+bool CheckCoherentScalarIdentityEquivalence()
+{
+  struct BackendRow
+  {
+    std::string_view id;
+    ApplicationBackend backend;
+    bool scalar_available;
+    RuntimeTupleDescriptor tuple;
+  };
+  const std::array<BackendRow, 4> rows{{
+      {CpuSerialBackendTag::id, ApplicationBackend::cpu_serial,
+       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1,
+       ScalarIgrCpuSerialRuntimeSelection::Descriptor()},
+      {CpuRank2BackendTag::id, ApplicationBackend::cpu_rank2,
+       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1,
+       ScalarIgrCpuRank2RuntimeSelection::Descriptor()},
+      {CudaRank1OneGpuBackendTag::id,
+       ApplicationBackend::cuda_rank1_one_gpu,
+       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1,
+       ScalarIgrCudaRank1RuntimeSelection::Descriptor()},
+      {CudaRank2OneGpuHostStagedBackendTag::id,
+       ApplicationBackend::cuda_rank2_one_gpu_host_staged,
+       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1,
+       ScalarIgrCudaRank2RuntimeSelection::Descriptor()}}};
+  bool passed = true;
+  for (const BackendRow& row : rows)
+  {
+    const ApplicationOptionsView base = ScalarIgr(row.id);
+    const ApplicationValidation first = ValidateApplicationOptions(base);
+    const ApplicationValidation repeat = ValidateApplicationOptions(base);
+    if (!CompiledBackendAvailable(row.backend) || !row.scalar_available)
+    {
+      passed = Check(first.rejection() ==
+                         ApplicationRejection::unbuilt_backend,
+                     "coherent_scalar_unbuilt_rejection") && passed;
+      continue;
+    }
+    const ApplicationValidation writer = ValidateApplicationOptions(
+        CanonicalScalarCheckpointWriter(base));
+    const ApplicationValidation reader =
+        ValidateApplicationOptions(SplitReader(base));
+    StateHash derived_writer{};
+    const bool derived = reader.accepted() &&
+        DeriveSplitWriterRunConfigHashV1(*reader.config(), derived_writer);
+    CheckpointDescriptor checkpoint{};
+    if (first.accepted())
+    {
+      checkpoint.schema_version = checkpoint_schema_version;
+      checkpoint.tuple = first.config()->tuple();
+    }
+    passed = Check(
+                 first.accepted() && repeat.accepted() && writer.accepted() &&
+                     first.config()->scenario() ==
+                         ApplicationScenarioV1::scalar_igr_sc25_v3 &&
+                     first.config()->backend() == row.backend &&
+                     first.config()->tuple() == row.tuple &&
+                     first.config()->scientific_config_sha256() ==
+                         repeat.config()->scientific_config_sha256() &&
+                     first.config()->run_config_sha256() ==
+                         repeat.config()->run_config_sha256() &&
+                     writer.config()->scientific_config_sha256() ==
+                         first.config()->scientific_config_sha256() &&
+                     writer.config()->run_config_sha256() !=
+                         first.config()->run_config_sha256() &&
+                     derived &&
+                     derived_writer == writer.config()->run_config_sha256() &&
+                     checkpoint.schema_version == checkpoint_schema_version &&
+                     checkpoint.tuple == row.tuple,
+                 "coherent_scalar_hash_and_checkpoint_schema_equivalence") &&
+        passed;
+  }
+  return passed;
+}
+
 bool CheckScalarIgrMatrix()
 {
   bool passed = true;
@@ -706,6 +1039,10 @@ int main()
   passed = CheckFocusedAndAlternateRoles() && passed;
   passed = CheckNegativeRoleControls() && passed;
   passed = CheckScientificCrossProducts() && passed;
+  passed = CheckCardScenarioTupleClosure() && passed;
+  passed = CheckMismatchedScenarioRoleFamilies() && passed;
+  passed = CheckStaticEntryOffDiagonalMatrix() && passed;
+  passed = CheckCoherentScalarIdentityEquivalence() && passed;
   passed = CheckScalarIgrMatrix() && passed;
   if (passed)
   {

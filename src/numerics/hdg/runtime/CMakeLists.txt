@@ -81,9 +81,12 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   set(_dg_igr_hdg_runtime_app_executable_sources
       "${CMAKE_CURRENT_SOURCE_DIR}/app/main.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/app/solver_cpu.cpp")
+  set(_dg_igr_hdg_runtime_app_entry_source
+      "${CMAKE_CURRENT_SOURCE_DIR}/app/solver_entry.cpp")
   set(_dg_igr_hdg_runtime_app_expected_sources
       ${_dg_igr_hdg_runtime_app_contract_sources}
-      ${_dg_igr_hdg_runtime_app_executable_sources})
+      ${_dg_igr_hdg_runtime_app_executable_sources}
+      ${_dg_igr_hdg_runtime_app_entry_source})
   list(SORT _dg_igr_hdg_runtime_app_sources)
   list(SORT _dg_igr_hdg_runtime_app_expected_sources)
   if(NOT _dg_igr_hdg_runtime_app_sources STREQUAL
@@ -111,6 +114,19 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
   target_link_libraries(dg_igr_hdg_runtime_app_contract
                         PUBLIC dg_igr_hdg_runtime_common)
+
+  add_library(dg_igr_hdg_runtime_app_entry OBJECT
+              "${_dg_igr_hdg_runtime_app_entry_source}")
+  target_include_directories(dg_igr_hdg_runtime_app_entry PRIVATE
+                             "${PROJECT_SOURCE_DIR}/include")
+  target_link_libraries(dg_igr_hdg_runtime_app_entry PRIVATE
+                        dg_igr_hdg_runtime_app_contract MPI::MPI_CXX)
+  target_compile_options(dg_igr_hdg_runtime_app_entry PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+  set_target_properties(dg_igr_hdg_runtime_app_entry PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
 
   dg_igr_add_hdg_cxx17_component(
     TARGET dg_igr_hdg_runtime_cpu
@@ -171,7 +187,8 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   endif()
 
   add_executable(dg_igr_hdg_runtime
-                 ${_dg_igr_hdg_runtime_app_executable_sources})
+                 ${_dg_igr_hdg_runtime_app_executable_sources}
+                 $<TARGET_OBJECTS:dg_igr_hdg_runtime_app_entry>)
   if(MFEM_USE_CUDA)
     target_sources(dg_igr_hdg_runtime PRIVATE
       $<TARGET_OBJECTS:dg_igr_hdg_runtime_scalar_cuda_rank2_app>)
