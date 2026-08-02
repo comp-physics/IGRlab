@@ -65,7 +65,8 @@ struct HypreAdmission final
   bool valid_host() const noexcept
   {
     return initialized != 0 && error == 0 && memory_query == 0 &&
-        execution_query == 0 && memory == HYPRE_MEMORY_HOST &&
+        execution_query == 0 &&
+        mfem::GetHypreMemoryLocation() == HYPRE_MEMORY_HOST &&
         execution == HYPRE_EXEC_HOST && !using_gpu;
   }
 };
