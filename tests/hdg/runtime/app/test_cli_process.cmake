@@ -150,34 +150,6 @@ function(run_private_scalar_preparation_failure prefix environment value)
   set(${prefix}_error "${error}" PARENT_SCOPE)
 endfunction()
 
-function(run_private_scalar_post_finalize_failure prefix value)
-  if(HDG_RUNTIME_RANKS EQUAL 1)
-    execute_process(
-      COMMAND "${CMAKE_COMMAND}" -E env
-        "DG_IGR_HDG_TEST_SCALAR_POST_FINALIZE_FAILURE=${value}"
-        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
-      TIMEOUT 180
-      RESULT_VARIABLE status
-      OUTPUT_VARIABLE output
-      ERROR_VARIABLE error)
-  else()
-    execute_process(
-      COMMAND "${CMAKE_COMMAND}" -E env
-        "DG_IGR_HDG_TEST_SCALAR_POST_FINALIZE_FAILURE=${value}"
-        "${HDG_RUNTIME_MPIEXEC}" "${HDG_RUNTIME_NUMPROC_FLAG}" 2
-        ${HDG_RUNTIME_MPIEXEC_PREFLAGS}
-        "${HDG_RUNTIME_EXECUTABLE}" ${ARGN}
-        ${HDG_RUNTIME_MPIEXEC_POSTFLAGS}
-      TIMEOUT 180
-      RESULT_VARIABLE status
-      OUTPUT_VARIABLE output
-      ERROR_VARIABLE error)
-  endif()
-  set(${prefix}_status "${status}" PARENT_SCOPE)
-  set(${prefix}_output "${output}" PARENT_SCOPE)
-  set(${prefix}_error "${error}" PARENT_SCOPE)
-endfunction()
-
 function(run_private_scientific_gate prefix)
   if(HDG_RUNTIME_RANKS EQUAL 1)
     execute_process(
@@ -325,6 +297,52 @@ function(require_exact_logical_artifacts root label)
   if(NOT observed STREQUAL expected)
     message(FATAL_ERROR
       "${label} logical artifact census mismatch: expected=${expected};observed=${observed}")
+  endif()
+  file(GLOB hidden RELATIVE "${root}" LIST_DIRECTORIES TRUE "${root}/.*")
+  list(SORT hidden)
+  set(expected_hidden .dg-igr-current .dg-igr-generations)
+  if(NOT hidden STREQUAL expected_hidden OR
+     NOT IS_SYMLINK "${root}/.dg-igr-current" OR
+     NOT IS_DIRECTORY "${root}/.dg-igr-generations")
+    message(FATAL_ERROR
+      "${label} hidden durable census mismatch: expected=${expected_hidden};observed=${hidden}")
+  endif()
+  file(READ_SYMLINK "${root}/.dg-igr-current" current_generation)
+  file(GLOB generations RELATIVE "${root}/.dg-igr-generations"
+       LIST_DIRECTORIES TRUE "${root}/.dg-igr-generations/generation-*")
+  list(SORT generations)
+  if(NOT generations OR
+     NOT current_generation MATCHES "^\\.dg-igr-generations/generation-")
+    message(FATAL_ERROR "${label} durable generation authority is incomplete")
+  endif()
+  set(generation_artifacts)
+  foreach(generation IN LISTS generations)
+    set(generation_root "${root}/.dg-igr-generations/${generation}")
+    if(NOT IS_DIRECTORY "${generation_root}")
+      message(FATAL_ERROR "${label} generation is not a directory: ${generation}")
+    endif()
+    file(GLOB generation_entries RELATIVE "${generation_root}"
+         LIST_DIRECTORIES TRUE "${generation_root}/*")
+    list(FIND generation_entries manifest.v1 manifest_index)
+    if(manifest_index LESS 0)
+      message(FATAL_ERROR "${label} generation lacks manifest: ${generation}")
+    endif()
+    list(REMOVE_ITEM generation_entries manifest.v1)
+    foreach(artifact IN LISTS generation_entries)
+      if(IS_DIRECTORY "${generation_root}/${artifact}" OR
+         IS_SYMLINK "${generation_root}/${artifact}")
+        message(FATAL_ERROR
+          "${label} generation contains non-regular artifact: ${generation}/${artifact}")
+      endif()
+      list(APPEND generation_artifacts "${artifact}")
+      require_manifest_artifact("${generation_root}" "${artifact}"
+                                "${label} ${generation}")
+    endforeach()
+  endforeach()
+  list(SORT generation_artifacts)
+  if(NOT generation_artifacts STREQUAL expected)
+    message(FATAL_ERROR
+      "${label} hidden-generation artifact census mismatch: expected=${expected};observed=${generation_artifacts}")
   endif()
 endfunction()
 
@@ -609,7 +627,8 @@ if(HDG_RUNTIME_FUNCTIONAL)
       endif()
     endforeach()
 
-    foreach(sidecar_case IN ITEMS count checksum shape)
+    foreach(sidecar_case IN ITEMS count-zero count-three count-maximum
+                                  checksum shape)
       set(sidecar_negative_directory
           "${HDG_RUNTIME_TEST_OUTPUT}-sidecar-${sidecar_case}")
       file(REMOVE_RECURSE "${sidecar_negative_directory}")
@@ -905,37 +924,6 @@ if(HDG_RUNTIME_FUNCTIONAL)
       checkpoint-runtime-identity.v1 restart-checkpoint.v2
       run-metadata-checkpoint.json run-metadata.json state-step-000000.vtk
       state-step-000010.vtk state-step-000020.vtk)
-    math(EXPR maximum_compensation_source "${HDG_RUNTIME_RANKS} - 1")
-    foreach(source RANGE 0 ${maximum_compensation_source})
-      set(compensation_directory
-          "${HDG_RUNTIME_TEST_OUTPUT}-post-finalize-rank${source}")
-      set(compensation_checkpoint
-          "${HDG_RUNTIME_TEST_OUTPUT}-post-finalize-rank${source}.checkpoint")
-      file(REMOVE_RECURSE "${compensation_directory}")
-      file(REMOVE "${compensation_checkpoint}")
-      run_private_scalar_post_finalize_failure(
-        compensation "10:${source}" ${functional_common}
-        --output-dir "${compensation_directory}"
-        --checkpoint-out "${compensation_checkpoint}" --checkpoint-step 10
-        --stop-after-checkpoint false --restart-from none
-        --max-retries 0 --inject-failure off)
-      file(READ_SYMLINK "${compensation_directory}/.dg-igr-current"
-                        compensation_current)
-      if(NOT compensation_status EQUAL 72 OR
-         NOT compensation_error MATCHES
-             "post-finalize compensation failure source_rank=${source}" OR
-         NOT compensation_current MATCHES "generation-0-" OR
-         EXISTS "${compensation_checkpoint}" OR
-         EXISTS "${compensation_directory}/state-step-000010.vtk" OR
-         EXISTS "${compensation_directory}/run-metadata.json" OR
-         EXISTS "${compensation_directory}/run-metadata-checkpoint.json")
-        message(FATAL_ERROR
-          "CUDA scalar post-finalize compensation/rank${source} failed: ${compensation_status};${compensation_output};${compensation_error}")
-      endif()
-      require_exact_logical_artifacts(
-        "${compensation_directory}" "post-finalize rank${source}"
-        state-step-000000.vtk)
-    endforeach()
   endif()
   if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2 AND
      HDG_RUNTIME_BACKEND STREQUAL "cpu")

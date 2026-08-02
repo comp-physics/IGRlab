@@ -2511,6 +2511,7 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   ScalarCudaStepEvidence pending_step{};
   ScalarCudaSnapshotEvidence capture_snapshot{};
   ScalarCudaSnapshotEvidence pending_snapshot{};
+  PublishedState checkpoint_workspace{};
   bool pending_attempt_active = false;
   int prepare_retry_index = 0;
   int last_device_status = detail::device_success;
@@ -4620,9 +4621,10 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   }
 
   static bool StateFromCheckpoint(const ScalarCudaCheckpoint& checkpoint,
-                                  PublishedState& state) noexcept
+                                  PublishedState& state,
+                                  const bool require_preallocated = false)
+      noexcept
   {
-    state = {};
     const int scalar_nodes = persistent_elements * volume_nodes;
     if (checkpoint.shard_rank < 0 || checkpoint.shard_rank >= 2 ||
         checkpoint.owned_scalar_trace_nodes <= 0 ||
@@ -4634,17 +4636,27 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     {
       return false;
     }
-    try
+    const bool prepared = state.u.size() == persistent_u_unknowns &&
+        state.sigma.size() == persistent_sigma_unknowns &&
+        state.z.size() == persistent_z_unknowns &&
+        state.uhat.size() == static_cast<std::size_t>(state_components) *
+            checkpoint.owned_scalar_trace_nodes &&
+        state.sigmahat.size() ==
+            static_cast<std::size_t>(checkpoint.owned_scalar_trace_nodes);
+    if (!prepared && require_preallocated) { return false; }
+    if (!prepared)
     {
-      state.u.assign(persistent_u_unknowns, 0.0);
-      state.sigma.assign(persistent_sigma_unknowns, 0.0);
-      state.z.assign(persistent_z_unknowns, 0.0);
-      state.uhat.assign(static_cast<std::size_t>(state_components) *
-                            checkpoint.owned_scalar_trace_nodes,
-                        0.0);
-      state.sigmahat.assign(checkpoint.owned_scalar_trace_nodes, 0.0);
+      try
+      {
+        state.u.resize(persistent_u_unknowns);
+        state.sigma.resize(persistent_sigma_unknowns);
+        state.z.resize(persistent_z_unknowns);
+        state.uhat.resize(static_cast<std::size_t>(state_components) *
+                          checkpoint.owned_scalar_trace_nodes);
+        state.sigmahat.resize(checkpoint.owned_scalar_trace_nodes);
+      }
+      catch (...) { state = {}; return false; }
     }
-    catch (...) { state = {}; return false; }
     for (int element = 0; element < persistent_elements; ++element)
       for (int a = 0; a < volume_nodes; ++a)
       {
@@ -4694,37 +4706,44 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     return valid ? StateHash{digest} : StateHash{};
   }
 
-  bool CaptureCheckpoint(ScalarCudaCheckpoint& output) noexcept
+  bool CaptureCheckpointSlot(const int slot,
+                             const StateCoordinates& checkpoint_coordinates,
+                             ScalarCudaCheckpoint& output,
+                             const bool require_preallocated) noexcept
   {
-    output = {};
-    const bool valid_entry = initialized && active_transaction_serial == 0 &&
-        elements == persistent_elements && coordinates.step != 0 &&
-        coordinates.step == coordinates.generation &&
-        coordinates.step == coordinates.cursor &&
-        coordinates.time ==
-            static_cast<double>(coordinates.step) * fixed_dt &&
-        coordinates.dt == fixed_dt;
+    const bool valid_entry = initialized && slot >= 0 && slot <= 1 &&
+        elements == persistent_elements && checkpoint_coordinates.step != 0 &&
+        checkpoint_coordinates.step == checkpoint_coordinates.generation &&
+        checkpoint_coordinates.step == checkpoint_coordinates.cursor &&
+        checkpoint_coordinates.time ==
+            static_cast<double>(checkpoint_coordinates.step) * fixed_dt &&
+        checkpoint_coordinates.dt == fixed_dt;
     if (!CollectiveAll(communicator.value, valid_entry))
     {
       return false;
     }
-    view.selected_current_slot = committed_slot;
-    try
-    {
-      output.interior_component_slabs.assign(
-          persistent_interior_unknowns, 0.0);
-      output.owned_trace_component_slabs.assign(
-          static_cast<std::size_t>(owned_true_trace_unknowns), 0.0);
-    }
-    catch (...) { output = {}; }
-    const bool allocated =
-        output.interior_component_slabs.size() ==
+    view.selected_current_slot = slot;
+    bool allocated = output.interior_component_slabs.size() ==
             persistent_interior_unknowns &&
         output.owned_trace_component_slabs.size() ==
             static_cast<std::size_t>(owned_true_trace_unknowns);
+    if (!allocated && !require_preallocated)
+    {
+      try
+      {
+        output.interior_component_slabs.resize(
+            persistent_interior_unknowns);
+        output.owned_trace_component_slabs.resize(
+            static_cast<std::size_t>(owned_true_trace_unknowns));
+      }
+      catch (...) {}
+      allocated = output.interior_component_slabs.size() ==
+              persistent_interior_unknowns &&
+          output.owned_trace_component_slabs.size() ==
+              static_cast<std::size_t>(owned_true_trace_unknowns);
+    }
     if (!CollectiveAll(communicator.value, allocated))
     {
-      output = {};
       return false;
     }
     if (!LaunchRecover(detail::KernelOperation::pack_checkpoint,
@@ -4745,7 +4764,6 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
             interior_bytes, interior_bytes);
     if (!CollectiveAll(communicator.value, interior_copied))
     {
-      output = {};
       return false;
     }
     const bool trace_copied = cuda_w8a::CudaTransportPolicy::DeviceToHost(
@@ -4756,30 +4774,27 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
             trace_bytes, trace_bytes);
     if (!CollectiveAll(communicator.value, trace_copied))
     {
-      output = {};
       return false;
     }
     const bool synchronized = cuda_w8a::CudaTransportPolicy::Synchronize(
         cuda_w8a::CudaTransferSite::checkpoint_stage_trace);
     if (!CollectiveAll(communicator.value, synchronized))
     {
-      output = {};
       return false;
     }
     output.shard_rank = rank;
     output.owned_scalar_trace_nodes = owned_scalar_trace_nodes;
-    PublishedState state;
     if (!CollectiveAll(communicator.value,
-                       StateFromCheckpoint(output, state)))
+                       StateFromCheckpoint(output, checkpoint_workspace,
+                                           true)))
     {
-      output = {};
       return false;
     }
     output.projection = StableIdentity::Copy(projection_id);
     output.tuple = StableIdentity::Copy(cuda_rank2_tuple_id);
     output.scenario = StableIdentity::Copy(cuda_rank2_fixture_id);
     output.layout = StableIdentity::Copy(checkpoint_layout_id);
-    output.raw_field_hashes = HashPublishedState(state);
+    output.raw_field_hashes = HashPublishedState(checkpoint_workspace);
     output.descriptor.schema_version = checkpoint_schema_version;
     output.descriptor.successful_commit = true;
     output.descriptor.restart_mode =
@@ -4793,18 +4808,18 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     output.descriptor.polynomial_order = 1;
     output.descriptor.layout = StableIdentity::Copy(interior_layout_id);
     output.descriptor.precision = StableIdentity::Copy("Fp64");
-    output.descriptor.cursor = coordinates.cursor;
-    output.descriptor.dt = coordinates.dt;
-    output.descriptor.coordinates = coordinates;
+    output.descriptor.cursor = checkpoint_coordinates.cursor;
+    output.descriptor.dt = checkpoint_coordinates.dt;
+    output.descriptor.coordinates = checkpoint_coordinates;
     output.descriptor.coordinate_fingerprint =
-        ::dg::hdg::runtime::detail::CoordinateFingerprint(coordinates);
+        ::dg::hdg::runtime::detail::CoordinateFingerprint(
+            checkpoint_coordinates);
     output.descriptor.interior_hash = output.raw_field_hashes.interior;
     output.descriptor.trace_hash = output.raw_field_hashes.trace;
     output.shard_manifest_hash = CheckpointManifest(output);
     if (!CollectiveAll(communicator.value,
                        output.shard_manifest_hash != StateHash{}))
     {
-      output = {};
       return false;
     }
     bool combined_valid = false;
@@ -4813,8 +4828,90 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     const bool valid_manifest = CollectiveAll(
         communicator.value,
         combined_valid && output.canonical_manifest_hash != StateHash{});
-    if (!valid_manifest) { output = {}; }
     return valid_manifest;
+  }
+
+  bool CaptureCheckpoint(ScalarCudaCheckpoint& output) noexcept
+  {
+    const bool entry = active_transaction_serial == 0;
+    if (!CollectiveAll(communicator.value, entry))
+    {
+      output = {};
+      return false;
+    }
+    const bool captured = CaptureCheckpointSlot(
+        committed_slot, coordinates, output, false);
+    if (!captured) { output = {}; }
+    return captured;
+  }
+
+  bool WriteProspectiveEvidence(ScalarCudaEvidence& output) const noexcept
+  {
+    if (!pending_attempt_active || active_transaction_serial == 0 ||
+        !active_installed || evidence.attempt_count < 0 ||
+        evidence.attempt_count >= static_cast<int>(evidence.attempts.size()) ||
+        evidence.step_evidence_count < 0 ||
+        evidence.step_evidence_count >=
+            static_cast<int>(evidence.steps.size()) ||
+        evidence.snapshot_count < 0 ||
+        evidence.snapshot_count >=
+            static_cast<int>(evidence.snapshots.size()) ||
+        !pending_snapshot.valid)
+    {
+      return false;
+    }
+    output = evidence;
+    ScalarCudaAttemptEvidence accepted_attempt = pending_attempt;
+    accepted_attempt.status = transaction_installed_after_retry
+        ? ScalarCudaStatus::accepted_after_one_retry
+        : ScalarCudaStatus::accepted;
+    accepted_attempt.failure_cause = ScalarCudaFailureCause::none;
+    ScalarCudaStepEvidence accepted_step = pending_step;
+    accepted_step.attempt_index = output.attempt_count;
+    ScalarCudaSnapshotEvidence accepted_snapshot = pending_snapshot;
+    accepted_snapshot.status = accepted_attempt.status;
+    output.attempts[static_cast<std::size_t>(output.attempt_count++)] =
+        accepted_attempt;
+    output.steps[static_cast<std::size_t>(output.step_evidence_count++)] =
+        accepted_step;
+    output.snapshots[static_cast<std::size_t>(output.snapshot_count++)] =
+        accepted_snapshot;
+    ++output.accepted_steps;
+    ++output.attempted_steps;
+    output.coordinates = pending_attempt.candidate_coordinates;
+    output.status = accepted_attempt.status;
+    return true;
+  }
+
+  void RestorePriorLogicalEvidence() noexcept
+  {
+    RefreshLedgers();
+    const ScalarCudaResidencyEvidence residency = evidence.residency;
+    const ScalarCudaAllocationEvidence allocations = evidence.allocations;
+    const ScalarCudaReuseEvidence reuse = evidence.reuse;
+    const ScalarCudaLaunchLedger launches = evidence.launches;
+    const cuda_w8a::CudaTransferLedgerV1 transfers = evidence.transfers;
+    const cuda_w8a::CudaAllocationLedgerV1 allocation_ledger =
+        evidence.allocation_ledger;
+    evidence = transaction_prior_evidence;
+    evidence.residency = residency;
+    evidence.allocations = allocations;
+    evidence.reuse = reuse;
+    evidence.launches = launches;
+    evidence.transfers = transfers;
+    evidence.allocation_ledger = allocation_ledger;
+  }
+
+  void RefreshExposedPriorEvidence() noexcept
+  {
+    RefreshLedgers();
+    transaction_prior_evidence.residency = evidence.residency;
+    transaction_prior_evidence.allocations = evidence.allocations;
+    transaction_prior_evidence.reuse = evidence.reuse;
+    transaction_prior_evidence.launches = evidence.launches;
+    transaction_prior_evidence.transfers = evidence.transfers;
+    transaction_prior_evidence.allocation_ledger =
+        evidence.allocation_ledger;
   }
 
   void RefreshLedgers() noexcept
@@ -5104,6 +5201,21 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
       value.active_transaction_serial == 0;
   if (!CollectiveAll(value.communicator.value, valid_entry))
     return ScalarCudaStatus::invalid_configuration;
+  bool checkpoint_workspace_ready = true;
+  try
+  {
+    value.checkpoint_workspace.u.resize(persistent_u_unknowns);
+    value.checkpoint_workspace.sigma.resize(persistent_sigma_unknowns);
+    value.checkpoint_workspace.z.resize(persistent_z_unknowns);
+    value.checkpoint_workspace.uhat.resize(
+        static_cast<std::size_t>(state_components) *
+        value.owned_scalar_trace_nodes);
+    value.checkpoint_workspace.sigmahat.resize(
+        value.owned_scalar_trace_nodes);
+  }
+  catch (...) { checkpoint_workspace_ready = false; }
+  if (!CollectiveAll(value.communicator.value, checkpoint_workspace_ready))
+    return ScalarCudaStatus::allocation_failure;
   value.committed_slot = 0;
   value.view.committed_slot = 0;
   value.view.selected_current_slot = 0;
@@ -5362,7 +5474,13 @@ PersistentSc25ScalarIgrCudaRank2::PreparePersistentTrajectoryTransaction(
       implementation_->pending_attempt_active &&
       !implementation_->active_installed)
   {
-    implementation_->RecordFailedAttempt(result, true);
+    const bool retryable = IsInjectedFailure(result);
+    implementation_->RecordFailedAttempt(result, !retryable);
+    if (retryable)
+    {
+      implementation_->prepare_retry_index = 1;
+      ++implementation_->evidence.retry_attempts;
+    }
   }
   return result;
 }
@@ -5790,10 +5908,6 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
     return value.pending_attempt.status;
   }
 
-  const std::uint64_t serial = value.next_transaction_serial++;
-  value.active_transaction_serial = serial;
-  value.active_candidate_slot = candidate_slot;
-  value.active_installed = false;
   value.pending_attempt.status = ScalarCudaStatus::accepted;
   value.pending_attempt.failure_cause = ScalarCudaFailureCause::none;
   value.pending_step.accepted = true;
@@ -5823,6 +5937,10 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
     value.pending_attempt.failure_cause = ScalarCudaFailureCause::publication;
     return value.pending_attempt.status;
   }
+  const std::uint64_t serial = value.next_transaction_serial++;
+  value.active_transaction_serial = serial;
+  value.active_candidate_slot = candidate_slot;
+  value.active_installed = false;
   output.incarnation_ = value.incarnation;
   output.serial_ = serial;
   output.candidate_slot_ = candidate_slot;
@@ -5831,9 +5949,7 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
   output.installed_ = false;
   value.status = ScalarCudaStatus::transaction_prepared;
   value.evidence.status = ScalarCudaStatus::transaction_prepared;
-  return CollectiveAll(value.communicator.value, true)
-      ? ScalarCudaStatus::accepted
-      : ScalarCudaStatus::publication_failure;
+  return ScalarCudaStatus::accepted;
 }
 
 bool PersistentSc25ScalarIgrCudaRank2::
@@ -5857,7 +5973,48 @@ bool PersistentSc25ScalarIgrCudaRank2::
       installed.pending_attempt.retry_index == 1;
   installed.active_installed = true;
   token.installed_ = true;
-  return CollectiveAll(installed.communicator.value, true);
+  return true;
+}
+
+bool PersistentSc25ScalarIgrCudaRank2::
+    StageInstalledTrajectoryTransaction(
+        Transaction& token, ScalarCudaCheckpoint& checkpoint,
+        ScalarCudaEvidence& prospective_evidence) noexcept
+{
+  if (!implementation_) { return false; }
+  Implementation& value = *implementation_;
+  const bool locally_valid = token.valid_ &&
+      token.incarnation_ == value.incarnation && token.serial_ != 0 &&
+      token.serial_ == value.active_transaction_serial &&
+      token.candidate_slot_ == value.active_candidate_slot &&
+      token.installed_ && value.active_installed &&
+      SameCoordinates(token.target_,
+                      value.pending_attempt.candidate_coordinates) &&
+      checkpoint.interior_component_slabs.size() ==
+          persistent_interior_unknowns &&
+      checkpoint.owned_trace_component_slabs.size() ==
+          static_cast<std::size_t>(value.owned_true_trace_unknowns) &&
+      value.evidence.attempt_count >= 0 &&
+      value.evidence.attempt_count <
+          static_cast<int>(value.evidence.attempts.size()) &&
+      value.evidence.step_evidence_count >= 0 &&
+      value.evidence.step_evidence_count <
+          static_cast<int>(value.evidence.steps.size()) &&
+      value.evidence.snapshot_count >= 0 &&
+      value.evidence.snapshot_count <
+          static_cast<int>(value.evidence.snapshots.size()) &&
+      value.pending_snapshot.valid;
+  if (!CollectiveAll(value.communicator.value, locally_valid))
+  {
+    return false;
+  }
+  if (!value.CaptureCheckpointSlot(token.candidate_slot_, token.target_,
+                                   checkpoint, true))
+  {
+    return false;
+  }
+  value.RefreshLedgers();
+  return value.WriteProspectiveEvidence(prospective_evidence);
 }
 
 bool PersistentSc25ScalarIgrCudaRank2::
@@ -5869,7 +6026,7 @@ bool PersistentSc25ScalarIgrCudaRank2::
       token.incarnation_ == observed.incarnation && token.serial_ != 0 &&
       token.serial_ == observed.active_transaction_serial &&
       token.candidate_slot_ == observed.active_candidate_slot &&
-      token.installed_ && observed.active_installed &&
+      token.installed_ == observed.active_installed &&
       SameCoordinates(token.target_,
                       observed.pending_attempt.candidate_coordinates);
   if (!CollectiveAll(observed.communicator.value, locally_valid))
@@ -5877,23 +6034,9 @@ bool PersistentSc25ScalarIgrCudaRank2::
     return false;
   }
   Implementation& reverted = *implementation_;
-  // Candidate execution is physically observable even when its logical
-  // publication is reverted.  Refresh and retain those observations while
-  // rolling back only the committed trajectory record.
-  reverted.RefreshLedgers();
-  const ScalarCudaEvidence& prior = reverted.transaction_prior_evidence;
-  reverted.evidence.status = prior.status;
-  reverted.evidence.first_failure = prior.first_failure;
-  reverted.evidence.accepted_steps = prior.accepted_steps;
-  reverted.evidence.attempted_steps = prior.attempted_steps;
-  reverted.evidence.retry_attempts = prior.retry_attempts;
-  reverted.evidence.attempt_count = prior.attempt_count;
-  reverted.evidence.step_evidence_count = prior.step_evidence_count;
-  reverted.evidence.coordinates = prior.coordinates;
-  reverted.evidence.attempts = prior.attempts;
-  reverted.evidence.steps = prior.steps;
-  reverted.evidence.snapshot_count = prior.snapshot_count;
-  reverted.evidence.snapshots = prior.snapshots;
+  // Candidate execution remains physically observable, but no logical
+  // trajectory field survives a successful rollback.
+  reverted.RestorePriorLogicalEvidence();
   reverted.status = reverted.transaction_prior_status;
   reverted.first_failure = reverted.transaction_prior_first_failure;
   reverted.pending_attempt_active = false;
@@ -5907,7 +6050,7 @@ bool PersistentSc25ScalarIgrCudaRank2::
   token.target_ = {};
   token.valid_ = false;
   token.installed_ = false;
-  return CollectiveAll(reverted.communicator.value, true);
+  return true;
 }
 
 bool PersistentSc25ScalarIgrCudaRank2::
@@ -5920,6 +6063,16 @@ bool PersistentSc25ScalarIgrCudaRank2::
       token.serial_ == observed.active_transaction_serial &&
       token.candidate_slot_ == observed.active_candidate_slot &&
       token.installed_ && observed.active_installed &&
+      observed.evidence.attempt_count >= 0 &&
+      observed.evidence.attempt_count <
+          static_cast<int>(observed.evidence.attempts.size()) &&
+      observed.evidence.step_evidence_count >= 0 &&
+      observed.evidence.step_evidence_count <
+          static_cast<int>(observed.evidence.steps.size()) &&
+      observed.evidence.snapshot_count >= 0 &&
+      observed.evidence.snapshot_count <
+          static_cast<int>(observed.evidence.snapshots.size()) &&
+      observed.pending_snapshot.valid &&
       SameCoordinates(token.target_,
                       observed.pending_attempt.candidate_coordinates);
   if (!CollectiveAll(observed.communicator.value, locally_valid))
@@ -5930,30 +6083,18 @@ bool PersistentSc25ScalarIgrCudaRank2::
   value.pending_attempt.status = value.transaction_installed_after_retry
       ? ScalarCudaStatus::accepted_after_one_retry
       : ScalarCudaStatus::accepted;
-  if (value.evidence.attempt_count <
-      static_cast<int>(value.evidence.attempts.size()))
-  {
-    value.pending_step.attempt_index = value.evidence.attempt_count;
-    value.evidence.attempts[
-        static_cast<std::size_t>(value.evidence.attempt_count++)] =
-        value.pending_attempt;
-  }
-  if (value.evidence.step_evidence_count <
-      static_cast<int>(value.evidence.steps.size()))
-  {
-    value.evidence.steps[
-        static_cast<std::size_t>(value.evidence.step_evidence_count++)] =
-        value.pending_step;
-  }
+  value.pending_step.attempt_index = value.evidence.attempt_count;
+  value.evidence.attempts[
+      static_cast<std::size_t>(value.evidence.attempt_count++)] =
+      value.pending_attempt;
+  value.evidence.steps[
+      static_cast<std::size_t>(value.evidence.step_evidence_count++)] =
+      value.pending_step;
   const int snapshot_index = value.evidence.snapshot_count;
-  if (snapshot_index >= 0 &&
-      snapshot_index < static_cast<int>(value.evidence.snapshots.size()))
-  {
-    value.pending_snapshot.status = value.pending_attempt.status;
-    value.evidence.snapshots[static_cast<std::size_t>(snapshot_index)] =
-        value.pending_snapshot;
-    ++value.evidence.snapshot_count;
-  }
+  value.pending_snapshot.status = value.pending_attempt.status;
+  value.evidence.snapshots[static_cast<std::size_t>(snapshot_index)] =
+      value.pending_snapshot;
+  ++value.evidence.snapshot_count;
   ++value.evidence.accepted_steps;
   ++value.evidence.attempted_steps;
   value.evidence.coordinates = token.target_;
@@ -5976,7 +6117,7 @@ bool PersistentSc25ScalarIgrCudaRank2::
   // A committed leaf remains ready for the next transaction; the accepted
   // result is retained in evidence and in the return from Advance.
   value.status = ScalarCudaStatus::ready;
-  return CollectiveAll(value.communicator.value, true);
+  return true;
 }
 
 ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::AdvancePersistentTrajectory(
@@ -6310,6 +6451,7 @@ PersistentSc25ScalarIgrCudaRank2::trajectory_evidence() const noexcept
   if (!implementation_) { return empty; }
   if (implementation_->active_transaction_serial != 0)
   {
+    implementation_->RefreshExposedPriorEvidence();
     return implementation_->transaction_prior_evidence;
   }
   implementation_->RefreshLedgers();
@@ -6322,6 +6464,7 @@ PersistentSc25ScalarIgrCudaRank2::reuse_evidence() const noexcept
   if (!implementation_) { return {}; }
   if (implementation_->active_transaction_serial != 0)
   {
+    implementation_->RefreshExposedPriorEvidence();
     return implementation_->transaction_prior_evidence.reuse;
   }
   implementation_->RefreshLedgers();

@@ -13,9 +13,11 @@
 #include <fstream>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <type_traits>
 #include <unistd.h>
 #include <vector>
@@ -464,6 +466,52 @@ bool LoadCpuManifests(
   }
   return cpu_manifest::CaptureManifestSetIdentity(directory, after) &&
       before == after;
+}
+
+bool HandoffPathNegativeControls()
+{
+  const std::string suffix =
+      std::to_string(static_cast<unsigned long long>(::getpid()));
+  const std::filesystem::path root =
+      std::filesystem::path{"/tmp"} / ("dg-igr-hdg-handoff-negative-" + suffix);
+  const std::filesystem::path alias = root.string() + "-alias";
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+  error.clear();
+  std::filesystem::remove(alias, error);
+  error.clear();
+  if (!std::filesystem::create_directory(root, error) || error ||
+      ::chmod(root.c_str(), S_IRWXU) != 0)
+    return false;
+
+  bool valid = false;
+  const std::filesystem::path regular = root / "regular";
+  const std::filesystem::path manifest = root / "rank-0.c3m";
+  {
+    std::ofstream output(regular, std::ios::binary);
+    output << "not-a-manifest";
+  }
+  if (::chmod(regular.c_str(), S_IRUSR | S_IWUSR) == 0)
+  {
+    std::filesystem::create_symlink(regular.filename(), manifest, error);
+    cpu_manifest::DirectoryHandle directory;
+    std::vector<std::uint8_t> bytes;
+    valid = !error && directory.Open(root.string()) &&
+        !cpu_manifest::ReadFileAt(directory, "rank-0.c3m", bytes);
+    std::filesystem::remove(manifest, error);
+    error.clear();
+    valid = valid && ::mkfifo(manifest.c_str(), S_IRUSR | S_IWUSR) == 0 &&
+        !cpu_manifest::ReadFileAt(directory, "rank-0.c3m", bytes);
+    std::filesystem::remove(manifest, error);
+    error.clear();
+    std::filesystem::create_directory_symlink(root, alias, error);
+    cpu_manifest::DirectoryHandle symlinked_directory;
+    valid = valid && !error && !symlinked_directory.Open(alias.string());
+  }
+  std::filesystem::remove(alias, error);
+  error.clear();
+  std::filesystem::remove_all(root, error);
+  return valid && !error;
 }
 
 bool RelativeL2Within(const std::vector<double>& actual,
@@ -918,7 +966,10 @@ bool MakeScalarSidecarNegative(const std::filesystem::path& source,
   CliScalarResourceSidecar sidecar{};
   std::memcpy(&sidecar, sidecar_bytes.data(), sizeof(sidecar));
   if (!ValidCliSidecar(sidecar)) return false;
-  if (kind == "count") sidecar.rank_count = 3;
+  if (kind == "count-zero") sidecar.rank_count = 0;
+  else if (kind == "count-three") sidecar.rank_count = 3;
+  else if (kind == "count-maximum")
+    sidecar.rank_count = std::numeric_limits<std::uint32_t>::max();
   else if (kind == "checksum") sidecar.checksum.bytes[0] ^= 1U;
   else if (kind == "shape") sidecar.ranks[0].private_descriptor.rank_count = 1;
   else return false;
@@ -1159,7 +1210,8 @@ int main(const int argc, const char* const* argv)
     return valid ? 0 : 1;
   }
   if (argc != 1) return 64;
-  const bool passed = DirectAndNegativeControls() && HelpAndConfig();
+  const bool passed = DirectAndNegativeControls() && HelpAndConfig() &&
+      Check(HandoffPathNegativeControls(), "handoff_path_negative_controls");
   if (passed) std::cout << "HDG runtime CLI contract PASS\n";
   return passed ? 0 : 1;
 }

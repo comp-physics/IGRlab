@@ -490,6 +490,9 @@ public:
       Transaction& output,
       FailureInjection injection = FailureInjection::none) noexcept;
   bool InstallPersistentTrajectoryTransaction(Transaction& token) noexcept;
+  bool StageInstalledTrajectoryTransaction(
+      Transaction& token, ScalarCudaCheckpoint& checkpoint,
+      ScalarCudaEvidence& prospective_evidence) noexcept;
   bool RevertPersistentTrajectoryTransaction(Transaction&& token) noexcept;
   bool FinalizePersistentTrajectoryTransaction(Transaction&& token) noexcept;
 
