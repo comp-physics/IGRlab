@@ -1,3 +1,5 @@
+cmake_policy(SET CMP0054 NEW)
+
 if(NOT DEFINED HDG_RUNTIME_EXECUTABLE OR
    NOT DEFINED HDG_RUNTIME_TEST_OUTPUT)
   message(FATAL_ERROR "executable and test output path are required")
