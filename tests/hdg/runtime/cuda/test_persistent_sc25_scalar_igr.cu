@@ -265,25 +265,6 @@ bool SameResidency(const scalar::ScalarCudaResidencyEvidence& left,
       left.host_numerical_fallback == right.host_numerical_fallback;
 }
 
-bool SamePhysicalEvidence(const scalar::ScalarCudaEvidence& left,
-                          const scalar::ScalarCudaEvidence& right) noexcept
-{
-  return left.trace_restart == right.trace_restart &&
-      left.trace_maximum_iterations == right.trace_maximum_iterations &&
-      left.trace_relative_tolerance == right.trace_relative_tolerance &&
-      left.trace_absolute_tolerance == right.trace_absolute_tolerance &&
-      left.ilu_type == right.ilu_type &&
-      left.ilu_level_of_fill == right.ilu_level_of_fill &&
-      left.ilu_local_reordering == right.ilu_local_reordering &&
-      SameResidency(left.residency, right.residency) &&
-      SameAllocations(left.allocations, right.allocations) &&
-      SameReuse(left.reuse, right.reuse) &&
-      SameLaunches(left.launches, right.launches) &&
-      SameTransferLedger(left.transfers, right.transfers) &&
-      SameAllocationLedger(left.allocation_ledger,
-                           right.allocation_ledger);
-}
-
 bool RestorePhysicalEvidenceAdvanced(
     const scalar::ScalarCudaEvidence& before,
     const scalar::ScalarCudaEvidence& after) noexcept
@@ -475,12 +456,12 @@ bool ValidateTerminalRestartHistory(
       static_cast<std::size_t>(local_steps));
 }
 
-bool DefaultCheckpoint(const scalar::ScalarCudaCheckpoint& checkpoint)
+bool SameCheckpoint(const scalar::ScalarCudaCheckpoint& left_checkpoint,
+                    const scalar::ScalarCudaCheckpoint& right_checkpoint)
     noexcept
 {
-  const scalar::ScalarCudaCheckpoint empty{};
-  const auto& left = checkpoint.descriptor;
-  const auto& right = empty.descriptor;
+  const auto& left = left_checkpoint.descriptor;
+  const auto& right = right_checkpoint.descriptor;
   return left.schema_version == right.schema_version &&
       left.successful_commit == right.successful_commit &&
       left.restart_mode == right.restart_mode && left.tuple == right.tuple &&
@@ -496,16 +477,25 @@ bool DefaultCheckpoint(const scalar::ScalarCudaCheckpoint& checkpoint)
       left.coordinate_fingerprint == right.coordinate_fingerprint &&
       left.interior_hash == right.interior_hash &&
       left.trace_hash == right.trace_hash &&
-      checkpoint.projection == empty.projection &&
-      checkpoint.tuple == empty.tuple &&
-      checkpoint.scenario == empty.scenario &&
-      checkpoint.layout == empty.layout &&
-      checkpoint.interior_component_slabs ==
-          empty.interior_component_slabs &&
-      checkpoint.trace_component_slabs == empty.trace_component_slabs &&
-      oracle::SameHashes(checkpoint.raw_field_hashes,
-                         empty.raw_field_hashes) &&
-      checkpoint.canonical_manifest_hash == empty.canonical_manifest_hash;
+      left_checkpoint.projection == right_checkpoint.projection &&
+      left_checkpoint.tuple == right_checkpoint.tuple &&
+      left_checkpoint.scenario == right_checkpoint.scenario &&
+      left_checkpoint.layout == right_checkpoint.layout &&
+      left_checkpoint.interior_component_slabs ==
+          right_checkpoint.interior_component_slabs &&
+      left_checkpoint.trace_component_slabs ==
+          right_checkpoint.trace_component_slabs &&
+      oracle::SameHashes(left_checkpoint.raw_field_hashes,
+                         right_checkpoint.raw_field_hashes) &&
+      left_checkpoint.canonical_manifest_hash ==
+          right_checkpoint.canonical_manifest_hash;
+}
+
+bool DefaultCheckpoint(const scalar::ScalarCudaCheckpoint& checkpoint)
+    noexcept
+{
+  const scalar::ScalarCudaCheckpoint empty{};
+  return SameCheckpoint(checkpoint, empty);
 }
 
 std::unique_ptr<cpu::PersistentSc25ScalarIgrCpuFoundation> CreateCpu(
@@ -2605,16 +2595,24 @@ bool RunC2()
       scalar::FailureInjection::trace_linear,
       scalar::FailureInjection::admissibility,
       scalar::FailureInjection::newton_iteration_limit}};
+  bool fault_campaigns_pass = true;
   for (const scalar::FailureInjection fault : faults)
   {
-    if (!RunFaultCampaign(fault))
-    {
-      std::cerr << "C2 fault campaign failed: "
-                << static_cast<int>(fault) << '\n';
-      return false;
-    }
+    const bool pass = RunFaultCampaign(fault);
+    std::cout << "C2 fault-campaign injection=" << static_cast<int>(fault)
+              << " pass=" << pass << '\n';
+    fault_campaigns_pass = pass && fault_campaigns_pass;
+  }
+  if (!fault_campaigns_pass)
+  {
+    std::cerr << "C2 one or more fresh-owner fault campaigns failed\n";
+    return false;
   }
 
+  const auto forbidden_step0_input =
+      std::make_unique<scalar::ScalarCudaCheckpoint>();
+  forbidden_step0_input->descriptor.successful_commit = true;
+  forbidden_step0_input->interior_component_slabs[0] = 1.0;
   auto cpu_run = CreateCpu(8);
   auto cuda_run = CreateCuda(8);
   if (!cpu_run || !cuda_run ||
@@ -2627,15 +2625,56 @@ bool RunC2()
   const auto step0_physical =
       std::make_unique<scalar::ScalarCudaEvidence>(
           cuda_run->trajectory_evidence());
-  scalar::ScalarCudaCheckpoint forbidden_step0{};
-  forbidden_step0.descriptor.successful_commit = true;
-  forbidden_step0.interior_component_slabs[0] = 1.0;
-  if (cuda_run->CaptureTrajectoryCheckpoint(forbidden_step0) ||
-      !DefaultCheckpoint(forbidden_step0) ||
-      !SamePhysicalEvidence(*step0_physical,
-                            cuda_run->trajectory_evidence()))
+  scalar::ScalarCudaCheckpoint forbidden_step0 = *forbidden_step0_input;
+  const bool capture_rejected =
+      !cuda_run->CaptureTrajectoryCheckpoint(forbidden_step0);
+  const bool output_cleared = DefaultCheckpoint(forbidden_step0);
+  const bool output_unchanged =
+      SameCheckpoint(forbidden_step0, *forbidden_step0_input);
+  const std::string_view output_disposition = output_cleared ? "cleared" :
+      output_unchanged ? "unchanged" : "other";
+  const auto& step0_after = cuda_run->trajectory_evidence();
+  const bool solver_policy_same =
+      step0_physical->trace_restart == step0_after.trace_restart &&
+      step0_physical->trace_maximum_iterations ==
+          step0_after.trace_maximum_iterations &&
+      step0_physical->trace_relative_tolerance ==
+          step0_after.trace_relative_tolerance &&
+      step0_physical->trace_absolute_tolerance ==
+          step0_after.trace_absolute_tolerance &&
+      step0_physical->ilu_type == step0_after.ilu_type &&
+      step0_physical->ilu_level_of_fill == step0_after.ilu_level_of_fill &&
+      step0_physical->ilu_local_reordering ==
+          step0_after.ilu_local_reordering;
+  const bool residency_same =
+      SameResidency(step0_physical->residency, step0_after.residency);
+  const bool allocations_same =
+      SameAllocations(step0_physical->allocations, step0_after.allocations);
+  const bool reuse_same = SameReuse(step0_physical->reuse, step0_after.reuse);
+  const bool launches_same =
+      SameLaunches(step0_physical->launches, step0_after.launches);
+  const bool transfers_same =
+      SameTransferLedger(step0_physical->transfers, step0_after.transfers);
+  const bool allocation_ledger_same = SameAllocationLedger(
+      step0_physical->allocation_ledger, step0_after.allocation_ledger);
+  const bool physical_evidence_same = solver_policy_same && residency_same &&
+      allocations_same && reuse_same && launches_same && transfers_same &&
+      allocation_ledger_same;
+  std::cout << "C2 step0 checkpoint capture-rejected=" << capture_rejected
+            << " output-disposition=" << output_disposition
+            << " physical-evidence-same=" << physical_evidence_same << '\n';
+  if (!capture_rejected || !physical_evidence_same)
   {
-    std::cerr << "C2 step0 checkpoint capture mutated physical evidence\n";
+    std::cerr << "C2 step0 checkpoint rejection/physical contract failed"
+              << " capture-rejected=" << capture_rejected
+              << " output-disposition=" << output_disposition
+              << " solver-policy=" << solver_policy_same
+              << " residency=" << residency_same
+              << " allocations=" << allocations_same
+              << " reuse=" << reuse_same
+              << " launches=" << launches_same
+              << " transfers=" << transfers_same
+              << " allocation-ledger=" << allocation_ledger_same << '\n';
     return false;
   }
   oracle::ComparisonEvidence comparison{};
@@ -2694,9 +2733,17 @@ bool RunC2()
     preceding_q14 = current_q14;
     if (step == 10)
     {
-      if (!cpu_run->CaptureTrajectoryCheckpoint(cpu_checkpoint10) ||
-          !cuda_run->CaptureTrajectoryCheckpoint(cuda_checkpoint10))
+      const bool cpu_checkpoint_captured =
+          cpu_run->CaptureTrajectoryCheckpoint(cpu_checkpoint10);
+      const bool cuda_checkpoint_captured =
+          cuda_run->CaptureTrajectoryCheckpoint(cuda_checkpoint10);
+      std::cout << "C2 step10 checkpoint cpu=" << cpu_checkpoint_captured
+                << " cuda=" << cuda_checkpoint_captured << '\n';
+      if (!cpu_checkpoint_captured || !cuda_checkpoint_captured)
       {
+        std::cerr << "C2 step10 checkpoint capture failed"
+                  << " cpu=" << cpu_checkpoint_captured
+                  << " cuda=" << cuda_checkpoint_captured << '\n';
         return false;
       }
     }
@@ -2735,16 +2782,46 @@ bool RunC2()
 
   auto cpu_restart = CreateCpu(8);
   auto cuda_restart = CreateCuda(8);
-  if (!cpu_restart || !cuda_restart ||
-      cpu_restart->InitializePersistentTrajectory() !=
-          cpu::TrajectoryStatus::ready ||
-      cuda_restart->InitializePersistentTrajectory() !=
-          scalar::ScalarCudaStatus::ready ||
-      !CpuAccepted(cpu_restart->RestoreTrajectoryCheckpoint(
-          cpu_checkpoint10)) ||
-      cuda_restart->RestoreTrajectoryCheckpoint(cuda_checkpoint10) !=
-          scalar::ScalarCudaStatus::ready)
+  const bool cpu_restart_created = cpu_restart != nullptr;
+  const bool cuda_restart_created = cuda_restart != nullptr;
+  bool cpu_restart_initialized = false;
+  bool cuda_restart_initialized = false;
+  if (cpu_restart_created)
   {
+    cpu_restart_initialized =
+        cpu_restart->InitializePersistentTrajectory() ==
+        cpu::TrajectoryStatus::ready;
+  }
+  if (cuda_restart_created)
+  {
+    cuda_restart_initialized =
+        cuda_restart->InitializePersistentTrajectory() ==
+        scalar::ScalarCudaStatus::ready;
+  }
+  bool cpu_checkpoint_restored = false;
+  bool cuda_checkpoint_restored = false;
+  if (cpu_restart_initialized)
+  {
+    cpu_checkpoint_restored = CpuAccepted(
+        cpu_restart->RestoreTrajectoryCheckpoint(cpu_checkpoint10));
+  }
+  if (cuda_restart_initialized)
+  {
+    cuda_checkpoint_restored =
+        cuda_restart->RestoreTrajectoryCheckpoint(cuda_checkpoint10) ==
+        scalar::ScalarCudaStatus::ready;
+  }
+  std::cout << "C2 fresh-restart cpu-created=" << cpu_restart_created
+            << " cuda-created=" << cuda_restart_created
+            << " cpu-initialized=" << cpu_restart_initialized
+            << " cuda-initialized=" << cuda_restart_initialized
+            << " cpu-restored=" << cpu_checkpoint_restored
+            << " cuda-restored=" << cuda_checkpoint_restored << '\n';
+  if (!cpu_restart_created || !cuda_restart_created ||
+      !cpu_restart_initialized || !cuda_restart_initialized ||
+      !cpu_checkpoint_restored || !cuda_checkpoint_restored)
+  {
+    std::cerr << "C2 fresh restart initialization/restore failed\n";
     return false;
   }
   if (cuda_restart->status() != scalar::ScalarCudaStatus::ready ||
@@ -2936,22 +3013,23 @@ bool RunC2()
   const auto& evidence = *continuous_evidence;
   const auto& transfers = evidence.transfers;
   const auto& allocations = evidence.allocation_ledger;
-  const bool persistent = evidence.accepted_steps == 20 &&
+  const bool trajectory_gate = evidence.accepted_steps == 20 &&
       evidence.step_evidence_count == 20 &&
-      evidence.attempt_count == 20 &&
-      evidence.trace_restart == 50 &&
+      evidence.attempt_count == 20;
+  const bool solver_policy_gate = evidence.trace_restart == 50 &&
       evidence.trace_maximum_iterations == 200 &&
       evidence.trace_relative_tolerance == 1.0e-12 &&
       evidence.trace_absolute_tolerance == 1.0e-14 &&
       evidence.ilu_type == 0 && evidence.ilu_level_of_fill == 0 &&
-      evidence.ilu_local_reordering == 1 && evidence.residency.mfem_cuda_device &&
+      evidence.ilu_local_reordering == 1;
+  const bool residency_gate = evidence.residency.mfem_cuda_device &&
       evidence.residency.hypre_cuda && evidence.residency.umpire_device_pool &&
       evidence.residency.state_device_resident &&
       evidence.residency.topology_device_resident &&
       evidence.residency.workspace_device_resident &&
       evidence.residency.trace_solve_device_resident &&
-      !evidence.residency.host_numerical_fallback &&
-      evidence.allocations.warm_plateau &&
+      !evidence.residency.host_numerical_fallback;
+  const bool allocation_plateau_gate = evidence.allocations.warm_plateau &&
       evidence.allocations.baseline_mfem_high_water != 0 &&
       evidence.allocations.baseline_hypre_high_water != 0 &&
       evidence.allocations.current_mfem_high_water ==
@@ -2960,29 +3038,45 @@ bool RunC2()
           evidence.allocations.baseline_hypre_high_water &&
       evidence.allocations.zero_post_baseline_observed_growth &&
       evidence.allocations.zero_post_baseline_owned_allocation &&
-      evidence.allocations.zero_post_baseline_owned_deallocation &&
-      reuse.unchanged && oracle::ValidateTopologyIdentity(reuse) &&
-      !oracle::ValidateTopologyIdentity(mutated_reuse) &&
-      evidence.launches.assemble_launches > 0 &&
+      evidence.allocations.zero_post_baseline_owned_deallocation;
+  const bool reuse_identity_gate = oracle::ValidateTopologyIdentity(reuse);
+  const bool mutated_reuse_rejected =
+      !oracle::ValidateTopologyIdentity(mutated_reuse);
+  const bool reuse_gate = reuse.unchanged && reuse_identity_gate &&
+      mutated_reuse_rejected;
+  const bool launch_gate = evidence.launches.assemble_launches > 0 &&
       evidence.launches.condense_launches > 0 &&
       evidence.launches.recover_launches > 0 &&
       evidence.launches.fallback_calls == 0 &&
       evidence.launches.last_compiled_architecture == 1200 &&
-      evidence.launches.all_launches_completed &&
-      oracle::ValidateTransferLedger(
-          transfers, evidence, oracle::c2_transfer_expectation) &&
-      RejectTransferCensusMutations(
-          transfers, evidence, oracle::c2_transfer_expectation) &&
-      oracle::ValidateAllocationLedger(allocations, evidence.allocations) &&
-      RunCopiedEvidenceMutationNegatives(evidence);
-  if (!persistent)
+      evidence.launches.all_launches_completed;
+  const bool persistent_gate = trajectory_gate && solver_policy_gate &&
+      residency_gate && allocation_plateau_gate && reuse_gate && launch_gate;
+  const bool transfer_gate = oracle::ValidateTransferLedger(
+      transfers, evidence, oracle::c2_transfer_expectation);
+  const bool transfer_mutation_gate = RejectTransferCensusMutations(
+      transfers, evidence, oracle::c2_transfer_expectation);
+  const bool allocation_gate =
+      oracle::ValidateAllocationLedger(allocations, evidence.allocations);
+  const bool copy_mutation_gate = RunCopiedEvidenceMutationNegatives(evidence);
+  const bool checkpoint_negative_gate =
+      RunCheckpointNegatives(cuda_checkpoint10, *cpu_restart);
+  std::cout << "C2 terminal-gates persistent=" << persistent_gate
+            << " trajectory=" << trajectory_gate
+            << " solver-policy=" << solver_policy_gate
+            << " residency=" << residency_gate
+            << " allocation-plateau=" << allocation_plateau_gate
+            << " reuse=" << reuse_gate
+            << " launches=" << launch_gate
+            << " transfer=" << transfer_gate
+            << " transfer-mutation=" << transfer_mutation_gate
+            << " allocation=" << allocation_gate
+            << " copy-mutation=" << copy_mutation_gate
+            << " checkpoint-negative=" << checkpoint_negative_gate << '\n';
+  if (!persistent_gate || !transfer_gate || !transfer_mutation_gate ||
+      !allocation_gate || !copy_mutation_gate || !checkpoint_negative_gate)
   {
-    std::cerr << "C2 residency/reuse/allocation evidence failed\n";
-    return false;
-  }
-  if (!RunCheckpointNegatives(cuda_checkpoint10, *cpu_restart))
-  {
-    std::cerr << "C2 restart negative campaign failed\n";
+    std::cerr << "C2 one or more independent terminal gates failed\n";
     return false;
   }
   std::cout << "PASS: HDG-EXP-SCALAR-DEVICE-01 C2 20-step CPU/CUDA "
