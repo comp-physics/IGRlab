@@ -48,13 +48,14 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   if(MFEM_USE_CUDA)
     set(_dg_igr_hdg_runtime_cuda_expected_sources
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/hdg_sc25_periodic_v3_device.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/hdg_sc25_periodic_v3_rank2_device.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu")
     list(SORT _dg_igr_hdg_runtime_cuda_sources)
     list(SORT _dg_igr_hdg_runtime_cuda_expected_sources)
     if(NOT _dg_igr_hdg_runtime_cuda_sources STREQUAL
        _dg_igr_hdg_runtime_cuda_expected_sources)
       message(FATAL_ERROR
-              "The frozen W8A+W8B CUDA component requires exactly persistent_smooth_euler.cu and hdg_sc25_periodic_v3_device.cu.")
+              "The frozen W8A+W8B CUDA component requires exactly persistent_smooth_euler.cu and the SC25 rank-one/rank-two device sources.")
     endif()
   endif()
 
@@ -122,7 +123,8 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     dg_igr_add_hdg_cuda17_component(
       TARGET dg_igr_hdg_runtime_cuda
       SOURCES ${_dg_igr_hdg_runtime_cuda_sources}
-      PUBLIC_LINK_LIBRARIES dg_igr_hdg_runtime_common)
+      PUBLIC_LINK_LIBRARIES dg_igr_hdg_runtime_common
+      PRIVATE_LINK_LIBRARIES dg_igr_hdg_runtime_cpu)
     target_link_libraries(dg_igr_hdg_runtime_components INTERFACE
                           dg_igr_hdg_runtime_cuda)
   elseif(_dg_igr_hdg_runtime_cuda_sources)

@@ -152,6 +152,69 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
       PROCESSORS 1
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 3600)
+
+  add_executable(dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test
+    test_persistent_sc25_scalar_igr_rank2.cu)
+
+  target_include_directories(dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test
+    PRIVATE
+      "${PROJECT_SOURCE_DIR}/include"
+      "${PROJECT_SOURCE_DIR}/tests/hdg/runtime/common"
+      "${CMAKE_CURRENT_SOURCE_DIR}")
+
+  target_link_libraries(dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test
+    PRIVATE
+      dg_igr_hdg_runtime_cuda
+      mfem
+      MPI::MPI_CXX)
+
+  target_compile_options(dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test
+    PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+
+  set_target_properties(dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test
+    PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_EXTENSIONS OFF
+      CUDA_ARCHITECTURES 120
+      CUDA_SEPARABLE_COMPILATION ON
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+  add_test(
+    NAME hdg_sc25_scalar_igr_cuda_rank2_c3
+    COMMAND
+      "${MPIEXEC_EXECUTABLE}"
+      "${MPIEXEC_NUMPROC_FLAG}" 2
+      ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test>
+      ${MPIEXEC_POSTFLAGS})
+
+  add_test(
+    NAME hdg_sc25_scalar_igr_cuda_rank2_device_object
+    COMMAND
+      "${CMAKE_COMMAND}"
+      "-DOBJECT_ROOT=${PROJECT_BINARY_DIR}"
+      "-DRUNTIME_ARCHIVE=$<TARGET_FILE:dg_igr_hdg_runtime_cuda>"
+      "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test>"
+      "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_CUOBJDUMP_EXECUTABLE}"
+      "-DNM_EXECUTABLE=${DG_IGR_NM_EXECUTABLE}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/check_sc25_scalar_igr_rank2_device_object.cmake")
+
+  set_tests_properties(hdg_sc25_scalar_igr_cuda_rank2_c3
+    PROPERTIES
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
+  set_tests_properties(hdg_sc25_scalar_igr_cuda_rank2_device_object
+    PROPERTIES
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
 endif()
 set_tests_properties(
   dg_igr_hdg_runtime_cuda_w8a_rank2_host_staged
