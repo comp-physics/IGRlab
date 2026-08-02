@@ -10,6 +10,11 @@ foreach(_dg_igr_hdg_app_test IN ITEMS
                  "test_${_dg_igr_hdg_app_test}.cpp")
   target_link_libraries("${_dg_igr_hdg_app_target}"
                         PRIVATE dg_igr_hdg_runtime_app_contract)
+  if(_dg_igr_hdg_app_test STREQUAL "command_line")
+    target_include_directories("${_dg_igr_hdg_app_target}" PRIVATE
+      "${PROJECT_SOURCE_DIR}/tests/hdg/runtime/common")
+    target_link_libraries("${_dg_igr_hdg_app_target}" PRIVATE mfem MPI::MPI_CXX)
+  endif()
   target_compile_definitions("${_dg_igr_hdg_app_target}" PRIVATE
     DG_IGR_HDG_RUNTIME_EXPECTED_CPLUSPLUS=201703L)
   target_compile_options("${_dg_igr_hdg_app_target}" PRIVATE
@@ -165,11 +170,38 @@ if(MFEM_USE_CUDA)
       "-DHDG_RUNTIME_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
       "-DHDG_RUNTIME_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_process.cmake")
+  add_test(NAME dg_igr_hdg_runtime_app_cli_scalar_igr_cuda_rank1
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
+      "-DHDG_RUNTIME_SCALAR_VTK_TEST=$<TARGET_FILE:dg_igr_hdg_runtime_app_command_line_test>"
+      "-DHDG_RUNTIME_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cli-scalar-igr-cuda-rank1"
+      -DHDG_RUNTIME_FUNCTIONAL=TRUE
+      -DHDG_RUNTIME_SCALAR_IGR=TRUE
+      -DHDG_RUNTIME_RANKS=1
+      -DHDG_RUNTIME_BACKEND=cuda
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_process.cmake")
+  add_test(NAME dg_igr_hdg_runtime_app_cli_scalar_igr_cuda_rank2
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
+      "-DHDG_RUNTIME_SCALAR_VTK_TEST=$<TARGET_FILE:dg_igr_hdg_runtime_app_command_line_test>"
+      "-DHDG_RUNTIME_SCALAR_RANK2_MANIFEST_CONSUMER=$<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test>"
+      "-DHDG_RUNTIME_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cli-scalar-igr-cuda-rank2"
+      -DHDG_RUNTIME_FUNCTIONAL=TRUE
+      -DHDG_RUNTIME_SCALAR_IGR=TRUE
+      -DHDG_RUNTIME_RANKS=2
+      -DHDG_RUNTIME_BACKEND=cuda
+      "-DHDG_RUNTIME_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_RUNTIME_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      "-DHDG_RUNTIME_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+      "-DHDG_RUNTIME_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_process.cmake")
   set_tests_properties(
     dg_igr_hdg_runtime_app_cli_process_cuda_rank1
     dg_igr_hdg_runtime_app_cli_process_cuda_rank2
     dg_igr_hdg_runtime_app_cli_functional_cuda_rank1
     dg_igr_hdg_runtime_app_cli_functional_cuda_rank2
+    dg_igr_hdg_runtime_app_cli_scalar_igr_cuda_rank1
+    dg_igr_hdg_runtime_app_cli_scalar_igr_cuda_rank2
     PROPERTIES
       LABELS "hdg;runtime;app;cli;functional;cuda"
       RESOURCE_LOCK dg_igr_sm120
@@ -177,5 +209,18 @@ if(MFEM_USE_CUDA)
   set_tests_properties(
     dg_igr_hdg_runtime_app_cli_process_cuda_rank2
     dg_igr_hdg_runtime_app_cli_functional_cuda_rank2
+    dg_igr_hdg_runtime_app_cli_scalar_igr_cuda_rank2
     PROPERTIES PROCESSORS 2)
+  # The measured pre-repair scalar tests were 277.58s (rank 1) and 916.58s
+  # (rank 2) for about three full-trajectory equivalents. The exact added
+  # campaigns raise those totals to 7.45 and 11.9 equivalents respectively:
+  # 3/6 full scheduled retries plus 1/2 terminal 19-step runs and 1/2
+  # 10-step restart continuations. These rounded bounds retain roughly 2x the
+  # proportional measured time without changing registration or resource use.
+  set_tests_properties(
+    dg_igr_hdg_runtime_app_cli_scalar_igr_cuda_rank1
+    PROPERTIES TIMEOUT 1800)
+  set_tests_properties(
+    dg_igr_hdg_runtime_app_cli_scalar_igr_cuda_rank2
+    PROPERTIES TIMEOUT 7200)
 endif()

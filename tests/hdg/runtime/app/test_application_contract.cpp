@@ -37,6 +37,12 @@ static_assert(IsFrozenApplicationBackend<CpuSerialBackendTag>::value &&
 static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0 ||
                   DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1,
               "scalar-IGR CPU availability is a build-owned boolean");
+static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 0 ||
+                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1,
+              "scalar-IGR CUDA rank-1 availability is build-owned");
+static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 0 ||
+                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1,
+              "scalar-IGR CUDA rank-2 availability is build-owned");
 
 bool Check(const bool condition, const char* name)
 {
@@ -138,6 +144,19 @@ ApplicationOptionsView SplitWriter(ApplicationOptionsView options)
 {
   options.run_role = ApplicationRunRoleV1::split_writer;
   options.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+  return options;
+}
+
+ApplicationOptionsView CanonicalScalarCheckpointWriter(
+    ApplicationOptionsView options)
+{
+  options = SplitWriter(options);
+  options.injection = {
+      FailureInjectionModeV1::prescribed,
+      smooth_periodic_euler_v1_failure_phase,
+      scalar_igr_sc25_v3_failure_target_step,
+      SourceRank(options.backend_id)};
+  options.retry_limit = scalar_igr_sc25_v3_retry_limit;
   return options;
 }
 
@@ -463,12 +482,125 @@ bool CheckScalarIgrMatrix()
                              ApplicationScenarioV1::scalar_igr_sc25_v3,
                      "scalar_igr_exact_scenario") && passed;
   }
-  for (const std::string_view backend :
-       {CudaRank1OneGpuBackendTag::id,
-        CudaRank2OneGpuHostStagedBackendTag::id})
-    passed = Check(ValidateApplicationOptions(ScalarIgr(backend)).rejection() ==
-                       ApplicationRejection::unbuilt_backend,
-                   "scalar_igr_cuda_slot_explicitly_unbuilt") && passed;
+  for (const auto& item : std::array<std::pair<std::string_view, bool>, 2>{{
+           {CudaRank1OneGpuBackendTag::id,
+            DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1},
+           {CudaRank2OneGpuHostStagedBackendTag::id,
+            DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1}}})
+  {
+    const ApplicationValidation validation =
+        ValidateApplicationOptions(ScalarIgr(item.first));
+    passed = Check(item.second ? validation.accepted()
+                               : validation.rejection() ==
+                                     ApplicationRejection::unbuilt_backend,
+                   "scalar_igr_cuda_static_matrix") && passed;
+    if (!item.second) continue;
+
+    const std::uint32_t rank_count =
+        item.first == CudaRank2OneGpuHostStagedBackendTag::id ? 2U : 1U;
+    ApplicationOptionsView fault_free = ScalarIgr(item.first);
+    fault_free.injection = {};
+    fault_free.retry_limit = 0;
+    const ApplicationValidation fault_free_validation =
+        ValidateApplicationOptions(fault_free);
+    const ApplicationValidation reader_validation =
+        ValidateApplicationOptions(SplitReader(fault_free));
+    StateHash expected_writer_hash{};
+    const bool expected_writer_ready = reader_validation.accepted() &&
+        DeriveSplitWriterRunConfigHashV1(
+            *reader_validation.config(), expected_writer_hash);
+    const auto canonical_writer_hash_matches =
+        [&](const ApplicationOptionsView& live)
+        {
+          const ApplicationValidation normalized =
+              ValidateApplicationOptions(CanonicalScalarCheckpointWriter(live));
+          return expected_writer_ready && normalized.accepted() &&
+              normalized.config()->run_config_sha256() ==
+                  expected_writer_hash;
+        };
+    const ApplicationValidation fault_free_public_writer =
+        ValidateApplicationOptions(SplitWriter(fault_free));
+    passed = Check(
+                 fault_free_validation.accepted() &&
+                     fault_free_public_writer.accepted() &&
+                     fault_free_public_writer.config()->run_config_sha256() !=
+                         expected_writer_hash &&
+                     canonical_writer_hash_matches(fault_free),
+                 "scalar_cuda_fault_free_checkpoint_writer_hash_normalizes") &&
+        passed;
+
+    for (std::uint32_t source = 0; source < rank_count; ++source)
+    {
+      for (const FailurePhase phase :
+           {FailurePhase::CheckpointStaging, FailurePhase::OutputStaging,
+            FailurePhase::AfterRecoveryBeforeCommit})
+      {
+        ApplicationOptionsView scheduled = ScalarIgr(item.first);
+        scheduled.injection = {FailureInjectionModeV1::prescribed, phase,
+                               scalar_igr_sc25_v3_checkpoint_step, source};
+        const ApplicationValidation scheduled_validation =
+            ValidateApplicationOptions(scheduled);
+        passed = Check(
+                     scheduled_validation.accepted() &&
+                         scheduled_validation.config()->injection() ==
+                             scheduled.injection &&
+                         scheduled_validation.config()->retry_limit() == 1 &&
+                         ValidateApplicationOptions(
+                             SplitWriter(scheduled)).accepted() &&
+                         canonical_writer_hash_matches(scheduled),
+                     "scalar_cuda_step10_scheduled_boundary_contract") &&
+            passed;
+      }
+
+      ApplicationOptionsView post_publication = ScalarIgr(item.first);
+      post_publication.injection = {
+          FailureInjectionModeV1::prescribed,
+          FailurePhase::AfterRecoveryBeforeCommit,
+          scalar_igr_sc25_v3_steps, source};
+      post_publication.retry_limit = 0;
+      const ApplicationValidation post_publication_validation =
+          ValidateApplicationOptions(post_publication);
+      const ApplicationValidation post_publication_writer_validation =
+          ValidateApplicationOptions(SplitWriter(post_publication));
+      passed = Check(
+                   post_publication_validation.accepted() &&
+                       post_publication_validation.config()->injection() ==
+                           post_publication.injection &&
+                       post_publication_validation.config()->retry_limit() ==
+                           0 &&
+                       post_publication_writer_validation.rejection() ==
+                           ApplicationRejection::invalid_run_role &&
+                       canonical_writer_hash_matches(post_publication),
+                   "scalar_cuda_step20_postpublication_boundary_contract") &&
+          passed;
+    }
+
+    ApplicationOptionsView malformed = ScalarIgr(item.first);
+    malformed.injection = {
+        FailureInjectionModeV1::prescribed,
+        FailurePhase::AfterRecoveryBeforeCommit,
+        scalar_igr_sc25_v3_checkpoint_step, rank_count};
+    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
+                       ApplicationRejection::invalid_run_role,
+                   "scalar_cuda_rejects_out_of_range_scheduled_source") &&
+        passed;
+    malformed.injection.source_rank = 0;
+    malformed.retry_limit = 0;
+    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
+                       ApplicationRejection::invalid_run_role,
+                   "scalar_cuda_rejects_terminal_step10_controls") && passed;
+    malformed.injection.target_step = scalar_igr_sc25_v3_steps;
+    malformed.retry_limit = scalar_igr_sc25_v3_retry_limit;
+    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
+                       ApplicationRejection::invalid_run_role,
+                   "scalar_cuda_rejects_retrying_step20_controls") && passed;
+    malformed.injection.phase = FailurePhase::CheckpointStaging;
+    malformed.retry_limit = 0;
+    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
+                       ApplicationRejection::invalid_run_role,
+                   "scalar_cuda_rejects_nonpublication_step20_phase") &&
+        passed;
+  }
 
   ApplicationOptionsView h1 = ScalarIgr(CpuSerialBackendTag::id);
   h1.interior_space = InteriorSpace::h1;

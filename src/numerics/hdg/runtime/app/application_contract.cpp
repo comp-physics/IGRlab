@@ -20,6 +20,12 @@
 #ifndef DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
 #error "build-owned scalar-IGR CPU availability definition is required"
 #endif
+#ifndef DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1
+#error "build-owned scalar-IGR CUDA rank-1 availability definition is required"
+#endif
+#ifndef DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
+#error "build-owned scalar-IGR CUDA rank-2 availability definition is required"
+#endif
 
 namespace dg::hdg::runtime::app
 {
@@ -415,14 +421,39 @@ ApplicationRejection ValidateRoleControls(
       options.injection.target_step == ScenarioFailureTarget(scenario) &&
       options.injection.source_rank == deferred.required_injected_source_rank;
   const bool scalar = scenario == ApplicationScenarioV1::scalar_igr_sc25_v3;
+  const bool scalar_cuda = scalar &&
+      (backend == ApplicationBackend::cuda_rank1_one_gpu ||
+       backend == ApplicationBackend::cuda_rank2_one_gpu_host_staged);
+  const bool scalar_source_valid =
+      options.injection.source_rank < deferred.required_mpi_rank_count;
+  const bool scalar_scheduled_retry = scalar_cuda && scalar_source_valid &&
+      options.injection.mode == FailureInjectionModeV1::prescribed &&
+      options.injection.target_step == checkpoint_step &&
+      options.retry_limit == scalar_igr_sc25_v3_retry_limit &&
+      (options.injection.phase == FailurePhase::CheckpointStaging ||
+       options.injection.phase == FailurePhase::OutputStaging ||
+       options.injection.phase == FailurePhase::AfterRecoveryBeforeCommit);
+  const bool scalar_terminal_post_publication =
+      scalar_cuda && scalar_source_valid &&
+      options.injection.mode == FailureInjectionModeV1::prescribed &&
+      options.injection.phase == FailurePhase::AfterRecoveryBeforeCommit &&
+      options.injection.target_step == options.accepted_steps &&
+      options.retry_limit == 0;
+  const bool scalar_fault_free = scalar_cuda && off &&
+      options.retry_limit == 0;
+  const bool scalar_writer_controls =
+      (prescribed_principal &&
+       options.retry_limit == scalar_igr_sc25_v3_retry_limit) ||
+      scalar_scheduled_retry || scalar_fault_free;
+  const bool scalar_uninterrupted_controls = scalar_writer_controls ||
+      scalar_terminal_post_publication;
 
   switch (options.run_role)
   {
     case ApplicationRunRoleV1::uninterrupted_reference:
       if (!writes_checkpoint ||
           options.stop_after_checkpoint != StopAfterCheckpointV1::no ||
-          (scalar ? (!prescribed_principal ||
-                     options.retry_limit != scalar_igr_sc25_v3_retry_limit)
+          (scalar ? !scalar_uninterrupted_controls
                   : (!off || options.retry_limit != 0)) ||
           options.seed != seed)
       {
@@ -432,8 +463,7 @@ ApplicationRejection ValidateRoleControls(
     case ApplicationRunRoleV1::split_writer:
       if (!writes_checkpoint ||
           options.stop_after_checkpoint != StopAfterCheckpointV1::yes ||
-          (scalar ? (!prescribed_principal ||
-                     options.retry_limit != scalar_igr_sc25_v3_retry_limit)
+          (scalar ? !scalar_writer_controls
                   : (!off || options.retry_limit != 0)) ||
           options.seed != seed)
       {
@@ -767,10 +797,14 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::unbuilt_backend);
   }
-  if (scalar &&
-      ((backend != ApplicationBackend::cpu_serial &&
-        backend != ApplicationBackend::cpu_rank2) ||
-       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU != 1))
+  const bool scalar_backend_available =
+      (backend == ApplicationBackend::cpu_serial ||
+       backend == ApplicationBackend::cpu_rank2)
+          ? DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1
+          : (backend == ApplicationBackend::cuda_rank1_one_gpu
+                 ? DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1
+                 : DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1);
+  if (scalar && !scalar_backend_available)
   {
     return reject(ApplicationRejection::unbuilt_backend);
   }

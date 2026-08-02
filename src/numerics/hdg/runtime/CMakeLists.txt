@@ -37,6 +37,7 @@ endif()
 
 if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT OR
    (DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA))
+  set(_dg_igr_hdg_scalar_igr_cpu_app_available ON)
   file(GLOB_RECURSE _dg_igr_hdg_auxiliary_sources CONFIGURE_DEPENDS
        "${CMAKE_CURRENT_SOURCE_DIR}/../auxiliary/*.cpp")
   dg_igr_add_hdg_cxx17_component(
@@ -103,7 +104,9 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     DG_IGR_HDG_APP_HAS_CPU_RANK2=1
     DG_IGR_HDG_APP_HAS_CUDA_RANK1=$<BOOL:${MFEM_USE_CUDA}>
     DG_IGR_HDG_APP_HAS_CUDA_RANK2=$<BOOL:${MFEM_USE_CUDA}>
-    DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU=$<BOOL:${DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT}>)
+    DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU=$<BOOL:${_dg_igr_hdg_scalar_igr_cpu_app_available}>
+    DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1=$<BOOL:${MFEM_USE_CUDA}>
+    DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2=$<BOOL:${MFEM_USE_CUDA}>)
   target_compile_options(dg_igr_hdg_runtime_app_contract PRIVATE
     $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
   target_link_libraries(dg_igr_hdg_runtime_app_contract
@@ -142,6 +145,26 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     endif()
     list(APPEND _dg_igr_hdg_runtime_app_executable_sources
          ${_dg_igr_hdg_runtime_app_cuda_sources})
+    add_library(dg_igr_hdg_runtime_scalar_cuda_rank2_app OBJECT
+                "${CMAKE_CURRENT_SOURCE_DIR}/app/solver_cuda.cu")
+    target_include_directories(dg_igr_hdg_runtime_scalar_cuda_rank2_app
+                               PRIVATE "${PROJECT_SOURCE_DIR}/include")
+    target_compile_definitions(
+      dg_igr_hdg_runtime_scalar_cuda_rank2_app PRIVATE
+      DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT=1)
+    target_compile_options(dg_igr_hdg_runtime_scalar_cuda_rank2_app PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    target_link_libraries(dg_igr_hdg_runtime_scalar_cuda_rank2_app PRIVATE
+                          dg_igr_hdg_runtime_app_contract
+                          dg_igr_hdg_runtime_cpu dg_igr_hdg_runtime_cuda
+                          dg_igr_hdg_auxiliary_cpu mfem MPI::MPI_CXX)
+    set_target_properties(dg_igr_hdg_runtime_scalar_cuda_rank2_app PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_EXTENSIONS OFF
+      CUDA_ARCHITECTURES 120
+      CUDA_SEPARABLE_COMPILATION ON)
   elseif(_dg_igr_hdg_runtime_app_cuda_sources)
     message(STATUS
             "HDG application CUDA source is reserved but not built by the CPU profile.")
@@ -149,6 +172,10 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
 
   add_executable(dg_igr_hdg_runtime
                  ${_dg_igr_hdg_runtime_app_executable_sources})
+  if(MFEM_USE_CUDA)
+    target_sources(dg_igr_hdg_runtime PRIVATE
+      $<TARGET_OBJECTS:dg_igr_hdg_runtime_scalar_cuda_rank2_app>)
+  endif()
   target_include_directories(dg_igr_hdg_runtime PRIVATE
                              "${PROJECT_SOURCE_DIR}/include")
   target_link_libraries(dg_igr_hdg_runtime PRIVATE

@@ -1,14 +1,23 @@
 #include "numerics/hdg/runtime/app/command_line.hpp"
+#include "numerics/hdg/runtime/app/checkpoint_codec.hpp"
+#include "numerics/hdg/runtime/app/durable_io.hpp"
+#include "sc25_scalar_igr_rank2_manifest.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <type_traits>
 #include <unistd.h>
 #include <vector>
@@ -17,12 +26,18 @@ namespace
 {
 using namespace dg::hdg::runtime;
 using namespace dg::hdg::runtime::app;
+namespace cpu_manifest = dg_igr_hdg_sc25_rank2_manifest;
+namespace cpu_sc25 = cpu_manifest::cpu;
 
 static_assert(__cplusplus == DG_IGR_HDG_RUNTIME_EXPECTED_CPLUSPLUS,
               "CLI test must compile as strict C++17");
 static_assert(!std::is_polymorphic<ParsedCommandLine>::value &&
                   !std::is_polymorphic<ApplicationOptionsView>::value,
               "CLI and configuration use static values");
+
+std::vector<std::string> ScalarArguments(const std::string& backend,
+                                         const std::string& device);
+ParsedCommandLine Parse(std::vector<std::string> values);
 
 bool Check(const bool condition, const char* name)
 {
@@ -42,10 +57,8 @@ struct ScalarVtkField final
   std::array<std::vector<double>, 7> fields;
 };
 
-bool ParseScalarVtk(const char* path, ScalarVtkField& field)
+bool ParseScalarVtk(std::istream& input, ScalarVtkField& field)
 {
-  std::ifstream input(path);
-  if (!input) return false;
   std::vector<std::string> tokens;
   for (std::string token; input >> token;) tokens.push_back(std::move(token));
   const auto find = [](const std::vector<std::string>& values,
@@ -189,6 +202,20 @@ bool ParseScalarVtk(const char* path, ScalarVtkField& field)
   return field.points > 0 && field.cells > 0;
 }
 
+bool ParseScalarVtk(const char* path, ScalarVtkField& field)
+{
+  std::ifstream input(path);
+  return input && ParseScalarVtk(input, field);
+}
+
+bool ParseScalarVtk(const std::vector<std::uint8_t>& bytes,
+                    ScalarVtkField& field)
+{
+  const std::string text(bytes.begin(), bytes.end());
+  std::istringstream input{text};
+  return ParseScalarVtk(input, field);
+}
+
 bool CompareScalarVtk(const char* left_path, const char* right_path,
                       const double tolerance)
 {
@@ -204,15 +231,24 @@ bool CompareScalarVtk(const char* left_path, const char* right_path,
   for (std::size_t index = 0; index < left.coordinates.size(); ++index)
     if (left.coordinates[index] != right.coordinates[index]) return false;
   for (std::size_t component = 0; component < left.fields.size(); ++component)
+  {
+    long double difference_squared = 0.0L;
+    long double reference_squared = 0.0L;
     for (std::size_t index = 0; index < left.points; ++index)
     {
       const double a = left.fields[component][index];
       const double b = right.fields[component][index];
-      const double scale = std::max({1.0, std::abs(a), std::abs(b)});
-      if (!std::isfinite(a) || !std::isfinite(b) ||
-          std::abs(a - b) > tolerance * scale)
-        return false;
+      if (!std::isfinite(a) || !std::isfinite(b)) return false;
+      const long double difference = static_cast<long double>(a) - b;
+      difference_squared += difference * difference;
+      reference_squared += static_cast<long double>(b) * b;
     }
+    const long double difference_norm = std::sqrt(difference_squared);
+    const long double reference_norm = std::sqrt(reference_squared);
+    const long double error = reference_norm == 0.0L
+        ? difference_norm : difference_norm / reference_norm;
+    if (!std::isfinite(error) || error > tolerance) return false;
+  }
   return true;
 }
 
@@ -341,6 +377,618 @@ bool ValidateScalarInitialVtk(const char* path, const double tolerance)
       ScalarNear(field.fields[6][4], -0.00973388369071104, tolerance);
 }
 
+struct CliScalarResourceRecord final
+{
+  StateHash mesh{};
+  StateHash partition{};
+  StateHash topology{};
+  std::array<std::uint8_t, 16> gpu_uuid{};
+  CheckpointDescriptor private_descriptor{};
+  cpu_sc25::Rank2TrajectoryStateHashes raw_field_hashes{};
+  StateHash shard_manifest_hash{};
+  StateHash canonical_manifest_hash{};
+};
+
+struct CliScalarResourceSidecar final
+{
+  std::array<char, 16> magic{{'D','G','I','G','R','-','S','C','2','5','-','R','E','S','1',0}};
+  std::uint32_t version = 1;
+  std::uint32_t rank_count = 0;
+  std::array<CliScalarResourceRecord, 2> ranks{};
+  StateHash checksum{};
+};
+
+static_assert(std::is_trivially_copyable<CliScalarResourceSidecar>::value,
+              "CLI sidecar decoder requires the fixed application layout");
+
+bool ReadCurrentArtifact(const std::filesystem::path& path,
+                         const std::size_t maximum,
+                         std::vector<std::uint8_t>& bytes)
+{
+  std::string diagnostic;
+  return ::dg::hdg::runtime::app::detail::ReadCurrentGenerationArtifact(
+             path, maximum, bytes, diagnostic) == DurableIoStatus::ok;
+}
+
+bool ReadDurableArtifact(const std::filesystem::path& path,
+                         const std::size_t maximum,
+                         std::vector<std::uint8_t>& bytes)
+{
+  std::string detail;
+  return ReadDurableFile(path, maximum, bytes, detail) == DurableIoStatus::ok;
+}
+
+bool DigestIs(const std::vector<std::uint8_t>& bytes,
+              const std::string_view expected)
+{
+  cpu_manifest::Digest digest{};
+  return cpu_manifest::ParseHexDigest(expected, digest) &&
+      cpu_manifest::DigestEqual(
+          ComputeSha256(bytes.data(), bytes.size()), digest);
+}
+
+bool LoadCpuManifests(
+    const std::string_view directory_path, const std::string_view run_id,
+    const std::array<std::string_view, 3>& expected_hashes,
+    std::array<cpu_manifest::CpuReferenceManifest, 2>& manifests)
+{
+  cpu_manifest::DirectoryHandle directory;
+  cpu_manifest::ManifestSetIdentity before{}, after{};
+  if (!directory.Open(directory_path) ||
+      !cpu_manifest::CaptureManifestSetIdentity(directory, before))
+    return false;
+  std::vector<std::uint8_t> complete_bytes;
+  std::array<std::vector<std::uint8_t>, 2> shard_bytes;
+  if (!cpu_manifest::ReadFileAt(
+          directory, cpu_manifest::complete_filename, complete_bytes) ||
+      !cpu_manifest::ReadFileAt(directory, "rank-0.c3m", shard_bytes[0]) ||
+      !cpu_manifest::ReadFileAt(directory, "rank-1.c3m", shard_bytes[1]) ||
+      !DigestIs(complete_bytes, expected_hashes[0]) ||
+      !DigestIs(shard_bytes[0], expected_hashes[1]) ||
+      !DigestIs(shard_bytes[1], expected_hashes[2]))
+    return false;
+  cpu_manifest::CompleteManifest complete{};
+  if (!cpu_manifest::DecodeComplete(
+          complete_bytes, run_id, directory.identity(), complete))
+    return false;
+  for (std::size_t rank = 0; rank < manifests.size(); ++rank)
+  {
+    const auto& entry = complete.shards[rank];
+    if (entry.filename != cpu_manifest::RankFilename(static_cast<int>(rank)) ||
+        entry.bytes != shard_bytes[rank].size() ||
+        !cpu_manifest::DigestEqual(
+            entry.sha256,
+            ComputeSha256(shard_bytes[rank].data(), shard_bytes[rank].size())) ||
+        !cpu_manifest::DecodeCpuManifest(
+            shard_bytes[rank], run_id, complete.executable_sha256,
+            static_cast<int>(rank), directory.identity(), manifests[rank]))
+      return false;
+  }
+  return cpu_manifest::CaptureManifestSetIdentity(directory, after) &&
+      before == after;
+}
+
+bool HandoffPathNegativeControls()
+{
+  const std::string suffix =
+      std::to_string(static_cast<unsigned long long>(::getpid()));
+  const std::filesystem::path root =
+      std::filesystem::path{"/tmp"} / ("dg-igr-hdg-handoff-negative-" + suffix);
+  const std::filesystem::path alias = root.string() + "-alias";
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+  error.clear();
+  std::filesystem::remove(alias, error);
+  error.clear();
+  if (!std::filesystem::create_directory(root, error) || error ||
+      ::chmod(root.c_str(), S_IRWXU) != 0)
+    return false;
+
+  bool valid = false;
+  const std::filesystem::path regular = root / "regular";
+  const std::filesystem::path manifest = root / "rank-0.c3m";
+  {
+    std::ofstream output(regular, std::ios::binary);
+    output << "not-a-manifest";
+  }
+  if (::chmod(regular.c_str(), S_IRUSR | S_IWUSR) == 0)
+  {
+    std::filesystem::create_symlink(regular.filename(), manifest, error);
+    cpu_manifest::DirectoryHandle directory;
+    std::vector<std::uint8_t> bytes;
+    valid = !error && directory.Open(root.string()) &&
+        !cpu_manifest::ReadFileAt(directory, "rank-0.c3m", bytes);
+    std::filesystem::remove(manifest, error);
+    error.clear();
+    valid = valid && ::mkfifo(manifest.c_str(), S_IRUSR | S_IWUSR) == 0 &&
+        !cpu_manifest::ReadFileAt(directory, "rank-0.c3m", bytes);
+    std::filesystem::remove(manifest, error);
+    error.clear();
+    std::filesystem::create_directory_symlink(root, alias, error);
+    cpu_manifest::DirectoryHandle symlinked_directory;
+    valid = valid && !error && !symlinked_directory.Open(alias.string());
+  }
+  std::filesystem::remove(alias, error);
+  error.clear();
+  std::filesystem::remove_all(root, error);
+  return valid && !error;
+}
+
+bool RelativeL2Within(const std::vector<double>& actual,
+                      const std::vector<double>& reference,
+                      const double tolerance)
+{
+  if (actual.size() != reference.size() || actual.empty()) return false;
+  long double difference_squared = 0.0L;
+  long double reference_squared = 0.0L;
+  for (std::size_t index = 0; index < actual.size(); ++index)
+  {
+    if (!std::isfinite(actual[index]) || !std::isfinite(reference[index]))
+      return false;
+    const long double difference =
+        static_cast<long double>(actual[index]) - reference[index];
+    difference_squared += difference * difference;
+    reference_squared += static_cast<long double>(reference[index]) *
+        reference[index];
+  }
+  const long double difference_norm = std::sqrt(difference_squared);
+  const long double reference_norm = std::sqrt(reference_squared);
+  const long double error = reference_norm == 0.0L
+      ? difference_norm : difference_norm / reference_norm;
+  return std::isfinite(error) && error <= tolerance;
+}
+
+double ManifestInteriorCoefficient(
+    const cpu_sc25::PersistentRank2TrajectoryState& state,
+    const int component, const int dof)
+{
+  const int element = dof / 4;
+  const int node = dof % 4;
+  if (component < 4)
+    return state.u[static_cast<std::size_t>(element * 16 + component * 4 + node)];
+  if (component == 4)
+    return state.sigma[static_cast<std::size_t>(element * 4 + node)];
+  return state.z[static_cast<std::size_t>(
+      element * 8 + (component - 5) * 4 + node)];
+}
+
+bool CompareScalarVtkToCpuManifest(
+    const std::filesystem::path& path,
+    const std::array<cpu_manifest::CpuReferenceManifest, 2>& manifests,
+    const int step, const double tolerance,
+    StateHash& artifact_hash)
+{
+  if (step < 0 || step > cpu_sc25::persistent_required_steps) return false;
+  std::vector<std::uint8_t> bytes;
+  ScalarVtkField field;
+  if (!ReadDurableArtifact(path, 32U * 1024U * 1024U, bytes) ||
+      !ParseScalarVtk(bytes, field) || field.points != 256 ||
+      field.cells != 64 || field.connectivity.size() != 256)
+    return false;
+  artifact_hash.bytes = ComputeSha256(bytes.data(), bytes.size());
+  if (artifact_hash == StateHash{}) return false;
+
+  constexpr double root_three = 1.73205080756887729352744634150587236;
+  const double node0 = 0.5 * (1.0 - 1.0 / root_three);
+  const double node1 = 0.5 * (1.0 + 1.0 / root_three);
+  const auto basis = [node0, node1](const int node, const double x)
+  {
+    return node == 0 ? (node1 - x) / (node1 - node0)
+                     : (x - node0) / (node1 - node0);
+  };
+  std::array<std::vector<double>, 7> expected;
+  for (auto& values : expected) values.resize(field.points);
+  for (int ey = 0; ey < 8; ++ey)
+    for (int ex = 0; ex < 8; ++ex)
+    {
+      const int rank = ex < 4 ? 0 : 1;
+      const int local_element = ey * 4 + ex % 4;
+      const auto& record = manifests[static_cast<std::size_t>(rank)]
+                               .steps[static_cast<std::size_t>(step)];
+      if (record.summary.coordinates.step != static_cast<std::uint64_t>(step) ||
+          record.summary.coordinates.generation !=
+              static_cast<std::uint64_t>(step) ||
+          record.summary.coordinates.cursor != static_cast<std::uint64_t>(step))
+        return false;
+      for (int vertex = 0; vertex < 4; ++vertex)
+      {
+        const int vx = vertex == 1 || vertex == 3 ? 1 : 0;
+        const int vy = vertex >= 2 ? 1 : 0;
+        const std::size_t point = static_cast<std::size_t>(4 * (ey * 8 + ex) + vertex);
+        if (field.connectivity[point] !=
+            static_cast<std::uint64_t>(4 * (ey * 8 + ex) +
+                std::array<int, 4>{{0, 1, 3, 2}}[static_cast<std::size_t>(vertex)]))
+          return false;
+        for (int component = 0; component < 7; ++component)
+        {
+          double value = 0.0;
+          for (int jy = 0; jy < 2; ++jy)
+            for (int ix = 0; ix < 2; ++ix)
+              value += ManifestInteriorCoefficient(
+                           record.state, component,
+                           local_element * 4 + 2 * jy + ix) *
+                  basis(ix, static_cast<double>(vx)) *
+                  basis(jy, static_cast<double>(vy));
+          expected[static_cast<std::size_t>(component)][point] = value;
+        }
+      }
+    }
+  for (std::size_t component = 0; component < field.fields.size(); ++component)
+    if (!RelativeL2Within(field.fields[component], expected[component], tolerance))
+      return false;
+  return true;
+}
+
+StateHash HashRanges(const std::initializer_list<std::pair<const double*,
+                                                           std::size_t>>& ranges)
+{
+  Sha256 hash;
+  Sha256Digest digest{};
+  for (const auto& range : ranges)
+    if (!hash.Update(range.first, range.second * sizeof(double))) return {};
+  return hash.Finalize(digest) ? StateHash{digest} : StateHash{};
+}
+
+bool ValidCliSidecar(const CliScalarResourceSidecar& sidecar)
+{
+  const CliScalarResourceSidecar expected{};
+  if (sidecar.magic != expected.magic || sidecar.version != 1 ||
+      sidecar.rank_count != 2 || sidecar.checksum == StateHash{} ||
+      sidecar.checksum.bytes != ComputeSha256(
+          &sidecar, offsetof(CliScalarResourceSidecar, checksum)))
+    return false;
+  for (const auto& record : sidecar.ranks)
+  {
+    if (record.mesh == StateHash{} || record.partition == StateHash{} ||
+        record.topology == StateHash{} ||
+        std::all_of(record.gpu_uuid.begin(), record.gpu_uuid.end(),
+                    [](const std::uint8_t byte) { return byte == 0; }) ||
+        record.shard_manifest_hash == StateHash{} ||
+        record.canonical_manifest_hash == StateHash{} ||
+        record.private_descriptor.rank_count != 2 ||
+        record.private_descriptor.coordinates.step != 10 ||
+        record.private_descriptor.coordinates.generation != 10 ||
+        record.private_descriptor.coordinates.cursor != 10 ||
+        record.private_descriptor.coordinates.time !=
+            10 * cpu_sc25::persistent_dt ||
+        record.private_descriptor.coordinates.dt != cpu_sc25::persistent_dt)
+      return false;
+  }
+  return sidecar.ranks[0].gpu_uuid == sidecar.ranks[1].gpu_uuid &&
+      sidecar.ranks[0].canonical_manifest_hash ==
+          sidecar.ranks[1].canonical_manifest_hash;
+}
+
+bool ValidCliSidecarForConfig(const CliScalarResourceSidecar& sidecar)
+{
+  if (!ValidCliSidecar(sidecar)) return false;
+  const RuntimeTupleDescriptor private_tuple{
+      StableIdentity::Copy(cpu_sc25::projection_id),
+      StableIdentity::Copy(cpu_sc25::object_id),
+      StableIdentity::Copy("DualConservativeScalarTraceV1"),
+      StableIdentity::Copy("W7Tau25.DensityHeightP2.v3"),
+      StableIdentity::Copy("BackwardEulerMonolithicV1"),
+      StableIdentity::Copy("CudaRank2OneGpuHostStaged"),
+      StableIdentity::Copy("Fp64")};
+  for (const auto& record : sidecar.ranks)
+  {
+    const auto& descriptor = record.private_descriptor;
+    const auto& hashes = record.raw_field_hashes;
+    if (descriptor.schema_version != checkpoint_schema_version ||
+        !descriptor.successful_commit ||
+        descriptor.restart_mode !=
+            RestartMode::same_backend_rank_partition ||
+        descriptor.tuple != private_tuple ||
+        descriptor.mfem_pin != StableIdentity::Copy(cpu_manifest::mfem_pin) ||
+        descriptor.mesh_hash != record.mesh ||
+        descriptor.partition_hash != record.partition ||
+        descriptor.topology_hash != record.topology ||
+        descriptor.polynomial_order != 1 ||
+        descriptor.layout != StableIdentity::Copy(
+            "device.field-blocked.U[e][c][a].Sigma[e][a].z[e][c][a].v3") ||
+        descriptor.precision != StableIdentity::Copy("Fp64") ||
+        descriptor.coordinate_fingerprint !=
+            ::dg::hdg::runtime::detail::CoordinateFingerprint(
+                descriptor.coordinates) ||
+        hashes.u == StateHash{} || hashes.sigma == StateHash{} ||
+        hashes.z == StateHash{} || hashes.uhat == StateHash{} ||
+        hashes.sigmahat == StateHash{} || hashes.interior == StateHash{} ||
+        hashes.trace == StateHash{} || hashes.shard == StateHash{})
+      return false;
+  }
+  return true;
+}
+
+PersistentResourceDescriptor CliScalarResources(
+    const CliScalarResourceSidecar& sidecar,
+    const ValidatedApplicationConfig& config)
+{
+  PersistentResourceDescriptor resources{};
+  resources.mfem_pin = StableIdentity::Copy(cpu_manifest::mfem_pin);
+  std::array<StateHash, 2> ordered{};
+  for (std::size_t rank = 0; rank < ordered.size(); ++rank)
+    ordered[rank] = sidecar.ranks[rank].mesh;
+  resources.mesh_hash.bytes = ComputeSha256(ordered.data(), sizeof(ordered));
+  for (std::size_t rank = 0; rank < ordered.size(); ++rank)
+    ordered[rank] = sidecar.ranks[rank].partition;
+  resources.partition_hash.bytes = ComputeSha256(ordered.data(), sizeof(ordered));
+  for (std::size_t rank = 0; rank < ordered.size(); ++rank)
+    ordered[rank] = sidecar.ranks[rank].topology;
+  resources.topology_hash.bytes = ComputeSha256(ordered.data(), sizeof(ordered));
+  resources.rank_count = 2;
+  resources.polynomial_order = config.polynomial_order();
+  resources.layout = StableIdentity::Copy(config.layout_id().view());
+  resources.reuse = {true, true, true, false, 1, 1, 1, 1};
+  return resources;
+}
+
+CheckpointRuntimeIdentityV1 CliScalarRuntimeIdentity(
+    const CliScalarResourceSidecar& sidecar,
+    const PersistentResourceDescriptor& resources)
+{
+  static constexpr char digits[] = "0123456789abcdef";
+  std::string uuid = "GPU-";
+  uuid.resize(36);
+  for (std::size_t index = 0; index < sidecar.ranks[0].gpu_uuid.size(); ++index)
+  {
+    uuid[4 + 2 * index] = digits[sidecar.ranks[0].gpu_uuid[index] >> 4U];
+    uuid[5 + 2 * index] = digits[sidecar.ranks[0].gpu_uuid[index] & 0xfU];
+  }
+  CheckpointRuntimeIdentityV1 identity{};
+  identity.physical_gpu_uuid = StableIdentity::Copy(uuid);
+  identity.ownership_hash = resources.partition_hash;
+  return identity;
+}
+
+std::optional<ValidatedApplicationConfig> ScalarRank2ReaderConfig(
+    const std::string& output_directory, const std::string& checkpoint)
+{
+  std::vector<std::string> arguments = ScalarArguments("cuda", "0");
+  for (std::size_t index = 1; index + 1 < arguments.size(); index += 2)
+  {
+    if (arguments[index] == "--output-dir") arguments[index + 1] = output_directory;
+    if (arguments[index] == "--checkpoint-out") arguments[index + 1] = "none";
+    if (arguments[index] == "--checkpoint-step") arguments[index + 1] = "none";
+    if (arguments[index] == "--stop-after-checkpoint") arguments[index + 1] = "false";
+    if (arguments[index] == "--restart-from") arguments[index + 1] = checkpoint;
+    if (arguments[index] == "--max-retries") arguments[index + 1] = "0";
+    if (arguments[index] == "--inject-failure") arguments[index + 1] = "off";
+  }
+  const ParsedCommandLine parsed = Parse(std::move(arguments));
+  ApplicationOptionsView options = parsed.options;
+  options.backend_id = CudaRank2OneGpuHostStagedBackendTag::id;
+  const ApplicationValidation validation = ValidateApplicationOptions(options);
+  return validation.accepted()
+      ? std::optional<ValidatedApplicationConfig>{*validation.config()}
+      : std::nullopt;
+}
+
+bool CheckDecodedRankAgainstManifest(
+    const std::vector<double>& interior, const std::vector<double>& trace,
+    const cpu_manifest::CpuReferenceManifest& manifest, const int rank,
+    const double tolerance)
+{
+  const auto& state = manifest.steps[10].state;
+  if (interior.size() != 896 || trace.size() != (rank == 0 ? 720U : 560U))
+    return false;
+  for (int component = 0; component < 7; ++component)
+  {
+    std::vector<double> actual(128), reference(128);
+    for (int dof = 0; dof < 128; ++dof)
+    {
+      actual[static_cast<std::size_t>(dof)] =
+          interior[static_cast<std::size_t>(component * 128 + dof)];
+      reference[static_cast<std::size_t>(dof)] =
+          ManifestInteriorCoefficient(state, component, dof);
+    }
+    if (!RelativeL2Within(actual, reference, tolerance)) return false;
+  }
+  const std::size_t nodes = rank == 0 ? 144U : 112U;
+  for (std::size_t component = 0; component < 5; ++component)
+  {
+    std::vector<double> actual(nodes), reference(nodes);
+    for (std::size_t dof = 0; dof < nodes; ++dof)
+    {
+      actual[dof] = trace[component * nodes + dof];
+      reference[dof] = component < 4
+          ? state.uhat[component * nodes + dof]
+          : state.sigmahat[dof];
+    }
+    if (!RelativeL2Within(actual, reference, tolerance)) return false;
+  }
+  return true;
+}
+
+bool CheckDecodedRankHashes(
+    const std::vector<double>& interior, const std::vector<double>& trace,
+    const CliScalarResourceRecord& record)
+{
+  std::vector<double> fields;
+  if (!::dg::hdg::runtime::app::detail::
+           ScalarIgrComponentMajorToFieldBlocksV1(interior, 4, fields) ||
+      fields.size() != 896)
+    return false;
+  const double* const u = fields.data();
+  const double* const sigma = u + 512;
+  const double* const z = sigma + 128;
+  const std::size_t trace_nodes = trace.size() / 5;
+  const double* const uhat = trace.data();
+  const double* const sigmahat = uhat + 4 * trace_nodes;
+  const auto& hashes = record.raw_field_hashes;
+  return hashes.u == HashRanges({{u, 512}}) &&
+      hashes.sigma == HashRanges({{sigma, 128}}) &&
+      hashes.z == HashRanges({{z, 256}}) &&
+      hashes.uhat == HashRanges({{uhat, 4 * trace_nodes}}) &&
+      hashes.sigmahat == HashRanges({{sigmahat, trace_nodes}}) &&
+      hashes.interior == HashRanges({{u, 512}, {sigma, 128}, {z, 256}}) &&
+      hashes.trace == HashRanges({{uhat, 4 * trace_nodes},
+                                  {sigmahat, trace_nodes}}) &&
+      hashes.shard == HashRanges({{u, 512}, {sigma, 128}, {z, 256},
+                                  {uhat, 4 * trace_nodes},
+                                  {sigmahat, trace_nodes}}) &&
+      record.private_descriptor.interior_hash == hashes.interior &&
+      record.private_descriptor.trace_hash == hashes.trace;
+}
+
+bool ValidateScalarRank2Artifacts(
+    const std::array<std::string_view, 3>& handoff,
+    const std::string_view run_id,
+    const std::array<std::string_view, 3>& expected_hashes,
+    const std::filesystem::path& output_directory,
+    const std::filesystem::path& checkpoint)
+{
+  std::array<cpu_manifest::CpuReferenceManifest, 2> manifests{};
+  if (!LoadCpuManifests(handoff[0], run_id, expected_hashes, manifests))
+    return false;
+  StateHash vtk0{}, vtk10{};
+  if (!CompareScalarVtkToCpuManifest(
+          output_directory / "state-step-000000.vtk", manifests, 0, 1.0e-10,
+          vtk0) ||
+      !CompareScalarVtkToCpuManifest(
+          output_directory / "state-step-000010.vtk", manifests, 10, 1.0e-10,
+          vtk10))
+    return false;
+
+  if (checkpoint == "none")
+  {
+    StateHash vtk20{};
+    std::vector<std::uint8_t> metadata_bytes;
+    if (!CompareScalarVtkToCpuManifest(
+            output_directory / "state-step-000020.vtk", manifests, 20,
+            1.0e-10, vtk20) ||
+        !ReadCurrentArtifact(output_directory / "run-metadata.json",
+                             1024U * 1024U, metadata_bytes))
+      return false;
+    const StateHash metadata_hash{
+        ComputeSha256(metadata_bytes.data(), metadata_bytes.size())};
+    if (metadata_hash == StateHash{}) return false;
+    std::cout << "SCALAR_RANK2_TRAJECTORY_BINDING_PASS"
+              << " vtk0_sha256=" << cpu_manifest::Hex(vtk0.bytes)
+              << " vtk10_sha256=" << cpu_manifest::Hex(vtk10.bytes)
+              << " vtk20_sha256=" << cpu_manifest::Hex(vtk20.bytes)
+              << " metadata_sha256="
+              << cpu_manifest::Hex(metadata_hash.bytes) << '\n';
+    return true;
+  }
+
+  std::vector<std::uint8_t> checkpoint_bytes, sidecar_bytes, metadata_bytes;
+  if (!ReadCurrentArtifact(checkpoint, 64U * 1024U * 1024U,
+                           checkpoint_bytes) ||
+      !ReadCurrentArtifact(output_directory / "checkpoint-runtime-identity.v1",
+                           sizeof(CliScalarResourceSidecar), sidecar_bytes) ||
+      sidecar_bytes.size() != sizeof(CliScalarResourceSidecar) ||
+      !ReadCurrentArtifact(output_directory / "run-metadata-checkpoint.json",
+                           1024U * 1024U, metadata_bytes))
+    return false;
+  CliScalarResourceSidecar sidecar{};
+  std::memcpy(&sidecar, sidecar_bytes.data(), sizeof(sidecar));
+  const auto config = ScalarRank2ReaderConfig(
+      output_directory.string(), checkpoint.string());
+  if (!config || !ValidCliSidecarForConfig(sidecar)) return false;
+  const PersistentResourceDescriptor resources =
+      CliScalarResources(sidecar, *config);
+  const CheckpointRuntimeIdentityV1 runtime =
+      CliScalarRuntimeIdentity(sidecar, resources);
+  ScenarioCoefficientExtentsV1 extents{};
+  if (!DeriveScenarioCoefficientExtentsV1(*config, 2, extents) ||
+      extents.interior_component_count != 7 ||
+      extents.trace_component_count != 5)
+    return false;
+  std::array<std::vector<double>, 2> interiors, traces;
+  std::array<RankStateBufferV1, 2> buffers{};
+  for (std::size_t rank = 0; rank < buffers.size(); ++rank)
+  {
+    const auto& shape = extents.ranks[rank];
+    interiors[rank].resize(shape.interior_coefficient_count);
+    traces[rank].resize(shape.trace_coefficient_count);
+    buffers[rank] = {
+        static_cast<std::uint32_t>(rank),
+        {interiors[rank].data(), interiors[rank].size(), interiors[rank].size(),
+         7, shape.interior_dofs_per_component,
+         CoefficientOrderingV1::component_major},
+        {traces[rank].data(), traces[rank].size(), traces[rank].size(), 5,
+         shape.trace_dofs_per_component,
+         CoefficientOrderingV1::component_major}};
+  }
+  DecodedCheckpointMetadataV1 metadata{};
+  if (DecodeCheckpointV1(
+          {checkpoint_bytes.data(), checkpoint_bytes.size()}, *config,
+          resources, runtime, buffers.data(), buffers.size(), metadata) !=
+          CheckpointCodecStatus::ok ||
+      metadata.rank_count != 2 || metadata.descriptor.coordinates.step != 10 ||
+      metadata.descriptor.coordinates.generation != 10 ||
+      metadata.descriptor.coordinates.cursor != 10 ||
+      metadata.aggregate_interior_coefficients != 1792 ||
+      metadata.aggregate_true_trace_coefficients != 1280)
+    return false;
+  for (std::size_t rank = 0; rank < buffers.size(); ++rank)
+    if (buffers[rank].rank != rank ||
+        buffers[rank].interior.ordering !=
+            CoefficientOrderingV1::component_major ||
+        buffers[rank].owned_true_trace.ordering !=
+            CoefficientOrderingV1::component_major ||
+        !CheckDecodedRankAgainstManifest(interiors[rank], traces[rank],
+                                         manifests[rank],
+                                         static_cast<int>(rank), 1.0e-10) ||
+        !CheckDecodedRankHashes(interiors[rank], traces[rank],
+                                sidecar.ranks[rank]))
+      return false;
+  const StateHash checkpoint_hash{
+      ComputeSha256(checkpoint_bytes.data(), checkpoint_bytes.size())};
+  const StateHash sidecar_hash{
+      ComputeSha256(sidecar_bytes.data(), sidecar_bytes.size())};
+  const StateHash metadata_hash{
+      ComputeSha256(metadata_bytes.data(), metadata_bytes.size())};
+  if (checkpoint_hash == StateHash{} || sidecar_hash == StateHash{} ||
+      metadata_hash == StateHash{})
+    return false;
+  std::cout << "SCALAR_RANK2_ARTIFACT_BINDING_PASS"
+            << " vtk0_sha256=" << cpu_manifest::Hex(vtk0.bytes)
+            << " vtk10_sha256=" << cpu_manifest::Hex(vtk10.bytes)
+            << " checkpoint_sha256=" << cpu_manifest::Hex(checkpoint_hash.bytes)
+            << " sidecar_sha256=" << cpu_manifest::Hex(sidecar_hash.bytes)
+            << " metadata_sha256=" << cpu_manifest::Hex(metadata_hash.bytes)
+            << '\n';
+  return true;
+}
+
+bool MakeScalarSidecarNegative(const std::filesystem::path& source,
+                               const std::filesystem::path& destination,
+                               const std::string_view kind)
+{
+  std::vector<std::uint8_t> checkpoint, sidecar_bytes;
+  if (!ReadCurrentArtifact(source / "restart-checkpoint.v2",
+                           64U * 1024U * 1024U, checkpoint) ||
+      !ReadCurrentArtifact(source / "checkpoint-runtime-identity.v1",
+                           sizeof(CliScalarResourceSidecar), sidecar_bytes) ||
+      sidecar_bytes.size() != sizeof(CliScalarResourceSidecar))
+    return false;
+  CliScalarResourceSidecar sidecar{};
+  std::memcpy(&sidecar, sidecar_bytes.data(), sizeof(sidecar));
+  if (!ValidCliSidecar(sidecar)) return false;
+  if (kind == "count-zero") sidecar.rank_count = 0;
+  else if (kind == "count-three") sidecar.rank_count = 3;
+  else if (kind == "count-maximum")
+    sidecar.rank_count = std::numeric_limits<std::uint32_t>::max();
+  else if (kind == "checksum") sidecar.checksum.bytes[0] ^= 1U;
+  else if (kind == "shape") sidecar.ranks[0].private_descriptor.rank_count = 1;
+  else return false;
+  if (kind != "checksum")
+    sidecar.checksum.bytes = ComputeSha256(
+        &sidecar, offsetof(CliScalarResourceSidecar, checksum));
+  const auto* const first = reinterpret_cast<const std::uint8_t*>(&sidecar);
+  sidecar_bytes.assign(first, first + sizeof(sidecar));
+  std::string detail;
+  DurableGenerationTransactionV1 transaction;
+  return CreateDurableDirectory(destination, detail) == DurableIoStatus::ok &&
+      transaction.Begin(destination, 10, detail) == DurableIoStatus::ok &&
+      transaction.Stage("restart-checkpoint.v2", checkpoint.data(),
+                        checkpoint.size(), detail) == DurableIoStatus::ok &&
+      transaction.Stage("checkpoint-runtime-identity.v1", sidecar_bytes.data(),
+                        sidecar_bytes.size(), detail) == DurableIoStatus::ok &&
+      transaction.Publish(detail) == DurableIoStatus::ok;
+}
+
 std::vector<std::string> SmokeArguments()
 {
   return {"dg_igr_hdg_runtime",
@@ -390,6 +1038,14 @@ std::vector<std::string> ScalarArguments(const std::string& backend,
       "--max-retries", "1", "--inject-failure",
       "AfterRecoveryBeforeCommit:7:0", "--seed",
       "0x5738425343323553"};
+}
+
+void SetOption(std::vector<std::string>& arguments,
+               const std::string& option, const std::string& value)
+{
+  const auto found = std::find(arguments.begin(), arguments.end(), option);
+  if (found != arguments.end() && found + 1 != arguments.end())
+    *(found + 1) = value;
 }
 
 ParsedCommandLine Parse(std::vector<std::string> values)
@@ -469,9 +1125,97 @@ bool DirectAndNegativeControls()
                  "scalar_igr_default_build_unavailable") && passed;
 #endif
   const ParsedCommandLine scalar_cuda = Parse(ScalarArguments("cuda", "0"));
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1
+  passed = Check(scalar_cuda.status == CommandLineStatus::run &&
+                     scalar_cuda.options.backend_id ==
+                         CudaRank1OneGpuBackendTag::id,
+                 "scalar_igr_cuda_static_cli") && passed;
+#else
   passed = Check(scalar_cuda.status == CommandLineStatus::rejected &&
                      scalar_cuda.rejection == ApplicationRejection::unbuilt_backend,
                  "scalar_igr_cuda_explicit_unbuilt") && passed;
+#endif
+  auto scalar_cuda_fault_free_arguments = ScalarArguments("cuda", "0");
+  SetOption(scalar_cuda_fault_free_arguments, "--max-retries", "0");
+  SetOption(scalar_cuda_fault_free_arguments, "--inject-failure", "off");
+  const ParsedCommandLine scalar_cuda_fault_free =
+      Parse(scalar_cuda_fault_free_arguments);
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1
+  passed = Check(scalar_cuda_fault_free.status == CommandLineStatus::run &&
+                     scalar_cuda_fault_free.options.injection.mode ==
+                         FailureInjectionModeV1::off &&
+                     scalar_cuda_fault_free.options.retry_limit == 0,
+                 "scalar_cuda_fault_free_cli_contract") && passed;
+  for (const std::string phase :
+       {"CheckpointStaging", "OutputStaging",
+        "AfterRecoveryBeforeCommit"})
+  {
+    auto scheduled_arguments = ScalarArguments("cuda", "0");
+    SetOption(scheduled_arguments, "--inject-failure",
+              phase + ":10:0");
+    const ParsedCommandLine scheduled = Parse(scheduled_arguments);
+    passed = Check(scheduled.status == CommandLineStatus::run &&
+                       scheduled.options.backend_id ==
+                           CudaRank1OneGpuBackendTag::id &&
+                       scheduled.options.injection.target_step == 10 &&
+                       scheduled.options.injection.source_rank == 0,
+                   "scalar_cuda_rank1_step10_cli_contract") && passed;
+  }
+  auto terminal_arguments = ScalarArguments("cuda", "0");
+  SetOption(terminal_arguments, "--max-retries", "0");
+  SetOption(terminal_arguments, "--inject-failure",
+            "AfterRecoveryBeforeCommit:20:0");
+  const ParsedCommandLine terminal = Parse(terminal_arguments);
+  auto terminal_writer_arguments = terminal_arguments;
+  SetOption(terminal_writer_arguments, "--stop-after-checkpoint", "true");
+  const ParsedCommandLine terminal_writer = Parse(terminal_writer_arguments);
+  passed = Check(terminal.status == CommandLineStatus::run &&
+                     terminal.options.backend_id ==
+                         CudaRank1OneGpuBackendTag::id &&
+                     terminal.options.injection.target_step == 20 &&
+                     terminal.options.retry_limit == 0 &&
+                     terminal_writer.status == CommandLineStatus::rejected &&
+                     terminal_writer.rejection ==
+                         ApplicationRejection::invalid_run_role,
+                 "scalar_cuda_rank1_step20_cli_contract") && passed;
+#endif
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
+  for (const std::string phase :
+       {"CheckpointStaging", "OutputStaging",
+        "AfterRecoveryBeforeCommit"})
+  {
+    auto scheduled_arguments = ScalarArguments("cuda", "0");
+    SetOption(scheduled_arguments, "--inject-failure",
+              phase + ":10:1");
+    const ParsedCommandLine scheduled = Parse(scheduled_arguments);
+    passed = Check(scheduled.status == CommandLineStatus::run &&
+                       scheduled.options.backend_id ==
+                           CudaRank2OneGpuHostStagedBackendTag::id &&
+                       scheduled.options.injection.target_step == 10 &&
+                       scheduled.options.injection.source_rank == 1,
+                   "scalar_cuda_rank2_step10_cli_fallback") && passed;
+  }
+  auto rank2_terminal_arguments = ScalarArguments("cuda", "0");
+  SetOption(rank2_terminal_arguments, "--max-retries", "0");
+  SetOption(rank2_terminal_arguments, "--inject-failure",
+            "AfterRecoveryBeforeCommit:20:1");
+  const ParsedCommandLine rank2_terminal = Parse(rank2_terminal_arguments);
+  auto rank2_terminal_writer_arguments = rank2_terminal_arguments;
+  SetOption(rank2_terminal_writer_arguments, "--stop-after-checkpoint",
+            "true");
+  const ParsedCommandLine rank2_terminal_writer =
+      Parse(rank2_terminal_writer_arguments);
+  passed = Check(rank2_terminal.status == CommandLineStatus::run &&
+                     rank2_terminal.options.backend_id ==
+                         CudaRank2OneGpuHostStagedBackendTag::id &&
+                     rank2_terminal.options.injection.target_step == 20 &&
+                     rank2_terminal.options.retry_limit == 0 &&
+                     rank2_terminal_writer.status ==
+                         CommandLineStatus::rejected &&
+                     rank2_terminal_writer.rejection ==
+                         ApplicationRejection::invalid_run_role,
+                 "scalar_cuda_rank2_step20_cli_fallback") && passed;
+#endif
   auto scalar_h1_args = ScalarArguments("cpu", "none");
   scalar_h1_args[6] = "h1";
   const ParsedCommandLine scalar_h1 = Parse(scalar_h1_args);
@@ -521,6 +1265,19 @@ bool HelpAndConfig()
 
 int main(const int argc, const char* const* argv)
 {
+  if (argc == 9 &&
+      std::string{argv[1]} == "--validate-scalar-rank2-artifacts")
+  {
+    const bool valid = ValidateScalarRank2Artifacts(
+        {{argv[2], {}, {}}}, argv[3], {{argv[4], argv[5], argv[6]}},
+        argv[7], argv[8]);
+    return valid ? 0 : 1;
+  }
+  if (argc == 5 &&
+      std::string{argv[1]} == "--make-scalar-sidecar-negative")
+  {
+    return MakeScalarSidecarNegative(argv[2], argv[3], argv[4]) ? 0 : 1;
+  }
   if (argc == 5 && std::string{argv[1]} == "--compare-scalar-vtk")
   {
     double tolerance = 0.0;
@@ -542,7 +1299,8 @@ int main(const int argc, const char* const* argv)
     return valid ? 0 : 1;
   }
   if (argc != 1) return 64;
-  const bool passed = DirectAndNegativeControls() && HelpAndConfig();
+  const bool passed = DirectAndNegativeControls() && HelpAndConfig() &&
+      Check(HandoffPathNegativeControls(), "handoff_path_negative_controls");
   if (passed) std::cout << "HDG runtime CLI contract PASS\n";
   return passed ? 0 : 1;
 }

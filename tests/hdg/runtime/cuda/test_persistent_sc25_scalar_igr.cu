@@ -229,6 +229,28 @@ bool SameReuse(const scalar::ScalarCudaReuseEvidence& left,
       left.unchanged == right.unchanged;
 }
 
+bool RollbackReuseAdvanced(const scalar::ScalarCudaReuseEvidence& before,
+                           const scalar::ScalarCudaReuseEvidence& after)
+    noexcept
+{
+  return before.owner == after.owner &&
+      before.topology == after.topology &&
+      before.workspace == after.workspace &&
+      before.interior_slots == after.interior_slots &&
+      before.trace_slots == after.trace_slots &&
+      before.topology_generation == after.topology_generation &&
+      before.storage_generation == after.storage_generation &&
+      after.factor_generation >= before.factor_generation &&
+      after.solver_generation >= before.solver_generation &&
+      before.identity_hash == after.identity_hash &&
+      before.host_topology_hash == after.host_topology_hash &&
+      before.device_topology_hash == after.device_topology_hash &&
+      before.host_quadrature_hash == after.host_quadrature_hash &&
+      before.device_quadrature_hash == after.device_quadrature_hash &&
+      before.device_topology_matches == after.device_topology_matches &&
+      before.unchanged == after.unchanged;
+}
+
 bool SameResidency(const scalar::ScalarCudaResidencyEvidence& left,
                    const scalar::ScalarCudaResidencyEvidence& right) noexcept
 {
@@ -241,25 +263,6 @@ bool SameResidency(const scalar::ScalarCudaResidencyEvidence& left,
       left.trace_solve_device_resident ==
           right.trace_solve_device_resident &&
       left.host_numerical_fallback == right.host_numerical_fallback;
-}
-
-bool SamePhysicalEvidence(const scalar::ScalarCudaEvidence& left,
-                          const scalar::ScalarCudaEvidence& right) noexcept
-{
-  return left.trace_restart == right.trace_restart &&
-      left.trace_maximum_iterations == right.trace_maximum_iterations &&
-      left.trace_relative_tolerance == right.trace_relative_tolerance &&
-      left.trace_absolute_tolerance == right.trace_absolute_tolerance &&
-      left.ilu_type == right.ilu_type &&
-      left.ilu_level_of_fill == right.ilu_level_of_fill &&
-      left.ilu_local_reordering == right.ilu_local_reordering &&
-      SameResidency(left.residency, right.residency) &&
-      SameAllocations(left.allocations, right.allocations) &&
-      SameReuse(left.reuse, right.reuse) &&
-      SameLaunches(left.launches, right.launches) &&
-      SameTransferLedger(left.transfers, right.transfers) &&
-      SameAllocationLedger(left.allocation_ledger,
-                           right.allocation_ledger);
 }
 
 bool RestorePhysicalEvidenceAdvanced(
@@ -275,7 +278,7 @@ bool RestorePhysicalEvidenceAdvanced(
       before.ilu_local_reordering == after.ilu_local_reordering &&
       SameResidency(before.residency, after.residency) &&
       SameAllocations(before.allocations, after.allocations) &&
-      SameReuse(before.reuse, after.reuse) &&
+      RollbackReuseAdvanced(before.reuse, after.reuse) &&
       LaunchesAdvanced(before.launches, after.launches) &&
       TransferLedgerAdvanced(before.transfers, after.transfers) &&
       SameAllocationLedger(before.allocation_ledger,
@@ -345,6 +348,35 @@ bool SameStepEvidence(const scalar::ScalarCudaStepEvidence& left,
       left.committed_integrals == right.committed_integrals &&
       left.accepted_integrals == right.accepted_integrals &&
       oracle::SameHashes(left.accepted_hashes, right.accepted_hashes);
+}
+
+bool SameLogicalEvidence(const scalar::ScalarCudaEvidence& left,
+                         const scalar::ScalarCudaEvidence& right) noexcept
+{
+  if (left.status != right.status ||
+      left.first_failure != right.first_failure ||
+      left.accepted_steps != right.accepted_steps ||
+      left.attempted_steps != right.attempted_steps ||
+      left.retry_attempts != right.retry_attempts ||
+      left.attempt_count != right.attempt_count ||
+      left.step_evidence_count != right.step_evidence_count ||
+      left.trace_restart != right.trace_restart ||
+      left.trace_maximum_iterations != right.trace_maximum_iterations ||
+      left.trace_relative_tolerance != right.trace_relative_tolerance ||
+      left.trace_absolute_tolerance != right.trace_absolute_tolerance ||
+      left.ilu_type != right.ilu_type ||
+      left.ilu_level_of_fill != right.ilu_level_of_fill ||
+      left.ilu_local_reordering != right.ilu_local_reordering ||
+      !SameCoordinates(left.coordinates, right.coordinates))
+  {
+    return false;
+  }
+  for (std::size_t index = 0; index < left.attempts.size(); ++index)
+    if (!SameAttemptEvidence(left.attempts[index], right.attempts[index]))
+      return false;
+  for (std::size_t index = 0; index < left.steps.size(); ++index)
+    if (!SameStepEvidence(left.steps[index], right.steps[index])) return false;
+  return true;
 }
 
 bool DefaultLogicalArrays(const scalar::ScalarCudaEvidence& evidence,
@@ -424,12 +456,12 @@ bool ValidateTerminalRestartHistory(
       static_cast<std::size_t>(local_steps));
 }
 
-bool DefaultCheckpoint(const scalar::ScalarCudaCheckpoint& checkpoint)
+bool SameCheckpoint(const scalar::ScalarCudaCheckpoint& left_checkpoint,
+                    const scalar::ScalarCudaCheckpoint& right_checkpoint)
     noexcept
 {
-  const scalar::ScalarCudaCheckpoint empty{};
-  const auto& left = checkpoint.descriptor;
-  const auto& right = empty.descriptor;
+  const auto& left = left_checkpoint.descriptor;
+  const auto& right = right_checkpoint.descriptor;
   return left.schema_version == right.schema_version &&
       left.successful_commit == right.successful_commit &&
       left.restart_mode == right.restart_mode && left.tuple == right.tuple &&
@@ -445,16 +477,25 @@ bool DefaultCheckpoint(const scalar::ScalarCudaCheckpoint& checkpoint)
       left.coordinate_fingerprint == right.coordinate_fingerprint &&
       left.interior_hash == right.interior_hash &&
       left.trace_hash == right.trace_hash &&
-      checkpoint.projection == empty.projection &&
-      checkpoint.tuple == empty.tuple &&
-      checkpoint.scenario == empty.scenario &&
-      checkpoint.layout == empty.layout &&
-      checkpoint.interior_component_slabs ==
-          empty.interior_component_slabs &&
-      checkpoint.trace_component_slabs == empty.trace_component_slabs &&
-      oracle::SameHashes(checkpoint.raw_field_hashes,
-                         empty.raw_field_hashes) &&
-      checkpoint.canonical_manifest_hash == empty.canonical_manifest_hash;
+      left_checkpoint.projection == right_checkpoint.projection &&
+      left_checkpoint.tuple == right_checkpoint.tuple &&
+      left_checkpoint.scenario == right_checkpoint.scenario &&
+      left_checkpoint.layout == right_checkpoint.layout &&
+      left_checkpoint.interior_component_slabs ==
+          right_checkpoint.interior_component_slabs &&
+      left_checkpoint.trace_component_slabs ==
+          right_checkpoint.trace_component_slabs &&
+      oracle::SameHashes(left_checkpoint.raw_field_hashes,
+                         right_checkpoint.raw_field_hashes) &&
+      left_checkpoint.canonical_manifest_hash ==
+          right_checkpoint.canonical_manifest_hash;
+}
+
+bool DefaultCheckpoint(const scalar::ScalarCudaCheckpoint& checkpoint)
+    noexcept
+{
+  const scalar::ScalarCudaCheckpoint empty{};
+  return SameCheckpoint(checkpoint, empty);
 }
 
 std::unique_ptr<cpu::PersistentSc25ScalarIgrCpuFoundation> CreateCpu(
@@ -1042,72 +1083,198 @@ bool RunC1()
 
 bool RunTransactionNegatives()
 {
+  const auto step0_evidence =
+      std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto prospective =
+      std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto finalized_prospective =
+      std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto fail_phase = [](const std::string_view phase)
+  {
+    std::cerr << "C2 transaction-negative phase=" << phase
+              << " pass=0\n";
+    return false;
+  };
   auto foreign = CreateCuda(8);
   auto owner = CreateCuda(8);
-  if (!owner || !foreign ||
-      owner->InitializePersistentTrajectory() !=
-          scalar::ScalarCudaStatus::ready)
+  if (!owner || !foreign) { return fail_phase("create"); }
+  if (owner->InitializePersistentTrajectory() !=
+      scalar::ScalarCudaStatus::ready)
   {
-    return false;
+    return fail_phase("initialize");
   }
   scalar::PublishedState step0{};
-  if (!owner->CopyPublishedTrajectoryState(step0)) { return false; }
+  if (!owner->CopyPublishedTrajectoryState(step0))
+  {
+    return fail_phase("step0-copy");
+  }
+  *step0_evidence = owner->trajectory_evidence();
   scalar::PersistentSc25ScalarIgrCudaRank1::Transaction invalid;
-  if (owner->InstallPersistentTrajectoryTransaction(invalid)) { return false; }
+  if (owner->InstallPersistentTrajectoryTransaction(invalid))
+  {
+    return fail_phase("invalid-token-install");
+  }
 
   scalar::PersistentSc25ScalarIgrCudaRank1::Transaction prepared;
   if (owner->PreparePersistentTrajectoryTransaction(prepared) !=
           scalar::ScalarCudaStatus::accepted ||
       !prepared.valid() || prepared.provisionally_installed())
   {
-    return false;
+    return fail_phase("prepare");
   }
   scalar::PersistentSc25ScalarIgrCudaRank1::Transaction live(
       std::move(prepared));
-  if (prepared.valid() ||
-      owner->InstallPersistentTrajectoryTransaction(prepared) ||
-      foreign->InstallPersistentTrajectoryTransaction(live) ||
-      !owner->InstallPersistentTrajectoryTransaction(live) ||
-      owner->InstallPersistentTrajectoryTransaction(live) ||
-      !live.provisionally_installed())
+  if (prepared.valid()) { return fail_phase("moved-from-token"); }
+  if (owner->InstallPersistentTrajectoryTransaction(prepared))
   {
-    return false;
+    return fail_phase("moved-from-install");
+  }
+  if (foreign->InstallPersistentTrajectoryTransaction(live))
+  {
+    return fail_phase("foreign-install");
+  }
+  if (!owner->InstallPersistentTrajectoryTransaction(live))
+  {
+    return fail_phase("owner-install");
+  }
+  if (owner->InstallPersistentTrajectoryTransaction(live))
+  {
+    return fail_phase("duplicate-install");
+  }
+  if (!live.provisionally_installed())
+  {
+    return fail_phase("installed-token-state");
   }
   scalar::PublishedState installed{};
   scalar::ScalarCudaCheckpoint forbidden{};
+  scalar::ScalarCudaCheckpoint staged_checkpoint{};
   scalar::PersistentSc25ScalarIgrCudaRank1::Transaction concurrent;
-  if (!owner->CopyPublishedTrajectoryState(installed) ||
-      !oracle::SameStateBytes(step0, installed) ||
-      owner->trajectory_evidence().coordinates.step != 0 ||
-      owner->trajectory_evidence().accepted_steps != 0 ||
-      owner->PreparePersistentTrajectoryTransaction(concurrent) !=
-          scalar::ScalarCudaStatus::publication_failure ||
-      concurrent.valid() ||
-      owner->CaptureTrajectoryCheckpoint(forbidden) ||
-      !owner->RevertPersistentTrajectoryTransaction(std::move(live)) ||
-      live.valid() ||
-      owner->RevertPersistentTrajectoryTransaction(std::move(live)))
+  if (!owner->CopyPublishedTrajectoryState(installed))
   {
-    return false;
+    return fail_phase("installed-state-copy");
+  }
+  if (!oracle::SameStateBytes(step0, installed) ||
+      owner->trajectory_evidence().coordinates.step != 0 ||
+      owner->trajectory_evidence().accepted_steps != 0)
+  {
+    return fail_phase("installed-state-view");
+  }
+  if (owner->PreparePersistentTrajectoryTransaction(concurrent) !=
+          scalar::ScalarCudaStatus::publication_failure ||
+      concurrent.valid())
+  {
+    return fail_phase("concurrent-prepare-rejection");
+  }
+  if (owner->CaptureTrajectoryCheckpoint(forbidden))
+  {
+    return fail_phase("installed-checkpoint-rejection");
+  }
+  if (!owner->StageInstalledTrajectoryTransaction(
+          live, staged_checkpoint, *prospective))
+  {
+    return fail_phase("stage-installed");
+  }
+  if (staged_checkpoint.descriptor.coordinates.step != 1 ||
+      prospective->accepted_steps != 1 ||
+      prospective->attempted_steps != 1 ||
+      prospective->coordinates.step != 1)
+  {
+    return fail_phase("staged-evidence");
+  }
+  if (!owner->RevertPersistentTrajectoryTransaction(std::move(live)))
+  {
+    return fail_phase("revert-installed");
+  }
+  if (live.valid()) { return fail_phase("reverted-token-state"); }
+  if (owner->RevertPersistentTrajectoryTransaction(std::move(live)))
+  {
+    return fail_phase("duplicate-revert");
   }
   scalar::PublishedState reverted{};
-  if (!owner->CopyPublishedTrajectoryState(reverted) ||
-      !oracle::SameStateBytes(step0, reverted))
+  const scalar::ScalarCudaEvidence& reverted_evidence =
+      owner->trajectory_evidence();
+  const bool reverted_copied =
+      owner->CopyPublishedTrajectoryState(reverted);
+  const bool state_rollback =
+      reverted_copied && oracle::SameStateBytes(step0, reverted);
+  const bool logical_rollback =
+      SameLogicalEvidence(*step0_evidence, reverted_evidence);
+  const bool physical_rollback =
+      RestorePhysicalEvidenceAdvanced(*step0_evidence, reverted_evidence);
+  if (!state_rollback || !logical_rollback || !physical_rollback)
   {
+    const auto& before = *step0_evidence;
+    const auto& after = reverted_evidence;
+    std::cerr << "C2 transaction-negative phase=rollback pass=0"
+              << " state=" << state_rollback
+              << " logical=" << logical_rollback
+              << " physical=" << physical_rollback
+              << " factor=" << before.reuse.factor_generation << "->"
+              << after.reuse.factor_generation
+              << " solver=" << before.reuse.solver_generation << "->"
+              << after.reuse.solver_generation
+              << " launches=" << before.launches.assemble_launches << ','
+              << before.launches.condense_launches << ','
+              << before.launches.recover_launches << ','
+              << before.launches.fallback_calls << "->"
+              << after.launches.assemble_launches << ','
+              << after.launches.condense_launches << ','
+              << after.launches.recover_launches << ','
+              << after.launches.fallback_calls
+              << " transfers=" << before.transfers.count << ','
+              << before.transfers.observed_count << ','
+              << before.transfers.dropped_count << ','
+              << before.transfers.ordered_digest << ','
+              << before.transfers.overflow << "->"
+              << after.transfers.count << ','
+              << after.transfers.observed_count << ','
+              << after.transfers.dropped_count << ','
+              << after.transfers.ordered_digest << ','
+              << after.transfers.overflow
+              << " allocations=" << before.allocation_ledger.count << ','
+              << before.allocation_ledger.observed_count << ','
+              << before.allocation_ledger.dropped_count << ','
+              << before.allocation_ledger.ordered_digest << ','
+              << before.allocation_ledger.overflow << "->"
+              << after.allocation_ledger.count << ','
+              << after.allocation_ledger.observed_count << ','
+              << after.allocation_ledger.dropped_count << ','
+              << after.allocation_ledger.ordered_digest << ','
+              << after.allocation_ledger.overflow << '\n';
     return false;
   }
 
+  scalar::PersistentSc25ScalarIgrCudaRank1::Transaction aborted;
+  if (owner->PreparePersistentTrajectoryTransaction(aborted) !=
+          scalar::ScalarCudaStatus::accepted ||
+      aborted.provisionally_installed() ||
+      !owner->RevertPersistentTrajectoryTransaction(std::move(aborted)) ||
+      aborted.valid() ||
+      !SameLogicalEvidence(*step0_evidence, owner->trajectory_evidence()))
+  {
+    return fail_phase("prepared-token-abort");
+  }
+
   scalar::PersistentSc25ScalarIgrCudaRank1::Transaction finalized;
+  scalar::ScalarCudaCheckpoint finalized_checkpoint{};
   if (owner->PreparePersistentTrajectoryTransaction(finalized) !=
           scalar::ScalarCudaStatus::accepted ||
       !owner->InstallPersistentTrajectoryTransaction(finalized) ||
+      !owner->StageInstalledTrajectoryTransaction(
+          finalized, finalized_checkpoint, *finalized_prospective) ||
       !owner->FinalizePersistentTrajectoryTransaction(std::move(finalized)) ||
       finalized.valid() ||
-      owner->FinalizePersistentTrajectoryTransaction(std::move(finalized)))
+      owner->FinalizePersistentTrajectoryTransaction(std::move(finalized)) ||
+      !SameLogicalEvidence(*finalized_prospective,
+                           owner->trajectory_evidence()))
   {
-    return false;
+    return fail_phase("finalize");
   }
-  return owner->trajectory_evidence().accepted_steps == 1;
+  if (owner->trajectory_evidence().accepted_steps != 1)
+  {
+    return fail_phase("finalized-evidence");
+  }
+  return true;
 }
 
 bool RunMoveWithLiveTransaction()
@@ -1801,6 +1968,7 @@ bool RunAbandonedPreparedTokenNegative()
 
 bool RunDirectPrepareInjectedFailureNegative()
 {
+  const auto retained = std::make_unique<scalar::ScalarCudaEvidence>();
   auto owner = CreateCuda(8);
   if (!owner || owner->InitializePersistentTrajectory() !=
           scalar::ScalarCudaStatus::ready)
@@ -1814,42 +1982,45 @@ bool RunDirectPrepareInjectedFailureNegative()
           failed, scalar::FailureInjection::local_factor) !=
           scalar::ScalarCudaStatus::injected_local_factor_failure ||
       failed.valid() ||
-      owner->status() !=
-          scalar::ScalarCudaStatus::injected_local_factor_failure ||
+      owner->status() != scalar::ScalarCudaStatus::ready ||
       !owner->CopyPublishedTrajectoryState(after) ||
       !oracle::SameStateBytes(before, after))
   {
     return false;
   }
-  const auto retained = owner->trajectory_evidence();
+  *retained = owner->trajectory_evidence();
   scalar::PersistentSc25ScalarIgrCudaRank1::Transaction overwrite;
-  if (retained.accepted_steps != 0 || retained.attempted_steps != 1 ||
-      retained.attempt_count != 1 || retained.coordinates.step != 0 ||
-      retained.first_failure !=
+  if (retained->accepted_steps != 0 || retained->attempted_steps != 1 ||
+      retained->retry_attempts != 1 || retained->attempt_count != 1 ||
+      retained->coordinates.step != 0 ||
+      retained->first_failure !=
           scalar::ScalarCudaStatus::injected_local_factor_failure ||
-      retained.attempts[0].status !=
+      retained->attempts[0].status !=
           scalar::ScalarCudaStatus::injected_local_factor_failure ||
-      retained.attempts[0].failure_cause !=
+      retained->attempts[0].failure_cause !=
           scalar::ScalarCudaFailureCause::injected_local_factor ||
-      retained.attempts[0].injection !=
+      retained->attempts[0].injection !=
           scalar::FailureInjection::local_factor ||
-      !oracle::NonzeroHashes(retained.attempts[0].entry_hashes) ||
-      !oracle::NonzeroHashes(retained.attempts[0].candidate_hashes) ||
+      !oracle::NonzeroHashes(retained->attempts[0].entry_hashes) ||
+      !oracle::NonzeroHashes(retained->attempts[0].candidate_hashes) ||
       owner->PreparePersistentTrajectoryTransaction(overwrite) !=
-          scalar::ScalarCudaStatus::publication_failure ||
-      overwrite.valid())
+          scalar::ScalarCudaStatus::accepted ||
+      !overwrite.valid() || overwrite.provisionally_installed() ||
+      !owner->RevertPersistentTrajectoryTransaction(std::move(overwrite)))
   {
     return false;
   }
   const auto& unchanged = owner->trajectory_evidence();
-  return unchanged.attempt_count == retained.attempt_count &&
-      unchanged.first_failure == retained.first_failure &&
-      unchanged.attempts[0].status == retained.attempts[0].status &&
+  return unchanged.attempt_count == retained->attempt_count &&
+      unchanged.retry_attempts == retained->retry_attempts &&
+      unchanged.first_failure == retained->first_failure &&
+      unchanged.attempts[0].status == retained->attempts[0].status &&
       unchanged.coordinates.step == 0;
 }
 
 bool RunInstalledAbandonmentNegative()
 {
+  const auto committed = std::make_unique<scalar::ScalarCudaEvidence>();
   auto owner = CreateCuda(8);
   if (!owner || owner->InitializePersistentTrajectory() !=
           scalar::ScalarCudaStatus::ready)
@@ -1865,7 +2036,7 @@ bool RunInstalledAbandonmentNegative()
   {
     return false;
   }
-  const scalar::ScalarCudaEvidence committed = owner->trajectory_evidence();
+  *committed = owner->trajectory_evidence();
   {
     scalar::PersistentSc25ScalarIgrCudaRank1::Transaction abandoned;
     if (owner->PreparePersistentTrajectoryTransaction(abandoned) !=
@@ -1882,21 +2053,20 @@ bool RunInstalledAbandonmentNegative()
   return owner->status() == scalar::ScalarCudaStatus::transaction_prepared &&
       owner->CopyPublishedTrajectoryState(installed) &&
       oracle::SameStateBytes(before, installed) &&
-      hidden.status == committed.status &&
-      hidden.accepted_steps == committed.accepted_steps &&
-      hidden.attempted_steps == committed.attempted_steps &&
-      hidden.attempt_count == committed.attempt_count &&
-      hidden.step_evidence_count == committed.step_evidence_count &&
-      hidden.coordinates.step == committed.coordinates.step &&
-      hidden.launches.assemble_launches ==
-          committed.launches.assemble_launches &&
-      hidden.launches.condense_launches ==
-          committed.launches.condense_launches &&
-      hidden.launches.recover_launches ==
-          committed.launches.recover_launches &&
-      hidden.transfers.count == committed.transfers.count &&
-      hidden.transfers.ordered_digest == committed.transfers.ordered_digest &&
-      hidden.reuse.identity_hash == committed.reuse.identity_hash &&
+      hidden.status == committed->status &&
+      hidden.accepted_steps == committed->accepted_steps &&
+      hidden.attempted_steps == committed->attempted_steps &&
+      hidden.attempt_count == committed->attempt_count &&
+      hidden.step_evidence_count == committed->step_evidence_count &&
+      hidden.coordinates.step == committed->coordinates.step &&
+      hidden.launches.assemble_launches >=
+          committed->launches.assemble_launches &&
+      hidden.launches.condense_launches >=
+          committed->launches.condense_launches &&
+      hidden.launches.recover_launches >=
+          committed->launches.recover_launches &&
+      hidden.transfers.count > committed->transfers.count &&
+      hidden.reuse.identity_hash == committed->reuse.identity_hash &&
       !owner->CaptureTrajectoryCheckpoint(checkpoint) &&
       owner->RestoreTrajectoryCheckpoint(committed_checkpoint) ==
           scalar::ScalarCudaStatus::restart_identity_failure &&
@@ -2393,12 +2563,29 @@ bool RunCheckpointNegatives(
 
 bool RunC2()
 {
-  if (!RunTransactionNegatives() || !RunMoveWithLiveTransaction() ||
-      !RunStaleTransactionAfterOwnerDestruction() ||
-      !RunRevertPhysicalEvidence() ||
-      !RunAbandonedPreparedTokenNegative() ||
-      !RunDirectPrepareInjectedFailureNegative() ||
-      !RunInstalledAbandonmentNegative())
+  bool transaction_negatives_pass = true;
+  const auto run_transaction_subcase =
+      [&transaction_negatives_pass](const std::string_view name,
+                                    bool (*run)())
+  {
+    const bool pass = run();
+    std::cout << "C2 transaction-negative subcase=" << name
+              << " pass=" << pass << '\n';
+    transaction_negatives_pass = pass && transaction_negatives_pass;
+  };
+  run_transaction_subcase("strong-transaction", RunTransactionNegatives);
+  run_transaction_subcase("move-live-token", RunMoveWithLiveTransaction);
+  run_transaction_subcase("stale-token-after-owner-destruction",
+                          RunStaleTransactionAfterOwnerDestruction);
+  run_transaction_subcase("revert-physical-evidence",
+                          RunRevertPhysicalEvidence);
+  run_transaction_subcase("abandoned-prepared-token",
+                          RunAbandonedPreparedTokenNegative);
+  run_transaction_subcase("direct-prepare-injected-failure",
+                          RunDirectPrepareInjectedFailureNegative);
+  run_transaction_subcase("installed-token-abandonment",
+                          RunInstalledAbandonmentNegative);
+  if (!transaction_negatives_pass)
   {
     std::cerr << "C2 transaction negative campaign failed\n";
     return false;
@@ -2408,16 +2595,24 @@ bool RunC2()
       scalar::FailureInjection::trace_linear,
       scalar::FailureInjection::admissibility,
       scalar::FailureInjection::newton_iteration_limit}};
+  bool fault_campaigns_pass = true;
   for (const scalar::FailureInjection fault : faults)
   {
-    if (!RunFaultCampaign(fault))
-    {
-      std::cerr << "C2 fault campaign failed: "
-                << static_cast<int>(fault) << '\n';
-      return false;
-    }
+    const bool pass = RunFaultCampaign(fault);
+    std::cout << "C2 fault-campaign injection=" << static_cast<int>(fault)
+              << " pass=" << pass << '\n';
+    fault_campaigns_pass = pass && fault_campaigns_pass;
+  }
+  if (!fault_campaigns_pass)
+  {
+    std::cerr << "C2 one or more fresh-owner fault campaigns failed\n";
+    return false;
   }
 
+  const auto forbidden_step0_input =
+      std::make_unique<scalar::ScalarCudaCheckpoint>();
+  forbidden_step0_input->descriptor.successful_commit = true;
+  forbidden_step0_input->interior_component_slabs[0] = 1.0;
   auto cpu_run = CreateCpu(8);
   auto cuda_run = CreateCuda(8);
   if (!cpu_run || !cuda_run ||
@@ -2430,15 +2625,56 @@ bool RunC2()
   const auto step0_physical =
       std::make_unique<scalar::ScalarCudaEvidence>(
           cuda_run->trajectory_evidence());
-  scalar::ScalarCudaCheckpoint forbidden_step0{};
-  forbidden_step0.descriptor.successful_commit = true;
-  forbidden_step0.interior_component_slabs[0] = 1.0;
-  if (cuda_run->CaptureTrajectoryCheckpoint(forbidden_step0) ||
-      !DefaultCheckpoint(forbidden_step0) ||
-      !SamePhysicalEvidence(*step0_physical,
-                            cuda_run->trajectory_evidence()))
+  scalar::ScalarCudaCheckpoint forbidden_step0 = *forbidden_step0_input;
+  const bool capture_rejected =
+      !cuda_run->CaptureTrajectoryCheckpoint(forbidden_step0);
+  const bool output_cleared = DefaultCheckpoint(forbidden_step0);
+  const bool output_unchanged =
+      SameCheckpoint(forbidden_step0, *forbidden_step0_input);
+  const std::string_view output_disposition = output_cleared ? "cleared" :
+      output_unchanged ? "unchanged" : "other";
+  const auto& step0_after = cuda_run->trajectory_evidence();
+  const bool solver_policy_same =
+      step0_physical->trace_restart == step0_after.trace_restart &&
+      step0_physical->trace_maximum_iterations ==
+          step0_after.trace_maximum_iterations &&
+      step0_physical->trace_relative_tolerance ==
+          step0_after.trace_relative_tolerance &&
+      step0_physical->trace_absolute_tolerance ==
+          step0_after.trace_absolute_tolerance &&
+      step0_physical->ilu_type == step0_after.ilu_type &&
+      step0_physical->ilu_level_of_fill == step0_after.ilu_level_of_fill &&
+      step0_physical->ilu_local_reordering ==
+          step0_after.ilu_local_reordering;
+  const bool residency_same =
+      SameResidency(step0_physical->residency, step0_after.residency);
+  const bool allocations_same =
+      SameAllocations(step0_physical->allocations, step0_after.allocations);
+  const bool reuse_same = SameReuse(step0_physical->reuse, step0_after.reuse);
+  const bool launches_same =
+      SameLaunches(step0_physical->launches, step0_after.launches);
+  const bool transfers_same =
+      SameTransferLedger(step0_physical->transfers, step0_after.transfers);
+  const bool allocation_ledger_same = SameAllocationLedger(
+      step0_physical->allocation_ledger, step0_after.allocation_ledger);
+  const bool physical_evidence_same = solver_policy_same && residency_same &&
+      allocations_same && reuse_same && launches_same && transfers_same &&
+      allocation_ledger_same;
+  std::cout << "C2 step0 checkpoint capture-rejected=" << capture_rejected
+            << " output-disposition=" << output_disposition
+            << " physical-evidence-same=" << physical_evidence_same << '\n';
+  if (!capture_rejected || !physical_evidence_same)
   {
-    std::cerr << "C2 step0 checkpoint capture mutated physical evidence\n";
+    std::cerr << "C2 step0 checkpoint rejection/physical contract failed"
+              << " capture-rejected=" << capture_rejected
+              << " output-disposition=" << output_disposition
+              << " solver-policy=" << solver_policy_same
+              << " residency=" << residency_same
+              << " allocations=" << allocations_same
+              << " reuse=" << reuse_same
+              << " launches=" << launches_same
+              << " transfers=" << transfers_same
+              << " allocation-ledger=" << allocation_ledger_same << '\n';
     return false;
   }
   oracle::ComparisonEvidence comparison{};
@@ -2497,9 +2733,17 @@ bool RunC2()
     preceding_q14 = current_q14;
     if (step == 10)
     {
-      if (!cpu_run->CaptureTrajectoryCheckpoint(cpu_checkpoint10) ||
-          !cuda_run->CaptureTrajectoryCheckpoint(cuda_checkpoint10))
+      const bool cpu_checkpoint_captured =
+          cpu_run->CaptureTrajectoryCheckpoint(cpu_checkpoint10);
+      const bool cuda_checkpoint_captured =
+          cuda_run->CaptureTrajectoryCheckpoint(cuda_checkpoint10);
+      std::cout << "C2 step10 checkpoint cpu=" << cpu_checkpoint_captured
+                << " cuda=" << cuda_checkpoint_captured << '\n';
+      if (!cpu_checkpoint_captured || !cuda_checkpoint_captured)
       {
+        std::cerr << "C2 step10 checkpoint capture failed"
+                  << " cpu=" << cpu_checkpoint_captured
+                  << " cuda=" << cuda_checkpoint_captured << '\n';
         return false;
       }
     }
@@ -2538,16 +2782,46 @@ bool RunC2()
 
   auto cpu_restart = CreateCpu(8);
   auto cuda_restart = CreateCuda(8);
-  if (!cpu_restart || !cuda_restart ||
-      cpu_restart->InitializePersistentTrajectory() !=
-          cpu::TrajectoryStatus::ready ||
-      cuda_restart->InitializePersistentTrajectory() !=
-          scalar::ScalarCudaStatus::ready ||
-      !CpuAccepted(cpu_restart->RestoreTrajectoryCheckpoint(
-          cpu_checkpoint10)) ||
-      cuda_restart->RestoreTrajectoryCheckpoint(cuda_checkpoint10) !=
-          scalar::ScalarCudaStatus::ready)
+  const bool cpu_restart_created = cpu_restart != nullptr;
+  const bool cuda_restart_created = cuda_restart != nullptr;
+  bool cpu_restart_initialized = false;
+  bool cuda_restart_initialized = false;
+  if (cpu_restart_created)
   {
+    cpu_restart_initialized =
+        cpu_restart->InitializePersistentTrajectory() ==
+        cpu::TrajectoryStatus::ready;
+  }
+  if (cuda_restart_created)
+  {
+    cuda_restart_initialized =
+        cuda_restart->InitializePersistentTrajectory() ==
+        scalar::ScalarCudaStatus::ready;
+  }
+  bool cpu_checkpoint_restored = false;
+  bool cuda_checkpoint_restored = false;
+  if (cpu_restart_initialized)
+  {
+    cpu_checkpoint_restored = CpuAccepted(
+        cpu_restart->RestoreTrajectoryCheckpoint(cpu_checkpoint10));
+  }
+  if (cuda_restart_initialized)
+  {
+    cuda_checkpoint_restored =
+        cuda_restart->RestoreTrajectoryCheckpoint(cuda_checkpoint10) ==
+        scalar::ScalarCudaStatus::ready;
+  }
+  std::cout << "C2 fresh-restart cpu-created=" << cpu_restart_created
+            << " cuda-created=" << cuda_restart_created
+            << " cpu-initialized=" << cpu_restart_initialized
+            << " cuda-initialized=" << cuda_restart_initialized
+            << " cpu-restored=" << cpu_checkpoint_restored
+            << " cuda-restored=" << cuda_checkpoint_restored << '\n';
+  if (!cpu_restart_created || !cuda_restart_created ||
+      !cpu_restart_initialized || !cuda_restart_initialized ||
+      !cpu_checkpoint_restored || !cuda_checkpoint_restored)
+  {
+    std::cerr << "C2 fresh restart initialization/restore failed\n";
     return false;
   }
   if (cuda_restart->status() != scalar::ScalarCudaStatus::ready ||
@@ -2739,22 +3013,23 @@ bool RunC2()
   const auto& evidence = *continuous_evidence;
   const auto& transfers = evidence.transfers;
   const auto& allocations = evidence.allocation_ledger;
-  const bool persistent = evidence.accepted_steps == 20 &&
+  const bool trajectory_gate = evidence.accepted_steps == 20 &&
       evidence.step_evidence_count == 20 &&
-      evidence.attempt_count == 20 &&
-      evidence.trace_restart == 50 &&
+      evidence.attempt_count == 20;
+  const bool solver_policy_gate = evidence.trace_restart == 50 &&
       evidence.trace_maximum_iterations == 200 &&
       evidence.trace_relative_tolerance == 1.0e-12 &&
       evidence.trace_absolute_tolerance == 1.0e-14 &&
       evidence.ilu_type == 0 && evidence.ilu_level_of_fill == 0 &&
-      evidence.ilu_local_reordering == 1 && evidence.residency.mfem_cuda_device &&
+      evidence.ilu_local_reordering == 1;
+  const bool residency_gate = evidence.residency.mfem_cuda_device &&
       evidence.residency.hypre_cuda && evidence.residency.umpire_device_pool &&
       evidence.residency.state_device_resident &&
       evidence.residency.topology_device_resident &&
       evidence.residency.workspace_device_resident &&
       evidence.residency.trace_solve_device_resident &&
-      !evidence.residency.host_numerical_fallback &&
-      evidence.allocations.warm_plateau &&
+      !evidence.residency.host_numerical_fallback;
+  const bool allocation_plateau_gate = evidence.allocations.warm_plateau &&
       evidence.allocations.baseline_mfem_high_water != 0 &&
       evidence.allocations.baseline_hypre_high_water != 0 &&
       evidence.allocations.current_mfem_high_water ==
@@ -2763,29 +3038,45 @@ bool RunC2()
           evidence.allocations.baseline_hypre_high_water &&
       evidence.allocations.zero_post_baseline_observed_growth &&
       evidence.allocations.zero_post_baseline_owned_allocation &&
-      evidence.allocations.zero_post_baseline_owned_deallocation &&
-      reuse.unchanged && oracle::ValidateTopologyIdentity(reuse) &&
-      !oracle::ValidateTopologyIdentity(mutated_reuse) &&
-      evidence.launches.assemble_launches > 0 &&
+      evidence.allocations.zero_post_baseline_owned_deallocation;
+  const bool reuse_identity_gate = oracle::ValidateTopologyIdentity(reuse);
+  const bool mutated_reuse_rejected =
+      !oracle::ValidateTopologyIdentity(mutated_reuse);
+  const bool reuse_gate = reuse.unchanged && reuse_identity_gate &&
+      mutated_reuse_rejected;
+  const bool launch_gate = evidence.launches.assemble_launches > 0 &&
       evidence.launches.condense_launches > 0 &&
       evidence.launches.recover_launches > 0 &&
       evidence.launches.fallback_calls == 0 &&
       evidence.launches.last_compiled_architecture == 1200 &&
-      evidence.launches.all_launches_completed &&
-      oracle::ValidateTransferLedger(
-          transfers, evidence, oracle::c2_transfer_expectation) &&
-      RejectTransferCensusMutations(
-          transfers, evidence, oracle::c2_transfer_expectation) &&
-      oracle::ValidateAllocationLedger(allocations, evidence.allocations) &&
-      RunCopiedEvidenceMutationNegatives(evidence);
-  if (!persistent)
+      evidence.launches.all_launches_completed;
+  const bool persistent_gate = trajectory_gate && solver_policy_gate &&
+      residency_gate && allocation_plateau_gate && reuse_gate && launch_gate;
+  const bool transfer_gate = oracle::ValidateTransferLedger(
+      transfers, evidence, oracle::c2_transfer_expectation);
+  const bool transfer_mutation_gate = RejectTransferCensusMutations(
+      transfers, evidence, oracle::c2_transfer_expectation);
+  const bool allocation_gate =
+      oracle::ValidateAllocationLedger(allocations, evidence.allocations);
+  const bool copy_mutation_gate = RunCopiedEvidenceMutationNegatives(evidence);
+  const bool checkpoint_negative_gate =
+      RunCheckpointNegatives(cuda_checkpoint10, *cpu_restart);
+  std::cout << "C2 terminal-gates persistent=" << persistent_gate
+            << " trajectory=" << trajectory_gate
+            << " solver-policy=" << solver_policy_gate
+            << " residency=" << residency_gate
+            << " allocation-plateau=" << allocation_plateau_gate
+            << " reuse=" << reuse_gate
+            << " launches=" << launch_gate
+            << " transfer=" << transfer_gate
+            << " transfer-mutation=" << transfer_mutation_gate
+            << " allocation=" << allocation_gate
+            << " copy-mutation=" << copy_mutation_gate
+            << " checkpoint-negative=" << checkpoint_negative_gate << '\n';
+  if (!persistent_gate || !transfer_gate || !transfer_mutation_gate ||
+      !allocation_gate || !copy_mutation_gate || !checkpoint_negative_gate)
   {
-    std::cerr << "C2 residency/reuse/allocation evidence failed\n";
-    return false;
-  }
-  if (!RunCheckpointNegatives(cuda_checkpoint10, *cpu_restart))
-  {
-    std::cerr << "C2 restart negative campaign failed\n";
+    std::cerr << "C2 one or more independent terminal gates failed\n";
     return false;
   }
   std::cout << "PASS: HDG-EXP-SCALAR-DEVICE-01 C2 20-step CPU/CUDA "

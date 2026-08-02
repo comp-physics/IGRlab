@@ -67,6 +67,95 @@ bool CudaAccepted(const scalar::ScalarCudaStatus status) noexcept
       status == scalar::ScalarCudaStatus::accepted_after_one_retry;
 }
 
+bool RollbackPhysicalEvidenceAdvanced(
+    const scalar::ScalarCudaEvidence& before,
+    const scalar::ScalarCudaEvidence& after) noexcept
+{
+  const auto& before_launches = before.launches;
+  const auto& after_launches = after.launches;
+  const bool launches_advanced =
+      after_launches.assemble_launches >=
+          before_launches.assemble_launches &&
+      after_launches.condense_launches >=
+          before_launches.condense_launches &&
+      after_launches.recover_launches >= before_launches.recover_launches &&
+      after_launches.remote_system_exchange_launches >=
+          before_launches.remote_system_exchange_launches &&
+      after_launches.owned_trace_distribution_launches >=
+          before_launches.owned_trace_distribution_launches &&
+      (after_launches.assemble_launches >
+           before_launches.assemble_launches ||
+       after_launches.condense_launches >
+           before_launches.condense_launches ||
+       after_launches.recover_launches > before_launches.recover_launches ||
+       after_launches.remote_system_exchange_launches >
+           before_launches.remote_system_exchange_launches ||
+       after_launches.owned_trace_distribution_launches >
+           before_launches.owned_trace_distribution_launches) &&
+      after_launches.fallback_calls == before_launches.fallback_calls &&
+      after_launches.last_compiled_architecture ==
+          before_launches.last_compiled_architecture &&
+      before_launches.all_launches_completed &&
+      after_launches.all_launches_completed;
+  const auto& before_transfers = before.transfers;
+  const auto& after_transfers = after.transfers;
+  const bool transfers_advanced =
+      after_transfers.schema == before_transfers.schema &&
+      after_transfers.capacity == before_transfers.capacity &&
+      after_transfers.count > before_transfers.count &&
+      after_transfers.observed_count > before_transfers.observed_count &&
+      after_transfers.dropped_count == before_transfers.dropped_count &&
+      !before_transfers.overflow && !after_transfers.overflow &&
+      after_transfers.totals.host_to_device_bytes >=
+          before_transfers.totals.host_to_device_bytes &&
+      after_transfers.totals.device_to_host_bytes >=
+          before_transfers.totals.device_to_host_bytes &&
+      after_transfers.totals.device_to_device_bytes >=
+          before_transfers.totals.device_to_device_bytes &&
+      after_transfers.totals.mpi_staging_bytes >=
+          before_transfers.totals.mpi_staging_bytes &&
+      after_transfers.totals.synchronization_events >=
+          before_transfers.totals.synchronization_events &&
+      after_transfers.totals.event_count >
+          before_transfers.totals.event_count &&
+      before_transfers.totals.complete && after_transfers.totals.complete;
+  const auto& left = before.allocations;
+  const auto& right = after.allocations;
+  const bool allocation_plateau =
+      left.double_arena == right.double_arena &&
+      left.integer_arena == right.integer_arena &&
+      left.true_matrix == right.true_matrix && left.gmres == right.gmres &&
+      left.ilu == right.ilu &&
+      left.current_observed_events == right.current_observed_events &&
+      left.current_owned_calls == right.current_owned_calls &&
+      left.current_deallocations == right.current_deallocations &&
+      left.current_mfem_high_water == right.current_mfem_high_water &&
+      left.current_hypre_high_water == right.current_hypre_high_water &&
+      right.warm_plateau && right.zero_post_baseline_observed_growth &&
+      right.zero_post_baseline_owned_allocation &&
+      right.zero_post_baseline_owned_deallocation &&
+      before.allocation_ledger.schema == after.allocation_ledger.schema &&
+      before.allocation_ledger.capacity == after.allocation_ledger.capacity &&
+      before.allocation_ledger.count == after.allocation_ledger.count &&
+      before.allocation_ledger.observed_count ==
+          after.allocation_ledger.observed_count &&
+      before.allocation_ledger.dropped_count ==
+          after.allocation_ledger.dropped_count &&
+      before.allocation_ledger.ordered_digest ==
+          after.allocation_ledger.ordered_digest &&
+      before.allocation_ledger.overflow == after.allocation_ledger.overflow;
+  return launches_advanced && transfers_advanced && allocation_plateau &&
+      before.reuse.identity_hash == after.reuse.identity_hash &&
+      before.reuse.owner == after.reuse.owner &&
+      before.reuse.workspace == after.reuse.workspace &&
+      before.reuse.unchanged && after.reuse.unchanged &&
+      before.residency.state_device_resident &&
+      after.residency.state_device_resident &&
+      before.residency.host_staged_rank2 && after.residency.host_staged_rank2 &&
+      !before.residency.host_numerical_fallback &&
+      !after.residency.host_numerical_fallback;
+}
+
 std::uint64_t DoubleBits(const double value) noexcept
 {
   std::uint64_t bits = 0;
@@ -585,6 +674,12 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
   // its initialization/warm plateau and is reused by every negative campaign.
   const auto negative_evidence_before =
       std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto before_prepare_evidence =
+      std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto prospective_evidence =
+      std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto finalized_prospective =
+      std::make_unique<scalar::ScalarCudaEvidence>();
   const auto cuda_baseline_snapshots = std::make_unique<std::array<
       scalar::ScalarCudaSnapshotEvidence,
       cpu::persistent_required_steps + 1>>();
@@ -640,6 +735,7 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
   const bool before_prepare_copied =
       cuda_owner->CopyPublishedTrajectoryState(before_prepare);
   if (!require(before_prepare_copied, "pre-prepare committed state")) return 1;
+  *before_prepare_evidence = cuda_owner->trajectory_evidence();
   scalar::PersistentSc25ScalarIgrCudaRank2::Transaction prepared{};
   const scalar::ScalarCudaStatus prepared_status =
       cuda_owner->PreparePersistentTrajectoryTransaction(prepared);
@@ -659,6 +755,22 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
   if (!require(prepared.provisionally_installed(),
                "installed affine token state"))
     return 1;
+  scalar::ScalarCudaCheckpoint staged_checkpoint{};
+  staged_checkpoint.interior_component_slabs.resize(
+      scalar::persistent_interior_unknowns);
+  staged_checkpoint.owned_trace_component_slabs.resize(
+      before_prepare.uhat.size() + before_prepare.sigmahat.size());
+  const bool candidate_staged =
+      cuda_owner->StageInstalledTrajectoryTransaction(
+          prepared, staged_checkpoint, *prospective_evidence);
+  if (!require(candidate_staged &&
+                   staged_checkpoint.descriptor.coordinates.step == 1 &&
+                   prospective_evidence->accepted_steps == 1 &&
+                   prospective_evidence->attempted_steps == 1 &&
+                   prospective_evidence->snapshot_count == 2 &&
+                   prospective_evidence->coordinates.step == 1,
+               "preallocated candidate checkpoint/prospective evidence"))
+    return 1;
   const bool prepared_reverted =
       cuda_owner->RevertPersistentTrajectoryTransaction(std::move(prepared));
   if (!require(prepared_reverted, "affine revert")) return 1;
@@ -669,12 +781,51 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
   if (!require(oracle::SameStateBytes(before_prepare, after_prepare),
                "affine prepare/install/revert is atomic"))
     return 1;
+  if (!require(oracle::SameLogicalEvidence(
+                   *before_prepare_evidence,
+                   cuda_owner->trajectory_evidence()),
+               "affine revert restores exact logical evidence"))
+    return 1;
+  if (!require(RollbackPhysicalEvidenceAdvanced(
+                   *before_prepare_evidence,
+                   cuda_owner->trajectory_evidence()),
+               "affine revert retains monotone physical work at allocation plateau"))
+    return 1;
+  scalar::PersistentSc25ScalarIgrCudaRank2::Transaction aborted{};
+  const bool uninstalled_aborted =
+      CudaAccepted(cuda_owner->PreparePersistentTrajectoryTransaction(aborted)) &&
+      aborted.valid() && !aborted.provisionally_installed() &&
+      cuda_owner->RevertPersistentTrajectoryTransaction(std::move(aborted));
+  if (!require(uninstalled_aborted && !aborted.valid() &&
+                   oracle::SameLogicalEvidence(
+                       *before_prepare_evidence,
+                       cuda_owner->trajectory_evidence()),
+               "prepared/uninstalled affine token abort"))
+    return 1;
 
   scalar::ScalarCudaCheckpoint cuda_checkpoint10{};
   for (int step = 1; step <= cpu::persistent_required_steps; ++step)
   {
-    const scalar::ScalarCudaStatus advanced =
-        cuda_owner->AdvancePersistentTrajectory();
+    scalar::ScalarCudaStatus advanced = scalar::ScalarCudaStatus::uninitialized;
+    if (step == 1)
+    {
+      scalar::PersistentSc25ScalarIgrCudaRank2::Transaction finalized{};
+      const bool staged_finalized = CudaAccepted(
+          cuda_owner->PreparePersistentTrajectoryTransaction(finalized)) &&
+          cuda_owner->InstallPersistentTrajectoryTransaction(finalized) &&
+          cuda_owner->StageInstalledTrajectoryTransaction(
+              finalized, staged_checkpoint, *finalized_prospective) &&
+          cuda_owner->FinalizePersistentTrajectoryTransaction(
+              std::move(finalized)) &&
+          oracle::SameLogicalEvidence(
+              *finalized_prospective, cuda_owner->trajectory_evidence());
+      if (!require(staged_finalized,
+                   "prospective evidence equals finalized logical evidence"))
+        return 1;
+      advanced = scalar::ScalarCudaStatus::accepted;
+    }
+    else
+      advanced = cuda_owner->AdvancePersistentTrajectory();
     if (!require(CudaAccepted(advanced), "CUDA baseline trajectory")) return 1;
     cuda_state_copied = cuda_owner->CopyPublishedTrajectoryState(cuda_state);
     if (!require(cuda_state_copied, "CUDA baseline state copy")) return 1;
@@ -736,30 +887,34 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
   cuda_owner.reset();
 
   // Fresh and used-owner checkpoint restore/replay.
+  const auto run_restart_replay = [&]() -> bool
+  {
   auto restart = CreateCuda();
-  if (!require(restart != nullptr, "fresh restart owner creation")) return 1;
+  if (!require(restart != nullptr, "fresh restart owner creation"))
+    return false;
   const scalar::ScalarCudaStatus restart_initialized =
       restart->InitializePersistentTrajectory();
   if (!require(restart_initialized == scalar::ScalarCudaStatus::ready,
                "fresh restart owner initialization"))
-    return 1;
+    return false;
   const scalar::ScalarCudaStatus restored =
       restart->RestoreTrajectoryCheckpoint(cuda_checkpoint10);
   if (!require(restored == scalar::ScalarCudaStatus::ready,
                "fresh two-shard restore"))
-    return 1;
+    return false;
   if (!require(oracle::CoherentReplayEvidence(
                    restart->trajectory_evidence(), 10),
                "fresh restore invalidates all future snapshot evidence"))
-    return 1;
+    return false;
   const bool restored_state_copied =
       restart->CopyPublishedTrajectoryState(cuda_state);
-  if (!require(restored_state_copied, "fresh restored state copy")) return 1;
+  if (!require(restored_state_copied, "fresh restored state copy"))
+    return false;
   if (!require(
           oracle::CrossBackendParityAgainstAcceptedCpuReceipt(
               cpu_states[10], cuda_state, 1.0e-10),
           "fresh restored accepted-CPU parity"))
-    return 1;
+    return false;
   if (!CollectiveAll(
           oracle::SameStateBytes(cuda_baseline_states[10], cuda_state)))
   {
@@ -767,13 +922,14 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
         rank, 10, "fresh-restore", cuda_baseline_states[10], cuda_state);
     if (rank == 0)
       std::cerr << "C3: fresh restore installs exact step-ten bytes\n";
-    return 1;
+    return false;
   }
   for (int step = 11; step <= cpu::persistent_required_steps; ++step)
   {
     const scalar::ScalarCudaStatus replayed =
         restart->AdvancePersistentTrajectory();
-    if (!require(CudaAccepted(replayed), "fresh restore replay")) return 1;
+    if (!require(CudaAccepted(replayed), "fresh restore replay"))
+      return false;
     const auto& replay_evidence = restart->trajectory_evidence();
     const std::size_t replay_index = static_cast<std::size_t>(step - 11);
     if (!require(oracle::CoherentReplayEvidence(replay_evidence, 10) &&
@@ -781,10 +937,10 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
                          cpu_reference.steps[static_cast<std::size_t>(step)],
                          replay_evidence.snapshots[replay_index], step),
                  "fresh replay appends dense coherent snapshot evidence"))
-      return 1;
+      return false;
     if (!require(restart->CopyPublishedTrajectoryState(cuda_state),
                  "fresh replay state copy"))
-      return 1;
+      return false;
     if (!CollectiveAll(oracle::SameStateBytes(
             cuda_baseline_states[static_cast<std::size_t>(step)],
             cuda_state)))
@@ -881,41 +1037,71 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
       }
       if (rank == 0)
         std::cerr << "C3: first non-bitwise fresh replay state\n";
-      return 1;
+      return false;
     }
   }
   if (!require(oracle::SameStateBytes(cuda_final, cuda_state),
                "bitwise restart continuation"))
-    return 1;
+    return false;
   const scalar::ScalarCudaStatus used_restore =
       restart->RestoreTrajectoryCheckpoint(cuda_checkpoint10);
   if (!require(used_restore == scalar::ScalarCudaStatus::ready,
                "used-owner restore"))
-    return 1;
+    return false;
   if (!require(oracle::CoherentReplayEvidence(
                    restart->trajectory_evidence(), 10),
                "used-owner restore invalidates prior/future snapshots"))
-    return 1;
-  if (!require(restart->CopyPublishedTrajectoryState(cuda_state) &&
-                   oracle::SameStateBytes(cuda_baseline_states[10],
-                                          cuda_state),
-               "used-owner restore installs exact step-ten bytes"))
-    return 1;
+    return false;
+  const bool used_restore_state_copied =
+      restart->CopyPublishedTrajectoryState(cuda_state);
+  const bool used_restore_state_equal =
+      oracle::SameStateBytes(cuda_baseline_states[10], cuda_state);
+  const bool used_restore_copy_gate = require(
+      used_restore_state_copied, "used-owner restored state copy");
+  const bool used_restore_equality_gate = require(
+      used_restore_state_equal,
+      "used-owner restore installs exact step-ten bytes");
+  if (!used_restore_copy_gate || !used_restore_equality_gate)
+    return false;
   const scalar::ScalarCudaStatus used_replay =
       restart->AdvancePersistentTrajectory();
-  if (!require(CudaAccepted(used_replay), "used-owner replay")) return 1;
+  if (!require(CudaAccepted(used_replay), "used-owner replay"))
+    return false;
   const auto& used_replay_evidence = restart->trajectory_evidence();
-  if (!require(oracle::CoherentReplayEvidence(used_replay_evidence, 10) &&
-                   used_replay_evidence.snapshot_count == 1 &&
-                   oracle::OperatorSnapshotParity(
-                       cpu_reference.steps[11],
-                       used_replay_evidence.snapshots[0], 11) &&
-                   restart->CopyPublishedTrajectoryState(cuda_state) &&
-                   oracle::SameStateBytes(cuda_baseline_states[11],
-                                          cuda_state),
-               "used-owner replay appends one coherent snapshot"))
-    return 1;
+  const bool used_replay_coherent =
+      oracle::CoherentReplayEvidence(used_replay_evidence, 10);
+  const bool used_replay_snapshot_count =
+      used_replay_evidence.snapshot_count == 1;
+  const bool used_replay_snapshot_parity = used_replay_snapshot_count &&
+      oracle::OperatorSnapshotParity(
+          cpu_reference.steps[11], used_replay_evidence.snapshots[0], 11);
+  const bool used_replay_state_copied =
+      restart->CopyPublishedTrajectoryState(cuda_state);
+  const bool used_replay_state_equal =
+      oracle::SameStateBytes(cuda_baseline_states[11], cuda_state);
+  const bool used_replay_coherent_gate = require(
+      used_replay_coherent, "used-owner replay coherent evidence");
+  const bool used_replay_count_gate = require(
+      used_replay_snapshot_count, "used-owner replay one snapshot");
+  const bool used_replay_parity_gate = require(
+      used_replay_snapshot_parity,
+      "used-owner replay operator snapshot parity");
+  const bool used_replay_copy_gate = require(
+      used_replay_state_copied, "used-owner replay state copy");
+  const bool used_replay_equality_gate = require(
+      used_replay_state_equal,
+      "used-owner replay installs exact step-eleven bytes");
+  if (!used_replay_coherent_gate || !used_replay_count_gate ||
+      !used_replay_parity_gate || !used_replay_copy_gate ||
+      !used_replay_equality_gate)
+    return false;
   restart.reset();
+  return true;
+  };
+  const bool restart_replay_pass = run_restart_replay();
+  if (rank == 0)
+    std::cout << "C3 post-baseline phase=restart-replay pass="
+              << restart_replay_pass << '\n';
 
   // Each rank-one-origin campaign must roll back exactly once and publish the
   // same step-seven bytes as the independent baseline continuation.
@@ -938,24 +1124,24 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
       {scalar::FailureInjection::newton_iteration_limit,
        scalar::ScalarCudaStatus::injected_newton_iteration_limit,
        scalar::ScalarCudaFailureCause::injected_newton_limit}}};
-  for (const FaultCase& campaign : fault_cases)
+  const auto run_fault_campaign = [&](const FaultCase& campaign) -> bool
   {
     auto fault = CreateCuda();
-    if (!require(fault != nullptr, "fault owner creation")) return 1;
+    if (!require(fault != nullptr, "fault owner creation")) return false;
     if (!require(fault->InitializePersistentTrajectory() ==
                      scalar::ScalarCudaStatus::ready,
                  "fault campaign initialization"))
-      return 1;
+      return false;
     for (int step = 1; step <= 6; ++step)
     {
       if (!require(CudaAccepted(fault->AdvancePersistentTrajectory()),
                    "fault campaign prefix"))
-        return 1;
+        return false;
     }
     cpu::PersistentRank2TrajectoryState fault_before{};
     if (!require(fault->CopyPublishedTrajectoryState(fault_before),
                  "fault pre-state capture"))
-      return 1;
+      return false;
     const int fault_before_accepted_steps =
         fault->trajectory_evidence().accepted_steps;
     const scalar::ScalarCudaStatus fault_result =
@@ -963,11 +1149,11 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
     if (!require(fault_result ==
                      scalar::ScalarCudaStatus::accepted_after_one_retry,
                  "rank1-origin collective rollback and same-dt retry"))
-      return 1;
+      return false;
     cpu::PersistentRank2TrajectoryState fault_after{};
     if (!require(fault->CopyPublishedTrajectoryState(fault_after),
                  "fault post-retry state capture"))
-      return 1;
+      return false;
     const scalar::ScalarCudaEvidence& fault_evidence =
         fault->trajectory_evidence();
     const auto& failed = fault_evidence.attempts[6];
@@ -1014,79 +1200,124 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
         fault_evidence.coordinates.generation == 7 &&
         fault_evidence.coordinates.cursor == 7 &&
         fault_evidence.coordinates.dt == scalar::fixed_dt;
-    if (!require(oracle::SameStateBytes(fault_before,
-                                        cuda_baseline_states[6]) &&
-                     oracle::SameStateBytes(fault_after,
-                                            cuda_baseline_states[7]),
-                 "failure rollback and retry preserve baseline bytes") ||
-        !require(retry_provenance,
-                 "exact four-campaign failure/retry provenance") ||
-        !require(oracle::AcceptedAttemptResidualBounds(retry),
-                 "retry admissibility, conservation, Newton and true-GMRES"))
-      return 1;
+    const bool fault_before_bytes =
+        oracle::SameStateBytes(fault_before, cuda_baseline_states[6]);
+    const bool fault_after_bytes =
+        oracle::SameStateBytes(fault_after, cuda_baseline_states[7]);
+    const bool retry_residuals =
+        oracle::AcceptedAttemptResidualBounds(retry);
+    const bool fault_before_bytes_gate = require(
+        fault_before_bytes, "failure rollback preserves step-six bytes");
+    const bool fault_after_bytes_gate = require(
+        fault_after_bytes, "same-dt retry reproduces step-seven bytes");
+    const bool retry_provenance_gate = require(
+        retry_provenance, "exact four-campaign failure/retry provenance");
+    const bool retry_residual_gate = require(
+        retry_residuals,
+        "retry admissibility, conservation, Newton and true-GMRES");
+    if (!fault_before_bytes_gate || !fault_after_bytes_gate ||
+        !retry_provenance_gate || !retry_residual_gate)
+      return false;
+    return true;
+  };
+  bool fault_campaigns_pass = true;
+  for (const FaultCase& campaign : fault_cases)
+  {
+    const bool pass = run_fault_campaign(campaign);
+    if (rank == 0)
+      std::cout << "C3 post-baseline phase=fault-campaign injection="
+                << static_cast<int>(campaign.injection)
+                << " pass=" << pass << '\n';
+    fault_campaigns_pass = pass && fault_campaigns_pass;
   }
 
   const auto reject = [&](scalar::ScalarCudaCheckpoint candidate,
                           const scalar::ScalarCudaStatus expected,
-                          const std::string_view message)
+                          const std::string_view message) -> bool
   {
     auto owner = CreateCuda();
-    if (!require(owner != nullptr, "negative owner creation")) return;
+    if (!require(owner != nullptr, "negative owner creation")) return false;
     const scalar::ScalarCudaStatus initialized =
         owner->InitializePersistentTrajectory();
     if (!require(initialized == scalar::ScalarCudaStatus::ready,
                  "negative owner initialization"))
-      return;
+      return false;
     cpu::PersistentRank2TrajectoryState state_before{};
     const bool before_copied =
         owner->CopyPublishedTrajectoryState(state_before);
-    if (!require(before_copied, "negative pre-state capture")) return;
+    if (!require(before_copied, "negative pre-state capture")) return false;
     *negative_evidence_before = owner->trajectory_evidence();
     const scalar::ScalarCudaStatus rejected =
         owner->RestoreTrajectoryCheckpoint(candidate);
-    if (!require(rejected == expected, message)) return;
+    const bool status_gate = require(rejected == expected, message);
     cpu::PersistentRank2TrajectoryState state_after{};
     const bool after_copied =
         owner->CopyPublishedTrajectoryState(state_after);
-    if (!require(after_copied, "negative post-state capture")) return;
     const scalar::ScalarCudaEvidence& evidence_after =
         owner->trajectory_evidence();
-    require(oracle::SameStateBytes(state_before, state_after) &&
-                oracle::SameLogicalEvidence(*negative_evidence_before,
-                                            evidence_after),
-            "corrupt checkpoint preserves state and logical evidence");
+    const bool state_preserved =
+        oracle::SameStateBytes(state_before, state_after);
+    const bool logical_preserved = oracle::SameLogicalEvidence(
+        *negative_evidence_before, evidence_after);
+    const bool post_copy_gate =
+        require(after_copied, "negative post-state capture");
+    const bool state_gate = require(
+        state_preserved, "corrupt checkpoint preserves state bytes");
+    const bool logical_gate = require(
+        logical_preserved, "corrupt checkpoint preserves logical evidence");
+    return status_gate && post_copy_gate && state_gate && logical_gate;
+  };
+
+  bool checkpoint_negatives_pass = true;
+  const auto record_checkpoint_negative =
+      [&](const std::string_view label, const bool pass)
+  {
+    if (rank == 0)
+      std::cout << "C3 post-baseline phase=checkpoint-negative case="
+                << label << " pass=" << pass << '\n';
+    checkpoint_negatives_pass = pass && checkpoint_negatives_pass;
   };
 
   scalar::ScalarCudaCheckpoint identity = cuda_checkpoint10;
   if (rank == 1) { identity.shard_rank = 0; }
-  reject(identity, scalar::ScalarCudaStatus::restart_identity_failure,
-         "rank-local identity negative");
+  record_checkpoint_negative(
+      "identity",
+      reject(identity, scalar::ScalarCudaStatus::restart_identity_failure,
+             "rank-local identity negative"));
   scalar::ScalarCudaCheckpoint bytes = cuda_checkpoint10;
   bytes.interior_component_slabs[0] += 1.0;
-  reject(bytes, scalar::ScalarCudaStatus::restart_hash_failure,
-         "raw-byte hash negative");
+  record_checkpoint_negative(
+      "raw-byte",
+      reject(bytes, scalar::ScalarCudaStatus::restart_hash_failure,
+             "raw-byte hash negative"));
   scalar::ScalarCudaCheckpoint manifest = cuda_checkpoint10;
   manifest.canonical_manifest_hash.bytes[0] ^= 0x1U;
-  reject(manifest, scalar::ScalarCudaStatus::restart_hash_failure,
-         "combined-manifest negative");
+  record_checkpoint_negative(
+      "manifest",
+      reject(manifest, scalar::ScalarCudaStatus::restart_hash_failure,
+             "combined-manifest negative"));
   scalar::ScalarCudaCheckpoint rho_zero = cuda_checkpoint10;
   rho_zero.interior_component_slabs[0] = 0.0;
-  if (!require(oracle::ResealCheckpoint(rho_zero),
-               "rho-zero adversarial checkpoint reseal"))
-    return 1;
-  reject(rho_zero, scalar::ScalarCudaStatus::restart_admissibility_failure,
-         "authenticated rho-zero semantic negative");
+  const bool rho_resealed = require(
+      oracle::ResealCheckpoint(rho_zero),
+      "rho-zero adversarial checkpoint reseal");
+  const bool rho_negative = rho_resealed && reject(
+      rho_zero, scalar::ScalarCudaStatus::restart_admissibility_failure,
+      "authenticated rho-zero semantic negative");
+  record_checkpoint_negative("rho-zero", rho_negative);
   scalar::ScalarCudaCheckpoint sigma_shift = cuda_checkpoint10;
   constexpr std::size_t sigma_component_slab =
       scalar::state_components * scalar::persistent_elements *
       scalar::volume_nodes;
   sigma_shift.interior_component_slabs[sigma_component_slab] += 1.0;
-  if (!require(oracle::ResealCheckpoint(sigma_shift),
-               "Sigma-shift adversarial checkpoint reseal"))
-    return 1;
-  reject(sigma_shift,
-         scalar::ScalarCudaStatus::restart_auxiliary_residual_failure,
-         "authenticated Sigma+1 auxiliary-residual negative");
+  const bool sigma_resealed = require(
+      oracle::ResealCheckpoint(sigma_shift),
+      "Sigma-shift adversarial checkpoint reseal");
+  const bool sigma_negative = sigma_resealed && reject(
+      sigma_shift,
+      scalar::ScalarCudaStatus::restart_auxiliary_residual_failure,
+      "authenticated Sigma+1 auxiliary-residual negative");
+  record_checkpoint_negative("sigma-shift", sigma_negative);
 
   int global_failures = 0;
   const int terminal_collective = MPI_Allreduce(
@@ -1097,7 +1328,9 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
               << '\n';
     return 1;
   }
-  return global_failures == 0 ? 0 : 1;
+  const bool postbaseline_pass = restart_replay_pass &&
+      fault_campaigns_pass && checkpoint_negatives_pass;
+  return global_failures == 0 && postbaseline_pass ? 0 : 1;
 }
 } // namespace
 
