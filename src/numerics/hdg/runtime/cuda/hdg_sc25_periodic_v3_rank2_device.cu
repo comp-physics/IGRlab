@@ -3439,10 +3439,11 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
       return false;
     }
     true_matrix->HypreReadWrite();
-    view.true_matrix_data = diagonal_view.GetMemoryData().ReadWrite(
-        mfem::MemoryClass::DEVICE, view.true_matrix_diag_nonzeros);
-    view.true_matrix_offd_data = offdiagonal_view.GetMemoryData().ReadWrite(
-        mfem::MemoryClass::DEVICE, view.true_matrix_offd_nonzeros);
+    hypre_ParCSRMatrix* raw = *true_matrix;
+    auto* diag = hypre_ParCSRMatrixDiag(raw);
+    auto* offd = hypre_ParCSRMatrixOffd(raw);
+    view.true_matrix_data = hypre_CSRMatrixData(diag);
+    view.true_matrix_offd_data = hypre_CSRMatrixData(offd);
     view.true_rhs = true_rhs->Write();
     view.true_solution = true_solution->Read();
     bool uploads = true;
@@ -3885,10 +3886,11 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     try
     {
       true_matrix->HypreReadWrite();
-      view.true_matrix_data = diagonal_view.GetMemoryData().ReadWrite(
-          mfem::MemoryClass::DEVICE, view.true_matrix_diag_nonzeros);
-      view.true_matrix_offd_data = offdiagonal_view.GetMemoryData().ReadWrite(
-          mfem::MemoryClass::DEVICE, view.true_matrix_offd_nonzeros);
+      hypre_ParCSRMatrix* raw = *true_matrix;
+      auto* diag = hypre_ParCSRMatrixDiag(raw);
+      auto* offd = hypre_ParCSRMatrixOffd(raw);
+      view.true_matrix_data = hypre_CSRMatrixData(diag);
+      view.true_matrix_offd_data = hypre_CSRMatrixData(offd);
       view.true_rhs = true_rhs->Write();
       pointers_ready = view.true_matrix_data != nullptr &&
           (view.true_matrix_offd_nonzeros == 0 ||
