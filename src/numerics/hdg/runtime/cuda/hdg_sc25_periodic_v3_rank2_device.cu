@@ -1325,6 +1325,8 @@ __device__ void AssembleSystem(scalar_detail::DeviceView& view)
 
 __device__ void ApplyAuxiliaryIdentityRows(scalar_detail::DeviceView& view)
 {
+  constexpr int physical_interior = scalar::state_components * ns;
+  constexpr int physical_trace = scalar::state_components * nf;
   for (int element = 0; element < view.elements; ++element)
   {
     double* a = view.a + static_cast<std::size_t>(element) * ni * ni;
@@ -1333,7 +1335,7 @@ __device__ void ApplyAuxiliaryIdentityRows(scalar_detail::DeviceView& view)
     double* d = view.d + static_cast<std::size_t>(element) * nt * nt;
     double* local_r = view.local_residual + element * ni;
     double* trace_r = view.trace_residual + element * nt;
-    for (int row = 0; row < 16; ++row)
+    for (int row = 0; row < physical_interior; ++row)
     {
       for (int column = 0; column < ni; ++column)
       {
@@ -1345,7 +1347,18 @@ __device__ void ApplyAuxiliaryIdentityRows(scalar_detail::DeviceView& view)
       }
       local_r[row] = 0.0;
     }
-    for (int row = 0; row < 32; ++row)
+    for (int row = physical_interior; row < ni; ++row)
+    {
+      for (int column = 0; column < physical_interior; ++column)
+      {
+        a[row * ni + column] = 0.0;
+      }
+      for (int column = 0; column < physical_trace; ++column)
+      {
+        b[row * nt + column] = 0.0;
+      }
+    }
+    for (int row = 0; row < physical_trace; ++row)
     {
       for (int column = 0; column < ni; ++column)
       {
@@ -1356,6 +1369,17 @@ __device__ void ApplyAuxiliaryIdentityRows(scalar_detail::DeviceView& view)
         d[row * nt + column] = row == column ? 1.0 : 0.0;
       }
       trace_r[row] = 0.0;
+    }
+    for (int row = physical_trace; row < nt; ++row)
+    {
+      for (int column = 0; column < physical_interior; ++column)
+      {
+        c[row * ni + column] = 0.0;
+      }
+      for (int column = 0; column < physical_trace; ++column)
+      {
+        d[row * nt + column] = 0.0;
+      }
     }
   }
 }
