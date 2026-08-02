@@ -5515,12 +5515,6 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
           ScalarCudaFailureCause::injected_trace_linear;
       break;
     }
-    if (!value.CaptureTrueTraceSolution(value.capture_snapshot))
-    {
-      failure = ScalarCudaStatus::transfer_failure;
-      value.pending_attempt.failure_cause = ScalarCudaFailureCause::transfer;
-      break;
-    }
     int trace_iterations = -1;
     double trace_residual = 0.0;
     double trace_rhs = 0.0;
@@ -5531,7 +5525,7 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
           ScalarCudaFailureCause::trace_nonconvergence;
       break;
     }
-    if (!value.CaptureRecoveredIncrement(value.capture_snapshot))
+    if (!value.CaptureTrueTraceSolution(value.capture_snapshot))
     {
       failure = ScalarCudaStatus::transfer_failure;
       value.pending_attempt.failure_cause = ScalarCudaFailureCause::transfer;
@@ -5542,6 +5536,12 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
     {
       failure = ScalarCudaStatus::local_factor_failure;
       value.pending_attempt.failure_cause = value.LastDeviceFailureCause();
+      break;
+    }
+    if (!value.CaptureRecoveredIncrement(value.capture_snapshot))
+    {
+      failure = ScalarCudaStatus::transfer_failure;
+      value.pending_attempt.failure_cause = ScalarCudaFailureCause::transfer;
       break;
     }
     std::array<double, 16> solve_metrics{};
@@ -5900,14 +5900,14 @@ bool PersistentSc25ScalarIgrCudaRank2::
         static_cast<std::size_t>(value.evidence.step_evidence_count++)] =
         value.pending_step;
   }
-  const int snapshot_index = value.pending_attempt.target_step;
-  if (snapshot_index > 0 && snapshot_index <= persistent_required_steps)
+  const int snapshot_index = value.evidence.snapshot_count;
+  if (snapshot_index >= 0 &&
+      snapshot_index < static_cast<int>(value.evidence.snapshots.size()))
   {
     value.pending_snapshot.status = value.pending_attempt.status;
     value.evidence.snapshots[static_cast<std::size_t>(snapshot_index)] =
         value.pending_snapshot;
-    value.evidence.snapshot_count =
-        std::max(value.evidence.snapshot_count, snapshot_index + 1);
+    ++value.evidence.snapshot_count;
   }
   ++value.evidence.accepted_steps;
   ++value.evidence.attempted_steps;
@@ -6236,8 +6236,12 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
   value.evidence.coordinates = value.coordinates;
   value.evidence.attempts = {};
   value.evidence.steps = {};
+  value.evidence.snapshot_count = 0;
+  value.evidence.snapshots = {};
   value.pending_attempt = {};
   value.pending_step = {};
+  value.capture_snapshot = {};
+  value.pending_snapshot = {};
   value.pending_attempt_active = false;
   value.prepare_retry_index = 0;
   value.last_device_status = detail::device_success;

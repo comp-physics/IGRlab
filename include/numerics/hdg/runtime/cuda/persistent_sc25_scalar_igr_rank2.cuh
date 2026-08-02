@@ -362,6 +362,7 @@ struct ScalarCudaSnapshotEvidence final
   StateCoordinates coordinates{};
   int target_step = 0;
   int retry_index = 0;
+  int iteration = -1;
   int attempted_newton_iterations = 0;
   int newton_iterations = 0;
   int full_vector_size = 0;

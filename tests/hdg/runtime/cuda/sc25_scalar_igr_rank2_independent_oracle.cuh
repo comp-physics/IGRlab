@@ -612,6 +612,64 @@ inline bool SameSnapshot(const scalar::ScalarCudaSnapshotEvidence& left,
       left.conserved_integrals == right.conserved_integrals;
 }
 
+inline bool CoherentReplayEvidence(
+    const scalar::ScalarCudaEvidence& evidence,
+    const int checkpoint_step) noexcept
+{
+  if (checkpoint_step <= 0 ||
+      checkpoint_step > scalar::persistent_required_steps ||
+      evidence.snapshot_count < 0 ||
+      evidence.snapshot_count > scalar::persistent_required_steps -
+          checkpoint_step ||
+      evidence.attempt_count != evidence.snapshot_count ||
+      evidence.step_evidence_count != evidence.snapshot_count ||
+      evidence.attempted_steps != evidence.snapshot_count ||
+      evidence.retry_attempts != 0 ||
+      evidence.accepted_steps != checkpoint_step + evidence.snapshot_count)
+    return false;
+  static const scalar::ScalarCudaAttemptEvidence empty_attempt{};
+  static const scalar::ScalarCudaStepEvidence empty_step{};
+  static const scalar::ScalarCudaSnapshotEvidence empty_snapshot{};
+  for (std::size_t index = 0; index < evidence.snapshots.size(); ++index)
+  {
+    const bool populated =
+        index < static_cast<std::size_t>(evidence.snapshot_count);
+    if (!populated)
+    {
+      if (!SameSnapshot(evidence.snapshots[index], empty_snapshot))
+        return false;
+      continue;
+    }
+    const int target_step = checkpoint_step + static_cast<int>(index) + 1;
+    const auto& attempt = evidence.attempts[index];
+    const auto& step = evidence.steps[index];
+    const auto& snapshot = evidence.snapshots[index];
+    if (attempt.status != scalar::ScalarCudaStatus::accepted ||
+        attempt.target_step != target_step || attempt.retry_index != 0 ||
+        step.step != target_step || step.attempt_index !=
+            static_cast<int>(index) || !step.accepted ||
+        !snapshot.valid || snapshot.initialization ||
+        snapshot.status != scalar::ScalarCudaStatus::accepted ||
+        snapshot.target_step != target_step || snapshot.retry_index != 0 ||
+        snapshot.coordinates.step != static_cast<std::uint64_t>(target_step) ||
+        snapshot.coordinates.generation !=
+            static_cast<std::uint64_t>(target_step) ||
+        snapshot.coordinates.cursor != static_cast<std::uint64_t>(target_step))
+      return false;
+  }
+  for (std::size_t index = static_cast<std::size_t>(evidence.snapshot_count);
+       index < evidence.attempts.size(); ++index)
+  {
+    if (!SameAttempt(evidence.attempts[index], empty_attempt)) return false;
+  }
+  for (std::size_t index = static_cast<std::size_t>(evidence.snapshot_count);
+       index < evidence.steps.size(); ++index)
+  {
+    if (!SameStep(evidence.steps[index], empty_step)) return false;
+  }
+  return true;
+}
+
 inline bool SameLogicalEvidence(const scalar::ScalarCudaEvidence& left,
                                 const scalar::ScalarCudaEvidence& right)
     noexcept

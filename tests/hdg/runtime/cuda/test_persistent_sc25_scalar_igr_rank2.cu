@@ -60,6 +60,22 @@ bool CudaAccepted(const scalar::ScalarCudaStatus status) noexcept
       status == scalar::ScalarCudaStatus::accepted_after_one_retry;
 }
 
+std::unique_ptr<scalar::PersistentSc25ScalarIgrCudaRank2> CreateCuda()
+{
+  scalar::ScalarCudaConfig config{};
+  config.polynomial_degree = 1;
+  config.elements_per_direction =
+      cpu::persistent_elements_per_direction;
+  config.requested_device = 0;
+  config.require_host_staged_rank2 = true;
+  std::unique_ptr<scalar::PersistentSc25ScalarIgrCudaRank2> result;
+  const scalar::ScalarCudaStatus status =
+      scalar::PersistentSc25ScalarIgrCudaRank2::Create(
+          MPI_COMM_WORLD, config, result);
+  if (status != scalar::ScalarCudaStatus::ready) return {};
+  return result;
+}
+
 struct HypreAdmission final
 {
   HYPRE_Int initialized = 0;
@@ -341,6 +357,10 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
   if (!require(restored == scalar::ScalarCudaStatus::ready,
                "fresh two-shard restore"))
     return 1;
+  if (!require(oracle::CoherentReplayEvidence(
+                   restart->trajectory_evidence(), 10),
+               "fresh restore invalidates all future snapshot evidence"))
+    return 1;
   const bool restored_state_copied =
       restart->CopyPublishedTrajectoryState(cuda_state);
   if (!require(restored_state_copied, "fresh restored state copy")) return 1;
@@ -354,6 +374,14 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
     const scalar::ScalarCudaStatus replayed =
         restart->AdvancePersistentTrajectory();
     if (!require(CudaAccepted(replayed), "fresh restore replay")) return 1;
+    const auto& replay_evidence = restart->trajectory_evidence();
+    const std::size_t replay_index = static_cast<std::size_t>(step - 11);
+    if (!require(oracle::CoherentReplayEvidence(replay_evidence, 10) &&
+                     oracle::OperatorSnapshotParity(
+                         cpu_reference.steps[static_cast<std::size_t>(step)],
+                         replay_evidence.snapshots[replay_index], step),
+                 "fresh replay appends dense coherent snapshot evidence"))
+      return 1;
   }
   const bool replay_state_copied =
       restart->CopyPublishedTrajectoryState(cuda_state);
@@ -365,6 +393,29 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
       restart->RestoreTrajectoryCheckpoint(cuda_checkpoint10);
   if (!require(used_restore == scalar::ScalarCudaStatus::ready,
                "used-owner restore"))
+    return 1;
+  if (!require(oracle::CoherentReplayEvidence(
+                   restart->trajectory_evidence(), 10),
+               "used-owner restore invalidates prior/future snapshots"))
+    return 1;
+  if (!require(restart->CopyPublishedTrajectoryState(cuda_state) &&
+                   oracle::SameStateBytes(cuda_baseline_states[10],
+                                          cuda_state),
+               "used-owner restore installs exact step-ten bytes"))
+    return 1;
+  const scalar::ScalarCudaStatus used_replay =
+      restart->AdvancePersistentTrajectory();
+  if (!require(CudaAccepted(used_replay), "used-owner replay")) return 1;
+  const auto& used_replay_evidence = restart->trajectory_evidence();
+  if (!require(oracle::CoherentReplayEvidence(used_replay_evidence, 10) &&
+                   used_replay_evidence.snapshot_count == 1 &&
+                   oracle::OperatorSnapshotParity(
+                       cpu_reference.steps[11],
+                       used_replay_evidence.snapshots[0], 11) &&
+                   restart->CopyPublishedTrajectoryState(cuda_state) &&
+                   oracle::SameStateBytes(cuda_baseline_states[11],
+                                          cuda_state),
+               "used-owner replay appends one coherent snapshot"))
     return 1;
   restart.reset();
 
