@@ -1071,6 +1071,12 @@ bool RunC1()
 
 bool RunTransactionNegatives()
 {
+  const auto step0_evidence =
+      std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto prospective =
+      std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto finalized_prospective =
+      std::make_unique<scalar::ScalarCudaEvidence>();
   auto foreign = CreateCuda(8);
   auto owner = CreateCuda(8);
   if (!owner || !foreign ||
@@ -1081,8 +1087,7 @@ bool RunTransactionNegatives()
   }
   scalar::PublishedState step0{};
   if (!owner->CopyPublishedTrajectoryState(step0)) { return false; }
-  const scalar::ScalarCudaEvidence step0_evidence =
-      owner->trajectory_evidence();
+  *step0_evidence = owner->trajectory_evidence();
   scalar::PersistentSc25ScalarIgrCudaRank1::Transaction invalid;
   if (owner->InstallPersistentTrajectoryTransaction(invalid)) { return false; }
 
@@ -1107,7 +1112,6 @@ bool RunTransactionNegatives()
   scalar::PublishedState installed{};
   scalar::ScalarCudaCheckpoint forbidden{};
   scalar::ScalarCudaCheckpoint staged_checkpoint{};
-  scalar::ScalarCudaEvidence prospective{};
   scalar::PersistentSc25ScalarIgrCudaRank1::Transaction concurrent;
   if (!owner->CopyPublishedTrajectoryState(installed) ||
       !oracle::SameStateBytes(step0, installed) ||
@@ -1118,11 +1122,11 @@ bool RunTransactionNegatives()
       concurrent.valid() ||
       owner->CaptureTrajectoryCheckpoint(forbidden) ||
       !owner->StageInstalledTrajectoryTransaction(
-          live, staged_checkpoint, prospective) ||
+          live, staged_checkpoint, *prospective) ||
       staged_checkpoint.descriptor.coordinates.step != 1 ||
-      prospective.accepted_steps != 1 ||
-      prospective.attempted_steps != 1 ||
-      prospective.coordinates.step != 1 ||
+      prospective->accepted_steps != 1 ||
+      prospective->attempted_steps != 1 ||
+      prospective->coordinates.step != 1 ||
       !owner->RevertPersistentTrajectoryTransaction(std::move(live)) ||
       live.valid() ||
       owner->RevertPersistentTrajectoryTransaction(std::move(live)))
@@ -1134,8 +1138,8 @@ bool RunTransactionNegatives()
       owner->trajectory_evidence();
   if (!owner->CopyPublishedTrajectoryState(reverted) ||
       !oracle::SameStateBytes(step0, reverted) ||
-      !SameLogicalEvidence(step0_evidence, reverted_evidence) ||
-      !RestorePhysicalEvidenceAdvanced(step0_evidence, reverted_evidence))
+      !SameLogicalEvidence(*step0_evidence, reverted_evidence) ||
+      !RestorePhysicalEvidenceAdvanced(*step0_evidence, reverted_evidence))
   {
     return false;
   }
@@ -1146,23 +1150,22 @@ bool RunTransactionNegatives()
       aborted.provisionally_installed() ||
       !owner->RevertPersistentTrajectoryTransaction(std::move(aborted)) ||
       aborted.valid() ||
-      !SameLogicalEvidence(step0_evidence, owner->trajectory_evidence()))
+      !SameLogicalEvidence(*step0_evidence, owner->trajectory_evidence()))
   {
     return false;
   }
 
   scalar::PersistentSc25ScalarIgrCudaRank1::Transaction finalized;
   scalar::ScalarCudaCheckpoint finalized_checkpoint{};
-  scalar::ScalarCudaEvidence finalized_prospective{};
   if (owner->PreparePersistentTrajectoryTransaction(finalized) !=
           scalar::ScalarCudaStatus::accepted ||
       !owner->InstallPersistentTrajectoryTransaction(finalized) ||
       !owner->StageInstalledTrajectoryTransaction(
-          finalized, finalized_checkpoint, finalized_prospective) ||
+          finalized, finalized_checkpoint, *finalized_prospective) ||
       !owner->FinalizePersistentTrajectoryTransaction(std::move(finalized)) ||
       finalized.valid() ||
       owner->FinalizePersistentTrajectoryTransaction(std::move(finalized)) ||
-      !SameLogicalEvidence(finalized_prospective,
+      !SameLogicalEvidence(*finalized_prospective,
                            owner->trajectory_evidence()))
   {
     return false;
@@ -1861,6 +1864,7 @@ bool RunAbandonedPreparedTokenNegative()
 
 bool RunDirectPrepareInjectedFailureNegative()
 {
+  const auto retained = std::make_unique<scalar::ScalarCudaEvidence>();
   auto owner = CreateCuda(8);
   if (!owner || owner->InitializePersistentTrajectory() !=
           scalar::ScalarCudaStatus::ready)
@@ -1880,21 +1884,21 @@ bool RunDirectPrepareInjectedFailureNegative()
   {
     return false;
   }
-  const auto retained = owner->trajectory_evidence();
+  *retained = owner->trajectory_evidence();
   scalar::PersistentSc25ScalarIgrCudaRank1::Transaction overwrite;
-  if (retained.accepted_steps != 0 || retained.attempted_steps != 1 ||
-      retained.retry_attempts != 1 || retained.attempt_count != 1 ||
-      retained.coordinates.step != 0 ||
-      retained.first_failure !=
+  if (retained->accepted_steps != 0 || retained->attempted_steps != 1 ||
+      retained->retry_attempts != 1 || retained->attempt_count != 1 ||
+      retained->coordinates.step != 0 ||
+      retained->first_failure !=
           scalar::ScalarCudaStatus::injected_local_factor_failure ||
-      retained.attempts[0].status !=
+      retained->attempts[0].status !=
           scalar::ScalarCudaStatus::injected_local_factor_failure ||
-      retained.attempts[0].failure_cause !=
+      retained->attempts[0].failure_cause !=
           scalar::ScalarCudaFailureCause::injected_local_factor ||
-      retained.attempts[0].injection !=
+      retained->attempts[0].injection !=
           scalar::FailureInjection::local_factor ||
-      !oracle::NonzeroHashes(retained.attempts[0].entry_hashes) ||
-      !oracle::NonzeroHashes(retained.attempts[0].candidate_hashes) ||
+      !oracle::NonzeroHashes(retained->attempts[0].entry_hashes) ||
+      !oracle::NonzeroHashes(retained->attempts[0].candidate_hashes) ||
       owner->PreparePersistentTrajectoryTransaction(overwrite) !=
           scalar::ScalarCudaStatus::accepted ||
       !overwrite.valid() || overwrite.provisionally_installed() ||
@@ -1903,15 +1907,16 @@ bool RunDirectPrepareInjectedFailureNegative()
     return false;
   }
   const auto& unchanged = owner->trajectory_evidence();
-  return unchanged.attempt_count == retained.attempt_count &&
-      unchanged.retry_attempts == retained.retry_attempts &&
-      unchanged.first_failure == retained.first_failure &&
-      unchanged.attempts[0].status == retained.attempts[0].status &&
+  return unchanged.attempt_count == retained->attempt_count &&
+      unchanged.retry_attempts == retained->retry_attempts &&
+      unchanged.first_failure == retained->first_failure &&
+      unchanged.attempts[0].status == retained->attempts[0].status &&
       unchanged.coordinates.step == 0;
 }
 
 bool RunInstalledAbandonmentNegative()
 {
+  const auto committed = std::make_unique<scalar::ScalarCudaEvidence>();
   auto owner = CreateCuda(8);
   if (!owner || owner->InitializePersistentTrajectory() !=
           scalar::ScalarCudaStatus::ready)
@@ -1927,7 +1932,7 @@ bool RunInstalledAbandonmentNegative()
   {
     return false;
   }
-  const scalar::ScalarCudaEvidence committed = owner->trajectory_evidence();
+  *committed = owner->trajectory_evidence();
   {
     scalar::PersistentSc25ScalarIgrCudaRank1::Transaction abandoned;
     if (owner->PreparePersistentTrajectoryTransaction(abandoned) !=
@@ -1944,20 +1949,20 @@ bool RunInstalledAbandonmentNegative()
   return owner->status() == scalar::ScalarCudaStatus::transaction_prepared &&
       owner->CopyPublishedTrajectoryState(installed) &&
       oracle::SameStateBytes(before, installed) &&
-      hidden.status == committed.status &&
-      hidden.accepted_steps == committed.accepted_steps &&
-      hidden.attempted_steps == committed.attempted_steps &&
-      hidden.attempt_count == committed.attempt_count &&
-      hidden.step_evidence_count == committed.step_evidence_count &&
-      hidden.coordinates.step == committed.coordinates.step &&
+      hidden.status == committed->status &&
+      hidden.accepted_steps == committed->accepted_steps &&
+      hidden.attempted_steps == committed->attempted_steps &&
+      hidden.attempt_count == committed->attempt_count &&
+      hidden.step_evidence_count == committed->step_evidence_count &&
+      hidden.coordinates.step == committed->coordinates.step &&
       hidden.launches.assemble_launches >=
-          committed.launches.assemble_launches &&
+          committed->launches.assemble_launches &&
       hidden.launches.condense_launches >=
-          committed.launches.condense_launches &&
+          committed->launches.condense_launches &&
       hidden.launches.recover_launches >=
-          committed.launches.recover_launches &&
-      hidden.transfers.count > committed.transfers.count &&
-      hidden.reuse.identity_hash == committed.reuse.identity_hash &&
+          committed->launches.recover_launches &&
+      hidden.transfers.count > committed->transfers.count &&
+      hidden.reuse.identity_hash == committed->reuse.identity_hash &&
       !owner->CaptureTrajectoryCheckpoint(checkpoint) &&
       owner->RestoreTrajectoryCheckpoint(committed_checkpoint) ==
           scalar::ScalarCudaStatus::restart_identity_failure &&

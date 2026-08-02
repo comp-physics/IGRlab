@@ -674,6 +674,12 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
   // its initialization/warm plateau and is reused by every negative campaign.
   const auto negative_evidence_before =
       std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto before_prepare_evidence =
+      std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto prospective_evidence =
+      std::make_unique<scalar::ScalarCudaEvidence>();
+  const auto finalized_prospective =
+      std::make_unique<scalar::ScalarCudaEvidence>();
   const auto cuda_baseline_snapshots = std::make_unique<std::array<
       scalar::ScalarCudaSnapshotEvidence,
       cpu::persistent_required_steps + 1>>();
@@ -729,8 +735,7 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
   const bool before_prepare_copied =
       cuda_owner->CopyPublishedTrajectoryState(before_prepare);
   if (!require(before_prepare_copied, "pre-prepare committed state")) return 1;
-  const scalar::ScalarCudaEvidence before_prepare_evidence =
-      cuda_owner->trajectory_evidence();
+  *before_prepare_evidence = cuda_owner->trajectory_evidence();
   scalar::PersistentSc25ScalarIgrCudaRank2::Transaction prepared{};
   const scalar::ScalarCudaStatus prepared_status =
       cuda_owner->PreparePersistentTrajectoryTransaction(prepared);
@@ -755,16 +760,15 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
       scalar::persistent_interior_unknowns);
   staged_checkpoint.owned_trace_component_slabs.resize(
       before_prepare.uhat.size() + before_prepare.sigmahat.size());
-  scalar::ScalarCudaEvidence prospective_evidence{};
   const bool candidate_staged =
       cuda_owner->StageInstalledTrajectoryTransaction(
-          prepared, staged_checkpoint, prospective_evidence);
+          prepared, staged_checkpoint, *prospective_evidence);
   if (!require(candidate_staged &&
                    staged_checkpoint.descriptor.coordinates.step == 1 &&
-                   prospective_evidence.accepted_steps == 1 &&
-                   prospective_evidence.attempted_steps == 1 &&
-                   prospective_evidence.snapshot_count == 2 &&
-                   prospective_evidence.coordinates.step == 1,
+                   prospective_evidence->accepted_steps == 1 &&
+                   prospective_evidence->attempted_steps == 1 &&
+                   prospective_evidence->snapshot_count == 2 &&
+                   prospective_evidence->coordinates.step == 1,
                "preallocated candidate checkpoint/prospective evidence"))
     return 1;
   const bool prepared_reverted =
@@ -778,12 +782,12 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
                "affine prepare/install/revert is atomic"))
     return 1;
   if (!require(oracle::SameLogicalEvidence(
-                   before_prepare_evidence,
+                   *before_prepare_evidence,
                    cuda_owner->trajectory_evidence()),
                "affine revert restores exact logical evidence"))
     return 1;
   if (!require(RollbackPhysicalEvidenceAdvanced(
-                   before_prepare_evidence,
+                   *before_prepare_evidence,
                    cuda_owner->trajectory_evidence()),
                "affine revert retains monotone physical work at allocation plateau"))
     return 1;
@@ -794,7 +798,7 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
       cuda_owner->RevertPersistentTrajectoryTransaction(std::move(aborted));
   if (!require(uninstalled_aborted && !aborted.valid() &&
                    oracle::SameLogicalEvidence(
-                       before_prepare_evidence,
+                       *before_prepare_evidence,
                        cuda_owner->trajectory_evidence()),
                "prepared/uninstalled affine token abort"))
     return 1;
@@ -806,16 +810,15 @@ int RunC3(const manifest::CpuReferenceManifest& cpu_reference)
     if (step == 1)
     {
       scalar::PersistentSc25ScalarIgrCudaRank2::Transaction finalized{};
-      scalar::ScalarCudaEvidence finalized_prospective{};
       const bool staged_finalized = CudaAccepted(
           cuda_owner->PreparePersistentTrajectoryTransaction(finalized)) &&
           cuda_owner->InstallPersistentTrajectoryTransaction(finalized) &&
           cuda_owner->StageInstalledTrajectoryTransaction(
-              finalized, staged_checkpoint, finalized_prospective) &&
+              finalized, staged_checkpoint, *finalized_prospective) &&
           cuda_owner->FinalizePersistentTrajectoryTransaction(
               std::move(finalized)) &&
           oracle::SameLogicalEvidence(
-              finalized_prospective, cuda_owner->trajectory_evidence());
+              *finalized_prospective, cuda_owner->trajectory_evidence());
       if (!require(staged_finalized,
                    "prospective evidence equals finalized logical evidence"))
         return 1;
