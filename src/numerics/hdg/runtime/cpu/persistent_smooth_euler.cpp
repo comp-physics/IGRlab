@@ -1,5 +1,7 @@
 #include "numerics/hdg/runtime/cpu/persistent_smooth_euler.hpp"
 
+#include "hdg_cpu_serial_lifecycle.hpp"
+
 #include "numerics/hdg/core/host_reference.hpp"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"
 
@@ -152,6 +154,28 @@ bool ManufacturedConservative(const double x, const double y,
   State primitive{};
   return ManufacturedPrimitive(x, y, primitive) &&
       Conservative(primitive, conservative);
+}
+
+bool W8cConservative(const double x, State& conservative) noexcept
+{
+  if (!Finite(x)) { return false; }
+  conservative = x < 0.25 || x >= 0.75 ? w8c::right_state
+                                        : w8c::left_state;
+  return true;
+}
+
+bool W8cTraceConservative(const double x, State& conservative) noexcept
+{
+  if (!Finite(x)) { return false; }
+  constexpr double tolerance =
+      64.0 * std::numeric_limits<double>::epsilon();
+  if (std::abs(x - 0.25) <= tolerance ||
+      std::abs(x - 0.75) <= tolerance)
+  {
+    conservative = w8c::interface_mean;
+    return true;
+  }
+  return W8cConservative(x, conservative);
 }
 
 State ManufacturedDerivative(const double x, const double y,
@@ -1278,6 +1302,16 @@ StateHash HashSystemMatrix(const LocalSystem& system) noexcept
 
 bool ExactConfig(const CpuPersistentConfig& config) noexcept
 {
+  const bool w8c_config = config.experiment.valid() &&
+      config.experiment == StableIdentity::Copy(w8c::experiment_id) &&
+      config.source.valid() &&
+      config.source == StableIdentity::Copy(w8c::conventional_source_id) &&
+      config.scenario == CpuScenario::smoke &&
+      config.polynomial_order == w8c::polynomial_order &&
+      config.elements_per_direction == static_cast<int>(w8c::mesh_n) &&
+      config.assembly_quadrature_order == w8c::conventional_q_a &&
+      ::dg::hdg::runtime::detail::DoubleBits(config.dt) ==
+          ::dg::hdg::runtime::detail::DoubleBits(w8c::dt);
   const bool smoke = config.scenario == CpuScenario::smoke &&
       config.polynomial_order == cpu_smoke_polynomial_order &&
       config.elements_per_direction == cpu_smoke_elements_per_direction &&
@@ -1294,7 +1328,7 @@ bool ExactConfig(const CpuPersistentConfig& config) noexcept
       config.polynomial_order == cpu_functional_polynomial_order &&
       functional_shape && config.assembly_quadrature_order ==
           cpu_functional_assembly_quadrature_order;
-  return config.experiment.valid() && config.experiment ==
+  const bool w8a_config = config.experiment.valid() && config.experiment ==
           StableIdentity::Copy(expected_experiment) &&
       config.source.valid() && config.source ==
           StableIdentity::Copy(expected_source) &&
@@ -1310,6 +1344,25 @@ bool ExactConfig(const CpuPersistentConfig& config) noexcept
       ::dg::hdg::runtime::detail::DoubleBits(config.true_residual_tolerance) ==
           ::dg::hdg::runtime::detail::DoubleBits(cpu_nonlinear_tolerance) &&
       config.allow_one_retry;
+  const bool common_controls =
+      config.maximum_newton_updates == cpu_maximum_newton_updates &&
+      config.maximum_line_search_trials == cpu_maximum_line_search_trials &&
+      ::dg::hdg::runtime::detail::DoubleBits(config.armijo_constant) ==
+          ::dg::hdg::runtime::detail::DoubleBits(cpu_armijo_constant) &&
+      ::dg::hdg::runtime::detail::DoubleBits(config.nonlinear_tolerance) ==
+          ::dg::hdg::runtime::detail::DoubleBits(cpu_nonlinear_tolerance) &&
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.true_residual_tolerance) ==
+          ::dg::hdg::runtime::detail::DoubleBits(cpu_nonlinear_tolerance) &&
+      config.allow_one_retry &&
+      !config.force_private_scientific_gate_failure;
+  return w8a_config || (w8c_config && common_controls);
+}
+
+bool IsW8cConfig(const CpuPersistentConfig& config) noexcept
+{
+  return config.experiment == StableIdentity::Copy(w8c::experiment_id) &&
+      config.source == StableIdentity::Copy(w8c::conventional_source_id);
 }
 
 bool ExactRankShape(const CpuPersistentConfig& config,
@@ -1702,7 +1755,9 @@ struct detail::CpuNumericsCore::Implementation
           mfem::Vector physical(cpu_dimension);
           transformation->Transform(nodes.IntPoint(scalar), physical);
           State state{};
-          const bool ok = perturbed
+          const bool ok = IsW8cConfig(config)
+              ? W8cTraceConservative(physical[0], state)
+              : perturbed
               ? PerturbedConservative(physical[0], physical[1], state)
               : ManufacturedConservative(physical[0], physical[1], state);
           if (!ok)
@@ -2740,8 +2795,10 @@ struct detail::CpuNumericsCore::Implementation
               !Interpolate(*old_interior, interior_vdofs,
                            scalar_interior_dofs, volume_shape_workspace,
                            old_state) ||
-              !ManufacturedSource(physical_workspace[0],
-                                  physical_workspace[1], source) ||
+              !(IsW8cConfig(config)
+                    ? (source = State{}, true)
+                    : ManufacturedSource(physical_workspace[0],
+                                         physical_workspace[1], source)) ||
               !NormalFlux(state, {{1.0, 0.0}}, flux_x) ||
               !NormalFlux(state, {{0.0, 1.0}}, flux_y) ||
               !NormalFluxJacobian(state, {{1.0, 0.0}}, jacobian_x) ||
@@ -3966,10 +4023,14 @@ bool detail::CpuNumericsCore::Initialize(
 
   try
   {
-    auto exact_function = [](const mfem::Vector& point, mfem::Vector& value)
+    const bool w8c_config = IsW8cConfig(config);
+    auto exact_function = [w8c_config](const mfem::Vector& point,
+                                      mfem::Vector& value)
     {
       State conservative{};
-      if (!ManufacturedConservative(point[0], point[1], conservative))
+      if (!(w8c_config ? W8cConservative(point[0], conservative)
+                       : ManufacturedConservative(
+                             point[0], point[1], conservative)))
       {
         throw std::runtime_error("exact state projection failed");
       }
@@ -3980,11 +4041,13 @@ bool detail::CpuNumericsCore::Initialize(
         value[component] = conservative[component];
       }
     };
-    auto perturbed_function = [](const mfem::Vector& point,
-                                 mfem::Vector& value)
+    auto perturbed_function = [w8c_config](const mfem::Vector& point,
+                                           mfem::Vector& value)
     {
       State conservative{};
-      if (!PerturbedConservative(point[0], point[1], conservative))
+      if (!(w8c_config ? W8cConservative(point[0], conservative)
+                       : PerturbedConservative(
+                             point[0], point[1], conservative)))
       {
         throw std::runtime_error("perturbed state projection failed");
       }
@@ -4220,7 +4283,9 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   evidence.committed_trace_before = state.entry_trace_hash;
 
   auto fail = [&](const CpuFailurePhase phase,
-                  const CpuAttemptStatus status = CpuAttemptStatus::runtime_failure)
+                  const CpuAttemptStatus status =
+                      CpuAttemptStatus::runtime_failure,
+                  const FailureReason reason = FailureReason::backend_failure)
   {
     evidence.failure_phase = phase;
     evidence.status = status;
@@ -4233,7 +4298,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
         state.allocations.EventsAfterBaseline();
     result.evidence = evidence;
     result.gates = {false, false, false, false, true, false};
-    result.originating_failure = FailureReason::backend_failure;
+    result.originating_failure = reason;
     return result;
   };
 
@@ -4241,8 +4306,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       state.Candidate() &&
       state.Candidate()->interior == state.Committed()->interior &&
       state.Candidate()->trace == state.Committed()->trace &&
-      (state.config.scenario != CpuScenario::functional ||
-       coordinates.step < cpu_functional_accepted_steps);
+      (IsW8cConfig(state.config)
+           ? coordinates.step < w8c::accepted_steps
+           : (state.config.scenario != CpuScenario::functional ||
+              coordinates.step < cpu_functional_accepted_steps));
   if (!state.CollectiveAll(local_entry_ready))
   {
     return fail(CpuFailurePhase::setup, CpuAttemptStatus::invalid_request);
@@ -4464,6 +4531,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     }
 
     bool accepted = false;
+    bool admissible_trial = false;
     for (int trial = 0;
          trial < state.config.maximum_line_search_trials; ++trial)
     {
@@ -4487,6 +4555,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       trial_evidence.minimum_pressure = pressure;
       trial_evidence.maximum_wave_speed = wave;
       if (!trial_evidence.prescreen_passed) { continue; }
+      admissible_trial = true;
       const bool trial_assembled = state.Assemble(
           *state.trial_interior, *state.trial_trace, state.trial_system);
       if (!state.CollectiveAll(trial_assembled))
@@ -4534,7 +4603,12 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     }
     if (!state.CollectiveAll(accepted))
     {
-      return fail(CpuFailurePhase::recovery);
+      return fail(
+          CpuFailurePhase::recovery, CpuAttemptStatus::runtime_failure,
+          IsW8cConfig(state.config)
+              ? (admissible_trial ? FailureReason::success_gate
+                                  : FailureReason::admissibility_gate)
+              : FailureReason::backend_failure);
     }
     ++updates;
     ++evidence.work.accepted_newton_updates;

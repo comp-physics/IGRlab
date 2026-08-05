@@ -965,7 +965,7 @@ public:
     prepared = CpuPreparedStep{};
     if (!contract_ || FacadeBusy()) { return false; }
     const BeginOutcome begin = contract_->BeginStep(
-        {InteriorSpace::l2, cpu_backward_euler_dt});
+        {InteriorSpace::l2, core_.evidence().dt});
     return begin.started && PrepareStarted(begin, injection, prepared);
   }
 

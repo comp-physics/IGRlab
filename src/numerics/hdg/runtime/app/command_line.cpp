@@ -1,5 +1,7 @@
 #include "numerics/hdg/runtime/app/command_line.hpp"
 
+#include "../cpu/hdg_cpu_serial_lifecycle.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -248,6 +250,22 @@ void SelectScalarIgrScenario(ApplicationOptionsView& options) noexcept
   options.checkpoint_id = scalar_igr_sc25_v3_checkpoint_id;
 }
 
+void SelectW8cScenario(ApplicationOptionsView& options,
+                       const bool scalar) noexcept
+{
+  if (scalar) SelectScalarIgrScenario(options);
+  options.scenario_id = cpu::w8c::scenario_id;
+  options.source_id = scalar ? cpu::w8c::scalar_source_id
+                             : cpu::w8c::conventional_source_id;
+  options.q_a = scalar ? cpu::w8c::scalar_q_a
+                       : cpu::w8c::conventional_q_a;
+  options.q_e = 0;
+  options.q_e4 = 0;
+  options.q_o = cpu::w8c::observable_q_o;
+  options.checkpoint_id = scalar ? cpu::w8c::scalar_checkpoint_id
+                                 : cpu::w8c::conventional_checkpoint_id;
+}
+
 bool LoadConfigFile(const std::string_view path, Settings& settings) noexcept
 {
   try
@@ -366,6 +384,7 @@ ParsedCommandLine ParseCommandLine(const int argc,
   else if (space == "h1") options.interior_space = InteriorSpace::h1;
   else { parsed.diagnostic = "ConfigurationError: --space must be l2 or h1"; return parsed; }
   const bool scalar_igr = options.card_id == scalar_igr_sc25_v3_card_id;
+  const bool w8c_case = options.case_id == cpu::w8c::case_id;
   if (!scalar_igr && options.card_id != smooth_periodic_euler_v1_card_id)
   {
     parsed.status = CommandLineStatus::rejected;
@@ -374,7 +393,8 @@ ParsedCommandLine ParseCommandLine(const int argc,
     parsed.options = options;
     return parsed;
   }
-  if (options.case_id != (scalar_igr ? scalar_igr_sc25_v3_case_id
+  if (!w8c_case &&
+      options.case_id != (scalar_igr ? scalar_igr_sc25_v3_case_id
                                      : smooth_periodic_euler_v1_case_id))
   {
     parsed.status = CommandLineStatus::rejected;
@@ -404,7 +424,9 @@ ParsedCommandLine ParseCommandLine(const int argc,
     return parsed;
   }
   options.mesh_n = static_cast<std::uint32_t>(mesh);
-  if (scalar_igr && options.accepted_steps == scalar_igr_sc25_v3_steps)
+  if (w8c_case && options.accepted_steps == cpu::w8c::accepted_steps)
+    SelectW8cScenario(options, scalar_igr);
+  else if (scalar_igr && options.accepted_steps == scalar_igr_sc25_v3_steps)
     SelectScalarIgrScenario(options);
   else if (options.accepted_steps == smooth_periodic_euler_v1_smoke_steps)
     SelectScenario(options, ApplicationScenarioV1::smoke);
@@ -486,7 +508,7 @@ ParsedCommandLine ParseCommandLine(const int argc,
   else if (stop_value)
     options.run_role = ApplicationRunRoleV1::split_writer;
   else if (options.injection.mode == FailureInjectionModeV1::prescribed &&
-           options.card_id != scalar_igr_sc25_v3_card_id)
+           (w8c_case || options.card_id != scalar_igr_sc25_v3_card_id))
     options.run_role = ApplicationRunRoleV1::focused_terminal_injection;
   else if (options.seed == smooth_periodic_euler_v1_alternate_functional_seed)
     options.run_role = ApplicationRunRoleV1::alternate_seed_reference;
@@ -539,13 +561,14 @@ void PrintCommandLineHelp(std::ostream& output)
       "   or: dg_igr_hdg_runtime [every value option below exactly once]\n\n"
       "  --card exp.hdg.euler.conventional.smooth_persistent.w8a.v1\n"
       "         exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3\n"
-      "  --case conventional-smooth-persistent-v1|sc25-periodic-smooth-persistent-v3\n"
+      "  --case conventional-smooth-persistent-v1|sc25-periodic-smooth-persistent-v3|periodic-double-riemann-v1\n"
       "  --space l2|h1                    (h1 reports UnsupportedDiscretization)\n"
       "  --mesh-family periodic-cartesian-quad --mesh-n 3|6|8|12\n"
-      "  --order 1|2 --dt 0.05|0.000244140625 --steps 3|20\n"
+      "  --order 1|2 --dt 0.05|0.000244140625|0.0009765625\n"
+      "  --steps 3|20|64 --final-time 0.15|0.0048828125|0.0625\n"
       "  --backend cpu|cuda --device-id none|0\n"
-      "  --output-dir PATH --output-steps 0,1,3|0,10,20\n"
-      "  --checkpoint-out PATH|none --checkpoint-step 1|10|none\n"
+      "  --output-dir PATH --output-steps 0,1,3|0,10,20|0,32,64\n"
+      "  --checkpoint-out PATH|none --checkpoint-step 1|10|32|none\n"
       "  --stop-after-checkpoint true|false --restart-from PATH|none\n"
       "  --max-retries 0|1\n"
       "  --inject-failure off|PHASE:TARGET_STEP:RANK\n"

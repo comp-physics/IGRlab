@@ -1,5 +1,7 @@
 #include "numerics/hdg/runtime/app/application_contract.hpp"
 
+#include "../cpu/hdg_cpu_serial_lifecycle.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -120,8 +122,10 @@ bool ComputeApplicationConfigHashes(
     const DeferredRuntimePredicatesV1& deferred,
     ApplicationConfigHashes& hashes) noexcept
 {
+  const bool w8c_case = options.case_id == cpu::w8c::case_id;
   CanonicalHashWriter scientific;
   if (!scientific.Text(
+          w8c_case ? "DGIGR-HDG-W8C-SCIENTIFIC-CONFIG-V1" :
           scenario == ApplicationScenarioV1::scalar_igr_sc25_v3
               ? "DGIGR-HDG-W8B-SCALAR-IGR-SCIENTIFIC-CONFIG-V1"
               : "DGIGR-HDG-W8A-SCIENTIFIC-CONFIG-V1") ||
@@ -164,6 +168,7 @@ bool ComputeApplicationConfigHashes(
 
   CanonicalHashWriter run;
   if (!run.Text(
+          w8c_case ? "DGIGR-HDG-W8C-RUN-CONFIG-V1" :
           scenario == ApplicationScenarioV1::scalar_igr_sc25_v3
               ? "DGIGR-HDG-W8B-SCALAR-IGR-RUN-CONFIG-V1"
               : "DGIGR-HDG-W8A-RUN-CONFIG-V1") ||
@@ -219,10 +224,12 @@ bool ExactFrozenTuple(const ApplicationOptionsView& options) noexcept
 
 bool ExactScientificIdentities(const ApplicationOptionsView& options) noexcept
 {
+  const bool w8c_case = options.case_id == cpu::w8c::case_id;
   if (options.card_id == scalar_igr_sc25_v3_card_id)
   {
     return options.mesh_family_id == smooth_periodic_euler_v1_mesh_family_id &&
-        options.source_id == scalar_igr_sc25_v3_source_id &&
+        options.source_id == (w8c_case ? cpu::w8c::scalar_source_id
+                                       : scalar_igr_sc25_v3_source_id) &&
         options.flux_id == scalar_igr_sc25_v3_flux_id &&
         options.time_rule_id == BackwardEulerMonolithicV1Tag::id &&
         options.layout_id == scalar_igr_sc25_v3_layout_id &&
@@ -231,7 +238,8 @@ bool ExactScientificIdentities(const ApplicationOptionsView& options) noexcept
   }
   return options.mesh_family_id ==
           smooth_periodic_euler_v1_mesh_family_id &&
-      options.source_id == smooth_periodic_euler_v1_source_id &&
+      options.source_id == (w8c_case ? cpu::w8c::conventional_source_id
+                                     : smooth_periodic_euler_v1_source_id) &&
       options.flux_id == smooth_periodic_euler_v1_flux_id &&
       options.time_rule_id == smooth_periodic_euler_v1_time_rule_id &&
       options.layout_id == smooth_periodic_euler_v1_layout_id &&
@@ -344,8 +352,11 @@ bool FocusedInjectionPhase(const FailurePhase phase) noexcept
 }
 
 std::uint64_t ScenarioCheckpointStep(
+    const ApplicationOptionsView& options,
     const ApplicationScenarioV1 scenario) noexcept
 {
+  if (options.case_id == cpu::w8c::case_id)
+    return cpu::w8c::checkpoint_step;
   if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
     return scalar_igr_sc25_v3_checkpoint_step;
   return scenario == ApplicationScenarioV1::smoke
@@ -354,8 +365,11 @@ std::uint64_t ScenarioCheckpointStep(
 }
 
 std::uint64_t ScenarioFailureTarget(
+    const ApplicationOptionsView& options,
     const ApplicationScenarioV1 scenario) noexcept
 {
+  if (options.case_id == cpu::w8c::case_id)
+    return cpu::w8c::failure_target_step;
   if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
     return scalar_igr_sc25_v3_failure_target_step;
   return scenario == ApplicationScenarioV1::smoke
@@ -363,8 +377,10 @@ std::uint64_t ScenarioFailureTarget(
       : smooth_periodic_euler_v1_functional_failure_target_step;
 }
 
-std::uint64_t ScenarioSeed(const ApplicationScenarioV1 scenario) noexcept
+std::uint64_t ScenarioSeed(const ApplicationOptionsView& options,
+                           const ApplicationScenarioV1 scenario) noexcept
 {
+  if (options.case_id == cpu::w8c::case_id) return cpu::w8c::seed;
   if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
     return scalar_igr_sc25_v3_seed;
   return scenario == ApplicationScenarioV1::smoke
@@ -406,8 +422,10 @@ ApplicationRejection ValidateRoleControls(
     return ApplicationRejection::invalid_injection_control;
   }
 
-  const std::uint64_t checkpoint_step = ScenarioCheckpointStep(scenario);
-  const std::uint64_t seed = ScenarioSeed(scenario);
+  const bool w8c_case = options.case_id == cpu::w8c::case_id;
+  const std::uint64_t checkpoint_step =
+      ScenarioCheckpointStep(options, scenario);
+  const std::uint64_t seed = ScenarioSeed(options, scenario);
   const bool writes_checkpoint = options.checkpoint_out.present &&
       options.checkpoint_step.present &&
       options.checkpoint_step.value == checkpoint_step &&
@@ -418,7 +436,8 @@ ApplicationRejection ValidateRoleControls(
   const bool prescribed_principal =
       options.injection.mode == FailureInjectionModeV1::prescribed &&
       options.injection.phase == smooth_periodic_euler_v1_failure_phase &&
-      options.injection.target_step == ScenarioFailureTarget(scenario) &&
+      options.injection.target_step ==
+          ScenarioFailureTarget(options, scenario) &&
       options.injection.source_rank == deferred.required_injected_source_rank;
   const bool scalar = scenario == ApplicationScenarioV1::scalar_igr_sc25_v3;
   const bool scalar_cuda = scalar &&
@@ -447,6 +466,46 @@ ApplicationRejection ValidateRoleControls(
       scalar_scheduled_retry || scalar_fault_free;
   const bool scalar_uninterrupted_controls = scalar_writer_controls ||
       scalar_terminal_post_publication;
+
+  if (w8c_case)
+  {
+    const bool focused =
+        options.injection.mode == FailureInjectionModeV1::prescribed &&
+        options.injection.phase == FailurePhase::AfterRecoveryBeforeCommit &&
+        options.injection.target_step == cpu::w8c::failure_target_step &&
+        options.injection.source_rank == 0 &&
+        options.retry_limit == cpu::w8c::retry_limit;
+    const bool ordinary = off && options.retry_limit == 0;
+    switch (options.run_role)
+    {
+      case ApplicationRunRoleV1::uninterrupted_reference:
+        return writes_checkpoint &&
+                options.stop_after_checkpoint == StopAfterCheckpointV1::no &&
+                ordinary && options.seed == seed
+            ? ApplicationRejection::none
+            : ApplicationRejection::invalid_run_role;
+      case ApplicationRunRoleV1::split_writer:
+        return writes_checkpoint &&
+                options.stop_after_checkpoint == StopAfterCheckpointV1::yes &&
+                ordinary && options.seed == seed
+            ? ApplicationRejection::none
+            : ApplicationRejection::invalid_run_role;
+      case ApplicationRunRoleV1::split_reader:
+        return reads_checkpoint &&
+                options.stop_after_checkpoint == StopAfterCheckpointV1::no &&
+                ordinary && options.seed == seed
+            ? ApplicationRejection::none
+            : ApplicationRejection::invalid_run_role;
+      case ApplicationRunRoleV1::focused_terminal_injection:
+        return writes_checkpoint &&
+                options.stop_after_checkpoint == StopAfterCheckpointV1::no &&
+                focused && options.seed == seed
+            ? ApplicationRejection::none
+            : ApplicationRejection::invalid_run_role;
+      case ApplicationRunRoleV1::alternate_seed_reference:
+        return ApplicationRejection::invalid_run_role;
+    }
+  }
 
   switch (options.run_role)
   {
@@ -625,6 +684,39 @@ ApplicationRejection ValidateScalarIgr(
   return ApplicationRejection::none;
 }
 
+ApplicationRejection ValidateW8c(
+    const ApplicationOptionsView& options,
+    const ApplicationBackend backend) noexcept
+{
+  if (backend != ApplicationBackend::cpu_serial)
+    return ApplicationRejection::unknown_backend;
+  if (options.scenario_id != cpu::w8c::scenario_id)
+    return ApplicationRejection::unknown_scenario;
+  if (options.polynomial_order != cpu::w8c::polynomial_order ||
+      options.mesh_n != cpu::w8c::mesh_n)
+    return ApplicationRejection::invalid_polynomial_mesh_pair;
+  const bool scalar = options.card_id == scalar_igr_sc25_v3_card_id;
+  if (options.q_a != (scalar ? cpu::w8c::scalar_q_a
+                             : cpu::w8c::conventional_q_a) ||
+      options.q_e != 0 || options.q_e4 != 0 ||
+      options.q_o != cpu::w8c::observable_q_o)
+    return ApplicationRejection::invalid_quadrature;
+  if (options.dt != cpu::w8c::dt)
+    return ApplicationRejection::invalid_dt;
+  if (options.accepted_steps != cpu::w8c::accepted_steps)
+    return ApplicationRejection::invalid_step_count;
+  if (options.final_time != cpu::w8c::final_time || !ExactEndTime(options))
+    return ApplicationRejection::invalid_final_time;
+  if (options.output_steps != cpu::w8c::output_steps)
+    return ApplicationRejection::invalid_output_schedule;
+  const std::string_view checkpoint = scalar
+      ? cpu::w8c::scalar_checkpoint_id
+      : cpu::w8c::conventional_checkpoint_id;
+  return options.checkpoint_id == checkpoint
+      ? ApplicationRejection::none
+      : ApplicationRejection::invalid_checkpoint_identity;
+}
+
 } // namespace
 
 ValidatedApplicationConfig::ValidatedApplicationConfig(
@@ -659,7 +751,7 @@ ValidatedApplicationConfig::ValidatedApplicationConfig(
       accepted_steps_(options.accepted_steps),
       final_time_(options.final_time),
       output_steps_(options.output_steps),
-      scenario_checkpoint_step_(ScenarioCheckpointStep(scenario)),
+      scenario_checkpoint_step_(ScenarioCheckpointStep(options, scenario)),
       run_role_(options.run_role),
       output_directory_(options.output_directory.present,
                         options.output_directory.canonical),
@@ -753,18 +845,23 @@ ApplicationValidation ValidateApplicationOptions(
     return ApplicationValidation(reason);
   };
   const bool scalar = options.card_id == scalar_igr_sc25_v3_card_id;
+  const bool w8c_case = options.case_id == cpu::w8c::case_id;
   if (!scalar && options.card_id != smooth_periodic_euler_v1_card_id)
   {
     return reject(ApplicationRejection::unknown_card);
   }
-  if (options.case_id != (scalar ? scalar_igr_sc25_v3_case_id
+  if (!w8c_case &&
+      options.case_id != (scalar ? scalar_igr_sc25_v3_case_id
                                  : smooth_periodic_euler_v1_case_id))
   {
     return reject(ApplicationRejection::unknown_case);
   }
-  const ApplicationScenarioV1 scenario =
-      ParseApplicationScenario(options.scenario_id);
-  if (scenario == ApplicationScenarioV1::unknown)
+  const ApplicationScenarioV1 scenario = w8c_case
+      ? (scalar ? ApplicationScenarioV1::scalar_igr_sc25_v3
+                : ApplicationScenarioV1::smoke)
+      : ParseApplicationScenario(options.scenario_id);
+  if ((!w8c_case && scenario == ApplicationScenarioV1::unknown) ||
+      (w8c_case && options.scenario_id != cpu::w8c::scenario_id))
   {
     return reject(ApplicationRejection::unknown_scenario);
   }
@@ -820,16 +917,18 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::invalid_scientific_identity);
   }
-  if (options.dt != (scalar ? scalar_igr_sc25_v3_dt
+  if (!w8c_case &&
+      options.dt != (scalar ? scalar_igr_sc25_v3_dt
                             : smooth_periodic_euler_v1_dt))
   {
     return reject(ApplicationRejection::invalid_dt);
   }
-  const ApplicationRejection scenario_rejection = scalar
-      ? ValidateScalarIgr(options)
-      : (scenario == ApplicationScenarioV1::smoke
-             ? ValidateSmoke(options)
-             : ValidateFunctional(options, backend));
+  const ApplicationRejection scenario_rejection = w8c_case
+      ? ValidateW8c(options, backend)
+      : (scalar ? ValidateScalarIgr(options)
+                : (scenario == ApplicationScenarioV1::smoke
+                       ? ValidateSmoke(options)
+                       : ValidateFunctional(options, backend)));
   if (scenario_rejection != ApplicationRejection::none)
   {
     return reject(scenario_rejection);
@@ -931,7 +1030,8 @@ bool DeriveSplitWriterRunConfigHashV1(
       split_reader.scenario_checkpoint_step());
   writer.restart_from = {};
   writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
-  writer.injection = split_reader.scalar_igr()
+  const bool w8c_case = split_reader.case_id().view() == cpu::w8c::case_id;
+  writer.injection = split_reader.scalar_igr() && !w8c_case
       ? FailureInjectionControlV1{
             FailureInjectionModeV1::prescribed,
             smooth_periodic_euler_v1_failure_phase,
@@ -942,7 +1042,7 @@ bool DeriveSplitWriterRunConfigHashV1(
   writer.restart_trajectory = split_reader.restart_trajectory();
   writer.rollback_obligation = split_reader.rollback_obligation();
   writer.source_rank_rule = split_reader.source_rank_rule();
-  writer.retry_limit = split_reader.scalar_igr()
+  writer.retry_limit = split_reader.scalar_igr() && !w8c_case
       ? scalar_igr_sc25_v3_retry_limit : 0;
   writer.seed = split_reader.seed();
 

@@ -1,4 +1,6 @@
 #include "numerics/hdg/runtime/cpu/persistent_sc25_scalar_igr.hpp"
+
+#include "hdg_cpu_serial_lifecycle.hpp"
 #include "numerics/hdg/runtime/sha256.hpp"
 
 #include <HYPRE_krylov.h>
@@ -297,6 +299,27 @@ bool ExactField(const mfem::ParGridFunction* field,
 
 } // namespace
 
+namespace
+{
+thread_local bool next_rank1_initialization_is_w8c = false;
+}
+
+namespace w8c_internal
+{
+
+[[gnu::visibility("hidden")]]
+void RequestW8cInitialization() noexcept
+{
+  next_rank1_initialization_is_w8c = true;
+}
+
+bool ConsumeW8cInitializationRequest() noexcept
+{
+  return std::exchange(next_rank1_initialization_is_w8c, false);
+}
+
+} // namespace w8c_internal
+
 double VelocityGradientInvariant(
     const std::array<std::array<double, dimension>, dimension>& gradient)
     noexcept
@@ -317,6 +340,26 @@ InitialStatePoint SmoothInitialState(const double x, const double y) noexcept
   output.conservative = {{
       rho, rho * u, rho * v,
       1.0 / (gamma - 1.0) + 0.5 * rho * (u * u + v * v)}};
+  return output;
+}
+
+InitialStatePoint W8cInitialState(const double x) noexcept
+{
+  InitialStatePoint output;
+  output.conservative = x < 0.25 || x >= 0.75 ? w8c::right_state
+                                               : w8c::left_state;
+  return output;
+}
+
+InitialStatePoint W8cTraceInitialState(const double x) noexcept
+{
+  InitialStatePoint output;
+  constexpr double tolerance =
+      64.0 * std::numeric_limits<double>::epsilon();
+  output.conservative = std::abs(x - 0.25) <= tolerance ||
+          std::abs(x - 0.75) <= tolerance
+      ? w8c::interface_mean
+      : W8cInitialState(x).conservative;
   return output;
 }
 
@@ -3204,6 +3247,9 @@ struct PersistentTrajectoryImplementation final
   TrajectoryStatus status = TrajectoryStatus::uninitialized;
   TrajectoryStatus first_failure = TrajectoryStatus::uninitialized;
   bool initialized = false;
+  bool w8c_initial_state = false;
+  int required_steps = persistent_required_steps;
+  double time_step = persistent_dt;
   std::uint64_t matrix_generation = 0;
   bool reuse_baseline_frozen = false;
   std::optional<TrajectoryContract::PreparedCommitToken>
@@ -3758,7 +3804,7 @@ TrajectoryAssemblyFailureCause PersistentTrajectoryImplementation::Assemble(
   if (!AssembleCoupledFixture(
           *owner.mesh, *owner.sigma_space, *owner.carrier_space,
           *owner.trace_collection, owner.topology, assembly_state,
-          coupled_fixture_quadrature_order, persistent_dt, false, output,
+          coupled_fixture_quadrature_order, time_step, false, output,
           quadrature_workspace, "persistent-assembly", diagnostic))
   {
     const TrajectoryAssemblyFailureCause cause = diagnostic.failure_cause;
@@ -3810,7 +3856,9 @@ bool PersistentTrajectoryImplementation::InitializePhysicalState(
         element_transformation->SetIntPoint(&ip);
         finite_element->CalcShape(ip, shape);
         element_transformation->Transform(ip, point);
-        const InitialStatePoint value = SmoothInitialState(point[0], point[1]);
+        const InitialStatePoint value = w8c_initial_state
+            ? W8cInitialState(point[0])
+            : SmoothInitialState(point[0], point[1]);
         const double weight = ip.weight * element_transformation->Weight();
         for (int row = 0; row < ns; ++row)
         {
@@ -3887,7 +3935,9 @@ bool PersistentTrajectoryImplementation::InitializePhysicalState(
         face_transformation->SetIntPoint(&ip);
         finite_element->CalcShape(ip, shape);
         face_transformation->Transform(ip, point);
-        const InitialStatePoint value = SmoothInitialState(point[0], point[1]);
+        const InitialStatePoint value = w8c_initial_state
+            ? W8cTraceInitialState(point[0])
+            : SmoothInitialState(point[0], point[1]);
         const double weight = ip.weight * face_transformation->Weight();
         for (int row = 0; row < nf; ++row)
         {
@@ -4082,6 +4132,32 @@ bool PersistentTrajectoryImplementation::InitializeAuxiliary(
 {
   try
   {
+    if (w8c_initial_state)
+    {
+      state.interior.sigma.fill(0.0);
+      state.interior.z.fill(0.0);
+      state.trace.sigmahat.fill(0.0);
+      AuxiliaryResidualMetrics residual;
+      if (!AuxiliaryResidualGate(owner, state, residual) ||
+          residual.normalized_maximum > 1.0e-10)
+      {
+        return false;
+      }
+      evidence.initialization = {
+          coupled_fixture_quadrature_order,
+          persistent_trace_restart_dimension,
+          persistent_trace_maximum_iterations,
+          1.0e-12,
+          1.0e-14,
+          0,
+          0,
+          1,
+          0,
+          0.0,
+          0.0,
+          residual};
+      return true;
+    }
     constexpr int full_ni = coupled_fixture_local_interior_unknowns;
     constexpr int full_nt = coupled_fixture_local_trace_unknowns;
     constexpr int aux_ni = 12;
@@ -5000,11 +5076,11 @@ TrajectoryStatus PersistentTrajectoryImplementation::ExecuteAttempt(
   attempt.retry_index = begin.attempt.retry_index;
   attempt.dt = begin.attempt.dt;
   attempt.committed_coordinates = {
-      begin.attempt.committed_step * persistent_dt,
+      begin.attempt.committed_step * time_step,
       begin.attempt.committed_step,
       begin.attempt.committed_generation,
       begin.attempt.committed_step,
-      begin.attempt.committed_step == 0 ? 0.0 : persistent_dt};
+      begin.attempt.committed_step == 0 ? 0.0 : time_step};
   attempt.entry_reuse = ReuseSnapshot(owner);
   if (!begin.started || !contract)
   {
@@ -5359,7 +5435,8 @@ TrajectoryStatus PersistentTrajectoryImplementation::Advance(
 {
   if (!initialized || !contract ||
       evidence.attempt_count >= static_cast<int>(evidence.attempts.size()) ||
-      contract->coordinates().step >= persistent_required_steps ||
+      contract->coordinates().step >=
+          static_cast<std::uint64_t>(required_steps) ||
       (injection != TrajectoryFailureInjection::none &&
        contract->coordinates().step + 1 != 7))
   {
@@ -5386,7 +5463,7 @@ TrajectoryStatus PersistentTrajectoryImplementation::Advance(
   }
 
   const BeginOutcome begin =
-      contract->BeginStep({InteriorSpace::l2, persistent_dt});
+      contract->BeginStep({InteriorSpace::l2, time_step});
   const int first_attempt_index = evidence.attempt_count++;
   TrajectoryStatus result = ExecuteAttempt(
       owner, begin, injection,
@@ -5435,11 +5512,11 @@ TrajectoryStatus PersistentTrajectoryImplementation::Advance(
   }
   const StateCoordinates coordinates = contract->coordinates();
   if (coordinates.step == 0 ||
-      coordinates.step > persistent_required_steps ||
+      coordinates.step > static_cast<std::uint64_t>(required_steps) ||
       coordinates.generation != coordinates.step ||
       coordinates.cursor != coordinates.step ||
       detail::DoubleBits(coordinates.dt) !=
-          detail::DoubleBits(persistent_dt))
+          detail::DoubleBits(time_step))
   {
     status = TrajectoryStatus::HdgSc25PublicationFailure;
     RememberFailure(status);
@@ -5503,9 +5580,10 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
   if (!trajectory.contract || trajectory.active_transaction_serial != 0 ||
       trajectory.transaction_prepared || trajectory.transaction_provisional ||
       trajectory.next_transaction_serial == 0 ||
-      trajectory.evidence.attempt_count >=
-          static_cast<int>(trajectory.evidence.attempts.size()) ||
-      trajectory.contract->coordinates().step >= persistent_required_steps)
+      (!trajectory.w8c_initial_state && trajectory.evidence.attempt_count >=
+          static_cast<int>(trajectory.evidence.attempts.size())) ||
+      trajectory.contract->coordinates().step >=
+          static_cast<std::uint64_t>(trajectory.required_steps))
   {
     return TrajectoryStatus::invalid_configuration;
   }
@@ -5526,8 +5604,12 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
   const BeginOutcome begin = trajectory.contract->status() ==
           RunStatus::retry_available
       ? trajectory.contract->Retry()
-      : trajectory.contract->BeginStep({InteriorSpace::l2, persistent_dt});
-  const int first_attempt_index = trajectory.evidence.attempt_count++;
+      : trajectory.contract->BeginStep(
+            {InteriorSpace::l2, trajectory.time_step});
+  const int first_attempt_index = trajectory.evidence.attempt_count <
+          static_cast<int>(trajectory.evidence.attempts.size())
+      ? trajectory.evidence.attempt_count++
+      : static_cast<int>(trajectory.evidence.attempts.size()) - 1;
   TrajectoryStatus result = trajectory.ExecuteAttempt(
       *implementation_, begin, injection,
       trajectory.evidence.attempts[
@@ -5537,9 +5619,16 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
   if (!IsAccepted(result))
   {
     trajectory.RememberFailure(result);
+    if (trajectory.w8c_initial_state)
+    {
+      trajectory.status = result;
+      trajectory.RefreshEvidence();
+      return result;
+    }
     if (trajectory.contract->status() != RunStatus::retry_available ||
-        trajectory.evidence.attempt_count >=
-            static_cast<int>(trajectory.evidence.attempts.size()))
+        (!trajectory.w8c_initial_state &&
+         trajectory.evidence.attempt_count >=
+            static_cast<int>(trajectory.evidence.attempts.size())))
     {
       trajectory.status = TrajectoryStatus::HdgSc25RetryExhausted;
       trajectory.RememberFailure(trajectory.status);
@@ -5547,7 +5636,10 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
       return trajectory.status;
     }
     const BeginOutcome retry = trajectory.contract->Retry();
-    accepted_attempt_index = trajectory.evidence.attempt_count++;
+    accepted_attempt_index = trajectory.evidence.attempt_count <
+            static_cast<int>(trajectory.evidence.attempts.size())
+        ? trajectory.evidence.attempt_count++
+        : static_cast<int>(trajectory.evidence.attempts.size()) - 1;
     ++trajectory.evidence.retry_attempts;
     result = trajectory.ExecuteAttempt(
         *implementation_, retry, TrajectoryFailureInjection::none,
@@ -5573,19 +5665,25 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
   if (!trajectory.transaction_prepared ||
       !trajectory.Integrals(*implementation_, accepted, accepted_integrals) ||
       coordinates.step == 0 ||
-      coordinates.step > persistent_required_steps ||
+      coordinates.step >
+          static_cast<std::uint64_t>(trajectory.required_steps) ||
       coordinates.generation != coordinates.step ||
       coordinates.cursor != coordinates.step ||
       detail::DoubleBits(coordinates.dt) !=
-          detail::DoubleBits(persistent_dt) ||
+          detail::DoubleBits(trajectory.time_step) ||
       trajectory.evidence.step_evidence_count < 0 ||
-      trajectory.evidence.step_evidence_count >=
-          static_cast<int>(trajectory.evidence.steps.size()))
+      (!trajectory.w8c_initial_state &&
+       trajectory.evidence.step_evidence_count >=
+          static_cast<int>(trajectory.evidence.steps.size())))
   {
     return TrajectoryStatus::HdgSc25PublicationFailure;
   }
+  const int step_evidence_index = trajectory.evidence.step_evidence_count <
+          static_cast<int>(trajectory.evidence.steps.size())
+      ? trajectory.evidence.step_evidence_count++
+      : static_cast<int>(trajectory.evidence.steps.size()) - 1;
   TrajectoryStepEvidence& step = trajectory.evidence.steps[
-      static_cast<std::size_t>(trajectory.evidence.step_evidence_count)];
+      static_cast<std::size_t>(step_evidence_index)];
   step.accepted = true;
   step.step = static_cast<int>(coordinates.step);
   step.time = coordinates.time;
@@ -5598,7 +5696,6 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
   step.accepted_hashes = HashState(accepted);
   step.reuse = trajectory.ReuseSnapshot(*implementation_);
   trajectory.evidence.accepted_steps = static_cast<int>(coordinates.step);
-  ++trajectory.evidence.step_evidence_count;
   trajectory.status = result;
   trajectory.evidence.status = result;
   trajectory.evidence.first_failure = trajectory.first_failure;
@@ -9869,6 +9966,7 @@ TrajectoryStatus
 PersistentSc25ScalarIgrCpuFoundation::InitializePersistentTrajectory()
     noexcept
 {
+  const bool w8c_mode = w8c_internal::ConsumeW8cInitializationRequest();
   if (!implementation_ || implementation_->status != FoundationStatus::ready ||
       implementation_->rank != 0 || implementation_->ranks != 1 ||
       implementation_->config.polynomial_degree != 1 ||
@@ -9885,6 +9983,10 @@ PersistentSc25ScalarIgrCpuFoundation::InitializePersistentTrajectory()
   try
   {
     auto trajectory = std::make_unique<PersistentTrajectoryImplementation>();
+    trajectory->w8c_initial_state = w8c_mode;
+    trajectory->required_steps = w8c_mode
+        ? static_cast<int>(w8c::accepted_steps) : persistent_required_steps;
+    trajectory->time_step = w8c_mode ? w8c::dt : persistent_dt;
     if (!trajectory->InitializeStorage(*implementation_))
     {
       return TrajectoryStatus::initialization_failure;
@@ -10049,12 +10151,15 @@ bool PersistentSc25ScalarIgrCpuFoundation::ImportTrajectoryCheckpoint(
   if (!implementation_ || implementation_->ranks != 1 ||
       !implementation_->trajectory ||
       !implementation_->trajectory->contract || coordinates.step == 0 ||
-      coordinates.step > persistent_required_steps ||
+      coordinates.step > static_cast<std::uint64_t>(
+          implementation_->trajectory->required_steps) ||
       coordinates.step != coordinates.generation ||
       coordinates.step != coordinates.cursor ||
       detail::DoubleBits(coordinates.time) !=
-          detail::DoubleBits(coordinates.step * persistent_dt) ||
-      detail::DoubleBits(coordinates.dt) != detail::DoubleBits(persistent_dt) ||
+          detail::DoubleBits(
+              coordinates.step * implementation_->trajectory->time_step) ||
+      detail::DoubleBits(coordinates.dt) != detail::DoubleBits(
+          implementation_->trajectory->time_step) ||
       !Finite(state.u) || !Finite(state.sigma) || !Finite(state.z) ||
       !Finite(state.uhat) || !Finite(state.sigmahat))
   {
@@ -10085,7 +10190,7 @@ bool PersistentSc25ScalarIgrCpuFoundation::ImportTrajectoryCheckpoint(
   candidate.descriptor.layout = resources.layout;
   candidate.descriptor.precision = StableIdentity::Copy("Fp64");
   candidate.descriptor.cursor = coordinates.cursor;
-  candidate.descriptor.dt = persistent_dt;
+  candidate.descriptor.dt = implementation_->trajectory->time_step;
   candidate.descriptor.coordinates = coordinates;
   candidate.descriptor.coordinate_fingerprint =
       detail::CoordinateFingerprint(coordinates);
@@ -10157,17 +10262,17 @@ PersistentSc25ScalarIgrCpuFoundation::RestoreTrajectoryCheckpoint(
       checkpoint.descriptor.cursor !=
           checkpoint.descriptor.coordinates.cursor ||
       detail::DoubleBits(checkpoint.descriptor.dt) !=
-          detail::DoubleBits(persistent_dt) ||
+          detail::DoubleBits(trajectory.time_step) ||
       checkpoint.descriptor.coordinates.step == 0 ||
       checkpoint.descriptor.coordinates.step !=
           checkpoint.descriptor.coordinates.generation ||
       checkpoint.descriptor.coordinates.step !=
           checkpoint.descriptor.coordinates.cursor ||
       detail::DoubleBits(checkpoint.descriptor.coordinates.dt) !=
-          detail::DoubleBits(persistent_dt) ||
+          detail::DoubleBits(trajectory.time_step) ||
       detail::DoubleBits(checkpoint.descriptor.coordinates.time) !=
           detail::DoubleBits(checkpoint.descriptor.coordinates.step *
-                             persistent_dt) ||
+                             trajectory.time_step) ||
       checkpoint.descriptor.coordinate_fingerprint !=
           detail::CoordinateFingerprint(checkpoint.descriptor.coordinates) ||
       !resources.reuse.persistent_topology ||

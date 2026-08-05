@@ -5,6 +5,7 @@
 #include "numerics/hdg/runtime/app/checkpoint_codec.hpp"
 #include "numerics/hdg/runtime/app/command_line.hpp"
 #include "numerics/hdg/runtime/app/durable_io.hpp"
+#include "../cpu/hdg_cpu_serial_lifecycle.hpp"
 #include "numerics/hdg/runtime/cpu/persistent_smooth_euler.hpp"
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
 #include "numerics/hdg/runtime/cpu/persistent_sc25_scalar_igr.hpp"
@@ -28,6 +29,13 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
+namespace dg::hdg::runtime::cpu::sc25::w8c_internal
+{
+[[gnu::visibility("hidden")]] void RequestW8cInitialization() noexcept;
+}
+#endif
 
 namespace dg::hdg::runtime::app
 {
@@ -1683,9 +1691,10 @@ std::optional<ValidatedApplicationConfig> CheckpointWriterConfig(
       config.scenario_checkpoint_step());
   writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
   writer.restart_from = {};
-  writer.injection = config.scalar_igr()
+  const bool w8c_case = config.case_id().view() == cpu::w8c::case_id;
+  writer.injection = config.scalar_igr() && !w8c_case
       ? config.injection() : FailureInjectionControlV1{};
-  writer.retry_limit = config.scalar_igr()
+  writer.retry_limit = config.scalar_igr() && !w8c_case
       ? config.retry_limit() : 0;
   const ApplicationValidation validation = ValidateApplicationOptions(writer);
   return validation.accepted()
@@ -2343,6 +2352,656 @@ ApplicationRunResult RunScalarIgrCpu(const ApplicationOptionsView& request,
 }
 #endif
 
+struct W8cCpuSerialSelection : CpuSerialRuntimeSelection
+{
+  static constexpr std::string_view experiment_id = cpu::w8c::experiment_id;
+};
+
+class W8cConventionalMethod final
+{
+public:
+  struct Transaction final
+  {
+    cpu::CpuPreparedStep staging;
+    cpu::CpuPreparedCommit prepared;
+    cpu::CpuProvisionalCommit provisional;
+    CpuStateSnapshot candidate{};
+    CheckpointDescriptor future_checkpoint{};
+  };
+
+  bool Initialize() noexcept
+  {
+    CpuPersistentConfig numerical = cpu::MakeCpuSmokeConfig();
+    numerical.experiment = StableIdentity::Copy(cpu::w8c::experiment_id);
+    numerical.source = StableIdentity::Copy(
+        cpu::w8c::conventional_source_id);
+    numerical.polynomial_order = cpu::w8c::polynomial_order;
+    numerical.elements_per_direction = static_cast<int>(cpu::w8c::mesh_n);
+    numerical.assembly_quadrature_order = cpu::w8c::conventional_q_a;
+    numerical.dt = cpu::w8c::dt;
+    numerical.allow_one_retry = true;
+    return adapter_.Initialize(numerical);
+  }
+
+  bool Prepare(Transaction& transaction, const bool retry) noexcept
+  {
+    const bool prepared = retry ? adapter_.PrepareRetry(transaction.staging)
+                                : adapter_.PrepareAdvance(transaction.staging);
+    if (!prepared) return false;
+    transaction.candidate = {
+        transaction.staging.target_coordinates,
+        transaction.staging.interior_hash,
+        transaction.staging.trace_hash,
+        transaction.staging.state_hash,
+        transaction.staging.interior,
+        transaction.staging.trace};
+    transaction.future_checkpoint = transaction.staging.future_checkpoint;
+    if (transaction.staging.numerically_ready) return true;
+    (void)adapter_.FinalizePrepared(transaction.staging);
+    return false;
+  }
+
+  bool Install(Transaction& transaction) noexcept
+  {
+    if (!adapter_.PrepareCommit(transaction.staging, transaction.prepared))
+      return false;
+    transaction.future_checkpoint = transaction.prepared.future_checkpoint;
+    return adapter_.CommitPrepared(transaction.prepared,
+                                   transaction.provisional);
+  }
+
+  bool Revert(Transaction&& transaction) noexcept
+  {
+    const AttemptOutcome outcome = adapter_.RevertCommit(
+        transaction.provisional, CpuFailurePhase::after_recovery_before_commit,
+        0);
+    return !outcome.committed && outcome.retry_available;
+  }
+
+  bool Finalize(Transaction&& transaction) noexcept
+  {
+    const AttemptOutcome outcome = adapter_.FinalizeCommit(
+        transaction.provisional);
+    return outcome.committed && outcome.reason == FailureReason::none;
+  }
+
+  bool Restore(const CpuCheckpoint& checkpoint) noexcept
+  {
+    return adapter_.Restore(checkpoint).restored;
+  }
+
+  RunStatus Status() const noexcept { return adapter_.status(); }
+  FailureReason Reason() const noexcept
+  {
+    return adapter_.last_transition_outcome().reason;
+  }
+  bool RetryAvailable() const noexcept
+  {
+    return adapter_.status() == RunStatus::retry_available;
+  }
+  StateCoordinates Coordinates() const noexcept
+  {
+    return adapter_.coordinates();
+  }
+  CpuStateSnapshot PublishedState() const noexcept
+  {
+    return adapter_.Snapshot();
+  }
+  const CpuStateSnapshot& CandidateState(const Transaction& transaction)
+      const noexcept
+  {
+    return transaction.candidate;
+  }
+  const CheckpointDescriptor& FutureCheckpoint(
+      const Transaction& transaction) const noexcept
+  {
+    return transaction.future_checkpoint;
+  }
+  const CpuRunEvidence& Evidence() const noexcept
+  {
+    return adapter_.evidence();
+  }
+
+private:
+  cpu::PersistentSmoothEulerCpuAdapter<W8cCpuSerialSelection> adapter_;
+};
+
+class W8cConventionalPublication final
+{
+public:
+  W8cConventionalPublication(
+      const ApplicationOptionsView& request,
+      const ValidatedApplicationConfig& config,
+      MpiApplicationContextV1& context, std::string& detail) noexcept
+      : config_(config), context_(context), detail_(detail),
+        output_directory_(std::string{
+            config.output_directory().identity().view()}),
+        checkpoint_writer_(CheckpointWriterConfig(request, config))
+  {}
+
+  bool Restore(W8cConventionalMethod& method) noexcept
+  {
+    if (!EnsureDirectory()) return false;
+    CpuCheckpoint checkpoint;
+    if (!RestoreCheckpoint(config_, method.Evidence(), context_, checkpoint,
+                           detail_) ||
+        !method.Restore(checkpoint))
+      return false;
+    return GlobalCpuStateIdentity(method.PublishedState(), context_,
+                                  initial_hash_);
+  }
+
+  bool PublishInitial(W8cConventionalMethod& method) noexcept
+  {
+    if (!EnsureDirectory() ||
+        !GlobalCpuStateIdentity(method.PublishedState(), context_,
+                                initial_hash_))
+      return false;
+    if (!cpu::w8c::IsOutputStep(0)) return true;
+    DurableGenerationTransactionV1 initial;
+    std::vector<std::uint8_t> vtk;
+    const bool staged = BeginRootTransaction(
+        initial, output_directory_, 0, context_, detail_) &&
+        StageStateVtk(config_, method.PublishedState(), context_, initial,
+                      vtk, detail_);
+    const bool published = staged &&
+        PublishRootTransaction(initial, context_, detail_);
+    if (!published) (void)RevertTransaction(initial, context_, detail_);
+    return published;
+  }
+
+  bool Stage(W8cConventionalMethod& method,
+             const W8cConventionalMethod::Transaction& method_transaction,
+             const std::uint64_t target, const bool output,
+             const bool checkpoint, const bool terminal) noexcept
+  {
+    try
+    {
+      active_ = true;
+      bool staged = BeginRootTransaction(
+          transaction_, output_directory_, target, context_, detail_);
+      const CpuStateSnapshot& state =
+          method.CandidateState(method_transaction);
+      if (staged && output)
+        staged = StageStateVtk(config_, state, context_, transaction_, vtk_,
+                               detail_);
+      if (staged && checkpoint)
+        staged = checkpoint_writer_ && StageCheckpoint(
+            *checkpoint_writer_, method.FutureCheckpoint(method_transaction),
+            state.interior, state.trace, method.Evidence(), context_,
+            transaction_, checkpoint_, detail_);
+      if (staged && terminal)
+      {
+        StateHash final_hash{};
+        staged = GlobalCpuStateIdentity(state, context_, final_hash);
+        bool root_staged = staged;
+        if (staged && context_.rank() == 0)
+        {
+          ApplicationRunResult anticipated;
+          anticipated.status = RunStatus::committed;
+          anticipated.reason = FailureReason::none;
+          anticipated.coordinates = state.coordinates;
+          anticipated.retries = ExpectedRetries();
+          anticipated.failure_class = ApplicationRunResult::FailureClass::none;
+          const std::string metadata = Metadata(
+              config_, anticipated, method.Evidence(), initial_hash_,
+              final_hash, detail_);
+          metadata_.assign(metadata.begin(), metadata.end());
+          root_staged = transaction_.Stage(
+              config_.run_role() == ApplicationRunRoleV1::split_writer
+                  ? "run-metadata-checkpoint.json" : "run-metadata.json",
+              metadata_.data(), metadata_.size(), detail_) ==
+              DurableIoStatus::ok;
+        }
+        staged = CollectiveAll(root_staged, context_.communicator());
+      }
+      return staged;
+    }
+    catch (...)
+    {
+      detail_ = "W8C conventional durable staging failed";
+      return false;
+    }
+  }
+
+  bool Publish() noexcept
+  {
+    const bool published = PublishRootTransaction(
+        transaction_, context_, detail_);
+    if (published) active_ = false;
+    return published;
+  }
+
+  bool Revert() noexcept
+  {
+    if (!active_) return true;
+    const bool reverted = RevertTransaction(transaction_, context_, detail_);
+    active_ = false;
+    return reverted;
+  }
+
+  bool Cleanup() noexcept
+  {
+    bool clean = true;
+    if (context_.rank() == 0 && output_directory_created_)
+      clean = DiscardDurableDirectoryIfEmpty(output_directory_, detail_) ==
+          DurableIoStatus::ok;
+    return CollectiveAll(clean, context_.communicator());
+  }
+
+private:
+  bool EnsureDirectory() noexcept
+  {
+    if (directory_ready_) return true;
+    bool ready = true;
+    if (context_.rank() == 0)
+    {
+      if (config_.run_role() == ApplicationRunRoleV1::split_reader)
+      {
+        std::error_code error;
+        const std::filesystem::file_status status =
+            std::filesystem::symlink_status(output_directory_, error);
+        ready = !error && std::filesystem::is_directory(status);
+        if (!ready) detail_ = "W8C split-reader output directory is unavailable";
+      }
+      else
+      {
+        ready = CreateDurableDirectory(output_directory_, detail_) ==
+            DurableIoStatus::ok;
+        output_directory_created_ = ready;
+      }
+    }
+    directory_ready_ = CollectiveAll(ready, context_.communicator());
+    return directory_ready_;
+  }
+
+  std::uint32_t ExpectedRetries() const noexcept
+  {
+    return config_.injection().mode == FailureInjectionModeV1::prescribed
+        ? 1U : 0U;
+  }
+
+  const ValidatedApplicationConfig& config_;
+  MpiApplicationContextV1& context_;
+  std::string& detail_;
+  std::filesystem::path output_directory_;
+  std::optional<ValidatedApplicationConfig> checkpoint_writer_;
+  DurableGenerationTransactionV1 transaction_;
+  std::vector<std::uint8_t> vtk_;
+  std::vector<std::uint8_t> checkpoint_;
+  std::vector<std::uint8_t> metadata_;
+  StateHash initial_hash_{};
+  bool directory_ready_ = false;
+  bool output_directory_created_ = false;
+  bool active_ = false;
+};
+
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
+class W8cScalarMethod final
+{
+public:
+  using Transaction =
+      sc25::PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction;
+
+  bool Initialize() noexcept
+  {
+    sc25::FoundationConfig foundation;
+    foundation.polynomial_degree = cpu::w8c::polynomial_order;
+    foundation.elements_per_direction = static_cast<int>(cpu::w8c::mesh_n);
+    if (ScalarIgrCpuTraits<false>::Create(foundation, owner_) !=
+            sc25::FoundationStatus::ready || !owner_)
+      return false;
+    cpu::sc25::w8c_internal::RequestW8cInitialization();
+    return ScalarIgrCpuTraits<false>::Initialize(*owner_) ==
+        sc25::TrajectoryStatus::ready;
+  }
+
+  bool Prepare(Transaction& transaction, const bool retry) noexcept
+  {
+    return owner_ && retry == RetryAvailable() && ScalarIgrAccepted(
+        ScalarIgrCpuTraits<false>::Prepare(
+            *owner_, transaction, sc25::TrajectoryFailureInjection::none));
+  }
+  bool Install(Transaction& transaction) noexcept
+  {
+    return owner_ && ScalarIgrCpuTraits<false>::Install(*owner_, transaction);
+  }
+  bool Revert(Transaction&& transaction) noexcept
+  {
+    retry_available_ = owner_ && ScalarIgrCpuTraits<false>::Revert(
+        *owner_, std::move(transaction));
+    return retry_available_;
+  }
+  bool Finalize(Transaction&& transaction) noexcept
+  {
+    retry_available_ = false;
+    return owner_ && ScalarIgrCpuTraits<false>::Finalize(
+        *owner_, std::move(transaction));
+  }
+  RunStatus Status() const noexcept
+  {
+    if (retry_available_) return RunStatus::retry_available;
+    return owner_ ? owner_->trajectory_evidence().contract_status
+                  : RunStatus::invalid_request;
+  }
+  FailureReason Reason() const noexcept
+  {
+    return owner_ ? owner_->trajectory_evidence().contract_last_failure
+                  : FailureReason::backend_failure;
+  }
+  bool RetryAvailable() const noexcept
+  {
+    return retry_available_ ||
+        (owner_ && owner_->trajectory_evidence().contract_status ==
+                       RunStatus::retry_available);
+  }
+  StateCoordinates Coordinates() const noexcept
+  {
+    return owner_ ? ScalarIgrCpuTraits<false>::Coordinates(*owner_)
+                  : StateCoordinates{};
+  }
+  bool PublishedState(ScalarIgrPackedState& state) const noexcept
+  {
+    ScalarIgrCpuTraits<false>::State current;
+    return owner_ && ScalarIgrCpuTraits<false>::CopyState(*owner_, current) &&
+        PackScalarIgrState(current, Coordinates(), state);
+  }
+  bool CandidateState(const Transaction& transaction,
+                      ScalarIgrPackedState& state) const noexcept
+  {
+    return PackScalarIgrState(
+        transaction.candidate_state(),
+        transaction.future_checkpoint().descriptor.coordinates, state);
+  }
+  const sc25::PersistentTrajectoryCheckpoint& FutureCheckpoint(
+      const Transaction& transaction) const noexcept
+  {
+    return transaction.future_checkpoint();
+  }
+  bool Restore(const ValidatedApplicationConfig& config,
+               const PersistentResourceDescriptor& resources,
+               const MpiApplicationContextV1& context,
+               std::string& detail) noexcept
+  {
+    std::uint32_t prior_retries = 0;
+    return owner_ && RestoreScalarIgrCheckpoint<false>(
+        config, resources, context, *owner_, prior_retries, detail);
+  }
+  const sc25::PersistentSc25ScalarIgrCpuFoundation& Owner() const noexcept
+  {
+    return *owner_;
+  }
+
+private:
+  std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> owner_;
+  bool retry_available_ = false;
+};
+
+class W8cScalarPublication final
+{
+public:
+  W8cScalarPublication(
+      const ApplicationOptionsView& request,
+      const ValidatedApplicationConfig& config,
+      MpiApplicationContextV1& context, std::string& detail) noexcept
+      : config_(config), context_(context), detail_(detail),
+        output_directory_(std::string{
+            config.output_directory().identity().view()}),
+        checkpoint_writer_(CheckpointWriterConfig(request, config))
+  {}
+
+  bool Restore(W8cScalarMethod& method) noexcept
+  {
+    if (!EnsureDirectory()) return false;
+    resources_ = ScalarIgrResources(config_, method.Owner(), context_);
+    if (!resources_.Valid() ||
+        !method.Restore(config_, resources_, context_, detail_) ||
+        !method.PublishedState(published_))
+      return false;
+    return GlobalScalarIgrStateIdentity(published_, context_, initial_hash_);
+  }
+
+  bool PublishInitial(W8cScalarMethod& method) noexcept
+  {
+    if (!EnsureDirectory()) return false;
+    resources_ = ScalarIgrResources(config_, method.Owner(), context_);
+    if (!resources_.Valid() || !method.PublishedState(published_) ||
+        !GlobalScalarIgrCoordinatesIdentity(published_.coordinates, context_) ||
+        !GlobalScalarIgrStateIdentity(published_, context_, initial_hash_))
+      return false;
+    DurableGenerationTransactionV1 initial;
+    std::vector<std::uint8_t> vtk;
+    const bool staged = BeginRootTransaction(
+        initial, output_directory_, 0, context_, detail_) &&
+        StageScalarIgrVtk(config_, published_, context_, initial, vtk,
+                          detail_);
+    const bool published = staged &&
+        PublishRootTransaction(initial, context_, detail_);
+    if (!published) (void)RevertTransaction(initial, context_, detail_);
+    return published;
+  }
+
+  bool Stage(W8cScalarMethod& method,
+             const W8cScalarMethod::Transaction& method_transaction,
+             const std::uint64_t target, const bool output,
+             const bool checkpoint, const bool terminal) noexcept
+  {
+    try
+    {
+      active_ = true;
+      bool staged = method.CandidateState(method_transaction, candidate_) &&
+          GlobalScalarIgrCoordinatesIdentity(candidate_.coordinates, context_) &&
+          BeginRootTransaction(transaction_, output_directory_, target,
+                               context_, detail_);
+      if (staged && output)
+        staged = StageScalarIgrVtk(config_, candidate_, context_, transaction_,
+                                  vtk_, detail_);
+      if (staged && checkpoint)
+        staged = checkpoint_writer_ && StageScalarIgrCheckpoint(
+            *checkpoint_writer_, method.FutureCheckpoint(method_transaction),
+            candidate_, resources_, context_, transaction_, checkpoint_,
+            detail_);
+      if (staged && terminal)
+      {
+        StateHash final_hash{};
+        staged = GlobalScalarIgrStateIdentity(candidate_, context_, final_hash);
+        bool root_staged = staged;
+        if (staged && context_.rank() == 0)
+        {
+          ApplicationRunResult anticipated;
+          anticipated.status = RunStatus::committed;
+          anticipated.reason = FailureReason::none;
+          anticipated.coordinates = candidate_.coordinates;
+          anticipated.retries = ExpectedRetries();
+          anticipated.failure_class = ApplicationRunResult::FailureClass::none;
+          ScalarIgrInjectionAudit audit;
+          if (anticipated.retries == 1)
+          {
+            audit.configured_source_rank = 0;
+            audit.observed_origin_rank = 0;
+            audit.local_injection_count = 1;
+            audit.collective_decisions = 1;
+          }
+          const std::string metadata = ScalarIgrMetadata(
+              config_, anticipated, initial_hash_, final_hash, audit, detail_);
+          metadata_.assign(metadata.begin(), metadata.end());
+          root_staged = transaction_.Stage(
+              config_.run_role() == ApplicationRunRoleV1::split_writer
+                  ? "run-metadata-checkpoint.json" : "run-metadata.json",
+              metadata_.data(), metadata_.size(), detail_) ==
+              DurableIoStatus::ok;
+        }
+        staged = CollectiveAll(root_staged, context_.communicator());
+      }
+      return staged;
+    }
+    catch (...)
+    {
+      detail_ = "W8C scalar-IGR durable staging failed";
+      return false;
+    }
+  }
+
+  bool Publish() noexcept
+  {
+    const bool published = PublishRootTransaction(
+        transaction_, context_, detail_);
+    if (published) active_ = false;
+    return published;
+  }
+  bool Revert() noexcept
+  {
+    if (!active_) return true;
+    const bool reverted = RevertTransaction(transaction_, context_, detail_);
+    active_ = false;
+    return reverted;
+  }
+  bool Cleanup() noexcept
+  {
+    bool clean = true;
+    if (context_.rank() == 0 && output_directory_created_)
+      clean = DiscardDurableDirectoryIfEmpty(output_directory_, detail_) ==
+          DurableIoStatus::ok;
+    return CollectiveAll(clean, context_.communicator());
+  }
+
+private:
+  bool EnsureDirectory() noexcept
+  {
+    if (directory_ready_) return true;
+    bool ready = true;
+    if (context_.rank() == 0)
+    {
+      if (config_.run_role() == ApplicationRunRoleV1::split_reader)
+      {
+        std::error_code error;
+        const std::filesystem::file_status status =
+            std::filesystem::symlink_status(output_directory_, error);
+        ready = !error && std::filesystem::is_directory(status);
+        if (!ready) detail_ = "W8C split-reader output directory is unavailable";
+      }
+      else
+      {
+        ready = CreateDurableDirectory(output_directory_, detail_) ==
+            DurableIoStatus::ok;
+        output_directory_created_ = ready;
+      }
+    }
+    directory_ready_ = CollectiveAll(ready, context_.communicator());
+    return directory_ready_;
+  }
+  std::uint32_t ExpectedRetries() const noexcept
+  {
+    return config_.injection().mode == FailureInjectionModeV1::prescribed
+        ? 1U : 0U;
+  }
+
+  const ValidatedApplicationConfig& config_;
+  MpiApplicationContextV1& context_;
+  std::string& detail_;
+  std::filesystem::path output_directory_;
+  std::optional<ValidatedApplicationConfig> checkpoint_writer_;
+  PersistentResourceDescriptor resources_{};
+  DurableGenerationTransactionV1 transaction_;
+  ScalarIgrPackedState published_;
+  ScalarIgrPackedState candidate_;
+  std::vector<std::uint8_t> vtk_;
+  std::vector<std::uint8_t> checkpoint_;
+  std::vector<std::uint8_t> metadata_;
+  StateHash initial_hash_{};
+  bool directory_ready_ = false;
+  bool output_directory_created_ = false;
+  bool active_ = false;
+};
+#endif
+
+ApplicationRunResult W8cResult(
+    const cpu::w8c::LifecycleReport& report) noexcept
+{
+  ApplicationRunResult result;
+  result.status = report.status;
+  result.reason = report.reason;
+  result.coordinates = report.coordinates;
+  result.retries = report.retries;
+  if (report.failure == cpu::w8c::LifecycleFailure::none)
+    result.failure_class = ApplicationRunResult::FailureClass::none;
+  else if (report.failure ==
+           cpu::w8c::LifecycleFailure::injected_after_recovery)
+    result.failure_class = ApplicationRunResult::FailureClass::injected;
+  else if (report.failure == cpu::w8c::LifecycleFailure::restart)
+    result.failure_class = ApplicationRunResult::FailureClass::checkpoint_data;
+  else if (report.failure == cpu::w8c::LifecycleFailure::initial_output ||
+           report.failure == cpu::w8c::LifecycleFailure::staging ||
+           report.failure == cpu::w8c::LifecycleFailure::publication)
+    result.failure_class = ApplicationRunResult::FailureClass::filesystem;
+  else if (ScientificFailureReason(report.reason))
+    result.failure_class = ApplicationRunResult::FailureClass::scientific;
+  else
+    result.failure_class = ApplicationRunResult::FailureClass::backend;
+  return result;
+}
+
+ApplicationRunResult RunW8cCpuSerial(
+    const ApplicationOptionsView& request, MpiApplicationContextV1& context)
+{
+  const ApplicationValidation validation = ValidateApplicationOptions(request);
+  if (!validation.accepted() || context.ranks() != 1)
+  {
+    ApplicationRunResult invalid;
+    invalid.status = request.interior_space == InteriorSpace::h1
+        ? RunStatus::unsupported_h1 : RunStatus::invalid_request;
+    invalid.reason = request.interior_space == InteriorSpace::h1
+        ? FailureReason::unsupported_h1
+        : FailureReason::invalid_resource_descriptor;
+    invalid.failure_class = ApplicationRunResult::FailureClass::configuration;
+    return invalid;
+  }
+  const ValidatedApplicationConfig& config = *validation.config();
+  cpu::w8c::LifecycleControl control;
+  control.restart = config.run_role() == ApplicationRunRoleV1::split_reader;
+  control.split_writer =
+      config.run_role() == ApplicationRunRoleV1::split_writer;
+  control.inject_after_recovery =
+      config.injection().mode == FailureInjectionModeV1::prescribed;
+  control.maximum_retries = config.retry_limit();
+  std::string detail;
+  cpu::w8c::LifecycleReport report;
+  bool clean = true;
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
+  if (config.scalar_igr())
+  {
+    W8cScalarMethod method;
+    W8cScalarPublication publication(request, config, context, detail);
+    report = cpu::w8c::RunCpuSerialLifecycle(method, publication, control);
+    clean = publication.Cleanup();
+  }
+  else
+#endif
+  {
+    W8cConventionalMethod method;
+    W8cConventionalPublication publication(request, config, context, detail);
+    report = cpu::w8c::RunCpuSerialLifecycle(method, publication, control);
+    if (report.failure != cpu::w8c::LifecycleFailure::none)
+    {
+      const CpuAttemptEvidence& attempt = method.Evidence().last_attempt;
+      AppendCpuFailureProvenance(attempt, detail);
+    }
+    clean = publication.Cleanup();
+  }
+  ApplicationRunResult result = W8cResult(report);
+  if (!clean)
+  {
+    result.status = RunStatus::terminal_failure;
+    result.reason = FailureReason::backend_failure;
+    result.failure_class = ApplicationRunResult::FailureClass::filesystem;
+  }
+  if (detail.empty() && result.failure_class !=
+                            ApplicationRunResult::FailureClass::none)
+    detail = "W8C shared CPU-serial lifecycle failed";
+  context.SetDiagnostic(detail);
+  return result;
+}
+
 template <typename Selection>
 ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
                             MpiApplicationContextV1& context)
@@ -2777,6 +3436,8 @@ ApplicationRunResult RunSmoothPeriodicEulerV1Downstream(
     CpuSerialBackendTag, const ApplicationOptionsView& request,
     MpiApplicationContextV1& context)
 {
+  if (request.case_id == cpu::w8c::case_id)
+    return RunW8cCpuSerial(request, context);
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
   if (request.card_id == scalar_igr_sc25_v3_card_id)
     return RunScalarIgrCpu<false>(request, context);

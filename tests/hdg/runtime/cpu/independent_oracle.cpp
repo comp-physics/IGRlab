@@ -16,6 +16,46 @@
 
 namespace dg_igr_hdg_cpu_test
 {
+
+W8cKnownState W8cCellState(const double x) noexcept
+{
+  constexpr W8cKnownState right{{0.125, 0.0, 0.0, 0.25}};
+  constexpr W8cKnownState left{{1.0, 0.0, 0.0, 2.5}};
+  return x < 0.25 || x >= 0.75 ? right : left;
+}
+
+W8cKnownState W8cInterfaceMean() noexcept
+{
+  return {{0.5625, 0.0, 0.0, 1.375}};
+}
+
+bool W8cCellCoefficientKnownAnswer(const int component,
+                                   const double value) noexcept
+{
+  if (component < 0 || component >= 4) return false;
+  const W8cKnownState right = W8cCellState(0.0);
+  const W8cKnownState left = W8cCellState(0.5);
+  const auto close = [value](const double expected) noexcept {
+    return std::abs(value - expected) <=
+        64.0 * std::numeric_limits<double>::epsilon() *
+            std::max(1.0, std::abs(expected));
+  };
+  return close(right[static_cast<std::size_t>(component)]) ||
+      close(left[static_cast<std::size_t>(component)]);
+}
+
+bool W8cTraceCoefficientKnownAnswer(const int component,
+                                    const double value) noexcept
+{
+  if (component < 0 || component >= 4) return false;
+  const W8cKnownState mean = W8cInterfaceMean();
+  const double expected = mean[static_cast<std::size_t>(component)];
+  return W8cCellCoefficientKnownAnswer(component, value) ||
+      std::abs(value - expected) <=
+          64.0 * std::numeric_limits<double>::epsilon() *
+              std::max(1.0, std::abs(expected));
+}
+
 namespace
 {
 

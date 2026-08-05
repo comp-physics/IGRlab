@@ -9,6 +9,13 @@
 namespace dg_igr_hdg_cpu_test
 {
 
+using W8cKnownState = std::array<double, 4>;
+
+W8cKnownState W8cCellState(double x) noexcept;
+W8cKnownState W8cInterfaceMean() noexcept;
+bool W8cCellCoefficientKnownAnswer(int component, double value) noexcept;
+bool W8cTraceCoefficientKnownAnswer(int component, double value) noexcept;
+
 struct IndependentOracleConfig
 {
   int polynomial_order = 1;
