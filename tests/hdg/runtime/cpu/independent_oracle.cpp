@@ -29,31 +29,232 @@ W8cKnownState W8cInterfaceMean() noexcept
   return {{0.5625, 0.0, 0.0, 1.375}};
 }
 
-bool W8cCellCoefficientKnownAnswer(const int component,
-                                   const double value) noexcept
+bool VerifyW8cTraceGeometryAndState(
+    MPI_Comm communicator, const double* true_trace,
+    const std::size_t true_trace_size,
+    W8cTraceGeometryEvidence& evidence) noexcept
 {
-  if (component < 0 || component >= 4) return false;
-  const W8cKnownState right = W8cCellState(0.0);
-  const W8cKnownState left = W8cCellState(0.5);
-  const auto close = [value](const double expected) noexcept {
-    return std::abs(value - expected) <=
-        64.0 * std::numeric_limits<double>::epsilon() *
-            std::max(1.0, std::abs(expected));
-  };
-  return close(right[static_cast<std::size_t>(component)]) ||
-      close(left[static_cast<std::size_t>(component)]);
-}
+  evidence = {};
+  if (communicator == MPI_COMM_NULL || !true_trace) return false;
+  int rank = -1;
+  int ranks = 0;
+  if (MPI_Comm_rank(communicator, &rank) != MPI_SUCCESS ||
+      MPI_Comm_size(communicator, &ranks) != MPI_SUCCESS ||
+      rank != 0 || ranks != 1)
+  {
+    return false;
+  }
 
-bool W8cTraceCoefficientKnownAnswer(const int component,
-                                    const double value) noexcept
-{
-  if (component < 0 || component >= 4) return false;
-  const W8cKnownState mean = W8cInterfaceMean();
-  const double expected = mean[static_cast<std::size_t>(component)];
-  return W8cCellCoefficientKnownAnswer(component, value) ||
-      std::abs(value - expected) <=
-          64.0 * std::numeric_limits<double>::epsilon() *
-              std::max(1.0, std::abs(expected));
+  constexpr int n = 8;
+  constexpr int trace_components = 4;
+  constexpr int expected_faces = 2 * n * n;
+  constexpr int expected_face_nodes = 2 * expected_faces;
+  constexpr int expected_true_dofs =
+      trace_components * expected_face_nodes;
+  constexpr double geometry_tolerance =
+      64.0 * std::numeric_limits<double>::epsilon();
+  const auto close = [](const double actual, const double expected) noexcept {
+    return std::abs(actual - expected) <=
+        64.0 * std::numeric_limits<double>::epsilon() *
+            std::max({1.0, std::abs(actual), std::abs(expected)});
+  };
+  const auto state_at_x = [](const double x) noexcept {
+    return std::abs(x - 0.25) <= geometry_tolerance ||
+            std::abs(x - 0.75) <= geometry_tolerance
+        ? W8cInterfaceMean() : W8cCellState(x);
+  };
+
+  try
+  {
+    mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+        n, n, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+    std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+    translations[0][0] = 1.0;
+    translations[0][1] = 0.0;
+    translations[1][0] = 0.0;
+    translations[1][1] = 1.0;
+    mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
+        original, original.CreatePeriodicVertexMapping(translations));
+    std::vector<int> partition(
+        static_cast<std::size_t>(periodic.GetNE()), 0);
+    mfem::ParMesh mesh(communicator, periodic, partition.data());
+    mfem::DG_Interface_FECollection collection(
+        1, 2, mfem::FiniteElement::VALUE,
+        mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace space(
+        &mesh, &collection, trace_components, mfem::Ordering::byNODES);
+
+    evidence.faces = static_cast<std::uint64_t>(mesh.GetNumFaces());
+    evidence.true_dofs = static_cast<std::uint64_t>(space.GetTrueVSize());
+    if (mesh.GetNE() != n * n || mesh.GetNumFaces() != expected_faces ||
+        space.GetTrueVSize() != expected_true_dofs ||
+        true_trace_size != static_cast<std::size_t>(expected_true_dofs))
+    {
+      return false;
+    }
+
+    std::vector<std::uint8_t> assigned(true_trace_size, 0);
+    std::vector<int> face_visits(static_cast<std::size_t>(expected_faces), 0);
+    for (int face = 0; face < mesh.GetNumFaces(); ++face)
+    {
+      const mfem::FiniteElement* finite_element = space.GetFaceElement(face);
+      mfem::ElementTransformation* transformation =
+          mesh.GetFaceTransformation(face);
+      mfem::Array<int> vdofs;
+      space.GetFaceVDofs(face, vdofs);
+      if (!finite_element || !transformation || finite_element->GetDof() != 2 ||
+          vdofs.Size() != 2 * trace_components)
+      {
+        return false;
+      }
+      const mfem::IntegrationRule& nodes = finite_element->GetNodes();
+      if (nodes.GetNPoints() != 2) return false;
+      for (int scalar = 0; scalar < 2; ++scalar)
+      {
+        mfem::Vector point(2);
+        transformation->Transform(nodes.IntPoint(scalar), point);
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1])) return false;
+        const W8cKnownState expected = state_at_x(point[0]);
+        ++evidence.face_nodes;
+        if (std::abs(point[0] - 0.25) <= geometry_tolerance ||
+            std::abs(point[0] - 0.75) <= geometry_tolerance)
+        {
+          ++evidence.mean_nodes;
+        }
+        else if (expected == W8cCellState(0.0))
+        {
+          ++evidence.right_nodes;
+        }
+        else
+        {
+          ++evidence.left_nodes;
+        }
+        if (std::abs(point[0]) <= geometry_tolerance ||
+            std::abs(point[0] - 1.0) <= geometry_tolerance)
+        {
+          ++evidence.periodic_nodes;
+        }
+        for (int component = 0; component < trace_components; ++component)
+        {
+          double sign = 1.0;
+          const int dof = mfem::FiniteElementSpace::DecodeDof(
+              vdofs[scalar + 2 * component], sign);
+          const int true_dof = dof >= 0
+              ? space.GetLocalTDofNumber(dof) : -1;
+          if (dof < 0 || true_dof < 0 ||
+              true_dof >= expected_true_dofs || sign == 0.0)
+          {
+            return false;
+          }
+          if (sign < 0.0) ++evidence.negative_face_vdofs;
+          const double expected_true =
+              sign * expected[static_cast<std::size_t>(component)];
+          if (!close(true_trace[static_cast<std::size_t>(true_dof)],
+                     expected_true) ||
+              assigned[static_cast<std::size_t>(true_dof)] != 0)
+          {
+            return false;
+          }
+          assigned[static_cast<std::size_t>(true_dof)] = 1;
+        }
+      }
+    }
+    if (!std::all_of(assigned.begin(), assigned.end(),
+                     [](const std::uint8_t value) { return value == 1; }))
+    {
+      return false;
+    }
+
+    for (int element = 0; element < mesh.GetNE(); ++element)
+    {
+      mfem::Array<int> faces, orientations;
+      mesh.GetElementEdges(element, faces, orientations);
+      if (faces.Size() != 4 || orientations.Size() != faces.Size())
+        return false;
+      for (int local_face = 0; local_face < faces.Size(); ++local_face)
+      {
+        const int face = faces[local_face];
+        const int orientation = orientations[local_face];
+        if (face < 0 || face >= expected_faces ||
+            (orientation != 1 && orientation != -1))
+        {
+          return false;
+        }
+        ++evidence.element_face_visits;
+        ++face_visits[static_cast<std::size_t>(face)];
+        if (orientation > 0) ++evidence.positive_orientations;
+        else ++evidence.negative_orientations;
+
+        const mfem::FiniteElement* finite_element = space.GetFaceElement(face);
+        mfem::ElementTransformation* transformation =
+            mesh.GetFaceTransformation(face);
+        mfem::Array<int> vdofs;
+        space.GetFaceVDofs(face, vdofs);
+        const int* permutation = collection.DofOrderForOrientation(
+            mfem::Geometry::SEGMENT, orientation);
+        if (!finite_element || !transformation || !permutation ||
+            finite_element->GetDof() != 2 ||
+            vdofs.Size() != 2 * trace_components)
+        {
+          return false;
+        }
+        std::array<std::uint8_t, 2> permutation_census{};
+        const mfem::IntegrationRule& nodes = finite_element->GetNodes();
+        for (int oriented = 0; oriented < 2; ++oriented)
+        {
+          double permutation_sign = 1.0;
+          const int canonical = mfem::FiniteElementSpace::DecodeDof(
+              permutation[oriented], permutation_sign);
+          if (canonical < 0 || canonical >= 2 || permutation_sign == 0.0 ||
+              permutation_census[static_cast<std::size_t>(canonical)] != 0)
+          {
+            return false;
+          }
+          permutation_census[static_cast<std::size_t>(canonical)] = 1;
+          if (permutation_sign < 0.0)
+            ++evidence.negative_permutation_dofs;
+          mfem::Vector point(2);
+          transformation->Transform(nodes.IntPoint(canonical), point);
+          const W8cKnownState expected = state_at_x(point[0]);
+          for (int component = 0; component < trace_components; ++component)
+          {
+            double face_sign = 1.0;
+            const int dof = mfem::FiniteElementSpace::DecodeDof(
+                vdofs[canonical + 2 * component], face_sign);
+            const int true_dof = dof >= 0
+                ? space.GetLocalTDofNumber(dof) : -1;
+            if (true_dof < 0 || true_dof >= expected_true_dofs ||
+                !close(face_sign *
+                           true_trace[static_cast<std::size_t>(true_dof)],
+                       expected[static_cast<std::size_t>(component)]))
+            {
+              return false;
+            }
+          }
+        }
+      }
+    }
+
+    const bool exact_face_multiplicity = std::all_of(
+        face_visits.begin(), face_visits.end(),
+        [](const int visits) { return visits == 2; });
+    return exact_face_multiplicity &&
+        evidence.faces == expected_faces &&
+        evidence.face_nodes == expected_face_nodes &&
+        evidence.true_dofs == expected_true_dofs &&
+        evidence.element_face_visits == 4 * n * n &&
+        evidence.positive_orientations == 2 * n * n &&
+        evidence.negative_orientations == 2 * n * n &&
+        evidence.negative_face_vdofs == 0 &&
+        evidence.negative_permutation_dofs == 0 &&
+        evidence.right_nodes == 112 && evidence.left_nodes == 112 &&
+        evidence.mean_nodes == 32 && evidence.periodic_nodes == 16;
+  }
+  catch (...)
+  {
+    evidence = {};
+    return false;
+  }
 }
 
 namespace

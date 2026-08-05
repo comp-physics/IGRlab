@@ -3,6 +3,7 @@
 #include <mpi.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -13,8 +14,33 @@ using W8cKnownState = std::array<double, 4>;
 
 W8cKnownState W8cCellState(double x) noexcept;
 W8cKnownState W8cInterfaceMean() noexcept;
-bool W8cCellCoefficientKnownAnswer(int component, double value) noexcept;
-bool W8cTraceCoefficientKnownAnswer(int component, double value) noexcept;
+
+struct W8cTraceGeometryEvidence final
+{
+  std::uint64_t faces = 0;
+  std::uint64_t face_nodes = 0;
+  std::uint64_t true_dofs = 0;
+  std::uint64_t element_face_visits = 0;
+  std::uint64_t positive_orientations = 0;
+  std::uint64_t negative_orientations = 0;
+  std::uint64_t negative_face_vdofs = 0;
+  std::uint64_t negative_permutation_dofs = 0;
+  std::uint64_t right_nodes = 0;
+  std::uint64_t left_nodes = 0;
+  std::uint64_t mean_nodes = 0;
+  std::uint64_t periodic_nodes = 0;
+};
+
+/**
+ * Rebuild the exact periodic N8/k1 face space locally, including signed face
+ * VDofs and per-element orientation permutations, and check every coherent
+ * four-component true-trace state against its physical face-node geometry.
+ * No production topology, projection, or initialization helper is called.
+ */
+bool VerifyW8cTraceGeometryAndState(
+    MPI_Comm communicator, const double* true_trace,
+    std::size_t true_trace_size,
+    W8cTraceGeometryEvidence& evidence) noexcept;
 
 struct IndependentOracleConfig
 {

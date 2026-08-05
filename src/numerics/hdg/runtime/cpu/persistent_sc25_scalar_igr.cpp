@@ -301,21 +301,40 @@ bool ExactField(const mfem::ParGridFunction* field,
 
 namespace
 {
-thread_local bool next_rank1_initialization_is_w8c = false;
+enum class Rank1InitializationSelection : unsigned char
+{
+  ordinary,
+  w8c
+};
+
+struct Rank1InitializationRequest final
+{
+  const PersistentSc25ScalarIgrCpuFoundation* owner = nullptr;
+  Rank1InitializationSelection selection =
+      Rank1InitializationSelection::ordinary;
+};
+
+thread_local Rank1InitializationRequest next_rank1_initialization{};
 }
 
 namespace w8c_internal
 {
 
 [[gnu::visibility("hidden")]]
-void RequestW8cInitialization() noexcept
+void RequestW8cInitialization(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept
 {
-  next_rank1_initialization_is_w8c = true;
+  next_rank1_initialization = {
+      &owner, Rank1InitializationSelection::w8c};
 }
 
-bool ConsumeW8cInitializationRequest() noexcept
+bool ConsumeW8cInitializationRequest(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept
 {
-  return std::exchange(next_rank1_initialization_is_w8c, false);
+  const Rank1InitializationRequest request = std::exchange(
+      next_rank1_initialization, Rank1InitializationRequest{});
+  return request.owner == &owner &&
+      request.selection == Rank1InitializationSelection::w8c;
 }
 
 } // namespace w8c_internal
@@ -9966,7 +9985,10 @@ TrajectoryStatus
 PersistentSc25ScalarIgrCpuFoundation::InitializePersistentTrajectory()
     noexcept
 {
-  const bool w8c_mode = w8c_internal::ConsumeW8cInitializationRequest();
+  // Consuming at the first statement clears the typed, owner-bound request on
+  // every exit, including invalid-configuration and initialization failures.
+  const bool w8c_mode =
+      w8c_internal::ConsumeW8cInitializationRequest(*this);
   if (!implementation_ || implementation_->status != FoundationStatus::ready ||
       implementation_->rank != 0 || implementation_->ranks != 1 ||
       implementation_->config.polynomial_degree != 1 ||

@@ -1,6 +1,7 @@
 #include "hdg_cpu_serial_lifecycle.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
 #include <type_traits>
@@ -59,13 +60,12 @@ public:
     ++reverts;
     return true;
   }
-  bool Finalize(Transaction&& transaction) noexcept
+  void Finalize(Transaction&& transaction) noexcept
   {
-    if (!transaction.installed) return false;
+    if (!transaction.installed) std::abort();
     status_ = RunStatus::committed;
     reason_ = FailureReason::none;
     ++finalizes;
-    return true;
   }
   void RestoreStep32() noexcept
   {

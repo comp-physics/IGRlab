@@ -20,7 +20,8 @@
 
 namespace dg::hdg::runtime::cpu::sc25::w8c_internal
 {
-[[gnu::visibility("hidden")]] void RequestW8cInitialization() noexcept;
+[[gnu::visibility("hidden")]] void RequestW8cInitialization(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept;
 }
 
 namespace
@@ -76,25 +77,6 @@ bool KnownCellCoefficients(const double* values, const std::size_t count)
         return false;
     }
   return true;
-}
-
-bool KnownTraceCoefficients(const double* values, const std::size_t count)
-{
-  if (!values || count == 0 || count % 4 != 0) return false;
-  const std::size_t scalar = count / 4;
-  bool saw_mean_density = false;
-  for (int component = 0; component < 4; ++component)
-    for (std::size_t index = 0; index < scalar; ++index)
-    {
-      const double value = values[static_cast<std::size_t>(component) * scalar +
-                                  index];
-      if (!dg_igr_hdg_cpu_test::W8cTraceCoefficientKnownAnswer(component,
-                                                                value))
-        return false;
-      if (component == 0) saw_mean_density =
-          saw_mean_density || Near(value, 0.5625);
-    }
-  return saw_mean_density;
 }
 
 bool KnownScalarCellCoefficients(const sc25::PersistentTrajectoryState& state)
@@ -211,12 +193,18 @@ int main(int argc, char** argv)
   checks.Require(conventional_ready,
                  "conventional W8C N8 initial projection must initialize");
   const cpu::CpuStateSnapshot conventional_state = conventional.Snapshot();
+  dg_igr_hdg_cpu_test::W8cTraceGeometryEvidence conventional_trace_evidence;
+  const bool conventional_trace_exact = conventional_ready &&
+      dg_igr_hdg_cpu_test::VerifyW8cTraceGeometryAndState(
+          MPI_COMM_WORLD, conventional_state.trace.data,
+          conventional_state.trace.size, conventional_trace_evidence);
   checks.Require(conventional_ready &&
                      KnownCellCoefficients(conventional_state.interior.data,
-                                           conventional_state.interior.size) &&
-                     KnownTraceCoefficients(conventional_state.trace.data,
-                                            conventional_state.trace.size),
-                 "conventional W8C initial cell/trace known answers");
+                                           conventional_state.interior.size),
+                 "conventional W8C initial cell known answer");
+  checks.Require(conventional_trace_exact,
+                 "conventional W8C trace must match independently rebuilt "
+                 "face geometry, signed true DOFs, and orientations");
   checks.Require(conventional.evidence().elements_per_direction == 8 &&
                      conventional.evidence().polynomial_order == 1 &&
                      conventional.evidence().assembly_quadrature_order == 11 &&
@@ -226,13 +214,47 @@ int main(int argc, char** argv)
   sc25::FoundationConfig foundation;
   foundation.polynomial_degree = 1;
   foundation.elements_per_direction = 8;
+
+  sc25::FoundationConfig failed_w8c_foundation = foundation;
+  failed_w8c_foundation.polynomial_degree = 2;
+  std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation>
+      failed_w8c_owner;
+  const bool failed_w8c_created =
+      sc25::PersistentSc25ScalarIgrCpuFoundation::Create(
+          MPI_COMM_WORLD, sc25::CpuSerialTag{}, failed_w8c_foundation,
+          failed_w8c_owner) == sc25::FoundationStatus::ready &&
+      failed_w8c_owner;
+  if (failed_w8c_created)
+    sc25::w8c_internal::RequestW8cInitialization(*failed_w8c_owner);
+  const bool requested_w8c_failed = failed_w8c_created &&
+      failed_w8c_owner->InitializePersistentTrajectory() ==
+          sc25::TrajectoryStatus::invalid_configuration;
+
+  std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation>
+      ordinary_w8b_owner;
+  const bool ordinary_w8b_created =
+      sc25::PersistentSc25ScalarIgrCpuFoundation::Create(
+          MPI_COMM_WORLD, sc25::CpuSerialTag{}, foundation,
+          ordinary_w8b_owner) == sc25::FoundationStatus::ready &&
+      ordinary_w8b_owner;
+  const bool ordinary_w8b_ready = ordinary_w8b_created &&
+      ordinary_w8b_owner->InitializePersistentTrajectory() ==
+          sc25::TrajectoryStatus::ready;
+  sc25::PersistentTrajectoryState ordinary_w8b_state;
+  const bool ordinary_w8b_copied = ordinary_w8b_ready &&
+      ordinary_w8b_owner->CopyPublishedTrajectoryState(ordinary_w8b_state);
+  checks.Require(requested_w8c_failed && ordinary_w8b_copied &&
+                     !KnownScalarCellCoefficients(ordinary_w8b_state),
+                 "failed typed W8C selection must clear before an ordinary "
+                 "same-process W8B initialization");
+
   std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> scalar;
   const bool scalar_created =
       sc25::PersistentSc25ScalarIgrCpuFoundation::Create(
           MPI_COMM_WORLD, sc25::CpuSerialTag{}, foundation, scalar) ==
           sc25::FoundationStatus::ready && scalar;
   if (scalar_created)
-    sc25::w8c_internal::RequestW8cInitialization();
+    sc25::w8c_internal::RequestW8cInitialization(*scalar);
   const bool scalar_ready = scalar_created &&
       scalar->InitializePersistentTrajectory() == sc25::TrajectoryStatus::ready;
   checks.Require(scalar_ready,
@@ -240,11 +262,17 @@ int main(int argc, char** argv)
   sc25::PersistentTrajectoryState scalar_state;
   const bool scalar_copied = scalar_ready &&
       scalar->CopyPublishedTrajectoryState(scalar_state);
+  dg_igr_hdg_cpu_test::W8cTraceGeometryEvidence scalar_trace_evidence;
+  const bool scalar_trace_exact = scalar_copied &&
+      dg_igr_hdg_cpu_test::VerifyW8cTraceGeometryAndState(
+          MPI_COMM_WORLD, scalar_state.uhat.data(), scalar_state.uhat.size(),
+          scalar_trace_evidence);
   checks.Require(scalar_copied &&
-                     KnownScalarCellCoefficients(scalar_state) &&
-                     KnownTraceCoefficients(scalar_state.uhat.data(),
-                                            scalar_state.uhat.size()),
-                 "scalar-IGR W8C U/Uhat initial known answers");
+                     KnownScalarCellCoefficients(scalar_state),
+                 "scalar-IGR W8C U initial known answer");
+  checks.Require(scalar_trace_exact,
+                 "scalar-IGR W8C Uhat must match independently rebuilt face "
+                 "geometry, signed true DOFs, and orientations");
   checks.Require(scalar_copied && PositiveZero(scalar_state.sigma) &&
                      PositiveZero(scalar_state.z) &&
                      PositiveZero(scalar_state.sigmahat),

@@ -62,7 +62,6 @@ enum class LifecycleFailure : unsigned char
   staging,
   injected_after_recovery,
   publication,
-  numerical_finalize,
   rollback
 };
 
@@ -104,6 +103,15 @@ LifecycleReport RunCpuSerialLifecycle(
                 "W8C method composition must use static dispatch");
   static_assert(!std::is_polymorphic<Publication>::value,
                 "W8C publication composition must use static dispatch");
+  using Transaction = typename Method::Transaction;
+  static_assert(
+      std::is_same<decltype(std::declval<Method&>().Finalize(
+                       std::declval<Transaction&&>())), void>::value,
+      "W8C finalization is a non-fallible post-publication invariant");
+  static_assert(
+      noexcept(std::declval<Method&>().Finalize(
+          std::declval<Transaction&&>())),
+      "W8C finalization must be noexcept after durable publication");
 
   LifecycleReport report{};
   const auto fail = [&](const LifecycleFailure failure,
@@ -140,7 +148,7 @@ LifecycleReport RunCpuSerialLifecycle(
   while (method.Coordinates().step < stop_step)
   {
     const std::uint64_t target = method.Coordinates().step + 1;
-    typename Method::Transaction transaction;
+    Transaction transaction;
     if (!method.Prepare(transaction, retry))
     {
       if (method.RetryAvailable() &&
@@ -192,9 +200,7 @@ LifecycleReport RunCpuSerialLifecycle(
       return fail(LifecycleFailure::publication,
                   FailureReason::backend_failure);
     }
-    if (!method.Finalize(std::move(transaction)))
-      return fail(LifecycleFailure::numerical_finalize,
-                  FailureReason::publication_precondition);
+    method.Finalize(std::move(transaction));
     retry = false;
     report.status = RunStatus::committed;
     report.reason = FailureReason::none;

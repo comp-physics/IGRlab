@@ -33,7 +33,8 @@
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
 namespace dg::hdg::runtime::cpu::sc25::w8c_internal
 {
-[[gnu::visibility("hidden")]] void RequestW8cInitialization() noexcept;
+[[gnu::visibility("hidden")]] void RequestW8cInitialization(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept;
 }
 #endif
 
@@ -2418,11 +2419,16 @@ public:
     return !outcome.committed && outcome.retry_available;
   }
 
-  bool Finalize(Transaction&& transaction) noexcept
+  void Finalize(Transaction&& transaction) noexcept
   {
+    // Install supplied the valid provisional token consumed here.  The
+    // run-contract FinalizeCommit implementation has no rejecting transition
+    // for such a token, so a contrary outcome is an internal invariant breach,
+    // not a recoverable post-publication branch.
     const AttemptOutcome outcome = adapter_.FinalizeCommit(
         transaction.provisional);
-    return outcome.committed && outcome.reason == FailureReason::none;
+    if (!outcome.committed || outcome.reason != FailureReason::none)
+      std::abort();
   }
 
   bool Restore(const CpuCheckpoint& checkpoint) noexcept
@@ -2651,7 +2657,7 @@ public:
     if (ScalarIgrCpuTraits<false>::Create(foundation, owner_) !=
             sc25::FoundationStatus::ready || !owner_)
       return false;
-    cpu::sc25::w8c_internal::RequestW8cInitialization();
+    cpu::sc25::w8c_internal::RequestW8cInitialization(*owner_);
     return ScalarIgrCpuTraits<false>::Initialize(*owner_) ==
         sc25::TrajectoryStatus::ready;
   }
@@ -2672,11 +2678,15 @@ public:
         *owner_, std::move(transaction));
     return retry_available_;
   }
-  bool Finalize(Transaction&& transaction) noexcept
+  void Finalize(Transaction&& transaction) noexcept
   {
     retry_available_ = false;
-    return owner_ && ScalarIgrCpuTraits<false>::Finalize(
-        *owner_, std::move(transaction));
+    // Successful Install leaves the exact valid scalar provisional token.
+    // Its run-contract finalizer cannot reject; publication has already
+    // released rollback authority when this non-fallible boundary is entered.
+    if (!owner_ || !ScalarIgrCpuTraits<false>::Finalize(
+                       *owner_, std::move(transaction)))
+      std::abort();
   }
   RunStatus Status() const noexcept
   {
