@@ -132,6 +132,57 @@ ApplicationOptionsView ScalarIgr(const std::string_view backend)
   return options;
 }
 
+ApplicationOptionsView W8cCase(const bool scalar, const bool smooth)
+{
+  ApplicationOptionsView options = scalar
+      ? ScalarIgr(CpuSerialBackendTag::id)
+      : Smoke(CpuSerialBackendTag::id);
+  options.case_id = smooth ? "periodic-smooth-transition-v2"
+                           : "periodic-double-riemann-v1";
+  options.scenario_id = smooth ? "W8C-V2-N8-DT10" : "W8C-N8-DT10";
+  options.source_id = scalar
+      ? (smooth ? "source.sc25.periodic-smooth-transition.v3"
+                : "source.sc25.periodic-double-riemann.v3")
+      : (smooth ? "source.euler.periodic-smooth-transition.v2"
+                : "source.euler.periodic-double-riemann.v1");
+  options.polynomial_order = 1;
+  options.mesh_n = 8;
+  options.q_a = scalar ? 12 : 11;
+  options.q_e = 0;
+  options.q_e4 = 0;
+  options.q_o = 18;
+  options.dt = 1.0 / 1024.0;
+  options.accepted_steps = 64;
+  options.final_time = 1.0 / 16.0;
+  options.output_steps = {{0, 32, 64}};
+  options.checkpoint_id = scalar
+      ? (smooth
+             ? "checkpoint.hdg.igr.sc25.periodic-smooth-transition.n8-dt10.step-32.v2"
+             : "checkpoint.hdg.igr.sc25.periodic-double-riemann.n8-dt10.step-32.v1")
+      : (smooth
+             ? "checkpoint.hdg.euler.periodic-smooth-transition.n8-dt10.step-32.v2"
+             : "checkpoint.hdg.euler.periodic-double-riemann.n8-dt10.step-32.v1");
+  options.checkpoint_step = OptionalCheckpointStepV1::Present(32);
+  options.injection = {};
+  options.retry_limit = 0;
+  options.seed = smooth ? UINT64_C(0x573843534d4f5632)
+                        : UINT64_C(0x5738434452495631);
+  return options;
+}
+
+ApplicationOptionsView W8cSplitReader(ApplicationOptionsView options)
+{
+  const std::string_view checkpoint = options.checkpoint_out.canonical;
+  options.run_role = ApplicationRunRoleV1::split_reader;
+  options.checkpoint_out = {};
+  options.checkpoint_step = {};
+  options.restart_from = CheckpointArtifactPathV1::Present(checkpoint);
+  options.stop_after_checkpoint = StopAfterCheckpointV1::no;
+  options.injection = {};
+  options.retry_limit = 0;
+  return options;
+}
+
 void SelectTuple(ApplicationOptionsView& options, const bool scalar)
 {
   if (scalar)
@@ -314,6 +365,84 @@ bool CheckExactAcceptedFieldsAndHashes()
                          config->run_config_sha256(),
                  "run_only_path_changes_only_run_hash") &&
       passed;
+  return passed;
+}
+
+bool CheckW8cSmoothTransitionClosure()
+{
+  bool passed = true;
+  for (const bool scalar : {false, true})
+  {
+    const ApplicationValidation smooth_validation =
+        ValidateApplicationOptions(W8cCase(scalar, true));
+    const ApplicationValidation exact_validation =
+        ValidateApplicationOptions(W8cCase(scalar, false));
+    const ValidatedApplicationConfig* smooth = smooth_validation.config();
+    const ValidatedApplicationConfig* exact = exact_validation.config();
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0
+    if (scalar)
+    {
+      passed = Check(smooth == nullptr && exact == nullptr &&
+                         smooth_validation.rejection() ==
+                             ApplicationRejection::unbuilt_backend &&
+                         exact_validation.rejection() ==
+                             ApplicationRejection::unbuilt_backend,
+                     "smooth_and_exact_scalar_cases_unbuilt_together") &&
+          passed;
+      continue;
+    }
+#endif
+    passed = Check(smooth != nullptr && exact != nullptr &&
+                       smooth->backend() == ApplicationBackend::cpu_serial &&
+                       smooth->scenario() ==
+                           (scalar
+                                ? ApplicationScenarioV1::scalar_igr_sc25_v3
+                                : ApplicationScenarioV1::smoke) &&
+                       smooth->case_id().view() ==
+                           "periodic-smooth-transition-v2" &&
+                       smooth->scenario_checkpoint_step() == 32 &&
+                       Nonzero(smooth->scientific_config_sha256()) &&
+                       Nonzero(smooth->run_config_sha256()) &&
+                       smooth->scientific_config_sha256() !=
+                           exact->scientific_config_sha256() &&
+                       smooth->run_config_sha256() !=
+                           exact->run_config_sha256(),
+                   "smooth_case_private_scenario_and_hash_separation") &&
+        passed;
+
+    ApplicationOptionsView writer = W8cCase(scalar, true);
+    writer.run_role = ApplicationRunRoleV1::split_writer;
+    writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+    const ApplicationValidation writer_validation =
+        ValidateApplicationOptions(writer);
+    const ApplicationValidation reader_validation =
+        ValidateApplicationOptions(W8cSplitReader(W8cCase(scalar, true)));
+    passed = Check(writer_validation.accepted() &&
+                       reader_validation.accepted(),
+                   "smooth_split_writer_reader_use_off_zero_controls") &&
+        passed;
+
+    ApplicationOptionsView crossed = W8cCase(scalar, true);
+    crossed.case_id = "periodic-double-riemann-v1";
+    passed = Check(!ValidateApplicationOptions(crossed).accepted(),
+                   "crossed_smooth_descriptor_exact_case_rejected") &&
+        passed;
+    crossed = W8cCase(scalar, true);
+    crossed.source_id = scalar
+        ? "source.sc25.periodic-double-riemann.v3"
+        : "source.euler.periodic-double-riemann.v1";
+    passed = Check(ValidateApplicationOptions(crossed).rejection() ==
+                       ApplicationRejection::invalid_scientific_identity,
+                   "crossed_smooth_source_identity_rejected") &&
+        passed;
+
+    ApplicationOptionsView rank2 = W8cCase(scalar, true);
+    rank2.backend_id = CpuRank2BackendTag::id;
+    passed = Check(ValidateApplicationOptions(rank2).rejection() ==
+                       ApplicationRejection::unknown_backend,
+                   "smooth_case_remains_cpu_serial_only") &&
+        passed;
+  }
   return passed;
 }
 
@@ -1035,6 +1164,7 @@ int main()
 {
   bool passed = true;
   passed = CheckExactAcceptedFieldsAndHashes() && passed;
+  passed = CheckW8cSmoothTransitionClosure() && passed;
   passed = CheckRoleBackendMatrix() && passed;
   passed = CheckFocusedAndAlternateRoles() && passed;
   passed = CheckNegativeRoleControls() && passed;

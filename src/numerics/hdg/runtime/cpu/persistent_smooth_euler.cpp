@@ -69,6 +69,116 @@ bool Finite(const std::vector<double>& values) noexcept
                      [](const double value) { return Finite(value); });
 }
 
+struct ProjectionDenseLu final
+{
+  int size = 0;
+  std::vector<double> values;
+  std::vector<int> pivots;
+
+  bool Factor(const std::vector<double>& matrix, const int n) noexcept
+  {
+    try
+    {
+      if (n <= 0 || matrix.size() != static_cast<std::size_t>(n) * n ||
+          !Finite(matrix))
+      {
+        return false;
+      }
+      size = n;
+      values = matrix;
+      pivots.assign(static_cast<std::size_t>(n), 0);
+      for (int column = 0; column < n; ++column)
+      {
+        int pivot = column;
+        double maximum = std::abs(values[
+            static_cast<std::size_t>(column) * n + column]);
+        for (int row = column + 1; row < n; ++row)
+        {
+          const double candidate = std::abs(values[
+              static_cast<std::size_t>(row) * n + column]);
+          if (candidate > maximum) { maximum = candidate; pivot = row; }
+        }
+        if (!Finite(maximum) || !(maximum > 0.0)) { return false; }
+        pivots[static_cast<std::size_t>(column)] = pivot;
+        if (pivot != column)
+        {
+          for (int entry = 0; entry < n; ++entry)
+          {
+            std::swap(values[static_cast<std::size_t>(column) * n + entry],
+                      values[static_cast<std::size_t>(pivot) * n + entry]);
+          }
+        }
+        const double diagonal = values[
+            static_cast<std::size_t>(column) * n + column];
+        for (int row = column + 1; row < n; ++row)
+        {
+          double& multiplier = values[
+              static_cast<std::size_t>(row) * n + column];
+          multiplier /= diagonal;
+          for (int entry = column + 1; entry < n; ++entry)
+          {
+            values[static_cast<std::size_t>(row) * n + entry] -=
+                multiplier * values[
+                    static_cast<std::size_t>(column) * n + entry];
+          }
+        }
+      }
+      return Finite(values);
+    }
+    catch (...)
+    {
+      return false;
+    }
+  }
+
+  bool Solve(const std::vector<double>& rhs,
+             std::vector<double>& solution) const noexcept
+  {
+    try
+    {
+      if (size <= 0 || rhs.size() != static_cast<std::size_t>(size) ||
+          pivots.size() != rhs.size() || !Finite(rhs))
+      {
+        return false;
+      }
+      solution = rhs;
+      for (int column = 0; column < size; ++column)
+      {
+        const int pivot = pivots[static_cast<std::size_t>(column)];
+        if (pivot < column || pivot >= size) { return false; }
+        if (pivot != column) { std::swap(solution[column], solution[pivot]); }
+      }
+      for (int column = 0; column < size; ++column)
+      {
+        for (int row = column + 1; row < size; ++row)
+        {
+          solution[row] -= values[
+              static_cast<std::size_t>(row) * size + column] *
+              solution[column];
+        }
+      }
+      for (int row = size - 1; row >= 0; --row)
+      {
+        for (int column = row + 1; column < size; ++column)
+        {
+          solution[row] -= values[
+              static_cast<std::size_t>(row) * size + column] *
+              solution[column];
+        }
+        const double diagonal = values[
+            static_cast<std::size_t>(row) * size + row];
+        if (!Finite(diagonal) || diagonal == 0.0) { return false; }
+        solution[row] /= diagonal;
+      }
+      return Finite(solution);
+    }
+    catch (...)
+    {
+      return false;
+    }
+  }
+};
+
 StateHash HashBytes(const void*, std::size_t) noexcept;
 
 bool Finite(const mfem::Vector& values) noexcept
@@ -176,6 +286,20 @@ bool W8cTraceConservative(const double x, State& conservative) noexcept
     return true;
   }
   return W8cConservative(x, conservative);
+}
+
+bool SmoothTransitionConservative(const double x,
+                                  State& conservative) noexcept
+{
+  if (!Finite(x)) { return false; }
+  const double kappa = std::atanh(0.8) /
+      std::sin(pi * w8c::SmoothTransitionV2Case::transition_width);
+  const double chi = 0.5 *
+      (1.0 - std::tanh(kappa * std::cos(2.0 * pi * x)));
+  const double rho = 0.125 + 0.875 * chi;
+  const double pressure = 0.1 + 0.9 * chi;
+  conservative = {{rho, 0.0, 0.0, pressure / (cpu_gamma - 1.0)}};
+  return Finite(conservative);
 }
 
 State ManufacturedDerivative(const double x, const double y,
@@ -1300,18 +1424,25 @@ StateHash HashSystemMatrix(const LocalSystem& system) noexcept
   return HashPair(value, HashDoubles(system.d));
 }
 
+template <typename Case>
+bool ExactW8cConfig(const CpuPersistentConfig& config) noexcept
+{
+  return config.experiment.valid() &&
+      config.experiment == StableIdentity::Copy(Case::experiment_id) &&
+      config.source.valid() &&
+      config.source == StableIdentity::Copy(Case::conventional_source_id) &&
+      config.scenario == CpuScenario::smoke &&
+      config.polynomial_order == Case::polynomial_order &&
+      config.elements_per_direction == static_cast<int>(Case::mesh_n) &&
+      config.assembly_quadrature_order == Case::conventional_q_a &&
+      ::dg::hdg::runtime::detail::DoubleBits(config.dt) ==
+          ::dg::hdg::runtime::detail::DoubleBits(Case::dt);
+}
+
 bool ExactConfig(const CpuPersistentConfig& config) noexcept
 {
-  const bool w8c_config = config.experiment.valid() &&
-      config.experiment == StableIdentity::Copy(w8c::experiment_id) &&
-      config.source.valid() &&
-      config.source == StableIdentity::Copy(w8c::conventional_source_id) &&
-      config.scenario == CpuScenario::smoke &&
-      config.polynomial_order == w8c::polynomial_order &&
-      config.elements_per_direction == static_cast<int>(w8c::mesh_n) &&
-      config.assembly_quadrature_order == w8c::conventional_q_a &&
-      ::dg::hdg::runtime::detail::DoubleBits(config.dt) ==
-          ::dg::hdg::runtime::detail::DoubleBits(w8c::dt);
+  const bool w8c_config = ExactW8cConfig<w8c::ExactJumpV1Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionV2Case>(config);
   const bool smoke = config.scenario == CpuScenario::smoke &&
       config.polynomial_order == cpu_smoke_polynomial_order &&
       config.elements_per_direction == cpu_smoke_elements_per_direction &&
@@ -1361,8 +1492,13 @@ bool ExactConfig(const CpuPersistentConfig& config) noexcept
 
 bool IsW8cConfig(const CpuPersistentConfig& config) noexcept
 {
-  return config.experiment == StableIdentity::Copy(w8c::experiment_id) &&
-      config.source == StableIdentity::Copy(w8c::conventional_source_id);
+  return ExactW8cConfig<w8c::ExactJumpV1Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionV2Case>(config);
+}
+
+bool IsSmoothTransitionConfig(const CpuPersistentConfig& config) noexcept
+{
+  return ExactW8cConfig<w8c::SmoothTransitionV2Case>(config);
 }
 
 bool ExactRankShape(const CpuPersistentConfig& config,
@@ -1747,6 +1883,73 @@ struct detail::CpuNumericsCore::Implementation
         {
           local_projection_ready = false;
           break;
+        }
+        if (IsSmoothTransitionConfig(config))
+        {
+          std::vector<double> mass(
+              static_cast<std::size_t>(scalar_dofs) * scalar_dofs, 0.0);
+          std::array<std::vector<double>, cpu_conserved_components> rhs;
+          for (auto& values : rhs)
+            values.assign(static_cast<std::size_t>(scalar_dofs), 0.0);
+          mfem::Vector shape(scalar_dofs), physical(cpu_dimension);
+          const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+              finite_element->GetGeomType(),
+              w8c::SmoothTransitionV2Case::projection_q);
+          for (int q = 0; q < rule.GetNPoints(); ++q)
+          {
+            const mfem::IntegrationPoint& ip = rule.IntPoint(q);
+            transformation->SetIntPoint(&ip);
+            finite_element->CalcShape(ip, shape);
+            transformation->Transform(ip, physical);
+            State value{};
+            if (!SmoothTransitionConservative(physical[0], value))
+            {
+              local_projection_ready = false;
+              break;
+            }
+            const double weight = ip.weight * transformation->Weight();
+            for (int row = 0; row < scalar_dofs; ++row)
+            {
+              for (int column = 0; column < scalar_dofs; ++column)
+              {
+                mass[static_cast<std::size_t>(row) * scalar_dofs + column] +=
+                    weight * shape[row] * shape[column];
+              }
+              for (int component = 0;
+                   component < cpu_conserved_components; ++component)
+              {
+                rhs[static_cast<std::size_t>(component)]
+                   [static_cast<std::size_t>(row)] +=
+                    weight * shape[row] * value[component];
+              }
+            }
+          }
+          ProjectionDenseLu factor;
+          local_projection_ready = local_projection_ready &&
+              factor.Factor(mass, scalar_dofs);
+          for (int component = 0;
+               component < cpu_conserved_components && local_projection_ready;
+               ++component)
+          {
+            std::vector<double> coefficients;
+            local_projection_ready = factor.Solve(
+                rhs[static_cast<std::size_t>(component)], coefficients);
+            for (int scalar = 0;
+                 scalar < scalar_dofs && local_projection_ready; ++scalar)
+            {
+              double sign = 1.0;
+              const int dof = Decode(
+                  vdofs[ByNodes(scalar, scalar_dofs, component)], sign);
+              if (dof < 0 || dof >= local_trace.Size())
+              {
+                local_projection_ready = false;
+                break;
+              }
+              local_trace[dof] = sign *
+                  coefficients[static_cast<std::size_t>(scalar)];
+            }
+          }
+          continue;
         }
         const mfem::IntegrationRule& nodes = finite_element->GetNodes();
         for (int scalar = 0;
@@ -4024,6 +4227,89 @@ bool detail::CpuNumericsCore::Initialize(
   try
   {
     const bool w8c_config = IsW8cConfig(config);
+    const bool smooth_transition = IsSmoothTransitionConfig(config);
+    if (smooth_transition)
+    {
+      const auto project_smooth = [&](mfem::ParGridFunction& field)
+      {
+        field = 0.0;
+        for (int element = 0; element < state.mesh->GetNE(); ++element)
+        {
+          const mfem::FiniteElement* finite_element =
+              state.interior_space->GetFE(element);
+          mfem::ElementTransformation* transformation =
+              state.mesh->GetElementTransformation(element);
+          if (!finite_element || !transformation) { return false; }
+          const int scalar_dofs = finite_element->GetDof();
+          std::vector<double> mass(
+              static_cast<std::size_t>(scalar_dofs) * scalar_dofs, 0.0);
+          std::array<std::vector<double>, cpu_conserved_components> rhs;
+          for (auto& values : rhs)
+            values.assign(static_cast<std::size_t>(scalar_dofs), 0.0);
+          mfem::Vector shape(scalar_dofs), point(cpu_dimension);
+          const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+              finite_element->GetGeomType(),
+              w8c::SmoothTransitionV2Case::projection_q);
+          for (int q = 0; q < rule.GetNPoints(); ++q)
+          {
+            const mfem::IntegrationPoint& ip = rule.IntPoint(q);
+            transformation->SetIntPoint(&ip);
+            finite_element->CalcShape(ip, shape);
+            transformation->Transform(ip, point);
+            State value{};
+            if (!SmoothTransitionConservative(point[0], value)) return false;
+            const double weight = ip.weight * transformation->Weight();
+            for (int row = 0; row < scalar_dofs; ++row)
+            {
+              for (int column = 0; column < scalar_dofs; ++column)
+              {
+                mass[static_cast<std::size_t>(row) * scalar_dofs + column] +=
+                    weight * shape[row] * shape[column];
+              }
+              for (int component = 0;
+                   component < cpu_conserved_components; ++component)
+              {
+                rhs[static_cast<std::size_t>(component)]
+                   [static_cast<std::size_t>(row)] +=
+                    weight * shape[row] * value[component];
+              }
+            }
+          }
+          ProjectionDenseLu factor;
+          if (!factor.Factor(mass, scalar_dofs)) return false;
+          mfem::Vector local(cpu_conserved_components * scalar_dofs);
+          for (int component = 0;
+               component < cpu_conserved_components; ++component)
+          {
+            std::vector<double> coefficients;
+            if (!factor.Solve(rhs[static_cast<std::size_t>(component)],
+                              coefficients))
+            {
+              return false;
+            }
+            for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+            {
+              local[component * scalar_dofs + scalar] =
+                  coefficients[static_cast<std::size_t>(scalar)];
+            }
+          }
+          mfem::Array<int> vdofs;
+          mfem::DofTransformation dof_transformation(
+              state.interior_space->GetVDim(),
+              state.interior_space->GetOrdering());
+          state.interior_space->GetElementVDofs(
+              element, vdofs, dof_transformation);
+          if (vdofs.Size() != local.Size()) { return false; }
+          dof_transformation.TransformPrimal(local);
+          field.SetSubVector(vdofs, local);
+        }
+        return Finite(field);
+      };
+      local_ok = project_smooth(*state.old_interior) &&
+          project_smooth(*state.trial_interior);
+    }
+    else
+    {
     auto exact_function = [w8c_config](const mfem::Vector& point,
                                       mfem::Vector& value)
     {
@@ -4065,6 +4351,7 @@ bool detail::CpuNumericsCore::Initialize(
     state.old_interior->ProjectCoefficient(exact_coefficient);
     state.trial_interior->ProjectCoefficient(perturbed_coefficient);
     local_ok = true;
+    }
   }
   catch (...)
   {

@@ -35,6 +35,8 @@ namespace dg::hdg::runtime::cpu::sc25::w8c_internal
 {
 [[gnu::visibility("hidden")]] void RequestW8cInitialization(
     const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept;
+[[gnu::visibility("hidden")]] void RequestSmoothTransitionInitialization(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept;
 }
 #endif
 
@@ -1692,7 +1694,7 @@ std::optional<ValidatedApplicationConfig> CheckpointWriterConfig(
       config.scenario_checkpoint_step());
   writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
   writer.restart_from = {};
-  const bool w8c_case = config.case_id().view() == cpu::w8c::case_id;
+  const bool w8c_case = cpu::w8c::IsCaseId(config.case_id().view());
   writer.injection = config.scalar_igr() && !w8c_case
       ? config.injection() : FailureInjectionControlV1{};
   writer.retry_limit = config.scalar_igr() && !w8c_case
@@ -2353,11 +2355,13 @@ ApplicationRunResult RunScalarIgrCpu(const ApplicationOptionsView& request,
 }
 #endif
 
+template <typename Case>
 struct W8cCpuSerialSelection : CpuSerialRuntimeSelection
 {
-  static constexpr std::string_view experiment_id = cpu::w8c::experiment_id;
+  static constexpr std::string_view experiment_id = Case::experiment_id;
 };
 
+template <typename Case>
 class W8cConventionalMethod final
 {
 public:
@@ -2373,13 +2377,13 @@ public:
   bool Initialize() noexcept
   {
     CpuPersistentConfig numerical = cpu::MakeCpuSmokeConfig();
-    numerical.experiment = StableIdentity::Copy(cpu::w8c::experiment_id);
+    numerical.experiment = StableIdentity::Copy(Case::experiment_id);
     numerical.source = StableIdentity::Copy(
-        cpu::w8c::conventional_source_id);
-    numerical.polynomial_order = cpu::w8c::polynomial_order;
-    numerical.elements_per_direction = static_cast<int>(cpu::w8c::mesh_n);
-    numerical.assembly_quadrature_order = cpu::w8c::conventional_q_a;
-    numerical.dt = cpu::w8c::dt;
+        Case::conventional_source_id);
+    numerical.polynomial_order = Case::polynomial_order;
+    numerical.elements_per_direction = static_cast<int>(Case::mesh_n);
+    numerical.assembly_quadrature_order = Case::conventional_q_a;
+    numerical.dt = Case::dt;
     numerical.allow_one_retry = true;
     return adapter_.Initialize(numerical);
   }
@@ -2469,9 +2473,10 @@ public:
   }
 
 private:
-  cpu::PersistentSmoothEulerCpuAdapter<W8cCpuSerialSelection> adapter_;
+  cpu::PersistentSmoothEulerCpuAdapter<W8cCpuSerialSelection<Case>> adapter_;
 };
 
+template <typename Case>
 class W8cConventionalPublication final
 {
 public:
@@ -2485,7 +2490,7 @@ public:
         checkpoint_writer_(CheckpointWriterConfig(request, config))
   {}
 
-  bool Restore(W8cConventionalMethod& method) noexcept
+  bool Restore(W8cConventionalMethod<Case>& method) noexcept
   {
     if (!EnsureDirectory()) return false;
     CpuCheckpoint checkpoint;
@@ -2497,13 +2502,13 @@ public:
                                   initial_hash_);
   }
 
-  bool PublishInitial(W8cConventionalMethod& method) noexcept
+  bool PublishInitial(W8cConventionalMethod<Case>& method) noexcept
   {
     if (!EnsureDirectory() ||
         !GlobalCpuStateIdentity(method.PublishedState(), context_,
                                 initial_hash_))
       return false;
-    if (!cpu::w8c::IsOutputStep(0)) return true;
+    if (Case::output_steps[0] != 0) return true;
     DurableGenerationTransactionV1 initial;
     std::vector<std::uint8_t> vtk;
     const bool staged = BeginRootTransaction(
@@ -2516,26 +2521,33 @@ public:
     return published;
   }
 
-  bool Stage(W8cConventionalMethod& method,
-             const W8cConventionalMethod::Transaction& method_transaction,
+  bool Stage(W8cConventionalMethod<Case>& method,
+             const typename W8cConventionalMethod<Case>::Transaction&
+                 method_transaction,
              const std::uint64_t target, const bool output,
              const bool checkpoint, const bool terminal) noexcept
   {
     try
     {
+      if (!output && !checkpoint && !terminal)
+      {
+        active_ = false;
+        return true;
+      }
+      transaction_.emplace();
       active_ = true;
       bool staged = BeginRootTransaction(
-          transaction_, output_directory_, target, context_, detail_);
+          *transaction_, output_directory_, target, context_, detail_);
       const CpuStateSnapshot& state =
           method.CandidateState(method_transaction);
       if (staged && output)
-        staged = StageStateVtk(config_, state, context_, transaction_, vtk_,
+        staged = StageStateVtk(config_, state, context_, *transaction_, vtk_,
                                detail_);
       if (staged && checkpoint)
         staged = checkpoint_writer_ && StageCheckpoint(
             *checkpoint_writer_, method.FutureCheckpoint(method_transaction),
             state.interior, state.trace, method.Evidence(), context_,
-            transaction_, checkpoint_, detail_);
+            *transaction_, checkpoint_, detail_);
       if (staged && terminal)
       {
         StateHash final_hash{};
@@ -2553,7 +2565,7 @@ public:
               config_, anticipated, method.Evidence(), initial_hash_,
               final_hash, detail_);
           metadata_.assign(metadata.begin(), metadata.end());
-          root_staged = transaction_.Stage(
+          root_staged = transaction_->Stage(
               config_.run_role() == ApplicationRunRoleV1::split_writer
                   ? "run-metadata-checkpoint.json" : "run-metadata.json",
               metadata_.data(), metadata_.size(), detail_) ==
@@ -2572,16 +2584,22 @@ public:
 
   bool Publish() noexcept
   {
+    if (!active_) return true;
     const bool published = PublishRootTransaction(
-        transaction_, context_, detail_);
-    if (published) active_ = false;
+        *transaction_, context_, detail_);
+    if (published)
+    {
+      transaction_.reset();
+      active_ = false;
+    }
     return published;
   }
 
   bool Revert() noexcept
   {
     if (!active_) return true;
-    const bool reverted = RevertTransaction(transaction_, context_, detail_);
+    const bool reverted = RevertTransaction(*transaction_, context_, detail_);
+    transaction_.reset();
     active_ = false;
     return reverted;
   }
@@ -2632,7 +2650,7 @@ private:
   std::string& detail_;
   std::filesystem::path output_directory_;
   std::optional<ValidatedApplicationConfig> checkpoint_writer_;
-  DurableGenerationTransactionV1 transaction_;
+  std::optional<DurableGenerationTransactionV1> transaction_;
   std::vector<std::uint8_t> vtk_;
   std::vector<std::uint8_t> checkpoint_;
   std::vector<std::uint8_t> metadata_;
@@ -2643,6 +2661,7 @@ private:
 };
 
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
+template <typename Case>
 class W8cScalarMethod final
 {
 public:
@@ -2652,12 +2671,15 @@ public:
   bool Initialize() noexcept
   {
     sc25::FoundationConfig foundation;
-    foundation.polynomial_degree = cpu::w8c::polynomial_order;
-    foundation.elements_per_direction = static_cast<int>(cpu::w8c::mesh_n);
+    foundation.polynomial_degree = Case::polynomial_order;
+    foundation.elements_per_direction = static_cast<int>(Case::mesh_n);
     if (ScalarIgrCpuTraits<false>::Create(foundation, owner_) !=
             sc25::FoundationStatus::ready || !owner_)
       return false;
-    cpu::sc25::w8c_internal::RequestW8cInitialization(*owner_);
+    if constexpr (Case::kind == cpu::w8c::CaseKind::smooth_transition_v2)
+      cpu::sc25::w8c_internal::RequestSmoothTransitionInitialization(*owner_);
+    else
+      cpu::sc25::w8c_internal::RequestW8cInitialization(*owner_);
     return ScalarIgrCpuTraits<false>::Initialize(*owner_) ==
         sc25::TrajectoryStatus::ready;
   }
@@ -2747,6 +2769,7 @@ private:
   bool retry_available_ = false;
 };
 
+template <typename Case>
 class W8cScalarPublication final
 {
 public:
@@ -2760,7 +2783,7 @@ public:
         checkpoint_writer_(CheckpointWriterConfig(request, config))
   {}
 
-  bool Restore(W8cScalarMethod& method) noexcept
+  bool Restore(W8cScalarMethod<Case>& method) noexcept
   {
     if (!EnsureDirectory()) return false;
     resources_ = ScalarIgrResources(config_, method.Owner(), context_);
@@ -2771,7 +2794,7 @@ public:
     return GlobalScalarIgrStateIdentity(published_, context_, initial_hash_);
   }
 
-  bool PublishInitial(W8cScalarMethod& method) noexcept
+  bool PublishInitial(W8cScalarMethod<Case>& method) noexcept
   {
     if (!EnsureDirectory()) return false;
     resources_ = ScalarIgrResources(config_, method.Owner(), context_);
@@ -2791,25 +2814,32 @@ public:
     return published;
   }
 
-  bool Stage(W8cScalarMethod& method,
-             const W8cScalarMethod::Transaction& method_transaction,
+  bool Stage(W8cScalarMethod<Case>& method,
+             const typename W8cScalarMethod<Case>::Transaction&
+                 method_transaction,
              const std::uint64_t target, const bool output,
              const bool checkpoint, const bool terminal) noexcept
   {
     try
     {
+      if (!output && !checkpoint && !terminal)
+      {
+        active_ = false;
+        return true;
+      }
+      transaction_.emplace();
       active_ = true;
       bool staged = method.CandidateState(method_transaction, candidate_) &&
           GlobalScalarIgrCoordinatesIdentity(candidate_.coordinates, context_) &&
-          BeginRootTransaction(transaction_, output_directory_, target,
+          BeginRootTransaction(*transaction_, output_directory_, target,
                                context_, detail_);
       if (staged && output)
-        staged = StageScalarIgrVtk(config_, candidate_, context_, transaction_,
+        staged = StageScalarIgrVtk(config_, candidate_, context_, *transaction_,
                                   vtk_, detail_);
       if (staged && checkpoint)
         staged = checkpoint_writer_ && StageScalarIgrCheckpoint(
             *checkpoint_writer_, method.FutureCheckpoint(method_transaction),
-            candidate_, resources_, context_, transaction_, checkpoint_,
+            candidate_, resources_, context_, *transaction_, checkpoint_,
             detail_);
       if (staged && terminal)
       {
@@ -2835,7 +2865,7 @@ public:
           const std::string metadata = ScalarIgrMetadata(
               config_, anticipated, initial_hash_, final_hash, audit, detail_);
           metadata_.assign(metadata.begin(), metadata.end());
-          root_staged = transaction_.Stage(
+          root_staged = transaction_->Stage(
               config_.run_role() == ApplicationRunRoleV1::split_writer
                   ? "run-metadata-checkpoint.json" : "run-metadata.json",
               metadata_.data(), metadata_.size(), detail_) ==
@@ -2854,15 +2884,21 @@ public:
 
   bool Publish() noexcept
   {
+    if (!active_) return true;
     const bool published = PublishRootTransaction(
-        transaction_, context_, detail_);
-    if (published) active_ = false;
+        *transaction_, context_, detail_);
+    if (published)
+    {
+      transaction_.reset();
+      active_ = false;
+    }
     return published;
   }
   bool Revert() noexcept
   {
     if (!active_) return true;
-    const bool reverted = RevertTransaction(transaction_, context_, detail_);
+    const bool reverted = RevertTransaction(*transaction_, context_, detail_);
+    transaction_.reset();
     active_ = false;
     return reverted;
   }
@@ -2912,7 +2948,7 @@ private:
   std::filesystem::path output_directory_;
   std::optional<ValidatedApplicationConfig> checkpoint_writer_;
   PersistentResourceDescriptor resources_{};
-  DurableGenerationTransactionV1 transaction_;
+  std::optional<DurableGenerationTransactionV1> transaction_;
   ScalarIgrPackedState published_;
   ScalarIgrPackedState candidate_;
   std::vector<std::uint8_t> vtk_;
@@ -2951,7 +2987,8 @@ ApplicationRunResult W8cResult(
   return result;
 }
 
-ApplicationRunResult RunW8cCpuSerial(
+template <typename Case>
+ApplicationRunResult RunW8cCaseCpuSerial(
     const ApplicationOptionsView& request, MpiApplicationContextV1& context)
 {
   const ApplicationValidation validation = ValidateApplicationOptions(request);
@@ -2980,17 +3017,20 @@ ApplicationRunResult RunW8cCpuSerial(
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
   if (config.scalar_igr())
   {
-    W8cScalarMethod method;
-    W8cScalarPublication publication(request, config, context, detail);
-    report = cpu::w8c::RunCpuSerialLifecycle(method, publication, control);
+    W8cScalarMethod<Case> method;
+    W8cScalarPublication<Case> publication(request, config, context, detail);
+    report = cpu::w8c::RunCpuSerialLifecycle(
+        method, publication, control, Case{});
     clean = publication.Cleanup();
   }
   else
 #endif
   {
-    W8cConventionalMethod method;
-    W8cConventionalPublication publication(request, config, context, detail);
-    report = cpu::w8c::RunCpuSerialLifecycle(method, publication, control);
+    W8cConventionalMethod<Case> method;
+    W8cConventionalPublication<Case> publication(
+        request, config, context, detail);
+    report = cpu::w8c::RunCpuSerialLifecycle(
+        method, publication, control, Case{});
     if (report.failure != cpu::w8c::LifecycleFailure::none)
     {
       const CpuAttemptEvidence& attempt = method.Evidence().last_attempt;
@@ -3010,6 +3050,14 @@ ApplicationRunResult RunW8cCpuSerial(
     detail = "W8C shared CPU-serial lifecycle failed";
   context.SetDiagnostic(detail);
   return result;
+}
+
+ApplicationRunResult RunW8cCpuSerial(
+    const ApplicationOptionsView& request, MpiApplicationContextV1& context)
+{
+  return request.case_id == cpu::w8c::SmoothTransitionV2Case::case_id
+      ? RunW8cCaseCpuSerial<cpu::w8c::SmoothTransitionV2Case>(request, context)
+      : RunW8cCaseCpuSerial<cpu::w8c::ExactJumpV1Case>(request, context);
 }
 
 template <typename Selection>
@@ -3446,7 +3494,7 @@ ApplicationRunResult RunSmoothPeriodicEulerV1Downstream(
     CpuSerialBackendTag, const ApplicationOptionsView& request,
     MpiApplicationContextV1& context)
 {
-  if (request.case_id == cpu::w8c::case_id)
+  if (cpu::w8c::IsCaseId(request.case_id))
     return RunW8cCpuSerial(request, context);
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
   if (request.card_id == scalar_igr_sc25_v3_card_id)

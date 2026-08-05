@@ -42,6 +42,37 @@ bool VerifyW8cTraceGeometryAndState(
     std::size_t true_trace_size,
     W8cTraceGeometryEvidence& evidence) noexcept;
 
+W8cKnownState SmoothTransitionV2State(double x) noexcept;
+
+struct SmoothTransitionProjectionEvidence final
+{
+  std::uint64_t elements = 0;
+  std::uint64_t faces = 0;
+  std::uint64_t interior_coefficients = 0;
+  std::uint64_t trace_coefficients = 0;
+  std::uint64_t element_face_visits = 0;
+  std::uint64_t positive_orientations = 0;
+  std::uint64_t negative_orientations = 0;
+  double density_integral = 0.0;
+  double x_momentum_integral = 0.0;
+  double y_momentum_integral = 0.0;
+  double energy_integral = 0.0;
+  double maximum_reflection_defect = 0.0;
+  double maximum_half_period_complement_defect = 0.0;
+  double maximum_y_invariance_defect = 0.0;
+  double homogeneous_auxiliary_residual = 0.0;
+};
+
+/**
+ * Independently rebuild and L2-project the frozen N8/k1 smooth transition on
+ * the cell and face spaces at q=14. This oracle does not call production
+ * initialization, projection, ownership, or residual helpers.
+ */
+bool BuildSmoothTransitionV2ProjectionOracle(
+    MPI_Comm communicator, std::vector<double>& component_major_interior,
+    std::vector<double>& true_trace,
+    SmoothTransitionProjectionEvidence& evidence) noexcept;
+
 struct IndependentOracleConfig
 {
   int polynomial_order = 1;

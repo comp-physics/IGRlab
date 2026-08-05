@@ -250,20 +250,20 @@ void SelectScalarIgrScenario(ApplicationOptionsView& options) noexcept
   options.checkpoint_id = scalar_igr_sc25_v3_checkpoint_id;
 }
 
+template <typename Case>
 void SelectW8cScenario(ApplicationOptionsView& options,
                        const bool scalar) noexcept
 {
   if (scalar) SelectScalarIgrScenario(options);
-  options.scenario_id = cpu::w8c::scenario_id;
-  options.source_id = scalar ? cpu::w8c::scalar_source_id
-                             : cpu::w8c::conventional_source_id;
-  options.q_a = scalar ? cpu::w8c::scalar_q_a
-                       : cpu::w8c::conventional_q_a;
+  options.scenario_id = Case::scenario_id;
+  options.source_id = scalar ? Case::scalar_source_id
+                             : Case::conventional_source_id;
+  options.q_a = scalar ? Case::scalar_q_a : Case::conventional_q_a;
   options.q_e = 0;
   options.q_e4 = 0;
-  options.q_o = cpu::w8c::observable_q_o;
-  options.checkpoint_id = scalar ? cpu::w8c::scalar_checkpoint_id
-                                 : cpu::w8c::conventional_checkpoint_id;
+  options.q_o = Case::observable_q_o;
+  options.checkpoint_id = scalar ? Case::scalar_checkpoint_id
+                                 : Case::conventional_checkpoint_id;
 }
 
 bool LoadConfigFile(const std::string_view path, Settings& settings) noexcept
@@ -384,7 +384,7 @@ ParsedCommandLine ParseCommandLine(const int argc,
   else if (space == "h1") options.interior_space = InteriorSpace::h1;
   else { parsed.diagnostic = "ConfigurationError: --space must be l2 or h1"; return parsed; }
   const bool scalar_igr = options.card_id == scalar_igr_sc25_v3_card_id;
-  const bool w8c_case = options.case_id == cpu::w8c::case_id;
+  const bool w8c_case = cpu::w8c::IsCaseId(options.case_id);
   if (!scalar_igr && options.card_id != smooth_periodic_euler_v1_card_id)
   {
     parsed.status = CommandLineStatus::rejected;
@@ -424,8 +424,14 @@ ParsedCommandLine ParseCommandLine(const int argc,
     return parsed;
   }
   options.mesh_n = static_cast<std::uint32_t>(mesh);
-  if (w8c_case && options.accepted_steps == cpu::w8c::accepted_steps)
-    SelectW8cScenario(options, scalar_igr);
+  if (w8c_case &&
+      options.accepted_steps == cpu::w8c::ExactJumpV1Case::accepted_steps)
+  {
+    if (options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id)
+      SelectW8cScenario<cpu::w8c::SmoothTransitionV2Case>(options, scalar_igr);
+    else
+      SelectW8cScenario<cpu::w8c::ExactJumpV1Case>(options, scalar_igr);
+  }
   else if (scalar_igr && options.accepted_steps == scalar_igr_sc25_v3_steps)
     SelectScalarIgrScenario(options);
   else if (options.accepted_steps == smooth_periodic_euler_v1_smoke_steps)
@@ -561,7 +567,7 @@ void PrintCommandLineHelp(std::ostream& output)
       "   or: dg_igr_hdg_runtime [every value option below exactly once]\n\n"
       "  --card exp.hdg.euler.conventional.smooth_persistent.w8a.v1\n"
       "         exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3\n"
-      "  --case conventional-smooth-persistent-v1|sc25-periodic-smooth-persistent-v3|periodic-double-riemann-v1\n"
+      "  --case conventional-smooth-persistent-v1|sc25-periodic-smooth-persistent-v3|periodic-double-riemann-v1|periodic-smooth-transition-v2\n"
       "  --space l2|h1                    (h1 reports UnsupportedDiscretization)\n"
       "  --mesh-family periodic-cartesian-quad --mesh-n 3|6|8|12\n"
       "  --order 1|2 --dt 0.05|0.000244140625|0.0009765625\n"

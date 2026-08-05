@@ -304,7 +304,8 @@ namespace
 enum class Rank1InitializationSelection : unsigned char
 {
   ordinary,
-  w8c
+  exact_jump_v1,
+  smooth_transition_v2
 };
 
 struct Rank1InitializationRequest final
@@ -325,16 +326,24 @@ void RequestW8cInitialization(
     const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept
 {
   next_rank1_initialization = {
-      &owner, Rank1InitializationSelection::w8c};
+      &owner, Rank1InitializationSelection::exact_jump_v1};
 }
 
-bool ConsumeW8cInitializationRequest(
+[[gnu::visibility("hidden")]]
+void RequestSmoothTransitionInitialization(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept
+{
+  next_rank1_initialization = {
+      &owner, Rank1InitializationSelection::smooth_transition_v2};
+}
+
+Rank1InitializationSelection ConsumeInitializationRequest(
     const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept
 {
   const Rank1InitializationRequest request = std::exchange(
       next_rank1_initialization, Rank1InitializationRequest{});
-  return request.owner == &owner &&
-      request.selection == Rank1InitializationSelection::w8c;
+  return request.owner == &owner ? request.selection
+                                 : Rank1InitializationSelection::ordinary;
 }
 
 } // namespace w8c_internal
@@ -379,6 +388,19 @@ InitialStatePoint W8cTraceInitialState(const double x) noexcept
           std::abs(x - 0.75) <= tolerance
       ? w8c::interface_mean
       : W8cInitialState(x).conservative;
+  return output;
+}
+
+InitialStatePoint SmoothTransitionInitialState(const double x) noexcept
+{
+  InitialStatePoint output;
+  const double kappa = std::atanh(0.8) /
+      std::sin(pi * w8c::SmoothTransitionV2Case::transition_width);
+  const double chi = 0.5 *
+      (1.0 - std::tanh(kappa * std::cos(2.0 * pi * x)));
+  const double rho = 0.125 + 0.875 * chi;
+  const double pressure = 0.1 + 0.9 * chi;
+  output.conservative = {{rho, 0.0, 0.0, pressure / (gamma - 1.0)}};
   return output;
 }
 
@@ -3267,6 +3289,8 @@ struct PersistentTrajectoryImplementation final
   TrajectoryStatus first_failure = TrajectoryStatus::uninitialized;
   bool initialized = false;
   bool w8c_initial_state = false;
+  Rank1InitializationSelection initialization_selection =
+      Rank1InitializationSelection::ordinary;
   int required_steps = persistent_required_steps;
   double time_step = persistent_dt;
   std::uint64_t matrix_generation = 0;
@@ -3313,7 +3337,8 @@ struct PersistentTrajectoryImplementation final
   bool AssembleTrueSystem(
       PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept;
   bool SolveTrueSystem(int& iterations, double& residual_norm,
-                       double& rhs_norm) noexcept;
+                       double& rhs_norm,
+                       bool admit_exact_homogeneous = false) noexcept;
   bool Recover(
                PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
                const CoupledFixtureAssembly& system,
@@ -3849,7 +3874,10 @@ bool PersistentTrajectoryImplementation::InitializePhysicalState(
   {
     constexpr int ns = persistent_scalar_volume_nodes;
     constexpr int nf = coupled_fixture_scalar_face_nodes;
-    constexpr int order = coupled_fixture_quadrature_order;
+    const int order = initialization_selection ==
+            Rank1InitializationSelection::smooth_transition_v2
+        ? coupled_fixture_repeat_quadrature_order
+        : coupled_fixture_quadrature_order;
     state = {};
     *owner.u = 0.0;
     for (int element = 0; element < persistent_elements; ++element)
@@ -3875,8 +3903,12 @@ bool PersistentTrajectoryImplementation::InitializePhysicalState(
         element_transformation->SetIntPoint(&ip);
         finite_element->CalcShape(ip, shape);
         element_transformation->Transform(ip, point);
-        const InitialStatePoint value = w8c_initial_state
+        const InitialStatePoint value = initialization_selection ==
+                Rank1InitializationSelection::exact_jump_v1
             ? W8cInitialState(point[0])
+            : initialization_selection ==
+                  Rank1InitializationSelection::smooth_transition_v2
+            ? SmoothTransitionInitialState(point[0])
             : SmoothInitialState(point[0], point[1]);
         const double weight = ip.weight * element_transformation->Weight();
         for (int row = 0; row < ns; ++row)
@@ -3954,8 +3986,12 @@ bool PersistentTrajectoryImplementation::InitializePhysicalState(
         face_transformation->SetIntPoint(&ip);
         finite_element->CalcShape(ip, shape);
         face_transformation->Transform(ip, point);
-        const InitialStatePoint value = w8c_initial_state
+        const InitialStatePoint value = initialization_selection ==
+                Rank1InitializationSelection::exact_jump_v1
             ? W8cTraceInitialState(point[0])
+            : initialization_selection ==
+                  Rank1InitializationSelection::smooth_transition_v2
+            ? SmoothTransitionInitialState(point[0])
             : SmoothInitialState(point[0], point[1]);
         const double weight = ip.weight * face_transformation->Weight();
         for (int row = 0; row < nf; ++row)
@@ -4151,7 +4187,8 @@ bool PersistentTrajectoryImplementation::InitializeAuxiliary(
 {
   try
   {
-    if (w8c_initial_state)
+    if (initialization_selection ==
+        Rank1InitializationSelection::exact_jump_v1)
     {
       state.interior.sigma.fill(0.0);
       state.interior.z.fill(0.0);
@@ -4296,7 +4333,9 @@ bool PersistentTrajectoryImplementation::InitializeAuxiliary(
     if (!Condense(assembly, maximum_local_residual) ||
         !AssembleTrueSystem(owner) ||
         !SolveTrueSystem(trace_iterations, trace_residual_norm,
-                         trace_rhs_norm) ||
+                         trace_rhs_norm,
+                         initialization_selection ==
+                             Rank1InitializationSelection::smooth_transition_v2) ||
         !Recover(owner, assembly, direction, maximum_local_residual))
     {
       return false;
@@ -4308,6 +4347,26 @@ bool PersistentTrajectoryImplementation::InitializeAuxiliary(
       return false;
     }
     state = solved;
+    if (initialization_selection ==
+        Rank1InitializationSelection::smooth_transition_v2)
+    {
+      const auto zero = [](const auto& values)
+      {
+        return std::all_of(values.begin(), values.end(),
+                           [](const double value) { return value == 0.0; });
+      };
+      if (!zero(state.interior.sigma) || !zero(state.interior.z) ||
+          !zero(state.trace.sigmahat))
+      {
+        return false;
+      }
+      // The full solve may express an exact homogeneous result as signed
+      // zero. Canonicalize only after proving every solved auxiliary
+      // coefficient is exactly zero so publication is stable and positive.
+      state.interior.sigma.fill(0.0);
+      state.interior.z.fill(0.0);
+      state.trace.sigmahat.fill(0.0);
+    }
     AuxiliaryResidualMetrics residual;
     if (!AuxiliaryResidualGate(owner, state, residual) ||
         residual.normalized_maximum > 1.0e-10)
@@ -4481,7 +4540,8 @@ bool PersistentTrajectoryImplementation::AssembleTrueSystem(
 }
 
 bool PersistentTrajectoryImplementation::SolveTrueSystem(
-    int& iterations, double& residual_norm, double& rhs_norm) noexcept
+    int& iterations, double& residual_norm, double& rhs_norm,
+    const bool admit_exact_homogeneous) noexcept
 {
   iterations = -1;
   residual_norm = std::numeric_limits<double>::infinity();
@@ -4513,8 +4573,11 @@ bool PersistentTrajectoryImplementation::SolveTrueSystem(
     true_residual -= *true_rhs;
     residual_norm = true_residual.Norml2();
     rhs_norm = true_rhs->Norml2();
+    const bool converged_or_exact_homogeneous = converged == 1 ||
+        (admit_exact_homogeneous && iterations == 0 && rhs_norm == 0.0 &&
+         residual_norm == 0.0);
     return setup_status == 0 && solve_status == 0 && query_status == 0 &&
-        converged == 1 && iterations >= 0 &&
+        converged_or_exact_homogeneous && iterations >= 0 &&
         iterations <= persistent_trace_maximum_iterations &&
         Finite(residual_norm) && Finite(rhs_norm) &&
         residual_norm <= 1.0e-14 + 1.0e-12 * rhs_norm;
@@ -9987,8 +10050,10 @@ PersistentSc25ScalarIgrCpuFoundation::InitializePersistentTrajectory()
 {
   // Consuming at the first statement clears the typed, owner-bound request on
   // every exit, including invalid-configuration and initialization failures.
-  const bool w8c_mode =
-      w8c_internal::ConsumeW8cInitializationRequest(*this);
+  const Rank1InitializationSelection initialization_selection =
+      w8c_internal::ConsumeInitializationRequest(*this);
+  const bool w8c_mode = initialization_selection !=
+      Rank1InitializationSelection::ordinary;
   if (!implementation_ || implementation_->status != FoundationStatus::ready ||
       implementation_->rank != 0 || implementation_->ranks != 1 ||
       implementation_->config.polynomial_degree != 1 ||
@@ -10006,9 +10071,12 @@ PersistentSc25ScalarIgrCpuFoundation::InitializePersistentTrajectory()
   {
     auto trajectory = std::make_unique<PersistentTrajectoryImplementation>();
     trajectory->w8c_initial_state = w8c_mode;
+    trajectory->initialization_selection = initialization_selection;
     trajectory->required_steps = w8c_mode
-        ? static_cast<int>(w8c::accepted_steps) : persistent_required_steps;
-    trajectory->time_step = w8c_mode ? w8c::dt : persistent_dt;
+        ? static_cast<int>(w8c::ExactJumpV1Case::accepted_steps)
+        : persistent_required_steps;
+    trajectory->time_step = w8c_mode ? w8c::ExactJumpV1Case::dt
+                                     : persistent_dt;
     if (!trajectory->InitializeStorage(*implementation_))
     {
       return TrajectoryStatus::initialization_failure;

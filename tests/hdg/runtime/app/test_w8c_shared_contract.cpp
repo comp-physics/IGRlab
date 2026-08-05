@@ -166,18 +166,18 @@ struct Checks final
   int failures = 0;
 };
 
-template <typename Policy>
+template <typename Policy, typename Case = w8c::ExactJumpV1Case>
 void CheckUninterruptedAndRetry(Checks& checks)
 {
   Method<Policy> method;
   Publication<Policy> publication;
   const w8c::LifecycleControl control{false, false, true, 1};
   const w8c::LifecycleReport report =
-      w8c::RunCpuSerialLifecycle(method, publication, control);
+      w8c::RunCpuSerialLifecycle(method, publication, control, Case{});
   checks.Require(report.status == RunStatus::committed &&
                      report.reason == FailureReason::none &&
                      report.coordinates.step == 64 &&
-                     report.coordinates.time == w8c::final_time &&
+                     report.coordinates.time == Case::final_time &&
                      report.retries == 1 && report.injected,
                  "focused W8C retry must reach the exact terminal cursor");
   checks.Require(method.reverts == 1 && method.finalizes == 64 &&
@@ -199,13 +199,13 @@ void CheckUninterruptedAndRetry(Checks& checks)
                  "engine output/checkpoint schedule must be 0,32,64/32");
 }
 
-template <typename Policy>
+template <typename Policy, typename Case = w8c::ExactJumpV1Case>
 void CheckSplitRestart(Checks& checks)
 {
   Method<Policy> writer_method;
   Publication<Policy> writer_publication;
   const w8c::LifecycleReport writer = w8c::RunCpuSerialLifecycle(
-      writer_method, writer_publication, {false, true, false, 0});
+      writer_method, writer_publication, {false, true, false, 0}, Case{});
   checks.Require(writer.status == RunStatus::committed &&
                      writer.coordinates.step == 32 &&
                      writer_publication.checkpoint_targets ==
@@ -215,10 +215,10 @@ void CheckSplitRestart(Checks& checks)
   Method<Policy> reader_method;
   Publication<Policy> reader_publication;
   const w8c::LifecycleReport reader = w8c::RunCpuSerialLifecycle(
-      reader_method, reader_publication, {true, false, false, 0});
+      reader_method, reader_publication, {true, false, false, 0}, Case{});
   checks.Require(reader.status == RunStatus::committed &&
                      reader.coordinates.step == 64 &&
-                     reader.coordinates.time == w8c::final_time &&
+                     reader.coordinates.time == Case::final_time &&
                      reader_publication.restores == 1 &&
                      reader_publication.initial_publications == 0 &&
                      reader_publication.output_targets ==
@@ -226,14 +226,14 @@ void CheckSplitRestart(Checks& checks)
                  "split reader must restore step 32 and continue to 64");
 }
 
-template <typename Policy>
+template <typename Policy, typename Case = w8c::ExactJumpV1Case>
 void CheckPublicationFailureRollback(Checks& checks)
 {
   Method<Policy> method;
   Publication<Policy> publication;
   publication.publication_failure_target = 4;
   const w8c::LifecycleReport report = w8c::RunCpuSerialLifecycle(
-      method, publication, {false, false, false, 0});
+      method, publication, {false, false, false, 0}, Case{});
   checks.Require(report.status == RunStatus::terminal_failure &&
                      report.failure == w8c::LifecycleFailure::publication &&
                      report.coordinates.step == 3,
@@ -257,5 +257,16 @@ int main()
   CheckSplitRestart<TracedScalarIgrPolicy>(checks);
   CheckPublicationFailureRollback<NonePolicy>(checks);
   CheckPublicationFailureRollback<TracedScalarIgrPolicy>(checks);
+  CheckUninterruptedAndRetry<
+      NonePolicy, w8c::SmoothTransitionV2Case>(checks);
+  CheckUninterruptedAndRetry<
+      TracedScalarIgrPolicy, w8c::SmoothTransitionV2Case>(checks);
+  CheckSplitRestart<NonePolicy, w8c::SmoothTransitionV2Case>(checks);
+  CheckSplitRestart<
+      TracedScalarIgrPolicy, w8c::SmoothTransitionV2Case>(checks);
+  CheckPublicationFailureRollback<
+      NonePolicy, w8c::SmoothTransitionV2Case>(checks);
+  CheckPublicationFailureRollback<
+      TracedScalarIgrPolicy, w8c::SmoothTransitionV2Case>(checks);
   return checks.failures == 0 ? 0 : 1;
 }

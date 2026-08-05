@@ -122,9 +122,12 @@ bool ComputeApplicationConfigHashes(
     const DeferredRuntimePredicatesV1& deferred,
     ApplicationConfigHashes& hashes) noexcept
 {
-  const bool w8c_case = options.case_id == cpu::w8c::case_id;
+  const bool w8c_case = cpu::w8c::IsCaseId(options.case_id);
+  const bool smooth_transition =
+      options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id;
   CanonicalHashWriter scientific;
   if (!scientific.Text(
+          smooth_transition ? "DGIGR-HDG-W8C-SMOOTH-SCIENTIFIC-CONFIG-V2" :
           w8c_case ? "DGIGR-HDG-W8C-SCIENTIFIC-CONFIG-V1" :
           scenario == ApplicationScenarioV1::scalar_igr_sc25_v3
               ? "DGIGR-HDG-W8B-SCALAR-IGR-SCIENTIFIC-CONFIG-V1"
@@ -168,6 +171,7 @@ bool ComputeApplicationConfigHashes(
 
   CanonicalHashWriter run;
   if (!run.Text(
+          smooth_transition ? "DGIGR-HDG-W8C-SMOOTH-RUN-CONFIG-V2" :
           w8c_case ? "DGIGR-HDG-W8C-RUN-CONFIG-V1" :
           scenario == ApplicationScenarioV1::scalar_igr_sc25_v3
               ? "DGIGR-HDG-W8B-SCALAR-IGR-RUN-CONFIG-V1"
@@ -224,12 +228,19 @@ bool ExactFrozenTuple(const ApplicationOptionsView& options) noexcept
 
 bool ExactScientificIdentities(const ApplicationOptionsView& options) noexcept
 {
-  const bool w8c_case = options.case_id == cpu::w8c::case_id;
+  const bool exact_jump =
+      options.case_id == cpu::w8c::ExactJumpV1Case::case_id;
+  const bool smooth_transition =
+      options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id;
   if (options.card_id == scalar_igr_sc25_v3_card_id)
   {
     return options.mesh_family_id == smooth_periodic_euler_v1_mesh_family_id &&
-        options.source_id == (w8c_case ? cpu::w8c::scalar_source_id
-                                       : scalar_igr_sc25_v3_source_id) &&
+        options.source_id ==
+            (smooth_transition
+                 ? cpu::w8c::SmoothTransitionV2Case::scalar_source_id
+                 : (exact_jump
+                        ? cpu::w8c::ExactJumpV1Case::scalar_source_id
+                        : scalar_igr_sc25_v3_source_id)) &&
         options.flux_id == scalar_igr_sc25_v3_flux_id &&
         options.time_rule_id == BackwardEulerMonolithicV1Tag::id &&
         options.layout_id == scalar_igr_sc25_v3_layout_id &&
@@ -238,8 +249,12 @@ bool ExactScientificIdentities(const ApplicationOptionsView& options) noexcept
   }
   return options.mesh_family_id ==
           smooth_periodic_euler_v1_mesh_family_id &&
-      options.source_id == (w8c_case ? cpu::w8c::conventional_source_id
-                                     : smooth_periodic_euler_v1_source_id) &&
+      options.source_id ==
+          (smooth_transition
+               ? cpu::w8c::SmoothTransitionV2Case::conventional_source_id
+               : (exact_jump
+                      ? cpu::w8c::ExactJumpV1Case::conventional_source_id
+                      : smooth_periodic_euler_v1_source_id)) &&
       options.flux_id == smooth_periodic_euler_v1_flux_id &&
       options.time_rule_id == smooth_periodic_euler_v1_time_rule_id &&
       options.layout_id == smooth_periodic_euler_v1_layout_id &&
@@ -355,8 +370,10 @@ std::uint64_t ScenarioCheckpointStep(
     const ApplicationOptionsView& options,
     const ApplicationScenarioV1 scenario) noexcept
 {
-  if (options.case_id == cpu::w8c::case_id)
-    return cpu::w8c::checkpoint_step;
+  if (options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id)
+    return cpu::w8c::SmoothTransitionV2Case::checkpoint_step;
+  if (options.case_id == cpu::w8c::ExactJumpV1Case::case_id)
+    return cpu::w8c::ExactJumpV1Case::checkpoint_step;
   if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
     return scalar_igr_sc25_v3_checkpoint_step;
   return scenario == ApplicationScenarioV1::smoke
@@ -368,8 +385,10 @@ std::uint64_t ScenarioFailureTarget(
     const ApplicationOptionsView& options,
     const ApplicationScenarioV1 scenario) noexcept
 {
-  if (options.case_id == cpu::w8c::case_id)
-    return cpu::w8c::failure_target_step;
+  if (options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id)
+    return cpu::w8c::SmoothTransitionV2Case::failure_target_step;
+  if (options.case_id == cpu::w8c::ExactJumpV1Case::case_id)
+    return cpu::w8c::ExactJumpV1Case::failure_target_step;
   if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
     return scalar_igr_sc25_v3_failure_target_step;
   return scenario == ApplicationScenarioV1::smoke
@@ -380,7 +399,10 @@ std::uint64_t ScenarioFailureTarget(
 std::uint64_t ScenarioSeed(const ApplicationOptionsView& options,
                            const ApplicationScenarioV1 scenario) noexcept
 {
-  if (options.case_id == cpu::w8c::case_id) return cpu::w8c::seed;
+  if (options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id)
+    return cpu::w8c::SmoothTransitionV2Case::seed;
+  if (options.case_id == cpu::w8c::ExactJumpV1Case::case_id)
+    return cpu::w8c::ExactJumpV1Case::seed;
   if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
     return scalar_igr_sc25_v3_seed;
   return scenario == ApplicationScenarioV1::smoke
@@ -422,7 +444,7 @@ ApplicationRejection ValidateRoleControls(
     return ApplicationRejection::invalid_injection_control;
   }
 
-  const bool w8c_case = options.case_id == cpu::w8c::case_id;
+  const bool w8c_case = cpu::w8c::IsCaseId(options.case_id);
   const std::uint64_t checkpoint_step =
       ScenarioCheckpointStep(options, scenario);
   const std::uint64_t seed = ScenarioSeed(options, scenario);
@@ -684,34 +706,33 @@ ApplicationRejection ValidateScalarIgr(
   return ApplicationRejection::none;
 }
 
+template <typename Case>
 ApplicationRejection ValidateW8c(
     const ApplicationOptionsView& options,
     const ApplicationBackend backend) noexcept
 {
   if (backend != ApplicationBackend::cpu_serial)
     return ApplicationRejection::unknown_backend;
-  if (options.scenario_id != cpu::w8c::scenario_id)
+  if (options.case_id != Case::case_id || options.scenario_id != Case::scenario_id)
     return ApplicationRejection::unknown_scenario;
-  if (options.polynomial_order != cpu::w8c::polynomial_order ||
-      options.mesh_n != cpu::w8c::mesh_n)
+  if (options.polynomial_order != Case::polynomial_order ||
+      options.mesh_n != Case::mesh_n)
     return ApplicationRejection::invalid_polynomial_mesh_pair;
   const bool scalar = options.card_id == scalar_igr_sc25_v3_card_id;
-  if (options.q_a != (scalar ? cpu::w8c::scalar_q_a
-                             : cpu::w8c::conventional_q_a) ||
+  if (options.q_a != (scalar ? Case::scalar_q_a : Case::conventional_q_a) ||
       options.q_e != 0 || options.q_e4 != 0 ||
-      options.q_o != cpu::w8c::observable_q_o)
+      options.q_o != Case::observable_q_o)
     return ApplicationRejection::invalid_quadrature;
-  if (options.dt != cpu::w8c::dt)
+  if (options.dt != Case::dt)
     return ApplicationRejection::invalid_dt;
-  if (options.accepted_steps != cpu::w8c::accepted_steps)
+  if (options.accepted_steps != Case::accepted_steps)
     return ApplicationRejection::invalid_step_count;
-  if (options.final_time != cpu::w8c::final_time || !ExactEndTime(options))
+  if (options.final_time != Case::final_time || !ExactEndTime(options))
     return ApplicationRejection::invalid_final_time;
-  if (options.output_steps != cpu::w8c::output_steps)
+  if (options.output_steps != Case::output_steps)
     return ApplicationRejection::invalid_output_schedule;
   const std::string_view checkpoint = scalar
-      ? cpu::w8c::scalar_checkpoint_id
-      : cpu::w8c::conventional_checkpoint_id;
+      ? Case::scalar_checkpoint_id : Case::conventional_checkpoint_id;
   return options.checkpoint_id == checkpoint
       ? ApplicationRejection::none
       : ApplicationRejection::invalid_checkpoint_identity;
@@ -845,7 +866,7 @@ ApplicationValidation ValidateApplicationOptions(
     return ApplicationValidation(reason);
   };
   const bool scalar = options.card_id == scalar_igr_sc25_v3_card_id;
-  const bool w8c_case = options.case_id == cpu::w8c::case_id;
+  const bool w8c_case = cpu::w8c::IsCaseId(options.case_id);
   if (!scalar && options.card_id != smooth_periodic_euler_v1_card_id)
   {
     return reject(ApplicationRejection::unknown_card);
@@ -861,7 +882,10 @@ ApplicationValidation ValidateApplicationOptions(
                 : ApplicationScenarioV1::smoke)
       : ParseApplicationScenario(options.scenario_id);
   if ((!w8c_case && scenario == ApplicationScenarioV1::unknown) ||
-      (w8c_case && options.scenario_id != cpu::w8c::scenario_id))
+      (options.case_id == cpu::w8c::ExactJumpV1Case::case_id &&
+       options.scenario_id != cpu::w8c::ExactJumpV1Case::scenario_id) ||
+      (options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
+       options.scenario_id != cpu::w8c::SmoothTransitionV2Case::scenario_id))
   {
     return reject(ApplicationRejection::unknown_scenario);
   }
@@ -923,8 +947,11 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::invalid_dt);
   }
-  const ApplicationRejection scenario_rejection = w8c_case
-      ? ValidateW8c(options, backend)
+  const ApplicationRejection scenario_rejection =
+      options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id
+      ? ValidateW8c<cpu::w8c::SmoothTransitionV2Case>(options, backend)
+      : options.case_id == cpu::w8c::ExactJumpV1Case::case_id
+      ? ValidateW8c<cpu::w8c::ExactJumpV1Case>(options, backend)
       : (scalar ? ValidateScalarIgr(options)
                 : (scenario == ApplicationScenarioV1::smoke
                        ? ValidateSmoke(options)
@@ -1030,7 +1057,7 @@ bool DeriveSplitWriterRunConfigHashV1(
       split_reader.scenario_checkpoint_step());
   writer.restart_from = {};
   writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
-  const bool w8c_case = split_reader.case_id().view() == cpu::w8c::case_id;
+  const bool w8c_case = cpu::w8c::IsCaseId(split_reader.case_id().view());
   writer.injection = split_reader.scalar_igr() && !w8c_case
       ? FailureInjectionControlV1{
             FailureInjectionModeV1::prescribed,
