@@ -61,6 +61,7 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
 
   add_executable(dg_igr_hdg_runtime_w8c_smooth_transition_cpu_serial_test
     independent_oracle.cpp
+    sc25_scalar_igr_independent_oracle.cpp
     test_w8c_smooth_transition_cpu_serial.cpp)
   target_include_directories(
     dg_igr_hdg_runtime_w8c_smooth_transition_cpu_serial_test PRIVATE

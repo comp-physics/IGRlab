@@ -1,4 +1,5 @@
 #include "independent_oracle.hpp"
+#include "sc25_scalar_igr_independent_oracle.hpp"
 
 #include "hdg_cpu_serial_lifecycle.hpp"
 #include "numerics/hdg/runtime/cpu/persistent_sc25_scalar_igr.hpp"
@@ -90,28 +91,6 @@ bool PositiveZero(const Range& values)
   });
 }
 
-double IndependentHomogeneousAuxiliaryResidual(
-    const sc25::PersistentTrajectoryState& state) noexcept
-{
-  double maximum = 0.0;
-  for (const double value : state.sigma)
-    maximum = std::max(maximum, std::abs(value));
-  for (const double value : state.z)
-    maximum = std::max(maximum, std::abs(value));
-  for (const double value : state.sigmahat)
-    maximum = std::max(maximum, std::abs(value));
-  constexpr std::size_t scalar_dofs = 4;
-  for (std::size_t element = 0; element < 64; ++element)
-    for (std::size_t scalar = 0; scalar < scalar_dofs; ++scalar)
-    {
-      maximum = std::max(maximum, std::abs(state.u[
-          element * 4 * scalar_dofs + scalar_dofs + scalar]));
-      maximum = std::max(maximum, std::abs(state.u[
-          element * 4 * scalar_dofs + 2 * scalar_dofs + scalar]));
-    }
-  return maximum;
-}
-
 } // namespace
 
 int main(int argc, char** argv)
@@ -149,8 +128,14 @@ int main(int argc, char** argv)
                      oracle_evidence.maximum_half_period_complement_defect <=
                          1.0e-14 &&
                      oracle_evidence.maximum_y_invariance_defect == 0.0 &&
-                     oracle_evidence.homogeneous_auxiliary_residual == 0.0,
-                 "independent q14/q18 oracle must recover means and symmetries");
+                     oracle_evidence.signed_permuted_trace_entries == 2048 &&
+                     oracle_evidence.permuted_trace_entries == 1024 &&
+                     oracle_evidence.doubly_covered_trace_dofs == 1024 &&
+                     oracle_evidence.maximum_signed_trace_coefficient_defect <=
+                         1.0e-14 &&
+                     oracle_evidence.maximum_projected_trace_value_defect <=
+                         1.0e-14,
+                 "independent q14/q18 oracle must recover projections, ownership, means, and symmetries");
 
   cpu::CpuPersistentConfig conventional_config = cpu::MakeCpuSmokeConfig();
   conventional_config.experiment = StableIdentity::Copy(
@@ -209,12 +194,21 @@ int main(int argc, char** argv)
                                  conventional_state.trace.data,
                                  scalar_state.uhat.size() * sizeof(double)) == 0,
                  "none and scalar policies must start from byte-identical U/Uhat");
+  sc25::AuxiliaryResidualMetrics independent_aux_q12;
+  sc25::AuxiliaryResidualMetrics independent_aux_q14;
+  const bool independent_auxiliary_ready = scalar_copied &&
+      dg_igr_hdg_sc25_cpu_test::EvaluateIndependentAuxiliaryResidualOracle(
+          *scalar, scalar_state, 12, independent_aux_q12) &&
+      dg_igr_hdg_sc25_cpu_test::EvaluateIndependentAuxiliaryResidualOracle(
+          *scalar, scalar_state, 14, independent_aux_q14);
   checks.Require(scalar_copied && PositiveZero(scalar_state.sigma) &&
                      PositiveZero(scalar_state.z) &&
-                     PositiveZero(scalar_state.sigmahat) &&
-                     IndependentHomogeneousAuxiliaryResidual(scalar_state) ==
-                         oracle_evidence.homogeneous_auxiliary_residual,
-                 "independent auxiliary oracle must recover homogeneous fields");
+                     PositiveZero(scalar_state.sigmahat),
+                 "smooth auxiliary fields must be homogeneous positive zero");
+  checks.Require(independent_auxiliary_ready &&
+                     independent_aux_q12.normalized_maximum <= 1.0e-10 &&
+                     independent_aux_q14.normalized_maximum <= 1.0e-10,
+                 "complete independent q12/q14 auxiliary weak residual must be homogeneous");
   const sc25::AuxiliaryInitializationEvidence* auxiliary = scalar_ready
       ? &scalar->trajectory_evidence().initialization : nullptr;
   checks.Require(auxiliary && auxiliary->quadrature_order == 12 &&
@@ -223,7 +217,11 @@ int main(int argc, char** argv)
                      auxiliary->trace_iterations >= 0 &&
                      auxiliary->trace_true_residual_norm == 0.0 &&
                      auxiliary->trace_right_hand_side_norm == 0.0 &&
-                     auxiliary->residual.normalized_maximum <= 1.0e-10,
+                     auxiliary->residual.normalized_maximum <= 1.0e-10 &&
+                     independent_auxiliary_ready &&
+                     std::abs(auxiliary->residual.normalized_maximum -
+                              independent_aux_q12.normalized_maximum) <=
+                         2.0e-11,
                  "smooth scalar initialization must complete the full auxiliary solve");
 
   MPI_Finalize();

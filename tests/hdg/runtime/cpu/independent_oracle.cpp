@@ -465,6 +465,14 @@ bool BuildSmoothTransitionV2ProjectionOracle(
     true_trace.assign(static_cast<std::size_t>(trace_space.GetTrueVSize()),
                       0.0);
     std::vector<std::uint8_t> assigned(true_trace.size(), 0);
+    std::vector<double> canonical_face_coefficients(
+        static_cast<std::size_t>(mesh.GetNumFaces()) * components * 2, 0.0);
+    const auto face_coefficient = [](const int face, const int component,
+                                     const int scalar)
+    {
+      return (static_cast<std::size_t>(face) * components + component) * 2 +
+          scalar;
+    };
     for (int face = 0; face < mesh.GetNumFaces(); ++face)
     {
       const mfem::FiniteElement* finite_element =
@@ -509,6 +517,10 @@ bool BuildSmoothTransitionV2ProjectionOracle(
       for (int component = 0; component < components; ++component)
         for (int scalar = 0; scalar < scalar_dofs; ++scalar)
         {
+          canonical_face_coefficients[
+              face_coefficient(face, component, scalar)] =
+              coefficients[static_cast<std::size_t>(component)]
+                          [static_cast<std::size_t>(scalar)];
           double sign = 1.0;
           const int dof = mfem::FiniteElementSpace::DecodeDof(
               vdofs[component * scalar_dofs + scalar], sign);
@@ -530,6 +542,9 @@ bool BuildSmoothTransitionV2ProjectionOracle(
                      [](const std::uint8_t value) { return value == 1; }))
       return false;
 
+    std::vector<int> true_trace_incidence(true_trace.size(), 0);
+    std::vector<int> face_visits(static_cast<std::size_t>(mesh.GetNumFaces()),
+                                 0);
     for (int element = 0; element < mesh.GetNE(); ++element)
     {
       mfem::Array<int> faces, orientations;
@@ -537,15 +552,120 @@ bool BuildSmoothTransitionV2ProjectionOracle(
       if (faces.Size() != 4 || orientations.Size() != 4) return false;
       for (int local_face = 0; local_face < faces.Size(); ++local_face)
       {
-        ++evidence.element_face_visits;
-        if (orientations[local_face] > 0)
-          ++evidence.positive_orientations;
-        else if (orientations[local_face] < 0)
-          ++evidence.negative_orientations;
-        else
+        const int face = faces[local_face];
+        const int orientation = orientations[local_face];
+        if (face < 0 || face >= mesh.GetNumFaces() ||
+            (orientation != 1 && orientation != -1))
+        {
           return false;
+        }
+        ++evidence.element_face_visits;
+        ++face_visits[static_cast<std::size_t>(face)];
+        if (orientation > 0)
+          ++evidence.positive_orientations;
+        else
+          ++evidence.negative_orientations;
+
+        const mfem::FiniteElement* finite_element =
+            trace_space.GetFaceElement(face);
+        mfem::Array<int> vdofs;
+        trace_space.GetFaceVDofs(face, vdofs);
+        const int* permutation = trace_collection.DofOrderForOrientation(
+            mfem::Geometry::SEGMENT, orientation);
+        if (!finite_element || !permutation || finite_element->GetDof() != 2 ||
+            vdofs.Size() != components * 2)
+        {
+          return false;
+        }
+        std::array<int, 2> canonical_dofs{};
+        std::array<double, 2> orientation_signs{};
+        std::array<std::uint8_t, 2> permutation_census{};
+        std::array<std::array<double, 2>, components> side_coefficients{};
+        for (int oriented = 0; oriented < 2; ++oriented)
+        {
+          double orientation_sign = 1.0;
+          const int canonical = mfem::FiniteElementSpace::DecodeDof(
+              permutation[oriented], orientation_sign);
+          if (canonical < 0 || canonical >= 2 || orientation_sign == 0.0 ||
+              permutation_census[static_cast<std::size_t>(canonical)] != 0)
+          {
+            return false;
+          }
+          permutation_census[static_cast<std::size_t>(canonical)] = 1;
+          canonical_dofs[static_cast<std::size_t>(oriented)] = canonical;
+          orientation_signs[static_cast<std::size_t>(oriented)] =
+              orientation_sign;
+          for (int component = 0; component < components; ++component)
+          {
+            double face_sign = 1.0;
+            const int dof = mfem::FiniteElementSpace::DecodeDof(
+                vdofs[component * 2 + canonical], face_sign);
+            const int true_dof = dof >= 0
+                ? trace_space.GetLocalTDofNumber(dof) : -1;
+            if (dof < 0 || true_dof < 0 ||
+                true_dof >= static_cast<int>(true_trace.size()) ||
+                face_sign == 0.0)
+            {
+              return false;
+            }
+            const double signed_coefficient = orientation_sign * face_sign *
+                true_trace[static_cast<std::size_t>(true_dof)];
+            const double expected_coefficient = orientation_sign *
+                canonical_face_coefficients[
+                    face_coefficient(face, component, canonical)];
+            side_coefficients[static_cast<std::size_t>(component)]
+                             [static_cast<std::size_t>(oriented)] =
+                signed_coefficient;
+            evidence.maximum_signed_trace_coefficient_defect = std::max(
+                evidence.maximum_signed_trace_coefficient_defect,
+                std::abs(signed_coefficient - expected_coefficient));
+            ++true_trace_incidence[static_cast<std::size_t>(true_dof)];
+            ++evidence.signed_permuted_trace_entries;
+            if (canonical != oriented) ++evidence.permuted_trace_entries;
+            if (orientation_sign * face_sign < 0.0)
+              ++evidence.negative_signed_trace_entries;
+          }
+        }
+
+        mfem::Vector face_shape(2), oriented_shape(2);
+        const mfem::IntegrationRule& verification_rule = mfem::IntRules.Get(
+            finite_element->GetGeomType(), projection_q);
+        for (int q = 0; q < verification_rule.GetNPoints(); ++q)
+        {
+          const mfem::IntegrationPoint& ip = verification_rule.IntPoint(q);
+          finite_element->CalcShape(ip, face_shape);
+          for (int oriented = 0; oriented < 2; ++oriented)
+          {
+            oriented_shape[oriented] =
+                orientation_signs[static_cast<std::size_t>(oriented)] *
+                face_shape[canonical_dofs[static_cast<std::size_t>(oriented)]];
+          }
+          for (int component = 0; component < components; ++component)
+          {
+            double canonical_value = 0.0;
+            double side_value = 0.0;
+            for (int scalar = 0; scalar < 2; ++scalar)
+            {
+              canonical_value += canonical_face_coefficients[
+                  face_coefficient(face, component, scalar)] *
+                  face_shape[scalar];
+              side_value += side_coefficients[
+                  static_cast<std::size_t>(component)]
+                  [static_cast<std::size_t>(scalar)] * oriented_shape[scalar];
+            }
+            evidence.maximum_projected_trace_value_defect = std::max(
+                evidence.maximum_projected_trace_value_defect,
+                std::abs(side_value - canonical_value));
+          }
+        }
       }
     }
+    evidence.doubly_covered_trace_dofs = static_cast<std::uint64_t>(
+        std::count(true_trace_incidence.begin(), true_trace_incidence.end(),
+                   2));
+    const bool exact_face_multiplicity = std::all_of(
+        face_visits.begin(), face_visits.end(),
+        [](const int visits) { return visits == 2; });
 
     for (int sample = 0; sample <= 512; ++sample)
     {
@@ -569,13 +689,21 @@ bool BuildSmoothTransitionV2ProjectionOracle(
     evidence.interior_coefficients = component_major_interior.size();
     evidence.trace_coefficients = true_trace.size();
     evidence.maximum_y_invariance_defect = 0.0;
-    evidence.homogeneous_auxiliary_residual = 0.0;
-    return evidence.elements == 64 && evidence.faces == 128 &&
+    return exact_face_multiplicity && evidence.elements == 64 &&
+        evidence.faces == 128 &&
         evidence.interior_coefficients == 1024 &&
         evidence.trace_coefficients == 1024 &&
         evidence.element_face_visits == 256 &&
         evidence.positive_orientations == 128 &&
-        evidence.negative_orientations == 128;
+        evidence.negative_orientations == 128 &&
+        evidence.signed_permuted_trace_entries == 2048 &&
+        evidence.permuted_trace_entries == 1024 &&
+        evidence.negative_signed_trace_entries == 0 &&
+        evidence.doubly_covered_trace_dofs == 1024 &&
+        evidence.maximum_signed_trace_coefficient_defect <=
+            2048.0 * std::numeric_limits<double>::epsilon() &&
+        evidence.maximum_projected_trace_value_defect <=
+            2048.0 * std::numeric_limits<double>::epsilon();
   }
   catch (...)
   {

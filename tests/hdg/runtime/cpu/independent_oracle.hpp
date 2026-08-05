@@ -53,6 +53,10 @@ struct SmoothTransitionProjectionEvidence final
   std::uint64_t element_face_visits = 0;
   std::uint64_t positive_orientations = 0;
   std::uint64_t negative_orientations = 0;
+  std::uint64_t signed_permuted_trace_entries = 0;
+  std::uint64_t permuted_trace_entries = 0;
+  std::uint64_t negative_signed_trace_entries = 0;
+  std::uint64_t doubly_covered_trace_dofs = 0;
   double density_integral = 0.0;
   double x_momentum_integral = 0.0;
   double y_momentum_integral = 0.0;
@@ -60,7 +64,8 @@ struct SmoothTransitionProjectionEvidence final
   double maximum_reflection_defect = 0.0;
   double maximum_half_period_complement_defect = 0.0;
   double maximum_y_invariance_defect = 0.0;
-  double homogeneous_auxiliary_residual = 0.0;
+  double maximum_signed_trace_coefficient_defect = 0.0;
+  double maximum_projected_trace_value_defect = 0.0;
 };
 
 /**

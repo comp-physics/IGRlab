@@ -1339,9 +1339,15 @@ bool DirectAndNegativeControls()
   const ParsedCommandLine smooth_cuda =
       Parse(SmoothTransitionArguments(false, "cuda", "0"));
   passed = Check(smooth_cuda.status == CommandLineStatus::rejected &&
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK1
+                     smooth_cuda.rejection ==
+                         ApplicationRejection::unknown_backend,
+                 "smooth_transition_cuda_case_is_cpu_serial_only") && passed;
+#else
                      smooth_cuda.rejection ==
                          ApplicationRejection::unbuilt_backend,
                  "smooth_transition_cuda_rejected") && passed;
+#endif
 
   auto scalar_h1_args = ScalarArguments("cpu", "none");
   scalar_h1_args[6] = "h1";
