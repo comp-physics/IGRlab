@@ -616,6 +616,64 @@ ApplicationValidation ScalarTestValidation(const std::string_view backend,
   return ValidateApplicationOptions(options);
 }
 
+ApplicationOptionsView W8cOptions(const bool scalar, const bool smooth)
+{
+  ApplicationOptionsView options = scalar
+      ? ScalarTestOptions(CpuSerialBackendTag::id)
+      : TestOptions(CpuSerialBackendTag::id);
+  options.case_id = smooth ? "periodic-smooth-transition-v2"
+                           : "periodic-double-riemann-v1";
+  options.scenario_id = smooth ? "W8C-V2-N8-DT10" : "W8C-N8-DT10";
+  options.source_id = scalar
+      ? (smooth ? "source.sc25.periodic-smooth-transition.v3"
+                : "source.sc25.periodic-double-riemann.v3")
+      : (smooth ? "source.euler.periodic-smooth-transition.v2"
+                : "source.euler.periodic-double-riemann.v1");
+  options.polynomial_order = 1;
+  options.mesh_n = 8;
+  options.q_a = scalar ? 12 : 11;
+  options.q_e = 0;
+  options.q_e4 = 0;
+  options.q_o = 18;
+  options.dt = 1.0 / 1024.0;
+  options.accepted_steps = 64;
+  options.final_time = 1.0 / 16.0;
+  options.output_steps = {{0, 32, 64}};
+  options.checkpoint_id = scalar
+      ? (smooth
+             ? "checkpoint.hdg.igr.sc25.periodic-smooth-transition.n8-dt10.step-32.v2"
+             : "checkpoint.hdg.igr.sc25.periodic-double-riemann.n8-dt10.step-32.v1")
+      : (smooth
+             ? "checkpoint.hdg.euler.periodic-smooth-transition.n8-dt10.step-32.v2"
+             : "checkpoint.hdg.euler.periodic-double-riemann.n8-dt10.step-32.v1");
+  options.checkpoint_step = OptionalCheckpointStepV1::Present(32);
+  options.injection = {};
+  options.retry_limit = 0;
+  options.seed = smooth ? UINT64_C(0x573843534d4f5632)
+                        : UINT64_C(0x5738434452495631);
+  return options;
+}
+
+ApplicationValidation W8cValidation(const bool scalar, const bool smooth,
+                                    const bool reader)
+{
+  ApplicationOptionsView options = W8cOptions(scalar, smooth);
+  const std::string_view artifact = options.checkpoint_out.canonical;
+  if (reader)
+  {
+    options.run_role = ApplicationRunRoleV1::split_reader;
+    options.checkpoint_out = {};
+    options.checkpoint_step = {};
+    options.restart_from = CheckpointArtifactPathV1::Present(artifact);
+  }
+  else
+  {
+    options.run_role = ApplicationRunRoleV1::split_writer;
+    options.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+  }
+  return ValidateApplicationOptions(options);
+}
+
 template <typename ContractType>
 typename ContractType::ProductBundle IssueAll(
     ContractType& contract,
@@ -807,22 +865,72 @@ struct FunctionalCoefficientFixture
   }
 };
 
+struct W8cConventionalCoefficientFixture
+{
+  State interior = State(1024);
+  State trace = State(1024);
+
+  W8cConventionalCoefficientFixture()
+  {
+    for (std::size_t index = 0; index < interior.size(); ++index)
+      interior[index] = static_cast<double>(24001 + index);
+    for (std::size_t index = 0; index < trace.size(); ++index)
+      trace[index] = static_cast<double>(28001 + index);
+  }
+
+  std::array<StagedStateViewV1, 1> Views() const noexcept
+  {
+    return {{{0,
+              {interior.data(), interior.size(), 4, 256,
+               CoefficientOrderingV1::component_major},
+              {trace.data(), trace.size(), 4, 256,
+               CoefficientOrderingV1::component_major}}}};
+  }
+};
+
 template <typename Fixture>
 std::optional<CapturedCheckpointV1> MakeSerialCapture(
     const ValidatedApplicationConfig& config,
     const PersistentResourceDescriptor& resources,
     const CheckpointRuntimeIdentityV1& runtime,
     const Fixture& fixture,
-    const std::uint64_t commits)
+    const std::uint64_t commits,
+    const double dt = 0.05)
 {
   const Slot committed{fixture.interior, fixture.trace};
   Slot candidate{};
   SerialContract contract(
-      committed, candidate, {0.0, 0, 0, 0, 0.05}, resources);
-  if (!AdvanceCommits(contract, commits)) { return std::nullopt; }
+      committed, candidate, {0.0, 0, 0, 0, dt}, resources);
+  if (!AdvanceCommits(contract, commits, dt)) { return std::nullopt; }
   const std::array<SerialContractView, 1> contracts{{{0, &contract}}};
   return CaptureCheckpointV1(contracts.data(), contracts.size(), config,
                              runtime);
+}
+
+template <typename Fixture>
+std::optional<CapturedCheckpointV1> MakeW8cCapture(
+    const bool scalar, const ValidatedApplicationConfig& config,
+    const PersistentResourceDescriptor& resources,
+    const CheckpointRuntimeIdentityV1& runtime, const Fixture& fixture)
+{
+  const Slot committed{fixture.interior, fixture.trace};
+  Slot candidate{};
+  constexpr double dt = 1.0 / 1024.0;
+  if (scalar)
+  {
+    ScalarSerialContract contract(
+        committed, candidate, {0.0, 0, 0, 0, dt}, resources);
+    if (!AdvanceCommits(contract, 32, dt)) return std::nullopt;
+    const std::array<ScalarSerialContractView, 1> contracts{{{0, &contract}}};
+    return CaptureCheckpointV1(
+        contracts.data(), contracts.size(), config, runtime);
+  }
+  SerialContract contract(
+      committed, candidate, {0.0, 0, 0, 0, dt}, resources);
+  if (!AdvanceCommits(contract, 32, dt)) return std::nullopt;
+  const std::array<SerialContractView, 1> contracts{{{0, &contract}}};
+  return CaptureCheckpointV1(
+      contracts.data(), contracts.size(), config, runtime);
 }
 
 std::optional<CapturedCheckpointV1> MakeCapture(
@@ -2259,6 +2367,150 @@ bool CheckNonEvidenceSplitRoundTrip()
   return passed;
 }
 
+template <typename Fixture>
+bool CheckW8cSmoothTransitionPolicyCodec(const bool scalar,
+                                         const Fixture& fixture)
+{
+  const ApplicationValidation smooth_writer_validation =
+      W8cValidation(scalar, true, false);
+  const ApplicationValidation smooth_reader_validation =
+      W8cValidation(scalar, true, true);
+  const ApplicationValidation exact_writer_validation =
+      W8cValidation(scalar, false, false);
+  const ApplicationValidation exact_reader_validation =
+      W8cValidation(scalar, false, true);
+  const ValidatedApplicationConfig* smooth_writer =
+      smooth_writer_validation.config();
+  const ValidatedApplicationConfig* smooth_reader =
+      smooth_reader_validation.config();
+  const ValidatedApplicationConfig* exact_writer =
+      exact_writer_validation.config();
+  const ValidatedApplicationConfig* exact_reader =
+      exact_reader_validation.config();
+  bool passed = Check(smooth_writer != nullptr && smooth_reader != nullptr &&
+                          exact_writer != nullptr && exact_reader != nullptr,
+                      scalar ? "w8c_scalar_codec_configs_validate"
+                             : "w8c_conventional_codec_configs_validate");
+  if (smooth_writer == nullptr || smooth_reader == nullptr ||
+      exact_writer == nullptr || exact_reader == nullptr)
+    return false;
+
+  const PersistentResourceDescriptor resources = TestResources(
+      1, 1, scalar ? scalar_igr_sc25_v3_layout_id
+                   : smooth_periodic_euler_v1_layout_id);
+  const CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
+  StateHash derived_writer_hash{};
+  passed = Check(
+               smooth_writer->injection() == FailureInjectionControlV1{} &&
+                   smooth_reader->injection() == FailureInjectionControlV1{} &&
+                   smooth_writer->retry_limit() == 0 &&
+                   smooth_reader->retry_limit() == 0 &&
+                   DeriveSplitWriterRunConfigHashV1(*smooth_reader,
+                                                    derived_writer_hash) &&
+                   derived_writer_hash == smooth_writer->run_config_sha256(),
+               scalar ? "w8c_scalar_smooth_restart_delta_off_zero"
+                      : "w8c_conventional_smooth_restart_delta_off_zero") &&
+      passed;
+
+  const auto smooth_capture = MakeW8cCapture(
+      scalar, *smooth_writer, resources, runtime, fixture);
+  const auto exact_capture = MakeW8cCapture(
+      scalar, *exact_writer, resources, runtime, fixture);
+  passed = Check(smooth_capture.has_value() && exact_capture.has_value(),
+                 scalar ? "w8c_scalar_step32_capture"
+                        : "w8c_conventional_step32_capture") &&
+      passed;
+  if (!smooth_capture || !exact_capture) return false;
+
+  const auto views = fixture.Views();
+  std::vector<std::uint8_t> smooth_encoded;
+  std::vector<std::uint8_t> exact_encoded;
+  passed = Check(
+               EncodeCheckpointV1(*smooth_capture, views.data(), views.size(),
+                                  smooth_encoded) == CheckpointCodecStatus::ok &&
+                   EncodeCheckpointV1(*exact_capture, views.data(), views.size(),
+                                      exact_encoded) ==
+                       CheckpointCodecStatus::ok,
+               scalar ? "w8c_scalar_exact_and_smooth_encode"
+                      : "w8c_conventional_exact_and_smooth_encode") &&
+      passed;
+
+  State decoded_interior(fixture.interior.size(), -1.0);
+  State decoded_trace(fixture.trace.size(), -1.0);
+  const std::uint32_t interior_components = scalar
+      ? scalar_igr_interior_component_count_v1 : 4U;
+  const std::uint32_t trace_components = scalar
+      ? scalar_igr_trace_component_count_v1 : 4U;
+  RankStateBufferV1 buffer{
+      0,
+      {decoded_interior.data(), decoded_interior.size(),
+       decoded_interior.size(), interior_components, 256,
+       CoefficientOrderingV1::component_major},
+      {decoded_trace.data(), decoded_trace.size(), decoded_trace.size(),
+       trace_components, 256, CoefficientOrderingV1::component_major}};
+  DecodedCheckpointMetadataV1 metadata{};
+  passed = Check(
+               DecodeCheckpointV1(
+                   {smooth_encoded.data(), smooth_encoded.size()},
+                   *smooth_reader, resources, runtime, &buffer, 1, metadata) ==
+                       CheckpointCodecStatus::ok &&
+                   decoded_interior == fixture.interior &&
+                   decoded_trace == fixture.trace &&
+                   metadata.case_id.view() ==
+                       "periodic-smooth-transition-v2" &&
+                   metadata.descriptor.coordinates.step == 32 &&
+                   metadata.descriptor.coordinates.time == 1.0 / 32.0,
+               scalar ? "w8c_scalar_smooth_step32_round_trip"
+                      : "w8c_conventional_smooth_step32_round_trip") &&
+      passed;
+
+  DecodeSentinel crossed_smooth_to_exact;
+  const DecodeSentinel crossed_smooth_to_exact_original =
+      crossed_smooth_to_exact;
+  auto exact_buffers = crossed_smooth_to_exact.Buffers();
+  const CheckpointCodecStatus smooth_to_exact = DecodeCheckpointV1(
+      {smooth_encoded.data(), smooth_encoded.size()}, *exact_reader,
+      resources, runtime, exact_buffers.data(), exact_buffers.size(),
+      crossed_smooth_to_exact.metadata);
+  passed = Check(
+               smooth_to_exact ==
+                       CheckpointCodecStatus::invalid_config_identity &&
+                   SentinelUnchanged(crossed_smooth_to_exact,
+                                     crossed_smooth_to_exact_original),
+               scalar ? "w8c_scalar_smooth_to_exact_rejected_atomically"
+                      : "w8c_conventional_smooth_to_exact_rejected_atomically") &&
+      passed;
+
+  DecodeSentinel crossed_exact_to_smooth;
+  const DecodeSentinel crossed_exact_to_smooth_original =
+      crossed_exact_to_smooth;
+  auto smooth_buffers = crossed_exact_to_smooth.Buffers();
+  const CheckpointCodecStatus exact_to_smooth = DecodeCheckpointV1(
+      {exact_encoded.data(), exact_encoded.size()}, *smooth_reader,
+      resources, runtime, smooth_buffers.data(), smooth_buffers.size(),
+      crossed_exact_to_smooth.metadata);
+  passed = Check(
+               exact_to_smooth ==
+                       CheckpointCodecStatus::invalid_config_identity &&
+                   SentinelUnchanged(crossed_exact_to_smooth,
+                                     crossed_exact_to_smooth_original),
+               scalar ? "w8c_scalar_exact_to_smooth_rejected_atomically"
+                      : "w8c_conventional_exact_to_smooth_rejected_atomically") &&
+      passed;
+  return passed;
+}
+
+bool CheckW8cSmoothTransitionCodecClosure()
+{
+  bool passed = CheckW8cSmoothTransitionPolicyCodec(
+      false, W8cConventionalCoefficientFixture{});
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
+  passed = CheckW8cSmoothTransitionPolicyCodec(
+               true, ScalarCoefficientFixture{}) && passed;
+#endif
+  return passed;
+}
+
 bool CheckFunctionalSplitRoundTrip()
 {
   const FunctionalCoefficientFixture fixture;
@@ -2869,6 +3121,7 @@ int main()
   passed = CheckScalarIgrSemanticInteriorLayout() && passed;
   passed = CheckScalarIgrCheckpointSchemaRoundTrip() && passed;
   passed = CheckNonEvidenceSplitRoundTrip() && passed;
+  passed = CheckW8cSmoothTransitionCodecClosure() && passed;
   passed = CheckFunctionalSplitRoundTrip() && passed;
   passed = CheckGoldenRoundTrip() && passed;
   passed = CheckEncoderControls() && passed;

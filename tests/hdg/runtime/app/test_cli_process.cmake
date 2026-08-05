@@ -612,6 +612,146 @@ function(validate_scalar_cuda_metadata metadata label expected_step)
   endif()
 endfunction()
 
+if(HDG_RUNTIME_W8C_SMOOTH)
+  if(NOT HDG_RUNTIME_RANKS EQUAL 1)
+    message(FATAL_ERROR "W8C smooth-transition CLI coverage is CPU serial")
+  endif()
+  foreach(policy IN ITEMS conventional scalar)
+    set(reference_directory
+        "${HDG_RUNTIME_TEST_OUTPUT}-${policy}-reference")
+    set(reference_checkpoint
+        "${HDG_RUNTIME_TEST_OUTPUT}-${policy}-reference.checkpoint")
+    set(split_directory "${HDG_RUNTIME_TEST_OUTPUT}-${policy}-split")
+    set(split_checkpoint
+        "${HDG_RUNTIME_TEST_OUTPUT}-${policy}-split.checkpoint")
+    file(REMOVE_RECURSE "${reference_directory}" "${split_directory}")
+    file(REMOVE "${reference_checkpoint}" "${split_checkpoint}")
+
+    if(policy STREQUAL "scalar")
+      set(card exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3)
+    else()
+      set(card exp.hdg.euler.conventional.smooth_persistent.w8a.v1)
+    endif()
+    set(common
+      --card "${card}" --case periodic-smooth-transition-v2
+      --space l2 --mesh-family periodic-cartesian-quad --mesh-n 8 --order 1
+      --dt 0.0009765625 --steps 64 --final-time 0.0625
+      --backend cpu --device-id none --output-steps 0,32,64
+      --max-retries 0 --inject-failure off --seed 0x573843534d4f5632)
+
+    run_serial_runtime(reference ${common}
+      --output-dir "${reference_directory}"
+      --checkpoint-out "${reference_checkpoint}" --checkpoint-step 32
+      --stop-after-checkpoint false --restart-from none)
+    if(NOT reference_status EQUAL 0 OR
+       NOT reference_output MATCHES "status=Success.*step=64.*retries=0" OR
+       NOT reference_error STREQUAL "")
+      message(FATAL_ERROR
+        "W8C smooth ${policy} uninterrupted launch failed: ${reference_status};${reference_output};${reference_error}")
+    endif()
+
+    run_serial_runtime(writer ${common}
+      --output-dir "${split_directory}"
+      --checkpoint-out "${split_checkpoint}" --checkpoint-step 32
+      --stop-after-checkpoint true --restart-from none)
+    if(NOT writer_status EQUAL 0 OR
+       NOT writer_output MATCHES "status=Success.*step=32.*retries=0" OR
+       NOT writer_error STREQUAL "")
+      message(FATAL_ERROR
+        "W8C smooth ${policy} split-writer launch failed: ${writer_status};${writer_output};${writer_error}")
+    endif()
+
+    run_serial_runtime(reader ${common}
+      --output-dir "${split_directory}"
+      --checkpoint-out none --checkpoint-step none
+      --stop-after-checkpoint false --restart-from "${split_checkpoint}")
+    if(NOT reader_status EQUAL 0 OR
+       NOT reader_output MATCHES "status=Success.*step=64.*retries=0" OR
+       NOT reader_error STREQUAL "")
+      message(FATAL_ERROR
+        "W8C smooth ${policy} split-reader launch failed: ${reader_status};${reader_output};${reader_error}")
+    endif()
+
+    foreach(directory IN ITEMS reference_directory split_directory)
+      foreach(step IN ITEMS 000000 000032 000064)
+        require_regular_file(
+          "${${directory}}/state-step-${step}.vtk"
+          "W8C smooth ${policy} ${directory} step ${step}")
+      endforeach()
+      file(GLOB states "${${directory}}/state-step-*.vtk")
+      list(LENGTH states state_count)
+      if(NOT state_count EQUAL 3)
+        message(FATAL_ERROR
+          "W8C smooth ${policy} ${directory} output census is ${state_count}, expected 3")
+      endif()
+    endforeach()
+    foreach(path IN ITEMS
+        "${reference_directory}/run-metadata.json"
+        "${reference_checkpoint}"
+        "${split_directory}/run-metadata-checkpoint.json"
+        "${split_directory}/run-metadata.json"
+        "${split_checkpoint}")
+      require_regular_file("${path}" "W8C smooth ${policy} publication")
+    endforeach()
+
+    if(policy STREQUAL "scalar")
+      foreach(directory IN ITEMS reference_directory split_directory)
+        foreach(step IN ITEMS 000000 000032 000064)
+          validate_scalar_igr_vtk(
+            "${${directory}}/state-step-${step}.vtk" 8
+            "W8C smooth scalar ${directory} step ${step}")
+        endforeach()
+      endforeach()
+    else()
+      foreach(directory IN ITEMS reference_directory split_directory)
+        foreach(step IN ITEMS 000000 000032 000064)
+          validate_physical_vtk(
+            "${${directory}}/state-step-${step}.vtk" 8
+            "W8C smooth conventional ${directory} step ${step}")
+        endforeach()
+      endforeach()
+    endif()
+
+    file(READ "${reference_directory}/run-metadata.json"
+         reference_metadata)
+    file(READ "${split_directory}/run-metadata-checkpoint.json"
+         writer_metadata)
+    file(READ "${split_directory}/run-metadata.json" reader_metadata)
+    foreach(metadata IN ITEMS reference_metadata writer_metadata
+                              reader_metadata)
+      if(NOT "${${metadata}}" MATCHES
+             "\"case\": \"periodic-smooth-transition-v2\"" OR
+         NOT "${${metadata}}" MATCHES "\"scenario\": \"W8C-V2-N8-DT10\"" OR
+         NOT "${${metadata}}" MATCHES "\"status\": \"Success\"" OR
+         NOT "${${metadata}}" MATCHES "\"retries\": 0")
+        message(FATAL_ERROR
+          "W8C smooth ${policy} ${metadata} identity/status is incomplete")
+      endif()
+    endforeach()
+    if(NOT writer_metadata MATCHES "\"committed_step\": 32" OR
+       NOT reference_metadata MATCHES "\"committed_step\": 64" OR
+       NOT reader_metadata MATCHES "\"committed_step\": 64")
+      message(FATAL_ERROR
+        "W8C smooth ${policy} metadata does not bind steps 32/64")
+    endif()
+    string(REGEX MATCH
+      "\"final_state_sha256\": \"([0-9a-f]+)\""
+      reference_hash_match "${reference_metadata}")
+    set(reference_hash "${CMAKE_MATCH_1}")
+    string(REGEX MATCH
+      "\"final_state_sha256\": \"([0-9a-f]+)\""
+      reader_hash_match "${reader_metadata}")
+    set(reader_hash "${CMAKE_MATCH_1}")
+    string(LENGTH "${reference_hash}" reference_hash_length)
+    if(NOT reference_hash_length EQUAL 64 OR
+       NOT reference_hash STREQUAL reader_hash)
+      message(FATAL_ERROR
+        "W8C smooth ${policy} uninterrupted/restart final-state identity differs")
+    endif()
+  endforeach()
+  return()
+endif()
+
 if(HDG_RUNTIME_FUNCTIONAL)
   if(NOT DEFINED HDG_RUNTIME_BACKEND)
     set(HDG_RUNTIME_BACKEND cpu)

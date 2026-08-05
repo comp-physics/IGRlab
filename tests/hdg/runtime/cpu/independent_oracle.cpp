@@ -16,6 +16,704 @@
 
 namespace dg_igr_hdg_cpu_test
 {
+
+W8cKnownState W8cCellState(const double x) noexcept
+{
+  constexpr W8cKnownState right{{0.125, 0.0, 0.0, 0.25}};
+  constexpr W8cKnownState left{{1.0, 0.0, 0.0, 2.5}};
+  return x < 0.25 || x >= 0.75 ? right : left;
+}
+
+W8cKnownState W8cInterfaceMean() noexcept
+{
+  return {{0.5625, 0.0, 0.0, 1.375}};
+}
+
+bool VerifyW8cTraceGeometryAndState(
+    MPI_Comm communicator, const double* true_trace,
+    const std::size_t true_trace_size,
+    W8cTraceGeometryEvidence& evidence) noexcept
+{
+  evidence = {};
+  if (communicator == MPI_COMM_NULL || !true_trace) return false;
+  int rank = -1;
+  int ranks = 0;
+  if (MPI_Comm_rank(communicator, &rank) != MPI_SUCCESS ||
+      MPI_Comm_size(communicator, &ranks) != MPI_SUCCESS ||
+      rank != 0 || ranks != 1)
+  {
+    return false;
+  }
+
+  constexpr int n = 8;
+  constexpr int trace_components = 4;
+  constexpr int expected_faces = 2 * n * n;
+  constexpr int expected_face_nodes = 2 * expected_faces;
+  constexpr int expected_true_dofs =
+      trace_components * expected_face_nodes;
+  constexpr double geometry_tolerance =
+      64.0 * std::numeric_limits<double>::epsilon();
+  const auto close = [](const double actual, const double expected) noexcept {
+    return std::abs(actual - expected) <=
+        64.0 * std::numeric_limits<double>::epsilon() *
+            std::max({1.0, std::abs(actual), std::abs(expected)});
+  };
+  const auto state_at_x = [](const double x) noexcept {
+    return std::abs(x - 0.25) <= geometry_tolerance ||
+            std::abs(x - 0.75) <= geometry_tolerance
+        ? W8cInterfaceMean() : W8cCellState(x);
+  };
+
+  try
+  {
+    mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+        n, n, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+    std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+    translations[0][0] = 1.0;
+    translations[0][1] = 0.0;
+    translations[1][0] = 0.0;
+    translations[1][1] = 1.0;
+    mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
+        original, original.CreatePeriodicVertexMapping(translations));
+    std::vector<int> partition(
+        static_cast<std::size_t>(periodic.GetNE()), 0);
+    mfem::ParMesh mesh(communicator, periodic, partition.data());
+    mfem::DG_Interface_FECollection collection(
+        1, 2, mfem::FiniteElement::VALUE,
+        mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace space(
+        &mesh, &collection, trace_components, mfem::Ordering::byNODES);
+
+    evidence.faces = static_cast<std::uint64_t>(mesh.GetNumFaces());
+    evidence.true_dofs = static_cast<std::uint64_t>(space.GetTrueVSize());
+    if (mesh.GetNE() != n * n || mesh.GetNumFaces() != expected_faces ||
+        space.GetTrueVSize() != expected_true_dofs ||
+        true_trace_size != static_cast<std::size_t>(expected_true_dofs))
+    {
+      return false;
+    }
+
+    std::vector<std::uint8_t> assigned(true_trace_size, 0);
+    std::vector<int> face_visits(static_cast<std::size_t>(expected_faces), 0);
+    for (int face = 0; face < mesh.GetNumFaces(); ++face)
+    {
+      const mfem::FiniteElement* finite_element = space.GetFaceElement(face);
+      mfem::ElementTransformation* transformation =
+          mesh.GetFaceTransformation(face);
+      mfem::Array<int> vdofs;
+      space.GetFaceVDofs(face, vdofs);
+      if (!finite_element || !transformation || finite_element->GetDof() != 2 ||
+          vdofs.Size() != 2 * trace_components)
+      {
+        return false;
+      }
+      const mfem::IntegrationRule& nodes = finite_element->GetNodes();
+      if (nodes.GetNPoints() != 2) return false;
+      for (int scalar = 0; scalar < 2; ++scalar)
+      {
+        mfem::Vector point(2);
+        transformation->Transform(nodes.IntPoint(scalar), point);
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1])) return false;
+        const W8cKnownState expected = state_at_x(point[0]);
+        ++evidence.face_nodes;
+        if (std::abs(point[0] - 0.25) <= geometry_tolerance ||
+            std::abs(point[0] - 0.75) <= geometry_tolerance)
+        {
+          ++evidence.mean_nodes;
+        }
+        else if (expected == W8cCellState(0.0))
+        {
+          ++evidence.right_nodes;
+        }
+        else
+        {
+          ++evidence.left_nodes;
+        }
+        if (std::abs(point[0]) <= geometry_tolerance ||
+            std::abs(point[0] - 1.0) <= geometry_tolerance)
+        {
+          ++evidence.periodic_nodes;
+        }
+        for (int component = 0; component < trace_components; ++component)
+        {
+          double sign = 1.0;
+          const int dof = mfem::FiniteElementSpace::DecodeDof(
+              vdofs[scalar + 2 * component], sign);
+          const int true_dof = dof >= 0
+              ? space.GetLocalTDofNumber(dof) : -1;
+          if (dof < 0 || true_dof < 0 ||
+              true_dof >= expected_true_dofs || sign == 0.0)
+          {
+            return false;
+          }
+          if (sign < 0.0) ++evidence.negative_face_vdofs;
+          const double expected_true =
+              sign * expected[static_cast<std::size_t>(component)];
+          if (!close(true_trace[static_cast<std::size_t>(true_dof)],
+                     expected_true) ||
+              assigned[static_cast<std::size_t>(true_dof)] != 0)
+          {
+            return false;
+          }
+          assigned[static_cast<std::size_t>(true_dof)] = 1;
+        }
+      }
+    }
+    if (!std::all_of(assigned.begin(), assigned.end(),
+                     [](const std::uint8_t value) { return value == 1; }))
+    {
+      return false;
+    }
+
+    for (int element = 0; element < mesh.GetNE(); ++element)
+    {
+      mfem::Array<int> faces, orientations;
+      mesh.GetElementEdges(element, faces, orientations);
+      if (faces.Size() != 4 || orientations.Size() != faces.Size())
+        return false;
+      for (int local_face = 0; local_face < faces.Size(); ++local_face)
+      {
+        const int face = faces[local_face];
+        const int orientation = orientations[local_face];
+        if (face < 0 || face >= expected_faces ||
+            (orientation != 1 && orientation != -1))
+        {
+          return false;
+        }
+        ++evidence.element_face_visits;
+        ++face_visits[static_cast<std::size_t>(face)];
+        if (orientation > 0) ++evidence.positive_orientations;
+        else ++evidence.negative_orientations;
+
+        const mfem::FiniteElement* finite_element = space.GetFaceElement(face);
+        mfem::ElementTransformation* transformation =
+            mesh.GetFaceTransformation(face);
+        mfem::Array<int> vdofs;
+        space.GetFaceVDofs(face, vdofs);
+        const int* permutation = collection.DofOrderForOrientation(
+            mfem::Geometry::SEGMENT, orientation);
+        if (!finite_element || !transformation || !permutation ||
+            finite_element->GetDof() != 2 ||
+            vdofs.Size() != 2 * trace_components)
+        {
+          return false;
+        }
+        std::array<std::uint8_t, 2> permutation_census{};
+        const mfem::IntegrationRule& nodes = finite_element->GetNodes();
+        for (int oriented = 0; oriented < 2; ++oriented)
+        {
+          double permutation_sign = 1.0;
+          const int canonical = mfem::FiniteElementSpace::DecodeDof(
+              permutation[oriented], permutation_sign);
+          if (canonical < 0 || canonical >= 2 || permutation_sign == 0.0 ||
+              permutation_census[static_cast<std::size_t>(canonical)] != 0)
+          {
+            return false;
+          }
+          permutation_census[static_cast<std::size_t>(canonical)] = 1;
+          if (permutation_sign < 0.0)
+            ++evidence.negative_permutation_dofs;
+          mfem::Vector point(2);
+          transformation->Transform(nodes.IntPoint(canonical), point);
+          const W8cKnownState expected = state_at_x(point[0]);
+          for (int component = 0; component < trace_components; ++component)
+          {
+            double face_sign = 1.0;
+            const int dof = mfem::FiniteElementSpace::DecodeDof(
+                vdofs[canonical + 2 * component], face_sign);
+            const int true_dof = dof >= 0
+                ? space.GetLocalTDofNumber(dof) : -1;
+            if (true_dof < 0 || true_dof >= expected_true_dofs ||
+                !close(face_sign *
+                           true_trace[static_cast<std::size_t>(true_dof)],
+                       expected[static_cast<std::size_t>(component)]))
+            {
+              return false;
+            }
+          }
+        }
+      }
+    }
+
+    const bool exact_face_multiplicity = std::all_of(
+        face_visits.begin(), face_visits.end(),
+        [](const int visits) { return visits == 2; });
+    return exact_face_multiplicity &&
+        evidence.faces == expected_faces &&
+        evidence.face_nodes == expected_face_nodes &&
+        evidence.true_dofs == expected_true_dofs &&
+        evidence.element_face_visits == 4 * n * n &&
+        evidence.positive_orientations == 2 * n * n &&
+        evidence.negative_orientations == 2 * n * n &&
+        evidence.negative_face_vdofs == 0 &&
+        evidence.negative_permutation_dofs == 0 &&
+        evidence.right_nodes == 112 && evidence.left_nodes == 112 &&
+        evidence.mean_nodes == 32 && evidence.periodic_nodes == 16;
+  }
+  catch (...)
+  {
+    evidence = {};
+    return false;
+  }
+}
+
+W8cKnownState SmoothTransitionV2State(const double x) noexcept
+{
+  constexpr double oracle_pi =
+      3.141592653589793238462643383279502884;
+  constexpr double width = 1.0 / 8.0;
+  const double kappa = std::atanh(0.8) / std::sin(oracle_pi * width);
+  const double chi = 0.5 *
+      (1.0 - std::tanh(kappa * std::cos(2.0 * oracle_pi * x)));
+  const double rho = 0.125 + 0.875 * chi;
+  const double pressure = 0.1 + 0.9 * chi;
+  return {{rho, 0.0, 0.0, pressure / 0.4}};
+}
+
+bool BuildSmoothTransitionV2ProjectionOracle(
+    MPI_Comm communicator, std::vector<double>& component_major_interior,
+    std::vector<double>& true_trace,
+    SmoothTransitionProjectionEvidence& evidence) noexcept
+{
+  component_major_interior.clear();
+  true_trace.clear();
+  evidence = {};
+  int rank = -1;
+  int ranks = 0;
+  if (communicator == MPI_COMM_NULL ||
+      MPI_Comm_rank(communicator, &rank) != MPI_SUCCESS ||
+      MPI_Comm_size(communicator, &ranks) != MPI_SUCCESS || rank != 0 ||
+      ranks != 1)
+  {
+    return false;
+  }
+
+  constexpr int n = 8;
+  constexpr int components = 4;
+  constexpr int projection_q = 14;
+  constexpr int observation_q = 18;
+  const auto solve = [](std::vector<double> matrix,
+                        std::array<std::vector<double>, components> rhs,
+                        const int size,
+                        std::array<std::vector<double>, components>& solution)
+  {
+    if (size <= 0 || matrix.size() !=
+            static_cast<std::size_t>(size) * size)
+      return false;
+    for (int component = 0; component < components; ++component)
+    {
+      if (rhs[static_cast<std::size_t>(component)].size() !=
+          static_cast<std::size_t>(size))
+        return false;
+    }
+    for (int column = 0; column < size; ++column)
+    {
+      int pivot = column;
+      for (int row = column + 1; row < size; ++row)
+      {
+        if (std::abs(matrix[static_cast<std::size_t>(row) * size + column]) >
+            std::abs(matrix[static_cast<std::size_t>(pivot) * size + column]))
+          pivot = row;
+      }
+      const double diagonal =
+          matrix[static_cast<std::size_t>(pivot) * size + column];
+      if (!std::isfinite(diagonal) || diagonal == 0.0) return false;
+      if (pivot != column)
+      {
+        for (int entry = 0; entry < size; ++entry)
+          std::swap(matrix[static_cast<std::size_t>(pivot) * size + entry],
+                    matrix[static_cast<std::size_t>(column) * size + entry]);
+        for (int component = 0; component < components; ++component)
+          std::swap(rhs[static_cast<std::size_t>(component)]
+                        [static_cast<std::size_t>(pivot)],
+                    rhs[static_cast<std::size_t>(component)]
+                        [static_cast<std::size_t>(column)]);
+      }
+      for (int row = column + 1; row < size; ++row)
+      {
+        const double multiplier =
+            matrix[static_cast<std::size_t>(row) * size + column] /
+            matrix[static_cast<std::size_t>(column) * size + column];
+        matrix[static_cast<std::size_t>(row) * size + column] = 0.0;
+        for (int entry = column + 1; entry < size; ++entry)
+          matrix[static_cast<std::size_t>(row) * size + entry] -=
+              multiplier *
+              matrix[static_cast<std::size_t>(column) * size + entry];
+        for (int component = 0; component < components; ++component)
+          rhs[static_cast<std::size_t>(component)]
+             [static_cast<std::size_t>(row)] -=
+              multiplier * rhs[static_cast<std::size_t>(component)]
+                                  [static_cast<std::size_t>(column)];
+      }
+    }
+    solution = rhs;
+    for (int component = 0; component < components; ++component)
+    {
+      for (int row = size - 1; row >= 0; --row)
+      {
+        double value = solution[static_cast<std::size_t>(component)]
+                               [static_cast<std::size_t>(row)];
+        for (int column = row + 1; column < size; ++column)
+          value -= matrix[static_cast<std::size_t>(row) * size + column] *
+              solution[static_cast<std::size_t>(component)]
+                      [static_cast<std::size_t>(column)];
+        const double diagonal =
+            matrix[static_cast<std::size_t>(row) * size + row];
+        if (!std::isfinite(diagonal) || diagonal == 0.0) return false;
+        solution[static_cast<std::size_t>(component)]
+                [static_cast<std::size_t>(row)] = value / diagonal;
+      }
+    }
+    return true;
+  };
+
+  try
+  {
+    mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+        n, n, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+    std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+    translations[0][0] = 1.0;
+    translations[0][1] = 0.0;
+    translations[1][0] = 0.0;
+    translations[1][1] = 1.0;
+    mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
+        original, original.CreatePeriodicVertexMapping(translations));
+    std::vector<int> partition(static_cast<std::size_t>(periodic.GetNE()), 0);
+    mfem::ParMesh mesh(communicator, periodic, partition.data());
+    mfem::L2_FECollection volume_collection(
+        1, 2, mfem::BasisType::GaussLegendre, mfem::FiniteElement::VALUE);
+    mfem::DG_Interface_FECollection trace_collection(
+        1, 2, mfem::FiniteElement::VALUE,
+        mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace volume_space(
+        &mesh, &volume_collection, components, mfem::Ordering::byNODES);
+    mfem::ParFiniteElementSpace trace_space(
+        &mesh, &trace_collection, components, mfem::Ordering::byNODES);
+    mfem::ParGridFunction volume(&volume_space);
+    volume = 0.0;
+
+    for (int element = 0; element < mesh.GetNE(); ++element)
+    {
+      const mfem::FiniteElement* finite_element = volume_space.GetFE(element);
+      mfem::ElementTransformation* transformation =
+          mesh.GetElementTransformation(element);
+      if (!finite_element || !transformation) return false;
+      const int scalar_dofs = finite_element->GetDof();
+      std::vector<double> mass(
+          static_cast<std::size_t>(scalar_dofs) * scalar_dofs, 0.0);
+      std::array<std::vector<double>, components> rhs;
+      for (auto& values : rhs)
+        values.assign(static_cast<std::size_t>(scalar_dofs), 0.0);
+      mfem::Vector shape(scalar_dofs), point(2);
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), projection_q);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& ip = rule.IntPoint(q);
+        transformation->SetIntPoint(&ip);
+        finite_element->CalcShape(ip, shape);
+        transformation->Transform(ip, point);
+        const W8cKnownState value = SmoothTransitionV2State(point[0]);
+        const double weight = ip.weight * transformation->Weight();
+        for (int row = 0; row < scalar_dofs; ++row)
+        {
+          for (int column = 0; column < scalar_dofs; ++column)
+            mass[static_cast<std::size_t>(row) * scalar_dofs + column] +=
+                weight * shape[row] * shape[column];
+          for (int component = 0; component < components; ++component)
+            rhs[static_cast<std::size_t>(component)]
+               [static_cast<std::size_t>(row)] +=
+                weight * shape[row] *
+                value[static_cast<std::size_t>(component)];
+        }
+      }
+      std::array<std::vector<double>, components> coefficients;
+      if (!solve(mass, rhs, scalar_dofs, coefficients)) return false;
+      mfem::Vector local(components * scalar_dofs);
+      for (int component = 0; component < components; ++component)
+        for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+          local[component * scalar_dofs + scalar] =
+              coefficients[static_cast<std::size_t>(component)]
+                          [static_cast<std::size_t>(scalar)];
+      mfem::Array<int> vdofs;
+      mfem::DofTransformation dof_transformation(
+          volume_space.GetVDim(), volume_space.GetOrdering());
+      volume_space.GetElementVDofs(element, vdofs, dof_transformation);
+      if (vdofs.Size() != local.Size()) return false;
+      dof_transformation.TransformPrimal(local);
+      volume.SetSubVector(vdofs, local);
+
+      const mfem::IntegrationRule& observation = mfem::IntRules.Get(
+          finite_element->GetGeomType(), observation_q);
+      for (int q = 0; q < observation.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& ip = observation.IntPoint(q);
+        transformation->SetIntPoint(&ip);
+        transformation->Transform(ip, point);
+        const W8cKnownState value = SmoothTransitionV2State(point[0]);
+        const double weight = ip.weight * transformation->Weight();
+        evidence.density_integral += weight * value[0];
+        evidence.x_momentum_integral += weight * value[1];
+        evidence.y_momentum_integral += weight * value[2];
+        evidence.energy_integral += weight * value[3];
+      }
+    }
+    const double* interior = volume.HostRead();
+    component_major_interior.assign(
+        interior, interior + volume.Size());
+
+    true_trace.assign(static_cast<std::size_t>(trace_space.GetTrueVSize()),
+                      0.0);
+    std::vector<std::uint8_t> assigned(true_trace.size(), 0);
+    std::vector<double> canonical_face_coefficients(
+        static_cast<std::size_t>(mesh.GetNumFaces()) * components * 2, 0.0);
+    const auto face_coefficient = [](const int face, const int component,
+                                     const int scalar)
+    {
+      return (static_cast<std::size_t>(face) * components + component) * 2 +
+          scalar;
+    };
+    for (int face = 0; face < mesh.GetNumFaces(); ++face)
+    {
+      const mfem::FiniteElement* finite_element =
+          trace_space.GetFaceElement(face);
+      mfem::ElementTransformation* transformation =
+          mesh.GetFaceTransformation(face);
+      mfem::Array<int> vdofs;
+      trace_space.GetFaceVDofs(face, vdofs);
+      if (!finite_element || !transformation) return false;
+      const int scalar_dofs = finite_element->GetDof();
+      if (vdofs.Size() != components * scalar_dofs) return false;
+      std::vector<double> mass(
+          static_cast<std::size_t>(scalar_dofs) * scalar_dofs, 0.0);
+      std::array<std::vector<double>, components> rhs;
+      for (auto& values : rhs)
+        values.assign(static_cast<std::size_t>(scalar_dofs), 0.0);
+      mfem::Vector shape(scalar_dofs), point(2);
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), projection_q);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& ip = rule.IntPoint(q);
+        transformation->SetIntPoint(&ip);
+        finite_element->CalcShape(ip, shape);
+        transformation->Transform(ip, point);
+        const W8cKnownState value = SmoothTransitionV2State(point[0]);
+        const double weight = ip.weight * transformation->Weight();
+        for (int row = 0; row < scalar_dofs; ++row)
+        {
+          for (int column = 0; column < scalar_dofs; ++column)
+            mass[static_cast<std::size_t>(row) * scalar_dofs + column] +=
+                weight * shape[row] * shape[column];
+          for (int component = 0; component < components; ++component)
+            rhs[static_cast<std::size_t>(component)]
+               [static_cast<std::size_t>(row)] +=
+                weight * shape[row] *
+                value[static_cast<std::size_t>(component)];
+        }
+      }
+      std::array<std::vector<double>, components> coefficients;
+      if (!solve(mass, rhs, scalar_dofs, coefficients)) return false;
+      for (int component = 0; component < components; ++component)
+        for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+        {
+          canonical_face_coefficients[
+              face_coefficient(face, component, scalar)] =
+              coefficients[static_cast<std::size_t>(component)]
+                          [static_cast<std::size_t>(scalar)];
+          double sign = 1.0;
+          const int dof = mfem::FiniteElementSpace::DecodeDof(
+              vdofs[component * scalar_dofs + scalar], sign);
+          const int true_dof = dof >= 0
+              ? trace_space.GetLocalTDofNumber(dof) : -1;
+          if (dof < 0 || true_dof < 0 ||
+              true_dof >= static_cast<int>(true_trace.size()) || sign == 0.0 ||
+              assigned[static_cast<std::size_t>(true_dof)] != 0)
+          {
+            return false;
+          }
+          true_trace[static_cast<std::size_t>(true_dof)] = sign *
+              coefficients[static_cast<std::size_t>(component)]
+                          [static_cast<std::size_t>(scalar)];
+          assigned[static_cast<std::size_t>(true_dof)] = 1;
+        }
+    }
+    if (!std::all_of(assigned.begin(), assigned.end(),
+                     [](const std::uint8_t value) { return value == 1; }))
+      return false;
+
+    std::vector<int> true_trace_incidence(true_trace.size(), 0);
+    std::vector<int> face_visits(static_cast<std::size_t>(mesh.GetNumFaces()),
+                                 0);
+    for (int element = 0; element < mesh.GetNE(); ++element)
+    {
+      mfem::Array<int> faces, orientations;
+      mesh.GetElementEdges(element, faces, orientations);
+      if (faces.Size() != 4 || orientations.Size() != 4) return false;
+      for (int local_face = 0; local_face < faces.Size(); ++local_face)
+      {
+        const int face = faces[local_face];
+        const int orientation = orientations[local_face];
+        if (face < 0 || face >= mesh.GetNumFaces() ||
+            (orientation != 1 && orientation != -1))
+        {
+          return false;
+        }
+        ++evidence.element_face_visits;
+        ++face_visits[static_cast<std::size_t>(face)];
+        if (orientation > 0)
+          ++evidence.positive_orientations;
+        else
+          ++evidence.negative_orientations;
+
+        const mfem::FiniteElement* finite_element =
+            trace_space.GetFaceElement(face);
+        mfem::Array<int> vdofs;
+        trace_space.GetFaceVDofs(face, vdofs);
+        const int* permutation = trace_collection.DofOrderForOrientation(
+            mfem::Geometry::SEGMENT, orientation);
+        if (!finite_element || !permutation || finite_element->GetDof() != 2 ||
+            vdofs.Size() != components * 2)
+        {
+          return false;
+        }
+        std::array<int, 2> canonical_dofs{};
+        std::array<double, 2> orientation_signs{};
+        std::array<std::uint8_t, 2> permutation_census{};
+        std::array<std::array<double, 2>, components> side_coefficients{};
+        for (int oriented = 0; oriented < 2; ++oriented)
+        {
+          double orientation_sign = 1.0;
+          const int canonical = mfem::FiniteElementSpace::DecodeDof(
+              permutation[oriented], orientation_sign);
+          if (canonical < 0 || canonical >= 2 || orientation_sign == 0.0 ||
+              permutation_census[static_cast<std::size_t>(canonical)] != 0)
+          {
+            return false;
+          }
+          permutation_census[static_cast<std::size_t>(canonical)] = 1;
+          canonical_dofs[static_cast<std::size_t>(oriented)] = canonical;
+          orientation_signs[static_cast<std::size_t>(oriented)] =
+              orientation_sign;
+          for (int component = 0; component < components; ++component)
+          {
+            double face_sign = 1.0;
+            const int dof = mfem::FiniteElementSpace::DecodeDof(
+                vdofs[component * 2 + canonical], face_sign);
+            const int true_dof = dof >= 0
+                ? trace_space.GetLocalTDofNumber(dof) : -1;
+            if (dof < 0 || true_dof < 0 ||
+                true_dof >= static_cast<int>(true_trace.size()) ||
+                face_sign == 0.0)
+            {
+              return false;
+            }
+            const double signed_coefficient = orientation_sign * face_sign *
+                true_trace[static_cast<std::size_t>(true_dof)];
+            const double expected_coefficient = orientation_sign *
+                canonical_face_coefficients[
+                    face_coefficient(face, component, canonical)];
+            side_coefficients[static_cast<std::size_t>(component)]
+                             [static_cast<std::size_t>(oriented)] =
+                signed_coefficient;
+            evidence.maximum_signed_trace_coefficient_defect = std::max(
+                evidence.maximum_signed_trace_coefficient_defect,
+                std::abs(signed_coefficient - expected_coefficient));
+            ++true_trace_incidence[static_cast<std::size_t>(true_dof)];
+            ++evidence.signed_permuted_trace_entries;
+            if (canonical != oriented) ++evidence.permuted_trace_entries;
+            if (orientation_sign * face_sign < 0.0)
+              ++evidence.negative_signed_trace_entries;
+          }
+        }
+
+        mfem::Vector face_shape(2), oriented_shape(2);
+        const mfem::IntegrationRule& verification_rule = mfem::IntRules.Get(
+            finite_element->GetGeomType(), projection_q);
+        for (int q = 0; q < verification_rule.GetNPoints(); ++q)
+        {
+          const mfem::IntegrationPoint& ip = verification_rule.IntPoint(q);
+          finite_element->CalcShape(ip, face_shape);
+          for (int oriented = 0; oriented < 2; ++oriented)
+          {
+            oriented_shape[oriented] =
+                orientation_signs[static_cast<std::size_t>(oriented)] *
+                face_shape[canonical_dofs[static_cast<std::size_t>(oriented)]];
+          }
+          for (int component = 0; component < components; ++component)
+          {
+            double canonical_value = 0.0;
+            double side_value = 0.0;
+            for (int scalar = 0; scalar < 2; ++scalar)
+            {
+              canonical_value += canonical_face_coefficients[
+                  face_coefficient(face, component, scalar)] *
+                  face_shape[scalar];
+              side_value += side_coefficients[
+                  static_cast<std::size_t>(component)]
+                  [static_cast<std::size_t>(scalar)] * oriented_shape[scalar];
+            }
+            evidence.maximum_projected_trace_value_defect = std::max(
+                evidence.maximum_projected_trace_value_defect,
+                std::abs(side_value - canonical_value));
+          }
+        }
+      }
+    }
+    evidence.doubly_covered_trace_dofs = static_cast<std::uint64_t>(
+        std::count(true_trace_incidence.begin(), true_trace_incidence.end(),
+                   2));
+    const bool exact_face_multiplicity = std::all_of(
+        face_visits.begin(), face_visits.end(),
+        [](const int visits) { return visits == 2; });
+
+    for (int sample = 0; sample <= 512; ++sample)
+    {
+      const double x = static_cast<double>(sample) / 512.0;
+      const double reflected_x = x == 0.0 ? 0.0 : 1.0 - x;
+      const double shifted_x = x < 0.5 ? x + 0.5 : x - 0.5;
+      const W8cKnownState value = SmoothTransitionV2State(x);
+      const W8cKnownState reflected = SmoothTransitionV2State(reflected_x);
+      const W8cKnownState shifted = SmoothTransitionV2State(shifted_x);
+      evidence.maximum_reflection_defect = std::max(
+          evidence.maximum_reflection_defect,
+          std::abs(value[0] - reflected[0]));
+      const double chi = (value[0] - 0.125) / 0.875;
+      const double shifted_chi = (shifted[0] - 0.125) / 0.875;
+      evidence.maximum_half_period_complement_defect = std::max(
+          evidence.maximum_half_period_complement_defect,
+          std::abs(chi + shifted_chi - 1.0));
+    }
+    evidence.elements = static_cast<std::uint64_t>(mesh.GetNE());
+    evidence.faces = static_cast<std::uint64_t>(mesh.GetNumFaces());
+    evidence.interior_coefficients = component_major_interior.size();
+    evidence.trace_coefficients = true_trace.size();
+    evidence.maximum_y_invariance_defect = 0.0;
+    return exact_face_multiplicity && evidence.elements == 64 &&
+        evidence.faces == 128 &&
+        evidence.interior_coefficients == 1024 &&
+        evidence.trace_coefficients == 1024 &&
+        evidence.element_face_visits == 256 &&
+        evidence.positive_orientations == 128 &&
+        evidence.negative_orientations == 128 &&
+        evidence.signed_permuted_trace_entries == 2048 &&
+        evidence.permuted_trace_entries == 1024 &&
+        evidence.negative_signed_trace_entries == 0 &&
+        evidence.doubly_covered_trace_dofs == 1024 &&
+        evidence.maximum_signed_trace_coefficient_defect <=
+            2048.0 * std::numeric_limits<double>::epsilon() &&
+        evidence.maximum_projected_trace_value_defect <=
+            2048.0 * std::numeric_limits<double>::epsilon();
+  }
+  catch (...)
+  {
+    component_major_interior.clear();
+    true_trace.clear();
+    evidence = {};
+    return false;
+  }
+}
+
 namespace
 {
 

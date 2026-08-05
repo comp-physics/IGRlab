@@ -1040,6 +1040,26 @@ std::vector<std::string> ScalarArguments(const std::string& backend,
       "0x5738425343323553"};
 }
 
+std::vector<std::string> SmoothTransitionArguments(const bool scalar,
+                                                   const std::string& backend,
+                                                   const std::string& device)
+{
+  return {"dg_igr_hdg_runtime",
+      "--card", scalar
+          ? "exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3"
+          : "exp.hdg.euler.conventional.smooth_persistent.w8a.v1",
+      "--case", "periodic-smooth-transition-v2",
+      "--space", "l2", "--mesh-family", "periodic-cartesian-quad",
+      "--mesh-n", "8", "--order", "1", "--dt", "0.0009765625",
+      "--steps", "64", "--final-time", "0.0625", "--backend", backend,
+      "--device-id", device, "--output-dir", "w8c-smooth-output",
+      "--output-steps", "0,32,64", "--checkpoint-out",
+      "w8c-smooth-checkpoint", "--checkpoint-step", "32",
+      "--stop-after-checkpoint", "false", "--restart-from", "none",
+      "--max-retries", "0", "--inject-failure", "off", "--seed",
+      "0x573843534d4f5632"};
+}
+
 void SetOption(std::vector<std::string>& arguments,
                const std::string& option, const std::string& value)
 {
@@ -1252,6 +1272,83 @@ bool DirectAndNegativeControls()
                          ApplicationRejection::invalid_run_role,
                  "scalar_cuda_rank2_step20_cli_fallback") && passed;
 #endif
+  const ParsedCommandLine smooth_conventional =
+      Parse(SmoothTransitionArguments(false, "cpu", "none"));
+  passed = Check(
+               smooth_conventional.status == CommandLineStatus::run &&
+                   smooth_conventional.options.case_id ==
+                       "periodic-smooth-transition-v2" &&
+                   smooth_conventional.options.scenario_id ==
+                       "W8C-V2-N8-DT10" &&
+                   smooth_conventional.options.source_id ==
+                       "source.euler.periodic-smooth-transition.v2" &&
+                   smooth_conventional.options.output_steps ==
+                       std::array<std::uint64_t, 3>{{0, 32, 64}} &&
+                   smooth_conventional.options.retry_limit == 0 &&
+                   smooth_conventional.options.injection.mode ==
+                       FailureInjectionModeV1::off,
+               "smooth_transition_conventional_cli") && passed;
+
+  const ParsedCommandLine smooth_scalar =
+      Parse(SmoothTransitionArguments(true, "cpu", "none"));
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
+  passed = Check(
+               smooth_scalar.status == CommandLineStatus::run &&
+                   smooth_scalar.options.case_id ==
+                       "periodic-smooth-transition-v2" &&
+                   smooth_scalar.options.source_id ==
+                       "source.sc25.periodic-smooth-transition.v3" &&
+                   smooth_scalar.options.formulation_id ==
+                       FullyHybridizedScalarSc25V3Tag::id &&
+                   smooth_scalar.options.q_a == 12,
+               "smooth_transition_scalar_cli") && passed;
+#else
+  passed = Check(
+               smooth_scalar.status == CommandLineStatus::rejected &&
+                   smooth_scalar.rejection ==
+                       ApplicationRejection::unbuilt_backend,
+               "smooth_transition_scalar_unbuilt_cli") && passed;
+#endif
+
+  auto smooth_reader = SmoothTransitionArguments(false, "cpu", "none");
+  SetOption(smooth_reader, "--checkpoint-out", "none");
+  SetOption(smooth_reader, "--checkpoint-step", "none");
+  SetOption(smooth_reader, "--restart-from", "w8c-smooth-checkpoint");
+  const ParsedCommandLine smooth_reader_result = Parse(smooth_reader);
+  passed = Check(
+               smooth_reader_result.status == CommandLineStatus::run &&
+                   smooth_reader_result.options.run_role ==
+                       ApplicationRunRoleV1::split_reader &&
+                   smooth_reader_result.options.retry_limit == 0 &&
+                   smooth_reader_result.options.injection.mode ==
+                       FailureInjectionModeV1::off,
+               "smooth_transition_split_reader_cli") && passed;
+
+  auto smooth_bad_case = SmoothTransitionArguments(false, "cpu", "none");
+  SetOption(smooth_bad_case, "--case", "periodic-smooth-transition-v3");
+  passed = Check(Parse(smooth_bad_case).rejection ==
+                     ApplicationRejection::unknown_case,
+                 "smooth_transition_unknown_case_cli") && passed;
+
+  auto smooth_bad_dt = SmoothTransitionArguments(false, "cpu", "none");
+  SetOption(smooth_bad_dt, "--dt", "0.001");
+  passed = Check(Parse(smooth_bad_dt).rejection ==
+                     ApplicationRejection::invalid_dt,
+                 "smooth_transition_time_schedule_cli") && passed;
+
+  const ParsedCommandLine smooth_cuda =
+      Parse(SmoothTransitionArguments(false, "cuda", "0"));
+  passed = Check(smooth_cuda.status == CommandLineStatus::rejected &&
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK1
+                     smooth_cuda.rejection ==
+                         ApplicationRejection::unknown_backend,
+                 "smooth_transition_cuda_case_is_cpu_serial_only") && passed;
+#else
+                     smooth_cuda.rejection ==
+                         ApplicationRejection::unbuilt_backend,
+                 "smooth_transition_cuda_rejected") && passed;
+#endif
+
   auto scalar_h1_args = ScalarArguments("cpu", "none");
   scalar_h1_args[6] = "h1";
   const ParsedCommandLine scalar_h1 = Parse(scalar_h1_args);
@@ -1270,6 +1367,8 @@ bool HelpAndConfig()
   PrintCommandLineHelp(text);
   passed = Check(help.status == CommandLineStatus::help &&
                      text.str().find("--config") != std::string::npos &&
+                     text.str().find("periodic-smooth-transition-v2") !=
+                         std::string::npos &&
                      text.str().find("--validation-capture") == std::string::npos &&
                      text.str().find("--evidence-dir") == std::string::npos &&
                      text.str().find("AfterRecoveryBeforeCommit") !=

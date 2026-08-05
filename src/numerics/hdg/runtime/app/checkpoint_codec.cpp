@@ -1,5 +1,7 @@
 #include "numerics/hdg/runtime/app/checkpoint_codec.hpp"
 
+#include "../cpu/hdg_cpu_serial_lifecycle.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -526,6 +528,8 @@ void WriteRestartDeltaManifestV2(
 {
   const bool scalar =
       writer_config.scenario() == ApplicationScenarioV1::scalar_igr_sc25_v3;
+  const bool smooth_transition = writer_config.case_id().view() ==
+      cpu::w8c::SmoothTransitionV2Case::case_id;
   const FailureInjectionControlV1 scalar_writer_injection{
       FailureInjectionModeV1::prescribed,
       smooth_periodic_euler_v1_failure_phase,
@@ -538,10 +542,13 @@ void WriteRestartDeltaManifestV2(
           ? smooth_periodic_euler_v1_smoke_failure_target_step
           : smooth_periodic_euler_v1_functional_failure_target_step,
       writer_config.deferred_runtime().required_injected_source_rank};
-  const FailureInjectionControlV1 writer_injection = scalar
-      ? scalar_writer_injection : FailureInjectionControlV1{};
-  const FailureInjectionControlV1 reader_injection = scalar
-      ? FailureInjectionControlV1{} : conventional_reader_injection;
+  const FailureInjectionControlV1 writer_injection = smooth_transition
+      ? FailureInjectionControlV1{}
+      : (scalar ? scalar_writer_injection : FailureInjectionControlV1{});
+  const FailureInjectionControlV1 reader_injection = smooth_transition
+      ? FailureInjectionControlV1{}
+      : (scalar ? FailureInjectionControlV1{}
+                : conventional_reader_injection);
   writer.U8(restart_delta_schema_v2);
   writer.U8(restart_delta_field_count_v2);
   writer.U8(1);
@@ -560,10 +567,13 @@ void WriteRestartDeltaManifestV2(
   WriteInjection(writer, writer_injection);
   WriteInjection(writer, reader_injection);
   writer.U8(6);
-  writer.UnsignedLittleEndian(
-      scalar ? scalar_igr_sc25_v3_retry_limit : std::uint32_t{0});
-  writer.UnsignedLittleEndian(
-      scalar ? std::uint32_t{0} : smooth_periodic_euler_v1_retry_limit);
+  writer.UnsignedLittleEndian(smooth_transition
+      ? std::uint32_t{0}
+      : (scalar ? scalar_igr_sc25_v3_retry_limit : std::uint32_t{0}));
+  writer.UnsignedLittleEndian(smooth_transition
+      ? std::uint32_t{0}
+      : (scalar ? std::uint32_t{0}
+                : smooth_periodic_euler_v1_retry_limit));
 }
 
 bool ReadRestartDeltaManifestV2(
@@ -776,6 +786,8 @@ bool ConfigMatchesSplitRestart(
   StateHash derived_writer_run_hash{};
   const FailureInjectionControlV1 canonical_off{};
   const bool scalar = expected.scalar_igr();
+  const bool smooth_transition = expected.case_id().view() ==
+      cpu::w8c::SmoothTransitionV2Case::case_id;
   const FailureInjectionControlV1 scalar_writer_injection{
       FailureInjectionModeV1::prescribed,
       smooth_periodic_euler_v1_failure_phase,
@@ -830,18 +842,20 @@ bool ConfigMatchesSplitRestart(
       !expected.checkpoint_step().present &&
       value.stop_after_checkpoint == StopAfterCheckpointV1::yes &&
       expected.stop_after_checkpoint() == StopAfterCheckpointV1::no &&
-      value.injection ==
-          (scalar ? scalar_writer_injection : canonical_off) &&
-      expected.injection() ==
-          (scalar ? canonical_off : delta.reader_injection) &&
+      value.injection == (smooth_transition
+          ? canonical_off
+          : (scalar ? scalar_writer_injection : canonical_off)) &&
+      expected.injection() == (smooth_transition
+          ? canonical_off
+          : (scalar ? canonical_off : delta.reader_injection)) &&
       value.restart_mode == expected.restart_mode() &&
       value.restart_trajectory == expected.restart_trajectory() &&
       value.rollback_obligation == expected.rollback_obligation() &&
       value.source_rank_rule == expected.source_rank_rule() &&
-      value.retry_limit ==
-          (scalar ? scalar_igr_sc25_v3_retry_limit : 0U) &&
-      expected.retry_limit() ==
-          (scalar ? 0U : smooth_periodic_euler_v1_retry_limit) &&
+      value.retry_limit == (smooth_transition
+          ? 0U : (scalar ? scalar_igr_sc25_v3_retry_limit : 0U)) &&
+      expected.retry_limit() == (smooth_transition
+          ? 0U : (scalar ? 0U : smooth_periodic_euler_v1_retry_limit)) &&
       value.seed == expected.seed() &&
       delta.schema == restart_delta_schema_v2 &&
       delta.count == restart_delta_field_count_v2 &&

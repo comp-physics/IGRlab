@@ -1,4 +1,6 @@
 #include "numerics/hdg/runtime/cpu/persistent_sc25_scalar_igr.hpp"
+
+#include "hdg_cpu_serial_lifecycle.hpp"
 #include "numerics/hdg/runtime/sha256.hpp"
 
 #include <HYPRE_krylov.h>
@@ -297,6 +299,55 @@ bool ExactField(const mfem::ParGridFunction* field,
 
 } // namespace
 
+namespace
+{
+enum class Rank1InitializationSelection : unsigned char
+{
+  ordinary,
+  exact_jump_v1,
+  smooth_transition_v2
+};
+
+struct Rank1InitializationRequest final
+{
+  const PersistentSc25ScalarIgrCpuFoundation* owner = nullptr;
+  Rank1InitializationSelection selection =
+      Rank1InitializationSelection::ordinary;
+};
+
+thread_local Rank1InitializationRequest next_rank1_initialization{};
+}
+
+namespace w8c_internal
+{
+
+[[gnu::visibility("hidden")]]
+void RequestW8cInitialization(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept
+{
+  next_rank1_initialization = {
+      &owner, Rank1InitializationSelection::exact_jump_v1};
+}
+
+[[gnu::visibility("hidden")]]
+void RequestSmoothTransitionInitialization(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept
+{
+  next_rank1_initialization = {
+      &owner, Rank1InitializationSelection::smooth_transition_v2};
+}
+
+Rank1InitializationSelection ConsumeInitializationRequest(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept
+{
+  const Rank1InitializationRequest request = std::exchange(
+      next_rank1_initialization, Rank1InitializationRequest{});
+  return request.owner == &owner ? request.selection
+                                 : Rank1InitializationSelection::ordinary;
+}
+
+} // namespace w8c_internal
+
 double VelocityGradientInvariant(
     const std::array<std::array<double, dimension>, dimension>& gradient)
     noexcept
@@ -317,6 +368,39 @@ InitialStatePoint SmoothInitialState(const double x, const double y) noexcept
   output.conservative = {{
       rho, rho * u, rho * v,
       1.0 / (gamma - 1.0) + 0.5 * rho * (u * u + v * v)}};
+  return output;
+}
+
+InitialStatePoint W8cInitialState(const double x) noexcept
+{
+  InitialStatePoint output;
+  output.conservative = x < 0.25 || x >= 0.75 ? w8c::right_state
+                                               : w8c::left_state;
+  return output;
+}
+
+InitialStatePoint W8cTraceInitialState(const double x) noexcept
+{
+  InitialStatePoint output;
+  constexpr double tolerance =
+      64.0 * std::numeric_limits<double>::epsilon();
+  output.conservative = std::abs(x - 0.25) <= tolerance ||
+          std::abs(x - 0.75) <= tolerance
+      ? w8c::interface_mean
+      : W8cInitialState(x).conservative;
+  return output;
+}
+
+InitialStatePoint SmoothTransitionInitialState(const double x) noexcept
+{
+  InitialStatePoint output;
+  const double kappa = std::atanh(0.8) /
+      std::sin(pi * w8c::SmoothTransitionV2Case::transition_width);
+  const double chi = 0.5 *
+      (1.0 - std::tanh(kappa * std::cos(2.0 * pi * x)));
+  const double rho = 0.125 + 0.875 * chi;
+  const double pressure = 0.1 + 0.9 * chi;
+  output.conservative = {{rho, 0.0, 0.0, pressure / (gamma - 1.0)}};
   return output;
 }
 
@@ -3204,6 +3288,11 @@ struct PersistentTrajectoryImplementation final
   TrajectoryStatus status = TrajectoryStatus::uninitialized;
   TrajectoryStatus first_failure = TrajectoryStatus::uninitialized;
   bool initialized = false;
+  bool w8c_initial_state = false;
+  Rank1InitializationSelection initialization_selection =
+      Rank1InitializationSelection::ordinary;
+  int required_steps = persistent_required_steps;
+  double time_step = persistent_dt;
   std::uint64_t matrix_generation = 0;
   bool reuse_baseline_frozen = false;
   std::optional<TrajectoryContract::PreparedCommitToken>
@@ -3248,7 +3337,8 @@ struct PersistentTrajectoryImplementation final
   bool AssembleTrueSystem(
       PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept;
   bool SolveTrueSystem(int& iterations, double& residual_norm,
-                       double& rhs_norm) noexcept;
+                       double& rhs_norm,
+                       bool admit_exact_homogeneous = false) noexcept;
   bool Recover(
                PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
                const CoupledFixtureAssembly& system,
@@ -3758,7 +3848,7 @@ TrajectoryAssemblyFailureCause PersistentTrajectoryImplementation::Assemble(
   if (!AssembleCoupledFixture(
           *owner.mesh, *owner.sigma_space, *owner.carrier_space,
           *owner.trace_collection, owner.topology, assembly_state,
-          coupled_fixture_quadrature_order, persistent_dt, false, output,
+          coupled_fixture_quadrature_order, time_step, false, output,
           quadrature_workspace, "persistent-assembly", diagnostic))
   {
     const TrajectoryAssemblyFailureCause cause = diagnostic.failure_cause;
@@ -3784,7 +3874,10 @@ bool PersistentTrajectoryImplementation::InitializePhysicalState(
   {
     constexpr int ns = persistent_scalar_volume_nodes;
     constexpr int nf = coupled_fixture_scalar_face_nodes;
-    constexpr int order = coupled_fixture_quadrature_order;
+    const int order = initialization_selection ==
+            Rank1InitializationSelection::smooth_transition_v2
+        ? coupled_fixture_repeat_quadrature_order
+        : coupled_fixture_quadrature_order;
     state = {};
     *owner.u = 0.0;
     for (int element = 0; element < persistent_elements; ++element)
@@ -3810,7 +3903,13 @@ bool PersistentTrajectoryImplementation::InitializePhysicalState(
         element_transformation->SetIntPoint(&ip);
         finite_element->CalcShape(ip, shape);
         element_transformation->Transform(ip, point);
-        const InitialStatePoint value = SmoothInitialState(point[0], point[1]);
+        const InitialStatePoint value = initialization_selection ==
+                Rank1InitializationSelection::exact_jump_v1
+            ? W8cInitialState(point[0])
+            : initialization_selection ==
+                  Rank1InitializationSelection::smooth_transition_v2
+            ? SmoothTransitionInitialState(point[0])
+            : SmoothInitialState(point[0], point[1]);
         const double weight = ip.weight * element_transformation->Weight();
         for (int row = 0; row < ns; ++row)
         {
@@ -3887,7 +3986,13 @@ bool PersistentTrajectoryImplementation::InitializePhysicalState(
         face_transformation->SetIntPoint(&ip);
         finite_element->CalcShape(ip, shape);
         face_transformation->Transform(ip, point);
-        const InitialStatePoint value = SmoothInitialState(point[0], point[1]);
+        const InitialStatePoint value = initialization_selection ==
+                Rank1InitializationSelection::exact_jump_v1
+            ? W8cTraceInitialState(point[0])
+            : initialization_selection ==
+                  Rank1InitializationSelection::smooth_transition_v2
+            ? SmoothTransitionInitialState(point[0])
+            : SmoothInitialState(point[0], point[1]);
         const double weight = ip.weight * face_transformation->Weight();
         for (int row = 0; row < nf; ++row)
         {
@@ -4082,6 +4187,33 @@ bool PersistentTrajectoryImplementation::InitializeAuxiliary(
 {
   try
   {
+    if (initialization_selection ==
+        Rank1InitializationSelection::exact_jump_v1)
+    {
+      state.interior.sigma.fill(0.0);
+      state.interior.z.fill(0.0);
+      state.trace.sigmahat.fill(0.0);
+      AuxiliaryResidualMetrics residual;
+      if (!AuxiliaryResidualGate(owner, state, residual) ||
+          residual.normalized_maximum > 1.0e-10)
+      {
+        return false;
+      }
+      evidence.initialization = {
+          coupled_fixture_quadrature_order,
+          persistent_trace_restart_dimension,
+          persistent_trace_maximum_iterations,
+          1.0e-12,
+          1.0e-14,
+          0,
+          0,
+          1,
+          0,
+          0.0,
+          0.0,
+          residual};
+      return true;
+    }
     constexpr int full_ni = coupled_fixture_local_interior_unknowns;
     constexpr int full_nt = coupled_fixture_local_trace_unknowns;
     constexpr int aux_ni = 12;
@@ -4201,7 +4333,9 @@ bool PersistentTrajectoryImplementation::InitializeAuxiliary(
     if (!Condense(assembly, maximum_local_residual) ||
         !AssembleTrueSystem(owner) ||
         !SolveTrueSystem(trace_iterations, trace_residual_norm,
-                         trace_rhs_norm) ||
+                         trace_rhs_norm,
+                         initialization_selection ==
+                             Rank1InitializationSelection::smooth_transition_v2) ||
         !Recover(owner, assembly, direction, maximum_local_residual))
     {
       return false;
@@ -4213,6 +4347,26 @@ bool PersistentTrajectoryImplementation::InitializeAuxiliary(
       return false;
     }
     state = solved;
+    if (initialization_selection ==
+        Rank1InitializationSelection::smooth_transition_v2)
+    {
+      const auto zero = [](const auto& values)
+      {
+        return std::all_of(values.begin(), values.end(),
+                           [](const double value) { return value == 0.0; });
+      };
+      if (!zero(state.interior.sigma) || !zero(state.interior.z) ||
+          !zero(state.trace.sigmahat))
+      {
+        return false;
+      }
+      // The full solve may express an exact homogeneous result as signed
+      // zero. Canonicalize only after proving every solved auxiliary
+      // coefficient is exactly zero so publication is stable and positive.
+      state.interior.sigma.fill(0.0);
+      state.interior.z.fill(0.0);
+      state.trace.sigmahat.fill(0.0);
+    }
     AuxiliaryResidualMetrics residual;
     if (!AuxiliaryResidualGate(owner, state, residual) ||
         residual.normalized_maximum > 1.0e-10)
@@ -4386,7 +4540,8 @@ bool PersistentTrajectoryImplementation::AssembleTrueSystem(
 }
 
 bool PersistentTrajectoryImplementation::SolveTrueSystem(
-    int& iterations, double& residual_norm, double& rhs_norm) noexcept
+    int& iterations, double& residual_norm, double& rhs_norm,
+    const bool admit_exact_homogeneous) noexcept
 {
   iterations = -1;
   residual_norm = std::numeric_limits<double>::infinity();
@@ -4418,8 +4573,11 @@ bool PersistentTrajectoryImplementation::SolveTrueSystem(
     true_residual -= *true_rhs;
     residual_norm = true_residual.Norml2();
     rhs_norm = true_rhs->Norml2();
+    const bool converged_or_exact_homogeneous = converged == 1 ||
+        (admit_exact_homogeneous && iterations == 0 && rhs_norm == 0.0 &&
+         residual_norm == 0.0);
     return setup_status == 0 && solve_status == 0 && query_status == 0 &&
-        converged == 1 && iterations >= 0 &&
+        converged_or_exact_homogeneous && iterations >= 0 &&
         iterations <= persistent_trace_maximum_iterations &&
         Finite(residual_norm) && Finite(rhs_norm) &&
         residual_norm <= 1.0e-14 + 1.0e-12 * rhs_norm;
@@ -5000,11 +5158,11 @@ TrajectoryStatus PersistentTrajectoryImplementation::ExecuteAttempt(
   attempt.retry_index = begin.attempt.retry_index;
   attempt.dt = begin.attempt.dt;
   attempt.committed_coordinates = {
-      begin.attempt.committed_step * persistent_dt,
+      begin.attempt.committed_step * time_step,
       begin.attempt.committed_step,
       begin.attempt.committed_generation,
       begin.attempt.committed_step,
-      begin.attempt.committed_step == 0 ? 0.0 : persistent_dt};
+      begin.attempt.committed_step == 0 ? 0.0 : time_step};
   attempt.entry_reuse = ReuseSnapshot(owner);
   if (!begin.started || !contract)
   {
@@ -5359,7 +5517,8 @@ TrajectoryStatus PersistentTrajectoryImplementation::Advance(
 {
   if (!initialized || !contract ||
       evidence.attempt_count >= static_cast<int>(evidence.attempts.size()) ||
-      contract->coordinates().step >= persistent_required_steps ||
+      contract->coordinates().step >=
+          static_cast<std::uint64_t>(required_steps) ||
       (injection != TrajectoryFailureInjection::none &&
        contract->coordinates().step + 1 != 7))
   {
@@ -5386,7 +5545,7 @@ TrajectoryStatus PersistentTrajectoryImplementation::Advance(
   }
 
   const BeginOutcome begin =
-      contract->BeginStep({InteriorSpace::l2, persistent_dt});
+      contract->BeginStep({InteriorSpace::l2, time_step});
   const int first_attempt_index = evidence.attempt_count++;
   TrajectoryStatus result = ExecuteAttempt(
       owner, begin, injection,
@@ -5435,11 +5594,11 @@ TrajectoryStatus PersistentTrajectoryImplementation::Advance(
   }
   const StateCoordinates coordinates = contract->coordinates();
   if (coordinates.step == 0 ||
-      coordinates.step > persistent_required_steps ||
+      coordinates.step > static_cast<std::uint64_t>(required_steps) ||
       coordinates.generation != coordinates.step ||
       coordinates.cursor != coordinates.step ||
       detail::DoubleBits(coordinates.dt) !=
-          detail::DoubleBits(persistent_dt))
+          detail::DoubleBits(time_step))
   {
     status = TrajectoryStatus::HdgSc25PublicationFailure;
     RememberFailure(status);
@@ -5503,9 +5662,10 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
   if (!trajectory.contract || trajectory.active_transaction_serial != 0 ||
       trajectory.transaction_prepared || trajectory.transaction_provisional ||
       trajectory.next_transaction_serial == 0 ||
-      trajectory.evidence.attempt_count >=
-          static_cast<int>(trajectory.evidence.attempts.size()) ||
-      trajectory.contract->coordinates().step >= persistent_required_steps)
+      (!trajectory.w8c_initial_state && trajectory.evidence.attempt_count >=
+          static_cast<int>(trajectory.evidence.attempts.size())) ||
+      trajectory.contract->coordinates().step >=
+          static_cast<std::uint64_t>(trajectory.required_steps))
   {
     return TrajectoryStatus::invalid_configuration;
   }
@@ -5526,8 +5686,12 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
   const BeginOutcome begin = trajectory.contract->status() ==
           RunStatus::retry_available
       ? trajectory.contract->Retry()
-      : trajectory.contract->BeginStep({InteriorSpace::l2, persistent_dt});
-  const int first_attempt_index = trajectory.evidence.attempt_count++;
+      : trajectory.contract->BeginStep(
+            {InteriorSpace::l2, trajectory.time_step});
+  const int first_attempt_index = trajectory.evidence.attempt_count <
+          static_cast<int>(trajectory.evidence.attempts.size())
+      ? trajectory.evidence.attempt_count++
+      : static_cast<int>(trajectory.evidence.attempts.size()) - 1;
   TrajectoryStatus result = trajectory.ExecuteAttempt(
       *implementation_, begin, injection,
       trajectory.evidence.attempts[
@@ -5537,9 +5701,16 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
   if (!IsAccepted(result))
   {
     trajectory.RememberFailure(result);
+    if (trajectory.w8c_initial_state)
+    {
+      trajectory.status = result;
+      trajectory.RefreshEvidence();
+      return result;
+    }
     if (trajectory.contract->status() != RunStatus::retry_available ||
-        trajectory.evidence.attempt_count >=
-            static_cast<int>(trajectory.evidence.attempts.size()))
+        (!trajectory.w8c_initial_state &&
+         trajectory.evidence.attempt_count >=
+            static_cast<int>(trajectory.evidence.attempts.size())))
     {
       trajectory.status = TrajectoryStatus::HdgSc25RetryExhausted;
       trajectory.RememberFailure(trajectory.status);
@@ -5547,7 +5718,10 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
       return trajectory.status;
     }
     const BeginOutcome retry = trajectory.contract->Retry();
-    accepted_attempt_index = trajectory.evidence.attempt_count++;
+    accepted_attempt_index = trajectory.evidence.attempt_count <
+            static_cast<int>(trajectory.evidence.attempts.size())
+        ? trajectory.evidence.attempt_count++
+        : static_cast<int>(trajectory.evidence.attempts.size()) - 1;
     ++trajectory.evidence.retry_attempts;
     result = trajectory.ExecuteAttempt(
         *implementation_, retry, TrajectoryFailureInjection::none,
@@ -5573,19 +5747,25 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
   if (!trajectory.transaction_prepared ||
       !trajectory.Integrals(*implementation_, accepted, accepted_integrals) ||
       coordinates.step == 0 ||
-      coordinates.step > persistent_required_steps ||
+      coordinates.step >
+          static_cast<std::uint64_t>(trajectory.required_steps) ||
       coordinates.generation != coordinates.step ||
       coordinates.cursor != coordinates.step ||
       detail::DoubleBits(coordinates.dt) !=
-          detail::DoubleBits(persistent_dt) ||
+          detail::DoubleBits(trajectory.time_step) ||
       trajectory.evidence.step_evidence_count < 0 ||
-      trajectory.evidence.step_evidence_count >=
-          static_cast<int>(trajectory.evidence.steps.size()))
+      (!trajectory.w8c_initial_state &&
+       trajectory.evidence.step_evidence_count >=
+          static_cast<int>(trajectory.evidence.steps.size())))
   {
     return TrajectoryStatus::HdgSc25PublicationFailure;
   }
+  const int step_evidence_index = trajectory.evidence.step_evidence_count <
+          static_cast<int>(trajectory.evidence.steps.size())
+      ? trajectory.evidence.step_evidence_count++
+      : static_cast<int>(trajectory.evidence.steps.size()) - 1;
   TrajectoryStepEvidence& step = trajectory.evidence.steps[
-      static_cast<std::size_t>(trajectory.evidence.step_evidence_count)];
+      static_cast<std::size_t>(step_evidence_index)];
   step.accepted = true;
   step.step = static_cast<int>(coordinates.step);
   step.time = coordinates.time;
@@ -5598,7 +5778,6 @@ PersistentSc25ScalarIgrCpuFoundation::PreparePersistentTrajectoryTransaction(
   step.accepted_hashes = HashState(accepted);
   step.reuse = trajectory.ReuseSnapshot(*implementation_);
   trajectory.evidence.accepted_steps = static_cast<int>(coordinates.step);
-  ++trajectory.evidence.step_evidence_count;
   trajectory.status = result;
   trajectory.evidence.status = result;
   trajectory.evidence.first_failure = trajectory.first_failure;
@@ -9869,6 +10048,12 @@ TrajectoryStatus
 PersistentSc25ScalarIgrCpuFoundation::InitializePersistentTrajectory()
     noexcept
 {
+  // Consuming at the first statement clears the typed, owner-bound request on
+  // every exit, including invalid-configuration and initialization failures.
+  const Rank1InitializationSelection initialization_selection =
+      w8c_internal::ConsumeInitializationRequest(*this);
+  const bool w8c_mode = initialization_selection !=
+      Rank1InitializationSelection::ordinary;
   if (!implementation_ || implementation_->status != FoundationStatus::ready ||
       implementation_->rank != 0 || implementation_->ranks != 1 ||
       implementation_->config.polynomial_degree != 1 ||
@@ -9885,6 +10070,13 @@ PersistentSc25ScalarIgrCpuFoundation::InitializePersistentTrajectory()
   try
   {
     auto trajectory = std::make_unique<PersistentTrajectoryImplementation>();
+    trajectory->w8c_initial_state = w8c_mode;
+    trajectory->initialization_selection = initialization_selection;
+    trajectory->required_steps = w8c_mode
+        ? static_cast<int>(w8c::ExactJumpV1Case::accepted_steps)
+        : persistent_required_steps;
+    trajectory->time_step = w8c_mode ? w8c::ExactJumpV1Case::dt
+                                     : persistent_dt;
     if (!trajectory->InitializeStorage(*implementation_))
     {
       return TrajectoryStatus::initialization_failure;
@@ -10049,12 +10241,15 @@ bool PersistentSc25ScalarIgrCpuFoundation::ImportTrajectoryCheckpoint(
   if (!implementation_ || implementation_->ranks != 1 ||
       !implementation_->trajectory ||
       !implementation_->trajectory->contract || coordinates.step == 0 ||
-      coordinates.step > persistent_required_steps ||
+      coordinates.step > static_cast<std::uint64_t>(
+          implementation_->trajectory->required_steps) ||
       coordinates.step != coordinates.generation ||
       coordinates.step != coordinates.cursor ||
       detail::DoubleBits(coordinates.time) !=
-          detail::DoubleBits(coordinates.step * persistent_dt) ||
-      detail::DoubleBits(coordinates.dt) != detail::DoubleBits(persistent_dt) ||
+          detail::DoubleBits(
+              coordinates.step * implementation_->trajectory->time_step) ||
+      detail::DoubleBits(coordinates.dt) != detail::DoubleBits(
+          implementation_->trajectory->time_step) ||
       !Finite(state.u) || !Finite(state.sigma) || !Finite(state.z) ||
       !Finite(state.uhat) || !Finite(state.sigmahat))
   {
@@ -10085,7 +10280,7 @@ bool PersistentSc25ScalarIgrCpuFoundation::ImportTrajectoryCheckpoint(
   candidate.descriptor.layout = resources.layout;
   candidate.descriptor.precision = StableIdentity::Copy("Fp64");
   candidate.descriptor.cursor = coordinates.cursor;
-  candidate.descriptor.dt = persistent_dt;
+  candidate.descriptor.dt = implementation_->trajectory->time_step;
   candidate.descriptor.coordinates = coordinates;
   candidate.descriptor.coordinate_fingerprint =
       detail::CoordinateFingerprint(coordinates);
@@ -10157,17 +10352,17 @@ PersistentSc25ScalarIgrCpuFoundation::RestoreTrajectoryCheckpoint(
       checkpoint.descriptor.cursor !=
           checkpoint.descriptor.coordinates.cursor ||
       detail::DoubleBits(checkpoint.descriptor.dt) !=
-          detail::DoubleBits(persistent_dt) ||
+          detail::DoubleBits(trajectory.time_step) ||
       checkpoint.descriptor.coordinates.step == 0 ||
       checkpoint.descriptor.coordinates.step !=
           checkpoint.descriptor.coordinates.generation ||
       checkpoint.descriptor.coordinates.step !=
           checkpoint.descriptor.coordinates.cursor ||
       detail::DoubleBits(checkpoint.descriptor.coordinates.dt) !=
-          detail::DoubleBits(persistent_dt) ||
+          detail::DoubleBits(trajectory.time_step) ||
       detail::DoubleBits(checkpoint.descriptor.coordinates.time) !=
           detail::DoubleBits(checkpoint.descriptor.coordinates.step *
-                             persistent_dt) ||
+                             trajectory.time_step) ||
       checkpoint.descriptor.coordinate_fingerprint !=
           detail::CoordinateFingerprint(checkpoint.descriptor.coordinates) ||
       !resources.reuse.persistent_topology ||
