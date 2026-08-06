@@ -1,5 +1,33 @@
 # Collect all source files (including module subdirectories)
+set(DG_IGR_MFEM_SOURCE_ROOT
+    "${CMAKE_SOURCE_DIR}/tpl/mfem"
+    CACHE PATH
+    "Exact MFEM source checkout supplying source-internal headers.")
+foreach(_dg_igr_mfem_source_header IN ITEMS
+        fem/picojson.h
+        general/tinyxml2.h)
+    if(NOT EXISTS
+       "${DG_IGR_MFEM_SOURCE_ROOT}/${_dg_igr_mfem_source_header}" OR
+       IS_DIRECTORY
+       "${DG_IGR_MFEM_SOURCE_ROOT}/${_dg_igr_mfem_source_header}")
+        message(FATAL_ERROR
+                "Required MFEM source header is missing: "
+                "${DG_IGR_MFEM_SOURCE_ROOT}/${_dg_igr_mfem_source_header}")
+    endif()
+endforeach()
+
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "*.cpp")
+
+# W8 runtime and auxiliary sources are owned by strict named component targets.
+# Exclude their complete C++ roots unconditionally so neither default-OFF nor
+# feature-ON configurations can double-compile them through igr_mfem's glob.
+file(GLOB_RECURSE _dg_igr_hdg_named_component_cpp CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/runtime/*.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/auxiliary/*.cpp")
+if(_dg_igr_hdg_named_component_cpp)
+    list(REMOVE_ITEM SOURCES ${_dg_igr_hdg_named_component_cpp})
+endif()
+
 if(NOT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT)
     list(REMOVE_ITEM SOURCES
          "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler_mpi.cpp")
@@ -96,8 +124,8 @@ target_include_directories(igr_mfem PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
 target_include_directories(igr_mfem PRIVATE
-    ${CMAKE_SOURCE_DIR}/tpl/mfem/fem
-    ${CMAKE_SOURCE_DIR}/tpl/mfem/general
+    ${DG_IGR_MFEM_SOURCE_ROOT}/fem
+    ${DG_IGR_MFEM_SOURCE_ROOT}/general
 )
 target_compile_definitions(igr_mfem PUBLIC
     DG_IGR_ENABLE_OBSERVABILITY=$<BOOL:${DG_IGR_ENABLE_OBSERVABILITY}>
@@ -170,4 +198,9 @@ if(DG_IGR_ACCELERATOR_KERNEL_SOURCES)
     message(STATUS
             "DG_IGR accelerator kernel sources (${DG_IGR_ACCELERATOR_LANGUAGE}): "
             "${_dg_igr_accel_sources_abs}")
+endif()
+
+if(DG_IGR_ENABLE_HDG_RUNTIME OR
+   DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
+    add_subdirectory(numerics/hdg/runtime)
 endif()

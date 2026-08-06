@@ -44,14 +44,246 @@ assert_adjacent_args() {
   fail "helper arguments do not contain adjacent '${first} ${second}'"
 }
 
+assert_reuse_transaction_order() {
+  local path="$1"
+  local install_line revalidate_line view_line
+  install_line="$(grep -nFx '  spack -e "${SPACK_ENV}" install' \
+    "${path}" | cut -d: -f1 || true)"
+  revalidate_line="$(grep -nFx \
+    '    revalidate_reused_mfem_after_dependencies' \
+    "${path}" | cut -d: -f1 || true)"
+  view_line="$(grep -nFx 'SPACK_VIEW="${SPACK_ENV}/.spack-env/view"' \
+    "${path}" | cut -d: -f1 || true)"
+  [[ "${install_line}" =~ ^[0-9]+$ &&
+     "${revalidate_line}" =~ ^[0-9]+$ &&
+     "${view_line}" =~ ^[0-9]+$ &&
+     ${install_line} -lt ${revalidate_line} &&
+     ${revalidate_line} -lt ${view_line} ]] || {
+    fail "reuse revalidation must occur once after dependency install and before SPACK_VIEW"
+  }
+}
+
+assert_reviewed_admission_route() {
+  local driver="$1"
+  local route="$2"
+  local record_reference="$3"
+  local sha_reference="$4"
+  local route_case
+
+  route_case="$(awk -v route="${route}" '
+    $0 == "    " route ")" { capture = 1 }
+    capture { print }
+    capture && $0 == "      ;;" { exit }
+  ' "${driver}")"
+  [[ -n "${route_case}" ]] || {
+    fail "build driver does not define reviewed admission route ${route}"
+  }
+  assert_contains "${route_case}" "${record_reference}"
+  assert_contains "${route_case}" "${sha_reference}"
+}
+
+assert_reviewed_admission_record() {
+  local record="$1"
+  local expected_sha="$2"
+  local route_mode="$3"
+  local route_profile="$4"
+  local anchor_key="$5"
+  local anchor_sha="$6"
+  local label="$7"
+  local record_sha altered_record altered_sha
+
+  [[ -f "${record}" && ! -L "${record}" ]] || {
+    fail "${label} reviewed MFEM admission record is missing or symlinked: ${record}"
+  }
+  record_sha="$(sha256sum "${record}" | cut -d' ' -f1)"
+  [[ "${record_sha}" == "${expected_sha}" ]] || {
+    fail "${label} reviewed MFEM admission record hash mismatch: ${record_sha}"
+  }
+  grep -Fq "\"mode\": \"${route_mode}\"" "${record}" || {
+    fail "${label} reviewed MFEM admission mode is not ${route_mode}"
+  }
+  grep -Fq "\"profile\": \"${route_profile}\"" "${record}" || {
+    fail "${label} reviewed MFEM admission profile is not ${route_profile}"
+  }
+  grep -Fq \
+    '"claim": "current tuple observed, independently reviewed, prospectively admitted for reuse; raw W8A ledgers are corroboration, not retroactive immutable proof"' \
+    "${record}" || fail "${label} reviewed MFEM admission claim changed"
+  grep -Fq "\"${anchor_key}\": \"${anchor_sha}\"" "${record}" || {
+    fail "${label} reviewed MFEM admission lost its DEV-3 anchor"
+  }
+
+  altered_record="${tmp_root}/altered-${label}-reviewed-mfem-admission.json"
+  sed 's/"version": "1"/"version": "0"/' \
+    "${record}" >"${altered_record}"
+  altered_sha="$(sha256sum "${altered_record}" | cut -d' ' -f1)"
+  [[ "${altered_sha}" != "${record_sha}" ]] || {
+    fail "${label} reviewed MFEM admission mismatch fixture retained the admitted hash"
+  }
+}
+
+assert_reuse_identity_policy() {
+  local driver="$1"
+  local cpu_record="$2"
+  local gpu_record="$3"
+  local expected
+  local cpu_sha gpu_sha
+
+  cpu_sha="d4e0f68d795d30ecb3e403f797ecf4ccd4ec8ed79ba5746a997f68bd6eae98ec"
+  gpu_sha="00559ec1cdd0ad5728a0ff92a165fdbf7d757da6f9c672153d8a665cc9e489a9"
+
+  for expected in \
+      'cmake_install.cmake' \
+      'CMakeFiles/cmake.check_cache' \
+      'MFEMTargets.cmake' \
+      'MFEMTargets-${targets_config_suffix}.cmake' \
+      'CMakeCXXCompiler.cmake' \
+      'require_exact_mfem_directory' \
+      'require_exact_mfem_file' \
+      'write_local_mfem_identity_stamp' \
+      'verify_reviewed_mfem_admission' \
+      'mfem_reviewed_admission_record_matches' \
+      'MFEM_REUSE_POST_MANIFEST_SHA256' \
+      'MFEM_REUSE_PRE_MANIFEST_SHA256' \
+      'MFEM_REUSE_POST_LOCK_SHA256' \
+      'MFEM_REUSE_PRE_LOCK_SHA256' \
+      'export DG_IGR_TEST_REUSE_PROFILE="${PROFILE}"' \
+      'export DG_IGR_TEST_REUSE_CALIPER="${CALIPER}"' \
+      'export DG_IGR_TEST_REUSE_CUDA_ARCH="${DEPENDENCY_CUDA_ARCH}"'; do
+    grep -Fq "${expected}" "${driver}" || {
+      fail "reuse identity policy is missing '${expected}'"
+    }
+  done
+  if grep -Fq 'make_reuse_fixture' "${driver}" ||
+     grep -Fq 'DG_IGR_REUSE_FIXTURE_CACHE' "${driver}" ||
+     grep -Fq 'cp "${source_build}/CMakeCache.txt"' "${driver}"; then
+    fail "reuse fixtures still reconstruct an accepted MFEM tuple"
+  fi
+
+  grep -Fq \
+    'MFEM_CPU_REVIEWED_ADMISSION_RECORD="${SCRIPT_DIR}/cmake/mfem-reuse-identities/cpu-w8a-d9d6526-973e5abc.json"' \
+    "${driver}" || fail "build driver does not pin the CPU admission record"
+  grep -Fq \
+    "MFEM_CPU_REVIEWED_ADMISSION_SHA256=\"${cpu_sha}\"" \
+    "${driver}" || fail "build driver does not pin the CPU admission hash"
+  grep -Fq \
+    'MFEM_GPU_SM120_REVIEWED_ADMISSION_RECORD="${SCRIPT_DIR}/cmake/mfem-reuse-identities/gpu-w8a-d9d6526-345d64a2.json"' \
+    "${driver}" || fail "build driver does not pin the GPU admission record"
+  grep -Fq \
+    "MFEM_GPU_SM120_REVIEWED_ADMISSION_SHA256=\"${gpu_sha}\"" \
+    "${driver}" || fail "build driver does not pin the GPU admission hash"
+  [[ "${cpu_sha}" != "${gpu_sha}" ]] || {
+    fail "CPU and GPU reviewed MFEM admissions share one hash"
+  }
+
+  assert_reviewed_admission_route "${driver}" cpu:cpu \
+    '${MFEM_CPU_REVIEWED_ADMISSION_RECORD}' \
+    '${MFEM_CPU_REVIEWED_ADMISSION_SHA256}'
+  assert_reviewed_admission_route "${driver}" gpu:cuda-sm120 \
+    '${MFEM_GPU_SM120_REVIEWED_ADMISSION_RECORD}' \
+    '${MFEM_GPU_SM120_REVIEWED_ADMISSION_SHA256}'
+  grep -Fq 'assert_reviewed_admission_route_rejected gpu cpu' \
+    "${driver}" || fail "reviewed admission routes lost the gpu/cpu negative anchor"
+  grep -Fq 'assert_reviewed_admission_route_rejected cpu cuda-sm120' \
+    "${driver}" || fail "reviewed admission routes lost the cpu/gpu negative anchor"
+  grep -Fq 'assert_reviewed_admission_route_rejected gpu cuda-sm90' \
+    "${driver}" || fail "reviewed admission routes lost the unsupported-profile anchor"
+
+  assert_reviewed_admission_record "${cpu_record}" \
+    "${cpu_sha}" cpu cpu sealed_dev3_cpu_manifest_sha256 \
+    008605ffe7d0192689a6dcdcebfcee7fcac4ead307ff6c6403ee36731ce2d59d cpu
+  assert_reviewed_admission_record "${gpu_record}" \
+    "${gpu_sha}" gpu cuda-sm120 sealed_dev3_gpu_manifest_sha256 \
+    ccb280318581f926b2bb65d98581868a29075ae4ba4f1ddf15eb24cf8939c059 gpu-sm120
+}
+
 [[ -f "${BUILD_DRIVER}" ]] || fail "missing build driver: ${BUILD_DRIVER}"
 [[ -f "${MFEM_DRIVER}" ]] || fail "missing MFEM driver: ${MFEM_DRIVER}"
+
+if [[ -n "${DG_IGR_TEST_REUSE_MFEM_ROOT:-}" ]]; then
+  mfem_source="${DG_IGR_TEST_REUSE_MFEM_ROOT}"
+else
+  mfem_source="${REPO_ROOT}/tpl/mfem"
+fi
+[[ -e "${mfem_source}/.git" ]] || {
+  fail "MFEM source is not initialized: ${mfem_source}"
+}
+mfem_source="$(realpath -e -- "${mfem_source}")"
+mfem_source_top="$(git -C "${mfem_source}" rev-parse --show-toplevel)"
+mfem_source_top="$(realpath -e -- "${mfem_source_top}")"
+[[ "${mfem_source_top}" == "${mfem_source}" ]] || {
+  fail "MFEM source is not the checkout top level: ${mfem_source}"
+}
+real_mfem_gitlink="$(git -C "${REPO_ROOT}" rev-parse HEAD:tpl/mfem)"
+real_mfem_head="$(git -C "${mfem_source}" rev-parse HEAD)"
+[[ "${real_mfem_head}" == "${real_mfem_gitlink}" ]] || {
+  fail "MFEM source/gitlink mismatch: source=${real_mfem_head} gitlink=${real_mfem_gitlink}"
+}
+real_mfem_status="$(GIT_OPTIONAL_LOCKS=0 git -C "${mfem_source}" \
+  status --porcelain=v1 --untracked-files=no)"
+[[ -z "${real_mfem_status}" ]] || {
+  fail "MFEM source has tracked changes: ${real_mfem_status}"
+}
 
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/dg_igr_cuda_policy.XXXXXX")"
 cleanup() {
   rm -rf -- "${tmp_root}"
 }
 trap cleanup EXIT
+
+fixture_root="${tmp_root}/fixture"
+fixture_mfem="${fixture_root}/tpl/mfem"
+fake_bin="${tmp_root}/fake-bin"
+mkdir -p "${fixture_root}/spack-envs/cuda-sm120/.spack-env/view" \
+         "${fixture_root}/tpl" "${fake_bin}"
+git -c advice.detachedHead=false clone --quiet --shared --no-checkout \
+  "${mfem_source}" "${fixture_mfem}"
+git -c advice.detachedHead=false -C "${fixture_mfem}" checkout --quiet \
+  --detach "${real_mfem_gitlink}"
+git -C "${fixture_root}" init --quiet
+git -C "${fixture_root}" -c advice.addEmbeddedRepo=false add -- tpl/mfem
+git -C "${fixture_root}" \
+  -c user.name=dg-igr-fixture \
+  -c user.email=dg-igr-fixture@example.invalid \
+  -c commit.gpgSign=false \
+  -c core.hooksPath=/dev/null \
+  commit --quiet -m "fixture: record exact MFEM gitlink"
+
+fixture_mfem_gitlink="$(git -C "${fixture_root}" rev-parse HEAD:tpl/mfem)"
+fixture_mfem_head="$(git -C "${fixture_mfem}" rev-parse HEAD)"
+fixture_mfem_status="$(GIT_OPTIONAL_LOCKS=0 git -C "${fixture_mfem}" \
+  status --porcelain=v1 --untracked-files=no)"
+fixture_mfem_entry="$(git -C "${fixture_root}" ls-tree HEAD -- tpl/mfem)"
+[[ "${fixture_mfem_gitlink}" == "${real_mfem_gitlink}" ]] || {
+  fail "fixture gitlink mismatch: fixture=${fixture_mfem_gitlink} real=${real_mfem_gitlink}"
+}
+[[ "${fixture_mfem_head}" == "${real_mfem_gitlink}" ]] || {
+  fail "fixture MFEM HEAD mismatch: fixture=${fixture_mfem_head} real=${real_mfem_gitlink}"
+}
+[[ -z "${fixture_mfem_status}" ]] || {
+  fail "fixture MFEM source has tracked changes: ${fixture_mfem_status}"
+}
+[[ "${fixture_mfem_entry}" == \
+   "160000 commit ${real_mfem_gitlink}"$'\t'"tpl/mfem" ]] || {
+  fail "fixture tpl/mfem is not the exact gitlink: ${fixture_mfem_entry}"
+}
+
+cp "${BUILD_DRIVER}" "${fixture_root}/build.sh"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '{' \
+  '  printf "MFEM_SRC=%s\\n" "${MFEM_SRC:?}"' \
+  '  printf "MFEM_BUILD=%s\\n" "${MFEM_BUILD:?}"' \
+  '  printf "MFEM_INSTALL=%s\\n" "${MFEM_INSTALL:?}"' \
+  '  printf "%s\\n" "$@"' \
+  '} >"${FAKE_HELPER_LOG:?}"' \
+  'exit 77' >"${fixture_root}/build_mfem_tpl.sh"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'printf "spack-called\\n" >>"${FAKE_SPACK_LOG:?}"' \
+  'exit 78' >"${fake_bin}/spack"
+chmod +x "${fixture_root}/build_mfem_tpl.sh" "${fake_bin}/spack"
 
 clean_env=(
   env
@@ -62,9 +294,11 @@ clean_env=(
   -u DG_IGR_SPACK_ENV
 )
 
-# The canonical sm120 plan keeps the dependency profile and project sources
-# native while compiling only MFEM through compatibility PTX.
-plan="$("${clean_env[@]}" bash "${BUILD_DRIVER}" \
+# The synthetic exact-source composition exercises normal-mode source
+# validation even when the application worktree's submodule is uninitialized.
+# The canonical sm120 plan keeps dependencies and project sources native while
+# compiling only MFEM through compatibility PTX.
+plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
   --gpu --cuda-arch 120 -j 16 --print-plan)"
 assert_contains "${plan}" "profile=cuda-sm120"
 assert_contains "${plan}" "dependency_cuda_arch=120"
@@ -73,36 +307,34 @@ assert_contains "${plan}" "app_cuda_archs=120"
 assert_contains "${plan}" "app_jobs=16"
 assert_contains "${plan}" "mfem_jobs=16"
 
-plan="$("${clean_env[@]}" bash "${BUILD_DRIVER}" \
+plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
   --gpu --cuda-arch 120 -j 16 --mfem-jobs 7 --print-plan)"
 assert_contains "${plan}" "app_jobs=16"
 assert_contains "${plan}" "mfem_jobs=7"
 
 # CUDA-specific variables remain inert on the CPU path.
 plan="$(CUDA_ARCHS=120 MFEM_CUDA_ARCHS=120 APP_CUDA_ARCHS=80-virtual \
-  bash "${BUILD_DRIVER}" --cpu-only -j 9 --print-plan)"
+  bash "${fixture_root}/build.sh" --cpu-only -j 9 --print-plan)"
 assert_contains "${plan}" "mode=cpu profile=cpu dependency_cuda_arch=none"
 assert_contains "${plan}" "mfem_cuda_archs=none app_cuda_archs=none"
 assert_contains "${plan}" "app_jobs=9 mfem_jobs=9"
 
-fixture_root="${tmp_root}/fixture"
-fake_bin="${tmp_root}/fake-bin"
-mkdir -p "${fixture_root}/spack-envs/cuda-sm120/.spack-env/view" "${fake_bin}"
-cp "${BUILD_DRIVER}" "${fixture_root}/build.sh"
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  'printf "%s\\n" "$@" >"${FAKE_HELPER_LOG:?}"' \
-  'exit 77' >"${fixture_root}/build_mfem_tpl.sh"
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  'printf "spack-called\\n" >>"${FAKE_SPACK_LOG:?}"' \
-  'exit 78' >"${fake_bin}/spack"
-chmod +x "${fixture_root}/build_mfem_tpl.sh" "${fake_bin}/spack"
-
 # Unsafe architecture selections must fail before dependency, helper, or cache
 # actions even without --print-plan.
+set +e
+reject_output="$(PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/empty-reuse-helper.log" \
+  FAKE_SPACK_LOG="${tmp_root}/empty-reuse-spack.log" \
+  bash "${fixture_root}/build.sh" --reuse-mfem-root '' \
+    --no-deps --no-tests --print-plan 2>&1)"
+reject_rc=$?
+set -e
+[[ ${reject_rc} -eq 2 ]] || fail "empty reuse root exited ${reject_rc}, expected 2"
+assert_contains "${reject_output}" \
+  "--reuse-mfem-root requires a non-empty value"
+assert_not_exists "${tmp_root}/empty-reuse-helper.log"
+assert_not_exists "${tmp_root}/empty-reuse-spack.log"
+
 set +e
 reject_output="$(env -u CUDA_ARCHS -u APP_CUDA_ARCHS -u SPACK_CUDA_ARCH \
   PATH="${fake_bin}:/usr/bin:/bin" \
@@ -202,10 +434,33 @@ env -u CUDA_ARCHS -u MFEM_CUDA_ARCHS -u APP_CUDA_ARCHS -u SPACK_CUDA_ARCH \
 forward_rc=$?
 set -e
 [[ ${forward_rc} -eq 77 ]] || fail "fake-helper forwarding exited ${forward_rc}, expected 77"
+forwarded_log="$(<"${tmp_root}/forwarded-args.log")"
+assert_contains "${forwarded_log}" "MFEM_SRC=${fixture_mfem}"
+assert_contains "${forwarded_log}" \
+  "MFEM_BUILD=${fixture_mfem}/build-gpu-sm120"
+assert_contains "${forwarded_log}" \
+  "MFEM_INSTALL=${fixture_mfem}/install-gpu-sm120"
 assert_adjacent_args "${tmp_root}/forwarded-args.log" "--jobs" "7"
 assert_adjacent_args "${tmp_root}/forwarded-args.log" "--cuda-arch" "120"
 assert_adjacent_args "${tmp_root}/forwarded-args.log" "--cuda-codegen" "80-virtual"
 assert_not_exists "${tmp_root}/forwarded-spack.log"
+
+# The reuse tuple is revalidated only after a real dependency install and
+# before any view export or build consumer can observe the transition.
+assert_reuse_transaction_order "${BUILD_DRIVER}"
+assert_reuse_identity_policy "${BUILD_DRIVER}" \
+  "${REPO_ROOT}/cmake/mfem-reuse-identities/cpu-w8a-d9d6526-973e5abc.json" \
+  "${REPO_ROOT}/cmake/mfem-reuse-identities/gpu-w8a-d9d6526-345d64a2.json"
+
+reuse_fixture_cmake="${REPO_ROOT}/tests/hdg/runtime/app/test_cli_process.cmake"
+grep -Fq 'set(reuse_mode_args --cpu-only --caliper)' \
+  "${reuse_fixture_cmake}" || fail "Caliper reuse fixtures are not propagated"
+grep -Fq '"$ENV{DG_IGR_TEST_REUSE_CUDA_ARCH}"' \
+  "${reuse_fixture_cmake}" || fail "selected reuse CUDA architecture is not propagated"
+if grep -Fq 'set(reuse_mode_args --gpu --cuda-arch 120)' \
+    "${reuse_fixture_cmake}"; then
+  fail "reuse fixture still hardcodes CUDA architecture 120"
+fi
 
 # Keep the application-level fallback and gate native to the selected profile.
 if grep -Fq 'set(_dg_igr_default_cuda_arch "80-virtual")' "${REPO_ROOT}/CMakeLists.txt"; then
