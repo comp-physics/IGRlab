@@ -145,10 +145,12 @@ enum class LifecycleFailure : unsigned char
   restart,
   initial_output,
   numerical_prepare,
-  provisional_install,
   staging,
   injected_after_recovery,
+  provisional_install,
+  pre_publication,
   publication,
+  post_publication_acknowledgement,
   rollback
 };
 
@@ -158,6 +160,14 @@ struct LifecycleControl final
   bool split_writer = false;
   bool inject_after_recovery = false;
   std::uint32_t maximum_retries = 0;
+  std::uint32_t initial_retries = 0;
+};
+
+struct LifecycleAttemptOutcome final
+{
+  bool rollback_succeeded = true;
+  bool retryable = false;
+  bool retry_without_budget = false;
 };
 
 struct LifecycleReport final
@@ -173,41 +183,48 @@ struct LifecycleReport final
 /**
  * One closed CPU-serial HDG application lifecycle.
  *
- * Method is the statically selected mathematical component.  Publication is
- * the application-owned durable output/checkpoint adapter.  The engine alone
- * controls step targets, retry, provisional installation, durable staging,
- * rollback, finalization, and terminal failure propagation.  A method may
- * execute formulation-specific Newton/linear solve hooks while preparing its
- * typed transaction; it cannot publish, advance the accepted-step cursor, or
- * choose a retry.
+ * Method is the statically selected mathematical component, Publication is
+ * the application-owned durable output/checkpoint adapter, and Schedule is a
+ * statically composed case/configuration view.  The engine alone controls
+ * step targets, retry, transaction order, publication, rollback, and terminal
+ * propagation.  Policy hooks may prepare numerical state or its durable
+ * representation; they cannot advance the accepted-step cursor or choose a
+ * retry.
  */
-template <typename Case, typename Method, typename Publication>
-LifecycleReport RunCpuSerialLifecycle(
+template <typename Method, typename Publication, typename Schedule>
+LifecycleReport RunCpuSerialLifecycleWithSchedule(
     Method& method, Publication& publication,
-    const LifecycleControl control, Case) noexcept
+    const LifecycleControl control, const Schedule& schedule) noexcept
 {
-  static_assert(std::is_same<Case, ExactJumpV1Case>::value ||
-                    std::is_same<Case, SmoothTransitionV2Case>::value,
-                "W8C lifecycle requires one frozen private case descriptor");
   static_assert(!std::is_polymorphic<Method>::value,
-                "W8C method composition must use static dispatch");
+                "CPU-serial method composition must use static dispatch");
   static_assert(!std::is_polymorphic<Publication>::value,
-                "W8C publication composition must use static dispatch");
+                "CPU-serial publication composition must use static dispatch");
+  static_assert(!std::is_polymorphic<Schedule>::value,
+                "CPU-serial schedule composition must use static dispatch");
   using Transaction = typename Method::Transaction;
   static_assert(
       std::is_same<decltype(std::declval<Method&>().Finalize(
                        std::declval<Transaction&&>())), void>::value,
-      "W8C finalization is a non-fallible post-publication invariant");
+      "CPU-serial finalization is a non-fallible invariant");
   static_assert(
       noexcept(std::declval<Method&>().Finalize(
           std::declval<Transaction&&>())),
-      "W8C finalization must be noexcept after durable publication");
+      "CPU-serial finalization must be noexcept after acknowledgement");
+  static_assert(
+      std::is_same<decltype(std::declval<Publication&>().Finalize()),
+                   void>::value,
+      "durable authority release must be a non-fallible invariant");
+  static_assert(noexcept(std::declval<Publication&>().Finalize()),
+                "durable authority release must be noexcept");
 
   LifecycleReport report{};
+  report.retries = control.initial_retries;
   const auto fail = [&](const LifecycleFailure failure,
                         const FailureReason fallback) noexcept {
     report.status = method.Status();
-    if (report.status != RunStatus::terminal_failure)
+    if (method.ForceTerminalFailure() &&
+        report.status != RunStatus::terminal_failure)
       report.status = RunStatus::terminal_failure;
     report.reason = method.Reason() == FailureReason::none
         ? fallback : method.Reason();
@@ -233,70 +250,112 @@ LifecycleReport RunCpuSerialLifecycle(
                 FailureReason::backend_failure);
 
   const std::uint64_t stop_step = control.split_writer
-      ? Case::checkpoint_step : Case::accepted_steps;
+      ? schedule.CheckpointStep() : schedule.AcceptedSteps();
   bool retry = false;
   while (method.Coordinates().step < stop_step)
   {
     const std::uint64_t target = method.Coordinates().step + 1;
     Transaction transaction;
-    if (!method.Prepare(transaction, retry))
-    {
-      if (method.RetryAvailable() &&
-          report.retries < control.maximum_retries)
-      {
-        ++report.retries;
-        retry = true;
-        continue;
-      }
-      return fail(LifecycleFailure::numerical_prepare,
-                  FailureReason::backend_failure);
-    }
-    if (!method.Install(transaction))
-      return fail(LifecycleFailure::provisional_install,
-                  FailureReason::publication_precondition);
+    LifecycleFailure failure = LifecycleFailure::none;
+    LifecycleAttemptOutcome outcome{};
+    bool committed = false;
 
-    const bool staged = publication.Stage(
-        method, transaction, target,
-        target == Case::output_steps[0] || target == Case::output_steps[1] ||
-            target == Case::output_steps[2],
-        target == Case::checkpoint_step, target == stop_step);
-    const bool injected = control.inject_after_recovery && !report.injected &&
-        target == Case::failure_target_step;
-    if (!staged || injected)
+    if (!method.Prepare(transaction, retry, target))
     {
-      const bool durable_reverted = publication.Revert();
-      const bool state_reverted = method.Revert(std::move(transaction));
-      report.injected = report.injected || injected;
-      if (!durable_reverted || !state_reverted)
-        return fail(LifecycleFailure::rollback,
-                    FailureReason::backend_failure);
-      if (report.retries < control.maximum_retries)
+      failure = LifecycleFailure::numerical_prepare;
+      outcome = method.PrepareFailure(transaction);
+    }
+    else
+    {
+      const bool staged = publication.Stage(
+          method, transaction, target, schedule.OutputStep(target),
+          schedule.CheckpointStep(target), target == stop_step,
+          report.retries);
+      if (!staged)
       {
-        ++report.retries;
-        retry = true;
-        continue;
+        failure = LifecycleFailure::staging;
+        const bool durable_reverted = publication.Revert();
+        outcome = method.AbortPrepared(
+            std::move(transaction), failure, durable_reverted);
       }
-      return fail(injected ? LifecycleFailure::injected_after_recovery
-                           : LifecycleFailure::staging,
-                  injected ? FailureReason::backend_failure
-                           : FailureReason::backend_failure);
+      else if (!method.Install(transaction))
+      {
+        failure = LifecycleFailure::provisional_install;
+        const bool durable_reverted = publication.Revert();
+        outcome = method.AbortPrepared(
+            std::move(transaction), failure, durable_reverted);
+      }
+      else
+      {
+        const bool injected = control.inject_after_recovery &&
+            !report.injected && target == schedule.FailureTargetStep();
+        const bool ready_to_publish = !injected &&
+            publication.ReadyToPublish(
+                method, transaction, report.retries);
+        if (!ready_to_publish)
+        {
+          failure = injected ? LifecycleFailure::injected_after_recovery
+                             : LifecycleFailure::pre_publication;
+          report.injected = report.injected || injected;
+          const bool durable_reverted = publication.Revert();
+          outcome = method.RevertInstalled(
+              std::move(transaction), failure, durable_reverted);
+        }
+        else if (!publication.Publish(method, transaction))
+        {
+          failure = LifecycleFailure::publication;
+          const bool durable_reverted = publication.Revert();
+          outcome = method.RevertInstalled(
+              std::move(transaction), failure, durable_reverted);
+        }
+        else if (!publication.Acknowledge(
+                     method, transaction, report.retries))
+        {
+          failure = LifecycleFailure::post_publication_acknowledgement;
+          const bool durable_reverted = publication.Revert();
+          outcome = method.RevertInstalled(
+              std::move(transaction), failure, durable_reverted);
+        }
+        else
+        {
+          // Publication retains exact prior-generation rollback authority
+          // until the non-fallible numerical token consumption completes.
+          method.Finalize(std::move(transaction));
+          publication.Finalize();
+          committed = true;
+        }
+      }
     }
 
-    if (!publication.Publish())
+    if (committed)
     {
-      const bool durable_reverted = publication.Revert();
-      const bool state_reverted = method.Revert(std::move(transaction));
-      if (!durable_reverted || !state_reverted)
-        return fail(LifecycleFailure::rollback,
-                    FailureReason::backend_failure);
-      return fail(LifecycleFailure::publication,
-                  FailureReason::backend_failure);
+      retry = false;
+      report.status = RunStatus::committed;
+      report.reason = FailureReason::none;
+      report.coordinates = method.Coordinates();
+      continue;
     }
-    method.Finalize(std::move(transaction));
-    retry = false;
-    report.status = RunStatus::committed;
-    report.reason = FailureReason::none;
-    report.coordinates = method.Coordinates();
+
+    if (!outcome.rollback_succeeded)
+      failure = LifecycleFailure::rollback;
+    const bool retry_allowed = outcome.rollback_succeeded &&
+        outcome.retryable &&
+        (report.retries < control.maximum_retries ||
+         (outcome.retry_without_budget && report.retries == 0));
+    if (retry_allowed)
+    {
+      ++report.retries;
+      method.OnRetry(failure, report.retries);
+      retry = true;
+      continue;
+    }
+    return fail(
+        failure,
+        failure == LifecycleFailure::restart
+            ? FailureReason::restart_incompatible
+            : (failure == LifecycleFailure::provisional_install
+                   ? FailureReason::publication_precondition
+                   : FailureReason::backend_failure));
   }
 
   report.status = RunStatus::committed;
@@ -304,6 +363,37 @@ LifecycleReport RunCpuSerialLifecycle(
   report.coordinates = method.Coordinates();
   report.failure = LifecycleFailure::none;
   return report;
+}
+
+template <typename Case>
+class FrozenCaseSchedule final
+{
+public:
+  constexpr std::uint64_t AcceptedSteps() const noexcept
+  { return Case::accepted_steps; }
+  constexpr std::uint64_t CheckpointStep() const noexcept
+  { return Case::checkpoint_step; }
+  constexpr bool OutputStep(const std::uint64_t step) const noexcept
+  {
+    return step == Case::output_steps[0] ||
+        step == Case::output_steps[1] || step == Case::output_steps[2];
+  }
+  constexpr bool CheckpointStep(const std::uint64_t step) const noexcept
+  { return step == Case::checkpoint_step; }
+  constexpr std::uint64_t FailureTargetStep() const noexcept
+  { return Case::failure_target_step; }
+};
+
+template <typename Case, typename Method, typename Publication>
+LifecycleReport RunCpuSerialLifecycle(
+    Method& method, Publication& publication,
+    const LifecycleControl control, Case) noexcept
+{
+  static_assert(std::is_same<Case, ExactJumpV1Case>::value ||
+                    std::is_same<Case, SmoothTransitionV2Case>::value,
+                "W8C lifecycle requires one frozen private case descriptor");
+  return RunCpuSerialLifecycleWithSchedule(
+      method, publication, control, FrozenCaseSchedule<Case>{});
 }
 
 template <typename Method, typename Publication>
