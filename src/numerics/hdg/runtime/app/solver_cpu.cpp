@@ -1874,15 +1874,17 @@ sc25::TrajectoryFailureInjection ScalarIgrNumericalInjection(
   }
 }
 
+template <bool Rank2>
 class TracedScalarIgrCpuSerialMethod final
 {
 public:
-  using Traits = ScalarIgrCpuTraits<false>;
+  using Traits = ScalarIgrCpuTraits<Rank2>;
   struct Transaction final
   {
     typename Traits::Transaction numerical;
     bool prescribed = false;
     bool app_injected = false;
+    bool private_preparation_injected = false;
     bool installed = false;
   };
 
@@ -1945,7 +1947,11 @@ public:
     }
     const sc25::TrajectoryStatus status = Traits::Prepare(
         owner_, transaction.numerical, numerical);
-    if (!ScalarIgrAccepted(status))
+    const bool locally_accepted = ScalarIgrAccepted(status);
+    const bool accepted = Rank2
+        ? CollectiveAll(locally_accepted, context_.communicator())
+        : locally_accepted;
+    if (!accepted)
     {
       injected_ = injected_ || prescribed;
       prepare_retryable_ = prescribed;
@@ -1970,6 +1976,8 @@ public:
   bool Install(Transaction& transaction) noexcept
   {
     transaction.installed = Traits::Install(owner_, transaction.numerical);
+    if constexpr (Rank2)
+      return CollectiveAll(transaction.installed, context_.communicator());
     return transaction.installed;
   }
 
@@ -1979,50 +1987,66 @@ public:
   {
     if (!transaction.installed)
       transaction.installed = Traits::Install(owner_, transaction.numerical);
-    const bool reverted = transaction.installed &&
+    const bool local_reverted = transaction.installed &&
         Traits::Revert(owner_, std::move(transaction.numerical));
+    const bool reverted = Rank2
+        ? CollectiveAll(local_reverted, context_.communicator())
+        : local_reverted;
     injected_ = injected_ || transaction.prescribed;
+    const bool transaction_injected = transaction.app_injected ||
+        transaction.private_preparation_injected;
     failure_class_ = !durable_reverted || !reverted
         ? ApplicationRunResult::FailureClass::backend
-        : (transaction.app_injected
+        : (transaction_injected
                ? ApplicationRunResult::FailureClass::injected
                : (failure == cpu::w8c::LifecycleFailure::staging
                       ? ApplicationRunResult::FailureClass::filesystem
                       : ApplicationRunResult::FailureClass::backend));
     return {durable_reverted && reverted,
-            reverted && transaction.app_injected, false};
+            reverted && transaction_injected, false};
   }
 
   cpu::w8c::LifecycleAttemptOutcome RevertInstalled(
       Transaction&& transaction, const cpu::w8c::LifecycleFailure failure,
       const bool durable_reverted) noexcept
   {
-    const bool reverted = transaction.installed &&
+    const bool local_reverted = transaction.installed &&
         Traits::Revert(owner_, std::move(transaction.numerical));
+    const bool reverted = Rank2
+        ? CollectiveAll(local_reverted, context_.communicator())
+        : local_reverted;
     injected_ = injected_ || transaction.prescribed;
+    const bool transaction_injected = transaction.app_injected ||
+        transaction.private_preparation_injected;
     if (!durable_reverted || !reverted ||
         failure == cpu::w8c::LifecycleFailure::rollback)
       failure_class_ = ApplicationRunResult::FailureClass::backend;
-    else if (transaction.app_injected)
+    else if (transaction_injected)
       failure_class_ = ApplicationRunResult::FailureClass::injected;
     else if (failure == cpu::w8c::LifecycleFailure::publication)
       failure_class_ = ApplicationRunResult::FailureClass::filesystem;
     else
       failure_class_ = ApplicationRunResult::FailureClass::backend;
     return {durable_reverted && reverted,
-            reverted && transaction.app_injected, false};
+            reverted && transaction_injected, false};
   }
 
   void Finalize(Transaction&& transaction) noexcept
   {
-    const bool finalized = transaction.installed &&
+    const bool local_finalized = transaction.installed &&
         Traits::Finalize(owner_, std::move(transaction.numerical));
-    if (!CollectiveAll(finalized, context_.communicator())) std::abort();
+    const bool finalized = CollectiveAll(
+        local_finalized, context_.communicator());
+    if (!finalized) std::abort();
     injected_ = injected_ || transaction.prescribed;
   }
 
   RunStatus Status() const noexcept
-  { return owner_.trajectory_evidence().contract_status; }
+  {
+    if constexpr (Rank2)
+      return RunStatus::terminal_failure;
+    return owner_.trajectory_evidence().contract_status;
+  }
   FailureReason Reason() const noexcept
   {
     return failure_class_ == ApplicationRunResult::FailureClass::none
@@ -2048,9 +2072,13 @@ private:
   bool prepare_retryable_ = false;
 };
 
+template <bool Rank2>
 class TracedScalarIgrCpuSerialPublication final
 {
 public:
+  using Method = TracedScalarIgrCpuSerialMethod<Rank2>;
+  using Traits = typename Method::Traits;
+
   TracedScalarIgrCpuSerialPublication(
       const ValidatedApplicationConfig& config,
       const PersistentResourceDescriptor& resources,
@@ -2066,17 +2094,16 @@ public:
         result_(result), injection_audit_(injection_audit), detail_(detail)
   {}
 
-  bool Restore(TracedScalarIgrCpuSerialMethod&) const noexcept { return true; }
-  bool PublishInitial(TracedScalarIgrCpuSerialMethod&) const noexcept
+  bool Restore(Method&) const noexcept { return true; }
+  bool PublishInitial(Method&) const noexcept
   { return true; }
 
   bool Stage(
-      TracedScalarIgrCpuSerialMethod&,
-      TracedScalarIgrCpuSerialMethod::Transaction& method_transaction,
+      Method&, typename Method::Transaction& method_transaction,
       const std::uint64_t target, const bool output, const bool checkpoint,
       const bool terminal, const std::uint32_t retries) noexcept
   {
-    try
+    const auto stage_impl = [&]() -> bool
     {
       transaction_.emplace();
       active_ = true;
@@ -2088,13 +2115,39 @@ public:
           method_transaction.numerical.future_checkpoint()
               .descriptor.coordinates,
           candidate_);
+      if constexpr (Rank2)
+      {
+        static bool candidate_pack_fault_consumed = false;
+        int candidate_pack_fault_source = -1;
+        const bool local_candidate_pack_fault = ConsumeScalarRankStepFault(
+            "DG_IGR_HDG_TEST_SCALAR_CANDIDATE_PACK_FAILURE", target,
+            context_.rank(), candidate_pack_fault_consumed,
+            candidate_pack_fault_source);
+        const int local_count = local_candidate_pack_fault ? 1 : 0;
+        const int local_source = local_candidate_pack_fault
+            ? context_.rank() + 1 : 0;
+        int collective_count = 0;
+        int collective_source = 0;
+        const bool reduced = MPI_Allreduce(
+            &local_count, &collective_count, 1, MPI_INT, MPI_SUM,
+            context_.communicator()) == MPI_SUCCESS &&
+            MPI_Allreduce(&local_source, &collective_source, 1, MPI_INT,
+                          MPI_SUM, context_.communicator()) == MPI_SUCCESS;
+        staged = staged && reduced && collective_count <= 1 &&
+            !local_candidate_pack_fault;
+        method_transaction.private_preparation_injected =
+            reduced && collective_count == 1;
+        if (method_transaction.private_preparation_injected)
+          detail_ = "scalar-IGR candidate pack failure source_rank=" +
+              std::to_string(collective_source - 1);
+      }
       staged = CollectiveAll(staged, context_.communicator());
       if (staged)
         staged = CollectiveAll(
             GlobalScalarIgrCoordinatesIdentity(
                 candidate_.coordinates, context_),
             context_.communicator());
-      if (!staged)
+      if (!staged && !method_transaction.private_preparation_injected)
         detail_ = "scalar-IGR candidate state pack failed";
       if (staged)
         staged = BeginRootTransaction(
@@ -2112,27 +2165,66 @@ public:
         StateHash final_hash{};
         bool metadata_ready = GlobalScalarIgrStateIdentity(
             candidate_, context_, final_hash);
+        if constexpr (Rank2)
+        {
+          static bool metadata_fault_consumed = false;
+          int metadata_fault_source = -1;
+          const bool local_metadata_fault = ConsumeScalarRankStepFault(
+              "DG_IGR_HDG_TEST_SCALAR_METADATA_PREPARATION_FAILURE", target,
+              context_.rank(), metadata_fault_consumed,
+              metadata_fault_source);
+          const int local_count = local_metadata_fault ? 1 : 0;
+          const int local_source = local_metadata_fault
+              ? context_.rank() + 1 : 0;
+          int collective_count = 0;
+          int collective_source = 0;
+          const bool reduced = MPI_Allreduce(
+              &local_count, &collective_count, 1, MPI_INT, MPI_SUM,
+              context_.communicator()) == MPI_SUCCESS &&
+              MPI_Allreduce(&local_source, &collective_source, 1, MPI_INT,
+                            MPI_SUM, context_.communicator()) == MPI_SUCCESS;
+          metadata_ready = metadata_ready && reduced &&
+              collective_count <= 1 && !local_metadata_fault;
+          method_transaction.private_preparation_injected =
+              method_transaction.private_preparation_injected ||
+              (reduced && collective_count == 1);
+          if (reduced && collective_count == 1)
+            detail_ = "scalar-IGR metadata preparation failure source_rank=" +
+                std::to_string(collective_source - 1);
+        }
         if (context_.rank() == 0 && metadata_ready)
         {
-          ApplicationRunResult anticipated = result_;
-          anticipated.status = RunStatus::committed;
-          anticipated.reason = FailureReason::none;
-          anticipated.coordinates = candidate_.coordinates;
-          anticipated.retries = retries;
-          const std::string text = ScalarIgrMetadata(
-              config_, anticipated, initial_hash_, final_hash,
-              injection_audit_, detail_);
-          metadata_.assign(text.begin(), text.end());
-          metadata_ready = transaction_->Stage(
-              config_.run_role() == ApplicationRunRoleV1::split_writer
-                  ? "run-metadata-checkpoint.json" : "run-metadata.json",
-              metadata_.data(), metadata_.size(), detail_) ==
-              DurableIoStatus::ok;
+          try
+          {
+            ApplicationRunResult anticipated = result_;
+            anticipated.status = RunStatus::committed;
+            anticipated.reason = FailureReason::none;
+            anticipated.coordinates = candidate_.coordinates;
+            anticipated.retries = retries;
+            const std::string text = ScalarIgrMetadata(
+                config_, anticipated, initial_hash_, final_hash,
+                injection_audit_, detail_);
+            metadata_.assign(text.begin(), text.end());
+            metadata_ready = transaction_->Stage(
+                config_.run_role() == ApplicationRunRoleV1::split_writer
+                    ? "run-metadata-checkpoint.json" : "run-metadata.json",
+                metadata_.data(), metadata_.size(), detail_) ==
+                DurableIoStatus::ok;
+          }
+          catch (...)
+          {
+            metadata_ready = false;
+            detail_ = Rank2
+                ? "scalar-IGR root metadata preparation failed"
+                : "scalar-IGR durable staging failed";
+          }
         }
         staged = CollectiveAll(metadata_ready, context_.communicator());
       }
       return staged;
-    }
+    };
+    if constexpr (Rank2) return stage_impl();
+    try { return stage_impl(); }
     catch (...)
     {
       detail_ = "scalar-IGR durable staging failed";
@@ -2141,29 +2233,54 @@ public:
   }
 
   bool ReadyToPublish(
-      TracedScalarIgrCpuSerialMethod&,
-      const TracedScalarIgrCpuSerialMethod::Transaction& transaction,
-      const std::uint32_t) const noexcept
+      Method&, typename Method::Transaction& transaction,
+      const std::uint32_t) noexcept
   {
-    return !transaction.app_injected;
+    if (transaction.app_injected) return false;
+    if constexpr (Rank2)
+    {
+      bool local_ready = Traits::FinalizeReady(transaction.numerical);
+      static bool finalize_fault_consumed = false;
+      int finalize_fault_source = -1;
+      const bool finalize_fault = ConsumeScalarRankStepFault(
+          "DG_IGR_HDG_TEST_SCALAR_FINALIZE_PREPARATION_FAILURE",
+          candidate_.coordinates.step, context_.rank(),
+          finalize_fault_consumed, finalize_fault_source);
+      local_ready = local_ready && !finalize_fault;
+      const int local_count = finalize_fault ? 1 : 0;
+      int collective_count = 0;
+      const bool reduced = MPI_Allreduce(
+          &local_count, &collective_count, 1, MPI_INT, MPI_SUM,
+          context_.communicator()) == MPI_SUCCESS;
+      transaction.private_preparation_injected = reduced &&
+          collective_count == 1;
+      const bool collectively_ready = CollectiveAll(
+          local_ready && reduced && collective_count <= 1,
+          context_.communicator());
+      if (!collectively_ready)
+        detail_ = transaction.private_preparation_injected &&
+                finalize_fault_source >= 0
+            ? "scalar-IGR finalize preparation failure source_rank=" +
+                  std::to_string(finalize_fault_source)
+            : "scalar-IGR finalize readiness consensus failed";
+      return collectively_ready;
+    }
+    return true;
   }
 
   bool Publish(
-      TracedScalarIgrCpuSerialMethod&,
-      const TracedScalarIgrCpuSerialMethod::Transaction&) noexcept
+      Method&, const typename Method::Transaction&) noexcept
   {
     return active_ &&
         PublishRootTransaction(*transaction_, context_, detail_);
   }
 
   bool Acknowledge(
-      TracedScalarIgrCpuSerialMethod&,
-      const TracedScalarIgrCpuSerialMethod::Transaction& transaction,
+      Method&, const typename Method::Transaction& transaction,
       const std::uint32_t) noexcept
   {
     const bool ready =
-        TracedScalarIgrCpuSerialMethod::Traits::FinalizeReady(
-            transaction.numerical);
+        Traits::FinalizeReady(transaction.numerical);
     const bool acknowledged = CollectiveAll(ready, context_.communicator());
     if (!acknowledged)
       detail_ = "scalar-IGR finalize readiness consensus failed";
@@ -2402,331 +2519,37 @@ ApplicationRunResult RunScalarIgrCpu(const ApplicationOptionsView& request,
 
   const std::optional<ValidatedApplicationConfig> checkpoint_writer =
       CheckpointWriterConfig(request, config);
-  if constexpr (!Rank2)
+  if (result.failure_class == ApplicationRunResult::FailureClass::none)
   {
-    static_assert(std::is_same<Traits, ScalarIgrCpuTraits<false>>::value,
-                  "only traced-scalar rank one uses the serial lifecycle");
-    if (result.failure_class == ApplicationRunResult::FailureClass::none)
-    {
-      TracedScalarIgrCpuSerialMethod method(
-          *owner, config, context, injection_audit, detail);
-      TracedScalarIgrCpuSerialPublication publication(
-          config, resources, context, output_directory, checkpoint_writer,
-          initial_hash, result, injection_audit, detail);
-      cpu::w8c::LifecycleControl control;
-      control.split_writer =
-          config.run_role() == ApplicationRunRoleV1::split_writer;
-      control.maximum_retries = config.retry_limit();
-      control.initial_retries = result.retries;
-      const cpu::w8c::LifecycleReport report =
-          cpu::w8c::RunCpuSerialLifecycleWithSchedule(
-              method, publication, control,
-              ApplicationCpuSerialSchedule{config});
-      result.status = report.status;
-      result.reason = report.reason;
-      result.coordinates = report.coordinates;
-      result.retries = report.retries;
-      result.failure_class =
-          report.failure == cpu::w8c::LifecycleFailure::none
-          ? ApplicationRunResult::FailureClass::none
-          : method.failure_class();
-      if (report.failure != cpu::w8c::LifecycleFailure::none &&
-          detail.empty())
-        detail = report.failure == cpu::w8c::LifecycleFailure::staging ||
-                report.failure == cpu::w8c::LifecycleFailure::publication
-            ? "scalar-IGR durable publication failed"
-            : "scalar-IGR transaction preparation failed";
-    }
-  }
-  else
-  {
-    const std::uint64_t stop_step =
-        config.run_role() == ApplicationRunRoleV1::split_writer
-        ? config.scenario_checkpoint_step() : config.accepted_steps();
-    bool injected = false;
-    while (result.failure_class == ApplicationRunResult::FailureClass::none &&
-           Traits::Coordinates(*owner).step < stop_step)
-    {
-      const std::uint64_t target = Traits::Coordinates(*owner).step + 1;
-    const bool prescribed = !injected &&
-        config.injection().mode == FailureInjectionModeV1::prescribed &&
-        config.injection().target_step == target;
-    const int prescribed_source_rank =
-        static_cast<int>(config.injection().source_rank);
-    const bool local_prescribed = prescribed &&
-        context.rank() == prescribed_source_rank;
-    const FailurePhase phase = prescribed ? config.injection().phase
-                                          : FailurePhase::Setup;
-    const sc25::TrajectoryFailureInjection prescribed_numerical = prescribed
-        ? ScalarIgrNumericalInjection(phase)
-        : sc25::TrajectoryFailureInjection::none;
-    const sc25::TrajectoryFailureInjection numerical = local_prescribed
-        ? prescribed_numerical : sc25::TrajectoryFailureInjection::none;
-    if (prescribed)
-    {
-      const std::array<int, 3> local_decision{{
-          local_prescribed ? 1 : 0,
-          local_prescribed ? context.rank() + 1 : 0,
-          local_prescribed &&
-                  context.rank() != prescribed_source_rank ? 1 : 0}};
-      std::array<int, 3> collective_decision{};
-      const bool reduced = MPI_Allreduce(
-          local_decision.data(), collective_decision.data(),
-          static_cast<int>(local_decision.size()), MPI_INT, MPI_SUM,
-          context.communicator()) == MPI_SUCCESS;
-      const bool decision_valid = reduced && collective_decision[0] == 1 &&
-          collective_decision[1] == prescribed_source_rank + 1 &&
-          collective_decision[2] == 0;
-      if (!CollectiveAll(decision_valid, context.communicator()))
-      {
-        result.status = RunStatus::terminal_failure;
-        result.reason = FailureReason::backend_failure;
-        result.failure_class = ApplicationRunResult::FailureClass::backend;
-        detail = "scalar-IGR injection origin consensus failed";
-        break;
-      }
-      injection_audit.observed_origin_rank = collective_decision[1] - 1;
-      injection_audit.local_injection_count += collective_decision[0];
-      injection_audit.non_origin_local_injection_count +=
-          collective_decision[2];
-      ++injection_audit.collective_decisions;
-    }
-    typename Traits::Transaction candidate;
-    const sc25::TrajectoryStatus status =
-        Traits::Prepare(*owner, candidate, numerical);
-    if (!ScalarIgrAccepted(status))
-    {
-      injected = injected || prescribed;
-      if (prescribed && result.retries < config.retry_limit())
-      {
-        ++result.retries;
-        continue;
-      }
-      result.status = RunStatus::terminal_failure;
-      result.reason = FailureReason::backend_failure;
-      result.failure_class = prescribed
-          ? ApplicationRunResult::FailureClass::injected
-          : ApplicationRunResult::FailureClass::scientific;
-      detail = "scalar-IGR numerical prepare failed";
-      break;
-    }
-
-    ScalarIgrPackedState packed;
-    bool packed_ready = PackScalarIgrState(
-        candidate.candidate_state(),
-        candidate.future_checkpoint().descriptor.coordinates, packed);
-    bool private_preparation_injected = false;
-    int candidate_pack_fault_source = -1;
-    if constexpr (Rank2)
-    {
-      static bool candidate_pack_fault_consumed = false;
-      const bool local_candidate_pack_fault = ConsumeScalarRankStepFault(
-          "DG_IGR_HDG_TEST_SCALAR_CANDIDATE_PACK_FAILURE", target,
-          context.rank(), candidate_pack_fault_consumed,
-          candidate_pack_fault_source);
-      const int local_count = local_candidate_pack_fault ? 1 : 0;
-      const int local_source = local_candidate_pack_fault
-          ? context.rank() + 1 : 0;
-      int collective_count = 0, collective_source = 0;
-      const bool reduced = MPI_Allreduce(
-          &local_count, &collective_count, 1, MPI_INT, MPI_SUM,
-          context.communicator()) == MPI_SUCCESS &&
-          MPI_Allreduce(&local_source, &collective_source, 1, MPI_INT,
-                        MPI_SUM, context.communicator()) == MPI_SUCCESS;
-      packed_ready = packed_ready && reduced && collective_count <= 1 &&
-          !local_candidate_pack_fault;
-      private_preparation_injected = reduced && collective_count == 1;
-      if (private_preparation_injected)
-        candidate_pack_fault_source = collective_source - 1;
-    }
-    // BeginRootTransaction is collective.  Converge every local pack result
-    // before any rank is allowed to enter it.
-    packed_ready = CollectiveAll(packed_ready, context.communicator());
-    if (packed_ready)
-      packed_ready = CollectiveAll(
-          GlobalScalarIgrCoordinatesIdentity(packed.coordinates, context),
-          context.communicator());
-    if (!packed_ready)
-      detail = private_preparation_injected
-          ? "scalar-IGR candidate pack failure source_rank=" +
-                std::to_string(candidate_pack_fault_source)
-          : "scalar-IGR candidate state pack failed";
-    bool staged = packed_ready;
-    DurableGenerationTransactionV1 transaction;
-    std::vector<std::uint8_t> vtk, checkpoint, metadata;
-    if (staged)
-      staged = BeginRootTransaction(
-          transaction, output_directory, target, context, detail);
-    if (staged && OutputStep(config, target))
-      staged = StageScalarIgrVtk(config, packed, context, transaction, vtk,
-                                 detail);
-    if (staged && config.checkpoint_out().present() &&
-        target == config.scenario_checkpoint_step())
-    {
-      staged = checkpoint_writer && StageScalarIgrCheckpoint(
-          *checkpoint_writer, candidate.future_checkpoint(), packed,
-          resources, context, transaction, checkpoint, detail);
-    }
-    if (staged && target == stop_step)
-    {
-      StateHash final_hash{};
-      bool metadata_ready =
-          GlobalScalarIgrStateIdentity(packed, context, final_hash);
-      int metadata_fault_source = -1;
-      int metadata_fault_count = 0;
-      if constexpr (Rank2)
-      {
-        static bool metadata_fault_consumed = false;
-        const bool local_metadata_fault = ConsumeScalarRankStepFault(
-            "DG_IGR_HDG_TEST_SCALAR_METADATA_PREPARATION_FAILURE", target,
-            context.rank(), metadata_fault_consumed, metadata_fault_source);
-        const int local_count = local_metadata_fault ? 1 : 0;
-        const int local_source = local_metadata_fault ? context.rank() + 1 : 0;
-        int collective_source = 0;
-        const bool reduced = MPI_Allreduce(
-            &local_count, &metadata_fault_count, 1, MPI_INT, MPI_SUM,
-            context.communicator()) == MPI_SUCCESS &&
-            MPI_Allreduce(&local_source, &collective_source, 1, MPI_INT,
-                          MPI_SUM, context.communicator()) == MPI_SUCCESS;
-        metadata_ready = metadata_ready && reduced &&
-            metadata_fault_count <= 1 && !local_metadata_fault;
-        if (metadata_fault_count == 1)
-          metadata_fault_source = collective_source - 1;
-        private_preparation_injected = private_preparation_injected ||
-            (reduced && metadata_fault_count == 1);
-      }
-      if (context.rank() == 0 && metadata_ready)
-      {
-        try
-        {
-          ApplicationRunResult anticipated = result;
-          anticipated.status = RunStatus::committed;
-          anticipated.reason = FailureReason::none;
-          anticipated.coordinates = packed.coordinates;
-          const std::string text = ScalarIgrMetadata(
-              config, anticipated, initial_hash, final_hash, injection_audit,
-              detail);
-          metadata.assign(text.begin(), text.end());
-          metadata_ready = transaction.Stage(
-              config.run_role() == ApplicationRunRoleV1::split_writer
-                  ? "run-metadata-checkpoint.json" : "run-metadata.json",
-              metadata.data(), metadata.size(), detail) == DurableIoStatus::ok;
-        }
-        catch (...)
-        {
-          metadata_ready = false;
-          detail = "scalar-IGR root metadata preparation failed";
-        }
-      }
-      if (metadata_fault_count == 1)
-        detail = "scalar-IGR metadata preparation failure source_rank=" +
-            std::to_string(metadata_fault_source);
-      staged = CollectiveAll(metadata_ready, context.communicator());
-    }
-
-    const bool app_injected = prescribed &&
-        prescribed_numerical == sc25::TrajectoryFailureInjection::none;
-    bool transaction_injected =
-        app_injected || private_preparation_injected;
-    bool installed = false;
-    bool committed = false;
-    bool publish_failed = false;
-    if (staged)
-    {
-      installed = Traits::Install(*owner, candidate);
-      const bool collectively_installed =
-          CollectiveAll(installed, context.communicator());
-      if (collectively_installed && !app_injected)
-      {
-        bool local_finalize_ready = Traits::FinalizeReady(candidate);
-        int finalize_fault_source = -1;
-        static bool finalize_fault_consumed = false;
-        if constexpr (Rank2)
-        {
-          const bool finalize_fault = ConsumeScalarRankStepFault(
-              "DG_IGR_HDG_TEST_SCALAR_FINALIZE_PREPARATION_FAILURE",
-              target, context.rank(), finalize_fault_consumed,
-              finalize_fault_source);
-          local_finalize_ready = local_finalize_ready && !finalize_fault;
-          transaction_injected = finalize_fault;
-        }
-        const bool collectively_finalize_ready =
-            CollectiveAll(local_finalize_ready, context.communicator());
-        int injected_finalize_count = transaction_injected ? 1 : 0;
-        int collective_finalize_count = 0;
-        const bool finalize_fault_reduced = MPI_Allreduce(
-            &injected_finalize_count, &collective_finalize_count, 1, MPI_INT,
-            MPI_SUM, context.communicator()) == MPI_SUCCESS;
-        transaction_injected = finalize_fault_reduced &&
-            collective_finalize_count == 1;
-        if (!collectively_finalize_ready)
-        {
-          detail = transaction_injected && finalize_fault_source >= 0
-              ? "scalar-IGR finalize preparation failure source_rank=" +
-                    std::to_string(finalize_fault_source)
-              : "scalar-IGR finalize readiness consensus failed";
-        }
-        else
-        {
-          const bool published_ok = PublishRootTransaction(
-              transaction, context, detail);
-          publish_failed = !published_ok;
-          if (published_ok)
-          {
-            // Install plus the rank-common readiness gate establish every
-            // documented precondition of this noexcept token consumption.
-            const bool finalized =
-                Traits::Finalize(*owner, std::move(candidate));
-            if (!CollectiveAll(finalized, context.communicator()))
-            {
-              result.status = RunStatus::terminal_failure;
-              result.reason = FailureReason::backend_failure;
-              result.failure_class =
-                  ApplicationRunResult::FailureClass::backend;
-              detail = "scalar-IGR finalize invariant failed";
-              break;
-            }
-            committed = true;
-          }
-        }
-      }
-    }
-    if (!committed)
-    {
-      (void)RevertTransaction(transaction, context, detail);
-      if (!installed) installed = Traits::Install(*owner, candidate);
-      const bool reverted = installed &&
-          Traits::Revert(*owner, std::move(candidate));
-      if (!CollectiveAll(reverted, context.communicator()))
-      {
-        result.status = RunStatus::terminal_failure;
-        result.reason = FailureReason::backend_failure;
-        result.failure_class = ApplicationRunResult::FailureClass::backend;
-        detail = "scalar-IGR transaction rollback failed";
-        break;
-      }
-      injected = injected || prescribed;
-      if (transaction_injected && result.retries < config.retry_limit())
-      {
-        ++result.retries;
-        continue;
-      }
-      result.status = RunStatus::terminal_failure;
-      result.reason = FailureReason::backend_failure;
-      result.failure_class = transaction_injected
-          ? ApplicationRunResult::FailureClass::injected
-          : (!staged || publish_failed
-                 ? ApplicationRunResult::FailureClass::filesystem
-                 : ApplicationRunResult::FailureClass::backend);
-      if (detail.empty()) detail = !staged || publish_failed
+    TracedScalarIgrCpuSerialMethod<Rank2> method(
+        *owner, config, context, injection_audit, detail);
+    TracedScalarIgrCpuSerialPublication<Rank2> publication(
+        config, resources, context, output_directory, checkpoint_writer,
+        initial_hash, result, injection_audit, detail);
+    cpu::w8c::LifecycleControl control;
+    control.split_writer =
+        config.run_role() == ApplicationRunRoleV1::split_writer;
+    control.maximum_retries = config.retry_limit();
+    control.initial_retries = result.retries;
+    const cpu::w8c::LifecycleReport report =
+        cpu::w8c::RunCpuSerialLifecycleWithSchedule(
+            method, publication, control,
+            ApplicationCpuSerialSchedule{config});
+    result.status = report.status;
+    result.reason = report.reason;
+    result.coordinates = report.coordinates;
+    result.retries = report.retries;
+    result.failure_class =
+        report.failure == cpu::w8c::LifecycleFailure::none
+        ? ApplicationRunResult::FailureClass::none
+        : method.failure_class();
+    if (report.failure != cpu::w8c::LifecycleFailure::none &&
+        detail.empty())
+      detail = report.failure == cpu::w8c::LifecycleFailure::staging ||
+              report.failure == cpu::w8c::LifecycleFailure::publication
           ? "scalar-IGR durable publication failed"
           : "scalar-IGR transaction preparation failed";
-      break;
-    }
-      injected = injected || prescribed;
-    }
   }
-
   result.coordinates = Traits::Coordinates(*owner);
   if (result.failure_class == ApplicationRunResult::FailureClass::none)
   {
@@ -3569,8 +3392,8 @@ public:
   NoRegularizationCpuSerialMethod(
       cpu::PersistentSmoothEulerCpuAdapter<Selection>& adapter,
       const ValidatedApplicationConfig& config,
-      std::string& detail) noexcept
-      : adapter_(adapter), config_(config), detail_(detail)
+      MpiApplicationContextV1& context, std::string& detail) noexcept
+      : adapter_(adapter), config_(config), context_(context), detail_(detail)
   {}
 
   bool Initialize() const noexcept { return true; }
@@ -3593,12 +3416,13 @@ public:
         transaction.injection.phase == CpuFailurePhase::commit ||
         transaction.injection.phase == CpuFailurePhase::rollback_audit ||
         transaction.injection.phase == CpuFailurePhase::terminal_evidence;
-    const bool prepared = retrying
+    const bool locally_prepared = retrying
         ? adapter_.PrepareRetry(transaction.staging)
         : adapter_.PrepareAdvance(
               transaction.staging,
               app_managed_injection ? CpuFailureInjection{}
                                     : transaction.injection);
+    const bool prepared = RankCommon(locally_prepared);
     if (!prepared)
     {
       transaction.outcome = adapter_.last_transition_outcome();
@@ -3608,7 +3432,7 @@ public:
             adapter_.status() == RunStatus::retry_available};
       return false;
     }
-    if (!transaction.staging.numerically_ready)
+    if (!RankCommon(transaction.staging.numerically_ready))
     {
       transaction.outcome = adapter_.FinalizePrepared(transaction.staging);
       return false;
@@ -3621,8 +3445,9 @@ public:
         transaction.staging.interior,
         transaction.staging.trace};
     transaction.future_checkpoint = transaction.staging.future_checkpoint;
-    if (!adapter_.PrepareCommit(
-            transaction.staging, transaction.prepared))
+    const bool locally_prepared_commit = adapter_.PrepareCommit(
+        transaction.staging, transaction.prepared);
+    if (!RankCommon(locally_prepared_commit))
     {
       transaction.outcome = adapter_.last_transition_outcome();
       return false;
@@ -3633,13 +3458,14 @@ public:
   cpu::w8c::LifecycleAttemptOutcome PrepareFailure(
       const Transaction& transaction) const noexcept
   {
-    return {true, transaction.outcome.retry_available, false};
+    return {true, RankCommon(transaction.outcome.retry_available), false};
   }
 
   bool Install(Transaction& transaction) noexcept
   {
-    transaction.installed = adapter_.CommitPrepared(
+    const bool locally_installed = adapter_.CommitPrepared(
         transaction.prepared, transaction.provisional);
+    transaction.installed = RankCommon(locally_installed);
     if (!transaction.installed)
       transaction.outcome = adapter_.last_transition_outcome();
     return transaction.installed;
@@ -3656,10 +3482,12 @@ public:
           durable_reverted ? transaction.rollback_phase
                            : CpuFailurePhase::rollback_audit,
           transaction.rollback_source_rank);
-    const bool state_reverted = !outcome.committed &&
+    const bool locally_reverted = !outcome.committed &&
         outcome.reason != FailureReason::stale_attempt;
+    const bool state_reverted = RankCommon(locally_reverted);
+    const bool retry_available = RankCommon(outcome.retry_available);
     return {durable_reverted && state_reverted,
-            outcome.retry_available, false};
+            retry_available, false};
   }
 
   cpu::w8c::LifecycleAttemptOutcome RevertInstalled(
@@ -3671,10 +3499,12 @@ public:
         durable_reverted ? transaction.rollback_phase
                          : CpuFailurePhase::rollback_audit,
         transaction.rollback_source_rank);
-    const bool state_reverted = !outcome.committed &&
+    const bool locally_reverted = !outcome.committed &&
         outcome.reason != FailureReason::stale_attempt;
+    const bool state_reverted = RankCommon(locally_reverted);
+    const bool retry_available = RankCommon(outcome.retry_available);
     return {durable_reverted && state_reverted,
-            outcome.retry_available,
+            retry_available,
             failure ==
                     cpu::w8c::LifecycleFailure::
                         post_publication_acknowledgement &&
@@ -3686,7 +3516,9 @@ public:
   {
     const AttemptOutcome outcome =
         adapter_.FinalizeCommit(transaction.provisional);
-    if (!outcome.committed || outcome.reason != FailureReason::none)
+    const bool finalized = RankCommon(
+        outcome.committed && outcome.reason == FailureReason::none);
+    if (!finalized)
       std::abort();
   }
 
@@ -3733,8 +3565,16 @@ public:
   { return adapter_.evidence(); }
 
 private:
+  bool RankCommon(const bool local) const noexcept
+  {
+    if constexpr (std::is_same<Selection, AppCpuRank2Selection>::value)
+      return CollectiveAll(local, context_.communicator());
+    return local;
+  }
+
   cpu::PersistentSmoothEulerCpuAdapter<Selection>& adapter_;
   const ValidatedApplicationConfig& config_;
+  MpiApplicationContextV1& context_;
   std::string& detail_;
 };
 
@@ -3766,7 +3606,7 @@ public:
              const bool checkpoint, const bool terminal,
              const std::uint32_t retries) noexcept
   {
-    try
+    const auto stage_impl = [&]() -> bool
     {
       transaction_.emplace();
       active_ = true;
@@ -3820,15 +3660,19 @@ public:
             method_transaction.candidate, context_, terminal_identity);
         if (context_.rank() == 0)
         {
-          const std::string metadata = Metadata(
-              config_, anticipated, method_.Evidence(), initial_hash_,
-              terminal_identity, detail_);
-          metadata_.assign(metadata.begin(), metadata.end());
-          metadata_staged = transaction_->Stage(
-              config_.run_role() == ApplicationRunRoleV1::split_writer
-                  ? "run-metadata-checkpoint.json" : "run-metadata.json",
-              metadata_.data(), metadata_.size(), detail_) ==
-              DurableIoStatus::ok;
+          try
+          {
+            const std::string metadata = Metadata(
+                config_, anticipated, method_.Evidence(), initial_hash_,
+                terminal_identity, detail_);
+            metadata_.assign(metadata.begin(), metadata.end());
+            metadata_staged = transaction_->Stage(
+                config_.run_role() == ApplicationRunRoleV1::split_writer
+                    ? "run-metadata-checkpoint.json" : "run-metadata.json",
+                metadata_.data(), metadata_.size(), detail_) ==
+                DurableIoStatus::ok;
+          }
+          catch (...) { metadata_staged = false; }
         }
         staged = CollectiveAll(metadata_staged, context_.communicator());
       }
@@ -3843,7 +3687,10 @@ public:
         return false;
       }
       return true;
-    }
+    };
+    if constexpr (std::is_same<Selection, AppCpuRank2Selection>::value)
+      return stage_impl();
+    try { return stage_impl(); }
     catch (...)
     {
       method_transaction.rollback_phase = CpuFailurePhase::terminal_evidence;
@@ -4078,308 +3925,36 @@ ApplicationRunResult RunCpu(const ApplicationOptionsView& request,
     }
   }
 
-  if constexpr (std::is_same<Selection, AppCpuSerialSelection>::value)
+  if (result.failure_class == ApplicationRunResult::FailureClass::none)
   {
-    static_assert(
-        std::is_same<Selection, AppCpuSerialSelection>::value,
-        "only NoRegularization CPU serial uses the shared host lifecycle");
-    if (result.failure_class == ApplicationRunResult::FailureClass::none)
+    NoRegularizationCpuSerialMethod<Selection> method(
+        adapter, config, context, detail);
+    NoRegularizationCpuSerialPublication<Selection> publication(
+        config, context, output_directory, checkpoint_writer, initial_hash,
+        result, method, detail);
+    cpu::w8c::LifecycleControl control;
+    control.split_writer =
+        config.run_role() == ApplicationRunRoleV1::split_writer;
+    control.maximum_retries = config.retry_limit();
+    const cpu::w8c::LifecycleReport report =
+        cpu::w8c::RunCpuSerialLifecycleWithSchedule(
+            method, publication, control,
+            ApplicationCpuSerialSchedule{config});
+    result.status = report.status;
+    result.reason = report.reason;
+    result.coordinates = report.coordinates;
+    result.retries = report.retries;
+    result.failure_class =
+        report.failure == cpu::w8c::LifecycleFailure::none
+        ? ApplicationRunResult::FailureClass::none
+        : method.failure_class();
+    if (report.failure != cpu::w8c::LifecycleFailure::none)
     {
-      NoRegularizationCpuSerialMethod<Selection> method(
-          adapter, config, detail);
-      NoRegularizationCpuSerialPublication<Selection> publication(
-          config, context, output_directory, checkpoint_writer, initial_hash,
-          result, method, detail);
-      cpu::w8c::LifecycleControl control;
-      control.split_writer =
-          config.run_role() == ApplicationRunRoleV1::split_writer;
-      control.maximum_retries = config.retry_limit();
-      const cpu::w8c::LifecycleReport report =
-          cpu::w8c::RunCpuSerialLifecycleWithSchedule(
-              method, publication, control,
-              ApplicationCpuSerialSchedule{config});
-      result.status = report.status;
-      result.reason = report.reason;
-      result.coordinates = report.coordinates;
-      result.retries = report.retries;
-      result.failure_class =
-          report.failure == cpu::w8c::LifecycleFailure::none
-          ? ApplicationRunResult::FailureClass::none
-          : method.failure_class();
-      if (report.failure != cpu::w8c::LifecycleFailure::none)
-      {
-        if (detail.empty()) detail = "persistent advance did not commit";
-        AppendCpuFailureProvenance(
-            adapter.evidence().last_attempt, detail);
-      }
-    }
-  }
-  else
-  {
-    static_assert(std::is_same<Selection, AppCpuRank2Selection>::value,
-                  "non-serial CPU lifecycle is the rank-two sentinel");
-    const std::uint64_t stop_step =
-        config.run_role() == ApplicationRunRoleV1::split_writer
-        ? config.scenario_checkpoint_step() : config.accepted_steps();
-    bool retrying = false;
-    while (result.failure_class == ApplicationRunResult::FailureClass::none &&
-           adapter.coordinates().step < stop_step)
-    {
-      bool private_post_publication_retry = false;
-      const std::uint64_t target = adapter.coordinates().step + 1;
-    CpuFailureInjection injection{};
-    if (!retrying &&
-        config.injection().mode == FailureInjectionModeV1::prescribed &&
-        config.injection().target_step == target)
-    {
-      injection.phase = ToCpuPhase(config.injection().phase);
-      injection.target_step = target;
-      injection.source_rank = static_cast<int>(config.injection().source_rank);
-    }
-    AttemptOutcome outcome{};
-    const bool app_managed_injection =
-        injection.phase == CpuFailurePhase::checkpoint_staging ||
-        injection.phase == CpuFailurePhase::output_staging ||
-        injection.phase == CpuFailurePhase::commit ||
-        injection.phase == CpuFailurePhase::rollback_audit ||
-        injection.phase == CpuFailurePhase::terminal_evidence;
-    cpu::CpuPreparedStep staging;
-    const bool prepared = retrying ? adapter.PrepareRetry(staging)
-        : adapter.PrepareAdvance(staging, app_managed_injection
-                                      ? CpuFailureInjection{} : injection);
-    if (!prepared)
-    {
-      outcome = adapter.last_transition_outcome();
-      if (outcome.reason == FailureReason::none)
-        outcome = {adapter.status(), FailureReason::backend_failure, false,
-                   adapter.status() == RunStatus::retry_available};
-    }
-    else if (!staging.numerically_ready)
-      outcome = adapter.FinalizePrepared(staging);
-    else
-    {
-      DurableGenerationTransactionV1 transaction;
-      std::vector<std::uint8_t> vtk_bytes;
-      std::vector<std::uint8_t> checkpoint_bytes;
-      std::vector<std::uint8_t> metadata_bytes;
-      bool staged = BeginRootTransaction(
-          transaction, output_directory, target, context, detail);
-      CpuFailurePhase staging_failure_phase = CpuFailurePhase::output_staging;
-      const bool injected_outer_stage =
-          injection.phase == CpuFailurePhase::checkpoint_staging ||
-          injection.phase == CpuFailurePhase::output_staging;
-      const CpuStateSnapshot candidate{
-          staging.target_coordinates, staging.interior_hash,
-          staging.trace_hash, staging.state_hash, staging.interior,
-          staging.trace};
-      if (!injected_outer_stage && OutputStep(config, target))
-        staged = StageStateVtk(config, candidate, context, transaction,
-                               vtk_bytes, detail);
-      if (!injected_outer_stage && staged &&
-          config.checkpoint_out().present() &&
-          target == config.scenario_checkpoint_step())
-      {
-        staging_failure_phase = CpuFailurePhase::checkpoint_staging;
-        staged = checkpoint_writer && StageCheckpoint(
-            *checkpoint_writer, staging.future_checkpoint, staging.interior,
-            staging.trace, adapter.evidence(), context, transaction,
-            checkpoint_bytes, detail);
-      }
-      if (!staged)
-      {
-        const bool cleaned = RevertTransaction(transaction, context, detail);
-        outcome = adapter.AbortPrepared(
-            staging, cleaned ? staging_failure_phase
-                             : CpuFailurePhase::rollback_audit, -1);
-      }
-      else if (injection.phase == CpuFailurePhase::checkpoint_staging ||
-               injection.phase == CpuFailurePhase::output_staging)
-      {
-        const bool cleaned = RevertTransaction(transaction, context, detail);
-        outcome = adapter.AbortPrepared(
-            staging, cleaned ? injection.phase
-                             : CpuFailurePhase::rollback_audit,
-            injection.source_rank);
-      }
-      else
-      {
-        cpu::CpuPreparedCommit commit;
-        if (!adapter.PrepareCommit(staging, commit))
-        {
-          const bool cleaned = RevertTransaction(transaction, context, detail);
-          outcome = adapter.last_transition_outcome();
-          if (!cleaned)
-            outcome = {RunStatus::terminal_failure,
-                       FailureReason::backend_failure, false, false};
-        }
-        else
-        {
-          const bool terminal_target = target == stop_step;
-          if (terminal_target)
-          {
-            ApplicationRunResult anticipated = result;
-            anticipated.status = RunStatus::committed;
-            anticipated.reason = FailureReason::none;
-            anticipated.failure_class =
-                ApplicationRunResult::FailureClass::none;
-            anticipated.coordinates = candidate.coordinates;
-            StateHash terminal_identity{};
-            bool metadata_staged = GlobalCpuStateIdentity(
-                candidate, context, terminal_identity);
-            if (context.rank() == 0)
-            {
-              try
-              {
-                const std::string metadata = Metadata(
-                    config, anticipated, adapter.evidence(), initial_hash,
-                    terminal_identity, detail);
-                metadata_bytes.assign(metadata.begin(), metadata.end());
-                metadata_staged = transaction.Stage(
-                    config.run_role() == ApplicationRunRoleV1::split_writer
-                        ? "run-metadata-checkpoint.json"
-                        : "run-metadata.json",
-                    metadata_bytes.data(), metadata_bytes.size(), detail) ==
-                    DurableIoStatus::ok;
-              }
-              catch (...) { metadata_staged = false; }
-            }
-            staged = CollectiveAll(metadata_staged, context.communicator());
-          }
-          if (!staged ||
-              injection.phase == CpuFailurePhase::terminal_evidence ||
-              injection.phase == CpuFailurePhase::commit)
-          {
-            const bool cleaned = RevertTransaction(transaction, context,
-                                                   detail);
-            const CpuFailurePhase phase = !staged
-                ? CpuFailurePhase::terminal_evidence : injection.phase;
-            outcome = adapter.AbortPrepared(
-                commit, cleaned ? phase : CpuFailurePhase::rollback_audit,
-                staged ? injection.source_rank : -1);
-          }
-          else
-          {
-            cpu::CpuProvisionalCommit provisional;
-            if (!adapter.CommitPrepared(commit, provisional))
-            {
-              const bool cleaned = RevertTransaction(transaction, context,
-                                                     detail);
-              outcome = adapter.last_transition_outcome();
-              if (!cleaned)
-                outcome = {RunStatus::terminal_failure,
-                           FailureReason::backend_failure, false, false};
-            }
-            else if (injection.phase == CpuFailurePhase::rollback_audit)
-            {
-              const bool cleaned = RevertTransaction(transaction, context,
-                                                     detail);
-              outcome = adapter.RevertCommit(
-                  provisional,
-                  cleaned ? injection.phase
-                          : CpuFailurePhase::rollback_audit,
-                  injection.source_rank);
-            }
-            else
-            {
-              const bool published = PublishRootTransaction(
-                  transaction, context, detail);
-              if (!published)
-              {
-                const bool cleaned =
-                    RevertTransaction(transaction, context, detail);
-                outcome = adapter.RevertCommit(
-                    provisional,
-                    cleaned ? CpuFailurePhase::output_staging
-                            : CpuFailurePhase::rollback_audit, -1);
-              }
-              else
-              {
-                int marker_source_rank = -1;
-                int finalize_source_rank = -1;
-                const bool marker_acknowledged = CollectiveAll(
-                    !ConsumePostPublicationFault(
-                        PostPublicationFault::after_marker, target,
-                        context.rank(), marker_source_rank),
-                    context.communicator());
-                const bool finalize_ready = marker_acknowledged &&
-                    CollectiveAll(
-                        !ConsumePostPublicationFault(
-                            PostPublicationFault::before_finalize, target,
-                            context.rank(), finalize_source_rank),
-                        context.communicator());
-                if (!finalize_ready)
-                {
-                  const bool cleaned =
-                      RevertTransaction(transaction, context, detail);
-                  outcome = adapter.RevertCommit(
-                      provisional,
-                      cleaned ? (marker_acknowledged
-                                     ? CpuFailurePhase::commit
-                                     : CpuFailurePhase::output_staging)
-                              : CpuFailurePhase::rollback_audit,
-                      marker_acknowledged ? finalize_source_rank
-                                          : marker_source_rank);
-                  private_post_publication_retry = cleaned &&
-                      PostPublicationFaultAllowsRetry() &&
-                      result.retries == 0;
-                }
-                else
-                {
-                  outcome = adapter.FinalizeCommit(provisional);
-                  if (!outcome.committed)
-                  {
-                    const bool cleaned =
-                        RevertTransaction(transaction, context, detail);
-                    if (!cleaned)
-                      outcome = {RunStatus::terminal_failure,
-                                 FailureReason::backend_failure, false, false};
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    if (!outcome.committed && outcome.retry_available &&
-        (result.retries < config.retry_limit() ||
-         private_post_publication_retry))
-    {
-      AppendCpuFailureProvenance(adapter.evidence().last_attempt, detail);
-      ++result.retries;
-      retrying = true;
-      continue;
-    }
-    if (!outcome.committed)
-    {
-      result.status = outcome.status;
-      result.reason = outcome.reason;
-      const CpuAttemptEvidence& failed = adapter.evidence().last_attempt;
-      const bool prescribed_failure_fired =
-          config.injection().mode == FailureInjectionModeV1::prescribed &&
-          failed.status == CpuAttemptStatus::injected_failure &&
-          failed.failure_phase == ToCpuPhase(config.injection().phase) &&
-          failed.failure_source_rank ==
-              static_cast<int>(config.injection().source_rank);
-      const bool scientific_failure = ScientificFailureReason(outcome.reason) ||
-          (failed.status == CpuAttemptStatus::success &&
-           failed.failure_phase == CpuFailurePhase::none &&
-           (!failed.finite_gate || !failed.admissibility_gate ||
-            !failed.recovery_gate || !failed.nonlinear_gate ||
-            !failed.true_residual_gate));
-      result.failure_class = prescribed_failure_fired
-          ? ApplicationRunResult::FailureClass::injected
-          : (scientific_failure
-                 ? ApplicationRunResult::FailureClass::scientific
-                 : ApplicationRunResult::FailureClass::backend);
       if (detail.empty()) detail = "persistent advance did not commit";
-      AppendCpuFailureProvenance(failed, detail);
-      break;
-    }
-      retrying = false;
+      AppendCpuFailureProvenance(
+          adapter.evidence().last_attempt, detail);
     }
   }
-
   result.coordinates = initialized ? adapter.coordinates() : StateCoordinates{};
   if (result.failure_class == ApplicationRunResult::FailureClass::none)
   {
