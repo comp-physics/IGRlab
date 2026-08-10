@@ -3284,10 +3284,26 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
     return valid && hash.Finalize(digest) ? StateHash{digest} : StateHash{};
   }
 
-  static PublishedState StateFromCheckpoint(
-      const ScalarCudaCheckpoint& checkpoint) noexcept
+  static bool StateFromCheckpoint(const ScalarCudaCheckpoint& checkpoint,
+                                  PublishedState& state) noexcept
   {
-    PublishedState state{};
+    const int scalar_nodes = persistent_elements * volume_nodes;
+    try
+    {
+      state.u.resize(static_cast<std::size_t>(state_components) *
+                     scalar_nodes);
+      state.sigma.resize(scalar_nodes);
+      state.z.resize(static_cast<std::size_t>(flux_components) *
+                     scalar_nodes);
+      state.uhat.resize(static_cast<std::size_t>(state_components) *
+                        persistent_scalar_trace_nodes);
+      state.sigmahat.resize(persistent_scalar_trace_nodes);
+    }
+    catch (...)
+    {
+      state = {};
+      return false;
+    }
     for (int element = 0; element < persistent_elements; ++element)
       for (int a = 0; a < volume_nodes; ++a)
       {
@@ -3296,23 +3312,23 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
         {
           state.u[(element * state_components + component) * volume_nodes +
                   a] = checkpoint.interior_component_slabs[
-              component * persistent_scalar_trace_nodes + scalar_node];
+              component * scalar_nodes + scalar_node];
         }
         state.sigma[scalar_node] = checkpoint.interior_component_slabs[
-            state_components * persistent_scalar_trace_nodes + scalar_node];
+            state_components * scalar_nodes + scalar_node];
         for (int component = 0; component < flux_components; ++component)
         {
           state.z[(element * flux_components + component) * volume_nodes +
                   a] = checkpoint.interior_component_slabs[
               (state_components + 1 + component) *
-                  persistent_scalar_trace_nodes + scalar_node];
+                  scalar_nodes + scalar_node];
         }
       }
     std::copy_n(checkpoint.trace_component_slabs.begin(), state.uhat.size(),
                 state.uhat.begin());
     std::copy_n(checkpoint.trace_component_slabs.begin() + state.uhat.size(),
                 state.sigmahat.size(), state.sigmahat.begin());
-    return state;
+    return true;
   }
 
   bool CaptureCheckpointSlot(const int slot,
@@ -3358,7 +3374,12 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
       output = {};
       return false;
     }
-    const PublishedState state = StateFromCheckpoint(output);
+    PublishedState state;
+    if (!StateFromCheckpoint(output, state))
+    {
+      output = {};
+      return false;
+    }
     output.projection = StableIdentity::Copy(projection_id);
     output.tuple = StableIdentity::Copy(cuda_rank1_tuple_id);
     output.scenario = StableIdentity::Copy(cuda_rank1_fixture_id);
@@ -4464,8 +4485,11 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank1::
           static_cast<double>(descriptor.coordinates.step) * fixed_dt &&
       descriptor.coordinates.dt == fixed_dt;
   if (!identity) { return ScalarCudaStatus::restart_identity_failure; }
-  const PublishedState host_state = Implementation::StateFromCheckpoint(
-      checkpoint);
+  PublishedState host_state;
+  if (!Implementation::StateFromCheckpoint(checkpoint, host_state))
+  {
+    return ScalarCudaStatus::restart_hash_failure;
+  }
   const StateHashes hashes = HashPublishedState(host_state);
   if (!SameStateHashes(hashes, checkpoint.raw_field_hashes) ||
       descriptor.interior_hash != hashes.interior ||
