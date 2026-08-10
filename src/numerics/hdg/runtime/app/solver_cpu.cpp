@@ -33,6 +33,9 @@
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
 namespace dg::hdg::runtime::cpu::sc25::w8c_internal
 {
+[[gnu::visibility("hidden")]] bool PrimePersistentTrajectoryTransaction(
+    PersistentSc25ScalarIgrCpuFoundation& owner,
+    PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction& token) noexcept;
 [[gnu::visibility("hidden")]] void RequestW8cInitialization(
     const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept;
 [[gnu::visibility("hidden")]] void RequestSmoothTransitionInitialization(
@@ -1171,6 +1174,12 @@ struct ScalarIgrCpuTraits<false> final
     return owner.PreparePersistentTrajectoryTransaction(transaction,
                                                         injection);
   }
+  static bool Prime(sc25::PersistentSc25ScalarIgrCpuFoundation& owner,
+                    Transaction& transaction) noexcept
+  {
+    return sc25::w8c_internal::PrimePersistentTrajectoryTransaction(
+        owner, transaction);
+  }
   static bool Install(sc25::PersistentSc25ScalarIgrCpuFoundation& owner,
                       Transaction& transaction) noexcept
   {
@@ -1245,6 +1254,9 @@ struct ScalarIgrCpuTraits<true> final
     return owner.PreparePersistentRank2TrajectoryTransaction(transaction,
                                                              injection);
   }
+  static bool Prime(sc25::PersistentSc25ScalarIgrCpuFoundation&,
+                    Transaction&) noexcept
+  { return true; }
   static bool Install(sc25::PersistentSc25ScalarIgrCpuFoundation& owner,
                       Transaction& transaction) noexcept
   {
@@ -1915,10 +1927,22 @@ public:
   {}
 
   bool Initialize() const noexcept { return true; }
+  bool PrimeTransaction(Transaction& transaction) noexcept
+  {
+    transaction.prescribed = false;
+    transaction.app_injected = false;
+    transaction.private_preparation_injected = false;
+    transaction.installed = false;
+    return Traits::Prime(owner_, transaction.numerical);
+  }
 
   bool Prepare(Transaction& transaction, const bool,
                const std::uint64_t target) noexcept
   {
+    transaction.prescribed = false;
+    transaction.app_injected = false;
+    transaction.private_preparation_injected = false;
+    transaction.installed = false;
     const bool prescribed = !injected_ &&
         config_.injection().mode == FailureInjectionModeV1::prescribed &&
         config_.injection().target_step == target;
@@ -2620,9 +2644,16 @@ public:
     return adapter_.Initialize(numerical);
   }
 
+  bool PrimeTransaction(Transaction& transaction) noexcept
+  {
+    transaction = {};
+    return true;
+  }
+
   bool Prepare(Transaction& transaction, const bool retry,
                const std::uint64_t) noexcept
   {
+    transaction = {};
     const bool prepared = retry ? adapter_.PrepareRetry(transaction.staging)
                                 : adapter_.PrepareAdvance(transaction.staging);
     if (!prepared) return false;
@@ -2969,6 +3000,11 @@ public:
       cpu::sc25::w8c_internal::RequestW8cInitialization(*owner_);
     return ScalarIgrCpuTraits<false>::Initialize(*owner_) ==
         sc25::TrajectoryStatus::ready;
+  }
+
+  bool PrimeTransaction(Transaction& transaction) noexcept
+  {
+    return owner_ && ScalarIgrCpuTraits<false>::Prime(*owner_, transaction);
   }
 
   bool Prepare(Transaction& transaction, const bool retry,
@@ -3422,10 +3458,16 @@ public:
   {}
 
   bool Initialize() const noexcept { return true; }
+  bool PrimeTransaction(Transaction& transaction) noexcept
+  {
+    transaction = {};
+    return true;
+  }
 
   bool Prepare(Transaction& transaction, const bool retrying,
                const std::uint64_t target) noexcept
   {
+    transaction = {};
     if (!retrying &&
         config_.injection().mode == FailureInjectionModeV1::prescribed &&
         config_.injection().target_step == target)

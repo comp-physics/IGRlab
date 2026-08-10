@@ -335,6 +335,12 @@ LifecycleReport RunCpuSerialLifecycleWithSchedule(
   if (!method.Initialize())
     return fail(LifecycleFailure::initialization,
                 FailureReason::backend_failure);
+  // One transaction survives every accepted step/retry.  Method-specific
+  // priming may reserve owned numerical payloads before the noexcept loop.
+  Transaction transaction;
+  if (!method.PrimeTransaction(transaction))
+    return fail(LifecycleFailure::initialization,
+                FailureReason::backend_failure);
   report.status = RunStatus::ready;
   report.reason = FailureReason::none;
   report.coordinates = method.Coordinates();
@@ -354,7 +360,6 @@ LifecycleReport RunCpuSerialLifecycleWithSchedule(
   while (method.Coordinates().step < stop_step)
   {
     const std::uint64_t target = method.Coordinates().step + 1;
-    Transaction transaction;
     LifecycleFailure failure = LifecycleFailure::none;
     LifecycleAttemptOutcome outcome{};
     bool committed = false;

@@ -20,6 +20,9 @@
 
 namespace dg::hdg::runtime::cpu::sc25::w8c_internal
 {
+[[gnu::visibility("hidden")]] bool PrimePersistentTrajectoryTransaction(
+    PersistentSc25ScalarIgrCpuFoundation& owner,
+    PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction& token) noexcept;
 [[gnu::visibility("hidden")]] void RequestW8cInitialization(
     const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept;
 }
@@ -127,13 +130,16 @@ bool CloseArrays(const double* left, const double* right,
 bool SameScalarStateBytes(const sc25::PersistentTrajectoryState& left,
                           const sc25::PersistentTrajectoryState& right) noexcept
 {
-  return std::memcmp(left.u.data(), right.u.data(), sizeof(left.u)) == 0 &&
-      std::memcmp(left.sigma.data(), right.sigma.data(),
-                  sizeof(left.sigma)) == 0 &&
-      std::memcmp(left.z.data(), right.z.data(), sizeof(left.z)) == 0 &&
-      std::memcmp(left.uhat.data(), right.uhat.data(), sizeof(left.uhat)) == 0 &&
-      std::memcmp(left.sigmahat.data(), right.sigmahat.data(),
-                  sizeof(left.sigmahat)) == 0;
+  const auto equal = [](const std::vector<double>& a,
+                        const std::vector<double>& b) noexcept
+  {
+    return a.size() == b.size() &&
+        (a.empty() || std::memcmp(a.data(), b.data(),
+                                  a.size() * sizeof(double)) == 0);
+  };
+  return equal(left.u, right.u) && equal(left.sigma, right.sigma) &&
+      equal(left.z, right.z) && equal(left.uhat, right.uhat) &&
+      equal(left.sigmahat, right.sigmahat);
 }
 
 bool ScalarAccepted(const sc25::TrajectoryStatus status) noexcept
@@ -328,13 +334,16 @@ int main(int argc, char** argv)
   sc25::TrajectoryStatus scalar_terminal = sc25::TrajectoryStatus::ready;
   sc25::PersistentTrajectoryState scalar_before_failure{};
   sc25::PersistentTrajectoryState scalar_after_failure{};
+  sc25::PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction transaction;
+  checks.Require(sc25::w8c_internal::PrimePersistentTrajectoryTransaction(
+                     *scalar, transaction),
+                 "scalar W8C reusable transaction prime");
   while (scalar->trajectory_evidence().coordinates.step <
          w8c::accepted_steps)
   {
     checks.Require(scalar->CopyPublishedTrajectoryState(
                        scalar_before_failure),
                    "scalar W8C pre-attempt state copy");
-    sc25::PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction transaction;
     scalar_terminal = scalar->PreparePersistentTrajectoryTransaction(
         transaction, sc25::TrajectoryFailureInjection::none);
     if (!ScalarAccepted(scalar_terminal)) break;

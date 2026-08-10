@@ -142,7 +142,7 @@ bool ReadOrdinaryVtk(const std::string& path, const bool scalar,
 {
   std::ifstream input(path);
   if (!input) { error = "cannot open " + path; return false; }
-  std::vector<std::vector<double>> fields(4);
+  std::array<std::vector<double>, 4> fields{};
   const std::string prefix = scalar ? "U" : "conservative";
   std::string token;
   std::size_t point_data = 0;

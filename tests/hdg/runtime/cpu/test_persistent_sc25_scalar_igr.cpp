@@ -18,8 +18,18 @@ extern "C" void dg_igr_sc25_rank2_test_inject_boundary_drift(
 extern "C" void dg_igr_sc25_rank2_test_inject_final_install_mismatch(
     int enabled) noexcept;
 
+namespace dg::hdg::runtime::cpu::sc25::w8c_internal
+{
+[[gnu::visibility("hidden")]] bool PrimePersistentTrajectoryTransaction(
+    PersistentSc25ScalarIgrCpuFoundation& owner,
+    PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction& token) noexcept;
+}
+
 namespace
 {
+  const auto equal_double = [](const double a, const double b) noexcept
+  { return dg::hdg::runtime::detail::DoubleBits(a) ==
+        dg::hdg::runtime::detail::DoubleBits(b); };
 
 namespace sc25 = dg::hdg::runtime::cpu::sc25;
 
@@ -77,11 +87,12 @@ bool Accepted(const sc25::TrajectoryStatus status) noexcept
       status == sc25::TrajectoryStatus::HdgSc25AcceptedAfterOneRetry;
 }
 
-template <std::size_t N>
-bool EqualFp64Bytes(const std::array<double, N>& left,
-                    const std::array<double, N>& right) noexcept
+template <typename Range>
+bool EqualFp64Bytes(const Range& left, const Range& right) noexcept
 {
-  return std::memcmp(left.data(), right.data(), N * sizeof(double)) == 0;
+  return left.size() == right.size() &&
+      (left.empty() || std::memcmp(left.data(), right.data(),
+                                   left.size() * sizeof(double)) == 0);
 }
 
 bool EqualStateBytes(const sc25::PersistentTrajectoryState& left,
@@ -124,10 +135,142 @@ bool EqualTrajectoryEvidenceBytes(
     const sc25::PersistentTrajectoryEvidence& left,
     const sc25::PersistentTrajectoryEvidence& right) noexcept
 {
-  static_assert(std::is_trivially_copyable<
-                    sc25::PersistentTrajectoryEvidence>::value,
-                "rank1 transaction evidence must be byte-comparable");
-  return std::memcmp(&left, &right, sizeof(left)) == 0;
+  const auto equal_hashes = [](const sc25::TrajectoryStateHashes& a,
+                               const sc25::TrajectoryStateHashes& b) noexcept
+  {
+    return a.u == b.u && a.sigma == b.sigma && a.z == b.z &&
+        a.uhat == b.uhat && a.sigmahat == b.sigmahat &&
+        a.interior == b.interior && a.trace == b.trace;
+  };
+  const auto equal_reuse = [](const sc25::TrajectoryReuseSnapshot& a,
+                              const sc25::TrajectoryReuseSnapshot& b) noexcept
+  {
+    return a.foundation_handle == b.foundation_handle &&
+        a.topology_handle == b.topology_handle &&
+        a.carrier_map_handle == b.carrier_map_handle &&
+        a.contract_handle == b.contract_handle &&
+        a.assembly_state_handle == b.assembly_state_handle &&
+        a.assembly_handle == b.assembly_handle &&
+        a.trial_assembly_handle == b.trial_assembly_handle &&
+        a.factor_handle == b.factor_handle && a.workspace_handle == b.workspace_handle &&
+        a.quadrature_workspace_handle == b.quadrature_workspace_handle &&
+        a.local_pattern_handle == b.local_pattern_handle &&
+        a.true_matrix_handle == b.true_matrix_handle && a.true_rhs_handle == b.true_rhs_handle &&
+        a.true_solution_handle == b.true_solution_handle && a.ilu_handle == b.ilu_handle &&
+        a.gmres_handle == b.gmres_handle && a.true_residual_handle == b.true_residual_handle &&
+        a.element_to_true_csr_handle == b.element_to_true_csr_handle &&
+        a.owned_boundary_identity_hash == b.owned_boundary_identity_hash &&
+        a.topology_generation == b.topology_generation && a.storage_generation == b.storage_generation &&
+        a.factor_generation == b.factor_generation && a.workspace_generation == b.workspace_generation &&
+        a.local_pattern_generation == b.local_pattern_generation && a.solver_generation == b.solver_generation &&
+        a.w8_owned_boundary_object_count == b.w8_owned_boundary_object_count &&
+        a.w8_owned_boundary_buffer_count == b.w8_owned_boundary_buffer_count &&
+        a.opaque_mfem_hypre_observed == b.opaque_mfem_hypre_observed;
+  };
+  const auto equal_initialization = [&](const sc25::AuxiliaryInitializationEvidence& a,
+                                        const sc25::AuxiliaryInitializationEvidence& b) noexcept
+  {
+    const auto bits = equal_double;
+    const auto metrics = [&](const sc25::AuxiliaryResidualMetrics& x,
+                             const sc25::AuxiliaryResidualMetrics& y) noexcept
+    { return bits(x.r_z_norm,y.r_z_norm) && bits(x.r_z_scale,y.r_z_scale) &&
+        bits(x.r_sigma_norm,y.r_sigma_norm) && bits(x.r_sigma_scale,y.r_sigma_scale) &&
+        bits(x.g_sigma_norm,y.g_sigma_norm) && bits(x.g_sigma_scale,y.g_sigma_scale) &&
+        bits(x.normalized_maximum,y.normalized_maximum); };
+    return a.quadrature_order == b.quadrature_order && a.trace_restart_dimension == b.trace_restart_dimension &&
+        a.trace_maximum_iterations == b.trace_maximum_iterations &&
+        bits(a.trace_relative_tolerance,b.trace_relative_tolerance) && bits(a.trace_absolute_tolerance,b.trace_absolute_tolerance) &&
+        a.ilu_type == b.ilu_type && a.ilu_level_of_fill == b.ilu_level_of_fill &&
+        a.ilu_local_reordering == b.ilu_local_reordering && a.trace_iterations == b.trace_iterations &&
+        bits(a.trace_true_residual_norm,b.trace_true_residual_norm) &&
+        bits(a.trace_right_hand_side_norm,b.trace_right_hand_side_norm) && metrics(a.residual,b.residual);
+  };
+  const auto equal_newton = [&](const sc25::TrajectoryNewtonEvidence& a,
+                                 const sc25::TrajectoryNewtonEvidence& b) noexcept
+  {
+    return a.iteration == b.iteration &&
+        equal_double(a.entry_residual_norm, b.entry_residual_norm) &&
+        equal_double(a.accepted_residual_norm, b.accepted_residual_norm) &&
+        a.accepted_line_search_index == b.accepted_line_search_index &&
+        a.trace_iterations == b.trace_iterations &&
+        equal_double(a.trace_true_residual_norm, b.trace_true_residual_norm) &&
+        equal_double(a.trace_right_hand_side_norm, b.trace_right_hand_side_norm) &&
+        equal_double(a.maximum_local_application_residual,
+                     b.maximum_local_application_residual) &&
+        EqualStateBytes(a.entry, b.entry) &&
+        EqualStateBytes(a.direction, b.direction) &&
+        EqualFp64Bytes(a.trial_residual_norms, b.trial_residual_norms) &&
+        a.trial_admissible == b.trial_admissible &&
+        a.trial_armijo == b.trial_armijo;
+  };
+  if (left.status != right.status || left.first_failure != right.first_failure ||
+      left.first_assembly_failure != right.first_assembly_failure ||
+      left.contract_status != right.contract_status ||
+      left.contract_last_failure != right.contract_last_failure ||
+      left.contract_first_failure != right.contract_first_failure ||
+      left.accepted_steps != right.accepted_steps ||
+      left.attempted_steps != right.attempted_steps ||
+      left.retry_attempts != right.retry_attempts ||
+      left.attempt_count != right.attempt_count ||
+      left.step_evidence_count != right.step_evidence_count ||
+      left.checkpoint_step_offset != right.checkpoint_step_offset ||
+      !dg::hdg::runtime::detail::SameCoordinates(
+          left.continuation_start_coordinates, right.continuation_start_coordinates) ||
+      !EqualStateBytes(left.continuation_start_state,
+                       right.continuation_start_state) ||
+      !equal_hashes(left.continuation_start_hashes,
+                    right.continuation_start_hashes) ||
+      left.restored_loaded_state_match != right.restored_loaded_state_match ||
+      left.restored_loaded_coordinates_match != right.restored_loaded_coordinates_match ||
+      left.restored_loaded_hashes_match != right.restored_loaded_hashes_match ||
+      left.trace_restart_dimension != right.trace_restart_dimension ||
+      left.trace_maximum_iterations != right.trace_maximum_iterations ||
+      !equal_double(left.trace_relative_tolerance, right.trace_relative_tolerance) ||
+      !equal_double(left.trace_absolute_tolerance, right.trace_absolute_tolerance) ||
+      left.ilu_type != right.ilu_type || left.ilu_level_of_fill != right.ilu_level_of_fill ||
+      left.ilu_local_reordering != right.ilu_local_reordering ||
+      !dg::hdg::runtime::detail::SameCoordinates(left.coordinates, right.coordinates) ||
+      !equal_initialization(left.initialization, right.initialization) ||
+      !equal_reuse(left.reuse.baseline, right.reuse.baseline) ||
+      !equal_reuse(left.reuse.current, right.reuse.current) ||
+      left.reuse.true_matrix_nonzeros != right.reuse.true_matrix_nonzeros ||
+      left.reuse.detected_w8_owned_boundary_identity_changes !=
+          right.reuse.detected_w8_owned_boundary_identity_changes ||
+      left.reuse.w8_device_transfer_calls != right.reuse.w8_device_transfer_calls ||
+      left.reuse.opaque_mfem_hypre_observed != right.reuse.opaque_mfem_hypre_observed)
+    return false;
+  for (std::size_t i = 0; i < left.attempts.size(); ++i)
+  {
+    const auto& a = left.attempts[i]; const auto& b = right.attempts[i];
+    if (a.status != b.status || a.injection != b.injection ||
+        a.target_step != b.target_step || a.retry_index != b.retry_index ||
+        !equal_double(a.dt, b.dt) || a.attempted_newton_iterations != b.attempted_newton_iterations ||
+        a.newton_iterations != b.newton_iterations ||
+        !equal_double(a.entry_residual_norm, b.entry_residual_norm) ||
+        !equal_double(a.final_residual_norm, b.final_residual_norm) ||
+        !equal_double(a.nonlinear_residual_bound, b.nonlinear_residual_bound) ||
+        !equal_double(a.maximum_conservation_error, b.maximum_conservation_error) ||
+        !equal_double(a.minimum_density, b.minimum_density) || !equal_double(a.minimum_pressure, b.minimum_pressure) ||
+        !equal_double(a.minimum_speed_margin, b.minimum_speed_margin) ||
+        !dg::hdg::runtime::detail::SameCoordinates(a.committed_coordinates, b.committed_coordinates) ||
+        !dg::hdg::runtime::detail::SameCoordinates(a.published_coordinates, b.published_coordinates) ||
+        !equal_hashes(a.entry_hashes, b.entry_hashes) || !equal_hashes(a.candidate_hashes, b.candidate_hashes) ||
+        !equal_hashes(a.published_hashes, b.published_hashes) ||
+        !equal_reuse(a.entry_reuse, b.entry_reuse) || !equal_reuse(a.exit_reuse, b.exit_reuse)) return false;
+    for (std::size_t j = 0; j < a.newton.size(); ++j)
+      if (!equal_newton(a.newton[j], b.newton[j])) return false;
+  }
+  for (std::size_t i = 0; i < left.steps.size(); ++i)
+  {
+    const auto& a = left.steps[i]; const auto& b = right.steps[i];
+    if (a.accepted != b.accepted || a.step != b.step || !equal_double(a.time, b.time) ||
+        !equal_double(a.dt, b.dt) || a.generation != b.generation || a.attempt_index != b.attempt_index ||
+        !EqualFp64Bytes(a.committed_integrals, b.committed_integrals) ||
+        !EqualFp64Bytes(a.accepted_integrals, b.accepted_integrals) ||
+        !EqualStateBytes(a.accepted_state, b.accepted_state) ||
+        !equal_hashes(a.accepted_hashes, b.accepted_hashes) || !equal_reuse(a.reuse, b.reuse)) return false;
+  }
+  return true;
 }
 
 bool EqualRank2EvidenceBoundary(
@@ -401,6 +544,8 @@ int RunTrajectoryHarness()
   };
   sc25::PersistentTrajectoryState positive_zero_state{};
   sc25::PersistentTrajectoryState negative_zero_state{};
+  positive_zero_state.u.assign(1, 0.0);
+  negative_zero_state.u.assign(1, 0.0);
   negative_zero_state.u[0] = -0.0;
   if (EqualStateBytes(positive_zero_state, negative_zero_state))
   {
@@ -432,17 +577,25 @@ int RunTrajectoryHarness()
     }
     else
     {
+      dg::hdg::runtime::PersistentResourceDescriptor initial_resources;
       sc25::PersistentTrajectoryState step0_state;
       const auto step0_evidence =
           std::make_unique<sc25::PersistentTrajectoryEvidence>(
               owner->trajectory_evidence());
       sc25::PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction invalid;
-      if (!owner->CopyPublishedTrajectoryState(step0_state) ||
+      if (!owner->CopyPersistentResourceDescriptor(initial_resources) ||
+          initial_resources.reuse.persistent_bytes == 0 ||
+          !owner->CopyPublishedTrajectoryState(step0_state) ||
           owner->InstallPersistentTrajectoryTransaction(invalid))
       {
         fail("rank1 invalid transaction token rejection");
       }
       sc25::PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction prepared;
+      if (!sc25::w8c_internal::PrimePersistentTrajectoryTransaction(
+              *owner, prepared))
+      {
+        fail("rank1 transaction prime");
+      }
       const sc25::TrajectoryStatus prepared_status =
           owner->PreparePersistentTrajectoryTransaction(prepared);
       sc25::PersistentTrajectoryState after_prepare;
@@ -480,7 +633,11 @@ int RunTrajectoryHarness()
         fail("rank1 exact revert and stale reuse rejection");
       }
       sc25::PersistentTrajectoryState after_revert;
-      if (!owner->CopyPublishedTrajectoryState(after_revert) ||
+      dg::hdg::runtime::PersistentResourceDescriptor reverted_resources;
+      if (!owner->CopyPersistentResourceDescriptor(reverted_resources) ||
+          reverted_resources.reuse.persistent_bytes !=
+              initial_resources.reuse.persistent_bytes ||
+          !owner->CopyPublishedTrajectoryState(after_revert) ||
           !EqualStateBytes(after_revert, step0_state) ||
           !EqualTrajectoryEvidenceBytes(owner->trajectory_evidence(),
                                         *step0_evidence))
@@ -490,7 +647,9 @@ int RunTrajectoryHarness()
 
       sc25::PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction
           finalized_transaction;
-      if (!Accepted(owner->PreparePersistentTrajectoryTransaction(
+      if (!sc25::w8c_internal::PrimePersistentTrajectoryTransaction(
+              *owner, finalized_transaction) ||
+          !Accepted(owner->PreparePersistentTrajectoryTransaction(
               finalized_transaction)) ||
           !owner->InstallPersistentTrajectoryTransaction(
               finalized_transaction))
@@ -513,6 +672,32 @@ int RunTrajectoryHarness()
           owner->trajectory_evidence().coordinates.step != 1)
       {
         fail("rank1 finalized checkpoint equals frozen future checkpoint");
+      }
+      sc25::PersistentTrajectoryState before_pending_restore;
+      dg::hdg::runtime::PersistentResourceDescriptor before_pending_resources;
+      dg::hdg::runtime::PersistentResourceDescriptor after_pending_resources;
+      const auto before_pending_evidence =
+          std::make_unique<sc25::PersistentTrajectoryEvidence>(
+              owner->trajectory_evidence());
+      sc25::PersistentSc25ScalarIgrCpuFoundation::Rank1Transaction pending;
+      if (!sc25::w8c_internal::PrimePersistentTrajectoryTransaction(
+              *owner, pending) ||
+          !owner->CopyPublishedTrajectoryState(before_pending_restore) ||
+          !owner->CopyPersistentResourceDescriptor(before_pending_resources) ||
+          !Accepted(owner->PreparePersistentTrajectoryTransaction(pending)) ||
+          owner->RestoreTrajectoryCheckpoint(finalized) !=
+              sc25::TrajectoryStatus::invalid_configuration ||
+          !owner->CopyPublishedTrajectoryState(after_revert) ||
+          !owner->CopyPersistentResourceDescriptor(after_pending_resources) ||
+          !EqualStateBytes(before_pending_restore, after_revert) ||
+          before_pending_resources.reuse.persistent_bytes !=
+              after_pending_resources.reuse.persistent_bytes ||
+          !EqualTrajectoryEvidenceBytes(owner->trajectory_evidence(),
+                                        *before_pending_evidence) ||
+          !owner->InstallPersistentTrajectoryTransaction(pending) ||
+          !owner->RevertPersistentTrajectoryTransaction(std::move(pending)))
+      {
+        fail("rank1 active transaction restore rejection is atomic");
       }
       sc25::PersistentTrajectoryCheckpoint imported;
       dg::hdg::runtime::PersistentResourceDescriptor resources;
