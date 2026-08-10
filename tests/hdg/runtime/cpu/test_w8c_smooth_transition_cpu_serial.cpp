@@ -18,6 +18,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -145,7 +146,9 @@ bool ReadOrdinaryVtk(const std::string& path, const bool scalar,
   std::array<std::vector<double>, 4> fields{};
   const std::string prefix = scalar ? "U" : "conservative";
   std::string token;
-  std::size_t point_data = 0;
+  std::size_t data_count = 0;
+  enum class DataAssociation { none, cells, points };
+  DataAssociation association = DataAssociation::none;
   while (input >> token)
   {
     if (token == "POINTS")
@@ -180,24 +183,44 @@ bool ReadOrdinaryVtk(const std::string& path, const bool scalar,
     }
     else if (token == "POINT_DATA")
     {
-      if (!(input >> point_data)) { error = "malformed POINT_DATA in " + path; return false; }
+      if (!(input >> data_count) || data_count != result.points.size())
+      { error = "malformed POINT_DATA in " + path; return false; }
+      association = DataAssociation::points;
+    }
+    else if (token == "CELL_DATA")
+    {
+      if (!(input >> data_count) || data_count != result.cells.size())
+      { error = "malformed CELL_DATA in " + path; return false; }
+      association = DataAssociation::cells;
     }
     else if (token == "SCALARS")
     {
       std::string name;
       std::string type;
-      std::size_t components = 0;
+      std::size_t components = 1;
       std::string lookup;
       std::string lookup_name;
-      if (!(input >> name >> type >> components >> lookup >> lookup_name) ||
-          lookup != "LOOKUP_TABLE" || point_data != result.points.size())
+      std::string header;
+      if (!(input >> name >> type) || !std::getline(input, header))
       { error = "malformed scalar field in " + path; return false; }
-      std::vector<double> values(point_data * components);
+      std::istringstream component_header{header};
+      component_header >> std::ws;
+      if (component_header.peek() != std::char_traits<char>::eof() &&
+          (!(component_header >> components) || components == 0))
+      { error = "malformed scalar field in " + path; return false; }
+      component_header >> std::ws;
+      if (component_header.peek() != std::char_traits<char>::eof())
+      { error = "malformed scalar field in " + path; return false; }
+      if (!(input >> lookup >> lookup_name) || lookup != "LOOKUP_TABLE" ||
+          association == DataAssociation::none || data_count == 0)
+      { error = "malformed scalar field in " + path; return false; }
+      std::vector<double> values(data_count * components);
       for (double& value : values)
         if (!(input >> value) || !std::isfinite(value))
         { error = "invalid scalar value in " + path; return false; }
       for (std::size_t component = 0; component < fields.size(); ++component)
-        if (name == prefix + std::to_string(component) && components == 1)
+        if (association == DataAssociation::points &&
+            name == prefix + std::to_string(component) && components == 1)
           fields[component] = std::move(values);
     }
     else if (token == "VECTORS")
@@ -205,8 +228,10 @@ bool ReadOrdinaryVtk(const std::string& path, const bool scalar,
       std::string name;
       std::string type;
       if (!(input >> name >> type)) { error = "malformed VECTORS in " + path; return false; }
+      if (association == DataAssociation::none || data_count == 0)
+      { error = "malformed VECTORS in " + path; return false; }
       double ignored = 0.0;
-      for (std::size_t index = 0; index < 3 * point_data; ++index)
+      for (std::size_t index = 0; index < 3 * data_count; ++index)
         if (!(input >> ignored)) { error = "truncated VECTORS in " + path; return false; }
     }
   }

@@ -1563,18 +1563,15 @@ bool RestoreScalarIgrCheckpoint(
   {
     local_interior.resize(shape.interior_coefficient_count);
     local_trace.resize(shape.trace_coefficient_count);
-    if constexpr (Rank2)
-    {
-      const std::size_t scalar_interior = local_interior.size() /
-          sc25::local_components;
-      const std::size_t scalar_trace = local_trace.size() /
-          sc25::trace_components;
-      state.u.resize(4 * scalar_interior);
-      state.sigma.resize(scalar_interior);
-      state.z.resize(2 * scalar_interior);
-      state.uhat.resize(4 * scalar_trace);
-      state.sigmahat.resize(scalar_trace);
-    }
+    const std::size_t scalar_interior = local_interior.size() /
+        sc25::local_components;
+    const std::size_t scalar_trace = local_trace.size() /
+        sc25::trace_components;
+    state.u.resize(4 * scalar_interior);
+    state.sigma.resize(scalar_interior);
+    state.z.resize(2 * scalar_interior);
+    state.uhat.resize(4 * scalar_trace);
+    state.sigmahat.resize(scalar_trace);
     if (context.rank() == 0)
     {
       int ioffset = 0, toffset = 0;
@@ -1666,28 +1663,14 @@ bool RestoreScalarIgrCheckpoint(
   {
     std::copy_n(source, count, destination.begin());
   };
-  if constexpr (Rank2)
-  {
-    assign(state.u, internal_interior.data(), 4 * scalar_interior);
-    assign(state.sigma, internal_interior.data() + 4 * scalar_interior,
-           scalar_interior);
-    assign(state.z, internal_interior.data() + 5 * scalar_interior,
-           2 * scalar_interior);
-    assign(state.uhat, local_trace.data(), 4 * scalar_trace);
-    assign(state.sigmahat, local_trace.data() + 4 * scalar_trace,
-           scalar_trace);
-  }
-  else
-  {
-    std::copy_n(internal_interior.data(), state.u.size(), state.u.begin());
-    std::copy_n(internal_interior.data() + state.u.size(), state.sigma.size(),
-                state.sigma.begin());
-    std::copy_n(internal_interior.data() + state.u.size() + state.sigma.size(),
-                state.z.size(), state.z.begin());
-    std::copy_n(local_trace.data(), state.uhat.size(), state.uhat.begin());
-    std::copy_n(local_trace.data() + state.uhat.size(), state.sigmahat.size(),
-                state.sigmahat.begin());
-  }
+  assign(state.u, internal_interior.data(), 4 * scalar_interior);
+  assign(state.sigma, internal_interior.data() + 4 * scalar_interior,
+         scalar_interior);
+  assign(state.z, internal_interior.data() + 5 * scalar_interior,
+         2 * scalar_interior);
+  assign(state.uhat, local_trace.data(), 4 * scalar_trace);
+  assign(state.sigmahat, local_trace.data() + 4 * scalar_trace,
+         scalar_trace);
   typename Traits::Checkpoint checkpoint;
   const bool imported = Traits::Import(
       owner, metadata.descriptor.coordinates, state, checkpoint);
