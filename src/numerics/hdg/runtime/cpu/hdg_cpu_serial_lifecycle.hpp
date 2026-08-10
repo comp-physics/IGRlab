@@ -82,6 +82,105 @@ struct SmoothTransitionV2Case final
   static constexpr double transition_width = 1.0 / 8.0;
 };
 
+/**
+ * Private CPU-serial rows for the V4 smooth-transition matrix.  These are
+ * case schedules, not a public diagnostic or replay interface.  Application
+ * options deliberately retain their historical three-slot control surface;
+ * the closed schedule below emits the nine scientific states.
+ */
+struct SmoothTransitionN16Dt11Case final
+{
+  static constexpr CaseKind kind = CaseKind::smooth_transition_v2;
+  static constexpr std::string_view case_id = SmoothTransitionV2Case::case_id;
+  static constexpr std::string_view scenario_id = "W8C-V2-N16-DT11";
+  static constexpr std::string_view conventional_source_id =
+      SmoothTransitionV2Case::conventional_source_id;
+  static constexpr std::string_view scalar_source_id =
+      SmoothTransitionV2Case::scalar_source_id;
+  static constexpr std::string_view conventional_checkpoint_id =
+      "checkpoint.hdg.euler.periodic-smooth-transition.n16-dt11.step-64.v2";
+  static constexpr std::string_view scalar_checkpoint_id =
+      "checkpoint.hdg.igr.sc25.periodic-smooth-transition.n16-dt11.step-64.v2";
+  static constexpr std::string_view experiment_id = SmoothTransitionV2Case::experiment_id;
+  static constexpr std::uint64_t seed = SmoothTransitionV2Case::seed;
+  static constexpr int polynomial_order = 1;
+  static constexpr std::uint32_t mesh_n = 16;
+  static constexpr int conventional_q_a = 11;
+  static constexpr int scalar_q_a = 12;
+  static constexpr int scalar_q_s = 14;
+  static constexpr int projection_q = 14;
+  static constexpr int observable_q_o = 18;
+  static constexpr double dt = 1.0 / 2048.0;
+  static constexpr std::uint64_t accepted_steps = 128;
+  static constexpr double final_time = 1.0 / 16.0;
+  static constexpr std::array<std::uint64_t, 9> output_steps{
+      {0, 16, 32, 48, 64, 80, 96, 112, 128}};
+  static constexpr std::uint64_t checkpoint_step = 64;
+  static constexpr std::uint64_t failure_target_step = 7;
+  static constexpr std::uint32_t retry_limit = 1;
+  static constexpr double transition_width = SmoothTransitionV2Case::transition_width;
+};
+
+struct SmoothTransitionN16Dt12Case final
+{
+  static constexpr CaseKind kind = CaseKind::smooth_transition_v2;
+  static constexpr std::string_view case_id = SmoothTransitionV2Case::case_id;
+  static constexpr std::string_view scenario_id = "W8C-V2-N16-DT12";
+  static constexpr std::string_view conventional_source_id = SmoothTransitionV2Case::conventional_source_id;
+  static constexpr std::string_view scalar_source_id = SmoothTransitionV2Case::scalar_source_id;
+  static constexpr std::string_view conventional_checkpoint_id = "checkpoint.hdg.euler.periodic-smooth-transition.n16-dt12.step-128.v2";
+  static constexpr std::string_view scalar_checkpoint_id = "checkpoint.hdg.igr.sc25.periodic-smooth-transition.n16-dt12.step-128.v2";
+  static constexpr std::string_view experiment_id = SmoothTransitionV2Case::experiment_id;
+  static constexpr std::uint64_t seed = SmoothTransitionV2Case::seed;
+  static constexpr int polynomial_order = 1;
+  static constexpr std::uint32_t mesh_n = 16;
+  static constexpr int conventional_q_a = 11;
+  static constexpr int scalar_q_a = 12;
+  static constexpr int scalar_q_s = 14;
+  static constexpr int projection_q = 14;
+  static constexpr int observable_q_o = 18;
+  static constexpr double dt = 1.0 / 4096.0;
+  static constexpr std::uint64_t accepted_steps = 256;
+  static constexpr double final_time = 1.0 / 16.0;
+  static constexpr std::array<std::uint64_t, 9> output_steps{
+      {0, 32, 64, 96, 128, 160, 192, 224, 256}};
+  static constexpr std::uint64_t checkpoint_step = 128;
+  static constexpr std::uint64_t failure_target_step = 7;
+  static constexpr std::uint32_t retry_limit = 1;
+  static constexpr double transition_width = SmoothTransitionV2Case::transition_width;
+};
+
+struct SmoothTransitionN32Dt12Case final
+{
+  static constexpr CaseKind kind = CaseKind::smooth_transition_v2;
+  static constexpr std::string_view case_id = SmoothTransitionV2Case::case_id;
+  static constexpr std::string_view scenario_id = "W8C-V2-N32-DT12";
+  static constexpr std::string_view conventional_source_id =
+      SmoothTransitionV2Case::conventional_source_id;
+  static constexpr std::string_view scalar_source_id =
+      SmoothTransitionV2Case::scalar_source_id;
+  static constexpr std::string_view conventional_checkpoint_id = "checkpoint.hdg.euler.periodic-smooth-transition.n32-dt12.step-128.v2";
+  static constexpr std::string_view scalar_checkpoint_id = "checkpoint.hdg.igr.sc25.periodic-smooth-transition.n32-dt12.step-128.v2";
+  static constexpr std::string_view experiment_id = SmoothTransitionV2Case::experiment_id;
+  static constexpr std::uint64_t seed = SmoothTransitionV2Case::seed;
+  static constexpr int polynomial_order = 1;
+  static constexpr std::uint32_t mesh_n = 32;
+  static constexpr int conventional_q_a = 11;
+  static constexpr int scalar_q_a = 12;
+  static constexpr int scalar_q_s = 14;
+  static constexpr int projection_q = 14;
+  static constexpr int observable_q_o = 18;
+  static constexpr double dt = 1.0 / 4096.0;
+  static constexpr std::uint64_t accepted_steps = 256;
+  static constexpr double final_time = 1.0 / 16.0;
+  static constexpr std::array<std::uint64_t, 9> output_steps{
+      {0, 32, 64, 96, 128, 160, 192, 224, 256}};
+  static constexpr std::uint64_t checkpoint_step = 128;
+  static constexpr std::uint64_t failure_target_step = 7;
+  static constexpr std::uint32_t retry_limit = 1;
+  static constexpr double transition_width = SmoothTransitionV2Case::transition_width;
+};
+
 // Exact-jump aliases retain the accepted W8C-v1 internal identities and keep
 // its existing callers and regression bytes unchanged.
 inline constexpr std::string_view case_id = ExactJumpV1Case::case_id;
@@ -375,8 +474,9 @@ public:
   { return Case::checkpoint_step; }
   constexpr bool OutputStep(const std::uint64_t step) const noexcept
   {
-    return step == Case::output_steps[0] ||
-        step == Case::output_steps[1] || step == Case::output_steps[2];
+    for (const std::uint64_t output : Case::output_steps)
+      if (step == output) return true;
+    return false;
   }
   constexpr bool CheckpointStep(const std::uint64_t step) const noexcept
   { return step == Case::checkpoint_step; }
@@ -390,7 +490,10 @@ LifecycleReport RunCpuSerialLifecycle(
     const LifecycleControl control, Case) noexcept
 {
   static_assert(std::is_same<Case, ExactJumpV1Case>::value ||
-                    std::is_same<Case, SmoothTransitionV2Case>::value,
+                    std::is_same<Case, SmoothTransitionV2Case>::value ||
+                    std::is_same<Case, SmoothTransitionN16Dt11Case>::value ||
+                    std::is_same<Case, SmoothTransitionN16Dt12Case>::value ||
+                    std::is_same<Case, SmoothTransitionN32Dt12Case>::value,
                 "W8C lifecycle requires one frozen private case descriptor");
   return RunCpuSerialLifecycleWithSchedule(
       method, publication, control, FrozenCaseSchedule<Case>{});

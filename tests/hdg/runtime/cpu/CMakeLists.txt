@@ -103,6 +103,21 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
       RESOURCE_LOCK hdg_runtime_cpu
       LABELS "hdg;runtime;app;cli;cpu;w8c;smooth-transition"
       TIMEOUT 3600)
+
+  add_test(NAME hdg_runtime_w8c_smooth_transition_matrix_cpu_serial
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
+      "-DHDG_RUNTIME_MATRIX_COMPARATOR=$<TARGET_FILE:dg_igr_hdg_runtime_w8c_smooth_transition_cpu_serial_test>"
+      "-DHDG_RUNTIME_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/w8c-smooth-transition-matrix"
+      -DHDG_RUNTIME_W8C_MATRIX=TRUE
+      -DHDG_RUNTIME_RANKS=1
+      -P "${PROJECT_SOURCE_DIR}/tests/hdg/runtime/app/test_cli_process.cmake")
+  set_tests_properties(hdg_runtime_w8c_smooth_transition_matrix_cpu_serial
+    PROPERTIES
+      PROCESSORS 1
+      RESOURCE_LOCK hdg_runtime_cpu
+      LABELS "hdg;runtime;app;cpu;w8c;smooth-transition;matrix"
+      TIMEOUT 21600)
 endif()
 
 add_test(

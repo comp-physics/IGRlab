@@ -37,6 +37,9 @@ namespace dg::hdg::runtime::cpu::sc25::w8c_internal
     const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept;
 [[gnu::visibility("hidden")]] void RequestSmoothTransitionInitialization(
     const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept;
+[[gnu::visibility("hidden")]] void RequestSmoothTransitionInitialization(
+    const PersistentSc25ScalarIgrCpuFoundation& owner,
+    int required_steps, double time_step) noexcept;
 }
 #endif
 
@@ -479,15 +482,20 @@ void AppendScalarRange(const Range& source, std::vector<double>& destination)
   {
     ScalarIgrPackedState candidate;
     candidate.coordinates = coordinates;
-    candidate.interior.reserve(sc25::persistent_interior_unknowns);
-    candidate.trace.reserve(sc25::persistent_true_trace_unknowns);
+    candidate.interior.reserve(state.u.size() + state.sigma.size() +
+                               state.z.size());
+    candidate.trace.reserve(state.uhat.size() + state.sigmahat.size());
     AppendScalarRange(state.u, candidate.interior);
     AppendScalarRange(state.sigma, candidate.interior);
     AppendScalarRange(state.z, candidate.interior);
     AppendScalarRange(state.uhat, candidate.trace);
     AppendScalarRange(state.sigmahat, candidate.trace);
-    if (candidate.interior.size() != sc25::persistent_interior_unknowns ||
-        candidate.trace.size() != sc25::persistent_true_trace_unknowns)
+    if (state.u.empty() || state.sigma.size() * 4 != state.u.size() ||
+        state.z.size() != state.sigma.size() * 2 ||
+        state.uhat.size() != state.sigmahat.size() * 4 ||
+        candidate.interior.size() != state.u.size() + state.sigma.size() +
+            state.z.size() || candidate.trace.size() !=
+            state.uhat.size() + state.sigmahat.size())
       return false;
     output = std::move(candidate);
     return true;
@@ -561,10 +569,10 @@ bool MakeScalarIgrVtk(const ValidatedApplicationConfig& config,
     const int elements = static_cast<int>(config.mesh_n() * config.mesh_n());
     const int scalar_dofs = (config.polynomial_order() + 1) *
                             (config.polynomial_order() + 1);
-    if (elements != sc25::persistent_elements ||
-        (ranks != 1 && ranks != 2))
+    if ((ranks != 1 && ranks != 2) ||
+        (ranks == 2 && elements != sc25::persistent_elements))
     {
-      detail = "scalar-IGR VTK topology is outside the frozen N8 tuple";
+      detail = "scalar-IGR VTK topology is outside the admitted rank layout";
       return false;
     }
     for (int rank = 0; rank < ranks; ++rank)
@@ -578,8 +586,15 @@ bool MakeScalarIgrVtk(const ValidatedApplicationConfig& config,
         return false;
       }
     }
-    std::array<bool, sc25::persistent_elements> global_seen{};
-    std::array<std::array<bool, sc25::persistent_elements>, 2> local_seen{};
+    std::vector<std::uint8_t> global_seen(
+        static_cast<std::size_t>(elements), 0);
+    std::array<std::vector<std::uint8_t>, 2> local_seen{};
+    for (int rank = 0; rank < ranks; ++rank)
+    {
+      const int owned = ranks == 1 ? elements :
+          sc25::persistent_rank2_local_elements;
+      local_seen[static_cast<std::size_t>(rank)].assign(owned, 0);
+    }
     std::array<int, 2> observed_local_elements{};
     const int n = static_cast<int>(config.mesh_n());
     const int slab_width = n / 2;
@@ -591,7 +606,8 @@ bool MakeScalarIgrVtk(const ValidatedApplicationConfig& config,
       const int local_ex = ranks == 1 ? ex : ex - owner * slab_width;
       const int local_element = ey * (ranks == 1 ? n : slab_width) + local_ex;
       if (element < 0 || element >= elements || local_element < 0 ||
-          local_element >= sc25::persistent_elements ||
+          local_element >= static_cast<int>(
+              local_seen[static_cast<std::size_t>(owner)].size()) ||
           global_seen[static_cast<std::size_t>(element)] ||
           local_seen[static_cast<std::size_t>(owner)]
                     [static_cast<std::size_t>(local_element)])
@@ -647,7 +663,7 @@ bool MakeScalarIgrVtk(const ValidatedApplicationConfig& config,
       }
     }
     if (!std::all_of(global_seen.begin(), global_seen.end(),
-                     [](const bool seen) { return seen; }))
+                     [](const std::uint8_t seen) { return seen == 1; }))
     {
       detail = "scalar-IGR VTK x-slab element map is incomplete";
       return false;
@@ -2947,7 +2963,8 @@ public:
             sc25::FoundationStatus::ready || !owner_)
       return false;
     if constexpr (Case::kind == cpu::w8c::CaseKind::smooth_transition_v2)
-      cpu::sc25::w8c_internal::RequestSmoothTransitionInitialization(*owner_);
+      cpu::sc25::w8c_internal::RequestSmoothTransitionInitialization(
+          *owner_, static_cast<int>(Case::accepted_steps), Case::dt);
     else
       cpu::sc25::w8c_internal::RequestW8cInitialization(*owner_);
     return ScalarIgrCpuTraits<false>::Initialize(*owner_) ==
@@ -3365,9 +3382,17 @@ ApplicationRunResult RunW8cCaseCpuSerial(
 ApplicationRunResult RunW8cCpuSerial(
     const ApplicationOptionsView& request, MpiApplicationContextV1& context)
 {
-  return request.case_id == cpu::w8c::SmoothTransitionV2Case::case_id
-      ? RunW8cCaseCpuSerial<cpu::w8c::SmoothTransitionV2Case>(request, context)
-      : RunW8cCaseCpuSerial<cpu::w8c::ExactJumpV1Case>(request, context);
+  if (request.case_id == cpu::w8c::SmoothTransitionV2Case::case_id)
+  {
+    if (request.scenario_id == cpu::w8c::SmoothTransitionN16Dt11Case::scenario_id)
+      return RunW8cCaseCpuSerial<cpu::w8c::SmoothTransitionN16Dt11Case>(request, context);
+    if (request.scenario_id == cpu::w8c::SmoothTransitionN16Dt12Case::scenario_id)
+      return RunW8cCaseCpuSerial<cpu::w8c::SmoothTransitionN16Dt12Case>(request, context);
+    if (request.scenario_id == cpu::w8c::SmoothTransitionN32Dt12Case::scenario_id)
+      return RunW8cCaseCpuSerial<cpu::w8c::SmoothTransitionN32Dt12Case>(request, context);
+    return RunW8cCaseCpuSerial<cpu::w8c::SmoothTransitionV2Case>(request, context);
+  }
+  return RunW8cCaseCpuSerial<cpu::w8c::ExactJumpV1Case>(request, context);
 }
 
 template <typename Selection>

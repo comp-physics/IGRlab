@@ -262,6 +262,14 @@ bool ExactScientificIdentities(const ApplicationOptionsView& options) noexcept
       options.tau == smooth_periodic_euler_v1_tau;
 }
 
+bool SmoothTransitionScenarioId(const std::string_view scenario) noexcept
+{
+  return scenario == cpu::w8c::SmoothTransitionV2Case::scenario_id ||
+      scenario == cpu::w8c::SmoothTransitionN16Dt11Case::scenario_id ||
+      scenario == cpu::w8c::SmoothTransitionN16Dt12Case::scenario_id ||
+      scenario == cpu::w8c::SmoothTransitionN32Dt12Case::scenario_id;
+}
+
 RuntimeTupleDescriptor TupleForBackend(
     const ApplicationBackend backend, const bool scalar) noexcept
 {
@@ -371,7 +379,14 @@ std::uint64_t ScenarioCheckpointStep(
     const ApplicationScenarioV1 scenario) noexcept
 {
   if (options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id)
+  {
+    if (options.scenario_id == cpu::w8c::SmoothTransitionN16Dt11Case::scenario_id)
+      return cpu::w8c::SmoothTransitionN16Dt11Case::checkpoint_step;
+    if (options.scenario_id == cpu::w8c::SmoothTransitionN16Dt12Case::scenario_id ||
+        options.scenario_id == cpu::w8c::SmoothTransitionN32Dt12Case::scenario_id)
+      return cpu::w8c::SmoothTransitionN16Dt12Case::checkpoint_step;
     return cpu::w8c::SmoothTransitionV2Case::checkpoint_step;
+  }
   if (options.case_id == cpu::w8c::ExactJumpV1Case::case_id)
     return cpu::w8c::ExactJumpV1Case::checkpoint_step;
   if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
@@ -729,7 +744,9 @@ ApplicationRejection ValidateW8c(
     return ApplicationRejection::invalid_step_count;
   if (options.final_time != Case::final_time || !ExactEndTime(options))
     return ApplicationRejection::invalid_final_time;
-  if (options.output_steps != Case::output_steps)
+  const std::array<std::uint64_t, 3> control_outputs{{
+      0, Case::checkpoint_step, Case::accepted_steps}};
+  if (options.output_steps != control_outputs)
     return ApplicationRejection::invalid_output_schedule;
   const std::string_view checkpoint = scalar
       ? Case::scalar_checkpoint_id : Case::conventional_checkpoint_id;
@@ -885,7 +902,7 @@ ApplicationValidation ValidateApplicationOptions(
       (options.case_id == cpu::w8c::ExactJumpV1Case::case_id &&
        options.scenario_id != cpu::w8c::ExactJumpV1Case::scenario_id) ||
       (options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
-       options.scenario_id != cpu::w8c::SmoothTransitionV2Case::scenario_id))
+       !SmoothTransitionScenarioId(options.scenario_id)))
   {
     return reject(ApplicationRejection::unknown_scenario);
   }
@@ -949,7 +966,13 @@ ApplicationValidation ValidateApplicationOptions(
   }
   const ApplicationRejection scenario_rejection =
       options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id
-      ? ValidateW8c<cpu::w8c::SmoothTransitionV2Case>(options, backend)
+      ? (options.scenario_id == cpu::w8c::SmoothTransitionN16Dt11Case::scenario_id
+             ? ValidateW8c<cpu::w8c::SmoothTransitionN16Dt11Case>(options, backend)
+             : options.scenario_id == cpu::w8c::SmoothTransitionN16Dt12Case::scenario_id
+             ? ValidateW8c<cpu::w8c::SmoothTransitionN16Dt12Case>(options, backend)
+             : options.scenario_id == cpu::w8c::SmoothTransitionN32Dt12Case::scenario_id
+             ? ValidateW8c<cpu::w8c::SmoothTransitionN32Dt12Case>(options, backend)
+             : ValidateW8c<cpu::w8c::SmoothTransitionV2Case>(options, backend))
       : options.case_id == cpu::w8c::ExactJumpV1Case::case_id
       ? ValidateW8c<cpu::w8c::ExactJumpV1Case>(options, backend)
       : (scalar ? ValidateScalarIgr(options)

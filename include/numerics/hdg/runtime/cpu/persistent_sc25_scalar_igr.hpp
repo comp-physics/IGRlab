@@ -495,11 +495,11 @@ enum class TrajectoryAssemblyFailureCause : std::uint8_t
 
 struct PersistentTrajectoryState final
 {
-  std::array<double, persistent_u_unknowns> u{};
-  std::array<double, persistent_sigma_unknowns> sigma{};
-  std::array<double, persistent_z_unknowns> z{};
-  std::array<double, persistent_uhat_unknowns> uhat{};
-  std::array<double, persistent_sigmahat_unknowns> sigmahat{};
+  std::vector<double> u{};
+  std::vector<double> sigma{};
+  std::vector<double> z{};
+  std::vector<double> uhat{};
+  std::vector<double> sigmahat{};
 };
 
 struct TrajectoryStateHashes final

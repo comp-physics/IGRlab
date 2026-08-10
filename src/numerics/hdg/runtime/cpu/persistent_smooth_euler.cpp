@@ -1442,7 +1442,10 @@ bool ExactW8cConfig(const CpuPersistentConfig& config) noexcept
 bool ExactConfig(const CpuPersistentConfig& config) noexcept
 {
   const bool w8c_config = ExactW8cConfig<w8c::ExactJumpV1Case>(config) ||
-      ExactW8cConfig<w8c::SmoothTransitionV2Case>(config);
+      ExactW8cConfig<w8c::SmoothTransitionV2Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionN16Dt11Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionN16Dt12Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionN32Dt12Case>(config);
   const bool smoke = config.scenario == CpuScenario::smoke &&
       config.polynomial_order == cpu_smoke_polynomial_order &&
       config.elements_per_direction == cpu_smoke_elements_per_direction &&
@@ -1493,12 +1496,28 @@ bool ExactConfig(const CpuPersistentConfig& config) noexcept
 bool IsW8cConfig(const CpuPersistentConfig& config) noexcept
 {
   return ExactW8cConfig<w8c::ExactJumpV1Case>(config) ||
-      ExactW8cConfig<w8c::SmoothTransitionV2Case>(config);
+      ExactW8cConfig<w8c::SmoothTransitionV2Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionN16Dt11Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionN16Dt12Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionN32Dt12Case>(config);
 }
 
 bool IsSmoothTransitionConfig(const CpuPersistentConfig& config) noexcept
 {
-  return ExactW8cConfig<w8c::SmoothTransitionV2Case>(config);
+  return ExactW8cConfig<w8c::SmoothTransitionV2Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionN16Dt11Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionN16Dt12Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionN32Dt12Case>(config);
+}
+
+std::uint64_t W8cAcceptedSteps(const CpuPersistentConfig& config) noexcept
+{
+  if (ExactW8cConfig<w8c::SmoothTransitionN16Dt11Case>(config))
+    return w8c::SmoothTransitionN16Dt11Case::accepted_steps;
+  if (ExactW8cConfig<w8c::SmoothTransitionN16Dt12Case>(config) ||
+      ExactW8cConfig<w8c::SmoothTransitionN32Dt12Case>(config))
+    return w8c::SmoothTransitionN16Dt12Case::accepted_steps;
+  return w8c::ExactJumpV1Case::accepted_steps;
 }
 
 bool ExactRankShape(const CpuPersistentConfig& config,
@@ -4594,7 +4613,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       state.Candidate()->interior == state.Committed()->interior &&
       state.Candidate()->trace == state.Committed()->trace &&
       (IsW8cConfig(state.config)
-           ? coordinates.step < w8c::accepted_steps
+           ? coordinates.step < W8cAcceptedSteps(state.config)
            : (state.config.scenario != CpuScenario::functional ||
               coordinates.step < cpu_functional_accepted_steps));
   if (!state.CollectiveAll(local_entry_ready))
