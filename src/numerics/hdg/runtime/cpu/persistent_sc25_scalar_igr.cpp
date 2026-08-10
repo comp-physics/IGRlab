@@ -3211,15 +3211,6 @@ bool CopyTrajectoryEvidence(const PersistentTrajectoryEvidence& source,
   return true;
 }
 
-TrajectorySlot ToSlot(const PersistentTrajectoryState& state) noexcept
-{
-  TrajectorySlot slot;
-  const int elements = static_cast<int>(state.sigma.size() / 4);
-  const int scalar_trace = static_cast<int>(state.sigmahat.size());
-  return ResizeTrajectorySlot(elements, scalar_trace, slot) &&
-      ToSlot(state, slot) ? std::move(slot) : TrajectorySlot{};
-}
-
 bool ToPublicState(const TrajectorySlot& slot,
                    PersistentTrajectoryState& state) noexcept
 {
@@ -3232,25 +3223,6 @@ bool ToPublicState(const TrajectorySlot& slot,
   std::copy(slot.trace.uhat.begin(), slot.trace.uhat.end(), state.uhat.begin());
   std::copy(slot.trace.sigmahat.begin(), slot.trace.sigmahat.end(), state.sigmahat.begin());
   return true;
-}
-
-PersistentTrajectoryState ToPublicState(const TrajectorySlot& slot) noexcept
-{
-  PersistentTrajectoryState state;
-  (void)ToPublicState(slot, state);
-  return state;
-}
-
-bool SameTrajectoryStateBytes(const PersistentTrajectoryState& left,
-                              const PersistentTrajectoryState& right) noexcept
-{
-  const auto same = [](const std::vector<double>& a,
-                       const std::vector<double>& b) noexcept
-  { return a.size() == b.size() &&
-        (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(double)) == 0); };
-  return same(left.u, right.u) && same(left.sigma, right.sigma) &&
-      same(left.z, right.z) && same(left.uhat, right.uhat) &&
-      same(left.sigmahat, right.sigmahat);
 }
 
 TrajectoryStateHashes HashState(const TrajectorySlot& state) noexcept
