@@ -3174,11 +3174,34 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
     return result;
   }
 
+  static bool ResizePublishedState(PublishedState& state) noexcept
+  {
+    const int scalar_nodes = persistent_elements * volume_nodes;
+    try
+    {
+      state.u.resize(static_cast<std::size_t>(state_components) *
+                     scalar_nodes);
+      state.sigma.resize(scalar_nodes);
+      state.z.resize(static_cast<std::size_t>(flux_components) *
+                     scalar_nodes);
+      state.uhat.resize(static_cast<std::size_t>(state_components) *
+                        persistent_scalar_trace_nodes);
+      state.sigmahat.resize(persistent_scalar_trace_nodes);
+      return true;
+    }
+    catch (...)
+    {
+      state = {};
+      return false;
+    }
+  }
+
   bool CopySlotState(const int slot, PublishedState& output) noexcept
   {
     output = {};
     if (slot < 0 || slot > 1 || elements != persistent_elements ||
-        true_trace_unknowns != persistent_trace_unknowns)
+        true_trace_unknowns != persistent_trace_unknowns ||
+        !ResizePublishedState(output))
     {
       return false;
     }
@@ -3288,22 +3311,7 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
                                   PublishedState& state) noexcept
   {
     const int scalar_nodes = persistent_elements * volume_nodes;
-    try
-    {
-      state.u.resize(static_cast<std::size_t>(state_components) *
-                     scalar_nodes);
-      state.sigma.resize(scalar_nodes);
-      state.z.resize(static_cast<std::size_t>(flux_components) *
-                     scalar_nodes);
-      state.uhat.resize(static_cast<std::size_t>(state_components) *
-                        persistent_scalar_trace_nodes);
-      state.sigmahat.resize(persistent_scalar_trace_nodes);
-    }
-    catch (...)
-    {
-      state = {};
-      return false;
-    }
+    if (!ResizePublishedState(state)) { return false; }
     for (int element = 0; element < persistent_elements; ++element)
       for (int a = 0; a < volume_nodes; ++a)
       {
