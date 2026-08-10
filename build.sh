@@ -2,12 +2,39 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# OpenMPI consults HOME even for serial CTest children.  The supervised
+# controller intentionally supplies a closed environment, so recover only the
+# effective user's passwd home when HOME is absent; an ambiguous or unusable
+# passwd entry is a configuration error rather than a guessed scratch path.
+if [[ -z "${HOME:-}" ]]; then
+  command -v getent >/dev/null 2>&1 || {
+    echo "ERROR: HOME is unset and getent is unavailable for passwd-home recovery." >&2
+    exit 2
+  }
+  passwd_record="$(getent passwd "${EUID}")" || {
+    echo "ERROR: HOME is unset and the effective user's passwd entry is unavailable." >&2
+    exit 2
+  }
+  [[ -n "${passwd_record}" && "${passwd_record}" != *$'\n'* ]] || {
+    echo "ERROR: HOME is unset and the effective user's passwd entry is ambiguous." >&2
+    exit 2
+  }
+  IFS=: read -r _ _ _ _ _ passwd_home _ <<< "${passwd_record}"
+  [[ -n "${passwd_home}" && "${passwd_home}" == /* && -d "${passwd_home}" ]] || {
+    echo "ERROR: HOME is unset and the effective user's passwd home is unusable." >&2
+    exit 2
+  }
+  export HOME="${passwd_home}"
+fi
+
 MODE="cpu"
 JOBS="${NPROC:-4}"
 MFEM_JOBS=""
 CLEAN=1
 INSTALL_DEPS=1
 RUN_TESTS=1
+TEST_REGEX=""
 RUN_SMOKE=0
 CALIPER=0
 HDG_EULER_EXPERIMENT="OFF"
@@ -130,6 +157,9 @@ Options:
   --no-clean        Reuse existing build and install directories.
   --no-deps         Do not run `spack install`.
   --no-tests        Do not run CTest.
+  --test-regex REGEX
+                    Require REGEX to select one or more CTest tests, then run
+                    only that selection.  Requires tests to remain enabled.
   --smoke           Run a short two-rank Sedov smoke test after tests.
   -h, --help        Show this help.
 
@@ -182,12 +212,26 @@ while (($#)); do
     --no-clean) CLEAN=0 ;;
     --no-deps) INSTALL_DEPS=0 ;;
     --no-tests) RUN_TESTS=0 ;;
+    --test-regex)
+      [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+      [[ -n "$2" && "$2" != *$'\n'* && "$2" != *$'\r'* ]] || {
+        echo "ERROR: --test-regex requires one non-empty single-line CTest regex." >&2
+        exit 2
+      }
+      TEST_REGEX="$2"
+      shift
+      ;;
     --smoke) RUN_SMOKE=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown option '$1'" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+
+if [[ -n "${TEST_REGEX}" && "${RUN_TESTS}" != "1" ]]; then
+  echo "ERROR: --test-regex requires CTest; do not combine it with --no-tests." >&2
+  exit 2
+fi
 
 cache_value() {
   local cache="$1"
@@ -2187,7 +2231,20 @@ fi
 
 if ((RUN_TESTS)); then
   CTEST_BIN="$(dirname -- "${CMAKE_BIN}")/ctest"
-  "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure
+  if [[ -n "${TEST_REGEX}" ]]; then
+    selected_tests="$("${CTEST_BIN}" --test-dir "${APP_BUILD}" -N -R "${TEST_REGEX}")" || {
+      echo "ERROR: --test-regex is not accepted by CTest: ${TEST_REGEX}" >&2
+      exit 2
+    }
+    if ! grep -Eq '^  Test #[0-9]+:' <<< "${selected_tests}"; then
+      echo "ERROR: --test-regex selected no tests: ${TEST_REGEX}" >&2
+      exit 2
+    fi
+    "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure \
+      -R "${TEST_REGEX}"
+  else
+    "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure
+  fi
 fi
 
 if ((RUN_SMOKE)); then
