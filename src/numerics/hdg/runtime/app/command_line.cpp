@@ -424,8 +424,29 @@ ParsedCommandLine ParseCommandLine(const int argc,
     return parsed;
   }
   options.mesh_n = static_cast<std::uint32_t>(mesh);
-  if (w8c_case &&
-      options.accepted_steps == cpu::w8c::ExactJumpV1Case::accepted_steps)
+  if (w8c_case && options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
+      options.mesh_n == cpu::w8c::SmoothTransitionN16Dt11Case::mesh_n &&
+      options.accepted_steps == cpu::w8c::SmoothTransitionN16Dt11Case::accepted_steps &&
+      options.dt == cpu::w8c::SmoothTransitionN16Dt11Case::dt)
+  {
+    SelectW8cScenario<cpu::w8c::SmoothTransitionN16Dt11Case>(options, scalar_igr);
+  }
+  else if (w8c_case && options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
+           options.mesh_n == cpu::w8c::SmoothTransitionN16Dt12Case::mesh_n &&
+           options.accepted_steps == cpu::w8c::SmoothTransitionN16Dt12Case::accepted_steps &&
+           options.dt == cpu::w8c::SmoothTransitionN16Dt12Case::dt)
+  {
+    SelectW8cScenario<cpu::w8c::SmoothTransitionN16Dt12Case>(options, scalar_igr);
+  }
+  else if (w8c_case && options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
+           options.mesh_n == cpu::w8c::SmoothTransitionN32Dt12Case::mesh_n &&
+           options.accepted_steps == cpu::w8c::SmoothTransitionN32Dt12Case::accepted_steps &&
+           options.dt == cpu::w8c::SmoothTransitionN32Dt12Case::dt)
+  {
+    SelectW8cScenario<cpu::w8c::SmoothTransitionN32Dt12Case>(options, scalar_igr);
+  }
+  else if (w8c_case &&
+           options.accepted_steps == cpu::w8c::ExactJumpV1Case::accepted_steps)
   {
     if (options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id)
       SelectW8cScenario<cpu::w8c::SmoothTransitionV2Case>(options, scalar_igr);
@@ -569,12 +590,12 @@ void PrintCommandLineHelp(std::ostream& output)
       "         exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3\n"
       "  --case conventional-smooth-persistent-v1|sc25-periodic-smooth-persistent-v3|periodic-double-riemann-v1|periodic-smooth-transition-v2\n"
       "  --space l2|h1                    (h1 reports UnsupportedDiscretization)\n"
-      "  --mesh-family periodic-cartesian-quad --mesh-n 3|6|8|12\n"
-      "  --order 1|2 --dt 0.05|0.000244140625|0.0009765625\n"
-      "  --steps 3|20|64 --final-time 0.15|0.0048828125|0.0625\n"
+      "  --mesh-family periodic-cartesian-quad --mesh-n 3|6|8|12|16|32\n"
+      "  --order 1|2 --dt 0.05|0.000244140625|0.0009765625|0.00048828125\n"
+      "  --steps 3|20|64|128|256 --final-time 0.15|0.0048828125|0.0625\n"
       "  --backend cpu|cuda --device-id none|0\n"
-      "  --output-dir PATH --output-steps 0,1,3|0,10,20|0,32,64\n"
-      "  --checkpoint-out PATH|none --checkpoint-step 1|10|32|none\n"
+      "  --output-dir PATH --output-steps 0,1,3|0,10,20|0,32,64|0,64,128|0,128,256\n"
+      "  --checkpoint-out PATH|none --checkpoint-step 1|10|32|64|128|none\n"
       "  --stop-after-checkpoint true|false --restart-from PATH|none\n"
       "  --max-retries 0|1\n"
       "  --inject-failure off|PHASE:TARGET_STEP:RANK\n"

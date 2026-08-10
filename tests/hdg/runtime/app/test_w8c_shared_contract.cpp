@@ -57,9 +57,15 @@ public:
     reason_ = FailureReason::none;
     return true;
   }
+  bool PrimeTransaction(Transaction& transaction) noexcept
+  {
+    transaction = {};
+    return true;
+  }
   bool Prepare(Transaction& transaction, const bool retry,
                const std::uint64_t target) noexcept
   {
+    transaction = {};
     trace_.events.push_back(Event::prepare);
     retry_flags.push_back(retry);
     transaction.entry = coordinates_;

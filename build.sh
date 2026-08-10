@@ -2,12 +2,39 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# OpenMPI consults HOME even for serial CTest children.  The supervised
+# controller intentionally supplies a closed environment, so recover only the
+# effective user's passwd home when HOME is absent; an ambiguous or unusable
+# passwd entry is a configuration error rather than a guessed scratch path.
+if [[ -z "${HOME:-}" ]]; then
+  command -v getent >/dev/null 2>&1 || {
+    echo "ERROR: HOME is unset and getent is unavailable for passwd-home recovery." >&2
+    exit 2
+  }
+  passwd_record="$(getent passwd "${EUID}")" || {
+    echo "ERROR: HOME is unset and the effective user's passwd entry is unavailable." >&2
+    exit 2
+  }
+  [[ -n "${passwd_record}" && "${passwd_record}" != *$'\n'* ]] || {
+    echo "ERROR: HOME is unset and the effective user's passwd entry is ambiguous." >&2
+    exit 2
+  }
+  IFS=: read -r _ _ _ _ _ passwd_home _ <<< "${passwd_record}"
+  [[ -n "${passwd_home}" && "${passwd_home}" == /* && -d "${passwd_home}" ]] || {
+    echo "ERROR: HOME is unset and the effective user's passwd home is unusable." >&2
+    exit 2
+  }
+  export HOME="${passwd_home}"
+fi
+
 MODE="cpu"
 JOBS="${NPROC:-4}"
 MFEM_JOBS=""
 CLEAN=1
 INSTALL_DEPS=1
 RUN_TESTS=1
+TEST_REGEX=""
 RUN_SMOKE=0
 CALIPER=0
 HDG_EULER_EXPERIMENT="OFF"
@@ -20,7 +47,13 @@ PRINT_PLAN=0
 TEMP_ROOT=""
 TEMP_ROOT_SOURCE=""
 MFEM_REUSE_REQUEST=""
+MFEM_REUSE_STAMP=""
 MFEM_REUSE_STATE="disabled"
+MFEM_FRESH_FROM_SEED=0
+MFEM_FRESH_SEED_ROOT=""
+MFEM_FRESH_SEED_STATUS=""
+MFEM_FRESH_TARGET_ROOT=""
+MFEM_CANONICAL_ORIGIN="https://github.com/mfem/mfem.git"
 MFEM_REUSE_ABI=""
 MFEM_REUSE_TRANSACTION_STATE="disabled"
 MFEM_REUSE_PRE_SOURCE_ROOT=""
@@ -123,13 +156,17 @@ Options:
   --mfem-jobs N     Parallel MFEM build jobs (default: --jobs value).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
   --reuse-mfem-root DIR
-                    Reuse a validated, read-only MFEM source/build/install
-                    tuple rooted at DIR instead of invoking build_mfem_tpl.sh.
+                    Reuse a strictly stamped MFEM tuple rooted at DIR.  An
+                    unstamped pinned clean checkout is a read-only seed for a
+                    target-local fresh MFEM build, never an in-place reuse.
   --print-plan      Validate and print the resolved build policy, then exit.
   --clean           Rebuild the selected mode from clean caches (default).
   --no-clean        Reuse existing build and install directories.
   --no-deps         Do not run `spack install`.
   --no-tests        Do not run CTest.
+  --test-regex REGEX
+                    Require REGEX to select one or more CTest tests, then run
+                    only that selection.  Requires tests to remain enabled.
   --smoke           Run a short two-rank Sedov smoke test after tests.
   -h, --help        Show this help.
 
@@ -182,12 +219,26 @@ while (($#)); do
     --no-clean) CLEAN=0 ;;
     --no-deps) INSTALL_DEPS=0 ;;
     --no-tests) RUN_TESTS=0 ;;
+    --test-regex)
+      [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+      [[ -n "$2" && "$2" != *$'\n'* && "$2" != *$'\r'* ]] || {
+        echo "ERROR: --test-regex requires one non-empty single-line CTest regex." >&2
+        exit 2
+      }
+      TEST_REGEX="$2"
+      shift
+      ;;
     --smoke) RUN_SMOKE=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown option '$1'" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+
+if [[ -n "${TEST_REGEX}" && "${RUN_TESTS}" != "1" ]]; then
+  echo "ERROR: --test-regex requires CTest; do not combine it with --no-tests." >&2
+  exit 2
+fi
 
 cache_value() {
   local cache="$1"
@@ -815,6 +866,165 @@ validate_mfem_source_checkout() {
 
   MFEM_SOURCE_ROOT="${root}"
   MFEM_SOURCE_PIN="${expected_pin}"
+}
+
+capture_mfem_seed_status() {
+  local root="$1"
+  printf 'head=%s\n' "$(git -C "${root}" rev-parse HEAD)"
+  printf 'tree=%s\n' "$(git -C "${root}" rev-parse HEAD^{tree})"
+  GIT_OPTIONAL_LOCKS=0 git -C "${root}" status \
+    --porcelain=v1 --untracked-files=normal
+}
+
+validate_mfem_origin() {
+  local root="$1" source_kind="$2" origin
+  origin="$(git -C "${root}" remote get-url origin 2>/dev/null)" || {
+    echo "ERROR: ${source_kind} MFEM source has no origin remote: ${root}" >&2
+    exit 3
+  }
+  [[ "${origin}" == "${MFEM_CANONICAL_ORIGIN}" ]] || {
+    echo "ERROR: ${source_kind} MFEM origin mismatch: expected=${MFEM_CANONICAL_ORIGIN} actual=${origin}" >&2
+    exit 3
+  }
+}
+
+require_target_local_mfem_parent() {
+  local create_if_absent="${1:-0}"
+  local parent="${SCRIPT_DIR}/build-deps" canonical
+  if [[ ! -e "${parent}" && ! -L "${parent}" ]]; then
+    [[ "${create_if_absent}" == "1" ]] || {
+      echo "ERROR: target-local MFEM parent is absent: ${parent}" >&2
+      exit 3
+    }
+    mkdir -p -- "${parent}"
+  fi
+  [[ -d "${parent}" && ! -L "${parent}" ]] || {
+    echo "ERROR: target-local MFEM parent is not a regular directory: ${parent}" >&2
+    exit 3
+  }
+  canonical="$(realpath -e -- "${parent}")" || {
+    echo "ERROR: unable to canonicalize target-local MFEM parent: ${parent}" >&2
+    exit 3
+  }
+  [[ "${canonical}" == "${parent}" ]] || {
+    echo "ERROR: target-local MFEM parent is not at its exact path: expected=${parent} actual=${canonical}" >&2
+    exit 3
+  }
+}
+
+plan_target_local_fresh_mfem() {
+  local requested="$1" pinprefix target target_canonical
+  validate_mfem_source_checkout "${requested}" "fresh MFEM seed"
+  MFEM_FRESH_SEED_ROOT="${MFEM_SOURCE_ROOT}"
+  validate_mfem_origin "${MFEM_FRESH_SEED_ROOT}" "fresh MFEM seed"
+  MFEM_FRESH_SEED_STATUS="$(capture_mfem_seed_status "${MFEM_FRESH_SEED_ROOT}")" || {
+    echo "ERROR: unable to record fresh MFEM seed status: ${MFEM_FRESH_SEED_ROOT}" >&2
+    exit 3
+  }
+  pinprefix="${MFEM_SOURCE_PIN:0:12}"
+  target="${SCRIPT_DIR}/build-deps/mfem-${PROFILE}-${pinprefix}"
+  MFEM_FRESH_TARGET_ROOT="${target}"
+  if [[ -e "${target}" || -L "${target}" ]]; then
+    require_target_local_mfem_parent 0
+    [[ -d "${target}" && ! -L "${target}" ]] || {
+      echo "ERROR: existing target-local MFEM root is not a regular directory: ${target}" >&2
+      exit 3
+    }
+    target_canonical="$(realpath -e -- "${target}")" || {
+      echo "ERROR: unable to canonicalize existing target-local MFEM root: ${target}" >&2
+      exit 3
+    }
+    [[ "${target_canonical}" == "${target}" ]] || {
+      echo "ERROR: existing target-local MFEM root is not at its exact path: expected=${target} actual=${target_canonical}" >&2
+      exit 3
+    }
+    validate_mfem_source_checkout "${target}" "existing target-local MFEM"
+    validate_mfem_origin "${MFEM_SOURCE_ROOT}" "existing target-local MFEM"
+    MFEM_BUILD="${target}/${MFEM_BUILD_NAME}"
+    MFEM_INSTALL="${target}/${MFEM_INSTALL_NAME}"
+    MFEM_REUSE_STATE="target-local-fresh-from-seed"
+    MFEM_TUPLE_STATE="target-local-fresh-from-seed-retry"
+    return
+  fi
+  MFEM_SOURCE_ROOT="${target}"
+  MFEM_BUILD="${target}/${MFEM_BUILD_NAME}"
+  MFEM_INSTALL="${target}/${MFEM_INSTALL_NAME}"
+  MFEM_REUSE_STATE="target-local-fresh-from-seed"
+  MFEM_TUPLE_STATE="target-local-fresh-from-seed-planned"
+}
+
+materialize_target_local_fresh_mfem() {
+  local seed="${MFEM_FRESH_SEED_ROOT}" target="${MFEM_FRESH_TARGET_ROOT}"
+  local before after staging attempt=0
+  [[ "${MFEM_FRESH_FROM_SEED}" == "1" && -n "${seed}" && -n "${target}" ]] || return 0
+  before="$(capture_mfem_seed_status "${seed}")" || {
+    echo "ERROR: unable to re-read fresh MFEM seed status before clone: ${seed}" >&2
+    exit 3
+  }
+  [[ "${before}" == "${MFEM_FRESH_SEED_STATUS}" ]] || {
+    echo "ERROR: fresh MFEM seed status changed before materialization: ${seed}" >&2
+    exit 3
+  }
+  if [[ -e "${target}" || -L "${target}" ]]; then
+    local target_canonical
+    require_target_local_mfem_parent 0
+    [[ -d "${target}" && ! -L "${target}" ]] || {
+      echo "ERROR: existing target-local MFEM root is not a regular directory: ${target}" >&2
+      exit 3
+    }
+    target_canonical="$(realpath -e -- "${target}")" || {
+      echo "ERROR: unable to canonicalize existing target-local MFEM root: ${target}" >&2
+      exit 3
+    }
+    [[ "${target_canonical}" == "${target}" ]] || {
+      echo "ERROR: existing target-local MFEM root is not at its exact path: expected=${target} actual=${target_canonical}" >&2
+      exit 3
+    }
+    validate_mfem_source_checkout "${target}" "existing target-local MFEM"
+    validate_mfem_origin "${MFEM_SOURCE_ROOT}" "existing target-local MFEM"
+    after="$(capture_mfem_seed_status "${seed}")" || {
+      echo "ERROR: unable to re-read fresh MFEM seed status after retry validation: ${seed}" >&2
+      exit 3
+    }
+    [[ "${after}" == "${MFEM_FRESH_SEED_STATUS}" ]] || {
+      echo "ERROR: fresh MFEM seed identity/status changed during retry validation: ${seed}" >&2
+      exit 3
+    }
+    MFEM_SOURCE_ROOT="${target}"
+    MFEM_BUILD="${target}/${MFEM_BUILD_NAME}"
+    MFEM_INSTALL="${target}/${MFEM_INSTALL_NAME}"
+    MFEM_TUPLE_STATE="target-local-fresh-from-seed-retry"
+    return
+  fi
+  require_target_local_mfem_parent 1
+  while ((attempt < 16)); do
+    staging="${target}.staging.${BASHPID}.${RANDOM}"
+    [[ ! -e "${staging}" && ! -L "${staging}" ]] && break
+    ((++attempt))
+  done
+  ((attempt < 16)) || { echo "ERROR: unable to allocate unique MFEM clone sibling." >&2; exit 3; }
+  git clone --no-local --no-hardlinks --no-checkout -- "${seed}" "${staging}"
+  git -C "${staging}" remote set-url origin "${MFEM_CANONICAL_ORIGIN}"
+  git -C "${staging}" checkout --detach "${MFEM_SOURCE_PIN}"
+  validate_mfem_source_checkout "${staging}" "target-local fresh MFEM"
+  validate_mfem_origin "${MFEM_SOURCE_ROOT}" "target-local fresh MFEM"
+  after="$(capture_mfem_seed_status "${seed}")" || {
+    echo "ERROR: unable to re-read fresh MFEM seed status after clone: ${seed}" >&2
+    exit 3
+  }
+  [[ "${after}" == "${MFEM_FRESH_SEED_STATUS}" ]] || {
+    echo "ERROR: fresh MFEM seed identity/status changed during materialization: ${seed}" >&2
+    exit 3
+  }
+  [[ ! -e "${target}" && ! -L "${target}" ]] || {
+    echo "ERROR: target-local fresh MFEM root appeared before atomic publish: ${target}" >&2
+    exit 3
+  }
+  mv -T -- "${staging}" "${target}"
+  MFEM_SOURCE_ROOT="${target}"
+  MFEM_BUILD="${target}/${MFEM_BUILD_NAME}"
+  MFEM_INSTALL="${target}/${MFEM_INSTALL_NAME}"
+  MFEM_TUPLE_STATE="target-local-fresh-from-seed-materialized"
 }
 
 validate_local_mfem_artifacts() {
@@ -2027,9 +2237,15 @@ else
 fi
 
 if [[ -n "${MFEM_REUSE_REQUEST}" ]]; then
-  select_reviewed_admission_route || true
-  validate_reused_mfem "${MFEM_REUSE_REQUEST}"
-  freeze_reuse_pre_dependency_identity
+  MFEM_REUSE_STAMP="${MFEM_REUSE_REQUEST}/${MFEM_BUILD_NAME}/${MFEM_IDENTITY_STAMP_NAME}"
+  if [[ -e "${MFEM_REUSE_STAMP}" || -L "${MFEM_REUSE_STAMP}" ]]; then
+    select_reviewed_admission_route || true
+    validate_reused_mfem "${MFEM_REUSE_REQUEST}"
+    freeze_reuse_pre_dependency_identity
+  else
+    MFEM_FRESH_FROM_SEED=1
+    plan_target_local_fresh_mfem "${MFEM_REUSE_REQUEST}"
+  fi
 else
   validate_mfem_source_checkout "${SCRIPT_DIR}/tpl/mfem" "local"
   MFEM_BUILD="${MFEM_SOURCE_ROOT}/${MFEM_BUILD_NAME}"
@@ -2049,6 +2265,9 @@ echo "[build-plan] env=${SPACK_ENV} app_build=${APP_BUILD} app_install=${APP_INS
 echo "[build-plan] temp_root=${TEMP_ROOT} temp_source=${TEMP_ROOT_SOURCE} temp_env=TMPDIR,TEMP,TMP"
 echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT}"
 echo "[build-plan] mfem_source=${MFEM_SOURCE_ROOT} mfem_build=${MFEM_BUILD} mfem_install=${MFEM_INSTALL} mfem_tuple_state=${MFEM_TUPLE_STATE} mfem_reuse_state=${MFEM_REUSE_STATE}"
+if [[ "${MFEM_FRESH_FROM_SEED}" == "1" ]]; then
+  echo "[build-plan] mfem_route=target-local-fresh-from-seed seed=${MFEM_FRESH_SEED_ROOT} target=${MFEM_FRESH_TARGET_ROOT}"
+fi
 echo "[build-plan] mfem_source_pin=${MFEM_SOURCE_PIN} fem_picojson_blob=${MFEM_PICOJSON_BLOB} general_tinyxml2_blob=${MFEM_TINYXML2_BLOB}"
 if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
   echo "[build-plan] mfem_reuse_abi=${MFEM_REUSE_ABI}"
@@ -2114,6 +2333,7 @@ if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
   export DG_IGR_TEST_REUSE_CALIPER="${CALIPER}"
   export DG_IGR_TEST_REUSE_CUDA_ARCH="${DEPENDENCY_CUDA_ARCH}"
 else
+  materialize_target_local_fresh_mfem
   DG_IGR_SPACK_ENV="${SPACK_ENV}" CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
     MFEM_SRC="${MFEM_SOURCE_ROOT}" MFEM_BUILD="${MFEM_BUILD}" \
     MFEM_INSTALL="${MFEM_INSTALL}" \
@@ -2187,7 +2407,20 @@ fi
 
 if ((RUN_TESTS)); then
   CTEST_BIN="$(dirname -- "${CMAKE_BIN}")/ctest"
-  "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure
+  if [[ -n "${TEST_REGEX}" ]]; then
+    selected_tests="$("${CTEST_BIN}" --test-dir "${APP_BUILD}" -N -R "${TEST_REGEX}")" || {
+      echo "ERROR: --test-regex is not accepted by CTest: ${TEST_REGEX}" >&2
+      exit 2
+    }
+    if ! grep -Eq '^  Test #[0-9]+:' <<< "${selected_tests}"; then
+      echo "ERROR: --test-regex selected no tests: ${TEST_REGEX}" >&2
+      exit 2
+    fi
+    "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure \
+      -R "${TEST_REGEX}"
+  else
+    "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure
+  fi
 fi
 
 if ((RUN_SMOKE)); then

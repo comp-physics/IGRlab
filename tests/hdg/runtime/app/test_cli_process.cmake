@@ -612,6 +612,96 @@ function(validate_scalar_cuda_metadata metadata label expected_step)
   endif()
 endfunction()
 
+if(HDG_RUNTIME_W8C_MATRIX)
+  if(NOT HDG_RUNTIME_RANKS EQUAL 1)
+    message(FATAL_ERROR "W8C smooth-transition matrix is CPU serial")
+  endif()
+  if(NOT DEFINED HDG_RUNTIME_MATRIX_COMPARATOR)
+    message(FATAL_ERROR "W8C smooth-transition matrix comparator is required")
+  endif()
+  set(matrix_comparator_arguments)
+  foreach(row IN ITEMS n16dt11 n16dt12 n32dt12)
+    if(row STREQUAL "n16dt11")
+      set(matrix_n 16)
+      set(matrix_dt 0.00048828125)
+      set(matrix_steps 128)
+      set(matrix_checkpoint 64)
+      set(matrix_outputs 0,64,128)
+      set(matrix_steps_padded 000000 000016 000032 000048 000064 000080 000096 000112 000128)
+    elseif(row STREQUAL "n16dt12")
+      set(matrix_n 16)
+      set(matrix_dt 0.000244140625)
+      set(matrix_steps 256)
+      set(matrix_checkpoint 128)
+      set(matrix_outputs 0,128,256)
+      set(matrix_steps_padded 000000 000032 000064 000096 000128 000160 000192 000224 000256)
+    else()
+      set(matrix_n 32)
+      set(matrix_dt 0.000244140625)
+      set(matrix_steps 256)
+      set(matrix_checkpoint 128)
+      set(matrix_outputs 0,128,256)
+      set(matrix_steps_padded 000000 000032 000064 000096 000128 000160 000192 000224 000256)
+    endif()
+    foreach(policy IN ITEMS conventional scalar)
+      set(matrix_directory "${HDG_RUNTIME_TEST_OUTPUT}-${row}-${policy}")
+      set(matrix_checkpoint_path "${matrix_directory}.checkpoint")
+      file(REMOVE_RECURSE "${matrix_directory}")
+      file(REMOVE "${matrix_checkpoint_path}")
+      if(policy STREQUAL "scalar")
+        set(matrix_card exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3)
+      else()
+        set(matrix_card exp.hdg.euler.conventional.smooth_persistent.w8a.v1)
+      endif()
+      run_serial_runtime(matrix_run
+        --card "${matrix_card}" --case periodic-smooth-transition-v2
+        --space l2 --mesh-family periodic-cartesian-quad --mesh-n "${matrix_n}" --order 1
+        --dt "${matrix_dt}" --steps "${matrix_steps}" --final-time 0.0625
+        --backend cpu --device-id none --output-steps "${matrix_outputs}"
+        --output-dir "${matrix_directory}" --checkpoint-out "${matrix_checkpoint_path}"
+        --checkpoint-step "${matrix_checkpoint}" --stop-after-checkpoint false
+        --restart-from none --max-retries 0 --inject-failure off
+        --seed 0x573843534d4f5632)
+      if(NOT matrix_run_status EQUAL 0 OR
+         NOT matrix_run_output MATCHES "status=Success.*step=${matrix_steps}.*retries=0" OR
+         NOT matrix_run_error STREQUAL "")
+        message(FATAL_ERROR "W8C matrix ${row}/${policy} failed: ${matrix_run_status};${matrix_run_output};${matrix_run_error}")
+      endif()
+      foreach(step IN LISTS matrix_steps_padded)
+        require_regular_file("${matrix_directory}/state-step-${step}.vtk"
+          "W8C matrix ${row}/${policy} output ${step}")
+        if(policy STREQUAL "scalar")
+          validate_scalar_igr_vtk("${matrix_directory}/state-step-${step}.vtk" "${matrix_n}"
+            "W8C matrix ${row}/${policy} output ${step}")
+        else()
+          validate_physical_vtk("${matrix_directory}/state-step-${step}.vtk" "${matrix_n}"
+            "W8C matrix ${row}/${policy} output ${step}")
+        endif()
+      endforeach()
+      file(GLOB matrix_states "${matrix_directory}/state-step-*.vtk")
+      list(LENGTH matrix_states matrix_state_count)
+      if(NOT matrix_state_count EQUAL 9)
+        message(FATAL_ERROR "W8C matrix ${row}/${policy} output census is ${matrix_state_count}, expected 9")
+      endif()
+      require_regular_file("${matrix_checkpoint_path}" "W8C matrix checkpoint")
+      list(APPEND matrix_comparator_arguments "${matrix_directory}")
+    endforeach()
+  endforeach()
+  execute_process(
+    COMMAND "${HDG_RUNTIME_MATRIX_COMPARATOR}" --matrix ${matrix_comparator_arguments}
+    RESULT_VARIABLE matrix_comparator_status
+    OUTPUT_VARIABLE matrix_comparator_output
+    ERROR_VARIABLE matrix_comparator_error)
+  if(NOT matrix_comparator_status EQUAL 0 OR
+     NOT matrix_comparator_error STREQUAL "" OR
+     NOT matrix_comparator_output MATCHES "q18-matrix-disposition=")
+    message(FATAL_ERROR
+      "W8C matrix q18 comparator failed: ${matrix_comparator_status};${matrix_comparator_output};${matrix_comparator_error}")
+  endif()
+  message(STATUS "W8C matrix q18 comparator: ${matrix_comparator_output}")
+  return()
+endif()
+
 if(HDG_RUNTIME_W8C_SMOOTH)
   if(NOT HDG_RUNTIME_RANKS EQUAL 1)
     message(FATAL_ERROR "W8C smooth-transition CLI coverage is CPU serial")

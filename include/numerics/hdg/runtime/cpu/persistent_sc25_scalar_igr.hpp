@@ -31,6 +31,11 @@
 namespace dg::hdg::runtime::cpu::sc25
 {
 
+namespace w8c_internal
+{
+struct Rank1TransactionPrimeAccess;
+}
+
 inline constexpr std::string_view projection_id =
     "exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3";
 inline constexpr std::string_view object_id =
@@ -495,11 +500,11 @@ enum class TrajectoryAssemblyFailureCause : std::uint8_t
 
 struct PersistentTrajectoryState final
 {
-  std::array<double, persistent_u_unknowns> u{};
-  std::array<double, persistent_sigma_unknowns> sigma{};
-  std::array<double, persistent_z_unknowns> z{};
-  std::array<double, persistent_uhat_unknowns> uhat{};
-  std::array<double, persistent_sigmahat_unknowns> sigmahat{};
+  std::vector<double> u{};
+  std::vector<double> sigma{};
+  std::vector<double> z{};
+  std::vector<double> uhat{};
+  std::vector<double> sigmahat{};
 };
 
 struct TrajectoryStateHashes final
@@ -1111,6 +1116,9 @@ public:
       const noexcept;
 
 private:
+  friend struct w8c_internal::Rank1TransactionPrimeAccess;
+  /** Internal W8C bridge only; never part of the application API. */
+  bool PrimePersistentTrajectoryTransaction(Rank1Transaction& output) noexcept;
   friend struct PersistentTrajectoryImplementation;
   friend struct PersistentRank2TrajectoryImplementation;
   struct Implementation;
