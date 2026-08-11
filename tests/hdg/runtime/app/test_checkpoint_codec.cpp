@@ -426,6 +426,18 @@ using ScalarRank2ContractView = RankCommittedContractViewV1<
     State,
     TestStoragePolicy,
     TestCollectivePolicy>;
+using ScalarCudaRank2Contract = PersistentRunContract<
+    ScalarIgrCudaRank2RuntimeSelection,
+    State,
+    State,
+    TestStoragePolicy,
+    TestCollectivePolicy>;
+using ScalarCudaRank2ContractView = RankCommittedContractViewV1<
+    ScalarIgrCudaRank2RuntimeSelection,
+    State,
+    State,
+    TestStoragePolicy,
+    TestCollectivePolicy>;
 
 StateHash FilledHash(const std::uint8_t first) noexcept
 {
@@ -2511,6 +2523,115 @@ bool CheckW8cSmoothTransitionCodecClosure()
   return passed;
 }
 
+bool CheckW8cScalarSmoothCudaRank2RetryRoundTrip()
+{
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
+  ApplicationOptionsView writer_options = W8cOptions(true, true);
+  writer_options.backend_id = CudaRank2OneGpuHostStagedBackendTag::id;
+  writer_options.device_id = 0;
+  writer_options.run_role = ApplicationRunRoleV1::split_writer;
+  writer_options.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+  writer_options.injection = {
+      FailureInjectionModeV1::prescribed,
+      FailurePhase::AfterRecoveryBeforeCommit,
+      scalar_igr_sc25_v3_failure_target_step, 1};
+  writer_options.retry_limit = scalar_igr_sc25_v3_retry_limit;
+  const ApplicationValidation writer_validation =
+      ValidateApplicationOptions(writer_options);
+
+  ApplicationOptionsView reader_options = W8cOptions(true, true);
+  reader_options.backend_id = CudaRank2OneGpuHostStagedBackendTag::id;
+  reader_options.device_id = 0;
+  reader_options.run_role = ApplicationRunRoleV1::split_reader;
+  reader_options.checkpoint_out = {};
+  reader_options.checkpoint_step = {};
+  reader_options.restart_from = CheckpointArtifactPathV1::Present(
+      writer_options.checkpoint_out.canonical);
+  reader_options.injection = {};
+  reader_options.retry_limit = 0;
+  const ApplicationValidation reader_validation =
+      ValidateApplicationOptions(reader_options);
+  const ValidatedApplicationConfig* writer = writer_validation.config();
+  const ValidatedApplicationConfig* reader = reader_validation.config();
+  bool passed = Check(
+          writer != nullptr && reader != nullptr &&
+          writer->injection() == writer_options.injection &&
+          writer->retry_limit() == scalar_igr_sc25_v3_retry_limit &&
+          reader->injection() == FailureInjectionControlV1{} &&
+          reader->retry_limit() == 0,
+      "w8c_scalar_cuda_rank2_retry_configs_validate");
+  if (writer == nullptr || reader == nullptr) { return false; }
+
+  StateHash derived_writer_hash{};
+  passed = Check(
+               DeriveSplitWriterRunConfigHashV1(*reader, derived_writer_hash) &&
+                   derived_writer_hash == writer->run_config_sha256(),
+               "w8c_scalar_cuda_rank2_retry_delta_derives_writer_hash") &&
+      passed;
+
+  const PersistentResourceDescriptor resources = TestResources(
+      2, 1, scalar_igr_sc25_v3_layout_id);
+  CheckpointRuntimeIdentityV1 runtime = TestRuntimeIdentity();
+  runtime.physical_gpu_uuid = StableIdentity::Copy(
+      "test.cuda-rank2-one-gpu-host-staged");
+  const ScalarRank2CoefficientFixture fixture;
+  std::array<Slot, 2> committed{{
+      {fixture.interior[0], fixture.trace[0]},
+      {fixture.interior[1], fixture.trace[1]}}};
+  std::array<Slot, 2> candidate{};
+  ScalarCudaRank2Contract contract0(
+      committed[0], candidate[0], {0.0, 0, 0, 0, 1.0 / 1024.0}, resources);
+  ScalarCudaRank2Contract contract1(
+      committed[1], candidate[1], {0.0, 0, 0, 0, 1.0 / 1024.0}, resources);
+  const std::array<ScalarCudaRank2ContractView, 2> contracts{{
+      {0, &contract0}, {1, &contract1}}};
+  const auto capture_ready = AdvanceCommits(contract0, 32, 1.0 / 1024.0) &&
+      AdvanceCommits(contract1, 32, 1.0 / 1024.0);
+  const auto capture = capture_ready
+      ? CaptureCheckpointV1(contracts.data(), contracts.size(), *writer, runtime)
+      : std::optional<CapturedCheckpointV1>{};
+  const auto views = fixture.Views();
+  std::vector<std::uint8_t> encoded;
+  passed = Check(
+               capture &&
+                   EncodeCheckpointV1(*capture, views.data(), views.size(),
+                                      encoded) == CheckpointCodecStatus::ok,
+               "w8c_scalar_cuda_rank2_retry_writer_encodes") &&
+      passed;
+  if (!capture) { return false; }
+
+  std::array<State, 2> interior{{State(896, -1.0), State(896, -1.0)}};
+  std::array<State, 2> trace{{State(720, -1.0), State(560, -1.0)}};
+  std::array<RankStateBufferV1, 2> buffers{{
+      {0,
+       {interior[0].data(), interior[0].size(), interior[0].size(),
+        scalar_igr_interior_component_count_v1, 128,
+        CoefficientOrderingV1::component_major},
+       {trace[0].data(), trace[0].size(), trace[0].size(),
+        scalar_igr_trace_component_count_v1, 144,
+        CoefficientOrderingV1::component_major}},
+      {1,
+       {interior[1].data(), interior[1].size(), interior[1].size(),
+        scalar_igr_interior_component_count_v1, 128,
+        CoefficientOrderingV1::component_major},
+       {trace[1].data(), trace[1].size(), trace[1].size(),
+        scalar_igr_trace_component_count_v1, 112,
+        CoefficientOrderingV1::component_major}}}};
+  DecodedCheckpointMetadataV1 metadata{};
+  passed = Check(
+               DecodeCheckpointV1({encoded.data(), encoded.size()}, *reader,
+                                  resources, runtime, buffers.data(),
+                                  buffers.size(), metadata) ==
+                       CheckpointCodecStatus::ok &&
+                   interior == fixture.interior && trace == fixture.trace,
+               "w8c_scalar_cuda_rank2_retry_round_trip") &&
+      passed;
+  return passed;
+#else
+  return true;
+#endif
+}
+
 bool CheckFunctionalSplitRoundTrip()
 {
   const FunctionalCoefficientFixture fixture;
@@ -3122,6 +3243,7 @@ int main()
   passed = CheckScalarIgrCheckpointSchemaRoundTrip() && passed;
   passed = CheckNonEvidenceSplitRoundTrip() && passed;
   passed = CheckW8cSmoothTransitionCodecClosure() && passed;
+  passed = CheckW8cScalarSmoothCudaRank2RetryRoundTrip() && passed;
   passed = CheckFunctionalSplitRoundTrip() && passed;
   passed = CheckGoldenRoundTrip() && passed;
   passed = CheckEncoderControls() && passed;

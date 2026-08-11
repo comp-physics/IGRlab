@@ -9,7 +9,7 @@
 namespace
 {
 
-namespace scalar = ::dg::hdg::runtime::cuda_w8b::sc25;
+namespace scalar = ::dg::hdg::runtime::cuda_w8b::sc25::rank2;
 
 bool Accepted(const scalar::ScalarCudaStatus status) noexcept
 {
@@ -70,11 +70,8 @@ int main(int argc, char** argv)
   {
     const auto& evidence = owner->trajectory_evidence();
     std::cerr << "SC25_CUDA_RANK2_W8C_SMOOTH_INIT_EVIDENCE rank=" << rank
-              << " snapshots=" << evidence.snapshot_count
-              << " trace_iterations=" << evidence.snapshots[0].trace_iterations
-              << " residual="
-              << evidence.snapshots[0].trace_true_residual_norm
-              << " rhs=" << evidence.snapshots[0].trace_right_hand_side_norm
+              << " trace_iterations=" << evidence.maximum_trace_iterations
+              << " trace_ratio=" << evidence.maximum_trace_residual_ratio
               << '\n';
   }
   if (!RequireCollective(ready, rank, "initialize", status)) return 1;

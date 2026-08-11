@@ -509,7 +509,8 @@ ApplicationRejection ValidateRoleControls(
     const bool rank2_smooth_scalar = scalar &&
         options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
         options.scenario_id == cpu::w8c::SmoothTransitionV2Case::scenario_id &&
-        backend == ApplicationBackend::cpu_rank2;
+        (backend == ApplicationBackend::cpu_rank2 ||
+         backend == ApplicationBackend::cuda_rank2_one_gpu_host_staged);
     const bool focused =
         options.injection.mode == FailureInjectionModeV1::prescribed &&
         options.injection.phase == FailurePhase::AfterRecoveryBeforeCommit &&
@@ -736,7 +737,8 @@ ApplicationRejection ValidateW8c(
       options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
       options.scenario_id == cpu::w8c::SmoothTransitionV2Case::scenario_id &&
       options.card_id == scalar_igr_sc25_v3_card_id &&
-      backend == ApplicationBackend::cpu_rank2;
+      (backend == ApplicationBackend::cpu_rank2 ||
+       backend == ApplicationBackend::cuda_rank2_one_gpu_host_staged);
   if (backend != ApplicationBackend::cpu_serial && !rank2_smooth_scalar)
     return ApplicationRejection::unknown_backend;
   if (options.case_id != Case::case_id || options.scenario_id != Case::scenario_id)
@@ -1097,7 +1099,9 @@ bool DeriveSplitWriterRunConfigHashV1(
           cpu::w8c::SmoothTransitionV2Case::case_id &&
       split_reader.scenario_id().view() ==
           cpu::w8c::SmoothTransitionV2Case::scenario_id &&
-      split_reader.backend() == ApplicationBackend::cpu_rank2;
+      (split_reader.backend() == ApplicationBackend::cpu_rank2 ||
+       split_reader.backend() ==
+           ApplicationBackend::cuda_rank2_one_gpu_host_staged);
   writer.injection = w8c_rank2_retry
       ? FailureInjectionControlV1{
             FailureInjectionModeV1::prescribed,

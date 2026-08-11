@@ -40,7 +40,11 @@ namespace
 {
 
 namespace cuda = ::dg::hdg::runtime::cuda_w8a;
+#if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
+namespace scalar = ::dg::hdg::runtime::cuda_w8b::sc25::rank2;
+#else
 namespace scalar = ::dg::hdg::runtime::cuda_w8b::sc25;
+#endif
 
 #if !defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
 
@@ -2535,6 +2539,12 @@ bool RestoreScalarCudaCheckpoint(
     return false;
   }
   ScalarCheckpoint checkpoint{};
+#if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
+  checkpoint.scenario = StableIdentity::Copy(
+      config.case_id().view() == "periodic-smooth-transition-v2"
+          ? scalar::cuda_rank2_smooth_transition_fixture_id
+          : scalar::cuda_rank2_fixture_id);
+#endif
   const bool sealed = SealScalarCheckpoint(
       checkpoint, state, sidecar.ranks[static_cast<std::size_t>(context.rank())],
       context);
@@ -2642,6 +2652,16 @@ std::string ScalarCudaMetadata(
     const StateHash& final_trace, const ScalarInjectionAudit& injection,
     const ScalarResourceRecord& resource, const std::string& diagnostic)
 {
+#if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
+  const double maximum_conservation = evidence.maximum_conservation_error;
+  const double minimum_density = evidence.minimum_density;
+  const double minimum_pressure = evidence.minimum_pressure;
+  const double minimum_speed_margin = evidence.minimum_speed_margin;
+  const bool trace_residual_gate =
+      evidence.maximum_trace_residual_ratio <= 1.0;
+  const std::uint64_t physical_cuda_transfers =
+      evidence.transfer_totals.event_count;
+#else
   double maximum_conservation = 0.0;
   double minimum_density = std::numeric_limits<double>::infinity();
   double minimum_pressure = std::numeric_limits<double>::infinity();
@@ -2669,6 +2689,8 @@ std::string ScalarCudaMetadata(
           newton.trace_true_residual_norm <= bound;
     }
   }
+  const std::uint64_t physical_cuda_transfers = evidence.transfers.count;
+#endif
   const bool residency = evidence.residency.mfem_cuda_device &&
       evidence.residency.hypre_cuda && evidence.residency.umpire_device_pool &&
       evidence.residency.state_device_resident &&
@@ -2726,7 +2748,7 @@ std::string ScalarCudaMetadata(
       << evidence.launches.assemble_launches +
              evidence.launches.condense_launches +
              evidence.launches.recover_launches
-      << ",\n  \"physical_cuda_transfers\": " << evidence.transfers.count
+      << ",\n  \"physical_cuda_transfers\": " << physical_cuda_transfers
       << ",\n  \"physical_cuda_owned_allocations\": "
       << evidence.allocations.current_owned_calls
       << ",\n  \"physical_cuda_observed_allocations\": "
@@ -2976,9 +2998,14 @@ ApplicationRunResult RunScalarIgrCuda(
     return result;
   }
   ScalarCheckpoint staged_checkpoint{};
-  scalar::ScalarCudaEvidence staged_evidence{};
+  std::unique_ptr<scalar::ScalarCudaEvidence> staged_evidence;
+  bool staging_workspace_ready = true;
+  try { staged_evidence = std::make_unique<scalar::ScalarCudaEvidence>(); }
+  catch (...) { staging_workspace_ready = false; }
   if (!ScalarCollectiveAll(
-          PrepareScalarCheckpoint(initial_state, staged_checkpoint), context))
+          staging_workspace_ready && staged_evidence &&
+              PrepareScalarCheckpoint(initial_state, staged_checkpoint),
+          context))
   {
     result.status = RunStatus::terminal_failure;
     result.reason = FailureReason::backend_failure;
@@ -3100,7 +3127,7 @@ ApplicationRunResult RunScalarIgrCuda(
     if (staged && scheduled_stage)
     {
       const bool candidate_staged = owner->StageInstalledTrajectoryTransaction(
-          candidate, staged_checkpoint, staged_evidence);
+          candidate, staged_checkpoint, *staged_evidence);
       staged = ScalarCollectiveAll(
           candidate_staged && PackedFromCheckpoint(staged_checkpoint, packed),
           context);
@@ -3163,7 +3190,7 @@ ApplicationRunResult RunScalarIgrCuda(
         try
         {
           const std::string text = ScalarCudaMetadata(
-              config, anticipated, staged_evidence, initial_hash,
+              config, anticipated, *staged_evidence, initial_hash,
               final_interior, final_trace, injection, resource,
               consumed_diagnostic.empty() ? diagnostic
                                           : consumed_diagnostic);

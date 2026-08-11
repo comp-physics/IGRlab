@@ -533,7 +533,9 @@ void WriteRestartDeltaManifestV2(
   const bool w8c_rank2_retry = scalar && smooth_transition &&
       writer_config.scenario_id().view() ==
           cpu::w8c::SmoothTransitionV2Case::scenario_id &&
-      writer_config.backend() == ApplicationBackend::cpu_rank2;
+      (writer_config.backend() == ApplicationBackend::cpu_rank2 ||
+       writer_config.backend() ==
+           ApplicationBackend::cuda_rank2_one_gpu_host_staged);
   const FailureInjectionControlV1 scalar_writer_injection{
       FailureInjectionModeV1::prescribed,
       smooth_periodic_euler_v1_failure_phase,
@@ -800,7 +802,9 @@ bool ConfigMatchesSplitRestart(
   const bool w8c_rank2_retry = scalar && smooth_transition &&
       expected.scenario_id().view() ==
           cpu::w8c::SmoothTransitionV2Case::scenario_id &&
-      expected.backend() == ApplicationBackend::cpu_rank2;
+      (expected.backend() == ApplicationBackend::cpu_rank2 ||
+       expected.backend() ==
+           ApplicationBackend::cuda_rank2_one_gpu_host_staged);
   const FailureInjectionControlV1 w8c_rank2_writer_injection{
       FailureInjectionModeV1::prescribed,
       FailurePhase::AfterRecoveryBeforeCommit,
