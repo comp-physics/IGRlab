@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # OpenMPI consults HOME even for serial CTest children.  The supervised
 # controller intentionally supplies a closed environment, so recover only the
@@ -44,6 +44,12 @@ HDG_AUXILIARY_EXPERIMENT="OFF"
 SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
 CUDA_ARCH_WAS_SET=0
 PRINT_PLAN=0
+OUTPUT_ROOT_REQUEST=""
+OUTPUT_ROOT=""
+WORKTREE_ID=""
+OUTPUT_SCOPE=""
+OUTPUT_LOCK_PATH=""
+OUTPUT_LOCK_FD=""
 TEMP_ROOT=""
 TEMP_ROOT_SOURCE=""
 MFEM_REUSE_REQUEST=""
@@ -158,7 +164,9 @@ Options:
   --reuse-mfem-root DIR
                     Reuse a strictly stamped MFEM tuple rooted at DIR.  An
                     unstamped pinned clean checkout is a read-only seed for a
-                    target-local fresh MFEM build, never an in-place reuse.
+                    external fresh MFEM build, never an in-place reuse.
+  --output-root DIR  Store build outputs in DIR (default: DG_IGR_OUTPUT_ROOT,
+                    then ${XDG_CACHE_HOME:-$HOME/.cache}/dg-igr-build).
   --print-plan      Validate and print the resolved build policy, then exit.
   --clean           Rebuild the selected mode from clean caches (default).
   --no-clean        Reuse existing build and install directories.
@@ -171,7 +179,7 @@ Options:
   -h, --help        Show this help.
 
 Environment overrides:
-  DG_IGR_SPACK_ENV, SPACK_CUDA_ARCH, MFEM_CUDA_ARCHS, APP_CUDA_ARCHS,
+  DG_IGR_OUTPUT_ROOT, DG_IGR_SPACK_ENV, SPACK_CUDA_ARCH, MFEM_CUDA_ARCHS, APP_CUDA_ARCHS,
   CMAKE_BUILD_TYPE, DG_IGR_ACCELERATOR_KERNEL_SOURCES, TMPDIR
 
 CUDA_ARCHS is intentionally rejected in GPU mode. Use MFEM_CUDA_ARCHS and
@@ -212,6 +220,15 @@ while (($#)); do
         exit 2
       }
       MFEM_REUSE_REQUEST="$2"
+      shift
+      ;;
+    --output-root)
+      [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
+      [[ -n "$2" ]] || {
+        echo "ERROR: --output-root requires a non-empty value" >&2
+        exit 2
+      }
+      OUTPUT_ROOT_REQUEST="$2"
       shift
       ;;
     --print-plan) PRINT_PLAN=1 ;;
@@ -259,6 +276,177 @@ canonical_existing_path() {
   local path="$1"
   [[ -n "${path}" && -e "${path}" ]] || return 1
   realpath -e -- "${path}"
+}
+
+canonicalize_external_path() {
+  local requested="$1"
+  local canonical probe checkout
+
+  [[ -n "${requested}" ]] || {
+    echo "ERROR: output path must be non-empty." >&2
+    exit 3
+  }
+  [[ "${requested}" == /* ]] || {
+    echo "ERROR: output path must be absolute: ${requested}" >&2
+    exit 3
+  }
+  canonical="$(realpath -m -- "${requested}")" || {
+    echo "ERROR: unable to canonicalize output path: ${requested}" >&2
+    exit 3
+  }
+  [[ "${canonical}" == /* ]] || {
+    echo "ERROR: canonical output path is not absolute: ${canonical}" >&2
+    exit 3
+  }
+  probe="${canonical}"
+  while [[ ! -e "${probe}" ]]; do
+    probe="$(dirname -- "${probe}")"
+  done
+  [[ -d "${probe}" ]] || probe="$(dirname -- "${probe}")"
+  while :; do
+    if checkout="$(git -C "${probe}" rev-parse --show-toplevel 2>/dev/null)"; then
+      checkout="$(realpath -e -- "${checkout}")" || {
+        echo "ERROR: unable to canonicalize detected Git checkout: ${checkout}" >&2
+        exit 3
+      }
+      case "${canonical}" in
+        "${checkout}"|"${checkout}"/*)
+          echo "ERROR: output path must be outside detected Git checkouts: ${canonical}" >&2
+          echo "       checkout=${checkout}" >&2
+          exit 3
+          ;;
+      esac
+    fi
+    [[ "${probe}" == "/" ]] && break
+    probe="$(dirname -- "${probe}")"
+  done
+  printf '%s' "${canonical}"
+}
+
+configure_output_layout() {
+  local requested
+
+  if [[ -n "${OUTPUT_ROOT_REQUEST}" ]]; then
+    requested="${OUTPUT_ROOT_REQUEST}"
+  elif [[ -n "${DG_IGR_OUTPUT_ROOT:-}" ]]; then
+    requested="${DG_IGR_OUTPUT_ROOT}"
+  else
+    requested="${XDG_CACHE_HOME:-${HOME}/.cache}/dg-igr-build"
+  fi
+  OUTPUT_ROOT="$(canonicalize_external_path "${requested}")"
+  WORKTREE_ID="wt-$(printf '%s' "${SCRIPT_DIR}" | sha256sum | cut -c1-16)"
+  OUTPUT_SCOPE="${OUTPUT_ROOT}/worktrees/${WORKTREE_ID}/${PROFILE}"
+  OUTPUT_LOCK_PATH="${OUTPUT_ROOT}/locks/${WORKTREE_ID}-${PROFILE}.lock"
+  APP_BUILD="${OUTPUT_SCOPE}/app/build"
+  APP_INSTALL="${OUTPUT_SCOPE}/app/install"
+  MFEM_BUILD="${OUTPUT_SCOPE}/mfem/build"
+  MFEM_INSTALL="${OUTPUT_SCOPE}/mfem/install"
+}
+
+validate_directory_components() {
+  local requested="$1" label="$2" create="${3:-0}"
+  local component current="/" canonical
+  local -a components
+
+  [[ "${requested}" == /* ]] || {
+    echo "ERROR: ${label} is not absolute: ${requested}" >&2
+    exit 3
+  }
+  IFS=/ read -r -a components <<<"${requested#/}"
+  for component in "${components[@]}"; do
+    [[ -n "${component}" ]] || continue
+    current="${current%/}/${component}"
+    if [[ -L "${current}" ]]; then
+      echo "ERROR: ${label} has a symlink component: ${current}" >&2
+      exit 3
+    fi
+    if [[ -e "${current}" ]]; then
+      [[ -d "${current}" ]] || {
+        echo "ERROR: ${label} has a non-directory component: ${current}" >&2
+        exit 3
+      }
+    elif [[ "${create}" == "1" ]]; then
+      if ! mkdir -- "${current}"; then
+        [[ -d "${current}" && ! -L "${current}" ]] || {
+          echo "ERROR: unable to create ${label} component: ${current}" >&2
+          exit 3
+        }
+      fi
+    else
+      echo "ERROR: ${label} has a missing component: ${current}" >&2
+      exit 3
+    fi
+    canonical="$(realpath -e -- "${current}")" || {
+      echo "ERROR: unable to canonicalize ${label} component: ${current}" >&2
+      exit 3
+    }
+    [[ "${canonical}" == "${current}" ]] || {
+      echo "ERROR: ${label} component is not at its exact canonical path: expected=${current} actual=${canonical}" >&2
+      exit 3
+    }
+  done
+}
+
+initialize_output_lock_path() {
+  validate_directory_components "${OUTPUT_ROOT}" "output root" 1
+  validate_directory_components "$(dirname -- "${OUTPUT_LOCK_PATH}")" "output lock directory" 1
+}
+
+initialize_scoped_output_layout() {
+  validate_directory_components "${OUTPUT_ROOT}" "output root" 1
+  validate_directory_components "${OUTPUT_SCOPE}" "output scope" 1
+  validate_directory_components "${OUTPUT_SCOPE}/app" "application output scope" 1
+  validate_directory_components "${APP_BUILD}" "application build scope" 1
+  validate_directory_components "${APP_INSTALL}" "application install scope" 1
+  [[ "${APP_BUILD}" == "${OUTPUT_SCOPE}/app/build" &&
+     "${APP_INSTALL}" == "${OUTPUT_SCOPE}/app/install" ]] || {
+    echo "ERROR: resolved build paths escaped the scoped output layout." >&2
+    exit 3
+  }
+  if [[ "${MFEM_REUSE_STATE}" != "validated-read-only" ]]; then
+    validate_directory_components "${OUTPUT_SCOPE}/mfem" "MFEM output scope" 1
+    validate_directory_components "${MFEM_BUILD}" "MFEM build scope" 1
+    validate_directory_components "${MFEM_INSTALL}" "MFEM install scope" 1
+    [[ "${MFEM_BUILD}" == "${OUTPUT_SCOPE}/mfem/build" &&
+       "${MFEM_INSTALL}" == "${OUTPUT_SCOPE}/mfem/install" ]] || {
+      echo "ERROR: resolved MFEM paths escaped the scoped output layout." >&2
+      exit 3
+    }
+  fi
+}
+
+revalidate_scoped_output_layout() {
+  validate_directory_components "${OUTPUT_ROOT}" "output root"
+  validate_directory_components "${OUTPUT_SCOPE}" "output scope"
+  validate_directory_components "${OUTPUT_SCOPE}/app" "application output scope"
+  validate_directory_components "${APP_BUILD}" "application build scope"
+  validate_directory_components "${APP_INSTALL}" "application install scope"
+  if [[ "${MFEM_REUSE_STATE}" != "validated-read-only" ]]; then
+    validate_directory_components "${OUTPUT_SCOPE}/mfem" "MFEM output scope"
+    validate_directory_components "${MFEM_BUILD}" "MFEM build scope"
+    validate_directory_components "${MFEM_INSTALL}" "MFEM install scope"
+  fi
+}
+
+acquire_output_lock() {
+
+  command -v flock >/dev/null 2>&1 || {
+    echo "ERROR: output locking requires flock." >&2
+    exit 3
+  }
+  [[ ! -L "${OUTPUT_LOCK_PATH}" ]] || {
+    echo "ERROR: output lock path is a symlink: ${OUTPUT_LOCK_PATH}" >&2
+    exit 3
+  }
+  [[ ! -e "${OUTPUT_LOCK_PATH}" || -f "${OUTPUT_LOCK_PATH}" ]] || {
+    echo "ERROR: output lock path is not a regular file: ${OUTPUT_LOCK_PATH}" >&2
+    exit 3
+  }
+  exec {OUTPUT_LOCK_FD}>>"${OUTPUT_LOCK_PATH}"
+  flock -n "${OUTPUT_LOCK_FD}" || {
+    echo "ERROR: output lock is already held for worktree/profile: ${OUTPUT_LOCK_PATH}" >&2
+    exit 3
+  }
 }
 
 require_exact_mfem_directory() {
@@ -720,7 +908,6 @@ preflight_temp_root() {
     echo "ERROR: temporary-directory preflight requires mkfifo." >&2
     exit 3
   }
-
   if [[ -n "${TMPDIR:-}" ]]; then
     requested="${TMPDIR}"
     TEMP_ROOT_SOURCE="environment:TMPDIR"
@@ -888,32 +1075,8 @@ validate_mfem_origin() {
   }
 }
 
-require_target_local_mfem_parent() {
-  local create_if_absent="${1:-0}"
-  local parent="${SCRIPT_DIR}/build-deps" canonical
-  if [[ ! -e "${parent}" && ! -L "${parent}" ]]; then
-    [[ "${create_if_absent}" == "1" ]] || {
-      echo "ERROR: target-local MFEM parent is absent: ${parent}" >&2
-      exit 3
-    }
-    mkdir -p -- "${parent}"
-  fi
-  [[ -d "${parent}" && ! -L "${parent}" ]] || {
-    echo "ERROR: target-local MFEM parent is not a regular directory: ${parent}" >&2
-    exit 3
-  }
-  canonical="$(realpath -e -- "${parent}")" || {
-    echo "ERROR: unable to canonicalize target-local MFEM parent: ${parent}" >&2
-    exit 3
-  }
-  [[ "${canonical}" == "${parent}" ]] || {
-    echo "ERROR: target-local MFEM parent is not at its exact path: expected=${parent} actual=${canonical}" >&2
-    exit 3
-  }
-}
-
-plan_target_local_fresh_mfem() {
-  local requested="$1" pinprefix target target_canonical
+plan_external_fresh_mfem() {
+  local requested="$1"
   validate_mfem_source_checkout "${requested}" "fresh MFEM seed"
   MFEM_FRESH_SEED_ROOT="${MFEM_SOURCE_ROOT}"
   validate_mfem_origin "${MFEM_FRESH_SEED_ROOT}" "fresh MFEM seed"
@@ -921,110 +1084,32 @@ plan_target_local_fresh_mfem() {
     echo "ERROR: unable to record fresh MFEM seed status: ${MFEM_FRESH_SEED_ROOT}" >&2
     exit 3
   }
-  pinprefix="${MFEM_SOURCE_PIN:0:12}"
-  target="${SCRIPT_DIR}/build-deps/mfem-${PROFILE}-${pinprefix}"
-  MFEM_FRESH_TARGET_ROOT="${target}"
-  if [[ -e "${target}" || -L "${target}" ]]; then
-    require_target_local_mfem_parent 0
-    [[ -d "${target}" && ! -L "${target}" ]] || {
-      echo "ERROR: existing target-local MFEM root is not a regular directory: ${target}" >&2
-      exit 3
-    }
-    target_canonical="$(realpath -e -- "${target}")" || {
-      echo "ERROR: unable to canonicalize existing target-local MFEM root: ${target}" >&2
-      exit 3
-    }
-    [[ "${target_canonical}" == "${target}" ]] || {
-      echo "ERROR: existing target-local MFEM root is not at its exact path: expected=${target} actual=${target_canonical}" >&2
-      exit 3
-    }
-    validate_mfem_source_checkout "${target}" "existing target-local MFEM"
-    validate_mfem_origin "${MFEM_SOURCE_ROOT}" "existing target-local MFEM"
-    MFEM_BUILD="${target}/${MFEM_BUILD_NAME}"
-    MFEM_INSTALL="${target}/${MFEM_INSTALL_NAME}"
-    MFEM_REUSE_STATE="target-local-fresh-from-seed"
-    MFEM_TUPLE_STATE="target-local-fresh-from-seed-retry"
-    return
-  fi
-  MFEM_SOURCE_ROOT="${target}"
-  MFEM_BUILD="${target}/${MFEM_BUILD_NAME}"
-  MFEM_INSTALL="${target}/${MFEM_INSTALL_NAME}"
-  MFEM_REUSE_STATE="target-local-fresh-from-seed"
-  MFEM_TUPLE_STATE="target-local-fresh-from-seed-planned"
+  MFEM_FRESH_TARGET_ROOT="${OUTPUT_SCOPE}/mfem"
+  MFEM_REUSE_STATE="external-fresh-from-seed"
+  MFEM_TUPLE_STATE="external-fresh-from-seed-planned"
 }
 
-materialize_target_local_fresh_mfem() {
-  local seed="${MFEM_FRESH_SEED_ROOT}" target="${MFEM_FRESH_TARGET_ROOT}"
-  local before after staging attempt=0
-  [[ "${MFEM_FRESH_FROM_SEED}" == "1" && -n "${seed}" && -n "${target}" ]] || return 0
+prepare_external_fresh_mfem() {
+  local seed="${MFEM_FRESH_SEED_ROOT}" before after
+  [[ "${MFEM_FRESH_FROM_SEED}" == "1" && -n "${seed}" ]] || return 0
   before="$(capture_mfem_seed_status "${seed}")" || {
-    echo "ERROR: unable to re-read fresh MFEM seed status before clone: ${seed}" >&2
+    echo "ERROR: unable to re-read fresh MFEM seed status before build: ${seed}" >&2
     exit 3
   }
   [[ "${before}" == "${MFEM_FRESH_SEED_STATUS}" ]] || {
-    echo "ERROR: fresh MFEM seed status changed before materialization: ${seed}" >&2
+    echo "ERROR: fresh MFEM seed status changed before external build: ${seed}" >&2
     exit 3
   }
-  if [[ -e "${target}" || -L "${target}" ]]; then
-    local target_canonical
-    require_target_local_mfem_parent 0
-    [[ -d "${target}" && ! -L "${target}" ]] || {
-      echo "ERROR: existing target-local MFEM root is not a regular directory: ${target}" >&2
-      exit 3
-    }
-    target_canonical="$(realpath -e -- "${target}")" || {
-      echo "ERROR: unable to canonicalize existing target-local MFEM root: ${target}" >&2
-      exit 3
-    }
-    [[ "${target_canonical}" == "${target}" ]] || {
-      echo "ERROR: existing target-local MFEM root is not at its exact path: expected=${target} actual=${target_canonical}" >&2
-      exit 3
-    }
-    validate_mfem_source_checkout "${target}" "existing target-local MFEM"
-    validate_mfem_origin "${MFEM_SOURCE_ROOT}" "existing target-local MFEM"
-    after="$(capture_mfem_seed_status "${seed}")" || {
-      echo "ERROR: unable to re-read fresh MFEM seed status after retry validation: ${seed}" >&2
-      exit 3
-    }
-    [[ "${after}" == "${MFEM_FRESH_SEED_STATUS}" ]] || {
-      echo "ERROR: fresh MFEM seed identity/status changed during retry validation: ${seed}" >&2
-      exit 3
-    }
-    MFEM_SOURCE_ROOT="${target}"
-    MFEM_BUILD="${target}/${MFEM_BUILD_NAME}"
-    MFEM_INSTALL="${target}/${MFEM_INSTALL_NAME}"
-    MFEM_TUPLE_STATE="target-local-fresh-from-seed-retry"
-    return
-  fi
-  require_target_local_mfem_parent 1
-  while ((attempt < 16)); do
-    staging="${target}.staging.${BASHPID}.${RANDOM}"
-    [[ ! -e "${staging}" && ! -L "${staging}" ]] && break
-    ((++attempt))
-  done
-  ((attempt < 16)) || { echo "ERROR: unable to allocate unique MFEM clone sibling." >&2; exit 3; }
-  git clone --no-local --no-hardlinks --no-checkout -- "${seed}" "${staging}"
-  git -C "${staging}" remote set-url origin "${MFEM_CANONICAL_ORIGIN}"
-  git -C "${staging}" checkout --detach "${MFEM_SOURCE_PIN}"
-  validate_mfem_source_checkout "${staging}" "target-local fresh MFEM"
-  validate_mfem_origin "${MFEM_SOURCE_ROOT}" "target-local fresh MFEM"
   after="$(capture_mfem_seed_status "${seed}")" || {
-    echo "ERROR: unable to re-read fresh MFEM seed status after clone: ${seed}" >&2
+    echo "ERROR: unable to re-read fresh MFEM seed status before helper forwarding: ${seed}" >&2
     exit 3
   }
   [[ "${after}" == "${MFEM_FRESH_SEED_STATUS}" ]] || {
-    echo "ERROR: fresh MFEM seed identity/status changed during materialization: ${seed}" >&2
+    echo "ERROR: fresh MFEM seed identity/status changed before helper forwarding: ${seed}" >&2
     exit 3
   }
-  [[ ! -e "${target}" && ! -L "${target}" ]] || {
-    echo "ERROR: target-local fresh MFEM root appeared before atomic publish: ${target}" >&2
-    exit 3
-  }
-  mv -T -- "${staging}" "${target}"
-  MFEM_SOURCE_ROOT="${target}"
-  MFEM_BUILD="${target}/${MFEM_BUILD_NAME}"
-  MFEM_INSTALL="${target}/${MFEM_INSTALL_NAME}"
-  MFEM_TUPLE_STATE="target-local-fresh-from-seed-materialized"
+  MFEM_SOURCE_ROOT="${seed}"
+  MFEM_TUPLE_STATE="external-fresh-from-seed-forwarded"
 }
 
 validate_local_mfem_artifacts() {
@@ -1465,8 +1550,8 @@ validate_reused_mfem() {
   }
   validate_mfem_source_checkout "${requested}" "${source_kind}"
   root="${MFEM_SOURCE_ROOT}"
-  build="${root}/${MFEM_BUILD_NAME}"
-  install="${root}/${MFEM_INSTALL_NAME}"
+  build="${MFEM_BUILD:-${root}/${MFEM_BUILD_NAME}}"
+  install="${MFEM_INSTALL:-${root}/${MFEM_INSTALL_NAME}}"
   cache="${build}/CMakeCache.txt"
   install_script="${build}/cmake_install.cmake"
   check_cache="${build}/CMakeFiles/cmake.check_cache"
@@ -2185,8 +2270,6 @@ if [[ "${MODE}" == "gpu" && -n "${CUDA_ARCHS+x}" ]]; then
   exit 2
 fi
 
-preflight_temp_root
-
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 if [[ "${MODE}" == "gpu" ]]; then
   PROFILE="cuda-sm${SPACK_CUDA_ARCH}"
@@ -2194,8 +2277,6 @@ if [[ "${MODE}" == "gpu" ]]; then
   SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/${PROFILE}}"
   MFEM_BUILD_NAME="build-gpu-sm${SPACK_CUDA_ARCH}"
   MFEM_INSTALL_NAME="install-gpu-sm${SPACK_CUDA_ARCH}"
-  APP_BUILD="${SCRIPT_DIR}/build-gpu-sm${SPACK_CUDA_ARCH}"
-  APP_INSTALL="${SCRIPT_DIR}/install-gpu-sm${SPACK_CUDA_ARCH}"
   EXPECTED_MFEM_CUDA_ARCHS="${SPACK_CUDA_ARCH}"
   if [[ "${SPACK_CUDA_ARCH}" == "120" ]]; then
     EXPECTED_MFEM_CUDA_ARCHS="80-virtual"
@@ -2222,35 +2303,36 @@ else
     SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu-caliper}"
     MFEM_BUILD_NAME="build-cpu-caliper"
     MFEM_INSTALL_NAME="install-cpu-caliper"
-    APP_BUILD="${SCRIPT_DIR}/build-cpu-caliper"
-    APP_INSTALL="${SCRIPT_DIR}/install-cpu-caliper"
   else
     PROFILE="cpu"
     SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu}"
     MFEM_BUILD_NAME="build-cpu"
     MFEM_INSTALL_NAME="install-cpu"
-    APP_BUILD="${SCRIPT_DIR}/build-cpu"
-    APP_INSTALL="${SCRIPT_DIR}/install-cpu"
   fi
   MFEM_CUDA_ARCHS="none"
   APP_CUDA_ARCHS="none"
 fi
 
+configure_output_layout
+preflight_temp_root
+
 if [[ -n "${MFEM_REUSE_REQUEST}" ]]; then
   MFEM_REUSE_STAMP="${MFEM_REUSE_REQUEST}/${MFEM_BUILD_NAME}/${MFEM_IDENTITY_STAMP_NAME}"
   if [[ -e "${MFEM_REUSE_STAMP}" || -L "${MFEM_REUSE_STAMP}" ]]; then
+    # A stamped legacy tuple is an explicit read-only reuse request.  Do not
+    # redirect its identity checks into the external fresh-build scope.
+    MFEM_BUILD=""
+    MFEM_INSTALL=""
     select_reviewed_admission_route || true
     validate_reused_mfem "${MFEM_REUSE_REQUEST}"
     freeze_reuse_pre_dependency_identity
   else
     MFEM_FRESH_FROM_SEED=1
-    plan_target_local_fresh_mfem "${MFEM_REUSE_REQUEST}"
+    plan_external_fresh_mfem "${MFEM_REUSE_REQUEST}"
   fi
 else
   validate_mfem_source_checkout "${SCRIPT_DIR}/tpl/mfem" "local"
-  MFEM_BUILD="${MFEM_SOURCE_ROOT}/${MFEM_BUILD_NAME}"
-  MFEM_INSTALL="${MFEM_SOURCE_ROOT}/${MFEM_INSTALL_NAME}"
-  MFEM_TUPLE_STATE="local-source-validated-artifacts-planned"
+  MFEM_TUPLE_STATE="local-source-external-artifacts-planned"
 fi
 if [[ "${DG_IGR_RUN_REUSE_FIXTURES:-0}" == "1" ]]; then
   [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]] || {
@@ -2261,12 +2343,13 @@ if [[ "${DG_IGR_RUN_REUSE_FIXTURES:-0}" == "1" ]]; then
 fi
 
 echo "[build-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH} mfem_cuda_archs=${MFEM_CUDA_ARCHS} app_cuda_archs=${APP_CUDA_ARCHS} app_jobs=${JOBS} mfem_jobs=${MFEM_JOBS}"
+echo "[build-plan] output_root=${OUTPUT_ROOT} worktree_id=${WORKTREE_ID} scope=${OUTPUT_SCOPE}"
 echo "[build-plan] env=${SPACK_ENV} app_build=${APP_BUILD} app_install=${APP_INSTALL}"
 echo "[build-plan] temp_root=${TEMP_ROOT} temp_source=${TEMP_ROOT_SOURCE} temp_env=TMPDIR,TEMP,TMP"
 echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT}"
 echo "[build-plan] mfem_source=${MFEM_SOURCE_ROOT} mfem_build=${MFEM_BUILD} mfem_install=${MFEM_INSTALL} mfem_tuple_state=${MFEM_TUPLE_STATE} mfem_reuse_state=${MFEM_REUSE_STATE}"
 if [[ "${MFEM_FRESH_FROM_SEED}" == "1" ]]; then
-  echo "[build-plan] mfem_route=target-local-fresh-from-seed seed=${MFEM_FRESH_SEED_ROOT} target=${MFEM_FRESH_TARGET_ROOT}"
+  echo "[build-plan] mfem_route=external-fresh-from-seed seed=${MFEM_FRESH_SEED_ROOT} target=${MFEM_FRESH_TARGET_ROOT}"
 fi
 echo "[build-plan] mfem_source_pin=${MFEM_SOURCE_PIN} fem_picojson_blob=${MFEM_PICOJSON_BLOB} general_tinyxml2_blob=${MFEM_TINYXML2_BLOB}"
 if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
@@ -2281,6 +2364,10 @@ fi
 if ((PRINT_PLAN)); then
   exit 0
 fi
+
+initialize_output_lock_path
+acquire_output_lock
+initialize_scoped_output_layout
 
 command -v spack >/dev/null 2>&1 || {
   echo "ERROR: spack is not available; source Spack's setup-env.sh first." >&2
@@ -2319,11 +2406,7 @@ if [[ "${MODE}" == "gpu" ]]; then
     --cuda-codegen "${MFEM_CUDA_ARCHS}"
   )
 fi
-if ((CLEAN)); then
-  mfem_args+=(--clean)
-else
-  mfem_args+=(--no-clean)
-fi
+mfem_args+=(--no-clean)
 if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
   echo "[mfem] reuse validated: source=${MFEM_SOURCE_ROOT} build=${MFEM_BUILD} install=${MFEM_INSTALL}"
   export DG_IGR_TEST_REUSE_MFEM_ROOT="${MFEM_SOURCE_ROOT}"
@@ -2333,8 +2416,13 @@ if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
   export DG_IGR_TEST_REUSE_CALIPER="${CALIPER}"
   export DG_IGR_TEST_REUSE_CUDA_ARCH="${DEPENDENCY_CUDA_ARCH}"
 else
-  materialize_target_local_fresh_mfem
-  DG_IGR_SPACK_ENV="${SPACK_ENV}" CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+  prepare_external_fresh_mfem
+  if ((CLEAN)); then
+    revalidate_scoped_output_layout
+    rm -rf "${MFEM_BUILD}" "${MFEM_INSTALL}"
+  fi
+  DG_IGR_BUILD_HELPER_CALLER="${SCRIPT_DIR}/build.sh" \
+    DG_IGR_SPACK_ENV="${SPACK_ENV}" CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
     MFEM_SRC="${MFEM_SOURCE_ROOT}" MFEM_BUILD="${MFEM_BUILD}" \
     MFEM_INSTALL="${MFEM_INSTALL}" \
     "${SCRIPT_DIR}/build_mfem_tpl.sh" "${mfem_args[@]}"
@@ -2344,6 +2432,7 @@ fi
 CMAKE_BIN="$(spack -e "${SPACK_ENV}" location -i cmake)/bin/cmake"
 MPI_PREFIX="$(spack -e "${SPACK_ENV}" location -i openmpi)"
 if ((CLEAN)); then
+  revalidate_scoped_output_layout
   rm -rf "${APP_BUILD}" "${APP_INSTALL}"
 fi
 
