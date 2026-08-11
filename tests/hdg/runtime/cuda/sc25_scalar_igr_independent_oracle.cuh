@@ -1028,6 +1028,23 @@ inline scalar::PublishedState DecodeCheckpoint(
     const scalar::ScalarCudaCheckpoint& checkpoint) noexcept
 {
   scalar::PublishedState state{};
+  const int scalar_nodes =
+      scalar::persistent_elements * scalar::volume_nodes;
+  try
+  {
+    state.u.resize(static_cast<std::size_t>(scalar::state_components) *
+                   scalar_nodes);
+    state.sigma.resize(scalar_nodes);
+    state.z.resize(static_cast<std::size_t>(scalar::flux_components) *
+                   scalar_nodes);
+    state.uhat.resize(static_cast<std::size_t>(scalar::state_components) *
+                      scalar::persistent_scalar_trace_nodes);
+    state.sigmahat.resize(scalar::persistent_scalar_trace_nodes);
+  }
+  catch (...)
+  {
+    return {};
+  }
   for (int element = 0; element < scalar::persistent_elements; ++element)
     for (int node = 0; node < scalar::volume_nodes; ++node)
     {
@@ -1038,11 +1055,10 @@ inline scalar::PublishedState DecodeCheckpoint(
         state.u[(element * scalar::state_components + component) *
                     scalar::volume_nodes + node] =
             checkpoint.interior_component_slabs[
-                component * scalar::persistent_scalar_trace_nodes +
-                scalar_node];
+                component * scalar_nodes + scalar_node];
       }
       state.sigma[scalar_node] = checkpoint.interior_component_slabs[
-          scalar::state_components * scalar::persistent_scalar_trace_nodes +
+          scalar::state_components * scalar_nodes +
           scalar_node];
       for (int component = 0; component < scalar::flux_components;
            ++component)
@@ -1051,7 +1067,7 @@ inline scalar::PublishedState DecodeCheckpoint(
                     scalar::volume_nodes + node] =
             checkpoint.interior_component_slabs[
                 (scalar::state_components + 1 + component) *
-                    scalar::persistent_scalar_trace_nodes + scalar_node];
+                    scalar_nodes + scalar_node];
       }
     }
   std::copy_n(checkpoint.trace_component_slabs.begin(), state.uhat.size(),
