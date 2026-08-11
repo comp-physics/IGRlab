@@ -492,7 +492,17 @@ CudaAllocationLedgerV1 UmpireDeviceAllocatorPolicy::Ledger() noexcept
 void CudaTransportPolicy::ResetLedger() noexcept
 {
   transport_context = {};
-  transport_ledger = {};
+  // The retained prefix is authoritative; events beyond count are never
+  // observed.  Reset only ledger metadata to avoid materializing a full-size
+  // temporary ledger on this already deep CUDA application call path.
+  transport_ledger.schema = 1;
+  transport_ledger.capacity = maximum_transfer_events;
+  transport_ledger.totals = {};
+  transport_ledger.count = 0;
+  transport_ledger.observed_count = 0;
+  transport_ledger.dropped_count = 0;
+  transport_ledger.ordered_digest = 1469598103934665603ULL;
+  transport_ledger.overflow = false;
   transport_attempt_totals = {};
 }
 

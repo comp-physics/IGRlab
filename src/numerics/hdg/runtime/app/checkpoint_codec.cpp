@@ -530,6 +530,12 @@ void WriteRestartDeltaManifestV2(
       writer_config.scenario() == ApplicationScenarioV1::scalar_igr_sc25_v3;
   const bool smooth_transition = writer_config.case_id().view() ==
       cpu::w8c::SmoothTransitionV2Case::case_id;
+  const bool w8c_rank2_retry = scalar && smooth_transition &&
+      writer_config.scenario_id().view() ==
+          cpu::w8c::SmoothTransitionV2Case::scenario_id &&
+      (writer_config.backend() == ApplicationBackend::cpu_rank2 ||
+       writer_config.backend() ==
+           ApplicationBackend::cuda_rank2_one_gpu_host_staged);
   const FailureInjectionControlV1 scalar_writer_injection{
       FailureInjectionModeV1::prescribed,
       smooth_periodic_euler_v1_failure_phase,
@@ -542,9 +548,13 @@ void WriteRestartDeltaManifestV2(
           ? smooth_periodic_euler_v1_smoke_failure_target_step
           : smooth_periodic_euler_v1_functional_failure_target_step,
       writer_config.deferred_runtime().required_injected_source_rank};
-  const FailureInjectionControlV1 writer_injection = smooth_transition
-      ? FailureInjectionControlV1{}
-      : (scalar ? scalar_writer_injection : FailureInjectionControlV1{});
+  const FailureInjectionControlV1 writer_injection = w8c_rank2_retry
+      ? FailureInjectionControlV1{
+            FailureInjectionModeV1::prescribed,
+            FailurePhase::AfterRecoveryBeforeCommit,
+            cpu::w8c::failure_target_step, 1}
+      : (smooth_transition ? FailureInjectionControlV1{}
+      : (scalar ? scalar_writer_injection : FailureInjectionControlV1{}));
   const FailureInjectionControlV1 reader_injection = smooth_transition
       ? FailureInjectionControlV1{}
       : (scalar ? FailureInjectionControlV1{}
@@ -567,9 +577,10 @@ void WriteRestartDeltaManifestV2(
   WriteInjection(writer, writer_injection);
   WriteInjection(writer, reader_injection);
   writer.U8(6);
-  writer.UnsignedLittleEndian(smooth_transition
-      ? std::uint32_t{0}
-      : (scalar ? scalar_igr_sc25_v3_retry_limit : std::uint32_t{0}));
+  writer.UnsignedLittleEndian(w8c_rank2_retry
+      ? cpu::w8c::retry_limit
+      : (smooth_transition ? std::uint32_t{0}
+      : (scalar ? scalar_igr_sc25_v3_retry_limit : std::uint32_t{0})));
   writer.UnsignedLittleEndian(smooth_transition
       ? std::uint32_t{0}
       : (scalar ? std::uint32_t{0}
@@ -788,6 +799,16 @@ bool ConfigMatchesSplitRestart(
   const bool scalar = expected.scalar_igr();
   const bool smooth_transition = expected.case_id().view() ==
       cpu::w8c::SmoothTransitionV2Case::case_id;
+  const bool w8c_rank2_retry = scalar && smooth_transition &&
+      expected.scenario_id().view() ==
+          cpu::w8c::SmoothTransitionV2Case::scenario_id &&
+      (expected.backend() == ApplicationBackend::cpu_rank2 ||
+       expected.backend() ==
+           ApplicationBackend::cuda_rank2_one_gpu_host_staged);
+  const FailureInjectionControlV1 w8c_rank2_writer_injection{
+      FailureInjectionModeV1::prescribed,
+      FailurePhase::AfterRecoveryBeforeCommit,
+      cpu::w8c::failure_target_step, 1};
   const FailureInjectionControlV1 scalar_writer_injection{
       FailureInjectionModeV1::prescribed,
       smooth_periodic_euler_v1_failure_phase,
@@ -842,9 +863,10 @@ bool ConfigMatchesSplitRestart(
       !expected.checkpoint_step().present &&
       value.stop_after_checkpoint == StopAfterCheckpointV1::yes &&
       expected.stop_after_checkpoint() == StopAfterCheckpointV1::no &&
-      value.injection == (smooth_transition
-          ? canonical_off
-          : (scalar ? scalar_writer_injection : canonical_off)) &&
+      value.injection == (w8c_rank2_retry
+          ? w8c_rank2_writer_injection
+          : (smooth_transition ? canonical_off
+          : (scalar ? scalar_writer_injection : canonical_off))) &&
       expected.injection() == (smooth_transition
           ? canonical_off
           : (scalar ? canonical_off : delta.reader_injection)) &&
@@ -852,8 +874,10 @@ bool ConfigMatchesSplitRestart(
       value.restart_trajectory == expected.restart_trajectory() &&
       value.rollback_obligation == expected.rollback_obligation() &&
       value.source_rank_rule == expected.source_rank_rule() &&
-      value.retry_limit == (smooth_transition
-          ? 0U : (scalar ? scalar_igr_sc25_v3_retry_limit : 0U)) &&
+      value.retry_limit == (w8c_rank2_retry
+          ? cpu::w8c::retry_limit
+          : (smooth_transition ? 0U
+                               : (scalar ? scalar_igr_sc25_v3_retry_limit : 0U))) &&
       expected.retry_limit() == (smooth_transition
           ? 0U : (scalar ? 0U : smooth_periodic_euler_v1_retry_limit)) &&
       value.seed == expected.seed() &&

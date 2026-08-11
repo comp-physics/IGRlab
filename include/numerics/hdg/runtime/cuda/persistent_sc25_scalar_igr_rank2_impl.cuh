@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace dg::hdg::runtime::cuda_w8b::sc25::detail
+namespace dg::hdg::runtime::cuda_w8b::sc25::rank2::detail
 {
 
 enum class KernelOperation : int
@@ -30,8 +30,6 @@ enum class KernelOperation : int
   gather_trace_residual,
   scatter_remote_trace_residual,
   install_distributed_trace,
-  fixed_jacobian_action,
-  scatter_remote_fixed_action,
   partial_pivot_contract
 };
 
@@ -56,6 +54,8 @@ struct DeviceView final
   int true_trace_unknowns = 0;
   int volume_quadrature_points = 0;
   int face_quadrature_points = 0;
+  int projection_volume_quadrature_points = 0;
+  int projection_face_quadrature_points = 0;
   int true_matrix_nonzeros = 0;
   int true_matrix_diag_nonzeros = 0;
   int true_matrix_offd_nonzeros = 0;
@@ -74,6 +74,7 @@ struct DeviceView final
   int operation = 0;
   int committed_slot = 0;
   int selected_current_slot = 0;
+  int smooth_transition = 0;
   int compiled_architecture_expected = required_native_architecture;
   double dt = fixed_dt;
   double trial_theta = 0.0;
@@ -117,6 +118,12 @@ struct DeviceView final
   double* face_normal = nullptr;
   double* face_x = nullptr;
   double* face_y = nullptr;
+  double* projection_volume_weight = nullptr;
+  double* projection_volume_shape = nullptr;
+  double* projection_volume_x = nullptr;
+  double* projection_face_weight = nullptr;
+  double* projection_face_oriented_shape = nullptr;
+  double* projection_face_x = nullptr;
   double* volume_node_x = nullptr;
   double* volume_node_y = nullptr;
   double* trace_node_coordinate = nullptr;
@@ -130,9 +137,6 @@ struct DeviceView final
   double* remote_matrix_receive = nullptr;
   double* remote_vector_send = nullptr;
   double* remote_vector_receive = nullptr;
-  double* evidence_action_input = nullptr;
-  double* evidence_action_result = nullptr;
-  double* evidence_trace_action = nullptr;
 
   int* local_trace_to_true = nullptr;
   int* local_trace_sign = nullptr;
@@ -169,11 +173,11 @@ enum DeviceStatusBit : int
   device_wrong_architecture = 1 << 5
 };
 
-} // namespace dg::hdg::runtime::cuda_w8b::sc25::detail
+} // namespace dg::hdg::runtime::cuda_w8b::sc25::rank2::detail
 
 extern "C" __global__ void HdgSc25Rank2AssembleLocalFp64Kernel(
-    dg::hdg::runtime::cuda_w8b::sc25::detail::DeviceView view);
+    dg::hdg::runtime::cuda_w8b::sc25::rank2::detail::DeviceView view);
 extern "C" __global__ void HdgSc25Rank2CondenseFp64Kernel(
-    dg::hdg::runtime::cuda_w8b::sc25::detail::DeviceView view);
+    dg::hdg::runtime::cuda_w8b::sc25::rank2::detail::DeviceView view);
 extern "C" __global__ void HdgSc25Rank2RecoverFp64Kernel(
-    dg::hdg::runtime::cuda_w8b::sc25::detail::DeviceView view);
+    dg::hdg::runtime::cuda_w8b::sc25::rank2::detail::DeviceView view);

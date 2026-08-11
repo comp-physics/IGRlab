@@ -20,6 +20,22 @@ Then use the unified build driver:
 ./build.sh --gpu --cuda-arch 120 -j 16
 ```
 
+Application and locally built MFEM outputs live outside the checkout. By default they are scoped under
+`${XDG_CACHE_HOME:-$HOME/.cache}/dg-igr-build` by canonical worktree and
+profile; choose another external location with `--output-root DIR` or
+`DG_IGR_OUTPUT_ROOT`. A selected output root must be outside every detected Git
+checkout.
+
+```bash
+./build.sh --cpu-only --output-root /scratch/$USER/dg-igr -j 16
+./build.sh --gpu --cuda-arch 120 --print-plan
+```
+
+`--print-plan` reports the output root, deterministic worktree/profile scope,
+and resolved app/MFEM paths without creating output-root content or acquiring
+the output lock. `build_mfem_tpl.sh` is an internal helper; invoke `build.sh`
+for all builds.
+
 Spack environments live under `spack-envs/`. The checked-in profiles are
 `cpu` and `cuda-sm120`; the latter uses CUDA 13 and HYPRE `develop`. Future
 datacenter profiles follow the same convention, such as `cuda-sm80` for A100,

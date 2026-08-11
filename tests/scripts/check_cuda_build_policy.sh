@@ -29,6 +29,11 @@ assert_not_exists() {
   [[ ! -e "${path}" ]] || fail "unexpected action marker exists: ${path}"
 }
 
+plan_field() {
+  local plan="$1" key="$2"
+  sed -n "s/.*${key}=\\([^ ]*\\).*/\\1/p" <<<"${plan}" | tail -n 1
+}
+
 assert_adjacent_args() {
   local path="$1"
   local first="$2"
@@ -60,6 +65,31 @@ assert_reuse_transaction_order() {
      ${install_line} -lt ${revalidate_line} &&
      ${revalidate_line} -lt ${view_line} ]] || {
     fail "reuse revalidation must occur once after dependency install and before SPACK_VIEW"
+  }
+}
+
+assert_stamped_reuse_scope_policy() {
+  local driver="$1" init_body runtime_body
+
+  init_body="$(awk '
+    /^initialize_scoped_output_layout\(\)/ { capture = 1 }
+    capture { print }
+    capture && /^}/ { exit }
+  ' "${driver}")"
+  runtime_body="$(awk '
+    /^if \[\[ "\$\{MFEM_REUSE_STATE\}" == "validated-read-only" \]\]; then/ { capture = 1 }
+    capture { print }
+    capture && /^CMAKE_BIN=/ { exit }
+  ' "${driver}")"
+  [[ "${init_body}" == *'application build scope'* &&
+     "${init_body}" == *'if [[ "${MFEM_REUSE_STATE}" != "validated-read-only" ]]; then'* &&
+     "${init_body}" == *'MFEM build scope'* ]] || {
+    fail "stamped reuse scope policy no longer separates app and MFEM paths"
+  }
+  [[ "${runtime_body}" == *'if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then'* &&
+     "${runtime_body}" == *'else'* &&
+     "${runtime_body}" == *'rm -rf "${MFEM_BUILD}" "${MFEM_INSTALL}"'* ]] || {
+    fail "stamped reuse runtime route no longer keeps legacy MFEM cleanup out of the reuse branch"
   }
 }
 
@@ -234,6 +264,7 @@ fixture_root="${tmp_root}/fixture"
 fixture_mfem="${fixture_root}/tpl/mfem"
 fake_bin="${tmp_root}/fake-bin"
 mkdir -p "${fixture_root}/spack-envs/cuda-sm120/.spack-env/view" \
+         "${fixture_root}/spack-envs/cpu/.spack-env/view" \
          "${fixture_root}/tpl" "${fake_bin}"
 git -c advice.detachedHead=false clone --quiet --shared --no-checkout \
   "${mfem_source}" "${fixture_mfem}"
@@ -292,20 +323,61 @@ clean_env=(
   -u APP_CUDA_ARCHS
   -u SPACK_CUDA_ARCH
   -u DG_IGR_SPACK_ENV
+  -u DG_IGR_OUTPUT_ROOT
 )
 
 # The synthetic exact-source composition exercises normal-mode source
 # validation even when the application worktree's submodule is uninitialized.
 # The canonical sm120 plan keeps dependencies and project sources native while
 # compiling only MFEM through compatibility PTX.
-plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
-  --gpu --cuda-arch 120 -j 16 --print-plan)"
+default_cache_root="${tmp_root}/default-cache"
+default_output_root="${default_cache_root}/dg-igr-build"
+plan="$("${clean_env[@]}" XDG_CACHE_HOME="${default_cache_root}" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 -j 16 --print-plan)"
 assert_contains "${plan}" "profile=cuda-sm120"
 assert_contains "${plan}" "dependency_cuda_arch=120"
 assert_contains "${plan}" "mfem_cuda_archs=80-virtual"
 assert_contains "${plan}" "app_cuda_archs=120"
 assert_contains "${plan}" "app_jobs=16"
 assert_contains "${plan}" "mfem_jobs=16"
+assert_contains "${plan}" "output_root=${default_output_root}"
+assert_not_exists "${default_output_root}"
+
+explicit_output_root="${tmp_root}/explicit-output"
+plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+  --gpu --cuda-arch 120 --output-root "${explicit_output_root}" --print-plan)"
+scope="$(plan_field "${plan}" scope)"
+[[ "${scope}" == "${explicit_output_root}/worktrees/"*/cuda-sm120 ]] || {
+  fail "explicit output scope is not worktree/profile scoped: ${scope}"
+}
+assert_contains "${plan}" "app_build=${scope}/app/build"
+assert_contains "${plan}" "app_install=${scope}/app/install"
+assert_contains "${plan}" "mfem_build=${scope}/mfem/build"
+assert_contains "${plan}" "mfem_install=${scope}/mfem/install"
+assert_not_exists "${explicit_output_root}"
+
+env_output_root="${tmp_root}/env-output"
+cli_output_root="${tmp_root}/cli-output"
+plan="$("${clean_env[@]}" DG_IGR_OUTPUT_ROOT="${env_output_root}" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 \
+    --output-root "${cli_output_root}" --print-plan)"
+assert_contains "${plan}" "output_root=${cli_output_root}"
+assert_not_exists "${cli_output_root}"
+plan="$("${clean_env[@]}" DG_IGR_OUTPUT_ROOT="${env_output_root}" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 --print-plan)"
+assert_contains "${plan}" "output_root=${env_output_root}"
+assert_not_exists "${env_output_root}"
+
+isolation_output_root="${tmp_root}/profile-isolation"
+gpu_scope="$(plan_field "$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+  --gpu --cuda-arch 120 --output-root "${isolation_output_root}" --print-plan)" scope)"
+cpu_scope="$(plan_field "$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+  --cpu-only --output-root "${isolation_output_root}" --print-plan)" scope)"
+[[ "${gpu_scope}" != "${cpu_scope}" && "${gpu_scope}" == */cuda-sm120 &&
+   "${cpu_scope}" == */cpu ]] || {
+  fail "worktree/profile scopes are not isolated: gpu=${gpu_scope} cpu=${cpu_scope}"
+}
+assert_not_exists "${isolation_output_root}"
 
 plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
   --gpu --cuda-arch 120 -j 16 --mfem-jobs 7 --print-plan)"
@@ -334,6 +406,48 @@ assert_contains "${reject_output}" \
   "--reuse-mfem-root requires a non-empty value"
 assert_not_exists "${tmp_root}/empty-reuse-helper.log"
 assert_not_exists "${tmp_root}/empty-reuse-spack.log"
+
+# An output root within a checkout is rejected before any helper or Spack path.
+set +e
+reject_output="$(PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/checkout-output-helper.log" \
+  FAKE_SPACK_LOG="${tmp_root}/checkout-output-spack.log" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 \
+    --output-root "${fixture_root}/forbidden-output" \
+    --no-deps --no-tests --print-plan 2>&1)"
+reject_rc=$?
+set -e
+[[ ${reject_rc} -eq 3 ]] || fail "checkout output root exited ${reject_rc}, expected 3"
+assert_contains "${reject_output}" "output path must be outside detected Git checkouts"
+assert_not_exists "${tmp_root}/checkout-output-helper.log"
+assert_not_exists "${tmp_root}/checkout-output-spack.log"
+
+set +e
+reject_output="$(PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/env-checkout-output-helper.log" \
+  FAKE_SPACK_LOG="${tmp_root}/env-checkout-output-spack.log" \
+  DG_IGR_OUTPUT_ROOT="${fixture_root}/forbidden-env-output" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 \
+    --no-deps --no-tests --print-plan 2>&1)"
+reject_rc=$?
+set -e
+[[ ${reject_rc} -eq 3 ]] || fail "environment checkout output root exited ${reject_rc}, expected 3"
+assert_contains "${reject_output}" "output path must be outside detected Git checkouts"
+assert_not_exists "${tmp_root}/env-checkout-output-helper.log"
+assert_not_exists "${tmp_root}/env-checkout-output-spack.log"
+
+set +e
+reject_output="$(PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/relative-output-helper.log" \
+  FAKE_SPACK_LOG="${tmp_root}/relative-output-spack.log" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 \
+    --output-root relative-output --no-deps --no-tests --print-plan 2>&1)"
+reject_rc=$?
+set -e
+[[ ${reject_rc} -eq 3 ]] || fail "relative output root exited ${reject_rc}, expected 3"
+assert_contains "${reject_output}" "output path must be absolute"
+assert_not_exists "${tmp_root}/relative-output-helper.log"
+assert_not_exists "${tmp_root}/relative-output-spack.log"
 
 set +e
 reject_output="$(env -u CUDA_ARCHS -u APP_CUDA_ARCHS -u SPACK_CUDA_ARCH \
@@ -380,74 +494,188 @@ assert_contains "${reject_output}" "CUDA_ARCHS is ambiguous"
 assert_not_exists "${tmp_root}/legacy-helper.log"
 assert_not_exists "${tmp_root}/legacy-spack.log"
 
-# The MFEM entry point enforces the same policy independently and before its
-# clean operation. Sentinels prove an invalid direct call cannot remove caches.
+# The private helper rejects clean even when its advisory caller marker is set.
 mfem_build="${tmp_root}/mfem-build"
 mfem_install="${tmp_root}/mfem-install"
 mkdir -p "${mfem_build}" "${mfem_install}"
 touch "${mfem_build}/sentinel" "${mfem_install}/sentinel"
+helper_caller="$(cd -- "$(dirname -- "${MFEM_DRIVER}")" && pwd)/build.sh"
 set +e
-reject_output="$(env -u CUDA_ARCHS -u SPACK_CUDA_ARCH \
-  PATH="${fake_bin}:/usr/bin:/bin" \
-  FAKE_SPACK_LOG="${tmp_root}/direct-helper-spack.log" \
-  MFEM_BUILD="${mfem_build}" MFEM_INSTALL="${mfem_install}" \
-  bash "${MFEM_DRIVER}" --gpu --cuda-arch 120 --cuda-codegen 120 \
-    --clean 2>&1)"
+reject_output="$(PATH="${fake_bin}:/usr/bin:/bin" \
+  DG_IGR_BUILD_HELPER_CALLER="${helper_caller}" \
+  DG_IGR_SPACK_ENV="${tmp_root}/spoofed-helper-spack" \
+  MFEM_SRC="${fixture_mfem}" MFEM_BUILD="${mfem_build}" \
+  MFEM_INSTALL="${mfem_install}" \
+  bash "${MFEM_DRIVER}" --gpu --cuda-arch 120 \
+    --cuda-codegen 80-virtual --clean 2>&1)"
 reject_rc=$?
 set -e
-[[ ${reject_rc} -eq 2 ]] || fail "unsafe direct helper exited ${reject_rc}, expected 2"
-assert_contains "${reject_output}" "requires --cuda-codegen 80-virtual"
-[[ -f "${mfem_build}/sentinel" ]] || fail "unsafe helper removed MFEM build sentinel"
-[[ -f "${mfem_install}/sentinel" ]] || fail "unsafe helper removed MFEM install sentinel"
-assert_not_exists "${tmp_root}/direct-helper-spack.log"
+[[ ${reject_rc} -eq 2 ]] || fail "spoofed helper clean exited ${reject_rc}, expected 2"
+assert_contains "${reject_output}" "private helper and rejects --clean"
+[[ -f "${mfem_build}/sentinel" ]] || fail "spoofed helper removed MFEM build sentinel"
+[[ -f "${mfem_install}/sentinel" ]] || fail "spoofed helper removed MFEM install sentinel"
 
+contained_build="${fixture_mfem}/direct-build"
+contained_install="${fixture_mfem}/direct-install"
+mkdir -p "${contained_build}" "${contained_install}"
+touch "${contained_build}/sentinel" "${contained_install}/sentinel"
 set +e
-reject_output="$(env -u SPACK_CUDA_ARCH \
-  PATH="${fake_bin}:/usr/bin:/bin" \
-  FAKE_SPACK_LOG="${tmp_root}/direct-legacy-spack.log" \
-  CUDA_ARCHS=80-virtual \
-  bash "${MFEM_DRIVER}" --gpu --cuda-arch 120 --cuda-codegen 80-virtual \
-    --clean 2>&1)"
+reject_output="$(PATH="${fake_bin}:/usr/bin:/bin" \
+  DG_IGR_BUILD_HELPER_CALLER="${helper_caller}" \
+  DG_IGR_SPACK_ENV="${tmp_root}/contained-helper-spack" \
+  MFEM_SRC="${fixture_mfem}" MFEM_BUILD="${contained_build}" \
+  MFEM_INSTALL="${contained_install}" \
+  FAKE_SPACK_LOG="${tmp_root}/contained-helper-spack.log" \
+  bash "${MFEM_DRIVER}" --cpu-only --no-clean 2>&1)"
 reject_rc=$?
 set -e
-[[ ${reject_rc} -eq 2 ]] || fail "direct legacy CUDA_ARCHS exited ${reject_rc}, expected 2"
-assert_contains "${reject_output}" "CUDA_ARCHS is ambiguous"
-assert_not_exists "${tmp_root}/direct-legacy-spack.log"
+[[ ${reject_rc} -eq 2 ]] || fail "source-contained helper exited ${reject_rc}, expected 2"
+assert_contains "${reject_output}" "rejects MFEM_BUILD inside MFEM_SRC"
+[[ -f "${contained_build}/sentinel" && -f "${contained_install}/sentinel" ]] || \
+  fail "source-contained helper altered a sentinel"
+assert_not_exists "${tmp_root}/contained-helper-spack.log"
 
-mfem_plan="$("${clean_env[@]}" bash "${MFEM_DRIVER}" \
-  --gpu --cuda-arch 120 --cuda-codegen 80-virtual -j 7 --print-plan)"
-assert_contains "${mfem_plan}" "profile=cuda-sm120"
-assert_contains "${mfem_plan}" "dependency_cuda_arch=120"
-assert_contains "${mfem_plan}" "cuda_codegen_archs=80-virtual jobs=7"
+# Scoped component validation rejects intermediate app/MFEM build symlinks
+# before Spack, the helper, or cleanup can reach their sentinel targets.
+app_link_output_root="${tmp_root}/app-link-output"
+app_link_plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+  --gpu --cuda-arch 120 --output-root "${app_link_output_root}" --print-plan)"
+app_link_scope="$(plan_field "${app_link_plan}" scope)"
+app_link_target="${tmp_root}/app-link-target"
+mkdir -p "${app_link_scope}/app" "${app_link_target}"
+printf 'app-link-sentinel\n' >"${app_link_target}/sentinel"
+ln -s "${app_link_target}" "${app_link_scope}/app/build"
+set +e
+reject_output="$(PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/app-link-helper.log" \
+  FAKE_SPACK_LOG="${tmp_root}/app-link-spack.log" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 \
+    --output-root "${app_link_output_root}" --clean --no-deps --no-tests 2>&1)"
+reject_rc=$?
+set -e
+[[ ${reject_rc} -eq 3 ]] || fail "app symlink scope exited ${reject_rc}, expected 3"
+assert_contains "${reject_output}" "application build scope has a symlink component"
+[[ "$(<"${app_link_target}/sentinel")" == "app-link-sentinel" ]] || \
+  fail "app symlink target sentinel changed"
+assert_not_exists "${tmp_root}/app-link-helper.log"
+assert_not_exists "${tmp_root}/app-link-spack.log"
+
+mfem_link_output_root="${tmp_root}/mfem-link-output"
+mfem_link_plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+  --gpu --cuda-arch 120 --output-root "${mfem_link_output_root}" --print-plan)"
+mfem_link_scope="$(plan_field "${mfem_link_plan}" scope)"
+mfem_link_target="${tmp_root}/mfem-link-target"
+mkdir -p "${mfem_link_scope}/mfem" "${mfem_link_target}"
+printf 'mfem-link-sentinel\n' >"${mfem_link_target}/sentinel"
+ln -s "${mfem_link_target}" "${mfem_link_scope}/mfem/build"
+set +e
+reject_output="$(PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/mfem-link-helper.log" \
+  FAKE_SPACK_LOG="${tmp_root}/mfem-link-spack.log" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 \
+    --output-root "${mfem_link_output_root}" --clean --no-deps --no-tests 2>&1)"
+reject_rc=$?
+set -e
+[[ ${reject_rc} -eq 3 ]] || fail "MFEM symlink scope exited ${reject_rc}, expected 3"
+assert_contains "${reject_output}" "MFEM build scope has a symlink component"
+[[ "$(<"${mfem_link_target}/sentinel")" == "mfem-link-sentinel" ]] || \
+  fail "MFEM symlink target sentinel changed"
+assert_not_exists "${tmp_root}/mfem-link-helper.log"
+assert_not_exists "${tmp_root}/mfem-link-spack.log"
 
 # A fake helper captures the canonical driver's explicit forwarding without
 # allowing the test to reach CMake or any build command.
+forward_output_root="${tmp_root}/forward-output"
+forward_spack_env="${tmp_root}/forward-spack-env"
+mkdir -p "${forward_spack_env}/.spack-env/view"
+cp "${REPO_ROOT}/spack-envs/cuda-sm120/spack.yaml" \
+  "${forward_spack_env}/spack.yaml"
 set +e
 env -u CUDA_ARCHS -u MFEM_CUDA_ARCHS -u APP_CUDA_ARCHS -u SPACK_CUDA_ARCH \
   PATH="${fake_bin}:/usr/bin:/bin" \
   FAKE_HELPER_LOG="${tmp_root}/forwarded-args.log" \
   FAKE_SPACK_LOG="${tmp_root}/forwarded-spack.log" \
-  DG_IGR_SPACK_ENV="${fixture_root}/spack-envs/cuda-sm120" \
+  DG_IGR_SPACK_ENV="${forward_spack_env}" \
   bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 \
+  --output-root "${forward_output_root}" \
   -j 16 --mfem-jobs 7 --no-clean --no-deps --no-tests \
   >"${tmp_root}/forwarding-output.log" 2>&1
 forward_rc=$?
 set -e
 [[ ${forward_rc} -eq 77 ]] || fail "fake-helper forwarding exited ${forward_rc}, expected 77"
 forwarded_log="$(<"${tmp_root}/forwarded-args.log")"
+forward_scope="$(plan_field "$(<"${tmp_root}/forwarding-output.log")" scope)"
+[[ "${forward_scope}" == "${forward_output_root}/worktrees/"*/cuda-sm120 ]] || {
+  fail "forwarded output scope is not worktree/profile scoped: ${forward_scope}"
+}
 assert_contains "${forwarded_log}" "MFEM_SRC=${fixture_mfem}"
 assert_contains "${forwarded_log}" \
-  "MFEM_BUILD=${fixture_mfem}/build-gpu-sm120"
+  "MFEM_BUILD=${forward_scope}/mfem/build"
 assert_contains "${forwarded_log}" \
-  "MFEM_INSTALL=${fixture_mfem}/install-gpu-sm120"
+  "MFEM_INSTALL=${forward_scope}/mfem/install"
 assert_adjacent_args "${tmp_root}/forwarded-args.log" "--jobs" "7"
 assert_adjacent_args "${tmp_root}/forwarded-args.log" "--cuda-arch" "120"
 assert_adjacent_args "${tmp_root}/forwarded-args.log" "--cuda-codegen" "80-virtual"
 assert_not_exists "${tmp_root}/forwarded-spack.log"
+assert_not_exists "${fixture_root}/build-deps"
+
+# Distinct profiles may race to create a fresh shared output root; each owns a
+# separate scope and reaches the fake helper without a spurious mkdir failure.
+concurrent_output_root="${tmp_root}/concurrent-output"
+set +e
+PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/concurrent-gpu-helper.log" \
+  FAKE_SPACK_LOG="${tmp_root}/concurrent-gpu-spack.log" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 \
+    --output-root "${concurrent_output_root}" --no-clean --no-deps --no-tests \
+    >"${tmp_root}/concurrent-gpu.out" 2>&1 &
+concurrent_gpu_pid=$!
+PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/concurrent-cpu-helper.log" \
+  FAKE_SPACK_LOG="${tmp_root}/concurrent-cpu-spack.log" \
+  bash "${fixture_root}/build.sh" --cpu-only \
+    --output-root "${concurrent_output_root}" --no-clean --no-deps --no-tests \
+    >"${tmp_root}/concurrent-cpu.out" 2>&1 &
+concurrent_cpu_pid=$!
+wait "${concurrent_gpu_pid}"
+concurrent_gpu_rc=$?
+wait "${concurrent_cpu_pid}"
+concurrent_cpu_rc=$?
+set -e
+[[ ${concurrent_gpu_rc} -eq 77 && ${concurrent_cpu_rc} -eq 77 ]] || {
+  fail "concurrent output initialization failed: gpu=${concurrent_gpu_rc} cpu=${concurrent_cpu_rc}"
+}
+assert_not_exists "${tmp_root}/concurrent-gpu-spack.log"
+assert_not_exists "${tmp_root}/concurrent-cpu-spack.log"
+
+# A held per-worktree/profile lock fails closed before either Spack or helper.
+lock_output_root="${tmp_root}/lock-output"
+lock_plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+  --gpu --cuda-arch 120 --output-root "${lock_output_root}" --print-plan)"
+lock_worktree_id="$(plan_field "${lock_plan}" worktree_id)"
+lock_path="${lock_output_root}/locks/${lock_worktree_id}-cuda-sm120.lock"
+mkdir -p "$(dirname -- "${lock_path}")"
+flock -n "${lock_path}" sleep 5 &
+lock_holder=$!
+set +e
+reject_output="$(PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/locked-helper.log" \
+  FAKE_SPACK_LOG="${tmp_root}/locked-spack.log" \
+  DG_IGR_SPACK_ENV="${forward_spack_env}" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 \
+    --output-root "${lock_output_root}" --no-deps --no-tests 2>&1)"
+reject_rc=$?
+set -e
+wait "${lock_holder}"
+[[ ${reject_rc} -eq 3 ]] || fail "locked output exited ${reject_rc}, expected 3"
+assert_contains "${reject_output}" "output lock is already held"
+assert_not_exists "${tmp_root}/locked-helper.log"
+assert_not_exists "${tmp_root}/locked-spack.log"
 
 # The reuse tuple is revalidated only after a real dependency install and
 # before any view export or build consumer can observe the transition.
 assert_reuse_transaction_order "${BUILD_DRIVER}"
+assert_stamped_reuse_scope_policy "${BUILD_DRIVER}"
 assert_reuse_identity_policy "${BUILD_DRIVER}" \
   "${REPO_ROOT}/cmake/mfem-reuse-identities/cpu-w8a-d9d6526-973e5abc.json" \
   "${REPO_ROOT}/cmake/mfem-reuse-identities/gpu-w8a-d9d6526-345d64a2.json"

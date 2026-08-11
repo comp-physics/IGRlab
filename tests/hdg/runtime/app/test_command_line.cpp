@@ -217,7 +217,8 @@ bool ParseScalarVtk(const std::vector<std::uint8_t>& bytes,
 }
 
 bool CompareScalarVtk(const char* left_path, const char* right_path,
-                      const double tolerance)
+                      const double tolerance,
+                      const bool unit_norm_floor = false)
 {
   ScalarVtkField left, right;
   if (!ParseScalarVtk(left_path, left) || !ParseScalarVtk(right_path, right) ||
@@ -245,8 +246,10 @@ bool CompareScalarVtk(const char* left_path, const char* right_path,
     }
     const long double difference_norm = std::sqrt(difference_squared);
     const long double reference_norm = std::sqrt(reference_squared);
-    const long double error = reference_norm == 0.0L
-        ? difference_norm : difference_norm / reference_norm;
+    const long double error = unit_norm_floor
+        ? difference_norm / std::max(1.0L, reference_norm)
+        : (reference_norm == 0.0L
+            ? difference_norm : difference_norm / reference_norm);
     if (!std::isfinite(error) || error > tolerance) return false;
   }
   return true;
@@ -1235,7 +1238,7 @@ bool DirectAndNegativeControls()
                          ApplicationRejection::invalid_run_role,
                  "scalar_cuda_rank1_step20_cli_contract") && passed;
 #endif
-#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK2 && DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
   for (const std::string phase :
        {"CheckpointStaging", "OutputStaging",
         "AfterRecoveryBeforeCommit"})
@@ -1308,6 +1311,41 @@ bool DirectAndNegativeControls()
                    smooth_scalar.rejection ==
                        ApplicationRejection::unbuilt_backend,
                "smooth_transition_scalar_unbuilt_cli") && passed;
+#endif
+
+  const ParsedCommandLine smooth_scalar_cuda_rank2 =
+      Parse(SmoothTransitionArguments(true, "cuda", "0"));
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK2 && DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
+  passed = Check(
+               smooth_scalar_cuda_rank2.status == CommandLineStatus::run &&
+                   smooth_scalar_cuda_rank2.options.backend_id ==
+                       CudaRank2OneGpuHostStagedBackendTag::id &&
+                   smooth_scalar_cuda_rank2.options.device_id == 0,
+               "smooth_transition_scalar_cuda_rank2_cli") &&
+      passed;
+  auto smooth_cuda_writer =
+      SmoothTransitionArguments(true, "cuda", "0");
+  SetOption(smooth_cuda_writer, "--stop-after-checkpoint", "true");
+  SetOption(smooth_cuda_writer, "--max-retries", "1");
+  SetOption(smooth_cuda_writer, "--inject-failure",
+            "AfterRecoveryBeforeCommit:7:1");
+  auto smooth_cuda_reader = smooth_cuda_writer;
+  SetOption(smooth_cuda_reader, "--checkpoint-out", "none");
+  SetOption(smooth_cuda_reader, "--checkpoint-step", "none");
+  SetOption(smooth_cuda_reader, "--stop-after-checkpoint", "false");
+  SetOption(smooth_cuda_reader, "--restart-from", "w8c-smooth-checkpoint");
+  SetOption(smooth_cuda_reader, "--max-retries", "0");
+  SetOption(smooth_cuda_reader, "--inject-failure", "off");
+  passed = Check(Parse(smooth_cuda_writer).status == CommandLineStatus::run &&
+                     Parse(smooth_cuda_reader).status == CommandLineStatus::run,
+                 "smooth_transition_scalar_cuda_rank2_split_cli") &&
+      passed;
+#else
+  passed = Check(smooth_scalar_cuda_rank2.status == CommandLineStatus::rejected &&
+                     smooth_scalar_cuda_rank2.rejection ==
+                         ApplicationRejection::unbuilt_backend,
+                 "smooth_transition_scalar_cuda_rank2_unbuilt_cli") &&
+      passed;
 #endif
 
   auto smooth_reader = SmoothTransitionArguments(false, "cpu", "none");
@@ -1421,6 +1459,17 @@ int main(const int argc, const char* const* argv)
     const bool compared = tolerance > 0.0 &&
         CompareScalarVtk(argv[2], argv[3], tolerance);
     if (compared) std::cout << "HDG scalar-IGR VTK parity PASS\n";
+    return compared ? 0 : 1;
+  }
+  if (argc == 5 &&
+      std::string{argv[1]} == "--compare-scalar-vtk-w8c-rank2")
+  {
+    double tolerance = 0.0;
+    try { tolerance = std::stod(argv[4]); }
+    catch (...) { return 64; }
+    const bool compared = tolerance > 0.0 &&
+        CompareScalarVtk(argv[2], argv[3], tolerance, true);
+    if (compared) std::cout << "HDG scalar-IGR W8C rank-two VTK parity PASS\n";
     return compared ? 0 : 1;
   }
   if (argc == 4 && std::string{argv[1]} == "--validate-scalar-initial-vtk")

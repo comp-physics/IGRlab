@@ -145,6 +145,21 @@ set_tests_properties(
   PROPERTIES PROCESSORS 2)
 
 if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
+  add_test(NAME dg_igr_hdg_runtime_app_cli_w8c_smooth_scalar_cpu_rank2
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
+      "-DHDG_RUNTIME_SCALAR_VTK_TEST=$<TARGET_FILE:dg_igr_hdg_runtime_app_command_line_test>"
+      "-DHDG_RUNTIME_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cli-w8c-smooth-scalar-cpu-rank2"
+      -DHDG_RUNTIME_W8C_SMOOTH_RANK2=TRUE
+      -DHDG_RUNTIME_RANKS=2
+      "-DHDG_RUNTIME_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_RUNTIME_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      "-DHDG_RUNTIME_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+      "-DHDG_RUNTIME_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_process.cmake")
+  set_tests_properties(dg_igr_hdg_runtime_app_cli_w8c_smooth_scalar_cpu_rank2
+    PROPERTIES LABELS "hdg;runtime;app;cli;cpu;rank2;w8c;smooth-transition"
+               PROCESSORS 2 RESOURCE_LOCK hdg_runtime_cpu TIMEOUT 7200)
   add_test(NAME dg_igr_hdg_runtime_app_cli_scalar_igr_cpu_serial
     COMMAND "${CMAKE_COMMAND}"
       "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
@@ -182,6 +197,27 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
 endif()
 
 if(MFEM_USE_CUDA)
+  add_test(NAME dg_igr_hdg_runtime_app_cli_w8c_smooth_scalar_cuda_rank2
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
+      "-DHDG_RUNTIME_SCALAR_VTK_TEST=$<TARGET_FILE:dg_igr_hdg_runtime_app_command_line_test>"
+      "-DHDG_RUNTIME_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cli-w8c-smooth-scalar-cuda-rank2"
+      -DHDG_RUNTIME_W8C_SMOOTH_RANK2=TRUE
+      -DHDG_RUNTIME_BACKEND=cuda
+      -DHDG_RUNTIME_DEVICE_ID=0
+      -DHDG_RUNTIME_RANKS=2
+      "-DHDG_RUNTIME_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_RUNTIME_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      "-DHDG_RUNTIME_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+      "-DHDG_RUNTIME_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_runtime_app_cli_w8c_smooth_scalar_cuda_rank2
+    PROPERTIES
+      LABELS "hdg;runtime;app;cli;cuda;rank2;w8c;smooth-transition"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 7200)
   add_test(NAME dg_igr_hdg_runtime_app_cli_process_cuda_rank1
     COMMAND "${CMAKE_COMMAND}"
       "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"

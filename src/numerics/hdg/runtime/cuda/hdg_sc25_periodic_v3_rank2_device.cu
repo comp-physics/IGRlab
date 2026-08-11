@@ -21,8 +21,8 @@
 #include <utility>
 #include <vector>
 
-namespace scalar = dg::hdg::runtime::cuda_w8b::sc25;
-namespace scalar_detail = dg::hdg::runtime::cuda_w8b::sc25::detail;
+namespace scalar = dg::hdg::runtime::cuda_w8b::sc25::rank2;
+namespace scalar_detail = dg::hdg::runtime::cuda_w8b::sc25::rank2::detail;
 
 namespace
 {
@@ -330,6 +330,18 @@ __device__ inline void SmoothState(const double x, const double y,
       0.5 * rho * (u * u + v * v);
 }
 
+__device__ inline void SmoothTransitionState(const double x, double value[4])
+{
+  const double kappa = atanh(0.8) / sin(pi_value / 8.0);
+  const double chi = 0.5 * (1.0 - tanh(kappa * cos(2.0 * pi_value * x)));
+  const double rho = 0.125 + 0.875 * chi;
+  const double pressure = 0.1 + 0.9 * chi;
+  value[0] = rho;
+  value[1] = 0.0;
+  value[2] = 0.0;
+  value[3] = pressure / (gamma_value - 1.0);
+}
+
 template <int N>
 __device__ bool SmallFullPivotSolve(double matrix[N * N],
                                     double rhs[N], double solution[N])
@@ -582,6 +594,24 @@ __device__ void InitializeProjection(scalar_detail::DeviceView& view)
 {
   double* interior = view.slot_interior[0];
   double* trace = view.slot_trace[0];
+  const int volume_qpoints = view.smooth_transition != 0
+      ? view.projection_volume_quadrature_points
+      : view.volume_quadrature_points;
+  const int face_qpoints = view.smooth_transition != 0
+      ? view.projection_face_quadrature_points
+      : view.face_quadrature_points;
+  const double* volume_weight = view.smooth_transition != 0
+      ? view.projection_volume_weight : view.volume_weight;
+  const double* volume_shape = view.smooth_transition != 0
+      ? view.projection_volume_shape : view.volume_shape;
+  const double* volume_x = view.smooth_transition != 0
+      ? view.projection_volume_x : view.volume_x;
+  const double* face_weight = view.smooth_transition != 0
+      ? view.projection_face_weight : view.face_weight;
+  const double* face_oriented_shape = view.smooth_transition != 0
+      ? view.projection_face_oriented_shape : view.face_oriented_shape;
+  const double* face_x = view.smooth_transition != 0
+      ? view.projection_face_x : view.face_x;
   for (int i = 0; i < scalar::persistent_interior_unknowns; ++i)
   {
     interior[i] = 0.0;
@@ -591,13 +621,16 @@ __device__ void InitializeProjection(scalar_detail::DeviceView& view)
   {
     double mass[ns * ns]{};
     double rhs[scalar::state_components][ns]{};
-    for (int q = 0; q < view.volume_quadrature_points; ++q)
+    for (int q = 0; q < volume_qpoints; ++q)
     {
-      const int qindex = element * view.volume_quadrature_points + q;
-      const double* shape = view.volume_shape + qindex * ns;
+      const int qindex = element * volume_qpoints + q;
+      const double* shape = volume_shape + qindex * ns;
       double state[4]{};
-      SmoothState(view.volume_x[qindex], view.volume_y[qindex], state);
-      const double weight = view.volume_weight[qindex];
+      if (view.smooth_transition != 0)
+        SmoothTransitionState(volume_x[qindex], state);
+      else
+        SmoothState(view.volume_x[qindex], view.volume_y[qindex], state);
+      const double weight = volume_weight[qindex];
       for (int row = 0; row < ns; ++row)
       {
         for (int column = 0; column < ns; ++column)
@@ -638,14 +671,17 @@ __device__ void InitializeProjection(scalar_detail::DeviceView& view)
     {
       double mass[face_nodes * face_nodes]{};
       double rhs[scalar::state_components][face_nodes]{};
-      for (int q = 0; q < view.face_quadrature_points; ++q)
+      for (int q = 0; q < face_qpoints; ++q)
       {
         const int qindex =
-            (element * 4 + local_face) * view.face_quadrature_points + q;
-        const double* shape = view.face_oriented_shape + qindex * face_nodes;
+            (element * 4 + local_face) * face_qpoints + q;
+        const double* shape = face_oriented_shape + qindex * face_nodes;
         double state[4]{};
-        SmoothState(view.face_x[qindex], view.face_y[qindex], state);
-        const double weight = view.face_weight[qindex];
+        if (view.smooth_transition != 0)
+          SmoothTransitionState(face_x[qindex], state);
+        else
+          SmoothState(view.face_x[qindex], view.face_y[qindex], state);
+        const double weight = face_weight[qindex];
         for (int row = 0; row < face_nodes; ++row)
         {
           for (int column = 0; column < face_nodes; ++column)
@@ -1570,112 +1606,6 @@ __device__ void ScatterRemoteSystem(scalar_detail::DeviceView& view)
   }
 }
 
-__device__ void FixedJacobianAction(scalar_detail::DeviceView& view)
-{
-  const int local_full = scalar::persistent_interior_unknowns +
-      view.owned_true_trace_unknowns;
-  for (int item = 0; item < local_full; ++item)
-  {
-    view.evidence_action_input[item] = 0.0;
-    view.evidence_action_result[item] = 0.0;
-  }
-  for (int element = 0; element < view.elements; ++element)
-  {
-    double center_x = 0.0;
-    double center_y = 0.0;
-    for (int node = 0; node < ns; ++node)
-    {
-      center_x += view.volume_node_x[element * ns + node];
-      center_y += view.volume_node_y[element * ns + node];
-    }
-    center_x /= static_cast<double>(ns);
-    center_y /= static_cast<double>(ns);
-    int ex = static_cast<int>(floor(8.0 * center_x));
-    int ey = static_cast<int>(floor(8.0 * center_y));
-    ex = ex < 0 ? 0 : (ex > 7 ? 7 : ex);
-    ey = ey < 0 ? 0 : (ey > 7 ? 7 : ey);
-    const int global_element = ey * 8 + ex;
-    const double* a = view.a + static_cast<std::size_t>(element) * ni * ni;
-    const double* b = view.b + static_cast<std::size_t>(element) * ni * nt;
-    const double* c = view.c + static_cast<std::size_t>(element) * nt * ni;
-    const double* d = view.d + static_cast<std::size_t>(element) * nt * nt;
-    double trace_action[nt];
-    for (int column = 0; column < nt; ++column)
-    {
-      const int map = element * nt + column;
-      const double global_value = -0.015625 +
-          static_cast<double>(view.local_trace_to_true[map] + 1) / 131072.0;
-      trace_action[column] =
-          static_cast<double>(view.local_trace_sign[map]) * global_value;
-    }
-    for (int row = 0; row < ni; ++row)
-    {
-      const int packed = element * ni + row;
-      view.evidence_action_input[packed] = 0.03125 +
-          static_cast<double>(global_element * ni + row + 1) / 65536.0;
-      double value = 0.0;
-      for (int column = 0; column < ni; ++column)
-      {
-        const double input = 0.03125 +
-            static_cast<double>(global_element * ni + column + 1) / 65536.0;
-        value += a[row * ni + column] * input;
-      }
-      for (int column = 0; column < nt; ++column)
-      {
-        value += b[row * nt + column] * trace_action[column];
-      }
-      view.evidence_action_result[packed] = value;
-    }
-    for (int row = 0; row < nt; ++row)
-    {
-      double value = 0.0;
-      for (int column = 0; column < ni; ++column)
-      {
-        const double input = 0.03125 +
-            static_cast<double>(global_element * ni + column + 1) / 65536.0;
-        value += c[row * ni + column] * input;
-      }
-      for (int column = 0; column < nt; ++column)
-      {
-        value += d[row * nt + column] * trace_action[column];
-      }
-      view.evidence_trace_action[element * nt + row] = value;
-    }
-  }
-  for (int row = 0; row < view.owned_true_trace_unknowns; ++row)
-  {
-    view.evidence_action_input[scalar::persistent_interior_unknowns + row] =
-        -0.015625 + static_cast<double>(view.owned_true_begin + row + 1) /
-            131072.0;
-  }
-  for (int item = 0; item < view.vector_owned_count; ++item)
-  {
-    const int source = view.vector_owned_source[item];
-    const int target = view.vector_owned_target[item];
-    view.evidence_action_result[
-        scalar::persistent_interior_unknowns + target] +=
-        static_cast<double>(view.local_trace_sign[source]) *
-        view.evidence_trace_action[source];
-  }
-  for (int item = 0; item < view.vector_send_count; ++item)
-  {
-    const int source = view.vector_send_source[item];
-    view.remote_vector_send[item] =
-        static_cast<double>(view.local_trace_sign[source]) *
-        view.evidence_trace_action[source];
-  }
-}
-
-__device__ void ScatterRemoteFixedAction(scalar_detail::DeviceView& view)
-{
-  for (int item = 0; item < view.vector_receive_count; ++item)
-  {
-    view.evidence_action_result[
-        scalar::persistent_interior_unknowns +
-        view.vector_receive_target[item]] += view.remote_vector_receive[item];
-  }
-}
-
 __device__ void GatherTraceResidual(scalar_detail::DeviceView& view)
 {
   for (int row = 0; row < view.owned_true_trace_unknowns; ++row)
@@ -2184,11 +2114,6 @@ extern "C" __global__ void HdgSc25Rank2CondenseFp64Kernel(
     ScatterRemoteSystem(view);
   else if (operation == scalar_detail::KernelOperation::gather_trace_residual)
     GatherTraceResidual(view);
-  else if (operation == scalar_detail::KernelOperation::fixed_jacobian_action)
-    FixedJacobianAction(view);
-  else if (operation ==
-           scalar_detail::KernelOperation::scatter_remote_fixed_action)
-    ScatterRemoteFixedAction(view);
   else if (operation == scalar_detail::KernelOperation::partial_pivot_contract)
     PartialPivotContract(view);
   else if (operation ==
@@ -2248,7 +2173,7 @@ extern "C" __global__ void HdgSc25Rank2RecoverFp64Kernel(
   }
 }
 
-namespace dg::hdg::runtime::cuda_w8b::sc25
+namespace dg::hdg::runtime::cuda_w8b::sc25::rank2
 {
 namespace
 {
@@ -2337,25 +2262,6 @@ bool SameCoordinates(const StateCoordinates& left,
       left.dt == right.dt;
 }
 
-int HostInteriorIndex(const int element, const int component,
-                      const int scalar_node) noexcept
-{
-  if (component < state_components)
-  {
-    return (element * state_components + component) * volume_nodes +
-        scalar_node;
-  }
-  if (component == state_components)
-  {
-    return persistent_u_unknowns + element * volume_nodes +
-        scalar_node;
-  }
-  return persistent_u_unknowns +
-      persistent_sigma_unknowns +
-      (element * flux_components + component - state_components - 1) *
-          volume_nodes + scalar_node;
-}
-
 bool ObservedCudaDevicePointer(const void* pointer) noexcept
 {
   if (pointer == nullptr) { return false; }
@@ -2387,6 +2293,31 @@ struct LocalPhaseFailure final
 
 struct PersistentSc25ScalarIgrCudaRank2::Implementation final
 {
+  struct PendingAttempt final
+  {
+    ScalarCudaStatus status = ScalarCudaStatus::uninitialized;
+    ScalarCudaFailureCause failure_cause = ScalarCudaFailureCause::none;
+    FailureInjection injection = FailureInjection::none;
+    int target_step = 0;
+    int retry_index = 0;
+    int attempted_newton_iterations = 0;
+    int newton_iterations = 0;
+    double entry_residual_norm = 0.0;
+    double final_residual_norm = 0.0;
+    double nonlinear_residual_bound = 0.0;
+    double maximum_conservation_error = 0.0;
+    double minimum_density = std::numeric_limits<double>::infinity();
+    double minimum_pressure = std::numeric_limits<double>::infinity();
+    double minimum_speed_margin = std::numeric_limits<double>::infinity();
+    double maximum_trace_residual_ratio = 0.0;
+    double maximum_local_application_residual_ratio = 0.0;
+    int maximum_trace_iterations = 0;
+    StateCoordinates committed_coordinates{};
+    StateCoordinates candidate_coordinates{};
+    StateHashes entry_hashes{};
+    StateHashes candidate_hashes{};
+  };
+
   struct OwnedCommunicator final
   {
     MPI_Comm value = MPI_COMM_NULL;
@@ -2404,6 +2335,28 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   ScalarCudaStatus first_failure = ScalarCudaStatus::uninitialized;
   int rank = -1;
   int ranks = 0;
+
+  bool smooth_transition() const noexcept
+  {
+    return config.lifecycle == ScalarCudaLifecycle::w8c_smooth_transition_v2;
+  }
+
+  int required_steps() const noexcept
+  {
+    return smooth_transition() ? smooth_transition_required_steps
+                               : persistent_required_steps;
+  }
+
+  double time_step() const noexcept
+  {
+    return smooth_transition() ? smooth_transition_dt : fixed_dt;
+  }
+
+  std::string_view fixture_id() const noexcept
+  {
+    return smooth_transition() ? cuda_rank2_smooth_transition_fixture_id
+                               : cuda_rank2_fixture_id;
+  }
   int device = -1;
   int elements = 0;
   int scalar_true_trace_nodes = 0;
@@ -2414,6 +2367,8 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   int full_unknowns = 0;
   int volume_qpoints = 0;
   int face_qpoints = 0;
+  int projection_volume_qpoints = 0;
+  int projection_face_qpoints = 0;
   bool same_device_uuid = false;
   StateHash mesh_hash{};
   StateHash partition_hash{};
@@ -2484,6 +2439,12 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   std::vector<double> face_normal;
   std::vector<double> face_x;
   std::vector<double> face_y;
+  std::vector<double> projection_volume_weight;
+  std::vector<double> projection_volume_shape;
+  std::vector<double> projection_volume_x;
+  std::vector<double> projection_face_weight;
+  std::vector<double> projection_face_oriented_shape;
+  std::vector<double> projection_face_x;
   std::vector<double> trace_node_coordinate;
 
   void* double_arena = nullptr;
@@ -2507,10 +2468,7 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   std::uint64_t solver_generation = 0;
 
   ScalarCudaEvidence evidence{};
-  ScalarCudaAttemptEvidence pending_attempt{};
-  ScalarCudaStepEvidence pending_step{};
-  ScalarCudaSnapshotEvidence capture_snapshot{};
-  ScalarCudaSnapshotEvidence pending_snapshot{};
+  PendingAttempt pending_attempt{};
   PublishedState checkpoint_workspace{};
   bool pending_attempt_active = false;
   int prepare_retry_index = 0;
@@ -2520,6 +2478,9 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   ScalarCudaStatus transaction_prior_first_failure =
       ScalarCudaStatus::uninitialized;
   bool transaction_installed_after_retry = false;
+  bool warm_sample_seen = false;
+  std::size_t warm_mfem_high_water = 0;
+  std::size_t warm_hypre_high_water = 0;
 
   ~Implementation() noexcept
   {
@@ -2913,6 +2874,121 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
           }
         }
       }
+      if (smooth_transition())
+      {
+        const int projection_order =
+            cpu_sc25::coupled_fixture_repeat_quadrature_order;
+        projection_volume_qpoints = mfem::IntRules.Get(
+            first_volume->GetGeomType(), projection_order).GetNPoints();
+        projection_face_qpoints = mfem::IntRules.Get(
+            first_trace->GetGeomType(), projection_order).GetNPoints();
+        if (projection_volume_qpoints <= volume_qpoints ||
+            projection_face_qpoints <= face_qpoints)
+        {
+          throw LocalPhaseFailure{};
+        }
+        const std::size_t projection_volume_points =
+            static_cast<std::size_t>(elements) * projection_volume_qpoints;
+        const std::size_t projection_face_points =
+            static_cast<std::size_t>(elements) * 4 * projection_face_qpoints;
+        projection_volume_weight.assign(projection_volume_points, 0.0);
+        projection_volume_shape.assign(
+            projection_volume_points * volume_nodes, 0.0);
+        projection_volume_x.assign(projection_volume_points, 0.0);
+        projection_face_weight.assign(projection_face_points, 0.0);
+        projection_face_oriented_shape.assign(
+            projection_face_points * face_nodes, 0.0);
+        projection_face_x.assign(projection_face_points, 0.0);
+
+        mfem::Vector projection_volume_shape_value(volume_nodes);
+        mfem::Vector projection_point(dimension);
+        for (int element = 0; element < elements; ++element)
+        {
+          const mfem::FiniteElement* finite_element =
+              volume_space->GetFE(element);
+          mfem::IsoparametricTransformation transformation_storage;
+          mesh->GetElementTransformation(element, &transformation_storage);
+          mfem::ElementTransformation* transformation =
+              &transformation_storage;
+          if (finite_element == nullptr) { throw LocalPhaseFailure{}; }
+          const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
+              finite_element->GetGeomType(), projection_order);
+          if (volume_rule.GetNPoints() != projection_volume_qpoints)
+          {
+            throw LocalPhaseFailure{};
+          }
+          for (int q = 0; q < projection_volume_qpoints; ++q)
+          {
+            const mfem::IntegrationPoint& ip = volume_rule.IntPoint(q);
+            transformation->SetIntPoint(&ip);
+            finite_element->CalcShape(ip, projection_volume_shape_value);
+            transformation->Transform(ip, projection_point);
+            const int qindex = element * projection_volume_qpoints + q;
+            projection_volume_weight[qindex] =
+                ip.weight * transformation->Weight();
+            projection_volume_x[qindex] = projection_point[0];
+            for (int a = 0; a < volume_nodes; ++a)
+            {
+              projection_volume_shape[
+                  static_cast<std::size_t>(qindex) * volume_nodes + a] =
+                  projection_volume_shape_value[a];
+            }
+          }
+
+          mfem::Array<int> faces, orientations;
+          mesh->GetElementEdges(element, faces, orientations);
+          for (int local_face = 0; local_face < 4; ++local_face)
+          {
+            const int face = faces[local_face];
+            mfem::FaceElementTransformations face_transformation_storage;
+            mfem::IsoparametricTransformation element_one_storage;
+            mfem::IsoparametricTransformation element_two_storage;
+            mesh->GetFaceElementTransformations(
+                face, face_transformation_storage, element_one_storage,
+                element_two_storage);
+            mfem::FaceElementTransformations* face_transformation =
+                &face_transformation_storage;
+            const mfem::FiniteElement* trace_element =
+                carrier_space->GetFaceElement(face);
+            const int* permutation = trace_collection->DofOrderForOrientation(
+                mfem::Geometry::SEGMENT, orientations[local_face]);
+            if (trace_element == nullptr) { throw LocalPhaseFailure{}; }
+            const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
+                trace_element->GetGeomType(), projection_order);
+            if (face_transformation == nullptr ||
+                face_transformation->Face == nullptr || permutation == nullptr ||
+                face_rule.GetNPoints() != projection_face_qpoints)
+            {
+              throw LocalPhaseFailure{};
+            }
+            mfem::Vector trace_shape(face_nodes), physical_point(dimension);
+            for (int q = 0; q < projection_face_qpoints; ++q)
+            {
+              const mfem::IntegrationPoint& ip = face_rule.IntPoint(q);
+              face_transformation->Face->SetIntPoint(&ip);
+              trace_element->CalcShape(ip, trace_shape);
+              face_transformation->Face->Transform(ip, physical_point);
+              const int qindex =
+                  (element * 4 + local_face) * projection_face_qpoints + q;
+              projection_face_weight[qindex] =
+                  ip.weight * face_transformation->Face->Weight();
+              projection_face_x[qindex] = physical_point[0];
+              for (int a = 0; a < face_nodes; ++a)
+              {
+                int sign = 0;
+                const int canonical = DecodeSignedDof(permutation[a], sign);
+                if (canonical < 0 || canonical >= face_nodes || sign == 0)
+                {
+                  throw LocalPhaseFailure{};
+                }
+                projection_face_oriented_shape[
+                    static_cast<std::size_t>(qindex) * face_nodes + a] =
+                    sign * trace_shape[canonical];
+              }
+            }
+          }
+        }
+      }
       return CollectiveAll(communicator.value, true);
     }
     catch (...) { return CollectiveAll(communicator.value, false); }
@@ -3225,7 +3301,9 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
         volume_weight, volume_shape, volume_derivative, volume_x, volume_y,
         face_weight, face_height, face_interior_shape, face_oriented_shape,
         face_normal, face_x, face_y, volume_node_x, volume_node_y,
-        trace_node_coordinate);
+        projection_volume_weight, projection_volume_shape, projection_volume_x,
+        projection_face_weight, projection_face_oriented_shape,
+        projection_face_x, trace_node_coordinate);
     if (topology_reference_hash == StateHash{} ||
         quadrature_reference_hash == StateHash{})
     {
@@ -3264,9 +3342,6 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     reserve_double(matrix_receive_host.size());
     reserve_double(vector_send_host.size());
     reserve_double(vector_receive_host.size());
-    reserve_double(full);
-    reserve_double(full);
-    reserve_double(element_count * nt);
     reserve_double(10 * 32 / sizeof(double));
     std::size_t quadrature_double_count = 0;
     const auto reserve_vector = [&](const auto& values)
@@ -3288,6 +3363,12 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     reserve_vector(face_y);
     reserve_vector(volume_node_x);
     reserve_vector(volume_node_y);
+    reserve_vector(projection_volume_weight);
+    reserve_vector(projection_volume_shape);
+    reserve_vector(projection_volume_x);
+    reserve_vector(projection_face_weight);
+    reserve_vector(projection_face_oriented_shape);
+    reserve_vector(projection_face_x);
     reserve_vector(trace_node_coordinate);
 
     std::size_t integer_count = 0;
@@ -3361,6 +3442,8 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     view.true_trace_unknowns = true_trace_unknowns;
     view.volume_quadrature_points = volume_qpoints;
     view.face_quadrature_points = face_qpoints;
+    view.projection_volume_quadrature_points = projection_volume_qpoints;
+    view.projection_face_quadrature_points = projection_face_qpoints;
     view.true_matrix_diag_nonzeros = diagonal_view.NumNonZeroElems();
     view.true_matrix_offd_nonzeros = offdiagonal_view.NumNonZeroElems();
     view.true_matrix_nonzeros = view.true_matrix_diag_nonzeros +
@@ -3386,7 +3469,8 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     view.quadrature_double_count =
         static_cast<int>(quadrature_double_count);
     view.assemble_dense_jacobian = 0;
-    view.dt = fixed_dt;
+    view.dt = time_step();
+    view.smooth_transition = smooth_transition() ? 1 : 0;
     view.slot_interior[0] = take_double(persistent_interior_unknowns);
     view.slot_interior[1] = take_double(persistent_interior_unknowns);
     view.slot_trace[0] = take_double(persistent_trace_unknowns);
@@ -3419,9 +3503,6 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     view.remote_matrix_receive = take_double(matrix_receive_host.size());
     view.remote_vector_send = take_double(vector_send_host.size());
     view.remote_vector_receive = take_double(vector_receive_host.size());
-    view.evidence_action_input = take_double(full);
-    view.evidence_action_result = take_double(full);
-    view.evidence_trace_action = take_double(element_count * nt);
     view.state_hash_bytes = reinterpret_cast<std::uint8_t*>(
         take_double(10 * 32 / sizeof(double)));
     view.volume_weight = take_double(volume_weight.size());
@@ -3438,6 +3519,15 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     view.face_y = take_double(face_y.size());
     view.volume_node_x = take_double(volume_node_x.size());
     view.volume_node_y = take_double(volume_node_y.size());
+    view.projection_volume_weight =
+        take_double(projection_volume_weight.size());
+    view.projection_volume_shape =
+        take_double(projection_volume_shape.size());
+    view.projection_volume_x = take_double(projection_volume_x.size());
+    view.projection_face_weight = take_double(projection_face_weight.size());
+    view.projection_face_oriented_shape =
+        take_double(projection_face_oriented_shape.size());
+    view.projection_face_x = take_double(projection_face_x.size());
     view.trace_node_coordinate = take_double(trace_node_coordinate.size());
     view.local_trace_to_true = take_integer(local_trace_to_true.size());
     view.local_trace_sign = take_integer(local_trace_sign.size());
@@ -3531,6 +3621,19 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     upload(view.volume_node_x, volume_node_x,
            cuda_w8a::CudaTransferSite::quadrature_upload);
     upload(view.volume_node_y, volume_node_y,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_volume_weight, projection_volume_weight,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_volume_shape, projection_volume_shape,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_volume_x, projection_volume_x,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_face_weight, projection_face_weight,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_face_oriented_shape,
+           projection_face_oriented_shape,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_face_x, projection_face_x,
            cuda_w8a::CudaTransferSite::quadrature_upload);
     upload(view.trace_node_coordinate, trace_node_coordinate,
            cuda_w8a::CudaTransferSite::quadrature_upload);
@@ -3729,104 +3832,6 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     return true;
   }
 
-  bool CaptureOperatorEvidence(ScalarCudaSnapshotEvidence& output) noexcept
-  {
-    output = {};
-    output.full_vector_size = persistent_interior_unknowns +
-        owned_true_trace_unknowns;
-    output.owned_trace_size = owned_true_trace_unknowns;
-    view.operation =
-        static_cast<int>(detail::KernelOperation::fixed_jacobian_action);
-    const bool prepared =
-        PrepareKernelStatus(cuda_w8a::CudaFailurePhase::diagnostics);
-    if (!CollectiveAll(communicator.value, prepared)) { return false; }
-    HdgSc25Rank2CondenseFp64Kernel<<<1, 1>>>(view);
-    ++evidence.launches.condense_launches;
-    const bool launched = cudaGetLastError() == cudaSuccess;
-    const bool status_read = ReadKernelStatus();
-    if (!ReconcileKernelOutcome(launched && status_read)) { return false; }
-
-    const std::size_t send_bytes = vector_send_host.size() * sizeof(double);
-    const std::size_t receive_bytes =
-        vector_receive_host.size() * sizeof(double);
-    bool staged_out = send_bytes == 0 ||
-        cuda_w8a::CudaTransportPolicy::DeviceToHost(
-            vector_send_host.data(), view.remote_vector_send, send_bytes,
-            cuda_w8a::CudaTransferCategory::host_staged_trace_exchange,
-            cuda_w8a::CudaTransferSite::rhs_remote_gather,
-            send_bytes, send_bytes);
-    staged_out = staged_out && cuda_w8a::CudaTransportPolicy::Synchronize(
-        cuda_w8a::CudaTransferSite::rhs_remote_gather);
-    if (!CollectiveAll(communicator.value, staged_out)) { return false; }
-    const int peer = 1 - rank;
-    const bool exchanged = MPI_Sendrecv(
-        vector_send_host.data(), static_cast<int>(vector_send_host.size()),
-        MPI_DOUBLE, peer, 5203, vector_receive_host.data(),
-        static_cast<int>(vector_receive_host.size()), MPI_DOUBLE, peer, 5203,
-        communicator.value, MPI_STATUS_IGNORE) == MPI_SUCCESS;
-    if (!CollectiveAll(communicator.value, exchanged)) { return false; }
-    const bool recorded = cuda_w8a::CudaTransportPolicy::RecordMpiStaging(
-        send_bytes + receive_bytes,
-        cuda_w8a::CudaTransferCategory::host_staged_trace_exchange,
-        cuda_w8a::CudaTransferSite::rhs_remote_gather,
-        vector_send_host.data(), vector_receive_host.data(),
-        send_bytes, receive_bytes, exchanged);
-    if (!CollectiveAll(communicator.value, recorded)) { return false; }
-    const bool staged_in = receive_bytes == 0 ||
-        cuda_w8a::CudaTransportPolicy::HostToDevice(
-            view.remote_vector_receive, vector_receive_host.data(),
-            receive_bytes,
-            cuda_w8a::CudaTransferCategory::host_staged_trace_exchange,
-            cuda_w8a::CudaTransferSite::rhs_remote_scatter,
-            receive_bytes, receive_bytes);
-    if (!CollectiveAll(communicator.value, staged_in)) { return false; }
-    view.operation = static_cast<int>(
-        detail::KernelOperation::scatter_remote_fixed_action);
-    const bool scatter_prepared =
-        PrepareKernelStatus(cuda_w8a::CudaFailurePhase::diagnostics);
-    if (!CollectiveAll(communicator.value, scatter_prepared)) { return false; }
-    HdgSc25Rank2CondenseFp64Kernel<<<1, 1>>>(view);
-    ++evidence.launches.remote_system_exchange_launches;
-    const bool scatter_launched = cudaGetLastError() == cudaSuccess;
-    const bool scatter_status_read = ReadKernelStatus();
-    if (!ReconcileKernelOutcome(scatter_launched && scatter_status_read))
-      return false;
-
-    const std::size_t interior_bytes =
-        static_cast<std::size_t>(persistent_interior_unknowns) *
-        sizeof(double);
-    const std::size_t owned_bytes =
-        static_cast<std::size_t>(owned_true_trace_unknowns) * sizeof(double);
-    const std::size_t full_bytes = interior_bytes + owned_bytes;
-    const double* entry_interior =
-        view.slot_interior[view.selected_current_slot];
-    const double* entry_trace =
-        view.slot_trace[view.selected_current_slot] + owned_true_begin;
-    const auto copy = [](double* destination, const double* source,
-                         const std::size_t bytes)
-    {
-      return bytes == 0 || cuda_w8a::CudaTransportPolicy::DeviceToHost(
-          destination, source, bytes,
-          cuda_w8a::CudaTransferCategory::oracle_export,
-          cuda_w8a::CudaTransferSite::oracle_export, bytes, bytes);
-    };
-    bool copied =
-        copy(output.nonlinear_residual.data(), view.local_residual,
-             interior_bytes) &&
-        copy(output.nonlinear_residual.data() +
-                 persistent_interior_unknowns,
-             view.true_rhs, owned_bytes) &&
-        copy(output.jacobian_action_input.data(), view.evidence_action_input,
-             full_bytes) &&
-        copy(output.jacobian_action_result.data(), view.evidence_action_result,
-             full_bytes) &&
-        copy(output.entry_interior.data(), entry_interior, interior_bytes) &&
-        copy(output.entry_trace.data(), entry_trace, owned_bytes);
-    copied = copied && cuda_w8a::CudaTransportPolicy::Synchronize(
-        cuda_w8a::CudaTransferSite::oracle_export);
-    return CollectiveAll(communicator.value, copied);
-  }
-
   bool RunPartialPivotContract() noexcept
   {
     view.operation =
@@ -3846,62 +3851,6 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     return CollectiveAll(communicator.value,
                          evidence.row_partial_pivot_contract &&
                              evidence.nonzero_small_pivot_contract);
-  }
-
-  bool CaptureCondensedRightHandSide(
-      ScalarCudaSnapshotEvidence& output) noexcept
-  {
-    const std::size_t bytes =
-        static_cast<std::size_t>(owned_true_trace_unknowns) * sizeof(double);
-    bool copied = cuda_w8a::CudaTransportPolicy::DeviceToHost(
-        output.condensed_right_hand_side.data(), view.true_rhs, bytes,
-        cuda_w8a::CudaTransferCategory::oracle_export,
-        cuda_w8a::CudaTransferSite::oracle_export, bytes, bytes);
-    copied = copied && cuda_w8a::CudaTransportPolicy::Synchronize(
-        cuda_w8a::CudaTransferSite::oracle_export);
-    return CollectiveAll(communicator.value, copied);
-  }
-
-  bool CaptureTrueTraceSolution(
-      ScalarCudaSnapshotEvidence& output) noexcept
-  {
-    const std::size_t bytes =
-        static_cast<std::size_t>(owned_true_trace_unknowns) * sizeof(double);
-    bool copied = true;
-    try
-    {
-      copied = cuda_w8a::CudaTransportPolicy::DeviceToHost(
-          output.true_trace_solution.data(), true_solution->Read(), bytes,
-          cuda_w8a::CudaTransferCategory::oracle_export,
-          cuda_w8a::CudaTransferSite::oracle_export, bytes, bytes);
-    }
-    catch (...) { copied = false; }
-    copied = copied && cuda_w8a::CudaTransportPolicy::Synchronize(
-        cuda_w8a::CudaTransferSite::oracle_export);
-    return CollectiveAll(communicator.value, copied);
-  }
-
-  bool CaptureRecoveredIncrement(
-      ScalarCudaSnapshotEvidence& output) noexcept
-  {
-    const std::size_t interior_bytes =
-        static_cast<std::size_t>(persistent_interior_unknowns) *
-        sizeof(double);
-    const std::size_t owned_bytes =
-        static_cast<std::size_t>(owned_true_trace_unknowns) * sizeof(double);
-    bool copied = cuda_w8a::CudaTransportPolicy::DeviceToHost(
-        output.recovered_interior.data(), view.direction_interior,
-        interior_bytes, cuda_w8a::CudaTransferCategory::oracle_export,
-        cuda_w8a::CudaTransferSite::oracle_export,
-        interior_bytes, interior_bytes);
-    copied = copied && cuda_w8a::CudaTransportPolicy::DeviceToHost(
-        output.recovered_trace.data(),
-        view.direction_trace + owned_true_begin, owned_bytes,
-        cuda_w8a::CudaTransferCategory::oracle_export,
-        cuda_w8a::CudaTransferSite::oracle_export, owned_bytes, owned_bytes);
-    copied = copied && cuda_w8a::CudaTransportPolicy::Synchronize(
-        cuda_w8a::CudaTransferSite::oracle_export);
-    return CollectiveAll(communicator.value, copied);
   }
 
   bool LaunchCondense() noexcept
@@ -4228,7 +4177,8 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   }
 
   bool SolveTrueSystem(int& iterations, double& residual_norm,
-                       double& rhs_norm) noexcept
+                       double& rhs_norm,
+                       const bool admit_exact_homogeneous = false) noexcept
   {
     iterations = -1;
     residual_norm = std::numeric_limits<double>::infinity();
@@ -4275,8 +4225,9 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
       gmres->GetNumIterations(iterations);
     }
     catch (...) { local_valid = false; }
-    local_valid = local_valid && query_status == 0 && converged == 1 &&
-        iterations >= 0 && iterations <= trace_maximum_iterations;
+    local_valid = local_valid && query_status == 0 && iterations >= 0 &&
+        iterations <= trace_maximum_iterations &&
+        (converged == 1 || admit_exact_homogeneous);
     if (!CollectiveAll(communicator.value, local_valid)) { return false; }
 
     local_valid = true;
@@ -4302,62 +4253,49 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
           communicator.value, *true_rhs, *true_rhs));
     }
     catch (...) { rhs_norm = std::numeric_limits<double>::infinity(); }
+    const bool converged_or_exact_homogeneous = converged == 1 ||
+        (admit_exact_homogeneous && iterations == 0 && rhs_norm == 0.0 &&
+         residual_norm == 0.0);
     const bool valid = CollectiveAll(
         communicator.value,
-        std::isfinite(rhs_norm) &&
+        converged_or_exact_homogeneous && std::isfinite(rhs_norm) &&
             residual_norm <= absolute_trace_tolerance +
                 relative_trace_tolerance * rhs_norm);
     if (valid) { ++solver_generation; }
     return valid;
   }
 
-  bool SampleHighWater(const int sample) noexcept
+  bool SampleHighWater(const bool establish_plateau) noexcept
   {
-    if (sample < 0 || sample > warm_plateau_cycles) { return false; }
     const char* mfem_name = mfem::MemoryManager::GetUmpireDeviceAllocatorName();
     const char* hypre_name = hypre_HandleUmpireDevicePoolName(hypre_handle());
-    evidence.allocations.mfem_high_water[static_cast<std::size_t>(sample)] =
-        UmpireHighWater(mfem_name);
-    evidence.allocations.hypre_high_water[static_cast<std::size_t>(sample)] =
-        UmpireHighWater(hypre_name);
-    return evidence.allocations.mfem_high_water[static_cast<std::size_t>(sample)]
-               != 0 &&
-        evidence.allocations.hypre_high_water[static_cast<std::size_t>(sample)]
-               != 0;
+    const std::size_t mfem_high_water = UmpireHighWater(mfem_name);
+    const std::size_t hypre_high_water = UmpireHighWater(hypre_name);
+    if (mfem_high_water == 0 || hypre_high_water == 0) return false;
+    if (!establish_plateau) return true;
+    if (!warm_sample_seen)
+    {
+      warm_sample_seen = true;
+      warm_mfem_high_water = mfem_high_water;
+      warm_hypre_high_water = hypre_high_water;
+      return true;
+    }
+    return mfem_high_water == warm_mfem_high_water &&
+        hypre_high_water == warm_hypre_high_water;
   }
 
   bool FreezeBaseline() noexcept
   {
-    bool plateau = true;
-    for (int sample = 2; sample <= warm_plateau_cycles; ++sample)
-    {
-      plateau = plateau &&
-          evidence.allocations.mfem_high_water[sample] ==
-              evidence.allocations.mfem_high_water[1] &&
-          evidence.allocations.hypre_high_water[sample] ==
-              evidence.allocations.hypre_high_water[1];
-    }
+    const bool plateau = warm_sample_seen;
     evidence.allocations.warm_plateau = plateau;
-    evidence.allocations.double_arena =
-        reinterpret_cast<std::uintptr_t>(double_arena);
-    evidence.allocations.integer_arena =
-        reinterpret_cast<std::uintptr_t>(integer_arena);
-    evidence.allocations.true_matrix =
-        reinterpret_cast<std::uintptr_t>(true_matrix.get());
-    evidence.allocations.gmres = reinterpret_cast<std::uintptr_t>(
-        static_cast<HYPRE_Solver>(*gmres));
-    evidence.allocations.ilu = reinterpret_cast<std::uintptr_t>(
-        static_cast<HYPRE_Solver>(*ilu));
     evidence.allocations.baseline_observed_events =
         cuda_w8a::UmpireDeviceAllocatorPolicy::AllocationEvents();
     evidence.allocations.baseline_owned_calls =
         cuda_w8a::UmpireDeviceAllocatorPolicy::W8OwnedAllocationCalls();
     evidence.allocations.baseline_deallocations =
         cuda_w8a::UmpireDeviceAllocatorPolicy::DeallocationEvents();
-    evidence.allocations.baseline_mfem_high_water =
-        evidence.allocations.mfem_high_water[warm_plateau_cycles];
-    evidence.allocations.baseline_hypre_high_water =
-        evidence.allocations.hypre_high_water[warm_plateau_cycles];
+    evidence.allocations.baseline_mfem_high_water = warm_mfem_high_water;
+    evidence.allocations.baseline_hypre_high_water = warm_hypre_high_water;
     baseline_frozen = plateau;
     return plateau;
   }
@@ -4395,6 +4333,13 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
         ObservedCudaDevicePointer(view.recovered) &&
         ObservedCudaDevicePointer(view.volume_weight) &&
         ObservedCudaDevicePointer(view.face_weight) &&
+        (!smooth_transition() ||
+         (ObservedCudaDevicePointer(view.projection_volume_weight) &&
+          ObservedCudaDevicePointer(view.projection_volume_shape) &&
+          ObservedCudaDevicePointer(view.projection_volume_x) &&
+          ObservedCudaDevicePointer(view.projection_face_weight) &&
+          ObservedCudaDevicePointer(view.projection_face_oriented_shape) &&
+          ObservedCudaDevicePointer(view.projection_face_x))) &&
         ObservedCudaDevicePointer(view.state_hash_bytes);
     bool hypre_observed = false;
     if (true_matrix && true_rhs && true_solution)
@@ -4716,8 +4661,8 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
         checkpoint_coordinates.step == checkpoint_coordinates.generation &&
         checkpoint_coordinates.step == checkpoint_coordinates.cursor &&
         checkpoint_coordinates.time ==
-            static_cast<double>(checkpoint_coordinates.step) * fixed_dt &&
-        checkpoint_coordinates.dt == fixed_dt;
+            static_cast<double>(checkpoint_coordinates.step) * time_step() &&
+        checkpoint_coordinates.dt == time_step();
     if (!CollectiveAll(communicator.value, valid_entry))
     {
       return false;
@@ -4792,7 +4737,7 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     }
     output.projection = StableIdentity::Copy(projection_id);
     output.tuple = StableIdentity::Copy(cuda_rank2_tuple_id);
-    output.scenario = StableIdentity::Copy(cuda_rank2_fixture_id);
+    output.scenario = StableIdentity::Copy(fixture_id());
     output.layout = StableIdentity::Copy(checkpoint_layout_id);
     output.raw_field_hashes = HashPublishedState(checkpoint_workspace);
     output.descriptor.schema_version = checkpoint_schema_version;
@@ -4845,41 +4790,48 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     return captured;
   }
 
+  static void AccumulatePendingMetrics(
+      ScalarCudaEvidence& output, const PendingAttempt& attempt) noexcept
+  {
+    output.maximum_attempted_newton_iterations = std::max(
+        output.maximum_attempted_newton_iterations,
+        attempt.attempted_newton_iterations);
+    output.maximum_newton_iterations = std::max(
+        output.maximum_newton_iterations, attempt.newton_iterations);
+    output.maximum_trace_iterations = std::max(
+        output.maximum_trace_iterations, attempt.maximum_trace_iterations);
+    output.minimum_density = std::min(output.minimum_density,
+                                      attempt.minimum_density);
+    output.minimum_pressure = std::min(output.minimum_pressure,
+                                       attempt.minimum_pressure);
+    output.minimum_speed_margin = std::min(output.minimum_speed_margin,
+                                            attempt.minimum_speed_margin);
+    output.maximum_conservation_error = std::max(
+        output.maximum_conservation_error, attempt.maximum_conservation_error);
+    const double nonlinear_denominator = std::max(
+        std::numeric_limits<double>::min(), attempt.nonlinear_residual_bound);
+    output.maximum_nonlinear_residual_ratio = std::max(
+        output.maximum_nonlinear_residual_ratio,
+        attempt.final_residual_norm / nonlinear_denominator);
+    output.maximum_trace_residual_ratio = std::max(
+        output.maximum_trace_residual_ratio, attempt.maximum_trace_residual_ratio);
+    output.maximum_local_application_residual_ratio = std::max(
+        output.maximum_local_application_residual_ratio,
+        attempt.maximum_local_application_residual_ratio);
+  }
+
   bool WriteProspectiveEvidence(ScalarCudaEvidence& output) const noexcept
   {
     if (!pending_attempt_active || active_transaction_serial == 0 ||
-        !active_installed || evidence.attempt_count < 0 ||
-        evidence.attempt_count >= static_cast<int>(evidence.attempts.size()) ||
-        evidence.step_evidence_count < 0 ||
-        evidence.step_evidence_count >=
-            static_cast<int>(evidence.steps.size()) ||
-        evidence.snapshot_count < 0 ||
-        evidence.snapshot_count >=
-            static_cast<int>(evidence.snapshots.size()) ||
-        !pending_snapshot.valid)
-    {
-      return false;
-    }
+        !active_installed) return false;
     output = evidence;
-    ScalarCudaAttemptEvidence accepted_attempt = pending_attempt;
-    accepted_attempt.status = transaction_installed_after_retry
-        ? ScalarCudaStatus::accepted_after_one_retry
-        : ScalarCudaStatus::accepted;
-    accepted_attempt.failure_cause = ScalarCudaFailureCause::none;
-    ScalarCudaStepEvidence accepted_step = pending_step;
-    accepted_step.attempt_index = output.attempt_count;
-    ScalarCudaSnapshotEvidence accepted_snapshot = pending_snapshot;
-    accepted_snapshot.status = accepted_attempt.status;
-    output.attempts[static_cast<std::size_t>(output.attempt_count++)] =
-        accepted_attempt;
-    output.steps[static_cast<std::size_t>(output.step_evidence_count++)] =
-        accepted_step;
-    output.snapshots[static_cast<std::size_t>(output.snapshot_count++)] =
-        accepted_snapshot;
+    AccumulatePendingMetrics(output, pending_attempt);
     ++output.accepted_steps;
     ++output.attempted_steps;
     output.coordinates = pending_attempt.candidate_coordinates;
-    output.status = accepted_attempt.status;
+    output.status = transaction_installed_after_retry
+        ? ScalarCudaStatus::accepted_after_one_retry
+        : ScalarCudaStatus::accepted;
     return true;
   }
 
@@ -4890,16 +4842,14 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     const ScalarCudaAllocationEvidence allocations = evidence.allocations;
     const ScalarCudaReuseEvidence reuse = evidence.reuse;
     const ScalarCudaLaunchLedger launches = evidence.launches;
-    const cuda_w8a::CudaTransferLedgerV1 transfers = evidence.transfers;
-    const cuda_w8a::CudaAllocationLedgerV1 allocation_ledger =
-        evidence.allocation_ledger;
+    const cuda_w8a::CudaTransferTotals transfer_totals =
+        evidence.transfer_totals;
     evidence = transaction_prior_evidence;
     evidence.residency = residency;
     evidence.allocations = allocations;
     evidence.reuse = reuse;
     evidence.launches = launches;
-    evidence.transfers = transfers;
-    evidence.allocation_ledger = allocation_ledger;
+    evidence.transfer_totals = transfer_totals;
   }
 
   void RefreshExposedPriorEvidence() noexcept
@@ -4909,17 +4859,13 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     transaction_prior_evidence.allocations = evidence.allocations;
     transaction_prior_evidence.reuse = evidence.reuse;
     transaction_prior_evidence.launches = evidence.launches;
-    transaction_prior_evidence.transfers = evidence.transfers;
-    transaction_prior_evidence.allocation_ledger =
-        evidence.allocation_ledger;
+    transaction_prior_evidence.transfer_totals = evidence.transfer_totals;
   }
 
   void RefreshLedgers() noexcept
   {
     ObserveResidency();
-    evidence.transfers = cuda_w8a::CudaTransportPolicy::Ledger();
-    evidence.allocation_ledger =
-        cuda_w8a::UmpireDeviceAllocatorPolicy::Ledger();
+    evidence.transfer_totals = cuda_w8a::CudaTransportPolicy::Accounting();
     evidence.allocations.current_observed_events =
         cuda_w8a::UmpireDeviceAllocatorPolicy::AllocationEvents();
     evidence.allocations.current_owned_calls =
@@ -4967,12 +4913,9 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
           ? ScalarCudaFailureCause::publication
           : ScalarCudaFailureCause::transfer;
     }
-    if (evidence.attempt_count < static_cast<int>(evidence.attempts.size()))
-    {
-      evidence.attempts[static_cast<std::size_t>(evidence.attempt_count++)] =
-          pending_attempt;
-    }
+    AccumulatePendingMetrics(evidence, pending_attempt);
     ++evidence.attempted_steps;
+    ++evidence.rejected_steps;
     if (first_failure == ScalarCudaStatus::uninitialized)
     {
       first_failure = failure;
@@ -5219,7 +5162,7 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
   value.committed_slot = 0;
   value.view.committed_slot = 0;
   value.view.selected_current_slot = 0;
-  value.view.dt = fixed_dt;
+  value.view.dt = value.time_step();
   if (!value.RunPartialPivotContract())
   {
     value.status = ScalarCudaStatus::local_factor_failure;
@@ -5248,55 +5191,24 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
     value.status = ScalarCudaStatus::assembly_failure;
     return value.status;
   }
-  ScalarCudaSnapshotEvidence& initialization_snapshot =
-      value.evidence.snapshots[0];
-  if (!value.CaptureOperatorEvidence(initialization_snapshot))
-  {
-    value.status = ScalarCudaStatus::transfer_failure;
-    return value.status;
-  }
-  std::array<double, 16> initialization_operator_metrics{};
-  if (!value.CopyReduction(initialization_operator_metrics))
-  {
-    value.status = ScalarCudaStatus::transfer_failure;
-    return value.status;
-  }
-  initialization_snapshot.initialization = true;
-  initialization_snapshot.iteration = 0;
-  initialization_snapshot.entry_residual_norm =
-      initialization_operator_metrics[0];
   if (!value.LaunchCondense())
   {
     value.status = ScalarCudaStatus::assembly_failure;
     return value.status;
   }
-  if (!value.CaptureCondensedRightHandSide(initialization_snapshot))
-  {
-    value.status = ScalarCudaStatus::transfer_failure;
-    return value.status;
-  }
   int iterations = -1;
   double residual = 0.0;
   double rhs = 0.0;
-  if (!value.SolveTrueSystem(iterations, residual, rhs))
+  if (!value.SolveTrueSystem(iterations, residual, rhs,
+                             value.smooth_transition()))
   {
     value.status = ScalarCudaStatus::trace_linear_failure;
-    return value.status;
-  }
-  if (!value.CaptureTrueTraceSolution(initialization_snapshot))
-  {
-    value.status = ScalarCudaStatus::transfer_failure;
     return value.status;
   }
   if (!value.LaunchRecover(detail::KernelOperation::recover_direction,
                            cuda_w8a::CudaFailurePhase::recovery))
   {
     value.status = ScalarCudaStatus::trace_linear_failure;
-    return value.status;
-  }
-  if (!value.CaptureRecoveredIncrement(initialization_snapshot))
-  {
-    value.status = ScalarCudaStatus::transfer_failure;
     return value.status;
   }
   std::array<double, 16> initialization_solve_metrics{};
@@ -5364,35 +5276,23 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
     value.status = ScalarCudaStatus::admissibility_failure;
     return value.status;
   }
-  initialization_snapshot.valid = true;
-  initialization_snapshot.status = ScalarCudaStatus::ready;
-  initialization_snapshot.coordinates = {0.0, 0, 0, 0, fixed_dt};
-  initialization_snapshot.trace_iterations = iterations;
-  initialization_snapshot.trace_true_residual_norm = residual;
-  initialization_snapshot.trace_right_hand_side_norm = rhs;
-  initialization_snapshot.maximum_local_application_residual =
-      initialization_solve_metrics[4];
-  initialization_snapshot.paired_local_application_residual =
-      initialization_solve_metrics[6];
-  initialization_snapshot.paired_local_right_hand_side_norm =
-      initialization_solve_metrics[7];
-  for (int component = 0; component < state_components; ++component)
-  {
-    initialization_snapshot.committed_integrals[component] =
-        initialization_metrics[8 + component];
-    initialization_snapshot.conserved_integrals[component] =
-        initialization_metrics[8 + component];
-  }
-  value.evidence.snapshot_count = 1;
-  if (!CollectiveAll(value.communicator.value, value.SampleHighWater(0)))
+  value.evidence.maximum_trace_iterations = std::max(0, iterations);
+  value.evidence.maximum_trace_residual_ratio = residual / std::max(
+      value.evidence.trace_absolute_tolerance,
+      value.evidence.trace_relative_tolerance * rhs);
+  value.evidence.maximum_local_application_residual_ratio =
+      initialization_solve_metrics[4] /
+      (1.0e-12 + 1.0e-11 * initialization_solve_metrics[7]);
+  if (!CollectiveAll(value.communicator.value, value.SampleHighWater(false)))
   {
     value.status = ScalarCudaStatus::allocation_failure;
     return value.status;
   }
 
-  // Decision-0013 permits opaque MFEM/HYPRE warm-up growth.  The complete
+  // Decision-0013 permits opaque MFEM/HYPRE warm-up growth. The complete
   // matrix/factor/solve/recovery path is exercised repeatedly, without state
-  // publication, and samples 1..20 must be an exact high-water plateau.
+  // publication; the first warm cycle establishes a scalar high-water
+  // baseline and every later cycle must match it.
   for (int cycle = 1; cycle <= warm_plateau_cycles; ++cycle)
   {
     value.view.selected_current_slot = value.committed_slot;
@@ -5419,7 +5319,7 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
       return value.status;
     }
     if (!CollectiveAll(value.communicator.value,
-                       value.SampleHighWater(cycle)))
+                       value.SampleHighWater(true)))
     {
       value.status = ScalarCudaStatus::allocation_failure;
       return value.status;
@@ -5430,7 +5330,7 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
     value.status = ScalarCudaStatus::allocation_failure;
     return value.status;
   }
-  value.coordinates = {0.0, 0, 0, 0, fixed_dt};
+  value.coordinates = {0.0, 0, 0, 0, value.time_step()};
   value.evidence.coordinates = value.coordinates;
   value.evidence.reuse = value.ReuseEvidence();
   value.evidence.reuse.unchanged = true;
@@ -5502,7 +5402,7 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
   const bool prepared_state = implementation_->initialized &&
       implementation_->status == ScalarCudaStatus::ready &&
       implementation_->active_transaction_serial == 0 &&
-      implementation_->coordinates.step < persistent_required_steps &&
+      implementation_->coordinates.step < implementation_->required_steps() &&
       implementation_->next_transaction_serial != 0 &&
       implementation_->next_transaction_serial !=
           std::numeric_limits<std::uint64_t>::max();
@@ -5516,23 +5416,20 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
   value.transaction_prior_first_failure = value.first_failure;
   const int candidate_slot = 1 - value.committed_slot;
   value.pending_attempt = {};
-  value.pending_step = {};
-  value.pending_snapshot = {};
   value.pending_attempt_active = true;
   value.pending_attempt.injection =
       value.rank == 1 ? injection : FailureInjection::none;
   value.pending_attempt.target_step =
       static_cast<int>(value.coordinates.step + 1);
   value.pending_attempt.retry_index = value.prepare_retry_index;
-  value.pending_attempt.dt = fixed_dt;
   value.pending_attempt.committed_coordinates = value.coordinates;
   const std::uint64_t target_step = value.coordinates.step + 1;
   value.pending_attempt.candidate_coordinates = {
-      static_cast<double>(target_step) * fixed_dt,
+      static_cast<double>(target_step) * value.time_step(),
       target_step,
       value.coordinates.generation + 1,
       value.coordinates.cursor + 1,
-      fixed_dt};
+      value.time_step()};
 
   cuda_w8a::CudaPolicyContext context{};
   context.attempt_sequence = value.coordinates.cursor + 1;
@@ -5651,24 +5548,10 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
           ScalarCudaFailureCause::injected_local_factor;
       break;
     }
-    if (!value.CaptureOperatorEvidence(value.capture_snapshot))
-    {
-      failure = ScalarCudaStatus::transfer_failure;
-      value.pending_attempt.failure_cause = ScalarCudaFailureCause::transfer;
-      break;
-    }
-    value.capture_snapshot.entry_residual_norm = residual_norm;
-    value.capture_snapshot.iteration = iteration;
     if (!value.LaunchCondense())
     {
       failure = ScalarCudaStatus::local_factor_failure;
       value.pending_attempt.failure_cause = value.LastDeviceFailureCause();
-      break;
-    }
-    if (!value.CaptureCondensedRightHandSide(value.capture_snapshot))
-    {
-      failure = ScalarCudaStatus::transfer_failure;
-      value.pending_attempt.failure_cause = ScalarCudaFailureCause::transfer;
       break;
     }
     if (iteration == 0 && inject_trace_linear)
@@ -5688,23 +5571,11 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
           ScalarCudaFailureCause::trace_nonconvergence;
       break;
     }
-    if (!value.CaptureTrueTraceSolution(value.capture_snapshot))
-    {
-      failure = ScalarCudaStatus::transfer_failure;
-      value.pending_attempt.failure_cause = ScalarCudaFailureCause::transfer;
-      break;
-    }
     if (!value.LaunchRecover(detail::KernelOperation::recover_direction,
                              cuda_w8a::CudaFailurePhase::recovery))
     {
       failure = ScalarCudaStatus::local_factor_failure;
       value.pending_attempt.failure_cause = value.LastDeviceFailureCause();
-      break;
-    }
-    if (!value.CaptureRecoveredIncrement(value.capture_snapshot))
-    {
-      failure = ScalarCudaStatus::transfer_failure;
-      value.pending_attempt.failure_cause = ScalarCudaFailureCause::transfer;
       break;
     }
     std::array<double, 16> solve_metrics{};
@@ -5714,34 +5585,22 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
       value.pending_attempt.failure_cause = ScalarCudaFailureCause::transfer;
       break;
     }
-    ScalarCudaNewtonEvidence& newton =
-        value.pending_attempt.newton[static_cast<std::size_t>(iteration)];
-    newton.iteration = iteration;
-    newton.entry_residual_norm = residual_norm;
-    newton.trace_iterations = trace_iterations;
-    newton.trace_true_residual_norm = trace_residual;
-    newton.trace_right_hand_side_norm = trace_rhs;
-    newton.maximum_local_application_residual = solve_metrics[4];
-    value.capture_snapshot.trace_iterations = trace_iterations;
-    value.capture_snapshot.trace_true_residual_norm = trace_residual;
-    value.capture_snapshot.trace_right_hand_side_norm = trace_rhs;
-    value.capture_snapshot.maximum_local_application_residual =
-        solve_metrics[4];
-    value.capture_snapshot.paired_local_application_residual =
-        solve_metrics[6];
-    value.capture_snapshot.paired_local_right_hand_side_norm =
-        solve_metrics[7];
-    value.capture_snapshot.valid = true;
-    value.pending_snapshot = value.capture_snapshot;
-    newton.trial_residual_norms.fill(
-        std::numeric_limits<double>::infinity());
+    value.pending_attempt.maximum_trace_iterations = std::max(
+        value.pending_attempt.maximum_trace_iterations, trace_iterations);
+    value.pending_attempt.maximum_trace_residual_ratio = std::max(
+        value.pending_attempt.maximum_trace_residual_ratio,
+        trace_residual / std::max(value.evidence.trace_absolute_tolerance,
+                                  value.evidence.trace_relative_tolerance *
+                                      trace_rhs));
+    value.pending_attempt.maximum_local_application_residual_ratio = std::max(
+        value.pending_attempt.maximum_local_application_residual_ratio,
+        solve_metrics[4] / (1.0e-12 + 1.0e-11 * solve_metrics[7]));
     bool accepted = false;
     for (int line = 0; line < line_search_trials; ++line)
     {
       const double theta = std::ldexp(1.0, -line);
       if (inject_admissibility)
       {
-        newton.trial_admissible[static_cast<std::size_t>(line)] = 0;
         value.pending_attempt.failure_cause =
             ScalarCudaFailureCause::injected_admissibility;
         continue;
@@ -5761,7 +5620,6 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
       {
         if (value.LastDeviceFailureIsAdmissibility())
         {
-          newton.trial_admissible[static_cast<std::size_t>(line)] = 0;
           continue;
         }
         failure = value.LastAssemblyFailureStatus();
@@ -5777,11 +5635,8 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
         break;
       }
       const double trial_norm = trial_metrics[0];
-      newton.trial_residual_norms[static_cast<std::size_t>(line)] = trial_norm;
-      newton.trial_admissible[static_cast<std::size_t>(line)] = 1;
       const bool armijo = std::isfinite(trial_norm) &&
           trial_norm <= (1.0 - armijo_coefficient * theta) * residual_norm;
-      newton.trial_armijo[static_cast<std::size_t>(line)] = armijo ? 1 : 0;
       if (armijo)
       {
         value.view.selected_current_slot = candidate_slot;
@@ -5793,8 +5648,6 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
               value.LastDeviceFailureCause();
           break;
         }
-        newton.accepted_line_search_index = line;
-        newton.accepted_residual_norm = trial_norm;
         accepted = true;
         break;
       }
@@ -5910,33 +5763,6 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
 
   value.pending_attempt.status = ScalarCudaStatus::accepted;
   value.pending_attempt.failure_cause = ScalarCudaFailureCause::none;
-  value.pending_step.accepted = true;
-  value.pending_step.step = static_cast<int>(value.coordinates.step + 1);
-  value.pending_step.time = static_cast<double>(target_step) * fixed_dt;
-  value.pending_step.generation = value.coordinates.generation + 1;
-  value.pending_step.committed_integrals = committed_integrals;
-  value.pending_step.accepted_integrals = accepted_integrals;
-  value.pending_step.accepted_hashes = value.pending_attempt.candidate_hashes;
-  value.pending_snapshot.initialization = false;
-  value.pending_snapshot.status = value.prepare_retry_index == 1
-      ? ScalarCudaStatus::accepted_after_one_retry
-      : ScalarCudaStatus::accepted;
-  value.pending_snapshot.coordinates =
-      value.pending_attempt.candidate_coordinates;
-  value.pending_snapshot.target_step = value.pending_attempt.target_step;
-  value.pending_snapshot.retry_index = value.pending_attempt.retry_index;
-  value.pending_snapshot.attempted_newton_iterations =
-      value.pending_attempt.attempted_newton_iterations;
-  value.pending_snapshot.newton_iterations =
-      value.pending_attempt.newton_iterations;
-  value.pending_snapshot.committed_integrals = committed_integrals;
-  value.pending_snapshot.conserved_integrals = accepted_integrals;
-  if (!CollectiveAll(value.communicator.value, value.pending_snapshot.valid))
-  {
-    value.pending_attempt.status = ScalarCudaStatus::publication_failure;
-    value.pending_attempt.failure_cause = ScalarCudaFailureCause::publication;
-    return value.pending_attempt.status;
-  }
   const std::uint64_t serial = value.next_transaction_serial++;
   value.active_transaction_serial = serial;
   value.active_candidate_slot = candidate_slot;
@@ -5993,17 +5819,7 @@ bool PersistentSc25ScalarIgrCudaRank2::
       checkpoint.interior_component_slabs.size() ==
           persistent_interior_unknowns &&
       checkpoint.owned_trace_component_slabs.size() ==
-          static_cast<std::size_t>(value.owned_true_trace_unknowns) &&
-      value.evidence.attempt_count >= 0 &&
-      value.evidence.attempt_count <
-          static_cast<int>(value.evidence.attempts.size()) &&
-      value.evidence.step_evidence_count >= 0 &&
-      value.evidence.step_evidence_count <
-          static_cast<int>(value.evidence.steps.size()) &&
-      value.evidence.snapshot_count >= 0 &&
-      value.evidence.snapshot_count <
-          static_cast<int>(value.evidence.snapshots.size()) &&
-      value.pending_snapshot.valid;
+          static_cast<std::size_t>(value.owned_true_trace_unknowns);
   if (!CollectiveAll(value.communicator.value, locally_valid))
   {
     return false;
@@ -6063,16 +5879,6 @@ bool PersistentSc25ScalarIgrCudaRank2::
       token.serial_ == observed.active_transaction_serial &&
       token.candidate_slot_ == observed.active_candidate_slot &&
       token.installed_ && observed.active_installed &&
-      observed.evidence.attempt_count >= 0 &&
-      observed.evidence.attempt_count <
-          static_cast<int>(observed.evidence.attempts.size()) &&
-      observed.evidence.step_evidence_count >= 0 &&
-      observed.evidence.step_evidence_count <
-          static_cast<int>(observed.evidence.steps.size()) &&
-      observed.evidence.snapshot_count >= 0 &&
-      observed.evidence.snapshot_count <
-          static_cast<int>(observed.evidence.snapshots.size()) &&
-      observed.pending_snapshot.valid &&
       SameCoordinates(token.target_,
                       observed.pending_attempt.candidate_coordinates);
   if (!CollectiveAll(observed.communicator.value, locally_valid))
@@ -6083,18 +5889,8 @@ bool PersistentSc25ScalarIgrCudaRank2::
   value.pending_attempt.status = value.transaction_installed_after_retry
       ? ScalarCudaStatus::accepted_after_one_retry
       : ScalarCudaStatus::accepted;
-  value.pending_step.attempt_index = value.evidence.attempt_count;
-  value.evidence.attempts[
-      static_cast<std::size_t>(value.evidence.attempt_count++)] =
-      value.pending_attempt;
-  value.evidence.steps[
-      static_cast<std::size_t>(value.evidence.step_evidence_count++)] =
-      value.pending_step;
-  const int snapshot_index = value.evidence.snapshot_count;
-  value.pending_snapshot.status = value.pending_attempt.status;
-  value.evidence.snapshots[static_cast<std::size_t>(snapshot_index)] =
-      value.pending_snapshot;
-  ++value.evidence.snapshot_count;
+  Implementation::AccumulatePendingMetrics(value.evidence,
+                                           value.pending_attempt);
   ++value.evidence.accepted_steps;
   ++value.evidence.attempted_steps;
   value.evidence.coordinates = token.target_;
@@ -6237,7 +6033,7 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
   const bool identity = checkpoint.projection == StableIdentity::Copy(
                             projection_id) &&
       checkpoint.tuple == StableIdentity::Copy(cuda_rank2_tuple_id) &&
-      checkpoint.scenario == StableIdentity::Copy(cuda_rank2_fixture_id) &&
+      checkpoint.scenario == StableIdentity::Copy(value.fixture_id()) &&
       checkpoint.layout == StableIdentity::Copy(checkpoint_layout_id) &&
       descriptor.schema_version == checkpoint_schema_version &&
       descriptor.successful_commit &&
@@ -6259,12 +6055,12 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
           ::dg::hdg::runtime::detail::CoordinateFingerprint(
               descriptor.coordinates) &&
       descriptor.coordinates.step != 0 &&
-      descriptor.coordinates.step <= persistent_required_steps &&
+      descriptor.coordinates.step <= value.required_steps() &&
       descriptor.coordinates.step == descriptor.coordinates.generation &&
       descriptor.coordinates.step == descriptor.coordinates.cursor &&
       descriptor.coordinates.time ==
-          static_cast<double>(descriptor.coordinates.step) * fixed_dt &&
-      descriptor.coordinates.dt == fixed_dt;
+          static_cast<double>(descriptor.coordinates.step) * value.time_step() &&
+      descriptor.coordinates.dt == value.time_step();
   if (!CollectiveAll(value.communicator.value, identity))
     return ScalarCudaStatus::restart_identity_failure;
   PublishedState host_state;
@@ -6416,18 +6212,21 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
   value.evidence.accepted_steps =
       static_cast<int>(descriptor.coordinates.step);
   value.evidence.attempted_steps = 0;
+  value.evidence.rejected_steps = 0;
   value.evidence.retry_attempts = 0;
-  value.evidence.attempt_count = 0;
-  value.evidence.step_evidence_count = 0;
+  value.evidence.maximum_attempted_newton_iterations = 0;
+  value.evidence.maximum_newton_iterations = 0;
+  value.evidence.maximum_trace_iterations = 0;
+  value.evidence.minimum_density = std::numeric_limits<double>::infinity();
+  value.evidence.minimum_pressure = std::numeric_limits<double>::infinity();
+  value.evidence.minimum_speed_margin =
+      std::numeric_limits<double>::infinity();
+  value.evidence.maximum_conservation_error = 0.0;
+  value.evidence.maximum_nonlinear_residual_ratio = 0.0;
+  value.evidence.maximum_trace_residual_ratio = 0.0;
+  value.evidence.maximum_local_application_residual_ratio = 0.0;
   value.evidence.coordinates = value.coordinates;
-  value.evidence.attempts = {};
-  value.evidence.steps = {};
-  value.evidence.snapshot_count = 0;
-  value.evidence.snapshots = {};
   value.pending_attempt = {};
-  value.pending_step = {};
-  value.capture_snapshot = {};
-  value.pending_snapshot = {};
   value.pending_attempt_active = false;
   value.prepare_retry_index = 0;
   value.last_device_status = detail::device_success;
@@ -6471,16 +6270,4 @@ PersistentSc25ScalarIgrCudaRank2::reuse_evidence() const noexcept
   return implementation_->evidence.reuse;
 }
 
-cuda_w8a::CudaTransferLedgerV1
-PersistentSc25ScalarIgrCudaRank2::transfer_ledger() const noexcept
-{
-  return cuda_w8a::CudaTransportPolicy::Ledger();
-}
-
-cuda_w8a::CudaAllocationLedgerV1
-PersistentSc25ScalarIgrCudaRank2::allocation_ledger() const noexcept
-{
-  return cuda_w8a::UmpireDeviceAllocatorPolicy::Ledger();
-}
-
-} // namespace dg::hdg::runtime::cuda_w8b::sc25
+} // namespace dg::hdg::runtime::cuda_w8b::sc25::rank2

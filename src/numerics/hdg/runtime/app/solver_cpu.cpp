@@ -43,6 +43,8 @@ namespace dg::hdg::runtime::cpu::sc25::w8c_internal
 [[gnu::visibility("hidden")]] void RequestSmoothTransitionInitialization(
     const PersistentSc25ScalarIgrCpuFoundation& owner,
     int required_steps, double time_step) noexcept;
+[[gnu::visibility("hidden")]] void RequestSmoothTransitionRank2Initialization(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept;
 }
 #endif
 
@@ -2415,8 +2417,18 @@ ApplicationRunResult RunScalarIgrCpu(const ApplicationOptionsView& request,
   foundation_config.polynomial_degree = config.polynomial_order();
   foundation_config.elements_per_direction = static_cast<int>(config.mesh_n());
   std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> owner;
-  const bool initialized = Traits::Create(foundation_config, owner) ==
-          sc25::FoundationStatus::ready && owner &&
+  const bool created = Traits::Create(foundation_config, owner) ==
+      sc25::FoundationStatus::ready && owner;
+  if constexpr (Rank2)
+  {
+    if (created && config.case_id().view() ==
+            cpu::w8c::SmoothTransitionV2Case::case_id &&
+        config.scenario_id().view() ==
+            cpu::w8c::SmoothTransitionV2Case::scenario_id)
+      cpu::sc25::w8c_internal::RequestSmoothTransitionRank2Initialization(
+          *owner);
+  }
+  const bool initialized = created &&
       Traits::Initialize(*owner) == sc25::TrajectoryStatus::ready;
   if (!CollectiveAll(initialized, context.communicator()))
   {

@@ -25,13 +25,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-namespace dg::hdg::runtime::cuda_w8b::sc25
+namespace dg::hdg::runtime::cuda_w8b::sc25::rank2
 {
 
 namespace cpu_sc25 = ::dg::hdg::runtime::cpu::sc25;
@@ -43,6 +44,8 @@ inline constexpr std::string_view cuda_rank2_tuple_id =
     "HDG-SC25-PER-BE-CUDA-R2-HOST-STAGED-FP64-v3";
 inline constexpr std::string_view cuda_rank2_fixture_id =
     "C3-MFEM-PERSISTENT-N8-CUDA-R2-HOST-STAGED-01";
+inline constexpr std::string_view cuda_rank2_smooth_transition_fixture_id =
+    "W8C-V2-MFEM-PERSISTENT-N8-CUDA-R2-HOST-STAGED-01";
 inline constexpr std::string_view interior_layout_id =
     "device.field-blocked.U[e][c][a].Sigma[e][a].z[e][c][a].v3";
 inline constexpr std::string_view trace_layout_id =
@@ -83,10 +86,8 @@ inline constexpr int persistent_trace_unknowns =
     cpu_sc25::persistent_true_trace_unknowns;
 inline constexpr int persistent_required_steps =
     cpu_sc25::persistent_required_steps;
-inline constexpr int persistent_max_owned_trace_unknowns =
-    cpu_sc25::persistent_rank2_rank0_owned_trace_unknowns;
-inline constexpr int persistent_max_full_unknowns =
-    persistent_interior_unknowns + persistent_max_owned_trace_unknowns;
+inline constexpr int smooth_transition_required_steps =
+    64;
 inline constexpr int newton_maximum_iterations =
     cpu_sc25::persistent_newton_maximum_iterations;
 inline constexpr int line_search_trials =
@@ -96,6 +97,8 @@ inline constexpr int trace_restart_dimension =
 inline constexpr int trace_maximum_iterations =
     cpu_sc25::persistent_trace_maximum_iterations;
 inline constexpr double fixed_dt = cpu_sc25::persistent_dt;
+inline constexpr double smooth_transition_dt =
+    1.0 / 1024.0;
 inline constexpr double relative_trace_tolerance = 1.0e-12;
 inline constexpr double absolute_trace_tolerance = 1.0e-14;
 inline constexpr double armijo_coefficient = 1.0e-4;
@@ -200,12 +203,20 @@ using FailureInjection = cpu_sc25::TrajectoryFailureInjection;
 using PublishedState = cpu_sc25::PersistentRank2TrajectoryState;
 using StateHashes = cpu_sc25::Rank2TrajectoryStateHashes;
 
+/** Closed leaf selection; this is not a public runtime dispatch surface. */
+enum class ScalarCudaLifecycle : std::uint8_t
+{
+  sc25_periodic_v3,
+  w8c_smooth_transition_v2
+};
+
 struct ScalarCudaConfig final
 {
   int polynomial_degree = 1;
   int elements_per_direction = 8;
   int requested_device = 0;
   bool require_host_staged_rank2 = true;
+  ScalarCudaLifecycle lifecycle = ScalarCudaLifecycle::sc25_periodic_v3;
 };
 
 /** Rank-local checkpoint shard; the canonical manifest binds both ranks. */
@@ -253,11 +264,6 @@ struct ScalarCudaResidencyEvidence final
 
 struct ScalarCudaAllocationEvidence final
 {
-  std::uintptr_t double_arena = 0;
-  std::uintptr_t integer_arena = 0;
-  std::uintptr_t true_matrix = 0;
-  std::uintptr_t gmres = 0;
-  std::uintptr_t ilu = 0;
   std::uint64_t baseline_observed_events = 0;
   std::uint64_t current_observed_events = 0;
   std::uint64_t baseline_owned_calls = 0;
@@ -268,8 +274,6 @@ struct ScalarCudaAllocationEvidence final
   std::size_t current_mfem_high_water = 0;
   std::size_t baseline_hypre_high_water = 0;
   std::size_t current_hypre_high_water = 0;
-  std::array<std::size_t, warm_plateau_cycles + 1> mfem_high_water{};
-  std::array<std::size_t, warm_plateau_cycles + 1> hypre_high_water{};
   bool warm_plateau = false;
   bool zero_post_baseline_observed_growth = false;
   bool zero_post_baseline_owned_allocation = false;
@@ -296,108 +300,24 @@ struct ScalarCudaReuseEvidence final
   bool unchanged = false;
 };
 
-struct ScalarCudaNewtonEvidence final
-{
-  int iteration = -1;
-  double entry_residual_norm = 0.0;
-  double accepted_residual_norm = 0.0;
-  int accepted_line_search_index = -1;
-  int trace_iterations = -1;
-  double trace_true_residual_norm = 0.0;
-  double trace_right_hand_side_norm = 0.0;
-  double maximum_local_application_residual = 0.0;
-  std::array<double, line_search_trials> trial_residual_norms{};
-  std::array<std::uint8_t, line_search_trials> trial_admissible{};
-  std::array<std::uint8_t, line_search_trials> trial_armijo{};
-};
-
-struct ScalarCudaAttemptEvidence final
-{
-  ScalarCudaStatus status = ScalarCudaStatus::uninitialized;
-  ScalarCudaFailureCause failure_cause = ScalarCudaFailureCause::none;
-  FailureInjection injection = FailureInjection::none;
-  int target_step = 0;
-  int retry_index = 0;
-  int iteration = -1;
-  int attempted_newton_iterations = 0;
-  int newton_iterations = 0;
-  double dt = 0.0;
-  double entry_residual_norm = 0.0;
-  double final_residual_norm = 0.0;
-  double nonlinear_residual_bound = 0.0;
-  double maximum_conservation_error = 0.0;
-  double minimum_density = 0.0;
-  double minimum_pressure = 0.0;
-  double minimum_speed_margin = 0.0;
-  StateCoordinates committed_coordinates{};
-  StateCoordinates candidate_coordinates{};
-  StateHashes entry_hashes{};
-  StateHashes candidate_hashes{};
-  std::array<ScalarCudaNewtonEvidence, newton_maximum_iterations> newton{};
-};
-
-struct ScalarCudaStepEvidence final
-{
-  bool accepted = false;
-  int step = 0;
-  double time = 0.0;
-  std::uint64_t generation = 0;
-  int attempt_index = -1;
-  std::array<double, state_components> committed_integrals{};
-  std::array<double, state_components> accepted_integrals{};
-  StateHashes accepted_hashes{};
-};
-
-/**
- * Preallocated rank-local operator/state evidence.  Index zero is the
- * initialization operator; indices one through twenty are the last completed
- * Newton operator of each accepted stage.  Every array has rank-zero maximum
- * capacity so capturing or transactionally copying evidence never allocates.
- */
-struct ScalarCudaSnapshotEvidence final
-{
-  bool valid = false;
-  bool initialization = false;
-  ScalarCudaStatus status = ScalarCudaStatus::uninitialized;
-  StateCoordinates coordinates{};
-  int target_step = 0;
-  int retry_index = 0;
-  int iteration = -1;
-  int attempted_newton_iterations = 0;
-  int newton_iterations = 0;
-  int full_vector_size = 0;
-  int owned_trace_size = 0;
-  int trace_iterations = -1;
-  double entry_residual_norm = 0.0;
-  double trace_true_residual_norm = 0.0;
-  double trace_right_hand_side_norm = 0.0;
-  double maximum_local_application_residual = 0.0;
-  double paired_local_application_residual = 0.0;
-  double paired_local_right_hand_side_norm = 0.0;
-  std::array<double, persistent_max_full_unknowns> nonlinear_residual{};
-  std::array<double, persistent_max_full_unknowns> jacobian_action_input{};
-  std::array<double, persistent_max_full_unknowns> jacobian_action_result{};
-  std::array<double, persistent_max_owned_trace_unknowns>
-      condensed_right_hand_side{};
-  std::array<double, persistent_max_owned_trace_unknowns>
-      true_trace_solution{};
-  std::array<double, persistent_interior_unknowns> entry_interior{};
-  std::array<double, persistent_max_owned_trace_unknowns> entry_trace{};
-  std::array<double, persistent_interior_unknowns> recovered_interior{};
-  std::array<double, persistent_max_owned_trace_unknowns> recovered_trace{};
-  std::array<double, state_components> committed_integrals{};
-  std::array<double, state_components> conserved_integrals{};
-};
-
 struct ScalarCudaEvidence final
 {
   ScalarCudaStatus status = ScalarCudaStatus::uninitialized;
   ScalarCudaStatus first_failure = ScalarCudaStatus::uninitialized;
   int accepted_steps = 0;
   int attempted_steps = 0;
+  int rejected_steps = 0;
   int retry_attempts = 0;
-  int attempt_count = 0;
-  int step_evidence_count = 0;
+  int maximum_attempted_newton_iterations = 0;
+  int maximum_newton_iterations = 0;
+  int maximum_trace_iterations = 0;
+  double minimum_density = std::numeric_limits<double>::infinity();
+  double minimum_pressure = std::numeric_limits<double>::infinity();
+  double minimum_speed_margin = std::numeric_limits<double>::infinity();
+  double maximum_conservation_error = 0.0;
+  double maximum_nonlinear_residual_ratio = 0.0;
+  double maximum_trace_residual_ratio = 0.0;
+  double maximum_local_application_residual_ratio = 0.0;
   int trace_restart = 0;
   int trace_maximum_iterations = 0;
   double trace_relative_tolerance = 0.0;
@@ -413,14 +333,7 @@ struct ScalarCudaEvidence final
   ScalarCudaAllocationEvidence allocations{};
   ScalarCudaReuseEvidence reuse{};
   ScalarCudaLaunchLedger launches{};
-  cuda_w8a::CudaTransferLedgerV1 transfers{};
-  cuda_w8a::CudaAllocationLedgerV1 allocation_ledger{};
-  std::array<ScalarCudaAttemptEvidence, persistent_required_steps + 4>
-      attempts{};
-  std::array<ScalarCudaStepEvidence, persistent_required_steps> steps{};
-  int snapshot_count = 0;
-  std::array<ScalarCudaSnapshotEvidence, persistent_required_steps + 1>
-      snapshots{};
+  cuda_w8a::CudaTransferTotals transfer_totals{};
 };
 
 class PersistentSc25ScalarIgrCudaRank2 final
@@ -504,8 +417,6 @@ public:
 
   const ScalarCudaEvidence& trajectory_evidence() const noexcept;
   ScalarCudaReuseEvidence reuse_evidence() const noexcept;
-  cuda_w8a::CudaTransferLedgerV1 transfer_ledger() const noexcept;
-  cuda_w8a::CudaAllocationLedgerV1 allocation_ledger() const noexcept;
 
 private:
   ScalarCudaStatus PreparePersistentTrajectoryTransactionImpl(
@@ -536,4 +447,4 @@ static_assert(!std::is_copy_constructible<
                       PersistentSc25ScalarIgrCudaRank2::Transaction>::value,
               "SC25 CUDA transaction authority must remain affine");
 
-} // namespace dg::hdg::runtime::cuda_w8b::sc25
+} // namespace dg::hdg::runtime::cuda_w8b::sc25::rank2
