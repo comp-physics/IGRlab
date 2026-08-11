@@ -132,11 +132,13 @@ ApplicationOptionsView ScalarIgr(const std::string_view backend)
   return options;
 }
 
-ApplicationOptionsView W8cCase(const bool scalar, const bool smooth)
+ApplicationOptionsView W8cCase(const bool scalar, const bool smooth,
+                               const std::string_view backend =
+                                   CpuSerialBackendTag::id)
 {
   ApplicationOptionsView options = scalar
-      ? ScalarIgr(CpuSerialBackendTag::id)
-      : Smoke(CpuSerialBackendTag::id);
+      ? ScalarIgr(backend)
+      : Smoke(backend);
   options.case_id = smooth ? "periodic-smooth-transition-v2"
                            : "periodic-double-riemann-v1";
   options.scenario_id = smooth ? "W8C-V2-N8-DT10" : "W8C-N8-DT10";
@@ -454,6 +456,56 @@ bool CheckW8cSmoothTransitionClosure()
           passed;
     }
   }
+
+  ApplicationOptionsView cuda_rank2 = W8cCase(
+      true, true, CudaRank2OneGpuHostStagedBackendTag::id);
+  const ApplicationValidation cuda_rank2_validation =
+      ValidateApplicationOptions(cuda_rank2);
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK2 && DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
+  passed = Check(cuda_rank2_validation.accepted() &&
+                     cuda_rank2_validation.config() != nullptr &&
+                     cuda_rank2_validation.config()->backend() ==
+                         ApplicationBackend::cuda_rank2_one_gpu_host_staged,
+                 "smooth_scalar_cuda_rank2_is_frozen") &&
+      passed;
+  ApplicationOptionsView cuda_writer = SplitWriter(cuda_rank2);
+  cuda_writer.injection = {
+      FailureInjectionModeV1::prescribed,
+      FailurePhase::AfterRecoveryBeforeCommit,
+      cpu::w8c::SmoothTransitionV2Case::failure_target_step, 1};
+  cuda_writer.retry_limit = cpu::w8c::retry_limit;
+  const ApplicationValidation cuda_reader_validation =
+      ValidateApplicationOptions(SplitReader(cuda_rank2));
+  StateHash cuda_writer_hash{};
+  passed = Check(ValidateApplicationOptions(cuda_writer).accepted() &&
+                     cuda_reader_validation.accepted() &&
+                     DeriveSplitWriterRunConfigHashV1(
+                         *cuda_reader_validation.config(), cuda_writer_hash),
+                 "smooth_scalar_cuda_rank2_retry_writer_reader_controls") &&
+      passed;
+  cuda_rank2.scenario_id = "W8C-V2-N16-DT11";
+  passed = Check(ValidateApplicationOptions(cuda_rank2).rejection() ==
+                     ApplicationRejection::unknown_backend,
+                 "smooth_scalar_cuda_rank2_rejects_n16") &&
+      passed;
+#else
+  passed = Check(cuda_rank2_validation.rejection() ==
+                     ApplicationRejection::unbuilt_backend,
+                 "smooth_scalar_cuda_rank2_unbuilt") &&
+      passed;
+#endif
+
+  const ApplicationValidation cuda_rank1 = ValidateApplicationOptions(
+      W8cCase(true, true, CudaRank1OneGpuBackendTag::id));
+  passed = Check(!cuda_rank1.accepted(),
+                 "smooth_scalar_cuda_rank1_rejected") &&
+      passed;
+  const ApplicationValidation conventional_cuda_rank2 =
+      ValidateApplicationOptions(W8cCase(
+          false, true, CudaRank2OneGpuHostStagedBackendTag::id));
+  passed = Check(!conventional_cuda_rank2.accepted(),
+                 "smooth_conventional_cuda_rank2_rejected") &&
+      passed;
   return passed;
 }
 

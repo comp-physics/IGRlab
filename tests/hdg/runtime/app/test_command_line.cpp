@@ -1238,7 +1238,7 @@ bool DirectAndNegativeControls()
                          ApplicationRejection::invalid_run_role,
                  "scalar_cuda_rank1_step20_cli_contract") && passed;
 #endif
-#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK2 && DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
   for (const std::string phase :
        {"CheckpointStaging", "OutputStaging",
         "AfterRecoveryBeforeCommit"})
@@ -1311,6 +1311,41 @@ bool DirectAndNegativeControls()
                    smooth_scalar.rejection ==
                        ApplicationRejection::unbuilt_backend,
                "smooth_transition_scalar_unbuilt_cli") && passed;
+#endif
+
+  const ParsedCommandLine smooth_scalar_cuda_rank2 =
+      Parse(SmoothTransitionArguments(true, "cuda", "0"));
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK2 && DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
+  passed = Check(
+               smooth_scalar_cuda_rank2.status == CommandLineStatus::run &&
+                   smooth_scalar_cuda_rank2.options.backend_id ==
+                       CudaRank2OneGpuHostStagedBackendTag::id &&
+                   smooth_scalar_cuda_rank2.options.device_id == 0,
+               "smooth_transition_scalar_cuda_rank2_cli") &&
+      passed;
+  auto smooth_cuda_writer =
+      SmoothTransitionArguments(true, "cuda", "0");
+  SetOption(smooth_cuda_writer, "--stop-after-checkpoint", "true");
+  SetOption(smooth_cuda_writer, "--max-retries", "1");
+  SetOption(smooth_cuda_writer, "--inject-failure",
+            "AfterRecoveryBeforeCommit:7:1");
+  auto smooth_cuda_reader = smooth_cuda_writer;
+  SetOption(smooth_cuda_reader, "--checkpoint-out", "none");
+  SetOption(smooth_cuda_reader, "--checkpoint-step", "none");
+  SetOption(smooth_cuda_reader, "--stop-after-checkpoint", "false");
+  SetOption(smooth_cuda_reader, "--restart-from", "w8c-smooth-checkpoint");
+  SetOption(smooth_cuda_reader, "--max-retries", "0");
+  SetOption(smooth_cuda_reader, "--inject-failure", "off");
+  passed = Check(Parse(smooth_cuda_writer).status == CommandLineStatus::run &&
+                     Parse(smooth_cuda_reader).status == CommandLineStatus::run,
+                 "smooth_transition_scalar_cuda_rank2_split_cli") &&
+      passed;
+#else
+  passed = Check(smooth_scalar_cuda_rank2.status == CommandLineStatus::rejected &&
+                     smooth_scalar_cuda_rank2.rejection ==
+                         ApplicationRejection::unbuilt_backend,
+                 "smooth_transition_scalar_cuda_rank2_unbuilt_cli") &&
+      passed;
 #endif
 
   auto smooth_reader = SmoothTransitionArguments(false, "cpu", "none");

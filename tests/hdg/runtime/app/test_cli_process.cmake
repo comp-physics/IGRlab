@@ -546,7 +546,7 @@ function(validate_scalar_igr_vtk path mesh_n label)
   endif()
 endfunction()
 
-function(validate_scalar_cuda_metadata metadata label expected_step)
+function(validate_scalar_cuda_metadata metadata label expected_step scenario)
   if(HDG_RUNTIME_RANKS EQUAL 1)
     set(expected_backend "cuda.rank1.one_gpu")
   else()
@@ -557,8 +557,7 @@ function(validate_scalar_cuda_metadata metadata label expected_step)
   if(fields_offset EQUAL -1 OR
      NOT metadata MATCHES
          "\"card\": \"exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3\"" OR
-     NOT metadata MATCHES
-         "\"scenario\": \"W8B-SC25-N8-K1-20STEP-v1\"" OR
+     NOT metadata MATCHES "\"scenario\": \"${scenario}\"" OR
      NOT metadata MATCHES "\"backend\": \"${expected_backend}\"" OR
      NOT metadata MATCHES
          "\"layout\": \"mfem.l2.byNODES.U4.Sigma1.z2.separate.v3\"" OR
@@ -617,25 +616,45 @@ if(HDG_RUNTIME_W8C_SMOOTH_RANK2)
      NOT DEFINED HDG_RUNTIME_SCALAR_VTK_TEST)
     message(FATAL_ERROR "W8C scalar rank-two test requires its comparator")
   endif()
+  if(NOT DEFINED HDG_RUNTIME_BACKEND)
+    set(HDG_RUNTIME_BACKEND cpu)
+  endif()
+  if(HDG_RUNTIME_BACKEND STREQUAL "cpu")
+    set(w8c_device none)
+  elseif(HDG_RUNTIME_BACKEND STREQUAL "cuda")
+    if(NOT DEFINED HDG_RUNTIME_DEVICE_ID OR
+       NOT HDG_RUNTIME_DEVICE_ID EQUAL 0)
+      message(FATAL_ERROR "W8C CUDA rank-two test requires device 0")
+    endif()
+    set(w8c_device 0)
+  else()
+    message(FATAL_ERROR "W8C rank-two test admits only CPU or CUDA")
+  endif()
   set(w8c_common
     --card exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3
     --case periodic-smooth-transition-v2
     --space l2 --mesh-family periodic-cartesian-quad --mesh-n 8 --order 1
     --dt 0.0009765625 --steps 64 --final-time 0.0625
-    --backend cpu --device-id none --output-steps 0,32,64
+    --backend "${HDG_RUNTIME_BACKEND}" --device-id "${w8c_device}"
+    --output-steps 0,32,64
     --seed 0x573843534d4f5632)
-  set(serial_directory "${HDG_RUNTIME_TEST_OUTPUT}-serial")
   set(rank2_directory "${HDG_RUNTIME_TEST_OUTPUT}-rank2")
   set(split_directory "${HDG_RUNTIME_TEST_OUTPUT}-split")
   set(split_checkpoint "${HDG_RUNTIME_TEST_OUTPUT}.checkpoint")
-  file(REMOVE_RECURSE "${serial_directory}" "${rank2_directory}" "${split_directory}")
+  if(HDG_RUNTIME_BACKEND STREQUAL "cpu")
+    set(serial_directory "${HDG_RUNTIME_TEST_OUTPUT}-serial")
+    file(REMOVE_RECURSE "${serial_directory}")
+  endif()
+  file(REMOVE_RECURSE "${rank2_directory}" "${split_directory}")
   file(REMOVE "${split_checkpoint}")
-  run_serial_runtime(serial ${w8c_common}
-    --output-dir "${serial_directory}" --checkpoint-out "${serial_directory}.checkpoint"
-    --checkpoint-step 32 --stop-after-checkpoint false --restart-from none
-    --max-retries 0 --inject-failure off)
-  if(NOT serial_status EQUAL 0 OR NOT serial_output MATCHES "status=Success.*step=64.*retries=0" OR NOT serial_error STREQUAL "")
-    message(FATAL_ERROR "W8C scalar serial reference failed: ${serial_status};${serial_output};${serial_error}")
+  if(HDG_RUNTIME_BACKEND STREQUAL "cpu")
+    run_serial_runtime(serial ${w8c_common}
+      --output-dir "${serial_directory}" --checkpoint-out "${serial_directory}.checkpoint"
+      --checkpoint-step 32 --stop-after-checkpoint false --restart-from none
+      --max-retries 0 --inject-failure off)
+    if(NOT serial_status EQUAL 0 OR NOT serial_output MATCHES "status=Success.*step=64.*retries=0" OR NOT serial_error STREQUAL "")
+      message(FATAL_ERROR "W8C scalar serial reference failed: ${serial_status};${serial_output};${serial_error}")
+    endif()
   endif()
   run_runtime(rank2 ${w8c_common}
     --output-dir "${rank2_directory}" --checkpoint-out "${rank2_directory}.checkpoint"
@@ -658,26 +677,72 @@ if(HDG_RUNTIME_W8C_SMOOTH_RANK2)
   if(NOT reader_status EQUAL 0 OR NOT reader_output MATCHES "status=Success.*step=64.*retries=1" OR NOT reader_error STREQUAL "")
     message(FATAL_ERROR "W8C scalar rank-two restart reader failed: ${reader_status};${reader_output};${reader_error}")
   endif()
+  foreach(directory IN ITEMS rank2_directory split_directory)
+    foreach(step IN ITEMS 000000 000032 000064)
+      validate_scalar_igr_vtk("${${directory}}/state-step-${step}.vtk" 8
+        "W8C scalar ${HDG_RUNTIME_BACKEND} ${directory} step ${step}")
+    endforeach()
+  endforeach()
   foreach(step IN ITEMS 000000 000032 000064)
-    execute_process(COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk-w8c-rank2
-                    "${serial_directory}/state-step-${step}.vtk"
-                    "${rank2_directory}/state-step-${step}.vtk" 5e-11
-                    RESULT_VARIABLE compare_status OUTPUT_VARIABLE compare_output ERROR_VARIABLE compare_error)
+    if(HDG_RUNTIME_BACKEND STREQUAL "cpu")
+      execute_process(COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk-w8c-rank2
+                      "${serial_directory}/state-step-${step}.vtk"
+                      "${rank2_directory}/state-step-${step}.vtk" 5e-11
+                      RESULT_VARIABLE compare_status OUTPUT_VARIABLE compare_output ERROR_VARIABLE compare_error)
+      set(parity_label "serial/rank-two")
+    else()
+      execute_process(COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk-w8c-rank2
+                      "${rank2_directory}/state-step-${step}.vtk"
+                      "${split_directory}/state-step-${step}.vtk" 5e-11
+                      RESULT_VARIABLE compare_status OUTPUT_VARIABLE compare_output ERROR_VARIABLE compare_error)
+      set(parity_label "uninterrupted/restart")
+    endif()
     if(NOT compare_status EQUAL 0 OR NOT compare_output MATCHES "HDG scalar-IGR W8C rank-two VTK parity PASS" OR NOT compare_error STREQUAL "")
-      message(FATAL_ERROR "W8C serial/rank-two field-topology comparator failed at ${step}: ${compare_status};${compare_output};${compare_error}")
+      message(FATAL_ERROR "W8C ${parity_label} field-topology comparator failed at ${step}: ${compare_status};${compare_output};${compare_error}")
     endif()
   endforeach()
-  execute_process(COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}"
-                  --compare-scalar-vtk-w8c-rank2
-                  "${rank2_directory}/state-step-000064.vtk"
-                  "${split_directory}/state-step-000064.vtk" 5e-11
-                  RESULT_VARIABLE split_compare_status
-                  OUTPUT_VARIABLE split_compare_output
-                  ERROR_VARIABLE split_compare_error)
-  if(NOT split_compare_status EQUAL 0 OR
-     NOT split_compare_output MATCHES "HDG scalar-IGR W8C rank-two VTK parity PASS" OR
-     NOT split_compare_error STREQUAL "")
-    message(FATAL_ERROR "W8C rank-two split-reader field-topology comparator failed: ${split_compare_status};${split_compare_output};${split_compare_error}")
+  if(HDG_RUNTIME_BACKEND STREQUAL "cpu")
+    execute_process(COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk-w8c-rank2
+                    "${rank2_directory}/state-step-000064.vtk"
+                    "${split_directory}/state-step-000064.vtk" 5e-11
+                    RESULT_VARIABLE split_compare_status
+                    OUTPUT_VARIABLE split_compare_output
+                    ERROR_VARIABLE split_compare_error)
+    if(NOT split_compare_status EQUAL 0 OR
+       NOT split_compare_output MATCHES "HDG scalar-IGR W8C rank-two VTK parity PASS" OR
+       NOT split_compare_error STREQUAL "")
+      message(FATAL_ERROR "W8C rank-two split-reader field-topology comparator failed: ${split_compare_status};${split_compare_output};${split_compare_error}")
+    endif()
+  endif()
+  if(HDG_RUNTIME_BACKEND STREQUAL "cuda")
+    foreach(path IN ITEMS
+        "${rank2_directory}/run-metadata.json"
+        "${split_directory}/run-metadata-checkpoint.json"
+        "${split_directory}/run-metadata.json"
+        "${split_checkpoint}")
+      require_regular_file("${path}" "W8C CUDA publication")
+    endforeach()
+    file(READ "${rank2_directory}/run-metadata.json" w8c_reference_metadata)
+    file(READ "${split_directory}/run-metadata-checkpoint.json" w8c_writer_metadata)
+    file(READ "${split_directory}/run-metadata.json" w8c_reader_metadata)
+    validate_scalar_cuda_metadata("${w8c_reference_metadata}" "W8C CUDA uninterrupted" 64 "W8C-V2-N8-DT10")
+    validate_scalar_cuda_metadata("${w8c_writer_metadata}" "W8C CUDA split writer" 32 "W8C-V2-N8-DT10")
+    validate_scalar_cuda_metadata("${w8c_reader_metadata}" "W8C CUDA split reader" 64 "W8C-V2-N8-DT10")
+    if(NOT w8c_writer_metadata MATCHES "\"retries\": 1" OR
+       NOT w8c_reader_metadata MATCHES "\"retries\": 1")
+      message(FATAL_ERROR "W8C CUDA retry evidence is incomplete")
+    endif()
+    foreach(hash_field IN ITEMS final_interior_sha256 final_trace_sha256)
+      string(REGEX MATCH "\"${hash_field}\": \"([0-9a-f]+)\""
+             w8c_reference_hash_match "${w8c_reference_metadata}")
+      set(w8c_reference_hash "${CMAKE_MATCH_1}")
+      string(REGEX MATCH "\"${hash_field}\": \"([0-9a-f]+)\""
+             w8c_reader_hash_match "${w8c_reader_metadata}")
+      if(w8c_reference_hash STREQUAL "" OR
+         NOT w8c_reference_hash STREQUAL "${CMAKE_MATCH_1}")
+        message(FATAL_ERROR "W8C CUDA ${hash_field} restart parity failed")
+      endif()
+    endforeach()
   endif()
   return()
 endif()
@@ -1235,10 +1300,14 @@ if(HDG_RUNTIME_FUNCTIONAL)
   if(HDG_RUNTIME_SCALAR_IGR AND
      HDG_RUNTIME_BACKEND STREQUAL "cuda")
     file(READ "${baseline_directory}/run-metadata.json" baseline_metadata)
-    validate_scalar_cuda_metadata("${baseline_metadata}" "baseline" 20)
-    validate_scalar_cuda_metadata("${reference_metadata}" "reference" 20)
-    validate_scalar_cuda_metadata("${writer_metadata}" "split writer" 10)
-    validate_scalar_cuda_metadata("${reader_metadata}" "split reader" 20)
+    validate_scalar_cuda_metadata("${baseline_metadata}" "baseline" 20
+      "W8B-SC25-N8-K1-20STEP-v1")
+    validate_scalar_cuda_metadata("${reference_metadata}" "reference" 20
+      "W8B-SC25-N8-K1-20STEP-v1")
+    validate_scalar_cuda_metadata("${writer_metadata}" "split writer" 10
+      "W8B-SC25-N8-K1-20STEP-v1")
+    validate_scalar_cuda_metadata("${reader_metadata}" "split reader" 20
+      "W8B-SC25-N8-K1-20STEP-v1")
   endif()
   if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 2)
     foreach(injection_metadata IN ITEMS reference_metadata writer_metadata)
