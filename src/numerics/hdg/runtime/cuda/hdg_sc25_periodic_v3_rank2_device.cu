@@ -330,6 +330,18 @@ __device__ inline void SmoothState(const double x, const double y,
       0.5 * rho * (u * u + v * v);
 }
 
+__device__ inline void SmoothTransitionState(const double x, double value[4])
+{
+  const double kappa = atanh(0.8) / sin(pi_value / 8.0);
+  const double chi = 0.5 * (1.0 - tanh(kappa * cos(2.0 * pi_value * x)));
+  const double rho = 0.125 + 0.875 * chi;
+  const double pressure = 0.1 + 0.9 * chi;
+  value[0] = rho;
+  value[1] = 0.0;
+  value[2] = 0.0;
+  value[3] = pressure / (gamma_value - 1.0);
+}
+
 template <int N>
 __device__ bool SmallFullPivotSolve(double matrix[N * N],
                                     double rhs[N], double solution[N])
@@ -582,6 +594,24 @@ __device__ void InitializeProjection(scalar_detail::DeviceView& view)
 {
   double* interior = view.slot_interior[0];
   double* trace = view.slot_trace[0];
+  const int volume_qpoints = view.smooth_transition != 0
+      ? view.projection_volume_quadrature_points
+      : view.volume_quadrature_points;
+  const int face_qpoints = view.smooth_transition != 0
+      ? view.projection_face_quadrature_points
+      : view.face_quadrature_points;
+  const double* volume_weight = view.smooth_transition != 0
+      ? view.projection_volume_weight : view.volume_weight;
+  const double* volume_shape = view.smooth_transition != 0
+      ? view.projection_volume_shape : view.volume_shape;
+  const double* volume_x = view.smooth_transition != 0
+      ? view.projection_volume_x : view.volume_x;
+  const double* face_weight = view.smooth_transition != 0
+      ? view.projection_face_weight : view.face_weight;
+  const double* face_oriented_shape = view.smooth_transition != 0
+      ? view.projection_face_oriented_shape : view.face_oriented_shape;
+  const double* face_x = view.smooth_transition != 0
+      ? view.projection_face_x : view.face_x;
   for (int i = 0; i < scalar::persistent_interior_unknowns; ++i)
   {
     interior[i] = 0.0;
@@ -591,13 +621,16 @@ __device__ void InitializeProjection(scalar_detail::DeviceView& view)
   {
     double mass[ns * ns]{};
     double rhs[scalar::state_components][ns]{};
-    for (int q = 0; q < view.volume_quadrature_points; ++q)
+    for (int q = 0; q < volume_qpoints; ++q)
     {
-      const int qindex = element * view.volume_quadrature_points + q;
-      const double* shape = view.volume_shape + qindex * ns;
+      const int qindex = element * volume_qpoints + q;
+      const double* shape = volume_shape + qindex * ns;
       double state[4]{};
-      SmoothState(view.volume_x[qindex], view.volume_y[qindex], state);
-      const double weight = view.volume_weight[qindex];
+      if (view.smooth_transition != 0)
+        SmoothTransitionState(volume_x[qindex], state);
+      else
+        SmoothState(view.volume_x[qindex], view.volume_y[qindex], state);
+      const double weight = volume_weight[qindex];
       for (int row = 0; row < ns; ++row)
       {
         for (int column = 0; column < ns; ++column)
@@ -638,14 +671,17 @@ __device__ void InitializeProjection(scalar_detail::DeviceView& view)
     {
       double mass[face_nodes * face_nodes]{};
       double rhs[scalar::state_components][face_nodes]{};
-      for (int q = 0; q < view.face_quadrature_points; ++q)
+      for (int q = 0; q < face_qpoints; ++q)
       {
         const int qindex =
-            (element * 4 + local_face) * view.face_quadrature_points + q;
-        const double* shape = view.face_oriented_shape + qindex * face_nodes;
+            (element * 4 + local_face) * face_qpoints + q;
+        const double* shape = face_oriented_shape + qindex * face_nodes;
         double state[4]{};
-        SmoothState(view.face_x[qindex], view.face_y[qindex], state);
-        const double weight = view.face_weight[qindex];
+        if (view.smooth_transition != 0)
+          SmoothTransitionState(face_x[qindex], state);
+        else
+          SmoothState(view.face_x[qindex], view.face_y[qindex], state);
+        const double weight = face_weight[qindex];
         for (int row = 0; row < face_nodes; ++row)
         {
           for (int column = 0; column < face_nodes; ++column)
@@ -2404,6 +2440,28 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   ScalarCudaStatus first_failure = ScalarCudaStatus::uninitialized;
   int rank = -1;
   int ranks = 0;
+
+  bool smooth_transition() const noexcept
+  {
+    return config.lifecycle == ScalarCudaLifecycle::w8c_smooth_transition_v2;
+  }
+
+  int required_steps() const noexcept
+  {
+    return smooth_transition() ? smooth_transition_required_steps
+                               : persistent_required_steps;
+  }
+
+  double time_step() const noexcept
+  {
+    return smooth_transition() ? smooth_transition_dt : fixed_dt;
+  }
+
+  std::string_view fixture_id() const noexcept
+  {
+    return smooth_transition() ? cuda_rank2_smooth_transition_fixture_id
+                               : cuda_rank2_fixture_id;
+  }
   int device = -1;
   int elements = 0;
   int scalar_true_trace_nodes = 0;
@@ -2414,6 +2472,8 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   int full_unknowns = 0;
   int volume_qpoints = 0;
   int face_qpoints = 0;
+  int projection_volume_qpoints = 0;
+  int projection_face_qpoints = 0;
   bool same_device_uuid = false;
   StateHash mesh_hash{};
   StateHash partition_hash{};
@@ -2484,6 +2544,12 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   std::vector<double> face_normal;
   std::vector<double> face_x;
   std::vector<double> face_y;
+  std::vector<double> projection_volume_weight;
+  std::vector<double> projection_volume_shape;
+  std::vector<double> projection_volume_x;
+  std::vector<double> projection_face_weight;
+  std::vector<double> projection_face_oriented_shape;
+  std::vector<double> projection_face_x;
   std::vector<double> trace_node_coordinate;
 
   void* double_arena = nullptr;
@@ -2913,6 +2979,121 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
           }
         }
       }
+      if (smooth_transition())
+      {
+        const int projection_order =
+            cpu_sc25::coupled_fixture_repeat_quadrature_order;
+        projection_volume_qpoints = mfem::IntRules.Get(
+            first_volume->GetGeomType(), projection_order).GetNPoints();
+        projection_face_qpoints = mfem::IntRules.Get(
+            first_trace->GetGeomType(), projection_order).GetNPoints();
+        if (projection_volume_qpoints <= volume_qpoints ||
+            projection_face_qpoints <= face_qpoints)
+        {
+          throw LocalPhaseFailure{};
+        }
+        const std::size_t projection_volume_points =
+            static_cast<std::size_t>(elements) * projection_volume_qpoints;
+        const std::size_t projection_face_points =
+            static_cast<std::size_t>(elements) * 4 * projection_face_qpoints;
+        projection_volume_weight.assign(projection_volume_points, 0.0);
+        projection_volume_shape.assign(
+            projection_volume_points * volume_nodes, 0.0);
+        projection_volume_x.assign(projection_volume_points, 0.0);
+        projection_face_weight.assign(projection_face_points, 0.0);
+        projection_face_oriented_shape.assign(
+            projection_face_points * face_nodes, 0.0);
+        projection_face_x.assign(projection_face_points, 0.0);
+
+        mfem::Vector projection_volume_shape_value(volume_nodes);
+        mfem::Vector projection_point(dimension);
+        for (int element = 0; element < elements; ++element)
+        {
+          const mfem::FiniteElement* finite_element =
+              volume_space->GetFE(element);
+          mfem::IsoparametricTransformation transformation_storage;
+          mesh->GetElementTransformation(element, &transformation_storage);
+          mfem::ElementTransformation* transformation =
+              &transformation_storage;
+          if (finite_element == nullptr) { throw LocalPhaseFailure{}; }
+          const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
+              finite_element->GetGeomType(), projection_order);
+          if (volume_rule.GetNPoints() != projection_volume_qpoints)
+          {
+            throw LocalPhaseFailure{};
+          }
+          for (int q = 0; q < projection_volume_qpoints; ++q)
+          {
+            const mfem::IntegrationPoint& ip = volume_rule.IntPoint(q);
+            transformation->SetIntPoint(&ip);
+            finite_element->CalcShape(ip, projection_volume_shape_value);
+            transformation->Transform(ip, projection_point);
+            const int qindex = element * projection_volume_qpoints + q;
+            projection_volume_weight[qindex] =
+                ip.weight * transformation->Weight();
+            projection_volume_x[qindex] = projection_point[0];
+            for (int a = 0; a < volume_nodes; ++a)
+            {
+              projection_volume_shape[
+                  static_cast<std::size_t>(qindex) * volume_nodes + a] =
+                  projection_volume_shape_value[a];
+            }
+          }
+
+          mfem::Array<int> faces, orientations;
+          mesh->GetElementEdges(element, faces, orientations);
+          for (int local_face = 0; local_face < 4; ++local_face)
+          {
+            const int face = faces[local_face];
+            mfem::FaceElementTransformations face_transformation_storage;
+            mfem::IsoparametricTransformation element_one_storage;
+            mfem::IsoparametricTransformation element_two_storage;
+            mesh->GetFaceElementTransformations(
+                face, face_transformation_storage, element_one_storage,
+                element_two_storage);
+            mfem::FaceElementTransformations* face_transformation =
+                &face_transformation_storage;
+            const mfem::FiniteElement* trace_element =
+                carrier_space->GetFaceElement(face);
+            const int* permutation = trace_collection->DofOrderForOrientation(
+                mfem::Geometry::SEGMENT, orientations[local_face]);
+            if (trace_element == nullptr) { throw LocalPhaseFailure{}; }
+            const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
+                trace_element->GetGeomType(), projection_order);
+            if (face_transformation == nullptr ||
+                face_transformation->Face == nullptr || permutation == nullptr ||
+                face_rule.GetNPoints() != projection_face_qpoints)
+            {
+              throw LocalPhaseFailure{};
+            }
+            mfem::Vector trace_shape(face_nodes), physical_point(dimension);
+            for (int q = 0; q < projection_face_qpoints; ++q)
+            {
+              const mfem::IntegrationPoint& ip = face_rule.IntPoint(q);
+              face_transformation->Face->SetIntPoint(&ip);
+              trace_element->CalcShape(ip, trace_shape);
+              face_transformation->Face->Transform(ip, physical_point);
+              const int qindex =
+                  (element * 4 + local_face) * projection_face_qpoints + q;
+              projection_face_weight[qindex] =
+                  ip.weight * face_transformation->Face->Weight();
+              projection_face_x[qindex] = physical_point[0];
+              for (int a = 0; a < face_nodes; ++a)
+              {
+                int sign = 0;
+                const int canonical = DecodeSignedDof(permutation[a], sign);
+                if (canonical < 0 || canonical >= face_nodes || sign == 0)
+                {
+                  throw LocalPhaseFailure{};
+                }
+                projection_face_oriented_shape[
+                    static_cast<std::size_t>(qindex) * face_nodes + a] =
+                    sign * trace_shape[canonical];
+              }
+            }
+          }
+        }
+      }
       return CollectiveAll(communicator.value, true);
     }
     catch (...) { return CollectiveAll(communicator.value, false); }
@@ -3225,7 +3406,9 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
         volume_weight, volume_shape, volume_derivative, volume_x, volume_y,
         face_weight, face_height, face_interior_shape, face_oriented_shape,
         face_normal, face_x, face_y, volume_node_x, volume_node_y,
-        trace_node_coordinate);
+        projection_volume_weight, projection_volume_shape, projection_volume_x,
+        projection_face_weight, projection_face_oriented_shape,
+        projection_face_x, trace_node_coordinate);
     if (topology_reference_hash == StateHash{} ||
         quadrature_reference_hash == StateHash{})
     {
@@ -3288,6 +3471,12 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     reserve_vector(face_y);
     reserve_vector(volume_node_x);
     reserve_vector(volume_node_y);
+    reserve_vector(projection_volume_weight);
+    reserve_vector(projection_volume_shape);
+    reserve_vector(projection_volume_x);
+    reserve_vector(projection_face_weight);
+    reserve_vector(projection_face_oriented_shape);
+    reserve_vector(projection_face_x);
     reserve_vector(trace_node_coordinate);
 
     std::size_t integer_count = 0;
@@ -3361,6 +3550,8 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     view.true_trace_unknowns = true_trace_unknowns;
     view.volume_quadrature_points = volume_qpoints;
     view.face_quadrature_points = face_qpoints;
+    view.projection_volume_quadrature_points = projection_volume_qpoints;
+    view.projection_face_quadrature_points = projection_face_qpoints;
     view.true_matrix_diag_nonzeros = diagonal_view.NumNonZeroElems();
     view.true_matrix_offd_nonzeros = offdiagonal_view.NumNonZeroElems();
     view.true_matrix_nonzeros = view.true_matrix_diag_nonzeros +
@@ -3386,7 +3577,8 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     view.quadrature_double_count =
         static_cast<int>(quadrature_double_count);
     view.assemble_dense_jacobian = 0;
-    view.dt = fixed_dt;
+    view.dt = time_step();
+    view.smooth_transition = smooth_transition() ? 1 : 0;
     view.slot_interior[0] = take_double(persistent_interior_unknowns);
     view.slot_interior[1] = take_double(persistent_interior_unknowns);
     view.slot_trace[0] = take_double(persistent_trace_unknowns);
@@ -3438,6 +3630,15 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     view.face_y = take_double(face_y.size());
     view.volume_node_x = take_double(volume_node_x.size());
     view.volume_node_y = take_double(volume_node_y.size());
+    view.projection_volume_weight =
+        take_double(projection_volume_weight.size());
+    view.projection_volume_shape =
+        take_double(projection_volume_shape.size());
+    view.projection_volume_x = take_double(projection_volume_x.size());
+    view.projection_face_weight = take_double(projection_face_weight.size());
+    view.projection_face_oriented_shape =
+        take_double(projection_face_oriented_shape.size());
+    view.projection_face_x = take_double(projection_face_x.size());
     view.trace_node_coordinate = take_double(trace_node_coordinate.size());
     view.local_trace_to_true = take_integer(local_trace_to_true.size());
     view.local_trace_sign = take_integer(local_trace_sign.size());
@@ -3531,6 +3732,19 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     upload(view.volume_node_x, volume_node_x,
            cuda_w8a::CudaTransferSite::quadrature_upload);
     upload(view.volume_node_y, volume_node_y,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_volume_weight, projection_volume_weight,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_volume_shape, projection_volume_shape,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_volume_x, projection_volume_x,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_face_weight, projection_face_weight,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_face_oriented_shape,
+           projection_face_oriented_shape,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.projection_face_x, projection_face_x,
            cuda_w8a::CudaTransferSite::quadrature_upload);
     upload(view.trace_node_coordinate, trace_node_coordinate,
            cuda_w8a::CudaTransferSite::quadrature_upload);
@@ -4228,7 +4442,8 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   }
 
   bool SolveTrueSystem(int& iterations, double& residual_norm,
-                       double& rhs_norm) noexcept
+                       double& rhs_norm,
+                       const bool admit_exact_homogeneous = false) noexcept
   {
     iterations = -1;
     residual_norm = std::numeric_limits<double>::infinity();
@@ -4275,8 +4490,9 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
       gmres->GetNumIterations(iterations);
     }
     catch (...) { local_valid = false; }
-    local_valid = local_valid && query_status == 0 && converged == 1 &&
-        iterations >= 0 && iterations <= trace_maximum_iterations;
+    local_valid = local_valid && query_status == 0 && iterations >= 0 &&
+        iterations <= trace_maximum_iterations &&
+        (converged == 1 || admit_exact_homogeneous);
     if (!CollectiveAll(communicator.value, local_valid)) { return false; }
 
     local_valid = true;
@@ -4302,9 +4518,12 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
           communicator.value, *true_rhs, *true_rhs));
     }
     catch (...) { rhs_norm = std::numeric_limits<double>::infinity(); }
+    const bool converged_or_exact_homogeneous = converged == 1 ||
+        (admit_exact_homogeneous && iterations == 0 && rhs_norm == 0.0 &&
+         residual_norm == 0.0);
     const bool valid = CollectiveAll(
         communicator.value,
-        std::isfinite(rhs_norm) &&
+        converged_or_exact_homogeneous && std::isfinite(rhs_norm) &&
             residual_norm <= absolute_trace_tolerance +
                 relative_trace_tolerance * rhs_norm);
     if (valid) { ++solver_generation; }
@@ -4395,6 +4614,13 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
         ObservedCudaDevicePointer(view.recovered) &&
         ObservedCudaDevicePointer(view.volume_weight) &&
         ObservedCudaDevicePointer(view.face_weight) &&
+        (!smooth_transition() ||
+         (ObservedCudaDevicePointer(view.projection_volume_weight) &&
+          ObservedCudaDevicePointer(view.projection_volume_shape) &&
+          ObservedCudaDevicePointer(view.projection_volume_x) &&
+          ObservedCudaDevicePointer(view.projection_face_weight) &&
+          ObservedCudaDevicePointer(view.projection_face_oriented_shape) &&
+          ObservedCudaDevicePointer(view.projection_face_x))) &&
         ObservedCudaDevicePointer(view.state_hash_bytes);
     bool hypre_observed = false;
     if (true_matrix && true_rhs && true_solution)
@@ -4716,8 +4942,8 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
         checkpoint_coordinates.step == checkpoint_coordinates.generation &&
         checkpoint_coordinates.step == checkpoint_coordinates.cursor &&
         checkpoint_coordinates.time ==
-            static_cast<double>(checkpoint_coordinates.step) * fixed_dt &&
-        checkpoint_coordinates.dt == fixed_dt;
+            static_cast<double>(checkpoint_coordinates.step) * time_step() &&
+        checkpoint_coordinates.dt == time_step();
     if (!CollectiveAll(communicator.value, valid_entry))
     {
       return false;
@@ -4792,7 +5018,7 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     }
     output.projection = StableIdentity::Copy(projection_id);
     output.tuple = StableIdentity::Copy(cuda_rank2_tuple_id);
-    output.scenario = StableIdentity::Copy(cuda_rank2_fixture_id);
+    output.scenario = StableIdentity::Copy(fixture_id());
     output.layout = StableIdentity::Copy(checkpoint_layout_id);
     output.raw_field_hashes = HashPublishedState(checkpoint_workspace);
     output.descriptor.schema_version = checkpoint_schema_version;
@@ -5219,7 +5445,7 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
   value.committed_slot = 0;
   value.view.committed_slot = 0;
   value.view.selected_current_slot = 0;
-  value.view.dt = fixed_dt;
+  value.view.dt = value.time_step();
   if (!value.RunPartialPivotContract())
   {
     value.status = ScalarCudaStatus::local_factor_failure;
@@ -5278,7 +5504,8 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
   int iterations = -1;
   double residual = 0.0;
   double rhs = 0.0;
-  if (!value.SolveTrueSystem(iterations, residual, rhs))
+  if (!value.SolveTrueSystem(iterations, residual, rhs,
+                             value.smooth_transition()))
   {
     value.status = ScalarCudaStatus::trace_linear_failure;
     return value.status;
@@ -5366,7 +5593,7 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
   }
   initialization_snapshot.valid = true;
   initialization_snapshot.status = ScalarCudaStatus::ready;
-  initialization_snapshot.coordinates = {0.0, 0, 0, 0, fixed_dt};
+  initialization_snapshot.coordinates = {0.0, 0, 0, 0, value.time_step()};
   initialization_snapshot.trace_iterations = iterations;
   initialization_snapshot.trace_true_residual_norm = residual;
   initialization_snapshot.trace_right_hand_side_norm = rhs;
@@ -5430,7 +5657,7 @@ PersistentSc25ScalarIgrCudaRank2::InitializePersistentTrajectory() noexcept
     value.status = ScalarCudaStatus::allocation_failure;
     return value.status;
   }
-  value.coordinates = {0.0, 0, 0, 0, fixed_dt};
+  value.coordinates = {0.0, 0, 0, 0, value.time_step()};
   value.evidence.coordinates = value.coordinates;
   value.evidence.reuse = value.ReuseEvidence();
   value.evidence.reuse.unchanged = true;
@@ -5502,7 +5729,7 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
   const bool prepared_state = implementation_->initialized &&
       implementation_->status == ScalarCudaStatus::ready &&
       implementation_->active_transaction_serial == 0 &&
-      implementation_->coordinates.step < persistent_required_steps &&
+      implementation_->coordinates.step < implementation_->required_steps() &&
       implementation_->next_transaction_serial != 0 &&
       implementation_->next_transaction_serial !=
           std::numeric_limits<std::uint64_t>::max();
@@ -5524,15 +5751,15 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
   value.pending_attempt.target_step =
       static_cast<int>(value.coordinates.step + 1);
   value.pending_attempt.retry_index = value.prepare_retry_index;
-  value.pending_attempt.dt = fixed_dt;
+  value.pending_attempt.dt = value.time_step();
   value.pending_attempt.committed_coordinates = value.coordinates;
   const std::uint64_t target_step = value.coordinates.step + 1;
   value.pending_attempt.candidate_coordinates = {
-      static_cast<double>(target_step) * fixed_dt,
+      static_cast<double>(target_step) * value.time_step(),
       target_step,
       value.coordinates.generation + 1,
       value.coordinates.cursor + 1,
-      fixed_dt};
+      value.time_step()};
 
   cuda_w8a::CudaPolicyContext context{};
   context.attempt_sequence = value.coordinates.cursor + 1;
@@ -5912,7 +6139,7 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
   value.pending_attempt.failure_cause = ScalarCudaFailureCause::none;
   value.pending_step.accepted = true;
   value.pending_step.step = static_cast<int>(value.coordinates.step + 1);
-  value.pending_step.time = static_cast<double>(target_step) * fixed_dt;
+  value.pending_step.time = static_cast<double>(target_step) * value.time_step();
   value.pending_step.generation = value.coordinates.generation + 1;
   value.pending_step.committed_integrals = committed_integrals;
   value.pending_step.accepted_integrals = accepted_integrals;
@@ -6237,7 +6464,7 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
   const bool identity = checkpoint.projection == StableIdentity::Copy(
                             projection_id) &&
       checkpoint.tuple == StableIdentity::Copy(cuda_rank2_tuple_id) &&
-      checkpoint.scenario == StableIdentity::Copy(cuda_rank2_fixture_id) &&
+      checkpoint.scenario == StableIdentity::Copy(value.fixture_id()) &&
       checkpoint.layout == StableIdentity::Copy(checkpoint_layout_id) &&
       descriptor.schema_version == checkpoint_schema_version &&
       descriptor.successful_commit &&
@@ -6259,12 +6486,12 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank2::
           ::dg::hdg::runtime::detail::CoordinateFingerprint(
               descriptor.coordinates) &&
       descriptor.coordinates.step != 0 &&
-      descriptor.coordinates.step <= persistent_required_steps &&
+      descriptor.coordinates.step <= value.required_steps() &&
       descriptor.coordinates.step == descriptor.coordinates.generation &&
       descriptor.coordinates.step == descriptor.coordinates.cursor &&
       descriptor.coordinates.time ==
-          static_cast<double>(descriptor.coordinates.step) * fixed_dt &&
-      descriptor.coordinates.dt == fixed_dt;
+          static_cast<double>(descriptor.coordinates.step) * value.time_step() &&
+      descriptor.coordinates.dt == value.time_step();
   if (!CollectiveAll(value.communicator.value, identity))
     return ScalarCudaStatus::restart_identity_failure;
   PublishedState host_state;

@@ -56,6 +56,8 @@ struct DeviceView final
   int true_trace_unknowns = 0;
   int volume_quadrature_points = 0;
   int face_quadrature_points = 0;
+  int projection_volume_quadrature_points = 0;
+  int projection_face_quadrature_points = 0;
   int true_matrix_nonzeros = 0;
   int true_matrix_diag_nonzeros = 0;
   int true_matrix_offd_nonzeros = 0;
@@ -74,6 +76,7 @@ struct DeviceView final
   int operation = 0;
   int committed_slot = 0;
   int selected_current_slot = 0;
+  int smooth_transition = 0;
   int compiled_architecture_expected = required_native_architecture;
   double dt = fixed_dt;
   double trial_theta = 0.0;
@@ -117,6 +120,12 @@ struct DeviceView final
   double* face_normal = nullptr;
   double* face_x = nullptr;
   double* face_y = nullptr;
+  double* projection_volume_weight = nullptr;
+  double* projection_volume_shape = nullptr;
+  double* projection_volume_x = nullptr;
+  double* projection_face_weight = nullptr;
+  double* projection_face_oriented_shape = nullptr;
+  double* projection_face_x = nullptr;
   double* volume_node_x = nullptr;
   double* volume_node_y = nullptr;
   double* trace_node_coordinate = nullptr;

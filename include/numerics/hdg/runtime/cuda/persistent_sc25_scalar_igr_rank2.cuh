@@ -43,6 +43,8 @@ inline constexpr std::string_view cuda_rank2_tuple_id =
     "HDG-SC25-PER-BE-CUDA-R2-HOST-STAGED-FP64-v3";
 inline constexpr std::string_view cuda_rank2_fixture_id =
     "C3-MFEM-PERSISTENT-N8-CUDA-R2-HOST-STAGED-01";
+inline constexpr std::string_view cuda_rank2_smooth_transition_fixture_id =
+    "W8C-V2-MFEM-PERSISTENT-N8-CUDA-R2-HOST-STAGED-01";
 inline constexpr std::string_view interior_layout_id =
     "device.field-blocked.U[e][c][a].Sigma[e][a].z[e][c][a].v3";
 inline constexpr std::string_view trace_layout_id =
@@ -83,6 +85,9 @@ inline constexpr int persistent_trace_unknowns =
     cpu_sc25::persistent_true_trace_unknowns;
 inline constexpr int persistent_required_steps =
     cpu_sc25::persistent_required_steps;
+inline constexpr int smooth_transition_required_steps =
+    64;
+inline constexpr int maximum_required_steps = smooth_transition_required_steps;
 inline constexpr int persistent_max_owned_trace_unknowns =
     cpu_sc25::persistent_rank2_rank0_owned_trace_unknowns;
 inline constexpr int persistent_max_full_unknowns =
@@ -96,6 +101,8 @@ inline constexpr int trace_restart_dimension =
 inline constexpr int trace_maximum_iterations =
     cpu_sc25::persistent_trace_maximum_iterations;
 inline constexpr double fixed_dt = cpu_sc25::persistent_dt;
+inline constexpr double smooth_transition_dt =
+    1.0 / 1024.0;
 inline constexpr double relative_trace_tolerance = 1.0e-12;
 inline constexpr double absolute_trace_tolerance = 1.0e-14;
 inline constexpr double armijo_coefficient = 1.0e-4;
@@ -200,12 +207,20 @@ using FailureInjection = cpu_sc25::TrajectoryFailureInjection;
 using PublishedState = cpu_sc25::PersistentRank2TrajectoryState;
 using StateHashes = cpu_sc25::Rank2TrajectoryStateHashes;
 
+/** Closed leaf selection; this is not a public runtime dispatch surface. */
+enum class ScalarCudaLifecycle : std::uint8_t
+{
+  sc25_periodic_v3,
+  w8c_smooth_transition_v2
+};
+
 struct ScalarCudaConfig final
 {
   int polynomial_degree = 1;
   int elements_per_direction = 8;
   int requested_device = 0;
   bool require_host_staged_rank2 = true;
+  ScalarCudaLifecycle lifecycle = ScalarCudaLifecycle::sc25_periodic_v3;
 };
 
 /** Rank-local checkpoint shard; the canonical manifest binds both ranks. */
@@ -415,11 +430,11 @@ struct ScalarCudaEvidence final
   ScalarCudaLaunchLedger launches{};
   cuda_w8a::CudaTransferLedgerV1 transfers{};
   cuda_w8a::CudaAllocationLedgerV1 allocation_ledger{};
-  std::array<ScalarCudaAttemptEvidence, persistent_required_steps + 4>
+  std::array<ScalarCudaAttemptEvidence, maximum_required_steps + 4>
       attempts{};
-  std::array<ScalarCudaStepEvidence, persistent_required_steps> steps{};
+  std::array<ScalarCudaStepEvidence, maximum_required_steps> steps{};
   int snapshot_count = 0;
-  std::array<ScalarCudaSnapshotEvidence, persistent_required_steps + 1>
+  std::array<ScalarCudaSnapshotEvidence, maximum_required_steps + 1>
       snapshots{};
 };
 
