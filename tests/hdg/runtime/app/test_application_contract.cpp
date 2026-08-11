@@ -438,10 +438,21 @@ bool CheckW8cSmoothTransitionClosure()
 
     ApplicationOptionsView rank2 = W8cCase(scalar, true);
     rank2.backend_id = CpuRank2BackendTag::id;
-    passed = Check(ValidateApplicationOptions(rank2).rejection() ==
-                       ApplicationRejection::unknown_backend,
-                   "smooth_case_remains_cpu_serial_only") &&
+    const ApplicationValidation rank2_validation =
+        ValidateApplicationOptions(rank2);
+    passed = Check(scalar ? rank2_validation.accepted()
+                          : rank2_validation.rejection() ==
+                                ApplicationRejection::unknown_backend,
+                   "smooth_scalar_cpu_rank2_is_frozen") &&
         passed;
+    if (scalar)
+    {
+      rank2.scenario_id = "W8C-V2-N16-DT11";
+      passed = Check(ValidateApplicationOptions(rank2).rejection() ==
+                         ApplicationRejection::unknown_backend,
+                     "smooth_scalar_cpu_rank2_rejects_n16") &&
+          passed;
+    }
   }
   return passed;
 }

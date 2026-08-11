@@ -217,7 +217,8 @@ bool ParseScalarVtk(const std::vector<std::uint8_t>& bytes,
 }
 
 bool CompareScalarVtk(const char* left_path, const char* right_path,
-                      const double tolerance)
+                      const double tolerance,
+                      const bool unit_norm_floor = false)
 {
   ScalarVtkField left, right;
   if (!ParseScalarVtk(left_path, left) || !ParseScalarVtk(right_path, right) ||
@@ -245,8 +246,10 @@ bool CompareScalarVtk(const char* left_path, const char* right_path,
     }
     const long double difference_norm = std::sqrt(difference_squared);
     const long double reference_norm = std::sqrt(reference_squared);
-    const long double error = reference_norm == 0.0L
-        ? difference_norm : difference_norm / reference_norm;
+    const long double error = unit_norm_floor
+        ? difference_norm / std::max(1.0L, reference_norm)
+        : (reference_norm == 0.0L
+            ? difference_norm : difference_norm / reference_norm);
     if (!std::isfinite(error) || error > tolerance) return false;
   }
   return true;
@@ -1421,6 +1424,17 @@ int main(const int argc, const char* const* argv)
     const bool compared = tolerance > 0.0 &&
         CompareScalarVtk(argv[2], argv[3], tolerance);
     if (compared) std::cout << "HDG scalar-IGR VTK parity PASS\n";
+    return compared ? 0 : 1;
+  }
+  if (argc == 5 &&
+      std::string{argv[1]} == "--compare-scalar-vtk-w8c-rank2")
+  {
+    double tolerance = 0.0;
+    try { tolerance = std::stod(argv[4]); }
+    catch (...) { return 64; }
+    const bool compared = tolerance > 0.0 &&
+        CompareScalarVtk(argv[2], argv[3], tolerance, true);
+    if (compared) std::cout << "HDG scalar-IGR W8C rank-two VTK parity PASS\n";
     return compared ? 0 : 1;
   }
   if (argc == 4 && std::string{argv[1]} == "--validate-scalar-initial-vtk")
