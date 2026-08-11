@@ -40,7 +40,11 @@ namespace
 {
 
 namespace cuda = ::dg::hdg::runtime::cuda_w8a;
+#if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
+namespace scalar = ::dg::hdg::runtime::cuda_w8b::sc25::rank2;
+#else
 namespace scalar = ::dg::hdg::runtime::cuda_w8b::sc25;
+#endif
 
 #if !defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
 
@@ -2976,9 +2980,14 @@ ApplicationRunResult RunScalarIgrCuda(
     return result;
   }
   ScalarCheckpoint staged_checkpoint{};
-  scalar::ScalarCudaEvidence staged_evidence{};
+  std::unique_ptr<scalar::ScalarCudaEvidence> staged_evidence;
+  bool staging_workspace_ready = true;
+  try { staged_evidence = std::make_unique<scalar::ScalarCudaEvidence>(); }
+  catch (...) { staging_workspace_ready = false; }
   if (!ScalarCollectiveAll(
-          PrepareScalarCheckpoint(initial_state, staged_checkpoint), context))
+          staging_workspace_ready && staged_evidence &&
+              PrepareScalarCheckpoint(initial_state, staged_checkpoint),
+          context))
   {
     result.status = RunStatus::terminal_failure;
     result.reason = FailureReason::backend_failure;
@@ -3100,7 +3109,7 @@ ApplicationRunResult RunScalarIgrCuda(
     if (staged && scheduled_stage)
     {
       const bool candidate_staged = owner->StageInstalledTrajectoryTransaction(
-          candidate, staged_checkpoint, staged_evidence);
+          candidate, staged_checkpoint, *staged_evidence);
       staged = ScalarCollectiveAll(
           candidate_staged && PackedFromCheckpoint(staged_checkpoint, packed),
           context);
@@ -3163,7 +3172,7 @@ ApplicationRunResult RunScalarIgrCuda(
         try
         {
           const std::string text = ScalarCudaMetadata(
-              config, anticipated, staged_evidence, initial_hash,
+              config, anticipated, *staged_evidence, initial_hash,
               final_interior, final_trace, injection, resource,
               consumed_diagnostic.empty() ? diagnostic
                                           : consumed_diagnostic);

@@ -28,7 +28,7 @@
 
 namespace
 {
-namespace scalar = ::dg::hdg::runtime::cuda_w8b::sc25;
+namespace scalar = ::dg::hdg::runtime::cuda_w8b::sc25::rank2;
 namespace cpu = ::dg::hdg::runtime::cpu::sc25;
 namespace oracle = ::dg_igr_hdg_sc25_cuda_rank2_test;
 namespace manifest = ::dg_igr_hdg_sc25_rank2_manifest;

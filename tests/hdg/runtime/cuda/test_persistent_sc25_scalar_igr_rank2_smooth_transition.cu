@@ -9,7 +9,7 @@
 namespace
 {
 
-namespace scalar = ::dg::hdg::runtime::cuda_w8b::sc25;
+namespace scalar = ::dg::hdg::runtime::cuda_w8b::sc25::rank2;
 
 bool Accepted(const scalar::ScalarCudaStatus status) noexcept
 {

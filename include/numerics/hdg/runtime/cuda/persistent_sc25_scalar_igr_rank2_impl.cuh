@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace dg::hdg::runtime::cuda_w8b::sc25::detail
+namespace dg::hdg::runtime::cuda_w8b::sc25::rank2::detail
 {
 
 enum class KernelOperation : int
@@ -178,11 +178,11 @@ enum DeviceStatusBit : int
   device_wrong_architecture = 1 << 5
 };
 
-} // namespace dg::hdg::runtime::cuda_w8b::sc25::detail
+} // namespace dg::hdg::runtime::cuda_w8b::sc25::rank2::detail
 
 extern "C" __global__ void HdgSc25Rank2AssembleLocalFp64Kernel(
-    dg::hdg::runtime::cuda_w8b::sc25::detail::DeviceView view);
+    dg::hdg::runtime::cuda_w8b::sc25::rank2::detail::DeviceView view);
 extern "C" __global__ void HdgSc25Rank2CondenseFp64Kernel(
-    dg::hdg::runtime::cuda_w8b::sc25::detail::DeviceView view);
+    dg::hdg::runtime::cuda_w8b::sc25::rank2::detail::DeviceView view);
 extern "C" __global__ void HdgSc25Rank2RecoverFp64Kernel(
-    dg::hdg::runtime::cuda_w8b::sc25::detail::DeviceView view);
+    dg::hdg::runtime::cuda_w8b::sc25::rank2::detail::DeviceView view);

@@ -21,8 +21,8 @@
 #include <utility>
 #include <vector>
 
-namespace scalar = dg::hdg::runtime::cuda_w8b::sc25;
-namespace scalar_detail = dg::hdg::runtime::cuda_w8b::sc25::detail;
+namespace scalar = dg::hdg::runtime::cuda_w8b::sc25::rank2;
+namespace scalar_detail = dg::hdg::runtime::cuda_w8b::sc25::rank2::detail;
 
 namespace
 {
@@ -2284,7 +2284,7 @@ extern "C" __global__ void HdgSc25Rank2RecoverFp64Kernel(
   }
 }
 
-namespace dg::hdg::runtime::cuda_w8b::sc25
+namespace dg::hdg::runtime::cuda_w8b::sc25::rank2
 {
 namespace
 {
@@ -6710,4 +6710,4 @@ PersistentSc25ScalarIgrCudaRank2::allocation_ledger() const noexcept
   return cuda_w8a::UmpireDeviceAllocatorPolicy::Ledger();
 }
 
-} // namespace dg::hdg::runtime::cuda_w8b::sc25
+} // namespace dg::hdg::runtime::cuda_w8b::sc25::rank2

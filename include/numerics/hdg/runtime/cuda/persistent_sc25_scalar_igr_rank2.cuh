@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-namespace dg::hdg::runtime::cuda_w8b::sc25
+namespace dg::hdg::runtime::cuda_w8b::sc25::rank2
 {
 
 namespace cpu_sc25 = ::dg::hdg::runtime::cpu::sc25;
@@ -551,4 +551,4 @@ static_assert(!std::is_copy_constructible<
                       PersistentSc25ScalarIgrCudaRank2::Transaction>::value,
               "SC25 CUDA transaction authority must remain affine");
 
-} // namespace dg::hdg::runtime::cuda_w8b::sc25
+} // namespace dg::hdg::runtime::cuda_w8b::sc25::rank2
