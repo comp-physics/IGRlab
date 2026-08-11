@@ -2652,6 +2652,16 @@ std::string ScalarCudaMetadata(
     const StateHash& final_trace, const ScalarInjectionAudit& injection,
     const ScalarResourceRecord& resource, const std::string& diagnostic)
 {
+#if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
+  const double maximum_conservation = evidence.maximum_conservation_error;
+  const double minimum_density = evidence.minimum_density;
+  const double minimum_pressure = evidence.minimum_pressure;
+  const double minimum_speed_margin = evidence.minimum_speed_margin;
+  const bool trace_residual_gate =
+      evidence.maximum_trace_residual_ratio <= 1.0;
+  const std::uint64_t physical_cuda_transfers =
+      evidence.transfer_totals.event_count;
+#else
   double maximum_conservation = 0.0;
   double minimum_density = std::numeric_limits<double>::infinity();
   double minimum_pressure = std::numeric_limits<double>::infinity();
@@ -2679,6 +2689,8 @@ std::string ScalarCudaMetadata(
           newton.trace_true_residual_norm <= bound;
     }
   }
+  const std::uint64_t physical_cuda_transfers = evidence.transfers.count;
+#endif
   const bool residency = evidence.residency.mfem_cuda_device &&
       evidence.residency.hypre_cuda && evidence.residency.umpire_device_pool &&
       evidence.residency.state_device_resident &&
@@ -2736,7 +2748,7 @@ std::string ScalarCudaMetadata(
       << evidence.launches.assemble_launches +
              evidence.launches.condense_launches +
              evidence.launches.recover_launches
-      << ",\n  \"physical_cuda_transfers\": " << evidence.transfers.count
+      << ",\n  \"physical_cuda_transfers\": " << physical_cuda_transfers
       << ",\n  \"physical_cuda_owned_allocations\": "
       << evidence.allocations.current_owned_calls
       << ",\n  \"physical_cuda_observed_allocations\": "

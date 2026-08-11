@@ -30,8 +30,6 @@ enum class KernelOperation : int
   gather_trace_residual,
   scatter_remote_trace_residual,
   install_distributed_trace,
-  fixed_jacobian_action,
-  scatter_remote_fixed_action,
   partial_pivot_contract
 };
 
@@ -139,9 +137,6 @@ struct DeviceView final
   double* remote_matrix_receive = nullptr;
   double* remote_vector_send = nullptr;
   double* remote_vector_receive = nullptr;
-  double* evidence_action_input = nullptr;
-  double* evidence_action_result = nullptr;
-  double* evidence_trace_action = nullptr;
 
   int* local_trace_to_true = nullptr;
   int* local_trace_sign = nullptr;
