@@ -506,11 +506,14 @@ ApplicationRejection ValidateRoleControls(
 
   if (w8c_case)
   {
+    const bool rank2_smooth_scalar = scalar &&
+        options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
+        backend == ApplicationBackend::cpu_rank2;
     const bool focused =
         options.injection.mode == FailureInjectionModeV1::prescribed &&
         options.injection.phase == FailurePhase::AfterRecoveryBeforeCommit &&
         options.injection.target_step == cpu::w8c::failure_target_step &&
-        options.injection.source_rank == 0 &&
+        options.injection.source_rank == (rank2_smooth_scalar ? 1U : 0U) &&
         options.retry_limit == cpu::w8c::retry_limit;
     const bool ordinary = off && options.retry_limit == 0;
     switch (options.run_role)
@@ -518,13 +521,15 @@ ApplicationRejection ValidateRoleControls(
       case ApplicationRunRoleV1::uninterrupted_reference:
         return writes_checkpoint &&
                 options.stop_after_checkpoint == StopAfterCheckpointV1::no &&
-                ordinary && options.seed == seed
+                ordinary &&
+                options.seed == seed
             ? ApplicationRejection::none
             : ApplicationRejection::invalid_run_role;
       case ApplicationRunRoleV1::split_writer:
         return writes_checkpoint &&
                 options.stop_after_checkpoint == StopAfterCheckpointV1::yes &&
-                ordinary && options.seed == seed
+                (ordinary || (rank2_smooth_scalar && focused)) &&
+                options.seed == seed
             ? ApplicationRejection::none
             : ApplicationRejection::invalid_run_role;
       case ApplicationRunRoleV1::split_reader:
@@ -726,7 +731,11 @@ ApplicationRejection ValidateW8c(
     const ApplicationOptionsView& options,
     const ApplicationBackend backend) noexcept
 {
-  if (backend != ApplicationBackend::cpu_serial)
+  const bool rank2_smooth_scalar =
+      options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
+      options.card_id == scalar_igr_sc25_v3_card_id &&
+      backend == ApplicationBackend::cpu_rank2;
+  if (backend != ApplicationBackend::cpu_serial && !rank2_smooth_scalar)
     return ApplicationRejection::unknown_backend;
   if (options.case_id != Case::case_id || options.scenario_id != Case::scenario_id)
     return ApplicationRejection::unknown_scenario;
@@ -1081,19 +1090,29 @@ bool DeriveSplitWriterRunConfigHashV1(
   writer.restart_from = {};
   writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
   const bool w8c_case = cpu::w8c::IsCaseId(split_reader.case_id().view());
-  writer.injection = split_reader.scalar_igr() && !w8c_case
+  const bool w8c_rank2_retry = split_reader.scalar_igr() &&
+      split_reader.case_id().view() ==
+          cpu::w8c::SmoothTransitionV2Case::case_id &&
+      split_reader.backend() == ApplicationBackend::cpu_rank2;
+  writer.injection = w8c_rank2_retry
+      ? FailureInjectionControlV1{
+            FailureInjectionModeV1::prescribed,
+            FailurePhase::AfterRecoveryBeforeCommit,
+            cpu::w8c::failure_target_step, 1}
+      : (split_reader.scalar_igr() && !w8c_case
       ? FailureInjectionControlV1{
             FailureInjectionModeV1::prescribed,
             smooth_periodic_euler_v1_failure_phase,
             scalar_igr_sc25_v3_failure_target_step,
             split_reader.deferred_runtime().required_injected_source_rank}
-      : FailureInjectionControlV1{};
+      : FailureInjectionControlV1{});
   writer.restart_mode = split_reader.restart_mode();
   writer.restart_trajectory = split_reader.restart_trajectory();
   writer.rollback_obligation = split_reader.rollback_obligation();
   writer.source_rank_rule = split_reader.source_rank_rule();
-  writer.retry_limit = split_reader.scalar_igr() && !w8c_case
-      ? scalar_igr_sc25_v3_retry_limit : 0;
+  writer.retry_limit = w8c_rank2_retry ? 1U :
+      (split_reader.scalar_igr() && !w8c_case
+          ? scalar_igr_sc25_v3_retry_limit : 0U);
   writer.seed = split_reader.seed();
 
   ApplicationConfigHashes hashes{};

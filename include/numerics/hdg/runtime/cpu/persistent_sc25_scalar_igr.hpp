@@ -140,6 +140,9 @@ inline constexpr int persistent_rank2_global_true_trace_unknowns = 1280;
 inline constexpr int persistent_rank2_rank0_ghost_trace_unknowns = 0;
 inline constexpr int persistent_rank2_rank1_ghost_trace_unknowns = 160;
 inline constexpr int persistent_required_steps = 20;
+// Rank-two remains bounded to the legacy 20-step fixture plus the frozen
+// W8C smooth-transition tuple (64 steps).
+inline constexpr int persistent_rank2_maximum_steps = 64;
 inline constexpr int persistent_newton_maximum_iterations = 20;
 inline constexpr int persistent_line_search_trials = 13;
 inline constexpr int persistent_trace_restart_dimension = 50;
@@ -864,9 +867,9 @@ struct PersistentRank2TrajectoryEvidence final
   std::uint64_t w8_owned_boundary_buffer_count = 0;
   bool opaque_mfem_hypre_observed = false;
   std::array<Rank2TrajectoryAttemptEvidence,
-             persistent_required_steps + 4> attempts{};
+             persistent_rank2_maximum_steps + 4> attempts{};
   std::array<Rank2TrajectoryStageEvidence,
-             persistent_required_steps> stages{};
+             persistent_rank2_maximum_steps> stages{};
 };
 
 double VelocityGradientInvariant(

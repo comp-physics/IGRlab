@@ -612,6 +612,64 @@ function(validate_scalar_cuda_metadata metadata label expected_step)
   endif()
 endfunction()
 
+if(HDG_RUNTIME_W8C_SMOOTH_RANK2)
+  if(NOT HDG_RUNTIME_RANKS EQUAL 2 OR
+     NOT DEFINED HDG_RUNTIME_SCALAR_VTK_TEST)
+    message(FATAL_ERROR "W8C scalar rank-two test requires its comparator")
+  endif()
+  set(w8c_common
+    --card exp.hdg.igr.traced_scalar.sc25.periodic.projection.v3
+    --case periodic-smooth-transition-v2
+    --space l2 --mesh-family periodic-cartesian-quad --mesh-n 8 --order 1
+    --dt 0.0009765625 --steps 64 --final-time 0.0625
+    --backend cpu --device-id none --output-steps 0,32,64
+    --seed 0x573843534d4f5632)
+  set(serial_directory "${HDG_RUNTIME_TEST_OUTPUT}-serial")
+  set(rank2_directory "${HDG_RUNTIME_TEST_OUTPUT}-rank2")
+  set(split_directory "${HDG_RUNTIME_TEST_OUTPUT}-split")
+  set(split_checkpoint "${HDG_RUNTIME_TEST_OUTPUT}.checkpoint")
+  file(REMOVE_RECURSE "${serial_directory}" "${rank2_directory}" "${split_directory}")
+  file(REMOVE "${split_checkpoint}")
+  run_serial_runtime(serial ${w8c_common}
+    --output-dir "${serial_directory}" --checkpoint-out "${serial_directory}.checkpoint"
+    --checkpoint-step 32 --stop-after-checkpoint false --restart-from none
+    --max-retries 0 --inject-failure off)
+  if(NOT serial_status EQUAL 0 OR NOT serial_output MATCHES "status=Success.*step=64.*retries=0" OR NOT serial_error STREQUAL "")
+    message(FATAL_ERROR "W8C scalar serial reference failed: ${serial_status};${serial_output};${serial_error}")
+  endif()
+  run_runtime(rank2 ${w8c_common}
+    --output-dir "${rank2_directory}" --checkpoint-out "${rank2_directory}.checkpoint"
+    --checkpoint-step 32 --stop-after-checkpoint false --restart-from none
+    --max-retries 0 --inject-failure off)
+  if(NOT rank2_status EQUAL 0 OR NOT rank2_output MATCHES "status=Success.*step=64.*retries=0" OR NOT rank2_error STREQUAL "")
+    message(FATAL_ERROR "W8C scalar rank-two reference failed: ${rank2_status};${rank2_output};${rank2_error}")
+  endif()
+  run_runtime(writer ${w8c_common}
+    --output-dir "${split_directory}" --checkpoint-out "${split_checkpoint}"
+    --checkpoint-step 32 --stop-after-checkpoint true --restart-from none
+    --max-retries 1 --inject-failure AfterRecoveryBeforeCommit:7:1)
+  if(NOT writer_status EQUAL 0 OR NOT writer_output MATCHES "status=Success.*step=32.*retries=1" OR NOT writer_error STREQUAL "")
+    message(FATAL_ERROR "W8C scalar rank-two retry writer failed: ${writer_status};${writer_output};${writer_error}")
+  endif()
+  run_runtime(reader ${w8c_common}
+    --output-dir "${split_directory}" --checkpoint-out none --checkpoint-step none
+    --stop-after-checkpoint false --restart-from "${split_checkpoint}"
+    --max-retries 0 --inject-failure off)
+  if(NOT reader_status EQUAL 0 OR NOT reader_output MATCHES "status=Success.*step=64.*retries=1" OR NOT reader_error STREQUAL "")
+    message(FATAL_ERROR "W8C scalar rank-two restart reader failed: ${reader_status};${reader_output};${reader_error}")
+  endif()
+  foreach(step IN ITEMS 000000 000032 000064)
+    execute_process(COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk
+                    "${serial_directory}/state-step-${step}.vtk"
+                    "${rank2_directory}/state-step-${step}.vtk" 5e-11
+                    RESULT_VARIABLE compare_status OUTPUT_VARIABLE compare_output ERROR_VARIABLE compare_error)
+    if(NOT compare_status EQUAL 0 OR NOT compare_output MATCHES "HDG scalar-IGR VTK parity PASS" OR NOT compare_error STREQUAL "")
+      message(FATAL_ERROR "W8C serial/rank-two field-topology comparator failed at ${step}: ${compare_status};${compare_output};${compare_error}")
+    endif()
+  endforeach()
+  return()
+endif()
+
 if(HDG_RUNTIME_W8C_MATRIX)
   if(NOT HDG_RUNTIME_RANKS EQUAL 1)
     message(FATAL_ERROR "W8C smooth-transition matrix is CPU serial")

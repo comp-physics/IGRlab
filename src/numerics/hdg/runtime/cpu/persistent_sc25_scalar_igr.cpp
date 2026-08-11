@@ -317,7 +317,15 @@ struct Rank1InitializationRequest final
   double time_step = persistent_dt;
 };
 
+struct Rank2InitializationRequest final
+{
+  const PersistentSc25ScalarIgrCpuFoundation* owner = nullptr;
+  int required_steps = 0;
+  double time_step = 0.0;
+};
+
 thread_local Rank1InitializationRequest next_rank1_initialization{};
+thread_local Rank2InitializationRequest next_rank2_initialization{};
 }
 
 namespace w8c_internal
@@ -373,6 +381,23 @@ Rank1InitializationRequest ConsumeInitializationRequest(
   const Rank1InitializationRequest request = std::exchange(
       next_rank1_initialization, Rank1InitializationRequest{});
   return request.owner == &owner ? request : Rank1InitializationRequest{};
+}
+
+[[gnu::visibility("hidden")]]
+void RequestSmoothTransitionRank2Initialization(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept
+{
+  next_rank2_initialization = {
+      &owner, static_cast<int>(w8c::SmoothTransitionV2Case::accepted_steps),
+      w8c::SmoothTransitionV2Case::dt};
+}
+
+Rank2InitializationRequest ConsumeRank2InitializationRequest(
+    const PersistentSc25ScalarIgrCpuFoundation& owner) noexcept
+{
+  const Rank2InitializationRequest request = std::exchange(
+      next_rank2_initialization, Rank2InitializationRequest{});
+  return request.owner == &owner ? request : Rank2InitializationRequest{};
 }
 
 } // namespace w8c_internal
@@ -6896,6 +6921,9 @@ struct PersistentRank2TrajectoryImplementation final
   StateHash partition_hash{};
   StateHash topology_hash{};
   StateHash boundary_identity_hash{};
+  int required_steps = persistent_required_steps;
+  double time_step = persistent_dt;
+  bool smooth_transition = false;
 
   bool InitializeStorage(
       PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept;
@@ -6919,7 +6947,8 @@ struct PersistentRank2TrajectoryImplementation final
       PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept;
   bool SolveTrueSystem(
       PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
-      int& iterations, double& residual_norm, double& rhs_norm) noexcept;
+      int& iterations, double& residual_norm, double& rhs_norm,
+      bool admit_exact_homogeneous = false) noexcept;
   bool Recover(PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
                const CoupledFixtureAssembly& system,
                PersistentRank2TrajectoryState& output,
@@ -7616,7 +7645,8 @@ bool PersistentRank2TrajectoryImplementation::InitializePhysicalState(
   {
     constexpr int ns = persistent_scalar_volume_nodes;
     constexpr int nf = coupled_fixture_scalar_face_nodes;
-    constexpr int order = coupled_fixture_quadrature_order;
+    const int order = smooth_transition ? coupled_fixture_repeat_quadrature_order
+                                        : coupled_fixture_quadrature_order;
     std::fill(state.u.begin(), state.u.end(), 0.0);
     std::fill(state.sigma.begin(), state.sigma.end(), 0.0);
     std::fill(state.z.begin(), state.z.end(), 0.0);
@@ -7645,7 +7675,9 @@ bool PersistentRank2TrajectoryImplementation::InitializePhysicalState(
         transformation->SetIntPoint(&ip);
         finite_element->CalcShape(ip, shape);
         transformation->Transform(ip, point);
-        const InitialStatePoint value = SmoothInitialState(point[0], point[1]);
+        const InitialStatePoint value = smooth_transition
+            ? SmoothTransitionInitialState(point[0])
+            : SmoothInitialState(point[0], point[1]);
         const double weight = ip.weight * transformation->Weight();
         for (int row = 0; row < ns; ++row)
         {
@@ -7731,8 +7763,9 @@ bool PersistentRank2TrajectoryImplementation::InitializePhysicalState(
           transformation->SetIntPoint(&ip);
           finite_element->CalcShape(ip, shape);
           transformation->Transform(ip, point);
-          const InitialStatePoint value =
-              SmoothInitialState(point[0], point[1]);
+          const InitialStatePoint value = smooth_transition
+              ? SmoothTransitionInitialState(point[0])
+              : SmoothInitialState(point[0], point[1]);
           const double weight = ip.weight * transformation->Weight();
           for (int row = 0; row < nf; ++row)
           {
@@ -7954,7 +7987,7 @@ PersistentRank2TrajectoryImplementation::Assemble(
       const bool assembled = AssembleCoupledFixture(
           *owner.mesh, *owner.sigma_space, *owner.carrier_space,
           *owner.trace_collection, owner.topology, assembly_state,
-          coupled_fixture_quadrature_order, persistent_dt, false, output,
+          coupled_fixture_quadrature_order, time_step, false, output,
           quadrature_workspace, "persistent-rank2-assembly", diagnostic);
       if (!assembled)
       {
@@ -8175,7 +8208,8 @@ bool PersistentRank2TrajectoryImplementation::AssembleTrueSystem(
 
 bool PersistentRank2TrajectoryImplementation::SolveTrueSystem(
     PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
-    int& iterations, double& residual_norm, double& rhs_norm) noexcept
+    int& iterations, double& residual_norm, double& rhs_norm,
+    const bool admit_exact_homogeneous) noexcept
 {
   iterations = -1;
   residual_norm = std::numeric_limits<double>::infinity();
@@ -8223,7 +8257,7 @@ bool PersistentRank2TrajectoryImplementation::SolveTrueSystem(
     const int query_status = HYPRE_GMRESGetConverged(
         static_cast<HYPRE_Solver>(*gmres), &converged);
     gmres->GetNumIterations(iterations);
-    local_valid = query_status == 0 && converged == 1 && iterations >= 0 &&
+    local_valid = query_status == 0 && iterations >= 0 &&
         iterations <= persistent_trace_maximum_iterations;
   }
   catch (...)
@@ -8268,8 +8302,12 @@ bool PersistentRank2TrajectoryImplementation::SolveTrueSystem(
                                      owner.communicator.value) == MPI_SUCCESS;
   residual_norm = std::sqrt(global_squares[0]);
   rhs_norm = std::sqrt(global_squares[1]);
+  const bool converged_or_exact_homogeneous = converged == 1 ||
+      (admit_exact_homogeneous && iterations == 0 && rhs_norm == 0.0 &&
+       residual_norm == 0.0);
   return CollectiveAll(owner.communicator.value,
-                       reduced && Finite(residual_norm) && Finite(rhs_norm) &&
+                       reduced && converged_or_exact_homogeneous &&
+                           Finite(residual_norm) && Finite(rhs_norm) &&
                            residual_norm <=
                                1.0e-14 + 1.0e-12 * rhs_norm);
 }
@@ -9231,7 +9269,8 @@ bool PersistentRank2TrajectoryImplementation::InitializeAuxiliary(
   {
     return false;
   }
-  if (!SolveTrueSystem(owner, iterations, residual_norm, rhs_norm))
+  if (!SolveTrueSystem(owner, iterations, residual_norm, rhs_norm,
+                       smooth_transition))
   {
     return false;
   }
@@ -9265,6 +9304,20 @@ bool PersistentRank2TrajectoryImplementation::InitializeAuxiliary(
     local_valid = false;
   }
   if (!CollectiveAll(owner.communicator.value, local_valid)) { return false; }
+
+  if (smooth_transition)
+  {
+    const auto zero = [](const auto& values)
+    {
+      return std::all_of(values.begin(), values.end(),
+                         [](const double value) { return value == 0.0; });
+    };
+    local_valid = zero(state.sigma) && zero(state.z) && zero(state.sigmahat);
+    if (!CollectiveAll(owner.communicator.value, local_valid)) { return false; }
+    std::fill(state.sigma.begin(), state.sigma.end(), 0.0);
+    std::fill(state.z.begin(), state.z.end(), 0.0);
+    std::fill(state.sigmahat.begin(), state.sigmahat.end(), 0.0);
+  }
 
   AuxiliaryResidualMetrics residual;
   if (!AuxiliaryResidualGate(owner, state, residual)) { return false; }
@@ -9521,10 +9574,10 @@ StateHash PersistentRank2TrajectoryImplementation::BoundaryHash(
   object(&pending_stage);
   object(&pending_stage.accepted_state);
   std::array<std::array<std::uint64_t, 3>,
-             persistent_required_steps + 1> stage_storage{};
+             persistent_rank2_maximum_steps + 1> stage_storage{};
   const auto stage_vectors = [&](const auto member)
   {
-    for (int stage_index = 0; stage_index < persistent_required_steps;
+    for (int stage_index = 0; stage_index < persistent_rank2_maximum_steps;
          ++stage_index)
     {
       const auto& values =
@@ -9580,7 +9633,7 @@ TrajectoryStatus PersistentRank2TrajectoryImplementation::ExecuteAttempt(
   attempt.injection = injection;
   attempt.target_step = static_cast<int>(evidence.coordinates.step) + 1;
   attempt.retry_index = retry_index;
-  attempt.dt = persistent_dt;
+  attempt.dt = time_step;
   attempt.committed_coordinates = evidence.coordinates;
   attempt.published_coordinates = evidence.coordinates;
   attempt.entry_hashes = HashRank2State(committed);
@@ -9874,7 +9927,8 @@ TrajectoryStatus PersistentRank2TrajectoryImplementation::Advance(
     PersistentSc25ScalarIgrCpuFoundation::Implementation& owner,
     const TrajectoryFailureInjection injection) noexcept
 {
-  if (!initialized || evidence.coordinates.step >= persistent_required_steps ||
+  if (!initialized || evidence.coordinates.step >=
+          static_cast<std::uint64_t>(required_steps) ||
       evidence.attempt_count >= static_cast<int>(evidence.attempts.size()) - 1)
   {
     status = TrajectoryStatus::invalid_configuration;
@@ -9918,7 +9972,7 @@ TrajectoryStatus PersistentRank2TrajectoryImplementation::Advance(
   }
 
   const int stage_index = static_cast<int>(evidence.coordinates.step);
-  if (stage_index < 0 || stage_index >= persistent_required_steps)
+  if (stage_index < 0 || stage_index >= required_steps)
   {
     status = TrajectoryStatus::HdgSc25PublicationFailure;
     evidence.status = status;
@@ -9931,11 +9985,11 @@ TrajectoryStatus PersistentRank2TrajectoryImplementation::Advance(
   pending_stage = {};
   pending_stage.accepted_state = std::move(pending_storage);
   const StateCoordinates next_coordinates{
-      evidence.coordinates.time + persistent_dt,
+      evidence.coordinates.time + time_step,
       evidence.coordinates.step + 1,
       evidence.coordinates.generation + 1,
       evidence.coordinates.cursor + 1,
-      persistent_dt};
+      time_step};
   pending_stage.accepted = true;
   pending_stage.step = static_cast<int>(next_coordinates.step);
   pending_stage.time = next_coordinates.time;
@@ -11101,6 +11155,21 @@ PersistentSc25ScalarIgrCpuFoundation::InitializePersistentRank2Trajectory()
   {
     return TrajectoryStatus::initialization_failure;
   }
+  const Rank2InitializationRequest initialization_request =
+      w8c_internal::ConsumeRank2InitializationRequest(*this);
+  if (initialization_request.owner != nullptr)
+  {
+    const bool admitted =
+        initialization_request.required_steps ==
+            static_cast<int>(w8c::SmoothTransitionV2Case::accepted_steps) &&
+        detail::DoubleBits(initialization_request.time_step) ==
+            detail::DoubleBits(w8c::SmoothTransitionV2Case::dt);
+    if (!CollectiveAll(implementation_->communicator.value, admitted))
+      return TrajectoryStatus::invalid_configuration;
+    trajectory->required_steps = initialization_request.required_steps;
+    trajectory->time_step = initialization_request.time_step;
+    trajectory->smooth_transition = true;
+  }
   const auto phase = [&](auto&& action)
   {
     bool phase_valid = true;
@@ -11170,7 +11239,7 @@ PersistentSc25ScalarIgrCpuFoundation::InitializePersistentRank2Trajectory()
               trajectory->direction.uhat.end(), 0.0);
     std::fill(trajectory->direction.sigmahat.begin(),
               trajectory->direction.sigmahat.end(), 0.0);
-    trajectory->evidence.coordinates = {0.0, 0, 0, 0, persistent_dt};
+    trajectory->evidence.coordinates = {0.0, 0, 0, 0, trajectory->time_step};
     std::uint64_t object_count = 0;
     std::uint64_t buffer_count = 0;
     trajectory->boundary_identity_hash =
@@ -11224,7 +11293,8 @@ PreparePersistentRank2TrajectoryTransaction(
       *implementation_->rank2_trajectory;
   if (trajectory.active_transaction_serial != 0 ||
       trajectory.next_transaction_serial == 0 ||
-      trajectory.evidence.coordinates.step >= persistent_required_steps)
+      trajectory.evidence.coordinates.step >=
+          static_cast<std::uint64_t>(trajectory.required_steps))
     return TrajectoryStatus::invalid_configuration;
 
   std::uint64_t prior_object_count = 0;
@@ -11493,7 +11563,7 @@ bool PersistentSc25ScalarIgrCpuFoundation::CaptureRank2TrajectoryCheckpoint(
     next.descriptor.layout = StableIdentity::Copy(interior_layout_id);
     next.descriptor.precision = StableIdentity::Copy("Fp64");
     next.descriptor.cursor = trajectory.evidence.coordinates.cursor;
-    next.descriptor.dt = persistent_dt;
+    next.descriptor.dt = trajectory.time_step;
     next.descriptor.coordinates = trajectory.evidence.coordinates;
     next.descriptor.coordinate_fingerprint = detail::CoordinateFingerprint(
         next.descriptor.coordinates);
@@ -11547,12 +11617,12 @@ bool PersistentSc25ScalarIgrCpuFoundation::ImportRank2TrajectoryCheckpoint(
   const PersistentRank2TrajectoryImplementation& trajectory =
       *implementation_->rank2_trajectory;
   const bool local_valid = coordinates.step > 0 &&
-      coordinates.step <= persistent_required_steps &&
+      coordinates.step <= static_cast<std::uint64_t>(trajectory.required_steps) &&
       coordinates.step == coordinates.generation &&
       coordinates.step == coordinates.cursor &&
       detail::DoubleBits(coordinates.time) ==
-          detail::DoubleBits(coordinates.step * persistent_dt) &&
-      detail::DoubleBits(coordinates.dt) == detail::DoubleBits(persistent_dt) &&
+          detail::DoubleBits(coordinates.step * trajectory.time_step) &&
+      detail::DoubleBits(coordinates.dt) == detail::DoubleBits(trajectory.time_step) &&
       Rank2StateStorageCompatible(state, trajectory.committed) &&
       Rank2Finite(state);
   if (!CollectiveAll(implementation_->communicator.value, local_valid))
@@ -11585,7 +11655,7 @@ bool PersistentSc25ScalarIgrCpuFoundation::ImportRank2TrajectoryCheckpoint(
     candidate.descriptor.layout = StableIdentity::Copy(interior_layout_id);
     candidate.descriptor.precision = StableIdentity::Copy("Fp64");
     candidate.descriptor.cursor = coordinates.cursor;
-    candidate.descriptor.dt = persistent_dt;
+    candidate.descriptor.dt = trajectory.time_step;
     candidate.descriptor.coordinates = coordinates;
     candidate.descriptor.coordinate_fingerprint =
         detail::CoordinateFingerprint(coordinates);
@@ -11693,17 +11763,17 @@ PersistentSc25ScalarIgrCpuFoundation::RestoreRank2TrajectoryCheckpoint(
       checkpoint.descriptor.cursor ==
           checkpoint.descriptor.coordinates.cursor &&
       detail::DoubleBits(checkpoint.descriptor.dt) ==
-          detail::DoubleBits(persistent_dt) &&
+          detail::DoubleBits(trajectory.time_step) &&
       checkpoint.descriptor.coordinates.step > 0 &&
       checkpoint.descriptor.coordinates.step ==
           checkpoint.descriptor.coordinates.generation &&
       checkpoint.descriptor.coordinates.step ==
           checkpoint.descriptor.coordinates.cursor &&
       detail::DoubleBits(checkpoint.descriptor.coordinates.dt) ==
-          detail::DoubleBits(persistent_dt) &&
+          detail::DoubleBits(trajectory.time_step) &&
       detail::DoubleBits(checkpoint.descriptor.coordinates.time) ==
           detail::DoubleBits(checkpoint.descriptor.coordinates.step *
-                             persistent_dt) &&
+                             trajectory.time_step) &&
       checkpoint.descriptor.coordinate_fingerprint ==
           detail::CoordinateFingerprint(checkpoint.descriptor.coordinates);
   if (!CollectiveAll(implementation_->communicator.value, local_identity))
