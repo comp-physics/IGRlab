@@ -659,14 +659,26 @@ if(HDG_RUNTIME_W8C_SMOOTH_RANK2)
     message(FATAL_ERROR "W8C scalar rank-two restart reader failed: ${reader_status};${reader_output};${reader_error}")
   endif()
   foreach(step IN ITEMS 000000 000032 000064)
-    execute_process(COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk
+    execute_process(COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}" --compare-scalar-vtk-w8c-rank2
                     "${serial_directory}/state-step-${step}.vtk"
                     "${rank2_directory}/state-step-${step}.vtk" 5e-11
                     RESULT_VARIABLE compare_status OUTPUT_VARIABLE compare_output ERROR_VARIABLE compare_error)
-    if(NOT compare_status EQUAL 0 OR NOT compare_output MATCHES "HDG scalar-IGR VTK parity PASS" OR NOT compare_error STREQUAL "")
+    if(NOT compare_status EQUAL 0 OR NOT compare_output MATCHES "HDG scalar-IGR W8C rank-two VTK parity PASS" OR NOT compare_error STREQUAL "")
       message(FATAL_ERROR "W8C serial/rank-two field-topology comparator failed at ${step}: ${compare_status};${compare_output};${compare_error}")
     endif()
   endforeach()
+  execute_process(COMMAND "${HDG_RUNTIME_SCALAR_VTK_TEST}"
+                  --compare-scalar-vtk-w8c-rank2
+                  "${rank2_directory}/state-step-000064.vtk"
+                  "${split_directory}/state-step-000064.vtk" 5e-11
+                  RESULT_VARIABLE split_compare_status
+                  OUTPUT_VARIABLE split_compare_output
+                  ERROR_VARIABLE split_compare_error)
+  if(NOT split_compare_status EQUAL 0 OR
+     NOT split_compare_output MATCHES "HDG scalar-IGR W8C rank-two VTK parity PASS" OR
+     NOT split_compare_error STREQUAL "")
+    message(FATAL_ERROR "W8C rank-two split-reader field-topology comparator failed: ${split_compare_status};${split_compare_output};${split_compare_error}")
+  endif()
   return()
 endif()
 

@@ -445,6 +445,14 @@ bool CheckW8cSmoothTransitionClosure()
                                 ApplicationRejection::unknown_backend,
                    "smooth_scalar_cpu_rank2_is_frozen") &&
         passed;
+    if (scalar)
+    {
+      rank2.scenario_id = "W8C-V2-N16-DT11";
+      passed = Check(ValidateApplicationOptions(rank2).rejection() ==
+                         ApplicationRejection::unknown_backend,
+                     "smooth_scalar_cpu_rank2_rejects_n16") &&
+          passed;
+    }
   }
   return passed;
 }

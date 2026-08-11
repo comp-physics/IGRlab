@@ -6924,6 +6924,8 @@ struct PersistentRank2TrajectoryImplementation final
   int required_steps = persistent_required_steps;
   double time_step = persistent_dt;
   bool smooth_transition = false;
+  std::size_t attempt_slot = 0;
+  std::size_t stage_slot = 0;
 
   bool InitializeStorage(
       PersistentSc25ScalarIgrCpuFoundation::Implementation& owner) noexcept;
@@ -9574,10 +9576,10 @@ StateHash PersistentRank2TrajectoryImplementation::BoundaryHash(
   object(&pending_stage);
   object(&pending_stage.accepted_state);
   std::array<std::array<std::uint64_t, 3>,
-             persistent_rank2_maximum_steps + 1> stage_storage{};
+             persistent_required_steps + 1> stage_storage{};
   const auto stage_vectors = [&](const auto member)
   {
-    for (int stage_index = 0; stage_index < persistent_rank2_maximum_steps;
+    for (int stage_index = 0; stage_index < persistent_required_steps;
          ++stage_index)
     {
       const auto& values =
@@ -9928,8 +9930,7 @@ TrajectoryStatus PersistentRank2TrajectoryImplementation::Advance(
     const TrajectoryFailureInjection injection) noexcept
 {
   if (!initialized || evidence.coordinates.step >=
-          static_cast<std::uint64_t>(required_steps) ||
-      evidence.attempt_count >= static_cast<int>(evidence.attempts.size()) - 1)
+          static_cast<std::uint64_t>(required_steps))
   {
     status = TrajectoryStatus::invalid_configuration;
     evidence.status = status;
@@ -9937,8 +9938,16 @@ TrajectoryStatus PersistentRank2TrajectoryImplementation::Advance(
   }
   const Rank2TrajectoryStateHashes before_hashes = HashRank2State(committed);
   ++evidence.attempted_steps;
-  Rank2TrajectoryAttemptEvidence& first =
-      evidence.attempts[static_cast<std::size_t>(evidence.attempt_count++)];
+  const auto next_attempt = [&]() -> Rank2TrajectoryAttemptEvidence&
+  {
+    Rank2TrajectoryAttemptEvidence& attempt = evidence.attempts[attempt_slot];
+    attempt_slot = (attempt_slot + 1) % evidence.attempts.size();
+    evidence.attempt_count = std::min(
+        evidence.attempt_count + 1,
+        static_cast<int>(evidence.attempts.size()));
+    return attempt;
+  };
+  Rank2TrajectoryAttemptEvidence& first = next_attempt();
   TrajectoryStatus result = CollectiveTrajectoryStatus(
       owner.communicator.value, ExecuteAttempt(owner, injection, 0, first));
   if (result != TrajectoryStatus::HdgSc25Accepted)
@@ -9954,8 +9963,7 @@ TrajectoryStatus PersistentRank2TrajectoryImplementation::Advance(
       return status;
     }
     ++evidence.retry_attempts;
-    Rank2TrajectoryAttemptEvidence& retry =
-        evidence.attempts[static_cast<std::size_t>(evidence.attempt_count++)];
+    Rank2TrajectoryAttemptEvidence& retry = next_attempt();
     result = CollectiveTrajectoryStatus(
         owner.communicator.value,
         ExecuteAttempt(owner, TrajectoryFailureInjection::none, 1, retry));
@@ -9979,7 +9987,9 @@ TrajectoryStatus PersistentRank2TrajectoryImplementation::Advance(
     return status;
   }
   Rank2TrajectoryAttemptEvidence& accepted_attempt =
-      evidence.attempts[static_cast<std::size_t>(evidence.attempt_count - 1)];
+      result == TrajectoryStatus::HdgSc25AcceptedAfterOneRetry ?
+          evidence.attempts[(attempt_slot + evidence.attempts.size() - 1) %
+                            evidence.attempts.size()] : first;
   PersistentRank2TrajectoryState pending_storage =
       std::move(pending_stage.accepted_state);
   pending_stage = {};
@@ -10079,12 +10089,14 @@ TrajectoryStatus PersistentRank2TrajectoryImplementation::Advance(
 
   using std::swap;
   swap(committed, candidate);
-  Rank2TrajectoryStageEvidence& stage =
-      evidence.stages[static_cast<std::size_t>(stage_index)];
+  Rank2TrajectoryStageEvidence& stage = evidence.stages[stage_slot];
+  stage_slot = (stage_slot + 1) % evidence.stages.size();
   swap(stage, pending_stage);
   evidence.coordinates = next_coordinates;
   ++evidence.accepted_steps;
-  evidence.step_evidence_count = stage_index + 1;
+  evidence.step_evidence_count = std::min(
+      evidence.step_evidence_count + 1,
+      static_cast<int>(evidence.stages.size()));
   accepted_attempt.published_coordinates = next_coordinates;
   accepted_attempt.published_hashes = accepted_attempt.candidate_hashes;
   status = result;
@@ -11886,6 +11898,8 @@ PersistentSc25ScalarIgrCpuFoundation::RestoreRank2TrajectoryCheckpoint(
   trajectory.evidence.retry_attempts = 0;
   trajectory.evidence.attempt_count = 0;
   trajectory.evidence.step_evidence_count = 0;
+  trajectory.attempt_slot = 0;
+  trajectory.stage_slot = 0;
   for (Rank2TrajectoryAttemptEvidence& attempt :
        trajectory.evidence.attempts)
   {

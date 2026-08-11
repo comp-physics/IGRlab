@@ -508,6 +508,7 @@ ApplicationRejection ValidateRoleControls(
   {
     const bool rank2_smooth_scalar = scalar &&
         options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
+        options.scenario_id == cpu::w8c::SmoothTransitionV2Case::scenario_id &&
         backend == ApplicationBackend::cpu_rank2;
     const bool focused =
         options.injection.mode == FailureInjectionModeV1::prescribed &&
@@ -733,6 +734,7 @@ ApplicationRejection ValidateW8c(
 {
   const bool rank2_smooth_scalar =
       options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
+      options.scenario_id == cpu::w8c::SmoothTransitionV2Case::scenario_id &&
       options.card_id == scalar_igr_sc25_v3_card_id &&
       backend == ApplicationBackend::cpu_rank2;
   if (backend != ApplicationBackend::cpu_serial && !rank2_smooth_scalar)
@@ -1093,6 +1095,8 @@ bool DeriveSplitWriterRunConfigHashV1(
   const bool w8c_rank2_retry = split_reader.scalar_igr() &&
       split_reader.case_id().view() ==
           cpu::w8c::SmoothTransitionV2Case::case_id &&
+      split_reader.scenario_id().view() ==
+          cpu::w8c::SmoothTransitionV2Case::scenario_id &&
       split_reader.backend() == ApplicationBackend::cpu_rank2;
   writer.injection = w8c_rank2_retry
       ? FailureInjectionControlV1{

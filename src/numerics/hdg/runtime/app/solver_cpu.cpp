@@ -2422,7 +2422,9 @@ ApplicationRunResult RunScalarIgrCpu(const ApplicationOptionsView& request,
   if constexpr (Rank2)
   {
     if (created && config.case_id().view() ==
-            cpu::w8c::SmoothTransitionV2Case::case_id)
+            cpu::w8c::SmoothTransitionV2Case::case_id &&
+        config.scenario_id().view() ==
+            cpu::w8c::SmoothTransitionV2Case::scenario_id)
       cpu::sc25::w8c_internal::RequestSmoothTransitionRank2Initialization(
           *owner);
   }
