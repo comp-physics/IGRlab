@@ -472,8 +472,8 @@ bool CheckW8cSmoothTransitionClosure()
   cuda_writer.injection = {
       FailureInjectionModeV1::prescribed,
       FailurePhase::AfterRecoveryBeforeCommit,
-      cpu::w8c::SmoothTransitionV2Case::failure_target_step, 1};
-  cuda_writer.retry_limit = cpu::w8c::retry_limit;
+      scalar_igr_sc25_v3_failure_target_step, 1};
+  cuda_writer.retry_limit = scalar_igr_sc25_v3_retry_limit;
   const ApplicationValidation cuda_reader_validation =
       ValidateApplicationOptions(SplitReader(cuda_rank2));
   StateHash cuda_writer_hash{};
