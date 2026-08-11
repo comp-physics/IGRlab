@@ -2539,6 +2539,12 @@ bool RestoreScalarCudaCheckpoint(
     return false;
   }
   ScalarCheckpoint checkpoint{};
+#if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
+  checkpoint.scenario = StableIdentity::Copy(
+      config.case_id().view() == "periodic-smooth-transition-v2"
+          ? scalar::cuda_rank2_smooth_transition_fixture_id
+          : scalar::cuda_rank2_fixture_id);
+#endif
   const bool sealed = SealScalarCheckpoint(
       checkpoint, state, sidecar.ranks[static_cast<std::size_t>(context.rank())],
       context);
