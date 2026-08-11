@@ -2879,6 +2879,11 @@ ApplicationRunResult RunScalarIgrCuda(
   numerical.polynomial_degree = config.polynomial_order();
   numerical.elements_per_direction = static_cast<int>(config.mesh_n());
   numerical.requested_device = config.device_id();
+#if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
+  numerical.lifecycle = config.case_id().view() == "periodic-smooth-transition-v2"
+      ? scalar::ScalarCudaLifecycle::w8c_smooth_transition_v2
+      : scalar::ScalarCudaLifecycle::sc25_periodic_v3;
+#endif
   std::unique_ptr<ScalarOwner> owner;
   const bool initialized =
       ScalarOwner::Create(context.communicator(), numerical, owner) ==
