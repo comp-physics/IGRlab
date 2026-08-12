@@ -208,41 +208,6 @@ struct CudaPolicyContext
   CudaFailurePhase phase = CudaFailurePhase::setup;
 };
 
-/** Fixed-schema production transfer event; no pointer conveys authority. */
-struct TransferEventV1
-{
-  std::uint64_t ordinal = 0;
-  CudaTransferDirection direction = CudaTransferDirection::host_to_device;
-  CudaTransferCategory category = CudaTransferCategory::topology;
-  CudaTransferSite site = CudaTransferSite::topology_upload;
-  CudaPolicyContext context{};
-  std::uint64_t bytes = 0;
-  std::uintptr_t source_token = 0;
-  std::uintptr_t destination_token = 0;
-  std::uint64_t source_capacity = 0;
-  std::uint64_t destination_capacity = 0;
-  std::uint64_t endpoint_token = 0;
-  bool success = false;
-};
-
-/** Fixed-schema production allocation event. */
-struct AllocationEventV1
-{
-  std::uint64_t ordinal = 0;
-  CudaAllocationSite site = CudaAllocationSite::persistent_double_arena;
-  CudaPolicyContext context{};
-  std::uint64_t bytes = 0;
-  std::uint64_t alignment = 0;
-  std::uint64_t capacity = 0;
-  std::uintptr_t storage_token = 0;
-  std::uint64_t generation = 0;
-  bool allocation = true;
-  bool success = false;
-};
-
-using CudaTransferEvent = TransferEventV1;
-using CudaAllocationEvent = AllocationEventV1;
-
 struct CudaDeviceTicket
 {
   CudaFailurePhase phase = CudaFailurePhase::setup;
@@ -308,13 +273,8 @@ struct CudaTransferTotals
 struct CudaTransferLedgerV1
 {
   std::uint32_t schema = 1;
-  std::uint32_t capacity = maximum_transfer_events;
   CudaTransferTotals totals{};
-  std::array<TransferEventV1, maximum_transfer_events> events{};
-  /** Number retained in events; never exceeds events.size(). */
-  std::size_t count = 0;
   std::uint64_t observed_count = 0;
-  std::uint64_t dropped_count = 0;
   std::uint64_t ordered_digest = 1469598103934665603ULL;
   bool overflow = false;
 };
@@ -322,11 +282,7 @@ struct CudaTransferLedgerV1
 struct CudaAllocationLedgerV1
 {
   std::uint32_t schema = 1;
-  std::uint32_t capacity = maximum_allocation_events;
-  std::array<AllocationEventV1, maximum_allocation_events> events{};
-  std::size_t count = 0;
   std::uint64_t observed_count = 0;
-  std::uint64_t dropped_count = 0;
   std::uint64_t ordered_digest = 1469598103934665603ULL;
   bool overflow = false;
 };
@@ -609,13 +565,9 @@ struct CudaFutureSharedAbiRequest
 static_assert(std::is_standard_layout<CudaOraclePod>::value &&
                   std::is_trivially_copyable<CudaOraclePod>::value,
               "independent CUDA oracle seam must remain POD");
-static_assert(std::is_standard_layout<TransferEventV1>::value &&
-                  std::is_trivially_copyable<TransferEventV1>::value &&
-                  std::is_standard_layout<AllocationEventV1>::value &&
-                  std::is_trivially_copyable<AllocationEventV1>::value &&
-                  std::is_standard_layout<CudaSerializedCheckpointV1>::value &&
+static_assert(std::is_standard_layout<CudaSerializedCheckpointV1>::value &&
                   std::is_trivially_copyable<CudaSerializedCheckpointV1>::value,
-              "CUDA accounting and checkpoint schemas must remain POD");
+              "CUDA checkpoint schema must remain POD");
 static_assert(!std::is_polymorphic<CudaConfig>::value &&
                   !std::is_polymorphic<CudaRunEvidence>::value,
               "CUDA W8A runtime values must use static dispatch");

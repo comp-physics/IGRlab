@@ -277,21 +277,6 @@ struct ScalarCudaReuseEvidence final
   bool unchanged = false;
 };
 
-struct ScalarCudaNewtonEvidence final
-{
-  int iteration = -1;
-  double entry_residual_norm = 0.0;
-  double accepted_residual_norm = 0.0;
-  int accepted_line_search_index = -1;
-  int trace_iterations = -1;
-  double trace_true_residual_norm = 0.0;
-  double trace_right_hand_side_norm = 0.0;
-  double maximum_local_application_residual = 0.0;
-  std::array<double, line_search_trials> trial_residual_norms{};
-  std::array<std::uint8_t, line_search_trials> trial_admissible{};
-  std::array<std::uint8_t, line_search_trials> trial_armijo{};
-};
-
 struct ScalarCudaAttemptEvidence final
 {
   ScalarCudaStatus status = ScalarCudaStatus::uninitialized;
@@ -306,6 +291,12 @@ struct ScalarCudaAttemptEvidence final
   double final_residual_norm = 0.0;
   double nonlinear_residual_bound = 0.0;
   double maximum_conservation_error = 0.0;
+  int maximum_trace_iterations = 0;
+  int accepted_line_search_index = -1;
+  int terminal_trial_count = 0;
+  double maximum_trace_true_residual = 0.0;
+  double maximum_trace_right_hand_side = 0.0;
+  double maximum_local_application_residual = 0.0;
   double minimum_density = 0.0;
   double minimum_pressure = 0.0;
   double minimum_speed_margin = 0.0;
@@ -313,7 +304,6 @@ struct ScalarCudaAttemptEvidence final
   StateCoordinates candidate_coordinates{};
   StateHashes entry_hashes{};
   StateHashes candidate_hashes{};
-  std::array<ScalarCudaNewtonEvidence, newton_maximum_iterations> newton{};
 };
 
 struct ScalarCudaStepEvidence final
@@ -334,9 +324,18 @@ struct ScalarCudaEvidence final
   ScalarCudaStatus first_failure = ScalarCudaStatus::uninitialized;
   int accepted_steps = 0;
   int attempted_steps = 0;
+  int rejected_steps = 0;
   int retry_attempts = 0;
-  int attempt_count = 0;
-  int step_evidence_count = 0;
+  int maximum_attempted_newton_iterations = 0;
+  int maximum_newton_iterations = 0;
+  int maximum_trace_iterations = 0;
+  double minimum_density = std::numeric_limits<double>::infinity();
+  double minimum_pressure = std::numeric_limits<double>::infinity();
+  double minimum_speed_margin = std::numeric_limits<double>::infinity();
+  double maximum_conservation_error = 0.0;
+  double maximum_nonlinear_residual_ratio = 0.0;
+  double maximum_trace_residual_ratio = 0.0;
+  double maximum_local_application_residual_ratio = 0.0;
   int trace_restart = 0;
   int trace_maximum_iterations = 0;
   double trace_relative_tolerance = 0.0;
@@ -349,11 +348,11 @@ struct ScalarCudaEvidence final
   ScalarCudaAllocationEvidence allocations{};
   ScalarCudaReuseEvidence reuse{};
   ScalarCudaLaunchLedger launches{};
-  cuda_w8a::CudaTransferLedgerV1 transfers{};
-  cuda_w8a::CudaAllocationLedgerV1 allocation_ledger{};
-  std::array<ScalarCudaAttemptEvidence, persistent_required_steps + 4>
-      attempts{};
-  std::array<ScalarCudaStepEvidence, persistent_required_steps> steps{};
+  cuda_w8a::CudaTransferTotals transfer_totals{};
+  ScalarCudaAttemptEvidence first_failed_attempt{};
+  ScalarCudaAttemptEvidence last_attempt{};
+  ScalarCudaAttemptEvidence last_accepted_attempt{};
+  ScalarCudaStepEvidence last_accepted_step{};
 };
 
 struct ScalarCudaOperatorEvidence final
@@ -456,8 +455,6 @@ public:
   const ScalarCudaOperatorEvidence& operator_evidence() const noexcept;
   const ScalarCudaEvidence& trajectory_evidence() const noexcept;
   ScalarCudaReuseEvidence reuse_evidence() const noexcept;
-  cuda_w8a::CudaTransferLedgerV1 transfer_ledger() const noexcept;
-  cuda_w8a::CudaAllocationLedgerV1 allocation_ledger() const noexcept;
 
 private:
   ScalarCudaStatus PreparePersistentTrajectoryTransactionImpl(

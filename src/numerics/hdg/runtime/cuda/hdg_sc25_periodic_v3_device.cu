@@ -3431,31 +3431,22 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
   bool WriteProspectiveEvidence(ScalarCudaEvidence& output) const noexcept
   {
     if (!pending_attempt_active || active_transaction_serial == 0 ||
-        !active_installed ||
-        evidence.attempt_count < 0 ||
-        evidence.attempt_count >= static_cast<int>(evidence.attempts.size()) ||
-        evidence.step_evidence_count < 0 ||
-        evidence.step_evidence_count >=
-            static_cast<int>(evidence.steps.size()))
+        !active_installed)
     {
       return false;
     }
     output = evidence;
-    ScalarCudaAttemptEvidence accepted_attempt = pending_attempt;
-    accepted_attempt.status = transaction_installed_after_retry
+    output.last_accepted_attempt = pending_attempt;
+    output.last_accepted_attempt.status = transaction_installed_after_retry
         ? ScalarCudaStatus::accepted_after_one_retry
         : ScalarCudaStatus::accepted;
-    accepted_attempt.failure_cause = ScalarCudaFailureCause::none;
-    ScalarCudaStepEvidence accepted_step = pending_step;
-    accepted_step.attempt_index = output.attempt_count;
-    output.attempts[static_cast<std::size_t>(output.attempt_count++)] =
-        accepted_attempt;
-    output.steps[static_cast<std::size_t>(output.step_evidence_count++)] =
-        accepted_step;
+    output.last_accepted_attempt.failure_cause = ScalarCudaFailureCause::none;
+    output.last_attempt = output.last_accepted_attempt;
+    output.last_accepted_step = pending_step;
     ++output.accepted_steps;
     ++output.attempted_steps;
-    output.coordinates = pending_attempt.candidate_coordinates;
-    output.status = accepted_attempt.status;
+    output.coordinates = output.last_accepted_attempt.candidate_coordinates;
+    output.status = output.last_accepted_attempt.status;
     return true;
   }
 
@@ -3466,16 +3457,13 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
     const ScalarCudaAllocationEvidence allocations = evidence.allocations;
     const ScalarCudaReuseEvidence reuse = evidence.reuse;
     const ScalarCudaLaunchLedger launches = evidence.launches;
-    const cuda_w8a::CudaTransferLedgerV1 transfers = evidence.transfers;
-    const cuda_w8a::CudaAllocationLedgerV1 allocation_ledger =
-        evidence.allocation_ledger;
+    const cuda_w8a::CudaTransferTotals transfers = evidence.transfer_totals;
     evidence = transaction_prior_evidence;
     evidence.residency = residency;
     evidence.allocations = allocations;
     evidence.reuse = reuse;
     evidence.launches = launches;
-    evidence.transfers = transfers;
-    evidence.allocation_ledger = allocation_ledger;
+    evidence.transfer_totals = transfers;
   }
 
   void RefreshExposedPriorEvidence() noexcept
@@ -3485,17 +3473,13 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
     transaction_prior_evidence.allocations = evidence.allocations;
     transaction_prior_evidence.reuse = evidence.reuse;
     transaction_prior_evidence.launches = evidence.launches;
-    transaction_prior_evidence.transfers = evidence.transfers;
-    transaction_prior_evidence.allocation_ledger =
-        evidence.allocation_ledger;
+    transaction_prior_evidence.transfer_totals = evidence.transfer_totals;
   }
 
   void RefreshLedgers() noexcept
   {
     ObserveResidency();
-    evidence.transfers = cuda_w8a::CudaTransportPolicy::Ledger();
-    evidence.allocation_ledger =
-        cuda_w8a::UmpireDeviceAllocatorPolicy::Ledger();
+    evidence.transfer_totals = cuda_w8a::CudaTransportPolicy::Accounting();
     evidence.allocations.current_observed_events =
         cuda_w8a::UmpireDeviceAllocatorPolicy::AllocationEvents();
     evidence.allocations.current_owned_calls =
@@ -3543,12 +3527,26 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
           ? ScalarCudaFailureCause::publication
           : ScalarCudaFailureCause::transfer;
     }
-    if (evidence.attempt_count < static_cast<int>(evidence.attempts.size()))
-    {
-      evidence.attempts[static_cast<std::size_t>(evidence.attempt_count++)] =
-          pending_attempt;
-    }
+    evidence.last_attempt = pending_attempt;
+    if (evidence.first_failed_attempt.status == ScalarCudaStatus::uninitialized)
+      evidence.first_failed_attempt = pending_attempt;
     ++evidence.attempted_steps;
+    ++evidence.rejected_steps;
+    evidence.maximum_attempted_newton_iterations = std::max(
+        evidence.maximum_attempted_newton_iterations,
+        pending_attempt.attempted_newton_iterations);
+    evidence.maximum_newton_iterations = std::max(
+        evidence.maximum_newton_iterations, pending_attempt.newton_iterations);
+    evidence.maximum_trace_iterations = std::max(
+        evidence.maximum_trace_iterations, pending_attempt.maximum_trace_iterations);
+    evidence.minimum_density = std::min(
+        evidence.minimum_density, pending_attempt.minimum_density);
+    evidence.minimum_pressure = std::min(
+        evidence.minimum_pressure, pending_attempt.minimum_pressure);
+    evidence.minimum_speed_margin = std::min(
+        evidence.minimum_speed_margin, pending_attempt.minimum_speed_margin);
+    evidence.maximum_conservation_error = std::max(
+        evidence.maximum_conservation_error, pending_attempt.maximum_conservation_error);
     if (first_failure == ScalarCudaStatus::uninitialized)
     {
       first_failure = failure;
@@ -4018,23 +4016,22 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank1::
       value.pending_attempt.failure_cause = ScalarCudaFailureCause::transfer;
       break;
     }
-    ScalarCudaNewtonEvidence& newton =
-        value.pending_attempt.newton[static_cast<std::size_t>(iteration)];
-    newton.iteration = iteration;
-    newton.entry_residual_norm = residual_norm;
-    newton.trace_iterations = trace_iterations;
-    newton.trace_true_residual_norm = trace_residual;
-    newton.trace_right_hand_side_norm = trace_rhs;
-    newton.maximum_local_application_residual = solve_metrics[4];
-    newton.trial_residual_norms.fill(
-        std::numeric_limits<double>::infinity());
+    value.pending_attempt.maximum_trace_iterations = std::max(
+        value.pending_attempt.maximum_trace_iterations, trace_iterations);
+    value.pending_attempt.maximum_trace_true_residual = std::max(
+        value.pending_attempt.maximum_trace_true_residual, trace_residual);
+    value.pending_attempt.maximum_trace_right_hand_side = std::max(
+        value.pending_attempt.maximum_trace_right_hand_side, trace_rhs);
+    value.pending_attempt.maximum_local_application_residual = std::max(
+        value.pending_attempt.maximum_local_application_residual,
+        solve_metrics[4]);
     bool accepted = false;
     for (int line = 0; line < line_search_trials; ++line)
     {
       const double theta = std::ldexp(1.0, -line);
       if (injection == FailureInjection::admissibility)
       {
-        newton.trial_admissible[static_cast<std::size_t>(line)] = 0;
+        value.pending_attempt.terminal_trial_count = line + 1;
         value.pending_attempt.failure_cause =
             ScalarCudaFailureCause::injected_admissibility;
         continue;
@@ -4054,7 +4051,7 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank1::
       {
         if (value.LastDeviceFailureIsAdmissibility())
         {
-          newton.trial_admissible[static_cast<std::size_t>(line)] = 0;
+          value.pending_attempt.terminal_trial_count = line + 1;
           continue;
         }
         failure = value.LastAssemblyFailureStatus();
@@ -4070,11 +4067,9 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank1::
         break;
       }
       const double trial_norm = trial_metrics[0];
-      newton.trial_residual_norms[static_cast<std::size_t>(line)] = trial_norm;
-      newton.trial_admissible[static_cast<std::size_t>(line)] = 1;
+      value.pending_attempt.terminal_trial_count = line + 1;
       const bool armijo = std::isfinite(trial_norm) &&
           trial_norm <= (1.0 - armijo_coefficient * theta) * residual_norm;
-      newton.trial_armijo[static_cast<std::size_t>(line)] = armijo ? 1 : 0;
       if (armijo)
       {
         value.view.selected_current_slot = candidate_slot;
@@ -4086,8 +4081,7 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank1::
               value.LastDeviceFailureCause();
           break;
         }
-        newton.accepted_line_search_index = line;
-        newton.accepted_residual_norm = trial_norm;
+        value.pending_attempt.accepted_line_search_index = line;
         accepted = true;
         break;
       }
@@ -4261,13 +4255,7 @@ bool PersistentSc25ScalarIgrCudaRank1::
       token.candidate_slot_ != value.active_candidate_slot ||
       !token.installed_ || !value.active_installed ||
       !SameCoordinates(token.target_,
-                       value.pending_attempt.candidate_coordinates) ||
-      value.evidence.attempt_count < 0 ||
-      value.evidence.attempt_count >=
-          static_cast<int>(value.evidence.attempts.size()) ||
-      value.evidence.step_evidence_count < 0 ||
-      value.evidence.step_evidence_count >=
-          static_cast<int>(value.evidence.steps.size()))
+                       value.pending_attempt.candidate_coordinates))
   {
     return false;
   }
@@ -4325,12 +4313,6 @@ bool PersistentSc25ScalarIgrCudaRank1::
       token.serial_ != observed.active_transaction_serial ||
       token.candidate_slot_ != observed.active_candidate_slot ||
       !token.installed_ || !observed.active_installed ||
-      observed.evidence.attempt_count < 0 ||
-      observed.evidence.attempt_count >=
-          static_cast<int>(observed.evidence.attempts.size()) ||
-      observed.evidence.step_evidence_count < 0 ||
-      observed.evidence.step_evidence_count >=
-          static_cast<int>(observed.evidence.steps.size()) ||
       !SameCoordinates(token.target_,
                        observed.pending_attempt.candidate_coordinates))
   {
@@ -4340,15 +4322,46 @@ bool PersistentSc25ScalarIgrCudaRank1::
   value.pending_attempt.status = value.transaction_installed_after_retry
       ? ScalarCudaStatus::accepted_after_one_retry
       : ScalarCudaStatus::accepted;
-  value.pending_step.attempt_index = value.evidence.attempt_count;
-  value.evidence.attempts[
-      static_cast<std::size_t>(value.evidence.attempt_count++)] =
-      value.pending_attempt;
-  value.evidence.steps[
-      static_cast<std::size_t>(value.evidence.step_evidence_count++)] =
-      value.pending_step;
+  value.evidence.last_accepted_attempt = value.pending_attempt;
+  value.evidence.last_attempt = value.pending_attempt;
+  value.evidence.last_accepted_step = value.pending_step;
   ++value.evidence.accepted_steps;
   ++value.evidence.attempted_steps;
+  value.evidence.maximum_attempted_newton_iterations = std::max(
+      value.evidence.maximum_attempted_newton_iterations,
+      value.pending_attempt.attempted_newton_iterations);
+  value.evidence.maximum_newton_iterations = std::max(
+      value.evidence.maximum_newton_iterations,
+      value.pending_attempt.newton_iterations);
+  value.evidence.maximum_trace_iterations = std::max(
+      value.evidence.maximum_trace_iterations,
+      value.pending_attempt.maximum_trace_iterations);
+  value.evidence.minimum_density = std::min(
+      value.evidence.minimum_density, value.pending_attempt.minimum_density);
+  value.evidence.minimum_pressure = std::min(
+      value.evidence.minimum_pressure, value.pending_attempt.minimum_pressure);
+  value.evidence.minimum_speed_margin = std::min(
+      value.evidence.minimum_speed_margin,
+      value.pending_attempt.minimum_speed_margin);
+  value.evidence.maximum_conservation_error = std::max(
+      value.evidence.maximum_conservation_error,
+      value.pending_attempt.maximum_conservation_error);
+  const double trace_bound = std::max(
+      value.evidence.trace_absolute_tolerance,
+      value.evidence.trace_relative_tolerance *
+          value.pending_attempt.maximum_trace_right_hand_side);
+  if (trace_bound > 0.0)
+    value.evidence.maximum_trace_residual_ratio = std::max(
+        value.evidence.maximum_trace_residual_ratio,
+        value.pending_attempt.maximum_trace_true_residual / trace_bound);
+  if (value.pending_attempt.nonlinear_residual_bound > 0.0)
+    value.evidence.maximum_nonlinear_residual_ratio = std::max(
+        value.evidence.maximum_nonlinear_residual_ratio,
+        value.pending_attempt.final_residual_norm /
+            value.pending_attempt.nonlinear_residual_bound);
+  value.evidence.maximum_local_application_residual_ratio = std::max(
+      value.evidence.maximum_local_application_residual_ratio,
+      value.pending_attempt.maximum_local_application_residual);
   value.evidence.coordinates = token.target_;
   value.evidence.status = value.pending_attempt.status;
   value.committed_slot = token.candidate_slot_;
@@ -4612,11 +4625,7 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank1::
       static_cast<int>(descriptor.coordinates.step);
   value.evidence.attempted_steps = 0;
   value.evidence.retry_attempts = 0;
-  value.evidence.attempt_count = 0;
-  value.evidence.step_evidence_count = 0;
   value.evidence.coordinates = value.coordinates;
-  value.evidence.attempts = {};
-  value.evidence.steps = {};
   value.pending_attempt = {};
   value.pending_step = {};
   value.pending_attempt_active = false;
@@ -4877,18 +4886,6 @@ PersistentSc25ScalarIgrCudaRank1::reuse_evidence() const noexcept
   }
   implementation_->RefreshLedgers();
   return implementation_->evidence.reuse;
-}
-
-cuda_w8a::CudaTransferLedgerV1
-PersistentSc25ScalarIgrCudaRank1::transfer_ledger() const noexcept
-{
-  return cuda_w8a::CudaTransportPolicy::Ledger();
-}
-
-cuda_w8a::CudaAllocationLedgerV1
-PersistentSc25ScalarIgrCudaRank1::allocation_ledger() const noexcept
-{
-  return cuda_w8a::UmpireDeviceAllocatorPolicy::Ledger();
 }
 
 } // namespace dg::hdg::runtime::cuda_w8b::sc25

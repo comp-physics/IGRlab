@@ -2662,34 +2662,14 @@ std::string ScalarCudaMetadata(
   const std::uint64_t physical_cuda_transfers =
       evidence.transfer_totals.event_count;
 #else
-  double maximum_conservation = 0.0;
-  double minimum_density = std::numeric_limits<double>::infinity();
-  double minimum_pressure = std::numeric_limits<double>::infinity();
-  double minimum_speed_margin = std::numeric_limits<double>::infinity();
-  bool trace_residual_gate = true;
-  for (int attempt_index = 0; attempt_index < evidence.attempt_count;
-       ++attempt_index)
-  {
-    const auto& attempt = evidence.attempts[
-        static_cast<std::size_t>(attempt_index)];
-    maximum_conservation = std::max(
-        maximum_conservation, attempt.maximum_conservation_error);
-    minimum_density = std::min(minimum_density, attempt.minimum_density);
-    minimum_pressure = std::min(minimum_pressure, attempt.minimum_pressure);
-    minimum_speed_margin = std::min(
-        minimum_speed_margin, attempt.minimum_speed_margin);
-    for (int iteration = 0; iteration < attempt.newton_iterations; ++iteration)
-    {
-      const auto& newton = attempt.newton[static_cast<std::size_t>(iteration)];
-      const double bound = std::max(
-          evidence.trace_absolute_tolerance,
-          evidence.trace_relative_tolerance *
-              newton.trace_right_hand_side_norm);
-      trace_residual_gate = trace_residual_gate &&
-          newton.trace_true_residual_norm <= bound;
-    }
-  }
-  const std::uint64_t physical_cuda_transfers = evidence.transfers.count;
+  const double maximum_conservation = evidence.maximum_conservation_error;
+  const double minimum_density = evidence.minimum_density;
+  const double minimum_pressure = evidence.minimum_pressure;
+  const double minimum_speed_margin = evidence.minimum_speed_margin;
+  const bool trace_residual_gate =
+      evidence.maximum_trace_residual_ratio <= 1.0;
+  const std::uint64_t physical_cuda_transfers =
+      evidence.transfer_totals.event_count;
 #endif
   const bool residency = evidence.residency.mfem_cuda_device &&
       evidence.residency.hypre_cuda && evidence.residency.umpire_device_pool &&
