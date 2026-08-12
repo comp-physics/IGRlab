@@ -1391,10 +1391,34 @@ make_mfem_source_fixture() {
   local label="$1"
   local source_root="$2"
   local fixture="${DG_IGR_REUSE_FIXTURE_ROOT}/${label}"
+  local source_stamp fixture_build fixture_stamp
+
   git -c advice.detachedHead=false clone --quiet --shared \
     "${source_root}" "${fixture}"
   git -c advice.detachedHead=false -C "${fixture}" checkout --quiet \
     --detach "$(git -C "${source_root}" rev-parse HEAD)"
+
+  source_stamp="${source_root}/${MFEM_BUILD_NAME}/${MFEM_IDENTITY_STAMP_NAME}"
+  fixture_build="${fixture}/${MFEM_BUILD_NAME}"
+  fixture_stamp="${fixture_build}/${MFEM_IDENTITY_STAMP_NAME}"
+  require_exact_mfem_file \
+    "${source_stamp}" "source MFEM identity stamp for reuse fixture"
+  mkdir -p -- "${fixture_build}" || {
+    echo "ERROR: unable to create the reuse fixture MFEM build directory: ${fixture_build}" >&2
+    exit 3
+  }
+  require_exact_mfem_directory \
+    "${fixture_build}" "reuse fixture MFEM build directory"
+  [[ ! -e "${fixture_stamp}" && ! -L "${fixture_stamp}" ]] || {
+    echo "ERROR: reuse fixture MFEM identity stamp already exists: ${fixture_stamp}" >&2
+    exit 3
+  }
+  if ! cp -- "${source_stamp}" "${fixture_stamp}"; then
+    echo "ERROR: unable to copy the MFEM identity stamp into the reuse fixture: ${fixture_stamp}" >&2
+    exit 3
+  fi
+  require_exact_mfem_file \
+    "${fixture_stamp}" "reuse fixture MFEM identity stamp after copy"
   DG_IGR_REUSE_FIXTURE="${fixture}"
 }
 
