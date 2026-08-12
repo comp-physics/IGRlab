@@ -62,7 +62,11 @@ bool RunC1()
       evidence.launches.fallback_calls == 0 &&
       evidence.launches.last_compiled_architecture == 1200 &&
       evidence.launches.all_launches_completed;
-  return All(valid);
+  const bool passed = All(valid);
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if (passed && rank == 0) { std::cout << "SC25_CUDA_RANK1_C1_PASS\n"; }
+  return passed;
 }
 
 bool RunC2()
@@ -166,7 +170,11 @@ bool RunC2()
       std::isfinite(audit.minimum_density) && std::isfinite(audit.minimum_pressure) &&
       std::isfinite(audit.minimum_speed_margin) &&
       sizeof(scalar::ScalarCudaEvidence) < 4096;
-  return All(compact);
+  const bool passed = All(compact);
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if (passed && rank == 0) { std::cout << "SC25_CUDA_RANK1_C2_PASS\n"; }
+  return passed;
 }
 } // namespace
 
