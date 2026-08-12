@@ -93,13 +93,13 @@ inline bool AuditPublishedState(
         mfem::BasisType::GaussLegendre);
     mfem::ParFiniteElementSpace volume_space(
         &mesh, &volume_collection, 1, mfem::Ordering::byNODES);
-    mfem::ParFiniteElementSpace trace_space(
-        &mesh, &trace_collection, scalar::trace_components,
+    mfem::ParFiniteElementSpace uhat_space(
+        &mesh, &trace_collection, scalar::state_components,
         mfem::Ordering::byNODES);
     if (mesh.GetNE() != scalar::persistent_elements ||
         volume_space.GetVSize() !=
             scalar::persistent_elements * scalar::volume_nodes ||
-        trace_space.GetTrueVSize() != scalar::persistent_trace_unknowns)
+        uhat_space.GetTrueVSize() != scalar::persistent_uhat_unknowns)
       return false;
 
     for (int element = 0; element < mesh.GetNE(); ++element)
@@ -143,14 +143,14 @@ inline bool AuditPublishedState(
     {
       mfem::FaceElementTransformations* face_transformations =
           mesh.GetFaceElementTransformations(face);
-      const mfem::FiniteElement* face_element = trace_space.GetFaceElement(face);
+      const mfem::FiniteElement* face_element = uhat_space.GetFaceElement(face);
       mfem::Array<int> face_vdofs;
-      trace_space.GetFaceVDofs(face, face_vdofs);
+      uhat_space.GetFaceVDofs(face, face_vdofs);
       if (face_transformations == nullptr ||
           face_transformations->Face == nullptr || face_element == nullptr ||
           face_element->GetDof() != scalar::face_nodes ||
           face_vdofs.Size() !=
-              scalar::trace_components * scalar::face_nodes)
+              scalar::state_components * scalar::face_nodes)
         return false;
       mfem::Vector face_shape(scalar::face_nodes);
       for (int point = 0; point < face_rule.GetNPoints(); ++point)
@@ -166,7 +166,7 @@ inline bool AuditPublishedState(
                 component * scalar::face_nodes + node];
             const int sign = encoded < 0 ? -1 : 1;
             const int local_dof = encoded < 0 ? -1 - encoded : encoded;
-            const int true_dof = trace_space.GetLocalTDofNumber(local_dof);
+            const int true_dof = uhat_space.GetLocalTDofNumber(local_dof);
             if (true_dof < 0 || true_dof >=
                     static_cast<int>(state.uhat.size()))
               return false;
