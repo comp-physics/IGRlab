@@ -156,7 +156,8 @@ bool FinalConventionalUpdateRejectedEveryTrial(
       !attempt.admissibility_gate && attempt.work.complete_assemblies > 0 &&
       attempt.final_line_search_trials ==
           cpu::cpu_maximum_line_search_trials &&
-      attempt.work.trial_reassemblies == 0 &&
+      attempt.work.trial_reassemblies ==
+          attempt.work.accepted_newton_updates &&
       attempt.work.complete_condensations >=
           attempt.work.accepted_newton_updates &&
       attempt.work.complete_factor_setups ==
