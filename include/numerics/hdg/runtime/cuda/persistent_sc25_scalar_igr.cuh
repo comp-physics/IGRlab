@@ -297,9 +297,9 @@ struct ScalarCudaAttemptEvidence final
   double maximum_trace_true_residual = 0.0;
   double maximum_trace_right_hand_side = 0.0;
   double maximum_local_application_residual = 0.0;
-  double minimum_density = 0.0;
-  double minimum_pressure = 0.0;
-  double minimum_speed_margin = 0.0;
+  double minimum_density = std::numeric_limits<double>::infinity();
+  double minimum_pressure = std::numeric_limits<double>::infinity();
+  double minimum_speed_margin = std::numeric_limits<double>::infinity();
   StateCoordinates committed_coordinates{};
   StateCoordinates candidate_coordinates{};
   StateHashes entry_hashes{};

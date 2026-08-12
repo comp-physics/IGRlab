@@ -76,9 +76,94 @@ bool RunC2()
       scalar::ScalarCudaStatus::ready)
     return false;
   scalar::PublishedState initial{};
-  if (!owner->CopyPublishedTrajectoryState(initial) ||
-      owner->AdvancePersistentTrajectory() != scalar::ScalarCudaStatus::accepted)
+  if (!owner->CopyPublishedTrajectoryState(initial)) return false;
+
+  const scalar::ScalarCudaEvidence live_before_stage =
+      owner->trajectory_evidence();
+  scalar::PersistentSc25ScalarIgrCudaRank1::Transaction staged{};
+  scalar::ScalarCudaCheckpoint staged_checkpoint{};
+  scalar::ScalarCudaEvidence prospective{};
+  if (owner->PreparePersistentTrajectoryTransaction(staged) !=
+          scalar::ScalarCudaStatus::accepted ||
+      !owner->InstallPersistentTrajectoryTransaction(staged) ||
+      !owner->StageInstalledTrajectoryTransaction(
+          staged, staged_checkpoint, prospective))
     return false;
+  const auto& live_during_stage = owner->trajectory_evidence();
+  const bool staged_metrics =
+      staged_checkpoint.descriptor.coordinates.step == 1 &&
+      prospective.status == scalar::ScalarCudaStatus::accepted &&
+      prospective.accepted_steps == 1 && prospective.attempted_steps == 1 &&
+      prospective.rejected_steps == 0 && prospective.retry_attempts == 0 &&
+      prospective.last_accepted_attempt.target_step == 1 &&
+      prospective.last_accepted_step.accepted &&
+      prospective.last_accepted_step.step == 1 &&
+      prospective.last_accepted_step.attempt_index == 0 &&
+      std::isfinite(prospective.minimum_density) &&
+      prospective.minimum_density > 0.0 &&
+      std::isfinite(prospective.minimum_pressure) &&
+      prospective.minimum_pressure > 0.0 &&
+      std::isfinite(prospective.minimum_speed_margin) &&
+      prospective.minimum_speed_margin > 0.0;
+  const bool live_unchanged =
+      live_during_stage.status == live_before_stage.status &&
+      live_during_stage.first_failure == live_before_stage.first_failure &&
+      live_during_stage.accepted_steps == live_before_stage.accepted_steps &&
+      live_during_stage.attempted_steps == live_before_stage.attempted_steps &&
+      live_during_stage.rejected_steps == live_before_stage.rejected_steps &&
+      live_during_stage.retry_attempts == live_before_stage.retry_attempts &&
+      live_during_stage.maximum_attempted_newton_iterations ==
+          live_before_stage.maximum_attempted_newton_iterations &&
+      live_during_stage.maximum_newton_iterations ==
+          live_before_stage.maximum_newton_iterations &&
+      live_during_stage.maximum_trace_iterations ==
+          live_before_stage.maximum_trace_iterations &&
+      std::isinf(live_during_stage.minimum_density) &&
+      std::isinf(live_during_stage.minimum_pressure) &&
+      std::isinf(live_during_stage.minimum_speed_margin) &&
+      live_during_stage.coordinates.step == live_before_stage.coordinates.step &&
+      live_during_stage.last_accepted_step.attempt_index ==
+          live_before_stage.last_accepted_step.attempt_index;
+  if (!staged_metrics || !live_unchanged ||
+      !owner->FinalizePersistentTrajectoryTransaction(std::move(staged)))
+    return false;
+  const auto& finalized_stage = owner->trajectory_evidence();
+  const bool finalize_matches_staged =
+      finalized_stage.status == prospective.status &&
+      finalized_stage.accepted_steps == prospective.accepted_steps &&
+      finalized_stage.attempted_steps == prospective.attempted_steps &&
+      finalized_stage.rejected_steps == prospective.rejected_steps &&
+      finalized_stage.retry_attempts == prospective.retry_attempts &&
+      finalized_stage.maximum_attempted_newton_iterations ==
+          prospective.maximum_attempted_newton_iterations &&
+      finalized_stage.maximum_newton_iterations ==
+          prospective.maximum_newton_iterations &&
+      finalized_stage.maximum_trace_iterations ==
+          prospective.maximum_trace_iterations &&
+      finalized_stage.minimum_density == prospective.minimum_density &&
+      finalized_stage.minimum_pressure == prospective.minimum_pressure &&
+      finalized_stage.minimum_speed_margin == prospective.minimum_speed_margin &&
+      finalized_stage.maximum_conservation_error ==
+          prospective.maximum_conservation_error &&
+      finalized_stage.maximum_nonlinear_residual_ratio ==
+          prospective.maximum_nonlinear_residual_ratio &&
+      finalized_stage.maximum_trace_residual_ratio ==
+          prospective.maximum_trace_residual_ratio &&
+      finalized_stage.maximum_local_application_residual_ratio ==
+          prospective.maximum_local_application_residual_ratio &&
+      finalized_stage.last_attempt.status == prospective.last_attempt.status &&
+      finalized_stage.last_attempt.target_step ==
+          prospective.last_attempt.target_step &&
+      finalized_stage.last_accepted_attempt.status ==
+          prospective.last_accepted_attempt.status &&
+      finalized_stage.last_accepted_attempt.target_step ==
+          prospective.last_accepted_attempt.target_step &&
+      finalized_stage.last_accepted_step.accepted &&
+      finalized_stage.last_accepted_step.step == 1 &&
+      finalized_stage.last_accepted_step.attempt_index == 0 &&
+      finalized_stage.coordinates.step == prospective.coordinates.step;
+  if (!finalize_matches_staged) return false;
+
   scalar::ScalarCudaCheckpoint checkpoint{};
   scalar::PublishedState committed{};
   if (!owner->CaptureTrajectoryCheckpoint(checkpoint) ||
@@ -142,9 +227,30 @@ bool RunC2()
       reset.coordinates.time == checkpoint.descriptor.coordinates.time &&
       reset.coordinates.dt == checkpoint.descriptor.coordinates.dt;
   if (!reset_compact || !reset_records ||
-      owner->AdvancePersistentTrajectory(
-          scalar::FailureInjection::local_factor) !=
-          scalar::ScalarCudaStatus::accepted_after_one_retry)
+      owner->PreparePersistentTrajectoryTransaction(
+          staged, scalar::FailureInjection::local_factor) !=
+          scalar::ScalarCudaStatus::injected_local_factor_failure)
+    return false;
+  const auto& early_failure = owner->trajectory_evidence();
+  const bool failed_minima = early_failure.accepted_steps == 1 &&
+      early_failure.attempted_steps == 1 && early_failure.rejected_steps == 1 &&
+      early_failure.retry_attempts == 1 &&
+      early_failure.first_failure ==
+          scalar::ScalarCudaStatus::injected_local_factor_failure &&
+      early_failure.first_failed_attempt.target_step == 2 &&
+      early_failure.first_failed_attempt.retry_index == 0 &&
+      std::isinf(early_failure.minimum_density) &&
+      early_failure.minimum_density > 0.0 &&
+      std::isinf(early_failure.minimum_pressure) &&
+      early_failure.minimum_pressure > 0.0 &&
+      std::isinf(early_failure.minimum_speed_margin) &&
+      early_failure.minimum_speed_margin > 0.0;
+  scalar::PersistentSc25ScalarIgrCudaRank1::Transaction retry{};
+  if (!failed_minima ||
+      owner->PreparePersistentTrajectoryTransaction(retry) !=
+          scalar::ScalarCudaStatus::accepted ||
+      !owner->InstallPersistentTrajectoryTransaction(retry) ||
+      !owner->FinalizePersistentTrajectoryTransaction(std::move(retry)))
     return false;
   scalar::PublishedState final_state{};
   oracle::StateQuadratureAudit audit{};
@@ -153,11 +259,15 @@ bool RunC2()
     return false;
   const auto& evidence = owner->trajectory_evidence();
   const bool compact = evidence.accepted_steps == 2 &&
+      evidence.attempted_steps == 2 &&
       evidence.rejected_steps == 1 && evidence.retry_attempts == 1 &&
       evidence.first_failure == scalar::ScalarCudaStatus::injected_local_factor_failure &&
       evidence.first_failed_attempt.target_step == 2 &&
+      evidence.first_failed_attempt.retry_index == 0 &&
       evidence.last_accepted_attempt.target_step == 2 &&
+      evidence.last_accepted_attempt.retry_index == 1 &&
       evidence.last_accepted_step.step == 2 &&
+      evidence.last_accepted_step.attempt_index == 1 &&
       evidence.coordinates.step == 2 && evidence.transfer_totals.complete &&
       evidence.transfer_totals.event_count != 0 &&
       evidence.residency.mfem_cuda_device && evidence.residency.hypre_cuda &&
@@ -167,6 +277,10 @@ bool RunC2()
       !evidence.residency.host_numerical_fallback &&
       evidence.reuse.unchanged && evidence.launches.fallback_calls == 0 &&
       evidence.launches.last_compiled_architecture == 1200 &&
+      std::isfinite(evidence.minimum_density) && evidence.minimum_density > 0.0 &&
+      std::isfinite(evidence.minimum_pressure) && evidence.minimum_pressure > 0.0 &&
+      std::isfinite(evidence.minimum_speed_margin) &&
+      evidence.minimum_speed_margin > 0.0 &&
       std::isfinite(audit.minimum_density) && std::isfinite(audit.minimum_pressure) &&
       std::isfinite(audit.minimum_speed_margin) &&
       sizeof(scalar::ScalarCudaEvidence) < 4096;

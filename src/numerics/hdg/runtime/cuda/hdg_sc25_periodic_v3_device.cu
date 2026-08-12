@@ -3428,6 +3428,58 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
     return CaptureCheckpointSlot(committed_slot, coordinates, output);
   }
 
+  void AccumulateAcceptedPendingMetrics(ScalarCudaEvidence& output) const
+      noexcept
+  {
+    ScalarCudaAttemptEvidence accepted_attempt = pending_attempt;
+    accepted_attempt.status = transaction_installed_after_retry
+        ? ScalarCudaStatus::accepted_after_one_retry
+        : ScalarCudaStatus::accepted;
+    accepted_attempt.failure_cause = ScalarCudaFailureCause::none;
+    ScalarCudaStepEvidence accepted_step = pending_step;
+    accepted_step.attempt_index = output.attempted_steps;
+    output.last_accepted_attempt = accepted_attempt;
+    output.last_attempt = accepted_attempt;
+    output.last_accepted_step = accepted_step;
+    ++output.accepted_steps;
+    ++output.attempted_steps;
+    output.maximum_attempted_newton_iterations = std::max(
+        output.maximum_attempted_newton_iterations,
+        accepted_attempt.attempted_newton_iterations);
+    output.maximum_newton_iterations = std::max(
+        output.maximum_newton_iterations, accepted_attempt.newton_iterations);
+    output.maximum_trace_iterations = std::max(
+        output.maximum_trace_iterations,
+        accepted_attempt.maximum_trace_iterations);
+    output.minimum_density = std::min(
+        output.minimum_density, accepted_attempt.minimum_density);
+    output.minimum_pressure = std::min(
+        output.minimum_pressure, accepted_attempt.minimum_pressure);
+    output.minimum_speed_margin = std::min(
+        output.minimum_speed_margin, accepted_attempt.minimum_speed_margin);
+    output.maximum_conservation_error = std::max(
+        output.maximum_conservation_error,
+        accepted_attempt.maximum_conservation_error);
+    const double trace_bound = std::max(
+        output.trace_absolute_tolerance,
+        output.trace_relative_tolerance *
+            accepted_attempt.maximum_trace_right_hand_side);
+    if (trace_bound > 0.0)
+      output.maximum_trace_residual_ratio = std::max(
+          output.maximum_trace_residual_ratio,
+          accepted_attempt.maximum_trace_true_residual / trace_bound);
+    if (accepted_attempt.nonlinear_residual_bound > 0.0)
+      output.maximum_nonlinear_residual_ratio = std::max(
+          output.maximum_nonlinear_residual_ratio,
+          accepted_attempt.final_residual_norm /
+              accepted_attempt.nonlinear_residual_bound);
+    output.maximum_local_application_residual_ratio = std::max(
+        output.maximum_local_application_residual_ratio,
+        accepted_attempt.maximum_local_application_residual);
+    output.coordinates = accepted_attempt.candidate_coordinates;
+    output.status = accepted_attempt.status;
+  }
+
   bool WriteProspectiveEvidence(ScalarCudaEvidence& output) const noexcept
   {
     if (!pending_attempt_active || active_transaction_serial == 0 ||
@@ -3436,17 +3488,7 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
       return false;
     }
     output = evidence;
-    output.last_accepted_attempt = pending_attempt;
-    output.last_accepted_attempt.status = transaction_installed_after_retry
-        ? ScalarCudaStatus::accepted_after_one_retry
-        : ScalarCudaStatus::accepted;
-    output.last_accepted_attempt.failure_cause = ScalarCudaFailureCause::none;
-    output.last_attempt = output.last_accepted_attempt;
-    output.last_accepted_step = pending_step;
-    ++output.accepted_steps;
-    ++output.attempted_steps;
-    output.coordinates = output.last_accepted_attempt.candidate_coordinates;
-    output.status = output.last_accepted_attempt.status;
+    AccumulateAcceptedPendingMetrics(output);
     return true;
   }
 
@@ -4344,51 +4386,7 @@ bool PersistentSc25ScalarIgrCudaRank1::
     return false;
   }
   Implementation& value = *implementation_;
-  value.pending_attempt.status = value.transaction_installed_after_retry
-      ? ScalarCudaStatus::accepted_after_one_retry
-      : ScalarCudaStatus::accepted;
-  value.evidence.last_accepted_attempt = value.pending_attempt;
-  value.evidence.last_attempt = value.pending_attempt;
-  value.evidence.last_accepted_step = value.pending_step;
-  ++value.evidence.accepted_steps;
-  ++value.evidence.attempted_steps;
-  value.evidence.maximum_attempted_newton_iterations = std::max(
-      value.evidence.maximum_attempted_newton_iterations,
-      value.pending_attempt.attempted_newton_iterations);
-  value.evidence.maximum_newton_iterations = std::max(
-      value.evidence.maximum_newton_iterations,
-      value.pending_attempt.newton_iterations);
-  value.evidence.maximum_trace_iterations = std::max(
-      value.evidence.maximum_trace_iterations,
-      value.pending_attempt.maximum_trace_iterations);
-  value.evidence.minimum_density = std::min(
-      value.evidence.minimum_density, value.pending_attempt.minimum_density);
-  value.evidence.minimum_pressure = std::min(
-      value.evidence.minimum_pressure, value.pending_attempt.minimum_pressure);
-  value.evidence.minimum_speed_margin = std::min(
-      value.evidence.minimum_speed_margin,
-      value.pending_attempt.minimum_speed_margin);
-  value.evidence.maximum_conservation_error = std::max(
-      value.evidence.maximum_conservation_error,
-      value.pending_attempt.maximum_conservation_error);
-  const double trace_bound = std::max(
-      value.evidence.trace_absolute_tolerance,
-      value.evidence.trace_relative_tolerance *
-          value.pending_attempt.maximum_trace_right_hand_side);
-  if (trace_bound > 0.0)
-    value.evidence.maximum_trace_residual_ratio = std::max(
-        value.evidence.maximum_trace_residual_ratio,
-        value.pending_attempt.maximum_trace_true_residual / trace_bound);
-  if (value.pending_attempt.nonlinear_residual_bound > 0.0)
-    value.evidence.maximum_nonlinear_residual_ratio = std::max(
-        value.evidence.maximum_nonlinear_residual_ratio,
-        value.pending_attempt.final_residual_norm /
-            value.pending_attempt.nonlinear_residual_bound);
-  value.evidence.maximum_local_application_residual_ratio = std::max(
-      value.evidence.maximum_local_application_residual_ratio,
-      value.pending_attempt.maximum_local_application_residual);
-  value.evidence.coordinates = token.target_;
-  value.evidence.status = value.pending_attempt.status;
+  value.AccumulateAcceptedPendingMetrics(value.evidence);
   value.committed_slot = token.candidate_slot_;
   value.coordinates = token.target_;
   value.pending_attempt_active = false;
