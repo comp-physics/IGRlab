@@ -4101,14 +4101,25 @@ ApplicationRunResult DispatchApplication(
   }
   if (backend != ApplicationBackend::unknown)
     backend = ParseApplicationBackend(derived.backend_id);
+  if (backend == ApplicationBackend::cpu_serial ||
+      backend == ApplicationBackend::cpu_rank2)
+  {
+    const ApplicationValidation validation =
+        ValidateApplicationOptions(derived);
+    if (!validation.accepted())
+    {
+      return {RunStatus::invalid_request,
+              FailureReason::invalid_resource_descriptor, {}, 0,
+              ApplicationRunResult::FailureClass::configuration};
+    }
+    const HdgMethodRequestV1 typed_request{
+        &derived, validation.config(), &cpu_context, nullptr};
+    return RunHdgMethodV1(typed_request).run;
+  }
   switch (backend)
   {
     case ApplicationBackend::cpu_serial:
-      return RunSmoothPeriodicEulerV1(CpuSerialBackendTag{}, derived,
-                                      cpu_context);
-    case ApplicationBackend::cpu_rank2:
-      return RunSmoothPeriodicEulerV1(CpuRank2BackendTag{}, derived,
-                                      cpu_context);
+    case ApplicationBackend::cpu_rank2: break;
     case ApplicationBackend::cuda_rank1_one_gpu:
 #if DG_IGR_HDG_APP_HAS_CUDA_RANK1
       if (cuda_context != nullptr)
