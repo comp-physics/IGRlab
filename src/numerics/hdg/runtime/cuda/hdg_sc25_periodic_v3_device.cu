@@ -2990,6 +2990,12 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
       true_residual -= *true_rhs;
       residual_norm = true_residual.Norml2();
       rhs_norm = true_rhs->Norml2();
+      if (pending_attempt_active)
+      {
+        detail::UpdateMaximumNormalizedResidual(
+            pending_attempt.maximum_trace_residual_ratio, residual_norm,
+            rhs_norm, absolute_trace_tolerance, relative_trace_tolerance);
+      }
       const bool valid = setup_status == 0 && solve_status == 0 &&
           query_status == 0 && converged == 1 && iterations >= 0 &&
           iterations <= trace_maximum_iterations &&
@@ -2999,16 +3005,18 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
       if (valid)
       {
         ++solver_generation;
-        if (pending_attempt_active)
-        {
-          detail::UpdateMaximumNormalizedResidual(
-              pending_attempt.maximum_trace_residual_ratio, residual_norm,
-              rhs_norm, absolute_trace_tolerance, relative_trace_tolerance);
-        }
       }
       return valid;
     }
-    catch (...) { return false; }
+    catch (...)
+    {
+      if (pending_attempt_active)
+      {
+        pending_attempt.maximum_trace_residual_ratio =
+            std::numeric_limits<double>::infinity();
+      }
+      return false;
+    }
   }
 
   bool SampleHighWater(const int sample) noexcept
