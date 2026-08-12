@@ -174,6 +174,26 @@ ApplicationOptionsView W8cCase(const bool scalar, const bool smooth,
   return options;
 }
 
+ApplicationOptionsView W8cSmoothHighN(const bool scalar,
+                                      const std::string_view scenario_id,
+                                      const std::uint32_t mesh_n,
+                                      const double dt,
+                                      const std::uint64_t accepted_steps,
+                                      const std::uint64_t checkpoint_step,
+                                      const std::string_view checkpoint_id)
+{
+  ApplicationOptionsView options = W8cCase(scalar, true);
+  options.scenario_id = scenario_id;
+  options.mesh_n = mesh_n;
+  options.dt = dt;
+  options.accepted_steps = accepted_steps;
+  options.final_time = 1.0 / 16.0;
+  options.output_steps = {{0, checkpoint_step, accepted_steps}};
+  options.checkpoint_step = OptionalCheckpointStepV1::Present(checkpoint_step);
+  options.checkpoint_id = checkpoint_id;
+  return options;
+}
+
 ApplicationOptionsView W8cSplitReader(ApplicationOptionsView options)
 {
   const std::string_view checkpoint = options.checkpoint_out.canonical;
@@ -893,13 +913,92 @@ bool CheckIntegrationSeamV1()
 
   ApplicationOptionsView unsupported = W8cCase(
       false, true, CpuRank2BackendTag::id);
+  const ApplicationValidation unsupported_validation =
+      ValidateApplicationOptions(unsupported);
   const HdgMethodCapabilitiesV1 rejected =
       QueryHdgMethodCapabilitiesV1(unsupported);
   passed = Check(!rejected.supported &&
+                     rejected.reason == unsupported_validation.rejection() &&
                      rejected.reason == ApplicationRejection::unknown_backend &&
                      !rejected.reason_text.empty(),
                  "hdg_closed_capability_rejects_unadvertised_w8c_cell") && passed;
   return passed;
+}
+
+bool CheckClosedCapabilityQueryParityV1()
+{
+  bool passed = true;
+  std::size_t rows = 0;
+  const auto check = [&](const ApplicationOptionsView& options,
+                         const char* name)
+  {
+    const ApplicationValidation validation = ValidateApplicationOptions(options);
+    const HdgMethodCapabilitiesV1 query =
+        QueryHdgMethodCapabilitiesV1(options);
+    ++rows;
+    passed = Check(query.supported == validation.accepted() &&
+                       query.reason == validation.rejection() &&
+                       !query.reason_text.empty(),
+                   name) && passed;
+  };
+
+  for (const std::string_view backend :
+       {CpuSerialBackendTag::id, CpuRank2BackendTag::id,
+        CudaRank1OneGpuBackendTag::id,
+        CudaRank2OneGpuHostStagedBackendTag::id})
+  {
+    check(Smoke(backend), "closed_capability_w8a_smoke_parity");
+    check(ScalarIgr(backend), "closed_capability_w8b_scalar_parity");
+  }
+  for (const std::uint32_t mesh_n : {3U, 6U, 12U})
+    check(Functional(CpuSerialBackendTag::id, mesh_n),
+          "closed_capability_w8a_serial_functional_parity");
+  for (const std::string_view backend :
+       {CpuRank2BackendTag::id, CudaRank1OneGpuBackendTag::id,
+        CudaRank2OneGpuHostStagedBackendTag::id})
+  {
+    check(Functional(backend), "closed_capability_w8a_functional_parity");
+  }
+
+  for (const bool scalar : {false, true})
+  {
+    check(W8cCase(scalar, false), "closed_capability_w8c_jump_parity");
+    check(W8cCase(scalar, true), "closed_capability_w8c_smooth_n8_parity");
+  }
+  check(W8cCase(true, true, CpuRank2BackendTag::id),
+        "closed_capability_w8c_smooth_cpu_rank2_parity");
+  check(W8cCase(true, true, CudaRank2OneGpuHostStagedBackendTag::id),
+        "closed_capability_w8c_smooth_cuda_rank2_parity");
+
+  struct HighNRow
+  {
+    std::string_view scenario_id;
+    std::uint32_t mesh_n;
+    double dt;
+    std::uint64_t accepted_steps;
+    std::uint64_t checkpoint_step;
+    std::string_view conventional_checkpoint;
+    std::string_view scalar_checkpoint;
+  };
+  const std::array<HighNRow, 3> high_n{{
+      {"W8C-V2-N16-DT11", 16, 1.0 / 2048.0, 128, 64,
+       "checkpoint.hdg.euler.periodic-smooth-transition.n16-dt11.step-64.v2",
+       "checkpoint.hdg.igr.sc25.periodic-smooth-transition.n16-dt11.step-64.v2"},
+      {"W8C-V2-N16-DT12", 16, 1.0 / 4096.0, 256, 128,
+       "checkpoint.hdg.euler.periodic-smooth-transition.n16-dt12.step-128.v2",
+       "checkpoint.hdg.igr.sc25.periodic-smooth-transition.n16-dt12.step-128.v2"},
+      {"W8C-V2-N32-DT12", 32, 1.0 / 4096.0, 256, 128,
+       "checkpoint.hdg.euler.periodic-smooth-transition.n32-dt12.step-128.v2",
+       "checkpoint.hdg.igr.sc25.periodic-smooth-transition.n32-dt12.step-128.v2"}}};
+  for (const HighNRow& row : high_n)
+    for (const bool scalar : {false, true})
+      check(W8cSmoothHighN(scalar, row.scenario_id, row.mesh_n, row.dt,
+                            row.accepted_steps, row.checkpoint_step,
+                            scalar ? row.scalar_checkpoint
+                                   : row.conventional_checkpoint),
+            "closed_capability_w8c_smooth_high_n_parity");
+
+  return Check(rows == 26, "closed_capability_exact_26_row_census") && passed;
 }
 
 bool CheckStaticEntryOffDiagonalMatrix()
@@ -1278,6 +1377,7 @@ int main()
   passed = CheckCardScenarioTupleClosure() && passed;
   passed = CheckMismatchedScenarioRoleFamilies() && passed;
   passed = CheckIntegrationSeamV1() && passed;
+  passed = CheckClosedCapabilityQueryParityV1() && passed;
   passed = CheckStaticEntryOffDiagonalMatrix() && passed;
   passed = CheckCoherentScalarIdentityEquivalence() && passed;
   passed = CheckScalarIgrMatrix() && passed;

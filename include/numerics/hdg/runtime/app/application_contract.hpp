@@ -2,12 +2,14 @@
 
 /**
  * @file numerics/hdg/runtime/app/application_contract.hpp
- * @brief Static request admission for the two frozen W8A scenarios.
+ * @brief Closed standalone HDG capability and validated configuration seam.
  *
- * This boundary validates syntax, exact card/scenario values, and compiled
- * backend selection only.  It does not accept caller-authored MPI or device
- * observations and grants no execution authority.  The later backend entry
- * owns MPI_Comm_size and CUDA UUID/shared-device observation before execution.
+ * This boundary admits only the current frozen W8A, W8B, and W8C rows with
+ * their exact card, periodic-case, mesh/order/time, and compiled-backend
+ * selections.  It is not a general runtime configuration interface.  It does
+ * not accept caller-authored MPI or device observations and grants no
+ * execution authority.  The later backend entry owns MPI_Comm_size and CUDA
+ * UUID/shared-device observation before execution.
  */
 
 #include "numerics/hdg/runtime/runtime_abi.hpp"
