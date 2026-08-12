@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -73,6 +74,12 @@ inline bool AuditPublishedState(
   audit.minimum_density = INFINITY;
   audit.minimum_pressure = INFINITY;
   audit.minimum_speed_margin = INFINITY;
+  const auto reject = [](const auto&... values) {
+    std::cerr << "SC25_CUDA_RANK1_AUDIT";
+    ((std::cerr << ' ' << values), ...);
+    std::cerr << '\n';
+    return false;
+  };
   try
   {
     mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
@@ -93,14 +100,29 @@ inline bool AuditPublishedState(
         mfem::BasisType::GaussLegendre);
     mfem::ParFiniteElementSpace volume_space(
         &mesh, &volume_collection, 1, mfem::Ordering::byNODES);
-    mfem::ParFiniteElementSpace uhat_space(
-        &mesh, &trace_collection, scalar::state_components,
+    mfem::ParFiniteElementSpace trace_space(
+        &mesh, &trace_collection, scalar::trace_components,
         mfem::Ordering::byNODES);
     if (mesh.GetNE() != scalar::persistent_elements ||
         volume_space.GetVSize() !=
             scalar::persistent_elements * scalar::volume_nodes ||
-        uhat_space.GetTrueVSize() != scalar::cpu_sc25::persistent_uhat_unknowns)
-      return false;
+        trace_space.GetVDim() != scalar::trace_components ||
+        trace_space.GetOrdering() != mfem::Ordering::byNODES ||
+        trace_space.GetTrueVSize() != scalar::persistent_trace_unknowns ||
+        trace_space.GetTrueVSize() / scalar::trace_components !=
+            scalar::persistent_scalar_trace_nodes ||
+        state.uhat.size() != static_cast<std::size_t>(
+            scalar::state_components * scalar::persistent_scalar_trace_nodes) ||
+        state.sigmahat.size() != static_cast<std::size_t>(
+            scalar::persistent_scalar_trace_nodes))
+      return reject("dimensions", "mesh", mesh.GetNE(), "volume",
+                    volume_space.GetVSize(), "trace_vdim",
+                    trace_space.GetVDim(), "trace_ordering",
+                    static_cast<int>(trace_space.GetOrdering()), "trace_true",
+                    trace_space.GetTrueVSize(), "trace_nodes",
+                    trace_space.GetTrueVSize() / scalar::trace_components,
+                    "uhat", state.uhat.size(), "sigmahat",
+                    state.sigmahat.size());
 
     for (int element = 0; element < mesh.GetNE(); ++element)
     {
@@ -109,7 +131,10 @@ inline bool AuditPublishedState(
           mesh.GetElementTransformation(element);
       if (finite_element == nullptr || transformation == nullptr ||
           finite_element->GetDof() != scalar::volume_nodes)
-        return false;
+        return reject("volume-precondition", "element", element, "fe",
+                      finite_element != nullptr, "transform",
+                      transformation != nullptr, "dof",
+                      finite_element == nullptr ? -1 : finite_element->GetDof());
       const mfem::IntegrationRule& rule = mfem::IntRules.Get(
           finite_element->GetGeomType(), quadrature_order);
       mfem::Vector shape(scalar::volume_nodes);
@@ -129,7 +154,9 @@ inline bool AuditPublishedState(
                     scalar::volume_nodes + node] * shape[node];
         if (!(weight > 0.0) || !std::isfinite(weight) ||
             !AuditPrimitive(value, audit))
-          return false;
+          return reject("volume-primitive", "element", element, "q", point,
+                        "weight", weight, "rho", value[0], "mx", value[1],
+                        "my", value[2], "E", value[3]);
         for (int component = 0; component < scalar::state_components;
              ++component)
           audit.integrals[component] += weight * value[component];
@@ -143,15 +170,21 @@ inline bool AuditPublishedState(
     {
       mfem::FaceElementTransformations* face_transformations =
           mesh.GetFaceElementTransformations(face);
-      const mfem::FiniteElement* face_element = uhat_space.GetFaceElement(face);
+      const mfem::FiniteElement* face_element = trace_space.GetFaceElement(face);
       mfem::Array<int> face_vdofs;
-      uhat_space.GetFaceVDofs(face, face_vdofs);
+      trace_space.GetFaceVDofs(face, face_vdofs);
       if (face_transformations == nullptr ||
           face_transformations->Face == nullptr || face_element == nullptr ||
           face_element->GetDof() != scalar::face_nodes ||
           face_vdofs.Size() !=
-              scalar::state_components * scalar::face_nodes)
-        return false;
+              scalar::trace_components * scalar::face_nodes)
+        return reject("face-precondition", "face", face, "transform",
+                      face_transformations != nullptr, "face_transform",
+                      face_transformations != nullptr &&
+                          face_transformations->Face != nullptr, "fe",
+                      face_element != nullptr, "dof",
+                      face_element == nullptr ? -1 : face_element->GetDof(),
+                      "vdofs", face_vdofs.Size());
       mfem::Vector face_shape(scalar::face_nodes);
       for (int point = 0; point < face_rule.GetNPoints(); ++point)
       {
@@ -166,15 +199,22 @@ inline bool AuditPublishedState(
                 component * scalar::face_nodes + node];
             const int sign = encoded < 0 ? -1 : 1;
             const int local_dof = encoded < 0 ? -1 - encoded : encoded;
-            const int true_dof = uhat_space.GetLocalTDofNumber(local_dof);
+            const int true_dof = trace_space.GetLocalTDofNumber(local_dof);
             if (true_dof < 0 || true_dof >=
-                    static_cast<int>(state.uhat.size()))
-              return false;
+                    static_cast<int>(state.uhat.size()) ||
+                true_dof / scalar::persistent_scalar_trace_nodes != component)
+              return reject("uhat-mapping", "face", face, "component",
+                            component, "node", node, "encoded", encoded,
+                            "local", local_dof, "true", true_dof, "uhat",
+                            state.uhat.size());
             trace_value[component] +=
                 sign * state.uhat[static_cast<std::size_t>(true_dof)] *
                     face_shape[node];
           }
-        if (!AuditPrimitive(trace_value, audit)) { return false; }
+        if (!AuditPrimitive(trace_value, audit))
+          return reject("trace-primitive", "face", face, "q", point, "rho",
+                        trace_value[0], "mx", trace_value[1], "my",
+                        trace_value[2], "E", trace_value[3]);
         ++audit.trace_points;
 
         face_transformations->SetAllIntPoints(&face_point);
@@ -188,7 +228,9 @@ inline bool AuditPublishedState(
               : face_transformations->GetElement2IntPoint();
           const mfem::FiniteElement* finite_element =
               volume_space.GetFE(elements[side]);
-          if (finite_element == nullptr) { return false; }
+          if (finite_element == nullptr)
+            return reject("side-precondition", "face", face, "q", point,
+                          "side", side, "element", elements[side]);
           mfem::Vector shape(scalar::volume_nodes);
           finite_element->CalcShape(element_point, shape);
           double side_value[scalar::state_components]{};
@@ -198,15 +240,26 @@ inline bool AuditPublishedState(
               side_value[component] += state.u[
                   (elements[side] * scalar::state_components + component) *
                       scalar::volume_nodes + node] * shape[node];
-          if (!AuditPrimitive(side_value, audit)) { return false; }
+          if (!AuditPrimitive(side_value, audit))
+            return reject("side-primitive", "face", face, "q", point,
+                          "side", side, "element", elements[side], "rho",
+                          side_value[0], "mx", side_value[1], "my",
+                          side_value[2], "E", side_value[3]);
           ++audit.side_points;
         }
       }
     }
-    return audit.volume_points > 0 && audit.side_points > 0 &&
-        audit.trace_points > 0;
+    if (!(audit.volume_points > 0 && audit.side_points > 0 &&
+          audit.trace_points > 0))
+      return reject("empty", "volume", audit.volume_points, "side",
+                    audit.side_points, "trace", audit.trace_points);
+    return true;
   }
-  catch (...) { return false; }
+  catch (const std::exception& exception)
+  {
+    return reject("exception", exception.what());
+  }
+  catch (...) { return reject("unknown-exception"); }
 }
 
 inline constexpr std::uint64_t fnv_offset = 1469598103934665603ULL;
