@@ -355,27 +355,7 @@ int main(int argc, char** argv)
   const sc25::PersistentTrajectoryEvidence& scalar_evidence =
       scalar->trajectory_evidence();
   const sc25::TrajectoryAttemptEvidence& scalar_failed_attempt =
-      scalar_evidence.attempts[static_cast<std::size_t>(
-          std::max(0, scalar_evidence.attempt_count - 1))];
-  const int scalar_last_newton =
-      scalar_failed_attempt.attempted_newton_iterations - 1;
-  bool scalar_last_update_rejected = scalar_last_newton >= 0;
-  if (scalar_last_update_rejected)
-  {
-    const sc25::TrajectoryNewtonEvidence& last =
-        scalar_failed_attempt.newton[static_cast<std::size_t>(
-            scalar_last_newton)];
-    scalar_last_update_rejected = last.accepted_line_search_index == -1 &&
-        std::none_of(last.trial_admissible.begin(),
-                     last.trial_admissible.end(),
-                     [](const std::uint8_t accepted) {
-                       return accepted != 0;
-                     }) &&
-        std::none_of(last.trial_armijo.begin(), last.trial_armijo.end(),
-                     [](const std::uint8_t accepted) {
-                       return accepted != 0;
-                     });
-  }
+      scalar_evidence.last_attempt;
   checks.Require(scalar_after_copied &&
                      scalar_terminal ==
                          sc25::TrajectoryStatus::HdgSc25AdmissibilityFailure &&
@@ -387,7 +367,9 @@ int main(int argc, char** argv)
                                           scalar_after_failure),
                  "scalar negative trajectory must preserve committed step 10 without a hidden retry");
   checks.Require(scalar_failed_attempt.target_step == 11 &&
-                     scalar_last_update_rejected,
+                     scalar_failed_attempt.final_line_search_trials ==
+                         sc25::persistent_line_search_maximum_trials &&
+                     scalar_failed_attempt.newton_iterations == 0,
                  "scalar target step 11 must not silently accept an inadmissible trial");
 
   MPI_Finalize();

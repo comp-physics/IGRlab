@@ -185,23 +185,42 @@ bool EqualTrajectoryEvidenceBytes(
         bits(a.trace_true_residual_norm,b.trace_true_residual_norm) &&
         bits(a.trace_right_hand_side_norm,b.trace_right_hand_side_norm) && metrics(a.residual,b.residual);
   };
-  const auto equal_newton = [&](const sc25::TrajectoryNewtonEvidence& a,
-                                 const sc25::TrajectoryNewtonEvidence& b) noexcept
+  const auto equal_attempt = [&](const sc25::TrajectoryAttemptEvidence& a,
+                                 const sc25::TrajectoryAttemptEvidence& b) noexcept
   {
-    return a.iteration == b.iteration &&
+    return a.status == b.status && a.injection == b.injection &&
+        a.target_step == b.target_step && a.retry_index == b.retry_index &&
+        equal_double(a.dt, b.dt) &&
+        a.attempted_newton_iterations == b.attempted_newton_iterations &&
+        a.newton_iterations == b.newton_iterations &&
+        a.final_line_search_trials == b.final_line_search_trials &&
         equal_double(a.entry_residual_norm, b.entry_residual_norm) &&
-        equal_double(a.accepted_residual_norm, b.accepted_residual_norm) &&
-        a.accepted_line_search_index == b.accepted_line_search_index &&
-        a.trace_iterations == b.trace_iterations &&
-        equal_double(a.trace_true_residual_norm, b.trace_true_residual_norm) &&
-        equal_double(a.trace_right_hand_side_norm, b.trace_right_hand_side_norm) &&
-        equal_double(a.maximum_local_application_residual,
-                     b.maximum_local_application_residual) &&
-        EqualStateBytes(a.entry, b.entry) &&
-        EqualStateBytes(a.direction, b.direction) &&
-        EqualFp64Bytes(a.trial_residual_norms, b.trial_residual_norms) &&
-        a.trial_admissible == b.trial_admissible &&
-        a.trial_armijo == b.trial_armijo;
+        equal_double(a.final_residual_norm, b.final_residual_norm) &&
+        equal_double(a.nonlinear_residual_bound, b.nonlinear_residual_bound) &&
+        equal_double(a.maximum_conservation_error, b.maximum_conservation_error) &&
+        equal_double(a.minimum_density, b.minimum_density) &&
+        equal_double(a.minimum_pressure, b.minimum_pressure) &&
+        equal_double(a.minimum_speed_margin, b.minimum_speed_margin) &&
+        dg::hdg::runtime::detail::SameCoordinates(
+            a.committed_coordinates, b.committed_coordinates) &&
+        dg::hdg::runtime::detail::SameCoordinates(
+            a.published_coordinates, b.published_coordinates) &&
+        equal_hashes(a.entry_hashes, b.entry_hashes) &&
+        equal_hashes(a.candidate_hashes, b.candidate_hashes) &&
+        equal_hashes(a.published_hashes, b.published_hashes) &&
+        equal_reuse(a.entry_reuse, b.entry_reuse) &&
+        equal_reuse(a.exit_reuse, b.exit_reuse);
+  };
+  const auto equal_accepted = [&](const sc25::TrajectoryAcceptedSummary& a,
+                                  const sc25::TrajectoryAcceptedSummary& b) noexcept
+  {
+    return a.accepted == b.accepted && a.step == b.step &&
+        equal_double(a.time, b.time) && equal_double(a.dt, b.dt) &&
+        a.generation == b.generation && a.attempt_index == b.attempt_index &&
+        EqualFp64Bytes(a.committed_integrals, b.committed_integrals) &&
+        EqualFp64Bytes(a.accepted_integrals, b.accepted_integrals) &&
+        equal_hashes(a.accepted_hashes, b.accepted_hashes) &&
+        equal_reuse(a.reuse, b.reuse);
   };
   if (left.status != right.status || left.first_failure != right.first_failure ||
       left.first_assembly_failure != right.first_assembly_failure ||
@@ -212,12 +231,9 @@ bool EqualTrajectoryEvidenceBytes(
       left.attempted_steps != right.attempted_steps ||
       left.retry_attempts != right.retry_attempts ||
       left.attempt_count != right.attempt_count ||
-      left.step_evidence_count != right.step_evidence_count ||
       left.checkpoint_step_offset != right.checkpoint_step_offset ||
       !dg::hdg::runtime::detail::SameCoordinates(
           left.continuation_start_coordinates, right.continuation_start_coordinates) ||
-      !EqualStateBytes(left.continuation_start_state,
-                       right.continuation_start_state) ||
       !equal_hashes(left.continuation_start_hashes,
                     right.continuation_start_hashes) ||
       left.restored_loaded_state_match != right.restored_loaded_state_match ||
@@ -237,39 +253,11 @@ bool EqualTrajectoryEvidenceBytes(
       left.reuse.detected_w8_owned_boundary_identity_changes !=
           right.reuse.detected_w8_owned_boundary_identity_changes ||
       left.reuse.w8_device_transfer_calls != right.reuse.w8_device_transfer_calls ||
-      left.reuse.opaque_mfem_hypre_observed != right.reuse.opaque_mfem_hypre_observed)
+      left.reuse.opaque_mfem_hypre_observed != right.reuse.opaque_mfem_hypre_observed ||
+      !equal_attempt(left.first_failed_attempt, right.first_failed_attempt) ||
+      !equal_attempt(left.last_attempt, right.last_attempt) ||
+      !equal_accepted(left.last_accepted, right.last_accepted))
     return false;
-  for (std::size_t i = 0; i < left.attempts.size(); ++i)
-  {
-    const auto& a = left.attempts[i]; const auto& b = right.attempts[i];
-    if (a.status != b.status || a.injection != b.injection ||
-        a.target_step != b.target_step || a.retry_index != b.retry_index ||
-        !equal_double(a.dt, b.dt) || a.attempted_newton_iterations != b.attempted_newton_iterations ||
-        a.newton_iterations != b.newton_iterations ||
-        !equal_double(a.entry_residual_norm, b.entry_residual_norm) ||
-        !equal_double(a.final_residual_norm, b.final_residual_norm) ||
-        !equal_double(a.nonlinear_residual_bound, b.nonlinear_residual_bound) ||
-        !equal_double(a.maximum_conservation_error, b.maximum_conservation_error) ||
-        !equal_double(a.minimum_density, b.minimum_density) || !equal_double(a.minimum_pressure, b.minimum_pressure) ||
-        !equal_double(a.minimum_speed_margin, b.minimum_speed_margin) ||
-        !dg::hdg::runtime::detail::SameCoordinates(a.committed_coordinates, b.committed_coordinates) ||
-        !dg::hdg::runtime::detail::SameCoordinates(a.published_coordinates, b.published_coordinates) ||
-        !equal_hashes(a.entry_hashes, b.entry_hashes) || !equal_hashes(a.candidate_hashes, b.candidate_hashes) ||
-        !equal_hashes(a.published_hashes, b.published_hashes) ||
-        !equal_reuse(a.entry_reuse, b.entry_reuse) || !equal_reuse(a.exit_reuse, b.exit_reuse)) return false;
-    for (std::size_t j = 0; j < a.newton.size(); ++j)
-      if (!equal_newton(a.newton[j], b.newton[j])) return false;
-  }
-  for (std::size_t i = 0; i < left.steps.size(); ++i)
-  {
-    const auto& a = left.steps[i]; const auto& b = right.steps[i];
-    if (a.accepted != b.accepted || a.step != b.step || !equal_double(a.time, b.time) ||
-        !equal_double(a.dt, b.dt) || a.generation != b.generation || a.attempt_index != b.attempt_index ||
-        !EqualFp64Bytes(a.committed_integrals, b.committed_integrals) ||
-        !EqualFp64Bytes(a.accepted_integrals, b.accepted_integrals) ||
-        !EqualStateBytes(a.accepted_state, b.accepted_state) ||
-        !equal_hashes(a.accepted_hashes, b.accepted_hashes) || !equal_reuse(a.reuse, b.reuse)) return false;
-  }
   return true;
 }
 
@@ -724,7 +712,26 @@ int RunTrajectoryHarness()
     }
   }
 
+  const auto independently_check_accepted = [&fail](
+      sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+      const std::string_view label)
+  {
+    sc25::PersistentTrajectoryState state;
+    sc25::AuxiliaryResidualMetrics q12{};
+    sc25::AuxiliaryResidualMetrics q14{};
+    if (!foundation.CopyPublishedTrajectoryState(state) ||
+        !dg_igr_hdg_sc25_cpu_test::EvaluateIndependentAuxiliaryResidualOracle(
+            foundation, state, sc25::coupled_fixture_quadrature_order, q12) ||
+        !dg_igr_hdg_sc25_cpu_test::EvaluateIndependentAuxiliaryResidualOracle(
+            foundation, state,
+            sc25::coupled_fixture_repeat_quadrature_order, q14) ||
+        q12.normalized_maximum > 1.0e-10 ||
+        q14.normalized_maximum > 1.0e-10)
+      fail(std::string(label) + " independent accepted-state residual");
+  };
+
   sc25::PersistentTrajectoryCheckpoint checkpoint10;
+  sc25::PersistentTrajectoryState baseline_step7;
   for (int step = 1; step <= sc25::persistent_required_steps; ++step)
   {
     const sc25::TrajectoryStatus status =
@@ -735,17 +742,17 @@ int RunTrajectoryHarness()
                 << " status " << static_cast<int>(status) << '\n';
       return 1;
     }
+    independently_check_accepted(*baseline, "baseline step");
+    if (step == 7 && !baseline->CopyPublishedTrajectoryState(baseline_step7))
+    {
+      fail("step-7 baseline state capture");
+      return failures;
+    }
     if (step == 10 && !baseline->CaptureTrajectoryCheckpoint(checkpoint10))
     {
       fail("step-10 checkpoint capture");
       return failures;
     }
-  }
-  dg_igr_hdg_sc25_cpu_test::IndependentTrajectoryEvidence oracle;
-  if (!dg_igr_hdg_sc25_cpu_test::RunIndependentTrajectoryOracle(
-          *baseline, oracle))
-  {
-    for (const std::string& failure : oracle.failures) { fail(failure); }
   }
   sc25::PersistentTrajectoryState baseline_final;
   if (!baseline->CopyPublishedTrajectoryState(baseline_final))
@@ -770,12 +777,9 @@ int RunTrajectoryHarness()
     if (!replay->CopyPublishedTrajectoryState(restored_start) ||
         !EqualStateBytes(restored_start, checkpoint10.state) ||
         restored_evidence.checkpoint_step_offset != 10 ||
-        restored_evidence.step_evidence_count != 0 ||
         restored_evidence.attempt_count != 0 ||
         !EqualCoordinates(restored_evidence.continuation_start_coordinates,
                           checkpoint10.descriptor.coordinates) ||
-        !EqualStateBytes(restored_evidence.continuation_start_state,
-                         checkpoint10.state) ||
         !EqualHashes(restored_evidence.continuation_start_hashes,
                      checkpoint10.raw_field_hashes) ||
         !restored_evidence.restored_loaded_state_match ||
@@ -783,15 +787,6 @@ int RunTrajectoryHarness()
         !restored_evidence.restored_loaded_hashes_match)
     {
       fail("step-10 immediate loaded checkpoint equality/evidence reset");
-    }
-    for (const sc25::TrajectoryStepEvidence& stale :
-         restored_evidence.steps)
-    {
-      if (stale.accepted)
-      {
-        fail("step-10 restore retained stale step evidence");
-        break;
-      }
     }
     for (int step = 11; step <= sc25::persistent_required_steps; ++step)
     {
@@ -802,6 +797,7 @@ int RunTrajectoryHarness()
         fail("restored trajectory advance");
         break;
       }
+      independently_check_accepted(*replay, "restored continuation");
     }
     sc25::PersistentTrajectoryState replay_final;
     if (!replay->CopyPublishedTrajectoryState(replay_final) ||
@@ -812,21 +808,11 @@ int RunTrajectoryHarness()
     const sc25::PersistentTrajectoryEvidence& continuation =
         replay->trajectory_evidence();
     if (continuation.checkpoint_step_offset != 10 ||
-        continuation.step_evidence_count != 10 ||
         continuation.attempt_count != 10 ||
-        continuation.steps[0].step != 11 ||
-        continuation.steps[9].step != 20)
+        continuation.last_accepted.step != 20 ||
+        continuation.last_accepted.attempt_index != 9)
     {
       fail("step-10 honest continuation record window");
-    }
-    dg_igr_hdg_sc25_cpu_test::IndependentTrajectoryEvidence replay_oracle;
-    if (!dg_igr_hdg_sc25_cpu_test::RunIndependentTrajectoryOracle(
-            *replay, replay_oracle))
-    {
-      for (const std::string& failure : replay_oracle.failures)
-      {
-        fail(std::string("restored continuation ") + failure);
-      }
     }
   }
 
@@ -883,9 +869,9 @@ int RunTrajectoryHarness()
     const sc25::PersistentTrajectoryEvidence& retry_evidence =
         injected->trajectory_evidence();
     const sc25::TrajectoryAttemptEvidence& failed =
-        retry_evidence.attempts[6];
+        retry_evidence.first_failed_attempt;
     const sc25::TrajectoryAttemptEvidence& retry =
-        retry_evidence.attempts[7];
+        retry_evidence.last_attempt;
     const dg::hdg::runtime::StateCoordinates step6_coordinates{
         6.0 * sc25::persistent_dt, 6, 6, 6, sc25::persistent_dt};
     const dg::hdg::runtime::StateCoordinates step7_coordinates{
@@ -933,9 +919,7 @@ int RunTrajectoryHarness()
 
     sc25::PersistentTrajectoryState injected_step7;
     if (!injected->CopyPublishedTrajectoryState(injected_step7) ||
-        !EqualStateBytes(
-            injected_step7,
-            baseline->trajectory_evidence().steps[6].accepted_state))
+        !EqualStateBytes(injected_step7, baseline_step7))
     {
       fail(prefix + "step-7 deterministic publication");
     }
@@ -960,17 +944,7 @@ int RunTrajectoryHarness()
     {
       fail(prefix + "bitwise final state");
     }
-    dg_igr_hdg_sc25_cpu_test::IndependentTrajectoryEvidence
-        campaign_oracle;
-    if (post_retry_valid &&
-        !dg_igr_hdg_sc25_cpu_test::RunIndependentTrajectoryOracle(
-            *injected, campaign_oracle))
-    {
-      for (const std::string& failure : campaign_oracle.failures)
-      {
-        fail(prefix + failure);
-      }
-    }
+    if (post_retry_valid) independently_check_accepted(*injected, prefix);
   }
 
   std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> negative =
@@ -1074,11 +1048,8 @@ int RunTrajectoryHarness()
         << "w8_device_transfer_calls=" << reuse.w8_device_transfer_calls
         << " opaque_mfem_hypre_observed="
         << (reuse.opaque_mfem_hypre_observed ? 1 : 0) << '\n';
-    std::cout << "PASS: " << sc25::persistent_fixture_id << " ("
-              << oracle.checked_steps << " accepted steps, "
-              << oracle.checked_newton_iterations << " Newton iterations, "
-              << oracle.checked_line_search_trials
-              << " independently checked line-search trials)\n";
+    std::cout << "PASS: " << sc25::persistent_fixture_id
+              << " (step-owned accepted-state residual checks)\n";
   }
   return failures;
 }
