@@ -1739,15 +1739,15 @@ bool StorageUnchanged(const CpuStorageEvidence& initial,
       current.allocation_events_after_baseline == 0;
 }
 
-bool AcceptedStepPasses(const CpuAcceptedStepEvidence& step,
+bool AcceptedStepPasses(const CpuAcceptedEvidence& accepted,
                         const std::uint64_t expected_step) noexcept
 {
-  return step.valid && step.coordinates.step == expected_step &&
-      step.coordinates.generation == expected_step &&
-      NearTime(step.coordinates.time,
+  const CpuAttemptEvidence& step = accepted.attempt;
+  return accepted.valid && accepted.coordinates.step == expected_step &&
+      accepted.coordinates.generation == expected_step &&
+      NearTime(accepted.coordinates.time,
                static_cast<double>(expected_step) * cpu_backward_euler_dt) &&
-      step.attempt_sequence != 0 &&
-      step.post_baseline_allocation_events == 0 &&
+      step.identity.sequence != 0 && step.transfers.allocation_events == 0 &&
       step.nonlinear_updates > 0 && step.linear_iterations >= 0 &&
       step.work.complete_assemblies ==
           1 + step.work.trial_reassemblies &&
@@ -2101,7 +2101,7 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
                    chain.accepted_candidate_true_trace_size == 0);
   }
   checks.Require(first_scientific.passed && AcceptedStepPasses(
-                     uninterrupted.evidence().accepted_steps[0], 1) &&
+                     uninterrupted.evidence().accepted, 1) &&
                      capture_policy_exact,
                  "functional step-1 solver-linked scientific/accounting gates");
 
@@ -2128,10 +2128,7 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
     const CpuRunEvidence& evidence = uninterrupted.evidence();
     checks.Require(scientific.passed &&
                        evidence.accepted_step_count == step &&
-                       AcceptedStepPasses(
-                           evidence.accepted_steps[
-                               static_cast<std::size_t>(step - 1)],
-                           step) &&
+                       AcceptedStepPasses(evidence.accepted, step) &&
                        StorageUnchanged(uninterrupted_storage,
                                         evidence.storage),
                    "functional uninterrupted history and persistent reuse");
@@ -2272,7 +2269,6 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
             step_oracles[static_cast<std::size_t>(step)], communicator);
     const StoredCpuState& expected = reference[static_cast<std::size_t>(step)];
     const CpuRunEvidence& evidence = reader.evidence();
-    const std::size_t local_history = static_cast<std::size_t>(step - 11);
     checks.Require(scientific.passed &&
                        CloseVectors(actual.interior, expected.interior,
                                 4096.0 *
@@ -2284,9 +2280,8 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
                                         std::numeric_limits<double>::epsilon(),
                                     4096.0 *
                                         std::numeric_limits<double>::epsilon()) &&
-                       evidence.accepted_step_count == local_history + 1 &&
-                       AcceptedStepPasses(
-                           evidence.accepted_steps[local_history], step) &&
+                       evidence.accepted_step_count == step - 10 &&
+                       AcceptedStepPasses(evidence.accepted, step) &&
                        StorageUnchanged(reader_storage, evidence.storage),
                    "functional restart/retry trajectory and reuse equivalence");
   }
@@ -2826,9 +2821,7 @@ int RunSolverLinkedConvergence(const MPI_Comm communicator, const int rank)
         const CpuRunEvidence& evidence = adapter.evidence();
         all_steps_admitted = evaluation.passed &&
             evidence.accepted_step_count == step &&
-            AcceptedStepPasses(
-                evidence.accepted_steps[static_cast<std::size_t>(step - 1)],
-                step);
+            AcceptedStepPasses(evidence.accepted, step);
         previous = StoreState(adapter.Snapshot());
       }
       else

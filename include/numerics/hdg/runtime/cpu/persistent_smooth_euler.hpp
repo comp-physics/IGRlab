@@ -348,31 +348,6 @@ struct CpuAcceptedEvidence
   CpuAttemptEvidence attempt{};
 };
 
-/** Compact, allocation-free accepted-step history for persistent runs. */
-struct CpuAcceptedStepEvidence
-{
-  bool valid = false;
-  StateCoordinates coordinates{};
-  StateHash interior_hash{};
-  StateHash trace_hash{};
-  double initial_nonlinear_residual = 0.0;
-  double final_nonlinear_residual = 0.0;
-  double maximum_true_relative_residual = 0.0;
-  double minimum_density = 0.0;
-  double minimum_pressure = 0.0;
-  double maximum_wave_speed = 0.0;
-  std::uint64_t attempt_sequence = 0;
-  std::uint64_t post_baseline_allocation_events = 0;
-  int nonlinear_updates = 0;
-  int linear_iterations = 0;
-  CpuWorkCensus work{};
-  TransferAccounting transfers{0, 0, 0, 0, 0, true};
-  bool finite_gate = false;
-  bool admissibility_gate = false;
-  bool nonlinear_gate = false;
-  bool true_residual_gate = false;
-};
-
 struct CpuRunEvidence
 {
   RuntimeTupleDescriptor tuple{};
@@ -400,8 +375,6 @@ struct CpuRunEvidence
   CpuStorageEvidence storage{};
   CpuAttemptEvidence last_attempt{};
   CpuAcceptedEvidence accepted{};
-  std::array<CpuAcceptedStepEvidence, cpu_functional_accepted_steps>
-      accepted_steps{};
   std::size_t accepted_step_count = 0;
   std::uint64_t topology_builds = 0;
   std::uint64_t attempts = 0;

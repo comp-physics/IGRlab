@@ -5068,34 +5068,7 @@ void detail::CpuNumericsCore::Complete(
     state.evidence.accepted.rank_common_trace_hash =
         CpuStateStoragePolicy::HashTrace(state.committed_slot.trace);
     state.evidence.accepted.attempt = attempt;
-    if (state.evidence.accepted_step_count <
-        state.evidence.accepted_steps.size())
-    {
-      CpuAcceptedStepEvidence& step = state.evidence.accepted_steps[
-          state.evidence.accepted_step_count++];
-      step.valid = true;
-      step.coordinates = coordinates;
-      step.interior_hash = attempt.committed_interior_after;
-      step.trace_hash = attempt.committed_trace_after;
-      step.initial_nonlinear_residual = attempt.initial_nonlinear_residual;
-      step.final_nonlinear_residual = attempt.final_nonlinear_residual;
-      step.maximum_true_relative_residual =
-          attempt.maximum_true_relative_residual;
-      step.minimum_density = attempt.minimum_density;
-      step.minimum_pressure = attempt.minimum_pressure;
-      step.maximum_wave_speed = attempt.maximum_wave_speed;
-      step.attempt_sequence = attempt.identity.sequence;
-      step.post_baseline_allocation_events =
-          attempt.transfers.allocation_events;
-      step.nonlinear_updates = attempt.nonlinear_updates;
-      step.linear_iterations = attempt.linear_iterations;
-      step.work = attempt.work;
-      step.transfers = attempt.transfers;
-      step.finite_gate = attempt.finite_gate;
-      step.admissibility_gate = attempt.admissibility_gate;
-      step.nonlinear_gate = attempt.nonlinear_gate;
-      step.true_residual_gate = attempt.true_residual_gate;
-    }
+    ++state.evidence.accepted_step_count;
     ++state.evidence.commits;
   }
   else
