@@ -159,7 +159,6 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
   target_include_directories(dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test
     PRIVATE
       "${PROJECT_SOURCE_DIR}/include"
-      "${PROJECT_SOURCE_DIR}/tests/hdg/runtime/common"
       "${CMAKE_CURRENT_SOURCE_DIR}")
 
   target_link_libraries(dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test
