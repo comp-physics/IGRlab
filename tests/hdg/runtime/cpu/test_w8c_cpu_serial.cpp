@@ -368,7 +368,7 @@ int main(int argc, char** argv)
                  "scalar negative trajectory must preserve committed step 10 without a hidden retry");
   checks.Require(scalar_failed_attempt.target_step == 11 &&
                      scalar_failed_attempt.final_line_search_trials ==
-                         sc25::persistent_line_search_maximum_trials &&
+                         sc25::persistent_line_search_trials &&
                      scalar_failed_attempt.newton_iterations == 0,
                  "scalar target step 11 must not silently accept an inadmissible trial");
 
