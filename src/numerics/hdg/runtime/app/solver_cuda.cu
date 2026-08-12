@@ -2652,7 +2652,6 @@ std::string ScalarCudaMetadata(
     const StateHash& final_trace, const ScalarInjectionAudit& injection,
     const ScalarResourceRecord& resource, const std::string& diagnostic)
 {
-#if defined(DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT)
   const double maximum_conservation = evidence.maximum_conservation_error;
   const double minimum_density = evidence.minimum_density;
   const double minimum_pressure = evidence.minimum_pressure;
@@ -2660,17 +2659,7 @@ std::string ScalarCudaMetadata(
   const bool trace_residual_gate =
       evidence.maximum_trace_residual_ratio <= 1.0;
   const std::uint64_t physical_cuda_transfers =
-      evidence.transfer_totals.event_count;
-#else
-  const double maximum_conservation = evidence.maximum_conservation_error;
-  const double minimum_density = evidence.minimum_density;
-  const double minimum_pressure = evidence.minimum_pressure;
-  const double minimum_speed_margin = evidence.minimum_speed_margin;
-  const bool trace_residual_gate =
-      evidence.maximum_trace_residual_ratio <= 1.0;
-  const std::uint64_t physical_cuda_transfers =
-      evidence.transfer_totals.event_count;
-#endif
+      cuda::CudaTransportPolicy::Ledger().totals.event_count;
   const bool residency = evidence.residency.mfem_cuda_device &&
       evidence.residency.hypre_cuda && evidence.residency.umpire_device_pool &&
       evidence.residency.state_device_resident &&
