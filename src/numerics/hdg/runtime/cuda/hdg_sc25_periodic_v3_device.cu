@@ -2996,7 +2996,16 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
           std::isfinite(residual_norm) && std::isfinite(rhs_norm) &&
           residual_norm <= absolute_trace_tolerance +
               relative_trace_tolerance * rhs_norm;
-      if (valid) { ++solver_generation; }
+      if (valid)
+      {
+        ++solver_generation;
+        if (pending_attempt_active)
+        {
+          detail::UpdateMaximumNormalizedResidual(
+              pending_attempt.maximum_trace_residual_ratio, residual_norm,
+              rhs_norm, absolute_trace_tolerance, relative_trace_tolerance);
+        }
+      }
       return valid;
     }
     catch (...) { return false; }
@@ -3428,6 +3437,36 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
     return CaptureCheckpointSlot(committed_slot, coordinates, output);
   }
 
+  static void AccumulatePendingMetrics(
+      ScalarCudaEvidence& output,
+      const ScalarCudaAttemptEvidence& attempt) noexcept
+  {
+    output.maximum_attempted_newton_iterations = std::max(
+        output.maximum_attempted_newton_iterations,
+        attempt.attempted_newton_iterations);
+    output.maximum_newton_iterations = std::max(
+        output.maximum_newton_iterations, attempt.newton_iterations);
+    output.maximum_trace_iterations = std::max(
+        output.maximum_trace_iterations, attempt.maximum_trace_iterations);
+    output.minimum_density = std::min(output.minimum_density,
+                                      attempt.minimum_density);
+    output.minimum_pressure = std::min(output.minimum_pressure,
+                                       attempt.minimum_pressure);
+    output.minimum_speed_margin = std::min(output.minimum_speed_margin,
+                                            attempt.minimum_speed_margin);
+    output.maximum_conservation_error = std::max(
+        output.maximum_conservation_error, attempt.maximum_conservation_error);
+    detail::UpdateMaximumResidualRatio(
+        output.maximum_nonlinear_residual_ratio, attempt.final_residual_norm,
+        attempt.nonlinear_residual_bound);
+    output.maximum_trace_residual_ratio = std::max(
+        output.maximum_trace_residual_ratio,
+        attempt.maximum_trace_residual_ratio);
+    output.maximum_local_application_residual_ratio = std::max(
+        output.maximum_local_application_residual_ratio,
+        attempt.maximum_local_application_residual_ratio);
+  }
+
   void AccumulateAcceptedPendingMetrics(ScalarCudaEvidence& output) const
       noexcept
   {
@@ -3443,39 +3482,7 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
     output.last_accepted_step = accepted_step;
     ++output.accepted_steps;
     ++output.attempted_steps;
-    output.maximum_attempted_newton_iterations = std::max(
-        output.maximum_attempted_newton_iterations,
-        accepted_attempt.attempted_newton_iterations);
-    output.maximum_newton_iterations = std::max(
-        output.maximum_newton_iterations, accepted_attempt.newton_iterations);
-    output.maximum_trace_iterations = std::max(
-        output.maximum_trace_iterations,
-        accepted_attempt.maximum_trace_iterations);
-    output.minimum_density = std::min(
-        output.minimum_density, accepted_attempt.minimum_density);
-    output.minimum_pressure = std::min(
-        output.minimum_pressure, accepted_attempt.minimum_pressure);
-    output.minimum_speed_margin = std::min(
-        output.minimum_speed_margin, accepted_attempt.minimum_speed_margin);
-    output.maximum_conservation_error = std::max(
-        output.maximum_conservation_error,
-        accepted_attempt.maximum_conservation_error);
-    const double trace_bound = std::max(
-        output.trace_absolute_tolerance,
-        output.trace_relative_tolerance *
-            accepted_attempt.maximum_trace_right_hand_side);
-    if (trace_bound > 0.0)
-      output.maximum_trace_residual_ratio = std::max(
-          output.maximum_trace_residual_ratio,
-          accepted_attempt.maximum_trace_true_residual / trace_bound);
-    if (accepted_attempt.nonlinear_residual_bound > 0.0)
-      output.maximum_nonlinear_residual_ratio = std::max(
-          output.maximum_nonlinear_residual_ratio,
-          accepted_attempt.final_residual_norm /
-              accepted_attempt.nonlinear_residual_bound);
-    output.maximum_local_application_residual_ratio = std::max(
-        output.maximum_local_application_residual_ratio,
-        accepted_attempt.maximum_local_application_residual);
+    AccumulatePendingMetrics(output, accepted_attempt);
     output.coordinates = accepted_attempt.candidate_coordinates;
     output.status = accepted_attempt.status;
   }
@@ -3597,23 +3604,9 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
     evidence.last_attempt = pending_attempt;
     if (evidence.first_failed_attempt.status == ScalarCudaStatus::uninitialized)
       evidence.first_failed_attempt = pending_attempt;
+    AccumulatePendingMetrics(evidence, pending_attempt);
     ++evidence.attempted_steps;
     ++evidence.rejected_steps;
-    evidence.maximum_attempted_newton_iterations = std::max(
-        evidence.maximum_attempted_newton_iterations,
-        pending_attempt.attempted_newton_iterations);
-    evidence.maximum_newton_iterations = std::max(
-        evidence.maximum_newton_iterations, pending_attempt.newton_iterations);
-    evidence.maximum_trace_iterations = std::max(
-        evidence.maximum_trace_iterations, pending_attempt.maximum_trace_iterations);
-    evidence.minimum_density = std::min(
-        evidence.minimum_density, pending_attempt.minimum_density);
-    evidence.minimum_pressure = std::min(
-        evidence.minimum_pressure, pending_attempt.minimum_pressure);
-    evidence.minimum_speed_margin = std::min(
-        evidence.minimum_speed_margin, pending_attempt.minimum_speed_margin);
-    evidence.maximum_conservation_error = std::max(
-        evidence.maximum_conservation_error, pending_attempt.maximum_conservation_error);
     if (first_failure == ScalarCudaStatus::uninitialized)
     {
       first_failure = failure;
@@ -4085,13 +4078,9 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank1::
     }
     value.pending_attempt.maximum_trace_iterations = std::max(
         value.pending_attempt.maximum_trace_iterations, trace_iterations);
-    value.pending_attempt.maximum_trace_true_residual = std::max(
-        value.pending_attempt.maximum_trace_true_residual, trace_residual);
-    value.pending_attempt.maximum_trace_right_hand_side = std::max(
-        value.pending_attempt.maximum_trace_right_hand_side, trace_rhs);
-    value.pending_attempt.maximum_local_application_residual = std::max(
-        value.pending_attempt.maximum_local_application_residual,
-        solve_metrics[4]);
+    detail::UpdateMaximumLocalApplicationResidual(
+        value.pending_attempt.maximum_local_application_residual_ratio,
+        solve_metrics[4], solve_metrics[7]);
     bool accepted = false;
     for (int line = 0; line < line_search_trials; ++line)
     {

@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -69,8 +70,30 @@ bool RunC1()
   return passed;
 }
 
+bool CompactRatioNormalization()
+{
+  double maximum = 0.0;
+  scalar::detail::UpdateMaximumNormalizedResidual(
+      maximum, 100.0, 100.0, 0.0, 1.0);
+  scalar::detail::UpdateMaximumNormalizedResidual(
+      maximum, 2.0, 1.0, 0.0, 1.0);
+  const double zero_bound = scalar::detail::NormalizedResidualRatio(
+      0.0, 0.0, 0.0, 0.0);
+  const double nonzero_zero_bound = scalar::detail::NormalizedResidualRatio(
+      1.0, 0.0, 0.0, 0.0);
+  const double invalid = scalar::detail::NormalizedResidualRatio(
+      std::numeric_limits<double>::quiet_NaN(), 1.0, 0.0, 1.0);
+  double invalid_local = 0.0;
+  scalar::detail::UpdateMaximumLocalApplicationResidual(
+      invalid_local, 1.0, -1.0);
+  return maximum == 2.0 && zero_bound == 0.0 &&
+      std::isinf(nonzero_zero_bound) && std::isinf(invalid) &&
+      std::isinf(invalid_local);
+}
+
 bool RunC2()
 {
+  if (!CompactRatioNormalization()) return false;
   auto owner = Create();
   if (!owner || owner->InitializePersistentTrajectory() !=
       scalar::ScalarCudaStatus::ready)
@@ -104,7 +127,12 @@ bool RunC2()
       std::isfinite(prospective.minimum_pressure) &&
       prospective.minimum_pressure > 0.0 &&
       std::isfinite(prospective.minimum_speed_margin) &&
-      prospective.minimum_speed_margin > 0.0;
+      prospective.minimum_speed_margin > 0.0 &&
+      std::isfinite(prospective.maximum_trace_residual_ratio) &&
+      prospective.maximum_trace_residual_ratio >= 0.0 &&
+      prospective.maximum_trace_residual_ratio <= 1.0 &&
+      std::isfinite(prospective.maximum_local_application_residual_ratio) &&
+      prospective.maximum_local_application_residual_ratio >= 0.0;
   const bool live_unchanged =
       live_during_stage.status == live_before_stage.status &&
       live_during_stage.first_failure == live_before_stage.first_failure &&
@@ -121,6 +149,8 @@ bool RunC2()
       std::isinf(live_during_stage.minimum_density) &&
       std::isinf(live_during_stage.minimum_pressure) &&
       std::isinf(live_during_stage.minimum_speed_margin) &&
+      live_during_stage.maximum_trace_residual_ratio == 0.0 &&
+      live_during_stage.maximum_local_application_residual_ratio == 0.0 &&
       live_during_stage.coordinates.step == live_before_stage.coordinates.step &&
       live_during_stage.last_accepted_step.attempt_index ==
           live_before_stage.last_accepted_step.attempt_index;
@@ -170,8 +200,27 @@ bool RunC2()
       !owner->CopyPublishedTrajectoryState(committed))
     return false;
   if (owner->AdvancePersistentTrajectory(
-          scalar::FailureInjection::local_factor) !=
-          scalar::ScalarCudaStatus::accepted_after_one_retry ||
+          scalar::FailureInjection::admissibility) !=
+          scalar::ScalarCudaStatus::accepted_after_one_retry)
+    return false;
+  const auto& observed_rejection = owner->trajectory_evidence();
+  const bool observed_ratios = observed_rejection.rejected_steps == 1 &&
+      observed_rejection.retry_attempts == 1 &&
+      observed_rejection.first_failed_attempt.status !=
+          scalar::ScalarCudaStatus::uninitialized &&
+      std::isfinite(
+          observed_rejection.first_failed_attempt.maximum_trace_residual_ratio) &&
+      observed_rejection.first_failed_attempt.maximum_trace_residual_ratio >= 0.0 &&
+      std::isfinite(observed_rejection.first_failed_attempt
+                        .maximum_local_application_residual_ratio) &&
+      observed_rejection.first_failed_attempt
+              .maximum_local_application_residual_ratio >= 0.0 &&
+      observed_rejection.maximum_trace_residual_ratio >=
+          observed_rejection.first_failed_attempt.maximum_trace_residual_ratio &&
+      observed_rejection.maximum_local_application_residual_ratio >=
+          observed_rejection.first_failed_attempt
+              .maximum_local_application_residual_ratio;
+  if (!observed_ratios ||
       owner->RestoreTrajectoryCheckpoint(checkpoint) !=
           scalar::ScalarCudaStatus::ready)
     return false;
@@ -244,7 +293,12 @@ bool RunC2()
       std::isinf(early_failure.minimum_pressure) &&
       early_failure.minimum_pressure > 0.0 &&
       std::isinf(early_failure.minimum_speed_margin) &&
-      early_failure.minimum_speed_margin > 0.0;
+      early_failure.minimum_speed_margin > 0.0 &&
+      early_failure.maximum_trace_residual_ratio == 0.0 &&
+      early_failure.maximum_local_application_residual_ratio == 0.0 &&
+      early_failure.first_failed_attempt.maximum_trace_residual_ratio == 0.0 &&
+      early_failure.first_failed_attempt
+              .maximum_local_application_residual_ratio == 0.0;
   scalar::PersistentSc25ScalarIgrCudaRank1::Transaction retry{};
   if (!failed_minima ||
       owner->PreparePersistentTrajectoryTransaction(retry) !=
@@ -281,6 +335,11 @@ bool RunC2()
       std::isfinite(evidence.minimum_pressure) && evidence.minimum_pressure > 0.0 &&
       std::isfinite(evidence.minimum_speed_margin) &&
       evidence.minimum_speed_margin > 0.0 &&
+      std::isfinite(evidence.maximum_trace_residual_ratio) &&
+      evidence.maximum_trace_residual_ratio >= 0.0 &&
+      evidence.maximum_trace_residual_ratio <= 1.0 &&
+      std::isfinite(evidence.maximum_local_application_residual_ratio) &&
+      evidence.maximum_local_application_residual_ratio >= 0.0 &&
       std::isfinite(audit.minimum_density) && std::isfinite(audit.minimum_pressure) &&
       std::isfinite(audit.minimum_speed_margin) &&
       sizeof(scalar::ScalarCudaEvidence) < 4096;
