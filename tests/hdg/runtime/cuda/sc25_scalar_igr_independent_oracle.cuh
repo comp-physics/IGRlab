@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -73,6 +74,12 @@ inline bool AuditPublishedState(
   audit.minimum_density = INFINITY;
   audit.minimum_pressure = INFINITY;
   audit.minimum_speed_margin = INFINITY;
+  const auto reject = [](const auto&... values) {
+    std::cerr << "SC25_CUDA_RANK1_AUDIT";
+    ((std::cerr << ' ' << values), ...);
+    std::cerr << '\n';
+    return false;
+  };
   try
   {
     mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
@@ -80,6 +87,8 @@ inline bool AuditPublishedState(
     std::vector<mfem::Vector> translations(
         scalar::dimension, mfem::Vector(scalar::dimension));
     translations[0][0] = 1.0;
+    translations[0][1] = 0.0;
+    translations[1][0] = 0.0;
     translations[1][1] = 1.0;
     mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
         original, original.CreatePeriodicVertexMapping(translations));
@@ -97,10 +106,27 @@ inline bool AuditPublishedState(
         &mesh, &trace_collection, scalar::trace_components,
         mfem::Ordering::byNODES);
     if (mesh.GetNE() != scalar::persistent_elements ||
+        mesh.GetNumFaces() != 2 * scalar::persistent_elements ||
         volume_space.GetVSize() !=
             scalar::persistent_elements * scalar::volume_nodes ||
-        trace_space.GetTrueVSize() != scalar::persistent_trace_unknowns)
-      return false;
+        trace_space.GetVDim() != scalar::trace_components ||
+        trace_space.GetOrdering() != mfem::Ordering::byNODES ||
+        trace_space.GetTrueVSize() != scalar::persistent_trace_unknowns ||
+        trace_space.GetTrueVSize() / scalar::trace_components !=
+            scalar::persistent_scalar_trace_nodes ||
+        state.uhat.size() != static_cast<std::size_t>(
+            scalar::state_components * scalar::persistent_scalar_trace_nodes) ||
+        state.sigmahat.size() != static_cast<std::size_t>(
+            scalar::persistent_scalar_trace_nodes))
+      return reject("dimensions", "mesh", mesh.GetNE(), "faces",
+                    mesh.GetNumFaces(), "volume",
+                    volume_space.GetVSize(), "trace_vdim",
+                    trace_space.GetVDim(), "trace_ordering",
+                    static_cast<int>(trace_space.GetOrdering()), "trace_true",
+                    trace_space.GetTrueVSize(), "trace_nodes",
+                    trace_space.GetTrueVSize() / scalar::trace_components,
+                    "uhat", state.uhat.size(), "sigmahat",
+                    state.sigmahat.size());
 
     for (int element = 0; element < mesh.GetNE(); ++element)
     {
@@ -109,7 +135,10 @@ inline bool AuditPublishedState(
           mesh.GetElementTransformation(element);
       if (finite_element == nullptr || transformation == nullptr ||
           finite_element->GetDof() != scalar::volume_nodes)
-        return false;
+        return reject("volume-precondition", "element", element, "fe",
+                      finite_element != nullptr, "transform",
+                      transformation != nullptr, "dof",
+                      finite_element == nullptr ? -1 : finite_element->GetDof());
       const mfem::IntegrationRule& rule = mfem::IntRules.Get(
           finite_element->GetGeomType(), quadrature_order);
       mfem::Vector shape(scalar::volume_nodes);
@@ -129,7 +158,9 @@ inline bool AuditPublishedState(
                     scalar::volume_nodes + node] * shape[node];
         if (!(weight > 0.0) || !std::isfinite(weight) ||
             !AuditPrimitive(value, audit))
-          return false;
+          return reject("volume-primitive", "element", element, "q", point,
+                        "weight", weight, "rho", value[0], "mx", value[1],
+                        "my", value[2], "E", value[3]);
         for (int component = 0; component < scalar::state_components;
              ++component)
           audit.integrals[component] += weight * value[component];
@@ -151,7 +182,13 @@ inline bool AuditPublishedState(
           face_element->GetDof() != scalar::face_nodes ||
           face_vdofs.Size() !=
               scalar::trace_components * scalar::face_nodes)
-        return false;
+        return reject("face-precondition", "face", face, "transform",
+                      face_transformations != nullptr, "face_transform",
+                      face_transformations != nullptr &&
+                          face_transformations->Face != nullptr, "fe",
+                      face_element != nullptr, "dof",
+                      face_element == nullptr ? -1 : face_element->GetDof(),
+                      "vdofs", face_vdofs.Size());
       mfem::Vector face_shape(scalar::face_nodes);
       for (int point = 0; point < face_rule.GetNPoints(); ++point)
       {
@@ -168,13 +205,20 @@ inline bool AuditPublishedState(
             const int local_dof = encoded < 0 ? -1 - encoded : encoded;
             const int true_dof = trace_space.GetLocalTDofNumber(local_dof);
             if (true_dof < 0 || true_dof >=
-                    static_cast<int>(state.uhat.size()))
-              return false;
+                    static_cast<int>(state.uhat.size()) ||
+                true_dof / scalar::persistent_scalar_trace_nodes != component)
+              return reject("uhat-mapping", "face", face, "component",
+                            component, "node", node, "encoded", encoded,
+                            "local", local_dof, "true", true_dof, "uhat",
+                            state.uhat.size());
             trace_value[component] +=
                 sign * state.uhat[static_cast<std::size_t>(true_dof)] *
                     face_shape[node];
           }
-        if (!AuditPrimitive(trace_value, audit)) { return false; }
+        if (!AuditPrimitive(trace_value, audit))
+          return reject("trace-primitive", "face", face, "q", point, "rho",
+                        trace_value[0], "mx", trace_value[1], "my",
+                        trace_value[2], "E", trace_value[3]);
         ++audit.trace_points;
 
         face_transformations->SetAllIntPoints(&face_point);
@@ -188,7 +232,9 @@ inline bool AuditPublishedState(
               : face_transformations->GetElement2IntPoint();
           const mfem::FiniteElement* finite_element =
               volume_space.GetFE(elements[side]);
-          if (finite_element == nullptr) { return false; }
+          if (finite_element == nullptr)
+            return reject("side-precondition", "face", face, "q", point,
+                          "side", side, "element", elements[side]);
           mfem::Vector shape(scalar::volume_nodes);
           finite_element->CalcShape(element_point, shape);
           double side_value[scalar::state_components]{};
@@ -198,15 +244,26 @@ inline bool AuditPublishedState(
               side_value[component] += state.u[
                   (elements[side] * scalar::state_components + component) *
                       scalar::volume_nodes + node] * shape[node];
-          if (!AuditPrimitive(side_value, audit)) { return false; }
+          if (!AuditPrimitive(side_value, audit))
+            return reject("side-primitive", "face", face, "q", point,
+                          "side", side, "element", elements[side], "rho",
+                          side_value[0], "mx", side_value[1], "my",
+                          side_value[2], "E", side_value[3]);
           ++audit.side_points;
         }
       }
     }
-    return audit.volume_points > 0 && audit.side_points > 0 &&
-        audit.trace_points > 0;
+    if (!(audit.volume_points > 0 && audit.side_points > 0 &&
+          audit.trace_points > 0))
+      return reject("empty", "volume", audit.volume_points, "side",
+                    audit.side_points, "trace", audit.trace_points);
+    return true;
   }
-  catch (...) { return false; }
+  catch (const std::exception& exception)
+  {
+    return reject("exception", exception.what());
+  }
+  catch (...) { return reject("unknown-exception"); }
 }
 
 inline constexpr std::uint64_t fnv_offset = 1469598103934665603ULL;
@@ -221,619 +278,6 @@ inline void MixBytes(std::uint64_t& hash, const void* data,
     hash ^= bytes[index];
     hash *= fnv_prime;
   }
-}
-
-template <typename T>
-void MixScalar(std::uint64_t& hash, const T value) noexcept
-{
-  MixBytes(hash, &value, sizeof(value));
-}
-
-inline std::uint64_t IndependentEndpointToken(
-    const scalar::cuda_w8a::TransferEventV1& event) noexcept
-{
-  std::uint64_t token = fnv_offset;
-  MixScalar(token, event.direction);
-  MixScalar(token, event.category);
-  MixScalar(token, event.site);
-  MixScalar(token, event.context.attempt_sequence);
-  MixScalar(token, event.context.target_step);
-  MixScalar(token, event.context.generation);
-  MixScalar(token, event.context.rank);
-  MixScalar(token, event.context.phase);
-  MixScalar(token, event.ordinal);
-  MixScalar(token, event.source_token);
-  MixScalar(token, event.destination_token);
-  MixScalar(token, event.bytes);
-  MixScalar(token, event.source_capacity);
-  MixScalar(token, event.destination_capacity);
-  MixScalar(token, event.success);
-  return token;
-}
-
-inline bool AddTransfer(
-    scalar::cuda_w8a::CudaTransferTotals& totals,
-    const scalar::cuda_w8a::TransferEventV1& event) noexcept
-{
-  if (totals.event_count == std::numeric_limits<std::uint64_t>::max())
-    return false;
-  ++totals.event_count;
-  totals.complete = totals.complete && event.success;
-  if (!event.success) { return false; }
-  std::uint64_t* endpoint = nullptr;
-  using Direction = scalar::cuda_w8a::CudaTransferDirection;
-  if (event.direction == Direction::host_to_device)
-    endpoint = &totals.host_to_device_bytes;
-  else if (event.direction == Direction::device_to_host)
-    endpoint = &totals.device_to_host_bytes;
-  else if (event.direction == Direction::device_to_device)
-    endpoint = &totals.device_to_device_bytes;
-  else
-    endpoint = &totals.mpi_staging_bytes;
-  if (event.bytes > std::numeric_limits<std::uint64_t>::max() - *endpoint)
-    return false;
-  *endpoint += event.bytes;
-  return true;
-}
-
-inline bool SameTransferTotals(
-    const scalar::cuda_w8a::CudaTransferTotals& left,
-    const scalar::cuda_w8a::CudaTransferTotals& right) noexcept
-{
-  return left.host_to_device_bytes == right.host_to_device_bytes &&
-      left.device_to_host_bytes == right.device_to_host_bytes &&
-      left.device_to_device_bytes == right.device_to_device_bytes &&
-      left.mpi_staging_bytes == right.mpi_staging_bytes &&
-      left.synchronization_events == right.synchronization_events &&
-      left.event_count == right.event_count &&
-      left.complete == right.complete;
-}
-
-inline bool ValidateTransferRoute(
-    const scalar::cuda_w8a::TransferEventV1& event) noexcept
-{
-  using Category = scalar::cuda_w8a::CudaTransferCategory;
-  using Direction = scalar::cuda_w8a::CudaTransferDirection;
-  using Site = scalar::cuda_w8a::CudaTransferSite;
-  if (!event.success || event.bytes == 0 || event.source_token == 0 ||
-      event.destination_token == 0 || event.source_capacity != event.bytes ||
-      event.destination_capacity != event.bytes || event.context.rank != 0)
-  {
-    return false;
-  }
-  if (event.context.attempt_sequence == 0)
-  {
-    if (event.context.target_step != 0 || event.context.generation != 0)
-      return false;
-  }
-  else if (event.context.attempt_sequence != event.context.target_step ||
-           event.context.target_step != event.context.generation ||
-           event.context.target_step > scalar::persistent_required_steps)
-  {
-    return false;
-  }
-  if (event.direction == Direction::host_to_device &&
-      event.category == Category::topology &&
-      (event.site == Site::map_upload ||
-       event.site == Site::quadrature_upload))
-    return true;
-  if (event.direction == Direction::host_to_device &&
-      event.category == Category::scalar_diagnostic &&
-      event.site == Site::scalar_status && event.bytes == sizeof(int))
-    return true;
-  if (event.direction == Direction::device_to_host &&
-      event.category == Category::scalar_diagnostic &&
-      event.site == Site::scalar_status &&
-      (event.bytes == sizeof(int) || event.bytes == 16 * sizeof(double)))
-    return true;
-  if (event.direction == Direction::device_to_host &&
-      event.category == Category::scalar_diagnostic &&
-      event.site == Site::state_hash &&
-      (event.bytes == 7 * 32 || event.bytes == 2 * 32))
-    return true;
-  if (event.direction == Direction::device_to_host &&
-      event.category == Category::oracle_export &&
-      event.site == Site::oracle_export &&
-      (event.bytes == scalar::persistent_interior_unknowns * sizeof(double) ||
-       event.bytes == scalar::persistent_trace_unknowns * sizeof(double)))
-    return true;
-  if (event.direction == Direction::device_to_host &&
-      event.category == Category::checkpoint_candidate_staging &&
-      ((event.site == Site::checkpoint_stage_interior &&
-        event.bytes == scalar::persistent_interior_unknowns * sizeof(double)) ||
-       (event.site == Site::checkpoint_stage_trace &&
-        event.bytes == scalar::persistent_trace_unknowns * sizeof(double))))
-    return true;
-  if (event.direction == Direction::host_to_device &&
-      event.category == Category::checkpoint_restore_import &&
-      ((event.site == Site::checkpoint_import_interior &&
-        event.bytes == scalar::persistent_interior_unknowns * sizeof(double)) ||
-       (event.site == Site::checkpoint_import_trace &&
-        event.bytes == scalar::persistent_trace_unknowns * sizeof(double))))
-    return true;
-  return false;
-}
-
-enum class TransferCensusScenario : unsigned char
-{
-  coupled_operator_c1,
-  persistent_trajectory_c2
-};
-
-struct TransferCensusExpectation final
-{
-  TransferCensusScenario scenario =
-      TransferCensusScenario::persistent_trajectory_c2;
-  int elements = 64;
-};
-
-inline constexpr TransferCensusExpectation c1_transfer_expectation{
-    TransferCensusScenario::coupled_operator_c1, 9};
-inline constexpr TransferCensusExpectation c2_transfer_expectation{
-    TransferCensusScenario::persistent_trajectory_c2, 64};
-
-inline bool ValidTransferCensusExpectation(
-    const TransferCensusExpectation expectation) noexcept
-{
-  return (expectation.scenario ==
-              TransferCensusScenario::coupled_operator_c1 &&
-          expectation.elements == 9) ||
-      (expectation.scenario ==
-              TransferCensusScenario::persistent_trajectory_c2 &&
-       expectation.elements == 64);
-}
-
-inline bool ValidateLaunchTransferCoherence(
-    const scalar::cuda_w8a::CudaTransferLedgerV1& ledger,
-    const scalar::ScalarCudaLaunchLedger& launches) noexcept
-{
-  using Category = scalar::cuda_w8a::CudaTransferCategory;
-  using Direction = scalar::cuda_w8a::CudaTransferDirection;
-  using Site = scalar::cuda_w8a::CudaTransferSite;
-  if (ledger.schema != 1 ||
-      ledger.capacity != scalar::cuda_w8a::maximum_transfer_events ||
-      ledger.count != ledger.observed_count ||
-      ledger.count != ledger.totals.event_count || ledger.overflow ||
-      ledger.dropped_count != 0 || !ledger.totals.complete)
-  {
-    return false;
-  }
-  const auto same_context = [](const auto& left, const auto& right)
-  {
-    return left.attempt_sequence == right.attempt_sequence &&
-        left.target_step == right.target_step &&
-        left.generation == right.generation && left.rank == right.rank &&
-        left.phase == right.phase;
-  };
-  std::uint64_t kernel_groups = 0;
-  for (std::size_t index = 0; index < ledger.count; ++index)
-  {
-    const auto& clear_status = ledger.events[index];
-    if (clear_status.direction != Direction::host_to_device ||
-        clear_status.category != Category::scalar_diagnostic ||
-        clear_status.site != Site::scalar_status)
-    {
-      continue;
-    }
-    if (index + 3 >= ledger.count) { return false; }
-    const auto& clear_architecture = ledger.events[index + 1];
-    const auto& read_status = ledger.events[index + 2];
-    const auto& read_architecture = ledger.events[index + 3];
-    if (clear_status.bytes != sizeof(int) || !clear_status.success ||
-        clear_architecture.direction != Direction::host_to_device ||
-        clear_architecture.category != Category::scalar_diagnostic ||
-        clear_architecture.site != Site::scalar_status ||
-        clear_architecture.bytes != sizeof(int) ||
-        !clear_architecture.success ||
-        read_status.direction != Direction::device_to_host ||
-        read_status.category != Category::scalar_diagnostic ||
-        read_status.site != Site::scalar_status ||
-        read_status.bytes != sizeof(int) || !read_status.success ||
-        read_architecture.direction != Direction::device_to_host ||
-        read_architecture.category != Category::scalar_diagnostic ||
-        read_architecture.site != Site::scalar_status ||
-        read_architecture.bytes != sizeof(int) ||
-        !read_architecture.success ||
-        !same_context(clear_status.context, clear_architecture.context) ||
-        !same_context(clear_status.context, read_status.context) ||
-        !same_context(clear_status.context, read_architecture.context))
-    {
-      return false;
-    }
-    ++kernel_groups;
-    index += 3;
-  }
-  return kernel_groups == launches.assemble_launches +
-      launches.condense_launches + launches.recover_launches;
-}
-
-inline bool ExpectedReductionReads(
-    const scalar::ScalarCudaEvidence& evidence,
-    const TransferCensusExpectation expectation,
-    std::uint64_t& output) noexcept
-{
-  output = 0;
-  if (!ValidTransferCensusExpectation(expectation) ||
-      expectation.scenario !=
-          TransferCensusScenario::persistent_trajectory_c2 ||
-      evidence.accepted_steps != scalar::persistent_required_steps ||
-      evidence.attempted_steps != scalar::persistent_required_steps ||
-      evidence.attempt_count != scalar::persistent_required_steps ||
-      evidence.retry_attempts != 0)
-  {
-    return false;
-  }
-  // Initialization performs one terminal state reduction.  Every accepted
-  // C2 attempt then performs one entry and one candidate reduction, one
-  // residual reduction per attempted Newton iteration, one recovered-solve
-  // reduction per completed Newton update, and one reduction for each trial
-  // whose device admissibility audit completed.
-  output = 1;
-  for (int attempt_index = 0; attempt_index < evidence.attempt_count;
-       ++attempt_index)
-  {
-    const auto& attempt =
-        evidence.attempts[static_cast<std::size_t>(attempt_index)];
-    if (attempt.status != scalar::ScalarCudaStatus::accepted ||
-        attempt.retry_index != 0 ||
-        attempt.attempted_newton_iterations !=
-            attempt.newton_iterations + 1 ||
-        attempt.newton_iterations < 0 ||
-        attempt.newton_iterations >= scalar::newton_maximum_iterations)
-    {
-      return false;
-    }
-    output += 2 +
-        static_cast<std::uint64_t>(attempt.attempted_newton_iterations) +
-        static_cast<std::uint64_t>(attempt.newton_iterations);
-    for (int iteration = 0; iteration < attempt.newton_iterations;
-         ++iteration)
-    {
-      const auto& newton =
-          attempt.newton[static_cast<std::size_t>(iteration)];
-      if (newton.iteration != iteration ||
-          newton.accepted_line_search_index < 0 ||
-          newton.accepted_line_search_index >= scalar::line_search_trials ||
-          newton.trial_admissible[static_cast<std::size_t>(
-              newton.accepted_line_search_index)] != 1)
-      {
-        return false;
-      }
-      for (int trial = 0; trial < scalar::line_search_trials; ++trial)
-      {
-        const std::uint8_t admissible =
-            newton.trial_admissible[static_cast<std::size_t>(trial)];
-        if (admissible > 1) { return false; }
-        if (admissible != 0)
-        {
-          ++output;
-        }
-      }
-    }
-  }
-  return true;
-}
-
-inline bool ValidateTransferLedger(
-    const scalar::cuda_w8a::CudaTransferLedgerV1& ledger,
-    const scalar::ScalarCudaEvidence& evidence,
-    const TransferCensusExpectation expectation) noexcept
-{
-  using Category = scalar::cuda_w8a::CudaTransferCategory;
-  using Direction = scalar::cuda_w8a::CudaTransferDirection;
-  using Site = scalar::cuda_w8a::CudaTransferSite;
-  if (!ValidTransferCensusExpectation(expectation) ||
-      expectation.scenario !=
-          TransferCensusScenario::persistent_trajectory_c2 ||
-      ledger.schema != 1 ||
-      ledger.capacity != scalar::cuda_w8a::maximum_transfer_events ||
-      ledger.count == 0 || ledger.count != ledger.observed_count ||
-      ledger.count != ledger.totals.event_count || ledger.overflow ||
-      ledger.dropped_count != 0 || !ledger.totals.complete)
-  {
-    return false;
-  }
-  if (ledger.count < 20) { return false; }
-  const std::uint64_t elements =
-      static_cast<std::uint64_t>(expectation.elements);
-  const std::uint64_t true_trace = 20 * elements;
-  const std::uint64_t volume_points = 49 * elements;
-  const std::uint64_t face_points = 28 * elements;
-  const std::array<std::uint64_t, 20> upload_bytes{{
-      elements * scalar::local_trace_unknowns * sizeof(int),
-      elements * scalar::local_trace_unknowns * sizeof(int),
-      elements * scalar::local_trace_unknowns *
-          scalar::local_trace_unknowns * sizeof(int),
-      (true_trace + 1) * sizeof(int),
-      true_trace * 70 * sizeof(int),
-      volume_points * sizeof(double),
-      volume_points * scalar::volume_nodes * sizeof(double),
-      volume_points * scalar::volume_nodes * scalar::dimension *
-          sizeof(double),
-      volume_points * sizeof(double),
-      volume_points * sizeof(double),
-      face_points * sizeof(double),
-      elements * 4 * sizeof(double),
-      face_points * scalar::volume_nodes * sizeof(double),
-      face_points * scalar::face_nodes * sizeof(double),
-      face_points * scalar::dimension * sizeof(double),
-      face_points * sizeof(double),
-      face_points * sizeof(double),
-      elements * scalar::volume_nodes * sizeof(double),
-      elements * scalar::volume_nodes * sizeof(double),
-      elements * 4 * scalar::face_nodes * sizeof(double)}};
-  for (std::size_t index = 0; index < upload_bytes.size(); ++index)
-  {
-    const auto& event = ledger.events[index];
-    const Site expected_site = index < 5 ? Site::map_upload
-                                         : Site::quadrature_upload;
-    if (event.direction != Direction::host_to_device ||
-        event.category != Category::topology ||
-        event.site != expected_site || event.bytes != upload_bytes[index] ||
-        event.source_capacity != upload_bytes[index] ||
-        event.destination_capacity != upload_bytes[index] ||
-        event.context.attempt_sequence != 0 ||
-        event.context.target_step != 0 || event.context.generation != 0 ||
-        event.context.rank != 0 || !event.success)
-    {
-      return false;
-    }
-  }
-
-  scalar::cuda_w8a::CudaTransferTotals totals{};
-  std::uint64_t digest = fnv_offset;
-  std::uint64_t kernel_groups = 0;
-  std::uint64_t reduction_reads = 0;
-  std::uint64_t state_hash_reads = 0;
-  std::uint64_t topology_hash_reads = 0;
-  std::uint64_t oracle_pairs = 0;
-  std::uint64_t checkpoint_pairs = 0;
-  std::uint64_t restore_pairs = 0;
-  std::uint64_t expected_reduction_reads = 0;
-  if (!ExpectedReductionReads(evidence, expectation,
-                              expected_reduction_reads))
-  {
-    return false;
-  }
-  for (std::size_t index = 0; index < ledger.count; ++index)
-  {
-    const auto& event = ledger.events[index];
-    if (event.ordinal != index + 1 || !ValidateTransferRoute(event) ||
-        event.endpoint_token != IndependentEndpointToken(event) ||
-        !AddTransfer(totals, event))
-    {
-      return false;
-    }
-    digest ^= event.endpoint_token;
-    digest *= fnv_prime;
-  }
-
-  const auto same_context = [](const auto& left, const auto& right)
-  {
-    return left.attempt_sequence == right.attempt_sequence &&
-        left.target_step == right.target_step &&
-        left.generation == right.generation && left.rank == right.rank &&
-        left.phase == right.phase;
-  };
-  bool kernel_payload_open = false;
-  scalar::cuda_w8a::CudaPolicyContext kernel_payload_context{};
-  for (std::size_t index = 20; index < ledger.count;)
-  {
-    const auto& event = ledger.events[index];
-    if (event.direction == Direction::host_to_device &&
-        event.category == Category::scalar_diagnostic &&
-        event.site == Site::scalar_status)
-    {
-      if (index + 3 >= ledger.count) { return false; }
-      const auto& clear_architecture = ledger.events[index + 1];
-      const auto& read_status = ledger.events[index + 2];
-      const auto& read_architecture = ledger.events[index + 3];
-      if (event.bytes != sizeof(int) ||
-          clear_architecture.direction != Direction::host_to_device ||
-          clear_architecture.category != Category::scalar_diagnostic ||
-          clear_architecture.site != Site::scalar_status ||
-          clear_architecture.bytes != sizeof(int) ||
-          read_status.direction != Direction::device_to_host ||
-          read_status.category != Category::scalar_diagnostic ||
-          read_status.site != Site::scalar_status ||
-          read_status.bytes != sizeof(int) ||
-          read_architecture.direction != Direction::device_to_host ||
-          read_architecture.category != Category::scalar_diagnostic ||
-          read_architecture.site != Site::scalar_status ||
-          read_architecture.bytes != sizeof(int) ||
-          !same_context(event.context, clear_architecture.context) ||
-          !same_context(event.context, read_status.context) ||
-          !same_context(event.context, read_architecture.context))
-      {
-        return false;
-      }
-      ++kernel_groups;
-      kernel_payload_open = true;
-      kernel_payload_context = event.context;
-      index += 4;
-      continue;
-    }
-    if (event.direction == Direction::device_to_host &&
-        event.category == Category::scalar_diagnostic &&
-        event.site == Site::scalar_status &&
-        event.bytes == 16 * sizeof(double))
-    {
-      if (!kernel_payload_open ||
-          !same_context(event.context, kernel_payload_context))
-      {
-        return false;
-      }
-      ++reduction_reads;
-      kernel_payload_open = false;
-      kernel_payload_context = {};
-      ++index;
-      continue;
-    }
-    if (event.direction == Direction::device_to_host &&
-        event.category == Category::scalar_diagnostic &&
-        event.site == Site::state_hash)
-    {
-      if (!kernel_payload_open ||
-          !same_context(event.context, kernel_payload_context))
-      {
-        return false;
-      }
-      if (event.bytes == 7 * 32) { ++state_hash_reads; }
-      else if (event.bytes == 2 * 32) { ++topology_hash_reads; }
-      else { return false; }
-      kernel_payload_open = false;
-      kernel_payload_context = {};
-      ++index;
-      continue;
-    }
-    const auto exact_pair = [&](const Direction direction,
-                                const Category category,
-                                const Site first_site,
-                                const Site second_site,
-                                const std::uint64_t first_bytes,
-                                const std::uint64_t second_bytes)
-    {
-      if (index + 1 >= ledger.count) { return false; }
-      const auto& second = ledger.events[index + 1];
-      return event.direction == direction && event.category == category &&
-          event.site == first_site && event.bytes == first_bytes &&
-          second.direction == direction && second.category == category &&
-          second.site == second_site && second.bytes == second_bytes &&
-          same_context(event.context, second.context);
-    };
-    if (exact_pair(Direction::device_to_host, Category::oracle_export,
-                   Site::oracle_export, Site::oracle_export,
-                   scalar::persistent_interior_unknowns * sizeof(double),
-                   scalar::persistent_trace_unknowns * sizeof(double)))
-    {
-      ++oracle_pairs;
-      kernel_payload_open = false;
-      kernel_payload_context = {};
-      index += 2;
-      continue;
-    }
-    if (exact_pair(Direction::device_to_host,
-                   Category::checkpoint_candidate_staging,
-                   Site::checkpoint_stage_interior,
-                   Site::checkpoint_stage_trace,
-                   scalar::persistent_interior_unknowns * sizeof(double),
-                   scalar::persistent_trace_unknowns * sizeof(double)))
-    {
-      if (!kernel_payload_open ||
-          !same_context(event.context, kernel_payload_context))
-      {
-        return false;
-      }
-      ++checkpoint_pairs;
-      kernel_payload_open = false;
-      kernel_payload_context = {};
-      index += 2;
-      continue;
-    }
-    if (exact_pair(Direction::host_to_device,
-                   Category::checkpoint_restore_import,
-                   Site::checkpoint_import_interior,
-                   Site::checkpoint_import_trace,
-                   scalar::persistent_interior_unknowns * sizeof(double),
-                   scalar::persistent_trace_unknowns * sizeof(double)))
-    {
-      ++restore_pairs;
-      kernel_payload_open = false;
-      kernel_payload_context = {};
-      index += 2;
-      continue;
-    }
-    return false;
-  }
-  const std::uint64_t recorded_launches = evidence.launches.assemble_launches +
-      evidence.launches.condense_launches +
-      evidence.launches.recover_launches;
-  if (kernel_groups != recorded_launches ||
-      reduction_reads != expected_reduction_reads ||
-      state_hash_reads != 2 * scalar::persistent_required_steps ||
-      topology_hash_reads != scalar::persistent_required_steps + 1 ||
-      oracle_pairs != scalar::persistent_required_steps + 2 ||
-      checkpoint_pairs != 1 || restore_pairs != 0)
-  {
-    return false;
-  }
-  totals.synchronization_events = 1 + kernel_groups +
-      expected_reduction_reads +
-      state_hash_reads + topology_hash_reads + oracle_pairs +
-      checkpoint_pairs;
-  return digest == ledger.ordered_digest &&
-      SameTransferTotals(totals, ledger.totals);
-}
-
-inline bool ValidateTopologyIdentity(
-    const scalar::ScalarCudaReuseEvidence& evidence) noexcept
-{
-  return evidence.device_topology_matches &&
-      evidence.host_topology_hash != ::dg::hdg::runtime::StateHash{} &&
-      evidence.host_quadrature_hash != ::dg::hdg::runtime::StateHash{} &&
-      evidence.host_topology_hash == evidence.device_topology_hash &&
-      evidence.host_quadrature_hash == evidence.device_quadrature_hash;
-}
-
-inline std::uint64_t IndependentAllocationDigest(
-    const scalar::cuda_w8a::AllocationEventV1& event) noexcept
-{
-  std::uint64_t digest = fnv_offset;
-  MixScalar(digest, event.ordinal);
-  MixScalar(digest, event.site);
-  MixScalar(digest, event.context.attempt_sequence);
-  MixScalar(digest, event.context.target_step);
-  MixScalar(digest, event.context.generation);
-  MixScalar(digest, event.context.rank);
-  MixScalar(digest, event.context.phase);
-  MixScalar(digest, event.bytes);
-  MixScalar(digest, event.alignment);
-  MixScalar(digest, event.storage_token);
-  MixScalar(digest, event.generation);
-  MixScalar(digest, event.allocation);
-  MixScalar(digest, event.success);
-  return digest;
-}
-
-inline bool ValidateAllocationLedger(
-    const scalar::cuda_w8a::CudaAllocationLedgerV1& ledger,
-    const scalar::ScalarCudaAllocationEvidence& evidence) noexcept
-{
-  using Site = scalar::cuda_w8a::CudaAllocationSite;
-  if (ledger.schema != 1 ||
-      ledger.capacity != scalar::cuda_w8a::maximum_allocation_events ||
-      ledger.count != 4 || ledger.observed_count != 4 || ledger.overflow ||
-      ledger.dropped_count != 0)
-    return false;
-  std::uint64_t digest = fnv_offset;
-  for (std::size_t index = 0; index < ledger.count; ++index)
-  {
-    const auto& event = ledger.events[index];
-    if (event.ordinal != index + 1 || !event.success || event.bytes == 0 ||
-        event.capacity != event.bytes || event.alignment == 0 ||
-        event.storage_token == 0 || event.generation == 0 ||
-        event.context.rank != 0 || event.context.attempt_sequence != 0 ||
-        event.context.target_step != 0 || event.context.generation != 0)
-      return false;
-    const std::uint64_t event_digest = IndependentAllocationDigest(event);
-    digest ^= event_digest;
-    digest *= fnv_prime;
-  }
-  const auto& probe_allocate = ledger.events[0];
-  const auto& probe_deallocate = ledger.events[1];
-  const auto& doubles = ledger.events[2];
-  const auto& integers = ledger.events[3];
-  return probe_allocate.site == Site::mfem_device_pool_probe &&
-      probe_allocate.allocation &&
-      probe_deallocate.site == Site::mfem_device_pool_probe &&
-      !probe_deallocate.allocation &&
-      probe_allocate.storage_token == probe_deallocate.storage_token &&
-      probe_allocate.generation == probe_deallocate.generation &&
-      doubles.site == Site::persistent_double_arena && doubles.allocation &&
-      doubles.storage_token == evidence.double_arena &&
-      integers.site == Site::persistent_integer_arena &&
-      integers.allocation && integers.storage_token == evidence.integer_arena &&
-      digest == ledger.ordered_digest;
 }
 
 template <typename Left, typename Right>

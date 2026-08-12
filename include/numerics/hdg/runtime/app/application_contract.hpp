@@ -2,12 +2,14 @@
 
 /**
  * @file numerics/hdg/runtime/app/application_contract.hpp
- * @brief Static request admission for the two frozen W8A scenarios.
+ * @brief Closed standalone HDG capability and validated configuration seam.
  *
- * This boundary validates syntax, exact card/scenario values, and compiled
- * backend selection only.  It does not accept caller-authored MPI or device
- * observations and grants no execution authority.  The later backend entry
- * owns MPI_Comm_size and CUDA UUID/shared-device observation before execution.
+ * This boundary admits only the current frozen W8A, W8B, and W8C rows with
+ * their exact card, periodic-case, mesh/order/time, and compiled-backend
+ * selections.  It is not a general runtime configuration interface.  It does
+ * not accept caller-authored MPI or device observations and grants no
+ * execution authority.  The later backend entry owns MPI_Comm_size and CUDA
+ * UUID/shared-device observation before execution.
  */
 
 #include "numerics/hdg/runtime/runtime_abi.hpp"
@@ -23,6 +25,7 @@ namespace dg::hdg::runtime::app
 {
 
 class ApplicationValidation;
+class HdgRunConfigV1;
 
 inline constexpr std::string_view smooth_periodic_euler_v1_card_id =
     conventional_persistent_card_id;
@@ -263,7 +266,7 @@ private:
   bool present_ = false;
   StableId<512> identity_{};
 
-  friend class ValidatedApplicationConfig;
+  friend class HdgRunConfigV1;
 };
 
 struct OutputDirectoryPathDomainV1;
@@ -408,14 +411,19 @@ struct ApplicationOptionsView
   std::uint64_t seed = smooth_periodic_euler_v1_smoke_seed;
 };
 
-class ValidatedApplicationConfig final
+/**
+ * Owned, validated HDG run boundary.  Its two digests bind the effective
+ * numerical tuple and the concrete run controls; callers cannot construct it
+ * without passing the closed application admission gate.
+ */
+class HdgRunConfigV1 final
 {
 public:
-  ValidatedApplicationConfig(const ValidatedApplicationConfig&) = default;
-  ValidatedApplicationConfig(ValidatedApplicationConfig&&) = default;
-  ValidatedApplicationConfig& operator=(const ValidatedApplicationConfig&) =
+  HdgRunConfigV1(const HdgRunConfigV1&) = default;
+  HdgRunConfigV1(HdgRunConfigV1&&) = default;
+  HdgRunConfigV1& operator=(const HdgRunConfigV1&) =
       default;
-  ValidatedApplicationConfig& operator=(ValidatedApplicationConfig&&) =
+  HdgRunConfigV1& operator=(HdgRunConfigV1&&) =
       default;
 
   ApplicationScenarioV1 scenario() const noexcept { return scenario_; }
@@ -457,6 +465,7 @@ public:
   {
     return output_steps_;
   }
+  /** The frozen output schedule is intentionally typed independently of I/O. */
   std::uint64_t scenario_checkpoint_step() const noexcept
   {
     return scenario_checkpoint_step_;
@@ -520,11 +529,11 @@ public:
   }
 
 private:
-  ValidatedApplicationConfig(const ApplicationOptionsView& options,
-                             ApplicationScenarioV1 scenario,
-                             ApplicationBackend backend,
-                             RuntimeTupleDescriptor tuple,
-                             DeferredRuntimePredicatesV1 deferred) noexcept;
+  HdgRunConfigV1(const ApplicationOptionsView& options,
+                 ApplicationScenarioV1 scenario,
+                 ApplicationBackend backend,
+                 RuntimeTupleDescriptor tuple,
+                 DeferredRuntimePredicatesV1 deferred) noexcept;
 
   ApplicationScenarioV1 scenario_ = ApplicationScenarioV1::unknown;
   ApplicationBackend backend_ = ApplicationBackend::unknown;
@@ -583,12 +592,97 @@ private:
       const ApplicationOptionsView&) noexcept;
 };
 
+/** Compatibility spelling retained while downstream numerical leaves migrate. */
+using ValidatedApplicationConfig = HdgRunConfigV1;
+
+enum class HdgFormulationV1 : std::uint8_t
+{
+  conventional = 0,
+  traced_scalar_igr = 1,
+  unknown = 255
+};
+
+enum class HdgPeriodicCaseV1 : std::uint8_t
+{
+  smooth = 0,
+  exact_jump = 1,
+  smooth_transition = 2,
+  unknown = 255
+};
+
+enum class HdgInitialConditionV1 : std::uint8_t
+{
+  smooth_analytic = 0,
+  exact_jump = 1,
+  smooth_transition = 2
+};
+
+/** Descriptor-only boundary: no mesh, field, allocator, or kernel ownership. */
+struct PeriodicQuadCaseDescriptorV1
+{
+  std::uint32_t spatial_dimension = 2;
+  std::string_view mesh_family_id = smooth_periodic_euler_v1_mesh_family_id;
+  std::string_view model_id = EulerCompressible2dTag::id;
+  HdgInitialConditionV1 initial_condition = HdgInitialConditionV1::smooth_analytic;
+  std::string_view boundary_condition_id = "bc.periodic.v1";
+  std::string_view source_id{};
+  std::string_view flux_id{};
+  std::string_view layout_id{};
+};
+
+class PeriodicQuadCaseProviderV1 final
+{
+public:
+  static std::optional<PeriodicQuadCaseDescriptorV1> Describe(
+      const HdgRunConfigV1& config) noexcept;
+};
+
+/** A frozen schedule is a policy, distinct from output destination and restart. */
+struct HdgOutputPolicyV1
+{
+  std::array<std::uint64_t, 3> steps{};
+  std::uint8_t count = 3;
+  bool valid() const noexcept
+  {
+    return count == steps.size() && steps[0] == 0 &&
+        steps[0] < steps[1] && steps[1] < steps[2];
+  }
+};
+
+struct HdgCheckpointIdentityV1
+{
+  StateHash same_layout_config_sha256{};
+  RuntimeTupleDescriptor tuple{};
+  std::uint32_t mesh_n = 0;
+  int polynomial_order = 0;
+  std::uint32_t rank_count = 0;
+};
+
+HdgOutputPolicyV1 OutputPolicyForV1(const HdgRunConfigV1& config) noexcept;
+HdgCheckpointIdentityV1 CheckpointIdentityForV1(
+    const HdgRunConfigV1& config) noexcept;
+
+struct HdgMethodCapabilitiesV1
+{
+  HdgFormulationV1 formulation = HdgFormulationV1::unknown;
+  ApplicationBackend backend = ApplicationBackend::unknown;
+  HdgPeriodicCaseV1 periodic_case = HdgPeriodicCaseV1::unknown;
+  bool supported = false;
+  ApplicationRejection reason = ApplicationRejection::unknown_tuple;
+  std::string_view reason_text{};
+};
+
+HdgMethodCapabilitiesV1 QueryHdgMethodCapabilitiesV1(
+    const ApplicationOptionsView& options) noexcept;
+HdgMethodCapabilitiesV1 CapabilitiesForV1(
+    const HdgRunConfigV1& config) noexcept;
+
 class ApplicationValidation final
 {
 public:
   bool accepted() const noexcept { return config_.has_value(); }
   ApplicationRejection rejection() const noexcept { return rejection_; }
-  const ValidatedApplicationConfig* config() const noexcept
+  const HdgRunConfigV1* config() const noexcept
   {
     return config_ ? &*config_ : nullptr;
   }
@@ -597,12 +691,12 @@ private:
   explicit ApplicationValidation(ApplicationRejection rejection) noexcept
       : rejection_(rejection)
   {}
-  explicit ApplicationValidation(ValidatedApplicationConfig config) noexcept
+  explicit ApplicationValidation(HdgRunConfigV1 config) noexcept
       : rejection_(ApplicationRejection::none), config_(config)
   {}
 
   ApplicationRejection rejection_ = ApplicationRejection::unknown_scenario;
-  std::optional<ValidatedApplicationConfig> config_{};
+  std::optional<HdgRunConfigV1> config_{};
 
   friend ApplicationValidation ValidateApplicationOptions(
       const ApplicationOptionsView&) noexcept;
@@ -678,11 +772,11 @@ ApplicationRunResult RunSmoothPeriodicEulerV1(
     const ApplicationOptionsView& request,
     CudaApplicationContextV1& context);
 
-static_assert(!std::is_default_constructible<ValidatedApplicationConfig>::value,
+static_assert(!std::is_default_constructible<HdgRunConfigV1>::value,
               "accepted configuration cannot bypass static validation");
-static_assert(!std::is_aggregate<ValidatedApplicationConfig>::value,
+static_assert(!std::is_aggregate<HdgRunConfigV1>::value,
               "accepted configuration is opaque");
-static_assert(!std::is_polymorphic<ValidatedApplicationConfig>::value,
+static_assert(!std::is_polymorphic<HdgRunConfigV1>::value,
               "static admission remains non-polymorphic");
 
 } // namespace dg::hdg::runtime::app

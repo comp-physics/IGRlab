@@ -1128,8 +1128,7 @@ bool ImportCpuCheckpoint(const CheckpointDescriptor& descriptor,
     imported = MakeSlot(local_interior_size, local_true_trace_size,
                         checkpoint_allocations);
     CpuSlotStorage* storage = Storage(imported);
-    if (storage && checkpoint_allocations.count <=
-                       checkpoint.owned_allocation_events.size())
+    if (storage)
     {
       if (local_interior_size != 0)
       {
@@ -1172,10 +1171,6 @@ bool ImportCpuCheckpoint(const CheckpointDescriptor& descriptor,
 
   checkpoint.descriptor = descriptor;
   checkpoint.state = std::move(imported);
-  std::copy_n(checkpoint_allocations.events.begin(),
-              checkpoint_allocations.count,
-              checkpoint.owned_allocation_events.begin());
-  checkpoint.owned_allocation_event_count = checkpoint_allocations.count;
   checkpoint.valid = true;
   return true;
 }
@@ -1385,37 +1380,6 @@ bool Copy(const mfem::Vector& source,
   return Finite(destination);
 }
 
-template <std::size_t Capacity>
-bool CaptureFixed(const mfem::Vector& source,
-                  std::array<double, Capacity>& destination,
-                  std::size_t& size,
-                  bool& complete) noexcept
-{
-  size = 0;
-  complete = false;
-  if (source.Size() < 0)
-  {
-    return false;
-  }
-  const double* values = source.HostRead();
-  const std::size_t source_size = static_cast<std::size_t>(source.Size());
-  if (!values && source_size != 0) { return false; }
-  if (source_size != 0 &&
-      !std::all_of(values, values + source_size,
-                   [](const double value) { return Finite(value); }))
-  {
-    return false;
-  }
-  // Full per-linearization coefficients are retained for the smoke and
-  // principal N=6 cases.  The N=12 convergence leaf retains complete hashes
-  // and final snapshots without inflating every adapter by O(N^2*Newton).
-  if (source_size > destination.size()) { return true; }
-  size = source_size;
-  if (size != 0) { std::copy_n(values, size, destination.begin()); }
-  complete = true;
-  return true;
-}
-
 StateHash HashSystemMatrix(const LocalSystem& system) noexcept
 {
   StateHash value = HashDoubles(system.a);
@@ -1588,6 +1552,22 @@ int CellIndex(const double coordinate,
 
 } // namespace
 
+struct CpuNewtonWorkspace
+{
+  StateHash candidate_state_hash{};
+  std::uint64_t candidate_generation = 0;
+  bool accepted = false;
+  bool ordered = false;
+  bool affine_consumption_verified = false;
+  bool retained_for_publication = false;
+};
+
+struct CpuAttemptWorkspace
+{
+  CpuAttemptEvidence attempt{};
+  CpuNewtonWorkspace current_newton{};
+};
+
 struct detail::CpuNumericsCore::Implementation
 {
   enum class ArtifactStage : unsigned char
@@ -1734,7 +1714,7 @@ struct detail::CpuNumericsCore::Implementation
   std::unique_ptr<mfem::HypreGMRES> gmres;
 
   CpuRunEvidence evidence{};
-  CpuAttemptEvidence active_evidence{};
+  CpuAttemptWorkspace active_evidence{};
   StateCoordinates entry_coordinates{};
   StateHash entry_interior_hash{};
   StateHash entry_trace_hash{};
@@ -1858,21 +1838,21 @@ struct detail::CpuNumericsCore::Implementation
   bool EnterPhase(const CpuFailureInjection& injection,
                   const CpuFailurePhase phase) noexcept
   {
-    ++active_evidence.work.phase_entries;
+    ++active_evidence.attempt.work.phase_entries;
     const bool local_injected = injection.phase == phase &&
         injection.source_rank == rank;
     const bool admitted = CollectiveAll(!local_injected);
     if (!admitted)
     {
-      active_evidence.failure_phase = phase;
-      active_evidence.failure_source_rank = injection.source_rank;
+      active_evidence.attempt.failure_phase = phase;
+      active_evidence.attempt.failure_source_rank = injection.source_rank;
     }
     return admitted;
   }
 
   void CompletePhase() noexcept
   {
-    ++active_evidence.work.phase_completions;
+    ++active_evidence.attempt.work.phase_completions;
   }
 
   bool ProjectTrace(mfem::ParGridFunction& local_trace,
@@ -4570,8 +4550,9 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
 {
   Implementation& state = *implementation_;
   CpuNumericalResult result;
-  CpuAttemptEvidence& evidence = state.active_evidence;
-  evidence = {};
+  CpuAttemptWorkspace& workspace = state.active_evidence;
+  workspace = {};
+  CpuAttemptEvidence& evidence = workspace.attempt;
   state.active_candidate_generation = 0;
   state.active_candidate_state_hash = {};
   state.publication_chain_authority = false;
@@ -4687,9 +4668,6 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   }
   evidence.initial_nonlinear_residual = residual;
   evidence.final_nonlinear_residual = residual;
-  StateHash current_residual_hash = HashPair(
-      HashDoubles(state.current_system.residual_interior),
-      HashDoubles(state.current_system.residual_trace));
   std::uint64_t current_local_generation =
       state.next_artifact_generation++;
   Implementation::ArtifactCapability current_local_capability{
@@ -4706,21 +4684,12 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     {
       break;
     }
-    const bool chain_capacity_available =
-        evidence.linearization_chain_count < evidence.linearization_chains.size();
-    if (!state.CollectiveAll(chain_capacity_available))
-    {
-      return fail(CpuFailurePhase::condensation);
-    }
-    CpuLinearizationChain& chain = evidence.linearization_chains[
-        evidence.linearization_chain_count];
-    chain.newton_update = updates;
-    chain.local_generation = current_local_generation;
-    chain.residual_hash = current_residual_hash;
+    workspace.current_newton = {};
+    CpuNewtonWorkspace& current_newton = workspace.current_newton;
     const bool consumed_local = state.ConsumeArtifact(
         std::move(current_local_capability),
         Implementation::ArtifactStage::local, attempt,
-        chain.local_generation);
+        current_local_generation);
     if (!state.CollectiveAll(consumed_local))
     {
       return fail(CpuFailurePhase::condensation);
@@ -4731,22 +4700,22 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
                   CpuAttemptStatus::injected_failure);
     }
     StateHash matrix_hash{};
+    std::uint64_t matrix_refresh_generation = 0;
     if (!state.CondenseAndAssemble(state.current_system, matrix_hash,
-                                   chain.matrix_refresh_generation))
+                                   matrix_refresh_generation))
     {
       return fail(CpuFailurePhase::condensation);
     }
     ++evidence.work.complete_condensations;
     state.CompletePhase();
-    chain.condensed_generation = state.next_artifact_generation++;
-    chain.matrix_hash = matrix_hash;
+    const std::uint64_t condensed_generation = state.next_artifact_generation++;
     Implementation::ArtifactCapability condensed_capability{
-        attempt.sequence, attempt.sequence, chain.condensed_generation,
+        attempt.sequence, attempt.sequence, condensed_generation,
         Implementation::ArtifactStage::condensed};
     const bool consumed_condensed = state.ConsumeArtifact(
         std::move(condensed_capability),
         Implementation::ArtifactStage::condensed, attempt,
-        chain.condensed_generation);
+        condensed_generation);
     if (!state.CollectiveAll(consumed_condensed))
     {
       return fail(CpuFailurePhase::trace_solve);
@@ -4760,48 +4729,43 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     double true_residual = 0.0;
     int linear_iterations = 0;
     StateHash factor_hash{}, solution_hash{};
+    std::uint64_t factor_setup_generation = 0;
+    bool factor_setup_current = false;
     const bool trace_solved = state.SolveTrace(
-        chain.matrix_refresh_generation, true_residual, linear_iterations,
-        factor_hash, solution_hash, chain.factor_setup_generation,
-        chain.factor_setup_current);
-    if (chain.factor_setup_current)
+        matrix_refresh_generation, true_residual, linear_iterations,
+        factor_hash, solution_hash, factor_setup_generation,
+        factor_setup_current);
+    if (factor_setup_current)
     {
       ++evidence.work.complete_factor_setups;
     }
-    const bool increment_captured = trace_solved && CaptureFixed(
-        state.true_increment, chain.true_trace_increment,
-        chain.true_trace_increment_size,
-        chain.true_trace_increment_capture_complete);
-    if (!state.CollectiveAll(increment_captured))
+    if (!state.CollectiveAll(trace_solved && Finite(state.true_increment)))
     {
       return fail(CpuFailurePhase::trace_solve);
     }
-    chain.true_relative_residual = true_residual;
     evidence.linear_iterations += linear_iterations;
     maximum_true_residual = std::max(maximum_true_residual, true_residual);
     ++evidence.work.complete_trace_solves;
     state.CompletePhase();
-    chain.solve_generation = state.next_artifact_generation++;
-    chain.factor_hash = factor_hash;
+    const std::uint64_t solve_generation = state.next_artifact_generation++;
     Implementation::ArtifactCapability solve_capability{
-        attempt.sequence, attempt.sequence, chain.solve_generation,
+        attempt.sequence, attempt.sequence, solve_generation,
         Implementation::ArtifactStage::solve};
     const bool consumed_solve = state.ConsumeArtifact(
         std::move(solve_capability), Implementation::ArtifactStage::solve,
-        attempt, chain.solve_generation);
+        attempt, solve_generation);
     if (!state.CollectiveAll(consumed_solve))
     {
       return fail(CpuFailurePhase::recovery);
     }
-    chain.solution_generation = state.next_artifact_generation++;
-    chain.solution_hash = solution_hash;
+    const std::uint64_t solution_generation = state.next_artifact_generation++;
     Implementation::ArtifactCapability solution_capability{
-        attempt.sequence, attempt.sequence, chain.solution_generation,
+        attempt.sequence, attempt.sequence, solution_generation,
         Implementation::ArtifactStage::solution};
     const bool consumed_solution = state.ConsumeArtifact(
         std::move(solution_capability),
         Implementation::ArtifactStage::solution, attempt,
-        chain.solution_generation);
+        solution_generation);
     if (!state.CollectiveAll(consumed_solution))
     {
       return fail(CpuFailurePhase::recovery);
@@ -4816,22 +4780,22 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     ++evidence.work.complete_recoveries;
     state.CompletePhase();
     recovered = true;
-    chain.recovery_generation = state.next_artifact_generation++;
+    const std::uint64_t recovery_generation = state.next_artifact_generation++;
     Implementation::ArtifactCapability recovery_capability{
-        attempt.sequence, attempt.sequence, chain.recovery_generation,
+        attempt.sequence, attempt.sequence, recovery_generation,
         Implementation::ArtifactStage::recovery};
     const bool consumed_recovery = state.ConsumeArtifact(
         std::move(recovery_capability),
         Implementation::ArtifactStage::recovery, attempt,
-        chain.recovery_generation);
-    chain.ordered = chain.local_generation < chain.condensed_generation &&
-        chain.condensed_generation < chain.solve_generation &&
-        chain.solve_generation < chain.solution_generation &&
-        chain.solution_generation < chain.recovery_generation;
-    chain.affine_consumption_verified = consumed_local &&
+        recovery_generation);
+    current_newton.ordered = current_local_generation < condensed_generation &&
+        condensed_generation < solve_generation &&
+        solve_generation < solution_generation &&
+        solution_generation < recovery_generation;
+    current_newton.affine_consumption_verified = consumed_local &&
         consumed_condensed && consumed_solve && consumed_solution &&
         consumed_recovery;
-    if (!state.CollectiveAll(chain.affine_consumption_verified))
+    if (!state.CollectiveAll(current_newton.affine_consumption_verified))
     {
       return fail(CpuFailurePhase::recovery);
     }
@@ -4842,12 +4806,8 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
          trial < state.config.maximum_line_search_trials; ++trial)
     {
       const double alpha = std::ldexp(1.0, -trial);
-      CpuTrialEvidence& trial_evidence = evidence.trials[evidence.trial_count++];
-      trial_evidence.newton_iteration = updates;
-      trial_evidence.trial_index = trial;
-      trial_evidence.alpha = alpha;
-      trial_evidence.base_residual = residual;
-      trial_evidence.armijo_boundary =
+      evidence.final_line_search_trials = trial + 1;
+      const double armijo_boundary =
           (1.0 - state.config.armijo_constant * alpha) * residual;
       if (!state.MakeTrial(alpha)) { return fail(CpuFailurePhase::recovery); }
       double density = 0.0;
@@ -4855,12 +4815,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       double wave = 0.0;
       const bool trial_prescreen = state.Prescreen(
           *state.trial_interior, *state.trial_trace, density, pressure, wave);
-      trial_evidence.prescreen_passed =
-          state.CollectiveAll(trial_prescreen);
-      trial_evidence.minimum_density = density;
-      trial_evidence.minimum_pressure = pressure;
-      trial_evidence.maximum_wave_speed = wave;
-      if (!trial_evidence.prescreen_passed) { continue; }
+      if (!state.CollectiveAll(trial_prescreen)) { continue; }
       admissible_trial = true;
       const bool trial_assembled = state.Assemble(
           *state.trial_interior, *state.trial_trace, state.trial_system);
@@ -4868,41 +4823,27 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       {
         return fail(CpuFailurePhase::assembly);
       }
-      trial_evidence.reassembled = true;
       ++evidence.work.complete_assemblies;
       ++evidence.work.trial_reassemblies;
       const double trial_residual = state.ResidualNorm(state.trial_system);
-      trial_evidence.trial_residual = trial_residual;
       if (!Finite(trial_residual)) { return fail(CpuFailurePhase::assembly); }
-      if (trial_residual <= trial_evidence.armijo_boundary)
+      if (trial_residual <= armijo_boundary)
       {
-        trial_evidence.accepted = true;
         if (!state.AcceptTrial()) { return fail(CpuFailurePhase::recovery); }
         residual = trial_residual;
         evidence.minimum_density = density;
         evidence.minimum_pressure = pressure;
         evidence.maximum_wave_speed = wave;
-        chain.candidate_generation = state.next_candidate_generation++;
-        chain.candidate_state_hash = HashPair(
+        current_newton.candidate_generation = state.next_candidate_generation++;
+        current_newton.candidate_state_hash = HashPair(
             HashVector(*state.iterate_interior),
             HashVector(state.iterate_true_trace));
-        chain.accepted_trial_index = trial;
-        bool interior_capture_complete = false;
-        bool trace_capture_complete = false;
-        const bool candidate_captured = CaptureFixed(
-            *state.iterate_interior, chain.accepted_candidate_interior,
-            chain.accepted_candidate_interior_size,
-            interior_capture_complete) &&
-            CaptureFixed(state.iterate_true_trace,
-                         chain.accepted_candidate_true_trace,
-                         chain.accepted_candidate_true_trace_size,
-                         trace_capture_complete);
-        chain.accepted_candidate_capture_complete =
-            interior_capture_complete && trace_capture_complete;
-        if (!state.CollectiveAll(candidate_captured))
+        if (!state.CollectiveAll(
+                Finite(*state.iterate_interior) && Finite(state.iterate_true_trace)))
         {
           return fail(CpuFailurePhase::recovery);
         }
+        current_newton.accepted = true;
         accepted = true;
         break;
       }
@@ -4918,14 +4859,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     }
     ++updates;
     ++evidence.work.accepted_newton_updates;
-    ++evidence.linearization_chain_count;
     current_local_generation = state.next_artifact_generation++;
     current_local_capability = Implementation::ArtifactCapability{
         attempt.sequence, attempt.sequence, current_local_generation,
         Implementation::ArtifactStage::local};
-    current_residual_hash = HashPair(
-        HashDoubles(state.current_system.residual_interior),
-        HashDoubles(state.current_system.residual_trace));
   }
 
   evidence.nonlinear_updates = updates;
@@ -4951,45 +4888,22 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   {
     return fail(CpuFailurePhase::recovery);
   }
-  if (!state.CollectiveAll(evidence.linearization_chain_count != 0))
-  {
-    return fail(CpuFailurePhase::recovery);
-  }
-  const std::size_t retained_index = evidence.linearization_chain_count - 1;
-  CpuLinearizationChain& retained =
-      evidence.linearization_chains[retained_index];
   const StateHash stored_candidate_hash = HashPair(
       HashDoubles(state.Candidate()->interior),
       HashDoubles(state.Candidate()->trace));
-  const bool retained_candidate_valid = retained.ordered &&
-      retained.candidate_state_hash == stored_candidate_hash;
+  const bool retained_candidate_valid = workspace.current_newton.accepted &&
+      workspace.current_newton.ordered &&
+      workspace.current_newton.affine_consumption_verified &&
+      workspace.current_newton.candidate_state_hash == stored_candidate_hash;
   if (!state.CollectiveAll(retained_candidate_valid))
   {
     return fail(CpuFailurePhase::recovery);
   }
-  retained.retained_for_publication = true;
-  evidence.retained_linearization_chain = retained_index;
-  evidence.candidate_generation = retained.candidate_generation;
-  state.active_candidate_generation = retained.candidate_generation;
+  workspace.current_newton.retained_for_publication = true;
+  evidence.candidate_generation = workspace.current_newton.candidate_generation;
+  state.active_candidate_generation = workspace.current_newton.candidate_generation;
   state.active_candidate_state_hash = stored_candidate_hash;
   state.publication_chain_authority = true;
-  evidence.products[0] = {DerivedProductKind::residual, attempt.sequence,
-                          attempt.sequence, retained.residual_hash,
-                          stored_candidate_hash, retained.local_generation,
-                          retained.candidate_generation, true};
-  evidence.products[1] = {DerivedProductKind::matrix, attempt.sequence,
-                          attempt.sequence, retained.matrix_hash,
-                          stored_candidate_hash,
-                          retained.condensed_generation,
-                          retained.candidate_generation, true};
-  evidence.products[2] = {DerivedProductKind::factor, attempt.sequence,
-                          attempt.sequence, retained.factor_hash,
-                          stored_candidate_hash, retained.solve_generation,
-                          retained.candidate_generation, true};
-  evidence.products[3] = {DerivedProductKind::solution, attempt.sequence,
-                          attempt.sequence, retained.solution_hash,
-                          stored_candidate_hash, retained.solution_generation,
-                          retained.candidate_generation, true};
 
   if (!state.EnterPhase(injection,
                         CpuFailurePhase::after_recovery_before_commit))
@@ -5050,7 +4964,7 @@ void detail::CpuNumericsCore::Complete(
     const RunTelemetry&) noexcept
 {
   Implementation& state = *implementation_;
-  CpuAttemptEvidence& attempt = state.active_evidence;
+  CpuAttemptEvidence& attempt = state.active_evidence.attempt;
   attempt.exit_coordinates = coordinates;
   attempt.committed_interior_after = HashDoubles(state.Committed()->interior);
   attempt.committed_trace_after = HashDoubles(state.Committed()->trace);
@@ -5073,34 +4987,7 @@ void detail::CpuNumericsCore::Complete(
     state.evidence.accepted.rank_common_trace_hash =
         CpuStateStoragePolicy::HashTrace(state.committed_slot.trace);
     state.evidence.accepted.attempt = attempt;
-    if (state.evidence.accepted_step_count <
-        state.evidence.accepted_steps.size())
-    {
-      CpuAcceptedStepEvidence& step = state.evidence.accepted_steps[
-          state.evidence.accepted_step_count++];
-      step.valid = true;
-      step.coordinates = coordinates;
-      step.interior_hash = attempt.committed_interior_after;
-      step.trace_hash = attempt.committed_trace_after;
-      step.initial_nonlinear_residual = attempt.initial_nonlinear_residual;
-      step.final_nonlinear_residual = attempt.final_nonlinear_residual;
-      step.maximum_true_relative_residual =
-          attempt.maximum_true_relative_residual;
-      step.minimum_density = attempt.minimum_density;
-      step.minimum_pressure = attempt.minimum_pressure;
-      step.maximum_wave_speed = attempt.maximum_wave_speed;
-      step.attempt_sequence = attempt.identity.sequence;
-      step.post_baseline_allocation_events =
-          attempt.transfers.allocation_events;
-      step.nonlinear_updates = attempt.nonlinear_updates;
-      step.linear_iterations = attempt.linear_iterations;
-      step.work = attempt.work;
-      step.transfers = attempt.transfers;
-      step.finite_gate = attempt.finite_gate;
-      step.admissibility_gate = attempt.admissibility_gate;
-      step.nonlinear_gate = attempt.nonlinear_gate;
-      step.true_residual_gate = attempt.true_residual_gate;
-    }
+    ++state.evidence.accepted_step_count;
     ++state.evidence.commits;
   }
   else
@@ -5147,10 +5034,6 @@ bool detail::CpuNumericsCore::CaptureCheckpoint(
   if (!CopySlot(state.committed_slot, snapshot)) { return false; }
   checkpoint.descriptor = descriptor;
   checkpoint.state = std::move(snapshot);
-  checkpoint.owned_allocation_event_count = checkpoint_allocations.count;
-  std::copy_n(checkpoint_allocations.events.begin(),
-              checkpoint_allocations.count,
-              checkpoint.owned_allocation_events.begin());
   checkpoint.valid = true;
   return true;
 }
@@ -5219,18 +5102,18 @@ CpuStateSnapshot detail::CpuNumericsCore::CandidateSnapshot(
 void detail::CpuNumericsCore::MarkPreparedFailure(
     const CpuFailurePhase phase, const int source_rank) noexcept
 {
-  implementation_->active_evidence.failure_phase = phase;
-  implementation_->active_evidence.failure_source_rank = source_rank;
-  implementation_->active_evidence.status = CpuAttemptStatus::runtime_failure;
+  implementation_->active_evidence.attempt.failure_phase = phase;
+  implementation_->active_evidence.attempt.failure_source_rank = source_rank;
+  implementation_->active_evidence.attempt.status = CpuAttemptStatus::runtime_failure;
 }
 
 void detail::CpuNumericsCore::MarkPreparedFailure(
     const CpuFailurePhase phase, const int source_rank,
     const CpuAttemptStatus status) noexcept
 {
-  implementation_->active_evidence.failure_phase = phase;
-  implementation_->active_evidence.failure_source_rank = source_rank;
-  implementation_->active_evidence.status = status;
+  implementation_->active_evidence.attempt.failure_phase = phase;
+  implementation_->active_evidence.attempt.failure_source_rank = source_rank;
+  implementation_->active_evidence.attempt.status = status;
 }
 
 bool detail::CpuNumericsCore::AuthorizePublicationChain(
@@ -5243,15 +5126,13 @@ bool detail::CpuNumericsCore::AuthorizePublicationChain(
       state.active_candidate_generation != candidate_generation ||
       state.active_candidate_state_hash != candidate_state_hash ||
       !::dg::hdg::runtime::detail::SameAttempt(
-          state.active_evidence.identity, attempt) ||
-      state.active_evidence.linearization_chain_count == 0)
+          state.active_evidence.attempt.identity, attempt) ||
+      !state.active_evidence.current_newton.retained_for_publication)
   {
     return false;
   }
-  const CpuLinearizationChain& retained =
-      state.active_evidence.linearization_chains[
-          state.active_evidence.retained_linearization_chain];
-  if (!retained.ordered || !retained.retained_for_publication ||
+  const CpuNewtonWorkspace& retained = state.active_evidence.current_newton;
+  if (!retained.ordered || !retained.affine_consumption_verified ||
       retained.candidate_generation != candidate_generation ||
       retained.candidate_state_hash != candidate_state_hash)
   {
@@ -5273,7 +5154,7 @@ void detail::CpuNumericsCore::InvalidateCandidateGeneration() noexcept
   Implementation& state = *implementation_;
   if (state.active_candidate_generation != 0)
   {
-    state.active_evidence.candidate_generation_invalidated = true;
+    state.active_evidence.attempt.candidate_generation_invalidated = true;
   }
   state.active_candidate_generation = 0;
   state.active_candidate_state_hash = {};
@@ -5297,10 +5178,6 @@ void detail::CpuNumericsCore::SealOwnedAllocationBaseline() noexcept
   storage.allocation_baseline = state.allocations.baseline;
   storage.allocation_events_after_baseline =
       state.allocations.EventsAfterBaseline();
-  storage.owned_allocation_event_count = state.allocations.count;
-  std::copy_n(state.allocations.events.begin(), state.allocations.count,
-              storage.owned_allocation_events.begin());
-  storage.selected_owned_allocation_stream_complete = true;
   storage.opaque_mfem_hypre_allocations_unobserved = true;
   storage.opaque_standard_library_control_blocks_unobserved = true;
 }

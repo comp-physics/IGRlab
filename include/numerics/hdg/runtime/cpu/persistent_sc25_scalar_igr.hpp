@@ -603,23 +603,6 @@ struct TrajectoryReuseSnapshot final
   bool opaque_mfem_hypre_observed = false;
 };
 
-struct TrajectoryNewtonEvidence final
-{
-  int iteration = -1;
-  double entry_residual_norm = 0.0;
-  double accepted_residual_norm = 0.0;
-  int accepted_line_search_index = -1;
-  int trace_iterations = -1;
-  double trace_true_residual_norm = 0.0;
-  double trace_right_hand_side_norm = 0.0;
-  double maximum_local_application_residual = 0.0;
-  PersistentTrajectoryState entry{};
-  PersistentTrajectoryState direction{};
-  std::array<double, persistent_line_search_trials> trial_residual_norms{};
-  std::array<std::uint8_t, persistent_line_search_trials> trial_admissible{};
-  std::array<std::uint8_t, persistent_line_search_trials> trial_armijo{};
-};
-
 struct TrajectoryAttemptEvidence final
 {
   TrajectoryStatus status = TrajectoryStatus::uninitialized;
@@ -629,6 +612,8 @@ struct TrajectoryAttemptEvidence final
   double dt = 0.0;
   int attempted_newton_iterations = 0;
   int newton_iterations = 0;
+  /** Trials in the terminal Newton update, not a retained trial history. */
+  int final_line_search_trials = 0;
   double entry_residual_norm = 0.0;
   double final_residual_norm = 0.0;
   double nonlinear_residual_bound = 0.0;
@@ -643,11 +628,9 @@ struct TrajectoryAttemptEvidence final
   TrajectoryStateHashes published_hashes{};
   TrajectoryReuseSnapshot entry_reuse{};
   TrajectoryReuseSnapshot exit_reuse{};
-  std::array<TrajectoryNewtonEvidence,
-             persistent_newton_maximum_iterations> newton{};
 };
 
-struct TrajectoryStepEvidence final
+struct TrajectoryAcceptedSummary final
 {
   bool accepted = false;
   int step = 0;
@@ -657,7 +640,6 @@ struct TrajectoryStepEvidence final
   int attempt_index = -1;
   std::array<double, state_components> committed_integrals{};
   std::array<double, state_components> accepted_integrals{};
-  PersistentTrajectoryState accepted_state{};
   TrajectoryStateHashes accepted_hashes{};
   TrajectoryReuseSnapshot reuse{};
 };
@@ -686,11 +668,8 @@ struct PersistentTrajectoryEvidence final
   int attempted_steps = 0;
   int retry_attempts = 0;
   int attempt_count = 0;
-  /** Number of records stored in steps, not the absolute accepted step. */
-  int step_evidence_count = 0;
   std::uint64_t checkpoint_step_offset = 0;
   StateCoordinates continuation_start_coordinates{};
-  PersistentTrajectoryState continuation_start_state{};
   TrajectoryStateHashes continuation_start_hashes{};
   bool restored_loaded_state_match = false;
   bool restored_loaded_coordinates_match = false;
@@ -705,9 +684,10 @@ struct PersistentTrajectoryEvidence final
   StateCoordinates coordinates{};
   AuxiliaryInitializationEvidence initialization{};
   TrajectoryReuseEvidence reuse{};
-  std::array<TrajectoryAttemptEvidence,
-             persistent_required_steps + 4> attempts{};
-  std::array<TrajectoryStepEvidence, persistent_required_steps> steps{};
+  /** Compact terminal summaries; historical trajectories are test-owned. */
+  TrajectoryAttemptEvidence first_failed_attempt{};
+  TrajectoryAttemptEvidence last_attempt{};
+  TrajectoryAcceptedSummary last_accepted{};
 };
 
 /** Rank-local committed state. Owned trace values exclude all ghost values. */

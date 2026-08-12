@@ -47,6 +47,29 @@ private:
   std::string diagnostic_{};
 };
 
+/**
+ * Thin static bridge for a future common application translator.  It owns no
+ * numerical state and deliberately points at the closed request/config and
+ * existing concrete CPU/CUDA entry contexts.
+ */
+struct HdgMethodRequestV1
+{
+  const ApplicationOptionsView* options = nullptr;
+  const HdgRunConfigV1* config = nullptr;
+  MpiApplicationContextV1* cpu_context = nullptr;
+  CudaApplicationContextV1* cuda_context = nullptr;
+};
+
+struct HdgMethodResultV1
+{
+  ApplicationRunResult run{};
+  HdgMethodCapabilitiesV1 capabilities{};
+  HdgCheckpointIdentityV1 checkpoint_identity{};
+};
+
+/** Static dispatch only; numerical leaves remain their existing owners. */
+HdgMethodResultV1 RunHdgMethodV1(const HdgMethodRequestV1& request);
+
 ApplicationRunResult DispatchApplication(const ApplicationOptionsView& request,
                                          MpiApplicationContextV1& cpu_context,
                                          CudaApplicationContextV1* cuda_context);

@@ -33,6 +33,9 @@ CudaAllocationLedgerV1 allocation_ledger{};
 thread_local CudaPolicyContext transport_context{};
 thread_local CudaTransferLedgerV1 transport_ledger{};
 thread_local CudaTransferTotals transport_attempt_totals{};
+thread_local CudaTransferLedgerRangeV1 transport_attempt_range{};
+thread_local CudaTransferLedgerRangeV1 transport_staging_range{};
+thread_local bool transport_staging_active = false;
 thread_local bool true_system_diagnostic_active = false;
 thread_local int true_system_diagnostic_rank = -1;
 
@@ -78,6 +81,24 @@ std::uint64_t EndpointToken(const CudaTransferDirection direction,
   return token;
 }
 
+void AccumulateRange(CudaTransferLedgerRangeV1& range,
+                     const std::uint64_t ordinal,
+                     const std::uint64_t token,
+                     const bool success) noexcept
+{
+  if (range.begin_ordinal == 0) { range.begin_ordinal = ordinal; }
+  range.end_ordinal = ordinal;
+  range.ordered_digest ^= token;
+  range.ordered_digest *= 1099511628211ULL;
+  range.complete = range.complete && success;
+}
+
+void MarkActiveRangesIncomplete() noexcept
+{
+  transport_attempt_range.complete = false;
+  if (transport_staging_active) { transport_staging_range.complete = false; }
+}
+
 void RecordTransfer(const CudaTransferDirection direction,
                     const CudaTransferCategory category,
                     const CudaTransferSite site,
@@ -95,6 +116,7 @@ void RecordTransfer(const CudaTransferDirection direction,
     transport_ledger.overflow = true;
     transport_ledger.totals.complete = false;
     transport_attempt_totals.complete = false;
+    MarkActiveRangesIncomplete();
     return;
   }
   const std::uint64_t ordinal = ++transport_ledger.observed_count;
@@ -128,35 +150,21 @@ void RecordTransfer(const CudaTransferDirection direction,
   };
   account(totals);
   account(transport_attempt_totals);
-  if (transport_ledger.count >= transport_ledger.events.size())
-  {
-    transport_ledger.overflow = true;
-    ++transport_ledger.dropped_count;
-    totals.complete = false;
-    transport_attempt_totals.complete = false;
-    return;
-  }
-  const std::size_t index = transport_ledger.count++;
   const auto source_token = reinterpret_cast<std::uintptr_t>(source);
   const auto destination_token = reinterpret_cast<std::uintptr_t>(destination);
   const std::size_t exact_source_capacity =
       source_capacity == 0 ? bytes : source_capacity;
   const std::size_t exact_destination_capacity =
       destination_capacity == 0 ? bytes : destination_capacity;
-  transport_ledger.events[index] = {
-      ordinal, direction, category, site, transport_context,
-      static_cast<std::uint64_t>(bytes), source_token,
-      destination_token,
-      static_cast<std::uint64_t>(exact_source_capacity),
-      static_cast<std::uint64_t>(exact_destination_capacity),
-      EndpointToken(direction, category, site, transport_context, ordinal,
-                    source_token, destination_token, bytes,
-                    exact_source_capacity, exact_destination_capacity,
-                    success),
-      success};
-  transport_ledger.ordered_digest ^=
-      transport_ledger.events[index].endpoint_token;
+  const std::uint64_t endpoint_token = EndpointToken(
+      direction, category, site, transport_context, ordinal, source_token,
+      destination_token, bytes, exact_source_capacity,
+      exact_destination_capacity, success);
+  transport_ledger.ordered_digest ^= endpoint_token;
   transport_ledger.ordered_digest *= 1099511628211ULL;
+  AccumulateRange(transport_attempt_range, ordinal, endpoint_token, success);
+  if (transport_staging_active)
+    AccumulateRange(transport_staging_range, ordinal, endpoint_token, success);
 }
 
 void RecordAllocation(const CudaAllocationSite site,
@@ -167,23 +175,16 @@ void RecordAllocation(const CudaAllocationSite site,
                       const bool success,
                       const std::uint64_t retained_generation = 0) noexcept
 {
-  ++allocation_ledger.observed_count;
-  if (allocation_ledger.count >= allocation_ledger.events.size())
+  if (allocation_ledger.observed_count ==
+      std::numeric_limits<std::uint64_t>::max())
   {
     allocation_ledger.overflow = true;
-    ++allocation_ledger.dropped_count;
     return;
   }
-  const std::size_t index = allocation_ledger.count++;
+  ++allocation_ledger.observed_count;
   const std::uint64_t ordinal = ++allocation_ordinal;
   const std::uint64_t generation = allocation && success
       ? ++allocation_generation : retained_generation;
-  allocation_ledger.events[index] = {
-      ordinal, site, transport_context, static_cast<std::uint64_t>(bytes),
-      static_cast<std::uint64_t>(alignment),
-      static_cast<std::uint64_t>(bytes),
-      reinterpret_cast<std::uintptr_t>(pointer), generation, allocation,
-      success};
   std::uint64_t event_digest = 1469598103934665603ULL;
   MixScalar(event_digest, ordinal);
   MixScalar(event_digest, site);
@@ -400,21 +401,6 @@ bool UmpireDeviceAllocatorPolicy::Deallocate(
     void* pointer, const CudaAllocationSite site) noexcept
 {
   if (pointer == nullptr) { return true; }
-  std::uint64_t original_bytes = 0;
-  std::uint64_t original_alignment = 0;
-  std::uint64_t original_generation = 0;
-  const auto token = reinterpret_cast<std::uintptr_t>(pointer);
-  for (std::size_t index = allocation_ledger.count; index > 0; --index)
-  {
-    const AllocationEventV1& event = allocation_ledger.events[index - 1];
-    if (event.allocation && event.success && event.storage_token == token)
-    {
-      original_bytes = event.bytes;
-      original_alignment = event.alignment;
-      original_generation = event.generation;
-      break;
-    }
-  }
   bool success = false;
 #if defined(MFEM_USE_UMPIRE) && defined(HYPRE_USING_UMPIRE)
   try
@@ -430,9 +416,7 @@ bool UmpireDeviceAllocatorPolicy::Deallocate(
   }
   catch (...) {}
 #endif
-  RecordAllocation(site, static_cast<std::size_t>(original_bytes),
-                   static_cast<std::size_t>(original_alignment), pointer,
-                   false, success, original_generation);
+  RecordAllocation(site, 0, 0, pointer, false, success);
   return success;
 }
 
@@ -492,18 +476,16 @@ CudaAllocationLedgerV1 UmpireDeviceAllocatorPolicy::Ledger() noexcept
 void CudaTransportPolicy::ResetLedger() noexcept
 {
   transport_context = {};
-  // The retained prefix is authoritative; events beyond count are never
-  // observed.  Reset only ledger metadata to avoid materializing a full-size
-  // temporary ledger on this already deep CUDA application call path.
+  // Compact accounting intentionally retains no event history.
   transport_ledger.schema = 1;
-  transport_ledger.capacity = maximum_transfer_events;
   transport_ledger.totals = {};
-  transport_ledger.count = 0;
   transport_ledger.observed_count = 0;
-  transport_ledger.dropped_count = 0;
   transport_ledger.ordered_digest = 1469598103934665603ULL;
   transport_ledger.overflow = false;
   transport_attempt_totals = {};
+  transport_attempt_range = {};
+  transport_staging_range = {};
+  transport_staging_active = false;
 }
 
 void CudaTransportPolicy::BeginAttempt(
@@ -511,6 +493,10 @@ void CudaTransportPolicy::BeginAttempt(
 {
   transport_context = context;
   transport_attempt_totals = {};
+  transport_attempt_range = {};
+  transport_attempt_range.begin_ordinal = transport_ledger.observed_count + 1;
+  transport_attempt_range.ordered_digest = 1469598103934665603ULL;
+  transport_attempt_range.complete = true;
 }
 
 void CudaTransportPolicy::SetPhase(const CudaFailurePhase phase,
@@ -643,6 +629,26 @@ CudaTransferTotals CudaTransportPolicy::Accounting() noexcept
 
 CudaTransferLedgerV1 CudaTransportPolicy::Ledger() noexcept
 { return transport_ledger; }
+
+CudaTransferLedgerRangeV1 CudaTransportPolicy::AttemptRange() noexcept
+{
+  return transport_attempt_range;
+}
+
+void CudaTransportPolicy::BeginStagingRange() noexcept
+{
+  transport_staging_range = {};
+  transport_staging_range.begin_ordinal = transport_ledger.observed_count + 1;
+  transport_staging_range.ordered_digest = 1469598103934665603ULL;
+  transport_staging_range.complete = true;
+  transport_staging_active = true;
+}
+
+CudaTransferLedgerRangeV1 CudaTransportPolicy::EndStagingRange() noexcept
+{
+  transport_staging_active = false;
+  return transport_staging_range;
+}
 
 CollectiveAdmissionReport CudaMpiCollectivePolicy::Admit(
     const AttemptCollectiveContext& context, const bool prepared,

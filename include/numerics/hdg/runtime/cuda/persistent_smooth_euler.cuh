@@ -87,6 +87,9 @@ struct CudaTransportPolicy
   static bool Synchronize(CudaTransferSite site) noexcept;
   static CudaTransferTotals Accounting() noexcept;
   static CudaTransferLedgerV1 Ledger() noexcept;
+  static CudaTransferLedgerRangeV1 AttemptRange() noexcept;
+  static void BeginStagingRange() noexcept;
+  static CudaTransferLedgerRangeV1 EndStagingRange() noexcept;
 };
 
 /** Real rank-1/rank-2 reduction policy consumed by PersistentRunContract. */
@@ -588,8 +591,7 @@ public:
     checkpoint.facade_incarnation = facade_incarnation_;
     checkpoint.descriptor = pending_.staging->future_checkpoint();
     checkpoint.candidate_frozen = true;
-    const std::uint64_t staging_begin =
-        TransportPolicy::Ledger().observed_count + 1;
+    TransportPolicy::BeginStagingRange();
     storage_policy::SetCopyOutPurpose(
         detail::CudaCopyOutPurpose::checkpoint_staging);
     state_slot& staging_slot = numerics_.WorkspaceSlot();
@@ -607,13 +609,9 @@ public:
       pending_.report.gates.success = false;
     }
     UpdateAttemptEvidence(pending_.evidence);
-    const CudaTransferLedgerV1 ledger = TransportPolicy::Ledger();
-    checkpoint.staging_range.begin_ordinal = staging_begin;
-    checkpoint.staging_range.end_ordinal = ledger.observed_count;
-    checkpoint.staging_range.ordered_digest = RangeDigest(
-        ledger, staging_begin, ledger.observed_count);
-    checkpoint.staging_range.complete = all_staged && !ledger.overflow &&
-        ledger.observed_count + 1 >= staging_begin;
+    checkpoint.staging_range = TransportPolicy::EndStagingRange();
+    checkpoint.staging_range.complete =
+        checkpoint.staging_range.complete && all_staged;
     evidence = pending_.evidence;
     return all_staged;
   }
@@ -902,11 +900,6 @@ public:
     return true;
   }
 
-  CudaTransferLedgerV1 TransferLedger() const noexcept
-  { return TransportPolicy::Ledger(); }
-  CudaAllocationLedgerV1 AllocationLedger() const noexcept
-  { return AllocatorPolicy::Ledger(); }
-
   CudaReuseEvidence ReuseEvidence() const noexcept
   { return numerics_.ReuseEvidence(); }
 
@@ -1013,35 +1006,12 @@ private:
         TransportPolicy::Accounting(), allocations);
   }
 
-  static std::uint64_t RangeDigest(const CudaTransferLedgerV1& ledger,
-                                   const std::uint64_t begin,
-                                   const std::uint64_t end) noexcept
-  {
-    std::uint64_t digest = 1469598103934665603ULL;
-    for (std::size_t index = 0; index < ledger.count; ++index)
-    {
-      const TransferEventV1& event = ledger.events[index];
-      if (event.ordinal < begin || event.ordinal > end) { continue; }
-      digest ^= event.endpoint_token;
-      digest *= 1099511628211ULL;
-    }
-    return digest;
-  }
-
   void UpdateAttemptEvidence(CudaStepEvidence& evidence) const noexcept
   {
-    const CudaTransferLedgerV1 ledger = TransportPolicy::Ledger();
     evidence.transfers = TransportPolicy::Accounting();
-    if (evidence.transfer_range.begin_ordinal == 0)
-      evidence.transfer_range.begin_ordinal = pending_.ledger_begin;
-    evidence.transfer_range.end_ordinal = ledger.observed_count;
-    evidence.transfer_range.ordered_digest = RangeDigest(
-        ledger, evidence.transfer_range.begin_ordinal,
-        evidence.transfer_range.end_ordinal);
-    evidence.transfer_range.complete = !ledger.overflow &&
-        evidence.transfers.complete &&
-        evidence.transfer_range.end_ordinal + 1 >=
-            evidence.transfer_range.begin_ordinal;
+    evidence.transfer_range = TransportPolicy::AttemptRange();
+    evidence.transfer_range.complete =
+        evidence.transfer_range.complete && evidence.transfers.complete;
   }
 
   void FinishOutcome(const AttemptOutcome& outcome,

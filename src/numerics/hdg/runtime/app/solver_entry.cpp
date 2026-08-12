@@ -23,6 +23,15 @@ ApplicationRunResult RejectStaticEntryMismatch() noexcept
   return result;
 }
 
+HdgMethodResultV1 RejectMethodRequest(
+    const HdgMethodCapabilitiesV1 capabilities) noexcept
+{
+  HdgMethodResultV1 result{};
+  result.capabilities = capabilities;
+  result.run = RejectStaticEntryMismatch();
+  return result;
+}
+
 } // namespace
 
 MpiApplicationContextV1::MpiApplicationContextV1(
@@ -43,6 +52,67 @@ CudaApplicationContextV1::CudaApplicationContextV1(
     (void)MPI_Comm_rank(communicator_, &rank_);
     (void)MPI_Comm_size(communicator_, &ranks_);
   }
+}
+
+HdgMethodResultV1 RunHdgMethodV1(const HdgMethodRequestV1& request)
+{
+  if (request.options == nullptr || request.config == nullptr)
+  {
+    return RejectMethodRequest({});
+  }
+  const ApplicationValidation validation =
+      ValidateApplicationOptions(*request.options);
+  if (!validation.accepted() ||
+      validation.config()->scientific_config_sha256() !=
+          request.config->scientific_config_sha256() ||
+      validation.config()->run_config_sha256() != request.config->run_config_sha256())
+  {
+    return RejectMethodRequest(QueryHdgMethodCapabilitiesV1(*request.options));
+  }
+
+  HdgMethodResultV1 result{};
+  result.capabilities = CapabilitiesForV1(*request.config);
+  result.checkpoint_identity = CheckpointIdentityForV1(*request.config);
+  if (!result.capabilities.supported)
+  {
+    result.run = RejectStaticEntryMismatch();
+    return result;
+  }
+
+  switch (request.config->backend())
+  {
+    case ApplicationBackend::cpu_serial:
+      if (request.cpu_context == nullptr) return RejectMethodRequest(result.capabilities);
+      result.run = RunSmoothPeriodicEulerV1(
+          CpuSerialBackendTag{}, *request.options, *request.cpu_context);
+      return result;
+    case ApplicationBackend::cpu_rank2:
+      if (request.cpu_context == nullptr) return RejectMethodRequest(result.capabilities);
+      result.run = RunSmoothPeriodicEulerV1(
+          CpuRank2BackendTag{}, *request.options, *request.cpu_context);
+      return result;
+    case ApplicationBackend::cuda_rank1_one_gpu:
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK1
+      if (request.cuda_context == nullptr) return RejectMethodRequest(result.capabilities);
+      result.run = RunSmoothPeriodicEulerV1(
+          CudaRank1OneGpuBackendTag{}, *request.options, *request.cuda_context);
+      return result;
+#else
+      return RejectMethodRequest(result.capabilities);
+#endif
+    case ApplicationBackend::cuda_rank2_one_gpu_host_staged:
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK2
+      if (request.cuda_context == nullptr) return RejectMethodRequest(result.capabilities);
+      result.run = RunSmoothPeriodicEulerV1(
+          CudaRank2OneGpuHostStagedBackendTag{}, *request.options,
+          *request.cuda_context);
+      return result;
+#else
+      return RejectMethodRequest(result.capabilities);
+#endif
+    case ApplicationBackend::unknown: return RejectMethodRequest(result.capabilities);
+  }
+  return RejectMethodRequest(result.capabilities);
 }
 
 ApplicationRunResult RunSmoothPeriodicEulerV1(

@@ -151,22 +151,19 @@ bool ScalarAccepted(const sc25::TrajectoryStatus status) noexcept
 bool FinalConventionalUpdateRejectedEveryTrial(
     const cpu::CpuAttemptEvidence& attempt) noexcept
 {
-  int final_update = -1;
-  for (std::size_t index = 0; index < attempt.trial_count; ++index)
-    final_update = std::max(final_update,
-                            attempt.trials[index].newton_iteration);
-  std::size_t final_trials = 0;
-  for (std::size_t index = 0; index < attempt.trial_count; ++index)
-  {
-    const auto& trial = attempt.trials[index];
-    if (trial.newton_iteration != final_update) continue;
-    ++final_trials;
-    if (trial.prescreen_passed || trial.reassembled || trial.accepted)
-      return false;
-  }
-  return final_update >= 0 &&
-      final_trials == static_cast<std::size_t>(
-          cpu::cpu_maximum_line_search_trials);
+  return !attempt.committed && attempt.rollback_byte_equal &&
+      attempt.failure_phase == cpu::CpuFailurePhase::recovery &&
+      !attempt.admissibility_gate && attempt.work.complete_assemblies > 0 &&
+      attempt.final_line_search_trials ==
+          cpu::cpu_maximum_line_search_trials &&
+      attempt.work.trial_reassemblies ==
+          attempt.work.accepted_newton_updates &&
+      attempt.work.complete_condensations >=
+          attempt.work.accepted_newton_updates &&
+      attempt.work.complete_factor_setups ==
+          attempt.work.complete_trace_solves &&
+      attempt.work.complete_trace_solves >=
+          attempt.work.accepted_newton_updates;
 }
 
 template <typename Range>
@@ -359,27 +356,7 @@ int main(int argc, char** argv)
   const sc25::PersistentTrajectoryEvidence& scalar_evidence =
       scalar->trajectory_evidence();
   const sc25::TrajectoryAttemptEvidence& scalar_failed_attempt =
-      scalar_evidence.attempts[static_cast<std::size_t>(
-          std::max(0, scalar_evidence.attempt_count - 1))];
-  const int scalar_last_newton =
-      scalar_failed_attempt.attempted_newton_iterations - 1;
-  bool scalar_last_update_rejected = scalar_last_newton >= 0;
-  if (scalar_last_update_rejected)
-  {
-    const sc25::TrajectoryNewtonEvidence& last =
-        scalar_failed_attempt.newton[static_cast<std::size_t>(
-            scalar_last_newton)];
-    scalar_last_update_rejected = last.accepted_line_search_index == -1 &&
-        std::none_of(last.trial_admissible.begin(),
-                     last.trial_admissible.end(),
-                     [](const std::uint8_t accepted) {
-                       return accepted != 0;
-                     }) &&
-        std::none_of(last.trial_armijo.begin(), last.trial_armijo.end(),
-                     [](const std::uint8_t accepted) {
-                       return accepted != 0;
-                     });
-  }
+      scalar_evidence.last_attempt;
   checks.Require(scalar_after_copied &&
                      scalar_terminal ==
                          sc25::TrajectoryStatus::HdgSc25AdmissibilityFailure &&
@@ -391,7 +368,13 @@ int main(int argc, char** argv)
                                           scalar_after_failure),
                  "scalar negative trajectory must preserve committed step 10 without a hidden retry");
   checks.Require(scalar_failed_attempt.target_step == 11 &&
-                     scalar_last_update_rejected,
+                     scalar_failed_attempt.final_line_search_trials ==
+                         sc25::persistent_line_search_trials &&
+                     scalar_failed_attempt.attempted_newton_iterations ==
+                         scalar_failed_attempt.newton_iterations &&
+                     scalar_failed_attempt.newton_iterations > 0 &&
+                     scalar_failed_attempt.newton_iterations <=
+                         sc25::persistent_newton_maximum_iterations,
                  "scalar target step 11 must not silently accept an inadmissible trial");
 
   MPI_Finalize();

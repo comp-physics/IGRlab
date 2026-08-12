@@ -10,11 +10,6 @@ foreach(_dg_igr_hdg_app_test IN ITEMS
                  "test_${_dg_igr_hdg_app_test}.cpp")
   target_link_libraries("${_dg_igr_hdg_app_target}"
                         PRIVATE dg_igr_hdg_runtime_app_contract)
-  if(_dg_igr_hdg_app_test STREQUAL "command_line")
-    target_include_directories("${_dg_igr_hdg_app_target}" PRIVATE
-      "${PROJECT_SOURCE_DIR}/tests/hdg/runtime/common")
-    target_link_libraries("${_dg_igr_hdg_app_target}" PRIVATE mfem MPI::MPI_CXX)
-  endif()
   target_compile_definitions("${_dg_igr_hdg_app_target}" PRIVATE
     DG_IGR_HDG_RUNTIME_EXPECTED_CPLUSPLUS=201703L)
   target_compile_options("${_dg_igr_hdg_app_target}" PRIVATE
@@ -275,7 +270,6 @@ if(MFEM_USE_CUDA)
     COMMAND "${CMAKE_COMMAND}"
       "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
       "-DHDG_RUNTIME_SCALAR_VTK_TEST=$<TARGET_FILE:dg_igr_hdg_runtime_app_command_line_test>"
-      "-DHDG_RUNTIME_SCALAR_RANK2_MANIFEST_CONSUMER=$<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test>"
       "-DHDG_RUNTIME_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cli-scalar-igr-cuda-rank2"
       -DHDG_RUNTIME_FUNCTIONAL=TRUE
       -DHDG_RUNTIME_SCALAR_IGR=TRUE
