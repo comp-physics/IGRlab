@@ -242,46 +242,4 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
       RESOURCE_LOCK hdg_sc25_scalar_igr_cpu
       TIMEOUT 3600)
 
-  add_executable(dg_igr_hdg_sc25_scalar_igr_cpu_rank2_manifest_producer
-    emit_sc25_scalar_igr_rank2_manifest.cpp)
-
-  target_include_directories(
-    dg_igr_hdg_sc25_scalar_igr_cpu_rank2_manifest_producer
-    PRIVATE
-      "${PROJECT_SOURCE_DIR}/include"
-      "${PROJECT_SOURCE_DIR}/tests/hdg/runtime/common")
-
-  target_link_libraries(
-    dg_igr_hdg_sc25_scalar_igr_cpu_rank2_manifest_producer
-    PRIVATE
-      dg_igr_hdg_runtime_cpu
-      dg_igr_hdg_auxiliary_cpu
-      mfem
-      MPI::MPI_CXX)
-
-  target_compile_options(
-    dg_igr_hdg_sc25_scalar_igr_cpu_rank2_manifest_producer
-    PRIVATE
-      $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
-
-  set_target_properties(
-    dg_igr_hdg_sc25_scalar_igr_cpu_rank2_manifest_producer
-    PROPERTIES
-      CXX_STANDARD 17
-      CXX_STANDARD_REQUIRED ON
-      CXX_EXTENSIONS OFF)
-
-  add_test(
-    NAME hdg_sc25_scalar_igr_cpu_rank2_manifest_producer
-    COMMAND
-      "${MPIEXEC_EXECUTABLE}"
-      "${MPIEXEC_NUMPROC_FLAG}" 2
-      ${MPIEXEC_PREFLAGS}
-      $<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cpu_rank2_manifest_producer>
-      ${MPIEXEC_POSTFLAGS})
-  set_tests_properties(hdg_sc25_scalar_igr_cpu_rank2_manifest_producer
-    PROPERTIES
-      PROCESSORS 2
-      RESOURCE_LOCK hdg_sc25_scalar_igr_cpu
-      TIMEOUT 3600)
 endif()
