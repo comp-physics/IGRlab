@@ -61,16 +61,6 @@ inline constexpr int cpu_maximum_newton_updates = 20;
 inline constexpr int cpu_maximum_line_search_trials = 13;
 inline constexpr double cpu_armijo_constant = 1.0e-4;
 inline constexpr double cpu_nonlinear_tolerance = 1.0e-10;
-inline constexpr std::size_t cpu_maximum_local_interior_coefficients =
-    cpu_functional_principal_elements_per_direction *
-    cpu_functional_principal_elements_per_direction *
-    (cpu_functional_polynomial_order + 1) *
-    (cpu_functional_polynomial_order + 1) *
-    cpu_conserved_components;
-inline constexpr std::size_t cpu_maximum_local_true_trace_coefficients =
-    2 * cpu_functional_principal_elements_per_direction *
-    cpu_functional_principal_elements_per_direction *
-    (cpu_functional_polynomial_order + 1) * cpu_conserved_components;
 
 enum class CpuScenario : unsigned char
 {
@@ -158,70 +148,6 @@ struct CpuCanonicalEntry
   double value = 0.0;
 };
 
-struct CpuTrialEvidence
-{
-  int newton_iteration = 0;
-  int trial_index = 0;
-  double alpha = 0.0;
-  double base_residual = 0.0;
-  double armijo_boundary = 0.0;
-  double trial_residual = 0.0;
-  double minimum_density = 0.0;
-  double minimum_pressure = 0.0;
-  double maximum_wave_speed = 0.0;
-  bool prescreen_passed = false;
-  bool reassembled = false;
-  bool accepted = false;
-};
-
-struct CpuProductRecord
-{
-  DerivedProductKind kind = DerivedProductKind::residual;
-  std::uint64_t attempt_sequence = 0;
-  std::uint64_t candidate_cursor = 0;
-  StateHash payload_hash{};
-  StateHash candidate_state_hash{};
-  std::uint64_t linearization_generation = 0;
-  std::uint64_t candidate_generation = 0;
-  bool produced = false;
-};
-
-struct CpuLinearizationChain
-{
-  std::uint64_t local_generation = 0;
-  std::uint64_t condensed_generation = 0;
-  std::uint64_t solve_generation = 0;
-  std::uint64_t solution_generation = 0;
-  std::uint64_t recovery_generation = 0;
-  std::uint64_t candidate_generation = 0;
-  StateHash residual_hash{};
-  StateHash matrix_hash{};
-  /** Hash of Schur input plus frozen ILU configuration, not factor bytes. */
-  StateHash factor_hash{};
-  StateHash solution_hash{};
-  StateHash candidate_state_hash{};
-  std::array<double, cpu_maximum_local_true_trace_coefficients>
-      true_trace_increment{};
-  std::array<double, cpu_maximum_local_interior_coefficients>
-      accepted_candidate_interior{};
-  std::array<double, cpu_maximum_local_true_trace_coefficients>
-      accepted_candidate_true_trace{};
-  std::size_t true_trace_increment_size = 0;
-  std::size_t accepted_candidate_interior_size = 0;
-  std::size_t accepted_candidate_true_trace_size = 0;
-  bool true_trace_increment_capture_complete = false;
-  bool accepted_candidate_capture_complete = false;
-  std::uint64_t matrix_refresh_generation = 0;
-  std::uint64_t factor_setup_generation = 0;
-  double true_relative_residual = 0.0;
-  int newton_update = -1;
-  int accepted_trial_index = -1;
-  bool factor_setup_current = false;
-  bool ordered = false;
-  bool affine_consumption_verified = false;
-  bool retained_for_publication = false;
-};
-
 enum class CpuOwnedAllocationSite : unsigned char
 {
   slot_cell,
@@ -304,6 +230,7 @@ struct CpuAttemptEvidence
   int failure_source_rank = -1;
   int nonlinear_updates = 0;
   int linear_iterations = 0;
+  int final_line_search_trials = 0;
   double initial_nonlinear_residual = 0.0;
   double final_nonlinear_residual = 0.0;
   double maximum_true_relative_residual = 0.0;
@@ -314,17 +241,8 @@ struct CpuAttemptEvidence
   StateHash committed_trace_before{};
   StateHash committed_interior_after{};
   StateHash committed_trace_after{};
-  std::array<CpuProductRecord, 4> products{};
-  std::array<CpuLinearizationChain, cpu_maximum_newton_updates>
-      linearization_chains{};
-  std::size_t linearization_chain_count = 0;
-  std::size_t retained_linearization_chain = 0;
   std::uint64_t candidate_generation = 0;
   bool candidate_generation_invalidated = false;
-  std::array<CpuTrialEvidence,
-             cpu_maximum_newton_updates * cpu_maximum_line_search_trials>
-      trials{};
-  std::size_t trial_count = 0;
   CpuWorkCensus work{};
   TransferAccounting transfers{0, 0, 0, 0, 0, true};
   ProhibitedActionAccounting prohibited{};

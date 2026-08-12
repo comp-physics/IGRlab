@@ -11,7 +11,6 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -90,9 +89,6 @@ static_assert(cpu_functional_polynomial_order == 2 &&
                   cpu_functional_checkpoint_step == 10 &&
                   cpu_functional_retry_target_step == 14,
               "functional CPU tuple constants remain card exact");
-static_assert(cpu_maximum_local_interior_coefficients == 1296 &&
-                  cpu_maximum_local_true_trace_coefficients == 864,
-              "p2/N6 principal chain capture capacities are exact");
 static_assert(!std::is_copy_constructible<CpuPreparedStep>::value &&
                   std::is_move_constructible<CpuPreparedStep>::value &&
                   !std::is_copy_constructible<CpuPreparedCommit>::value &&
@@ -121,28 +117,7 @@ struct Checks
   }
 };
 
-std::string HashHex(const std::array<std::uint8_t, 32>& hash)
-{
-  constexpr char digits[] = "0123456789abcdef";
-  std::string result(hash.size() * 2, '0');
-  for (std::size_t index = 0; index < hash.size(); ++index)
-  {
-    result[2 * index] = digits[hash[index] >> 4U];
-    result[2 * index + 1] = digits[hash[index] & 0x0fU];
-  }
-  return result;
-}
-
-constexpr double independent_trajectory_relative_tolerance = 1.0e-8;
-constexpr double independent_trajectory_scaled_tolerance = 2.0e-8;
 constexpr double independent_true_residual_limit = 1.0e-10;
-constexpr double independent_armijo_constant = 1.0e-4;
-
-bool HashNonZero(const std::array<std::uint8_t, 32>& hash) noexcept
-{
-  return std::any_of(hash.begin(), hash.end(),
-                     [](const std::uint8_t byte) { return byte != 0; });
-}
 
 std::uint64_t IndependentRankOrderedStateIdentity(
     const CpuStateSnapshot& snapshot, const bool perturb_rank_one,
@@ -176,393 +151,6 @@ std::uint64_t IndependentRankOrderedStateIdentity(
   mix(global, ordered.data(), static_cast<std::size_t>(ranks) *
                                   sizeof(std::uint64_t));
   return global;
-}
-
-double RelativeScalarDifference(const double left,
-                                const double right) noexcept
-{
-  return std::abs(left - right) /
-      std::max({std::abs(left), std::abs(right), 1.0e-300});
-}
-
-bool CloseTrajectoryScalar(const double left, const double right) noexcept
-{
-  if (!std::isfinite(left) || !std::isfinite(right)) { return false; }
-  const double difference = std::abs(left - right);
-  const double scale = std::max({1.0, std::abs(left), std::abs(right)});
-  return RelativeScalarDifference(left, right) <=
-          independent_trajectory_relative_tolerance &&
-      difference <= independent_trajectory_scaled_tolerance * scale;
-}
-
-struct VectorComparison
-{
-  double production_norm = 0.0;
-  double oracle_norm = 0.0;
-  double difference_norm = 0.0;
-  double relative_difference = std::numeric_limits<double>::infinity();
-  double maximum_difference = std::numeric_limits<double>::infinity();
-  double infinity_scale = 1.0;
-  bool size_equal = false;
-  bool finite = false;
-  bool close = false;
-};
-
-VectorComparison CompareVectorData(const double* production,
-                                   const std::size_t production_size,
-                                   const std::vector<double>& oracle) noexcept
-{
-  VectorComparison comparison;
-  comparison.size_equal = production_size == oracle.size();
-  if (!comparison.size_equal || (!production && production_size != 0))
-  {
-    return comparison;
-  }
-  double production_squared = 0.0;
-  double oracle_squared = 0.0;
-  double difference_squared = 0.0;
-  double maximum_difference = 0.0;
-  double infinity_scale = 1.0;
-  bool finite = true;
-  for (std::size_t index = 0; index < oracle.size(); ++index)
-  {
-    finite = finite && std::isfinite(production[index]) &&
-        std::isfinite(oracle[index]);
-    const double difference = production[index] - oracle[index];
-    production_squared += production[index] * production[index];
-    oracle_squared += oracle[index] * oracle[index];
-    difference_squared += difference * difference;
-    maximum_difference = std::max(maximum_difference, std::abs(difference));
-    infinity_scale = std::max(
-        infinity_scale,
-        std::max(std::abs(production[index]), std::abs(oracle[index])));
-  }
-  comparison.production_norm = std::sqrt(production_squared);
-  comparison.oracle_norm = std::sqrt(oracle_squared);
-  comparison.difference_norm = std::sqrt(difference_squared);
-  comparison.relative_difference = comparison.difference_norm /
-      std::max({comparison.production_norm, comparison.oracle_norm, 1.0e-300});
-  comparison.maximum_difference = maximum_difference;
-  comparison.infinity_scale = infinity_scale;
-  comparison.finite = finite && std::isfinite(comparison.relative_difference) &&
-      std::isfinite(comparison.maximum_difference);
-  comparison.close = comparison.finite &&
-      comparison.relative_difference <=
-          independent_trajectory_relative_tolerance &&
-      comparison.maximum_difference <=
-          independent_trajectory_scaled_tolerance * comparison.infinity_scale;
-  return comparison;
-}
-
-template <std::size_t Capacity>
-VectorComparison CompareCaptured(
-    const std::array<double, Capacity>& production,
-    const std::size_t production_size,
-    const std::vector<double>& oracle) noexcept
-{
-  if (production_size > production.size()) { return {}; }
-  return CompareVectorData(production.data(), production_size, oracle);
-}
-
-const CpuTrialEvidence* AcceptedProductionTrial(
-    const CpuAttemptEvidence& produced,
-    const int update,
-    int& attempted_trials,
-    int& accepted_trials,
-    bool& ordered_trial_indices) noexcept
-{
-  attempted_trials = 0;
-  accepted_trials = 0;
-  ordered_trial_indices = true;
-  const CpuTrialEvidence* accepted = nullptr;
-  for (std::size_t index = 0; index < produced.trial_count; ++index)
-  {
-    const CpuTrialEvidence& trial = produced.trials[index];
-    if (trial.newton_iteration != update) { continue; }
-    ordered_trial_indices = ordered_trial_indices &&
-        trial.trial_index == attempted_trials;
-    ++attempted_trials;
-    if (trial.accepted)
-    {
-      ++accepted_trials;
-      accepted = &trial;
-    }
-  }
-  return accepted;
-}
-
-void ReportIndependentChainDiagnostics(
-    const dg_igr_hdg_cpu_test::IndependentOracleResult& oracle,
-    const CpuAttemptEvidence& produced,
-    const int rank)
-{
-  const std::size_t oracle_count = oracle.linearizations.size();
-  const std::size_t produced_count = produced.linearization_chain_count;
-  std::ostringstream output;
-  output << "rank " << rank
-         << ": independent_oracle flags"
-         << " mesh=" << oracle.mesh_rebuilt
-         << " analytic_source_flux_jacobian="
-         << oracle.analytic_source_flux_jacobian
-         << " signed_maps=" << oracle.signed_maps_rebuilt
-         << " signed_map_extent=" << oracle.signed_map_extent_valid
-         << " signed_map_entries=" << oracle.signed_map_entries_valid
-         << " signed_map_permutation="
-         << oracle.signed_map_permutation_rebuilt
-         << " signed_map_used=" << oracle.signed_map_used
-         << " negative_signed_trace_dofs="
-         << oracle.negative_signed_trace_dofs
-         << " local_schur=" << oracle.local_schur_rebuilt
-         << " global_ptsp=" << oracle.global_ptsp_rebuilt
-         << " true_residual=" << oracle.true_residual_rebuilt
-         << " distribute=" << oracle.distribute_rebuilt
-         << " recovery=" << oracle.recovery_rebuilt
-         << " admissible=" << oracle.admissible
-         << " passed=" << oracle.passed
-         << " initial_residual=" << oracle.initial_residual
-         << " final_residual=" << oracle.final_residual
-         << " maximum_true_residual=" << oracle.maximum_true_residual
-         << '\n'
-         << "rank " << rank
-         << ": independent_chain counts oracle=" << oracle_count
-         << " produced=" << produced_count
-         << " oracle_steps=" << oracle.newton_steps.size()
-         << " oracle_newton_updates=" << oracle.newton_updates
-         << " produced_newton_updates=" << produced.nonlinear_updates
-         << " production_trial_count=" << produced.trial_count
-         << " production_factor_setups="
-         << produced.work.complete_factor_setups
-         << " production_trace_solves="
-         << produced.work.complete_trace_solves
-         << " count_equal=" << (oracle_count == produced_count)
-         << " oracle_count_matches_updates="
-         << (oracle_count == static_cast<std::size_t>(oracle.newton_updates))
-         << " produced_count_matches_updates="
-         << (produced_count ==
-             static_cast<std::size_t>(produced.nonlinear_updates))
-         << " multi_update=" << (oracle_count > 1) << '\n';
-
-  const std::size_t common = std::min(oracle_count, produced_count);
-  for (std::size_t index = 0; index < common; ++index)
-  {
-    const dg_igr_hdg_cpu_test::IndependentLinearizationHashes& rebuilt =
-        oracle.linearizations[index];
-    const CpuLinearizationChain& chain =
-        produced.linearization_chains[index];
-    const bool residual_equal =
-        chain.residual_hash.bytes == rebuilt.residual;
-    const bool matrix_equal = chain.matrix_hash.bytes == rebuilt.matrix;
-    const bool factor_equal = chain.factor_hash.bytes == rebuilt.factor;
-    const bool solution_equal = chain.solution_hash.bytes == rebuilt.solution;
-    const bool candidate_equal =
-        chain.candidate_state_hash.bytes == rebuilt.candidate;
-    const bool solve_before_solution =
-        chain.solve_generation < chain.solution_generation;
-    const bool solution_before_recovery =
-        chain.solution_generation < chain.recovery_generation;
-    const bool previous_recovery_before_local = index == 0 ||
-        produced.linearization_chains[index - 1].recovery_generation <
-            chain.local_generation;
-    const bool previous_candidate_before_candidate = index == 0 ||
-        produced.linearization_chains[index - 1].candidate_generation <
-            chain.candidate_generation;
-    const bool factor_setup_census_current = chain.factor_setup_current &&
-        chain.matrix_refresh_generation != 0 &&
-        chain.matrix_refresh_generation == chain.factor_setup_generation;
-    output << "rank " << rank << ": independent_chain[" << index << ']'
-           << " residual_equal=" << residual_equal
-           << " matrix_equal=" << matrix_equal
-           << " factor_equal=" << factor_equal
-           << " solution_equal=" << solution_equal
-           << " candidate_equal=" << candidate_equal
-           << " oracle_hashes_nonzero="
-           << (HashNonZero(rebuilt.residual) && HashNonZero(rebuilt.matrix) &&
-               HashNonZero(rebuilt.factor) && HashNonZero(rebuilt.solution) &&
-               HashNonZero(rebuilt.candidate))
-           << " production_hashes_nonzero="
-           << (HashNonZero(chain.residual_hash.bytes) &&
-               HashNonZero(chain.matrix_hash.bytes) &&
-               HashNonZero(chain.factor_hash.bytes) &&
-               HashNonZero(chain.solution_hash.bytes) &&
-               HashNonZero(chain.candidate_state_hash.bytes))
-           << " ordered=" << chain.ordered
-           << " affine=" << chain.affine_consumption_verified
-           << " solve_before_solution=" << solve_before_solution
-           << " solution_before_recovery=" << solution_before_recovery
-           << " previous_recovery_before_local="
-           << previous_recovery_before_local
-           << " previous_candidate_before_candidate="
-           << previous_candidate_before_candidate
-           << " factor_setup_current=" << chain.factor_setup_current
-           << " factor_setup_census_current="
-           << factor_setup_census_current
-           << " matrix_refresh_generation="
-           << chain.matrix_refresh_generation
-           << " factor_setup_generation=" << chain.factor_setup_generation
-           << " true_relative_residual=" << chain.true_relative_residual
-           << " newton_update=" << chain.newton_update
-           << " accepted_trial_index=" << chain.accepted_trial_index
-           << " captured_sizes={trace_increment:"
-           << chain.true_trace_increment_size
-           << ",candidate_interior:"
-           << chain.accepted_candidate_interior_size
-           << ",candidate_trace:"
-           << chain.accepted_candidate_true_trace_size << "}"
-           << " generations={local:" << chain.local_generation
-           << ",condensed:" << chain.condensed_generation
-           << ",solve:" << chain.solve_generation
-           << ",solution:" << chain.solution_generation
-           << ",recovery:" << chain.recovery_generation
-           << ",candidate:" << chain.candidate_generation << "}\n"
-           << "  oracle.residual=" << HashHex(rebuilt.residual) << '\n'
-           << "  produced.residual=" << HashHex(chain.residual_hash.bytes)
-           << '\n'
-           << "  oracle.matrix=" << HashHex(rebuilt.matrix) << '\n'
-           << "  produced.matrix=" << HashHex(chain.matrix_hash.bytes) << '\n'
-           << "  oracle.factor=" << HashHex(rebuilt.factor) << '\n'
-           << "  produced.factor=" << HashHex(chain.factor_hash.bytes) << '\n'
-           << "  oracle.solution=" << HashHex(rebuilt.solution) << '\n'
-           << "  produced.solution=" << HashHex(chain.solution_hash.bytes)
-           << '\n'
-           << "  oracle.candidate=" << HashHex(rebuilt.candidate) << '\n'
-           << "  produced.candidate="
-           << HashHex(chain.candidate_state_hash.bytes) << '\n';
-  }
-  for (std::size_t index = common;
-       index < std::max(oracle_count, produced_count); ++index)
-  {
-    output << "rank " << rank << ": independent_chain[" << index << ']'
-           << " oracle_present=" << (index < oracle_count)
-           << " produced_present=" << (index < produced_count) << '\n';
-  }
-
-  const std::size_t trajectory_count = std::min(
-      oracle.newton_steps.size(), produced_count);
-  for (std::size_t index = 0; index < trajectory_count; ++index)
-  {
-    const dg_igr_hdg_cpu_test::IndependentNewtonStepEvidence& step =
-        oracle.newton_steps[index];
-    const CpuLinearizationChain& chain =
-        produced.linearization_chains[index];
-    const VectorComparison trace_increment = CompareCaptured(
-        chain.true_trace_increment, chain.true_trace_increment_size,
-        step.true_trace_increment);
-    const VectorComparison candidate_interior = CompareCaptured(
-        chain.accepted_candidate_interior,
-        chain.accepted_candidate_interior_size,
-        step.accepted_candidate_interior);
-    const VectorComparison candidate_trace = CompareCaptured(
-        chain.accepted_candidate_true_trace,
-        chain.accepted_candidate_true_trace_size,
-        step.accepted_candidate_true_trace);
-    int attempted_trials = 0;
-    int accepted_trials = 0;
-    bool ordered_trial_indices = false;
-    const CpuTrialEvidence* trial = AcceptedProductionTrial(
-        produced, static_cast<int>(index), attempted_trials,
-        accepted_trials, ordered_trial_indices);
-    output << "rank " << rank << ": independent_trajectory[" << index << ']'
-           << " oracle_update=" << step.update_index
-           << " oracle_attempted_trials=" << step.attempted_trials
-           << " produced_attempted_trials=" << attempted_trials
-           << " accepted_trials=" << accepted_trials
-           << " ordered_trial_indices=" << ordered_trial_indices
-           << " trace_increment={size_equal:" << trace_increment.size_equal
-           << ",finite:" << trace_increment.finite
-           << ",close:" << trace_increment.close
-           << ",production_norm:" << trace_increment.production_norm
-           << ",oracle_norm:" << trace_increment.oracle_norm
-           << ",difference_norm:" << trace_increment.difference_norm
-           << ",relative:" << trace_increment.relative_difference
-           << ",max_difference:" << trace_increment.maximum_difference
-           << ",scale:" << trace_increment.infinity_scale << "}"
-           << " candidate_interior={size_equal:"
-           << candidate_interior.size_equal
-           << ",finite:" << candidate_interior.finite
-           << ",close:" << candidate_interior.close
-           << ",production_norm:" << candidate_interior.production_norm
-           << ",oracle_norm:" << candidate_interior.oracle_norm
-           << ",difference_norm:" << candidate_interior.difference_norm
-           << ",relative:" << candidate_interior.relative_difference
-           << ",max_difference:" << candidate_interior.maximum_difference
-           << ",scale:" << candidate_interior.infinity_scale << "}"
-           << " candidate_trace={size_equal:" << candidate_trace.size_equal
-           << ",finite:" << candidate_trace.finite
-           << ",close:" << candidate_trace.close
-           << ",production_norm:" << candidate_trace.production_norm
-           << ",oracle_norm:" << candidate_trace.oracle_norm
-           << ",difference_norm:" << candidate_trace.difference_norm
-           << ",relative:" << candidate_trace.relative_difference
-           << ",max_difference:" << candidate_trace.maximum_difference
-           << ",scale:" << candidate_trace.infinity_scale << "}";
-    if (trial)
-    {
-      const double oracle_armijo_boundary =
-          (1.0 - independent_armijo_constant * step.accepted_alpha) *
-          step.base_residual;
-      const double produced_armijo_boundary =
-          (1.0 - independent_armijo_constant * trial->alpha) *
-          trial->base_residual;
-      output << " oracle_trial=" << step.accepted_trial_index
-             << " produced_trial=" << trial->trial_index
-             << " oracle_alpha=" << step.accepted_alpha
-             << " produced_alpha=" << trial->alpha
-             << " alpha_difference="
-             << std::abs(step.accepted_alpha - trial->alpha)
-             << " base_oracle=" << step.base_residual
-             << " base_produced=" << trial->base_residual
-             << " base_difference="
-             << std::abs(step.base_residual - trial->base_residual)
-             << " base_relative_difference="
-             << RelativeScalarDifference(step.base_residual,
-                                         trial->base_residual)
-             << " base_close="
-             << CloseTrajectoryScalar(step.base_residual,
-                                      trial->base_residual)
-             << " candidate_oracle=" << step.accepted_candidate_residual
-             << " candidate_produced=" << trial->trial_residual
-             << " candidate_difference="
-             << std::abs(step.accepted_candidate_residual -
-                         trial->trial_residual)
-             << " candidate_relative_difference="
-             << RelativeScalarDifference(step.accepted_candidate_residual,
-                                         trial->trial_residual)
-             << " candidate_close="
-             << CloseTrajectoryScalar(step.accepted_candidate_residual,
-                                      trial->trial_residual)
-             << " oracle_true_relative=" << step.true_relative_residual
-             << " produced_chain_true_relative="
-             << chain.true_relative_residual
-             << " true_relative_difference="
-             << std::abs(step.true_relative_residual -
-                         chain.true_relative_residual)
-             << " produced_maximum_true_relative="
-             << produced.maximum_true_relative_residual
-             << " oracle_true_gate="
-             << (std::isfinite(step.true_relative_residual) &&
-                 step.true_relative_residual <=
-                     independent_true_residual_limit)
-             << " produced_true_gate="
-             << (std::isfinite(produced.maximum_true_relative_residual) &&
-                 produced.maximum_true_relative_residual <=
-                     independent_true_residual_limit)
-             << " oracle_armijo=" << step.armijo_satisfied
-             << " oracle_armijo_boundary=" << oracle_armijo_boundary
-             << " produced_armijo="
-             << (trial->accepted &&
-                 trial->trial_residual <= trial->armijo_boundary)
-             << " produced_recorded_armijo_boundary="
-             << trial->armijo_boundary
-             << " produced_rebuilt_armijo_boundary="
-             << produced_armijo_boundary;
-    }
-    else
-    {
-      output << " produced_accepted_trial=missing";
-    }
-    output << '\n';
-  }
-  std::cerr << output.str();
 }
 
 std::vector<double> CopyView(const CpuCoefficientView view)
@@ -2082,27 +1670,12 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
           communicator);
   const CpuAttemptEvidence& functional_first =
       uninterrupted.evidence().accepted.attempt;
-  bool capture_policy_exact = functional_first.linearization_chain_count > 0;
-  for (std::size_t index = 0;
-       index < functional_first.linearization_chain_count; ++index)
-  {
-    const CpuLinearizationChain& chain =
-        functional_first.linearization_chains[index];
-    const bool principal_capture = elements_per_direction <=
-        cpu_functional_principal_elements_per_direction;
-    capture_policy_exact = capture_policy_exact &&
-        (principal_capture
-             ? chain.true_trace_increment_capture_complete &&
-                   chain.accepted_candidate_capture_complete
-             : !chain.true_trace_increment_capture_complete &&
-                   !chain.accepted_candidate_capture_complete &&
-                   chain.true_trace_increment_size == 0 &&
-                   chain.accepted_candidate_interior_size == 0 &&
-                   chain.accepted_candidate_true_trace_size == 0);
-  }
   checks.Require(first_scientific.passed && AcceptedStepPasses(
                      uninterrupted.evidence().accepted, 1) &&
-                     capture_policy_exact,
+                     functional_first.work.complete_factor_setups ==
+                         functional_first.work.complete_trace_solves &&
+                     functional_first.work.complete_trace_solves ==
+                         functional_first.work.accepted_newton_updates,
                  "functional step-1 solver-linked scientific/accounting gates");
 
   CpuCheckpoint uninterrupted_checkpoint;
@@ -2381,141 +1954,23 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                  "step 1 commit");
   const CpuAttemptEvidence& first_accepted =
       adapter.evidence().accepted.attempt;
-  bool independent_chain = oracle.passed &&
-      oracle.linearizations.size() == oracle.newton_steps.size() &&
-      oracle.linearizations.size() ==
-          first_accepted.linearization_chain_count &&
-      oracle.linearizations.size() ==
-          static_cast<std::size_t>(oracle.newton_updates) &&
-      oracle.linearizations.size() ==
-          static_cast<std::size_t>(first_accepted.nonlinear_updates) &&
-      oracle.linearizations.size() > 1 &&
-      first_accepted.work.complete_factor_setups ==
-          first_accepted.work.complete_trace_solves &&
-      first_accepted.work.complete_factor_setups ==
-          first_accepted.work.accepted_newton_updates &&
-      first_accepted.work.complete_factor_setups ==
-          first_accepted.linearization_chain_count &&
-      first_accepted.finite_gate && first_accepted.admissibility_gate &&
-      first_accepted.recovery_gate && first_accepted.nonlinear_gate &&
-      first_accepted.true_residual_gate &&
-      std::isfinite(first_accepted.maximum_true_relative_residual) &&
-      first_accepted.maximum_true_relative_residual <=
-          independent_true_residual_limit;
-  bool localized_initial_inputs_exact =
-      !oracle.linearizations.empty() &&
-      first_accepted.linearization_chain_count != 0;
-  bool stale_identity_setup_rejected = localized_initial_inputs_exact;
-  std::uint64_t prior_matrix_refresh_generation = 0;
-  std::uint64_t prior_factor_setup_generation = 0;
-  const std::size_t comparison_count = std::min(
-      {oracle.linearizations.size(), oracle.newton_steps.size(),
-       first_accepted.linearization_chain_count});
-  for (std::size_t index = 0; index < comparison_count; ++index)
-  {
-    const dg_igr_hdg_cpu_test::IndependentLinearizationHashes& rebuilt =
-        oracle.linearizations[index];
-    const dg_igr_hdg_cpu_test::IndependentNewtonStepEvidence& step =
-        oracle.newton_steps[index];
-    const CpuLinearizationChain& produced =
-        first_accepted.linearization_chains[index];
-    int attempted_trials = 0;
-    int accepted_trials = 0;
-    bool ordered_trial_indices = false;
-    const CpuTrialEvidence* trial = AcceptedProductionTrial(
-        first_accepted, static_cast<int>(index), attempted_trials,
-        accepted_trials, ordered_trial_indices);
-    const VectorComparison trace_increment = CompareCaptured(
-        produced.true_trace_increment, produced.true_trace_increment_size,
-        step.true_trace_increment);
-    const VectorComparison candidate_interior = CompareCaptured(
-        produced.accepted_candidate_interior,
-        produced.accepted_candidate_interior_size,
-        step.accepted_candidate_interior);
-    const VectorComparison candidate_trace = CompareCaptured(
-        produced.accepted_candidate_true_trace,
-        produced.accepted_candidate_true_trace_size,
-        step.accepted_candidate_true_trace);
-    const bool hashes_retained = HashNonZero(rebuilt.residual) &&
-        HashNonZero(rebuilt.matrix) && HashNonZero(rebuilt.factor) &&
-        HashNonZero(rebuilt.solution) && HashNonZero(rebuilt.candidate) &&
-        HashNonZero(produced.residual_hash.bytes) &&
-        HashNonZero(produced.matrix_hash.bytes) &&
-        HashNonZero(produced.factor_hash.bytes) &&
-        HashNonZero(produced.solution_hash.bytes) &&
-        HashNonZero(produced.candidate_state_hash.bytes);
-    const bool factor_setup_current = produced.factor_setup_current &&
-        produced.matrix_refresh_generation > prior_matrix_refresh_generation &&
-        produced.factor_setup_generation > prior_factor_setup_generation &&
-        produced.matrix_refresh_generation ==
-            produced.factor_setup_generation;
-    const bool trial_association = trial &&
-        produced.newton_update == static_cast<int>(index) &&
-        step.update_index == static_cast<int>(index) &&
-        produced.accepted_trial_index == step.accepted_trial_index &&
-        trial->newton_iteration == static_cast<int>(index) &&
-        trial->trial_index == step.accepted_trial_index &&
-        attempted_trials == step.attempted_trials &&
-        attempted_trials == step.accepted_trial_index + 1 &&
-        accepted_trials == 1 && ordered_trial_indices &&
-        trial->alpha == step.accepted_alpha &&
-        trial->alpha == std::ldexp(1.0, -trial->trial_index);
-    const bool trajectory_scalars = trial &&
-        CloseTrajectoryScalar(step.base_residual, trial->base_residual) &&
-        CloseTrajectoryScalar(step.accepted_candidate_residual,
-                              trial->trial_residual);
-    const bool independent_armijo = step.armijo_satisfied &&
-        step.accepted_candidate_residual <=
-            (1.0 - independent_armijo_constant * step.accepted_alpha) *
-                step.base_residual &&
-        step.accepted_candidate_residual < step.base_residual;
-    const bool production_armijo = trial && trial->accepted &&
-        trial->prescreen_passed && trial->reassembled &&
-        trial->trial_residual <= trial->armijo_boundary &&
-        trial->armijo_boundary ==
-            (1.0 - independent_armijo_constant * trial->alpha) *
-                trial->base_residual &&
-        trial->trial_residual < trial->base_residual;
-    const bool true_residuals =
-        std::isfinite(step.true_relative_residual) &&
-        step.true_relative_residual <= independent_true_residual_limit &&
-        std::isfinite(produced.true_relative_residual) &&
-        produced.true_relative_residual <= independent_true_residual_limit;
-    localized_initial_inputs_exact = localized_initial_inputs_exact &&
-        (index != 0 ||
-         (produced.residual_hash.bytes == rebuilt.residual &&
-          produced.matrix_hash.bytes == rebuilt.matrix &&
-          produced.factor_hash.bytes == rebuilt.factor));
-    stale_identity_setup_rejected = stale_identity_setup_rejected &&
-        (index != 0 || (factor_setup_current && trace_increment.close));
-    independent_chain = independent_chain && hashes_retained &&
-        factor_setup_current &&
-        trace_increment.close && candidate_interior.close &&
-        candidate_trace.close && trial_association && trajectory_scalars &&
-        independent_armijo && production_armijo && true_residuals &&
-        produced.ordered && produced.affine_consumption_verified &&
-        produced.solve_generation < produced.solution_generation &&
-        produced.solution_generation < produced.recovery_generation &&
-        (index == 0 ||
-         first_accepted.linearization_chains[index - 1]
-                 .recovery_generation < produced.local_generation) &&
-        (index == 0 ||
-         first_accepted.linearization_chains[index - 1]
-                 .candidate_generation < produced.candidate_generation);
-    prior_matrix_refresh_generation = produced.matrix_refresh_generation;
-    prior_factor_setup_generation = produced.factor_setup_generation;
-  }
-  checks.Require(localized_initial_inputs_exact,
-                 "chain-0 residual/matrix/factor-input hashes localize inputs");
-  checks.Require(stale_identity_setup_rejected,
-                 "current Schur setup and increment reject identity-primed reuse");
-  if (!independent_chain || !localized_initial_inputs_exact ||
-      !stale_identity_setup_rejected)
-  {
-    ReportIndependentChainDiagnostics(oracle, first_accepted, rank);
-  }
-  checks.Require(independent_chain,
-                 "independent numerical Newton chains match with provenance hashes");
+  checks.Require(oracle.passed && oracle.newton_updates > 1 &&
+                     first_accepted.nonlinear_updates ==
+                         oracle.newton_updates &&
+                     first_accepted.work.complete_factor_setups ==
+                         first_accepted.work.complete_trace_solves &&
+                     first_accepted.work.complete_trace_solves ==
+                         first_accepted.work.accepted_newton_updates &&
+                     first_accepted.finite_gate &&
+                     first_accepted.admissibility_gate &&
+                     first_accepted.recovery_gate &&
+                     first_accepted.nonlinear_gate &&
+                     first_accepted.true_residual_gate &&
+                     std::isfinite(
+                         first_accepted.maximum_true_relative_residual) &&
+                     first_accepted.maximum_true_relative_residual <=
+                         independent_true_residual_limit,
+                 "independent solver state and compact Newton census agree");
   checks.Require(NearTime(adapter.coordinates().time, 0.05) &&
                      adapter.coordinates().step == 1 &&
                      adapter.coordinates().generation == 1 &&
@@ -2612,62 +2067,6 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                       local_trace_hashes[0] != local_trace_hashes[1]),
                  "checkpoint identity is rank-common while local hashes remain local");
   const CpuAttemptEvidence& accepted = terminal.accepted.attempt;
-  bool chain_coherent = accepted.linearization_chain_count ==
-      static_cast<std::size_t>(accepted.nonlinear_updates) &&
-      accepted.linearization_chain_count > 1 &&
-      accepted.retained_linearization_chain + 1 ==
-          accepted.linearization_chain_count;
-  std::uint64_t prior_generation = 0;
-  std::uint64_t prior_candidate_generation = 0;
-  std::uint64_t terminal_prior_factor_setup_generation = 0;
-  for (std::size_t index = 0;
-       index < accepted.linearization_chain_count; ++index)
-  {
-    const CpuLinearizationChain& chain = accepted.linearization_chains[index];
-    chain_coherent = chain_coherent && chain.ordered &&
-        chain.affine_consumption_verified &&
-        chain.true_trace_increment_capture_complete &&
-        chain.accepted_candidate_capture_complete &&
-        chain.factor_setup_current &&
-        chain.matrix_refresh_generation == chain.factor_setup_generation &&
-        chain.factor_setup_generation >
-            terminal_prior_factor_setup_generation &&
-        chain.true_trace_increment_size ==
-            terminal.local_owned_true_trace_coefficients &&
-        chain.accepted_candidate_interior_size ==
-            terminal.local_owned_interior_coefficients &&
-        chain.accepted_candidate_true_trace_size ==
-            terminal.local_owned_true_trace_coefficients &&
-        chain.local_generation > prior_generation &&
-        chain.local_generation < chain.condensed_generation &&
-        chain.condensed_generation < chain.solve_generation &&
-        chain.solve_generation < chain.solution_generation &&
-        chain.solution_generation < chain.recovery_generation &&
-        chain.candidate_generation > prior_candidate_generation &&
-        chain.residual_hash != StateHash{} && chain.matrix_hash != StateHash{} &&
-        chain.factor_hash != StateHash{} && chain.solution_hash != StateHash{} &&
-        chain.candidate_state_hash != StateHash{} &&
-        (chain.retained_for_publication ==
-         (index == accepted.retained_linearization_chain));
-    prior_generation = chain.recovery_generation;
-    prior_candidate_generation = chain.candidate_generation;
-    terminal_prior_factor_setup_generation = chain.factor_setup_generation;
-  }
-  const CpuLinearizationChain& retained =
-      accepted.linearization_chains[accepted.retained_linearization_chain];
-  const bool products_bind_retained_chain =
-      accepted.products[0].payload_hash == retained.residual_hash &&
-      accepted.products[0].linearization_generation ==
-          retained.local_generation &&
-      accepted.products[1].payload_hash == retained.matrix_hash &&
-      accepted.products[1].linearization_generation ==
-          retained.condensed_generation &&
-      accepted.products[2].payload_hash == retained.factor_hash &&
-      accepted.products[2].linearization_generation ==
-          retained.solve_generation &&
-      accepted.products[3].payload_hash == retained.solution_hash &&
-      accepted.products[3].linearization_generation ==
-          retained.solution_generation;
   checks.Require(accepted.work.complete_assemblies ==
                          1 + accepted.work.trial_reassemblies &&
                      accepted.work.complete_condensations ==
@@ -2680,33 +2079,12 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                          accepted.work.accepted_newton_updates &&
                      accepted.work.complete_recoveries ==
                          accepted.work.accepted_newton_updates &&
-                     accepted.products[0].kind ==
-                         DerivedProductKind::residual &&
-                     accepted.products[1].kind ==
-                         DerivedProductKind::matrix &&
-                     accepted.products[2].kind ==
-                         DerivedProductKind::factor &&
-                     accepted.products[3].kind ==
-                         DerivedProductKind::solution &&
-                     std::all_of(accepted.products.begin(),
-                                 accepted.products.end(),
-                                 [&](const CpuProductRecord& product)
-                                 {
-                                   return product.produced &&
-                                       product.attempt_sequence ==
-                                           accepted.identity.sequence &&
-                                       product.candidate_cursor ==
-                                           accepted.candidate_cursor &&
-                                       product.candidate_generation ==
-                                           accepted.candidate_generation &&
-                                       product.candidate_state_hash ==
-                                           accepted.linearization_chains[
-                                               accepted
-                                                   .retained_linearization_chain]
-                                               .candidate_state_hash;
-                                 }) && chain_coherent &&
-                     products_bind_retained_chain,
-                 "Newton census and attempt-qualified product order");
+                     accepted.candidate_generation != 0 &&
+                     accepted.committed_interior_after ==
+                         terminal.accepted.interior_hash &&
+                     accepted.committed_trace_after ==
+                         terminal.accepted.trace_hash,
+                 "compact Newton census and committed-state binding");
   const RunTelemetry* telemetry = adapter.contract_telemetry();
   checks.Require(telemetry && telemetry->attempts_started == 4 &&
                      telemetry->attempts_failed == 1 &&

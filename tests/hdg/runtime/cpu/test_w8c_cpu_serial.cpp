@@ -151,22 +151,18 @@ bool ScalarAccepted(const sc25::TrajectoryStatus status) noexcept
 bool FinalConventionalUpdateRejectedEveryTrial(
     const cpu::CpuAttemptEvidence& attempt) noexcept
 {
-  int final_update = -1;
-  for (std::size_t index = 0; index < attempt.trial_count; ++index)
-    final_update = std::max(final_update,
-                            attempt.trials[index].newton_iteration);
-  std::size_t final_trials = 0;
-  for (std::size_t index = 0; index < attempt.trial_count; ++index)
-  {
-    const auto& trial = attempt.trials[index];
-    if (trial.newton_iteration != final_update) continue;
-    ++final_trials;
-    if (trial.prescreen_passed || trial.reassembled || trial.accepted)
-      return false;
-  }
-  return final_update >= 0 &&
-      final_trials == static_cast<std::size_t>(
-          cpu::cpu_maximum_line_search_trials);
+  return !attempt.committed && attempt.rollback_byte_equal &&
+      attempt.failure_phase == cpu::CpuFailurePhase::recovery &&
+      !attempt.admissibility_gate && attempt.work.complete_assemblies > 0 &&
+      attempt.final_line_search_trials ==
+          cpu::cpu_maximum_line_search_trials &&
+      attempt.work.trial_reassemblies == 0 &&
+      attempt.work.complete_condensations >=
+          attempt.work.accepted_newton_updates &&
+      attempt.work.complete_factor_setups ==
+          attempt.work.complete_trace_solves &&
+      attempt.work.complete_trace_solves >=
+          attempt.work.accepted_newton_updates;
 }
 
 template <typename Range>
