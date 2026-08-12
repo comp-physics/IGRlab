@@ -4101,8 +4101,20 @@ ApplicationRunResult DispatchApplication(
   }
   if (backend != ApplicationBackend::unknown)
     backend = ParseApplicationBackend(derived.backend_id);
-  if (backend == ApplicationBackend::cpu_serial ||
-      backend == ApplicationBackend::cpu_rank2)
+  const bool typed_cpu = backend == ApplicationBackend::cpu_serial ||
+      backend == ApplicationBackend::cpu_rank2;
+  bool typed_cuda = false;
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK1
+  typed_cuda = typed_cuda ||
+      (backend == ApplicationBackend::cuda_rank1_one_gpu &&
+       cuda_context != nullptr);
+#endif
+#if DG_IGR_HDG_APP_HAS_CUDA_RANK2
+  typed_cuda = typed_cuda ||
+      (backend == ApplicationBackend::cuda_rank2_one_gpu_host_staged &&
+       cuda_context != nullptr);
+#endif
+  if (typed_cpu || typed_cuda)
   {
     const ApplicationValidation validation =
         ValidateApplicationOptions(derived);
@@ -4113,7 +4125,8 @@ ApplicationRunResult DispatchApplication(
               ApplicationRunResult::FailureClass::configuration};
     }
     const HdgMethodRequestV1 typed_request{
-        &derived, validation.config(), &cpu_context, nullptr};
+        &derived, validation.config(), typed_cpu ? &cpu_context : nullptr,
+        typed_cuda ? cuda_context : nullptr};
     return RunHdgMethodV1(typed_request).run;
   }
   switch (backend)
