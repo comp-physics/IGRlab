@@ -99,7 +99,7 @@ inline bool AuditPublishedState(
     if (mesh.GetNE() != scalar::persistent_elements ||
         volume_space.GetVSize() !=
             scalar::persistent_elements * scalar::volume_nodes ||
-        uhat_space.GetTrueVSize() != scalar::persistent_uhat_unknowns)
+        uhat_space.GetTrueVSize() != scalar::cpu_sc25::persistent_uhat_unknowns)
       return false;
 
     for (int element = 0; element < mesh.GetNE(); ++element)
