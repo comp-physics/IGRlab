@@ -283,9 +283,6 @@ struct CpuStorageEvidence
   std::uint64_t storage_generation = 0;
   std::uint64_t allocation_baseline = 0;
   std::uint64_t allocation_events_after_baseline = 0;
-  std::array<CpuOwnedAllocationEvent, 96> owned_allocation_events{};
-  std::size_t owned_allocation_event_count = 0;
-  bool selected_owned_allocation_stream_complete = false;
   bool opaque_mfem_hypre_allocations_unobserved = true;
   bool opaque_standard_library_control_blocks_unobserved = true;
   bool publish_is_complete_slot_exchange = false;
@@ -698,8 +695,6 @@ struct CpuCheckpoint
   CpuCheckpoint& operator=(CpuCheckpoint&&) noexcept = default;
   CheckpointDescriptor descriptor{};
   CpuStateSlot state{};
-  std::array<CpuOwnedAllocationEvent, 4> owned_allocation_events{};
-  std::size_t owned_allocation_event_count = 0;
   bool valid = false;
 
   CpuCoefficientView interior() const noexcept;

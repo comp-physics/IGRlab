@@ -1128,8 +1128,7 @@ bool ImportCpuCheckpoint(const CheckpointDescriptor& descriptor,
     imported = MakeSlot(local_interior_size, local_true_trace_size,
                         checkpoint_allocations);
     CpuSlotStorage* storage = Storage(imported);
-    if (storage && checkpoint_allocations.count <=
-                       checkpoint.owned_allocation_events.size())
+    if (storage)
     {
       if (local_interior_size != 0)
       {
@@ -1172,10 +1171,6 @@ bool ImportCpuCheckpoint(const CheckpointDescriptor& descriptor,
 
   checkpoint.descriptor = descriptor;
   checkpoint.state = std::move(imported);
-  std::copy_n(checkpoint_allocations.events.begin(),
-              checkpoint_allocations.count,
-              checkpoint.owned_allocation_events.begin());
-  checkpoint.owned_allocation_event_count = checkpoint_allocations.count;
   checkpoint.valid = true;
   return true;
 }
@@ -5147,10 +5142,6 @@ bool detail::CpuNumericsCore::CaptureCheckpoint(
   if (!CopySlot(state.committed_slot, snapshot)) { return false; }
   checkpoint.descriptor = descriptor;
   checkpoint.state = std::move(snapshot);
-  checkpoint.owned_allocation_event_count = checkpoint_allocations.count;
-  std::copy_n(checkpoint_allocations.events.begin(),
-              checkpoint_allocations.count,
-              checkpoint.owned_allocation_events.begin());
   checkpoint.valid = true;
   return true;
 }
@@ -5297,10 +5288,6 @@ void detail::CpuNumericsCore::SealOwnedAllocationBaseline() noexcept
   storage.allocation_baseline = state.allocations.baseline;
   storage.allocation_events_after_baseline =
       state.allocations.EventsAfterBaseline();
-  storage.owned_allocation_event_count = state.allocations.count;
-  std::copy_n(state.allocations.events.begin(), state.allocations.count,
-              storage.owned_allocation_events.begin());
-  storage.selected_owned_allocation_stream_complete = true;
   storage.opaque_mfem_hypre_allocations_unobserved = true;
   storage.opaque_standard_library_control_blocks_unobserved = true;
 }

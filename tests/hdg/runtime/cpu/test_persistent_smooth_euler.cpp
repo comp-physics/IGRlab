@@ -583,15 +583,12 @@ bool ByteEqual(const CpuCoefficientView view,
 struct CpuCheckpointObservation
 {
   std::array<unsigned char, sizeof(CheckpointDescriptor)> descriptor_bytes{};
-  std::array<unsigned char,
-             sizeof(std::array<CpuOwnedAllocationEvent, 4>)> event_bytes{};
   std::vector<double> interior;
   std::vector<double> trace;
   const double* interior_data = nullptr;
   const double* trace_data = nullptr;
   std::size_t interior_capacity = 0;
   std::size_t trace_capacity = 0;
-  std::size_t event_count = 0;
   bool valid = false;
 };
 
@@ -600,9 +597,6 @@ CpuCheckpointObservation ObserveCheckpoint(const CpuCheckpoint& checkpoint)
   CpuCheckpointObservation observation;
   std::memcpy(observation.descriptor_bytes.data(), &checkpoint.descriptor,
               sizeof(checkpoint.descriptor));
-  std::memcpy(observation.event_bytes.data(),
-              checkpoint.owned_allocation_events.data(),
-              sizeof(checkpoint.owned_allocation_events));
   const CpuCoefficientView interior = checkpoint.interior();
   const CpuCoefficientView trace = checkpoint.trace();
   observation.interior = CopyView(interior);
@@ -611,7 +605,6 @@ CpuCheckpointObservation ObserveCheckpoint(const CpuCheckpoint& checkpoint)
   observation.trace_data = trace.data;
   observation.interior_capacity = interior.capacity;
   observation.trace_capacity = trace.capacity;
-  observation.event_count = checkpoint.owned_allocation_event_count;
   observation.valid = checkpoint.valid;
   return observation;
 }
@@ -622,12 +615,8 @@ bool CheckpointUnchanged(const CpuCheckpoint& checkpoint,
   const CpuCoefficientView interior = checkpoint.interior();
   const CpuCoefficientView trace = checkpoint.trace();
   return checkpoint.valid == before.valid &&
-      checkpoint.owned_allocation_event_count == before.event_count &&
       std::memcmp(&checkpoint.descriptor, before.descriptor_bytes.data(),
                   sizeof(checkpoint.descriptor)) == 0 &&
-      std::memcmp(checkpoint.owned_allocation_events.data(),
-                  before.event_bytes.data(),
-                  sizeof(checkpoint.owned_allocation_events)) == 0 &&
       interior.data == before.interior_data &&
       trace.data == before.trace_data &&
       interior.capacity == before.interior_capacity &&
@@ -658,9 +647,6 @@ void SeedInvalidCheckpoint(CpuCheckpoint& checkpoint,
 {
   checkpoint.descriptor = descriptor;
   checkpoint.descriptor.cursor ^= std::uint64_t{0x5a5a};
-  checkpoint.owned_allocation_event_count = 1;
-  checkpoint.owned_allocation_events[0] = {
-      CpuOwnedAllocationSite::slot_cell, 77, 88, 8, 11, 99};
   checkpoint.valid = false;
 }
 
@@ -1687,7 +1673,6 @@ void CheckCheckpointImportAndIndependence(
   checks.Require(ImportCpuCheckpoint(
                      checkpoint.descriptor, interior.data(), interior.size(),
                      trace.data(), trace.size(), imported) && imported.valid &&
-                     imported.owned_allocation_event_count == 3 &&
                      imported.interior().data != checkpoint.interior().data &&
                      imported.trace().data != checkpoint.trace().data,
                  "serialized payload imports into an independent opaque slot");
@@ -2061,6 +2046,7 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
                      initialized.initial_trace_hash != StateHash{} &&
                      initialized.topology_builds == 1 &&
                      initialized.accepted_step_count == 0 &&
+                     initialized.storage.allocation_baseline > 0 &&
                      initialized.storage.allocation_events_after_baseline == 0,
                  "functional shape/topology/initial-state evidence");
 
@@ -2368,9 +2354,6 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                      initial.storage.topology_generation == 1 &&
                      initial.storage.storage_generation == 1 &&
                      initial.storage.allocation_baseline > 0 &&
-                     initial.storage.owned_allocation_event_count ==
-                         initial.storage.allocation_baseline &&
-                     initial.storage.selected_owned_allocation_stream_complete &&
                      initial.storage.opaque_mfem_hypre_allocations_unobserved &&
                      initial.storage
                          .opaque_standard_library_control_blocks_unobserved &&
@@ -2382,16 +2365,6 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                      initial.storage
                          .publish_and_revert_preserve_disjoint_backing,
                  "complete slots/workspace must be preallocated");
-  for (std::size_t index = 0;
-       index < initial.storage.owned_allocation_event_count; ++index)
-  {
-    const CpuOwnedAllocationEvent& event =
-        initial.storage.owned_allocation_events[index];
-    checks.Require(event.ordinal == index + 1 && event.bytes > 0 &&
-                       event.alignment > 0 && event.capacity > 0 &&
-                       event.backing_token != 0,
-                   "observed W8 allocation event metadata is exact");
-  }
 
   CpuPreparedStep first;
   checks.Require(adapter.PrepareAdvance(first) && first.valid &&
@@ -2559,8 +2532,7 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                      checkpoint.descriptor.polynomial_order ==
                          cpu_smoke_polynomial_order &&
                      checkpoint.descriptor.layout.view() ==
-                         cpu_detail::cpu_runtime_layout_identity &&
-                     checkpoint.owned_allocation_event_count == 3,
+                         cpu_detail::cpu_runtime_layout_identity,
                  "in-memory committed checkpoint capture");
 
   const CpuStateSnapshot before_failure = adapter.Snapshot();
