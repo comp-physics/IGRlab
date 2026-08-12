@@ -203,14 +203,6 @@ bool ParseScalarVtk(const char* path, ScalarVtkField& field)
   return input && ParseScalarVtk(input, field);
 }
 
-bool ParseScalarVtk(const std::vector<std::uint8_t>& bytes,
-                    ScalarVtkField& field)
-{
-  const std::string text(bytes.begin(), bytes.end());
-  std::istringstream input{text};
-  return ParseScalarVtk(input, field);
-}
-
 bool CompareScalarVtk(const char* left_path, const char* right_path,
                       const double tolerance,
                       const bool unit_norm_floor = false)
