@@ -4850,11 +4850,6 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     }
     if (!state.CollectiveAll(accepted))
     {
-      if (IsW8cConfig(state.config))
-      {
-        // A rejected W8C terminal line search publishes no trial assembly.
-        evidence.work.trial_reassemblies = 0;
-      }
       return fail(
           CpuFailurePhase::recovery, CpuAttemptStatus::runtime_failure,
           IsW8cConfig(state.config)

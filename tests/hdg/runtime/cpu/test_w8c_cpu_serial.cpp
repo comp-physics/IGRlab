@@ -156,7 +156,8 @@ bool FinalConventionalUpdateRejectedEveryTrial(
       !attempt.admissibility_gate && attempt.work.complete_assemblies > 0 &&
       attempt.final_line_search_trials ==
           cpu::cpu_maximum_line_search_trials &&
-      attempt.work.trial_reassemblies == 0 &&
+      attempt.work.trial_reassemblies ==
+          cpu::cpu_maximum_line_search_trials &&
       attempt.work.complete_condensations >=
           attempt.work.accepted_newton_updates &&
       attempt.work.complete_factor_setups ==
@@ -369,7 +370,8 @@ int main(int argc, char** argv)
   checks.Require(scalar_failed_attempt.target_step == 11 &&
                      scalar_failed_attempt.final_line_search_trials ==
                          sc25::persistent_line_search_trials &&
-                     scalar_failed_attempt.newton_iterations == 0,
+                     scalar_failed_attempt.attempted_newton_iterations == 1 &&
+                     scalar_failed_attempt.newton_iterations == 1,
                  "scalar target step 11 must not silently accept an inadmissible trial");
 
   MPI_Finalize();
