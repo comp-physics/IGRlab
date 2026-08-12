@@ -3450,6 +3450,31 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
     return true;
   }
 
+  void ResetRestoredLogicalEvidence() noexcept
+  {
+    evidence.status = ScalarCudaStatus::ready;
+    evidence.first_failure = ScalarCudaStatus::uninitialized;
+    evidence.accepted_steps = static_cast<int>(coordinates.step);
+    evidence.attempted_steps = 0;
+    evidence.rejected_steps = 0;
+    evidence.retry_attempts = 0;
+    evidence.maximum_attempted_newton_iterations = 0;
+    evidence.maximum_newton_iterations = 0;
+    evidence.maximum_trace_iterations = 0;
+    evidence.minimum_density = std::numeric_limits<double>::infinity();
+    evidence.minimum_pressure = std::numeric_limits<double>::infinity();
+    evidence.minimum_speed_margin = std::numeric_limits<double>::infinity();
+    evidence.maximum_conservation_error = 0.0;
+    evidence.maximum_nonlinear_residual_ratio = 0.0;
+    evidence.maximum_trace_residual_ratio = 0.0;
+    evidence.maximum_local_application_residual_ratio = 0.0;
+    evidence.coordinates = coordinates;
+    evidence.first_failed_attempt = {};
+    evidence.last_attempt = {};
+    evidence.last_accepted_attempt = {};
+    evidence.last_accepted_step = {};
+  }
+
   void RestorePriorLogicalEvidence() noexcept
   {
     RefreshLedgers();
@@ -4619,13 +4644,7 @@ ScalarCudaStatus PersistentSc25ScalarIgrCudaRank1::
   value.incarnation = restored_incarnation;
   value.status = ScalarCudaStatus::ready;
   value.first_failure = ScalarCudaStatus::uninitialized;
-  value.evidence.status = ScalarCudaStatus::ready;
-  value.evidence.first_failure = ScalarCudaStatus::uninitialized;
-  value.evidence.accepted_steps =
-      static_cast<int>(descriptor.coordinates.step);
-  value.evidence.attempted_steps = 0;
-  value.evidence.retry_attempts = 0;
-  value.evidence.coordinates = value.coordinates;
+  value.ResetRestoredLogicalEvidence();
   value.pending_attempt = {};
   value.pending_step = {};
   value.pending_attempt_active = false;

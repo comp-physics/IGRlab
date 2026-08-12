@@ -48,9 +48,7 @@ std::unique_ptr<scalar::PersistentSc25ScalarIgrCudaRank1> Create(
 bool RunC1()
 {
   auto owner = Create(true);
-  if (!owner || owner->InitializePersistentTrajectory() !=
-      scalar::ScalarCudaStatus::ready)
-    return false;
+  if (!owner) return false;
   scalar::CoupledOperatorSnapshot snapshot{};
   const auto& evidence = owner->operator_evidence();
   const bool valid = owner->ExportIndependentOperator(snapshot) &&
@@ -82,24 +80,74 @@ bool RunC2()
   if (!owner->CaptureTrajectoryCheckpoint(checkpoint) ||
       !owner->CopyPublishedTrajectoryState(committed))
     return false;
-  auto restored = Create();
-  if (!restored || restored->InitializePersistentTrajectory() !=
-      scalar::ScalarCudaStatus::ready ||
-      restored->RestoreTrajectoryCheckpoint(checkpoint) !=
+  if (owner->AdvancePersistentTrajectory(
+          scalar::FailureInjection::local_factor) !=
+          scalar::ScalarCudaStatus::accepted_after_one_retry ||
+      owner->RestoreTrajectoryCheckpoint(checkpoint) !=
           scalar::ScalarCudaStatus::ready)
     return false;
   scalar::PublishedState restored_state{};
-  if (!restored->CopyPublishedTrajectoryState(restored_state) ||
+  scalar::ScalarCudaCheckpoint restored_checkpoint{};
+  if (!owner->CopyPublishedTrajectoryState(restored_state) ||
+      !owner->CaptureTrajectoryCheckpoint(restored_checkpoint) ||
       !oracle::SameStateBytes(committed, restored_state) ||
-      restored->AdvancePersistentTrajectory(scalar::FailureInjection::local_factor) !=
+      checkpoint.interior_component_slabs !=
+          restored_checkpoint.interior_component_slabs ||
+      checkpoint.trace_component_slabs !=
+          restored_checkpoint.trace_component_slabs ||
+      checkpoint.raw_field_hashes.interior !=
+          restored_checkpoint.raw_field_hashes.interior ||
+      checkpoint.raw_field_hashes.trace != restored_checkpoint.raw_field_hashes.trace ||
+      checkpoint.canonical_manifest_hash !=
+          restored_checkpoint.canonical_manifest_hash)
+    return false;
+  const auto& reset = owner->trajectory_evidence();
+  const bool reset_records =
+      reset.first_failed_attempt.status ==
+          scalar::ScalarCudaStatus::uninitialized &&
+      reset.first_failed_attempt.target_step == 0 &&
+      reset.last_attempt.status == scalar::ScalarCudaStatus::uninitialized &&
+      reset.last_attempt.target_step == 0 &&
+      reset.last_accepted_attempt.status ==
+          scalar::ScalarCudaStatus::uninitialized &&
+      reset.last_accepted_attempt.target_step == 0 &&
+      !reset.last_accepted_step.accepted && reset.last_accepted_step.step == 0 &&
+      reset.last_accepted_step.attempt_index == -1;
+  const bool reset_compact =
+      reset.status == scalar::ScalarCudaStatus::ready &&
+      reset.first_failure == scalar::ScalarCudaStatus::uninitialized &&
+      reset.accepted_steps ==
+          static_cast<int>(checkpoint.descriptor.coordinates.step) &&
+      reset.attempted_steps == 0 && reset.rejected_steps == 0 &&
+      reset.retry_attempts == 0 &&
+      reset.maximum_attempted_newton_iterations == 0 &&
+      reset.maximum_newton_iterations == 0 &&
+      reset.maximum_trace_iterations == 0 &&
+      std::isinf(reset.minimum_density) && reset.minimum_density > 0.0 &&
+      std::isinf(reset.minimum_pressure) && reset.minimum_pressure > 0.0 &&
+      std::isinf(reset.minimum_speed_margin) &&
+      reset.minimum_speed_margin > 0.0 &&
+      reset.maximum_conservation_error == 0.0 &&
+      reset.maximum_nonlinear_residual_ratio == 0.0 &&
+      reset.maximum_trace_residual_ratio == 0.0 &&
+      reset.maximum_local_application_residual_ratio == 0.0 &&
+      reset.coordinates.step == checkpoint.descriptor.coordinates.step &&
+      reset.coordinates.generation ==
+          checkpoint.descriptor.coordinates.generation &&
+      reset.coordinates.cursor == checkpoint.descriptor.coordinates.cursor &&
+      reset.coordinates.time == checkpoint.descriptor.coordinates.time &&
+      reset.coordinates.dt == checkpoint.descriptor.coordinates.dt;
+  if (!reset_compact || !reset_records ||
+      owner->AdvancePersistentTrajectory(
+          scalar::FailureInjection::local_factor) !=
           scalar::ScalarCudaStatus::accepted_after_one_retry)
     return false;
   scalar::PublishedState final_state{};
   oracle::StateQuadratureAudit audit{};
-  if (!restored->CopyPublishedTrajectoryState(final_state) ||
+  if (!owner->CopyPublishedTrajectoryState(final_state) ||
       !oracle::AuditPublishedState(final_state, 4, audit))
     return false;
-  const auto& evidence = restored->trajectory_evidence();
+  const auto& evidence = owner->trajectory_evidence();
   const bool compact = evidence.accepted_steps == 2 &&
       evidence.rejected_steps == 1 && evidence.retry_attempts == 1 &&
       evidence.first_failure == scalar::ScalarCudaStatus::injected_local_factor_failure &&

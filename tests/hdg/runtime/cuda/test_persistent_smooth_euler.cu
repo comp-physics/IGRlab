@@ -64,9 +64,9 @@ bool RunCompactStep(const int ranks, const bool token_negative,
   CudaConfig config{};
   config.expected_rank_count = ranks;
   config.require_host_staged_rank2 = ranks == 2;
-  Engine<Backend> engine(config);
+  auto engine = std::make_unique<Engine<Backend>>(config);
   CudaRunEvidence setup{};
-  if (!engine.Initialize(setup)) { return false; }
+  if (!engine->Initialize(setup)) { return false; }
   const bool setup_valid = setup.status == CudaRunStatus::ready &&
       setup.ranks == ranks && setup.mfem_device_valid &&
       setup.hypre_cuda_umpire_device && setup.same_physical_gpu &&
@@ -80,9 +80,9 @@ bool RunCompactStep(const int ranks, const bool token_negative,
     CudaPrecommitSnapshot snapshot{};
     CudaStepEvidence evidence{};
     CudaSerializedCheckpointV1 checkpoint{};
-    if (!engine.PrepareStep(false, snapshot, evidence) ||
+    if (!engine->PrepareStep(false, snapshot, evidence) ||
         !snapshot.numerical_candidate_ready ||
-        !engine.StagePreparedCheckpoint(checkpoint, evidence))
+        !engine->StagePreparedCheckpoint(checkpoint, evidence))
       return false;
     const CudaTransferLedgerRangeV1 staged = checkpoint.staging_range;
     const bool sealed = staged.begin_ordinal != 0 &&
@@ -94,17 +94,17 @@ bool RunCompactStep(const int ranks, const bool token_negative,
     {
       CudaSerializedCheckpointV1 forged = checkpoint;
       ++forged.attempt.sequence;
-      const bool rejected = !engine.MarkOutputStaged(forged);
-      const bool retriable = engine.AbortPrepared(
+      const bool rejected = !engine->MarkOutputStaged(forged);
+      const bool retriable = engine->AbortPrepared(
           checkpoint, FailureReason::backend_failure, evidence);
       if (!All(rejected && retriable && !checkpoint.successful_commit))
         return false;
       continue;
     }
-    if (!engine.MarkOutputStaged(checkpoint) ||
-        !engine.PrepareCommit(checkpoint, evidence) ||
-        !engine.CommitPrepared(checkpoint, evidence) ||
-        !engine.FinalizeCommit(checkpoint, evidence))
+    if (!engine->MarkOutputStaged(checkpoint) ||
+        !engine->PrepareCommit(checkpoint, evidence) ||
+        !engine->CommitPrepared(checkpoint, evidence) ||
+        !engine->FinalizeCommit(checkpoint, evidence))
       return false;
     const CudaTransferLedgerV1 ledger = CudaTransportPolicy::Ledger();
     const bool committed = checkpoint.successful_commit &&
