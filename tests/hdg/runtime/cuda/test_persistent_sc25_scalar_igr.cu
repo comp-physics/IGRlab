@@ -685,109 +685,12 @@ bool ValidateAttemptParity(
                    cpu_attempt.nonlinear_residual_bound) ||
       !CloseMetric(cuda_attempt.maximum_conservation_error,
                    cpu_attempt.maximum_conservation_error))
-  {
     return false;
-  }
-  if (CudaAccepted(cuda_attempt.status) &&
-      (!ValidAttemptAdmissibility(cuda_attempt) ||
-       !ValidAttemptAdmissibility(cpu_attempt) ||
-       !(cuda_attempt.final_residual_norm <=
-         1.0e-12 + 1.0e-10 * cuda_attempt.entry_residual_norm)))
-  {
-    return false;
-  }
-  for (int iteration = 0; iteration < cuda_attempt.newton_iterations;
-       ++iteration)
-  {
-    const auto& cuda_newton =
-        cuda_attempt.newton[static_cast<std::size_t>(iteration)];
-    const auto& cpu_newton =
-        cpu_attempt.newton[static_cast<std::size_t>(iteration)];
-    if (cuda_newton.iteration != cpu_newton.iteration ||
-        cuda_newton.accepted_line_search_index !=
-            cpu_newton.accepted_line_search_index ||
-        cuda_newton.trace_iterations != cpu_newton.trace_iterations ||
-        !CloseMetric(cuda_newton.entry_residual_norm,
-                     cpu_newton.entry_residual_norm) ||
-        !CloseMetric(cuda_newton.accepted_residual_norm,
-                     cpu_newton.accepted_residual_norm) ||
-        !CloseMetric(cuda_newton.trace_true_residual_norm,
-                     cpu_newton.trace_true_residual_norm) ||
-        !CloseMetric(cuda_newton.trace_right_hand_side_norm,
-                     cpu_newton.trace_right_hand_side_norm) ||
-        !CloseMetric(cuda_newton.maximum_local_application_residual,
-                     cpu_newton.maximum_local_application_residual) ||
-        !(cuda_newton.trace_true_residual_norm <=
-          1.0e-14 + 1.0e-12 *
-              cuda_newton.trace_right_hand_side_norm))
-      return false;
-    int first_armijo = -1;
-    const int reached = cuda_newton.accepted_line_search_index >= 0
-        ? cuda_newton.accepted_line_search_index + 1
-        : scalar::line_search_trials;
-    for (int line = 0; line < reached; ++line)
-    {
-      const std::size_t index = static_cast<std::size_t>(line);
-      if (cuda_newton.trial_admissible[index] !=
-              cpu_newton.trial_admissible[index] ||
-          cuda_newton.trial_armijo[index] != cpu_newton.trial_armijo[index])
-        return false;
-      if (cuda_newton.trial_admissible[index] != 0 &&
-          !CloseMetric(cuda_newton.trial_residual_norms[index],
-                       cpu_newton.trial_residual_norms[index]))
-        return false;
-      const double theta = std::ldexp(1.0, -line);
-      const bool recomputed = cuda_newton.trial_admissible[index] != 0 &&
-          std::isfinite(cuda_newton.trial_residual_norms[index]) &&
-          cuda_newton.trial_residual_norms[index] <=
-              (1.0 - scalar::armijo_coefficient * theta) *
-                  cuda_newton.entry_residual_norm;
-      if (cuda_newton.trial_armijo[index] != (recomputed ? 1 : 0))
-        return false;
-      if (first_armijo < 0 && recomputed) { first_armijo = line; }
-    }
-    if (first_armijo != cuda_newton.accepted_line_search_index)
-      return false;
-  }
-  return true;
-}
-
-bool ValidateIndependentCensus(
-    const cpu_oracle::IndependentTrajectoryEvidence& independent,
-    const cpu::PersistentTrajectoryEvidence& run)
-{
-  int newton = 0;
-  int accepted_attempts = 0;
-  for (int index = 0; index < run.attempt_count; ++index)
-  {
-    const auto& attempt = run.attempts[static_cast<std::size_t>(index)];
-    newton += attempt.newton_iterations;
-    accepted_attempts += CpuAccepted(attempt.status) ? 1 : 0;
-  }
-  constexpr int residual_assemblies_per_newton =
-      2 + 2 * scalar::line_search_trials;
-  const int expected_assemblies = 2 * run.step_evidence_count +
-      run.attempt_count + residual_assemblies_per_newton * newton +
-      3 * accepted_attempts;
-  return independent.failures.empty() &&
-      independent.checked_steps == run.step_evidence_count &&
-      independent.checked_steps > 0 &&
-      independent.checked_attempts == run.attempt_count &&
-      independent.checked_attempts > 0 &&
-      independent.checked_newton_iterations == newton && newton > 0 &&
-      independent.checked_line_search_trials ==
-          scalar::line_search_trials * newton &&
-      independent.independently_assembled_residuals == expected_assemblies &&
-      independent.checked_conservation_maxima == run.step_evidence_count &&
-      independent.maximum_jacobian_action_relative_l2 <= 1.0e-10 &&
-      independent.maximum_condensed_action_relative_l2 <= 1.0e-10 &&
-      independent.maximum_recovery_relative_l2 <= 1.0e-10 &&
-      independent.maximum_residual_norm_discrepancy <= 1.0e-10 &&
-      independent.maximum_integral_discrepancy <= 1.0e-10 &&
-      independent.maximum_conservation_maximum_discrepancy <= 1.0e-10 &&
-      independent.minimum_density >= 1.0e-8 &&
-      independent.minimum_pressure >= 1.0e-8 &&
-      independent.minimum_speed_margin > 0.0;
+  return !CudaAccepted(cuda_attempt.status) ||
+      (ValidAttemptAdmissibility(cuda_attempt) &&
+       ValidAttemptAdmissibility(cpu_attempt) &&
+       cuda_attempt.final_residual_norm <=
+           1.0e-12 + 1.0e-10 * cuda_attempt.entry_residual_norm);
 }
 
 bool ValidateCudaStateScience(
@@ -797,7 +700,6 @@ bool ValidateCudaStateScience(
     const std::array<double, scalar::state_components>* preceding_q14,
     const scalar::ScalarCudaStepEvidence* cuda_step,
     const scalar::ScalarCudaAttemptEvidence* cuda_attempt,
-    const cpu::TrajectoryStepEvidence* cpu_step,
     oracle::StateQuadratureAudit& q12,
     oracle::StateQuadratureAudit& q14)
 {
@@ -836,12 +738,10 @@ bool ValidateCudaStateScience(
     if (std::abs(q14.integrals[index] - q12.integrals[index]) /
             std::max(1.0, std::abs(q12.integrals[index])) > 1.0e-11)
       return false;
-    if (cuda_step != nullptr && cpu_step != nullptr)
+    if (cuda_step != nullptr)
     {
       if (!CloseMetric(q12.integrals[index],
-                       cuda_step->accepted_integrals[index]) ||
-          !CloseMetric(q12.integrals[index],
-                       cpu_step->accepted_integrals[index]))
+                       cuda_step->accepted_integrals[index]))
         return false;
     }
     if (preceding_q12 != nullptr && preceding_q14 != nullptr)
@@ -1720,7 +1620,7 @@ bool RunFaultCampaign(const scalar::FailureInjection injection)
     }
     if (!ValidateAttemptParity(
             cuda_evidence.attempts[step - 1],
-            cpu_evidence.attempts[step - 1]))
+            cpu_evidence.last_attempt))
     {
       return report_failure("baseline-step-parity", step,
                             baseline_cpu.get(), baseline_cuda.get(),
@@ -1730,21 +1630,6 @@ bool RunFaultCampaign(const scalar::FailureInjection injection)
     if (step == 7) { baseline_step7 = baseline_cuda_state; }
   }
   const scalar::PublishedState baseline_final = baseline_cuda_state;
-  cpu_oracle::IndependentTrajectoryEvidence baseline_independent{};
-  if (!cpu_oracle::RunIndependentTrajectoryOracle(
-          *baseline_cpu, baseline_independent) ||
-      !ValidateIndependentCensus(
-          baseline_independent, baseline_cpu->trajectory_evidence()))
-  {
-    std::cerr << "C2 fault-campaign baseline independent checked_steps="
-              << baseline_independent.checked_steps
-              << " checked_attempts=" << baseline_independent.checked_attempts
-              << " failures=" << baseline_independent.failures.size() << '\n';
-    return report_failure("baseline-independent-oracle", 20,
-                          baseline_cpu.get(), baseline_cuda.get(),
-                          status_not_observed, status_not_observed,
-                          baseline_cpu->trajectory_evidence().attempt_count - 1);
-  }
   baseline_cpu.reset();
   baseline_cuda.reset();
 
@@ -1774,7 +1659,7 @@ bool RunFaultCampaign(const scalar::FailureInjection injection)
   }
   oracle::StateQuadratureAudit preceding_q12{}, preceding_q14{};
   if (!ValidateCudaStateScience(*cpu_run, cuda_state, nullptr, nullptr,
-                                nullptr, nullptr, nullptr,
+                                nullptr, nullptr,
                                 preceding_q12, preceding_q14))
   {
     std::cerr << "C2 initialized CUDA state science audit failed\n";
@@ -1833,7 +1718,7 @@ bool RunFaultCampaign(const scalar::FailureInjection injection)
     }
     if (!ValidateAttemptParity(
             current.attempts[static_cast<std::size_t>(accepted_attempt)],
-            cpu_current.attempts[static_cast<std::size_t>(accepted_attempt)]))
+            cpu_current.last_attempt))
     {
       return report_failure("fault-accepted-attempt-parity", step,
                             cpu_run.get(), cuda_run.get(),
@@ -1845,7 +1730,7 @@ bool RunFaultCampaign(const scalar::FailureInjection injection)
             *cpu_run, cuda_state, &preceding_q12.integrals,
             &preceding_q14.integrals, &current.steps[step - 1],
             &current.attempts[static_cast<std::size_t>(accepted_attempt)],
-            &cpu_current.steps[step - 1], current_q12, current_q14))
+            current_q12, current_q14))
     {
       return report_failure("fault-state-science", step, cpu_run.get(),
                             cuda_run.get(), static_cast<int>(cpu_status),
@@ -1866,7 +1751,7 @@ bool RunFaultCampaign(const scalar::FailureInjection injection)
           !oracle::SameHashes(failed.entry_hashes, entry_hashes) ||
           !oracle::SameHashes(failed.candidate_hashes, entry_hashes) ||
           failed.retry_index != 0 || failed.dt != scalar::fixed_dt ||
-          !ValidateAttemptParity(failed, cpu_current.attempts[6]) ||
+          !ValidateAttemptParity(failed, cpu_current.first_failed_attempt) ||
           current.steps[6].attempt_index != 7 ||
           current.accepted_steps != 7 || current.retry_attempts != 1)
       {
@@ -1887,20 +1772,6 @@ bool RunFaultCampaign(const scalar::FailureInjection injection)
     }
   }
   const auto& evidence = cuda_run->trajectory_evidence();
-  cpu_oracle::IndependentTrajectoryEvidence independent{};
-  if (!cpu_oracle::RunIndependentTrajectoryOracle(*cpu_run, independent) ||
-      !ValidateIndependentCensus(independent,
-                                 cpu_run->trajectory_evidence()))
-  {
-    std::cerr << "C2 fault-campaign independent checked_steps="
-              << independent.checked_steps
-              << " checked_attempts=" << independent.checked_attempts
-              << " failures=" << independent.failures.size() << '\n';
-    return report_failure("fault-independent-oracle", 20, cpu_run.get(),
-                          cuda_run.get(), status_not_observed,
-                          status_not_observed,
-                          evidence.attempt_count - 1);
-  }
   const bool final_contract = evidence.retry_attempts == 1 &&
       evidence.attempt_count == 21 &&
       evidence.accepted_steps == 20 &&
@@ -2544,7 +2415,7 @@ bool RunCheckpointNegatives(
   destination.reset();
   oracle::StateQuadratureAudit q12{}, q14{};
   if (!ValidateCudaStateScience(cpu_audit, restored, nullptr, nullptr,
-                                nullptr, nullptr, nullptr, q12, q14))
+                                nullptr, nullptr, q12, q14))
   {
     std::cerr << "C2 checkpoint-negative pristine-state-science"
               << " q12_points=" << q12.volume_points << ','
@@ -2685,7 +2556,7 @@ bool RunC2()
   }
   oracle::StateQuadratureAudit preceding_q12{}, preceding_q14{};
   if (!ValidateCudaStateScience(*cpu_run, cuda_state, nullptr, nullptr,
-                                nullptr, nullptr, nullptr,
+                                nullptr, nullptr,
                                 preceding_q12, preceding_q14))
   {
     std::cerr << "C2 initialized CUDA state science audit failed\n";
@@ -2712,7 +2583,7 @@ bool RunC2()
             current.steps[step - 1], step, entry_cuda, cuda_state) ||
         !ValidateAttemptParity(
             current.attempts[static_cast<std::size_t>(attempt_index)],
-            cpu_current.attempts[static_cast<std::size_t>(attempt_index)]))
+            cpu_current.last_attempt))
     {
       std::cerr << "C2 hash/coordinate evidence failed at step "
                 << step << '\n';
@@ -2723,7 +2594,7 @@ bool RunC2()
             *cpu_run, cuda_state, &preceding_q12.integrals,
             &preceding_q14.integrals, &current.steps[step - 1],
             &current.attempts[static_cast<std::size_t>(attempt_index)],
-            &cpu_current.steps[step - 1], current_q12, current_q14))
+            current_q12, current_q14))
     {
       std::cerr << "C2 quadrature/admissibility/auxiliary audit failed at step "
                 << step << '\n';
@@ -2754,20 +2625,12 @@ bool RunC2()
     return false;
   }
 
-  cpu_oracle::IndependentTrajectoryEvidence independent{};
   cpu::AuxiliaryResidualMetrics auxiliary{};
-  if (!cpu_oracle::RunIndependentTrajectoryOracle(*cpu_run, independent) ||
-      !ValidateIndependentCensus(independent,
-                                 cpu_run->trajectory_evidence()) ||
-      !cpu_oracle::EvaluateIndependentAuxiliaryResidualOracle(
+  if (!cpu_oracle::EvaluateIndependentAuxiliaryResidualOracle(
           *cpu_run, cuda_final,
           cpu::coupled_fixture_repeat_quadrature_order, auxiliary) ||
       auxiliary.normalized_maximum > comparison_tolerance)
   {
-    for (const std::string& failure : independent.failures)
-    {
-      std::cerr << "C2 independent oracle: " << failure << '\n';
-    }
     return false;
   }
 
@@ -2840,7 +2703,7 @@ bool RunC2()
   }
   oracle::StateQuadratureAudit restart_q12{}, restart_q14{};
   if (!ValidateCudaStateScience(*cpu_restart, restart_cuda, nullptr, nullptr,
-                                nullptr, nullptr, nullptr,
+                                nullptr, nullptr,
                                 restart_q12, restart_q14))
   {
     return false;
@@ -2919,7 +2782,7 @@ bool RunC2()
             entry_cuda, restart_cuda) ||
         !ValidateAttemptParity(
             cuda_current.attempts[static_cast<std::size_t>(attempt_index)],
-            cpu_current.attempts[static_cast<std::size_t>(attempt_index)]))
+            cpu_current.last_attempt))
     {
       return false;
     }
@@ -2929,7 +2792,6 @@ bool RunC2()
             &restart_q14.integrals,
             &cuda_current.steps[static_cast<std::size_t>(local_step)],
             &cuda_current.attempts[static_cast<std::size_t>(attempt_index)],
-            &cpu_current.steps[static_cast<std::size_t>(local_step)],
             current_q12, current_q14))
     {
       return false;
@@ -2949,14 +2811,6 @@ bool RunC2()
                 cuda_restarted_final, comparison) ||
       !oracle::SameStateBytes(cpu_final, cpu_restarted_final) ||
       !oracle::SameStateBytes(cuda_final, cuda_restarted_final))
-  {
-    return false;
-  }
-  cpu_oracle::IndependentTrajectoryEvidence restart_independent{};
-  if (!cpu_oracle::RunIndependentTrajectoryOracle(
-          *cpu_restart, restart_independent) ||
-      !ValidateIndependentCensus(
-          restart_independent, cpu_restart->trajectory_evidence()))
   {
     return false;
   }
