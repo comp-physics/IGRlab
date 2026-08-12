@@ -35,9 +35,13 @@ if(_dg_igr_hdg_runtime_unclassified_cpp OR
           "${_dg_igr_hdg_runtime_unclassified_cpp};${_dg_igr_hdg_runtime_unclassified_cuda}")
 endif()
 
+set(_dg_igr_hdg_scalar_igr_cpu_app_available OFF)
+if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
+  set(_dg_igr_hdg_scalar_igr_cpu_app_available ON)
+endif()
+
 if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT OR
    (DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA))
-  set(_dg_igr_hdg_scalar_igr_cpu_app_available ON)
   file(GLOB_RECURSE _dg_igr_hdg_auxiliary_sources CONFIGURE_DEPENDS
        "${CMAKE_CURRENT_SOURCE_DIR}/../auxiliary/*.cpp")
   dg_igr_add_hdg_cxx17_component(

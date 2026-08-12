@@ -1801,7 +1801,9 @@ if(HDG_RUNTIME_FUNCTIONAL)
         "scalar-IGR asymmetric restart-preparation rollback failed: ${restart_negative_status};${restart_negative_output};${restart_negative_error}")
     endif()
   endif()
-  if(HDG_RUNTIME_BACKEND STREQUAL "cuda")
+  # Scalar CPU-CUDA parity is a composite cross-profile gate. A CUDA-profile
+  # binary intentionally does not advertise the scalar CPU backend.
+  if(HDG_RUNTIME_BACKEND STREQUAL "cuda" AND NOT HDG_RUNTIME_SCALAR_IGR)
     if(HDG_RUNTIME_SCALAR_IGR)
       if(NOT DEFINED HDG_RUNTIME_SCALAR_VTK_TEST)
         message(FATAL_ERROR "CUDA scalar field parity comparator is unavailable")

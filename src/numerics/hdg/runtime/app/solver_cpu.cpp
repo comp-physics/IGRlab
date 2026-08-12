@@ -23,7 +23,6 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
-#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -149,31 +148,6 @@ bool CollectiveAll(const bool local, const MPI_Comm communicator) noexcept
   int reduced = 0;
   return MPI_Allreduce(&value, &reduced, 1, MPI_INT, MPI_MIN,
                        communicator) == MPI_SUCCESS && reduced == 1;
-}
-
-template <typename Invoke>
-ApplicationRunResult RunCpuWithExecutionBoundary(
-    MpiApplicationContextV1& context, Invoke&& invoke)
-{
-  std::unique_ptr<mfem::Device> device;
-  bool configured = true;
-  try
-  {
-    device = std::make_unique<mfem::Device>("cpu");
-    configured = mfem::Device::IsDisabled();
-    if (configured) mfem::Hypre::Init();
-  }
-  catch (...) { configured = false; }
-  if (!CollectiveAll(configured, context.communicator()))
-  {
-    ApplicationRunResult result;
-    result.status = RunStatus::terminal_failure;
-    result.reason = FailureReason::backend_failure;
-    result.failure_class = ApplicationRunResult::FailureClass::configuration;
-    context.SetDiagnostic("CPU MFEM device configuration failed");
-    return result;
-  }
-  return invoke();
 }
 
 enum class PostPublicationFault : unsigned char
@@ -4075,28 +4049,24 @@ ApplicationRunResult RunSmoothPeriodicEulerV1Downstream(
     CpuSerialBackendTag, const ApplicationOptionsView& request,
     MpiApplicationContextV1& context)
 {
-  return RunCpuWithExecutionBoundary(context, [&]() {
-    if (cpu::w8c::IsCaseId(request.case_id))
-      return RunW8cCpuSerial(request, context);
+  if (cpu::w8c::IsCaseId(request.case_id))
+    return RunW8cCpuSerial(request, context);
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
-    if (request.card_id == scalar_igr_sc25_v3_card_id)
-      return RunScalarIgrCpu<false>(request, context);
+  if (request.card_id == scalar_igr_sc25_v3_card_id)
+    return RunScalarIgrCpu<false>(request, context);
 #endif
-    return RunCpu<AppCpuSerialSelection>(request, context);
-  });
+  return RunCpu<AppCpuSerialSelection>(request, context);
 }
 
 ApplicationRunResult RunSmoothPeriodicEulerV1Downstream(
     CpuRank2BackendTag, const ApplicationOptionsView& request,
     MpiApplicationContextV1& context)
 {
-  return RunCpuWithExecutionBoundary(context, [&]() {
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
-    if (request.card_id == scalar_igr_sc25_v3_card_id)
-      return RunScalarIgrCpu<true>(request, context);
+  if (request.card_id == scalar_igr_sc25_v3_card_id)
+    return RunScalarIgrCpu<true>(request, context);
 #endif
-    return RunCpu<AppCpuRank2Selection>(request, context);
-  });
+  return RunCpu<AppCpuRank2Selection>(request, context);
 }
 
 } // namespace detail
