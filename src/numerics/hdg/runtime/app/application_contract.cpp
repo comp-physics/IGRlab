@@ -770,7 +770,7 @@ ApplicationRejection ValidateW8c(
 
 } // namespace
 
-ValidatedApplicationConfig::ValidatedApplicationConfig(
+HdgRunConfigV1::HdgRunConfigV1(
     const ApplicationOptionsView& options,
     const ApplicationScenarioV1 scenario,
     const ApplicationBackend backend,
@@ -1035,7 +1035,185 @@ ApplicationValidation ValidateApplicationOptions(
     return reject(ApplicationRejection::invalid_config_hash);
   }
   return ApplicationValidation(
-      ValidatedApplicationConfig(options, scenario, backend, tuple, deferred));
+      HdgRunConfigV1(options, scenario, backend, tuple, deferred));
+}
+
+namespace
+{
+
+HdgFormulationV1 FormulationFor(const std::string_view card) noexcept
+{
+  if (card == smooth_periodic_euler_v1_card_id)
+    return HdgFormulationV1::conventional;
+  if (card == scalar_igr_sc25_v3_card_id)
+    return HdgFormulationV1::traced_scalar_igr;
+  return HdgFormulationV1::unknown;
+}
+
+HdgPeriodicCaseV1 PeriodicCaseFor(const std::string_view case_id) noexcept
+{
+  if (case_id == cpu::w8c::ExactJumpV1Case::case_id)
+    return HdgPeriodicCaseV1::exact_jump;
+  if (case_id == cpu::w8c::SmoothTransitionV2Case::case_id)
+    return HdgPeriodicCaseV1::smooth_transition;
+  if (case_id == smooth_periodic_euler_v1_case_id ||
+      case_id == scalar_igr_sc25_v3_case_id)
+    return HdgPeriodicCaseV1::smooth;
+  return HdgPeriodicCaseV1::unknown;
+}
+
+struct ClosedCapabilityRowV1
+{
+  HdgFormulationV1 formulation;
+  ApplicationBackend backend;
+  HdgPeriodicCaseV1 periodic_case;
+};
+
+/*
+ * This is deliberately a closed table.  Tuple-specific validation remains in
+ * the existing W8A/W8B/W8C validators below it, which keeps the established
+ * error taxonomy and does not accidentally advertise a new numerical cell.
+ */
+constexpr std::array<ClosedCapabilityRowV1, 14> closed_capability_rows_v1{{
+    {HdgFormulationV1::conventional, ApplicationBackend::cpu_serial,
+     HdgPeriodicCaseV1::smooth},
+    {HdgFormulationV1::conventional, ApplicationBackend::cpu_rank2,
+     HdgPeriodicCaseV1::smooth},
+    {HdgFormulationV1::conventional,
+     ApplicationBackend::cuda_rank1_one_gpu, HdgPeriodicCaseV1::smooth},
+    {HdgFormulationV1::conventional,
+     ApplicationBackend::cuda_rank2_one_gpu_host_staged,
+     HdgPeriodicCaseV1::smooth},
+    {HdgFormulationV1::traced_scalar_igr, ApplicationBackend::cpu_serial,
+     HdgPeriodicCaseV1::smooth},
+    {HdgFormulationV1::traced_scalar_igr, ApplicationBackend::cpu_rank2,
+     HdgPeriodicCaseV1::smooth},
+    {HdgFormulationV1::traced_scalar_igr,
+     ApplicationBackend::cuda_rank1_one_gpu, HdgPeriodicCaseV1::smooth},
+    {HdgFormulationV1::traced_scalar_igr,
+     ApplicationBackend::cuda_rank2_one_gpu_host_staged,
+     HdgPeriodicCaseV1::smooth},
+    {HdgFormulationV1::conventional, ApplicationBackend::cpu_serial,
+     HdgPeriodicCaseV1::exact_jump},
+    {HdgFormulationV1::traced_scalar_igr, ApplicationBackend::cpu_serial,
+     HdgPeriodicCaseV1::exact_jump},
+    {HdgFormulationV1::conventional, ApplicationBackend::cpu_serial,
+     HdgPeriodicCaseV1::smooth_transition},
+    {HdgFormulationV1::traced_scalar_igr, ApplicationBackend::cpu_serial,
+     HdgPeriodicCaseV1::smooth_transition},
+    {HdgFormulationV1::traced_scalar_igr, ApplicationBackend::cpu_rank2,
+     HdgPeriodicCaseV1::smooth_transition},
+    {HdgFormulationV1::traced_scalar_igr,
+     ApplicationBackend::cuda_rank2_one_gpu_host_staged,
+     HdgPeriodicCaseV1::smooth_transition},
+}};
+
+bool InClosedCapabilityTable(const HdgFormulationV1 formulation,
+                             const ApplicationBackend backend,
+                             const HdgPeriodicCaseV1 periodic_case) noexcept
+{
+  return std::any_of(closed_capability_rows_v1.begin(),
+                     closed_capability_rows_v1.end(),
+                     [=](const ClosedCapabilityRowV1& row) {
+                       return row.formulation == formulation &&
+                           row.backend == backend &&
+                           row.periodic_case == periodic_case;
+                     });
+}
+
+std::string_view CapabilityReasonText(const ApplicationRejection reason) noexcept
+{
+  switch (reason)
+  {
+    case ApplicationRejection::none: return "supported frozen HDG capability";
+    case ApplicationRejection::unknown_backend:
+      return "formulation/case/backend topology is not an admitted HDG cell";
+    case ApplicationRejection::unbuilt_backend:
+      return "the selected HDG capability is not built in this artifact";
+    case ApplicationRejection::invalid_polynomial_mesh_pair:
+      return "mesh/order tuple is outside the closed HDG capability table";
+    case ApplicationRejection::invalid_dt:
+    case ApplicationRejection::invalid_step_count:
+    case ApplicationRejection::invalid_final_time:
+      return "time tuple is outside the closed HDG capability table";
+    case ApplicationRejection::invalid_output_schedule:
+      return "output policy is not the frozen policy for this HDG capability";
+    default: return "request does not satisfy the closed HDG contract";
+  }
+}
+
+} // namespace
+
+HdgOutputPolicyV1 OutputPolicyForV1(const HdgRunConfigV1& config) noexcept
+{
+  return {config.output_steps(),
+          static_cast<std::uint8_t>(config.output_steps().size())};
+}
+
+HdgCheckpointIdentityV1 CheckpointIdentityForV1(
+    const HdgRunConfigV1& config) noexcept
+{
+  /* scientific_config_sha256 deliberately excludes output path/cadence and
+   * run role; codec v2 continues to own artifact layout validation. */
+  return {config.scientific_config_sha256(), config.tuple(), config.mesh_n(),
+          config.polynomial_order(),
+          config.deferred_runtime().required_mpi_rank_count};
+}
+
+std::optional<PeriodicQuadCaseDescriptorV1> PeriodicQuadCaseProviderV1::Describe(
+    const HdgRunConfigV1& config) noexcept
+{
+  const HdgPeriodicCaseV1 periodic_case = PeriodicCaseFor(config.case_id().view());
+  if (periodic_case == HdgPeriodicCaseV1::unknown ||
+      config.mesh_family_id().view() != smooth_periodic_euler_v1_mesh_family_id)
+  {
+    return std::nullopt;
+  }
+  const HdgInitialConditionV1 initial =
+      periodic_case == HdgPeriodicCaseV1::exact_jump
+      ? HdgInitialConditionV1::exact_jump
+      : periodic_case == HdgPeriodicCaseV1::smooth_transition
+          ? HdgInitialConditionV1::smooth_transition
+          : HdgInitialConditionV1::smooth_analytic;
+  return PeriodicQuadCaseDescriptorV1{
+      2, smooth_periodic_euler_v1_mesh_family_id, config.tuple().model.view(),
+      initial, "bc.periodic.v1", config.source_id().view(),
+      config.flux_id().view(), config.layout_id().view()};
+}
+
+HdgMethodCapabilitiesV1 QueryHdgMethodCapabilitiesV1(
+    const ApplicationOptionsView& options) noexcept
+{
+  const HdgFormulationV1 formulation = FormulationFor(options.card_id);
+  const ApplicationBackend backend = ParseApplicationBackend(options.backend_id);
+  const HdgPeriodicCaseV1 periodic_case = PeriodicCaseFor(options.case_id);
+  HdgMethodCapabilitiesV1 result{formulation, backend, periodic_case, false,
+                                 ApplicationRejection::unknown_tuple, {}};
+  if (!InClosedCapabilityTable(formulation, backend, periodic_case))
+  {
+    result.reason = ApplicationRejection::unknown_backend;
+    result.reason_text = CapabilityReasonText(result.reason);
+    return result;
+  }
+  const ApplicationValidation validation = ValidateApplicationOptions(options);
+  result.supported = validation.accepted();
+  result.reason = validation.rejection();
+  result.reason_text = CapabilityReasonText(result.reason);
+  return result;
+}
+
+HdgMethodCapabilitiesV1 CapabilitiesForV1(
+    const HdgRunConfigV1& config) noexcept
+{
+  const HdgFormulationV1 formulation = config.scalar_igr()
+      ? HdgFormulationV1::traced_scalar_igr : HdgFormulationV1::conventional;
+  const HdgPeriodicCaseV1 periodic_case = PeriodicCaseFor(config.case_id().view());
+  const bool supported = InClosedCapabilityTable(formulation, config.backend(),
+                                                  periodic_case);
+  const ApplicationRejection reason = supported ? ApplicationRejection::none
+                                                 : ApplicationRejection::unknown_backend;
+  return {formulation, config.backend(), periodic_case, supported, reason,
+          CapabilityReasonText(reason)};
 }
 
 bool DeriveSplitWriterRunConfigHashV1(

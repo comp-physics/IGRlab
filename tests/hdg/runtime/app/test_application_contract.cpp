@@ -19,6 +19,8 @@ static_assert(!std::is_default_constructible<ValidatedApplicationConfig>::value 
                   !std::is_polymorphic<ValidatedApplicationConfig>::value &&
                   !std::is_polymorphic<FailureInjectionControlV1>::value,
               "validated controls are closed non-polymorphic values");
+static_assert(std::is_same<HdgRunConfigV1, ValidatedApplicationConfig>::value,
+              "the legacy validated-config spelling is a compatibility alias");
 static_assert(!std::is_same<OutputDirectoryPathV1,
                             EvidenceDirectoryPathV1>::value &&
                   !std::is_same<OutputDirectoryIdentityV1,
@@ -859,6 +861,47 @@ bool CheckMismatchedScenarioRoleFamilies()
   return passed;
 }
 
+bool CheckIntegrationSeamV1()
+{
+  bool passed = true;
+  const ApplicationOptionsView smoke = Smoke(CpuSerialBackendTag::id);
+  const ApplicationValidation validation = ValidateApplicationOptions(smoke);
+  const HdgRunConfigV1* config = validation.config();
+  passed = Check(config != nullptr, "hdg_run_config_v1_validated") && passed;
+  if (config == nullptr) return false;
+
+  const HdgMethodCapabilitiesV1 capabilities = CapabilitiesForV1(*config);
+  const HdgMethodCapabilitiesV1 queried = QueryHdgMethodCapabilitiesV1(smoke);
+  const HdgOutputPolicyV1 output = OutputPolicyForV1(*config);
+  const HdgCheckpointIdentityV1 checkpoint = CheckpointIdentityForV1(*config);
+  const auto descriptor = PeriodicQuadCaseProviderV1::Describe(*config);
+  passed = Check(capabilities.supported && queried.supported &&
+                     capabilities.formulation == HdgFormulationV1::conventional &&
+                     capabilities.periodic_case == HdgPeriodicCaseV1::smooth &&
+                     output.valid() && output.steps == config->output_steps() &&
+                     checkpoint.same_layout_config_sha256 ==
+                         config->scientific_config_sha256() &&
+                     checkpoint.mesh_n == config->mesh_n() &&
+                     checkpoint.polynomial_order == config->polynomial_order() &&
+                     checkpoint.rank_count ==
+                         config->deferred_runtime().required_mpi_rank_count &&
+                     descriptor && descriptor->spatial_dimension == 2 &&
+                     descriptor->mesh_family_id ==
+                         smooth_periodic_euler_v1_mesh_family_id &&
+                     descriptor->boundary_condition_id == "bc.periodic.v1",
+                 "hdg_integration_seam_descriptor_policy_identity") && passed;
+
+  ApplicationOptionsView unsupported = W8cCase(
+      false, true, CpuRank2BackendTag::id);
+  const HdgMethodCapabilitiesV1 rejected =
+      QueryHdgMethodCapabilitiesV1(unsupported);
+  passed = Check(!rejected.supported &&
+                     rejected.reason == ApplicationRejection::unknown_backend &&
+                     !rejected.reason_text.empty(),
+                 "hdg_closed_capability_rejects_unadvertised_w8c_cell") && passed;
+  return passed;
+}
+
 bool CheckStaticEntryOffDiagonalMatrix()
 {
   const auto matches = [](const ApplicationOptionsView& request,
@@ -1234,6 +1277,7 @@ int main()
   passed = CheckScientificCrossProducts() && passed;
   passed = CheckCardScenarioTupleClosure() && passed;
   passed = CheckMismatchedScenarioRoleFamilies() && passed;
+  passed = CheckIntegrationSeamV1() && passed;
   passed = CheckStaticEntryOffDiagonalMatrix() && passed;
   passed = CheckCoherentScalarIdentityEquivalence() && passed;
   passed = CheckScalarIgrMatrix() && passed;

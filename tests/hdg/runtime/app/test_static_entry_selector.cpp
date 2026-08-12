@@ -319,6 +319,25 @@ int main()
   }
   passed = Check(diagonal_count == 8 && off_diagonal_count == 8,
                  "static_entry_exact_16_row_census") && passed;
+
+  const Row& seam_row = rows[0];
+  const std::string seam_stem = "/tmp/dg-igr-hdg-method-seam-" +
+      std::to_string(static_cast<long long>(::getpid()));
+  const ApplicationOptionsView seam_request =
+      Request(seam_row, seam_stem, seam_stem + ".checkpoint");
+  const ApplicationValidation seam_validation =
+      ValidateApplicationOptions(seam_request);
+  MpiApplicationContextV1 seam_context(MPI_COMM_NULL);
+  test_detail::calls = {};
+  const HdgMethodResultV1 seam_result = RunHdgMethodV1(
+      {&seam_request, seam_validation.config(), &seam_context, nullptr});
+  passed = Check(seam_validation.accepted() && seam_result.capabilities.supported &&
+                     seam_result.checkpoint_identity.mesh_n == seam_request.mesh_n &&
+                     seam_result.run.status == RunStatus::committed &&
+                     test_detail::calls.downstream[0] == 1 &&
+                     test_detail::calls.invalid_context == 0 &&
+                     Absent(seam_stem) && Absent(seam_stem + ".checkpoint"),
+                 "typed_hdg_method_bridge_uses_existing_static_entry") && passed;
   if (passed)
     std::cout << "HDG static entry selector 16-row oracle PASS\n";
   return passed ? 0 : 1;
