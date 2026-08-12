@@ -87,6 +87,8 @@ inline bool AuditPublishedState(
     std::vector<mfem::Vector> translations(
         scalar::dimension, mfem::Vector(scalar::dimension));
     translations[0][0] = 1.0;
+    translations[0][1] = 0.0;
+    translations[1][0] = 0.0;
     translations[1][1] = 1.0;
     mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
         original, original.CreatePeriodicVertexMapping(translations));
@@ -104,6 +106,7 @@ inline bool AuditPublishedState(
         &mesh, &trace_collection, scalar::trace_components,
         mfem::Ordering::byNODES);
     if (mesh.GetNE() != scalar::persistent_elements ||
+        mesh.GetNumFaces() != 2 * scalar::persistent_elements ||
         volume_space.GetVSize() !=
             scalar::persistent_elements * scalar::volume_nodes ||
         trace_space.GetVDim() != scalar::trace_components ||
@@ -115,7 +118,8 @@ inline bool AuditPublishedState(
             scalar::state_components * scalar::persistent_scalar_trace_nodes) ||
         state.sigmahat.size() != static_cast<std::size_t>(
             scalar::persistent_scalar_trace_nodes))
-      return reject("dimensions", "mesh", mesh.GetNE(), "volume",
+      return reject("dimensions", "mesh", mesh.GetNE(), "faces",
+                    mesh.GetNumFaces(), "volume",
                     volume_space.GetVSize(), "trace_vdim",
                     trace_space.GetVDim(), "trace_ordering",
                     static_cast<int>(trace_space.GetOrdering()), "trace_true",
