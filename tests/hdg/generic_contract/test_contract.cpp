@@ -44,12 +44,20 @@ mfem::ParMesh MakeSquareMesh()
   return mfem::ParMesh(MPI_COMM_SELF, serial);
 }
 
+mfem::ParMesh MakeOneElementParallelMesh(const mfem::Element::Type type)
+{
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+      1, 1, type, true, 1.0, 1.0);
+  std::array<int, 1> partition{{0}};
+  return mfem::ParMesh(MPI_COMM_WORLD, serial, partition.data());
+}
+
 EulerHdgRequest ValidRequest(const mfem::ParMesh& mesh,
                              const std::array<double, 4>& initial)
 {
   EulerHdgRequest request{};
   request.mesh = &mesh;
-  request.communicator = MPI_COMM_SELF;
+  request.communicator = mesh.GetComm();
   request.polynomial_order = 2;
   request.backend = {BackendKind::cpu, -1};
   request.capabilities = all_cpu_capabilities;
@@ -138,12 +146,87 @@ bool CheckTriangleRejection()
       ContractStatus::nonquadrilateral_mesh;
 }
 
+bool CheckZeroOwnedElementAdmission()
+{
+  int ranks = 0;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS || ranks < 2)
+  {
+    return true;
+  }
+  mfem::ParMesh mesh =
+      MakeOneElementParallelMesh(mfem::Element::QUADRILATERAL);
+  const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  const EulerHdgRequest request = ValidRequest(mesh, initial);
+  const ContractStatus status = ValidateEulerHdgRequest(request);
+  const int local_empty = mesh.GetNE() == 0 ? 1 : 0;
+  int has_empty_rank = 0;
+  int status_code = static_cast<int>(status);
+  int minimum_status = status_code;
+  int maximum_status = status_code;
+  if (MPI_Allreduce(&local_empty, &has_empty_rank, 1, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Allreduce(&status_code, &minimum_status, 1, MPI_INT, MPI_MIN,
+                    MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Allreduce(&status_code, &maximum_status, 1, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  return has_empty_rank == 1 && status == ContractStatus::accepted &&
+      minimum_status == static_cast<int>(ContractStatus::accepted) &&
+      maximum_status == static_cast<int>(ContractStatus::accepted);
+}
+
+bool CheckCollectiveFailureConvergence()
+{
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  mfem::ParMesh mesh =
+      MakeOneElementParallelMesh(mfem::Element::QUADRILATERAL);
+  const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  EulerHdgRequest request = ValidRequest(mesh, initial);
+  request.polynomial_order = rank == 0 ? 4 : 2;
+  const int local_status = static_cast<int>(ValidateEulerHdgRequest(request));
+  int minimum_status = local_status;
+  int maximum_status = local_status;
+  if (MPI_Allreduce(&local_status, &minimum_status, 1, MPI_INT, MPI_MIN,
+                    MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Allreduce(&local_status, &maximum_status, 1, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  return local_status == static_cast<int>(ContractStatus::unsupported_polynomial_order) &&
+      minimum_status == local_status && maximum_status == local_status;
+}
+
+bool CheckCollectiveGeometryConvergence()
+{
+  mfem::ParMesh mesh = MakeOneElementParallelMesh(mfem::Element::TRIANGLE);
+  const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  const int local_status =
+      static_cast<int>(ValidateEulerHdgRequest(ValidRequest(mesh, initial)));
+  int minimum_status = local_status;
+  int maximum_status = local_status;
+  if (MPI_Allreduce(&local_status, &minimum_status, 1, MPI_INT, MPI_MIN,
+                    MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Allreduce(&local_status, &maximum_status, 1, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  return local_status == static_cast<int>(ContractStatus::nonquadrilateral_mesh) &&
+      minimum_status == local_status && maximum_status == local_status;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[])
 {
   mfem::MPI_Session mpi(argc, argv);
-  return CheckPODSurface() && CheckAcceptAndReject() && CheckTriangleRejection()
+  return CheckPODSurface() && CheckAcceptAndReject() && CheckTriangleRejection() &&
+      CheckZeroOwnedElementAdmission() && CheckCollectiveFailureConvergence() &&
+      CheckCollectiveGeometryConvergence()
       ? 0
       : 1;
 }
