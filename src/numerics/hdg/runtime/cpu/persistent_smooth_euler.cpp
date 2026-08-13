@@ -4477,6 +4477,14 @@ bool detail::CpuNumericsCore::Initialize(
 bool detail::CpuNumericsCore::RunBorrowedEuler(
     const generic::EulerHdgRequest& request) noexcept
 {
+  if (!InitializeBorrowedEuler(request)) { return false; }
+  StateCoordinates coordinates{0.0, 0, 0, 0, 0.0};
+  return AdvanceBorrowedEuler(cpu_backward_euler_dt, coordinates);
+}
+
+bool detail::CpuNumericsCore::InitializeBorrowedEuler(
+    const generic::EulerHdgRequest& request) noexcept
+{
   CpuPersistentConfig config = MakeCpuSmokeConfig();
   config.polynomial_order = request.polynomial_order;
   // This is not a Cartesian-grid request.  Keep standalone grid provenance
@@ -4503,20 +4511,58 @@ bool detail::CpuNumericsCore::RunBorrowedEuler(
     return false;
   }
   SealOwnedAllocationBaseline();
+  return true;
+}
 
-  const AttemptIdentity attempt{1, 0, 0, 0, config.dt};
-  const StateCoordinates entry{0.0, 0, 0, 0, config.dt};
-  const CpuNumericalResult numerical = Execute(attempt, entry, {});
+bool detail::CpuNumericsCore::AdvanceBorrowedEuler(
+    const double dt, StateCoordinates& coordinates) noexcept
+{
   Implementation& state = *implementation_;
+  const bool local_coordinates_valid = state.initialized && state.IsBorrowed() &&
+      Finite(dt) && dt > 0.0 && Finite(coordinates.time) &&
+      coordinates.step != std::numeric_limits<std::uint64_t>::max() &&
+      coordinates.generation != std::numeric_limits<std::uint64_t>::max() &&
+      coordinates.cursor != std::numeric_limits<std::uint64_t>::max() &&
+      Finite(coordinates.time + dt);
+  if (!state.CollectiveAll(local_coordinates_valid)) { return false; }
+
+  unsigned long long local_dt_bits = 0;
+  std::memcpy(&local_dt_bits, &dt, sizeof(local_dt_bits));
+  unsigned long long minimum_dt_bits = 0;
+  unsigned long long maximum_dt_bits = 0;
+  const bool consensus =
+      MPI_Allreduce(&local_dt_bits, &minimum_dt_bits, 1,
+                    MPI_UNSIGNED_LONG_LONG, MPI_MIN,
+                    state.communicator) == MPI_SUCCESS &&
+      MPI_Allreduce(&local_dt_bits, &maximum_dt_bits, 1,
+                    MPI_UNSIGNED_LONG_LONG, MPI_MAX,
+                    state.communicator) == MPI_SUCCESS &&
+      minimum_dt_bits == maximum_dt_bits;
+  if (!state.CollectiveAll(consensus)) { return false; }
+
+  const double previous_dt = state.config.dt;
+  state.config.dt = dt;
+  const AttemptIdentity attempt{coordinates.cursor + 1, coordinates.step,
+                                coordinates.generation, 0, dt};
+  const CpuNumericalResult numerical = Execute(attempt, coordinates, {});
   const bool accepted = numerical.gates.All() &&
       numerical.originating_failure == FailureReason::none &&
       CpuStateStoragePolicy::CanPublish(state.committed_slot,
                                         state.candidate_slot);
   if (!state.CollectiveAll(accepted))
   {
+    state.config.dt = previous_dt;
+    const bool reset = CopySlot(state.committed_slot, state.candidate_slot);
+    InvalidateCandidateGeneration();
+    (void)state.CollectiveAll(reset);
     return false;
   }
   CpuStateStoragePolicy::Publish(state.committed_slot, state.candidate_slot);
+  coordinates.time += dt;
+  ++coordinates.step;
+  ++coordinates.generation;
+  coordinates.cursor = attempt.sequence;
+  coordinates.dt = dt;
   return true;
 }
 
@@ -5757,6 +5803,49 @@ void detail::CpuNumericsCore::SealOwnedAllocationBaseline() noexcept
 const CpuRunEvidence& detail::CpuNumericsCore::evidence() const noexcept
 {
   return implementation_->evidence;
+}
+
+bool detail::CpuNumericsCore::ExportCommittedInterior(
+    double* const destination, const std::size_t size) const noexcept
+{
+  const Implementation& state = *implementation_;
+  const CpuSlotStorage* const committed = state.Committed();
+  if (!state.initialized || !state.IsBorrowed() || !committed ||
+      size != committed->interior.size() ||
+      (destination == nullptr && size != 0))
+  {
+    return false;
+  }
+  if (size != 0)
+  {
+    std::memcpy(destination, committed->interior.data(),
+                size * sizeof(double));
+  }
+  return true;
+}
+
+bool detail::CpuNumericsCore::ExportCommittedInterior(
+    mfem::ParGridFunction& destination) const noexcept
+{
+  const Implementation& state = *implementation_;
+  const mfem::FiniteElementSpace* const space = destination.FESpace();
+  const CpuSlotStorage* const committed = state.Committed();
+  if (!state.initialized || !state.IsBorrowed() || !space || !committed ||
+      space->GetMesh() != state.mesh ||
+      space->GetVDim() != cpu_conserved_components ||
+      space->GetOrdering() != mfem::Ordering::byNODES ||
+      destination.Size() != static_cast<int>(committed->interior.size()))
+  {
+    return false;
+  }
+  double* const values = destination.HostWrite();
+  if (values == nullptr && destination.Size() != 0) { return false; }
+  if (destination.Size() != 0)
+  {
+    std::memcpy(values, committed->interior.data(),
+                committed->interior.size() * sizeof(double));
+  }
+  return true;
 }
 
 bool detail::CpuNumericsCore::ExportCanonicalCommitted(

@@ -18,6 +18,8 @@ using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::runtime::cpu::ExecuteGenericEulerHdgCpu;
+using dg::hdg::runtime::cpu::GenericEulerCpuSessionStatus;
+using dg::hdg::runtime::cpu::GenericEulerHdgCpuSession;
 using dg::hdg::runtime::cpu::RestartGenericEulerHdgCpu;
 
 constexpr std::uint32_t cpu_capabilities =
@@ -174,32 +176,87 @@ bool CheckOrdersAndDeterminism()
   // EulerFieldView is component-major: two repeat samples per component.
   const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
                                         0.0, 0.0, 2.5, 2.5}};
-  const std::array<double, 8> source{{}};
+  const std::array<double, 8> source{{0.03, 0.04, 0.01, 0.02,
+                                       0.00, 0.00, 0.05, 0.06}};
   for (int order = 1; order <= 3; ++order)
   {
-    BoundaryContext first_context{};
-    EulerHdgRequest first_request = Request(mesh, order, first_context,
-                                            initial, source);
+    BoundaryContext context{};
+    EulerHdgRequest request = Request(mesh, order, context, initial, source);
     const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
-    const bool first = ExecuteGenericEulerHdgCpu(first_request);
-    if (!first || first_context.calls == 0)
+    GenericEulerHdgCpuSession session;
+    const auto initialized = session.Initialize(request);
+    if (initialized.status != GenericEulerCpuSessionStatus::initialized ||
+        initialized.coordinates.step != 0 || initialized.coordinates.time != 0.0)
     {
-      std::cerr << "generic order " << order << " first=" << first
-                << " calls=" << first_context.calls << '\n';
+      std::cerr << "generic session initialization failed for p" << order
+                << '\n';
       return false;
     }
-    if (!SameBorrowedMesh(mesh, before, first_request.communicator)) return false;
-    BoundaryContext second_context{};
-    const bool second = ExecuteGenericEulerHdgCpu(
-        Request(mesh, order, second_context, initial, source));
-    if (!second ||
-        second_context.calls != first_context.calls)
+    mfem::L2_FECollection collection(
+        order, 2, mfem::BasisType::GaussLegendre, mfem::FiniteElement::VALUE);
+    mfem::ParFiniteElementSpace interior_space(
+        &mesh, &collection, 4, mfem::Ordering::byNODES);
+    mfem::ParGridFunction committed(&interior_space);
+    if (!session.ExportCommittedInterior(committed)) return false;
+    std::vector<double> first(static_cast<std::size_t>(committed.Size()));
+    if (!session.ExportCommittedInterior({first.data(), first.size()})) return false;
+
+    const auto first_step = session.Advance(0.005);
+    const auto second_step = session.Advance(0.011);
+    if (first_step.status != GenericEulerCpuSessionStatus::advanced ||
+        second_step.status != GenericEulerCpuSessionStatus::advanced ||
+        second_step.coordinates.step != 2 ||
+        second_step.coordinates.generation != 2 ||
+        second_step.coordinates.dt != 0.011 ||
+        second_step.coordinates.time != 0.016 || context.calls == 0)
     {
-      std::cerr << "generic order " << order << " second=" << second
-                << " calls=" << second_context.calls
-                << " expected=" << first_context.calls << '\n';
+      std::cerr << "generic unequal-dt session advance failed for p" << order
+                << '\n';
       return false;
     }
+    std::vector<double> second(first.size());
+    if (!session.ExportCommittedInterior({second.data(), second.size()})) return false;
+    bool changed = false;
+    for (std::size_t index = 0; index < first.size(); ++index)
+      changed = changed || first[index] != second[index];
+    if (!changed) return false;
+
+    mfem::ParFiniteElementSpace wrong_layout_space(
+        &mesh, &collection, 4, mfem::Ordering::byVDIM);
+    mfem::ParGridFunction wrong_layout(&wrong_layout_space);
+    wrong_layout = 7.0;
+    const double* const wrong_values = wrong_layout.HostRead();
+    bool wrong_unchanged = wrong_values != nullptr || wrong_layout.Size() == 0;
+    for (int index = 0; index < wrong_layout.Size(); ++index)
+      wrong_unchanged = wrong_unchanged && wrong_values[index] == 7.0;
+    if (session.ExportCommittedInterior(wrong_layout) || !wrong_unchanged)
+    {
+      return false;
+    }
+    if (!session.ExportCommittedInterior(committed)) return false;
+    const double* committed_values = committed.HostRead();
+    for (int index = 0; index < committed.Size(); ++index)
+      if (second[static_cast<std::size_t>(index)] != committed_values[index])
+        return false;
+
+    const auto coordinates_before_failure = session.coordinates();
+    const std::vector<double> committed_before_failure = second;
+    context.fail = true;
+    if (session.Advance(0.031).status != GenericEulerCpuSessionStatus::rejected ||
+        session.coordinates().step != coordinates_before_failure.step ||
+        session.coordinates().time != coordinates_before_failure.time ||
+        !session.ExportCommittedInterior({second.data(), second.size()}))
+    {
+      return false;
+    }
+    if (second != committed_before_failure) return false;
+    if (session.Advance(0.0).status != GenericEulerCpuSessionStatus::rejected ||
+        session.coordinates().step != coordinates_before_failure.step ||
+        session.coordinates().time != coordinates_before_failure.time)
+    {
+      return false;
+    }
+    if (!SameBorrowedMesh(mesh, before, request.communicator)) return false;
   }
   return true;
 }
@@ -236,8 +293,13 @@ bool CheckZeroOwnedElementEngine()
   const std::array<double, 8> source{{}};
   BoundaryContext boundary{};
   const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
-  const bool accepted = ExecuteGenericEulerHdgCpu(
-      Request(mesh, 1, boundary, initial, source));
+  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  GenericEulerHdgCpuSession session;
+  const bool accepted =
+      session.Initialize(request).status ==
+          GenericEulerCpuSessionStatus::initialized &&
+      session.Advance(0.019).status == GenericEulerCpuSessionStatus::advanced &&
+      session.Advance(0.041).status == GenericEulerCpuSessionStatus::advanced;
   const int local_empty = mesh.GetNE() == 0 ? 1 : 0;
   int any_empty = 0;
   if (MPI_Allreduce(&local_empty, &any_empty, 1, MPI_INT, MPI_MAX,
@@ -268,7 +330,13 @@ bool CheckSubcommunicatorIsolation()
     BoundaryContext boundary{};
     EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
     const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
-    local = ExecuteGenericEulerHdgCpu(request) && boundary.calls > 0 &&
+    GenericEulerHdgCpuSession session;
+    local = session.Initialize(request).status ==
+            GenericEulerCpuSessionStatus::initialized &&
+        session.Advance(0.013).status ==
+            GenericEulerCpuSessionStatus::advanced &&
+        session.Advance(0.047).status ==
+            GenericEulerCpuSessionStatus::advanced && boundary.calls > 0 &&
         SameBorrowedMesh(mesh, before, subcommunicator);
     local = All(local, subcommunicator);
   }
