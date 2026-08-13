@@ -64,7 +64,10 @@ class EulerBoundaryPlan
 public:
   void AddPeriodic(mfem::Array<int> marker)
   {
-    entries_.push_back({EulerBoundaryKind::Periodic, std::move(marker)});
+    EulerBoundaryPlanEntry entry;
+    entry.kind = EulerBoundaryKind::Periodic;
+    entry.marker = std::move(marker);
+    entries_.push_back(std::move(entry));
   }
 
   void AddSupersonicInlet(mfem::Array<int> marker,
@@ -111,7 +114,10 @@ public:
 
   void AddSlipWall(mfem::Array<int> marker)
   {
-    entries_.push_back({EulerBoundaryKind::Slip, std::move(marker)});
+    EulerBoundaryPlanEntry entry;
+    entry.kind = EulerBoundaryKind::Slip;
+    entry.marker = std::move(marker);
+    entries_.push_back(std::move(entry));
   }
 
   void AddNonReflectingOutlet(mfem::Array<int> marker,
