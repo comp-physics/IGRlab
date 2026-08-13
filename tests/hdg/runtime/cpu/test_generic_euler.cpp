@@ -185,6 +185,144 @@ bool SameBorrowedMesh(const mfem::ParMesh& mesh,
   return true;
 }
 
+int ByNodes(const int scalar, const int scalar_dofs,
+            const int component) noexcept
+{
+  return scalar + scalar_dofs * component;
+}
+
+bool CheckBorrowedTraceRestrictsInterior()
+{
+  mfem::ParMesh mesh = MakeBorrowedMesh();
+  for (int order = 1; order <= 3; ++order)
+  {
+    mfem::L2_FECollection interior_collection(
+        order, 2, mfem::BasisType::GaussLegendre, mfem::FiniteElement::VALUE);
+    mfem::ParFiniteElementSpace interior_space(
+        &mesh, &interior_collection, 4, mfem::Ordering::byNODES);
+    mfem::ParGridFunction nonuniform_interior(&interior_space);
+    auto field = [](const mfem::Vector& point, mfem::Vector& value)
+    {
+      const double density = 1.0 + 0.05 * point[0] + 0.02 * point[1];
+      const double velocity_x = 0.2 + 0.03 * point[0];
+      const double velocity_y = -0.1 + 0.02 * point[1];
+      const double pressure = 1.0 + 0.03 * point[0] - 0.02 * point[1];
+      value.SetSize(4);
+      value[0] = density;
+      value[1] = density * velocity_x;
+      value[2] = density * velocity_y;
+      value[3] = pressure / 0.4 +
+          0.5 * density * (velocity_x * velocity_x + velocity_y * velocity_y);
+    };
+    mfem::VectorFunctionCoefficient coefficient(4, field);
+    nonuniform_interior.ProjectCoefficient(coefficient);
+    const double* const interior_values = nonuniform_interior.HostRead();
+    if (interior_values == nullptr && nonuniform_interior.Size() != 0)
+      return false;
+    std::vector<double> initial;
+    if (nonuniform_interior.Size() != 0)
+      initial.assign(interior_values,
+                     interior_values + nonuniform_interior.Size());
+    const std::array<double, 4> zero_local_initial{{1.0, 0.2, -0.1, 2.5}};
+
+    mfem::DG_Interface_FECollection trace_collection(
+        order, 2, mfem::FiniteElement::VALUE,
+        mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace trace_space(
+        &mesh, &trace_collection, 4, mfem::Ordering::byNODES);
+    mfem::ParGridFunction expected_local_trace(&trace_space);
+    mfem::Vector expected_true_trace(trace_space.GetTrueVSize());
+    expected_local_trace = 0.0;
+    for (int face = 0; face < mesh.GetNumFaces(); ++face)
+    {
+      mfem::FaceElementTransformations* const transformations =
+          mesh.GetFaceElementTransformations(face);
+      const mfem::FiniteElement* const trace_element =
+          trace_space.GetFaceElement(face);
+      if (!transformations || !trace_element || transformations->Elem1No < 0 ||
+          transformations->Elem1No >= mesh.GetNE())
+      {
+        return false;
+      }
+      const mfem::FiniteElement* const interior_element =
+          interior_space.GetFE(transformations->Elem1No);
+      mfem::Array<int> interior_vdofs;
+      mfem::Array<int> trace_vdofs;
+      interior_space.GetElementVDofs(transformations->Elem1No, interior_vdofs);
+      trace_space.GetFaceVDofs(face, trace_vdofs);
+      if (!interior_element ||
+          interior_vdofs.Size() != 4 * interior_element->GetDof() ||
+          trace_vdofs.Size() != 4 * trace_element->GetDof())
+      {
+        return false;
+      }
+      mfem::Vector shape(interior_element->GetDof());
+      const mfem::IntegrationRule& nodes = trace_element->GetNodes();
+      for (int scalar = 0; scalar < trace_element->GetDof(); ++scalar)
+      {
+        const mfem::IntegrationPoint& point = nodes.IntPoint(scalar);
+        transformations->SetAllIntPoints(&point);
+        interior_element->CalcShape(transformations->GetElement1IntPoint(),
+                                    shape);
+        for (int component = 0; component < 4; ++component)
+        {
+          double restricted = 0.0;
+          for (int interior_scalar = 0;
+               interior_scalar < interior_element->GetDof(); ++interior_scalar)
+          {
+            double sign = 1.0;
+            const int dof = mfem::FiniteElementSpace::DecodeDof(
+                interior_vdofs[ByNodes(interior_scalar,
+                                       interior_element->GetDof(), component)],
+                sign);
+            if (dof < 0 || dof >= nonuniform_interior.Size()) return false;
+            restricted += shape[interior_scalar] * sign * interior_values[dof];
+          }
+          double sign = 1.0;
+          const int dof = mfem::FiniteElementSpace::DecodeDof(
+              trace_vdofs[ByNodes(scalar, trace_element->GetDof(), component)],
+              sign);
+          if (dof < 0 || dof >= expected_local_trace.Size()) return false;
+          expected_local_trace[dof] = sign * restricted;
+        }
+      }
+    }
+    expected_local_trace.ParallelProject(expected_true_trace);
+
+    BoundaryContext boundary{};
+    EulerHdgRequest request{};
+    request.mesh = &mesh;
+    request.communicator = mesh.GetComm();
+    request.polynomial_order = order;
+    request.backend = {BackendKind::cpu, -1};
+    request.capabilities = cpu_capabilities;
+    request.initial_state = initial.empty()
+        ? dg::hdg::generic::EulerFieldView{zero_local_initial.data(),
+                                           zero_local_initial.size(), 4}
+        : dg::hdg::generic::EulerFieldView{initial.data(), initial.size(), 4};
+    request.source = {nullptr, 0, 4};
+    request.boundary = {&boundary, NonperiodicExterior};
+    if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+        dg::hdg::generic::ContractStatus::accepted)
+    {
+      return false;
+    }
+    dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+    if (!core.InitializeBorrowedEuler(request)) return false;
+    const dg::hdg::runtime::cpu::CpuStateSnapshot snapshot = core.Snapshot({});
+    if (snapshot.trace.size != static_cast<std::size_t>(expected_true_trace.Size()) ||
+        (snapshot.trace.data == nullptr && snapshot.trace.size != 0))
+    {
+      return false;
+    }
+    const double* const expected = expected_true_trace.HostRead();
+    if (expected == nullptr && expected_true_trace.Size() != 0) return false;
+    for (int index = 0; index < expected_true_trace.Size(); ++index)
+      if (snapshot.trace.data[index] != expected[index]) return false;
+  }
+  return true;
+}
+
 bool CheckOrdersAndDeterminism()
 {
   mfem::ParMesh mesh = MakeBorrowedMesh();
@@ -290,6 +428,28 @@ bool CheckPeriodicAnnotationsRemainTraceCouplings()
       session.Advance(0.001).status ==
       GenericEulerCpuSessionStatus::advanced &&
       context.calls == 0;
+}
+
+bool CheckDynamicTauHighWaveTwoSteps()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  // |u . n| + c exceeds the standalone fixed cap on x-normal faces.  The
+  // borrowed path must instead freeze its local face spectral-radius bound.
+  const std::array<double, 8> initial{{1.0, 1.0, 5.0, 5.0,
+                                        0.0, 0.0, 15.0, 15.0}};
+  const std::array<double, 8> source{{0.03, 0.04, 0.01, 0.02,
+                                       0.00, 0.00, 0.05, 0.06}};
+  BoundaryContext context{};
+  EulerHdgRequest request = Request(mesh, 1, context, initial, source);
+  const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
+  GenericEulerHdgCpuSession session;
+  return session.Initialize(request).status ==
+             GenericEulerCpuSessionStatus::initialized &&
+      session.Advance(0.001).status == GenericEulerCpuSessionStatus::advanced &&
+      session.Advance(0.001).status == GenericEulerCpuSessionStatus::advanced &&
+      session.coordinates().step == 2 && session.coordinates().generation == 2 &&
+      session.coordinates().time == 0.002 && context.calls == 0 &&
+      SameBorrowedMesh(mesh, before, request.communicator);
 }
 
 bool CheckClosedBoundaryPicardAssembly()
@@ -415,15 +575,17 @@ int main(int argc, char* argv[])
 {
   mfem::MPI_Session mpi(argc, argv);
   const bool boundary_semantics = CheckBoundaryExteriorSemantics();
+  const bool trace_restriction = CheckBorrowedTraceRestrictsInterior();
   const bool orders = CheckOrdersAndDeterminism();
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
+  const bool dynamic_tau = CheckDynamicTauHighWaveTwoSteps();
   const bool boundary_picard = CheckClosedBoundaryPicardAssembly();
   const bool zero_owned = CheckZeroOwnedElementEngine();
   const bool subcommunicator = CheckSubcommunicatorIsolation();
   const bool mismatch = CheckCollectiveMismatchAndAtomicFailure();
   const bool callback_failure = CheckAcceptedRequestRankLocalCallbackFailure();
-  const bool local = boundary_semantics && orders && periodic &&
-      boundary_picard &&
+  const bool local = boundary_semantics && trace_restriction && orders &&
+      periodic && dynamic_tau && boundary_picard &&
       zero_owned && subcommunicator && mismatch && callback_failure;
   if (!All(local))
   {
@@ -431,7 +593,9 @@ int main(int argc, char* argv[])
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     std::cerr << "generic Euler CPU test failed on rank " << rank
               << " boundary_semantics=" << boundary_semantics
+              << " trace_restriction=" << trace_restriction
               << " orders=" << orders << " periodic=" << periodic
+              << " dynamic_tau=" << dynamic_tau
               << " boundary_picard=" << boundary_picard
               << " zero_owned=" << zero_owned
               << " subcommunicator=" << subcommunicator

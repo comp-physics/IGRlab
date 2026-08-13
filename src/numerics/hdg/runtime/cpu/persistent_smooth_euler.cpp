@@ -388,6 +388,24 @@ bool NormalFluxJacobian(const State& conservative,
                      [](const auto& row) { return Finite(row); });
 }
 
+bool NormalSpectralRadius(const State& conservative,
+                          const std::array<double, 2>& normal,
+                          double& radius) noexcept
+{
+  State primitive{};
+  if (!Primitive(conservative, primitive) || !Finite(normal) ||
+      (normal[0] == 0.0 && normal[1] == 0.0))
+  {
+    return false;
+  }
+  const double normal_velocity =
+      primitive[1] * normal[0] + primitive[2] * normal[1];
+  const double sound_speed =
+      std::sqrt(cpu_gamma * primitive[3] / primitive[0]);
+  radius = std::abs(normal_velocity) + sound_speed;
+  return Finite(radius) && radius > 0.0;
+}
+
 bool ManufacturedSource(const double x, const double y,
                         State& source) noexcept
 {
@@ -1943,42 +1961,65 @@ struct detail::CpuNumericsCore::Implementation
       if (IsBorrowed())
       {
         local_trace = 0.0;
-        const generic::EulerFieldView view = borrowed_request->initial_state;
-        const std::size_t samples = view.scalar_count /
-            static_cast<std::size_t>(cpu_conserved_components);
         for (int face = 0;
              face < mesh->GetNumFaces() && local_projection_ready; ++face)
         {
-          const mfem::FiniteElement* finite_element =
+          mfem::FaceElementTransformations* face_transformation =
+              mesh->GetFaceElementTransformations(face);
+          const mfem::FiniteElement* trace_element =
               trace_space->GetFaceElement(face);
           mfem::Array<int> vdofs;
           trace_space->GetFaceVDofs(face, vdofs);
-          if (!finite_element ||
-              vdofs.Size() != finite_element->GetDof() *
+          if (!face_transformation || !trace_element ||
+              face_transformation->Elem1No < 0 ||
+              face_transformation->Elem1No >= mesh->GetNE() ||
+              vdofs.Size() != trace_element->GetDof() *
                   cpu_conserved_components)
           {
             local_projection_ready = false;
             break;
           }
+          const mfem::FiniteElement* interior_element = interior_space->GetFE(
+              face_transformation->Elem1No);
+          const int* const interior_vdofs = element_interior_vdofs.data() +
+              static_cast<std::size_t>(face_transformation->Elem1No) *
+                  local_interior;
+          if (!interior_element ||
+              interior_element->GetDof() != scalar_interior_dofs)
+          {
+            local_projection_ready = false;
+            break;
+          }
+          const mfem::IntegrationRule& nodes = trace_element->GetNodes();
           for (int scalar = 0;
-               scalar < finite_element->GetDof() && local_projection_ready;
+               scalar < trace_element->GetDof() && local_projection_ready;
                ++scalar)
           {
+            const mfem::IntegrationPoint& face_point = nodes.IntPoint(scalar);
+            face_transformation->SetAllIntPoints(&face_point);
+            interior_element->CalcShape(
+                face_transformation->GetElement1IntPoint(),
+                face_interior_shape_workspace);
+            State state{};
+            if (!Interpolate(*old_interior, interior_vdofs,
+                             scalar_interior_dofs,
+                             face_interior_shape_workspace, state))
+            {
+              local_projection_ready = false;
+              break;
+            }
             for (int component = 0; component < cpu_conserved_components;
                  ++component)
             {
               double sign = 1.0;
               const int dof = Decode(vdofs[ByNodes(
-                  scalar, finite_element->GetDof(), component)], sign);
-              const double value = view.data[
-                  static_cast<std::size_t>(component) * samples +
-                  static_cast<std::size_t>(scalar) % samples];
-              if (dof < 0 || dof >= local_trace.Size() || !Finite(value))
+                  scalar, trace_element->GetDof(), component)], sign);
+              if (dof < 0 || dof >= local_trace.Size())
               {
                 local_projection_ready = false;
                 break;
               }
-              local_trace[dof] = sign * value;
+              local_trace[dof] = sign * state[component];
             }
           }
         }
@@ -3461,6 +3502,24 @@ struct detail::CpuNumericsCore::Implementation
             {
               return false;
             }
+            // The standalone formulation is frozen at the fixed value.  A
+            // borrowed field may carry waves outside that private envelope,
+            // so freeze a face-quadrature LLF bound from both states for the
+            // complete residual/Jacobian assembly at this point.
+            double stabilization = cpu_fixed_tau;
+            if (IsBorrowed())
+            {
+              double interior_radius = 0.0;
+              double trace_radius = 0.0;
+              if (!NormalSpectralRadius(interior_state, normal,
+                                        interior_radius) ||
+                  !NormalSpectralRadius(trace_state, normal, trace_radius))
+              {
+                return false;
+              }
+              stabilization = std::max(
+                  cpu_fixed_tau, std::max(interior_radius, trace_radius));
+            }
             // The physical-boundary trace remains an unknown in the interior
             // numerical flux. Its own row constrains trace = exterior(U), so
             // the condensed trace system remains closed and nonsingular.
@@ -3504,7 +3563,7 @@ struct detail::CpuNumericsCore::Implementation
                     ByNodes(row, scalar_interior_dofs, component);
                 system.residual_interior[element_ni + local_row] +=
                     weight * face_interior_shape_workspace[row] *
-                    (trace_flux[component] + cpu_fixed_tau *
+                    (trace_flux[component] + stabilization *
                          (interior_state[component] - trace_state[component]));
               }
             for (int row = 0; row < scalar_trace_dofs; ++row)
@@ -3518,7 +3577,7 @@ struct detail::CpuNumericsCore::Implementation
                     local_row] += weight * face_trace_shape_workspace[row] *
                     (physical_boundary
                          ? trace_state[component] - exterior_state[component]
-                         : trace_flux[component] + cpu_fixed_tau *
+                         : trace_flux[component] + stabilization *
                              (interior_state[component] - trace_state[component]));
               }
             for (int row = 0; row < scalar_interior_dofs; ++row)
@@ -3534,7 +3593,7 @@ struct detail::CpuNumericsCore::Implementation
                     const int local_column = ByNodes(
                         column, scalar_interior_dofs, column_component);
                     const double derivative = row_component == column_component
-                        ? cpu_fixed_tau : 0.0;
+                        ? stabilization : 0.0;
                     system.a[element_a +
                              static_cast<std::size_t>(local_row) *
                                  local_interior + local_column] +=
@@ -3563,7 +3622,7 @@ struct detail::CpuNumericsCore::Implementation
                         face_trace_shape_workspace[column] *
                         (trace_jacobian[row_component][column_component] -
                          (row_component == column_component
-                              ? cpu_fixed_tau : 0.0));
+                              ? stabilization : 0.0));
                   }
             for (int row = 0; row < scalar_trace_dofs; ++row)
               for (int column = 0; column < scalar_interior_dofs; ++column)
@@ -3580,7 +3639,7 @@ struct detail::CpuNumericsCore::Implementation
                   const double derivative = physical_boundary
                       ? 0.0
                       : (row_component == column_component
-                             ? cpu_fixed_tau : 0.0);
+                             ? stabilization : 0.0);
                   system.c[static_cast<std::size_t>(element) * local_trace *
                                local_interior +
                            static_cast<std::size_t>(local_row) *
@@ -3606,7 +3665,7 @@ struct detail::CpuNumericsCore::Implementation
                         ? (row_component == column_component ? 1.0 : 0.0)
                         : trace_jacobian[row_component][column_component] -
                             (row_component == column_component
-                                 ? cpu_fixed_tau : 0.0);
+                                 ? stabilization : 0.0);
                     system.d[static_cast<std::size_t>(element) * local_trace *
                                  local_trace +
                              static_cast<std::size_t>(local_row) *
@@ -3759,8 +3818,9 @@ struct detail::CpuNumericsCore::Implementation
     minimum_density = std::min(minimum_density, primitive[0]);
     minimum_pressure = std::min(minimum_pressure, primitive[3]);
     maximum_wave_speed = std::max(maximum_wave_speed, wave_speed);
-    return primitive[0] >= density_gate && primitive[3] >= pressure_gate &&
-        wave_speed < cpu_fixed_tau;
+    return IsBorrowed() ||
+        (primitive[0] >= density_gate && primitive[3] >= pressure_gate &&
+         wave_speed < cpu_fixed_tau);
   }
 
   bool Prescreen(const mfem::ParGridFunction& interior,
@@ -3851,8 +3911,11 @@ struct detail::CpuNumericsCore::Implementation
         pressure_status == MPI_SUCCESS && wave_status == MPI_SUCCESS &&
         global_valid == 1 && Finite(minimum_density) &&
         Finite(minimum_pressure) && Finite(maximum_wave_speed) &&
-        minimum_density >= density_gate && minimum_pressure >= pressure_gate &&
-        maximum_wave_speed < cpu_fixed_tau;
+        (IsBorrowed()
+             ? minimum_density > 0.0 && minimum_pressure > 0.0
+             : minimum_density >= density_gate &&
+                   minimum_pressure >= pressure_gate &&
+                   maximum_wave_speed < cpu_fixed_tau);
   }
 
   bool CondenseAndAssemble(const LocalSystem& system,
@@ -4563,6 +4626,20 @@ bool detail::CpuNumericsCore::AdvanceBorrowedEuler(
                     state.communicator) == MPI_SUCCESS &&
       minimum_dt_bits == maximum_dt_bits;
   if (!state.CollectiveAll(consensus)) { return false; }
+
+  // Publish exchanges complete backing stores.  Consequently the retained
+  // candidate holds the preceding committed bytes after a successful step;
+  // refresh it collectively before every borrowed attempt so Execute starts
+  // from a valid committed/candidate pair on every step.
+  const bool candidate_refreshed =
+      CopySlot(state.committed_slot, state.candidate_slot);
+  if (!state.CollectiveAll(candidate_refreshed))
+  {
+    const bool restored = CopySlot(state.committed_slot, state.candidate_slot);
+    InvalidateCandidateGeneration();
+    (void)state.CollectiveAll(restored);
+    return false;
+  }
 
   const double previous_dt = state.config.dt;
   state.config.dt = dt;
@@ -5570,8 +5647,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   evidence.maximum_wave_speed = final_wave;
   evidence.finite_gate = Finite(residual) && Finite(maximum_true_residual) &&
       Finite(state.Candidate()->interior) && Finite(state.Candidate()->trace);
-  evidence.admissibility_gate = final_density >= density_gate &&
-      final_pressure >= pressure_gate && final_wave < cpu_fixed_tau;
+  evidence.admissibility_gate = state.IsBorrowed()
+      ? final_density > 0.0 && final_pressure > 0.0 && Finite(final_wave)
+      : final_density >= density_gate && final_pressure >= pressure_gate &&
+            final_wave < cpu_fixed_tau;
   evidence.recovery_gate = recovered;
   evidence.nonlinear_gate = nonlinear_converged;
   evidence.true_residual_gate = maximum_true_residual <=

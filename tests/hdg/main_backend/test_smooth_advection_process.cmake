@@ -14,7 +14,7 @@ set(_arguments
   --serial-refine 0
   --parallel-refine 0
   --time-step 0.00001
-  --t-final 0.00001
+  --t-final 0.00002
   --time-step-save 0.00001
   --vtk_save
   --no-glvis)
@@ -42,7 +42,7 @@ else()
 endif()
 
 if(NOT _status EQUAL 0 OR
-   NOT _stdout MATCHES "\\[hdg-main\\] status=Success.*step=1" OR
+   NOT _stdout MATCHES "\\[hdg-main\\] status=Success.*step=2" OR
    NOT _stderr STREQUAL "")
   message(FATAL_ERROR
     "generic HDG main execution failed: ${_status}\n${_stdout}\n${_stderr}")
@@ -55,7 +55,7 @@ if(NOT EXISTS "${_pvd}")
   message(FATAL_ERROR "missing HDG PVD series: ${_pvd}")
 endif()
 file(READ "${_pvd}" _pvd_text)
-foreach(_cycle IN ITEMS 000000 000001)
+foreach(_cycle IN ITEMS 000000 000001 000002)
   if(NOT _pvd_text MATCHES "Cycle${_cycle}/data.pvtu" OR
      NOT EXISTS "${_root}/Cycle${_cycle}/data.pvtu" OR
      NOT EXISTS "${_root}/Cycle${_cycle}/proc000000.vtu")
@@ -69,7 +69,7 @@ endforeach()
 
 file(GLOB _cycles LIST_DIRECTORIES TRUE "${_root}/Cycle*")
 list(LENGTH _cycles _cycle_count)
-if(NOT _cycle_count EQUAL 2)
+if(NOT _cycle_count EQUAL 3)
   message(FATAL_ERROR
-    "HDG output has ${_cycle_count} cycle directories; expected exactly 2")
+    "HDG output has ${_cycle_count} cycle directories; expected exactly 3")
 endif()
