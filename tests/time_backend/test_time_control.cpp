@@ -196,6 +196,31 @@ int main()
   }
 
   {
+    constexpr double short_final = 1.0e-14;
+    StepPlanCursor cursor(TimeControl::Fixed(0.0, short_final, 1.0),
+                          OutputSchedule::Explicit({short_final},
+                                                   InitialOutputPolicy::Suppress,
+                                                   FinalOutputPolicy::Suppress));
+    const auto final = cursor.Commit(cursor.Plan(0.0));
+    checks.Expect(final && final->cycle == 1 && final->is_final &&
+                    final->time == short_final,
+                  "short-span explicit final remains scheduled when force is suppressed");
+  }
+
+  {
+    constexpr double short_final = 1.0e-14;
+    StepPlanCursor cursor(TimeControl::Fixed(0.0, short_final, 1.0),
+                          OutputSchedule::Explicit({0.0, short_final},
+                                                   InitialOutputPolicy::Suppress,
+                                                   FinalOutputPolicy::Suppress));
+    const auto initial = cursor.InitialOutput();
+    const auto final = cursor.Commit(cursor.Plan(0.0));
+    checks.Expect(initial && initial->cycle == 0 && initial->is_initial &&
+                    final && final->cycle == 1 && final->is_final,
+                  "short-span explicit initial and final remain distinct publications");
+  }
+
+  {
     StepPlanCursor cursor(TimeControl::CFL(0.0, 1.0, 0.5),
                           OutputSchedule::FixedInterval(0.4));
     const StepPlan& original = cursor.Plan(0.7);

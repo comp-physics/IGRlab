@@ -442,18 +442,20 @@ private:
     unique.reserve(schedule_.explicit_times.size());
     for (double value : schedule_.explicit_times)
     {
-      // Bounds admitted by ValidateExplicitBounds() through NearlyEqual() must
-      // become exact cursor boundaries before deduplication.  Otherwise a
-      // just-outside endpoint can pass validation yet be missed by clipping.
-      if (NearlyEqual(value, control_.initial_time))
+      // Only tolerance-admitted values outside the interval normalize to a
+      // bound.  In-range explicit values are caller-authored events and stay
+      // distinct, even for spans smaller than the generic float tolerance.
+      if (value < control_.initial_time &&
+          NearlyEqual(value, control_.initial_time))
       {
         value = control_.initial_time;
       }
-      else if (NearlyEqual(value, control_.final_time))
+      else if (value > control_.final_time &&
+               NearlyEqual(value, control_.final_time))
       {
         value = control_.final_time;
       }
-      if (unique.empty() || !NearlyEqual(unique.back(), value))
+      if (unique.empty() || unique.back() != value)
       {
         unique.push_back(value);
       }
@@ -485,7 +487,7 @@ private:
   {
     if (schedule_.kind == OutputScheduleKind::ExplicitTimes &&
         !schedule_.explicit_times.empty() &&
-        NearlyEqual(schedule_.explicit_times.front(), control_.initial_time))
+        schedule_.explicit_times.front() == control_.initial_time)
     {
       next_explicit_index_ = 1;
     }
@@ -495,7 +497,7 @@ private:
   {
     return schedule_.kind == OutputScheduleKind::ExplicitTimes &&
            !schedule_.explicit_times.empty() &&
-           NearlyEqual(schedule_.explicit_times.front(), control_.initial_time);
+           schedule_.explicit_times.front() == control_.initial_time;
   }
 
   std::optional<Boundary> NextOutputBoundary() const
