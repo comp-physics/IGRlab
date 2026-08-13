@@ -11,7 +11,7 @@
 #include "mfem.hpp"
 
 #include "sim/config/case_config.hpp"
-#include "sim/context/mesh_build.hpp"
+#include "sim/context/case_context.hpp"
 
 namespace dg_sim
 {
@@ -83,7 +83,7 @@ private:
 struct ExampleContext
 {
   const RunConfig& run_cfg;
-  std::unique_ptr<mfem::ParMesh> pmesh;
+  CaseContext case_context;
   int dim = 0;
   int num_equations = 0;
   DGSpaces spaces;
@@ -95,15 +95,15 @@ struct ExampleContext
   }
 
   ExampleContext(const RunConfig& cfg,
-                 std::unique_ptr<mfem::ParMesh> pmesh_in,
+                 CaseContext case_context_in,
                  const std::string& sigma_space,
                  bool need_sigma,
                  bool need_h1)
     : run_cfg(cfg),
-      pmesh(std::move(pmesh_in)),
-      dim(pmesh->Dimension()),
+      case_context(std::move(case_context_in)),
+      dim(case_context.Mesh().Dimension()),
       num_equations(dim + 2),
-      spaces(*pmesh,
+      spaces(case_context.Mesh(),
              cfg.opts.order,
              dim,
              num_equations,
@@ -114,8 +114,43 @@ struct ExampleContext
   {
   }
 
-  mfem::ParMesh& Mesh() { return *pmesh; }
-  const mfem::ParMesh& Mesh() const { return *pmesh; }
+  /// @brief Compatibility adapter for callers that already own a ParMesh.
+  ///
+  /// New case construction should use BuildCaseContext so its mesh provenance
+  /// and refinement sequence are retained.  This overload preserves existing
+  /// DG test and utility callers without introducing a partition policy.
+  ExampleContext(const RunConfig& cfg,
+                 std::unique_ptr<mfem::ParMesh> pmesh_in,
+                 const std::string& sigma_space,
+                 bool need_sigma,
+                 bool need_h1)
+    : ExampleContext(cfg,
+                     WrapExistingMesh(std::move(pmesh_in)),
+                     sigma_space,
+                     need_sigma,
+                     need_h1)
+  {
+  }
+
+  mfem::ParMesh& Mesh() { return case_context.Mesh(); }
+  const mfem::ParMesh& Mesh() const { return case_context.Mesh(); }
+  MPI_Comm Comm() const { return case_context.Comm(); }
+  const MeshBuildMetadata& MeshMetadata() const
+  {
+    return case_context.MeshMetadata();
+  }
+
+private:
+  static CaseContext WrapExistingMesh(std::unique_ptr<mfem::ParMesh> mesh)
+  {
+    MFEM_VERIFY(mesh, "ExampleContext requires a parallel mesh.");
+    const MPI_Comm communicator = mesh->GetComm();
+    MeshBuildMetadata metadata;
+    metadata.mesh_path_precedence = MeshPathPrecedence::AlreadyResolved;
+    metadata.local_elements_after_partitioning = mesh->GetNE();
+    metadata.local_elements_after_parallel_refinement = mesh->GetNE();
+    return CaseContext(std::move(mesh), communicator, std::move(metadata));
+  }
 };
 
 /// @brief Build mesh + DG spaces with standard serial/parallel refinement.
@@ -124,14 +159,10 @@ inline ExampleContext BuildExampleContext(const RunConfig& run_cfg,
                                           bool need_sigma,
                                           bool need_h1)
 {
-  mfem::Mesh mesh =
-    LoadSerialMesh(run_cfg.mesh_path, run_cfg.opts.ser_ref_levels);
-  auto pmesh = std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD, mesh);
-  mesh.Clear();
-  RefineParMesh(*pmesh, run_cfg.opts.par_ref_levels);
+  CaseContext case_context = BuildCaseContext(run_cfg);
 
   return ExampleContext(run_cfg,
-                        std::move(pmesh),
+                        std::move(case_context),
                         sigma_space,
                         need_sigma,
                         need_h1);
