@@ -1071,8 +1071,14 @@ private:
         config_.injection.phase == CudaFailurePhase::diagnostics ||
         config_.injection.phase ==
             CudaFailurePhase::after_recovery_before_commit;
+    const bool topology_configuration = config_.use_borrowed_topology
+        ? config_.borrowed_mesh != nullptr &&
+            config_.borrowed_communicator != MPI_COMM_NULL
+        : config_.borrowed_mesh == nullptr &&
+            config_.borrowed_communicator == MPI_COMM_NULL;
     return config_.experiment == StableIdentity::Copy(experiment_id) &&
         (smoke_shape || functional_shape) &&
+        topology_configuration &&
         std::isfinite(config_.dt) &&
         std::memcmp(&config_.dt, &fixed_dt, sizeof(double)) == 0 &&
         config_.requested_device == 0 &&
@@ -1141,6 +1147,9 @@ private:
     AppendConfigValue(descriptor, cursor, complete,
                       config_.expected_rank_count);
     append_bool(config_.require_host_staged_rank2);
+    // Pointer and communicator identities are rank-local borrowed handles;
+    // their compatibility is proved by the pre-device topology admission.
+    append_bool(config_.use_borrowed_topology);
     append_bool(config_.capture_oracle);
     AppendConfigValue(descriptor, cursor, complete, config_.injection.phase);
     AppendConfigValue(descriptor, cursor, complete,
