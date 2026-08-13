@@ -53,8 +53,9 @@ struct DGInterfaceTraceMap
  * DG_Interface_FECollection segment faces, positive vdim, and
  * Ordering::byNODES is accepted.  Three-dimensional triangle and quadrilateral
  * faces are deliberately rejected until equivalent orientation evidence is
- * admitted.  A local true-DOF partition may be empty.  On failure, @a map is
- * preserved.
+ * admitted.  A rank with no local elements may produce a valid empty map
+ * (zero local faces and true dofs) so it can join a later collective exchange.
+ * On failure, @a map is preserved.
  */
 bool BuildDGInterfaceTraceMap(const mfem::ParFiniteElementSpace& space,
                               DGInterfaceTraceMap& map);
@@ -91,8 +92,9 @@ struct DGInterfaceTraceExchangePlan
    * an MFEM-owned collective before any rank enters prolongation.  The exact
    * bound space and its saved generations are required, and the bound space,
    * mesh, and finite-element collection must outlive this plan.  Input and
-   * output storage may not overlap.  The output must already have local VSize;
-   * exchange performs no candidate-owned allocation.  Any failure preserves
+   * output storage may not overlap.  The output must already have local VSize
+   * (which may be zero on an empty local partition); exchange performs no
+   * candidate-owned allocation.  Any failure preserves
    * @a local_values on every participating rank.
    */
   bool Distribute(mfem::ParFiniteElementSpace& space,
