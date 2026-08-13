@@ -16,48 +16,14 @@
 namespace dg::hdg::runtime::cpu
 {
 
-enum class GenericEulerCpuStatus : std::uint8_t
-{
-  ready,
-  accepted,
-  rejected,
-  boundary_failure,
-  collective_failure,
-  unsupported_restart
-};
-
 /**
- * Value-only evidence for one generic CPU assembly.  The result is written
- * only after the complete collective operation has succeeded.
+ * Execute one conventional Euler HDG CPU step over caller-borrowed inputs.
+ * The external mesh and field storage remain caller-owned.  Rejected input,
+ * callback failure, and unsupported restart leave all borrowed state intact.
  */
-struct GenericEulerCpuResult
-{
-  GenericEulerCpuStatus status = GenericEulerCpuStatus::ready;
-  generic::ContractStatus admission = generic::ContractStatus::accepted;
-  int rank = -1;
-  int ranks = 0;
-  int local_elements = 0;
-  int polynomial_order = 0;
-  int neighbor_count = 0;
-  std::uint64_t boundary_calls = 0;
-  std::uint64_t local_residual_digest = 0;
-  std::uint64_t ordered_exchange_digest = 0;
-  bool assembled = false;
-};
-
-/**
- * Assemble one conventional Euler HDG CPU residual over caller-borrowed
- * inputs.  Initial and optional source views are copied only into temporary
- * local FE fields.  Shared-neighbor values are exchanged in rank order.
- *
- * On rejection, callback failure, MPI failure, or an internal exception this
- * returns false and leaves `result` byte-for-byte unchanged.
- */
-bool AssembleGenericEulerHdgCpu(const generic::EulerHdgRequest& request,
-                                GenericEulerCpuResult& result) noexcept;
+bool ExecuteGenericEulerHdgCpu(const generic::EulerHdgRequest& request) noexcept;
 
 /** Generic borrowed-mesh restart is intentionally unsupported and atomic. */
-bool RestartGenericEulerHdgCpu(const generic::EulerHdgRequest& request,
-                               GenericEulerCpuResult& result) noexcept;
+bool RestartGenericEulerHdgCpu(const generic::EulerHdgRequest& request) noexcept;
 
 } // namespace dg::hdg::runtime::cpu
