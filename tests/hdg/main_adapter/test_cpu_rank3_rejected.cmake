@@ -9,7 +9,7 @@ file(REMOVE_RECURSE "${HDG_SMOOTH_PERIODIC_OUTPUT}")
 file(REMOVE "${HDG_SMOOTH_PERIODIC_OUTPUT}.checkpoint")
 execute_process(
   COMMAND "${HDG_SMOOTH_PERIODIC_MPIEXEC}"
-    "${HDG_SMOOTH_PERIODIC_NUMPROC_FLAG}" 2
+    "${HDG_SMOOTH_PERIODIC_NUMPROC_FLAG}" 3
     ${HDG_SMOOTH_PERIODIC_MPIEXEC_PREFLAGS}
     "${HDG_SMOOTH_PERIODIC_EXECUTABLE}"
       --discretization hdg
@@ -20,9 +20,9 @@ execute_process(
   ERROR_VARIABLE error)
 set(combined_output "${output}${error}")
 if(status EQUAL 0 OR
-   NOT combined_output MATCHES "CPU-serial HDG requires exactly one MPI rank" OR
+   NOT combined_output MATCHES "CPU HDG requires exactly one or two MPI ranks" OR
    EXISTS "${HDG_SMOOTH_PERIODIC_OUTPUT}" OR
    EXISTS "${HDG_SMOOTH_PERIODIC_OUTPUT}.checkpoint")
   message(FATAL_ERROR
-    "rank-two adapter execution did not reject cleanly: ${status};${output};${error}")
+    "rank-three adapter execution did not reject cleanly: ${status};${output};${error}")
 endif()
