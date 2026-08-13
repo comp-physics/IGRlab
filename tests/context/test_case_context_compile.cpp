@@ -1,6 +1,17 @@
 #include "sim/context/case_context.hpp"
 #include "sim/wiring/euler_boundary_plan.hpp"
 
+#include <memory>
+#include <type_traits>
+
+static_assert(std::is_constructible_v<dg_sim::CaseContext,
+                                      std::unique_ptr<mfem::ParMesh>,
+                                      dg_sim::MeshBuildMetadata>);
+static_assert(!std::is_constructible_v<dg_sim::CaseContext,
+                                       std::unique_ptr<mfem::ParMesh>,
+                                       MPI_Comm,
+                                       dg_sim::MeshBuildMetadata>);
+
 int main()
 {
   dg_sim::MeshBuildRequest request;
