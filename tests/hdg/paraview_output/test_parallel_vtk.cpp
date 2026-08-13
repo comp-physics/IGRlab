@@ -50,6 +50,18 @@ bool Run(const std::filesystem::path& output)
   if (rank == 0) { std::filesystem::remove_all(output); }
   MPI_Barrier(MPI_COMM_WORLD);
 
+  // A publication-only adapter must not import or retain a PVD history from
+  // an earlier writer.  Seed an incompatible historical record before every
+  // fresh collection save and verify that MFEM replaces it.
+  if (rank == 0)
+  {
+    const std::filesystem::path collection_root = output / "hdg_physical";
+    std::filesystem::create_directories(collection_root);
+    std::ofstream stale_pvd(collection_root / "hdg_physical.pvd");
+    stale_pvd << "stale-history-cycle-000003\n";
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+
   mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
       2, 1, mfem::Element::QUADRILATERAL, false, 2.0, 1.0, false);
   mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh);
@@ -96,6 +108,7 @@ bool Run(const std::filesystem::path& output)
     const std::string pvtu = ReadFile(cycle / "data.pvtu");
     passed = passed && Contains(pvd, "timestep=\"1.25\"") &&
         Contains(pvd, "Cycle000007/data.pvtu") &&
+        !Contains(pvd, "stale-history-cycle-000003") &&
         Contains(pvtu, "proc000000.vtu");
     if (ranks == 2)
     {

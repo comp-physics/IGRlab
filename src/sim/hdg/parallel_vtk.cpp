@@ -89,9 +89,6 @@ void WriteHDGParaViewOutput(const HDGParaViewRequest& request)
   collection.SetDataFormat(request.options.data_format);
   collection.SetCycle(request.metadata.cycle);
   collection.SetTime(request.metadata.time);
-  // A fresh adapter object may publish successive steps.  Let MFEM retain
-  // older, strictly earlier PVD records instead of replacing the timeline.
-  collection.UseRestartMode(true);
 
   for (const HDGInteriorFieldView& view : request.interior_fields)
   {
