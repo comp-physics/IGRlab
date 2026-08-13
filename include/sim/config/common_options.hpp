@@ -103,7 +103,7 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.discretization,
                  "-disc",
                  "--discretization",
-                 "Discretization: dg | dgsem | hdg (HDG is unavailable).");
+                 "Discretization: dg | dgsem | hdg (case support required).");
   args.AddOption(&opts.zhang_shu_points,
                  "-zsp",
                  "--zhang-shu-points",

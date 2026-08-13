@@ -1708,6 +1708,7 @@ struct detail::CpuNumericsCore::Implementation
   int scalar_trace_dofs = 0;
   std::vector<int> element_interior_vdofs;
   std::vector<int> element_faces;
+  std::vector<unsigned char> shared_faces;
   std::vector<int> signed_trace_dofs;
   // Extracted only while the serial attribute tag is present.  These are
   // provenance for the MFEM-selected local mesh, never physics attributes.
@@ -2465,12 +2466,29 @@ struct detail::CpuNumericsCore::Implementation
                        static_cast<std::size_t>(mesh->GetNE()) * 4,
                        CpuOwnedAllocationSite::topology_vector,
                        allocations) ||
+          !ResizeOwned(shared_faces,
+                       static_cast<std::size_t>(mesh->GetNumFaces()),
+                       CpuOwnedAllocationSite::topology_vector,
+                       allocations) ||
           !ResizeOwned(signed_trace_dofs,
                        static_cast<std::size_t>(mesh->GetNE()) * local_trace,
                        CpuOwnedAllocationSite::topology_vector,
                        allocations))
       {
         return false;
+      }
+      std::fill(shared_faces.begin(), shared_faces.end(), 0);
+      for (int shared_face = 0;
+           shared_face < mesh->GetNSharedFaces();
+           ++shared_face)
+      {
+        const int face = mesh->GetSharedFace(shared_face);
+        if (face < 0 ||
+            face >= static_cast<int>(shared_faces.size()))
+        {
+          return false;
+        }
+        shared_faces[static_cast<std::size_t>(face)] = 1;
       }
       for (int element = 0; element < mesh->GetNE(); ++element)
       {
@@ -3390,6 +3408,11 @@ struct detail::CpuNumericsCore::Implementation
           {
             return false;
           }
+          const bool true_boundary =
+              face >= 0 &&
+              face < static_cast<int>(shared_faces.size()) &&
+              shared_faces[static_cast<std::size_t>(face)] == 0 &&
+              face_transformation->Elem2No < 0;
           const bool element_one = face_transformation->Elem1No == element;
           if (!element_one && face_transformation->Elem2No != element)
           {
@@ -3441,13 +3464,14 @@ struct detail::CpuNumericsCore::Implementation
             // The physical-boundary trace remains an unknown in the interior
             // numerical flux. Its own row constrains trace = exterior(U), so
             // the condensed trace system remains closed and nonsingular.
-            // MFEM uses Elem2No < 0 for both physical boundaries and some
-            // rank-neighbour faces.  Only a mapped boundary element is a
-            // caller boundary condition; neighbour faces retain the ordinary
-            // trace flux and participate in the distributed trace solve.
+            // A physical caller boundary must be a true MFEM boundary and be
+            // mapped to a boundary element.  ParMesh's explicit shared-face
+            // list is available without face-neighbor exchange, so periodic
+            // faces crossing MPI ranks remain ordinary trace couplings even
+            // when their local Elem2No is negative and annotations survive.
             const int boundary_element =
                 mesh->GetFaceToBdrElMap()[face];
-            if (IsBorrowed() && boundary_element >= 0)
+            if (IsBorrowed() && true_boundary && boundary_element >= 0)
             {
               mfem::Vector position(cpu_dimension);
               face_transformation->Face->Transform(face_point, position);

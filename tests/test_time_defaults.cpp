@@ -103,11 +103,10 @@ int RunTimeDefaultsTests(TestContext& ctx)
 
     const dg_sim::DiscretizationResolution hdg_selection =
       dg_sim::ResolveDiscretization("dg", "hdg", "dg", true, false);
-    ctx.Check(hdg_selection.status ==
-                dg_sim::DiscretizationResolutionStatus::Unavailable &&
+    ctx.Check(hdg_selection.IsResolved() &&
                 hdg_selection.discretization == dg_sim::Discretization::HDG &&
                 !hdg_selection.dg_backend,
-              "discretization: hdg is recognized but unavailable");
+              "discretization: hdg resolves without a legacy DG backend");
 
     ctx.Check(!dg_sim::DGBackendForDiscretization(
                 dg_sim::Discretization::HDG),

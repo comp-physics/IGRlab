@@ -5,10 +5,14 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "physics/euler/conversions.hpp"
 #include "sim/igr_sim.hpp"
+#if DG_IGR_HAS_HDG_MAIN_BACKEND
+#include "sim/hdg/main_backend.hpp"
+#endif
 
 namespace
 {
@@ -46,6 +50,34 @@ std::string EnsurePeriodicMeshFile()
   return mesh_path.filename().string();
 }
 
+std::unique_ptr<mfem::VectorCoefficient>
+MakeSmoothAdvectionInitialCondition(const double gamma)
+{
+  const double rho0 = 1.0;
+  const double u0 = 2.0;
+  const double v0 = 0.0;
+  const double p0 = 1.0;
+  const double amp = 0.1;
+  const double sigma = 0.12;
+
+  auto ic_fun = [=](const mfem::Vector& x, mfem::Vector& U)
+  {
+    const double dx = x(0) - 0.5;
+    const double dy = x(1) - 0.5;
+    const double r2 = dx * dx + dy * dy;
+    const double rho = rho0 + amp * std::exp(-r2 / (sigma * sigma));
+
+    mfem::Vector prim(4);
+    prim(0) = rho;
+    prim(1) = u0;
+    prim(2) = v0;
+    prim(3) = p0;
+    mfem::EulerPrimToConservative(prim, /*dim=*/2, gamma, U);
+  };
+
+  return dg_sim::MakeVectorFunctionIC(4, ic_fun);
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -77,29 +109,7 @@ int main(int argc, char* argv[])
                     const dg_sim::ExampleContext&,
                     double gamma)
   {
-    const double rho0 = 1.0;
-    const double u0 = 2.0;
-    const double v0 = 0.0;
-    const double p0 = 1.0;
-    const double amp = 0.1;
-    const double sigma = 0.12;
-
-    auto ic_fun = [=](const mfem::Vector& x, mfem::Vector& U)
-    {
-      const double dx = x(0) - 0.5;
-      const double dy = x(1) - 0.5;
-      const double r2 = dx * dx + dy * dy;
-      const double rho = rho0 + amp * std::exp(-r2 / (sigma * sigma));
-
-      mfem::Vector prim(4);
-      prim(0) = rho;
-      prim(1) = u0;
-      prim(2) = v0;
-      prim(3) = p0;
-      mfem::EulerPrimToConservative(prim, /*dim=*/2, gamma, U);
-    };
-
-    return dg_sim::MakeVectorFunctionIC(4, ic_fun);
+    return MakeSmoothAdvectionInitialCondition(gamma);
   };
 
   spec.build_markers = [](dg_sim::ExampleContext&)
@@ -112,6 +122,22 @@ int main(int argc, char* argv[])
                      auto&,
                      const auto&) {
   };
+
+#if DG_IGR_HAS_HDG_MAIN_BACKEND
+  spec.run_hdg = [](const SmoothAdvectionOptions&,
+                    const dg_sim::CaseConfig& case_config,
+                    const dg_sim::CommonOptions& options)
+  {
+    auto initial_condition =
+      MakeSmoothAdvectionInitialCondition(case_config.gamma);
+    dg_sim::EulerBoundaryPlan boundary_plan;
+    mfem::Array<int> periodic_marker(4);
+    periodic_marker = 1;
+    boundary_plan.AddPeriodic(std::move(periodic_marker));
+    return dg_sim::hdg::RunEulerMainBackend(
+      {case_config, options, *initial_condition, boundary_plan});
+  };
+#endif
 
   return dg_sim::Solver::solve(spec, argc, argv);
 }

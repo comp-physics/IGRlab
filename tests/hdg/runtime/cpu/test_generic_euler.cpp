@@ -89,6 +89,21 @@ mfem::ParMesh MakeBorrowedMesh(const MPI_Comm communicator = MPI_COMM_WORLD)
   return mfem::ParMesh(communicator, serial, partition.data());
 }
 
+mfem::ParMesh MakePeriodicBorrowedMesh(
+    const MPI_Comm communicator = MPI_COMM_WORLD)
+{
+  mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+      3, 3, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+  translations[0][0] = 1.0;
+  translations[0][1] = 0.0;
+  translations[1][0] = 0.0;
+  translations[1][1] = 1.0;
+  mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
+      original, original.CreatePeriodicVertexMapping(translations));
+  return mfem::ParMesh(communicator, periodic);
+}
+
 mfem::ParMesh MakeRankZeroOwnedBorrowedMesh(
     const MPI_Comm communicator = MPI_COMM_WORLD)
 {
@@ -261,6 +276,22 @@ bool CheckOrdersAndDeterminism()
   return true;
 }
 
+bool CheckPeriodicAnnotationsRemainTraceCouplings()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                       0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{};
+  BoundaryContext context{};
+  EulerHdgRequest request = Request(mesh, 1, context, initial, source);
+  GenericEulerHdgCpuSession session;
+  return session.Initialize(request).status ==
+      GenericEulerCpuSessionStatus::initialized &&
+      session.Advance(0.001).status ==
+      GenericEulerCpuSessionStatus::advanced &&
+      context.calls == 0;
+}
+
 bool CheckClosedBoundaryPicardAssembly()
 {
   mfem::ParMesh mesh = MakeBorrowedMesh();
@@ -385,12 +416,14 @@ int main(int argc, char* argv[])
   mfem::MPI_Session mpi(argc, argv);
   const bool boundary_semantics = CheckBoundaryExteriorSemantics();
   const bool orders = CheckOrdersAndDeterminism();
+  const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
   const bool boundary_picard = CheckClosedBoundaryPicardAssembly();
   const bool zero_owned = CheckZeroOwnedElementEngine();
   const bool subcommunicator = CheckSubcommunicatorIsolation();
   const bool mismatch = CheckCollectiveMismatchAndAtomicFailure();
   const bool callback_failure = CheckAcceptedRequestRankLocalCallbackFailure();
-  const bool local = boundary_semantics && orders && boundary_picard &&
+  const bool local = boundary_semantics && orders && periodic &&
+      boundary_picard &&
       zero_owned && subcommunicator && mismatch && callback_failure;
   if (!All(local))
   {
@@ -398,7 +431,8 @@ int main(int argc, char* argv[])
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     std::cerr << "generic Euler CPU test failed on rank " << rank
               << " boundary_semantics=" << boundary_semantics
-              << " orders=" << orders << " boundary_picard=" << boundary_picard
+              << " orders=" << orders << " periodic=" << periodic
+              << " boundary_picard=" << boundary_picard
               << " zero_owned=" << zero_owned
               << " subcommunicator=" << subcommunicator
               << " mismatch=" << mismatch

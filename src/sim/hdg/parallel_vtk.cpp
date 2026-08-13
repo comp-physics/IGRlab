@@ -3,6 +3,13 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iterator>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -74,11 +81,106 @@ void ValidateMetadata(const HDGParaViewMetadata& metadata)
   }
 }
 
+bool CollectiveAll(const MPI_Comm communicator, const bool local) noexcept
+{
+  const int input = local ? 1 : 0;
+  int output = 0;
+  return communicator != MPI_COMM_NULL &&
+      MPI_Allreduce(&input, &output, 1, MPI_INT, MPI_MIN, communicator) ==
+          MPI_SUCCESS &&
+      output == 1;
+}
+
+bool ExactMetadataConsensus(const MPI_Comm communicator,
+                            const HDGParaViewMetadata& metadata) noexcept
+{
+  int minimum_cycle = 0;
+  int maximum_cycle = 0;
+  int minimum_step = 0;
+  int maximum_step = 0;
+  std::uint64_t time_bits = 0;
+  std::uint64_t minimum_time_bits = 0;
+  std::uint64_t maximum_time_bits = 0;
+  static_assert(sizeof(time_bits) == sizeof(metadata.time),
+                "HDG ParaView metadata requires IEEE binary64 doubles");
+  std::memcpy(&time_bits, &metadata.time, sizeof(time_bits));
+  bool reduced = true;
+  reduced =
+      (MPI_Allreduce(&metadata.cycle, &minimum_cycle, 1, MPI_INT, MPI_MIN,
+                     communicator) == MPI_SUCCESS) && reduced;
+  reduced =
+      (MPI_Allreduce(&metadata.cycle, &maximum_cycle, 1, MPI_INT, MPI_MAX,
+                     communicator) == MPI_SUCCESS) && reduced;
+  reduced =
+      (MPI_Allreduce(&metadata.step, &minimum_step, 1, MPI_INT, MPI_MIN,
+                     communicator) == MPI_SUCCESS) && reduced;
+  reduced =
+      (MPI_Allreduce(&metadata.step, &maximum_step, 1, MPI_INT, MPI_MAX,
+                     communicator) == MPI_SUCCESS) && reduced;
+  reduced =
+      (MPI_Allreduce(&time_bits, &minimum_time_bits, 1, MPI_UINT64_T,
+                     MPI_MIN, communicator) == MPI_SUCCESS) && reduced;
+  reduced =
+      (MPI_Allreduce(&time_bits, &maximum_time_bits, 1, MPI_UINT64_T,
+                     MPI_MAX, communicator) == MPI_SUCCESS) && reduced;
+  return CollectiveAll(
+      communicator,
+      reduced && minimum_cycle == maximum_cycle &&
+          minimum_step == maximum_step &&
+          minimum_time_bits == maximum_time_bits);
+}
+
+std::string Padded(const int value)
+{
+  std::ostringstream stream;
+  stream << std::setw(6) << std::setfill('0') << value;
+  return stream.str();
+}
+
+bool StructurallyCompleteXml(const std::filesystem::path& path)
+{
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return false;
+  input.seekg(0, std::ios::end);
+  const std::streamoff size = input.tellg();
+  if (size <= 0) return false;
+  constexpr std::streamoff tail_capacity = 512;
+  const std::streamoff tail_size = std::min(size, tail_capacity);
+  input.seekg(size - tail_size);
+  std::string tail(static_cast<std::size_t>(tail_size), '\0');
+  input.read(tail.data(), tail_size);
+  return input && tail.find("</VTKFile>") != std::string::npos;
+}
+
+bool TextContains(const std::filesystem::path& path,
+                  const std::string& token)
+{
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return false;
+  const std::string text((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+  return !input.bad() && text.find(token) != std::string::npos;
+}
+
 } // namespace
 
 HDGParaViewSeries::HDGParaViewSeries(const HDGParaViewRequest& request)
 {
   ValidateRequest(request);
+
+  communicator_ = request.mesh.GetComm();
+  if (communicator_ == MPI_COMM_NULL ||
+      MPI_Comm_rank(communicator_, &rank_) != MPI_SUCCESS ||
+      MPI_Comm_size(communicator_, &ranks_) != MPI_SUCCESS ||
+      rank_ < 0 || ranks_ <= 0)
+  {
+    throw std::invalid_argument(
+        "HDG ParaView requires a live mesh communicator");
+  }
+  collection_name_ = request.options.collection_name;
+  collection_path_ =
+      (std::filesystem::path(request.options.prefix_path) /
+       collection_name_).string();
 
   // Passing the caller's ParMesh directly preserves its rank-local geometry
   // and partition.  ParaViewDataCollection writes one VTU per rank and its
@@ -99,14 +201,115 @@ HDGParaViewSeries::HDGParaViewSeries(const HDGParaViewRequest& request)
 
 void HDGParaViewSeries::Write(const HDGParaViewMetadata& metadata)
 {
-  ValidateMetadata(metadata);
+  std::string cycle;
+  std::filesystem::path root;
+  std::filesystem::path cycle_path;
+  std::filesystem::path local_vtu;
+  std::filesystem::path pvtu;
+  std::filesystem::path pvd;
+  bool metadata_ready = true;
+  try
+  {
+    ValidateMetadata(metadata);
+    metadata_ready = metadata.cycle > last_cycle_;
+    cycle = "Cycle" + Padded(metadata.cycle);
+    root = std::filesystem::path(collection_path_);
+    cycle_path = root / cycle;
+    local_vtu = cycle_path / ("proc" + Padded(rank_) + ".vtu");
+    pvtu = cycle_path / "data.pvtu";
+    pvd = root / (collection_name_ + ".pvd");
+  }
+  catch (...)
+  {
+    metadata_ready = false;
+  }
+  if (!CollectiveAll(communicator_, metadata_ready))
+  {
+    throw std::invalid_argument(
+        "HDG ParaView metadata is invalid or cycles did not increase");
+  }
+  if (!ExactMetadataConsensus(communicator_, metadata))
+  {
+    throw std::invalid_argument(
+        "HDG ParaView metadata differs between MPI ranks");
+  }
+
+  bool targets_ready = true;
+  try
+  {
+    std::error_code error;
+    std::filesystem::remove(local_vtu, error);
+    targets_ready = !error && !std::filesystem::exists(local_vtu);
+    if (rank_ == 0)
+    {
+      error.clear();
+      std::filesystem::remove(pvtu, error);
+      targets_ready = targets_ready && !error &&
+          !std::filesystem::exists(pvtu);
+      if (last_cycle_ < 0)
+      {
+        error.clear();
+        std::filesystem::remove(pvd, error);
+        targets_ready = targets_ready && !error &&
+            !std::filesystem::exists(pvd);
+      }
+    }
+  }
+  catch (...)
+  {
+    targets_ready = false;
+  }
+  if (!CollectiveAll(communicator_, targets_ready))
+  {
+    throw std::runtime_error(
+        "HDG ParaView could not prepare fresh publication targets");
+  }
+
   collection_->SetCycle(metadata.cycle);
   collection_->SetTime(metadata.time);
-  collection_->Save();
-  if (collection_->Error() != mfem::DataCollection::No_Error)
+
+  bool local_saved = true;
+  try
+  {
+    collection_->Save();
+    local_saved =
+        collection_->Error() == mfem::DataCollection::No_Error;
+  }
+  catch (...)
+  {
+    local_saved = false;
+  }
+  if (!CollectiveAll(communicator_, local_saved))
   {
     throw std::runtime_error("MFEM failed to write HDG ParaView output");
   }
+
+  bool local_complete = false;
+  try
+  {
+    local_complete = StructurallyCompleteXml(local_vtu);
+    if (local_complete && rank_ == 0)
+    {
+      local_complete = StructurallyCompleteXml(pvtu) &&
+          StructurallyCompleteXml(pvd) &&
+          TextContains(pvd, cycle + "/data.pvtu");
+      for (int rank = 0; local_complete && rank < ranks_; ++rank)
+      {
+        local_complete =
+            TextContains(pvtu, "proc" + Padded(rank) + ".vtu");
+      }
+    }
+  }
+  catch (...)
+  {
+    local_complete = false;
+  }
+  if (!CollectiveAll(communicator_, local_complete))
+  {
+    throw std::runtime_error(
+        "HDG ParaView publication is incomplete on at least one rank");
+  }
+  last_cycle_ = metadata.cycle;
 }
 
 } // namespace dg_sim::hdg

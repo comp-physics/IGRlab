@@ -28,6 +28,12 @@ if(_dg_igr_hdg_named_component_cpp)
     list(REMOVE_ITEM SOURCES ${_dg_igr_hdg_named_component_cpp})
 endif()
 
+# The opt-in main-application HDG runner is compiled only by its named CPU
+# component.  Keeping it out of igr_mfem preserves default-OFF examples and
+# prevents a second copy of its generic runtime entry.
+list(REMOVE_ITEM SOURCES
+     "${CMAKE_CURRENT_SOURCE_DIR}/sim/hdg/main_backend.cpp")
+
 if(NOT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT)
     list(REMOVE_ITEM SOURCES
          "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler_mpi.cpp")

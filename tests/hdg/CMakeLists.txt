@@ -190,8 +190,16 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/boundary_lowering/CMakeLists.txt")
   add_subdirectory(boundary_lowering)
 endif()
 if(MFEM_USE_MPI AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/state_io/CMakeLists.txt")
+  add_subdirectory(state_io)
+endif()
+if(MFEM_USE_MPI AND
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/paraview_output/CMakeLists.txt")
   add_subdirectory(paraview_output)
+endif()
+if(TARGET dg_igr_hdg_main_backend_cpu AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/main_backend/CMakeLists.txt")
+  add_subdirectory(main_backend)
 endif()
 
 # CPU core, trace, device, and formulation tests remain independently
