@@ -186,6 +186,9 @@ if(MFEM_USE_MPI AND
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generic_contract/CMakeLists.txt")
   add_subdirectory(generic_contract)
 endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/boundary_lowering/CMakeLists.txt")
+  add_subdirectory(boundary_lowering)
+endif()
 if(MFEM_USE_MPI AND
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/paraview_output/CMakeLists.txt")
   add_subdirectory(paraview_output)

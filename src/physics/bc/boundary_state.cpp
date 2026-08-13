@@ -232,6 +232,103 @@ PrimitiveNormalState SubsonicInletClosure(const PrimitiveNormalState& inner,
 
 } // namespace
 
+void EvaluateEulerExteriorState(const EulerExteriorStateKind kind,
+                                const Vector& Uminus,
+                                const Vector& nor,
+                                const int dim,
+                                const double gamma,
+                                const Vector* const reference_state,
+                                const double pressure_out,
+                                Vector& Uplus)
+{
+  switch (kind)
+  {
+  case EulerExteriorStateKind::SupersonicInlet:
+    MFEM_VERIFY(reference_state != nullptr,
+                "Supersonic inlet exterior state requires a reference state.");
+    Uplus = *reference_state;
+    return;
+  case EulerExteriorStateKind::SupersonicOutlet:
+    Uplus = Uminus;
+    return;
+  case EulerExteriorStateKind::SlipWall:
+  {
+    Uplus = Uminus;
+    const double rho = std::max(Uminus(0), kRhoFloor);
+    Vector nhat(nor);
+    const double nrm = nhat.Norml2();
+    if (nrm > 0.0)
+    {
+      nhat /= nrm;
+    }
+    Vector velocity(dim);
+    for (int d = 0; d < dim; ++d)
+    {
+      velocity(d) = Uminus(1 + d) / rho;
+    }
+    const double normal_velocity = InnerProduct(velocity, nhat);
+    Uplus(0) = rho;
+    for (int d = 0; d < dim; ++d)
+    {
+      Uplus(1 + d) = rho * (velocity(d) - 2.0 * normal_velocity * nhat(d));
+    }
+    return;
+  }
+  case EulerExteriorStateKind::SubsonicInlet:
+  case EulerExteriorStateKind::SubsonicOutletPressure:
+  case EulerExteriorStateKind::FarField:
+  case EulerExteriorStateKind::NonReflectingOutlet:
+    break;
+  }
+
+  mfem::Vector nhat, that;
+  BuildNormalTangential(nor, dim, nhat, that);
+  const PrimitiveNormalState inner =
+    ConservativeToPrimitiveNormal(Uminus, dim, gamma, nhat, that);
+
+  if (kind == EulerExteriorStateKind::SubsonicOutletPressure)
+  {
+    const PrimitiveNormalState bnd =
+      SubsonicOutletPressureClosure(inner, gamma, pressure_out);
+    PrimitiveNormalToConservative(bnd, dim, gamma, nhat, that, Uplus);
+    return;
+  }
+
+  MFEM_VERIFY(reference_state != nullptr,
+              "Characteristic exterior state requires a reference state.");
+  const PrimitiveNormalState reference =
+    ConservativeToPrimitiveNormal(*reference_state, dim, gamma, nhat, that);
+  if (kind == EulerExteriorStateKind::NonReflectingOutlet)
+  {
+    const PrimitiveNormalState bnd =
+      NonReflectingOutletClosure(inner, reference, gamma);
+    PrimitiveNormalToConservative(bnd, dim, gamma, nhat, that, Uplus);
+    return;
+  }
+  if (kind == EulerExteriorStateKind::SubsonicInlet)
+  {
+    const PrimitiveNormalState bnd =
+      SubsonicInletClosure(inner, reference, gamma);
+    PrimitiveNormalToConservative(bnd, dim, gamma, nhat, that, Uplus);
+    return;
+  }
+
+  if (inner.un <= -inner.c)
+  {
+    Uplus = *reference_state;
+    return;
+  }
+  if (inner.un >= inner.c)
+  {
+    Uplus = Uminus;
+    return;
+  }
+  const PrimitiveNormalState bnd = inner.un < 0.0
+      ? SubsonicInletClosure(inner, reference, gamma)
+      : NonReflectingOutletClosure(inner, reference, gamma);
+  PrimitiveNormalToConservative(bnd, dim, gamma, nhat, that, Uplus);
+}
+
 // ---------- SupersonicInletState ----------
 
 SupersonicInletState::SupersonicInletState(const Vector& Uin)
@@ -239,22 +336,24 @@ SupersonicInletState::SupersonicInletState(const Vector& Uin)
 {
 }
 
-void SupersonicInletState::Eval(const Vector&,
-                                const Vector&,
+void SupersonicInletState::Eval(const Vector& Uminus,
+                                const Vector& nor,
                                 FaceElementTransformations&,
                                 Vector& Uplus) const
 {
-  Uplus = Uin_;
+  EvaluateEulerExteriorState(EulerExteriorStateKind::SupersonicInlet,
+                             Uminus, nor, 1, 1.4, &Uin_, 0.0, Uplus);
 }
 
 // ---------- SupersonicOutletState ----------
 
 void SupersonicOutletState::Eval(const Vector& Uminus,
-                                 const Vector&,
+                                 const Vector& nor,
                                  FaceElementTransformations&,
                                  Vector& Uplus) const
 {
-  Uplus = Uminus;
+  EvaluateEulerExteriorState(EulerExteriorStateKind::SupersonicOutlet,
+                             Uminus, nor, 1, 1.4, nullptr, 0.0, Uplus);
 }
 
 // ---------- SubsonicOutletPressureState ----------
@@ -273,13 +372,8 @@ void SubsonicOutletPressureState::Eval(const Vector& Uminus,
                                        FaceElementTransformations&,
                                        Vector& Uplus) const
 {
-  mfem::Vector nhat, that;
-  BuildNormalTangential(nor, dim_, nhat, that);
-  const PrimitiveNormalState inner =
-    ConservativeToPrimitiveNormal(Uminus, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState bnd =
-    SubsonicOutletPressureClosure(inner, gamma_, p_out_);
-  PrimitiveNormalToConservative(bnd, dim_, gamma_, nhat, that, Uplus);
+  EvaluateEulerExteriorState(EulerExteriorStateKind::SubsonicOutletPressure,
+                             Uminus, nor, dim_, gamma_, nullptr, p_out_, Uplus);
 }
 
 // ---------- NonReflectingOutletState ----------
@@ -298,14 +392,8 @@ void NonReflectingOutletState::Eval(const Vector& Uminus,
                                     FaceElementTransformations&,
                                     Vector& Uplus) const
 {
-  mfem::Vector nhat, that;
-  BuildNormalTangential(nor, dim_, nhat, that);
-  const PrimitiveNormalState inner =
-    ConservativeToPrimitiveNormal(Uminus, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState ref =
-    ConservativeToPrimitiveNormal(Uref_, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState bnd = NonReflectingOutletClosure(inner, ref, gamma_);
-  PrimitiveNormalToConservative(bnd, dim_, gamma_, nhat, that, Uplus);
+  EvaluateEulerExteriorState(EulerExteriorStateKind::NonReflectingOutlet,
+                             Uminus, nor, dim_, gamma_, &Uref_, 0.0, Uplus);
 }
 
 // ---------- SubsonicInletState ----------
@@ -322,14 +410,8 @@ void SubsonicInletState::Eval(const Vector& Uminus,
                               FaceElementTransformations&,
                               Vector& Uplus) const
 {
-  mfem::Vector nhat, that;
-  BuildNormalTangential(nor, dim_, nhat, that);
-  const PrimitiveNormalState inner =
-    ConservativeToPrimitiveNormal(Uminus, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState target =
-    ConservativeToPrimitiveNormal(Uin_, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState bnd = SubsonicInletClosure(inner, target, gamma_);
-  PrimitiveNormalToConservative(bnd, dim_, gamma_, nhat, that, Uplus);
+  EvaluateEulerExteriorState(EulerExteriorStateKind::SubsonicInlet,
+                             Uminus, nor, dim_, gamma_, &Uin_, 0.0, Uplus);
 }
 
 // ---------- FarFieldState ----------
@@ -346,34 +428,8 @@ void FarFieldState::Eval(const Vector& Uminus,
                          FaceElementTransformations&,
                          Vector& Uplus) const
 {
-  mfem::Vector nhat, that;
-  BuildNormalTangential(nor, dim_, nhat, that);
-  const PrimitiveNormalState inner =
-    ConservativeToPrimitiveNormal(Uminus, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState far =
-    ConservativeToPrimitiveNormal(Ufar_, dim_, gamma_, nhat, that);
-
-  if (inner.un <= -inner.c)
-  {
-    Uplus = Ufar_;
-    return;
-  }
-  if (inner.un >= inner.c)
-  {
-    Uplus = Uminus;
-    return;
-  }
-
-  PrimitiveNormalState bnd;
-  if (inner.un < 0.0)
-  {
-    bnd = SubsonicInletClosure(inner, far, gamma_);
-  }
-  else
-  {
-    bnd = NonReflectingOutletClosure(inner, far, gamma_);
-  }
-  PrimitiveNormalToConservative(bnd, dim_, gamma_, nhat, that, Uplus);
+  EvaluateEulerExteriorState(EulerExteriorStateKind::FarField,
+                             Uminus, nor, dim_, gamma_, &Ufar_, 0.0, Uplus);
 }
 
 // ---------- SlipWallState ----------
@@ -388,36 +444,8 @@ void SlipWallState::Eval(const Vector& Uminus,
                          FaceElementTransformations&,
                          Vector& Uplus) const
 {
-  // Copy conservative state
-  Uplus = Uminus;
-
-  const double rho_raw = Uminus(0);
-  const double rho = std::max(rho_raw, kRhoFloor);
-
-  // Unit normal from scaled normal
-  Vector nhat(nor);
-  const double nrm = nhat.Norml2();
-  if (nrm > 0.0)
-  {
-    nhat /= nrm;
-  }
-
-  // Reconstruct velocity u^- from momentum
-  Vector u(dim_);
-  for (int d = 0; d < dim_; ++d)
-  {
-    u(d) = Uminus(1 + d) / rho;
-  }
-
-  // Reflect normal component
-  const double un = InnerProduct(u, nhat);
-  Uplus(0) = rho;
-  for (int d = 0; d < dim_; ++d)
-  {
-    const double uprime_d = u(d) - 2.0 * un * nhat(d);
-    Uplus(1 + d) = rho * uprime_d; // new momentum
-  }
-  // rho (index 0) and E (index 1+dim_) remain unchanged (adiabatic slip wall)
+  EvaluateEulerExteriorState(EulerExteriorStateKind::SlipWall,
+                             Uminus, nor, dim_, 1.4, nullptr, 0.0, Uplus);
 }
 
 } // namespace mfem
