@@ -17,6 +17,7 @@ namespace
 using dg::hdg::runtime::app::ApplicationExit;
 using dg::hdg::runtime::app::ApplicationOptionsView;
 using dg::hdg::runtime::app::ApplicationRunResult;
+using dg::hdg::runtime::CpuRank2BackendTag;
 using dg::hdg::runtime::CpuSerialBackendTag;
 using dg::hdg::runtime::app::ExitForResult;
 using dg::hdg::runtime::app::HdgMethodRequestV1;
@@ -51,7 +52,7 @@ void PrintHelp(std::ostream& output)
 {
   output << "Usage: hdg_smooth_periodic --discretization hdg "
             "--hdg-output-dir ABSOLUTE_PATH\n\n"
-            "Runs the admitted CPU-serial conventional HDG smooth-periodic "
+            "Runs the admitted CPU conventional HDG smooth-periodic "
             "functional tuple (steps 0, 10, and 20 are published as VTK).\n";
 }
 
@@ -148,7 +149,7 @@ bool ParseAdapterOptions(const int argc, char* argv[], AdapterOptions& options,
     if (argument == "--device" || argument.rfind("--device=", 0) == 0 ||
         argument == "-dev")
     {
-      diagnostic = "device selection is unsupported by CPU-serial HDG";
+      diagnostic = "device selection is unsupported by CPU HDG";
       return false;
     }
     diagnostic = "unsupported HDG adapter option: " + std::string{argument};
@@ -164,11 +165,12 @@ bool ParseAdapterOptions(const int argc, char* argv[], AdapterOptions& options,
 }
 
 ApplicationOptionsView MakeFunctionalRequest(
+    const std::string_view backend_id,
     const std::string_view output_directory,
     const std::string_view checkpoint_path) noexcept
 {
   ApplicationOptionsView options{};
-  options.backend_id = CpuSerialBackendTag::id;
+  options.backend_id = backend_id;
   options.scenario_id = smooth_periodic_euler_v1_functional_id;
   options.polynomial_order = smooth_periodic_euler_v1_functional_polynomial_order;
   options.mesh_n = smooth_periodic_euler_v1_functional_mesh_n;
@@ -222,10 +224,19 @@ int main(int argc, char* argv[])
 
   mfem::Mpi::Init(argc, argv);
   MpiApplicationContextV1 context;
-  if (context.ranks() != 1)
+  std::string_view backend_id;
+  if (context.ranks() == 1)
+  {
+    backend_id = CpuSerialBackendTag::id;
+  }
+  else if (context.ranks() == 2)
+  {
+    backend_id = CpuRank2BackendTag::id;
+  }
+  else
   {
     if (context.rank() == 0)
-      std::cerr << "hdg_smooth_periodic: CPU-serial HDG requires exactly one MPI rank\n";
+      std::cerr << "hdg_smooth_periodic: CPU HDG requires exactly one or two MPI ranks\n";
     return FinishAfterMpi(
         static_cast<int>(ApplicationExit::unsupported_discretization));
   }
@@ -234,7 +245,7 @@ int main(int argc, char* argv[])
   const std::string checkpoint_path = adapter_options.output_directory +
       ".checkpoint";
   const ApplicationOptionsView options = MakeFunctionalRequest(
-      adapter_options.output_directory, checkpoint_path);
+      backend_id, adapter_options.output_directory, checkpoint_path);
   const auto validation = ValidateApplicationOptions(options);
   if (!validation.accepted())
   {
