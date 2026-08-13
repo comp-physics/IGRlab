@@ -144,12 +144,11 @@ private:
   static CaseContext WrapExistingMesh(std::unique_ptr<mfem::ParMesh> mesh)
   {
     MFEM_VERIFY(mesh, "ExampleContext requires a parallel mesh.");
-    const MPI_Comm communicator = mesh->GetComm();
     MeshBuildMetadata metadata;
     metadata.mesh_path_precedence = MeshPathPrecedence::AlreadyResolved;
     metadata.local_elements_after_partitioning = mesh->GetNE();
     metadata.local_elements_after_parallel_refinement = mesh->GetNE();
-    return CaseContext(std::move(mesh), communicator, std::move(metadata));
+    return CaseContext(std::move(mesh), std::move(metadata));
   }
 };
 

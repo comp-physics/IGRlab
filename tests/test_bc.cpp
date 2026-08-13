@@ -1,10 +1,21 @@
 #include "physics/bc/boundary_state.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/riemann/rusanov.hpp"
+#include "sim/context/case_context.hpp"
 #include "sim/context/mesh_build.hpp"
 #include "sim/wiring/bc_wiring.hpp"
 
+#include <memory>
 #include <string>
+#include <type_traits>
+
+static_assert(std::is_constructible_v<dg_sim::CaseContext,
+                                      std::unique_ptr<mfem::ParMesh>,
+                                      dg_sim::MeshBuildMetadata>);
+static_assert(!std::is_constructible_v<dg_sim::CaseContext,
+                                       std::unique_ptr<mfem::ParMesh>,
+                                       MPI_Comm,
+                                       dg_sim::MeshBuildMetadata>);
 
 #include "test_utils.hpp"
 
@@ -327,6 +338,28 @@ int RunBCTests(TestContext& ctx)
     direct_output -= lowered_output;
     ctx.Check(direct_output.Normlinf() == 0.0,
               "Euler boundary plan lowering exactly reuses DG integrators");
+  }
+
+  // --- CaseContext has a single communicator authority: its owned mesh ---
+  {
+    mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
+      /*nx=*/1,
+      /*ny=*/1,
+      mfem::Element::QUADRILATERAL,
+      /*generate_edges=*/true,
+      /*sx=*/1.0,
+      /*sy=*/1.0);
+    auto parallel_mesh =
+      std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD, serial_mesh);
+    dg_sim::MeshBuildMetadata metadata;
+    dg_sim::CaseContext case_context(std::move(parallel_mesh),
+                                     std::move(metadata));
+    int communicator_relation = MPI_UNEQUAL;
+    MPI_Comm_compare(case_context.Comm(),
+                     case_context.Mesh().GetComm(),
+                     &communicator_relation);
+    ctx.Check(communicator_relation == MPI_IDENT,
+              "CaseContext communicator is the owned mesh communicator");
   }
 
   return ctx.failures;

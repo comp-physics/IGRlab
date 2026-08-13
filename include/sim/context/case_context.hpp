@@ -15,7 +15,7 @@
 namespace dg_sim
 {
 
-/// @brief Owns a resolved parallel mesh and the communicator used to build it.
+/// @brief Owns a resolved parallel mesh and exposes its communicator.
 ///
 /// This context deliberately owns no solver, field, time-loop, or numerical
 /// backend state.  A backend may layer its spaces over Mesh() after this
@@ -24,10 +24,8 @@ class CaseContext
 {
 public:
   CaseContext(std::unique_ptr<mfem::ParMesh> mesh,
-              MPI_Comm communicator,
               MeshBuildMetadata mesh_metadata)
     : mesh_(std::move(mesh)),
-      communicator_(communicator),
       mesh_metadata_(std::move(mesh_metadata))
   {
     MFEM_VERIFY(mesh_, "CaseContext requires a resolved parallel mesh.");
@@ -40,12 +38,11 @@ public:
 
   mfem::ParMesh& Mesh() { return *mesh_; }
   const mfem::ParMesh& Mesh() const { return *mesh_; }
-  MPI_Comm Comm() const { return communicator_; }
+  MPI_Comm Comm() const { return Mesh().GetComm(); }
   const MeshBuildMetadata& MeshMetadata() const { return mesh_metadata_; }
 
 private:
   std::unique_ptr<mfem::ParMesh> mesh_;
-  MPI_Comm communicator_ = MPI_COMM_NULL;
   MeshBuildMetadata mesh_metadata_;
 };
 
@@ -78,7 +75,7 @@ inline CaseContext BuildCaseContext(const MeshBuildRequest& request,
   RefineParMesh(*parallel_mesh, request.parallel_refinement_levels);
   metadata.local_elements_after_parallel_refinement = parallel_mesh->GetNE();
 
-  return CaseContext(std::move(parallel_mesh), communicator, std::move(metadata));
+  return CaseContext(std::move(parallel_mesh), std::move(metadata));
 }
 
 /// @brief Convenience overload for an already resolved sim-layer run config.
