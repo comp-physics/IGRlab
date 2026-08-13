@@ -85,6 +85,27 @@ target_include_directories(dg_igr_unit_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/include
 )
 
+add_executable(dg_igr_discretization_cli_boundary_test
+  test_discretization_cli_boundary.cpp
+)
+target_link_libraries(dg_igr_discretization_cli_boundary_test PRIVATE
+  igr_mfem
+  mfem
+)
+target_include_directories(dg_igr_discretization_cli_boundary_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+)
+add_test(NAME dg_igr_discretization_cli_hdg_rejected
+  COMMAND ${CMAKE_COMMAND}
+          -DTEST_EXE=$<TARGET_FILE:dg_igr_discretization_cli_boundary_test>
+          -DSENTINEL=${CMAKE_CURRENT_BINARY_DIR}/discretization-cli-boundary.sentinel
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/check_discretization_cli_hdg_rejected.cmake
+)
+set_tests_properties(dg_igr_discretization_cli_hdg_rejected PROPERTIES
+  LABELS "config;cli;discretization"
+  TIMEOUT 30
+)
+
 add_executable(dg_igr_zhang_shu_sequential_test
   test_zhang_shu_sequential.cpp
 )
