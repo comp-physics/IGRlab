@@ -12,6 +12,8 @@
 
 #include "numerics/hdg/runtime/run_contract.hpp"
 
+#include <mfem.hpp>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -130,6 +132,14 @@ struct CudaConfig
   int requested_device = 0;
   int expected_rank_count = 1;
   bool require_host_staged_rank2 = false;
+  // The generic CUDA topology path borrows these objects for the complete
+  // engine lifetime.  It never repartitions, periodicizes, or otherwise
+  // mutates the supplied ParMesh.  The legacy generated-topology path remains
+  // selected unless this flag is set so frozen application callers retain
+  // their existing configuration ABI.
+  bool use_borrowed_topology = false;
+  mfem::ParMesh* borrowed_mesh = nullptr;
+  MPI_Comm borrowed_communicator = MPI_COMM_NULL;
   bool capture_oracle = false;
   bool force_private_scientific_gate_failure = false;
   CudaInjection injection{};
@@ -398,6 +408,7 @@ struct CudaRunEvidence
   bool mfem_device_valid = false;
   bool hypre_cuda_umpire_device = false;
   bool signed_owner_ghost_semantics = false;
+  bool borrowed_topology = false;
   bool host_staged_rank2 = false;
   bool no_host_solver_fallback = false;
   bool pass = false;

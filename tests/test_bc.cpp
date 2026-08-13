@@ -1,6 +1,21 @@
 #include "physics/bc/boundary_state.hpp"
+#include "numerics/dg/DGHyperbolicConservationLaws.hpp"
+#include "numerics/riemann/rusanov.hpp"
+#include "sim/context/case_context.hpp"
+#include "sim/context/mesh_build.hpp"
+#include "sim/wiring/bc_wiring.hpp"
 
+#include <memory>
 #include <string>
+#include <type_traits>
+
+static_assert(std::is_constructible_v<dg_sim::CaseContext,
+                                      std::unique_ptr<mfem::ParMesh>,
+                                      dg_sim::MeshBuildMetadata>);
+static_assert(!std::is_constructible_v<dg_sim::CaseContext,
+                                       std::unique_ptr<mfem::ParMesh>,
+                                       MPI_Comm,
+                                       dg_sim::MeshBuildMetadata>);
 
 #include "test_utils.hpp"
 
@@ -188,6 +203,164 @@ int RunBCTests(TestContext& ctx)
                 1.0e-11,
                 "SlipWallState preserves tangential momentum");
   ctx.CheckNear(Uplus(3), energy, 1.0e-11, "SlipWallState preserves energy");
+
+  // --- Mesh requests retain CLI/default precedence and refinement metadata ---
+  {
+    dg_sim::RunConfig run_cfg;
+    run_cfg.case_config.case_dir = "cases/example";
+    run_cfg.case_config.default_mesh_file = "default.mesh";
+    run_cfg.opts.ser_ref_levels = 2;
+    run_cfg.opts.par_ref_levels = 3;
+    run_cfg.mesh_path = "cases/example/default.mesh";
+    const dg_sim::MeshBuildRequest default_request =
+      dg_sim::ResolveMeshBuildRequest(run_cfg);
+    ctx.Check(default_request.mesh_path == run_cfg.mesh_path,
+              "Mesh build request retains the resolved default mesh path");
+    ctx.Check(default_request.mesh_path_precedence ==
+                dg_sim::MeshPathPrecedence::CaseDefault,
+              "Mesh build request records default-mesh precedence");
+    ctx.Check(default_request.serial_refinement_levels == 2 &&
+                default_request.parallel_refinement_levels == 3,
+              "Mesh build request records serial then parallel refinement levels");
+
+    run_cfg.opts.mesh_file = "override.mesh";
+    run_cfg.mesh_path = "override.mesh";
+    const dg_sim::MeshBuildRequest override_request =
+      dg_sim::ResolveMeshBuildRequest(run_cfg);
+    ctx.Check(override_request.mesh_path == "override.mesh" &&
+                override_request.mesh_path_precedence ==
+                  dg_sim::MeshPathPrecedence::CommandLineOverride,
+              "Mesh build request gives a CLI mesh override precedence");
+  }
+
+  // --- Semantic plan lowering is identical to the established DG wiring ---
+  {
+    mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
+      /*nx=*/1,
+      /*ny=*/1,
+      mfem::Element::QUADRILATERAL,
+      /*generate_edges=*/true,
+      /*sx=*/1.0,
+      /*sy=*/1.0);
+    mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+    mfem::DG_FECollection fec(/*order=*/1, dim);
+    mfem::ParFiniteElementSpace vfes(&pmesh,
+                                     &fec,
+                                     /*vdim=*/dim + 2,
+                                     mfem::Ordering::byNODES);
+    mfem::EulerFlux flux(dim, gamma);
+    mfem::RusanovFluxWithSides numerical_flux(flux);
+    constexpr int int_order_offset = 1;
+    mfem::DGHyperbolicConservationLaws direct(
+      vfes,
+      std::make_unique<mfem::HyperbolicFormIntegrator>(numerical_flux,
+                                                        int_order_offset));
+    mfem::DGHyperbolicConservationLaws lowered(
+      vfes,
+      std::make_unique<mfem::HyperbolicFormIntegrator>(numerical_flux,
+                                                        int_order_offset));
+    mfem::Array<int> all_boundaries(pmesh.bdr_attributes.Max());
+    all_boundaries = 1;
+    const mfem::Vector reference_state = EulerConsFromPrim2D(
+      /*rho=*/1.1, /*u=*/0.3, /*v=*/-0.2, /*p=*/1.2, gamma);
+
+    dg_sim::AddSupersonicInlet(direct,
+                               numerical_flux,
+                               reference_state,
+                               int_order_offset,
+                               all_boundaries);
+    dg_sim::AddSupersonicOutlet(
+      direct, numerical_flux, int_order_offset, all_boundaries);
+    dg_sim::AddSubsonicInlet(direct,
+                             numerical_flux,
+                             reference_state,
+                             int_order_offset,
+                             dim,
+                             gamma,
+                             all_boundaries);
+    dg_sim::AddSubsonicOutletPressure(direct,
+                                      numerical_flux,
+                                      1.2,
+                                      int_order_offset,
+                                      dim,
+                                      gamma,
+                                      all_boundaries);
+    dg_sim::AddFarField(direct,
+                        numerical_flux,
+                        reference_state,
+                        int_order_offset,
+                        dim,
+                        gamma,
+                        all_boundaries);
+    dg_sim::AddSlipWall(
+      direct, numerical_flux, int_order_offset, dim, all_boundaries);
+    dg_sim::AddNonReflectingOutlet(direct,
+                                   numerical_flux,
+                                   reference_state,
+                                   int_order_offset,
+                                   dim,
+                                   gamma,
+                                   all_boundaries);
+
+    dg_sim::EulerBoundaryPlan plan;
+    plan.AddPeriodic(all_boundaries);
+    plan.AddSupersonicInlet(all_boundaries,
+                            [reference_state]() { return reference_state; });
+    plan.AddSupersonicOutlet(all_boundaries);
+    plan.AddSubsonicInlet(all_boundaries,
+                          [reference_state]() { return reference_state; });
+    plan.AddSubsonicOutletPressure(all_boundaries, []() { return 1.2; });
+    plan.AddFarField(all_boundaries,
+                     [reference_state]() { return reference_state; });
+    plan.AddSlipWall(all_boundaries);
+    plan.AddNonReflectingOutlet(all_boundaries,
+                                [reference_state]() { return reference_state; });
+    dg_sim::LowerDGEulerBoundaryPlan(lowered,
+                                     numerical_flux,
+                                     int_order_offset,
+                                     dim,
+                                     gamma,
+                                     plan);
+
+    mfem::ParGridFunction state(&vfes);
+    FillConstantState(EulerConsFromPrim2D(/*rho=*/1.0,
+                                          /*u=*/0.1,
+                                          /*v=*/0.0,
+                                          /*p=*/1.0,
+                                          gamma),
+                      state);
+    mfem::Vector input;
+    state.GetTrueDofs(input);
+    mfem::Vector direct_output(vfes.GetTrueVSize());
+    mfem::Vector lowered_output(vfes.GetTrueVSize());
+    direct.Mult(input, direct_output);
+    lowered.Mult(input, lowered_output);
+    direct_output -= lowered_output;
+    ctx.Check(direct_output.Normlinf() == 0.0,
+              "Euler boundary plan lowering exactly reuses DG integrators");
+  }
+
+  // --- CaseContext has a single communicator authority: its owned mesh ---
+  {
+    mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
+      /*nx=*/1,
+      /*ny=*/1,
+      mfem::Element::QUADRILATERAL,
+      /*generate_edges=*/true,
+      /*sx=*/1.0,
+      /*sy=*/1.0);
+    auto parallel_mesh =
+      std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD, serial_mesh);
+    dg_sim::MeshBuildMetadata metadata;
+    dg_sim::CaseContext case_context(std::move(parallel_mesh),
+                                     std::move(metadata));
+    int communicator_relation = MPI_UNEQUAL;
+    MPI_Comm_compare(case_context.Comm(),
+                     case_context.Mesh().GetComm(),
+                     &communicator_relation);
+    ctx.Check(communicator_relation == MPI_IDENT,
+              "CaseContext communicator is the owned mesh communicator");
+  }
 
   return ctx.failures;
 }

@@ -12,6 +12,7 @@
 #include "mfem.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
+#include "sim/wiring/euler_boundary_plan.hpp"
 #include "utils/mesh/boundary_markers.hpp"
 
 namespace dg_sim
@@ -198,6 +199,93 @@ inline void AddSlipWall(mfem::DGHyperbolicConservationLaws& op,
                             std::make_unique<mfem::SlipWallState>(dim),
                             int_order_offset),
                           marker);
+}
+
+/// @brief Lower a semantic plan to the existing Euler DG boundary integrators.
+///
+/// HDG lowering is intentionally not provided by this foundation.
+inline void LowerDGEulerBoundaryPlan(
+  mfem::DGHyperbolicConservationLaws& op,
+  const mfem::NumericalFlux& numerical_flux,
+  int int_order_offset,
+  int dim,
+  double gamma,
+  const EulerBoundaryPlan& plan)
+{
+  for (const EulerBoundaryPlanEntry& entry : plan.Entries())
+  {
+    switch (entry.kind)
+    {
+    case EulerBoundaryKind::Periodic:
+      // A periodic mesh has no physical boundary integrator to attach.
+      break;
+    case EulerBoundaryKind::Inlet:
+      MFEM_VERIFY(entry.state, "Euler inlet plan entry requires a state callback.");
+      if (entry.inlet_model == EulerInletModel::Supersonic)
+      {
+        AddSupersonicInlet(op,
+                           numerical_flux,
+                           entry.state(),
+                           int_order_offset,
+                           entry.marker);
+      }
+      else
+      {
+        AddSubsonicInlet(op,
+                         numerical_flux,
+                         entry.state(),
+                         int_order_offset,
+                         dim,
+                         gamma,
+                         entry.marker);
+      }
+      break;
+    case EulerBoundaryKind::Outlet:
+      switch (entry.outlet_model)
+      {
+      case EulerOutletModel::Supersonic:
+        AddSupersonicOutlet(op, numerical_flux, int_order_offset, entry.marker);
+        break;
+      case EulerOutletModel::SubsonicPressure:
+        MFEM_VERIFY(entry.pressure,
+                    "Subsonic outlet plan entry requires a pressure callback.");
+        AddSubsonicOutletPressure(op,
+                                  numerical_flux,
+                                  entry.pressure(),
+                                  int_order_offset,
+                                  dim,
+                                  gamma,
+                                  entry.marker);
+        break;
+      case EulerOutletModel::FarField:
+        MFEM_VERIFY(entry.state,
+                    "Far-field outlet plan entry requires a state callback.");
+        AddFarField(op,
+                    numerical_flux,
+                    entry.state(),
+                    int_order_offset,
+                    dim,
+                    gamma,
+                    entry.marker);
+        break;
+      }
+      break;
+    case EulerBoundaryKind::Slip:
+      AddSlipWall(op, numerical_flux, int_order_offset, dim, entry.marker);
+      break;
+    case EulerBoundaryKind::NonReflecting:
+      MFEM_VERIFY(entry.state,
+                  "Non-reflecting plan entry requires a state callback.");
+      AddNonReflectingOutlet(op,
+                             numerical_flux,
+                             entry.state(),
+                             int_order_offset,
+                             dim,
+                             gamma,
+                             entry.marker);
+      break;
+    }
+  }
 }
 
 /// @brief Convenience wrapper for adding Euler boundary integrators.

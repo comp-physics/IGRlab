@@ -1,5 +1,7 @@
 #pragma once
 
+#include "numerics/hdg/generic/contract.hpp"
+
 /**
  * @file numerics/hdg/runtime/cpu/persistent_smooth_euler.hpp
  * @brief Bounded smoke and functional conventional Euler HDG CPU adapter.
@@ -663,6 +665,10 @@ void ArmCpuCollectiveTestFault(
 void ResetCpuCollectiveTestFault() noexcept;
 CpuCollectiveTestConsumptionEvidence ObserveCpuCollectiveTestFault() noexcept;
 
+/** Test-only assertion of the borrowed physical-boundary Picard row. */
+void ResetCpuGenericBoundaryPicardTestObservation() noexcept;
+bool CpuGenericBoundaryPicardAssemblyObservedForTests() noexcept;
+
 struct CpuCollectiveTestAccess
 {
   template <typename Selection>
@@ -698,6 +704,12 @@ public:
   bool Initialize(const CpuPersistentConfig&,
                   const RuntimeTupleDescriptor&,
                   CpuInitialization&) noexcept;
+  /**
+   * One borrowed-input invocation through this core's existing Euler HDG
+   * assembly, condensation, trace solve, and recovery phases.  The mesh is
+   * observed only: ownership remains with the request's caller.
+   */
+  bool RunBorrowedEuler(const generic::EulerHdgRequest&) noexcept;
   bool AdmitInitialization(bool facade_empty,
                            const CpuPersistentConfig&,
                            const RuntimeTupleDescriptor&) const noexcept;
@@ -738,6 +750,10 @@ public:
                                 std::size_t&) const noexcept;
 
 private:
+  bool InitializeInternal(const CpuPersistentConfig&,
+                          const RuntimeTupleDescriptor&,
+                          const generic::EulerHdgRequest*,
+                          CpuInitialization&) noexcept;
   struct Implementation;
   std::unique_ptr<Implementation> implementation_;
   std::uint64_t incarnation_ = 0;

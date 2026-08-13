@@ -12,6 +12,33 @@ namespace mfem
 {
 
 /**
+ * @brief Physical exterior-state mappings shared by DG and HDG boundary code.
+ *
+ * The mapping is deliberately independent of a face integrator.  It consumes
+ * an interior conservative state and a scaled outward normal and produces the
+ * exterior conservative state used by a numerical flux.
+ */
+enum class EulerExteriorStateKind
+{
+  SupersonicInlet,
+  SubsonicInlet,
+  SupersonicOutlet,
+  SubsonicOutletPressure,
+  FarField,
+  NonReflectingOutlet,
+  SlipWall
+};
+
+void EvaluateEulerExteriorState(EulerExteriorStateKind kind,
+                                const mfem::Vector& Uminus,
+                                const mfem::Vector& nor,
+                                int dim,
+                                double gamma,
+                                const mfem::Vector* reference_state,
+                                double pressure_out,
+                                mfem::Vector& Uplus);
+
+/**
  * @brief Abstract boundary “ghost state” policy for DG hyperbolic problems.
  *
  * Given the interior (minus) conservative state at a boundary face, a

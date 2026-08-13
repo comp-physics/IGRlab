@@ -29,6 +29,69 @@ set_target_properties(dg_igr_hdg_runtime_cuda_w8a_leaf
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+add_executable(dg_igr_hdg_runtime_cuda_generic_external_topology
+  test_generic_external_topology.cu)
+target_include_directories(dg_igr_hdg_runtime_cuda_generic_external_topology
+  PRIVATE
+    "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_hdg_runtime_cuda_generic_external_topology
+  PRIVATE
+    dg_igr_hdg_runtime_cuda
+    mfem
+    MPI::MPI_CXX)
+target_compile_options(dg_igr_hdg_runtime_cuda_generic_external_topology
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(dg_igr_hdg_runtime_cuda_generic_external_topology
+  PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF
+    CUDA_ARCHITECTURES 120
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_generic_external_topology_rank1
+  COMMAND dg_igr_hdg_runtime_cuda_generic_external_topology)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_generic_external_topology_rank2
+  COMMAND
+    "${MPIEXEC_EXECUTABLE}"
+    "${MPIEXEC_NUMPROC_FLAG}" 2
+    ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_external_topology>
+    ${MPIEXEC_POSTFLAGS})
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_generic_external_topology_negatives_rank1
+  COMMAND dg_igr_hdg_runtime_cuda_generic_external_topology --negatives)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_generic_external_topology_negatives_rank2
+  COMMAND
+    "${MPIEXEC_EXECUTABLE}"
+    "${MPIEXEC_NUMPROC_FLAG}" 2
+    ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_external_topology>
+    --negatives
+    ${MPIEXEC_POSTFLAGS})
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_generic_external_topology_rank1
+  dg_igr_hdg_runtime_cuda_generic_external_topology_negatives_rank1
+  PROPERTIES
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 1800)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_generic_external_topology_rank2
+  dg_igr_hdg_runtime_cuda_generic_external_topology_negatives_rank2
+  PROPERTIES
+    PROCESSORS 2
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 1800)
+
 get_target_property(_dg_igr_hdg_cuda_leaf_resolve
   dg_igr_hdg_runtime_cuda_w8a_leaf CUDA_RESOLVE_DEVICE_SYMBOLS)
 if(NOT _dg_igr_hdg_cuda_leaf_resolve STREQUAL "ON")

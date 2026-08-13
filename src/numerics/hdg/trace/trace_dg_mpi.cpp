@@ -217,11 +217,18 @@ bool BuildDGInterfaceDofMap(const mfem::ParFiniteElementSpace& space,
 bool DGInterfaceTraceMap::IsConsistent() const noexcept
 {
   if (!dofs.IsConsistent() || vector_dimension <= 0 ||
-      ordering != mfem::Ordering::byNODES || faces.empty() ||
-      dofs.entries.empty() ||
+      ordering != mfem::Ordering::byNODES ||
       dofs.entries.size() % static_cast<std::size_t>(vector_dimension) != 0)
   {
     return false;
+  }
+  // A globally nonempty ParMesh may assign no cells (and therefore no trace
+  // faces or true dofs) to this local rank.  Such a map is deliberately empty
+  // but remains a valid participant in the plan's later collective exchange.
+  if (dofs.entries.empty() || faces.empty())
+  {
+    return dofs.entries.empty() && faces.empty() &&
+        dofs.local_true_dof_count == 0;
   }
   const std::size_t scalar_local_dofs =
       dofs.entries.size() / static_cast<std::size_t>(vector_dimension);
@@ -287,12 +294,16 @@ bool BuildDGInterfaceTraceMap(const mfem::ParFiniteElementSpace& space,
     const mfem::FiniteElementCollection* const collection = space.FEColl();
     if (mesh == nullptr || collection == nullptr || !space.Conforming() ||
         mesh->Dimension() != 2 || mesh->SpaceDimension() != 2 ||
-        space.GetVSize() <= 0 || space.GetTrueVSize() < 0 ||
+        space.GetVSize() < 0 || space.GetTrueVSize() < 0 ||
         space.GetNRanks() <= 0 || space.GetMyRank() < 0 ||
         space.GetMyRank() >= space.GetNRanks() || space.GetVDim() <= 0 ||
         space.GetOrdering() != mfem::Ordering::byNODES ||
         typeid(*collection) != typeid(mfem::DG_Interface_FECollection) ||
-        mesh->GetNumFaces() <= 0)
+        mesh->GetNumFaces() < 0 ||
+        (space.GetVSize() == 0 &&
+         (space.GetTrueVSize() != 0 || mesh->GetNE() != 0 ||
+          mesh->GetNumFaces() != 0)) ||
+        (space.GetVSize() != 0 && mesh->GetNumFaces() == 0))
     {
       return false;
     }
@@ -485,7 +496,8 @@ bool DGInterfaceTraceExchangePlan::Distribute(
       if (local_values.Size() == storage_->local_size)
       {
         output = local_values.HostRead();
-        local_valid = output != nullptr && local_valid;
+        local_valid =
+            (output != nullptr || local_values.Size() == 0) && local_valid;
       }
       local_valid = !HasStorageOverlap(
           input, owned_true_values.Size(), output, local_values.Size()) &&
