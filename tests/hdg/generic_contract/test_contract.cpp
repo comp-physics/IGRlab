@@ -4,6 +4,7 @@
 
 #include <array>
 #include <type_traits>
+#include <vector>
 
 namespace
 {
@@ -44,11 +45,13 @@ mfem::ParMesh MakeSquareMesh()
   return mfem::ParMesh(MPI_COMM_SELF, serial);
 }
 
-mfem::ParMesh MakeOneElementParallelMesh(const mfem::Element::Type type)
+mfem::ParMesh MakeRankZeroOwnedParallelMesh(const mfem::Element::Type type)
 {
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
       1, 1, type, true, 1.0, 1.0);
-  std::array<int, 1> partition{{0}};
+  // MFEM requires one partition owner per serial element; the 1x1 triangle
+  // fixture contains two triangles even though the quadrilateral fixture has one.
+  std::vector<int> partition(static_cast<std::size_t>(serial.GetNE()));
   return mfem::ParMesh(MPI_COMM_WORLD, serial, partition.data());
 }
 
@@ -154,7 +157,7 @@ bool CheckZeroOwnedElementAdmission()
     return true;
   }
   mfem::ParMesh mesh =
-      MakeOneElementParallelMesh(mfem::Element::QUADRILATERAL);
+      MakeRankZeroOwnedParallelMesh(mfem::Element::QUADRILATERAL);
   const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
   const EulerHdgRequest request = ValidRequest(mesh, initial);
   const ContractStatus status = ValidateEulerHdgRequest(request);
@@ -182,7 +185,7 @@ bool CheckCollectiveFailureConvergence()
   int rank = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   mfem::ParMesh mesh =
-      MakeOneElementParallelMesh(mfem::Element::QUADRILATERAL);
+      MakeRankZeroOwnedParallelMesh(mfem::Element::QUADRILATERAL);
   const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
   EulerHdgRequest request = ValidRequest(mesh, initial);
   request.polynomial_order = rank == 0 ? 4 : 2;
@@ -202,7 +205,8 @@ bool CheckCollectiveFailureConvergence()
 
 bool CheckCollectiveGeometryConvergence()
 {
-  mfem::ParMesh mesh = MakeOneElementParallelMesh(mfem::Element::TRIANGLE);
+  mfem::ParMesh mesh =
+      MakeRankZeroOwnedParallelMesh(mfem::Element::TRIANGLE);
   const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
   const int local_status =
       static_cast<int>(ValidateEulerHdgRequest(ValidRequest(mesh, initial)));
