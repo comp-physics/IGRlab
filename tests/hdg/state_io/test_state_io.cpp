@@ -32,6 +32,10 @@ bool TestAssociationAndFourComponents()
 
   mfem::ParFiniteElementSpace scalar_space(&mesh, &collection);
   mfem::ParGridFunction scalar_state(&scalar_space);
+  mfem::ParFiniteElementSpace by_vdim_space(
+      &mesh, &collection, dg_sim::hdg::hdg_euler_2d_components,
+      mfem::Ordering::byVDIM);
+  mfem::ParGridFunction by_vdim_state(&by_vdim_space);
 
   mfem::Mesh other_serial_mesh = mfem::Mesh::MakeCartesian2D(
       1, 1, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
@@ -40,6 +44,8 @@ bool TestAssociationAndFourComponents()
   return dg_sim::hdg::IsHdgVolumeStateAssociation(
              mesh, volume_space, state) &&
       !dg_sim::hdg::IsHdgVolumeStateAssociation(mesh, scalar_space, scalar_state) &&
+      !dg_sim::hdg::IsHdgVolumeStateAssociation(
+          mesh, by_vdim_space, by_vdim_state) &&
       !dg_sim::hdg::IsHdgVolumeStateAssociation(other_mesh, volume_space, state);
 }
 
@@ -68,13 +74,16 @@ bool TestProjectionAndGenericImport()
   const dg::hdg::generic::EulerFieldView imported =
       state_io.ImportPublishedInitialState();
   bool finite = coordinates != nullptr && scalar_count > 0;
-  bool projected_values = scalar_count % values.Size() == 0;
+  const std::size_t scalar_dofs_per_component =
+      scalar_count / static_cast<std::size_t>(values.Size());
+  bool projected_values = scalar_dofs_per_component > 0 &&
+      scalar_count % values.Size() == 0;
   for (std::size_t coordinate = 0; coordinate < scalar_count; ++coordinate)
   {
     finite = finite && std::isfinite(coordinates[coordinate]);
     projected_values = projected_values &&
         coordinates[coordinate] ==
-        values(static_cast<int>(coordinate % static_cast<std::size_t>(values.Size())));
+        values(static_cast<int>(coordinate / scalar_dofs_per_component));
   }
 
   return finite && projected_values &&

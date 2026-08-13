@@ -32,10 +32,11 @@ inline constexpr int hdg_euler_2d_components =
     dg::hdg::generic::euler_2d_conserved_components;
 
 /**
- * Return whether @p state is exactly the four-component volume field on
- * @p space and @p mesh admitted by this seam.  This predicate is public so
+ * Return whether @p state is exactly the four-component, byNODES volume field
+ * on @p space and @p mesh admitted by this seam.  This predicate is public so
  * callers and source-level tests can check an association before constructing
- * the fail-closed adapter.
+ * the fail-closed adapter.  byNODES is required because the imported raw view
+ * is consumed as component-major coordinates.
  */
 inline bool IsHdgVolumeStateAssociation(
     const mfem::ParMesh& mesh,
@@ -44,6 +45,7 @@ inline bool IsHdgVolumeStateAssociation(
 {
   return mesh.Dimension() == 2 && space.GetParMesh() == &mesh &&
       space.GetVDim() == hdg_euler_2d_components &&
+      space.GetOrdering() == mfem::Ordering::byNODES &&
       state.ParFESpace() == &space;
 }
 
@@ -130,6 +132,7 @@ private:
 
   mfem::ParFiniteElementSpace& volume_space_;
   mfem::ParGridFunction& published_state_;
+  // Narrow one-call projection/publication guards, not solver lifecycle state.
   bool projection_attempted_ = false;
   bool published_ = false;
 };
