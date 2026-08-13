@@ -1,8 +1,10 @@
-cmake_minimum_required(VERSION 3.20)
-project(dg_igr_hdg_paraview_output_tests LANGUAGES CXX)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  cmake_minimum_required(VERSION 3.20)
+  project(dg_igr_hdg_paraview_output_tests LANGUAGES CXX)
 
-find_package(MFEM 4.9 CONFIG REQUIRED)
-find_package(MPI REQUIRED COMPONENTS CXX)
+  find_package(MFEM 4.9 CONFIG REQUIRED)
+  find_package(MPI REQUIRED COMPONENTS CXX)
+endif()
 
 get_filename_component(DG_IGR_REPOSITORY_ROOT
   "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)

@@ -182,6 +182,14 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT AND
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/auxiliary/CMakeLists.txt")
   add_subdirectory(auxiliary)
 endif()
+if(MFEM_USE_MPI AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generic_contract/CMakeLists.txt")
+  add_subdirectory(generic_contract)
+endif()
+if(MFEM_USE_MPI AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/paraview_output/CMakeLists.txt")
+  add_subdirectory(paraview_output)
+endif()
 
 # CPU core, trace, device, and formulation tests remain independently
 # registerable even when the accelerator-only oracle below is unavailable.

@@ -1001,5 +1001,11 @@ add_example_regression(dg_igr_regression_sedov
 #   REG_TF 1.0e-6 REG_DT 1.0e-6
 #   -no-vtk -dt_save 1.0)
 
+if(MFEM_USE_MPI AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/context/CMakeLists.txt")
+  add_subdirectory(context)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/time_backend/CMakeLists.txt")
+  add_subdirectory(time_backend)
+endif()
 add_subdirectory(hdg)
 add_subdirectory(regularization)
