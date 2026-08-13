@@ -12,6 +12,7 @@
 #include "mfem.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
+#include "sim/wiring/euler_boundary_plan.hpp"
 #include "utils/mesh/boundary_markers.hpp"
 
 namespace dg_sim
@@ -200,6 +201,93 @@ inline void AddSlipWall(mfem::DGHyperbolicConservationLaws& op,
                           marker);
 }
 
+/// @brief Lower a semantic plan to the existing Euler DG boundary integrators.
+///
+/// HDG lowering is intentionally not provided by this foundation.
+inline void LowerDGEulerBoundaryPlan(
+  mfem::DGHyperbolicConservationLaws& op,
+  const mfem::NumericalFlux& numerical_flux,
+  int int_order_offset,
+  int dim,
+  double gamma,
+  const EulerBoundaryPlan& plan)
+{
+  for (const EulerBoundaryPlanEntry& entry : plan.Entries())
+  {
+    switch (entry.kind)
+    {
+    case EulerBoundaryKind::Periodic:
+      // A periodic mesh has no physical boundary integrator to attach.
+      break;
+    case EulerBoundaryKind::Inlet:
+      MFEM_VERIFY(entry.state, "Euler inlet plan entry requires a state callback.");
+      if (entry.inlet_model == EulerInletModel::Supersonic)
+      {
+        AddSupersonicInlet(op,
+                           numerical_flux,
+                           entry.state(),
+                           int_order_offset,
+                           entry.marker);
+      }
+      else
+      {
+        AddSubsonicInlet(op,
+                         numerical_flux,
+                         entry.state(),
+                         int_order_offset,
+                         dim,
+                         gamma,
+                         entry.marker);
+      }
+      break;
+    case EulerBoundaryKind::Outlet:
+      switch (entry.outlet_model)
+      {
+      case EulerOutletModel::Supersonic:
+        AddSupersonicOutlet(op, numerical_flux, int_order_offset, entry.marker);
+        break;
+      case EulerOutletModel::SubsonicPressure:
+        MFEM_VERIFY(entry.pressure,
+                    "Subsonic outlet plan entry requires a pressure callback.");
+        AddSubsonicOutletPressure(op,
+                                  numerical_flux,
+                                  entry.pressure(),
+                                  int_order_offset,
+                                  dim,
+                                  gamma,
+                                  entry.marker);
+        break;
+      case EulerOutletModel::FarField:
+        MFEM_VERIFY(entry.state,
+                    "Far-field outlet plan entry requires a state callback.");
+        AddFarField(op,
+                    numerical_flux,
+                    entry.state(),
+                    int_order_offset,
+                    dim,
+                    gamma,
+                    entry.marker);
+        break;
+      }
+      break;
+    case EulerBoundaryKind::Slip:
+      AddSlipWall(op, numerical_flux, int_order_offset, dim, entry.marker);
+      break;
+    case EulerBoundaryKind::NonReflecting:
+      MFEM_VERIFY(entry.state,
+                  "Non-reflecting plan entry requires a state callback.");
+      AddNonReflectingOutlet(op,
+                             numerical_flux,
+                             entry.state(),
+                             int_order_offset,
+                             dim,
+                             gamma,
+                             entry.marker);
+      break;
+    }
+  }
+}
+
 /// @brief Convenience wrapper for adding Euler boundary integrators.
 template <typename NumericalFlux> class EulerBoundaryWiring
 {
@@ -220,83 +308,72 @@ public:
   void AddSlipWall(const BoundaryMarkerMap& markers,
                    BoundaryRole role = BoundaryRole::Slip) const
   {
-    dg_sim::AddSlipWall(op_,
-                        numerical_flux_,
-                        int_order_offset_,
-                        dim_,
-                        markers.At(role));
+    EulerBoundaryPlan plan;
+    plan.AddSlipWall(markers.At(role));
+    LowerDGEulerBoundaryPlan(
+      op_, numerical_flux_, int_order_offset_, dim_, gamma_, plan);
   }
 
   void AddSupersonicOutlet(const BoundaryMarkerMap& markers,
                            BoundaryRole role = BoundaryRole::Outlet) const
   {
-    dg_sim::AddSupersonicOutlet(op_,
-                                numerical_flux_,
-                                int_order_offset_,
-                                markers.At(role));
+    EulerBoundaryPlan plan;
+    plan.AddSupersonicOutlet(markers.At(role));
+    LowerDGEulerBoundaryPlan(
+      op_, numerical_flux_, int_order_offset_, dim_, gamma_, plan);
   }
 
   void AddSupersonicInlet(const BoundaryMarkerMap& markers,
                           const mfem::Vector& inlet_state,
                           BoundaryRole role = BoundaryRole::Inlet) const
   {
-    dg_sim::AddSupersonicInlet(op_,
-                               numerical_flux_,
-                               inlet_state,
-                               int_order_offset_,
-                               markers.At(role));
+    EulerBoundaryPlan plan;
+    plan.AddSupersonicInlet(markers.At(role), [inlet_state]() { return inlet_state; });
+    LowerDGEulerBoundaryPlan(
+      op_, numerical_flux_, int_order_offset_, dim_, gamma_, plan);
   }
 
   void AddSubsonicInlet(const BoundaryMarkerMap& markers,
                         const mfem::Vector& inlet_state,
                         BoundaryRole role = BoundaryRole::Inlet) const
   {
-    dg_sim::AddSubsonicInlet(op_,
-                             numerical_flux_,
-                             inlet_state,
-                             int_order_offset_,
-                             dim_,
-                             gamma_,
-                             markers.At(role));
+    EulerBoundaryPlan plan;
+    plan.AddSubsonicInlet(markers.At(role), [inlet_state]() { return inlet_state; });
+    LowerDGEulerBoundaryPlan(
+      op_, numerical_flux_, int_order_offset_, dim_, gamma_, plan);
   }
 
   void AddSubsonicOutletPressure(const BoundaryMarkerMap& markers,
                                  double pressure_out,
                                  BoundaryRole role = BoundaryRole::Outlet) const
   {
-    dg_sim::AddSubsonicOutletPressure(op_,
-                                      numerical_flux_,
-                                      pressure_out,
-                                      int_order_offset_,
-                                      dim_,
-                                      gamma_,
-                                      markers.At(role));
+    EulerBoundaryPlan plan;
+    plan.AddSubsonicOutletPressure(
+      markers.At(role), [pressure_out]() { return pressure_out; });
+    LowerDGEulerBoundaryPlan(
+      op_, numerical_flux_, int_order_offset_, dim_, gamma_, plan);
   }
 
   void AddNonReflectingOutlet(const BoundaryMarkerMap& markers,
                               const mfem::Vector& reference_state,
                               BoundaryRole role = BoundaryRole::Outlet) const
   {
-    dg_sim::AddNonReflectingOutlet(op_,
-                                   numerical_flux_,
-                                   reference_state,
-                                   int_order_offset_,
-                                   dim_,
-                                   gamma_,
-                                   markers.At(role));
+    EulerBoundaryPlan plan;
+    plan.AddNonReflectingOutlet(markers.At(role),
+                                 [reference_state]() { return reference_state; });
+    LowerDGEulerBoundaryPlan(
+      op_, numerical_flux_, int_order_offset_, dim_, gamma_, plan);
   }
 
   void AddFarField(const BoundaryMarkerMap& markers,
                    const mfem::Vector& farfield_state,
                    BoundaryRole role = BoundaryRole::Outlet) const
   {
-    dg_sim::AddFarField(op_,
-                        numerical_flux_,
-                        farfield_state,
-                        int_order_offset_,
-                        dim_,
-                        gamma_,
-                        markers.At(role));
+    EulerBoundaryPlan plan;
+    plan.AddFarField(markers.At(role),
+                     [farfield_state]() { return farfield_state; });
+    LowerDGEulerBoundaryPlan(
+      op_, numerical_flux_, int_order_offset_, dim_, gamma_, plan);
   }
 
   template <typename StateBuilder>
@@ -305,12 +382,11 @@ public:
                                 StateBuilder&& build_inlet_state,
                                 BoundaryRole role = BoundaryRole::Inlet) const
   {
-    dg_sim::AddSupersonicInletFromBuilder(
-      op_,
-      numerical_flux_,
-      std::forward<StateBuilder>(build_inlet_state),
-      int_order_offset_,
-      markers.At(role));
+    EulerBoundaryPlan plan;
+    plan.AddSupersonicInlet(markers.At(role),
+                             std::forward<StateBuilder>(build_inlet_state));
+    LowerDGEulerBoundaryPlan(
+      op_, numerical_flux_, int_order_offset_, dim_, gamma_, plan);
   }
 
 private:
