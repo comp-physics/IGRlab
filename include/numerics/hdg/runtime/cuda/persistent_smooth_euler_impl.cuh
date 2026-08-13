@@ -1485,6 +1485,89 @@ public:
   }
 
 private:
+  static bool ExactTopologyShapeFitsCapacity(
+      const CudaConfig& config, const mfem::ParMesh& mesh,
+      const mfem::ParFiniteElementSpace& interior,
+      const mfem::ParFiniteElementSpace& trace,
+      const dg::hdg::trace::DGInterfaceTraceExchangePlan& exchange) noexcept
+  {
+    const int elements = mesh.GetNE();
+    if (elements <= 0 || elements > maximum_rank_elements ||
+        !exchange.IsConsistent() || exchange.space != &trace ||
+        exchange.map.dofs.entries.size() !=
+            static_cast<std::size_t>(trace.GetVSize()) ||
+        exchange.map.GhostCount() >
+            static_cast<std::size_t>(maximum_local_trace_dofs) ||
+        interior.GetOrdering() != mfem::Ordering::byNODES ||
+        trace.GetOrdering() != mfem::Ordering::byNODES)
+      return false;
+
+    const mfem::FiniteElement* fe = interior.GetFE(0);
+    mfem::Array<int> faces, orientations;
+    mesh.GetElementEdges(0, faces, orientations);
+    const mfem::FiniteElement* face_fe = faces.Size() == faces_per_element
+        ? trace.GetFaceElement(faces[0]) : nullptr;
+    if (fe == nullptr || face_fe == nullptr) { return false; }
+
+    const int scalar_interior_dofs = fe->GetDof();
+    const int scalar_face_dofs = face_fe->GetDof();
+    const int interior_dofs =
+        conserved_components * scalar_interior_dofs;
+    const int trace_dofs =
+        faces_per_element * conserved_components * scalar_face_dofs;
+    const int assembly_order = config.order == functional_polynomial_order
+        ? functional_assembly_quadrature_order : assembly_quadrature_order;
+    const int volume_points = mfem::IntRules.Get(
+        fe->GetGeomType(), assembly_order).GetNPoints();
+    const int face_points = mfem::IntRules.Get(
+        face_fe->GetGeomType(), assembly_order).GetNPoints();
+    return trace.GetVSize() > 0 &&
+        trace.GetVSize() <= maximum_local_trace_dofs &&
+        trace.GetTrueVSize() > 0 &&
+        trace.GetTrueVSize() <= maximum_true_trace_dofs &&
+        exchange.map.dofs.global_true_dof_count > 0 &&
+        exchange.map.dofs.global_true_dof_count <=
+            static_cast<std::uint64_t>(maximum_true_trace_dofs) &&
+        scalar_interior_dofs > 0 &&
+        scalar_interior_dofs <= maximum_scalar_dofs_per_element &&
+        scalar_face_dofs > 0 &&
+        scalar_face_dofs <= maximum_scalar_dofs_per_face &&
+        interior_dofs <= maximum_interior_dofs_per_element &&
+        trace_dofs <= maximum_trace_dofs_per_element &&
+        volume_points <= maximum_volume_points &&
+        face_points <= maximum_face_points;
+  }
+
+  bool ValidateBorrowedTopologyCapacity(const CudaConfig& config) const
+      noexcept
+  {
+    bool local_valid = false;
+    try
+    {
+      mfem::L2_FECollection interior_collection(
+          config.order, dimension, mfem::BasisType::GaussLegendre,
+          mfem::FiniteElement::VALUE);
+      mfem::DG_Interface_FECollection trace_collection(
+          config.order, dimension, mfem::FiniteElement::VALUE,
+          mfem::BasisType::GaussLegendre);
+      mfem::ParFiniteElementSpace interior_space(
+          config.borrowed_mesh, &interior_collection, conserved_components,
+          mfem::Ordering::byNODES);
+      mfem::ParFiniteElementSpace trace_space(
+          config.borrowed_mesh, &trace_collection, conserved_components,
+          mfem::Ordering::byNODES);
+      interior_space.ExchangeFaceNbrData();
+      trace_space.ExchangeFaceNbrData();
+      dg::hdg::trace::DGInterfaceTraceExchangePlan exchange;
+      local_valid = dg::hdg::trace::BuildDGInterfaceTraceExchangePlan(
+          trace_space, exchange) && ExactTopologyShapeFitsCapacity(
+          config, *config.borrowed_mesh, interior_space, trace_space,
+          exchange);
+    }
+    catch (...) { local_valid = false; }
+    return CollectiveContinue(local_valid);
+  }
+
   bool ValidateTopologyBeforeDevice(const CudaConfig& config) const noexcept
   {
     const bool supported_rank = config.expected_rank_count == 1 ||
@@ -1542,7 +1625,8 @@ private:
         &local_element_count, &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM,
         MPI_COMM_WORLD) == MPI_SUCCESS;
     return census_ready && global_elements ==
-        static_cast<long long>(config.mesh_n) * config.mesh_n;
+            static_cast<long long>(config.mesh_n) * config.mesh_n &&
+        ValidateBorrowedTopologyCapacity(config);
   }
 
   bool ConfigureDeviceAndRanks(const CudaConfig& config,
@@ -1761,19 +1845,8 @@ private:
     shape_.assembly_order = config.order == functional_polynomial_order
         ? functional_assembly_quadrature_order : assembly_quadrature_order;
     shape_.interior_count = shape_.elements * shape_.interior_dofs;
-    if (shape_.elements <= 0 || shape_.elements > maximum_rank_elements ||
-        shape_.local_trace_count <= 0 ||
-        shape_.local_trace_count > maximum_local_trace_dofs ||
-        shape_.true_trace_count <= 0 ||
-        shape_.true_trace_count > maximum_true_trace_dofs || fe == nullptr ||
-        face_fe == nullptr || shape_.scalar_interior_dofs <= 0 ||
-        shape_.scalar_interior_dofs > maximum_scalar_dofs_per_element ||
-        shape_.scalar_face_dofs <= 0 ||
-        shape_.scalar_face_dofs > maximum_scalar_dofs_per_face ||
-        shape_.interior_dofs > maximum_interior_dofs_per_element ||
-        shape_.trace_dofs > maximum_trace_dofs_per_element ||
-        interior_space_->GetOrdering() != mfem::Ordering::byNODES ||
-        trace_space_->GetOrdering() != mfem::Ordering::byNODES)
+    if (!ExactTopologyShapeFitsCapacity(config, *mesh_, *interior_space_,
+                                        *trace_space_, exchange_plan_))
       return false;
     shape_.volume_points = mfem::IntRules.Get(
         fe->GetGeomType(), shape_.assembly_order).GetNPoints();

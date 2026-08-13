@@ -48,6 +48,12 @@ mfem::Mesh PeriodicSquareMesh(const int n)
       original, original.CreatePeriodicVertexMapping(translations));
 }
 
+mfem::Mesh NonperiodicSquareMesh(const int n)
+{
+  return mfem::Mesh::MakeCartesian2D(
+      n, n, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+}
+
 CudaConfig BorrowedConfig(mfem::ParMesh& mesh, const int ranks,
                           const int order, const int n) noexcept
 {
@@ -129,6 +135,16 @@ bool CheckNegatives(const int ranks)
                                        functional_polynomial_order,
                                        functional_elements_per_direction);
 
+  // It has the admitted global 6x6 element count, but boundary faces add
+  // p2 trace DOFs beyond the fixed topology arena.  Admission must reject it
+  // before cudaSetDevice, not after the legacy BuildTopology phase.
+  mfem::Mesh boundary_serial =
+      NonperiodicSquareMesh(functional_elements_per_direction);
+  mfem::ParMesh boundary_trace(MPI_COMM_WORLD, boundary_serial);
+  CudaConfig boundary_capacity = BorrowedConfig(
+      boundary_trace, ranks, functional_polynomial_order,
+      functional_elements_per_direction);
+
   mfem::Mesh triangles = mfem::Mesh::MakeCartesian2D(
       smoke_elements_per_direction, smoke_elements_per_direction,
       mfem::Element::TRIANGLE, false, 1.0, 1.0, false);
@@ -140,6 +156,7 @@ bool CheckNegatives(const int ranks)
              RejectedBeforeDevice<Backend>(null_communicator) &&
              mismatched_communicator_rejected &&
              RejectedBeforeDevice<Backend>(capacity) &&
+             RejectedBeforeDevice<Backend>(boundary_capacity) &&
              RejectedBeforeDevice<Backend>(geometry));
 }
 }  // namespace
