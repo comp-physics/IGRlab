@@ -174,6 +174,28 @@ int main()
   }
 
   {
+    StepPlanCursor cursor(TimeControl::Fixed(0.0, 1.0, 2.0),
+                          OutputSchedule::Explicit({1.0 + 1.0e-14},
+                                                   InitialOutputPolicy::Suppress,
+                                                   FinalOutputPolicy::Suppress));
+    const auto final = cursor.Commit(cursor.Plan(0.0));
+    checks.Expect(final && final->cycle == 1 && final->is_final &&
+                    Near(final->time, 1.0),
+                  "near-outside final canonicalizes to its scheduled boundary");
+  }
+
+  {
+    StepPlanCursor cursor(TimeControl::Fixed(0.0, 1.0, 1.0),
+                          OutputSchedule::Explicit({-1.0e-14},
+                                                   InitialOutputPolicy::Suppress,
+                                                   FinalOutputPolicy::Suppress));
+    const auto initial = cursor.InitialOutput();
+    checks.Expect(initial && initial->cycle == 0 && initial->is_initial &&
+                    !initial->is_final && Near(initial->time, 0.0),
+                  "near-outside initial canonicalizes to cycle-zero schedule");
+  }
+
+  {
     StepPlanCursor cursor(TimeControl::CFL(0.0, 1.0, 0.5),
                           OutputSchedule::FixedInterval(0.4));
     const StepPlan& original = cursor.Plan(0.7);

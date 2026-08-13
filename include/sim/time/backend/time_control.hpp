@@ -442,6 +442,17 @@ private:
     unique.reserve(schedule_.explicit_times.size());
     for (double value : schedule_.explicit_times)
     {
+      // Bounds admitted by ValidateExplicitBounds() through NearlyEqual() must
+      // become exact cursor boundaries before deduplication.  Otherwise a
+      // just-outside endpoint can pass validation yet be missed by clipping.
+      if (NearlyEqual(value, control_.initial_time))
+      {
+        value = control_.initial_time;
+      }
+      else if (NearlyEqual(value, control_.final_time))
+      {
+        value = control_.final_time;
+      }
       if (unique.empty() || !NearlyEqual(unique.back(), value))
       {
         unique.push_back(value);
