@@ -26,4 +26,11 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set_tests_properties(dg_igr_hdg_generic_contract PROPERTIES
     LABELS "hdg;generic;contract"
     TIMEOUT 30)
+  add_test(NAME dg_igr_hdg_generic_contract_mpi_2
+    COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
+            $<TARGET_FILE:dg_igr_hdg_generic_contract_test>)
+  set_tests_properties(dg_igr_hdg_generic_contract_mpi_2 PROPERTIES
+    LABELS "hdg;generic;contract;mpi"
+    PROCESSORS 2
+    TIMEOUT 30)
 endif()
