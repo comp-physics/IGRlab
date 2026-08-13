@@ -148,6 +148,7 @@ struct CpuCanonicalEntry
   double value = 0.0;
 };
 
+
 enum class CpuOwnedAllocationSite : unsigned char
 {
   slot_cell,
@@ -309,6 +310,9 @@ struct CpuStateSnapshot
   StateHash state_hash{};
   CpuCoefficientView interior{};
   CpuCoefficientView trace{};
+  const std::uint64_t* physical_interior_ids = nullptr;
+  std::size_t physical_interior_id_count = 0;
+  int scalar_interior_dofs = 0;
 };
 
 template <typename Selection>

@@ -754,8 +754,8 @@ struct CoefficientFixture
 
 struct Rank2CoefficientFixture
 {
-  std::array<State, 2> interior{{State(80), State(64)}};
-  std::array<State, 2> trace{{State(112), State(32)}};
+  std::array<State, 2> interior{{State(96), State(48)}};
+  std::array<State, 2> trace{{State(96), State(48)}};
 
   Rank2CoefficientFixture()
   {
@@ -780,14 +780,14 @@ struct Rank2CoefficientFixture
   std::array<StagedStateViewV1, 2> Views() const noexcept
   {
     return {{{0,
-              {interior[0].data(), interior[0].size(), 4, 20,
+              {interior[0].data(), interior[0].size(), 4, 24,
                CoefficientOrderingV1::component_major},
-              {trace[0].data(), trace[0].size(), 4, 28,
+              {trace[0].data(), trace[0].size(), 4, 24,
                CoefficientOrderingV1::component_major}},
              {1,
-              {interior[1].data(), interior[1].size(), 4, 16,
+              {interior[1].data(), interior[1].size(), 4, 12,
                CoefficientOrderingV1::component_major},
-              {trace[1].data(), trace[1].size(), 4, 8,
+              {trace[1].data(), trace[1].size(), 4, 12,
                CoefficientOrderingV1::component_major}}}};
   }
 };
@@ -1519,21 +1519,21 @@ struct DecodeSentinel
 
 struct Rank2DecodeOutput
 {
-  std::array<State, 2> interior{{State(80, -1.0), State(64, -1.0)}};
-  std::array<State, 2> trace{{State(112, -1.0), State(32, -1.0)}};
+  std::array<State, 2> interior{{State(96, -1.0), State(48, -1.0)}};
+  std::array<State, 2> trace{{State(96, -1.0), State(48, -1.0)}};
   DecodedCheckpointMetadataV1 metadata{};
 
   std::array<RankStateBufferV1, 2> Buffers() noexcept
   {
     return {{{0,
               {interior[0].data(), interior[0].size(), interior[0].size(), 4,
-               20, CoefficientOrderingV1::component_major},
-              {trace[0].data(), trace[0].size(), trace[0].size(), 4, 28,
+               24, CoefficientOrderingV1::component_major},
+              {trace[0].data(), trace[0].size(), trace[0].size(), 4, 24,
                CoefficientOrderingV1::component_major}},
              {1,
               {interior[1].data(), interior[1].size(), interior[1].size(), 4,
-               16, CoefficientOrderingV1::component_major},
-              {trace[1].data(), trace[1].size(), trace[1].size(), 4, 8,
+               12, CoefficientOrderingV1::component_major},
+              {trace[1].data(), trace[1].size(), trace[1].size(), 4, 12,
                CoefficientOrderingV1::component_major}}}};
   }
 };
@@ -1922,6 +1922,51 @@ bool CheckRank2CaptureAndAllRankEvidence()
     return Check(false, "rank2_static_config_valid");
   }
 
+  std::array<RankCoefficientExtentsV1, 2> observed{{
+      {24, 96, 24, 96}, {12, 48, 12, 48}}};
+  ScenarioCoefficientExtentsV1 observed_extents{};
+  bool passed = Check(
+      DeriveObservedCoefficientExtentsV1(
+          *config, 2, observed.data(), observed_extents) &&
+          observed_extents.aggregate_interior_coefficient_count == 144 &&
+          observed_extents.aggregate_trace_coefficient_count == 144,
+      "rank2_observed_extents_validate_exact_global_census");
+  auto wrong_aggregate = observed;
+  wrong_aggregate[0] = {20, 80, 24, 96};
+  passed = Check(
+               !DeriveObservedCoefficientExtentsV1(
+                   *config, 2, wrong_aggregate.data(), observed_extents),
+               "rank2_observed_extents_reject_wrong_aggregate") &&
+      passed;
+  auto wrong_basis = observed;
+  wrong_basis[0] = {23, 92, 24, 96};
+  wrong_basis[1] = {13, 52, 12, 48};
+  passed = Check(
+               !DeriveObservedCoefficientExtentsV1(
+                   *config, 2, wrong_basis.data(), observed_extents),
+               "rank2_observed_extents_reject_nonintegral_element_basis") &&
+      passed;
+  const ApplicationValidation serial_validation =
+      TestValidation(CpuSerialBackendTag::id);
+  passed = Check(
+               serial_validation.config() != nullptr &&
+                   !DeriveObservedCoefficientExtentsV1(
+                       *serial_validation.config(), 1, observed.data(),
+                       observed_extents),
+               "observed_mfem_extents_reject_serial_backend") &&
+      passed;
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
+  const ApplicationValidation scalar_rank2_validation =
+      ScalarTestValidation(CpuRank2BackendTag::id, false);
+  passed = Check(
+               scalar_rank2_validation.config() != nullptr &&
+                   !DeriveObservedCoefficientExtentsV1(
+                       *scalar_rank2_validation.config(), 2, observed.data(),
+                       observed_extents),
+               "observed_mfem_extents_reject_scalar_igr") &&
+      passed;
+#endif
+
   const Slot committed0{fixture.interior[0], fixture.trace[0]};
   const Slot committed1{fixture.interior[1], fixture.trace[1]};
   Slot candidate0{};
@@ -1930,9 +1975,10 @@ bool CheckRank2CaptureAndAllRankEvidence()
       committed0, candidate0, {0.0, 0, 0, 0, 0.05}, resources);
   Rank2Contract contract1(
       committed1, candidate1, {0.0, 0, 0, 0, 0.05}, resources);
-  bool passed = Check(AdvanceOneCommit(contract0) &&
-                          AdvanceOneCommit(contract1),
-                      "rank2_live_contracts_commit");
+  passed = Check(AdvanceOneCommit(contract0) &&
+                     AdvanceOneCommit(contract1),
+                 "rank2_live_contracts_commit") &&
+      passed;
   const std::array<Rank2ContractView, 2> valid{{
       {0, &contract0}, {1, &contract1}}};
   const std::array<Rank2ContractView, 2> duplicate{{
@@ -1996,7 +2042,13 @@ bool CheckRank2CaptureAndAllRankEvidence()
                      output.metadata.rank_count == 2 &&
                      output.metadata.aggregate_interior_coefficients == 144 &&
                      output.metadata.aggregate_true_trace_coefficients == 144,
-                 "rank2_exact_extents_round_trip") &&
+                 "rank2_observed_nonformula_extents_round_trip") &&
+      passed;
+  passed = Check(
+               output.metadata.partition_layout_rule_id ==
+                   StableIdentity::Copy(
+                       checkpoint_mfem_observed_partition_layout_rule_id_v1),
+               "rank2_observed_extents_encode_truthful_mfem_partition_rule") &&
       passed;
 
   fixture.interior[0][0] += 0.25;

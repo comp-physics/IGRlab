@@ -34,6 +34,8 @@ inline constexpr std::uint64_t fp64_coefficient_bytes_v1 = 8;
 inline constexpr std::string_view no_physical_gpu_uuid_v1 = "none";
 inline constexpr std::string_view checkpoint_partition_layout_rule_id_v1 =
     "periodic-cartesian.contiguous-element.min-adjacent-face-owner.v1";
+inline constexpr std::string_view checkpoint_mfem_observed_partition_layout_rule_id_v1 =
+    "periodic-cartesian.mfem-default-parmesh.owned-true-trace.v1";
 
 static_assert(sizeof(double) == fp64_coefficient_bytes_v1 &&
                   std::numeric_limits<double>::is_iec559 &&
@@ -228,6 +230,16 @@ bool ScenarioCheckpointTimeMatchesV1(
 bool DeriveScenarioCoefficientExtentsV1(
     const ValidatedApplicationConfig& config,
     std::uint32_t rank_count,
+    ScenarioCoefficientExtentsV1& extents) noexcept;
+/**
+ * Validates rank-local extents observed from an initialized owner.  This is
+ * used by conventional MFEM CPU restart paths whose automatic ParMesh split
+ * is intentionally not a formula-level application policy.
+ */
+bool DeriveObservedCoefficientExtentsV1(
+    const ValidatedApplicationConfig& config,
+    std::uint32_t rank_count,
+    const RankCoefficientExtentsV1* observed_ranks,
     ScenarioCoefficientExtentsV1& extents) noexcept;
 CheckpointCoefficientSchemaV1 CheckpointCoefficientSchema(
     const ValidatedApplicationConfig& config) noexcept;
