@@ -214,6 +214,7 @@ bool PostPublicationFaultAllowsRetry() noexcept
   return raw == nullptr || std::string_view{raw} == "1";
 }
 
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
 bool ConsumeScalarRankStepFault(const char* const environment,
                                 const std::uint64_t step, const int rank,
                                 bool& consumed, int& source_rank) noexcept
@@ -242,6 +243,7 @@ bool ConsumeScalarRankStepFault(const char* const environment,
   consumed = true;
   return true;
 }
+#endif
 
 std::string Hex(const StateHash& hash)
 {
