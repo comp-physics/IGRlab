@@ -35,6 +35,22 @@ enum class IntegratorTag
   EmbeddedError
 };
 
+inline void ValidateIntegratorTag(IntegratorTag tag)
+{
+  switch (tag)
+  {
+    case IntegratorTag::BackendDefault:
+    case IntegratorTag::SSPRK33:
+    case IntegratorTag::BackwardEuler:
+    case IntegratorTag::DIRK:
+    case IntegratorTag::IMEX:
+    case IntegratorTag::EmbeddedError:
+      return;
+    default:
+      throw std::invalid_argument("unknown integrator tag");
+  }
+}
+
 inline const char* IntegratorTagName(IntegratorTag tag)
 {
   switch (tag)
@@ -281,6 +297,7 @@ public:
       integrator_(integrator),
       time_(control_.initial_time)
   {
+    ValidateIntegratorTag(integrator_);
     control_.Validate();
     schedule_.Validate();
     CanonicalizeExplicitTimes();
@@ -293,21 +310,25 @@ public:
   IntegratorTag integrator() const { return integrator_; }
   double time() const { return time_; }
   std::uint64_t committed_steps() const { return committed_steps_; }
-  bool Finished() const { return NearlyEqual(time_, control_.final_time); }
+  bool Finished() const { return time_ == control_.final_time; }
   bool HasPendingPlan() const { return pending_.has_value(); }
 
+  /// Returns the cycle-zero boundary publication, if requested.  For a
+  /// zero-duration run, initial/scheduled/final requests coalesce into one
+  /// cycle-zero event with the corresponding flags.
   std::optional<OutputEvent> InitialOutput() const
   {
-    if (schedule_.initial == InitialOutputPolicy::Suppress &&
-        !HasExplicitInitialOutput())
+    const bool explicit_initial = HasExplicitInitialOutput();
+    const bool emit_initial = schedule_.initial == InitialOutputPolicy::Emit ||
+                              explicit_initial;
+    const bool emit_final = Finished() &&
+                            (schedule_.final == FinalOutputPolicy::Emit ||
+                             explicit_initial);
+    if (!emit_initial && !emit_final)
     {
       return std::nullopt;
     }
-    return OutputEvent{0,
-                       control_.initial_time,
-                       true,
-                       Finished() && (schedule_.final == FinalOutputPolicy::Emit ||
-                                      HasExplicitInitialOutput())};
+    return OutputEvent{0, control_.initial_time, emit_initial, emit_final};
   }
 
   const StepPlan& Plan(double backend_proposed_dt)
@@ -324,27 +345,24 @@ public:
     const double proposed_dt = control_.ResolveDt(backend_proposed_dt);
     const double final_boundary = control_.final_time;
     const std::optional<Boundary> output = NextOutputBoundary();
-    double end_time = std::min(time_ + proposed_dt, final_boundary);
+    const double remaining_dt = final_boundary - time_;
+    double planned_dt = std::min(proposed_dt, remaining_dt);
+    double end_time = planned_dt == remaining_dt ? final_boundary
+                                                  : time_ + planned_dt;
     bool hit_output = false;
     std::uint64_t output_cycle = 0;
-    if (output && output->time < end_time && !NearlyEqual(output->time, end_time))
+    if (output)
     {
-      end_time = output->time;
-      hit_output = true;
-      output_cycle = output->cycle;
+      const double output_dt = output->time - time_;
+      if (output_dt >= 0.0 && output_dt <= planned_dt)
+      {
+        planned_dt = output_dt;
+        end_time = output->time;
+        hit_output = true;
+        output_cycle = output->cycle;
+      }
     }
-    else if (output && NearlyEqual(output->time, end_time))
-    {
-      end_time = output->time;
-      hit_output = true;
-      output_cycle = output->cycle;
-    }
-
-    if (NearlyEqual(end_time, final_boundary))
-    {
-      end_time = final_boundary;
-    }
-    const bool hit_final = NearlyEqual(end_time, final_boundary);
+    const bool hit_final = end_time == final_boundary;
     if (!(end_time > time_))
     {
       throw std::logic_error("time plan did not make forward progress");
@@ -352,7 +370,7 @@ public:
     pending_ = StepPlan{next_sequence_++,
                         time_,
                         proposed_dt,
-                        end_time - time_,
+                        planned_dt,
                         end_time,
                         hit_output,
                         hit_final,

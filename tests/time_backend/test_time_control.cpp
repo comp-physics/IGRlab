@@ -111,6 +111,30 @@ int main()
   }
 
   {
+    const double just_after_one = 1.0 + 1.0e-14;
+    StepPlanCursor fixed(TimeControl::Fixed(0.0, 2.0, 1.0),
+                         OutputSchedule::Explicit({just_after_one},
+                                                  InitialOutputPolicy::Suppress,
+                                                  FinalOutputPolicy::Suppress));
+    const StepPlan& fixed_first = fixed.Plan(0.0);
+    checks.Expect(fixed_first.dt == 1.0 && !fixed_first.hits_scheduled_output,
+                  "a near-future explicit output never increases fixed dt");
+    fixed.Commit(fixed_first);
+    const StepPlan& fixed_second = fixed.Plan(0.0);
+    checks.Expect(fixed_second.hits_scheduled_output &&
+                    fixed_second.dt > 0.0 && fixed_second.dt <= 1.0,
+                  "the near-future fixed output is clipped on its following step");
+
+    StepPlanCursor cfl(TimeControl::CFL(0.0, 2.0, 0.5),
+                       OutputSchedule::Explicit({just_after_one},
+                                                InitialOutputPolicy::Suppress,
+                                                FinalOutputPolicy::Suppress));
+    const StepPlan& cfl_first = cfl.Plan(1.0);
+    checks.Expect(cfl_first.dt == 1.0 && !cfl_first.hits_scheduled_output,
+                  "a near-future explicit output never increases CFL dt");
+  }
+
+  {
     StepPlanCursor cursor(TimeControl::Fixed(0.0, 1.0, 1.0),
                           OutputSchedule::Explicit({0.0, 0.4, 0.8},
                                                    InitialOutputPolicy::Suppress,
@@ -187,6 +211,16 @@ int main()
   }
 
   {
+    StepPlanCursor cursor(TimeControl::Fixed(1.0, 1.0, 1.0),
+                          OutputSchedule::Disabled(InitialOutputPolicy::Suppress,
+                                                   FinalOutputPolicy::Emit));
+    const auto final = cursor.InitialOutput();
+    checks.Expect(final && final->cycle == 0 && !final->is_initial &&
+                    final->is_final && Near(final->time, 1.0),
+                  "a zero-duration forced final is a sole cycle-zero publication");
+  }
+
+  {
     StepPlanCursor cursor(TimeControl::Fixed(0.0, 0.3, 1.0),
                           OutputSchedule::FixedInterval(0.1));
     cursor.Commit(cursor.Plan(0.0));
@@ -255,6 +289,14 @@ int main()
                   schedule.Validate();
                 },
                 "invalid final output policy enum is rejected");
+  ExpectInvalid(checks,
+                []
+                {
+                  StepPlanCursor(TimeControl::Fixed(0.0, 1.0, 0.1),
+                                 OutputSchedule::Disabled(),
+                                 static_cast<IntegratorTag>(99));
+                },
+                "invalid integrator tag is rejected at cursor construction");
 
   if (checks.failures() != 0)
   {
