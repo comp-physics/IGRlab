@@ -450,18 +450,6 @@ bool Interpolate(const mfem::Vector& field,
   return Finite(state);
 }
 
-std::vector<int> BuildPartition(const mfem::Mesh& mesh, const int ranks)
-{
-  std::vector<int> partition(static_cast<std::size_t>(mesh.GetNE()), 0);
-  if (ranks == 1) { return partition; }
-  for (int element = 0; element < mesh.GetNE(); ++element)
-  {
-    partition[static_cast<std::size_t>(element)] =
-        element * ranks / mesh.GetNE();
-  }
-  return partition;
-}
-
 // Compact SHA-256 used for committed bytes and product payload identities.
 constexpr std::array<std::uint32_t, 64> sha_constants{{
     0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
@@ -1683,7 +1671,12 @@ struct detail::CpuNumericsCore::Implementation
   std::vector<int> element_interior_vdofs;
   std::vector<int> element_faces;
   std::vector<int> signed_trace_dofs;
+  // Extracted only while the serial attribute tag is present.  These are
+  // provenance for the MFEM-selected local mesh, never physics attributes.
+  std::vector<std::uint64_t> local_parent_cell_ids;
+  std::vector<std::uint64_t> local_parent_cell_ids_sorted;
   std::vector<std::uint64_t> interior_global_ids;
+  std::vector<std::uint64_t> physical_interior_ids;
   std::vector<std::uint64_t> trace_canonical_ids;
 
   LocalSystem current_system;
@@ -2069,6 +2062,48 @@ struct detail::CpuNumericsCore::Implementation
       {
         return false;
       }
+      if (!ResizeOwned(physical_interior_ids,
+                       static_cast<std::size_t>(interior_space->GetVSize()),
+                       CpuOwnedAllocationSite::topology_vector,
+                       allocations)) return false;
+      std::fill(physical_interior_ids.begin(), physical_interior_ids.end(),
+                std::numeric_limits<std::uint64_t>::max());
+      if (local_parent_cell_ids.size() !=
+          static_cast<std::size_t>(mesh->GetNE())) return false;
+      for (int element = 0; element < mesh->GetNE(); ++element)
+      {
+        mfem::Array<int> vdofs;
+        interior_space->GetElementVDofs(element, vdofs);
+        if (vdofs.Size() != local_interior) return false;
+        const std::uint64_t parent = local_parent_cell_ids[
+            static_cast<std::size_t>(element)];
+        for (int scalar = 0; scalar < scalar_interior_dofs; ++scalar)
+          for (int component = 0; component < cpu_conserved_components;
+               ++component)
+          {
+            double sign = 1.0;
+            const int dof = Decode(vdofs[ByNodes(
+                scalar, scalar_interior_dofs, component)], sign);
+            if (dof < 0 || dof >= interior_space->GetVSize() || sign != 1.0)
+              return false;
+            const std::uint64_t canonical =
+                (parent * static_cast<std::uint64_t>(scalar_interior_dofs) +
+                 static_cast<std::uint64_t>(scalar)) *
+                    cpu_conserved_components +
+                static_cast<std::uint64_t>(component);
+            std::uint64_t& stored = physical_interior_ids[
+                static_cast<std::size_t>(dof)];
+            if (stored != std::numeric_limits<std::uint64_t>::max() &&
+                stored != canonical) return false;
+            stored = canonical;
+          }
+      }
+      if (std::any_of(physical_interior_ids.begin(), physical_interior_ids.end(),
+                      [](const std::uint64_t value)
+                      { return value == std::numeric_limits<std::uint64_t>::max(); }))
+      {
+        return false;
+      }
       for (int local = 0; local < interior_space->GetVSize(); ++local)
       {
         interior_global_ids[static_cast<std::size_t>(local)] =
@@ -2179,6 +2214,80 @@ struct detail::CpuNumericsCore::Implementation
                             return value ==
                                 std::numeric_limits<std::uint64_t>::max();
                           });
+    }
+    catch (...)
+    {
+      return false;
+    }
+  }
+
+  bool ObserveParentCellIds() noexcept
+  {
+    bool local_ready = true;
+    try
+    {
+      if (!ResizeOwned(local_parent_cell_ids,
+                       static_cast<std::size_t>(mesh->GetNE()),
+                       CpuOwnedAllocationSite::topology_vector, allocations))
+        local_ready = false;
+      for (int element = 0; local_ready && element < mesh->GetNE(); ++element)
+      {
+        const int attribute = mesh->GetElement(element)->GetAttribute();
+        if (attribute <= 0) { local_ready = false; break; }
+        local_parent_cell_ids[static_cast<std::size_t>(element)] =
+            static_cast<std::uint64_t>(attribute - 1);
+        // Attribute values are transient construction provenance.  The
+        // numerical mesh retains the physical default after extraction.
+        mesh->SetAttribute(element, 1);
+      }
+      if (!AllRanks(local_ready)) return false;
+      mesh->SetAttributes();
+      if (mesh->attributes.Size() != 1 || mesh->attributes[0] != 1)
+        local_ready = false;
+      if (!ResizeOwned(local_parent_cell_ids_sorted,
+                       local_parent_cell_ids.size(),
+                       CpuOwnedAllocationSite::topology_vector, allocations))
+        local_ready = false;
+      if (local_ready)
+      {
+        local_parent_cell_ids_sorted = local_parent_cell_ids;
+        std::sort(local_parent_cell_ids_sorted.begin(),
+                  local_parent_cell_ids_sorted.end());
+      }
+      if (local_ready && std::adjacent_find(local_parent_cell_ids_sorted.begin(),
+                             local_parent_cell_ids_sorted.end()) !=
+          local_parent_cell_ids_sorted.end()) local_ready = false;
+      if (!AllRanks(local_ready)) return false;
+      const int local_count = mesh->GetNE();
+      std::array<int, 2> counts{};
+      std::array<int, 2> offsets{};
+      const bool counts_gathered = MPI_Allgather(
+          &local_count, 1, MPI_INT, counts.data(), 1, MPI_INT,
+          MPI_COMM_WORLD) == MPI_SUCCESS;
+      if (!AllRanks(counts_gathered)) return false;
+      int total = 0;
+      for (int rank = 0; rank < ranks; ++rank)
+      {
+        if (counts[static_cast<std::size_t>(rank)] <= 0) local_ready = false;
+        offsets[static_cast<std::size_t>(rank)] = total;
+        total += counts[static_cast<std::size_t>(rank)];
+      }
+      if (!AllRanks(local_ready)) return false;
+      std::vector<std::uint64_t> all;
+      try { all.resize(static_cast<std::size_t>(total)); }
+      catch (...) { local_ready = false; }
+      if (!AllRanks(local_ready)) return false;
+      if (MPI_Allgatherv(local_parent_cell_ids.data(), local_count,
+                         MPI_UINT64_T, all.data(), counts.data(), offsets.data(),
+                         MPI_UINT64_T, MPI_COMM_WORLD) != MPI_SUCCESS)
+        return false;
+      std::sort(all.begin(), all.end());
+      if (total != config.elements_per_direction *
+                       config.elements_per_direction) return false;
+      for (int element = 0; element < total; ++element)
+        if (all[static_cast<std::size_t>(element)] !=
+            static_cast<std::uint64_t>(element)) return false;
+      return true;
     }
     catch (...)
     {
@@ -4076,7 +4185,6 @@ bool detail::CpuNumericsCore::Initialize(
   state.config = config;
   state.tuple = tuple;
 
-  std::vector<int> partition;
   std::optional<mfem::Mesh> periodic_mesh;
   try
   {
@@ -4090,8 +4198,13 @@ bool detail::CpuNumericsCore::Initialize(
     translations[1][1] = 1.0;
     periodic_mesh.emplace(mfem::Mesh::MakePeriodic(
         original, original.CreatePeriodicVertexMapping(translations)));
-    partition = BuildPartition(*periodic_mesh, state.ranks);
-    local_ok = periodic_mesh.has_value() && !partition.empty();
+    for (int element = 0; element < periodic_mesh->GetNE(); ++element)
+    {
+      // MFEM's two-argument constructor owns partition selection.  The
+      // serial attribute is only a stable parent-cell provenance tag.
+      periodic_mesh->SetAttribute(element, element + 1);
+    }
+    local_ok = periodic_mesh.has_value() && periodic_mesh->GetNE() > 0;
   }
   catch (...)
   {
@@ -4101,14 +4214,19 @@ bool detail::CpuNumericsCore::Initialize(
 
   try
   {
-    state.mesh = std::make_unique<mfem::ParMesh>(
-        MPI_COMM_WORLD, *periodic_mesh, partition.data());
+    state.mesh = std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD,
+                                                 *periodic_mesh);
+    for (int element = 0; element < periodic_mesh->GetNE(); ++element)
+      periodic_mesh->SetAttribute(element, 1);
     local_ok = state.ObserveWrapper(state.mesh) && state.mesh->GetNE() > 0;
   }
   catch (...)
   {
     local_ok = false;
   }
+  if (!AllRanks(local_ok)) { return false; }
+
+  local_ok = state.ObserveParentCellIds();
   if (!AllRanks(local_ok)) { return false; }
 
   try
@@ -4435,7 +4553,27 @@ bool detail::CpuNumericsCore::Initialize(
                                           config.elements_per_direction}};
   const StateHash local_mesh = HashBytes(
       mesh_identity.data(), mesh_identity.size() * sizeof(int));
-  const StateHash local_partition = HashTopologyIntegers(partition);
+  StateHash local_partition{};
+  if (state.ranks == 1)
+  {
+    std::vector<int> serial_partition_compatibility;
+    try
+    {
+      serial_partition_compatibility.assign(
+          static_cast<std::size_t>(config.elements_per_direction) *
+              config.elements_per_direction,
+          0);
+    }
+    catch (...) { local_ok = false; }
+    if (!AllRanks(local_ok)) { return false; }
+    local_partition = HashTopologyIntegers(serial_partition_compatibility);
+  }
+  else
+  {
+    local_partition = HashBytes(
+        state.local_parent_cell_ids_sorted.data(),
+        state.local_parent_cell_ids_sorted.size() * sizeof(std::uint64_t));
+  }
   const StateHash local_topology = HashPair(
       HashTopologyIntegers(state.signed_trace_dofs),
       HashBytes(state.trace_canonical_ids.data(),
@@ -5078,6 +5216,9 @@ CpuStateSnapshot detail::CpuNumericsCore::Snapshot(
                        storage->interior.capacity()};
   snapshot.trace = {storage->trace.data(), storage->trace.size(),
                     storage->trace.capacity()};
+  snapshot.physical_interior_ids = state.physical_interior_ids.data();
+  snapshot.physical_interior_id_count = state.physical_interior_ids.size();
+  snapshot.scalar_interior_dofs = state.scalar_interior_dofs;
   return snapshot;
 }
 
@@ -5096,6 +5237,9 @@ CpuStateSnapshot detail::CpuNumericsCore::CandidateSnapshot(
                        storage->interior.capacity()};
   snapshot.trace = {storage->trace.data(), storage->trace.size(),
                     storage->trace.capacity()};
+  snapshot.physical_interior_ids = state.physical_interior_ids.data();
+  snapshot.physical_interior_id_count = state.physical_interior_ids.size();
+  snapshot.scalar_interior_dofs = state.scalar_interior_dofs;
   return snapshot;
 }
 
@@ -5254,5 +5398,6 @@ bool detail::CpuNumericsCore::ExportCanonicalCandidate(
             { return left.global_id < right.global_id; });
   return true;
 }
+
 
 } // namespace dg::hdg::runtime::cpu

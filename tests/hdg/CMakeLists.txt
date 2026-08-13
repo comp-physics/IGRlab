@@ -174,6 +174,10 @@ if((DG_IGR_ENABLE_HDG_RUNTIME OR
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/CMakeLists.txt")
   add_subdirectory(runtime)
 endif()
+if(DG_IGR_ENABLE_HDG_RUNTIME AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/main_adapter/CMakeLists.txt")
+  add_subdirectory(main_adapter)
+endif()
 if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT AND
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/auxiliary/CMakeLists.txt")
   add_subdirectory(auxiliary)

@@ -49,6 +49,100 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "Zhang-Shu options: consumer policy has stable metadata name");
   }
 
+  // --- General discretization selection and legacy backend adapter ---
+  {
+    const dg_sim::DiscretizationResolution default_selection =
+      dg_sim::ResolveDiscretization("dgsem", "", "dgsem", false, false);
+    ctx.Check(default_selection.IsResolved() &&
+                default_selection.discretization ==
+                  dg_sim::Discretization::DGSEM &&
+                default_selection.provenance ==
+                  dg_sim::DiscretizationProvenance::CaseDefault &&
+                default_selection.dg_backend == dg_sim::DGBackend::DGSEM,
+              "discretization: no CLI selector retains the per-case default");
+
+    const dg_sim::DiscretizationResolution discretization_selection =
+      dg_sim::ResolveDiscretization("dg", "DGSEM", "dg", true, false);
+    ctx.Check(discretization_selection.IsResolved() &&
+                discretization_selection.discretization ==
+                  dg_sim::Discretization::DGSEM &&
+                discretization_selection.provenance ==
+                  dg_sim::DiscretizationProvenance::DiscretizationOption &&
+                discretization_selection.dg_backend == dg_sim::DGBackend::DGSEM,
+              "discretization: general selector overrides the case default");
+
+    const dg_sim::DiscretizationResolution backend_selection =
+      dg_sim::ResolveDiscretization("dgsem", "", "dg", false, true);
+    ctx.Check(backend_selection.IsResolved() &&
+                backend_selection.discretization ==
+                  dg_sim::Discretization::DG &&
+                backend_selection.provenance ==
+                  dg_sim::DiscretizationProvenance::DGBackendOption &&
+                backend_selection.dg_backend == dg_sim::DGBackend::DG,
+              "discretization: legacy backend selector remains compatible");
+
+    const dg_sim::DiscretizationResolution both_selection =
+      dg_sim::ResolveDiscretization("dg", "DGSEM", "dgsem", true, true);
+    ctx.Check(both_selection.IsResolved() &&
+                both_selection.provenance ==
+                  dg_sim::DiscretizationProvenance::BothOptions &&
+                both_selection.dg_backend == dg_sim::DGBackend::DGSEM,
+              "discretization: normalized equal selectors are accepted");
+
+    const dg_sim::DiscretizationResolution conflict_selection =
+      dg_sim::ResolveDiscretization("dg", "dg", "dgsem", true, true);
+    ctx.Check(conflict_selection.status ==
+                dg_sim::DiscretizationResolutionStatus::Conflict,
+              "discretization: conflicting selectors are rejected");
+
+    const dg_sim::DiscretizationResolution legacy_hdg =
+      dg_sim::ResolveDiscretization("dg", "", "hdg", false, true);
+    ctx.Check(legacy_hdg.status ==
+                dg_sim::DiscretizationResolutionStatus::InvalidDGBackend,
+              "discretization: legacy backend rejects hdg");
+
+    const dg_sim::DiscretizationResolution hdg_selection =
+      dg_sim::ResolveDiscretization("dg", "hdg", "dg", true, false);
+    ctx.Check(hdg_selection.status ==
+                dg_sim::DiscretizationResolutionStatus::Unavailable &&
+                hdg_selection.discretization == dg_sim::Discretization::HDG &&
+                !hdg_selection.dg_backend,
+              "discretization: hdg is recognized but unavailable");
+
+    ctx.Check(!dg_sim::DGBackendForDiscretization(
+                dg_sim::Discretization::HDG),
+              "discretization: HDG has no legacy backend adapter");
+
+    char program_name[] = "test";
+    char discretization_flag[] = "--discretization";
+    char discretization_value[] = "dg";
+    char legacy_flag[] = "-dg";
+    char legacy_value[] = "dg";
+    char* argv[] = {program_name,
+                    discretization_flag,
+                    discretization_value,
+                    legacy_flag,
+                    legacy_value};
+    ctx.Check(dg_sim::HasDiscretizationOptionOverride(5, argv) &&
+                dg_sim::HasDGBackendOptionOverride(5, argv),
+              "discretization: explicit selector provenance uses exact argv flags");
+
+    dg_sim::CommonOptions opts;
+    dg_sim::CaseConfig case_cfg;
+    dg_sim::IGROptions igr_opts;
+    opts.discretization = "dgsem";
+    const dg_sim::RunConfig run_cfg = dg_sim::MakeRunConfig(
+      case_cfg,
+      opts,
+      igr_opts,
+      dg_sim::DiscretizationProvenance::DiscretizationOption);
+    ctx.Check(run_cfg.discretization == dg_sim::Discretization::DGSEM &&
+                run_cfg.discretization_provenance ==
+                  dg_sim::DiscretizationProvenance::DiscretizationOption &&
+                run_cfg.dg_backend == dg_sim::DGBackend::DGSEM,
+              "discretization: run config records selector and compatibility backend");
+  }
+
   // --- IGR derived runtime defaults ---
   {
     dg_sim::CommonOptions opts;

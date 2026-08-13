@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "mfem.hpp"
@@ -58,6 +59,49 @@ enum class DGBackend
 {
   DG,
   DGSEM
+};
+
+/// @brief General discretization selection, including unavailable seams.
+enum class Discretization
+{
+  DG,
+  DGSEM,
+  HDG
+};
+
+/// @brief Source of the effective general discretization selection.
+enum class DiscretizationProvenance
+{
+  CaseDefault,
+  DiscretizationOption,
+  DGBackendOption,
+  BothOptions
+};
+
+/// @brief Outcome of reconciling the general and legacy CLI selectors.
+enum class DiscretizationResolutionStatus
+{
+  Resolved,
+  InvalidDiscretization,
+  InvalidDGBackend,
+  Conflict,
+  Unavailable
+};
+
+struct DiscretizationResolution
+{
+  Discretization discretization = Discretization::DG;
+  DiscretizationProvenance provenance =
+    DiscretizationProvenance::CaseDefault;
+  std::optional<DGBackend> dg_backend = DGBackend::DG;
+  DiscretizationResolutionStatus status =
+    DiscretizationResolutionStatus::Resolved;
+  std::string message;
+
+  bool IsResolved() const
+  {
+    return status == DiscretizationResolutionStatus::Resolved;
+  }
 };
 
 /// @brief Runtime compute device selection.
@@ -129,6 +173,9 @@ struct RunConfig
   CommonOptions opts;
   IGROptions igr_opts;
   DeviceBackend device_backend = DeviceBackend::CPU;
+  Discretization discretization = Discretization::DG;
+  DiscretizationProvenance discretization_provenance =
+    DiscretizationProvenance::CaseDefault;
   DGBackend dg_backend = DGBackend::DG;
   DGSEMStabilization dgsem_stab = DGSEMStabilization::None;
   DGSEMVolumeFlux dgsem_volume_flux = DGSEMVolumeFlux::Central;
@@ -471,7 +518,7 @@ IGRAlphaLengthScalePolicyToString(dg_igr::IGRAlphaLengthScalePolicy value)
   return "average";
 }
 
-inline DGBackend ParseDGBackend(const std::string& value)
+inline std::optional<DGBackend> TryParseDGBackend(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "dg")
@@ -482,9 +529,192 @@ inline DGBackend ParseDGBackend(const std::string& value)
   {
     return DGBackend::DGSEM;
   }
+  return std::nullopt;
+}
+
+inline DGBackend ParseDGBackend(const std::string& value)
+{
+  if (const std::optional<DGBackend> backend = TryParseDGBackend(value))
+  {
+    return *backend;
+  }
   MFEM_VERIFY(false,
               "Invalid DG backend '" << value << "'. Use 'dg' or 'dgsem'.");
   return DGBackend::DG;
+}
+
+inline std::optional<Discretization>
+TryParseDiscretization(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "dg")
+  {
+    return Discretization::DG;
+  }
+  if (lower == "dgsem")
+  {
+    return Discretization::DGSEM;
+  }
+  if (lower == "hdg")
+  {
+    return Discretization::HDG;
+  }
+  return std::nullopt;
+}
+
+inline Discretization ParseDiscretization(const std::string& value)
+{
+  if (const std::optional<Discretization> discretization =
+        TryParseDiscretization(value))
+  {
+    return *discretization;
+  }
+  MFEM_VERIFY(false,
+              "Invalid discretization '" << value
+                                          << "'. Use 'dg', 'dgsem', or 'hdg'.");
+  return Discretization::DG;
+}
+
+inline std::optional<DGBackend>
+DGBackendForDiscretization(Discretization discretization)
+{
+  switch (discretization)
+  {
+  case Discretization::DG:
+    return DGBackend::DG;
+  case Discretization::DGSEM:
+    return DGBackend::DGSEM;
+  case Discretization::HDG:
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+inline Discretization DiscretizationForDGBackend(DGBackend backend)
+{
+  switch (backend)
+  {
+  case DGBackend::DG:
+    return Discretization::DG;
+  case DGBackend::DGSEM:
+    return Discretization::DGSEM;
+  }
+  return Discretization::DG;
+}
+
+inline const char* DiscretizationToString(Discretization discretization)
+{
+  switch (discretization)
+  {
+  case Discretization::DG:
+    return "dg";
+  case Discretization::DGSEM:
+    return "dgsem";
+  case Discretization::HDG:
+    return "hdg";
+  }
+  return "dg";
+}
+
+inline const char*
+DiscretizationProvenanceToString(DiscretizationProvenance provenance)
+{
+  switch (provenance)
+  {
+  case DiscretizationProvenance::CaseDefault:
+    return "case-default";
+  case DiscretizationProvenance::DiscretizationOption:
+    return "discretization-option";
+  case DiscretizationProvenance::DGBackendOption:
+    return "dg-backend-option";
+  case DiscretizationProvenance::BothOptions:
+    return "both-options";
+  }
+  return "case-default";
+}
+
+inline DiscretizationResolution
+ResolveDiscretization(const std::string& case_default_dg_backend,
+                      const std::string& discretization_value,
+                      const std::string& dg_backend_value,
+                      bool discretization_overridden,
+                      bool dg_backend_overridden)
+{
+  DiscretizationResolution result;
+  if (!discretization_overridden && !dg_backend_overridden)
+  {
+    const std::optional<DGBackend> backend =
+      TryParseDGBackend(case_default_dg_backend);
+    if (!backend)
+    {
+      result.status = DiscretizationResolutionStatus::InvalidDGBackend;
+      result.dg_backend.reset();
+      result.message = "Invalid per-case DG backend '" +
+                       case_default_dg_backend +
+                       "'. Use 'dg' or 'dgsem'.";
+      return result;
+    }
+    result.discretization = DiscretizationForDGBackend(*backend);
+    result.dg_backend = backend;
+    return result;
+  }
+
+  std::optional<Discretization> selected;
+  if (discretization_overridden)
+  {
+    selected = TryParseDiscretization(discretization_value);
+    if (!selected)
+    {
+      result.status = DiscretizationResolutionStatus::InvalidDiscretization;
+      result.dg_backend.reset();
+      result.message = "Invalid discretization '" + discretization_value +
+                       "'. Use 'dg', 'dgsem', or 'hdg'.";
+      return result;
+    }
+    result.provenance = dg_backend_overridden
+                          ? DiscretizationProvenance::BothOptions
+                          : DiscretizationProvenance::DiscretizationOption;
+  }
+
+  if (dg_backend_overridden)
+  {
+    const std::optional<DGBackend> legacy_backend =
+      TryParseDGBackend(dg_backend_value);
+    if (!legacy_backend)
+    {
+      result.status = DiscretizationResolutionStatus::InvalidDGBackend;
+      result.dg_backend.reset();
+      result.message = "Invalid DG backend '" + dg_backend_value +
+                       "'. Use 'dg' or 'dgsem'.";
+      return result;
+    }
+    const Discretization legacy_discretization =
+      DiscretizationForDGBackend(*legacy_backend);
+    if (selected && *selected != legacy_discretization)
+    {
+      result.status = DiscretizationResolutionStatus::Conflict;
+      result.dg_backend.reset();
+      result.message = "Conflicting '--discretization " +
+                       discretization_value + "' and '--dg-backend " +
+                       dg_backend_value + "' selections.";
+      return result;
+    }
+    selected = legacy_discretization;
+    if (!discretization_overridden)
+    {
+      result.provenance = DiscretizationProvenance::DGBackendOption;
+    }
+  }
+
+  result.discretization = *selected;
+  result.dg_backend = DGBackendForDiscretization(result.discretization);
+  if (!result.dg_backend)
+  {
+    result.status = DiscretizationResolutionStatus::Unavailable;
+    result.message = "Discretization 'hdg' is recognized but unavailable in "
+                     "this executable.";
+  }
+  return result;
 }
 
 inline DeviceBackend ParseDeviceBackend(const std::string& value)
@@ -528,6 +758,40 @@ inline bool HasExactDGFaceOptionOverride(int argc, char** argv)
   for (int i = 1; i < argc; ++i)
   {
     if (IsExactDGFaceOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool IsDiscretizationOptionName(const std::string& value)
+{
+  return value == "-disc" || value == "--discretization";
+}
+
+inline bool IsDGBackendOptionName(const std::string& value)
+{
+  return value == "-dg" || value == "--dg-backend";
+}
+
+inline bool HasDiscretizationOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsDiscretizationOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool HasDGBackendOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsDGBackendOptionName(argv[i]))
     {
       return true;
     }
@@ -1031,9 +1295,12 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
     "(default off).");
 }
 
-inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
-                               const CommonOptions& opts,
-                               const IGROptions& igr_opts)
+inline RunConfig MakeRunConfig(
+  const CaseConfig& case_cfg,
+  const CommonOptions& opts,
+  const IGROptions& igr_opts,
+  DiscretizationProvenance discretization_provenance =
+    DiscretizationProvenance::CaseDefault)
 {
   RunConfig run_cfg;
   run_cfg.case_config = case_cfg;
@@ -1044,7 +1311,18 @@ inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
   run_cfg.opts.zhang_shu_points = ZhangShuPointSetToString(zhang_shu_points);
   run_cfg.igr_opts = igr_opts;
   run_cfg.device_backend = ParseDeviceBackend(opts.device);
-  run_cfg.dg_backend = ParseDGBackend(opts.dg_backend);
+  run_cfg.discretization = opts.discretization.empty()
+                              ? DiscretizationForDGBackend(
+                                  ParseDGBackend(opts.dg_backend))
+                              : ParseDiscretization(opts.discretization);
+  run_cfg.discretization_provenance = discretization_provenance;
+  const std::optional<DGBackend> dg_backend =
+    DGBackendForDiscretization(run_cfg.discretization);
+  MFEM_VERIFY(dg_backend,
+              "Discretization '"
+                << DiscretizationToString(run_cfg.discretization)
+                << "' is recognized but unavailable in this executable.");
+  run_cfg.dg_backend = dg_backend.value_or(DGBackend::DG);
   run_cfg.dgsem_stab = ParseDGSEMStabilization(opts.dgsem_stab);
   run_cfg.dgsem_volume_flux = ParseDGSEMVolumeFlux(opts.dgsem_volume_flux);
   run_cfg.dgsem_volume_dissipation =

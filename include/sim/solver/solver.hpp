@@ -458,6 +458,22 @@ struct Solver
       spec.add_options(args, case_opts);
     }
     args.ParseCheck();
+    const DiscretizationResolution discretization_resolution =
+      ResolveDiscretization(case_cfg.defaults.dg_backend,
+                            cli_opts.discretization,
+                            cli_opts.dg_backend,
+                            HasDiscretizationOptionOverride(argc, argv),
+                            HasDGBackendOptionOverride(argc, argv));
+    MFEM_VERIFY(discretization_resolution.IsResolved(),
+                discretization_resolution.message);
+    if (!discretization_resolution.IsResolved())
+    {
+      return 1;
+    }
+    cli_opts.discretization =
+      DiscretizationToString(discretization_resolution.discretization);
+    cli_opts.dg_backend =
+      DGBackendToString(*discretization_resolution.dg_backend);
     MFEM_VERIFY(!cli_opts.restart_vtk.empty() ||
                   (cli_opts.restart_cycle < 0 && cli_opts.restart_step < 0),
                 "--restart-cycle/--restart-step require --restart-vtk.");
@@ -465,7 +481,11 @@ struct Solver
                                    cli_igr_opts,
                                    HasExactDGFaceOptionOverride(argc, argv));
 
-    const RunConfig run_cfg = MakeRunConfig(case_cfg, cli_opts, cli_igr_opts);
+    const RunConfig run_cfg = MakeRunConfig(
+      case_cfg,
+      cli_opts,
+      cli_igr_opts,
+      discretization_resolution.provenance);
     if (spec.use_igr && mfem::Mpi::Root())
     {
       std::cout << "[igr-options] event=effective"

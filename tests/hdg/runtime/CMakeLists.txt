@@ -25,6 +25,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   endif()
   _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_common)
   _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_app_contract)
+  _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_app_cpu)
   _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_cpu)
 
   if(MFEM_USE_CUDA)

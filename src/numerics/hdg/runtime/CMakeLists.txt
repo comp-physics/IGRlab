@@ -83,13 +83,15 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
       "${CMAKE_CURRENT_SOURCE_DIR}/app/command_line.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/app/durable_io.cpp")
   set(_dg_igr_hdg_runtime_app_executable_sources
-      "${CMAKE_CURRENT_SOURCE_DIR}/app/main.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/app/main.cpp")
+  set(_dg_igr_hdg_runtime_app_cpu_sources
       "${CMAKE_CURRENT_SOURCE_DIR}/app/solver_cpu.cpp")
   set(_dg_igr_hdg_runtime_app_entry_source
       "${CMAKE_CURRENT_SOURCE_DIR}/app/solver_entry.cpp")
   set(_dg_igr_hdg_runtime_app_expected_sources
       ${_dg_igr_hdg_runtime_app_contract_sources}
       ${_dg_igr_hdg_runtime_app_executable_sources}
+      ${_dg_igr_hdg_runtime_app_cpu_sources}
       ${_dg_igr_hdg_runtime_app_entry_source})
   list(SORT _dg_igr_hdg_runtime_app_sources)
   list(SORT _dg_igr_hdg_runtime_app_expected_sources)
@@ -119,6 +121,15 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   target_link_libraries(dg_igr_hdg_runtime_app_contract
                         PUBLIC dg_igr_hdg_runtime_common)
 
+  dg_igr_add_hdg_cxx17_component(
+    TARGET dg_igr_hdg_runtime_cpu
+    SOURCES ${_dg_igr_hdg_runtime_cpu_sources}
+    PUBLIC_LINK_LIBRARIES dg_igr_hdg_runtime_common)
+
+  # Keep the entry as an object library so the static selector test can bind
+  # it to its own mock downstreams.  Production users link the one combined
+  # static archive below, avoiding an archive-order cycle between entry and
+  # solver_cpu (each calls symbols defined by the other).
   add_library(dg_igr_hdg_runtime_app_entry OBJECT
               "${_dg_igr_hdg_runtime_app_entry_source}")
   target_include_directories(dg_igr_hdg_runtime_app_entry PRIVATE
@@ -132,10 +143,22 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF)
 
-  dg_igr_add_hdg_cxx17_component(
-    TARGET dg_igr_hdg_runtime_cpu
-    SOURCES ${_dg_igr_hdg_runtime_cpu_sources}
-    PUBLIC_LINK_LIBRARIES dg_igr_hdg_runtime_common)
+  add_library(dg_igr_hdg_runtime_app_cpu STATIC
+              ${_dg_igr_hdg_runtime_app_cpu_sources}
+              $<TARGET_OBJECTS:dg_igr_hdg_runtime_app_entry>)
+  target_include_directories(dg_igr_hdg_runtime_app_cpu PRIVATE
+                             "${PROJECT_SOURCE_DIR}/include")
+  target_link_libraries(dg_igr_hdg_runtime_app_cpu PUBLIC
+                        dg_igr_hdg_runtime_app_contract
+                        dg_igr_hdg_runtime_cpu
+                        mfem
+                        MPI::MPI_CXX)
+  target_compile_options(dg_igr_hdg_runtime_app_cpu PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+  set_target_properties(dg_igr_hdg_runtime_app_cpu PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
 
   target_link_libraries(dg_igr_hdg_runtime_components INTERFACE
                         dg_igr_hdg_runtime_common
@@ -191,8 +214,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   endif()
 
   add_executable(dg_igr_hdg_runtime
-                 ${_dg_igr_hdg_runtime_app_executable_sources}
-                 $<TARGET_OBJECTS:dg_igr_hdg_runtime_app_entry>)
+                 ${_dg_igr_hdg_runtime_app_executable_sources})
   if(MFEM_USE_CUDA)
     target_sources(dg_igr_hdg_runtime PRIVATE
       $<TARGET_OBJECTS:dg_igr_hdg_runtime_scalar_cuda_rank2_app>)
@@ -201,7 +223,8 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
                              "${PROJECT_SOURCE_DIR}/include")
   target_link_libraries(dg_igr_hdg_runtime PRIVATE
                         dg_igr_hdg_runtime_app_contract
-                        dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
+                        dg_igr_hdg_runtime_app_cpu
+                        mfem MPI::MPI_CXX)
   if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT OR MFEM_USE_CUDA)
     target_link_libraries(dg_igr_hdg_runtime PRIVATE dg_igr_hdg_auxiliary_cpu)
   endif()

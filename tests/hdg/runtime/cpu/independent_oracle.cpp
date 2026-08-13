@@ -1041,17 +1041,6 @@ OracleHash OracleHashSystemMatrix(const System& system) noexcept
   return OracleHashPair(value, OracleHashDoubles(system.d));
 }
 
-std::vector<int> Partition(const mfem::Mesh& mesh, const int ranks)
-{
-  std::vector<int> result(static_cast<std::size_t>(mesh.GetNE()), 0);
-  for (int element = 0; element < mesh.GetNE(); ++element)
-  {
-    result[static_cast<std::size_t>(element)] =
-        element * ranks / mesh.GetNE();
-  }
-  return result;
-}
-
 bool Assemble(mfem::ParMesh& mesh,
               mfem::ParFiniteElementSpace& interior_space,
               mfem::ParFiniteElementSpace& trace_space,
@@ -1578,8 +1567,7 @@ bool RunIndependentStep(
     translations[1][1] = 1.0;
     mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
         original, original.CreatePeriodicVertexMapping(translations));
-    std::vector<int> partition = Partition(periodic, ranks);
-    mfem::ParMesh mesh(communicator, periodic, partition.data());
+    mfem::ParMesh mesh(communicator, periodic);
     mfem::L2_FECollection interior_collection(
         config.polynomial_order, dim, mfem::BasisType::GaussLegendre,
         mfem::FiniteElement::VALUE);

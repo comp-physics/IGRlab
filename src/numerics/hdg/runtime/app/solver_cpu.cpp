@@ -214,6 +214,7 @@ bool PostPublicationFaultAllowsRetry() noexcept
   return raw == nullptr || std::string_view{raw} == "1";
 }
 
+#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
 bool ConsumeScalarRankStepFault(const char* const environment,
                                 const std::uint64_t step, const int rank,
                                 bool& consumed, int& source_rank) noexcept
@@ -242,6 +243,7 @@ bool ConsumeScalarRankStepFault(const char* const environment,
   consumed = true;
   return true;
 }
+#endif
 
 std::string Hex(const StateHash& hash)
 {
@@ -270,22 +272,47 @@ std::string StepName(const std::uint64_t step)
   return name.str();
 }
 
-bool GatherPhysicalInterior(const CpuCoefficientView& interior,
+bool GatherDoubles(const double* local, std::size_t local_count,
+                   const MpiApplicationContextV1& context,
+                   std::array<int, 2>& counts,
+                   std::array<int, 2>& displacements,
+                   std::vector<double>& gathered, std::string& detail);
+
+bool GatherPhysicalInterior(const CpuStateSnapshot& snapshot,
                             const MpiApplicationContextV1& context,
                             std::array<int, 2>& counts,
                             std::array<int, 2>& displacements,
-                            std::vector<double>& global,
+                            std::vector<CpuCanonicalEntry>& global,
                             std::string& detail)
 {
+  static_assert(std::is_trivially_copyable<CpuCanonicalEntry>::value,
+                "physical VTK records require MPI-byte transport");
+  const CpuCoefficientView& interior = snapshot.interior;
   const bool local_valid = interior.size <= static_cast<std::size_t>(
-      std::numeric_limits<int>::max()) &&
-      (interior.size == 0 || interior.data != nullptr);
+      std::numeric_limits<int>::max()) && interior.data != nullptr &&
+      snapshot.physical_interior_ids != nullptr &&
+      snapshot.physical_interior_id_count == interior.size &&
+      snapshot.scalar_interior_dofs > 0;
   if (!CollectiveAll(local_valid, context.communicator()))
   {
     detail = "VTK rank-local interior extent is invalid";
     return false;
   }
-  const int local_count = static_cast<int>(interior.size);
+  std::vector<CpuCanonicalEntry> local;
+  bool allocated = true;
+  try
+  {
+    local.resize(interior.size);
+    for (std::size_t index = 0; index < interior.size; ++index)
+      local[index] = {snapshot.physical_interior_ids[index], interior.data[index]};
+  }
+  catch (...) { allocated = false; }
+  if (!CollectiveAll(allocated, context.communicator()))
+  {
+    detail = "VTK physical record allocation failed";
+    return false;
+  }
+  const int local_count = static_cast<int>(local.size());
   const bool count_gathered = MPI_Gather(
       &local_count, 1, MPI_INT, counts.data(), 1, MPI_INT, 0,
       context.communicator()) == MPI_SUCCESS;
@@ -318,9 +345,36 @@ bool GatherPhysicalInterior(const CpuCoefficientView& interior,
     }
   }
   if (!CollectiveAll(root_valid, context.communicator())) return false;
-  const int gather = MPI_Gatherv(
-      interior.data, local_count, MPI_DOUBLE, global.data(), counts.data(),
-      displacements.data(), MPI_DOUBLE, 0, context.communicator());
+  std::array<int, 2> byte_counts{}, byte_displacements{};
+  bool byte_valid = local_count <= std::numeric_limits<int>::max() /
+      static_cast<int>(sizeof(CpuCanonicalEntry));
+  if (context.rank() == 0)
+  {
+    for (int rank = 0; rank < context.ranks(); ++rank)
+    {
+      if (counts[rank] > std::numeric_limits<int>::max() /
+              static_cast<int>(sizeof(CpuCanonicalEntry)) ||
+          displacements[rank] > std::numeric_limits<int>::max() /
+              static_cast<int>(sizeof(CpuCanonicalEntry)))
+      {
+        byte_valid = false;
+        break;
+      }
+      byte_counts[rank] =
+          counts[rank] * static_cast<int>(sizeof(CpuCanonicalEntry));
+      byte_displacements[rank] =
+          displacements[rank] * static_cast<int>(sizeof(CpuCanonicalEntry));
+    }
+  }
+  if (!CollectiveAll(byte_valid, context.communicator()))
+  {
+    detail = "VTK physical record bytes exceed MPI range";
+    return false;
+  }
+  const int gather = MPI_Gatherv(local.data(),
+      local_count * static_cast<int>(sizeof(CpuCanonicalEntry)), MPI_BYTE,
+      global.data(), byte_counts.data(), byte_displacements.data(), MPI_BYTE,
+      0, context.communicator());
   if (!CollectiveAll(gather == MPI_SUCCESS, context.communicator()))
   {
     detail = "MPI_Gatherv VTK interior state failed";
@@ -330,10 +384,7 @@ bool GatherPhysicalInterior(const CpuCoefficientView& interior,
 }
 
 bool MakeVtk(const ValidatedApplicationConfig& config,
-             const int ranks,
-             const std::array<int, 2>& counts,
-             const std::array<int, 2>& displacements,
-             const std::vector<double>& gathered,
+             const std::vector<CpuCanonicalEntry>& gathered,
              std::string& vtk,
              std::string& detail)
 {
@@ -360,26 +411,17 @@ bool MakeVtk(const ValidatedApplicationConfig& config,
                                                   config.mesh_n());
     const int scalar_dofs = (config.polynomial_order() + 1) *
                             (config.polynomial_order() + 1);
-    for (int rank = 0; rank < ranks; ++rank)
-    {
-      const int expected_elements =
-          (global_elements * (rank + 1) + ranks - 1) / ranks -
-          (global_elements * rank + ranks - 1) / ranks;
-      if (counts[static_cast<std::size_t>(rank)] !=
-          expected_elements * scalar_dofs * 4)
-      {
-        detail = "rank-ordered VTK state census is invalid";
-        return false;
-      }
-    }
-    std::array<int, 2> local_elements{};
+    if (static_cast<int>(gathered.size()) != global_elements * scalar_dofs * 4)
+    { detail = "VTK physical record census is invalid"; return false; }
+    std::vector<CpuCanonicalEntry> records = gathered;
+    std::sort(records.begin(), records.end(),
+              [](const CpuCanonicalEntry& a, const CpuCanonicalEntry& b)
+              { return a.global_id < b.global_id; });
+    for (std::size_t index = 0; index < records.size(); ++index)
+      if (records[index].global_id != index)
+      { detail = "VTK physical records are not complete and unique"; return false; }
     for (int element = 0; element < global_elements; ++element)
     {
-      const int owner = element * ranks / global_elements;
-      const int local_element =
-          local_elements[static_cast<std::size_t>(owner)]++;
-      const int local_scalar_dofs =
-          counts[static_cast<std::size_t>(owner)] / 4;
       mfem::Array<int> vector_dofs;
       space.GetElementVDofs(element, vector_dofs);
       if (vector_dofs.Size() != scalar_dofs * 4)
@@ -390,23 +432,18 @@ bool MakeVtk(const ValidatedApplicationConfig& config,
       for (int scalar = 0; scalar < scalar_dofs; ++scalar)
         for (int component = 0; component < 4; ++component)
         {
-          const int source = displacements[static_cast<std::size_t>(owner)] +
-              component * local_scalar_dofs +
-              local_element * scalar_dofs + scalar;
+          const std::size_t source = (static_cast<std::size_t>(element) *
+              scalar_dofs + scalar) * 4 + component;
           const int encoded = vector_dofs[
               scalar + component * scalar_dofs];
           const int destination = encoded >= 0 ? encoded : -1 - encoded;
           const double sign = encoded >= 0 ? 1.0 : -1.0;
-          if (source < 0 ||
-              source >= displacements[static_cast<std::size_t>(owner)] +
-                  counts[static_cast<std::size_t>(owner)] ||
-              destination < 0 || destination >= field.Size())
+          if (source >= records.size() || destination < 0 || destination >= field.Size())
           {
             detail = "rank-ordered VTK element map is out of range";
             return false;
           }
-          field[destination] = sign *
-              gathered[static_cast<std::size_t>(source)];
+          field[destination] = sign * records[source].value;
         }
     }
     std::ostringstream output;
@@ -432,8 +469,8 @@ bool StageStateVtk(const ValidatedApplicationConfig& config,
 {
   std::array<int, 2> counts{};
   std::array<int, 2> displacements{};
-  std::vector<double> global;
-  if (!GatherPhysicalInterior(snapshot.interior, context, counts,
+  std::vector<CpuCanonicalEntry> global;
+  if (!GatherPhysicalInterior(snapshot, context, counts,
                               displacements, global, detail))
   {
     return false;
@@ -444,8 +481,7 @@ bool StageStateVtk(const ValidatedApplicationConfig& config,
     try
     {
       std::string vtk;
-      staged_ok = MakeVtk(config, context.ranks(), counts, displacements,
-                          global, vtk, detail);
+      staged_ok = MakeVtk(config, global, vtk, detail);
       if (staged_ok)
       {
         payload.assign(vtk.begin(), vtk.end());
@@ -710,8 +746,8 @@ bool MakeScalarIgrVtk(const ValidatedApplicationConfig& config,
   std::vector<double> gathered;
   const CpuCoefficientView interior{state.interior.data(),
                                     state.interior.size()};
-  if (!GatherPhysicalInterior(interior, context, counts, displacements,
-                              gathered, detail))
+  if (!GatherDoubles(interior.data, interior.size, context, counts,
+                     displacements, gathered, detail))
     return false;
   bool staged = true;
   if (context.rank() == 0)
@@ -921,6 +957,12 @@ bool StageCheckpoint(const ValidatedApplicationConfig& config,
       for (int rank = 0; rank < context.ranks(); ++rank)
       {
         const std::size_t index = static_cast<std::size_t>(rank);
+        if (interior_counts[index] < 0 || trace_counts[index] < 0 ||
+            interior_counts[index] % 4 != 0 || trace_counts[index] % 4 != 0)
+        {
+          staged_ok = false;
+          break;
+        }
         ranks[index].rank = static_cast<std::uint32_t>(rank);
         ranks[index].interior = {
             interior.data() + interior_displacements[index],
@@ -933,11 +975,11 @@ bool StageCheckpoint(const ValidatedApplicationConfig& config,
             static_cast<std::uint64_t>(trace_counts[index] / 4),
             CoefficientOrderingV1::component_major};
       }
-      const CheckpointCodecStatus codec = captured
+      const CheckpointCodecStatus codec = captured && staged_ok
           ? EncodeCheckpointV1(*captured, ranks.data(),
                                static_cast<std::size_t>(context.ranks()), encoded)
           : CheckpointCodecStatus::invalid_descriptor;
-      staged_ok = codec == CheckpointCodecStatus::ok &&
+      staged_ok = staged_ok && codec == CheckpointCodecStatus::ok &&
           transaction.Stage("restart-checkpoint.v2", encoded.data(),
                             encoded.size(), detail) == DurableIoStatus::ok &&
           transaction.AddAlias(
@@ -964,9 +1006,38 @@ bool RestoreCheckpoint(const ValidatedApplicationConfig& config,
                        CpuCheckpoint& checkpoint,
                        std::string& detail)
 {
+  std::array<RankCoefficientExtentsV1, 2> observed{};
+  const std::array<std::uint64_t, 2> local_shape{{
+      evidence.local_owned_interior_coefficients,
+      evidence.local_owned_true_trace_coefficients}};
+  std::array<std::array<std::uint64_t, 2>, 2> all_shapes{};
+  const bool shapes_gathered = MPI_Allgather(
+      local_shape.data(), 2, MPI_UINT64_T, all_shapes.data(), 2,
+      MPI_UINT64_T, context.communicator()) == MPI_SUCCESS;
+  if (!CollectiveAll(shapes_gathered, context.communicator()))
+  {
+    detail = "MPI_Allgather restart runtime extents failed";
+    return false;
+  }
+  for (int rank = 0; rank < context.ranks(); ++rank)
+  {
+    const auto& shape = all_shapes[static_cast<std::size_t>(rank)];
+    if (shape[0] % 4 != 0 || shape[1] % 4 != 0)
+    {
+      detail = "restart observed extent is not component-major";
+      return false;
+    }
+    observed[static_cast<std::size_t>(rank)] = {
+        shape[0] / 4, shape[0], shape[1] / 4, shape[1]};
+  }
   ScenarioCoefficientExtentsV1 extents{};
-  if (!DeriveScenarioCoefficientExtentsV1(
-          config, static_cast<std::uint32_t>(context.ranks()), extents))
+  const bool observed_rank2 = context.ranks() == 2;
+  if (!(observed_rank2
+            ? DeriveObservedCoefficientExtentsV1(
+                  config, static_cast<std::uint32_t>(context.ranks()),
+                  observed.data(), extents)
+            : DeriveScenarioCoefficientExtentsV1(
+                  config, static_cast<std::uint32_t>(context.ranks()), extents)))
   {
     detail = "restart coefficient extents are invalid";
     return false;
@@ -2652,13 +2723,17 @@ public:
     const bool prepared = retry ? adapter_.PrepareRetry(transaction.staging)
                                 : adapter_.PrepareAdvance(transaction.staging);
     if (!prepared) return false;
-    transaction.candidate = {
-        transaction.staging.target_coordinates,
-        transaction.staging.interior_hash,
-        transaction.staging.trace_hash,
-        transaction.staging.state_hash,
-        transaction.staging.interior,
-        transaction.staging.trace};
+    auto candidate_capability =
+        adapter_.AcquirePreparedCandidate(transaction.staging);
+    if (!candidate_capability || !adapter_.ConsumePreparedCandidate(
+                                   std::move(*candidate_capability),
+                                   transaction.candidate))
+    {
+      (void)adapter_.AbortPrepared(
+          transaction.staging, CpuFailurePhase::diagnostics, 0);
+      return false;
+    }
+    transaction.candidate.coordinates = transaction.staging.target_coordinates;
     transaction.future_checkpoint = transaction.staging.future_checkpoint;
     if (!transaction.staging.numerically_ready)
     {
@@ -3499,13 +3574,18 @@ public:
       transaction.outcome = adapter_.FinalizePrepared(transaction.staging);
       return false;
     }
-    transaction.candidate = {
-        transaction.staging.target_coordinates,
-        transaction.staging.interior_hash,
-        transaction.staging.trace_hash,
-        transaction.staging.state_hash,
-        transaction.staging.interior,
-        transaction.staging.trace};
+    auto candidate_capability =
+        adapter_.AcquirePreparedCandidate(transaction.staging);
+    const bool locally_consumed = candidate_capability &&
+        adapter_.ConsumePreparedCandidate(std::move(*candidate_capability),
+                                          transaction.candidate);
+    if (!RankCommon(locally_consumed))
+    {
+      transaction.outcome = adapter_.AbortPrepared(
+          transaction.staging, CpuFailurePhase::diagnostics);
+      return false;
+    }
+    transaction.candidate.coordinates = transaction.staging.target_coordinates;
     transaction.future_checkpoint = transaction.staging.future_checkpoint;
     const bool locally_prepared_commit = adapter_.PrepareCommit(
         transaction.staging, transaction.prepared);

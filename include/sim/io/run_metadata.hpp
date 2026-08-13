@@ -183,6 +183,14 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << detail::ToJsonString(
            DeviceBackendToString(run_cfg.device_backend))
       << ",\n";
+  out << "    \"discretization\": "
+      << detail::ToJsonString(
+           DiscretizationToString(run_cfg.discretization))
+      << ",\n";
+  out << "    \"discretization_provenance\": "
+      << detail::ToJsonString(DiscretizationProvenanceToString(
+           run_cfg.discretization_provenance))
+      << ",\n";
   out << "    \"dg_backend\": "
       << detail::ToJsonString(DGBackendToString(run_cfg.dg_backend)) << ",\n";
   out << "    \"dgsem_volume_flux\": "
