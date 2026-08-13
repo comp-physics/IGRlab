@@ -760,6 +760,54 @@ std::vector<int> BuildPartition(const mfem::Mesh& mesh, const int rank_count)
   return partition;
 }
 
+bool CheckZeroLocalMapPlanAndExchange(MPI_Comm comm)
+{
+  int rank = -1;
+  int rank_count = 0;
+  MPI_Comm_rank(comm, &rank);
+  MPI_Comm_size(comm, &rank_count);
+  if (rank_count == 1) { return true; }
+
+  // One globally owned cell leaves rank one with no local elements, faces, or
+  // trace dofs.  It must nevertheless retain an empty plan and participate in
+  // the same plan distribution as the owner rank.
+  mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
+      1, 1, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+  const std::vector<int> partition(1, 0);
+  mfem::ParMesh mesh(comm, serial_mesh, partition.data());
+  mfem::DG_Interface_FECollection collection(
+      1, 2, mfem::FiniteElement::VALUE, mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace space(
+      &mesh, &collection, vector_dimension, mfem::Ordering::byNODES);
+
+  DGInterfaceTraceMap map;
+  DGInterfaceTraceExchangePlan plan;
+  bool local = BuildDGInterfaceTraceMap(space, map) && map.IsConsistent() &&
+      BuildDGInterfaceTraceExchangePlan(space, plan) && plan.IsConsistent();
+  const bool empty_rank = mesh.GetNE() == 0;
+  local = local && (empty_rank
+      ? (space.GetVSize() == 0 && space.GetTrueVSize() == 0 &&
+         mesh.GetNumFaces() == 0 && map.dofs.entries.empty() &&
+         map.faces.empty() && plan.map.dofs.entries.empty() &&
+         plan.map.faces.empty())
+      : (space.GetVSize() > 0 && space.GetTrueVSize() > 0 &&
+         !map.dofs.entries.empty() && !map.faces.empty()));
+  if (!GlobalAll(comm, local)) { return false; }
+
+  mfem::Vector true_values(space.GetTrueVSize());
+  true_values = 1.0;
+  mfem::Vector distributed(space.GetVSize());
+  distributed = -1.0;
+  local = plan.Distribute(space, true_values, distributed);
+  const double* const distributed_data = distributed.HostRead();
+  local = local && (distributed_data != nullptr || distributed.Size() == 0);
+  for (int dof = 0; dof < distributed.Size(); ++dof)
+  {
+    local = NearlyEqual(distributed_data[dof], 1.0) && local;
+  }
+  return GlobalAll(comm, local);
+}
+
 double SerialActionOracle(mfem::Mesh& mesh,
                           const mfem::FiniteElementCollection& collection)
 {
@@ -790,7 +838,9 @@ bool CheckMapExchangeAndParity(MPI_Comm comm)
   int rank_count = 0;
   MPI_Comm_rank(comm, &rank);
   MPI_Comm_size(comm, &rank_count);
-  if (rank_count != 1 && rank_count != 2) { return false; }
+  // This parity partition is intentionally two-way; the zero-local plan test
+  // below covers all larger communicator sizes with its rank-zero-owned cell.
+  if (rank_count > 2) { return true; }
 
   constexpr int elements_x = 4;
   constexpr int elements_y = 2;
@@ -1041,7 +1091,7 @@ int main(int argc, char* argv[])
   int rank_count = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &rank_count);
-  if (rank_count != 1 && rank_count != 2)
+  if (rank_count < 1)
   {
     MPI_Finalize();
     return 75;
@@ -1052,6 +1102,9 @@ int main(int argc, char* argv[])
               CheckAnalyticSegmentOrientations(), failures, rank);
   RecordCheck("zero_owned_true_dof_map_contract",
               CheckZeroOwnedMapContract(), failures, rank);
+  RecordCheck("zero_local_dg_trace_map_plan_exchange",
+              CheckZeroLocalMapPlanAndExchange(MPI_COMM_WORLD), failures,
+              rank);
   RecordCheck("unsupported_3d_rejected", CheckUnsupported3D(), failures, rank);
   RecordCheck("dg_interface_map_exchange_and_parity",
               CheckMapExchangeAndParity(MPI_COMM_WORLD), failures, rank);

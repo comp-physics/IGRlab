@@ -665,6 +665,10 @@ void ArmCpuCollectiveTestFault(
 void ResetCpuCollectiveTestFault() noexcept;
 CpuCollectiveTestConsumptionEvidence ObserveCpuCollectiveTestFault() noexcept;
 
+/** Test-only assertion of the borrowed physical-boundary Picard row. */
+void ResetCpuGenericBoundaryPicardTestObservation() noexcept;
+bool CpuGenericBoundaryPicardAssemblyObservedForTests() noexcept;
+
 struct CpuCollectiveTestAccess
 {
   template <typename Selection>

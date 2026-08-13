@@ -706,6 +706,17 @@ struct CpuCollectiveTestLogicalState
 // or consume this private fault state.
 thread_local CpuCollectiveTestLogicalState collective_test_state{};
 
+struct CpuGenericBoundaryPicardTestState
+{
+  std::uint64_t callbacks = 0;
+  std::uint64_t physical_rows = 0;
+  std::uint64_t zero_c_rows = 0;
+  std::uint64_t nonzero_d_rows = 0;
+};
+
+thread_local CpuGenericBoundaryPicardTestState
+    generic_boundary_picard_test_state{};
+
 bool ConsumeOwnedCollectiveTestFault(
     const detail::CpuCollectiveTestFault expected, const int rank,
     const std::uint64_t incarnation) noexcept
@@ -841,6 +852,20 @@ detail::ObserveCpuCollectiveTestFault() noexcept
           collective_test_state.armed,
           collective_test_state.reset_collectively_attested,
           true};
+}
+
+void detail::ResetCpuGenericBoundaryPicardTestObservation() noexcept
+{
+  generic_boundary_picard_test_state = {};
+}
+
+bool detail::CpuGenericBoundaryPicardAssemblyObservedForTests() noexcept
+{
+  const CpuGenericBoundaryPicardTestState& state =
+      generic_boundary_picard_test_state;
+  return state.callbacks != 0 && state.callbacks == state.physical_rows &&
+      state.zero_c_rows == state.physical_rows &&
+      state.nonzero_d_rows == state.physical_rows;
 }
 
 struct CpuSlotStorage
@@ -1050,10 +1075,14 @@ bool CpuStateStoragePolicy::Disjoint(
   return ValidSlot(left) && ValidSlot(right) &&
       left.interior.cell != right.interior.cell &&
       left.interior.cell->backing.get() != right.interior.cell->backing.get() &&
-      left.interior.cell->backing->interior.data() !=
-          right.interior.cell->backing->interior.data() &&
-      left.interior.cell->backing->trace.data() !=
-          right.interior.cell->backing->trace.data();
+      (left.interior.cell->backing->interior.empty() ||
+       right.interior.cell->backing->interior.empty() ||
+       left.interior.cell->backing->interior.data() !=
+           right.interior.cell->backing->interior.data()) &&
+      (left.interior.cell->backing->trace.empty() ||
+       right.interior.cell->backing->trace.empty() ||
+       left.interior.cell->backing->trace.data() !=
+           right.interior.cell->backing->trace.data());
 }
 
 StateHash CpuStateStoragePolicy::HashInterior(
@@ -2104,9 +2133,10 @@ struct detail::CpuNumericsCore::Implementation
     try
     {
       trace_distribution_workspace = 0.0;
-      local_prepared = exchange_plan && !ConsumeOwnedCollectiveTestFault(
-          detail::CpuCollectiveTestFault::trace_load_preparation, rank,
-          incarnation);
+      local_prepared = exchange_plan.has_value() &&
+          !ConsumeOwnedCollectiveTestFault(
+              detail::CpuCollectiveTestFault::trace_load_preparation, rank,
+              incarnation);
     }
     catch (...)
     {
@@ -2136,7 +2166,7 @@ struct detail::CpuNumericsCore::Implementation
       {
         local_copied = false;
       }
-      if (local_copied)
+      if (local_copied && trace_distribution_workspace.Size() != 0)
       {
         std::memcpy(destination, source,
                     static_cast<std::size_t>(
@@ -2408,22 +2438,24 @@ struct detail::CpuNumericsCore::Implementation
   {
     try
     {
-      const mfem::FiniteElement* interior = interior_space->GetFE(0);
       const int expected_interior_dofs =
           (config.polynomial_order + 1) * (config.polynomial_order + 1);
-      if (!interior || interior->GetDof() != expected_interior_dofs ||
-          mesh->GetNE() <= 0)
-      {
-        return false;
-      }
-      scalar_interior_dofs = interior->GetDof();
+      scalar_interior_dofs = expected_interior_dofs;
       local_interior = scalar_interior_dofs * cpu_conserved_components;
-      mfem::Array<int> first_faces, first_orientations;
-      mesh->GetElementEdges(0, first_faces, first_orientations);
-      if (first_faces.Size() != 4) { return false; }
       scalar_trace_dofs = config.polynomial_order + 1;
-      local_trace = first_faces.Size() * scalar_trace_dofs *
+      local_trace = 4 * scalar_trace_dofs *
           cpu_conserved_components;
+      if (mesh->GetNE() > 0)
+      {
+        const mfem::FiniteElement* interior = interior_space->GetFE(0);
+        mfem::Array<int> first_faces, first_orientations;
+        mesh->GetElementEdges(0, first_faces, first_orientations);
+        if (!interior || interior->GetDof() != expected_interior_dofs ||
+            first_faces.Size() != 4)
+        {
+          return false;
+        }
+      }
       if (!ResizeOwned(element_interior_vdofs,
                        static_cast<std::size_t>(mesh->GetNE()) *
                            local_interior,
@@ -2481,6 +2513,11 @@ struct detail::CpuNumericsCore::Implementation
 
   bool PrimeCondensationWorkspace() noexcept
   {
+    if (mesh->GetNE() == 0)
+    {
+      current_system.Zero();
+      return true;
+    }
     current_system.Zero();
     for (int element = 0; element < current_system.elements; ++element)
       for (int index = 0; index < local_interior; ++index)
@@ -2542,23 +2579,31 @@ struct detail::CpuNumericsCore::Implementation
         int* diagonal_j = true_diagonal_view.GetJ();
         double* diagonal_data = true_diagonal_view.GetData();
         double* offdiagonal_data = true_offdiagonal_view.GetData();
-        if (!row_starts || !diagonal_i || !diagonal_j || !diagonal_data ||
-            (true_offdiagonal_view.NumNonZeroElems() != 0 &&
-             !offdiagonal_data))
+        const int diagonal_nnz = true_diagonal_view.NumNonZeroElems();
+        const int offdiagonal_nnz = true_offdiagonal_view.NumNonZeroElems();
+        const int local_rows = true_diagonal_view.Height();
+        // A globally active borrowed mesh may legitimately give this rank no
+        // true-trace rows.  Hypre/MFEM then expose empty (and potentially
+        // null) local CSR storage; no entry is read or written on that rank.
+        if ((local_rows != 0 && !row_starts) ||
+            (local_rows != 0 && !diagonal_i) ||
+            (diagonal_nnz != 0 && (!diagonal_j || !diagonal_data)) ||
+            (offdiagonal_nnz != 0 && !offdiagonal_data))
         {
           return false;
         }
+        if (diagonal_nnz != 0)
+        {
+          std::fill(diagonal_data, diagonal_data + diagonal_nnz, 0.0);
+        }
+        if (offdiagonal_nnz != 0)
+        {
+          std::fill(offdiagonal_data, offdiagonal_data + offdiagonal_nnz, 0.0);
+        }
+        if (local_rows == 0) { return true; }
         const HYPRE_BigInt row_begin = HYPRE_AssumedPartitionCheck()
             ? row_starts[0] : row_starts[rank];
-        std::fill(diagonal_data,
-                  diagonal_data + true_diagonal_view.NumNonZeroElems(), 0.0);
-        if (true_offdiagonal_view.NumNonZeroElems() != 0)
-        {
-          std::fill(
-              offdiagonal_data,
-              offdiagonal_data + true_offdiagonal_view.NumNonZeroElems(), 0.0);
-        }
-        for (int row = 0; row < true_diagonal_view.Height(); ++row)
+        for (int row = 0; row < local_rows; ++row)
         {
           bool found = false;
           for (int entry = diagonal_i[row]; entry < diagonal_i[row + 1];
@@ -2643,7 +2688,7 @@ struct detail::CpuNumericsCore::Implementation
     int* diagonal_j = true_diagonal_view.GetJ();
     int* offdiagonal_i = true_offdiagonal_view.GetI();
     int* offdiagonal_j = true_offdiagonal_view.GetJ();
-    if (!row_starts || !diagonal_i || !diagonal_j || !offdiagonal_i)
+    if (!row_starts || !diagonal_i)
     {
       return false;
     }
@@ -2659,6 +2704,7 @@ struct detail::CpuNumericsCore::Implementation
     if (global_column >= static_cast<std::uint64_t>(row_begin) &&
         global_column < static_cast<std::uint64_t>(row_end))
     {
+      if (!diagonal_j) { return false; }
       const int local_column = static_cast<int>(global_column - row_begin);
       for (int entry = diagonal_i[local_row];
            entry < diagonal_i[local_row + 1]; ++entry)
@@ -2672,7 +2718,10 @@ struct detail::CpuNumericsCore::Implementation
       }
       return false;
     }
-    if (!offdiagonal_j || !true_offdiagonal_columns) { return false; }
+    if (!offdiagonal_i || !offdiagonal_j || !true_offdiagonal_columns)
+    {
+      return false;
+    }
     for (int entry = offdiagonal_i[local_row];
          entry < offdiagonal_i[local_row + 1]; ++entry)
     {
@@ -3376,7 +3425,6 @@ struct detail::CpuNumericsCore::Implementation
                                      face_trace_shape_workspace);
             State interior_state{}, trace_state{}, trace_flux{}, exterior_state{};
             Matrix4 trace_jacobian{};
-            Matrix4 exterior_jacobian{};
             bool physical_boundary = false;
             if (!Interpolate(current_interior, interior_vdofs,
                              scalar_interior_dofs,
@@ -3413,29 +3461,15 @@ struct detail::CpuNumericsCore::Implementation
               {
                 return false;
               }
-              // The generic callback defines exterior(U), not exterior(trace).
-              // Its finite-difference derivative belongs only in C; D is the
-              // trace mass matrix for this boundary constraint.
-              constexpr double epsilon = 1.0e-7;
-              for (int column = 0; column < cpu_conserved_components; ++column)
-              {
-                State perturbed = interior_state;
-                const double delta = epsilon *
-                    std::max(1.0, std::abs(interior_state[column]));
-                perturbed[column] += delta;
-                State perturbed_exterior{};
-                if (!borrowed_request->boundary.exterior_state(
-                        borrowed_request->boundary.context, point,
-                        perturbed.data(), perturbed_exterior.data()) ||
-                    !Finite(perturbed_exterior))
-                {
-                  return false;
-                }
-                for (int row = 0; row < cpu_conserved_components; ++row)
-                  exterior_jacobian[row][column] =
-                      (perturbed_exterior[row] - exterior_state[row]) / delta;
-              }
+              // NumericalBoundaryState is a value callback, not a
+              // differentiable or pure function. Freeze this one exterior
+              // value for the current Picard/Newton assembly: the boundary
+              // row is trace - exterior(U_frozen), with C = 0 and D equal to
+              // the trace mass matrix. The interior numerical flux remains
+              // the ordinary trace-dependent A/B coupling.
               physical_boundary = true;
+              ++generic_boundary_picard_test_state.callbacks;
+              ++generic_boundary_picard_test_state.physical_rows;
             }
             const double weight = face_point.weight * face_measure;
             for (int row = 0; row < scalar_interior_dofs; ++row)
@@ -3520,7 +3554,7 @@ struct detail::CpuNumericsCore::Implementation
                   const int local_column =
                       ByNodes(column, scalar_interior_dofs, column_component);
                   const double derivative = physical_boundary
-                      ? -exterior_jacobian[row_component][column_component]
+                      ? 0.0
                       : (row_component == column_component
                              ? cpu_fixed_tau : 0.0);
                   system.c[static_cast<std::size_t>(element) * local_trace *
@@ -3553,10 +3587,38 @@ struct detail::CpuNumericsCore::Implementation
                                  local_trace +
                              static_cast<std::size_t>(local_row) *
                                  local_trace +
-                                 local_column] +=
+                             local_column] +=
                         weight * face_trace_shape_workspace[row] *
                         face_trace_shape_workspace[column] * derivative;
                   }
+            if (physical_boundary)
+            {
+              bool c_is_zero = true;
+              bool d_is_nonzero = false;
+              for (int row = 0; row < scalar_trace_dofs; ++row)
+                for (int component = 0;
+                     component < cpu_conserved_components; ++component)
+                {
+                  const int local_row = trace_offset +
+                      ByNodes(row, scalar_trace_dofs, component);
+                  for (int column = 0; column < local_interior; ++column)
+                    c_is_zero = c_is_zero &&
+                        system.c[static_cast<std::size_t>(element) *
+                                     local_trace * local_interior +
+                                 static_cast<std::size_t>(local_row) *
+                                     local_interior + column] == 0.0;
+                  d_is_nonzero = d_is_nonzero ||
+                      system.d[static_cast<std::size_t>(element) *
+                                   local_trace * local_trace +
+                               static_cast<std::size_t>(local_row) *
+                                   local_trace + local_row] != 0.0;
+                }
+              if (c_is_zero) { ++generic_boundary_picard_test_state.zero_c_rows; }
+              if (d_is_nonzero)
+              {
+                ++generic_boundary_picard_test_state.nonzero_d_rows;
+              }
+            }
           }
           trace_offset += scalar_trace_dofs * cpu_conserved_components;
         }
@@ -3781,6 +3843,13 @@ struct detail::CpuNumericsCore::Implementation
     {
       const auto prepare_outgoing = [&]() -> bool
       {
+        if (system.elements == 0)
+        {
+          *local_matrix = 0.0;
+          local_trace_rhs = 0.0;
+          return outgoing_schur_terms.empty() && schur.empty() &&
+              reduced_rhs.empty();
+        }
         const LocalBlockShape shape{
             local_interior / cpu_conserved_components,
             local_trace / cpu_conserved_components,
@@ -4136,7 +4205,7 @@ struct detail::CpuNumericsCore::Implementation
               static_cast<std::size_t>(element) * local_trace + local] =
               sign * distributed[dof];
         }
-      if (local_recovery_ready &&
+      if (local_recovery_ready && mesh->GetNE() > 0 &&
           (condensation.Recover(
               AsConst(View(local_trace_increment.data(), mesh->GetNE(),
                            local_trace, 1)),
@@ -4190,7 +4259,11 @@ struct detail::CpuNumericsCore::Implementation
       const double* trace_values = iterate_true_trace.HostRead();
       const double* trace_delta = true_increment.HostRead();
       double* trace_trial = trial_true_trace.HostWrite();
-      if (!interior || !trial || !trace_values || !trace_delta || !trace_trial)
+      if ((!interior && iterate_interior->Size() != 0) ||
+          (!trial && trial_interior->Size() != 0) ||
+          (!trace_values && iterate_true_trace.Size() != 0) ||
+          (!trace_delta && true_increment.Size() != 0) ||
+          (!trace_trial && trial_true_trace.Size() != 0))
       {
         local_trial_ready = false;
       }
@@ -4223,18 +4296,27 @@ struct detail::CpuNumericsCore::Implementation
       double* next_interior = iterate_interior->HostWrite();
       const double* trace_values = trial_true_trace.HostRead();
       double* next_trace = iterate_true_trace.HostWrite();
-      if (!interior || !next_interior || !trace_values || !next_trace)
+      if ((!interior && trial_interior->Size() != 0) ||
+          (!next_interior && iterate_interior->Size() != 0) ||
+          (!trace_values && trial_true_trace.Size() != 0) ||
+          (!next_trace && iterate_true_trace.Size() != 0))
       {
         local_accept_ready = false;
       }
       if (local_accept_ready)
       {
-        std::memcpy(next_interior, interior,
-                    static_cast<std::size_t>(iterate_interior->Size()) *
-                        sizeof(double));
-        std::memcpy(next_trace, trace_values,
-                    static_cast<std::size_t>(iterate_true_trace.Size()) *
-                        sizeof(double));
+        if (iterate_interior->Size() != 0)
+        {
+          std::memcpy(next_interior, interior,
+                      static_cast<std::size_t>(iterate_interior->Size()) *
+                          sizeof(double));
+        }
+        if (iterate_true_trace.Size() != 0)
+        {
+          std::memcpy(next_trace, trace_values,
+                      static_cast<std::size_t>(iterate_true_trace.Size()) *
+                          sizeof(double));
+        }
       }
     }
     catch (...)
@@ -4401,7 +4483,11 @@ bool detail::CpuNumericsCore::RunBorrowedEuler(
   // inapplicable instead of inventing an elements-per-direction value.
   config.elements_per_direction = 0;
   config.assembly_quadrature_order = 2 * request.polynomial_order + 2;
-  config.maximum_newton_updates = cpu_maximum_newton_updates;
+  // The value-only physical boundary is a frozen-exterior Picard row, so its
+  // outer update is intentionally inexact rather than a differentiated
+  // Newton step.  Retain the same engine while allowing that convergent outer
+  // iteration enough bounded sweeps.
+  config.maximum_newton_updates = 80;
   RuntimeTupleDescriptor tuple{};
   tuple.model = StableIdentity::Copy("euler.conservative.2d.v1");
   tuple.formulation = StableIdentity::Copy("hdg.conventional.v1");
@@ -4496,7 +4582,10 @@ bool detail::CpuNumericsCore::InitializeInternal(
     if (generic)
     {
       state.mesh = const_cast<mfem::ParMesh*>(borrowed_request->mesh);
-      local_ok = state.mesh != nullptr && state.mesh->GetNE() > 0;
+      // Generic admission already establishes that the communicator has at
+      // least one element globally. Individual ranks may legitimately own no
+      // elements and must still join the trace/HYPRE collectives below.
+      local_ok = state.mesh != nullptr;
     }
     else
     {
@@ -4542,7 +4631,7 @@ bool detail::CpuNumericsCore::InitializeInternal(
         state.mesh, state.interior_collection.get(),
         cpu_conserved_components, mfem::Ordering::byNODES);
     local_ok = state.ObserveWrapper(state.interior_space) &&
-        state.interior_space->GetVSize() > 0;
+        (generic || state.interior_space->GetVSize() > 0);
   }
   catch (...)
   {
@@ -4556,8 +4645,8 @@ bool detail::CpuNumericsCore::InitializeInternal(
         state.mesh, state.trace_collection.get(),
         cpu_conserved_components, mfem::Ordering::byNODES);
     local_ok = state.ObserveWrapper(state.trace_space) &&
-        state.trace_space->GetVSize() > 0 &&
-        state.trace_space->GetTrueVSize() > 0;
+        (generic || (state.trace_space->GetVSize() > 0 &&
+                     state.trace_space->GetTrueVSize() > 0));
   }
   catch (...)
   {
@@ -4567,7 +4656,11 @@ bool detail::CpuNumericsCore::InitializeInternal(
 
   try
   {
-    state.interior_space->ExchangeFaceNbrData();
+    // This HDG formulation couples ranks through the trace exchange plan; it
+    // never reads MFEM face-neighbour interior values.  Avoid materializing
+    // that optional MFEM storage for borrowed meshes, where an otherwise
+    // valid zero-element rank has no compatible local face-neighbour table.
+    if (!generic) { state.interior_space->ExchangeFaceNbrData(); }
     local_ok = true;
   }
   catch (...)
@@ -4578,7 +4671,9 @@ bool detail::CpuNumericsCore::InitializeInternal(
 
   try
   {
-    state.trace_space->ExchangeFaceNbrData();
+    // See the interior-space rationale above.  The owned standalone route
+    // retains its established MFEM face-neighbour setup unchanged.
+    if (!generic) { state.trace_space->ExchangeFaceNbrData(); }
     local_ok = true;
   }
   catch (...)

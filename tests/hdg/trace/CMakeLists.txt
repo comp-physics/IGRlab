@@ -58,10 +58,16 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set_tests_properties(dg_igr_hdg_trace_dg_mpi_serial_cpu PROPERTIES
     LABELS "hdg;trace;dg-interface;cpu" TIMEOUT 30)
 
-  add_test(NAME dg_igr_hdg_trace_dg_mpi_2_cpu
-    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
-            $<TARGET_FILE:dg_igr_hdg_trace_dg_mpi_test>)
-  set_tests_properties(dg_igr_hdg_trace_dg_mpi_2_cpu PROPERTIES
-    LABELS "hdg;trace;dg-interface;cpu;mpi" PROCESSORS 2
-    RESOURCE_LOCK dg_igr_sm120 SKIP_RETURN_CODE 75 TIMEOUT 60)
+  foreach(_trace_dg_ranks IN ITEMS 2 3)
+    add_test(NAME dg_igr_hdg_trace_dg_mpi_${_trace_dg_ranks}_cpu
+      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${_trace_dg_ranks}
+              $<TARGET_FILE:dg_igr_hdg_trace_dg_mpi_test>)
+    set_tests_properties(dg_igr_hdg_trace_dg_mpi_${_trace_dg_ranks}_cpu
+      PROPERTIES
+        LABELS "hdg;trace;dg-interface;cpu;mpi"
+        PROCESSORS ${_trace_dg_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        SKIP_RETURN_CODE 75
+        TIMEOUT 60)
+  endforeach()
 endif()

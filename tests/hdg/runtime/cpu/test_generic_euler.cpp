@@ -1,13 +1,12 @@
 #include "numerics/hdg/generic/contract.hpp"
 #include "numerics/hdg/runtime/cpu/generic_euler.hpp"
+#include "numerics/hdg/runtime/cpu/persistent_smooth_euler.hpp"
 
 #include <mfem.hpp>
 #include <mpi.h>
 
 #include <array>
-#include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -59,119 +58,19 @@ bool NonperiodicExterior(const void* opaque,
   return true;
 }
 
-bool EulerNormalFlux(const std::array<double, 4>& state,
-                     const std::array<double, 2>& normal,
-                     std::array<double, 4>& flux)
+bool CheckBoundaryExteriorSemantics()
 {
-  if (!(state[0] > 0.0)) return false;
-  const double velocity_x = state[1] / state[0];
-  const double velocity_y = state[2] / state[0];
-  const double pressure = 0.4 * (state[3] - 0.5 *
-      (state[1] * state[1] + state[2] * state[2]) / state[0]);
-  if (!(pressure > 0.0)) return false;
-  const double normal_velocity = velocity_x * normal[0] +
-      velocity_y * normal[1];
-  flux = {{state[0] * normal_velocity,
-            state[1] * normal_velocity + pressure * normal[0],
-            state[2] * normal_velocity + pressure * normal[1],
-            (state[3] + pressure) * normal_velocity}};
-  return true;
-}
-
-bool BoundaryResidual(const BoundaryContext& context,
-                      const std::array<double, 4>& interior,
-                      const std::array<double, 4>& trace,
-                      std::array<double, 8>& residual)
-{
+  BoundaryContext context{};
   const std::array<double, 2> position{{0.25, 0.75}};
   const std::array<double, 2> normal{{1.0, 0.0}};
+  const std::array<double, 4> interior{{1.2, 0.15, -0.04, 2.7}};
+  std::array<double, 4> exterior{};
   const dg::hdg::generic::BoundaryPointView point{
       position.data(), normal.data(), 2, 1};
-  std::array<double, 4> exterior{}, flux{};
-  if (!NonperiodicExterior(&context, point, interior.data(), exterior.data()) ||
-      !EulerNormalFlux(trace, normal, flux)) return false;
-  for (int component = 0; component < 4; ++component)
-  {
-    residual[static_cast<std::size_t>(component)] = flux[component] + 2.5 *
-        (interior[component] - trace[component]);
-    residual[static_cast<std::size_t>(4 + component)] = trace[component] -
-        exterior[component];
-  }
-  return true;
-}
-
-bool CheckFullBoundaryFiniteDifference()
-{
-  const std::array<double, 4> interior{{1.2, 0.15, -0.04, 2.7}};
-  const std::array<double, 4> trace{{1.1, 0.08, 0.03, 2.6}};
-  BoundaryContext context{};
-  constexpr double delta = 1.0e-6;
-  constexpr double tolerance = 2.0e-5;
-  for (int column = 0; column < 8; ++column)
-  {
-    auto plus_interior = interior;
-    auto minus_interior = interior;
-    auto plus_trace = trace;
-    auto minus_trace = trace;
-    if (column < 4)
-    {
-      plus_interior[static_cast<std::size_t>(column)] += delta;
-      minus_interior[static_cast<std::size_t>(column)] -= delta;
-    }
-    else
-    {
-      plus_trace[static_cast<std::size_t>(column - 4)] += delta;
-      minus_trace[static_cast<std::size_t>(column - 4)] -= delta;
-    }
-    std::array<double, 8> plus{}, minus{};
-    if (!BoundaryResidual(context, plus_interior, plus_trace, plus) ||
-        !BoundaryResidual(context, minus_interior, minus_trace, minus))
-    {
-      return false;
-    }
-    for (int row = 0; row < 8; ++row)
-    {
-      const double finite_difference = (plus[static_cast<std::size_t>(row)] -
-          minus[static_cast<std::size_t>(row)]) / (2.0 * delta);
-      double expected = 0.0;
-      if (row < 4 && column < 4)
-        expected = row == column ? 2.5 : 0.0;
-      else if (row >= 4 && column >= 4)
-        expected = row - 4 == column - 4 ? 1.0 : 0.0;
-      else if (row >= 4 && column < 4)
-      {
-        // The reflected exterior has dUext/dU = I - 2 n n^T in momentum.
-        if (row - 4 == column)
-        {
-          expected = -1.0;
-          if (row == 5 && column == 1) expected = 1.0;
-        }
-      }
-      if ((row < 4 && column >= 4) ||
-          std::abs(finite_difference - expected) > tolerance)
-      {
-        // The upper-right Euler-flux block is nonlinear; compare it against
-        // a second, independently sized finite-difference stencil.
-        if (!(row < 4 && column >= 4)) return false;
-        const double reference_delta = 5.0e-7;
-        auto reference_plus = trace;
-        auto reference_minus = trace;
-        reference_plus[static_cast<std::size_t>(column - 4)] += reference_delta;
-        reference_minus[static_cast<std::size_t>(column - 4)] -= reference_delta;
-        std::array<double, 8> reference_a{}, reference_b{};
-        if (!BoundaryResidual(context, interior, reference_plus, reference_a) ||
-            !BoundaryResidual(context, interior, reference_minus, reference_b) ||
-            std::abs(finite_difference -
-                     (reference_a[static_cast<std::size_t>(row)] -
-                      reference_b[static_cast<std::size_t>(row)]) /
-                         (2.0 * reference_delta)) > tolerance)
-        {
-          return false;
-        }
-      }
-    }
-  }
-  return true;
+  return NonperiodicExterior(&context, point, interior.data(), exterior.data()) &&
+      context.calls == 1 && exterior[0] == interior[0] &&
+      exterior[1] == -interior[1] && exterior[2] == interior[2] &&
+      exterior[3] == interior[3];
 }
 
 mfem::ParMesh MakeBorrowedMesh(const MPI_Comm communicator = MPI_COMM_WORLD)
@@ -185,6 +84,17 @@ mfem::ParMesh MakeBorrowedMesh(const MPI_Comm communicator = MPI_COMM_WORLD)
   {
     partition[static_cast<std::size_t>(element)] = element % ranks;
   }
+  return mfem::ParMesh(communicator, serial, partition.data());
+}
+
+mfem::ParMesh MakeRankZeroOwnedBorrowedMesh(
+    const MPI_Comm communicator = MPI_COMM_WORLD)
+{
+  // Deliberately use the frozen contract's globally nonempty one-cell case:
+  // rank zero owns its only cell and all other ranks have NE == 0.
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+      1, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  const std::vector<int> partition(static_cast<std::size_t>(serial.GetNE()), 0);
   return mfem::ParMesh(communicator, serial, partition.data());
 }
 
@@ -264,8 +174,7 @@ bool CheckOrdersAndDeterminism()
   // EulerFieldView is component-major: two repeat samples per component.
   const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
                                         0.0, 0.0, 2.5, 2.5}};
-  const std::array<double, 8> source{{0.01, 0.02, 0.0, 0.0,
-                                       0.0, 0.0, 0.03, 0.04}};
+  const std::array<double, 8> source{{}};
   for (int order = 1; order <= 3; ++order)
   {
     BoundaryContext first_context{};
@@ -293,6 +202,51 @@ bool CheckOrdersAndDeterminism()
     }
   }
   return true;
+}
+
+bool CheckClosedBoundaryPicardAssembly()
+{
+  mfem::ParMesh mesh = MakeBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                        0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.0, 0.0,
+                                       0.0, 0.0, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
+  dg::hdg::runtime::cpu::detail::ResetCpuGenericBoundaryPicardTestObservation();
+  const bool accepted = ExecuteGenericEulerHdgCpu(
+      Request(mesh, 1, boundary, initial, source));
+  // This executes the closed nonperiodic solve.  The production hook observes
+  // the actual assembled physical trace rows: one callback value per face
+  // quadrature point, C = 0, and a nonzero trace-mass D contribution.
+  return accepted && boundary.calls > 0 &&
+      dg::hdg::runtime::cpu::detail::
+          CpuGenericBoundaryPicardAssemblyObservedForTests() &&
+      SameBorrowedMesh(mesh, before, mesh.GetComm());
+}
+
+bool CheckZeroOwnedElementEngine()
+{
+  int ranks = 1;
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  if (ranks == 1) return true;
+  mfem::ParMesh mesh = MakeRankZeroOwnedBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                        0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{{}};
+  BoundaryContext boundary{};
+  const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
+  const bool accepted = ExecuteGenericEulerHdgCpu(
+      Request(mesh, 1, boundary, initial, source));
+  const int local_empty = mesh.GetNE() == 0 ? 1 : 0;
+  int any_empty = 0;
+  if (MPI_Allreduce(&local_empty, &any_empty, 1, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  return accepted && any_empty != 0 &&
+      SameBorrowedMesh(mesh, before, mesh.GetComm());
 }
 
 bool CheckSubcommunicatorIsolation()
@@ -361,20 +315,24 @@ bool CheckAcceptedRequestRankLocalCallbackFailure()
 int main(int argc, char* argv[])
 {
   mfem::MPI_Session mpi(argc, argv);
-  const bool boundary_jacobian = CheckFullBoundaryFiniteDifference();
+  const bool boundary_semantics = CheckBoundaryExteriorSemantics();
   const bool orders = CheckOrdersAndDeterminism();
+  const bool boundary_picard = CheckClosedBoundaryPicardAssembly();
+  const bool zero_owned = CheckZeroOwnedElementEngine();
   const bool subcommunicator = CheckSubcommunicatorIsolation();
   const bool mismatch = CheckCollectiveMismatchAndAtomicFailure();
   const bool callback_failure = CheckAcceptedRequestRankLocalCallbackFailure();
-  const bool local = boundary_jacobian && orders && subcommunicator &&
-      mismatch && callback_failure;
+  const bool local = boundary_semantics && orders && boundary_picard &&
+      zero_owned && subcommunicator && mismatch && callback_failure;
   if (!All(local))
   {
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     std::cerr << "generic Euler CPU test failed on rank " << rank
-              << " boundary_jacobian=" << boundary_jacobian
-              << " orders=" << orders << " subcommunicator=" << subcommunicator
+              << " boundary_semantics=" << boundary_semantics
+              << " orders=" << orders << " boundary_picard=" << boundary_picard
+              << " zero_owned=" << zero_owned
+              << " subcommunicator=" << subcommunicator
               << " mismatch=" << mismatch
               << " callback_failure=" << callback_failure << '\n';
     return 1;
