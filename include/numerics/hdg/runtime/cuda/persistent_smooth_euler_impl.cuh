@@ -767,6 +767,16 @@ public:
     CudaPolicyContext setup{};
     setup.phase = CudaFailurePhase::setup;
     TransportPolicy::BeginAttempt(setup);
+    // Admission of borrowed topology is deliberately ahead of cudaSetDevice,
+    // HYPRE initialization, and arena allocation.  Unsupported degree/rank,
+    // communicator disagreement, geometry, and fixed-arena capacity are thus
+    // collective host-side rejections rather than partially initialized GPU
+    // state.
+    if (!ValidateTopologyBeforeDevice(config))
+    {
+      ReportCudaSetupFailure(evidence.rank, "topology-preflight");
+      return false;
+    }
     if (!CollectiveContinue(ConfigureDeviceAndRanks(config, evidence)))
     {
       ReportCudaSetupFailure(evidence.rank, "configure-device-ranks");
@@ -884,6 +894,7 @@ public:
     evidence.mfem_device_valid = device_resident_;
     evidence.hypre_cuda_umpire_device = hypre_policy_valid_;
     evidence.signed_owner_ghost_semantics = signed_owner_ghost_valid_;
+    evidence.borrowed_topology = borrowed_topology_;
     evidence.host_staged_rank2 = ranks_ == 1 || host_staged_rank2_;
     evidence.no_host_solver_fallback = no_fallback_;
     return true;
@@ -1474,6 +1485,66 @@ public:
   }
 
 private:
+  bool ValidateTopologyBeforeDevice(const CudaConfig& config) const noexcept
+  {
+    const bool supported_rank = config.expected_rank_count == 1 ||
+        config.expected_rank_count == 2;
+    const bool supported_order = config.order == smoke_polynomial_order ||
+        config.order == functional_polynomial_order;
+    int world_ranks = 0;
+    const bool world_ready =
+        MPI_Comm_size(MPI_COMM_WORLD, &world_ranks) == MPI_SUCCESS;
+    bool local_valid = supported_rank && supported_order && world_ready &&
+        world_ranks == config.expected_rank_count;
+    int local_elements = 0;
+
+    if (config.use_borrowed_topology)
+    {
+      local_valid = local_valid && config.borrowed_mesh != nullptr &&
+          config.borrowed_communicator != MPI_COMM_NULL;
+      if (local_valid)
+      {
+        int caller_world = MPI_UNEQUAL;
+        int mesh_caller = MPI_UNEQUAL;
+        const MPI_Comm mesh_communicator = config.borrowed_mesh->GetComm();
+        local_valid =
+            MPI_Comm_compare(config.borrowed_communicator, MPI_COMM_WORLD,
+                             &caller_world) == MPI_SUCCESS &&
+            (caller_world == MPI_IDENT || caller_world == MPI_CONGRUENT) &&
+            MPI_Comm_compare(config.borrowed_communicator, mesh_communicator,
+                             &mesh_caller) == MPI_SUCCESS &&
+            (mesh_caller == MPI_IDENT || mesh_caller == MPI_CONGRUENT) &&
+            !config.borrowed_mesh->Nonconforming() &&
+            config.borrowed_mesh->Dimension() == dimension;
+        local_elements = config.borrowed_mesh->GetNE();
+        local_valid = local_valid && local_elements > 0 &&
+            local_elements <= maximum_rank_elements;
+        for (int element = 0; local_valid && element < local_elements;
+             ++element)
+        {
+          local_valid = config.borrowed_mesh->GetElementBaseGeometry(element) ==
+              mfem::Geometry::SQUARE;
+        }
+      }
+    }
+    else
+    {
+      // Do not silently discard an incomplete caller-owned request.
+      local_valid = local_valid && config.borrowed_mesh == nullptr &&
+          config.borrowed_communicator == MPI_COMM_NULL;
+    }
+    if (!CollectiveContinue(local_valid)) { return false; }
+
+    if (!config.use_borrowed_topology) { return true; }
+    long long global_elements = 0;
+    const long long local_element_count = local_elements;
+    const bool census_ready = MPI_Allreduce(
+        &local_element_count, &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    return census_ready && global_elements ==
+        static_cast<long long>(config.mesh_n) * config.mesh_n;
+  }
+
   bool ConfigureDeviceAndRanks(const CudaConfig& config,
                                CudaRunEvidence& evidence) noexcept
   {
@@ -1626,31 +1697,40 @@ private:
   {
     try
     {
-      mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
-          config.mesh_n, config.mesh_n,
-          mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
-      // MFEM owns this setup-only container and the mapping allocation.
-      std::vector<mfem::Vector> translations(2, mfem::Vector(dimension));
-      translations[0][0] = 1.0;
-      translations[1][1] = 1.0;
-      serial_mesh_ = mfem::Mesh::MakePeriodic(
-          original, original.CreatePeriodicVertexMapping(translations));
-      std::array<int, maximum_rank_elements> partition{};
-      const int global_elements = config.mesh_n * config.mesh_n;
-      for (int element = 0; element < global_elements;
-           ++element)
-        partition[static_cast<std::size_t>(element)] =
-            element * ranks_ / global_elements;
-      mesh_.emplace(MPI_COMM_WORLD, serial_mesh_, partition.data());
+      borrowed_topology_ = config.use_borrowed_topology;
+      if (borrowed_topology_)
+      {
+        // The caller owns the ParMesh and its partition.  This engine borrows
+        // it only to construct FE spaces; it never rebuilds or repartitions it.
+        mesh_ = config.borrowed_mesh;
+      }
+      else
+      {
+        mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+            config.mesh_n, config.mesh_n,
+            mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+        std::vector<mfem::Vector> translations(2, mfem::Vector(dimension));
+        translations[0][0] = 1.0;
+        translations[1][1] = 1.0;
+        serial_mesh_ = mfem::Mesh::MakePeriodic(
+            original, original.CreatePeriodicVertexMapping(translations));
+        std::array<int, maximum_rank_elements> partition{};
+        const int global_elements = config.mesh_n * config.mesh_n;
+        for (int element = 0; element < global_elements; ++element)
+          partition[static_cast<std::size_t>(element)] =
+              element * ranks_ / global_elements;
+        owned_mesh_.emplace(MPI_COMM_WORLD, serial_mesh_, partition.data());
+        mesh_ = &*owned_mesh_;
+      }
       interior_collection_.emplace(
           config.order, dimension, mfem::BasisType::GaussLegendre,
           mfem::FiniteElement::VALUE);
       trace_collection_.emplace(
           config.order, dimension, mfem::FiniteElement::VALUE,
           mfem::BasisType::GaussLegendre);
-      interior_space_.emplace(&*mesh_, &*interior_collection_,
+      interior_space_.emplace(mesh_, &*interior_collection_,
                               conserved_components, mfem::Ordering::byNODES);
-      trace_space_.emplace(&*mesh_, &*trace_collection_, conserved_components,
+      trace_space_.emplace(mesh_, &*trace_collection_, conserved_components,
                            mfem::Ordering::byNODES);
       interior_space_->ExchangeFaceNbrData();
       trace_space_->ExchangeFaceNbrData();
@@ -1896,7 +1976,9 @@ private:
   mfem::Vector double_arena_vector_{};
   mfem::Array<int> integer_arena_array_{};
   mfem::Mesh serial_mesh_{};
-  std::optional<mfem::ParMesh> mesh_{};
+  mfem::ParMesh* mesh_ = nullptr;
+  std::optional<mfem::ParMesh> owned_mesh_{};
+  bool borrowed_topology_ = false;
   std::optional<mfem::L2_FECollection> interior_collection_{};
   std::optional<mfem::DG_Interface_FECollection> trace_collection_{};
   std::optional<mfem::ParFiniteElementSpace> interior_space_{};
