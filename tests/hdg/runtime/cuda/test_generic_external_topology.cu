@@ -4,6 +4,7 @@
 
 #include <array>
 #include <iostream>
+#include <memory>
 #include <string_view>
 #include <vector>
 
@@ -70,9 +71,9 @@ bool CheckBorrowedTopology(const int ranks, const int order, const int n)
   // partition vector of its own.
   mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
   CudaConfig config = BorrowedConfig(mesh, ranks, order, n);
-  Engine<Backend> engine(config);
+  auto engine = std::make_unique<Engine<Backend>>(config);
   CudaRunEvidence evidence{};
-  const bool initialized = engine.Initialize(evidence);
+  const bool initialized = engine->Initialize(evidence);
   const bool borrowed = initialized && evidence.borrowed_topology &&
       config.borrowed_mesh == &mesh && mesh.GetNE() > 0 &&
       evidence.status == CudaRunStatus::ready &&
@@ -86,9 +87,9 @@ bool CheckBorrowedTopology(const int ranks, const int order, const int n)
 template <typename Backend>
 bool RejectedBeforeDevice(const CudaConfig& config) noexcept
 {
-  Engine<Backend> engine(config);
+  auto engine = std::make_unique<Engine<Backend>>(config);
   CudaRunEvidence evidence{};
-  return !engine.Initialize(evidence) && evidence.device == -1 &&
+  return !engine->Initialize(evidence) && evidence.device == -1 &&
       evidence.status == CudaRunStatus::setup_failure;
 }
 
