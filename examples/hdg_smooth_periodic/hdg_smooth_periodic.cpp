@@ -19,6 +19,9 @@ using dg::hdg::runtime::app::ApplicationOptionsView;
 using dg::hdg::runtime::app::ApplicationRunResult;
 using dg::hdg::runtime::CpuRank2BackendTag;
 using dg::hdg::runtime::CpuSerialBackendTag;
+using dg::hdg::runtime::CudaRank1OneGpuBackendTag;
+using dg::hdg::runtime::CudaRank2OneGpuHostStagedBackendTag;
+using dg::hdg::runtime::app::CudaApplicationContextV1;
 using dg::hdg::runtime::app::ExitForResult;
 using dg::hdg::runtime::app::HdgMethodRequestV1;
 using dg::hdg::runtime::app::MpiApplicationContextV1;
@@ -46,13 +49,24 @@ struct AdapterOptions
 {
   bool help = false;
   std::string output_directory;
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+  bool cuda_device_seen = false;
+#endif
 };
 
 void PrintHelp(std::ostream& output)
 {
   output << "Usage: hdg_smooth_periodic --discretization hdg "
-            "--hdg-output-dir ABSOLUTE_PATH\n\n"
+            "--hdg-output-dir ABSOLUTE_PATH"
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+            " --device cuda"
+#endif
+            "\n\n"
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+            "Runs the admitted conventional HDG smooth-periodic "
+#else
             "Runs the admitted CPU conventional HDG smooth-periodic "
+#endif
             "functional tuple (steps 0, 10, and 20 are published as VTK).\n";
 }
 
@@ -149,8 +163,27 @@ bool ParseAdapterOptions(const int argc, char* argv[], AdapterOptions& options,
     if (argument == "--device" || argument.rfind("--device=", 0) == 0 ||
         argument == "-dev")
     {
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+      if (options.cuda_device_seen)
+      {
+        diagnostic = "duplicate --device option";
+        return false;
+      }
+      const std::string_view option_name =
+          argument == "-dev" ? "-dev" : "--device";
+      if (!ParseOptionValue(argc, argv, index, option_name, value, diagnostic))
+        return false;
+      if (value != "cuda")
+      {
+        diagnostic = "CUDA HDG requires --device cuda";
+        return false;
+      }
+      options.cuda_device_seen = true;
+      continue;
+#else
       diagnostic = "device selection is unsupported by CPU HDG";
       return false;
+#endif
     }
     diagnostic = "unsupported HDG adapter option: " + std::string{argument};
     return false;
@@ -161,16 +194,25 @@ bool ParseAdapterOptions(const int argc, char* argv[], AdapterOptions& options,
     diagnostic = "--discretization hdg and --hdg-output-dir are required";
     return false;
   }
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+  if (!options.cuda_device_seen)
+  {
+    diagnostic = "CUDA HDG requires --device cuda";
+    return false;
+  }
+#endif
   return true;
 }
 
 ApplicationOptionsView MakeFunctionalRequest(
     const std::string_view backend_id,
+    const int device_id,
     const std::string_view output_directory,
     const std::string_view checkpoint_path) noexcept
 {
   ApplicationOptionsView options{};
   options.backend_id = backend_id;
+  options.device_id = device_id;
   options.scenario_id = smooth_periodic_euler_v1_functional_id;
   options.polynomial_order = smooth_periodic_euler_v1_functional_polynomial_order;
   options.mesh_n = smooth_periodic_euler_v1_functional_mesh_n;
@@ -202,11 +244,13 @@ int FinishAfterMpi(const int exit_code)
   return exit_code;
 }
 
+#if !DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
 int FinishAfterHypre(const int exit_code)
 {
   mfem::Hypre::Finalize();
   return FinishAfterMpi(exit_code);
 }
+#endif
 
 } // namespace
 
@@ -223,37 +267,72 @@ int main(int argc, char* argv[])
   }
 
   mfem::Mpi::Init(argc, argv);
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+  CudaApplicationContextV1 context;
+#else
   MpiApplicationContextV1 context;
+#endif
   std::string_view backend_id;
   if (context.ranks() == 1)
   {
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+    backend_id = CudaRank1OneGpuBackendTag::id;
+#else
     backend_id = CpuSerialBackendTag::id;
+#endif
   }
   else if (context.ranks() == 2)
   {
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+    backend_id = CudaRank2OneGpuHostStagedBackendTag::id;
+#else
     backend_id = CpuRank2BackendTag::id;
+#endif
   }
   else
   {
     if (context.rank() == 0)
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+      std::cerr << "hdg_smooth_periodic: CUDA HDG requires exactly one or two MPI ranks\n";
+#else
       std::cerr << "hdg_smooth_periodic: CPU HDG requires exactly one or two MPI ranks\n";
+#endif
     return FinishAfterMpi(
         static_cast<int>(ApplicationExit::unsupported_discretization));
   }
+#if !DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
   mfem::Hypre::Init();
+#endif
 
   const std::string checkpoint_path = adapter_options.output_directory +
       ".checkpoint";
   const ApplicationOptionsView options = MakeFunctionalRequest(
-      backend_id, adapter_options.output_directory, checkpoint_path);
+      backend_id,
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+      0,
+#else
+      -1,
+#endif
+      adapter_options.output_directory, checkpoint_path);
   const auto validation = ValidateApplicationOptions(options);
   if (!validation.accepted())
   {
     std::cerr << "hdg_smooth_periodic: internal HDG tuple rejected\n";
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+    return FinishAfterMpi(
+        static_cast<int>(ApplicationExit::configuration_error));
+#else
     return FinishAfterHypre(
         static_cast<int>(ApplicationExit::configuration_error));
+#endif
   }
-  const HdgMethodRequestV1 request{&options, validation.config(), &context, nullptr};
+  const HdgMethodRequestV1 request{
+      &options, validation.config(),
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+      nullptr, &context};
+#else
+      &context, nullptr};
+#endif
   const auto result = RunHdgMethodV1(request);
   const ApplicationRunResult& run = result.run;
   if (context.rank() == 0)
@@ -264,5 +343,9 @@ int main(int argc, char* argv[])
            << " step=" << run.coordinates.step
            << " time=" << run.coordinates.time << '\n';
   }
+#if DG_IGR_HDG_SMOOTH_PERIODIC_HAS_CUDA
+  return FinishAfterMpi(static_cast<int>(ExitForResult(run)));
+#else
   return FinishAfterHypre(static_cast<int>(ExitForResult(run)));
+#endif
 }
