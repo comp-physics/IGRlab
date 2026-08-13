@@ -37,15 +37,6 @@ void ValidateRequest(const HDGParaViewRequest& request)
     throw std::invalid_argument(
         "HDG ParaView levels_of_detail must be non-negative");
   }
-  if (request.metadata.cycle < 0 || request.metadata.step < 0)
-  {
-    throw std::invalid_argument(
-        "HDG ParaView cycle and step must be non-negative");
-  }
-  if (!std::isfinite(request.metadata.time))
-  {
-    throw std::invalid_argument("HDG ParaView time must be finite");
-  }
   if (request.interior_fields.empty())
   {
     throw std::invalid_argument(
@@ -70,31 +61,49 @@ void ValidateRequest(const HDGParaViewRequest& request)
   }
 }
 
+void ValidateMetadata(const HDGParaViewMetadata& metadata)
+{
+  if (metadata.cycle < 0 || metadata.step < 0)
+  {
+    throw std::invalid_argument(
+        "HDG ParaView cycle and step must be non-negative");
+  }
+  if (!std::isfinite(metadata.time))
+  {
+    throw std::invalid_argument("HDG ParaView time must be finite");
+  }
+}
+
 } // namespace
 
-void WriteHDGParaViewOutput(const HDGParaViewRequest& request)
+HDGParaViewSeries::HDGParaViewSeries(const HDGParaViewRequest& request)
 {
   ValidateRequest(request);
 
   // Passing the caller's ParMesh directly preserves its rank-local geometry
   // and partition.  ParaViewDataCollection writes one VTU per rank and its
   // rank-zero PVTU/PVD coordination; this adapter performs no gather.
-  mfem::ParaViewDataCollection collection(request.options.collection_name,
-                                          &request.mesh);
-  collection.SetOwnData(false);
-  collection.SetPrefixPath(request.options.prefix_path);
-  collection.SetLevelsOfDetail(request.options.levels_of_detail);
-  collection.SetHighOrderOutput(request.options.high_order_output);
-  collection.SetDataFormat(request.options.data_format);
-  collection.SetCycle(request.metadata.cycle);
-  collection.SetTime(request.metadata.time);
+  collection_ = std::make_unique<mfem::ParaViewDataCollection>(
+      request.options.collection_name, &request.mesh);
+  collection_->SetOwnData(false);
+  collection_->SetPrefixPath(request.options.prefix_path);
+  collection_->SetLevelsOfDetail(request.options.levels_of_detail);
+  collection_->SetHighOrderOutput(request.options.high_order_output);
+  collection_->SetDataFormat(request.options.data_format);
 
   for (const HDGInteriorFieldView& view : request.interior_fields)
   {
-    collection.RegisterField(view.name, &view.values);
+    collection_->RegisterField(view.name, &view.values);
   }
-  collection.Save();
-  if (collection.Error() != mfem::DataCollection::No_Error)
+}
+
+void HDGParaViewSeries::Write(const HDGParaViewMetadata& metadata)
+{
+  ValidateMetadata(metadata);
+  collection_->SetCycle(metadata.cycle);
+  collection_->SetTime(metadata.time);
+  collection_->Save();
+  if (collection_->Error() != mfem::DataCollection::No_Error)
   {
     throw std::runtime_error("MFEM failed to write HDG ParaView output");
   }

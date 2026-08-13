@@ -13,6 +13,7 @@
  * stage their state into these host views before calling this API.
  */
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -57,7 +58,7 @@ struct HDGParaViewOptions
 };
 
 /**
- * Externally owned mesh, physical interior fields, and output metadata.
+ * Externally owned mesh, physical interior fields, and output configuration.
  *
  * All field spaces must be parallel spaces attached to exactly @ref mesh.
  * Their data are used directly by MFEM's rank-local writer; ownership remains
@@ -67,15 +68,37 @@ struct HDGParaViewRequest
 {
   mfem::ParMesh& mesh;
   std::vector<HDGInteriorFieldView> interior_fields;
-  HDGParaViewMetadata metadata;
   HDGParaViewOptions options;
 };
 
 /**
- * Write MFEM ParaViewDataCollection PVD/PVTU/VTU output for physical HDG
- * interior fields.  Throws std::invalid_argument for an incompatible host view
- * or metadata, and std::runtime_error if MFEM reports a write failure.
+ * Caller-owned MFEM ParaView publication series for physical HDG interior
+ * fields.  The series owns only its mfem::ParaViewDataCollection writer state;
+ * the supplied mesh and fields remain externally owned and must outlive it.
+ *
+ * Keeping this object alive across Write() calls preserves native MFEM PVD
+ * entries for each published cycle.  It neither uses restart mode nor reads
+ * historical output from disk.
  */
-void WriteHDGParaViewOutput(const HDGParaViewRequest& request);
+class HDGParaViewSeries
+{
+public:
+  explicit HDGParaViewSeries(const HDGParaViewRequest& request);
+  ~HDGParaViewSeries() = default;
+
+  HDGParaViewSeries(const HDGParaViewSeries&) = delete;
+  HDGParaViewSeries& operator=(const HDGParaViewSeries&) = delete;
+  HDGParaViewSeries(HDGParaViewSeries&&) noexcept = default;
+  HDGParaViewSeries& operator=(HDGParaViewSeries&&) noexcept = default;
+
+  /**
+   * Append one native MFEM PVD/PVTU/VTU publication.  @ref cycle and @ref
+   * time are serialized by MFEM; @ref step remains caller provenance only.
+   */
+  void Write(const HDGParaViewMetadata& metadata);
+
+private:
+  std::unique_ptr<mfem::ParaViewDataCollection> collection_;
+};
 
 } // namespace dg_sim::hdg

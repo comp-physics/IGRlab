@@ -17,6 +17,19 @@ bool Contains(const std::string& text, const std::string& needle)
   return text.find(needle) != std::string::npos;
 }
 
+std::size_t CountOccurrences(const std::string& text,
+                             const std::string& needle)
+{
+  std::size_t count = 0;
+  std::size_t offset = 0;
+  while ((offset = text.find(needle, offset)) != std::string::npos)
+  {
+    ++count;
+    offset += needle.size();
+  }
+  return count;
+}
+
 std::string ReadFile(const std::filesystem::path& path)
 {
   std::ifstream input(path);
@@ -82,20 +95,27 @@ bool Run(const std::filesystem::path& output)
   dg_sim::hdg::HDGParaViewRequest request{
       mesh,
       {{"density", density}, {"momentum", momentum}},
-      {3, 20, 1.25},
       {output.string(), "hdg_physical", mfem::VTKFormat::ASCII, 1, false}};
-  dg_sim::hdg::WriteHDGParaViewOutput(request);
+  dg_sim::hdg::HDGParaViewSeries publisher(request);
+  publisher.Write({3, 20, 1.25});
+  publisher.Write({4, 25, 1.5});
   MPI_Barrier(MPI_COMM_WORLD);
 
-  const std::filesystem::path cycle =
+  const std::filesystem::path first_cycle =
       output / "hdg_physical" / "Cycle000003";
-  const std::filesystem::path local_vtu = cycle /
+  const std::filesystem::path second_cycle =
+      output / "hdg_physical" / "Cycle000004";
+  const std::filesystem::path first_local_vtu = first_cycle /
       (std::string("proc") +
        (rank == 0 ? "000000" : "000001") + ".vtu");
-  const std::string local_text = ReadFile(local_vtu);
+  const std::filesystem::path second_local_vtu = second_cycle /
+      (std::string("proc") +
+       (rank == 0 ? "000000" : "000001") + ".vtu");
+  const std::string local_text = ReadFile(first_local_vtu);
   const std::string local_cells =
       "NumberOfCells=\"" + std::to_string(mesh.GetNE()) + "\"";
-  bool passed = std::filesystem::exists(local_vtu) &&
+  bool passed = std::filesystem::exists(first_local_vtu) &&
+      std::filesystem::exists(second_local_vtu) &&
       Contains(local_text, "Name=\"density\"") &&
       Contains(local_text, "Name=\"momentum\"") &&
       Contains(local_text, "NumberOfComponents=\"2\"") &&
@@ -105,14 +125,21 @@ bool Run(const std::filesystem::path& output)
   if (rank == 0)
   {
     const std::string pvd = ReadFile(output / "hdg_physical" / "hdg_physical.pvd");
-    const std::string pvtu = ReadFile(cycle / "data.pvtu");
+    const std::string first_pvtu = ReadFile(first_cycle / "data.pvtu");
+    const std::string second_pvtu = ReadFile(second_cycle / "data.pvtu");
     passed = passed && Contains(pvd, "timestep=\"1.25\"") &&
+        Contains(pvd, "timestep=\"1.5\"") &&
         Contains(pvd, "Cycle000003/data.pvtu") &&
+        Contains(pvd, "Cycle000004/data.pvtu") &&
+        CountOccurrences(pvd, "Cycle000003/data.pvtu") == 1 &&
+        CountOccurrences(pvd, "Cycle000004/data.pvtu") == 1 &&
         !Contains(pvd, "stale-history-cycle-000002") &&
-        Contains(pvtu, "proc000000.vtu");
+        Contains(first_pvtu, "proc000000.vtu") &&
+        Contains(second_pvtu, "proc000000.vtu");
     if (ranks == 2)
     {
-      passed = passed && Contains(pvtu, "proc000001.vtu");
+      passed = passed && Contains(first_pvtu, "proc000001.vtu") &&
+          Contains(second_pvtu, "proc000001.vtu");
     }
   }
   return AllRanks(MPI_COMM_WORLD, passed);
