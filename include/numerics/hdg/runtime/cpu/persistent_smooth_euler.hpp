@@ -710,6 +710,13 @@ public:
    * observed only: ownership remains with the request's caller.
    */
   bool RunBorrowedEuler(const generic::EulerHdgRequest&) noexcept;
+  /** Initialize one borrowed generic Euler lifecycle without advancing it. */
+  bool InitializeBorrowedEuler(const generic::EulerHdgRequest&) noexcept;
+  /** Advance one borrowed generic Euler attempt and publish only on success. */
+  bool AdvanceBorrowedEuler(double, StateCoordinates&) noexcept;
+  /** Copy only the committed physical interior into validated host output. */
+  bool ExportCommittedInterior(double*, std::size_t) const noexcept;
+  bool ExportCommittedInterior(mfem::ParGridFunction&) const noexcept;
   bool AdmitInitialization(bool facade_empty,
                            const CpuPersistentConfig&,
                            const RuntimeTupleDescriptor&) const noexcept;

@@ -313,6 +313,16 @@ public:
   bool Finished() const { return time_ == control_.final_time; }
   bool HasPendingPlan() const { return pending_.has_value(); }
 
+  /// Returns the transaction that Commit() may consume without advancing it.
+  const StepPlan& PendingPlan() const
+  {
+    if (!pending_)
+    {
+      throw std::logic_error("no step plan is pending");
+    }
+    return *pending_;
+  }
+
   /// Returns the cycle-zero boundary publication, if requested.  For a
   /// zero-duration run, initial/scheduled/final requests coalesce into one
   /// cycle-zero event with the corresponding flags.
@@ -378,6 +388,23 @@ public:
     return *pending_;
   }
 
+  /**
+   * @brief Preview exactly the output event that Commit() would return.
+   *
+   * This is deliberately a validation-only operation: it leaves the time,
+   * output, and pending-plan cursors unchanged.  Staging code can therefore
+   * prepare an output transaction before accepting the associated solver
+   * step, while a retry continues to observe the same plan and event.
+   */
+  std::optional<OutputEvent> PreviewCommit(const StepPlan& plan) const
+  {
+    if (!pending_ || !SamePlan(plan, *pending_))
+    {
+      throw std::logic_error("only the pending plan may be previewed");
+    }
+    return OutputForCommit(*pending_);
+  }
+
   std::optional<OutputEvent> Commit(const StepPlan& plan)
   {
     if (!pending_ || !SamePlan(plan, *pending_))
@@ -386,6 +413,7 @@ public:
     }
 
     const StepPlan committed = *pending_;
+    const std::optional<OutputEvent> output = PreviewCommit(plan);
     pending_.reset();
     time_ = committed.end_time;
     ++committed_steps_;
@@ -394,18 +422,7 @@ public:
       AdvanceScheduledOutput();
     }
 
-    if (committed.hits_scheduled_output)
-    {
-      return OutputEvent{committed.scheduled_cycle,
-                         time_,
-                         false,
-                         committed.hits_final};
-    }
-    if (committed.hits_final && schedule_.final == FinalOutputPolicy::Emit)
-    {
-      return OutputEvent{NextPolicyCycle(), time_, false, true};
-    }
-    return std::nullopt;
+    return output;
   }
 
 private:
@@ -544,6 +561,22 @@ private:
   std::uint64_t NextPolicyCycle() const
   {
     return next_publication_cycle_;
+  }
+
+  std::optional<OutputEvent> OutputForCommit(const StepPlan& committed) const
+  {
+    if (committed.hits_scheduled_output)
+    {
+      return OutputEvent{committed.scheduled_cycle,
+                         committed.end_time,
+                         false,
+                         committed.hits_final};
+    }
+    if (committed.hits_final && schedule_.final == FinalOutputPolicy::Emit)
+    {
+      return OutputEvent{NextPolicyCycle(), committed.end_time, false, true};
+    }
+    return std::nullopt;
   }
 
   TimeControl control_;

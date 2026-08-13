@@ -92,13 +92,22 @@ public:
   HDGParaViewSeries& operator=(HDGParaViewSeries&&) noexcept = default;
 
   /**
-   * Append one native MFEM PVD/PVTU/VTU publication.  @ref cycle and @ref
-   * time are serialized by MFEM; @ref step remains caller provenance only.
+   * Collectively append and validate one native MFEM PVD/PVTU/VTU
+   * publication.  Every rank must call Write with the same metadata.  The
+   * method returns only after every local VTU and the rank-zero PVTU/PVD are
+   * present and structurally complete.  @ref cycle and @ref time are
+   * serialized by MFEM; @ref step remains caller provenance only.
    */
   void Write(const HDGParaViewMetadata& metadata);
 
 private:
   std::unique_ptr<mfem::ParaViewDataCollection> collection_;
+  MPI_Comm communicator_ = MPI_COMM_NULL;
+  int rank_ = -1;
+  int ranks_ = 0;
+  std::string collection_path_;
+  std::string collection_name_;
+  int last_cycle_ = -1;
 };
 
 } // namespace dg_sim::hdg

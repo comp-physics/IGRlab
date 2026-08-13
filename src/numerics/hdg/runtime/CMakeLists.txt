@@ -126,6 +126,24 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     SOURCES ${_dg_igr_hdg_runtime_cpu_sources}
     PUBLIC_LINK_LIBRARIES dg_igr_hdg_runtime_common)
 
+  if(NOT MFEM_USE_CUDA)
+    add_library(dg_igr_hdg_main_backend_cpu STATIC
+      "${PROJECT_SOURCE_DIR}/src/sim/hdg/main_backend.cpp")
+    target_include_directories(dg_igr_hdg_main_backend_cpu PUBLIC
+      "${PROJECT_SOURCE_DIR}/include")
+    target_link_libraries(dg_igr_hdg_main_backend_cpu PUBLIC
+      igr_mfem
+      dg_igr_hdg_runtime_cpu
+      mfem
+      MPI::MPI_CXX)
+    target_compile_options(dg_igr_hdg_main_backend_cpu PRIVATE
+      $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+    set_target_properties(dg_igr_hdg_main_backend_cpu PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF)
+  endif()
+
   # Keep the entry as an object library so the static selector test can bind
   # it to its own mock downstreams.  Production users link the one combined
   # static archive below, avoiding an archive-order cycle between entry and

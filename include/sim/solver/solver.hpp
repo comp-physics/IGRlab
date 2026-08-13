@@ -472,11 +472,25 @@ struct Solver
     }
     cli_opts.discretization =
       DiscretizationToString(discretization_resolution.discretization);
-    cli_opts.dg_backend =
-      DGBackendToString(*discretization_resolution.dg_backend);
     MFEM_VERIFY(!cli_opts.restart_vtk.empty() ||
                   (cli_opts.restart_cycle < 0 && cli_opts.restart_step < 0),
                 "--restart-cycle/--restart-step require --restart-vtk.");
+    if (discretization_resolution.discretization == Discretization::HDG)
+    {
+      MFEM_VERIFY(static_cast<bool>(spec.run_hdg),
+                  "Case '" << case_cfg.case_name
+                            << "' does not provide an HDG backend adapter.");
+      if (!spec.run_hdg)
+      {
+        return 1;
+      }
+      return spec.run_hdg(case_opts, case_cfg, cli_opts);
+    }
+
+    MFEM_VERIFY(discretization_resolution.dg_backend,
+                "DG/DGSEM selection requires a legacy DG backend mapping.");
+    cli_opts.dg_backend =
+      DGBackendToString(*discretization_resolution.dg_backend);
     ApplyIGRDerivedRuntimeDefaults(cli_opts,
                                    cli_igr_opts,
                                    HasExactDGFaceOptionOverride(argc, argv));

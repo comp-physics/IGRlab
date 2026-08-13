@@ -708,12 +708,6 @@ ResolveDiscretization(const std::string& case_default_dg_backend,
 
   result.discretization = *selected;
   result.dg_backend = DGBackendForDiscretization(result.discretization);
-  if (!result.dg_backend)
-  {
-    result.status = DiscretizationResolutionStatus::Unavailable;
-    result.message = "Discretization 'hdg' is recognized but unavailable in "
-                     "this executable.";
-  }
   return result;
 }
 

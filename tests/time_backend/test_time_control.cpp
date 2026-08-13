@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "sim/hdg/transactional_time_adapter.hpp"
 #include "sim/time/backend/time_control.hpp"
 
 namespace
@@ -18,6 +19,9 @@ using dg_sim::time::backend::OutputSchedule;
 using dg_sim::time::backend::StepPlan;
 using dg_sim::time::backend::StepPlanCursor;
 using dg_sim::time::backend::TimeControl;
+using dg_sim::hdg::HdgStepFailurePhase;
+using dg_sim::hdg::HdgTimeControlMode;
+using dg_sim::hdg::HdgTransactionalTimeAdapter;
 
 class Checks
 {
@@ -40,6 +44,18 @@ private:
 bool Near(double lhs, double rhs)
 {
   return std::abs(lhs - rhs) < 1.0e-12;
+}
+
+bool SameOutput(const std::optional<dg_sim::time::backend::OutputEvent>& lhs,
+                const std::optional<dg_sim::time::backend::OutputEvent>& rhs)
+{
+  if (lhs.has_value() != rhs.has_value())
+  {
+    return false;
+  }
+  return !lhs || (lhs->cycle == rhs->cycle && Near(lhs->time, rhs->time) &&
+                  lhs->is_initial == rhs->is_initial &&
+                  lhs->is_final == rhs->is_final);
 }
 
 template <typename Fn>
@@ -245,6 +261,91 @@ int main()
   }
 
   {
+    StepPlanCursor cursor(TimeControl::Fixed(0.0, 1.0, 0.6),
+                          OutputSchedule::FixedInterval(0.25));
+    const StepPlan previewed_plan = cursor.Plan(0.0);
+    const auto preview = cursor.PreviewCommit(previewed_plan);
+    checks.Expect(Near(cursor.time(), 0.0) && cursor.HasPendingPlan(),
+                  "commit preview is pure and retains the pending transaction");
+    const auto committed = cursor.Commit(previewed_plan);
+    checks.Expect(SameOutput(preview, committed),
+                  "previewed output exactly equals the later commit event");
+  }
+
+  {
+    HdgTransactionalTimeAdapter adapter(
+      TimeControl::Fixed(0.0, 1.0, 0.6), OutputSchedule::FixedInterval(0.25));
+    const StepPlan first = adapter.BeginStep();
+    const auto preview = adapter.PreviewFinalizedOutput();
+    adapter.RecordFailure(HdgStepFailurePhase::Assembly);
+    adapter.RecordFailure(HdgStepFailurePhase::NonlinearSolve);
+    adapter.RecordFailure(HdgStepFailurePhase::LinearSolve);
+    adapter.RecordFailure(HdgStepFailurePhase::OutputStaging);
+    const StepPlan retry = adapter.RetryPendingStep();
+    checks.Expect(first.sequence == retry.sequence && Near(first.dt, retry.dt) &&
+                    Near(first.end_time, retry.end_time) &&
+                    adapter.solver_step() == 0 && adapter.output_cycle() == 0 &&
+                    Near(adapter.time(), 0.0),
+                  "all HDG failure phases retain the exact pending transaction");
+    const auto committed = adapter.FinalizeSuccess();
+    checks.Expect(SameOutput(preview, committed) && adapter.solver_step() == 1 &&
+                    adapter.output_cycle() == 1 && Near(adapter.time(), 0.25),
+                  "HDG finalized success advances solver step and output cycle once");
+  }
+
+  {
+    HdgTransactionalTimeAdapter adapter(
+      TimeControl::Fixed(0.0, 1.0, 0.6),
+      OutputSchedule::Disabled(InitialOutputPolicy::Suppress,
+                               FinalOutputPolicy::Suppress));
+    adapter.BeginStep();
+    adapter.FinalizeSuccess();
+    const StepPlan final_plan = adapter.BeginStep();
+    const auto final_preview = adapter.PreviewFinalizedOutput();
+    const auto final = adapter.FinalizeSuccess();
+    checks.Expect(Near(final_plan.dt, 0.4) && !final &&
+                    SameOutput(final_preview, final) && adapter.solver_step() == 2 &&
+                    adapter.output_cycle() == 0,
+                  "HDG clips the final remainder without conflating steps and outputs");
+  }
+
+  {
+    HdgTransactionalTimeAdapter adapter(
+      TimeControl::Fixed(0.0, 1.0, 0.3), OutputSchedule::FixedInterval(0.4));
+    const auto initial = adapter.InitialOutput();
+    adapter.BeginStep();
+    adapter.FinalizeSuccess();
+    adapter.BeginStep();
+    const auto first_output = adapter.FinalizeSuccess();
+    adapter.BeginStep();
+    adapter.FinalizeSuccess();
+    adapter.BeginStep();
+    const auto second_output = adapter.FinalizeSuccess();
+    adapter.BeginStep();
+    const auto final_output = adapter.FinalizeSuccess();
+    checks.Expect(!initial && first_output && first_output->cycle == 1 &&
+                    Near(first_output->time, 0.4) && second_output &&
+                    second_output->cycle == 2 && Near(second_output->time, 0.8) &&
+                    final_output && final_output->cycle == 3 && final_output->is_final &&
+                    Near(final_output->time, 1.0),
+                  "nonintegral save cadence emits deduplicated scheduled and final cycles");
+  }
+
+  {
+    HdgTransactionalTimeAdapter adapter(
+      TimeControl::Fixed(0.0, 1.0, 2.0),
+      OutputSchedule::Explicit({0.0, 1.0}, InitialOutputPolicy::Emit,
+                               FinalOutputPolicy::Emit));
+    const auto initial = adapter.InitialOutput();
+    adapter.BeginStep();
+    const auto final = adapter.FinalizeSuccess();
+    checks.Expect(initial && initial->cycle == 0 && initial->is_initial &&
+                    final && final->cycle == 1 && final->is_final &&
+                    adapter.output_cycle() == 1,
+                  "HDG initial and final output requests deduplicate by cycle");
+  }
+
+  {
     StepPlanCursor cursor(TimeControl::Fixed(0.0, 1.0, 2.0),
                           OutputSchedule::Disabled(InitialOutputPolicy::Emit,
                                                    FinalOutputPolicy::Emit),
@@ -344,6 +445,22 @@ int main()
                                  static_cast<IntegratorTag>(99));
                 },
                 "invalid integrator tag is rejected at cursor construction");
+  ExpectInvalid(checks,
+                []
+                {
+                  HdgTransactionalTimeAdapter(
+                    TimeControl::CFL(0.0, 1.0, 0.5), OutputSchedule::Disabled());
+                },
+                "HDG CFL control remains reserved until implemented");
+  ExpectInvalid(checks,
+                []
+                {
+                  HdgTransactionalTimeAdapter(
+                    TimeControl::Fixed(0.0, 1.0, 0.1),
+                    OutputSchedule::Disabled(),
+                    HdgTimeControlMode::IMEX);
+                },
+                "HDG IMEX control remains reserved until implemented");
 
   if (checks.failures() != 0)
   {

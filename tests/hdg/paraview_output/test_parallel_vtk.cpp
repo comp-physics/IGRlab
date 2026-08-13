@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -72,6 +73,21 @@ bool Run(const std::filesystem::path& output)
     std::filesystem::create_directories(collection_root);
     std::ofstream stale_pvd(collection_root / "hdg_physical.pvd");
     stale_pvd << "stale-history-cycle-000002\n";
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+  const std::filesystem::path stale_cycle =
+      output / "hdg_physical" / "Cycle000003";
+  std::filesystem::create_directories(stale_cycle);
+  std::ostringstream rank_name;
+  rank_name << "proc" << std::setw(6) << std::setfill('0') << rank << ".vtu";
+  {
+    std::ofstream stale_local(stale_cycle / rank_name.str());
+    stale_local << "stale-local-output</VTKFile>\n";
+  }
+  if (rank == 0)
+  {
+    std::ofstream stale_pvtu(stale_cycle / "data.pvtu");
+    stale_pvtu << "stale-parallel-output</VTKFile>\n";
   }
   MPI_Barrier(MPI_COMM_WORLD);
 

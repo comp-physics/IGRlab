@@ -92,6 +92,17 @@ template <typename CaseOptions, typename NumericalFlux> struct CaseSpec
                      EulerBoundaryWiring<NumericalFlux>&,
                      const BoundaryMarkerMap&)>
     apply_bc;
+  /**
+   * Optional main-application HDG entry for cases that explicitly support it.
+   *
+   * The callback receives only parsed case/configuration data.  It owns the
+   * HDG-specific mesh, state, boundary lowering, and time-driver wiring, so
+   * the existing DG/DGSEM ExampleContext and operator path remain untouched.
+   */
+  std::function<int(const CaseOptions&,
+                    const CaseConfig&,
+                    const CommonOptions&)>
+    run_hdg;
   std::function<void(const CaseOptions&, ExampleContext&, EulerStateBundle&)>
     after_init;
   std::function<int(const CaseOptions&,
