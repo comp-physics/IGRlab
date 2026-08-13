@@ -168,6 +168,86 @@ bool ByteEqual(const CpuCoefficientView view,
                    values.size() * sizeof(double)) == 0);
 }
 
+bool CollectivelyTrue(bool local, MPI_Comm communicator);
+
+template <typename Selection>
+void CheckPhysicalInteriorIds(PersistentSmoothEulerCpuAdapter<Selection>& adapter,
+                             Checks& checks, MPI_Comm communicator)
+{
+  const CpuStateSnapshot snapshot = adapter.Snapshot();
+  const bool local_valid = snapshot.physical_interior_ids != nullptr &&
+      snapshot.physical_interior_id_count == snapshot.interior.size &&
+      snapshot.scalar_interior_dofs > 0;
+  const bool globally_valid = CollectivelyTrue(local_valid, communicator);
+  checks.Require(globally_valid,
+                 "physical parent-cell map is complete on every rank");
+  if (!globally_valid) return;
+  std::vector<std::uint64_t> local;
+  bool allocated = true;
+  try
+  {
+    local.assign(snapshot.physical_interior_ids,
+                 snapshot.physical_interior_ids +
+                     snapshot.physical_interior_id_count);
+  }
+  catch (...) { allocated = false; }
+  if (!CollectivelyTrue(allocated, communicator))
+  {
+    checks.Require(false, "physical parent-cell map allocation succeeds");
+    return;
+  }
+  std::array<int, 2> counts{};
+  std::array<int, 2> displacements{};
+  const int local_count = static_cast<int>(local.size());
+  const bool counts_ready = MPI_Gather(
+      &local_count, 1, MPI_INT, counts.data(), 1, MPI_INT, 0,
+      communicator) == MPI_SUCCESS;
+  if (!CollectivelyTrue(counts_ready, communicator))
+  {
+    checks.Require(false, "physical parent-cell map counts gather");
+    return;
+  }
+  int rank = 0;
+  int ranks = 0;
+  MPI_Comm_rank(communicator, &rank);
+  MPI_Comm_size(communicator, &ranks);
+  int total = 0;
+  if (rank == 0)
+    for (int peer = 0; peer < ranks; ++peer)
+    {
+      displacements[peer] = total;
+      total += counts[peer];
+    }
+  std::vector<std::uint64_t> all;
+  allocated = true;
+  try { all.resize(static_cast<std::size_t>(total)); }
+  catch (...) { allocated = false; }
+  if (!CollectivelyTrue(allocated, communicator))
+  {
+    checks.Require(false, "physical parent-cell map aggregate allocation");
+    return;
+  }
+  const bool gathered = MPI_Gatherv(
+      local.data(), local_count, MPI_UINT64_T, all.data(), counts.data(),
+      displacements.data(), MPI_UINT64_T, 0, communicator) == MPI_SUCCESS;
+  if (!CollectivelyTrue(gathered, communicator))
+  {
+    checks.Require(false, "physical parent-cell map gather");
+    return;
+  }
+  int complete_unique = 1;
+  if (rank == 0)
+  {
+    std::sort(all.begin(), all.end());
+    complete_unique = all.size() == 144 ? 1 : 0;
+    for (std::uint64_t id = 0; id < all.size() && complete_unique == 1; ++id)
+      complete_unique = all[static_cast<std::size_t>(id)] == id ? 1 : 0;
+  }
+  MPI_Bcast(&complete_unique, 1, MPI_INT, 0, communicator);
+  checks.Require(complete_unique == 1,
+                 "physical parent-cell/DOF VTK map has unique full coverage");
+}
+
 struct CpuCheckpointObservation
 {
   std::array<unsigned char, sizeof(CheckpointDescriptor)> descriptor_bytes{};
@@ -1418,31 +1498,72 @@ CommittedScientificEvaluation EvaluateCommittedScientificState(
       std::isfinite(oracle.maximum_true_residual) &&
       oracle.maximum_true_residual <= independent_true_residual_limit;
 
-  const bool exported = snapshot.interior.size <= static_cast<std::size_t>(
-      std::numeric_limits<int>::max()) &&
-      (snapshot.interior.size == 0 || snapshot.interior.data != nullptr);
+  static_assert(std::is_trivially_copyable<CpuCanonicalEntry>::value,
+                "scientific state records require MPI-byte transport");
+  const bool exported = snapshot.interior.size <=
+          static_cast<std::size_t>(std::numeric_limits<int>::max()) /
+              sizeof(CpuCanonicalEntry) &&
+      snapshot.interior.data != nullptr &&
+      snapshot.physical_interior_ids != nullptr &&
+      snapshot.physical_interior_id_count == snapshot.interior.size;
   int export_ok = exported ? 1 : 0;
   MPI_Allreduce(MPI_IN_PLACE, &export_ok, 1, MPI_INT, MPI_MIN, communicator);
   if (export_ok != 1) return evaluation;
-  const int local_count = static_cast<int>(snapshot.interior.size);
+  std::vector<CpuCanonicalEntry> local;
+  int allocation_ok = 1;
+  try
+  {
+    local.resize(snapshot.interior.size);
+    for (std::size_t index = 0; index < snapshot.interior.size; ++index)
+      local[index] = {snapshot.physical_interior_ids[index],
+                      snapshot.interior.data[index]};
+  }
+  catch (...) { allocation_ok = 0; }
+  MPI_Allreduce(MPI_IN_PLACE, &allocation_ok, 1, MPI_INT, MPI_MIN,
+                communicator);
+  if (allocation_ok != 1) return evaluation;
+  const int local_count = static_cast<int>(
+      local.size() * sizeof(CpuCanonicalEntry));
   std::array<int, 2> counts{};
   MPI_Gather(&local_count, 1, MPI_INT, counts.data(), 1, MPI_INT, 0,
              communicator);
   std::array<int, 2> displacements{};
   int total_bytes = 0;
+  int census_ok = 1;
   if (rank == 0)
   {
     for (int source = 0; source < ranks; ++source)
     {
       displacements[static_cast<std::size_t>(source)] = total_bytes;
-      total_bytes += counts[static_cast<std::size_t>(source)];
+      const int count = counts[static_cast<std::size_t>(source)];
+      if (count < 0 || count % static_cast<int>(sizeof(CpuCanonicalEntry)) != 0 ||
+          total_bytes > std::numeric_limits<int>::max() - count)
+      {
+        census_ok = 0;
+        break;
+      }
+      total_bytes += count;
     }
   }
-  std::vector<double> global(
-      rank == 0 ? static_cast<std::size_t>(total_bytes) : 0);
-  MPI_Gatherv(snapshot.interior.data, local_count, MPI_DOUBLE, global.data(),
-              counts.data(), displacements.data(), MPI_DOUBLE, 0,
-              communicator);
+  MPI_Bcast(&census_ok, 1, MPI_INT, 0, communicator);
+  if (census_ok != 1) return evaluation;
+  std::vector<CpuCanonicalEntry> global;
+  allocation_ok = 1;
+  try
+  {
+    if (rank == 0)
+      global.resize(static_cast<std::size_t>(total_bytes) /
+                    sizeof(CpuCanonicalEntry));
+  }
+  catch (...) { allocation_ok = 0; }
+  MPI_Allreduce(MPI_IN_PLACE, &allocation_ok, 1, MPI_INT, MPI_MIN,
+                communicator);
+  if (allocation_ok != 1) return evaluation;
+  int gathered = MPI_Gatherv(
+      local.data(), local_count, MPI_BYTE, global.data(), counts.data(),
+      displacements.data(), MPI_BYTE, 0, communicator) == MPI_SUCCESS ? 1 : 0;
+  MPI_Allreduce(MPI_IN_PLACE, &gathered, 1, MPI_INT, MPI_MIN, communicator);
+  if (gathered != 1) return evaluation;
 
   if (rank == 0)
   {
@@ -1468,23 +1589,20 @@ CommittedScientificEvaluation EvaluateCommittedScientificState(
       const int scalar_dofs =
           (cpu_functional_polynomial_order + 1) *
           (cpu_functional_polynomial_order + 1);
-      for (int source = 0; source < ranks; ++source)
-      {
-        const int expected_elements =
-            (global_elements * (source + 1) + ranks - 1) / ranks -
-            (global_elements * source + ranks - 1) / ranks;
-        if (counts[static_cast<std::size_t>(source)] !=
-            expected_elements * scalar_dofs * 4)
-          throw std::runtime_error("scientific state census is invalid");
-      }
-      std::array<int, 2> local_elements{};
+      const std::size_t expected_records =
+          static_cast<std::size_t>(global_elements) * scalar_dofs * 4;
+      if (global.size() != expected_records)
+        throw std::runtime_error("scientific state census is invalid");
+      std::sort(global.begin(), global.end(),
+                [](const CpuCanonicalEntry& left,
+                   const CpuCanonicalEntry& right)
+                { return left.global_id < right.global_id; });
+      for (std::size_t index = 0; index < global.size(); ++index)
+        if (global[index].global_id != index)
+          throw std::runtime_error(
+              "scientific state keys are not complete and unique");
       for (int element = 0; element < global_elements; ++element)
       {
-        const int owner = element * ranks / global_elements;
-        const int local_element =
-            local_elements[static_cast<std::size_t>(owner)]++;
-        const int local_scalar_dofs =
-            counts[static_cast<std::size_t>(owner)] / 4;
         mfem::Array<int> vector_dofs;
         space.GetElementVDofs(element, vector_dofs);
         if (vector_dofs.Size() != scalar_dofs * 4)
@@ -1493,21 +1611,19 @@ CommittedScientificEvaluation EvaluateCommittedScientificState(
         for (int scalar = 0; scalar < scalar_dofs; ++scalar)
           for (int component = 0; component < 4; ++component)
           {
-            const int source =
-                displacements[static_cast<std::size_t>(owner)] +
-                component * local_scalar_dofs +
-                local_element * scalar_dofs + scalar;
+            const std::size_t source =
+                (static_cast<std::size_t>(element) * scalar_dofs + scalar) *
+                    4 +
+                component;
             const int encoded = vector_dofs[
                 scalar + component * scalar_dofs];
             const int destination = encoded >= 0 ? encoded : -1 - encoded;
             const double sign = encoded >= 0 ? 1.0 : -1.0;
-            if (source < 0 ||
-                source >= displacements[static_cast<std::size_t>(owner)] +
-                    counts[static_cast<std::size_t>(owner)] ||
-                destination < 0 || destination >= field.Size())
+            if (source >= global.size() || destination < 0 ||
+                destination >= field.Size())
               throw std::runtime_error("scientific state map is out of range");
             field[destination] = sign *
-                global[static_cast<std::size_t>(source)];
+                global[source].value;
           }
       }
 
@@ -2143,6 +2259,7 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                  "uninterrupted/restarted committed state equivalence");
 
   CheckCanonicalIds(adapter, checks, communicator);
+  CheckPhysicalInteriorIds(adapter, checks, communicator);
   CheckCheckpointImportAndIndependence(
       adapter, checkpoint, checks, communicator, rank, ranks);
   CheckProductNegatives<Selection>(checks);

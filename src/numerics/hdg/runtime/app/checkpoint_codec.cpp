@@ -1496,6 +1496,75 @@ bool DeriveScenarioCoefficientExtentsV1(
   return true;
 }
 
+bool DeriveObservedCoefficientExtentsV1(
+    const ValidatedApplicationConfig& config,
+    const std::uint32_t rank_count,
+    const RankCoefficientExtentsV1* const observed_ranks,
+    ScenarioCoefficientExtentsV1& extents) noexcept
+{
+  if (rank_count == 0 || rank_count > application_checkpoint_max_rank_count_v1 ||
+      rank_count != config.deferred_runtime().required_mpi_rank_count ||
+      observed_ranks == nullptr ||
+      config.backend() != ApplicationBackend::cpu_rank2 ||
+      config.scalar_igr()) return false;
+  const CheckpointCoefficientSchemaV1 schema =
+      CheckpointCoefficientSchema(config);
+  if (schema.interior_component_count == 0 ||
+      schema.trace_component_count == 0) return false;
+  ScenarioCoefficientExtentsV1 scenario_totals{};
+  if (!DeriveScenarioCoefficientExtentsV1(config, rank_count,
+                                          scenario_totals)) return false;
+  const std::uint64_t basis =
+      static_cast<std::uint64_t>(config.polynomial_order() + 1);
+  std::uint64_t interior_basis = 0;
+  if (!codec_detail::Multiply(basis, basis, interior_basis)) return false;
+  ScenarioCoefficientExtentsV1 candidate{};
+  candidate.rank_count = rank_count;
+  candidate.interior_component_count = schema.interior_component_count;
+  candidate.trace_component_count = schema.trace_component_count;
+  for (std::uint32_t rank = 0; rank < rank_count; ++rank)
+  {
+    const RankCoefficientExtentsV1& observed = observed_ranks[rank];
+    RankCoefficientExtentsV1& value = candidate.ranks[rank];
+    std::uint64_t interior_count = 0;
+    std::uint64_t trace_count = 0;
+    if (observed.interior_dofs_per_component == 0 ||
+        observed.trace_dofs_per_component == 0 ||
+        observed.interior_dofs_per_component % interior_basis != 0 ||
+        observed.trace_dofs_per_component % basis != 0 ||
+        !codec_detail::Multiply(observed.interior_dofs_per_component,
+                                schema.interior_component_count,
+                                interior_count) ||
+        !codec_detail::Multiply(observed.trace_dofs_per_component,
+                                schema.trace_component_count, trace_count) ||
+        interior_count != observed.interior_coefficient_count ||
+        trace_count != observed.trace_coefficient_count ||
+        !codec_detail::Add(candidate.aggregate_interior_coefficient_count,
+                           interior_count,
+                           candidate.aggregate_interior_coefficient_count) ||
+        !codec_detail::Add(candidate.aggregate_trace_coefficient_count,
+                           trace_count,
+                           candidate.aggregate_trace_coefficient_count))
+      return false;
+    value = observed;
+  }
+  if (candidate.aggregate_interior_coefficient_count !=
+          scenario_totals.aggregate_interior_coefficient_count ||
+      candidate.aggregate_trace_coefficient_count !=
+          scenario_totals.aggregate_trace_coefficient_count) return false;
+  extents = candidate;
+  return true;
+}
+
+namespace
+{
+bool UsesObservedMfemExtents(const ValidatedApplicationConfig& config) noexcept
+{
+  return config.backend() == ApplicationBackend::cpu_rank2 &&
+      !config.scalar_igr();
+}
+}
+
 CheckpointCoefficientSchemaV1 CheckpointCoefficientSchema(
     const ValidatedApplicationConfig& config) noexcept
 {
@@ -1575,6 +1644,8 @@ CheckpointCodecStatus EncodeCheckpointV1(
     const CheckpointDescriptor& captured_descriptor =
         checkpoint.rank_descriptor(0);
     if (checkpoint.rank_count() != rank_count ||
+        ranks == nullptr || rank_count == 0 ||
+        rank_count > application_checkpoint_max_rank_count_v1 ||
         !DescriptorStructurallyValid(captured_descriptor, config) ||
         !ValidCheckpointRuntimeIdentityV1(config, runtime) ||
         captured_descriptor.tuple != config.tuple() ||
@@ -1588,8 +1659,18 @@ CheckpointCodecStatus EncodeCheckpointV1(
       return CheckpointCodecStatus::invalid_descriptor;
     }
     ScenarioCoefficientExtentsV1 extents{};
-    if (!DeriveScenarioCoefficientExtentsV1(
-            config, captured_descriptor.rank_count, extents))
+    std::array<RankCoefficientExtentsV1, application_checkpoint_max_rank_count_v1>
+        observed{};
+    for (std::size_t rank = 0; rank < rank_count; ++rank)
+      observed[rank] = {ranks[rank].interior.dofs_per_component,
+                        ranks[rank].interior.coefficient_count,
+                        ranks[rank].owned_true_trace.dofs_per_component,
+                        ranks[rank].owned_true_trace.coefficient_count};
+    if (!(UsesObservedMfemExtents(config)
+              ? DeriveObservedCoefficientExtentsV1(
+                    config, captured_descriptor.rank_count, observed.data(), extents)
+              : DeriveScenarioCoefficientExtentsV1(
+                    config, captured_descriptor.rank_count, extents)))
     {
       return CheckpointCodecStatus::invalid_descriptor;
     }
@@ -1632,8 +1713,10 @@ CheckpointCodecStatus EncodeCheckpointV1(
     writer.Bytes(magic.data(), magic.size());
     writer.UnsignedLittleEndian(application_checkpoint_codec_version_v2);
     writer.UnsignedLittleEndian(std::uint64_t{0});
-    const StableIdentity partition_layout_rule =
-        StableIdentity::Copy(checkpoint_partition_layout_rule_id_v1);
+    const StableIdentity partition_layout_rule = StableIdentity::Copy(
+        UsesObservedMfemExtents(config)
+            ? checkpoint_mfem_observed_partition_layout_rule_id_v1
+            : checkpoint_partition_layout_rule_id_v1);
     if (!WriteConfig(writer, config))
     {
       return CheckpointCodecStatus::invalid_config_identity;
@@ -1768,8 +1851,11 @@ CheckpointCodecStatus DecodeCheckpointV1(
   {
     return CheckpointCodecStatus::invalid_config_identity;
   }
-  if (artifact_partition_layout_rule.view() !=
-          checkpoint_partition_layout_rule_id_v1 ||
+  const std::string_view expected_partition_layout_rule =
+      UsesObservedMfemExtents(expected_config)
+          ? checkpoint_mfem_observed_partition_layout_rule_id_v1
+          : checkpoint_partition_layout_rule_id_v1;
+  if (artifact_partition_layout_rule.view() != expected_partition_layout_rule ||
       !DescriptorStructurallyValid(descriptor, expected_config))
   {
     return CheckpointCodecStatus::invalid_descriptor;
@@ -1800,8 +1886,18 @@ CheckpointCodecStatus DecodeCheckpointV1(
     return CheckpointCodecStatus::output_buffer_mismatch;
   }
   ScenarioCoefficientExtentsV1 extents{};
-  if (!DeriveScenarioCoefficientExtentsV1(expected_config, rank_count,
-                                          extents))
+  std::array<RankCoefficientExtentsV1, application_checkpoint_max_rank_count_v1>
+      observed{};
+  for (std::size_t rank = 0; rank < rank_count; ++rank)
+    observed[rank] = {rank_buffers[rank].interior.dofs_per_component,
+                      rank_buffers[rank].interior.coefficient_count,
+                      rank_buffers[rank].owned_true_trace.dofs_per_component,
+                      rank_buffers[rank].owned_true_trace.coefficient_count};
+  if (!(UsesObservedMfemExtents(expected_config)
+            ? DeriveObservedCoefficientExtentsV1(
+                  expected_config, rank_count, observed.data(), extents)
+            : DeriveScenarioCoefficientExtentsV1(
+                  expected_config, rank_count, extents)))
   {
     return CheckpointCodecStatus::invalid_descriptor;
   }
