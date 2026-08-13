@@ -31,15 +31,16 @@ struct HDGInteriorFieldView
 };
 
 /**
- * Output metadata.  V1 requires @ref cycle and @ref step to be equal so the
- * MFEM PVD timeline has one unambiguous solver-step identity.  @ref cycle is
- * written through mfem::DataCollection::SetCycle and @ref time through
- * SetTime; no custom sidecar format is introduced.
+ * Output metadata.  @ref cycle is the MFEM publication identity and is
+ * written through mfem::DataCollection::SetCycle.  @ref step is independent
+ * solver-step provenance and may differ from cycle; V1 does not add a custom
+ * sidecar or encode it into MFEM's native PVD/PVTU/VTU naming.  @ref time is
+ * written through SetTime.
  */
 struct HDGParaViewMetadata
 {
-  int cycle = 0;
-  int step = 0;
+  int cycle = 0; ///< Non-negative MFEM publication-cycle identity.
+  int step = 0;  ///< Non-negative caller solver-step provenance.
   double time = 0.0;
 };
 

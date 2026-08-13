@@ -37,11 +37,10 @@ void ValidateRequest(const HDGParaViewRequest& request)
     throw std::invalid_argument(
         "HDG ParaView levels_of_detail must be non-negative");
   }
-  if (request.metadata.cycle < 0 || request.metadata.step < 0 ||
-      request.metadata.cycle != request.metadata.step)
+  if (request.metadata.cycle < 0 || request.metadata.step < 0)
   {
     throw std::invalid_argument(
-        "HDG ParaView V1 requires non-negative, equal cycle and step");
+        "HDG ParaView cycle and step must be non-negative");
   }
   if (!std::isfinite(request.metadata.time))
   {

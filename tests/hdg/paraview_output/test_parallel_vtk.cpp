@@ -58,7 +58,7 @@ bool Run(const std::filesystem::path& output)
     const std::filesystem::path collection_root = output / "hdg_physical";
     std::filesystem::create_directories(collection_root);
     std::ofstream stale_pvd(collection_root / "hdg_physical.pvd");
-    stale_pvd << "stale-history-cycle-000003\n";
+    stale_pvd << "stale-history-cycle-000002\n";
   }
   MPI_Barrier(MPI_COMM_WORLD);
 
@@ -82,13 +82,13 @@ bool Run(const std::filesystem::path& output)
   dg_sim::hdg::HDGParaViewRequest request{
       mesh,
       {{"density", density}, {"momentum", momentum}},
-      {7, 7, 1.25},
+      {3, 20, 1.25},
       {output.string(), "hdg_physical", mfem::VTKFormat::ASCII, 1, false}};
   dg_sim::hdg::WriteHDGParaViewOutput(request);
   MPI_Barrier(MPI_COMM_WORLD);
 
   const std::filesystem::path cycle =
-      output / "hdg_physical" / "Cycle000007";
+      output / "hdg_physical" / "Cycle000003";
   const std::filesystem::path local_vtu = cycle /
       (std::string("proc") +
        (rank == 0 ? "000000" : "000001") + ".vtu");
@@ -107,8 +107,8 @@ bool Run(const std::filesystem::path& output)
     const std::string pvd = ReadFile(output / "hdg_physical" / "hdg_physical.pvd");
     const std::string pvtu = ReadFile(cycle / "data.pvtu");
     passed = passed && Contains(pvd, "timestep=\"1.25\"") &&
-        Contains(pvd, "Cycle000007/data.pvtu") &&
-        !Contains(pvd, "stale-history-cycle-000003") &&
+        Contains(pvd, "Cycle000003/data.pvtu") &&
+        !Contains(pvd, "stale-history-cycle-000002") &&
         Contains(pvtu, "proc000000.vtu");
     if (ranks == 2)
     {
