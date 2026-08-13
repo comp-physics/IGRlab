@@ -309,6 +309,11 @@ bool CheckBorrowedTraceRestrictsInterior()
     }
     dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
     if (!core.InitializeBorrowedEuler(request)) return false;
+    if (core.evidence().tuple.stabilization.view() !=
+        "tau.llf.max-fixed-local.v1")
+    {
+      return false;
+    }
     const dg::hdg::runtime::cpu::CpuStateSnapshot snapshot = core.Snapshot({});
     if (snapshot.trace.size != static_cast<std::size_t>(expected_true_trace.Size()) ||
         (snapshot.trace.data == nullptr && snapshot.trace.size != 0))

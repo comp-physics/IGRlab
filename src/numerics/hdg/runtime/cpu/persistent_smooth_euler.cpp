@@ -37,6 +37,8 @@ constexpr std::string_view expected_model = "euler.compressible.2d";
 constexpr std::string_view expected_formulation = "hdg.conventional";
 constexpr std::string_view expected_trace = "mfem.dg_interface.trace";
 constexpr std::string_view expected_stabilization = "tau.fixed";
+constexpr std::string_view generic_borrowed_stabilization =
+    "tau.llf.max-fixed-local.v1";
 constexpr std::string_view expected_time = "backward_euler";
 constexpr std::string_view expected_precision = "fp64";
 constexpr std::string_view expected_mfem_pin =
@@ -4587,7 +4589,7 @@ bool detail::CpuNumericsCore::InitializeBorrowedEuler(
   tuple.model = StableIdentity::Copy("euler.conservative.2d.v1");
   tuple.formulation = StableIdentity::Copy("hdg.conventional.v1");
   tuple.trace = StableIdentity::Copy("trace.dg.interface.v1");
-  tuple.stabilization = StableIdentity::Copy("tau.fixed.v1");
+  tuple.stabilization = StableIdentity::Copy(generic_borrowed_stabilization);
   tuple.time_treatment = StableIdentity::Copy("backward-euler.v1");
   tuple.backend = StableIdentity::Copy("cpu.host.v1");
   tuple.precision = StableIdentity::Copy("fp64.v1");
