@@ -98,15 +98,23 @@ struct TimeControl
     {
       throw std::invalid_argument("final time must not precede initial time");
     }
-    if (kind == StepControlKind::Fixed &&
-        (!std::isfinite(fixed_dt) || fixed_dt <= 0.0))
+    switch (kind)
     {
-      throw std::invalid_argument("fixed dt must be finite and positive");
-    }
-    if (kind == StepControlKind::CFL &&
-        (!std::isfinite(cfl) || cfl <= 0.0))
-    {
-      throw std::invalid_argument("CFL number must be finite and positive");
+      case StepControlKind::Fixed:
+        if (!std::isfinite(fixed_dt) || fixed_dt <= 0.0)
+        {
+          throw std::invalid_argument("fixed dt must be finite and positive");
+        }
+        break;
+      case StepControlKind::CFL:
+        if (!std::isfinite(cfl) || cfl <= 0.0)
+        {
+          throw std::invalid_argument(
+            "CFL number must be finite and positive");
+        }
+        break;
+      default:
+        throw std::invalid_argument("unknown step control kind");
     }
   }
 
@@ -145,7 +153,14 @@ enum class FinalOutputPolicy
   Emit
 };
 
-/** Output event policy and regular-boundary definition. */
+/**
+ * @brief Output event policy and regular-boundary definition.
+ *
+ * The initial/final policies are additive force flags.  A scheduled explicit
+ * entry at either boundary is always emitted; Emit adds that boundary only if
+ * the schedule does not already do so.  Coincident scheduled and forced
+ * events are published once.
+ */
 struct OutputSchedule
 {
   OutputScheduleKind kind = OutputScheduleKind::Disabled;
@@ -186,24 +201,43 @@ struct OutputSchedule
 
   void Validate() const
   {
-    if (kind == OutputScheduleKind::FixedInterval &&
-        (!std::isfinite(interval) || interval <= 0.0))
+    if (initial != InitialOutputPolicy::Suppress &&
+        initial != InitialOutputPolicy::Emit)
     {
-      throw std::invalid_argument("output interval must be finite and positive");
+      throw std::invalid_argument("unknown initial output policy");
     }
-    if (kind == OutputScheduleKind::ExplicitTimes)
+    if (final != FinalOutputPolicy::Suppress &&
+        final != FinalOutputPolicy::Emit)
     {
-      for (std::size_t i = 0; i < explicit_times.size(); ++i)
-      {
-        if (!std::isfinite(explicit_times[i]))
+      throw std::invalid_argument("unknown final output policy");
+    }
+    switch (kind)
+    {
+      case OutputScheduleKind::Disabled:
+        return;
+      case OutputScheduleKind::FixedInterval:
+        if (!std::isfinite(interval) || interval <= 0.0)
         {
-          throw std::invalid_argument("explicit output time must be finite");
+          throw std::invalid_argument(
+            "output interval must be finite and positive");
         }
-        if (i > 0 && explicit_times[i] < explicit_times[i - 1])
+        return;
+      case OutputScheduleKind::ExplicitTimes:
+        for (std::size_t i = 0; i < explicit_times.size(); ++i)
         {
-          throw std::invalid_argument("explicit output times must be sorted");
+          if (!std::isfinite(explicit_times[i]))
+          {
+            throw std::invalid_argument("explicit output time must be finite");
+          }
+          if (i > 0 && explicit_times[i] < explicit_times[i - 1])
+          {
+            throw std::invalid_argument(
+              "explicit output times must be sorted");
+          }
         }
-      }
+        return;
+      default:
+        throw std::invalid_argument("unknown output schedule kind");
     }
   }
 };
@@ -264,13 +298,16 @@ public:
 
   std::optional<OutputEvent> InitialOutput() const
   {
-    if (schedule_.initial == InitialOutputPolicy::Suppress)
+    if (schedule_.initial == InitialOutputPolicy::Suppress &&
+        !HasExplicitInitialOutput())
     {
       return std::nullopt;
     }
-    return OutputEvent{0, control_.initial_time, true, Finished() &&
-                                                    schedule_.final ==
-                                                      FinalOutputPolicy::Emit};
+    return OutputEvent{0,
+                       control_.initial_time,
+                       true,
+                       Finished() && (schedule_.final == FinalOutputPolicy::Emit ||
+                                      HasExplicitInitialOutput())};
   }
 
   const StepPlan& Plan(double backend_proposed_dt)
@@ -339,22 +376,16 @@ public:
       AdvanceScheduledOutput();
     }
 
-    const bool emit_final = committed.hits_final &&
-                            schedule_.final == FinalOutputPolicy::Emit;
-    if (emit_final)
-    {
-      if (committed.hits_scheduled_output)
-      {
-        return OutputEvent{committed.scheduled_cycle,
-                           time_,
-                           false,
-                           true};
-      }
-      return OutputEvent{NextPolicyCycle(), time_, false, true};
-    }
     if (committed.hits_scheduled_output)
     {
-      return OutputEvent{committed.scheduled_cycle, time_, false, false};
+      return OutputEvent{committed.scheduled_cycle,
+                         time_,
+                         false,
+                         committed.hits_final};
+    }
+    if (committed.hits_final && schedule_.final == FinalOutputPolicy::Emit)
+    {
+      return OutputEvent{NextPolicyCycle(), time_, false, true};
     }
     return std::nullopt;
   }
@@ -431,6 +462,13 @@ private:
     }
   }
 
+  bool HasExplicitInitialOutput() const
+  {
+    return schedule_.kind == OutputScheduleKind::ExplicitTimes &&
+           !schedule_.explicit_times.empty() &&
+           NearlyEqual(schedule_.explicit_times.front(), control_.initial_time);
+  }
+
   std::optional<Boundary> NextOutputBoundary() const
   {
     if (schedule_.kind == OutputScheduleKind::Disabled)
@@ -456,7 +494,7 @@ private:
       return std::nullopt;
     }
     return Boundary{schedule_.explicit_times[next_explicit_index_],
-                    static_cast<std::uint64_t>(next_explicit_index_ + 1)};
+                    next_publication_cycle_};
   }
 
   void AdvanceScheduledOutput()
@@ -469,19 +507,12 @@ private:
     {
       ++next_explicit_index_;
     }
+    ++next_publication_cycle_;
   }
 
   std::uint64_t NextPolicyCycle() const
   {
-    if (schedule_.kind == OutputScheduleKind::FixedInterval)
-    {
-      return next_fixed_cycle_;
-    }
-    if (schedule_.kind == OutputScheduleKind::ExplicitTimes)
-    {
-      return static_cast<std::uint64_t>(next_explicit_index_ + 1);
-    }
-    return committed_steps_ + 1;
+    return next_publication_cycle_;
   }
 
   TimeControl control_;
@@ -491,6 +522,7 @@ private:
   std::uint64_t committed_steps_ = 0;
   std::uint64_t next_sequence_ = 1;
   std::uint64_t next_fixed_cycle_ = 1;
+  std::uint64_t next_publication_cycle_ = 1;
   std::size_t next_explicit_index_ = 0;
   std::optional<StepPlan> pending_;
 };

@@ -111,6 +111,45 @@ int main()
   }
 
   {
+    StepPlanCursor cursor(TimeControl::Fixed(0.0, 1.0, 1.0),
+                          OutputSchedule::Explicit({0.0, 0.4, 0.8},
+                                                   InitialOutputPolicy::Suppress,
+                                                   FinalOutputPolicy::Suppress));
+    const auto initial = cursor.InitialOutput();
+    checks.Expect(initial && initial->is_initial && initial->cycle == 0,
+                  "an explicit initial request emits despite suppressed force");
+    const auto first = cursor.Commit(cursor.Plan(0.0));
+    checks.Expect(first && first->cycle == 1 && Near(first->time, 0.4),
+                  "explicit publications remain contiguous after cycle zero");
+    const auto second = cursor.Commit(cursor.Plan(0.0));
+    checks.Expect(second && second->cycle == 2 && Near(second->time, 0.8),
+                  "explicit publication cycle is independent of vector index");
+  }
+
+  {
+    StepPlanCursor cursor(TimeControl::Fixed(0.0, 1.0, 1.0),
+                          OutputSchedule::Explicit({0.0, 1.0},
+                                                   InitialOutputPolicy::Emit,
+                                                   FinalOutputPolicy::Emit));
+    const auto initial = cursor.InitialOutput();
+    checks.Expect(initial && initial->is_initial && initial->cycle == 0,
+                  "automatic and explicit initial outputs deduplicate at cycle zero");
+    const auto final = cursor.Commit(cursor.Plan(0.0));
+    checks.Expect(final && final->is_final && final->cycle == 1,
+                  "scheduled and forced final outputs deduplicate at one cycle");
+  }
+
+  {
+    StepPlanCursor cursor(TimeControl::Fixed(0.0, 1.0, 1.0),
+                          OutputSchedule::Explicit({1.0},
+                                                   InitialOutputPolicy::Suppress,
+                                                   FinalOutputPolicy::Suppress));
+    const auto final = cursor.Commit(cursor.Plan(0.0));
+    checks.Expect(final && final->is_final && final->cycle == 1,
+                  "a scheduled final output remains enabled when force is suppressed");
+  }
+
+  {
     StepPlanCursor cursor(TimeControl::CFL(0.0, 1.0, 0.5),
                           OutputSchedule::FixedInterval(0.4));
     const StepPlan& original = cursor.Plan(0.7);
@@ -182,6 +221,40 @@ int main()
                   cursor.Plan(-0.1);
                 },
                 "nonpositive CFL backend proposals are rejected");
+  ExpectInvalid(checks,
+                []
+                {
+                  TimeControl control = TimeControl::Fixed(0.0, 1.0, 0.1);
+                  control.kind = static_cast<dg_sim::time::backend::StepControlKind>(99);
+                  control.Validate();
+                },
+                "invalid step control enum is rejected");
+  ExpectInvalid(checks,
+                []
+                {
+                  OutputSchedule schedule = OutputSchedule::Disabled();
+                  schedule.kind =
+                    static_cast<dg_sim::time::backend::OutputScheduleKind>(99);
+                  schedule.Validate();
+                },
+                "invalid output schedule enum is rejected");
+  ExpectInvalid(checks,
+                []
+                {
+                  OutputSchedule schedule = OutputSchedule::Disabled();
+                  schedule.initial =
+                    static_cast<InitialOutputPolicy>(99);
+                  schedule.Validate();
+                },
+                "invalid initial output policy enum is rejected");
+  ExpectInvalid(checks,
+                []
+                {
+                  OutputSchedule schedule = OutputSchedule::Disabled();
+                  schedule.final = static_cast<FinalOutputPolicy>(99);
+                  schedule.Validate();
+                },
+                "invalid final output policy enum is rejected");
 
   if (checks.failures() != 0)
   {
