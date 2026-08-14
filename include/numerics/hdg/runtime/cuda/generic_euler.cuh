@@ -5,11 +5,10 @@
  * @brief Narrow native-CUDA prepared-transaction facade for the W8A engine.
  *
  * This facade accepts an existing @ref CudaConfig with a caller-owned
- * periodic @ref mfem::ParMesh.  It does not accept generic Euler field views,
- * alter the manufactured initial/source physics, or invoke semantic boundary
- * callbacks.  The only export is @ref CudaSerializedCheckpointV1: a
- * rank-local, component-major candidate payload.  It is not VTK, parallel
- * I/O, a new durable restart format, or a public evidence history.
+ * periodic @ref mfem::ParMesh and an explicit borrowed byNODES L2 initial
+ * field.  Optional static L2 source coefficients are copied at Initialize;
+ * no caller field pointer is retained.  Physical interior exports use the
+ * same explicit L2 ABI and never decode a checkpoint outside this engine.
  */
 
 #include "numerics/hdg/generic/session_contract.hpp"
@@ -104,13 +103,15 @@ public:
   GenericEulerHdgCudaSession& operator=(GenericEulerHdgCudaSession&&) =
       delete;
 
-  /** Exactly prepared_commit | prepared_output; no CFL or borrowed-input bit. */
+  /** No CFL diagnostics; borrowed inputs are real CUDA data, not a promise. */
   static constexpr std::uint32_t capabilities() noexcept
   {
     return generic::HdgEulerSessionCapabilityBit(
-               generic::HdgEulerSessionCapability::prepared_commit) |
+        generic::HdgEulerSessionCapability::prepared_commit) |
         generic::HdgEulerSessionCapabilityBit(
-            generic::HdgEulerSessionCapability::prepared_output);
+            generic::HdgEulerSessionCapability::prepared_output) |
+        generic::HdgEulerSessionCapabilityBit(
+            generic::HdgEulerSessionCapability::generic_borrowed_inputs);
   }
 
   /**
@@ -241,6 +242,38 @@ public:
     return Result(generic::HdgEulerSessionStatus::prepared);
   }
 
+  /** Export the initial or later committed physical interior to byNODES L2. */
+  bool ExportCommittedInterior(
+      cuda_w8a::CudaMutableHostL2Output destination) noexcept
+  {
+    const bool local_valid = initialized_ && !failed_ && !prepared_active_ &&
+        destination.coefficients != nullptr &&
+        destination.components == cuda_w8a::conserved_components;
+    if (!AdmitOperation(operation_tag::export_committed, local_valid))
+      return false;
+    return Dispatch([&](auto& engine)
+    { return engine.ExportCommittedInterior(destination); });
+  }
+
+  /**
+   * Export a physical candidate only while its affine authority is live.
+   * This does not acknowledge or publish it: Commit still requires the
+   * existing AcknowledgePreparedOutput call after the caller accepts bytes.
+   */
+  bool ExportPreparedInterior(
+      const GenericEulerCudaPreparedStep& authority,
+      const native_export_type& native_export,
+      cuda_w8a::CudaMutableHostL2Output destination) noexcept
+  {
+    const bool local_valid = Matches(authority, native_export) &&
+        destination.coefficients != nullptr &&
+        destination.components == cuda_w8a::conserved_components;
+    if (!AdmitOperation(operation_tag::export_prepared, local_valid))
+      return false;
+    return Dispatch([&](auto& engine)
+    { return engine.ExportPreparedInterior(destination); });
+  }
+
   /** The caller attests that the staged native export is ready for publication. */
   bool AcknowledgePreparedOutput(
       const GenericEulerCudaPreparedStep& authority,
@@ -337,7 +370,9 @@ private:
     prepare = 2,
     acknowledge_output = 3,
     commit = 4,
-    abort = 5
+    abort = 5,
+    export_committed = 6,
+    export_prepared = 7
   };
 
   using rank1_engine = cuda_w8a::PersistentCudaSmoothEulerEngine<
@@ -506,6 +541,18 @@ private:
     AppendConfigValue(local, cursor, complete, config.expected_rank_count);
     append_bool(config.require_host_staged_rank2);
     append_bool(config.use_borrowed_topology);
+    // Preserve the frozen legacy descriptor byte-for-byte.  The data-mode
+    // branch carries only rank-common ABI facts: local L2 counts are expected
+    // to vary with the borrowed partition and are validated locally later.
+    if (config.use_borrowed_host_inputs)
+    {
+      append_bool(true);
+      AppendConfigValue(local, cursor, complete,
+                        config.borrowed_initial.components);
+      AppendConfigValue(local, cursor, complete,
+                        config.borrowed_source.components);
+      append_bool(config.borrowed_source.coefficients != nullptr);
+    }
     append_bool(config.capture_oracle);
     append_bool(config.force_private_scientific_gate_failure);
     AppendConfigValue(local, cursor, complete, config.injection.phase);
@@ -539,11 +586,30 @@ private:
         MPI_Finalized(&mpi_finalized) != MPI_SUCCESS || mpi_finalized)
       return false;
     const bool config_consensus = ConfigConsensus(config);
+    const bool empty_borrowed_fields =
+        config.borrowed_initial.coefficients == nullptr &&
+        config.borrowed_initial.scalar_count == 0 &&
+        config.borrowed_initial.components == cuda_w8a::conserved_components &&
+        config.borrowed_source.coefficients == nullptr &&
+        config.borrowed_source.scalar_count == 0 &&
+        config.borrowed_source.components == cuda_w8a::conserved_components;
+    const bool borrowed_data_abi = config.use_borrowed_host_inputs
+        ? config.borrowed_initial.coefficients != nullptr &&
+            config.borrowed_initial.scalar_count != 0 &&
+            config.borrowed_initial.components == cuda_w8a::conserved_components &&
+            ((config.borrowed_source.coefficients == nullptr &&
+              config.borrowed_source.scalar_count == 0 &&
+              config.borrowed_source.components == cuda_w8a::conserved_components) ||
+             (config.borrowed_source.coefficients != nullptr &&
+              config.borrowed_source.scalar_count != 0 &&
+              config.borrowed_source.components == cuda_w8a::conserved_components))
+        : empty_borrowed_fields;
     int ranks = 0;
     int borrowed_world = MPI_UNEQUAL;
     int borrowed_mesh = MPI_UNEQUAL;
     bool local = config.use_borrowed_topology && config.borrowed_mesh != nullptr &&
         config.borrowed_communicator != MPI_COMM_NULL &&
+        borrowed_data_abi &&
         MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS &&
         (ranks == 1 || ranks == 2) && ranks == config.expected_rank_count &&
         config.requested_device == 0 &&
@@ -595,6 +661,24 @@ private:
             local_faces <= std::numeric_limits<long long>::max() / 2;
         if (local)
           local_face_measure = 2 * local_faces - local_shared_faces;
+      }
+      if (local && config.use_borrowed_host_inputs)
+      {
+        const std::size_t expected_scalar_count = static_cast<std::size_t>(
+            config.borrowed_mesh->GetNE()) * static_cast<std::size_t>(
+            (config.order + 1) * (config.order + 1));
+        const bool source_empty = config.borrowed_source.coefficients == nullptr &&
+            config.borrowed_source.scalar_count == 0;
+        local = config.borrowed_initial.scalar_count == expected_scalar_count &&
+            (source_empty || config.borrowed_source.scalar_count ==
+                expected_scalar_count);
+        // Count equality is established before dereferencing either caller
+        // field, so wrong-count admission fails without speculative reads.
+        for (std::size_t i = 0; local && i < expected_scalar_count *
+                 static_cast<std::size_t>(cuda_w8a::conserved_components); ++i)
+          local = std::isfinite(config.borrowed_initial.coefficients[i]) &&
+              (source_empty ||
+               std::isfinite(config.borrowed_source.coefficients[i]));
       }
     }
     const int local_bit = local ? 1 : 0;

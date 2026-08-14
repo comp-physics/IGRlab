@@ -338,6 +338,9 @@ struct CudaDeviceView
   double* slot_interior[2]{};
   double* old_interior = nullptr;
   double* work_interior = nullptr;
+  // Dedicated persistent slice for caller-supplied static L2 source values.
+  // It is always allocated; legacy manufactured forcing ignores it.
+  double* static_source = nullptr;
   double* initial_current_interior = nullptr;
   double* base_interior = nullptr;
   double* trial_interior = nullptr;
@@ -416,6 +419,7 @@ struct CudaMeshShape
   int vector_owned_count = 0;
   int vector_send_count = 0;
   int vector_receive_count = 0;
+  bool borrowed_static_source = false;
 };
 
 enum class CudaHypreSetupAction : std::uint8_t
@@ -789,6 +793,11 @@ public:
       ReportCudaSetupFailure(evidence.rank, "build-topology");
       return false;
     }
+    if (!CollectiveContinue(InitializeBorrowedHostFields(config)))
+    {
+      ReportCudaSetupFailure(evidence.rank, "borrowed-host-fields");
+      return false;
+    }
     const int local_ghost_count =
         static_cast<int>(exchange_plan_.map.GhostCount());
     std::array<int, 2> ghost_counts{};
@@ -902,6 +911,13 @@ public:
 
   state_slot CommittedSlot() const noexcept { return committed_slot_; }
   state_slot CandidateSlot() const noexcept { return candidate_slot_; }
+  /** Mirror a final contract slot publication without moving any payload. */
+  void SwapPublishedSlotHandles() noexcept
+  {
+    const state_slot prior_committed = committed_slot_;
+    committed_slot_ = candidate_slot_;
+    candidate_slot_ = prior_committed;
+  }
   state_slot& WorkspaceSlot() noexcept { return workspace_slot_; }
   const PersistentResourceDescriptor& Resources() const noexcept
   {
@@ -1484,6 +1500,10 @@ public:
         ExportTrueSystem(pod);
   }
 
+  /** Map one device element-local state back to a validated byNODES L2 view. */
+  bool ExportInterior(const CudaInteriorState& source,
+                      CudaMutableHostL2Output destination) noexcept;
+
 private:
   static bool ExactTopologyShapeFitsCapacity(
       const CudaConfig& config, const mfem::ParMesh& mesh,
@@ -1845,6 +1865,7 @@ private:
     shape_.assembly_order = config.order == functional_polynomial_order
         ? functional_assembly_quadrature_order : assembly_quadrature_order;
     shape_.interior_count = shape_.elements * shape_.interior_dofs;
+    shape_.borrowed_static_source = false;
     if (!ExactTopologyShapeFitsCapacity(config, *mesh_, *interior_space_,
                                         *trace_space_, exchange_plan_))
       return false;
@@ -1859,6 +1880,7 @@ private:
   }
 
   bool BuildHostGeometryAndMaps() noexcept;
+  bool InitializeBorrowedHostFields(const CudaConfig& config) noexcept;
   bool BuildLocalTraceGraph() noexcept;
   bool BuildPersistentTrueSystem() noexcept;
   bool BuildSparseStagingPlan() noexcept;
@@ -2119,6 +2141,13 @@ private:
       host_perturbed_interior_{};
   std::array<double, maximum_true_trace_dofs> host_exact_true_trace_{};
   std::array<double, maximum_true_trace_dofs> host_perturbed_true_trace_{};
+  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
+      host_static_source_{};
+  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
+      host_export_interior_{};
+  std::array<int, maximum_rank_elements * maximum_interior_dofs_per_element>
+      signed_element_interior_{};
+  bool borrowed_host_inputs_ = false;
   std::array<int, maximum_local_matrix_entries> host_matrix_owned_source_{};
   std::array<int, maximum_local_matrix_entries> host_matrix_owned_section_{};
   std::array<int, maximum_local_matrix_entries> host_matrix_owned_target_{};

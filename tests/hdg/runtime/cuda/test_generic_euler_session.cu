@@ -3,6 +3,9 @@
 
 #include <mfem.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <new>
@@ -45,8 +48,33 @@ mfem::Mesh NonperiodicSquareMesh(const int n)
 }
 
 CudaConfig BorrowedConfig(mfem::ParMesh& mesh, const int ranks,
-                          const int order, const int n) noexcept
+                          const int order, const int n)
 {
+  // Each returned config receives one unique stable slot.  The bounded pool
+  // fails closed rather than reusing/overwriting a queued config's input.
+  using storage_type = std::array<double, maximum_rank_elements *
+      maximum_interior_dofs_per_element>;
+  static std::array<storage_type, 128> fixture_storage{};
+  static std::size_t fixture_count = 0;
+  if (fixture_count == fixture_storage.size()) throw std::bad_alloc();
+  storage_type& initial = fixture_storage[fixture_count++];
+  mfem::L2_FECollection collection(
+      order, 2, mfem::BasisType::GaussLegendre,
+      mfem::FiniteElement::VALUE);
+  mfem::ParFiniteElementSpace space(
+      &mesh, &collection, conserved_components, mfem::Ordering::byNODES);
+  const std::size_t scalar_count = static_cast<std::size_t>(space.GetVSize() /
+      conserved_components);
+  if (scalar_count * conserved_components > initial.size())
+    throw std::bad_alloc();
+  for (std::size_t scalar = 0; scalar < scalar_count; ++scalar)
+  {
+    const double perturbation = 1.0e-3 * static_cast<double>(scalar + 1);
+    initial[scalar] = 1.0 + perturbation;
+    initial[scalar_count + scalar] = 0.20 + 0.25 * perturbation;
+    initial[2 * scalar_count + scalar] = -0.10 + 0.15 * perturbation;
+    initial[3 * scalar_count + scalar] = 2.60 + 0.10 * perturbation;
+  }
   CudaConfig config{};
   config.order = order;
   config.mesh_n = n;
@@ -56,7 +84,88 @@ CudaConfig BorrowedConfig(mfem::ParMesh& mesh, const int ranks,
   config.use_borrowed_topology = true;
   config.borrowed_mesh = &mesh;
   config.borrowed_communicator = MPI_COMM_WORLD;
+  config.use_borrowed_host_inputs = true;
+  config.borrowed_initial = {initial.data(), scalar_count,
+                             conserved_components};
+  config.borrowed_source = {nullptr, 0, conserved_components};
   return config;
+}
+
+struct HostFields
+{
+  std::vector<double> initial;
+  std::vector<double> source;
+  std::size_t scalar_count = 0;
+};
+
+HostFields NonuniformHostFields(mfem::ParMesh& mesh, const int order,
+                                const bool nonzero_source)
+{
+  mfem::L2_FECollection collection(
+      order, 2, mfem::BasisType::GaussLegendre,
+      mfem::FiniteElement::VALUE);
+  mfem::ParFiniteElementSpace space(
+      &mesh, &collection, conserved_components, mfem::Ordering::byNODES);
+  HostFields fields;
+  fields.scalar_count = static_cast<std::size_t>(space.GetVSize() /
+      conserved_components);
+  fields.initial.resize(fields.scalar_count * conserved_components);
+  if (nonzero_source)
+    fields.source.resize(fields.initial.size());
+  for (std::size_t scalar = 0; scalar < fields.scalar_count; ++scalar)
+  {
+    const double value = 1.0e-3 * static_cast<double>(scalar + 1);
+    fields.initial[scalar] = 1.0 + value;
+    fields.initial[fields.scalar_count + scalar] = 0.20 + 0.25 * value;
+    fields.initial[2 * fields.scalar_count + scalar] = -0.10 + 0.15 * value;
+    fields.initial[3 * fields.scalar_count + scalar] = 2.60 + 0.10 * value;
+    if (nonzero_source)
+    {
+      fields.source[scalar] = 0.01 * value;
+      fields.source[fields.scalar_count + scalar] = -0.02 * value;
+      fields.source[2 * fields.scalar_count + scalar] = 0.03 * value;
+      fields.source[3 * fields.scalar_count + scalar] = 0.04 * value;
+    }
+  }
+  return fields;
+}
+
+CudaConfig BorrowedDataConfig(mfem::ParMesh& mesh, const int ranks,
+                              const int order, const int n,
+                              const HostFields& fields)
+{
+  CudaConfig config = BorrowedConfig(mesh, ranks, order, n);
+  config.borrowed_initial = {fields.initial.data(), fields.scalar_count,
+                             conserved_components};
+  config.borrowed_source = fields.source.empty()
+      ? CudaBorrowedHostL2Input{nullptr, 0, conserved_components}
+      : CudaBorrowedHostL2Input{fields.source.data(), fields.scalar_count,
+                                conserved_components};
+  return config;
+}
+
+CudaConfig LegacyBorrowedConfig(mfem::ParMesh& mesh, const int ranks,
+                                const int order, const int n)
+{
+  CudaConfig config = BorrowedConfig(mesh, ranks, order, n);
+  config.use_borrowed_host_inputs = false;
+  config.borrowed_initial = {nullptr, 0, conserved_components};
+  config.borrowed_source = {nullptr, 0, conserved_components};
+  return config;
+}
+
+bool SameValues(const std::vector<double>& left,
+                const std::vector<double>& right) noexcept
+{
+  return left == right;
+}
+
+bool FullyFiniteOverwritten(const std::vector<double>& values,
+                            const double sentinel) noexcept
+{
+  for (const double value : values)
+    if (!std::isfinite(value) || value == sentinel) return false;
+  return true;
 }
 
 bool SameCoordinates(const dg::hdg::generic::HdgEulerSessionCoordinates& left,
@@ -119,13 +228,15 @@ bool CheckTransaction(const int ranks)
       mesh, ranks, smoke_polynomial_order, smoke_elements_per_direction));
   const std::uint32_t expected_capabilities =
       HdgEulerSessionCapabilityBit(HdgEulerSessionCapability::prepared_commit) |
-      HdgEulerSessionCapabilityBit(HdgEulerSessionCapability::prepared_output);
+      HdgEulerSessionCapabilityBit(HdgEulerSessionCapability::prepared_output) |
+      HdgEulerSessionCapabilityBit(
+          HdgEulerSessionCapability::generic_borrowed_inputs);
   if (!All(initialized.status == HdgEulerSessionStatus::initialized &&
            session.capabilities() == expected_capabilities &&
            (session.capabilities() & HdgEulerSessionCapabilityBit(
                HdgEulerSessionCapability::committed_cfl_diagnostics)) == 0 &&
            (session.capabilities() & HdgEulerSessionCapabilityBit(
-               HdgEulerSessionCapability::generic_borrowed_inputs)) == 0))
+               HdgEulerSessionCapability::generic_borrowed_inputs)) != 0))
     return false;
 
   GenericEulerCudaPreparedStep prepared{};
@@ -219,9 +330,20 @@ bool CheckRankTwoCollectiveAdmission(const int ranks)
   GenericEulerCudaPreparedStep authority{};
   CudaSerializedCheckpointV1 native_export{};
   const auto staged = session.Prepare(authority, native_export);
+  const CudaSerializedCheckpointV1 before_tamper = native_export;
+  // This passes facade authority matching but makes one rank's checkpoint
+  // descriptor stale, exercising engine-side collective atomicity.
+  if (rank == 0) ++native_export.descriptor.coordinates.generation;
+  const bool tamper_rejected = !session.AcknowledgePreparedOutput(
+      authority, native_export);
+  native_export.descriptor.coordinates = before_tamper.descriptor.coordinates;
+  const bool tamper_atomic = tamper_rejected &&
+      SameNativeExport(native_export, before_tamper) &&
+      !native_export.output_staged && !native_export.successful_commit;
   const bool acknowledged = session.AcknowledgePreparedOutput(authority,
                                                                native_export);
-  if (staged.status != HdgEulerSessionStatus::prepared || !acknowledged)
+  if (staged.status != HdgEulerSessionStatus::prepared || !tamper_atomic ||
+      !acknowledged)
     return false;
   const auto mismatched = rank == 0
       ? session.Commit(std::move(authority), native_export)
@@ -367,8 +489,8 @@ bool CheckAddressReuseAba(const int ranks)
     return false;
   }
   GenericEulerCudaPreparedStep retired_authority{};
-  CudaSerializedCheckpointV1 retired_export{};
-  const auto retired_prepared = retired->Prepare(retired_authority, retired_export);
+  CudaSerializedCheckpointV1 shared_export{};
+  const auto retired_prepared = retired->Prepare(retired_authority, shared_export);
   if (!All(retired_prepared.status == HdgEulerSessionStatus::prepared))
   {
     retired->~GenericEulerHdgCudaSession();
@@ -380,13 +502,15 @@ bool CheckAddressReuseAba(const int ranks)
   const auto replacement_initialized = replacement->Initialize(BorrowedConfig(
       mesh, ranks, smoke_polynomial_order, smoke_elements_per_direction));
   GenericEulerCudaPreparedStep current_authority{};
-  CudaSerializedCheckpointV1 current_export{};
+  shared_export = {};
   const auto current_prepared = replacement->Prepare(current_authority,
-                                                      current_export);
+                                                      shared_export);
+  // Session and export addresses are both reused.  Rejection must therefore
+  // come from the retired facade incarnation carried by the authority.
   const bool stale_acknowledged = replacement->AcknowledgePreparedOutput(
-      retired_authority, retired_export);
+      retired_authority, shared_export);
   const auto current_aborted = replacement->Abort(std::move(current_authority),
-                                                   current_export);
+                                                   shared_export);
   const bool passed = All(replacement_initialized.status ==
                               HdgEulerSessionStatus::initialized &&
                           current_prepared.status == HdgEulerSessionStatus::prepared &&
@@ -406,6 +530,127 @@ bool CheckP2Admission(const int ranks)
       functional_elements_per_direction));
   return All(result.status == HdgEulerSessionStatus::initialized &&
              session.coordinates().step == 0 && session.coordinates().dt == 0.0);
+}
+
+bool CheckLegacyFacadeAdmission(const int ranks)
+{
+  mfem::Mesh serial = PeriodicSquareMesh(smoke_elements_per_direction);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
+  GenericEulerHdgCudaSession session;
+  const auto initialized = session.Initialize(LegacyBorrowedConfig(
+      mesh, ranks, smoke_polynomial_order, smoke_elements_per_direction));
+  GenericEulerCudaPreparedStep authority{};
+  CudaSerializedCheckpointV1 native_export{};
+  const auto prepared = initialized.status == HdgEulerSessionStatus::initialized
+      ? session.Prepare(authority, native_export)
+      : dg::hdg::generic::HdgEulerSessionResult{};
+  const auto aborted = prepared.status == HdgEulerSessionStatus::prepared
+      ? session.Abort(std::move(authority), native_export)
+      : dg::hdg::generic::HdgEulerSessionResult{};
+  return All(initialized.status == HdgEulerSessionStatus::initialized &&
+             prepared.status == HdgEulerSessionStatus::prepared &&
+             aborted.status == HdgEulerSessionStatus::aborted &&
+             session.coordinates().step == 0 &&
+             session.coordinates().generation == 0);
+}
+
+bool CheckBorrowedDataBridge(const int ranks, const int order, const int n)
+{
+  std::vector<double> candidate;
+  {
+    mfem::Mesh serial = PeriodicSquareMesh(n);
+    mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
+    HostFields zero = NonuniformHostFields(mesh, order, false);
+    const std::vector<double> initial_before = zero.initial;
+    GenericEulerHdgCudaSession session;
+    const auto initialized = session.Initialize(
+        BorrowedDataConfig(mesh, ranks, order, n, zero));
+    // Initialize has copied input/source bytes.  The caller may immediately
+    // overwrite and release both buffers without changing the engine state.
+    std::fill(zero.initial.begin(), zero.initial.end(), -3.0);
+    zero.initial.clear();
+    zero.initial.shrink_to_fit();
+    std::vector<double> committed(initial_before.size(), -7.0);
+    const bool committed_export = session.ExportCommittedInterior(
+        {committed.data(), zero.scalar_count, conserved_components});
+    std::vector<double> invalid_destination(initial_before.size(), -13.0);
+    const bool invalid_export = session.ExportCommittedInterior(
+        {invalid_destination.data(), zero.scalar_count - 1,
+         conserved_components});
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    std::vector<double> divergent_destination(initial_before.size(), -15.0);
+    const bool divergent_export = ranks != 2 ||
+        session.ExportCommittedInterior(
+            {divergent_destination.data(), rank == 0 ? zero.scalar_count :
+             zero.scalar_count - 1, conserved_components});
+    if (!All(initialized.status == HdgEulerSessionStatus::initialized &&
+             committed_export && SameValues(committed, initial_before) &&
+             !invalid_export &&
+             std::all_of(invalid_destination.begin(),
+                         invalid_destination.end(),
+                         [](const double value) { return value == -13.0; }) &&
+             (ranks != 2 || (!divergent_export && std::all_of(
+                 divergent_destination.begin(), divergent_destination.end(),
+                 [](const double value) { return value == -15.0; })))))
+      return false;
+
+    GenericEulerCudaPreparedStep authority{};
+    CudaSerializedCheckpointV1 native_export{};
+    const auto prepared = session.Prepare(authority, native_export);
+    candidate.assign(initial_before.size(), -9.0);
+    const bool prepared_export = session.ExportPreparedInterior(
+        authority, native_export,
+        {candidate.data(), zero.scalar_count, conserved_components});
+    const bool acknowledged = session.AcknowledgePreparedOutput(authority,
+                                                                 native_export);
+    const auto committed_step = session.Commit(std::move(authority),
+                                                native_export);
+    std::vector<double> committed_after(initial_before.size(), -17.0);
+    const bool committed_after_export = session.ExportCommittedInterior(
+        {committed_after.data(), zero.scalar_count, conserved_components});
+    if (!All(prepared.status == HdgEulerSessionStatus::prepared &&
+             prepared_export && FullyFiniteOverwritten(candidate, -9.0) &&
+             acknowledged &&
+             committed_step.status == HdgEulerSessionStatus::committed &&
+             committed_after_export && SameValues(committed_after, candidate)))
+      return false;
+  }
+
+  // The persistent CUDA runtime owns process-global allocation and transport
+  // ledgers.  Retain only exported bytes across the source comparison; do not
+  // overlap two live numerical engines.
+
+  // A static source has its own persistent source slice: with identical ICs,
+  // the prepared physical candidate must not collapse to the zero-source one.
+  mfem::Mesh source_serial = PeriodicSquareMesh(n);
+  mfem::ParMesh source_mesh(MPI_COMM_WORLD, source_serial);
+  HostFields forced = NonuniformHostFields(source_mesh, order, true);
+  GenericEulerHdgCudaSession forced_session;
+  const auto forced_initialized = forced_session.Initialize(
+      BorrowedDataConfig(source_mesh, ranks, order, n, forced));
+  std::fill(forced.initial.begin(), forced.initial.end(), -5.0);
+  std::fill(forced.source.begin(), forced.source.end(), -6.0);
+  forced.initial.clear();
+  forced.source.clear();
+  forced.initial.shrink_to_fit();
+  forced.source.shrink_to_fit();
+  GenericEulerCudaPreparedStep forced_authority{};
+  CudaSerializedCheckpointV1 forced_export{};
+  const auto forced_prepared = forced_session.Prepare(forced_authority,
+                                                       forced_export);
+  std::vector<double> forced_candidate(candidate.size(), -9.0);
+  const bool forced_output = forced_session.ExportPreparedInterior(
+      forced_authority, forced_export,
+      {forced_candidate.data(), forced.scalar_count, conserved_components});
+  const auto forced_aborted = forced_session.Abort(std::move(forced_authority),
+                                                    forced_export);
+  return All(forced_initialized.status == HdgEulerSessionStatus::initialized &&
+             forced_prepared.status == HdgEulerSessionStatus::prepared &&
+             forced_output && FullyFiniteOverwritten(forced_candidate, -9.0) &&
+             forced_aborted.status ==
+                 HdgEulerSessionStatus::aborted &&
+             !SameValues(candidate, forced_candidate));
 }
 
 bool Rejected(GenericEulerHdgCudaSession& session,
@@ -445,6 +690,37 @@ bool CheckNegatives(const int ranks)
       periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction);
   injection.injection.enabled = true;
 
+  HostFields fields = NonuniformHostFields(periodic, smoke_polynomial_order,
+                                           true);
+  const std::vector<double> fields_initial_before = fields.initial;
+  const std::vector<double> fields_source_before = fields.source;
+  CudaConfig null_initial = BorrowedDataConfig(
+      periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction,
+      fields);
+  null_initial.borrowed_initial.coefficients = nullptr;
+  CudaConfig wrong_initial_count = BorrowedDataConfig(
+      periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction,
+      fields);
+  --wrong_initial_count.borrowed_initial.scalar_count;
+  CudaConfig wrong_initial_components = BorrowedDataConfig(
+      periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction,
+      fields);
+  wrong_initial_components.borrowed_initial.components = 3;
+  CudaConfig null_source = BorrowedDataConfig(
+      periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction,
+      fields);
+  null_source.borrowed_source.coefficients = nullptr;
+  HostFields initial_nan = fields;
+  initial_nan.initial[0] = std::numeric_limits<double>::quiet_NaN();
+  CudaConfig nonfinite_initial = BorrowedDataConfig(
+      periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction,
+      initial_nan);
+  HostFields source_infinite = fields;
+  source_infinite.source[0] = std::numeric_limits<double>::infinity();
+  CudaConfig nonfinite_source = BorrowedDataConfig(
+      periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction,
+      source_infinite);
+
   GenericEulerHdgCudaSession one, two, three, four, five, six, seven, eight;
   const bool nonperiodic_rejected = Rejected(one, nonperiodic);
   const bool wrong_shape_rejected = Rejected(two, wrong_shape);
@@ -454,9 +730,22 @@ bool CheckNegatives(const int ranks)
   const bool wrong_dt_rejected = Rejected(six, wrong_dt);
   const bool capture_oracle_rejected = Rejected(seven, capture_oracle);
   const bool injection_rejected = Rejected(eight, injection);
+  GenericEulerHdgCudaSession nine, ten, eleven, twelve, thirteen, fourteen;
+  const bool null_initial_rejected = Rejected(nine, null_initial);
+  const bool wrong_initial_count_rejected = Rejected(ten, wrong_initial_count);
+  const bool wrong_initial_components_rejected = Rejected(
+      eleven, wrong_initial_components);
+  const bool null_source_rejected = Rejected(twelve, null_source);
+  const bool nonfinite_initial_rejected = Rejected(thirteen, nonfinite_initial);
+  const bool nonfinite_source_rejected = Rejected(fourteen, nonfinite_source);
   bool rejected = nonperiodic_rejected && wrong_shape_rejected && p3_rejected &&
       wrong_device_rejected && wrong_ranks_rejected && wrong_dt_rejected &&
-      capture_oracle_rejected && injection_rejected;
+      capture_oracle_rejected && injection_rejected && null_initial_rejected &&
+      wrong_initial_count_rejected && wrong_initial_components_rejected &&
+      null_source_rejected && nonfinite_initial_rejected &&
+      nonfinite_source_rejected &&
+      SameValues(fields.initial, fields_initial_before) &&
+      SameValues(fields.source, fields_source_before);
 
   if (ranks == 2)
   {
@@ -466,16 +755,16 @@ bool CheckNegatives(const int ranks)
     CudaConfig empty = BorrowedConfig(
         empty_local, ranks, smoke_polynomial_order,
         smoke_elements_per_direction);
-    GenericEulerHdgCudaSession nine;
-    const bool empty_rejected = Rejected(nine, empty);
+    GenericEulerHdgCudaSession fifteen;
+    const bool empty_rejected = Rejected(fifteen, empty);
 
     CudaConfig divergent = BorrowedConfig(
         periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction);
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     if (rank == 0) divergent.dt = 0.01;
-    GenericEulerHdgCudaSession ten;
-    const bool divergent_rejected = Rejected(ten, divergent);
+    GenericEulerHdgCudaSession sixteen;
+    const bool divergent_rejected = Rejected(sixteen, divergent);
     rejected = rejected && empty_rejected && divergent_rejected;
   }
   return All(rejected);
@@ -504,7 +793,8 @@ int main(int argc, char** argv)
     (void)device;
     if (mode == "--p2")
     {
-      pass = CheckP2Admission(ranks);
+      pass = CheckP2Admission(ranks) && CheckBorrowedDataBridge(
+          ranks, functional_polynomial_order, functional_elements_per_direction);
     }
     else
     {
@@ -513,8 +803,11 @@ int main(int argc, char** argv)
       const bool address_reuse = CheckAddressReuseAba(ranks);
       const bool session_identity = CheckRankTwoSessionIdentityAdmission(ranks);
       const bool rank_two = CheckRankTwoCollectiveAdmission(ranks);
+      const bool legacy_facade = CheckLegacyFacadeAdmission(ranks);
+      const bool host_data = CheckBorrowedDataBridge(
+          ranks, smoke_polynomial_order, smoke_elements_per_direction);
       pass = transaction && foreign_authority && address_reuse &&
-          session_identity && rank_two;
+          session_identity && rank_two && legacy_facade && host_data;
     }
   }
   if (!pass && ranks > 0)

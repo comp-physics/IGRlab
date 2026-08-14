@@ -518,6 +518,7 @@ public:
         MPI_COMM_WORLD) == MPI_SUCCESS && global_config == 1;
     if (!descriptor_consensus || !validity_consensus)
     {
+      ForgetBorrowedHostInputPointers();
       evidence.status = CudaRunStatus::setup_failure;
       evidence.setup_origin = descriptor_consensus
           ? FailureReason::backend_failure
@@ -528,7 +529,12 @@ public:
       return false;
     }
     AllocatorPolicy::ResetLedger();
-    if (!numerics_.Initialize(config_, evidence, Selection::Descriptor()))
+    const bool numerics_initialized = numerics_.Initialize(
+        config_, evidence, Selection::Descriptor());
+    // The numerical setup has copied every admitted host coefficient into
+    // engine-owned arrays.  Retain only the borrowed topology thereafter.
+    ForgetBorrowedHostInputPointers();
+    if (!numerics_initialized)
     {
       evidence.status = CudaRunStatus::setup_failure;
       evidence.setup_origin = FailureReason::backend_failure;
@@ -646,12 +652,21 @@ public:
   /** A caller invokes this only after its output artifact is staged. */
   bool MarkOutputStaged(CudaSerializedCheckpointV1& checkpoint) noexcept
   {
-    if (!pending_.active || !pending_.staging ||
-        !pending_.prestage_allowed || !pending_.checkpoint_staged ||
-        checkpoint.facade_incarnation != facade_incarnation_ ||
-        checkpoint.attempt.sequence != pending_.attempt.sequence ||
-        !dg::hdg::runtime::detail::SameCheckpoint(
-            checkpoint.descriptor, pending_.staging->future_checkpoint()))
+    const bool local_valid = pending_.active && pending_.staging &&
+        pending_.prestage_allowed && pending_.checkpoint_staged &&
+        checkpoint.candidate_frozen && checkpoint.checkpoint_staged &&
+        !checkpoint.output_staged && !checkpoint.successful_commit &&
+        checkpoint.facade_incarnation == facade_incarnation_ &&
+        checkpoint.attempt.sequence == pending_.attempt.sequence &&
+        checkpoint.attempt.committed_step == pending_.attempt.committed_step &&
+        checkpoint.attempt.committed_generation ==
+            pending_.attempt.committed_generation &&
+        checkpoint.attempt.retry_index == pending_.attempt.retry_index &&
+        std::memcmp(&checkpoint.attempt.dt, &pending_.attempt.dt,
+                    sizeof(double)) == 0 &&
+        dg::hdg::runtime::detail::SameCheckpoint(
+            checkpoint.descriptor, pending_.staging->future_checkpoint());
+    if (!numerics_.CollectiveContinue(local_valid))
       return false;
     checkpoint.output_staged = true;
     pending_.output_staged = true;
@@ -747,6 +762,8 @@ public:
     const AttemptOutcome outcome =
         contract_->FinalizeCommit(std::move(*pending_.provisional));
     pending_.provisional.reset();
+    if (outcome.committed)
+      numerics_.SwapPublishedSlotHandles();
     checkpoint.successful_commit = outcome.committed;
     FinishOutcome(outcome, pending_.evidence);
     if (pending_.has_oracle)
@@ -877,6 +894,7 @@ public:
     }
     else
     {
+      numerics_.SwapPublishedSlotHandles();
       next_attempt_sequence_ = restored_frontier;
     }
     evidence.after = contract_->coordinates();
@@ -898,6 +916,24 @@ public:
     if (!last_oracle_valid_) { return false; }
     pod = last_oracle_;
     return true;
+  }
+
+  /** Explicitly map the currently committed interior into caller L2 storage. */
+  bool ExportCommittedInterior(CudaMutableHostL2Output destination) noexcept
+  {
+    if (!initialized_ || pending_.active) { return false; }
+    return numerics_.ExportInterior(numerics_.CommittedSlot().interior,
+                                    destination);
+  }
+
+  /** Export only the currently staged candidate; no logical publication occurs. */
+  bool ExportPreparedInterior(CudaMutableHostL2Output destination) noexcept
+  {
+    if (!initialized_ || !pending_.active || !pending_.staging ||
+        !pending_.prestage_allowed || !pending_.checkpoint_staged)
+      return false;
+    return numerics_.ExportInterior(numerics_.WorkspaceSlot().interior,
+                                    destination);
   }
 
   CudaReuseEvidence ReuseEvidence() const noexcept
@@ -922,6 +958,12 @@ public:
   }
 
 private:
+  void ForgetBorrowedHostInputPointers() noexcept
+  {
+    config_.borrowed_initial.coefficients = nullptr;
+    config_.borrowed_source.coefficients = nullptr;
+  }
+
   static void AbortStagedArtifacts(
       CudaSerializedCheckpointV1& checkpoint) noexcept
   {
@@ -1076,9 +1118,26 @@ private:
             config_.borrowed_communicator != MPI_COMM_NULL
         : config_.borrowed_mesh == nullptr &&
             config_.borrowed_communicator == MPI_COMM_NULL;
+    const auto empty_l2 = [](const CudaBorrowedHostL2Input& field)
+    {
+      return field.coefficients == nullptr && field.scalar_count == 0 &&
+          field.components == conserved_components;
+    };
+    const bool generic_l2_configuration = config_.use_borrowed_host_inputs
+        ? config_.borrowed_initial.coefficients != nullptr &&
+            config_.borrowed_initial.scalar_count != 0 &&
+            config_.borrowed_initial.components == conserved_components &&
+            ((config_.borrowed_source.coefficients == nullptr &&
+              config_.borrowed_source.scalar_count == 0 &&
+              config_.borrowed_source.components == conserved_components) ||
+             (config_.borrowed_source.coefficients != nullptr &&
+              config_.borrowed_source.scalar_count != 0 &&
+              config_.borrowed_source.components == conserved_components))
+        : empty_l2(config_.borrowed_initial) && empty_l2(config_.borrowed_source);
     return config_.experiment == StableIdentity::Copy(experiment_id) &&
         (smoke_shape || functional_shape) &&
         topology_configuration &&
+        generic_l2_configuration &&
         std::isfinite(config_.dt) &&
         std::memcmp(&config_.dt, &fixed_dt, sizeof(double)) == 0 &&
         config_.requested_device == 0 &&
@@ -1150,6 +1209,18 @@ private:
     // Pointer and communicator identities are rank-local borrowed handles;
     // their compatibility is proved by the pre-device topology admission.
     append_bool(config_.use_borrowed_topology);
+    // Keep all legacy false-mode descriptor bytes exactly as they were.  L2
+    // scalar counts are partition-local, so true mode records only common ABI
+    // facts and lets the collective topology/input admission check local size.
+    if (config_.use_borrowed_host_inputs)
+    {
+      append_bool(true);
+      AppendConfigValue(descriptor, cursor, complete,
+                        config_.borrowed_initial.components);
+      AppendConfigValue(descriptor, cursor, complete,
+                        config_.borrowed_source.components);
+      append_bool(config_.borrowed_source.coefficients != nullptr);
+    }
     append_bool(config_.capture_oracle);
     AppendConfigValue(descriptor, cursor, complete, config_.injection.phase);
     AppendConfigValue(descriptor, cursor, complete,

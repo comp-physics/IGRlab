@@ -1255,8 +1255,13 @@ __global__ void AssemblyKernel(CudaDeviceView v, CudaMeshShape s,
       state[k]+=phi*v.work_interior[e_i+ByNodes(a,si,k)];
       old[k]+=phi*v.old_interior[e_i+ByNodes(a,si,k)];
     }
-    double source[4], fx[4], fy[4], jx[16], jy[16];
-    if (!(w>0) || !Source(v.volume_position[qp*2],v.volume_position[qp*2+1],source) ||
+    double source[4]={}, fx[4], fy[4], jx[16], jy[16];
+    if (s.borrowed_static_source)
+      for(int a=0;a<si;++a) for(int k=0;k<4;++k)
+        source[k] += v.volume_shape[qp*si+a] *
+            v.static_source[e_i+ByNodes(a,si,k)];
+    if (!(w>0) || (!s.borrowed_static_source &&
+                    !Source(v.volume_position[qp*2],v.volume_position[qp*2+1],source)) ||
         !FluxJacobian(state,1,0,fx,jx) || !FluxJacobian(state,0,1,fy,jy))
     { v.status[e]=-1; return; }
     for(int row=0;row<si;++row)
