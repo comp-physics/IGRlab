@@ -13,9 +13,9 @@ set(_arguments
   --order 1
   --serial-refine 0
   --parallel-refine 0
-  --time-step 0.00001
-  --t-final 0.00002
-  --time-step-save 0.00001
+  --time-step 0.00006
+  --t-final 0.00013
+  --time-step-save 0.00005
   --vtk_save
   --no-glvis)
 
@@ -42,7 +42,7 @@ else()
 endif()
 
 if(NOT _status EQUAL 0 OR
-   NOT _stdout MATCHES "\\[hdg-main\\] status=Success.*step=2" OR
+   NOT _stdout MATCHES "\\[hdg-main\\] status=Success.*step=3" OR
    NOT _stderr STREQUAL "")
   message(FATAL_ERROR
     "generic HDG main execution failed: ${_status}\n${_stdout}\n${_stderr}")
@@ -55,8 +55,13 @@ if(NOT EXISTS "${_pvd}")
   message(FATAL_ERROR "missing HDG PVD series: ${_pvd}")
 endif()
 file(READ "${_pvd}" _pvd_text)
-foreach(_cycle IN ITEMS 000000 000001 000002)
-  if(NOT _pvd_text MATCHES "Cycle${_cycle}/data.pvtu" OR
+set(_expected_cycles 000000 000001 000002 000003)
+set(_expected_times 0 5e-05 0.0001 0.00013)
+foreach(_index RANGE 0 3)
+  list(GET _expected_cycles ${_index} _cycle)
+  list(GET _expected_times ${_index} _time)
+  if(NOT _pvd_text MATCHES
+       "timestep=\\\"${_time}\\\"[^<]*Cycle${_cycle}/data.pvtu" OR
      NOT EXISTS "${_root}/Cycle${_cycle}/data.pvtu" OR
      NOT EXISTS "${_root}/Cycle${_cycle}/proc000000.vtu")
     message(FATAL_ERROR "missing complete HDG ParaView cycle ${_cycle}")
@@ -67,9 +72,17 @@ foreach(_cycle IN ITEMS 000000 000001 000002)
   endif()
 endforeach()
 
+string(REGEX MATCHALL "Cycle[0-9][0-9][0-9][0-9][0-9][0-9]/data.pvtu"
+  _pvd_entries "${_pvd_text}")
+list(LENGTH _pvd_entries _pvd_entry_count)
+if(NOT _pvd_entry_count EQUAL 4)
+  message(FATAL_ERROR
+    "HDG PVD has ${_pvd_entry_count} publications; expected exactly 4")
+endif()
+
 file(GLOB _cycles LIST_DIRECTORIES TRUE "${_root}/Cycle*")
 list(LENGTH _cycles _cycle_count)
-if(NOT _cycle_count EQUAL 3)
+if(NOT _cycle_count EQUAL 4)
   message(FATAL_ERROR
-    "HDG output has ${_cycle_count} cycle directories; expected exactly 3")
+    "HDG output has ${_cycle_count} cycle directories; expected exactly 4")
 endif()
