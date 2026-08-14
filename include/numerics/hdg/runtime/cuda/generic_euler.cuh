@@ -562,7 +562,9 @@ private:
          (config.order == cuda_w8a::functional_polynomial_order &&
           config.mesh_n == cuda_w8a::functional_elements_per_direction));
     long long local_elements = 0;
+    long long local_face_measure = 0;
     long long global_elements = 0;
+    long long global_face_measure = 0;
     if (local)
     {
       const MPI_Comm mesh_communicator = config.borrowed_mesh->GetComm();
@@ -575,7 +577,6 @@ private:
           !config.borrowed_mesh->Nonconforming() &&
           config.borrowed_mesh->Dimension() == cuda_w8a::dimension &&
           config.borrowed_mesh->SpaceDimension() == cuda_w8a::dimension &&
-          config.borrowed_mesh->GetNBE() == 0 &&
           config.borrowed_mesh->GetNE() > 0 &&
           config.borrowed_mesh->GetNE() <= cuda_w8a::maximum_rank_elements;
       local_elements = config.borrowed_mesh->GetNE();
@@ -583,6 +584,18 @@ private:
            ++element)
         local = config.borrowed_mesh->GetElementBaseGeometry(element) ==
             mfem::Geometry::SQUARE;
+      if (local)
+      {
+        const long long local_faces =
+            static_cast<long long>(config.borrowed_mesh->GetNumFaces());
+        const long long local_shared_faces =
+            static_cast<long long>(config.borrowed_mesh->GetNSharedFaces());
+        local = local_faces >= 0 && local_shared_faces >= 0 &&
+            local_shared_faces <= local_faces &&
+            local_faces <= std::numeric_limits<long long>::max() / 2;
+        if (local)
+          local_face_measure = 2 * local_faces - local_shared_faces;
+      }
     }
     const int local_bit = local ? 1 : 0;
     int all_local = 0;
@@ -592,10 +605,19 @@ private:
     const bool element_census = MPI_Allreduce(
         &local_elements, &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM,
         MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool face_census = MPI_Allreduce(
+        &local_face_measure, &global_face_measure, 1, MPI_LONG_LONG_INT,
+        MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
     const long long expected_elements =
         static_cast<long long>(config.mesh_n) * config.mesh_n;
-    return config_consensus && local_census && element_census &&
-        all_local == 1 && global_elements == expected_elements;
+    const bool expected_measure_safe = expected_elements >= 0 &&
+        expected_elements <= std::numeric_limits<long long>::max() / 4;
+    const long long expected_face_measure = expected_measure_safe
+        ? 4 * expected_elements : 0;
+    return config_consensus && local_census && element_census && face_census &&
+        expected_measure_safe && all_local == 1 &&
+        global_elements == expected_elements &&
+        global_face_measure == expected_face_measure;
   }
 
   template <typename Callback>
