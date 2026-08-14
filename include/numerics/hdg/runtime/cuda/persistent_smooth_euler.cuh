@@ -762,6 +762,8 @@ public:
     const AttemptOutcome outcome =
         contract_->FinalizeCommit(std::move(*pending_.provisional));
     pending_.provisional.reset();
+    if (outcome.committed)
+      numerics_.SwapPublishedSlotHandles();
     checkpoint.successful_commit = outcome.committed;
     FinishOutcome(outcome, pending_.evidence);
     if (pending_.has_oracle)
@@ -892,6 +894,7 @@ public:
     }
     else
     {
+      numerics_.SwapPublishedSlotHandles();
       next_attempt_sequence_ = restored_frontier;
     }
     evidence.after = contract_->coordinates();

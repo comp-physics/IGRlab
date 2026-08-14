@@ -911,6 +911,13 @@ public:
 
   state_slot CommittedSlot() const noexcept { return committed_slot_; }
   state_slot CandidateSlot() const noexcept { return candidate_slot_; }
+  /** Mirror a final contract slot publication without moving any payload. */
+  void SwapPublishedSlotHandles() noexcept
+  {
+    const state_slot prior_committed = committed_slot_;
+    committed_slot_ = candidate_slot_;
+    candidate_slot_ = prior_committed;
+  }
   state_slot& WorkspaceSlot() noexcept { return workspace_slot_; }
   const PersistentResourceDescriptor& Resources() const noexcept
   {
