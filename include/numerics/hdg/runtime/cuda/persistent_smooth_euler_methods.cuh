@@ -330,10 +330,15 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
   if (!CollectiveContinue(scatter_ready)) { return false; }
 
   std::optional<mfem::ParGridFunction> local_trace;
+  std::array<unsigned char, maximum_local_trace_dofs> local_trace_assigned{};
   bool restriction_ready = false;
   try
   {
     local_trace.emplace(trace_space_.operator->());
+    if (local_trace->Size() < 0 ||
+        local_trace->Size() != shape_.local_trace_count ||
+        local_trace->Size() > maximum_local_trace_dofs)
+      throw 0;
     *local_trace = 0.0;
     for (int face = 0; face < mesh_->GetNumFaces(); ++face)
     {
@@ -383,32 +388,50 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
               scalar + trace_element->GetDof() * component], sign);
           if (dof < 0 || dof >= local_trace->Size()) { throw 0; }
           (*local_trace)[dof] = sign * restricted;
+          local_trace_assigned[static_cast<std::size_t>(dof)] = 1;
         }
       }
     }
-    restriction_ready = true;
+    restriction_ready = std::find(local_trace_assigned.begin(),
+        local_trace_assigned.begin() + local_trace->Size(), 0) ==
+            local_trace_assigned.begin() + local_trace->Size();
   }
   catch (...) { restriction_ready = false; }
-  // No rank enters ParallelProject until every rank has completed the local
+  // No rank seeds true trace data until every rank has completed the local
   // restriction and map validation.
   if (!CollectiveContinue(restriction_ready)) { return false; }
 
-  bool projected = false;
+  bool trace_seeded = false;
   try
   {
-    mfem::Vector owned_true(shape_.true_trace_count);
-    local_trace->ParallelProject(owned_true);
-    for (int local = 0; local < shape_.true_trace_count; ++local)
+    if (!exchange_plan_.map.dofs.IsConsistent() ||
+        shape_.true_trace_count < 0 ||
+        shape_.true_trace_count > maximum_true_trace_dofs)
+      throw 0;
+    std::array<unsigned char, maximum_true_trace_dofs> true_assigned{};
+    for (const dg::hdg::trace::TraceMapEntry& entry :
+         exchange_plan_.map.dofs.entries)
     {
-      const double value = owned_true[local];
+      if (entry.ownership != dg::hdg::Ownership::owned) continue;
+      if (entry.local_dof < 0 || entry.local_dof >= local_trace->Size() ||
+          entry.local_true_dof < 0 ||
+          entry.local_true_dof >= shape_.true_trace_count ||
+          true_assigned[static_cast<std::size_t>(entry.local_true_dof)] != 0)
+        throw 0;
+      const double value = (*local_trace)[entry.local_dof];
       if (!std::isfinite(value)) { throw 0; }
-      host_exact_true_trace_[static_cast<std::size_t>(local)] = value;
-      host_perturbed_true_trace_[static_cast<std::size_t>(local)] = value;
+      const std::size_t local_true =
+          static_cast<std::size_t>(entry.local_true_dof);
+      host_exact_true_trace_[local_true] = value;
+      host_perturbed_true_trace_[local_true] = value;
+      true_assigned[local_true] = 1;
     }
-    projected = true;
+    trace_seeded = std::find(true_assigned.begin(),
+        true_assigned.begin() + shape_.true_trace_count, 0) ==
+            true_assigned.begin() + shape_.true_trace_count;
   }
-  catch (...) { projected = false; }
-  return CollectiveContinue(projected);
+  catch (...) { trace_seeded = false; }
+  return CollectiveContinue(trace_seeded);
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
