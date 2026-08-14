@@ -262,7 +262,9 @@ function(dg_igr_add_hdg_cuda17_component)
             "dg_igr_add_hdg_cuda17_component requires TARGET and accepts only SOURCES/PUBLIC_LINK_LIBRARIES/PRIVATE_LINK_LIBRARIES.")
   endif()
 
-  set(_dg_igr_hdg_cuda_targets dg_igr_hdg_runtime_cuda)
+  set(_dg_igr_hdg_cuda_targets
+      dg_igr_hdg_runtime_cuda
+      dg_igr_hdg_main_backend_cuda)
   _dg_igr_hdg_require_canonical_target("${HDG_TARGET}"
                                        "${_dg_igr_hdg_cuda_targets}")
   dg_igr_require_hdg_cuda17_profile()

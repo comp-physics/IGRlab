@@ -191,6 +191,17 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
       PRIVATE_LINK_LIBRARIES dg_igr_hdg_runtime_cpu)
     target_link_libraries(dg_igr_hdg_runtime_components INTERFACE
                           dg_igr_hdg_runtime_cuda)
+
+    # This application-facing CUDA adapter deliberately lives outside the
+    # frozen runtime CUDA inventory above.  It is a separate profile-only
+    # component over the existing generic session, not another W8A kernel or
+    # allocator implementation.
+    dg_igr_add_hdg_cuda17_component(
+      TARGET dg_igr_hdg_main_backend_cuda
+      SOURCES "${PROJECT_SOURCE_DIR}/src/sim/hdg/main_backend_cuda.cu"
+      PRIVATE_LINK_LIBRARIES
+        dg_igr_hdg_runtime_cuda
+        dg_igr_hdg_runtime_cpu)
   elseif(_dg_igr_hdg_runtime_cuda_sources)
     message(STATUS
             "HDG CUDA sources are reserved but not built by the requested CPU profile.")

@@ -1,9 +1,12 @@
-if(NOT TARGET dg_igr_hdg_main_backend_cpu OR
-   NOT TARGET dgsem_smooth_advection_periodic)
+if(NOT TARGET dgsem_smooth_advection_periodic)
   message(FATAL_ERROR
-    "The generic CPU HDG main backend and opted-in example are required.")
+    "The opted-in generic HDG main-backend example is required.")
 endif()
 
+if(NOT MFEM_USE_CUDA)
+if(NOT TARGET dg_igr_hdg_main_backend_cpu)
+  message(FATAL_ERROR "The generic CPU HDG main backend is required.")
+endif()
 foreach(_ranks IN ITEMS 1 2)
   add_test(NAME dg_igr_hdg_main_backend_smooth_advection_cpu_rank${_ranks}
     COMMAND "${CMAKE_COMMAND}"
@@ -33,3 +36,68 @@ set_tests_properties(
     LABELS "hdg;main-backend;cpu;compatibility;dgsem;process"
     RESOURCE_LOCK hdg_generic_euler_cpu
     TIMEOUT 300)
+endif()
+
+if(MFEM_USE_CUDA)
+  if(NOT TARGET dg_igr_hdg_main_backend_cuda OR
+     NOT TARGET dgsem_smooth_advection_periodic)
+    message(FATAL_ERROR
+      "The CUDA generic HDG main backend and opted-in example are required.")
+  endif()
+
+  foreach(_ranks IN ITEMS 1 2)
+    add_test(NAME dg_igr_hdg_main_backend_cuda_rank${_ranks}_n3
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-rank${_ranks}-n3-output"
+        "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+        "-DHDG_MAIN_RANKS=${_ranks}"
+        "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+    set_tests_properties(dg_igr_hdg_main_backend_cuda_rank${_ranks}_n3 PROPERTIES
+      LABELS "hdg;main-backend;cuda;mpi;process;generic-borrowed"
+      PROCESSORS ${_ranks}
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1200)
+  endforeach()
+
+  add_test(NAME dg_igr_hdg_main_backend_cuda_rank1_n3_no_vtk
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-rank1-n3-no-vtk-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_RANKS=1"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      "-DHDG_MAIN_NO_VTK=ON"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set_tests_properties(dg_igr_hdg_main_backend_cuda_rank1_n3_no_vtk PROPERTIES
+    LABELS "hdg;main-backend;cuda;rank1;process;generic-borrowed;no-vtk"
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 1200)
+
+  add_test(NAME dg_igr_hdg_main_backend_cuda_rejects_cpu_profile
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_reject_process.cmake")
+  set_tests_properties(dg_igr_hdg_main_backend_cuda_rejects_cpu_profile PROPERTIES
+    LABELS "hdg;main-backend;cuda;negative;profile"
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 300)
+
+  add_test(NAME dg_igr_hdg_main_backend_preserves_dgsem_cuda_profile
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_WORK=${CMAKE_CURRENT_BINARY_DIR}/dgsem-cuda-compat"
+      "-DHDG_MAIN_DEVICE=cuda"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_dgsem_compat_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_preserves_dgsem_cuda_profile PROPERTIES
+      LABELS "hdg;main-backend;cuda;compatibility;dgsem;process"
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 300)
+endif()
