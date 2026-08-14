@@ -257,6 +257,51 @@ bool CheckRankTwoCollectiveAdmission(const int ranks)
              session.coordinates().generation == 1);
 }
 
+bool CheckRankTwoSessionIdentityAdmission(const int ranks)
+{
+  if (ranks != 2) return true;
+  mfem::Mesh serial = PeriodicSquareMesh(smoke_elements_per_direction);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+  // This is collective-identity discrimination only.  The global CUDA
+  // allocation baseline permits the last initialized engine (B) to advance;
+  // A remains intentionally untouched after B establishes its baseline.
+  GenericEulerHdgCudaSession a;
+  GenericEulerHdgCudaSession b;
+  const auto a_initialized = a.Initialize(BorrowedConfig(
+      mesh, ranks, smoke_polynomial_order, smoke_elements_per_direction));
+  const auto b_initialized = b.Initialize(BorrowedConfig(
+      mesh, ranks, smoke_polynomial_order, smoke_elements_per_direction));
+
+  GenericEulerCudaPreparedStep a_authority{};
+  GenericEulerCudaPreparedStep b_authority{};
+  CudaSerializedCheckpointV1 a_export{};
+  CudaSerializedCheckpointV1 b_export{};
+  const auto crossed_prepare = rank == 0
+      ? a.Prepare(a_authority, a_export)
+      : b.Prepare(b_authority, b_export);
+  const bool a_untouched = a.coordinates().step == 0 &&
+      a.coordinates().generation == 0 && !a_export.candidate_frozen &&
+      !a_export.checkpoint_staged && !a_export.output_staged &&
+      !a_export.successful_commit;
+  const bool b_untouched = b.coordinates().step == 0 &&
+      b.coordinates().generation == 0 && !b_export.candidate_frozen &&
+      !b_export.checkpoint_staged && !b_export.output_staged &&
+      !b_export.successful_commit;
+
+  const auto b_prepared = b.Prepare(b_authority, b_export);
+  const auto b_aborted = b.Abort(std::move(b_authority), b_export);
+  return All(a_initialized.status == HdgEulerSessionStatus::initialized &&
+             b_initialized.status == HdgEulerSessionStatus::initialized &&
+             crossed_prepare.status == HdgEulerSessionStatus::rejected &&
+             a_untouched && b_untouched &&
+             b_prepared.status == HdgEulerSessionStatus::prepared &&
+             b_aborted.status == HdgEulerSessionStatus::aborted &&
+             b.coordinates().step == 0 && b.coordinates().generation == 0);
+}
+
 bool CheckForeignDestinationAuthority(const int ranks)
 {
   mfem::Mesh serial = PeriodicSquareMesh(smoke_elements_per_direction);
@@ -466,8 +511,10 @@ int main(int argc, char** argv)
       const bool transaction = CheckTransaction(ranks);
       const bool foreign_authority = CheckForeignDestinationAuthority(ranks);
       const bool address_reuse = CheckAddressReuseAba(ranks);
+      const bool session_identity = CheckRankTwoSessionIdentityAdmission(ranks);
       const bool rank_two = CheckRankTwoCollectiveAdmission(ranks);
-      pass = transaction && foreign_authority && address_reuse && rank_two;
+      pass = transaction && foreign_authority && address_reuse &&
+          session_identity && rank_two;
     }
   }
   if (!pass && ranks > 0)

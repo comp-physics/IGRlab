@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <type_traits>
 
@@ -122,7 +123,8 @@ public:
     // This is deliberately the first collective for initialization: ranks
     // that call another facade operation must converge on the operation-tag
     // rejection before any config or topology collective is entered.
-    const bool one_shot = !initialization_attempted_;
+    const bool one_shot = !initialization_attempted_ &&
+        session_collective_id_ == unassigned_session_collective_id;
     initialization_attempted_ = true;
     if (!AdmitOperation(operation_tag::initialize, one_shot))
     {
@@ -133,6 +135,14 @@ public:
     const bool admitted = PreDeviceAdmission(config);
     if (!CollectiveAll(admitted))
     {
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    // The per-process ordinal is useful only after min/max proves every rank
+    // selected the same next value.  It is a wrapper-owned admission key, not
+    // caller export or token data, and must exist before any engine collective.
+    if (!AssignSessionCollectiveId())
+    {
+      failed_ = true;
       return Result(generic::HdgEulerSessionStatus::rejected);
     }
     bool allocated = false;
@@ -344,6 +354,8 @@ private:
   result_type Result(const generic::HdgEulerSessionStatus status) const noexcept
   { return {status, coordinates_}; }
 
+  static constexpr std::uint64_t unassigned_session_collective_id = 0;
+
   bool ReadyForPrepare() const noexcept
   {
     return initialized_ && !failed_ && !prepared_active_ &&
@@ -363,6 +375,30 @@ private:
         native_export.facade_incarnation == active_facade_incarnation_;
   }
 
+  bool AssignSessionCollectiveId() noexcept
+  {
+    const bool local_available = session_collective_id_ ==
+            unassigned_session_collective_id &&
+        next_session_collective_id_ != std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t local_candidate = local_available
+        ? next_session_collective_id_ + 1 : unassigned_session_collective_id;
+    std::uint64_t minimum = local_candidate;
+    std::uint64_t maximum = local_candidate;
+    const bool minimum_ready = MPI_Allreduce(
+        &local_candidate, &minimum, 1, MPI_UINT64_T, MPI_MIN,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        &local_candidate, &maximum, 1, MPI_UINT64_T, MPI_MAX,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    if (!minimum_ready || !maximum_ready || local_candidate ==
+            unassigned_session_collective_id ||
+        minimum != maximum || minimum != local_candidate)
+      return false;
+    next_session_collective_id_ = local_candidate;
+    session_collective_id_ = local_candidate;
+    return true;
+  }
+
   bool AdmitOperation(const operation_tag tag, const bool local_valid) const
       noexcept
   {
@@ -371,16 +407,29 @@ private:
     if (MPI_Initialized(&mpi_initialized) != MPI_SUCCESS || !mpi_initialized ||
         MPI_Finalized(&mpi_finalized) != MPI_SUCCESS || mpi_finalized)
       return false;
-    const int local[2] = {static_cast<int>(tag), local_valid ? 1 : 0};
-    int minimum[2] = {local[0], local[1]};
-    int maximum[2] = {local[0], local[1]};
+    const std::uint64_t local[3] = {
+        session_collective_id_, static_cast<std::uint64_t>(tag),
+        local_valid ? 1U : 0U};
+    std::uint64_t minimum[3] = {local[0], local[1], local[2]};
+    std::uint64_t maximum[3] = {local[0], local[1], local[2]};
     const bool minimum_ready = MPI_Allreduce(
-        local, minimum, 2, MPI_INT, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+        local, minimum, 3, MPI_UINT64_T, MPI_MIN,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
     const bool maximum_ready = MPI_Allreduce(
-        local, maximum, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+        local, maximum, 3, MPI_UINT64_T, MPI_MAX,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool unassigned_initialize =
+        tag == operation_tag::initialize &&
+        minimum[0] == unassigned_session_collective_id &&
+        maximum[0] == unassigned_session_collective_id;
+    const bool assigned_operation = tag != operation_tag::initialize &&
+        minimum[0] == maximum[0] &&
+        minimum[0] != unassigned_session_collective_id;
     return minimum_ready && maximum_ready &&
-        minimum[0] == maximum[0] && minimum[0] == static_cast<int>(tag) &&
-        minimum[1] == maximum[1] && minimum[1] == 1;
+        (unassigned_initialize || assigned_operation) &&
+        minimum[1] == maximum[1] &&
+        minimum[1] == static_cast<std::uint64_t>(tag) &&
+        minimum[2] == maximum[2] && minimum[2] == 1;
   }
 
   static bool CollectiveAll(const bool local) noexcept
@@ -575,8 +624,11 @@ private:
   bool output_acknowledged_ = false;
   bool failed_ = false;
   bool retry_ready_ = false;
+  std::uint64_t session_collective_id_ = unassigned_session_collective_id;
   native_export_type* active_native_export_ = nullptr;
   std::uint64_t active_facade_incarnation_ = 0;
+  inline static std::uint64_t next_session_collective_id_ =
+      unassigned_session_collective_id;
 };
 
 }  // namespace dg::hdg::runtime::cuda
