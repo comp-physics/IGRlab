@@ -484,6 +484,22 @@ struct Solver
       {
         return 1;
       }
+#if defined(MFEM_USE_CUDA)
+      // The CUDA HDG adapter returns before the legacy device construction
+      // below.  Keep this device alive for its entire callback so the
+      // borrowed CUDA session sees the same selected MFEM device lifetime as
+      // every other CUDA execution route, without changing CPU/DG/DGSEM.
+      if (ParseDeviceBackend(cli_opts.device) == DeviceBackend::CUDA)
+      {
+        mfem::Device hdg_cuda_device("cuda");
+        if (mfem::Mpi::Root())
+        {
+          std::cout << "[device] requested=cuda\n";
+          hdg_cuda_device.Print();
+        }
+        return spec.run_hdg(case_opts, case_cfg, cli_opts);
+      }
+#endif
       return spec.run_hdg(case_opts, case_cfg, cli_opts);
     }
 

@@ -66,6 +66,12 @@ BuildHostGeometryAndMaps() noexcept
     mfem::ElementTransformation* transformation =
         mesh_->GetElementTransformation(element);
     if (fe == nullptr || transformation == nullptr) { return false; }
+    mfem::Array<int> interior_vdofs;
+    interior_space_->GetElementVDofs(element, interior_vdofs);
+    if (interior_vdofs.Size() != shape_.interior_dofs) { return false; }
+    for (int local = 0; local < shape_.interior_dofs; ++local)
+      signed_element_interior_[static_cast<std::size_t>(element) *
+          shape_.interior_dofs + local] = interior_vdofs[local];
     mfem::IntegrationPoint center;
     center.x = center.y = 0.5;
     mfem::Vector center_physical(dimension);
@@ -254,6 +260,231 @@ BuildHostGeometryAndMaps() noexcept
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+InitializeBorrowedHostFields(const CudaConfig& config) noexcept
+{
+  borrowed_host_inputs_ = config.use_borrowed_host_inputs;
+  shape_.borrowed_static_source = config.use_borrowed_host_inputs;
+  if (!config.use_borrowed_host_inputs) { return true; }
+
+  const std::size_t scalar_count =
+      static_cast<std::size_t>(interior_space_->GetVSize() /
+                               conserved_components);
+  const std::size_t coefficient_count =
+      scalar_count * static_cast<std::size_t>(conserved_components);
+  const bool source_empty = config.borrowed_source.coefficients == nullptr &&
+      config.borrowed_source.scalar_count == 0 &&
+      config.borrowed_source.components == conserved_components;
+  bool local_valid = config.borrowed_initial.coefficients != nullptr &&
+      config.borrowed_initial.scalar_count == scalar_count &&
+      config.borrowed_initial.components == conserved_components &&
+      coefficient_count == static_cast<std::size_t>(shape_.interior_count) &&
+      (source_empty ||
+       (config.borrowed_source.coefficients != nullptr &&
+        config.borrowed_source.scalar_count == scalar_count &&
+        config.borrowed_source.components == conserved_components));
+  if (local_valid)
+  {
+    for (std::size_t i = 0; i < coefficient_count; ++i)
+      local_valid = std::isfinite(config.borrowed_initial.coefficients[i]) &&
+          (source_empty ||
+           std::isfinite(config.borrowed_source.coefficients[i]));
+  }
+  // All ranks reject before any input is copied or a trace projection starts.
+  if (!CollectiveContinue(local_valid)) { return false; }
+
+  std::array<double, maximum_rank_elements *
+                         maximum_interior_dofs_per_element> initial{};
+  std::array<double, maximum_rank_elements *
+                         maximum_interior_dofs_per_element> static_source{};
+  std::copy_n(config.borrowed_initial.coefficients, coefficient_count,
+              initial.data());
+  std::fill(host_static_source_.begin(), host_static_source_.end(), 0.0);
+  if (!source_empty)
+    std::copy_n(config.borrowed_source.coefficients, coefficient_count,
+                static_source.data());
+
+  bool scatter_ready = true;
+  for (int element = 0; scatter_ready && element < shape_.elements; ++element)
+    for (int local = 0; scatter_ready && local < shape_.interior_dofs; ++local)
+    {
+      double sign = 1.0;
+      const int dof = CudaDecodeSigned(signed_element_interior_[
+          static_cast<std::size_t>(element) * shape_.interior_dofs + local],
+          sign);
+      if (dof < 0 || static_cast<std::size_t>(dof) >= coefficient_count)
+      {
+        scatter_ready = false;
+        continue;
+      }
+      const std::size_t destination = static_cast<std::size_t>(element) *
+          shape_.interior_dofs + local;
+      host_exact_interior_[destination] = sign * initial[static_cast<std::size_t>(dof)];
+      // Generic data mode starts the physical current state at the supplied
+      // committed state; the manufactured perturbed starting state remains
+      // exclusively on the legacy path.
+      host_perturbed_interior_[destination] = host_exact_interior_[destination];
+      if (!source_empty)
+        host_static_source_[destination] = sign *
+            static_source[static_cast<std::size_t>(dof)];
+    }
+  if (!CollectiveContinue(scatter_ready)) { return false; }
+
+  std::optional<mfem::ParGridFunction> local_trace;
+  std::array<unsigned char, maximum_local_trace_dofs> local_trace_assigned{};
+  bool restriction_ready = false;
+  try
+  {
+    local_trace.emplace(trace_space_.operator->());
+    if (local_trace->Size() < 0 ||
+        local_trace->Size() != shape_.local_trace_count ||
+        local_trace->Size() > maximum_local_trace_dofs)
+      throw 0;
+    *local_trace = 0.0;
+    for (int face = 0; face < mesh_->GetNumFaces(); ++face)
+    {
+      mfem::FaceElementTransformations* transformations =
+          mesh_->GetFaceElementTransformations(face);
+      const mfem::FiniteElement* trace_element =
+          trace_space_->GetFaceElement(face);
+      if (transformations == nullptr || trace_element == nullptr ||
+          transformations->Elem1No < 0 || transformations->Elem1No >=
+              shape_.elements)
+        throw 0;
+      const mfem::FiniteElement* interior_element =
+          interior_space_->GetFE(transformations->Elem1No);
+      mfem::Array<int> interior_vdofs, trace_vdofs;
+      interior_space_->GetElementVDofs(transformations->Elem1No,
+                                       interior_vdofs);
+      trace_space_->GetFaceVDofs(face, trace_vdofs);
+      if (interior_element == nullptr ||
+          interior_vdofs.Size() != conserved_components *
+              interior_element->GetDof() ||
+          trace_vdofs.Size() != conserved_components * trace_element->GetDof())
+        throw 0;
+      mfem::Vector shape(interior_element->GetDof());
+      const mfem::IntegrationRule& nodes = trace_element->GetNodes();
+      for (int scalar = 0; scalar < trace_element->GetDof(); ++scalar)
+      {
+        const mfem::IntegrationPoint& point = nodes.IntPoint(scalar);
+        transformations->SetAllIntPoints(&point);
+        interior_element->CalcShape(transformations->GetElement1IntPoint(),
+                                    shape);
+        for (int component = 0; component < conserved_components; ++component)
+        {
+          double restricted = 0.0;
+          for (int interior_scalar = 0;
+               interior_scalar < interior_element->GetDof(); ++interior_scalar)
+          {
+            double sign = 1.0;
+            const int dof = CudaDecodeSigned(interior_vdofs[
+                interior_scalar + interior_element->GetDof() * component], sign);
+            if (dof < 0 || static_cast<std::size_t>(dof) >= coefficient_count)
+              throw 0;
+            restricted += shape[interior_scalar] * sign *
+                initial[static_cast<std::size_t>(dof)];
+          }
+          double sign = 1.0;
+          const int dof = CudaDecodeSigned(trace_vdofs[
+              scalar + trace_element->GetDof() * component], sign);
+          if (dof < 0 || dof >= local_trace->Size()) { throw 0; }
+          (*local_trace)[dof] = sign * restricted;
+          local_trace_assigned[static_cast<std::size_t>(dof)] = 1;
+        }
+      }
+    }
+    restriction_ready = std::find(local_trace_assigned.begin(),
+        local_trace_assigned.begin() + local_trace->Size(), 0) ==
+            local_trace_assigned.begin() + local_trace->Size();
+  }
+  catch (...) { restriction_ready = false; }
+  // No rank seeds true trace data until every rank has completed the local
+  // restriction and map validation.
+  if (!CollectiveContinue(restriction_ready)) { return false; }
+
+  bool trace_seeded = false;
+  try
+  {
+    if (!exchange_plan_.map.dofs.IsConsistent() ||
+        shape_.true_trace_count < 0 ||
+        shape_.true_trace_count > maximum_true_trace_dofs)
+      throw 0;
+    std::array<unsigned char, maximum_true_trace_dofs> true_assigned{};
+    for (const dg::hdg::trace::TraceMapEntry& entry :
+         exchange_plan_.map.dofs.entries)
+    {
+      if (entry.ownership != dg::hdg::Ownership::owned) continue;
+      if (entry.local_dof < 0 || entry.local_dof >= local_trace->Size() ||
+          entry.local_true_dof < 0 ||
+          entry.local_true_dof >= shape_.true_trace_count ||
+          true_assigned[static_cast<std::size_t>(entry.local_true_dof)] != 0)
+        throw 0;
+      const double value = (*local_trace)[entry.local_dof];
+      if (!std::isfinite(value)) { throw 0; }
+      const std::size_t local_true =
+          static_cast<std::size_t>(entry.local_true_dof);
+      host_exact_true_trace_[local_true] = value;
+      host_perturbed_true_trace_[local_true] = value;
+      true_assigned[local_true] = 1;
+    }
+    trace_seeded = std::find(true_assigned.begin(),
+        true_assigned.begin() + shape_.true_trace_count, 0) ==
+            true_assigned.begin() + shape_.true_trace_count;
+  }
+  catch (...) { trace_seeded = false; }
+  return CollectiveContinue(trace_seeded);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+ExportInterior(const CudaInteriorState& source,
+               CudaMutableHostL2Output destination) noexcept
+{
+  const std::size_t scalar_count =
+      static_cast<std::size_t>(interior_space_->GetVSize() /
+                               conserved_components);
+  const std::size_t coefficient_count =
+      scalar_count * static_cast<std::size_t>(conserved_components);
+  bool local_valid = initialized_ && borrowed_host_inputs_ &&
+      source.coefficients != nullptr && source.count ==
+          static_cast<std::size_t>(shape_.interior_count) &&
+      destination.coefficients != nullptr &&
+      destination.scalar_count == scalar_count &&
+      destination.components == conserved_components;
+  // Validate the complete reverse scatter before the D2H transfer.  A bad
+  // destination or map therefore cannot receive a prefix of a failed export.
+  for (int element = 0; local_valid && element < shape_.elements; ++element)
+    for (int local = 0; local_valid && local < shape_.interior_dofs; ++local)
+    {
+      double sign = 1.0;
+      const int dof = CudaDecodeSigned(signed_element_interior_[
+          static_cast<std::size_t>(element) * shape_.interior_dofs + local],
+          sign);
+      local_valid = dof >= 0 &&
+          static_cast<std::size_t>(dof) < coefficient_count;
+    }
+  if (!CollectiveContinue(local_valid)) { return false; }
+  const bool copied = TransportPolicy::DeviceToHost(
+      host_export_interior_.data(), source.coefficients,
+      static_cast<std::size_t>(shape_.interior_count) * sizeof(double),
+      CudaTransferCategory::generic_host_bridge,
+      CudaTransferSite::generic_host_export) &&
+      TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+  if (!CollectiveContinue(copied)) { return false; }
+  for (int element = 0; element < shape_.elements; ++element)
+    for (int local = 0; local < shape_.interior_dofs; ++local)
+    {
+      double sign = 1.0;
+      const int dof = CudaDecodeSigned(signed_element_interior_[
+          static_cast<std::size_t>(element) * shape_.interior_dofs + local],
+          sign);
+      destination.coefficients[dof] = sign * host_export_interior_[
+          static_cast<std::size_t>(element) * shape_.interior_dofs + local];
+    }
+  return true;
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildLocalTraceGraph() noexcept
 {
   try
@@ -320,6 +551,7 @@ BindArenaViews() noexcept
   view_.slot_interior[1] = take_d(max_i);
   view_.old_interior = take_d(max_i);
   view_.work_interior = take_d(max_i);
+  view_.static_source = take_d(max_i);
   view_.initial_current_interior = take_d(max_i);
   view_.base_interior = take_d(max_i);
   view_.trial_interior = take_d(max_i);
@@ -372,6 +604,12 @@ BindArenaViews() noexcept
                              maximum_face_points * dimension);
   view_.status = take_d(maximum_rank_elements);
   view_.scalar = take_d(8);
+  // Append the borrowed-only stabilization slice after every frozen W8A
+  // allocation.  False mode therefore preserves the exact legacy arena
+  // partition, offsets, and resource evidence tokens.
+  if (shape_.borrowed_host_inputs)
+    view_.borrowed_lagged_llf_tau = take_d(maximum_rank_elements *
+        faces_per_element * maximum_face_points);
   if (static_cast<std::size_t>(d - double_arena_) >
       persistent_double_capacity)
     return false;
@@ -421,6 +659,11 @@ UploadTopologyAndState() noexcept
   };
   const std::size_t interior_bytes =
       static_cast<std::size_t>(shape_.interior_count) * sizeof(double);
+  const bool static_source_uploaded = !shape_.borrowed_static_source ||
+      TransportPolicy::HostToDevice(
+          view_.static_source, host_static_source_.data(), interior_bytes,
+          CudaTransferCategory::initial_state,
+          CudaTransferSite::initial_interior_upload);
   if (!TransportPolicy::HostToDevice(
           view_.slot_interior[0], host_exact_interior_.data(), interior_bytes,
           CudaTransferCategory::initial_state,
@@ -433,6 +676,7 @@ UploadTopologyAndState() noexcept
           view_.initial_current_interior, host_perturbed_interior_.data(),
           interior_bytes, CudaTransferCategory::initial_state,
           CudaTransferSite::initial_interior_upload) ||
+      !static_source_uploaded ||
       !TransportPolicy::HostToDevice(
           view_.initial_current_true_trace,
           host_perturbed_true_trace_.data(),

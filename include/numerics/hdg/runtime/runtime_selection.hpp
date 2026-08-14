@@ -73,6 +73,16 @@ struct FixedScalarTauTag
   static constexpr std::string_view id = "tau.fixed";
 };
 
+/**
+ * Borrowed L2 data uses a separate, attempt-lagged local LLF selection.  It
+ * must never alias the frozen manufactured W8A fixed-tau descriptor.
+ */
+struct BorrowedHostLocalLaggedLlfTauTag
+{
+  static constexpr std::string_view id =
+      "tau.llf.local.lagged.borrowed-host.v1";
+};
+
 struct BackwardEulerRuntimeTag
 {
   static constexpr std::string_view id = "backward_euler";
@@ -122,6 +132,22 @@ using CudaRank1OneGpuRuntimeSelection =
     ConventionalEulerSmoothPersistentV1Selection<CudaRank1OneGpuBackendTag>;
 using CudaRank2OneGpuHostStagedRuntimeSelection =
     ConventionalEulerSmoothPersistentV1Selection<
+        CudaRank2OneGpuHostStagedBackendTag>;
+
+template <typename BackendTag>
+using BorrowedEulerLocalLaggedLlfSelection =
+    StaticRunSelection<EulerCompressible2dTag,
+                       ConventionalHdgTag,
+                       MfemDgInterfaceTraceTag,
+                       BorrowedHostLocalLaggedLlfTauTag,
+                       BackwardEulerRuntimeTag,
+                       BackendTag,
+                       Fp64RuntimeTag>;
+
+using BorrowedCudaRank1OneGpuRuntimeSelection =
+    BorrowedEulerLocalLaggedLlfSelection<CudaRank1OneGpuBackendTag>;
+using BorrowedCudaRank2OneGpuHostStagedRuntimeSelection =
+    BorrowedEulerLocalLaggedLlfSelection<
         CudaRank2OneGpuHostStagedBackendTag>;
 
 template <typename BackendTag>

@@ -197,7 +197,8 @@ if(MFEM_USE_MPI AND
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/paraview_output/CMakeLists.txt")
   add_subdirectory(paraview_output)
 endif()
-if(TARGET dg_igr_hdg_main_backend_cpu AND
+if((TARGET dg_igr_hdg_main_backend_cpu OR
+    TARGET dg_igr_hdg_main_backend_cuda) AND
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/main_backend/CMakeLists.txt")
   add_subdirectory(main_backend)
 endif()

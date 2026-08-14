@@ -123,6 +123,30 @@ struct CudaInjection
   CudaTokenFault token_fault = CudaTokenFault::none;
 };
 
+/**
+ * Caller-owned L2 data in MFEM Ordering::byNODES form.  `scalar_count` is
+ * the local scalar L2 dof count (not an element count); the fixed four
+ * conserved components therefore occupy `4 * scalar_count` doubles.
+ *
+ * These pointers are an Initialize-only borrowing ABI.  The persistent CUDA
+ * engine validates and copies them before it allocates its numerical state;
+ * it never retains either input pointer.
+ */
+struct CudaBorrowedHostL2Input
+{
+  const double* coefficients = nullptr;
+  std::size_t scalar_count = 0;
+  int components = conserved_components;
+};
+
+/** Mutable caller-owned L2 destination for an explicit host export. */
+struct CudaMutableHostL2Output
+{
+  double* coefficients = nullptr;
+  std::size_t scalar_count = 0;
+  int components = conserved_components;
+};
+
 struct CudaConfig
 {
   StableIdentity experiment = StableIdentity::Copy(experiment_id);
@@ -140,6 +164,12 @@ struct CudaConfig
   bool use_borrowed_topology = false;
   mfem::ParMesh* borrowed_mesh = nullptr;
   MPI_Comm borrowed_communicator = MPI_COMM_NULL;
+  // Generic-session field mode is opt-in.  The default keeps the frozen W8A
+  // manufactured interior/source bytes and behavior exactly intact.
+  bool use_borrowed_host_inputs = false;
+  CudaBorrowedHostL2Input borrowed_initial{};
+  // The sole empty spelling is {nullptr, 0, 4}; it selects a zero source.
+  CudaBorrowedHostL2Input borrowed_source{};
   bool capture_oracle = false;
   bool force_private_scientific_gate_failure = false;
   CudaInjection injection{};
@@ -170,7 +200,8 @@ enum class CudaTransferCategory : unsigned char
   checkpoint_restore_materialization,
   scalar_diagnostic,
   host_staged_trace_exchange,
-  oracle_export
+  oracle_export,
+  generic_host_bridge
 };
 
 enum class CudaTransferSite : unsigned char
@@ -206,7 +237,8 @@ enum class CudaTransferSite : unsigned char
   trace_ghost_stage_in,
   scalar_status,
   state_hash,
-  oracle_export
+  oracle_export,
+  generic_host_export
 };
 
 struct CudaPolicyContext
