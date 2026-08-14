@@ -713,6 +713,53 @@ bool CheckSubcommunicatorIsolation()
   return All(local && freed);
 }
 
+bool CheckBorrowedSessionDoesNotUseWorldCollectives()
+{
+  int world_rank = 0;
+  int world_size = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+  if (world_size == 1) { return true; }
+
+  MPI_Comm active_communicator = MPI_COMM_NULL;
+  const int active_color = (world_rank % 2) == 0 ? 0 : MPI_UNDEFINED;
+  if (MPI_Comm_split(MPI_COMM_WORLD, active_color, world_rank,
+                     &active_communicator) != MPI_SUCCESS)
+  {
+    return false;
+  }
+
+  bool local = true;
+  if (active_communicator != MPI_COMM_NULL)
+  {
+    const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                          0.0, 0.0, 2.5, 2.5}};
+    const std::array<double, 8> source{{}};
+    mfem::ParMesh mesh = MakeBorrowedMesh(active_communicator);
+    BoundaryContext boundary{};
+    EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+    const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
+    GenericEulerHdgCpuSession session;
+    GenericEulerCpuPreparedStep prepared;
+    local = session.Initialize(request).status ==
+            GenericEulerCpuSessionStatus::initialized &&
+        session.Prepare(0.013, prepared).status ==
+            GenericEulerCpuSessionStatus::prepared &&
+        session.Commit(std::move(prepared)).status ==
+            GenericEulerCpuSessionStatus::committed &&
+        session.Advance(0.047).status ==
+            GenericEulerCpuSessionStatus::advanced &&
+        boundary.calls > 0 && SameBorrowedMesh(mesh, before, active_communicator);
+    local = All(local, active_communicator);
+  }
+
+  const bool freed = active_communicator == MPI_COMM_NULL ||
+      MPI_Comm_free(&active_communicator) == MPI_SUCCESS;
+  // Passive world ranks join only after the active subgroup has completed all
+  // borrowed-session operations, including its unequal number of commits.
+  return All(local && freed);
+}
+
 bool CheckCollectiveMismatchAndAtomicFailure()
 {
   mfem::ParMesh mesh = MakeBorrowedMesh();
@@ -761,12 +808,14 @@ int main(int argc, char* argv[])
   const bool boundary_picard = CheckClosedBoundaryPicardAssembly();
   const bool zero_owned = CheckZeroOwnedElementEngine();
   const bool subcommunicator = CheckSubcommunicatorIsolation();
+  const bool passive_world = CheckBorrowedSessionDoesNotUseWorldCollectives();
   const bool mismatch = CheckCollectiveMismatchAndAtomicFailure();
   const bool callback_failure = CheckAcceptedRequestRankLocalCallbackFailure();
   const bool local = boundary_semantics && trace_restriction && orders &&
       prepared_lifecycle &&
       periodic && dynamic_tau && boundary_picard &&
-      zero_owned && subcommunicator && mismatch && callback_failure;
+      zero_owned && subcommunicator && passive_world && mismatch &&
+      callback_failure;
   if (!All(local))
   {
     int rank = 0;
@@ -779,6 +828,7 @@ int main(int argc, char* argv[])
               << " dynamic_tau=" << dynamic_tau
               << " boundary_picard=" << boundary_picard
               << " zero_owned=" << zero_owned
+              << " passive_world=" << passive_world
               << " subcommunicator=" << subcommunicator
               << " mismatch=" << mismatch
               << " callback_failure=" << callback_failure << '\n';

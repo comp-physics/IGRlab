@@ -5843,10 +5843,13 @@ void detail::CpuNumericsCore::Complete(
     state.evidence.accepted.interior_hash =
         attempt.committed_interior_after;
     state.evidence.accepted.trace_hash = attempt.committed_trace_after;
-    state.evidence.accepted.rank_common_interior_hash =
-        CpuStateStoragePolicy::HashInterior(state.committed_slot.interior);
-    state.evidence.accepted.rank_common_trace_hash =
-        CpuStateStoragePolicy::HashTrace(state.committed_slot.trace);
+    if (!state.IsBorrowed())
+    {
+      state.evidence.accepted.rank_common_interior_hash =
+          CpuStateStoragePolicy::HashInterior(state.committed_slot.interior);
+      state.evidence.accepted.rank_common_trace_hash =
+          CpuStateStoragePolicy::HashTrace(state.committed_slot.trace);
+    }
     state.evidence.accepted.attempt = attempt;
     ++state.evidence.accepted_step_count;
     ++state.evidence.commits;
