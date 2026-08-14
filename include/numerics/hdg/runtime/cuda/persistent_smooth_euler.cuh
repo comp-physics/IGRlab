@@ -438,11 +438,15 @@ inline bool ExactSelection(const CudaConfig& config) noexcept
       ExactId(tuple.backend, "cuda.rank1.one_gpu");
   const bool rank_two = config.expected_rank_count == 2 &&
       ExactId(tuple.backend, "cuda.rank2.one_gpu.host_staged");
+  const bool legacy_fixed = !config.use_borrowed_host_inputs &&
+      ExactId(tuple.stabilization, "tau.fixed");
+  const bool borrowed_lagged_llf = config.use_borrowed_host_inputs &&
+      ExactId(tuple.stabilization, "tau.llf.local.lagged.borrowed-host.v1");
   return Selection::interior_space == InteriorSpace::l2 && tuple.Valid() &&
       ExactId(tuple.model, "euler.compressible.2d") &&
       ExactId(tuple.formulation, "hdg.conventional") &&
       ExactId(tuple.trace, "mfem.dg_interface.trace") &&
-      ExactId(tuple.stabilization, "tau.fixed") &&
+      (legacy_fixed || borrowed_lagged_llf) &&
       ExactId(tuple.time_treatment, "backward_euler") &&
       ExactId(tuple.precision, "fp64") && (rank_one || rank_two);
 }

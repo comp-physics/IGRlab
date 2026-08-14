@@ -604,6 +604,12 @@ BindArenaViews() noexcept
                              maximum_face_points * dimension);
   view_.status = take_d(maximum_rank_elements);
   view_.scalar = take_d(8);
+  // Append the borrowed-only stabilization slice after every frozen W8A
+  // allocation.  False mode therefore preserves the exact legacy arena
+  // partition, offsets, and resource evidence tokens.
+  if (shape_.borrowed_host_inputs)
+    view_.borrowed_lagged_llf_tau = take_d(maximum_rank_elements *
+        faces_per_element * maximum_face_points);
   if (static_cast<std::size_t>(d - double_arena_) >
       persistent_double_capacity)
     return false;

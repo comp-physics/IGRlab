@@ -341,6 +341,10 @@ struct CudaDeviceView
   // Dedicated persistent slice for caller-supplied static L2 source values.
   // It is always allocated; legacy manufactured forcing ignores it.
   double* static_source = nullptr;
+  // One frozen local LLF speed for every element/face/quadrature point.  This
+  // slice is populated once from the committed state at Prepare and is never
+  // differentiated or updated during the nonlinear attempt.
+  double* borrowed_lagged_llf_tau = nullptr;
   double* initial_current_interior = nullptr;
   double* base_interior = nullptr;
   double* trial_interior = nullptr;
@@ -420,6 +424,7 @@ struct CudaMeshShape
   int vector_send_count = 0;
   int vector_receive_count = 0;
   bool borrowed_static_source = false;
+  bool borrowed_host_inputs = false;
 };
 
 enum class CudaHypreSetupAction : std::uint8_t
@@ -678,6 +683,8 @@ bool CudaLaunchGatherLocalTrace(const int* signed_map, int count,
                                 double* local_trace) noexcept;
 bool CudaLaunchAdmissibility(const CudaDeviceView& view,
                              const CudaMeshShape& shape) noexcept;
+bool CudaLaunchSeedBorrowedLaggedLlfTau(const CudaDeviceView& view,
+                                        const CudaMeshShape& shape) noexcept;
 bool CudaLaunchAssembly(const CudaDeviceView& view,
                         const CudaMeshShape& shape, double dt) noexcept;
 bool CudaLaunchCondensation(const CudaDeviceView& view,
@@ -1122,12 +1129,11 @@ public:
     current_generation_ = attempt.committed_generation + 1;
     ticket_count_ = 0;
     TransportPolicy::SetPhase(CudaFailurePhase::setup, current_generation_);
-    bool local_ready = TransportPolicy::DeviceToDevice(
-            view_.old_interior, workspace.interior.coefficients,
-            workspace.interior.count * sizeof(double),
-            CudaTransferCategory::attempt_history,
-            CudaTransferSite::attempt_seed_interior);
-    if (first_step)
+    // Borrowed mode must seed its face LLF speeds from one coherent committed
+    // state.  On the initial attempt materialize both committed slots before
+    // copying old_interior; the frozen legacy route below remains unchanged.
+    bool local_ready = true;
+    if (first_step && shape_.borrowed_host_inputs)
     {
       const bool interior_ready = TransportPolicy::DeviceToDevice(
               workspace.interior.coefficients,
@@ -1141,9 +1147,40 @@ public:
               workspace.trace.count * sizeof(double),
               CudaTransferCategory::attempt_history,
               CudaTransferSite::attempt_seed_trace);
-      local_ready = local_ready && interior_ready && trace_ready;
+      const bool old_ready = TransportPolicy::DeviceToDevice(
+              view_.old_interior, workspace.interior.coefficients,
+              workspace.interior.count * sizeof(double),
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::attempt_seed_interior);
+      local_ready = interior_ready && trace_ready && old_ready;
       workspace.interior.generation = current_generation_;
       workspace.trace.generation = current_generation_;
+    }
+    else
+    {
+      local_ready = TransportPolicy::DeviceToDevice(
+          view_.old_interior, workspace.interior.coefficients,
+          workspace.interior.count * sizeof(double),
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::attempt_seed_interior);
+      if (first_step)
+      {
+        const bool interior_ready = TransportPolicy::DeviceToDevice(
+                workspace.interior.coefficients,
+                view_.initial_current_interior,
+                workspace.interior.count * sizeof(double),
+                CudaTransferCategory::attempt_history,
+                CudaTransferSite::attempt_seed_interior);
+        const bool trace_ready = TransportPolicy::DeviceToDevice(
+                workspace.trace.coefficients,
+                view_.initial_current_true_trace,
+                workspace.trace.count * sizeof(double),
+                CudaTransferCategory::attempt_history,
+                CudaTransferSite::attempt_seed_trace);
+        local_ready = local_ready && interior_ready && trace_ready;
+        workspace.interior.generation = current_generation_;
+        workspace.trace.generation = current_generation_;
+      }
     }
     const bool synchronized =
         TransportPolicy::Synchronize(CudaTransferSite::attempt_seed_trace);
@@ -1181,6 +1218,23 @@ public:
       result.phase = CudaFailurePhase::setup;
       result.reason = FailureReason::collective_protocol;
       return result;
+    }
+    // The borrowed path owns a single stabilization field per prepared
+    // attempt.  Seed it from the committed interior/local trace before any
+    // nonlinear update, then retain it unchanged through every assembly and
+    // line-search reassembly.  The legacy manufactured W8A path deliberately
+    // does not launch this kernel and continues to use its fixed arithmetic.
+    if (shape_.borrowed_host_inputs)
+    {
+      const bool tau_seeded = CudaLaunchSeedBorrowedLaggedLlfTau(view_, shape_) &&
+          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+          StatusPassed();
+      if (!CollectiveContinue(tau_seeded))
+      {
+        result.phase = CudaFailurePhase::assembly;
+        result.reason = FailureReason::admissibility_gate;
+        return result;
+      }
     }
     const bool injection_active = config.injection.enabled &&
         config.injection.target_step == attempt.committed_step + 1 &&
@@ -1866,6 +1920,7 @@ private:
         ? functional_assembly_quadrature_order : assembly_quadrature_order;
     shape_.interior_count = shape_.elements * shape_.interior_dofs;
     shape_.borrowed_static_source = false;
+    shape_.borrowed_host_inputs = config.use_borrowed_host_inputs;
     if (!ExactTopologyShapeFitsCapacity(config, *mesh_, *interior_space_,
                                         *trace_space_, exchange_plan_))
       return false;

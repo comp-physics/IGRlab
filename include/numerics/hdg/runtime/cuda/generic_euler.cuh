@@ -151,13 +151,29 @@ public:
     {
       if (config.expected_rank_count == 1)
       {
-        rank1_ = std::make_unique<rank1_engine>(config);
-        allocated = rank1_ != nullptr;
+        if (config.use_borrowed_host_inputs)
+        {
+          borrowed_rank1_ = std::make_unique<borrowed_rank1_engine>(config);
+          allocated = borrowed_rank1_ != nullptr;
+        }
+        else
+        {
+          rank1_ = std::make_unique<rank1_engine>(config);
+          allocated = rank1_ != nullptr;
+        }
       }
       else
       {
-        rank2_ = std::make_unique<rank2_engine>(config);
-        allocated = rank2_ != nullptr;
+        if (config.use_borrowed_host_inputs)
+        {
+          borrowed_rank2_ = std::make_unique<borrowed_rank2_engine>(config);
+          allocated = borrowed_rank2_ != nullptr;
+        }
+        else
+        {
+          rank2_ = std::make_unique<rank2_engine>(config);
+          allocated = rank2_ != nullptr;
+        }
       }
     }
     catch (...)
@@ -168,6 +184,8 @@ public:
     {
       rank1_.reset();
       rank2_.reset();
+      borrowed_rank1_.reset();
+      borrowed_rank2_.reset();
       failed_ = true;
       return Result(generic::HdgEulerSessionStatus::rejected);
     }
@@ -379,6 +397,10 @@ private:
       CudaRank1OneGpuRuntimeSelection>;
   using rank2_engine = cuda_w8a::PersistentCudaSmoothEulerEngine<
       CudaRank2OneGpuHostStagedRuntimeSelection>;
+  using borrowed_rank1_engine = cuda_w8a::PersistentCudaSmoothEulerEngine<
+      BorrowedCudaRank1OneGpuRuntimeSelection>;
+  using borrowed_rank2_engine = cuda_w8a::PersistentCudaSmoothEulerEngine<
+      BorrowedCudaRank2OneGpuHostStagedRuntimeSelection>;
 
   static coordinates_type ToCoordinates(
       const StateCoordinates& value) noexcept
@@ -480,7 +502,11 @@ private:
     return (rank1_ && rank1_->contract() &&
             rank1_->contract()->status() == expected) ||
         (rank2_ && rank2_->contract() &&
-         rank2_->contract()->status() == expected);
+         rank2_->contract()->status() == expected) ||
+        (borrowed_rank1_ && borrowed_rank1_->contract() &&
+         borrowed_rank1_->contract()->status() == expected) ||
+        (borrowed_rank2_ && borrowed_rank2_->contract() &&
+         borrowed_rank2_->contract()->status() == expected);
   }
 
   void ConsumeAuthority(GenericEulerCudaPreparedStep& authority) noexcept
@@ -576,6 +602,30 @@ private:
         MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
     return complete_census && minimum_census && maximum_census &&
         all_complete == 1 && minimum == maximum;
+  }
+
+  static bool PhysicallyAdmissibleBorrowedInitial(
+      const cuda_w8a::CudaBorrowedHostL2Input& field) noexcept
+  {
+    if (field.coefficients == nullptr || field.components !=
+        cuda_w8a::conserved_components) return false;
+    constexpr double gamma = 1.4;
+    for (std::size_t scalar = 0; scalar < field.scalar_count; ++scalar)
+    {
+      const double rho = field.coefficients[scalar];
+      const double mx = field.coefficients[field.scalar_count + scalar];
+      const double my = field.coefficients[2 * field.scalar_count + scalar];
+      const double energy = field.coefficients[3 * field.scalar_count + scalar];
+      if (!std::isfinite(rho) || !std::isfinite(mx) || !std::isfinite(my) ||
+          !std::isfinite(energy) || !(rho > 0.0)) return false;
+      const double pressure = (gamma - 1.0) *
+          (energy - 0.5 * (mx * mx + my * my) / rho);
+      const double sound_squared = gamma * pressure / rho;
+      if (!(pressure > 0.0) || !(sound_squared > 0.0) ||
+          !std::isfinite(sound_squared) ||
+          !std::isfinite(std::sqrt(sound_squared))) return false;
+    }
+    return true;
   }
 
   bool PreDeviceAdmission(const cuda_w8a::CudaConfig& config) const noexcept
@@ -679,6 +729,8 @@ private:
           local = std::isfinite(config.borrowed_initial.coefficients[i]) &&
               (source_empty ||
                std::isfinite(config.borrowed_source.coefficients[i]));
+        local = local && PhysicallyAdmissibleBorrowedInitial(
+            config.borrowed_initial);
       }
     }
     const int local_bit = local ? 1 : 0;
@@ -709,6 +761,8 @@ private:
   {
     if (rank1_) return callback(*rank1_);
     if (rank2_) return callback(*rank2_);
+    if (borrowed_rank1_) return callback(*borrowed_rank1_);
+    if (borrowed_rank2_) return callback(*borrowed_rank2_);
     return false;
   }
 
@@ -716,11 +770,17 @@ private:
   {
     if (rank1_ && rank1_->contract()) return ToCoordinates(rank1_->contract()->coordinates());
     if (rank2_ && rank2_->contract()) return ToCoordinates(rank2_->contract()->coordinates());
+    if (borrowed_rank1_ && borrowed_rank1_->contract())
+      return ToCoordinates(borrowed_rank1_->contract()->coordinates());
+    if (borrowed_rank2_ && borrowed_rank2_->contract())
+      return ToCoordinates(borrowed_rank2_->contract()->coordinates());
     return coordinates_;
   }
 
   std::unique_ptr<rank1_engine> rank1_;
   std::unique_ptr<rank2_engine> rank2_;
+  std::unique_ptr<borrowed_rank1_engine> borrowed_rank1_;
+  std::unique_ptr<borrowed_rank2_engine> borrowed_rank2_;
   cuda_w8a::CudaRunEvidence setup_{};
   coordinates_type coordinates_{};
   std::uint64_t epoch_ = 0;
