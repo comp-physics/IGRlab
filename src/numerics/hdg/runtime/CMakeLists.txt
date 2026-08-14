@@ -202,8 +202,6 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
       PRIVATE_LINK_LIBRARIES
         dg_igr_hdg_runtime_cuda
         dg_igr_hdg_runtime_cpu)
-    set_target_properties(dg_igr_hdg_main_backend_cuda PROPERTIES
-      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   elseif(_dg_igr_hdg_runtime_cuda_sources)
     message(STATUS
             "HDG CUDA sources are reserved but not built by the requested CPU profile.")

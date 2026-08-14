@@ -401,8 +401,10 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     return Reject("generic CUDA session initialization failed");
   CudaMutableHostL2Output destination{};
   if (!CollectiveAll(FreshOutputView(*published_state, scalar_count,
-                                     destination)) ||
-      !session.ExportCommittedInterior(destination))
+                                     destination)))
+    return Reject("initial CUDA committed-state output view failed");
+  local_ok = session.ExportCommittedInterior(destination);
+  if (!CollectiveAll(local_ok))
     return Reject("initial CUDA committed-state export failed");
 
   std::unique_ptr<HdgTransactionalTimeAdapter> time_driver;
@@ -464,8 +466,16 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       return Reject("generic CUDA prepared step failed");
     }
     if (!CollectiveAll(FreshOutputView(*published_state, scalar_count,
-                                       destination)) ||
-        !session.ExportPreparedInterior(authority, native_export, destination))
+                                       destination)))
+    {
+      local_ok = AbortPrepared(session, authority, native_export);
+      time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+      return Reject(local_ok ? "CUDA prepared-state output view failed"
+                             : "CUDA prepared abort failed after output-view failure");
+    }
+    local_ok = session.ExportPreparedInterior(authority, native_export,
+                                              destination);
+    if (!CollectiveAll(local_ok))
     {
       local_ok = AbortPrepared(session, authority, native_export);
       time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
@@ -496,8 +506,10 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     // Publication remains post-commit: replace the staged physical candidate
     // with the engine's committed bytes before finalizing time/output.
     if (!CollectiveAll(FreshOutputView(*published_state, scalar_count,
-                                       destination)) ||
-        !session.ExportCommittedInterior(destination))
+                                       destination)))
+      return Reject("CUDA committed-state output view failed after commit");
+    local_ok = session.ExportCommittedInterior(destination);
+    if (!CollectiveAll(local_ok))
       return Reject("CUDA committed-state export failed after commit");
 
     std::optional<HdgTransactionalTimeAdapter::OutputEvent> finalized;
