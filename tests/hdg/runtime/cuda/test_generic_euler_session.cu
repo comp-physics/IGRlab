@@ -60,7 +60,7 @@ CudaConfig BorrowedConfig(mfem::ParMesh& mesh, const int ranks,
 }
 
 bool SameCoordinates(const dg::hdg::generic::HdgEulerSessionCoordinates& left,
-                     const StateCoordinates& right) noexcept
+                     const dg::hdg::runtime::StateCoordinates& right) noexcept
 {
   return left.time == right.time && left.dt == right.dt &&
       left.step == right.step && left.generation == right.generation;
@@ -69,8 +69,8 @@ bool SameCoordinates(const dg::hdg::generic::HdgEulerSessionCoordinates& left,
 bool SameNativeExport(const CudaSerializedCheckpointV1& left,
                       const CudaSerializedCheckpointV1& right) noexcept
 {
-  const auto same_attempt = [](const AttemptIdentity& first,
-                               const AttemptIdentity& second)
+  const auto same_attempt = [](const dg::hdg::runtime::AttemptIdentity& first,
+                               const dg::hdg::runtime::AttemptIdentity& second)
   {
     return first.sequence == second.sequence &&
         first.committed_step == second.committed_step &&
