@@ -691,6 +691,15 @@ struct CpuNumericalResult
   FailureReason originating_failure = FailureReason::none;
 };
 
+enum class CpuBorrowedEulerOperation : unsigned char
+{
+  prepare = 0,
+  commit = 1,
+  abort = 2,
+  export_prepared_buffer = 3,
+  export_prepared_grid_function = 4
+};
+
 class CpuNumericsCore
 {
 public:
@@ -714,13 +723,25 @@ public:
   bool InitializeBorrowedEuler(const generic::EulerHdgRequest&) noexcept;
   /** Advance one borrowed generic Euler attempt and publish only on success. */
   bool AdvanceBorrowedEuler(double, StateCoordinates&) noexcept;
+  /** Prepare one borrowed candidate without changing the committed slot. */
+  bool PrepareBorrowedEuler(double, StateCoordinates&,
+                            std::uint64_t&) noexcept;
+  /** Publish exactly one active prepared candidate. */
+  bool CommitBorrowedEuler(std::uint64_t, StateCoordinates&, double&) noexcept;
+  /** Discard exactly one active prepared candidate. */
+  bool AbortBorrowedEuler(std::uint64_t,
+                          const StateCoordinates&) noexcept;
   /** Copy only the committed physical interior into validated host output. */
   bool ExportCommittedInterior(double*, std::size_t) const noexcept;
   bool ExportCommittedInterior(mfem::ParGridFunction&) const noexcept;
+  bool ExportPreparedInterior(std::uint64_t, double*, std::size_t) const noexcept;
+  bool ExportPreparedInterior(std::uint64_t,
+                              mfem::ParGridFunction&) const noexcept;
   bool AdmitInitialization(bool facade_empty,
                            const CpuPersistentConfig&,
                            const RuntimeTupleDescriptor&) const noexcept;
   bool CollectiveAll(bool) const noexcept;
+  bool AdmitBorrowedEulerOperation(CpuBorrowedEulerOperation) const noexcept;
   bool ResetAfterInitializationFailure() noexcept;
   bool ConsumeCollectiveTestFault(CpuCollectiveTestFault) noexcept;
   std::uint64_t incarnation() const noexcept;
@@ -742,6 +763,9 @@ public:
   bool AuthorizePublicationChain(const AttemptIdentity&,
                                  std::uint64_t candidate_generation,
                                  const StateHash& candidate_state_hash) noexcept;
+  bool CanAuthorizePublicationChain(const AttemptIdentity&,
+                                    std::uint64_t candidate_generation,
+                                    const StateHash& candidate_state_hash) const noexcept;
   bool CandidateGenerationActive(std::uint64_t) const noexcept;
   void InvalidateCandidateGeneration() noexcept;
   bool ObserveOwnedAllocation(CpuOwnedAllocationSite,
