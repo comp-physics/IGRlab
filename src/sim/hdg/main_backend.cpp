@@ -33,6 +33,7 @@ using dg::hdg::generic::BackendSelection;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::runtime::cpu::GenericEulerCpuSessionStatus;
 using dg::hdg::runtime::cpu::GenericEulerHdgCpuSession;
+using dg::hdg::runtime::cpu::GenericEulerCpuPreparedStep;
 
 bool IsRoot(const MPI_Comm communicator) noexcept
 {
@@ -650,38 +651,121 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     while (!time_driver->Finished())
     {
       const auto& plan = time_driver->BeginStep();
-      local_ok = session->Advance(plan.dt).status ==
-          GenericEulerCpuSessionStatus::advanced;
+      GenericEulerCpuPreparedStep prepared;
+      local_ok = session->Prepare(plan.dt, prepared).status ==
+          GenericEulerCpuSessionStatus::prepared;
       if (!CollectiveAll(request.communicator, local_ok))
       {
+        // Prepare only mints a token after its collective admission succeeds.
         time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
-        return Reject(request, "generic CPU step failed");
+        return Reject(request, "generic CPU prepared step failed");
       }
 
-      // The numerical session has committed its candidate.  Keep the pure
-      // time cursor pending until the committed state and any scheduled
-      // publication have been staged successfully on every rank.  A staging
-      // failure remains terminal because this V1 session has no rollback API.
-      const auto preview = time_driver->PreviewFinalizedOutput();
-      local_ok = session->ExportCommittedInterior(*published_state);
+      // Keep the pure time cursor pending until the candidate state has been
+      // staged in memory.  All ranks own a valid prepared token from here
+      // until the same collective Commit or Abort consumes it.
+      local_ok = session->ExportPreparedInterior(prepared, *published_state);
       if (!CollectiveAll(request.communicator, local_ok))
       {
+        local_ok = session->Abort(std::move(prepared)).status ==
+            GenericEulerCpuSessionStatus::aborted;
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+          return Reject(
+              request,
+              "generic CPU prepared-step abort failed after export failure");
+        }
         time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-        return Reject(request, "committed-state export failed");
+        return Reject(request, "prepared-state export failed");
       }
-      if (output && preview)
+
+      std::optional<HdgTransactionalTimeAdapter::OutputEvent> preview;
+      try
+      {
+        preview = time_driver->PreviewFinalizedOutput();
+        local_ok = true;
+      }
+      catch (...)
+      {
+        local_ok = false;
+      }
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        local_ok = session->Abort(std::move(prepared)).status ==
+            GenericEulerCpuSessionStatus::aborted;
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+          return Reject(
+              request,
+              "generic CPU prepared-step abort failed after output preview failure");
+        }
+        time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+        return Reject(request, "HDG output preview failed");
+      }
+      local_ok = session->Commit(std::move(prepared)).status ==
+          GenericEulerCpuSessionStatus::committed;
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        local_ok = session->Abort(std::move(prepared)).status ==
+            GenericEulerCpuSessionStatus::aborted;
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          return Reject(
+              request,
+              "generic CPU prepared-step abort failed after commit failure");
+        }
+        return Reject(request, "generic CPU prepared commit failed");
+      }
+
+      std::optional<HdgTransactionalTimeAdapter::OutputEvent> finalized;
+      try
+      {
+        finalized = time_driver->FinalizeSuccess();
+        local_ok = true;
+      }
+      catch (...)
+      {
+        local_ok = false;
+      }
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        return Reject(request, "HDG time transaction finalization failed after commit");
+      }
+
+      local_ok = preview.has_value() == finalized.has_value();
+      if (local_ok && preview)
+      {
+        local_ok = preview->cycle == finalized->cycle &&
+            preview->time == finalized->time &&
+            preview->is_initial == finalized->is_initial &&
+            preview->is_final == finalized->is_final;
+      }
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        return Reject(request, "HDG finalized output differs from its preview");
+      }
+
+      if (output && finalized)
       {
         try
         {
-          output->Write(Metadata(*preview, time_driver->solver_step() + 1));
+          output->Write(Metadata(*finalized, time_driver->solver_step()));
+          local_ok = true;
         }
         catch (...)
         {
-          time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-          return Reject(request, "HDG ParaView output failed");
+          local_ok = false;
+        }
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          // The numerical and time transactions are already committed.  The
+          // writer cannot be aborted or rolled back; partial output is only a
+          // failed-run artifact and never names an uncommitted state.
+          return Reject(request, "HDG ParaView output failed after commit");
         }
       }
-      static_cast<void>(time_driver->FinalizeSuccess());
     }
 
     if (IsRoot(request.communicator))

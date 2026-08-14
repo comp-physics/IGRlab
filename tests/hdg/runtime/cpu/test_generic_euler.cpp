@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 namespace
@@ -18,6 +19,7 @@ using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::runtime::cpu::ExecuteGenericEulerHdgCpu;
+using dg::hdg::runtime::cpu::GenericEulerCpuPreparedStep;
 using dg::hdg::runtime::cpu::GenericEulerCpuSessionStatus;
 using dg::hdg::runtime::cpu::GenericEulerHdgCpuSession;
 using dg::hdg::runtime::cpu::RestartGenericEulerHdgCpu;
@@ -419,6 +421,161 @@ bool CheckOrdersAndDeterminism()
   return true;
 }
 
+bool CheckPreparedSessionLifecycle()
+{
+  const dg::hdg::generic::HdgEulerCommittedDiagnostics unavailable{};
+  if (dg::hdg::generic::IsValidHdgEulerCommittedDiagnostics(unavailable, 0))
+  {
+    return false;
+  }
+  mfem::ParMesh mesh = MakeBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                        0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{{0.03, 0.04, 0.01, 0.02,
+                                       0.00, 0.00, 0.05, 0.06}};
+  BoundaryContext boundary{};
+  GenericEulerHdgCpuSession session;
+  if (session.Initialize(Request(mesh, 1, boundary, initial, source)).status !=
+      GenericEulerCpuSessionStatus::initialized)
+  {
+    return false;
+  }
+  const std::uint32_t required_capabilities =
+      dg::hdg::generic::HdgEulerSessionCapabilityBit(
+          dg::hdg::generic::HdgEulerSessionCapability::prepared_commit) |
+      dg::hdg::generic::HdgEulerSessionCapabilityBit(
+          dg::hdg::generic::HdgEulerSessionCapability::prepared_output) |
+      dg::hdg::generic::HdgEulerSessionCapabilityBit(
+          dg::hdg::generic::HdgEulerSessionCapability::generic_borrowed_inputs);
+  if (!dg::hdg::generic::HasHdgEulerSessionCapabilities(
+          session.capabilities(), required_capabilities) ||
+      dg::hdg::generic::HasHdgEulerSessionCapabilities(
+          session.capabilities(),
+          dg::hdg::generic::HdgEulerSessionCapabilityBit(
+              dg::hdg::generic::HdgEulerSessionCapability::
+                  committed_cfl_diagnostics)) ||
+      !dg::hdg::generic::IsValidHdgEulerCommittedDiagnostics(
+          session.diagnostics(), session.capabilities()))
+  {
+    return false;
+  }
+  auto stale_unavailable_wave = session.diagnostics();
+  stale_unavailable_wave.coordinates.generation = 1;
+  stale_unavailable_wave.wave_generation = 1;
+  if (dg::hdg::generic::IsValidHdgEulerCommittedDiagnostics(
+          stale_unavailable_wave, session.capabilities()))
+  {
+    return false;
+  }
+
+  mfem::L2_FECollection collection(
+      1, 2, mfem::BasisType::GaussLegendre, mfem::FiniteElement::VALUE);
+  mfem::ParFiniteElementSpace space(&mesh, &collection, 4,
+                                    mfem::Ordering::byNODES);
+  mfem::ParGridFunction committed(&space);
+  mfem::ParGridFunction prepared(&space);
+  if (!session.ExportCommittedInterior(committed)) return false;
+  std::vector<double> before(static_cast<std::size_t>(committed.Size()));
+  if (!session.ExportCommittedInterior({before.data(), before.size()})) return false;
+  const auto coordinates_before = session.coordinates();
+  const auto diagnostics_before = session.diagnostics();
+
+  GenericEulerCpuPreparedStep first;
+  if (session.Prepare(0.005, first).status !=
+          GenericEulerCpuSessionStatus::prepared ||
+      session.Prepare(0.005, first).status !=
+          GenericEulerCpuSessionStatus::rejected ||
+      session.coordinates().step != coordinates_before.step ||
+      session.coordinates().generation != coordinates_before.generation ||
+      session.diagnostics().coordinates.generation !=
+          diagnostics_before.coordinates.generation ||
+      !session.ExportPreparedInterior(first, prepared) ||
+      !session.ExportCommittedInterior(committed))
+  {
+    return false;
+  }
+  std::vector<double> prepared_values(
+      static_cast<std::size_t>(prepared.Size()));
+  std::vector<double> committed_values(
+      static_cast<std::size_t>(committed.Size()));
+  if (!session.ExportPreparedInterior(
+          first, {prepared_values.data(), prepared_values.size()}) ||
+      !session.ExportCommittedInterior(
+          {committed_values.data(), committed_values.size()}) ||
+      committed_values != before)
+  {
+    return false;
+  }
+
+  // A different rank-local token must be rejected collectively with neither
+  // committed bytes nor coordinates changed; the valid authority survives.
+  int rank = 0;
+  int ranks = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  if (ranks > 1)
+  {
+    const auto divergent_operation = rank == 0
+        ? session.Commit(std::move(first))
+        : session.Abort(std::move(first));
+    if (divergent_operation.status != GenericEulerCpuSessionStatus::rejected ||
+        session.coordinates().step != coordinates_before.step ||
+        !session.ExportCommittedInterior(
+            {committed_values.data(), committed_values.size()}) ||
+        committed_values != before)
+    {
+      return false;
+    }
+  }
+  GenericEulerCpuPreparedStep stale;
+  const auto mismatched = rank == 0 ? session.Commit(std::move(stale))
+                                    : session.Commit(std::move(first));
+  if (mismatched.status != GenericEulerCpuSessionStatus::rejected ||
+      session.coordinates().step != coordinates_before.step ||
+      !session.ExportCommittedInterior(
+          {committed_values.data(), committed_values.size()}) ||
+      committed_values != before)
+  {
+    return false;
+  }
+  if (session.Abort(std::move(first)).status !=
+          GenericEulerCpuSessionStatus::aborted ||
+      session.coordinates().step != coordinates_before.step ||
+      session.coordinates().generation != coordinates_before.generation ||
+      session.diagnostics().coordinates.generation !=
+          diagnostics_before.coordinates.generation ||
+      !session.ExportCommittedInterior(
+          {committed_values.data(), committed_values.size()}) ||
+      committed_values != before)
+  {
+    return false;
+  }
+
+  GenericEulerCpuPreparedStep second;
+  if (session.Prepare(0.007, second).status !=
+          GenericEulerCpuSessionStatus::prepared ||
+      session.Commit(std::move(second)).status !=
+          GenericEulerCpuSessionStatus::committed ||
+      session.coordinates().step != 1 || session.coordinates().generation != 1 ||
+      session.coordinates().dt != 0.007 || session.coordinates().time != 0.007 ||
+      !dg::hdg::generic::IsValidHdgEulerCommittedDiagnostics(
+          session.diagnostics(), session.capabilities()))
+  {
+    return false;
+  }
+  const auto committed_coordinates = session.coordinates();
+  if (session.Commit(std::move(second)).status !=
+          GenericEulerCpuSessionStatus::rejected ||
+      session.coordinates().step != committed_coordinates.step ||
+      session.coordinates().generation != committed_coordinates.generation ||
+      session.Advance(0.011).status != GenericEulerCpuSessionStatus::advanced ||
+      session.coordinates().step != 2 || session.coordinates().generation != 2)
+  {
+    return false;
+  }
+  return true;
+}
+
 bool CheckPeriodicAnnotationsRemainTraceCouplings()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
@@ -527,16 +684,79 @@ bool CheckSubcommunicatorIsolation()
     EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
     const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
     GenericEulerHdgCpuSession session;
-    local = session.Initialize(request).status ==
-            GenericEulerCpuSessionStatus::initialized &&
-        session.Advance(0.013).status ==
-            GenericEulerCpuSessionStatus::advanced &&
-        session.Advance(0.047).status ==
-            GenericEulerCpuSessionStatus::advanced && boundary.calls > 0 &&
-        SameBorrowedMesh(mesh, before, subcommunicator);
+    GenericEulerCpuPreparedStep prepared;
+    const bool initialized = session.Initialize(request).status ==
+        GenericEulerCpuSessionStatus::initialized;
+    const bool prepared_step = initialized &&
+        session.Prepare(0.013, prepared).status ==
+            GenericEulerCpuSessionStatus::prepared;
+    const bool even_group = (world_rank % 2) == 0;
+    const bool resolved_prepared = prepared_step &&
+        (even_group
+            ? session.Commit(std::move(prepared)).status ==
+                GenericEulerCpuSessionStatus::committed
+            : session.Abort(std::move(prepared)).status ==
+                GenericEulerCpuSessionStatus::aborted);
+    const bool advanced = resolved_prepared &&
+        (even_group
+            ? session.Advance(0.047).status ==
+                GenericEulerCpuSessionStatus::advanced
+            : session.Advance(0.013).status ==
+                    GenericEulerCpuSessionStatus::advanced &&
+                session.Advance(0.047).status ==
+                    GenericEulerCpuSessionStatus::advanced);
+    local = initialized && prepared_step && resolved_prepared && advanced &&
+        boundary.calls > 0 && SameBorrowedMesh(mesh, before, subcommunicator);
     local = All(local, subcommunicator);
   }
   const bool freed = MPI_Comm_free(&subcommunicator) == MPI_SUCCESS;
+  return All(local && freed);
+}
+
+bool CheckBorrowedSessionDoesNotUseWorldCollectives()
+{
+  int world_rank = 0;
+  int world_size = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+  if (world_size == 1) { return true; }
+
+  MPI_Comm active_communicator = MPI_COMM_NULL;
+  const int active_color = (world_rank % 2) == 0 ? 0 : MPI_UNDEFINED;
+  if (MPI_Comm_split(MPI_COMM_WORLD, active_color, world_rank,
+                     &active_communicator) != MPI_SUCCESS)
+  {
+    return false;
+  }
+
+  bool local = true;
+  if (active_communicator != MPI_COMM_NULL)
+  {
+    const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                          0.0, 0.0, 2.5, 2.5}};
+    const std::array<double, 8> source{{}};
+    mfem::ParMesh mesh = MakeBorrowedMesh(active_communicator);
+    BoundaryContext boundary{};
+    EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+    const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
+    GenericEulerHdgCpuSession session;
+    GenericEulerCpuPreparedStep prepared;
+    local = session.Initialize(request).status ==
+            GenericEulerCpuSessionStatus::initialized &&
+        session.Prepare(0.013, prepared).status ==
+            GenericEulerCpuSessionStatus::prepared &&
+        session.Commit(std::move(prepared)).status ==
+            GenericEulerCpuSessionStatus::committed &&
+        session.Advance(0.047).status ==
+            GenericEulerCpuSessionStatus::advanced &&
+        boundary.calls > 0 && SameBorrowedMesh(mesh, before, active_communicator);
+    local = All(local, active_communicator);
+  }
+
+  const bool freed = active_communicator == MPI_COMM_NULL ||
+      MPI_Comm_free(&active_communicator) == MPI_SUCCESS;
+  // Passive world ranks join only after the active subgroup has completed all
+  // borrowed-session operations, including its unequal number of commits.
   return All(local && freed);
 }
 
@@ -582,16 +802,20 @@ int main(int argc, char* argv[])
   const bool boundary_semantics = CheckBoundaryExteriorSemantics();
   const bool trace_restriction = CheckBorrowedTraceRestrictsInterior();
   const bool orders = CheckOrdersAndDeterminism();
+  const bool prepared_lifecycle = CheckPreparedSessionLifecycle();
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
   const bool dynamic_tau = CheckDynamicTauHighWaveTwoSteps();
   const bool boundary_picard = CheckClosedBoundaryPicardAssembly();
   const bool zero_owned = CheckZeroOwnedElementEngine();
   const bool subcommunicator = CheckSubcommunicatorIsolation();
+  const bool passive_world = CheckBorrowedSessionDoesNotUseWorldCollectives();
   const bool mismatch = CheckCollectiveMismatchAndAtomicFailure();
   const bool callback_failure = CheckAcceptedRequestRankLocalCallbackFailure();
   const bool local = boundary_semantics && trace_restriction && orders &&
+      prepared_lifecycle &&
       periodic && dynamic_tau && boundary_picard &&
-      zero_owned && subcommunicator && mismatch && callback_failure;
+      zero_owned && subcommunicator && passive_world && mismatch &&
+      callback_failure;
   if (!All(local))
   {
     int rank = 0;
@@ -600,9 +824,11 @@ int main(int argc, char* argv[])
               << " boundary_semantics=" << boundary_semantics
               << " trace_restriction=" << trace_restriction
               << " orders=" << orders << " periodic=" << periodic
+              << " prepared_lifecycle=" << prepared_lifecycle
               << " dynamic_tau=" << dynamic_tau
               << " boundary_picard=" << boundary_picard
               << " zero_owned=" << zero_owned
+              << " passive_world=" << passive_world
               << " subcommunicator=" << subcommunicator
               << " mismatch=" << mismatch
               << " callback_failure=" << callback_failure << '\n';

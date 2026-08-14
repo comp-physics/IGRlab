@@ -1782,6 +1782,8 @@ struct detail::CpuNumericsCore::Implementation
   std::uint64_t active_candidate_generation = 0;
   StateHash active_candidate_state_hash{};
   bool publication_chain_authority = false;
+  bool borrowed_prepare_active = false;
+  double borrowed_prepared_previous_dt = 0.0;
 
   bool CollectiveAll(const bool local) const noexcept
   {
@@ -4539,7 +4541,30 @@ bool detail::CpuNumericsCore::AdmitInitialization(
 
 bool detail::CpuNumericsCore::CollectiveAll(const bool local) const noexcept
 {
-  return AllRanks(local);
+  return implementation_ && implementation_->CollectiveAll(local);
+}
+
+bool detail::CpuNumericsCore::AdmitBorrowedEulerOperation(
+    const CpuBorrowedEulerOperation operation) const noexcept
+{
+  const Implementation& state = *implementation_;
+  const int local_operation = static_cast<int>(operation);
+  int minimum_operation = 0;
+  int maximum_operation = 0;
+  const int minimum_status = MPI_Allreduce(
+      &local_operation, &minimum_operation, 1, MPI_INT, MPI_MIN,
+      state.communicator);
+  const int maximum_status = MPI_Allreduce(
+      &local_operation, &maximum_operation, 1, MPI_INT, MPI_MAX,
+      state.communicator);
+  const bool known = local_operation >=
+          static_cast<int>(CpuBorrowedEulerOperation::prepare) &&
+      local_operation <= static_cast<int>(
+          CpuBorrowedEulerOperation::export_prepared_grid_function);
+  return state.CollectiveAll(
+      state.initialized && state.IsBorrowed() &&
+      minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS && known &&
+      minimum_operation == maximum_operation);
 }
 
 bool detail::CpuNumericsCore::ConsumeCollectiveTestFault(
@@ -4606,8 +4631,23 @@ bool detail::CpuNumericsCore::InitializeBorrowedEuler(
 bool detail::CpuNumericsCore::AdvanceBorrowedEuler(
     const double dt, StateCoordinates& coordinates) noexcept
 {
+  std::uint64_t generation = 0;
+  if (!PrepareBorrowedEuler(dt, coordinates, generation))
+  {
+    return false;
+  }
+  double maximum_wave_speed = 0.0;
+  return CommitBorrowedEuler(generation, coordinates, maximum_wave_speed);
+}
+
+bool detail::CpuNumericsCore::PrepareBorrowedEuler(
+    const double dt, StateCoordinates& coordinates, std::uint64_t& generation) noexcept
+{
+  generation = 0;
   Implementation& state = *implementation_;
   const bool local_coordinates_valid = state.initialized && state.IsBorrowed() &&
+      !state.borrowed_prepare_active &&
+      state.active_candidate_generation == 0 &&
       Finite(dt) && dt > 0.0 && Finite(coordinates.time) &&
       coordinates.step != std::numeric_limits<std::uint64_t>::max() &&
       coordinates.generation != std::numeric_limits<std::uint64_t>::max() &&
@@ -4619,20 +4659,18 @@ bool detail::CpuNumericsCore::AdvanceBorrowedEuler(
   std::memcpy(&local_dt_bits, &dt, sizeof(local_dt_bits));
   unsigned long long minimum_dt_bits = 0;
   unsigned long long maximum_dt_bits = 0;
-  const bool consensus =
-      MPI_Allreduce(&local_dt_bits, &minimum_dt_bits, 1,
-                    MPI_UNSIGNED_LONG_LONG, MPI_MIN,
-                    state.communicator) == MPI_SUCCESS &&
-      MPI_Allreduce(&local_dt_bits, &maximum_dt_bits, 1,
-                    MPI_UNSIGNED_LONG_LONG, MPI_MAX,
-                    state.communicator) == MPI_SUCCESS &&
-      minimum_dt_bits == maximum_dt_bits;
+  const int minimum_status = MPI_Allreduce(
+      &local_dt_bits, &minimum_dt_bits, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN,
+      state.communicator);
+  const int maximum_status = MPI_Allreduce(
+      &local_dt_bits, &maximum_dt_bits, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX,
+      state.communicator);
+  const bool consensus = minimum_status == MPI_SUCCESS &&
+      maximum_status == MPI_SUCCESS && minimum_dt_bits == maximum_dt_bits;
   if (!state.CollectiveAll(consensus)) { return false; }
 
-  // Publish exchanges complete backing stores.  Consequently the retained
-  // candidate holds the preceding committed bytes after a successful step;
-  // refresh it collectively before every borrowed attempt so Execute starts
-  // from a valid committed/candidate pair on every step.
+  // The candidate slot must begin as a committed copy.  Execute then writes
+  // only that candidate; publication is deferred to CommitBorrowedEuler.
   const bool candidate_refreshed =
       CopySlot(state.committed_slot, state.candidate_slot);
   if (!state.CollectiveAll(candidate_refreshed))
@@ -4660,12 +4698,118 @@ bool detail::CpuNumericsCore::AdvanceBorrowedEuler(
     (void)state.CollectiveAll(reset);
     return false;
   }
+  state.borrowed_prepare_active = true;
+  state.borrowed_prepared_previous_dt = previous_dt;
+  generation = state.active_candidate_generation;
+  std::uint64_t minimum_generation = 0;
+  std::uint64_t maximum_generation = 0;
+  const int generation_minimum_status = MPI_Allreduce(
+      &generation, &minimum_generation, 1, MPI_UINT64_T, MPI_MIN,
+      state.communicator);
+  const int generation_maximum_status = MPI_Allreduce(
+      &generation, &maximum_generation, 1, MPI_UINT64_T, MPI_MAX,
+      state.communicator);
+  if (!state.CollectiveAll(
+          generation_minimum_status == MPI_SUCCESS &&
+          generation_maximum_status == MPI_SUCCESS && generation != 0 &&
+          minimum_generation == maximum_generation))
+  {
+    state.config.dt = previous_dt;
+    const bool reset = CopySlot(state.committed_slot, state.candidate_slot);
+    InvalidateCandidateGeneration();
+    state.borrowed_prepare_active = false;
+    (void)state.CollectiveAll(reset);
+    generation = 0;
+    return false;
+  }
+  return true;
+}
+
+bool detail::CpuNumericsCore::CommitBorrowedEuler(
+    const std::uint64_t generation, StateCoordinates& coordinates,
+    double& maximum_wave_speed) noexcept
+{
+  maximum_wave_speed = 0.0;
+  Implementation& state = *implementation_;
+  std::uint64_t minimum_generation = 0;
+  std::uint64_t maximum_generation = 0;
+  const int minimum_status = MPI_Allreduce(
+      &generation, &minimum_generation, 1, MPI_UINT64_T, MPI_MIN,
+      state.communicator);
+  const int maximum_status = MPI_Allreduce(
+      &generation, &maximum_generation, 1, MPI_UINT64_T, MPI_MAX,
+      state.communicator);
+  const bool generation_consensus = minimum_status == MPI_SUCCESS &&
+      maximum_status == MPI_SUCCESS && minimum_generation == maximum_generation;
+  const bool local_valid = state.initialized && state.IsBorrowed() &&
+      state.borrowed_prepare_active && CandidateGenerationActive(generation) &&
+      ::dg::hdg::runtime::detail::SameCoordinates(
+          coordinates, state.active_evidence.attempt.entry_coordinates) &&
+      CpuStateStoragePolicy::CanPublish(state.committed_slot,
+                                        state.candidate_slot) &&
+      Finite(state.active_evidence.attempt.maximum_wave_speed) &&
+      state.active_evidence.attempt.maximum_wave_speed >= 0.0;
+  if (!state.CollectiveAll(generation_consensus && local_valid))
+  {
+    return false;
+  }
+
+  const AttemptIdentity attempt = state.active_evidence.attempt.identity;
+  const StateHash candidate_hash = state.active_candidate_state_hash;
+  if (!state.CollectiveAll(
+          CanAuthorizePublicationChain(attempt, generation, candidate_hash)))
+  {
+    return false;
+  }
+  // CanAuthorizePublicationChain performed the final collective preflight.
+  // No fallible operation occurs between consuming this authority and publish.
+  if (!AuthorizePublicationChain(attempt, generation, candidate_hash))
+  {
+    return false;
+  }
   CpuStateStoragePolicy::Publish(state.committed_slot, state.candidate_slot);
-  coordinates.time += dt;
+  coordinates.time += attempt.dt;
   ++coordinates.step;
   ++coordinates.generation;
   coordinates.cursor = attempt.sequence;
-  coordinates.dt = dt;
+  coordinates.dt = attempt.dt;
+  maximum_wave_speed = state.active_evidence.attempt.maximum_wave_speed;
+  state.borrowed_prepare_active = false;
+  InvalidateCandidateGeneration();
+  Complete({RunStatus::committed, FailureReason::none, true, false},
+           coordinates, {});
+  return true;
+}
+
+bool detail::CpuNumericsCore::AbortBorrowedEuler(
+    const std::uint64_t generation, const StateCoordinates& coordinates) noexcept
+{
+  Implementation& state = *implementation_;
+  std::uint64_t minimum_generation = 0;
+  std::uint64_t maximum_generation = 0;
+  const int minimum_status = MPI_Allreduce(
+      &generation, &minimum_generation, 1, MPI_UINT64_T, MPI_MIN,
+      state.communicator);
+  const int maximum_status = MPI_Allreduce(
+      &generation, &maximum_generation, 1, MPI_UINT64_T, MPI_MAX,
+      state.communicator);
+  const bool generation_consensus = minimum_status == MPI_SUCCESS &&
+      maximum_status == MPI_SUCCESS && minimum_generation == maximum_generation;
+  const bool local_valid = state.initialized && state.IsBorrowed() &&
+      state.borrowed_prepare_active && CandidateGenerationActive(generation) &&
+      ::dg::hdg::runtime::detail::SameCoordinates(
+          coordinates, state.active_evidence.attempt.entry_coordinates);
+  if (!state.CollectiveAll(generation_consensus && local_valid))
+  {
+    return false;
+  }
+  const bool restored = CopySlot(state.committed_slot, state.candidate_slot);
+  if (!state.CollectiveAll(restored)) { return false; }
+  state.config.dt = state.borrowed_prepared_previous_dt;
+  state.borrowed_prepare_active = false;
+  InvalidateCandidateGeneration();
+  Complete({RunStatus::terminal_failure, FailureReason::backend_failure,
+            false, false}, coordinates, {});
   return true;
 }
 
@@ -5699,10 +5843,13 @@ void detail::CpuNumericsCore::Complete(
     state.evidence.accepted.interior_hash =
         attempt.committed_interior_after;
     state.evidence.accepted.trace_hash = attempt.committed_trace_after;
-    state.evidence.accepted.rank_common_interior_hash =
-        CpuStateStoragePolicy::HashInterior(state.committed_slot.interior);
-    state.evidence.accepted.rank_common_trace_hash =
-        CpuStateStoragePolicy::HashTrace(state.committed_slot.trace);
+    if (!state.IsBorrowed())
+    {
+      state.evidence.accepted.rank_common_interior_hash =
+          CpuStateStoragePolicy::HashInterior(state.committed_slot.interior);
+      state.evidence.accepted.rank_common_trace_hash =
+          CpuStateStoragePolicy::HashTrace(state.committed_slot.trace);
+    }
     state.evidence.accepted.attempt = attempt;
     ++state.evidence.accepted_step_count;
     ++state.evidence.commits;
@@ -5845,6 +5992,21 @@ bool detail::CpuNumericsCore::AuthorizePublicationChain(
     const StateHash& candidate_state_hash) noexcept
 {
   Implementation& state = *implementation_;
+  if (!CanAuthorizePublicationChain(
+          attempt, candidate_generation, candidate_state_hash))
+  {
+    return false;
+  }
+  state.publication_chain_authority = false;
+  return true;
+}
+
+bool detail::CpuNumericsCore::CanAuthorizePublicationChain(
+    const AttemptIdentity& attempt,
+    const std::uint64_t candidate_generation,
+    const StateHash& candidate_state_hash) const noexcept
+{
+  const Implementation& state = *implementation_;
   if (!state.publication_chain_authority ||
       state.active_candidate_generation != candidate_generation ||
       state.active_candidate_state_hash != candidate_state_hash ||
@@ -5855,14 +6017,9 @@ bool detail::CpuNumericsCore::AuthorizePublicationChain(
     return false;
   }
   const CpuNewtonWorkspace& retained = state.active_evidence.current_newton;
-  if (!retained.ordered || !retained.affine_consumption_verified ||
-      retained.candidate_generation != candidate_generation ||
-      retained.candidate_state_hash != candidate_state_hash)
-  {
-    return false;
-  }
-  state.publication_chain_authority = false;
-  return true;
+  return retained.ordered && retained.affine_consumption_verified &&
+      retained.candidate_generation == candidate_generation &&
+      retained.candidate_state_hash == candidate_state_hash;
 }
 
 bool detail::CpuNumericsCore::CandidateGenerationActive(
@@ -5949,6 +6106,74 @@ bool detail::CpuNumericsCore::ExportCommittedInterior(
   {
     std::memcpy(values, committed->interior.data(),
                 committed->interior.size() * sizeof(double));
+  }
+  return true;
+}
+
+bool detail::CpuNumericsCore::ExportPreparedInterior(
+    const std::uint64_t generation, double* const destination,
+    const std::size_t size) const noexcept
+{
+  const Implementation& state = *implementation_;
+  std::uint64_t minimum_generation = 0;
+  std::uint64_t maximum_generation = 0;
+  const int minimum_status = MPI_Allreduce(
+      &generation, &minimum_generation, 1, MPI_UINT64_T, MPI_MIN,
+      state.communicator);
+  const int maximum_status = MPI_Allreduce(
+      &generation, &maximum_generation, 1, MPI_UINT64_T, MPI_MAX,
+      state.communicator);
+  const bool generation_consensus = minimum_status == MPI_SUCCESS &&
+      maximum_status == MPI_SUCCESS && minimum_generation == maximum_generation;
+  const CpuSlotStorage* const candidate = state.Candidate();
+  const bool local_valid = state.initialized && state.IsBorrowed() &&
+      state.borrowed_prepare_active && CandidateGenerationActive(generation) &&
+      candidate && size == candidate->interior.size() &&
+      (destination != nullptr || size == 0);
+  if (!state.CollectiveAll(generation_consensus && local_valid))
+  {
+    return false;
+  }
+  if (size != 0)
+  {
+    std::memcpy(destination, candidate->interior.data(),
+                size * sizeof(double));
+  }
+  return true;
+}
+
+bool detail::CpuNumericsCore::ExportPreparedInterior(
+    const std::uint64_t generation, mfem::ParGridFunction& destination) const noexcept
+{
+  const Implementation& state = *implementation_;
+  const mfem::FiniteElementSpace* const space = destination.FESpace();
+  const CpuSlotStorage* const candidate = state.Candidate();
+  std::uint64_t minimum_generation = 0;
+  std::uint64_t maximum_generation = 0;
+  const int minimum_status = MPI_Allreduce(
+      &generation, &minimum_generation, 1, MPI_UINT64_T, MPI_MIN,
+      state.communicator);
+  const int maximum_status = MPI_Allreduce(
+      &generation, &maximum_generation, 1, MPI_UINT64_T, MPI_MAX,
+      state.communicator);
+  const bool generation_consensus = minimum_status == MPI_SUCCESS &&
+      maximum_status == MPI_SUCCESS && minimum_generation == maximum_generation;
+  const bool local_valid = state.initialized && state.IsBorrowed() &&
+      state.borrowed_prepare_active && CandidateGenerationActive(generation) &&
+      space && candidate && space->GetMesh() == state.mesh &&
+      space->GetVDim() == cpu_conserved_components &&
+      space->GetOrdering() == mfem::Ordering::byNODES &&
+      destination.Size() == static_cast<int>(candidate->interior.size());
+  if (!state.CollectiveAll(generation_consensus && local_valid))
+  {
+    return false;
+  }
+  double* const values = destination.HostWrite();
+  if (values == nullptr && destination.Size() != 0) { return false; }
+  if (destination.Size() != 0)
+  {
+    std::memcpy(values, candidate->interior.data(),
+                candidate->interior.size() * sizeof(double));
   }
   return true;
 }

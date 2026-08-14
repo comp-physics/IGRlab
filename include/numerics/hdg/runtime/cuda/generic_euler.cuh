@@ -1,0 +1,656 @@
+#pragma once
+
+/**
+ * @file numerics/hdg/runtime/cuda/generic_euler.cuh
+ * @brief Narrow native-CUDA prepared-transaction facade for the W8A engine.
+ *
+ * This facade accepts an existing @ref CudaConfig with a caller-owned
+ * periodic @ref mfem::ParMesh.  It does not accept generic Euler field views,
+ * alter the manufactured initial/source physics, or invoke semantic boundary
+ * callbacks.  The only export is @ref CudaSerializedCheckpointV1: a
+ * rank-local, component-major candidate payload.  It is not VTK, parallel
+ * I/O, a new durable restart format, or a public evidence history.
+ */
+
+#include "numerics/hdg/generic/session_contract.hpp"
+#include "numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh"
+#include "numerics/hdg/runtime/runtime_selection.hpp"
+
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <type_traits>
+
+namespace dg::hdg::runtime::cuda
+{
+
+class GenericEulerHdgCudaSession;
+
+/**
+ * Move-only authority for one staged native CUDA candidate.  The authority is
+ * session-, epoch-, and export-object-specific.  It has no destructor
+ * rollback: abandoning a live authority intentionally leaves its session
+ * fail-closed instead of attempting a noncollective recovery.
+ */
+class GenericEulerCudaPreparedStep
+{
+public:
+  GenericEulerCudaPreparedStep() noexcept = default;
+  GenericEulerCudaPreparedStep(const GenericEulerCudaPreparedStep&) = delete;
+  GenericEulerCudaPreparedStep& operator=(
+      const GenericEulerCudaPreparedStep&) = delete;
+  GenericEulerCudaPreparedStep(GenericEulerCudaPreparedStep&& other) noexcept
+  {
+    MoveFrom(other);
+  }
+  GenericEulerCudaPreparedStep& operator=(GenericEulerCudaPreparedStep&&) =
+      delete;
+
+private:
+  friend class GenericEulerHdgCudaSession;
+
+  void MoveFrom(GenericEulerCudaPreparedStep& other) noexcept
+  {
+    owner_ = other.owner_;
+    epoch_ = other.epoch_;
+    facade_incarnation_ = other.facade_incarnation_;
+    native_export_ = other.native_export_;
+    valid_ = other.valid_;
+    other.valid_ = false;
+  }
+
+  void Clear() noexcept
+  {
+    owner_ = nullptr;
+    epoch_ = 0;
+    facade_incarnation_ = 0;
+    native_export_ = nullptr;
+    valid_ = false;
+  }
+
+  const GenericEulerHdgCudaSession* owner_ = nullptr;
+  std::uint64_t epoch_ = 0;
+  std::uint64_t facade_incarnation_ = 0;
+  cuda_w8a::CudaSerializedCheckpointV1* native_export_ = nullptr;
+  bool valid_ = false;
+};
+
+/**
+ * Header-only adapter over the existing persistent CUDA engine.  Its complete
+ * lifecycle is PrepareStep -> StagePreparedCheckpoint -> MarkOutputStaged ->
+ * PrepareCommit -> CommitPrepared -> FinalizeCommit.  No second numerical
+ * engine, allocator, kernel, or commit lifecycle is introduced here.  Every
+ * member of MPI_COMM_WORLD must call the same public collective operation in
+ * the same order; the facade converges mismatched operation tags and local
+ * authority failures before entering an engine affine phase.
+ */
+class GenericEulerHdgCudaSession
+{
+public:
+  using result_type = generic::HdgEulerSessionResult;
+  using coordinates_type = generic::HdgEulerSessionCoordinates;
+  using native_export_type = cuda_w8a::CudaSerializedCheckpointV1;
+
+  GenericEulerHdgCudaSession() = default;
+  ~GenericEulerHdgCudaSession() = default;
+  GenericEulerHdgCudaSession(const GenericEulerHdgCudaSession&) = delete;
+  GenericEulerHdgCudaSession& operator=(const GenericEulerHdgCudaSession&) =
+      delete;
+  GenericEulerHdgCudaSession(GenericEulerHdgCudaSession&&) = delete;
+  GenericEulerHdgCudaSession& operator=(GenericEulerHdgCudaSession&&) =
+      delete;
+
+  /** Exactly prepared_commit | prepared_output; no CFL or borrowed-input bit. */
+  static constexpr std::uint32_t capabilities() noexcept
+  {
+    return generic::HdgEulerSessionCapabilityBit(
+               generic::HdgEulerSessionCapability::prepared_commit) |
+        generic::HdgEulerSessionCapabilityBit(
+            generic::HdgEulerSessionCapability::prepared_output);
+  }
+
+  /**
+   * Admit only the already-supported borrowed periodic topology envelope.
+   * Device setup remains in the existing engine; locally-invalid requests are
+   * rejected before an engine is constructed.
+   */
+  result_type Initialize(const cuda_w8a::CudaConfig& config) noexcept
+  {
+    // This is deliberately the first collective for initialization: ranks
+    // that call another facade operation must converge on the operation-tag
+    // rejection before any config or topology collective is entered.
+    const bool one_shot = !initialization_attempted_ &&
+        session_collective_id_ == unassigned_session_collective_id;
+    initialization_attempted_ = true;
+    if (!AdmitOperation(operation_tag::initialize, one_shot))
+    {
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    // Once every rank has agreed on Initialize, this admission is deliberately
+    // evaluated everywhere, then gated again before allocation.
+    const bool admitted = PreDeviceAdmission(config);
+    if (!CollectiveAll(admitted))
+    {
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    // The per-process ordinal is useful only after min/max proves every rank
+    // selected the same next value.  It is a wrapper-owned admission key, not
+    // caller export or token data, and must exist before any engine collective.
+    if (!AssignSessionCollectiveId())
+    {
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    bool allocated = false;
+    try
+    {
+      if (config.expected_rank_count == 1)
+      {
+        rank1_ = std::make_unique<rank1_engine>(config);
+        allocated = rank1_ != nullptr;
+      }
+      else
+      {
+        rank2_ = std::make_unique<rank2_engine>(config);
+        allocated = rank2_ != nullptr;
+      }
+    }
+    catch (...)
+    {
+      allocated = false;
+    }
+    if (!CollectiveAll(allocated))
+    {
+      rank1_.reset();
+      rank2_.reset();
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    // Every rank now owns the selected engine and enters its collective
+    // initialization route together.
+    initialized_ = Dispatch([&](auto& engine)
+    { return engine.Initialize(setup_); });
+    if (!CollectiveAll(initialized_))
+    {
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    coordinates_ = EngineCoordinates();
+    return Result(generic::HdgEulerSessionStatus::initialized);
+  }
+
+  /** Stage the native candidate export; an explicit acknowledgement is next. */
+  result_type Prepare(GenericEulerCudaPreparedStep& authority,
+                      native_export_type& native_export) noexcept
+  {
+    // A destination authority is never an overwrite slot.  In particular, a
+    // live authority from another session remains usable by its owner when
+    // this session rejects the prepare collectively.
+    const bool local_valid = ReadyForPrepare() && !authority.valid_;
+    if (!AdmitOperation(operation_tag::prepare, local_valid))
+      return Result(generic::HdgEulerSessionStatus::rejected);
+
+    cuda_w8a::CudaPrecommitSnapshot snapshot{};
+    cuda_w8a::CudaStepEvidence evidence{};
+    native_export_type staged_export{};
+    const bool prepared_locally = Dispatch([&](auto& engine)
+    { return engine.PrepareStep(retry_ready_, snapshot, evidence); });
+    const bool prepared = CollectiveAll(prepared_locally);
+    if (!prepared)
+    {
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    const bool staged_locally = Dispatch([&](auto& engine)
+    { return engine.StagePreparedCheckpoint(staged_export, evidence); });
+    const bool locally_staged = staged_locally &&
+        snapshot.numerical_candidate_ready &&
+        staged_export.candidate_frozen && staged_export.checkpoint_staged &&
+        !staged_export.output_staged && !staged_export.successful_commit;
+    if (!CollectiveAll(locally_staged))
+    {
+      // StagePreparedCheckpoint can leave a live affine staging token when a
+      // collective staging operation fails.  Consume it through the engine's
+      // existing abort route; never discard it or invent a second rollback.
+      if (prepared)
+      {
+        (void)Dispatch([&](auto& engine)
+        { return engine.AbortPrepared(staged_export, FailureReason::backend_failure,
+                                      evidence); });
+      }
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    native_export = staged_export;
+    authority.Clear();
+    ++epoch_;
+    retry_ready_ = false;
+    prepared_active_ = true;
+    output_acknowledged_ = false;
+    active_native_export_ = &native_export;
+    active_facade_incarnation_ = native_export.facade_incarnation;
+    authority.owner_ = this;
+    authority.epoch_ = epoch_;
+    authority.facade_incarnation_ = active_facade_incarnation_;
+    authority.native_export_ = &native_export;
+    authority.valid_ = true;
+    return Result(generic::HdgEulerSessionStatus::prepared);
+  }
+
+  /** The caller attests that the staged native export is ready for publication. */
+  bool AcknowledgePreparedOutput(
+      const GenericEulerCudaPreparedStep& authority,
+      native_export_type& native_export) noexcept
+  {
+    const bool local_valid = Matches(authority, native_export) &&
+        !output_acknowledged_;
+    if (!AdmitOperation(operation_tag::acknowledge_output, local_valid))
+      return false;
+    const bool marked_locally = Dispatch([&](auto& engine)
+    { return engine.MarkOutputStaged(native_export); });
+    output_acknowledged_ = CollectiveAll(marked_locally);
+    return output_acknowledged_;
+  }
+
+  /** Consume the authority and publish exactly once through the existing engine. */
+  result_type Commit(GenericEulerCudaPreparedStep&& authority,
+                     native_export_type& native_export) noexcept
+  {
+    const bool local_valid = Matches(authority, native_export) &&
+        output_acknowledged_;
+    if (!AdmitOperation(operation_tag::commit, local_valid))
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    cuda_w8a::CudaStepEvidence evidence{};
+    const bool prepared = Dispatch([&](auto& engine)
+    { return engine.PrepareCommit(native_export, evidence); });
+    const bool prepared_live = prepared && EngineHasStatus(RunStatus::attempt_active);
+    if (!CollectiveAll(prepared_live))
+    {
+      ConsumeAuthority(authority);
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    const bool provisional = Dispatch([&](auto& engine)
+    { return engine.CommitPrepared(native_export, evidence); });
+    const bool provisional_live = provisional &&
+        EngineHasStatus(RunStatus::attempt_active);
+    if (!CollectiveAll(provisional_live))
+    {
+      // CommitPrepared consumes or aborts its matching prepared token on every
+      // documented failure path; no prepared authority remains to abort.
+      ConsumeAuthority(authority);
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    const bool committed = Dispatch([&](auto& engine)
+    { return engine.FinalizeCommit(native_export, evidence); });
+    const bool finalized = committed && native_export.successful_commit &&
+        EngineHasStatus(RunStatus::committed);
+    ConsumeAuthority(authority);
+    if (!CollectiveAll(finalized))
+    {
+      // FinalizeCommit either commits or invokes its existing RevertCommit
+      // route for a reversible provisional publication; it leaves no facade
+      // authority to replay.
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    coordinates_ = EngineCoordinates();
+    return Result(generic::HdgEulerSessionStatus::committed);
+  }
+
+  /** Consume the authority through the existing prepared-abort path. */
+  result_type Abort(GenericEulerCudaPreparedStep&& authority,
+                    native_export_type& native_export) noexcept
+  {
+    if (!AdmitOperation(operation_tag::abort, Matches(authority, native_export)))
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    cuda_w8a::CudaStepEvidence evidence{};
+    const bool aborted = Dispatch([&](auto& engine)
+    { return engine.AbortPrepared(native_export, FailureReason::backend_failure,
+                                  evidence); });
+    const bool rollback_retry = aborted && evidence.retry_available &&
+        evidence.coordinates_preserved && evidence.committed_bytes_preserved &&
+        !native_export.candidate_frozen && !native_export.checkpoint_staged &&
+        !native_export.output_staged && !native_export.successful_commit;
+    ConsumeAuthority(authority);
+    if (!CollectiveAll(rollback_retry))
+    {
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    retry_ready_ = true;
+    coordinates_ = EngineCoordinates();
+    return Result(generic::HdgEulerSessionStatus::aborted);
+  }
+
+  coordinates_type coordinates() const noexcept { return coordinates_; }
+
+private:
+  enum class operation_tag : int
+  {
+    initialize = 1,
+    prepare = 2,
+    acknowledge_output = 3,
+    commit = 4,
+    abort = 5
+  };
+
+  using rank1_engine = cuda_w8a::PersistentCudaSmoothEulerEngine<
+      CudaRank1OneGpuRuntimeSelection>;
+  using rank2_engine = cuda_w8a::PersistentCudaSmoothEulerEngine<
+      CudaRank2OneGpuHostStagedRuntimeSelection>;
+
+  static coordinates_type ToCoordinates(
+      const StateCoordinates& value) noexcept
+  {
+    return {value.time, value.dt, value.step, value.generation};
+  }
+
+  result_type Result(const generic::HdgEulerSessionStatus status) const noexcept
+  { return {status, coordinates_}; }
+
+  static constexpr std::uint64_t unassigned_session_collective_id = 0;
+
+  bool ReadyForPrepare() const noexcept
+  {
+    return initialized_ && !failed_ && !prepared_active_ &&
+        active_native_export_ == nullptr && active_facade_incarnation_ == 0;
+  }
+
+  bool Matches(const GenericEulerCudaPreparedStep& authority,
+               const native_export_type& native_export) const noexcept
+  {
+    return initialized_ && !failed_ && prepared_active_ && authority.valid_ &&
+        authority.owner_ == this && authority.epoch_ == epoch_ &&
+        authority.native_export_ == active_native_export_ &&
+        active_native_export_ == &native_export &&
+        authority.facade_incarnation_ != 0 &&
+        active_facade_incarnation_ != 0 &&
+        authority.facade_incarnation_ == active_facade_incarnation_ &&
+        native_export.facade_incarnation == active_facade_incarnation_;
+  }
+
+  bool AssignSessionCollectiveId() noexcept
+  {
+    const bool local_available = session_collective_id_ ==
+            unassigned_session_collective_id &&
+        next_session_collective_id_ != std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t local_candidate = local_available
+        ? next_session_collective_id_ + 1 : unassigned_session_collective_id;
+    std::uint64_t minimum = local_candidate;
+    std::uint64_t maximum = local_candidate;
+    const bool minimum_ready = MPI_Allreduce(
+        &local_candidate, &minimum, 1, MPI_UINT64_T, MPI_MIN,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        &local_candidate, &maximum, 1, MPI_UINT64_T, MPI_MAX,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    if (!minimum_ready || !maximum_ready || local_candidate ==
+            unassigned_session_collective_id ||
+        minimum != maximum || minimum != local_candidate)
+      return false;
+    next_session_collective_id_ = local_candidate;
+    session_collective_id_ = local_candidate;
+    return true;
+  }
+
+  bool AdmitOperation(const operation_tag tag, const bool local_valid) const
+      noexcept
+  {
+    int mpi_initialized = 0;
+    int mpi_finalized = 0;
+    if (MPI_Initialized(&mpi_initialized) != MPI_SUCCESS || !mpi_initialized ||
+        MPI_Finalized(&mpi_finalized) != MPI_SUCCESS || mpi_finalized)
+      return false;
+    const std::uint64_t local[3] = {
+        session_collective_id_, static_cast<std::uint64_t>(tag),
+        local_valid ? 1U : 0U};
+    std::uint64_t minimum[3] = {local[0], local[1], local[2]};
+    std::uint64_t maximum[3] = {local[0], local[1], local[2]};
+    const bool minimum_ready = MPI_Allreduce(
+        local, minimum, 3, MPI_UINT64_T, MPI_MIN,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        local, maximum, 3, MPI_UINT64_T, MPI_MAX,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool unassigned_initialize =
+        tag == operation_tag::initialize &&
+        minimum[0] == unassigned_session_collective_id &&
+        maximum[0] == unassigned_session_collective_id;
+    const bool assigned_operation = tag != operation_tag::initialize &&
+        minimum[0] == maximum[0] &&
+        minimum[0] != unassigned_session_collective_id;
+    return minimum_ready && maximum_ready &&
+        (unassigned_initialize || assigned_operation) &&
+        minimum[1] == maximum[1] &&
+        minimum[1] == static_cast<std::uint64_t>(tag) &&
+        minimum[2] == maximum[2] && minimum[2] == 1;
+  }
+
+  static bool CollectiveAll(const bool local) noexcept
+  {
+    const int input = local ? 1 : 0;
+    int output = 0;
+    return MPI_Allreduce(&input, &output, 1, MPI_INT, MPI_MIN,
+                         MPI_COMM_WORLD) == MPI_SUCCESS && output == 1;
+  }
+
+  bool EngineHasStatus(const RunStatus expected) const noexcept
+  {
+    return (rank1_ && rank1_->contract() &&
+            rank1_->contract()->status() == expected) ||
+        (rank2_ && rank2_->contract() &&
+         rank2_->contract()->status() == expected);
+  }
+
+  void ConsumeAuthority(GenericEulerCudaPreparedStep& authority) noexcept
+  {
+    authority.Clear();
+    prepared_active_ = false;
+    output_acknowledged_ = false;
+    active_native_export_ = nullptr;
+    active_facade_incarnation_ = 0;
+  }
+
+  using config_descriptor = std::array<unsigned char, 256>;
+
+  template <typename Value>
+  static void AppendConfigValue(config_descriptor& descriptor,
+                                std::size_t& cursor, bool& complete,
+                                const Value& value) noexcept
+  {
+    static_assert(std::is_trivially_copyable<Value>::value,
+                  "CUDA admission descriptor values must be stable");
+    if (!complete || sizeof(Value) > descriptor.size() - cursor)
+    {
+      complete = false;
+      return;
+    }
+    std::memcpy(descriptor.data() + cursor, &value, sizeof(Value));
+    cursor += sizeof(Value);
+  }
+
+  static bool ConfigConsensus(const cuda_w8a::CudaConfig& config) noexcept
+  {
+    config_descriptor local{};
+    std::size_t cursor = 0;
+    bool complete = true;
+    const std::uint64_t experiment_size = config.experiment.size();
+    const std::uint8_t experiment_valid = config.experiment.valid() ? 1U : 0U;
+    const auto append_bool = [&](const bool value)
+    {
+      const std::uint8_t bit = value ? 1U : 0U;
+      AppendConfigValue(local, cursor, complete, bit);
+    };
+    AppendConfigValue(local, cursor, complete, experiment_size);
+    AppendConfigValue(local, cursor, complete, experiment_valid);
+    if (complete && experiment_size <= local.size() - cursor)
+    {
+      std::memcpy(local.data() + cursor, config.experiment.data(),
+                  static_cast<std::size_t>(experiment_size));
+      cursor += static_cast<std::size_t>(experiment_size);
+    }
+    else
+    {
+      complete = false;
+    }
+    AppendConfigValue(local, cursor, complete, config.order);
+    AppendConfigValue(local, cursor, complete, config.mesh_n);
+    AppendConfigValue(local, cursor, complete, config.dt);
+    AppendConfigValue(local, cursor, complete, config.requested_device);
+    AppendConfigValue(local, cursor, complete, config.expected_rank_count);
+    append_bool(config.require_host_staged_rank2);
+    append_bool(config.use_borrowed_topology);
+    append_bool(config.capture_oracle);
+    append_bool(config.force_private_scientific_gate_failure);
+    AppendConfigValue(local, cursor, complete, config.injection.phase);
+    AppendConfigValue(local, cursor, complete, config.injection.target_step);
+    AppendConfigValue(local, cursor, complete, config.injection.source_rank);
+    append_bool(config.injection.enabled);
+    AppendConfigValue(local, cursor, complete, config.injection.token_fault);
+
+    config_descriptor minimum = local;
+    config_descriptor maximum = local;
+    const int complete_bit = complete ? 1 : 0;
+    int all_complete = 0;
+    const bool complete_census = MPI_Allreduce(
+        &complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool minimum_census = MPI_Allreduce(
+        local.data(), minimum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool maximum_census = MPI_Allreduce(
+        local.data(), maximum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+    return complete_census && minimum_census && maximum_census &&
+        all_complete == 1 && minimum == maximum;
+  }
+
+  bool PreDeviceAdmission(const cuda_w8a::CudaConfig& config) const noexcept
+  {
+    int mpi_initialized = 0;
+    int mpi_finalized = 0;
+    if (MPI_Initialized(&mpi_initialized) != MPI_SUCCESS || !mpi_initialized ||
+        MPI_Finalized(&mpi_finalized) != MPI_SUCCESS || mpi_finalized)
+      return false;
+    const bool config_consensus = ConfigConsensus(config);
+    int ranks = 0;
+    int borrowed_world = MPI_UNEQUAL;
+    int borrowed_mesh = MPI_UNEQUAL;
+    bool local = config.use_borrowed_topology && config.borrowed_mesh != nullptr &&
+        config.borrowed_communicator != MPI_COMM_NULL &&
+        MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS &&
+        (ranks == 1 || ranks == 2) && ranks == config.expected_rank_count &&
+        config.requested_device == 0 &&
+        (ranks == 1 || config.require_host_staged_rank2) &&
+        config.experiment == StableIdentity::Copy(cuda_w8a::experiment_id) &&
+        !config.capture_oracle && !config.force_private_scientific_gate_failure &&
+        !config.injection.enabled &&
+        config.injection.phase ==
+            cuda_w8a::CudaFailurePhase::after_recovery_before_commit &&
+        config.injection.target_step == 2 && config.injection.source_rank == 0 &&
+        config.injection.token_fault == cuda_w8a::CudaTokenFault::none &&
+        std::isfinite(config.dt) &&
+        std::memcmp(&config.dt, &cuda_w8a::fixed_dt, sizeof(double)) == 0 &&
+        ((config.order == cuda_w8a::smoke_polynomial_order &&
+          config.mesh_n == cuda_w8a::smoke_elements_per_direction) ||
+         (config.order == cuda_w8a::functional_polynomial_order &&
+          config.mesh_n == cuda_w8a::functional_elements_per_direction));
+    long long local_elements = 0;
+    long long local_face_measure = 0;
+    long long global_elements = 0;
+    long long global_face_measure = 0;
+    if (local)
+    {
+      const MPI_Comm mesh_communicator = config.borrowed_mesh->GetComm();
+      local = MPI_Comm_compare(config.borrowed_communicator, MPI_COMM_WORLD,
+                               &borrowed_world) == MPI_SUCCESS &&
+          (borrowed_world == MPI_IDENT || borrowed_world == MPI_CONGRUENT) &&
+          MPI_Comm_compare(config.borrowed_communicator, mesh_communicator,
+                           &borrowed_mesh) == MPI_SUCCESS &&
+          (borrowed_mesh == MPI_IDENT || borrowed_mesh == MPI_CONGRUENT) &&
+          !config.borrowed_mesh->Nonconforming() &&
+          config.borrowed_mesh->Dimension() == cuda_w8a::dimension &&
+          config.borrowed_mesh->SpaceDimension() == cuda_w8a::dimension &&
+          config.borrowed_mesh->GetNE() > 0 &&
+          config.borrowed_mesh->GetNE() <= cuda_w8a::maximum_rank_elements;
+      local_elements = config.borrowed_mesh->GetNE();
+      for (int element = 0; local && element < config.borrowed_mesh->GetNE();
+           ++element)
+        local = config.borrowed_mesh->GetElementBaseGeometry(element) ==
+            mfem::Geometry::SQUARE;
+      if (local)
+      {
+        const long long local_faces =
+            static_cast<long long>(config.borrowed_mesh->GetNumFaces());
+        const long long local_shared_faces =
+            static_cast<long long>(config.borrowed_mesh->GetNSharedFaces());
+        local = local_faces >= 0 && local_shared_faces >= 0 &&
+            local_shared_faces <= local_faces &&
+            local_faces <= std::numeric_limits<long long>::max() / 2;
+        if (local)
+          local_face_measure = 2 * local_faces - local_shared_faces;
+      }
+    }
+    const int local_bit = local ? 1 : 0;
+    int all_local = 0;
+    const bool local_census = MPI_Allreduce(&local_bit, &all_local, 1,
+                                             MPI_INT, MPI_MIN,
+                                             MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool element_census = MPI_Allreduce(
+        &local_elements, &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM,
+        MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool face_census = MPI_Allreduce(
+        &local_face_measure, &global_face_measure, 1, MPI_LONG_LONG_INT,
+        MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+    const long long expected_elements =
+        static_cast<long long>(config.mesh_n) * config.mesh_n;
+    const bool expected_measure_safe = expected_elements >= 0 &&
+        expected_elements <= std::numeric_limits<long long>::max() / 4;
+    const long long expected_face_measure = expected_measure_safe
+        ? 4 * expected_elements : 0;
+    return config_consensus && local_census && element_census && face_census &&
+        expected_measure_safe && all_local == 1 &&
+        global_elements == expected_elements &&
+        global_face_measure == expected_face_measure;
+  }
+
+  template <typename Callback>
+  bool Dispatch(Callback&& callback) noexcept
+  {
+    if (rank1_) return callback(*rank1_);
+    if (rank2_) return callback(*rank2_);
+    return false;
+  }
+
+  coordinates_type EngineCoordinates() const noexcept
+  {
+    if (rank1_ && rank1_->contract()) return ToCoordinates(rank1_->contract()->coordinates());
+    if (rank2_ && rank2_->contract()) return ToCoordinates(rank2_->contract()->coordinates());
+    return coordinates_;
+  }
+
+  std::unique_ptr<rank1_engine> rank1_;
+  std::unique_ptr<rank2_engine> rank2_;
+  cuda_w8a::CudaRunEvidence setup_{};
+  coordinates_type coordinates_{};
+  std::uint64_t epoch_ = 0;
+  bool initialization_attempted_ = false;
+  bool initialized_ = false;
+  bool prepared_active_ = false;
+  bool output_acknowledged_ = false;
+  bool failed_ = false;
+  bool retry_ready_ = false;
+  std::uint64_t session_collective_id_ = unassigned_session_collective_id;
+  native_export_type* active_native_export_ = nullptr;
+  std::uint64_t active_facade_incarnation_ = 0;
+  inline static std::uint64_t next_session_collective_id_ =
+      unassigned_session_collective_id;
+};
+
+}  // namespace dg::hdg::runtime::cuda
