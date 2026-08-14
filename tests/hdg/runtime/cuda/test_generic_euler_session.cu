@@ -556,60 +556,70 @@ bool CheckLegacyFacadeAdmission(const int ranks)
 
 bool CheckBorrowedDataBridge(const int ranks, const int order, const int n)
 {
-  mfem::Mesh serial = PeriodicSquareMesh(n);
-  mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
-  HostFields zero = NonuniformHostFields(mesh, order, false);
-  const std::vector<double> initial_before = zero.initial;
-  GenericEulerHdgCudaSession session;
-  const auto initialized = session.Initialize(
-      BorrowedDataConfig(mesh, ranks, order, n, zero));
-  // Initialize has copied input/source bytes.  The caller may immediately
-  // overwrite and release both buffers without changing the engine state.
-  std::fill(zero.initial.begin(), zero.initial.end(), -3.0);
-  zero.initial.clear();
-  zero.initial.shrink_to_fit();
-  std::vector<double> committed(initial_before.size(), -7.0);
-  const bool committed_export = session.ExportCommittedInterior(
-      {committed.data(), zero.scalar_count, conserved_components});
-  std::vector<double> invalid_destination(initial_before.size(), -13.0);
-  const bool invalid_export = session.ExportCommittedInterior(
-      {invalid_destination.data(), zero.scalar_count - 1,
-       conserved_components});
-  int rank = 0;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  std::vector<double> divergent_destination(initial_before.size(), -15.0);
-  const bool divergent_export = ranks != 2 || session.ExportCommittedInterior(
-      {divergent_destination.data(), rank == 0 ? zero.scalar_count :
-       zero.scalar_count - 1, conserved_components});
-  if (!All(initialized.status == HdgEulerSessionStatus::initialized &&
-           committed_export && SameValues(committed, initial_before) &&
-           !invalid_export &&
-           std::all_of(invalid_destination.begin(), invalid_destination.end(),
-                       [](const double value) { return value == -13.0; }) &&
-           (ranks != 2 || (!divergent_export && std::all_of(
-               divergent_destination.begin(), divergent_destination.end(),
-               [](const double value) { return value == -15.0; })))))
-    return false;
+  std::vector<double> candidate;
+  {
+    mfem::Mesh serial = PeriodicSquareMesh(n);
+    mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
+    HostFields zero = NonuniformHostFields(mesh, order, false);
+    const std::vector<double> initial_before = zero.initial;
+    GenericEulerHdgCudaSession session;
+    const auto initialized = session.Initialize(
+        BorrowedDataConfig(mesh, ranks, order, n, zero));
+    // Initialize has copied input/source bytes.  The caller may immediately
+    // overwrite and release both buffers without changing the engine state.
+    std::fill(zero.initial.begin(), zero.initial.end(), -3.0);
+    zero.initial.clear();
+    zero.initial.shrink_to_fit();
+    std::vector<double> committed(initial_before.size(), -7.0);
+    const bool committed_export = session.ExportCommittedInterior(
+        {committed.data(), zero.scalar_count, conserved_components});
+    std::vector<double> invalid_destination(initial_before.size(), -13.0);
+    const bool invalid_export = session.ExportCommittedInterior(
+        {invalid_destination.data(), zero.scalar_count - 1,
+         conserved_components});
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    std::vector<double> divergent_destination(initial_before.size(), -15.0);
+    const bool divergent_export = ranks != 2 ||
+        session.ExportCommittedInterior(
+            {divergent_destination.data(), rank == 0 ? zero.scalar_count :
+             zero.scalar_count - 1, conserved_components});
+    if (!All(initialized.status == HdgEulerSessionStatus::initialized &&
+             committed_export && SameValues(committed, initial_before) &&
+             !invalid_export &&
+             std::all_of(invalid_destination.begin(),
+                         invalid_destination.end(),
+                         [](const double value) { return value == -13.0; }) &&
+             (ranks != 2 || (!divergent_export && std::all_of(
+                 divergent_destination.begin(), divergent_destination.end(),
+                 [](const double value) { return value == -15.0; })))))
+      return false;
 
-  GenericEulerCudaPreparedStep authority{};
-  CudaSerializedCheckpointV1 native_export{};
-  const auto prepared = session.Prepare(authority, native_export);
-  std::vector<double> candidate(initial_before.size(), -9.0);
-  const bool prepared_export = session.ExportPreparedInterior(
-      authority, native_export,
-      {candidate.data(), zero.scalar_count, conserved_components});
-  const bool acknowledged = session.AcknowledgePreparedOutput(authority,
-                                                               native_export);
-  const auto committed_step = session.Commit(std::move(authority), native_export);
-  std::vector<double> committed_after(initial_before.size(), -17.0);
-  const bool committed_after_export = session.ExportCommittedInterior(
-      {committed_after.data(), zero.scalar_count, conserved_components});
-  if (!All(prepared.status == HdgEulerSessionStatus::prepared &&
-           prepared_export && FullyFiniteOverwritten(candidate, -9.0) &&
-           acknowledged &&
-           committed_step.status == HdgEulerSessionStatus::committed &&
-           committed_after_export && SameValues(committed_after, candidate)))
-    return false;
+    GenericEulerCudaPreparedStep authority{};
+    CudaSerializedCheckpointV1 native_export{};
+    const auto prepared = session.Prepare(authority, native_export);
+    candidate.assign(initial_before.size(), -9.0);
+    const bool prepared_export = session.ExportPreparedInterior(
+        authority, native_export,
+        {candidate.data(), zero.scalar_count, conserved_components});
+    const bool acknowledged = session.AcknowledgePreparedOutput(authority,
+                                                                 native_export);
+    const auto committed_step = session.Commit(std::move(authority),
+                                                native_export);
+    std::vector<double> committed_after(initial_before.size(), -17.0);
+    const bool committed_after_export = session.ExportCommittedInterior(
+        {committed_after.data(), zero.scalar_count, conserved_components});
+    if (!All(prepared.status == HdgEulerSessionStatus::prepared &&
+             prepared_export && FullyFiniteOverwritten(candidate, -9.0) &&
+             acknowledged &&
+             committed_step.status == HdgEulerSessionStatus::committed &&
+             committed_after_export && SameValues(committed_after, candidate)))
+      return false;
+  }
+
+  // The persistent CUDA runtime owns process-global allocation and transport
+  // ledgers.  Retain only exported bytes across the source comparison; do not
+  // overlap two live numerical engines.
 
   // A static source has its own persistent source slice: with identical ICs,
   // the prepared physical candidate must not collapse to the zero-source one.
@@ -629,7 +639,7 @@ bool CheckBorrowedDataBridge(const int ranks, const int order, const int n)
   CudaSerializedCheckpointV1 forced_export{};
   const auto forced_prepared = forced_session.Prepare(forced_authority,
                                                        forced_export);
-  std::vector<double> forced_candidate(initial_before.size(), -9.0);
+  std::vector<double> forced_candidate(candidate.size(), -9.0);
   const bool forced_output = forced_session.ExportPreparedInterior(
       forced_authority, forced_export,
       {forced_candidate.data(), forced.scalar_count, conserved_components});
