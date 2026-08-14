@@ -1144,6 +1144,39 @@ __device__ bool Admissible(const double* state)
   return isfinite(speed) && speed < cuda_tau;
 }
 
+__device__ bool PhysicallyAdmissible(const double* state)
+{
+  if (!Finite4(state) || !(state[0] > 0.0)) return false;
+  const double kinetic = 0.5 *
+      (state[1] * state[1] + state[2] * state[2]) / state[0];
+  const double pressure = (cuda_gamma - 1.0) * (state[3] - kinetic);
+  const double sound_squared = cuda_gamma * pressure / state[0];
+  return pressure > 0.0 && sound_squared > 0.0 && isfinite(pressure) &&
+      isfinite(sound_squared) && isfinite(sqrt(sound_squared));
+}
+
+// Borrowed input admission is physical rather than the manufactured W8A
+// speed cap: rho, pressure, and sound speed must be finite and strictly
+// positive.  The local LLF field below is deliberately lagged, so it has no
+// derivative contribution to the Newton blocks.
+__device__ bool LocalLlfSpeed(const double* state, const double nx,
+                              const double ny, double& speed)
+{
+  if (!Finite4(state) || !(state[0] > 0.0) || !isfinite(nx) ||
+      !isfinite(ny) || (nx == 0.0 && ny == 0.0)) return false;
+  const double rho = state[0];
+  const double mx = state[1], my = state[2], energy = state[3];
+  const double pressure = (cuda_gamma - 1.0) *
+      (energy - 0.5 * (mx * mx + my * my) / rho);
+  const double sound_squared = cuda_gamma * pressure / rho;
+  if (!(pressure > 0.0) || !(sound_squared > 0.0) ||
+      !isfinite(pressure) || !isfinite(sound_squared)) return false;
+  const double sound = sqrt(sound_squared);
+  const double normal_velocity = (mx * nx + my * ny) / rho;
+  speed = fabs(normal_velocity) + sound;
+  return isfinite(sound) && isfinite(speed) && speed > 0.0;
+}
+
 __device__ int Decode(const int encoded, double& sign)
 {
   sign = encoded >= 0 ? 1.0 : -1.0;
@@ -1196,7 +1229,8 @@ __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
             view.volume_shape[qp * shape.scalar_interior_dofs + scalar] *
             view.work_interior[ni0 + ByNodes(
                 scalar, shape.scalar_interior_dofs, component)];
-    if (!Admissible(state)) { view.status[element] = -1.0; return; }
+    if (!(shape.borrowed_host_inputs ? PhysicallyAdmissible(state) :
+          Admissible(state))) { view.status[element] = -1.0; return; }
   }
   for (int face = 0; face < faces_per_element; ++face)
     for (int q = 0; q < shape.face_points; ++q)
@@ -1218,8 +1252,59 @@ __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
               view.face_trace_shape[qp * shape.scalar_face_dofs + scalar] *
               view.current_local_trace[nt0 + offset + ByNodes(
                   scalar, shape.scalar_face_dofs, component)];
-      if (!Admissible(interior) || !Admissible(trace))
+      if (!(shape.borrowed_host_inputs ? PhysicallyAdmissible(interior) :
+            Admissible(interior)) ||
+          !(shape.borrowed_host_inputs ? PhysicallyAdmissible(trace) :
+            Admissible(trace)))
       { view.status[element] = -2.0; return; }
+    }
+}
+
+__global__ void SeedBorrowedLaggedLlfTauKernel(CudaDeviceView view,
+                                                CudaMeshShape shape)
+{
+  const int element = blockIdx.x * blockDim.x + threadIdx.x;
+  if (element >= shape.elements) return;
+  view.status[element] = 1.0;
+  const int interior_offset = element * shape.interior_dofs;
+  const int trace_offset = element * shape.trace_dofs;
+  for (int face = 0; face < faces_per_element; ++face)
+    for (int q = 0; q < shape.face_points; ++q)
+    {
+      const int qp = (element * faces_per_element + face) *
+          shape.face_points + q;
+      const int face_offset = face * conserved_components *
+          shape.scalar_face_dofs;
+      double old_interior[conserved_components] = {};
+      double old_trace[conserved_components] = {};
+      for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
+        for (int component = 0; component < conserved_components; ++component)
+          old_interior[component] += view.face_interior_shape[
+              qp * shape.scalar_interior_dofs + scalar] *
+              view.old_interior[interior_offset + ByNodes(
+                  scalar, shape.scalar_interior_dofs, component)];
+      for (int scalar = 0; scalar < shape.scalar_face_dofs; ++scalar)
+        for (int component = 0; component < conserved_components; ++component)
+          old_trace[component] += view.face_trace_shape[
+              qp * shape.scalar_face_dofs + scalar] *
+              view.current_local_trace[trace_offset + face_offset + ByNodes(
+                  scalar, shape.scalar_face_dofs, component)];
+      double interior_speed = 0.0, trace_speed = 0.0;
+      if (!LocalLlfSpeed(old_interior, view.face_normal[qp * dimension],
+                         view.face_normal[qp * dimension + 1], interior_speed) ||
+          !LocalLlfSpeed(old_trace, view.face_normal[qp * dimension],
+                         view.face_normal[qp * dimension + 1], trace_speed))
+      {
+        view.status[element] = -3.0;
+        return;
+      }
+      const double tau = fmax(interior_speed, trace_speed);
+      if (!(tau > 0.0) || !isfinite(tau))
+      {
+        view.status[element] = -3.0;
+        return;
+      }
+      view.borrowed_lagged_llf_tau[qp] = tau;
     }
 }
 
@@ -1336,6 +1421,125 @@ __global__ void AssemblyKernel(CudaDeviceView v, CudaMeshShape s,
   for(int i=0;i<nt;++i) v.g[e_t+i]=-v.residual_g[e_t+i];
 }
 
+// This is intentionally a separate instantiation from AssemblyKernel: the
+// legacy fixed-tau manufactured path above retains its arithmetic verbatim.
+// Here tau is a prepared-attempt-lagged coefficient, not a differentiated
+// state function, so every residual and A/B/C/D contribution reads the same
+// stored per-face quadrature value and adds no d-tau terms.
+__global__ void BorrowedLaggedLlfAssemblyKernel(CudaDeviceView v,
+                                                CudaMeshShape s,
+                                                const double dt)
+{
+  const int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= s.elements) return;
+  const int ni = s.interior_dofs, nt = s.trace_dofs;
+  const int si = s.scalar_interior_dofs, sf = s.scalar_face_dofs;
+  const int e_i = e * ni, e_t = e * nt;
+  const std::size_t ao = static_cast<std::size_t>(e) * ni * ni;
+  const std::size_t bo = static_cast<std::size_t>(e) * ni * nt;
+  const std::size_t co = static_cast<std::size_t>(e) * nt * ni;
+  const std::size_t doff = static_cast<std::size_t>(e) * nt * nt;
+  v.status[e] = 1.0;
+  for (int i = 0; i < ni; ++i) { v.residual_r[e_i+i] = 0; v.f[e_i+i] = 0; }
+  for (int i = 0; i < nt; ++i) { v.residual_g[e_t+i] = 0; v.g[e_t+i] = 0; }
+  for (int i = 0; i < ni * ni; ++i) v.a[ao+i] = 0;
+  for (int i = 0; i < ni * nt; ++i) v.b[bo+i] = 0;
+  for (int i = 0; i < nt * ni; ++i) v.c[co+i] = 0;
+  for (int i = 0; i < nt * nt; ++i) v.d[doff+i] = 0;
+  for (int q = 0; q < s.volume_points; ++q)
+  {
+    const int qp = e * s.volume_points + q;
+    const double w = v.volume_weight[qp];
+    double state[4] = {}, old[4] = {}, source[4] = {}, fx[4], fy[4];
+    double jx[16], jy[16];
+    for (int a = 0; a < si; ++a) for (int k = 0; k < 4; ++k)
+    {
+      const double phi = v.volume_shape[qp * si + a];
+      state[k] += phi * v.work_interior[e_i + ByNodes(a, si, k)];
+      old[k] += phi * v.old_interior[e_i + ByNodes(a, si, k)];
+      if (s.borrowed_static_source)
+        source[k] += phi * v.static_source[e_i + ByNodes(a, si, k)];
+    }
+    if (!(w > 0) || (!s.borrowed_static_source &&
+          !Source(v.volume_position[qp*2], v.volume_position[qp*2+1], source)) ||
+        !FluxJacobian(state, 1, 0, fx, jx) ||
+        !FluxJacobian(state, 0, 1, fy, jy))
+    { v.status[e] = -1; return; }
+    for (int row = 0; row < si; ++row)
+    {
+      const double phi = v.volume_shape[qp * si + row];
+      const double dx = v.volume_derivative[(qp * si + row) * 2];
+      const double dy = v.volume_derivative[(qp * si + row) * 2 + 1];
+      for (int rc = 0; rc < 4; ++rc)
+      {
+        const int lr = ByNodes(row, si, rc);
+        v.residual_r[e_i+lr] += w * (phi * (state[rc]-old[rc]) / dt -
+            dx * fx[rc] - dy * fy[rc] - phi * source[rc]);
+        for (int col = 0; col < si; ++col) for (int cc = 0; cc < 4; ++cc)
+        {
+          const int lc = ByNodes(col, si, cc);
+          const double mass = rc == cc ? phi * v.volume_shape[qp*si+col] / dt : 0;
+          const double flux = -(dx*jx[rc*4+cc] + dy*jy[rc*4+cc]) *
+              v.volume_shape[qp*si+col];
+          v.a[ao+lr*ni+lc] += w * (mass + flux);
+        }
+      }
+    }
+  }
+  for (int face = 0; face < faces_per_element; ++face)
+    for (int q = 0; q < s.face_points; ++q)
+    {
+      const int qp = (e * faces_per_element + face) * s.face_points + q;
+      const int to = face * conserved_components * sf;
+      const double w = v.face_weight[qp];
+      const double tau = v.borrowed_lagged_llf_tau[qp];
+      double u[4] = {}, l[4] = {}, flux[4], jac[16];
+      for (int a = 0; a < si; ++a) for (int k = 0; k < 4; ++k)
+        u[k] += v.face_interior_shape[qp*si+a] *
+            v.work_interior[e_i+ByNodes(a,si,k)];
+      for (int a = 0; a < sf; ++a) for (int k = 0; k < 4; ++k)
+        l[k] += v.face_trace_shape[qp*sf+a] *
+            v.current_local_trace[e_t+to+ByNodes(a,sf,k)];
+      if (!(w > 0) || !(tau > 0) || !isfinite(tau) ||
+          !FluxJacobian(l, v.face_normal[qp*2], v.face_normal[qp*2+1], flux, jac))
+      { v.status[e] = -2; return; }
+      for (int row = 0; row < si; ++row)
+      {
+        const double rp = v.face_interior_shape[qp*si+row];
+        for (int rc = 0; rc < 4; ++rc)
+        {
+          const int lr = ByNodes(row,si,rc);
+          v.residual_r[e_i+lr] += w*rp*(flux[rc]+tau*(u[rc]-l[rc]));
+          for (int col = 0; col < si; ++col)
+            v.a[ao+lr*ni+ByNodes(col,si,rc)] += w*rp*tau*
+                v.face_interior_shape[qp*si+col];
+          for (int col = 0; col < sf; ++col) for (int cc = 0; cc < 4; ++cc)
+            v.b[bo+lr*nt+to+ByNodes(col,sf,cc)] += w*rp*
+                v.face_trace_shape[qp*sf+col] *
+                (jac[rc*4+cc] - (rc == cc ? tau : 0));
+        }
+      }
+      for (int row = 0; row < sf; ++row)
+      {
+        const double rp = v.face_trace_shape[qp*sf+row];
+        for (int rc = 0; rc < 4; ++rc)
+        {
+          const int lr = to + ByNodes(row,sf,rc);
+          v.residual_g[e_t+lr] += w*rp*(flux[rc]+tau*(u[rc]-l[rc]));
+          for (int col = 0; col < si; ++col)
+            v.c[co+lr*ni+ByNodes(col,si,rc)] += w*rp*tau*
+                v.face_interior_shape[qp*si+col];
+          for (int col = 0; col < sf; ++col) for (int cc = 0; cc < 4; ++cc)
+            v.d[doff+lr*nt+to+ByNodes(col,sf,cc)] += w*rp*
+                v.face_trace_shape[qp*sf+col] *
+                (jac[rc*4+cc] - (rc == cc ? tau : 0));
+        }
+      }
+    }
+  for (int i = 0; i < ni; ++i) v.f[e_i+i] = -v.residual_r[e_i+i];
+  for (int i = 0; i < nt; ++i) v.g[e_t+i] = -v.residual_g[e_t+i];
+}
+
 __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;
@@ -1404,8 +1608,11 @@ bool CudaLaunchGatherLocalTrace(const int* map,int count,const double* source,do
 {GatherKernel<<<Blocks(count),128>>>(map,count,source,destination);return LaunchOk();}
 bool CudaLaunchAdmissibility(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
 {AdmissibilityKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
+bool CudaLaunchSeedBorrowedLaggedLlfTau(const CudaDeviceView& v,
+                                        const CudaMeshShape& s) noexcept
+{SeedBorrowedLaggedLlfTauKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
 bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,double dt) noexcept
-{AssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt);return LaunchOk();}
+{if(s.borrowed_host_inputs)BorrowedLaggedLlfAssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt);else AssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt);return LaunchOk();}
 bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
 {CondenseKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
 bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& m,double* rhs,int n) noexcept
