@@ -296,6 +296,42 @@ bool CheckSourceDifferential()
     Same(device_zero.C, device_sourced.C) && Same(device_zero.D, device_sourced.D);
 }
 
+bool CheckLargeFiniteGeometry()
+{
+  // det(J)=1, while the horizontal tangent has norm 1e200. A naive x*x+y*y
+  // norm overflows here even though this affine geometry and its local system
+  // remain finite with the deliberately small positive alpha below.
+  cpu::AffineQuad geometry{{{{0., 0.}, {1.e200, 0.}, {1.e200, 1.e-200}, {0., 1.e-200}}}};
+  const std::array<double, 8> vertices{{0., 0., 1.e200, 0., 1.e200, 1.e-200, 0., 1.e-200}};
+  cpu::Parameters parameters{};
+  parameters.alpha = 1.e-300; parameters.beta = 1.; parameters.dt = .09; parameters.quadrature_order = 12;
+  std::vector<double> interior(28, 0.), previous_interior(28, 0.);
+  std::vector<double> trace(40, 0.), previous_trace(40, 0.);
+  // Zero momentum keeps the quotient-rule velocity-gradient path identically
+  // zero despite the intentionally extreme inverse affine scale.
+  const double state[4] = {1.2, 0., 0., 3.};
+  for (int component = 0; component < 4; ++component)
+  {
+    for (int q = 0; q < 4; ++q)
+      interior[4 * component + q] = previous_interior[4 * component + q] = state[component];
+    for (int q = 0; q < 8; ++q)
+      trace[8 * component + q] = previous_trace[8 * component + q] = state[component];
+  }
+  const cpu::ElementState local_state{interior.data(), previous_interior.data(), trace.data(), previous_trace.data(), {}};
+  cpu::LocalOperator host;
+  if (cpu::Assemble(geometry, parameters, local_state, host) != cpu::Status::success) return false;
+  const Quadrature quadrature = MakeQuadrature(parameters.quadrature_order);
+  const algebra::Parameters raw_parameters{parameters.gamma, parameters.alpha, parameters.beta,
+                                           parameters.dt, parameters.density_floor};
+  DeviceResult device;
+  return DeviceAssemble(vertices, raw_parameters, interior, previous_interior, trace, previous_trace,
+                        quadrature, nullptr, 0, device) && device.status == algebra::Status::success &&
+    Same(host.interior_residual, device.interior_residual) &&
+    Same(host.trace_residual, device.trace_residual) && Same(host.A, device.A) &&
+    Same(host.B, device.B) && Same(host.C, device.C) && Same(host.D, device.D) &&
+    Same(host.f, device.f) && Same(host.g, device.g);
+}
+
 bool CheckStatuses()
 {
   cpu::AffineQuad geometry{{{{.2, -.1}, {2.2, .2}, {2.6, 1.5}, {.6, 1.2}}}};
@@ -352,6 +388,22 @@ bool CheckStatuses()
                                            {nonfinite_rhs.data(), nonfinite_rhs.size() / 4}};
   if (!compare(geometry, parameters, interior, previous_interior, trace, previous_trace, nonfinite_source,
                vertices, raw_parameters, nonfinite_rhs.data(), static_cast<int>(nonfinite_rhs.size() / 4))) return false;
+  // Every input is finite and admissible. The finite sigma/sigmahat jump is
+  // amplified by tau in the face arithmetic and must report nonfinite_result.
+  std::vector<double> overflow_sigma = interior;
+  std::vector<double> overflow_trace = trace;
+  for (int q = 0; q < 4; ++q) overflow_sigma[16 + q] = 5.e307;
+  for (int q = 0; q < 8; ++q) overflow_trace[32 + q] = -5.e307;
+  const cpu::ElementState overflow_state{overflow_sigma.data(), previous_interior.data(), overflow_trace.data(),
+                                         previous_trace.data(), {}};
+  cpu::LocalOperator overflow_host;
+  DeviceResult overflow_device;
+  const cpu::Status overflow_status = cpu::Assemble(geometry, parameters, overflow_state, overflow_host);
+  if (overflow_status != cpu::Status::nonfinite_result ||
+      !DeviceAssemble(vertices, raw_parameters, overflow_sigma, previous_interior, overflow_trace,
+                      previous_trace, quadrature, nullptr, 0, overflow_device) ||
+      overflow_device.status != algebra::Status::nonfinite_result ||
+      !SameStatus(overflow_status, overflow_device.status)) return false;
   std::vector<double> inadmissible = interior; inadmissible[0] = 0.;
   const cpu::ElementState bad_state{inadmissible.data(), previous_interior.data(), trace.data(), previous_trace.data(), {}};
   if (!compare(geometry, parameters, inadmissible, previous_interior, trace, previous_trace, bad_state,
@@ -393,5 +445,5 @@ bool CheckStatuses()
 int main()
 {
   return CheckMassFluxJacobianWitness() && CheckCase(12, true) && CheckCase(14, false) && CheckSourceDifferential() &&
-    CheckStatuses() ? 0 : 1;
+    CheckLargeFiniteGeometry() && CheckStatuses() ? 0 : 1;
 }

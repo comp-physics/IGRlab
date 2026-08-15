@@ -67,6 +67,20 @@ struct Output final
 MFEM_HOST_DEVICE inline bool Finite(const double value) noexcept
 { return ::isfinite(value); }
 
+/** Hypot-equivalent 2-norm without relying on a device hypot overload. */
+MFEM_HOST_DEVICE inline double ScaledNorm2(const double x, const double y) noexcept
+{
+  if (!Finite(x)) return x;
+  if (!Finite(y)) return y;
+  const double ax = ::fabs(x);
+  const double ay = ::fabs(y);
+  const double scale = ax > ay ? ax : ay;
+  if (!(scale > 0.)) return scale;
+  const double sx = x / scale;
+  const double sy = y / scale;
+  return scale * ::sqrt(sx * sx + sy * sy);
+}
+
 MFEM_HOST_DEVICE inline int I(const int component, const int scalar) noexcept
 { return component * volume_scalar_dofs + scalar; }
 
@@ -372,8 +386,7 @@ MFEM_HOST_DEVICE inline Status Assemble(const Input& input, Output& output) noex
             dr[2 * a + 1] * inverse[2 + direction];
       const double physical_tangent[2] = {j[0] * tangent[0] + j[2] * tangent[1],
                                           j[1] * tangent[0] + j[3] * tangent[1]};
-      const double length = ::sqrt(physical_tangent[0] * physical_tangent[0] +
-                                   physical_tangent[1] * physical_tangent[1]);
+      const double length = ScaledNorm2(physical_tangent[0], physical_tangent[1]);
       if (!(length > 0.) || !Finite(length)) return Status::invalid_geometry;
       const double normal[2] = {physical_tangent[1] / length, -physical_tangent[0] / length};
       const double h = determinant / length;
