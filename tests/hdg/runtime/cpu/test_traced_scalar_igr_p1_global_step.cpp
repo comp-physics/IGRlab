@@ -731,8 +731,10 @@ bool Check(const MPI_Comm communicator)
       SameBits(scratch_first.interior_increment, first.interior_increment) &&
       SameBits(scratch_repeat.trace_increment, scratch_first.trace_increment) &&
       SameBits(scratch_repeat.interior_increment, scratch_first.interior_increment) &&
-      !SameBits(scratch_source.trace_increment, scratch_first.trace_increment) &&
-      !SameBits(scratch_dt.trace_increment, scratch_first.trace_increment);
+      SameBits(scratch_source.trace_increment, second.trace_increment) &&
+      SameBits(scratch_source.interior_increment, second.interior_increment) &&
+      SameBits(scratch_dt.trace_increment, changed_dt.trace_increment) &&
+      SameBits(scratch_dt.interior_increment, changed_dt.interior_increment);
   if (!Require(communicator, ok && scratch_match, "scratch repeated global steps"))
   {
     return false;
