@@ -424,9 +424,31 @@ bool SolveAndRecoverTracedScalarIgrP1Trace(
   return true;
 }
 
-TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
+/** Per-call ownership for the one shared convenience compute path. */
+struct EphemeralStepState final
+{
+  mfem::Vector current_local_trace;
+  mfem::Vector previous_local_trace;
+  std::vector<double> a, b, c, d, f, g, source_samples;
+  std::vector<double> schur, reduced;
+  mfem::Vector raw_local_trace;
+  mfem::Vector raw_true_trace;
+  core::HostReferenceEngine condensation;
+  std::unique_ptr<mfem::SparseMatrix> local_matrix;
+  mfem::Vector local_rhs;
+  mfem::Vector true_rhs_values;
+  std::unique_ptr<mfem::HypreParMatrix> true_matrix;
+  TracedScalarIgrP1TraceSolveOutput solved;
+};
+
+// Input/trace/source staging, element assembly/condensation, true-system
+// assembly, and solve/recovery remain deliberately ordered in this one path.
+// The next scratch leaf can replace only this ephemeral owner without cloning
+// the numerical or collective implementation.
+static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
     const TracedScalarIgrP1GlobalStepInput& input,
-    TracedScalarIgrP1GlobalStepOutput& output) noexcept
+    TracedScalarIgrP1GlobalStepOutput& output,
+    EphemeralStepState& state) noexcept
 {
   // The communicator has been admitted by the caller.  This initial local
   // check is deliberately before every opaque collective phase.
@@ -447,10 +469,17 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
 
-  mfem::Vector current_local_trace;
-  mfem::Vector previous_local_trace;
-  std::vector<double> a, b, c, d, f, g, source_samples;
-  std::vector<double> schur, reduced;
+  mfem::Vector& current_local_trace = state.current_local_trace;
+  mfem::Vector& previous_local_trace = state.previous_local_trace;
+  std::vector<double>& a = state.a;
+  std::vector<double>& b = state.b;
+  std::vector<double>& c = state.c;
+  std::vector<double>& d = state.d;
+  std::vector<double>& f = state.f;
+  std::vector<double>& g = state.g;
+  std::vector<double>& source_samples = state.source_samples;
+  std::vector<double>& schur = state.schur;
+  std::vector<double>& reduced = state.reduced;
   bool local_ok = true;
   try
   {
@@ -563,8 +592,8 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
     return assembly_result;
   }
 
-  mfem::Vector raw_local_trace;
-  mfem::Vector raw_true_trace;
+  mfem::Vector& raw_local_trace = state.raw_local_trace;
+  mfem::Vector& raw_true_trace = state.raw_true_trace;
   try
   {
     raw_local_trace.SetSize(layout.TraceLocalVSize()); raw_local_trace = 0.0;
@@ -608,7 +637,7 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
 
-  core::HostReferenceEngine condensation;
+  core::HostReferenceEngine& condensation = state.condensation;
   if (elements > 0)
   {
     const core::LocalSystemBatchView system{
@@ -627,9 +656,9 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
 
-  std::unique_ptr<mfem::SparseMatrix> local_matrix;
-  mfem::Vector local_rhs;
-  mfem::Vector true_rhs_values;
+  std::unique_ptr<mfem::SparseMatrix>& local_matrix = state.local_matrix;
+  mfem::Vector& local_rhs = state.local_rhs;
+  mfem::Vector& true_rhs_values = state.true_rhs_values;
   try
   {
     local_matrix = std::make_unique<mfem::SparseMatrix>(layout.TraceLocalVSize());
@@ -673,8 +702,8 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
   // The opaque parallel assembly is entered only after all ranks have a fully
   // formed local matrix.  Do not catch this collective operation.
   mfem::ParBilinearForm parallel_form(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
-  std::unique_ptr<mfem::HypreParMatrix> true_matrix(
-      parallel_form.ParallelAssemble(local_matrix.get()));
+  state.true_matrix.reset(parallel_form.ParallelAssemble(local_matrix.get()));
+  std::unique_ptr<mfem::HypreParMatrix>& true_matrix = state.true_matrix;
   local_ok = true_matrix != nullptr &&
       true_matrix->Height() == layout.TraceTrueVSize() &&
       true_matrix->Width() == layout.TraceTrueVSize() &&
@@ -692,7 +721,7 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
   {
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
-  TracedScalarIgrP1TraceSolveOutput solved;
+  TracedScalarIgrP1TraceSolveOutput& solved = state.solved;
   const TracedScalarIgrP1TraceSolveInput solve_input{
       input.communicator, &layout, trace_space, true_matrix.get(),
       &true_rhs_values, &condensation};
@@ -706,6 +735,14 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
   output.reduced_rhs_norm = solved.reduced_rhs_norm;
   output.linear_residual_norm = solved.linear_residual_norm;
   return TracedScalarIgrP1GlobalStepResult::success;
+}
+
+TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
+    const TracedScalarIgrP1GlobalStepInput& input,
+    TracedScalarIgrP1GlobalStepOutput& output) noexcept
+{
+  EphemeralStepState state;
+  return ComputeEphemeralStep(input, output, state);
 }
 
 } // namespace dg::hdg::runtime::cpu::detail
