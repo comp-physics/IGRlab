@@ -325,6 +325,20 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     metadata.local_elements_after_partitioning = parallel_mesh->GetNE();
     RefineParMesh(*parallel_mesh, request.options.par_ref_levels);
     metadata.local_elements_after_parallel_refinement = parallel_mesh->GetNE();
+    long long expected_global_elements = metadata.serial_element_count;
+    for (int level = 0; level < request.options.par_ref_levels; ++level)
+    {
+      if (expected_global_elements >
+          std::numeric_limits<long long>::max() / 4)
+        throw std::overflow_error("CUDA HDG refined element census overflow");
+      expected_global_elements *= 4;
+    }
+    const long long local_refined_elements = parallel_mesh->GetNE();
+    long long global_refined_elements = 0;
+    if (MPI_Allreduce(&local_refined_elements, &global_refined_elements, 1,
+                      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS ||
+        global_refined_elements != expected_global_elements)
+      throw std::runtime_error("CUDA HDG parallel refinement census mismatch");
     context.emplace(std::move(parallel_mesh), std::move(metadata));
     local_ok = true;
   }

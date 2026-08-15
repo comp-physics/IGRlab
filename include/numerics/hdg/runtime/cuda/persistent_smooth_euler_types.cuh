@@ -201,7 +201,8 @@ enum class CudaTransferCategory : unsigned char
   scalar_diagnostic,
   host_staged_trace_exchange,
   oracle_export,
-  generic_host_bridge
+  generic_host_bridge,
+  generic_output_metadata_staging
 };
 
 enum class CudaTransferSite : unsigned char
@@ -238,7 +239,9 @@ enum class CudaTransferSite : unsigned char
   scalar_status,
   state_hash,
   oracle_export,
-  generic_host_export
+  generic_host_export,
+  output_metadata_stage_interior,
+  output_metadata_stage_trace
 };
 
 struct CudaPolicyContext
@@ -447,6 +450,9 @@ struct CudaPreparedOutputMetadataV1
   std::uintptr_t interior_source_token = 0;
   std::uintptr_t trace_source_token = 0;
   std::uint64_t staging_generation = 0;
+  std::uint64_t staging_host_to_device_bytes = 0;
+  std::uint64_t staging_device_to_host_bytes = 0;
+  std::uint64_t staging_device_to_device_bytes = 0;
   CudaTransferLedgerRangeV1 staging_range{};
   bool candidate_frozen = false;
   bool checkpoint_staged = false;

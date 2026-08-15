@@ -229,6 +229,9 @@ bool SameNativeExport(const CudaPreparedOutputMetadataV1& left,
       left.interior_source_token == right.interior_source_token &&
       left.trace_source_token == right.trace_source_token &&
       left.staging_generation == right.staging_generation &&
+      left.staging_host_to_device_bytes == right.staging_host_to_device_bytes &&
+      left.staging_device_to_host_bytes == right.staging_device_to_host_bytes &&
+      left.staging_device_to_device_bytes == right.staging_device_to_device_bytes &&
       same_range(left.staging_range, right.staging_range) &&
       left.candidate_frozen == right.candidate_frozen &&
       left.checkpoint_staged == right.checkpoint_staged &&
@@ -262,6 +265,10 @@ bool CheckTransaction(const int ranks)
   const auto before_commit = session.coordinates();
   const bool native_staged = staged.status == HdgEulerSessionStatus::prepared &&
       native_export.candidate_frozen && native_export.checkpoint_staged &&
+      native_export.staging_range.complete &&
+      native_export.staging_device_to_device_bytes != 0 &&
+      native_export.staging_host_to_device_bytes == 0 &&
+      native_export.staging_device_to_host_bytes == 0 &&
       !native_export.output_staged && !native_export.successful_commit;
   const GenericPreparedOutput before_duplicate = native_export;
   GenericEulerCudaPreparedStep duplicate{};
@@ -557,7 +564,7 @@ bool CheckLegacyFacadeAdmission(const int ranks)
   const auto initialized = session.Initialize(LegacyBorrowedConfig(
       mesh, ranks, smoke_polynomial_order, smoke_elements_per_direction));
   GenericEulerCudaPreparedStep authority{};
-  GenericPreparedOutput native_export{};
+  GenericEulerHdgCudaSession::native_export_type native_export{};
   const auto prepared = initialized.status == HdgEulerSessionStatus::initialized
       ? session.Prepare(authority, native_export)
       : dg::hdg::generic::HdgEulerSessionResult{};
@@ -566,6 +573,9 @@ bool CheckLegacyFacadeAdmission(const int ranks)
       : dg::hdg::generic::HdgEulerSessionResult{};
   return All(initialized.status == HdgEulerSessionStatus::initialized &&
              prepared.status == HdgEulerSessionStatus::prepared &&
+             native_export.interior_count != 0 &&
+             native_export.owned_true_trace_count != 0 &&
+             native_export.staging_range.complete &&
              aborted.status == HdgEulerSessionStatus::aborted &&
              session.coordinates().step == 0 &&
              session.coordinates().generation == 0);
@@ -729,6 +739,22 @@ bool Rejected(GenericEulerHdgCudaSession& session,
       result.coordinates.step == 0 && result.coordinates.generation == 0;
 }
 
+bool DirectFixedOracleRejected(const CudaConfig& config, const int ranks)
+{
+  CudaRunEvidence evidence{};
+  if (ranks == 1)
+  {
+    PersistentCudaSmoothEulerEngine<BorrowedCudaRank1OneGpuRuntimeSelection>
+        engine(config);
+    return !engine.Initialize(evidence) &&
+        evidence.status == CudaRunStatus::setup_failure;
+  }
+  PersistentCudaSmoothEulerEngine<
+      BorrowedCudaRank2OneGpuHostStagedRuntimeSelection> engine(config);
+  return !engine.Initialize(evidence) &&
+      evidence.status == CudaRunStatus::setup_failure;
+}
+
 bool CheckNegatives(const int ranks)
 {
   mfem::Mesh periodic_serial = PeriodicSquareMesh(smoke_elements_per_direction);
@@ -804,6 +830,8 @@ bool CheckNegatives(const int ranks)
   const bool wrong_ranks_rejected = Rejected(five, wrong_ranks);
   const bool wrong_dt_rejected = Rejected(six, wrong_dt);
   const bool capture_oracle_rejected = Rejected(seven, capture_oracle);
+  const bool direct_capture_oracle_rejected = DirectFixedOracleRejected(
+      capture_oracle, ranks);
   const bool injection_rejected = Rejected(eight, injection);
   GenericEulerHdgCudaSession nine, ten, eleven, twelve, thirteen, fourteen,
       fifteen;
@@ -818,7 +846,8 @@ bool CheckNegatives(const int ranks)
                                                       nonphysical_initial);
   bool rejected = nonperiodic_rejected && wrong_shape_rejected && p3_rejected &&
       wrong_device_rejected && wrong_ranks_rejected && wrong_dt_rejected &&
-      capture_oracle_rejected && injection_rejected && null_initial_rejected &&
+      capture_oracle_rejected && direct_capture_oracle_rejected &&
+      injection_rejected && null_initial_rejected &&
       wrong_initial_count_rejected && wrong_initial_components_rejected &&
       null_source_rejected && nonfinite_initial_rejected &&
       nonfinite_source_rejected && nonphysical_initial_rejected &&

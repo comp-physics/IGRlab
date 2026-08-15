@@ -74,13 +74,13 @@ private:
   const GenericEulerHdgCudaSession* owner_ = nullptr;
   std::uint64_t epoch_ = 0;
   std::uint64_t facade_incarnation_ = 0;
-  cuda_w8a::CudaPreparedOutputMetadataV1* native_export_ = nullptr;
+  void* native_export_ = nullptr;
   bool valid_ = false;
 };
 
 /**
  * Header-only adapter over the existing persistent CUDA engine.  Its complete
- * lifecycle is PrepareStep -> StagePreparedOutputMetadata -> MarkOutputStaged ->
+ * lifecycle is PrepareStep -> staged output -> MarkOutputStaged ->
  * PrepareCommit -> CommitPrepared -> FinalizeCommit.  No second numerical
  * engine, allocator, kernel, or commit lifecycle is introduced here.  Every
  * member of MPI_COMM_WORLD must call the same public collective operation in
@@ -92,7 +92,11 @@ class GenericEulerHdgCudaSession
 public:
   using result_type = generic::HdgEulerSessionResult;
   using coordinates_type = generic::HdgEulerSessionCoordinates;
-  using native_export_type = cuda_w8a::CudaPreparedOutputMetadataV1;
+  // Retain the established fixed checkpoint DTO for false mode.  Borrowed
+  // host sessions select the separate metadata-only DTO below so dynamic
+  // storage is never represented as a fixed checkpoint payload.
+  using native_export_type = cuda_w8a::CudaSerializedCheckpointV1;
+  using prepared_output_type = cuda_w8a::CudaPreparedOutputMetadataV1;
 
   GenericEulerHdgCudaSession() = default;
   ~GenericEulerHdgCudaSession() = default;
@@ -199,23 +203,28 @@ public:
       return Result(generic::HdgEulerSessionStatus::rejected);
     }
     coordinates_ = EngineCoordinates();
+    metadata_output_mode_ = config.use_borrowed_host_inputs;
     return Result(generic::HdgEulerSessionStatus::initialized);
   }
 
   /** Stage the native candidate export; an explicit acknowledgement is next. */
+  template <typename StagedOutput>
   result_type Prepare(GenericEulerCudaPreparedStep& authority,
-                      native_export_type& native_export) noexcept
+                      StagedOutput& native_export) noexcept
   {
+    static_assert(IsSupportedOutput<StagedOutput>(),
+                  "CUDA prepared output must be checkpoint or metadata");
     // A destination authority is never an overwrite slot.  In particular, a
     // live authority from another session remains usable by its owner when
     // this session rejects the prepare collectively.
-    const bool local_valid = ReadyForPrepare() && !authority.valid_;
+    const bool local_valid = ReadyForPrepare() && !authority.valid_ &&
+        OutputMatchesMode<StagedOutput>();
     if (!AdmitOperation(operation_tag::prepare, local_valid))
       return Result(generic::HdgEulerSessionStatus::rejected);
 
     cuda_w8a::CudaPrecommitSnapshot snapshot{};
     cuda_w8a::CudaStepEvidence evidence{};
-    native_export_type staged_export{};
+    StagedOutput staged_export{};
     const bool prepared_locally = Dispatch([&](auto& engine)
     { return engine.PrepareStep(retry_ready_, snapshot, evidence); });
     const bool prepared = CollectiveAll(prepared_locally);
@@ -225,14 +234,19 @@ public:
       return Result(generic::HdgEulerSessionStatus::rejected);
     }
     const bool staged_locally = Dispatch([&](auto& engine)
-    { return engine.StagePreparedOutputMetadata(staged_export, evidence); });
+    {
+      if constexpr (IsMetadataOutput<StagedOutput>())
+        return engine.StagePreparedOutputMetadata(staged_export, evidence);
+      else
+        return engine.StagePreparedCheckpoint(staged_export, evidence);
+    });
     const bool locally_staged = staged_locally &&
         snapshot.numerical_candidate_ready &&
         staged_export.candidate_frozen && staged_export.checkpoint_staged &&
         !staged_export.output_staged && !staged_export.successful_commit;
     if (!CollectiveAll(locally_staged))
     {
-      // Metadata staging can leave a live affine staging token when a
+      // Output staging can leave a live affine staging token when a
       // collective staging operation fails.  Consume it through the engine's
       // existing abort route; never discard it or invent a second rollback.
       if (prepared)
@@ -278,12 +292,16 @@ public:
    * This does not acknowledge or publish it: Commit still requires the
    * existing AcknowledgePreparedOutput call after the caller accepts bytes.
    */
+  template <typename StagedOutput>
   bool ExportPreparedInterior(
       const GenericEulerCudaPreparedStep& authority,
-      const native_export_type& native_export,
+      const StagedOutput& native_export,
       cuda_w8a::CudaMutableHostL2Output destination) noexcept
   {
-    const bool local_valid = Matches(authority, native_export) &&
+    static_assert(IsSupportedOutput<StagedOutput>(),
+                  "CUDA prepared output must be checkpoint or metadata");
+    const bool local_valid = OutputMatchesMode<StagedOutput>() &&
+        Matches(authority, native_export) &&
         destination.coefficients != nullptr &&
         destination.components == cuda_w8a::conserved_components;
     if (!AdmitOperation(operation_tag::export_prepared, local_valid))
@@ -293,11 +311,15 @@ public:
   }
 
   /** The caller attests that the staged native export is ready for publication. */
+  template <typename StagedOutput>
   bool AcknowledgePreparedOutput(
       const GenericEulerCudaPreparedStep& authority,
-      native_export_type& native_export) noexcept
+      StagedOutput& native_export) noexcept
   {
-    const bool local_valid = Matches(authority, native_export) &&
+    static_assert(IsSupportedOutput<StagedOutput>(),
+                  "CUDA prepared output must be checkpoint or metadata");
+    const bool local_valid = OutputMatchesMode<StagedOutput>() &&
+        Matches(authority, native_export) &&
         !output_acknowledged_;
     if (!AdmitOperation(operation_tag::acknowledge_output, local_valid))
       return false;
@@ -308,10 +330,14 @@ public:
   }
 
   /** Consume the authority and publish exactly once through the existing engine. */
+  template <typename StagedOutput>
   result_type Commit(GenericEulerCudaPreparedStep&& authority,
-                     native_export_type& native_export) noexcept
+                     StagedOutput& native_export) noexcept
   {
-    const bool local_valid = Matches(authority, native_export) &&
+    static_assert(IsSupportedOutput<StagedOutput>(),
+                  "CUDA prepared output must be checkpoint or metadata");
+    const bool local_valid = OutputMatchesMode<StagedOutput>() &&
+        Matches(authority, native_export) &&
         output_acknowledged_;
     if (!AdmitOperation(operation_tag::commit, local_valid))
       return Result(generic::HdgEulerSessionStatus::rejected);
@@ -355,10 +381,15 @@ public:
   }
 
   /** Consume the authority through the existing prepared-abort path. */
+  template <typename StagedOutput>
   result_type Abort(GenericEulerCudaPreparedStep&& authority,
-                    native_export_type& native_export) noexcept
+                    StagedOutput& native_export) noexcept
   {
-    if (!AdmitOperation(operation_tag::abort, Matches(authority, native_export)))
+    static_assert(IsSupportedOutput<StagedOutput>(),
+                  "CUDA prepared output must be checkpoint or metadata");
+    if (!AdmitOperation(operation_tag::abort,
+                        OutputMatchesMode<StagedOutput>() &&
+                        Matches(authority, native_export)))
       return Result(generic::HdgEulerSessionStatus::rejected);
     cuda_w8a::CudaStepEvidence evidence{};
     const bool aborted = Dispatch([&](auto& engine)
@@ -413,19 +444,39 @@ private:
 
   static constexpr std::uint64_t unassigned_session_collective_id = 0;
 
+  template <typename StagedOutput>
+  static constexpr bool IsMetadataOutput() noexcept
+  {
+    return std::is_same<StagedOutput, prepared_output_type>::value;
+  }
+
+  template <typename StagedOutput>
+  static constexpr bool IsSupportedOutput() noexcept
+  {
+    return IsMetadataOutput<StagedOutput>() ||
+        std::is_same<StagedOutput, native_export_type>::value;
+  }
+
+  template <typename StagedOutput>
+  bool OutputMatchesMode() const noexcept
+  {
+    return metadata_output_mode_ == IsMetadataOutput<StagedOutput>();
+  }
+
   bool ReadyForPrepare() const noexcept
   {
     return initialized_ && !failed_ && !prepared_active_ &&
         active_native_export_ == nullptr && active_facade_incarnation_ == 0;
   }
 
+  template <typename StagedOutput>
   bool Matches(const GenericEulerCudaPreparedStep& authority,
-               const native_export_type& native_export) const noexcept
+               const StagedOutput& native_export) const noexcept
   {
     return initialized_ && !failed_ && prepared_active_ && authority.valid_ &&
         authority.owner_ == this && authority.epoch_ == epoch_ &&
         authority.native_export_ == active_native_export_ &&
-        active_native_export_ == &native_export &&
+        active_native_export_ == static_cast<const void*>(&native_export) &&
         authority.facade_incarnation_ != 0 &&
         active_facade_incarnation_ != 0 &&
         authority.facade_incarnation_ == active_facade_incarnation_ &&
@@ -779,8 +830,9 @@ private:
   bool failed_ = false;
   bool retry_ready_ = false;
   std::uint64_t session_collective_id_ = unassigned_session_collective_id;
-  native_export_type* active_native_export_ = nullptr;
+  const void* active_native_export_ = nullptr;
   std::uint64_t active_facade_incarnation_ = 0;
+  bool metadata_output_mode_ = false;
   inline static std::uint64_t next_session_collective_id_ =
       unassigned_session_collective_id;
 };

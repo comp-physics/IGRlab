@@ -754,6 +754,22 @@ BuildPersistentTrueSystem() noexcept
                                    &TransportPolicy::DeviceToHost,
                                    &TransportPolicy::Synchronize) &&
         CudaGetTrueMatrixDeviceView(*true_matrix_, true_device_);
+    if (local_objects_ready && oracle_capture_requested_)
+    {
+      local_objects_ready = true_structure_.diag_nonzeros >= 0 &&
+          true_structure_.offd_nonzeros >= 0 &&
+          static_cast<std::size_t>(true_structure_.diag_nonzeros) <=
+              maximum_true_matrix_entries &&
+          static_cast<std::size_t>(true_structure_.offd_nonzeros) <=
+              maximum_true_matrix_entries;
+      if (local_objects_ready)
+      {
+        host_true_diag_values_.assign(
+            static_cast<std::size_t>(true_structure_.diag_nonzeros), 0.0);
+        host_true_offd_values_.assign(
+            static_cast<std::size_t>(true_structure_.offd_nonzeros), 0.0);
+      }
+    }
     if (local_objects_ready)
     {
       trace_slots_[0].emplace(trace_space_.operator->());
@@ -1599,11 +1615,103 @@ WorkspaceBytes() const noexcept
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+OraclePayloadFitsCapacity() const noexcept
+{
+  const auto nonnegative = [](const int value) { return value >= 0; };
+  if (!nonnegative(shape_.elements) || !nonnegative(shape_.interior_count) ||
+      !nonnegative(shape_.local_trace_count) ||
+      !nonnegative(shape_.true_trace_count) ||
+      !nonnegative(shape_.trace_dofs) ||
+      !nonnegative(shape_.volume_points) || !nonnegative(shape_.face_points) ||
+      !nonnegative(shape_.scalar_interior_dofs) ||
+      !nonnegative(shape_.scalar_face_dofs) ||
+      !nonnegative(true_structure_.diag_nonzeros) ||
+      !nonnegative(true_structure_.offd_nonzeros))
+    return false;
+
+  // Check dimensions before forming payload products.  These fixed limits
+  // bound every CudaOraclePod array and keep the following arithmetic exact.
+  if (shape_.elements > maximum_rank_elements ||
+      shape_.trace_dofs > maximum_trace_dofs_per_element ||
+      shape_.volume_points > maximum_volume_points ||
+      shape_.face_points > maximum_face_points ||
+      shape_.scalar_interior_dofs > maximum_scalar_dofs_per_element ||
+      shape_.scalar_face_dofs > maximum_scalar_dofs_per_face ||
+      shape_.interior_count >
+          maximum_rank_elements * maximum_interior_dofs_per_element ||
+      shape_.local_trace_count > maximum_local_trace_dofs ||
+      shape_.true_trace_count > maximum_true_trace_dofs)
+    return false;
+
+  const std::size_t elements = static_cast<std::size_t>(shape_.elements);
+  const std::size_t interior = static_cast<std::size_t>(shape_.interior_count);
+  const std::size_t local_trace =
+      static_cast<std::size_t>(shape_.local_trace_count);
+  const std::size_t true_trace =
+      static_cast<std::size_t>(shape_.true_trace_count);
+  const std::size_t element_trace = elements *
+      static_cast<std::size_t>(shape_.trace_dofs);
+  const std::size_t csr_nonzeros = static_cast<std::size_t>(
+      true_structure_.diag_nonzeros) + static_cast<std::size_t>(
+      true_structure_.offd_nonzeros);
+  const auto fits = [](const std::size_t available, const std::size_t required,
+                       const std::size_t capacity)
+  { return required <= available && required <= capacity; };
+
+  return fits(signed_element_trace_.size(), element_trace,
+              maximum_element_trace_dofs) &&
+      fits(local_global_true_.size(), local_trace, maximum_local_trace_dofs) &&
+      fits(owned_global_true_.size(), true_trace, maximum_true_trace_dofs) &&
+      fits(element_coordinate_keys_.size(), elements * dimension,
+           maximum_rank_elements * dimension) &&
+      fits(host_volume_shape_.size(), elements * shape_.volume_points *
+           shape_.scalar_interior_dofs, maximum_rank_elements *
+           maximum_volume_points * maximum_scalar_dofs_per_element) &&
+      fits(host_volume_derivative_.size(), elements * shape_.volume_points *
+           shape_.scalar_interior_dofs * dimension, maximum_rank_elements *
+           maximum_volume_points * maximum_scalar_dofs_per_element * dimension) &&
+      fits(host_volume_weight_.size(), elements * shape_.volume_points,
+           maximum_rank_elements * maximum_volume_points) &&
+      fits(host_volume_position_.size(), elements * shape_.volume_points * dimension,
+           maximum_rank_elements * maximum_volume_points * dimension) &&
+      fits(host_face_interior_shape_.size(), elements * faces_per_element *
+           shape_.face_points * shape_.scalar_interior_dofs,
+           maximum_rank_elements * faces_per_element * maximum_face_points *
+           maximum_scalar_dofs_per_element) &&
+      fits(host_face_trace_shape_.size(), elements * faces_per_element *
+           shape_.face_points * shape_.scalar_face_dofs,
+           maximum_rank_elements * faces_per_element * maximum_face_points *
+           maximum_scalar_dofs_per_face) &&
+      fits(host_face_weight_.size(), elements * faces_per_element * shape_.face_points,
+           maximum_rank_elements * faces_per_element * maximum_face_points) &&
+      fits(host_face_normal_.size(), elements * faces_per_element *
+           shape_.face_points * dimension, maximum_rank_elements *
+           faces_per_element * maximum_face_points * dimension) &&
+      interior <= maximum_rank_elements * maximum_interior_dofs_per_element &&
+      csr_nonzeros <= maximum_true_matrix_entries &&
+      host_true_diag_values_.size() >= static_cast<std::size_t>(
+          true_structure_.diag_nonzeros) &&
+      host_true_offd_values_.size() >= static_cast<std::size_t>(
+          true_structure_.offd_nonzeros) &&
+      true_structure_.diag_offsets.size() >= true_trace + 1 &&
+      true_structure_.offd_offsets.size() >= true_trace + 1 &&
+      true_structure_.diag_columns.size() >= static_cast<std::size_t>(
+          true_structure_.diag_nonzeros) &&
+      true_structure_.offd_columns.size() >= static_cast<std::size_t>(
+          true_structure_.offd_nonzeros);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
 void CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 CaptureOracleMetadata(const AttemptIdentity& attempt,
                       const std::uint64_t generation) noexcept
 {
   oracle_ = {};
+  oracle_captured_ = false;
+  // Dynamic borrowed storage is not a complete CudaOraclePod.  Refuse the
+  // fixed export rather than truncating bytes or writing beyond the ABI.
+  if (!OraclePayloadFitsCapacity()) return;
   oracle_.rank = rank_;
   oracle_.ranks = ranks_;
   oracle_.elements = shape_.elements;
@@ -1652,18 +1760,15 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 ExportTrueSystem(CudaOraclePod& pod) noexcept
 {
-  std::vector<double> diag(static_cast<std::size_t>(
-      true_structure_.diag_nonzeros), 0.0);
-  std::vector<double> offd(static_cast<std::size_t>(
-      true_structure_.offd_nonzeros), 0.0);
-  if (!TransportPolicy::DeviceToHost(
-          diag.data(), true_device_.diag_values,
+  if (!OraclePayloadFitsCapacity() ||
+      !TransportPolicy::DeviceToHost(
+          host_true_diag_values_.data(), true_device_.diag_values,
           static_cast<std::size_t>(true_structure_.diag_nonzeros) *
               sizeof(double),
           CudaTransferCategory::oracle_export,
           CudaTransferSite::oracle_export) ||
       !TransportPolicy::DeviceToHost(
-          offd.data(), true_device_.offd_values,
+          host_true_offd_values_.data(), true_device_.offd_values,
           static_cast<std::size_t>(true_structure_.offd_nonzeros) *
               sizeof(double),
           CudaTransferCategory::oracle_export,
@@ -1683,7 +1788,7 @@ ExportTrueSystem(CudaOraclePod& pod) noexcept
       pod.true_csr_columns[static_cast<std::size_t>(cursor)] =
           owned_global_true_[static_cast<std::size_t>(local_column)];
       pod.true_csr_values[static_cast<std::size_t>(cursor++)] =
-          diag[static_cast<std::size_t>(entry)];
+          host_true_diag_values_[static_cast<std::size_t>(entry)];
     }
     for (int entry = true_structure_.offd_offsets[static_cast<std::size_t>(row)];
          entry < true_structure_.offd_offsets[static_cast<std::size_t>(row + 1)];
@@ -1692,7 +1797,7 @@ ExportTrueSystem(CudaOraclePod& pod) noexcept
       pod.true_csr_columns[static_cast<std::size_t>(cursor)] =
           true_structure_.offd_columns[static_cast<std::size_t>(entry)];
       pod.true_csr_values[static_cast<std::size_t>(cursor++)] =
-          offd[static_cast<std::size_t>(entry)];
+          host_true_offd_values_[static_cast<std::size_t>(entry)];
     }
     pod.true_csr_offsets[static_cast<std::size_t>(row + 1)] = cursor;
   }

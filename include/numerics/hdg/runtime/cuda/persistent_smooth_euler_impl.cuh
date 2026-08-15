@@ -774,6 +774,7 @@ public:
   bool Initialize(const CudaConfig& config, CudaRunEvidence& evidence,
                   const RuntimeTupleDescriptor& tuple) noexcept
   {
+    oracle_capture_requested_ = config.capture_oracle;
     TransportPolicy::ResetLedger();
     CudaPolicyContext setup{};
     setup.phase = CudaFailurePhase::setup;
@@ -1506,7 +1507,8 @@ public:
 
   bool ExportOracle(CudaOraclePod& pod) noexcept
   {
-    if (!initialized_ || !oracle_captured_) { return false; }
+    if (!initialized_ || !oracle_captured_ || !OraclePayloadFitsCapacity())
+      return false;
     pod = oracle_;
     TransportPolicy::SetPhase(CudaFailurePhase::terminal_evidence,
                               current_generation_);
@@ -1713,11 +1715,7 @@ private:
     const bool periodic = element_census && face_census && periodic_measure_safe &&
         global_face_measure == 4 * global_elements;
     if (!periodic) return false;
-    if (config.use_borrowed_host_inputs)
-      return ValidateBorrowedTopologyCapacity(config);
-    const long long expected = static_cast<long long>(config.mesh_n) * config.mesh_n;
-    return expected >= 0 && global_elements == expected &&
-        ValidateBorrowedTopologyCapacity(config);
+    return ValidateBorrowedTopologyCapacity(config);
   }
 
   bool ConfigureDeviceAndRanks(const CudaConfig& config,
@@ -2258,6 +2256,7 @@ private:
   bool AggregateHash(const StateHash& local, StateHash& aggregate) const
       noexcept;
   std::size_t WorkspaceBytes() const noexcept;
+  bool OraclePayloadFitsCapacity() const noexcept;
   void CaptureOracleMetadata(const AttemptIdentity& attempt,
                              std::uint64_t generation) noexcept;
   bool ExportTrueSystem(CudaOraclePod& pod) noexcept;
@@ -2279,6 +2278,7 @@ private:
   bool hypre_policy_valid_ = false;
   bool no_fallback_ = true;
   bool oracle_captured_ = false;
+  bool oracle_capture_requested_ = false;
   int rank_ = -1;
   int ranks_ = 0;
   int device_ = -1;
@@ -2292,6 +2292,8 @@ private:
   CudaDeviceView view_{};
   CudaTrueMatrixStructure true_structure_{};
   CudaTrueMatrixDeviceView true_device_{};
+  std::vector<double> host_true_diag_values_{};
+  std::vector<double> host_true_offd_values_{};
   double* double_arena_ = nullptr;
   int* integer_arena_ = nullptr;
   // False-mode retains the literal W8A capacities and BindArenaViews branch.

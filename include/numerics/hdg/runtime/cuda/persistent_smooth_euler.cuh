@@ -179,7 +179,8 @@ enum class CudaCopyOutPurpose : unsigned char
 {
   none,
   attempt_seed,
-  checkpoint_staging
+  checkpoint_staging,
+  output_metadata_staging
 };
 
 inline bool SameRange(const double* first, std::size_t first_count,
@@ -323,6 +324,20 @@ struct CudaContractStoragePolicy
           CudaTransferSite::checkpoint_stage_trace);
       const bool synchronized = TransportPolicy::Synchronize(
           CudaTransferSite::checkpoint_stage_trace);
+      return interior && trace && synchronized;
+    }
+    if (purpose == CudaCopyOutPurpose::output_metadata_staging)
+    {
+      const bool interior = CopyInterior(
+          copy.interior, source.interior,
+          CudaTransferCategory::generic_output_metadata_staging,
+          CudaTransferSite::output_metadata_stage_interior);
+      const bool trace = CopyTrace(
+          copy.trace, source.trace,
+          CudaTransferCategory::generic_output_metadata_staging,
+          CudaTransferSite::output_metadata_stage_trace);
+      const bool synchronized = TransportPolicy::Synchronize(
+          CudaTransferSite::output_metadata_stage_trace);
       return interior && trace && synchronized;
     }
     return false;
@@ -642,11 +657,14 @@ public:
     metadata.facade_incarnation = facade_incarnation_;
     metadata.descriptor = pending_.staging->future_checkpoint();
     metadata.candidate_frozen = true;
+    const CudaTransferTotals transfers_before = TransportPolicy::Accounting();
     TransportPolicy::BeginStagingRange();
-    storage_policy::SetCopyOutPurpose(detail::CudaCopyOutPurpose::none);
+    storage_policy::SetCopyOutPurpose(
+        detail::CudaCopyOutPurpose::output_metadata_staging);
     state_slot& staging_slot = numerics_.WorkspaceSlot();
     const bool token_copy = contract_->CopyPrepared(*pending_.staging,
                                                      staging_slot);
+    storage_policy::SetCopyOutPurpose(detail::CudaCopyOutPurpose::none);
     metadata.source_rank = numerics_.rank();
     metadata.rank_count = config_.expected_rank_count;
     metadata.local_mesh_hash = numerics_.LocalMeshHash();
@@ -670,6 +688,13 @@ public:
     }
     UpdateAttemptEvidence(pending_.evidence);
     metadata.staging_range = TransportPolicy::EndStagingRange();
+    const CudaTransferTotals transfers_after = TransportPolicy::Accounting();
+    metadata.staging_host_to_device_bytes =
+        transfers_after.host_to_device_bytes - transfers_before.host_to_device_bytes;
+    metadata.staging_device_to_host_bytes =
+        transfers_after.device_to_host_bytes - transfers_before.device_to_host_bytes;
+    metadata.staging_device_to_device_bytes =
+        transfers_after.device_to_device_bytes - transfers_before.device_to_device_bytes;
     metadata.staging_range.complete = metadata.staging_range.complete &&
         all_staged;
     evidence = pending_.evidence;
@@ -745,8 +770,11 @@ public:
       pending_.report.originating_failure = FailureReason::backend_failure;
       pending_.report.gates.success = false;
     }
-    const bool copies_complete = TransportPolicy::Synchronize(
-        CudaTransferSite::checkpoint_stage_trace);
+    const CudaTransferSite staging_site = std::is_same<
+        StagedOutput, CudaPreparedOutputMetadataV1>::value
+        ? CudaTransferSite::output_metadata_stage_trace
+        : CudaTransferSite::checkpoint_stage_trace;
+    const bool copies_complete = TransportPolicy::Synchronize(staging_site);
     if (!numerics_.CollectiveContinue(copies_complete))
     {
       pending_.report.originating_failure = FailureReason::backend_failure;
@@ -1198,10 +1226,14 @@ private:
               config_.borrowed_source.scalar_count != 0 &&
               config_.borrowed_source.components == conserved_components))
         : empty_l2(config_.borrowed_initial) && empty_l2(config_.borrowed_source);
+    const bool fixed_oracle_requested_for_generic_storage =
+        config_.use_borrowed_topology && config_.use_borrowed_host_inputs &&
+        config_.capture_oracle;
     return config_.experiment == StableIdentity::Copy(experiment_id) &&
         (borrowed_generic_shape || smoke_shape || functional_shape) &&
         topology_configuration &&
         generic_l2_configuration &&
+        !fixed_oracle_requested_for_generic_storage &&
         std::isfinite(config_.dt) &&
         std::memcmp(&config_.dt, &fixed_dt, sizeof(double)) == 0 &&
         config_.requested_device == 0 &&
@@ -1254,6 +1286,13 @@ private:
 
   bool MakeConfigDescriptor(ConfigDescriptor& descriptor) const noexcept
   {
+    // CudaOraclePod is a frozen fixed-capacity ABI.  Borrowed host sessions
+    // may use dynamic storage, so their output route is metadata-only and may
+    // not request fixed oracle materialization.  False mode writes the same
+    // descriptor bytes as before.
+    if (config_.use_borrowed_topology && config_.use_borrowed_host_inputs &&
+        config_.capture_oracle)
+      return false;
     descriptor = {};
     std::size_t cursor = 0;
     bool complete = true;
