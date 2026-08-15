@@ -2074,7 +2074,9 @@ struct detail::CpuNumericsCore::Implementation
     if (!CollectiveAll(Finite(residual) && residual >= 0.0)) return fail(CpuFailurePhase::assembly);
     evidence.initial_nonlinear_residual = residual;
     bool accepted = false;
-    for (int backtrack = 0; backtrack < 8 && !accepted; ++backtrack)
+    for (int backtrack = 0;
+         backtrack < config.maximum_line_search_trials && !accepted;
+         ++backtrack)
     {
       const double scale = std::ldexp(1.0, -backtrack);
       for (int i = 0; i < igr_trial.interior.Size(); ++i)
