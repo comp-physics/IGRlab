@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <vector>
 
@@ -69,6 +70,14 @@ bool SameStatus(const cpu::Status cpu_status, const algebra::Status device_statu
     case cpu::Status::inadmissible_state: return device_status == algebra::Status::inadmissible_state;
     case cpu::Status::nonfinite_result: return device_status == algebra::Status::nonfinite_result;
   }
+  return false;
+}
+
+bool ReportFailure(const char* const subcheck, const char* const status_case = nullptr)
+{
+  std::cerr << "hdg_traced_scalar_igr_p1_local_cuda first failed subcheck: " << subcheck;
+  if (status_case) std::cerr << "/" << status_case;
+  std::cerr << '\n';
   return false;
 }
 
@@ -357,37 +366,41 @@ bool CheckStatuses()
                           quadrature, raw_rhs, rhs_points, device) &&
       SameStatus(cpu::Assemble(cpu_geometry, cpu_parameters, state, host), device.status);
   };
+  const auto check = [](const bool value, const char* const name)
+  { return value ? true : ReportFailure("statuses", name); };
   cpu::AffineQuad reversed = geometry; std::swap(reversed.vertices[1], reversed.vertices[3]);
   std::array<double, 8> reversed_vertices = vertices;
   for (int direction = 0; direction < 2; ++direction)
     std::swap(reversed_vertices[2 + direction], reversed_vertices[6 + direction]);
   const cpu::ElementState regular{interior.data(), previous_interior.data(), trace.data(), previous_trace.data(), {}};
-  if (!compare(reversed, parameters, interior, previous_interior, trace, previous_trace, regular,
-               reversed_vertices, raw_parameters, nullptr, 0)) return false;
+  if (!check(compare(reversed, parameters, interior, previous_interior, trace, previous_trace, regular,
+                     reversed_vertices, raw_parameters, nullptr, 0), "reversed_geometry")) return false;
   cpu::AffineQuad non_affine = geometry; non_affine.vertices[2][0] += .05;
   std::array<double, 8> non_affine_vertices = vertices; non_affine_vertices[4] += .05;
-  if (!compare(non_affine, parameters, interior, previous_interior, trace, previous_trace, regular,
-               non_affine_vertices, raw_parameters, nullptr, 0)) return false;
+  if (!check(compare(non_affine, parameters, interior, previous_interior, trace, previous_trace, regular,
+                     non_affine_vertices, raw_parameters, nullptr, 0), "non_affine_geometry")) return false;
   cpu::AffineQuad nan_geometry = geometry;
   nan_geometry.vertices[2][0] = std::numeric_limits<double>::quiet_NaN();
   std::array<double, 8> nan_vertices = vertices;
   nan_vertices[4] = std::numeric_limits<double>::quiet_NaN();
-  if (!compare(nan_geometry, parameters, interior, previous_interior, trace, previous_trace, regular,
-               nan_vertices, raw_parameters, nullptr, 0)) return false;
+  if (!check(compare(nan_geometry, parameters, interior, previous_interior, trace, previous_trace, regular,
+                     nan_vertices, raw_parameters, nullptr, 0), "nan_geometry")) return false;
   cpu::Parameters bad_parameters = parameters; bad_parameters.gamma = 1.;
   algebra::Parameters bad_raw = raw_parameters; bad_raw.gamma = 1.;
-  if (!compare(geometry, bad_parameters, interior, previous_interior, trace, previous_trace, regular,
-               vertices, bad_raw, nullptr, 0)) return false;
+  if (!check(compare(geometry, bad_parameters, interior, previous_interior, trace, previous_trace, regular,
+                     vertices, bad_raw, nullptr, 0), "invalid_parameter")) return false;
   const cpu::ElementState bad_source{interior.data(), previous_interior.data(), trace.data(), previous_trace.data(),
                                      {rhs.data(), rhs.size() / 4 - 1}};
-  if (!compare(geometry, parameters, interior, previous_interior, trace, previous_trace, bad_source,
-               vertices, raw_parameters, rhs.data(), static_cast<int>(rhs.size() / 4 - 1))) return false;
+  if (!check(compare(geometry, parameters, interior, previous_interior, trace, previous_trace, bad_source,
+                     vertices, raw_parameters, rhs.data(), static_cast<int>(rhs.size() / 4 - 1)),
+             "invalid_source_layout")) return false;
   std::vector<double> nonfinite_rhs = rhs;
   nonfinite_rhs[3] = std::numeric_limits<double>::quiet_NaN();
   const cpu::ElementState nonfinite_source{interior.data(), previous_interior.data(), trace.data(), previous_trace.data(),
                                            {nonfinite_rhs.data(), nonfinite_rhs.size() / 4}};
-  if (!compare(geometry, parameters, interior, previous_interior, trace, previous_trace, nonfinite_source,
-               vertices, raw_parameters, nonfinite_rhs.data(), static_cast<int>(nonfinite_rhs.size() / 4))) return false;
+  if (!check(compare(geometry, parameters, interior, previous_interior, trace, previous_trace, nonfinite_source,
+                     vertices, raw_parameters, nonfinite_rhs.data(), static_cast<int>(nonfinite_rhs.size() / 4)),
+             "nonfinite_source")) return false;
   // Every input is finite and admissible. The finite sigma/sigmahat jump is
   // amplified by tau in the face arithmetic and must report nonfinite_result.
   std::vector<double> overflow_sigma = interior;
@@ -399,51 +412,58 @@ bool CheckStatuses()
   cpu::LocalOperator overflow_host;
   DeviceResult overflow_device;
   const cpu::Status overflow_status = cpu::Assemble(geometry, parameters, overflow_state, overflow_host);
-  if (overflow_status != cpu::Status::nonfinite_result ||
-      !DeviceAssemble(vertices, raw_parameters, overflow_sigma, previous_interior, overflow_trace,
-                      previous_trace, quadrature, nullptr, 0, overflow_device) ||
-      overflow_device.status != algebra::Status::nonfinite_result ||
-      !SameStatus(overflow_status, overflow_device.status)) return false;
+  const bool overflow_ok = overflow_status == cpu::Status::nonfinite_result &&
+    DeviceAssemble(vertices, raw_parameters, overflow_sigma, previous_interior, overflow_trace,
+                   previous_trace, quadrature, nullptr, 0, overflow_device) &&
+    overflow_device.status == algebra::Status::nonfinite_result &&
+    SameStatus(overflow_status, overflow_device.status);
+  if (!check(overflow_ok, "overflow_nonfinite_result")) return false;
   std::vector<double> inadmissible = interior; inadmissible[0] = 0.;
   const cpu::ElementState bad_state{inadmissible.data(), previous_interior.data(), trace.data(), previous_trace.data(), {}};
-  if (!compare(geometry, parameters, inadmissible, previous_interior, trace, previous_trace, bad_state,
-               vertices, raw_parameters, nullptr, 0)) return false;
+  if (!check(compare(geometry, parameters, inadmissible, previous_interior, trace, previous_trace, bad_state,
+                     vertices, raw_parameters, nullptr, 0), "current_density")) return false;
   std::vector<double> previous_density = previous_interior; previous_density[0] = 0.;
   const cpu::ElementState bad_previous_density{interior.data(), previous_density.data(), trace.data(), previous_trace.data(), {}};
-  if (!compare(geometry, parameters, interior, previous_density, trace, previous_trace, bad_previous_density,
-               vertices, raw_parameters, nullptr, 0)) return false;
+  if (!check(compare(geometry, parameters, interior, previous_density, trace, previous_trace, bad_previous_density,
+                     vertices, raw_parameters, nullptr, 0), "previous_density")) return false;
   std::vector<double> previous_pressure = previous_interior;
   for (int q = 0; q < 4; ++q) previous_pressure[12 + q] = .001;
   const cpu::ElementState bad_previous_pressure{interior.data(), previous_pressure.data(), trace.data(), previous_trace.data(), {}};
-  if (!compare(geometry, parameters, interior, previous_pressure, trace, previous_trace, bad_previous_pressure,
-               vertices, raw_parameters, nullptr, 0)) return false;
+  if (!check(compare(geometry, parameters, interior, previous_pressure, trace, previous_trace, bad_previous_pressure,
+                     vertices, raw_parameters, nullptr, 0), "previous_pressure")) return false;
   std::vector<double> trace_density = trace;
   for (int q = 0; q < 8; ++q) trace_density[q] = 0.;
   const cpu::ElementState bad_trace_density{interior.data(), previous_interior.data(), trace_density.data(), previous_trace.data(), {}};
-  if (!compare(geometry, parameters, interior, previous_interior, trace_density, previous_trace, bad_trace_density,
-               vertices, raw_parameters, nullptr, 0)) return false;
+  if (!check(compare(geometry, parameters, interior, previous_interior, trace_density, previous_trace, bad_trace_density,
+                     vertices, raw_parameters, nullptr, 0), "trace_density")) return false;
   std::vector<double> previous_trace_density = previous_trace;
   for (int q = 0; q < 8; ++q) previous_trace_density[q] = 0.;
   const cpu::ElementState bad_previous_trace_density{interior.data(), previous_interior.data(), trace.data(),
                                                      previous_trace_density.data(), {}};
-  if (!compare(geometry, parameters, interior, previous_interior, trace, previous_trace_density,
-               bad_previous_trace_density, vertices, raw_parameters, nullptr, 0)) return false;
+  if (!check(compare(geometry, parameters, interior, previous_interior, trace, previous_trace_density,
+                     bad_previous_trace_density, vertices, raw_parameters, nullptr, 0),
+             "previous_trace_density")) return false;
   std::vector<double> trace_pressure = trace;
   for (int q = 0; q < 8; ++q) trace_pressure[24 + q] = .001;
   const cpu::ElementState bad_trace_pressure{interior.data(), previous_interior.data(), trace_pressure.data(), previous_trace.data(), {}};
-  if (!compare(geometry, parameters, interior, previous_interior, trace_pressure, previous_trace, bad_trace_pressure,
-               vertices, raw_parameters, nullptr, 0)) return false;
+  if (!check(compare(geometry, parameters, interior, previous_interior, trace_pressure, previous_trace, bad_trace_pressure,
+                     vertices, raw_parameters, nullptr, 0), "trace_pressure")) return false;
   std::vector<double> previous_trace_pressure = previous_trace;
   for (int q = 0; q < 8; ++q) previous_trace_pressure[24 + q] = .001;
   const cpu::ElementState bad_previous_trace_pressure{interior.data(), previous_interior.data(), trace.data(),
                                                       previous_trace_pressure.data(), {}};
-  return compare(geometry, parameters, interior, previous_interior, trace, previous_trace_pressure,
-                 bad_previous_trace_pressure, vertices, raw_parameters, nullptr, 0);
+  return check(compare(geometry, parameters, interior, previous_interior, trace, previous_trace_pressure,
+                       bad_previous_trace_pressure, vertices, raw_parameters, nullptr, 0),
+               "previous_trace_pressure");
 }
 } // namespace
 
 int main()
 {
-  return CheckMassFluxJacobianWitness() && CheckCase(12, true) && CheckCase(14, false) && CheckSourceDifferential() &&
-    CheckLargeFiniteGeometry() && CheckStatuses() ? 0 : 1;
+  if (!CheckMassFluxJacobianWitness()) { ReportFailure("mass_witness"); return 1; }
+  if (!CheckCase(12, true)) { ReportFailure("q12"); return 1; }
+  if (!CheckCase(14, false)) { ReportFailure("q14"); return 1; }
+  if (!CheckSourceDifferential()) { ReportFailure("source"); return 1; }
+  if (!CheckLargeFiniteGeometry()) { ReportFailure("large_geometry"); return 1; }
+  return CheckStatuses() ? 0 : 1;
 }
