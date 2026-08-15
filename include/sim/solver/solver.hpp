@@ -9,6 +9,7 @@
 #include <cmath>
 #include <filesystem>
 #include <functional>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -106,6 +107,50 @@ bool WithEulerOperator(ExampleContext& ctx,
     gamma);
   bc_setup(bc, markers);
   return func(op);
+}
+
+enum class SolverRequestAdmission
+{
+  Accepted,
+  ResolutionFailure,
+  Mismatch,
+  CollectiveFailure
+};
+
+/// @brief Admit one identical, resolved request on every MPI rank.
+inline SolverRequestAdmission
+AdmitSolverRequest(const SolverRequestResolution& request)
+{
+  constexpr int tuple_size = 7;
+  const int local[tuple_size] = {
+    static_cast<int>(request.status),
+    static_cast<int>(request.discretization),
+    static_cast<int>(request.discretization_provenance),
+    request.dg_backend ? static_cast<int>(*request.dg_backend) : -1,
+    static_cast<int>(request.device_backend),
+    static_cast<int>(request.regularization),
+    static_cast<int>(request.time_integrator)};
+  int minimum[tuple_size] = {};
+  int maximum[tuple_size] = {};
+  const int minimum_status =
+    MPI_Allreduce(local, minimum, tuple_size, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  const int maximum_status =
+    MPI_Allreduce(local, maximum, tuple_size, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  if (minimum_status != MPI_SUCCESS || maximum_status != MPI_SUCCESS)
+  {
+    return SolverRequestAdmission::CollectiveFailure;
+  }
+  for (int i = 0; i < tuple_size; ++i)
+  {
+    if (minimum[i] != maximum[i])
+    {
+      return SolverRequestAdmission::Mismatch;
+    }
+  }
+  return minimum[0] ==
+           static_cast<int>(SolverRequestResolutionStatus::Resolved)
+           ? SolverRequestAdmission::Accepted
+           : SolverRequestAdmission::ResolutionFailure;
 }
 
 } // namespace detail
@@ -458,24 +503,52 @@ struct Solver
       spec.add_options(args, case_opts);
     }
     args.ParseCheck();
-    const DiscretizationResolution discretization_resolution =
-      ResolveDiscretization(case_cfg.defaults.dg_backend,
-                            cli_opts.discretization,
-                            cli_opts.dg_backend,
-                            HasDiscretizationOptionOverride(argc, argv),
-                            HasDGBackendOptionOverride(argc, argv));
-    MFEM_VERIFY(discretization_resolution.IsResolved(),
-                discretization_resolution.message);
-    if (!discretization_resolution.IsResolved())
+    const SolverRequestResolution request_resolution = ResolveSolverRequest(
+      case_cfg.defaults.dg_backend,
+      spec.use_igr,
+      cli_opts.discretization,
+      cli_opts.dg_backend,
+      cli_opts.regularization,
+      cli_opts.time_integrator,
+      HasDiscretizationOptionOverride(argc, argv),
+      HasDGBackendOptionOverride(argc, argv),
+      HasRegularizationOptionOverride(argc, argv),
+      HasTimeIntegratorOptionOverride(argc, argv),
+      cli_opts.device);
+    const detail::SolverRequestAdmission request_admission =
+      detail::AdmitSolverRequest(request_resolution);
+    if (request_admission != detail::SolverRequestAdmission::Accepted)
     {
+      if (mfem::Mpi::Root())
+      {
+        if (request_admission ==
+            detail::SolverRequestAdmission::ResolutionFailure)
+        {
+          std::cerr << request_resolution.message << "\n";
+        }
+        else if (request_admission == detail::SolverRequestAdmission::Mismatch)
+        {
+          std::cerr << "Solver request differs across MPI ranks; refusing "
+                       "runtime construction.\n";
+        }
+        else
+        {
+          std::cerr << "Unable to collectively admit the solver request.\n";
+        }
+      }
       return 1;
     }
     cli_opts.discretization =
-      DiscretizationToString(discretization_resolution.discretization);
+      DiscretizationToString(request_resolution.discretization);
+    cli_opts.device = DeviceBackendToString(request_resolution.device_backend);
+    cli_opts.regularization =
+      RegularizationToString(request_resolution.regularization);
+    cli_opts.time_integrator =
+      TimeIntegratorToString(request_resolution.time_integrator);
     MFEM_VERIFY(!cli_opts.restart_vtk.empty() ||
                   (cli_opts.restart_cycle < 0 && cli_opts.restart_step < 0),
                 "--restart-cycle/--restart-step require --restart-vtk.");
-    if (discretization_resolution.discretization == Discretization::HDG)
+    if (request_resolution.discretization == Discretization::HDG)
     {
       MFEM_VERIFY(static_cast<bool>(spec.run_hdg),
                   "Case '" << case_cfg.case_name
@@ -489,7 +562,7 @@ struct Solver
       // below.  Keep this device alive for its entire callback so the
       // borrowed CUDA session sees the same selected MFEM device lifetime as
       // every other CUDA execution route, without changing CPU/DG/DGSEM.
-      if (ParseDeviceBackend(cli_opts.device) == DeviceBackend::CUDA)
+      if (request_resolution.device_backend == DeviceBackend::CUDA)
       {
         mfem::Device hdg_cuda_device("cuda");
         if (mfem::Mpi::Root())
@@ -503,10 +576,10 @@ struct Solver
       return spec.run_hdg(case_opts, case_cfg, cli_opts);
     }
 
-    MFEM_VERIFY(discretization_resolution.dg_backend,
+    MFEM_VERIFY(request_resolution.dg_backend,
                 "DG/DGSEM selection requires a legacy DG backend mapping.");
     cli_opts.dg_backend =
-      DGBackendToString(*discretization_resolution.dg_backend);
+      DGBackendToString(*request_resolution.dg_backend);
     ApplyIGRDerivedRuntimeDefaults(cli_opts,
                                    cli_igr_opts,
                                    HasExactDGFaceOptionOverride(argc, argv));
@@ -515,8 +588,11 @@ struct Solver
       case_cfg,
       cli_opts,
       cli_igr_opts,
-      discretization_resolution.provenance);
-    if (spec.use_igr && mfem::Mpi::Root())
+      request_resolution.discretization_provenance,
+      request_resolution.regularization,
+      request_resolution.time_integrator);
+    const bool use_igr = run_cfg.regularization == Regularization::IGR;
+    if (use_igr && mfem::Mpi::Root())
     {
       std::cout << "[igr-options] event=effective"
                 << " exact_dg_face="
@@ -565,7 +641,7 @@ struct Solver
     bool glvis_enabled = run_cfg.opts.glvis;
     std::cout.precision(spec.glvis.precision);
 
-    const bool need_sigma_space = spec.use_igr || spec.need_sigma;
+    const bool need_sigma_space = use_igr || spec.need_sigma;
     const bool enable_h1_vis_diag =
       spec.diagnostics.h1_diagnostics &&
       (run_cfg.opts.glvis ||
@@ -620,7 +696,7 @@ struct Solver
     const double rho_floor = case_cfg.rk3_config.rho_min;
     std::unique_ptr<dg_igr::IGRSolver> igr;
     double vtk_c_alpha = spec.vtk.c_alpha_value;
-    if (spec.use_igr)
+    if (use_igr)
     {
       const auto alpha_policy = ResolveIGRAlphaLengthScalePolicy(run_cfg);
       const AlphaInfo alpha_info =

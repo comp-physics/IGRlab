@@ -65,9 +65,10 @@ template <typename CaseOptions, typename NumericalFlux> struct CaseSpec
   const char* case_file = nullptr;
   double gamma = mfem::dg_igr::EulerDefaults::kGamma;
   DGBackend dg_backend_default = DGBackend::DG;
+  /// Default regularization when --regularization is omitted.
   bool use_igr = true;
   /// Optional sigma-space allocation when IGR coupling is disabled.
-  /// When use_igr=true, sigma space is always allocated.
+  /// The resolved regularization selector independently requests IGR storage.
   bool need_sigma = false;
   bool need_h1 = false;
 

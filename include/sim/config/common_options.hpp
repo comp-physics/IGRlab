@@ -26,6 +26,10 @@ struct CommonOptions
   std::string dg_backend = "dg"; ///< DG backend: "dg" or "dgsem".
   std::string discretization;
   ///< General discretization selector; empty retains the per-case default.
+  std::string regularization;
+  ///< Regularization selector: none | igr; empty retains the case default.
+  std::string time_integrator;
+  ///< Time-integrator selector; empty selects the discretization default.
   std::string zhang_shu_points =
     "consumer"; ///< Zhang-Shu point set: "consumer" or "quadrature".
   std::string dgsem_stab =
@@ -104,6 +108,15 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-disc",
                  "--discretization",
                  "Discretization: dg | dgsem | hdg (case support required).");
+  args.AddOption(&opts.regularization,
+                 "-reg",
+                 "--regularization",
+                 "Regularization: none | igr (case support required).");
+  args.AddOption(&opts.time_integrator,
+                 "-ti",
+                 "--time-integrator",
+                 "Time integrator: rk3ssp | backward-euler "
+                 "(discretization support required).");
   args.AddOption(&opts.zhang_shu_points,
                  "-zsp",
                  "--zhang-shu-points",
