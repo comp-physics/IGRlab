@@ -677,7 +677,11 @@ bool CheckPrivateTracedScalarIgrLifecycle()
   GenericEulerHdgCpuSession session;
   const auto initialized = session.Initialize(request);
   if (initialized.status != GenericEulerCpuSessionStatus::initialized) return false;
-  std::vector<double> before(request.initial_state.scalar_count, 0.0);
+  mfem::L2_FECollection collection(1, 2, mfem::BasisType::GaussLegendre,
+                                   mfem::FiniteElement::VALUE);
+  mfem::ParFiniteElementSpace space(&mesh, &collection, 4,
+                                    mfem::Ordering::byNODES);
+  std::vector<double> before(static_cast<std::size_t>(space.GetVSize()), 0.0);
   const bool exported_before = session.ExportCommittedInterior(
       {before.data(), before.size()});
   GenericEulerCpuPreparedStep first;
@@ -725,6 +729,39 @@ bool CheckPrivateTracedScalarIgrZeroLocal()
   return initialized.status == GenericEulerCpuSessionStatus::initialized &&
       advanced.status == GenericEulerCpuSessionStatus::advanced &&
       reduction == MPI_SUCCESS && any_empty == 1 && boundary.calls == 0;
+}
+
+bool CheckPrivateTracedScalarIgrInitializationDeterminism()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  mfem::L2_FECollection collection(1, 2, mfem::BasisType::GaussLegendre,
+                                   mfem::FiniteElement::VALUE);
+  mfem::ParFiniteElementSpace space(&mesh, &collection, 4,
+                                    mfem::Ordering::byNODES);
+  std::vector<double> first(static_cast<std::size_t>(space.GetVSize()), 0.0);
+  std::vector<double> second(static_cast<std::size_t>(space.GetVSize()), 0.0);
+  bool first_ok = false;
+  {
+    GenericEulerHdgCpuSession session;
+    const auto initialized = session.Initialize(request);
+    first_ok = initialized.status == GenericEulerCpuSessionStatus::initialized &&
+        session.ExportCommittedInterior({first.data(), first.size()});
+  }
+  bool second_ok = false;
+  {
+    GenericEulerHdgCpuSession session;
+    const auto initialized = session.Initialize(request);
+    second_ok = initialized.status == GenericEulerCpuSessionStatus::initialized &&
+        session.ExportCommittedInterior({second.data(), second.size()});
+  }
+  return first_ok && second_ok && first == second && boundary.calls == 0;
 }
 
 bool CheckDynamicTauHighWaveTwoSteps()
@@ -941,6 +978,8 @@ int main(int argc, char* argv[])
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
   const bool private_igr = CheckPrivateTracedScalarIgrLifecycle();
   const bool private_igr_zero_local = CheckPrivateTracedScalarIgrZeroLocal();
+  const bool private_igr_initialization =
+      CheckPrivateTracedScalarIgrInitializationDeterminism();
   const bool dynamic_tau = CheckDynamicTauHighWaveTwoSteps();
   const bool boundary_picard = CheckClosedBoundaryPicardAssembly();
   const bool zero_owned = CheckZeroOwnedElementEngine();
@@ -950,7 +989,8 @@ int main(int argc, char* argv[])
   const bool callback_failure = CheckAcceptedRequestRankLocalCallbackFailure();
   const bool local = boundary_semantics && trace_restriction && orders &&
       prepared_lifecycle &&
-      periodic && private_igr && private_igr_zero_local && dynamic_tau && boundary_picard &&
+      periodic && private_igr && private_igr_zero_local &&
+      private_igr_initialization && dynamic_tau && boundary_picard &&
       zero_owned && subcommunicator && passive_world && mismatch &&
       callback_failure;
   if (!All(local))
@@ -963,6 +1003,7 @@ int main(int argc, char* argv[])
               << " orders=" << orders << " periodic=" << periodic
               << " private_igr=" << private_igr
               << " private_igr_zero_local=" << private_igr_zero_local
+              << " private_igr_initialization=" << private_igr_initialization
               << " prepared_lifecycle=" << prepared_lifecycle
               << " dynamic_tau=" << dynamic_tau
               << " boundary_picard=" << boundary_picard

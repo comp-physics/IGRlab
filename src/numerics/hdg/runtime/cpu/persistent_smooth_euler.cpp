@@ -1735,17 +1735,14 @@ struct detail::CpuNumericsCore::Implementation
   int igr_committed_index = 0;
   int igr_candidate_index = 1;
   IgrSlot igr_trial{};
-  mfem::Vector igr_private_local_trace;
-  std::unique_ptr<mfem::ParGridFunction> igr_private_trace_field;
   mfem::Vector igr_public_interior;
-  mfem::Vector igr_public_local_trace;
   mfem::Vector igr_public_true_trace;
   detail::TracedScalarIgrP1GlobalStepOutput igr_linear_output{};
   detail::TracedScalarIgrP1GlobalStepOutput igr_probe_output{};
   std::unique_ptr<detail::TracedScalarIgrP1Scratch> igr_scratch;
-  // Maps are captured once.  Entries encode an MFEM VDOF index and its sign;
-  // hot paths only perform fixed-size indexed copies and never ask MFEM to
-  // derive element maps or allocate temporary grid functions.
+  // Maps are captured once.  Entries encode direct owned component-slab
+  // indices; hot paths only perform fixed-size local copies, never a trace
+  // distribution, projection, or MFEM topology query.
   std::vector<int> igr_public_interior_to_private;
   std::vector<double> igr_public_interior_sign;
   std::vector<int> igr_public_trace_to_private;
@@ -1863,11 +1860,22 @@ struct detail::CpuNumericsCore::Implementation
   {
     if (source.interior.Size() != destination.interior.Size() ||
         source.true_trace.Size() != destination.true_trace.Size()) return false;
-    if (source.interior.Size()) std::memcpy(destination.interior.HostWrite(),
-        source.interior.HostRead(), static_cast<std::size_t>(source.interior.Size()) * sizeof(double));
-    if (source.true_trace.Size()) std::memcpy(destination.true_trace.HostWrite(),
-        source.true_trace.HostRead(), static_cast<std::size_t>(source.true_trace.Size()) * sizeof(double));
+    try {
+    if (source.interior.Size()) {
+      double* const target = destination.interior.HostWrite();
+      const double* const input = source.interior.HostRead();
+      if (!target || !input) return false;
+      std::memcpy(target, input, static_cast<std::size_t>(source.interior.Size()) * sizeof(double));
+    }
+    if (source.true_trace.Size()) {
+      double* const target = destination.true_trace.HostWrite();
+      const double* const input = source.true_trace.HostRead();
+      if (!target || !input) return false;
+      std::memcpy(target, input, static_cast<std::size_t>(source.true_trace.Size()) * sizeof(double));
+    }
     return Finite(destination.interior) && Finite(destination.true_trace);
+    }
+    catch (...) { return false; }
   }
   static StateHash HashIgrSlot(const IgrSlot& slot) noexcept
   { return HashPair(HashVector(slot.interior), HashVector(slot.true_trace)); }
@@ -1903,10 +1911,6 @@ struct detail::CpuNumericsCore::Implementation
     try
     {
       igr_affine_quads.assign(static_cast<std::size_t>(mesh->GetNE()), {});
-      igr_public_interior_to_private.assign(static_cast<std::size_t>(interior_space->GetVSize()), -1);
-      igr_public_interior_sign.assign(static_cast<std::size_t>(interior_space->GetVSize()), 0.0);
-      igr_public_trace_to_private.assign(static_cast<std::size_t>(trace_space->GetVSize()), -1);
-      igr_public_trace_sign.assign(static_cast<std::size_t>(trace_space->GetVSize()), 0.0);
       constexpr std::array<std::array<double, 2>, 4> corners{{{{0.,0.}},{{1.,0.}},{{1.,1.}},{{0.,1.}}}};
       for (int e = 0; e < mesh->GetNE(); ++e)
       {
@@ -1925,24 +1929,61 @@ struct detail::CpuNumericsCore::Implementation
         const double det = (q[1][0]-q[0][0])*(q[3][1]-q[0][1]) - (q[1][1]-q[0][1])*(q[3][0]-q[0][0]);
         if (!(det > 0.0) || std::abs(q[1][0]+q[3][0]-q[0][0]-q[2][0]) > 1.e-10 ||
             std::abs(q[1][1]+q[3][1]-q[0][1]-q[2][1]) > 1.e-10) return false;
-        mfem::Array<int> public_dofs, private_dofs;
-        interior_space->GetElementVDofs(e, public_dofs); private_interior->GetElementVDofs(e, private_dofs);
-        if (public_dofs.Size() != 16 || private_dofs.Size() != 28) return false;
-        for (int c = 0; c < 4; ++c) for (int d = 0; d < 4; ++d) {
-          double ps = 1., qs = 1.; const int p = Decode(public_dofs[c*4+d], ps); const int r = Decode(private_dofs[c*4+d], qs);
-          if (p < 0 || p >= interior_space->GetVSize() || r < 0 || r >= private_interior->GetVSize()) return false;
-          igr_public_interior_to_private[static_cast<std::size_t>(p)] = r; igr_public_interior_sign[static_cast<std::size_t>(p)] = ps * qs;
+      }
+      // Both spaces are byNODES and the scalar DG topology is identical at
+      // p1.  Prove the owned scalar slabs match before recording component
+      // maps; this avoids all per-step local/true trace projection.
+      const int public_interior_scalar = interior_space->GetVSize() / 4;
+      const int private_interior_scalar = private_interior->GetVSize() / 7;
+      const int public_trace_scalar = trace_space->GetTrueVSize() / 4;
+      const int private_trace_scalar = private_trace->GetTrueVSize() / 5;
+      if (interior_space->GetOrdering() != mfem::Ordering::byNODES ||
+          private_interior->GetOrdering() != mfem::Ordering::byNODES ||
+          trace_space->GetOrdering() != mfem::Ordering::byNODES ||
+          private_trace->GetOrdering() != mfem::Ordering::byNODES ||
+          interior_space->GetVDim() != 4 || private_interior->GetVDim() != 7 ||
+          trace_space->GetVDim() != 4 || private_trace->GetVDim() != 5 ||
+          interior_space->GetVSize() != 4 * public_interior_scalar ||
+          private_interior->GetVSize() != 7 * private_interior_scalar ||
+          trace_space->GetTrueVSize() != 4 * public_trace_scalar ||
+          private_trace->GetTrueVSize() != 5 * private_trace_scalar ||
+          public_interior_scalar != private_interior_scalar ||
+          public_trace_scalar != private_trace_scalar) return false;
+      igr_public_interior_to_private.assign(static_cast<std::size_t>(interior_space->GetVSize()), -1);
+      igr_public_interior_sign.assign(igr_public_interior_to_private.size(), 1.0);
+      igr_public_trace_to_private.assign(static_cast<std::size_t>(trace_space->GetTrueVSize()), -1);
+      igr_public_trace_sign.assign(igr_public_trace_to_private.size(), 1.0);
+      std::vector<unsigned char> interior_covered(static_cast<std::size_t>(private_interior->GetVSize()), 0);
+      std::vector<unsigned char> trace_covered(static_cast<std::size_t>(private_trace->GetTrueVSize()), 0);
+      for (int component = 0; component < 4; ++component)
+      {
+        for (int scalar = 0; scalar < public_interior_scalar; ++scalar)
+        {
+          const int public_index = component * public_interior_scalar + scalar;
+          const int private_index = component * private_interior_scalar + scalar;
+          igr_public_interior_to_private[static_cast<std::size_t>(public_index)] = private_index;
+          if (private_index < 0 || private_index >= private_interior->GetVSize() ||
+              interior_covered[static_cast<std::size_t>(private_index)]++) return false;
         }
-        trace_space->GetElementVDofs(e, public_dofs); private_trace->GetElementVDofs(e, private_dofs);
-        if (public_dofs.Size() != 32 || private_dofs.Size() != 40) return false;
-        for (int c = 0; c < 4; ++c) for (int d = 0; d < 8; ++d) {
-          double ps = 1., qs = 1.; const int p = Decode(public_dofs[c*8+d], ps); const int r = Decode(private_dofs[c*8+d], qs);
-          if (p < 0 || p >= trace_space->GetVSize() || r < 0 || r >= private_trace->GetVSize()) return false;
-          const std::size_t index = static_cast<std::size_t>(p);
-          if (igr_public_trace_to_private[index] >= 0 && (igr_public_trace_to_private[index] != r || igr_public_trace_sign[index] != ps * qs)) return false;
-          igr_public_trace_to_private[index] = r; igr_public_trace_sign[index] = ps * qs;
+        for (int scalar = 0; scalar < public_trace_scalar; ++scalar)
+        {
+          const int public_index = component * public_trace_scalar + scalar;
+          const int private_index = component * private_trace_scalar + scalar;
+          igr_public_trace_to_private[static_cast<std::size_t>(public_index)] = private_index;
+          if (private_index < 0 || private_index >= private_trace->GetTrueVSize() ||
+              trace_covered[static_cast<std::size_t>(private_index)]++) return false;
         }
       }
+      for (const int value : igr_public_interior_to_private)
+        if (value < 0 || value >= private_interior->GetVSize()) return false;
+      for (const int value : igr_public_trace_to_private)
+        if (value < 0 || value >= private_trace->GetTrueVSize()) return false;
+      for (int component = 0; component < 4; ++component)
+        for (int scalar = 0; scalar < private_interior_scalar; ++scalar)
+          if (interior_covered[static_cast<std::size_t>(component * private_interior_scalar + scalar)] != 1) return false;
+      for (int component = 0; component < 4; ++component)
+        for (int scalar = 0; scalar < private_trace_scalar; ++scalar)
+          if (trace_covered[static_cast<std::size_t>(component * private_trace_scalar + scalar)] != 1) return false;
     }
     catch (...) { return false; }
     return true;
@@ -1950,38 +1991,35 @@ struct detail::CpuNumericsCore::Implementation
 
   bool MapPublicToIgr(const CpuSlotStorage& public_slot, IgrSlot& private_slot) noexcept
   {
-    if (!ValidIgrSlot(private_slot) || !iterate_trace || public_slot.interior.size() != igr_public_interior_to_private.size()) return false;
-    private_slot.interior = 0.0; igr_private_local_trace = 0.0;
-    double* pi = private_slot.interior.HostWrite(); double* pt = igr_private_local_trace.HostWrite();
-    const double* ui = public_slot.interior.data(); const double* ut = iterate_trace->HostRead();
-    if ((!pi && private_slot.interior.Size()) || (!pt && igr_private_local_trace.Size()) || (!ui && !public_slot.interior.empty()) || (!ut && iterate_trace->Size())) return false;
-    for (std::size_t i = 0; i < igr_public_interior_to_private.size(); ++i) pi[igr_public_interior_to_private[i]] = igr_public_interior_sign[i] * ui[i];
-    for (std::size_t i = 0; i < igr_public_trace_to_private.size(); ++i) if (igr_public_trace_to_private[i] >= 0) pt[igr_public_trace_to_private[i]] = igr_public_trace_sign[i] * ut[i];
+    if (!igr_layout || private_slot.interior.Size() != igr_layout->InteriorLocalVSize() ||
+        private_slot.true_trace.Size() != igr_layout->TraceTrueVSize() ||
+        public_slot.interior.size() != igr_public_interior_to_private.size() ||
+        public_slot.trace.size() != igr_public_trace_to_private.size()) return false;
     try {
-      std::memcpy(igr_private_trace_field->HostWrite(), pt,
-                  static_cast<std::size_t>(igr_private_local_trace.Size()) * sizeof(double));
-      igr_private_trace_field->ParallelProject(private_slot.true_trace);
+    private_slot.interior = 0.0; private_slot.true_trace = 0.0;
+    double* pi = private_slot.interior.HostWrite(); double* pt = private_slot.true_trace.HostWrite();
+    const double* ui = public_slot.interior.data(); const double* ut = public_slot.trace.data();
+    if ((!pi && private_slot.interior.Size()) || (!pt && private_slot.true_trace.Size()) || (!ui && !public_slot.interior.empty()) || (!ut && !public_slot.trace.empty())) return false;
+    for (std::size_t i = 0; i < igr_public_interior_to_private.size(); ++i) pi[igr_public_interior_to_private[i]] = igr_public_interior_sign[i] * ui[i];
+    for (std::size_t i = 0; i < igr_public_trace_to_private.size(); ++i) pt[igr_public_trace_to_private[i]] = igr_public_trace_sign[i] * ut[i];
+    return ValidIgrSlot(private_slot);
     }
     catch (...) { return false; }
-    return ValidIgrSlot(private_slot);
   }
 
   bool MapIgrToPublic(const IgrSlot& private_slot) noexcept
   {
-    if (!ValidIgrSlot(private_slot) || !igr_layout->DistributeTrace(private_slot.true_trace, igr_private_local_trace)) return false;
-    igr_public_interior = 0.0; igr_public_local_trace = 0.0;
-    double* ui = igr_public_interior.HostWrite(); double* ut = igr_public_local_trace.HostWrite();
-    const double* pi = private_slot.interior.HostRead(); const double* pt = igr_private_local_trace.HostRead();
-    if ((!ui && igr_public_interior.Size()) || (!ut && igr_public_local_trace.Size()) || (!pi && private_slot.interior.Size()) || (!pt && igr_private_local_trace.Size())) return false;
-    for (std::size_t i = 0; i < igr_public_interior_to_private.size(); ++i) ui[i] = igr_public_interior_sign[i] * pi[igr_public_interior_to_private[i]];
-    for (std::size_t i = 0; i < igr_public_trace_to_private.size(); ++i) if (igr_public_trace_to_private[i] >= 0) ut[i] = igr_public_trace_sign[i] * pt[igr_public_trace_to_private[i]];
     try {
-      std::memcpy(iterate_trace->HostWrite(), ut,
-                  static_cast<std::size_t>(igr_public_local_trace.Size()) * sizeof(double));
-      iterate_trace->ParallelProject(igr_public_true_trace);
+    if (!ValidIgrSlot(private_slot)) return false;
+    igr_public_interior = 0.0; igr_public_true_trace = 0.0;
+    double* ui = igr_public_interior.HostWrite(); double* ut = igr_public_true_trace.HostWrite();
+    const double* pi = private_slot.interior.HostRead(); const double* pt = private_slot.true_trace.HostRead();
+    if ((!ui && igr_public_interior.Size()) || (!ut && igr_public_true_trace.Size()) || (!pi && private_slot.interior.Size()) || (!pt && private_slot.true_trace.Size())) return false;
+    for (std::size_t i = 0; i < igr_public_interior_to_private.size(); ++i) ui[i] = igr_public_interior_sign[i] * pi[igr_public_interior_to_private[i]];
+    for (std::size_t i = 0; i < igr_public_trace_to_private.size(); ++i) ut[i] = igr_public_trace_sign[i] * pt[igr_public_trace_to_private[i]];
+    return Finite(igr_public_interior) && Finite(igr_public_true_trace);
     }
     catch (...) { return false; }
-    return Finite(igr_public_interior) && Finite(igr_public_true_trace);
   }
 
   CpuNumericalResult ExecuteIgrBorrowedStep(
@@ -2054,14 +2092,17 @@ struct detail::CpuNumericsCore::Implementation
       }
       if (!CollectiveAll(Finite(igr_probe_output.initial_residual_norm) &&
                          igr_probe_output.initial_residual_norm >= 0.0)) return fail(CpuFailurePhase::assembly);
-      if (igr_probe_output.initial_residual_norm <= residual || backtrack == 7)
+      const double armijo = (1.0 - config.armijo_constant * scale) * residual;
+      if (igr_probe_output.initial_residual_norm <= armijo)
       {
         if (!CollectiveAll(CopyIgrSlot(igr_trial, IgrCandidate()))) return fail(CpuFailurePhase::recovery);
         residual = igr_probe_output.initial_residual_norm; accepted = true;
         evidence.final_line_search_trials = backtrack + 1;
       }
     }
-    if (!CollectiveAll(accepted && MapIgrToPublic(IgrCandidate()))) return fail(CpuFailurePhase::recovery);
+    if (!CollectiveAll(accepted)) return fail(CpuFailurePhase::recovery);
+    const bool mapped = MapIgrToPublic(IgrCandidate());
+    if (!CollectiveAll(mapped)) return fail(CpuFailurePhase::recovery);
     const bool copied = Copy(igr_public_interior, Candidate()->interior) &&
         Copy(igr_public_true_trace, Candidate()->trace);
     if (!CollectiveAll(copied)) return fail(CpuFailurePhase::recovery);
@@ -3617,16 +3658,13 @@ struct detail::CpuNumericsCore::Implementation
     { return static_cast<std::size_t>(vector.Capacity()) * sizeof(double); };
     const std::size_t igr_bytes = !IsIgr() ? 0 :
         mfem_bytes(igr_trial.interior) + mfem_bytes(igr_trial.true_trace) +
-        mfem_bytes(igr_private_local_trace) + mfem_bytes(igr_public_interior) +
-        mfem_bytes(igr_public_local_trace) + mfem_bytes(igr_public_true_trace) +
+        mfem_bytes(igr_public_interior) + mfem_bytes(igr_public_true_trace) +
         mfem_bytes(igr_linear_output.interior_increment) +
         mfem_bytes(igr_linear_output.trace_increment) +
         mfem_bytes(igr_probe_output.interior_increment) +
         mfem_bytes(igr_probe_output.trace_increment) + bytes(igr_affine_quads) +
         bytes(igr_public_interior_to_private) + bytes(igr_public_interior_sign) +
         bytes(igr_public_trace_to_private) + bytes(igr_public_trace_sign) +
-        (igr_private_trace_field ?
-             static_cast<std::size_t>(igr_private_trace_field->Capacity()) * sizeof(double) : 0) +
         (igr_scratch ? igr_scratch->WorkspaceBytes() : 0);
     return igr_bytes + bytes(current_system.residual_interior) +
         bytes(current_system.residual_trace) + bytes(current_system.a) +
@@ -5159,17 +5197,20 @@ bool detail::CpuNumericsCore::CommitBorrowedEuler(
                                         state.candidate_slot) &&
       Finite(state.active_evidence.attempt.maximum_wave_speed) &&
       state.active_evidence.attempt.maximum_wave_speed >= 0.0;
-  const bool private_coherent = !state.IsIgr() ||
+  const bool private_preflight = !state.IsIgr() ||
       (state.igr_candidate_hash == HashIgrSlot(state.IgrCandidate()) &&
-       state.MapIgrToPublic(state.IgrCandidate()) &&
-       state.igr_candidate_public_hash == HashPair(HashVector(state.igr_public_interior),
-                                                    HashVector(state.igr_public_true_trace)) &&
        state.igr_candidate_public_hash == HashPair(HashDoubles(state.Candidate()->interior),
                                                     HashDoubles(state.Candidate()->trace)));
-  if (!state.CollectiveAll(generation_consensus && local_valid && private_coherent))
+  if (!state.CollectiveAll(generation_consensus && local_valid && private_preflight))
   {
     return false;
   }
+  const bool mapped = !state.IsIgr() || state.MapIgrToPublic(state.IgrCandidate());
+  if (!state.CollectiveAll(mapped)) { return false; }
+  const bool private_coherent = !state.IsIgr() ||
+      state.igr_candidate_public_hash == HashPair(HashVector(state.igr_public_interior),
+                                                   HashVector(state.igr_public_true_trace));
+  if (!state.CollectiveAll(private_coherent)) { return false; }
 
   const AttemptIdentity attempt = state.active_evidence.attempt.identity;
   const StateHash candidate_hash = state.active_candidate_state_hash;
@@ -5636,43 +5677,52 @@ bool detail::CpuNumericsCore::InitializeInternal(
       {
         const int interior = state.igr_layout->InteriorLocalVSize();
         const int trace_true = state.igr_layout->TraceTrueVSize();
-        const int trace_local = state.igr_layout->TraceLocalVSize();
-        for (auto& slot : state.igr_slots) { slot.interior.SetSize(interior); slot.true_trace.SetSize(trace_true); }
+        for (auto& slot : state.igr_slots) {
+          slot.interior.SetSize(interior); slot.interior = 0.0;
+          slot.true_trace.SetSize(trace_true); slot.true_trace = 0.0;
+        }
         state.igr_trial.interior.SetSize(interior); state.igr_trial.true_trace.SetSize(trace_true);
-        state.igr_private_local_trace.SetSize(trace_local);
+        state.igr_trial.interior = 0.0; state.igr_trial.true_trace = 0.0;
         state.igr_public_interior.SetSize(state.interior_space->GetVSize());
-        state.igr_public_local_trace.SetSize(state.trace_space->GetVSize());
+        state.igr_public_interior = 0.0;
         state.igr_public_true_trace.SetSize(state.trace_space->GetTrueVSize());
+        state.igr_public_true_trace = 0.0;
         state.igr_linear_output.interior_increment.SetSize(interior);
         state.igr_linear_output.trace_increment.SetSize(trace_true);
         state.igr_probe_output.interior_increment.SetSize(interior);
         state.igr_probe_output.trace_increment.SetSize(trace_true);
-        state.igr_private_trace_field = std::make_unique<mfem::ParGridFunction>(
-            const_cast<mfem::ParFiniteElementSpace*>(state.igr_layout->TraceSpace()));
-        local_ok = state.ObserveWrapper(state.igr_private_trace_field) &&
-            state.MapPublicToIgr(*state.Committed(), state.IgrCommitted()) &&
+        state.igr_linear_output.interior_increment = 0.0;
+        state.igr_linear_output.trace_increment = 0.0;
+        state.igr_probe_output.interior_increment = 0.0;
+        state.igr_probe_output.trace_increment = 0.0;
+        local_ok = state.MapPublicToIgr(*state.Committed(), state.IgrCommitted()) &&
             CopyIgrSlot(state.IgrCommitted(), state.IgrCandidate()) &&
             CopyIgrSlot(state.IgrCommitted(), state.igr_trial);
         state.igr_committed_hash = HashIgrSlot(state.IgrCommitted());
         state.igr_candidate_hash = HashIgrSlot(state.IgrCandidate());
-        traced_scalar_igr_p1::Parameters parameters{};
-        parameters.alpha = borrowed_request->regularization.alpha;
-        parameters.beta = borrowed_request->regularization.beta;
-        parameters.dt = state.config.dt;
-        parameters.density_floor = density_gate;
-        detail::TracedScalarIgrP1GlobalStepInput input{};
-        input.communicator = state.communicator; input.layout = state.igr_layout.get();
-        input.affine_quads = state.igr_affine_quads.data(); input.affine_quad_count = static_cast<int>(state.igr_affine_quads.size());
-        input.parameters = parameters; input.current_true_trace = &state.IgrCommitted().true_trace;
-        input.previous_true_trace = &state.IgrCommitted().true_trace; input.current_interior = &state.IgrCommitted().interior;
-        input.previous_interior = &state.IgrCommitted().interior; input.static_euler_rhs_space = state.interior_space.get();
-        input.static_euler_rhs_coefficients = state.external_source.get();
         state.igr_scratch = std::make_unique<detail::TracedScalarIgrP1Scratch>(state.communicator, *state.igr_layout);
-        local_ok = local_ok && state.igr_scratch && state.igr_scratch->Initialize(input) && state.igr_scratch->IsReady();
+        local_ok = local_ok && state.igr_scratch != nullptr;
       }
     }
     catch (...) { local_ok = false; }
     if (!state.CollectiveAll(local_ok)) { return false; }
+    // No rank enters scratch initialization until every rank has constructed
+    // the identical retained layout, maps, slots, and pre-sized outputs.
+    traced_scalar_igr_p1::Parameters parameters{};
+    parameters.alpha = borrowed_request->regularization.alpha;
+    parameters.beta = borrowed_request->regularization.beta;
+    parameters.dt = state.config.dt;
+    parameters.density_floor = density_gate;
+    detail::TracedScalarIgrP1GlobalStepInput input{};
+    input.communicator = state.communicator; input.layout = state.igr_layout.get();
+    input.affine_quads = state.igr_affine_quads.data(); input.affine_quad_count = static_cast<int>(state.igr_affine_quads.size());
+    input.parameters = parameters; input.current_true_trace = &state.IgrCandidate().true_trace;
+    input.previous_true_trace = &state.IgrCommitted().true_trace; input.current_interior = &state.IgrCandidate().interior;
+    input.previous_interior = &state.IgrCommitted().interior; input.static_euler_rhs_space = state.interior_space.get();
+    input.static_euler_rhs_coefficients = state.external_source.get();
+    const bool scratch_ready = state.igr_scratch->Initialize(input) &&
+        state.igr_scratch->IsReady();
+    if (!state.CollectiveAll(scratch_ready)) { return false; }
   }
 
   // Prove the exact storage semantics required by the accepted two-phase
@@ -5809,18 +5859,29 @@ bool detail::CpuNumericsCore::InitializeInternal(
   resources.layout = StableIdentity::Copy(state.IsIgr()
       ? "cpu.borrowed.p1.traced-scalar-igr.private.7x5.v1"
       : detail::cpu_runtime_layout_identity);
-  std::size_t state_bytes =
-      (state.Committed()->interior.capacity() +
-       state.Committed()->trace.capacity()) * sizeof(double);
+  std::size_t persistent_bytes = 0;
+  const auto add_persistent = [&persistent_bytes](const std::size_t count) noexcept
+  {
+    return count <= (std::numeric_limits<std::size_t>::max() - persistent_bytes) /
+            sizeof(double) &&
+        (persistent_bytes += count * sizeof(double), true);
+  };
+  bool persistent_bytes_valid =
+      add_persistent(state.committed_slot.interior.capacity()) &&
+      add_persistent(state.committed_slot.trace.capacity()) &&
+      add_persistent(state.candidate_slot.interior.capacity()) &&
+      add_persistent(state.candidate_slot.trace.capacity());
   if (state.IsIgr())
   {
-    state_bytes += (static_cast<std::size_t>(state.igr_slots[0].interior.Capacity()) +
-                    static_cast<std::size_t>(state.igr_slots[0].true_trace.Capacity()) +
-                    static_cast<std::size_t>(state.igr_slots[1].interior.Capacity()) +
-                    static_cast<std::size_t>(state.igr_slots[1].true_trace.Capacity())) * sizeof(double);
+    persistent_bytes_valid = persistent_bytes_valid &&
+        add_persistent(static_cast<std::size_t>(state.igr_slots[0].interior.Capacity())) &&
+        add_persistent(static_cast<std::size_t>(state.igr_slots[0].true_trace.Capacity())) &&
+        add_persistent(static_cast<std::size_t>(state.igr_slots[1].interior.Capacity())) &&
+        add_persistent(static_cast<std::size_t>(state.igr_slots[1].true_trace.Capacity()));
   }
+  if (!state.CollectiveAll(persistent_bytes_valid)) { return false; }
   resources.reuse = {true, true, true, false, 1, 1,
-                     2 * state_bytes, state.WorkspaceBytes()};
+                     persistent_bytes, state.WorkspaceBytes()};
   if (!state.CollectiveAll(resources.Valid())) { return false; }
 
   state.evidence.tuple = tuple;

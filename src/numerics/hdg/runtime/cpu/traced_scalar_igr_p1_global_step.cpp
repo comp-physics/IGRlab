@@ -2028,6 +2028,13 @@ std::size_t TracedScalarIgrP1Scratch::WorkspaceBytes() const noexcept
       add_doubles(state.g) && add_doubles(state.schur) && add_doubles(state.reduced) &&
       add_doubles(state.source_samples) &&
       add(state.operators.capacity(), sizeof(local::LocalOperator));
+  for (const local::LocalOperator& op : state.operators)
+  {
+    ok = ok && add_doubles(op.interior_residual) &&
+        add_doubles(op.trace_residual) && add_doubles(op.A) &&
+        add_doubles(op.B) && add_doubles(op.C) && add_doubles(op.D) &&
+        add_doubles(op.f) && add_doubles(op.g);
+  }
   const SolveAndRecoverTracedScalarIgrP1State& solve = state.solve_and_recovery;
   ok = ok && add_vector(solve.true_trace) && add_vector(solve.next_trace) &&
       add_vector(solve.local_trace) && add_vector(solve.next_interior) &&
