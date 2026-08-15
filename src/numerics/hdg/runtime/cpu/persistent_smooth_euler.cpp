@@ -5134,7 +5134,7 @@ bool detail::CpuNumericsCore::PrepareBorrowedEuler(
       numerical.originating_failure == FailureReason::none &&
       CpuStateStoragePolicy::CanPublish(state.committed_slot,
                                         state.candidate_slot) &&
-      (!state.IsIgr() || (state.igr_candidate_hash == HashIgrSlot(state.IgrCandidate()) &&
+      (!state.IsIgr() || (state.igr_candidate_hash == state.HashIgrSlot(state.IgrCandidate()) &&
           state.igr_candidate_public_hash == HashPair(HashDoubles(state.Candidate()->interior),
                                                        HashDoubles(state.Candidate()->trace))));
   if (!state.CollectiveAll(accepted))
@@ -5200,7 +5200,7 @@ bool detail::CpuNumericsCore::CommitBorrowedEuler(
       Finite(state.active_evidence.attempt.maximum_wave_speed) &&
       state.active_evidence.attempt.maximum_wave_speed >= 0.0;
   const bool private_preflight = !state.IsIgr() ||
-      (state.igr_candidate_hash == HashIgrSlot(state.IgrCandidate()) &&
+      (state.igr_candidate_hash == state.HashIgrSlot(state.IgrCandidate()) &&
        state.igr_candidate_public_hash == HashPair(HashDoubles(state.Candidate()->interior),
                                                     HashDoubles(state.Candidate()->trace)));
   if (!state.CollectiveAll(generation_consensus && local_valid && private_preflight))
@@ -5698,10 +5698,10 @@ bool detail::CpuNumericsCore::InitializeInternal(
         state.igr_probe_output.interior_increment = 0.0;
         state.igr_probe_output.trace_increment = 0.0;
         local_ok = state.MapPublicToIgr(*state.Committed(), state.IgrCommitted()) &&
-            CopyIgrSlot(state.IgrCommitted(), state.IgrCandidate()) &&
-            CopyIgrSlot(state.IgrCommitted(), state.igr_trial);
-        state.igr_committed_hash = HashIgrSlot(state.IgrCommitted());
-        state.igr_candidate_hash = HashIgrSlot(state.IgrCandidate());
+            state.CopyIgrSlot(state.IgrCommitted(), state.IgrCandidate()) &&
+            state.CopyIgrSlot(state.IgrCommitted(), state.igr_trial);
+        state.igr_committed_hash = state.HashIgrSlot(state.IgrCommitted());
+        state.igr_candidate_hash = state.HashIgrSlot(state.IgrCandidate());
         state.igr_scratch = std::make_unique<detail::TracedScalarIgrP1Scratch>(state.communicator, *state.igr_layout);
         local_ok = local_ok && state.igr_scratch != nullptr;
       }
@@ -5869,10 +5869,10 @@ bool detail::CpuNumericsCore::InitializeInternal(
         (persistent_bytes += count * sizeof(double), true);
   };
   bool persistent_bytes_valid =
-      add_persistent(state.committed_slot.interior.capacity()) &&
-      add_persistent(state.committed_slot.trace.capacity()) &&
-      add_persistent(state.candidate_slot.interior.capacity()) &&
-      add_persistent(state.candidate_slot.trace.capacity());
+      add_persistent(state.Committed()->interior.capacity()) &&
+      add_persistent(state.Committed()->trace.capacity()) &&
+      add_persistent(state.Candidate()->interior.capacity()) &&
+      add_persistent(state.Candidate()->trace.capacity());
   if (state.IsIgr())
   {
     persistent_bytes_valid = persistent_bytes_valid &&
