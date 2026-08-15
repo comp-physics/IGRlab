@@ -85,6 +85,14 @@ foreach(_index RANGE 0 2)
      NOT _pvtu_text MATCHES "NumberOfComponents=\\\"4\\\"")
     message(FATAL_ERROR "CUDA HDG PVTU cycle ${_cycle} misses four-component conservative data")
   endif()
+  string(REGEX MATCHALL
+    "<Piece Source=\\\"proc[0-9][0-9][0-9][0-9][0-9][0-9]\\.vtu\\\"/>"
+    _pvtu_piece_references "${_pvtu_text}")
+  list(LENGTH _pvtu_piece_references _pvtu_piece_count)
+  if(NOT _pvtu_piece_count EQUAL HDG_MAIN_RANKS)
+    message(FATAL_ERROR
+      "CUDA HDG PVTU cycle ${_cycle} has ${_pvtu_piece_count} piece references; expected ${HDG_MAIN_RANKS}")
+  endif()
   math(EXPR _last_rank "${HDG_MAIN_RANKS} - 1")
   foreach(_rank RANGE 0 ${_last_rank})
     set(_rank_text "000000${_rank}")
@@ -92,6 +100,11 @@ foreach(_index RANGE 0 2)
     math(EXPR _rank_suffix_start "${_rank_text_length} - 6")
     string(SUBSTRING "${_rank_text}" ${_rank_suffix_start} 6 _rank_suffix)
     set(_vtu "${_root}/Cycle${_cycle}/proc${_rank_suffix}.vtu")
+    if(NOT _pvtu_text MATCHES
+        "<Piece Source=\\\"proc${_rank_suffix}\\.vtu\\\"/>")
+      message(FATAL_ERROR
+        "CUDA HDG PVTU cycle ${_cycle} omits rank ${_rank} piece proc${_rank_suffix}.vtu")
+    endif()
     if(NOT EXISTS "${_vtu}")
       message(FATAL_ERROR "missing CUDA HDG VTU piece for rank ${_rank}: ${_vtu}")
     endif()
