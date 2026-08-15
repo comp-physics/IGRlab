@@ -356,7 +356,6 @@ struct SolveAndRecoverTracedScalarIgrP1State final
 
 static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
     const TracedScalarIgrP1TraceSolveInput& input,
-    TracedScalarIgrP1TraceSolveOutput& output,
     SolveAndRecoverTracedScalarIgrP1State& state) noexcept
 {
   if (input.communicator == MPI_COMM_NULL) { return false; }
@@ -399,6 +398,7 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
   std::vector<double>& local_trace_values = state.local_trace_values;
   mfem::Vector& gathered_trace = state.gathered_trace;
   mfem::Vector& element_interior = state.element_interior;
+  TracedScalarIgrP1TraceSolveOutput& result = state.result;
   bool local_ok = true;
   try
   {
@@ -409,6 +409,14 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
     gathered_trace.SetSize(40); element_interior.SetSize(28);
     recovered.resize(static_cast<std::size_t>(elements) * 28);
     local_trace_values.resize(static_cast<std::size_t>(elements) * 40);
+    if (result.trace_increment.Size() != input.layout->TraceTrueVSize())
+    {
+      result.trace_increment.SetSize(input.layout->TraceTrueVSize());
+    }
+    if (result.interior_increment.Size() != input.layout->InteriorLocalVSize())
+    {
+      result.interior_increment.SetSize(input.layout->InteriorLocalVSize());
+    }
   }
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
@@ -501,22 +509,17 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
   }
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
-  TracedScalarIgrP1TraceSolveOutput published;
-  try
-  {
-    published.trace_increment.SetSize(next_trace.Size());
-    published.interior_increment.SetSize(next_interior.Size());
-    local_ok = CopyVector(next_trace, published.trace_increment) &&
-        CopyVector(next_interior, published.interior_increment);
-  }
-  catch (const std::exception&) { local_ok = false; }
+  // The retained result is written in place only after all solve/recovery
+  // gates; it is never swapped into an external caller output.
+  local_ok = result.trace_increment.Size() == next_trace.Size() &&
+      result.interior_increment.Size() == next_interior.Size() &&
+      HasCapacity(result.trace_increment, next_trace.Size()) &&
+      HasCapacity(result.interior_increment, next_interior.Size()) &&
+      CopyVector(next_trace, result.trace_increment) &&
+      CopyVector(next_interior, result.interior_increment);
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
-  published.reduced_rhs_norm = rhs_norm;
-  published.linear_residual_norm = linear_norm;
-  output.trace_increment.Swap(published.trace_increment);
-  output.interior_increment.Swap(published.interior_increment);
-  output.reduced_rhs_norm = published.reduced_rhs_norm;
-  output.linear_residual_norm = published.linear_residual_norm;
+  result.reduced_rhs_norm = rhs_norm;
+  result.linear_residual_norm = linear_norm;
   return true;
 }
 
@@ -525,7 +528,28 @@ bool SolveAndRecoverTracedScalarIgrP1Trace(
     TracedScalarIgrP1TraceSolveOutput& output) noexcept
 {
   SolveAndRecoverTracedScalarIgrP1State state;
-  return SolveAndRecoverTracedScalarIgrP1TraceWithState(input, output, state);
+  if (!SolveAndRecoverTracedScalarIgrP1TraceWithState(input, state))
+  {
+    return false;
+  }
+  TracedScalarIgrP1TraceSolveOutput published;
+  bool local_ok = true;
+  try
+  {
+    published.trace_increment.SetSize(state.result.trace_increment.Size());
+    published.interior_increment.SetSize(state.result.interior_increment.Size());
+    local_ok = CopyVector(state.result.trace_increment, published.trace_increment) &&
+        CopyVector(state.result.interior_increment, published.interior_increment);
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  published.reduced_rhs_norm = state.result.reduced_rhs_norm;
+  published.linear_residual_norm = state.result.linear_residual_norm;
+  output.trace_increment.Swap(published.trace_increment);
+  output.interior_increment.Swap(published.interior_increment);
+  output.reduced_rhs_norm = published.reduced_rhs_norm;
+  output.linear_residual_norm = published.linear_residual_norm;
+  return true;
 }
 
 /** Per-call ownership for the one shared convenience compute path. */
@@ -904,15 +928,16 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
   {
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
-  TracedScalarIgrP1TraceSolveOutput& solved = state.solve_and_recovery.result;
   const TracedScalarIgrP1TraceSolveInput solve_input{
       input.communicator, &layout, trace_space, true_matrix.get(),
       &true_rhs_values, &condensation};
   if (!SolveAndRecoverTracedScalarIgrP1TraceWithState(
-          solve_input, solved, state.solve_and_recovery))
+          solve_input, state.solve_and_recovery))
   {
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
+  const TracedScalarIgrP1TraceSolveOutput& solved =
+      state.solve_and_recovery.result;
   TracedScalarIgrP1GlobalStepOutput published;
   try
   {
@@ -1019,7 +1044,7 @@ TracedScalarIgrP1Scratch::TracedScalarIgrP1Scratch(
     solve.next_interior.SetSize(interior_size);
     solve.gathered_trace.SetSize(40);
     solve.element_interior.SetSize(28);
-    solve.recovered.resize(reduced_capacity);
+    solve.recovered.resize(f_capacity);
     solve.local_trace_values.resize(g_capacity);
     solve.result.trace_increment.SetSize(trace_true_size);
     solve.result.interior_increment.SetSize(interior_size);
