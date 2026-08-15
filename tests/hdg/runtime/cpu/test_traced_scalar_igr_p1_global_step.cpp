@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -22,6 +23,20 @@ bool AllRanks(const MPI_Comm communicator, const bool local_ok)
   int result = 0;
   return MPI_Allreduce(&source, &result, 1, MPI_INT, MPI_MIN,
                        communicator) == MPI_SUCCESS && result == 1;
+}
+
+bool Require(const MPI_Comm communicator, const bool local_ok,
+             const char* const stage)
+{
+  if (AllRanks(communicator, local_ok)) { return true; }
+  int rank = -1;
+  MPI_Comm_rank(communicator, &rank);
+  if (!local_ok)
+  {
+    std::cerr << "traced_scalar_igr_p1_global_step: " << stage
+              << " failed on rank " << rank << '\n';
+  }
+  return false;
 }
 
 bool Finite(const mfem::Vector& values)
@@ -59,7 +74,9 @@ bool FillTrueTrace(const mfem::ParFiniteElementSpace& space, mfem::Vector& value
   {
     const int local_true = space.GetLocalTDofNumber(local_dof);
     if (local_true < 0) { continue; }
-    const int component = local_dof % 5; // p1 byNODES component ordering.
+    const int scalar_vsize = space.GetVSize() / 5;
+    if (scalar_vsize <= 0) { return false; }
+    const int component = local_dof / scalar_vsize;
     const double base = component == 0 ? 1.0 : component == 1 ? 0.14 :
         component == 2 ? -0.03 : component == 3 ? 2.8 : 0.85;
     values[local_true] = base + perturbation * static_cast<double>(local_dof + 1);
@@ -76,7 +93,9 @@ bool FillEquilibriumTrueTrace(const mfem::ParFiniteElementSpace& space,
   {
     const int local_true = space.GetLocalTDofNumber(local_dof);
     if (local_true < 0) { continue; }
-    const int component = local_dof % 5;
+    const int scalar_vsize = space.GetVSize() / 5;
+    if (scalar_vsize <= 0) { return false; }
+    const int component = local_dof / scalar_vsize;
     values[local_true] = component == 0 ? 1.0 : component == 1 ? 0.1 :
         component == 2 ? -0.02 : component == 3 ? 2.6 : 0.0;
   }
@@ -146,10 +165,12 @@ bool FillSource(const mfem::ParFiniteElementSpace& space, mfem::Vector& values,
   {
     return false;
   }
+  const int scalar_vsize = space.GetVSize() / 4;
+  if (scalar_vsize <= 0) { return false; }
   for (int vdof = 0; vdof < values.Size(); ++vdof)
   {
-    const int component = vdof % 4;
-    const int node = vdof / 4;
+    const int component = vdof / scalar_vsize;
+    const int node = vdof % scalar_vsize;
     values[vdof] = (component == 3 ? 0.015 : 0.0) + slope *
         static_cast<double>((node % 4) - 1.5) * static_cast<double>(component + 1);
   }
@@ -202,7 +223,7 @@ bool SampleSource(const mfem::ParFiniteElementSpace& space,
       for (int dof = 0; dof < 4; ++dof)
       {
         double sign = 1.0;
-        const int vdof = DecodeSigned(vdofs[dof * 4 + component], sign);
+        const int vdof = DecodeSigned(vdofs[component * 4 + dof], sign);
         if (vdof < 0 || vdof >= coefficients.Size()) { return false; }
         samples[static_cast<std::size_t>(point) * 4 + component] +=
             shape[dof] * sign * coefficients[vdof];
@@ -372,25 +393,25 @@ bool Check(const MPI_Comm communicator)
                                             mfem::Ordering::byNODES);
   std::vector<local::AffineQuad> quads;
   bool ok = layout.IsUsable() && BuildAffineQuads(mesh, quads);
-  if (!AllRanks(communicator, ok)) { return false; }
+  if (!Require(communicator, ok, "layout/geometry setup")) { return false; }
 
   mfem::Vector source_a(source_space.GetVSize());
   mfem::Vector source_b(source_space.GetVSize());
   ok = FillSource(source_space, source_a, 2.0e-3) &&
       FillSource(source_space, source_b, -2.0e-3);
-  if (!AllRanks(communicator, ok)) { return false; }
+  if (!Require(communicator, ok, "nonconstant source setup")) { return false; }
   mfem::Vector ones(source_space.GetVSize());
   ones = 1.0;
   const double mean_a = mfem::InnerProduct(communicator, source_a, ones);
   const double mean_b = mfem::InnerProduct(communicator, source_b, ones);
   ok = std::abs(mean_a - mean_b) < 1.0e-12;
-  if (!AllRanks(communicator, ok)) { return false; }
+  if (!Require(communicator, ok, "equal source means")) { return false; }
 
   detail::TracedScalarIgrP1GlobalStepOutput first, second, changed_dt;
   ok = Run(communicator, layout, quads, source_space, source_a, 0.05, first) &&
       Run(communicator, layout, quads, source_space, source_b, 0.05, second) &&
       Run(communicator, layout, quads, source_space, source_a, 0.08, changed_dt);
-  if (!AllRanks(communicator, ok)) { return false; }
+  if (!Require(communicator, ok, "nonconstant/dt global steps")) { return false; }
   const double trace_difference = NormSquared(communicator, first.trace_increment) +
       NormSquared(communicator, first.interior_increment);
   mfem::Vector source_delta(first.trace_increment);
@@ -405,11 +426,11 @@ bool Check(const MPI_Comm communicator)
       std::isfinite(first.reduced_rhs_norm) && std::isfinite(first.linear_residual_norm) &&
       first.reduced_rhs_norm > 0.0 &&
       first.linear_residual_norm <= first.reduced_rhs_norm * 1.0e-10;
-  if (!AllRanks(communicator, ok)) { return false; }
+  if (!Require(communicator, ok, "increment/residual predicates")) { return false; }
 
   ok = CheckLocalRecovery(communicator, layout, quads, source_space, source_a,
                           first);
-  if (!AllRanks(communicator, ok)) { return false; }
+  if (!Require(communicator, ok, "local recovery/action oracle")) { return false; }
 
   detail::TracedScalarIgrP1GlobalStepOutput zero_rhs;
   ok = RunZeroReducedTraceRhs(communicator, layout, quads, zero_rhs);
@@ -421,7 +442,7 @@ bool Check(const MPI_Comm communicator)
       zero_rhs.reduced_rhs_norm <= 1.0e-150 &&
       zero_rhs.linear_residual_norm <= 1.0e-150 &&
       zero_trace_norm <= 1.0e-300 && zero_interior_norm <= 1.0e-300;
-  if (!AllRanks(communicator, ok)) { return false; }
+  if (!Require(communicator, ok, "zero reduced trace rhs")) { return false; }
 
   detail::TracedScalarIgrP1GlobalStepOutput preserved;
   preserved.trace_increment.SetSize(1); preserved.trace_increment[0] = 73.0;
@@ -437,14 +458,14 @@ bool Check(const MPI_Comm communicator)
       preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
       preserved.initial_residual_norm == 11.0 &&
       preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0;
-  if (!AllRanks(communicator, ok)) { return false; }
+  if (!Require(communicator, ok, "invalid input preservation")) { return false; }
 
   const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
   mfem::Vector aliased_trace(layout.TraceTrueVSize());
   mfem::Vector aliased_current_interior, aliased_previous_interior;
   ok = trace_space != nullptr && FillTrueTrace(*trace_space, aliased_trace, 0.0) &&
       FillInterior(layout, aliased_current_interior, aliased_previous_interior);
-  if (!AllRanks(communicator, ok)) { return false; }
+  if (!Require(communicator, ok, "trace alias setup")) { return false; }
   local::Parameters alias_parameters{};
   alias_parameters.dt = 0.05; alias_parameters.alpha = 0.8;
   alias_parameters.beta = 1.1; alias_parameters.quadrature_order = 12;
@@ -457,7 +478,7 @@ bool Check(const MPI_Comm communicator)
       preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
       preserved.initial_residual_norm == 11.0 &&
       preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0;
-  return AllRanks(communicator, ok);
+  return Require(communicator, ok, "trace alias preservation");
 }
 
 } // namespace

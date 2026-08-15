@@ -121,6 +121,7 @@ bool ValidInput(const TracedScalarIgrP1GlobalStepInput& input) noexcept
       source_space->GetParMesh() == interior_space->GetParMesh() &&
       source_space->GetVDim() == 4 &&
       source_space->GetOrdering() == mfem::Ordering::byNODES &&
+      source_space->GetVSize() % 4 == 0 &&
       source.Size() == source_space->GetVSize() && AllFinite(source);
 }
 
@@ -136,7 +137,8 @@ bool FillElementSource(const mfem::ParFiniteElementSpace* source_space,
     return true;
   }
   if (source_space == nullptr || samples == nullptr ||
-      source_space->GetOrdering() != mfem::Ordering::byNODES)
+      source_space->GetOrdering() != mfem::Ordering::byNODES ||
+      source_space->GetVSize() % 4 != 0)
   {
     return false;
   }
@@ -161,7 +163,8 @@ bool FillElementSource(const mfem::ParFiniteElementSpace* source_space,
       for (int dof = 0; dof < 4; ++dof)
       {
         double sign = 1.0;
-        const int vdof = DecodeSignedVDof(signed_vdofs[dof * 4 + component], sign);
+        // MFEM byNODES is component-blocked: [component][scalar dof].
+        const int vdof = DecodeSignedVDof(signed_vdofs[component * 4 + dof], sign);
         if (vdof < 0 || vdof >= source_coefficients->Size()) { return false; }
         value += shape[dof] * sign * coefficients[vdof];
       }
