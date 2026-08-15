@@ -29,6 +29,19 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_cpu)
 
   if(MFEM_USE_CUDA)
+    foreach(_dg_igr_hdg_cxx_archive IN ITEMS
+            dg_igr_hdg_runtime_common
+            dg_igr_hdg_runtime_cpu
+            dg_igr_hdg_auxiliary_cpu)
+      get_target_property(_dg_igr_hdg_cxx_archive_resolve
+                          "${_dg_igr_hdg_cxx_archive}"
+                          CUDA_RESOLVE_DEVICE_SYMBOLS)
+      if(NOT _dg_igr_hdg_cxx_archive_resolve STREQUAL "OFF")
+        message(FATAL_ERROR
+                "${_dg_igr_hdg_cxx_archive} must explicitly defer CUDA device-symbol resolution to final executables.")
+      endif()
+    endforeach()
+
     _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_cuda)
     get_target_property(_dg_igr_hdg_cuda_standard
                         dg_igr_hdg_runtime_cuda CUDA_STANDARD)

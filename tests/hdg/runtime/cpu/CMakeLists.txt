@@ -23,6 +23,18 @@ set_target_properties(dg_igr_hdg_runtime_cpu_test
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF)
 
+if(MFEM_USE_CUDA)
+  set_target_properties(dg_igr_hdg_runtime_cpu_test PROPERTIES
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  get_target_property(_dg_igr_hdg_runtime_cpu_test_resolve
+                      dg_igr_hdg_runtime_cpu_test
+                      CUDA_RESOLVE_DEVICE_SYMBOLS)
+  if(NOT _dg_igr_hdg_runtime_cpu_test_resolve STREQUAL "ON")
+    message(FATAL_ERROR
+            "dg_igr_hdg_runtime_cpu_test must own CUDA device-symbol resolution in CUDA profiles.")
+  endif()
+endif()
+
 add_test(
   NAME hdg_runtime_cpu_serial
   COMMAND dg_igr_hdg_runtime_cpu_test)

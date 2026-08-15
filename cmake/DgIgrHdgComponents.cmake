@@ -63,6 +63,14 @@ function(dg_igr_add_hdg_cxx17_component)
                         CXX_STANDARD 17
                         CXX_STANDARD_REQUIRED ON
                         CXX_EXTENSIONS OFF)
+  if(MFEM_USE_CUDA)
+    # These reusable C++ archives carry CUDA-reachable objects through their
+    # public MFEM dependency.  Defer device-symbol resolution to the final
+    # executable so archive-member selection happens after all CUDA
+    # registrations have become unresolved.
+    set_target_properties("${HDG_TARGET}" PROPERTIES
+                          CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+  endif()
   target_include_directories("${HDG_TARGET}" PUBLIC
                              "${PROJECT_SOURCE_DIR}/include")
   if(HDG_STANDARD_LIBRARY_ONLY)
