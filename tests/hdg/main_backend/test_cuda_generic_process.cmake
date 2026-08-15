@@ -81,8 +81,8 @@ foreach(_index RANGE 0 2)
     message(FATAL_ERROR "CUDA HDG PVD misses committed time ${_time} cycle ${_cycle}")
   endif()
   file(READ "${_root}/Cycle${_cycle}/data.pvtu" _pvtu_text)
-  if(NOT _pvtu_text MATCHES "Name=\\\"conservative\\\"" OR
-     NOT _pvtu_text MATCHES "NumberOfComponents=\\\"4\\\"")
+  if(NOT _pvtu_text MATCHES
+      "<PDataArray[^>]*(Name=\\\"conservative\\\"[^>]*NumberOfComponents=\\\"4\\\"|NumberOfComponents=\\\"4\\\"[^>]*Name=\\\"conservative\\\")[^>]*>")
     message(FATAL_ERROR "CUDA HDG PVTU cycle ${_cycle} misses four-component conservative data")
   endif()
   string(REGEX MATCHALL
@@ -109,8 +109,8 @@ foreach(_index RANGE 0 2)
       message(FATAL_ERROR "missing CUDA HDG VTU piece for rank ${_rank}: ${_vtu}")
     endif()
     file(READ "${_vtu}" _vtu_text)
-    if(NOT _vtu_text MATCHES "Name=\\\"conservative\\\"" OR
-       NOT _vtu_text MATCHES "NumberOfComponents=\\\"4\\\"")
+    if(NOT _vtu_text MATCHES
+        "<DataArray[^>]*(Name=\\\"conservative\\\"[^>]*NumberOfComponents=\\\"4\\\"|NumberOfComponents=\\\"4\\\"[^>]*Name=\\\"conservative\\\")[^>]*>")
       message(FATAL_ERROR
         "CUDA HDG VTU piece for rank ${_rank} cycle ${_cycle} misses four-component conservative data")
     endif()
