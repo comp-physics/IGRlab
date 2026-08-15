@@ -16,6 +16,21 @@ endif()
 if(NOT DEFINED HDG_MAIN_PARALLEL_REFINE)
   set(HDG_MAIN_PARALLEL_REFINE 0)
 endif()
+if(HDG_MAIN_N LESS 1 OR HDG_MAIN_N GREATER 100000 OR
+   HDG_MAIN_SERIAL_REFINE LESS 0 OR HDG_MAIN_PARALLEL_REFINE LESS 0)
+  message(FATAL_ERROR "CUDA HDG cell census requires bounded nonnegative mesh/refinement inputs.")
+endif()
+math(EXPR _refinement_levels
+  "${HDG_MAIN_SERIAL_REFINE} + ${HDG_MAIN_PARALLEL_REFINE}")
+if(_refinement_levels GREATER 10)
+  message(FATAL_ERROR "CUDA HDG cell census refinement depth exceeds checked process-test bounds.")
+endif()
+math(EXPR _expected_global_cells "${HDG_MAIN_N} * ${HDG_MAIN_N}")
+if(_refinement_levels GREATER 0)
+  foreach(_level RANGE 1 ${_refinement_levels})
+    math(EXPR _expected_global_cells "${_expected_global_cells} * 4")
+  endforeach()
+endif()
 
 file(REMOVE_RECURSE "${HDG_MAIN_OUTPUT}")
 set(_arguments
@@ -100,6 +115,7 @@ foreach(_index RANGE 0 2)
       "CUDA HDG PVTU cycle ${_cycle} has ${_pvtu_piece_count} piece references; expected ${HDG_MAIN_RANKS}")
   endif()
   math(EXPR _last_rank "${HDG_MAIN_RANKS} - 1")
+  set(_cycle_cell_total 0)
   foreach(_rank RANGE 0 ${_last_rank})
     set(_rank_text "000000${_rank}")
     string(LENGTH "${_rank_text}" _rank_text_length)
@@ -115,12 +131,27 @@ foreach(_index RANGE 0 2)
       message(FATAL_ERROR "missing CUDA HDG VTU piece for rank ${_rank}: ${_vtu}")
     endif()
     file(READ "${_vtu}" _vtu_text)
+    string(REGEX MATCHALL "NumberOfCells=\"[0-9]+\""
+      _piece_cell_fields "${_vtu_text}")
+    list(LENGTH _piece_cell_fields _piece_cell_field_count)
+    if(NOT _piece_cell_field_count EQUAL 1)
+      message(FATAL_ERROR
+        "CUDA HDG VTU piece for rank ${_rank} cycle ${_cycle} must contain exactly one numeric NumberOfCells attribute")
+    endif()
+    list(GET _piece_cell_fields 0 _piece_cell_field)
+    string(REGEX REPLACE "NumberOfCells=\"([0-9]+)\"" "\\1"
+      _piece_cells "${_piece_cell_field}")
+    math(EXPR _cycle_cell_total "${_cycle_cell_total} + ${_piece_cells}")
     if(NOT _vtu_text MATCHES
         "<DataArray[^>]*(Name=\\\"conservative\\\"[^>]*NumberOfComponents=\\\"4\\\"|NumberOfComponents=\\\"4\\\"[^>]*Name=\\\"conservative\\\")[^>]*>")
       message(FATAL_ERROR
         "CUDA HDG VTU piece for rank ${_rank} cycle ${_cycle} misses four-component conservative data")
     endif()
   endforeach()
+  if(NOT _cycle_cell_total EQUAL _expected_global_cells)
+    message(FATAL_ERROR
+      "CUDA HDG VTU cycle ${_cycle} has ${_cycle_cell_total} global cells; expected ${_expected_global_cells} after serial+parallel refinement")
+  endif()
 endforeach()
 string(REGEX MATCHALL "Cycle[0-9][0-9][0-9][0-9][0-9][0-9]/data.pvtu"
   _pvd_entries "${_pvd_text}")

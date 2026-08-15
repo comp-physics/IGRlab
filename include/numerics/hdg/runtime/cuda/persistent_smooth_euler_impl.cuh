@@ -307,6 +307,30 @@ struct CudaTrueMatrixDeviceView
   int offd_nonzeros = 0;
 };
 
+/** One checked generic arena plan; BindArenaViews consumes these exact slices. */
+struct CudaGenericArenaLayout
+{
+  std::size_t elements = 0;
+  std::size_t interior = 0;
+  std::size_t local_trace = 0;
+  std::size_t true_trace = 0;
+  std::size_t element_coordinates = 0;
+  std::size_t element_trace = 0;
+  std::size_t element_interior2 = 0;
+  std::size_t element_coupling = 0;
+  std::size_t local_matrix = 0;
+  std::size_t volume_shape = 0;
+  std::size_t volume_derivative = 0;
+  std::size_t volume_weight = 0;
+  std::size_t volume_position = 0;
+  std::size_t face_interior = 0;
+  std::size_t face_trace = 0;
+  std::size_t face_weight = 0;
+  std::size_t face_normal = 0;
+  std::size_t solve_workspace = 0;
+  std::size_t two_exchange_keys = 0;
+};
+
 // Allocation-free, fail-neutral setup provenance.  The implementation only
 // samples HYPRE_GetError/cudaPeekAtLastError; it never clears or synchronizes.
 void CudaBeginTrueSystemDiagnostic(int rank) noexcept;
@@ -1986,65 +2010,82 @@ private:
       const std::size_t interior = static_cast<std::size_t>(shape_.interior_count);
       const std::size_t local_trace = static_cast<std::size_t>(shape_.local_trace_count);
       const std::size_t true_trace = static_cast<std::size_t>(shape_.true_trace_count);
-      std::size_t element_trace = 0, local_matrix = 0, element_interior2 = 0;
-      std::size_t element_coupling = 0, volume_shape = 0, volume_derivative = 0;
-      std::size_t volume_weight = 0, volume_position = 0, face_interior = 0;
-      std::size_t face_trace = 0, face_weight = 0, face_normal = 0;
-      bool valid = elements != 0 && checked_product(elements,
-          static_cast<std::size_t>(shape_.trace_dofs), element_trace) &&
-          checked_product(element_trace,
-          static_cast<std::size_t>(shape_.trace_dofs), local_matrix) &&
-          checked_product(elements, static_cast<std::size_t>(shape_.interior_dofs) *
-              static_cast<std::size_t>(shape_.interior_dofs), element_interior2) &&
-          checked_product(elements, static_cast<std::size_t>(shape_.interior_dofs) *
-              static_cast<std::size_t>(shape_.trace_dofs), element_coupling) &&
-          checked_product(elements * static_cast<std::size_t>(shape_.volume_points),
-              static_cast<std::size_t>(shape_.scalar_interior_dofs), volume_shape) &&
-          checked_product(volume_shape, dimension, volume_derivative) &&
-          checked_product(elements, static_cast<std::size_t>(shape_.volume_points),
-                          volume_weight) &&
-          checked_product(volume_weight, dimension, volume_position) &&
-          checked_product(elements * faces_per_element *
-              static_cast<std::size_t>(shape_.face_points),
-              static_cast<std::size_t>(shape_.scalar_interior_dofs), face_interior) &&
-          checked_product(elements * faces_per_element *
-              static_cast<std::size_t>(shape_.face_points),
-              static_cast<std::size_t>(shape_.scalar_face_dofs), face_trace) &&
-          checked_product(elements * faces_per_element,
-              static_cast<std::size_t>(shape_.face_points), face_weight) &&
-          checked_product(face_weight, dimension, face_normal);
+      const std::size_t interior_dofs =
+          static_cast<std::size_t>(shape_.interior_dofs);
+      const std::size_t trace_dofs = static_cast<std::size_t>(shape_.trace_dofs);
+      const std::size_t volume_points =
+          static_cast<std::size_t>(shape_.volume_points);
+      const std::size_t face_points = static_cast<std::size_t>(shape_.face_points);
+      const std::size_t scalar_interior_dofs =
+          static_cast<std::size_t>(shape_.scalar_interior_dofs);
+      const std::size_t scalar_face_dofs =
+          static_cast<std::size_t>(shape_.scalar_face_dofs);
+      CudaGenericArenaLayout layout{};
+      std::size_t interior_square = 0, element_volume_points = 0;
+      std::size_t element_faces = 0, face_points_total = 0;
+      std::size_t trace_plus_one = 0, solve_base = 0;
+      bool valid = elements != 0 && checked_product(elements, trace_dofs,
+          layout.element_trace) &&
+          checked_product(elements, dimension, layout.element_coordinates) &&
+          checked_product(layout.element_trace, trace_dofs, layout.local_matrix) &&
+          checked_product(interior_dofs, interior_dofs, interior_square) &&
+          checked_product(elements, interior_square, layout.element_interior2) &&
+          checked_product(interior_dofs, trace_dofs, interior_square) &&
+          checked_product(elements, interior_square, layout.element_coupling) &&
+          checked_product(elements, volume_points, element_volume_points) &&
+          checked_product(element_volume_points, scalar_interior_dofs,
+                          layout.volume_shape) &&
+          checked_product(layout.volume_shape, dimension, layout.volume_derivative) &&
+          checked_product(elements, volume_points, layout.volume_weight) &&
+          checked_product(layout.volume_weight, dimension, layout.volume_position) &&
+          checked_product(elements, faces_per_element, element_faces) &&
+          checked_product(element_faces, face_points, face_points_total) &&
+          checked_product(face_points_total, scalar_interior_dofs,
+                          layout.face_interior) &&
+          checked_product(face_points_total, scalar_face_dofs, layout.face_trace) &&
+          checked_product(element_faces, face_points, layout.face_weight) &&
+          checked_product(layout.face_weight, dimension, layout.face_normal) &&
+          checked_add(trace_plus_one, trace_dofs) && checked_add(trace_plus_one, 1) &&
+          checked_product(elements, interior_dofs, solve_base) &&
+          checked_product(solve_base, trace_plus_one, layout.solve_workspace) &&
+          checked_product(layout.local_matrix, 2, layout.two_exchange_keys);
       if (!valid) return false;
-      const std::size_t host_elements = generic ? elements : maximum_rank_elements;
+      layout.elements = elements;
+      layout.interior = interior;
+      layout.local_trace = local_trace;
+      layout.true_trace = true_trace;
+      const std::size_t host_elements = generic ? layout.elements : maximum_rank_elements;
       const std::size_t host_interior = generic ? interior :
           static_cast<std::size_t>(maximum_rank_elements) * maximum_interior_dofs_per_element;
-      const std::size_t host_element_trace = generic ? element_trace :
+      const std::size_t host_element_trace = generic ? layout.element_trace :
           static_cast<std::size_t>(maximum_rank_elements) * maximum_trace_dofs_per_element;
       const std::size_t host_local_trace = generic ? local_trace : maximum_local_trace_dofs;
       const std::size_t host_true_trace = generic ? true_trace : maximum_true_trace_dofs;
-      const std::size_t host_matrix = generic ? local_matrix : maximum_local_matrix_entries;
-      const std::size_t host_exchange = generic ? local_matrix : maximum_exchange_entries;
+      const std::size_t host_matrix = generic ? layout.local_matrix : maximum_local_matrix_entries;
+      const std::size_t host_exchange = generic ? layout.local_matrix : maximum_exchange_entries;
 
       signed_element_trace_.assign(host_element_trace, 0);
       local_global_true_.assign(host_local_trace, 0);
       local_owner_.assign(host_local_trace, 0);
       local_true_index_.assign(host_local_trace, 0);
       owned_global_true_.assign(host_true_trace, 0);
-      element_coordinate_keys_.assign(host_elements * dimension, 0);
-      host_volume_shape_.assign(generic ? volume_shape :
+      element_coordinate_keys_.assign(generic ? layout.element_coordinates :
+          host_elements * dimension, 0);
+      host_volume_shape_.assign(generic ? layout.volume_shape :
           static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * maximum_scalar_dofs_per_element, 0.0);
-      host_volume_derivative_.assign(generic ? volume_derivative :
+      host_volume_derivative_.assign(generic ? layout.volume_derivative :
           static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * maximum_scalar_dofs_per_element * dimension, 0.0);
-      host_volume_weight_.assign(generic ? volume_weight :
+      host_volume_weight_.assign(generic ? layout.volume_weight :
           static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points, 0.0);
-      host_volume_position_.assign(generic ? volume_position :
+      host_volume_position_.assign(generic ? layout.volume_position :
           static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * dimension, 0.0);
-      host_face_interior_shape_.assign(generic ? face_interior :
+      host_face_interior_shape_.assign(generic ? layout.face_interior :
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * maximum_scalar_dofs_per_element, 0.0);
-      host_face_trace_shape_.assign(generic ? face_trace :
+      host_face_trace_shape_.assign(generic ? layout.face_trace :
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * maximum_scalar_dofs_per_face, 0.0);
-      host_face_weight_.assign(generic ? face_weight :
+      host_face_weight_.assign(generic ? layout.face_weight :
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points, 0.0);
-      host_face_normal_.assign(generic ? face_normal :
+      host_face_normal_.assign(generic ? layout.face_normal :
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension, 0.0);
       host_exact_interior_.assign(host_interior, 0.0);
       host_perturbed_interior_.assign(host_interior, 0.0);
@@ -2064,8 +2105,10 @@ private:
       host_vector_owned_target_.assign(host_element_trace, 0);
       host_vector_send_source_.assign(host_element_trace, 0);
       host_vector_receive_target_.assign(host_element_trace, 0);
-      matrix_send_keys_.assign(2 * host_exchange, 0);
-      matrix_receive_keys_.assign(2 * host_exchange, 0);
+      matrix_send_keys_.assign(generic ? layout.two_exchange_keys :
+          2 * host_exchange, 0);
+      matrix_receive_keys_.assign(generic ? layout.two_exchange_keys :
+          2 * host_exchange, 0);
       vector_send_keys_.assign(host_element_trace, 0);
       vector_receive_keys_.assign(host_element_trace, 0);
       matrix_send_host_.assign(host_exchange, 0.0);
@@ -2075,34 +2118,46 @@ private:
 
       if (!generic) return true;
       std::size_t doubles = 0;
-      const std::size_t solve_workspace = elements *
-          static_cast<std::size_t>(shape_.interior_dofs) *
-          static_cast<std::size_t>(shape_.trace_dofs + 1);
-      valid = checked_add(doubles, 10 * interior) &&
-          checked_add(doubles, 4 * true_trace) && checked_add(doubles, local_trace) &&
-          checked_add(doubles, 3 * element_trace) && checked_add(doubles, interior) &&
-          checked_add(doubles, element_trace) && checked_add(doubles, element_interior2) &&
-          checked_add(doubles, 2 * element_coupling) && checked_add(doubles, local_matrix) &&
-          checked_add(doubles, interior) && checked_add(doubles, element_trace) &&
-          checked_add(doubles, element_interior2) && checked_add(doubles, interior) &&
-          checked_add(doubles, solve_workspace) && checked_add(doubles, local_matrix) &&
-          checked_add(doubles, element_trace) && checked_add(doubles, true_trace) &&
-          checked_add(doubles, 2 * local_matrix) && checked_add(doubles, 2 * element_trace) &&
-          checked_add(doubles, volume_shape) && checked_add(doubles, volume_derivative) &&
-          checked_add(doubles, volume_weight) && checked_add(doubles, volume_position) &&
-          checked_add(doubles, face_interior) && checked_add(doubles, face_trace) &&
-          checked_add(doubles, face_weight) && checked_add(doubles, face_normal) &&
+      std::size_t ten_interior = 0, four_true = 0, three_element_trace = 0;
+      std::size_t two_coupling = 0, two_local_matrix = 0;
+      std::size_t two_element_trace = 0, three_local_matrix = 0;
+      std::size_t four_element_trace = 0;
+      valid = checked_product(interior, 10, ten_interior) &&
+          checked_product(true_trace, 4, four_true) &&
+          checked_product(layout.element_trace, 3, three_element_trace) &&
+          checked_product(layout.element_coupling, 2, two_coupling) &&
+          checked_product(layout.local_matrix, 2, two_local_matrix) &&
+          checked_product(layout.element_trace, 2, two_element_trace) &&
+          checked_product(layout.local_matrix, 3, three_local_matrix) &&
+          checked_product(layout.element_trace, 4, four_element_trace) &&
+          checked_add(doubles, ten_interior) &&
+          checked_add(doubles, four_true) && checked_add(doubles, local_trace) &&
+          checked_add(doubles, three_element_trace) && checked_add(doubles, interior) &&
+          checked_add(doubles, layout.element_trace) &&
+          checked_add(doubles, layout.element_interior2) &&
+          checked_add(doubles, two_coupling) && checked_add(doubles, layout.local_matrix) &&
+          checked_add(doubles, interior) && checked_add(doubles, layout.element_trace) &&
+          checked_add(doubles, layout.element_interior2) && checked_add(doubles, interior) &&
+          checked_add(doubles, layout.solve_workspace) && checked_add(doubles, layout.local_matrix) &&
+          checked_add(doubles, layout.element_trace) && checked_add(doubles, true_trace) &&
+          checked_add(doubles, two_local_matrix) && checked_add(doubles, two_element_trace) &&
+          checked_add(doubles, layout.volume_shape) && checked_add(doubles, layout.volume_derivative) &&
+          checked_add(doubles, layout.volume_weight) && checked_add(doubles, layout.volume_position) &&
+          checked_add(doubles, layout.face_interior) && checked_add(doubles, layout.face_trace) &&
+          checked_add(doubles, layout.face_weight) && checked_add(doubles, layout.face_normal) &&
           checked_add(doubles, elements) && checked_add(doubles, 8) &&
-          checked_add(doubles, face_weight);
+          checked_add(doubles, layout.face_weight);
       std::size_t integers = 16;
-      valid = valid && checked_add(integers, element_trace) &&
-          checked_add(integers, 3 * local_matrix) && checked_add(integers, 3 * local_matrix) &&
-          checked_add(integers, 4 * element_trace);
+      valid = valid && checked_add(integers, layout.element_trace) &&
+          checked_add(integers, three_local_matrix) &&
+          checked_add(integers, three_local_matrix) &&
+          checked_add(integers, four_element_trace);
       if (!valid || doubles > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
           integers > static_cast<std::size_t>(std::numeric_limits<int>::max()))
         return false;
       double_arena_capacity_ = doubles;
       integer_arena_capacity_ = integers;
+      generic_arena_layout_ = layout;
       return true;
     }
     catch (...) { return false; }
@@ -2289,6 +2344,7 @@ private:
   StateHash local_partition_hash_{};
   StateHash local_topology_hash_{};
   CudaMeshShape shape_{};
+  CudaGenericArenaLayout generic_arena_layout_{};
   CudaDeviceView view_{};
   CudaTrueMatrixStructure true_structure_{};
   CudaTrueMatrixDeviceView true_device_{};

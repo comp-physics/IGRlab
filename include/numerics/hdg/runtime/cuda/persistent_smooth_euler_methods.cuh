@@ -539,25 +539,23 @@ BindArenaViews() noexcept
     return result;
   };
   const bool generic = borrowed_topology_ && shape_.borrowed_host_inputs;
-  const std::size_t max_i = generic ? static_cast<std::size_t>(shape_.interior_count) :
+  const std::size_t max_i = generic ? generic_arena_layout_.interior :
       static_cast<std::size_t>(maximum_rank_elements) * maximum_interior_dofs_per_element;
-  const std::size_t max_lt = generic ? static_cast<std::size_t>(shape_.local_trace_count) :
+  const std::size_t max_lt = generic ? generic_arena_layout_.local_trace :
       maximum_local_trace_dofs;
-  const std::size_t max_tt = generic ? static_cast<std::size_t>(shape_.true_trace_count) :
+  const std::size_t max_tt = generic ? generic_arena_layout_.true_trace :
       maximum_true_trace_dofs;
-  const std::size_t max_er = generic ? static_cast<std::size_t>(shape_.elements) *
-      shape_.trace_dofs : static_cast<std::size_t>(maximum_rank_elements) *
+  const std::size_t max_er = generic ? generic_arena_layout_.element_trace :
+      static_cast<std::size_t>(maximum_rank_elements) *
       maximum_trace_dofs_per_element;
-  const std::size_t max_a = generic ? static_cast<std::size_t>(shape_.elements) *
-      shape_.interior_dofs * shape_.interior_dofs :
+  const std::size_t max_a = generic ? generic_arena_layout_.element_interior2 :
       static_cast<std::size_t>(maximum_rank_elements) *
       maximum_interior_dofs_per_element * maximum_interior_dofs_per_element;
-  const std::size_t max_b = generic ? static_cast<std::size_t>(shape_.elements) *
-      shape_.interior_dofs * shape_.trace_dofs :
+  const std::size_t max_b = generic ? generic_arena_layout_.element_coupling :
       static_cast<std::size_t>(maximum_rank_elements) *
       maximum_interior_dofs_per_element * maximum_trace_dofs_per_element;
-  const std::size_t max_d = generic ? static_cast<std::size_t>(shape_.elements) *
-      shape_.trace_dofs * shape_.trace_dofs : maximum_local_matrix_entries;
+  const std::size_t max_d = generic ? generic_arena_layout_.local_matrix :
+      maximum_local_matrix_entries;
   const std::size_t max_exchange = generic ? max_d : maximum_exchange_entries;
   view_.slot_interior[0] = take_d(max_i);
   view_.slot_interior[1] = take_d(max_i);
@@ -587,8 +585,7 @@ BindArenaViews() noexcept
   view_.g = take_d(max_er);
   view_.lu = take_d(max_a);
   view_.pivots = take_d(max_i);
-  view_.solve_workspace = take_d(generic ? static_cast<std::size_t>(shape_.elements) *
-      shape_.interior_dofs * (shape_.trace_dofs + 1) :
+  view_.solve_workspace = take_d(generic ? generic_arena_layout_.solve_workspace :
       static_cast<std::size_t>(maximum_rank_elements) *
       maximum_interior_dofs_per_element * (maximum_trace_dofs_per_element + 1));
   view_.schur = take_d(max_d);
@@ -598,34 +595,30 @@ BindArenaViews() noexcept
   view_.remote_matrix_receive = take_d(max_exchange);
   view_.remote_vector_send = take_d(max_er);
   view_.remote_vector_receive = take_d(max_er);
-  view_.volume_shape = take_d(generic ? static_cast<std::size_t>(shape_.elements) *
-      shape_.volume_points * shape_.scalar_interior_dofs :
+  view_.volume_shape = take_d(generic ? generic_arena_layout_.volume_shape :
       static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * maximum_scalar_dofs_per_element);
-  view_.volume_derivative = take_d(generic ? static_cast<std::size_t>(shape_.elements) *
-      shape_.volume_points * shape_.scalar_interior_dofs * dimension :
+  view_.volume_derivative = take_d(generic ? generic_arena_layout_.volume_derivative :
       static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * maximum_scalar_dofs_per_element * dimension);
-  view_.volume_weight = take_d(generic ? static_cast<std::size_t>(shape_.elements) *
-      shape_.volume_points : static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points);
-  view_.volume_position = take_d(generic ? static_cast<std::size_t>(shape_.elements) *
-      shape_.volume_points * dimension : static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * dimension);
-  view_.face_interior_shape = take_d(generic ? static_cast<std::size_t>(shape_.elements) *
-      faces_per_element * shape_.face_points * shape_.scalar_interior_dofs :
+  view_.volume_weight = take_d(generic ? generic_arena_layout_.volume_weight :
+      static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points);
+  view_.volume_position = take_d(generic ? generic_arena_layout_.volume_position :
+      static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * dimension);
+  view_.face_interior_shape = take_d(generic ? generic_arena_layout_.face_interior :
       static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * maximum_scalar_dofs_per_element);
-  view_.face_trace_shape = take_d(generic ? static_cast<std::size_t>(shape_.elements) *
-      faces_per_element * shape_.face_points * shape_.scalar_face_dofs :
+  view_.face_trace_shape = take_d(generic ? generic_arena_layout_.face_trace :
       static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * maximum_scalar_dofs_per_face);
-  view_.face_weight = take_d(generic ? static_cast<std::size_t>(shape_.elements) *
-      faces_per_element * shape_.face_points : static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points);
-  view_.face_normal = take_d(generic ? static_cast<std::size_t>(shape_.elements) *
-      faces_per_element * shape_.face_points * dimension : static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension);
-  view_.status = take_d(generic ? static_cast<std::size_t>(shape_.elements) : maximum_rank_elements);
+  view_.face_weight = take_d(generic ? generic_arena_layout_.face_weight :
+      static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points);
+  view_.face_normal = take_d(generic ? generic_arena_layout_.face_normal :
+      static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension);
+  view_.status = take_d(generic ? generic_arena_layout_.elements : maximum_rank_elements);
   view_.scalar = take_d(8);
   // Append the borrowed-only stabilization slice after every frozen W8A
   // allocation.  False mode therefore preserves the exact legacy arena
   // partition, offsets, and resource evidence tokens.
   if (shape_.borrowed_host_inputs)
-    view_.borrowed_lagged_llf_tau = take_d(generic ? static_cast<std::size_t>(shape_.elements) *
-        faces_per_element * shape_.face_points : static_cast<std::size_t>(maximum_rank_elements) *
+    view_.borrowed_lagged_llf_tau = take_d(generic ? generic_arena_layout_.face_weight :
+        static_cast<std::size_t>(maximum_rank_elements) *
         faces_per_element * maximum_face_points);
   if (static_cast<std::size_t>(d - double_arena_) >
       double_arena_capacity_)
