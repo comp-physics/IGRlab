@@ -102,6 +102,17 @@ public:
   TracedScalarIgrP1Scratch(TracedScalarIgrP1Scratch&&) noexcept;
   TracedScalarIgrP1Scratch& operator=(TracedScalarIgrP1Scratch&&) noexcept;
 
+  /**
+   * Collectively bind the one permitted input layout and eagerly construct the
+   * retained graph, local condensation workspace, and solver prime.  A failed
+   * or repeated initialization permanently makes this detail object unusable.
+   */
+  bool Initialize(const TracedScalarIgrP1GlobalStepInput& input) noexcept;
+
+  /** True only after the collective Initialize gate has completed. */
+  bool IsReady() const noexcept;
+
+  /** Backward-compatible structural query; use IsReady before Compute. */
   bool IsUsable() const noexcept;
 
 private:

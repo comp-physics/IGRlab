@@ -141,6 +141,34 @@ bool SourceIsZero(const TracedScalarIgrP1GlobalStepInput& input) noexcept
       input.static_euler_rhs_coefficients->Size() == 0;
 }
 
+bool CaptureSourceElementVDofs(const mfem::ParFiniteElementSpace* const space,
+                               const int elements,
+                               std::vector<int>& destination) noexcept
+{
+  if (space == nullptr) { destination.clear(); return true; }
+  std::size_t entries = 0;
+  if (!CheckedBatchCapacity(elements, 16, entries)) { return false; }
+  try
+  {
+    destination.resize(entries);
+    for (int element = 0; element < elements; ++element)
+    {
+      mfem::Array<int> vdofs;
+      space->GetElementVDofs(element, vdofs);
+      if (vdofs.Size() != 16 || vdofs.HostRead() == nullptr) { return false; }
+      for (int index = 0; index < 16; ++index)
+      {
+        double sign = 1.0;
+        const int vdof = DecodeSignedVDof(vdofs[index], sign);
+        if (vdof < 0 || vdof >= space->GetVSize()) { return false; }
+        destination[static_cast<std::size_t>(element) * 16 + index] = vdofs[index];
+      }
+    }
+    return true;
+  }
+  catch (const std::exception&) { return false; }
+}
+
 bool ValidParameters(const local::Parameters& parameters) noexcept
 {
   return Finite(parameters.gamma) && parameters.gamma > 1.0 &&
@@ -188,6 +216,7 @@ bool ValidInput(const TracedScalarIgrP1GlobalStepInput& input) noexcept
 
 bool FillElementSource(const mfem::ParFiniteElementSpace* source_space,
                        const mfem::Vector* source_coefficients,
+                       const int* const bound_signed_vdofs,
                        const int element, const mfem::IntegrationRule& rule,
                        double* samples) noexcept
 {
@@ -203,17 +232,22 @@ bool FillElementSource(const mfem::ParFiniteElementSpace* source_space,
   {
     return false;
   }
-  mfem::Array<int> vdofs;
-  source_space->GetElementVDofs(element, vdofs);
   const mfem::FiniteElement* const finite_element = source_space->GetFE(element);
-  if (finite_element == nullptr || finite_element->GetDof() != 4 ||
-      vdofs.Size() != 16)
+  if (finite_element == nullptr || finite_element->GetDof() != 4)
   {
     return false;
   }
   const double* const coefficients = source_coefficients->HostRead();
-  const int* const signed_vdofs = vdofs.HostRead();
-  if (coefficients == nullptr || signed_vdofs == nullptr) { return false; }
+  if (coefficients == nullptr) { return false; }
+  mfem::Array<int> fallback_vdofs;
+  const int* signed_vdofs = bound_signed_vdofs;
+  if (signed_vdofs == nullptr)
+  {
+    source_space->GetElementVDofs(element, fallback_vdofs);
+    if (fallback_vdofs.Size() != 16) { return false; }
+    signed_vdofs = fallback_vdofs.HostRead();
+  }
+  if (signed_vdofs == nullptr) { return false; }
   mfem::Vector shape(4);
   for (int point = 0; point < rule.GetNPoints(); ++point)
   {
@@ -503,6 +537,7 @@ struct RetainedTraceSystem final
   }
 
   bool Initialize(MPI_Comm comm, const BorrowedP1DGInterfaceLayout& bound) noexcept;
+  bool Prime() noexcept;
   bool Refresh(const std::vector<double>& schur_values,
                const std::vector<double>& reduced_values) noexcept;
   bool Solve(const double scale, mfem::Vector& true_trace,
@@ -817,6 +852,49 @@ bool RetainedTraceSystem::Initialize(
   if (!CollectiveAll(communicator, local_ok)) { return false; }
   refreshed = false;
   return true;
+}
+
+bool RetainedTraceSystem::Prime() noexcept
+{
+  refreshed = false;
+  bool local_ok = matrix && rhs && solution && residual && gmres && true_size >= 0;
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  try
+  {
+    matrix->HostReadWrite(); matrix->GetDiag(diagonal); matrix->GetOffd(offdiagonal, offd_columns);
+    double* const diagonal_data = diagonal.GetData();
+    double* const offd_data = offdiagonal.GetData();
+    const int diagonal_nnz = diagonal.NumNonZeroElems();
+    const int offd_nnz = offdiagonal.NumNonZeroElems();
+    local_ok = (diagonal_nnz == 0 || diagonal_data != nullptr) &&
+        (offd_nnz == 0 || offd_data != nullptr) && diagonal.Height() == true_size;
+    if (local_ok)
+    {
+      if (diagonal_nnz) std::fill(diagonal_data, diagonal_data + diagonal_nnz, 0.0);
+      if (offd_nnz) std::fill(offd_data, offd_data + offd_nnz, 0.0);
+      const int* const row_offsets = diagonal.GetI();
+      const int* const columns = diagonal.GetJ();
+      local_ok = (true_size == 0) || (row_offsets != nullptr && columns != nullptr);
+      for (int row = 0; row < true_size && local_ok; ++row)
+      {
+        bool found = false;
+        for (int entry = row_offsets[row]; entry < row_offsets[row + 1]; ++entry)
+          if (columns[entry] == row) { diagonal_data[entry] = 1.0; found = true; break; }
+        local_ok = found;
+      }
+      if (local_ok) { matrix->HypreRead(); local_ok = BindSolver(); }
+      if (local_ok) { *rhs = 1.0; *solution = 0.0; }
+    }
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  try { gmres->Mult(*rhs, *solution); local_ok = AllFinite(*solution); }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  try { *rhs = 0.0; *solution = 0.0; *residual = 0.0; }
+  catch (const std::exception&) { local_ok = false; }
+  refreshed = false;
+  return CollectiveAll(communicator, local_ok);
 }
 
 bool RetainedTraceSystem::Refresh(const std::vector<double>& schur_values,
@@ -1192,6 +1270,12 @@ struct EphemeralStepState final
   std::vector<double> schur, reduced;
   mfem::Vector raw_local_trace;
   mfem::Vector raw_true_trace;
+  mfem::Vector current_element_interior;
+  mfem::Vector previous_element_interior;
+  mfem::Vector current_element_trace;
+  mfem::Vector previous_element_trace;
+  std::vector<local::LocalOperator> operators;
+  const std::vector<int>* source_element_vdofs = nullptr;
   core::HostReferenceEngine condensation;
   mfem::Vector local_rhs;
   mfem::Vector true_rhs_values;
@@ -1210,12 +1294,17 @@ struct TracedScalarIgrP1Scratch::Implementation final
   int trace_local_size = -1;
   int elements = -1;
   std::size_t source_sample_capacity = 0;
+  const mfem::ParFiniteElementSpace* source_space = nullptr;
+  long source_sequence = -1;
+  std::vector<int> source_element_vdofs;
   EphemeralStepState state{};
   RetainedTraceSystem retained{};
   bool retained_initialized = false;
+  bool initialized = false;
+  bool initialization_attempted = false;
   bool initialization_poisoned = false;
 
-  bool Matches(const TracedScalarIgrP1GlobalStepInput& input) const noexcept
+  bool StorageMatches(const TracedScalarIgrP1GlobalStepInput& input) const noexcept
   {
     int comparison = MPI_UNEQUAL;
     const bool communicator_matches = input.communicator != MPI_COMM_NULL &&
@@ -1271,6 +1360,11 @@ struct TracedScalarIgrP1Scratch::Implementation final
         state.schur.size() <= state.schur.capacity() &&
         state.reduced.size() <= state.reduced.capacity() &&
         state.source_samples.size() <= state.source_samples.capacity() &&
+        state.operators.size() == static_cast<std::size_t>(elements) &&
+        state.current_element_interior.Size() == 28 &&
+        state.previous_element_interior.Size() == 28 &&
+        state.current_element_trace.Size() == 40 &&
+        state.previous_element_trace.Size() == 40 &&
         state.solve_and_recovery.HasExpectedStorage(
             trace_true_size, trace_local_size, interior_size, elements) &&
         (!retained_initialized ||
@@ -1279,6 +1373,16 @@ struct TracedScalarIgrP1Scratch::Implementation final
           retained.local_size == trace_local_size && retained.true_size == trace_true_size &&
           retained.trace_sequence == trace_space->GetSequence() && mesh &&
           retained.mesh_sequence == mesh->GetSequence() && retained.IsFrozen()));
+  }
+
+  bool Matches(const TracedScalarIgrP1GlobalStepInput& input) const noexcept
+  {
+    const bool source_matches = source_space == input.static_euler_rhs_space &&
+        ((source_space == nullptr && source_element_vdofs.empty()) ||
+         (source_space != nullptr && source_space->GetSequence() == source_sequence &&
+          source_element_vdofs.size() == static_cast<std::size_t>(elements) * 16));
+    return initialized && StorageMatches(input) && source_matches &&
+        state.source_element_vdofs == &source_element_vdofs;
   }
 };
 
@@ -1331,6 +1435,12 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
   {
     current_local_trace.SetSize(layout.TraceLocalVSize());
     previous_local_trace.SetSize(layout.TraceLocalVSize());
+    if (state.current_element_interior.Size() != 28) state.current_element_interior.SetSize(28);
+    if (state.previous_element_interior.Size() != 28) state.previous_element_interior.SetSize(28);
+    if (state.current_element_trace.Size() != 40) state.current_element_trace.SetSize(40);
+    if (state.previous_element_trace.Size() != 40) state.previous_element_trace.SetSize(40);
+    if (state.operators.size() != static_cast<std::size_t>(elements))
+      state.operators.resize(static_cast<std::size_t>(elements));
     const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
         mfem::Geometry::SQUARE, input.parameters.quadrature_order);
     const std::size_t count = static_cast<std::size_t>(elements);
@@ -1375,8 +1485,10 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
         mfem::Geometry::SQUARE, input.parameters.quadrature_order);
     for (int element = 0; element < elements && local_ok; ++element)
     {
-      mfem::Vector current_interior(28), previous_interior(28), trace(40),
-          previous_trace(40);
+      mfem::Vector& current_interior = state.current_element_interior;
+      mfem::Vector& previous_interior = state.previous_element_interior;
+      mfem::Vector& trace = state.current_element_trace;
+      mfem::Vector& previous_trace = state.previous_element_trace;
       local_ok = layout.GatherInteriorElement(element, *input.current_interior,
                                               current_interior) &&
           layout.GatherInteriorElement(element, *input.previous_interior,
@@ -1384,12 +1496,17 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
           layout.GatherTraceElement(element, current_local_trace, trace) &&
           layout.GatherTraceElement(element, previous_local_trace, previous_trace) &&
           FillElementSource(input.static_euler_rhs_space,
-                            input.static_euler_rhs_coefficients, element,
+                            input.static_euler_rhs_coefficients,
+                            state.source_element_vdofs == nullptr ? nullptr :
+                                state.source_element_vdofs->data() +
+                                    static_cast<std::size_t>(element) * 16,
+                            element,
                             volume_rule,
                             source_samples.data() +
                                 static_cast<std::size_t>(element) *
                                     static_cast<std::size_t>(volume_rule.GetNPoints()) * 4);
-      local::LocalOperator operator_data;
+      local::LocalOperator& operator_data = state.operators[
+          static_cast<std::size_t>(element)];
       if (local_ok)
       {
         const local::ElementState state{
@@ -1522,28 +1639,35 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
     retained->MarkUnrefreshed();
     const TracedScalarIgrP1TraceSolveOutput& solved =
         state.solve_and_recovery.result;
-    TracedScalarIgrP1GlobalStepOutput published;
-    try
-    {
-      published.trace_increment.SetSize(solved.trace_increment.Size());
-      published.interior_increment.SetSize(solved.interior_increment.Size());
-      local_ok = CopyVector(solved.trace_increment, published.trace_increment) &&
-          CopyVector(solved.interior_increment, published.interior_increment);
-    }
-    catch (const std::exception&) { local_ok = false; }
+    // Scratch callers bind their output storage before entry.  Publish only
+    // after every numerical and collective gate, without swapping its backing.
+    local_ok = output.trace_increment.Size() == solved.trace_increment.Size() &&
+        output.interior_increment.Size() == solved.interior_increment.Size() &&
+        HasCapacity(output.trace_increment, solved.trace_increment.Size()) &&
+        HasCapacity(output.interior_increment, solved.interior_increment.Size());
+    const double* const solved_trace = solved.trace_increment.HostRead();
+    const double* const solved_interior = solved.interior_increment.HostRead();
+    double* const output_trace = output.trace_increment.HostWrite();
+    double* const output_interior = output.interior_increment.HostWrite();
+    local_ok = local_ok &&
+        ((solved.trace_increment.Size() == 0) ||
+         (solved_trace != nullptr && output_trace != nullptr)) &&
+        ((solved.interior_increment.Size() == 0) ||
+         (solved_interior != nullptr && output_interior != nullptr));
     if (!CollectiveAll(input.communicator, local_ok))
     {
       retained->MarkUnrefreshed();
       return TracedScalarIgrP1GlobalStepResult::failure;
     }
-    published.initial_residual_norm = initial_norm;
-    published.reduced_rhs_norm = solved.reduced_rhs_norm;
-    published.linear_residual_norm = solved.linear_residual_norm;
-    output.trace_increment.Swap(published.trace_increment);
-    output.interior_increment.Swap(published.interior_increment);
-    output.initial_residual_norm = published.initial_residual_norm;
-    output.reduced_rhs_norm = published.reduced_rhs_norm;
-    output.linear_residual_norm = published.linear_residual_norm;
+    if (solved.trace_increment.Size() != 0)
+      std::memcpy(output_trace, solved_trace,
+                  static_cast<std::size_t>(solved.trace_increment.Size()) * sizeof(double));
+    if (solved.interior_increment.Size() != 0)
+      std::memcpy(output_interior, solved_interior,
+                  static_cast<std::size_t>(solved.interior_increment.Size()) * sizeof(double));
+    output.initial_residual_norm = initial_norm;
+    output.reduced_rhs_norm = solved.reduced_rhs_norm;
+    output.linear_residual_norm = solved.linear_residual_norm;
     return TracedScalarIgrP1GlobalStepResult::success;
   }
 
@@ -1737,7 +1861,13 @@ TracedScalarIgrP1Scratch::TracedScalarIgrP1Scratch(
     TracedScalarIgrP1GlobalStepInput binding{};
     binding.communicator = communicator;
     binding.layout = &layout;
-    if (!state.Matches(binding)) { implementation_.reset(); }
+    state.state.current_element_interior.SetSize(28);
+    state.state.previous_element_interior.SetSize(28);
+    state.state.current_element_trace.SetSize(40);
+    state.state.previous_element_trace.SetSize(40);
+    state.state.operators.resize(static_cast<std::size_t>(elements));
+    state.state.source_element_vdofs = &state.source_element_vdofs;
+    if (!state.StorageMatches(binding)) { implementation_.reset(); }
   }
   catch (...) { implementation_.reset(); }
 }
@@ -1748,6 +1878,73 @@ TracedScalarIgrP1Scratch::TracedScalarIgrP1Scratch(
 TracedScalarIgrP1Scratch& TracedScalarIgrP1Scratch::operator=(
     TracedScalarIgrP1Scratch&&) noexcept = default;
 
+bool TracedScalarIgrP1Scratch::Initialize(
+    const TracedScalarIgrP1GlobalStepInput& input) noexcept
+{
+  if (input.communicator == MPI_COMM_NULL) { return false; }
+  const bool local_admission = implementation_ != nullptr &&
+      !implementation_->initialization_attempted &&
+      implementation_->StorageMatches(input) && ValidInput(input);
+  if (!CollectiveAll(input.communicator, local_admission))
+  {
+    if (implementation_) { implementation_->initialization_attempted = true; implementation_->initialization_poisoned = true; }
+    return false;
+  }
+  TracedScalarIgrP1Scratch::Implementation& implementation = *implementation_;
+  implementation.initialization_attempted = true;
+  bool local_ok = true;
+  try
+  {
+    implementation.source_space = input.static_euler_rhs_space;
+    implementation.source_sequence = implementation.source_space == nullptr ? -1 :
+        implementation.source_space->GetSequence();
+    for (int order = 2; order <= 32; ++order)
+    {
+      (void)mfem::IntRules.Get(mfem::Geometry::SQUARE, order);
+      (void)mfem::IntRules.Get(mfem::Geometry::SEGMENT, order);
+    }
+    local_ok = CaptureSourceElementVDofs(implementation.source_space,
+        implementation.elements, implementation.source_element_vdofs) &&
+        implementation.state.condensation.Prepare({4, 8, 7, 5},
+            static_cast<std::size_t>(implementation.elements)) == core::Status::success;
+    if (local_ok)
+      for (local::LocalOperator& operator_data : implementation.state.operators)
+        operator_data.Resize();
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(input.communicator, local_ok))
+  {
+    implementation.initialization_poisoned = true;
+    return false;
+  }
+  if (!implementation.retained.Initialize(input.communicator, *input.layout) ||
+      !implementation.retained.Prime())
+  {
+    implementation.initialization_poisoned = true;
+    return false;
+  }
+  implementation.retained_initialized = true;
+  implementation.initialized = true;
+  if (!CollectiveAll(input.communicator, implementation.Matches(input)))
+  {
+    implementation.initialization_poisoned = true;
+    implementation.initialized = false;
+    return false;
+  }
+  return true;
+}
+
+bool TracedScalarIgrP1Scratch::IsReady() const noexcept
+{
+  if (!implementation_ || !implementation_->initialized ||
+      implementation_->initialization_poisoned) return false;
+  TracedScalarIgrP1GlobalStepInput binding{};
+  binding.communicator = implementation_->communicator;
+  binding.layout = implementation_->layout;
+  binding.static_euler_rhs_space = implementation_->source_space;
+  return implementation_->Matches(binding);
+}
+
 bool TracedScalarIgrP1Scratch::IsUsable() const noexcept
 {
   if (!implementation_ || implementation_->communicator == MPI_COMM_NULL ||
@@ -1755,7 +1952,7 @@ bool TracedScalarIgrP1Scratch::IsUsable() const noexcept
   TracedScalarIgrP1GlobalStepInput binding{};
   binding.communicator = implementation_->communicator;
   binding.layout = implementation_->layout;
-  return implementation_->Matches(binding);
+  return implementation_->StorageMatches(binding);
 }
 
 TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
@@ -1763,7 +1960,11 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
     TracedScalarIgrP1GlobalStepOutput& output,
     TracedScalarIgrP1Scratch& scratch) noexcept
 {
-  const bool local_ok = scratch.implementation_ && scratch.implementation_->Matches(input);
+  const bool local_ok = scratch.implementation_ && scratch.implementation_->Matches(input) &&
+      output.trace_increment.Size() == input.layout->TraceTrueVSize() &&
+      output.interior_increment.Size() == input.layout->InteriorLocalVSize() &&
+      HasCapacity(output.trace_increment, output.trace_increment.Size()) &&
+      HasCapacity(output.interior_increment, output.interior_increment.Size());
   if (input.communicator == MPI_COMM_NULL ||
       !CollectiveAll(input.communicator, local_ok))
   {
@@ -1771,40 +1972,6 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
   }
   TracedScalarIgrP1Scratch::Implementation& implementation =
       *scratch.implementation_;
-  int initialized = implementation.retained_initialized ? 1 : 0;
-  int initialized_min = 0;
-  int initialized_max = 0;
-  const int minimum_status = MPI_Allreduce(
-      &initialized, &initialized_min, 1, MPI_INT, MPI_MIN,
-      input.communicator);
-  // Execute the second collective even when the first reports an error: a
-  // short-circuit here would strand peers that entered their second reduction.
-  const int maximum_status = MPI_Allreduce(
-      &initialized, &initialized_max, 1, MPI_INT, MPI_MAX,
-      input.communicator);
-  const bool initialization_status = minimum_status == MPI_SUCCESS &&
-      maximum_status == MPI_SUCCESS;
-  if (!CollectiveAll(input.communicator, initialization_status) ||
-      initialized_min != initialized_max)
-  {
-    implementation.initialization_poisoned = true;
-    return TracedScalarIgrP1GlobalStepResult::failure;
-  }
-  if (initialized_min == 0)
-  {
-    if (!implementation.retained.Initialize(input.communicator, *input.layout))
-    {
-      // Initialize may have constructed a partial graph/plan before a
-      // collectively admitted failure.  It is never retried in place.
-      implementation.initialization_poisoned = true;
-      return TracedScalarIgrP1GlobalStepResult::failure;
-    }
-    implementation.retained_initialized = true;
-  }
-  if (!CollectiveAll(input.communicator, implementation.Matches(input)))
-  {
-    return TracedScalarIgrP1GlobalStepResult::failure;
-  }
   return ComputeEphemeralStep(input, output, implementation.state,
                               &implementation.retained);
 }

@@ -48,6 +48,8 @@ Status BuildRepresentativeShapeCensus(const mfem::Mesh& mesh,
 class HostReferenceEngine
 {
 public:
+  /** Reserve fixed internal staging for one stable local block batch. */
+  Status Prepare(const LocalBlockShape& shape, std::size_t batches) noexcept;
   Status Condense(const LocalSystemBatchView& input,
                   const CondensedBatchView& output) noexcept;
   Status ApplySchur(StridedBlockView<const double> trace,
@@ -66,6 +68,11 @@ private:
   // matrix-free Schur action instead of multiplying by a stored S.
   std::vector<double> lu_, b_, c_, d_, f_;
   std::vector<int> pivots_;
+  // Private fixed staging used by prepared repeated Condense/Recover calls.
+  std::vector<double> staged_lu_, staged_b_, staged_c_, staged_d_, staged_f_,
+      staged_schur_, staged_rhs_;
+  mutable std::vector<double> work_, recovered_;
+  std::vector<int> staged_pivots_;
 };
 
 static_assert(!std::is_polymorphic<HostReferenceEngine>::value,

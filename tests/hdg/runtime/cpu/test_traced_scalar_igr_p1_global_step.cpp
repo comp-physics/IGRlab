@@ -676,6 +676,14 @@ bool Run(const MPI_Comm communicator, const Layout& layout,
       communicator, &layout, quads.data(), static_cast<int>(quads.size()),
       parameters, &current_trace, &previous_trace, &current_interior,
       &previous_interior, &source_space, &source};
+  if (scratch != nullptr)
+  {
+    if (!scratch->IsReady() && !scratch->Initialize(input)) { return false; }
+    if (output.trace_increment.Size() != layout.TraceTrueVSize())
+      output.trace_increment.SetSize(layout.TraceTrueVSize());
+    if (output.interior_increment.Size() != layout.InteriorLocalVSize())
+      output.interior_increment.SetSize(layout.InteriorLocalVSize());
+  }
   const detail::TracedScalarIgrP1GlobalStepResult result = scratch
       ? detail::ComputeTracedScalarIgrP1GlobalStep(input, output, *scratch)
       : detail::ComputeTracedScalarIgrP1GlobalStep(input, output);
@@ -716,7 +724,7 @@ bool Check(const MPI_Comm communicator)
   detail::TracedScalarIgrP1Scratch scratch(communicator, layout);
   detail::TracedScalarIgrP1GlobalStepOutput scratch_first, scratch_repeat,
       scratch_source, scratch_dt;
-  ok = scratch.IsUsable();
+  ok = scratch.IsUsable() && !scratch.IsReady();
   if (!Require(communicator, ok, "scratch binding")) { return false; }
   const bool scratch_first_ok = Run(communicator, layout, quads, source_space,
       source_a, 0.05, scratch_first, &scratch) && scratch.IsUsable();
