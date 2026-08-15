@@ -3,11 +3,14 @@
 #include "numerics/hdg/core/host_reference.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -84,6 +87,19 @@ bool CheckedBatchCapacity(const int elements, const std::size_t entries,
 {
   return elements >= 0 && CheckedProduct(static_cast<std::size_t>(elements),
                                          entries, capacity);
+}
+
+bool CheckedGlobalTraceKey(const HYPRE_BigInt value,
+                           std::uint64_t& key) noexcept
+{
+  if (value < 0) { return false; }
+  if (sizeof(HYPRE_BigInt) > sizeof(std::uint64_t) &&
+      value > static_cast<HYPRE_BigInt>(std::numeric_limits<std::uint64_t>::max()))
+  {
+    return false;
+  }
+  key = static_cast<std::uint64_t>(value);
+  return true;
 }
 
 bool HasCapacity(const mfem::Vector& values, const int required) noexcept
@@ -310,6 +326,529 @@ bool MaxAbsAndNorm(const MPI_Comm communicator, const std::vector<double>& inter
 
 } // namespace
 
+/*
+ * A deliberately narrow retained true-trace system.  The public scratch
+ * owner below supplies the frozen layout lifetime; this type does not expose
+ * a session or attempt protocol.  The graph is assembled exactly once from
+ * signed element vdofs, then all numerical assembly writes through the
+ * recorded CSR slots.  Rows owned by another rank are exchanged in fixed
+ * rank-major order, so this works for an arbitrary number of neighbours.
+ */
+struct RetainedTraceSystem final
+{
+  struct LocalDof final { HYPRE_BigInt global = -1; int owner = -1; };
+  struct Slot final
+  {
+    std::size_t schur = 0;
+    int entry = -1;
+    double sign = 1.0;
+    bool offd = false;
+  };
+  struct Outgoing final
+  {
+    std::size_t schur = 0;
+    double sign = 1.0;
+    int destination = -1;
+  };
+  struct Incoming final { int entry = -1; bool offd = false; };
+
+  MPI_Comm communicator = MPI_COMM_NULL;
+  const BorrowedP1DGInterfaceLayout* layout = nullptr;
+  const mfem::ParFiniteElementSpace* trace_space = nullptr;
+  int rank = -1;
+  int ranks = 0;
+  int elements = -1;
+  int local_size = -1;
+  int true_size = -1;
+  long trace_sequence = -1;
+  long mesh_sequence = -1;
+  bool refreshed = false;
+  std::vector<int> element_vdofs;
+  std::vector<LocalDof> local_dofs;
+  std::unique_ptr<mfem::HypreParMatrix> matrix;
+  mfem::SparseMatrix diagonal;
+  mfem::SparseMatrix offdiagonal;
+  HYPRE_BigInt* offd_columns = nullptr;
+  std::vector<Slot> owned;
+  std::vector<Outgoing> outgoing;
+  std::vector<Incoming> incoming;
+  std::vector<int> send_counts, receive_counts, send_offsets, receive_offsets;
+  std::vector<double> send_values, receive_values;
+  mfem::Vector local_rhs;
+  mfem::Vector true_rhs;
+  std::unique_ptr<mfem::HypreParVector> rhs;
+  std::unique_ptr<mfem::HypreParVector> solution;
+  std::unique_ptr<mfem::HypreParVector> residual;
+  std::unique_ptr<mfem::HypreILU> ilu;
+  std::unique_ptr<mfem::HypreGMRES> gmres;
+
+  void MarkUnrefreshed() noexcept { refreshed = false; }
+
+  bool IsFrozen() const noexcept
+  {
+    if (communicator == MPI_COMM_NULL || !layout || !trace_space || rank < 0 ||
+        ranks <= 0 || elements < 0 || local_size < 0 || true_size < 0 ||
+        !matrix || !rhs || !solution || !residual || !ilu || !gmres ||
+        matrix->Height() != true_size || matrix->Width() != true_size ||
+        diagonal.Height() != true_size ||
+        element_vdofs.size() != static_cast<std::size_t>(elements) * 40 ||
+        local_dofs.size() != static_cast<std::size_t>(local_size) ||
+        send_counts.size() != static_cast<std::size_t>(ranks) ||
+        receive_counts.size() != static_cast<std::size_t>(ranks) ||
+        send_offsets.size() != static_cast<std::size_t>(ranks) ||
+        receive_offsets.size() != static_cast<std::size_t>(ranks) ||
+        send_values.size() != outgoing.size() || receive_values.size() != incoming.size() ||
+        local_rhs.Size() != local_size || true_rhs.Size() != true_size)
+    {
+      return false;
+    }
+    int send_cursor = 0;
+    int receive_cursor = 0;
+    for (int peer = 0; peer < ranks; ++peer)
+    {
+      const std::size_t index = static_cast<std::size_t>(peer);
+      if (send_counts[index] < 0 || receive_counts[index] < 0 ||
+          send_offsets[index] != send_cursor || receive_offsets[index] != receive_cursor ||
+          send_cursor > std::numeric_limits<int>::max() - send_counts[index] ||
+          receive_cursor > std::numeric_limits<int>::max() - receive_counts[index])
+      {
+        return false;
+      }
+      send_cursor += send_counts[index]; receive_cursor += receive_counts[index];
+    }
+    if (static_cast<std::size_t>(send_cursor) != outgoing.size() ||
+        static_cast<std::size_t>(receive_cursor) != incoming.size()) return false;
+    const std::size_t schur_entries = static_cast<std::size_t>(elements) * 1600;
+    for (const Slot& term : owned)
+      if (term.entry < 0 || term.schur >= schur_entries) return false;
+    for (const Outgoing& term : outgoing)
+      if (term.destination < 0 || term.destination >= ranks ||
+          term.destination == rank || term.schur >= schur_entries) return false;
+    for (const Incoming& term : incoming) if (term.entry < 0) return false;
+    return true;
+  }
+
+  bool FindSlot(const HYPRE_BigInt row, const HYPRE_BigInt column,
+                int& entry, bool& is_offd) const noexcept
+  {
+    const HYPRE_BigInt* starts = matrix ? matrix->GetRowStarts() : nullptr;
+    const int local_rows = diagonal.Height();
+    const int* di = diagonal.GetI();
+    const int* dj = diagonal.GetJ();
+    const int* oi = offdiagonal.GetI();
+    const int* oj = offdiagonal.GetJ();
+    if (local_rows == 0) { return false; }
+    if (!starts || !di) { return false; }
+    const HYPRE_BigInt begin = HYPRE_AssumedPartitionCheck() ? starts[0] : starts[rank];
+    const HYPRE_BigInt end = begin + local_rows;
+    if (row < begin || row >= end) { return false; }
+    const int local_row = static_cast<int>(row - begin);
+    if (column >= begin && column < end)
+    {
+      if (!dj) { return false; }
+      const int local_column = static_cast<int>(column - begin);
+      for (int index = di[local_row]; index < di[local_row + 1]; ++index)
+      {
+        if (dj[index] == local_column) { entry = index; is_offd = false; return true; }
+      }
+      return false;
+    }
+    if (!oi || !oj || !offd_columns) { return false; }
+    for (int index = oi[local_row]; index < oi[local_row + 1]; ++index)
+    {
+      if (offd_columns[oj[index]] == column)
+      { entry = index; is_offd = true; return true; }
+    }
+    return false;
+  }
+
+  bool BindSolver() noexcept
+  {
+    try
+    {
+      if (!matrix || !ilu || !gmres) { return false; }
+      gmres->SetOperator(*matrix);
+      // SetOperator may recreate the bound HypreILU with defaults.  Match the
+      // accepted retained-core rebind sequence before it is reattached.
+      ilu->SetType(0); ilu->SetLevelOfFill(0); ilu->SetMaxIter(1);
+      ilu->SetTol(0.0); ilu->SetLocalReordering(0); ilu->SetPrintLevel(0);
+      gmres->SetPreconditioner(*ilu);
+      return true;
+    }
+    catch (const std::exception&) { return false; }
+  }
+
+  bool Initialize(MPI_Comm comm, const BorrowedP1DGInterfaceLayout& bound) noexcept;
+  bool Refresh(const std::vector<double>& schur_values,
+               const std::vector<double>& reduced_values) noexcept;
+  bool Solve(const double scale, mfem::Vector& true_trace,
+             double& residual_norm) noexcept;
+};
+
+bool RetainedTraceSystem::Initialize(
+    const MPI_Comm comm, const BorrowedP1DGInterfaceLayout& bound) noexcept
+{
+  communicator = comm; layout = &bound; trace_space = bound.TraceSpace();
+  bool local_ok = communicator != MPI_COMM_NULL && bound.IsUsable() &&
+      trace_space != nullptr && MPI_Comm_rank(communicator, &rank) == MPI_SUCCESS &&
+      MPI_Comm_size(communicator, &ranks) == MPI_SUCCESS && rank >= 0 &&
+      ranks > 0;
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  try
+  {
+    elements = bound.LocalElementCount(); local_size = bound.TraceLocalVSize();
+    true_size = bound.TraceTrueVSize();
+    trace_sequence = trace_space->GetSequence();
+    const mfem::ParMesh* const mesh = trace_space->GetParMesh();
+    mesh_sequence = mesh ? mesh->GetSequence() : -1;
+    local_ok = elements >= 0 && local_size >= 0 && true_size >= 0 &&
+        trace_sequence >= 0 && mesh_sequence >= 0 &&
+        trace_space->GetVSize() == local_size && trace_space->GetTrueVSize() == true_size;
+    element_vdofs.resize(static_cast<std::size_t>(elements) * 40);
+    local_dofs.resize(static_cast<std::size_t>(local_size));
+    std::vector<int> owner(static_cast<std::size_t>(local_size), rank);
+    const mfem::GroupCommunicator& group = trace_space->GroupComm();
+    const mfem::Table& group_dofs = group.GroupLDofTable();
+    const mfem::GroupTopology& topology = group.GetGroupTopology();
+    local_ok = local_ok && group_dofs.Size() == topology.NGroups();
+    for (int group_index = 1; group_index < group_dofs.Size() && local_ok;
+         ++group_index)
+    {
+      const int master = topology.GetGroupMasterRank(group_index);
+      const int* const dofs = group_dofs.GetRow(group_index);
+      local_ok = master >= 0 && master < ranks &&
+          (group_dofs.RowSize(group_index) == 0 || dofs != nullptr);
+      for (int index = 0; index < group_dofs.RowSize(group_index) && local_ok;
+           ++index)
+      {
+        local_ok = dofs[index] >= 0 && dofs[index] < local_size;
+        if (local_ok) { owner[static_cast<std::size_t>(dofs[index])] = master; }
+      }
+    }
+    for (int dof = 0; dof < local_size && local_ok; ++dof)
+    {
+      const HYPRE_BigInt global = trace_space->GetGlobalTDofNumber(dof);
+      const int local_true = trace_space->GetLocalTDofNumber(dof);
+      local_ok = global >= 0 && owner[static_cast<std::size_t>(dof)] >= 0 &&
+          owner[static_cast<std::size_t>(dof)] < ranks &&
+          ((local_true >= 0) == (owner[static_cast<std::size_t>(dof)] == rank));
+      local_dofs[static_cast<std::size_t>(dof)] = {global,
+          owner[static_cast<std::size_t>(dof)]};
+    }
+    for (int element = 0; element < elements && local_ok; ++element)
+    {
+      mfem::Array<int> vdofs;
+      trace_space->GetElementVDofs(element, vdofs);
+      local_ok = vdofs.Size() == 40;
+      for (int index = 0; index < 40 && local_ok; ++index)
+      {
+        double sign = 1.0;
+        const int dof = DecodeSignedVDof(vdofs[index], sign);
+        local_ok = dof >= 0 && dof < local_size;
+        element_vdofs[static_cast<std::size_t>(element) * 40 + index] = vdofs[index];
+      }
+    }
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+
+  try
+  {
+    mfem::SparseMatrix graph(local_size);
+    mfem::DenseMatrix pattern(40);
+    for (int element = 0; element < elements; ++element)
+    {
+      mfem::Array<int> vdofs(40);
+      for (int row = 0; row < 40; ++row)
+      {
+        vdofs[row] = element_vdofs[static_cast<std::size_t>(element) * 40 + row];
+        double row_sign = 1.0;
+        (void)DecodeSignedVDof(vdofs[row], row_sign);
+        for (int column = 0; column < 40; ++column)
+        {
+          double column_sign = 1.0;
+          (void)DecodeSignedVDof(element_vdofs[static_cast<std::size_t>(element) * 40 + column], column_sign);
+          pattern(row, column) = row_sign * column_sign;
+        }
+      }
+      graph.AddSubMatrix(vdofs, vdofs, pattern, 1);
+    }
+    graph.Finalize(0, false);
+    mfem::ParBilinearForm form(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
+    matrix.reset(form.ParallelAssemble(&graph));
+    local_ok = matrix != nullptr && matrix->Height() == true_size &&
+        matrix->Width() == true_size &&
+        matrix->GetGlobalNumRows() == trace_space->GlobalTrueVSize() &&
+        matrix->GetGlobalNumCols() == trace_space->GlobalTrueVSize() &&
+        matrix->GetGlobalNumRows() > 0 &&
+        matrix->GetGlobalNumRows() <= std::numeric_limits<int>::max();
+    if (local_ok)
+    {
+      matrix->HostReadWrite(); matrix->GetDiag(diagonal);
+      matrix->GetOffd(offdiagonal, offd_columns);
+      local_ok = diagonal.Height() == true_size;
+    }
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+
+  std::vector<std::array<std::uint64_t, 2>> outgoing_keys;
+  try
+  {
+    for (int element = 0; element < elements && local_ok; ++element)
+      for (int row = 0; row < 40 && local_ok; ++row)
+      {
+        double row_sign = 1.0;
+        const int row_dof = DecodeSignedVDof(element_vdofs[static_cast<std::size_t>(element) * 40 + row], row_sign);
+        local_ok = row_dof >= 0 && row_dof < local_size;
+        const LocalDof& row_info = local_dofs[static_cast<std::size_t>(row_dof)];
+        for (int column = 0; column < 40 && local_ok; ++column)
+        {
+          double column_sign = 1.0;
+          const int column_dof = DecodeSignedVDof(element_vdofs[static_cast<std::size_t>(element) * 40 + column], column_sign);
+          local_ok = column_dof >= 0 && column_dof < local_size;
+          const LocalDof& column_info = local_dofs[static_cast<std::size_t>(column_dof)];
+          const std::size_t index = static_cast<std::size_t>(element) * 1600 +
+              static_cast<std::size_t>(row) * 40 + column;
+          if (row_info.owner == rank)
+          {
+            int entry = -1; bool is_offd = false;
+            local_ok = FindSlot(row_info.global, column_info.global, entry, is_offd);
+            if (local_ok) { owned.push_back({index, entry, row_sign * column_sign, is_offd}); }
+          }
+          else
+          {
+            std::uint64_t row_key = 0;
+            std::uint64_t column_key = 0;
+            local_ok = CheckedGlobalTraceKey(row_info.global, row_key) &&
+                CheckedGlobalTraceKey(column_info.global, column_key);
+            if (!local_ok) { break; }
+            outgoing.push_back({index, row_sign * column_sign, row_info.owner});
+            outgoing_keys.push_back({row_key, column_key});
+          }
+        }
+      }
+    std::vector<std::size_t> order(outgoing.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b)
+      { return outgoing[a].destination < outgoing[b].destination; });
+    std::vector<Outgoing> sorted(outgoing.size());
+    std::vector<std::array<std::uint64_t, 2>> sorted_keys(outgoing.size());
+    for (std::size_t index = 0; index < order.size(); ++index)
+    { sorted[index] = outgoing[order[index]]; sorted_keys[index] = outgoing_keys[order[index]]; }
+    outgoing.swap(sorted); outgoing_keys.swap(sorted_keys);
+    send_counts.assign(static_cast<std::size_t>(ranks), 0);
+    send_offsets.assign(static_cast<std::size_t>(ranks), 0);
+    for (const Outgoing& term : outgoing)
+    {
+      local_ok = local_ok && term.destination >= 0 && term.destination < ranks && term.destination != rank;
+      if (local_ok)
+      {
+        int& count = send_counts[static_cast<std::size_t>(term.destination)];
+        local_ok = count >= 0 && count < std::numeric_limits<int>::max() / 2;
+        if (local_ok) { ++count; }
+      }
+    }
+    for (int peer = 1; peer < ranks && local_ok; ++peer)
+    {
+      const int previous_offset = send_offsets[static_cast<std::size_t>(peer - 1)];
+      const int previous_count = send_counts[static_cast<std::size_t>(peer - 1)];
+      local_ok = previous_offset >= 0 && previous_count >= 0 &&
+          previous_offset <= std::numeric_limits<int>::max() - previous_count;
+      if (local_ok) send_offsets[static_cast<std::size_t>(peer)] =
+          previous_offset + previous_count;
+    }
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  receive_counts.assign(static_cast<std::size_t>(ranks), 0);
+  receive_offsets.assign(static_cast<std::size_t>(ranks), 0);
+  const bool count_exchange = MPI_Alltoall(
+      send_counts.data(), 1, MPI_INT, receive_counts.data(), 1, MPI_INT,
+      communicator) == MPI_SUCCESS;
+  if (!CollectiveAll(communicator, count_exchange)) { return false; }
+  std::size_t incoming_count = 0;
+  for (int peer = 0; peer < ranks; ++peer)
+  {
+    const int count = receive_counts[static_cast<std::size_t>(peer)];
+    local_ok = local_ok && count >= 0 &&
+        count <= std::numeric_limits<int>::max() / 2;
+    if (peer > 0 && local_ok)
+    {
+      const int previous_offset = receive_offsets[static_cast<std::size_t>(peer - 1)];
+      const int previous_count = receive_counts[static_cast<std::size_t>(peer - 1)];
+      local_ok = previous_offset >= 0 && previous_count >= 0 &&
+          previous_offset <= std::numeric_limits<int>::max() - previous_count;
+      if (local_ok) receive_offsets[static_cast<std::size_t>(peer)] =
+          previous_offset + previous_count;
+    }
+  }
+  if (ranks > 0 && local_ok)
+  {
+    const int final_offset = receive_offsets.back();
+    const int final_count = receive_counts.back();
+    local_ok = final_offset >= 0 && final_count >= 0 &&
+        final_offset <= std::numeric_limits<int>::max() - final_count;
+    if (local_ok) incoming_count = static_cast<std::size_t>(final_offset + final_count);
+  }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  std::vector<std::array<std::uint64_t, 2>> incoming_keys(incoming_count);
+  std::vector<int> send_key_counts(static_cast<std::size_t>(ranks)), receive_key_counts(static_cast<std::size_t>(ranks)), send_key_offsets(static_cast<std::size_t>(ranks)), receive_key_offsets(static_cast<std::size_t>(ranks));
+  for (int peer = 0; peer < ranks; ++peer)
+  {
+    local_ok = local_ok && send_counts[peer] >= 0 && receive_counts[peer] >= 0 &&
+        send_offsets[peer] >= 0 && receive_offsets[peer] >= 0 &&
+        send_counts[peer] <= std::numeric_limits<int>::max() / 2 &&
+        receive_counts[peer] <= std::numeric_limits<int>::max() / 2 &&
+        send_offsets[peer] <= std::numeric_limits<int>::max() / 2 &&
+        receive_offsets[peer] <= std::numeric_limits<int>::max() / 2;
+    if (local_ok)
+    {
+      send_key_counts[peer] = 2 * send_counts[peer]; receive_key_counts[peer] = 2 * receive_counts[peer];
+      send_key_offsets[peer] = 2 * send_offsets[peer]; receive_key_offsets[peer] = 2 * receive_offsets[peer];
+    }
+  }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  const bool key_exchange = MPI_Alltoallv(
+      outgoing_keys.data(), send_key_counts.data(), send_key_offsets.data(),
+      MPI_UINT64_T, incoming_keys.data(), receive_key_counts.data(),
+      receive_key_offsets.data(), MPI_UINT64_T, communicator) == MPI_SUCCESS;
+  if (!CollectiveAll(communicator, key_exchange)) { return false; }
+  try
+  {
+    incoming.resize(incoming_count); send_values.resize(outgoing.size()); receive_values.resize(incoming_count);
+    for (std::size_t index = 0; index < incoming_count && local_ok; ++index)
+    {
+      int entry = -1; bool is_offd = false;
+      local_ok = incoming_keys[index][0] <= static_cast<std::uint64_t>(
+              std::numeric_limits<HYPRE_BigInt>::max()) &&
+          incoming_keys[index][1] <= static_cast<std::uint64_t>(
+              std::numeric_limits<HYPRE_BigInt>::max()) &&
+          FindSlot(static_cast<HYPRE_BigInt>(incoming_keys[index][0]),
+                   static_cast<HYPRE_BigInt>(incoming_keys[index][1]), entry,
+                   is_offd);
+      incoming[index] = {entry, is_offd};
+    }
+    local_rhs.SetSize(local_size); true_rhs.SetSize(true_size);
+    rhs = std::make_unique<mfem::HypreParVector>(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
+    solution = std::make_unique<mfem::HypreParVector>(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
+    residual = std::make_unique<mfem::HypreParVector>(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
+    ilu = std::make_unique<mfem::HypreILU>(); gmres = std::make_unique<mfem::HypreGMRES>(communicator);
+    gmres->SetTol(1.0e-12); gmres->SetAbsTol(0.0);
+    const int global = static_cast<int>(matrix->GetGlobalNumRows());
+    gmres->SetMaxIter(std::max(100, global)); gmres->SetKDim(std::min(100, std::max(20, global)));
+    gmres->SetLogging(0); gmres->SetPrintLevel(0);
+    local_ok = BindSolver();
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  refreshed = false;
+  return true;
+}
+
+bool RetainedTraceSystem::Refresh(const std::vector<double>& schur_values,
+                                  const std::vector<double>& reduced_values) noexcept
+{
+  const std::size_t expected_schur = static_cast<std::size_t>(elements) * 1600;
+  const std::size_t expected_reduced = static_cast<std::size_t>(elements) * 40;
+  bool local_ok = matrix && schur_values.size() == expected_schur &&
+      reduced_values.size() == expected_reduced && AllFinite(schur_values) &&
+      AllFinite(reduced_values);
+  if (!CollectiveAll(communicator, local_ok)) { refreshed = false; return false; }
+  refreshed = false;
+  try
+  {
+    matrix->HostReadWrite(); matrix->GetDiag(diagonal); matrix->GetOffd(offdiagonal, offd_columns);
+    double* diagonal_data = diagonal.GetData(); double* offd_data = offdiagonal.GetData();
+    const int diagonal_nnz = diagonal.NumNonZeroElems(); const int offd_nnz = offdiagonal.NumNonZeroElems();
+    local_ok = (diagonal_nnz == 0 || diagonal_data != nullptr) && (offd_nnz == 0 || offd_data != nullptr);
+    if (local_ok)
+    {
+      if (diagonal_nnz) std::fill(diagonal_data, diagonal_data + diagonal_nnz, 0.0);
+      if (offd_nnz) std::fill(offd_data, offd_data + offd_nnz, 0.0);
+      local_rhs = 0.0;
+      for (int element = 0; element < elements && local_ok; ++element)
+        for (int row = 0; row < 40; ++row)
+        {
+          double sign = 1.0; const int dof = DecodeSignedVDof(element_vdofs[static_cast<std::size_t>(element) * 40 + row], sign);
+          local_ok = dof >= 0 && dof < local_rhs.Size();
+          if (local_ok) local_rhs[dof] += sign * reduced_values[static_cast<std::size_t>(element) * 40 + row];
+        }
+      for (const Slot& term : owned)
+      {
+        double* data = term.offd ? offd_data : diagonal_data;
+        local_ok = local_ok && data != nullptr && term.entry >= 0 && term.schur < schur_values.size();
+        if (local_ok) data[term.entry] += term.sign * schur_values[term.schur];
+      }
+      for (std::size_t index = 0; index < outgoing.size() && local_ok; ++index)
+      {
+        local_ok = outgoing[index].schur < schur_values.size();
+        if (local_ok) send_values[index] = outgoing[index].sign * schur_values[outgoing[index].schur];
+      }
+      local_ok = local_ok && AllFinite(local_rhs) && AllFinite(send_values);
+    }
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  const bool value_exchange = MPI_Alltoallv(
+      send_values.data(), send_counts.data(), send_offsets.data(), MPI_DOUBLE,
+      receive_values.data(), receive_counts.data(), receive_offsets.data(),
+      MPI_DOUBLE, communicator) == MPI_SUCCESS;
+  if (!CollectiveAll(communicator, value_exchange)) { return false; }
+  try
+  {
+    double* diagonal_data = diagonal.GetData(); double* offd_data = offdiagonal.GetData();
+    local_ok = AllFinite(receive_values);
+    for (std::size_t index = 0; index < incoming.size() && local_ok; ++index)
+    {
+      double* data = incoming[index].offd ? offd_data : diagonal_data;
+      local_ok = data != nullptr && incoming[index].entry >= 0;
+      if (local_ok) data[incoming[index].entry] += receive_values[index];
+    }
+    trace_space->Dof_TrueDof_Matrix()->MultTranspose(local_rhs, true_rhs);
+    matrix->HypreRead();
+    local_ok = local_ok && AllFinite(true_rhs) && BindSolver();
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  refreshed = true;
+  return true;
+}
+
+bool RetainedTraceSystem::Solve(const double scale, mfem::Vector& true_trace,
+                                double& residual_norm) noexcept
+{
+  bool local_ok = refreshed && Finite(scale) && scale > 0.0 && rhs && solution && residual;
+  if (!CollectiveAll(communicator, local_ok)) { refreshed = false; return false; }
+  try
+  {
+    const double* values = true_rhs.HostRead(); double* scaled = rhs->HostWrite();
+    local_ok = (true_size == 0 || (values != nullptr && scaled != nullptr));
+    for (int index = 0; index < true_size && local_ok; ++index) { scaled[index] = values[index] / scale; local_ok = Finite(scaled[index]); }
+    *solution = 0.0;
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { refreshed = false; return false; }
+  try { gmres->Mult(*rhs, *solution); matrix->Mult(*solution, *residual); *residual -= *rhs; }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { refreshed = false; return false; }
+  double maximum = 0.0;
+  if (!MaxAbsAndNorm(communicator, *residual, maximum, residual_norm))
+  { refreshed = false; return false; }
+  try
+  {
+    const double* solved = solution->HostRead(); double* destination = true_trace.HostWrite();
+    local_ok = AllFinite(*solution) && residual_norm <= 1.0e-10 &&
+        (true_size == 0 || (solved != nullptr && destination != nullptr));
+    for (int index = 0; index < true_size && local_ok; ++index) { destination[index] = scale * solved[index]; local_ok = Finite(destination[index]); }
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { refreshed = false; return false; }
+  residual_norm *= scale;
+  refreshed = false;
+  return Finite(residual_norm);
+}
+
 /** Retained non-Hypre storage for one solve/recovery call. */
 struct SolveAndRecoverTracedScalarIgrP1State final
 {
@@ -356,7 +895,8 @@ struct SolveAndRecoverTracedScalarIgrP1State final
 
 static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
     const TracedScalarIgrP1TraceSolveInput& input,
-    SolveAndRecoverTracedScalarIgrP1State& state) noexcept
+    SolveAndRecoverTracedScalarIgrP1State& state,
+    RetainedTraceSystem* const retained = nullptr) noexcept
 {
   if (input.communicator == MPI_COMM_NULL) { return false; }
   bool local_input_ok = input.layout != nullptr && input.trace_space != nullptr &&
@@ -422,7 +962,11 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
   double linear_norm = 0.0;
 
-  if (!exact_zero_rhs)
+  if (!exact_zero_rhs && retained != nullptr)
+  {
+    if (!retained->Solve(rhs_maximum, true_trace, linear_norm)) { return false; }
+  }
+  else if (!exact_zero_rhs)
   {
     mfem::Vector scaled_values(input.layout->TraceTrueVSize());
     const double* const rhs = input.true_rhs_values->HostRead();
@@ -580,6 +1124,7 @@ struct TracedScalarIgrP1Scratch::Implementation final
   int elements = -1;
   std::size_t source_sample_capacity = 0;
   EphemeralStepState state{};
+  RetainedTraceSystem retained{};
 
   bool Matches(const TracedScalarIgrP1GlobalStepInput& input) const noexcept
   {
@@ -638,7 +1183,13 @@ struct TracedScalarIgrP1Scratch::Implementation final
         state.reduced.size() <= state.reduced.capacity() &&
         state.source_samples.size() <= state.source_samples.capacity() &&
         state.solve_and_recovery.HasExpectedStorage(
-            trace_true_size, trace_local_size, interior_size, elements);
+            trace_true_size, trace_local_size, interior_size, elements) &&
+        retained.communicator == communicator && retained.layout == layout &&
+        retained.trace_space == trace_space && retained.elements == elements &&
+        retained.local_size == trace_local_size && retained.true_size == trace_true_size &&
+        retained.trace_sequence == trace_space->GetSequence() && mesh &&
+        retained.mesh_sequence == mesh->GetSequence() &&
+        retained.IsFrozen();
   }
 };
 
@@ -649,7 +1200,8 @@ struct TracedScalarIgrP1Scratch::Implementation final
 static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
     const TracedScalarIgrP1GlobalStepInput& input,
     TracedScalarIgrP1GlobalStepOutput& output,
-    EphemeralStepState& state) noexcept
+    EphemeralStepState& state,
+    RetainedTraceSystem* const retained = nullptr) noexcept
 {
   // The communicator has been admitted by the caller.  This initial local
   // check is deliberately before every opaque collective phase.
@@ -861,8 +1413,53 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
 
-  // Assembled matrix ownership remains call-local: neither MFEM nor Hypre
-  // objects are retained by TracedScalarIgrP1Scratch between attempts.
+  if (retained != nullptr)
+  {
+    if (!retained->Refresh(schur, reduced))
+    {
+      return TracedScalarIgrP1GlobalStepResult::failure;
+    }
+    const TracedScalarIgrP1TraceSolveInput solve_input{
+        input.communicator, &layout, trace_space, retained->matrix.get(),
+        &retained->true_rhs, &condensation};
+    if (!SolveAndRecoverTracedScalarIgrP1TraceWithState(
+            solve_input, state.solve_and_recovery, retained))
+    {
+      retained->MarkUnrefreshed();
+      return TracedScalarIgrP1GlobalStepResult::failure;
+    }
+    // A refresh is single-use, including the exact-zero RHS path that skips
+    // GMRES.  A subsequent attempt must complete a new numerical refresh.
+    retained->MarkUnrefreshed();
+    const TracedScalarIgrP1TraceSolveOutput& solved =
+        state.solve_and_recovery.result;
+    TracedScalarIgrP1GlobalStepOutput published;
+    try
+    {
+      published.trace_increment.SetSize(solved.trace_increment.Size());
+      published.interior_increment.SetSize(solved.interior_increment.Size());
+      local_ok = CopyVector(solved.trace_increment, published.trace_increment) &&
+          CopyVector(solved.interior_increment, published.interior_increment);
+    }
+    catch (const std::exception&) { local_ok = false; }
+    if (!CollectiveAll(input.communicator, local_ok))
+    {
+      retained->MarkUnrefreshed();
+      return TracedScalarIgrP1GlobalStepResult::failure;
+    }
+    published.initial_residual_norm = initial_norm;
+    published.reduced_rhs_norm = solved.reduced_rhs_norm;
+    published.linear_residual_norm = solved.linear_residual_norm;
+    output.trace_increment.Swap(published.trace_increment);
+    output.interior_increment.Swap(published.interior_increment);
+    output.initial_residual_norm = published.initial_residual_norm;
+    output.reduced_rhs_norm = published.reduced_rhs_norm;
+    output.linear_residual_norm = published.linear_residual_norm;
+    return TracedScalarIgrP1GlobalStepResult::success;
+  }
+
+  // The convenience overload retains no matrix or Hypre state.  The scratch
+  // overload returned above owns the frozen graph and its retained objects.
   std::unique_ptr<mfem::SparseMatrix> local_matrix;
   mfem::Vector& local_rhs = state.local_rhs;
   mfem::Vector& true_rhs_values = state.true_rhs_values;
@@ -1048,6 +1645,11 @@ TracedScalarIgrP1Scratch::TracedScalarIgrP1Scratch(
     solve.local_trace_values.resize(g_capacity);
     solve.result.trace_increment.SetSize(trace_true_size);
     solve.result.interior_increment.SetSize(interior_size);
+    if (!state.retained.Initialize(communicator, layout))
+    {
+      implementation_.reset();
+      return;
+    }
     TracedScalarIgrP1GlobalStepInput binding{};
     binding.communicator = communicator;
     binding.layout = &layout;
@@ -1083,7 +1685,8 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
   {
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
-  return ComputeEphemeralStep(input, output, scratch.implementation_->state);
+  return ComputeEphemeralStep(input, output, scratch.implementation_->state,
+                              &scratch.implementation_->retained);
 }
 
 } // namespace dg::hdg::runtime::cpu::detail

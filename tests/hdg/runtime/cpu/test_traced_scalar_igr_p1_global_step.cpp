@@ -854,6 +854,40 @@ bool Check(const MPI_Comm communicator)
       scratch.IsUsable();
   if (!Require(communicator, ok, "invalid input preservation")) { return false; }
 
+  // A rejected refresh must not publish into the caller output, and the same
+  // retained graph must accept the next complete finite refresh.  Only ranks
+  // with source dofs inject the NaN; the detail helper's collective gate makes
+  // every rank observe the failure, including an empty partition.
+  mfem::Vector nonfinite_source(source_a);
+  if (nonfinite_source.Size() > 0)
+  {
+    nonfinite_source[0] = std::numeric_limits<double>::quiet_NaN();
+  }
+  ok = !Run(communicator, layout, quads, source_space, nonfinite_source, 0.05,
+            preserved, &scratch) &&
+      preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
+      preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
+      preserved.initial_residual_norm == 11.0 && preserved.reduced_rhs_norm == 13.0 &&
+      preserved.linear_residual_norm == 17.0;
+  if (!Require(communicator, ok, "nonfinite refresh preservation")) { return false; }
+  std::vector<local::AffineQuad> topology_drift = quads;
+  if (!topology_drift.empty()) { topology_drift.pop_back(); }
+  ok = !Run(communicator, layout, topology_drift, source_space, source_a, 0.05,
+            preserved, &scratch) &&
+      preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
+      preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
+      preserved.initial_residual_norm == 11.0 && preserved.reduced_rhs_norm == 13.0 &&
+      preserved.linear_residual_norm == 17.0;
+  if (!Require(communicator, ok, "topology drift preservation")) { return false; }
+  detail::TracedScalarIgrP1GlobalStepOutput recovered_after_failure;
+  ok = Run(communicator, layout, quads, source_space, source_a, 0.05,
+           recovered_after_failure, &scratch) &&
+      SameBits(recovered_after_failure.trace_increment,
+               scratch_first.trace_increment) &&
+      SameBits(recovered_after_failure.interior_increment,
+               scratch_first.interior_increment);
+  if (!Require(communicator, ok, "complete refresh recovery")) { return false; }
+
   mfem::Vector aliased_trace(layout.TraceTrueVSize());
   mfem::Vector aliased_current_interior, aliased_previous_interior;
   ok = trace_space != nullptr && FillTrueTrace(*trace_space, aliased_trace, 0.0) &&
