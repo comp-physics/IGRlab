@@ -31,6 +31,8 @@ namespace
 using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::BackendSelection;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::RegularizationKind;
+using dg::hdg::generic::RegularizationSelection;
 using dg::hdg::runtime::cpu::GenericEulerCpuSessionStatus;
 using dg::hdg::runtime::cpu::GenericEulerHdgCpuSession;
 using dg::hdg::runtime::cpu::GenericEulerCpuPreparedStep;
@@ -274,7 +276,8 @@ std::string CanonicalMainRequest(
     const HdgEulerMainRequest& request,
     const std::string& mesh_path,
     const mfem::io::VTKOutputConfig& vtk,
-    const std::string& boundary_key)
+    const std::string& boundary_key,
+    const RegularizationSelection regularization)
 {
   std::ostringstream stream;
   AppendText(stream, request.case_config.case_name);
@@ -298,9 +301,29 @@ std::string CanonicalMainRequest(
   AppendDouble(stream, request.options.t_final);
   AppendDouble(stream, request.options.dt_save);
   AppendDouble(stream, request.case_config.gamma);
+  stream << static_cast<int>(regularization.kind) << ';';
+  AppendDouble(stream, regularization.alpha);
+  AppendDouble(stream, regularization.beta);
   stream << request.initial_condition.GetVDim() << ';';
   AppendText(stream, boundary_key);
   return stream.str();
+}
+
+RegularizationSelection CanonicalRegularization(
+    const HdgEulerMainRequest& request)
+{
+  const std::string selector = ToLowerCopy(request.options.regularization);
+  if (selector == "none")
+  {
+    return {RegularizationKind::none, 0.0, 0.0};
+  }
+  if (selector == "igr")
+  {
+    return {RegularizationKind::igr,
+            request.options.hdg_igr_alpha,
+            request.options.hdg_igr_beta};
+  }
+  throw std::invalid_argument("HDG regularization must resolve to 'none' or 'igr'");
 }
 
 int Reject(const HdgEulerMainRequest& request,
@@ -313,7 +336,8 @@ int Reject(const HdgEulerMainRequest& request,
   return 1;
 }
 
-std::string Validate(const HdgEulerMainRequest& request)
+std::string Validate(const HdgEulerMainRequest& request,
+                     const RegularizationSelection regularization)
 {
   int initialized = 0;
   int finalized = 0;
@@ -326,6 +350,15 @@ std::string Validate(const HdgEulerMainRequest& request)
   if (ToLowerCopy(request.options.device) != "cpu")
   {
     return "generic main-backend V1 supports only --device cpu";
+  }
+  if (!dg::hdg::generic::ValidRegularizationSelection(regularization))
+  {
+    return "HDG IGR alpha and beta must be finite and positive";
+  }
+  if (regularization.kind == RegularizationKind::igr &&
+      request.options.order != dg::hdg::generic::minimum_polynomial_order)
+  {
+    return "HDG IGR supports only polynomial order one";
   }
   if (!request.options.restart_vtk.empty() ||
       request.options.restart_cycle >= 0 || request.options.restart_step >= 0)
@@ -417,10 +450,12 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       return Reject(request, "invalid MPI communicator or lifecycle");
     }
     std::string rejection;
+    RegularizationSelection regularization{};
     bool local_ok = true;
     try
     {
-      rejection = Validate(request);
+      regularization = CanonicalRegularization(request);
+      rejection = Validate(request, regularization);
       local_ok = rejection.empty();
     }
     catch (const std::exception& error)
@@ -457,7 +492,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       frozen_boundary.emplace(FreezeBoundaryPlan(request.boundary_plan));
       canonical_request = CanonicalMainRequest(
           request, mesh_request.mesh_path, vtk,
-          frozen_boundary->consensus_key);
+          frozen_boundary->consensus_key, regularization);
       local_ok = true;
     }
     catch (...)
@@ -589,7 +624,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       state_io->ImportPublishedInitialState(),
       {nullptr, 0, dg::hdg::generic::euler_2d_conserved_components},
       boundary->View(),
-      {dg::hdg::generic::RegularizationKind::none, 0.0, 0.0}};
+      regularization};
 
     std::unique_ptr<GenericEulerHdgCpuSession> session;
     try
@@ -837,7 +872,10 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       std::cout << "[hdg-main] status=Success step="
                 << time_driver->solver_step() << " time="
                 << time_driver->time() << " output_cycle="
-                << time_driver->output_cycle() << '\n';
+                << time_driver->output_cycle() << " regularization="
+                << (regularization.kind == RegularizationKind::igr ? "igr" : "none")
+                << " alpha=" << regularization.alpha
+                << " beta=" << regularization.beta << '\n';
     }
     return 0;
   }

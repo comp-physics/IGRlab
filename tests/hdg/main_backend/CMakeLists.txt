@@ -26,6 +26,25 @@ foreach(_ranks IN ITEMS 1 2)
       TIMEOUT 1200)
 endforeach()
 
+foreach(_ranks IN ITEMS 1 2)
+  add_test(NAME dg_igr_hdg_main_backend_igr_cpu_rank${_ranks}_n3
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_RANKS=${_ranks}"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+      "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_igr_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_igr_cpu_rank${_ranks}_n3 PROPERTIES
+      LABELS "hdg;main-backend;cpu;igr;mpi;process;periodic;n3;no-vtk"
+      PROCESSORS ${_ranks}
+      RESOURCE_LOCK hdg_generic_euler_cpu
+      TIMEOUT 1200)
+endforeach()
+
 add_test(NAME dg_igr_hdg_main_backend_preserves_dgsem_cpu_serial
   COMMAND "${CMAKE_COMMAND}"
     "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"

@@ -36,5 +36,5 @@ expect_early_rejection(
   "Time integrator 'rk3ssp' is unavailable for HDG"
   --discretization hdg --time-integrator rk3ssp)
 expect_early_rejection(
-  "Regularization 'igr' is temporarily unavailable with HDG\\."
-  --discretization hdg --regularization igr)
+  "Regularization 'igr' with HDG is available only on --device cpu\\."
+  --discretization hdg --regularization igr --device cuda)

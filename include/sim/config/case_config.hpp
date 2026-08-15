@@ -939,11 +939,12 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
   }
 
   if (result.discretization == Discretization::HDG &&
-      result.regularization == Regularization::IGR)
+      result.regularization == Regularization::IGR &&
+      result.device_backend != DeviceBackend::CPU)
   {
     result.status = SolverRequestResolutionStatus::UnsupportedRegularization;
     result.message =
-      "Regularization 'igr' is temporarily unavailable with HDG.";
+      "Regularization 'igr' with HDG is available only on --device cpu.";
     return result;
   }
   if (result.discretization != Discretization::HDG &&

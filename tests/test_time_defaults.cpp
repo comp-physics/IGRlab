@@ -31,6 +31,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::IGROptions igr_opts;
     ctx.Check(opts.zhang_shu_points == "consumer",
               "Zhang-Shu defaults: consumer point set selected");
+    ctx.Check(opts.hdg_igr_alpha == 1.0 && opts.hdg_igr_beta == 1.0,
+              "HDG IGR defaults: alpha and beta are one");
     ctx.Check(dg_sim::ParseZhangShuPointSet("consumer") ==
                 mfem::ZhangShuPointSet::kConsumer,
               "Zhang-Shu options: parse consumer point set");
@@ -271,12 +273,39 @@ int RunTimeDefaultsTests(TestContext& ctx)
                 dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
               "request: HDG RK3SSP is rejected");
 
-    const dg_sim::SolverRequestResolution hdg_igr =
+    const dg_sim::SolverRequestResolution hdg_igr_cpu =
       dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "igr", "",
                                    true, false, true, false);
-    ctx.Check(hdg_igr.status ==
+    ctx.Check(hdg_igr_cpu.IsResolved() &&
+                hdg_igr_cpu.regularization == dg_sim::Regularization::IGR &&
+                hdg_igr_cpu.time_integrator ==
+                  dg_sim::TimeIntegrator::BackwardEuler &&
+                hdg_igr_cpu.device_backend == dg_sim::DeviceBackend::CPU,
+              "request: HDG CPU IGR resolves to backward-euler");
+
+    const dg_sim::SolverRequestResolution hdg_igr_cuda =
+      dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "igr", "",
+                                   true, false, true, false, "cuda");
+    ctx.Check(hdg_igr_cuda.status ==
                 dg_sim::SolverRequestResolutionStatus::UnsupportedRegularization,
-              "request: HDG IGR is temporarily rejected");
+              "request: HDG CUDA IGR is rejected during resolution");
+
+    const dg_sim::SolverRequestResolution hdg_cuda_none =
+      dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "none", "",
+                                   true, false, true, false, "cuda");
+    ctx.Check(hdg_cuda_none.IsResolved() &&
+                hdg_cuda_none.regularization == dg_sim::Regularization::None &&
+                hdg_cuda_none.device_backend == dg_sim::DeviceBackend::CUDA,
+              "request: HDG CUDA none remains supported");
+
+    const dg_sim::SolverRequestResolution dgsem_cuda_igr =
+      dg_sim::ResolveSolverRequest("dgsem", true, "", "dgsem", "", "",
+                                   false, false, false, false, "cuda");
+    ctx.Check(dgsem_cuda_igr.IsResolved() &&
+                dgsem_cuda_igr.discretization == dg_sim::Discretization::DGSEM &&
+                dgsem_cuda_igr.regularization == dg_sim::Regularization::IGR &&
+                dgsem_cuda_igr.device_backend == dg_sim::DeviceBackend::CUDA,
+              "request: DGSEM CUDA IGR remains supported");
 
     char program_name[] = "test";
     char regularization_flag[] = "--regularization";
