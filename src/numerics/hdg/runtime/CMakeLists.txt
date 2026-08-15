@@ -54,13 +54,14 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     set(_dg_igr_hdg_runtime_cuda_expected_sources
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/hdg_sc25_periodic_v3_device.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/hdg_sc25_periodic_v3_rank2_device.cu"
-        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu")
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/traced_scalar_igr_p1_private.cu")
     list(SORT _dg_igr_hdg_runtime_cuda_sources)
     list(SORT _dg_igr_hdg_runtime_cuda_expected_sources)
     if(NOT _dg_igr_hdg_runtime_cuda_sources STREQUAL
        _dg_igr_hdg_runtime_cuda_expected_sources)
       message(FATAL_ERROR
-              "The frozen W8A+W8B CUDA component requires exactly persistent_smooth_euler.cu and the SC25 rank-one/rank-two device sources.")
+              "The frozen W8A+W8B CUDA component requires exactly persistent_smooth_euler.cu, the SC25 rank-one/rank-two device sources, and the private traced-scalar-IGR packed-batch source.")
     endif()
   endif()
 

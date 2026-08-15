@@ -224,6 +224,44 @@ set_tests_properties(
     TIMEOUT 1800)
 
 if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
+  add_executable(dg_igr_hdg_traced_scalar_igr_p1_private_cuda_test
+    test_traced_scalar_igr_p1_private.cu)
+  target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_private_cuda_test
+    PRIVATE
+      "${PROJECT_SOURCE_DIR}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_private_cuda_test
+    PRIVATE
+      dg_igr_hdg_runtime_cuda
+      dg_igr_hdg_runtime_cpu
+      dg_igr_hdg_auxiliary_cpu
+      mfem
+      MPI::MPI_CXX)
+  target_compile_options(dg_igr_hdg_traced_scalar_igr_p1_private_cuda_test
+    PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_hdg_traced_scalar_igr_p1_private_cuda_test
+    PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_EXTENSIONS OFF
+      CUDA_ARCHITECTURES 120
+      CUDA_SEPARABLE_COMPILATION ON
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  add_test(
+    NAME hdg_traced_scalar_igr_p1_private_cuda
+    COMMAND dg_igr_hdg_traced_scalar_igr_p1_private_cuda_test)
+  set_tests_properties(hdg_traced_scalar_igr_p1_private_cuda
+    PROPERTIES
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1800
+      LABELS "hdg;runtime;cuda;traced-igr;private;packed-batch")
+
   add_executable(dg_igr_hdg_traced_scalar_igr_p1_local_cuda_test
     test_traced_scalar_igr_p1_local.cu)
   target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_local_cuda_test
