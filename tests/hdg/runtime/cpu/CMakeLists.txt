@@ -181,6 +181,35 @@ set_tests_properties(hdg_traced_scalar_igr_p1_local PROPERTIES
   PROCESSORS 1 RESOURCE_LOCK hdg_traced_scalar_igr_p1_local TIMEOUT 180
   LABELS "hdg;traced-scalar-igr;local;cpu")
 
+add_executable(dg_igr_hdg_borrowed_p1_dg_interface_layout_test
+  test_borrowed_p1_dg_interface_layout.cpp)
+target_include_directories(dg_igr_hdg_borrowed_p1_dg_interface_layout_test
+  PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PRIVATE
+  dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
+target_compile_options(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+foreach(_ranks IN ITEMS 1 2 3)
+  if(_ranks EQUAL 1)
+    add_test(NAME hdg_borrowed_p1_dg_interface_layout_rank1
+      COMMAND dg_igr_hdg_borrowed_p1_dg_interface_layout_test)
+  else()
+    add_test(NAME hdg_borrowed_p1_dg_interface_layout_rank${_ranks}
+      COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" ${_ranks}
+              ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:dg_igr_hdg_borrowed_p1_dg_interface_layout_test>
+              ${MPIEXEC_POSTFLAGS})
+  endif()
+  set_tests_properties(hdg_borrowed_p1_dg_interface_layout_rank${_ranks}
+    PROPERTIES
+      PROCESSORS ${_ranks}
+      RESOURCE_LOCK hdg_borrowed_p1_dg_interface_layout
+      LABELS "hdg;runtime;cpu;borrowed;dg-interface;layout;mpi"
+      TIMEOUT 180)
+endforeach()
+
 foreach(_n IN ITEMS 3 6 12)
   add_test(
     NAME hdg_runtime_cpu_functional_serial_n${_n}
