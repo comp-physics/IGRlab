@@ -97,6 +97,7 @@ bool ValidInput(const TracedScalarIgrP1GlobalStepInput& input) noexcept
       input.previous_true_trace == nullptr || input.current_interior == nullptr ||
       input.previous_interior == nullptr ||
       input.current_interior == input.previous_interior ||
+      input.current_true_trace == input.previous_true_trace ||
       input.current_true_trace->Size() != input.layout->TraceTrueVSize() ||
       input.previous_true_trace->Size() != input.layout->TraceTrueVSize() ||
       input.current_interior->Size() != input.layout->InteriorLocalVSize() ||
@@ -378,7 +379,7 @@ bool ComputeTracedScalarIgrP1GlobalStep(
   if (!GlobalNorm(input.communicator, local_initial_squared, initial_norm)) { return false; }
   const double rhs_squared = mfem::InnerProduct(input.communicator,
                                                 true_rhs_values, true_rhs_values);
-  if (!CollectiveAll(input.communicator, Finite(rhs_squared) && rhs_squared > 1.0e-300))
+  if (!CollectiveAll(input.communicator, Finite(rhs_squared) && rhs_squared >= 0.0))
   {
     return false;
   }
@@ -390,21 +391,24 @@ bool ComputeTracedScalarIgrP1GlobalStep(
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
   true_increment = 0.0;
 
-  // All solver objects are constructed and dimension-checked before the
-  // collective HYPRE solve.  ILU/GMRES configuration matches the accepted
-  // CPU HDG solve policy, while the independently recomputed true residual is
-  // the success condition.
-  mfem::HypreILU ilu;
-  ilu.SetType(0); ilu.SetLevelOfFill(0); ilu.SetMaxIter(1); ilu.SetTol(0.0);
-  ilu.SetLocalReordering(0); ilu.SetPrintLevel(0);
-  mfem::HypreGMRES gmres(input.communicator);
-  const int global_size = static_cast<int>(true_matrix->GetGlobalNumRows());
-  gmres.SetTol(1.0e-12); gmres.SetAbsTol(0.0);
-  gmres.SetMaxIter(std::max(100, global_size));
-  gmres.SetKDim(std::min(100, std::max(20, global_size)));
-  gmres.SetLogging(0); gmres.SetPrintLevel(0);
-  gmres.SetPreconditioner(ilu); gmres.SetOperator(*true_matrix);
-  gmres.Mult(true_rhs, true_increment);
+  if (rhs_squared > 1.0e-300)
+  {
+    // All solver objects are constructed and dimension-checked before the
+    // collective HYPRE solve.  ILU/GMRES configuration matches the accepted
+    // CPU HDG solve policy, while the independently recomputed true residual
+    // is the success condition.
+    mfem::HypreILU ilu;
+    ilu.SetType(0); ilu.SetLevelOfFill(0); ilu.SetMaxIter(1); ilu.SetTol(0.0);
+    ilu.SetLocalReordering(0); ilu.SetPrintLevel(0);
+    mfem::HypreGMRES gmres(input.communicator);
+    const int global_size = static_cast<int>(true_matrix->GetGlobalNumRows());
+    gmres.SetTol(1.0e-12); gmres.SetAbsTol(0.0);
+    gmres.SetMaxIter(std::max(100, global_size));
+    gmres.SetKDim(std::min(100, std::max(20, global_size)));
+    gmres.SetLogging(0); gmres.SetPrintLevel(0);
+    gmres.SetPreconditioner(ilu); gmres.SetOperator(*true_matrix);
+    gmres.Mult(true_rhs, true_increment);
+  }
 
   mfem::HypreParVector true_residual(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
   true_matrix->Mult(true_increment, true_residual);
@@ -412,7 +416,9 @@ bool ComputeTracedScalarIgrP1GlobalStep(
   const double residual_squared = mfem::InnerProduct(input.communicator,
                                                      true_residual, true_residual);
   local_ok = AllFinite(true_increment) && Finite(residual_squared) &&
-      residual_squared >= 0.0 && residual_squared <= rhs_squared * 1.0e-20;
+      residual_squared >= 0.0 &&
+      (rhs_squared > 1.0e-300 ? residual_squared <= rhs_squared * 1.0e-20 :
+                                residual_squared <= 1.0e-300);
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
   const double linear_norm = std::sqrt(residual_squared);
 

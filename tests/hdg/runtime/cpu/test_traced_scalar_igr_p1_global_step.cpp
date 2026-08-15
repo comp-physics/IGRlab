@@ -67,6 +67,22 @@ bool FillTrueTrace(const mfem::ParFiniteElementSpace& space, mfem::Vector& value
   return true;
 }
 
+bool FillEquilibriumTrueTrace(const mfem::ParFiniteElementSpace& space,
+                              mfem::Vector& values)
+{
+  if (values.Size() != space.GetTrueVSize()) { return false; }
+  values = 0.0;
+  for (int local_dof = 0; local_dof < space.GetVSize(); ++local_dof)
+  {
+    const int local_true = space.GetLocalTDofNumber(local_dof);
+    if (local_true < 0) { continue; }
+    const int component = local_dof % 5;
+    values[local_true] = component == 0 ? 1.0 : component == 1 ? 0.1 :
+        component == 2 ? -0.02 : component == 3 ? 2.6 : 0.0;
+  }
+  return true;
+}
+
 bool FillInterior(const Layout& layout, mfem::Vector& current,
                   mfem::Vector& previous)
 {
@@ -92,6 +108,29 @@ bool FillInterior(const Layout& layout, mfem::Vector& current,
     }
     if (!layout.ScatterInteriorElement(element, current_element, current) ||
         !layout.ScatterInteriorElement(element, previous_element, previous))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool FillEquilibriumInterior(const Layout& layout, mfem::Vector& values)
+{
+  values.SetSize(layout.InteriorLocalVSize());
+  values = 0.0;
+  for (int element = 0; element < layout.LocalElementCount(); ++element)
+  {
+    mfem::Vector element_values(28);
+    element_values = 0.0;
+    for (int dof = 0; dof < 4; ++dof)
+    {
+      element_values[dof] = 1.0;
+      element_values[4 + dof] = 0.1;
+      element_values[8 + dof] = -0.02;
+      element_values[12 + dof] = 2.6;
+    }
+    if (!layout.ScatterInteriorElement(element, element_values, values))
     {
       return false;
     }
@@ -299,6 +338,30 @@ bool Run(const MPI_Comm communicator, const Layout& layout,
   return detail::ComputeTracedScalarIgrP1GlobalStep(input, output);
 }
 
+bool RunZeroReducedTraceRhs(
+    const MPI_Comm communicator, const Layout& layout,
+    const std::vector<local::AffineQuad>& quads,
+    detail::TracedScalarIgrP1GlobalStepOutput& output)
+{
+  const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
+  if (trace_space == nullptr) { return false; }
+  mfem::Vector trace(layout.TraceTrueVSize());
+  mfem::Vector interior;
+  bool ok = FillEquilibriumTrueTrace(*trace_space, trace) &&
+      FillEquilibriumInterior(layout, interior);
+  if (!AllRanks(communicator, ok)) { return false; }
+  local::Parameters parameters{};
+  parameters.alpha = 0.8; parameters.beta = 1.1; parameters.dt = 0.05;
+  parameters.quadrature_order = 12;
+  mfem::Vector previous_trace(trace);
+  mfem::Vector previous_interior(interior);
+  const detail::TracedScalarIgrP1GlobalStepInput distinct_input{
+      communicator, &layout, quads.data(), static_cast<int>(quads.size()),
+      parameters, &trace, &previous_trace, &interior, &previous_interior,
+      nullptr, nullptr};
+  return detail::ComputeTracedScalarIgrP1GlobalStep(distinct_input, output);
+}
+
 bool Check(const MPI_Comm communicator)
 {
   mfem::ParMesh mesh = MakeMesh(communicator);
@@ -348,17 +411,52 @@ bool Check(const MPI_Comm communicator)
                           first);
   if (!AllRanks(communicator, ok)) { return false; }
 
+  detail::TracedScalarIgrP1GlobalStepOutput zero_rhs;
+  ok = RunZeroReducedTraceRhs(communicator, layout, quads, zero_rhs);
+  const double zero_trace_norm = NormSquared(communicator,
+                                             zero_rhs.trace_increment);
+  const double zero_interior_norm = NormSquared(communicator,
+                                                zero_rhs.interior_increment);
+  ok = ok && std::isfinite(zero_rhs.reduced_rhs_norm) &&
+      zero_rhs.reduced_rhs_norm <= 1.0e-150 &&
+      zero_rhs.linear_residual_norm <= 1.0e-150 &&
+      zero_trace_norm <= 1.0e-300 && zero_interior_norm <= 1.0e-300;
+  if (!AllRanks(communicator, ok)) { return false; }
+
   detail::TracedScalarIgrP1GlobalStepOutput preserved;
   preserved.trace_increment.SetSize(1); preserved.trace_increment[0] = 73.0;
   preserved.interior_increment.SetSize(1); preserved.interior_increment[0] = -19.0;
   preserved.initial_residual_norm = 11.0;
+  preserved.reduced_rhs_norm = 13.0;
+  preserved.linear_residual_norm = 17.0;
   const detail::TracedScalarIgrP1GlobalStepInput invalid{
       communicator, &layout, quads.data(), static_cast<int>(quads.size()), {},
       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
   ok = !detail::ComputeTracedScalarIgrP1GlobalStep(invalid, preserved) &&
       preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
       preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
-      preserved.initial_residual_norm == 11.0;
+      preserved.initial_residual_norm == 11.0 &&
+      preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0;
+  if (!AllRanks(communicator, ok)) { return false; }
+
+  const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
+  mfem::Vector aliased_trace(layout.TraceTrueVSize());
+  mfem::Vector aliased_current_interior, aliased_previous_interior;
+  ok = trace_space != nullptr && FillTrueTrace(*trace_space, aliased_trace, 0.0) &&
+      FillInterior(layout, aliased_current_interior, aliased_previous_interior);
+  if (!AllRanks(communicator, ok)) { return false; }
+  local::Parameters alias_parameters{};
+  alias_parameters.dt = 0.05; alias_parameters.alpha = 0.8;
+  alias_parameters.beta = 1.1; alias_parameters.quadrature_order = 12;
+  const detail::TracedScalarIgrP1GlobalStepInput aliased_trace_input{
+      communicator, &layout, quads.data(), static_cast<int>(quads.size()),
+      alias_parameters, &aliased_trace, &aliased_trace,
+      &aliased_current_interior, &aliased_previous_interior, nullptr, nullptr};
+  ok = !detail::ComputeTracedScalarIgrP1GlobalStep(aliased_trace_input, preserved) &&
+      preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
+      preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
+      preserved.initial_residual_norm == 11.0 &&
+      preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0;
   return AllRanks(communicator, ok);
 }
 
