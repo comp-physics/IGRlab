@@ -139,7 +139,7 @@ EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
 
 bool MatchesCommittedCflDiagnostic(
     const dg::hdg::generic::HdgEulerCommittedDiagnostics& diagnostics,
-    const mfem::ParMesh& mesh, const int polynomial_order)
+    mfem::ParMesh& mesh, const int polynomial_order)
 {
   double local_hmin = std::numeric_limits<double>::infinity();
   for (int element = 0; element < mesh.GetNE(); ++element)
