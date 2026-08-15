@@ -40,7 +40,10 @@ __global__ void AssemblePacked(const BatchInput input, const BatchOutput output)
 
 bool ValidEnvelope(const BatchInput& input, const BatchOutput& output) noexcept
 {
-  return input.vertices && input.parameters && input.interior &&
+  return input.volume_points > 0 && input.segment_points > 0 &&
+    input.volume_xyw && input.segment_xw &&
+    (!input.static_euler_rhs || input.static_euler_rhs_points) &&
+    input.vertices && input.parameters && input.interior &&
     input.previous_interior && input.trace && input.previous_trace && output.statuses &&
     output.interior_residual && output.trace_residual && output.A && output.B &&
     output.C && output.D && output.f && output.g;

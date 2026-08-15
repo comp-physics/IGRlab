@@ -29,6 +29,7 @@ struct Quadrature final
 struct HostBatch final
 {
   int elements = 0;
+  bool has_rhs = true;
   Quadrature quadrature;
   std::vector<double> vertices, interior, previous_interior, trace, previous_trace, rhs;
   std::vector<algebra::Parameters> parameters;
@@ -195,7 +196,7 @@ bool Run(const HostBatch& batch, HostOutputs& output)
   {
     const packed::BatchInput input{batch.elements, storage.vertices, storage.parameters,
       storage.interior, storage.previous_interior, storage.trace, storage.previous_trace,
-      storage.rhs, storage.rhs_points, storage.volume,
+      batch.has_rhs ? storage.rhs : nullptr, storage.rhs_points, storage.volume,
       static_cast<int>(batch.quadrature.volume_xyw.size() / 3), storage.segment,
       static_cast<int>(batch.quadrature.segment_xw.size() / 2)};
     const packed::BatchOutput device_output{storage.statuses, storage.ri, storage.rt, storage.A,
@@ -274,6 +275,36 @@ bool ElementIs(const HostOutputs& output, const int element, const double expect
     SliceIs(output.g, static_cast<std::size_t>(element) * 40, 40, expected);
 }
 
+bool CheckEnvelopeValidation()
+{
+  // These calls intentionally use host addresses: every nonzero-element case
+  // below is rejected before a kernel launch or any pointer dereference.
+  if (packed::Launch({}, {}) != cudaSuccess) return false;
+  double value = 0.;
+  algebra::Parameters parameters{1.4, .7, 1.3, .09, 1.e-12};
+  algebra::Status status = algebra::Status::success;
+  const auto output = packed::BatchOutput{&status, &value, &value, &value, &value,
+                                           &value, &value, &value, &value};
+  auto rejected = [&](packed::BatchInput input)
+  { return packed::Launch(input, output) == cudaErrorInvalidValue; };
+  const auto envelope = [&]()
+  {
+    return packed::BatchInput{1, &value, &parameters, &value, &value, &value, &value,
+                              nullptr, nullptr, &value, 1, &value, 1};
+  };
+  auto bad = envelope(); bad.volume_points = 0;
+  if (!rejected(bad)) return false;
+  bad = envelope(); bad.segment_points = 0;
+  if (!rejected(bad)) return false;
+  bad = envelope(); bad.volume_xyw = nullptr;
+  if (!rejected(bad)) return false;
+  bad = envelope(); bad.segment_xw = nullptr;
+  if (!rejected(bad)) return false;
+  bad = envelope(); bad.static_euler_rhs = &value;
+  if (!rejected(bad)) return false;
+  return true;
+}
+
 bool CheckPackedCpuAgreement()
 {
   const HostBatch batch = MakeBatch(3);
@@ -287,7 +318,9 @@ bool CheckStatusIsolationAndPreservation()
   batch.vertices[static_cast<std::size_t>(1) * 8 + 4] += .25; // non-affine geometry
   for (int q = 0; q < 4; ++q)
     batch.interior[static_cast<std::size_t>(2) * algebra::interior_unknowns + q] = 0.; // density
-  batch.rhs_points[3] -= 1; // source table/layout mismatch
+  batch.has_rhs = false;
+  batch.rhs_points.assign(batch.elements, 0);
+  batch.rhs_points[3] = 1; // null-source per-element layout mismatch
   HostOutputs output = SentinelOutputs(batch.elements);
   if (!Run(batch, output) || output.statuses[0] != algebra::Status::success ||
       output.statuses[1] != algebra::Status::invalid_geometry ||
@@ -302,6 +335,11 @@ bool CheckStatusIsolationAndPreservation()
 
 int main()
 {
+  if (!CheckEnvelopeValidation())
+  {
+    std::cerr << "traced_scalar_igr_p1_private envelope validation failed\n";
+    return 1;
+  }
   if (!CheckPackedCpuAgreement())
   {
     std::cerr << "traced_scalar_igr_p1_private packed CPU agreement failed\n";

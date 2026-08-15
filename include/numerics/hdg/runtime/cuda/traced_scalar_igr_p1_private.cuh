@@ -30,10 +30,11 @@ struct BatchInput final
   const double* previous_interior = nullptr;    // [E][28]
   const double* trace = nullptr;                // [E][40]
   const double* previous_trace = nullptr;       // [E][40]
-  // [E][volume_points][4], or null when every source count is zero.
+  // [E][volume_points][4], or null for a source-free batch.
   const double* static_euler_rhs = nullptr;
-  // [E]; entries equal volume_points with a source table, or zero when the
-  // batch source pointer is null.
+  // [E]; required with a source table.  Without one, this may be null (all
+  // elements have zero source count), or it may carry per-element zero/nonzero
+  // counts so common algebra reports source-layout mismatches in statuses.
   const int* static_euler_rhs_points = nullptr;
   const double* volume_xyw = nullptr;           // [volume_points][x,y,weight]
   int volume_points = 0;
