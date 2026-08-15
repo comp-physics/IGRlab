@@ -154,13 +154,22 @@ bool BuildAffineQuads(const mfem::ParMesh& mesh,
   quads.resize(static_cast<std::size_t>(mesh.GetNE()));
   for (int element = 0; element < mesh.GetNE(); ++element)
   {
-    mfem::Array<int> vertices;
-    mesh.GetElementVertices(element, vertices);
-    if (vertices.Size() != 4) { return false; }
+    mfem::ElementTransformation* const transformation =
+        mesh.GetElementTransformation(element);
+    if (transformation == nullptr) { return false; }
+    constexpr double corners[4][2]{{0.0, 0.0}, {1.0, 0.0},
+                                   {1.0, 1.0}, {0.0, 1.0}};
     for (int corner = 0; corner < 4; ++corner)
     {
-      const double* const point = mesh.GetVertex(vertices[corner]);
-      if (point == nullptr) { return false; }
+      mfem::IntegrationPoint reference;
+      reference.Set2(corners[corner][0], corners[corner][1]);
+      mfem::Vector point(2);
+      transformation->Transform(reference, point);
+      if (point.Size() != 2 || !std::isfinite(point[0]) ||
+          !std::isfinite(point[1]))
+      {
+        return false;
+      }
       quads[static_cast<std::size_t>(element)].vertices[
           static_cast<std::size_t>(corner)] = {{point[0], point[1]}};
     }
@@ -418,19 +427,6 @@ bool CheckUniformTraceGather(const Layout& layout, const mfem::Vector& values)
     }
   }
   return true;
-}
-
-void ReportPeriodicCancellation(const MPI_Comm communicator,
-                                const RawUncondensedResidual& residual)
-{
-  int rank = -1;
-  MPI_Comm_rank(communicator, &rank);
-  if (rank == 0)
-  {
-    std::cerr << "periodic raw trace: element="
-              << residual.element_trace_norm_squared << " true="
-              << residual.true_trace_norm_squared << '\n';
-  }
 }
 
 bool CheckLocalRecovery(const MPI_Comm communicator, const Layout& layout,
@@ -764,11 +760,11 @@ bool Check(const MPI_Comm communicator)
   ok = ComputeRawUncondensedResidual(communicator, periodic_layout, periodic_quads,
       nullptr, nullptr, raw_parameters, periodic_current_trace,
       periodic_previous_trace, periodic_current_interior,
-      periodic_previous_interior, periodic_raw) &&
-      periodic_raw.element_trace_norm_squared > 0.0 &&
+      periodic_previous_interior, periodic_raw);
+  if (!Require(communicator, ok, "periodic raw residual setup")) { return false; }
+  ok = periodic_raw.element_trace_norm_squared > 0.0 &&
       periodic_raw.true_trace_norm_squared <= 1.0e-26 *
           periodic_raw.element_trace_norm_squared;
-  if (!ok) { ReportPeriodicCancellation(communicator, periodic_raw); }
   if (!Require(communicator, ok, "periodic raw trace cancellation")) { return false; }
 
   ok = CheckLocalRecovery(communicator, layout, quads, source_space, source_a,
