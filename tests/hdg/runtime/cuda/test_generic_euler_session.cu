@@ -976,7 +976,7 @@ bool CheckStaticPhysicalBoundaryTransaction(const int ranks, const int order,
 {
   mfem::Mesh serial = NonperiodicSquareMesh(n);
   mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
-  HostFields fields = NonuniformHostFields(mesh, order, true);
+  HostFields fields = HighWaveHostFields(mesh, order);
   const std::array<CudaStaticBoundaryPolicy, 4> fixture =
       StaticPhysicalPolicies();
   std::vector<CudaStaticBoundaryPolicy> policies(fixture.begin(), fixture.end());
