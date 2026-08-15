@@ -67,21 +67,14 @@ mfem::ParMesh MakeMesh(const MPI_Comm communicator)
 
 mfem::ParMesh MakePeriodicMesh(const MPI_Comm communicator)
 {
-  int ranks = 1;
-  MPI_Comm_size(communicator, &ranks);
   mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
-      3, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      3, 3, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
   std::vector<mfem::Vector> translations(2, mfem::Vector(2));
   translations[0][0] = 1.0;
   translations[1][1] = 1.0;
   mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
       original, original.CreatePeriodicVertexMapping(translations));
-  std::vector<int> partition(static_cast<std::size_t>(periodic.GetNE()));
-  for (int element = 0; element < periodic.GetNE(); ++element)
-  {
-    partition[static_cast<std::size_t>(element)] = element % ranks;
-  }
-  return mfem::ParMesh(communicator, periodic, partition.data());
+  return mfem::ParMesh(communicator, periodic);
 }
 
 bool FillTrueTrace(const mfem::ParFiniteElementSpace& space, mfem::Vector& values,
