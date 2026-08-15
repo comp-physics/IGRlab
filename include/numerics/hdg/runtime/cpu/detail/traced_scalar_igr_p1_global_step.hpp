@@ -14,6 +14,7 @@
 
 #include <mfem.hpp>
 
+#include <cstddef>
 #include <memory>
 
 namespace dg::hdg::runtime::cpu::detail
@@ -111,6 +112,9 @@ public:
 
   /** True only after the collective Initialize gate has completed. */
   bool IsReady() const noexcept;
+
+  /** Exact local retained-capacity census for the initialized private seam. */
+  std::size_t WorkspaceBytes() const noexcept;
 
   /** Backward-compatible structural query; use IsReady before Compute. */
   bool IsUsable() const noexcept;

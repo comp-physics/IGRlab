@@ -1997,6 +1997,64 @@ bool TracedScalarIgrP1Scratch::IsReady() const noexcept
   return implementation_->Matches(binding);
 }
 
+std::size_t TracedScalarIgrP1Scratch::WorkspaceBytes() const noexcept
+{
+  if (!IsReady()) return 0;
+  const Implementation& impl = *implementation_;
+  std::size_t total = 0;
+  const auto add = [&total](const std::size_t count, const std::size_t width)
+  {
+    if (width != 0 && count > (std::numeric_limits<std::size_t>::max() - total) / width)
+      return false;
+    total += count * width;
+    return true;
+  };
+  const auto add_vector = [&add](const mfem::Vector& values)
+  { return add(static_cast<std::size_t>(values.Capacity()), sizeof(double)); };
+  const auto add_doubles = [&add](const std::vector<double>& values)
+  { return add(values.capacity(), sizeof(double)); };
+  const auto add_ints = [&add](const std::vector<int>& values)
+  { return add(values.capacity(), sizeof(int)); };
+  const EphemeralStepState& state = impl.state;
+  bool ok = add(sizeof(Implementation), 1) &&
+      add_ints(impl.source_element_vdofs) && add_ints(impl.trace_element_vdofs) &&
+      add_vector(state.current_local_trace) && add_vector(state.previous_local_trace) &&
+      add_vector(state.raw_local_trace) && add_vector(state.raw_true_trace) &&
+      add_vector(state.current_element_interior) && add_vector(state.previous_element_interior) &&
+      add_vector(state.current_element_trace) && add_vector(state.previous_element_trace) &&
+      add_vector(state.source_shape) && add_vector(state.local_rhs) &&
+      add_vector(state.true_rhs_values) && add_doubles(state.a) && add_doubles(state.b) &&
+      add_doubles(state.c) && add_doubles(state.d) && add_doubles(state.f) &&
+      add_doubles(state.g) && add_doubles(state.schur) && add_doubles(state.reduced) &&
+      add_doubles(state.source_samples) &&
+      add(state.operators.capacity(), sizeof(local::LocalOperator));
+  const SolveAndRecoverTracedScalarIgrP1State& solve = state.solve_and_recovery;
+  ok = ok && add_vector(solve.true_trace) && add_vector(solve.next_trace) &&
+      add_vector(solve.local_trace) && add_vector(solve.next_interior) &&
+      add_vector(solve.gathered_trace) && add_vector(solve.element_interior) &&
+      add_doubles(solve.recovered) && add_doubles(solve.local_trace_values) &&
+      add_vector(solve.result.trace_increment) && add_vector(solve.result.interior_increment);
+  const RetainedTraceSystem& retained = impl.retained;
+  ok = ok && add(retained.element_vdofs.capacity(), sizeof(int)) &&
+      add(retained.local_dofs.capacity(), sizeof(RetainedTraceSystem::LocalDof)) &&
+      add(retained.owned.capacity(), sizeof(RetainedTraceSystem::Slot)) &&
+      add(retained.outgoing.capacity(), sizeof(RetainedTraceSystem::Outgoing)) &&
+      add(retained.incoming.capacity(), sizeof(RetainedTraceSystem::Incoming)) &&
+      add_ints(retained.send_counts) && add_ints(retained.receive_counts) &&
+      add_ints(retained.send_offsets) && add_ints(retained.receive_offsets) &&
+      add_doubles(retained.send_values) && add_doubles(retained.receive_values) &&
+      add_vector(retained.local_rhs) && add_vector(retained.true_rhs) &&
+      add(static_cast<std::size_t>(std::max(0, retained.diagonal.NumNonZeroElems())),
+          sizeof(double) + sizeof(int)) &&
+      add(static_cast<std::size_t>(std::max(0, retained.offdiagonal.NumNonZeroElems())),
+          sizeof(double) + sizeof(int) + sizeof(HYPRE_BigInt)) &&
+      add(static_cast<std::size_t>(std::max(0, retained.true_size) + 1), sizeof(int)) &&
+      add(static_cast<std::size_t>(std::max(0, retained.true_size)), 3 * sizeof(double)) &&
+      add(sizeof(mfem::HypreParMatrix) + sizeof(mfem::HypreParVector) * 3 +
+          sizeof(mfem::HypreILU) + sizeof(mfem::HypreGMRES), 1);
+  return ok ? total : 0;
+}
+
 bool TracedScalarIgrP1Scratch::IsUsable() const noexcept
 {
   if (!implementation_ || implementation_->communicator == MPI_COMM_NULL ||

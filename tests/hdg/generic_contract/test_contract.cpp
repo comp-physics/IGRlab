@@ -14,6 +14,7 @@ using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
 using dg::hdg::generic::ContractStatus;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::ValidateEulerHdgRequest;
 
 constexpr std::uint32_t all_cpu_capabilities =
@@ -43,6 +44,18 @@ mfem::ParMesh MakeSquareMesh()
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
       1, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
   return mfem::ParMesh(MPI_COMM_SELF, serial);
+}
+
+mfem::ParMesh MakePeriodicSquareMesh(const MPI_Comm communicator = MPI_COMM_WORLD)
+{
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+      2, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+  translations[0][0] = 1.0;
+  translations[1][1] = 1.0;
+  mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
+      serial, serial.CreatePeriodicVertexMapping(translations));
+  return mfem::ParMesh(communicator, periodic);
 }
 
 mfem::ParMesh MakeRankZeroOwnedParallelMesh(const mfem::Element::Type type)
@@ -149,6 +162,39 @@ bool CheckTriangleRejection()
       ContractStatus::nonquadrilateral_mesh;
 }
 
+bool CheckIgrSelectionAdmission()
+{
+  mfem::ParMesh mesh = MakePeriodicSquareMesh();
+  const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  EulerHdgRequest request = ValidRequest(mesh, initial);
+  request.polynomial_order = 1;
+  request.regularization = {RegularizationKind::igr, 0.25, 0.5};
+  const ContractStatus valid = ValidateEulerHdgRequest(request);
+  request.polynomial_order = 2;
+  const ContractStatus p2 = ValidateEulerHdgRequest(request);
+  request.polynomial_order = 1;
+  request.backend = {BackendKind::cuda, 0};
+  request.capabilities = all_cuda_capabilities;
+  const ContractStatus cuda = ValidateEulerHdgRequest(request);
+  request.backend = {BackendKind::cpu, -1};
+  request.capabilities = all_cpu_capabilities;
+  int rank = 0;
+  MPI_Comm_rank(mesh.GetComm(), &rank);
+  request.regularization.alpha = rank == 0 ? 0.25 : 0.5;
+  const ContractStatus mismatch = ValidateEulerHdgRequest(request);
+  int min_status = static_cast<int>(mismatch), max_status = min_status;
+  const int min_result = MPI_Allreduce(MPI_IN_PLACE, &min_status, 1, MPI_INT,
+                                       MPI_MIN, mesh.GetComm());
+  const int max_result = MPI_Allreduce(MPI_IN_PLACE, &max_status, 1, MPI_INT,
+                                       MPI_MAX, mesh.GetComm());
+  return valid == ContractStatus::accepted &&
+      p2 == ContractStatus::invalid_regularization &&
+      cuda == ContractStatus::invalid_regularization &&
+      mismatch == ContractStatus::invalid_regularization &&
+      min_result == MPI_SUCCESS && max_result == MPI_SUCCESS &&
+      min_status == max_status;
+}
+
 bool CheckZeroOwnedElementAdmission()
 {
   int ranks = 0;
@@ -228,9 +274,13 @@ bool CheckCollectiveGeometryConvergence()
 int main(int argc, char* argv[])
 {
   mfem::MPI_Session mpi(argc, argv);
-  return CheckPODSurface() && CheckAcceptAndReject() && CheckTriangleRejection() &&
-      CheckZeroOwnedElementAdmission() && CheckCollectiveFailureConvergence() &&
-      CheckCollectiveGeometryConvergence()
-      ? 0
-      : 1;
+  bool ok = CheckPODSurface();
+  const bool basic = CheckAcceptAndReject();
+  const bool triangle = CheckTriangleRejection();
+  const bool igr = CheckIgrSelectionAdmission();
+  const bool empty = CheckZeroOwnedElementAdmission();
+  const bool mismatch = CheckCollectiveFailureConvergence();
+  const bool geometry = CheckCollectiveGeometryConvergence();
+  ok = ok && basic && triangle && igr && empty && mismatch && geometry;
+  return ok ? 0 : 1;
 }
