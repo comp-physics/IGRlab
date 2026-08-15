@@ -4,6 +4,7 @@
 #include <mpi.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -206,6 +207,8 @@ struct RawUncondensedResidual final
   double norm = 0.0;
   double local_trace_norm_squared = 0.0;
   double true_trace_norm_squared = 0.0;
+  std::array<double, 5> local_trace_component_norm_squared{};
+  std::array<double, 5> true_trace_component_norm_squared{};
 };
 
 bool ComputeRawUncondensedResidual(
@@ -307,9 +310,60 @@ bool ComputeRawUncondensedResidual(
   output.norm = maximum == 0.0 ? 0.0 : maximum * std::sqrt(global_sum);
   output.local_trace_norm_squared = NormSquared(communicator, local_raw);
   output.true_trace_norm_squared = NormSquared(communicator, true_raw);
+  if (local_raw.Size() % 5 != 0 || true_raw.Size() % 5 != 0) { return false; }
+  const int local_scalar_size = local_raw.Size() / 5;
+  const int true_scalar_size = true_raw.Size() / 5;
+  for (int component = 0; component < 5; ++component)
+  {
+    double local_component_sum = 0.0;
+    double true_component_sum = 0.0;
+    for (int scalar = 0; scalar < local_scalar_size; ++scalar)
+    {
+      const double value = local_raw[component * local_scalar_size + scalar];
+      local_component_sum += value * value;
+    }
+    for (int scalar = 0; scalar < true_scalar_size; ++scalar)
+    {
+      const double value = true_raw[component * true_scalar_size + scalar];
+      true_component_sum += value * value;
+    }
+    if (MPI_Allreduce(&local_component_sum,
+                      &output.local_trace_component_norm_squared[component],
+                      1, MPI_DOUBLE, MPI_SUM, communicator) != MPI_SUCCESS ||
+        MPI_Allreduce(&true_component_sum,
+                      &output.true_trace_component_norm_squared[component],
+                      1, MPI_DOUBLE, MPI_SUM, communicator) != MPI_SUCCESS)
+    {
+      return false;
+    }
+  }
   return std::isfinite(output.norm) &&
       std::isfinite(output.local_trace_norm_squared) &&
-      std::isfinite(output.true_trace_norm_squared);
+      std::isfinite(output.true_trace_norm_squared) &&
+      std::all_of(output.local_trace_component_norm_squared.begin(),
+                  output.local_trace_component_norm_squared.end(),
+                  [](const double value) { return std::isfinite(value); }) &&
+      std::all_of(output.true_trace_component_norm_squared.begin(),
+                  output.true_trace_component_norm_squared.end(),
+                  [](const double value) { return std::isfinite(value); });
+}
+
+void ReportPeriodicCancellation(const MPI_Comm communicator,
+                                const RawUncondensedResidual& residual)
+{
+  int rank = -1;
+  MPI_Comm_rank(communicator, &rank);
+  if (rank != 0) { return; }
+  std::cerr << "periodic raw trace: local="
+            << residual.local_trace_norm_squared << " true="
+            << residual.true_trace_norm_squared;
+  for (int component = 0; component < 5; ++component)
+  {
+    std::cerr << " c" << component << "=("
+              << residual.local_trace_component_norm_squared[component] << ','
+              << residual.true_trace_component_norm_squared[component] << ')';
+  }
+  std::cerr << '\n';
 }
 
 bool FillUniformTrace(mfem::ParMesh& mesh,
@@ -718,6 +772,7 @@ bool Check(const MPI_Comm communicator)
       periodic_raw.local_trace_norm_squared > 0.0 &&
       periodic_raw.true_trace_norm_squared <= 1.0e-26 *
           periodic_raw.local_trace_norm_squared;
+  if (!ok) { ReportPeriodicCancellation(communicator, periodic_raw); }
   if (!Require(communicator, ok, "periodic raw trace cancellation")) { return false; }
 
   ok = CheckLocalRecovery(communicator, layout, quads, source_space, source_a,
