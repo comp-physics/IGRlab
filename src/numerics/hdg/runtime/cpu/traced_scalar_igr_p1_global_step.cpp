@@ -562,10 +562,8 @@ struct EphemeralStepState final
   mfem::Vector raw_local_trace;
   mfem::Vector raw_true_trace;
   core::HostReferenceEngine condensation;
-  std::unique_ptr<mfem::SparseMatrix> local_matrix;
   mfem::Vector local_rhs;
   mfem::Vector true_rhs_values;
-  std::unique_ptr<mfem::HypreParMatrix> true_matrix;
   SolveAndRecoverTracedScalarIgrP1State solve_and_recovery;
 };
 
@@ -863,7 +861,9 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
 
-  std::unique_ptr<mfem::SparseMatrix>& local_matrix = state.local_matrix;
+  // Assembled matrix ownership remains call-local: neither MFEM nor Hypre
+  // objects are retained by TracedScalarIgrP1Scratch between attempts.
+  std::unique_ptr<mfem::SparseMatrix> local_matrix;
   mfem::Vector& local_rhs = state.local_rhs;
   mfem::Vector& true_rhs_values = state.true_rhs_values;
   try
@@ -909,8 +909,8 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
   // The opaque parallel assembly is entered only after all ranks have a fully
   // formed local matrix.  Do not catch this collective operation.
   mfem::ParBilinearForm parallel_form(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
-  state.true_matrix.reset(parallel_form.ParallelAssemble(local_matrix.get()));
-  std::unique_ptr<mfem::HypreParMatrix>& true_matrix = state.true_matrix;
+  std::unique_ptr<mfem::HypreParMatrix> true_matrix(
+      parallel_form.ParallelAssemble(local_matrix.get()));
   local_ok = true_matrix != nullptr &&
       true_matrix->Height() == layout.TraceTrueVSize() &&
       true_matrix->Width() == layout.TraceTrueVSize() &&
