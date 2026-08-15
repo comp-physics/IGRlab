@@ -18,6 +18,8 @@ namespace
 using dg::hdg::generic::HdgEulerSessionCapability;
 using dg::hdg::generic::HdgEulerSessionCapabilityBit;
 using dg::hdg::generic::HdgEulerSessionStatus;
+using dg::hdg::runtime::BorrowedCudaRank1OneGpuRuntimeSelection;
+using dg::hdg::runtime::BorrowedCudaRank2OneGpuHostStagedRuntimeSelection;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using namespace dg::hdg::runtime::cuda_w8a;
