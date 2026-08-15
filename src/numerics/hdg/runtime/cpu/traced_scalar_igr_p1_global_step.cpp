@@ -390,7 +390,7 @@ struct RetainedTraceSystem final
         ranks <= 0 || elements < 0 || local_size < 0 || true_size < 0 ||
         !matrix || !rhs || !solution || !residual || !ilu || !gmres ||
         matrix->Height() != true_size || matrix->Width() != true_size ||
-        diagonal.Height() != true_size ||
+        diagonal.Height() != true_size || offdiagonal.Height() != true_size ||
         element_vdofs.size() != static_cast<std::size_t>(elements) * 40 ||
         local_dofs.size() != static_cast<std::size_t>(local_size) ||
         send_counts.size() != static_cast<std::size_t>(ranks) ||
@@ -419,12 +419,20 @@ struct RetainedTraceSystem final
     if (static_cast<std::size_t>(send_cursor) != outgoing.size() ||
         static_cast<std::size_t>(receive_cursor) != incoming.size()) return false;
     const std::size_t schur_entries = static_cast<std::size_t>(elements) * 1600;
+    const int diagonal_nnz = diagonal.NumNonZeroElems();
+    const int offdiagonal_nnz = offdiagonal.NumNonZeroElems();
+    if (diagonal_nnz < 0 || offdiagonal_nnz < 0 ||
+        (offdiagonal_nnz != 0 && offd_columns == nullptr) ||
+        (true_size == 0 && (!owned.empty() || !incoming.empty()))) return false;
     for (const Slot& term : owned)
-      if (term.entry < 0 || term.schur >= schur_entries) return false;
+      if (term.entry < 0 || term.schur >= schur_entries ||
+          term.entry >= (term.offd ? offdiagonal_nnz : diagonal_nnz)) return false;
     for (const Outgoing& term : outgoing)
       if (term.destination < 0 || term.destination >= ranks ||
           term.destination == rank || term.schur >= schur_entries) return false;
-    for (const Incoming& term : incoming) if (term.entry < 0) return false;
+    for (const Incoming& term : incoming)
+      if (term.entry < 0 || term.entry >=
+          (term.offd ? offdiagonal_nnz : diagonal_nnz)) return false;
     return true;
   }
 
@@ -478,6 +486,20 @@ struct RetainedTraceSystem final
     catch (const std::exception&) { return false; }
   }
 
+  bool InitialBindSolver() noexcept
+  {
+    try
+    {
+      if (!matrix || !ilu || !gmres) { return false; }
+      ilu->SetType(0); ilu->SetLevelOfFill(0); ilu->SetMaxIter(1);
+      ilu->SetTol(0.0); ilu->SetLocalReordering(0); ilu->SetPrintLevel(0);
+      gmres->SetPreconditioner(*ilu);
+      gmres->SetOperator(*matrix);
+      return true;
+    }
+    catch (const std::exception&) { return false; }
+  }
+
   bool Initialize(MPI_Comm comm, const BorrowedP1DGInterfaceLayout& bound) noexcept;
   bool Refresh(const std::vector<double>& schur_values,
                const std::vector<double>& reduced_values) noexcept;
@@ -489,10 +511,13 @@ bool RetainedTraceSystem::Initialize(
     const MPI_Comm comm, const BorrowedP1DGInterfaceLayout& bound) noexcept
 {
   communicator = comm; layout = &bound; trace_space = bound.TraceSpace();
+  int comparison = MPI_UNEQUAL;
   bool local_ok = communicator != MPI_COMM_NULL && bound.IsUsable() &&
       trace_space != nullptr && MPI_Comm_rank(communicator, &rank) == MPI_SUCCESS &&
       MPI_Comm_size(communicator, &ranks) == MPI_SUCCESS && rank >= 0 &&
-      ranks > 0;
+      ranks > 0 && MPI_Comm_compare(communicator, trace_space->GetComm(),
+                                    &comparison) == MPI_SUCCESS &&
+      (comparison == MPI_IDENT || comparison == MPI_CONGRUENT);
   if (!CollectiveAll(communicator, local_ok)) { return false; }
   try
   {
@@ -552,9 +577,10 @@ bool RetainedTraceSystem::Initialize(
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(communicator, local_ok)) { return false; }
 
+  std::unique_ptr<mfem::SparseMatrix> graph;
   try
   {
-    mfem::SparseMatrix graph(local_size);
+    graph = std::make_unique<mfem::SparseMatrix>(local_size);
     mfem::DenseMatrix pattern(40);
     for (int element = 0; element < elements; ++element)
     {
@@ -571,11 +597,19 @@ bool RetainedTraceSystem::Initialize(
           pattern(row, column) = row_sign * column_sign;
         }
       }
-      graph.AddSubMatrix(vdofs, vdofs, pattern, 1);
+      graph->AddSubMatrix(vdofs, vdofs, pattern, 1);
     }
-    graph.Finalize(0, false);
+    graph->Finalize(0, false);
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+
+  try
+  {
     mfem::ParBilinearForm form(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
-    matrix.reset(form.ParallelAssemble(&graph));
+    // Every rank reaches this opaque collective only after its local signed
+    // symbolic graph has been admitted.
+    matrix.reset(form.ParallelAssemble(graph.get()));
     local_ok = matrix != nullptr && matrix->Height() == true_size &&
         matrix->Width() == true_size &&
         matrix->GetGlobalNumRows() == trace_space->GlobalTrueVSize() &&
@@ -658,11 +692,27 @@ bool RetainedTraceSystem::Initialize(
       if (local_ok) send_offsets[static_cast<std::size_t>(peer)] =
           previous_offset + previous_count;
     }
+    if (local_ok && ranks > 0)
+    {
+      const int final_offset = send_offsets.back();
+      const int final_count = send_counts.back();
+      local_ok = final_offset >= 0 && final_count >= 0 &&
+          final_offset <= std::numeric_limits<int>::max() - final_count &&
+          final_offset + final_count <= std::numeric_limits<int>::max() / 2 &&
+          static_cast<std::size_t>(final_offset + final_count) == outgoing.size();
+    }
   }
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(communicator, local_ok)) { return false; }
-  receive_counts.assign(static_cast<std::size_t>(ranks), 0);
-  receive_offsets.assign(static_cast<std::size_t>(ranks), 0);
+  try
+  {
+    receive_counts.assign(static_cast<std::size_t>(ranks), 0);
+    receive_offsets.assign(static_cast<std::size_t>(ranks), 0);
+    local_ok = receive_counts.size() == static_cast<std::size_t>(ranks) &&
+        receive_offsets.size() == static_cast<std::size_t>(ranks);
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
   const bool count_exchange = MPI_Alltoall(
       send_counts.data(), 1, MPI_INT, receive_counts.data(), 1, MPI_INT,
       communicator) == MPI_SUCCESS;
@@ -689,11 +739,29 @@ bool RetainedTraceSystem::Initialize(
     const int final_count = receive_counts.back();
     local_ok = final_offset >= 0 && final_count >= 0 &&
         final_offset <= std::numeric_limits<int>::max() - final_count;
+    local_ok = local_ok && final_offset + final_count <=
+        std::numeric_limits<int>::max() / 2;
     if (local_ok) incoming_count = static_cast<std::size_t>(final_offset + final_count);
   }
   if (!CollectiveAll(communicator, local_ok)) { return false; }
-  std::vector<std::array<std::uint64_t, 2>> incoming_keys(incoming_count);
-  std::vector<int> send_key_counts(static_cast<std::size_t>(ranks)), receive_key_counts(static_cast<std::size_t>(ranks)), send_key_offsets(static_cast<std::size_t>(ranks)), receive_key_offsets(static_cast<std::size_t>(ranks));
+  std::vector<std::array<std::uint64_t, 2>> incoming_keys;
+  std::vector<int> send_key_counts, receive_key_counts, send_key_offsets,
+      receive_key_offsets;
+  try
+  {
+    incoming_keys.resize(incoming_count);
+    send_key_counts.assign(static_cast<std::size_t>(ranks), 0);
+    receive_key_counts.assign(static_cast<std::size_t>(ranks), 0);
+    send_key_offsets.assign(static_cast<std::size_t>(ranks), 0);
+    receive_key_offsets.assign(static_cast<std::size_t>(ranks), 0);
+    local_ok = incoming_keys.size() == incoming_count &&
+        send_key_counts.size() == static_cast<std::size_t>(ranks) &&
+        receive_key_counts.size() == static_cast<std::size_t>(ranks) &&
+        send_key_offsets.size() == static_cast<std::size_t>(ranks) &&
+        receive_key_offsets.size() == static_cast<std::size_t>(ranks);
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
   for (int peer = 0; peer < ranks; ++peer)
   {
     local_ok = local_ok && send_counts[peer] >= 0 && receive_counts[peer] >= 0 &&
@@ -738,7 +806,7 @@ bool RetainedTraceSystem::Initialize(
     const int global = static_cast<int>(matrix->GetGlobalNumRows());
     gmres->SetMaxIter(std::max(100, global)); gmres->SetKDim(std::min(100, std::max(20, global)));
     gmres->SetLogging(0); gmres->SetPrintLevel(0);
-    local_ok = BindSolver();
+    local_ok = InitialBindSolver();
   }
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(communicator, local_ok)) { return false; }
@@ -771,7 +839,7 @@ bool RetainedTraceSystem::Refresh(const std::vector<double>& schur_values,
         for (int row = 0; row < 40; ++row)
         {
           double sign = 1.0; const int dof = DecodeSignedVDof(element_vdofs[static_cast<std::size_t>(element) * 40 + row], sign);
-          local_ok = dof >= 0 && dof < local_rhs.Size();
+          local_ok = local_ok && dof >= 0 && dof < local_rhs.Size();
           if (local_ok) local_rhs[dof] += sign * reduced_values[static_cast<std::size_t>(element) * 40 + row];
         }
       for (const Slot& term : owned)
@@ -1125,6 +1193,7 @@ struct TracedScalarIgrP1Scratch::Implementation final
   std::size_t source_sample_capacity = 0;
   EphemeralStepState state{};
   RetainedTraceSystem retained{};
+  bool retained_initialized = false;
 
   bool Matches(const TracedScalarIgrP1GlobalStepInput& input) const noexcept
   {
@@ -1184,12 +1253,12 @@ struct TracedScalarIgrP1Scratch::Implementation final
         state.source_samples.size() <= state.source_samples.capacity() &&
         state.solve_and_recovery.HasExpectedStorage(
             trace_true_size, trace_local_size, interior_size, elements) &&
-        retained.communicator == communicator && retained.layout == layout &&
-        retained.trace_space == trace_space && retained.elements == elements &&
-        retained.local_size == trace_local_size && retained.true_size == trace_true_size &&
-        retained.trace_sequence == trace_space->GetSequence() && mesh &&
-        retained.mesh_sequence == mesh->GetSequence() &&
-        retained.IsFrozen();
+        (!retained_initialized ||
+         (retained.communicator == communicator && retained.layout == layout &&
+          retained.trace_space == trace_space && retained.elements == elements &&
+          retained.local_size == trace_local_size && retained.true_size == trace_true_size &&
+          retained.trace_sequence == trace_space->GetSequence() && mesh &&
+          retained.mesh_sequence == mesh->GetSequence() && retained.IsFrozen()));
   }
 };
 
@@ -1645,11 +1714,6 @@ TracedScalarIgrP1Scratch::TracedScalarIgrP1Scratch(
     solve.local_trace_values.resize(g_capacity);
     solve.result.trace_increment.SetSize(trace_true_size);
     solve.result.interior_increment.SetSize(interior_size);
-    if (!state.retained.Initialize(communicator, layout))
-    {
-      implementation_.reset();
-      return;
-    }
     TracedScalarIgrP1GlobalStepInput binding{};
     binding.communicator = communicator;
     binding.layout = &layout;
@@ -1685,8 +1749,35 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
   {
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
-  return ComputeEphemeralStep(input, output, scratch.implementation_->state,
-                              &scratch.implementation_->retained);
+  TracedScalarIgrP1Scratch::Implementation& implementation =
+      *scratch.implementation_;
+  int initialized = implementation.retained_initialized ? 1 : 0;
+  int initialized_min = 0;
+  int initialized_max = 0;
+  const bool initialization_status =
+      MPI_Allreduce(&initialized, &initialized_min, 1, MPI_INT, MPI_MIN,
+                    input.communicator) == MPI_SUCCESS &&
+      MPI_Allreduce(&initialized, &initialized_max, 1, MPI_INT, MPI_MAX,
+                    input.communicator) == MPI_SUCCESS;
+  if (!CollectiveAll(input.communicator, initialization_status) ||
+      initialized_min != initialized_max)
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
+  if (initialized_min == 0)
+  {
+    if (!implementation.retained.Initialize(input.communicator, *input.layout))
+    {
+      return TracedScalarIgrP1GlobalStepResult::failure;
+    }
+    implementation.retained_initialized = true;
+  }
+  if (!CollectiveAll(input.communicator, implementation.Matches(input)))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
+  return ComputeEphemeralStep(input, output, implementation.state,
+                              &implementation.retained);
 }
 
 } // namespace dg::hdg::runtime::cpu::detail
