@@ -963,12 +963,26 @@ bool BoundaryPolicyViolationsRejectedBeforeDevice(mfem::ParMesh& mesh,
   CudaConfig signed_zero_config = base;
   signed_zero_config.borrowed_boundary_policies =
       {signed_zero.data(), signed_zero.size()};
+  std::array<CudaStaticBoundaryPolicy, 5> unused_extra{};
+  const std::array<CudaStaticBoundaryPolicy, 4> valid =
+      StaticPhysicalPolicies();
+  std::copy(valid.begin(), valid.end(), unused_extra.begin());
+  unused_extra[4] = {5, CudaStaticBoundaryPolicyKind::slip_wall,
+                     {{0.0, 0.0, 0.0, 0.0}}};
+  CudaConfig unused_extra_config = base;
+  unused_extra_config.borrowed_boundary_policies =
+      {unused_extra.data(), unused_extra.size()};
+  GenericEulerHdgCudaSession unused_extra_session;
+  const bool unused_extra_rejected_pre_device =
+      Rejected(unused_extra_session, unused_extra_config) &&
+      DirectBorrowedRejectedBeforeDevice(unused_extra_config, ranks);
 
   return unknown_rejected_pre_device &&
       DirectBorrowedRejectedBeforeDevice(unsupported_config, ranks) &&
       DirectBorrowedRejectedBeforeDevice(nonfinite_config, ranks) &&
       DirectBorrowedRejectedBeforeDevice(noncanonical_config, ranks) &&
-      DirectBorrowedRejectedBeforeDevice(signed_zero_config, ranks);
+      DirectBorrowedRejectedBeforeDevice(signed_zero_config, ranks) &&
+      unused_extra_rejected_pre_device;
 }
 
 bool CheckStaticPhysicalBoundaryTransaction(const int ranks, const int order,
@@ -1125,6 +1139,15 @@ bool CheckNegatives(const int ranks)
       fields);
   noncanonical_periodic_identity.borrowed_global_topology =
       StableIdentity::Copy(nonperiodic_topology_identity);
+  std::array<CudaStaticBoundaryPolicy, 4> unused_periodic_policies =
+      StaticPhysicalPolicies();
+  CudaConfig unused_periodic_policy = BorrowedDataConfig(
+      periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction,
+      fields);
+  unused_periodic_policy.borrowed_global_topology =
+      StableIdentity::Copy(nonperiodic_topology_identity);
+  unused_periodic_policy.borrowed_boundary_policies =
+      {unused_periodic_policies.data(), unused_periodic_policies.size()};
 
   GenericEulerHdgCudaSession one, two, three, four, five, six, seven, eight;
   const bool nonperiodic_rejected = Rejected(one, nonperiodic);
@@ -1161,6 +1184,10 @@ bool CheckNegatives(const int ranks)
   GenericEulerHdgCudaSession twenty_three;
   const bool noncanonical_periodic_identity_rejected = Rejected(
       twenty_three, noncanonical_periodic_identity);
+  GenericEulerHdgCudaSession twenty_four;
+  const bool unused_periodic_policy_rejected = Rejected(
+      twenty_four, unused_periodic_policy) &&
+      DirectBorrowedRejectedBeforeDevice(unused_periodic_policy, ranks);
   const bool boundary_pre_device_rejected =
       DirectBorrowedRejectedBeforeDevice(unsupported_boundary_policy, ranks) &&
       DirectBorrowedRejectedBeforeDevice(nonfinite_boundary_policy, ranks) &&
@@ -1182,7 +1209,8 @@ bool CheckNegatives(const int ranks)
       unknown_boundary_rejected && unsupported_boundary_rejected &&
       nonfinite_boundary_rejected && noncanonical_boundary_rejected &&
       signed_zero_table_rejected && signed_zero_boundary_rejected &&
-      noncanonical_periodic_identity_rejected && boundary_pre_device_rejected &&
+      noncanonical_periodic_identity_rejected &&
+      unused_periodic_policy_rejected && boundary_pre_device_rejected &&
       boundary_p2_pre_device_rejected &&
       SameValues(fields.initial, fields_initial_before) &&
       SameValues(fields.source, fields_source_before);

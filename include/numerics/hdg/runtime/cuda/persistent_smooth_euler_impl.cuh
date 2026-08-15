@@ -1794,6 +1794,10 @@ private:
     // copied static policy.  This replaces the old periodic-only face census.
     long long local_face_measure = 0;
     long long local_physical_faces = 0;
+    std::array<long long, maximum_static_boundary_policies>
+        local_policy_uses{};
+    std::array<long long, maximum_static_boundary_policies>
+        global_policy_uses{};
     try
     {
       const int face_count = config.borrowed_mesh->GetNumFaces();
@@ -1839,13 +1843,21 @@ private:
           }
           const int attribute = config.borrowed_mesh->GetBdrAttribute(boundary_element);
           const CudaStaticBoundaryPolicy* found = nullptr;
+          std::size_t found_index = maximum_static_boundary_policies;
           for (std::size_t policy = 0;
                policy < config.borrowed_boundary_policies.count; ++policy)
             if (config.borrowed_boundary_policies.policies[policy].attribute == attribute)
+            {
               found = config.borrowed_boundary_policies.policies + policy;
+              found_index = policy;
+            }
           if (attribute <= 0 || found == nullptr ||
-              !IsCudaAdmittedStaticBoundaryPolicy(found->kind))
+              found_index >= config.borrowed_boundary_policies.count ||
+              !IsCudaAdmittedStaticBoundaryPolicy(found->kind) ||
+              local_policy_uses[found_index] ==
+                  std::numeric_limits<long long>::max())
           { local_valid = false; break; }
+          ++local_policy_uses[found_index];
           ++local_physical_faces;
         }
       }
@@ -1867,7 +1879,18 @@ private:
         &global_face_measure, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
     const bool boundary_census = MPI_Allreduce(&local_physical_faces,
         &global_physical_faces, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool policy_usage_census = MPI_Allreduce(local_policy_uses.data(),
+        global_policy_uses.data(),
+        static_cast<int>(global_policy_uses.size()), MPI_LONG_LONG_INT,
+        MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+    bool every_policy_used = config.borrowed_boundary_policies.count == 0
+        ? global_physical_faces == 0
+        : global_physical_faces > 0;
+    for (std::size_t policy = 0; every_policy_used &&
+         policy < config.borrowed_boundary_policies.count; ++policy)
+      every_policy_used = global_policy_uses[policy] > 0;
     if (!element_census || !face_census || !boundary_census ||
+        !policy_usage_census || !every_policy_used ||
         global_elements < 0 || global_physical_faces < 0 ||
         global_elements > (std::numeric_limits<long long>::max() -
             global_physical_faces) / faces_per_element ||
