@@ -311,7 +311,7 @@ int main()
                     first_output && Near(first_output->time, 0.25) &&
                     Near(second.proposed_dt, 0.4) && Near(second.dt, 0.25) &&
                     Near(final.proposed_dt, 0.4) && Near(final.dt, 0.2) &&
-                    final.hits_final_time,
+                    final.hits_final,
                   "HDG CFL proposals are transactional and clip at output and final boundaries");
   }
 
