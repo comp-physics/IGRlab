@@ -26,6 +26,9 @@ using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using namespace dg::hdg::runtime::cuda_w8a;
 using GenericPreparedOutput = CudaPreparedOutputMetadataV1;
 
+inline constexpr std::string_view nonperiodic_topology_identity =
+    "cuda.generic.quad.physical-boundary.v1";
+
 bool All(const bool local) noexcept
 {
   int input = local ? 1 : 0;
@@ -256,8 +259,15 @@ bool CheckTransaction(const int ranks)
   mfem::Mesh serial = PeriodicSquareMesh(smoke_elements_per_direction);
   mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
   GenericEulerHdgCudaSession session;
-  const auto initialized = session.Initialize(BorrowedConfig(
-      mesh, ranks, smoke_polynomial_order, smoke_elements_per_direction));
+  CudaConfig periodic_config = BorrowedConfig(
+      mesh, ranks, smoke_polynomial_order, smoke_elements_per_direction);
+  // Periodic borrowed callers retain the empty physical-policy and topology
+  // identity spellings; only an active static physical table needs an ID.
+  const bool periodic_legacy_spelling =
+      periodic_config.borrowed_boundary_policies.policies == nullptr &&
+      periodic_config.borrowed_boundary_policies.count == 0 &&
+      periodic_config.borrowed_global_topology.empty();
+  const auto initialized = session.Initialize(periodic_config);
   const std::uint32_t expected_capabilities =
       HdgEulerSessionCapabilityBit(HdgEulerSessionCapability::prepared_commit) |
       HdgEulerSessionCapabilityBit(HdgEulerSessionCapability::prepared_output) |
@@ -265,7 +275,8 @@ bool CheckTransaction(const int ranks)
           HdgEulerSessionCapability::committed_cfl_diagnostics) |
       HdgEulerSessionCapabilityBit(
           HdgEulerSessionCapability::generic_borrowed_inputs);
-  if (!All(initialized.status == HdgEulerSessionStatus::initialized &&
+  if (!All(periodic_legacy_spelling &&
+           initialized.status == HdgEulerSessionStatus::initialized &&
            session.capabilities() == expected_capabilities &&
            (session.capabilities() & HdgEulerSessionCapabilityBit(
                HdgEulerSessionCapability::committed_cfl_diagnostics)) != 0 &&
@@ -874,6 +885,29 @@ bool DirectFixedOracleRejected(const CudaConfig& config, const int ranks)
       evidence.device == -1;
 }
 
+bool DirectBorrowedRejectedBeforeDevice(const CudaConfig& config,
+                                        const int ranks)
+{
+  CudaRunEvidence evidence{};
+  if (ranks == 1)
+  {
+    auto engine = std::make_unique<
+        PersistentCudaSmoothEulerEngine<
+            BorrowedCudaRank1OneGpuRuntimeSelection>>(config);
+    return !engine->Initialize(evidence) && evidence.device == -1 &&
+        evidence.status == CudaRunStatus::setup_failure &&
+        evidence.setup_origin ==
+            dg::hdg::runtime::FailureReason::collective_protocol;
+  }
+  auto engine = std::make_unique<
+      PersistentCudaSmoothEulerEngine<
+          BorrowedCudaRank2OneGpuHostStagedRuntimeSelection>>(config);
+  return !engine->Initialize(evidence) && evidence.device == -1 &&
+      evidence.status == CudaRunStatus::setup_failure &&
+      evidence.setup_origin ==
+          dg::hdg::runtime::FailureReason::collective_protocol;
+}
+
 std::array<CudaStaticBoundaryPolicy, 4> StaticPhysicalPolicies()
 {
   const std::array<double, conserved_components> reference{{1.0, 2.0, 0.0,
@@ -886,6 +920,54 @@ std::array<CudaStaticBoundaryPolicy, 4> StaticPhysicalPolicies()
            {4, CudaStaticBoundaryPolicyKind::slip_wall, unused}}};
 }
 
+bool BoundaryPolicyViolationsRejectedBeforeDevice(mfem::ParMesh& mesh,
+                                                  const int ranks,
+                                                  const int order,
+                                                  const int n)
+{
+  HostFields fields = NonuniformHostFields(mesh, order, false);
+  CudaConfig base = BorrowedDataConfig(mesh, ranks, order, n, fields);
+  base.borrowed_global_topology =
+      StableIdentity::Copy(nonperiodic_topology_identity);
+
+  std::array<CudaStaticBoundaryPolicy, 4> unknown = StaticPhysicalPolicies();
+  for (std::size_t policy = 0; policy < unknown.size(); ++policy)
+    unknown[policy].attribute = static_cast<int>(policy) + 5;
+  CudaConfig unknown_config = base;
+  unknown_config.borrowed_boundary_policies = {unknown.data(), unknown.size()};
+  GenericEulerHdgCudaSession unknown_session;
+  const bool unknown_rejected_pre_device = Rejected(unknown_session,
+                                                    unknown_config);
+
+  std::array<CudaStaticBoundaryPolicy, 4> unsupported = StaticPhysicalPolicies();
+  unsupported[0].kind = CudaStaticBoundaryPolicyKind::far_field;
+  CudaConfig unsupported_config = base;
+  unsupported_config.borrowed_boundary_policies = {unsupported.data(), unsupported.size()};
+
+  std::array<CudaStaticBoundaryPolicy, 4> nonfinite = StaticPhysicalPolicies();
+  nonfinite[0].reference_state[0] = std::numeric_limits<double>::quiet_NaN();
+  CudaConfig nonfinite_config = base;
+  nonfinite_config.borrowed_boundary_policies = {nonfinite.data(), nonfinite.size()};
+
+  std::array<CudaStaticBoundaryPolicy, 4> noncanonical = StaticPhysicalPolicies();
+  noncanonical[1].reference_state[0] = 1.0;
+  CudaConfig noncanonical_config = base;
+  noncanonical_config.borrowed_boundary_policies =
+      {noncanonical.data(), noncanonical.size()};
+
+  std::array<CudaStaticBoundaryPolicy, 4> signed_zero = StaticPhysicalPolicies();
+  signed_zero[1].reference_state[0] = -0.0;
+  CudaConfig signed_zero_config = base;
+  signed_zero_config.borrowed_boundary_policies =
+      {signed_zero.data(), signed_zero.size()};
+
+  return unknown_rejected_pre_device &&
+      DirectBorrowedRejectedBeforeDevice(unsupported_config, ranks) &&
+      DirectBorrowedRejectedBeforeDevice(nonfinite_config, ranks) &&
+      DirectBorrowedRejectedBeforeDevice(noncanonical_config, ranks) &&
+      DirectBorrowedRejectedBeforeDevice(signed_zero_config, ranks);
+}
+
 bool CheckStaticPhysicalBoundaryTransaction(const int ranks, const int order,
                                             const int n)
 {
@@ -896,6 +978,8 @@ bool CheckStaticPhysicalBoundaryTransaction(const int ranks, const int order,
       StaticPhysicalPolicies();
   std::vector<CudaStaticBoundaryPolicy> policies(fixture.begin(), fixture.end());
   CudaConfig config = BorrowedDataConfig(mesh, ranks, order, n, fields);
+  config.borrowed_global_topology =
+      StableIdentity::Copy(nonperiodic_topology_identity);
   config.borrowed_boundary_policies = {policies.data(), policies.size()};
   GenericEulerHdgCudaSession session;
   const auto initialized = session.Initialize(config);
@@ -1004,6 +1088,8 @@ bool CheckNegatives(const int ranks)
   CudaConfig unknown_boundary_policy = BorrowedDataConfig(
       boundary, ranks, smoke_polynomial_order, smoke_elements_per_direction,
       boundary_fields);
+  unknown_boundary_policy.borrowed_global_topology =
+      StableIdentity::Copy(nonperiodic_topology_identity);
   for (std::size_t policy = 0; policy < policies.size(); ++policy)
     policies[policy].attribute = static_cast<int>(policy) + 5;
   unknown_boundary_policy.borrowed_boundary_policies =
@@ -1031,6 +1117,11 @@ bool CheckNegatives(const int ranks)
   const bool signed_zero_table_rejected =
       !ValidateCudaStaticBoundaryPolicyTable(
           signed_zero_boundary_policy.borrowed_boundary_policies);
+  CudaConfig noncanonical_periodic_identity = BorrowedDataConfig(
+      periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction,
+      fields);
+  noncanonical_periodic_identity.borrowed_global_topology =
+      StableIdentity::Copy(nonperiodic_topology_identity);
 
   GenericEulerHdgCudaSession one, two, three, four, five, six, seven, eight;
   const bool nonperiodic_rejected = Rejected(one, nonperiodic);
@@ -1064,6 +1155,20 @@ bool CheckNegatives(const int ranks)
       twenty_one, noncanonical_boundary_policy);
   const bool signed_zero_boundary_rejected = Rejected(
       twenty_two, signed_zero_boundary_policy);
+  GenericEulerHdgCudaSession twenty_three;
+  const bool noncanonical_periodic_identity_rejected = Rejected(
+      twenty_three, noncanonical_periodic_identity);
+  const bool boundary_pre_device_rejected =
+      DirectBorrowedRejectedBeforeDevice(unsupported_boundary_policy, ranks) &&
+      DirectBorrowedRejectedBeforeDevice(nonfinite_boundary_policy, ranks) &&
+      DirectBorrowedRejectedBeforeDevice(noncanonical_boundary_policy, ranks) &&
+      DirectBorrowedRejectedBeforeDevice(signed_zero_boundary_policy, ranks);
+  // The same stage-specific rejection coverage applies to functional p2 on
+  // both supported rank selections; no CUDA device may be configured first.
+  const bool boundary_p2_pre_device_rejected =
+      BoundaryPolicyViolationsRejectedBeforeDevice(
+          boundary, ranks, functional_polynomial_order,
+          smoke_elements_per_direction);
   bool rejected = nonperiodic_rejected && invalid_mesh_n_rejected && p3_rejected &&
       wrong_device_rejected && wrong_ranks_rejected && invalid_config_dt_rejected &&
       capture_oracle_rejected && direct_capture_oracle_rejected &&
@@ -1074,6 +1179,8 @@ bool CheckNegatives(const int ranks)
       unknown_boundary_rejected && unsupported_boundary_rejected &&
       nonfinite_boundary_rejected && noncanonical_boundary_rejected &&
       signed_zero_table_rejected && signed_zero_boundary_rejected &&
+      noncanonical_periodic_identity_rejected && boundary_pre_device_rejected &&
+      boundary_p2_pre_device_rejected &&
       SameValues(fields.initial, fields_initial_before) &&
       SameValues(fields.source, fields_source_before);
 
@@ -1095,7 +1202,50 @@ bool CheckNegatives(const int ranks)
     if (rank == 0) divergent.dt = 0.01;
     GenericEulerHdgCudaSession seventeen;
     const bool divergent_rejected = Rejected(seventeen, divergent);
-    rejected = rejected && empty_rejected && divergent_rejected;
+
+    CudaConfig mode_mismatch = BorrowedDataConfig(
+        periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction,
+        fields);
+    if (rank == 1)
+    {
+      mode_mismatch.use_borrowed_host_inputs = false;
+      mode_mismatch.borrowed_initial = {nullptr, 0, conserved_components};
+      mode_mismatch.borrowed_source = {nullptr, 0, conserved_components};
+    }
+    GenericEulerHdgCudaSession mode_session;
+    const bool mode_mismatch_rejected = Rejected(mode_session, mode_mismatch) &&
+        DirectBorrowedRejectedBeforeDevice(mode_mismatch, ranks);
+
+    // Each rank deliberately borrows a different mesh object while declaring
+    // the other mesh's rank-common identity.  The identity min/max admission
+    // must reject before engine allocation or any ParFESpace exchange.
+    mfem::Mesh serial_a = NonperiodicSquareMesh(smoke_elements_per_direction);
+    mfem::Mesh serial_b = NonperiodicSquareMesh(smoke_elements_per_direction);
+    mfem::ParMesh mesh_a(MPI_COMM_WORLD, serial_a);
+    mfem::ParMesh mesh_b(MPI_COMM_WORLD, serial_b);
+    HostFields fields_a = NonuniformHostFields(
+        mesh_a, smoke_polynomial_order, false);
+    HostFields fields_b = NonuniformHostFields(
+        mesh_b, smoke_polynomial_order, false);
+    CudaConfig crossed_identity = rank == 0
+        ? BorrowedDataConfig(mesh_a, ranks, smoke_polynomial_order,
+                             smoke_elements_per_direction, fields_a)
+        : BorrowedDataConfig(mesh_b, ranks, smoke_polynomial_order,
+                             smoke_elements_per_direction, fields_b);
+    crossed_identity.borrowed_global_topology = rank == 0
+        ? StableIdentity::Copy("cuda.generic.quad.physical.mesh-b.v1")
+        : StableIdentity::Copy("cuda.generic.quad.physical.mesh-a.v1");
+    std::array<CudaStaticBoundaryPolicy, 4> crossed_policies =
+        StaticPhysicalPolicies();
+    crossed_identity.borrowed_boundary_policies = {crossed_policies.data(),
+                                                   crossed_policies.size()};
+    GenericEulerHdgCudaSession twenty_four;
+    const bool crossed_identity_rejected = Rejected(twenty_four,
+                                                    crossed_identity) &&
+        DirectBorrowedRejectedBeforeDevice(crossed_identity, ranks);
+    rejected = rejected && empty_rejected && divergent_rejected &&
+        mode_mismatch_rejected &&
+        crossed_identity_rejected;
   }
   return All(rejected);
 }

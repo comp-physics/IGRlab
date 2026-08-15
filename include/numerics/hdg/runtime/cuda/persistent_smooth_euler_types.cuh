@@ -227,6 +227,34 @@ inline bool ValidateCudaStaticBoundaryPolicyTable(
   return true;
 }
 
+inline bool CudaBorrowedHostModeConsensus(const bool requested,
+                                          bool& agreed_mode) noexcept
+{
+  const int local = requested ? 1 : 0;
+  int minimum = 0;
+  int maximum = 0;
+  const bool minimum_ready = MPI_Allreduce(&local, &minimum, 1, MPI_INT,
+      MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool maximum_ready = MPI_Allreduce(&local, &maximum, 1, MPI_INT,
+      MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool consensus_ok = minimum_ready && maximum_ready &&
+      minimum == maximum && (minimum == 0 || minimum == 1);
+  agreed_mode = consensus_ok && minimum == 1;
+  return consensus_ok;
+}
+
+inline bool IsCudaBorrowedGlobalTopologyIdentity(
+    const StableIdentity& value) noexcept
+{
+  return value.valid() && !value.empty();
+}
+
+inline bool IsCudaAbsentBorrowedGlobalTopologyIdentity(
+    const StableIdentity& value) noexcept
+{
+  return value.empty();
+}
+
 struct CudaConfig
 {
   StableIdentity experiment = StableIdentity::Copy(experiment_id);
@@ -250,6 +278,11 @@ struct CudaConfig
   CudaBorrowedHostL2Input borrowed_initial{};
   // The sole empty spelling is {nullptr, 0, 4}; it selects a zero source.
   CudaBorrowedHostL2Input borrowed_source{};
+  // Nonempty only with a static physical-boundary policy table: this is the
+  // rank-common caller declaration of the complete borrowed global topology.
+  // It is an Initialize-only admission identity, not a mesh pointer, hash of
+  // local partition bytes, or post-initialization evidence payload.
+  StableIdentity borrowed_global_topology{};
   // This descriptor is valid only for borrowed-host sessions.  Initialize
   // validates and copies it; no caller policy pointer survives publication.
   CudaStaticBoundaryPolicyTable borrowed_boundary_policies{};

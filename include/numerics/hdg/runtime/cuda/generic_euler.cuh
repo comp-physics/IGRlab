@@ -644,6 +644,7 @@ private:
 
   using config_descriptor = std::array<unsigned char, 256>;
   using policy_descriptor = std::array<unsigned char, 2048>;
+  using topology_descriptor = std::array<unsigned char, 128>;
 
   template <typename Value>
   static void AppendConfigValue(config_descriptor& descriptor,
@@ -663,6 +664,13 @@ private:
 
   static bool ConfigConsensus(const cuda_w8a::CudaConfig& config) noexcept
   {
+    bool borrowed_host_mode = false;
+    // This min/max pair is unconditional and precedes every descriptor whose
+    // shape depends on borrowed-host mode.  A mismatch therefore cannot send
+    // ranks into different collective sequences.
+    if (!cuda_w8a::CudaBorrowedHostModeConsensus(
+            config.use_borrowed_host_inputs, borrowed_host_mode))
+      return false;
     config_descriptor local{};
     std::size_t cursor = 0;
     bool complete = true;
@@ -695,7 +703,7 @@ private:
     // Preserve the frozen legacy descriptor byte-for-byte.  The data-mode
     // branch carries only rank-common ABI facts: local L2 counts are expected
     // to vary with the borrowed partition and are validated locally later.
-    if (config.use_borrowed_host_inputs)
+    if (borrowed_host_mode)
     {
       append_bool(true);
       AppendConfigValue(local, cursor, complete,
@@ -727,8 +735,45 @@ private:
         MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
     const bool base_consensus = complete_census && minimum_census && maximum_census &&
         all_complete == 1 && minimum == maximum;
-    return base_consensus && (!config.use_borrowed_host_inputs ||
-        PolicyTableConsensus(config));
+    if (!base_consensus || !borrowed_host_mode) return base_consensus;
+    // The exact fixed-size policy consensus is always run in true mode.  Only
+    // a nonempty policy table activates the physical-boundary identity ABI;
+    // this leaves existing borrowed periodic callers unchanged.
+    if (!PolicyTableConsensus(config)) return false;
+    return config.borrowed_boundary_policies.count == 0 ||
+        TopologyIdentityConsensus(config);
+  }
+
+  static bool TopologyIdentityConsensus(
+      const cuda_w8a::CudaConfig& config) noexcept
+  {
+    topology_descriptor local{}, minimum{}, maximum{};
+    const StableIdentity& identity = config.borrowed_global_topology;
+    const std::uint64_t length = identity.size();
+    const std::uint8_t valid = identity.valid() ? 1U : 0U;
+    bool complete = cuda_w8a::IsCudaBorrowedGlobalTopologyIdentity(identity) &&
+        length <= local.size() - sizeof(length) - sizeof(valid);
+    std::size_t cursor = 0;
+    if (complete)
+    {
+      std::memcpy(local.data() + cursor, &length, sizeof(length));
+      cursor += sizeof(length);
+      std::memcpy(local.data() + cursor, &valid, sizeof(valid));
+      cursor += sizeof(valid);
+      std::memcpy(local.data() + cursor, identity.data(),
+                  static_cast<std::size_t>(length));
+    }
+    minimum = local;
+    maximum = local;
+    const int complete_bit = complete ? 1 : 0;
+    int all_complete = 0;
+    return MPI_Allreduce(&complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
+                         MPI_COMM_WORLD) == MPI_SUCCESS &&
+        MPI_Allreduce(local.data(), minimum.data(), static_cast<int>(local.size()),
+                      MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS &&
+        MPI_Allreduce(local.data(), maximum.data(), static_cast<int>(local.size()),
+                      MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS &&
+        all_complete == 1 && minimum == maximum;
   }
 
   static bool PolicyTableConsensus(const cuda_w8a::CudaConfig& config) noexcept
@@ -829,6 +874,14 @@ private:
               config.borrowed_boundary_policies)
         : config.borrowed_boundary_policies.policies == nullptr &&
             config.borrowed_boundary_policies.count == 0;
+    const bool borrowed_topology_identity = config.use_borrowed_host_inputs
+        ? (config.borrowed_boundary_policies.count == 0
+            ? cuda_w8a::IsCudaAbsentBorrowedGlobalTopologyIdentity(
+                config.borrowed_global_topology)
+            : cuda_w8a::IsCudaBorrowedGlobalTopologyIdentity(
+                config.borrowed_global_topology))
+        : cuda_w8a::IsCudaAbsentBorrowedGlobalTopologyIdentity(
+            config.borrowed_global_topology);
     int ranks = 0;
     int borrowed_world = MPI_UNEQUAL;
     int borrowed_mesh = MPI_UNEQUAL;
@@ -836,6 +889,7 @@ private:
         config.borrowed_communicator != MPI_COMM_NULL &&
         borrowed_data_abi &&
         boundary_policy_abi &&
+        borrowed_topology_identity &&
         MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS &&
         (ranks == 1 || ranks == 2) && ranks == config.expected_rank_count &&
         config.requested_device == 0 &&

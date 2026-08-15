@@ -1741,6 +1741,14 @@ private:
     {
       local_valid = local_valid && config.borrowed_mesh != nullptr &&
           config.borrowed_communicator != MPI_COMM_NULL;
+      const bool static_physical_boundaries =
+          config.use_borrowed_host_inputs &&
+          config.borrowed_boundary_policies.count != 0;
+      local_valid = local_valid && (static_physical_boundaries
+          ? IsCudaBorrowedGlobalTopologyIdentity(
+              config.borrowed_global_topology)
+          : IsCudaAbsentBorrowedGlobalTopologyIdentity(
+              config.borrowed_global_topology));
       if (local_valid)
       {
         int caller_world = MPI_UNEQUAL;
