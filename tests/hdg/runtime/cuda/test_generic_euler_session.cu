@@ -915,10 +915,12 @@ std::array<CudaStaticBoundaryPolicy, 4> StaticPhysicalPolicies()
       4.5}};
   const std::array<double, conserved_components> unused{{0.0, 0.0, 0.0,
       0.0}};
-  return {{{1, CudaStaticBoundaryPolicyKind::supersonic_inlet, reference},
+  // MFEM Cartesian boundary attributes are bottom/right/top/left = 1/2/3/4.
+  // Exercise a horizontal left-in/right-out channel with slip walls.
+  return {{{1, CudaStaticBoundaryPolicyKind::slip_wall, unused},
            {2, CudaStaticBoundaryPolicyKind::supersonic_outlet, unused},
            {3, CudaStaticBoundaryPolicyKind::slip_wall, unused},
-           {4, CudaStaticBoundaryPolicyKind::slip_wall, unused}}};
+           {4, CudaStaticBoundaryPolicyKind::supersonic_inlet, reference}}};
 }
 
 bool BoundaryPolicyViolationsRejectedBeforeDevice(mfem::ParMesh& mesh,
