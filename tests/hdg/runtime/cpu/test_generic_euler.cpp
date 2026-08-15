@@ -126,7 +126,7 @@ mfem::ParMesh MakePeriodicRankZeroOwnedBorrowedMesh(
     const MPI_Comm communicator = MPI_COMM_WORLD)
 {
   mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
-      2, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      3, 3, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
   std::vector<mfem::Vector> translations(2, mfem::Vector(2));
   translations[0][0] = 1.0;
   translations[1][1] = 1.0;

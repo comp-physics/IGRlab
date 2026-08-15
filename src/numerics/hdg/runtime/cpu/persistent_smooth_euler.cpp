@@ -1904,7 +1904,7 @@ struct detail::CpuNumericsCore::Implementation
 
   bool CaptureIgrGeometryAndMaps() noexcept
   {
-    if (!mesh || !igr_layout || mesh->GetNBE() != 0) return false;
+    if (!mesh || !igr_layout || generic::HasPhysicalBoundaryFace(*mesh)) return false;
     const mfem::ParFiniteElementSpace* const private_interior = igr_layout->InteriorSpace();
     const mfem::ParFiniteElementSpace* const private_trace = igr_layout->TraceSpace();
     if (!private_interior || !private_trace) return false;
@@ -5673,7 +5673,8 @@ bool detail::CpuNumericsCore::InitializeInternal(
     {
       state.igr_layout = std::make_unique<BorrowedP1DGInterfaceLayout>(*state.mesh);
       local_ok = state.igr_layout && state.igr_layout->IsUsable() &&
-          state.config.polynomial_order == 1 && state.mesh->GetNBE() == 0 &&
+          state.config.polynomial_order == 1 &&
+          !generic::HasPhysicalBoundaryFace(*state.mesh) &&
           state.CaptureIgrGeometryAndMaps();
       if (local_ok)
       {

@@ -49,7 +49,7 @@ mfem::ParMesh MakeSquareMesh()
 mfem::ParMesh MakePeriodicSquareMesh(const MPI_Comm communicator = MPI_COMM_WORLD)
 {
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
-      2, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      3, 3, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
   std::vector<mfem::Vector> translations(2, mfem::Vector(2));
   translations[0][0] = 1.0;
   translations[1][1] = 1.0;
@@ -172,14 +172,20 @@ bool CheckIgrSelectionAdmission()
   const ContractStatus valid = ValidateEulerHdgRequest(request);
   request.polynomial_order = 2;
   const ContractStatus p2 = ValidateEulerHdgRequest(request);
+  mfem::ParMesh physical_mesh = MakeSquareMesh();
+  EulerHdgRequest physical = ValidRequest(physical_mesh, initial);
+  physical.polynomial_order = 1;
+  physical.regularization = {RegularizationKind::igr, 0.25, 0.5};
+  const ContractStatus physical_boundary = ValidateEulerHdgRequest(physical);
   request.polynomial_order = 1;
   request.backend = {BackendKind::cuda, 0};
   request.capabilities = all_cuda_capabilities;
   const ContractStatus cuda = ValidateEulerHdgRequest(request);
   request.backend = {BackendKind::cpu, -1};
   request.capabilities = all_cpu_capabilities;
-  int rank = 0;
+  int rank = 0, ranks = 0;
   MPI_Comm_rank(mesh.GetComm(), &rank);
+  MPI_Comm_size(mesh.GetComm(), &ranks);
   request.regularization.alpha = rank == 0 ? 0.25 : 0.5;
   const ContractStatus mismatch = ValidateEulerHdgRequest(request);
   int min_status = static_cast<int>(mismatch), max_status = min_status;
@@ -189,8 +195,10 @@ bool CheckIgrSelectionAdmission()
                                        MPI_MAX, mesh.GetComm());
   return valid == ContractStatus::accepted &&
       p2 == ContractStatus::invalid_regularization &&
+      physical_boundary == ContractStatus::invalid_regularization &&
       cuda == ContractStatus::invalid_regularization &&
-      mismatch == ContractStatus::invalid_regularization &&
+      mismatch == (ranks == 1 ? ContractStatus::accepted
+                              : ContractStatus::invalid_regularization) &&
       min_result == MPI_SUCCESS && max_result == MPI_SUCCESS &&
       min_status == max_status;
 }

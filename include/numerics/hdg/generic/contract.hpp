@@ -17,6 +17,7 @@
 #include <cstring>
 #include <limits>
 #include <type_traits>
+#include <vector>
 
 namespace dg::hdg::generic
 {
@@ -190,6 +191,49 @@ inline bool ValidRegularizationSelection(
       std::isfinite(selection.beta) && selection.beta > 0.0;
 }
 
+/**
+ * Periodic MFEM meshes retain boundary-element annotations for faces that
+ * become interior (or rank-shared) after periodic identification.  IGR has
+ * no physical boundary treatment, so distinguish those annotations from a
+ * true physical boundary face rather than using GetNBE() directly.
+ */
+inline bool HasPhysicalBoundaryFace(const mfem::ParMesh& mesh) noexcept
+{
+  try
+  {
+    const int faces = mesh.GetNumFaces();
+    if (faces < 0) { return true; }
+    std::vector<bool> shared(static_cast<std::size_t>(faces), false);
+    const int shared_faces = mesh.GetNSharedFaces();
+    if (shared_faces < 0) { return true; }
+    for (int shared_face = 0; shared_face < shared_faces; ++shared_face)
+    {
+      const int face = mesh.GetSharedFace(shared_face);
+      if (face < 0 || face >= faces) { return true; }
+      shared[static_cast<std::size_t>(face)] = true;
+    }
+    for (int boundary = 0; boundary < mesh.GetNBE(); ++boundary)
+    {
+      const int face = mesh.GetBdrElementFaceIndex(boundary);
+      if (face < 0 || face >= faces) { return true; }
+    }
+
+    for (int face = 0; face < faces; ++face)
+    {
+      if (!mesh.FaceIsInterior(face) &&
+          !shared[static_cast<std::size_t>(face)])
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+  catch (...)
+  {
+    return true;
+  }
+}
+
 constexpr std::uint32_t RequiredCapabilities(
     const BackendSelection backend) noexcept
 {
@@ -358,7 +402,7 @@ inline ContractStatus ValidateEulerHdgRequest(
   if (request.regularization.kind == RegularizationKind::igr &&
       (request.backend.kind != BackendKind::cpu ||
        request.polynomial_order != minimum_polynomial_order ||
-       request.mesh->GetNBE() != 0))
+       HasPhysicalBoundaryFace(*request.mesh)))
   {
     RecordFailure(local_status, ContractStatus::invalid_regularization);
   }
