@@ -57,6 +57,15 @@ bool SameBits(const mfem::Vector& left, const mfem::Vector& right)
       static_cast<std::size_t>(left.Size()) * sizeof(double)) == 0;
 }
 
+bool AllEqual(const mfem::Vector& values, const double expected)
+{
+  const double* const data = values.HostRead();
+  if (values.Size() == 0) return true;
+  if (data == nullptr) return false;
+  return std::all_of(data, data + values.Size(),
+                     [expected](const double value) { return value == expected; });
+}
+
 double NormSquared(const MPI_Comm communicator, const mfem::Vector& values)
 {
   return mfem::InnerProduct(communicator, values, values);
@@ -679,16 +688,27 @@ bool Run(const MPI_Comm communicator, const Layout& layout,
   if (scratch != nullptr)
   {
     if (!scratch->IsReady() && !scratch->Initialize(input)) { return false; }
-    if (output.trace_increment.Size() != layout.TraceTrueVSize())
-      output.trace_increment.SetSize(layout.TraceTrueVSize());
-    if (output.interior_increment.Size() != layout.InteriorLocalVSize())
-      output.interior_increment.SetSize(layout.InteriorLocalVSize());
   }
   const detail::TracedScalarIgrP1GlobalStepResult result = scratch
       ? detail::ComputeTracedScalarIgrP1GlobalStep(input, output, *scratch)
       : detail::ComputeTracedScalarIgrP1GlobalStep(input, output);
   return result ==
       detail::TracedScalarIgrP1GlobalStepResult::success;
+}
+
+bool RunScratchSuccess(const MPI_Comm communicator, const Layout& layout,
+                       const std::vector<local::AffineQuad>& quads,
+                       const mfem::ParFiniteElementSpace& source_space,
+                       const mfem::Vector& source, const double dt,
+                       detail::TracedScalarIgrP1GlobalStepOutput& output,
+                       detail::TracedScalarIgrP1Scratch& scratch)
+{
+  if (output.trace_increment.Size() != layout.TraceTrueVSize())
+    output.trace_increment.SetSize(layout.TraceTrueVSize());
+  if (output.interior_increment.Size() != layout.InteriorLocalVSize())
+    output.interior_increment.SetSize(layout.InteriorLocalVSize());
+  return Run(communicator, layout, quads, source_space, source, dt, output,
+             &scratch);
 }
 
 bool Check(const MPI_Comm communicator)
@@ -726,14 +746,14 @@ bool Check(const MPI_Comm communicator)
       scratch_source, scratch_dt;
   ok = scratch.IsUsable() && !scratch.IsReady();
   if (!Require(communicator, ok, "scratch binding")) { return false; }
-  const bool scratch_first_ok = Run(communicator, layout, quads, source_space,
-      source_a, 0.05, scratch_first, &scratch) && scratch.IsUsable();
-  const bool scratch_repeat_ok = Run(communicator, layout, quads, source_space,
-      source_a, 0.05, scratch_repeat, &scratch) && scratch.IsUsable();
-  const bool scratch_source_ok = Run(communicator, layout, quads, source_space,
-      source_b, 0.05, scratch_source, &scratch) && scratch.IsUsable();
-  const bool scratch_dt_ok = Run(communicator, layout, quads, source_space,
-      source_a, 0.08, scratch_dt, &scratch) && scratch.IsUsable();
+  const bool scratch_first_ok = RunScratchSuccess(communicator, layout, quads,
+      source_space, source_a, 0.05, scratch_first, scratch) && scratch.IsUsable();
+  const bool scratch_repeat_ok = RunScratchSuccess(communicator, layout, quads,
+      source_space, source_a, 0.05, scratch_repeat, scratch) && scratch.IsUsable();
+  const bool scratch_source_ok = RunScratchSuccess(communicator, layout, quads,
+      source_space, source_b, 0.05, scratch_source, scratch) && scratch.IsUsable();
+  const bool scratch_dt_ok = RunScratchSuccess(communicator, layout, quads,
+      source_space, source_a, 0.08, scratch_dt, scratch) && scratch.IsUsable();
   ok = scratch_first_ok && scratch_repeat_ok && scratch_source_ok && scratch_dt_ok;
   const bool scratch_match = SameBits(scratch_first.trace_increment, first.trace_increment) &&
       SameBits(scratch_first.interior_increment, first.interior_increment) &&
@@ -743,7 +763,16 @@ bool Check(const MPI_Comm communicator)
       SameBits(scratch_source.interior_increment, second.interior_increment) &&
       SameBits(scratch_dt.trace_increment, changed_dt.trace_increment) &&
       SameBits(scratch_dt.interior_increment, changed_dt.interior_increment);
-  if (!Require(communicator, ok && scratch_match, "scratch repeated global steps"))
+  const double* const scratch_trace_backing = scratch_first.trace_increment.HostRead();
+  const double* const scratch_interior_backing = scratch_first.interior_increment.HostRead();
+  const bool scratch_reused = RunScratchSuccess(communicator, layout, quads,
+      source_space, source_a, 0.05, scratch_first, scratch) &&
+      scratch_first.trace_increment.HostRead() == scratch_trace_backing &&
+      scratch_first.interior_increment.HostRead() == scratch_interior_backing &&
+      SameBits(scratch_first.trace_increment, first.trace_increment) &&
+      SameBits(scratch_first.interior_increment, first.interior_increment);
+  if (!Require(communicator, ok && scratch_match && scratch_reused,
+               "scratch repeated global steps"))
   {
     return false;
   }
@@ -871,25 +900,35 @@ bool Check(const MPI_Comm communicator)
   {
     nonfinite_source[0] = std::numeric_limits<double>::quiet_NaN();
   }
+  detail::TracedScalarIgrP1GlobalStepOutput refresh_sentinel;
+  refresh_sentinel.trace_increment.SetSize(layout.TraceTrueVSize());
+  refresh_sentinel.interior_increment.SetSize(layout.InteriorLocalVSize());
+  refresh_sentinel.trace_increment = 73.0;
+  refresh_sentinel.interior_increment = -19.0;
+  refresh_sentinel.initial_residual_norm = 11.0;
+  refresh_sentinel.reduced_rhs_norm = 13.0;
+  refresh_sentinel.linear_residual_norm = 17.0;
   ok = !Run(communicator, layout, quads, source_space, nonfinite_source, 0.05,
-            preserved, &scratch) &&
-      preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
-      preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
-      preserved.initial_residual_norm == 11.0 && preserved.reduced_rhs_norm == 13.0 &&
-      preserved.linear_residual_norm == 17.0;
+            refresh_sentinel, &scratch) &&
+      AllEqual(refresh_sentinel.trace_increment, 73.0) &&
+      AllEqual(refresh_sentinel.interior_increment, -19.0) &&
+      refresh_sentinel.initial_residual_norm == 11.0 &&
+      refresh_sentinel.reduced_rhs_norm == 13.0 &&
+      refresh_sentinel.linear_residual_norm == 17.0;
   if (!Require(communicator, ok, "nonfinite refresh preservation")) { return false; }
   std::vector<local::AffineQuad> topology_drift = quads;
   if (!topology_drift.empty()) { topology_drift.pop_back(); }
   ok = !Run(communicator, layout, topology_drift, source_space, source_a, 0.05,
-            preserved, &scratch) &&
-      preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
-      preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
-      preserved.initial_residual_norm == 11.0 && preserved.reduced_rhs_norm == 13.0 &&
-      preserved.linear_residual_norm == 17.0;
+            refresh_sentinel, &scratch) &&
+      AllEqual(refresh_sentinel.trace_increment, 73.0) &&
+      AllEqual(refresh_sentinel.interior_increment, -19.0) &&
+      refresh_sentinel.initial_residual_norm == 11.0 &&
+      refresh_sentinel.reduced_rhs_norm == 13.0 &&
+      refresh_sentinel.linear_residual_norm == 17.0;
   if (!Require(communicator, ok, "topology drift preservation")) { return false; }
   detail::TracedScalarIgrP1GlobalStepOutput recovered_after_failure;
-  ok = Run(communicator, layout, quads, source_space, source_a, 0.05,
-           recovered_after_failure, &scratch) &&
+  ok = RunScratchSuccess(communicator, layout, quads, source_space, source_a,
+                         0.05, recovered_after_failure, scratch) &&
       SameBits(recovered_after_failure.trace_increment,
                scratch_first.trace_increment) &&
       SameBits(recovered_after_failure.interior_increment,
@@ -965,7 +1004,20 @@ bool Check(const MPI_Comm communicator)
       preserved.initial_residual_norm == 11.0 &&
       preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0 &&
       scratch.IsUsable();
-  return Require(communicator, ok, "structural failure preservation");
+  if (!Require(communicator, ok, "structural failure preservation")) return false;
+
+  detail::TracedScalarIgrP1Scratch no_retry(communicator, layout);
+  const detail::TracedScalarIgrP1GlobalStepInput null_initialize{
+      MPI_COMM_NULL, &layout, quads.data(), static_cast<int>(quads.size()),
+      alias_parameters, &classified_current_trace, &classified_previous_trace,
+      &aliased_current_interior, &aliased_previous_interior, nullptr, nullptr};
+  const detail::TracedScalarIgrP1GlobalStepInput valid_initialize{
+      communicator, &layout, quads.data(), static_cast<int>(quads.size()),
+      alias_parameters, &classified_current_trace, &classified_previous_trace,
+      &aliased_current_interior, &aliased_previous_interior, nullptr, nullptr};
+  ok = !no_retry.Initialize(null_initialize) && !no_retry.IsUsable() &&
+      !no_retry.Initialize(valid_initialize) && !no_retry.IsReady();
+  return Require(communicator, ok, "failed initialization cannot retry");
 }
 
 } // namespace

@@ -382,13 +382,19 @@ Status HostReferenceEngine::Prepare(const LocalBlockShape& shape,
       !Multiply(ni, nt + 1, work_count)) return Status::overflow;
   try
   {
-    lu_.resize(lu_count); b_.resize(b_count); c_.resize(c_count);
-    d_.resize(d_count); f_.resize(f_count); pivots_.resize(f_count);
-    staged_lu_.resize(lu_count); staged_b_.resize(b_count);
-    staged_c_.resize(c_count); staged_d_.resize(d_count);
-    staged_f_.resize(f_count); staged_pivots_.resize(f_count);
-    staged_schur_.resize(d_count); staged_rhs_.resize(rhs_count);
-    work_.resize(work_count); recovered_.resize(f_count);
+    std::vector<double> next_lu(lu_count), next_b(b_count), next_c(c_count),
+        next_d(d_count), next_f(f_count), next_staged_lu(lu_count),
+        next_staged_b(b_count), next_staged_c(c_count), next_staged_d(d_count),
+        next_staged_f(f_count), next_staged_schur(d_count),
+        next_staged_rhs(rhs_count), next_work(work_count), next_recovered(f_count);
+    std::vector<int> next_pivots(f_count), next_staged_pivots(f_count);
+    lu_.swap(next_lu); b_.swap(next_b); c_.swap(next_c); d_.swap(next_d);
+    f_.swap(next_f); pivots_.swap(next_pivots);
+    staged_lu_.swap(next_staged_lu); staged_b_.swap(next_staged_b);
+    staged_c_.swap(next_staged_c); staged_d_.swap(next_staged_d);
+    staged_f_.swap(next_staged_f); staged_pivots_.swap(next_staged_pivots);
+    staged_schur_.swap(next_staged_schur); staged_rhs_.swap(next_staged_rhs);
+    work_.swap(next_work); recovered_.swap(next_recovered);
   }
   catch (const std::bad_alloc&) { return Status::allocation_failure; }
   catch (const std::length_error&) { return Status::allocation_failure; }
@@ -435,7 +441,9 @@ Status HostReferenceEngine::Condense(const LocalSystemBatchView& input,
       shape_.trace_dofs == input.shape.trace_dofs &&
       shape_.interior_components == input.shape.interior_components &&
       shape_.trace_components == input.shape.trace_components &&
-      batch_count_ == batches && staged_lu_.size() == lu_count &&
+      batch_count_ == batches && lu_.size() == lu_count && b_.size() == b_count &&
+      c_.size() == c_count && d_.size() == d_count && f_.size() == f_count &&
+      pivots_.size() == f_count && staged_lu_.size() == lu_count &&
       staged_b_.size() == b_count && staged_c_.size() == c_count &&
       staged_d_.size() == d_count && staged_f_.size() == f_count &&
       staged_pivots_.size() == f_count && staged_schur_.size() == d_count &&
@@ -518,13 +526,18 @@ Status HostReferenceEngine::ApplySchur(const StridedBlockView<const double> trac
   const Status result_status = ValidateWritable(result,batch_count_,nt,1);
   if (result_status != Status::success) { return result_status; }
   try {
-    std::vector<double> staged(batch_count_*nt), local(ni);
+    const bool prepared = staged_rhs_.size() == batch_count_ * nt &&
+        work_.size() >= ni;
+    std::vector<double> staged, local;
+    std::vector<double>& staged_values = prepared ? staged_rhs_ : staged;
+    std::vector<double>& local_values = prepared ? work_ : local;
+    if (!prepared) { staged_values.resize(batch_count_*nt); local_values.resize(ni); }
     for (std::size_t batch=0;batch<batch_count_;++batch) {
-      for (std::size_t i=0;i<ni;++i) { local[i]=0.; for (std::size_t j=0;j<nt;++j) { if(!std::isfinite(trace(batch,j,0))) return Status::non_finite; local[i]+=b_[batch*ni*nt+i*nt+j]*trace(batch,j,0); } }
-      if (!Solve(lu_.data()+batch*ni*ni,pivots_.data()+batch*ni,ni,local.data(),1)) return Status::non_finite;
-      for (std::size_t row=0;row<nt;++row) { staged[batch*nt+row]=0.; for(std::size_t col=0;col<nt;++col) staged[batch*nt+row]+=d_[batch*nt*nt+row*nt+col]*trace(batch,col,0); for(std::size_t k=0;k<ni;++k) staged[batch*nt+row]-=c_[batch*nt*ni+row*ni+k]*local[k]; if(!std::isfinite(staged[batch*nt+row])) return Status::non_finite; }
+      for (std::size_t i=0;i<ni;++i) { local_values[i]=0.; for (std::size_t j=0;j<nt;++j) { if(!std::isfinite(trace(batch,j,0))) return Status::non_finite; local_values[i]+=b_[batch*ni*nt+i*nt+j]*trace(batch,j,0); } }
+      if (!Solve(lu_.data()+batch*ni*ni,pivots_.data()+batch*ni,ni,local_values.data(),1)) return Status::non_finite;
+      for (std::size_t row=0;row<nt;++row) { staged_values[batch*nt+row]=0.; for(std::size_t col=0;col<nt;++col) staged_values[batch*nt+row]+=d_[batch*nt*nt+row*nt+col]*trace(batch,col,0); for(std::size_t k=0;k<ni;++k) staged_values[batch*nt+row]-=c_[batch*nt*ni+row*ni+k]*local_values[k]; if(!std::isfinite(staged_values[batch*nt+row])) return Status::non_finite; }
     }
-    for(std::size_t batch=0;batch<batch_count_;++batch) CopyOut(staged.data()+batch*nt,nt,1,result,batch);
+    for(std::size_t batch=0;batch<batch_count_;++batch) CopyOut(staged_values.data()+batch*nt,nt,1,result,batch);
     return Status::success;
   } catch(const std::bad_alloc&) { return Status::allocation_failure; }
   catch(const std::length_error&) { return Status::allocation_failure; }

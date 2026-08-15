@@ -70,7 +70,8 @@ private:
   std::vector<int> pivots_;
   // Private fixed staging used by prepared repeated Condense/Recover calls.
   std::vector<double> staged_lu_, staged_b_, staged_c_, staged_d_, staged_f_,
-      staged_schur_, staged_rhs_;
+      staged_schur_;
+  mutable std::vector<double> staged_rhs_;
   mutable std::vector<double> work_, recovered_;
   std::vector<int> staged_pivots_;
 };

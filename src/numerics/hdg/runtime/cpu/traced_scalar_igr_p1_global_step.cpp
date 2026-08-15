@@ -141,13 +141,15 @@ bool SourceIsZero(const TracedScalarIgrP1GlobalStepInput& input) noexcept
       input.static_euler_rhs_coefficients->Size() == 0;
 }
 
-bool CaptureSourceElementVDofs(const mfem::ParFiniteElementSpace* const space,
-                               const int elements,
-                               std::vector<int>& destination) noexcept
+bool CaptureElementVDofs(const mfem::ParFiniteElementSpace* const space,
+                         const int elements, const int expected_per_element,
+                         std::vector<int>& destination) noexcept
 {
-  if (space == nullptr) { destination.clear(); return true; }
+  if (space == nullptr || expected_per_element <= 0) { return false; }
   std::size_t entries = 0;
-  if (!CheckedBatchCapacity(elements, 16, entries)) { return false; }
+  if (!CheckedBatchCapacity(elements,
+                            static_cast<std::size_t>(expected_per_element),
+                            entries)) { return false; }
   try
   {
     destination.resize(entries);
@@ -155,13 +157,16 @@ bool CaptureSourceElementVDofs(const mfem::ParFiniteElementSpace* const space,
     {
       mfem::Array<int> vdofs;
       space->GetElementVDofs(element, vdofs);
-      if (vdofs.Size() != 16 || vdofs.HostRead() == nullptr) { return false; }
-      for (int index = 0; index < 16; ++index)
+      if (vdofs.Size() != expected_per_element || vdofs.HostRead() == nullptr)
+        return false;
+      for (int index = 0; index < expected_per_element; ++index)
       {
         double sign = 1.0;
         const int vdof = DecodeSignedVDof(vdofs[index], sign);
         if (vdof < 0 || vdof >= space->GetVSize()) { return false; }
-        destination[static_cast<std::size_t>(element) * 16 + index] = vdofs[index];
+        destination[static_cast<std::size_t>(element) *
+                        static_cast<std::size_t>(expected_per_element) + index] =
+            vdofs[index];
       }
     }
     return true;
@@ -218,7 +223,7 @@ bool FillElementSource(const mfem::ParFiniteElementSpace* source_space,
                        const mfem::Vector* source_coefficients,
                        const int* const bound_signed_vdofs,
                        const int element, const mfem::IntegrationRule& rule,
-                       double* samples) noexcept
+                       double* samples, mfem::Vector& shape) noexcept
 {
   if (source_coefficients == nullptr || source_coefficients->Size() == 0)
   {
@@ -239,16 +244,17 @@ bool FillElementSource(const mfem::ParFiniteElementSpace* source_space,
   }
   const double* const coefficients = source_coefficients->HostRead();
   if (coefficients == nullptr) { return false; }
-  mfem::Array<int> fallback_vdofs;
-  const int* signed_vdofs = bound_signed_vdofs;
-  if (signed_vdofs == nullptr)
+  if (bound_signed_vdofs == nullptr)
   {
+    mfem::Array<int> fallback_vdofs;
     source_space->GetElementVDofs(element, fallback_vdofs);
     if (fallback_vdofs.Size() != 16) { return false; }
-    signed_vdofs = fallback_vdofs.HostRead();
+    return FillElementSource(source_space, source_coefficients,
+                             fallback_vdofs.HostRead(), element, rule, samples,
+                             shape);
   }
-  if (signed_vdofs == nullptr) { return false; }
-  mfem::Vector shape(4);
+  const int* const signed_vdofs = bound_signed_vdofs;
+  if (shape.Size() != 4) { return false; }
   for (int point = 0; point < rule.GetNPoints(); ++point)
   {
     finite_element->CalcShape(rule.IntPoint(point), shape);
@@ -1276,6 +1282,8 @@ struct EphemeralStepState final
   mfem::Vector previous_element_trace;
   std::vector<local::LocalOperator> operators;
   const std::vector<int>* source_element_vdofs = nullptr;
+  const std::vector<int>* trace_element_vdofs = nullptr;
+  mfem::Vector source_shape;
   core::HostReferenceEngine condensation;
   mfem::Vector local_rhs;
   mfem::Vector true_rhs_values;
@@ -1297,6 +1305,7 @@ struct TracedScalarIgrP1Scratch::Implementation final
   const mfem::ParFiniteElementSpace* source_space = nullptr;
   long source_sequence = -1;
   std::vector<int> source_element_vdofs;
+  std::vector<int> trace_element_vdofs;
   EphemeralStepState state{};
   RetainedTraceSystem retained{};
   bool retained_initialized = false;
@@ -1365,6 +1374,7 @@ struct TracedScalarIgrP1Scratch::Implementation final
         state.previous_element_interior.Size() == 28 &&
         state.current_element_trace.Size() == 40 &&
         state.previous_element_trace.Size() == 40 &&
+        state.source_shape.Size() == 4 &&
         state.solve_and_recovery.HasExpectedStorage(
             trace_true_size, trace_local_size, interior_size, elements) &&
         (!retained_initialized ||
@@ -1382,7 +1392,9 @@ struct TracedScalarIgrP1Scratch::Implementation final
          (source_space != nullptr && source_space->GetSequence() == source_sequence &&
           source_element_vdofs.size() == static_cast<std::size_t>(elements) * 16));
     return initialized && StorageMatches(input) && source_matches &&
-        state.source_element_vdofs == &source_element_vdofs;
+        state.source_element_vdofs == &source_element_vdofs &&
+        state.trace_element_vdofs == &trace_element_vdofs &&
+        trace_element_vdofs.size() == static_cast<std::size_t>(elements) * 40;
   }
 };
 
@@ -1439,6 +1451,7 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
     if (state.previous_element_interior.Size() != 28) state.previous_element_interior.SetSize(28);
     if (state.current_element_trace.Size() != 40) state.current_element_trace.SetSize(40);
     if (state.previous_element_trace.Size() != 40) state.previous_element_trace.SetSize(40);
+    if (state.source_shape.Size() != 4) state.source_shape.SetSize(4);
     if (state.operators.size() != static_cast<std::size_t>(elements))
       state.operators.resize(static_cast<std::size_t>(elements));
     const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
@@ -1504,7 +1517,8 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
                             volume_rule,
                             source_samples.data() +
                                 static_cast<std::size_t>(element) *
-                                    static_cast<std::size_t>(volume_rule.GetNPoints()) * 4);
+                                    static_cast<std::size_t>(volume_rule.GetNPoints()) * 4,
+                            state.source_shape);
       local::LocalOperator& operator_data = state.operators[
           static_cast<std::size_t>(element)];
       if (local_ok)
@@ -1563,13 +1577,38 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
     raw_true_trace.SetSize(layout.TraceTrueVSize()); raw_true_trace = 0.0;
     for (int element = 0; element < elements && local_ok; ++element)
     {
-      mfem::Array<int> vdofs;
-      trace_space->GetElementVDofs(element, vdofs);
-      local_ok = vdofs.Size() == 40;
+      const int* signed_vdofs = nullptr;
+      if (state.trace_element_vdofs != nullptr)
+      {
+        signed_vdofs = state.trace_element_vdofs->data() +
+            static_cast<std::size_t>(element) * 40;
+      }
+      else
+      {
+        mfem::Array<int> fallback_vdofs;
+        trace_space->GetElementVDofs(element, fallback_vdofs);
+        local_ok = fallback_vdofs.Size() == 40;
+        signed_vdofs = local_ok ? fallback_vdofs.HostRead() : nullptr;
+        if (!local_ok || signed_vdofs == nullptr) { break; }
+        for (int row = 0; row < 40 && local_ok; ++row)
+        {
+          double sign = 1.0;
+          const int vdof = DecodeSignedVDof(signed_vdofs[row], sign);
+          local_ok = vdof >= 0 && vdof < raw_local_trace.Size();
+          if (local_ok)
+          {
+            raw_local_trace[vdof] += sign *
+                g[static_cast<std::size_t>(element) * 40 + row];
+            local_ok = Finite(raw_local_trace[vdof]);
+          }
+        }
+        continue;
+      }
+      local_ok = local_ok && signed_vdofs != nullptr;
       for (int row = 0; row < 40 && local_ok; ++row)
       {
         double sign = 1.0;
-        const int vdof = DecodeSignedVDof(vdofs[row], sign);
+        const int vdof = DecodeSignedVDof(signed_vdofs[row], sign);
         local_ok = vdof >= 0 && vdof < raw_local_trace.Size();
         if (local_ok)
         {
@@ -1865,8 +1904,10 @@ TracedScalarIgrP1Scratch::TracedScalarIgrP1Scratch(
     state.state.previous_element_interior.SetSize(28);
     state.state.current_element_trace.SetSize(40);
     state.state.previous_element_trace.SetSize(40);
+    state.state.source_shape.SetSize(4);
     state.state.operators.resize(static_cast<std::size_t>(elements));
     state.state.source_element_vdofs = &state.source_element_vdofs;
+    state.state.trace_element_vdofs = &state.trace_element_vdofs;
     if (!state.StorageMatches(binding)) { implementation_.reset(); }
   }
   catch (...) { implementation_.reset(); }
@@ -1881,7 +1922,15 @@ TracedScalarIgrP1Scratch& TracedScalarIgrP1Scratch::operator=(
 bool TracedScalarIgrP1Scratch::Initialize(
     const TracedScalarIgrP1GlobalStepInput& input) noexcept
 {
-  if (input.communicator == MPI_COMM_NULL) { return false; }
+  if (input.communicator == MPI_COMM_NULL)
+  {
+    if (implementation_)
+    {
+      implementation_->initialization_attempted = true;
+      implementation_->initialization_poisoned = true;
+    }
+    return false;
+  }
   const bool local_admission = implementation_ != nullptr &&
       !implementation_->initialization_attempted &&
       implementation_->StorageMatches(input) && ValidInput(input);
@@ -1903,8 +1952,11 @@ bool TracedScalarIgrP1Scratch::Initialize(
       (void)mfem::IntRules.Get(mfem::Geometry::SQUARE, order);
       (void)mfem::IntRules.Get(mfem::Geometry::SEGMENT, order);
     }
-    local_ok = CaptureSourceElementVDofs(implementation.source_space,
-        implementation.elements, implementation.source_element_vdofs) &&
+    local_ok = CaptureElementVDofs(implementation.trace_space,
+        implementation.elements, 40, implementation.trace_element_vdofs) &&
+        (implementation.source_space == nullptr || CaptureElementVDofs(
+            implementation.source_space, implementation.elements, 16,
+            implementation.source_element_vdofs)) &&
         implementation.state.condensation.Prepare({4, 8, 7, 5},
             static_cast<std::size_t>(implementation.elements)) == core::Status::success;
     if (local_ok)
