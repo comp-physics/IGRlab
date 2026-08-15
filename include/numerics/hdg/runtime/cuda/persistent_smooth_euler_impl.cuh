@@ -740,6 +740,11 @@ bool CudaLaunchTrial(const CudaDeviceView& view,
 bool CudaLaunchLocalSquaredNorm(const double* first, int first_count,
                                 const double* second, int second_count,
                                 double* result) noexcept;
+bool CudaLaunchMaximumWave(const CudaDeviceView& view,
+                           const CudaMeshShape& shape,
+                           const double* interior,
+                           const double* element_trace,
+                           double* result) noexcept;
 bool CudaLaunchHash(const double* values, int count,
                     std::uint64_t* words) noexcept;
 
@@ -966,6 +971,49 @@ public:
   const std::array<CudaDeviceTicket, maximum_device_tickets>& Tickets()
       const noexcept { return tickets_; }
   std::size_t TicketCount() const noexcept { return ticket_count_; }
+
+  bool CommittedBorrowedEulerDiagnostics(const state_slot& committed,
+                                         const int order,
+                                         double& maximum_wave_speed,
+                                         double& backend_stable_dt) noexcept
+  {
+    maximum_wave_speed = 0.0;
+    backend_stable_dt = std::numeric_limits<double>::quiet_NaN();
+    const bool local_slot_valid = initialized_ && shape_.borrowed_host_inputs &&
+        committed.interior.coefficients != nullptr &&
+        committed.trace.coefficients != nullptr && local_hmin_ > 0.0 &&
+        std::isfinite(local_hmin_);
+    if (!CollectiveContinue(local_slot_valid)) return false;
+    const bool trace_ready = DistributeCurrentTrace(committed.trace.coefficients);
+    const bool launched = trace_ready && CudaLaunchMaximumWave(
+        view_, shape_, committed.interior.coefficients,
+        view_.current_local_trace, view_.scalar) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!CollectiveContinue(launched)) return false;
+    const bool copied = TransportPolicy::DeviceToHost(
+        host_cfl_scalars_.data(), view_.scalar,
+        host_cfl_scalars_.size() * sizeof(double),
+        CudaTransferCategory::scalar_diagnostic,
+        CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!CollectiveContinue(copied && host_cfl_scalars_[1] == 1.0 &&
+                            std::isfinite(host_cfl_scalars_[0]) &&
+                            host_cfl_scalars_[0] >= 0.0)) return false;
+    double global_hmin = local_hmin_;
+    maximum_wave_speed = host_cfl_scalars_[0];
+    const bool hmin_reduced = MPI_Allreduce(&local_hmin_, &global_hmin, 1,
+        MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool wave_reduced = MPI_Allreduce(&host_cfl_scalars_[0],
+        &maximum_wave_speed, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+    const double denominator = 2.0 * static_cast<double>(order) + 1.0;
+    backend_stable_dt = maximum_wave_speed > 0.0
+        ? global_hmin / (denominator * maximum_wave_speed)
+        : global_hmin / denominator;
+    return CollectiveContinue(hmin_reduced && wave_reduced &&
+        std::isfinite(global_hmin) && global_hmin > 0.0 &&
+        std::isfinite(maximum_wave_speed) && maximum_wave_speed >= 0.0 &&
+        std::isfinite(backend_stable_dt) && backend_stable_dt > 0.0);
+  }
 
   bool CollectiveContinue(const bool local) const noexcept
   {
@@ -1289,7 +1337,7 @@ public:
     const bool assembly_ticket = initialized_ &&
         Ticket(CudaFailurePhase::assembly);
     if (!CollectiveContinue(assembly_ticket) ||
-        !AssembleAndNorm(workspace, result.initial_residual))
+        !AssembleAndNorm(workspace, attempt.dt, result.initial_residual))
     {
       result.reason = FailureReason::finite_gate;
       return result;
@@ -1382,7 +1430,7 @@ public:
           continue;
         }
         double trial_residual = std::numeric_limits<double>::infinity();
-        if (!AssembleAndNorm(workspace, trial_residual) ||
+        if (!AssembleAndNorm(workspace, attempt.dt, trial_residual) ||
             !std::isfinite(trial_residual))
         {
           result.reason = FailureReason::finite_gate;
@@ -2302,7 +2350,8 @@ private:
   bool AssembleTrueSystem() noexcept;
   bool SolveTrueSystem(double& true_relative_residual,
                        std::uint64_t matrix_generation) noexcept;
-  bool AssembleAndNorm(state_slot& workspace, double& norm) noexcept;
+  bool AssembleAndNorm(state_slot& workspace, double dt,
+                       double& norm) noexcept;
   bool CopyBase(state_slot& workspace) noexcept;
   bool RestoreBase(state_slot& workspace) noexcept;
   bool SwapTrialIntoWorkspace(state_slot& workspace) noexcept;
@@ -2391,6 +2440,8 @@ private:
   std::uint64_t accepted_allocation_events_ = 0;
   std::uint64_t baseline_w8_owned_allocation_calls_ = 0;
   std::uint64_t baseline_deallocation_events_ = 0;
+  double local_hmin_ = std::numeric_limits<double>::infinity();
+  std::array<double, 2> host_cfl_scalars_{{0.0, 0.0}};
   bool allocation_plateau_sampled_ = false;
   std::size_t host_exchange_bytes_ = 0;
   std::array<CudaDeviceTicket, maximum_device_tickets> tickets_{};

@@ -7,6 +7,22 @@ endif()
 if(NOT DEFINED HDG_MAIN_ORDER)
   set(HDG_MAIN_ORDER 1)
 endif()
+if(NOT DEFINED HDG_MAIN_DT)
+  set(HDG_MAIN_DT 0.05)
+endif()
+if(NOT DEFINED HDG_MAIN_T_FINAL)
+  set(HDG_MAIN_T_FINAL 0.10)
+endif()
+if(NOT DEFINED HDG_MAIN_DT_SAVE)
+  set(HDG_MAIN_DT_SAVE 0.05)
+endif()
+if(NOT DEFINED HDG_MAIN_EXPECTED_STEPS)
+  set(HDG_MAIN_EXPECTED_STEPS 2)
+endif()
+if(HDG_MAIN_DT STREQUAL "0.03" AND HDG_MAIN_T_FINAL STREQUAL "0.10" AND
+   HDG_MAIN_DT_SAVE STREQUAL "0.05")
+  set(HDG_MAIN_EXPECTED_STEPS 4)
+endif()
 if(NOT DEFINED HDG_MAIN_N)
   set(HDG_MAIN_N 3)
 endif()
@@ -40,13 +56,16 @@ set(_arguments
   --order "${HDG_MAIN_ORDER}"
   --serial-refine "${HDG_MAIN_SERIAL_REFINE}"
   --parallel-refine "${HDG_MAIN_PARALLEL_REFINE}"
-  --time-step 0.05
-  --t-final 0.10
+  --time-step "${HDG_MAIN_DT}"
+  --t-final "${HDG_MAIN_T_FINAL}"
   --no-glvis)
+if(DEFINED HDG_MAIN_CFL)
+  list(APPEND _arguments --cfl-number "${HDG_MAIN_CFL}")
+endif()
 if(HDG_MAIN_NO_VTK)
   list(APPEND _arguments --no-vtk_save)
 else()
-  list(APPEND _arguments --time-step-save 0.05 --vtk_save)
+  list(APPEND _arguments --time-step-save "${HDG_MAIN_DT_SAVE}" --vtk_save)
 endif()
 
 if(HDG_MAIN_RANKS EQUAL 1)
@@ -67,7 +86,7 @@ else()
 endif()
 
 if(NOT _status EQUAL 0 OR
-   NOT _stdout MATCHES "\\[hdg-main\\] status=Success.*step=2.*time=0\\.1" OR
+   NOT _stdout MATCHES "\\[hdg-main\\] status=Success.*step=${HDG_MAIN_EXPECTED_STEPS}" OR
    NOT _stderr STREQUAL "")
   message(FATAL_ERROR
     "generic CUDA HDG main execution failed: ${_status}\n${_stdout}\n${_stderr}")

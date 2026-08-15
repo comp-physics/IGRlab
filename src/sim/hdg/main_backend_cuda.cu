@@ -49,6 +49,19 @@ bool CollectiveAll(const bool local) noexcept
                        MPI_COMM_WORLD) == MPI_SUCCESS && output == 1;
 }
 
+bool ExactDoubleConsensus(const double value) noexcept
+{
+  std::uint64_t bits = 0, minimum = 0, maximum = 0;
+  static_assert(sizeof(bits) == sizeof(value), "CUDA CFL requires binary64");
+  std::memcpy(&bits, &value, sizeof(bits));
+  const int minimum_status = MPI_Allreduce(&bits, &minimum, 1,
+      MPI_UINT64_T, MPI_MIN, MPI_COMM_WORLD);
+  const int maximum_status = MPI_Allreduce(&bits, &maximum, 1,
+      MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+  return minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS &&
+      minimum == maximum;
+}
+
 int Reject(const std::string& reason) noexcept
 {
   if (IsRoot())
@@ -69,23 +82,6 @@ bool WorldCongruent(const MPI_Comm communicator) noexcept
       (ranks == 1 || ranks == 2) &&
       MPI_Comm_compare(communicator, MPI_COMM_WORLD, &comparison) == MPI_SUCCESS &&
       (comparison == MPI_IDENT || comparison == MPI_CONGRUENT);
-}
-
-bool ExactFixedDt(const double value) noexcept
-{
-  const double fixed = dg::hdg::runtime::cuda_w8a::fixed_dt;
-  return std::isfinite(value) && std::memcmp(&value, &fixed, sizeof(value)) == 0;
-}
-
-bool IntegralMultiple(const double value, const double increment) noexcept
-{
-  if (!std::isfinite(value) || value <= 0.0 || !ExactFixedDt(increment))
-    return false;
-  const double count = value / increment;
-  const double rounded = std::round(count);
-  return rounded >= 1.0 &&
-      rounded <= static_cast<double>(std::numeric_limits<std::uint64_t>::max()) &&
-      value == rounded * increment;
 }
 
 bool OnlyPeriodic(const EulerBoundaryPlan& plan) noexcept
@@ -168,20 +164,23 @@ std::string Validate(const HdgEulerMainRequest& request)
     return "generic CUDA HDG restart/state-file routes are unsupported";
   if (request.options.glvis)
     return "generic CUDA HDG GLVis is unsupported";
-  if (!ExactFixedDt(request.options.dt))
-    return "generic CUDA HDG requires --time-step 0.05";
-  if (!IntegralMultiple(request.options.t_final, request.options.dt))
-    return "generic CUDA HDG requires integral 0.05 final-time steps";
+  if (!std::isfinite(request.options.dt))
+    return "CUDA HDG --time-step must be finite";
+  if (request.options.dt <= 0.0 &&
+      (!std::isfinite(request.options.cfl) || request.options.cfl <= 0.0))
+    return "CUDA CFL Backward Euler requires a finite positive --cfl-number";
+  if (!std::isfinite(request.options.dt_min) || request.options.dt_min < 0.0)
+    return "CUDA HDG --dt-min must be finite and non-negative";
+  if (!std::isfinite(request.options.t_final) || request.options.t_final <= 0.0)
+    return "CUDA HDG final time must be finite and positive";
   if (request.options.vtk_save &&
-      !IntegralMultiple(request.options.dt_save, request.options.dt))
-    return "generic CUDA HDG requires a positive integral 0.05 ParaView cadence";
+      (!std::isfinite(request.options.dt_save) || request.options.dt_save <= 0.0))
+    return "CUDA HDG ParaView output requires a positive --time-step-save";
   if (request.options.order != dg::hdg::runtime::cuda_w8a::smoke_polynomial_order &&
       request.options.order != dg::hdg::runtime::cuda_w8a::functional_polynomial_order)
     return "generic CUDA HDG admits only p1 or p2";
   if (request.options.ser_ref_levels < 0 || request.options.par_ref_levels < 0)
     return "generic CUDA HDG refinement levels must be nonnegative";
-  if (request.options.cfl != CommonOptions{}.cfl)
-    return "generic CUDA HDG does not admit a caller-selected CFL control";
   if (request.initial_condition.GetVDim() !=
       dg::hdg::runtime::cuda_w8a::conserved_components)
     return "generic CUDA HDG requires a four-component Euler IC";
@@ -232,31 +231,6 @@ bool FreshOutputView(mfem::ParGridFunction& published_state,
   catch (...) { return false; }
 }
 
-bool ScheduleIsExactlyAdmitted(const CommonOptions& options) noexcept
-{
-  try
-  {
-    const auto schedule = options.vtk_save
-        ? HdgTransactionalTimeAdapter::OutputSchedule::FixedInterval(
-            options.dt_save, time::backend::InitialOutputPolicy::Emit,
-            time::backend::FinalOutputPolicy::Emit)
-        : HdgTransactionalTimeAdapter::OutputSchedule::Disabled(
-            time::backend::InitialOutputPolicy::Suppress,
-            time::backend::FinalOutputPolicy::Suppress);
-    HdgTransactionalTimeAdapter cursor(
-        HdgTransactionalTimeAdapter::TimeControl::Fixed(
-            0.0, options.t_final, options.dt), schedule,
-        HdgTimeControlMode::FixedBackwardEuler);
-    while (!cursor.Finished())
-    {
-      if (!ExactFixedDt(cursor.BeginStep().dt)) return false;
-      static_cast<void>(cursor.FinalizeSuccess());
-    }
-    return cursor.time() == options.t_final;
-  }
-  catch (...) { return false; }
-}
-
 } // namespace
 
 int RunEulerMainBackend(const HdgEulerMainRequest& request)
@@ -287,8 +261,6 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
                                  : reason);
   if (!ExactTextConsensus(consensus))
     return Reject("CUDA HDG configuration differs between MPI ranks");
-  if (!CollectiveAll(ScheduleIsExactlyAdmitted(request.options)))
-    return Reject("CUDA HDG time/output schedule is not exactly fixed-grid");
 
   std::optional<mfem::Mesh> serial_mesh;
   std::string serialized_mesh;
@@ -445,9 +417,14 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   std::unique_ptr<HDGParaViewSeries> output;
   try
   {
+    const bool cfl_control = request.options.dt <= 0.0;
+    const auto control = cfl_control
+        ? HdgTransactionalTimeAdapter::TimeControl::CFL(
+              0.0, request.options.t_final, request.options.cfl)
+        : HdgTransactionalTimeAdapter::TimeControl::Fixed(
+              0.0, request.options.t_final, request.options.dt);
     time_driver = std::make_unique<HdgTransactionalTimeAdapter>(
-        HdgTransactionalTimeAdapter::TimeControl::Fixed(
-            0.0, request.options.t_final, request.options.dt),
+        control,
         request.options.vtk_save
             ? HdgTransactionalTimeAdapter::OutputSchedule::FixedInterval(
                 request.options.dt_save,
@@ -456,7 +433,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
             : HdgTransactionalTimeAdapter::OutputSchedule::Disabled(
                 time::backend::InitialOutputPolicy::Suppress,
                 time::backend::FinalOutputPolicy::Suppress),
-        HdgTimeControlMode::FixedBackwardEuler);
+        cfl_control ? HdgTimeControlMode::CFLBackwardEuler
+                    : HdgTimeControlMode::FixedBackwardEuler);
     if (request.options.vtk_save)
     {
       const mfem::io::VTKOutputConfig vtk = MakeCaseVTKConfig(request.case_config);
@@ -485,15 +463,33 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
 
   while (!time_driver->Finished())
   {
-    const auto& plan = time_driver->BeginStep();
-    if (!CollectiveAll(ExactFixedDt(plan.dt)))
+    double proposed_dt = 0.0;
+    if (time_driver->mode() == HdgTimeControlMode::CFLBackwardEuler)
     {
-      time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
-      return Reject("CUDA HDG time planner produced a non-fixed step");
+      const auto diagnostics = session.diagnostics();
+      const bool diagnostics_ready =
+          dg::hdg::generic::HasHdgEulerSessionCapabilities(
+              session.capabilities(),
+              dg::hdg::generic::HdgEulerSessionCapabilityBit(
+                  dg::hdg::generic::HdgEulerSessionCapability::
+                      committed_cfl_diagnostics)) &&
+          dg::hdg::generic::IsValidHdgEulerCommittedDiagnostics(
+              diagnostics, session.capabilities()) &&
+          diagnostics.coordinates.time == time_driver->time() &&
+          diagnostics.coordinates.step == time_driver->solver_step() &&
+          diagnostics.coordinates.generation == diagnostics.wave_generation;
+      proposed_dt = diagnostics.backend_stable_dt * request.options.cfl;
+      const bool proposal_valid = diagnostics_ready &&
+          std::isfinite(proposed_dt) && proposed_dt > 0.0 &&
+          (request.options.dt_min <= 0.0 || proposed_dt >= request.options.dt_min);
+      const bool proposal_consensus = ExactDoubleConsensus(proposed_dt);
+      if (!CollectiveAll(proposal_valid && proposal_consensus))
+        return Reject("committed CUDA CFL proposal is invalid or below --dt-min");
     }
+    const auto& plan = time_driver->BeginStep(proposed_dt, request.options.dt_min);
     GenericEulerCudaPreparedStep authority;
     CudaPreparedOutputMetadataV1 native_export{};
-    if (session.Prepare(authority, native_export).status !=
+    if (session.Prepare(plan.dt, authority, native_export).status !=
         HdgEulerSessionStatus::prepared)
     {
       time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);

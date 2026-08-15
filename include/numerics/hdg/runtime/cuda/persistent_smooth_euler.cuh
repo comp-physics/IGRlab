@@ -571,6 +571,17 @@ public:
       detail::ReportCudaSetupFailure(evidence.rank, "contract-ready");
       return false;
     }
+    if (config_.use_borrowed_host_inputs &&
+        !numerics_.CommittedBorrowedEulerDiagnostics(
+            numerics_.CommittedSlot(), config_.order,
+            committed_maximum_wave_speed_, committed_backend_stable_dt_))
+    {
+      evidence.status = CudaRunStatus::setup_failure;
+      evidence.setup_origin = FailureReason::backend_failure;
+      detail::ReportCudaSetupFailure(evidence.rank, "initial-cfl-diagnostics");
+      return false;
+    }
+    committed_diagnostics_valid_ = config_.use_borrowed_host_inputs;
     initialized_ = true;
     evidence.reuse = numerics_.ReuseEvidence();
     evidence.status = CudaRunStatus::ready;
@@ -580,12 +591,13 @@ public:
   /** Complete numerical work, freeze the contract candidate, and retain the
    * affine staging token internally.  No rank may stage before the final
    * all-rank prestaging agreement in this call. */
-  bool PrepareStep(const bool retry, CudaPrecommitSnapshot& snapshot,
+  bool PrepareStep(const bool retry, const double dt,
+                   CudaPrecommitSnapshot& snapshot,
                    CudaStepEvidence& evidence) noexcept
   {
     snapshot = {};
     if (pending_.active || !initialized_) { return false; }
-    if (!PreparePending(retry, evidence)) { return false; }
+    if (!PreparePending(retry, dt, evidence)) { return false; }
     if (!pending_.staging) { return false; }
     snapshot.attempt = pending_.attempt;
     snapshot.committed = pending_.staging->entry_coordinates();
@@ -603,6 +615,11 @@ public:
     snapshot.numerical_candidate_ready = pending_.numerical.candidate_ready;
     return true;
   }
+
+  /** Retained W8A entry point: false mode still advances at exactly .05. */
+  bool PrepareStep(const bool retry, CudaPrecommitSnapshot& snapshot,
+                   CudaStepEvidence& evidence) noexcept
+  { return PrepareStep(retry, fixed_dt, snapshot, evidence); }
 
   /** Token-validated candidate copy followed by real D2H checkpoint staging. */
   bool StagePreparedCheckpoint(CudaSerializedCheckpointV1& checkpoint,
@@ -845,11 +862,29 @@ public:
                           evidence);
     }
     if (!local_artifacts_publishable) return false;
+    // Compute trace-inclusive diagnostics from candidate slot 1 while the
+    // provisional authority remains reversible.  A failed scan reverts the
+    // provisional publication instead of rejecting after bytes are committed.
+    double candidate_maximum_wave_speed = 0.0;
+    double candidate_backend_stable_dt = std::numeric_limits<double>::quiet_NaN();
+    if (config_.use_borrowed_host_inputs &&
+        !numerics_.CommittedBorrowedEulerDiagnostics(
+            numerics_.CandidateSlot(), config_.order,
+            candidate_maximum_wave_speed, candidate_backend_stable_dt))
+      return RevertCommit(checkpoint, FailureReason::backend_failure, evidence);
     const AttemptOutcome outcome =
         contract_->FinalizeCommit(std::move(*pending_.provisional));
     pending_.provisional.reset();
     if (outcome.committed)
+    {
       numerics_.SwapPublishedSlotHandles();
+      if (config_.use_borrowed_host_inputs)
+      {
+        committed_maximum_wave_speed_ = candidate_maximum_wave_speed;
+        committed_backend_stable_dt_ = candidate_backend_stable_dt;
+        committed_diagnostics_valid_ = true;
+      }
+    }
     checkpoint.successful_commit = outcome.committed;
     FinishOutcome(outcome, pending_.evidence);
     if (pending_.has_oracle)
@@ -1012,6 +1047,14 @@ public:
     if (!initialized_ || pending_.active) { return false; }
     return numerics_.ExportInterior(numerics_.CommittedSlot().interior,
                                     destination);
+  }
+
+  bool CachedBorrowedEulerDiagnostics(double& maximum_wave_speed,
+                                      double& backend_stable_dt) const noexcept
+  {
+    maximum_wave_speed = committed_maximum_wave_speed_;
+    backend_stable_dt = committed_backend_stable_dt_;
+    return initialized_ && committed_diagnostics_valid_;
   }
 
   /** Export only the currently staged candidate; no logical publication occurs. */
@@ -1234,8 +1277,9 @@ private:
         topology_configuration &&
         generic_l2_configuration &&
         !fixed_oracle_requested_for_generic_storage &&
-        std::isfinite(config_.dt) &&
-        std::memcmp(&config_.dt, &fixed_dt, sizeof(double)) == 0 &&
+        std::isfinite(config_.dt) && config_.dt > 0.0 &&
+        (config_.use_borrowed_host_inputs ||
+         std::memcmp(&config_.dt, &fixed_dt, sizeof(double)) == 0) &&
         config_.requested_device == 0 &&
         (config_.expected_rank_count == 1 ||
          config_.expected_rank_count == 2) &&
@@ -1368,7 +1412,8 @@ private:
         minimum == maximum;
   }
 
-  bool PreparePending(const bool retry, CudaStepEvidence& evidence) noexcept
+  bool PreparePending(const bool retry, const double dt,
+                      CudaStepEvidence& evidence) noexcept
   {
     evidence = {};
     evidence.before = contract_->coordinates();
@@ -1381,8 +1426,11 @@ private:
     pending_.ledger_begin = TransportPolicy::Ledger().observed_count + 1;
     pending_.w8_owned_allocation_begin =
         AllocatorPolicy::W8OwnedAllocationCalls();
+    const bool dt_valid = std::isfinite(dt) && dt > 0.0 &&
+        (!retry || std::memcmp(&dt, &retained_retry_dt_, sizeof(double)) == 0);
+    if (!numerics_.CollectiveContinue(dt_valid)) return false;
     const BeginOutcome begin = retry ? contract_->Retry() :
-        contract_->BeginStep({InteriorSpace::l2, config_.dt});
+        contract_->BeginStep({InteriorSpace::l2, dt});
     evidence.attempt = begin.attempt;
     if (!begin.started)
     {
@@ -1455,6 +1503,7 @@ private:
     pending_.active = true;
     pending_.prestage_allowed = false;
     pending_.attempt = begin.attempt;
+    retained_retry_dt_ = begin.attempt.dt;
     pending_.report = report;
     pending_.bundle = std::move(bundle);
     pending_.numerical = adjusted;
@@ -1713,8 +1762,12 @@ private:
   PendingAttempt pending_{};
   CudaOraclePod last_oracle_{};
   std::uint64_t next_attempt_sequence_ = 0;
+  double retained_retry_dt_ = fixed_dt;
+  double committed_maximum_wave_speed_ = 0.0;
+  double committed_backend_stable_dt_ = std::numeric_limits<double>::quiet_NaN();
   std::uint64_t facade_incarnation_ = 0;
   bool initialized_ = false;
+  bool committed_diagnostics_valid_ = false;
   bool last_oracle_valid_ = false;
 };
 

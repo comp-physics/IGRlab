@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <new>
 #include <string_view>
 #include <type_traits>
@@ -261,18 +262,22 @@ bool CheckTransaction(const int ranks)
       HdgEulerSessionCapabilityBit(HdgEulerSessionCapability::prepared_commit) |
       HdgEulerSessionCapabilityBit(HdgEulerSessionCapability::prepared_output) |
       HdgEulerSessionCapabilityBit(
+          HdgEulerSessionCapability::committed_cfl_diagnostics) |
+      HdgEulerSessionCapabilityBit(
           HdgEulerSessionCapability::generic_borrowed_inputs);
   if (!All(initialized.status == HdgEulerSessionStatus::initialized &&
            session.capabilities() == expected_capabilities &&
            (session.capabilities() & HdgEulerSessionCapabilityBit(
-               HdgEulerSessionCapability::committed_cfl_diagnostics)) == 0 &&
+               HdgEulerSessionCapability::committed_cfl_diagnostics)) != 0 &&
+           dg::hdg::generic::IsValidHdgEulerCommittedDiagnostics(
+               session.diagnostics(), session.capabilities()) &&
            (session.capabilities() & HdgEulerSessionCapabilityBit(
                HdgEulerSessionCapability::generic_borrowed_inputs)) != 0))
     return false;
 
   GenericEulerCudaPreparedStep prepared{};
   GenericPreparedOutput native_export{};
-  const auto staged = session.Prepare(prepared, native_export);
+  const auto staged = session.Prepare(0.025, prepared, native_export);
   const auto before_commit = session.coordinates();
   const bool native_staged = staged.status == HdgEulerSessionStatus::prepared &&
       native_export.candidate_frozen && native_export.checkpoint_staged &&
@@ -314,7 +319,8 @@ bool CheckTransaction(const int ranks)
 
   GenericEulerCudaPreparedStep abort_authority{};
   GenericPreparedOutput aborted_export{};
-  const auto abort_prepared = session.Prepare(abort_authority, aborted_export);
+  const auto diagnostics_before_abort = session.diagnostics();
+  const auto abort_prepared = session.Prepare(0.013, abort_authority, aborted_export);
   GenericEulerHdgCudaSession foreign;
   const bool foreign_rejected = !foreign.AcknowledgePreparedOutput(
       abort_authority, aborted_export);
@@ -327,6 +333,10 @@ bool CheckTransaction(const int ranks)
              foreign_rejected && aborted.status == HdgEulerSessionStatus::aborted &&
              session.coordinates().step == after_commit.step &&
              session.coordinates().generation == after_commit.generation &&
+             session.diagnostics().coordinates.generation ==
+                 diagnostics_before_abort.coordinates.generation &&
+             session.diagnostics().backend_stable_dt ==
+                 diagnostics_before_abort.backend_stable_dt &&
              !aborted_export.candidate_frozen &&
              !aborted_export.checkpoint_staged && !aborted_export.output_staged &&
              !aborted_export.successful_commit && stale_rejected &&
@@ -335,7 +345,7 @@ bool CheckTransaction(const int ranks)
 
   GenericEulerCudaPreparedStep retry_authority{};
   GenericPreparedOutput retry_export{};
-  const auto retry_prepared = session.Prepare(retry_authority, retry_export);
+  const auto retry_prepared = session.Prepare(0.013, retry_authority, retry_export);
   const bool retry_acknowledged = session.AcknowledgePreparedOutput(
       retry_authority, retry_export);
   const auto retry_committed = session.Commit(std::move(retry_authority),
@@ -789,6 +799,41 @@ bool CheckBorrowedLaggedLlfHighWave(const int ranks, const int order,
              session.coordinates().time == 2.0 * fixed_dt);
 }
 
+bool CheckPreparedDtAdmission(const int ranks)
+{
+  mfem::Mesh serial = PeriodicSquareMesh(smoke_elements_per_direction);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
+  GenericEulerHdgCudaSession session;
+  if (!All(session.Initialize(BorrowedConfig(mesh, ranks,
+      smoke_polynomial_order, smoke_elements_per_direction)).status ==
+      HdgEulerSessionStatus::initialized)) return false;
+  GenericEulerCudaPreparedStep authority{};
+  GenericPreparedOutput output{};
+  const bool zero_rejected = session.Prepare(0.0, authority, output).status ==
+      HdgEulerSessionStatus::rejected;
+  const bool nan_rejected = session.Prepare(std::numeric_limits<double>::quiet_NaN(),
+      authority, output).status == HdgEulerSessionStatus::rejected;
+  const bool infinity_rejected = session.Prepare(
+      std::numeric_limits<double>::infinity(), authority, output).status ==
+      HdgEulerSessionStatus::rejected;
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  bool divergent_rejected = true;
+  if (ranks == 2)
+  {
+    const double divergent_dt = rank == 0 ? 0.0125 : 0.025;
+    divergent_rejected = session.Prepare(divergent_dt, authority, output).status ==
+        HdgEulerSessionStatus::rejected;
+  }
+  const auto prepared = session.Prepare(0.0125, authority, output);
+  const auto aborted = prepared.status == HdgEulerSessionStatus::prepared
+      ? session.Abort(std::move(authority), output)
+      : dg::hdg::generic::HdgEulerSessionResult{};
+  return All(zero_rejected && nan_rejected && infinity_rejected &&
+      divergent_rejected && prepared.status == HdgEulerSessionStatus::prepared &&
+      aborted.status == HdgEulerSessionStatus::aborted);
+}
+
 bool Rejected(GenericEulerHdgCudaSession& session,
               const CudaConfig& config) noexcept
 {
@@ -985,10 +1030,11 @@ int main(int argc, char** argv)
           ranks, smoke_polynomial_order, smoke_elements_per_direction);
       const bool high_wave = CheckBorrowedLaggedLlfHighWave(
           ranks, smoke_polynomial_order, smoke_elements_per_direction);
+      const bool prepared_dt = CheckPreparedDtAdmission(ranks);
       const bool refined_capacity = CheckRefinedDynamicCapacity(ranks);
       pass = transaction && foreign_authority && address_reuse &&
           session_identity && rank_two && legacy_facade && host_data && high_wave &&
-          refined_capacity;
+          prepared_dt && refined_capacity;
     }
   }
   if (!pass && ranks > 0)

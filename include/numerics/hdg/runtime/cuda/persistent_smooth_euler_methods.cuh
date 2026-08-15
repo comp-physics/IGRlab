@@ -69,6 +69,9 @@ BuildHostGeometryAndMaps() noexcept
     mfem::ElementTransformation* transformation =
         mesh_->GetElementTransformation(element);
     if (fe == nullptr || transformation == nullptr) { return false; }
+    const double element_hmin = mesh_->GetElementSize(element, 1);
+    if (!std::isfinite(element_hmin) || !(element_hmin > 0.0)) return false;
+    local_hmin_ = std::min(local_hmin_, element_hmin);
     mfem::Array<int> interior_vdofs;
     interior_space_->GetElementVDofs(element, interior_vdofs);
     if (interior_vdofs.Size() != shape_.interior_dofs) { return false; }
@@ -1441,10 +1444,10 @@ SolveTrueSystem(double& true_relative_residual,
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
-AssembleAndNorm(state_slot&, double& norm) noexcept
+AssembleAndNorm(state_slot&, const double dt, double& norm) noexcept
 {
   TransportPolicy::SetPhase(CudaFailurePhase::assembly, current_generation_);
-  const bool local_assembly = CudaLaunchAssembly(view_, shape_, fixed_dt) &&
+  const bool local_assembly = CudaLaunchAssembly(view_, shape_, dt) &&
       TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
       StatusPassed();
   if (!CollectiveContinue(local_assembly) ||

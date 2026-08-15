@@ -107,15 +107,19 @@ public:
   GenericEulerHdgCudaSession& operator=(GenericEulerHdgCudaSession&&) =
       delete;
 
-  /** No CFL diagnostics; borrowed inputs are real CUDA data, not a promise. */
-  static constexpr std::uint32_t capabilities() noexcept
+  /** Borrowed CUDA sessions expose diagnostics for committed state only. */
+  std::uint32_t capabilities() const noexcept
   {
-    return generic::HdgEulerSessionCapabilityBit(
+    const std::uint32_t base = generic::HdgEulerSessionCapabilityBit(
         generic::HdgEulerSessionCapability::prepared_commit) |
         generic::HdgEulerSessionCapabilityBit(
             generic::HdgEulerSessionCapability::prepared_output) |
         generic::HdgEulerSessionCapabilityBit(
             generic::HdgEulerSessionCapability::generic_borrowed_inputs);
+    return metadata_output_mode_ ? base |
+        generic::HdgEulerSessionCapabilityBit(
+            generic::HdgEulerSessionCapability::committed_cfl_diagnostics)
+        : base;
   }
 
   /**
@@ -204,12 +208,17 @@ public:
     }
     coordinates_ = EngineCoordinates();
     metadata_output_mode_ = config.use_borrowed_host_inputs;
+    if (metadata_output_mode_ && !RefreshCommittedDiagnostics())
+    {
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
     return Result(generic::HdgEulerSessionStatus::initialized);
   }
 
   /** Stage the native candidate export; an explicit acknowledgement is next. */
   template <typename StagedOutput>
-  result_type Prepare(GenericEulerCudaPreparedStep& authority,
+  result_type Prepare(const double dt, GenericEulerCudaPreparedStep& authority,
                       StagedOutput& native_export) noexcept
   {
     static_assert(IsSupportedOutput<StagedOutput>(),
@@ -218,15 +227,21 @@ public:
     // live authority from another session remains usable by its owner when
     // this session rejects the prepare collectively.
     const bool local_valid = ReadyForPrepare() && !authority.valid_ &&
-        OutputMatchesMode<StagedOutput>();
+        OutputMatchesMode<StagedOutput>() && std::isfinite(dt) && dt > 0.0 &&
+        (!retry_ready_ || SameDouble(dt, retained_dt_));
     if (!AdmitOperation(operation_tag::prepare, local_valid))
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    // Admission above deliberately carries only a validity bit; retain the
+    // exact IEEE payload agreement as its own collective before any engine
+    // affine phase so unequal finite proposals cannot silently proceed.
+    if (!ExactDtConsensus(dt))
       return Result(generic::HdgEulerSessionStatus::rejected);
 
     cuda_w8a::CudaPrecommitSnapshot snapshot{};
     cuda_w8a::CudaStepEvidence evidence{};
     StagedOutput staged_export{};
     const bool prepared_locally = Dispatch([&](auto& engine)
-    { return engine.PrepareStep(retry_ready_, snapshot, evidence); });
+    { return engine.PrepareStep(retry_ready_, dt, snapshot, evidence); });
     const bool prepared = CollectiveAll(prepared_locally);
     if (!prepared)
     {
@@ -261,6 +276,7 @@ public:
     native_export = staged_export;
     authority.Clear();
     ++epoch_;
+    retained_dt_ = dt;
     retry_ready_ = false;
     prepared_active_ = true;
     output_acknowledged_ = false;
@@ -273,6 +289,11 @@ public:
     authority.valid_ = true;
     return Result(generic::HdgEulerSessionStatus::prepared);
   }
+
+  template <typename StagedOutput>
+  result_type Prepare(GenericEulerCudaPreparedStep& authority,
+                      StagedOutput& native_export) noexcept
+  { return Prepare(cuda_w8a::fixed_dt, authority, native_export); }
 
   /** Export the initial or later committed physical interior to byNODES L2. */
   bool ExportCommittedInterior(
@@ -377,6 +398,9 @@ public:
       return Result(generic::HdgEulerSessionStatus::rejected);
     }
     coordinates_ = EngineCoordinates();
+    // The engine reduced and cached candidate diagnostics before consuming its
+    // final publication authority.  This is POD copying only.
+    if (metadata_output_mode_) InstallCommittedDiagnostics();
     return Result(generic::HdgEulerSessionStatus::committed);
   }
 
@@ -412,6 +436,9 @@ public:
 
   coordinates_type coordinates() const noexcept { return coordinates_; }
 
+  generic::HdgEulerCommittedDiagnostics diagnostics() const noexcept
+  { return diagnostics_; }
+
 private:
   enum class operation_tag : int
   {
@@ -437,6 +464,48 @@ private:
       const StateCoordinates& value) noexcept
   {
     return {value.time, value.dt, value.step, value.generation};
+  }
+
+  static bool SameDouble(const double left, const double right) noexcept
+  { return std::memcmp(&left, &right, sizeof(double)) == 0; }
+
+  static bool ExactDtConsensus(const double dt) noexcept
+  {
+    std::uint64_t bits = 0, minimum = 0, maximum = 0;
+    std::memcpy(&bits, &dt, sizeof(bits));
+    const int minimum_status = MPI_Allreduce(&bits, &minimum, 1,
+        MPI_UINT64_T, MPI_MIN, MPI_COMM_WORLD);
+    const int maximum_status = MPI_Allreduce(&bits, &maximum, 1,
+        MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+    return minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS &&
+        minimum == maximum;
+  }
+
+  bool RefreshCommittedDiagnostics() noexcept
+  {
+    double maximum_wave_speed = 0.0;
+    double backend_stable_dt = std::numeric_limits<double>::quiet_NaN();
+    const bool measured = Dispatch([&](auto& engine)
+    { return engine.CachedBorrowedEulerDiagnostics(maximum_wave_speed,
+                                                    backend_stable_dt); });
+    if (!measured) return false;
+    diagnostics_ = {true, coordinates_, coordinates_.generation,
+                    maximum_wave_speed, backend_stable_dt};
+    return generic::IsValidHdgEulerCommittedDiagnostics(diagnostics_,
+                                                         capabilities());
+  }
+
+  void InstallCommittedDiagnostics() noexcept
+  {
+    // FinalizeCommit can reach this point only after its candidate scan and
+    // successful slot swap.  Do not introduce any collective or failure path.
+    double maximum_wave_speed = 0.0;
+    double backend_stable_dt = std::numeric_limits<double>::quiet_NaN();
+    (void)Dispatch([&](auto& engine)
+    { return engine.CachedBorrowedEulerDiagnostics(maximum_wave_speed,
+                                                    backend_stable_dt); });
+    diagnostics_ = {true, coordinates_, coordinates_.generation,
+                    maximum_wave_speed, backend_stable_dt};
   }
 
   result_type Result(const generic::HdgEulerSessionStatus status) const noexcept
@@ -722,8 +791,9 @@ private:
             cuda_w8a::CudaFailurePhase::after_recovery_before_commit &&
         config.injection.target_step == 2 && config.injection.source_rank == 0 &&
         config.injection.token_fault == cuda_w8a::CudaTokenFault::none &&
-        std::isfinite(config.dt) &&
-        std::memcmp(&config.dt, &cuda_w8a::fixed_dt, sizeof(double)) == 0 &&
+        std::isfinite(config.dt) && config.dt > 0.0 &&
+        (config.use_borrowed_host_inputs ||
+         std::memcmp(&config.dt, &cuda_w8a::fixed_dt, sizeof(double)) == 0) &&
         (config.order == cuda_w8a::smoke_polynomial_order ||
          config.order == cuda_w8a::functional_polynomial_order) &&
         config.mesh_n >= 0;
@@ -829,6 +899,8 @@ private:
   bool output_acknowledged_ = false;
   bool failed_ = false;
   bool retry_ready_ = false;
+  double retained_dt_ = cuda_w8a::fixed_dt;
+  generic::HdgEulerCommittedDiagnostics diagnostics_{};
   std::uint64_t session_collective_id_ = unassigned_session_collective_id;
   const void* active_native_export_ = nullptr;
   std::uint64_t active_facade_incarnation_ = 0;
