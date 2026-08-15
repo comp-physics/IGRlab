@@ -1354,8 +1354,13 @@ public:
         result.initial_residual > 1.0e-8;
     result.final_residual = result.initial_residual;
     const double target = 1.0e-10 * (1.0 + result.initial_residual);
+    // Physical boundary rows use the same value-only exterior-state Picard
+    // linearization as the CPU path.  Match that bounded envelope without
+    // changing the periodic generic or legacy W8A iteration limit.
+    const int maximum_nonlinear_updates =
+        shape_.borrowed_static_boundary_policies ? 80 : 20;
     std::uint64_t last_product_generation = 0;
-    for (int iteration = 0; iteration < 20; ++iteration)
+    for (int iteration = 0; iteration < maximum_nonlinear_updates; ++iteration)
     {
       if (result.nonlinear_updates >= 2 && result.final_residual <= target)
         break;
