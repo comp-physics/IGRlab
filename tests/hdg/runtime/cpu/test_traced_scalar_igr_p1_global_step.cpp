@@ -148,7 +148,7 @@ bool FillSource(const mfem::ParFiniteElementSpace& space, mfem::Vector& values,
   return true;
 }
 
-bool BuildAffineQuads(const mfem::ParMesh& mesh,
+bool BuildAffineQuads(mfem::ParMesh& mesh,
                       std::vector<local::AffineQuad>& quads)
 {
   quads.resize(static_cast<std::size_t>(mesh.GetNE()));
