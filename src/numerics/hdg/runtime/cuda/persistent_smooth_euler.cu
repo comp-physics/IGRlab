@@ -824,15 +824,16 @@ bool CudaGetTrueMatrixStructure(
     auto* offd = hypre_ParCSRMatrixOffd(raw);
     const HYPRE_Int diag_nonzeros = hypre_CSRMatrixNumNonzeros(diag);
     const HYPRE_Int offd_nonzeros = hypre_CSRMatrixNumNonzeros(offd);
-    if (owned_count < 0 || owned_count > maximum_true_trace_dofs ||
-        diag_nonzeros < 0 || offd_nonzeros < 0 ||
-        diag_nonzeros > maximum_true_matrix_entries ||
-        offd_nonzeros > maximum_true_matrix_entries - diag_nonzeros)
+    if (owned_count < 0 || diag_nonzeros < 0 || offd_nonzeros < 0)
       return false;
     structure = {};
     structure.rows = owned_count;
     structure.diag_nonzeros = static_cast<int>(diag_nonzeros);
     structure.offd_nonzeros = static_cast<int>(offd_nonzeros);
+    structure.diag_offsets.resize(static_cast<std::size_t>(owned_count) + 1);
+    structure.diag_columns.resize(static_cast<std::size_t>(diag_nonzeros));
+    structure.offd_offsets.resize(static_cast<std::size_t>(owned_count) + 1);
+    structure.offd_columns.resize(static_cast<std::size_t>(offd_nonzeros));
     const HYPRE_Int* di = hypre_CSRMatrixI(diag);
     const HYPRE_Int* dj = hypre_CSRMatrixJ(diag);
     const HYPRE_Int* oi = hypre_CSRMatrixI(offd);
@@ -859,16 +860,17 @@ bool CudaGetTrueMatrixStructure(
     if (!diag_offsets_copied || !diag_columns_copied ||
         !offd_offsets_copied || !first_synchronized)
       return false;
-    std::array<HYPRE_Int, maximum_true_matrix_entries> offd_columns{};
-    std::array<HYPRE_BigInt, maximum_true_matrix_entries> offd_global{};
     const HYPRE_Int raw_offd_column_count = hypre_CSRMatrixNumCols(offd);
-    if (raw_offd_column_count < 0 ||
-        raw_offd_column_count > maximum_true_matrix_entries)
+    if (raw_offd_column_count < 0)
       return false;
     const int offd_column_count = static_cast<int>(raw_offd_column_count);
     if ((structure.offd_nonzeros > 0 && offd_column_count == 0) ||
         (offd_column_count > 0 && cmap == nullptr))
       return false;
+    std::vector<HYPRE_Int> offd_columns(
+        static_cast<std::size_t>(structure.offd_nonzeros));
+    std::vector<HYPRE_BigInt> offd_global(
+        static_cast<std::size_t>(offd_column_count));
     const std::size_t offd_column_bytes =
         static_cast<std::size_t>(structure.offd_nonzeros) * sizeof(HYPRE_Int);
     const bool offd_columns_copied = copy_out(

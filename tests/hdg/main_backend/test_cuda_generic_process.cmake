@@ -10,6 +10,12 @@ endif()
 if(NOT DEFINED HDG_MAIN_N)
   set(HDG_MAIN_N 3)
 endif()
+if(NOT DEFINED HDG_MAIN_SERIAL_REFINE)
+  set(HDG_MAIN_SERIAL_REFINE 0)
+endif()
+if(NOT DEFINED HDG_MAIN_PARALLEL_REFINE)
+  set(HDG_MAIN_PARALLEL_REFINE 0)
+endif()
 
 file(REMOVE_RECURSE "${HDG_MAIN_OUTPUT}")
 set(_arguments
@@ -17,8 +23,8 @@ set(_arguments
   --device cuda
   --mesh "${HDG_MAIN_MESH}"
   --order "${HDG_MAIN_ORDER}"
-  --serial-refine 0
-  --parallel-refine 0
+  --serial-refine "${HDG_MAIN_SERIAL_REFINE}"
+  --parallel-refine "${HDG_MAIN_PARALLEL_REFINE}"
   --time-step 0.05
   --t-final 0.10
   --no-glvis)

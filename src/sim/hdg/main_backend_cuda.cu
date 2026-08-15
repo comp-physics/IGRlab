@@ -33,7 +33,7 @@ using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::CudaConfig;
 using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
-using dg::hdg::runtime::cuda_w8a::CudaSerializedCheckpointV1;
+using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 
 bool IsRoot() noexcept
 {
@@ -177,9 +177,9 @@ std::string Validate(const HdgEulerMainRequest& request)
     return "generic CUDA HDG requires a positive integral 0.05 ParaView cadence";
   if (request.options.order != dg::hdg::runtime::cuda_w8a::smoke_polynomial_order &&
       request.options.order != dg::hdg::runtime::cuda_w8a::functional_polynomial_order)
-    return "generic CUDA HDG admits only p1/N3 or p2/N6";
-  if (request.options.ser_ref_levels != 0 || request.options.par_ref_levels != 0)
-    return "generic CUDA HDG does not admit mesh refinement";
+    return "generic CUDA HDG admits only p1 or p2";
+  if (request.options.ser_ref_levels < 0 || request.options.par_ref_levels < 0)
+    return "generic CUDA HDG refinement levels must be nonnegative";
   if (request.options.cfl != CommonOptions{}.cfl)
     return "generic CUDA HDG does not admit a caller-selected CFL control";
   if (request.initial_condition.GetVDim() !=
@@ -212,7 +212,7 @@ HDGParaViewMetadata Metadata(
 
 bool AbortPrepared(GenericEulerHdgCudaSession& session,
                    GenericEulerCudaPreparedStep& authority,
-                   CudaSerializedCheckpointV1& native_export) noexcept
+                   CudaPreparedOutputMetadataV1& native_export) noexcept
 {
   return session.Abort(std::move(authority), native_export).status ==
       HdgEulerSessionStatus::aborted;
@@ -295,7 +295,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   bool local_ok = false;
   try
   {
-    serial_mesh.emplace(LoadSerialMesh(mesh_path, 0));
+    serial_mesh.emplace(LoadSerialMesh(mesh_path, request.options.ser_ref_levels));
     std::ostringstream stream;
     stream.precision(std::numeric_limits<double>::max_digits10);
     serial_mesh->Print(stream);
@@ -316,11 +316,14 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     metadata.mesh_path = mesh_path;
     metadata.mesh_path_precedence = request.options.mesh_file.empty()
         ? MeshPathPrecedence::CaseDefault : MeshPathPrecedence::CommandLineOverride;
+    metadata.serial_refinement_levels = request.options.ser_ref_levels;
+    metadata.parallel_refinement_levels = request.options.par_ref_levels;
     metadata.serial_element_count = serial_mesh->GetNE();
     auto parallel_mesh = std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD,
                                                          *serial_mesh);
     serial_mesh->Clear();
     metadata.local_elements_after_partitioning = parallel_mesh->GetNE();
+    RefineParMesh(*parallel_mesh, request.options.par_ref_levels);
     metadata.local_elements_after_parallel_refinement = parallel_mesh->GetNE();
     context.emplace(std::move(parallel_mesh), std::move(metadata));
     local_ok = true;
@@ -348,9 +351,6 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   if (!CollectiveAll(local_ok))
     return Reject("CUDA HDG periodic boundary lowering failed");
 
-  const int mesh_n = request.options.order == 1
-      ? dg::hdg::runtime::cuda_w8a::smoke_elements_per_direction
-      : dg::hdg::runtime::cuda_w8a::functional_elements_per_direction;
   local_ok = false;
   std::unique_ptr<mfem::L2_FECollection> collection;
   std::unique_ptr<mfem::ParFiniteElementSpace> volume_space;
@@ -380,7 +380,9 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       volume_space->GetVSize() / dg::hdg::runtime::cuda_w8a::conserved_components);
   CudaConfig config;
   config.order = request.options.order;
-  config.mesh_n = mesh_n;
+  // Borrowed mode derives all topology and storage counts from this ParMesh;
+  // mesh_n remains a legacy generated-mesh descriptor only.
+  config.mesh_n = 0;
   config.dt = dg::hdg::runtime::cuda_w8a::fixed_dt;
   config.requested_device = 0;
   int ranks = 0;
@@ -458,7 +460,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       return Reject("CUDA HDG time planner produced a non-fixed step");
     }
     GenericEulerCudaPreparedStep authority;
-    CudaSerializedCheckpointV1 native_export{};
+    CudaPreparedOutputMetadataV1 native_export{};
     if (session.Prepare(authority, native_export).status !=
         HdgEulerSessionStatus::prepared)
     {

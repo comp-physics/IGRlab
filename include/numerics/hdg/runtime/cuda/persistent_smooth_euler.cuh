@@ -626,6 +626,56 @@ public:
     return all_staged;
   }
 
+  /**
+   * Generic borrowed-mode staging copies the frozen slot device-to-device but
+   * never materializes the legacy fixed checkpoint payload.  The caller can
+   * export that slot through the explicit L2 bridge while this authority is
+   * live.  Restart/checkpoint routes continue to use StagePreparedCheckpoint.
+   */
+  bool StagePreparedOutputMetadata(CudaPreparedOutputMetadataV1& metadata,
+                                   CudaStepEvidence& evidence) noexcept
+  {
+    metadata = {};
+    if (!pending_.active || !pending_.staging || !pending_.prestage_allowed)
+      return false;
+    metadata.attempt = pending_.attempt;
+    metadata.facade_incarnation = facade_incarnation_;
+    metadata.descriptor = pending_.staging->future_checkpoint();
+    metadata.candidate_frozen = true;
+    TransportPolicy::BeginStagingRange();
+    storage_policy::SetCopyOutPurpose(detail::CudaCopyOutPurpose::none);
+    state_slot& staging_slot = numerics_.WorkspaceSlot();
+    const bool token_copy = contract_->CopyPrepared(*pending_.staging,
+                                                     staging_slot);
+    metadata.source_rank = numerics_.rank();
+    metadata.rank_count = config_.expected_rank_count;
+    metadata.local_mesh_hash = numerics_.LocalMeshHash();
+    metadata.local_partition_hash = numerics_.LocalPartitionHash();
+    metadata.local_topology_hash = numerics_.LocalTopologyHash();
+    metadata.local_interior_hash = staging_slot.interior.local_hash;
+    metadata.local_trace_hash = staging_slot.trace.local_hash;
+    metadata.interior_count = staging_slot.interior.count;
+    metadata.owned_true_trace_count = staging_slot.trace.count;
+    metadata.interior_source_token = staging_slot.interior.storage_token;
+    metadata.trace_source_token = staging_slot.trace.storage_token;
+    metadata.staging_generation = staging_slot.interior.generation;
+    const bool all_staged = numerics_.CollectiveContinue(token_copy);
+    metadata.checkpoint_staged = all_staged;
+    pending_.checkpoint_staged = all_staged;
+    if (!all_staged)
+    {
+      pending_.prestage_allowed = false;
+      pending_.report.originating_failure = FailureReason::backend_failure;
+      pending_.report.gates.success = false;
+    }
+    UpdateAttemptEvidence(pending_.evidence);
+    metadata.staging_range = TransportPolicy::EndStagingRange();
+    metadata.staging_range.complete = metadata.staging_range.complete &&
+        all_staged;
+    evidence = pending_.evidence;
+    return all_staged;
+  }
+
   /** Freeze the independent oracle bytes during the same candidate epoch. */
   bool StagePreparedOracle(CudaOraclePod& pod,
                            CudaStepEvidence& evidence) noexcept
@@ -654,7 +704,8 @@ public:
   }
 
   /** A caller invokes this only after its output artifact is staged. */
-  bool MarkOutputStaged(CudaSerializedCheckpointV1& checkpoint) noexcept
+  template <typename StagedOutput>
+  bool MarkOutputStaged(StagedOutput& checkpoint) noexcept
   {
     const bool local_valid = pending_.active && pending_.staging &&
         pending_.prestage_allowed && pending_.checkpoint_staged &&
@@ -678,7 +729,8 @@ public:
   }
 
   /** Consume StagingToken and retain PreparedCommitToken internally. */
-  bool PrepareCommit(CudaSerializedCheckpointV1& checkpoint,
+  template <typename StagedOutput>
+  bool PrepareCommit(StagedOutput& checkpoint,
                      CudaStepEvidence& evidence) noexcept
   {
     const bool local_staging = pending_.active && pending_.staging.has_value();
@@ -724,7 +776,8 @@ public:
   }
 
   /** Reversible whole-slot exchange; old logical publication remains visible. */
-  bool CommitPrepared(CudaSerializedCheckpointV1& checkpoint,
+  template <typename StagedOutput>
+  bool CommitPrepared(StagedOutput& checkpoint,
                       CudaStepEvidence& evidence) noexcept
   {
     const bool local_prepared = pending_.active && pending_.prepared.has_value();
@@ -744,7 +797,8 @@ public:
   }
 
   /** Sole logical publication boundary; validation failure remains reversible. */
-  bool FinalizeCommit(CudaSerializedCheckpointV1& checkpoint,
+  template <typename StagedOutput>
+  bool FinalizeCommit(StagedOutput& checkpoint,
                       CudaStepEvidence& evidence) noexcept
   {
     const bool local_provisional =
@@ -781,7 +835,8 @@ public:
   }
 
   /** FailureReason::none is normalized to backend_failure and cannot commit. */
-  bool AbortPrepared(CudaSerializedCheckpointV1& checkpoint,
+  template <typename StagedOutput>
+  bool AbortPrepared(StagedOutput& checkpoint,
                      FailureReason reason,
                      CudaStepEvidence& evidence) noexcept
   {
@@ -809,7 +864,8 @@ public:
     return outcome.retry_available;
   }
 
-  bool RevertCommit(CudaSerializedCheckpointV1& checkpoint,
+  template <typename StagedOutput>
+  bool RevertCommit(StagedOutput& checkpoint,
                     FailureReason reason,
                     CudaStepEvidence& evidence) noexcept
   {
@@ -968,8 +1024,8 @@ private:
     config_.borrowed_source.coefficients = nullptr;
   }
 
-  static void AbortStagedArtifacts(
-      CudaSerializedCheckpointV1& checkpoint) noexcept
+  template <typename StagedOutput>
+  static void AbortStagedArtifacts(StagedOutput& checkpoint) noexcept
   {
     checkpoint.candidate_frozen = false;
     checkpoint.checkpoint_staged = false;
@@ -1104,6 +1160,10 @@ private:
 
   bool ValidateConfig() const noexcept
   {
+    const bool borrowed_generic_shape = config_.use_borrowed_topology &&
+        config_.use_borrowed_host_inputs && config_.mesh_n >= 0 &&
+        (config_.order == smoke_polynomial_order ||
+         config_.order == functional_polynomial_order);
     const bool smoke_shape = config_.order == smoke_polynomial_order &&
         config_.mesh_n == smoke_elements_per_direction;
     const bool functional_shape =
@@ -1139,7 +1199,7 @@ private:
               config_.borrowed_source.components == conserved_components))
         : empty_l2(config_.borrowed_initial) && empty_l2(config_.borrowed_source);
     return config_.experiment == StableIdentity::Copy(experiment_id) &&
-        (smoke_shape || functional_shape) &&
+        (borrowed_generic_shape || smoke_shape || functional_shape) &&
         topology_configuration &&
         generic_l2_configuration &&
         std::isfinite(config_.dt) &&

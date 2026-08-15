@@ -74,13 +74,13 @@ private:
   const GenericEulerHdgCudaSession* owner_ = nullptr;
   std::uint64_t epoch_ = 0;
   std::uint64_t facade_incarnation_ = 0;
-  cuda_w8a::CudaSerializedCheckpointV1* native_export_ = nullptr;
+  cuda_w8a::CudaPreparedOutputMetadataV1* native_export_ = nullptr;
   bool valid_ = false;
 };
 
 /**
  * Header-only adapter over the existing persistent CUDA engine.  Its complete
- * lifecycle is PrepareStep -> StagePreparedCheckpoint -> MarkOutputStaged ->
+ * lifecycle is PrepareStep -> StagePreparedOutputMetadata -> MarkOutputStaged ->
  * PrepareCommit -> CommitPrepared -> FinalizeCommit.  No second numerical
  * engine, allocator, kernel, or commit lifecycle is introduced here.  Every
  * member of MPI_COMM_WORLD must call the same public collective operation in
@@ -92,7 +92,7 @@ class GenericEulerHdgCudaSession
 public:
   using result_type = generic::HdgEulerSessionResult;
   using coordinates_type = generic::HdgEulerSessionCoordinates;
-  using native_export_type = cuda_w8a::CudaSerializedCheckpointV1;
+  using native_export_type = cuda_w8a::CudaPreparedOutputMetadataV1;
 
   GenericEulerHdgCudaSession() = default;
   ~GenericEulerHdgCudaSession() = default;
@@ -225,14 +225,14 @@ public:
       return Result(generic::HdgEulerSessionStatus::rejected);
     }
     const bool staged_locally = Dispatch([&](auto& engine)
-    { return engine.StagePreparedCheckpoint(staged_export, evidence); });
+    { return engine.StagePreparedOutputMetadata(staged_export, evidence); });
     const bool locally_staged = staged_locally &&
         snapshot.numerical_candidate_ready &&
         staged_export.candidate_frozen && staged_export.checkpoint_staged &&
         !staged_export.output_staged && !staged_export.successful_commit;
     if (!CollectiveAll(locally_staged))
     {
-      // StagePreparedCheckpoint can leave a live affine staging token when a
+      // Metadata staging can leave a live affine staging token when a
       // collective staging operation fails.  Consume it through the engine's
       // existing abort route; never discard it or invent a second rollback.
       if (prepared)
@@ -673,10 +673,9 @@ private:
         config.injection.token_fault == cuda_w8a::CudaTokenFault::none &&
         std::isfinite(config.dt) &&
         std::memcmp(&config.dt, &cuda_w8a::fixed_dt, sizeof(double)) == 0 &&
-        ((config.order == cuda_w8a::smoke_polynomial_order &&
-          config.mesh_n == cuda_w8a::smoke_elements_per_direction) ||
-         (config.order == cuda_w8a::functional_polynomial_order &&
-          config.mesh_n == cuda_w8a::functional_elements_per_direction));
+        (config.order == cuda_w8a::smoke_polynomial_order ||
+         config.order == cuda_w8a::functional_polynomial_order) &&
+        config.mesh_n >= 0;
     long long local_elements = 0;
     long long local_face_measure = 0;
     long long global_elements = 0;
@@ -693,8 +692,7 @@ private:
           !config.borrowed_mesh->Nonconforming() &&
           config.borrowed_mesh->Dimension() == cuda_w8a::dimension &&
           config.borrowed_mesh->SpaceDimension() == cuda_w8a::dimension &&
-          config.borrowed_mesh->GetNE() > 0 &&
-          config.borrowed_mesh->GetNE() <= cuda_w8a::maximum_rank_elements;
+          config.borrowed_mesh->GetNE() > 0;
       local_elements = config.borrowed_mesh->GetNE();
       for (int element = 0; local && element < config.borrowed_mesh->GetNE();
            ++element)
@@ -702,15 +700,11 @@ private:
             mfem::Geometry::SQUARE;
       if (local)
       {
-        const long long local_faces =
-            static_cast<long long>(config.borrowed_mesh->GetNumFaces());
-        const long long local_shared_faces =
-            static_cast<long long>(config.borrowed_mesh->GetNSharedFaces());
-        local = local_faces >= 0 && local_shared_faces >= 0 &&
-            local_shared_faces <= local_faces &&
-            local_faces <= std::numeric_limits<long long>::max() / 2;
-        if (local)
-          local_face_measure = 2 * local_faces - local_shared_faces;
+        const long long faces = config.borrowed_mesh->GetNumFaces();
+        const long long shared = config.borrowed_mesh->GetNSharedFaces();
+        local = faces >= 0 && shared >= 0 && shared <= faces &&
+            faces <= std::numeric_limits<long long>::max() / 2;
+        if (local) local_face_measure = 2 * faces - shared;
       }
       if (local && config.use_borrowed_host_inputs)
       {
@@ -738,22 +732,16 @@ private:
     const bool local_census = MPI_Allreduce(&local_bit, &all_local, 1,
                                              MPI_INT, MPI_MIN,
                                              MPI_COMM_WORLD) == MPI_SUCCESS;
-    const bool element_census = MPI_Allreduce(
-        &local_elements, &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM,
+    const bool element_census = MPI_Allreduce(&local_elements, &global_elements,
+        1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool face_census = MPI_Allreduce(&local_face_measure,
+        &global_face_measure, 1, MPI_LONG_LONG_INT, MPI_SUM,
         MPI_COMM_WORLD) == MPI_SUCCESS;
-    const bool face_census = MPI_Allreduce(
-        &local_face_measure, &global_face_measure, 1, MPI_LONG_LONG_INT,
-        MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
-    const long long expected_elements =
-        static_cast<long long>(config.mesh_n) * config.mesh_n;
-    const bool expected_measure_safe = expected_elements >= 0 &&
-        expected_elements <= std::numeric_limits<long long>::max() / 4;
-    const long long expected_face_measure = expected_measure_safe
-        ? 4 * expected_elements : 0;
+    const bool periodic_measure_safe = global_elements >= 0 &&
+        global_elements <= std::numeric_limits<long long>::max() / 4;
     return config_consensus && local_census && element_census && face_census &&
-        expected_measure_safe && all_local == 1 &&
-        global_elements == expected_elements &&
-        global_face_measure == expected_face_measure;
+        all_local == 1 && periodic_measure_safe &&
+        global_face_measure == 4 * global_elements;
   }
 
   template <typename Callback>

@@ -293,10 +293,10 @@ struct CudaTrueMatrixStructure
   int rows = 0;
   int diag_nonzeros = 0;
   int offd_nonzeros = 0;
-  std::array<int, maximum_true_trace_dofs + 1> diag_offsets{};
-  std::array<int, maximum_true_matrix_entries> diag_columns{};
-  std::array<int, maximum_true_trace_dofs + 1> offd_offsets{};
-  std::array<std::int64_t, maximum_true_matrix_entries> offd_columns{};
+  std::vector<int> diag_offsets{};
+  std::vector<int> diag_columns{};
+  std::vector<int> offd_offsets{};
+  std::vector<std::int64_t> offd_columns{};
 };
 
 struct CudaTrueMatrixDeviceView
@@ -780,7 +780,7 @@ public:
     TransportPolicy::BeginAttempt(setup);
     // Admission of borrowed topology is deliberately ahead of cudaSetDevice,
     // HYPRE initialization, and arena allocation.  Unsupported degree/rank,
-    // communicator disagreement, geometry, and fixed-arena capacity are thus
+    // communicator disagreement and geometry are thus
     // collective host-side rejections rather than partially initialized GPU
     // state.
     if (!ValidateTopologyBeforeDevice(config))
@@ -887,8 +887,8 @@ public:
                         false,
                         1,
                         1,
-                        persistent_double_capacity * sizeof(double) +
-                            persistent_integer_capacity * sizeof(int),
+                        double_arena_capacity_ * sizeof(double) +
+                            integer_arena_capacity_ * sizeof(int),
                         WorkspaceBytes()};
     tuple_ = tuple;
     ReportCudaWarmLifetimeMarker(
@@ -1566,12 +1566,12 @@ private:
       const dg::hdg::trace::DGInterfaceTraceExchangePlan& exchange) noexcept
   {
     const int elements = mesh.GetNE();
-    if (elements <= 0 || elements > maximum_rank_elements ||
+    const bool generic = config.use_borrowed_topology &&
+        config.use_borrowed_host_inputs;
+    if (elements <= 0 || (!generic && elements > maximum_rank_elements) ||
         !exchange.IsConsistent() || exchange.space != &trace ||
         exchange.map.dofs.entries.size() !=
             static_cast<std::size_t>(trace.GetVSize()) ||
-        exchange.map.GhostCount() >
-            static_cast<std::size_t>(maximum_local_trace_dofs) ||
         interior.GetOrdering() != mfem::Ordering::byNODES ||
         trace.GetOrdering() != mfem::Ordering::byNODES)
       return false;
@@ -1595,13 +1595,8 @@ private:
         fe->GetGeomType(), assembly_order).GetNPoints();
     const int face_points = mfem::IntRules.Get(
         face_fe->GetGeomType(), assembly_order).GetNPoints();
-    return trace.GetVSize() > 0 &&
-        trace.GetVSize() <= maximum_local_trace_dofs &&
-        trace.GetTrueVSize() > 0 &&
-        trace.GetTrueVSize() <= maximum_true_trace_dofs &&
+    const bool common_shape = trace.GetVSize() > 0 && trace.GetTrueVSize() > 0 &&
         exchange.map.dofs.global_true_dof_count > 0 &&
-        exchange.map.dofs.global_true_dof_count <=
-            static_cast<std::uint64_t>(maximum_true_trace_dofs) &&
         scalar_interior_dofs > 0 &&
         scalar_interior_dofs <= maximum_scalar_dofs_per_element &&
         scalar_face_dofs > 0 &&
@@ -1610,6 +1605,11 @@ private:
         trace_dofs <= maximum_trace_dofs_per_element &&
         volume_points <= maximum_volume_points &&
         face_points <= maximum_face_points;
+    if (generic) return common_shape;
+    return common_shape && trace.GetVSize() <= maximum_local_trace_dofs &&
+        trace.GetTrueVSize() <= maximum_true_trace_dofs &&
+        exchange.map.dofs.global_true_dof_count <=
+            static_cast<std::uint64_t>(maximum_true_trace_dofs);
   }
 
   bool ValidateBorrowedTopologyCapacity(const CudaConfig& config) const
@@ -1674,8 +1674,7 @@ private:
             !config.borrowed_mesh->Nonconforming() &&
             config.borrowed_mesh->Dimension() == dimension;
         local_elements = config.borrowed_mesh->GetNE();
-        local_valid = local_valid && local_elements > 0 &&
-            local_elements <= maximum_rank_elements;
+        local_valid = local_valid && local_elements > 0;
         for (int element = 0; local_valid && element < local_elements;
              ++element)
         {
@@ -1693,13 +1692,31 @@ private:
     if (!CollectiveContinue(local_valid)) { return false; }
 
     if (!config.use_borrowed_topology) { return true; }
-    long long global_elements = 0;
+    long long local_face_measure = 0;
+    const long long faces = config.borrowed_mesh->GetNumFaces();
+    const long long shared = config.borrowed_mesh->GetNSharedFaces();
+    local_valid = faces >= 0 && shared >= 0 && shared <= faces &&
+        faces <= std::numeric_limits<long long>::max() / 2;
+    if (local_valid) local_face_measure = 2 * faces - shared;
+    if (!CollectiveContinue(local_valid)) return false;
     const long long local_element_count = local_elements;
-    const bool census_ready = MPI_Allreduce(
-        &local_element_count, &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM,
+    long long global_elements = 0;
+    long long global_face_measure = 0;
+    const bool element_census = MPI_Allreduce(&local_element_count,
+        &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) ==
+        MPI_SUCCESS;
+    const bool face_census = MPI_Allreduce(&local_face_measure,
+        &global_face_measure, 1, MPI_LONG_LONG_INT, MPI_SUM,
         MPI_COMM_WORLD) == MPI_SUCCESS;
-    return census_ready && global_elements ==
-            static_cast<long long>(config.mesh_n) * config.mesh_n &&
+    const bool periodic_measure_safe = global_elements >= 0 &&
+        global_elements <= std::numeric_limits<long long>::max() / 4;
+    const bool periodic = element_census && face_census && periodic_measure_safe &&
+        global_face_measure == 4 * global_elements;
+    if (!periodic) return false;
+    if (config.use_borrowed_host_inputs)
+      return ValidateBorrowedTopologyCapacity(config);
+    const long long expected = static_cast<long long>(config.mesh_n) * config.mesh_n;
+    return expected >= 0 && global_elements == expected &&
         ValidateBorrowedTopologyCapacity(config);
   }
 
@@ -1903,8 +1920,7 @@ private:
     shape_.elements = mesh_->GetNE();
     shape_.local_trace_count = trace_space_->GetVSize();
     shape_.true_trace_count = trace_space_->GetTrueVSize();
-    shape_.global_true_trace_count = static_cast<int>(
-        exchange_plan_.map.dofs.global_true_dof_count);
+    const std::uint64_t global_true = exchange_plan_.map.dofs.global_true_dof_count;
     const mfem::FiniteElement* fe = interior_space_->GetFE(0);
     mfem::Array<int> first_faces, first_orientations;
     mesh_->GetElementEdges(0, first_faces, first_orientations);
@@ -1918,7 +1934,18 @@ private:
         shape_.scalar_face_dofs;
     shape_.assembly_order = config.order == functional_polynomial_order
         ? functional_assembly_quadrature_order : assembly_quadrature_order;
-    shape_.interior_count = shape_.elements * shape_.interior_dofs;
+    const long long expected_interior = static_cast<long long>(shape_.elements) *
+        static_cast<long long>(shape_.interior_dofs);
+    const int interior_vsize = interior_space_->GetVSize();
+    if (shape_.elements <= 0 || shape_.local_trace_count <= 0 ||
+        shape_.true_trace_count <= 0 || interior_vsize <= 0 ||
+        expected_interior <= 0 || expected_interior >
+            std::numeric_limits<int>::max() ||
+        interior_vsize != expected_interior || global_true == 0 ||
+        global_true > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+      return false;
+    shape_.interior_count = interior_vsize;
+    shape_.global_true_trace_count = static_cast<int>(global_true);
     shape_.borrowed_static_source = false;
     shape_.borrowed_host_inputs = config.use_borrowed_host_inputs;
     if (!ExactTopologyShapeFitsCapacity(config, *mesh_, *interior_space_,
@@ -1931,10 +1958,157 @@ private:
     if (shape_.volume_points > maximum_volume_points ||
         shape_.face_points > maximum_face_points)
       return false;
-    return BuildHostGeometryAndMaps() && BuildLocalTraceGraph();
+    return AllocateTopologyStorage() && BuildHostGeometryAndMaps() &&
+        BuildLocalTraceGraph();
   }
 
   bool BuildHostGeometryAndMaps() noexcept;
+  bool AllocateTopologyStorage() noexcept
+  {
+    try
+    {
+      const bool generic = borrowed_topology_ && shape_.borrowed_host_inputs;
+      const auto checked_product = [](const std::size_t a,
+                                      const std::size_t b,
+                                      std::size_t& result)
+      {
+        if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a)
+          return false;
+        result = a * b;
+        return true;
+      };
+      const auto checked_add = [](std::size_t& total, const std::size_t value)
+      {
+        if (value > std::numeric_limits<std::size_t>::max() - total)
+          return false;
+        total += value;
+        return true;
+      };
+      const std::size_t elements = static_cast<std::size_t>(shape_.elements);
+      const std::size_t interior = static_cast<std::size_t>(shape_.interior_count);
+      const std::size_t local_trace = static_cast<std::size_t>(shape_.local_trace_count);
+      const std::size_t true_trace = static_cast<std::size_t>(shape_.true_trace_count);
+      std::size_t element_trace = 0, local_matrix = 0, element_interior2 = 0;
+      std::size_t element_coupling = 0, volume_shape = 0, volume_derivative = 0;
+      std::size_t volume_weight = 0, volume_position = 0, face_interior = 0;
+      std::size_t face_trace = 0, face_weight = 0, face_normal = 0;
+      bool valid = elements != 0 && checked_product(elements,
+          static_cast<std::size_t>(shape_.trace_dofs), element_trace) &&
+          checked_product(element_trace,
+          static_cast<std::size_t>(shape_.trace_dofs), local_matrix) &&
+          checked_product(elements, static_cast<std::size_t>(shape_.interior_dofs) *
+              static_cast<std::size_t>(shape_.interior_dofs), element_interior2) &&
+          checked_product(elements, static_cast<std::size_t>(shape_.interior_dofs) *
+              static_cast<std::size_t>(shape_.trace_dofs), element_coupling) &&
+          checked_product(elements * static_cast<std::size_t>(shape_.volume_points),
+              static_cast<std::size_t>(shape_.scalar_interior_dofs), volume_shape) &&
+          checked_product(volume_shape, dimension, volume_derivative) &&
+          checked_product(elements, static_cast<std::size_t>(shape_.volume_points),
+                          volume_weight) &&
+          checked_product(volume_weight, dimension, volume_position) &&
+          checked_product(elements * faces_per_element *
+              static_cast<std::size_t>(shape_.face_points),
+              static_cast<std::size_t>(shape_.scalar_interior_dofs), face_interior) &&
+          checked_product(elements * faces_per_element *
+              static_cast<std::size_t>(shape_.face_points),
+              static_cast<std::size_t>(shape_.scalar_face_dofs), face_trace) &&
+          checked_product(elements * faces_per_element,
+              static_cast<std::size_t>(shape_.face_points), face_weight) &&
+          checked_product(face_weight, dimension, face_normal);
+      if (!valid) return false;
+      const std::size_t host_elements = generic ? elements : maximum_rank_elements;
+      const std::size_t host_interior = generic ? interior :
+          static_cast<std::size_t>(maximum_rank_elements) * maximum_interior_dofs_per_element;
+      const std::size_t host_element_trace = generic ? element_trace :
+          static_cast<std::size_t>(maximum_rank_elements) * maximum_trace_dofs_per_element;
+      const std::size_t host_local_trace = generic ? local_trace : maximum_local_trace_dofs;
+      const std::size_t host_true_trace = generic ? true_trace : maximum_true_trace_dofs;
+      const std::size_t host_matrix = generic ? local_matrix : maximum_local_matrix_entries;
+      const std::size_t host_exchange = generic ? local_matrix : maximum_exchange_entries;
+
+      signed_element_trace_.assign(host_element_trace, 0);
+      local_global_true_.assign(host_local_trace, 0);
+      local_owner_.assign(host_local_trace, 0);
+      local_true_index_.assign(host_local_trace, 0);
+      owned_global_true_.assign(host_true_trace, 0);
+      element_coordinate_keys_.assign(host_elements * dimension, 0);
+      host_volume_shape_.assign(generic ? volume_shape :
+          static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * maximum_scalar_dofs_per_element, 0.0);
+      host_volume_derivative_.assign(generic ? volume_derivative :
+          static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * maximum_scalar_dofs_per_element * dimension, 0.0);
+      host_volume_weight_.assign(generic ? volume_weight :
+          static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points, 0.0);
+      host_volume_position_.assign(generic ? volume_position :
+          static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * dimension, 0.0);
+      host_face_interior_shape_.assign(generic ? face_interior :
+          static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * maximum_scalar_dofs_per_element, 0.0);
+      host_face_trace_shape_.assign(generic ? face_trace :
+          static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * maximum_scalar_dofs_per_face, 0.0);
+      host_face_weight_.assign(generic ? face_weight :
+          static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points, 0.0);
+      host_face_normal_.assign(generic ? face_normal :
+          static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension, 0.0);
+      host_exact_interior_.assign(host_interior, 0.0);
+      host_perturbed_interior_.assign(host_interior, 0.0);
+      host_exact_true_trace_.assign(host_true_trace, 0.0);
+      host_perturbed_true_trace_.assign(host_true_trace, 0.0);
+      host_static_source_.assign(host_interior, 0.0);
+      host_export_interior_.assign(host_interior, 0.0);
+      host_status_.assign(host_elements, 0.0);
+      signed_element_interior_.assign(host_interior, 0);
+      host_matrix_owned_source_.assign(host_matrix, 0);
+      host_matrix_owned_section_.assign(host_matrix, 0);
+      host_matrix_owned_target_.assign(host_matrix, 0);
+      host_matrix_send_source_.assign(host_exchange, 0);
+      host_matrix_receive_section_.assign(host_exchange, 0);
+      host_matrix_receive_target_.assign(host_exchange, 0);
+      host_vector_owned_source_.assign(host_element_trace, 0);
+      host_vector_owned_target_.assign(host_element_trace, 0);
+      host_vector_send_source_.assign(host_element_trace, 0);
+      host_vector_receive_target_.assign(host_element_trace, 0);
+      matrix_send_keys_.assign(2 * host_exchange, 0);
+      matrix_receive_keys_.assign(2 * host_exchange, 0);
+      vector_send_keys_.assign(host_element_trace, 0);
+      vector_receive_keys_.assign(host_element_trace, 0);
+      matrix_send_host_.assign(host_exchange, 0.0);
+      matrix_receive_host_.assign(host_exchange, 0.0);
+      vector_send_host_.assign(host_element_trace, 0.0);
+      vector_receive_host_.assign(host_element_trace, 0.0);
+
+      if (!generic) return true;
+      std::size_t doubles = 0;
+      const std::size_t solve_workspace = elements *
+          static_cast<std::size_t>(shape_.interior_dofs) *
+          static_cast<std::size_t>(shape_.trace_dofs + 1);
+      valid = checked_add(doubles, 10 * interior) &&
+          checked_add(doubles, 4 * true_trace) && checked_add(doubles, local_trace) &&
+          checked_add(doubles, 3 * element_trace) && checked_add(doubles, interior) &&
+          checked_add(doubles, element_trace) && checked_add(doubles, element_interior2) &&
+          checked_add(doubles, 2 * element_coupling) && checked_add(doubles, local_matrix) &&
+          checked_add(doubles, interior) && checked_add(doubles, element_trace) &&
+          checked_add(doubles, element_interior2) && checked_add(doubles, interior) &&
+          checked_add(doubles, solve_workspace) && checked_add(doubles, local_matrix) &&
+          checked_add(doubles, element_trace) && checked_add(doubles, true_trace) &&
+          checked_add(doubles, 2 * local_matrix) && checked_add(doubles, 2 * element_trace) &&
+          checked_add(doubles, volume_shape) && checked_add(doubles, volume_derivative) &&
+          checked_add(doubles, volume_weight) && checked_add(doubles, volume_position) &&
+          checked_add(doubles, face_interior) && checked_add(doubles, face_trace) &&
+          checked_add(doubles, face_weight) && checked_add(doubles, face_normal) &&
+          checked_add(doubles, elements) && checked_add(doubles, 8) &&
+          checked_add(doubles, face_weight);
+      std::size_t integers = 16;
+      valid = valid && checked_add(integers, element_trace) &&
+          checked_add(integers, 3 * local_matrix) && checked_add(integers, 3 * local_matrix) &&
+          checked_add(integers, 4 * element_trace);
+      if (!valid || doubles > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+          integers > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        return false;
+      double_arena_capacity_ = doubles;
+      integer_arena_capacity_ = integers;
+      return true;
+    }
+    catch (...) { return false; }
+  }
   bool InitializeBorrowedHostFields(const CudaConfig& config) noexcept;
   bool BuildLocalTraceGraph() noexcept;
   bool BuildPersistentTrueSystem() noexcept;
@@ -1945,11 +2119,11 @@ private:
     void* doubles = nullptr;
     void* integers = nullptr;
     if (!AllocatorPolicy::Allocate(
-            persistent_double_capacity * sizeof(double), alignof(double),
+            double_arena_capacity_ * sizeof(double), alignof(double),
             CudaAllocationSite::persistent_double_arena, doubles))
       return false;
     if (!AllocatorPolicy::Allocate(
-            persistent_integer_capacity * sizeof(int), alignof(std::uint64_t),
+            integer_arena_capacity_ * sizeof(int), alignof(std::uint64_t),
             CudaAllocationSite::persistent_integer_arena, integers))
     {
       // Retain the local token until the common release path observes an exact
@@ -2120,6 +2294,11 @@ private:
   CudaTrueMatrixDeviceView true_device_{};
   double* double_arena_ = nullptr;
   int* integer_arena_ = nullptr;
+  // False-mode retains the literal W8A capacities and BindArenaViews branch.
+  // Borrowed mode receives exact one-time capacities after its actual ParMesh
+  // and exchange topology have been constructed.
+  std::size_t double_arena_capacity_ = persistent_double_capacity;
+  std::size_t integer_arena_capacity_ = persistent_integer_capacity;
   CudaArenaReleaseState arena_release_state_{};
   mfem::Memory<double> double_memory_{};
   mfem::Memory<int> integer_memory_{};
@@ -2160,77 +2339,47 @@ private:
   std::size_t ticket_count_ = 0;
   CudaOraclePod oracle_{};
 
-  std::array<int, maximum_rank_elements * maximum_trace_dofs_per_element>
-      signed_element_trace_{};
-  std::array<std::int64_t, maximum_local_trace_dofs> local_global_true_{};
-  std::array<int, maximum_local_trace_dofs> local_owner_{};
-  std::array<int, maximum_local_trace_dofs> local_true_index_{};
-  std::array<std::int64_t, maximum_true_trace_dofs> owned_global_true_{};
-  std::array<std::int64_t, maximum_rank_elements * dimension>
-      element_coordinate_keys_{};
-  std::array<double, maximum_rank_elements * maximum_volume_points *
-                         maximum_scalar_dofs_per_element>
-      host_volume_shape_{};
-  std::array<double, maximum_rank_elements * maximum_volume_points *
-                         maximum_scalar_dofs_per_element * dimension>
-      host_volume_derivative_{};
-  std::array<double, maximum_rank_elements * maximum_volume_points>
-      host_volume_weight_{};
-  std::array<double, maximum_rank_elements * maximum_volume_points * dimension>
-      host_volume_position_{};
-  std::array<double, maximum_rank_elements * faces_per_element *
-                         maximum_face_points * maximum_scalar_dofs_per_element>
-      host_face_interior_shape_{};
-  std::array<double, maximum_rank_elements * faces_per_element *
-                         maximum_face_points * maximum_scalar_dofs_per_face>
-      host_face_trace_shape_{};
-  std::array<double, maximum_rank_elements * faces_per_element *
-                         maximum_face_points>
-      host_face_weight_{};
-  std::array<double, maximum_rank_elements * faces_per_element *
-                         maximum_face_points * dimension>
-      host_face_normal_{};
-  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
-      host_exact_interior_{};
-  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
-      host_perturbed_interior_{};
-  std::array<double, maximum_true_trace_dofs> host_exact_true_trace_{};
-  std::array<double, maximum_true_trace_dofs> host_perturbed_true_trace_{};
-  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
-      host_static_source_{};
-  std::array<double, maximum_rank_elements * maximum_interior_dofs_per_element>
-      host_export_interior_{};
-  std::array<int, maximum_rank_elements * maximum_interior_dofs_per_element>
-      signed_element_interior_{};
+  std::vector<int> signed_element_trace_{};
+  std::vector<std::int64_t> local_global_true_{};
+  std::vector<int> local_owner_{};
+  std::vector<int> local_true_index_{};
+  std::vector<std::int64_t> owned_global_true_{};
+  std::vector<std::int64_t> element_coordinate_keys_{};
+  std::vector<double> host_volume_shape_{};
+  std::vector<double> host_volume_derivative_{};
+  std::vector<double> host_volume_weight_{};
+  std::vector<double> host_volume_position_{};
+  std::vector<double> host_face_interior_shape_{};
+  std::vector<double> host_face_trace_shape_{};
+  std::vector<double> host_face_weight_{};
+  std::vector<double> host_face_normal_{};
+  std::vector<double> host_exact_interior_{};
+  std::vector<double> host_perturbed_interior_{};
+  std::vector<double> host_exact_true_trace_{};
+  std::vector<double> host_perturbed_true_trace_{};
+  std::vector<double> host_static_source_{};
+  std::vector<double> host_export_interior_{};
+  std::vector<double> host_status_{};
+  std::vector<int> signed_element_interior_{};
   bool borrowed_host_inputs_ = false;
-  std::array<int, maximum_local_matrix_entries> host_matrix_owned_source_{};
-  std::array<int, maximum_local_matrix_entries> host_matrix_owned_section_{};
-  std::array<int, maximum_local_matrix_entries> host_matrix_owned_target_{};
-  std::array<int, maximum_exchange_entries> host_matrix_send_source_{};
-  std::array<int, maximum_exchange_entries> host_matrix_receive_section_{};
-  std::array<int, maximum_exchange_entries> host_matrix_receive_target_{};
-  std::array<int, maximum_rank_elements * maximum_trace_dofs_per_element>
-      host_vector_owned_source_{};
-  std::array<int, maximum_rank_elements * maximum_trace_dofs_per_element>
-      host_vector_owned_target_{};
-  std::array<int, maximum_rank_elements * maximum_trace_dofs_per_element>
-      host_vector_send_source_{};
-  std::array<int, maximum_rank_elements * maximum_trace_dofs_per_element>
-      host_vector_receive_target_{};
-  std::array<std::int64_t, maximum_exchange_entries * 2> matrix_send_keys_{};
-  std::array<std::int64_t, maximum_exchange_entries * 2> matrix_receive_keys_{};
-  std::array<std::int64_t,
-             maximum_rank_elements * maximum_trace_dofs_per_element>
-      vector_send_keys_{};
-  std::array<std::int64_t,
-             maximum_rank_elements * maximum_trace_dofs_per_element>
-      vector_receive_keys_{};
-  std::array<double, maximum_exchange_entries> matrix_send_host_{};
-  std::array<double, maximum_exchange_entries> matrix_receive_host_{};
-  std::array<double, maximum_rank_elements * maximum_trace_dofs_per_element>
-      vector_send_host_{};
-  std::array<double, maximum_rank_elements * maximum_trace_dofs_per_element>
-      vector_receive_host_{};
+  std::vector<int> host_matrix_owned_source_{};
+  std::vector<int> host_matrix_owned_section_{};
+  std::vector<int> host_matrix_owned_target_{};
+  std::vector<int> host_matrix_send_source_{};
+  std::vector<int> host_matrix_receive_section_{};
+  std::vector<int> host_matrix_receive_target_{};
+  std::vector<int> host_vector_owned_source_{};
+  std::vector<int> host_vector_owned_target_{};
+  std::vector<int> host_vector_send_source_{};
+  std::vector<int> host_vector_receive_target_{};
+  std::vector<std::int64_t> matrix_send_keys_{};
+  std::vector<std::int64_t> matrix_receive_keys_{};
+  std::vector<std::int64_t> vector_send_keys_{};
+  std::vector<std::int64_t> vector_receive_keys_{};
+  std::vector<double> matrix_send_host_{};
+  std::vector<double> matrix_receive_host_{};
+  std::vector<double> vector_send_host_{};
+  std::vector<double> vector_receive_host_{};
 };
 
 } // namespace detail

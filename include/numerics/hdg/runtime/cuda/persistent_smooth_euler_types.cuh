@@ -424,6 +424,36 @@ struct CudaSerializedCheckpointV1
   bool successful_commit = false;
 };
 
+/**
+ * Affine generic-output authority.  It deliberately carries metadata only:
+ * generic VTK exports the staged L2 state explicitly, so it must not be
+ * bounded by the frozen checkpoint payload used by legacy restart routes.
+ */
+struct CudaPreparedOutputMetadataV1
+{
+  std::uint32_t schema = 1;
+  int source_rank = -1;
+  int rank_count = 0;
+  AttemptIdentity attempt{};
+  std::uint64_t facade_incarnation = 0;
+  CheckpointDescriptor descriptor{};
+  StateHash local_mesh_hash{};
+  StateHash local_partition_hash{};
+  StateHash local_topology_hash{};
+  StateHash local_interior_hash{};
+  StateHash local_trace_hash{};
+  std::uint64_t interior_count = 0;
+  std::uint64_t owned_true_trace_count = 0;
+  std::uintptr_t interior_source_token = 0;
+  std::uintptr_t trace_source_token = 0;
+  std::uint64_t staging_generation = 0;
+  CudaTransferLedgerRangeV1 staging_range{};
+  bool candidate_frozen = false;
+  bool checkpoint_staged = false;
+  bool output_staged = false;
+  bool successful_commit = false;
+};
+
 struct CudaRunEvidence
 {
   CudaRunStatus status = CudaRunStatus::ready;
@@ -611,6 +641,9 @@ static_assert(std::is_standard_layout<CudaOraclePod>::value &&
 static_assert(std::is_standard_layout<CudaSerializedCheckpointV1>::value &&
                   std::is_trivially_copyable<CudaSerializedCheckpointV1>::value,
               "CUDA checkpoint schema must remain POD");
+static_assert(std::is_standard_layout<CudaPreparedOutputMetadataV1>::value &&
+                  std::is_trivially_copyable<CudaPreparedOutputMetadataV1>::value,
+              "CUDA prepared-output metadata must remain POD");
 static_assert(!std::is_polymorphic<CudaConfig>::value &&
                   !std::is_polymorphic<CudaRunEvidence>::value,
               "CUDA W8A runtime values must use static dispatch");
