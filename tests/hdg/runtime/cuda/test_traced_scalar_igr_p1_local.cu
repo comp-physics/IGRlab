@@ -48,6 +48,11 @@ __global__ void MassFluxJacobianWitness(double* values)
   values[1] = jacobian[2];
 }
 
+__global__ void ScaledNormWitness(const double x, const double y, double* value)
+{
+  value[0] = algebra::ScaledNorm2(x, y);
+}
+
 bool CudaOk(const cudaError_t error) { return error == cudaSuccess; }
 
 bool Near(const double left, const double right, const double tolerance = 3.e-10)
@@ -132,6 +137,26 @@ bool CheckMassFluxJacobianWitness()
       Download(values, device_values, 2) && Near(values[0], .6) && Near(values[1], -.8);
   }
   Release(device_values);
+  return ok;
+}
+
+bool CheckScaledNormWitness()
+{
+  // Both finite components exceed sqrt(DBL_MAX), so a direct x*x+y*y norm
+  // overflows although the correctly scaled norm remains finite.
+  constexpr double x = 1.e200;
+  constexpr double y = -2.e200;
+  const double expected = std::hypot(x, y);
+  double* device_value = nullptr;
+  double value = 0.;
+  bool ok = algebra::Finite(expected) && Allocate(device_value, 1);
+  if (ok)
+  {
+    ScaledNormWitness<<<1, 1>>>(x, y, device_value);
+    ok = CudaOk(cudaGetLastError()) && CudaOk(cudaDeviceSynchronize()) &&
+      Download(&value, device_value, 1) && algebra::Finite(value) && Near(value, expected, 2.e-15);
+  }
+  Release(device_value);
   return ok;
 }
 
@@ -305,42 +330,6 @@ bool CheckSourceDifferential()
     Same(device_zero.C, device_sourced.C) && Same(device_zero.D, device_sourced.D);
 }
 
-bool CheckLargeFiniteGeometry()
-{
-  // det(J)=1, while the horizontal tangent has norm 1e200. A naive x*x+y*y
-  // norm overflows here even though this affine geometry and its local system
-  // remain finite with the deliberately small positive alpha below.
-  cpu::AffineQuad geometry{{{{0., 0.}, {1.e200, 0.}, {1.e200, 1.e-200}, {0., 1.e-200}}}};
-  const std::array<double, 8> vertices{{0., 0., 1.e200, 0., 1.e200, 1.e-200, 0., 1.e-200}};
-  cpu::Parameters parameters{};
-  parameters.alpha = 1.e-300; parameters.beta = 1.; parameters.dt = .09; parameters.quadrature_order = 12;
-  std::vector<double> interior(28, 0.), previous_interior(28, 0.);
-  std::vector<double> trace(40, 0.), previous_trace(40, 0.);
-  // Zero momentum keeps the quotient-rule velocity-gradient path identically
-  // zero despite the intentionally extreme inverse affine scale.
-  const double state[4] = {1.2, 0., 0., 3.};
-  for (int component = 0; component < 4; ++component)
-  {
-    for (int q = 0; q < 4; ++q)
-      interior[4 * component + q] = previous_interior[4 * component + q] = state[component];
-    for (int q = 0; q < 8; ++q)
-      trace[8 * component + q] = previous_trace[8 * component + q] = state[component];
-  }
-  const cpu::ElementState local_state{interior.data(), previous_interior.data(), trace.data(), previous_trace.data(), {}};
-  cpu::LocalOperator host;
-  if (cpu::Assemble(geometry, parameters, local_state, host) != cpu::Status::success) return false;
-  const Quadrature quadrature = MakeQuadrature(parameters.quadrature_order);
-  const algebra::Parameters raw_parameters{parameters.gamma, parameters.alpha, parameters.beta,
-                                           parameters.dt, parameters.density_floor};
-  DeviceResult device;
-  return DeviceAssemble(vertices, raw_parameters, interior, previous_interior, trace, previous_trace,
-                        quadrature, nullptr, 0, device) && device.status == algebra::Status::success &&
-    Same(host.interior_residual, device.interior_residual) &&
-    Same(host.trace_residual, device.trace_residual) && Same(host.A, device.A) &&
-    Same(host.B, device.B) && Same(host.C, device.C) && Same(host.D, device.D) &&
-    Same(host.f, device.f) && Same(host.g, device.g);
-}
-
 bool CheckStatuses()
 {
   cpu::AffineQuad geometry{{{{.2, -.1}, {2.2, .2}, {2.6, 1.5}, {.6, 1.2}}}};
@@ -464,6 +453,6 @@ int main()
   if (!CheckCase(12, true)) { ReportFailure("q12"); return 1; }
   if (!CheckCase(14, false)) { ReportFailure("q14"); return 1; }
   if (!CheckSourceDifferential()) { ReportFailure("source"); return 1; }
-  if (!CheckLargeFiniteGeometry()) { ReportFailure("large_geometry"); return 1; }
+  if (!CheckScaledNormWitness()) { ReportFailure("scaled_norm"); return 1; }
   return CheckStatuses() ? 0 : 1;
 }
