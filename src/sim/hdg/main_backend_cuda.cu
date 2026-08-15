@@ -309,23 +309,25 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   if (!ExactTextConsensus(serialized_mesh))
     return Reject("CUDA HDG serial mesh content differs between MPI ranks");
 
-  std::optional<CaseContext> context;
+  std::unique_ptr<mfem::ParMesh> refined_mesh;
+  MeshBuildMetadata refined_metadata;
+  long long expected_global_elements = 0;
+  long long local_refined_elements = 0;
   try
   {
-    MeshBuildMetadata metadata;
-    metadata.mesh_path = mesh_path;
-    metadata.mesh_path_precedence = request.options.mesh_file.empty()
+    refined_metadata.mesh_path = mesh_path;
+    refined_metadata.mesh_path_precedence = request.options.mesh_file.empty()
         ? MeshPathPrecedence::CaseDefault : MeshPathPrecedence::CommandLineOverride;
-    metadata.serial_refinement_levels = request.options.ser_ref_levels;
-    metadata.parallel_refinement_levels = request.options.par_ref_levels;
-    metadata.serial_element_count = serial_mesh->GetNE();
-    auto parallel_mesh = std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD,
-                                                         *serial_mesh);
+    refined_metadata.serial_refinement_levels = request.options.ser_ref_levels;
+    refined_metadata.parallel_refinement_levels = request.options.par_ref_levels;
+    refined_metadata.serial_element_count = serial_mesh->GetNE();
+    refined_mesh = std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD,
+                                                   *serial_mesh);
     serial_mesh->Clear();
-    metadata.local_elements_after_partitioning = parallel_mesh->GetNE();
-    RefineParMesh(*parallel_mesh, request.options.par_ref_levels);
-    metadata.local_elements_after_parallel_refinement = parallel_mesh->GetNE();
-    long long expected_global_elements = metadata.serial_element_count;
+    refined_metadata.local_elements_after_partitioning = refined_mesh->GetNE();
+    RefineParMesh(*refined_mesh, request.options.par_ref_levels);
+    refined_metadata.local_elements_after_parallel_refinement = refined_mesh->GetNE();
+    expected_global_elements = refined_metadata.serial_element_count;
     for (int level = 0; level < request.options.par_ref_levels; ++level)
     {
       if (expected_global_elements >
@@ -333,19 +335,35 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         throw std::overflow_error("CUDA HDG refined element census overflow");
       expected_global_elements *= 4;
     }
-    const long long local_refined_elements = parallel_mesh->GetNE();
-    long long global_refined_elements = 0;
-    if (MPI_Allreduce(&local_refined_elements, &global_refined_elements, 1,
-                      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS ||
-        global_refined_elements != expected_global_elements)
-      throw std::runtime_error("CUDA HDG parallel refinement census mismatch");
-    context.emplace(std::move(parallel_mesh), std::move(metadata));
+    local_refined_elements = refined_mesh->GetNE();
     local_ok = true;
   }
   catch (...) { reason = "CUDA HDG periodic mesh construction failed"; }
-  if (!CollectiveAll(context.has_value()))
+  if (!CollectiveAll(local_ok))
     return Reject(reason.empty() ? "CUDA HDG mesh construction failed on another rank"
                                  : reason);
+
+  // No rank can enter this census until every rank has completed local mesh
+  // construction, refinement, and expected-count arithmetic.  The count is
+  // therefore both collective-order safe and an observable refinement gate.
+  long long global_refined_elements = 0;
+  const bool census_complete = MPI_Allreduce(
+      &local_refined_elements, &global_refined_elements, 1,
+      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool census_matches = census_complete &&
+      global_refined_elements == expected_global_elements;
+  if (!CollectiveAll(census_matches))
+    return Reject("CUDA HDG parallel refinement census mismatch");
+
+  std::optional<CaseContext> context;
+  try
+  {
+    context.emplace(std::move(refined_mesh), std::move(refined_metadata));
+    local_ok = true;
+  }
+  catch (...) { local_ok = false; }
+  if (!CollectiveAll(context.has_value() && local_ok))
+    return Reject("CUDA HDG mesh context publication failed on another rank");
 
   local_ok = false;
   try
