@@ -409,11 +409,13 @@ bool FillUniformInterior(const Layout& layout, mfem::Vector& values)
 
 bool CheckUniformTraceGather(const Layout& layout, const mfem::Vector& values)
 {
+  mfem::Vector local_values(layout.TraceLocalVSize());
+  if (!layout.DistributeTrace(values, local_values)) { return false; }
   const double state[5]{1.0, 0.12, -0.04, 2.75, 0.86};
   for (int element = 0; element < layout.LocalElementCount(); ++element)
   {
     mfem::Vector gathered(40);
-    if (!layout.GatherTraceElement(element, values, gathered)) { return false; }
+    if (!layout.GatherTraceElement(element, local_values, gathered)) { return false; }
     for (int component = 0; component < 5; ++component)
     {
       for (int face_dof = 0; face_dof < 8; ++face_dof)
@@ -771,12 +773,8 @@ bool Check(const MPI_Comm communicator)
     return false;
   }
   ok = FillUniformInterior(periodic_layout, periodic_current_interior);
-  if (!Require(communicator, ok, "periodic current interior setup"))
-  {
-    return false;
-  }
-  ok = FillUniformInterior(periodic_layout, periodic_previous_interior);
-  if (!Require(communicator, ok, "periodic previous interior setup"))
+  ok = FillUniformInterior(periodic_layout, periodic_previous_interior) && ok;
+  if (!Require(communicator, ok, "periodic uniform interior setup"))
   {
     return false;
   }
