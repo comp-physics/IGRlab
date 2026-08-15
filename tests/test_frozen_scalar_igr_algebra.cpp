@@ -11,7 +11,9 @@ namespace
 {
 
 using ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFlux;
+using ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFluxJacobian;
 using ::dg_igr::frozen_scalar_igr_algebra::AddTensorSigmaFlux;
+using ::dg_igr::frozen_scalar_igr_algebra::AddTensorSigmaFluxJacobian;
 using ::dg_igr::frozen_scalar_igr_algebra::AddTwoStateAverageNormalSigmaFlux;
 using ::dg_igr::frozen_scalar_igr_algebra::AlphaOverDensity;
 using ::dg_igr::frozen_scalar_igr_algebra::
@@ -257,6 +259,233 @@ void CheckFluxIdentities(int dimension, Checks& checks)
   }
 }
 
+void CheckFluxJacobians(int dimension, Checks& checks)
+{
+  const int equations = dimension + 2;
+  const int energy_equation = dimension + 1;
+  constexpr mfem::real_t density_floor = static_cast<mfem::real_t>(0.5);
+  constexpr mfem::real_t sigma = static_cast<mfem::real_t>(1.25);
+  constexpr mfem::real_t fd_step = static_cast<mfem::real_t>(1.0e-6);
+  const std::array<mfem::real_t, 3> normal{{static_cast<mfem::real_t>(0.5),
+                                            static_cast<mfem::real_t>(-1.0),
+                                            static_cast<mfem::real_t>(2.0)}};
+  const std::array<mfem::real_t, 3> momentum{{static_cast<mfem::real_t>(1.0),
+                                              static_cast<mfem::real_t>(-2.0),
+                                              static_cast<mfem::real_t>(0.25)}};
+
+  for (const mfem::real_t density : {static_cast<mfem::real_t>(1.75),
+                                     static_cast<mfem::real_t>(0.25)})
+  {
+    const bool above_floor = density > density_floor;
+    std::array<mfem::real_t, 5> state{};
+    std::array<mfem::real_t, 75> tensor_jacobian{};
+    std::array<mfem::real_t, 25> normal_jacobian{};
+    state[0] = density;
+    for (int d = 0; d < dimension; ++d)
+    {
+      state[1 + d] = momentum[d];
+    }
+
+    AddTensorSigmaFluxJacobian(dimension,
+                               state.data(),
+                               1,
+                               sigma,
+                               density_floor,
+                               tensor_jacobian.data(),
+                               1,
+                               equations,
+                               equations * equations);
+    AddNormalSigmaFluxJacobian(dimension,
+                               state.data(),
+                               1,
+                               normal.data(),
+                               1,
+                               sigma,
+                               density_floor,
+                               normal_jacobian.data(),
+                               1,
+                               equations);
+
+    mfem::real_t normal_momentum = static_cast<mfem::real_t>(0.0);
+    for (int d = 0; d < dimension; ++d)
+    {
+      normal_momentum += momentum[d] * normal[d];
+    }
+    const mfem::real_t inverse_density =
+      static_cast<mfem::real_t>(1.0) /
+      (above_floor ? density : density_floor);
+    for (int equation = 0; equation < equations; ++equation)
+    {
+      for (int state_component = 0; state_component < equations;
+           ++state_component)
+      {
+        mfem::real_t normal_expected = static_cast<mfem::real_t>(0.0);
+        if (equation == energy_equation && state_component == 0 &&
+            above_floor)
+        {
+          normal_expected = -sigma * normal_momentum / (density * density);
+        }
+        if (equation == energy_equation && state_component >= 1 &&
+            state_component <= dimension)
+        {
+          normal_expected = sigma * normal[state_component - 1] * inverse_density;
+        }
+        checks.Near(normal_jacobian[equation + equations * state_component],
+                    normal_expected,
+                    static_cast<mfem::real_t>(2.0e-14),
+                    "normal sigma Jacobian analytic dim=" +
+                      std::to_string(dimension));
+
+        mfem::real_t normal_contraction = static_cast<mfem::real_t>(0.0);
+        for (int d = 0; d < dimension; ++d)
+        {
+          mfem::real_t tensor_expected = static_cast<mfem::real_t>(0.0);
+          if (equation == energy_equation && state_component == 0 &&
+              above_floor)
+          {
+            tensor_expected = -sigma * momentum[d] / (density * density);
+          }
+          if (equation == energy_equation && state_component == 1 + d)
+          {
+            tensor_expected = sigma * inverse_density;
+          }
+          const mfem::real_t tensor_actual =
+            tensor_jacobian[equation + equations * state_component +
+                            equations * equations * d];
+          checks.Near(tensor_actual,
+                      tensor_expected,
+                      static_cast<mfem::real_t>(2.0e-14),
+                      "tensor sigma Jacobian analytic dim=" +
+                        std::to_string(dimension));
+          normal_contraction += tensor_actual * normal[d];
+        }
+        checks.Near(normal_contraction,
+                    normal_jacobian[equation + equations * state_component],
+                    static_cast<mfem::real_t>(2.0e-14),
+                    "Jacobian tensor-normal contraction dim=" +
+                      std::to_string(dimension));
+      }
+    }
+
+    for (int state_component = 0; state_component < equations;
+         ++state_component)
+    {
+      std::array<mfem::real_t, 5> state_minus = state;
+      std::array<mfem::real_t, 5> state_plus = state;
+      std::array<mfem::real_t, 15> tensor_minus{};
+      std::array<mfem::real_t, 15> tensor_plus{};
+      std::array<mfem::real_t, 5> normal_minus{};
+      std::array<mfem::real_t, 5> normal_plus{};
+      state_minus[state_component] -= fd_step;
+      state_plus[state_component] += fd_step;
+      AddTensorSigmaFlux(dimension,
+                         state_minus.data(),
+                         1,
+                         sigma,
+                         density_floor,
+                         tensor_minus.data(),
+                         1,
+                         equations);
+      AddTensorSigmaFlux(dimension,
+                         state_plus.data(),
+                         1,
+                         sigma,
+                         density_floor,
+                         tensor_plus.data(),
+                         1,
+                         equations);
+      AddNormalSigmaFlux(dimension,
+                         state_minus.data(),
+                         1,
+                         normal.data(),
+                         1,
+                         sigma,
+                         density_floor,
+                         normal_minus.data(),
+                         1);
+      AddNormalSigmaFlux(dimension,
+                         state_plus.data(),
+                         1,
+                         normal.data(),
+                         1,
+                         sigma,
+                         density_floor,
+                         normal_plus.data(),
+                         1);
+      for (int equation = 0; equation < equations; ++equation)
+      {
+        const mfem::real_t normal_fd =
+          (normal_plus[equation] - normal_minus[equation]) /
+          (static_cast<mfem::real_t>(2.0) * fd_step);
+        checks.Near(normal_fd,
+                    normal_jacobian[equation + equations * state_component],
+                    static_cast<mfem::real_t>(2.0e-8),
+                    "normal sigma Jacobian centered FD dim=" +
+                      std::to_string(dimension));
+        for (int d = 0; d < dimension; ++d)
+        {
+          const mfem::real_t tensor_fd =
+            (tensor_plus[equation + equations * d] -
+             tensor_minus[equation + equations * d]) /
+            (static_cast<mfem::real_t>(2.0) * fd_step);
+          checks.Near(tensor_fd,
+                      tensor_jacobian[equation + equations * state_component +
+                                      equations * equations * d],
+                      static_cast<mfem::real_t>(2.0e-8),
+                      "tensor sigma Jacobian centered FD dim=" +
+                        std::to_string(dimension));
+        }
+      }
+    }
+  }
+
+  std::array<mfem::real_t, 5> zero_momentum_state{};
+  std::array<mfem::real_t, 3> zero_normal{};
+  std::array<mfem::real_t, 75> tensor_jacobian{};
+  std::array<mfem::real_t, 25> normal_jacobian{};
+  zero_momentum_state[0] = static_cast<mfem::real_t>(1.75);
+  AddTensorSigmaFluxJacobian(dimension,
+                             zero_momentum_state.data(),
+                             1,
+                             sigma,
+                             density_floor,
+                             tensor_jacobian.data(),
+                             1,
+                             equations,
+                             equations * equations);
+  AddNormalSigmaFluxJacobian(dimension,
+                             zero_momentum_state.data(),
+                             1,
+                             zero_normal.data(),
+                             1,
+                             sigma,
+                             density_floor,
+                             normal_jacobian.data(),
+                             1,
+                             equations);
+  for (int equation = 0; equation < equations; ++equation)
+  {
+    for (int state_component = 0; state_component < equations;
+         ++state_component)
+    {
+      checks.Near(normal_jacobian[equation + equations * state_component],
+                  static_cast<mfem::real_t>(0.0),
+                  static_cast<mfem::real_t>(0.0),
+                  "zero-normal sigma Jacobian dim=" +
+                    std::to_string(dimension));
+    }
+  }
+  for (int d = 0; d < dimension; ++d)
+  {
+    checks.Near(tensor_jacobian[energy_equation +
+                                equations * equations * d],
+                static_cast<mfem::real_t>(0.0),
+                static_cast<mfem::real_t>(0.0),
+                "zero-momentum tensor density derivative dim=" +
+                  std::to_string(dimension));
+  }
+}
+
 void CheckTwoStateAverage(int dimension, Checks& checks)
 {
   constexpr mfem::real_t sigma = static_cast<mfem::real_t>(0.75);
@@ -422,6 +651,7 @@ int main()
   {
     CheckGradientInputs(dimension, checks);
     CheckFluxIdentities(dimension, checks);
+    CheckFluxJacobians(dimension, checks);
     CheckTwoStateAverage(dimension, checks);
   }
 

@@ -225,6 +225,109 @@ MFEM_HOST_DEVICE inline void AddNormalSigmaFlux(int dimension,
     sigma * (normal_momentum / density);
 }
 
+/** Derivative of one tensor energy flux component with respect to density.
+ *
+ * Sigma is frozen during the state linearization.  The floored velocity is
+ * piecewise differentiable, so the density derivative is intentionally zero
+ * on the floor branch.
+ */
+MFEM_HOST_DEVICE inline mfem::real_t
+TensorSigmaEnergyDensityJacobianTerm(mfem::real_t sigma,
+                                     mfem::real_t momentum,
+                                     mfem::real_t density,
+                                     mfem::real_t density_floor)
+{
+  if (density <= density_floor)
+  {
+    return static_cast<mfem::real_t>(0.0);
+  }
+  return -sigma * momentum / (density * density);
+}
+
+/** Derivative of one tensor energy flux component with respect to momentum. */
+MFEM_HOST_DEVICE inline mfem::real_t
+TensorSigmaEnergyMomentumJacobianTerm(mfem::real_t sigma,
+                                      mfem::real_t density,
+                                      mfem::real_t density_floor)
+{
+  return sigma / DensityWithFloor(density, density_floor);
+}
+
+/** Add the frozen-Sigma increment to the tensor-flux Jacobian.
+ *
+ * The Jacobian layout is [flux equation][state component][flux direction],
+ * with the corresponding explicitly supplied strides.  Frozen Sigma has no
+ * derivative with respect to the conservative state, so only the energy row
+ * receives an increment.
+ */
+MFEM_HOST_DEVICE inline void AddTensorSigmaFluxJacobian(
+  int dimension,
+  const mfem::real_t* state,
+  int state_component_stride,
+  mfem::real_t sigma,
+  mfem::real_t density_floor,
+  mfem::real_t* tensor_flux_jacobian,
+  int jacobian_flux_equation_stride,
+  int jacobian_state_component_stride,
+  int jacobian_direction_stride)
+{
+  const int energy_equation = 1 + dimension;
+  const mfem::real_t density = state[0];
+  const mfem::real_t momentum_jacobian =
+    TensorSigmaEnergyMomentumJacobianTerm(sigma, density, density_floor);
+  for (int d = 0; d < dimension; ++d)
+  {
+    tensor_flux_jacobian[energy_equation * jacobian_flux_equation_stride +
+                         d * jacobian_direction_stride] +=
+      TensorSigmaEnergyDensityJacobianTerm(
+        sigma,
+        state[(1 + d) * state_component_stride],
+        density,
+        density_floor);
+    tensor_flux_jacobian[energy_equation * jacobian_flux_equation_stride +
+                         (1 + d) * jacobian_state_component_stride +
+                         d * jacobian_direction_stride] += momentum_jacobian;
+  }
+}
+
+/** Add the frozen-Sigma increment to the normal-flux Jacobian.
+ *
+ * The Jacobian layout is [flux equation][state component].  Sigma is frozen,
+ * so its state derivative is omitted.
+ */
+MFEM_HOST_DEVICE inline void AddNormalSigmaFluxJacobian(
+  int dimension,
+  const mfem::real_t* state,
+  int state_component_stride,
+  const mfem::real_t* normal,
+  int normal_stride,
+  mfem::real_t sigma,
+  mfem::real_t density_floor,
+  mfem::real_t* normal_flux_jacobian,
+  int jacobian_flux_equation_stride,
+  int jacobian_state_component_stride)
+{
+  const int energy_equation = 1 + dimension;
+  const mfem::real_t density = state[0];
+  mfem::real_t normal_momentum = static_cast<mfem::real_t>(0.0);
+  for (int d = 0; d < dimension; ++d)
+  {
+    normal_momentum +=
+      state[(1 + d) * state_component_stride] * normal[d * normal_stride];
+  }
+  normal_flux_jacobian[energy_equation * jacobian_flux_equation_stride] +=
+    TensorSigmaEnergyDensityJacobianTerm(
+      sigma, normal_momentum, density, density_floor);
+  const mfem::real_t momentum_jacobian =
+    TensorSigmaEnergyMomentumJacobianTerm(sigma, density, density_floor);
+  for (int d = 0; d < dimension; ++d)
+  {
+    normal_flux_jacobian[energy_equation * jacobian_flux_equation_stride +
+                         (1 + d) * jacobian_state_component_stride] +=
+      momentum_jacobian * normal[d * normal_stride];
+  }
+}
+
 /** Exact line average of (m.n)/rho between two positive-density states. */
 MFEM_HOST_DEVICE inline mfem::real_t
 ExactAverageNormalVelocity(int dimension,
