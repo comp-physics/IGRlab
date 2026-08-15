@@ -948,7 +948,7 @@ bool BoundaryPolicyViolationsRejectedBeforeDevice(mfem::ParMesh& mesh,
   unsupported_config.borrowed_boundary_policies = {unsupported.data(), unsupported.size()};
 
   std::array<CudaStaticBoundaryPolicy, 4> nonfinite = StaticPhysicalPolicies();
-  nonfinite[0].reference_state[0] = std::numeric_limits<double>::quiet_NaN();
+  nonfinite[3].reference_state[0] = std::numeric_limits<double>::quiet_NaN();
   CudaConfig nonfinite_config = base;
   nonfinite_config.borrowed_boundary_policies = {nonfinite.data(), nonfinite.size()};
 
@@ -1103,7 +1103,7 @@ bool CheckNegatives(const int ranks)
   unsupported_boundary_policy.borrowed_boundary_policies =
       {unsupported.data(), unsupported.size()};
   std::array<CudaStaticBoundaryPolicy, 4> nonfinite = StaticPhysicalPolicies();
-  nonfinite[0].reference_state[0] = std::numeric_limits<double>::quiet_NaN();
+  nonfinite[3].reference_state[0] = std::numeric_limits<double>::quiet_NaN();
   CudaConfig nonfinite_boundary_policy = unknown_boundary_policy;
   nonfinite_boundary_policy.borrowed_boundary_policies =
       {nonfinite.data(), nonfinite.size()};
