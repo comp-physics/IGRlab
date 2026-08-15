@@ -50,6 +50,13 @@ bool Finite(const mfem::Vector& values)
   return true;
 }
 
+bool SameBits(const mfem::Vector& left, const mfem::Vector& right)
+{
+  if (left.Size() != right.Size()) return false;
+  return left.Size() == 0 || std::memcmp(left.HostRead(), right.HostRead(),
+      static_cast<std::size_t>(left.Size()) * sizeof(double)) == 0;
+}
+
 double NormSquared(const MPI_Comm communicator, const mfem::Vector& values)
 {
   return mfem::InnerProduct(communicator, values, values);
@@ -649,7 +656,8 @@ bool Run(const MPI_Comm communicator, const Layout& layout,
          const std::vector<local::AffineQuad>& quads,
          const mfem::ParFiniteElementSpace& source_space,
          const mfem::Vector& source, const double dt,
-         detail::TracedScalarIgrP1GlobalStepOutput& output)
+         detail::TracedScalarIgrP1GlobalStepOutput& output,
+         detail::TracedScalarIgrP1Scratch* const scratch = nullptr)
 {
   const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
   if (trace_space == nullptr) { return false; }
@@ -668,7 +676,10 @@ bool Run(const MPI_Comm communicator, const Layout& layout,
       communicator, &layout, quads.data(), static_cast<int>(quads.size()),
       parameters, &current_trace, &previous_trace, &current_interior,
       &previous_interior, &source_space, &source};
-  return detail::ComputeTracedScalarIgrP1GlobalStep(input, output) ==
+  const detail::TracedScalarIgrP1GlobalStepResult result = scratch
+      ? detail::ComputeTracedScalarIgrP1GlobalStep(input, output, *scratch)
+      : detail::ComputeTracedScalarIgrP1GlobalStep(input, output);
+  return result ==
       detail::TracedScalarIgrP1GlobalStepResult::success;
 }
 
@@ -701,6 +712,30 @@ bool Check(const MPI_Comm communicator)
       Run(communicator, layout, quads, source_space, source_b, 0.05, second) &&
       Run(communicator, layout, quads, source_space, source_a, 0.08, changed_dt);
   if (!Require(communicator, ok, "nonconstant/dt global steps")) { return false; }
+
+  detail::TracedScalarIgrP1Scratch scratch(communicator, layout);
+  detail::TracedScalarIgrP1GlobalStepOutput scratch_first, scratch_repeat,
+      scratch_source, scratch_dt;
+  ok = scratch.IsUsable();
+  if (!Require(communicator, ok, "scratch binding")) { return false; }
+  ok = Run(communicator, layout, quads, source_space, source_a, 0.05,
+           scratch_first, &scratch) &&
+      Run(communicator, layout, quads, source_space, source_a, 0.05,
+          scratch_repeat, &scratch) &&
+      Run(communicator, layout, quads, source_space, source_b, 0.05,
+          scratch_source, &scratch) &&
+      Run(communicator, layout, quads, source_space, source_a, 0.08,
+          scratch_dt, &scratch);
+  const bool scratch_match = SameBits(scratch_first.trace_increment, first.trace_increment) &&
+      SameBits(scratch_first.interior_increment, first.interior_increment) &&
+      SameBits(scratch_repeat.trace_increment, scratch_first.trace_increment) &&
+      SameBits(scratch_repeat.interior_increment, scratch_first.interior_increment) &&
+      !SameBits(scratch_source.trace_increment, scratch_first.trace_increment) &&
+      !SameBits(scratch_dt.trace_increment, scratch_first.trace_increment);
+  if (!Require(communicator, ok && scratch_match, "scratch repeated global steps"))
+  {
+    return false;
+  }
   const double trace_difference = NormSquared(communicator, first.trace_increment) +
       NormSquared(communicator, first.interior_increment);
   mfem::Vector source_delta(first.trace_increment);

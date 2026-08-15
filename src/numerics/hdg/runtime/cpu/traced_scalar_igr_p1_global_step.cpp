@@ -441,6 +441,42 @@ struct EphemeralStepState final
   TracedScalarIgrP1TraceSolveOutput solved;
 };
 
+struct TracedScalarIgrP1Scratch::Implementation final
+{
+  MPI_Comm communicator = MPI_COMM_NULL;
+  const BorrowedP1DGInterfaceLayout* layout = nullptr;
+  const mfem::ParFiniteElementSpace* interior_space = nullptr;
+  const mfem::ParFiniteElementSpace* trace_space = nullptr;
+  const mfem::ParMesh* mesh = nullptr;
+  int interior_size = -1;
+  int trace_true_size = -1;
+  int trace_local_size = -1;
+  int elements = -1;
+  EphemeralStepState state{};
+
+  bool Matches(const TracedScalarIgrP1GlobalStepInput& input) const noexcept
+  {
+    int comparison = MPI_UNEQUAL;
+    const bool communicator_matches = input.communicator != MPI_COMM_NULL &&
+        MPI_Comm_compare(communicator, input.communicator, &comparison) == MPI_SUCCESS &&
+        (comparison == MPI_IDENT || comparison == MPI_CONGRUENT);
+    return communicator_matches && input.layout == layout && layout &&
+        layout->IsUsable() && layout->InteriorSpace() == interior_space &&
+        layout->TraceSpace() == trace_space && interior_space && trace_space &&
+        interior_space->GetParMesh() == mesh && trace_space->GetParMesh() == mesh &&
+        layout->InteriorLocalVSize() == interior_size &&
+        layout->TraceTrueVSize() == trace_true_size &&
+        layout->TraceLocalVSize() == trace_local_size &&
+        layout->LocalElementCount() == elements &&
+        state.current_local_trace.Capacity() >= trace_local_size &&
+        state.previous_local_trace.Capacity() >= trace_local_size &&
+        state.raw_local_trace.Capacity() >= trace_local_size &&
+        state.raw_true_trace.Capacity() >= trace_true_size &&
+        state.local_rhs.Capacity() >= trace_local_size &&
+        state.true_rhs_values.Capacity() >= trace_true_size;
+  }
+};
+
 // Input/trace/source staging, element assembly/condensation, true-system
 // assembly, and solve/recovery remain deliberately ordered in this one path.
 // The next scratch leaf can replace only this ephemeral owner without cloning
@@ -480,6 +516,10 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
   std::vector<double>& source_samples = state.source_samples;
   std::vector<double>& schur = state.schur;
   std::vector<double>& reduced = state.reduced;
+  // Retained scratch preserves capacity only; every numerical phase starts
+  // from the same empty block sequence as the legacy ephemeral call.
+  a.clear(); b.clear(); c.clear(); d.clear(); f.clear(); g.clear();
+  source_samples.clear(); schur.clear(); reduced.clear();
   bool local_ok = true;
   try
   {
@@ -743,6 +783,71 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
 {
   EphemeralStepState state;
   return ComputeEphemeralStep(input, output, state);
+}
+
+TracedScalarIgrP1Scratch::TracedScalarIgrP1Scratch(
+    const MPI_Comm communicator, const BorrowedP1DGInterfaceLayout& layout) noexcept
+{
+  try
+  {
+    implementation_ = std::make_unique<Implementation>();
+    Implementation& state = *implementation_;
+    state.communicator = communicator;
+    state.layout = &layout;
+    state.interior_space = layout.InteriorSpace();
+    state.trace_space = layout.TraceSpace();
+    state.mesh = state.interior_space ? state.interior_space->GetParMesh() : nullptr;
+    state.interior_size = layout.InteriorLocalVSize();
+    state.trace_true_size = layout.TraceTrueVSize();
+    state.trace_local_size = layout.TraceLocalVSize();
+    state.elements = layout.LocalElementCount();
+    const std::size_t count = static_cast<std::size_t>(std::max(0, state.elements));
+    const mfem::IntegrationRule& maximum_rule = mfem::IntRules.Get(
+        mfem::Geometry::SQUARE, 32);
+    state.state.current_local_trace.SetSize(state.trace_local_size);
+    state.state.previous_local_trace.SetSize(state.trace_local_size);
+    state.state.raw_local_trace.SetSize(state.trace_local_size);
+    state.state.raw_true_trace.SetSize(state.trace_true_size);
+    state.state.local_rhs.SetSize(state.trace_local_size);
+    state.state.true_rhs_values.SetSize(state.trace_true_size);
+    state.state.a.reserve(count * 28 * 28); state.state.b.reserve(count * 28 * 40);
+    state.state.c.reserve(count * 40 * 28); state.state.d.reserve(count * 40 * 40);
+    state.state.f.reserve(count * 28); state.state.g.reserve(count * 40);
+    state.state.schur.reserve(count * 40 * 40); state.state.reduced.reserve(count * 40);
+    state.state.source_samples.reserve(count *
+        static_cast<std::size_t>(maximum_rule.GetNPoints()) * 4);
+  }
+  catch (...) { implementation_.reset(); }
+}
+
+TracedScalarIgrP1Scratch::~TracedScalarIgrP1Scratch() = default;
+TracedScalarIgrP1Scratch::TracedScalarIgrP1Scratch(
+    TracedScalarIgrP1Scratch&&) noexcept = default;
+TracedScalarIgrP1Scratch& TracedScalarIgrP1Scratch::operator=(
+    TracedScalarIgrP1Scratch&&) noexcept = default;
+
+bool TracedScalarIgrP1Scratch::IsUsable() const noexcept
+{
+  if (!implementation_ || implementation_->communicator == MPI_COMM_NULL ||
+      implementation_->layout == nullptr) return false;
+  TracedScalarIgrP1GlobalStepInput binding{};
+  binding.communicator = implementation_->communicator;
+  binding.layout = implementation_->layout;
+  return implementation_->Matches(binding);
+}
+
+TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
+    const TracedScalarIgrP1GlobalStepInput& input,
+    TracedScalarIgrP1GlobalStepOutput& output,
+    TracedScalarIgrP1Scratch& scratch) noexcept
+{
+  const bool local_ok = scratch.implementation_ && scratch.implementation_->Matches(input);
+  if (input.communicator == MPI_COMM_NULL ||
+      !CollectiveAll(input.communicator, local_ok))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
+  return ComputeEphemeralStep(input, output, scratch.implementation_->state);
 }
 
 } // namespace dg::hdg::runtime::cpu::detail

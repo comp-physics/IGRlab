@@ -14,6 +14,8 @@
 
 #include <mfem.hpp>
 
+#include <memory>
+
 namespace dg::hdg::runtime::cpu::detail
 {
 
@@ -84,6 +86,32 @@ enum class TracedScalarIgrP1GlobalStepResult : unsigned char
 { success, inadmissible_trial, failure };
 
 /**
+ * Detail-only retained non-Hypre storage for repeated p1 global steps.
+ * It is bound to one communicator and one borrowed layout; it has no solver,
+ * session, publication, or persistence contract.
+ */
+class TracedScalarIgrP1Scratch final
+{
+public:
+  TracedScalarIgrP1Scratch(MPI_Comm communicator,
+                           const BorrowedP1DGInterfaceLayout& layout) noexcept;
+  ~TracedScalarIgrP1Scratch();
+  TracedScalarIgrP1Scratch(const TracedScalarIgrP1Scratch&) = delete;
+  TracedScalarIgrP1Scratch& operator=(const TracedScalarIgrP1Scratch&) = delete;
+  TracedScalarIgrP1Scratch(TracedScalarIgrP1Scratch&&) noexcept;
+  TracedScalarIgrP1Scratch& operator=(TracedScalarIgrP1Scratch&&) noexcept;
+
+  bool IsUsable() const noexcept;
+
+private:
+  struct Implementation;
+  std::unique_ptr<Implementation> implementation_;
+  friend TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
+      const TracedScalarIgrP1GlobalStepInput&, TracedScalarIgrP1GlobalStepOutput&,
+      TracedScalarIgrP1Scratch&) noexcept;
+};
+
+/**
  * Compute exactly one global Newton linearization.  Unless the result is
  * success, @a output is unchanged.  inadmissible_trial is reserved solely for
  * a local operator inadmissible_state; all structural, nonfinite, exception,
@@ -92,5 +120,10 @@ enum class TracedScalarIgrP1GlobalStepResult : unsigned char
 TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
     const TracedScalarIgrP1GlobalStepInput& input,
     TracedScalarIgrP1GlobalStepOutput& output) noexcept;
+
+TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
+    const TracedScalarIgrP1GlobalStepInput& input,
+    TracedScalarIgrP1GlobalStepOutput& output,
+    TracedScalarIgrP1Scratch& scratch) noexcept;
 
 } // namespace dg::hdg::runtime::cpu::detail
