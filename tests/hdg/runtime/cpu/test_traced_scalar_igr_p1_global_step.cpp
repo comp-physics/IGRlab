@@ -398,6 +398,41 @@ bool FillUniformInterior(const Layout& layout, mfem::Vector& values)
   return true;
 }
 
+bool CheckUniformTraceGather(const Layout& layout, const mfem::Vector& values)
+{
+  const double state[5]{1.0, 0.12, -0.04, 2.75, 0.86};
+  for (int element = 0; element < layout.LocalElementCount(); ++element)
+  {
+    mfem::Vector gathered(40);
+    if (!layout.GatherTraceElement(element, values, gathered)) { return false; }
+    for (int component = 0; component < 5; ++component)
+    {
+      for (int face_dof = 0; face_dof < 8; ++face_dof)
+      {
+        if (std::abs(gathered[component * 8 + face_dof] - state[component]) >
+            1.0e-14)
+        {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+void ReportPeriodicCancellation(const MPI_Comm communicator,
+                                const RawUncondensedResidual& residual)
+{
+  int rank = -1;
+  MPI_Comm_rank(communicator, &rank);
+  if (rank == 0)
+  {
+    std::cerr << "periodic raw trace: element="
+              << residual.element_trace_norm_squared << " true="
+              << residual.true_trace_norm_squared << '\n';
+  }
+}
+
 bool CheckLocalRecovery(const MPI_Comm communicator, const Layout& layout,
                         const std::vector<local::AffineQuad>& quads,
                         const mfem::ParFiniteElementSpace& source_space,
@@ -717,18 +752,23 @@ bool Check(const MPI_Comm communicator)
       periodic_current_interior, periodic_previous_interior;
   RawUncondensedResidual periodic_raw;
   ok = periodic_layout.IsUsable() && periodic_trace != nullptr &&
-      BuildAffineQuads(periodic_mesh, periodic_quads) &&
-      FillUniformTrace(periodic_mesh, *periodic_trace, periodic_current_trace) &&
+      BuildAffineQuads(periodic_mesh, periodic_quads);
+  if (!Require(communicator, ok, "periodic layout/geometry setup")) { return false; }
+  ok = FillUniformTrace(periodic_mesh, *periodic_trace, periodic_current_trace) &&
       FillUniformTrace(periodic_mesh, *periodic_trace, periodic_previous_trace) &&
+      CheckUniformTraceGather(periodic_layout, periodic_current_trace) &&
+      CheckUniformTraceGather(periodic_layout, periodic_previous_trace) &&
       FillUniformInterior(periodic_layout, periodic_current_interior) &&
-      FillUniformInterior(periodic_layout, periodic_previous_interior) &&
-      ComputeRawUncondensedResidual(communicator, periodic_layout, periodic_quads,
-          nullptr, nullptr, raw_parameters, periodic_current_trace,
-          periodic_previous_trace, periodic_current_interior,
-          periodic_previous_interior, periodic_raw) &&
+      FillUniformInterior(periodic_layout, periodic_previous_interior);
+  if (!Require(communicator, ok, "periodic oriented trace setup")) { return false; }
+  ok = ComputeRawUncondensedResidual(communicator, periodic_layout, periodic_quads,
+      nullptr, nullptr, raw_parameters, periodic_current_trace,
+      periodic_previous_trace, periodic_current_interior,
+      periodic_previous_interior, periodic_raw) &&
       periodic_raw.element_trace_norm_squared > 0.0 &&
       periodic_raw.true_trace_norm_squared <= 1.0e-26 *
           periodic_raw.element_trace_norm_squared;
+  if (!ok) { ReportPeriodicCancellation(communicator, periodic_raw); }
   if (!Require(communicator, ok, "periodic raw trace cancellation")) { return false; }
 
   ok = CheckLocalRecovery(communicator, layout, quads, source_space, source_a,
