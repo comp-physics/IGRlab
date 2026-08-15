@@ -1354,8 +1354,14 @@ public:
         result.initial_residual > 1.0e-8;
     result.final_residual = result.initial_residual;
     const double target = 1.0e-10 * (1.0 + result.initial_residual);
+    // Value-only physical boundary rows freeze the exterior state for each
+    // linearization, so the borrowed generic path is a convergent Picard
+    // iteration rather than a fully differentiated Newton update.  Match the
+    // CPU borrowed envelope while preserving the legacy W8A bound exactly.
+    const int maximum_nonlinear_updates =
+        shape_.borrowed_host_inputs ? 80 : 20;
     std::uint64_t last_product_generation = 0;
-    for (int iteration = 0; iteration < 20; ++iteration)
+    for (int iteration = 0; iteration < maximum_nonlinear_updates; ++iteration)
     {
       if (result.nonlinear_updates >= 2 && result.final_residual <= target)
         break;
