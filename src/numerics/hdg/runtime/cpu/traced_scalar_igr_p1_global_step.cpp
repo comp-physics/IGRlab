@@ -68,6 +68,35 @@ bool CopyVector(const mfem::Vector& source, mfem::Vector& destination) noexcept
   return true;
 }
 
+bool CheckedProduct(const std::size_t left, const std::size_t right,
+                    std::size_t& product) noexcept
+{
+  if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left)
+  {
+    return false;
+  }
+  product = left * right;
+  return true;
+}
+
+bool CheckedBatchCapacity(const int elements, const std::size_t entries,
+                          std::size_t& capacity) noexcept
+{
+  return elements >= 0 && CheckedProduct(static_cast<std::size_t>(elements),
+                                         entries, capacity);
+}
+
+bool HasCapacity(const mfem::Vector& values, const int required) noexcept
+{
+  return required >= 0 && values.Capacity() >= required;
+}
+
+bool HasCapacity(const std::vector<double>& values,
+                 const std::size_t required) noexcept
+{
+  return values.capacity() >= required && values.size() <= values.capacity();
+}
+
 int DecodeSignedVDof(const int signed_vdof, double& sign) noexcept
 {
   if (signed_vdof == std::numeric_limits<int>::min()) { return -1; }
@@ -281,9 +310,54 @@ bool MaxAbsAndNorm(const MPI_Comm communicator, const std::vector<double>& inter
 
 } // namespace
 
-bool SolveAndRecoverTracedScalarIgrP1Trace(
+/** Retained non-Hypre storage for one solve/recovery call. */
+struct SolveAndRecoverTracedScalarIgrP1State final
+{
+  mfem::Vector true_trace;
+  mfem::Vector next_trace;
+  mfem::Vector local_trace;
+  mfem::Vector next_interior;
+  std::vector<double> recovered;
+  std::vector<double> local_trace_values;
+  mfem::Vector gathered_trace;
+  mfem::Vector element_interior;
+  TracedScalarIgrP1TraceSolveOutput result;
+
+  bool HasExpectedStorage(const int trace_true_size, const int trace_local_size,
+                          const int interior_local_size,
+                          const int elements) const noexcept
+  {
+    std::size_t recovered_capacity = 0;
+    std::size_t local_trace_capacity = 0;
+    return trace_true_size >= 0 && trace_local_size >= 0 &&
+        interior_local_size >= 0 && elements >= 0 &&
+        CheckedBatchCapacity(elements, 28, recovered_capacity) &&
+        CheckedBatchCapacity(elements, 40, local_trace_capacity) &&
+        true_trace.Size() == trace_true_size &&
+        next_trace.Size() == trace_true_size &&
+        local_trace.Size() == trace_local_size &&
+        next_interior.Size() == interior_local_size &&
+        gathered_trace.Size() == 40 && element_interior.Size() == 28 &&
+        HasCapacity(true_trace, trace_true_size) &&
+        HasCapacity(next_trace, trace_true_size) &&
+        HasCapacity(local_trace, trace_local_size) &&
+        HasCapacity(next_interior, interior_local_size) &&
+        HasCapacity(gathered_trace, 40) && HasCapacity(element_interior, 28) &&
+        recovered.size() == recovered_capacity &&
+        local_trace_values.size() == local_trace_capacity &&
+        HasCapacity(recovered, recovered_capacity) &&
+        HasCapacity(local_trace_values, local_trace_capacity) &&
+        result.trace_increment.Size() == trace_true_size &&
+        result.interior_increment.Size() == interior_local_size &&
+        HasCapacity(result.trace_increment, trace_true_size) &&
+        HasCapacity(result.interior_increment, interior_local_size);
+  }
+};
+
+static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
     const TracedScalarIgrP1TraceSolveInput& input,
-    TracedScalarIgrP1TraceSolveOutput& output) noexcept
+    TracedScalarIgrP1TraceSolveOutput& output,
+    SolveAndRecoverTracedScalarIgrP1State& state) noexcept
 {
   if (input.communicator == MPI_COMM_NULL) { return false; }
   bool local_input_ok = input.layout != nullptr && input.trace_space != nullptr &&
@@ -317,9 +391,27 @@ bool SolveAndRecoverTracedScalarIgrP1Trace(
   {
     return false;
   }
-  mfem::HypreParVector trace_solution(
-      const_cast<mfem::ParFiniteElementSpace*>(input.trace_space));
-  trace_solution = 0.0;
+  mfem::Vector& true_trace = state.true_trace;
+  mfem::Vector& next_trace = state.next_trace;
+  mfem::Vector& local_trace = state.local_trace;
+  mfem::Vector& next_interior = state.next_interior;
+  std::vector<double>& recovered = state.recovered;
+  std::vector<double>& local_trace_values = state.local_trace_values;
+  mfem::Vector& gathered_trace = state.gathered_trace;
+  mfem::Vector& element_interior = state.element_interior;
+  bool local_ok = true;
+  try
+  {
+    true_trace.SetSize(input.layout->TraceTrueVSize()); true_trace = 0.0;
+    next_trace.SetSize(input.layout->TraceTrueVSize());
+    local_trace.SetSize(input.layout->TraceLocalVSize());
+    next_interior.SetSize(input.layout->InteriorLocalVSize());
+    gathered_trace.SetSize(40); element_interior.SetSize(28);
+    recovered.resize(static_cast<std::size_t>(elements) * 28);
+    local_trace_values.resize(static_cast<std::size_t>(elements) * 40);
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
   double linear_norm = 0.0;
 
   if (!exact_zero_rhs)
@@ -363,10 +455,10 @@ bool SolveAndRecoverTracedScalarIgrP1Trace(
     local_ok = AllFinite(scaled_solution) && residual_norm <= 1.0e-10;
     if (!CollectiveAll(input.communicator, local_ok)) { return false; }
     const double* const scaled_solution_data = scaled_solution.HostRead();
-    double* const solution = trace_solution.HostWrite();
+    double* const solution = true_trace.HostWrite();
     local_ok = (scaled_solution_data != nullptr && solution != nullptr) ||
-        trace_solution.Size() == 0;
-    for (int index = 0; index < trace_solution.Size() && local_ok; ++index)
+        true_trace.Size() == 0;
+    for (int index = 0; index < true_trace.Size() && local_ok; ++index)
     {
       solution[index] = rhs_maximum * scaled_solution_data[index];
       local_ok = Finite(solution[index]);
@@ -376,20 +468,7 @@ bool SolveAndRecoverTracedScalarIgrP1Trace(
     if (!Finite(linear_norm)) { return false; }
   }
 
-  mfem::Vector next_trace;
-  mfem::Vector local_trace;
-  mfem::Vector next_interior;
-  std::vector<double> recovered;
-  bool local_ok = true;
-  try
-  {
-    next_trace.SetSize(input.layout->TraceTrueVSize());
-    local_trace.SetSize(input.layout->TraceLocalVSize());
-    next_interior.SetSize(input.layout->InteriorLocalVSize());
-    recovered.resize(static_cast<std::size_t>(elements) * 28);
-    local_ok = CopyVector(trace_solution, next_trace);
-  }
-  catch (const std::exception&) { local_ok = false; }
+  local_ok = CopyVector(true_trace, next_trace);
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
   local_ok = input.layout->DistributeTrace(next_trace, local_trace);
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
@@ -398,17 +477,22 @@ bool SolveAndRecoverTracedScalarIgrP1Trace(
     next_interior = 0.0;
     if (elements > 0)
     {
-      std::vector<double> local_trace_values(static_cast<std::size_t>(elements) * 40);
       for (int element = 0; element < elements && local_ok; ++element)
       {
-        mfem::Vector gathered(40);
-        local_ok = input.layout->GatherTraceElement(element, local_trace, gathered);
-        if (local_ok) { std::memcpy(local_trace_values.data() + static_cast<std::size_t>(element) * 40, gathered.HostRead(), 40 * sizeof(double)); }
+        local_ok = input.layout->GatherTraceElement(element, local_trace,
+                                                    gathered_trace);
+        const double* const gathered = gathered_trace.HostRead();
+        if (local_ok && gathered != nullptr)
+        {
+          std::memcpy(local_trace_values.data() +
+                          static_cast<std::size_t>(element) * 40,
+                      gathered, 40 * sizeof(double));
+        }
+        else if (local_ok) { local_ok = false; }
       }
       if (local_ok) { local_ok = input.condensation->Recover(ConstView(local_trace_values, elements, 40, 1), View(recovered, elements, 28, 1)) == core::Status::success; }
       for (int element = 0; element < elements && local_ok; ++element)
       {
-        mfem::Vector element_interior(28);
         std::memcpy(element_interior.HostWrite(), recovered.data() + static_cast<std::size_t>(element) * 28, 28 * sizeof(double));
         local_ok = input.layout->ScatterInteriorElement(element, element_interior, next_interior);
       }
@@ -417,11 +501,31 @@ bool SolveAndRecoverTracedScalarIgrP1Trace(
   }
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
-  output.trace_increment.Swap(next_trace);
-  output.interior_increment.Swap(next_interior);
-  output.reduced_rhs_norm = rhs_norm;
-  output.linear_residual_norm = linear_norm;
+  TracedScalarIgrP1TraceSolveOutput published;
+  try
+  {
+    published.trace_increment.SetSize(next_trace.Size());
+    published.interior_increment.SetSize(next_interior.Size());
+    local_ok = CopyVector(next_trace, published.trace_increment) &&
+        CopyVector(next_interior, published.interior_increment);
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  published.reduced_rhs_norm = rhs_norm;
+  published.linear_residual_norm = linear_norm;
+  output.trace_increment.Swap(published.trace_increment);
+  output.interior_increment.Swap(published.interior_increment);
+  output.reduced_rhs_norm = published.reduced_rhs_norm;
+  output.linear_residual_norm = published.linear_residual_norm;
   return true;
+}
+
+bool SolveAndRecoverTracedScalarIgrP1Trace(
+    const TracedScalarIgrP1TraceSolveInput& input,
+    TracedScalarIgrP1TraceSolveOutput& output) noexcept
+{
+  SolveAndRecoverTracedScalarIgrP1State state;
+  return SolveAndRecoverTracedScalarIgrP1TraceWithState(input, output, state);
 }
 
 /** Per-call ownership for the one shared convenience compute path. */
@@ -438,7 +542,7 @@ struct EphemeralStepState final
   mfem::Vector local_rhs;
   mfem::Vector true_rhs_values;
   std::unique_ptr<mfem::HypreParMatrix> true_matrix;
-  TracedScalarIgrP1TraceSolveOutput solved;
+  SolveAndRecoverTracedScalarIgrP1State solve_and_recovery;
 };
 
 struct TracedScalarIgrP1Scratch::Implementation final
@@ -452,6 +556,7 @@ struct TracedScalarIgrP1Scratch::Implementation final
   int trace_true_size = -1;
   int trace_local_size = -1;
   int elements = -1;
+  std::size_t source_sample_capacity = 0;
   EphemeralStepState state{};
 
   bool Matches(const TracedScalarIgrP1GlobalStepInput& input) const noexcept
@@ -460,20 +565,58 @@ struct TracedScalarIgrP1Scratch::Implementation final
     const bool communicator_matches = input.communicator != MPI_COMM_NULL &&
         MPI_Comm_compare(communicator, input.communicator, &comparison) == MPI_SUCCESS &&
         (comparison == MPI_IDENT || comparison == MPI_CONGRUENT);
-    return communicator_matches && input.layout == layout && layout &&
+    std::size_t a_capacity = 0, b_capacity = 0, c_capacity = 0;
+    std::size_t d_capacity = 0, f_capacity = 0, g_capacity = 0;
+    std::size_t schur_capacity = 0, reduced_capacity = 0;
+    const bool capacities_are_valid =
+        CheckedBatchCapacity(elements, 28 * 28, a_capacity) &&
+        CheckedBatchCapacity(elements, 28 * 40, b_capacity) &&
+        CheckedBatchCapacity(elements, 40 * 28, c_capacity) &&
+        CheckedBatchCapacity(elements, 40 * 40, d_capacity) &&
+        CheckedBatchCapacity(elements, 28, f_capacity) &&
+        CheckedBatchCapacity(elements, 40, g_capacity) &&
+        CheckedBatchCapacity(elements, 40 * 40, schur_capacity) &&
+        CheckedBatchCapacity(elements, 40, reduced_capacity);
+    return communicator_matches && capacities_are_valid && input.layout == layout && layout &&
         layout->IsUsable() && layout->InteriorSpace() == interior_space &&
         layout->TraceSpace() == trace_space && interior_space && trace_space &&
         interior_space->GetParMesh() == mesh && trace_space->GetParMesh() == mesh &&
+        interior_space->GetVSize() == interior_size &&
+        trace_space->GetVSize() == trace_local_size &&
+        trace_space->GetTrueVSize() == trace_true_size &&
         layout->InteriorLocalVSize() == interior_size &&
         layout->TraceTrueVSize() == trace_true_size &&
         layout->TraceLocalVSize() == trace_local_size &&
         layout->LocalElementCount() == elements &&
+        state.current_local_trace.Size() == trace_local_size &&
+        state.previous_local_trace.Size() == trace_local_size &&
+        state.raw_local_trace.Size() == trace_local_size &&
+        state.raw_true_trace.Size() == trace_true_size &&
+        state.local_rhs.Size() == trace_local_size &&
+        state.true_rhs_values.Size() == trace_true_size &&
         state.current_local_trace.Capacity() >= trace_local_size &&
         state.previous_local_trace.Capacity() >= trace_local_size &&
         state.raw_local_trace.Capacity() >= trace_local_size &&
         state.raw_true_trace.Capacity() >= trace_true_size &&
         state.local_rhs.Capacity() >= trace_local_size &&
-        state.true_rhs_values.Capacity() >= trace_true_size;
+        state.true_rhs_values.Capacity() >= trace_true_size &&
+        HasCapacity(state.a, a_capacity) && HasCapacity(state.b, b_capacity) &&
+        HasCapacity(state.c, c_capacity) && HasCapacity(state.d, d_capacity) &&
+        HasCapacity(state.f, f_capacity) && HasCapacity(state.g, g_capacity) &&
+        HasCapacity(state.schur, schur_capacity) &&
+        HasCapacity(state.reduced, reduced_capacity) &&
+        HasCapacity(state.source_samples, source_sample_capacity) &&
+        state.a.size() <= state.a.capacity() &&
+        state.b.size() <= state.b.capacity() &&
+        state.c.size() <= state.c.capacity() &&
+        state.d.size() <= state.d.capacity() &&
+        state.f.size() <= state.f.capacity() &&
+        state.g.size() <= state.g.capacity() &&
+        state.schur.size() <= state.schur.capacity() &&
+        state.reduced.size() <= state.reduced.capacity() &&
+        state.source_samples.size() <= state.source_samples.capacity() &&
+        state.solve_and_recovery.HasExpectedStorage(
+            trace_true_size, trace_local_size, interior_size, elements);
   }
 };
 
@@ -761,19 +904,36 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
   {
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
-  TracedScalarIgrP1TraceSolveOutput& solved = state.solved;
+  TracedScalarIgrP1TraceSolveOutput& solved = state.solve_and_recovery.result;
   const TracedScalarIgrP1TraceSolveInput solve_input{
       input.communicator, &layout, trace_space, true_matrix.get(),
       &true_rhs_values, &condensation};
-  if (!SolveAndRecoverTracedScalarIgrP1Trace(solve_input, solved))
+  if (!SolveAndRecoverTracedScalarIgrP1TraceWithState(
+          solve_input, solved, state.solve_and_recovery))
   {
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
-  output.trace_increment.Swap(solved.trace_increment);
-  output.interior_increment.Swap(solved.interior_increment);
-  output.initial_residual_norm = initial_norm;
-  output.reduced_rhs_norm = solved.reduced_rhs_norm;
-  output.linear_residual_norm = solved.linear_residual_norm;
+  TracedScalarIgrP1GlobalStepOutput published;
+  try
+  {
+    published.trace_increment.SetSize(solved.trace_increment.Size());
+    published.interior_increment.SetSize(solved.interior_increment.Size());
+    local_ok = CopyVector(solved.trace_increment, published.trace_increment) &&
+        CopyVector(solved.interior_increment, published.interior_increment);
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(input.communicator, local_ok))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
+  published.initial_residual_norm = initial_norm;
+  published.reduced_rhs_norm = solved.reduced_rhs_norm;
+  published.linear_residual_norm = solved.linear_residual_norm;
+  output.trace_increment.Swap(published.trace_increment);
+  output.interior_increment.Swap(published.interior_increment);
+  output.initial_residual_norm = published.initial_residual_norm;
+  output.reduced_rhs_norm = published.reduced_rhs_norm;
+  output.linear_residual_norm = published.linear_residual_norm;
   return TracedScalarIgrP1GlobalStepResult::success;
 }
 
@@ -790,32 +950,83 @@ TracedScalarIgrP1Scratch::TracedScalarIgrP1Scratch(
 {
   try
   {
+    if (communicator == MPI_COMM_NULL || !layout.IsUsable()) { return; }
+    const mfem::ParFiniteElementSpace* const interior_space = layout.InteriorSpace();
+    const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
+    const mfem::ParMesh* const mesh =
+        interior_space ? interior_space->GetParMesh() : nullptr;
+    const int interior_size = layout.InteriorLocalVSize();
+    const int trace_true_size = layout.TraceTrueVSize();
+    const int trace_local_size = layout.TraceLocalVSize();
+    const int elements = layout.LocalElementCount();
+    std::size_t a_capacity = 0, b_capacity = 0, c_capacity = 0;
+    std::size_t d_capacity = 0, f_capacity = 0, g_capacity = 0;
+    std::size_t schur_capacity = 0, reduced_capacity = 0;
+    const bool sizes_are_usable = interior_space != nullptr && trace_space != nullptr &&
+        mesh != nullptr && trace_space->GetParMesh() == mesh &&
+        interior_size >= 0 && trace_true_size >= 0 && trace_local_size >= 0 &&
+        interior_space->GetVSize() == interior_size &&
+        trace_space->GetVSize() == trace_local_size &&
+        trace_space->GetTrueVSize() == trace_true_size &&
+        elements >= 0 &&
+        CheckedBatchCapacity(elements, 28 * 28, a_capacity) &&
+        CheckedBatchCapacity(elements, 28 * 40, b_capacity) &&
+        CheckedBatchCapacity(elements, 40 * 28, c_capacity) &&
+        CheckedBatchCapacity(elements, 40 * 40, d_capacity) &&
+        CheckedBatchCapacity(elements, 28, f_capacity) &&
+        CheckedBatchCapacity(elements, 40, g_capacity) &&
+        CheckedBatchCapacity(elements, 40 * 40, schur_capacity) &&
+        CheckedBatchCapacity(elements, 40, reduced_capacity);
+    if (!sizes_are_usable) { return; }
+    const mfem::IntegrationRule& maximum_rule = mfem::IntRules.Get(
+        mfem::Geometry::SQUARE, 32);
+    std::size_t source_entries = 0;
+    std::size_t source_sample_capacity = 0;
+    if (maximum_rule.GetNPoints() <= 0 ||
+        !CheckedProduct(static_cast<std::size_t>(maximum_rule.GetNPoints()), 4,
+                        source_entries) ||
+        !CheckedBatchCapacity(elements, source_entries, source_sample_capacity))
+    {
+      return;
+    }
     implementation_ = std::make_unique<Implementation>();
     Implementation& state = *implementation_;
     state.communicator = communicator;
     state.layout = &layout;
-    state.interior_space = layout.InteriorSpace();
-    state.trace_space = layout.TraceSpace();
-    state.mesh = state.interior_space ? state.interior_space->GetParMesh() : nullptr;
-    state.interior_size = layout.InteriorLocalVSize();
-    state.trace_true_size = layout.TraceTrueVSize();
-    state.trace_local_size = layout.TraceLocalVSize();
-    state.elements = layout.LocalElementCount();
-    const std::size_t count = static_cast<std::size_t>(std::max(0, state.elements));
-    const mfem::IntegrationRule& maximum_rule = mfem::IntRules.Get(
-        mfem::Geometry::SQUARE, 32);
-    state.state.current_local_trace.SetSize(state.trace_local_size);
-    state.state.previous_local_trace.SetSize(state.trace_local_size);
-    state.state.raw_local_trace.SetSize(state.trace_local_size);
-    state.state.raw_true_trace.SetSize(state.trace_true_size);
-    state.state.local_rhs.SetSize(state.trace_local_size);
-    state.state.true_rhs_values.SetSize(state.trace_true_size);
-    state.state.a.reserve(count * 28 * 28); state.state.b.reserve(count * 28 * 40);
-    state.state.c.reserve(count * 40 * 28); state.state.d.reserve(count * 40 * 40);
-    state.state.f.reserve(count * 28); state.state.g.reserve(count * 40);
-    state.state.schur.reserve(count * 40 * 40); state.state.reduced.reserve(count * 40);
-    state.state.source_samples.reserve(count *
-        static_cast<std::size_t>(maximum_rule.GetNPoints()) * 4);
+    state.interior_space = interior_space;
+    state.trace_space = trace_space;
+    state.mesh = mesh;
+    state.interior_size = interior_size;
+    state.trace_true_size = trace_true_size;
+    state.trace_local_size = trace_local_size;
+    state.elements = elements;
+    state.source_sample_capacity = source_sample_capacity;
+    state.state.current_local_trace.SetSize(trace_local_size);
+    state.state.previous_local_trace.SetSize(trace_local_size);
+    state.state.raw_local_trace.SetSize(trace_local_size);
+    state.state.raw_true_trace.SetSize(trace_true_size);
+    state.state.local_rhs.SetSize(trace_local_size);
+    state.state.true_rhs_values.SetSize(trace_true_size);
+    state.state.a.reserve(a_capacity); state.state.b.reserve(b_capacity);
+    state.state.c.reserve(c_capacity); state.state.d.reserve(d_capacity);
+    state.state.f.reserve(f_capacity); state.state.g.reserve(g_capacity);
+    state.state.schur.reserve(schur_capacity); state.state.reduced.reserve(reduced_capacity);
+    state.state.source_samples.reserve(source_sample_capacity);
+    SolveAndRecoverTracedScalarIgrP1State& solve = state.state.solve_and_recovery;
+    solve.true_trace.SetSize(trace_true_size);
+    solve.next_trace.SetSize(trace_true_size);
+    solve.local_trace.SetSize(trace_local_size);
+    solve.next_interior.SetSize(interior_size);
+    solve.gathered_trace.SetSize(40);
+    solve.element_interior.SetSize(28);
+    solve.recovered.resize(reduced_capacity);
+    solve.local_trace_values.resize(g_capacity);
+    solve.result.trace_increment.SetSize(trace_true_size);
+    solve.result.interior_increment.SetSize(interior_size);
+    TracedScalarIgrP1GlobalStepInput binding{};
+    binding.communicator = communicator;
+    binding.layout = &layout;
+    if (!state.Matches(binding)) { implementation_.reset(); }
   }
   catch (...) { implementation_.reset(); }
 }

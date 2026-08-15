@@ -718,14 +718,15 @@ bool Check(const MPI_Comm communicator)
       scratch_source, scratch_dt;
   ok = scratch.IsUsable();
   if (!Require(communicator, ok, "scratch binding")) { return false; }
-  ok = Run(communicator, layout, quads, source_space, source_a, 0.05,
-           scratch_first, &scratch) &&
-      Run(communicator, layout, quads, source_space, source_a, 0.05,
-          scratch_repeat, &scratch) &&
-      Run(communicator, layout, quads, source_space, source_b, 0.05,
-          scratch_source, &scratch) &&
-      Run(communicator, layout, quads, source_space, source_a, 0.08,
-          scratch_dt, &scratch);
+  const bool scratch_first_ok = Run(communicator, layout, quads, source_space,
+      source_a, 0.05, scratch_first, &scratch) && scratch.IsUsable();
+  const bool scratch_repeat_ok = Run(communicator, layout, quads, source_space,
+      source_a, 0.05, scratch_repeat, &scratch) && scratch.IsUsable();
+  const bool scratch_source_ok = Run(communicator, layout, quads, source_space,
+      source_b, 0.05, scratch_source, &scratch) && scratch.IsUsable();
+  const bool scratch_dt_ok = Run(communicator, layout, quads, source_space,
+      source_a, 0.08, scratch_dt, &scratch) && scratch.IsUsable();
+  ok = scratch_first_ok && scratch_repeat_ok && scratch_source_ok && scratch_dt_ok;
   const bool scratch_match = SameBits(scratch_first.trace_increment, first.trace_increment) &&
       SameBits(scratch_first.interior_increment, first.interior_increment) &&
       SameBits(scratch_repeat.trace_increment, scratch_first.trace_increment) &&
@@ -842,12 +843,13 @@ bool Check(const MPI_Comm communicator)
   const detail::TracedScalarIgrP1GlobalStepInput invalid{
       communicator, &layout, quads.data(), static_cast<int>(quads.size()), {},
       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-  ok = detail::ComputeTracedScalarIgrP1GlobalStep(invalid, preserved) ==
+  ok = detail::ComputeTracedScalarIgrP1GlobalStep(invalid, preserved, scratch) ==
           detail::TracedScalarIgrP1GlobalStepResult::failure &&
       preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
       preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
       preserved.initial_residual_norm == 11.0 &&
-      preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0;
+      preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0 &&
+      scratch.IsUsable();
   if (!Require(communicator, ok, "invalid input preservation")) { return false; }
 
   mfem::Vector aliased_trace(layout.TraceTrueVSize());
@@ -911,12 +913,14 @@ bool Check(const MPI_Comm communicator)
       static_cast<int>(structurally_invalid_quads.size()), alias_parameters,
       &classified_current_trace, &classified_previous_trace, &aliased_current_interior,
       &aliased_previous_interior, nullptr, nullptr};
-  ok = detail::ComputeTracedScalarIgrP1GlobalStep(structural_input, preserved) ==
+  ok = detail::ComputeTracedScalarIgrP1GlobalStep(
+           structural_input, preserved, scratch) ==
           detail::TracedScalarIgrP1GlobalStepResult::failure &&
       preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
       preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
       preserved.initial_residual_norm == 11.0 &&
-      preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0;
+      preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0 &&
+      scratch.IsUsable();
   return Require(communicator, ok, "structural failure preservation");
 }
 

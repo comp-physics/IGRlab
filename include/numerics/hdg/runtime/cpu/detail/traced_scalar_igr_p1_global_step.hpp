@@ -86,9 +86,9 @@ enum class TracedScalarIgrP1GlobalStepResult : unsigned char
 { success, inadmissible_trial, failure };
 
 /**
- * Detail-only retained non-Hypre storage for repeated p1 global steps.
- * It is bound to one communicator and one borrowed layout; it has no solver,
- * session, publication, or persistence contract.
+ * Detail-only retained assembly and solve/recovery staging for repeated p1
+ * global steps.  It is bound to one communicator and one borrowed layout; it
+ * has no solver, session, publication, or persistence contract.
  */
 class TracedScalarIgrP1Scratch final
 {
