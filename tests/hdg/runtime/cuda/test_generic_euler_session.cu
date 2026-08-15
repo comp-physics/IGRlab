@@ -21,6 +21,7 @@ using dg::hdg::generic::HdgEulerSessionCapabilityBit;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::runtime::BorrowedCudaRank1OneGpuRuntimeSelection;
 using dg::hdg::runtime::BorrowedCudaRank2OneGpuHostStagedRuntimeSelection;
+using dg::hdg::runtime::FailureReason;
 using dg::hdg::runtime::StableIdentity;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
@@ -887,7 +888,9 @@ bool DirectFixedOracleRejected(const CudaConfig& config, const int ranks)
 }
 
 bool DirectBorrowedRejectedBeforeDevice(const CudaConfig& config,
-                                        const int ranks)
+                                        const int ranks,
+                                        const FailureReason expected_origin =
+                                            FailureReason::collective_protocol)
 {
   CudaRunEvidence evidence{};
   if (ranks == 1)
@@ -897,16 +900,14 @@ bool DirectBorrowedRejectedBeforeDevice(const CudaConfig& config,
             BorrowedCudaRank1OneGpuRuntimeSelection>>(config);
     return !engine->Initialize(evidence) && evidence.device == -1 &&
         evidence.status == CudaRunStatus::setup_failure &&
-        evidence.setup_origin ==
-            dg::hdg::runtime::FailureReason::collective_protocol;
+        evidence.setup_origin == expected_origin;
   }
   auto engine = std::make_unique<
       PersistentCudaSmoothEulerEngine<
           BorrowedCudaRank2OneGpuHostStagedRuntimeSelection>>(config);
   return !engine->Initialize(evidence) && evidence.device == -1 &&
       evidence.status == CudaRunStatus::setup_failure &&
-      evidence.setup_origin ==
-          dg::hdg::runtime::FailureReason::collective_protocol;
+      evidence.setup_origin == expected_origin;
 }
 
 std::array<CudaStaticBoundaryPolicy, 4> StaticPhysicalPolicies()
@@ -975,7 +976,8 @@ bool BoundaryPolicyViolationsRejectedBeforeDevice(mfem::ParMesh& mesh,
   GenericEulerHdgCudaSession unused_extra_session;
   const bool unused_extra_rejected_pre_device =
       Rejected(unused_extra_session, unused_extra_config) &&
-      DirectBorrowedRejectedBeforeDevice(unused_extra_config, ranks);
+      DirectBorrowedRejectedBeforeDevice(unused_extra_config, ranks,
+          FailureReason::backend_failure);
 
   return unknown_rejected_pre_device &&
       DirectBorrowedRejectedBeforeDevice(unsupported_config, ranks) &&
@@ -1187,7 +1189,8 @@ bool CheckNegatives(const int ranks)
   GenericEulerHdgCudaSession twenty_four;
   const bool unused_periodic_policy_rejected = Rejected(
       twenty_four, unused_periodic_policy) &&
-      DirectBorrowedRejectedBeforeDevice(unused_periodic_policy, ranks);
+      DirectBorrowedRejectedBeforeDevice(unused_periodic_policy, ranks,
+          FailureReason::backend_failure);
   const bool boundary_pre_device_rejected =
       DirectBorrowedRejectedBeforeDevice(unsupported_boundary_policy, ranks) &&
       DirectBorrowedRejectedBeforeDevice(nonfinite_boundary_policy, ranks) &&
