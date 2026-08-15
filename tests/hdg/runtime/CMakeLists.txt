@@ -32,7 +32,8 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     foreach(_dg_igr_hdg_cxx_archive IN ITEMS
             dg_igr_hdg_runtime_common
             dg_igr_hdg_runtime_cpu
-            dg_igr_hdg_auxiliary_cpu)
+            dg_igr_hdg_auxiliary_cpu
+            dg_igr_hdg_runtime_app_cpu)
       get_target_property(_dg_igr_hdg_cxx_archive_resolve
                           "${_dg_igr_hdg_cxx_archive}"
                           CUDA_RESOLVE_DEVICE_SYMBOLS)

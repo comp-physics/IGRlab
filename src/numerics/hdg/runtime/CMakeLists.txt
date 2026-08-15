@@ -177,6 +177,10 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF)
+  if(MFEM_USE_CUDA)
+    set_target_properties(dg_igr_hdg_runtime_app_cpu PROPERTIES
+      CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+  endif()
 
   target_link_libraries(dg_igr_hdg_runtime_components INTERFACE
                         dg_igr_hdg_runtime_common
