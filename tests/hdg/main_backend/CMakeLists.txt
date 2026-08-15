@@ -94,9 +94,9 @@ if(MFEM_USE_CUDA)
         "-DHDG_MAIN_RANKS=${_ranks}"
         "-DHDG_MAIN_DT=0"
         "-DHDG_MAIN_CFL=0.25"
-        "-DHDG_MAIN_T_FINAL=0.001"
-        "-DHDG_MAIN_EXPECTED_STEPS=1"
-        "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.001"
+        "-DHDG_MAIN_T_FINAL=0.02"
+        "-DHDG_MAIN_EXPECTED_STEPS=3"
+        "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.02"
         "-DHDG_MAIN_NO_VTK=ON"
         "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
         "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
@@ -106,6 +106,47 @@ if(MFEM_USE_CUDA)
     set_tests_properties(dg_igr_hdg_main_backend_cuda_rank${_ranks}_cfl PROPERTIES
       LABELS "hdg;main-backend;cuda;mpi;process;generic-borrowed;cfl"
       PROCESSORS ${_ranks} RESOURCE_LOCK dg_igr_sm120 TIMEOUT 1200)
+  endforeach()
+
+  # Keep p2 serial and parallel refinement as independent process gates.
+  # They validate each refined trajectory's own output, never field equality.
+  foreach(_refine_mode IN ITEMS serial parallel)
+    if(_refine_mode STREQUAL "serial")
+      set(_serial_refine 1)
+      set(_parallel_refine 0)
+      set(_ranks 1)
+    else()
+      set(_serial_refine 0)
+      set(_parallel_refine 1)
+      set(_ranks 2)
+    endif()
+    add_test(NAME dg_igr_hdg_main_backend_cuda_p2_${_refine_mode}_refine_small_dt
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-p2-${_refine_mode}-refine-small-dt-output"
+        "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh"
+        "-DHDG_MAIN_ORDER=2"
+        "-DHDG_MAIN_N=6"
+        "-DHDG_MAIN_RANKS=${_ranks}"
+        "-DHDG_MAIN_SERIAL_REFINE=${_serial_refine}"
+        "-DHDG_MAIN_PARALLEL_REFINE=${_parallel_refine}"
+        "-DHDG_MAIN_DT=0.005"
+        "-DHDG_MAIN_T_FINAL=0.01"
+        "-DHDG_MAIN_DT_SAVE=0.005"
+        "-DHDG_MAIN_EXPECTED_STEPS=2"
+        "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.01"
+        "-DHDG_MAIN_EXPECTED_TIMES=0,0.005,0.01"
+        "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_p2_${_refine_mode}_refine_small_dt PROPERTIES
+      LABELS "hdg;main-backend;cuda;mpi;process;generic-borrowed;p2;refinement"
+      PROCESSORS ${_ranks}
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1200)
   endforeach()
 
   foreach(_ranks IN ITEMS 1 2)
