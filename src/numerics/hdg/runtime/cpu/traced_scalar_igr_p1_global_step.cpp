@@ -580,6 +580,7 @@ bool RetainedTraceSystem::Initialize(
   if (!CollectiveAll(communicator, local_ok)) { return false; }
 
   std::unique_ptr<mfem::SparseMatrix> graph;
+  std::unique_ptr<mfem::ParBilinearForm> parallel_form;
   try
   {
     graph = std::make_unique<mfem::SparseMatrix>(local_size);
@@ -602,16 +603,18 @@ bool RetainedTraceSystem::Initialize(
       graph->AddSubMatrix(vdofs, vdofs, pattern, 1);
     }
     graph->Finalize(0, false);
+    parallel_form = std::make_unique<mfem::ParBilinearForm>(
+        const_cast<mfem::ParFiniteElementSpace*>(trace_space));
+    local_ok = parallel_form != nullptr;
   }
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(communicator, local_ok)) { return false; }
 
   try
   {
-    mfem::ParBilinearForm form(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
     // Every rank reaches this opaque collective only after its local signed
     // symbolic graph has been admitted.
-    matrix.reset(form.ParallelAssemble(graph.get()));
+    matrix.reset(parallel_form->ParallelAssemble(graph.get()));
     local_ok = matrix != nullptr && matrix->Height() == true_size &&
         matrix->Width() == true_size &&
         matrix->GetGlobalNumRows() == trace_space->GlobalTrueVSize() &&
@@ -875,9 +878,20 @@ bool RetainedTraceSystem::Refresh(const std::vector<double>& schur_values,
       local_ok = data != nullptr && incoming[index].entry >= 0;
       if (local_ok) data[incoming[index].entry] += receive_values[index];
     }
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  try
+  {
     trace_space->Dof_TrueDof_Matrix()->MultTranspose(local_rhs, true_rhs);
+    local_ok = AllFinite(true_rhs);
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { return false; }
+  try
+  {
     matrix->HypreRead();
-    local_ok = local_ok && AllFinite(true_rhs) && BindSolver();
+    local_ok = BindSolver();
   }
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(communicator, local_ok)) { return false; }
@@ -899,7 +913,10 @@ bool RetainedTraceSystem::Solve(const double scale, mfem::Vector& true_trace,
   }
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(communicator, local_ok)) { refreshed = false; return false; }
-  try { gmres->Mult(*rhs, *solution); matrix->Mult(*solution, *residual); *residual -= *rhs; }
+  try { gmres->Mult(*rhs, *solution); }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) { refreshed = false; return false; }
+  try { matrix->Mult(*solution, *residual); *residual -= *rhs; }
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(communicator, local_ok)) { refreshed = false; return false; }
   double maximum = 0.0;
