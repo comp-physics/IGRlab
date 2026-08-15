@@ -86,7 +86,7 @@ foreach(_index RANGE 0 2)
     message(FATAL_ERROR "CUDA HDG PVTU cycle ${_cycle} misses four-component conservative data")
   endif()
   string(REGEX MATCHALL
-    "<Piece Source=\\\"proc[0-9][0-9][0-9][0-9][0-9][0-9]\\.vtu\\\"/>"
+    "<Piece[^>]*>"
     _pvtu_piece_references "${_pvtu_text}")
   list(LENGTH _pvtu_piece_references _pvtu_piece_count)
   if(NOT _pvtu_piece_count EQUAL HDG_MAIN_RANKS)
