@@ -633,6 +633,10 @@ bool CheckLegacyFacadeAdmission(const int ranks)
       mesh, ranks, smoke_polynomial_order, smoke_elements_per_direction));
   GenericEulerCudaPreparedStep authority{};
   GenericEulerHdgCudaSession::native_export_type native_export{};
+  const auto coordinates_before_rejected = session.coordinates();
+  const auto nonfixed = initialized.status == HdgEulerSessionStatus::initialized
+      ? session.Prepare(0.025, authority, native_export)
+      : dg::hdg::generic::HdgEulerSessionResult{};
   const auto prepared = initialized.status == HdgEulerSessionStatus::initialized
       ? session.Prepare(authority, native_export)
       : dg::hdg::generic::HdgEulerSessionResult{};
@@ -640,6 +644,10 @@ bool CheckLegacyFacadeAdmission(const int ranks)
       ? session.Abort(std::move(authority), native_export)
       : dg::hdg::generic::HdgEulerSessionResult{};
   return All(initialized.status == HdgEulerSessionStatus::initialized &&
+             nonfixed.status == HdgEulerSessionStatus::rejected &&
+             session.coordinates().step == 0 &&
+             session.coordinates().generation == 0 &&
+             coordinates_before_rejected.time == 0.0 &&
              prepared.status == HdgEulerSessionStatus::prepared &&
              native_export.interior_count != 0 &&
              native_export.owned_true_trace_count != 0 &&
@@ -885,9 +893,9 @@ bool CheckNegatives(const int ranks)
   wrong_device.requested_device = 1;
   CudaConfig wrong_ranks = BorrowedConfig(
       periodic, 3, smoke_polynomial_order, smoke_elements_per_direction);
-  CudaConfig wrong_dt = BorrowedConfig(
+  CudaConfig invalid_config_dt = BorrowedConfig(
       periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction);
-  wrong_dt.dt = 0.01;
+  invalid_config_dt.dt = 0.0;
   CudaConfig capture_oracle = BorrowedConfig(
       periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction);
   capture_oracle.capture_oracle = true;
@@ -939,7 +947,7 @@ bool CheckNegatives(const int ranks)
   const bool p3_rejected = Rejected(three, p3);
   const bool wrong_device_rejected = Rejected(four, wrong_device);
   const bool wrong_ranks_rejected = Rejected(five, wrong_ranks);
-  const bool wrong_dt_rejected = Rejected(six, wrong_dt);
+  const bool invalid_config_dt_rejected = Rejected(six, invalid_config_dt);
   const bool capture_oracle_rejected = Rejected(seven, capture_oracle);
   const bool direct_capture_oracle_rejected = DirectFixedOracleRejected(
       capture_oracle, ranks);
@@ -956,7 +964,7 @@ bool CheckNegatives(const int ranks)
   const bool nonphysical_initial_rejected = Rejected(fifteen,
                                                       nonphysical_initial);
   bool rejected = nonperiodic_rejected && invalid_mesh_n_rejected && p3_rejected &&
-      wrong_device_rejected && wrong_ranks_rejected && wrong_dt_rejected &&
+      wrong_device_rejected && wrong_ranks_rejected && invalid_config_dt_rejected &&
       capture_oracle_rejected && direct_capture_oracle_rejected &&
       injection_rejected && null_initial_rejected &&
       wrong_initial_count_rejected && wrong_initial_components_rejected &&

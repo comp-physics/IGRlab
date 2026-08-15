@@ -228,6 +228,7 @@ public:
     // this session rejects the prepare collectively.
     const bool local_valid = ReadyForPrepare() && !authority.valid_ &&
         OutputMatchesMode<StagedOutput>() && std::isfinite(dt) && dt > 0.0 &&
+        (metadata_output_mode_ || SameDouble(dt, cuda_w8a::fixed_dt)) &&
         (!retry_ready_ || SameDouble(dt, retained_dt_));
     if (!AdmitOperation(operation_tag::prepare, local_valid))
       return Result(generic::HdgEulerSessionStatus::rejected);

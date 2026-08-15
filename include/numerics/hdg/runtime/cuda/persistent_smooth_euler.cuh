@@ -1427,6 +1427,8 @@ private:
     pending_.w8_owned_allocation_begin =
         AllocatorPolicy::W8OwnedAllocationCalls();
     const bool dt_valid = std::isfinite(dt) && dt > 0.0 &&
+        (config_.use_borrowed_host_inputs ||
+         std::memcmp(&dt, &fixed_dt, sizeof(double)) == 0) &&
         (!retry || std::memcmp(&dt, &retained_retry_dt_, sizeof(double)) == 0);
     if (!numerics_.CollectiveContinue(dt_valid)) return false;
     const BeginOutcome begin = retry ? contract_->Retry() :

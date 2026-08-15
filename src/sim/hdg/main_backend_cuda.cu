@@ -111,6 +111,7 @@ std::string ConsensusText(const HdgEulerMainRequest& request,
          << request.options.restart_cycle << '\n'
          << request.options.restart_step << '\n'
          << request.options.cfl << '\n'
+         << request.options.dt_min << '\n'
          << request.case_config.gamma << '\n'
          << request.initial_condition.GetVDim() << '\n'
          << request.boundary_plan.Entries().size() << '\n';
