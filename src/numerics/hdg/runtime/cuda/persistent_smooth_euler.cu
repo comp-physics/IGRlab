@@ -1179,6 +1179,39 @@ __device__ bool LocalLlfSpeed(const double* state, const double nx,
   return isfinite(sound) && isfinite(speed) && speed > 0.0;
 }
 
+__device__ bool StaticBoundaryExterior(const int kind, const double* reference,
+                                       const double* interior, const double nx,
+                                       const double ny, double* exterior)
+{
+  if (!PhysicallyAdmissible(interior) || !isfinite(nx) || !isfinite(ny))
+    return false;
+  if (kind == static_cast<int>(CudaStaticBoundaryPolicyKind::supersonic_inlet))
+  {
+    if (!reference || !PhysicallyAdmissible(reference)) return false;
+    for (int component = 0; component < conserved_components; ++component)
+      exterior[component] = reference[component];
+    return true;
+  }
+  if (kind == static_cast<int>(CudaStaticBoundaryPolicyKind::supersonic_outlet))
+  {
+    for (int component = 0; component < conserved_components; ++component)
+      exterior[component] = interior[component];
+    return true;
+  }
+  if (kind == static_cast<int>(CudaStaticBoundaryPolicyKind::slip_wall))
+  {
+    const double normal_squared = nx * nx + ny * ny;
+    if (!(normal_squared > 0.0) || !isfinite(normal_squared)) return false;
+    const double normal_momentum = interior[1] * nx + interior[2] * ny;
+    exterior[0] = interior[0];
+    exterior[1] = interior[1] - 2.0 * normal_momentum * nx / normal_squared;
+    exterior[2] = interior[2] - 2.0 * normal_momentum * ny / normal_squared;
+    exterior[3] = interior[3];
+    return PhysicallyAdmissible(exterior);
+  }
+  return false;
+}
+
 __device__ int Decode(const int encoded, double& sign)
 {
   sign = encoded >= 0 ? 1.0 : -1.0;
@@ -1495,6 +1528,8 @@ __global__ void BorrowedLaggedLlfAssemblyKernel(CudaDeviceView v,
       const int to = face * conserved_components * sf;
       const double w = v.face_weight[qp];
       const double tau = v.borrowed_lagged_llf_tau[qp];
+      const int boundary_kind = s.borrowed_static_boundary_policies
+          ? v.boundary_policy_kind[e * faces_per_element + face] : 0;
       double u[4] = {}, l[4] = {}, flux[4], jac[16];
       for (int a = 0; a < si; ++a) for (int k = 0; k < 4; ++k)
         u[k] += v.face_interior_shape[qp*si+a] *
@@ -1505,6 +1540,13 @@ __global__ void BorrowedLaggedLlfAssemblyKernel(CudaDeviceView v,
       if (!(w > 0) || !(tau > 0) || !isfinite(tau) ||
           !FluxJacobian(l, v.face_normal[qp*2], v.face_normal[qp*2+1], flux, jac))
       { v.status[e] = -2; return; }
+      double exterior[conserved_components] = {};
+      const bool physical_boundary = boundary_kind != 0;
+      if (physical_boundary && !StaticBoundaryExterior(boundary_kind,
+          v.boundary_reference + (e * faces_per_element + face) *
+              conserved_components,
+          u, v.face_normal[qp*2], v.face_normal[qp*2+1], exterior))
+      { v.status[e] = -3; return; }
       for (int row = 0; row < si; ++row)
       {
         const double rp = v.face_interior_shape[qp*si+row];
@@ -1527,14 +1569,18 @@ __global__ void BorrowedLaggedLlfAssemblyKernel(CudaDeviceView v,
         for (int rc = 0; rc < 4; ++rc)
         {
           const int lr = to + ByNodes(row,sf,rc);
-          v.residual_g[e_t+lr] += w*rp*(flux[rc]+tau*(u[rc]-l[rc]));
+          v.residual_g[e_t+lr] += w*rp*(physical_boundary
+              ? l[rc] - exterior[rc] : flux[rc]+tau*(u[rc]-l[rc]));
           for (int col = 0; col < si; ++col)
-            v.c[co+lr*ni+ByNodes(col,si,rc)] += w*rp*tau*
-                v.face_interior_shape[qp*si+col];
+            if (!physical_boundary)
+              v.c[co+lr*ni+ByNodes(col,si,rc)] += w*rp*tau*
+                  v.face_interior_shape[qp*si+col];
           for (int col = 0; col < sf; ++col) for (int cc = 0; cc < 4; ++cc)
             v.d[doff+lr*nt+to+ByNodes(col,sf,cc)] += w*rp*
                 v.face_trace_shape[qp*sf+col] *
-                (jac[rc*4+cc] - (rc == cc ? tau : 0));
+                (physical_boundary
+                    ? (rc == cc ? 1.0 : 0.0)
+                    : jac[rc*4+cc] - (rc == cc ? tau : 0));
         }
       }
     }

@@ -135,9 +135,9 @@ bool CheckNegatives(const int ranks)
                                        functional_polynomial_order,
                                        functional_elements_per_direction);
 
-  // It has the admitted global 6x6 element count, but boundary faces add
-  // p2 trace DOFs beyond the fixed topology arena.  Admission must reject it
-  // before cudaSetDevice, not after the legacy BuildTopology phase.
+  // A bare borrowed topology has no copied physical-boundary policy table.
+  // Admission must reject this true-boundary mesh before cudaSetDevice rather
+  // than treating physical faces as periodic trace couplings.
   mfem::Mesh boundary_serial =
       NonperiodicSquareMesh(functional_elements_per_direction);
   mfem::ParMesh boundary_trace(MPI_COMM_WORLD, boundary_serial);

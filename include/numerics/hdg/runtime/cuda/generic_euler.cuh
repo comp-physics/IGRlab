@@ -5,10 +5,11 @@
  * @brief Narrow native-CUDA prepared-transaction facade for the W8A engine.
  *
  * This facade accepts an existing @ref CudaConfig with a caller-owned
- * periodic @ref mfem::ParMesh and an explicit borrowed byNODES L2 initial
- * field.  Optional static L2 source coefficients are copied at Initialize;
- * no caller field pointer is retained.  Physical interior exports use the
- * same explicit L2 ABI and never decode a checkpoint outside this engine.
+ * caller-owned conforming-quad @ref mfem::ParMesh and an explicit borrowed
+ * byNODES L2 initial field. Optional static L2 source coefficients and the
+ * admitted static physical-boundary table are copied at Initialize; no caller
+ * field or policy pointer is retained. Physical interior exports use the same
+ * explicit L2 ABI and never decode a checkpoint outside this engine.
  */
 
 #include "numerics/hdg/generic/session_contract.hpp"
@@ -23,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <type_traits>
+#include <vector>
 
 namespace dg::hdg::runtime::cuda
 {
@@ -123,7 +125,8 @@ public:
   }
 
   /**
-   * Admit only the already-supported borrowed periodic topology envelope.
+   * Admit the borrowed conforming-quad topology plus its complete static
+   * physical-boundary policy coverage.
    * Device setup remains in the existing engine; locally-invalid requests are
    * rejected before an engine is constructed.
    */
@@ -640,6 +643,7 @@ private:
   }
 
   using config_descriptor = std::array<unsigned char, 256>;
+  using policy_descriptor = std::array<unsigned char, 2048>;
 
   template <typename Value>
   static void AppendConfigValue(config_descriptor& descriptor,
@@ -721,7 +725,52 @@ private:
     const bool maximum_census = MPI_Allreduce(
         local.data(), maximum.data(), static_cast<int>(local.size()),
         MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
-    return complete_census && minimum_census && maximum_census &&
+    const bool base_consensus = complete_census && minimum_census && maximum_census &&
+        all_complete == 1 && minimum == maximum;
+    return base_consensus && (!config.use_borrowed_host_inputs ||
+        PolicyTableConsensus(config));
+  }
+
+  static bool PolicyTableConsensus(const cuda_w8a::CudaConfig& config) noexcept
+  {
+    policy_descriptor local{}, minimum{}, maximum{};
+    std::size_t cursor = 0;
+    bool complete = cuda_w8a::ValidateCudaStaticBoundaryPolicyTable(
+        config.borrowed_boundary_policies);
+    const auto append = [&](const auto& value)
+    {
+      using value_type = std::decay_t<decltype(value)>;
+      if (!complete || sizeof(value_type) > local.size() - cursor)
+      { complete = false; return; }
+      std::memcpy(local.data() + cursor, &value, sizeof(value_type));
+      cursor += sizeof(value_type);
+    };
+    append(config.borrowed_boundary_policies.count);
+    const bool readable = config.borrowed_boundary_policies.policies != nullptr &&
+        config.borrowed_boundary_policies.count <=
+            cuda_w8a::maximum_static_boundary_policies;
+    for (std::size_t index = 0;
+         index < cuda_w8a::maximum_static_boundary_policies; ++index)
+    {
+      const cuda_w8a::CudaStaticBoundaryPolicy empty{};
+      const cuda_w8a::CudaStaticBoundaryPolicy& policy = readable && index <
+          config.borrowed_boundary_policies.count
+          ? config.borrowed_boundary_policies.policies[index] : empty;
+      append(policy.attribute);
+      const std::uint8_t kind = static_cast<std::uint8_t>(policy.kind);
+      append(kind);
+      for (const double reference : policy.reference_state) append(reference);
+    }
+    minimum = local;
+    maximum = local;
+    const int complete_bit = complete ? 1 : 0;
+    int all_complete = 0;
+    return MPI_Allreduce(&complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
+                         MPI_COMM_WORLD) == MPI_SUCCESS &&
+        MPI_Allreduce(local.data(), minimum.data(), static_cast<int>(local.size()),
+                      MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS &&
+        MPI_Allreduce(local.data(), maximum.data(), static_cast<int>(local.size()),
+                      MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS &&
         all_complete == 1 && minimum == maximum;
   }
 
@@ -775,12 +824,18 @@ private:
               config.borrowed_source.scalar_count != 0 &&
               config.borrowed_source.components == cuda_w8a::conserved_components))
         : empty_borrowed_fields;
+    const bool boundary_policy_abi = config.use_borrowed_host_inputs
+        ? cuda_w8a::ValidateCudaStaticBoundaryPolicyTable(
+              config.borrowed_boundary_policies)
+        : config.borrowed_boundary_policies.policies == nullptr &&
+            config.borrowed_boundary_policies.count == 0;
     int ranks = 0;
     int borrowed_world = MPI_UNEQUAL;
     int borrowed_mesh = MPI_UNEQUAL;
     bool local = config.use_borrowed_topology && config.borrowed_mesh != nullptr &&
         config.borrowed_communicator != MPI_COMM_NULL &&
         borrowed_data_abi &&
+        boundary_policy_abi &&
         MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS &&
         (ranks == 1 || ranks == 2) && ranks == config.expected_rank_count &&
         config.requested_device == 0 &&
@@ -798,10 +853,11 @@ private:
         (config.order == cuda_w8a::smoke_polynomial_order ||
          config.order == cuda_w8a::functional_polynomial_order) &&
         config.mesh_n >= 0;
-    long long local_elements = 0;
     long long local_face_measure = 0;
+    long long local_physical_faces = 0;
     long long global_elements = 0;
     long long global_face_measure = 0;
+    long long global_physical_faces = 0;
     if (local)
     {
       const MPI_Comm mesh_communicator = config.borrowed_mesh->GetComm();
@@ -815,18 +871,71 @@ private:
           config.borrowed_mesh->Dimension() == cuda_w8a::dimension &&
           config.borrowed_mesh->SpaceDimension() == cuda_w8a::dimension &&
           config.borrowed_mesh->GetNE() > 0;
-      local_elements = config.borrowed_mesh->GetNE();
       for (int element = 0; local && element < config.borrowed_mesh->GetNE();
            ++element)
         local = config.borrowed_mesh->GetElementBaseGeometry(element) ==
             mfem::Geometry::SQUARE;
       if (local)
       {
+        try
+        {
+          const int face_count = config.borrowed_mesh->GetNumFaces();
+          if (face_count < 0) local = false;
+          std::vector<unsigned char> shared(
+              local ? static_cast<std::size_t>(face_count) : 0, 0);
+          for (int index = 0; local &&
+               index < config.borrowed_mesh->GetNSharedFaces(); ++index)
+          {
+            const int face = config.borrowed_mesh->GetSharedFace(index);
+            if (face < 0 || face >= static_cast<int>(shared.size())) local = false;
+            else shared[static_cast<std::size_t>(face)] = 1;
+          }
+          for (int element = 0; local && element < config.borrowed_mesh->GetNE();
+               ++element)
+          {
+            mfem::Array<int> faces, orientations;
+            config.borrowed_mesh->GetElementEdges(element, faces, orientations);
+            if (faces.Size() != cuda_w8a::faces_per_element) { local = false; break; }
+            for (int local_face = 0; local_face < faces.Size(); ++local_face)
+            {
+              const int face = faces[local_face];
+              mfem::FaceElementTransformations* transformations =
+                  config.borrowed_mesh->GetFaceElementTransformations(face);
+              if (face < 0 || face >= static_cast<int>(shared.size()) ||
+                  transformations == nullptr || transformations->Face == nullptr ||
+                  (transformations->Elem1No != element &&
+                   transformations->Elem2No != element))
+              { local = false; break; }
+              const int boundary_element = config.borrowed_mesh->GetFaceToBdrElMap()[face];
+              const bool is_shared = shared[static_cast<std::size_t>(face)] != 0;
+              const bool physical = !is_shared && transformations->Elem2No < 0 &&
+                  boundary_element >= 0;
+              if (!physical)
+              {
+                if (!is_shared && transformations->Elem2No < 0) local = false;
+                if (!local) break;
+                continue;
+              }
+              const int attribute = config.borrowed_mesh->GetBdrAttribute(boundary_element);
+              const cuda_w8a::CudaStaticBoundaryPolicy* found = nullptr;
+              for (std::size_t policy = 0;
+                   policy < config.borrowed_boundary_policies.count; ++policy)
+                if (config.borrowed_boundary_policies.policies[policy].attribute == attribute)
+                  found = config.borrowed_boundary_policies.policies + policy;
+              if (attribute <= 0 || found == nullptr ||
+                  !cuda_w8a::IsCudaAdmittedStaticBoundaryPolicy(found->kind))
+              { local = false; break; }
+              ++local_physical_faces;
+            }
+          }
+        }
+        catch (...) { local = false; }
         const long long faces = config.borrowed_mesh->GetNumFaces();
-        const long long shared = config.borrowed_mesh->GetNSharedFaces();
-        local = faces >= 0 && shared >= 0 && shared <= faces &&
+        const long long shared_count = config.borrowed_mesh->GetNSharedFaces();
+        local = local && faces >= 0 && shared_count >= 0 &&
+            shared_count <= faces &&
             faces <= std::numeric_limits<long long>::max() / 2;
-        if (local) local_face_measure = 2 * faces - shared;
+        if (local) local_face_measure = 2 * faces - shared_count;
       }
       if (local && config.use_borrowed_host_inputs)
       {
@@ -854,16 +963,21 @@ private:
     const bool local_census = MPI_Allreduce(&local_bit, &all_local, 1,
                                              MPI_INT, MPI_MIN,
                                              MPI_COMM_WORLD) == MPI_SUCCESS;
+    const long long local_elements = local ? config.borrowed_mesh->GetNE() : 0;
     const bool element_census = MPI_Allreduce(&local_elements, &global_elements,
         1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
     const bool face_census = MPI_Allreduce(&local_face_measure,
-        &global_face_measure, 1, MPI_LONG_LONG_INT, MPI_SUM,
+        &global_face_measure, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool boundary_census = MPI_Allreduce(&local_physical_faces,
+        &global_physical_faces, 1, MPI_LONG_LONG_INT, MPI_SUM,
         MPI_COMM_WORLD) == MPI_SUCCESS;
-    const bool periodic_measure_safe = global_elements >= 0 &&
-        global_elements <= std::numeric_limits<long long>::max() / 4;
     return config_consensus && local_census && element_census && face_census &&
-        all_local == 1 && periodic_measure_safe &&
-        global_face_measure == 4 * global_elements;
+        boundary_census && all_local == 1 && global_elements >= 0 &&
+        global_physical_faces >= 0 && global_elements <=
+            (std::numeric_limits<long long>::max() - global_physical_faces) /
+                cuda_w8a::faces_per_element &&
+        global_face_measure == cuda_w8a::faces_per_element * global_elements +
+            global_physical_faces;
   }
 
   template <typename Callback>

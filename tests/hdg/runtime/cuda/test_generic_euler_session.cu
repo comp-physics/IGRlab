@@ -874,6 +874,64 @@ bool DirectFixedOracleRejected(const CudaConfig& config, const int ranks)
       evidence.device == -1;
 }
 
+std::array<CudaStaticBoundaryPolicy, 4> StaticPhysicalPolicies()
+{
+  const std::array<double, conserved_components> reference{{1.0, 2.0, 0.0,
+      4.5}};
+  const std::array<double, conserved_components> unused{{0.0, 0.0, 0.0,
+      0.0}};
+  return {{{1, CudaStaticBoundaryPolicyKind::supersonic_inlet, reference},
+           {2, CudaStaticBoundaryPolicyKind::supersonic_outlet, unused},
+           {3, CudaStaticBoundaryPolicyKind::slip_wall, unused},
+           {4, CudaStaticBoundaryPolicyKind::slip_wall, unused}}};
+}
+
+bool CheckStaticPhysicalBoundaryTransaction(const int ranks, const int order,
+                                            const int n)
+{
+  mfem::Mesh serial = NonperiodicSquareMesh(n);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
+  HostFields fields = NonuniformHostFields(mesh, order, true);
+  const std::array<CudaStaticBoundaryPolicy, 4> fixture =
+      StaticPhysicalPolicies();
+  std::vector<CudaStaticBoundaryPolicy> policies(fixture.begin(), fixture.end());
+  CudaConfig config = BorrowedDataConfig(mesh, ranks, order, n, fields);
+  config.borrowed_boundary_policies = {policies.data(), policies.size()};
+  GenericEulerHdgCudaSession session;
+  const auto initialized = session.Initialize(config);
+  // Initialize owns a copied host/device policy projection.  Destroy the
+  // caller table before the first numerical attempt to catch any retained
+  // table pointer in the session or kernel launch path.
+  policies.clear();
+  policies.shrink_to_fit();
+  std::vector<double> before(fields.initial.size(), -9.0);
+  const bool initial_export = initialized.status == HdgEulerSessionStatus::initialized &&
+      session.ExportCommittedInterior({before.data(), fields.scalar_count,
+                                       conserved_components});
+  GenericEulerCudaPreparedStep authority{};
+  GenericPreparedOutput output{};
+  const auto prepared = session.Prepare(0.0125, authority, output);
+  const auto coordinates_before_abort = session.coordinates();
+  const auto aborted = prepared.status == HdgEulerSessionStatus::prepared
+      ? session.Abort(std::move(authority), output)
+      : dg::hdg::generic::HdgEulerSessionResult{};
+  std::vector<double> after_abort(fields.initial.size(), -7.0);
+  const bool abort_export = aborted.status == HdgEulerSessionStatus::aborted &&
+      session.ExportCommittedInterior({after_abort.data(), fields.scalar_count,
+                                       conserved_components});
+  GenericEulerCudaPreparedStep retry{};
+  GenericPreparedOutput retry_output{};
+  const auto retry_prepared = session.Prepare(0.0125, retry, retry_output);
+  const bool acknowledged = retry_prepared.status == HdgEulerSessionStatus::prepared &&
+      session.AcknowledgePreparedOutput(retry, retry_output);
+  const auto committed = acknowledged ? session.Commit(std::move(retry), retry_output)
+      : dg::hdg::generic::HdgEulerSessionResult{};
+  return All(initial_export && abort_export && SameValues(before, after_abort) &&
+      session.coordinates().step == coordinates_before_abort.step + 1 &&
+      committed.status == HdgEulerSessionStatus::committed &&
+      retry_output.successful_commit);
+}
+
 bool CheckNegatives(const int ranks)
 {
   mfem::Mesh periodic_serial = PeriodicSquareMesh(smoke_elements_per_direction);
@@ -940,6 +998,39 @@ bool CheckNegatives(const int ranks)
   CudaConfig nonphysical_initial = BorrowedDataConfig(
       periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction,
       nonphysical);
+  std::array<CudaStaticBoundaryPolicy, 4> policies = StaticPhysicalPolicies();
+  HostFields boundary_fields = NonuniformHostFields(
+      boundary, smoke_polynomial_order, false);
+  CudaConfig unknown_boundary_policy = BorrowedDataConfig(
+      boundary, ranks, smoke_polynomial_order, smoke_elements_per_direction,
+      boundary_fields);
+  for (std::size_t policy = 0; policy < policies.size(); ++policy)
+    policies[policy].attribute = static_cast<int>(policy) + 5;
+  unknown_boundary_policy.borrowed_boundary_policies =
+      {policies.data(), policies.size()};
+  std::array<CudaStaticBoundaryPolicy, 4> unsupported = StaticPhysicalPolicies();
+  unsupported[0].kind = CudaStaticBoundaryPolicyKind::far_field;
+  CudaConfig unsupported_boundary_policy = unknown_boundary_policy;
+  unsupported_boundary_policy.borrowed_boundary_policies =
+      {unsupported.data(), unsupported.size()};
+  std::array<CudaStaticBoundaryPolicy, 4> nonfinite = StaticPhysicalPolicies();
+  nonfinite[0].reference_state[0] = std::numeric_limits<double>::quiet_NaN();
+  CudaConfig nonfinite_boundary_policy = unknown_boundary_policy;
+  nonfinite_boundary_policy.borrowed_boundary_policies =
+      {nonfinite.data(), nonfinite.size()};
+  std::array<CudaStaticBoundaryPolicy, 4> noncanonical = StaticPhysicalPolicies();
+  noncanonical[1].reference_state[0] = 1.0;
+  CudaConfig noncanonical_boundary_policy = unknown_boundary_policy;
+  noncanonical_boundary_policy.borrowed_boundary_policies =
+      {noncanonical.data(), noncanonical.size()};
+  std::array<CudaStaticBoundaryPolicy, 4> signed_zero = StaticPhysicalPolicies();
+  signed_zero[1].reference_state[0] = -0.0;
+  CudaConfig signed_zero_boundary_policy = unknown_boundary_policy;
+  signed_zero_boundary_policy.borrowed_boundary_policies =
+      {signed_zero.data(), signed_zero.size()};
+  const bool signed_zero_table_rejected =
+      !ValidateCudaStaticBoundaryPolicyTable(
+          signed_zero_boundary_policy.borrowed_boundary_policies);
 
   GenericEulerHdgCudaSession one, two, three, four, five, six, seven, eight;
   const bool nonperiodic_rejected = Rejected(one, nonperiodic);
@@ -963,6 +1054,16 @@ bool CheckNegatives(const int ranks)
   const bool nonfinite_source_rejected = Rejected(fourteen, nonfinite_source);
   const bool nonphysical_initial_rejected = Rejected(fifteen,
                                                       nonphysical_initial);
+  GenericEulerHdgCudaSession eighteen, nineteen, twenty, twenty_one, twenty_two;
+  const bool unknown_boundary_rejected = Rejected(eighteen, unknown_boundary_policy);
+  const bool unsupported_boundary_rejected = Rejected(
+      nineteen, unsupported_boundary_policy);
+  const bool nonfinite_boundary_rejected = Rejected(
+      twenty, nonfinite_boundary_policy);
+  const bool noncanonical_boundary_rejected = Rejected(
+      twenty_one, noncanonical_boundary_policy);
+  const bool signed_zero_boundary_rejected = Rejected(
+      twenty_two, signed_zero_boundary_policy);
   bool rejected = nonperiodic_rejected && invalid_mesh_n_rejected && p3_rejected &&
       wrong_device_rejected && wrong_ranks_rejected && invalid_config_dt_rejected &&
       capture_oracle_rejected && direct_capture_oracle_rejected &&
@@ -970,6 +1071,9 @@ bool CheckNegatives(const int ranks)
       wrong_initial_count_rejected && wrong_initial_components_rejected &&
       null_source_rejected && nonfinite_initial_rejected &&
       nonfinite_source_rejected && nonphysical_initial_rejected &&
+      unknown_boundary_rejected && unsupported_boundary_rejected &&
+      nonfinite_boundary_rejected && noncanonical_boundary_rejected &&
+      signed_zero_table_rejected && signed_zero_boundary_rejected &&
       SameValues(fields.initial, fields_initial_before) &&
       SameValues(fields.source, fields_source_before);
 
@@ -1024,7 +1128,9 @@ int main(int argc, char** argv)
           CheckBorrowedLaggedLlfHighWave(
               ranks, functional_polynomial_order,
               functional_elements_per_direction) &&
-          CheckRefinedDynamicCapacity(ranks);
+          CheckRefinedDynamicCapacity(ranks) &&
+          CheckStaticPhysicalBoundaryTransaction(
+              ranks, functional_polynomial_order, functional_elements_per_direction);
     }
     else
     {
@@ -1042,7 +1148,8 @@ int main(int argc, char** argv)
       const bool refined_capacity = CheckRefinedDynamicCapacity(ranks);
       pass = transaction && foreign_authority && address_reuse &&
           session_identity && rank_two && legacy_facade && host_data && high_wave &&
-          prepared_dt && refined_capacity;
+          prepared_dt && refined_capacity && CheckStaticPhysicalBoundaryTransaction(
+              ranks, smoke_polynomial_order, smoke_elements_per_direction);
     }
   }
   if (!pass && ranks > 0)

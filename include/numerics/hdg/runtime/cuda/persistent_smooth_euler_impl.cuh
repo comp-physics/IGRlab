@@ -327,6 +327,8 @@ struct CudaGenericArenaLayout
   std::size_t face_trace = 0;
   std::size_t face_weight = 0;
   std::size_t face_normal = 0;
+  std::size_t element_faces = 0;
+  std::size_t boundary_reference = 0;
   std::size_t solve_workspace = 0;
   std::size_t two_exchange_keys = 0;
 };
@@ -410,11 +412,16 @@ struct CudaDeviceView
   double* face_trace_shape = nullptr;
   double* face_weight = nullptr;
   double* face_normal = nullptr;
+  // Borrowed-host physical-boundary data.  A zero kind is an ordinary
+  // periodic/shared/interior trace coupling; nonzero values select a copied
+  // value-only exterior policy for this element-local face.
+  double* boundary_reference = nullptr;
   double* status = nullptr;
   double* scalar = nullptr;
   std::uint64_t* hash_words = nullptr;
   int* ticket_words = nullptr;
   int* signed_element_trace = nullptr;
+  int* boundary_policy_kind = nullptr;
   int* matrix_owned_source = nullptr;
   int* matrix_owned_section = nullptr;
   int* matrix_owned_target = nullptr;
@@ -449,6 +456,7 @@ struct CudaMeshShape
   int vector_receive_count = 0;
   bool borrowed_static_source = false;
   bool borrowed_host_inputs = false;
+  bool borrowed_static_boundary_policies = false;
 };
 
 enum class CudaHypreSetupAction : std::uint8_t
@@ -1766,27 +1774,93 @@ private:
     if (!CollectiveContinue(local_valid)) { return false; }
 
     if (!config.use_borrowed_topology) { return true; }
+    // A borrowed mesh may contain ordinary periodic/shared faces and true
+    // physical boundaries.  Classify every element-local face before device
+    // setup: an unpaired nonshared face without a boundary element is a hole,
+    // while every true boundary attribute must map to exactly one admitted
+    // copied static policy.  This replaces the old periodic-only face census.
     long long local_face_measure = 0;
+    long long local_physical_faces = 0;
+    try
+    {
+      const int face_count = config.borrowed_mesh->GetNumFaces();
+      if (face_count < 0) local_valid = false;
+      std::vector<unsigned char> shared(
+          local_valid ? static_cast<std::size_t>(face_count) : 0, 0);
+      for (int index = 0; local_valid &&
+           index < config.borrowed_mesh->GetNSharedFaces(); ++index)
+      {
+        const int face = config.borrowed_mesh->GetSharedFace(index);
+        if (face < 0 || face >= static_cast<int>(shared.size())) local_valid = false;
+        else shared[static_cast<std::size_t>(face)] = 1;
+      }
+      local_valid = local_valid &&
+          ValidateCudaStaticBoundaryPolicyTable(config.borrowed_boundary_policies);
+      for (int element = 0; local_valid && element < local_elements; ++element)
+      {
+        mfem::Array<int> faces, orientations;
+        config.borrowed_mesh->GetElementEdges(element, faces, orientations);
+        if (faces.Size() != faces_per_element) { local_valid = false; break; }
+        for (int local_face = 0; local_face < faces.Size(); ++local_face)
+        {
+          const int face = faces[local_face];
+          mfem::FaceElementTransformations* transformations =
+              config.borrowed_mesh->GetFaceElementTransformations(face);
+          if (face < 0 || face >= static_cast<int>(shared.size()) ||
+              transformations == nullptr || transformations->Face == nullptr ||
+              (transformations->Elem1No != element &&
+               transformations->Elem2No != element))
+          { local_valid = false; break; }
+          const int boundary_element = config.borrowed_mesh->GetFaceToBdrElMap()[face];
+          const bool is_shared = shared[static_cast<std::size_t>(face)] != 0;
+          const bool is_physical = !is_shared && transformations->Elem2No < 0 &&
+              boundary_element >= 0;
+          if (!is_physical)
+          {
+            // Shared faces and local paired faces retain ordinary trace
+            // coupling.  A nonshared one-sided face with no boundary tag is
+            // an unsupported topology hole.
+            if (!is_shared && transformations->Elem2No < 0) local_valid = false;
+            if (!local_valid) break;
+            continue;
+          }
+          const int attribute = config.borrowed_mesh->GetBdrAttribute(boundary_element);
+          const CudaStaticBoundaryPolicy* found = nullptr;
+          for (std::size_t policy = 0;
+               policy < config.borrowed_boundary_policies.count; ++policy)
+            if (config.borrowed_boundary_policies.policies[policy].attribute == attribute)
+              found = config.borrowed_boundary_policies.policies + policy;
+          if (attribute <= 0 || found == nullptr ||
+              !IsCudaAdmittedStaticBoundaryPolicy(found->kind))
+          { local_valid = false; break; }
+          ++local_physical_faces;
+        }
+      }
+    }
+    catch (...) { local_valid = false; }
     const long long faces = config.borrowed_mesh->GetNumFaces();
-    const long long shared = config.borrowed_mesh->GetNSharedFaces();
-    local_valid = faces >= 0 && shared >= 0 && shared <= faces &&
-        faces <= std::numeric_limits<long long>::max() / 2;
-    if (local_valid) local_face_measure = 2 * faces - shared;
+    const long long shared_count = config.borrowed_mesh->GetNSharedFaces();
+    local_valid = local_valid && faces >= 0 && shared_count >= 0 &&
+        shared_count <= faces && faces <= std::numeric_limits<long long>::max() / 2;
+    if (local_valid) local_face_measure = 2 * faces - shared_count;
     if (!CollectiveContinue(local_valid)) return false;
     const long long local_element_count = local_elements;
     long long global_elements = 0;
     long long global_face_measure = 0;
+    long long global_physical_faces = 0;
     const bool element_census = MPI_Allreduce(&local_element_count,
-        &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) ==
-        MPI_SUCCESS;
+        &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
     const bool face_census = MPI_Allreduce(&local_face_measure,
-        &global_face_measure, 1, MPI_LONG_LONG_INT, MPI_SUM,
-        MPI_COMM_WORLD) == MPI_SUCCESS;
-    const bool periodic_measure_safe = global_elements >= 0 &&
-        global_elements <= std::numeric_limits<long long>::max() / 4;
-    const bool periodic = element_census && face_census && periodic_measure_safe &&
-        global_face_measure == 4 * global_elements;
-    if (!periodic) return false;
+        &global_face_measure, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool boundary_census = MPI_Allreduce(&local_physical_faces,
+        &global_physical_faces, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+    if (!element_census || !face_census || !boundary_census ||
+        global_elements < 0 || global_physical_faces < 0 ||
+        global_elements > (std::numeric_limits<long long>::max() -
+            global_physical_faces) / faces_per_element ||
+        global_face_measure != faces_per_element * global_elements +
+            global_physical_faces)
+      return false;
     return ValidateBorrowedTopologyCapacity(config);
   }
 
@@ -2018,6 +2092,9 @@ private:
     shape_.global_true_trace_count = static_cast<int>(global_true);
     shape_.borrowed_static_source = false;
     shape_.borrowed_host_inputs = config.use_borrowed_host_inputs;
+    shape_.borrowed_static_boundary_policies =
+        config.use_borrowed_host_inputs &&
+        config.borrowed_boundary_policies.count != 0;
     if (!ExactTopologyShapeFitsCapacity(config, *mesh_, *interior_space_,
                                         *trace_space_, exchange_plan_))
       return false;
@@ -2028,11 +2105,11 @@ private:
     if (shape_.volume_points > maximum_volume_points ||
         shape_.face_points > maximum_face_points)
       return false;
-    return AllocateTopologyStorage() && BuildHostGeometryAndMaps() &&
+    return AllocateTopologyStorage() && BuildHostGeometryAndMaps(config) &&
         BuildLocalTraceGraph();
   }
 
-  bool BuildHostGeometryAndMaps() noexcept;
+  bool BuildHostGeometryAndMaps(const CudaConfig&) noexcept;
   bool AllocateTopologyStorage() noexcept
   {
     try
@@ -2102,6 +2179,10 @@ private:
       layout.interior = interior;
       layout.local_trace = local_trace;
       layout.true_trace = true_trace;
+      layout.element_faces = element_faces;
+      valid = valid && checked_product(element_faces, conserved_components,
+                                       layout.boundary_reference);
+      if (!valid) return false;
       const std::size_t host_elements = generic ? layout.elements : maximum_rank_elements;
       const std::size_t host_interior = generic ? interior :
           static_cast<std::size_t>(maximum_rank_elements) * maximum_interior_dofs_per_element;
@@ -2135,6 +2216,11 @@ private:
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points, 0.0);
       host_face_normal_.assign(generic ? layout.face_normal :
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension, 0.0);
+      host_boundary_reference_.assign(generic &&
+          shape_.borrowed_static_boundary_policies ? layout.boundary_reference : 0,
+          0.0);
+      host_boundary_policy_kind_.assign(generic &&
+          shape_.borrowed_static_boundary_policies ? layout.element_faces : 0, 0);
       host_exact_interior_.assign(host_interior, 0.0);
       host_perturbed_interior_.assign(host_interior, 0.0);
       host_exact_true_trace_.assign(host_true_trace, 0.0);
@@ -2194,12 +2280,16 @@ private:
           checked_add(doubles, layout.face_interior) && checked_add(doubles, layout.face_trace) &&
           checked_add(doubles, layout.face_weight) && checked_add(doubles, layout.face_normal) &&
           checked_add(doubles, elements) && checked_add(doubles, 8) &&
-          checked_add(doubles, layout.face_weight);
+          checked_add(doubles, layout.face_weight) &&
+          (!shape_.borrowed_static_boundary_policies ||
+           checked_add(doubles, layout.boundary_reference));
       std::size_t integers = 16;
       valid = valid && checked_add(integers, layout.element_trace) &&
           checked_add(integers, three_local_matrix) &&
           checked_add(integers, three_local_matrix) &&
-          checked_add(integers, four_element_trace);
+          checked_add(integers, four_element_trace) &&
+          (!shape_.borrowed_static_boundary_policies ||
+           checked_add(integers, layout.element_faces));
       if (!valid || doubles > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
           integers > static_cast<std::size_t>(std::numeric_limits<int>::max()))
         return false;
@@ -2462,6 +2552,8 @@ private:
   std::vector<double> host_face_trace_shape_{};
   std::vector<double> host_face_weight_{};
   std::vector<double> host_face_normal_{};
+  std::vector<double> host_boundary_reference_{};
+  std::vector<int> host_boundary_policy_kind_{};
   std::vector<double> host_exact_interior_{};
   std::vector<double> host_perturbed_interior_{};
   std::vector<double> host_exact_true_trace_{};
