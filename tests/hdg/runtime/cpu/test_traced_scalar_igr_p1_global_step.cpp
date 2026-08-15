@@ -312,19 +312,63 @@ bool ComputeRawUncondensedResidual(
       std::isfinite(output.true_trace_norm_squared);
 }
 
-bool FillUniformTrace(const mfem::ParFiniteElementSpace& space, mfem::Vector& values)
+bool FillUniformTrace(mfem::ParMesh& mesh,
+                      mfem::ParFiniteElementSpace& space,
+                      mfem::Vector& values)
 {
   if (values.Size() != space.GetTrueVSize()) { return false; }
   const double state[5]{1.0, 0.12, -0.04, 2.75, 0.86};
-  const int scalar_vsize = space.GetVSize() / 5;
-  if (scalar_vsize <= 0) { return false; }
-  values = 0.0;
-  for (int local_dof = 0; local_dof < space.GetVSize(); ++local_dof)
+  mfem::ParGridFunction local(&space);
+  local = 0.0;
+  for (int face = 0; face < mesh.GetNumFaces(); ++face)
   {
-    const int true_dof = space.GetLocalTDofNumber(local_dof);
-    if (true_dof >= 0) { values[true_dof] = state[local_dof / scalar_vsize]; }
+    const mfem::FiniteElement* const finite_element = space.GetFaceElement(face);
+    mfem::Array<int> vdofs;
+    space.GetFaceVDofs(face, vdofs);
+    if (finite_element == nullptr || finite_element->GetDof() <= 0 ||
+        vdofs.Size() != finite_element->GetDof() * 5)
+    {
+      return false;
+    }
+    for (int scalar = 0; scalar < finite_element->GetDof(); ++scalar)
+    {
+      for (int component = 0; component < 5; ++component)
+      {
+        double sign = 1.0;
+        const int vdof = DecodeSigned(
+            vdofs[component * finite_element->GetDof() + scalar], sign);
+        if (vdof < 0 || vdof >= local.Size()) { return false; }
+        local[vdof] = sign * state[component];
+      }
+    }
   }
-  return true;
+  local.ParallelProject(values);
+  local.Distribute(values);
+  for (int face = 0; face < mesh.GetNumFaces(); ++face)
+  {
+    const mfem::FiniteElement* const finite_element = space.GetFaceElement(face);
+    mfem::Array<int> vdofs;
+    space.GetFaceVDofs(face, vdofs);
+    if (finite_element == nullptr || vdofs.Size() != finite_element->GetDof() * 5)
+    {
+      return false;
+    }
+    for (int scalar = 0; scalar < finite_element->GetDof(); ++scalar)
+    {
+      for (int component = 0; component < 5; ++component)
+      {
+        double sign = 1.0;
+        const int vdof = DecodeSigned(
+            vdofs[component * finite_element->GetDof() + scalar], sign);
+        if (vdof < 0 || vdof >= local.Size() ||
+            std::abs(sign * local[vdof] - state[component]) > 1.0e-14)
+        {
+          return false;
+        }
+      }
+    }
+  }
+  return Finite(values);
 }
 
 bool FillUniformInterior(const Layout& layout, mfem::Vector& values)
@@ -655,16 +699,16 @@ bool Check(const MPI_Comm communicator)
   mfem::ParMesh periodic_mesh = MakePeriodicMesh(communicator);
   Layout periodic_layout(periodic_mesh);
   std::vector<local::AffineQuad> periodic_quads;
-  const mfem::ParFiniteElementSpace* const periodic_trace =
-      periodic_layout.TraceSpace();
+  mfem::ParFiniteElementSpace* const periodic_trace =
+      const_cast<mfem::ParFiniteElementSpace*>(periodic_layout.TraceSpace());
   mfem::Vector periodic_current_trace(periodic_layout.TraceTrueVSize()),
       periodic_previous_trace(periodic_layout.TraceTrueVSize()),
       periodic_current_interior, periodic_previous_interior;
   RawUncondensedResidual periodic_raw;
   ok = periodic_layout.IsUsable() && periodic_trace != nullptr &&
       BuildAffineQuads(periodic_mesh, periodic_quads) &&
-      FillUniformTrace(*periodic_trace, periodic_current_trace) &&
-      FillUniformTrace(*periodic_trace, periodic_previous_trace) &&
+      FillUniformTrace(periodic_mesh, *periodic_trace, periodic_current_trace) &&
+      FillUniformTrace(periodic_mesh, *periodic_trace, periodic_previous_trace) &&
       FillUniformInterior(periodic_layout, periodic_current_interior) &&
       FillUniformInterior(periodic_layout, periodic_previous_interior) &&
       ComputeRawUncondensedResidual(communicator, periodic_layout, periodic_quads,
