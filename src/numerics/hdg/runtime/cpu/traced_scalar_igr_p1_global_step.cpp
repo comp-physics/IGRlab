@@ -398,7 +398,9 @@ struct RetainedTraceSystem final
         send_offsets.size() != static_cast<std::size_t>(ranks) ||
         receive_offsets.size() != static_cast<std::size_t>(ranks) ||
         send_values.size() != outgoing.size() || receive_values.size() != incoming.size() ||
-        local_rhs.Size() != local_size || true_rhs.Size() != true_size)
+        local_rhs.Size() != local_size || true_rhs.Size() != true_size ||
+        rhs->Size() != true_size || solution->Size() != true_size ||
+        residual->Size() != true_size)
     {
       return false;
     }
@@ -1194,6 +1196,7 @@ struct TracedScalarIgrP1Scratch::Implementation final
   EphemeralStepState state{};
   RetainedTraceSystem retained{};
   bool retained_initialized = false;
+  bool initialization_poisoned = false;
 
   bool Matches(const TracedScalarIgrP1GlobalStepInput& input) const noexcept
   {
@@ -1213,7 +1216,7 @@ struct TracedScalarIgrP1Scratch::Implementation final
         CheckedBatchCapacity(elements, 40, g_capacity) &&
         CheckedBatchCapacity(elements, 40 * 40, schur_capacity) &&
         CheckedBatchCapacity(elements, 40, reduced_capacity);
-    return communicator_matches && capacities_are_valid && input.layout == layout && layout &&
+    return !initialization_poisoned && communicator_matches && capacities_are_valid && input.layout == layout && layout &&
         layout->IsUsable() && layout->InteriorSpace() == interior_space &&
         layout->TraceSpace() == trace_space && interior_space && trace_space &&
         interior_space->GetParMesh() == mesh && trace_space->GetParMesh() == mesh &&
@@ -1754,20 +1757,29 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
   int initialized = implementation.retained_initialized ? 1 : 0;
   int initialized_min = 0;
   int initialized_max = 0;
-  const bool initialization_status =
-      MPI_Allreduce(&initialized, &initialized_min, 1, MPI_INT, MPI_MIN,
-                    input.communicator) == MPI_SUCCESS &&
-      MPI_Allreduce(&initialized, &initialized_max, 1, MPI_INT, MPI_MAX,
-                    input.communicator) == MPI_SUCCESS;
+  const int minimum_status = MPI_Allreduce(
+      &initialized, &initialized_min, 1, MPI_INT, MPI_MIN,
+      input.communicator);
+  // Execute the second collective even when the first reports an error: a
+  // short-circuit here would strand peers that entered their second reduction.
+  const int maximum_status = MPI_Allreduce(
+      &initialized, &initialized_max, 1, MPI_INT, MPI_MAX,
+      input.communicator);
+  const bool initialization_status = minimum_status == MPI_SUCCESS &&
+      maximum_status == MPI_SUCCESS;
   if (!CollectiveAll(input.communicator, initialization_status) ||
       initialized_min != initialized_max)
   {
+    implementation.initialization_poisoned = true;
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
   if (initialized_min == 0)
   {
     if (!implementation.retained.Initialize(input.communicator, *input.layout))
     {
+      // Initialize may have constructed a partial graph/plan before a
+      // collectively admitted failure.  It is never retried in place.
+      implementation.initialization_poisoned = true;
       return TracedScalarIgrP1GlobalStepResult::failure;
     }
     implementation.retained_initialized = true;
