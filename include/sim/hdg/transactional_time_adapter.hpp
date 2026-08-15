@@ -2,13 +2,14 @@
 
 /**
  * @file sim/hdg/transactional_time_adapter.hpp
- * @brief Pure fixed-step Backward-Euler transaction adapter for HDG staging.
+ * @brief Pure fixed/CFL Backward-Euler transaction adapter for HDG staging.
  *
  * No solver, MFEM, runtime backend, or output writer is included here.  The
  * caller owns those effects and uses the preview before FinalizeSuccess().
  */
 
 #include <cstdint>
+#include <cmath>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -74,8 +75,42 @@ public:
   /// The last finalized output cycle; zero denotes cycle-zero/no output.
   std::uint64_t output_cycle() const { return output_cycle_; }
 
-  /// Starts a fixed Backward-Euler transaction, or returns its pending retry.
-  const StepPlan& BeginStep() { return cursor_.Plan(0.0); }
+  /**
+   * Start a Backward-Euler transaction, or return its pending retry.
+   *
+   * In fixed mode @p proposed_dt is intentionally ignored by the underlying
+   * planner.  In CFL mode it must be the backend's finite, positive,
+   * communicator-reduced stable step before output/final-time clipping.
+   */
+  const StepPlan& BeginStep(const double proposed_dt)
+  {
+    return cursor_.Plan(proposed_dt);
+  }
+
+  /**
+   * Start a transaction after enforcing a minimum on the nominal CFL
+   * proposal.  The minimum is deliberately checked before cursor clipping at
+   * an output or final-time boundary.
+   */
+  const StepPlan& BeginStep(const double proposed_dt,
+                            const double minimum_nominal_dt)
+  {
+    if (!std::isfinite(minimum_nominal_dt) || minimum_nominal_dt < 0.0)
+    {
+      throw std::invalid_argument(
+          "HDG minimum nominal dt must be finite and non-negative");
+    }
+    if (mode_ == HdgTimeControlMode::CFLBackwardEuler &&
+        proposed_dt < minimum_nominal_dt)
+    {
+      throw std::invalid_argument(
+          "HDG CFL nominal dt is below the configured minimum");
+    }
+    return BeginStep(proposed_dt);
+  }
+
+  /// Compatibility spelling for a fixed Backward-Euler transaction.
+  const StepPlan& BeginStep() { return BeginStep(0.0); }
 
   /// Returns the same uncommitted plan after an external failure.
   const StepPlan& RetryPendingStep() const { return cursor_.PendingPlan(); }
@@ -114,16 +149,16 @@ private:
   static TimeControl ValidateAndMoveControl(TimeControl control,
                                             HdgTimeControlMode mode)
   {
-    if (mode != HdgTimeControlMode::FixedBackwardEuler)
+    const bool fixed_pair = mode == HdgTimeControlMode::FixedBackwardEuler &&
+        control.kind == time::backend::StepControlKind::Fixed;
+    const bool cfl_pair = mode == HdgTimeControlMode::CFLBackwardEuler &&
+        control.kind == time::backend::StepControlKind::CFL;
+    if (!fixed_pair && !cfl_pair)
     {
       throw std::invalid_argument(
-        "HDG time-control mode is reserved but not implemented");
+          "HDG time-control requires an exact Backward-Euler/control pairing");
     }
-    if (control.kind != time::backend::StepControlKind::Fixed)
-    {
-      throw std::invalid_argument(
-        "HDG fixed Backward-Euler requires fixed time control");
-    }
+    control.Validate();
     return control;
   }
 

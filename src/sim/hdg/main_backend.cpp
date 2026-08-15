@@ -70,6 +70,23 @@ bool CollectiveAll(const MPI_Comm communicator, const bool local) noexcept
       output == 1;
 }
 
+bool ExactDoubleConsensus(const MPI_Comm communicator, const double value) noexcept
+{
+  if (communicator == MPI_COMM_NULL) return false;
+  std::uint64_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value),
+                "HDG main consensus requires IEEE binary64 doubles");
+  std::memcpy(&bits, &value, sizeof(bits));
+  std::uint64_t minimum = 0;
+  std::uint64_t maximum = 0;
+  const int minimum_status = MPI_Allreduce(
+      &bits, &minimum, 1, MPI_UINT64_T, MPI_MIN, communicator);
+  const int maximum_status = MPI_Allreduce(
+      &bits, &maximum, 1, MPI_UINT64_T, MPI_MAX, communicator);
+  return minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS &&
+      minimum == maximum;
+}
+
 bool ExactTextConsensus(const MPI_Comm communicator,
                         const std::string& local) noexcept
 {
@@ -276,6 +293,8 @@ std::string CanonicalMainRequest(
          << vtk.high_order_output << ';'
          << vtk.levels_of_detail << ';';
   AppendDouble(stream, request.options.dt);
+  AppendDouble(stream, request.options.dt_min);
+  AppendDouble(stream, request.options.cfl);
   AppendDouble(stream, request.options.t_final);
   AppendDouble(stream, request.options.dt_save);
   AppendDouble(stream, request.case_config.gamma);
@@ -317,9 +336,18 @@ std::string Validate(const HdgEulerMainRequest& request)
   {
     return "generic HDG GLVis output is unsupported";
   }
-  if (!std::isfinite(request.options.dt) || request.options.dt <= 0.0)
+  if (!std::isfinite(request.options.dt))
   {
-    return "fixed Backward Euler requires a positive --time-step";
+    return "HDG --time-step must be finite";
+  }
+  if (request.options.dt <= 0.0 &&
+      (!std::isfinite(request.options.cfl) || request.options.cfl <= 0.0))
+  {
+    return "CFL Backward Euler requires a finite positive --cfl-number";
+  }
+  if (!std::isfinite(request.options.dt_min) || request.options.dt_min < 0.0)
+  {
+    return "HDG --dt-min must be finite and non-negative";
   }
   if (!std::isfinite(request.options.t_final) ||
       request.options.t_final <= 0.0)
@@ -600,11 +628,16 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         : HdgTransactionalTimeAdapter::OutputSchedule::Disabled(
             time::backend::InitialOutputPolicy::Suppress,
             time::backend::FinalOutputPolicy::Suppress);
+      const bool cfl_control = request.options.dt <= 0.0;
+      const auto control = cfl_control
+          ? HdgTransactionalTimeAdapter::TimeControl::CFL(
+                0.0, request.options.t_final, request.options.cfl)
+          : HdgTransactionalTimeAdapter::TimeControl::Fixed(
+                0.0, request.options.t_final, request.options.dt);
       time_driver = std::make_unique<HdgTransactionalTimeAdapter>(
-        HdgTransactionalTimeAdapter::TimeControl::Fixed(
-          0.0, request.options.t_final, request.options.dt),
-        output_schedule,
-        HdgTimeControlMode::FixedBackwardEuler);
+          control, output_schedule,
+          cfl_control ? HdgTimeControlMode::CFLBackwardEuler
+                      : HdgTimeControlMode::FixedBackwardEuler);
       local_ok = true;
     }
     catch (...)
@@ -650,7 +683,37 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
 
     while (!time_driver->Finished())
     {
-      const auto& plan = time_driver->BeginStep();
+      double proposed_dt = 0.0;
+      if (time_driver->mode() == HdgTimeControlMode::CFLBackwardEuler)
+      {
+        const auto diagnostics = session->diagnostics();
+        const bool diagnostics_ready =
+            dg::hdg::generic::HasHdgEulerSessionCapabilities(
+                session->capabilities(),
+                dg::hdg::generic::HdgEulerSessionCapabilityBit(
+                    dg::hdg::generic::HdgEulerSessionCapability::
+                        committed_cfl_diagnostics)) &&
+            dg::hdg::generic::IsValidHdgEulerCommittedDiagnostics(
+                diagnostics, session->capabilities()) &&
+            diagnostics.coordinates.time == time_driver->time() &&
+            diagnostics.coordinates.step == time_driver->solver_step() &&
+            diagnostics.coordinates.generation == diagnostics.wave_generation;
+        proposed_dt = diagnostics.backend_stable_dt * request.options.cfl;
+        const bool proposal_valid = diagnostics_ready &&
+            std::isfinite(proposed_dt) && proposed_dt > 0.0 &&
+            (request.options.dt_min <= 0.0 ||
+             proposed_dt >= request.options.dt_min);
+        const bool proposal_consensus =
+            ExactDoubleConsensus(request.communicator, proposed_dt);
+        if (!CollectiveAll(request.communicator,
+                           proposal_valid && proposal_consensus))
+        {
+          return Reject(request,
+                        "committed CFL proposal is invalid or below --dt-min");
+        }
+      }
+      const auto& plan = time_driver->BeginStep(proposed_dt,
+                                                 request.options.dt_min);
       GenericEulerCpuPreparedStep prepared;
       local_ok = session->Prepare(plan.dt, prepared).status ==
           GenericEulerCpuSessionStatus::prepared;

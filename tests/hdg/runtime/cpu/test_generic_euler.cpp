@@ -6,8 +6,11 @@
 #include <mpi.h>
 
 #include <array>
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -132,6 +135,35 @@ EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
   request.source = {source.data(), source.size(), 4};
   request.boundary = {&boundary, NonperiodicExterior};
   return request;
+}
+
+bool MatchesCommittedCflDiagnostic(
+    const dg::hdg::generic::HdgEulerCommittedDiagnostics& diagnostics,
+    const mfem::ParMesh& mesh, const int polynomial_order)
+{
+  double local_hmin = std::numeric_limits<double>::infinity();
+  for (int element = 0; element < mesh.GetNE(); ++element)
+  {
+    local_hmin = std::min(local_hmin, mesh.GetElementSize(element, 1));
+  }
+  double hmin = std::numeric_limits<double>::infinity();
+  if (MPI_Allreduce(&local_hmin, &hmin, 1, MPI_DOUBLE, MPI_MIN,
+                    mesh.GetComm()) != MPI_SUCCESS ||
+      !(hmin > 0.0) || !std::isfinite(hmin))
+  {
+    return false;
+  }
+  const double denominator = 2.0 * polynomial_order + 1.0;
+  const double expected = diagnostics.maximum_wave_speed > 0.0
+      ? hmin / (denominator * diagnostics.maximum_wave_speed)
+      : hmin / denominator;
+  const double scale = std::max({1.0, std::abs(expected),
+                                 std::abs(diagnostics.backend_stable_dt)});
+  return std::isfinite(diagnostics.maximum_wave_speed) &&
+      diagnostics.maximum_wave_speed >= 0.0 &&
+      std::isfinite(diagnostics.backend_stable_dt) &&
+      diagnostics.backend_stable_dt > 0.0 &&
+      std::abs(diagnostics.backend_stable_dt - expected) <= 1.0e-12 * scale;
 }
 
 bool All(const bool local, const MPI_Comm communicator = MPI_COMM_WORLD)
@@ -446,26 +478,44 @@ bool CheckPreparedSessionLifecycle()
       dg::hdg::generic::HdgEulerSessionCapabilityBit(
           dg::hdg::generic::HdgEulerSessionCapability::prepared_output) |
       dg::hdg::generic::HdgEulerSessionCapabilityBit(
+          dg::hdg::generic::HdgEulerSessionCapability::committed_cfl_diagnostics) |
+      dg::hdg::generic::HdgEulerSessionCapabilityBit(
           dg::hdg::generic::HdgEulerSessionCapability::generic_borrowed_inputs);
   if (!dg::hdg::generic::HasHdgEulerSessionCapabilities(
           session.capabilities(), required_capabilities) ||
-      dg::hdg::generic::HasHdgEulerSessionCapabilities(
-          session.capabilities(),
-          dg::hdg::generic::HdgEulerSessionCapabilityBit(
-              dg::hdg::generic::HdgEulerSessionCapability::
-                  committed_cfl_diagnostics)) ||
       !dg::hdg::generic::IsValidHdgEulerCommittedDiagnostics(
-          session.diagnostics(), session.capabilities()))
+          session.diagnostics(), session.capabilities()) ||
+      !MatchesCommittedCflDiagnostic(session.diagnostics(), mesh, 1))
   {
     return false;
   }
-  auto stale_unavailable_wave = session.diagnostics();
-  stale_unavailable_wave.coordinates.generation = 1;
-  stale_unavailable_wave.wave_generation = 1;
+  auto stale_generation = session.diagnostics();
+  stale_generation.wave_generation = 1;
   if (dg::hdg::generic::IsValidHdgEulerCommittedDiagnostics(
-          stale_unavailable_wave, session.capabilities()))
+          stale_generation, session.capabilities()))
   {
     return false;
+  }
+
+  int rank = 0;
+  int ranks = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  const auto initial_diagnostics = session.diagnostics();
+  if (ranks > 1)
+  {
+    GenericEulerCpuPreparedStep divergent_proposal;
+    const double rank_divergent_dt = rank == 0 ? 0.005 : 0.006;
+    if (session.Prepare(rank_divergent_dt, divergent_proposal).status !=
+            GenericEulerCpuSessionStatus::rejected ||
+        session.coordinates().generation != 0 ||
+        session.diagnostics().maximum_wave_speed !=
+            initial_diagnostics.maximum_wave_speed ||
+        session.diagnostics().backend_stable_dt !=
+            initial_diagnostics.backend_stable_dt)
+    {
+      return false;
+    }
   }
 
   mfem::L2_FECollection collection(
@@ -509,10 +559,6 @@ bool CheckPreparedSessionLifecycle()
 
   // A different rank-local token must be rejected collectively with neither
   // committed bytes nor coordinates changed; the valid authority survives.
-  int rank = 0;
-  int ranks = 1;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
   if (ranks > 1)
   {
     const auto divergent_operation = rank == 0
@@ -544,6 +590,10 @@ bool CheckPreparedSessionLifecycle()
       session.coordinates().generation != coordinates_before.generation ||
       session.diagnostics().coordinates.generation !=
           diagnostics_before.coordinates.generation ||
+      session.diagnostics().maximum_wave_speed !=
+          diagnostics_before.maximum_wave_speed ||
+      session.diagnostics().backend_stable_dt !=
+          diagnostics_before.backend_stable_dt ||
       !session.ExportCommittedInterior(
           {committed_values.data(), committed_values.size()}) ||
       committed_values != before)
@@ -559,7 +609,10 @@ bool CheckPreparedSessionLifecycle()
       session.coordinates().step != 1 || session.coordinates().generation != 1 ||
       session.coordinates().dt != 0.007 || session.coordinates().time != 0.007 ||
       !dg::hdg::generic::IsValidHdgEulerCommittedDiagnostics(
-          session.diagnostics(), session.capabilities()))
+          session.diagnostics(), session.capabilities()) ||
+      session.diagnostics().coordinates.generation != 1 ||
+      session.diagnostics().wave_generation != 1 ||
+      !MatchesCommittedCflDiagnostic(session.diagnostics(), mesh, 1))
   {
     return false;
   }
@@ -569,7 +622,10 @@ bool CheckPreparedSessionLifecycle()
       session.coordinates().step != committed_coordinates.step ||
       session.coordinates().generation != committed_coordinates.generation ||
       session.Advance(0.011).status != GenericEulerCpuSessionStatus::advanced ||
-      session.coordinates().step != 2 || session.coordinates().generation != 2)
+      session.coordinates().step != 2 || session.coordinates().generation != 2 ||
+      session.diagnostics().coordinates.generation != 2 ||
+      session.diagnostics().wave_generation != 2 ||
+      !MatchesCommittedCflDiagnostic(session.diagnostics(), mesh, 1))
   {
     return false;
   }

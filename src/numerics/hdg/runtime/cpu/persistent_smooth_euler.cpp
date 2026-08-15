@@ -3922,6 +3922,74 @@ struct detail::CpuNumericsCore::Implementation
                    maximum_wave_speed < cpu_fixed_tau);
   }
 
+  /**
+   * Compute a CFL diagnostic from a borrowed slot.  Both the volume and
+   * trace representations are reloaded from the supplied state so the
+   * reported wave speed has the same observable scope as publication.
+   */
+  bool ScanBorrowedEulerState(const CpuSlotStorage& committed_state,
+                              double& maximum_wave_speed,
+                              double& backend_stable_dt) noexcept
+  {
+    maximum_wave_speed = 0.0;
+    backend_stable_dt = std::numeric_limits<double>::quiet_NaN();
+    const bool local_state_ready = initialized && IsBorrowed() && mesh &&
+        iterate_interior && iterate_trace;
+    if (!CollectiveAll(local_state_ready)) { return false; }
+
+    const bool fields_assigned =
+        Assign(*iterate_interior, committed_state.interior) &&
+        Assign(iterate_true_trace, committed_state.trace);
+    if (!CollectiveAll(fields_assigned)) { return false; }
+    // LoadTrace owns parallel trace distribution.  Every rank reaches it
+    // only after the rank-local slot copies have collectively succeeded.
+    const bool trace_loaded = LoadTrace(iterate_true_trace, *iterate_trace);
+    if (!CollectiveAll(trace_loaded)) { return false; }
+
+    double minimum_density = 0.0;
+    double minimum_pressure = 0.0;
+    const bool state_valid = Prescreen(*iterate_interior, *iterate_trace,
+                                       minimum_density, minimum_pressure,
+                                       maximum_wave_speed);
+    if (!CollectiveAll(state_valid)) { return false; }
+
+    double local_hmin = std::numeric_limits<double>::infinity();
+    bool local_geometry_valid = true;
+    try
+    {
+      for (int element = 0; element < mesh->GetNE(); ++element)
+      {
+        const double element_hmin = mesh->GetElementSize(element, 1);
+        if (!Finite(element_hmin) || !(element_hmin > 0.0))
+        {
+          local_geometry_valid = false;
+          break;
+        }
+        local_hmin = std::min(local_hmin, element_hmin);
+      }
+    }
+    catch (...)
+    {
+      local_geometry_valid = false;
+    }
+    double global_hmin = std::numeric_limits<double>::infinity();
+    const int hmin_status = MPI_Allreduce(
+        &local_hmin, &global_hmin, 1, MPI_DOUBLE, MPI_MIN, communicator);
+    const bool geometry_valid = local_geometry_valid &&
+        hmin_status == MPI_SUCCESS && Finite(global_hmin) &&
+        global_hmin > 0.0;
+    if (!CollectiveAll(geometry_valid)) { return false; }
+
+    const double denominator =
+        2.0 * static_cast<double>(config.polynomial_order) + 1.0;
+    backend_stable_dt = maximum_wave_speed > 0.0
+        ? global_hmin / (denominator * maximum_wave_speed)
+        : global_hmin / denominator;
+    return CollectiveAll(Finite(maximum_wave_speed) &&
+                         maximum_wave_speed >= 0.0 &&
+                         Finite(backend_stable_dt) && backend_stable_dt > 0.0);
+  }
+
   bool CondenseAndAssemble(const LocalSystem& system,
                            StateHash& matrix_hash,
                            std::uint64_t& matrix_refresh_generation) noexcept
@@ -4637,7 +4705,23 @@ bool detail::CpuNumericsCore::AdvanceBorrowedEuler(
     return false;
   }
   double maximum_wave_speed = 0.0;
-  return CommitBorrowedEuler(generation, coordinates, maximum_wave_speed);
+  double backend_stable_dt = 0.0;
+  return CommitBorrowedEuler(generation, coordinates, maximum_wave_speed,
+                             backend_stable_dt);
+}
+
+bool detail::CpuNumericsCore::CommittedBorrowedEulerDiagnostics(
+    double& maximum_wave_speed, double& backend_stable_dt) noexcept
+{
+  if (!implementation_) return false;
+  const CpuSlotStorage* const committed =
+      implementation_->Committed();
+  if (!implementation_->CollectiveAll(committed != nullptr))
+  {
+    return false;
+  }
+  return implementation_->ScanBorrowedEulerState(
+      *committed, maximum_wave_speed, backend_stable_dt);
 }
 
 bool detail::CpuNumericsCore::PrepareBorrowedEuler(
@@ -4727,9 +4811,10 @@ bool detail::CpuNumericsCore::PrepareBorrowedEuler(
 
 bool detail::CpuNumericsCore::CommitBorrowedEuler(
     const std::uint64_t generation, StateCoordinates& coordinates,
-    double& maximum_wave_speed) noexcept
+    double& maximum_wave_speed, double& backend_stable_dt) noexcept
 {
   maximum_wave_speed = 0.0;
+  backend_stable_dt = std::numeric_limits<double>::quiet_NaN();
   Implementation& state = *implementation_;
   std::uint64_t minimum_generation = 0;
   std::uint64_t maximum_generation = 0;
@@ -4761,6 +4846,20 @@ bool detail::CpuNumericsCore::CommitBorrowedEuler(
   {
     return false;
   }
+  // Scan the candidate immediately before it becomes committed.  The slots
+  // exchange atomically below, so these trace-inclusive diagnostics describe
+  // exactly the bytes that the successful commit publishes; no fallible work
+  // is introduced after the final publication authority has been consumed.
+  const CpuSlotStorage* const candidate = state.Candidate();
+  if (!state.CollectiveAll(candidate != nullptr))
+  {
+    return false;
+  }
+  if (!state.ScanBorrowedEulerState(*candidate, maximum_wave_speed,
+                                    backend_stable_dt))
+  {
+    return false;
+  }
   // CanAuthorizePublicationChain performed the final collective preflight.
   // No fallible operation occurs between consuming this authority and publish.
   if (!AuthorizePublicationChain(attempt, generation, candidate_hash))
@@ -4773,7 +4872,6 @@ bool detail::CpuNumericsCore::CommitBorrowedEuler(
   ++coordinates.generation;
   coordinates.cursor = attempt.sequence;
   coordinates.dt = attempt.dt;
-  maximum_wave_speed = state.active_evidence.attempt.maximum_wave_speed;
   state.borrowed_prepare_active = false;
   InvalidateCandidateGeneration();
   Complete({RunStatus::committed, FailureReason::none, true, false},

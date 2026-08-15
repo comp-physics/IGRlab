@@ -67,13 +67,20 @@ GenericEulerCpuSessionResult GenericEulerHdgCpuSession::Initialize(
     initialized_ = false;
     return {GenericEulerCpuSessionStatus::rejected, coordinates_};
   }
+  double maximum_wave_speed = 0.0;
+  double backend_stable_dt = 0.0;
+  if (!core_->CommittedBorrowedEulerDiagnostics(maximum_wave_speed,
+                                                backend_stable_dt))
+  {
+    initialized_ = false;
+    return {GenericEulerCpuSessionStatus::rejected, coordinates_};
+  }
   diagnostics_.available = true;
   diagnostics_.coordinates = {coordinates_.time, coordinates_.dt,
                               coordinates_.step, coordinates_.generation};
   diagnostics_.wave_generation = coordinates_.generation;
-  diagnostics_.maximum_wave_speed = std::numeric_limits<double>::quiet_NaN();
-  // The borrowed CPU core has no characteristic-length/stable-dt estimator.
-  // Do not manufacture a CFL value; capabilities() leaves that bit clear.
+  diagnostics_.maximum_wave_speed = maximum_wave_speed;
+  diagnostics_.backend_stable_dt = backend_stable_dt;
   return {GenericEulerCpuSessionStatus::initialized, coordinates_};
 }
 
@@ -123,8 +130,10 @@ GenericEulerCpuSessionResult GenericEulerHdgCpuSession::Commit(
       token.epoch_ == session_epoch_;
   StateCoordinates core_coordinates = ToCoreCoordinates(coordinates_);
   double maximum_wave_speed = 0.0;
+  double backend_stable_dt = 0.0;
   if (!core_->CommitBorrowedEuler(local_token_valid ? token.generation_ : 0,
-                                  core_coordinates, maximum_wave_speed))
+                                  core_coordinates, maximum_wave_speed,
+                                  backend_stable_dt))
   {
     return {GenericEulerCpuSessionStatus::rejected, coordinates_};
   }
@@ -134,6 +143,7 @@ GenericEulerCpuSessionResult GenericEulerHdgCpuSession::Commit(
                               coordinates_.step, coordinates_.generation};
   diagnostics_.wave_generation = coordinates_.generation;
   diagnostics_.maximum_wave_speed = maximum_wave_speed;
+  diagnostics_.backend_stable_dt = backend_stable_dt;
   return {GenericEulerCpuSessionStatus::committed, coordinates_};
 }
 
@@ -187,6 +197,8 @@ std::uint32_t GenericEulerHdgCpuSession::capabilities() const noexcept
              generic::HdgEulerSessionCapability::prepared_commit) |
       generic::HdgEulerSessionCapabilityBit(
           generic::HdgEulerSessionCapability::prepared_output) |
+      generic::HdgEulerSessionCapabilityBit(
+          generic::HdgEulerSessionCapability::committed_cfl_diagnostics) |
       generic::HdgEulerSessionCapabilityBit(
           generic::HdgEulerSessionCapability::generic_borrowed_inputs);
 }

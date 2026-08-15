@@ -128,12 +128,7 @@ public:
   GenericEulerCpuSessionResult Advance(double dt) noexcept;
   GenericEulerCpuSessionCoordinates coordinates() const noexcept;
   std::uint32_t capabilities() const noexcept;
-  /**
-   * STOPPING NOTE: the borrowed CPU core reports a maximum wave speed after a
-   * commit, but it does not own a truthful characteristic-length/stable-dt
-   * calculation.  The committed_cfl_diagnostics capability therefore remains
-   * unavailable until a backend-specific estimator lands.
-   */
+  /** Trace-inclusive diagnostics for the generation-bound committed state. */
   generic::HdgEulerCommittedDiagnostics diagnostics() const noexcept;
 
   /** Copy only the committed physical interior; trace values are never output. */
