@@ -39,6 +39,22 @@ bool CollectiveAll(const MPI_Comm communicator, const bool local_ok) noexcept
                        communicator) == MPI_SUCCESS && result == 1;
 }
 
+TracedScalarIgrP1GlobalStepResult CollectiveStepResult(
+    const MPI_Comm communicator,
+    const TracedScalarIgrP1GlobalStepResult local_result) noexcept
+{
+  const int local_code = static_cast<int>(local_result);
+  int global_code = static_cast<int>(TracedScalarIgrP1GlobalStepResult::failure);
+  if (MPI_Allreduce(&local_code, &global_code, 1, MPI_INT, MPI_MAX,
+                    communicator) != MPI_SUCCESS ||
+      global_code < static_cast<int>(TracedScalarIgrP1GlobalStepResult::success) ||
+      global_code > static_cast<int>(TracedScalarIgrP1GlobalStepResult::failure))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
+  return static_cast<TracedScalarIgrP1GlobalStepResult>(global_code);
+}
+
 bool CopyVector(const mfem::Vector& source, mfem::Vector& destination) noexcept
 {
   if (source.Size() != destination.Size()) { return false; }
@@ -213,6 +229,56 @@ bool MaxAbsAndNorm(const MPI_Comm communicator, const mfem::Vector& values,
   return Finite(norm);
 }
 
+/** Scale-safe norm of all broken interior values and owned assembled trace values. */
+bool MaxAbsAndNorm(const MPI_Comm communicator, const std::vector<double>& interior,
+                   const mfem::Vector& true_trace, double& maximum,
+                   double& norm) noexcept
+{
+  const double* const trace = true_trace.HostRead();
+  bool local_ok = (trace != nullptr || true_trace.Size() == 0) &&
+      AllFinite(interior);
+  double local_maximum = 0.0;
+  for (const double value : interior)
+  {
+    local_maximum = std::max(local_maximum, std::abs(value));
+  }
+  for (int index = 0; index < true_trace.Size() && local_ok; ++index)
+  {
+    local_ok = Finite(trace[index]);
+    if (!local_ok) { break; }
+    local_maximum = std::max(local_maximum, std::abs(trace[index]));
+  }
+  if (!CollectiveAll(communicator, local_ok) ||
+      MPI_Allreduce(&local_maximum, &maximum, 1, MPI_DOUBLE, MPI_MAX,
+                    communicator) != MPI_SUCCESS || !Finite(maximum) ||
+      maximum < 0.0)
+  {
+    return false;
+  }
+  if (maximum == 0.0) { norm = 0.0; return true; }
+  double local_sum = 0.0;
+  for (const double value : interior)
+  {
+    const double scaled = value / maximum;
+    local_sum += scaled * scaled;
+  }
+  for (int index = 0; index < true_trace.Size(); ++index)
+  {
+    const double scaled = trace[index] / maximum;
+    local_sum += scaled * scaled;
+  }
+  double global_sum = 0.0;
+  if (!CollectiveAll(communicator, Finite(local_sum)) ||
+      MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM,
+                    communicator) != MPI_SUCCESS || !Finite(global_sum) ||
+      global_sum <= 0.0)
+  {
+    return false;
+  }
+  norm = maximum * std::sqrt(global_sum);
+  return Finite(norm);
+}
+
 } // namespace
 
 bool SolveAndRecoverTracedScalarIgrP1Trace(
@@ -358,19 +424,28 @@ bool SolveAndRecoverTracedScalarIgrP1Trace(
   return true;
 }
 
-bool ComputeTracedScalarIgrP1GlobalStep(
+TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
     const TracedScalarIgrP1GlobalStepInput& input,
     TracedScalarIgrP1GlobalStepOutput& output) noexcept
 {
   // The communicator has been admitted by the caller.  This initial local
   // check is deliberately before every opaque collective phase.
-  if (input.communicator == MPI_COMM_NULL) { return false; }
-  if (!CollectiveAll(input.communicator, ValidInput(input))) { return false; }
+  if (input.communicator == MPI_COMM_NULL)
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
+  if (!CollectiveAll(input.communicator, ValidInput(input)))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
 
   const BorrowedP1DGInterfaceLayout& layout = *input.layout;
   const int elements = layout.LocalElementCount();
   const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
-  if (!CollectiveAll(input.communicator, trace_space != nullptr)) { return false; }
+  if (!CollectiveAll(input.communicator, trace_space != nullptr))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
 
   mfem::Vector current_local_trace;
   mfem::Vector previous_local_trace;
@@ -402,15 +477,23 @@ bool ComputeTracedScalarIgrP1GlobalStep(
   {
     local_ok = false;
   }
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  if (!CollectiveAll(input.communicator, local_ok))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
 
   // Both trace distributions are collective through the existing exact-space
   // exchange plan, so all local allocation/shape checks have happened above.
   local_ok = layout.DistributeTrace(*input.current_true_trace,
                                     current_local_trace) &&
       layout.DistributeTrace(*input.previous_true_trace, previous_local_trace);
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  if (!CollectiveAll(input.communicator, local_ok))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
 
+  TracedScalarIgrP1GlobalStepResult local_result =
+      TracedScalarIgrP1GlobalStepResult::success;
   try
   {
     const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
@@ -440,8 +523,17 @@ bool ComputeTracedScalarIgrP1GlobalStep(
             {source_samples.data() + static_cast<std::size_t>(element) *
                  static_cast<std::size_t>(volume_rule.GetNPoints()) * 4,
              static_cast<std::size_t>(volume_rule.GetNPoints())}};
-        local_ok = local::Assemble(input.affine_quads[element], input.parameters,
-                                   state, operator_data) == local::Status::success;
+        const local::Status assembly = local::Assemble(
+            input.affine_quads[element], input.parameters, state, operator_data);
+        if (assembly == local::Status::inadmissible_state)
+        {
+          local_result = TracedScalarIgrP1GlobalStepResult::inadmissible_trial;
+          local_ok = false;
+        }
+        else
+        {
+          local_ok = assembly == local::Status::success;
+        }
       }
       if (local_ok)
       {
@@ -460,18 +552,61 @@ bool ComputeTracedScalarIgrP1GlobalStep(
   {
     local_ok = false;
   }
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  if (local_result == TracedScalarIgrP1GlobalStepResult::success && !local_ok)
+  {
+    local_result = TracedScalarIgrP1GlobalStepResult::failure;
+  }
+  const TracedScalarIgrP1GlobalStepResult assembly_result =
+      CollectiveStepResult(input.communicator, local_result);
+  if (assembly_result != TracedScalarIgrP1GlobalStepResult::success)
+  {
+    return assembly_result;
+  }
 
-  mfem::Vector initial_residuals;
+  mfem::Vector raw_local_trace;
+  mfem::Vector raw_true_trace;
   try
   {
-    initial_residuals.SetSize(static_cast<int>(f.size() + g.size()));
-    std::copy(f.begin(), f.end(), initial_residuals.HostWrite());
-    std::copy(g.begin(), g.end(), initial_residuals.HostWrite() + f.size());
-    local_ok = AllFinite(initial_residuals);
+    raw_local_trace.SetSize(layout.TraceLocalVSize()); raw_local_trace = 0.0;
+    raw_true_trace.SetSize(layout.TraceTrueVSize()); raw_true_trace = 0.0;
+    for (int element = 0; element < elements && local_ok; ++element)
+    {
+      mfem::Array<int> vdofs;
+      trace_space->GetElementVDofs(element, vdofs);
+      local_ok = vdofs.Size() == 40;
+      for (int row = 0; row < 40 && local_ok; ++row)
+      {
+        double sign = 1.0;
+        const int vdof = DecodeSignedVDof(vdofs[row], sign);
+        local_ok = vdof >= 0 && vdof < raw_local_trace.Size();
+        if (local_ok)
+        {
+          raw_local_trace[vdof] += sign *
+              g[static_cast<std::size_t>(element) * 40 + row];
+          local_ok = Finite(raw_local_trace[vdof]);
+        }
+      }
+    }
   }
   catch (const std::exception&) { local_ok = false; }
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  if (!CollectiveAll(input.communicator, local_ok))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
+  trace_space->Dof_TrueDof_Matrix()->MultTranspose(raw_local_trace,
+                                                    raw_true_trace);
+  if (!CollectiveAll(input.communicator, AllFinite(raw_true_trace)))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
+
+  double initial_maximum = 0.0;
+  double initial_norm = 0.0;
+  if (!MaxAbsAndNorm(input.communicator, f, raw_true_trace, initial_maximum,
+                     initial_norm))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
 
   core::HostReferenceEngine condensation;
   if (elements > 0)
@@ -487,7 +622,10 @@ bool ComputeTracedScalarIgrP1GlobalStep(
         system, {View(schur, elements, 40, 40), View(reduced, elements, 40, 1)})
         == core::Status::success && AllFinite(schur) && AllFinite(reduced);
   }
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  if (!CollectiveAll(input.communicator, local_ok))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
 
   std::unique_ptr<mfem::SparseMatrix> local_matrix;
   mfem::Vector local_rhs;
@@ -527,7 +665,10 @@ bool ComputeTracedScalarIgrP1GlobalStep(
   {
     local_ok = false;
   }
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  if (!CollectiveAll(input.communicator, local_ok))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
 
   // The opaque parallel assembly is entered only after all ranks have a fully
   // formed local matrix.  Do not catch this collective operation.
@@ -541,26 +682,30 @@ bool ComputeTracedScalarIgrP1GlobalStep(
       true_matrix->GetGlobalNumCols() == trace_space->GlobalTrueVSize() &&
       true_matrix->GetGlobalNumRows() > 0 &&
       true_matrix->GetGlobalNumRows() <= std::numeric_limits<int>::max();
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  if (!CollectiveAll(input.communicator, local_ok))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
 
   trace_space->Dof_TrueDof_Matrix()->MultTranspose(local_rhs, true_rhs_values);
-  if (!CollectiveAll(input.communicator, AllFinite(true_rhs_values))) { return false; }
-
-  double initial_maximum = 0.0;
-  double initial_norm = 0.0;
-  if (!MaxAbsAndNorm(input.communicator, initial_residuals, initial_maximum,
-                     initial_norm)) { return false; }
+  if (!CollectiveAll(input.communicator, AllFinite(true_rhs_values)))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
   TracedScalarIgrP1TraceSolveOutput solved;
   const TracedScalarIgrP1TraceSolveInput solve_input{
       input.communicator, &layout, trace_space, true_matrix.get(),
       &true_rhs_values, &condensation};
-  if (!SolveAndRecoverTracedScalarIgrP1Trace(solve_input, solved)) { return false; }
+  if (!SolveAndRecoverTracedScalarIgrP1Trace(solve_input, solved))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
   output.trace_increment.Swap(solved.trace_increment);
   output.interior_increment.Swap(solved.interior_increment);
   output.initial_residual_norm = initial_norm;
   output.reduced_rhs_norm = solved.reduced_rhs_norm;
   output.linear_residual_norm = solved.linear_residual_norm;
-  return true;
+  return TracedScalarIgrP1GlobalStepResult::success;
 }
 
 } // namespace dg::hdg::runtime::cpu::detail

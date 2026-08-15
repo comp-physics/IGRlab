@@ -65,6 +65,25 @@ mfem::ParMesh MakeMesh(const MPI_Comm communicator)
   return mfem::ParMesh(communicator, serial, partition.data());
 }
 
+mfem::ParMesh MakePeriodicMesh(const MPI_Comm communicator)
+{
+  int ranks = 1;
+  MPI_Comm_size(communicator, &ranks);
+  mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+      3, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+  translations[0][0] = 1.0;
+  translations[1][1] = 1.0;
+  mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
+      original, original.CreatePeriodicVertexMapping(translations));
+  std::vector<int> partition(static_cast<std::size_t>(periodic.GetNE()));
+  for (int element = 0; element < periodic.GetNE(); ++element)
+  {
+    partition[static_cast<std::size_t>(element)] = element % ranks;
+  }
+  return mfem::ParMesh(communicator, periodic, partition.data());
+}
+
 bool FillTrueTrace(const mfem::ParFiniteElementSpace& space, mfem::Vector& values,
                    const double perturbation)
 {
@@ -185,6 +204,148 @@ bool SampleSource(const mfem::ParFiniteElementSpace& space,
   for (const double value : samples)
   {
     if (!std::isfinite(value)) { return false; }
+  }
+  return true;
+}
+
+struct RawUncondensedResidual final
+{
+  double norm = 0.0;
+  double local_trace_norm_squared = 0.0;
+  double true_trace_norm_squared = 0.0;
+};
+
+bool ComputeRawUncondensedResidual(
+    const MPI_Comm communicator, const Layout& layout,
+    const std::vector<local::AffineQuad>& quads,
+    const mfem::ParFiniteElementSpace* const source_space,
+    const mfem::Vector* const source, const local::Parameters& parameters,
+    const mfem::Vector& current_trace, const mfem::Vector& previous_trace,
+    const mfem::Vector& current_interior, const mfem::Vector& previous_interior,
+    RawUncondensedResidual& output)
+{
+  const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
+  if (trace_space == nullptr || static_cast<int>(quads.size()) !=
+      layout.LocalElementCount())
+  {
+    return false;
+  }
+  mfem::Vector current_local(layout.TraceLocalVSize()),
+      previous_local(layout.TraceLocalVSize()), local_raw(layout.TraceLocalVSize()),
+      true_raw(layout.TraceTrueVSize());
+  bool ok = layout.DistributeTrace(current_trace, current_local) &&
+      layout.DistributeTrace(previous_trace, previous_local);
+  if (!AllRanks(communicator, ok)) { return false; }
+  local_raw = 0.0; true_raw = 0.0;
+  std::vector<double> interior;
+  const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+      mfem::Geometry::SQUARE, parameters.quadrature_order);
+  for (int element = 0; element < layout.LocalElementCount() && ok; ++element)
+  {
+    mfem::Vector now(28), old(28), trace(40), old_trace(40);
+    std::vector<double> samples;
+    ok = layout.GatherInteriorElement(element, current_interior, now) &&
+        layout.GatherInteriorElement(element, previous_interior, old) &&
+        layout.GatherTraceElement(element, current_local, trace) &&
+        layout.GatherTraceElement(element, previous_local, old_trace);
+    if (ok && source != nullptr)
+    {
+      ok = source_space != nullptr && SampleSource(*source_space, *source,
+                                                    element, rule, samples);
+    }
+    local::LocalOperator operator_data;
+    if (ok)
+    {
+      const local::ElementState state{now.HostRead(), old.HostRead(),
+          trace.HostRead(), old_trace.HostRead(),
+          {samples.empty() ? nullptr : samples.data(),
+           samples.empty() ? 0U : static_cast<std::size_t>(rule.GetNPoints())}};
+      ok = local::Assemble(quads[static_cast<std::size_t>(element)], parameters,
+                           state, operator_data) == local::Status::success;
+    }
+    mfem::Array<int> vdofs;
+    if (ok) { trace_space->GetElementVDofs(element, vdofs); ok = vdofs.Size() == 40; }
+    for (int row = 0; row < 40 && ok; ++row)
+    {
+      double sign = 1.0;
+      const int vdof = DecodeSigned(vdofs[row], sign);
+      ok = vdof >= 0 && vdof < local_raw.Size();
+      if (ok) { local_raw[vdof] += sign * operator_data.g[row]; }
+    }
+    if (ok)
+    {
+      interior.insert(interior.end(), operator_data.f.begin(), operator_data.f.end());
+    }
+  }
+  if (!AllRanks(communicator, ok) || !Finite(local_raw)) { return false; }
+  trace_space->Dof_TrueDof_Matrix()->MultTranspose(local_raw, true_raw);
+  if (!AllRanks(communicator, Finite(true_raw))) { return false; }
+
+  double local_maximum = 0.0;
+  double local_sum = 0.0;
+  for (const double value : interior) { local_maximum = std::max(local_maximum, std::abs(value)); }
+  for (int index = 0; index < true_raw.Size(); ++index)
+  {
+    local_maximum = std::max(local_maximum, std::abs(true_raw[index]));
+  }
+  double maximum = 0.0;
+  if (MPI_Allreduce(&local_maximum, &maximum, 1, MPI_DOUBLE, MPI_MAX,
+                    communicator) != MPI_SUCCESS || !std::isfinite(maximum))
+  {
+    return false;
+  }
+  if (maximum > 0.0)
+  {
+    for (const double value : interior)
+    {
+      const double scaled = value / maximum; local_sum += scaled * scaled;
+    }
+    for (int index = 0; index < true_raw.Size(); ++index)
+    {
+      const double scaled = true_raw[index] / maximum; local_sum += scaled * scaled;
+    }
+  }
+  double global_sum = 0.0;
+  if (MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM,
+                    communicator) != MPI_SUCCESS || !std::isfinite(global_sum))
+  {
+    return false;
+  }
+  output.norm = maximum == 0.0 ? 0.0 : maximum * std::sqrt(global_sum);
+  output.local_trace_norm_squared = NormSquared(communicator, local_raw);
+  output.true_trace_norm_squared = NormSquared(communicator, true_raw);
+  return std::isfinite(output.norm) &&
+      std::isfinite(output.local_trace_norm_squared) &&
+      std::isfinite(output.true_trace_norm_squared);
+}
+
+bool FillUniformTrace(const mfem::ParFiniteElementSpace& space, mfem::Vector& values)
+{
+  if (values.Size() != space.GetTrueVSize()) { return false; }
+  const double state[5]{1.0, 0.12, -0.04, 2.75, 0.86};
+  const int scalar_vsize = space.GetVSize() / 5;
+  if (scalar_vsize <= 0) { return false; }
+  values = 0.0;
+  for (int local_dof = 0; local_dof < space.GetVSize(); ++local_dof)
+  {
+    const int true_dof = space.GetLocalTDofNumber(local_dof);
+    if (true_dof >= 0) { values[true_dof] = state[local_dof / scalar_vsize]; }
+  }
+  return true;
+}
+
+bool FillUniformInterior(const Layout& layout, mfem::Vector& values)
+{
+  values.SetSize(layout.InteriorLocalVSize()); values = 0.0;
+  const double state[7]{1.0, 0.12, -0.04, 2.75, 0.86, 0.0, 0.0};
+  for (int element = 0; element < layout.LocalElementCount(); ++element)
+  {
+    mfem::Vector local_values(28);
+    for (int component = 0; component < 7; ++component)
+    {
+      for (int dof = 0; dof < 4; ++dof) { local_values[component * 4 + dof] = state[component]; }
+    }
+    if (!layout.ScatterInteriorElement(element, local_values, values)) { return false; }
   }
   return true;
 }
@@ -426,7 +587,8 @@ bool Run(const MPI_Comm communicator, const Layout& layout,
       communicator, &layout, quads.data(), static_cast<int>(quads.size()),
       parameters, &current_trace, &previous_trace, &current_interior,
       &previous_interior, &source_space, &source};
-  return detail::ComputeTracedScalarIgrP1GlobalStep(input, output);
+  return detail::ComputeTracedScalarIgrP1GlobalStep(input, output) ==
+      detail::TracedScalarIgrP1GlobalStepResult::success;
 }
 
 bool Check(const MPI_Comm communicator)
@@ -474,6 +636,53 @@ bool Check(const MPI_Comm communicator)
       first.linear_residual_norm <= first.reduced_rhs_norm * 1.0e-10;
   if (!Require(communicator, ok, "increment/residual predicates")) { return false; }
 
+  const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
+  mfem::Vector raw_current_trace(layout.TraceTrueVSize()),
+      raw_previous_trace(layout.TraceTrueVSize()), raw_current_interior,
+      raw_previous_interior;
+  local::Parameters raw_parameters{};
+  raw_parameters.dt = 0.05; raw_parameters.alpha = 0.8;
+  raw_parameters.beta = 1.1; raw_parameters.quadrature_order = 12;
+  RawUncondensedResidual raw_nonconstant;
+  ok = trace_space != nullptr &&
+      FillTrueTrace(*trace_space, raw_current_trace, 2.0e-5) &&
+      FillTrueTrace(*trace_space, raw_previous_trace, 0.0) &&
+      FillInterior(layout, raw_current_interior, raw_previous_interior) &&
+      ComputeRawUncondensedResidual(communicator, layout, quads, &source_space,
+          &source_a, raw_parameters, raw_current_trace, raw_previous_trace,
+          raw_current_interior, raw_previous_interior, raw_nonconstant) &&
+      std::abs(raw_nonconstant.norm - first.initial_residual_norm) <=
+          1.0e-11 * std::max({1.0, raw_nonconstant.norm,
+                               first.initial_residual_norm});
+  if (!Require(communicator, ok, "independent [f;T^T g] initial norm"))
+  {
+    return false;
+  }
+
+  mfem::ParMesh periodic_mesh = MakePeriodicMesh(communicator);
+  Layout periodic_layout(periodic_mesh);
+  std::vector<local::AffineQuad> periodic_quads;
+  const mfem::ParFiniteElementSpace* const periodic_trace =
+      periodic_layout.TraceSpace();
+  mfem::Vector periodic_current_trace(periodic_layout.TraceTrueVSize()),
+      periodic_previous_trace(periodic_layout.TraceTrueVSize()),
+      periodic_current_interior, periodic_previous_interior;
+  RawUncondensedResidual periodic_raw;
+  ok = periodic_layout.IsUsable() && periodic_trace != nullptr &&
+      BuildAffineQuads(periodic_mesh, periodic_quads) &&
+      FillUniformTrace(*periodic_trace, periodic_current_trace) &&
+      FillUniformTrace(*periodic_trace, periodic_previous_trace) &&
+      FillUniformInterior(periodic_layout, periodic_current_interior) &&
+      FillUniformInterior(periodic_layout, periodic_previous_interior) &&
+      ComputeRawUncondensedResidual(communicator, periodic_layout, periodic_quads,
+          nullptr, nullptr, raw_parameters, periodic_current_trace,
+          periodic_previous_trace, periodic_current_interior,
+          periodic_previous_interior, periodic_raw) &&
+      periodic_raw.local_trace_norm_squared > 0.0 &&
+      periodic_raw.true_trace_norm_squared <= 1.0e-26 *
+          periodic_raw.local_trace_norm_squared;
+  if (!Require(communicator, ok, "periodic raw trace cancellation")) { return false; }
+
   ok = CheckLocalRecovery(communicator, layout, quads, source_space, source_a,
                           first);
   if (!Require(communicator, ok, "local recovery/action oracle")) { return false; }
@@ -493,14 +702,14 @@ bool Check(const MPI_Comm communicator)
   const detail::TracedScalarIgrP1GlobalStepInput invalid{
       communicator, &layout, quads.data(), static_cast<int>(quads.size()), {},
       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-  ok = !detail::ComputeTracedScalarIgrP1GlobalStep(invalid, preserved) &&
+  ok = detail::ComputeTracedScalarIgrP1GlobalStep(invalid, preserved) ==
+          detail::TracedScalarIgrP1GlobalStepResult::failure &&
       preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
       preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
       preserved.initial_residual_norm == 11.0 &&
       preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0;
   if (!Require(communicator, ok, "invalid input preservation")) { return false; }
 
-  const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
   mfem::Vector aliased_trace(layout.TraceTrueVSize());
   mfem::Vector aliased_current_interior, aliased_previous_interior;
   ok = trace_space != nullptr && FillTrueTrace(*trace_space, aliased_trace, 0.0) &&
@@ -513,12 +722,62 @@ bool Check(const MPI_Comm communicator)
       communicator, &layout, quads.data(), static_cast<int>(quads.size()),
       alias_parameters, &aliased_trace, &aliased_trace,
       &aliased_current_interior, &aliased_previous_interior, nullptr, nullptr};
-  ok = !detail::ComputeTracedScalarIgrP1GlobalStep(aliased_trace_input, preserved) &&
+  ok = detail::ComputeTracedScalarIgrP1GlobalStep(aliased_trace_input, preserved) ==
+          detail::TracedScalarIgrP1GlobalStepResult::failure &&
       preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
       preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
       preserved.initial_residual_norm == 11.0 &&
       preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0;
-  return Require(communicator, ok, "trace alias preservation");
+  if (!Require(communicator, ok, "trace alias preservation")) { return false; }
+
+  mfem::Vector classified_current_trace(layout.TraceTrueVSize()),
+      classified_previous_trace(layout.TraceTrueVSize());
+  ok = trace_space != nullptr &&
+      FillTrueTrace(*trace_space, classified_current_trace, 0.0) &&
+      FillTrueTrace(*trace_space, classified_previous_trace, 0.0);
+  if (!Require(communicator, ok, "classified-result trace setup")) { return false; }
+  mfem::Vector inadmissible_interior(aliased_current_interior);
+  if (layout.LocalElementCount() > 0)
+  {
+    mfem::Vector first_element(28);
+    ok = layout.GatherInteriorElement(0, inadmissible_interior, first_element);
+    for (int dof = 0; dof < 4 && ok; ++dof) { first_element[dof] = 0.0; }
+    if (ok)
+    {
+      ok = layout.ScatterInteriorElement(0, first_element, inadmissible_interior);
+    }
+  }
+  if (!Require(communicator, ok, "inadmissible trial setup")) { return false; }
+  const detail::TracedScalarIgrP1GlobalStepInput inadmissible_input{
+      communicator, &layout, quads.data(), static_cast<int>(quads.size()),
+      alias_parameters, &classified_current_trace, &classified_previous_trace,
+      &inadmissible_interior, &aliased_previous_interior, nullptr, nullptr};
+  ok = detail::ComputeTracedScalarIgrP1GlobalStep(inadmissible_input, preserved) ==
+          detail::TracedScalarIgrP1GlobalStepResult::inadmissible_trial &&
+      preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
+      preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
+      preserved.initial_residual_norm == 11.0 &&
+      preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0;
+  if (!Require(communicator, ok, "inadmissible trial preservation")) { return false; }
+
+  std::vector<local::AffineQuad> structurally_invalid_quads = quads;
+  if (!structurally_invalid_quads.empty())
+  {
+    structurally_invalid_quads.front().vertices[2] =
+        structurally_invalid_quads.front().vertices[1];
+  }
+  const detail::TracedScalarIgrP1GlobalStepInput structural_input{
+      communicator, &layout, structurally_invalid_quads.data(),
+      static_cast<int>(structurally_invalid_quads.size()), alias_parameters,
+      &classified_current_trace, &classified_previous_trace, &aliased_current_interior,
+      &aliased_previous_interior, nullptr, nullptr};
+  ok = detail::ComputeTracedScalarIgrP1GlobalStep(structural_input, preserved) ==
+          detail::TracedScalarIgrP1GlobalStepResult::failure &&
+      preserved.trace_increment.Size() == 1 && preserved.trace_increment[0] == 73.0 &&
+      preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
+      preserved.initial_residual_norm == 11.0 &&
+      preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0;
+  return Require(communicator, ok, "structural failure preservation");
 }
 
 } // namespace

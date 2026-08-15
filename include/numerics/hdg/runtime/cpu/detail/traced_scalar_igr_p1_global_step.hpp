@@ -79,11 +79,17 @@ struct TracedScalarIgrP1GlobalStepOutput final
   double linear_residual_norm = 0.0;
 };
 
+/** Result of a private one-linearization attempt. */
+enum class TracedScalarIgrP1GlobalStepResult : unsigned char
+{ success, inadmissible_trial, failure };
+
 /**
- * Compute exactly one global Newton linearization.  On false, @a output is
- * unchanged.  All ranks must call this collectively with compatible input.
+ * Compute exactly one global Newton linearization.  Unless the result is
+ * success, @a output is unchanged.  inadmissible_trial is reserved solely for
+ * a local operator inadmissible_state; all structural, nonfinite, exception,
+ * and linear-solver failures are failure.  All ranks must call collectively.
  */
-bool ComputeTracedScalarIgrP1GlobalStep(
+TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
     const TracedScalarIgrP1GlobalStepInput& input,
     TracedScalarIgrP1GlobalStepOutput& output) noexcept;
 
