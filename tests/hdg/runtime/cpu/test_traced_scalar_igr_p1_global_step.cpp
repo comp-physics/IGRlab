@@ -347,6 +347,69 @@ bool CheckExactZeroReducedRhsRecovery()
   return recovered == f;
 }
 
+bool CheckTraceSolveRecoverySeam(const MPI_Comm communicator, const Layout& layout)
+{
+  const mfem::ParFiniteElementSpace* const space = layout.TraceSpace();
+  const int elements = layout.LocalElementCount();
+  if (space == nullptr) { return false; }
+  std::vector<double> a(static_cast<std::size_t>(elements) * 28 * 28, 0.0);
+  std::vector<double> b(static_cast<std::size_t>(elements) * 28 * 40, 0.0);
+  std::vector<double> c(static_cast<std::size_t>(elements) * 40 * 28, 0.0);
+  std::vector<double> d(static_cast<std::size_t>(elements) * 40 * 40, 0.0);
+  std::vector<double> f(static_cast<std::size_t>(elements) * 28, 0.0);
+  std::vector<double> g(static_cast<std::size_t>(elements) * 40, 0.0);
+  for (int element = 0; element < elements; ++element)
+  {
+    for (int i = 0; i < 28; ++i)
+    {
+      a[static_cast<std::size_t>(element) * 28 * 28 + i * 28 + i] = 1.0;
+      f[static_cast<std::size_t>(element) * 28 + i] = 0.125 * (i + 1);
+    }
+    for (int i = 0; i < 40; ++i)
+    {
+      d[static_cast<std::size_t>(element) * 40 * 40 + i * 40 + i] = 1.0;
+    }
+  }
+  auto cv = [](const std::vector<double>& values, int rows, int cols, int batches) {
+    return dg::hdg::StridedBlockView<const double>{values.data(), batches, rows,
+        cols, rows * cols, cols, 1};
+  };
+  auto v = [](std::vector<double>& values, int rows, int cols, int batches) {
+    return dg::hdg::StridedBlockView<double>{values.data(), batches, rows, cols,
+        rows * cols, cols, 1};
+  };
+  std::vector<double> schur(static_cast<std::size_t>(elements) * 40 * 40);
+  std::vector<double> reduced(static_cast<std::size_t>(elements) * 40);
+  dg::hdg::core::HostReferenceEngine condensation;
+  bool ok = elements == 0 || condensation.Condense({{4,8,7,5},cv(a,28,28,elements),cv(b,28,40,elements),cv(c,40,28,elements),cv(d,40,40,elements),cv(f,28,1,elements),cv(g,40,1,elements)}, {v(schur,40,40,elements),v(reduced,40,1,elements)}) == dg::hdg::core::Status::success;
+  if (!AllRanks(communicator, ok)) { return false; }
+  mfem::SparseMatrix local_matrix(layout.TraceLocalVSize());
+  for (int element = 0; element < elements; ++element)
+  {
+    mfem::Array<int> vdofs; space->GetElementVDofs(element, vdofs);
+    mfem::DenseMatrix identity(40); identity = 0.0;
+    for (int i = 0; i < 40; ++i) { identity(i,i) = 1.0; }
+    local_matrix.AddSubMatrix(vdofs, vdofs, identity);
+  }
+  local_matrix.Finalize();
+  mfem::ParBilinearForm form(const_cast<mfem::ParFiniteElementSpace*>(space));
+  std::unique_ptr<mfem::HypreParMatrix> matrix(form.ParallelAssemble(&local_matrix));
+  mfem::Vector zero(layout.TraceTrueVSize()); zero = 0.0;
+  detail::TracedScalarIgrP1TraceSolveOutput exact;
+  const detail::TracedScalarIgrP1TraceSolveInput exact_input{communicator,&layout,space,matrix.get(),&zero,&condensation};
+  ok = matrix != nullptr && detail::SolveAndRecoverTracedScalarIgrP1Trace(exact_input, exact) &&
+      NormSquared(communicator, exact.trace_increment) == 0.0 &&
+      NormSquared(communicator, exact.interior_increment) > 0.0;
+  if (!AllRanks(communicator, ok)) { return false; }
+  mfem::Vector tiny(layout.TraceTrueVSize()); tiny = 1.0e-151;
+  detail::TracedScalarIgrP1TraceSolveOutput tiny_output;
+  const detail::TracedScalarIgrP1TraceSolveInput tiny_input{communicator,&layout,space,matrix.get(),&tiny,&condensation};
+  ok = detail::SolveAndRecoverTracedScalarIgrP1Trace(tiny_input, tiny_output) &&
+      NormSquared(communicator, tiny_output.trace_increment) > 0.0 &&
+      Finite(tiny_output.trace_increment) && Finite(tiny_output.interior_increment);
+  return AllRanks(communicator, ok);
+}
+
 bool Run(const MPI_Comm communicator, const Layout& layout,
          const std::vector<local::AffineQuad>& quads,
          const mfem::ParFiniteElementSpace& source_space,
@@ -424,6 +487,9 @@ bool Check(const MPI_Comm communicator)
 
   ok = CheckExactZeroReducedRhsRecovery();
   if (!Require(communicator, ok, "exact zero reduced rhs recovery")) { return false; }
+
+  ok = CheckTraceSolveRecoverySeam(communicator, layout);
+  if (!Require(communicator, ok, "trace solve/recovery seam")) { return false; }
 
   detail::TracedScalarIgrP1GlobalStepOutput preserved;
   preserved.trace_increment.SetSize(1); preserved.trace_increment[0] = 73.0;

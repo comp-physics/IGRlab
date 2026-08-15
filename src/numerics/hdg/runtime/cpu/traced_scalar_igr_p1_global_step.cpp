@@ -175,22 +175,188 @@ bool FillElementSource(const mfem::ParFiniteElementSpace* source_space,
   return true;
 }
 
-bool GlobalNorm(const MPI_Comm communicator, const double local_squared,
-                double& norm) noexcept
+bool MaxAbsAndNorm(const MPI_Comm communicator, const mfem::Vector& values,
+                   double& maximum, double& norm) noexcept
 {
-  if (!Finite(local_squared) || local_squared < 0.0) { return false; }
-  double global_squared = 0.0;
-  if (MPI_Allreduce(&local_squared, &global_squared, 1, MPI_DOUBLE, MPI_SUM,
-                    communicator) != MPI_SUCCESS ||
-      !Finite(global_squared) || global_squared < 0.0)
+  const double* const data = values.HostRead();
+  bool local_ok = data != nullptr || values.Size() == 0;
+  double local_maximum = 0.0;
+  for (int index = 0; index < values.Size() && local_ok; ++index)
+  {
+    local_ok = Finite(data[index]);
+    if (!local_ok) { break; }
+    local_maximum = std::max(local_maximum, std::abs(data[index]));
+  }
+  if (!CollectiveAll(communicator, local_ok) ||
+      MPI_Allreduce(&local_maximum, &maximum, 1, MPI_DOUBLE, MPI_MAX,
+                    communicator) != MPI_SUCCESS || !Finite(maximum) ||
+      maximum < 0.0)
   {
     return false;
   }
-  norm = std::sqrt(global_squared);
+  if (maximum == 0.0) { norm = 0.0; return true; }
+  double local_sum = 0.0;
+  for (int index = 0; index < values.Size(); ++index)
+  {
+    const double scaled = data[index] / maximum;
+    local_sum += scaled * scaled;
+  }
+  double global_sum = 0.0;
+  if (!CollectiveAll(communicator, Finite(local_sum)) ||
+      MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM,
+                    communicator) != MPI_SUCCESS || !Finite(global_sum) ||
+      global_sum <= 0.0)
+  {
+    return false;
+  }
+  norm = maximum * std::sqrt(global_sum);
   return Finite(norm);
 }
 
 } // namespace
+
+bool SolveAndRecoverTracedScalarIgrP1Trace(
+    const TracedScalarIgrP1TraceSolveInput& input,
+    TracedScalarIgrP1TraceSolveOutput& output) noexcept
+{
+  if (input.communicator == MPI_COMM_NULL) { return false; }
+  bool local_input_ok = input.layout != nullptr && input.trace_space != nullptr &&
+      input.true_matrix != nullptr && input.true_rhs_values != nullptr &&
+      input.condensation != nullptr;
+  if (local_input_ok)
+  {
+    local_input_ok = input.layout->IsUsable() &&
+        input.trace_space == input.layout->TraceSpace() &&
+        input.true_rhs_values->Size() == input.layout->TraceTrueVSize() &&
+        input.true_matrix->Height() == input.layout->TraceTrueVSize() &&
+        input.true_matrix->Width() == input.layout->TraceTrueVSize() &&
+        input.true_matrix->GetGlobalNumRows() == input.trace_space->GlobalTrueVSize() &&
+        input.true_matrix->GetGlobalNumCols() == input.trace_space->GlobalTrueVSize();
+  }
+  if (!CollectiveAll(input.communicator, local_input_ok)) { return false; }
+  const int elements = input.layout->LocalElementCount();
+  if (!CollectiveAll(input.communicator, elements == 0 ||
+      (input.condensation->ready() && input.condensation->batch_count() ==
+       static_cast<std::size_t>(elements)))) { return false; }
+
+  double rhs_maximum = 0.0;
+  double rhs_norm = 0.0;
+  if (!MaxAbsAndNorm(input.communicator, *input.true_rhs_values, rhs_maximum,
+                     rhs_norm) || !CollectiveAll(input.communicator, Finite(rhs_norm)))
+  {
+    return false;
+  }
+  const bool exact_zero_rhs = rhs_maximum == 0.0;
+  if (!exact_zero_rhs && rhs_maximum < std::numeric_limits<double>::min())
+  {
+    return false;
+  }
+  mfem::HypreParVector trace_solution(
+      const_cast<mfem::ParFiniteElementSpace*>(input.trace_space));
+  trace_solution = 0.0;
+  double linear_norm = 0.0;
+
+  if (!exact_zero_rhs)
+  {
+    mfem::Vector scaled_values(input.layout->TraceTrueVSize());
+    const double* const rhs = input.true_rhs_values->HostRead();
+    double* const scaled = scaled_values.HostWrite();
+    bool local_ok = (rhs != nullptr && scaled != nullptr) || scaled_values.Size() == 0;
+    for (int index = 0; index < scaled_values.Size() && local_ok; ++index)
+    {
+      scaled[index] = rhs[index] / rhs_maximum;
+      local_ok = Finite(scaled[index]);
+    }
+    if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+    mfem::HypreParVector scaled_rhs(
+        const_cast<mfem::ParFiniteElementSpace*>(input.trace_space));
+    mfem::HypreParVector scaled_solution(
+        const_cast<mfem::ParFiniteElementSpace*>(input.trace_space));
+    local_ok = CopyVector(scaled_values, scaled_rhs);
+    if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+    scaled_solution = 0.0;
+    mfem::HypreILU ilu;
+    ilu.SetType(0); ilu.SetLevelOfFill(0); ilu.SetMaxIter(1); ilu.SetTol(0.0);
+    ilu.SetLocalReordering(0); ilu.SetPrintLevel(0);
+    mfem::HypreGMRES gmres(input.communicator);
+    const int global_size = static_cast<int>(input.true_matrix->GetGlobalNumRows());
+    gmres.SetTol(1.0e-12); gmres.SetAbsTol(0.0);
+    gmres.SetMaxIter(std::max(100, global_size));
+    gmres.SetKDim(std::min(100, std::max(20, global_size)));
+    gmres.SetLogging(0); gmres.SetPrintLevel(0);
+    gmres.SetPreconditioner(ilu); gmres.SetOperator(*input.true_matrix);
+    gmres.Mult(scaled_rhs, scaled_solution);
+    mfem::HypreParVector scaled_residual(
+        const_cast<mfem::ParFiniteElementSpace*>(input.trace_space));
+    input.true_matrix->Mult(scaled_solution, scaled_residual);
+    scaled_residual -= scaled_rhs;
+    double residual_maximum = 0.0;
+    double residual_norm = 0.0;
+    if (!MaxAbsAndNorm(input.communicator, scaled_residual, residual_maximum,
+                       residual_norm)) { return false; }
+    local_ok = AllFinite(scaled_solution) && residual_norm <= 1.0e-10;
+    if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+    const double* const scaled_solution_data = scaled_solution.HostRead();
+    double* const solution = trace_solution.HostWrite();
+    local_ok = (scaled_solution_data != nullptr && solution != nullptr) ||
+        trace_solution.Size() == 0;
+    for (int index = 0; index < trace_solution.Size() && local_ok; ++index)
+    {
+      solution[index] = rhs_maximum * scaled_solution_data[index];
+      local_ok = Finite(solution[index]);
+    }
+    if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+    linear_norm = rhs_maximum * residual_norm;
+    if (!Finite(linear_norm)) { return false; }
+  }
+
+  mfem::Vector next_trace;
+  mfem::Vector local_trace;
+  mfem::Vector next_interior;
+  std::vector<double> recovered;
+  bool local_ok = true;
+  try
+  {
+    next_trace.SetSize(input.layout->TraceTrueVSize());
+    local_trace.SetSize(input.layout->TraceLocalVSize());
+    next_interior.SetSize(input.layout->InteriorLocalVSize());
+    recovered.resize(static_cast<std::size_t>(elements) * 28);
+    local_ok = CopyVector(trace_solution, next_trace);
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  local_ok = input.layout->DistributeTrace(next_trace, local_trace);
+  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  try
+  {
+    next_interior = 0.0;
+    if (elements > 0)
+    {
+      std::vector<double> local_trace_values(static_cast<std::size_t>(elements) * 40);
+      for (int element = 0; element < elements && local_ok; ++element)
+      {
+        mfem::Vector gathered(40);
+        local_ok = input.layout->GatherTraceElement(element, local_trace, gathered);
+        if (local_ok) { std::memcpy(local_trace_values.data() + static_cast<std::size_t>(element) * 40, gathered.HostRead(), 40 * sizeof(double)); }
+      }
+      if (local_ok) { local_ok = input.condensation->Recover(ConstView(local_trace_values, elements, 40, 1), View(recovered, elements, 28, 1)) == core::Status::success; }
+      for (int element = 0; element < elements && local_ok; ++element)
+      {
+        mfem::Vector element_interior(28);
+        std::memcpy(element_interior.HostWrite(), recovered.data() + static_cast<std::size_t>(element) * 28, 28 * sizeof(double));
+        local_ok = input.layout->ScatterInteriorElement(element, element_interior, next_interior);
+      }
+    }
+    local_ok = local_ok && AllFinite(next_trace) && AllFinite(next_interior);
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+  output.trace_increment.Swap(next_trace);
+  output.interior_increment.Swap(next_interior);
+  output.reduced_rhs_norm = rhs_norm;
+  output.linear_residual_norm = linear_norm;
+  return true;
+}
 
 bool ComputeTracedScalarIgrP1GlobalStep(
     const TracedScalarIgrP1GlobalStepInput& input,
@@ -209,8 +375,7 @@ bool ComputeTracedScalarIgrP1GlobalStep(
   mfem::Vector current_local_trace;
   mfem::Vector previous_local_trace;
   std::vector<double> a, b, c, d, f, g, source_samples;
-  std::vector<double> schur, reduced, recovered;
-  double local_initial_squared = 0.0;
+  std::vector<double> schur, reduced;
   bool local_ok = true;
   try
   {
@@ -231,7 +396,6 @@ bool ComputeTracedScalarIgrP1GlobalStep(
       f.reserve(count * 28); g.reserve(count * 40);
       source_samples.resize(count * points * 4, 0.0);
       schur.resize(count * 40 * 40); reduced.resize(count * 40);
-      recovered.resize(count * 28);
     }
   }
   catch (const std::exception&)
@@ -287,15 +451,8 @@ bool ComputeTracedScalarIgrP1GlobalStep(
         d.insert(d.end(), operator_data.D.begin(), operator_data.D.end());
         f.insert(f.end(), operator_data.f.begin(), operator_data.f.end());
         g.insert(g.end(), operator_data.g.begin(), operator_data.g.end());
-        for (const double value : operator_data.interior_residual)
-        {
-          local_initial_squared += value * value;
-        }
-        for (const double value : operator_data.trace_residual)
-        {
-          local_initial_squared += value * value;
-        }
-        local_ok = Finite(local_initial_squared);
+        local_ok = AllFinite(operator_data.interior_residual) &&
+            AllFinite(operator_data.trace_residual);
       }
     }
   }
@@ -303,6 +460,17 @@ bool ComputeTracedScalarIgrP1GlobalStep(
   {
     local_ok = false;
   }
+  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
+
+  mfem::Vector initial_residuals;
+  try
+  {
+    initial_residuals.SetSize(static_cast<int>(f.size() + g.size()));
+    std::copy(f.begin(), f.end(), initial_residuals.HostWrite());
+    std::copy(g.begin(), g.end(), initial_residuals.HostWrite() + f.size());
+    local_ok = AllFinite(initial_residuals);
+  }
+  catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
 
   core::HostReferenceEngine condensation;
@@ -378,119 +546,20 @@ bool ComputeTracedScalarIgrP1GlobalStep(
   trace_space->Dof_TrueDof_Matrix()->MultTranspose(local_rhs, true_rhs_values);
   if (!CollectiveAll(input.communicator, AllFinite(true_rhs_values))) { return false; }
 
+  double initial_maximum = 0.0;
   double initial_norm = 0.0;
-  if (!GlobalNorm(input.communicator, local_initial_squared, initial_norm)) { return false; }
-  const double rhs_squared = mfem::InnerProduct(input.communicator,
-                                                true_rhs_values, true_rhs_values);
-  if (!CollectiveAll(input.communicator, Finite(rhs_squared) && rhs_squared >= 0.0))
-  {
-    return false;
-  }
-  const double reduced_norm = std::sqrt(rhs_squared);
-
-  mfem::HypreParVector true_rhs(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
-  mfem::HypreParVector true_increment(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
-  local_ok = CopyVector(true_rhs_values, true_rhs);
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
-  true_increment = 0.0;
-
-  if (rhs_squared > 1.0e-300)
-  {
-    // All solver objects are constructed and dimension-checked before the
-    // collective HYPRE solve.  ILU/GMRES configuration matches the accepted
-    // CPU HDG solve policy, while the independently recomputed true residual
-    // is the success condition.
-    mfem::HypreILU ilu;
-    ilu.SetType(0); ilu.SetLevelOfFill(0); ilu.SetMaxIter(1); ilu.SetTol(0.0);
-    ilu.SetLocalReordering(0); ilu.SetPrintLevel(0);
-    mfem::HypreGMRES gmres(input.communicator);
-    const int global_size = static_cast<int>(true_matrix->GetGlobalNumRows());
-    gmres.SetTol(1.0e-12); gmres.SetAbsTol(0.0);
-    gmres.SetMaxIter(std::max(100, global_size));
-    gmres.SetKDim(std::min(100, std::max(20, global_size)));
-    gmres.SetLogging(0); gmres.SetPrintLevel(0);
-    gmres.SetPreconditioner(ilu); gmres.SetOperator(*true_matrix);
-    gmres.Mult(true_rhs, true_increment);
-  }
-
-  mfem::HypreParVector true_residual(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
-  true_matrix->Mult(true_increment, true_residual);
-  true_residual -= true_rhs;
-  const double residual_squared = mfem::InnerProduct(input.communicator,
-                                                     true_residual, true_residual);
-  local_ok = AllFinite(true_increment) && Finite(residual_squared) &&
-      residual_squared >= 0.0 &&
-      (rhs_squared > 1.0e-300 ? residual_squared <= rhs_squared * 1.0e-20 :
-                                residual_squared <= 1.0e-300);
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
-  const double linear_norm = std::sqrt(residual_squared);
-
-  mfem::Vector next_trace;
-  mfem::Vector local_trace_increment;
-  mfem::Vector next_interior;
-  try
-  {
-    next_trace.SetSize(layout.TraceTrueVSize());
-    local_trace_increment.SetSize(layout.TraceLocalVSize());
-    next_interior.SetSize(layout.InteriorLocalVSize());
-    local_ok = CopyVector(true_increment, next_trace);
-  }
-  catch (const std::exception&)
-  {
-    local_ok = false;
-  }
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
-
-  // Enter the exchange only after every rank has its destination storage.
-  local_ok = layout.DistributeTrace(next_trace, local_trace_increment);
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
-
-  try
-  {
-    next_interior = 0.0;
-    if (local_ok && elements > 0)
-    {
-      std::vector<double> local_trace_values(static_cast<std::size_t>(elements) * 40);
-      for (int element = 0; element < elements && local_ok; ++element)
-      {
-        mfem::Vector element_trace(40);
-        local_ok = layout.GatherTraceElement(element, local_trace_increment,
-                                             element_trace);
-        if (local_ok)
-        {
-          std::memcpy(local_trace_values.data() + static_cast<std::size_t>(element) * 40,
-                      element_trace.HostRead(), 40 * sizeof(double));
-        }
-      }
-      if (local_ok)
-      {
-        local_ok = condensation.Recover(
-            ConstView(local_trace_values, elements, 40, 1),
-            View(recovered, elements, 28, 1)) == core::Status::success;
-      }
-      for (int element = 0; element < elements && local_ok; ++element)
-      {
-        mfem::Vector element_interior(28);
-        std::memcpy(element_interior.HostWrite(),
-                    recovered.data() + static_cast<std::size_t>(element) * 28,
-                    28 * sizeof(double));
-        local_ok = layout.ScatterInteriorElement(element, element_interior,
-                                                 next_interior);
-      }
-    }
-    local_ok = local_ok && AllFinite(next_trace) && AllFinite(next_interior);
-  }
-  catch (const std::exception&)
-  {
-    local_ok = false;
-  }
-  if (!CollectiveAll(input.communicator, local_ok)) { return false; }
-
-  output.trace_increment.Swap(next_trace);
-  output.interior_increment.Swap(next_interior);
+  if (!MaxAbsAndNorm(input.communicator, initial_residuals, initial_maximum,
+                     initial_norm)) { return false; }
+  TracedScalarIgrP1TraceSolveOutput solved;
+  const TracedScalarIgrP1TraceSolveInput solve_input{
+      input.communicator, &layout, trace_space, true_matrix.get(),
+      &true_rhs_values, &condensation};
+  if (!SolveAndRecoverTracedScalarIgrP1Trace(solve_input, solved)) { return false; }
+  output.trace_increment.Swap(solved.trace_increment);
+  output.interior_increment.Swap(solved.interior_increment);
   output.initial_residual_norm = initial_norm;
-  output.reduced_rhs_norm = reduced_norm;
-  output.linear_residual_norm = linear_norm;
+  output.reduced_rhs_norm = solved.reduced_rhs_norm;
+  output.linear_residual_norm = solved.linear_residual_norm;
   return true;
 }
 

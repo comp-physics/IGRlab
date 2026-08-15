@@ -17,6 +17,34 @@
 namespace dg::hdg::runtime::cpu::detail
 {
 
+/** Private assembled-trace solve/recovery seam shared by Compute and tests. */
+struct TracedScalarIgrP1TraceSolveInput final
+{
+  MPI_Comm communicator = MPI_COMM_NULL;
+  const BorrowedP1DGInterfaceLayout* layout = nullptr;
+  const mfem::ParFiniteElementSpace* trace_space = nullptr;
+  const mfem::HypreParMatrix* true_matrix = nullptr;
+  const mfem::Vector* true_rhs_values = nullptr;
+  const core::HostReferenceEngine* condensation = nullptr;
+};
+
+struct TracedScalarIgrP1TraceSolveOutput final
+{
+  mfem::Vector trace_increment;
+  mfem::Vector interior_increment;
+  double reduced_rhs_norm = 0.0;
+  double linear_residual_norm = 0.0;
+};
+
+/**
+ * Solve the assembled true trace system and recover local interior increments.
+ * An exactly zero true RHS skips GMRES but still distributes and recovers.  On
+ * failure output is unchanged.
+ */
+bool SolveAndRecoverTracedScalarIgrP1Trace(
+    const TracedScalarIgrP1TraceSolveInput& input,
+    TracedScalarIgrP1TraceSolveOutput& output) noexcept;
+
 struct TracedScalarIgrP1GlobalStepInput final
 {
   MPI_Comm communicator = MPI_COMM_NULL;
