@@ -57,15 +57,21 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildHostGeometryAndMaps() noexcept
 {
-  std::array<double, maximum_local_trace_dofs> local_exact_trace{};
-  std::array<double, maximum_local_trace_dofs> local_perturbed_trace{};
-  std::array<unsigned char, maximum_local_trace_dofs> assigned{};
+  std::vector<double> local_exact_trace(
+      static_cast<std::size_t>(shape_.local_trace_count), 0.0);
+  std::vector<double> local_perturbed_trace(
+      static_cast<std::size_t>(shape_.local_trace_count), 0.0);
+  std::vector<unsigned char> assigned(
+      static_cast<std::size_t>(shape_.local_trace_count), 0);
   for (int element = 0; element < shape_.elements; ++element)
   {
     const mfem::FiniteElement* fe = interior_space_->GetFE(element);
     mfem::ElementTransformation* transformation =
         mesh_->GetElementTransformation(element);
     if (fe == nullptr || transformation == nullptr) { return false; }
+    const double element_hmin = mesh_->GetElementSize(element, 1);
+    if (!std::isfinite(element_hmin) || !(element_hmin > 0.0)) return false;
+    local_hmin_ = std::min(local_hmin_, element_hmin);
     mfem::Array<int> interior_vdofs;
     interior_space_->GetElementVDofs(element, interior_vdofs);
     if (interior_vdofs.Size() != shape_.interior_dofs) { return false; }
@@ -292,10 +298,8 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
   // All ranks reject before any input is copied or a trace projection starts.
   if (!CollectiveContinue(local_valid)) { return false; }
 
-  std::array<double, maximum_rank_elements *
-                         maximum_interior_dofs_per_element> initial{};
-  std::array<double, maximum_rank_elements *
-                         maximum_interior_dofs_per_element> static_source{};
+  std::vector<double> initial(coefficient_count, 0.0);
+  std::vector<double> static_source(coefficient_count, 0.0);
   std::copy_n(config.borrowed_initial.coefficients, coefficient_count,
               initial.data());
   std::fill(host_static_source_.begin(), host_static_source_.end(), 0.0);
@@ -330,14 +334,14 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
   if (!CollectiveContinue(scatter_ready)) { return false; }
 
   std::optional<mfem::ParGridFunction> local_trace;
-  std::array<unsigned char, maximum_local_trace_dofs> local_trace_assigned{};
+  std::vector<unsigned char> local_trace_assigned(
+      static_cast<std::size_t>(shape_.local_trace_count), 0);
   bool restriction_ready = false;
   try
   {
     local_trace.emplace(trace_space_.operator->());
     if (local_trace->Size() < 0 ||
-        local_trace->Size() != shape_.local_trace_count ||
-        local_trace->Size() > maximum_local_trace_dofs)
+        local_trace->Size() != shape_.local_trace_count)
       throw 0;
     *local_trace = 0.0;
     for (int face = 0; face < mesh_->GetNumFaces(); ++face)
@@ -406,9 +410,10 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
   {
     if (!exchange_plan_.map.dofs.IsConsistent() ||
         shape_.true_trace_count < 0 ||
-        shape_.true_trace_count > maximum_true_trace_dofs)
+        shape_.true_trace_count < 0)
       throw 0;
-    std::array<unsigned char, maximum_true_trace_dofs> true_assigned{};
+    std::vector<unsigned char> true_assigned(
+        static_cast<std::size_t>(shape_.true_trace_count), 0);
     for (const dg::hdg::trace::TraceMapEntry& entry :
          exchange_plan_.map.dofs.entries)
     {
@@ -536,17 +541,25 @@ BindArenaViews() noexcept
     d += count;
     return result;
   };
-  constexpr std::size_t max_i =
-      maximum_rank_elements * maximum_interior_dofs_per_element;
-  constexpr std::size_t max_lt = maximum_local_trace_dofs;
-  constexpr std::size_t max_tt = maximum_true_trace_dofs;
-  constexpr std::size_t max_er =
-      maximum_rank_elements * maximum_trace_dofs_per_element;
-  constexpr std::size_t max_a = maximum_rank_elements *
+  const bool generic = borrowed_topology_ && shape_.borrowed_host_inputs;
+  const std::size_t max_i = generic ? generic_arena_layout_.interior :
+      static_cast<std::size_t>(maximum_rank_elements) * maximum_interior_dofs_per_element;
+  const std::size_t max_lt = generic ? generic_arena_layout_.local_trace :
+      maximum_local_trace_dofs;
+  const std::size_t max_tt = generic ? generic_arena_layout_.true_trace :
+      maximum_true_trace_dofs;
+  const std::size_t max_er = generic ? generic_arena_layout_.element_trace :
+      static_cast<std::size_t>(maximum_rank_elements) *
+      maximum_trace_dofs_per_element;
+  const std::size_t max_a = generic ? generic_arena_layout_.element_interior2 :
+      static_cast<std::size_t>(maximum_rank_elements) *
       maximum_interior_dofs_per_element * maximum_interior_dofs_per_element;
-  constexpr std::size_t max_b = maximum_rank_elements *
+  const std::size_t max_b = generic ? generic_arena_layout_.element_coupling :
+      static_cast<std::size_t>(maximum_rank_elements) *
       maximum_interior_dofs_per_element * maximum_trace_dofs_per_element;
-  constexpr std::size_t max_d = maximum_local_matrix_entries;
+  const std::size_t max_d = generic ? generic_arena_layout_.local_matrix :
+      maximum_local_matrix_entries;
+  const std::size_t max_exchange = generic ? max_d : maximum_exchange_entries;
   view_.slot_interior[0] = take_d(max_i);
   view_.slot_interior[1] = take_d(max_i);
   view_.old_interior = take_d(max_i);
@@ -575,43 +588,43 @@ BindArenaViews() noexcept
   view_.g = take_d(max_er);
   view_.lu = take_d(max_a);
   view_.pivots = take_d(max_i);
-  view_.solve_workspace = take_d(maximum_rank_elements *
-      maximum_interior_dofs_per_element *
-          (maximum_trace_dofs_per_element + 1));
+  view_.solve_workspace = take_d(generic ? generic_arena_layout_.solve_workspace :
+      static_cast<std::size_t>(maximum_rank_elements) *
+      maximum_interior_dofs_per_element * (maximum_trace_dofs_per_element + 1));
   view_.schur = take_d(max_d);
   view_.condensed_rhs = take_d(max_er);
   view_.true_residual = take_d(max_tt);
-  view_.remote_matrix_send = take_d(maximum_exchange_entries);
-  view_.remote_matrix_receive = take_d(maximum_exchange_entries);
+  view_.remote_matrix_send = take_d(max_exchange);
+  view_.remote_matrix_receive = take_d(max_exchange);
   view_.remote_vector_send = take_d(max_er);
   view_.remote_vector_receive = take_d(max_er);
-  view_.volume_shape = take_d(maximum_rank_elements * maximum_volume_points *
-                              maximum_scalar_dofs_per_element);
-  view_.volume_derivative = take_d(maximum_rank_elements *
-      maximum_volume_points * maximum_scalar_dofs_per_element * dimension);
-  view_.volume_weight = take_d(maximum_rank_elements * maximum_volume_points);
-  view_.volume_position = take_d(maximum_rank_elements *
-                                 maximum_volume_points * dimension);
-  view_.face_interior_shape = take_d(maximum_rank_elements *
-      faces_per_element * maximum_face_points *
-          maximum_scalar_dofs_per_element);
-  view_.face_trace_shape = take_d(maximum_rank_elements * faces_per_element *
-                                  maximum_face_points *
-                                      maximum_scalar_dofs_per_face);
-  view_.face_weight = take_d(maximum_rank_elements * faces_per_element *
-                             maximum_face_points);
-  view_.face_normal = take_d(maximum_rank_elements * faces_per_element *
-                             maximum_face_points * dimension);
-  view_.status = take_d(maximum_rank_elements);
+  view_.volume_shape = take_d(generic ? generic_arena_layout_.volume_shape :
+      static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * maximum_scalar_dofs_per_element);
+  view_.volume_derivative = take_d(generic ? generic_arena_layout_.volume_derivative :
+      static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * maximum_scalar_dofs_per_element * dimension);
+  view_.volume_weight = take_d(generic ? generic_arena_layout_.volume_weight :
+      static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points);
+  view_.volume_position = take_d(generic ? generic_arena_layout_.volume_position :
+      static_cast<std::size_t>(maximum_rank_elements) * maximum_volume_points * dimension);
+  view_.face_interior_shape = take_d(generic ? generic_arena_layout_.face_interior :
+      static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * maximum_scalar_dofs_per_element);
+  view_.face_trace_shape = take_d(generic ? generic_arena_layout_.face_trace :
+      static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * maximum_scalar_dofs_per_face);
+  view_.face_weight = take_d(generic ? generic_arena_layout_.face_weight :
+      static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points);
+  view_.face_normal = take_d(generic ? generic_arena_layout_.face_normal :
+      static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension);
+  view_.status = take_d(generic ? generic_arena_layout_.elements : maximum_rank_elements);
   view_.scalar = take_d(8);
   // Append the borrowed-only stabilization slice after every frozen W8A
   // allocation.  False mode therefore preserves the exact legacy arena
   // partition, offsets, and resource evidence tokens.
   if (shape_.borrowed_host_inputs)
-    view_.borrowed_lagged_llf_tau = take_d(maximum_rank_elements *
+    view_.borrowed_lagged_llf_tau = take_d(generic ? generic_arena_layout_.face_weight :
+        static_cast<std::size_t>(maximum_rank_elements) *
         faces_per_element * maximum_face_points);
   if (static_cast<std::size_t>(d - double_arena_) >
-      persistent_double_capacity)
+      double_arena_capacity_)
     return false;
 
   int* i = integer_arena_;
@@ -619,30 +632,29 @@ BindArenaViews() noexcept
   i += 8;
   view_.ticket_words = i;
   i += 8;
-  view_.signed_element_trace = TakeArena(i,
-      maximum_rank_elements * maximum_trace_dofs_per_element);
-  view_.matrix_owned_source = TakeArena(i, maximum_local_matrix_entries);
-  view_.matrix_owned_section = TakeArena(i, maximum_local_matrix_entries);
-  view_.matrix_owned_target = TakeArena(i, maximum_local_matrix_entries);
-  view_.matrix_send_source = TakeArena(i, maximum_exchange_entries);
-  view_.matrix_receive_section = TakeArena(i, maximum_exchange_entries);
-  view_.matrix_receive_target = TakeArena(i, maximum_exchange_entries);
+  view_.signed_element_trace = TakeArena(i, max_er);
+  view_.matrix_owned_source = TakeArena(i, max_d);
+  view_.matrix_owned_section = TakeArena(i, max_d);
+  view_.matrix_owned_target = TakeArena(i, max_d);
+  view_.matrix_send_source = TakeArena(i, max_exchange);
+  view_.matrix_receive_section = TakeArena(i, max_exchange);
+  view_.matrix_receive_target = TakeArena(i, max_exchange);
   view_.vector_owned_source = TakeArena(i, max_er);
   view_.vector_owned_target = TakeArena(i, max_er);
   view_.vector_send_source = TakeArena(i, max_er);
   view_.vector_receive_target = TakeArena(i, max_er);
   if (static_cast<std::size_t>(i - integer_arena_) >
-      persistent_integer_capacity)
+      integer_arena_capacity_)
     return false;
 
   double_memory_.Wrap(double_arena_,
-                      static_cast<int>(persistent_double_capacity),
+                      static_cast<int>(double_arena_capacity_),
                       mfem::MemoryType::DEVICE_UMPIRE, false);
   integer_memory_.Wrap(integer_arena_,
-                       static_cast<int>(persistent_integer_capacity),
+                       static_cast<int>(integer_arena_capacity_),
                        mfem::MemoryType::DEVICE_UMPIRE, false);
   double_arena_vector_.NewMemoryAndSize(
-      double_memory_, static_cast<int>(persistent_double_capacity), false);
+      double_memory_, static_cast<int>(double_arena_capacity_), false);
   double_arena_vector_.UseDevice(true);
   return double_memory_.DeviceIsValid() && integer_memory_.DeviceIsValid();
 }
@@ -738,6 +750,22 @@ BuildPersistentTrueSystem() noexcept
                                    &TransportPolicy::DeviceToHost,
                                    &TransportPolicy::Synchronize) &&
         CudaGetTrueMatrixDeviceView(*true_matrix_, true_device_);
+    if (local_objects_ready && oracle_capture_requested_)
+    {
+      local_objects_ready = true_structure_.diag_nonzeros >= 0 &&
+          true_structure_.offd_nonzeros >= 0 &&
+          static_cast<std::size_t>(true_structure_.diag_nonzeros) <=
+              maximum_true_matrix_entries &&
+          static_cast<std::size_t>(true_structure_.offd_nonzeros) <=
+              maximum_true_matrix_entries;
+      if (local_objects_ready)
+      {
+        host_true_diag_values_.assign(
+            static_cast<std::size_t>(true_structure_.diag_nonzeros), 0.0);
+        host_true_offd_values_.assign(
+            static_cast<std::size_t>(true_structure_.offd_nonzeros), 0.0);
+      }
+    }
     if (local_objects_ready)
     {
       trace_slots_[0].emplace(trace_space_.operator->());
@@ -1004,10 +1032,12 @@ BuildSparseStagingPlan() noexcept
             vector_count_ok);
     if (!CollectiveContinue(vector_count_ok && vector_count_recorded))
       return false;
-    const bool counts_valid =
-        shape_.matrix_receive_count <= maximum_exchange_entries &&
-        shape_.vector_receive_count <=
-            maximum_rank_elements * maximum_trace_dofs_per_element;
+    const bool counts_valid = shape_.matrix_receive_count >= 0 &&
+        shape_.vector_receive_count >= 0 &&
+        static_cast<std::size_t>(shape_.matrix_receive_count) <=
+            host_matrix_receive_section_.size() &&
+        static_cast<std::size_t>(shape_.vector_receive_count) <=
+            host_vector_receive_target_.size();
     if (!CollectiveContinue(counts_valid))
       return false;
     const bool matrix_keys_ok = MPI_Sendrecv(
@@ -1178,16 +1208,15 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 StatusPassed() noexcept
 {
-  std::array<double, maximum_rank_elements> status{};
   if (!TransportPolicy::DeviceToHost(
-          status.data(), view_.status,
+          host_status_.data(), view_.status,
           static_cast<std::size_t>(shape_.elements) * sizeof(double),
           CudaTransferCategory::scalar_diagnostic,
           CudaTransferSite::scalar_status) ||
       !TransportPolicy::Synchronize(CudaTransferSite::scalar_status))
     return false;
   for (int element = 0; element < shape_.elements; ++element)
-    if (status[static_cast<std::size_t>(element)] != 1.0) { return false; }
+    if (host_status_[static_cast<std::size_t>(element)] != 1.0) { return false; }
   return true;
 }
 
@@ -1415,10 +1444,10 @@ SolveTrueSystem(double& true_relative_residual,
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
-AssembleAndNorm(state_slot&, double& norm) noexcept
+AssembleAndNorm(state_slot&, const double dt, double& norm) noexcept
 {
   TransportPolicy::SetPhase(CudaFailurePhase::assembly, current_generation_);
-  const bool local_assembly = CudaLaunchAssembly(view_, shape_, fixed_dt) &&
+  const bool local_assembly = CudaLaunchAssembly(view_, shape_, dt) &&
       TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
       StatusPassed();
   if (!CollectiveContinue(local_assembly) ||
@@ -1567,10 +1596,106 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 std::size_t CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 WorkspaceBytes() const noexcept
 {
-  return (persistent_double_capacity -
-          2 * maximum_rank_elements * maximum_interior_dofs_per_element -
-          2 * maximum_true_trace_dofs) * sizeof(double) +
-      persistent_integer_capacity * sizeof(int);
+  if (!(borrowed_topology_ && shape_.borrowed_host_inputs))
+  {
+    return (persistent_double_capacity -
+            2 * maximum_rank_elements * maximum_interior_dofs_per_element -
+            2 * maximum_true_trace_dofs) * sizeof(double) +
+        persistent_integer_capacity * sizeof(int);
+  }
+  const std::size_t committed_slots = 2 * static_cast<std::size_t>(
+      shape_.interior_count) + 2 * static_cast<std::size_t>(
+      shape_.true_trace_count);
+  return (double_arena_capacity_ - committed_slots) * sizeof(double) +
+      integer_arena_capacity_ * sizeof(int);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+OraclePayloadFitsCapacity() const noexcept
+{
+  const auto nonnegative = [](const int value) { return value >= 0; };
+  if (!nonnegative(shape_.elements) || !nonnegative(shape_.interior_count) ||
+      !nonnegative(shape_.local_trace_count) ||
+      !nonnegative(shape_.true_trace_count) ||
+      !nonnegative(shape_.trace_dofs) ||
+      !nonnegative(shape_.volume_points) || !nonnegative(shape_.face_points) ||
+      !nonnegative(shape_.scalar_interior_dofs) ||
+      !nonnegative(shape_.scalar_face_dofs) ||
+      !nonnegative(true_structure_.diag_nonzeros) ||
+      !nonnegative(true_structure_.offd_nonzeros))
+    return false;
+
+  // Check dimensions before forming payload products.  These fixed limits
+  // bound every CudaOraclePod array and keep the following arithmetic exact.
+  if (shape_.elements > maximum_rank_elements ||
+      shape_.trace_dofs > maximum_trace_dofs_per_element ||
+      shape_.volume_points > maximum_volume_points ||
+      shape_.face_points > maximum_face_points ||
+      shape_.scalar_interior_dofs > maximum_scalar_dofs_per_element ||
+      shape_.scalar_face_dofs > maximum_scalar_dofs_per_face ||
+      shape_.interior_count >
+          maximum_rank_elements * maximum_interior_dofs_per_element ||
+      shape_.local_trace_count > maximum_local_trace_dofs ||
+      shape_.true_trace_count > maximum_true_trace_dofs)
+    return false;
+
+  const std::size_t elements = static_cast<std::size_t>(shape_.elements);
+  const std::size_t interior = static_cast<std::size_t>(shape_.interior_count);
+  const std::size_t local_trace =
+      static_cast<std::size_t>(shape_.local_trace_count);
+  const std::size_t true_trace =
+      static_cast<std::size_t>(shape_.true_trace_count);
+  const std::size_t element_trace = elements *
+      static_cast<std::size_t>(shape_.trace_dofs);
+  const std::size_t csr_nonzeros = static_cast<std::size_t>(
+      true_structure_.diag_nonzeros) + static_cast<std::size_t>(
+      true_structure_.offd_nonzeros);
+  const auto fits = [](const std::size_t available, const std::size_t required,
+                       const std::size_t capacity)
+  { return required <= available && required <= capacity; };
+
+  return fits(signed_element_trace_.size(), element_trace,
+              maximum_element_trace_dofs) &&
+      fits(local_global_true_.size(), local_trace, maximum_local_trace_dofs) &&
+      fits(owned_global_true_.size(), true_trace, maximum_true_trace_dofs) &&
+      fits(element_coordinate_keys_.size(), elements * dimension,
+           maximum_rank_elements * dimension) &&
+      fits(host_volume_shape_.size(), elements * shape_.volume_points *
+           shape_.scalar_interior_dofs, maximum_rank_elements *
+           maximum_volume_points * maximum_scalar_dofs_per_element) &&
+      fits(host_volume_derivative_.size(), elements * shape_.volume_points *
+           shape_.scalar_interior_dofs * dimension, maximum_rank_elements *
+           maximum_volume_points * maximum_scalar_dofs_per_element * dimension) &&
+      fits(host_volume_weight_.size(), elements * shape_.volume_points,
+           maximum_rank_elements * maximum_volume_points) &&
+      fits(host_volume_position_.size(), elements * shape_.volume_points * dimension,
+           maximum_rank_elements * maximum_volume_points * dimension) &&
+      fits(host_face_interior_shape_.size(), elements * faces_per_element *
+           shape_.face_points * shape_.scalar_interior_dofs,
+           maximum_rank_elements * faces_per_element * maximum_face_points *
+           maximum_scalar_dofs_per_element) &&
+      fits(host_face_trace_shape_.size(), elements * faces_per_element *
+           shape_.face_points * shape_.scalar_face_dofs,
+           maximum_rank_elements * faces_per_element * maximum_face_points *
+           maximum_scalar_dofs_per_face) &&
+      fits(host_face_weight_.size(), elements * faces_per_element * shape_.face_points,
+           maximum_rank_elements * faces_per_element * maximum_face_points) &&
+      fits(host_face_normal_.size(), elements * faces_per_element *
+           shape_.face_points * dimension, maximum_rank_elements *
+           faces_per_element * maximum_face_points * dimension) &&
+      interior <= maximum_rank_elements * maximum_interior_dofs_per_element &&
+      csr_nonzeros <= maximum_true_matrix_entries &&
+      host_true_diag_values_.size() >= static_cast<std::size_t>(
+          true_structure_.diag_nonzeros) &&
+      host_true_offd_values_.size() >= static_cast<std::size_t>(
+          true_structure_.offd_nonzeros) &&
+      true_structure_.diag_offsets.size() >= true_trace + 1 &&
+      true_structure_.offd_offsets.size() >= true_trace + 1 &&
+      true_structure_.diag_columns.size() >= static_cast<std::size_t>(
+          true_structure_.diag_nonzeros) &&
+      true_structure_.offd_columns.size() >= static_cast<std::size_t>(
+          true_structure_.offd_nonzeros);
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -1579,6 +1704,10 @@ CaptureOracleMetadata(const AttemptIdentity& attempt,
                       const std::uint64_t generation) noexcept
 {
   oracle_ = {};
+  oracle_captured_ = false;
+  // Dynamic borrowed storage is not a complete CudaOraclePod.  Refuse the
+  // fixed export rather than truncating bytes or writing beyond the ABI.
+  if (!OraclePayloadFitsCapacity()) return;
   oracle_.rank = rank_;
   oracle_.ranks = ranks_;
   oracle_.elements = shape_.elements;
@@ -1627,18 +1756,15 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 ExportTrueSystem(CudaOraclePod& pod) noexcept
 {
-  std::array<double, maximum_true_matrix_entries> diag{};
-  std::array<double, maximum_true_matrix_entries> offd{};
-  if (true_structure_.diag_nonzeros + true_structure_.offd_nonzeros >
-          maximum_true_matrix_entries ||
+  if (!OraclePayloadFitsCapacity() ||
       !TransportPolicy::DeviceToHost(
-          diag.data(), true_device_.diag_values,
+          host_true_diag_values_.data(), true_device_.diag_values,
           static_cast<std::size_t>(true_structure_.diag_nonzeros) *
               sizeof(double),
           CudaTransferCategory::oracle_export,
           CudaTransferSite::oracle_export) ||
       !TransportPolicy::DeviceToHost(
-          offd.data(), true_device_.offd_values,
+          host_true_offd_values_.data(), true_device_.offd_values,
           static_cast<std::size_t>(true_structure_.offd_nonzeros) *
               sizeof(double),
           CudaTransferCategory::oracle_export,
@@ -1658,7 +1784,7 @@ ExportTrueSystem(CudaOraclePod& pod) noexcept
       pod.true_csr_columns[static_cast<std::size_t>(cursor)] =
           owned_global_true_[static_cast<std::size_t>(local_column)];
       pod.true_csr_values[static_cast<std::size_t>(cursor++)] =
-          diag[static_cast<std::size_t>(entry)];
+          host_true_diag_values_[static_cast<std::size_t>(entry)];
     }
     for (int entry = true_structure_.offd_offsets[static_cast<std::size_t>(row)];
          entry < true_structure_.offd_offsets[static_cast<std::size_t>(row + 1)];
@@ -1667,7 +1793,7 @@ ExportTrueSystem(CudaOraclePod& pod) noexcept
       pod.true_csr_columns[static_cast<std::size_t>(cursor)] =
           true_structure_.offd_columns[static_cast<std::size_t>(entry)];
       pod.true_csr_values[static_cast<std::size_t>(cursor++)] =
-          offd[static_cast<std::size_t>(entry)];
+          host_true_offd_values_[static_cast<std::size_t>(entry)];
     }
     pod.true_csr_offsets[static_cast<std::size_t>(row + 1)] = cursor;
   }

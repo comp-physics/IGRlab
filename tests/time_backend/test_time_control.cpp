@@ -295,6 +295,41 @@ int main()
 
   {
     HdgTransactionalTimeAdapter adapter(
+        TimeControl::CFL(0.0, 0.7, 0.5),
+        OutputSchedule::FixedInterval(0.25),
+        HdgTimeControlMode::CFLBackwardEuler);
+    const StepPlan first = adapter.BeginStep(0.8);
+    adapter.RecordFailure(HdgStepFailurePhase::LinearSolve);
+    const StepPlan retry = adapter.BeginStep(0.1);
+    const auto first_output = adapter.FinalizeSuccess();
+    const StepPlan second = adapter.BeginStep(0.4);
+    adapter.FinalizeSuccess();
+    const StepPlan final = adapter.BeginStep(0.4);
+    checks.Expect(Near(first.proposed_dt, 0.8) && Near(first.dt, 0.25) &&
+                    first.sequence == retry.sequence &&
+                    Near(retry.proposed_dt, first.proposed_dt) &&
+                    first_output && Near(first_output->time, 0.25) &&
+                    Near(second.proposed_dt, 0.4) && Near(second.dt, 0.25) &&
+                    Near(final.proposed_dt, 0.4) && Near(final.dt, 0.2) &&
+                    final.hits_final,
+                  "HDG CFL proposals are transactional and clip at output and final boundaries");
+  }
+
+  {
+    HdgTransactionalTimeAdapter adapter(
+        TimeControl::CFL(0.0, 1.0, 0.5),
+        OutputSchedule::FixedInterval(0.05),
+        HdgTimeControlMode::CFLBackwardEuler);
+    ExpectInvalid(checks,
+                  [&adapter] { adapter.BeginStep(0.04, 0.05); },
+                  "HDG applies dt_min to the nominal CFL proposal before output clipping");
+    const StepPlan accepted = adapter.BeginStep(0.06, 0.05);
+    checks.Expect(Near(accepted.proposed_dt, 0.06) && Near(accepted.dt, 0.05),
+                  "HDG admits a nominal CFL proposal before its output clipping");
+  }
+
+  {
+    HdgTransactionalTimeAdapter adapter(
       TimeControl::Fixed(0.0, 1.0, 0.6),
       OutputSchedule::Disabled(InitialOutputPolicy::Suppress,
                                FinalOutputPolicy::Suppress));
@@ -449,9 +484,18 @@ int main()
                 []
                 {
                   HdgTransactionalTimeAdapter(
-                    TimeControl::CFL(0.0, 1.0, 0.5), OutputSchedule::Disabled());
+                    TimeControl::CFL(0.0, 1.0, 0.5), OutputSchedule::Disabled(),
+                    HdgTimeControlMode::FixedBackwardEuler);
                 },
-                "HDG CFL control remains reserved until implemented");
+                "HDG fixed Backward-Euler rejects CFL control");
+  ExpectInvalid(checks,
+                []
+                {
+                  HdgTransactionalTimeAdapter(
+                    TimeControl::Fixed(0.0, 1.0, 0.1), OutputSchedule::Disabled(),
+                    HdgTimeControlMode::CFLBackwardEuler);
+                },
+                "HDG CFL Backward-Euler rejects fixed control");
   ExpectInvalid(checks,
                 []
                 {

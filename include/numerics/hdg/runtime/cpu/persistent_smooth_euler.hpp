@@ -727,7 +727,10 @@ public:
   bool PrepareBorrowedEuler(double, StateCoordinates&,
                             std::uint64_t&) noexcept;
   /** Publish exactly one active prepared candidate. */
-  bool CommitBorrowedEuler(std::uint64_t, StateCoordinates&, double&) noexcept;
+  bool CommitBorrowedEuler(std::uint64_t, StateCoordinates&, double&,
+                           double&) noexcept;
+  /** Scan the committed borrowed interior and trace for CFL diagnostics. */
+  bool CommittedBorrowedEulerDiagnostics(double&, double&) noexcept;
   /** Discard exactly one active prepared candidate. */
   bool AbortBorrowedEuler(std::uint64_t,
                           const StateCoordinates&) noexcept;

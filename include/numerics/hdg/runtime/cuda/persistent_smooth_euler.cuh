@@ -179,7 +179,8 @@ enum class CudaCopyOutPurpose : unsigned char
 {
   none,
   attempt_seed,
-  checkpoint_staging
+  checkpoint_staging,
+  output_metadata_staging
 };
 
 inline bool SameRange(const double* first, std::size_t first_count,
@@ -323,6 +324,20 @@ struct CudaContractStoragePolicy
           CudaTransferSite::checkpoint_stage_trace);
       const bool synchronized = TransportPolicy::Synchronize(
           CudaTransferSite::checkpoint_stage_trace);
+      return interior && trace && synchronized;
+    }
+    if (purpose == CudaCopyOutPurpose::output_metadata_staging)
+    {
+      const bool interior = CopyInterior(
+          copy.interior, source.interior,
+          CudaTransferCategory::generic_output_metadata_staging,
+          CudaTransferSite::output_metadata_stage_interior);
+      const bool trace = CopyTrace(
+          copy.trace, source.trace,
+          CudaTransferCategory::generic_output_metadata_staging,
+          CudaTransferSite::output_metadata_stage_trace);
+      const bool synchronized = TransportPolicy::Synchronize(
+          CudaTransferSite::output_metadata_stage_trace);
       return interior && trace && synchronized;
     }
     return false;
@@ -556,6 +571,17 @@ public:
       detail::ReportCudaSetupFailure(evidence.rank, "contract-ready");
       return false;
     }
+    if (config_.use_borrowed_host_inputs &&
+        !numerics_.CommittedBorrowedEulerDiagnostics(
+            numerics_.CommittedSlot(), config_.order,
+            committed_maximum_wave_speed_, committed_backend_stable_dt_))
+    {
+      evidence.status = CudaRunStatus::setup_failure;
+      evidence.setup_origin = FailureReason::backend_failure;
+      detail::ReportCudaSetupFailure(evidence.rank, "initial-cfl-diagnostics");
+      return false;
+    }
+    committed_diagnostics_valid_ = config_.use_borrowed_host_inputs;
     initialized_ = true;
     evidence.reuse = numerics_.ReuseEvidence();
     evidence.status = CudaRunStatus::ready;
@@ -565,12 +591,13 @@ public:
   /** Complete numerical work, freeze the contract candidate, and retain the
    * affine staging token internally.  No rank may stage before the final
    * all-rank prestaging agreement in this call. */
-  bool PrepareStep(const bool retry, CudaPrecommitSnapshot& snapshot,
+  bool PrepareStep(const bool retry, const double dt,
+                   CudaPrecommitSnapshot& snapshot,
                    CudaStepEvidence& evidence) noexcept
   {
     snapshot = {};
     if (pending_.active || !initialized_) { return false; }
-    if (!PreparePending(retry, evidence)) { return false; }
+    if (!PreparePending(retry, dt, evidence)) { return false; }
     if (!pending_.staging) { return false; }
     snapshot.attempt = pending_.attempt;
     snapshot.committed = pending_.staging->entry_coordinates();
@@ -588,6 +615,11 @@ public:
     snapshot.numerical_candidate_ready = pending_.numerical.candidate_ready;
     return true;
   }
+
+  /** Retained W8A entry point: false mode still advances at exactly .05. */
+  bool PrepareStep(const bool retry, CudaPrecommitSnapshot& snapshot,
+                   CudaStepEvidence& evidence) noexcept
+  { return PrepareStep(retry, fixed_dt, snapshot, evidence); }
 
   /** Token-validated candidate copy followed by real D2H checkpoint staging. */
   bool StagePreparedCheckpoint(CudaSerializedCheckpointV1& checkpoint,
@@ -626,6 +658,66 @@ public:
     return all_staged;
   }
 
+  /**
+   * Generic borrowed-mode staging copies the frozen slot device-to-device but
+   * never materializes the legacy fixed checkpoint payload.  The caller can
+   * export that slot through the explicit L2 bridge while this authority is
+   * live.  Restart/checkpoint routes continue to use StagePreparedCheckpoint.
+   */
+  bool StagePreparedOutputMetadata(CudaPreparedOutputMetadataV1& metadata,
+                                   CudaStepEvidence& evidence) noexcept
+  {
+    metadata = {};
+    if (!pending_.active || !pending_.staging || !pending_.prestage_allowed)
+      return false;
+    metadata.attempt = pending_.attempt;
+    metadata.facade_incarnation = facade_incarnation_;
+    metadata.descriptor = pending_.staging->future_checkpoint();
+    metadata.candidate_frozen = true;
+    const CudaTransferTotals transfers_before = TransportPolicy::Accounting();
+    TransportPolicy::BeginStagingRange();
+    storage_policy::SetCopyOutPurpose(
+        detail::CudaCopyOutPurpose::output_metadata_staging);
+    state_slot& staging_slot = numerics_.WorkspaceSlot();
+    const bool token_copy = contract_->CopyPrepared(*pending_.staging,
+                                                     staging_slot);
+    storage_policy::SetCopyOutPurpose(detail::CudaCopyOutPurpose::none);
+    metadata.source_rank = numerics_.rank();
+    metadata.rank_count = config_.expected_rank_count;
+    metadata.local_mesh_hash = numerics_.LocalMeshHash();
+    metadata.local_partition_hash = numerics_.LocalPartitionHash();
+    metadata.local_topology_hash = numerics_.LocalTopologyHash();
+    metadata.local_interior_hash = staging_slot.interior.local_hash;
+    metadata.local_trace_hash = staging_slot.trace.local_hash;
+    metadata.interior_count = staging_slot.interior.count;
+    metadata.owned_true_trace_count = staging_slot.trace.count;
+    metadata.interior_source_token = staging_slot.interior.storage_token;
+    metadata.trace_source_token = staging_slot.trace.storage_token;
+    metadata.staging_generation = staging_slot.interior.generation;
+    const bool all_staged = numerics_.CollectiveContinue(token_copy);
+    metadata.checkpoint_staged = all_staged;
+    pending_.checkpoint_staged = all_staged;
+    if (!all_staged)
+    {
+      pending_.prestage_allowed = false;
+      pending_.report.originating_failure = FailureReason::backend_failure;
+      pending_.report.gates.success = false;
+    }
+    UpdateAttemptEvidence(pending_.evidence);
+    metadata.staging_range = TransportPolicy::EndStagingRange();
+    const CudaTransferTotals transfers_after = TransportPolicy::Accounting();
+    metadata.staging_host_to_device_bytes =
+        transfers_after.host_to_device_bytes - transfers_before.host_to_device_bytes;
+    metadata.staging_device_to_host_bytes =
+        transfers_after.device_to_host_bytes - transfers_before.device_to_host_bytes;
+    metadata.staging_device_to_device_bytes =
+        transfers_after.device_to_device_bytes - transfers_before.device_to_device_bytes;
+    metadata.staging_range.complete = metadata.staging_range.complete &&
+        all_staged;
+    evidence = pending_.evidence;
+    return all_staged;
+  }
+
   /** Freeze the independent oracle bytes during the same candidate epoch. */
   bool StagePreparedOracle(CudaOraclePod& pod,
                            CudaStepEvidence& evidence) noexcept
@@ -654,7 +746,8 @@ public:
   }
 
   /** A caller invokes this only after its output artifact is staged. */
-  bool MarkOutputStaged(CudaSerializedCheckpointV1& checkpoint) noexcept
+  template <typename StagedOutput>
+  bool MarkOutputStaged(StagedOutput& checkpoint) noexcept
   {
     const bool local_valid = pending_.active && pending_.staging &&
         pending_.prestage_allowed && pending_.checkpoint_staged &&
@@ -678,7 +771,8 @@ public:
   }
 
   /** Consume StagingToken and retain PreparedCommitToken internally. */
-  bool PrepareCommit(CudaSerializedCheckpointV1& checkpoint,
+  template <typename StagedOutput>
+  bool PrepareCommit(StagedOutput& checkpoint,
                      CudaStepEvidence& evidence) noexcept
   {
     const bool local_staging = pending_.active && pending_.staging.has_value();
@@ -693,8 +787,11 @@ public:
       pending_.report.originating_failure = FailureReason::backend_failure;
       pending_.report.gates.success = false;
     }
-    const bool copies_complete = TransportPolicy::Synchronize(
-        CudaTransferSite::checkpoint_stage_trace);
+    const CudaTransferSite staging_site = std::is_same<
+        StagedOutput, CudaPreparedOutputMetadataV1>::value
+        ? CudaTransferSite::output_metadata_stage_trace
+        : CudaTransferSite::checkpoint_stage_trace;
+    const bool copies_complete = TransportPolicy::Synchronize(staging_site);
     if (!numerics_.CollectiveContinue(copies_complete))
     {
       pending_.report.originating_failure = FailureReason::backend_failure;
@@ -724,7 +821,8 @@ public:
   }
 
   /** Reversible whole-slot exchange; old logical publication remains visible. */
-  bool CommitPrepared(CudaSerializedCheckpointV1& checkpoint,
+  template <typename StagedOutput>
+  bool CommitPrepared(StagedOutput& checkpoint,
                       CudaStepEvidence& evidence) noexcept
   {
     const bool local_prepared = pending_.active && pending_.prepared.has_value();
@@ -744,7 +842,8 @@ public:
   }
 
   /** Sole logical publication boundary; validation failure remains reversible. */
-  bool FinalizeCommit(CudaSerializedCheckpointV1& checkpoint,
+  template <typename StagedOutput>
+  bool FinalizeCommit(StagedOutput& checkpoint,
                       CudaStepEvidence& evidence) noexcept
   {
     const bool local_provisional =
@@ -763,11 +862,29 @@ public:
                           evidence);
     }
     if (!local_artifacts_publishable) return false;
+    // Compute trace-inclusive diagnostics from candidate slot 1 while the
+    // provisional authority remains reversible.  A failed scan reverts the
+    // provisional publication instead of rejecting after bytes are committed.
+    double candidate_maximum_wave_speed = 0.0;
+    double candidate_backend_stable_dt = std::numeric_limits<double>::quiet_NaN();
+    if (config_.use_borrowed_host_inputs &&
+        !numerics_.CommittedBorrowedEulerDiagnostics(
+            numerics_.CandidateSlot(), config_.order,
+            candidate_maximum_wave_speed, candidate_backend_stable_dt))
+      return RevertCommit(checkpoint, FailureReason::backend_failure, evidence);
     const AttemptOutcome outcome =
         contract_->FinalizeCommit(std::move(*pending_.provisional));
     pending_.provisional.reset();
     if (outcome.committed)
+    {
       numerics_.SwapPublishedSlotHandles();
+      if (config_.use_borrowed_host_inputs)
+      {
+        committed_maximum_wave_speed_ = candidate_maximum_wave_speed;
+        committed_backend_stable_dt_ = candidate_backend_stable_dt;
+        committed_diagnostics_valid_ = true;
+      }
+    }
     checkpoint.successful_commit = outcome.committed;
     FinishOutcome(outcome, pending_.evidence);
     if (pending_.has_oracle)
@@ -781,7 +898,8 @@ public:
   }
 
   /** FailureReason::none is normalized to backend_failure and cannot commit. */
-  bool AbortPrepared(CudaSerializedCheckpointV1& checkpoint,
+  template <typename StagedOutput>
+  bool AbortPrepared(StagedOutput& checkpoint,
                      FailureReason reason,
                      CudaStepEvidence& evidence) noexcept
   {
@@ -809,7 +927,8 @@ public:
     return outcome.retry_available;
   }
 
-  bool RevertCommit(CudaSerializedCheckpointV1& checkpoint,
+  template <typename StagedOutput>
+  bool RevertCommit(StagedOutput& checkpoint,
                     FailureReason reason,
                     CudaStepEvidence& evidence) noexcept
   {
@@ -930,6 +1049,14 @@ public:
                                     destination);
   }
 
+  bool CachedBorrowedEulerDiagnostics(double& maximum_wave_speed,
+                                      double& backend_stable_dt) const noexcept
+  {
+    maximum_wave_speed = committed_maximum_wave_speed_;
+    backend_stable_dt = committed_backend_stable_dt_;
+    return initialized_ && committed_diagnostics_valid_;
+  }
+
   /** Export only the currently staged candidate; no logical publication occurs. */
   bool ExportPreparedInterior(CudaMutableHostL2Output destination) noexcept
   {
@@ -968,8 +1095,8 @@ private:
     config_.borrowed_source.coefficients = nullptr;
   }
 
-  static void AbortStagedArtifacts(
-      CudaSerializedCheckpointV1& checkpoint) noexcept
+  template <typename StagedOutput>
+  static void AbortStagedArtifacts(StagedOutput& checkpoint) noexcept
   {
     checkpoint.candidate_frozen = false;
     checkpoint.checkpoint_staged = false;
@@ -1104,6 +1231,10 @@ private:
 
   bool ValidateConfig() const noexcept
   {
+    const bool borrowed_generic_shape = config_.use_borrowed_topology &&
+        config_.use_borrowed_host_inputs && config_.mesh_n >= 0 &&
+        (config_.order == smoke_polynomial_order ||
+         config_.order == functional_polynomial_order);
     const bool smoke_shape = config_.order == smoke_polynomial_order &&
         config_.mesh_n == smoke_elements_per_direction;
     const bool functional_shape =
@@ -1138,12 +1269,17 @@ private:
               config_.borrowed_source.scalar_count != 0 &&
               config_.borrowed_source.components == conserved_components))
         : empty_l2(config_.borrowed_initial) && empty_l2(config_.borrowed_source);
+    const bool fixed_oracle_requested_for_generic_storage =
+        config_.use_borrowed_topology && config_.use_borrowed_host_inputs &&
+        config_.capture_oracle;
     return config_.experiment == StableIdentity::Copy(experiment_id) &&
-        (smoke_shape || functional_shape) &&
+        (borrowed_generic_shape || smoke_shape || functional_shape) &&
         topology_configuration &&
         generic_l2_configuration &&
-        std::isfinite(config_.dt) &&
-        std::memcmp(&config_.dt, &fixed_dt, sizeof(double)) == 0 &&
+        !fixed_oracle_requested_for_generic_storage &&
+        std::isfinite(config_.dt) && config_.dt > 0.0 &&
+        (config_.use_borrowed_host_inputs ||
+         std::memcmp(&config_.dt, &fixed_dt, sizeof(double)) == 0) &&
         config_.requested_device == 0 &&
         (config_.expected_rank_count == 1 ||
          config_.expected_rank_count == 2) &&
@@ -1194,6 +1330,13 @@ private:
 
   bool MakeConfigDescriptor(ConfigDescriptor& descriptor) const noexcept
   {
+    // CudaOraclePod is a frozen fixed-capacity ABI.  Borrowed host sessions
+    // may use dynamic storage, so their output route is metadata-only and may
+    // not request fixed oracle materialization.  False mode writes the same
+    // descriptor bytes as before.
+    if (config_.use_borrowed_topology && config_.use_borrowed_host_inputs &&
+        config_.capture_oracle)
+      return false;
     descriptor = {};
     std::size_t cursor = 0;
     bool complete = true;
@@ -1269,7 +1412,8 @@ private:
         minimum == maximum;
   }
 
-  bool PreparePending(const bool retry, CudaStepEvidence& evidence) noexcept
+  bool PreparePending(const bool retry, const double dt,
+                      CudaStepEvidence& evidence) noexcept
   {
     evidence = {};
     evidence.before = contract_->coordinates();
@@ -1282,8 +1426,13 @@ private:
     pending_.ledger_begin = TransportPolicy::Ledger().observed_count + 1;
     pending_.w8_owned_allocation_begin =
         AllocatorPolicy::W8OwnedAllocationCalls();
+    const bool dt_valid = std::isfinite(dt) && dt > 0.0 &&
+        (config_.use_borrowed_host_inputs ||
+         std::memcmp(&dt, &fixed_dt, sizeof(double)) == 0) &&
+        (!retry || std::memcmp(&dt, &retained_retry_dt_, sizeof(double)) == 0);
+    if (!numerics_.CollectiveContinue(dt_valid)) return false;
     const BeginOutcome begin = retry ? contract_->Retry() :
-        contract_->BeginStep({InteriorSpace::l2, config_.dt});
+        contract_->BeginStep({InteriorSpace::l2, dt});
     evidence.attempt = begin.attempt;
     if (!begin.started)
     {
@@ -1356,6 +1505,7 @@ private:
     pending_.active = true;
     pending_.prestage_allowed = false;
     pending_.attempt = begin.attempt;
+    retained_retry_dt_ = begin.attempt.dt;
     pending_.report = report;
     pending_.bundle = std::move(bundle);
     pending_.numerical = adjusted;
@@ -1614,8 +1764,12 @@ private:
   PendingAttempt pending_{};
   CudaOraclePod last_oracle_{};
   std::uint64_t next_attempt_sequence_ = 0;
+  double retained_retry_dt_ = fixed_dt;
+  double committed_maximum_wave_speed_ = 0.0;
+  double committed_backend_stable_dt_ = std::numeric_limits<double>::quiet_NaN();
   std::uint64_t facade_incarnation_ = 0;
   bool initialized_ = false;
+  bool committed_diagnostics_valid_ = false;
   bool last_oracle_valid_ = false;
 };
 
