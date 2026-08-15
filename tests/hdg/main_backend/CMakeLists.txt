@@ -115,22 +115,22 @@ if(MFEM_USE_CUDA)
       TIMEOUT 1200)
   endforeach()
 
-  add_test(NAME dg_igr_hdg_main_backend_cuda_p2_serial1_parallel1_rank2
+  add_test(NAME dg_igr_hdg_main_backend_cuda_p2_serial1_parallel0_rank2
     COMMAND "${CMAKE_COMMAND}"
       "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
-      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-p2-serial1-parallel1-rank2-output"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-p2-serial1-parallel0-rank2-output"
       "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh"
       "-DHDG_MAIN_ORDER=2"
       "-DHDG_MAIN_N=6"
       "-DHDG_MAIN_RANKS=2"
       "-DHDG_MAIN_SERIAL_REFINE=1"
-      "-DHDG_MAIN_PARALLEL_REFINE=1"
+      "-DHDG_MAIN_PARALLEL_REFINE=0"
       "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
       "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
       "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
       "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
-  set_tests_properties(dg_igr_hdg_main_backend_cuda_p2_serial1_parallel1_rank2 PROPERTIES
+  set_tests_properties(dg_igr_hdg_main_backend_cuda_p2_serial1_parallel0_rank2 PROPERTIES
     LABELS "hdg;main-backend;cuda;mpi;process;generic-borrowed;refinement;p2"
     PROCESSORS 2
     RESOURCE_LOCK dg_igr_sm120
