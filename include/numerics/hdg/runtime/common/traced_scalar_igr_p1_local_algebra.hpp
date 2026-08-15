@@ -64,8 +64,15 @@ struct Output final
   double* g;
 };
 
-MFEM_HOST_DEVICE inline bool Finite(const double value) noexcept
-{ return ::isfinite(value); }
+// Exact IEEE-754 binary64 maximum; range comparisons reject NaN and both infinities
+// without depending on host/device-specific isfinite namespace declarations.
+inline constexpr double max_finite_double = 0x1.fffffffffffffp+1023;
+
+MFEM_HOST_DEVICE constexpr bool Finite(const double value) noexcept
+{ return value >= -max_finite_double && value <= max_finite_double; }
+
+static_assert(Finite(max_finite_double) && Finite(-max_finite_double),
+              "the finite predicate must accept the binary64 endpoints");
 
 /** Hypot-equivalent 2-norm without relying on a device hypot overload. */
 MFEM_HOST_DEVICE inline double ScaledNorm2(const double x, const double y) noexcept
