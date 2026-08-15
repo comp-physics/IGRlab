@@ -309,3 +309,59 @@ function(dg_igr_add_hdg_cuda17_component)
                         PRIVATE umpire ${DG_IGR_REQUIRED_CUDA_TARGETS}
                                 ${HDG_PRIVATE_LINK_LIBRARIES})
 endfunction()
+
+function(dg_igr_configure_hdg_cuda_final_consumer target)
+  set(_dg_igr_hdg_final_consumers
+      dg_igr_hdg_runtime
+      hdg_smooth_periodic)
+  list(FIND _dg_igr_hdg_final_consumers "${target}"
+       _dg_igr_hdg_final_consumer_index)
+  if(_dg_igr_hdg_final_consumer_index EQUAL -1 OR NOT TARGET "${target}")
+    message(FATAL_ERROR
+            "HDG CUDA final consumer '${target}' is not a canonical executable target.")
+  endif()
+  if(NOT MFEM_USE_CUDA)
+    message(FATAL_ERROR
+            "HDG CUDA final consumer '${target}' requires a CUDA-enabled MFEM profile.")
+  endif()
+  dg_igr_require_hdg_cuda17_profile()
+
+  # Seed the final device-link closure before transitive static archives are
+  # appended.  The later transitive occurrence remains available for normal
+  # host archive extraction.
+  target_link_libraries("${target}" PRIVATE igr_mfem)
+  set_target_properties("${target}" PROPERTIES
+                        CUDA_STANDARD 17
+                        CUDA_STANDARD_REQUIRED ON
+                        CUDA_EXTENSIONS OFF
+                        CUDA_ARCHITECTURES 120
+                        CUDA_SEPARABLE_COMPILATION ON
+                        CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+  get_target_property(_dg_igr_hdg_final_links "${target}" LINK_LIBRARIES)
+  list(FIND _dg_igr_hdg_final_links "igr_mfem"
+       _dg_igr_hdg_final_igr_mfem_index)
+  get_target_property(_dg_igr_hdg_final_type "${target}" TYPE)
+  get_target_property(_dg_igr_hdg_final_standard "${target}" CUDA_STANDARD)
+  get_target_property(_dg_igr_hdg_final_required "${target}"
+                      CUDA_STANDARD_REQUIRED)
+  get_target_property(_dg_igr_hdg_final_extensions "${target}"
+                      CUDA_EXTENSIONS)
+  get_target_property(_dg_igr_hdg_final_architectures "${target}"
+                      CUDA_ARCHITECTURES)
+  get_target_property(_dg_igr_hdg_final_separable "${target}"
+                      CUDA_SEPARABLE_COMPILATION)
+  get_target_property(_dg_igr_hdg_final_resolve "${target}"
+                      CUDA_RESOLVE_DEVICE_SYMBOLS)
+  if(_dg_igr_hdg_final_igr_mfem_index EQUAL -1 OR
+     NOT _dg_igr_hdg_final_type STREQUAL "EXECUTABLE" OR
+     NOT _dg_igr_hdg_final_standard STREQUAL "17" OR
+     NOT _dg_igr_hdg_final_required OR
+     _dg_igr_hdg_final_extensions OR
+     NOT _dg_igr_hdg_final_architectures STREQUAL "120" OR
+     NOT _dg_igr_hdg_final_separable OR
+     NOT _dg_igr_hdg_final_resolve STREQUAL "ON")
+    message(FATAL_ERROR
+            "${target} must be a strict native-SM120 CUDA17 final executable that directly seeds igr_mfem and owns device-symbol resolution.")
+  endif()
+endfunction()

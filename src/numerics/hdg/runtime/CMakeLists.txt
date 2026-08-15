@@ -247,6 +247,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   if(MFEM_USE_CUDA)
     target_sources(dg_igr_hdg_runtime PRIVATE
       $<TARGET_OBJECTS:dg_igr_hdg_runtime_scalar_cuda_rank2_app>)
+    dg_igr_configure_hdg_cuda_final_consumer(dg_igr_hdg_runtime)
   endif()
   target_include_directories(dg_igr_hdg_runtime PRIVATE
                              "${PROJECT_SOURCE_DIR}/include")
@@ -268,12 +269,5 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   if(MFEM_USE_CUDA)
     target_link_libraries(dg_igr_hdg_runtime PRIVATE
                           dg_igr_hdg_runtime_cuda)
-    set_target_properties(dg_igr_hdg_runtime PROPERTIES
-      CUDA_STANDARD 17
-      CUDA_STANDARD_REQUIRED ON
-      CUDA_EXTENSIONS OFF
-      CUDA_ARCHITECTURES 120
-      CUDA_SEPARABLE_COMPILATION ON
-      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   endif()
 endif()
