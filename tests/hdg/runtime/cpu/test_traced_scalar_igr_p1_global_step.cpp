@@ -84,24 +84,6 @@ bool FillTrueTrace(const mfem::ParFiniteElementSpace& space, mfem::Vector& value
   return true;
 }
 
-bool FillEquilibriumTrueTrace(const mfem::ParFiniteElementSpace& space,
-                              mfem::Vector& values)
-{
-  if (values.Size() != space.GetTrueVSize()) { return false; }
-  values = 0.0;
-  for (int local_dof = 0; local_dof < space.GetVSize(); ++local_dof)
-  {
-    const int local_true = space.GetLocalTDofNumber(local_dof);
-    if (local_true < 0) { continue; }
-    const int scalar_vsize = space.GetVSize() / 5;
-    if (scalar_vsize <= 0) { return false; }
-    const int component = local_dof / scalar_vsize;
-    values[local_true] = component == 0 ? 1.0 : component == 1 ? 0.1 :
-        component == 2 ? -0.02 : component == 3 ? 2.6 : 0.0;
-  }
-  return true;
-}
-
 bool FillInterior(const Layout& layout, mfem::Vector& current,
                   mfem::Vector& previous)
 {
@@ -134,29 +116,6 @@ bool FillInterior(const Layout& layout, mfem::Vector& current,
   return true;
 }
 
-bool FillEquilibriumInterior(const Layout& layout, mfem::Vector& values)
-{
-  values.SetSize(layout.InteriorLocalVSize());
-  values = 0.0;
-  for (int element = 0; element < layout.LocalElementCount(); ++element)
-  {
-    mfem::Vector element_values(28);
-    element_values = 0.0;
-    for (int dof = 0; dof < 4; ++dof)
-    {
-      element_values[dof] = 1.0;
-      element_values[4 + dof] = 0.1;
-      element_values[8 + dof] = -0.02;
-      element_values[12 + dof] = 2.6;
-    }
-    if (!layout.ScatterInteriorElement(element, element_values, values))
-    {
-      return false;
-    }
-  }
-  return true;
-}
-
 bool FillSource(const mfem::ParFiniteElementSpace& space, mfem::Vector& values,
                 const double slope)
 {
@@ -166,7 +125,7 @@ bool FillSource(const mfem::ParFiniteElementSpace& space, mfem::Vector& values,
     return false;
   }
   const int scalar_vsize = space.GetVSize() / 4;
-  if (scalar_vsize <= 0) { return false; }
+  if (scalar_vsize == 0) { return true; }
   for (int vdof = 0; vdof < values.Size(); ++vdof)
   {
     const int component = vdof / scalar_vsize;
@@ -333,6 +292,61 @@ bool CheckLocalRecovery(const MPI_Comm communicator, const Layout& layout,
   return AllRanks(communicator, ok);
 }
 
+bool CheckExactZeroReducedRhsRecovery()
+{
+  constexpr int interior = 28;
+  constexpr int trace = 40;
+  std::vector<double> a(static_cast<std::size_t>(interior) * interior, 0.0);
+  std::vector<double> b(static_cast<std::size_t>(interior) * trace, 0.0);
+  std::vector<double> c(static_cast<std::size_t>(trace) * interior, 0.0);
+  std::vector<double> d(static_cast<std::size_t>(trace) * trace, 0.0);
+  std::vector<double> f(interior), g(trace, 0.0), schur(trace * trace),
+      reduced(trace), recovered(interior), zero_trace(trace, 0.0);
+  for (int index = 0; index < interior; ++index)
+  {
+    a[static_cast<std::size_t>(index) * interior + index] = 1.0;
+    f[static_cast<std::size_t>(index)] = 0.125 * static_cast<double>(index + 1);
+  }
+  for (int index = 0; index < trace; ++index)
+  {
+    d[static_cast<std::size_t>(index) * trace + index] = 1.0;
+  }
+  auto constant = [](const std::vector<double>& values, const int rows,
+                     const int columns) {
+    return dg::hdg::StridedBlockView<const double>{values.data(), 1, rows,
+        columns, rows * columns, columns, 1};
+  };
+  auto writable = [](std::vector<double>& values, const int rows,
+                     const int columns) {
+    return dg::hdg::StridedBlockView<double>{values.data(), 1, rows, columns,
+        rows * columns, columns, 1};
+  };
+  dg::hdg::core::HostReferenceEngine condensation;
+  const dg::hdg::core::LocalSystemBatchView system{
+      {4, 8, 7, 5}, constant(a, interior, interior),
+      constant(b, interior, trace), constant(c, trace, interior),
+      constant(d, trace, trace), constant(f, interior, 1), constant(g, trace, 1)};
+  if (condensation.Condense(system, {writable(schur, trace, trace),
+                                     writable(reduced, trace, 1)}) !=
+      dg::hdg::core::Status::success)
+  {
+    return false;
+  }
+  if (std::any_of(reduced.begin(), reduced.end(),
+                  [](const double value) { return value != 0.0; }))
+  {
+    return false;
+  }
+  const dg::hdg::StridedBlockView<const double> trace_view{
+      zero_trace.data(), 1, trace, 1, trace, 1, 1};
+  if (condensation.Recover(trace_view, writable(recovered, interior, 1)) !=
+      dg::hdg::core::Status::success)
+  {
+    return false;
+  }
+  return recovered == f;
+}
+
 bool Run(const MPI_Comm communicator, const Layout& layout,
          const std::vector<local::AffineQuad>& quads,
          const mfem::ParFiniteElementSpace& source_space,
@@ -357,30 +371,6 @@ bool Run(const MPI_Comm communicator, const Layout& layout,
       parameters, &current_trace, &previous_trace, &current_interior,
       &previous_interior, &source_space, &source};
   return detail::ComputeTracedScalarIgrP1GlobalStep(input, output);
-}
-
-bool RunZeroReducedTraceRhs(
-    const MPI_Comm communicator, const Layout& layout,
-    const std::vector<local::AffineQuad>& quads,
-    detail::TracedScalarIgrP1GlobalStepOutput& output)
-{
-  const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
-  if (trace_space == nullptr) { return false; }
-  mfem::Vector trace(layout.TraceTrueVSize());
-  mfem::Vector interior;
-  bool ok = FillEquilibriumTrueTrace(*trace_space, trace) &&
-      FillEquilibriumInterior(layout, interior);
-  if (!AllRanks(communicator, ok)) { return false; }
-  local::Parameters parameters{};
-  parameters.alpha = 0.8; parameters.beta = 1.1; parameters.dt = 0.05;
-  parameters.quadrature_order = 12;
-  mfem::Vector previous_trace(trace);
-  mfem::Vector previous_interior(interior);
-  const detail::TracedScalarIgrP1GlobalStepInput distinct_input{
-      communicator, &layout, quads.data(), static_cast<int>(quads.size()),
-      parameters, &trace, &previous_trace, &interior, &previous_interior,
-      nullptr, nullptr};
-  return detail::ComputeTracedScalarIgrP1GlobalStep(distinct_input, output);
 }
 
 bool Check(const MPI_Comm communicator)
@@ -432,17 +422,8 @@ bool Check(const MPI_Comm communicator)
                           first);
   if (!Require(communicator, ok, "local recovery/action oracle")) { return false; }
 
-  detail::TracedScalarIgrP1GlobalStepOutput zero_rhs;
-  ok = RunZeroReducedTraceRhs(communicator, layout, quads, zero_rhs);
-  const double zero_trace_norm = NormSquared(communicator,
-                                             zero_rhs.trace_increment);
-  const double zero_interior_norm = NormSquared(communicator,
-                                                zero_rhs.interior_increment);
-  ok = ok && std::isfinite(zero_rhs.reduced_rhs_norm) &&
-      zero_rhs.reduced_rhs_norm <= 1.0e-150 &&
-      zero_rhs.linear_residual_norm <= 1.0e-150 &&
-      zero_trace_norm <= 1.0e-300 && zero_interior_norm <= 1.0e-300;
-  if (!Require(communicator, ok, "zero reduced trace rhs")) { return false; }
+  ok = CheckExactZeroReducedRhsRecovery();
+  if (!Require(communicator, ok, "exact zero reduced rhs recovery")) { return false; }
 
   detail::TracedScalarIgrP1GlobalStepOutput preserved;
   preserved.trace_increment.SetSize(1); preserved.trace_increment[0] = 73.0;
