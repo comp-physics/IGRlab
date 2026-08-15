@@ -168,25 +168,18 @@ bool SampleSource(const mfem::ParFiniteElementSpace& space,
                   const mfem::IntegrationRule& rule, std::vector<double>& samples)
 {
   samples.assign(static_cast<std::size_t>(rule.GetNPoints()) * 4, 0.0);
-  mfem::Array<int> vdofs;
-  space.GetElementVDofs(element, vdofs);
-  const mfem::FiniteElement* const finite_element = space.GetFE(element);
-  if (finite_element == nullptr || finite_element->GetDof() != 4 ||
-      vdofs.Size() != 16) { return false; }
-  mfem::Vector shape(4);
+  if (coefficients.Size() != space.GetVSize()) { return false; }
+  mfem::ParGridFunction source_field(
+      const_cast<mfem::ParFiniteElementSpace*>(&space));
+  source_field = coefficients;
+  mfem::Vector value(4);
   for (int point = 0; point < rule.GetNPoints(); ++point)
   {
-    finite_element->CalcShape(rule.IntPoint(point), shape);
+    source_field.GetVectorValue(element, rule.IntPoint(point), value);
+    if (value.Size() != 4) { return false; }
     for (int component = 0; component < 4; ++component)
     {
-      for (int dof = 0; dof < 4; ++dof)
-      {
-        double sign = 1.0;
-        const int vdof = DecodeSigned(vdofs[component * 4 + dof], sign);
-        if (vdof < 0 || vdof >= coefficients.Size()) { return false; }
-        samples[static_cast<std::size_t>(point) * 4 + component] +=
-            shape[dof] * sign * coefficients[vdof];
-      }
+      samples[static_cast<std::size_t>(point) * 4 + component] = value[component];
     }
   }
   for (const double value : samples)
