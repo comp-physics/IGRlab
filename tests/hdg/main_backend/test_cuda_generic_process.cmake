@@ -4,12 +4,19 @@ if(NOT DEFINED HDG_MAIN_EXECUTABLE OR NOT DEFINED HDG_MAIN_OUTPUT OR
   message(FATAL_ERROR "CUDA main executable, output, mesh, ranks, and MPI launcher are required.")
 endif()
 
+if(NOT DEFINED HDG_MAIN_ORDER)
+  set(HDG_MAIN_ORDER 1)
+endif()
+if(NOT DEFINED HDG_MAIN_N)
+  set(HDG_MAIN_N 3)
+endif()
+
 file(REMOVE_RECURSE "${HDG_MAIN_OUTPUT}")
 set(_arguments
   --discretization hdg
   --device cuda
   --mesh "${HDG_MAIN_MESH}"
-  --order 1
+  --order "${HDG_MAIN_ORDER}"
   --serial-refine 0
   --parallel-refine 0
   --time-step 0.05
@@ -39,13 +46,14 @@ else()
 endif()
 
 if(NOT _status EQUAL 0 OR
-   NOT _stdout MATCHES "\\[hdg-main\\] status=Success.*step=2" OR
+   NOT _stdout MATCHES "\\[hdg-main\\] status=Success.*step=2.*time=0\\.1" OR
    NOT _stderr STREQUAL "")
   message(FATAL_ERROR
     "generic CUDA HDG main execution failed: ${_status}\n${_stdout}\n${_stderr}")
 endif()
 
-set(_collection "dgsem_smooth_advection_periodic_hdg_cuda_p_1_n_3")
+set(_collection
+  "dgsem_smooth_advection_periodic_hdg_cuda_p_${HDG_MAIN_ORDER}_n_${HDG_MAIN_N}")
 set(_root "${HDG_MAIN_OUTPUT}/${_collection}")
 if(HDG_MAIN_NO_VTK)
   file(GLOB_RECURSE _artifacts LIST_DIRECTORIES FALSE
@@ -65,8 +73,7 @@ set(_times 0 0.05 0.1)
 foreach(_index RANGE 0 2)
   list(GET _cycles ${_index} _cycle)
   list(GET _times ${_index} _time)
-  if(NOT EXISTS "${_root}/Cycle${_cycle}/data.pvtu" OR
-     NOT EXISTS "${_root}/Cycle${_cycle}/proc000000.vtu")
+  if(NOT EXISTS "${_root}/Cycle${_cycle}/data.pvtu")
     message(FATAL_ERROR "missing committed CUDA HDG output cycle ${_cycle}")
   endif()
   if(NOT _pvd_text MATCHES
@@ -74,17 +81,27 @@ foreach(_index RANGE 0 2)
     message(FATAL_ERROR "CUDA HDG PVD misses committed time ${_time} cycle ${_cycle}")
   endif()
   file(READ "${_root}/Cycle${_cycle}/data.pvtu" _pvtu_text)
-  file(READ "${_root}/Cycle${_cycle}/proc000000.vtu" _vtu_text)
   if(NOT _pvtu_text MATCHES "Name=\\\"conservative\\\"" OR
-     NOT _pvtu_text MATCHES "NumberOfComponents=\\\"4\\\"" OR
-     NOT _vtu_text MATCHES "Name=\\\"conservative\\\"" OR
-     NOT _vtu_text MATCHES "NumberOfComponents=\\\"4\\\"")
-    message(FATAL_ERROR "CUDA HDG output cycle ${_cycle} misses four-component conservative data")
+     NOT _pvtu_text MATCHES "NumberOfComponents=\\\"4\\\"")
+    message(FATAL_ERROR "CUDA HDG PVTU cycle ${_cycle} misses four-component conservative data")
   endif()
-  if(HDG_MAIN_RANKS EQUAL 2 AND
-     NOT EXISTS "${_root}/Cycle${_cycle}/proc000001.vtu")
-    message(FATAL_ERROR "missing rank-one CUDA HDG output for cycle ${_cycle}")
-  endif()
+  math(EXPR _last_rank "${HDG_MAIN_RANKS} - 1")
+  foreach(_rank RANGE 0 ${_last_rank})
+    set(_rank_text "000000${_rank}")
+    string(LENGTH "${_rank_text}" _rank_text_length)
+    math(EXPR _rank_suffix_start "${_rank_text_length} - 6")
+    string(SUBSTRING "${_rank_text}" ${_rank_suffix_start} 6 _rank_suffix)
+    set(_vtu "${_root}/Cycle${_cycle}/proc${_rank_suffix}.vtu")
+    if(NOT EXISTS "${_vtu}")
+      message(FATAL_ERROR "missing CUDA HDG VTU piece for rank ${_rank}: ${_vtu}")
+    endif()
+    file(READ "${_vtu}" _vtu_text)
+    if(NOT _vtu_text MATCHES "Name=\\\"conservative\\\"" OR
+       NOT _vtu_text MATCHES "NumberOfComponents=\\\"4\\\"")
+      message(FATAL_ERROR
+        "CUDA HDG VTU piece for rank ${_rank} cycle ${_cycle} misses four-component conservative data")
+    endif()
+  endforeach()
 endforeach()
 string(REGEX MATCHALL "Cycle[0-9][0-9][0-9][0-9][0-9][0-9]/data.pvtu"
   _pvd_entries "${_pvd_text}")
