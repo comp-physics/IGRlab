@@ -750,13 +750,36 @@ bool Check(const MPI_Comm communicator)
   ok = periodic_layout.IsUsable() && periodic_trace != nullptr &&
       BuildAffineQuads(periodic_mesh, periodic_quads);
   if (!Require(communicator, ok, "periodic layout/geometry setup")) { return false; }
-  ok = FillUniformTrace(periodic_mesh, *periodic_trace, periodic_current_trace) &&
-      FillUniformTrace(periodic_mesh, *periodic_trace, periodic_previous_trace) &&
-      CheckUniformTraceGather(periodic_layout, periodic_current_trace) &&
-      CheckUniformTraceGather(periodic_layout, periodic_previous_trace) &&
-      FillUniformInterior(periodic_layout, periodic_current_interior) &&
-      FillUniformInterior(periodic_layout, periodic_previous_interior);
-  if (!Require(communicator, ok, "periodic oriented trace setup")) { return false; }
+  ok = FillUniformTrace(periodic_mesh, *periodic_trace, periodic_current_trace);
+  if (!Require(communicator, ok, "periodic current trace projection"))
+  {
+    return false;
+  }
+  ok = FillUniformTrace(periodic_mesh, *periodic_trace, periodic_previous_trace);
+  if (!Require(communicator, ok, "periodic previous trace projection"))
+  {
+    return false;
+  }
+  ok = CheckUniformTraceGather(periodic_layout, periodic_current_trace);
+  if (!Require(communicator, ok, "periodic current trace gather"))
+  {
+    return false;
+  }
+  ok = CheckUniformTraceGather(periodic_layout, periodic_previous_trace);
+  if (!Require(communicator, ok, "periodic previous trace gather"))
+  {
+    return false;
+  }
+  ok = FillUniformInterior(periodic_layout, periodic_current_interior);
+  if (!Require(communicator, ok, "periodic current interior setup"))
+  {
+    return false;
+  }
+  ok = FillUniformInterior(periodic_layout, periodic_previous_interior);
+  if (!Require(communicator, ok, "periodic previous interior setup"))
+  {
+    return false;
+  }
   ok = ComputeRawUncondensedResidual(communicator, periodic_layout, periodic_quads,
       nullptr, nullptr, raw_parameters, periodic_current_trace,
       periodic_previous_trace, periodic_current_interior,
