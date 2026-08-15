@@ -746,15 +746,23 @@ bool DirectFixedOracleRejected(const CudaConfig& config, const int ranks)
   CudaRunEvidence evidence{};
   if (ranks == 1)
   {
-    PersistentCudaSmoothEulerEngine<BorrowedCudaRank1OneGpuRuntimeSelection>
-        engine(config);
-    return !engine.Initialize(evidence) &&
-        evidence.status == CudaRunStatus::setup_failure;
+    auto engine = std::make_unique<
+        PersistentCudaSmoothEulerEngine<
+            BorrowedCudaRank1OneGpuRuntimeSelection>>(config);
+    return !engine->Initialize(evidence) &&
+        evidence.status == CudaRunStatus::setup_failure &&
+        evidence.setup_origin ==
+            dg::hdg::runtime::FailureReason::collective_protocol &&
+        evidence.device == -1;
   }
-  PersistentCudaSmoothEulerEngine<
-      BorrowedCudaRank2OneGpuHostStagedRuntimeSelection> engine(config);
-  return !engine.Initialize(evidence) &&
-      evidence.status == CudaRunStatus::setup_failure;
+  auto engine = std::make_unique<
+      PersistentCudaSmoothEulerEngine<
+          BorrowedCudaRank2OneGpuHostStagedRuntimeSelection>>(config);
+  return !engine->Initialize(evidence) &&
+      evidence.status == CudaRunStatus::setup_failure &&
+      evidence.setup_origin ==
+          dg::hdg::runtime::FailureReason::collective_protocol &&
+      evidence.device == -1;
 }
 
 bool CheckNegatives(const int ranks)
@@ -766,9 +774,9 @@ bool CheckNegatives(const int ranks)
 
   CudaConfig nonperiodic = BorrowedConfig(
       boundary, ranks, smoke_polynomial_order, smoke_elements_per_direction);
-  CudaConfig wrong_shape = BorrowedConfig(
+  CudaConfig invalid_mesh_n = BorrowedConfig(
       periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction);
-  wrong_shape.mesh_n = 4;
+  invalid_mesh_n.mesh_n = -1;
   CudaConfig p3 = BorrowedConfig(
       periodic, ranks, 3, smoke_elements_per_direction);
   CudaConfig wrong_device = BorrowedConfig(
@@ -826,7 +834,7 @@ bool CheckNegatives(const int ranks)
 
   GenericEulerHdgCudaSession one, two, three, four, five, six, seven, eight;
   const bool nonperiodic_rejected = Rejected(one, nonperiodic);
-  const bool wrong_shape_rejected = Rejected(two, wrong_shape);
+  const bool invalid_mesh_n_rejected = Rejected(two, invalid_mesh_n);
   const bool p3_rejected = Rejected(three, p3);
   const bool wrong_device_rejected = Rejected(four, wrong_device);
   const bool wrong_ranks_rejected = Rejected(five, wrong_ranks);
@@ -846,7 +854,7 @@ bool CheckNegatives(const int ranks)
   const bool nonfinite_source_rejected = Rejected(fourteen, nonfinite_source);
   const bool nonphysical_initial_rejected = Rejected(fifteen,
                                                       nonphysical_initial);
-  bool rejected = nonperiodic_rejected && wrong_shape_rejected && p3_rejected &&
+  bool rejected = nonperiodic_rejected && invalid_mesh_n_rejected && p3_rejected &&
       wrong_device_rejected && wrong_ranks_rejected && wrong_dt_rejected &&
       capture_oracle_rejected && direct_capture_oracle_rejected &&
       injection_rejected && null_initial_rejected &&
