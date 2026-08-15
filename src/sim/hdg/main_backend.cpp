@@ -588,7 +588,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       dg::hdg::generic::RequiredCapabilities(backend),
       state_io->ImportPublishedInitialState(),
       {nullptr, 0, dg::hdg::generic::euler_2d_conserved_components},
-      boundary->View()};
+      boundary->View(),
+      {dg::hdg::generic::RegularizationKind::none, 0.0, 0.0}};
 
     std::unique_ptr<GenericEulerHdgCpuSession> session;
     try
