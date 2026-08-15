@@ -155,7 +155,16 @@ CudaConfig BorrowedDataConfig(mfem::ParMesh& mesh, const int ranks,
                               const int order, const int n,
                               const HostFields& fields)
 {
-  CudaConfig config = BorrowedConfig(mesh, ranks, order, n);
+  CudaConfig config{};
+  config.order = order;
+  config.mesh_n = n;
+  config.requested_device = 0;
+  config.expected_rank_count = ranks;
+  config.require_host_staged_rank2 = ranks == 2;
+  config.use_borrowed_topology = true;
+  config.borrowed_mesh = &mesh;
+  config.borrowed_communicator = MPI_COMM_WORLD;
+  config.use_borrowed_host_inputs = true;
   config.borrowed_initial = {fields.initial.data(), fields.scalar_count,
                              conserved_components};
   config.borrowed_source = fields.source.empty()
@@ -558,6 +567,53 @@ bool CheckP2Admission(const int ranks)
              session.coordinates().step == 0 && session.coordinates().dt == 0.0);
 }
 
+bool CheckRefinedDynamicCapacity(const int ranks)
+{
+  constexpr int refined_elements_per_direction = 6;
+  mfem::Mesh serial = PeriodicSquareMesh(refined_elements_per_direction);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
+  mesh.UniformRefinement();
+
+  mfem::DG_Interface_FECollection trace_collection(
+      functional_polynomial_order, dimension, mfem::FiniteElement::VALUE,
+      mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace trace_space(
+      &mesh, &trace_collection, conserved_components, mfem::Ordering::byNODES);
+  const bool exceeds_fixed_capacity = mesh.GetNE() > maximum_rank_elements &&
+      trace_space.GetTrueVSize() > maximum_true_trace_dofs;
+
+  HostFields fields = NonuniformHostFields(
+      mesh, functional_polynomial_order, true);
+  const std::vector<double> initial_before = fields.initial;
+  GenericEulerHdgCudaSession session;
+  const auto initialized = session.Initialize(BorrowedDataConfig(
+      mesh, ranks, functional_polynomial_order,
+      refined_elements_per_direction, fields));
+  const auto coordinates_before_export = session.coordinates();
+
+  // Generic initialization owns persistent copies, so the caller can release
+  // both field buffers before observing the committed initial interior.
+  std::fill(fields.initial.begin(), fields.initial.end(), -21.0);
+  std::fill(fields.source.begin(), fields.source.end(), -22.0);
+  fields.initial.clear();
+  fields.source.clear();
+  fields.initial.shrink_to_fit();
+  fields.source.shrink_to_fit();
+
+  std::vector<double> committed(initial_before.size(), -23.0);
+  const bool exported = session.ExportCommittedInterior(
+      {committed.data(), fields.scalar_count, conserved_components});
+  const auto coordinates_after_export = session.coordinates();
+  return All(exceeds_fixed_capacity &&
+             initialized.status == HdgEulerSessionStatus::initialized &&
+             exported && FullyFiniteOverwritten(committed, -23.0) &&
+             SameValues(committed, initial_before) &&
+             coordinates_after_export.step == coordinates_before_export.step &&
+             coordinates_after_export.generation ==
+                 coordinates_before_export.generation &&
+             coordinates_after_export.time == coordinates_before_export.time);
+}
+
 bool CheckLegacyFacadeAdmission(const int ranks)
 {
   mfem::Mesh serial = PeriodicSquareMesh(smoke_elements_per_direction);
@@ -914,7 +970,8 @@ int main(int argc, char** argv)
           ranks, functional_polynomial_order, functional_elements_per_direction) &&
           CheckBorrowedLaggedLlfHighWave(
               ranks, functional_polynomial_order,
-              functional_elements_per_direction);
+              functional_elements_per_direction) &&
+          CheckRefinedDynamicCapacity(ranks);
     }
     else
     {
@@ -928,8 +985,10 @@ int main(int argc, char** argv)
           ranks, smoke_polynomial_order, smoke_elements_per_direction);
       const bool high_wave = CheckBorrowedLaggedLlfHighWave(
           ranks, smoke_polynomial_order, smoke_elements_per_direction);
+      const bool refined_capacity = CheckRefinedDynamicCapacity(ranks);
       pass = transaction && foreign_authority && address_reuse &&
-          session_identity && rank_two && legacy_facade && host_data && high_wave;
+          session_identity && rank_two && legacy_facade && host_data && high_wave &&
+          refined_capacity;
     }
   }
   if (!pass && ranks > 0)
