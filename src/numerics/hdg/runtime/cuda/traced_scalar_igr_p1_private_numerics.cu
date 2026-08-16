@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -36,10 +37,11 @@ bool WorldFreshRange(const bool fresh, int& minimum, int& maximum) noexcept
   const int value = fresh ? 1 : 0;
   minimum = 0;
   maximum = 0;
-  return MPI_Allreduce(&value, &minimum, 1, MPI_INT, MPI_MIN,
-                       MPI_COMM_WORLD) == MPI_SUCCESS &&
-      MPI_Allreduce(&value, &maximum, 1, MPI_INT, MPI_MAX,
-                    MPI_COMM_WORLD) == MPI_SUCCESS;
+  const int minimum_status = MPI_Allreduce(&value, &minimum, 1, MPI_INT, MPI_MIN,
+                                           MPI_COMM_WORLD);
+  const int maximum_status = MPI_Allreduce(&value, &maximum, 1, MPI_INT, MPI_MAX,
+                                           MPI_COMM_WORLD);
+  return minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS;
 }
 
 bool Add(const std::size_t a, const std::size_t b, std::size_t& out) noexcept
@@ -107,6 +109,19 @@ bool CopyInto(std::vector<unsigned char>& storage, const std::int64_t offset,
 }
 
 int Sign(const int value) noexcept { return value < 0 ? -1 : 1; }
+
+int Decode(const int value) noexcept
+{
+  return value == std::numeric_limits<int>::min() ? -1 :
+      (value < 0 ? -1 - value : value);
+}
+
+bool BigIntToWire(const HYPRE_BigInt value, std::uint64_t& wire) noexcept
+{
+  if (value < 0) return false;
+  wire = static_cast<std::uint64_t>(value);
+  return static_cast<HYPRE_BigInt>(wire) == value;
+}
 
 bool ValidateCsr(mfem::SparseMatrix& matrix, const int rows) noexcept
 {
@@ -182,6 +197,14 @@ struct RetainedTopology::Implementation final
   trace::DGInterfaceTraceExchangePlan trace_exchange_plan;
   std::vector<int> signed_interior_vdofs;
   std::vector<int> signed_trace_vdofs;
+  std::vector<RetainedCsrSlot> csr_slots;
+  std::vector<RetainedCsrSlot> owned_csr_slots;
+  std::vector<ValueExchangeSlot> outgoing_value_slots;
+  std::vector<ValueExchangeSlot> incoming_value_slots;
+  std::vector<std::uint64_t> outgoing_pair_wire;
+  std::vector<int> outgoing_counts, outgoing_offsets;
+  std::vector<int> incoming_counts, incoming_offsets;
+  std::vector<double> outgoing_values, incoming_staging, published_incoming_values;
   std::vector<double> vertices, volume_quadrature, segment_quadrature;
   ArenaPlan arena;
   void* integer_arena = nullptr;
@@ -189,6 +212,9 @@ struct RetainedTopology::Implementation final
   bool integer_release_attempted = false;
   bool double_release_attempted = false;
   std::unique_ptr<mfem::HypreParMatrix> matrix;
+  mfem::SparseMatrix csr_diagonal, csr_offdiagonal;
+  HYPRE_BigInt* csr_offd_columns = nullptr;
+  HYPRE_BigInt csr_row_begin = -1, csr_row_end = -1;
   std::unique_ptr<mfem::HypreParVector> rhs, solution, action;
   std::unique_ptr<mfem::HypreILU> ilu;
   std::unique_ptr<mfem::HypreGMRES> gmres;
@@ -228,6 +254,18 @@ struct RetainedTopology::Implementation final
         std::isfinite(prime_maximum_solution_error) &&
         arena.interior_values == signed_interior_vdofs.size() &&
         arena.trace_values == signed_trace_vdofs.size() &&
+        csr_slots.size() == arena.symbolic_slots &&
+        owned_csr_slots.size() + outgoing_value_slots.size() == csr_slots.size() &&
+        outgoing_pair_wire.size() == 2 * outgoing_value_slots.size() &&
+        outgoing_counts.size() == incoming_counts.size() &&
+        outgoing_offsets.size() == outgoing_counts.size() + 1 &&
+        incoming_offsets.size() == incoming_counts.size() + 1 &&
+        !outgoing_offsets.empty() && !incoming_offsets.empty() &&
+        outgoing_offsets.back() == static_cast<int>(outgoing_value_slots.size()) &&
+        incoming_offsets.back() == static_cast<int>(incoming_value_slots.size()) &&
+        outgoing_values.size() == outgoing_value_slots.size() &&
+        incoming_staging.size() == incoming_value_slots.size() &&
+        published_incoming_values.size() == incoming_value_slots.size() &&
         arena.integer_physical_bytes >= arena.integer_logical_bytes &&
         arena.double_physical_bytes >= arena.double_logical_bytes &&
         matrix->Height() == trace_space->GetTrueVSize() &&
@@ -240,6 +278,63 @@ struct RetainedTopology::Implementation final
 
 namespace
 {
+bool CacheCsrViews(RetainedTopology::Implementation& state) noexcept
+{
+  try
+  {
+    if (!state.matrix || !state.trace_space) return false;
+    state.matrix->HostReadWrite();
+    state.csr_offd_columns = nullptr;
+    state.matrix->GetDiag(state.csr_diagonal);
+    state.matrix->GetOffd(state.csr_offdiagonal, state.csr_offd_columns);
+    const int rows = state.csr_diagonal.Height();
+    const HYPRE_BigInt* starts = state.matrix->GetRowStarts();
+    const int rank = state.trace_exchange_plan.map.dofs.rank;
+    if (!starts || rows != state.trace_space->GetTrueVSize() || rows < 0 ||
+        state.csr_offdiagonal.Height() != rows ||
+        !ValidateCsr(state.csr_diagonal, rows) || !ValidateCsr(state.csr_offdiagonal, rows)) return false;
+    state.csr_row_begin = HYPRE_AssumedPartitionCheck() ? starts[0] : starts[rank];
+    if (state.csr_row_begin < 0 ||
+        (rows > 0 && state.csr_row_begin > std::numeric_limits<HYPRE_BigInt>::max() - rows)) return false;
+    state.csr_row_end = state.csr_row_begin + rows;
+    return state.csr_row_end >= state.csr_row_begin;
+  }
+  catch (...) { return false; }
+}
+
+bool FindCsrEntry(RetainedTopology::Implementation& state,
+                  const HYPRE_BigInt row, const HYPRE_BigInt column,
+                  int& entry, bool& is_offd) noexcept
+{
+  entry = -1; is_offd = false;
+  try
+  {
+    const int rows = state.csr_diagonal.Height();
+    const int* di = state.csr_diagonal.GetI(); const int* dj = state.csr_diagonal.GetJ();
+    const int* oi = state.csr_offdiagonal.GetI(); const int* oj = state.csr_offdiagonal.GetJ();
+    if (rows < 0 || state.csr_offdiagonal.Height() != rows ||
+        state.csr_row_begin < 0 || state.csr_row_end < state.csr_row_begin ||
+        row < state.csr_row_begin || row >= state.csr_row_end ||
+        (rows > 0 && di == nullptr)) return false;
+    const int local_row = static_cast<int>(row - state.csr_row_begin);
+    if (column >= state.csr_row_begin && column < state.csr_row_end)
+    {
+      if (dj == nullptr) return false;
+      const int local_column = static_cast<int>(column - state.csr_row_begin);
+      for (int i = di[local_row]; i < di[local_row + 1]; ++i)
+        if (dj[i] == local_column) { entry = i; return true; }
+      return false;
+    }
+    if (oi == nullptr || oj == nullptr || state.csr_offd_columns == nullptr) return false;
+    for (int i = oi[local_row]; i < oi[local_row + 1]; ++i)
+      if (oj[i] >= 0 && oj[i] < state.csr_offdiagonal.Width() &&
+          state.csr_offd_columns[oj[i]] == column)
+      { entry = i; is_offd = true; return true; }
+  }
+  catch (...) { return false; }
+  return false;
+}
+
 bool AdmitLocalMesh(mfem::ParMesh& mesh) noexcept
 {
   try
@@ -360,6 +455,175 @@ bool BuildLocalMapsGeometryQuadrature(RetainedTopology::Implementation& state,
   catch (...) { return false; }
 }
 
+bool BuildRetainedCsrMetadata(RetainedTopology::Implementation& state) noexcept
+{
+  try
+  {
+    const auto& map = state.trace_exchange_plan.map.dofs;
+    const int ranks = map.rank_count;
+    const int rank = map.rank;
+    std::size_t slot_count = 0;
+    if (ranks <= 0 || rank < 0 || rank >= ranks ||
+        !Multiply(state.arena.element_count, 1600, slot_count) ||
+        state.signed_trace_vdofs.size() != state.arena.trace_values ||
+        map.entries.size() != static_cast<std::size_t>(state.trace_space->GetVSize()) ||
+        !Resize(state.csr_slots, slot_count)) return false;
+    state.owned_csr_slots.clear(); state.incoming_value_slots.clear();
+    state.outgoing_value_slots.clear(); state.outgoing_pair_wire.clear();
+    for (std::size_t element = 0; element < state.arena.element_count; ++element)
+      for (int row = 0; row < 40; ++row)
+        for (int column = 0; column < 40; ++column)
+        {
+          const std::size_t source = element * 1600 +
+              static_cast<std::size_t>(row) * 40 + static_cast<std::size_t>(column);
+          const int signed_row = state.signed_trace_vdofs[element * 40 + row];
+          const int signed_column = state.signed_trace_vdofs[element * 40 + column];
+          const int local_row = Decode(signed_row);
+          const int local_column = Decode(signed_column);
+          if (local_row < 0 || local_column < 0 ||
+              static_cast<std::size_t>(local_row) >= map.entries.size() ||
+              static_cast<std::size_t>(local_column) >= map.entries.size()) return false;
+          const auto& row_entry = map.entries[static_cast<std::size_t>(local_row)];
+          const auto& column_entry = map.entries[static_cast<std::size_t>(local_column)];
+          std::uint64_t global_row = 0, global_column = 0;
+          if (row_entry.global_true_dof < 0 || column_entry.global_true_dof < 0 ||
+              row_entry.owner_rank < 0 || row_entry.owner_rank >= ranks ||
+              !BigIntToWire(static_cast<HYPRE_BigInt>(row_entry.global_true_dof), global_row) ||
+              !BigIntToWire(static_cast<HYPRE_BigInt>(column_entry.global_true_dof), global_column))
+            return false;
+          RetainedTopology::RetainedCsrSlot slot;
+          slot.source_slot = static_cast<std::uint64_t>(source);
+          slot.signed_row_vdof = signed_row;
+          slot.signed_column_vdof = signed_column;
+          slot.global_row = global_row; slot.global_column = global_column;
+          slot.owner_rank = row_entry.owner_rank;
+          slot.row_sign = Sign(signed_row); slot.column_sign = Sign(signed_column);
+          if (slot.owner_rank == rank)
+          {
+            if (!FindCsrEntry(state, static_cast<HYPRE_BigInt>(global_row),
+                              static_cast<HYPRE_BigInt>(global_column),
+                              slot.csr_entry, slot.csr_entry_is_offd)) return false;
+            state.owned_csr_slots.push_back(slot);
+          }
+          else
+          {
+            state.outgoing_value_slots.push_back({slot.source_slot, slot.owner_rank, -1, false});
+            state.outgoing_pair_wire.push_back(global_row);
+            state.outgoing_pair_wire.push_back(global_column);
+          }
+          state.csr_slots[source] = slot;
+        }
+    state.arena.symbolic_slots = slot_count;
+    if (state.outgoing_value_slots.size() > static_cast<std::size_t>(std::numeric_limits<int>::max() / 2) ||
+        state.outgoing_pair_wire.size() != 2 * state.outgoing_value_slots.size()) return false;
+    std::vector<std::size_t> order(state.outgoing_value_slots.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::stable_sort(order.begin(), order.end(), [&](const std::size_t left, const std::size_t right)
+      { return state.outgoing_value_slots[left].peer_rank < state.outgoing_value_slots[right].peer_rank; });
+    std::vector<RetainedTopology::ValueExchangeSlot> sorted_slots(
+        state.outgoing_value_slots.size());
+    std::vector<std::uint64_t> sorted_wire(state.outgoing_pair_wire.size());
+    for (std::size_t index = 0; index < order.size(); ++index)
+    {
+      sorted_slots[index] = state.outgoing_value_slots[order[index]];
+      sorted_wire[2 * index] = state.outgoing_pair_wire[2 * order[index]];
+      sorted_wire[2 * index + 1] = state.outgoing_pair_wire[2 * order[index] + 1];
+    }
+    state.outgoing_value_slots.swap(sorted_slots); state.outgoing_pair_wire.swap(sorted_wire);
+    if (!Resize(state.incoming_counts, static_cast<std::size_t>(ranks)) ||
+        !Resize(state.incoming_offsets, static_cast<std::size_t>(ranks) + 1) ||
+        !Resize(state.outgoing_counts, static_cast<std::size_t>(ranks)) ||
+        !Resize(state.outgoing_offsets, static_cast<std::size_t>(ranks) + 1)) return false;
+    std::fill(state.incoming_counts.begin(), state.incoming_counts.end(), 0);
+    std::fill(state.outgoing_counts.begin(), state.outgoing_counts.end(), 0);
+    for (const auto& slot : state.outgoing_value_slots)
+    {
+      if (slot.peer_rank < 0 || slot.peer_rank >= ranks || slot.peer_rank == rank ||
+          state.outgoing_counts[static_cast<std::size_t>(slot.peer_rank)] == std::numeric_limits<int>::max()) return false;
+      ++state.outgoing_counts[static_cast<std::size_t>(slot.peer_rank)];
+    }
+    for (int peer = 0; peer < ranks; ++peer)
+    {
+      if (peer > 0 && state.outgoing_offsets[static_cast<std::size_t>(peer - 1)] >
+          std::numeric_limits<int>::max() - state.outgoing_counts[static_cast<std::size_t>(peer - 1)]) return false;
+      state.outgoing_offsets[static_cast<std::size_t>(peer)] = peer == 0 ? 0 :
+          state.outgoing_offsets[static_cast<std::size_t>(peer - 1)] + state.outgoing_counts[static_cast<std::size_t>(peer - 1)];
+    }
+    state.outgoing_offsets[static_cast<std::size_t>(ranks)] = static_cast<int>(state.outgoing_value_slots.size());
+    return true;
+  }
+  catch (...) { return false; }
+}
+
+bool BuildValueExchangePlan(RetainedTopology::Implementation& state) noexcept
+{
+  const int ranks = state.trace_exchange_plan.map.dofs.rank_count;
+  bool local_ready = ranks > 0 && state.outgoing_pair_wire.size() == 2 * state.outgoing_value_slots.size();
+  if (!WorldAll(local_ready)) return false;
+  bool collective_ok = MPI_Alltoall(state.outgoing_counts.data(), 1, MPI_INT,
+      state.incoming_counts.data(), 1, MPI_INT, MPI_COMM_WORLD) == MPI_SUCCESS;
+  if (!WorldAll(collective_ok)) return false;
+  std::size_t incoming = 0;
+  local_ready = true;
+  for (int peer = 0; peer < ranks; ++peer)
+  {
+    const int count = state.incoming_counts[static_cast<std::size_t>(peer)];
+    local_ready = count >= 0 && incoming <= static_cast<std::size_t>(std::numeric_limits<int>::max()) - static_cast<std::size_t>(count) && local_ready;
+    if (local_ready) { state.incoming_offsets[static_cast<std::size_t>(peer)] = static_cast<int>(incoming); incoming += static_cast<std::size_t>(count); }
+  }
+  if (ranks > 0) state.incoming_offsets[static_cast<std::size_t>(ranks)] = static_cast<int>(incoming);
+  std::vector<int> send_key_counts, receive_key_counts, send_key_offsets, receive_key_offsets;
+  try
+  {
+    send_key_counts.resize(static_cast<std::size_t>(ranks));
+    receive_key_counts.resize(static_cast<std::size_t>(ranks));
+    send_key_offsets.resize(static_cast<std::size_t>(ranks));
+    receive_key_offsets.resize(static_cast<std::size_t>(ranks));
+  }
+  catch (...) { local_ready = false; }
+  local_ready = local_ready && state.outgoing_offsets[static_cast<std::size_t>(ranks)] <=
+      std::numeric_limits<int>::max() / 2 &&
+      state.incoming_offsets[static_cast<std::size_t>(ranks)] <= std::numeric_limits<int>::max() / 2;
+  if (!WorldAll(local_ready)) return false;
+  for (int peer = 0; peer < ranks; ++peer)
+  {
+    local_ready = state.outgoing_counts[static_cast<std::size_t>(peer)] <= std::numeric_limits<int>::max() / 2 &&
+        state.incoming_counts[static_cast<std::size_t>(peer)] <= std::numeric_limits<int>::max() / 2 &&
+        state.outgoing_offsets[static_cast<std::size_t>(peer)] <= std::numeric_limits<int>::max() / 2 &&
+        state.incoming_offsets[static_cast<std::size_t>(peer)] <= std::numeric_limits<int>::max() / 2 && local_ready;
+    if (local_ready)
+    { send_key_counts[peer] = 2 * state.outgoing_counts[peer]; receive_key_counts[peer] = 2 * state.incoming_counts[peer];
+      send_key_offsets[peer] = 2 * state.outgoing_offsets[peer]; receive_key_offsets[peer] = 2 * state.incoming_offsets[peer]; }
+  }
+  std::vector<std::uint64_t> incoming_wire;
+  try { if (local_ready) incoming_wire.resize(2 * incoming); else incoming_wire.clear(); }
+  catch (...) { local_ready = false; }
+  if (!WorldAll(local_ready)) return false;
+  collective_ok = MPI_Alltoallv(state.outgoing_pair_wire.data(), send_key_counts.data(), send_key_offsets.data(), MPI_UINT64_T,
+      incoming_wire.data(), receive_key_counts.data(), receive_key_offsets.data(), MPI_UINT64_T, MPI_COMM_WORLD) == MPI_SUCCESS;
+  if (!WorldAll(collective_ok)) return false;
+  try
+  {
+    state.incoming_value_slots.resize(incoming);
+    for (std::size_t index = 0; index < incoming; ++index)
+    {
+      int peer = 0;
+      while (peer + 1 < ranks && index >= static_cast<std::size_t>(
+          state.incoming_offsets[static_cast<std::size_t>(peer + 1)])) ++peer;
+      int entry = -1; bool offd = false;
+      local_ready = incoming_wire[2 * index] <= static_cast<std::uint64_t>(std::numeric_limits<HYPRE_BigInt>::max()) &&
+          incoming_wire[2 * index + 1] <= static_cast<std::uint64_t>(std::numeric_limits<HYPRE_BigInt>::max()) && local_ready;
+      if (local_ready) local_ready = FindCsrEntry(state, static_cast<HYPRE_BigInt>(incoming_wire[2 * index]),
+          static_cast<HYPRE_BigInt>(incoming_wire[2 * index + 1]), entry, offd);
+      state.incoming_value_slots[index] = {0, peer, entry, offd};
+    }
+    local_ready = local_ready && Resize(state.outgoing_values, state.outgoing_value_slots.size()) &&
+        Resize(state.incoming_staging, incoming) && Resize(state.published_incoming_values, incoming);
+  }
+  catch (...) { local_ready = false; }
+  return WorldAll(local_ready);
+}
+
 bool AllocatePackedArenas(RetainedTopology::Implementation& state) noexcept
 {
   const bool integer_ok = cuda_w8a::UmpireDeviceAllocatorPolicy::Allocate(
@@ -421,11 +685,10 @@ bool BuildGraphAndForm(RetainedTopology::Implementation& state,
         for (int column = 0; column < 40; ++column)
           signed_pattern(row, column) = static_cast<double>(Sign(dofs[row]) * Sign(dofs[column]));
       graph->AddSubMatrix(dofs, dofs, signed_pattern, 1);
-      if (!Add(state.arena.symbolic_slots, 1600, state.arena.symbolic_slots)) return false;
     }
     graph->Finalize(0, false);
     form = std::make_unique<mfem::ParBilinearForm>(state.trace_space.get());
-    return graph && form;
+    return graph && form && state.arena.symbolic_slots == state.csr_slots.size();
   }
   catch (...) { return false; }
 }
@@ -631,6 +894,12 @@ bool RetainedTopology::Setup(mfem::ParMesh& mesh) noexcept
   if (!WorldAll(BuildGraphAndForm(*candidate, graph, form))) return poison();
   try { candidate->matrix.reset(form->ParallelAssemble(graph.get())); }
   catch (...) { candidate->matrix.reset(); }
+  if (!WorldAll(candidate->matrix != nullptr)) return poison();
+  if (!WorldAll(CacheCsrViews(*candidate))) return poison();
+  // CSR slots refer to the assembled host CSR matrix, so they intentionally
+  // live in retained host vectors rather than the earlier topology arenas.
+  if (!WorldAll(BuildRetainedCsrMetadata(*candidate))) return poison();
+  if (!BuildValueExchangePlan(*candidate)) return poison();
   if (!WorldAll(candidate->matrix != nullptr && MakeIdentity(*candidate))) return poison();
   if (!WorldAll(PrimeIdentity(*candidate, ranks))) return poison();
   long long census[3] = {mesh.GetNE(), candidate->trace_space->GetTrueVSize(),
@@ -667,6 +936,58 @@ const std::vector<int>& RetainedTopology::SignedElementTraceVDofs() const noexce
 { static const std::vector<int> empty; return IsReady() ? implementation_->signed_trace_vdofs : empty; }
 const RetainedTopology::ArenaPlan& RetainedTopology::Arena() const noexcept
 { static const ArenaPlan empty; return IsReady() ? implementation_->arena : empty; }
+const std::vector<RetainedTopology::RetainedCsrSlot>& RetainedTopology::RetainedCsrSlots() const noexcept
+{ static const std::vector<RetainedCsrSlot> empty; return IsReady() ? implementation_->csr_slots : empty; }
+const std::vector<RetainedTopology::RetainedCsrSlot>& RetainedTopology::OwnedCsrSlots() const noexcept
+{ static const std::vector<RetainedCsrSlot> empty; return IsReady() ? implementation_->owned_csr_slots : empty; }
+const std::vector<RetainedTopology::ValueExchangeSlot>& RetainedTopology::OutgoingValueSlots() const noexcept
+{ static const std::vector<ValueExchangeSlot> empty; return IsReady() ? implementation_->outgoing_value_slots : empty; }
+const std::vector<RetainedTopology::ValueExchangeSlot>& RetainedTopology::IncomingValueSlots() const noexcept
+{ static const std::vector<ValueExchangeSlot> empty; return IsReady() ? implementation_->incoming_value_slots : empty; }
+
+bool RetainedTopology::ExchangeOwnedCsrValues(const std::vector<double>& source_values) noexcept
+{
+  bool local_ready = IsReady();
+  if (!WorldAll(local_ready)) return false;
+  bool input_ready = source_values.size() == implementation_->csr_slots.size() &&
+      implementation_->outgoing_values.size() == implementation_->outgoing_value_slots.size() &&
+      implementation_->incoming_staging.size() == implementation_->incoming_value_slots.size() &&
+      implementation_->published_incoming_values.size() == implementation_->incoming_value_slots.size();
+  for (const double value : source_values) input_ready = std::isfinite(value) && input_ready;
+  if (!WorldAll(input_ready)) return false;
+  local_ready = true;
+  try
+  {
+    for (std::size_t index = 0; index < implementation_->outgoing_value_slots.size(); ++index)
+    {
+      const std::size_t source = static_cast<std::size_t>(implementation_->outgoing_value_slots[index].source_slot);
+      local_ready = source < source_values.size() && source < implementation_->csr_slots.size() && local_ready;
+      if (source < source_values.size() && source < implementation_->csr_slots.size())
+        implementation_->outgoing_values[index] = source_values[source] *
+            static_cast<double>(implementation_->csr_slots[source].row_sign *
+                                implementation_->csr_slots[source].column_sign);
+    }
+  }
+  catch (...) { local_ready = false; }
+  if (!WorldAll(local_ready)) return false;
+  const bool exchanged = MPI_Alltoallv(implementation_->outgoing_values.data(),
+      implementation_->outgoing_counts.data(), implementation_->outgoing_offsets.data(), MPI_DOUBLE,
+      implementation_->incoming_staging.data(), implementation_->incoming_counts.data(),
+      implementation_->incoming_offsets.data(), MPI_DOUBLE, MPI_COMM_WORLD) == MPI_SUCCESS;
+  if (!WorldAll(exchanged)) return false;
+  local_ready = true;
+  for (const double value : implementation_->incoming_staging)
+    local_ready = std::isfinite(value) && local_ready;
+  if (!WorldAll(local_ready)) return false;
+  // The buffers are fixed by Setup.  Publication therefore cannot allocate
+  // and occurs only after every rank has observed a successful collective.
+  std::copy(implementation_->incoming_staging.begin(), implementation_->incoming_staging.end(),
+            implementation_->published_incoming_values.begin());
+  return true;
+}
+
+const std::vector<double>& RetainedTopology::PublishedIncomingValues() const noexcept
+{ static const std::vector<double> empty; return IsReady() ? implementation_->published_incoming_values : empty; }
 bool RetainedTopology::IdentityPrimed() const noexcept
 { return IsReady() && implementation_->identity_primed; }
 double RetainedTopology::PrimeResidual() const noexcept
