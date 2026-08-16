@@ -129,9 +129,7 @@ bool AffinePositiveElement(mfem::ParMesh& mesh, const int element,
     ip.Set2(points[point][0], points[point][1]);
     transformation->SetIntPoint(&ip);
     const mfem::DenseMatrix& jacobian = transformation->Jacobian();
-    const double determinant = transformation->Weight();
-    if (jacobian.Height() != 2 || jacobian.Width() != 2 ||
-        !std::isfinite(determinant) || determinant <= 0.0) return false;
+    if (jacobian.Height() != 2 || jacobian.Width() != 2) return false;
     for (int row = 0; row < 2; ++row)
       for (int column = 0; column < 2; ++column)
       {
@@ -143,6 +141,9 @@ bool AffinePositiveElement(mfem::ParMesh& mesh, const int element,
                  64.0 * std::numeric_limits<double>::epsilon() *
                      std::max(1.0, std::abs(center_jacobian[index]))) return false;
       }
+    const double determinant = jacobian(0, 0) * jacobian(1, 1) -
+        jacobian(0, 1) * jacobian(1, 0);
+    if (!std::isfinite(determinant) || determinant <= 0.0) return false;
     if (point != 0)
     {
       mfem::Vector physical;
@@ -228,8 +229,7 @@ struct RetainedTopology::Implementation final
 
 namespace
 {
-bool BuildHostTopology(RetainedTopology::Implementation& state,
-                       mfem::ParMesh& mesh) noexcept
+bool AdmitLocalMesh(mfem::ParMesh& mesh) noexcept
 {
   try
   {
@@ -237,18 +237,63 @@ bool BuildHostTopology(RetainedTopology::Implementation& state,
     if (mesh.Dimension() != RetainedTopology::dimension ||
         mesh.SpaceDimension() != RetainedTopology::dimension || mesh.GetNE() < 0 ||
         generic::HasPhysicalBoundaryFace(mesh)) return false;
-    state.mesh = &mesh;
+    for (int element = 0; element < mesh.GetNE(); ++element)
+      if (mesh.GetElementBaseGeometry(element) != mfem::Geometry::SQUARE ||
+          (nodes != nullptr && (!nodes->FESpace() ||
+              nodes->FESpace()->GetFE(element)->GetOrder() != 1))) return false;
+    return true;
+  }
+  catch (...) { return false; }
+}
+
+bool AllocateCollections(RetainedTopology::Implementation& state) noexcept
+{
+  try
+  {
     state.trace_collection = std::make_unique<mfem::DG_Interface_FECollection>(
         1, 2, mfem::FiniteElement::VALUE, mfem::BasisType::GaussLegendre);
     state.interior_collection = std::make_unique<mfem::L2_FECollection>(
         1, 2, mfem::BasisType::GaussLegendre, mfem::FiniteElement::VALUE);
+    return state.trace_collection != nullptr && state.interior_collection != nullptr;
+  }
+  catch (...) { return false; }
+}
+
+bool ConstructTraceSpace(RetainedTopology::Implementation& state,
+                         mfem::ParMesh& mesh) noexcept
+{
+  try
+  {
+    if (!state.trace_collection) return false;
     state.trace_space = std::make_unique<mfem::ParFiniteElementSpace>(
         &mesh, state.trace_collection.get(), 5, mfem::Ordering::byNODES);
+    return state.trace_space != nullptr && state.trace_space->GetVSize() >= 0 &&
+        state.trace_space->GetTrueVSize() >= 0;
+  }
+  catch (...) { return false; }
+}
+
+bool ConstructInteriorSpace(RetainedTopology::Implementation& state,
+                            mfem::ParMesh& mesh) noexcept
+{
+  try
+  {
+    if (!state.interior_collection) return false;
     state.interior_space = std::make_unique<mfem::ParFiniteElementSpace>(
         &mesh, state.interior_collection.get(), 7, mfem::Ordering::byNODES);
+    return state.interior_space != nullptr && state.interior_space->GetVSize() >= 0;
+  }
+  catch (...) { return false; }
+}
+
+bool BuildLocalMapsGeometryQuadrature(RetainedTopology::Implementation& state,
+                                      mfem::ParMesh& mesh) noexcept
+{
+  try
+  {
+    if (!state.trace_space || !state.interior_space) return false;
+    state.mesh = &mesh;
     state.mesh_sequence = mesh.GetSequence();
-    if (state.trace_space->GetVSize() < 0 || state.trace_space->GetTrueVSize() < 0 ||
-        state.interior_space->GetVSize() < 0) return false;
     const std::size_t elements = static_cast<std::size_t>(mesh.GetNE());
     std::size_t interior_count = 0, trace_count = 0, vertex_count = 0;
     if (!Multiply(elements, 28, interior_count) || !Multiply(elements, 40, trace_count) ||
@@ -256,8 +301,6 @@ bool BuildHostTopology(RetainedTopology::Implementation& state,
         !Resize(state.signed_trace_vdofs, trace_count) || !Resize(state.vertices, vertex_count)) return false;
     for (int element = 0; element < mesh.GetNE(); ++element)
     {
-      if (nodes != nullptr && (!nodes->FESpace() ||
-          nodes->FESpace()->GetFE(element)->GetOrder() != 1)) return false;
       mfem::Array<int> interior, trace;
       state.interior_space->GetElementVDofs(element, interior);
       state.trace_space->GetElementVDofs(element, trace);
@@ -315,16 +358,9 @@ bool AllocatePackedArenas(RetainedTopology::Implementation& state) noexcept
       state.arena.double_physical_bytes, alignof(std::max_align_t),
       cuda_w8a::CudaAllocationSite::persistent_double_arena, state.double_arena);
   if (integer_ok && double_ok) return true;
-  if (integer_ok)
-  {
-    state.integer_release_attempted = true;
-    (void)Release(state.integer_arena, cuda_w8a::CudaAllocationSite::persistent_integer_arena);
-  }
-  if (double_ok)
-  {
-    state.double_release_attempted = true;
-    (void)Release(state.double_arena, cuda_w8a::CudaAllocationSite::persistent_double_arena);
-  }
+  // Preserve any successful allocation in the poisoned candidate.  Its
+  // destructor makes the single permitted release attempt after all wrappers
+  // have been destroyed; a failed release remains quarantined, not retried.
   return false;
 }
 
@@ -531,7 +567,15 @@ RetainedTopology& RetainedTopology::operator=(RetainedTopology&&) noexcept = def
 
 bool RetainedTopology::Setup(mfem::ParMesh& mesh) noexcept
 {
-  if (!WorldAll(!setup_attempted_)) return false;
+  if (!WorldAll(!setup_attempted_))
+  {
+    // A divergent re-entry consumes the fresh ranks too.  This prevents a
+    // later invocation from pairing a fresh rank with a terminal peer.
+    setup_attempted_ = true;
+    terminal_poisoned_ = true;
+    if (implementation_) implementation_->poisoned = true;
+    return false;
+  }
   setup_attempted_ = true;
   int relation = MPI_UNEQUAL, ranks = 0;
   const bool admitted = mesh.GetComm() != MPI_COMM_NULL &&
@@ -549,7 +593,13 @@ bool RetainedTopology::Setup(mfem::ParMesh& mesh) noexcept
   };
   if (!WorldAll(candidate != nullptr)) return poison();
   if (!WorldAll(admitted)) return poison();
-  if (!WorldAll(BuildHostTopology(*candidate, mesh))) return poison();
+  // No rank may reach a collective-capable MFEM constructor until every peer
+  // has passed the preceding local-only phase.
+  if (!WorldAll(AdmitLocalMesh(mesh))) return poison();
+  if (!WorldAll(AllocateCollections(*candidate))) return poison();
+  if (!WorldAll(ConstructTraceSpace(*candidate, mesh))) return poison();
+  if (!WorldAll(ConstructInteriorSpace(*candidate, mesh))) return poison();
+  if (!WorldAll(BuildLocalMapsGeometryQuadrature(*candidate, mesh))) return poison();
   bool plan_ready = false;
   try { plan_ready = trace::BuildDGInterfaceTraceExchangePlan(*candidate->trace_space,
                                                                 candidate->trace_exchange_plan); }
