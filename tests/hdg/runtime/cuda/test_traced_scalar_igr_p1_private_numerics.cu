@@ -410,8 +410,18 @@ bool Fixture(const bool rank_zero_only)
         topology.LocalTraceVSize() == 160 && topology.LocalTrueTraceSize() > 0 &&
         topology.InteriorSpace()->GetVSize() == 140 : topology.LocalElementCount() == 4 &&
         topology.LocalTraceVSize() == 140 && topology.LocalTrueTraceSize() > 0 &&
-        topology.InteriorSpace()->GetVSize() == 112) && !topology.OutgoingValueSlots().empty() &&
-        !topology.IncomingValueSlots().empty();
+        topology.InteriorSpace()->GetVSize() == 112);
+    const unsigned long long local_traffic[2] = {
+        static_cast<unsigned long long>(topology.OutgoingValueSlots().size()),
+        static_cast<unsigned long long>(topology.IncomingValueSlots().size())};
+    unsigned long long global_traffic[2] = {0, 0};
+    const bool traffic_reduced = MPI_Allreduce(local_traffic, global_traffic, 2,
+        MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+    const bool directional = rank == 0 ? topology.OutgoingValueSlots().empty() &&
+        !topology.IncomingValueSlots().empty() : !topology.OutgoingValueSlots().empty() &&
+        topology.IncomingValueSlots().empty();
+    local = local && traffic_reduced && global_traffic[0] == global_traffic[1] &&
+        global_traffic[0] > 0 && directional;
     int local_offd = 0, global_offd = 0;
     for (const auto& slot : topology.OwnedCsrSlots()) local_offd = local_offd || slot.csr_entry_is_offd;
     for (const auto& slot : topology.IncomingValueSlots()) local_offd = local_offd || slot.csr_entry_is_offd;
