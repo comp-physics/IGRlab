@@ -31,6 +31,17 @@ bool WorldAll(const bool local) noexcept
                        MPI_COMM_WORLD) == MPI_SUCCESS && output == 1;
 }
 
+bool WorldFreshRange(const bool fresh, int& minimum, int& maximum) noexcept
+{
+  const int value = fresh ? 1 : 0;
+  minimum = 0;
+  maximum = 0;
+  return MPI_Allreduce(&value, &minimum, 1, MPI_INT, MPI_MIN,
+                       MPI_COMM_WORLD) == MPI_SUCCESS &&
+      MPI_Allreduce(&value, &maximum, 1, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD) == MPI_SUCCESS;
+}
+
 bool Add(const std::size_t a, const std::size_t b, std::size_t& out) noexcept
 {
   if (a > std::numeric_limits<std::size_t>::max() - b) return false;
@@ -567,7 +578,11 @@ RetainedTopology& RetainedTopology::operator=(RetainedTopology&&) noexcept = def
 
 bool RetainedTopology::Setup(mfem::ParMesh& mesh) noexcept
 {
-  if (!WorldAll(!setup_attempted_))
+  int fresh_minimum = 0;
+  int fresh_maximum = 0;
+  const bool fresh_range = WorldFreshRange(!setup_attempted_, fresh_minimum,
+                                           fresh_maximum);
+  if (!fresh_range || fresh_minimum != fresh_maximum)
   {
     // A divergent re-entry consumes the fresh ranks too.  This prevents a
     // later invocation from pairing a fresh rank with a terminal peer.
@@ -576,6 +591,9 @@ bool RetainedTopology::Setup(mfem::ParMesh& mesh) noexcept
     if (implementation_) implementation_->poisoned = true;
     return false;
   }
+  // A symmetric second call is an ordinary one-shot rejection: preserve the
+  // ready object (or an already poisoned candidate) exactly as it was.
+  if (fresh_minimum == 0) return false;
   setup_attempted_ = true;
   int relation = MPI_UNEQUAL, ranks = 0;
   const bool admitted = mesh.GetComm() != MPI_COMM_NULL &&
