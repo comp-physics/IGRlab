@@ -6258,33 +6258,35 @@ bool detail::CpuNumericsCore::InitializeInternal(
   // compatibility empty view selects derived projection only when *every*
   // participating rank supplied an empty view.  Once any rank supplies a
   // trace, every rank must provide its exact local true-vector extent (which
-  // can legitimately be zero).  Validate the whole iterate before allowing
-  // any rank into the collective trace distribution below.
+  // can legitimately be zero).  Populate and collectively validate both
+  // initialization staging vectors before allowing any rank into either
+  // collective trace distribution below.
   bool derive_initial_true_trace = !generic;
   if (generic)
   {
     derive_initial_true_trace = state.CollectiveAll(
         borrowed_request->initial_true_trace.scalar_count == 0);
   }
-  local_ok = derive_initial_true_trace
+  const bool iterate_trace_ready = derive_initial_true_trace
       ? state.ProjectTrace(*state.iterate_trace, state.iterate_true_trace,
                            false)
       : state.FillBorrowedTrueTrace(state.iterate_true_trace,
                                     borrowed_request->initial_true_trace);
-  if (!state.CollectiveAll(local_ok)) { return false; }
+  const bool trial_trace_ready = derive_initial_true_trace
+      ? state.ProjectTrace(*state.trial_trace, state.trial_true_trace, true)
+      : state.FillBorrowedTrueTrace(state.trial_true_trace,
+                                    borrowed_request->initial_true_trace);
+  const bool iterate_trace_admitted = state.CollectiveAll(iterate_trace_ready);
+  const bool trial_trace_admitted = state.CollectiveAll(trial_trace_ready);
+  if (!iterate_trace_admitted || !trial_trace_admitted)
+  {
+    return false;
+  }
   if (!state.LoadTrace(state.iterate_true_trace, *state.iterate_trace))
   {
     return false;
   }
   local_ok = Copy(state.iterate_true_trace, state.Committed()->trace);
-  if (!state.CollectiveAll(local_ok)) { return false; }
-  // Revalidate the independent trial staging vector before its own load.  In
-  // particular, a nonfinite borrowed entry cannot let a peer enter
-  // Distribute while this rank returns locally.
-  local_ok = derive_initial_true_trace
-      ? state.ProjectTrace(*state.trial_trace, state.trial_true_trace, true)
-      : state.FillBorrowedTrueTrace(state.trial_true_trace,
-                                    borrowed_request->initial_true_trace);
   if (!state.CollectiveAll(local_ok)) { return false; }
   if (!state.LoadTrace(state.trial_true_trace, *state.trial_trace))
   {
