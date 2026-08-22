@@ -508,7 +508,10 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     RecordFailure(local_status, ContractStatus::invalid_backend);
   }
-  if (!IsValidField(request.initial_state, true))
+  // A globally nonempty borrowed mesh may legitimately leave this rank with
+  // no volume dofs.  Such a rank contributes an empty exact local field while
+  // still joining every collective admission and trace operation.
+  if (!IsValidField(request.initial_state, local_elements > 0))
   {
     RecordFailure(local_status, ContractStatus::invalid_initial_state);
   }

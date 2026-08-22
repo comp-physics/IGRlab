@@ -228,7 +228,12 @@ bool CheckZeroOwnedElementAdmission()
   mfem::ParMesh mesh =
       MakeRankZeroOwnedParallelMesh(mfem::Element::QUADRILATERAL);
   const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
-  const EulerHdgRequest request = ValidRequest(mesh, initial);
+  EulerHdgRequest request = ValidRequest(mesh, initial);
+  if (mesh.GetNE() == 0)
+  {
+    request.initial_state = {nullptr, 0, 4};
+    request.initial_true_trace = {nullptr, 0, 4};
+  }
   const ContractStatus status = ValidateEulerHdgRequest(request);
   const int local_empty = mesh.GetNE() == 0 ? 1 : 0;
   int has_empty_rank = 0;
