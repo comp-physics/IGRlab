@@ -25,6 +25,7 @@
 #include <type_traits>
 
 #include <mfem.hpp>
+#include <mpi.h>
 
 #include "numerics/hdg/generic/contract.hpp"
 
@@ -33,6 +34,22 @@ namespace dg_sim::hdg
 
 inline constexpr int hdg_euler_2d_components =
     dg::hdg::generic::euler_2d_conserved_components;
+
+namespace detail
+{
+
+inline bool CollectiveTraceProjectionReady(
+    const MPI_Comm communicator, const bool local) noexcept
+{
+  const int input = local ? 1 : 0;
+  int output = 0;
+  return communicator != MPI_COMM_NULL &&
+      MPI_Allreduce(&input, &output, 1, MPI_INT, MPI_MIN, communicator) ==
+          MPI_SUCCESS &&
+      output == 1;
+}
+
+} // namespace detail
 
 /**
  * Return whether @p state is exactly the four-component, byNODES volume field
@@ -125,22 +142,19 @@ inline bool ProjectEulerCoefficientL2(
   catch (...) { return false; }
 }
 
-/**
- * Independently L2-project an analytic Euler state onto local trace faces and
- * publish the resulting owned true-trace coordinates.  This intentionally
- * never samples the already-projected volume field.
- */
-inline bool ProjectEulerTrueTraceCoefficientL2(
+namespace detail
+{
+
+inline bool ProjectEulerTrueTraceCoefficientL2Local(
     mfem::ParFiniteElementSpace& trace_space, mfem::ParGridFunction& local_trace,
-    mfem::Vector& true_trace, mfem::VectorCoefficient& coefficient,
-    const int quadrature_order) noexcept
+    mfem::VectorCoefficient& coefficient, const int quadrature_order) noexcept
 {
   try
   {
     if (quadrature_order <= 0 || coefficient.GetVDim() != hdg_euler_2d_components ||
         trace_space.GetVDim() != hdg_euler_2d_components ||
         trace_space.GetOrdering() != mfem::Ordering::byNODES ||
-        local_trace.ParFESpace() != &trace_space)
+        local_trace.ParFESpace() != &trace_space || trace_space.GetParMesh() == nullptr)
     {
       return false;
     }
@@ -202,15 +216,52 @@ inline bool ProjectEulerTrueTraceCoefficientL2(
         }
       }
     }
-    if (local_trace.CheckFinite() != 0) { return false; }
-    true_trace.SetSize(trace_space.GetTrueVSize());
-    local_trace.ParallelProject(true_trace);
-    if (true_trace.Size() != trace_space.GetTrueVSize()) { return false; }
-    for (int index = 0; index < true_trace.Size(); ++index)
-      if (!std::isfinite(true_trace[index])) { return false; }
-    return true;
+    return local_trace.CheckFinite() == 0;
   }
   catch (...) { return false; }
+}
+
+} // namespace detail
+
+/**
+ * Independently L2-project an analytic Euler state onto local trace faces and
+ * publish the resulting owned true-trace coordinates.  This intentionally
+ * never samples the already-projected volume field.  Every rank collectively
+ * admits both local projection and true-vector storage before entering the
+ * collective true-trace projection.
+ */
+inline bool ProjectEulerTrueTraceCoefficientL2(
+    mfem::ParFiniteElementSpace& trace_space, mfem::ParGridFunction& local_trace,
+    mfem::Vector& true_trace, mfem::VectorCoefficient& coefficient,
+    const int quadrature_order) noexcept
+{
+  const MPI_Comm communicator = trace_space.GetComm();
+  bool local_ready = detail::ProjectEulerTrueTraceCoefficientL2Local(
+      trace_space, local_trace, coefficient, quadrature_order);
+  if (local_ready)
+  {
+    try
+    {
+      true_trace.SetSize(trace_space.GetTrueVSize());
+      local_ready = true_trace.Size() == trace_space.GetTrueVSize();
+    }
+    catch (...) { local_ready = false; }
+  }
+  if (!detail::CollectiveTraceProjectionReady(communicator, local_ready))
+  {
+    return false;
+  }
+
+  bool output_ready = false;
+  try
+  {
+    local_trace.ParallelProject(true_trace);
+    output_ready = true_trace.Size() == trace_space.GetTrueVSize();
+    for (int index = 0; output_ready && index < true_trace.Size(); ++index)
+      output_ready = std::isfinite(true_trace[index]);
+  }
+  catch (...) { output_ready = false; }
+  return detail::CollectiveTraceProjectionReady(communicator, output_ready);
 }
 
 /**

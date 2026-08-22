@@ -688,12 +688,30 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       if (!ProjectEulerCoefficientL2(
               *volume_space, *initial_state, *case_data->initial_condition,
               numerical_policy.volume_projection_quadrature_order) ||
-          !ProjectEulerTrueTraceCoefficientL2(
+          initial_state->CheckFinite() != 0)
+      {
+        throw std::runtime_error("HDG L2 volume initial-state projection failed");
+      }
+      local_ok = true;
+    }
+    catch (...)
+    {
+      local_ok = false;
+    }
+    if (!CollectiveAll(request.communicator, local_ok))
+    {
+      return Reject(request,
+                    "HDG volume initial-state projection failed on at least one rank");
+    }
+
+    try
+    {
+      if (!ProjectEulerTrueTraceCoefficientL2(
               *trace_space, *local_initial_trace, initial_true_trace,
               *case_data->initial_condition,
               numerical_policy.true_trace_projection_quadrature_order))
       {
-        throw std::runtime_error("HDG independent L2 initial-state projection failed");
+        throw std::runtime_error("HDG independent L2 true-trace projection failed");
       }
       if (case_data->static_source)
       {

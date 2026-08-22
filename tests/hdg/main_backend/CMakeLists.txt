@@ -7,6 +7,32 @@ if(NOT MFEM_USE_CUDA)
 if(NOT TARGET dg_igr_hdg_main_backend_cpu)
   message(FATAL_ERROR "The generic CPU HDG main backend is required.")
 endif()
+
+add_executable(dg_igr_hdg_main_backend_collective_projection_test
+  test_collective_projection.cpp)
+target_compile_definitions(dg_igr_hdg_main_backend_collective_projection_test PRIVATE
+  DG_IGR_HDG_REPOSITORY_ROOT="${PROJECT_SOURCE_DIR}")
+target_link_libraries(dg_igr_hdg_main_backend_collective_projection_test PRIVATE
+  dg_igr_hdg_main_backend_cpu MPI::MPI_CXX)
+target_compile_options(dg_igr_hdg_main_backend_collective_projection_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_main_backend_collective_projection_test PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+
+add_test(NAME dg_igr_hdg_main_backend_collective_projection_rejected_rank2
+  COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
+          ${MPIEXEC_PREFLAGS}
+          $<TARGET_FILE:dg_igr_hdg_main_backend_collective_projection_test>
+          ${MPIEXEC_POSTFLAGS})
+set_tests_properties(
+  dg_igr_hdg_main_backend_collective_projection_rejected_rank2 PROPERTIES
+    LABELS "hdg;main-backend;cpu;mpi;negative;collective;projection"
+    PROCESSORS 2
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    TIMEOUT 60)
+
 if(NOT TARGET dgsem_smooth_advection OR
    NOT TARGET hdg_smooth_transition_research)
   message(FATAL_ERROR
