@@ -3818,7 +3818,8 @@ bool ValidateIndependentSc25VtkArtifact(
   }
   const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
   if (!spaces.u.address || spaces.u.address->GetVDim() != 4 ||
-      foundation.trajectory_evidence().coordinates.step != expected_step)
+      foundation.trajectory_evidence().coordinates.step !=
+          static_cast<std::uint64_t>(expected_step))
   {
     failure = "independent reference state";
     return false;
