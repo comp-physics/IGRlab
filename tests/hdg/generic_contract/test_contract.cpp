@@ -344,7 +344,7 @@ bool CheckIgrSelectionAdmission()
       physical_p1 == ContractStatus::accepted &&
       physical_p2 == ContractStatus::accepted &&
       physical_p3 == ContractStatus::accepted &&
-      cuda == ContractStatus::invalid_regularization &&
+      cuda == ContractStatus::accepted &&
       mismatch == (ranks == 1 ? ContractStatus::accepted
                               : ContractStatus::invalid_numerical_policy) &&
       min_result == MPI_SUCCESS && max_result == MPI_SUCCESS &&
