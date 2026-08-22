@@ -121,7 +121,7 @@ bool ReduceObservables(const MPI_Comm communicator, const mfem::ParMesh& mesh,
       const mfem::FiniteElement* finite_element =
           sample.ElementFiniteElement(element);
       mfem::ElementTransformation* transformation =
-          mesh.GetElementTransformation(element);
+          const_cast<mfem::ParMesh&>(mesh).GetElementTransformation(element);
       if (!finite_element || !transformation) { local_valid = false; break; }
       const mfem::IntegrationRule& rule = mfem::IntRules.Get(
           finite_element->GetGeomType(), quadrature_order);
