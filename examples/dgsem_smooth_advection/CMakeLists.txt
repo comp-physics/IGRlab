@@ -2,7 +2,7 @@
 add_executable(dgsem_smooth_advection dgsem_smooth_advection.cpp)
 if(TARGET dg_igr_hdg_main_backend_cuda)
   dg_igr_configure_hdg_cuda_final_consumer(dgsem_smooth_advection)
-  target_link_libraries(dgsem_smooth_advection
+  target_link_libraries(dgsem_smooth_advection PRIVATE
     dg_igr_hdg_main_backend_cuda
     igr_mfem)
   target_compile_definitions(dgsem_smooth_advection PRIVATE
