@@ -387,6 +387,41 @@ bool CheckZeroOwnedElementAdmission()
       maximum_status == static_cast<int>(ContractStatus::accepted);
 }
 
+bool CheckAsymmetricNullMeshConvergence()
+{
+  int rank = 0;
+  int ranks = 0;
+  if (MPI_Comm_rank(MPI_COMM_WORLD, &rank) != MPI_SUCCESS ||
+      MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  if (ranks < 2) { return true; }
+
+  mfem::ParMesh mesh =
+      MakeRankZeroOwnedParallelMesh(mfem::Element::QUADRILATERAL);
+  const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  EulerHdgRequest request = ValidRequest(mesh, initial);
+  if (mesh.GetNE() == 0)
+  {
+    request.initial_state = {nullptr, 0, 4};
+    request.initial_true_trace = {nullptr, 0, 4};
+  }
+  if (rank == 0) { request.mesh = nullptr; }
+
+  const ContractStatus status = ValidateEulerHdgRequest(request);
+  int minimum = static_cast<int>(status);
+  int maximum = minimum;
+  const int minimum_result = MPI_Allreduce(
+      MPI_IN_PLACE, &minimum, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  const int maximum_result = MPI_Allreduce(
+      MPI_IN_PLACE, &maximum, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  return status == ContractStatus::null_mesh &&
+      minimum_result == MPI_SUCCESS && maximum_result == MPI_SUCCESS &&
+      minimum == static_cast<int>(ContractStatus::null_mesh) &&
+      maximum == minimum;
+}
+
 bool CheckCollectiveFailureConvergence()
 {
   int rank = 0;
@@ -442,9 +477,10 @@ int main(int argc, char* argv[])
   const bool boundary_mismatch = CheckBoundaryPolicyCollectiveMismatch();
   const bool igr = CheckIgrSelectionAdmission();
   const bool empty = CheckZeroOwnedElementAdmission();
+  const bool asymmetric_null = CheckAsymmetricNullMeshConvergence();
   const bool mismatch = CheckCollectiveFailureConvergence();
   const bool geometry = CheckCollectiveGeometryConvergence();
   ok = ok && basic && triangle && boundary && boundary_mismatch && igr && empty &&
-      mismatch && geometry;
+      asymmetric_null && mismatch && geometry;
   return ok ? 0 : 1;
 }

@@ -1256,6 +1256,7 @@ BuildPersistentTrueSystem() noexcept
   CudaSolveDiagnostics warm{};
   const bool warm_solved = CudaRefreshFactorAndSolve(
       *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_, ranks_,
+      communicator_,
       linear_relative_tolerance_, maximum_linear_iterations_,
       krylov_dimension_, 0, warm);
   const bool warmed = warm_solved && warm.device_policy &&
@@ -1439,7 +1440,7 @@ BuildSparseStagingPlan() noexcept
     const bool matrix_count_ok = MPI_Sendrecv(
                      &shape_.matrix_send_count, 1, MPI_INT, peer, 4101,
                      &shape_.matrix_receive_count, 1, MPI_INT, peer, 4101,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) == MPI_SUCCESS;
+                     communicator_, MPI_STATUS_IGNORE) == MPI_SUCCESS;
     const bool matrix_count_recorded = TransportPolicy::RecordMpiStaging(
             2 * sizeof(int), CudaTransferCategory::topology,
             CudaTransferSite::map_upload, &shape_.matrix_send_count,
@@ -1450,7 +1451,7 @@ BuildSparseStagingPlan() noexcept
     const bool vector_count_ok = MPI_Sendrecv(
                      &shape_.vector_send_count, 1, MPI_INT, peer, 4102,
                      &shape_.vector_receive_count, 1, MPI_INT, peer, 4102,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) == MPI_SUCCESS;
+                     communicator_, MPI_STATUS_IGNORE) == MPI_SUCCESS;
     const bool vector_count_recorded = TransportPolicy::RecordMpiStaging(
             2 * sizeof(int), CudaTransferCategory::topology,
             CudaTransferSite::map_upload, &shape_.vector_send_count,
@@ -1471,7 +1472,7 @@ BuildSparseStagingPlan() noexcept
                      MPI_INT64_T, peer, 4103,
                      matrix_receive_keys_.data(),
                      2 * shape_.matrix_receive_count, MPI_INT64_T,
-                     peer, 4103, MPI_COMM_WORLD,
+                     peer, 4103, communicator_,
                      MPI_STATUS_IGNORE) == MPI_SUCCESS;
     const std::size_t matrix_key_bytes = 2 * static_cast<std::size_t>(
         shape_.matrix_send_count + shape_.matrix_receive_count) *
@@ -1489,7 +1490,7 @@ BuildSparseStagingPlan() noexcept
                      vector_send_keys_.data(), shape_.vector_send_count,
                      MPI_INT64_T, peer, 4104,
                      vector_receive_keys_.data(), shape_.vector_receive_count,
-                     MPI_INT64_T, peer, 4104, MPI_COMM_WORLD,
+                     MPI_INT64_T, peer, 4104, communicator_,
                      MPI_STATUS_IGNORE) == MPI_SUCCESS;
     const std::size_t vector_key_bytes = static_cast<std::size_t>(
         shape_.vector_send_count + shape_.vector_receive_count) *
@@ -1765,7 +1766,7 @@ AssembleTrueVector(const double* element_values, double* true_values) noexcept
                      vector_send_host_.data(), shape_.vector_send_count,
                      MPI_DOUBLE, peer, 4201, vector_receive_host_.data(),
                      shape_.vector_receive_count, MPI_DOUBLE, peer, 4201,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) == MPI_SUCCESS;
+                     communicator_, MPI_STATUS_IGNORE) == MPI_SUCCESS;
     const bool exchange_recorded = TransportPolicy::RecordMpiStaging(
             send_bytes + receive_bytes,
             CudaTransferCategory::host_staged_trace_exchange,
@@ -1815,7 +1816,7 @@ AssembleTrueSystem() noexcept
                      matrix_send_host_.data(), shape_.matrix_send_count,
                      MPI_DOUBLE, peer, 4202, matrix_receive_host_.data(),
                      shape_.matrix_receive_count, MPI_DOUBLE, peer, 4202,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE) == MPI_SUCCESS;
+                     communicator_, MPI_STATUS_IGNORE) == MPI_SUCCESS;
     const bool exchange_recorded = TransportPolicy::RecordMpiStaging(
             send_bytes + receive_bytes,
             CudaTransferCategory::host_staged_trace_exchange,
@@ -1849,8 +1850,9 @@ SolveTrueSystem(double& true_relative_residual,
 {
   CudaSolveDiagnostics diagnostics{};
   const bool local_solve = CudaRefreshFactorAndSolve(
-          *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-          ranks_, linear_relative_tolerance_, maximum_linear_iterations_,
+      *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
+          ranks_, communicator_, linear_relative_tolerance_,
+          maximum_linear_iterations_,
           krylov_dimension_, matrix_generation, diagnostics) &&
       diagnostics.device_policy && diagnostics.configured_ilu0 &&
       diagnostics.matrix_generation == matrix_generation &&
@@ -1860,9 +1862,9 @@ SolveTrueSystem(double& true_relative_residual,
   true_matrix_->Mult(*hypre_solution_, *hypre_action_);
   *hypre_action_ -= *hypre_rhs_;
   const double residual_squared = mfem::InnerProduct(
-      MPI_COMM_WORLD, *hypre_action_, *hypre_action_);
+      communicator_, *hypre_action_, *hypre_action_);
   const double rhs_squared = mfem::InnerProduct(
-      MPI_COMM_WORLD, *hypre_rhs_, *hypre_rhs_);
+      communicator_, *hypre_rhs_, *hypre_rhs_);
   true_relative_residual = std::sqrt(residual_squared) /
       std::max(std::sqrt(rhs_squared), 1.0e-300);
   return std::isfinite(true_relative_residual) &&
@@ -1896,7 +1898,7 @@ AssembleAndNorm(state_slot&, const double dt, double& norm) noexcept
   double global_squared = local_squared;
   if (ranks_ > 1 && MPI_Allreduce(&local_squared, &global_squared, 1,
                                   MPI_DOUBLE, MPI_SUM,
-                                  MPI_COMM_WORLD) != MPI_SUCCESS)
+                                  communicator_) != MPI_SUCCESS)
     return false;
   norm = std::sqrt(global_squared);
   return std::isfinite(norm);
@@ -2012,7 +2014,7 @@ AggregateHash(const StateHash& local, StateHash& aggregate) const noexcept
   if (ranks_ < 1 || ranks_ > 2 ||
       MPI_Allgather(local.bytes.data(), 32, MPI_UNSIGNED_CHAR,
                     pieces.data(), 32, MPI_UNSIGNED_CHAR,
-                    MPI_COMM_WORLD) != MPI_SUCCESS)
+                    communicator_) != MPI_SUCCESS)
     return false;
   aggregate = HashHostBytes(
       pieces.data(), static_cast<std::size_t>(ranks_) * 32);

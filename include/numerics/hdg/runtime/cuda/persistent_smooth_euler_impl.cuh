@@ -716,6 +716,7 @@ bool CudaRefreshFactorAndSolve(mfem::HypreParMatrix& matrix,
                                mfem::HypreILU& ilu,
                                mfem::HypreGMRES& gmres,
                                int ranks,
+                               MPI_Comm communicator,
                                double relative_tolerance,
                                int maximum_iterations,
                                int krylov_dimension,
@@ -847,6 +848,7 @@ public:
   bool Initialize(const CudaConfig& config, CudaRunEvidence& evidence,
                   const RuntimeTupleDescriptor& tuple) noexcept
   {
+    communicator_ = CudaCollectiveCommunicator(config);
     oracle_capture_requested_ = config.capture_oracle;
     TransportPolicy::ResetLedger();
     CudaPolicyContext setup{};
@@ -908,7 +910,7 @@ public:
     std::array<int, 2> ghost_counts{};
     const bool ghost_census_ready = MPI_Allgather(
         &local_ghost_count, 1, MPI_INT, ghost_counts.data(), 1, MPI_INT,
-        MPI_COMM_WORLD) == MPI_SUCCESS;
+        communicator_) == MPI_SUCCESS;
     if (!CollectiveContinue(ghost_census_ready))
     {
       ReportCudaSetupFailure(evidence.rank, "ghost-census");
@@ -1070,9 +1072,9 @@ public:
     double global_hmin = local_hmin_;
     maximum_wave_speed = host_cfl_scalars_[0];
     const bool hmin_reduced = MPI_Allreduce(&local_hmin_, &global_hmin, 1,
-        MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+        MPI_DOUBLE, MPI_MIN, communicator_) == MPI_SUCCESS;
     const bool wave_reduced = MPI_Allreduce(&host_cfl_scalars_[0],
-        &maximum_wave_speed, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+        &maximum_wave_speed, 1, MPI_DOUBLE, MPI_MAX, communicator_) == MPI_SUCCESS;
     const double denominator = 2.0 * static_cast<double>(order) + 1.0;
     backend_stable_dt = maximum_wave_speed > 0.0
         ? global_hmin / (denominator * maximum_wave_speed)
@@ -1088,7 +1090,7 @@ public:
     int local_value = local ? 1 : 0;
     int global_value = 0;
     return MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN,
-                         MPI_COMM_WORLD) == MPI_SUCCESS && global_value == 1;
+                         communicator_) == MPI_SUCCESS && global_value == 1;
   }
 
   bool CollectiveCount(const bool local, int& count) const noexcept
@@ -1096,7 +1098,7 @@ public:
     const int local_value = local ? 1 : 0;
     count = 0;
     return MPI_Allreduce(&local_value, &count, 1, MPI_INT, MPI_SUM,
-                         MPI_COMM_WORLD) == MPI_SUCCESS;
+                         communicator_) == MPI_SUCCESS;
   }
 
   bool StageCheckpoint(const state_slot& frozen,
@@ -1644,7 +1646,7 @@ public:
       std::array<double, 4> global{};
       const bool reduced = MPI_Allreduce(
           local.data(), global.data(), static_cast<int>(global.size()),
-          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+          MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS;
       if (!CollectiveContinue(reduced)) return false;
       const double denominator = std::max({
           std::sqrt(global[1]), std::sqrt(global[2]),
@@ -1705,13 +1707,13 @@ public:
     if (!CollectiveContinue(local_valid)) return false;
     std::array<double, components> global_balance{};
     std::array<double, components> global_scale{};
-    const bool reduced = MPI_Allreduce(
-            local.data(), global_balance.data(), components, MPI_DOUBLE,
-            MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS &&
-        MPI_Allreduce(local.data() + components, global_scale.data(),
-                      components, MPI_DOUBLE, MPI_SUM,
-                      MPI_COMM_WORLD) == MPI_SUCCESS;
-    if (!CollectiveContinue(reduced)) return false;
+    const bool balance_reduced = MPI_Allreduce(
+        local.data(), global_balance.data(), components, MPI_DOUBLE,
+        MPI_SUM, communicator_) == MPI_SUCCESS;
+    const bool scale_reduced = MPI_Allreduce(
+        local.data() + components, global_scale.data(), components,
+        MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS;
+    if (!CollectiveContinue(balance_reduced && scale_reduced)) return false;
     for (int component = 0; component < components; ++component)
     {
       const double error = std::abs(
@@ -1783,7 +1785,7 @@ public:
       const int local_claim = rank_ == config.injection.source_rank ? 1 : 0;
       int claims = 0;
       if (MPI_Allreduce(&local_claim, &claims, 1, MPI_INT, MPI_SUM,
-                        MPI_COMM_WORLD) != MPI_SUCCESS || claims != 1)
+                        communicator_) != MPI_SUCCESS || claims != 1)
       {
         injection_protocol_failure = true;
         result.reason = FailureReason::collective_protocol;
@@ -2259,11 +2261,11 @@ private:
             config.order <= generic::maximum_polynomial_order
         : config.order == smoke_polynomial_order ||
             config.order == functional_polynomial_order;
-    int world_ranks = 0;
-    const bool world_ready =
-        MPI_Comm_size(MPI_COMM_WORLD, &world_ranks) == MPI_SUCCESS;
-    bool local_valid = supported_rank && supported_order && world_ready &&
-        world_ranks == config.expected_rank_count;
+    int collective_ranks = 0;
+    const bool communicator_ready = communicator_ != MPI_COMM_NULL &&
+        MPI_Comm_size(communicator_, &collective_ranks) == MPI_SUCCESS;
+    bool local_valid = supported_rank && supported_order && communicator_ready &&
+        collective_ranks == config.expected_rank_count;
     int local_elements = 0;
 
     if (config.use_borrowed_topology)
@@ -2280,13 +2282,14 @@ private:
               config.borrowed_global_topology));
       if (local_valid)
       {
-        int caller_world = MPI_UNEQUAL;
+        int caller_collective = MPI_UNEQUAL;
         int mesh_caller = MPI_UNEQUAL;
         const MPI_Comm mesh_communicator = config.borrowed_mesh->GetComm();
         local_valid =
-            MPI_Comm_compare(config.borrowed_communicator, MPI_COMM_WORLD,
-                             &caller_world) == MPI_SUCCESS &&
-            (caller_world == MPI_IDENT || caller_world == MPI_CONGRUENT) &&
+            MPI_Comm_compare(config.borrowed_communicator, communicator_,
+                             &caller_collective) == MPI_SUCCESS &&
+            (caller_collective == MPI_IDENT ||
+             caller_collective == MPI_CONGRUENT) &&
             MPI_Comm_compare(config.borrowed_communicator, mesh_communicator,
                              &mesh_caller) == MPI_SUCCESS &&
             (mesh_caller == MPI_IDENT || mesh_caller == MPI_CONGRUENT) &&
@@ -2398,15 +2401,18 @@ private:
     long long global_face_measure = 0;
     long long global_physical_faces = 0;
     const bool element_census = MPI_Allreduce(&local_element_count,
-        &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+        &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM,
+        communicator_) == MPI_SUCCESS;
     const bool face_census = MPI_Allreduce(&local_face_measure,
-        &global_face_measure, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+        &global_face_measure, 1, MPI_LONG_LONG_INT, MPI_SUM,
+        communicator_) == MPI_SUCCESS;
     const bool boundary_census = MPI_Allreduce(&local_physical_faces,
-        &global_physical_faces, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+        &global_physical_faces, 1, MPI_LONG_LONG_INT, MPI_SUM,
+        communicator_) == MPI_SUCCESS;
     const bool policy_usage_census = MPI_Allreduce(local_policy_uses.data(),
         global_policy_uses.data(),
         static_cast<int>(global_policy_uses.size()), MPI_LONG_LONG_INT,
-        MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+        MPI_SUM, communicator_) == MPI_SUCCESS;
     bool every_policy_used = config.borrowed_boundary_policies.count == 0
         ? global_physical_faces == 0
         : global_physical_faces > 0;
@@ -2427,8 +2433,8 @@ private:
   bool ConfigureDeviceAndRanks(const CudaConfig& config,
                                CudaRunEvidence& evidence) noexcept
   {
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
-    MPI_Comm_size(MPI_COMM_WORLD, &ranks_);
+    MPI_Comm_rank(communicator_, &rank_);
+    MPI_Comm_size(communicator_, &ranks_);
     const bool rank_count_valid = ranks_ == config.expected_rank_count;
     const bool cuda_set_device_valid =
         cudaSetDevice(config.requested_device) == cudaSuccess;
@@ -2556,7 +2562,7 @@ private:
     {
       if (MPI_Allgather(gpu_uuid_.data(), 16, MPI_UNSIGNED_CHAR,
                         gathered.data(), 16, MPI_UNSIGNED_CHAR,
-                        MPI_COMM_WORLD) != MPI_SUCCESS)
+                        communicator_) != MPI_SUCCESS)
         return false;
       same_physical_gpu_ =
           std::equal(gathered.begin(), gathered.begin() + 16,
@@ -2598,7 +2604,7 @@ private:
         for (int element = 0; element < global_elements; ++element)
           partition[static_cast<std::size_t>(element)] =
               element * ranks_ / global_elements;
-        owned_mesh_.emplace(MPI_COMM_WORLD, serial_mesh_, partition.data());
+        owned_mesh_.emplace(communicator_, serial_mesh_, partition.data());
         mesh_ = &*owned_mesh_;
       }
       interior_collection_.emplace(
@@ -3050,6 +3056,7 @@ private:
   bool no_fallback_ = true;
   bool oracle_captured_ = false;
   bool oracle_capture_requested_ = false;
+  MPI_Comm communicator_ = MPI_COMM_WORLD;
   int rank_ = -1;
   int ranks_ = 0;
   int device_ = -1;

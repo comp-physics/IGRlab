@@ -262,16 +262,18 @@ inline bool ValidateCudaStaticBoundaryPolicyTable(
   return true;
 }
 
-inline bool CudaBorrowedHostModeConsensus(const bool requested,
+inline bool CudaBorrowedHostModeConsensus(const MPI_Comm communicator,
+                                          const bool requested,
                                           bool& agreed_mode) noexcept
 {
+  if (communicator == MPI_COMM_NULL) return false;
   const int local = requested ? 1 : 0;
   int minimum = 0;
   int maximum = 0;
   const bool minimum_ready = MPI_Allreduce(&local, &minimum, 1, MPI_INT,
-      MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+      MPI_MIN, communicator) == MPI_SUCCESS;
   const bool maximum_ready = MPI_Allreduce(&local, &maximum, 1, MPI_INT,
-      MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+      MPI_MAX, communicator) == MPI_SUCCESS;
   const bool consensus_ok = minimum_ready && maximum_ready &&
       minimum == maximum && (minimum == 0 || minimum == 1);
   agreed_mode = consensus_ok && minimum == 1;
@@ -338,6 +340,18 @@ struct CudaConfig
   bool force_private_scientific_gate_failure = false;
   CudaInjection injection{};
 };
+
+/**
+ * Select the communicator that owns every collective in one CUDA engine.
+ * Borrowed generic sessions retain their request/mesh communicator for the
+ * full engine lifetime.  The frozen generated-topology/direct-config route
+ * remains MPI_COMM_WORLD-bound for compatibility.
+ */
+inline MPI_Comm CudaCollectiveCommunicator(const CudaConfig& config) noexcept
+{
+  return config.borrowed_communicator != MPI_COMM_NULL
+      ? config.borrowed_communicator : MPI_COMM_WORLD;
+}
 
 enum class CudaAllocationSite : unsigned char
 {

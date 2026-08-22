@@ -645,8 +645,6 @@ inline bool ExactNumericalPolicyConsensus(
 inline ContractStatus ValidateEulerHdgRequest(
     const EulerHdgRequest& request) noexcept
 {
-  if (request.mesh == nullptr) { return ContractStatus::null_mesh; }
-
   int mpi_initialized = 0;
   int mpi_finalized = 0;
   if (MPI_Initialized(&mpi_initialized) != MPI_SUCCESS || !mpi_initialized ||
@@ -654,22 +652,35 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     return ContractStatus::incompatible_communicator;
   }
+  if (request.communicator == MPI_COMM_NULL)
+  {
+    return ContractStatus::null_communicator;
+  }
+  // The request communicator is the sole collective authority.  Establish
+  // mesh presence on it before any rank dereferences a borrowed mesh: one
+  // rank-local null must reject the complete request instead of letting the
+  // null rank return while its peers enter mesh collectives.
+  const int local_mesh_present = request.mesh == nullptr ? 0 : 1;
+  int every_mesh_present = 0;
+  if (MPI_Allreduce(&local_mesh_present, &every_mesh_present, 1, MPI_INT,
+                    MPI_MIN, request.communicator) != MPI_SUCCESS)
+  {
+    return ContractStatus::collective_failure;
+  }
+  if (every_mesh_present != 1) { return ContractStatus::null_mesh; }
+
   const MPI_Comm mesh_communicator = request.mesh->GetComm();
   ContractStatus local_status = ContractStatus::accepted;
   int comparison = MPI_UNEQUAL;
-  if (request.communicator == MPI_COMM_NULL)
-  {
-    RecordFailure(local_status, ContractStatus::null_communicator);
-  }
-  else if (MPI_Comm_compare(request.communicator, mesh_communicator,
-                            &comparison) != MPI_SUCCESS ||
-           (comparison != MPI_IDENT && comparison != MPI_CONGRUENT))
+  if (MPI_Comm_compare(request.communicator, mesh_communicator,
+                       &comparison) != MPI_SUCCESS ||
+      (comparison != MPI_IDENT && comparison != MPI_CONGRUENT))
   {
     RecordFailure(local_status, ContractStatus::incompatible_communicator);
   }
   // Keep this fixed sequence even for malformed local input: validation is
   // collective, and every numerical choice has exact rank agreement.
-  if (!ExactNumericalPolicyConsensus(mesh_communicator,
+  if (!ExactNumericalPolicyConsensus(request.communicator,
                                      request.numerical_policy) ||
       !ValidEulerHdgNumericalPolicy(request.numerical_policy))
   {
@@ -742,7 +753,7 @@ inline ContractStatus ValidateEulerHdgRequest(
   // Every mesh rank enters the same metadata/payload sequence and receives the
   // same invalid-boundary disposition for unequal policy bits.
   const bool exact_boundary_policy = ExactEulerBoundaryPolicyConsensus(
-      mesh_communicator, request.boundary.policies);
+      request.communicator, request.boundary.policies);
   const bool valid_boundary_policy = IsValidEulerBoundaryPolicyTable(
       request.boundary.policies, request.mesh->SpaceDimension(),
       boundary_attribute_count);
@@ -751,7 +762,8 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     RecordFailure(local_status, ContractStatus::invalid_boundary_operator);
   }
-  return CollectAdmissionStatus(mesh_communicator, local_status, local_elements);
+  return CollectAdmissionStatus(
+      request.communicator, local_status, local_elements);
 }
 
 }  // namespace dg::hdg::generic

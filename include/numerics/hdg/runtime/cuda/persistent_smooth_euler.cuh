@@ -96,16 +96,24 @@ struct CudaTransportPolicy
 /** Real rank-1/rank-2 reduction policy consumed by PersistentRunContract. */
 struct CudaMpiCollectivePolicy
 {
-  static CollectiveAdmissionReport Admit(
+  explicit CudaMpiCollectivePolicy(
+      const MPI_Comm communicator = MPI_COMM_WORLD) noexcept
+      : communicator_(communicator)
+  {}
+
+  CollectiveAdmissionReport Admit(
       const AttemptCollectiveContext& context, bool prepared,
-      FailureReason reason, std::uint32_t expected_ranks) noexcept;
-  static CollectiveGateReport Reduce(
+      FailureReason reason, std::uint32_t expected_ranks) const noexcept;
+  CollectiveGateReport Reduce(
       const AttemptCollectiveContext& context, const GateReport& gates,
-      FailureReason reason, std::uint32_t expected_ranks) noexcept;
-  static CollectiveRestoreReport ReduceRestore(
+      FailureReason reason, std::uint32_t expected_ranks) const noexcept;
+  CollectiveRestoreReport ReduceRestore(
       const RestoreCollectiveContext& context,
       RestartCompatibility compatibility, FailureReason reason,
-      std::uint32_t expected_ranks) noexcept;
+      std::uint32_t expected_ranks) const noexcept;
+
+private:
+  MPI_Comm communicator_ = MPI_COMM_WORLD;
 };
 
 namespace detail
@@ -490,7 +498,9 @@ public:
   using state_slot = typename contract_type::state_slot;
 
   explicit PersistentCudaSmoothEulerEngine(const CudaConfig& config) noexcept
-      : config_(config), facade_incarnation_(
+      : config_(config),
+        communicator_(CudaCollectiveCommunicator(config)),
+        facade_incarnation_(
             detail::AcquireCudaFacadeIncarnation())
   {
     static_assert(!std::is_polymorphic<Selection>::value,
@@ -530,15 +540,15 @@ public:
   bool Initialize(CudaRunEvidence& evidence) noexcept
   {
     evidence = {};
-    MPI_Comm_rank(MPI_COMM_WORLD, &evidence.rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &evidence.ranks);
+    MPI_Comm_rank(communicator_, &evidence.rank);
+    MPI_Comm_size(communicator_, &evidence.ranks);
     const bool descriptor_consensus = ConfigurationConsensus();
     const int local_config =
         ValidateConfig() && facade_incarnation_ != 0 ? 1 : 0;
     int global_config = 0;
     const bool validity_consensus = MPI_Allreduce(
         &local_config, &global_config, 1, MPI_INT, MPI_MIN,
-        MPI_COMM_WORLD) == MPI_SUCCESS && global_config == 1;
+        communicator_) == MPI_SUCCESS && global_config == 1;
     if (!descriptor_consensus || !validity_consensus)
     {
       ForgetBorrowedHostInputPointers();
@@ -567,7 +577,8 @@ public:
     StateCoordinates initial{};
     initial.dt = 0.0;
     contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
-                      initial, numerics_.Resources());
+                      initial, numerics_.Resources(), 0,
+                      CollectivePolicy(communicator_));
     if (contract_->status() != RunStatus::ready)
     {
       evidence.status = CudaRunStatus::setup_failure;
@@ -1009,14 +1020,16 @@ public:
     contract_.reset();
     StateCoordinates initial{};
     contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
-                      initial, numerics_.Resources(), restored_frontier);
+                      initial, numerics_.Resources(), restored_frontier,
+                      CollectivePolicy(communicator_));
     const RestoreOutcome restored =
         contract_->Restore(checkpoint.descriptor, loaded);
     if (!restored.restored)
     {
       contract_.reset();
       contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
-                        initial, numerics_.Resources(), 0);
+                        initial, numerics_.Resources(), 0,
+                        CollectivePolicy(communicator_));
       next_attempt_sequence_ = 0;
     }
     else
@@ -1173,12 +1186,12 @@ private:
     int minimum[2] = {local[0], local[1]};
     int maximum[2] = {local[0], local[1]};
     const bool minimum_ready = MPI_Allreduce(
-        local, minimum, 2, MPI_INT, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+        local, minimum, 2, MPI_INT, MPI_MIN, communicator_) == MPI_SUCCESS;
     const bool maximum_ready = MPI_Allreduce(
-        local, maximum, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+        local, maximum, 2, MPI_INT, MPI_MAX, communicator_) == MPI_SUCCESS;
     int ranks = 0;
     const bool size_ready =
-        MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS;
+        MPI_Comm_size(communicator_, &ranks) == MPI_SUCCESS;
     const bool agreed = minimum_ready && maximum_ready && size_ready &&
         ranks == config_.expected_rank_count && minimum[0] == maximum[0] &&
         minimum[1] == maximum[1] && minimum[0] != 0;
@@ -1531,7 +1544,8 @@ private:
     // This collective is intentionally before MakeConfigDescriptor: that
     // descriptor has a borrowed-host-only branch and must never be entered
     // asymmetrically.
-    if (!CudaBorrowedHostModeConsensus(config_.use_borrowed_host_inputs,
+    if (!CudaBorrowedHostModeConsensus(communicator_,
+                                       config_.use_borrowed_host_inputs,
                                        borrowed_host_mode))
       return false;
     ConfigDescriptor local{};
@@ -1542,13 +1556,13 @@ private:
     maximum = local;
     int ranks = 0;
     const bool size_ready =
-        MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS;
+        MPI_Comm_size(communicator_, &ranks) == MPI_SUCCESS;
     const bool minimum_ready = MPI_Allreduce(
         local.data(), minimum.data(), static_cast<int>(local.size()),
-        MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+        MPI_UNSIGNED_CHAR, MPI_MIN, communicator_) == MPI_SUCCESS;
     const bool maximum_ready = MPI_Allreduce(
         local.data(), maximum.data(), static_cast<int>(local.size()),
-        MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+        MPI_UNSIGNED_CHAR, MPI_MAX, communicator_) == MPI_SUCCESS;
     const bool base_consensus = descriptor_complete && size_ready && minimum_ready &&
         maximum_ready && ranks == config_.expected_rank_count &&
         minimum == maximum;
@@ -1583,12 +1597,16 @@ private:
     maximum = local;
     const int complete_bit = complete ? 1 : 0;
     int all_complete = 0;
-    return MPI_Allreduce(&complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
-                         MPI_COMM_WORLD) == MPI_SUCCESS &&
-        MPI_Allreduce(local.data(), minimum.data(), static_cast<int>(local.size()),
-                      MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS &&
-        MPI_Allreduce(local.data(), maximum.data(), static_cast<int>(local.size()),
-                      MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS &&
+    const bool complete_ready = MPI_Allreduce(
+        &complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
+        communicator_) == MPI_SUCCESS;
+    const bool minimum_ready = MPI_Allreduce(
+        local.data(), minimum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MIN, communicator_) == MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        local.data(), maximum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MAX, communicator_) == MPI_SUCCESS;
+    return complete_ready && minimum_ready && maximum_ready &&
         all_complete == 1 && minimum == maximum;
   }
 
@@ -1628,12 +1646,16 @@ private:
     maximum = local;
     const int complete_bit = complete ? 1 : 0;
     int all_complete = 0;
-    return MPI_Allreduce(&complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
-                         MPI_COMM_WORLD) == MPI_SUCCESS &&
-        MPI_Allreduce(local.data(), minimum.data(), static_cast<int>(local.size()),
-                      MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS &&
-        MPI_Allreduce(local.data(), maximum.data(), static_cast<int>(local.size()),
-                      MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS &&
+    const bool complete_ready = MPI_Allreduce(
+        &complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
+        communicator_) == MPI_SUCCESS;
+    const bool minimum_ready = MPI_Allreduce(
+        local.data(), minimum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MIN, communicator_) == MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        local.data(), maximum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MAX, communicator_) == MPI_SUCCESS;
+    return complete_ready && minimum_ready && maximum_ready &&
         all_complete == 1 && minimum == maximum;
   }
 
@@ -1984,6 +2006,7 @@ private:
   };
 
   CudaConfig config_{};
+  MPI_Comm communicator_ = MPI_COMM_WORLD;
   detail::CudaPersistentNumerics<AllocatorPolicy, TransportPolicy> numerics_{};
   std::optional<contract_type> contract_{};
   PendingAttempt pending_{};

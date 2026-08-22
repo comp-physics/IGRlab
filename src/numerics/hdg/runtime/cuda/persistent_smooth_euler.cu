@@ -236,16 +236,18 @@ std::uint64_t ContextHash(const RestoreCollectiveContext& value) noexcept
 
 bool CollectiveHashConsensus(const std::uint64_t local,
                              const std::uint32_t expected,
-                             std::uint32_t& participating) noexcept
+                             std::uint32_t& participating,
+                             const MPI_Comm communicator) noexcept
 {
   int size = 0;
   std::uint64_t minimum = local;
   std::uint64_t maximum = local;
-  if (MPI_Comm_size(MPI_COMM_WORLD, &size) != MPI_SUCCESS || size <= 0 ||
+  if (communicator == MPI_COMM_NULL ||
+      MPI_Comm_size(communicator, &size) != MPI_SUCCESS || size <= 0 ||
       MPI_Allreduce(&local, &minimum, 1, MPI_UINT64_T, MPI_MIN,
-                    MPI_COMM_WORLD) != MPI_SUCCESS ||
+                    communicator) != MPI_SUCCESS ||
       MPI_Allreduce(&local, &maximum, 1, MPI_UINT64_T, MPI_MAX,
-                    MPI_COMM_WORLD) != MPI_SUCCESS)
+                    communicator) != MPI_SUCCESS)
     return false;
   participating = static_cast<std::uint32_t>(size);
   return participating == expected && minimum == maximum;
@@ -267,19 +269,20 @@ FailureReason FirstFailure(const std::uint64_t mask) noexcept
   return FailureReason::none;
 }
 
-bool ReduceMask(const std::uint64_t local, std::uint64_t& global) noexcept
+bool ReduceMask(const std::uint64_t local, std::uint64_t& global,
+                const MPI_Comm communicator) noexcept
 {
   global = local;
   return MPI_Allreduce(&local, &global, 1, MPI_UINT64_T, MPI_BOR,
-                       MPI_COMM_WORLD) == MPI_SUCCESS;
+                       communicator) == MPI_SUCCESS;
 }
 
-bool AllRanksReady(const bool local) noexcept
+bool AllRanksReady(const bool local, const MPI_Comm communicator) noexcept
 {
   const int local_value = local ? 1 : 0;
   int global_value = 0;
   return MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN,
-                       MPI_COMM_WORLD) == MPI_SUCCESS && global_value == 1;
+                       communicator) == MPI_SUCCESS && global_value == 1;
 }
 
 void ObserveHighwater(std::atomic<std::size_t>& endpoint,
@@ -652,22 +655,24 @@ CudaTransferLedgerRangeV1 CudaTransportPolicy::EndStagingRange() noexcept
 
 CollectiveAdmissionReport CudaMpiCollectivePolicy::Admit(
     const AttemptCollectiveContext& context, const bool prepared,
-    FailureReason reason, const std::uint32_t expected) noexcept
+    FailureReason reason, const std::uint32_t expected) const noexcept
 {
   CollectiveAdmissionReport report{};
   report.context = context;
   if (!prepared && reason == FailureReason::none)
     reason = FailureReason::backend_failure;
   report.identity_consistent = CollectiveHashConsensus(
-      ContextHash(context), expected, report.participating_ranks);
+      ContextHash(context), expected, report.participating_ranks,
+      communicator_);
   int local_prepared = prepared ? 1 : 0;
   int all_prepared = local_prepared;
   const bool reduced_prepared = MPI_Allreduce(
       &local_prepared, &all_prepared, 1, MPI_INT, MPI_MIN,
-      MPI_COMM_WORLD) == MPI_SUCCESS;
+      communicator_) == MPI_SUCCESS;
   report.all_prepared = reduced_prepared && all_prepared == 1;
   const std::uint64_t local_mask = FailureBit(reason);
-  report.failure_consistent = ReduceMask(local_mask, report.failure_mask);
+  report.failure_consistent = ReduceMask(
+      local_mask, report.failure_mask, communicator_);
   report.any_failure = report.failure_mask != 0 || !report.all_prepared;
   report.resolved_reason = !report.identity_consistent ||
           !report.failure_consistent
@@ -680,23 +685,24 @@ CollectiveAdmissionReport CudaMpiCollectivePolicy::Admit(
 
 CollectiveGateReport CudaMpiCollectivePolicy::Reduce(
     const AttemptCollectiveContext& context, const GateReport& gates,
-    FailureReason reason, const std::uint32_t expected) noexcept
+    FailureReason reason, const std::uint32_t expected) const noexcept
 {
   CollectiveGateReport report{};
   report.context = context;
   report.identity_consistent = CollectiveHashConsensus(
-      ContextHash(context), expected, report.participating_ranks);
+      ContextHash(context), expected, report.participating_ranks,
+      communicator_);
   const int local[6] = {gates.finite, gates.admissible, gates.recovery,
                         gates.true_residual, gates.telemetry, gates.success};
   int global[6] = {};
   const bool gate_ok = MPI_Allreduce(local, global, 6, MPI_INT, MPI_MIN,
-                                     MPI_COMM_WORLD) == MPI_SUCCESS;
+                                     communicator_) == MPI_SUCCESS;
   report.gates = {global[0] == 1, global[1] == 1, global[2] == 1,
                   global[3] == 1, global[4] == 1, global[5] == 1};
   if ((!gate_ok || !gates.All()) && reason == FailureReason::none)
     reason = FailureReason::success_gate;
-  report.failure_consistent = ReduceMask(FailureBit(reason),
-                                         report.failure_mask);
+  report.failure_consistent = ReduceMask(
+      FailureBit(reason), report.failure_mask, communicator_);
   report.any_failure = !gate_ok || !report.gates.All() ||
       report.failure_mask != 0;
   report.resolved_reason = !report.identity_consistent ||
@@ -711,27 +717,29 @@ CollectiveGateReport CudaMpiCollectivePolicy::Reduce(
 CollectiveRestoreReport CudaMpiCollectivePolicy::ReduceRestore(
     const RestoreCollectiveContext& context,
     const RestartCompatibility compatibility, FailureReason reason,
-    const std::uint32_t expected) noexcept
+    const std::uint32_t expected) const noexcept
 {
   CollectiveRestoreReport report{};
   report.context = context;
   report.identity_consistent = CollectiveHashConsensus(
-      ContextHash(context), expected, report.participating_ranks);
+      ContextHash(context), expected, report.participating_ranks,
+      communicator_);
   const auto index = static_cast<unsigned>(compatibility);
   const int local_invalid =
       index >= static_cast<unsigned>(RestartCompatibility::count) ? 1 : 0;
   int any_invalid = local_invalid;
   const bool invalid_reduced = MPI_Allreduce(
       &local_invalid, &any_invalid, 1, MPI_INT, MPI_MAX,
-      MPI_COMM_WORLD) == MPI_SUCCESS;
+      communicator_) == MPI_SUCCESS;
   const std::uint64_t local_compatibility =
       compatibility == RestartCompatibility::compatible ? 0ULL :
       (index < static_cast<unsigned>(RestartCompatibility::count) &&
        index < 64 ? 1ULL << index : 0ULL);
   const bool compatibility_reduced =
-      ReduceMask(local_compatibility, report.compatibility_mask);
-  const bool failure_reduced = ReduceMask(FailureBit(reason),
-                                          report.failure_mask);
+      ReduceMask(local_compatibility, report.compatibility_mask,
+                 communicator_);
+  const bool failure_reduced = ReduceMask(
+      FailureBit(reason), report.failure_mask, communicator_);
   report.failure_consistent = compatibility_reduced && failure_reduced &&
       invalid_reduced;
   report.any_failure = any_invalid != 0 || !report.identity_consistent ||
@@ -999,6 +1007,7 @@ bool CudaRefreshFactorAndSolve(
     mfem::HypreParMatrix& matrix, mfem::HypreParVector& rhs,
     mfem::HypreParVector& solution, mfem::HypreILU& ilu,
     mfem::HypreGMRES& gmres, const int ranks,
+    const MPI_Comm communicator,
     const double relative_tolerance, const int maximum_iterations,
     const int krylov_dimension,
     const std::uint64_t matrix_generation,
@@ -1018,7 +1027,7 @@ bool CudaRefreshFactorAndSolve(
                                      matrix_generation, setup_order);
   }
   catch (...) { policy_ready = false; }
-  if (!AllRanksReady(policy_ready)) { return false; }
+  if (!AllRanksReady(policy_ready, communicator)) { return false; }
   bool vectors_ready = false;
   try
   {
@@ -1027,7 +1036,7 @@ bool CudaRefreshFactorAndSolve(
     vectors_ready = true;
   }
   catch (...) { vectors_ready = false; }
-  if (!AllRanksReady(vectors_ready)) { return false; }
+  if (!AllRanksReady(vectors_ready, communicator)) { return false; }
   try
   {
     gmres.Mult(rhs, solution);

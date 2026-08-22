@@ -41,53 +41,61 @@ using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 
-bool IsRoot() noexcept
-{
-  int rank = -1;
-  return MPI_Comm_rank(MPI_COMM_WORLD, &rank) == MPI_SUCCESS && rank == 0;
-}
-
-bool CollectiveAll(const bool local) noexcept
-{
-  const int input = local ? 1 : 0;
-  int output = 0;
-  return MPI_Allreduce(&input, &output, 1, MPI_INT, MPI_MIN,
-                       MPI_COMM_WORLD) == MPI_SUCCESS && output == 1;
-}
-
-bool ExactDoubleConsensus(const double value) noexcept
-{
-  std::uint64_t bits = 0, minimum = 0, maximum = 0;
-  static_assert(sizeof(bits) == sizeof(value), "CUDA CFL requires binary64");
-  std::memcpy(&bits, &value, sizeof(bits));
-  const int minimum_status = MPI_Allreduce(&bits, &minimum, 1,
-      MPI_UINT64_T, MPI_MIN, MPI_COMM_WORLD);
-  const int maximum_status = MPI_Allreduce(&bits, &maximum, 1,
-      MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
-  return minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS &&
-      minimum == maximum;
-}
-
-int Reject(const std::string& reason) noexcept
-{
-  if (IsRoot())
-    std::cerr << "[hdg-main] status=Rejected reason=" << reason << '\n';
-  return 1;
-}
-
-bool WorldCongruent(const MPI_Comm communicator) noexcept
+bool IsRoot(const MPI_Comm communicator) noexcept
 {
   int initialized = 0;
   int finalized = 0;
-  int comparison = MPI_UNEQUAL;
+  int rank = -1;
+  return communicator != MPI_COMM_NULL &&
+      MPI_Initialized(&initialized) == MPI_SUCCESS && initialized &&
+      MPI_Finalized(&finalized) == MPI_SUCCESS && !finalized &&
+      MPI_Comm_rank(communicator, &rank) == MPI_SUCCESS && rank == 0;
+}
+
+bool LiveSupportedCommunicator(const MPI_Comm communicator) noexcept
+{
+  int initialized = 0;
+  int finalized = 0;
+  int rank = -1;
   int ranks = 0;
   return communicator != MPI_COMM_NULL &&
       MPI_Initialized(&initialized) == MPI_SUCCESS && initialized &&
       MPI_Finalized(&finalized) == MPI_SUCCESS && !finalized &&
-      MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS &&
-      (ranks == 1 || ranks == 2) &&
-      MPI_Comm_compare(communicator, MPI_COMM_WORLD, &comparison) == MPI_SUCCESS &&
-      (comparison == MPI_IDENT || comparison == MPI_CONGRUENT);
+      MPI_Comm_rank(communicator, &rank) == MPI_SUCCESS &&
+      MPI_Comm_size(communicator, &ranks) == MPI_SUCCESS && rank >= 0 &&
+      (ranks == 1 || ranks == 2);
+}
+
+bool CollectiveAll(const MPI_Comm communicator, const bool local) noexcept
+{
+  const int input = local ? 1 : 0;
+  int output = 0;
+  return communicator != MPI_COMM_NULL &&
+      MPI_Allreduce(&input, &output, 1, MPI_INT, MPI_MIN,
+                    communicator) == MPI_SUCCESS && output == 1;
+}
+
+bool ExactDoubleConsensus(const MPI_Comm communicator,
+                          const double value) noexcept
+{
+  if (communicator == MPI_COMM_NULL) return false;
+  std::uint64_t bits = 0, minimum = 0, maximum = 0;
+  static_assert(sizeof(bits) == sizeof(value), "CUDA CFL requires binary64");
+  std::memcpy(&bits, &value, sizeof(bits));
+  const int minimum_status = MPI_Allreduce(&bits, &minimum, 1,
+      MPI_UINT64_T, MPI_MIN, communicator);
+  const int maximum_status = MPI_Allreduce(&bits, &maximum, 1,
+      MPI_UINT64_T, MPI_MAX, communicator);
+  return minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS &&
+      minimum == maximum;
+}
+
+int Reject(const HdgEulerMainRequest& request,
+           const std::string& reason) noexcept
+{
+  if (IsRoot(request.communicator))
+    std::cerr << "[hdg-main] status=Rejected reason=" << reason << '\n';
+  return 1;
 }
 
 void AppendText(std::ostringstream& stream, const std::string& value)
@@ -320,37 +328,40 @@ std::string CaseDataConsensusText(
   return stream.str();
 }
 
-bool ExactTextConsensus(const std::string& local) noexcept
+bool ExactTextConsensus(const MPI_Comm communicator,
+                        const std::string& local) noexcept
 {
   int rank = -1;
-  if (MPI_Comm_rank(MPI_COMM_WORLD, &rank) != MPI_SUCCESS) return false;
+  if (communicator == MPI_COMM_NULL ||
+      MPI_Comm_rank(communicator, &rank) != MPI_SUCCESS) return false;
   std::uint64_t root_size = rank == 0 ? local.size() : 0;
   const bool size_broadcast = MPI_Bcast(&root_size, 1, MPI_UINT64_T, 0,
-                                        MPI_COMM_WORLD) == MPI_SUCCESS;
-  if (!CollectiveAll(size_broadcast &&
+                                        communicator) == MPI_SUCCESS;
+  if (!CollectiveAll(communicator, size_broadcast &&
       root_size <= static_cast<std::uint64_t>(std::numeric_limits<int>::max())))
     return false;
   std::string root;
   bool allocated = true;
   try { root.resize(static_cast<std::size_t>(root_size)); }
   catch (...) { allocated = false; }
-  if (!CollectiveAll(allocated)) return false;
+  if (!CollectiveAll(communicator, allocated)) return false;
   if (rank == 0 && root_size != 0)
     std::memcpy(root.data(), local.data(), static_cast<std::size_t>(root_size));
   char empty = 0;
   char* data = root.empty() ? &empty : root.data();
   const bool text_broadcast = MPI_Bcast(data, static_cast<int>(root_size),
-                                        MPI_CHAR, 0, MPI_COMM_WORLD) == MPI_SUCCESS;
-  if (!CollectiveAll(text_broadcast)) return false;
-  return CollectiveAll(local.size() == static_cast<std::size_t>(root_size) &&
-                       std::equal(local.begin(), local.end(), root.begin()));
+                                        MPI_CHAR, 0, communicator) == MPI_SUCCESS;
+  if (!CollectiveAll(communicator, text_broadcast)) return false;
+  return CollectiveAll(
+      communicator, local.size() == static_cast<std::size_t>(root_size) &&
+          std::equal(local.begin(), local.end(), root.begin()));
 }
 
 std::string Validate(const HdgEulerMainRequest& request,
                      const RegularizationSelection regularization)
 {
-  if (!WorldCongruent(request.communicator))
-    return "CUDA HDG requires MPI_COMM_WORLD-congruent ranks one or two";
+  if (!LiveSupportedCommunicator(request.communicator))
+    return "CUDA HDG requires a live one- or two-rank MPI communicator";
   if (!request.make_case_data)
     return "CUDA HDG case physics factory is empty";
   if (ToLowerCopy(request.options.device) != "cuda")
@@ -404,9 +415,10 @@ std::string ValidateCaseData(const HdgEulerCaseData& case_data,
 
 std::string CollectionName(const HdgEulerMainRequest& request)
 {
-  return request.case_config.case_name + "_hdg_cuda_p_" +
-      std::to_string(request.options.order) + "_n_" +
-      std::to_string(request.options.order == 1 ? 3 : 6);
+  return request.case_config.case_name + "_hdg_p_" +
+      std::to_string(request.options.order) + "_ref_" +
+      std::to_string(request.options.ser_ref_levels +
+                     request.options.par_ref_levels);
 }
 
 HDGParaViewMetadata Metadata(
@@ -461,11 +473,10 @@ bool FreshOutputView(mfem::ParGridFunction& published_state,
 
 int RunEulerMainBackend(const HdgEulerMainRequest& request)
 {
-  // This adapter is MPI_COMM_WORLD-bound.  Converge a rank-local bad request
-  // communicator before any later WORLD collective so a divergent caller
-  // cannot return on one rank while another advances into admission.
-  if (!CollectiveAll(WorldCongruent(request.communicator)))
-    return Reject("invalid MPI_COMM_WORLD-congruent CUDA HDG invocation");
+  // Fail locally before any rank/root/collective call when MPI is absent or
+  // finalized; a live request communicator owns every operation thereafter.
+  if (!LiveSupportedCommunicator(request.communicator))
+    return Reject(request, "invalid MPI communicator or lifecycle");
 
   std::string reason;
   RegularizationSelection regularization{};
@@ -475,9 +486,9 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     reason = Validate(request, regularization);
   }
   catch (...) { reason = "rank-local CUDA HDG request validation failed"; }
-  if (!CollectiveAll(reason.empty()))
-    return Reject(reason.empty() ? "CUDA HDG request validation failed on another rank"
-                                 : reason);
+  if (!CollectiveAll(request.communicator, reason.empty()))
+    return Reject(request, reason.empty()
+        ? "CUDA HDG request validation failed on another rank" : reason);
 
   std::string mesh_path;
   std::string consensus;
@@ -487,11 +498,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     consensus = ConsensusText(request, mesh_path, regularization);
   }
   catch (...) { reason = "CUDA HDG configuration resolution failed"; }
-  if (!CollectiveAll(!consensus.empty()))
-    return Reject(reason.empty() ? "CUDA HDG configuration resolution failed on another rank"
-                                 : reason);
-  if (!ExactTextConsensus(consensus))
-    return Reject("CUDA HDG configuration differs between MPI ranks");
+  if (!CollectiveAll(request.communicator, !consensus.empty()))
+    return Reject(request, reason.empty()
+        ? "CUDA HDG configuration resolution failed on another rank" : reason);
+  if (!ExactTextConsensus(request.communicator, consensus))
+    return Reject(request, "CUDA HDG configuration differs between MPI ranks");
 
   std::optional<mfem::Mesh> serial_mesh;
   std::string serialized_mesh;
@@ -507,10 +518,12 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         serial_mesh->SpaceDimension() == 2 && !serialized_mesh.empty();
   }
   catch (...) { local_ok = false; }
-  if (!CollectiveAll(local_ok))
-    return Reject("CUDA HDG serial mesh loading failed on at least one rank");
-  if (!ExactTextConsensus(serialized_mesh))
-    return Reject("CUDA HDG serial mesh content differs between MPI ranks");
+  if (!CollectiveAll(request.communicator, local_ok))
+    return Reject(request,
+                  "CUDA HDG serial mesh loading failed on at least one rank");
+  if (!ExactTextConsensus(request.communicator, serialized_mesh))
+    return Reject(request,
+                  "CUDA HDG serial mesh content differs between MPI ranks");
 
   std::unique_ptr<mfem::ParMesh> refined_mesh;
   MeshBuildMetadata refined_metadata;
@@ -524,7 +537,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     refined_metadata.serial_refinement_levels = request.options.ser_ref_levels;
     refined_metadata.parallel_refinement_levels = request.options.par_ref_levels;
     refined_metadata.serial_element_count = serial_mesh->GetNE();
-    refined_mesh = std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD,
+    refined_mesh = std::make_unique<mfem::ParMesh>(request.communicator,
                                                    *serial_mesh);
     serial_mesh->Clear();
     refined_metadata.local_elements_after_partitioning = refined_mesh->GetNE();
@@ -546,9 +559,9 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     reason = "CUDA HDG mesh construction failed";
     local_ok = false;
   }
-  if (!CollectiveAll(local_ok))
-    return Reject(reason.empty() ? "CUDA HDG mesh construction failed on another rank"
-                                 : reason);
+  if (!CollectiveAll(request.communicator, local_ok))
+    return Reject(request, reason.empty()
+        ? "CUDA HDG mesh construction failed on another rank" : reason);
 
   // No rank can enter this census until every rank has completed local mesh
   // construction, refinement, and expected-count arithmetic.  The count is
@@ -556,11 +569,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   long long global_refined_elements = 0;
   const bool census_complete = MPI_Allreduce(
       &local_refined_elements, &global_refined_elements, 1,
-      MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+      MPI_LONG_LONG_INT, MPI_SUM, request.communicator) == MPI_SUCCESS;
   const bool census_matches = census_complete &&
       global_refined_elements == expected_global_elements;
-  if (!CollectiveAll(census_matches))
-    return Reject("CUDA HDG parallel refinement census mismatch");
+  if (!CollectiveAll(request.communicator, census_matches))
+    return Reject(request, "CUDA HDG parallel refinement census mismatch");
 
   std::optional<CaseContext> context;
   try
@@ -569,8 +582,9 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     local_ok = true;
   }
   catch (...) { local_ok = false; }
-  if (!CollectiveAll(context.has_value() && local_ok))
-    return Reject("CUDA HDG mesh context publication failed on another rank");
+  if (!CollectiveAll(request.communicator, context.has_value() && local_ok))
+    return Reject(request,
+                  "CUDA HDG mesh context publication failed on another rank");
 
   std::optional<HdgEulerCaseData> case_data;
   std::optional<FrozenBoundaryPlan> frozen_boundary;
@@ -600,12 +614,13 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     reason = "rank-local CUDA HDG case-data resolution failed";
     local_ok = false;
   }
-  if (!CollectiveAll(local_ok && case_data.has_value()))
-    return Reject(reason.empty()
+  if (!CollectiveAll(request.communicator,
+                     local_ok && case_data.has_value()))
+    return Reject(request, reason.empty()
         ? "CUDA HDG case-data factory or validation failed on another rank"
         : reason);
-  if (!ExactTextConsensus(case_data_consensus))
-    return Reject("CUDA HDG case data differs between MPI ranks");
+  if (!ExactTextConsensus(request.communicator, case_data_consensus))
+    return Reject(request, "CUDA HDG case data differs between MPI ranks");
 
   local_ok = false;
   std::unique_ptr<mfem::L2_FECollection> collection;
@@ -649,8 +664,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         dg::hdg::generic::euler_2d_conserved_components == 0;
   }
   catch (...) { local_ok = false; }
-  if (!CollectiveAll(local_ok))
-    return Reject("CUDA HDG volume initial-state projection failed");
+  if (!CollectiveAll(request.communicator, local_ok))
+    return Reject(request, "CUDA HDG volume initial-state projection failed");
 
   try
   {
@@ -677,8 +692,9 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         static_cast<std::size_t>(boundary_attributes);
   }
   catch (...) { local_ok = false; }
-  if (!CollectiveAll(local_ok))
-    return Reject("CUDA HDG state projection or boundary lowering failed");
+  if (!CollectiveAll(request.communicator, local_ok))
+    return Reject(request,
+                  "CUDA HDG state projection or boundary lowering failed");
 
   const std::size_t scalar_count = static_cast<std::size_t>(
       volume_space->GetVSize() /
@@ -706,14 +722,15 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   GenericEulerHdgCudaSession session;
   if (session.Initialize(resolved_plan.request).status !=
       HdgEulerSessionStatus::initialized)
-    return Reject("generic CUDA session initialization failed");
+    return Reject(request, "generic CUDA session initialization failed");
   CudaMutableHostL2Output destination{};
-  if (!CollectiveAll(FreshOutputView(*published_state, scalar_count,
+  if (!CollectiveAll(request.communicator,
+                     FreshOutputView(*published_state, scalar_count,
                                      destination)))
-    return Reject("initial CUDA committed-state output view failed");
+    return Reject(request, "initial CUDA committed-state output view failed");
   local_ok = session.ExportCommittedInterior(destination);
-  if (!CollectiveAll(local_ok))
-    return Reject("initial CUDA committed-state export failed");
+  if (!CollectiveAll(request.communicator, local_ok))
+    return Reject(request, "initial CUDA committed-state export failed");
 
   std::unique_ptr<HdgTransactionalTimeAdapter> time_driver;
   std::unique_ptr<HDGParaViewSeries> output;
@@ -755,9 +772,9 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     }
   }
   catch (...) { local_ok = false; }
-  if (!CollectiveAll(time_driver != nullptr &&
+  if (!CollectiveAll(request.communicator, time_driver != nullptr &&
       (!request.options.vtk_save || output != nullptr)))
-    return Reject("CUDA HDG time/output setup failed");
+    return Reject(request, "CUDA HDG time/output setup failed");
   try
   {
     if (output)
@@ -766,8 +783,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     local_ok = true;
   }
   catch (...) { local_ok = false; }
-  if (!CollectiveAll(local_ok))
-    return Reject("CUDA HDG initial ParaView output failed");
+  if (!CollectiveAll(request.communicator, local_ok))
+    return Reject(request, "CUDA HDG initial ParaView output failed");
 
   while (!time_driver->Finished())
   {
@@ -790,9 +807,12 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       const bool proposal_valid = diagnostics_ready &&
           std::isfinite(proposed_dt) && proposed_dt > 0.0 &&
           (request.options.dt_min <= 0.0 || proposed_dt >= request.options.dt_min);
-      const bool proposal_consensus = ExactDoubleConsensus(proposed_dt);
-      if (!CollectiveAll(proposal_valid && proposal_consensus))
-        return Reject("committed CUDA CFL proposal is invalid or below --dt-min");
+      const bool proposal_consensus = ExactDoubleConsensus(
+          request.communicator, proposed_dt);
+      if (!CollectiveAll(request.communicator,
+                         proposal_valid && proposal_consensus))
+        return Reject(request,
+            "committed CUDA CFL proposal is invalid or below --dt-min");
     }
     const auto& plan = time_driver->BeginStep(proposed_dt, request.options.dt_min);
     GenericEulerCudaPreparedStep authority;
@@ -801,75 +821,88 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         HdgEulerSessionStatus::prepared)
     {
       time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
-      return Reject("generic CUDA prepared step failed");
+      return Reject(request, "generic CUDA prepared step failed");
     }
-    if (!CollectiveAll(FreshOutputView(*published_state, scalar_count,
+    if (!CollectiveAll(request.communicator,
+                       FreshOutputView(*published_state, scalar_count,
                                        destination)))
     {
       local_ok = AbortPrepared(session, authority, native_export);
       time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-      return Reject(local_ok ? "CUDA prepared-state output view failed"
-                             : "CUDA prepared abort failed after output-view failure");
+      return Reject(request,
+          local_ok ? "CUDA prepared-state output view failed"
+                   : "CUDA prepared abort failed after output-view failure");
     }
     local_ok = session.ExportPreparedInterior(authority, native_export,
                                               destination);
-    if (!CollectiveAll(local_ok))
+    if (!CollectiveAll(request.communicator, local_ok))
     {
       local_ok = AbortPrepared(session, authority, native_export);
       time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-      return Reject(local_ok ? "CUDA prepared-state export failed"
-                             : "CUDA prepared abort failed after export failure");
+      return Reject(request,
+          local_ok ? "CUDA prepared-state export failed"
+                   : "CUDA prepared abort failed after export failure");
     }
     if (!session.AcknowledgePreparedOutput(authority, native_export))
     {
       local_ok = AbortPrepared(session, authority, native_export);
       time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-      return Reject(local_ok ? "CUDA prepared output acknowledgement failed"
-                             : "CUDA prepared abort failed after acknowledgement failure");
+      return Reject(request,
+          local_ok ? "CUDA prepared output acknowledgement failed"
+                   : "CUDA prepared abort failed after acknowledgement failure");
     }
 
     std::optional<HdgTransactionalTimeAdapter::OutputEvent> preview;
     try { preview = time_driver->PreviewFinalizedOutput(); local_ok = true; }
     catch (...) { local_ok = false; }
-    if (!CollectiveAll(local_ok))
+    if (!CollectiveAll(request.communicator, local_ok))
     {
       local_ok = AbortPrepared(session, authority, native_export);
       time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-      return Reject(local_ok ? "CUDA output preview failed"
-                             : "CUDA prepared abort failed after preview failure");
+      return Reject(request,
+          local_ok ? "CUDA output preview failed"
+                   : "CUDA prepared abort failed after preview failure");
     }
     if (session.Commit(std::move(authority), native_export).status !=
         HdgEulerSessionStatus::committed)
-      return Reject("generic CUDA prepared commit failed");
+      return Reject(request, "generic CUDA prepared commit failed");
     // Publication remains post-commit: replace the staged physical candidate
     // with the engine's committed bytes before finalizing time/output.
-    if (!CollectiveAll(FreshOutputView(*published_state, scalar_count,
+    if (!CollectiveAll(request.communicator,
+                       FreshOutputView(*published_state, scalar_count,
                                        destination)))
-      return Reject("CUDA committed-state output view failed after commit");
+      return Reject(request,
+                    "CUDA committed-state output view failed after commit");
     local_ok = session.ExportCommittedInterior(destination);
-    if (!CollectiveAll(local_ok))
-      return Reject("CUDA committed-state export failed after commit");
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(request,
+                    "CUDA committed-state export failed after commit");
 
     std::optional<HdgTransactionalTimeAdapter::OutputEvent> finalized;
     try { finalized = time_driver->FinalizeSuccess(); local_ok = true; }
     catch (...) { local_ok = false; }
-    if (!CollectiveAll(local_ok))
-      return Reject("CUDA time transaction finalization failed after commit");
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(request,
+                    "CUDA time transaction finalization failed after commit");
     local_ok = preview.has_value() == finalized.has_value();
     if (local_ok && preview)
-      local_ok = preview->cycle == finalized->cycle && preview->time == finalized->time;
-    if (!CollectiveAll(local_ok))
-      return Reject("CUDA finalized output differs from its preview");
+      local_ok = preview->cycle == finalized->cycle &&
+          preview->time == finalized->time &&
+          preview->is_initial == finalized->is_initial &&
+          preview->is_final == finalized->is_final;
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(request,
+                    "CUDA finalized output differs from its preview");
     if (output && finalized)
     {
       try { output->Write(Metadata(*finalized, time_driver->solver_step())); local_ok = true; }
       catch (...) { local_ok = false; }
-      if (!CollectiveAll(local_ok))
-        return Reject("CUDA ParaView output failed after commit");
+      if (!CollectiveAll(request.communicator, local_ok))
+        return Reject(request, "CUDA ParaView output failed after commit");
     }
   }
 
-  if (IsRoot())
+  if (IsRoot(request.communicator))
     std::cout << "[hdg-main] status=Success step=" << time_driver->solver_step()
               << " time=" << time_driver->time() << " output_cycle="
               << time_driver->output_cycle() << " regularization="
