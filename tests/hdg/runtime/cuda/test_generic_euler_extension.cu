@@ -1280,8 +1280,14 @@ bool RejectedBeforeMfemDevice(const EulerHdgRequest& request)
 bool CheckContractAdmission(const int order)
 {
   mfem::ParMesh mesh = MakePhysicalMesh();
-  BorrowedFields fields = MakeBorrowedFields(
-      mesh, order, SourceMode::nonzero);
+  // Keep this pre-device contract fixture host-only.  ProjectCoefficient on a
+  // CUDA-enabled MFEM build requires an admitted Device, while the malformed
+  // session cases below deliberately prove rejection before Device setup.
+  BorrowedFields fields{};
+  fields.volume_scalar_count = 1;
+  fields.initial = {1.0, 0.05, -0.02, 2.60};
+  fields.initial_true_trace = fields.initial;
+  fields.source = {0.25, 0.125, -0.1875, 0.375};
   BoundaryContext boundary{};
   EulerHdgRequest conventional = MakeRequest(
       mesh, order, fields, boundary, true, RegularizationKind::none);
