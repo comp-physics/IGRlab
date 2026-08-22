@@ -142,6 +142,7 @@ public:
         generic::ValidEulerHdgNumericalPolicy(request.numerical_policy) &&
         !generic::IsAbsentEulerBoundaryPolicyTable(
             request.boundary.policies) &&
+        request.boundary.exterior_state != nullptr &&
         request.initial_state.components == cuda_w8a::conserved_components &&
         request.initial_state.scalar_count %
             static_cast<std::size_t>(cuda_w8a::conserved_components) == 0 &&
