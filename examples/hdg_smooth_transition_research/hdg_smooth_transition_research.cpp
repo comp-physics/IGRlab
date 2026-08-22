@@ -86,10 +86,20 @@ int main(int argc, char* argv[])
 
   spec.make_hdg_case_data = [](const SmoothTransitionResearchOptions&,
                                 const dg_sim::CaseConfig& case_config,
-                                const dg_sim::CommonOptions&,
+                                const dg_sim::CommonOptions& options,
                                 const dg_sim::CaseContext& context)
   {
     dg_sim::hdg::HdgEulerCaseData data;
+    data.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
+    // These are declared numerical roles, not a legacy-solver selector.
+    data.numerical_policy.volume_projection_quadrature_order = 14;
+    data.numerical_policy.true_trace_projection_quadrature_order = 14;
+    data.numerical_policy.conventional_assembly_quadrature_order = 11;
+    data.numerical_policy.igr_assembly_quadrature_order = 12;
+    data.numerical_policy.audit_quadrature_order = 14;
+    data.numerical_policy.observable_quadrature_order = 11;
+    data.numerical_policy.maximum_nonlinear_updates = 20;
     data.initial_condition =
       MakeSmoothTransitionInitialCondition(case_config.gamma);
 

@@ -148,8 +148,11 @@ EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
   request.backend = {BackendKind::cpu, -1};
   request.capabilities = cpu_capabilities;
   request.initial_state = {initial.data(), initial.size(), 4};
+  request.initial_true_trace = {nullptr, 0, 4};
   request.source = {source.data(), source.size(), 4};
   request.boundary = {&boundary, NonperiodicExterior};
+  request.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
   return request;
 }
 
@@ -350,8 +353,11 @@ bool CheckBorrowedTraceRestrictsInterior()
         ? dg::hdg::generic::EulerFieldView{zero_local_initial.data(),
                                            zero_local_initial.size(), 4}
         : dg::hdg::generic::EulerFieldView{initial.data(), initial.size(), 4};
+    request.initial_true_trace = {nullptr, 0, 4};
     request.source = {nullptr, 0, 4};
     request.boundary = {&boundary, NonperiodicExterior};
+    request.numerical_policy =
+        dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
     if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
         dg::hdg::generic::ContractStatus::accepted)
     {
@@ -673,7 +679,7 @@ bool CheckPrivateTracedScalarIgrLifecycle()
                                       0.00, 0.00, 0.03, 0.04}};
   BoundaryContext boundary{};
   EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
-  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  request.numerical_policy.stabilization = {RegularizationKind::igr, 0.2, 0.4};
   GenericEulerHdgCpuSession session;
   const auto initialized = session.Initialize(request);
   if (initialized.status != GenericEulerCpuSessionStatus::initialized) return false;
@@ -756,7 +762,7 @@ bool CheckPrivateTracedScalarIgrZeroLocal()
   const std::array<double, 8> source{};
   BoundaryContext boundary{};
   EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
-  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  request.numerical_policy.stabilization = {RegularizationKind::igr, 0.2, 0.4};
   GenericEulerHdgCpuSession session;
   const auto initialized = session.Initialize(request);
   const auto advanced = initialized.status == GenericEulerCpuSessionStatus::initialized
@@ -779,7 +785,7 @@ bool CheckPrivateTracedScalarIgrInitializationDeterminism()
                                       0.00, 0.00, 0.03, 0.04}};
   BoundaryContext boundary{};
   EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
-  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  request.numerical_policy.stabilization = {RegularizationKind::igr, 0.2, 0.4};
   mfem::L2_FECollection collection(1, 2, mfem::BasisType::GaussLegendre,
                                    mfem::FiniteElement::VALUE);
   mfem::ParFiniteElementSpace space(&mesh, &collection, 4,

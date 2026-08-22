@@ -15,6 +15,7 @@
 #include "sim/config/case_config.hpp"
 #include "sim/context/case_context.hpp"
 #include "sim/wiring/euler_boundary_plan.hpp"
+#include "numerics/hdg/generic/contract.hpp"
 
 namespace dg_sim::hdg
 {
@@ -32,6 +33,9 @@ struct HdgEulerCaseData
   std::unique_ptr<mfem::VectorCoefficient> initial_condition;
   std::unique_ptr<mfem::VectorCoefficient> static_source;
   EulerBoundaryPlan boundary_plan;
+  /** Explicit numerical policy; factories should use the generic default when
+   * they do not request a research-specific numerical contract. */
+  dg::hdg::generic::EulerHdgNumericalPolicy numerical_policy{};
 };
 
 /**

@@ -307,6 +307,30 @@ std::string CanonicalMainRequest(
   return stream.str();
 }
 
+std::string CanonicalNumericalPolicy(
+    const dg::hdg::generic::EulerHdgNumericalPolicy& policy)
+{
+  std::ostringstream stream;
+  stream << policy.volume_projection_quadrature_order << ';'
+         << policy.true_trace_projection_quadrature_order << ';'
+         << policy.conventional_assembly_quadrature_order << ';'
+         << policy.igr_assembly_quadrature_order << ';'
+         << policy.audit_quadrature_order << ';'
+         << policy.observable_quadrature_order << ';'
+         << policy.maximum_nonlinear_updates << ';'
+         << policy.maximum_linear_iterations << ';'
+         << policy.maximum_line_search_trials << ';'
+         << static_cast<int>(policy.stabilization.kind) << ';';
+  AppendDouble(stream, policy.nonlinear_relative_tolerance);
+  AppendDouble(stream, policy.linear_relative_tolerance);
+  AppendDouble(stream, policy.true_residual_relative_tolerance);
+  AppendDouble(stream, policy.conservation_relative_tolerance);
+  AppendDouble(stream, policy.armijo_constant);
+  AppendDouble(stream, policy.stabilization.alpha);
+  AppendDouble(stream, policy.stabilization.beta);
+  return stream.str();
+}
+
 RegularizationSelection CanonicalRegularization(
     const HdgEulerMainRequest& request)
 {
@@ -571,6 +595,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     // below, while the semantic boundary plan is frozen before lowering.
     std::optional<HdgEulerCaseData> case_data;
     std::optional<FrozenBoundaryPlan> frozen_boundary;
+    dg::hdg::generic::EulerHdgNumericalPolicy numerical_policy{};
     std::string canonical_case_data;
     try
     {
@@ -592,6 +617,13 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         throw std::invalid_argument(
             "HDG Euler static source must have four components");
       }
+      numerical_policy = case_data->numerical_policy;
+      // Cases own all numerical roles except command-line regularization.
+      numerical_policy.stabilization = regularization;
+      if (!dg::hdg::generic::ValidEulerHdgNumericalPolicy(numerical_policy))
+      {
+        throw std::invalid_argument("HDG case data has an invalid numerical policy");
+      }
       frozen_boundary.emplace(FreezeBoundaryPlan(case_data->boundary_plan));
       std::ostringstream case_data_key;
       case_data_key << case_data->initial_condition->GetVDim() << ';'
@@ -601,6 +633,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         case_data_key << case_data->static_source->GetVDim() << ';';
       }
       AppendText(case_data_key, frozen_boundary->consensus_key);
+      AppendText(case_data_key, CanonicalNumericalPolicy(numerical_policy));
       canonical_case_data = case_data_key.str();
       local_ok = true;
     }
@@ -620,11 +653,14 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     }
 
     std::unique_ptr<mfem::L2_FECollection> collection;
+    std::unique_ptr<mfem::DG_Interface_FECollection> trace_collection;
     std::unique_ptr<mfem::ParFiniteElementSpace> volume_space;
+    std::unique_ptr<mfem::ParFiniteElementSpace> trace_space;
     std::unique_ptr<mfem::ParGridFunction> initial_state;
+    std::unique_ptr<mfem::ParGridFunction> local_initial_trace;
+    mfem::Vector initial_true_trace;
     std::unique_ptr<mfem::ParGridFunction> source_state;
     std::unique_ptr<mfem::ParGridFunction> published_state;
-    std::unique_ptr<HdgStateIo> state_io;
     std::optional<dg::hdg::generic::EulerBoundaryContext> boundary;
     try
     {
@@ -638,12 +674,27 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
           mfem::Ordering::byNODES);
       initial_state =
           std::make_unique<mfem::ParGridFunction>(volume_space.get());
+      trace_collection = std::make_unique<mfem::DG_Interface_FECollection>(
+          request.options.order, /*dim=*/2, mfem::FiniteElement::VALUE,
+          mfem::BasisType::GaussLegendre);
+      trace_space = std::make_unique<mfem::ParFiniteElementSpace>(
+          &context->Mesh(), trace_collection.get(),
+          dg::hdg::generic::euler_2d_conserved_components,
+          mfem::Ordering::byNODES);
+      local_initial_trace =
+          std::make_unique<mfem::ParGridFunction>(trace_space.get());
       published_state =
           std::make_unique<mfem::ParGridFunction>(volume_space.get());
-      state_io = std::make_unique<HdgStateIo>(
-          context->Mesh(), *volume_space, *initial_state);
-      state_io->ProjectBorrowedInitialConditionOnce(
-          *case_data->initial_condition);
+      if (!ProjectEulerCoefficientL2(
+              *volume_space, *initial_state, *case_data->initial_condition,
+              numerical_policy.volume_projection_quadrature_order) ||
+          !ProjectEulerTrueTraceCoefficientL2(
+              *trace_space, *local_initial_trace, initial_true_trace,
+              *case_data->initial_condition,
+              numerical_policy.true_trace_projection_quadrature_order))
+      {
+        throw std::runtime_error("HDG independent L2 initial-state projection failed");
+      }
       if (case_data->static_source)
       {
         source_state =
@@ -679,7 +730,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       request.options.order,
       backend,
       dg::hdg::generic::RequiredCapabilities(backend),
-      state_io->ImportPublishedInitialState(),
+      {initial_state->HostRead(), static_cast<std::size_t>(initial_state->Size()),
+       dg::hdg::generic::euler_2d_conserved_components},
+      {initial_true_trace.HostRead(),
+       static_cast<std::size_t>(initial_true_trace.Size()),
+       dg::hdg::generic::euler_2d_conserved_components},
       source_state
         ? dg::hdg::generic::EulerFieldView{
             source_state->HostRead(),
@@ -688,7 +743,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         : dg::hdg::generic::EulerFieldView{
             nullptr, 0, dg::hdg::generic::euler_2d_conserved_components},
       boundary->View(),
-      regularization};
+      numerical_policy};
 
     std::unique_ptr<GenericEulerHdgCpuSession> session;
     try

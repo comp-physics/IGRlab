@@ -78,8 +78,11 @@ EulerHdgRequest ValidRequest(const mfem::ParMesh& mesh,
   request.backend = {BackendKind::cpu, -1};
   request.capabilities = all_cpu_capabilities;
   request.initial_state = {initial.data(), initial.size(), 4};
+  request.initial_true_trace = {initial.data(), initial.size(), 4};
   request.source = {nullptr, 0, 4};
   request.boundary = {nullptr, ExteriorState};
+  request.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(request.polynomial_order);
   return request;
 }
 
@@ -143,6 +146,18 @@ bool CheckAcceptAndReject()
     return false;
   }
   request = ValidRequest(mesh, initial);
+  request.initial_true_trace = {initial.data(), initial.size(), 3};
+  if (ValidateEulerHdgRequest(request) != ContractStatus::invalid_initial_trace)
+  {
+    return false;
+  }
+  request = ValidRequest(mesh, initial);
+  request.numerical_policy.audit_quadrature_order = 0;
+  if (ValidateEulerHdgRequest(request) != ContractStatus::invalid_numerical_policy)
+  {
+    return false;
+  }
+  request = ValidRequest(mesh, initial);
   request.boundary.exterior_state = nullptr;
   if (ValidateEulerHdgRequest(request) !=
       ContractStatus::invalid_boundary_operator)
@@ -168,14 +183,14 @@ bool CheckIgrSelectionAdmission()
   const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
   EulerHdgRequest request = ValidRequest(mesh, initial);
   request.polynomial_order = 1;
-  request.regularization = {RegularizationKind::igr, 0.25, 0.5};
+  request.numerical_policy.stabilization = {RegularizationKind::igr, 0.25, 0.5};
   const ContractStatus valid = ValidateEulerHdgRequest(request);
   request.polynomial_order = 2;
   const ContractStatus p2 = ValidateEulerHdgRequest(request);
   mfem::ParMesh physical_mesh = MakeSquareMesh();
   EulerHdgRequest physical = ValidRequest(physical_mesh, initial);
   physical.polynomial_order = 1;
-  physical.regularization = {RegularizationKind::igr, 0.25, 0.5};
+  physical.numerical_policy.stabilization = {RegularizationKind::igr, 0.25, 0.5};
   const ContractStatus physical_boundary = ValidateEulerHdgRequest(physical);
   request.polynomial_order = 1;
   request.backend = {BackendKind::cuda, 0};
@@ -186,7 +201,7 @@ bool CheckIgrSelectionAdmission()
   int rank = 0, ranks = 0;
   MPI_Comm_rank(mesh.GetComm(), &rank);
   MPI_Comm_size(mesh.GetComm(), &ranks);
-  request.regularization.alpha = rank == 0 ? 0.25 : 0.5;
+  request.numerical_policy.stabilization.alpha = rank == 0 ? 0.25 : 0.5;
   const ContractStatus mismatch = ValidateEulerHdgRequest(request);
   int min_status = static_cast<int>(mismatch), max_status = min_status;
   const int min_result = MPI_Allreduce(MPI_IN_PLACE, &min_status, 1, MPI_INT,
@@ -198,7 +213,7 @@ bool CheckIgrSelectionAdmission()
       physical_boundary == ContractStatus::invalid_regularization &&
       cuda == ContractStatus::invalid_regularization &&
       mismatch == (ranks == 1 ? ContractStatus::accepted
-                              : ContractStatus::invalid_regularization) &&
+                              : ContractStatus::invalid_numerical_policy) &&
       min_result == MPI_SUCCESS && max_result == MPI_SUCCESS &&
       min_status == max_status;
 }

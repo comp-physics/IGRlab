@@ -11,10 +11,12 @@
 
 #include <mfem.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <type_traits>
 #include <vector>
@@ -50,6 +52,37 @@ struct RegularizationSelection
   double beta;
 };
 
+/** Rank-identical numerical choices for one Euler HDG invocation. */
+struct EulerHdgNumericalPolicy
+{
+  // All quadrature members are MFEM integration-rule orders.
+  int volume_projection_quadrature_order;
+  int true_trace_projection_quadrature_order;
+  int conventional_assembly_quadrature_order;
+  int igr_assembly_quadrature_order;
+  int audit_quadrature_order;
+  int observable_quadrature_order;
+  int maximum_nonlinear_updates;
+  int maximum_linear_iterations;
+  int maximum_line_search_trials;
+  double nonlinear_relative_tolerance;
+  double linear_relative_tolerance;
+  double true_residual_relative_tolerance;
+  double conservation_relative_tolerance;
+  double armijo_constant;
+  RegularizationSelection stabilization;
+};
+
+/** Preserve the pre-policy generic CPU numerical choices for order @p p. */
+constexpr EulerHdgNumericalPolicy DefaultEulerHdgNumericalPolicy(
+    const int p) noexcept
+{
+  const int quadrature = 2 * p + 2;
+  return {quadrature, quadrature, quadrature, quadrature, quadrature,
+          quadrature, 80, 100, 13, 1.0e-10, 1.0e-10, 1.0e-10,
+          1.0e-10, 1.0e-4, {RegularizationKind::none, 0.0, 0.0}};
+}
+
 enum class ContractStatus : std::uint8_t
 {
   accepted,
@@ -67,7 +100,9 @@ enum class ContractStatus : std::uint8_t
   invalid_source,
   invalid_boundary_operator,
   collective_failure,
-  invalid_regularization
+  invalid_regularization,
+  invalid_initial_trace,
+  invalid_numerical_policy
 };
 
 enum class Capability : std::uint32_t
@@ -141,9 +176,11 @@ struct EulerHdgRequest
   BackendSelection backend;
   std::uint32_t capabilities;
   EulerFieldView initial_state;
+  /** Independently projected component-major owned true-trace coordinates. */
+  EulerFieldView initial_true_trace;
   EulerFieldView source;
   BoundaryOperatorView boundary;
-  RegularizationSelection regularization;
+  EulerHdgNumericalPolicy numerical_policy;
 };
 
 static_assert(std::is_standard_layout<BackendSelection>::value &&
@@ -161,6 +198,9 @@ static_assert(std::is_standard_layout<BoundaryOperatorView>::value &&
 static_assert(std::is_standard_layout<RegularizationSelection>::value &&
                   std::is_trivial<RegularizationSelection>::value,
               "generic HDG regularization must stay POD");
+static_assert(std::is_standard_layout<EulerHdgNumericalPolicy>::value &&
+                  std::is_trivial<EulerHdgNumericalPolicy>::value,
+              "generic HDG numerical policy must stay POD");
 static_assert(std::is_standard_layout<EulerHdgRequest>::value &&
                   std::is_trivial<EulerHdgRequest>::value &&
                   !std::is_polymorphic<EulerHdgRequest>::value,
@@ -189,6 +229,36 @@ inline bool ValidRegularizationSelection(
   return selection.kind == RegularizationKind::igr &&
       std::isfinite(selection.alpha) && selection.alpha > 0.0 &&
       std::isfinite(selection.beta) && selection.beta > 0.0;
+}
+
+inline bool ValidEulerHdgNumericalPolicy(
+    const EulerHdgNumericalPolicy& policy) noexcept
+{
+  const int positive_integers[] = {
+      policy.volume_projection_quadrature_order,
+      policy.true_trace_projection_quadrature_order,
+      policy.conventional_assembly_quadrature_order,
+      policy.igr_assembly_quadrature_order,
+      policy.audit_quadrature_order,
+      policy.observable_quadrature_order,
+      policy.maximum_nonlinear_updates,
+      policy.maximum_linear_iterations,
+      policy.maximum_line_search_trials};
+  for (const int value : positive_integers)
+  {
+    if (value <= 0) { return false; }
+  }
+  const double positive_reals[] = {policy.nonlinear_relative_tolerance,
+                                   policy.linear_relative_tolerance,
+                                   policy.true_residual_relative_tolerance,
+                                   policy.conservation_relative_tolerance};
+  for (const double value : positive_reals)
+  {
+    if (!std::isfinite(value) || value <= 0.0) { return false; }
+  }
+  return std::isfinite(policy.armijo_constant) &&
+      policy.armijo_constant > 0.0 && policy.armijo_constant < 1.0 &&
+      ValidRegularizationSelection(policy.stabilization);
 }
 
 /**
@@ -315,6 +385,50 @@ inline ContractStatus CollectAdmissionStatus(
       : status;
 }
 
+inline bool ExactNumericalPolicyConsensus(
+    const MPI_Comm communicator, const EulerHdgNumericalPolicy& policy) noexcept
+{
+  const int integers[] = {
+      policy.volume_projection_quadrature_order,
+      policy.true_trace_projection_quadrature_order,
+      policy.conventional_assembly_quadrature_order,
+      policy.igr_assembly_quadrature_order,
+      policy.audit_quadrature_order,
+      policy.observable_quadrature_order,
+      policy.maximum_nonlinear_updates,
+      policy.maximum_linear_iterations,
+      policy.maximum_line_search_trials,
+      static_cast<int>(policy.stabilization.kind)};
+  std::uint64_t reals[] = {
+      DoubleBits(policy.nonlinear_relative_tolerance),
+      DoubleBits(policy.linear_relative_tolerance),
+      DoubleBits(policy.true_residual_relative_tolerance),
+      DoubleBits(policy.conservation_relative_tolerance),
+      DoubleBits(policy.armijo_constant),
+      DoubleBits(policy.stabilization.alpha),
+      DoubleBits(policy.stabilization.beta)};
+  int minimum_integers[sizeof(integers) / sizeof(*integers)]{};
+  int maximum_integers[sizeof(integers) / sizeof(*integers)]{};
+  std::uint64_t minimum_reals[sizeof(reals) / sizeof(*reals)]{};
+  std::uint64_t maximum_reals[sizeof(reals) / sizeof(*reals)]{};
+  return MPI_Allreduce(integers, minimum_integers,
+                       static_cast<int>(sizeof(integers) / sizeof(*integers)),
+                       MPI_INT, MPI_MIN, communicator) == MPI_SUCCESS &&
+      MPI_Allreduce(integers, maximum_integers,
+                    static_cast<int>(sizeof(integers) / sizeof(*integers)),
+                    MPI_INT, MPI_MAX, communicator) == MPI_SUCCESS &&
+      MPI_Allreduce(reals, minimum_reals,
+                    static_cast<int>(sizeof(reals) / sizeof(*reals)),
+                    MPI_UINT64_T, MPI_MIN, communicator) == MPI_SUCCESS &&
+      MPI_Allreduce(reals, maximum_reals,
+                    static_cast<int>(sizeof(reals) / sizeof(*reals)),
+                    MPI_UINT64_T, MPI_MAX, communicator) == MPI_SUCCESS &&
+      std::equal(std::begin(minimum_integers), std::end(minimum_integers),
+                 std::begin(maximum_integers)) &&
+      std::equal(std::begin(minimum_reals), std::end(minimum_reals),
+                 std::begin(maximum_reals));
+}
+
 inline ContractStatus ValidateEulerHdgRequest(
     const EulerHdgRequest& request) noexcept
 {
@@ -341,31 +455,12 @@ inline ContractStatus ValidateEulerHdgRequest(
     RecordFailure(local_status, ContractStatus::incompatible_communicator);
   }
   // Keep this fixed sequence even for malformed local input: validation is
-  // called collectively, and agreement is byte-exact for floating payloads.
-  const int local_kind = static_cast<int>(request.regularization.kind);
-  const std::uint64_t local_alpha = DoubleBits(request.regularization.alpha);
-  const std::uint64_t local_beta = DoubleBits(request.regularization.beta);
-  int min_kind = 0, max_kind = 0;
-  std::uint64_t min_alpha = 0, max_alpha = 0, min_beta = 0, max_beta = 0;
-  const int kind_min_result = MPI_Allreduce(&local_kind, &min_kind, 1, MPI_INT,
-                                            MPI_MIN, mesh_communicator);
-  const int kind_max_result = MPI_Allreduce(&local_kind, &max_kind, 1, MPI_INT,
-                                            MPI_MAX, mesh_communicator);
-  const int alpha_min_result = MPI_Allreduce(&local_alpha, &min_alpha, 1,
-      MPI_UINT64_T, MPI_MIN, mesh_communicator);
-  const int alpha_max_result = MPI_Allreduce(&local_alpha, &max_alpha, 1,
-      MPI_UINT64_T, MPI_MAX, mesh_communicator);
-  const int beta_min_result = MPI_Allreduce(&local_beta, &min_beta, 1,
-      MPI_UINT64_T, MPI_MIN, mesh_communicator);
-  const int beta_max_result = MPI_Allreduce(&local_beta, &max_beta, 1,
-      MPI_UINT64_T, MPI_MAX, mesh_communicator);
-  if (kind_min_result != MPI_SUCCESS || kind_max_result != MPI_SUCCESS ||
-      alpha_min_result != MPI_SUCCESS || alpha_max_result != MPI_SUCCESS ||
-      beta_min_result != MPI_SUCCESS || beta_max_result != MPI_SUCCESS ||
-      min_kind != max_kind || min_alpha != max_alpha || min_beta != max_beta ||
-      !ValidRegularizationSelection(request.regularization))
+  // collective, and every numerical choice has exact rank agreement.
+  if (!ExactNumericalPolicyConsensus(mesh_communicator,
+                                     request.numerical_policy) ||
+      !ValidEulerHdgNumericalPolicy(request.numerical_policy))
   {
-    RecordFailure(local_status, ContractStatus::invalid_regularization);
+    RecordFailure(local_status, ContractStatus::invalid_numerical_policy);
   }
   if (request.backend.kind != BackendKind::cpu &&
       request.backend.kind != BackendKind::cuda)
@@ -399,7 +494,7 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     RecordFailure(local_status, ContractStatus::unsupported_polynomial_order);
   }
-  if (request.regularization.kind == RegularizationKind::igr &&
+  if (request.numerical_policy.stabilization.kind == RegularizationKind::igr &&
       (request.backend.kind != BackendKind::cpu ||
        request.polynomial_order != minimum_polynomial_order ||
        HasPhysicalBoundaryFace(*request.mesh)))
@@ -416,6 +511,12 @@ inline ContractStatus ValidateEulerHdgRequest(
   if (!IsValidField(request.initial_state, true))
   {
     RecordFailure(local_status, ContractStatus::invalid_initial_state);
+  }
+  // Empty is a compatibility request for the pre-policy derived-trace path.
+  // New main-adapter requests always supply the independently projected view.
+  if (!IsValidField(request.initial_true_trace, false))
+  {
+    RecordFailure(local_status, ContractStatus::invalid_initial_trace);
   }
   if (!IsValidField(request.source, false))
   {

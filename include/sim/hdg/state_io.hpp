@@ -18,6 +18,9 @@
  * is intentionally a zero-copy snapshot of the committed IC coordinates.
  */
 
+#include <cmath>
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <type_traits>
 
@@ -47,6 +50,166 @@ inline bool IsHdgVolumeStateAssociation(
       space.GetVDim() == hdg_euler_2d_components &&
       space.GetOrdering() == mfem::Ordering::byNODES &&
       state.ParFESpace() == &space;
+}
+
+/** L2-project one four-component coefficient on an element-owned L2 space. */
+inline bool ProjectEulerCoefficientL2(
+    mfem::ParFiniteElementSpace& space, mfem::ParGridFunction& state,
+    mfem::VectorCoefficient& coefficient, const int quadrature_order) noexcept
+{
+  try
+  {
+    if (quadrature_order <= 0 || coefficient.GetVDim() != hdg_euler_2d_components ||
+        space.GetVDim() != hdg_euler_2d_components ||
+        space.GetOrdering() != mfem::Ordering::byNODES ||
+        state.ParFESpace() != &space)
+    {
+      return false;
+    }
+    state = 0.0;
+    for (int element = 0; element < space.GetNE(); ++element)
+    {
+      const mfem::FiniteElement* const finite_element = space.GetFE(element);
+      mfem::ElementTransformation* const transformation =
+          space.GetElementTransformation(element);
+      if (!finite_element || !transformation) { return false; }
+      const int scalar_dofs = finite_element->GetDof();
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), quadrature_order);
+      if (scalar_dofs <= 0 || rule.GetNPoints() <= 0) { return false; }
+      mfem::DenseMatrix mass(scalar_dofs);
+      mass = 0.0;
+      std::array<mfem::Vector, hdg_euler_2d_components> rhs;
+      for (auto& component : rhs) { component.SetSize(scalar_dofs); component = 0.0; }
+      mfem::Vector shape(scalar_dofs);
+      mfem::Vector value(hdg_euler_2d_components);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& point = rule.IntPoint(q);
+        transformation->SetIntPoint(&point);
+        finite_element->CalcShape(point, shape);
+        coefficient.Eval(value, *transformation, point);
+        const double weight = point.weight * transformation->Weight();
+        if (!std::isfinite(weight)) { return false; }
+        for (int row = 0; row < scalar_dofs; ++row)
+        {
+          for (int column = 0; column < scalar_dofs; ++column)
+            mass(row, column) += weight * shape[row] * shape[column];
+          for (int component = 0; component < hdg_euler_2d_components; ++component)
+          {
+            if (!std::isfinite(value[component])) { return false; }
+            rhs[static_cast<std::size_t>(component)][row] +=
+                weight * shape[row] * value[component];
+          }
+        }
+      }
+      mfem::DenseMatrixInverse inverse(mass);
+      mfem::Array<int> vdofs;
+      mfem::DofTransformation transformation_map(
+          space.GetVDim(), space.GetOrdering());
+      space.GetElementVDofs(element, vdofs, transformation_map);
+      mfem::Vector local(vdofs.Size());
+      if (local.Size() != scalar_dofs * hdg_euler_2d_components) { return false; }
+      for (int component = 0; component < hdg_euler_2d_components; ++component)
+      {
+        mfem::Vector solution(scalar_dofs);
+        inverse.Mult(rhs[static_cast<std::size_t>(component)], solution);
+        for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+          local[component * scalar_dofs + scalar] = solution[scalar];
+      }
+      transformation_map.TransformPrimal(local);
+      state.SetSubVector(vdofs, local);
+    }
+    return state.CheckFinite() == 0;
+  }
+  catch (...) { return false; }
+}
+
+/**
+ * Independently L2-project an analytic Euler state onto local trace faces and
+ * publish the resulting owned true-trace coordinates.  This intentionally
+ * never samples the already-projected volume field.
+ */
+inline bool ProjectEulerTrueTraceCoefficientL2(
+    mfem::ParFiniteElementSpace& trace_space, mfem::ParGridFunction& local_trace,
+    mfem::Vector& true_trace, mfem::VectorCoefficient& coefficient,
+    const int quadrature_order) noexcept
+{
+  try
+  {
+    if (quadrature_order <= 0 || coefficient.GetVDim() != hdg_euler_2d_components ||
+        trace_space.GetVDim() != hdg_euler_2d_components ||
+        trace_space.GetOrdering() != mfem::Ordering::byNODES ||
+        local_trace.ParFESpace() != &trace_space)
+    {
+      return false;
+    }
+    local_trace = 0.0;
+    for (int face = 0; face < trace_space.GetParMesh()->GetNumFaces(); ++face)
+    {
+      const mfem::FiniteElement* const finite_element =
+          trace_space.GetFaceElement(face);
+      mfem::ElementTransformation* const transformation =
+          trace_space.GetParMesh()->GetFaceTransformation(face);
+      mfem::Array<int> vdofs;
+      trace_space.GetFaceVDofs(face, vdofs);
+      if (!finite_element || !transformation || finite_element->GetDof() <= 0 ||
+          vdofs.Size() != finite_element->GetDof() * hdg_euler_2d_components)
+      {
+        return false;
+      }
+      const int scalar_dofs = finite_element->GetDof();
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), quadrature_order);
+      if (rule.GetNPoints() <= 0) { return false; }
+      mfem::DenseMatrix mass(scalar_dofs);
+      mass = 0.0;
+      std::array<mfem::Vector, hdg_euler_2d_components> rhs;
+      for (auto& component : rhs) { component.SetSize(scalar_dofs); component = 0.0; }
+      mfem::Vector shape(scalar_dofs);
+      mfem::Vector value(hdg_euler_2d_components);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& point = rule.IntPoint(q);
+        transformation->SetIntPoint(&point);
+        finite_element->CalcShape(point, shape);
+        coefficient.Eval(value, *transformation, point);
+        const double weight = point.weight * transformation->Weight();
+        if (!std::isfinite(weight)) { return false; }
+        for (int row = 0; row < scalar_dofs; ++row)
+        {
+          for (int column = 0; column < scalar_dofs; ++column)
+            mass(row, column) += weight * shape[row] * shape[column];
+          for (int component = 0; component < hdg_euler_2d_components; ++component)
+          {
+            if (!std::isfinite(value[component])) { return false; }
+            rhs[static_cast<std::size_t>(component)][row] +=
+                weight * shape[row] * value[component];
+          }
+        }
+      }
+      mfem::DenseMatrixInverse inverse(mass);
+      for (int component = 0; component < hdg_euler_2d_components; ++component)
+      {
+        mfem::Vector solution(scalar_dofs);
+        inverse.Mult(rhs[static_cast<std::size_t>(component)], solution);
+        for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+        {
+          const int signed_dof = vdofs[scalar + scalar_dofs * component];
+          const int dof = signed_dof >= 0 ? signed_dof : -1 - signed_dof;
+          if (dof < 0 || dof >= local_trace.Size()) { return false; }
+          local_trace[dof] = (signed_dof >= 0 ? 1.0 : -1.0) * solution[scalar];
+        }
+      }
+    }
+    if (local_trace.CheckFinite() != 0) { return false; }
+    local_trace.ParallelProject(true_trace);
+    if (true_trace.Size() != trace_space.GetTrueVSize()) { return false; }
+    for (int index = 0; index < true_trace.Size(); ++index)
+      if (!std::isfinite(true_trace[index])) { return false; }
+    return true;
+  }
+  catch (...) { return false; }
 }
 
 /**

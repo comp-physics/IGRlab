@@ -60,26 +60,6 @@ StridedBlockView<T> View(T* data, const int batches, const int rows,
 
 bool Finite(const double value) noexcept { return std::isfinite(value); }
 
-bool ExactBorrowedRegularizationConsensus(
-    const MPI_Comm communicator,
-    const generic::RegularizationSelection selection) noexcept
-{
-  const int kind = static_cast<int>(selection.kind);
-  const std::uint64_t alpha = generic::DoubleBits(selection.alpha);
-  const std::uint64_t beta = generic::DoubleBits(selection.beta);
-  int min_kind = 0, max_kind = 0;
-  std::uint64_t min_alpha = 0, max_alpha = 0, min_beta = 0, max_beta = 0;
-  const int a = MPI_Allreduce(&kind, &min_kind, 1, MPI_INT, MPI_MIN, communicator);
-  const int b = MPI_Allreduce(&kind, &max_kind, 1, MPI_INT, MPI_MAX, communicator);
-  const int c = MPI_Allreduce(&alpha, &min_alpha, 1, MPI_UINT64_T, MPI_MIN, communicator);
-  const int d = MPI_Allreduce(&alpha, &max_alpha, 1, MPI_UINT64_T, MPI_MAX, communicator);
-  const int e = MPI_Allreduce(&beta, &min_beta, 1, MPI_UINT64_T, MPI_MIN, communicator);
-  const int f = MPI_Allreduce(&beta, &max_beta, 1, MPI_UINT64_T, MPI_MAX, communicator);
-  return a == MPI_SUCCESS && b == MPI_SUCCESS && c == MPI_SUCCESS &&
-      d == MPI_SUCCESS && e == MPI_SUCCESS && f == MPI_SUCCESS &&
-      min_kind == max_kind && min_alpha == max_alpha && min_beta == max_beta;
-}
-
 template <std::size_t N>
 bool Finite(const std::array<double, N>& values) noexcept
 {
@@ -2151,8 +2131,8 @@ struct detail::CpuNumericsCore::Implementation
     if (!CollectiveAll(IsIgr() && igr_scratch && igr_scratch->IsReady() &&
                        RestoreIgrCandidate())) return fail(CpuFailurePhase::setup);
     traced_scalar_igr_p1::Parameters parameters{};
-    parameters.alpha = borrowed_request->regularization.alpha;
-    parameters.beta = borrowed_request->regularization.beta;
+    parameters.alpha = borrowed_request->numerical_policy.stabilization.alpha;
+    parameters.beta = borrowed_request->numerical_policy.stabilization.beta;
     parameters.dt = attempt.dt; parameters.density_floor = density_gate;
     const auto input_for = [&](const IgrSlot& current) noexcept {
       detail::TracedScalarIgrP1GlobalStepInput input{};
@@ -2350,21 +2330,33 @@ struct detail::CpuNumericsCore::Implementation
     {
       return false;
     }
-    const std::size_t samples = view.scalar_count /
-        static_cast<std::size_t>(cpu_conserved_components);
+    if (view.components != cpu_conserved_components ||
+        view.scalar_count != static_cast<std::size_t>(field.Size()))
+    {
+      return false;
+    }
     for (int index = 0; index < field.Size(); ++index)
     {
-      const int component = space->GetOrdering() == mfem::Ordering::byNODES
-          ? index / (field.Size() / cpu_conserved_components)
-          : index % cpu_conserved_components;
-      const std::size_t scalar = static_cast<std::size_t>(
-          space->GetOrdering() == mfem::Ordering::byNODES
-              ? index % (field.Size() / cpu_conserved_components)
-              : index / cpu_conserved_components);
-      const double value = view.data[static_cast<std::size_t>(component) *
-                                     samples + scalar % samples];
+      const double value = view.data[static_cast<std::size_t>(index)];
       if (!Finite(value)) { return false; }
       values[index] = value;
+    }
+    return true;
+  }
+
+  bool FillBorrowedTrueTrace(mfem::Vector& trace,
+                             const generic::EulerFieldView view) const noexcept
+  {
+    if (view.components != cpu_conserved_components || view.data == nullptr ||
+        view.scalar_count != static_cast<std::size_t>(trace.Size()))
+    {
+      return false;
+    }
+    for (int index = 0; index < trace.Size(); ++index)
+    {
+      const double value = view.data[static_cast<std::size_t>(index)];
+      if (!Finite(value)) { return false; }
+      trace[index] = value;
     }
     return true;
   }
@@ -5219,8 +5211,9 @@ bool detail::CpuNumericsCore::RunBorrowedEuler(
 bool detail::CpuNumericsCore::InitializeBorrowedEuler(
     const generic::EulerHdgRequest& request) noexcept
 {
-  if (!ExactBorrowedRegularizationConsensus(request.communicator,
-                                            request.regularization))
+  if (!generic::ExactNumericalPolicyConsensus(request.communicator,
+                                              request.numerical_policy) ||
+      !generic::ValidEulerHdgNumericalPolicy(request.numerical_policy))
   {
     return false;
   }
@@ -5229,20 +5222,31 @@ bool detail::CpuNumericsCore::InitializeBorrowedEuler(
   // This is not a Cartesian-grid request.  Keep standalone grid provenance
   // inapplicable instead of inventing an elements-per-direction value.
   config.elements_per_direction = 0;
-  config.assembly_quadrature_order = 2 * request.polynomial_order + 2;
+  config.assembly_quadrature_order =
+      request.numerical_policy.stabilization.kind ==
+              generic::RegularizationKind::igr
+          ? request.numerical_policy.igr_assembly_quadrature_order
+          : request.numerical_policy.conventional_assembly_quadrature_order;
   // The value-only physical boundary is a frozen-exterior Picard row, so its
   // outer update is intentionally inexact rather than a differentiated
   // Newton step.  Retain the same engine while allowing that convergent outer
   // iteration enough bounded sweeps.
-  config.maximum_newton_updates = 80;
+  config.maximum_newton_updates = request.numerical_policy.maximum_nonlinear_updates;
+  config.maximum_line_search_trials =
+      request.numerical_policy.maximum_line_search_trials;
+  config.armijo_constant = request.numerical_policy.armijo_constant;
+  config.nonlinear_tolerance =
+      request.numerical_policy.nonlinear_relative_tolerance;
+  config.true_residual_tolerance =
+      request.numerical_policy.true_residual_relative_tolerance;
   RuntimeTupleDescriptor tuple{};
   tuple.model = StableIdentity::Copy("euler.conservative.2d.v1");
   tuple.formulation = StableIdentity::Copy(
-      request.regularization.kind == generic::RegularizationKind::igr
+      request.numerical_policy.stabilization.kind == generic::RegularizationKind::igr
           ? "hdg.traced-scalar-igr.p1.private.v1" : "hdg.conventional.v1");
   tuple.trace = StableIdentity::Copy("trace.dg.interface.v1");
   tuple.stabilization = StableIdentity::Copy(
-      request.regularization.kind == generic::RegularizationKind::igr
+      request.numerical_policy.stabilization.kind == generic::RegularizationKind::igr
           ? "igr.scalar.traced.alpha-beta.v1" : generic_borrowed_stabilization);
   tuple.time_treatment = StableIdentity::Copy("backward-euler.v1");
   tuple.backend = StableIdentity::Copy("cpu.host.v1");
@@ -5511,7 +5515,7 @@ bool detail::CpuNumericsCore::InitializeInternal(
   MPI_Finalized(&mpi_finalized);
   const bool generic = borrowed_request != nullptr;
   state.igr_active = generic &&
-      borrowed_request->regularization.kind ==
+      borrowed_request->numerical_policy.stabilization.kind ==
           ::dg::hdg::generic::RegularizationKind::igr;
   const bool config_consensus = !generic && mpi_initialized != 0 && mpi_finalized == 0
       ? ExactConfigConsensus(config) : false;
@@ -5847,21 +5851,25 @@ bool detail::CpuNumericsCore::InitializeInternal(
   local_ok = Copy(*state.old_interior, state.Committed()->interior) &&
       Copy(*state.trial_interior, state.first_iterate_interior);
   if (!state.CollectiveAll(local_ok)) { return false; }
-  if (!state.ProjectTrace(*state.iterate_trace, state.iterate_true_trace,
-                          false))
-  {
-    return false;
-  }
+  const bool supplied_true_trace = generic &&
+      borrowed_request->initial_true_trace.scalar_count != 0;
+  if (supplied_true_trace
+      ? !state.FillBorrowedTrueTrace(state.iterate_true_trace,
+                                     borrowed_request->initial_true_trace)
+      : !state.ProjectTrace(*state.iterate_trace, state.iterate_true_trace,
+                            false))
+  { return false; }
   if (!state.LoadTrace(state.iterate_true_trace, *state.iterate_trace))
   {
     return false;
   }
   local_ok = Copy(state.iterate_true_trace, state.Committed()->trace);
   if (!state.CollectiveAll(local_ok)) { return false; }
-  if (!state.ProjectTrace(*state.trial_trace, state.trial_true_trace, true))
-  {
-    return false;
-  }
+  if (supplied_true_trace
+      ? !state.FillBorrowedTrueTrace(state.trial_true_trace,
+                                     borrowed_request->initial_true_trace)
+      : !state.ProjectTrace(*state.trial_trace, state.trial_true_trace, true))
+  { return false; }
   if (!state.LoadTrace(state.trial_true_trace, *state.trial_trace))
   {
     return false;
@@ -5915,8 +5923,8 @@ bool detail::CpuNumericsCore::InitializeInternal(
     // No rank enters scratch initialization until every rank has constructed
     // the identical retained layout, maps, slots, and pre-sized outputs.
     traced_scalar_igr_p1::Parameters parameters{};
-    parameters.alpha = borrowed_request->regularization.alpha;
-    parameters.beta = borrowed_request->regularization.beta;
+    parameters.alpha = borrowed_request->numerical_policy.stabilization.alpha;
+    parameters.beta = borrowed_request->numerical_policy.stabilization.beta;
     parameters.dt = state.config.dt;
     parameters.density_floor = density_gate;
     detail::TracedScalarIgrP1GlobalStepInput input{};

@@ -132,6 +132,24 @@ std::string CaseDataConsensusText(const HdgEulerCaseData& case_data)
       stream << entry.marker[marker] << ',';
     stream << '\n';
   }
+  const auto& policy = case_data.numerical_policy;
+  stream << policy.volume_projection_quadrature_order << ':'
+         << policy.true_trace_projection_quadrature_order << ':'
+         << policy.conventional_assembly_quadrature_order << ':'
+         << policy.igr_assembly_quadrature_order << ':'
+         << policy.audit_quadrature_order << ':'
+         << policy.observable_quadrature_order << ':'
+         << policy.maximum_nonlinear_updates << ':'
+         << policy.maximum_linear_iterations << ':'
+         << policy.maximum_line_search_trials << ':'
+         << static_cast<int>(policy.stabilization.kind) << ':'
+         << std::setprecision(std::numeric_limits<double>::max_digits10)
+         << policy.nonlinear_relative_tolerance << ':'
+         << policy.linear_relative_tolerance << ':'
+         << policy.true_residual_relative_tolerance << ':'
+         << policy.conservation_relative_tolerance << ':'
+         << policy.armijo_constant << ':' << policy.stabilization.alpha << ':'
+         << policy.stabilization.beta << '\n';
   return stream.str();
 }
 
@@ -197,7 +215,35 @@ std::string Validate(const HdgEulerMainRequest& request)
   return {};
 }
 
-std::string ValidateCaseData(const HdgEulerCaseData& case_data)
+bool IsDefaultCudaPolicy(
+    const dg::hdg::generic::EulerHdgNumericalPolicy& policy,
+    const int order) noexcept
+{
+  const auto expected = dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
+  return policy.volume_projection_quadrature_order ==
+             expected.volume_projection_quadrature_order &&
+      policy.true_trace_projection_quadrature_order ==
+             expected.true_trace_projection_quadrature_order &&
+      policy.conventional_assembly_quadrature_order ==
+             expected.conventional_assembly_quadrature_order &&
+      policy.igr_assembly_quadrature_order == expected.igr_assembly_quadrature_order &&
+      policy.audit_quadrature_order == expected.audit_quadrature_order &&
+      policy.observable_quadrature_order == expected.observable_quadrature_order &&
+      policy.maximum_nonlinear_updates == expected.maximum_nonlinear_updates &&
+      policy.maximum_linear_iterations == expected.maximum_linear_iterations &&
+      policy.maximum_line_search_trials == expected.maximum_line_search_trials &&
+      policy.nonlinear_relative_tolerance == expected.nonlinear_relative_tolerance &&
+      policy.linear_relative_tolerance == expected.linear_relative_tolerance &&
+      policy.true_residual_relative_tolerance == expected.true_residual_relative_tolerance &&
+      policy.conservation_relative_tolerance == expected.conservation_relative_tolerance &&
+      policy.armijo_constant == expected.armijo_constant &&
+      policy.stabilization.kind == expected.stabilization.kind &&
+      policy.stabilization.alpha == expected.stabilization.alpha &&
+      policy.stabilization.beta == expected.stabilization.beta;
+}
+
+std::string ValidateCaseData(const HdgEulerCaseData& case_data,
+                             const int order)
 {
   if (!case_data.initial_condition)
     return "generic CUDA HDG requires an initial-condition coefficient";
@@ -208,6 +254,11 @@ std::string ValidateCaseData(const HdgEulerCaseData& case_data)
     return "generic CUDA HDG does not admit a static source";
   if (!OnlyPeriodic(case_data.boundary_plan))
     return "generic CUDA HDG admits periodic boundary plans only";
+  if (!dg::hdg::generic::ValidEulerHdgNumericalPolicy(case_data.numerical_policy) ||
+      !IsDefaultCudaPolicy(case_data.numerical_policy, order))
+  {
+    return "generic CUDA HDG rejects nondefault numerical policies";
+  }
   return {};
 }
 
@@ -366,7 +417,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   if (!CollectiveAll(local_ok && case_data.has_value()))
     return Reject("CUDA HDG case-data factory failed on at least one rank");
 
-  try { reason = ValidateCaseData(*case_data); }
+  try { reason = ValidateCaseData(*case_data, request.options.order); }
   catch (...) { reason = "rank-local CUDA HDG case-data validation failed"; }
   if (!CollectiveAll(reason.empty()))
     return Reject(reason.empty() ? "CUDA HDG case-data validation failed on another rank"
