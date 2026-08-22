@@ -1052,6 +1052,7 @@ namespace
 {
 constexpr double cuda_gamma = 1.4;
 constexpr double cuda_tau = 2.5;
+constexpr double cuda_density_gate = 1.0e-8;
 constexpr double cuda_pi = 3.141592653589793238462643383279502884;
 
 __device__ int ByNodes(const int scalar, const int count,
@@ -1910,7 +1911,7 @@ __global__ void BorrowedLaggedLlfAssemblyKernel(CudaDeviceView v,
         const double h = v.face_h[e * faces_per_element + face];
         const double degree_scale =
             static_cast<double>((s.order + 1) * (s.order + 1));
-        if (!(l[0] > 0.0) || !(h > 0.0) || !isfinite(h))
+        if (!(l[0] > cuda_density_gate) || !(h > 0.0) || !isfinite(h))
         { v.status[e] = -4; return; }
         tau = degree_scale / (l[0] * h);
         jump = sigma - sigma_hat;
@@ -2148,7 +2149,8 @@ __global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
                 v.work_interior[interior_offset + ByNodes(
                     scalar, s.scalar_interior_dofs, component)];
       }
-      valid = weight > 0.0 && isfinite(weight) && current[0] > 0.0 &&
+      valid = weight > 0.0 && isfinite(weight) &&
+          current[0] > cuda_density_gate &&
           isfinite(sigma);
       for (int component = 0;
            component < conserved_components && valid; ++component)
@@ -2248,6 +2250,7 @@ __global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
           out[component] += contribution;
           out[components + component] += fabs(contribution);
         }
+        valid = valid && trace[0] > cuda_density_gate;
         const double tau = degree_scale / (trace[0] * h);
         const double z_hat_normal = z[0] * normal[0] + z[1] * normal[1] -
             tau * (sigma - sigma_hat);

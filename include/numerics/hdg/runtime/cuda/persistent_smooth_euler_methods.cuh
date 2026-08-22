@@ -48,6 +48,8 @@ inline bool CudaEvaluateStaticExteriorStateHost(
       kind = mfem::EulerExteriorStateKind::SlipWall;
       break;
     case CudaStaticBoundaryPolicyKind::none:
+    case CudaStaticBoundaryPolicyKind::subsonic_outlet:
+    case CudaStaticBoundaryPolicyKind::nonreflecting:
       return false;
     }
     mfem::Vector interior_view(

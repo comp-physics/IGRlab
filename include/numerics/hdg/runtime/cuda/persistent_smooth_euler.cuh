@@ -14,6 +14,7 @@
 
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler_types.cuh"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"
+#include "physics/bc/boundary_state.hpp"
 
 #include <HYPRE_config.h>
 #include <cuda_runtime.h>
@@ -1344,6 +1345,7 @@ private:
         generic_l2_configuration &&
         initial_trace_configuration &&
         generic_numerical_configuration &&
+        (!config_.use_generic_numerical_policy || borrowed_generic_shape) &&
         boundary_policy_configuration &&
         borrowed_topology_identity &&
         !fixed_oracle_requested_for_generic_storage &&

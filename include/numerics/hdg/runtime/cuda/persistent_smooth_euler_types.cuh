@@ -170,7 +170,10 @@ enum class CudaStaticBoundaryPolicyKind : std::uint8_t
   subsonic_inlet = 4,
   subsonic_outlet_pressure = 5,
   far_field = 6,
-  nonreflecting_outlet = 7
+  nonreflecting_outlet = 7,
+  // Retained reject-only spellings used by legacy negative-admission tests.
+  subsonic_outlet = 8,
+  nonreflecting = 9
 };
 
 /** Caller-borrowed initialization descriptor; values are copied immediately. */
@@ -232,16 +235,26 @@ inline bool ValidateCudaStaticBoundaryPolicyTable(
     if (policy.attribute <= 0 ||
         !IsCudaAdmittedStaticBoundaryPolicy(policy.kind))
       return false;
-    if (policy.kind == CudaStaticBoundaryPolicyKind::supersonic_inlet ||
+    const bool needs_reference =
+        policy.kind == CudaStaticBoundaryPolicyKind::supersonic_inlet ||
         policy.kind == CudaStaticBoundaryPolicyKind::subsonic_inlet ||
         policy.kind == CudaStaticBoundaryPolicyKind::far_field ||
-        policy.kind == CudaStaticBoundaryPolicyKind::nonreflecting_outlet)
+        policy.kind == CudaStaticBoundaryPolicyKind::nonreflecting_outlet;
+    if (needs_reference)
     {
       if (!IsCudaPhysicalEulerState(policy.reference_state)) return false;
     }
-    if (!std::isfinite(policy.pressure_out) ||
-        (policy.kind == CudaStaticBoundaryPolicyKind::subsonic_outlet_pressure &&
-         !(policy.pressure_out > 0.0)))
+    else
+      for (const double value : policy.reference_state)
+        if (value != 0.0 || std::signbit(value)) return false;
+    if (policy.kind == CudaStaticBoundaryPolicyKind::
+            subsonic_outlet_pressure)
+    {
+      if (!std::isfinite(policy.pressure_out) ||
+          !(policy.pressure_out > 0.0)) return false;
+    }
+    else if (policy.pressure_out != 0.0 ||
+             std::signbit(policy.pressure_out))
       return false;
     if (i != 0 && table.policies[i - 1].attribute >= policy.attribute)
       return false;
