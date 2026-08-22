@@ -1089,6 +1089,25 @@ public:
             relative_tolerance, relative_errors);
   }
 
+  /** Detail-only audit that borrowed true-trace data is an owned copy. */
+  bool VerifyBorrowedInitialTrueTraceForTests(
+      const CudaBorrowedHostL2Input expected) noexcept
+  {
+    return initialized_ && !pending_.active &&
+        numerics_.VerifyBorrowedInitialTrueTraceForTests(expected);
+  }
+
+  /** Detail-only host/device parity check for every admitted static closure. */
+  bool VerifyStaticBoundaryClosuresForTests(
+      const double relative_tolerance,
+      std::array<double, 7>& relative_errors) noexcept
+  {
+    relative_errors.fill(std::numeric_limits<double>::infinity());
+    return initialized_ && !pending_.active &&
+        numerics_.VerifyStaticBoundaryClosuresForTests(
+            relative_tolerance, relative_errors);
+  }
+
   /** Export only the currently staged candidate; no logical publication occurs. */
   bool ExportPreparedInterior(CudaMutableHostL2Output destination) noexcept
   {

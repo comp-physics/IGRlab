@@ -33,6 +33,7 @@ using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::BorrowedCudaRank1OneGpuRuntimeSelection;
 using dg::hdg::runtime::BorrowedCudaRank2OneGpuHostStagedRuntimeSelection;
 using dg::hdg::runtime::cuda_w8a::CudaConfig;
+using dg::hdg::runtime::cuda_w8a::CudaBorrowedHostL2Input;
 using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
 using dg::hdg::runtime::cuda_w8a::CudaPrecommitSnapshot;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
@@ -165,8 +166,42 @@ enum class SourceMode
   nonzero
 };
 
+enum class InitialMode
+{
+  constant,
+  smooth_periodic
+};
+
+void EvaluateInitialState(const InitialMode mode, const mfem::Vector& point,
+                          mfem::Vector& state)
+{
+  state.SetSize(components);
+  if (mode == InitialMode::constant)
+  {
+    state[0] = 1.0;
+    state[1] = 0.05;
+    state[2] = -0.02;
+    state[3] = 2.60;
+    return;
+  }
+  constexpr double pi = 3.141592653589793238462643383279502884;
+  const double sx = std::sin(2.0 * pi * point[0]);
+  const double sy = std::sin(2.0 * pi * point[1]);
+  const double cx = std::cos(2.0 * pi * point[0]);
+  const double cy = std::cos(2.0 * pi * point[1]);
+  const double rho = 1.0 + 0.08 * sx * sy;
+  const double u = 0.22 + 0.04 * cx * sy;
+  const double v = -0.11 + 0.03 * sx * cy;
+  const double pressure = 1.0 + 0.06 * cx * cy;
+  state[0] = rho;
+  state[1] = rho * u;
+  state[2] = rho * v;
+  state[3] = pressure / 0.4 + 0.5 * rho * (u * u + v * v);
+}
+
 BorrowedFields MakeBorrowedFields(
-    mfem::ParMesh& mesh, const int order, const SourceMode source_mode)
+    mfem::ParMesh& mesh, const int order, const SourceMode source_mode,
+    const InitialMode initial_mode = InitialMode::constant)
 {
   BorrowedFields fields;
   mfem::L2_FECollection volume_collection(
@@ -176,22 +211,26 @@ BorrowedFields MakeBorrowedFields(
       &mesh, &volume_collection, components, mfem::Ordering::byNODES);
   fields.volume_scalar_count = static_cast<std::size_t>(
       volume_space.GetVSize() / components);
-  fields.initial.resize(static_cast<std::size_t>(volume_space.GetVSize()));
+  mfem::ParGridFunction volume_initial(&volume_space);
+  mfem::VectorFunctionCoefficient initial_coefficient(
+      components, [initial_mode](const mfem::Vector& point,
+                                mfem::Vector& state)
+      { EvaluateInitialState(initial_mode, point, state); });
+  volume_initial.ProjectCoefficient(initial_coefficient);
+  const double* const volume_values = volume_initial.HostRead();
+  fields.initial.assign(
+      volume_values, volume_values + volume_space.GetVSize());
   if (source_mode != SourceMode::empty)
   {
     fields.source.resize(fields.initial.size(), 0.0);
   }
   for (std::size_t scalar = 0; scalar < fields.volume_scalar_count; ++scalar)
   {
-    fields.initial[scalar] = 1.0;
-    fields.initial[fields.volume_scalar_count + scalar] = 0.05;
-    fields.initial[2 * fields.volume_scalar_count + scalar] = -0.02;
-    fields.initial[3 * fields.volume_scalar_count + scalar] = 2.60;
     if (source_mode == SourceMode::nonzero)
     {
       fields.source[scalar] = 1.0e-3;
       fields.source[fields.volume_scalar_count + scalar] = 2.0e-4;
-      fields.source[2 * fields.volume_scalar_count + scalar] = -1.0e-4;
+      fields.source[2 * fields.volume_scalar_count + scalar] = -3.0e-4;
       fields.source[3 * fields.volume_scalar_count + scalar] = 2.5e-3;
     }
   }
@@ -203,14 +242,9 @@ BorrowedFields MakeBorrowedFields(
       &mesh, &trace_collection, components, mfem::Ordering::byNODES);
   mfem::ParGridFunction local_trace(&trace_space);
   mfem::VectorFunctionCoefficient trace_coefficient(
-      components, [](const mfem::Vector&, mfem::Vector& state)
-      {
-        state.SetSize(components);
-        state[0] = 1.0;
-        state[1] = 0.05;
-        state[2] = -0.02;
-        state[3] = 2.60;
-      });
+      components, [initial_mode](const mfem::Vector& point,
+                                mfem::Vector& state)
+      { EvaluateInitialState(initial_mode, point, state); });
   local_trace.ProjectCoefficient(trace_coefficient);
   mfem::Vector true_trace;
   local_trace.GetTrueDofs(true_trace);
@@ -261,10 +295,8 @@ EulerHdgRequest MakeRequest(
   return request;
 }
 
-template <typename Selection>
-bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
-                                 const int ranks,
-                                 const int order)
+CudaConfig MakeDirectConfig(const EulerHdgRequest& request,
+                            const int ranks, const int order)
 {
   CudaConfig config{};
   config.order = order;
@@ -292,41 +324,67 @@ bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
   config.borrowed_boundary = request.boundary;
   config.use_generic_numerical_policy = true;
   config.numerical_policy = request.numerical_policy;
+  return config;
+}
+
+template <typename Selection>
+bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
+                                 const int ranks,
+                                 const int order)
+{
+  CudaConfig config = MakeDirectConfig(request, ranks, order);
 
   PersistentCudaSmoothEulerEngine<Selection> engine(config);
   CudaRunEvidence initialization{};
   std::array<double, 6> jacobian_errors{};
   constexpr double jacobian_tolerance = 5.0e-5;
   const bool initialized = engine.Initialize(initialization);
-  const bool jacobian = initialized &&
+  const bool initialized_everywhere = All(initialized, request.communicator);
+  if (!initialized_everywhere) return false;
+  const bool jacobian =
       engine.VerifyBorrowedEulerAssemblerJacobianForTests(
           jacobian_tolerance, jacobian_errors);
+  const bool jacobian_everywhere = All(jacobian, request.communicator);
+  if (!jacobian_everywhere) return false;
 
   CudaPrecommitSnapshot snapshot{};
   CudaStepEvidence step{};
   constexpr double dt = 1.0e-5;
-  const bool prepared = jacobian &&
-      engine.PrepareStep(false, dt, snapshot, step);
+  const bool prepared = engine.PrepareStep(false, dt, snapshot, step);
+  const bool prepared_everywhere = All(prepared, request.communicator);
+  if (!prepared_everywhere) return false;
   double conservation_error = std::numeric_limits<double>::infinity();
   double conservation_relative_error =
       std::numeric_limits<double>::infinity();
-  const bool conservation = prepared &&
+  const bool conservation_seam =
       engine.VerifyPreparedIgrConservationForTests(
-          conservation_error, conservation_relative_error) &&
+          conservation_error, conservation_relative_error);
+  const bool conservation = conservation_seam &&
       std::isfinite(conservation_error) &&
       std::isfinite(conservation_relative_error) &&
       conservation_relative_error <=
           config.numerical_policy.conservation_relative_tolerance;
+  const bool conservation_everywhere = All(
+      conservation, request.communicator);
+  if (!conservation_everywhere) return false;
 
   CudaPreparedOutputMetadataV1 output{};
-  const bool staged = conservation &&
-      engine.StagePreparedOutputMetadata(output, step);
-  const bool acknowledged = staged && engine.MarkOutputStaged(output);
-  const bool commit_prepared = acknowledged &&
-      engine.PrepareCommit(output, step);
-  const bool provisional = commit_prepared &&
-      engine.CommitPrepared(output, step);
-  const bool committed = provisional && engine.FinalizeCommit(output, step);
+  const bool staged = engine.StagePreparedOutputMetadata(output, step);
+  const bool staged_everywhere = All(staged, request.communicator);
+  if (!staged_everywhere) return false;
+  const bool acknowledged = engine.MarkOutputStaged(output);
+  const bool acknowledged_everywhere = All(
+      acknowledged, request.communicator);
+  if (!acknowledged_everywhere) return false;
+  const bool commit_prepared = engine.PrepareCommit(output, step);
+  const bool commit_prepared_everywhere = All(
+      commit_prepared, request.communicator);
+  if (!commit_prepared_everywhere) return false;
+  const bool provisional = engine.CommitPrepared(output, step);
+  const bool provisional_everywhere = All(
+      provisional, request.communicator);
+  if (!provisional_everywhere) return false;
+  const bool committed = engine.FinalizeCommit(output, step);
   const bool passed = committed && output.successful_commit;
   if (!passed)
   {
@@ -347,6 +405,82 @@ bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
     }
   }
   return All(passed, request.communicator);
+}
+
+template <typename Selection>
+bool CheckCopiedTraceAndBoundaryClosuresForSelection(
+    const EulerHdgRequest& request, BorrowedFields& fields,
+    const std::vector<double>& expected_trace, const int ranks,
+    const int order)
+{
+  CudaConfig config = MakeDirectConfig(request, ranks, order);
+  PersistentCudaSmoothEulerEngine<Selection> engine(config);
+  CudaRunEvidence initialization{};
+  const bool initialized = engine.Initialize(initialization);
+  const bool initialized_everywhere = All(initialized, request.communicator);
+  if (!initialized_everywhere) return false;
+
+  const double poisoned = std::numeric_limits<double>::quiet_NaN();
+  std::fill(fields.initial_true_trace.begin(),
+            fields.initial_true_trace.end(), poisoned);
+  const bool copied_trace = engine.VerifyBorrowedInitialTrueTraceForTests(
+      CudaBorrowedHostL2Input{
+          expected_trace.data(), expected_trace.size() /
+              static_cast<std::size_t>(components), components});
+  std::array<double, 7> boundary_errors{};
+  constexpr double boundary_tolerance = 2.0e-12;
+  const bool boundary_parity = engine.VerifyStaticBoundaryClosuresForTests(
+      boundary_tolerance, boundary_errors);
+  const bool passed = initialized && copied_trace && boundary_parity;
+  if (!passed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA copied-trace/boundary qualification failed order="
+                << order << " initialized=" << initialized
+                << " copied_trace=" << copied_trace
+                << " boundary_parity=" << boundary_parity
+                << " boundary_errors=";
+      for (const double error : boundary_errors) std::cerr << ' ' << error;
+      std::cerr << '\n';
+    }
+  }
+  return All(passed, request.communicator);
+}
+
+bool CheckCopiedTraceAndBoundaryClosures(const int order, const int ranks)
+{
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::empty);
+  const std::vector<double> restricted_trace = fields.initial_true_trace;
+  const std::size_t trace_scalars =
+      fields.initial_true_trace.size() / static_cast<std::size_t>(components);
+  for (std::size_t scalar = 0; scalar < trace_scalars; ++scalar)
+  {
+    fields.initial_true_trace[scalar] +=
+        5.0e-4 * static_cast<double>(1 + scalar % 3);
+    fields.initial_true_trace[trace_scalars + scalar] -=
+        3.0e-4 * static_cast<double>(1 + scalar % 2);
+    fields.initial_true_trace[2 * trace_scalars + scalar] +=
+        2.0e-4 * static_cast<double>(1 + scalar % 4);
+    fields.initial_true_trace[3 * trace_scalars + scalar] += 7.0e-4;
+  }
+  const std::vector<double> expected_trace = fields.initial_true_trace;
+  BoundaryContext boundary{};
+  const EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::igr);
+  const bool intentionally_distinct = restricted_trace != expected_trace;
+  const bool seam = ranks == 1
+      ? CheckCopiedTraceAndBoundaryClosuresForSelection<
+            BorrowedCudaRank1OneGpuRuntimeSelection>(
+                request, fields, expected_trace, ranks, order)
+      : CheckCopiedTraceAndBoundaryClosuresForSelection<
+            BorrowedCudaRank2OneGpuHostStagedRuntimeSelection>(
+                request, fields, expected_trace, ranks, order);
+  return All(intentionally_distinct && seam, request.communicator);
 }
 
 bool CheckIgrAlgebra(const int order, const int ranks)
@@ -393,6 +527,69 @@ bool DifferentValues(const std::vector<double>& left,
 {
   return left.size() == right.size() &&
       !std::equal(left.begin(), left.end(), right.begin());
+}
+
+bool ExpectedPeriodicSourceResponse(
+    const std::vector<double>& candidate,
+    const std::vector<double>& initial,
+    const std::vector<double>& source,
+    const std::size_t scalar_count,
+    const SourceMode source_mode,
+    const InitialMode initial_mode,
+    const double dt)
+{
+  if (initial_mode != InitialMode::constant) return true;
+  if (source_mode == SourceMode::empty ||
+      source_mode == SourceMode::explicit_zero)
+    return NearValues(candidate, initial);
+  if (candidate.size() != initial.size() ||
+      source.size() != initial.size() ||
+      initial.size() != scalar_count * static_cast<std::size_t>(components))
+    return false;
+  for (int component = 0; component < components; ++component)
+    for (std::size_t scalar = 0; scalar < scalar_count; ++scalar)
+    {
+      const std::size_t index = scalar_count *
+          static_cast<std::size_t>(component) + scalar;
+      const double expected_delta = dt * source[index];
+      const double actual_delta = candidate[index] - initial[index];
+      const double tolerance = 5.0e-10 + 0.05 * std::abs(expected_delta);
+      if (!std::isfinite(actual_delta) || expected_delta == 0.0 ||
+          std::signbit(actual_delta) != std::signbit(expected_delta) ||
+          std::abs(actual_delta - expected_delta) > tolerance)
+        return false;
+    }
+  return true;
+}
+
+bool GlobalRelativeDifference(const std::vector<double>& left,
+                              const std::vector<double>& right,
+                              double& relative_difference,
+                              const MPI_Comm communicator)
+{
+  std::array<double, 3> local{};
+  bool local_valid = left.size() == right.size() && !left.empty();
+  for (std::size_t index = 0; local_valid && index < left.size(); ++index)
+  {
+    const double difference = left[index] - right[index];
+    local_valid = std::isfinite(left[index]) && std::isfinite(right[index]) &&
+        std::isfinite(difference);
+    local[0] += difference * difference;
+    local[1] += left[index] * left[index];
+    local[2] += right[index] * right[index];
+  }
+  if (!local_valid) local.fill(std::numeric_limits<double>::infinity());
+  std::array<double, 3> global{};
+  const bool reduced = MPI_Allreduce(
+      local.data(), global.data(), static_cast<int>(global.size()), MPI_DOUBLE,
+      MPI_SUM, communicator) == MPI_SUCCESS;
+  const double denominator = reduced
+      ? std::max({1.0, std::sqrt(global[1]), std::sqrt(global[2])})
+      : 1.0;
+  relative_difference = reduced ? std::sqrt(global[0]) / denominator
+                                : std::numeric_limits<double>::infinity();
+  return All(reduced && local_valid && std::isfinite(relative_difference),
+             communicator);
 }
 
 bool BoundaryCoverage(const BoundaryContext& context,
@@ -519,11 +716,14 @@ bool CheckContractAdmission(const int order)
 bool CheckLifecycle(const int order, const bool physical,
                     const RegularizationKind kind,
                     const SourceMode source_mode,
+                    const InitialMode initial_mode,
                     std::vector<double>& committed_result)
 {
   mfem::ParMesh mesh = physical ? MakePhysicalMesh() : MakePeriodicMesh();
-  BorrowedFields fields = MakeBorrowedFields(mesh, order, source_mode);
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, source_mode, initial_mode);
   const std::vector<double> expected_initial = fields.initial;
+  const std::vector<double> expected_source = fields.source;
   BoundaryContext boundary{};
   EulerHdgRequest request = MakeRequest(
       mesh, order, fields, boundary, physical, kind);
@@ -539,8 +739,9 @@ bool CheckLifecycle(const int order, const bool physical,
   const bool initialized_everywhere = All(
       initialized.status == HdgEulerSessionStatus::initialized,
       request.communicator);
-  const bool initial_export = initialized_everywhere &&
-      session.ExportCommittedInterior(CudaMutableHostL2Output{
+  if (!initialized_everywhere) return false;
+  const bool initial_export = session.ExportCommittedInterior(
+      CudaMutableHostL2Output{
           committed_initial.data(), fields.volume_scalar_count, components});
   if (!All(initial_export && SameValues(committed_initial, expected_initial),
            request.communicator))
@@ -565,13 +766,17 @@ bool CheckLifecycle(const int order, const bool physical,
   const bool first_prepared_everywhere = All(
       first_prepared.status == HdgEulerSessionStatus::prepared,
       request.communicator);
-  const bool first_export = first_prepared_everywhere &&
-      session.ExportPreparedInterior(
-          first_authority, first_output,
-          CudaMutableHostL2Output{first_candidate.data(),
-                                 fields.volume_scalar_count, components});
-  const bool expected_update = source_mode != SourceMode::nonzero ||
-      DifferentValues(first_candidate, committed_initial);
+  if (!first_prepared_everywhere) return false;
+  const bool first_export = session.ExportPreparedInterior(
+      first_authority, first_output,
+      CudaMutableHostL2Output{first_candidate.data(),
+                             fields.volume_scalar_count, components});
+  const bool expected_update = physical
+      ? (source_mode != SourceMode::nonzero ||
+         DifferentValues(first_candidate, committed_initial))
+      : ExpectedPeriodicSourceResponse(
+            first_candidate, committed_initial, expected_source,
+            fields.volume_scalar_count, source_mode, initial_mode, dt);
   if (!All(first_export && expected_update,
            request.communicator))
   {
@@ -583,8 +788,9 @@ bool CheckLifecycle(const int order, const bool physical,
   const bool aborted_everywhere = All(
       aborted.status == HdgEulerSessionStatus::aborted,
       request.communicator);
-  const bool abort_export = aborted_everywhere &&
-      session.ExportCommittedInterior(CudaMutableHostL2Output{
+  if (!aborted_everywhere) return false;
+  const bool abort_export = session.ExportCommittedInterior(
+      CudaMutableHostL2Output{
           after_abort.data(), fields.volume_scalar_count, components});
   if (!All(abort_export && SameValues(after_abort, committed_initial) &&
                session.coordinates().step == before.step &&
@@ -603,11 +809,11 @@ bool CheckLifecycle(const int order, const bool physical,
   const bool retry_prepared_everywhere = All(
       retry_prepared.status == HdgEulerSessionStatus::prepared,
       request.communicator);
-  const bool retry_export = retry_prepared_everywhere &&
-      session.ExportPreparedInterior(
-          retry_authority, retry_output,
-          CudaMutableHostL2Output{retry_candidate.data(),
-                                 fields.volume_scalar_count, components});
+  if (!retry_prepared_everywhere) return false;
+  const bool retry_export = session.ExportPreparedInterior(
+      retry_authority, retry_output,
+      CudaMutableHostL2Output{retry_candidate.data(),
+                             fields.volume_scalar_count, components});
   if (!All(retry_export && NearValues(first_candidate, retry_candidate),
            request.communicator))
   {
@@ -622,8 +828,9 @@ bool CheckLifecycle(const int order, const bool physical,
   const bool committed_everywhere = All(
       committed.status == HdgEulerSessionStatus::committed,
       request.communicator);
-  const bool final_export = committed_everywhere &&
-      session.ExportCommittedInterior(CudaMutableHostL2Output{
+  if (!committed_everywhere) return false;
+  const bool final_export = session.ExportCommittedInterior(
+      CudaMutableHostL2Output{
           committed_final.data(), fields.volume_scalar_count, components});
   const auto after = session.coordinates();
   const bool boundary_coverage = BoundaryCoverage(
@@ -674,31 +881,57 @@ int main(int argc, char* argv[])
   std::vector<double> conventional_zero_source_state;
   std::vector<double> igr_empty_source_state;
   std::vector<double> igr_zero_source_state;
+  std::vector<double> conventional_nonuniform_state;
+  std::vector<double> igr_nonuniform_state;
+  const bool copied_trace_and_boundaries = order > 0 &&
+      CheckCopiedTraceAndBoundaryClosures(order, ranks);
   const bool igr_algebra = order > 0 && CheckIgrAlgebra(order, ranks);
   const bool conventional_periodic = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::nonzero,
+      InitialMode::constant,
       conventional_periodic_state);
   const bool conventional_physical = order > 0 && CheckLifecycle(
       order, true, RegularizationKind::none, SourceMode::nonzero,
+      InitialMode::constant,
       conventional_physical_state);
   const bool igr_periodic = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::igr, SourceMode::nonzero,
+      InitialMode::constant,
       igr_periodic_state);
   const bool igr_physical = order > 0 && CheckLifecycle(
       order, true, RegularizationKind::igr, SourceMode::nonzero,
+      InitialMode::constant,
       igr_physical_state);
   const bool conventional_empty_source = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::empty,
+      InitialMode::constant,
       conventional_empty_source_state);
   const bool conventional_zero_source = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::explicit_zero,
+      InitialMode::constant,
       conventional_zero_source_state);
   const bool igr_empty_source = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::igr, SourceMode::empty,
+      InitialMode::constant,
       igr_empty_source_state);
   const bool igr_zero_source = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::igr, SourceMode::explicit_zero,
+      InitialMode::constant,
       igr_zero_source_state);
+  const bool conventional_nonuniform = order > 0 && CheckLifecycle(
+      order, false, RegularizationKind::none, SourceMode::empty,
+      InitialMode::smooth_periodic, conventional_nonuniform_state);
+  const bool igr_nonuniform = order > 0 && CheckLifecycle(
+      order, false, RegularizationKind::igr, SourceMode::empty,
+      InitialMode::smooth_periodic, igr_nonuniform_state);
+  double nonuniform_relative_difference =
+      std::numeric_limits<double>::infinity();
+  const bool nonuniform_difference_ready = GlobalRelativeDifference(
+      conventional_nonuniform_state, igr_nonuniform_state,
+      nonuniform_relative_difference, MPI_COMM_WORLD);
+  const bool igr_nonuniform_effect = conventional_nonuniform &&
+      igr_nonuniform && nonuniform_difference_ready &&
+      nonuniform_relative_difference > 1.0e-10;
   const bool source_equivalence = conventional_empty_source &&
       conventional_zero_source && igr_empty_source && igr_zero_source &&
       NearValues(conventional_empty_source_state,
@@ -710,21 +943,29 @@ int main(int argc, char* argv[])
                       conventional_physical_state) &&
       DifferentValues(igr_periodic_state, igr_physical_state);
   const bool passed = (ranks == 1 || ranks == 2) && All(
-      admission && igr_algebra &&
+      admission && copied_trace_and_boundaries && igr_algebra &&
       conventional_periodic && conventional_physical &&
-      igr_periodic && igr_physical && boundary_effect && source_equivalence);
+      igr_periodic && igr_physical && boundary_effect && source_equivalence &&
+      igr_nonuniform_effect);
   if (!passed)
   {
     std::cerr << "generic CUDA Euler-extension qualification failed rank="
               << rank << " ranks=" << ranks << " order=" << order
               << " admission=" << admission
+              << " copied_trace_and_boundaries="
+              << copied_trace_and_boundaries
               << " igr_algebra=" << igr_algebra
               << " conventional_periodic=" << conventional_periodic
               << " conventional_physical=" << conventional_physical
               << " igr_periodic=" << igr_periodic
               << " igr_physical=" << igr_physical
               << " boundary_effect=" << boundary_effect
-              << " source_equivalence=" << source_equivalence << '\n';
+              << " source_equivalence=" << source_equivalence
+              << " conventional_nonuniform=" << conventional_nonuniform
+              << " igr_nonuniform=" << igr_nonuniform
+              << " igr_nonuniform_effect=" << igr_nonuniform_effect
+              << " nonuniform_relative_difference="
+              << nonuniform_relative_difference << '\n';
     return EXIT_FAILURE;
   }
   return EXIT_SUCCESS;

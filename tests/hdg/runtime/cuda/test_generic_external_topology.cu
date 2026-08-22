@@ -152,13 +152,21 @@ bool CheckNegatives(const int ranks)
   mfem::ParMesh nonquad(MPI_COMM_WORLD, triangles);
   CudaConfig geometry = BorrowedConfig(nonquad, ranks, smoke_polynomial_order,
                                        smoke_elements_per_direction);
-  return All(RejectedBeforeDevice<Backend>(unsupported_order) &&
-             RejectedBeforeDevice<Backend>(rank3) &&
-             RejectedBeforeDevice<Backend>(null_communicator) &&
-             mismatched_communicator_rejected &&
-             RejectedBeforeDevice<Backend>(capacity) &&
-             RejectedBeforeDevice<Backend>(boundary_capacity) &&
-             RejectedBeforeDevice<Backend>(geometry));
+  // Each rejection enters collective preflight.  Invoke every case in a fixed
+  // rank-independent order before combining the local results.
+  const bool unsupported_order_rejected =
+      RejectedBeforeDevice<Backend>(unsupported_order);
+  const bool rank3_rejected = RejectedBeforeDevice<Backend>(rank3);
+  const bool null_communicator_rejected =
+      RejectedBeforeDevice<Backend>(null_communicator);
+  const bool capacity_rejected = RejectedBeforeDevice<Backend>(capacity);
+  const bool boundary_capacity_rejected =
+      RejectedBeforeDevice<Backend>(boundary_capacity);
+  const bool geometry_rejected = RejectedBeforeDevice<Backend>(geometry);
+  return All(unsupported_order_rejected && rank3_rejected &&
+             null_communicator_rejected &&
+             mismatched_communicator_rejected && capacity_rejected &&
+             boundary_capacity_rejected && geometry_rejected);
 }
 }  // namespace
 
@@ -173,21 +181,35 @@ int main(int argc, char** argv)
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
   const std::string_view mode = argc == 2 ? argv[1] : "";
   const bool known_mode = mode.empty() || mode == "--negatives";
-  const bool pass = known_mode && (ranks == 1
-      ? (mode == "--negatives" ? CheckNegatives<RankOneTag>(ranks)
-         : CheckBorrowedTopology<RankOneTag>(ranks, smoke_polynomial_order,
-                                             smoke_elements_per_direction) &&
-           CheckBorrowedTopology<RankOneTag>(ranks,
-                                             functional_polynomial_order,
-                                             functional_elements_per_direction))
-      : ranks == 2
-      ? (mode == "--negatives" ? CheckNegatives<RankTwoTag>(ranks)
-         : CheckBorrowedTopology<RankTwoTag>(ranks, smoke_polynomial_order,
-                                             smoke_elements_per_direction) &&
-           CheckBorrowedTopology<RankTwoTag>(ranks,
-                                             functional_polynomial_order,
-                                             functional_elements_per_direction))
-      : false);
+  bool pass = false;
+  if (known_mode && ranks == 1)
+  {
+    if (mode == "--negatives")
+      pass = CheckNegatives<RankOneTag>(ranks);
+    else
+    {
+      const bool smoke = CheckBorrowedTopology<RankOneTag>(
+          ranks, smoke_polynomial_order, smoke_elements_per_direction);
+      const bool functional = CheckBorrowedTopology<RankOneTag>(
+          ranks, functional_polynomial_order,
+          functional_elements_per_direction);
+      pass = smoke && functional;
+    }
+  }
+  else if (known_mode && ranks == 2)
+  {
+    if (mode == "--negatives")
+      pass = CheckNegatives<RankTwoTag>(ranks);
+    else
+    {
+      const bool smoke = CheckBorrowedTopology<RankTwoTag>(
+          ranks, smoke_polynomial_order, smoke_elements_per_direction);
+      const bool functional = CheckBorrowedTopology<RankTwoTag>(
+          ranks, functional_polynomial_order,
+          functional_elements_per_direction);
+      pass = smoke && functional;
+    }
+  }
   if (!pass && rank == 0)
     std::cerr << "CUDA generic external-topology audit failed\n";
   return pass ? 0 : 1;

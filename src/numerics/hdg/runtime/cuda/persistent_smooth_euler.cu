@@ -2269,6 +2269,16 @@ __global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
 __global__ void HashKernel(const double* values,int count,std::uint64_t* out)
 {if(blockIdx.x||threadIdx.x)return;std::uint64_t h[4]={1469598103934665603ULL,1099511628211ULL^0x9e3779b97f4a7c15ULL,1469598103934665603ULL^0xd6e8feb86659fd93ULL,1099511628211ULL^0xa0761d6478bd642fULL};const unsigned char* bytes=reinterpret_cast<const unsigned char*>(values);for(int i=0;i<count*static_cast<int>(sizeof(double));++i)for(int lane=0;lane<4;++lane){h[lane]^=static_cast<std::uint64_t>(bytes[i]+17U*lane);h[lane]*=1099511628211ULL+2ULL*lane;}for(int lane=0;lane<4;++lane)out[lane]=h[lane];}
 
+__global__ void StaticBoundaryClosureForTestsKernel(
+    const CudaStaticBoundaryClosureCaseForTests input, double* const output)
+{
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  const bool ready = StaticBoundaryExterior(
+      input.kind, input.reference, input.pressure_out, input.gamma,
+      input.interior, input.normal[0], input.normal[1], output);
+  output[conserved_components] = ready ? 1.0 : 0.0;
+}
+
 bool LaunchOk() noexcept { return cudaPeekAtLastError() == cudaSuccess; }
 int Blocks(const int n) noexcept { return (n + 127) / 128; }
 } // namespace
@@ -2314,6 +2324,10 @@ bool CudaLaunchIgrConservation(const CudaDeviceView& v,
                                const CudaMeshShape& s,
                                const double dt, double* out) noexcept
 {IgrConservationKernel<<<1,1>>>(v,s,dt,out);return LaunchOk();}
+bool CudaLaunchStaticBoundaryClosureForTests(
+    const CudaStaticBoundaryClosureCaseForTests& input,
+    double* const result) noexcept
+{StaticBoundaryClosureForTestsKernel<<<1,1>>>(input,result);return LaunchOk();}
 bool CudaLaunchHash(const double* values,int count,std::uint64_t* words) noexcept
 {HashKernel<<<1,1>>>(values,count,words);return LaunchOk();}
 

@@ -68,6 +68,171 @@ inline bool CudaEvaluateStaticExteriorStateHost(
   catch (...) { return false; }
 }
 
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+VerifyBorrowedInitialTrueTraceForTests(
+    const CudaBorrowedHostL2Input expected) noexcept
+{
+  const bool shape_valid = shape_.trace_components >= conserved_components &&
+      shape_.true_trace_count >= 0 &&
+      shape_.trace_components != 0 &&
+      shape_.true_trace_count % shape_.trace_components == 0;
+  const std::size_t scalar_count = shape_valid
+      ? static_cast<std::size_t>(shape_.true_trace_count /
+                                 shape_.trace_components)
+      : 0;
+  bool local_valid = initialized_ && borrowed_host_inputs_ && shape_valid &&
+      expected.coefficients != nullptr &&
+      expected.scalar_count == scalar_count &&
+      expected.components == conserved_components &&
+      host_exact_true_trace_.size() ==
+          static_cast<std::size_t>(shape_.true_trace_count) &&
+      committed_slot_.trace.coefficients != nullptr &&
+      committed_slot_.trace.count ==
+          static_cast<std::size_t>(shape_.true_trace_count);
+  std::vector<double> observed;
+  try
+  {
+    observed.resize(static_cast<std::size_t>(shape_.true_trace_count));
+  }
+  catch (...) { local_valid = false; }
+  if (!CollectiveContinue(local_valid)) return false;
+  const bool copied = TransportPolicy::DeviceToHost(
+      observed.data(), committed_slot_.trace.coefficients,
+      observed.size() * sizeof(double),
+      CudaTransferCategory::generic_host_bridge,
+      CudaTransferSite::generic_host_export);
+  const bool synchronized = TransportPolicy::Synchronize(
+      CudaTransferSite::generic_host_export);
+  if (!CollectiveContinue(copied && synchronized)) return false;
+  for (int component = 0;
+       local_valid && component < conserved_components; ++component)
+    for (std::size_t scalar = 0; scalar < scalar_count; ++scalar)
+    {
+      const std::size_t index = scalar_count *
+          static_cast<std::size_t>(component) + scalar;
+      local_valid = std::isfinite(expected.coefficients[index]) &&
+          host_exact_true_trace_[index] == expected.coefficients[index] &&
+          observed[index] == expected.coefficients[index];
+    }
+  for (int component = conserved_components;
+       local_valid && component < shape_.trace_components; ++component)
+    for (std::size_t scalar = 0; scalar < scalar_count; ++scalar)
+    {
+      const std::size_t index =
+          scalar_count * static_cast<std::size_t>(component) + scalar;
+      const double host_value = host_exact_true_trace_[index];
+      const double device_value = observed[index];
+      local_valid = host_value == 0.0 && !std::signbit(host_value) &&
+          device_value == 0.0 && !std::signbit(device_value);
+    }
+  return CollectiveContinue(local_valid);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+VerifyStaticBoundaryClosuresForTests(
+    const double relative_tolerance,
+    std::array<double, 7>& relative_errors) noexcept
+{
+  relative_errors.fill(std::numeric_limits<double>::infinity());
+  constexpr std::array<CudaStaticBoundaryPolicyKind, 7> kinds{{
+      CudaStaticBoundaryPolicyKind::supersonic_inlet,
+      CudaStaticBoundaryPolicyKind::supersonic_outlet,
+      CudaStaticBoundaryPolicyKind::slip_wall,
+      CudaStaticBoundaryPolicyKind::subsonic_inlet,
+      CudaStaticBoundaryPolicyKind::subsonic_outlet_pressure,
+      CudaStaticBoundaryPolicyKind::far_field,
+      CudaStaticBoundaryPolicyKind::nonreflecting_outlet}};
+  constexpr std::array<std::array<double, dimension>, 7> normals{{
+      {{1.0, 0.0}}, {{0.0, 1.0}}, {{0.6, 0.8}}, {{1.0, 0.0}},
+      {{0.8, -0.6}}, {{-1.0, 0.0}}, {{1.0, 0.0}}}};
+  constexpr std::array<double, conserved_components> interior{{
+      1.1, 0.275, -0.165, 3.04675}};
+  constexpr std::array<std::array<double, conserved_components>, 4>
+      references{{
+          {{1.0, -1.8, 0.1, 4.125}},
+          {{1.0, -0.25, 0.1, 2.41125}},
+          {{1.0, 0.15, 0.05, 2.5125}},
+          {{0.98, 0.0784, -0.0392, 2.42892}}}};
+  constexpr std::array<int, 7> reference_index{{0, -1, -1, 1, -1, 2, 3}};
+
+  bool local_valid = initialized_ && std::isfinite(relative_tolerance) &&
+      relative_tolerance > 0.0;
+  for (std::size_t closure = 0; closure < kinds.size(); ++closure)
+  {
+    CudaStaticBoundaryPolicy policy{};
+    policy.attribute = static_cast<int>(closure) + 1;
+    policy.kind = kinds[closure];
+    if (reference_index[closure] >= 0)
+      policy.reference_state =
+          references[static_cast<std::size_t>(reference_index[closure])];
+    if (policy.kind ==
+        CudaStaticBoundaryPolicyKind::subsonic_outlet_pressure)
+      policy.pressure_out = 0.92;
+    const CudaStaticBoundaryPolicyTable policy_table{&policy, 1, 1.4};
+    const bool policy_admitted =
+        ValidateCudaStaticBoundaryPolicyTable(policy_table);
+
+    std::array<double, conserved_components> host_exterior{};
+    const bool host_ready = CudaEvaluateStaticExteriorStateHost(
+        policy, interior, normals[closure], 1.4, host_exterior);
+    CudaStaticBoundaryClosureCaseForTests device_input{};
+    device_input.kind = static_cast<int>(policy.kind);
+    device_input.pressure_out = policy.pressure_out;
+    device_input.gamma = 1.4;
+    std::copy(policy.reference_state.begin(), policy.reference_state.end(),
+              device_input.reference);
+    std::copy(interior.begin(), interior.end(), device_input.interior);
+    std::copy(normals[closure].begin(), normals[closure].end(),
+              device_input.normal);
+
+    std::array<double, conserved_components + 1> device_result{};
+    const bool launched = CudaLaunchStaticBoundaryClosureForTests(
+        device_input, view_.scalar);
+    const bool launch_synchronized = TransportPolicy::Synchronize(
+        CudaTransferSite::scalar_status);
+    const bool copied = TransportPolicy::DeviceToHost(
+        device_result.data(), view_.scalar,
+        device_result.size() * sizeof(double),
+        CudaTransferCategory::scalar_diagnostic,
+        CudaTransferSite::scalar_status);
+    const bool copy_synchronized = TransportPolicy::Synchronize(
+        CudaTransferSite::scalar_status);
+    bool closure_valid = policy_admitted && host_ready && launched &&
+        launch_synchronized && copied && copy_synchronized &&
+        device_result[conserved_components] == 1.0;
+    double maximum_error = 0.0;
+    for (int component = 0;
+         closure_valid && component < conserved_components; ++component)
+    {
+      const double device_value = device_result[component];
+      const double host_value = host_exterior[component];
+      const double scale = std::max({1.0, std::abs(device_value),
+                                     std::abs(host_value)});
+      const double error = std::abs(device_value - host_value) / scale;
+      closure_valid = std::isfinite(device_value) &&
+          std::isfinite(host_value) && std::isfinite(error);
+      maximum_error = std::max(maximum_error, error);
+    }
+    relative_errors[closure] = closure_valid
+        ? maximum_error : std::numeric_limits<double>::infinity();
+    local_valid = closure_valid && local_valid;
+  }
+
+  std::array<double, 7> global_errors{};
+  const bool reduced = MPI_Allreduce(
+      relative_errors.data(), global_errors.data(),
+      static_cast<int>(global_errors.size()), MPI_DOUBLE, MPI_MAX,
+      MPI_COMM_WORLD) == MPI_SUCCESS;
+  if (reduced) relative_errors = global_errors;
+  const bool within_tolerance = reduced && local_valid && std::all_of(
+      relative_errors.begin(), relative_errors.end(),
+      [relative_tolerance](const double error)
+      { return std::isfinite(error) && error <= relative_tolerance; });
+  return CollectiveContinue(within_tolerance);
+}
+
 inline void CudaManufacturedState(const double x, const double y,
                                   double* state) noexcept
 {

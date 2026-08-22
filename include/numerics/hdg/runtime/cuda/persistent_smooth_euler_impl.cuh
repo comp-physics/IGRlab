@@ -774,6 +774,21 @@ bool CudaLaunchMaximumWave(const CudaDeviceView& view,
 bool CudaLaunchIgrConservation(const CudaDeviceView& view,
                                const CudaMeshShape& shape,
                                double dt, double* result) noexcept;
+
+/** Fixed-size input used only by the all-closure CUDA qualification seam. */
+struct CudaStaticBoundaryClosureCaseForTests
+{
+  int kind = 0;
+  double reference[conserved_components]{};
+  double pressure_out = 0.0;
+  double gamma = 1.4;
+  double interior[conserved_components]{};
+  double normal[dimension]{};
+};
+
+bool CudaLaunchStaticBoundaryClosureForTests(
+    const CudaStaticBoundaryClosureCaseForTests& input,
+    double* result) noexcept;
 bool CudaLaunchHash(const double* values, int count,
                     std::uint64_t* words) noexcept;
 
@@ -1656,6 +1671,15 @@ public:
         { return std::isfinite(error) && error <= relative_tolerance; });
     return restored && CollectiveContinue(within_tolerance);
   }
+
+  /** Verify the caller-supplied public trace was copied into owned storage. */
+  bool VerifyBorrowedInitialTrueTraceForTests(
+      CudaBorrowedHostL2Input expected) noexcept;
+
+  /** Direct host/device parity audit of all seven admitted static closures. */
+  bool VerifyStaticBoundaryClosuresForTests(
+      double relative_tolerance,
+      std::array<double, 7>& relative_errors) noexcept;
 
   bool IgrConservationBalance(const double dt, double& maximum_error,
                               double& maximum_relative_error) noexcept
