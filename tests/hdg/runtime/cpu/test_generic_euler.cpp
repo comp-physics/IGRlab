@@ -136,10 +136,41 @@ mfem::ParMesh MakePeriodicRankZeroOwnedBorrowedMesh(
   return mfem::ParMesh(communicator, periodic, partition.data());
 }
 
+struct ExactBorrowedEulerFields
+{
+  std::vector<double> initial;
+  std::vector<double> source;
+
+  ExactBorrowedEulerFields(const mfem::ParMesh& mesh, const int order,
+                           const std::array<double, 8>& initial_pattern,
+                           const std::array<double, 8>& source_pattern)
+  {
+    mfem::L2_FECollection collection(
+        order, 2, mfem::BasisType::GaussLegendre, mfem::FiniteElement::VALUE);
+    mfem::ParFiniteElementSpace space(
+        const_cast<mfem::ParMesh*>(&mesh), &collection, 4,
+        mfem::Ordering::byNODES);
+    const int scalar_dofs = space.GetVSize() / 4;
+    initial.resize(static_cast<std::size_t>(space.GetVSize()));
+    source.resize(static_cast<std::size_t>(space.GetVSize()));
+    for (int component = 0; component < 4; ++component)
+    {
+      for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+      {
+        const std::size_t destination = static_cast<std::size_t>(
+            component * scalar_dofs + scalar);
+        const std::size_t pattern = static_cast<std::size_t>(2 * component +
+                                                              scalar % 2);
+        initial[destination] = initial_pattern[pattern];
+        source[destination] = source_pattern[pattern];
+      }
+    }
+  }
+};
+
 EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
                         BoundaryContext& boundary,
-                        const std::array<double, 8>& initial,
-                        const std::array<double, 8>& source)
+                        const ExactBorrowedEulerFields& fields)
 {
   EulerHdgRequest request{};
   request.mesh = &mesh;
@@ -147,9 +178,11 @@ EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
   request.polynomial_order = order;
   request.backend = {BackendKind::cpu, -1};
   request.capabilities = cpu_capabilities;
-  request.initial_state = {initial.data(), initial.size(), 4};
+  request.initial_state = {fields.initial.empty() ? nullptr : fields.initial.data(),
+                           fields.initial.size(), 4};
   request.initial_true_trace = {nullptr, 0, 4};
-  request.source = {source.data(), source.size(), 4};
+  request.source = {fields.source.empty() ? nullptr : fields.source.data(),
+                    fields.source.size(), 4};
   request.boundary = {&boundary, NonperiodicExterior};
   request.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
@@ -395,7 +428,8 @@ bool CheckOrdersAndDeterminism()
   for (int order = 1; order <= 3; ++order)
   {
     BoundaryContext context{};
-    EulerHdgRequest request = Request(mesh, order, context, initial, source);
+    ExactBorrowedEulerFields fields(mesh, order, initial, source);
+    EulerHdgRequest request = Request(mesh, order, context, fields);
     const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
     GenericEulerHdgCpuSession session;
     const auto initialized = session.Initialize(request);
@@ -488,8 +522,9 @@ bool CheckPreparedSessionLifecycle()
   const std::array<double, 8> source{{0.03, 0.04, 0.01, 0.02,
                                        0.00, 0.00, 0.05, 0.06}};
   BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
   GenericEulerHdgCpuSession session;
-  if (session.Initialize(Request(mesh, 1, boundary, initial, source)).status !=
+  if (session.Initialize(Request(mesh, 1, boundary, fields)).status !=
       GenericEulerCpuSessionStatus::initialized)
   {
     return false;
@@ -661,7 +696,8 @@ bool CheckPeriodicAnnotationsRemainTraceCouplings()
                                        0.0, 0.0, 2.5, 2.5}};
   const std::array<double, 8> source{};
   BoundaryContext context{};
-  EulerHdgRequest request = Request(mesh, 1, context, initial, source);
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, context, fields);
   GenericEulerHdgCpuSession session;
   return session.Initialize(request).status ==
       GenericEulerCpuSessionStatus::initialized &&
@@ -678,7 +714,8 @@ bool CheckPrivateTracedScalarIgrLifecycle()
   const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
                                       0.00, 0.00, 0.03, 0.04}};
   BoundaryContext boundary{};
-  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
   request.numerical_policy.stabilization = {RegularizationKind::igr, 0.2, 0.4};
   GenericEulerHdgCpuSession session;
   const auto initialized = session.Initialize(request);
@@ -722,7 +759,8 @@ bool CheckPrivateTracedScalarIgrConvergenceEvidence()
   const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
                                       0.00, 0.00, 0.03, 0.04}};
   BoundaryContext boundary{};
-  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
   request.numerical_policy.stabilization =
       {RegularizationKind::igr, 0.2, 0.4};
   dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
@@ -762,7 +800,8 @@ bool CheckPrivateTracedScalarIgrZeroLocal()
                                        0.0, 0.0, 2.5, 2.5}};
   const std::array<double, 8> source{};
   BoundaryContext boundary{};
-  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
   request.numerical_policy.stabilization = {RegularizationKind::igr, 0.2, 0.4};
   GenericEulerHdgCpuSession session;
   const auto initialized = session.Initialize(request);
@@ -785,7 +824,8 @@ bool CheckPrivateTracedScalarIgrInitializationDeterminism()
   const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
                                       0.00, 0.00, 0.03, 0.04}};
   BoundaryContext boundary{};
-  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
   request.numerical_policy.stabilization = {RegularizationKind::igr, 0.2, 0.4};
   mfem::L2_FECollection collection(1, 2, mfem::BasisType::GaussLegendre,
                                    mfem::FiniteElement::VALUE);
@@ -820,7 +860,8 @@ bool CheckDynamicTauHighWaveTwoSteps()
   const std::array<double, 8> source{{0.03, 0.04, 0.01, 0.02,
                                        0.00, 0.00, 0.05, 0.06}};
   BoundaryContext context{};
-  EulerHdgRequest request = Request(mesh, 1, context, initial, source);
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, context, fields);
   const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
   GenericEulerHdgCpuSession session;
   return session.Initialize(request).status ==
@@ -840,10 +881,11 @@ bool CheckClosedBoundaryPicardAssembly()
   const std::array<double, 8> source{{0.01, 0.02, 0.0, 0.0,
                                        0.0, 0.0, 0.03, 0.04}};
   BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
   const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
   dg::hdg::runtime::cpu::detail::ResetCpuGenericBoundaryPicardTestObservation();
   const bool accepted = ExecuteGenericEulerHdgCpu(
-      Request(mesh, 1, boundary, initial, source));
+      Request(mesh, 1, boundary, fields));
   // This executes the closed nonperiodic solve.  The production hook observes
   // the actual assembled physical trace rows: one callback value per face
   // quadrature point, C = 0, and a nonzero trace-mass D contribution.
@@ -863,8 +905,9 @@ bool CheckZeroOwnedElementEngine()
                                         0.0, 0.0, 2.5, 2.5}};
   const std::array<double, 8> source{{}};
   BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
   const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
-  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
   GenericEulerHdgCpuSession session;
   const bool accepted =
       session.Initialize(request).status ==
@@ -899,7 +942,8 @@ bool CheckSubcommunicatorIsolation()
   {
     mfem::ParMesh mesh = MakeBorrowedMesh(subcommunicator);
     BoundaryContext boundary{};
-    EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+    ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+    EulerHdgRequest request = Request(mesh, 1, boundary, fields);
     const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
     GenericEulerHdgCpuSession session;
     GenericEulerCpuPreparedStep prepared;
@@ -955,7 +999,8 @@ bool CheckBorrowedSessionDoesNotUseWorldCollectives()
     const std::array<double, 8> source{{}};
     mfem::ParMesh mesh = MakeBorrowedMesh(active_communicator);
     BoundaryContext boundary{};
-    EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+    ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+    EulerHdgRequest request = Request(mesh, 1, boundary, fields);
     const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
     GenericEulerHdgCpuSession session;
     GenericEulerCpuPreparedStep prepared;
@@ -987,8 +1032,9 @@ bool CheckCollectiveMismatchAndAtomicFailure()
   int rank = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   BoundaryContext boundary{};
-  EulerHdgRequest request = Request(mesh, rank == 0 ? 4 : 2, boundary,
-                                    initial, source);
+  const int order = rank == 0 ? 4 : 2;
+  ExactBorrowedEulerFields fields(mesh, order, initial, source);
+  EulerHdgRequest request = Request(mesh, order, boundary, fields);
   const bool rejected = !ExecuteGenericEulerHdgCpu(request);
   const bool restart_rejected = !RestartGenericEulerHdgCpu(request);
   return All(rejected && restart_rejected);
@@ -1007,8 +1053,9 @@ bool CheckAcceptedRequestRankLocalCallbackFailure()
   // The request itself is collectively admitted.  Only the boundary callback
   // fails on rank zero; every rank must return rather than entering a lone
   // neighbor exchange.
+  ExactBorrowedEulerFields fields(mesh, 2, initial, source);
   const bool rejected = !ExecuteGenericEulerHdgCpu(
-      Request(mesh, 2, boundary, initial, source));
+      Request(mesh, 2, boundary, fields));
   return All(rejected);
 }
 
