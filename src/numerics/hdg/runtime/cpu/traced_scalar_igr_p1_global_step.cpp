@@ -1,6 +1,7 @@
 #include "numerics/hdg/runtime/cpu/detail/traced_scalar_igr_p1_global_step.hpp"
 
 #include "numerics/hdg/core/host_reference.hpp"
+#include "numerics/hdg/generic/contract.hpp"
 
 #include <algorithm>
 #include <array>
@@ -198,7 +199,42 @@ bool ValidLinearControls(const int maximum_iterations,
 int ResolveMaximumLinearIterations(const int requested,
                                    const int global_size) noexcept
 {
-  return requested > 0 ? requested : std::max(100, global_size);
+  return generic::ResolveEulerHdgMaximumLinearIterations(requested,
+                                                          global_size);
+}
+
+bool ExactLinearControlsConsensus(const MPI_Comm communicator,
+                                  const int maximum_iterations,
+                                  const double relative_tolerance,
+                                  const double true_residual_tolerance) noexcept
+{
+  const std::uint64_t local_tolerances[] = {
+      generic::DoubleBits(relative_tolerance),
+      generic::DoubleBits(true_residual_tolerance)};
+  int minimum_iterations = 0;
+  int maximum_iterations_seen = 0;
+  std::uint64_t minimum_tolerances[2]{};
+  std::uint64_t maximum_tolerances[2]{};
+  // Keep this exact four-reduction sequence before any HYPRE setup or solve.
+  const int minimum_iterations_status = MPI_Allreduce(
+      &maximum_iterations, &minimum_iterations, 1, MPI_INT, MPI_MIN,
+      communicator);
+  const int maximum_iterations_status = MPI_Allreduce(
+      &maximum_iterations, &maximum_iterations_seen, 1, MPI_INT, MPI_MAX,
+      communicator);
+  const int minimum_tolerances_status = MPI_Allreduce(
+      local_tolerances, minimum_tolerances, 2, MPI_UINT64_T, MPI_MIN,
+      communicator);
+  const int maximum_tolerances_status = MPI_Allreduce(
+      local_tolerances, maximum_tolerances, 2, MPI_UINT64_T, MPI_MAX,
+      communicator);
+  return minimum_iterations_status == MPI_SUCCESS &&
+      maximum_iterations_status == MPI_SUCCESS &&
+      minimum_tolerances_status == MPI_SUCCESS &&
+      maximum_tolerances_status == MPI_SUCCESS &&
+      minimum_iterations == maximum_iterations_seen &&
+      minimum_tolerances[0] == maximum_tolerances[0] &&
+      minimum_tolerances[1] == maximum_tolerances[1];
 }
 
 bool ValidInput(const TracedScalarIgrP1GlobalStepInput& input) noexcept
@@ -441,6 +477,10 @@ struct RetainedTraceSystem final
   std::unique_ptr<mfem::HypreParVector> residual;
   std::unique_ptr<mfem::HypreILU> ilu;
   std::unique_ptr<mfem::HypreGMRES> gmres;
+  // This value is established before HYPRE's first setup and never changes
+  // during the retained layout lifetime.  maximum_linear_iterations remains
+  // a per-solve cap only.
+  int krylov_restart_dimension = 0;
   int maximum_linear_iterations = 0;
   double linear_relative_tolerance = 1.0e-12;
   double true_residual_relative_tolerance = 1.0e-10;
@@ -454,6 +494,8 @@ struct RetainedTraceSystem final
         !matrix || !rhs || !solution || !residual || !ilu || !gmres ||
         matrix->Height() != true_size || matrix->Width() != true_size ||
         diagonal.Height() != true_size || offdiagonal.Height() != true_size ||
+        krylov_restart_dimension != generic::EulerHdgKrylovRestartDimension(
+            static_cast<int>(matrix->GetGlobalNumRows())) ||
         !ValidLinearControls(maximum_linear_iterations,
                              linear_relative_tolerance,
                              true_residual_relative_tolerance) ||
@@ -889,9 +931,10 @@ bool RetainedTraceSystem::Initialize(
     const int global = static_cast<int>(matrix->GetGlobalNumRows());
     const int resolved_maximum = ResolveMaximumLinearIterations(
         maximum_linear_iterations, global);
+    krylov_restart_dimension =
+        generic::EulerHdgKrylovRestartDimension(global);
     gmres->SetMaxIter(resolved_maximum);
-    gmres->SetKDim(std::min(resolved_maximum,
-                             std::min(100, std::max(20, global))));
+    gmres->SetKDim(krylov_restart_dimension);
     gmres->SetLogging(0); gmres->SetPrintLevel(0);
     local_ok = InitialBindSolver();
   }
@@ -1055,8 +1098,6 @@ bool RetainedTraceSystem::Solve(const double scale, mfem::Vector& true_trace,
     true_residual_relative_tolerance = true_residual_tolerance;
     gmres->SetTol(relative_tolerance);
     gmres->SetMaxIter(resolved_maximum);
-    gmres->SetKDim(std::min(resolved_maximum, std::min(
-        100, std::max(20, static_cast<int>(matrix->GetGlobalNumRows())))));
     gmres->Mult(*rhs, *solution);
     gmres->GetNumIterations(iterations);
     local_ok = iterations >= 0 && iterations <= resolved_maximum;
@@ -1134,7 +1175,8 @@ struct SolveAndRecoverTracedScalarIgrP1State final
 static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
     const TracedScalarIgrP1TraceSolveInput& input,
     SolveAndRecoverTracedScalarIgrP1State& state,
-    RetainedTraceSystem* const retained = nullptr) noexcept
+    RetainedTraceSystem* const retained = nullptr,
+    const bool linear_controls_admitted = false) noexcept
 {
   if (input.communicator == MPI_COMM_NULL) { return false; }
   bool local_input_ok = input.layout != nullptr && input.trace_space != nullptr &&
@@ -1154,6 +1196,14 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
         input.true_matrix->GetGlobalNumCols() == input.trace_space->GlobalTrueVSize();
   }
   if (!CollectiveAll(input.communicator, local_input_ok)) { return false; }
+  if (!linear_controls_admitted &&
+      !ExactLinearControlsConsensus(input.communicator,
+                                    input.maximum_linear_iterations,
+                                    input.linear_relative_tolerance,
+                                    input.true_residual_relative_tolerance))
+  {
+    return false;
+  }
   const int elements = input.layout->LocalElementCount();
   if (!CollectiveAll(input.communicator, elements == 0 ||
       (input.condensation->ready() && input.condensation->batch_count() ==
@@ -1242,8 +1292,7 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
         input.maximum_linear_iterations, global_size);
     gmres.SetTol(input.linear_relative_tolerance); gmres.SetAbsTol(0.0);
     gmres.SetMaxIter(maximum_iterations);
-    gmres.SetKDim(std::min(maximum_iterations,
-                            std::min(100, std::max(20, global_size))));
+    gmres.SetKDim(generic::EulerHdgKrylovRestartDimension(global_size));
     gmres.SetLogging(0); gmres.SetPrintLevel(0);
     input.true_matrix->HypreRead();
     gmres.SetPreconditioner(ilu); gmres.SetOperator(*input.true_matrix);
@@ -1508,6 +1557,13 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
   {
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
+  if (!ExactLinearControlsConsensus(input.communicator,
+                                    input.maximum_linear_iterations,
+                                    input.linear_relative_tolerance,
+                                    input.true_residual_relative_tolerance))
+  {
+    return TracedScalarIgrP1GlobalStepResult::failure;
+  }
 
   const BorrowedP1DGInterfaceLayout& layout = *input.layout;
   const int elements = layout.LocalElementCount();
@@ -1760,7 +1816,7 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
         input.linear_relative_tolerance,
         input.true_residual_relative_tolerance};
     if (!SolveAndRecoverTracedScalarIgrP1TraceWithState(
-            solve_input, state.solve_and_recovery, retained))
+            solve_input, state.solve_and_recovery, retained, true))
     {
       retained->MarkUnrefreshed();
       return TracedScalarIgrP1GlobalStepResult::failure;
@@ -1876,7 +1932,7 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
       input.linear_relative_tolerance,
       input.true_residual_relative_tolerance};
   if (!SolveAndRecoverTracedScalarIgrP1TraceWithState(
-          solve_input, state.solve_and_recovery))
+          solve_input, state.solve_and_recovery, nullptr, true))
   {
     return TracedScalarIgrP1GlobalStepResult::failure;
   }
@@ -2034,6 +2090,18 @@ bool TracedScalarIgrP1Scratch::Initialize(
   if (!CollectiveAll(input.communicator, local_admission))
   {
     if (implementation_) { implementation_->initialization_attempted = true; implementation_->initialization_poisoned = true; }
+    return false;
+  }
+  if (!ExactLinearControlsConsensus(input.communicator,
+                                    input.maximum_linear_iterations,
+                                    input.linear_relative_tolerance,
+                                    input.true_residual_relative_tolerance))
+  {
+    if (implementation_)
+    {
+      implementation_->initialization_attempted = true;
+      implementation_->initialization_poisoned = true;
+    }
     return false;
   }
   TracedScalarIgrP1Scratch::Implementation& implementation = *implementation_;

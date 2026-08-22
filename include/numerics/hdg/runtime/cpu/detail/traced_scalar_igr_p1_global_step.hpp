@@ -30,7 +30,7 @@ struct TracedScalarIgrP1TraceSolveInput final
   const mfem::Vector* true_rhs_values = nullptr;
   const core::HostReferenceEngine* condensation = nullptr;
   // A zero cap retains the legacy size-derived GMRES bound for direct helper
-  // callers.  Generic requests always supply a positive policy value.
+  // callers and the generic policy's documented adaptive default.
   int maximum_linear_iterations = 0;
   double linear_relative_tolerance = 1.0e-12;
   double true_residual_relative_tolerance = 1.0e-10;

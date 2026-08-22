@@ -813,6 +813,45 @@ bool CheckCommittedObservablesZeroOwnedRank()
           observables, session.capabilities());
 }
 
+bool CheckDefaultNumericalPolicyAdaptiveLinearCap()
+{
+  // p3 on this deliberately nontrivial mesh has a true trace larger than the
+  // historical literal 100 cap.  The default policy must preserve the older
+  // size-derived bound, while a positive request stays literal.
+  mfem::ParMesh mesh = MakeBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                        0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 3, initial, source);
+  EulerHdgRequest request = Request(mesh, 3, boundary, fields);
+  const auto default_policy = request.numerical_policy;
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (default_policy.maximum_linear_iterations != 0 ||
+      default_policy.linear_relative_tolerance != 1.0e-12 ||
+      default_policy.igr_assembly_quadrature_order != 12 ||
+      !core.InitializeBorrowedEuler(request))
+  {
+    return false;
+  }
+  const int global_true_trace = static_cast<int>(
+      core.evidence().global_owned_true_trace_coefficients);
+  if (global_true_trace <= 100 ||
+      dg::hdg::generic::ResolveEulerHdgMaximumLinearIterations(
+          default_policy.maximum_linear_iterations, global_true_trace) !=
+          global_true_trace)
+  {
+    return false;
+  }
+  constexpr int explicit_cap = 37;
+  request.numerical_policy.maximum_linear_iterations = explicit_cap;
+  return dg::hdg::generic::ValidEulerHdgNumericalPolicy(
+             request.numerical_policy) &&
+      dg::hdg::generic::ResolveEulerHdgMaximumLinearIterations(
+          request.numerical_policy.maximum_linear_iterations,
+          global_true_trace) == explicit_cap;
+}
+
 bool CheckPeriodicAnnotationsRemainTraceCouplings()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
@@ -1245,6 +1284,8 @@ int main(int argc, char* argv[])
   const bool committed_observables = CheckCommittedObservables();
   const bool committed_observables_zero_owned =
       CheckCommittedObservablesZeroOwnedRank();
+  const bool default_numerical_policy =
+      CheckDefaultNumericalPolicyAdaptiveLinearCap();
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
   const bool private_igr = CheckPrivateTracedScalarIgrLifecycle();
   const bool private_igr_convergence =
@@ -1264,6 +1305,7 @@ int main(int argc, char* argv[])
   const bool local = boundary_semantics && trace_restriction && orders &&
       prepared_lifecycle &&
       committed_observables && committed_observables_zero_owned &&
+      default_numerical_policy &&
       periodic && private_igr && private_igr_zero_local &&
       private_igr_convergence &&
       private_igr_numerical_policy &&
@@ -1288,6 +1330,7 @@ int main(int argc, char* argv[])
               << " committed_observables=" << committed_observables
               << " committed_observables_zero_owned="
               << committed_observables_zero_owned
+              << " default_numerical_policy=" << default_numerical_policy
               << " dynamic_tau=" << dynamic_tau
               << " boundary_picard=" << boundary_picard
               << " zero_owned=" << zero_owned

@@ -3866,13 +3866,12 @@ struct detail::CpuNumericsCore::Implementation
       gmres->SetAbsTol(0.0);
       const int global_trace_size =
           static_cast<int>(trace_space->GlobalTrueVSize());
-      const int maximum_iterations = config.maximum_linear_iterations > 0
-          ? config.maximum_linear_iterations
-          : std::max(100, global_trace_size);
+      const int maximum_iterations =
+          generic::ResolveEulerHdgMaximumLinearIterations(
+              config.maximum_linear_iterations, global_trace_size);
       gmres->SetMaxIter(maximum_iterations);
-      gmres->SetKDim(std::min(maximum_iterations,
-                               std::min(100,
-                                        std::max(20, global_trace_size))));
+      gmres->SetKDim(
+          generic::EulerHdgKrylovRestartDimension(global_trace_size));
       gmres->SetLogging(1);
       gmres->SetPrintLevel(0);
     }
@@ -4832,9 +4831,10 @@ struct detail::CpuNumericsCore::Implementation
       factor_setup_current = factor_setup_generation ==
           expected_matrix_refresh_generation;
       gmres->GetNumIterations(iterations);
-      const int maximum_iterations = config.maximum_linear_iterations > 0
-          ? config.maximum_linear_iterations
-          : std::max(100, static_cast<int>(trace_space->GlobalTrueVSize()));
+      const int maximum_iterations =
+          generic::ResolveEulerHdgMaximumLinearIterations(
+              config.maximum_linear_iterations,
+              static_cast<int>(trace_space->GlobalTrueVSize()));
       solved = factor_setup_current && iterations > 0 &&
           iterations <= maximum_iterations;
     }

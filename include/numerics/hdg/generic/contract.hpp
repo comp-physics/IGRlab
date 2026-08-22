@@ -63,6 +63,8 @@ struct EulerHdgNumericalPolicy
   int audit_quadrature_order;
   int observable_quadrature_order;
   int maximum_nonlinear_updates;
+  // Zero selects the legacy adaptive cap: max(100, global true-trace size).
+  // A positive value is an exact per-solve iteration cap.
   int maximum_linear_iterations;
   int maximum_line_search_trials;
   double nonlinear_relative_tolerance;
@@ -78,9 +80,29 @@ constexpr EulerHdgNumericalPolicy DefaultEulerHdgNumericalPolicy(
     const int p) noexcept
 {
   const int quadrature = 2 * p + 2;
-  return {quadrature, quadrature, quadrature, quadrature, quadrature,
-          quadrature, 80, 100, 13, 1.0e-10, 1.0e-12, 1.0e-10,
+  // The private p1 IGR helper predated this policy and used order 12.
+  return {quadrature, quadrature, quadrature, 12, quadrature,
+          quadrature, 80, 0, 13, 1.0e-10, 1.0e-12, 1.0e-10,
           1.0e-10, 1.0e-4, {RegularizationKind::none, 0.0, 0.0}};
+}
+
+/** Resolve the documented adaptive linear cap for a true-trace system. */
+constexpr int ResolveEulerHdgMaximumLinearIterations(
+    const int requested, const int global_true_trace_size) noexcept
+{
+  return requested > 0 ? requested : std::max(100, global_true_trace_size);
+}
+
+/**
+ * Fixed GMRES restart dimension for one true-trace system lifetime.
+ *
+ * This deliberately does not depend on the mutable per-solve iteration cap:
+ * HYPRE allocates its Krylov basis for the configured restart dimension.
+ */
+constexpr int EulerHdgKrylovRestartDimension(
+    const int global_true_trace_size) noexcept
+{
+  return std::min(100, std::max(20, global_true_trace_size));
 }
 
 enum class ContractStatus : std::uint8_t
@@ -242,12 +264,12 @@ inline bool ValidEulerHdgNumericalPolicy(
       policy.audit_quadrature_order,
       policy.observable_quadrature_order,
       policy.maximum_nonlinear_updates,
-      policy.maximum_linear_iterations,
       policy.maximum_line_search_trials};
   for (const int value : positive_integers)
   {
     if (value <= 0) { return false; }
   }
+  if (policy.maximum_linear_iterations < 0) { return false; }
   const double positive_reals[] = {policy.nonlinear_relative_tolerance,
                                    policy.linear_relative_tolerance,
                                    policy.true_residual_relative_tolerance,

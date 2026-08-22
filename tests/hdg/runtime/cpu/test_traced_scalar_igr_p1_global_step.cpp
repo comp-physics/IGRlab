@@ -4,6 +4,7 @@
 #include <mpi.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -820,6 +821,60 @@ bool Check(const MPI_Comm communicator)
   {
     return false;
   }
+  // HYPRE allocates its Krylov basis on the first retained solve.  Initialize
+  // with the known-convergent strict cap, then vary only SetMaxIter across
+  // high/low/high calls on the same scratch.
+  detail::TracedScalarIgrP1Scratch changing_cap_scratch(communicator, layout);
+  detail::TracedScalarIgrP1GlobalStepOutput low_cap_first, high_cap_one_shot,
+      high_cap_first, high_cap_second, low_cap_again;
+  const std::array<detail::TracedScalarIgrP1GlobalStepOutput*, 4> outputs{{
+      &low_cap_first, &high_cap_first, &high_cap_second, &low_cap_again}};
+  for (detail::TracedScalarIgrP1GlobalStepOutput* const output : outputs)
+  {
+    output->trace_increment.SetSize(layout.TraceTrueVSize());
+    output->interior_increment.SetSize(layout.InteriorLocalVSize());
+  }
+  constexpr int low_retained_cap = selected_maximum_linear_iterations;
+  constexpr int high_retained_cap = 64;
+  ok = Run(communicator, layout, quads, source_space, source_a, 0.05,
+           low_cap_first, &changing_cap_scratch, selected_quadrature_order,
+           low_retained_cap, selected_linear_relative_tolerance,
+           selected_true_residual_relative_tolerance) &&
+      changing_cap_scratch.IsReady() &&
+      Run(communicator, layout, quads, source_space, source_a, 0.05,
+          high_cap_one_shot, nullptr, selected_quadrature_order,
+          high_retained_cap, selected_linear_relative_tolerance,
+          selected_true_residual_relative_tolerance) &&
+      Run(communicator, layout, quads, source_space, source_a, 0.05,
+          high_cap_first, &changing_cap_scratch, selected_quadrature_order,
+          high_retained_cap, selected_linear_relative_tolerance,
+          selected_true_residual_relative_tolerance) &&
+      Run(communicator, layout, quads, source_space, source_a, 0.05,
+          low_cap_again, &changing_cap_scratch, selected_quadrature_order,
+          low_retained_cap, selected_linear_relative_tolerance,
+          selected_true_residual_relative_tolerance) &&
+      Run(communicator, layout, quads, source_space, source_a, 0.05,
+          high_cap_second, &changing_cap_scratch, selected_quadrature_order,
+          high_retained_cap, selected_linear_relative_tolerance,
+          selected_true_residual_relative_tolerance) &&
+      low_cap_first.linear_iterations > 0 &&
+      low_cap_first.linear_iterations <= low_retained_cap &&
+      high_cap_one_shot.linear_iterations > 0 &&
+      high_cap_one_shot.linear_iterations <= high_retained_cap &&
+      high_cap_first.linear_iterations > 0 &&
+      high_cap_first.linear_iterations <= high_retained_cap &&
+      high_cap_second.linear_iterations > 0 &&
+      high_cap_second.linear_iterations <= high_retained_cap &&
+      SameBits(high_cap_one_shot.trace_increment,
+               high_cap_first.trace_increment) &&
+      SameBits(high_cap_one_shot.interior_increment,
+               high_cap_first.interior_increment) &&
+      SameBits(high_cap_first.trace_increment, high_cap_second.trace_increment) &&
+      SameBits(high_cap_first.interior_increment, high_cap_second.interior_increment);
+  if (!Require(communicator, ok, "retained IGR changing linear cap"))
+  {
+    return false;
+  }
   const double trace_difference = NormSquared(communicator, first.trace_increment) +
       NormSquared(communicator, first.interior_increment);
   mfem::Vector source_delta(first.trace_increment);
@@ -1054,6 +1109,128 @@ bool Check(const MPI_Comm communicator)
       preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0 &&
       scratch.IsUsable();
   if (!Require(communicator, ok, "structural failure preservation")) return false;
+
+  int ranks = 1;
+  int rank = 0;
+  MPI_Comm_size(communicator, &ranks);
+  MPI_Comm_rank(communicator, &rank);
+  if (ranks == 2)
+  {
+    mfem::Vector consensus_current_trace(layout.TraceTrueVSize());
+    mfem::Vector consensus_previous_trace(layout.TraceTrueVSize());
+    mfem::Vector consensus_current_interior, consensus_previous_interior;
+    ok = trace_space != nullptr &&
+        FillTrueTrace(*trace_space, consensus_current_trace, 2.0e-5) &&
+        FillTrueTrace(*trace_space, consensus_previous_trace, 0.0) &&
+        FillInterior(layout, consensus_current_interior,
+                     consensus_previous_interior);
+    if (!Require(communicator, ok, "linear-control consensus setup"))
+    {
+      return false;
+    }
+    local::Parameters consensus_parameters{};
+    consensus_parameters.dt = 0.05;
+    consensus_parameters.alpha = 0.8;
+    consensus_parameters.beta = 1.1;
+    consensus_parameters.quadrature_order = selected_quadrature_order;
+    const detail::TracedScalarIgrP1GlobalStepInput uniform_controls{
+        communicator, &layout, quads.data(), static_cast<int>(quads.size()),
+        consensus_parameters, &consensus_current_trace,
+        &consensus_previous_trace, &consensus_current_interior,
+        &consensus_previous_interior, &source_space, &source_a,
+        selected_maximum_linear_iterations, selected_linear_relative_tolerance,
+        selected_true_residual_relative_tolerance};
+    detail::TracedScalarIgrP1GlobalStepInput mismatched_cap = uniform_controls;
+    if (rank == 0) { mismatched_cap.maximum_linear_iterations = 64; }
+    detail::TracedScalarIgrP1GlobalStepInput mismatched_tolerance =
+        uniform_controls;
+    if (rank == 0) { mismatched_tolerance.linear_relative_tolerance = 1.0e-11; }
+    detail::TracedScalarIgrP1GlobalStepOutput consensus_sentinel;
+    consensus_sentinel.trace_increment.SetSize(1);
+    consensus_sentinel.interior_increment.SetSize(1);
+    consensus_sentinel.trace_increment[0] = 73.0;
+    consensus_sentinel.interior_increment[0] = -19.0;
+    consensus_sentinel.initial_residual_norm = 11.0;
+    consensus_sentinel.reduced_rhs_norm = 13.0;
+    consensus_sentinel.linear_residual_norm = 17.0;
+    consensus_sentinel.linear_iterations = 23;
+    const auto sentinel_intact = [&]() noexcept
+    {
+      return consensus_sentinel.trace_increment.Size() == 1 &&
+          consensus_sentinel.trace_increment[0] == 73.0 &&
+          consensus_sentinel.interior_increment.Size() == 1 &&
+          consensus_sentinel.interior_increment[0] == -19.0 &&
+          consensus_sentinel.initial_residual_norm == 11.0 &&
+          consensus_sentinel.reduced_rhs_norm == 13.0 &&
+          consensus_sentinel.linear_residual_norm == 17.0 &&
+          consensus_sentinel.linear_iterations == 23;
+    };
+    ok = detail::ComputeTracedScalarIgrP1GlobalStep(
+             mismatched_cap, consensus_sentinel) ==
+            detail::TracedScalarIgrP1GlobalStepResult::failure &&
+        sentinel_intact() &&
+        detail::ComputeTracedScalarIgrP1GlobalStep(
+            mismatched_tolerance, consensus_sentinel) ==
+            detail::TracedScalarIgrP1GlobalStepResult::failure &&
+        sentinel_intact();
+    if (!Require(communicator, ok, "one-shot linear-control consensus"))
+    {
+      return false;
+    }
+    detail::TracedScalarIgrP1GlobalStepOutput uniform_after_mismatch;
+    ok = detail::ComputeTracedScalarIgrP1GlobalStep(
+             uniform_controls, uniform_after_mismatch) ==
+            detail::TracedScalarIgrP1GlobalStepResult::success &&
+        uniform_after_mismatch.linear_iterations > 0 &&
+        uniform_after_mismatch.linear_iterations <=
+            selected_maximum_linear_iterations;
+    if (!Require(communicator, ok, "one-shot linear-control retry"))
+    {
+      return false;
+    }
+    detail::TracedScalarIgrP1GlobalStepOutput retained_sentinel;
+    retained_sentinel.trace_increment.SetSize(layout.TraceTrueVSize());
+    retained_sentinel.interior_increment.SetSize(layout.InteriorLocalVSize());
+    retained_sentinel.trace_increment = 73.0;
+    retained_sentinel.interior_increment = -19.0;
+    retained_sentinel.initial_residual_norm = 11.0;
+    retained_sentinel.reduced_rhs_norm = 13.0;
+    retained_sentinel.linear_residual_norm = 17.0;
+    retained_sentinel.linear_iterations = 23;
+    detail::TracedScalarIgrP1GlobalStepOutput retained_after_mismatch;
+    retained_after_mismatch.trace_increment.SetSize(layout.TraceTrueVSize());
+    retained_after_mismatch.interior_increment.SetSize(
+        layout.InteriorLocalVSize());
+    ok = detail::ComputeTracedScalarIgrP1GlobalStep(
+             mismatched_tolerance, retained_sentinel, scratch) ==
+            detail::TracedScalarIgrP1GlobalStepResult::failure &&
+        AllEqual(retained_sentinel.trace_increment, 73.0) &&
+        AllEqual(retained_sentinel.interior_increment, -19.0) &&
+        retained_sentinel.initial_residual_norm == 11.0 &&
+        retained_sentinel.reduced_rhs_norm == 13.0 &&
+        retained_sentinel.linear_residual_norm == 17.0 &&
+        retained_sentinel.linear_iterations == 23 &&
+        detail::ComputeTracedScalarIgrP1GlobalStep(
+            uniform_controls, retained_after_mismatch, scratch) ==
+            detail::TracedScalarIgrP1GlobalStepResult::success &&
+        SameBits(retained_after_mismatch.trace_increment,
+                 uniform_after_mismatch.trace_increment) &&
+        SameBits(retained_after_mismatch.interior_increment,
+                 uniform_after_mismatch.interior_increment);
+    if (!Require(communicator, ok, "retained linear-control consensus retry"))
+    {
+      return false;
+    }
+    detail::TracedScalarIgrP1Scratch mismatch_no_retry(communicator, layout);
+    ok = !mismatch_no_retry.Initialize(mismatched_cap) &&
+        !mismatch_no_retry.IsUsable() &&
+        !mismatch_no_retry.Initialize(uniform_controls) &&
+        !mismatch_no_retry.IsReady();
+    if (!Require(communicator, ok, "scratch linear-control mismatch poison"))
+    {
+      return false;
+    }
+  }
 
   detail::TracedScalarIgrP1Scratch no_retry(communicator, layout);
   const detail::TracedScalarIgrP1GlobalStepInput null_initialize{
