@@ -72,7 +72,29 @@ bool CheckSemanticParity()
       plan, kDimension, kGamma, kAttributes);
   const auto view = context.View();
   if (view.context != &context || view.exterior_state == nullptr ||
+      view.policies.policies == nullptr ||
+      view.policies.count != static_cast<std::size_t>(kAttributes) ||
+      view.policies.space_dimension != kDimension ||
+      view.policies.gamma != kGamma ||
       !context.IsPeriodicTopologyAttribute(8) || context.IsPeriodicTopologyAttribute(7))
+  {
+    return false;
+  }
+  using dg::hdg::generic::EulerBoundaryPolicyKind;
+  const auto* const policies = view.policies.policies;
+  if (policies[0].kind != EulerBoundaryPolicyKind::supersonic_inlet ||
+      policies[1].kind != EulerBoundaryPolicyKind::subsonic_inlet ||
+      policies[2].kind != EulerBoundaryPolicyKind::supersonic_outlet ||
+      policies[3].kind != EulerBoundaryPolicyKind::subsonic_outlet_pressure ||
+      policies[4].kind != EulerBoundaryPolicyKind::far_field ||
+      policies[5].kind != EulerBoundaryPolicyKind::nonreflecting_outlet ||
+      policies[6].kind != EulerBoundaryPolicyKind::slip_wall ||
+      policies[7].kind != EulerBoundaryPolicyKind::periodic_topology ||
+      !Equal(policies[0].reference_state, reference) ||
+      !Equal(policies[1].reference_state, reference) ||
+      !Equal(policies[4].reference_state, reference) ||
+      !Equal(policies[5].reference_state, reference) ||
+      policies[3].pressure_out != 0.85)
   {
     return false;
   }

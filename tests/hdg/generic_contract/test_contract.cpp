@@ -3,6 +3,7 @@
 #include <mfem.hpp>
 
 #include <array>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -13,6 +14,8 @@ using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
 using dg::hdg::generic::ContractStatus;
+using dg::hdg::generic::EulerBoundaryPolicy;
+using dg::hdg::generic::EulerBoundaryPolicyKind;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::ValidateEulerHdgRequest;
@@ -84,6 +87,26 @@ EulerHdgRequest ValidRequest(const mfem::ParMesh& mesh,
   request.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(request.polynomial_order);
   return request;
+}
+
+std::vector<EulerBoundaryPolicy> PhysicalPolicies(const mfem::ParMesh& mesh)
+{
+  const int attributes = mesh.bdr_attributes.Size() == 0
+      ? 0 : mesh.bdr_attributes.Max();
+  std::vector<EulerBoundaryPolicy> policies(
+      static_cast<std::size_t>(attributes));
+  for (EulerBoundaryPolicy& policy : policies)
+  {
+    policy.kind = EulerBoundaryPolicyKind::slip_wall;
+  }
+  return policies;
+}
+
+void AttachPolicyTable(EulerHdgRequest& request,
+                       const std::vector<EulerBoundaryPolicy>& policies)
+{
+  request.boundary.policies = {
+      policies.empty() ? nullptr : policies.data(), policies.size(), 2, 1.4};
 }
 
 bool CheckPODSurface()
@@ -175,6 +198,101 @@ bool CheckTriangleRejection()
   const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
   return ValidateEulerHdgRequest(ValidRequest(triangle, initial)) ==
       ContractStatus::nonquadrilateral_mesh;
+}
+
+bool CheckBoundaryPolicyAdmission()
+{
+  mfem::ParMesh mesh = MakeSquareMesh();
+  const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  std::vector<EulerBoundaryPolicy> policies = PhysicalPolicies(mesh);
+  if (policies.empty()) return false;
+  EulerHdgRequest request = ValidRequest(mesh, initial);
+  AttachPolicyTable(request, policies);
+  if (ValidateEulerHdgRequest(request) != ContractStatus::accepted)
+  {
+    return false;
+  }
+
+  policies[0].kind = static_cast<EulerBoundaryPolicyKind>(255);
+  if (ValidateEulerHdgRequest(request) !=
+      ContractStatus::invalid_boundary_operator)
+  {
+    return false;
+  }
+  policies[0].kind = EulerBoundaryPolicyKind::slip_wall;
+  policies[0].reference_state[0] =
+      std::numeric_limits<double>::quiet_NaN();
+  if (ValidateEulerHdgRequest(request) !=
+      ContractStatus::invalid_boundary_operator)
+  {
+    return false;
+  }
+  policies[0].reference_state[0] = 0.0;
+  request.boundary.policies.gamma = 1.0;
+  if (ValidateEulerHdgRequest(request) !=
+      ContractStatus::invalid_boundary_operator)
+  {
+    return false;
+  }
+  request.boundary.policies.gamma = 1.4;
+  request.boundary.policies.policies = nullptr;
+  if (ValidateEulerHdgRequest(request) !=
+      ContractStatus::invalid_boundary_operator)
+  {
+    return false;
+  }
+  AttachPolicyTable(request, policies);
+  policies.push_back(EulerBoundaryPolicy{});
+  AttachPolicyTable(request, policies);
+  return ValidateEulerHdgRequest(request) ==
+      ContractStatus::invalid_boundary_operator;
+}
+
+bool CheckBoundaryPolicyCollectiveMismatch()
+{
+  int rank = 0;
+  int ranks = 0;
+  if (MPI_Comm_rank(MPI_COMM_WORLD, &rank) != MPI_SUCCESS ||
+      MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  mfem::ParMesh mesh =
+      MakeRankZeroOwnedParallelMesh(mfem::Element::QUADRILATERAL);
+  const int local_attributes = mesh.bdr_attributes.Size() == 0
+      ? 0 : mesh.bdr_attributes.Max();
+  int minimum_attributes = local_attributes;
+  int maximum_attributes = local_attributes;
+  if (MPI_Allreduce(MPI_IN_PLACE, &minimum_attributes, 1, MPI_INT, MPI_MIN,
+                    MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Allreduce(MPI_IN_PLACE, &maximum_attributes, 1, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD) != MPI_SUCCESS ||
+      minimum_attributes != maximum_attributes || minimum_attributes <= 0)
+  {
+    return false;
+  }
+  const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  std::vector<EulerBoundaryPolicy> policies = PhysicalPolicies(mesh);
+  EulerHdgRequest request = ValidRequest(mesh, initial);
+  if (mesh.GetNE() == 0)
+  {
+    request.initial_state = {nullptr, 0, 4};
+    request.initial_true_trace = {nullptr, 0, 4};
+  }
+  AttachPolicyTable(request, policies);
+  policies[0].pressure_out = rank == 0 ? 0.0 : 1.0;
+  const ContractStatus status = ValidateEulerHdgRequest(request);
+  int minimum = static_cast<int>(status);
+  int maximum = minimum;
+  const int minimum_result = MPI_Allreduce(
+      MPI_IN_PLACE, &minimum, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  const int maximum_result = MPI_Allreduce(
+      MPI_IN_PLACE, &maximum, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  const ContractStatus expected = ranks == 1
+      ? ContractStatus::accepted
+      : ContractStatus::invalid_boundary_operator;
+  return status == expected && minimum_result == MPI_SUCCESS &&
+      maximum_result == MPI_SUCCESS && minimum == maximum;
 }
 
 bool CheckIgrSelectionAdmission()
@@ -320,10 +438,13 @@ int main(int argc, char* argv[])
   bool ok = CheckPODSurface();
   const bool basic = CheckAcceptAndReject();
   const bool triangle = CheckTriangleRejection();
+  const bool boundary = CheckBoundaryPolicyAdmission();
+  const bool boundary_mismatch = CheckBoundaryPolicyCollectiveMismatch();
   const bool igr = CheckIgrSelectionAdmission();
   const bool empty = CheckZeroOwnedElementAdmission();
   const bool mismatch = CheckCollectiveFailureConvergence();
   const bool geometry = CheckCollectiveGeometryConvergence();
-  ok = ok && basic && triangle && igr && empty && mismatch && geometry;
+  ok = ok && basic && triangle && boundary && boundary_mismatch && igr && empty &&
+      mismatch && geometry;
   return ok ? 0 : 1;
 }

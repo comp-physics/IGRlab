@@ -34,7 +34,7 @@ void ValidateState(const mfem::Vector& state)
 
 EulerBoundaryPolicy PolicyFor(const dg_sim::EulerBoundaryPlanEntry& entry)
 {
-  EulerBoundaryPolicy policy;
+  EulerBoundaryPolicy policy{};
   switch (entry.kind)
   {
   case dg_sim::EulerBoundaryKind::Periodic:
