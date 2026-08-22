@@ -24,8 +24,7 @@ enum class HdgEulerSessionCapability : std::uint32_t
   prepared_output = 1u << 1,
   committed_cfl_diagnostics = 1u << 2,
   generic_borrowed_inputs = 1u << 3,
-  committed_observables = 1u << 4,
-  committed_nonlinear_residual_audit = 1u << 5
+  committed_observables = 1u << 4
 };
 
 constexpr std::uint32_t HdgEulerSessionCapabilityBit(
@@ -75,34 +74,6 @@ struct HdgEulerCommittedObservables
   double minimum_density = 0.0;
   double minimum_pressure = 0.0;
 };
-
-/** The residual vectors differ between the two admitted Euler formulations. */
-enum class HdgEulerResidualFormulation : std::uint8_t
-{
-  unavailable = 0,
-  conventional_u4_uhat4 = 1,
-  traced_scalar_igr_p1_u7_uhat5 = 2
-};
-
-/** One generation-bound committed nonlinear-residual audit. */
-struct HdgEulerCommittedResidualAudit
-{
-  bool available = false;
-  HdgEulerSessionCoordinates coordinates{};
-  std::uint64_t residual_generation = 0;
-  int quadrature_order = 0;
-  HdgEulerResidualFormulation formulation =
-      HdgEulerResidualFormulation::unavailable;
-  double norm = std::numeric_limits<double>::quiet_NaN();
-};
-
-constexpr bool IsKnownHdgEulerResidualFormulation(
-    const HdgEulerResidualFormulation formulation) noexcept
-{
-  return formulation == HdgEulerResidualFormulation::conventional_u4_uhat4 ||
-      formulation ==
-          HdgEulerResidualFormulation::traced_scalar_igr_p1_u7_uhat5;
-}
 
 enum class HdgEulerSessionStatus : std::uint8_t
 {
@@ -178,37 +149,6 @@ inline bool IsValidHdgEulerCommittedObservables(
       std::isfinite(observables.minimum_pressure);
 }
 
-inline bool IsValidHdgEulerCommittedResidualAudit(
-    const HdgEulerCommittedResidualAudit audit,
-    const std::uint32_t capabilities) noexcept
-{
-  if (!HasHdgEulerSessionCapabilities(
-          capabilities, HdgEulerSessionCapabilityBit(
-                            HdgEulerSessionCapability::committed_nonlinear_residual_audit)) ||
-      !IsValidHdgEulerSessionCoordinates(audit.coordinates) ||
-      audit.residual_generation != audit.coordinates.generation ||
-      audit.quadrature_order <= 0)
-  {
-    return false;
-  }
-  return audit.available && IsKnownHdgEulerResidualFormulation(audit.formulation) &&
-      std::isfinite(audit.norm) && audit.norm >= 0.0;
-}
-
-/** Internal lifecycle coherence also admits explicit unavailable evidence. */
-inline bool IsCoherentHdgEulerCommittedResidualAudit(
-    const HdgEulerCommittedResidualAudit audit) noexcept
-{
-  return IsValidHdgEulerSessionCoordinates(audit.coordinates) &&
-      audit.residual_generation == audit.coordinates.generation &&
-      audit.quadrature_order > 0 &&
-      (audit.available
-           ? IsKnownHdgEulerResidualFormulation(audit.formulation) &&
-                 std::isfinite(audit.norm) && audit.norm >= 0.0
-           : audit.formulation == HdgEulerResidualFormulation::unavailable &&
-                 std::isnan(audit.norm));
-}
-
 static_assert(std::is_standard_layout<HdgEulerSessionCoordinates>::value &&
                   std::is_trivially_copyable<HdgEulerSessionCoordinates>::value,
               "generic HDG session coordinates must remain POD");
@@ -218,9 +158,6 @@ static_assert(std::is_standard_layout<HdgEulerCommittedDiagnostics>::value &&
 static_assert(std::is_standard_layout<HdgEulerCommittedObservables>::value &&
                   std::is_trivially_copyable<HdgEulerCommittedObservables>::value,
               "generic HDG committed observables must remain POD");
-static_assert(std::is_standard_layout<HdgEulerCommittedResidualAudit>::value &&
-                  std::is_trivially_copyable<HdgEulerCommittedResidualAudit>::value,
-              "generic HDG committed residual audit must remain POD");
 static_assert(std::is_standard_layout<HdgEulerSessionResult>::value &&
                   std::is_trivially_copyable<HdgEulerSessionResult>::value,
               "generic HDG session result must remain POD");

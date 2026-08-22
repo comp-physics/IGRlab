@@ -31,9 +31,8 @@ static_assert(application_checkpoint_codec_version_v2 == 2 &&
 static_assert(!std::is_default_constructible<CapturedCheckpointV1>::value &&
                   std::is_copy_constructible<CapturedCheckpointV1>::value,
               "capture is live-contract-originated but repeatably encodable");
-static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0 ||
-                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1,
-              "scalar-IGR CPU availability is a build-owned boolean");
+static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0,
+              "the production application exposes no legacy scalar-IGR CPU route");
 
 bool Check(const bool condition, const char* name)
 {
@@ -1761,10 +1760,10 @@ bool CheckExactScenarioExtents()
 #if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0
   passed = Check(
                scalar_serial_validation.rejection() ==
-                       ApplicationRejection::unbuilt_backend &&
+                       ApplicationRejection::unknown_card &&
                    scalar_rank2_validation.rejection() ==
-                       ApplicationRejection::unbuilt_backend,
-               "scalar_rank1_and_rank2_static_configs_reject_unbuilt_profile") &&
+                       ApplicationRejection::unknown_card,
+               "legacy_scalar_configs_are_not_application_cards") &&
       passed;
   passed = Check(
                serial_oracle.ranks[0].interior_coefficient_count == 144 &&
@@ -2074,10 +2073,10 @@ bool CheckScalarIgrCheckpointSchemaRoundTrip()
   {
     passed = Check(
                  ScalarTestValidation(backend, false).rejection() ==
-                         ApplicationRejection::unbuilt_backend &&
+                         ApplicationRejection::unknown_card &&
                      ScalarTestValidation(backend, true).rejection() ==
-                         ApplicationRejection::unbuilt_backend,
-                 "scalar_checkpoint_roles_reject_unbuilt_cpu_profile") &&
+                         ApplicationRejection::unknown_card,
+                 "scalar_checkpoint_roles_have_no_application_card") &&
         passed;
   }
   return passed;

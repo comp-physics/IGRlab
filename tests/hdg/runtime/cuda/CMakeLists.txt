@@ -225,14 +225,15 @@ set_tests_properties(
 
 if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
   add_executable(dg_igr_hdg_traced_scalar_igr_p1_private_cuda_test
-    test_traced_scalar_igr_p1_private.cu)
+    test_traced_scalar_igr_p1_private.cu
+    "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/cpu/traced_scalar_igr_p1_local.cpp")
   target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_private_cuda_test
     PRIVATE
       "${PROJECT_SOURCE_DIR}/include"
       "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_private_cuda_test
     PRIVATE
-      dg_igr_hdg_runtime_cuda
+      dg_igr_hdg_sc25_oracle_cuda
       dg_igr_hdg_generic_cpu
       dg_igr_hdg_auxiliary_cpu
       mfem
@@ -263,14 +264,15 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
       LABELS "hdg;runtime;cuda;traced-igr;private;packed-batch")
 
   add_executable(dg_igr_hdg_traced_scalar_igr_p1_local_cuda_test
-    test_traced_scalar_igr_p1_local.cu)
+    test_traced_scalar_igr_p1_local.cu
+    "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/cpu/traced_scalar_igr_p1_local.cpp")
   target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_local_cuda_test
     PRIVATE
       "${PROJECT_SOURCE_DIR}/include"
       "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_local_cuda_test
     PRIVATE
-      dg_igr_hdg_runtime_cuda
+      dg_igr_hdg_sc25_oracle_cuda
       dg_igr_hdg_generic_cpu
       dg_igr_hdg_auxiliary_cpu
       mfem
@@ -312,7 +314,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
 
   target_link_libraries(dg_igr_hdg_sc25_scalar_igr_cuda_rank1_test
     PRIVATE
-      dg_igr_hdg_runtime_cuda
+      dg_igr_hdg_sc25_oracle_cuda
       dg_igr_hdg_sc25_oracle_cpu
       dg_igr_hdg_auxiliary_cpu
       mfem
@@ -356,7 +358,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
     COMMAND
       "${CMAKE_COMMAND}"
       "-DOBJECT_ROOT=${PROJECT_BINARY_DIR}"
-      "-DRUNTIME_ARCHIVE=$<TARGET_FILE:dg_igr_hdg_runtime_cuda>"
+      "-DRUNTIME_ARCHIVE=$<TARGET_FILE:dg_igr_hdg_sc25_oracle_cuda>"
       "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank1_test>"
       "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_CUOBJDUMP_EXECUTABLE}"
       "-DNM_EXECUTABLE=${DG_IGR_NM_EXECUTABLE}"
@@ -381,7 +383,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
 
   target_link_libraries(dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test
     PRIVATE
-      dg_igr_hdg_runtime_cuda
+      dg_igr_hdg_sc25_oracle_cuda
       mfem
       MPI::MPI_CXX)
 
@@ -416,7 +418,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
     COMMAND
       "${CMAKE_COMMAND}"
       "-DOBJECT_ROOT=${PROJECT_BINARY_DIR}"
-      "-DRUNTIME_ARCHIVE=$<TARGET_FILE:dg_igr_hdg_runtime_cuda>"
+      "-DRUNTIME_ARCHIVE=$<TARGET_FILE:dg_igr_hdg_sc25_oracle_cuda>"
       "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test>"
       "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_CUOBJDUMP_EXECUTABLE}"
       "-DNM_EXECUTABLE=${DG_IGR_NM_EXECUTABLE}"
@@ -441,7 +443,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
     "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(
     dg_igr_hdg_sc25_scalar_igr_cuda_rank2_smooth_transition_test PRIVATE
-    dg_igr_hdg_runtime_cuda mfem MPI::MPI_CXX)
+    dg_igr_hdg_sc25_oracle_cuda mfem MPI::MPI_CXX)
   target_compile_options(
     dg_igr_hdg_sc25_scalar_igr_cuda_rank2_smooth_transition_test PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>

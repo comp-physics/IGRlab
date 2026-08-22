@@ -34,7 +34,7 @@ enum class BackendKind : std::uint8_t
   cuda
 };
 
-/** Private numerical regularization selected by a borrowed Euler request. */
+/** Optional numerical augmentation selected by a borrowed Euler request. */
 enum class RegularizationKind : std::uint8_t
 {
   none = 0,
@@ -80,7 +80,8 @@ constexpr EulerHdgNumericalPolicy DefaultEulerHdgNumericalPolicy(
     const int p) noexcept
 {
   const int quadrature = 2 * p + 2;
-  // The private p1 IGR helper predated this policy and used order 12.
+  // Keep the inactive default IGR quadrature field stable for conventional
+  // requests; the order-general extension deliberately overintegrates at 12.
   return {quadrature, quadrature, quadrature, 12, quadrature,
           quadrature, 80, 0, 13, 1.0e-10, 1.0e-12, 1.0e-10,
           1.0e-10, 1.0e-4, {RegularizationKind::none, 0.0, 0.0}};
@@ -285,9 +286,9 @@ inline bool ValidEulerHdgNumericalPolicy(
 
 /**
  * Periodic MFEM meshes retain boundary-element annotations for faces that
- * become interior (or rank-shared) after periodic identification.  IGR has
- * no physical boundary treatment, so distinguish those annotations from a
- * true physical boundary face rather than using GetNBE() directly.
+ * become interior (or rank-shared) after periodic identification.  This
+ * helper distinguishes those annotations from a true physical boundary face
+ * rather than using GetNBE() directly.
  */
 inline bool HasPhysicalBoundaryFace(const mfem::ParMesh& mesh) noexcept
 {
@@ -516,10 +517,11 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     RecordFailure(local_status, ContractStatus::unsupported_polynomial_order);
   }
+  // The reference IGR augmentation is currently a CPU capability.  It shares
+  // the conventional Euler solver's complete admitted order and boundary
+  // surface; neither mesh boundaries nor p2/p3 select another formulation.
   if (request.numerical_policy.stabilization.kind == RegularizationKind::igr &&
-      (request.backend.kind != BackendKind::cpu ||
-       request.polynomial_order != minimum_polynomial_order ||
-       HasPhysicalBoundaryFace(*request.mesh)))
+      request.backend.kind != BackendKind::cpu)
   {
     RecordFailure(local_status, ContractStatus::invalid_regularization);
   }

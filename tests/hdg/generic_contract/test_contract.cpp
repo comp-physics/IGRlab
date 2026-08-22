@@ -180,19 +180,31 @@ bool CheckTriangleRejection()
 bool CheckIgrSelectionAdmission()
 {
   mfem::ParMesh mesh = MakePeriodicSquareMesh();
+  mfem::ParMesh physical_mesh = MakeSquareMesh();
   const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  const auto admit_igr = [&initial](const mfem::ParMesh& target,
+                                    const int order)
+  {
+    EulerHdgRequest candidate = ValidRequest(target, initial);
+    candidate.polynomial_order = order;
+    candidate.numerical_policy =
+        dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
+    candidate.numerical_policy.stabilization =
+        {RegularizationKind::igr, 0.25, 0.5};
+    return ValidateEulerHdgRequest(candidate);
+  };
+  const ContractStatus periodic_p1 = admit_igr(mesh, 1);
+  const ContractStatus periodic_p2 = admit_igr(mesh, 2);
+  const ContractStatus periodic_p3 = admit_igr(mesh, 3);
+  const ContractStatus physical_p1 = admit_igr(physical_mesh, 1);
+  const ContractStatus physical_p2 = admit_igr(physical_mesh, 2);
+  const ContractStatus physical_p3 = admit_igr(physical_mesh, 3);
+
   EulerHdgRequest request = ValidRequest(mesh, initial);
   request.polynomial_order = 1;
+  request.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(1);
   request.numerical_policy.stabilization = {RegularizationKind::igr, 0.25, 0.5};
-  const ContractStatus valid = ValidateEulerHdgRequest(request);
-  request.polynomial_order = 2;
-  const ContractStatus p2 = ValidateEulerHdgRequest(request);
-  mfem::ParMesh physical_mesh = MakeSquareMesh();
-  EulerHdgRequest physical = ValidRequest(physical_mesh, initial);
-  physical.polynomial_order = 1;
-  physical.numerical_policy.stabilization = {RegularizationKind::igr, 0.25, 0.5};
-  const ContractStatus physical_boundary = ValidateEulerHdgRequest(physical);
-  request.polynomial_order = 1;
   request.backend = {BackendKind::cuda, 0};
   request.capabilities = all_cuda_capabilities;
   const ContractStatus cuda = ValidateEulerHdgRequest(request);
@@ -208,9 +220,12 @@ bool CheckIgrSelectionAdmission()
                                        MPI_MIN, mesh.GetComm());
   const int max_result = MPI_Allreduce(MPI_IN_PLACE, &max_status, 1, MPI_INT,
                                        MPI_MAX, mesh.GetComm());
-  return valid == ContractStatus::accepted &&
-      p2 == ContractStatus::invalid_regularization &&
-      physical_boundary == ContractStatus::invalid_regularization &&
+  return periodic_p1 == ContractStatus::accepted &&
+      periodic_p2 == ContractStatus::accepted &&
+      periodic_p3 == ContractStatus::accepted &&
+      physical_p1 == ContractStatus::accepted &&
+      physical_p2 == ContractStatus::accepted &&
+      physical_p3 == ContractStatus::accepted &&
       cuda == ContractStatus::invalid_regularization &&
       mismatch == (ranks == 1 ? ContractStatus::accepted
                               : ContractStatus::invalid_numerical_policy) &&

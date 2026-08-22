@@ -4,7 +4,7 @@
  * @file numerics/hdg/runtime/app/application_contract.hpp
  * @brief Closed standalone HDG capability and validated configuration seam.
  *
- * This boundary admits only the current frozen W8A, W8B, and W8C rows with
+ * This boundary admits only the current conventional W8A and W8C rows with
  * their exact card, periodic-case, mesh/order/time, and compiled-backend
  * selections.  It is not a general runtime configuration interface.  It does
  * not accept caller-authored MPI or device observations and grants no
@@ -52,6 +52,8 @@ inline constexpr std::string_view
     smooth_periodic_euler_v1_functional_checkpoint_id =
         "checkpoint.hdg.euler.smooth-periodic.functional.step-10.v1";
 
+/* Frozen SC25 checkpoint/oracle schema identifiers. The production
+ * application contract does not advertise or admit this legacy card. */
 inline constexpr std::string_view scalar_igr_sc25_v3_card_id =
     scalar_igr_persistent_card_id;
 inline constexpr std::string_view scalar_igr_sc25_v3_case_id =

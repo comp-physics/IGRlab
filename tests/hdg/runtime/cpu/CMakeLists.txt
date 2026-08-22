@@ -113,34 +113,10 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
     LABELS "hdg;runtime;cpu;w8c;smooth-transition"
     TIMEOUT 1800)
 
-  add_test(NAME hdg_runtime_w8c_smooth_transition_cli_cpu_serial
-    COMMAND "${CMAKE_COMMAND}"
-      "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
-      "-DHDG_RUNTIME_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/w8c-smooth-transition-cli"
-      -DHDG_RUNTIME_W8C_SMOOTH=TRUE
-      -DHDG_RUNTIME_RANKS=1
-      -P "${PROJECT_SOURCE_DIR}/tests/hdg/runtime/app/test_cli_process.cmake")
-  set_tests_properties(hdg_runtime_w8c_smooth_transition_cli_cpu_serial
-    PROPERTIES
-      PROCESSORS 1
-      RESOURCE_LOCK hdg_runtime_cpu
-      LABELS "hdg;runtime;app;cli;cpu;w8c;smooth-transition"
-      TIMEOUT 3600)
-
-  add_test(NAME hdg_runtime_w8c_smooth_transition_matrix_cpu_serial
-    COMMAND "${CMAKE_COMMAND}"
-      "-DHDG_RUNTIME_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime>"
-      "-DHDG_RUNTIME_MATRIX_COMPARATOR=$<TARGET_FILE:dg_igr_hdg_runtime_w8c_smooth_transition_cpu_serial_test>"
-      "-DHDG_RUNTIME_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/w8c-smooth-transition-matrix"
-      -DHDG_RUNTIME_W8C_MATRIX=TRUE
-      -DHDG_RUNTIME_RANKS=1
-      -P "${PROJECT_SOURCE_DIR}/tests/hdg/runtime/app/test_cli_process.cmake")
-  set_tests_properties(hdg_runtime_w8c_smooth_transition_matrix_cpu_serial
-    PROPERTIES
-      PROCESSORS 1
-      RESOURCE_LOCK hdg_runtime_cpu
-      LABELS "hdg;runtime;app;cpu;w8c;smooth-transition;matrix"
-      TIMEOUT 21600)
+  # The retired scalar card is never exercised through the production CLI.
+  # Its frozen W8C implementation remains reachable only by the direct oracle
+  # target above; comparative scientific-efficacy matrices are held until the
+  # general-purpose reference solver is promoted.
 
   add_executable(dg_igr_hdg_n8_generic_reference_transfer_test
     euler_committed_observable_oracle.cpp
@@ -230,7 +206,8 @@ foreach(_ranks IN ITEMS 1 2 3)
 endforeach()
 
 add_executable(dg_igr_hdg_traced_scalar_igr_p1_local_test
-  test_traced_scalar_igr_p1_local.cpp)
+  test_traced_scalar_igr_p1_local.cpp
+  "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/cpu/traced_scalar_igr_p1_local.cpp")
 target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_local_test PRIVATE
   "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_local_test PRIVATE
@@ -244,74 +221,6 @@ add_test(NAME hdg_traced_scalar_igr_p1_local
 set_tests_properties(hdg_traced_scalar_igr_p1_local PROPERTIES
   PROCESSORS 1 RESOURCE_LOCK hdg_traced_scalar_igr_p1_local TIMEOUT 180
   LABELS "hdg;traced-scalar-igr;local;cpu")
-
-add_executable(dg_igr_hdg_borrowed_p1_dg_interface_layout_test
-  test_borrowed_p1_dg_interface_layout.cpp)
-target_include_directories(dg_igr_hdg_borrowed_p1_dg_interface_layout_test
-  PRIVATE "${PROJECT_SOURCE_DIR}/include")
-target_link_libraries(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PRIVATE
-  dg_igr_hdg_generic_cpu mfem MPI::MPI_CXX)
-target_compile_options(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PRIVATE
-  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
-set_target_properties(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PROPERTIES
-  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-foreach(_ranks IN ITEMS 1 2 3)
-  if(_ranks EQUAL 1)
-    add_test(NAME hdg_borrowed_p1_dg_interface_layout_rank1
-      COMMAND dg_igr_hdg_borrowed_p1_dg_interface_layout_test)
-  else()
-    add_test(NAME hdg_borrowed_p1_dg_interface_layout_rank${_ranks}
-      COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" ${_ranks}
-              ${MPIEXEC_PREFLAGS}
-              $<TARGET_FILE:dg_igr_hdg_borrowed_p1_dg_interface_layout_test>
-              ${MPIEXEC_POSTFLAGS})
-  endif()
-  set_tests_properties(hdg_borrowed_p1_dg_interface_layout_rank${_ranks}
-    PROPERTIES
-      PROCESSORS ${_ranks}
-      RESOURCE_LOCK hdg_borrowed_p1_dg_interface_layout
-      LABELS "hdg;runtime;cpu;borrowed;dg-interface;layout;mpi"
-      TIMEOUT 180)
-endforeach()
-
-add_executable(dg_igr_hdg_traced_scalar_igr_p1_global_step_test
-  test_traced_scalar_igr_p1_global_step.cpp)
-if(MFEM_USE_CUDA)
-  set_source_files_properties(test_traced_scalar_igr_p1_global_step.cpp
-    PROPERTIES LANGUAGE CUDA)
-  set_target_properties(dg_igr_hdg_traced_scalar_igr_p1_global_step_test
-    PROPERTIES
-      CUDA_STANDARD 17
-      CUDA_STANDARD_REQUIRED ON
-      CUDA_EXTENSIONS OFF)
-endif()
-target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_global_step_test
-  PRIVATE "${PROJECT_SOURCE_DIR}/include")
-target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_global_step_test PRIVATE
-  dg_igr_hdg_generic_cpu mfem MPI::MPI_CXX)
-target_compile_options(dg_igr_hdg_traced_scalar_igr_p1_global_step_test PRIVATE
-  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>
-  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
-set_target_properties(dg_igr_hdg_traced_scalar_igr_p1_global_step_test PROPERTIES
-  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-foreach(_ranks IN ITEMS 1 2 3)
-  if(_ranks EQUAL 1)
-    add_test(NAME hdg_traced_scalar_igr_p1_global_step_rank1
-      COMMAND dg_igr_hdg_traced_scalar_igr_p1_global_step_test)
-  else()
-    add_test(NAME hdg_traced_scalar_igr_p1_global_step_rank${_ranks}
-      COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" ${_ranks}
-              ${MPIEXEC_PREFLAGS}
-              $<TARGET_FILE:dg_igr_hdg_traced_scalar_igr_p1_global_step_test>
-              ${MPIEXEC_POSTFLAGS})
-  endif()
-  set_tests_properties(hdg_traced_scalar_igr_p1_global_step_rank${_ranks}
-    PROPERTIES
-      PROCESSORS ${_ranks}
-      RESOURCE_LOCK hdg_traced_scalar_igr_p1_global_step
-      LABELS "hdg;runtime;cpu;traced-scalar-igr;global-step;mpi"
-      TIMEOUT 180)
-endforeach()
 
 foreach(_n IN ITEMS 3 6 12)
   add_test(

@@ -381,11 +381,6 @@ std::string Validate(const HdgEulerMainRequest& request,
   {
     return "HDG IGR alpha and beta must be finite and positive";
   }
-  if (regularization.kind == RegularizationKind::igr &&
-      request.options.order != dg::hdg::generic::minimum_polynomial_order)
-  {
-    return "HDG IGR supports only polynomial order one";
-  }
   if (!request.options.restart_vtk.empty() ||
       request.options.restart_cycle >= 0 || request.options.restart_step >= 0)
   {

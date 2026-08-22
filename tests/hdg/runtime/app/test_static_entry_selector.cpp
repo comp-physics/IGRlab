@@ -103,6 +103,10 @@ static_assert(__cplusplus == DG_IGR_HDG_RUNTIME_EXPECTED_CPLUSPLUS,
 static_assert(DG_IGR_HDG_APP_HAS_CUDA_RANK1 == 1 &&
                   DG_IGR_HDG_APP_HAS_CUDA_RANK2 == 1,
               "the complete selector oracle is registered only when all four entries exist");
+static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0 &&
+                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 0 &&
+                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 0,
+              "the production selector must expose no legacy scalar route");
 
 enum class Entry : std::uint8_t
 {
@@ -249,15 +253,15 @@ int main()
 {
   const std::array<Row, 16> rows{{
       {Entry::cpu_rank1, CpuSerialBackendTag::id, false, true, 0, 101},
-      {Entry::cpu_rank1, CpuSerialBackendTag::id, true, true, 0, 101},
+      {Entry::cpu_rank1, CpuSerialBackendTag::id, true, false, 0, 0},
       {Entry::cpu_rank2, CpuRank2BackendTag::id, false, true, 1, 102},
-      {Entry::cpu_rank2, CpuRank2BackendTag::id, true, true, 1, 102},
+      {Entry::cpu_rank2, CpuRank2BackendTag::id, true, false, 0, 0},
       {Entry::cuda_rank1, CudaRank1OneGpuBackendTag::id, false, true, 2, 103},
-      {Entry::cuda_rank1, CudaRank1OneGpuBackendTag::id, true, true, 2, 103},
+      {Entry::cuda_rank1, CudaRank1OneGpuBackendTag::id, true, false, 0, 0},
       {Entry::cuda_rank2, CudaRank2OneGpuHostStagedBackendTag::id, false,
        true, 3, 104},
       {Entry::cuda_rank2, CudaRank2OneGpuHostStagedBackendTag::id, true,
-       true, 3, 104},
+       false, 0, 0},
       {Entry::cpu_rank1, CudaRank1OneGpuBackendTag::id, false, false, 0, 0},
       {Entry::cpu_rank1, CudaRank1OneGpuBackendTag::id, true, false, 0, 0},
       {Entry::cuda_rank1, CpuSerialBackendTag::id, false, false, 0, 0},
@@ -317,8 +321,8 @@ int main()
                                   : "static_entry_off_diagonal_rejection") &&
         passed;
   }
-  passed = Check(diagonal_count == 8 && off_diagonal_count == 8,
-                 "static_entry_exact_16_row_census") && passed;
+  passed = Check(diagonal_count == 4 && off_diagonal_count == 12,
+                 "static_entry_conventional_only_16_row_census") && passed;
 
   const Row& seam_row = rows[0];
   const std::string seam_stem = "/tmp/dg-igr-hdg-method-seam-" +
@@ -339,6 +343,6 @@ int main()
                      Absent(seam_stem) && Absent(seam_stem + ".checkpoint"),
                  "typed_hdg_method_bridge_uses_existing_static_entry") && passed;
   if (passed)
-    std::cout << "HDG static entry selector 16-row oracle PASS\n";
+    std::cout << "HDG conventional-only static entry selector oracle PASS\n";
   return passed ? 0 : 1;
 }

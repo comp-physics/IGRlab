@@ -23,34 +23,34 @@ file(GLOB_RECURSE _dg_igr_hdg_runtime_all_cuda CONFIGURE_DEPENDS
 set(_dg_igr_hdg_mfem_sparse_owner_sources
     "${CMAKE_CURRENT_SOURCE_DIR}/cpu/persistent_sc25_scalar_igr.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/cpu/persistent_smooth_euler.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpu/traced_scalar_igr_p1_global_step.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../auxiliary/screened_poisson_cpu.cpp")
 if(MFEM_USE_CUDA)
   set_source_files_properties(${_dg_igr_hdg_mfem_sparse_owner_sources}
     PROPERTIES LANGUAGE CUDA)
 endif()
 
-# The generic Euler CPU reference engine deliberately owns only the reusable
-# request/session, borrowed-layout, and traced p1 pieces. The frozen SC25
-# implementation remains a separate oracle component. Keep both inventories
-# explicit so an added CPU source cannot silently reconstitute a monolith.
+# The generic Euler CPU reference engine owns the reusable request/session and
+# the conventional solver implementation. Only the local P1 algebra source is
+# retained as a bounded test oracle; it is deliberately absent from the
+# production archive. Keep every inventory explicit so an added CPU source
+# cannot silently reconstitute the duplicated execution path.
 set(_dg_igr_hdg_generic_cpu_sources
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpu/borrowed_p1_dg_interface_layout.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/cpu/generic_euler.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpu/persistent_smooth_euler.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpu/traced_scalar_igr_p1_global_step.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpu/traced_scalar_igr_p1_local.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/cpu/persistent_smooth_euler.cpp")
 set(_dg_igr_hdg_sc25_oracle_cpu_sources
     "${CMAKE_CURRENT_SOURCE_DIR}/cpu/persistent_sc25_scalar_igr.cpp")
+set(_dg_igr_hdg_local_p1_algebra_test_only_cpu_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/cpu/traced_scalar_igr_p1_local.cpp")
 set(_dg_igr_hdg_runtime_cpu_expected_sources
     ${_dg_igr_hdg_generic_cpu_sources}
-    ${_dg_igr_hdg_sc25_oracle_cpu_sources})
+    ${_dg_igr_hdg_sc25_oracle_cpu_sources}
+    ${_dg_igr_hdg_local_p1_algebra_test_only_cpu_sources})
 list(SORT _dg_igr_hdg_runtime_cpu_sources)
 list(SORT _dg_igr_hdg_runtime_cpu_expected_sources)
 if(NOT _dg_igr_hdg_runtime_cpu_sources STREQUAL
    _dg_igr_hdg_runtime_cpu_expected_sources)
   message(FATAL_ERROR
-          "HDG CPU source inventory drifted: every runtime CPU source must be classified as either generic reference or frozen SC25 oracle.")
+          "HDG CPU source inventory drifted: every runtime CPU source must be classified as generic reference, frozen SC25 oracle, or local-algebra test oracle.")
 endif()
 list(FIND _dg_igr_hdg_generic_cpu_sources
      "${CMAKE_CURRENT_SOURCE_DIR}/cpu/persistent_sc25_scalar_igr.cpp"
@@ -79,11 +79,6 @@ if(_dg_igr_hdg_runtime_unclassified_cpp OR
           "${_dg_igr_hdg_runtime_unclassified_cpp};${_dg_igr_hdg_runtime_unclassified_cuda}")
 endif()
 
-set(_dg_igr_hdg_scalar_igr_cpu_app_available OFF)
-if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
-  set(_dg_igr_hdg_scalar_igr_cpu_app_available ON)
-endif()
-
 if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT OR
    (DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA))
   file(GLOB_RECURSE _dg_igr_hdg_auxiliary_sources CONFIGURE_DEPENDS
@@ -104,18 +99,22 @@ endif()
 
 if(DG_IGR_ENABLE_HDG_RUNTIME)
   if(MFEM_USE_CUDA)
-    set(_dg_igr_hdg_runtime_cuda_expected_sources
+    set(_dg_igr_hdg_runtime_cuda_production_sources
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu")
+    set(_dg_igr_hdg_frozen_test_only_cuda_sources
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/hdg_sc25_periodic_v3_device.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/hdg_sc25_periodic_v3_rank2_device.cu"
-        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/traced_scalar_igr_p1_private.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/traced_scalar_igr_p1_private_numerics.cu")
+    set(_dg_igr_hdg_runtime_cuda_expected_sources
+        ${_dg_igr_hdg_runtime_cuda_production_sources}
+        ${_dg_igr_hdg_frozen_test_only_cuda_sources})
     list(SORT _dg_igr_hdg_runtime_cuda_sources)
     list(SORT _dg_igr_hdg_runtime_cuda_expected_sources)
     if(NOT _dg_igr_hdg_runtime_cuda_sources STREQUAL
        _dg_igr_hdg_runtime_cuda_expected_sources)
       message(FATAL_ERROR
-              "The frozen W8A+W8B CUDA component requires exactly persistent_smooth_euler.cu, the SC25 rank-one/rank-two device sources, and the private traced-scalar-IGR packed-batch/topology sources.")
+              "HDG CUDA source inventory drifted: every source must be classified as conventional production runtime or frozen test-only oracle.")
     endif()
   endif()
 
@@ -168,9 +167,9 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     DG_IGR_HDG_APP_HAS_CPU_RANK2=1
     DG_IGR_HDG_APP_HAS_CUDA_RANK1=$<BOOL:${MFEM_USE_CUDA}>
     DG_IGR_HDG_APP_HAS_CUDA_RANK2=$<BOOL:${MFEM_USE_CUDA}>
-    DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU=$<BOOL:${_dg_igr_hdg_scalar_igr_cpu_app_available}>
-    DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1=$<BOOL:${MFEM_USE_CUDA}>
-    DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2=$<BOOL:${MFEM_USE_CUDA}>)
+    DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU=0
+    DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1=0
+    DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2=0)
   target_compile_options(dg_igr_hdg_runtime_app_contract PRIVATE
     $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
   target_link_libraries(dg_igr_hdg_runtime_app_contract
@@ -184,13 +183,10 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     TARGET dg_igr_hdg_sc25_oracle_cpu
     SOURCES ${_dg_igr_hdg_sc25_oracle_cpu_sources}
     PUBLIC_LINK_LIBRARIES dg_igr_hdg_runtime_common)
-  # Keep the frozen oracle configured for the graph guard, but do not compile
-  # it in a generic-only runtime build. Auxiliary/W8C consumers name it
-  # explicitly and thereby opt it back into the default build closure.
-  if(NOT _dg_igr_hdg_scalar_igr_cpu_app_available)
-    set_target_properties(dg_igr_hdg_sc25_oracle_cpu PROPERTIES
-      EXCLUDE_FROM_ALL TRUE)
-  endif()
+  # This is a frozen validation oracle, never a production runtime component.
+  # Direct oracle tests name it explicitly and pull it into their build only.
+  set_target_properties(dg_igr_hdg_sc25_oracle_cpu PROPERTIES
+    EXCLUDE_FROM_ALL TRUE)
   if(MFEM_USE_CUDA)
     foreach(_dg_igr_hdg_cpu_component IN ITEMS
             dg_igr_hdg_generic_cpu
@@ -252,10 +248,6 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
                         dg_igr_hdg_generic_cpu
                         mfem
                         MPI::MPI_CXX)
-  if(_dg_igr_hdg_scalar_igr_cpu_app_available)
-    target_link_libraries(dg_igr_hdg_runtime_app_cpu PUBLIC
-                          dg_igr_hdg_sc25_oracle_cpu)
-  endif()
   target_compile_options(dg_igr_hdg_runtime_app_cpu PRIVATE
     $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
   set_target_properties(dg_igr_hdg_runtime_app_cpu PROPERTIES
@@ -270,15 +262,44 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   target_link_libraries(dg_igr_hdg_runtime_components INTERFACE
                         dg_igr_hdg_runtime_common
                         dg_igr_hdg_runtime_app_contract
-                        dg_igr_hdg_generic_cpu
-                        dg_igr_hdg_sc25_oracle_cpu)
+                        dg_igr_hdg_generic_cpu)
 
   if(MFEM_USE_CUDA)
     dg_igr_add_hdg_cuda17_component(
       TARGET dg_igr_hdg_runtime_cuda
-      SOURCES ${_dg_igr_hdg_runtime_cuda_sources}
+      SOURCES ${_dg_igr_hdg_runtime_cuda_production_sources}
       PUBLIC_LINK_LIBRARIES dg_igr_hdg_runtime_common
       PRIVATE_LINK_LIBRARIES dg_igr_hdg_generic_cpu)
+    dg_igr_hdg_require_target_link_closure_absent(
+      dg_igr_hdg_runtime_cuda dg_igr_hdg_sc25_oracle_cpu)
+
+    # Preserve the legacy CUDA implementation only as an explicitly linked,
+    # excluded-from-all validation oracle. Production executables and the
+    # runtime component aggregate never inherit this target or its sources.
+    add_library(dg_igr_hdg_sc25_oracle_cuda STATIC
+                ${_dg_igr_hdg_frozen_test_only_cuda_sources})
+    set_target_properties(dg_igr_hdg_sc25_oracle_cuda PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_EXTENSIONS OFF
+      CUDA_ARCHITECTURES 120
+      CUDA_SEPARABLE_COMPILATION ON
+      CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+      EXCLUDE_FROM_ALL TRUE)
+    target_include_directories(dg_igr_hdg_sc25_oracle_cuda PUBLIC
+                               "${PROJECT_SOURCE_DIR}/include")
+    target_compile_options(dg_igr_hdg_sc25_oracle_cuda PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    target_link_libraries(dg_igr_hdg_sc25_oracle_cuda
+      PUBLIC igr_mfem dg_igr_hdg_runtime_common
+      PRIVATE umpire ${DG_IGR_REQUIRED_CUDA_TARGETS}
+              dg_igr_hdg_generic_cpu dg_igr_hdg_sc25_oracle_cpu)
+    dg_igr_hdg_require_target_link_closure_absent(
+      dg_igr_hdg_runtime_cuda dg_igr_hdg_sc25_oracle_cuda)
     target_link_libraries(dg_igr_hdg_runtime_components INTERFACE
                           dg_igr_hdg_runtime_cuda)
 
@@ -307,27 +328,6 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     endif()
     list(APPEND _dg_igr_hdg_runtime_app_executable_sources
          ${_dg_igr_hdg_runtime_app_cuda_sources})
-    add_library(dg_igr_hdg_runtime_scalar_cuda_rank2_app OBJECT
-                "${CMAKE_CURRENT_SOURCE_DIR}/app/solver_cuda.cu")
-    target_include_directories(dg_igr_hdg_runtime_scalar_cuda_rank2_app
-                               PRIVATE "${PROJECT_SOURCE_DIR}/include")
-    target_compile_definitions(
-      dg_igr_hdg_runtime_scalar_cuda_rank2_app PRIVATE
-      DG_IGR_HDG_SCALAR_IGR_CUDA_RANK2_TRANSLATION_UNIT=1)
-    target_compile_options(dg_igr_hdg_runtime_scalar_cuda_rank2_app PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
-      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-    target_link_libraries(dg_igr_hdg_runtime_scalar_cuda_rank2_app PRIVATE
-                          dg_igr_hdg_runtime_app_contract
-                          dg_igr_hdg_generic_cpu
-                          dg_igr_hdg_runtime_cuda
-                          dg_igr_hdg_auxiliary_cpu mfem MPI::MPI_CXX)
-    set_target_properties(dg_igr_hdg_runtime_scalar_cuda_rank2_app PROPERTIES
-      CUDA_STANDARD 17
-      CUDA_STANDARD_REQUIRED ON
-      CUDA_EXTENSIONS OFF
-      CUDA_ARCHITECTURES 120
-      CUDA_SEPARABLE_COMPILATION ON)
   elseif(_dg_igr_hdg_runtime_app_cuda_sources)
     message(STATUS
             "HDG application CUDA source is reserved but not built by the CPU profile.")
@@ -336,8 +336,6 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   add_executable(dg_igr_hdg_runtime
                  ${_dg_igr_hdg_runtime_app_executable_sources})
   if(MFEM_USE_CUDA)
-    target_sources(dg_igr_hdg_runtime PRIVATE
-      $<TARGET_OBJECTS:dg_igr_hdg_runtime_scalar_cuda_rank2_app>)
     dg_igr_configure_hdg_cuda_final_consumer(dg_igr_hdg_runtime)
   endif()
   target_include_directories(dg_igr_hdg_runtime PRIVATE
@@ -360,5 +358,20 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   if(MFEM_USE_CUDA)
     target_link_libraries(dg_igr_hdg_runtime PRIVATE
                           dg_igr_hdg_runtime_cuda)
+  endif()
+
+  dg_igr_hdg_require_target_link_closure_absent(
+    dg_igr_hdg_runtime_app_cpu dg_igr_hdg_sc25_oracle_cpu)
+  dg_igr_hdg_require_target_link_closure_absent(
+    dg_igr_hdg_runtime_components dg_igr_hdg_sc25_oracle_cpu)
+  dg_igr_hdg_require_target_link_closure_absent(
+    dg_igr_hdg_runtime dg_igr_hdg_sc25_oracle_cpu)
+  if(MFEM_USE_CUDA)
+    dg_igr_hdg_require_target_link_closure_absent(
+      dg_igr_hdg_runtime_components dg_igr_hdg_sc25_oracle_cuda)
+    dg_igr_hdg_require_target_link_closure_absent(
+      dg_igr_hdg_main_backend_cuda dg_igr_hdg_sc25_oracle_cuda)
+    dg_igr_hdg_require_target_link_closure_absent(
+      dg_igr_hdg_runtime dg_igr_hdg_sc25_oracle_cuda)
   endif()
 endif()

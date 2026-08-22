@@ -649,7 +649,7 @@ bool DirectAndNegativeControls()
   const ParsedCommandLine crossed_scalar = Parse(scalar_conventional_case);
   passed = Check(crossed_scalar.status == CommandLineStatus::rejected &&
                      crossed_scalar.rejection ==
-                         ApplicationRejection::unknown_case &&
+                         ApplicationRejection::unknown_card &&
                      ExitForRejection(crossed_scalar.rejection) ==
                          ApplicationExit::configuration_error,
                  "scalar_card_conventional_case_cli_rejected") && passed;
@@ -660,116 +660,19 @@ bool DirectAndNegativeControls()
   passed = Check(
                scalar_short_result.status == CommandLineStatus::rejected &&
                    scalar_short_result.rejection ==
-                       ApplicationRejection::unknown_scenario &&
+                       ApplicationRejection::unknown_card &&
                    ExitForRejection(scalar_short_result.rejection) ==
                        ApplicationExit::configuration_error,
                "scalar_card_three_steps_cli_rejected") && passed;
 
   const ParsedCommandLine scalar_cpu = Parse(ScalarArguments("cpu", "none"));
-#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
-  passed = Check(scalar_cpu.status == CommandLineStatus::run &&
-                     scalar_cpu.options.scenario_id ==
-                         scalar_igr_sc25_v3_scenario_id &&
-                     scalar_cpu.options.formulation_id ==
-                         FullyHybridizedScalarSc25V3Tag::id,
-                 "scalar_igr_static_cli") && passed;
-#else
   passed = Check(scalar_cpu.status == CommandLineStatus::rejected &&
-                     scalar_cpu.rejection == ApplicationRejection::unbuilt_backend,
-                 "scalar_igr_default_build_unavailable") && passed;
-#endif
+                     scalar_cpu.rejection == ApplicationRejection::unknown_card,
+                 "legacy_scalar_card_not_admitted_cpu") && passed;
   const ParsedCommandLine scalar_cuda = Parse(ScalarArguments("cuda", "0"));
-#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1
-  passed = Check(scalar_cuda.status == CommandLineStatus::run &&
-                     scalar_cuda.options.backend_id ==
-                         CudaRank1OneGpuBackendTag::id,
-                 "scalar_igr_cuda_static_cli") && passed;
-#else
   passed = Check(scalar_cuda.status == CommandLineStatus::rejected &&
-                     scalar_cuda.rejection == ApplicationRejection::unbuilt_backend,
-                 "scalar_igr_cuda_explicit_unbuilt") && passed;
-#endif
-  auto scalar_cuda_fault_free_arguments = ScalarArguments("cuda", "0");
-  SetOption(scalar_cuda_fault_free_arguments, "--max-retries", "0");
-  SetOption(scalar_cuda_fault_free_arguments, "--inject-failure", "off");
-  const ParsedCommandLine scalar_cuda_fault_free =
-      Parse(scalar_cuda_fault_free_arguments);
-#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1
-  passed = Check(scalar_cuda_fault_free.status == CommandLineStatus::run &&
-                     scalar_cuda_fault_free.options.injection.mode ==
-                         FailureInjectionModeV1::off &&
-                     scalar_cuda_fault_free.options.retry_limit == 0,
-                 "scalar_cuda_fault_free_cli_contract") && passed;
-  for (const std::string phase :
-       {"CheckpointStaging", "OutputStaging",
-        "AfterRecoveryBeforeCommit"})
-  {
-    auto scheduled_arguments = ScalarArguments("cuda", "0");
-    SetOption(scheduled_arguments, "--inject-failure",
-              phase + ":10:0");
-    const ParsedCommandLine scheduled = Parse(scheduled_arguments);
-    passed = Check(scheduled.status == CommandLineStatus::run &&
-                       scheduled.options.backend_id ==
-                           CudaRank1OneGpuBackendTag::id &&
-                       scheduled.options.injection.target_step == 10 &&
-                       scheduled.options.injection.source_rank == 0,
-                   "scalar_cuda_rank1_step10_cli_contract") && passed;
-  }
-  auto terminal_arguments = ScalarArguments("cuda", "0");
-  SetOption(terminal_arguments, "--max-retries", "0");
-  SetOption(terminal_arguments, "--inject-failure",
-            "AfterRecoveryBeforeCommit:20:0");
-  const ParsedCommandLine terminal = Parse(terminal_arguments);
-  auto terminal_writer_arguments = terminal_arguments;
-  SetOption(terminal_writer_arguments, "--stop-after-checkpoint", "true");
-  const ParsedCommandLine terminal_writer = Parse(terminal_writer_arguments);
-  passed = Check(terminal.status == CommandLineStatus::run &&
-                     terminal.options.backend_id ==
-                         CudaRank1OneGpuBackendTag::id &&
-                     terminal.options.injection.target_step == 20 &&
-                     terminal.options.retry_limit == 0 &&
-                     terminal_writer.status == CommandLineStatus::rejected &&
-                     terminal_writer.rejection ==
-                         ApplicationRejection::invalid_run_role,
-                 "scalar_cuda_rank1_step20_cli_contract") && passed;
-#endif
-#if DG_IGR_HDG_APP_HAS_CUDA_RANK2 && DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
-  for (const std::string phase :
-       {"CheckpointStaging", "OutputStaging",
-        "AfterRecoveryBeforeCommit"})
-  {
-    auto scheduled_arguments = ScalarArguments("cuda", "0");
-    SetOption(scheduled_arguments, "--inject-failure",
-              phase + ":10:1");
-    const ParsedCommandLine scheduled = Parse(scheduled_arguments);
-    passed = Check(scheduled.status == CommandLineStatus::run &&
-                       scheduled.options.backend_id ==
-                           CudaRank2OneGpuHostStagedBackendTag::id &&
-                       scheduled.options.injection.target_step == 10 &&
-                       scheduled.options.injection.source_rank == 1,
-                   "scalar_cuda_rank2_step10_cli_fallback") && passed;
-  }
-  auto rank2_terminal_arguments = ScalarArguments("cuda", "0");
-  SetOption(rank2_terminal_arguments, "--max-retries", "0");
-  SetOption(rank2_terminal_arguments, "--inject-failure",
-            "AfterRecoveryBeforeCommit:20:1");
-  const ParsedCommandLine rank2_terminal = Parse(rank2_terminal_arguments);
-  auto rank2_terminal_writer_arguments = rank2_terminal_arguments;
-  SetOption(rank2_terminal_writer_arguments, "--stop-after-checkpoint",
-            "true");
-  const ParsedCommandLine rank2_terminal_writer =
-      Parse(rank2_terminal_writer_arguments);
-  passed = Check(rank2_terminal.status == CommandLineStatus::run &&
-                     rank2_terminal.options.backend_id ==
-                         CudaRank2OneGpuHostStagedBackendTag::id &&
-                     rank2_terminal.options.injection.target_step == 20 &&
-                     rank2_terminal.options.retry_limit == 0 &&
-                     rank2_terminal_writer.status ==
-                         CommandLineStatus::rejected &&
-                     rank2_terminal_writer.rejection ==
-                         ApplicationRejection::invalid_run_role,
-                 "scalar_cuda_rank2_step20_cli_fallback") && passed;
-#endif
+                     scalar_cuda.rejection == ApplicationRejection::unknown_card,
+                 "legacy_scalar_card_not_admitted_cuda") && passed;
   const ParsedCommandLine smooth_conventional =
       Parse(SmoothTransitionArguments(false, "cpu", "none"));
   passed = Check(
@@ -789,59 +692,20 @@ bool DirectAndNegativeControls()
 
   const ParsedCommandLine smooth_scalar =
       Parse(SmoothTransitionArguments(true, "cpu", "none"));
-#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU
-  passed = Check(
-               smooth_scalar.status == CommandLineStatus::run &&
-                   smooth_scalar.options.case_id ==
-                       "periodic-smooth-transition-v2" &&
-                   smooth_scalar.options.source_id ==
-                       "source.sc25.periodic-smooth-transition.v3" &&
-                   smooth_scalar.options.formulation_id ==
-                       FullyHybridizedScalarSc25V3Tag::id &&
-                   smooth_scalar.options.q_a == 12,
-               "smooth_transition_scalar_cli") && passed;
-#else
   passed = Check(
                smooth_scalar.status == CommandLineStatus::rejected &&
                    smooth_scalar.rejection ==
-                       ApplicationRejection::unbuilt_backend,
-               "smooth_transition_scalar_unbuilt_cli") && passed;
-#endif
+                       ApplicationRejection::unknown_card,
+               "smooth_transition_scalar_card_not_admitted_cli") && passed;
 
   const ParsedCommandLine smooth_scalar_cuda_rank2 =
       Parse(SmoothTransitionArguments(true, "cuda", "0"));
-#if DG_IGR_HDG_APP_HAS_CUDA_RANK2 && DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
   passed = Check(
-               smooth_scalar_cuda_rank2.status == CommandLineStatus::run &&
-                   smooth_scalar_cuda_rank2.options.backend_id ==
-                       CudaRank2OneGpuHostStagedBackendTag::id &&
-                   smooth_scalar_cuda_rank2.options.device_id == 0,
-               "smooth_transition_scalar_cuda_rank2_cli") &&
-      passed;
-  auto smooth_cuda_writer =
-      SmoothTransitionArguments(true, "cuda", "0");
-  SetOption(smooth_cuda_writer, "--stop-after-checkpoint", "true");
-  SetOption(smooth_cuda_writer, "--max-retries", "1");
-  SetOption(smooth_cuda_writer, "--inject-failure",
-            "AfterRecoveryBeforeCommit:7:1");
-  auto smooth_cuda_reader = smooth_cuda_writer;
-  SetOption(smooth_cuda_reader, "--checkpoint-out", "none");
-  SetOption(smooth_cuda_reader, "--checkpoint-step", "none");
-  SetOption(smooth_cuda_reader, "--stop-after-checkpoint", "false");
-  SetOption(smooth_cuda_reader, "--restart-from", "w8c-smooth-checkpoint");
-  SetOption(smooth_cuda_reader, "--max-retries", "0");
-  SetOption(smooth_cuda_reader, "--inject-failure", "off");
-  passed = Check(Parse(smooth_cuda_writer).status == CommandLineStatus::run &&
-                     Parse(smooth_cuda_reader).status == CommandLineStatus::run,
-                 "smooth_transition_scalar_cuda_rank2_split_cli") &&
-      passed;
-#else
-  passed = Check(smooth_scalar_cuda_rank2.status == CommandLineStatus::rejected &&
+               smooth_scalar_cuda_rank2.status == CommandLineStatus::rejected &&
                      smooth_scalar_cuda_rank2.rejection ==
-                         ApplicationRejection::unbuilt_backend,
-                 "smooth_transition_scalar_cuda_rank2_unbuilt_cli") &&
+                         ApplicationRejection::unknown_card,
+                 "smooth_transition_scalar_cuda_card_not_admitted_cli") &&
       passed;
-#endif
 
   auto smooth_reader = SmoothTransitionArguments(false, "cpu", "none");
   SetOption(smooth_reader, "--checkpoint-out", "none");
@@ -886,8 +750,8 @@ bool DirectAndNegativeControls()
   scalar_h1_args[6] = "h1";
   const ParsedCommandLine scalar_h1 = Parse(scalar_h1_args);
   passed = Check(scalar_h1.status == CommandLineStatus::rejected &&
-                     scalar_h1.rejection == ApplicationRejection::unsupported_h1,
-                 "scalar_igr_h1_pre_resource_rejection") && passed;
+                     scalar_h1.rejection == ApplicationRejection::unknown_card,
+                 "legacy_scalar_card_rejected_before_discretization") && passed;
   return passed;
 }
 
@@ -902,6 +766,9 @@ bool HelpAndConfig()
                      text.str().find("--config") != std::string::npos &&
                      text.str().find("periodic-smooth-transition-v2") !=
                          std::string::npos &&
+                     text.str().find("traced_scalar.sc25") ==
+                         std::string::npos &&
+                     text.str().find("sc25-periodic") == std::string::npos &&
                      text.str().find("--validation-capture") == std::string::npos &&
                      text.str().find("--evidence-dir") == std::string::npos &&
                      text.str().find("AfterRecoveryBeforeCommit") !=

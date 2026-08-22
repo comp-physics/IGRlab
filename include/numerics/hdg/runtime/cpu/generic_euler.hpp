@@ -132,8 +132,6 @@ public:
   generic::HdgEulerCommittedDiagnostics diagnostics() const noexcept;
   /** Fresh collective summary of committed volume coefficients only. */
   generic::HdgEulerCommittedObservables ObserveCommitted() noexcept;
-  /** Stored generation-bound residual audit; access is noncollective. */
-  generic::HdgEulerCommittedResidualAudit committed_residual_audit() const noexcept;
 
   /** Copy only the committed physical interior; trace values are never output. */
   bool ExportCommittedInterior(GenericEulerCpuInteriorBuffer) const noexcept;

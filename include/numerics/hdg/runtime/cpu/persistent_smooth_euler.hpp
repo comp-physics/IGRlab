@@ -249,9 +249,9 @@ struct CpuAttemptEvidence
   double initial_nonlinear_residual = 0.0;
   double final_nonlinear_residual = 0.0;
   double maximum_true_relative_residual = 0.0;
-  // Periodic IGR attempts publish only after the conservative p1 update is
-  // balanced against the integrated static source over the accepted step.
-  // These are compact terminal scalars, not per-iteration history.
+  // IGR attempts publish only after the Euler balance and the global sigma
+  // compatibility residual are both within tolerance.  These are compact
+  // terminal scalars, not per-iteration history.
   double maximum_conservation_error = 0.0;
   double maximum_conservation_relative_error = 0.0;
   double minimum_density = 0.0;
@@ -753,12 +753,15 @@ public:
   /** Fresh collective volume-only observables for the committed slot. */
   bool ObserveCommittedBorrowedEuler(
       generic::HdgEulerCommittedObservables&) noexcept;
-  /** Stored committed audit accessor; no collective occurs on access. */
-  generic::HdgEulerCommittedResidualAudit
-  CommittedBorrowedEulerResidualAudit() const noexcept;
-  /** Internal preparation of the core-owned optional candidate audit. */
-  bool AuditPreparedBorrowedEulerResidual(
-      generic::HdgEulerCommittedResidualAudit&) noexcept;
+  /**
+   * Detail-only central-difference check of the live borrowed IGR assembler.
+   * The six outputs are relative errors for A, B, C, D, the simultaneous
+   * interior residual, and the simultaneous trace residual, respectively.
+   * This seam is intentionally unavailable through the generic session.
+   */
+  bool VerifyBorrowedEulerAssemblerJacobianForTests(
+      double relative_tolerance,
+      std::array<double, 6>& relative_errors) noexcept;
   /** Discard exactly one active prepared candidate. */
   bool AbortBorrowedEuler(std::uint64_t,
                           const StateCoordinates&) noexcept;

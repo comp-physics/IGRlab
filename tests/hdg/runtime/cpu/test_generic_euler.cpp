@@ -67,6 +67,30 @@ bool NonperiodicExterior(const void* opaque,
   return true;
 }
 
+bool FixedExteriorForAssemblerJacobianForTests(
+    const void* opaque,
+    const dg::hdg::generic::BoundaryPointView& point,
+    const double*, double* exterior) noexcept
+{
+  auto* const context = static_cast<BoundaryContext*>(const_cast<void*>(opaque));
+  if (context == nullptr || context->fail || point.space_dimension != 2 ||
+      point.position == nullptr || point.outward_normal == nullptr ||
+      point.boundary_attribute <= 0 || exterior == nullptr)
+  {
+    return false;
+  }
+  ++context->calls;
+  // The production physical-boundary Jacobian deliberately freezes the
+  // Euler exterior-state callback (Picard linearization).  Keep this test
+  // callback independent of the perturbed state so finite differences check
+  // that exact contract while still exercising every physical face row.
+  exterior[0] = 1.1;
+  exterior[1] = 0.03 * point.outward_normal[0];
+  exterior[2] = 0.03 * point.outward_normal[1];
+  exterior[3] = 2.9;
+  return true;
+}
+
 bool CheckBoundaryExteriorSemantics()
 {
   BoundaryContext context{};
@@ -398,8 +422,10 @@ bool CheckBorrowedTraceRestrictsInterior()
     }
     dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
     if (!core.InitializeBorrowedEuler(request)) return false;
-    if (core.evidence().tuple.stabilization.view() !=
-        "tau.llf.max-fixed-local.v1")
+    if (core.evidence().tuple.formulation.view() !=
+            "hdg.conventional.v1" ||
+        core.evidence().tuple.stabilization.view() !=
+            "tau.llf.max-fixed-local.v1")
     {
       return false;
     }
@@ -813,93 +839,6 @@ bool CheckCommittedObservablesZeroOwnedRank()
           observables, session.capabilities());
 }
 
-bool SameCommittedResidualAudit(
-    const dg::hdg::generic::HdgEulerCommittedResidualAudit& left,
-    const dg::hdg::generic::HdgEulerCommittedResidualAudit& right)
-{
-  return left.available == right.available &&
-      left.coordinates.time == right.coordinates.time &&
-      left.coordinates.dt == right.coordinates.dt &&
-      left.coordinates.step == right.coordinates.step &&
-      left.coordinates.generation == right.coordinates.generation &&
-      left.residual_generation == right.residual_generation &&
-      left.quadrature_order == right.quadrature_order &&
-      left.formulation == right.formulation &&
-      ((std::isnan(left.norm) && std::isnan(right.norm)) ||
-       left.norm == right.norm);
-}
-
-bool CheckCommittedResidualAuditLifecycle()
-{
-  GenericEulerHdgCpuSession uninitialized;
-  const auto empty = uninitialized.committed_residual_audit();
-  if (empty.available || !std::isnan(empty.norm) ||
-      dg::hdg::generic::IsValidHdgEulerCommittedResidualAudit(empty, 0))
-  {
-    return false;
-  }
-  mfem::ParMesh mesh = MakeBorrowedMesh();
-  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
-                                        0.00, 0.01, 2.55, 2.62}};
-  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
-                                       0.00, 0.00, 0.03, 0.04}};
-  BoundaryContext boundary{};
-  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
-  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
-  request.numerical_policy.conventional_assembly_quadrature_order = 4;
-  request.numerical_policy.audit_quadrature_order = 9;
-  GenericEulerHdgCpuSession session;
-  if (session.Initialize(request).status !=
-          GenericEulerCpuSessionStatus::initialized ||
-      !dg::hdg::generic::HasHdgEulerSessionCapabilities(
-          session.capabilities(),
-          dg::hdg::generic::HdgEulerSessionCapabilityBit(
-              dg::hdg::generic::HdgEulerSessionCapability::committed_nonlinear_residual_audit)))
-  {
-    return false;
-  }
-  const auto before = session.committed_residual_audit();
-  GenericEulerCpuPreparedStep prepared;
-  if (session.Prepare(0.005, prepared).status !=
-          GenericEulerCpuSessionStatus::prepared ||
-      !SameCommittedResidualAudit(before, session.committed_residual_audit()) ||
-      session.Abort(std::move(prepared)).status !=
-          GenericEulerCpuSessionStatus::aborted ||
-      !SameCommittedResidualAudit(before, session.committed_residual_audit()))
-  {
-    return false;
-  }
-  GenericEulerCpuPreparedStep committed;
-  if (session.Prepare(0.007, committed).status !=
-          GenericEulerCpuSessionStatus::prepared ||
-      session.Commit(std::move(committed)).status !=
-          GenericEulerCpuSessionStatus::committed)
-  {
-    return false;
-  }
-  const auto first = session.committed_residual_audit();
-  if (!dg::hdg::generic::IsValidHdgEulerCommittedResidualAudit(
-          first, session.capabilities()) ||
-      first.coordinates.step != 1 || first.coordinates.generation != 1 ||
-      first.residual_generation != 1 || first.quadrature_order != 9 ||
-      first.formulation !=
-          dg::hdg::generic::HdgEulerResidualFormulation::conventional_u4_uhat4)
-  {
-    return false;
-  }
-  if (session.Advance(0.009).status != GenericEulerCpuSessionStatus::advanced)
-  {
-    return false;
-  }
-  const auto second = session.committed_residual_audit();
-  return dg::hdg::generic::IsValidHdgEulerCommittedResidualAudit(
-             second, session.capabilities()) &&
-      second.coordinates.step == 2 && second.coordinates.generation == 2 &&
-      second.residual_generation == 2 && second.quadrature_order == 9 &&
-      second.formulation ==
-          dg::hdg::generic::HdgEulerResidualFormulation::conventional_u4_uhat4;
-}
-
 bool CheckDefaultNumericalPolicyAdaptiveLinearCap()
 {
   // p3 on this deliberately nontrivial mesh has a true trace larger than the
@@ -960,7 +899,7 @@ bool CheckPeriodicAnnotationsRemainTraceCouplings()
       context.calls == 0;
 }
 
-bool CheckPrivateTracedScalarIgrLifecycle()
+bool CheckIgrExtensionLifecycle()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
   const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
@@ -974,8 +913,6 @@ bool CheckPrivateTracedScalarIgrLifecycle()
   GenericEulerHdgCpuSession session;
   const auto initialized = session.Initialize(request);
   if (initialized.status != GenericEulerCpuSessionStatus::initialized) return false;
-  const auto audit_before = session.committed_residual_audit();
-  if (audit_before.available || !std::isnan(audit_before.norm)) return false;
   mfem::L2_FECollection collection(1, 2, mfem::BasisType::GaussLegendre,
                                    mfem::FiniteElement::VALUE);
   mfem::ParFiniteElementSpace space(&mesh, &collection, 4,
@@ -988,41 +925,26 @@ bool CheckPrivateTracedScalarIgrLifecycle()
   std::vector<double> candidate(before.size(), 0.0);
   const bool exported_candidate = prepared.status == GenericEulerCpuSessionStatus::prepared &&
       session.ExportPreparedInterior(first, {candidate.data(), candidate.size()});
-  const bool audit_hidden_during_prepare =
-      SameCommittedResidualAudit(audit_before, session.committed_residual_audit());
   const bool changed = candidate != before;
   const auto aborted = prepared.status == GenericEulerCpuSessionStatus::prepared
       ? session.Abort(std::move(first)) : decltype(session.Abort(std::move(first))){ };
   std::vector<double> after_abort(before.size(), 0.0);
   const bool rollback = session.ExportCommittedInterior({after_abort.data(), after_abort.size()}) &&
       after_abort == before;
-  const bool audit_preserved_by_abort =
-      SameCommittedResidualAudit(audit_before, session.committed_residual_audit());
   GenericEulerCpuPreparedStep retry;
   const auto retried = session.Prepare(0.001, retry);
   const auto committed = retried.status == GenericEulerCpuSessionStatus::prepared
       ? session.Commit(std::move(retry)) : decltype(session.Commit(std::move(retry))){ };
-  const auto audit_after_commit = session.committed_residual_audit();
   const auto second = session.Advance(0.001);
-  const auto audit_after_second = session.committed_residual_audit();
   return exported_before && exported_candidate && changed &&
-      audit_hidden_during_prepare &&
       aborted.status == GenericEulerCpuSessionStatus::aborted && rollback &&
-      audit_preserved_by_abort &&
       committed.status == GenericEulerCpuSessionStatus::committed &&
-      dg::hdg::generic::IsValidHdgEulerCommittedResidualAudit(
-          audit_after_commit, session.capabilities()) &&
-      audit_after_commit.formulation ==
-          dg::hdg::generic::HdgEulerResidualFormulation::traced_scalar_igr_p1_u7_uhat5 &&
-      audit_after_commit.quadrature_order !=
-          request.numerical_policy.igr_assembly_quadrature_order &&
       second.status == GenericEulerCpuSessionStatus::advanced &&
-      dg::hdg::generic::IsValidHdgEulerCommittedResidualAudit(
-          audit_after_second, session.capabilities()) &&
-      audit_after_second.coordinates.generation == 2 && boundary.calls == 0;
+      second.coordinates.step == 2 && second.coordinates.generation == 2 &&
+      boundary.calls == 0;
 }
 
-bool CheckPrivateTracedScalarIgrConvergenceEvidence()
+bool CheckIgrExtensionConvergenceEvidence()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
   const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
@@ -1038,6 +960,13 @@ bool CheckPrivateTracedScalarIgrConvergenceEvidence()
       {RegularizationKind::igr, 0.2, 0.4};
   dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
   if (!core.InitializeBorrowedEuler(request)) return false;
+  if (core.evidence().tuple.formulation.view() !=
+          "hdg.conventional.v1" ||
+      core.evidence().tuple.stabilization.view() !=
+          "igr.scalar.traced.alpha-beta.v1")
+  {
+    return false;
+  }
   dg::hdg::runtime::StateCoordinates coordinates{};
   std::uint64_t generation = 0;
   if (!core.PrepareBorrowedEuler(0.001, coordinates, generation)) return false;
@@ -1063,240 +992,7 @@ bool CheckPrivateTracedScalarIgrConvergenceEvidence()
       boundary.calls == 0;
 }
 
-bool SamePrimaryIgrAttemptEvidence(
-    const dg::hdg::runtime::cpu::CpuAttemptEvidence& left,
-    const dg::hdg::runtime::cpu::CpuAttemptEvidence& right)
-{
-  return left.status == right.status &&
-      left.failure_phase == right.failure_phase &&
-      left.nonlinear_updates == right.nonlinear_updates &&
-      left.linear_iterations == right.linear_iterations &&
-      left.final_line_search_trials == right.final_line_search_trials &&
-      left.initial_nonlinear_residual == right.initial_nonlinear_residual &&
-      left.final_nonlinear_residual == right.final_nonlinear_residual &&
-      left.maximum_true_relative_residual == right.maximum_true_relative_residual &&
-      left.maximum_conservation_error == right.maximum_conservation_error &&
-      left.maximum_conservation_relative_error ==
-          right.maximum_conservation_relative_error &&
-      left.minimum_density == right.minimum_density &&
-      left.minimum_pressure == right.minimum_pressure &&
-      left.maximum_wave_speed == right.maximum_wave_speed &&
-      left.committed_interior_before == right.committed_interior_before &&
-      left.committed_trace_before == right.committed_trace_before &&
-      left.committed_interior_after == right.committed_interior_after &&
-      left.committed_trace_after == right.committed_trace_after &&
-      left.candidate_generation == right.candidate_generation &&
-      left.candidate_generation_invalidated ==
-          right.candidate_generation_invalidated &&
-      left.work.complete_assemblies == right.work.complete_assemblies &&
-      left.work.complete_condensations == right.work.complete_condensations &&
-      left.work.complete_factor_setups == right.work.complete_factor_setups &&
-      left.work.complete_trace_solves == right.work.complete_trace_solves &&
-      left.work.complete_recoveries == right.work.complete_recoveries &&
-      left.work.trial_reassemblies == right.work.trial_reassemblies &&
-      left.work.accepted_newton_updates ==
-          right.work.accepted_newton_updates &&
-      left.work.phase_entries == right.work.phase_entries &&
-      left.work.phase_completions == right.work.phase_completions &&
-      left.finite_gate == right.finite_gate &&
-      left.admissibility_gate == right.admissibility_gate &&
-      left.recovery_gate == right.recovery_gate &&
-      left.nonlinear_gate == right.nonlinear_gate &&
-      left.true_residual_gate == right.true_residual_gate &&
-      left.conservation_gate == right.conservation_gate;
-}
-
-bool SameCommittedState(const std::vector<double>& left_interior,
-                        const std::vector<double>& left_trace,
-                        const std::vector<double>& right_interior,
-                        const std::vector<double>& right_trace)
-{
-  return left_interior == right_interior && left_trace == right_trace;
-}
-
-bool CheckPrivateTracedScalarIgrAuditQuadratureNoninterference()
-{
-  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
-  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
-                                       0.00, 0.01, 2.55, 2.62}};
-  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
-                                      0.00, 0.00, 0.03, 0.04}};
-  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
-  struct Run final
-  {
-    std::vector<double> committed_interior;
-    std::vector<double> committed_trace;
-    dg::hdg::runtime::StateHash interior_hash{};
-    dg::hdg::runtime::StateHash trace_hash{};
-    dg::hdg::runtime::cpu::CpuAttemptEvidence attempt{};
-    dg::hdg::generic::HdgEulerCommittedResidualAudit audit{};
-    bool initialized = false;
-    bool prepared = false;
-    bool committed_step = false;
-    bool complete = false;
-  };
-  const auto run = [&](const int audit_quadrature_order) -> Run
-  {
-    BoundaryContext boundary{};
-    EulerHdgRequest request = Request(mesh, 1, boundary, fields);
-    request.numerical_policy.stabilization = {RegularizationKind::igr, 0.2, 0.4};
-    request.numerical_policy.audit_quadrature_order = audit_quadrature_order;
-    dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
-    dg::hdg::runtime::StateCoordinates coordinates{};
-    std::uint64_t generation = 0;
-    double maximum_wave_speed = 0.0;
-    double stable_dt = 0.0;
-    Run result{};
-    result.initialized = core.InitializeBorrowedEuler(request);
-    result.prepared = result.initialized &&
-        core.PrepareBorrowedEuler(0.001, coordinates, generation);
-    result.committed_step = result.prepared && core.CommitBorrowedEuler(
-        generation, coordinates, maximum_wave_speed, stable_dt);
-    if (!result.committed_step)
-    {
-      return result;
-    }
-    const dg::hdg::runtime::cpu::CpuStateSnapshot snapshot =
-        core.Snapshot(coordinates);
-    if ((snapshot.interior.size != 0 && snapshot.interior.data == nullptr) ||
-        (snapshot.trace.size != 0 && snapshot.trace.data == nullptr))
-    {
-      return result;
-    }
-    if (snapshot.interior.size != 0)
-    {
-      result.committed_interior.assign(snapshot.interior.data,
-                                       snapshot.interior.data +
-                                           snapshot.interior.size);
-    }
-    if (snapshot.trace.size != 0)
-    {
-      result.committed_trace.assign(snapshot.trace.data,
-                                    snapshot.trace.data + snapshot.trace.size);
-    }
-    result.interior_hash = snapshot.interior_hash;
-    result.trace_hash = snapshot.trace_hash;
-    result.attempt = core.evidence().last_attempt;
-    result.audit = core.CommittedBorrowedEulerResidualAudit();
-    result.complete = boundary.calls == 0;
-    return result;
-  };
-
-  constexpr int first_audit_q = 14;
-  constexpr int second_audit_q = 18;
-  const Run first = run(first_audit_q);
-  const Run second = run(second_audit_q);
-  const std::uint32_t audit_capability =
-      dg::hdg::generic::HdgEulerSessionCapabilityBit(
-          dg::hdg::generic::HdgEulerSessionCapability::committed_nonlinear_residual_audit);
-  const bool first_audit_valid =
-      dg::hdg::generic::IsValidHdgEulerCommittedResidualAudit(
-          first.audit, audit_capability);
-  const bool second_audit_valid =
-      dg::hdg::generic::IsValidHdgEulerCommittedResidualAudit(
-          second.audit, audit_capability);
-  const bool same_state = SameCommittedState(
-      first.committed_interior, first.committed_trace,
-      second.committed_interior, second.committed_trace);
-  const bool same_state_hashes = first.interior_hash == second.interior_hash &&
-      first.trace_hash == second.trace_hash;
-  const bool same_evidence =
-      SamePrimaryIgrAttemptEvidence(first.attempt, second.attempt);
-  const bool audit_metadata =
-      first.audit.quadrature_order == first_audit_q &&
-      second.audit.quadrature_order == second_audit_q &&
-      first.audit.formulation ==
-          dg::hdg::generic::HdgEulerResidualFormulation::traced_scalar_igr_p1_u7_uhat5 &&
-      second.audit.formulation ==
-          dg::hdg::generic::HdgEulerResidualFormulation::traced_scalar_igr_p1_u7_uhat5;
-  const bool passed = first.complete && second.complete && same_state &&
-      same_state_hashes &&
-      same_evidence && first_audit_valid && second_audit_valid && audit_metadata;
-  if (!passed)
-  {
-    int rank = 0;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    std::cerr << "igr audit noninterference rank=" << rank
-              << " stages=" << first.initialized << ',' << first.prepared
-              << ',' << first.committed_step << '/' << second.initialized << ','
-              << second.prepared << ',' << second.committed_step
-              << " complete=" << first.complete << ',' << second.complete
-              << " state=" << same_state << " state_hashes="
-              << same_state_hashes << " evidence=" << same_evidence
-              << " audit_valid=" << first_audit_valid << ',' << second_audit_valid
-              << " audit_metadata=" << audit_metadata << '\n';
-    for (std::size_t index = 0;
-         index < std::min(first.committed_interior.size(),
-                          second.committed_interior.size());
-         ++index)
-    {
-      if (first.committed_interior[index] != second.committed_interior[index])
-      {
-        std::cerr << "igr audit state mismatch index=" << index
-                  << " field=interior first="
-                  << first.committed_interior[index] << " second="
-                  << second.committed_interior[index] << '\n';
-        break;
-      }
-    }
-    for (std::size_t index = 0;
-         index < std::min(first.committed_trace.size(),
-                          second.committed_trace.size());
-         ++index)
-    {
-      if (first.committed_trace[index] != second.committed_trace[index])
-      {
-        std::cerr << "igr audit state mismatch index=" << index
-                  << " field=trace first=" << first.committed_trace[index]
-                  << " second=" << second.committed_trace[index] << '\n';
-        break;
-      }
-    }
-    std::cerr << "igr audit evidence first="
-              << first.attempt.nonlinear_updates << ','
-              << first.attempt.linear_iterations << ','
-              << first.attempt.initial_nonlinear_residual << ','
-              << first.attempt.final_nonlinear_residual << ','
-              << first.attempt.maximum_true_relative_residual << ','
-              << first.attempt.maximum_conservation_error << ','
-              << first.attempt.maximum_conservation_relative_error << ','
-              << first.attempt.work.complete_assemblies << ','
-              << first.attempt.work.complete_condensations << ','
-              << first.attempt.work.complete_factor_setups << ','
-              << first.attempt.work.complete_trace_solves << ','
-              << first.attempt.work.complete_recoveries << ','
-              << first.attempt.work.trial_reassemblies << ','
-              << first.attempt.work.accepted_newton_updates << ','
-              << first.attempt.work.phase_entries << ','
-              << first.attempt.work.phase_completions << " second="
-              << second.attempt.nonlinear_updates << ','
-              << second.attempt.linear_iterations << ','
-              << second.attempt.initial_nonlinear_residual << ','
-              << second.attempt.final_nonlinear_residual << ','
-              << second.attempt.maximum_true_relative_residual << ','
-              << second.attempt.maximum_conservation_error << ','
-              << second.attempt.maximum_conservation_relative_error << ','
-              << second.attempt.work.complete_assemblies << ','
-              << second.attempt.work.complete_condensations << ','
-              << second.attempt.work.complete_factor_setups << ','
-              << second.attempt.work.complete_trace_solves << ','
-              << second.attempt.work.complete_recoveries << ','
-              << second.attempt.work.trial_reassemblies << ','
-              << second.attempt.work.accepted_newton_updates << ','
-              << second.attempt.work.phase_entries << ','
-              << second.attempt.work.phase_completions << '\n';
-    std::cerr << "igr audit records first=" << first.audit.available << ','
-              << first.audit.quadrature_order << ','
-              << static_cast<int>(first.audit.formulation) << ','
-              << first.audit.norm << " second=" << second.audit.available << ','
-              << second.audit.quadrature_order << ','
-              << static_cast<int>(second.audit.formulation) << ','
-              << second.audit.norm << '\n';
-  }
-  return passed;
-}
-
-bool CheckPrivateTracedScalarIgrNumericalPolicy()
+bool CheckIgrExtensionNumericalPolicy()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
   const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
@@ -1342,7 +1038,7 @@ bool CheckPrivateTracedScalarIgrNumericalPolicy()
       boundary.calls == 0;
 }
 
-bool CheckPrivateTracedScalarIgrZeroLocal()
+bool CheckIgrExtensionZeroLocal()
 {
   int ranks = 1;
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
@@ -1359,7 +1055,6 @@ bool CheckPrivateTracedScalarIgrZeroLocal()
   const auto initialized = session.Initialize(request);
   const auto advanced = initialized.status == GenericEulerCpuSessionStatus::initialized
       ? session.Advance(0.001) : GenericEulerCpuSessionResult{};
-  const auto audit = session.committed_residual_audit();
   const int local_empty = mesh.GetNE() == 0 ? 1 : 0;
   int any_empty = 0;
   const int reduction = MPI_Allreduce(&local_empty, &any_empty, 1, MPI_INT,
@@ -1367,14 +1062,10 @@ bool CheckPrivateTracedScalarIgrZeroLocal()
   return initialized.status == GenericEulerCpuSessionStatus::initialized &&
       advanced.status == GenericEulerCpuSessionStatus::advanced &&
       reduction == MPI_SUCCESS && any_empty == 1 &&
-      dg::hdg::generic::IsValidHdgEulerCommittedResidualAudit(
-          audit, session.capabilities()) &&
-      audit.formulation ==
-          dg::hdg::generic::HdgEulerResidualFormulation::traced_scalar_igr_p1_u7_uhat5 &&
       boundary.calls == 0;
 }
 
-bool CheckPrivateTracedScalarIgrInitializationDeterminism()
+bool CheckIgrExtensionInitializationDeterminism()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
   const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
@@ -1406,6 +1097,56 @@ bool CheckPrivateTracedScalarIgrInitializationDeterminism()
         session.ExportCommittedInterior({second.data(), second.size()});
   }
   return first_ok && second_ok && first == second && boundary.calls == 0;
+}
+
+bool CheckUnifiedIgrAssemblerJacobianForTests()
+{
+  constexpr std::array<double, 8> initial{{
+      1.10, 1.12, 0.08, 0.09, -0.04, -0.03, 2.90, 2.95}};
+  constexpr std::array<double, 8> source{};
+  constexpr double relative_tolerance = 5.0e-5;
+  bool local = true;
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  for (int order = 1; order <= 3; ++order)
+    for (int boundary_case = 0; boundary_case < 2; ++boundary_case)
+    {
+      const bool physical_boundary = boundary_case != 0;
+      mfem::ParMesh mesh = physical_boundary
+          ? MakeBorrowedMesh() : MakePeriodicBorrowedMesh();
+      BoundaryContext boundary{};
+      ExactBorrowedEulerFields fields(mesh, order, initial, source);
+      EulerHdgRequest request = Request(mesh, order, boundary, fields);
+      request.boundary = {
+          &boundary, FixedExteriorForAssemblerJacobianForTests};
+      request.numerical_policy.stabilization =
+          {RegularizationKind::igr, 0.2, 0.8};
+      dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+      std::array<double, 6> relative_errors{};
+      const bool initialized = core.InitializeBorrowedEuler(request);
+      const bool verified = initialized &&
+          core.VerifyBorrowedEulerAssemblerJacobianForTests(
+              relative_tolerance, relative_errors);
+      int global_boundary_calls = 0;
+      const bool calls_reduced = MPI_Allreduce(
+          &boundary.calls, &global_boundary_calls, 1, MPI_INT, MPI_SUM,
+          mesh.GetComm()) == MPI_SUCCESS;
+      const bool boundary_exercised = physical_boundary
+          ? global_boundary_calls > 0 : global_boundary_calls == 0;
+      if ((!verified || !calls_reduced || !boundary_exercised) && rank == 0)
+      {
+        std::cerr << "unified IGR assembler Jacobian check failed order="
+                  << order << " physical_boundary=" << physical_boundary
+                  << " initialized=" << initialized
+                  << " boundary_calls=" << global_boundary_calls
+                  << " errors=";
+        for (const double error : relative_errors)
+          std::cerr << ' ' << error;
+        std::cerr << '\n';
+      }
+      local = local && verified && calls_reduced && boundary_exercised;
+    }
+  return All(local);
 }
 
 bool CheckDynamicTauHighWaveTwoSteps()
@@ -1442,11 +1183,15 @@ bool CheckClosedBoundaryPicardAssembly()
   ExactBorrowedEulerFields fields(mesh, 1, initial, source);
   const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
   dg::hdg::runtime::cpu::detail::ResetCpuGenericBoundaryPicardTestObservation();
-  const bool accepted = ExecuteGenericEulerHdgCpu(
-      Request(mesh, 1, boundary, fields));
-  // This executes the closed nonperiodic solve.  The production hook observes
-  // the actual assembled physical trace rows: one callback value per face
-  // quadrature point, C = 0, and a nonzero trace-mass D contribution.
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  request.numerical_policy.stabilization =
+      {RegularizationKind::igr, 0.2, 0.4};
+  const bool accepted = ExecuteGenericEulerHdgCpu(request);
+  // This executes the closed nonperiodic IGR-augmented solve.  The production
+  // hook observes the conventional Euler physical trace rows in the same
+  // system: one callback value per face quadrature point, C = 0, and a
+  // nonzero trace-mass D contribution.  The auxiliary trace row retains its
+  // homogeneous Neumann closure.
   return accepted && boundary.calls > 0 &&
       dg::hdg::runtime::cpu::detail::
           CpuGenericBoundaryPicardAssemblyObservedForTests() &&
@@ -1787,20 +1532,19 @@ int main(int argc, char* argv[])
   const bool committed_observables = CheckCommittedObservables();
   const bool committed_observables_zero_owned =
       CheckCommittedObservablesZeroOwnedRank();
-  const bool committed_residual_audit = CheckCommittedResidualAuditLifecycle();
   const bool default_numerical_policy =
       CheckDefaultNumericalPolicyAdaptiveLinearCap();
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
-  const bool private_igr = CheckPrivateTracedScalarIgrLifecycle();
-  const bool private_igr_convergence =
-      CheckPrivateTracedScalarIgrConvergenceEvidence();
-  const bool private_igr_audit_noninterference =
-      CheckPrivateTracedScalarIgrAuditQuadratureNoninterference();
-  const bool private_igr_numerical_policy =
-      CheckPrivateTracedScalarIgrNumericalPolicy();
-  const bool private_igr_zero_local = CheckPrivateTracedScalarIgrZeroLocal();
-  const bool private_igr_initialization =
-      CheckPrivateTracedScalarIgrInitializationDeterminism();
+  const bool igr_extension = CheckIgrExtensionLifecycle();
+  const bool igr_extension_convergence =
+      CheckIgrExtensionConvergenceEvidence();
+  const bool igr_extension_numerical_policy =
+      CheckIgrExtensionNumericalPolicy();
+  const bool igr_extension_zero_local = CheckIgrExtensionZeroLocal();
+  const bool igr_extension_initialization =
+      CheckIgrExtensionInitializationDeterminism();
+  const bool igr_assembler_jacobian =
+      CheckUnifiedIgrAssemblerJacobianForTests();
   const bool dynamic_tau = CheckDynamicTauHighWaveTwoSteps();
   const bool boundary_picard = CheckClosedBoundaryPicardAssembly();
   const bool zero_owned = CheckZeroOwnedElementEngine();
@@ -1814,13 +1558,12 @@ int main(int argc, char* argv[])
   const bool local = boundary_semantics && trace_restriction && orders &&
       prepared_lifecycle &&
       committed_observables && committed_observables_zero_owned &&
-      committed_residual_audit &&
       default_numerical_policy &&
-      periodic && private_igr && private_igr_zero_local &&
-      private_igr_convergence &&
-      private_igr_audit_noninterference &&
-      private_igr_numerical_policy &&
-      private_igr_initialization && dynamic_tau && boundary_picard &&
+      periodic && igr_extension && igr_extension_zero_local &&
+      igr_extension_convergence &&
+      igr_extension_numerical_policy &&
+      igr_extension_initialization && igr_assembler_jacobian && dynamic_tau &&
+      boundary_picard &&
       zero_owned && subcommunicator && passive_world && mismatch &&
       initial_trace_admission && initial_trace_zero_local && callback_failure;
   if (!All(local))
@@ -1831,19 +1574,18 @@ int main(int argc, char* argv[])
               << " boundary_semantics=" << boundary_semantics
               << " trace_restriction=" << trace_restriction
               << " orders=" << orders << " periodic=" << periodic
-              << " private_igr=" << private_igr
-              << " private_igr_convergence=" << private_igr_convergence
-              << " private_igr_audit_noninterference="
-              << private_igr_audit_noninterference
-              << " private_igr_numerical_policy="
-              << private_igr_numerical_policy
-              << " private_igr_zero_local=" << private_igr_zero_local
-              << " private_igr_initialization=" << private_igr_initialization
+              << " igr_extension=" << igr_extension
+              << " igr_extension_convergence=" << igr_extension_convergence
+              << " igr_extension_numerical_policy="
+              << igr_extension_numerical_policy
+              << " igr_extension_zero_local=" << igr_extension_zero_local
+              << " igr_extension_initialization="
+              << igr_extension_initialization
+              << " igr_assembler_jacobian=" << igr_assembler_jacobian
               << " prepared_lifecycle=" << prepared_lifecycle
               << " committed_observables=" << committed_observables
               << " committed_observables_zero_owned="
               << committed_observables_zero_owned
-              << " committed_residual_audit=" << committed_residual_audit
               << " default_numerical_policy=" << default_numerical_policy
               << " dynamic_tau=" << dynamic_tau
               << " boundary_picard=" << boundary_picard
