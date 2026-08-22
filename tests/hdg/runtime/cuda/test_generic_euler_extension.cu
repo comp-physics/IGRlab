@@ -559,6 +559,7 @@ using dg::hdg::runtime::cuda_w8a::PersistentCudaSmoothEulerEngine;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedIgrConservationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
+using dg::hdg::runtime::cuda_w8a::detail::qualification_density_gate;
 
 constexpr int components = dg::hdg::generic::euler_2d_conserved_components;
 constexpr std::uint32_t cuda_capabilities =
