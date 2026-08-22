@@ -1165,6 +1165,7 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
     gmres.SetMaxIter(std::max(100, global_size));
     gmres.SetKDim(std::min(100, std::max(20, global_size)));
     gmres.SetLogging(0); gmres.SetPrintLevel(0);
+    input.true_matrix->HypreRead();
     gmres.SetPreconditioner(ilu); gmres.SetOperator(*input.true_matrix);
     gmres.Mult(scaled_rhs, scaled_solution);
     mfem::HypreParVector scaled_residual(

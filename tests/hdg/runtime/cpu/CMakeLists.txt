@@ -2,6 +2,14 @@ add_executable(dg_igr_hdg_runtime_cpu_test
   independent_oracle.cpp
   test_persistent_smooth_euler.cpp)
 
+if(MFEM_USE_CUDA)
+  set_source_files_properties(independent_oracle.cpp PROPERTIES LANGUAGE CUDA)
+  set_target_properties(dg_igr_hdg_runtime_cpu_test PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF)
+endif()
+
 target_include_directories(dg_igr_hdg_runtime_cpu_test
   PRIVATE
     "${PROJECT_SOURCE_DIR}/include"
@@ -15,7 +23,8 @@ target_link_libraries(dg_igr_hdg_runtime_cpu_test
 
 target_compile_options(dg_igr_hdg_runtime_cpu_test
   PRIVATE
-    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
 
 set_target_properties(dg_igr_hdg_runtime_cpu_test
   PROPERTIES
@@ -224,12 +233,22 @@ endforeach()
 
 add_executable(dg_igr_hdg_traced_scalar_igr_p1_global_step_test
   test_traced_scalar_igr_p1_global_step.cpp)
+if(MFEM_USE_CUDA)
+  set_source_files_properties(test_traced_scalar_igr_p1_global_step.cpp
+    PROPERTIES LANGUAGE CUDA)
+  set_target_properties(dg_igr_hdg_traced_scalar_igr_p1_global_step_test
+    PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_EXTENSIONS OFF)
+endif()
 target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_global_step_test
   PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_global_step_test PRIVATE
   dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
 target_compile_options(dg_igr_hdg_traced_scalar_igr_p1_global_step_test PRIVATE
-  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
 set_target_properties(dg_igr_hdg_traced_scalar_igr_p1_global_step_test PROPERTIES
   CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 foreach(_ranks IN ITEMS 1 2 3)

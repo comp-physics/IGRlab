@@ -74,8 +74,20 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
          "src/numerics/dg/DGFaceQuadratureKernels.cpp"
          "src/numerics/dgsem/dgsem_device.cpp"
          "src/numerics/hdg/device/device_core.cpp"
+         "src/numerics/hdg/scalar_hdg_oracle.cpp"
          "src/numerics/limiters/zhang_shu.cpp"
          "src/physics/igr/IGR_device_coefficients.cpp")
+    # CUDA-enabled MFEM conditionally extends mfem::SparseMatrix under NVCC.
+    # Keep every enabled HDG owner of that type ABI-compatible with MFEM.
+    if(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT OR
+       DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
+        list(APPEND _dg_igr_default_accel_sources
+             "src/numerics/hdg/euler/smooth_euler.cpp")
+    endif()
+    if(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT)
+        list(APPEND _dg_igr_default_accel_sources
+             "src/numerics/hdg/euler/smooth_euler_mpi.cpp")
+    endif()
     if(DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
         list(APPEND _dg_igr_default_accel_sources
              "src/numerics/hdg/euler/smooth_euler_device.cpp")
