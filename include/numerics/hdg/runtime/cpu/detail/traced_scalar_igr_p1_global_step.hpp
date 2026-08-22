@@ -29,6 +29,11 @@ struct TracedScalarIgrP1TraceSolveInput final
   const mfem::HypreParMatrix* true_matrix = nullptr;
   const mfem::Vector* true_rhs_values = nullptr;
   const core::HostReferenceEngine* condensation = nullptr;
+  // A zero cap retains the legacy size-derived GMRES bound for direct helper
+  // callers.  Generic requests always supply a positive policy value.
+  int maximum_linear_iterations = 0;
+  double linear_relative_tolerance = 1.0e-12;
+  double true_residual_relative_tolerance = 1.0e-10;
 };
 
 struct TracedScalarIgrP1TraceSolveOutput final
@@ -37,6 +42,7 @@ struct TracedScalarIgrP1TraceSolveOutput final
   mfem::Vector interior_increment;
   double reduced_rhs_norm = 0.0;
   double linear_residual_norm = 0.0;
+  int linear_iterations = 0;
 };
 
 /**
@@ -71,6 +77,11 @@ struct TracedScalarIgrP1GlobalStepInput final
    */
   const mfem::ParFiniteElementSpace* static_euler_rhs_space = nullptr;
   const mfem::Vector* static_euler_rhs_coefficients = nullptr;
+
+  // Trailing defaults preserve direct one-shot helper behavior.
+  int maximum_linear_iterations = 0;
+  double linear_relative_tolerance = 1.0e-12;
+  double true_residual_relative_tolerance = 1.0e-10;
 };
 
 struct TracedScalarIgrP1GlobalStepOutput final
@@ -80,6 +91,7 @@ struct TracedScalarIgrP1GlobalStepOutput final
   double initial_residual_norm = 0.0;
   double reduced_rhs_norm = 0.0;
   double linear_residual_norm = 0.0;
+  int linear_iterations = 0;
 };
 
 /** Result of a private one-linearization attempt. */

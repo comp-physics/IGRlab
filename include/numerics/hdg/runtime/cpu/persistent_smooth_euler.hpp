@@ -63,6 +63,11 @@ inline constexpr int cpu_maximum_newton_updates = 20;
 inline constexpr int cpu_maximum_line_search_trials = 13;
 inline constexpr double cpu_armijo_constant = 1.0e-4;
 inline constexpr double cpu_nonlinear_tolerance = 1.0e-10;
+// Zero retains the legacy size-derived GMRES cap for standalone routes.
+inline constexpr int cpu_maximum_linear_iterations = 0;
+inline constexpr double cpu_linear_relative_tolerance = 1.0e-12;
+inline constexpr double cpu_conservation_relative_tolerance =
+    cpu_nonlinear_tolerance;
 
 enum class CpuScenario : unsigned char
 {
@@ -123,6 +128,12 @@ struct CpuPersistentConfig
   double true_residual_tolerance = cpu_nonlinear_tolerance;
   bool allow_one_retry = true;
   bool force_private_scientific_gate_failure = false;
+  // These trailing controls leave all standalone aggregate/default routes on
+  // their exact pre-policy numerical settings.
+  int maximum_linear_iterations = cpu_maximum_linear_iterations;
+  double linear_relative_tolerance = cpu_linear_relative_tolerance;
+  double conservation_relative_tolerance =
+      cpu_conservation_relative_tolerance;
 };
 
 CpuPersistentConfig MakeCpuSmokeConfig() noexcept;

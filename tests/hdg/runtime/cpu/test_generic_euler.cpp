@@ -698,6 +698,10 @@ bool CheckPeriodicAnnotationsRemainTraceCouplings()
   BoundaryContext context{};
   ExactBorrowedEulerFields fields(mesh, 1, initial, source);
   EulerHdgRequest request = Request(mesh, 1, context, fields);
+  request.numerical_policy.conventional_assembly_quadrature_order = 10;
+  request.numerical_policy.maximum_linear_iterations = 64;
+  request.numerical_policy.linear_relative_tolerance = 1.0e-11;
+  request.numerical_policy.true_residual_relative_tolerance = 1.0e-9;
   GenericEulerHdgCpuSession session;
   return session.Initialize(request).status ==
       GenericEulerCpuSessionStatus::initialized &&
@@ -787,6 +791,52 @@ bool CheckPrivateTracedScalarIgrConvergenceEvidence()
       std::isfinite(attempt.maximum_conservation_error) &&
       std::isfinite(attempt.maximum_conservation_relative_error) &&
       attempt.maximum_conservation_relative_error <= 1.0e-10 &&
+      boundary.calls == 0;
+}
+
+bool CheckPrivateTracedScalarIgrNumericalPolicy()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  request.numerical_policy.stabilization =
+      {RegularizationKind::igr, 0.2, 0.4};
+  // Deliberately distinct policy controls ensure the IGR assembly,
+  // Krylov stopping, true-residual acceptance, and source conservation gates
+  // do not silently borrow the nonlinear tolerance or a helper default.
+  request.numerical_policy.igr_assembly_quadrature_order = 10;
+  request.numerical_policy.maximum_linear_iterations = 31;
+  request.numerical_policy.linear_relative_tolerance = 1.0e-12;
+  request.numerical_policy.true_residual_relative_tolerance = 1.0e-9;
+  request.numerical_policy.conservation_relative_tolerance = 1.0e-8;
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request)) return false;
+  const bool selected_quadrature =
+      core.evidence().assembly_quadrature_order ==
+      request.numerical_policy.igr_assembly_quadrature_order;
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  std::uint64_t generation = 0;
+  if (!core.PrepareBorrowedEuler(0.001, coordinates, generation)) return false;
+  double maximum_wave_speed = 0.0;
+  double stable_dt = 0.0;
+  if (!core.CommitBorrowedEuler(generation, coordinates, maximum_wave_speed,
+                                stable_dt)) return false;
+  const auto& attempt = core.evidence().last_attempt;
+  return selected_quadrature && attempt.committed &&
+      attempt.linear_iterations > 0 &&
+      attempt.linear_iterations <=
+          request.numerical_policy.maximum_linear_iterations *
+              static_cast<int>(attempt.work.complete_trace_solves) &&
+      attempt.maximum_true_relative_residual <=
+          request.numerical_policy.true_residual_relative_tolerance &&
+      attempt.maximum_conservation_relative_error <=
+          request.numerical_policy.conservation_relative_tolerance &&
+      attempt.maximum_conservation_relative_error >= 0.0 &&
       boundary.calls == 0;
 }
 
@@ -1072,6 +1122,8 @@ int main(int argc, char* argv[])
   const bool private_igr = CheckPrivateTracedScalarIgrLifecycle();
   const bool private_igr_convergence =
       CheckPrivateTracedScalarIgrConvergenceEvidence();
+  const bool private_igr_numerical_policy =
+      CheckPrivateTracedScalarIgrNumericalPolicy();
   const bool private_igr_zero_local = CheckPrivateTracedScalarIgrZeroLocal();
   const bool private_igr_initialization =
       CheckPrivateTracedScalarIgrInitializationDeterminism();
@@ -1086,6 +1138,7 @@ int main(int argc, char* argv[])
       prepared_lifecycle &&
       periodic && private_igr && private_igr_zero_local &&
       private_igr_convergence &&
+      private_igr_numerical_policy &&
       private_igr_initialization && dynamic_tau && boundary_picard &&
       zero_owned && subcommunicator && passive_world && mismatch &&
       callback_failure;
@@ -1099,6 +1152,8 @@ int main(int argc, char* argv[])
               << " orders=" << orders << " periodic=" << periodic
               << " private_igr=" << private_igr
               << " private_igr_convergence=" << private_igr_convergence
+              << " private_igr_numerical_policy="
+              << private_igr_numerical_policy
               << " private_igr_zero_local=" << private_igr_zero_local
               << " private_igr_initialization=" << private_igr_initialization
               << " prepared_lifecycle=" << prepared_lifecycle

@@ -1481,6 +1481,15 @@ bool ExactConfig(const CpuPersistentConfig& config) noexcept
           ::dg::hdg::runtime::detail::DoubleBits(cpu_nonlinear_tolerance) &&
       ::dg::hdg::runtime::detail::DoubleBits(config.true_residual_tolerance) ==
           ::dg::hdg::runtime::detail::DoubleBits(cpu_nonlinear_tolerance) &&
+      config.maximum_linear_iterations == cpu_maximum_linear_iterations &&
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.linear_relative_tolerance) ==
+          ::dg::hdg::runtime::detail::DoubleBits(
+              cpu_linear_relative_tolerance) &&
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.conservation_relative_tolerance) ==
+          ::dg::hdg::runtime::detail::DoubleBits(
+              cpu_conservation_relative_tolerance) &&
       config.allow_one_retry;
   const bool common_controls =
       config.maximum_newton_updates == cpu_maximum_newton_updates &&
@@ -1492,6 +1501,15 @@ bool ExactConfig(const CpuPersistentConfig& config) noexcept
       ::dg::hdg::runtime::detail::DoubleBits(
           config.true_residual_tolerance) ==
           ::dg::hdg::runtime::detail::DoubleBits(cpu_nonlinear_tolerance) &&
+      config.maximum_linear_iterations == cpu_maximum_linear_iterations &&
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.linear_relative_tolerance) ==
+          ::dg::hdg::runtime::detail::DoubleBits(
+              cpu_linear_relative_tolerance) &&
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.conservation_relative_tolerance) ==
+          ::dg::hdg::runtime::detail::DoubleBits(
+              cpu_conservation_relative_tolerance) &&
       config.allow_one_retry &&
       !config.force_private_scientific_gate_failure;
   return w8a_config || (w8c_config && common_controls);
@@ -1536,16 +1554,30 @@ bool ExactRankShape(const CpuPersistentConfig& config,
 
 bool ExactConfigConsensus(const CpuPersistentConfig& config) noexcept
 {
-  const std::array<int, 4> local{{static_cast<int>(config.scenario),
-                                  config.polynomial_order,
-                                  config.elements_per_direction,
-                                  config.assembly_quadrature_order}};
-  std::array<int, 4> minimum{}, maximum{};
+  const std::array<std::uint64_t, 15> local{{
+      static_cast<std::uint64_t>(config.scenario),
+      static_cast<std::uint64_t>(config.polynomial_order),
+      static_cast<std::uint64_t>(config.elements_per_direction),
+      static_cast<std::uint64_t>(config.assembly_quadrature_order),
+      static_cast<std::uint64_t>(config.maximum_newton_updates),
+      static_cast<std::uint64_t>(config.maximum_linear_iterations),
+      static_cast<std::uint64_t>(config.maximum_line_search_trials),
+      ::dg::hdg::runtime::detail::DoubleBits(config.dt),
+      ::dg::hdg::runtime::detail::DoubleBits(config.armijo_constant),
+      ::dg::hdg::runtime::detail::DoubleBits(config.nonlinear_tolerance),
+      ::dg::hdg::runtime::detail::DoubleBits(config.linear_relative_tolerance),
+      ::dg::hdg::runtime::detail::DoubleBits(config.true_residual_tolerance),
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.conservation_relative_tolerance),
+      static_cast<std::uint64_t>(config.allow_one_retry),
+      static_cast<std::uint64_t>(
+          config.force_private_scientific_gate_failure)}};
+  std::array<std::uint64_t, 15> minimum{}, maximum{};
   return MPI_Allreduce(local.data(), minimum.data(),
-                       static_cast<int>(local.size()), MPI_INT, MPI_MIN,
+                       static_cast<int>(local.size()), MPI_UINT64_T, MPI_MIN,
                        MPI_COMM_WORLD) == MPI_SUCCESS &&
       MPI_Allreduce(local.data(), maximum.data(),
-                    static_cast<int>(local.size()), MPI_INT, MPI_MAX,
+                    static_cast<int>(local.size()), MPI_UINT64_T, MPI_MAX,
                     MPI_COMM_WORLD) == MPI_SUCCESS &&
       minimum == maximum;
 }
@@ -2149,6 +2181,7 @@ struct detail::CpuNumericsCore::Implementation
     parameters.alpha = borrowed_request->numerical_policy.stabilization.alpha;
     parameters.beta = borrowed_request->numerical_policy.stabilization.beta;
     parameters.dt = attempt.dt; parameters.density_floor = density_gate;
+    parameters.quadrature_order = config.assembly_quadrature_order;
     const auto input_for = [&](const IgrSlot& current) noexcept {
       detail::TracedScalarIgrP1GlobalStepInput input{};
       input.communicator = communicator; input.layout = igr_layout.get();
@@ -2156,7 +2189,11 @@ struct detail::CpuNumericsCore::Implementation
       input.parameters = parameters; input.current_true_trace = &current.true_trace;
       input.previous_true_trace = &IgrCommitted().true_trace; input.current_interior = &current.interior;
       input.previous_interior = &IgrCommitted().interior; input.static_euler_rhs_space = interior_space.get();
-      input.static_euler_rhs_coefficients = external_source.get(); return input;
+      input.static_euler_rhs_coefficients = external_source.get();
+      input.maximum_linear_iterations = config.maximum_linear_iterations;
+      input.linear_relative_tolerance = config.linear_relative_tolerance;
+      input.true_residual_relative_tolerance = config.true_residual_tolerance;
+      return input;
     };
     // The traced-scalar helper owns exactly one refreshed linearization.  Its
     // caller owns the nonlinear lifecycle: never publish a one-update probe.
@@ -2202,6 +2239,7 @@ struct detail::CpuNumericsCore::Implementation
       ++evidence.work.complete_factor_setups;
       ++evidence.work.complete_trace_solves;
       ++evidence.work.complete_recoveries;
+      evidence.linear_iterations += igr_linear_output.linear_iterations;
       residual = igr_linear_output.initial_residual_norm;
       if (!have_initial_residual)
       {
@@ -2242,6 +2280,7 @@ struct detail::CpuNumericsCore::Implementation
         ++evidence.work.complete_factor_setups;
         ++evidence.work.complete_trace_solves;
         ++evidence.work.complete_recoveries;
+        evidence.linear_iterations += igr_probe_output.linear_iterations;
         const double armijo = (1.0 - config.armijo_constant * scale) * residual;
         if (igr_probe_output.initial_residual_norm <= armijo)
         {
@@ -2287,7 +2326,7 @@ struct detail::CpuNumericsCore::Implementation
     evidence.maximum_conservation_error = conservation_error;
     evidence.maximum_conservation_relative_error = conservation_relative_error;
     evidence.conservation_gate = source_balanced &&
-        conservation_relative_error <= config.nonlinear_tolerance;
+        conservation_relative_error <= config.conservation_relative_tolerance;
     if (!CollectiveAll(evidence.conservation_gate))
     {
       return fail(CpuFailurePhase::diagnostics);
@@ -3823,12 +3862,17 @@ struct detail::CpuNumericsCore::Implementation
     bool solver_configuration_ready = true;
     try
     {
-      gmres->SetTol(1.0e-12);
+      gmres->SetTol(config.linear_relative_tolerance);
       gmres->SetAbsTol(0.0);
       const int global_trace_size =
           static_cast<int>(trace_space->GlobalTrueVSize());
-      gmres->SetMaxIter(std::max(100, global_trace_size));
-      gmres->SetKDim(std::min(100, std::max(20, global_trace_size)));
+      const int maximum_iterations = config.maximum_linear_iterations > 0
+          ? config.maximum_linear_iterations
+          : std::max(100, global_trace_size);
+      gmres->SetMaxIter(maximum_iterations);
+      gmres->SetKDim(std::min(maximum_iterations,
+                               std::min(100,
+                                        std::max(20, global_trace_size))));
       gmres->SetLogging(1);
       gmres->SetPrintLevel(0);
     }
@@ -4788,7 +4832,11 @@ struct detail::CpuNumericsCore::Implementation
       factor_setup_current = factor_setup_generation ==
           expected_matrix_refresh_generation;
       gmres->GetNumIterations(iterations);
-      solved = factor_setup_current && iterations > 0;
+      const int maximum_iterations = config.maximum_linear_iterations > 0
+          ? config.maximum_linear_iterations
+          : std::max(100, static_cast<int>(trace_space->GlobalTrueVSize()));
+      solved = factor_setup_current && iterations > 0 &&
+          iterations <= maximum_iterations;
     }
     catch (...)
     {
@@ -5247,13 +5295,19 @@ bool detail::CpuNumericsCore::InitializeBorrowedEuler(
   // Newton step.  Retain the same engine while allowing that convergent outer
   // iteration enough bounded sweeps.
   config.maximum_newton_updates = request.numerical_policy.maximum_nonlinear_updates;
+  config.maximum_linear_iterations =
+      request.numerical_policy.maximum_linear_iterations;
   config.maximum_line_search_trials =
       request.numerical_policy.maximum_line_search_trials;
   config.armijo_constant = request.numerical_policy.armijo_constant;
   config.nonlinear_tolerance =
       request.numerical_policy.nonlinear_relative_tolerance;
+  config.linear_relative_tolerance =
+      request.numerical_policy.linear_relative_tolerance;
   config.true_residual_tolerance =
       request.numerical_policy.true_residual_relative_tolerance;
+  config.conservation_relative_tolerance =
+      request.numerical_policy.conservation_relative_tolerance;
   RuntimeTupleDescriptor tuple{};
   tuple.model = StableIdentity::Copy("euler.conservative.2d.v1");
   tuple.formulation = StableIdentity::Copy(
@@ -5942,6 +5996,7 @@ bool detail::CpuNumericsCore::InitializeInternal(
     parameters.beta = borrowed_request->numerical_policy.stabilization.beta;
     parameters.dt = state.config.dt;
     parameters.density_floor = density_gate;
+    parameters.quadrature_order = state.config.assembly_quadrature_order;
     detail::TracedScalarIgrP1GlobalStepInput input{};
     input.communicator = state.communicator; input.layout = state.igr_layout.get();
     input.affine_quads = state.igr_affine_quads.data(); input.affine_quad_count = static_cast<int>(state.igr_affine_quads.size());
@@ -5949,6 +6004,10 @@ bool detail::CpuNumericsCore::InitializeInternal(
     input.previous_true_trace = &state.IgrCommitted().true_trace; input.current_interior = &state.IgrCandidate().interior;
     input.previous_interior = &state.IgrCommitted().interior; input.static_euler_rhs_space = state.interior_space.get();
     input.static_euler_rhs_coefficients = state.external_source.get();
+    input.maximum_linear_iterations = state.config.maximum_linear_iterations;
+    input.linear_relative_tolerance = state.config.linear_relative_tolerance;
+    input.true_residual_relative_tolerance =
+        state.config.true_residual_tolerance;
     const bool scratch_ready = state.igr_scratch->Initialize(input) &&
         state.igr_scratch->IsReady();
     if (!state.CollectiveAll(scratch_ready)) { return false; }

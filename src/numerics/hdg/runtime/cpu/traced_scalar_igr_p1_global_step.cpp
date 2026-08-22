@@ -184,6 +184,23 @@ bool ValidParameters(const local::Parameters& parameters) noexcept
       parameters.quadrature_order >= 2 && parameters.quadrature_order <= 32;
 }
 
+bool ValidLinearControls(const int maximum_iterations,
+                         const double relative_tolerance,
+                         const double true_residual_tolerance) noexcept
+{
+  // Direct detail callers retain the old size-derived bound with zero.  A
+  // generic policy is already admitted as strictly positive by the contract.
+  return maximum_iterations >= 0 && Finite(relative_tolerance) &&
+      relative_tolerance > 0.0 && Finite(true_residual_tolerance) &&
+      true_residual_tolerance > 0.0;
+}
+
+int ResolveMaximumLinearIterations(const int requested,
+                                   const int global_size) noexcept
+{
+  return requested > 0 ? requested : std::max(100, global_size);
+}
+
 bool ValidInput(const TracedScalarIgrP1GlobalStepInput& input) noexcept
 {
   if (input.communicator == MPI_COMM_NULL || input.layout == nullptr ||
@@ -200,6 +217,9 @@ bool ValidInput(const TracedScalarIgrP1GlobalStepInput& input) noexcept
       !AllFinite(*input.previous_true_trace) || !AllFinite(*input.current_interior) ||
       !AllFinite(*input.previous_interior) ||
       !ValidParameters(input.parameters) ||
+      !ValidLinearControls(input.maximum_linear_iterations,
+                           input.linear_relative_tolerance,
+                           input.true_residual_relative_tolerance) ||
       input.affine_quad_count != input.layout->LocalElementCount() ||
       (input.affine_quad_count > 0 && input.affine_quads == nullptr))
   {
@@ -421,6 +441,9 @@ struct RetainedTraceSystem final
   std::unique_ptr<mfem::HypreParVector> residual;
   std::unique_ptr<mfem::HypreILU> ilu;
   std::unique_ptr<mfem::HypreGMRES> gmres;
+  int maximum_linear_iterations = 0;
+  double linear_relative_tolerance = 1.0e-12;
+  double true_residual_relative_tolerance = 1.0e-10;
 
   void MarkUnrefreshed() noexcept { refreshed = false; }
 
@@ -431,6 +454,9 @@ struct RetainedTraceSystem final
         !matrix || !rhs || !solution || !residual || !ilu || !gmres ||
         matrix->Height() != true_size || matrix->Width() != true_size ||
         diagonal.Height() != true_size || offdiagonal.Height() != true_size ||
+        !ValidLinearControls(maximum_linear_iterations,
+                             linear_relative_tolerance,
+                             true_residual_relative_tolerance) ||
         element_vdofs.size() != static_cast<std::size_t>(elements) * 40 ||
         local_dofs.size() != static_cast<std::size_t>(local_size) ||
         send_counts.size() != static_cast<std::size_t>(ranks) ||
@@ -542,23 +568,31 @@ struct RetainedTraceSystem final
     catch (const std::exception&) { return false; }
   }
 
-  bool Initialize(MPI_Comm comm, const BorrowedP1DGInterfaceLayout& bound) noexcept;
+  bool Initialize(MPI_Comm comm, const BorrowedP1DGInterfaceLayout& bound,
+                  int maximum_iterations, double relative_tolerance,
+                  double true_residual_tolerance) noexcept;
   bool Prime() noexcept;
   bool Refresh(const std::vector<double>& schur_values,
                const std::vector<double>& reduced_values) noexcept;
   bool Solve(const double scale, mfem::Vector& true_trace,
-             double& residual_norm) noexcept;
+             double& residual_norm, int& iterations,
+             int maximum_iterations, double relative_tolerance,
+             double true_residual_tolerance, double rhs_norm) noexcept;
 };
 
 bool RetainedTraceSystem::Initialize(
-    const MPI_Comm comm, const BorrowedP1DGInterfaceLayout& bound) noexcept
+    const MPI_Comm comm, const BorrowedP1DGInterfaceLayout& bound,
+    const int maximum_iterations, const double relative_tolerance,
+    const double true_residual_tolerance) noexcept
 {
   communicator = comm; layout = &bound; trace_space = bound.TraceSpace();
   int comparison = MPI_UNEQUAL;
   bool local_ok = communicator != MPI_COMM_NULL && bound.IsUsable() &&
       trace_space != nullptr && MPI_Comm_rank(communicator, &rank) == MPI_SUCCESS &&
       MPI_Comm_size(communicator, &ranks) == MPI_SUCCESS && rank >= 0 &&
-      ranks > 0 && MPI_Comm_compare(communicator, trace_space->GetComm(),
+      ranks > 0 && ValidLinearControls(maximum_iterations, relative_tolerance,
+                                       true_residual_tolerance) &&
+      MPI_Comm_compare(communicator, trace_space->GetComm(),
                                     &comparison) == MPI_SUCCESS &&
       (comparison == MPI_IDENT || comparison == MPI_CONGRUENT);
   if (!CollectiveAll(communicator, local_ok)) { return false; }
@@ -848,9 +882,16 @@ bool RetainedTraceSystem::Initialize(
     solution = std::make_unique<mfem::HypreParVector>(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
     residual = std::make_unique<mfem::HypreParVector>(const_cast<mfem::ParFiniteElementSpace*>(trace_space));
     ilu = std::make_unique<mfem::HypreILU>(); gmres = std::make_unique<mfem::HypreGMRES>(communicator);
-    gmres->SetTol(1.0e-12); gmres->SetAbsTol(0.0);
+    maximum_linear_iterations = maximum_iterations;
+    linear_relative_tolerance = relative_tolerance;
+    true_residual_relative_tolerance = true_residual_tolerance;
+    gmres->SetTol(linear_relative_tolerance); gmres->SetAbsTol(0.0);
     const int global = static_cast<int>(matrix->GetGlobalNumRows());
-    gmres->SetMaxIter(std::max(100, global)); gmres->SetKDim(std::min(100, std::max(20, global)));
+    const int resolved_maximum = ResolveMaximumLinearIterations(
+        maximum_linear_iterations, global);
+    gmres->SetMaxIter(resolved_maximum);
+    gmres->SetKDim(std::min(resolved_maximum,
+                             std::min(100, std::max(20, global))));
     gmres->SetLogging(0); gmres->SetPrintLevel(0);
     local_ok = InitialBindSolver();
   }
@@ -984,9 +1025,17 @@ bool RetainedTraceSystem::Refresh(const std::vector<double>& schur_values,
 }
 
 bool RetainedTraceSystem::Solve(const double scale, mfem::Vector& true_trace,
-                                double& residual_norm) noexcept
+                                double& residual_norm, int& iterations,
+                                const int maximum_iterations,
+                                const double relative_tolerance,
+                                const double true_residual_tolerance,
+                                const double rhs_norm) noexcept
 {
-  bool local_ok = refreshed && Finite(scale) && scale > 0.0 && rhs && solution && residual;
+  iterations = 0;
+  bool local_ok = refreshed && Finite(scale) && scale > 0.0 && rhs && solution &&
+      residual && ValidLinearControls(maximum_iterations, relative_tolerance,
+                                      true_residual_tolerance) &&
+      Finite(rhs_norm) && rhs_norm > 0.0;
   if (!CollectiveAll(communicator, local_ok)) { refreshed = false; return false; }
   try
   {
@@ -997,7 +1046,21 @@ bool RetainedTraceSystem::Solve(const double scale, mfem::Vector& true_trace,
   }
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(communicator, local_ok)) { refreshed = false; return false; }
-  try { gmres->Mult(*rhs, *solution); }
+  const int resolved_maximum = ResolveMaximumLinearIterations(
+      maximum_iterations, static_cast<int>(matrix->GetGlobalNumRows()));
+  try
+  {
+    maximum_linear_iterations = maximum_iterations;
+    linear_relative_tolerance = relative_tolerance;
+    true_residual_relative_tolerance = true_residual_tolerance;
+    gmres->SetTol(relative_tolerance);
+    gmres->SetMaxIter(resolved_maximum);
+    gmres->SetKDim(std::min(resolved_maximum, std::min(
+        100, std::max(20, static_cast<int>(matrix->GetGlobalNumRows())))));
+    gmres->Mult(*rhs, *solution);
+    gmres->GetNumIterations(iterations);
+    local_ok = iterations >= 0 && iterations <= resolved_maximum;
+  }
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(communicator, local_ok)) { refreshed = false; return false; }
   try { matrix->Mult(*solution, *residual); *residual -= *rhs; }
@@ -1009,7 +1072,11 @@ bool RetainedTraceSystem::Solve(const double scale, mfem::Vector& true_trace,
   try
   {
     const double* solved = solution->HostRead(); double* destination = true_trace.HostWrite();
-    local_ok = AllFinite(*solution) && residual_norm <= 1.0e-10 &&
+    const double scaled_rhs_norm = rhs_norm / scale;
+    const double true_relative_residual = residual_norm /
+        std::max(scaled_rhs_norm, 1.0e-300);
+    local_ok = AllFinite(*solution) && Finite(true_relative_residual) &&
+        true_relative_residual <= true_residual_tolerance &&
         (true_size == 0 || (solved != nullptr && destination != nullptr));
     for (int index = 0; index < true_size && local_ok; ++index) { destination[index] = scale * solved[index]; local_ok = Finite(destination[index]); }
   }
@@ -1072,7 +1139,10 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
   if (input.communicator == MPI_COMM_NULL) { return false; }
   bool local_input_ok = input.layout != nullptr && input.trace_space != nullptr &&
       input.true_matrix != nullptr && input.true_rhs_values != nullptr &&
-      input.condensation != nullptr;
+      input.condensation != nullptr &&
+      ValidLinearControls(input.maximum_linear_iterations,
+                          input.linear_relative_tolerance,
+                          input.true_residual_relative_tolerance);
   if (local_input_ok)
   {
     local_input_ok = input.layout->IsUsable() &&
@@ -1132,10 +1202,17 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
   catch (const std::exception&) { local_ok = false; }
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
   double linear_norm = 0.0;
+  int linear_iterations = 0;
 
   if (!exact_zero_rhs && retained != nullptr)
   {
-    if (!retained->Solve(rhs_maximum, true_trace, linear_norm)) { return false; }
+    if (!retained->Solve(rhs_maximum, true_trace, linear_norm,
+                         linear_iterations, input.maximum_linear_iterations,
+                         input.linear_relative_tolerance,
+                         input.true_residual_relative_tolerance, rhs_norm))
+    {
+      return false;
+    }
   }
   else if (!exact_zero_rhs)
   {
@@ -1161,13 +1238,17 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
     ilu.SetLocalReordering(0); ilu.SetPrintLevel(0);
     mfem::HypreGMRES gmres(input.communicator);
     const int global_size = static_cast<int>(input.true_matrix->GetGlobalNumRows());
-    gmres.SetTol(1.0e-12); gmres.SetAbsTol(0.0);
-    gmres.SetMaxIter(std::max(100, global_size));
-    gmres.SetKDim(std::min(100, std::max(20, global_size)));
+    const int maximum_iterations = ResolveMaximumLinearIterations(
+        input.maximum_linear_iterations, global_size);
+    gmres.SetTol(input.linear_relative_tolerance); gmres.SetAbsTol(0.0);
+    gmres.SetMaxIter(maximum_iterations);
+    gmres.SetKDim(std::min(maximum_iterations,
+                            std::min(100, std::max(20, global_size))));
     gmres.SetLogging(0); gmres.SetPrintLevel(0);
     input.true_matrix->HypreRead();
     gmres.SetPreconditioner(ilu); gmres.SetOperator(*input.true_matrix);
     gmres.Mult(scaled_rhs, scaled_solution);
+    gmres.GetNumIterations(linear_iterations);
     mfem::HypreParVector scaled_residual(
         const_cast<mfem::ParFiniteElementSpace*>(input.trace_space));
     input.true_matrix->Mult(scaled_solution, scaled_residual);
@@ -1176,7 +1257,12 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
     double residual_norm = 0.0;
     if (!MaxAbsAndNorm(input.communicator, scaled_residual, residual_maximum,
                        residual_norm)) { return false; }
-    local_ok = AllFinite(scaled_solution) && residual_norm <= 1.0e-10;
+    const double scaled_rhs_norm = rhs_norm / rhs_maximum;
+    const double true_relative_residual = residual_norm /
+        std::max(scaled_rhs_norm, 1.0e-300);
+    local_ok = linear_iterations >= 0 && linear_iterations <= maximum_iterations &&
+        AllFinite(scaled_solution) && Finite(true_relative_residual) &&
+        true_relative_residual <= input.true_residual_relative_tolerance;
     if (!CollectiveAll(input.communicator, local_ok)) { return false; }
     const double* const scaled_solution_data = scaled_solution.HostRead();
     double* const solution = true_trace.HostWrite();
@@ -1236,6 +1322,7 @@ static bool SolveAndRecoverTracedScalarIgrP1TraceWithState(
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
   result.reduced_rhs_norm = rhs_norm;
   result.linear_residual_norm = linear_norm;
+  result.linear_iterations = linear_iterations;
   return true;
 }
 
@@ -1261,10 +1348,12 @@ bool SolveAndRecoverTracedScalarIgrP1Trace(
   if (!CollectiveAll(input.communicator, local_ok)) { return false; }
   published.reduced_rhs_norm = state.result.reduced_rhs_norm;
   published.linear_residual_norm = state.result.linear_residual_norm;
+  published.linear_iterations = state.result.linear_iterations;
   output.trace_increment.Swap(published.trace_increment);
   output.interior_increment.Swap(published.interior_increment);
   output.reduced_rhs_norm = published.reduced_rhs_norm;
   output.linear_residual_norm = published.linear_residual_norm;
+  output.linear_iterations = published.linear_iterations;
   return true;
 }
 
@@ -1667,7 +1756,9 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
     }
     const TracedScalarIgrP1TraceSolveInput solve_input{
         input.communicator, &layout, trace_space, retained->matrix.get(),
-        &retained->true_rhs, &condensation};
+        &retained->true_rhs, &condensation, input.maximum_linear_iterations,
+        input.linear_relative_tolerance,
+        input.true_residual_relative_tolerance};
     if (!SolveAndRecoverTracedScalarIgrP1TraceWithState(
             solve_input, state.solve_and_recovery, retained))
     {
@@ -1708,6 +1799,7 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
     output.initial_residual_norm = initial_norm;
     output.reduced_rhs_norm = solved.reduced_rhs_norm;
     output.linear_residual_norm = solved.linear_residual_norm;
+    output.linear_iterations = solved.linear_iterations;
     return TracedScalarIgrP1GlobalStepResult::success;
   }
 
@@ -1780,7 +1872,9 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
   }
   const TracedScalarIgrP1TraceSolveInput solve_input{
       input.communicator, &layout, trace_space, true_matrix.get(),
-      &true_rhs_values, &condensation};
+      &true_rhs_values, &condensation, input.maximum_linear_iterations,
+      input.linear_relative_tolerance,
+      input.true_residual_relative_tolerance};
   if (!SolveAndRecoverTracedScalarIgrP1TraceWithState(
           solve_input, state.solve_and_recovery))
   {
@@ -1804,11 +1898,13 @@ static TracedScalarIgrP1GlobalStepResult ComputeEphemeralStep(
   published.initial_residual_norm = initial_norm;
   published.reduced_rhs_norm = solved.reduced_rhs_norm;
   published.linear_residual_norm = solved.linear_residual_norm;
+  published.linear_iterations = solved.linear_iterations;
   output.trace_increment.Swap(published.trace_increment);
   output.interior_increment.Swap(published.interior_increment);
   output.initial_residual_norm = published.initial_residual_norm;
   output.reduced_rhs_norm = published.reduced_rhs_norm;
   output.linear_residual_norm = published.linear_residual_norm;
+  output.linear_iterations = published.linear_iterations;
   return TracedScalarIgrP1GlobalStepResult::success;
 }
 
@@ -1970,7 +2066,10 @@ bool TracedScalarIgrP1Scratch::Initialize(
     implementation.initialization_poisoned = true;
     return false;
   }
-  if (!implementation.retained.Initialize(input.communicator, *input.layout) ||
+  if (!implementation.retained.Initialize(
+          input.communicator, *input.layout, input.maximum_linear_iterations,
+          input.linear_relative_tolerance,
+          input.true_residual_relative_tolerance) ||
       !implementation.retained.Prime())
   {
     implementation.initialization_poisoned = true;

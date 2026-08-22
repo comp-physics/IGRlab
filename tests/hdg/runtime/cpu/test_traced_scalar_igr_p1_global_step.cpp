@@ -666,7 +666,11 @@ bool Run(const MPI_Comm communicator, const Layout& layout,
          const mfem::ParFiniteElementSpace& source_space,
          const mfem::Vector& source, const double dt,
          detail::TracedScalarIgrP1GlobalStepOutput& output,
-         detail::TracedScalarIgrP1Scratch* const scratch = nullptr)
+         detail::TracedScalarIgrP1Scratch* const scratch = nullptr,
+         const int quadrature_order = 12,
+         const int maximum_linear_iterations = 0,
+         const double linear_relative_tolerance = 1.0e-12,
+         const double true_residual_relative_tolerance = 1.0e-10)
 {
   const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
   if (trace_space == nullptr) { return false; }
@@ -680,11 +684,12 @@ bool Run(const MPI_Comm communicator, const Layout& layout,
   if (!AllRanks(communicator, ok)) { return false; }
   local::Parameters parameters{};
   parameters.dt = dt; parameters.alpha = 0.8; parameters.beta = 1.1;
-  parameters.quadrature_order = 12;
+  parameters.quadrature_order = quadrature_order;
   const detail::TracedScalarIgrP1GlobalStepInput input{
       communicator, &layout, quads.data(), static_cast<int>(quads.size()),
       parameters, &current_trace, &previous_trace, &current_interior,
-      &previous_interior, &source_space, &source};
+      &previous_interior, &source_space, &source, maximum_linear_iterations,
+      linear_relative_tolerance, true_residual_relative_tolerance};
   if (scratch != nullptr)
   {
     if (!scratch->IsReady() && !scratch->Initialize(input)) { return false; }
@@ -773,6 +778,43 @@ bool Check(const MPI_Comm communicator)
       SameBits(scratch_first.interior_increment, first.interior_increment);
   if (!Require(communicator, ok && scratch_match && scratch_reused,
                "scratch repeated global steps"))
+  {
+    return false;
+  }
+  // The private helper accepts a selected quadrature and independent linear
+  // versus reconstructed-true-residual controls for both one-shot and
+  // retained solves.  The compact iteration count must honor the selected
+  // GMRES cap on every successful path.
+  detail::TracedScalarIgrP1GlobalStepOutput policy_one_shot, policy_retained;
+  constexpr int selected_quadrature_order = 10;
+  constexpr int selected_maximum_linear_iterations = 31;
+  constexpr double selected_linear_relative_tolerance = 1.0e-12;
+  constexpr double selected_true_residual_relative_tolerance = 1.0e-8;
+  ok = Run(communicator, layout, quads, source_space, source_a, 0.05,
+           policy_one_shot, nullptr, selected_quadrature_order,
+           selected_maximum_linear_iterations,
+           selected_linear_relative_tolerance,
+           selected_true_residual_relative_tolerance) &&
+      Run(communicator, layout, quads, source_space, source_a, 0.05,
+          policy_retained, &scratch, selected_quadrature_order,
+          selected_maximum_linear_iterations,
+          selected_linear_relative_tolerance,
+          selected_true_residual_relative_tolerance) &&
+      policy_one_shot.linear_iterations >= 0 &&
+      policy_one_shot.linear_iterations <= selected_maximum_linear_iterations &&
+      policy_retained.linear_iterations >= 0 &&
+      policy_retained.linear_iterations <= selected_maximum_linear_iterations &&
+      policy_one_shot.linear_residual_norm <=
+          selected_true_residual_relative_tolerance *
+              std::max(policy_one_shot.reduced_rhs_norm, 1.0e-300) &&
+      policy_retained.linear_residual_norm <=
+          selected_true_residual_relative_tolerance *
+              std::max(policy_retained.reduced_rhs_norm, 1.0e-300) &&
+      SameBits(policy_one_shot.trace_increment,
+               policy_retained.trace_increment) &&
+      SameBits(policy_one_shot.interior_increment,
+               policy_retained.interior_increment);
+  if (!Require(communicator, ok, "selected IGR linear policy"))
   {
     return false;
   }
@@ -879,6 +921,7 @@ bool Check(const MPI_Comm communicator)
   preserved.initial_residual_norm = 11.0;
   preserved.reduced_rhs_norm = 13.0;
   preserved.linear_residual_norm = 17.0;
+  preserved.linear_iterations = 23;
   const detail::TracedScalarIgrP1GlobalStepInput invalid{
       communicator, &layout, quads.data(), static_cast<int>(quads.size()), {},
       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -888,6 +931,7 @@ bool Check(const MPI_Comm communicator)
       preserved.interior_increment.Size() == 1 && preserved.interior_increment[0] == -19.0 &&
       preserved.initial_residual_norm == 11.0 &&
       preserved.reduced_rhs_norm == 13.0 && preserved.linear_residual_norm == 17.0 &&
+      preserved.linear_iterations == 23 &&
       scratch.IsUsable();
   if (!Require(communicator, ok, "invalid input preservation")) { return false; }
 
@@ -908,13 +952,15 @@ bool Check(const MPI_Comm communicator)
   refresh_sentinel.initial_residual_norm = 11.0;
   refresh_sentinel.reduced_rhs_norm = 13.0;
   refresh_sentinel.linear_residual_norm = 17.0;
+  refresh_sentinel.linear_iterations = 23;
   ok = !Run(communicator, layout, quads, source_space, nonfinite_source, 0.05,
             refresh_sentinel, &scratch) &&
       AllEqual(refresh_sentinel.trace_increment, 73.0) &&
       AllEqual(refresh_sentinel.interior_increment, -19.0) &&
       refresh_sentinel.initial_residual_norm == 11.0 &&
       refresh_sentinel.reduced_rhs_norm == 13.0 &&
-      refresh_sentinel.linear_residual_norm == 17.0;
+      refresh_sentinel.linear_residual_norm == 17.0 &&
+      refresh_sentinel.linear_iterations == 23;
   if (!Require(communicator, ok, "nonfinite refresh preservation")) { return false; }
   std::vector<local::AffineQuad> topology_drift = quads;
   if (!topology_drift.empty()) { topology_drift.pop_back(); }
@@ -924,7 +970,8 @@ bool Check(const MPI_Comm communicator)
       AllEqual(refresh_sentinel.interior_increment, -19.0) &&
       refresh_sentinel.initial_residual_norm == 11.0 &&
       refresh_sentinel.reduced_rhs_norm == 13.0 &&
-      refresh_sentinel.linear_residual_norm == 17.0;
+      refresh_sentinel.linear_residual_norm == 17.0 &&
+      refresh_sentinel.linear_iterations == 23;
   if (!Require(communicator, ok, "topology drift preservation")) { return false; }
   detail::TracedScalarIgrP1GlobalStepOutput recovered_after_failure;
   ok = RunScratchSuccess(communicator, layout, quads, source_space, source_a,
