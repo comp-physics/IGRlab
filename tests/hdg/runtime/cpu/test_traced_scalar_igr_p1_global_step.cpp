@@ -786,6 +786,8 @@ bool Check(const MPI_Comm communicator)
   // retained solves.  The compact iteration count must honor the selected
   // GMRES cap on every successful path.
   detail::TracedScalarIgrP1GlobalStepOutput policy_one_shot, policy_retained;
+  policy_retained.trace_increment.SetSize(layout.TraceTrueVSize());
+  policy_retained.interior_increment.SetSize(layout.InteriorLocalVSize());
   constexpr int selected_quadrature_order = 10;
   constexpr int selected_maximum_linear_iterations = 31;
   constexpr double selected_linear_relative_tolerance = 1.0e-12;
