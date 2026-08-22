@@ -121,10 +121,38 @@ endif()
 
 if(MFEM_USE_CUDA)
   if(NOT TARGET dg_igr_hdg_main_backend_cuda OR
-     NOT TARGET dgsem_smooth_advection_periodic)
+     NOT TARGET dgsem_smooth_advection_periodic OR
+     NOT TARGET dgsem_smooth_advection)
     message(FATAL_ERROR
-      "The CUDA generic HDG main backend and opted-in example are required.")
+      "The CUDA generic HDG main backend and periodic/physical examples are required.")
   endif()
+
+  # These are real application-entry gates, not direct backend fixtures.  The
+  # periodic case carries an IGR-augmented source and the physical case covers
+  # each of its selectable Euler boundary plans on the same CUDA HDG lifecycle.
+  # Explicit small meshes keep every rank within the bounded CUDA arena.
+  foreach(_ranks IN ITEMS 1 2)
+    add_test(NAME dg_igr_hdg_main_backend_representative_cases_cuda_rank${_ranks}_p1
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_PERIODIC_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_NONPERIODIC_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection>"
+        "-DHDG_REPRESENTATIVE_WORK=${CMAKE_CURRENT_BINARY_DIR}/cuda-representative-rank${_ranks}"
+        "-DHDG_REPRESENTATIVE_DEVICE=cuda"
+        "-DHDG_REPRESENTATIVE_RANKS=${_ranks}"
+        "-DHDG_REPRESENTATIVE_PERIODIC_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+        "-DHDG_REPRESENTATIVE_NONPERIODIC_MESH=${CMAKE_CURRENT_SOURCE_DIR}/smooth_advection_physical_n2.mesh"
+        "-DHDG_REPRESENTATIVE_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_REPRESENTATIVE_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_REPRESENTATIVE_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_REPRESENTATIVE_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_representative_case_process.cmake")
+    set_tests_properties(
+      dg_igr_hdg_main_backend_representative_cases_cuda_rank${_ranks}_p1 PROPERTIES
+        LABELS "hdg;main-backend;cuda;real-application;igr;source;periodic;physical;boundary;p1;no-vtk;mpi"
+        PROCESSORS ${_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 3600)
+  endforeach()
 
   # A production-main fixture over a seven-attribute mesh covers every
   # conventional semantic Euler boundary policy in one solve.  IGR remains a
