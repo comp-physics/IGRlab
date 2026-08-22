@@ -1025,5 +1025,7 @@ bool Check(const MPI_Comm communicator)
 int main(int argc, char* argv[])
 {
   mfem::MPI_Session session(argc, argv);
+  mfem::Hypre::Init();
+  mfem::Device device("cpu");
   return Check(MPI_COMM_WORLD) ? 0 : 1;
 }

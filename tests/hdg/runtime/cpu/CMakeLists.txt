@@ -249,10 +249,6 @@ foreach(_ranks IN ITEMS 1 2 3)
       RESOURCE_LOCK hdg_traced_scalar_igr_p1_global_step
       LABELS "hdg;runtime;cpu;traced-scalar-igr;global-step;mpi"
       TIMEOUT 180)
-  if(MFEM_USE_CUDA)
-    set_tests_properties(hdg_traced_scalar_igr_p1_global_step_rank${_ranks}
-      PROPERTIES ENVIRONMENT "MFEM_DEVICE=cpu")
-  endif()
 endforeach()
 
 foreach(_n IN ITEMS 3 6 12)
