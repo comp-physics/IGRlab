@@ -98,8 +98,9 @@ int main(int argc, char* argv[])
     data.numerical_policy.conventional_assembly_quadrature_order = 11;
     data.numerical_policy.igr_assembly_quadrature_order = 12;
     data.numerical_policy.audit_quadrature_order = 14;
-    data.numerical_policy.observable_quadrature_order = 11;
+    data.numerical_policy.observable_quadrature_order = 18;
     data.numerical_policy.maximum_nonlinear_updates = 20;
+    data.numerical_policy.maximum_linear_iterations = 200;
     data.initial_condition =
       MakeSmoothTransitionInitialCondition(case_config.gamma);
 
@@ -111,8 +112,8 @@ int main(int argc, char* argv[])
 
     // static_source remains null: the generic main adapter treats it as zero.
     // This case shares only analytic initial data with the frozen W8C family.
-    // It intentionally does not reproduce q14/q11 observables, full-Newton
-    // controls, checkpoints, or any scientific-parity schedule, and never
+    // It intentionally does not reproduce checkpoints or any
+    // scientific-parity schedule, and never
     // imports or calls the legacy SC25/application solver implementation.
     return data;
   };

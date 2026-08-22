@@ -79,7 +79,7 @@ constexpr EulerHdgNumericalPolicy DefaultEulerHdgNumericalPolicy(
 {
   const int quadrature = 2 * p + 2;
   return {quadrature, quadrature, quadrature, quadrature, quadrature,
-          quadrature, 80, 100, 13, 1.0e-10, 1.0e-10, 1.0e-10,
+          quadrature, 80, 100, 13, 1.0e-10, 1.0e-12, 1.0e-10,
           1.0e-10, 1.0e-4, {RegularizationKind::none, 0.0, 0.0}};
 }
 
