@@ -20,6 +20,8 @@
 namespace dg::hdg::runtime::cuda_w8a::detail
 {
 
+constexpr double qualification_density_gate = 1.0e-8;
+
 // This accessor is defined only in the qualification translation unit.  The
 // production engine and generic facade grant it private friendship but ship no
 // callable test API or test-only device kernel.
@@ -135,7 +137,7 @@ struct CudaQualificationTestAccess
                               shape.scalar_interior_dofs) * component];
         }
         local_valid = std::isfinite(weight) && weight > 0.0 &&
-            std::isfinite(sigma) && state[0] > cuda_density_gate;
+            std::isfinite(sigma) && state[0] > qualification_density_gate;
         for (int component = 0;
              local_valid && component < conserved_components; ++component)
         {
