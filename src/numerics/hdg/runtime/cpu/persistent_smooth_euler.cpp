@@ -2050,7 +2050,8 @@ struct detail::CpuNumericsCore::Implementation
     if (!CollectiveAll(structural_ready)) return false;
     const int private_scalar = current.interior.Size() / 7;
     const int public_scalar = external_source->Size() / 4;
-    const bool layout_ready = private_scalar > 0 && public_scalar > 0 &&
+    const bool layout_ready = private_scalar >= 0 && public_scalar >= 0 &&
+        current.interior.Size() % 7 == 0 && external_source->Size() % 4 == 0 &&
         static_cast<std::size_t>(4 * private_scalar) <=
             igr_component_integral_weights.size() &&
         igr_public_interior_to_private.size() ==
@@ -2059,8 +2060,11 @@ struct detail::CpuNumericsCore::Implementation
     const double* const old_values = previous.interior.HostRead();
     const double* const new_values = current.interior.HostRead();
     const double* const source_values = external_source->HostRead();
-    if (!CollectiveAll(old_values != nullptr && new_values != nullptr &&
-                       source_values != nullptr)) return false;
+    const bool storage_ready =
+        (old_values != nullptr || previous.interior.Size() == 0) &&
+        (new_values != nullptr || current.interior.Size() == 0) &&
+        (source_values != nullptr || external_source->Size() == 0);
+    if (!CollectiveAll(storage_ready)) return false;
     std::array<double, 12> local{};
     std::array<double, 12> global{};
     bool local_valid = true;
