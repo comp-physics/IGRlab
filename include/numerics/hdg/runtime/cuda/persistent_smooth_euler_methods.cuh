@@ -9,6 +9,63 @@ inline int CudaDecodeSigned(const int encoded, double& sign) noexcept
   return encoded >= 0 ? encoded : -1 - encoded;
 }
 
+inline bool CudaEvaluateStaticExteriorStateHost(
+    const CudaStaticBoundaryPolicy& policy,
+    const std::array<double, conserved_components>& interior,
+    const std::array<double, dimension>& normal,
+    const double gamma,
+    std::array<double, conserved_components>& exterior) noexcept
+{
+  try
+  {
+    mfem::EulerExteriorStateKind kind{};
+    bool reference_required = false;
+    switch (policy.kind)
+    {
+    case CudaStaticBoundaryPolicyKind::supersonic_inlet:
+      kind = mfem::EulerExteriorStateKind::SupersonicInlet;
+      reference_required = true;
+      break;
+    case CudaStaticBoundaryPolicyKind::subsonic_inlet:
+      kind = mfem::EulerExteriorStateKind::SubsonicInlet;
+      reference_required = true;
+      break;
+    case CudaStaticBoundaryPolicyKind::supersonic_outlet:
+      kind = mfem::EulerExteriorStateKind::SupersonicOutlet;
+      break;
+    case CudaStaticBoundaryPolicyKind::subsonic_outlet_pressure:
+      kind = mfem::EulerExteriorStateKind::SubsonicOutletPressure;
+      break;
+    case CudaStaticBoundaryPolicyKind::far_field:
+      kind = mfem::EulerExteriorStateKind::FarField;
+      reference_required = true;
+      break;
+    case CudaStaticBoundaryPolicyKind::nonreflecting_outlet:
+      kind = mfem::EulerExteriorStateKind::NonReflectingOutlet;
+      reference_required = true;
+      break;
+    case CudaStaticBoundaryPolicyKind::slip_wall:
+      kind = mfem::EulerExteriorStateKind::SlipWall;
+      break;
+    case CudaStaticBoundaryPolicyKind::none:
+      return false;
+    }
+    mfem::Vector interior_view(
+        const_cast<double*>(interior.data()), conserved_components);
+    mfem::Vector normal_view(const_cast<double*>(normal.data()), dimension);
+    mfem::Vector exterior_view(exterior.data(), conserved_components);
+    mfem::Vector reference_view(
+        const_cast<double*>(policy.reference_state.data()),
+        conserved_components);
+    mfem::EvaluateEulerExteriorState(
+        kind, interior_view, normal_view, dimension, gamma,
+        reference_required ? &reference_view : nullptr,
+        policy.pressure_out, exterior_view);
+    return IsCudaPhysicalEulerState(exterior);
+  }
+  catch (...) { return false; }
+}
+
 inline void CudaManufacturedState(const double x, const double y,
                                   double* state) noexcept
 {
@@ -78,6 +135,8 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       std::fill(host_boundary_policy_kind_.begin(),
                 host_boundary_policy_kind_.end(), 0);
       std::fill(host_boundary_reference_.begin(), host_boundary_reference_.end(),
+                0.0);
+      std::fill(host_boundary_pressure_.begin(), host_boundary_pressure_.end(),
                 0.0);
     }
   }
@@ -171,7 +230,7 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       mfem::Array<int> vdofs;
       trace_space_->GetFaceVDofs(face, vdofs);
       if (ft == nullptr || ft->Face == nullptr || trace_fe == nullptr ||
-          vdofs.Size() != conserved_components * shape_.scalar_face_dofs)
+          vdofs.Size() != shape_.trace_components * shape_.scalar_face_dofs)
         return false;
       const bool element_one = ft->Elem1No == element;
       if (!element_one && ft->Elem2No != element) { return false; }
@@ -194,6 +253,7 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
               faces_per_element + local_face;
           host_boundary_policy_kind_[face_index] =
               static_cast<int>(policy->kind);
+          host_boundary_pressure_[face_index] = policy->pressure_out;
           for (int component = 0; component < conserved_components; ++component)
             host_boundary_reference_[face_index * conserved_components + component] =
                 policy->reference_state[static_cast<std::size_t>(component)];
@@ -207,7 +267,7 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
         double exact[conserved_components], perturbed[conserved_components];
         CudaManufacturedState(face_physical[0], face_physical[1], exact);
         CudaPerturbedState(face_physical[0], face_physical[1], perturbed);
-        for (int component = 0; component < conserved_components; ++component)
+        for (int component = 0; component < shape_.trace_components; ++component)
         {
           const int local = scalar + shape_.scalar_face_dofs * component;
           double sign = 1.0;
@@ -216,8 +276,10 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
           const std::size_t map_index = static_cast<std::size_t>(element) *
                   shape_.trace_dofs + trace_offset + local;
           signed_element_trace_[map_index] = vdofs[local];
-          const double exact_value = sign * exact[component];
-          const double perturbed_value = sign * perturbed[component];
+          const double exact_value = component < conserved_components
+              ? sign * exact[component] : 0.0;
+          const double perturbed_value = component < conserved_components
+              ? sign * perturbed[component] : 0.0;
           if (assigned[static_cast<std::size_t>(dof)] != 0 &&
               (std::abs(local_exact_trace[static_cast<std::size_t>(dof)] -
                         exact_value) > 1.0e-12 ||
@@ -231,6 +293,27 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       }
       const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
           trace_fe->GetGeomType(), shape_.assembly_order);
+      if (shape_.igr_active)
+      {
+        double face_measure = 0.0;
+        for (int measure_q = 0; measure_q < face_rule.GetNPoints(); ++measure_q)
+        {
+          const mfem::IntegrationPoint& point = face_rule.IntPoint(measure_q);
+          ft->SetAllIntPoints(&point);
+          const double contribution = point.weight * ft->Face->Weight();
+          if (!(contribution > 0.0) || !std::isfinite(contribution))
+            return false;
+          face_measure += contribution;
+        }
+        const double element_volume = mesh_->GetElementVolume(element);
+        const double h = element_volume / face_measure;
+        if (!(element_volume > 0.0) || !std::isfinite(element_volume) ||
+            !(face_measure > 0.0) || !std::isfinite(face_measure) ||
+            !(h > 0.0) || !std::isfinite(h))
+          return false;
+        host_face_h_[static_cast<std::size_t>(element) * faces_per_element +
+                     local_face] = h;
+      }
       mfem::Vector interior_shape(shape_.scalar_interior_dofs);
       mfem::Vector trace_shape(shape_.scalar_face_dofs);
       for (int q = 0; q < shape_.face_points; ++q)
@@ -316,16 +399,30 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
 
   const std::size_t scalar_count =
       static_cast<std::size_t>(interior_space_->GetVSize() /
-                               conserved_components);
+                               shape_.interior_components);
   const std::size_t coefficient_count =
       scalar_count * static_cast<std::size_t>(conserved_components);
+  const std::size_t true_trace_scalar_count =
+      static_cast<std::size_t>(shape_.true_trace_count /
+                               shape_.trace_components);
+  const bool initial_trace_empty =
+      config.borrowed_initial_true_trace.coefficients == nullptr &&
+      config.borrowed_initial_true_trace.scalar_count == 0 &&
+      config.borrowed_initial_true_trace.components == conserved_components;
   const bool source_empty = config.borrowed_source.coefficients == nullptr &&
       config.borrowed_source.scalar_count == 0 &&
       config.borrowed_source.components == conserved_components;
   bool local_valid = config.borrowed_initial.coefficients != nullptr &&
       config.borrowed_initial.scalar_count == scalar_count &&
       config.borrowed_initial.components == conserved_components &&
-      coefficient_count == static_cast<std::size_t>(shape_.interior_count) &&
+      scalar_count * static_cast<std::size_t>(shape_.interior_components) ==
+          static_cast<std::size_t>(shape_.interior_count) &&
+      (initial_trace_empty ||
+       (config.borrowed_initial_true_trace.coefficients != nullptr &&
+        config.borrowed_initial_true_trace.scalar_count ==
+            true_trace_scalar_count &&
+        config.borrowed_initial_true_trace.components ==
+            conserved_components)) &&
       (source_empty ||
        (config.borrowed_source.coefficients != nullptr &&
         config.borrowed_source.scalar_count == scalar_count &&
@@ -336,6 +433,12 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
       local_valid = std::isfinite(config.borrowed_initial.coefficients[i]) &&
           (source_empty ||
            std::isfinite(config.borrowed_source.coefficients[i]));
+    const std::size_t initial_trace_count = true_trace_scalar_count *
+        static_cast<std::size_t>(conserved_components);
+    for (std::size_t i = 0;
+         local_valid && !initial_trace_empty && i < initial_trace_count; ++i)
+      local_valid =
+          std::isfinite(config.borrowed_initial_true_trace.coefficients[i]);
   }
   // All ranks reject before any input is copied or a trace projection starts.
   if (!CollectiveContinue(local_valid)) { return false; }
@@ -351,25 +454,33 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
 
   bool scatter_ready = true;
   for (int element = 0; scatter_ready && element < shape_.elements; ++element)
-    for (int local = 0; scatter_ready && local < shape_.interior_dofs; ++local)
+    for (int component = 0;
+         scatter_ready && component < shape_.interior_components; ++component)
+      for (int scalar = 0;
+           scatter_ready && scalar < shape_.scalar_interior_dofs; ++scalar)
     {
+      const int local = scalar + shape_.scalar_interior_dofs * component;
       double sign = 1.0;
       const int dof = CudaDecodeSigned(signed_element_interior_[
           static_cast<std::size_t>(element) * shape_.interior_dofs + local],
           sign);
-      if (dof < 0 || static_cast<std::size_t>(dof) >= coefficient_count)
+      const bool public_component = component < conserved_components;
+      if (dof < 0 || dof >= shape_.interior_count ||
+          (public_component &&
+           static_cast<std::size_t>(dof) >= coefficient_count))
       {
         scatter_ready = false;
         continue;
       }
       const std::size_t destination = static_cast<std::size_t>(element) *
           shape_.interior_dofs + local;
-      host_exact_interior_[destination] = sign * initial[static_cast<std::size_t>(dof)];
+      host_exact_interior_[destination] = public_component
+          ? sign * initial[static_cast<std::size_t>(dof)] : 0.0;
       // Generic data mode starts the physical current state at the supplied
       // committed state; the manufactured perturbed starting state remains
       // exclusively on the legacy path.
       host_perturbed_interior_[destination] = host_exact_interior_[destination];
-      if (!source_empty)
+      if (public_component && !source_empty)
         host_static_source_[destination] = sign *
             static_source[static_cast<std::size_t>(dof)];
     }
@@ -411,9 +522,10 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
                                        interior_vdofs);
       trace_space_->GetFaceVDofs(face, trace_vdofs);
       if (interior_element == nullptr ||
-          interior_vdofs.Size() != conserved_components *
+          interior_vdofs.Size() != shape_.interior_components *
               interior_element->GetDof() ||
-          trace_vdofs.Size() != conserved_components * trace_element->GetDof())
+          trace_vdofs.Size() != shape_.trace_components *
+              trace_element->GetDof())
         throw 0;
       const int boundary_element = mesh_->GetFaceToBdrElMap()[face];
       const bool physical_boundary = shape_.borrowed_static_boundary_policies &&
@@ -457,32 +569,36 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
         std::array<double, conserved_components> exterior = restricted;
         if (physical_boundary)
         {
-          if (boundary_policy->kind ==
-              CudaStaticBoundaryPolicyKind::supersonic_inlet)
-          {
-            exterior = boundary_policy->reference_state;
-          }
-          else if (boundary_policy->kind == CudaStaticBoundaryPolicyKind::slip_wall)
-          {
-            mfem::Vector scaled_normal(dimension);
-            mfem::CalcOrtho(transformations->Face->Jacobian(), scaled_normal);
-            const double normal_norm = scaled_normal.Norml2();
-            if (!(normal_norm > 0.0) || !std::isfinite(normal_norm)) throw 0;
-            const double nx = scaled_normal[0] / normal_norm;
-            const double ny = scaled_normal[1] / normal_norm;
-            const double normal_momentum = exterior[1] * nx + exterior[2] * ny;
-            exterior[1] -= 2.0 * normal_momentum * nx;
-            exterior[2] -= 2.0 * normal_momentum * ny;
-          }
+          mfem::Vector scaled_normal(dimension), position(dimension);
+          mfem::CalcOrtho(transformations->Face->Jacobian(), scaled_normal);
+          const double normal_norm = scaled_normal.Norml2();
+          if (!(normal_norm > 0.0) || !std::isfinite(normal_norm)) throw 0;
+          std::array<double, dimension> normal{{
+              scaled_normal[0] / normal_norm,
+              scaled_normal[1] / normal_norm}};
+          transformations->Face->Transform(point, position);
+          const generic::BoundaryPointView boundary_point{
+              position.HostRead(), normal.data(), dimension,
+              mesh_->GetBdrAttribute(boundary_element)};
+          const bool exterior_ready =
+              config.borrowed_boundary.exterior_state != nullptr
+              ? config.borrowed_boundary.exterior_state(
+                    config.borrowed_boundary.context, boundary_point,
+                    restricted.data(), exterior.data())
+              : CudaEvaluateStaticExteriorStateHost(
+                    *boundary_policy, restricted, normal,
+                    config.borrowed_boundary_policies.gamma, exterior);
+          if (!exterior_ready) throw 0;
           if (!IsCudaPhysicalEulerState(exterior)) throw 0;
         }
-        for (int component = 0; component < conserved_components; ++component)
+        for (int component = 0; component < shape_.trace_components; ++component)
         {
           double sign = 1.0;
           const int dof = CudaDecodeSigned(trace_vdofs[
               scalar + trace_element->GetDof() * component], sign);
           if (dof < 0 || dof >= local_trace->Size()) { throw 0; }
-          (*local_trace)[dof] = sign * exterior[static_cast<std::size_t>(component)];
+          (*local_trace)[dof] = component < conserved_components
+              ? sign * exterior[static_cast<std::size_t>(component)] : 0.0;
           local_trace_assigned[static_cast<std::size_t>(dof)] = 1;
         }
       }
@@ -527,6 +643,18 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
             true_assigned.begin() + shape_.true_trace_count;
   }
   catch (...) { trace_seeded = false; }
+  if (trace_seeded && !initial_trace_empty)
+  {
+    std::fill(host_exact_true_trace_.begin(), host_exact_true_trace_.end(), 0.0);
+    std::fill(host_perturbed_true_trace_.begin(),
+              host_perturbed_true_trace_.end(), 0.0);
+    const std::size_t public_count = true_trace_scalar_count *
+        static_cast<std::size_t>(conserved_components);
+    std::copy_n(config.borrowed_initial_true_trace.coefficients, public_count,
+                host_exact_true_trace_.data());
+    std::copy_n(config.borrowed_initial_true_trace.coefficients, public_count,
+                host_perturbed_true_trace_.data());
+  }
   return CollectiveContinue(trace_seeded);
 }
 
@@ -537,7 +665,7 @@ ExportInterior(const CudaInteriorState& source,
 {
   const std::size_t scalar_count =
       static_cast<std::size_t>(interior_space_->GetVSize() /
-                               conserved_components);
+                               shape_.interior_components);
   const std::size_t coefficient_count =
       scalar_count * static_cast<std::size_t>(conserved_components);
   bool local_valid = initialized_ && borrowed_host_inputs_ &&
@@ -549,8 +677,12 @@ ExportInterior(const CudaInteriorState& source,
   // Validate the complete reverse scatter before the D2H transfer.  A bad
   // destination or map therefore cannot receive a prefix of a failed export.
   for (int element = 0; local_valid && element < shape_.elements; ++element)
-    for (int local = 0; local_valid && local < shape_.interior_dofs; ++local)
+    for (int component = 0;
+         local_valid && component < conserved_components; ++component)
+      for (int scalar = 0;
+           local_valid && scalar < shape_.scalar_interior_dofs; ++scalar)
     {
+      const int local = scalar + shape_.scalar_interior_dofs * component;
       double sign = 1.0;
       const int dof = CudaDecodeSigned(signed_element_interior_[
           static_cast<std::size_t>(element) * shape_.interior_dofs + local],
@@ -567,8 +699,10 @@ ExportInterior(const CudaInteriorState& source,
       TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
   if (!CollectiveContinue(copied)) { return false; }
   for (int element = 0; element < shape_.elements; ++element)
-    for (int local = 0; local < shape_.interior_dofs; ++local)
+    for (int component = 0; component < conserved_components; ++component)
+      for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
     {
+      const int local = scalar + shape_.scalar_interior_dofs * component;
       double sign = 1.0;
       const int dof = CudaDecodeSigned(signed_element_interior_[
           static_cast<std::size_t>(element) * shape_.interior_dofs + local],
@@ -705,8 +839,10 @@ BindArenaViews() noexcept
       static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points);
   view_.face_normal = take_d(generic ? generic_arena_layout_.face_normal :
       static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension);
+  if (shape_.igr_active)
+    view_.face_h = take_d(generic ? generic_arena_layout_.face_h : 0);
   view_.status = take_d(generic ? generic_arena_layout_.elements : maximum_rank_elements);
-  view_.scalar = take_d(8);
+  view_.scalar = take_d(11);
   // Append the borrowed-only stabilization slice after every frozen W8A
   // allocation.  False mode therefore preserves the exact legacy arena
   // partition, offsets, and resource evidence tokens.
@@ -715,8 +851,12 @@ BindArenaViews() noexcept
         static_cast<std::size_t>(maximum_rank_elements) *
         faces_per_element * maximum_face_points);
   if (shape_.borrowed_static_boundary_policies)
+  {
     view_.boundary_reference = take_d(generic ?
         generic_arena_layout_.boundary_reference : 0);
+    view_.boundary_pressure = take_d(generic ?
+        generic_arena_layout_.boundary_pressure : 0);
+  }
   if (static_cast<std::size_t>(d - double_arena_) >
       double_arena_capacity_)
     return false;
@@ -829,11 +969,19 @@ UploadTopologyAndState() noexcept
                shape_.face_points * dimension * sizeof(double),
            CudaTransferSite::quadrature_upload))
     return false;
+  if (shape_.igr_active &&
+      !h2d(view_.face_h, host_face_h_.data(),
+           static_cast<std::size_t>(shape_.elements) * faces_per_element *
+               sizeof(double), CudaTransferSite::quadrature_upload))
+    return false;
   if (shape_.borrowed_static_boundary_policies &&
       (!h2d(view_.boundary_reference, host_boundary_reference_.data(),
             static_cast<std::size_t>(shape_.elements) * faces_per_element *
                 conserved_components * sizeof(double),
             CudaTransferSite::quadrature_upload) ||
+       !h2d(view_.boundary_pressure, host_boundary_pressure_.data(),
+            static_cast<std::size_t>(shape_.elements) * faces_per_element *
+                sizeof(double), CudaTransferSite::quadrature_upload) ||
        !h2d(view_.boundary_policy_kind, host_boundary_policy_kind_.data(),
             static_cast<std::size_t>(shape_.elements) * faces_per_element *
                 sizeof(int), CudaTransferSite::map_upload)))
@@ -883,7 +1031,9 @@ BuildPersistentTrueSystem() noexcept
       gmres_.emplace(*true_matrix_);
       CudaHypreSetupOrderEvidence initial_setup{};
       local_objects_ready = CudaConfigurePersistentHypre(
-          *true_matrix_, *ilu_, *gmres_, ranks_, 0, initial_setup) &&
+          *true_matrix_, *ilu_, *gmres_, ranks_,
+          linear_relative_tolerance_, maximum_linear_iterations_,
+          krylov_dimension_, 0, initial_setup) &&
           initial_setup.ConfigurationExactForGeneration(0);
     }
     if (local_objects_ready)
@@ -939,7 +1089,8 @@ BuildPersistentTrueSystem() noexcept
   CudaSolveDiagnostics warm{};
   const bool warm_solved = CudaRefreshFactorAndSolve(
       *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_, ranks_,
-      0, warm);
+      linear_relative_tolerance_, maximum_linear_iterations_,
+      krylov_dimension_, 0, warm);
   const bool warmed = warm_solved && warm.device_policy &&
       warm.configured_ilu0 &&
       warm.matrix_generation == 0;
@@ -981,7 +1132,9 @@ BuildPersistentTrueSystem() noexcept
     gmres_.emplace(*true_matrix_);
     CudaHypreSetupOrderEvidence persistent_setup{};
     persistent_configured = CudaConfigurePersistentHypre(
-        *true_matrix_, *ilu_, *gmres_, ranks_, 0, persistent_setup) &&
+        *true_matrix_, *ilu_, *gmres_, ranks_,
+        linear_relative_tolerance_, maximum_linear_iterations_,
+        krylov_dimension_, 0, persistent_setup) &&
         persistent_setup.ConfigurationExactForGeneration(0);
   }
   catch (...) { persistent_configured = false; }
@@ -1530,7 +1683,8 @@ SolveTrueSystem(double& true_relative_residual,
   CudaSolveDiagnostics diagnostics{};
   const bool local_solve = CudaRefreshFactorAndSolve(
           *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-          ranks_, matrix_generation, diagnostics) &&
+          ranks_, linear_relative_tolerance_, maximum_linear_iterations_,
+          krylov_dimension_, matrix_generation, diagnostics) &&
       diagnostics.device_policy && diagnostics.configured_ilu0 &&
       diagnostics.matrix_generation == matrix_generation &&
       diagnostics.converged && diagnostics.finite;
@@ -1545,7 +1699,7 @@ SolveTrueSystem(double& true_relative_residual,
   true_relative_residual = std::sqrt(residual_squared) /
       std::max(std::sqrt(rhs_squared), 1.0e-300);
   return std::isfinite(true_relative_residual) &&
-      true_relative_residual <= 1.0e-10;
+      true_relative_residual <= true_residual_relative_tolerance_;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>

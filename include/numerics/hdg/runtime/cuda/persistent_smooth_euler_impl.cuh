@@ -327,8 +327,10 @@ struct CudaGenericArenaLayout
   std::size_t face_trace = 0;
   std::size_t face_weight = 0;
   std::size_t face_normal = 0;
+  std::size_t face_h = 0;
   std::size_t element_faces = 0;
   std::size_t boundary_reference = 0;
+  std::size_t boundary_pressure = 0;
   std::size_t solve_workspace = 0;
   std::size_t two_exchange_keys = 0;
 };
@@ -412,10 +414,13 @@ struct CudaDeviceView
   double* face_trace_shape = nullptr;
   double* face_weight = nullptr;
   double* face_normal = nullptr;
+  // Element-volume / face-measure length used by the IGR auxiliary closure.
+  double* face_h = nullptr;
   // Borrowed-host physical-boundary data.  A zero kind is an ordinary
   // periodic/shared/interior trace coupling; nonzero values select a copied
   // value-only exterior policy for this element-local face.
   double* boundary_reference = nullptr;
+  double* boundary_pressure = nullptr;
   double* status = nullptr;
   double* scalar = nullptr;
   std::uint64_t* hash_words = nullptr;
@@ -437,6 +442,8 @@ struct CudaDeviceView
 struct CudaMeshShape
 {
   int elements = 0;
+  int interior_components = conserved_components;
+  int trace_components = conserved_components;
   int scalar_interior_dofs = 0;
   int scalar_face_dofs = 0;
   int interior_dofs = 0;
@@ -454,6 +461,11 @@ struct CudaMeshShape
   int vector_owned_count = 0;
   int vector_send_count = 0;
   int vector_receive_count = 0;
+  int order = cuda_w8a::polynomial_order;
+  double igr_alpha = 0.0;
+  double igr_beta = 0.0;
+  double boundary_gamma = 1.4;
+  bool igr_active = false;
   bool borrowed_static_source = false;
   bool borrowed_host_inputs = false;
   bool borrowed_static_boundary_policies = false;
@@ -692,6 +704,9 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   mfem::HypreILU& ilu,
                                   mfem::HypreGMRES& gmres,
                                   int ranks,
+                                  double relative_tolerance,
+                                  int maximum_iterations,
+                                  int krylov_dimension,
                                   std::uint64_t matrix_generation,
                                   CudaHypreSetupOrderEvidence& evidence)
     noexcept;
@@ -701,6 +716,9 @@ bool CudaRefreshFactorAndSolve(mfem::HypreParMatrix& matrix,
                                mfem::HypreILU& ilu,
                                mfem::HypreGMRES& gmres,
                                int ranks,
+                               double relative_tolerance,
+                               int maximum_iterations,
+                               int krylov_dimension,
                                std::uint64_t matrix_generation,
                                CudaSolveDiagnostics& diagnostics) noexcept;
 bool CudaHypreDevicePolicyValid(mfem::HypreParMatrix& matrix,
@@ -753,6 +771,9 @@ bool CudaLaunchMaximumWave(const CudaDeviceView& view,
                            const double* interior,
                            const double* element_trace,
                            double* result) noexcept;
+bool CudaLaunchIgrConservation(const CudaDeviceView& view,
+                               const CudaMeshShape& shape,
+                               double dt, double* result) noexcept;
 bool CudaLaunchHash(const double* values, int count,
                     std::uint64_t* words) noexcept;
 
@@ -836,6 +857,30 @@ public:
     if (!CollectiveContinue(BuildTopology(config)))
     {
       ReportCudaSetupFailure(evidence.rank, "build-topology");
+      return false;
+    }
+    linear_relative_tolerance_ = config.use_generic_numerical_policy
+        ? config.numerical_policy.linear_relative_tolerance : 1.0e-13;
+    true_residual_relative_tolerance_ = config.use_generic_numerical_policy
+        ? config.numerical_policy.true_residual_relative_tolerance : 1.0e-10;
+    maximum_linear_iterations_ = config.use_generic_numerical_policy
+        ? generic::ResolveEulerHdgMaximumLinearIterations(
+              config.numerical_policy.maximum_linear_iterations,
+              shape_.global_true_trace_count)
+        : 400;
+    krylov_dimension_ = config.use_generic_numerical_policy
+        ? generic::EulerHdgKrylovRestartDimension(
+              shape_.global_true_trace_count)
+        : (ranks_ == 1 ? shape_.true_trace_count
+                       : shape_.global_true_trace_count);
+    if (!CollectiveContinue(linear_relative_tolerance_ > 0.0 &&
+                            std::isfinite(linear_relative_tolerance_) &&
+                            true_residual_relative_tolerance_ > 0.0 &&
+                            std::isfinite(true_residual_relative_tolerance_) &&
+                            maximum_linear_iterations_ > 0 &&
+                            krylov_dimension_ > 0))
+    {
+      ReportCudaSetupFailure(evidence.rank, "generic-linear-policy");
       return false;
     }
     if (!CollectiveContinue(InitializeBorrowedHostFields(config)))
@@ -1270,6 +1315,50 @@ public:
     return DistributeCurrentTrace(workspace.trace.coefficients);
   }
 
+  bool IgrConservationBalance(const double dt, double& maximum_error,
+                              double& maximum_relative_error) noexcept
+  {
+    maximum_error = 0.0;
+    maximum_relative_error = 0.0;
+    constexpr int components = 5;
+    constexpr int result_scalars = 2 * components + 1;
+    std::array<double, result_scalars> local{};
+    const bool launched = initialized_ && shape_.igr_active &&
+        std::isfinite(dt) && dt > 0.0 &&
+        CudaLaunchIgrConservation(view_, shape_, dt, view_.scalar) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!CollectiveContinue(launched)) return false;
+    const bool copied = TransportPolicy::DeviceToHost(
+            local.data(), view_.scalar, local.size() * sizeof(double),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    bool local_valid = copied && local[2 * components] == 1.0;
+    for (int index = 0; local_valid && index < 2 * components; ++index)
+      local_valid = std::isfinite(local[static_cast<std::size_t>(index)]);
+    if (!CollectiveContinue(local_valid)) return false;
+    std::array<double, components> global_balance{};
+    std::array<double, components> global_scale{};
+    const bool reduced = MPI_Allreduce(
+            local.data(), global_balance.data(), components, MPI_DOUBLE,
+            MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS &&
+        MPI_Allreduce(local.data() + components, global_scale.data(),
+                      components, MPI_DOUBLE, MPI_SUM,
+                      MPI_COMM_WORLD) == MPI_SUCCESS;
+    if (!CollectiveContinue(reduced)) return false;
+    for (int component = 0; component < components; ++component)
+    {
+      const double error = std::abs(
+          global_balance[static_cast<std::size_t>(component)]);
+      const double relative = error /
+          (1.0 + global_scale[static_cast<std::size_t>(component)]);
+      maximum_error = std::max(maximum_error, error);
+      maximum_relative_error = std::max(maximum_relative_error, relative);
+    }
+    return CollectiveContinue(std::isfinite(maximum_error) &&
+                              std::isfinite(maximum_relative_error));
+  }
+
   CudaNumericalResult Execute(const CudaConfig& config,
                               const AttemptIdentity& attempt,
                               state_slot& workspace) noexcept
@@ -1305,7 +1394,7 @@ public:
     // nonlinear update, then retain it unchanged through every assembly and
     // line-search reassembly.  The legacy manufactured W8A path deliberately
     // does not launch this kernel and continues to use its fixed arithmetic.
-    if (shape_.borrowed_host_inputs)
+    if (shape_.borrowed_host_inputs && !shape_.igr_active)
     {
       const bool tau_seeded = CudaLaunchSeedBorrowedLaggedLlfTau(view_, shape_) &&
           TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
@@ -1351,18 +1440,31 @@ public:
       return result;
     }
     result.finite = std::isfinite(result.initial_residual) &&
-        result.initial_residual > 1.0e-8;
+        (config.use_generic_numerical_policy ||
+         result.initial_residual > 1.0e-8);
     result.final_residual = result.initial_residual;
-    const double target = 1.0e-10 * (1.0 + result.initial_residual);
+    const double nonlinear_relative_tolerance =
+        config.use_generic_numerical_policy
+            ? config.numerical_policy.nonlinear_relative_tolerance : 1.0e-10;
+    const double armijo_constant = config.use_generic_numerical_policy
+        ? config.numerical_policy.armijo_constant : 1.0e-4;
+    const int maximum_line_search_trials =
+        config.use_generic_numerical_policy
+            ? config.numerical_policy.maximum_line_search_trials : 13;
+    const double target = nonlinear_relative_tolerance *
+        (1.0 + result.initial_residual);
     // Physical boundary rows use the same value-only exterior-state Picard
     // linearization as the CPU path.  Match that bounded envelope without
     // changing the periodic generic or legacy W8A iteration limit.
-    const int maximum_nonlinear_updates =
-        shape_.borrowed_static_boundary_policies ? 80 : 20;
+    const int maximum_nonlinear_updates = config.use_generic_numerical_policy
+        ? config.numerical_policy.maximum_nonlinear_updates
+        : (shape_.borrowed_static_boundary_policies ? 80 : 20);
     std::uint64_t last_product_generation = 0;
     for (int iteration = 0; iteration < maximum_nonlinear_updates; ++iteration)
     {
-      if (result.nonlinear_updates >= 2 && result.final_residual <= target)
+      const bool minimum_update_witness = config.use_generic_numerical_policy ||
+          result.nonlinear_updates >= 2;
+      if (minimum_update_witness && result.final_residual <= target)
         break;
       if (inject_at(CudaFailurePhase::condensation)) { return result; }
       const bool condensed = CopyBase(workspace) &&
@@ -1413,7 +1515,7 @@ public:
       }
       last_product_generation = generation;
       bool accepted = false;
-      for (int trial = 0; trial <= 12; ++trial)
+      for (int trial = 0; trial < maximum_line_search_trials; ++trial)
       {
         const double alpha = std::ldexp(1.0, -trial);
         const bool trial_ready = CudaLaunchTrial(view_, shape_, alpha) &&
@@ -1450,7 +1552,7 @@ public:
           return result;
         }
         if (trial_residual <=
-            (1.0 - 1.0e-4 * alpha) * result.final_residual)
+            (1.0 - armijo_constant * alpha) * result.final_residual)
         {
           result.final_residual = trial_residual;
           ++result.nonlinear_updates;
@@ -1485,7 +1587,9 @@ public:
 
     // Freeze one coherent accepted linearization: A/B/C/D, Schur/RHS,
     // solution, and recovery all describe the same candidate generation.
-    const bool coherent_base = result.nonlinear_updates >= 2 &&
+    const bool coherent_base =
+        (config.use_generic_numerical_policy ||
+         result.nonlinear_updates >= 2) &&
         result.final_residual <= target && CopyBase(workspace) &&
         Ticket(CudaFailurePhase::condensation) &&
         CudaLaunchCondensation(view_, shape_) &&
@@ -1520,6 +1624,12 @@ public:
       result.reason = FailureReason::recovery_gate;
       return result;
     }
+    // A generic steady state may satisfy the nonlinear gate before its first
+    // Newton update.  The coherent condensation/trace-solve/recovery sequence
+    // above is still formed and validated; it is the recovery witness for
+    // that zero-update candidate.  Legacy W8A retains its two-update witness.
+    result.recovery = true;
+    result.candidate_ready = true;
     // Rank-two increment distribution reuses distributed_local_trace as its
     // host-staged ghost buffer.  Restore the accepted current trace before
     // oracle capture so current_local_trace, distributed_local_trace, and
@@ -1542,10 +1652,23 @@ public:
         StatusPassed();
     result.admissible = CollectiveContinue(local_admissible);
     result.true_residual = std::isfinite(result.true_relative_residual) &&
-        result.true_relative_residual <= 1.0e-10;
+        result.true_relative_residual <= true_residual_relative_tolerance_;
     if (config.force_private_scientific_gate_failure)
       result.true_residual = false;
     if (inject_at(CudaFailurePhase::diagnostics)) { return result; }
+    if (shape_.igr_active)
+    {
+      result.conservation = IgrConservationBalance(
+          attempt.dt, result.maximum_conservation_error,
+          result.maximum_conservation_relative_error) &&
+          result.maximum_conservation_relative_error <=
+              config.numerical_policy.conservation_relative_tolerance;
+      if (!CollectiveContinue(result.conservation))
+      {
+        result.reason = FailureReason::success_gate;
+        return result;
+      }
+    }
     const std::uint64_t current_allocation_events =
         AllocatorPolicy::AllocationEvents();
     bool allocation_plateau_exact =
@@ -1572,7 +1695,7 @@ public:
             baseline_deallocation_events_ &&
         allocation_plateau_exact;
     result.success = result.finite && result.admissible && result.recovery &&
-        result.true_residual && result.telemetry;
+        result.true_residual && result.conservation && result.telemetry;
     result.reason = result.success ? FailureReason::none :
         (!result.true_residual ? FailureReason::true_residual_gate
                               : FailureReason::success_gate);
@@ -1646,6 +1769,29 @@ public:
                       CudaMutableHostL2Output destination) noexcept;
 
 private:
+  static bool IgrActive(const CudaConfig& config) noexcept
+  {
+    return config.use_generic_numerical_policy &&
+        config.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::igr;
+  }
+
+  static int InteriorComponents(const CudaConfig& config) noexcept
+  { return IgrActive(config) ? igr_interior_components : conserved_components; }
+
+  static int TraceComponents(const CudaConfig& config) noexcept
+  { return IgrActive(config) ? igr_trace_components : conserved_components; }
+
+  static int AssemblyOrder(const CudaConfig& config) noexcept
+  {
+    if (config.use_generic_numerical_policy)
+      return IgrActive(config)
+          ? config.numerical_policy.igr_assembly_quadrature_order
+          : config.numerical_policy.conventional_assembly_quadrature_order;
+    return config.order == functional_polynomial_order
+        ? functional_assembly_quadrature_order : assembly_quadrature_order;
+  }
+
   static bool ExactTopologyShapeFitsCapacity(
       const CudaConfig& config, const mfem::ParMesh& mesh,
       const mfem::ParFiniteElementSpace& interior,
@@ -1673,11 +1819,10 @@ private:
     const int scalar_interior_dofs = fe->GetDof();
     const int scalar_face_dofs = face_fe->GetDof();
     const int interior_dofs =
-        conserved_components * scalar_interior_dofs;
+        InteriorComponents(config) * scalar_interior_dofs;
     const int trace_dofs =
-        faces_per_element * conserved_components * scalar_face_dofs;
-    const int assembly_order = config.order == functional_polynomial_order
-        ? functional_assembly_quadrature_order : assembly_quadrature_order;
+        faces_per_element * TraceComponents(config) * scalar_face_dofs;
+    const int assembly_order = AssemblyOrder(config);
     const int volume_points = mfem::IntRules.Get(
         fe->GetGeomType(), assembly_order).GetNPoints();
     const int face_points = mfem::IntRules.Get(
@@ -1685,11 +1830,19 @@ private:
     const bool common_shape = trace.GetVSize() > 0 && trace.GetTrueVSize() > 0 &&
         exchange.map.dofs.global_true_dof_count > 0 &&
         scalar_interior_dofs > 0 &&
-        scalar_interior_dofs <= maximum_scalar_dofs_per_element &&
+        scalar_interior_dofs <= (generic
+            ? generic_maximum_scalar_dofs_per_element
+            : maximum_scalar_dofs_per_element) &&
         scalar_face_dofs > 0 &&
-        scalar_face_dofs <= maximum_scalar_dofs_per_face &&
-        interior_dofs <= maximum_interior_dofs_per_element &&
-        trace_dofs <= maximum_trace_dofs_per_element &&
+        scalar_face_dofs <= (generic
+            ? generic_maximum_scalar_dofs_per_face
+            : maximum_scalar_dofs_per_face) &&
+        interior_dofs <= (generic
+            ? generic_maximum_interior_dofs_per_element
+            : maximum_interior_dofs_per_element) &&
+        trace_dofs <= (generic
+            ? generic_maximum_trace_dofs_per_element
+            : maximum_trace_dofs_per_element) &&
         volume_points <= maximum_volume_points &&
         face_points <= maximum_face_points;
     if (generic) return common_shape;
@@ -1712,10 +1865,11 @@ private:
           config.order, dimension, mfem::FiniteElement::VALUE,
           mfem::BasisType::GaussLegendre);
       mfem::ParFiniteElementSpace interior_space(
-          config.borrowed_mesh, &interior_collection, conserved_components,
+          config.borrowed_mesh, &interior_collection,
+          InteriorComponents(config),
           mfem::Ordering::byNODES);
       mfem::ParFiniteElementSpace trace_space(
-          config.borrowed_mesh, &trace_collection, conserved_components,
+          config.borrowed_mesh, &trace_collection, TraceComponents(config),
           mfem::Ordering::byNODES);
       interior_space.ExchangeFaceNbrData();
       trace_space.ExchangeFaceNbrData();
@@ -1733,8 +1887,12 @@ private:
   {
     const bool supported_rank = config.expected_rank_count == 1 ||
         config.expected_rank_count == 2;
-    const bool supported_order = config.order == smoke_polynomial_order ||
-        config.order == functional_polynomial_order;
+    const bool supported_order = config.use_borrowed_topology &&
+            config.use_borrowed_host_inputs
+        ? config.order >= generic::minimum_polynomial_order &&
+            config.order <= generic::maximum_polynomial_order
+        : config.order == smoke_polynomial_order ||
+            config.order == functional_polynomial_order;
     int world_ranks = 0;
     const bool world_ready =
         MPI_Comm_size(MPI_COMM_WORLD, &world_ranks) == MPI_SUCCESS;
@@ -2084,8 +2242,9 @@ private:
           config.order, dimension, mfem::FiniteElement::VALUE,
           mfem::BasisType::GaussLegendre);
       interior_space_.emplace(mesh_, &*interior_collection_,
-                              conserved_components, mfem::Ordering::byNODES);
-      trace_space_.emplace(mesh_, &*trace_collection_, conserved_components,
+                              InteriorComponents(config),
+                              mfem::Ordering::byNODES);
+      trace_space_.emplace(mesh_, &*trace_collection_, TraceComponents(config),
                            mfem::Ordering::byNODES);
       interior_space_->ExchangeFaceNbrData();
       trace_space_->ExchangeFaceNbrData();
@@ -2108,12 +2267,20 @@ private:
         trace_space_->GetFaceElement(first_faces[0]);
     shape_.scalar_interior_dofs = fe == nullptr ? 0 : fe->GetDof();
     shape_.scalar_face_dofs = face_fe == nullptr ? 0 : face_fe->GetDof();
+    shape_.interior_components = InteriorComponents(config);
+    shape_.trace_components = TraceComponents(config);
     shape_.interior_dofs =
-        conserved_components * shape_.scalar_interior_dofs;
-    shape_.trace_dofs = faces_per_element * conserved_components *
+        shape_.interior_components * shape_.scalar_interior_dofs;
+    shape_.trace_dofs = faces_per_element * shape_.trace_components *
         shape_.scalar_face_dofs;
-    shape_.assembly_order = config.order == functional_polynomial_order
-        ? functional_assembly_quadrature_order : assembly_quadrature_order;
+    shape_.assembly_order = AssemblyOrder(config);
+    shape_.order = config.order;
+    shape_.igr_active = IgrActive(config);
+    shape_.igr_alpha = shape_.igr_active
+        ? config.numerical_policy.stabilization.alpha : 0.0;
+    shape_.igr_beta = shape_.igr_active
+        ? config.numerical_policy.stabilization.beta : 0.0;
+    shape_.boundary_gamma = config.borrowed_boundary_policies.gamma;
     const long long expected_interior = static_cast<long long>(shape_.elements) *
         static_cast<long long>(shape_.interior_dofs);
     const int interior_vsize = interior_space_->GetVSize();
@@ -2216,8 +2383,10 @@ private:
       layout.local_trace = local_trace;
       layout.true_trace = true_trace;
       layout.element_faces = element_faces;
+      layout.face_h = element_faces;
       valid = valid && checked_product(element_faces, conserved_components,
                                        layout.boundary_reference);
+      layout.boundary_pressure = element_faces;
       if (!valid) return false;
       const std::size_t host_elements = generic ? layout.elements : maximum_rank_elements;
       const std::size_t host_interior = generic ? interior :
@@ -2252,8 +2421,12 @@ private:
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points, 0.0);
       host_face_normal_.assign(generic ? layout.face_normal :
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension, 0.0);
+      host_face_h_.assign(generic ? layout.face_h : 0, 1.0);
       host_boundary_reference_.assign(generic &&
           shape_.borrowed_static_boundary_policies ? layout.boundary_reference : 0,
+          0.0);
+      host_boundary_pressure_.assign(generic &&
+          shape_.borrowed_static_boundary_policies ? layout.boundary_pressure : 0,
           0.0);
       host_boundary_policy_kind_.assign(generic &&
           shape_.borrowed_static_boundary_policies ? layout.element_faces : 0, 0);
@@ -2315,10 +2488,12 @@ private:
           checked_add(doubles, layout.volume_weight) && checked_add(doubles, layout.volume_position) &&
           checked_add(doubles, layout.face_interior) && checked_add(doubles, layout.face_trace) &&
           checked_add(doubles, layout.face_weight) && checked_add(doubles, layout.face_normal) &&
-          checked_add(doubles, elements) && checked_add(doubles, 8) &&
+          checked_add(doubles, layout.face_h) &&
+          checked_add(doubles, elements) && checked_add(doubles, 11) &&
           checked_add(doubles, layout.face_weight) &&
           (!shape_.borrowed_static_boundary_policies ||
-           checked_add(doubles, layout.boundary_reference));
+           (checked_add(doubles, layout.boundary_reference) &&
+            checked_add(doubles, layout.boundary_pressure)));
       std::size_t integers = 16;
       valid = valid && checked_add(integers, layout.element_trace) &&
           checked_add(integers, three_local_matrix) &&
@@ -2569,6 +2744,10 @@ private:
   double local_hmin_ = std::numeric_limits<double>::infinity();
   std::array<double, 2> host_cfl_scalars_{{0.0, 0.0}};
   bool allocation_plateau_sampled_ = false;
+  double linear_relative_tolerance_ = 1.0e-13;
+  double true_residual_relative_tolerance_ = 1.0e-10;
+  int maximum_linear_iterations_ = 400;
+  int krylov_dimension_ = 20;
   std::size_t host_exchange_bytes_ = 0;
   std::array<CudaDeviceTicket, maximum_device_tickets> tickets_{};
   std::size_t ticket_count_ = 0;
@@ -2588,7 +2767,9 @@ private:
   std::vector<double> host_face_trace_shape_{};
   std::vector<double> host_face_weight_{};
   std::vector<double> host_face_normal_{};
+  std::vector<double> host_face_h_{};
   std::vector<double> host_boundary_reference_{};
+  std::vector<double> host_boundary_pressure_{};
   std::vector<int> host_boundary_policy_kind_{};
   std::vector<double> host_exact_interior_{};
   std::vector<double> host_perturbed_interior_{};

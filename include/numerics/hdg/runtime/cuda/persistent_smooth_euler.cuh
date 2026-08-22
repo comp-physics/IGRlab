@@ -416,6 +416,7 @@ struct CudaNumericalResult
   bool admissible = false;
   bool recovery = false;
   bool true_residual = false;
+  bool conservation = true;
   bool telemetry = false;
   bool success = false;
   bool injected = false;
@@ -426,6 +427,8 @@ struct CudaNumericalResult
   double initial_residual = std::numeric_limits<double>::infinity();
   double final_residual = std::numeric_limits<double>::infinity();
   double true_relative_residual = std::numeric_limits<double>::infinity();
+  double maximum_conservation_error = 0.0;
+  double maximum_conservation_relative_error = 0.0;
   int nonlinear_updates = 0;
   int trace_solves = 0;
 };
@@ -1057,6 +1060,20 @@ public:
     return initialized_ && committed_diagnostics_valid_;
   }
 
+  /** Narrow runtime-test seam over the production post-candidate IGR gate. */
+  bool VerifyPreparedIgrConservationForTests(
+      double& maximum_error, double& maximum_relative_error) noexcept
+  {
+    maximum_error = std::numeric_limits<double>::infinity();
+    maximum_relative_error = std::numeric_limits<double>::infinity();
+    return initialized_ && pending_.active && pending_.staging &&
+        config_.use_generic_numerical_policy &&
+        config_.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::igr &&
+        numerics_.IgrConservationBalance(
+            pending_.attempt.dt, maximum_error, maximum_relative_error);
+  }
+
   /** Export only the currently staged candidate; no logical publication occurs. */
   bool ExportPreparedInterior(CudaMutableHostL2Output destination) noexcept
   {
@@ -1092,9 +1109,11 @@ private:
   void ForgetBorrowedHostInputPointers() noexcept
   {
     config_.borrowed_initial.coefficients = nullptr;
+    config_.borrowed_initial_true_trace.coefficients = nullptr;
     config_.borrowed_source.coefficients = nullptr;
     config_.borrowed_boundary_policies.policies = nullptr;
     config_.borrowed_boundary_policies.count = 0;
+    config_.borrowed_boundary = {};
     config_.borrowed_global_topology = {};
   }
 
@@ -1236,8 +1255,8 @@ private:
   {
     const bool borrowed_generic_shape = config_.use_borrowed_topology &&
         config_.use_borrowed_host_inputs && config_.mesh_n >= 0 &&
-        (config_.order == smoke_polynomial_order ||
-         config_.order == functional_polynomial_order);
+        config_.order >= generic::minimum_polynomial_order &&
+        config_.order <= generic::maximum_polynomial_order;
     const bool smoke_shape = config_.order == smoke_polynomial_order &&
         config_.mesh_n == smoke_elements_per_direction;
     const bool functional_shape =
@@ -1271,10 +1290,27 @@ private:
              (config_.borrowed_source.coefficients != nullptr &&
               config_.borrowed_source.scalar_count != 0 &&
               config_.borrowed_source.components == conserved_components))
-        : empty_l2(config_.borrowed_initial) && empty_l2(config_.borrowed_source);
+        : empty_l2(config_.borrowed_initial) &&
+            empty_l2(config_.borrowed_initial_true_trace) &&
+            empty_l2(config_.borrowed_source);
+    const bool initial_trace_configuration = config_.use_borrowed_host_inputs
+        ? empty_l2(config_.borrowed_initial_true_trace) ||
+            (config_.borrowed_initial_true_trace.coefficients != nullptr &&
+             config_.borrowed_initial_true_trace.scalar_count != 0 &&
+             config_.borrowed_initial_true_trace.components ==
+                 conserved_components)
+        : empty_l2(config_.borrowed_initial_true_trace);
+    const bool generic_numerical_configuration =
+        config_.use_generic_numerical_policy
+        ? config_.use_borrowed_host_inputs &&
+            generic::ValidEulerHdgNumericalPolicy(config_.numerical_policy)
+        : !config_.use_borrowed_host_inputs ||
+            config_.numerical_policy.stabilization.kind ==
+                generic::RegularizationKind::none;
     const bool boundary_policy_configuration =
         config_.use_borrowed_host_inputs
-        ? ValidateCudaStaticBoundaryPolicyTable(config_.borrowed_boundary_policies)
+        ? ValidateCudaStaticBoundaryPolicyTable(
+              config_.borrowed_boundary_policies)
         : config_.borrowed_boundary_policies.policies == nullptr &&
             config_.borrowed_boundary_policies.count == 0;
     const bool borrowed_topology_identity = config_.use_borrowed_host_inputs
@@ -1292,6 +1328,8 @@ private:
         (borrowed_generic_shape || smoke_shape || functional_shape) &&
         topology_configuration &&
         generic_l2_configuration &&
+        initial_trace_configuration &&
+        generic_numerical_configuration &&
         boundary_policy_configuration &&
         borrowed_topology_identity &&
         !fixed_oracle_requested_for_generic_storage &&
@@ -1385,8 +1423,50 @@ private:
       AppendConfigValue(descriptor, cursor, complete,
                         config_.borrowed_initial.components);
       AppendConfigValue(descriptor, cursor, complete,
+                        config_.borrowed_initial_true_trace.components);
+      append_bool(config_.borrowed_initial_true_trace.coefficients != nullptr);
+      AppendConfigValue(descriptor, cursor, complete,
                         config_.borrowed_source.components);
       append_bool(config_.borrowed_source.coefficients != nullptr);
+      append_bool(config_.use_generic_numerical_policy);
+      if (config_.use_generic_numerical_policy)
+      {
+        const auto& policy = config_.numerical_policy;
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.volume_projection_quadrature_order);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.true_trace_projection_quadrature_order);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.conventional_assembly_quadrature_order);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.igr_assembly_quadrature_order);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.audit_quadrature_order);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.observable_quadrature_order);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.maximum_nonlinear_updates);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.maximum_linear_iterations);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.maximum_line_search_trials);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.nonlinear_relative_tolerance);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.linear_relative_tolerance);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.true_residual_relative_tolerance);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.conservation_relative_tolerance);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.armijo_constant);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.stabilization.kind);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.stabilization.alpha);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.stabilization.beta);
+      }
     }
     append_bool(config_.capture_oracle);
     AppendConfigValue(descriptor, cursor, complete, config_.injection.phase);
@@ -1494,6 +1574,7 @@ private:
       cursor += sizeof(value_type);
     };
     append(config_.borrowed_boundary_policies.count);
+    append(config_.borrowed_boundary_policies.gamma);
     const bool readable = config_.borrowed_boundary_policies.policies != nullptr &&
         config_.borrowed_boundary_policies.count <= maximum_static_boundary_policies;
     for (std::size_t index = 0; index < maximum_static_boundary_policies; ++index)
@@ -1506,6 +1587,7 @@ private:
       const std::uint8_t kind = static_cast<std::uint8_t>(policy.kind);
       append(kind);
       for (const double reference : policy.reference_state) append(reference);
+      append(policy.pressure_out);
     }
     minimum = local;
     maximum = local;

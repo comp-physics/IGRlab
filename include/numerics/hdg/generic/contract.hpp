@@ -707,14 +707,9 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     RecordFailure(local_status, ContractStatus::unsupported_polynomial_order);
   }
-  // The reference IGR augmentation is currently a CPU capability.  It shares
-  // the conventional Euler solver's complete admitted order and boundary
-  // surface; neither mesh boundaries nor p2/p3 select another formulation.
-  if (request.numerical_policy.stabilization.kind == RegularizationKind::igr &&
-      request.backend.kind != BackendKind::cpu)
-  {
-    RecordFailure(local_status, ContractStatus::invalid_regularization);
-  }
+  // IGR is an augmentation selected inside either conventional backend; it
+  // does not select another Euler solver or narrow the admitted order and
+  // physical-boundary surface.
   if ((request.backend.kind == BackendKind::cpu &&
        request.backend.device_ordinal != -1) ||
       (request.backend.kind == BackendKind::cuda &&

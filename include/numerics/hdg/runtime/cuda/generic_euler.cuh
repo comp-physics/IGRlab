@@ -125,6 +125,148 @@ public:
   }
 
   /**
+   * Lower the shared backend-neutral request into the existing engine.  The
+   * temporary value-only device policy table is copied synchronously by the
+   * CudaConfig Initialize route; no request field or policy pointer is kept.
+   */
+  result_type Initialize(const generic::EulerHdgRequest& request) noexcept
+  {
+    cuda_w8a::CudaConfig config{};
+    std::vector<cuda_w8a::CudaStaticBoundaryPolicy> device_policies;
+    bool lowered = request.mesh != nullptr &&
+        request.backend.kind == generic::BackendKind::cuda &&
+        request.backend.device_ordinal >= 0 &&
+        generic::HasCapabilities(
+            request.capabilities,
+            generic::RequiredCapabilities(request.backend)) &&
+        generic::ValidEulerHdgNumericalPolicy(request.numerical_policy) &&
+        !generic::IsAbsentEulerBoundaryPolicyTable(
+            request.boundary.policies) &&
+        request.initial_state.components == cuda_w8a::conserved_components &&
+        request.initial_state.scalar_count %
+            static_cast<std::size_t>(cuda_w8a::conserved_components) == 0 &&
+        request.initial_true_trace.components ==
+            cuda_w8a::conserved_components &&
+        request.initial_true_trace.scalar_count %
+            static_cast<std::size_t>(cuda_w8a::conserved_components) == 0 &&
+        request.source.components == cuda_w8a::conserved_components &&
+        request.source.scalar_count %
+            static_cast<std::size_t>(cuda_w8a::conserved_components) == 0;
+    int ranks = 0;
+    lowered = lowered &&
+        MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS &&
+        (ranks == 1 || ranks == 2);
+    int boundary_attributes = 0;
+    if (request.mesh != nullptr)
+    {
+      try
+      {
+        boundary_attributes = request.mesh->bdr_attributes.Size() == 0
+            ? 0 : request.mesh->bdr_attributes.Max();
+      }
+      catch (...) { lowered = false; }
+    }
+    lowered = lowered && generic::IsValidEulerBoundaryPolicyTable(
+        request.boundary.policies, cuda_w8a::dimension,
+        boundary_attributes) &&
+        generic::DoubleBits(request.boundary.policies.gamma) ==
+            generic::DoubleBits(1.4) &&
+        request.boundary.policies.count <=
+            cuda_w8a::maximum_static_boundary_policies;
+    if (lowered)
+    {
+      try
+      {
+        device_policies.reserve(request.boundary.policies.count);
+        for (std::size_t index = 0;
+             index < request.boundary.policies.count; ++index)
+        {
+          const generic::EulerBoundaryPolicy& source =
+              request.boundary.policies.policies[index];
+          if (source.kind ==
+              generic::EulerBoundaryPolicyKind::periodic_topology)
+            continue;
+          cuda_w8a::CudaStaticBoundaryPolicy destination{};
+          destination.attribute = static_cast<int>(index) + 1;
+          destination.reference_state = source.reference_state;
+          destination.pressure_out = source.pressure_out;
+          switch (source.kind)
+          {
+          case generic::EulerBoundaryPolicyKind::supersonic_inlet:
+            destination.kind = cuda_w8a::CudaStaticBoundaryPolicyKind::
+                supersonic_inlet;
+            break;
+          case generic::EulerBoundaryPolicyKind::subsonic_inlet:
+            destination.kind = cuda_w8a::CudaStaticBoundaryPolicyKind::
+                subsonic_inlet;
+            break;
+          case generic::EulerBoundaryPolicyKind::supersonic_outlet:
+            destination.kind = cuda_w8a::CudaStaticBoundaryPolicyKind::
+                supersonic_outlet;
+            break;
+          case generic::EulerBoundaryPolicyKind::subsonic_outlet_pressure:
+            destination.kind = cuda_w8a::CudaStaticBoundaryPolicyKind::
+                subsonic_outlet_pressure;
+            break;
+          case generic::EulerBoundaryPolicyKind::far_field:
+            destination.kind =
+                cuda_w8a::CudaStaticBoundaryPolicyKind::far_field;
+            break;
+          case generic::EulerBoundaryPolicyKind::nonreflecting_outlet:
+            destination.kind = cuda_w8a::CudaStaticBoundaryPolicyKind::
+                nonreflecting_outlet;
+            break;
+          case generic::EulerBoundaryPolicyKind::slip_wall:
+            destination.kind =
+                cuda_w8a::CudaStaticBoundaryPolicyKind::slip_wall;
+            break;
+          case generic::EulerBoundaryPolicyKind::periodic_topology:
+            break;
+          }
+          device_policies.push_back(destination);
+        }
+      }
+      catch (...) { lowered = false; }
+    }
+
+    config.order = request.polynomial_order;
+    config.mesh_n = 0;
+    config.dt = cuda_w8a::fixed_dt;
+    config.requested_device = lowered ? request.backend.device_ordinal : -1;
+    config.expected_rank_count = ranks;
+    config.require_host_staged_rank2 = ranks == 2;
+    config.use_borrowed_topology = true;
+    config.borrowed_mesh = const_cast<mfem::ParMesh*>(request.mesh);
+    config.borrowed_communicator = request.communicator;
+    config.use_borrowed_host_inputs = true;
+    config.borrowed_initial = {
+        request.initial_state.data,
+        request.initial_state.scalar_count /
+            static_cast<std::size_t>(cuda_w8a::conserved_components),
+        request.initial_state.components};
+    config.borrowed_initial_true_trace = {
+        request.initial_true_trace.data,
+        request.initial_true_trace.scalar_count /
+            static_cast<std::size_t>(cuda_w8a::conserved_components),
+        request.initial_true_trace.components};
+    config.borrowed_source = {
+        request.source.data,
+        request.source.scalar_count /
+            static_cast<std::size_t>(cuda_w8a::conserved_components),
+        request.source.components};
+    if (!device_policies.empty())
+      config.borrowed_global_topology = StableIdentity::Copy(
+          "generic.euler.request.topology.v1");
+    config.borrowed_boundary_policies = {
+        device_policies.empty() ? nullptr : device_policies.data(),
+        device_policies.size(), request.boundary.policies.gamma};
+    config.borrowed_boundary = request.boundary;
+    config.use_generic_numerical_policy = true;
+    config.numerical_policy = request.numerical_policy;
+    return Initialize(config);
+  }
+
+  /**
    * Admit the borrowed conforming-quad topology plus its complete static
    * physical-boundary policy coverage.
    * Device setup remains in the existing engine; locally-invalid requests are
@@ -642,7 +784,7 @@ private:
     active_facade_incarnation_ = 0;
   }
 
-  using config_descriptor = std::array<unsigned char, 256>;
+  using config_descriptor = std::array<unsigned char, 1024>;
   using policy_descriptor = std::array<unsigned char, 2048>;
   using topology_descriptor = std::array<unsigned char, 128>;
 
@@ -709,8 +851,50 @@ private:
       AppendConfigValue(local, cursor, complete,
                         config.borrowed_initial.components);
       AppendConfigValue(local, cursor, complete,
+                        config.borrowed_initial_true_trace.components);
+      append_bool(config.borrowed_initial_true_trace.coefficients != nullptr);
+      AppendConfigValue(local, cursor, complete,
                         config.borrowed_source.components);
       append_bool(config.borrowed_source.coefficients != nullptr);
+      append_bool(config.use_generic_numerical_policy);
+      if (config.use_generic_numerical_policy)
+      {
+        const auto& policy = config.numerical_policy;
+        AppendConfigValue(local, cursor, complete,
+                          policy.volume_projection_quadrature_order);
+        AppendConfigValue(local, cursor, complete,
+                          policy.true_trace_projection_quadrature_order);
+        AppendConfigValue(local, cursor, complete,
+                          policy.conventional_assembly_quadrature_order);
+        AppendConfigValue(local, cursor, complete,
+                          policy.igr_assembly_quadrature_order);
+        AppendConfigValue(local, cursor, complete,
+                          policy.audit_quadrature_order);
+        AppendConfigValue(local, cursor, complete,
+                          policy.observable_quadrature_order);
+        AppendConfigValue(local, cursor, complete,
+                          policy.maximum_nonlinear_updates);
+        AppendConfigValue(local, cursor, complete,
+                          policy.maximum_linear_iterations);
+        AppendConfigValue(local, cursor, complete,
+                          policy.maximum_line_search_trials);
+        AppendConfigValue(local, cursor, complete,
+                          policy.nonlinear_relative_tolerance);
+        AppendConfigValue(local, cursor, complete,
+                          policy.linear_relative_tolerance);
+        AppendConfigValue(local, cursor, complete,
+                          policy.true_residual_relative_tolerance);
+        AppendConfigValue(local, cursor, complete,
+                          policy.conservation_relative_tolerance);
+        AppendConfigValue(local, cursor, complete,
+                          policy.armijo_constant);
+        AppendConfigValue(local, cursor, complete,
+                          policy.stabilization.kind);
+        AppendConfigValue(local, cursor, complete,
+                          policy.stabilization.alpha);
+        AppendConfigValue(local, cursor, complete,
+                          policy.stabilization.beta);
+      }
     }
     append_bool(config.capture_oracle);
     append_bool(config.force_private_scientific_gate_failure);
@@ -739,7 +923,10 @@ private:
     // The exact fixed-size policy consensus is always run in true mode.  Only
     // a nonempty policy table activates the physical-boundary identity ABI;
     // this leaves existing borrowed periodic callers unchanged.
-    if (!PolicyTableConsensus(config)) return false;
+    if (!PolicyTableConsensus(config) ||
+        !generic::ExactEulerBoundaryPolicyConsensus(
+            MPI_COMM_WORLD, config.borrowed_boundary.policies))
+      return false;
     return config.borrowed_boundary_policies.count == 0 ||
         TopologyIdentityConsensus(config);
   }
@@ -791,6 +978,7 @@ private:
       cursor += sizeof(value_type);
     };
     append(config.borrowed_boundary_policies.count);
+    append(config.borrowed_boundary_policies.gamma);
     const bool readable = config.borrowed_boundary_policies.policies != nullptr &&
         config.borrowed_boundary_policies.count <=
             cuda_w8a::maximum_static_boundary_policies;
@@ -805,6 +993,7 @@ private:
       const std::uint8_t kind = static_cast<std::uint8_t>(policy.kind);
       append(kind);
       for (const double reference : policy.reference_state) append(reference);
+      append(policy.pressure_out);
     }
     minimum = local;
     maximum = local;
@@ -855,6 +1044,10 @@ private:
         config.borrowed_initial.coefficients == nullptr &&
         config.borrowed_initial.scalar_count == 0 &&
         config.borrowed_initial.components == cuda_w8a::conserved_components &&
+        config.borrowed_initial_true_trace.coefficients == nullptr &&
+        config.borrowed_initial_true_trace.scalar_count == 0 &&
+        config.borrowed_initial_true_trace.components ==
+            cuda_w8a::conserved_components &&
         config.borrowed_source.coefficients == nullptr &&
         config.borrowed_source.scalar_count == 0 &&
         config.borrowed_source.components == cuda_w8a::conserved_components;
@@ -869,6 +1062,20 @@ private:
               config.borrowed_source.scalar_count != 0 &&
               config.borrowed_source.components == cuda_w8a::conserved_components))
         : empty_borrowed_fields;
+    const bool initial_trace_abi = config.use_borrowed_host_inputs
+        ? (config.borrowed_initial_true_trace.coefficients == nullptr &&
+           config.borrowed_initial_true_trace.scalar_count == 0 &&
+           config.borrowed_initial_true_trace.components ==
+               cuda_w8a::conserved_components) ||
+            (config.borrowed_initial_true_trace.coefficients != nullptr &&
+             config.borrowed_initial_true_trace.scalar_count != 0 &&
+             config.borrowed_initial_true_trace.components ==
+                 cuda_w8a::conserved_components)
+        : true;
+    const bool numerical_policy_abi = config.use_generic_numerical_policy
+        ? config.use_borrowed_host_inputs &&
+            generic::ValidEulerHdgNumericalPolicy(config.numerical_policy)
+        : true;
     const bool boundary_policy_abi = config.use_borrowed_host_inputs
         ? cuda_w8a::ValidateCudaStaticBoundaryPolicyTable(
               config.borrowed_boundary_policies)
@@ -888,6 +1095,7 @@ private:
     bool local = config.use_borrowed_topology && config.borrowed_mesh != nullptr &&
         config.borrowed_communicator != MPI_COMM_NULL &&
         borrowed_data_abi &&
+        initial_trace_abi && numerical_policy_abi &&
         boundary_policy_abi &&
         borrowed_topology_identity &&
         MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS &&
@@ -904,8 +1112,8 @@ private:
         std::isfinite(config.dt) && config.dt > 0.0 &&
         (config.use_borrowed_host_inputs ||
          std::memcmp(&config.dt, &cuda_w8a::fixed_dt, sizeof(double)) == 0) &&
-        (config.order == cuda_w8a::smoke_polynomial_order ||
-         config.order == cuda_w8a::functional_polynomial_order) &&
+        config.order >= generic::minimum_polynomial_order &&
+        config.order <= generic::maximum_polynomial_order &&
         config.mesh_n >= 0;
     long long local_face_measure = 0;
     long long local_physical_faces = 0;
