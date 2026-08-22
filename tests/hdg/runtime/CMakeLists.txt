@@ -26,12 +26,16 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_common)
   _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_app_contract)
   _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_app_cpu)
-  _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_runtime_cpu)
+  _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_generic_cpu)
+  _dg_igr_require_hdg_cxx17_target(dg_igr_hdg_sc25_oracle_cpu)
+  dg_igr_hdg_require_target_link_closure_absent(
+    dg_igr_hdg_generic_cpu dg_igr_hdg_sc25_oracle_cpu)
 
   if(MFEM_USE_CUDA)
     foreach(_dg_igr_hdg_cxx_archive IN ITEMS
             dg_igr_hdg_runtime_common
-            dg_igr_hdg_runtime_cpu
+            dg_igr_hdg_generic_cpu
+            dg_igr_hdg_sc25_oracle_cpu
             dg_igr_hdg_auxiliary_cpu
             dg_igr_hdg_runtime_app_cpu)
       get_target_property(_dg_igr_hdg_cxx_archive_resolve

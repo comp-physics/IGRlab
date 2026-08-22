@@ -17,7 +17,7 @@ target_include_directories(dg_igr_hdg_runtime_cpu_test
 
 target_link_libraries(dg_igr_hdg_runtime_cpu_test
   PRIVATE
-    dg_igr_hdg_runtime_cpu
+    dg_igr_hdg_generic_cpu
     mfem
     MPI::MPI_CXX)
 
@@ -62,7 +62,7 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
     "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/cpu"
     "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(dg_igr_hdg_runtime_w8c_cpu_serial_test PRIVATE
-    dg_igr_hdg_runtime_cpu
+    dg_igr_hdg_sc25_oracle_cpu
     dg_igr_hdg_auxiliary_cpu
     mfem
     MPI::MPI_CXX)
@@ -91,7 +91,7 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
     "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(
     dg_igr_hdg_runtime_w8c_smooth_transition_cpu_serial_test PRIVATE
-    dg_igr_hdg_runtime_cpu
+    dg_igr_hdg_sc25_oracle_cpu
     dg_igr_hdg_auxiliary_cpu
     mfem
     MPI::MPI_CXX)
@@ -160,7 +160,7 @@ add_executable(dg_igr_hdg_generic_euler_cpu_test
 target_include_directories(dg_igr_hdg_generic_euler_cpu_test PRIVATE
   "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(dg_igr_hdg_generic_euler_cpu_test PRIVATE
-  dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
+  dg_igr_hdg_generic_cpu mfem MPI::MPI_CXX)
 target_compile_options(dg_igr_hdg_generic_euler_cpu_test PRIVATE
   $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
 set_target_properties(dg_igr_hdg_generic_euler_cpu_test PROPERTIES
@@ -191,7 +191,7 @@ add_executable(dg_igr_hdg_traced_scalar_igr_p1_local_test
 target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_local_test PRIVATE
   "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_local_test PRIVATE
-  dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
+  dg_igr_hdg_generic_cpu mfem MPI::MPI_CXX)
 target_compile_options(dg_igr_hdg_traced_scalar_igr_p1_local_test PRIVATE
   $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
 set_target_properties(dg_igr_hdg_traced_scalar_igr_p1_local_test PROPERTIES
@@ -207,7 +207,7 @@ add_executable(dg_igr_hdg_borrowed_p1_dg_interface_layout_test
 target_include_directories(dg_igr_hdg_borrowed_p1_dg_interface_layout_test
   PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PRIVATE
-  dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
+  dg_igr_hdg_generic_cpu mfem MPI::MPI_CXX)
 target_compile_options(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PRIVATE
   $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
 set_target_properties(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PROPERTIES
@@ -245,7 +245,7 @@ endif()
 target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_global_step_test
   PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_global_step_test PRIVATE
-  dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
+  dg_igr_hdg_generic_cpu mfem MPI::MPI_CXX)
 target_compile_options(dg_igr_hdg_traced_scalar_igr_p1_global_step_test PRIVATE
   $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
@@ -330,7 +330,7 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
 
   target_link_libraries(dg_igr_hdg_sc25_scalar_igr_cpu_test
     PRIVATE
-      dg_igr_hdg_runtime_cpu
+      dg_igr_hdg_sc25_oracle_cpu
       dg_igr_hdg_auxiliary_cpu
       mfem
       MPI::MPI_CXX)

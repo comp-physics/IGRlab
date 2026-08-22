@@ -233,7 +233,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
   target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_private_cuda_test
     PRIVATE
       dg_igr_hdg_runtime_cuda
-      dg_igr_hdg_runtime_cpu
+      dg_igr_hdg_generic_cpu
       dg_igr_hdg_auxiliary_cpu
       mfem
       MPI::MPI_CXX)
@@ -271,7 +271,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
   target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_local_cuda_test
     PRIVATE
       dg_igr_hdg_runtime_cuda
-      dg_igr_hdg_runtime_cpu
+      dg_igr_hdg_generic_cpu
       dg_igr_hdg_auxiliary_cpu
       mfem
       MPI::MPI_CXX)
@@ -313,7 +313,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
   target_link_libraries(dg_igr_hdg_sc25_scalar_igr_cuda_rank1_test
     PRIVATE
       dg_igr_hdg_runtime_cuda
-      dg_igr_hdg_runtime_cpu
+      dg_igr_hdg_sc25_oracle_cpu
       dg_igr_hdg_auxiliary_cpu
       mfem
       MPI::MPI_CXX)
