@@ -30,7 +30,15 @@ using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
+using dg::hdg::runtime::BorrowedCudaRank1OneGpuRuntimeSelection;
+using dg::hdg::runtime::BorrowedCudaRank2OneGpuHostStagedRuntimeSelection;
+using dg::hdg::runtime::cuda_w8a::CudaConfig;
 using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
+using dg::hdg::runtime::cuda_w8a::CudaPrecommitSnapshot;
+using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
+using dg::hdg::runtime::cuda_w8a::CudaRunEvidence;
+using dg::hdg::runtime::cuda_w8a::CudaStepEvidence;
+using dg::hdg::runtime::cuda_w8a::PersistentCudaSmoothEulerEngine;
 
 constexpr int components = dg::hdg::generic::euler_2d_conserved_components;
 constexpr std::uint32_t cuda_capabilities =
@@ -251,6 +259,110 @@ EulerHdgRequest MakeRequest(
       : dg::hdg::generic::RegularizationSelection{
             RegularizationKind::none, 0.0, 0.0};
   return request;
+}
+
+template <typename Selection>
+bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
+                                 const int ranks,
+                                 const int order)
+{
+  CudaConfig config{};
+  config.order = order;
+  config.mesh_n = 0;
+  config.requested_device = 0;
+  config.expected_rank_count = ranks;
+  config.require_host_staged_rank2 = ranks == 2;
+  config.use_borrowed_topology = true;
+  config.borrowed_mesh = const_cast<mfem::ParMesh*>(request.mesh);
+  config.borrowed_communicator = request.communicator;
+  config.use_borrowed_host_inputs = true;
+  config.borrowed_initial = {
+      request.initial_state.data,
+      request.initial_state.scalar_count / static_cast<std::size_t>(components),
+      request.initial_state.components};
+  config.borrowed_initial_true_trace = {
+      request.initial_true_trace.data,
+      request.initial_true_trace.scalar_count /
+          static_cast<std::size_t>(components),
+      request.initial_true_trace.components};
+  config.borrowed_source = {
+      request.source.data,
+      request.source.scalar_count / static_cast<std::size_t>(components),
+      request.source.components};
+  config.borrowed_boundary = request.boundary;
+  config.use_generic_numerical_policy = true;
+  config.numerical_policy = request.numerical_policy;
+
+  PersistentCudaSmoothEulerEngine<Selection> engine(config);
+  CudaRunEvidence initialization{};
+  std::array<double, 6> jacobian_errors{};
+  constexpr double jacobian_tolerance = 5.0e-5;
+  const bool initialized = engine.Initialize(initialization);
+  const bool jacobian = initialized &&
+      engine.VerifyBorrowedEulerAssemblerJacobianForTests(
+          jacobian_tolerance, jacobian_errors);
+
+  CudaPrecommitSnapshot snapshot{};
+  CudaStepEvidence step{};
+  constexpr double dt = 1.0e-5;
+  const bool prepared = jacobian &&
+      engine.PrepareStep(false, dt, snapshot, step);
+  double conservation_error = std::numeric_limits<double>::infinity();
+  double conservation_relative_error =
+      std::numeric_limits<double>::infinity();
+  const bool conservation = prepared &&
+      engine.VerifyPreparedIgrConservationForTests(
+          conservation_error, conservation_relative_error) &&
+      std::isfinite(conservation_error) &&
+      std::isfinite(conservation_relative_error) &&
+      conservation_relative_error <=
+          config.numerical_policy.conservation_relative_tolerance;
+
+  CudaPreparedOutputMetadataV1 output{};
+  const bool staged = conservation &&
+      engine.StagePreparedOutputMetadata(output, step);
+  const bool acknowledged = staged && engine.MarkOutputStaged(output);
+  const bool commit_prepared = acknowledged &&
+      engine.PrepareCommit(output, step);
+  const bool provisional = commit_prepared &&
+      engine.CommitPrepared(output, step);
+  const bool committed = provisional && engine.FinalizeCommit(output, step);
+  const bool passed = committed && output.successful_commit;
+  if (!passed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA IGR algebra qualification failed order=" << order
+                << " initialized=" << initialized
+                << " jacobian=" << jacobian
+                << " prepared=" << prepared
+                << " conservation=" << conservation
+                << " conservation_error=" << conservation_error
+                << " conservation_relative_error="
+                << conservation_relative_error << " jacobian_errors=";
+      for (const double error : jacobian_errors) std::cerr << ' ' << error;
+      std::cerr << '\n';
+    }
+  }
+  return All(passed, request.communicator);
+}
+
+bool CheckIgrAlgebra(const int order, const int ranks)
+{
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::empty);
+  BoundaryContext boundary{};
+  const EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::igr);
+  return ranks == 1
+      ? CheckIgrAlgebraForSelection<
+            BorrowedCudaRank1OneGpuRuntimeSelection>(request, ranks, order)
+      : CheckIgrAlgebraForSelection<
+            BorrowedCudaRank2OneGpuHostStagedRuntimeSelection>(
+                request, ranks, order);
 }
 
 bool SameValues(const std::vector<double>& left,
@@ -562,6 +674,7 @@ int main(int argc, char* argv[])
   std::vector<double> conventional_zero_source_state;
   std::vector<double> igr_empty_source_state;
   std::vector<double> igr_zero_source_state;
+  const bool igr_algebra = order > 0 && CheckIgrAlgebra(order, ranks);
   const bool conventional_periodic = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::nonzero,
       conventional_periodic_state);
@@ -597,13 +710,15 @@ int main(int argc, char* argv[])
                       conventional_physical_state) &&
       DifferentValues(igr_periodic_state, igr_physical_state);
   const bool passed = (ranks == 1 || ranks == 2) && All(
-      admission && conventional_periodic && conventional_physical &&
+      admission && igr_algebra &&
+      conventional_periodic && conventional_physical &&
       igr_periodic && igr_physical && boundary_effect && source_equivalence);
   if (!passed)
   {
     std::cerr << "generic CUDA Euler-extension qualification failed rank="
               << rank << " ranks=" << ranks << " order=" << order
               << " admission=" << admission
+              << " igr_algebra=" << igr_algebra
               << " conventional_periodic=" << conventional_periodic
               << " conventional_physical=" << conventional_physical
               << " igr_periodic=" << igr_periodic
