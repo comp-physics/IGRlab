@@ -188,15 +188,6 @@ __device__ inline double InteriorValue(const double* state,
   return state[InteriorIndex(element, component, scalar_node)];
 }
 
-__device__ inline double TraceValue(const scalar_detail::DeviceView& view,
-                                    const double* state,
-                                    const int element,
-                                    const int local_row)
-{
-  const int map = element * nt + local_row;
-  return static_cast<double>(view.local_trace_sign[map]) *
-      state[view.local_trace_to_true[map]];
-}
 
 __device__ inline double EvaluateInterior(const double* state,
                                           const int element,
@@ -211,20 +202,6 @@ __device__ inline double EvaluateInterior(const double* state,
   return value;
 }
 
-__device__ inline double EvaluateDerivative(const double* state,
-                                            const int element,
-                                            const int component,
-                                            const double* derivative,
-                                            const int direction)
-{
-  double value = 0.0;
-  for (int a = 0; a < ns; ++a)
-  {
-    value += InteriorValue(state, element, component, a) *
-        derivative[a * scalar::dimension + direction];
-  }
-  return value;
-}
 
 __device__ inline bool Primitive(const double u[4], double& pressure,
                                  double velocity[2])
@@ -242,19 +219,6 @@ __device__ inline bool Primitive(const double u[4], double& pressure,
       DeviceFinite(velocity[0]) && DeviceFinite(velocity[1]);
 }
 
-__device__ inline bool Admissible(const double u[4])
-{
-  double pressure = 0.0;
-  double velocity[2]{};
-  if (!Primitive(u, pressure, velocity) || u[0] < 1.0e-8 ||
-      pressure < 1.0e-8)
-  {
-    return false;
-  }
-  const double speed = hypot(velocity[0], velocity[1]);
-  const double sound = sqrt(gamma_value * pressure / u[0]);
-  return DeviceFinite(speed) && DeviceFinite(sound) && speed + sound < 2.5;
-}
 
 __device__ inline bool FiniteConservativeState(const double u[4])
 {
@@ -262,63 +226,6 @@ __device__ inline bool FiniteConservativeState(const double u[4])
       DeviceFinite(u[2]) && DeviceFinite(u[3]);
 }
 
-__device__ inline bool EulerSigmaFlux(const double u[4], const double sigma,
-                                      const double normal[2],
-                                      double flux[4], double jacobian[4][5])
-{
-  double pressure = 0.0;
-  double velocity[2]{};
-  if (!Primitive(u, pressure, velocity) || !DeviceFinite(sigma))
-  {
-    return false;
-  }
-  const double rho = u[0];
-  const double mx = u[1];
-  const double my = u[2];
-  const double energy = u[3];
-  const double un = velocity[0] * normal[0] + velocity[1] * normal[1];
-  flux[0] = mx * normal[0] + my * normal[1];
-  flux[1] = mx * un + (pressure + sigma) * normal[0];
-  flux[2] = my * un + (pressure + sigma) * normal[1];
-  flux[3] = (energy + pressure + sigma) * un;
-  for (int row = 0; row < 4; ++row)
-    for (int column = 0; column < 5; ++column)
-    {
-      jacobian[row][column] = 0.0;
-    }
-  const double gm1 = gamma_value - 1.0;
-  const double momentum_square = mx * mx + my * my;
-  const double pressure_derivative[4]{
-      0.5 * gm1 * momentum_square / (rho * rho),
-      -gm1 * mx / rho, -gm1 * my / rho, gm1};
-  const double normal_velocity_derivative[4]{
-      -un / rho, normal[0] / rho, normal[1] / rho, 0.0};
-  jacobian[0][1] = normal[0];
-  jacobian[0][2] = normal[1];
-  for (int column = 0; column < 4; ++column)
-  {
-    jacobian[1][column] = (column == 1 ? un : 0.0) +
-        mx * normal_velocity_derivative[column] +
-        pressure_derivative[column] * normal[0];
-    jacobian[2][column] = (column == 2 ? un : 0.0) +
-        my * normal_velocity_derivative[column] +
-        pressure_derivative[column] * normal[1];
-    jacobian[3][column] =
-        ((column == 3 ? 1.0 : 0.0) + pressure_derivative[column]) * un +
-        (energy + pressure + sigma) * normal_velocity_derivative[column];
-  }
-  jacobian[1][4] = normal[0];
-  jacobian[2][4] = normal[1];
-  jacobian[3][4] = un;
-  bool finite = DeviceFinite(flux[0]) && DeviceFinite(flux[1]) &&
-      DeviceFinite(flux[2]) && DeviceFinite(flux[3]);
-  for (int row = 0; row < 4; ++row)
-    for (int column = 0; column < 5; ++column)
-    {
-      finite = finite && DeviceFinite(jacobian[row][column]);
-    }
-  return finite;
-}
 
 __device__ inline void SmoothState(const double x, const double y,
                                    double value[4])
