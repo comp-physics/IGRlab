@@ -5235,7 +5235,7 @@ bool detail::CpuNumericsCore::AdmitBorrowedEulerOperation(
   const bool known = local_operation >=
           static_cast<int>(CpuBorrowedEulerOperation::prepare) &&
       local_operation <= static_cast<int>(
-          CpuBorrowedEulerOperation::export_prepared_grid_function);
+          CpuBorrowedEulerOperation::observe_committed);
   return state.CollectiveAll(
       state.initialized && state.IsBorrowed() &&
       minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS && known &&
@@ -5356,6 +5356,156 @@ bool detail::CpuNumericsCore::CommittedBorrowedEulerDiagnostics(
   }
   return implementation_->ScanBorrowedEulerState(
       *committed, maximum_wave_speed, backend_stable_dt);
+}
+
+bool detail::CpuNumericsCore::ObserveCommittedBorrowedEuler(
+    generic::HdgEulerCommittedObservables& observables) noexcept
+{
+  observables = {};
+  if (!implementation_) { return false; }
+  Implementation& state = *implementation_;
+  const CpuSlotStorage* const committed = state.Committed();
+  const int quadrature_order = state.borrowed_request
+      ? state.borrowed_request->numerical_policy.observable_quadrature_order
+      : 0;
+  bool local_valid = state.initialized && state.IsBorrowed() &&
+      state.mesh != nullptr && state.interior_space != nullptr && committed &&
+      state.interior_space->GetMesh() == state.mesh &&
+      state.interior_space->GetVDim() == cpu_conserved_components &&
+      state.interior_space->GetOrdering() == mfem::Ordering::byNODES &&
+      committed->interior.size() ==
+          static_cast<std::size_t>(state.interior_space->GetVSize()) &&
+      quadrature_order > 0 && Finite(committed->interior);
+  if (!state.CollectiveAll(local_valid)) { return false; }
+
+  std::array<double, 8> local_sums{};
+  std::array<double, 2> local_minima{{
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity()}};
+  try
+  {
+    for (int element_index = 0;
+         element_index < state.mesh->GetNE() && local_valid; ++element_index)
+    {
+      const mfem::FiniteElement* const element =
+          state.interior_space->GetFE(element_index);
+      mfem::ElementTransformation* const transformation =
+          state.mesh->GetElementTransformation(element_index);
+      if (!element || !transformation) { local_valid = false; break; }
+      const int scalar_dofs = element->GetDof();
+      if (scalar_dofs <= 0) { local_valid = false; break; }
+      mfem::Array<int> vdofs;
+      state.interior_space->GetElementVDofs(element_index, vdofs);
+      if (vdofs.Size() != scalar_dofs * cpu_conserved_components)
+      {
+        local_valid = false;
+        break;
+      }
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          element->GetGeomType(), quadrature_order);
+      mfem::Vector shape(scalar_dofs);
+      for (int point_index = 0;
+           point_index < rule.GetNPoints() && local_valid; ++point_index)
+      {
+        const mfem::IntegrationPoint& point = rule.IntPoint(point_index);
+        transformation->SetIntPoint(&point);
+        element->CalcShape(point, shape);
+        const double weight = point.weight * transformation->Weight();
+        if (!Finite(weight) || !(weight > 0.0) || !Finite(shape))
+        {
+          local_valid = false;
+          break;
+        }
+        State conservative{};
+        for (int component = 0; component < cpu_conserved_components;
+             ++component)
+        {
+          for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+          {
+            double sign = 1.0;
+            const int dof = Decode(vdofs[ByNodes(scalar, scalar_dofs,
+                                                  component)], sign);
+            if (dof < 0 || dof >= state.interior_space->GetVSize() ||
+                !Finite(sign))
+            {
+              local_valid = false;
+              break;
+            }
+            conservative[static_cast<std::size_t>(component)] +=
+                shape[scalar] * sign * committed->interior[
+                    static_cast<std::size_t>(dof)];
+          }
+          if (!local_valid) { break; }
+        }
+        if (!local_valid || !Finite(conservative) || conservative[0] == 0.0)
+        {
+          local_valid = false;
+          break;
+        }
+        const double kinetic = 0.5 *
+            (conservative[1] * conservative[1] +
+             conservative[2] * conservative[2]) / conservative[0];
+        const double pressure = (cpu_gamma - 1.0) *
+            (conservative[3] - kinetic);
+        if (!Finite(pressure)) { local_valid = false; break; }
+        for (int component = 0; component < cpu_conserved_components;
+             ++component)
+        {
+          const double integral = weight * conservative[component];
+          const double squared = integral * conservative[component];
+          if (!Finite(integral) || !Finite(squared))
+          {
+            local_valid = false;
+            break;
+          }
+          local_sums[static_cast<std::size_t>(component)] += integral;
+          local_sums[static_cast<std::size_t>(
+              cpu_conserved_components + component)] += squared;
+        }
+        if (!Finite(local_sums)) { local_valid = false; break; }
+        local_minima[0] = std::min(local_minima[0], conservative[0]);
+        local_minima[1] = std::min(local_minima[1], pressure);
+      }
+    }
+  }
+  catch (...)
+  {
+    local_valid = false;
+  }
+  if (!state.CollectiveAll(local_valid)) { return false; }
+
+  std::array<double, 8> global_sums{};
+  std::array<double, 2> global_minima{};
+  const int sums_status = MPI_Allreduce(
+      local_sums.data(), global_sums.data(), static_cast<int>(global_sums.size()),
+      MPI_DOUBLE, MPI_SUM, state.communicator);
+  const int minima_status = MPI_Allreduce(
+      local_minima.data(), global_minima.data(),
+      static_cast<int>(global_minima.size()), MPI_DOUBLE, MPI_MIN,
+      state.communicator);
+  local_valid = sums_status == MPI_SUCCESS && minima_status == MPI_SUCCESS &&
+      Finite(global_sums) && Finite(global_minima);
+  generic::HdgEulerCommittedObservables candidate{};
+  candidate.available = local_valid;
+  candidate.quadrature_order = quadrature_order;
+  for (int component = 0; component < cpu_conserved_components && local_valid;
+       ++component)
+  {
+    candidate.conserved_integrals[static_cast<std::size_t>(component)] =
+        global_sums[static_cast<std::size_t>(component)];
+    const double squared = global_sums[static_cast<std::size_t>(
+        cpu_conserved_components + component)];
+    if (squared < 0.0) { local_valid = false; break; }
+    candidate.conserved_l2_norms[static_cast<std::size_t>(component)] =
+        std::sqrt(squared);
+    local_valid = Finite(candidate.conserved_l2_norms[
+        static_cast<std::size_t>(component)]);
+  }
+  candidate.minimum_density = global_minima[0];
+  candidate.minimum_pressure = global_minima[1];
+  if (!state.CollectiveAll(local_valid)) { return false; }
+  observables = candidate;
+  return true;
 }
 
 bool detail::CpuNumericsCore::PrepareBorrowedEuler(

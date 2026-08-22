@@ -714,7 +714,8 @@ enum class CpuBorrowedEulerOperation : unsigned char
   commit = 1,
   abort = 2,
   export_prepared_buffer = 3,
-  export_prepared_grid_function = 4
+  export_prepared_grid_function = 4,
+  observe_committed = 5
 };
 
 class CpuNumericsCore
@@ -748,6 +749,9 @@ public:
                            double&) noexcept;
   /** Scan the committed borrowed interior and trace for CFL diagnostics. */
   bool CommittedBorrowedEulerDiagnostics(double&, double&) noexcept;
+  /** Fresh collective volume-only observables for the committed slot. */
+  bool ObserveCommittedBorrowedEuler(
+      generic::HdgEulerCommittedObservables&) noexcept;
   /** Discard exactly one active prepared candidate. */
   bool AbortBorrowedEuler(std::uint64_t,
                           const StateCoordinates&) noexcept;

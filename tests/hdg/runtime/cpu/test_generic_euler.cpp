@@ -689,6 +689,130 @@ bool CheckPreparedSessionLifecycle()
   return true;
 }
 
+bool SameCommittedObservables(
+    const dg::hdg::generic::HdgEulerCommittedObservables& left,
+    const dg::hdg::generic::HdgEulerCommittedObservables& right)
+{
+  return left.available == right.available &&
+      left.coordinates.time == right.coordinates.time &&
+      left.coordinates.dt == right.coordinates.dt &&
+      left.coordinates.step == right.coordinates.step &&
+      left.coordinates.generation == right.coordinates.generation &&
+      left.quadrature_order == right.quadrature_order &&
+      left.conserved_integrals == right.conserved_integrals &&
+      left.conserved_l2_norms == right.conserved_l2_norms &&
+      left.minimum_density == right.minimum_density &&
+      left.minimum_pressure == right.minimum_pressure;
+}
+
+bool CheckCommittedObservables()
+{
+  const dg::hdg::generic::HdgEulerCommittedObservables unavailable{};
+  if (dg::hdg::generic::IsValidHdgEulerCommittedObservables(unavailable, 0))
+  {
+    return false;
+  }
+  GenericEulerHdgCpuSession uninitialized;
+  if (uninitialized.ObserveCommitted().available) { return false; }
+
+  mfem::ParMesh mesh = MakeBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                        0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                       0.00, 0.00, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  if (request.numerical_policy.observable_quadrature_order != 4) { return false; }
+  request.numerical_policy.observable_quadrature_order = 9;
+  GenericEulerHdgCpuSession session;
+  if (session.Initialize(request).status !=
+      GenericEulerCpuSessionStatus::initialized)
+  {
+    return false;
+  }
+  const auto before_coordinates = session.coordinates();
+  const auto before = session.ObserveCommitted();
+  if (!before.available || before.quadrature_order != 9 ||
+      !dg::hdg::generic::IsValidHdgEulerCommittedObservables(
+          before, session.capabilities()) ||
+      before.coordinates.time != before_coordinates.time ||
+      before.coordinates.dt != before_coordinates.dt ||
+      before.coordinates.step != before_coordinates.step ||
+      before.coordinates.generation != before_coordinates.generation)
+  {
+    return false;
+  }
+  std::vector<double> committed_before(fields.initial.size());
+  if (!session.ExportCommittedInterior(
+          {committed_before.data(), committed_before.size()}))
+  {
+    return false;
+  }
+
+  GenericEulerCpuPreparedStep prepared;
+  if (session.Prepare(0.005, prepared).status !=
+          GenericEulerCpuSessionStatus::prepared ||
+      !SameCommittedObservables(before, session.ObserveCommitted()) ||
+      session.coordinates().generation != before_coordinates.generation)
+  {
+    return false;
+  }
+  std::vector<double> committed_during_prepare(committed_before.size());
+  if (!session.ExportCommittedInterior(
+          {committed_during_prepare.data(), committed_during_prepare.size()}) ||
+      committed_during_prepare != committed_before ||
+      session.Abort(std::move(prepared)).status !=
+          GenericEulerCpuSessionStatus::aborted ||
+      !SameCommittedObservables(before, session.ObserveCommitted()))
+  {
+    return false;
+  }
+
+  if (session.Advance(0.007).status != GenericEulerCpuSessionStatus::advanced)
+  {
+    return false;
+  }
+  std::vector<double> committed_after_before_observe(committed_before.size());
+  if (!session.ExportCommittedInterior(
+          {committed_after_before_observe.data(),
+           committed_after_before_observe.size()}))
+  {
+    return false;
+  }
+  const auto after = session.ObserveCommitted();
+  std::vector<double> committed_after(committed_before.size());
+  return after.available && after.quadrature_order == 9 &&
+      after.coordinates.step == 1 && after.coordinates.generation == 1 &&
+      after.coordinates.dt == 0.007 && after.coordinates.time == 0.007 &&
+      dg::hdg::generic::IsValidHdgEulerCommittedObservables(
+          after, session.capabilities()) &&
+      session.ExportCommittedInterior(
+          {committed_after.data(), committed_after.size()}) &&
+      committed_after == committed_after_before_observe &&
+      session.coordinates().step == after.coordinates.step;
+}
+
+bool CheckCommittedObservablesZeroOwnedRank()
+{
+  mfem::ParMesh mesh = MakeRankZeroOwnedBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                        0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  GenericEulerHdgCpuSession session;
+  if (session.Initialize(Request(mesh, 1, boundary, fields)).status !=
+      GenericEulerCpuSessionStatus::initialized)
+  {
+    return false;
+  }
+  const auto observables = session.ObserveCommitted();
+  return observables.available &&
+      dg::hdg::generic::IsValidHdgEulerCommittedObservables(
+          observables, session.capabilities());
+}
+
 bool CheckPeriodicAnnotationsRemainTraceCouplings()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
@@ -1118,6 +1242,9 @@ int main(int argc, char* argv[])
   const bool trace_restriction = CheckBorrowedTraceRestrictsInterior();
   const bool orders = CheckOrdersAndDeterminism();
   const bool prepared_lifecycle = CheckPreparedSessionLifecycle();
+  const bool committed_observables = CheckCommittedObservables();
+  const bool committed_observables_zero_owned =
+      CheckCommittedObservablesZeroOwnedRank();
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
   const bool private_igr = CheckPrivateTracedScalarIgrLifecycle();
   const bool private_igr_convergence =
@@ -1136,6 +1263,7 @@ int main(int argc, char* argv[])
   const bool callback_failure = CheckAcceptedRequestRankLocalCallbackFailure();
   const bool local = boundary_semantics && trace_restriction && orders &&
       prepared_lifecycle &&
+      committed_observables && committed_observables_zero_owned &&
       periodic && private_igr && private_igr_zero_local &&
       private_igr_convergence &&
       private_igr_numerical_policy &&
@@ -1157,6 +1285,9 @@ int main(int argc, char* argv[])
               << " private_igr_zero_local=" << private_igr_zero_local
               << " private_igr_initialization=" << private_igr_initialization
               << " prepared_lifecycle=" << prepared_lifecycle
+              << " committed_observables=" << committed_observables
+              << " committed_observables_zero_owned="
+              << committed_observables_zero_owned
               << " dynamic_tau=" << dynamic_tau
               << " boundary_picard=" << boundary_picard
               << " zero_owned=" << zero_owned

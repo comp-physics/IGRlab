@@ -8,6 +8,8 @@
  * operator, output writer, restart payload, or virtual dispatch surface.
  */
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cmath>
 #include <limits>
@@ -21,7 +23,8 @@ enum class HdgEulerSessionCapability : std::uint32_t
   prepared_commit = 1u << 0,
   prepared_output = 1u << 1,
   committed_cfl_diagnostics = 1u << 2,
-  generic_borrowed_inputs = 1u << 3
+  generic_borrowed_inputs = 1u << 3,
+  committed_observables = 1u << 4
 };
 
 constexpr std::uint32_t HdgEulerSessionCapabilityBit(
@@ -55,6 +58,21 @@ struct HdgEulerCommittedDiagnostics
   std::uint64_t wave_generation = 0;
   double maximum_wave_speed = 0.0;
   double backend_stable_dt = std::numeric_limits<double>::quiet_NaN();
+};
+
+/**
+ * Caller-triggered collective summary of the committed volume state.  This
+ * is a single fresh snapshot, never a cached or per-step history record.
+ */
+struct HdgEulerCommittedObservables
+{
+  bool available = false;
+  HdgEulerSessionCoordinates coordinates{};
+  int quadrature_order = 0;
+  std::array<double, 4> conserved_integrals{};
+  std::array<double, 4> conserved_l2_norms{};
+  double minimum_density = 0.0;
+  double minimum_pressure = 0.0;
 };
 
 enum class HdgEulerSessionStatus : std::uint8_t
@@ -110,12 +128,36 @@ inline bool IsValidHdgEulerCommittedDiagnostics(
       std::isnan(diagnostics.backend_stable_dt);
 }
 
+inline bool IsValidHdgEulerCommittedObservables(
+    const HdgEulerCommittedObservables observables,
+    const std::uint32_t capabilities) noexcept
+{
+  return observables.available &&
+      HasHdgEulerSessionCapabilities(
+          capabilities, HdgEulerSessionCapabilityBit(
+                            HdgEulerSessionCapability::committed_observables)) &&
+      IsValidHdgEulerSessionCoordinates(observables.coordinates) &&
+      observables.quadrature_order > 0 &&
+      std::all_of(observables.conserved_integrals.begin(),
+                  observables.conserved_integrals.end(),
+                  [](const double value) { return std::isfinite(value); }) &&
+      std::all_of(observables.conserved_l2_norms.begin(),
+                  observables.conserved_l2_norms.end(),
+                  [](const double value)
+                  { return std::isfinite(value) && value >= 0.0; }) &&
+      std::isfinite(observables.minimum_density) &&
+      std::isfinite(observables.minimum_pressure);
+}
+
 static_assert(std::is_standard_layout<HdgEulerSessionCoordinates>::value &&
                   std::is_trivially_copyable<HdgEulerSessionCoordinates>::value,
               "generic HDG session coordinates must remain POD");
 static_assert(std::is_standard_layout<HdgEulerCommittedDiagnostics>::value &&
                   std::is_trivially_copyable<HdgEulerCommittedDiagnostics>::value,
               "generic HDG committed diagnostics must remain POD");
+static_assert(std::is_standard_layout<HdgEulerCommittedObservables>::value &&
+                  std::is_trivially_copyable<HdgEulerCommittedObservables>::value,
+              "generic HDG committed observables must remain POD");
 static_assert(std::is_standard_layout<HdgEulerSessionResult>::value &&
                   std::is_trivially_copyable<HdgEulerSessionResult>::value,
               "generic HDG session result must remain POD");
