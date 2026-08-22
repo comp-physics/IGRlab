@@ -92,6 +92,55 @@ bool TestProjectionAndGenericImport()
       dg::hdg::generic::IsValidField(imported, true);
 }
 
+bool TestIndependentTrueTraceProjection()
+{
+  mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
+      2, 1, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh);
+  mfem::DG_Interface_FECollection collection(
+      1, 2, mfem::FiniteElement::VALUE, mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace trace_space(
+      &mesh, &collection, dg_sim::hdg::hdg_euler_2d_components,
+      mfem::Ordering::byNODES);
+  mfem::ParGridFunction local_trace(&trace_space);
+  mfem::Vector true_trace;
+  mfem::Vector values(dg_sim::hdg::hdg_euler_2d_components);
+  values(0) = 1.0;
+  values(1) = -2.0;
+  values(2) = 3.5;
+  values(3) = 11.0;
+  mfem::VectorConstantCoefficient initial_condition(values);
+
+  if (!dg_sim::hdg::ProjectEulerTrueTraceCoefficientL2(
+          trace_space, local_trace, true_trace, initial_condition, 5) ||
+      true_trace.Size() != trace_space.GetTrueVSize() ||
+      true_trace.Size() <= 0 || true_trace.CheckFinite() != 0)
+  {
+    return false;
+  }
+  const int scalar_true_dofs =
+      true_trace.Size() / dg_sim::hdg::hdg_euler_2d_components;
+  if (scalar_true_dofs <= 0 ||
+      true_trace.Size() !=
+          scalar_true_dofs * dg_sim::hdg::hdg_euler_2d_components)
+  {
+    return false;
+  }
+  for (int component = 0;
+       component < dg_sim::hdg::hdg_euler_2d_components; ++component)
+  {
+    for (int scalar = 0; scalar < scalar_true_dofs; ++scalar)
+    {
+      if (std::abs(true_trace[component * scalar_true_dofs + scalar] -
+                   values[component]) > 1.0e-12)
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -101,7 +150,8 @@ int main(int argc, char* argv[])
                 "HDG state I/O must remain nonvirtual.");
 
   const bool passed = AllRanks(TestAssociationAndFourComponents()) &&
-      AllRanks(TestProjectionAndGenericImport());
+      AllRanks(TestProjectionAndGenericImport()) &&
+      AllRanks(TestIndependentTrueTraceProjection());
   int rank = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   if (!passed && rank == 0)

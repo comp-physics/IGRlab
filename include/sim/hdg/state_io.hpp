@@ -203,6 +203,7 @@ inline bool ProjectEulerTrueTraceCoefficientL2(
       }
     }
     if (local_trace.CheckFinite() != 0) { return false; }
+    true_trace.SetSize(trace_space.GetTrueVSize());
     local_trace.ParallelProject(true_trace);
     if (true_trace.Size() != trace_space.GetTrueVSize()) { return false; }
     for (int index = 0; index < true_trace.Size(); ++index)

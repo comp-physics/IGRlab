@@ -26,4 +26,13 @@ if(BUILD_TESTING)
   set_tests_properties(dg_igr_hdg_state_io_rank1 PROPERTIES
     LABELS "hdg;state-io;cpu;rank1"
     TIMEOUT 30)
+  add_test(NAME dg_igr_hdg_state_io_rank2
+    COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
+            ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:dg_igr_hdg_state_io_test>
+            ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(dg_igr_hdg_state_io_rank2 PROPERTIES
+    LABELS "hdg;state-io;cpu;rank2;mpi"
+    PROCESSORS 2
+    TIMEOUT 30)
 endif()
