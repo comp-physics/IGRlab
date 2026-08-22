@@ -723,7 +723,8 @@ bool CheckPrivateTracedScalarIgrConvergenceEvidence()
                                       0.00, 0.00, 0.03, 0.04}};
   BoundaryContext boundary{};
   EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
-  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  request.numerical_policy.stabilization =
+      {RegularizationKind::igr, 0.2, 0.4};
   dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
   if (!core.InitializeBorrowedEuler(request)) return false;
   dg::hdg::runtime::StateCoordinates coordinates{};
