@@ -112,4 +112,22 @@ bool RehashIndependentRank2Checkpoint(
     dg::hdg::runtime::cpu::sc25::PersistentRank2TrajectoryCheckpoint&
         checkpoint) noexcept;
 
+/**
+ * Test-only physical-artifact oracle.  It advances the independent SC25
+ * reference to the requested accepted step, reconstructs every p=1 value at
+ * the VTK points from the public state, and compares that reference with one
+ * scalar-IGR runtime artifact.  It does not call the application VTK writer.
+ */
+bool ValidateIndependentSc25VtkArtifact(
+    dg::hdg::runtime::cpu::sc25::PersistentSc25ScalarIgrCpuFoundation&
+        foundation,
+    const dg::hdg::runtime::cpu::sc25::PersistentTrajectoryState& state,
+    int expected_step, const std::string& path, double tolerance,
+    std::string& failure);
+
+/** Create one deliberately altered scalar-IGR VTK fixture for a negative. */
+bool MakeIndependentSc25VtkArtifactNegative(const std::string& input_path,
+                                             const std::string& output_path,
+                                             std::string& failure);
+
 } // namespace dg_igr_hdg_sc25_cpu_test

@@ -69,6 +69,27 @@ enum class Discretization
   HDG
 };
 
+/// @brief Runtime compute device selection.
+enum class DeviceBackend
+{
+  CPU,
+  CUDA
+};
+
+/// @brief Regularization selection for the Euler solver request.
+enum class Regularization
+{
+  None,
+  IGR
+};
+
+/// @brief Time-integrator selection for the Euler solver request.
+enum class TimeIntegrator
+{
+  RK3SSP,
+  BackwardEuler
+};
+
 /// @brief Source of the effective general discretization selection.
 enum class DiscretizationProvenance
 {
@@ -104,11 +125,38 @@ struct DiscretizationResolution
   }
 };
 
-/// @brief Runtime compute device selection.
-enum class DeviceBackend
+/// @brief Resolution status for the complete CLI/case solver request.
+enum class SolverRequestResolutionStatus
 {
-  CPU,
-  CUDA
+  Resolved,
+  InvalidDiscretization,
+  InvalidDGBackend,
+  InvalidDeviceBackend,
+  Conflict,
+  InvalidRegularization,
+  InvalidTimeIntegrator,
+  UnsupportedRegularization,
+  UnsupportedTimeIntegrator
+};
+
+/// @brief Pure resolved request consumed before runtime construction begins.
+struct SolverRequestResolution
+{
+  Discretization discretization = Discretization::DG;
+  DiscretizationProvenance discretization_provenance =
+    DiscretizationProvenance::CaseDefault;
+  std::optional<DGBackend> dg_backend = DGBackend::DG;
+  DeviceBackend device_backend = DeviceBackend::CPU;
+  Regularization regularization = Regularization::None;
+  TimeIntegrator time_integrator = TimeIntegrator::RK3SSP;
+  SolverRequestResolutionStatus status =
+    SolverRequestResolutionStatus::Resolved;
+  std::string message;
+
+  bool IsResolved() const
+  {
+    return status == SolverRequestResolutionStatus::Resolved;
+  }
 };
 
 /// @brief Optional DGSEM stabilization hook selection.
@@ -177,6 +225,8 @@ struct RunConfig
   DiscretizationProvenance discretization_provenance =
     DiscretizationProvenance::CaseDefault;
   DGBackend dg_backend = DGBackend::DG;
+  Regularization regularization = Regularization::IGR;
+  TimeIntegrator time_integrator = TimeIntegrator::RK3SSP;
   DGSEMStabilization dgsem_stab = DGSEMStabilization::None;
   DGSEMVolumeFlux dgsem_volume_flux = DGSEMVolumeFlux::Central;
   DGSEMVolumeDissipation dgsem_volume_dissipation =
@@ -616,6 +666,87 @@ inline const char* DiscretizationToString(Discretization discretization)
   return "dg";
 }
 
+inline std::optional<Regularization>
+TryParseRegularization(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "none")
+  {
+    return Regularization::None;
+  }
+  if (lower == "igr")
+  {
+    return Regularization::IGR;
+  }
+  return std::nullopt;
+}
+
+inline const char* RegularizationToString(Regularization regularization)
+{
+  switch (regularization)
+  {
+  case Regularization::None:
+    return "none";
+  case Regularization::IGR:
+    return "igr";
+  }
+  return "none";
+}
+
+inline std::optional<TimeIntegrator>
+TryParseTimeIntegrator(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "rk3ssp")
+  {
+    return TimeIntegrator::RK3SSP;
+  }
+  if (lower == "backward-euler")
+  {
+    return TimeIntegrator::BackwardEuler;
+  }
+  return std::nullopt;
+}
+
+inline const char* TimeIntegratorToString(TimeIntegrator time_integrator)
+{
+  switch (time_integrator)
+  {
+  case TimeIntegrator::RK3SSP:
+    return "rk3ssp";
+  case TimeIntegrator::BackwardEuler:
+    return "backward-euler";
+  }
+  return "rk3ssp";
+}
+
+inline const char*
+SolverRequestResolutionStatusToString(SolverRequestResolutionStatus status)
+{
+  switch (status)
+  {
+  case SolverRequestResolutionStatus::Resolved:
+    return "resolved";
+  case SolverRequestResolutionStatus::InvalidDiscretization:
+    return "invalid-discretization";
+  case SolverRequestResolutionStatus::InvalidDGBackend:
+    return "invalid-dg-backend";
+  case SolverRequestResolutionStatus::InvalidDeviceBackend:
+    return "invalid-device-backend";
+  case SolverRequestResolutionStatus::Conflict:
+    return "conflict";
+  case SolverRequestResolutionStatus::InvalidRegularization:
+    return "invalid-regularization";
+  case SolverRequestResolutionStatus::InvalidTimeIntegrator:
+    return "invalid-time-integrator";
+  case SolverRequestResolutionStatus::UnsupportedRegularization:
+    return "unsupported-regularization";
+  case SolverRequestResolutionStatus::UnsupportedTimeIntegrator:
+    return "unsupported-time-integrator";
+  }
+  return "invalid-request";
+}
+
 inline const char*
 DiscretizationProvenanceToString(DiscretizationProvenance provenance)
 {
@@ -711,7 +842,8 @@ ResolveDiscretization(const std::string& case_default_dg_backend,
   return result;
 }
 
-inline DeviceBackend ParseDeviceBackend(const std::string& value)
+inline std::optional<DeviceBackend>
+TryParseDeviceBackend(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "cpu")
@@ -721,6 +853,125 @@ inline DeviceBackend ParseDeviceBackend(const std::string& value)
   if (lower == "cuda")
   {
     return DeviceBackend::CUDA;
+  }
+  return std::nullopt;
+}
+
+/// @brief Resolve every solver selector without constructing runtime state.
+inline SolverRequestResolution
+ResolveSolverRequest(const std::string& case_default_dg_backend,
+                     bool case_default_use_igr,
+                     const std::string& discretization_value,
+                     const std::string& dg_backend_value,
+                     const std::string& regularization_value,
+                     const std::string& time_integrator_value,
+                     bool discretization_overridden,
+                     bool dg_backend_overridden,
+                     bool regularization_overridden,
+                     bool time_integrator_overridden,
+                     const std::string& device_value = "cpu")
+{
+  SolverRequestResolution result;
+  const DiscretizationResolution discretization =
+    ResolveDiscretization(case_default_dg_backend,
+                          discretization_value,
+                          dg_backend_value,
+                          discretization_overridden,
+                          dg_backend_overridden);
+  result.discretization = discretization.discretization;
+  result.discretization_provenance = discretization.provenance;
+  result.dg_backend = discretization.dg_backend;
+  if (!discretization.IsResolved())
+  {
+    result.status =
+      discretization.status == DiscretizationResolutionStatus::InvalidDiscretization
+        ? SolverRequestResolutionStatus::InvalidDiscretization
+        : discretization.status == DiscretizationResolutionStatus::InvalidDGBackend
+            ? SolverRequestResolutionStatus::InvalidDGBackend
+            : SolverRequestResolutionStatus::Conflict;
+    result.message = discretization.message;
+    return result;
+  }
+
+  const std::optional<DeviceBackend> device =
+    TryParseDeviceBackend(device_value);
+  if (!device)
+  {
+    result.status = SolverRequestResolutionStatus::InvalidDeviceBackend;
+    result.message = "Invalid device backend '" + device_value +
+                     "'. Use 'cpu' or 'cuda'.";
+    return result;
+  }
+  result.device_backend = *device;
+
+  result.regularization = case_default_use_igr ? Regularization::IGR
+                                                : Regularization::None;
+  if (regularization_overridden)
+  {
+    const std::optional<Regularization> regularization =
+      TryParseRegularization(regularization_value);
+    if (!regularization)
+    {
+      result.status = SolverRequestResolutionStatus::InvalidRegularization;
+      result.message = "Invalid regularization '" + regularization_value +
+                       "'. Use 'none' or 'igr'.";
+      return result;
+    }
+    result.regularization = *regularization;
+  }
+
+  result.time_integrator =
+    result.discretization == Discretization::HDG
+      ? TimeIntegrator::BackwardEuler
+      : TimeIntegrator::RK3SSP;
+  if (time_integrator_overridden)
+  {
+    const std::optional<TimeIntegrator> time_integrator =
+      TryParseTimeIntegrator(time_integrator_value);
+    if (!time_integrator)
+    {
+      result.status = SolverRequestResolutionStatus::InvalidTimeIntegrator;
+      result.message = "Invalid time integrator '" + time_integrator_value +
+                       "'. Use 'rk3ssp' or 'backward-euler'.";
+      return result;
+    }
+    result.time_integrator = *time_integrator;
+  }
+
+  if (result.discretization == Discretization::HDG &&
+      result.regularization == Regularization::IGR &&
+      result.device_backend != DeviceBackend::CPU)
+  {
+    result.status = SolverRequestResolutionStatus::UnsupportedRegularization;
+    result.message =
+      "Regularization 'igr' with HDG is available only on --device cpu.";
+    return result;
+  }
+  if (result.discretization != Discretization::HDG &&
+      result.time_integrator != TimeIntegrator::RK3SSP)
+  {
+    result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
+    result.message = "Time integrator 'backward-euler' is unavailable for "
+                     "DG/DGSEM; use 'rk3ssp'.";
+    return result;
+  }
+  if (result.discretization == Discretization::HDG &&
+      result.time_integrator != TimeIntegrator::BackwardEuler)
+  {
+    result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
+    result.message = "Time integrator 'rk3ssp' is unavailable for HDG; use "
+                     "'backward-euler'.";
+    return result;
+  }
+  return result;
+}
+
+inline DeviceBackend ParseDeviceBackend(const std::string& value)
+{
+  if (const std::optional<DeviceBackend> backend =
+        TryParseDeviceBackend(value))
+  {
+    return *backend;
   }
   MFEM_VERIFY(false,
               "Invalid device backend '" << value
@@ -769,6 +1020,16 @@ inline bool IsDGBackendOptionName(const std::string& value)
   return value == "-dg" || value == "--dg-backend";
 }
 
+inline bool IsRegularizationOptionName(const std::string& value)
+{
+  return value == "-reg" || value == "--regularization";
+}
+
+inline bool IsTimeIntegratorOptionName(const std::string& value)
+{
+  return value == "-ti" || value == "--time-integrator";
+}
+
 inline bool HasDiscretizationOptionOverride(int argc, char** argv)
 {
   for (int i = 1; i < argc; ++i)
@@ -786,6 +1047,30 @@ inline bool HasDGBackendOptionOverride(int argc, char** argv)
   for (int i = 1; i < argc; ++i)
   {
     if (IsDGBackendOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool HasRegularizationOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsRegularizationOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool HasTimeIntegratorOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsTimeIntegratorOptionName(argv[i]))
     {
       return true;
     }
@@ -1294,7 +1579,9 @@ inline RunConfig MakeRunConfig(
   const CommonOptions& opts,
   const IGROptions& igr_opts,
   DiscretizationProvenance discretization_provenance =
-    DiscretizationProvenance::CaseDefault)
+    DiscretizationProvenance::CaseDefault,
+  Regularization regularization = Regularization::IGR,
+  TimeIntegrator time_integrator = TimeIntegrator::RK3SSP)
 {
   RunConfig run_cfg;
   run_cfg.case_config = case_cfg;
@@ -1310,6 +1597,8 @@ inline RunConfig MakeRunConfig(
                                   ParseDGBackend(opts.dg_backend))
                               : ParseDiscretization(opts.discretization);
   run_cfg.discretization_provenance = discretization_provenance;
+  run_cfg.regularization = regularization;
+  run_cfg.time_integrator = time_integrator;
   const std::optional<DGBackend> dg_backend =
     DGBackendForDiscretization(run_cfg.discretization);
   MFEM_VERIFY(dg_backend,

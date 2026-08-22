@@ -16,11 +16,20 @@ endif()
 add_executable(dg_igr_hdg_auxiliary_cpu_test
   test_screened_poisson_cpu.cpp
   screened_poisson_h1_reference.cpp)
+if(MFEM_USE_CUDA)
+  set_source_files_properties(screened_poisson_h1_reference.cpp
+    PROPERTIES LANGUAGE CUDA)
+  set_target_properties(dg_igr_hdg_auxiliary_cpu_test PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF)
+endif()
 target_link_libraries(dg_igr_hdg_auxiliary_cpu_test PRIVATE
   dg_igr_hdg_auxiliary_cpu
   MPI::MPI_CXX)
 target_compile_options(dg_igr_hdg_auxiliary_cpu_test PRIVATE
-  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror;-pedantic-errors>)
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror;-pedantic-errors>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
 set_target_properties(dg_igr_hdg_auxiliary_cpu_test PROPERTIES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED ON

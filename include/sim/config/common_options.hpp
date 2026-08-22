@@ -26,6 +26,14 @@ struct CommonOptions
   std::string dg_backend = "dg"; ///< DG backend: "dg" or "dgsem".
   std::string discretization;
   ///< General discretization selector; empty retains the per-case default.
+  std::string regularization;
+  ///< Regularization selector: none | igr; empty retains the case default.
+  double hdg_igr_alpha = 1.0;
+  ///< HDG private IGR alpha; used only with --discretization hdg --regularization igr.
+  double hdg_igr_beta = 1.0;
+  ///< HDG private IGR beta; used only with --discretization hdg --regularization igr.
+  std::string time_integrator;
+  ///< Time-integrator selector; empty selects the discretization default.
   std::string zhang_shu_points =
     "consumer"; ///< Zhang-Shu point set: "consumer" or "quadrature".
   std::string dgsem_stab =
@@ -104,6 +112,23 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-disc",
                  "--discretization",
                  "Discretization: dg | dgsem | hdg (case support required).");
+  args.AddOption(&opts.regularization,
+                 "-reg",
+                 "--regularization",
+                 "Regularization: none | igr (case support required).");
+  args.AddOption(&opts.hdg_igr_alpha,
+                 "-hia",
+                 "--hdg-igr-alpha",
+                 "HDG private IGR alpha (finite and positive; default 1.0).");
+  args.AddOption(&opts.hdg_igr_beta,
+                 "-hib",
+                 "--hdg-igr-beta",
+                 "HDG private IGR beta (finite and positive; default 1.0).");
+  args.AddOption(&opts.time_integrator,
+                 "-ti",
+                 "--time-integrator",
+                 "Time integrator: rk3ssp | backward-euler "
+                 "(discretization support required).");
   args.AddOption(&opts.zhang_shu_points,
                  "-zsp",
                  "--zhang-shu-points",

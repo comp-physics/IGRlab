@@ -1839,10 +1839,64 @@ int RunRank2TrajectoryHarness()
   return global_failures;
 }
 
+int RunIndependentArtifactOracle(const int expected_step,
+                                 const std::string& path)
+{
+  if (expected_step != 10 && expected_step != 20)
+  {
+    std::cerr << "SC25 artifact oracle admits only steps 10 and 20\n";
+    return 1;
+  }
+  std::unique_ptr<sc25::PersistentSc25ScalarIgrCpuFoundation> foundation =
+      CreatePersistentFoundation();
+  if (!foundation || foundation->InitializePersistentTrajectory() !=
+                         sc25::TrajectoryStatus::ready)
+  {
+    std::cerr << "SC25 artifact oracle reference initialization failed\n";
+    return 1;
+  }
+  for (int step = 1; step <= expected_step; ++step)
+  {
+    if (!Accepted(foundation->AdvancePersistentTrajectory()))
+    {
+      std::cerr << "SC25 artifact oracle reference advance failed at step "
+                << step << '\n';
+      return 1;
+    }
+  }
+  sc25::PersistentTrajectoryState state;
+  std::string failure;
+  if (!foundation->CopyPublishedTrajectoryState(state) ||
+      !dg_igr_hdg_sc25_cpu_test::ValidateIndependentSc25VtkArtifact(
+          *foundation, state, expected_step, path, 2.0e-11, failure))
+  {
+    std::cerr << "SC25 artifact oracle rejected step " << expected_step
+              << ": " << failure << '\n';
+    return 1;
+  }
+  std::cout << "SC25 independent artifact oracle PASS step="
+            << expected_step << '\n';
+  return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
+  if (argc == 4 && std::string_view(argv[1]) ==
+                       "--make-artifact-vtk-negative")
+  {
+    std::string failure;
+    const bool made =
+        dg_igr_hdg_sc25_cpu_test::MakeIndependentSc25VtkArtifactNegative(
+            argv[2], argv[3], failure);
+    if (!made)
+    {
+      std::cerr << "SC25 artifact oracle negative fixture failed: "
+                << failure << '\n';
+    }
+    return made ? 0 : 1;
+  }
   MPI_Init(&argc, &argv);
   mfem::Hypre::Init();
   int rank = -1;
@@ -1853,7 +1907,27 @@ int main(int argc, char** argv)
   int failures = 0;
   const bool rank2_trajectory = argc == 2 &&
       std::string_view(argv[1]) == "--rank2-trajectory";
-  if (rank2_trajectory)
+  const bool artifact_oracle = argc == 4 &&
+      std::string_view(argv[1]) == "--validate-artifact-vtk";
+  if (artifact_oracle)
+  {
+    int expected_step = -1;
+    try { expected_step = std::stoi(argv[2]); }
+    catch (...) { expected_step = -1; }
+    if (ranks != 1)
+    {
+      if (rank == 0)
+      {
+        std::cerr << "SC25 artifact oracle requires exactly one rank\n";
+      }
+      failures = 1;
+    }
+    else
+    {
+      failures = RunIndependentArtifactOracle(expected_step, argv[3]);
+    }
+  }
+  else if (rank2_trajectory)
   {
     if (ranks != 2)
     {

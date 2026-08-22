@@ -1219,6 +1219,62 @@ if(HDG_RUNTIME_FUNCTIONAL)
       "functional final generation")
   endif()
 
+  # This reference is deliberately a test-side SC25 foundation, not a second
+  # application run and not CPU/CUDA parity.  It rebuilds the independent
+  # accepted numerical state, evaluates it at every physical VTK point, and
+  # must reject a deliberately altered artifact.
+  if(HDG_RUNTIME_SCALAR_IGR AND HDG_RUNTIME_RANKS EQUAL 1 AND
+     HDG_RUNTIME_BACKEND STREQUAL "cpu")
+    if(NOT DEFINED HDG_RUNTIME_SCALAR_IGR_ARTIFACT_ORACLE)
+      message(FATAL_ERROR "scalar-IGR independent artifact oracle is unavailable")
+    endif()
+    foreach(step IN ITEMS 10 20)
+      if(step EQUAL 10)
+        set(step_padded 000010)
+      else()
+        set(step_padded 000020)
+      endif()
+      execute_process(
+        COMMAND "${HDG_RUNTIME_SCALAR_IGR_ARTIFACT_ORACLE}"
+          --validate-artifact-vtk ${step}
+          "${reference_directory}/state-step-${step_padded}.vtk"
+        RESULT_VARIABLE artifact_oracle_status
+        OUTPUT_VARIABLE artifact_oracle_output
+        ERROR_VARIABLE artifact_oracle_error)
+      if(NOT artifact_oracle_status EQUAL 0 OR
+         NOT artifact_oracle_output MATCHES
+             "SC25 independent artifact oracle PASS step=${step}" OR
+         NOT artifact_oracle_error STREQUAL "")
+        message(FATAL_ERROR
+          "scalar-IGR independent artifact oracle failed at ${step}: ${artifact_oracle_output};${artifact_oracle_error}")
+      endif()
+    endforeach()
+    set(artifact_negative
+        "${HDG_RUNTIME_TEST_OUTPUT}-independent-artifact-negative.vtk")
+    execute_process(
+      COMMAND "${HDG_RUNTIME_SCALAR_IGR_ARTIFACT_ORACLE}"
+        --make-artifact-vtk-negative
+        "${reference_directory}/state-step-000010.vtk" "${artifact_negative}"
+      RESULT_VARIABLE artifact_negative_make_status
+      OUTPUT_VARIABLE artifact_negative_make_output
+      ERROR_VARIABLE artifact_negative_make_error)
+    if(NOT artifact_negative_make_status EQUAL 0 OR
+       NOT artifact_negative_make_error STREQUAL "")
+      message(FATAL_ERROR
+        "scalar-IGR independent artifact negative fixture failed: ${artifact_negative_make_output};${artifact_negative_make_error}")
+    endif()
+    execute_process(
+      COMMAND "${HDG_RUNTIME_SCALAR_IGR_ARTIFACT_ORACLE}"
+        --validate-artifact-vtk 10 "${artifact_negative}"
+      RESULT_VARIABLE artifact_negative_status
+      OUTPUT_VARIABLE artifact_negative_output
+      ERROR_VARIABLE artifact_negative_error)
+    if(artifact_negative_status EQUAL 0)
+      message(FATAL_ERROR
+        "scalar-IGR independent artifact oracle accepted the altered step-10 artifact: ${artifact_negative_output};${artifact_negative_error}")
+    endif()
+  endif()
+
   file(READ "${reference_directory}/run-metadata.json" reference_metadata)
   file(READ "${writer_directory}/run-metadata-checkpoint.json"
        writer_metadata)

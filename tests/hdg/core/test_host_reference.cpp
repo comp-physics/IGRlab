@@ -343,16 +343,25 @@ int TestFailuresAndCensus()
       huge(maximum,maximum,1),huge(maximum,1,1)};
   if(engine.Condense(overflow,{huge_output(maximum,1,1),huge_output(maximum,1,1)})!=Status::overflow || storage!=3.) return 5;
 
+  HostReferenceEngine prepared;
+  std::array<double,1> prepared_s{{-3.}}, prepared_r{{-4.}}, prepared_action{{-5.}};
+  if(prepared.Prepare({1,1,1,1},1)!=Status::success ||
+     prepared.Condense(alias,{View(prepared_s.data(),1,1,1),View(prepared_r.data(),1,1,1)})!=Status::success ||
+     prepared.ApplySchur(ConstView(prepared_r.data(),1,1,1),View(prepared_action.data(),1,1,1))!=Status::success ||
+     prepared.Prepare({0,1,1,1},1)!=Status::invalid_shape || !prepared.ready()) return 6;
+  std::array<double,1> prepared_recovered{{-6.}};
+  if(prepared.Recover(ConstView(prepared_r.data(),1,1,1),View(prepared_recovered.data(),1,1,1))!=Status::success) return 7;
+
   dg::hdg::core::ShapeCensus census;
   mfem::Mesh segment=mfem::Mesh::MakeCartesian1D(1,1.);
-  if(dg::hdg::core::BuildRepresentativeShapeCensus(segment,census)!=Status::success || census.size()!=8) return 6;
+  if(dg::hdg::core::BuildRepresentativeShapeCensus(segment,census)!=Status::success || census.size()!=8) return 8;
   const auto segment_p1=std::find_if(census.begin(),census.end(),[](const auto& entry){return entry.polynomial_order==1 && entry.components==1;});
   if(segment_p1==census.end() || segment_p1->shape.interior_dofs!=2 ||
-     segment_p1->shape.trace_dofs!=2 || segment_p1->element_count!=1) return 7;
+     segment_p1->shape.trace_dofs!=2 || segment_p1->element_count!=1) return 9;
 
   mfem::Mesh quad=mfem::Mesh::MakeCartesian2D(
       1,1,mfem::Element::QUADRILATERAL,false,1.,1.);
-  if(dg::hdg::core::BuildRepresentativeShapeCensus(quad,census)!=Status::success || census.size()!=8) return 8;
+  if(dg::hdg::core::BuildRepresentativeShapeCensus(quad,census)!=Status::success || census.size()!=8) return 10;
   const auto quad_p1=std::find_if(census.begin(),census.end(),[](const auto& entry){return entry.polynomial_order==1 && entry.components==1;});
   const auto quad_p4_euler=std::find_if(census.begin(),census.end(),[](const auto& entry){return entry.polynomial_order==4 && entry.components==5;});
   if(quad_p1==census.end() || quad_p1->shape.interior_dofs!=4 ||
@@ -360,30 +369,30 @@ int TestFailuresAndCensus()
      quad_p4_euler==census.end() || quad_p4_euler->shape.interior_dofs!=25 ||
      quad_p4_euler->shape.trace_dofs!=20 ||
      quad_p4_euler->shape.interior_components!=5 ||
-     quad_p4_euler->shape.trace_components!=5) return 9;
+     quad_p4_euler->shape.trace_components!=5) return 11;
 
   mfem::Mesh triangle=mfem::Mesh::MakeCartesian2D(
       1,1,mfem::Element::TRIANGLE,false,1.,1.);
-  if(dg::hdg::core::BuildRepresentativeShapeCensus(triangle,census)!=Status::success || census.size()!=8) return 10;
+  if(dg::hdg::core::BuildRepresentativeShapeCensus(triangle,census)!=Status::success || census.size()!=8) return 12;
   const auto triangle_p1=std::find_if(census.begin(),census.end(),[](const auto& entry){return entry.polynomial_order==1 && entry.components==1;});
   if(triangle_p1==census.end() || triangle_p1->shape.interior_dofs!=3 ||
-     triangle_p1->shape.trace_dofs!=6 || triangle_p1->element_count!=2) return 11;
+     triangle_p1->shape.trace_dofs!=6 || triangle_p1->element_count!=2) return 13;
 
   mfem::Mesh hex=mfem::Mesh::MakeCartesian3D(
       1,1,1,mfem::Element::HEXAHEDRON,1.,1.,1.,false);
-  if(dg::hdg::core::BuildRepresentativeShapeCensus(hex,census)!=Status::success || census.size()!=8) return 12;
+  if(dg::hdg::core::BuildRepresentativeShapeCensus(hex,census)!=Status::success || census.size()!=8) return 14;
   const auto hex_p1=std::find_if(census.begin(),census.end(),[](const auto& entry){return entry.polynomial_order==1 && entry.components==1;});
   if(hex_p1==census.end() || hex_p1->shape.interior_dofs!=8 ||
-     hex_p1->shape.trace_dofs!=24 || hex_p1->element_count!=1) return 13;
+     hex_p1->shape.trace_dofs!=24 || hex_p1->element_count!=1) return 15;
 
   mfem::Mesh tetrahedron=mfem::Mesh::MakeCartesian3D(
       1,1,1,mfem::Element::TETRAHEDRON,1.,1.,1.,false);
-  if(dg::hdg::core::BuildRepresentativeShapeCensus(tetrahedron,census)!=Status::success || census.size()!=8) return 14;
+  if(dg::hdg::core::BuildRepresentativeShapeCensus(tetrahedron,census)!=Status::success || census.size()!=8) return 16;
   const auto tetrahedron_p1=std::find_if(census.begin(),census.end(),[](const auto& entry){return entry.polynomial_order==1 && entry.components==1;});
   return tetrahedron_p1!=census.end() &&
          tetrahedron_p1->shape.interior_dofs==4 &&
          tetrahedron_p1->shape.trace_dofs==12 &&
-         tetrahedron_p1->element_count==6 ? 0 : 15;
+         tetrahedron_p1->element_count==6 ? 0 : 17;
 }
 }  // namespace
 

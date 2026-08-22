@@ -55,7 +55,7 @@ inline void CudaPerturbedState(const double x, const double y,
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
-BuildHostGeometryAndMaps() noexcept
+BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
 {
   std::vector<double> local_exact_trace(
       static_cast<std::size_t>(shape_.local_trace_count), 0.0);
@@ -63,6 +63,24 @@ BuildHostGeometryAndMaps() noexcept
       static_cast<std::size_t>(shape_.local_trace_count), 0.0);
   std::vector<unsigned char> assigned(
       static_cast<std::size_t>(shape_.local_trace_count), 0);
+  std::vector<unsigned char> shared_faces(
+      static_cast<std::size_t>(mesh_->GetNumFaces()), 0);
+  if (shape_.borrowed_host_inputs)
+  {
+    for (int index = 0; index < mesh_->GetNSharedFaces(); ++index)
+    {
+      const int face = mesh_->GetSharedFace(index);
+      if (face < 0 || face >= static_cast<int>(shared_faces.size())) return false;
+      shared_faces[static_cast<std::size_t>(face)] = 1;
+    }
+    if (shape_.borrowed_static_boundary_policies)
+    {
+      std::fill(host_boundary_policy_kind_.begin(),
+                host_boundary_policy_kind_.end(), 0);
+      std::fill(host_boundary_reference_.begin(), host_boundary_reference_.end(),
+                0.0);
+    }
+  }
   for (int element = 0; element < shape_.elements; ++element)
   {
     const mfem::FiniteElement* fe = interior_space_->GetFE(element);
@@ -157,6 +175,30 @@ BuildHostGeometryAndMaps() noexcept
         return false;
       const bool element_one = ft->Elem1No == element;
       if (!element_one && ft->Elem2No != element) { return false; }
+      if (shape_.borrowed_static_boundary_policies)
+      {
+        const int boundary_element = mesh_->GetFaceToBdrElMap()[face];
+        const bool physical = shared_faces[static_cast<std::size_t>(face)] == 0 &&
+            ft->Elem2No < 0 && boundary_element >= 0;
+        if (physical)
+        {
+          const int attribute = mesh_->GetBdrAttribute(boundary_element);
+          const CudaStaticBoundaryPolicy* policy = nullptr;
+          for (std::size_t index = 0;
+               index < config.borrowed_boundary_policies.count; ++index)
+            if (config.borrowed_boundary_policies.policies[index].attribute == attribute)
+              policy = config.borrowed_boundary_policies.policies + index;
+          if (policy == nullptr || !IsCudaAdmittedStaticBoundaryPolicy(policy->kind))
+            return false;
+          const std::size_t face_index = static_cast<std::size_t>(element) *
+              faces_per_element + local_face;
+          host_boundary_policy_kind_[face_index] =
+              static_cast<int>(policy->kind);
+          for (int component = 0; component < conserved_components; ++component)
+            host_boundary_reference_[face_index * conserved_components + component] =
+                policy->reference_state[static_cast<std::size_t>(component)];
+        }
+      }
       const mfem::IntegrationRule& face_nodes = trace_fe->GetNodes();
       for (int scalar = 0; scalar < shape_.scalar_face_dofs; ++scalar)
       {
@@ -344,6 +386,14 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
         local_trace->Size() != shape_.local_trace_count)
       throw 0;
     *local_trace = 0.0;
+    std::vector<unsigned char> shared_faces(
+        static_cast<std::size_t>(mesh_->GetNumFaces()), 0);
+    for (int index = 0; index < mesh_->GetNSharedFaces(); ++index)
+    {
+      const int face = mesh_->GetSharedFace(index);
+      if (face < 0 || face >= static_cast<int>(shared_faces.size())) throw 0;
+      shared_faces[static_cast<std::size_t>(face)] = 1;
+    }
     for (int face = 0; face < mesh_->GetNumFaces(); ++face)
     {
       mfem::FaceElementTransformations* transformations =
@@ -365,6 +415,21 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
               interior_element->GetDof() ||
           trace_vdofs.Size() != conserved_components * trace_element->GetDof())
         throw 0;
+      const int boundary_element = mesh_->GetFaceToBdrElMap()[face];
+      const bool physical_boundary = shape_.borrowed_static_boundary_policies &&
+          shared_faces[static_cast<std::size_t>(face)] == 0 &&
+          transformations->Elem2No < 0 && boundary_element >= 0;
+      const CudaStaticBoundaryPolicy* boundary_policy = nullptr;
+      if (physical_boundary)
+      {
+        const int attribute = mesh_->GetBdrAttribute(boundary_element);
+        for (std::size_t policy = 0;
+             policy < config.borrowed_boundary_policies.count; ++policy)
+          if (config.borrowed_boundary_policies.policies[policy].attribute == attribute)
+            boundary_policy = config.borrowed_boundary_policies.policies + policy;
+        if (boundary_policy == nullptr ||
+            !IsCudaAdmittedStaticBoundaryPolicy(boundary_policy->kind)) throw 0;
+      }
       mfem::Vector shape(interior_element->GetDof());
       const mfem::IntegrationRule& nodes = trace_element->GetNodes();
       for (int scalar = 0; scalar < trace_element->GetDof(); ++scalar)
@@ -373,9 +438,9 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
         transformations->SetAllIntPoints(&point);
         interior_element->CalcShape(transformations->GetElement1IntPoint(),
                                     shape);
+        std::array<double, conserved_components> restricted{};
         for (int component = 0; component < conserved_components; ++component)
         {
-          double restricted = 0.0;
           for (int interior_scalar = 0;
                interior_scalar < interior_element->GetDof(); ++interior_scalar)
           {
@@ -384,14 +449,40 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
                 interior_scalar + interior_element->GetDof() * component], sign);
             if (dof < 0 || static_cast<std::size_t>(dof) >= coefficient_count)
               throw 0;
-            restricted += shape[interior_scalar] * sign *
+            restricted[static_cast<std::size_t>(component)] +=
+                shape[interior_scalar] * sign *
                 initial[static_cast<std::size_t>(dof)];
           }
+        }
+        std::array<double, conserved_components> exterior = restricted;
+        if (physical_boundary)
+        {
+          if (boundary_policy->kind ==
+              CudaStaticBoundaryPolicyKind::supersonic_inlet)
+          {
+            exterior = boundary_policy->reference_state;
+          }
+          else if (boundary_policy->kind == CudaStaticBoundaryPolicyKind::slip_wall)
+          {
+            mfem::Vector scaled_normal(dimension);
+            mfem::CalcOrtho(transformations->Face->Jacobian(), scaled_normal);
+            const double normal_norm = scaled_normal.Norml2();
+            if (!(normal_norm > 0.0) || !std::isfinite(normal_norm)) throw 0;
+            const double nx = scaled_normal[0] / normal_norm;
+            const double ny = scaled_normal[1] / normal_norm;
+            const double normal_momentum = exterior[1] * nx + exterior[2] * ny;
+            exterior[1] -= 2.0 * normal_momentum * nx;
+            exterior[2] -= 2.0 * normal_momentum * ny;
+          }
+          if (!IsCudaPhysicalEulerState(exterior)) throw 0;
+        }
+        for (int component = 0; component < conserved_components; ++component)
+        {
           double sign = 1.0;
           const int dof = CudaDecodeSigned(trace_vdofs[
               scalar + trace_element->GetDof() * component], sign);
           if (dof < 0 || dof >= local_trace->Size()) { throw 0; }
-          (*local_trace)[dof] = sign * restricted;
+          (*local_trace)[dof] = sign * exterior[static_cast<std::size_t>(component)];
           local_trace_assigned[static_cast<std::size_t>(dof)] = 1;
         }
       }
@@ -623,6 +714,9 @@ BindArenaViews() noexcept
     view_.borrowed_lagged_llf_tau = take_d(generic ? generic_arena_layout_.face_weight :
         static_cast<std::size_t>(maximum_rank_elements) *
         faces_per_element * maximum_face_points);
+  if (shape_.borrowed_static_boundary_policies)
+    view_.boundary_reference = take_d(generic ?
+        generic_arena_layout_.boundary_reference : 0);
   if (static_cast<std::size_t>(d - double_arena_) >
       double_arena_capacity_)
     return false;
@@ -633,6 +727,9 @@ BindArenaViews() noexcept
   view_.ticket_words = i;
   i += 8;
   view_.signed_element_trace = TakeArena(i, max_er);
+  if (shape_.borrowed_static_boundary_policies)
+    view_.boundary_policy_kind = TakeArena(i, generic ?
+        generic_arena_layout_.element_faces : 0);
   view_.matrix_owned_source = TakeArena(i, max_d);
   view_.matrix_owned_section = TakeArena(i, max_d);
   view_.matrix_owned_target = TakeArena(i, max_d);
@@ -731,6 +828,15 @@ UploadTopologyAndState() noexcept
            static_cast<std::size_t>(shape_.elements) * faces_per_element *
                shape_.face_points * dimension * sizeof(double),
            CudaTransferSite::quadrature_upload))
+    return false;
+  if (shape_.borrowed_static_boundary_policies &&
+      (!h2d(view_.boundary_reference, host_boundary_reference_.data(),
+            static_cast<std::size_t>(shape_.elements) * faces_per_element *
+                conserved_components * sizeof(double),
+            CudaTransferSite::quadrature_upload) ||
+       !h2d(view_.boundary_policy_kind, host_boundary_policy_kind_.data(),
+            static_cast<std::size_t>(shape_.elements) * faces_per_element *
+                sizeof(int), CudaTransferSite::map_upload)))
     return false;
   return TransportPolicy::Synchronize(CudaTransferSite::topology_upload);
 }

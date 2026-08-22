@@ -15,6 +15,7 @@
 #include <mfem.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -147,6 +148,113 @@ struct CudaMutableHostL2Output
   int components = conserved_components;
 };
 
+/** The small, value-only physical-boundary subset admitted by CUDA. */
+enum class CudaStaticBoundaryPolicyKind : std::uint8_t
+{
+  none = 0,
+  supersonic_inlet = 1,
+  supersonic_outlet = 2,
+  slip_wall = 3,
+  // These spellings make unsupported caller intent explicit and rejectable.
+  subsonic_inlet = 4,
+  subsonic_outlet = 5,
+  far_field = 6,
+  nonreflecting = 7
+};
+
+/** Caller-borrowed initialization descriptor; values are copied immediately. */
+struct CudaStaticBoundaryPolicy
+{
+  int attribute = 0;
+  CudaStaticBoundaryPolicyKind kind = CudaStaticBoundaryPolicyKind::none;
+  std::array<double, conserved_components> reference_state{{0.0, 0.0, 0.0,
+                                                              0.0}};
+};
+
+inline constexpr std::size_t maximum_static_boundary_policies = 32;
+
+struct CudaStaticBoundaryPolicyTable
+{
+  const CudaStaticBoundaryPolicy* policies = nullptr;
+  std::size_t count = 0;
+};
+
+inline bool IsCudaAdmittedStaticBoundaryPolicy(
+    const CudaStaticBoundaryPolicyKind kind) noexcept
+{
+  return kind == CudaStaticBoundaryPolicyKind::supersonic_inlet ||
+      kind == CudaStaticBoundaryPolicyKind::supersonic_outlet ||
+      kind == CudaStaticBoundaryPolicyKind::slip_wall;
+}
+
+inline bool IsCudaPhysicalEulerState(
+    const std::array<double, conserved_components>& state) noexcept
+{
+  constexpr double gamma = 1.4;
+  for (const double value : state)
+    if (!std::isfinite(value)) return false;
+  if (!(state[0] > 0.0)) return false;
+  const double pressure = (gamma - 1.0) *
+      (state[3] - 0.5 * (state[1] * state[1] + state[2] * state[2]) /
+                       state[0]);
+  return pressure > 0.0 && std::isfinite(pressure);
+}
+
+inline bool ValidateCudaStaticBoundaryPolicyTable(
+    const CudaStaticBoundaryPolicyTable& table) noexcept
+{
+  if (table.count == 0) return table.policies == nullptr;
+  if (table.policies == nullptr || table.count > maximum_static_boundary_policies)
+    return false;
+  for (std::size_t i = 0; i < table.count; ++i)
+  {
+    const CudaStaticBoundaryPolicy& policy = table.policies[i];
+    if (policy.attribute <= 0 ||
+        !IsCudaAdmittedStaticBoundaryPolicy(policy.kind))
+      return false;
+    if (policy.kind == CudaStaticBoundaryPolicyKind::supersonic_inlet)
+    {
+      if (!IsCudaPhysicalEulerState(policy.reference_state)) return false;
+    }
+    else
+    {
+      for (const double value : policy.reference_state)
+        if (value != 0.0 || std::signbit(value)) return false;
+    }
+    if (i != 0 && table.policies[i - 1].attribute >= policy.attribute)
+      return false;
+  }
+  return true;
+}
+
+inline bool CudaBorrowedHostModeConsensus(const bool requested,
+                                          bool& agreed_mode) noexcept
+{
+  const int local = requested ? 1 : 0;
+  int minimum = 0;
+  int maximum = 0;
+  const bool minimum_ready = MPI_Allreduce(&local, &minimum, 1, MPI_INT,
+      MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool maximum_ready = MPI_Allreduce(&local, &maximum, 1, MPI_INT,
+      MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+  const bool consensus_ok = minimum_ready && maximum_ready &&
+      minimum == maximum && (minimum == 0 || minimum == 1);
+  agreed_mode = consensus_ok && minimum == 1;
+  return consensus_ok;
+}
+
+inline bool IsCudaBorrowedGlobalTopologyIdentity(
+    const StableIdentity& value) noexcept
+{
+  return value.valid() && !value.empty();
+}
+
+inline bool IsCudaAbsentBorrowedGlobalTopologyIdentity(
+    const StableIdentity& value) noexcept
+{
+  return value.empty();
+}
+
 struct CudaConfig
 {
   StableIdentity experiment = StableIdentity::Copy(experiment_id);
@@ -170,6 +278,14 @@ struct CudaConfig
   CudaBorrowedHostL2Input borrowed_initial{};
   // The sole empty spelling is {nullptr, 0, 4}; it selects a zero source.
   CudaBorrowedHostL2Input borrowed_source{};
+  // Nonempty only with a static physical-boundary policy table: this is the
+  // rank-common caller declaration of the complete borrowed global topology.
+  // It is an Initialize-only admission identity, not a mesh pointer, hash of
+  // local partition bytes, or post-initialization evidence payload.
+  StableIdentity borrowed_global_topology{};
+  // This descriptor is valid only for borrowed-host sessions.  Initialize
+  // validates and copies it; no caller policy pointer survives publication.
+  CudaStaticBoundaryPolicyTable borrowed_boundary_policies{};
   bool capture_oracle = false;
   bool force_private_scientific_gate_failure = false;
   CudaInjection injection{};

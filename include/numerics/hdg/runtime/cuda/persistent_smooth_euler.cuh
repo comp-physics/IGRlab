@@ -1093,6 +1093,9 @@ private:
   {
     config_.borrowed_initial.coefficients = nullptr;
     config_.borrowed_source.coefficients = nullptr;
+    config_.borrowed_boundary_policies.policies = nullptr;
+    config_.borrowed_boundary_policies.count = 0;
+    config_.borrowed_global_topology = {};
   }
 
   template <typename StagedOutput>
@@ -1269,6 +1272,19 @@ private:
               config_.borrowed_source.scalar_count != 0 &&
               config_.borrowed_source.components == conserved_components))
         : empty_l2(config_.borrowed_initial) && empty_l2(config_.borrowed_source);
+    const bool boundary_policy_configuration =
+        config_.use_borrowed_host_inputs
+        ? ValidateCudaStaticBoundaryPolicyTable(config_.borrowed_boundary_policies)
+        : config_.borrowed_boundary_policies.policies == nullptr &&
+            config_.borrowed_boundary_policies.count == 0;
+    const bool borrowed_topology_identity = config_.use_borrowed_host_inputs
+        ? (config_.borrowed_boundary_policies.count == 0
+            ? IsCudaAbsentBorrowedGlobalTopologyIdentity(
+                config_.borrowed_global_topology)
+            : IsCudaBorrowedGlobalTopologyIdentity(
+                config_.borrowed_global_topology))
+        : IsCudaAbsentBorrowedGlobalTopologyIdentity(
+            config_.borrowed_global_topology);
     const bool fixed_oracle_requested_for_generic_storage =
         config_.use_borrowed_topology && config_.use_borrowed_host_inputs &&
         config_.capture_oracle;
@@ -1276,6 +1292,8 @@ private:
         (borrowed_generic_shape || smoke_shape || functional_shape) &&
         topology_configuration &&
         generic_l2_configuration &&
+        boundary_policy_configuration &&
+        borrowed_topology_identity &&
         !fixed_oracle_requested_for_generic_storage &&
         std::isfinite(config_.dt) && config_.dt > 0.0 &&
         (config_.use_borrowed_host_inputs ||
@@ -1294,6 +1312,8 @@ private:
   }
 
   using ConfigDescriptor = std::array<unsigned char, 1024>;
+  using PolicyDescriptor = std::array<unsigned char, 2048>;
+  using TopologyDescriptor = std::array<unsigned char, 128>;
 
   template <typename Value>
   static void AppendConfigValue(ConfigDescriptor& descriptor,
@@ -1392,6 +1412,13 @@ private:
 
   bool ConfigurationConsensus() const noexcept
   {
+    bool borrowed_host_mode = false;
+    // This collective is intentionally before MakeConfigDescriptor: that
+    // descriptor has a borrowed-host-only branch and must never be entered
+    // asymmetrically.
+    if (!CudaBorrowedHostModeConsensus(config_.use_borrowed_host_inputs,
+                                       borrowed_host_mode))
+      return false;
     ConfigDescriptor local{};
     ConfigDescriptor minimum{};
     ConfigDescriptor maximum{};
@@ -1407,9 +1434,90 @@ private:
     const bool maximum_ready = MPI_Allreduce(
         local.data(), maximum.data(), static_cast<int>(local.size()),
         MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
-    return descriptor_complete && size_ready && minimum_ready &&
+    const bool base_consensus = descriptor_complete && size_ready && minimum_ready &&
         maximum_ready && ranks == config_.expected_rank_count &&
         minimum == maximum;
+    if (!base_consensus || !borrowed_host_mode) return base_consensus;
+    // True borrowed mode always proves the exact policy table.  The topology
+    // identity is a physical-boundary-only contract so legacy periodic
+    // borrowed callers retain their empty config spelling.
+    if (!PolicyTableConsensus()) return false;
+    return config_.borrowed_boundary_policies.count == 0 ||
+        TopologyIdentityConsensus();
+  }
+
+  bool TopologyIdentityConsensus() const noexcept
+  {
+    TopologyDescriptor local{}, minimum{}, maximum{};
+    const StableIdentity& identity = config_.borrowed_global_topology;
+    const std::uint64_t length = identity.size();
+    const std::uint8_t valid = identity.valid() ? 1U : 0U;
+    bool complete = IsCudaBorrowedGlobalTopologyIdentity(identity) &&
+        length <= local.size() - sizeof(length) - sizeof(valid);
+    std::size_t cursor = 0;
+    if (complete)
+    {
+      std::memcpy(local.data() + cursor, &length, sizeof(length));
+      cursor += sizeof(length);
+      std::memcpy(local.data() + cursor, &valid, sizeof(valid));
+      cursor += sizeof(valid);
+      std::memcpy(local.data() + cursor, identity.data(),
+                  static_cast<std::size_t>(length));
+    }
+    minimum = local;
+    maximum = local;
+    const int complete_bit = complete ? 1 : 0;
+    int all_complete = 0;
+    return MPI_Allreduce(&complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
+                         MPI_COMM_WORLD) == MPI_SUCCESS &&
+        MPI_Allreduce(local.data(), minimum.data(), static_cast<int>(local.size()),
+                      MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS &&
+        MPI_Allreduce(local.data(), maximum.data(), static_cast<int>(local.size()),
+                      MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS &&
+        all_complete == 1 && minimum == maximum;
+  }
+
+  bool PolicyTableConsensus() const noexcept
+  {
+    PolicyDescriptor local{}, minimum{}, maximum{};
+    std::size_t cursor = 0;
+    bool complete = ValidateCudaStaticBoundaryPolicyTable(
+        config_.borrowed_boundary_policies);
+    const auto append = [&](const auto& value)
+    {
+      using value_type = std::decay_t<decltype(value)>;
+      static_assert(std::is_trivially_copyable<value_type>::value,
+                    "policy descriptor values must be bitwise stable");
+      if (!complete || sizeof(value_type) > local.size() - cursor)
+      { complete = false; return; }
+      std::memcpy(local.data() + cursor, &value, sizeof(value_type));
+      cursor += sizeof(value_type);
+    };
+    append(config_.borrowed_boundary_policies.count);
+    const bool readable = config_.borrowed_boundary_policies.policies != nullptr &&
+        config_.borrowed_boundary_policies.count <= maximum_static_boundary_policies;
+    for (std::size_t index = 0; index < maximum_static_boundary_policies; ++index)
+    {
+      const CudaStaticBoundaryPolicy empty{};
+      const CudaStaticBoundaryPolicy& policy = readable && index <
+          config_.borrowed_boundary_policies.count
+          ? config_.borrowed_boundary_policies.policies[index] : empty;
+      append(policy.attribute);
+      const std::uint8_t kind = static_cast<std::uint8_t>(policy.kind);
+      append(kind);
+      for (const double reference : policy.reference_state) append(reference);
+    }
+    minimum = local;
+    maximum = local;
+    const int complete_bit = complete ? 1 : 0;
+    int all_complete = 0;
+    return MPI_Allreduce(&complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
+                         MPI_COMM_WORLD) == MPI_SUCCESS &&
+        MPI_Allreduce(local.data(), minimum.data(), static_cast<int>(local.size()),
+                      MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS &&
+        MPI_Allreduce(local.data(), maximum.data(), static_cast<int>(local.size()),
+                      MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS &&
+        all_complete == 1 && minimum == maximum;
   }
 
   bool PreparePending(const bool retry, const double dt,

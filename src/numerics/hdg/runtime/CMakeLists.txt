@@ -16,6 +16,20 @@ file(GLOB_RECURSE _dg_igr_hdg_runtime_all_cpp CONFIGURE_DEPENDS
 file(GLOB_RECURSE _dg_igr_hdg_runtime_all_cuda CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/*.cu")
 
+# CUDA-enabled MFEM conditionally extends mfem::SparseMatrix when a translation
+# unit is compiled by NVCC.  Any owner of that type must therefore use the same
+# language as the MFEM library in CUDA profiles; mixing a C++ owner with MFEM's
+# CUDA constructor is an object-layout ABI violation.
+set(_dg_igr_hdg_mfem_sparse_owner_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/cpu/persistent_sc25_scalar_igr.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cpu/persistent_smooth_euler.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cpu/traced_scalar_igr_p1_global_step.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../auxiliary/screened_poisson_cpu.cpp")
+if(MFEM_USE_CUDA)
+  set_source_files_properties(${_dg_igr_hdg_mfem_sparse_owner_sources}
+    PROPERTIES LANGUAGE CUDA)
+endif()
+
 set(_dg_igr_hdg_runtime_unclassified_cpp
     ${_dg_igr_hdg_runtime_all_cpp})
 list(REMOVE_ITEM _dg_igr_hdg_runtime_unclassified_cpp
@@ -47,6 +61,15 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT OR
   dg_igr_add_hdg_cxx17_component(
     TARGET dg_igr_hdg_auxiliary_cpu
     SOURCES ${_dg_igr_hdg_auxiliary_sources})
+  if(MFEM_USE_CUDA)
+    set_target_properties(dg_igr_hdg_auxiliary_cpu PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_EXTENSIONS OFF)
+    target_compile_options(dg_igr_hdg_auxiliary_cpu PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  endif()
 endif()
 
 if(DG_IGR_ENABLE_HDG_RUNTIME)
@@ -54,13 +77,15 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     set(_dg_igr_hdg_runtime_cuda_expected_sources
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/hdg_sc25_periodic_v3_device.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/hdg_sc25_periodic_v3_rank2_device.cu"
-        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu")
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/traced_scalar_igr_p1_private.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/traced_scalar_igr_p1_private_numerics.cu")
     list(SORT _dg_igr_hdg_runtime_cuda_sources)
     list(SORT _dg_igr_hdg_runtime_cuda_expected_sources)
     if(NOT _dg_igr_hdg_runtime_cuda_sources STREQUAL
        _dg_igr_hdg_runtime_cuda_expected_sources)
       message(FATAL_ERROR
-              "The frozen W8A+W8B CUDA component requires exactly persistent_smooth_euler.cu and the SC25 rank-one/rank-two device sources.")
+              "The frozen W8A+W8B CUDA component requires exactly persistent_smooth_euler.cu, the SC25 rank-one/rank-two device sources, and the private traced-scalar-IGR packed-batch/topology sources.")
     endif()
   endif()
 
@@ -125,6 +150,15 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     TARGET dg_igr_hdg_runtime_cpu
     SOURCES ${_dg_igr_hdg_runtime_cpu_sources}
     PUBLIC_LINK_LIBRARIES dg_igr_hdg_runtime_common)
+  if(MFEM_USE_CUDA)
+    set_target_properties(dg_igr_hdg_runtime_cpu PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_EXTENSIONS OFF)
+    target_compile_options(dg_igr_hdg_runtime_cpu PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  endif()
 
   if(NOT MFEM_USE_CUDA)
     add_library(dg_igr_hdg_main_backend_cpu STATIC
@@ -177,6 +211,10 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF)
+  if(MFEM_USE_CUDA)
+    set_target_properties(dg_igr_hdg_runtime_app_cpu PROPERTIES
+      CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+  endif()
 
   target_link_libraries(dg_igr_hdg_runtime_components INTERFACE
                         dg_igr_hdg_runtime_common
@@ -247,6 +285,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   if(MFEM_USE_CUDA)
     target_sources(dg_igr_hdg_runtime PRIVATE
       $<TARGET_OBJECTS:dg_igr_hdg_runtime_scalar_cuda_rank2_app>)
+    dg_igr_configure_hdg_cuda_final_consumer(dg_igr_hdg_runtime)
   endif()
   target_include_directories(dg_igr_hdg_runtime PRIVATE
                              "${PROJECT_SOURCE_DIR}/include")
@@ -268,12 +307,5 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
   if(MFEM_USE_CUDA)
     target_link_libraries(dg_igr_hdg_runtime PRIVATE
                           dg_igr_hdg_runtime_cuda)
-    set_target_properties(dg_igr_hdg_runtime PROPERTIES
-      CUDA_STANDARD 17
-      CUDA_STANDARD_REQUIRED ON
-      CUDA_EXTENSIONS OFF
-      CUDA_ARCHITECTURES 120
-      CUDA_SEPARABLE_COMPILATION ON
-      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   endif()
 endif()

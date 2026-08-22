@@ -12,9 +12,12 @@
 #include <mfem.hpp>
 
 #include <cstddef>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <type_traits>
+#include <vector>
 
 namespace dg::hdg::generic
 {
@@ -27,6 +30,24 @@ enum class BackendKind : std::uint8_t
 {
   cpu,
   cuda
+};
+
+/** Private numerical regularization selected by a borrowed Euler request. */
+enum class RegularizationKind : std::uint8_t
+{
+  none = 0,
+  igr = 1
+};
+
+/**
+ * Trailing, zero-compatible regularization payload.  The exact object bits of
+ * alpha and beta are collective request identity (not merely their values).
+ */
+struct RegularizationSelection
+{
+  RegularizationKind kind;
+  double alpha;
+  double beta;
 };
 
 enum class ContractStatus : std::uint8_t
@@ -45,7 +66,8 @@ enum class ContractStatus : std::uint8_t
   invalid_initial_state,
   invalid_source,
   invalid_boundary_operator,
-  collective_failure
+  collective_failure,
+  invalid_regularization
 };
 
 enum class Capability : std::uint32_t
@@ -121,6 +143,7 @@ struct EulerHdgRequest
   EulerFieldView initial_state;
   EulerFieldView source;
   BoundaryOperatorView boundary;
+  RegularizationSelection regularization;
 };
 
 static_assert(std::is_standard_layout<BackendSelection>::value &&
@@ -135,6 +158,9 @@ static_assert(std::is_standard_layout<BoundaryPointView>::value &&
 static_assert(std::is_standard_layout<BoundaryOperatorView>::value &&
                   std::is_trivial<BoundaryOperatorView>::value,
               "generic HDG boundary views must stay POD");
+static_assert(std::is_standard_layout<RegularizationSelection>::value &&
+                  std::is_trivial<RegularizationSelection>::value,
+              "generic HDG regularization must stay POD");
 static_assert(std::is_standard_layout<EulerHdgRequest>::value &&
                   std::is_trivial<EulerHdgRequest>::value &&
                   !std::is_polymorphic<EulerHdgRequest>::value,
@@ -144,6 +170,68 @@ constexpr bool HasCapabilities(const std::uint32_t available,
                                const std::uint32_t required) noexcept
 {
   return (available & required) == required;
+}
+
+inline std::uint64_t DoubleBits(const double value) noexcept
+{
+  std::uint64_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+inline bool ValidRegularizationSelection(
+    const RegularizationSelection selection) noexcept
+{
+  if (selection.kind == RegularizationKind::none)
+  {
+    return DoubleBits(selection.alpha) == 0 && DoubleBits(selection.beta) == 0;
+  }
+  return selection.kind == RegularizationKind::igr &&
+      std::isfinite(selection.alpha) && selection.alpha > 0.0 &&
+      std::isfinite(selection.beta) && selection.beta > 0.0;
+}
+
+/**
+ * Periodic MFEM meshes retain boundary-element annotations for faces that
+ * become interior (or rank-shared) after periodic identification.  IGR has
+ * no physical boundary treatment, so distinguish those annotations from a
+ * true physical boundary face rather than using GetNBE() directly.
+ */
+inline bool HasPhysicalBoundaryFace(const mfem::ParMesh& mesh) noexcept
+{
+  try
+  {
+    const int faces = mesh.GetNumFaces();
+    if (faces < 0) { return true; }
+    std::vector<bool> shared(static_cast<std::size_t>(faces), false);
+    const int shared_faces = mesh.GetNSharedFaces();
+    if (shared_faces < 0) { return true; }
+    for (int shared_face = 0; shared_face < shared_faces; ++shared_face)
+    {
+      const int face = mesh.GetSharedFace(shared_face);
+      if (face < 0 || face >= faces) { return true; }
+      shared[static_cast<std::size_t>(face)] = true;
+    }
+    for (int boundary = 0; boundary < mesh.GetNBE(); ++boundary)
+    {
+      const int face = mesh.GetBdrElementFaceIndex(boundary);
+      if (face < 0 || face >= faces) { return true; }
+    }
+
+    for (int face = 0; face < faces; ++face)
+    {
+      if (!mesh.FaceIsInterior(face) &&
+          !shared[static_cast<std::size_t>(face)])
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+  catch (...)
+  {
+    return true;
+  }
 }
 
 constexpr std::uint32_t RequiredCapabilities(
@@ -252,6 +340,33 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     RecordFailure(local_status, ContractStatus::incompatible_communicator);
   }
+  // Keep this fixed sequence even for malformed local input: validation is
+  // called collectively, and agreement is byte-exact for floating payloads.
+  const int local_kind = static_cast<int>(request.regularization.kind);
+  const std::uint64_t local_alpha = DoubleBits(request.regularization.alpha);
+  const std::uint64_t local_beta = DoubleBits(request.regularization.beta);
+  int min_kind = 0, max_kind = 0;
+  std::uint64_t min_alpha = 0, max_alpha = 0, min_beta = 0, max_beta = 0;
+  const int kind_min_result = MPI_Allreduce(&local_kind, &min_kind, 1, MPI_INT,
+                                            MPI_MIN, mesh_communicator);
+  const int kind_max_result = MPI_Allreduce(&local_kind, &max_kind, 1, MPI_INT,
+                                            MPI_MAX, mesh_communicator);
+  const int alpha_min_result = MPI_Allreduce(&local_alpha, &min_alpha, 1,
+      MPI_UINT64_T, MPI_MIN, mesh_communicator);
+  const int alpha_max_result = MPI_Allreduce(&local_alpha, &max_alpha, 1,
+      MPI_UINT64_T, MPI_MAX, mesh_communicator);
+  const int beta_min_result = MPI_Allreduce(&local_beta, &min_beta, 1,
+      MPI_UINT64_T, MPI_MIN, mesh_communicator);
+  const int beta_max_result = MPI_Allreduce(&local_beta, &max_beta, 1,
+      MPI_UINT64_T, MPI_MAX, mesh_communicator);
+  if (kind_min_result != MPI_SUCCESS || kind_max_result != MPI_SUCCESS ||
+      alpha_min_result != MPI_SUCCESS || alpha_max_result != MPI_SUCCESS ||
+      beta_min_result != MPI_SUCCESS || beta_max_result != MPI_SUCCESS ||
+      min_kind != max_kind || min_alpha != max_alpha || min_beta != max_beta ||
+      !ValidRegularizationSelection(request.regularization))
+  {
+    RecordFailure(local_status, ContractStatus::invalid_regularization);
+  }
   if (request.backend.kind != BackendKind::cpu &&
       request.backend.kind != BackendKind::cuda)
   {
@@ -283,6 +398,13 @@ inline ContractStatus ValidateEulerHdgRequest(
       request.polynomial_order > maximum_polynomial_order)
   {
     RecordFailure(local_status, ContractStatus::unsupported_polynomial_order);
+  }
+  if (request.regularization.kind == RegularizationKind::igr &&
+      (request.backend.kind != BackendKind::cpu ||
+       request.polynomial_order != minimum_polynomial_order ||
+       HasPhysicalBoundaryFace(*request.mesh)))
+  {
+    RecordFailure(local_status, ContractStatus::invalid_regularization);
   }
   if ((request.backend.kind == BackendKind::cpu &&
        request.backend.device_ordinal != -1) ||

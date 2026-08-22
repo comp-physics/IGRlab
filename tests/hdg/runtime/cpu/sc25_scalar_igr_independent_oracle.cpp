@@ -8,6 +8,9 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <set>
 #include <string>
@@ -3623,6 +3626,338 @@ bool RehashIndependentRank2Checkpoint(
       dg::hdg::runtime::StateHash{};
   return checkpoint.canonical_manifest_hash !=
       dg::hdg::runtime::StateHash{};
+}
+
+namespace
+{
+
+struct IndependentScalarVtk final
+{
+  std::size_t points = 0;
+  std::size_t cells = 0;
+  std::vector<std::uint64_t> connectivity;
+  std::vector<int> cell_types;
+  std::vector<int> materials;
+  std::vector<int> material_ids;
+  std::vector<double> coordinates;
+  std::array<std::vector<double>, 7> fields;
+};
+
+bool ReadIndependentScalarVtk(const std::string& path,
+                              IndependentScalarVtk& field)
+{
+  std::ifstream input(path);
+  if (!input) { return false; }
+  std::vector<std::string> tokens;
+  for (std::string token; input >> token;) { tokens.push_back(token); }
+  const auto find = [&tokens](const std::string& value, std::size_t begin)
+  {
+    for (std::size_t index = begin; index < tokens.size(); ++index)
+      if (tokens[index] == value) { return index; }
+    return tokens.size();
+  };
+  try
+  {
+    const auto expect = [&tokens](const std::size_t index,
+                                  const std::string& value)
+    { return index < tokens.size() && tokens[index] == value; };
+    std::size_t cursor = find("FIELD", 0);
+    if (cursor == tokens.size() || find("FIELD", cursor + 1) != tokens.size() ||
+        !expect(cursor + 1, "FieldData") || !expect(cursor + 2, "1") ||
+        !expect(cursor + 3, "MaterialIds") || !expect(cursor + 4, "1") ||
+        !expect(cursor + 5, "1") || !expect(cursor + 6, "int") ||
+        cursor + 7 >= tokens.size())
+      return false;
+    field.material_ids = {std::stoi(tokens[cursor + 7])};
+    cursor += 8;
+    if (!expect(cursor, "POINTS") || cursor + 2 >= tokens.size() ||
+        !expect(cursor + 2, "double"))
+      return false;
+    field.points = static_cast<std::size_t>(std::stoull(tokens[cursor + 1]));
+    cursor += 3;
+    field.coordinates.resize(3 * field.points);
+    for (double& value : field.coordinates)
+    {
+      if (cursor >= tokens.size()) { return false; }
+      value = std::stod(tokens[cursor++]);
+    }
+    if (!expect(cursor, "CELLS") || cursor + 2 >= tokens.size()) return false;
+    field.cells = static_cast<std::size_t>(std::stoull(tokens[cursor + 1]));
+    if (static_cast<std::size_t>(std::stoull(tokens[cursor + 2])) !=
+        5 * field.cells)
+      return false;
+    cursor += 3;
+    field.connectivity.reserve(4 * field.cells);
+    for (std::size_t cell = 0; cell < field.cells; ++cell)
+    {
+      if (cursor >= tokens.size() || std::stoull(tokens[cursor++]) != 4)
+        return false;
+      for (int vertex = 0; vertex < 4; ++vertex)
+      {
+        if (cursor >= tokens.size()) { return false; }
+        const std::uint64_t point = std::stoull(tokens[cursor++]);
+        if (point >= field.points) { return false; }
+        field.connectivity.push_back(point);
+      }
+    }
+    if (!expect(cursor, "CELL_TYPES") || cursor + 1 >= tokens.size() ||
+        static_cast<std::size_t>(std::stoull(tokens[cursor + 1])) !=
+            field.cells)
+      return false;
+    cursor += 2;
+    field.cell_types.resize(field.cells);
+    for (int& value : field.cell_types)
+    {
+      if (cursor >= tokens.size()) { return false; }
+      value = std::stoi(tokens[cursor++]);
+    }
+    if (!expect(cursor, "CELL_DATA") || cursor + 6 >= tokens.size() ||
+        static_cast<std::size_t>(std::stoull(tokens[cursor + 1])) !=
+            field.cells ||
+        !expect(cursor + 2, "SCALARS") || !expect(cursor + 3, "material") ||
+        !expect(cursor + 4, "int") || !expect(cursor + 5, "LOOKUP_TABLE") ||
+        !expect(cursor + 6, "default"))
+      return false;
+    cursor += 7;
+    field.materials.resize(field.cells);
+    for (int& value : field.materials)
+    {
+      if (cursor >= tokens.size()) { return false; }
+      value = std::stoi(tokens[cursor++]);
+    }
+    if (!expect(cursor, "SCALARS") ||
+        !expect(cursor + 1, "element_coloring") ||
+        !expect(cursor + 2, "int") || !expect(cursor + 3, "LOOKUP_TABLE") ||
+        !expect(cursor + 4, "default"))
+      return false;
+    cursor += 5;
+    for (std::size_t cell = 0; cell < field.cells; ++cell)
+    {
+      if (cursor >= tokens.size()) { return false; }
+      (void)std::stoi(tokens[cursor++]);
+    }
+    if (!expect(cursor, "POINT_DATA") || cursor + 1 >= tokens.size() ||
+        static_cast<std::size_t>(std::stoull(tokens[cursor + 1])) !=
+            field.points)
+      return false;
+    cursor += 2;
+    constexpr std::array<const char*, 5> scalar_names{{"U0", "U1", "U2",
+                                                         "U3", "Sigma"}};
+    for (std::size_t component = 0; component < scalar_names.size();
+         ++component)
+    {
+      if (!expect(cursor, "SCALARS") ||
+          !expect(cursor + 1, scalar_names[component]) ||
+          !expect(cursor + 2, "double") || !expect(cursor + 3, "1") ||
+          !expect(cursor + 4, "LOOKUP_TABLE") || !expect(cursor + 5, "default"))
+        return false;
+      cursor += 6;
+      field.fields[component].resize(field.points);
+      for (double& value : field.fields[component])
+      {
+        if (cursor >= tokens.size()) { return false; }
+        value = std::stod(tokens[cursor++]);
+      }
+    }
+    if (!expect(cursor, "VECTORS") || !expect(cursor + 1, "z") ||
+        !expect(cursor + 2, "double"))
+      return false;
+    cursor += 3;
+    field.fields[5].resize(field.points);
+    field.fields[6].resize(field.points);
+    for (std::size_t point = 0; point < field.points; ++point)
+    {
+      if (cursor + 2 >= tokens.size()) { return false; }
+      field.fields[5][point] = std::stod(tokens[cursor++]);
+      field.fields[6][point] = std::stod(tokens[cursor++]);
+      if (std::stod(tokens[cursor++]) != 0.0) { return false; }
+    }
+    return cursor == tokens.size();
+  }
+  catch (...) { return false; }
+}
+
+bool IndependentScalarNear(const double actual, const double expected,
+                           const double tolerance)
+{
+  return std::isfinite(actual) && std::isfinite(expected) &&
+      std::abs(actual - expected) <=
+      tolerance * std::max({1.0, std::abs(actual), std::abs(expected)});
+}
+
+} // namespace
+
+bool ValidateIndependentSc25VtkArtifact(
+    sc25::PersistentSc25ScalarIgrCpuFoundation& foundation,
+    const sc25::PersistentTrajectoryState& state, const int expected_step,
+    const std::string& path, const double tolerance, std::string& failure)
+{
+  failure.clear();
+  IndependentScalarVtk artifact;
+  if ((expected_step != 10 && expected_step != 20) || !(tolerance > 0.0) ||
+      !ReadIndependentScalarVtk(path, artifact))
+  {
+    failure = "artifact parse or requested step";
+    return false;
+  }
+  constexpr int n = 8;
+  constexpr int scalar_dofs = 4;
+  constexpr int elements = n * n;
+  if (artifact.points != static_cast<std::size_t>(4 * elements) ||
+      artifact.cells != static_cast<std::size_t>(elements) ||
+      artifact.connectivity.size() != artifact.points ||
+      artifact.cell_types.size() != artifact.cells ||
+      artifact.materials.size() != artifact.cells ||
+      artifact.material_ids != std::vector<int>{1} ||
+      state.u.size() != static_cast<std::size_t>(elements * 4 * scalar_dofs) ||
+      state.sigma.size() != static_cast<std::size_t>(elements * scalar_dofs) ||
+      state.z.size() != static_cast<std::size_t>(elements * 2 * scalar_dofs))
+  {
+    failure = "artifact/reference extent";
+    return false;
+  }
+  const sc25::SpaceOwnershipSnapshot spaces = foundation.spaces();
+  if (!spaces.u.address || spaces.u.address->GetVDim() != 4 ||
+      foundation.trajectory_evidence().coordinates.step !=
+          static_cast<std::uint64_t>(expected_step))
+  {
+    failure = "independent reference state";
+    return false;
+  }
+  sc25::AuxiliaryResidualMetrics q12{}, q14{};
+  if (!EvaluateIndependentAuxiliaryResidualOracle(
+          foundation, state, sc25::coupled_fixture_quadrature_order, q12) ||
+      !EvaluateIndependentAuxiliaryResidualOracle(
+          foundation, state, sc25::coupled_fixture_repeat_quadrature_order,
+          q14) ||
+      q12.normalized_maximum > 1.0e-10 || q14.normalized_maximum > 1.0e-10)
+  {
+    failure = "independent SC25 numerical residual";
+    return false;
+  }
+  constexpr std::array<int, 4> vtk_order{{0, 1, 3, 2}};
+  for (int element = 0; element < elements; ++element)
+  {
+    const int ex = element % n;
+    const int ey = element / n;
+    const mfem::FiniteElement* finite_element =
+        spaces.u.address->GetFE(element);
+    if (!finite_element || finite_element->GetDof() != scalar_dofs ||
+        artifact.cell_types[static_cast<std::size_t>(element)] != 9 ||
+        artifact.materials[static_cast<std::size_t>(element)] != 1)
+    {
+      failure = "independent element topology";
+      return false;
+    }
+    for (int vertex = 0; vertex < 4; ++vertex)
+    {
+      const std::size_t point =
+          static_cast<std::size_t>(4 * element + vertex);
+      if (artifact.connectivity[point] !=
+          static_cast<std::uint64_t>(4 * element + vtk_order[vertex]))
+      {
+        failure = "independent connectivity";
+        return false;
+      }
+      const double x = artifact.coordinates[3 * point];
+      const double y = artifact.coordinates[3 * point + 1];
+      const int vx = vertex == 1 || vertex == 3 ? 1 : 0;
+      const int vy = vertex >= 2 ? 1 : 0;
+      if (!IndependentScalarNear(x, static_cast<double>(ex + vx) / n, 1.0e-14) ||
+          !IndependentScalarNear(y, static_cast<double>(ey + vy) / n, 1.0e-14) ||
+          artifact.coordinates[3 * point + 2] != 0.0)
+      {
+        failure = "independent physical point map";
+        return false;
+      }
+      mfem::IntegrationPoint ip;
+      ip.x = x * n - ex;
+      ip.y = y * n - ey;
+      mfem::Vector shape(scalar_dofs);
+      finite_element->CalcShape(ip, shape);
+      const auto evaluate = [&shape, element](const std::vector<double>& values,
+                                               const int components,
+                                               const int component)
+      {
+        const std::size_t base = static_cast<std::size_t>(element) *
+            components * scalar_dofs + component * scalar_dofs;
+        double value = 0.0;
+        for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+          value += values[base + static_cast<std::size_t>(scalar)] *
+              shape[scalar];
+        return value;
+      };
+      for (int component = 0; component < 4; ++component)
+        if (!IndependentScalarNear(
+                artifact.fields[static_cast<std::size_t>(component)][point],
+                evaluate(state.u, 4, component), tolerance))
+        {
+          failure = "independent U field value";
+          return false;
+        }
+      if (!IndependentScalarNear(artifact.fields[4][point],
+                                 evaluate(state.sigma, 1, 0), tolerance) ||
+          !IndependentScalarNear(artifact.fields[5][point],
+                                 evaluate(state.z, 2, 0), tolerance) ||
+          !IndependentScalarNear(artifact.fields[6][point],
+                                 evaluate(state.z, 2, 1), tolerance))
+      {
+        failure = "independent auxiliary field value";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool MakeIndependentSc25VtkArtifactNegative(const std::string& input_path,
+                                             const std::string& output_path,
+                                             std::string& failure)
+{
+  failure.clear();
+  std::ifstream input(input_path, std::ios::binary);
+  if (!input)
+  {
+    failure = "negative input";
+    return false;
+  }
+  std::string payload((std::istreambuf_iterator<char>(input)),
+                      std::istreambuf_iterator<char>());
+  constexpr char u0_marker[] = "SCALARS U0 double 1\nLOOKUP_TABLE default\n";
+  const std::size_t marker = payload.find(u0_marker);
+  if (marker == std::string::npos)
+  {
+    failure = "negative U0 marker";
+    return false;
+  }
+  const std::size_t value_begin = marker + sizeof(u0_marker) - 1;
+  std::size_t value_count = 0;
+  double value = 0.0;
+  try { value = std::stod(payload.substr(value_begin), &value_count); }
+  catch (...)
+  {
+    failure = "negative U0 value";
+    return false;
+  }
+  if (value_count == 0 || !std::isfinite(value))
+  {
+    failure = "negative U0 finite value";
+    return false;
+  }
+  payload.replace(value_begin, value_count, std::to_string(value + 1.0));
+  std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+  if (!output)
+  {
+    failure = "negative output";
+    return false;
+  }
+  output << payload;
+  if (!output)
+  {
+    failure = "negative write";
+    return false;
+  }
+  return true;
 }
 
 } // namespace dg_igr_hdg_sc25_cpu_test

@@ -2,6 +2,14 @@ add_executable(dg_igr_hdg_runtime_cpu_test
   independent_oracle.cpp
   test_persistent_smooth_euler.cpp)
 
+if(MFEM_USE_CUDA)
+  set_source_files_properties(independent_oracle.cpp PROPERTIES LANGUAGE CUDA)
+  set_target_properties(dg_igr_hdg_runtime_cpu_test PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF)
+endif()
+
 target_include_directories(dg_igr_hdg_runtime_cpu_test
   PRIVATE
     "${PROJECT_SOURCE_DIR}/include"
@@ -15,13 +23,26 @@ target_link_libraries(dg_igr_hdg_runtime_cpu_test
 
 target_compile_options(dg_igr_hdg_runtime_cpu_test
   PRIVATE
-    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
 
 set_target_properties(dg_igr_hdg_runtime_cpu_test
   PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF)
+
+if(MFEM_USE_CUDA)
+  set_target_properties(dg_igr_hdg_runtime_cpu_test PROPERTIES
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  get_target_property(_dg_igr_hdg_runtime_cpu_test_resolve
+                      dg_igr_hdg_runtime_cpu_test
+                      CUDA_RESOLVE_DEVICE_SYMBOLS)
+  if(NOT _dg_igr_hdg_runtime_cpu_test_resolve STREQUAL "ON")
+    message(FATAL_ERROR
+            "dg_igr_hdg_runtime_cpu_test must own CUDA device-symbol resolution in CUDA profiles.")
+  endif()
+endif()
 
 add_test(
   NAME hdg_runtime_cpu_serial
@@ -163,6 +184,90 @@ foreach(_ranks IN ITEMS 1 2 3)
     RESOURCE_LOCK hdg_generic_euler_cpu
     LABELS "hdg;generic;cpu;mpi"
     TIMEOUT 180)
+endforeach()
+
+add_executable(dg_igr_hdg_traced_scalar_igr_p1_local_test
+  test_traced_scalar_igr_p1_local.cpp)
+target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_local_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_local_test PRIVATE
+  dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
+target_compile_options(dg_igr_hdg_traced_scalar_igr_p1_local_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_traced_scalar_igr_p1_local_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+add_test(NAME hdg_traced_scalar_igr_p1_local
+  COMMAND dg_igr_hdg_traced_scalar_igr_p1_local_test)
+set_tests_properties(hdg_traced_scalar_igr_p1_local PROPERTIES
+  PROCESSORS 1 RESOURCE_LOCK hdg_traced_scalar_igr_p1_local TIMEOUT 180
+  LABELS "hdg;traced-scalar-igr;local;cpu")
+
+add_executable(dg_igr_hdg_borrowed_p1_dg_interface_layout_test
+  test_borrowed_p1_dg_interface_layout.cpp)
+target_include_directories(dg_igr_hdg_borrowed_p1_dg_interface_layout_test
+  PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PRIVATE
+  dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
+target_compile_options(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_borrowed_p1_dg_interface_layout_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+foreach(_ranks IN ITEMS 1 2 3)
+  if(_ranks EQUAL 1)
+    add_test(NAME hdg_borrowed_p1_dg_interface_layout_rank1
+      COMMAND dg_igr_hdg_borrowed_p1_dg_interface_layout_test)
+  else()
+    add_test(NAME hdg_borrowed_p1_dg_interface_layout_rank${_ranks}
+      COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" ${_ranks}
+              ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:dg_igr_hdg_borrowed_p1_dg_interface_layout_test>
+              ${MPIEXEC_POSTFLAGS})
+  endif()
+  set_tests_properties(hdg_borrowed_p1_dg_interface_layout_rank${_ranks}
+    PROPERTIES
+      PROCESSORS ${_ranks}
+      RESOURCE_LOCK hdg_borrowed_p1_dg_interface_layout
+      LABELS "hdg;runtime;cpu;borrowed;dg-interface;layout;mpi"
+      TIMEOUT 180)
+endforeach()
+
+add_executable(dg_igr_hdg_traced_scalar_igr_p1_global_step_test
+  test_traced_scalar_igr_p1_global_step.cpp)
+if(MFEM_USE_CUDA)
+  set_source_files_properties(test_traced_scalar_igr_p1_global_step.cpp
+    PROPERTIES LANGUAGE CUDA)
+  set_target_properties(dg_igr_hdg_traced_scalar_igr_p1_global_step_test
+    PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_EXTENSIONS OFF)
+endif()
+target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_global_step_test
+  PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_global_step_test PRIVATE
+  dg_igr_hdg_runtime_cpu mfem MPI::MPI_CXX)
+target_compile_options(dg_igr_hdg_traced_scalar_igr_p1_global_step_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+set_target_properties(dg_igr_hdg_traced_scalar_igr_p1_global_step_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+foreach(_ranks IN ITEMS 1 2 3)
+  if(_ranks EQUAL 1)
+    add_test(NAME hdg_traced_scalar_igr_p1_global_step_rank1
+      COMMAND dg_igr_hdg_traced_scalar_igr_p1_global_step_test)
+  else()
+    add_test(NAME hdg_traced_scalar_igr_p1_global_step_rank${_ranks}
+      COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" ${_ranks}
+              ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:dg_igr_hdg_traced_scalar_igr_p1_global_step_test>
+              ${MPIEXEC_POSTFLAGS})
+  endif()
+  set_tests_properties(hdg_traced_scalar_igr_p1_global_step_rank${_ranks}
+    PROPERTIES
+      PROCESSORS ${_ranks}
+      RESOURCE_LOCK hdg_traced_scalar_igr_p1_global_step
+      LABELS "hdg;runtime;cpu;traced-scalar-igr;global-step;mpi"
+      TIMEOUT 180)
 endforeach()
 
 foreach(_n IN ITEMS 3 6 12)

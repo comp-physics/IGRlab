@@ -2,23 +2,39 @@ if(NOT DEFINED TEST_EXE OR NOT DEFINED SENTINEL)
   message(FATAL_ERROR "TEST_EXE and SENTINEL are required.")
 endif()
 
-file(REMOVE "${SENTINEL}")
-execute_process(
-  COMMAND "${CMAKE_COMMAND}" -E env
-          "DG_IGR_CONFIG_BOUNDARY_SENTINEL=${SENTINEL}"
-          "${TEST_EXE}" --discretization hdg
-  RESULT_VARIABLE result
-  OUTPUT_VARIABLE stdout
-  ERROR_VARIABLE stderr
-)
-set(output "${stdout}\n${stderr}")
+function(expect_early_rejection expected_diagnostic)
+  file(REMOVE "${SENTINEL}")
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E env
+            "DG_IGR_CONFIG_BOUNDARY_SENTINEL=${SENTINEL}"
+            "${TEST_EXE}" ${ARGN}
+    RESULT_VARIABLE result
+    OUTPUT_VARIABLE stdout
+    ERROR_VARIABLE stderr
+  )
+  set(output "${stdout}\n${stderr}")
 
-if("${result}" STREQUAL "0")
-  message(FATAL_ERROR "--discretization hdg unexpectedly returned zero.\n${output}")
-endif()
-if(NOT output MATCHES "Case 'discretization-cli-boundary' does not provide an HDG backend adapter\\.")
-  message(FATAL_ERROR "Expected case-level HDG diagnostic was not emitted.\n${output}")
-endif()
-if(EXISTS "${SENTINEL}")
-  message(FATAL_ERROR "HDG rejection reached the post-setup make_ic callback.")
-endif()
+  if("${result}" STREQUAL "0")
+    message(FATAL_ERROR "Rejected request unexpectedly returned zero.\n${output}")
+  endif()
+  if(NOT output MATCHES "${expected_diagnostic}")
+    message(FATAL_ERROR
+      "Expected early rejection diagnostic was not emitted.\n${output}")
+  endif()
+  if(EXISTS "${SENTINEL}")
+    message(FATAL_ERROR "Rejected request reached the post-setup make_ic callback.")
+  endif()
+endfunction()
+
+expect_early_rejection(
+  "Case 'discretization-cli-boundary' does not provide an HDG backend adapter\\."
+  --discretization hdg)
+expect_early_rejection(
+  "Time integrator 'backward-euler' is unavailable for DG/DGSEM"
+  --time-integrator backward-euler)
+expect_early_rejection(
+  "Time integrator 'rk3ssp' is unavailable for HDG"
+  --discretization hdg --time-integrator rk3ssp)
+expect_early_rejection(
+  "Regularization 'igr' with HDG is available only on --device cpu\\."
+  --discretization hdg --regularization igr --device cuda)

@@ -364,6 +364,44 @@ int CodimensionOneGeometries(
 }
 }  // namespace
 
+Status HostReferenceEngine::Prepare(const LocalBlockShape& shape,
+                                    const std::size_t batches) noexcept
+{
+  if (!IsValidLocalBlockShape(shape) || shape.InteriorUnknowns() <= 0 ||
+      shape.TraceUnknowns() <= 0) return Status::invalid_shape;
+  const std::size_t ni = static_cast<std::size_t>(shape.InteriorUnknowns());
+  const std::size_t nt = static_cast<std::size_t>(shape.TraceUnknowns());
+  std::size_t ni2 = 0, nint = 0, ntni = 0, nt2 = 0;
+  std::size_t lu_count = 0, b_count = 0, c_count = 0, d_count = 0;
+  std::size_t f_count = 0, rhs_count = 0, work_count = 0;
+  if (!Multiply(ni, ni, ni2) || !Multiply(ni, nt, nint) ||
+      !Multiply(nt, ni, ntni) || !Multiply(nt, nt, nt2) ||
+      !Multiply(batches, ni2, lu_count) || !Multiply(batches, nint, b_count) ||
+      !Multiply(batches, ntni, c_count) || !Multiply(batches, nt2, d_count) ||
+      !Multiply(batches, ni, f_count) || !Multiply(batches, nt, rhs_count) ||
+      !Multiply(ni, nt + 1, work_count)) return Status::overflow;
+  try
+  {
+    std::vector<double> next_lu(lu_count), next_b(b_count), next_c(c_count),
+        next_d(d_count), next_f(f_count), next_staged_lu(lu_count),
+        next_staged_b(b_count), next_staged_c(c_count), next_staged_d(d_count),
+        next_staged_f(f_count), next_staged_schur(d_count),
+        next_staged_rhs(rhs_count), next_work(work_count), next_recovered(f_count);
+    std::vector<int> next_pivots(f_count), next_staged_pivots(f_count);
+    lu_.swap(next_lu); b_.swap(next_b); c_.swap(next_c); d_.swap(next_d);
+    f_.swap(next_f); pivots_.swap(next_pivots);
+    staged_lu_.swap(next_staged_lu); staged_b_.swap(next_staged_b);
+    staged_c_.swap(next_staged_c); staged_d_.swap(next_staged_d);
+    staged_f_.swap(next_staged_f); staged_pivots_.swap(next_staged_pivots);
+    staged_schur_.swap(next_staged_schur); staged_rhs_.swap(next_staged_rhs);
+    work_.swap(next_work); recovered_.swap(next_recovered);
+  }
+  catch (const std::bad_alloc&) { return Status::allocation_failure; }
+  catch (const std::length_error&) { return Status::allocation_failure; }
+  shape_ = shape; batch_count_ = batches; ready_ = false;
+  return Status::success;
+}
+
 Status HostReferenceEngine::Condense(const LocalSystemBatchView& input,
                                      const CondensedBatchView& output) noexcept
 {
@@ -399,11 +437,40 @@ Status HostReferenceEngine::Condense(const LocalSystemBatchView& input,
     alias_status=ValidateDisjoint(output.right_hand_side,read_view);
     if(alias_status!=Status::success) return alias_status;
   }
+  const bool prepared = shape_.interior_dofs == input.shape.interior_dofs &&
+      shape_.trace_dofs == input.shape.trace_dofs &&
+      shape_.interior_components == input.shape.interior_components &&
+      shape_.trace_components == input.shape.trace_components &&
+      batch_count_ == batches && lu_.size() == lu_count && b_.size() == b_count &&
+      c_.size() == c_count && d_.size() == d_count && f_.size() == f_count &&
+      pivots_.size() == f_count && staged_lu_.size() == lu_count &&
+      staged_b_.size() == b_count && staged_c_.size() == c_count &&
+      staged_d_.size() == d_count && staged_f_.size() == f_count &&
+      staged_pivots_.size() == f_count && staged_schur_.size() == d_count &&
+      staged_rhs_.size() == rhs_count && work_.size() >= nint + ni;
   try
   {
-    std::vector<double> new_lu(lu_count), new_b(b_count), new_c(c_count),
-        new_d(d_count), new_f(f_count), new_s(d_count), new_rhs(rhs_count), x(nint), y(ni);
-    std::vector<int> new_pivots(f_count);
+    std::vector<double> local_lu, local_b, local_c, local_d, local_f,
+        local_s, local_rhs, local_work;
+    std::vector<int> local_pivots;
+    std::vector<double>& new_lu = prepared ? staged_lu_ : local_lu;
+    std::vector<double>& new_b = prepared ? staged_b_ : local_b;
+    std::vector<double>& new_c = prepared ? staged_c_ : local_c;
+    std::vector<double>& new_d = prepared ? staged_d_ : local_d;
+    std::vector<double>& new_f = prepared ? staged_f_ : local_f;
+    std::vector<double>& new_s = prepared ? staged_schur_ : local_s;
+    std::vector<double>& new_rhs = prepared ? staged_rhs_ : local_rhs;
+    std::vector<int>& new_pivots = prepared ? staged_pivots_ : local_pivots;
+    std::vector<double>& workspace = prepared ? work_ : local_work;
+    if (!prepared)
+    {
+      new_lu.resize(lu_count); new_b.resize(b_count); new_c.resize(c_count);
+      new_d.resize(d_count); new_f.resize(f_count); new_s.resize(d_count);
+      new_rhs.resize(rhs_count); new_pivots.resize(f_count);
+      workspace.resize(nint + ni);
+    }
+    double* const x = workspace.data();
+    double* const y = workspace.data() + nint;
     for (std::size_t batch=0; batch<batches; ++batch)
     {
       double* lu=new_lu.data()+batch*ni2; CopyIn(input.a,batch,lu);
@@ -413,9 +480,9 @@ Status HostReferenceEngine::Condense(const LocalSystemBatchView& input,
           !AllFinite(new_d.data()+batch*nt2,nt2) || !AllFinite(new_f.data()+batch*ni,ni)) return Status::non_finite;
       for (std::size_t i=0;i<nt;++i) if (!std::isfinite(input.g(batch,static_cast<LocalIndex>(i),0))) return Status::non_finite;
       if (!Factor(lu,new_pivots.data()+batch*ni,ni)) return Status::singular;
-      std::copy(new_b.begin()+static_cast<std::ptrdiff_t>(batch*nint),new_b.begin()+static_cast<std::ptrdiff_t>((batch+1)*nint),x.begin());
-      std::copy(new_f.begin()+static_cast<std::ptrdiff_t>(batch*ni),new_f.begin()+static_cast<std::ptrdiff_t>((batch+1)*ni),y.begin());
-      if (!Solve(lu,new_pivots.data()+batch*ni,ni,x.data(),nt) || !Solve(lu,new_pivots.data()+batch*ni,ni,y.data(),1)) return Status::non_finite;
+      std::copy(new_b.begin()+static_cast<std::ptrdiff_t>(batch*nint),new_b.begin()+static_cast<std::ptrdiff_t>((batch+1)*nint),x);
+      std::copy(new_f.begin()+static_cast<std::ptrdiff_t>(batch*ni),new_f.begin()+static_cast<std::ptrdiff_t>((batch+1)*ni),y);
+      if (!Solve(lu,new_pivots.data()+batch*ni,ni,x,nt) || !Solve(lu,new_pivots.data()+batch*ni,ni,y,1)) return Status::non_finite;
       double* s=new_s.data()+batch*nt2; double* rhs=new_rhs.data()+batch*nt;
       for (std::size_t row=0;row<nt;++row)
       {
@@ -431,7 +498,18 @@ Status HostReferenceEngine::Condense(const LocalSystemBatchView& input,
       }
     }
     for (std::size_t batch=0;batch<batches;++batch) { CopyOut(new_s.data()+batch*nt2,nt,nt,output.schur,batch); CopyOut(new_rhs.data()+batch*nt,nt,1,output.right_hand_side,batch); }
-    shape_=input.shape; batch_count_=batches; lu_.swap(new_lu); pivots_.swap(new_pivots); b_.swap(new_b); c_.swap(new_c); d_.swap(new_d); f_.swap(new_f); ready_=true;
+    if (prepared)
+    {
+      std::copy(new_lu.begin(), new_lu.end(), lu_.begin());
+      std::copy(new_pivots.begin(), new_pivots.end(), pivots_.begin());
+      std::copy(new_b.begin(), new_b.end(), b_.begin());
+      std::copy(new_c.begin(), new_c.end(), c_.begin());
+      std::copy(new_d.begin(), new_d.end(), d_.begin());
+      std::copy(new_f.begin(), new_f.end(), f_.begin());
+    }
+    else
+    { shape_=input.shape; batch_count_=batches; lu_.swap(new_lu); pivots_.swap(new_pivots); b_.swap(new_b); c_.swap(new_c); d_.swap(new_d); f_.swap(new_f); }
+    ready_=true;
     return Status::success;
   }
   catch (const std::bad_alloc&) { return Status::allocation_failure; }
@@ -448,13 +526,18 @@ Status HostReferenceEngine::ApplySchur(const StridedBlockView<const double> trac
   const Status result_status = ValidateWritable(result,batch_count_,nt,1);
   if (result_status != Status::success) { return result_status; }
   try {
-    std::vector<double> staged(batch_count_*nt), local(ni);
+    const bool prepared = staged_rhs_.size() == batch_count_ * nt &&
+        work_.size() >= ni;
+    std::vector<double> staged, local;
+    std::vector<double>& staged_values = prepared ? staged_rhs_ : staged;
+    std::vector<double>& local_values = prepared ? work_ : local;
+    if (!prepared) { staged_values.resize(batch_count_*nt); local_values.resize(ni); }
     for (std::size_t batch=0;batch<batch_count_;++batch) {
-      for (std::size_t i=0;i<ni;++i) { local[i]=0.; for (std::size_t j=0;j<nt;++j) { if(!std::isfinite(trace(batch,j,0))) return Status::non_finite; local[i]+=b_[batch*ni*nt+i*nt+j]*trace(batch,j,0); } }
-      if (!Solve(lu_.data()+batch*ni*ni,pivots_.data()+batch*ni,ni,local.data(),1)) return Status::non_finite;
-      for (std::size_t row=0;row<nt;++row) { staged[batch*nt+row]=0.; for(std::size_t col=0;col<nt;++col) staged[batch*nt+row]+=d_[batch*nt*nt+row*nt+col]*trace(batch,col,0); for(std::size_t k=0;k<ni;++k) staged[batch*nt+row]-=c_[batch*nt*ni+row*ni+k]*local[k]; if(!std::isfinite(staged[batch*nt+row])) return Status::non_finite; }
+      for (std::size_t i=0;i<ni;++i) { local_values[i]=0.; for (std::size_t j=0;j<nt;++j) { if(!std::isfinite(trace(batch,j,0))) return Status::non_finite; local_values[i]+=b_[batch*ni*nt+i*nt+j]*trace(batch,j,0); } }
+      if (!Solve(lu_.data()+batch*ni*ni,pivots_.data()+batch*ni,ni,local_values.data(),1)) return Status::non_finite;
+      for (std::size_t row=0;row<nt;++row) { staged_values[batch*nt+row]=0.; for(std::size_t col=0;col<nt;++col) staged_values[batch*nt+row]+=d_[batch*nt*nt+row*nt+col]*trace(batch,col,0); for(std::size_t k=0;k<ni;++k) staged_values[batch*nt+row]-=c_[batch*nt*ni+row*ni+k]*local_values[k]; if(!std::isfinite(staged_values[batch*nt+row])) return Status::non_finite; }
     }
-    for(std::size_t batch=0;batch<batch_count_;++batch) CopyOut(staged.data()+batch*nt,nt,1,result,batch);
+    for(std::size_t batch=0;batch<batch_count_;++batch) CopyOut(staged_values.data()+batch*nt,nt,1,result,batch);
     return Status::success;
   } catch(const std::bad_alloc&) { return Status::allocation_failure; }
   catch(const std::length_error&) { return Status::allocation_failure; }
@@ -471,9 +554,14 @@ Status HostReferenceEngine::Recover(const StridedBlockView<const double> trace,
       ValidateWritable(interior,batch_count_,ni,1);
   if (interior_status != Status::success) { return interior_status; }
   try {
-    std::vector<double> staged(batch_count_*ni), local(ni);
-    for(std::size_t batch=0;batch<batch_count_;++batch) { for(std::size_t i=0;i<ni;++i) { local[i]=f_[batch*ni+i]; for(std::size_t j=0;j<nt;++j) { if(!std::isfinite(trace(batch,j,0))) return Status::non_finite; local[i]-=b_[batch*ni*nt+i*nt+j]*trace(batch,j,0); } } if(!Solve(lu_.data()+batch*ni*ni,pivots_.data()+batch*ni,ni,local.data(),1)) return Status::non_finite; std::copy(local.begin(),local.end(),staged.begin()+static_cast<std::ptrdiff_t>(batch*ni)); }
-    for(std::size_t batch=0;batch<batch_count_;++batch) CopyOut(staged.data()+batch*ni,ni,1,interior,batch);
+    const bool prepared = recovered_.size() == batch_count_ * ni &&
+        work_.size() >= ni;
+    std::vector<double> staged, local;
+    std::vector<double>& staged_values = prepared ? recovered_ : staged;
+    std::vector<double>& local_values = prepared ? work_ : local;
+    if (!prepared) { staged_values.resize(batch_count_*ni); local_values.resize(ni); }
+    for(std::size_t batch=0;batch<batch_count_;++batch) { for(std::size_t i=0;i<ni;++i) { local_values[i]=f_[batch*ni+i]; for(std::size_t j=0;j<nt;++j) { if(!std::isfinite(trace(batch,j,0))) return Status::non_finite; local_values[i]-=b_[batch*ni*nt+i*nt+j]*trace(batch,j,0); } } if(!Solve(lu_.data()+batch*ni*ni,pivots_.data()+batch*ni,ni,local_values.data(),1)) return Status::non_finite; std::copy(local_values.begin(),local_values.begin()+static_cast<std::ptrdiff_t>(ni),staged_values.begin()+static_cast<std::ptrdiff_t>(batch*ni)); }
+    for(std::size_t batch=0;batch<batch_count_;++batch) CopyOut(staged_values.data()+batch*ni,ni,1,interior,batch);
     return Status::success;
   } catch(const std::bad_alloc&) { return Status::allocation_failure; }
   catch(const std::length_error&) { return Status::allocation_failure; }

@@ -31,6 +31,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::IGROptions igr_opts;
     ctx.Check(opts.zhang_shu_points == "consumer",
               "Zhang-Shu defaults: consumer point set selected");
+    ctx.Check(opts.hdg_igr_alpha == 1.0 && opts.hdg_igr_beta == 1.0,
+              "HDG IGR defaults: alpha and beta are one");
     ctx.Check(dg_sim::ParseZhangShuPointSet("consumer") ==
                 mfem::ZhangShuPointSet::kConsumer,
               "Zhang-Shu options: parse consumer point set");
@@ -140,6 +142,184 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   dg_sim::DiscretizationProvenance::DiscretizationOption &&
                 run_cfg.dg_backend == dg_sim::DGBackend::DGSEM,
               "discretization: run config records selector and compatibility backend");
+  }
+
+  // --- Orthogonal solver request selection and compatibility contract ---
+  {
+    ctx.Check(dg_sim::TryParseRegularization("IGR") ==
+                dg_sim::Regularization::IGR &&
+                std::string(dg_sim::RegularizationToString(
+                  dg_sim::Regularization::None)) == "none",
+              "request: regularization parser and metadata name are stable");
+    ctx.Check(!dg_sim::TryParseRegularization("invalid"),
+              "request: invalid regularization is not parsed");
+    ctx.Check(dg_sim::TryParseTimeIntegrator("BACKWARD-EULER") ==
+                dg_sim::TimeIntegrator::BackwardEuler &&
+                std::string(dg_sim::TimeIntegratorToString(
+                  dg_sim::TimeIntegrator::RK3SSP)) == "rk3ssp",
+              "request: time-integrator parser and metadata name are stable");
+    ctx.Check(!dg_sim::TryParseTimeIntegrator("invalid"),
+              "request: invalid time integrator is not parsed");
+    ctx.Check(dg_sim::TryParseDeviceBackend("CUDA") ==
+                dg_sim::DeviceBackend::CUDA &&
+                std::string(dg_sim::DeviceBackendToString(
+                  dg_sim::DeviceBackend::CPU)) == "cpu",
+              "request: device parser and metadata name are stable");
+    ctx.Check(!dg_sim::TryParseDeviceBackend("invalid"),
+              "request: invalid device backend is not parsed");
+    ctx.Check(std::string(dg_sim::SolverRequestResolutionStatusToString(
+                dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator)) ==
+                "unsupported-time-integrator",
+              "request: resolution status has a stable metadata name");
+    ctx.Check(std::string(dg_sim::SolverRequestResolutionStatusToString(
+                dg_sim::SolverRequestResolutionStatus::InvalidDeviceBackend)) ==
+                "invalid-device-backend",
+              "request: device failure status has a stable metadata name");
+    const dg_sim::SolverRequestResolution fail_safe_request;
+    ctx.Check(fail_safe_request.regularization == dg_sim::Regularization::None &&
+                fail_safe_request.device_backend == dg_sim::DeviceBackend::CPU,
+              "request: default-constructed request is fail-safe");
+
+    const dg_sim::SolverRequestResolution dg_default =
+      dg_sim::ResolveSolverRequest("dg", true, "", "dg", "", "",
+                                   false, false, false, false);
+    ctx.Check(dg_default.IsResolved() &&
+                dg_default.regularization == dg_sim::Regularization::IGR &&
+                dg_default.time_integrator == dg_sim::TimeIntegrator::RK3SSP,
+              "request: omitted DG selectors retain CaseSpec IGR and RK3SSP defaults");
+
+    const dg_sim::SolverRequestResolution dgsem_default =
+      dg_sim::ResolveSolverRequest("dgsem", false, "", "dgsem", "", "",
+                                   false, false, false, false);
+    ctx.Check(dgsem_default.IsResolved() &&
+                dgsem_default.discretization == dg_sim::Discretization::DGSEM &&
+                dgsem_default.regularization == dg_sim::Regularization::None &&
+                dgsem_default.time_integrator == dg_sim::TimeIntegrator::RK3SSP,
+              "request: omitted DGSEM selectors retain CaseSpec "
+              "regularization and RK3SSP");
+
+    const dg_sim::SolverRequestResolution legacy_override =
+      dg_sim::ResolveSolverRequest("dg", true, "", "dg", "none", "rk3ssp",
+                                   false, false, true, true);
+    ctx.Check(legacy_override.IsResolved() &&
+                legacy_override.regularization == dg_sim::Regularization::None,
+              "request: explicit regularization overrides the CaseSpec default");
+
+    const dg_sim::SolverRequestResolution cuda_request =
+      dg_sim::ResolveSolverRequest("dg", false, "", "dg", "", "",
+                                   false, false, false, false, "cuda");
+    ctx.Check(cuda_request.IsResolved() &&
+                cuda_request.device_backend == dg_sim::DeviceBackend::CUDA,
+              "request: valid device reaches the resolved request");
+
+    const dg_sim::SolverRequestResolution invalid_device =
+      dg_sim::ResolveSolverRequest("dg", false, "", "dg", "", "",
+                                   false, false, false, false, "invalid");
+    ctx.Check(invalid_device.status ==
+                dg_sim::SolverRequestResolutionStatus::InvalidDeviceBackend,
+              "request: invalid device backend is rejected");
+
+    const dg_sim::SolverRequestResolution compatible_backends =
+      dg_sim::ResolveSolverRequest("dg", false, "dgsem", "dgsem", "", "",
+                                   true, true, false, false);
+    ctx.Check(compatible_backends.IsResolved() &&
+                compatible_backends.discretization_provenance ==
+                  dg_sim::DiscretizationProvenance::BothOptions &&
+                compatible_backends.dg_backend == dg_sim::DGBackend::DGSEM,
+              "request: matching discretization and legacy backend remain compatible");
+
+    const dg_sim::SolverRequestResolution conflicting_backends =
+      dg_sim::ResolveSolverRequest("dg", false, "dg", "dgsem", "", "",
+                                   true, true, false, false);
+    ctx.Check(conflicting_backends.status ==
+                dg_sim::SolverRequestResolutionStatus::Conflict,
+              "request: conflicting discretization and legacy backend are rejected");
+
+    const dg_sim::SolverRequestResolution hdg_default =
+      dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "", "",
+                                   true, false, false, false);
+    ctx.Check(hdg_default.IsResolved() &&
+                hdg_default.discretization == dg_sim::Discretization::HDG &&
+                hdg_default.regularization == dg_sim::Regularization::None &&
+                hdg_default.time_integrator ==
+                  dg_sim::TimeIntegrator::BackwardEuler,
+              "request: omitted HDG integrator defaults to backward-euler");
+
+    const dg_sim::SolverRequestResolution legacy_be =
+      dg_sim::ResolveSolverRequest("dg", false, "", "dg", "", "backward-euler",
+                                   false, false, false, true);
+    ctx.Check(legacy_be.status ==
+                dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
+              "request: DG/DGSEM backward-euler is rejected");
+
+    const dg_sim::SolverRequestResolution invalid_regularization =
+      dg_sim::ResolveSolverRequest("dg", false, "", "dg", "invalid", "",
+                                   false, false, true, false);
+    ctx.Check(invalid_regularization.status ==
+                dg_sim::SolverRequestResolutionStatus::InvalidRegularization,
+              "request: invalid regularization is rejected");
+
+    const dg_sim::SolverRequestResolution invalid_time_integrator =
+      dg_sim::ResolveSolverRequest("dg", false, "", "dg", "", "invalid",
+                                   false, false, false, true);
+    ctx.Check(invalid_time_integrator.status ==
+                dg_sim::SolverRequestResolutionStatus::InvalidTimeIntegrator,
+              "request: invalid time integrator is rejected");
+
+    const dg_sim::SolverRequestResolution hdg_rk =
+      dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "", "rk3ssp",
+                                   true, false, false, true);
+    ctx.Check(hdg_rk.status ==
+                dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
+              "request: HDG RK3SSP is rejected");
+
+    const dg_sim::SolverRequestResolution hdg_igr_cpu =
+      dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "igr", "",
+                                   true, false, true, false);
+    ctx.Check(hdg_igr_cpu.IsResolved() &&
+                hdg_igr_cpu.regularization == dg_sim::Regularization::IGR &&
+                hdg_igr_cpu.time_integrator ==
+                  dg_sim::TimeIntegrator::BackwardEuler &&
+                hdg_igr_cpu.device_backend == dg_sim::DeviceBackend::CPU,
+              "request: HDG CPU IGR resolves to backward-euler");
+
+    const dg_sim::SolverRequestResolution hdg_igr_cuda =
+      dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "igr", "",
+                                   true, false, true, false, "cuda");
+    ctx.Check(hdg_igr_cuda.status ==
+                dg_sim::SolverRequestResolutionStatus::UnsupportedRegularization,
+              "request: HDG CUDA IGR is rejected during resolution");
+
+    const dg_sim::SolverRequestResolution hdg_cuda_none =
+      dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "none", "",
+                                   true, false, true, false, "cuda");
+    ctx.Check(hdg_cuda_none.IsResolved() &&
+                hdg_cuda_none.regularization == dg_sim::Regularization::None &&
+                hdg_cuda_none.device_backend == dg_sim::DeviceBackend::CUDA,
+              "request: HDG CUDA none remains supported");
+
+    const dg_sim::SolverRequestResolution dgsem_cuda_igr =
+      dg_sim::ResolveSolverRequest("dgsem", true, "", "dgsem", "", "",
+                                   false, false, false, false, "cuda");
+    ctx.Check(dgsem_cuda_igr.IsResolved() &&
+                dgsem_cuda_igr.discretization == dg_sim::Discretization::DGSEM &&
+                dgsem_cuda_igr.regularization == dg_sim::Regularization::IGR &&
+                dgsem_cuda_igr.device_backend == dg_sim::DeviceBackend::CUDA,
+              "request: DGSEM CUDA IGR remains supported");
+
+    char program_name[] = "test";
+    char regularization_flag[] = "--regularization";
+    char regularization_value[] = "none";
+    char integrator_flag[] = "-ti";
+    char integrator_value[] = "rk3ssp";
+    char* argv[] = {program_name,
+                    regularization_flag,
+                    regularization_value,
+                    integrator_flag,
+                    integrator_value};
+    ctx.Check(dg_sim::HasRegularizationOptionOverride(5, argv) &&
+                dg_sim::HasTimeIntegratorOptionOverride(5, argv),
+              "request: selector provenance uses exact argv flags");
   }
 
   // --- IGR derived runtime defaults ---

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "numerics/hdg/runtime/cuda/persistent_sc25_scalar_igr_rank2.cuh"
+#include "numerics/hdg/runtime/cuda/traced_scalar_igr_p1_private.cuh"
 
 #include <cstddef>
 #include <cstdint>
@@ -102,6 +103,20 @@ struct DeviceView final
   double* full_residual = nullptr;
   double* full_jacobian = nullptr;
   double* reduction = nullptr;
+  // Fixed adapter storage for the borrowed packed P1 algebra.  These slices
+  // are carved from the owner arena before its allocation baseline freezes.
+  double* packed_vertices = nullptr;
+  common::traced_scalar_igr_p1_local_algebra::Parameters* packed_parameters =
+      nullptr;
+  double* packed_interior = nullptr;
+  double* packed_previous_interior = nullptr;
+  double* packed_trace = nullptr;
+  double* packed_previous_trace = nullptr;
+  double* packed_f = nullptr;
+  double* packed_g = nullptr;
+  std::uint8_t* packed_status = nullptr;
+  double* packed_volume_xyw = nullptr;
+  double* packed_segment_xw = nullptr;
   double* checkpoint_interior_slabs = nullptr;
   double* checkpoint_trace_slabs = nullptr;
   std::uint8_t* state_hash_bytes = nullptr;

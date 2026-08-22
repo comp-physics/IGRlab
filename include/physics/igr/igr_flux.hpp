@@ -146,12 +146,20 @@ public:
                          FaceElementTransformations& Tr,
                          Vector& fluxN) const override;
 
-  /// Jacobians: forwarded to the base (unchanged).
+  /** Jacobians delegate the physical base term to the wrapped flux, then add
+   * the frozen-Sigma pressure-like energy-row increment. The wrapped flux
+   * must implement the requested Jacobian virtual.
+   */
   void ComputeFluxJacobian(const Vector& state,
                            ElementTransformation& Tr,
                            DenseTensor& J_) const override
   {
     base_.ComputeFluxJacobian(state, Tr, J_);
+    if (!sigma_)
+    {
+      return;
+    }
+    AddTensorSigmaJacobianTerms(state, GetSigmaAtPoint(Tr), J_);
   }
 
   void ComputeFluxJacobianDotN(const Vector& state,
@@ -160,6 +168,11 @@ public:
                                DenseMatrix& JDotN) const override
   {
     base_.ComputeFluxJacobianDotN(state, normal, Tr, JDotN);
+    if (!sigma_)
+    {
+      return;
+    }
+    AddDotNSigmaJacobianTerms(state, normal, GetSigmaAtPoint(Tr), JDotN);
   }
 
   /// Get Sigma at the current element integration point (0 if IGR is off).
@@ -217,6 +230,40 @@ private:
                                                             rho_vel_floor_,
                                                             Fn.GetData(),
                                                             1);
+  }
+
+  inline void AddTensorSigmaJacobianTerms(const Vector& U,
+                                          double sigma,
+                                          DenseTensor& J_) const
+  {
+    ::dg_igr::frozen_scalar_igr_algebra::AddTensorSigmaFluxJacobian(
+      dim,
+      U.GetData(),
+      1,
+      sigma,
+      rho_vel_floor_,
+      J_.Data(),
+      1,
+      num_equations,
+      num_equations * num_equations);
+  }
+
+  inline void AddDotNSigmaJacobianTerms(const Vector& U,
+                                        const Vector& n,
+                                        double sigma_face,
+                                        DenseMatrix& JDotN) const
+  {
+    ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFluxJacobian(
+      dim,
+      U.GetData(),
+      1,
+      n.GetData(),
+      1,
+      sigma_face,
+      rho_vel_floor_,
+      JDotN.GetData(),
+      1,
+      JDotN.Height());
   }
 };
 

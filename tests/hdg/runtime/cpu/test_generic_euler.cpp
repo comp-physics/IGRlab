@@ -21,8 +21,10 @@ using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::cpu::ExecuteGenericEulerHdgCpu;
 using dg::hdg::runtime::cpu::GenericEulerCpuPreparedStep;
+using dg::hdg::runtime::cpu::GenericEulerCpuSessionResult;
 using dg::hdg::runtime::cpu::GenericEulerCpuSessionStatus;
 using dg::hdg::runtime::cpu::GenericEulerHdgCpuSession;
 using dg::hdg::runtime::cpu::RestartGenericEulerHdgCpu;
@@ -118,6 +120,20 @@ mfem::ParMesh MakeRankZeroOwnedBorrowedMesh(
       1, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
   const std::vector<int> partition(static_cast<std::size_t>(serial.GetNE()), 0);
   return mfem::ParMesh(communicator, serial, partition.data());
+}
+
+mfem::ParMesh MakePeriodicRankZeroOwnedBorrowedMesh(
+    const MPI_Comm communicator = MPI_COMM_WORLD)
+{
+  mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+      3, 3, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+  translations[0][0] = 1.0;
+  translations[1][1] = 1.0;
+  mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
+      original, original.CreatePeriodicVertexMapping(translations));
+  std::vector<int> partition(static_cast<std::size_t>(periodic.GetNE()), 0);
+  return mfem::ParMesh(communicator, periodic, partition.data());
 }
 
 EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
@@ -648,6 +664,106 @@ bool CheckPeriodicAnnotationsRemainTraceCouplings()
       context.calls == 0;
 }
 
+bool CheckPrivateTracedScalarIgrLifecycle()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  GenericEulerHdgCpuSession session;
+  const auto initialized = session.Initialize(request);
+  if (initialized.status != GenericEulerCpuSessionStatus::initialized) return false;
+  mfem::L2_FECollection collection(1, 2, mfem::BasisType::GaussLegendre,
+                                   mfem::FiniteElement::VALUE);
+  mfem::ParFiniteElementSpace space(&mesh, &collection, 4,
+                                    mfem::Ordering::byNODES);
+  std::vector<double> before(static_cast<std::size_t>(space.GetVSize()), 0.0);
+  const bool exported_before = session.ExportCommittedInterior(
+      {before.data(), before.size()});
+  GenericEulerCpuPreparedStep first;
+  const auto prepared = session.Prepare(0.001, first);
+  std::vector<double> candidate(before.size(), 0.0);
+  const bool exported_candidate = prepared.status == GenericEulerCpuSessionStatus::prepared &&
+      session.ExportPreparedInterior(first, {candidate.data(), candidate.size()});
+  const bool changed = candidate != before;
+  const auto aborted = prepared.status == GenericEulerCpuSessionStatus::prepared
+      ? session.Abort(std::move(first)) : decltype(session.Abort(std::move(first))){ };
+  std::vector<double> after_abort(before.size(), 0.0);
+  const bool rollback = session.ExportCommittedInterior({after_abort.data(), after_abort.size()}) &&
+      after_abort == before;
+  GenericEulerCpuPreparedStep retry;
+  const auto retried = session.Prepare(0.001, retry);
+  const auto committed = retried.status == GenericEulerCpuSessionStatus::prepared
+      ? session.Commit(std::move(retry)) : decltype(session.Commit(std::move(retry))){ };
+  const auto second = session.Advance(0.001);
+  return exported_before && exported_candidate && changed &&
+      aborted.status == GenericEulerCpuSessionStatus::aborted && rollback &&
+      committed.status == GenericEulerCpuSessionStatus::committed &&
+      second.status == GenericEulerCpuSessionStatus::advanced && boundary.calls == 0;
+}
+
+bool CheckPrivateTracedScalarIgrZeroLocal()
+{
+  int ranks = 1;
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  if (ranks == 1) return true;
+  mfem::ParMesh mesh = MakePeriodicRankZeroOwnedBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.1, 0.1,
+                                       0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{};
+  BoundaryContext boundary{};
+  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  GenericEulerHdgCpuSession session;
+  const auto initialized = session.Initialize(request);
+  const auto advanced = initialized.status == GenericEulerCpuSessionStatus::initialized
+      ? session.Advance(0.001) : GenericEulerCpuSessionResult{};
+  const int local_empty = mesh.GetNE() == 0 ? 1 : 0;
+  int any_empty = 0;
+  const int reduction = MPI_Allreduce(&local_empty, &any_empty, 1, MPI_INT,
+                                      MPI_MAX, mesh.GetComm());
+  return initialized.status == GenericEulerCpuSessionStatus::initialized &&
+      advanced.status == GenericEulerCpuSessionStatus::advanced &&
+      reduction == MPI_SUCCESS && any_empty == 1 && boundary.calls == 0;
+}
+
+bool CheckPrivateTracedScalarIgrInitializationDeterminism()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  mfem::L2_FECollection collection(1, 2, mfem::BasisType::GaussLegendre,
+                                   mfem::FiniteElement::VALUE);
+  mfem::ParFiniteElementSpace space(&mesh, &collection, 4,
+                                    mfem::Ordering::byNODES);
+  std::vector<double> first(static_cast<std::size_t>(space.GetVSize()), 0.0);
+  std::vector<double> second(static_cast<std::size_t>(space.GetVSize()), 0.0);
+  bool first_ok = false;
+  {
+    GenericEulerHdgCpuSession session;
+    const auto initialized = session.Initialize(request);
+    first_ok = initialized.status == GenericEulerCpuSessionStatus::initialized &&
+        session.ExportCommittedInterior({first.data(), first.size()});
+  }
+  bool second_ok = false;
+  {
+    GenericEulerHdgCpuSession session;
+    const auto initialized = session.Initialize(request);
+    second_ok = initialized.status == GenericEulerCpuSessionStatus::initialized &&
+        session.ExportCommittedInterior({second.data(), second.size()});
+  }
+  return first_ok && second_ok && first == second && boundary.calls == 0;
+}
+
 bool CheckDynamicTauHighWaveTwoSteps()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
@@ -860,6 +976,10 @@ int main(int argc, char* argv[])
   const bool orders = CheckOrdersAndDeterminism();
   const bool prepared_lifecycle = CheckPreparedSessionLifecycle();
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
+  const bool private_igr = CheckPrivateTracedScalarIgrLifecycle();
+  const bool private_igr_zero_local = CheckPrivateTracedScalarIgrZeroLocal();
+  const bool private_igr_initialization =
+      CheckPrivateTracedScalarIgrInitializationDeterminism();
   const bool dynamic_tau = CheckDynamicTauHighWaveTwoSteps();
   const bool boundary_picard = CheckClosedBoundaryPicardAssembly();
   const bool zero_owned = CheckZeroOwnedElementEngine();
@@ -869,7 +989,8 @@ int main(int argc, char* argv[])
   const bool callback_failure = CheckAcceptedRequestRankLocalCallbackFailure();
   const bool local = boundary_semantics && trace_restriction && orders &&
       prepared_lifecycle &&
-      periodic && dynamic_tau && boundary_picard &&
+      periodic && private_igr && private_igr_zero_local &&
+      private_igr_initialization && dynamic_tau && boundary_picard &&
       zero_owned && subcommunicator && passive_world && mismatch &&
       callback_failure;
   if (!All(local))
@@ -880,6 +1001,9 @@ int main(int argc, char* argv[])
               << " boundary_semantics=" << boundary_semantics
               << " trace_restriction=" << trace_restriction
               << " orders=" << orders << " periodic=" << periodic
+              << " private_igr=" << private_igr
+              << " private_igr_zero_local=" << private_igr_zero_local
+              << " private_igr_initialization=" << private_igr_initialization
               << " prepared_lifecycle=" << prepared_lifecycle
               << " dynamic_tau=" << dynamic_tau
               << " boundary_picard=" << boundary_picard

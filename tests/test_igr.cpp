@@ -385,6 +385,47 @@ public:
     return ComputeFlux(avg, Tr, flux);
   }
 
+  void ComputeFluxJacobian(const mfem::Vector&,
+                           mfem::ElementTransformation&,
+                           mfem::DenseTensor& jacobian) const override
+  {
+    jacobian.SetSize(num_equations, num_equations, dim);
+    for (int d = 0; d < dim; ++d)
+    {
+      for (int equation = 0; equation < num_equations; ++equation)
+      {
+        for (int state_component = 0; state_component < num_equations;
+             ++state_component)
+        {
+          jacobian(equation, state_component, d) =
+            equation == state_component ? dir_(d) : 0.0;
+        }
+      }
+    }
+  }
+
+  void ComputeFluxJacobianDotN(const mfem::Vector&,
+                               const mfem::Vector& normal,
+                               mfem::ElementTransformation&,
+                               mfem::DenseMatrix& jacobian) const override
+  {
+    jacobian.SetSize(num_equations, num_equations);
+    double normal_scale = 0.0;
+    for (int d = 0; d < dim; ++d)
+    {
+      normal_scale += dir_(d) * normal(d);
+    }
+    for (int equation = 0; equation < num_equations; ++equation)
+    {
+      for (int state_component = 0; state_component < num_equations;
+           ++state_component)
+      {
+        jacobian(equation, state_component) =
+          equation == state_component ? normal_scale : 0.0;
+      }
+    }
+  }
+
 private:
   mfem::Vector dir_;
 };
@@ -850,6 +891,103 @@ int RunIGRTests(TestContext& ctx)
                     tol,
                     "FluxWithIGR adds +sigma*u to energy tensor row, dim=" +
                       std::to_string(d));
+    }
+
+    mfem::Vector jacobian_direction(dim);
+    jacobian_direction = 0.0;
+    for (int d = 0; d < dim; ++d)
+    {
+      jacobian_direction(d) = 0.25 * (d + 1);
+    }
+    LinearAverageFlux jacobian_base(dim, jacobian_direction);
+    mfem::FluxWithIGR jacobian_igr_flux(jacobian_base);
+    jacobian_igr_flux.SetSigmaField(&sigma);
+    mfem::DenseTensor base_tensor_jacobian(dim + 2, dim + 2, dim);
+    mfem::DenseTensor igr_tensor_jacobian(dim + 2, dim + 2, dim);
+    jacobian_base.ComputeFluxJacobian(state, *Te, base_tensor_jacobian);
+    jacobian_igr_flux.ComputeFluxJacobian(state, *Te, igr_tensor_jacobian);
+    mfem::DenseMatrix base_normal_jacobian(dim + 2, dim + 2);
+    mfem::DenseMatrix igr_normal_jacobian(dim + 2, dim + 2);
+    jacobian_base.ComputeFluxJacobianDotN(state,
+                                          normal,
+                                          *Te,
+                                          base_normal_jacobian);
+    jacobian_igr_flux.ComputeFluxJacobianDotN(state,
+                                               normal,
+                                               *Te,
+                                               igr_normal_jacobian);
+    for (int equation = 0; equation < dim + 2; ++equation)
+    {
+      for (int state_component = 0; state_component < dim + 2;
+           ++state_component)
+      {
+        double expected_normal = 0.0;
+        if (equation == dim + 1 && state_component == 0)
+        {
+          expected_normal =
+            -sigma_value * DotMomentumNormal(state, normal, dim) / (rho * rho);
+        }
+        if (equation == dim + 1 && state_component >= 1 &&
+            state_component <= dim)
+        {
+          expected_normal = sigma_value * normal(state_component - 1) / rho;
+        }
+        ctx.CheckNear(igr_normal_jacobian(equation, state_component) -
+                        base_normal_jacobian(equation, state_component),
+                      expected_normal,
+                      tol,
+                      "FluxWithIGR adds frozen-sigma normal Jacobian dim=" +
+                        std::to_string(state_component));
+        for (int d = 0; d < dim; ++d)
+        {
+          double expected_tensor = 0.0;
+          if (equation == dim + 1 && state_component == 0)
+          {
+            expected_tensor = -sigma_value * state(1 + d) / (rho * rho);
+          }
+          if (equation == dim + 1 && state_component == 1 + d)
+          {
+            expected_tensor = sigma_value / rho;
+          }
+          ctx.CheckNear(igr_tensor_jacobian(equation, state_component, d) -
+                          base_tensor_jacobian(equation, state_component, d),
+                        expected_tensor,
+                        tol,
+                        "FluxWithIGR adds frozen-sigma tensor Jacobian dim=" +
+                          std::to_string(d));
+        }
+      }
+    }
+
+    jacobian_igr_flux.SetSigmaField(nullptr);
+    mfem::DenseTensor null_sigma_tensor_jacobian(dim + 2, dim + 2, dim);
+    mfem::DenseMatrix null_sigma_normal_jacobian(dim + 2, dim + 2);
+    jacobian_igr_flux.ComputeFluxJacobian(state,
+                                           *Te,
+                                           null_sigma_tensor_jacobian);
+    jacobian_igr_flux.ComputeFluxJacobianDotN(state,
+                                               normal,
+                                               *Te,
+                                               null_sigma_normal_jacobian);
+    for (int equation = 0; equation < dim + 2; ++equation)
+    {
+      for (int state_component = 0; state_component < dim + 2;
+           ++state_component)
+      {
+        ctx.CheckNear(null_sigma_normal_jacobian(equation, state_component),
+                      base_normal_jacobian(equation, state_component),
+                      tol,
+                      "FluxWithIGR null sigma normal Jacobian passthrough");
+        for (int d = 0; d < dim; ++d)
+        {
+          ctx.CheckNear(null_sigma_tensor_jacobian(equation,
+                                                    state_component,
+                                                    d),
+                        base_tensor_jacobian(equation, state_component, d),
+                        tol,
+                        "FluxWithIGR null sigma tensor Jacobian passthrough");
+        }
+      }
     }
   }
 
