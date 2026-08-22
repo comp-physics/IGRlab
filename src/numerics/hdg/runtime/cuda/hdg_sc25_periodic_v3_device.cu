@@ -814,7 +814,7 @@ __global__ void PackSc25ForPackedAlgebra(scalar_detail::DeviceView view)
 {
   const int element = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (element >= view.elements) { return; }
-  if (view.volume_quadrature_points != 4 || view.face_quadrature_points != 2 ||
+  if (view.volume_quadrature_points <= 0 || view.face_quadrature_points <= 0 ||
       view.packed_vertices == nullptr || view.packed_parameters == nullptr ||
       view.packed_interior == nullptr || view.packed_previous_interior == nullptr ||
       view.packed_trace == nullptr || view.packed_previous_trace == nullptr)
@@ -883,8 +883,43 @@ __global__ void PackSc25ForPackedAlgebra(scalar_detail::DeviceView view)
       return;
     }
   }
+  for (int q = 0; q < view.volume_quadrature_points; ++q)
+  {
+    double shape[4]{}, derivative[8]{}, now[4]{}, before[4]{};
+    const double* point = view.packed_volume_xyw + 3 * q;
+    packed_algebra::Shapes(point[0], point[1], shape, derivative);
+    packed_algebra::Value(packed_current, shape, now);
+    packed_algebra::Value(packed_old, shape, before);
+    if (!StrictPackedAdmissible(now) || !StrictPackedAdmissible(before))
+    { atomicOr(view.status, scalar_detail::device_admissibility); return; }
+  }
   constexpr double qa = 0.21132486540518711775;
   constexpr double qb = 0.78867513459481288225;
+  constexpr double hscale = 1.7320508075688772935;
+  for (int face = 0; face < 4; ++face)
+    for (int q = 0; q < view.face_quadrature_points; ++q)
+    {
+      const double s = view.packed_segment_xw[2 * q];
+      double xi = 0.0, eta = 0.0, tangent[2]{}, shape[4]{}, derivative[8]{};
+      packed_algebra::FacePoint(face, s, xi, eta, tangent);
+      packed_algebra::Shapes(xi, eta, shape, derivative);
+      double now[4]{}, before[4]{}, trace_now[4]{}, trace_before[4]{};
+      packed_algebra::Value(packed_current, shape, now);
+      packed_algebra::Value(packed_old, shape, before);
+      const double hshape[2]{(qb - s) * hscale, (s - qa) * hscale};
+      for (int component = 0; component < 4; ++component)
+        for (int a = 0; a < face_nodes; ++a)
+        {
+          trace_now[component] += packed_trace[
+              packed_algebra::T(component, face * face_nodes + a)] * hshape[a];
+          trace_before[component] += packed_old_trace[
+              packed_algebra::T(component, face * face_nodes + a)] * hshape[a];
+        }
+      if (!StrictPackedAdmissible(now) || !StrictPackedAdmissible(before) ||
+          !StrictPackedAdmissible(trace_now) ||
+          !StrictPackedAdmissible(trace_before))
+      { atomicOr(view.status, scalar_detail::device_admissibility); return; }
+    }
   const double* node_x = view.volume_node_x + element * ns;
   const double* node_y = view.volume_node_y + element * ns;
   const double denominator = qb - qa;
@@ -933,6 +968,81 @@ __global__ void CanonicalizePackedAssembly(scalar_detail::DeviceView view)
     for (int i = 0; i < nt; ++i)
       view.trace_residual[trace_base + i] = -view.packed_g[trace_base + i];
   }
+  const int global_interior = view.elements * ni;
+  for (int element = 0; element < view.elements; ++element)
+  {
+    const int local_base = element * ni;
+    const double* block_a = view.a + static_cast<std::size_t>(element) * ni * ni;
+    const double* block_b = view.b + static_cast<std::size_t>(element) * ni * nt;
+    const double* block_c = view.c + static_cast<std::size_t>(element) * nt * ni;
+    const double* block_d = view.d + static_cast<std::size_t>(element) * nt * nt;
+    for (int row = 0; row < ni; ++row)
+    {
+      view.full_residual[local_base + row] = view.local_residual[local_base + row];
+      for (int column = 0; view.assemble_dense_jacobian != 0 && column < ni; ++column)
+        view.full_jacobian[static_cast<std::size_t>(local_base + row) *
+                              view.full_unknowns + local_base + column] =
+            block_a[row * ni + column];
+      for (int column = 0; column < nt; ++column)
+      {
+        const int map = element * nt + column;
+        const int true_column = view.local_trace_to_true[map];
+        if (true_column < 0 || true_column >= view.true_trace_unknowns)
+        { *view.status |= scalar_detail::device_invalid_layout; return; }
+        if (view.assemble_dense_jacobian != 0)
+          view.full_jacobian[static_cast<std::size_t>(local_base + row) *
+                                view.full_unknowns + global_interior + true_column] +=
+              static_cast<double>(view.local_trace_sign[map]) * block_b[row * nt + column];
+      }
+    }
+    for (int row = 0; row < nt; ++row)
+    {
+      const int row_map = element * nt + row;
+      const int true_row = view.local_trace_to_true[row_map];
+      const int row_sign = view.local_trace_sign[row_map];
+      if (true_row < 0 || true_row >= view.true_trace_unknowns ||
+          (row_sign != -1 && row_sign != 1))
+      { *view.status |= scalar_detail::device_invalid_layout; return; }
+      const int full_row = global_interior + true_row;
+      view.full_residual[full_row] +=
+          static_cast<double>(row_sign) * view.trace_residual[element * nt + row];
+      for (int column = 0; view.assemble_dense_jacobian != 0 && column < ni; ++column)
+        view.full_jacobian[static_cast<std::size_t>(full_row) *
+                              view.full_unknowns + local_base + column] +=
+            static_cast<double>(row_sign) * block_c[row * ni + column];
+      for (int column = 0; column < nt; ++column)
+      {
+        const int column_map = element * nt + column;
+        const int true_column = view.local_trace_to_true[column_map];
+        const int column_sign = view.local_trace_sign[column_map];
+        if (true_column < 0 || true_column >= view.true_trace_unknowns ||
+            (column_sign != -1 && column_sign != 1))
+        { *view.status |= scalar_detail::device_invalid_layout; return; }
+        if (view.assemble_dense_jacobian != 0)
+          view.full_jacobian[static_cast<std::size_t>(full_row) *
+                                view.full_unknowns + global_interior + true_column] +=
+              static_cast<double>(row_sign * column_sign) * block_d[row * nt + column];
+      }
+    }
+  }
+  view.reduction[0] = VectorNorm(view.full_residual, view.full_unknowns);
+  double auxiliary_residual_squared = 0.0;
+  for (int element = 0; element < view.elements; ++element)
+    for (int row = 4 * ns; row < ni; ++row)
+    {
+      const double residual = view.full_residual[element * ni + row];
+      auxiliary_residual_squared += residual * residual;
+    }
+  const int auxiliary_trace_begin = global_interior +
+      scalar::state_components * view.scalar_true_trace_nodes;
+  for (int row = auxiliary_trace_begin; row < view.full_unknowns; ++row)
+  {
+    const double residual = view.full_residual[row];
+    auxiliary_residual_squared += residual * residual;
+  }
+  view.reduction[5] = sqrt(auxiliary_residual_squared);
+  if (!DeviceFinite(view.reduction[0]) || !DeviceFinite(view.reduction[5]))
+  { *view.status |= scalar_detail::device_nonfinite; }
 }
 
 __device__ void ApplyAuxiliaryIdentityRows(scalar_detail::DeviceView& view)
@@ -1931,12 +2041,32 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
       const mfem::FiniteElement* first_volume = volume_space->GetFE(0);
       const mfem::FiniteElement* first_trace = carrier_space->GetFaceElement(0);
       if (first_volume == nullptr || first_trace == nullptr) { return false; }
-      volume_qpoints = mfem::IntRules.Get(
-          first_volume->GetGeomType(),
-          cpu_sc25::coupled_fixture_quadrature_order).GetNPoints();
-      face_qpoints = mfem::IntRules.Get(
-          first_trace->GetGeomType(),
-          cpu_sc25::coupled_fixture_quadrature_order).GetNPoints();
+      const auto& packed_plan =
+          dg::hdg::runtime::cuda::traced_scalar_igr_p1_private_numerics::
+              ReferencePlan();
+      if (packed_plan.integration_order !=
+          cpu_sc25::coupled_fixture_quadrature_order) { return false; }
+      const mfem::IntegrationRule& packed_volume_rule = mfem::IntRules.Get(
+          first_volume->GetGeomType(), packed_plan.integration_order);
+      const mfem::IntegrationRule& packed_segment_rule = mfem::IntRules.Get(
+          first_trace->GetGeomType(), packed_plan.integration_order);
+      volume_qpoints = packed_volume_rule.GetNPoints();
+      face_qpoints = packed_segment_rule.GetNPoints();
+      packed_volume_xyw.resize(static_cast<std::size_t>(volume_qpoints) * 3);
+      for (int q = 0; q < volume_qpoints; ++q)
+      {
+        const mfem::IntegrationPoint& ip = packed_volume_rule.IntPoint(q);
+        packed_volume_xyw[3 * q] = ip.x;
+        packed_volume_xyw[3 * q + 1] = ip.y;
+        packed_volume_xyw[3 * q + 2] = ip.weight;
+      }
+      packed_segment_xw.resize(static_cast<std::size_t>(face_qpoints) * 2);
+      for (int q = 0; q < face_qpoints; ++q)
+      {
+        const mfem::IntegrationPoint& ip = packed_segment_rule.IntPoint(q);
+        packed_segment_xw[2 * q] = ip.x;
+        packed_segment_xw[2 * q + 1] = ip.weight;
+      }
       const std::size_t volume_points =
           static_cast<std::size_t>(elements) * volume_qpoints;
       const std::size_t face_points =
@@ -2190,17 +2320,15 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
 
   bool BindPersistentArenas() noexcept
   {
-    const auto& packed_plan =
-        dg::hdg::runtime::cuda::traced_scalar_igr_p1_private_numerics::
-            ReferencePlan();
     const double packed_dt = config.coupled_operator_fixture
         ? cpu_sc25::coupled_fixture_dt : fixed_dt;
     packed_parameters.assign(static_cast<std::size_t>(elements),
         {gamma_value, alpha_value, state_tau, packed_dt, 1.0e-8});
-    packed_volume_xyw.assign(packed_plan.volume_xyw.begin(),
-                             packed_plan.volume_xyw.end());
-    packed_segment_xw.assign(packed_plan.segment_xw.begin(),
-                             packed_plan.segment_xw.end());
+    if (packed_volume_xyw.size() !=
+            static_cast<std::size_t>(volume_qpoints) * 3 ||
+        packed_segment_xw.size() !=
+            static_cast<std::size_t>(face_qpoints) * 2)
+    { return false; }
     topology_reference_hash = HashArrays(
         local_trace_to_true, local_trace_sign, element_to_true_csr,
         true_row_offsets, true_columns);
@@ -2557,7 +2685,8 @@ struct PersistentSc25ScalarIgrCudaRank1::Implementation final
           view.elements, view.packed_vertices, view.packed_parameters,
           view.packed_interior, view.packed_previous_interior,
           view.packed_trace, view.packed_previous_trace, nullptr, nullptr,
-          view.packed_volume_xyw, 4, view.packed_segment_xw, 2};
+          view.packed_volume_xyw, view.volume_quadrature_points,
+          view.packed_segment_xw, view.face_quadrature_points};
       const packed::BatchOutput output{
           reinterpret_cast<packed_algebra::Status*>(view.packed_status),
           view.local_residual, view.trace_residual, view.a, view.b, view.c,
