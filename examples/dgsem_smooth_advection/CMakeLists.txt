@@ -1,6 +1,19 @@
 # Create the dgsem_smooth_advection executable
 add_executable(dgsem_smooth_advection dgsem_smooth_advection.cpp)
-target_link_libraries(dgsem_smooth_advection igr_mfem)
+if(TARGET dg_igr_hdg_main_backend_cpu)
+  # This case deliberately demonstrates the conventional CPU backend's
+  # physical-boundary semantics.  CUDA's periodic-only envelope is not opted
+  # in here.
+  target_link_libraries(dgsem_smooth_advection dg_igr_hdg_main_backend_cpu)
+  target_compile_definitions(dgsem_smooth_advection PRIVATE
+    DG_IGR_HAS_HDG_MAIN_BACKEND=1
+    DG_IGR_HAS_HDG_MAIN_BACKEND_CUDA=0)
+else()
+  target_link_libraries(dgsem_smooth_advection igr_mfem)
+  target_compile_definitions(dgsem_smooth_advection PRIVATE
+    DG_IGR_HAS_HDG_MAIN_BACKEND=0
+    DG_IGR_HAS_HDG_MAIN_BACKEND_CUDA=0)
+endif()
 
 # Create symlink to mesh file
 add_custom_command(TARGET dgsem_smooth_advection POST_BUILD

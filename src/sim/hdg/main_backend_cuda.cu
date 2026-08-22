@@ -112,19 +112,26 @@ std::string ConsensusText(const HdgEulerMainRequest& request,
          << request.options.restart_step << '\n'
          << request.options.cfl << '\n'
          << request.options.dt_min << '\n'
-         << request.case_config.gamma << '\n'
-         << request.initial_condition.GetVDim() << '\n'
-         << request.boundary_plan.Entries().size() << '\n';
-  for (const EulerBoundaryPlanEntry& entry : request.boundary_plan.Entries())
+         << request.case_config.gamma << '\n';
+  const mfem::io::VTKOutputConfig vtk = MakeCaseVTKConfig(request.case_config);
+  stream << vtk.prefix_path << '\n' << static_cast<int>(vtk.format) << '\n'
+         << vtk.high_order_output << '\n' << vtk.levels_of_detail << '\n';
+  return stream.str();
+}
+
+std::string CaseDataConsensusText(const HdgEulerCaseData& case_data)
+{
+  std::ostringstream stream;
+  stream << case_data.initial_condition->GetVDim() << '\n'
+         << static_cast<bool>(case_data.static_source) << '\n'
+         << case_data.boundary_plan.Entries().size() << '\n';
+  for (const EulerBoundaryPlanEntry& entry : case_data.boundary_plan.Entries())
   {
     stream << static_cast<int>(entry.kind) << ':' << entry.marker.Size() << ':';
     for (int marker = 0; marker < entry.marker.Size(); ++marker)
       stream << entry.marker[marker] << ',';
     stream << '\n';
   }
-  const mfem::io::VTKOutputConfig vtk = MakeCaseVTKConfig(request.case_config);
-  stream << vtk.prefix_path << '\n' << static_cast<int>(vtk.format) << '\n'
-         << vtk.high_order_output << '\n' << vtk.levels_of_detail << '\n';
   return stream.str();
 }
 
@@ -158,6 +165,8 @@ std::string Validate(const HdgEulerMainRequest& request)
 {
   if (!WorldCongruent(request.communicator))
     return "CUDA HDG requires MPI_COMM_WORLD-congruent ranks one or two";
+  if (!request.make_case_data)
+    return "CUDA HDG case physics factory is empty";
   if (ToLowerCopy(request.options.device) != "cuda")
     return "generic CUDA HDG requires --device cuda";
   if (!request.options.restart_vtk.empty() || request.options.restart_cycle >= 0 ||
@@ -182,14 +191,23 @@ std::string Validate(const HdgEulerMainRequest& request)
     return "generic CUDA HDG admits only p1 or p2";
   if (request.options.ser_ref_levels < 0 || request.options.par_ref_levels < 0)
     return "generic CUDA HDG refinement levels must be nonnegative";
-  if (request.initial_condition.GetVDim() !=
-      dg::hdg::runtime::cuda_w8a::conserved_components)
-    return "generic CUDA HDG requires a four-component Euler IC";
-  if (!OnlyPeriodic(request.boundary_plan))
-    return "generic CUDA HDG admits periodic boundary plans only";
   if (!std::isfinite(request.case_config.gamma) ||
       request.case_config.gamma != mfem::dg_igr::EulerDefaults::kGamma)
     return "generic CUDA HDG requires frozen Euler gamma 1.4";
+  return {};
+}
+
+std::string ValidateCaseData(const HdgEulerCaseData& case_data)
+{
+  if (!case_data.initial_condition)
+    return "generic CUDA HDG requires an initial-condition coefficient";
+  if (case_data.initial_condition->GetVDim() !=
+      dg::hdg::runtime::cuda_w8a::conserved_components)
+    return "generic CUDA HDG requires a four-component Euler IC";
+  if (case_data.static_source)
+    return "generic CUDA HDG does not admit a static source";
+  if (!OnlyPeriodic(case_data.boundary_plan))
+    return "generic CUDA HDG admits periodic boundary plans only";
   return {};
 }
 
@@ -338,13 +356,37 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   if (!CollectiveAll(context.has_value() && local_ok))
     return Reject("CUDA HDG mesh context publication failed on another rank");
 
+  std::optional<HdgEulerCaseData> case_data;
+  try
+  {
+    case_data.emplace(request.make_case_data(*context));
+    local_ok = true;
+  }
+  catch (...) { local_ok = false; }
+  if (!CollectiveAll(local_ok && case_data.has_value()))
+    return Reject("CUDA HDG case-data factory failed on at least one rank");
+
+  try { reason = ValidateCaseData(*case_data); }
+  catch (...) { reason = "rank-local CUDA HDG case-data validation failed"; }
+  if (!CollectiveAll(reason.empty()))
+    return Reject(reason.empty() ? "CUDA HDG case-data validation failed on another rank"
+                                 : reason);
+
+  std::string case_data_consensus;
+  try { case_data_consensus = CaseDataConsensusText(*case_data); }
+  catch (...) { case_data_consensus.clear(); }
+  if (!CollectiveAll(!case_data_consensus.empty()))
+    return Reject("CUDA HDG case-data consensus serialization failed");
+  if (!ExactTextConsensus(case_data_consensus))
+    return Reject("CUDA HDG case data differs between MPI ranks");
+
   local_ok = false;
   try
   {
     const int boundary_attributes = context->Mesh().bdr_attributes.Size() == 0
         ? 0 : context->Mesh().bdr_attributes.Max();
     const auto lowered = dg::hdg::generic::LowerHdgEulerBoundaryPlan(
-        request.boundary_plan, 2, request.case_config.gamma,
+        case_data->boundary_plan, 2, request.case_config.gamma,
         boundary_attributes);
     local_ok = lowered.AttributeCount() ==
         static_cast<std::size_t>(boundary_attributes);
@@ -372,7 +414,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         mfem::Ordering::byNODES);
     projected_initial = std::make_unique<mfem::ParGridFunction>(volume_space.get());
     published_state = std::make_unique<mfem::ParGridFunction>(volume_space.get());
-    projected_initial->ProjectCoefficient(request.initial_condition);
+    projected_initial->ProjectCoefficient(*case_data->initial_condition);
     local_ok = projected_initial->CheckFinite() == 0 &&
         volume_space->GetVSize() > 0 &&
         volume_space->GetVSize() % dg::hdg::runtime::cuda_w8a::conserved_components == 0;
