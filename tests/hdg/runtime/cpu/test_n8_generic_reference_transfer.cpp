@@ -3,6 +3,7 @@
 #include "hdg_cpu_serial_lifecycle.hpp"
 #include "numerics/hdg/generic/contract.hpp"
 #include "numerics/hdg/runtime/cpu/generic_euler.hpp"
+#include "numerics/hdg/runtime/cpu/persistent_sc25_scalar_igr.hpp"
 
 #include <mpi.h>
 
@@ -175,28 +176,33 @@ bool ObservablesTransferMatch(
             transfer_observable_relative_tolerance);
 }
 
-bool CoordinatesMatch(const generic::HdgEulerSessionCoordinates& coordinates,
+template <typename Coordinates>
+bool CoordinatesMatch(const Coordinates& coordinates,
                       const std::uint64_t step) noexcept
 {
   const double expected_time = static_cast<double>(step) *
       cpu::w8c::SmoothTransitionV2Case::dt;
+  const double expected_dt = step == 0
+      ? 0.0 : cpu::w8c::SmoothTransitionV2Case::dt;
   return coordinates.step == step && coordinates.generation == step &&
       Close(coordinates.time, expected_time, 1.0e-15, 1.0e-15) &&
-      Close(coordinates.dt, cpu::w8c::SmoothTransitionV2Case::dt,
-            1.0e-15, 1.0e-15);
+      Close(coordinates.dt, expected_dt, 1.0e-15, 1.0e-15);
 }
 
 bool Sc25CoordinatesMatch(
     const dg::hdg::runtime::StateCoordinates& coordinates,
-    const std::uint64_t step) noexcept
+    const std::uint64_t step, const int ranks) noexcept
 {
   const double expected_time = static_cast<double>(step) *
       cpu::w8c::SmoothTransitionV2Case::dt;
+  // The frozen rank-two leaf preloads dt at initialization; the rank-one leaf
+  // and the generic session expose zero until the first committed step.
+  const double expected_dt = step == 0 && ranks == 1
+      ? 0.0 : cpu::w8c::SmoothTransitionV2Case::dt;
   return coordinates.step == step && coordinates.generation == step &&
       coordinates.cursor == step &&
       Close(coordinates.time, expected_time, 1.0e-15, 1.0e-15) &&
-      Close(coordinates.dt, cpu::w8c::SmoothTransitionV2Case::dt,
-            1.0e-15, 1.0e-15);
+      Close(coordinates.dt, expected_dt, 1.0e-15, 1.0e-15);
 }
 
 bool CheckTransferCheckpoint(
@@ -224,18 +230,31 @@ bool CheckTransferCheckpoint(
           maximum_relative_error);
   const bool coordinates = CoordinatesMatch(generic_session.coordinates(), step) &&
       CoordinatesMatch(production.coordinates, step) &&
-      Sc25CoordinatesMatch(sc25_coordinates, step);
-  const bool passed = oracle_ready && coordinates &&
-      ObservableMatchesOracle(production, generic_oracle) &&
-      ObservablesTransferMatch(generic_oracle, scalar_oracle) &&
-      maximum_absolute_error <= transfer_state_absolute_tolerance &&
+      Sc25CoordinatesMatch(sc25_coordinates, step, generic_mesh.GetNRanks());
+  const bool production_matches =
+      ObservableMatchesOracle(production, generic_oracle);
+  const bool transfer_matches =
+      ObservablesTransferMatch(generic_oracle, scalar_oracle);
+  const bool state_absolute_matches =
+      maximum_absolute_error <= transfer_state_absolute_tolerance;
+  const bool state_relative_matches =
       maximum_relative_error <= transfer_state_relative_tolerance;
+  const bool passed = oracle_ready && coordinates && production_matches &&
+      transfer_matches && state_absolute_matches && state_relative_matches;
   if (!passed)
   {
     int rank = -1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     if (rank == 0)
       std::cerr << "N8 reference-transfer checkpoint failed step=" << step
+                << " oracle=" << oracle_ready
+                << " coordinates=" << coordinates
+                << " production_observables=" << production_matches
+                << " transfer_observables=" << transfer_matches
+                << " production_available=" << production.available
+                << " production_q=" << production.quadrature_order
+                << " generic_oracle_available=" << generic_oracle.available
+                << " scalar_oracle_available=" << scalar_oracle.available
                 << " state_abs=" << maximum_absolute_error
                 << " state_rel=" << maximum_relative_error << '\n';
   }
