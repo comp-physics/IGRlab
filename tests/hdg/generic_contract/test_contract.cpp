@@ -83,7 +83,7 @@ EulerHdgRequest ValidRequest(const mfem::ParMesh& mesh,
   request.initial_state = {initial.data(), initial.size(), 4};
   request.initial_true_trace = {initial.data(), initial.size(), 4};
   request.source = {nullptr, 0, 4};
-  request.boundary = {nullptr, ExteriorState};
+  request.boundary = {nullptr, ExteriorState, {nullptr, 0, 0, 0.0}};
   request.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(request.polynomial_order);
   return request;

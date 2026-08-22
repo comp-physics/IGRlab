@@ -207,7 +207,8 @@ EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
   request.initial_true_trace = {nullptr, 0, 4};
   request.source = {fields.source.empty() ? nullptr : fields.source.data(),
                     fields.source.size(), 4};
-  request.boundary = {&boundary, NonperiodicExterior};
+  request.boundary = {
+      &boundary, NonperiodicExterior, {nullptr, 0, 0, 0.0}};
   request.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
   return request;
@@ -412,7 +413,8 @@ bool CheckBorrowedTraceRestrictsInterior()
         : dg::hdg::generic::EulerFieldView{initial.data(), initial.size(), 4};
     request.initial_true_trace = {nullptr, 0, 4};
     request.source = {nullptr, 0, 4};
-    request.boundary = {&boundary, NonperiodicExterior};
+    request.boundary = {
+        &boundary, NonperiodicExterior, {nullptr, 0, 0, 0.0}};
     request.numerical_policy =
         dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
     if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
@@ -1118,7 +1120,8 @@ bool CheckUnifiedIgrAssemblerJacobianForTests()
       ExactBorrowedEulerFields fields(mesh, order, initial, source);
       EulerHdgRequest request = Request(mesh, order, boundary, fields);
       request.boundary = {
-          &boundary, FixedExteriorForAssemblerJacobianForTests};
+          &boundary, FixedExteriorForAssemblerJacobianForTests,
+          {nullptr, 0, 0, 0.0}};
       request.numerical_policy.stabilization =
           {RegularizationKind::igr, 0.2, 0.8};
       dg::hdg::runtime::cpu::detail::CpuNumericsCore core;

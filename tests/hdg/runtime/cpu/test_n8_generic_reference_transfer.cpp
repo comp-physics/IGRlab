@@ -115,7 +115,7 @@ generic::EulerHdgRequest MakeRequest(
           {initial.data(), initial.size(), 4},
           {true_trace.data(), true_trace.size(), 4},
           {source.data(), source.size(), 4},
-          {nullptr, PeriodicExterior},
+          {nullptr, PeriodicExterior, {nullptr, 0, 0, 0.0}},
           policy};
 }
 
