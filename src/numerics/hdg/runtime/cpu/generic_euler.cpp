@@ -202,13 +202,22 @@ std::uint32_t GenericEulerHdgCpuSession::capabilities() const noexcept
       generic::HdgEulerSessionCapabilityBit(
           generic::HdgEulerSessionCapability::generic_borrowed_inputs) |
       generic::HdgEulerSessionCapabilityBit(
-          generic::HdgEulerSessionCapability::committed_observables);
+          generic::HdgEulerSessionCapability::committed_observables) |
+      generic::HdgEulerSessionCapabilityBit(
+          generic::HdgEulerSessionCapability::committed_nonlinear_residual_audit);
 }
 
 generic::HdgEulerCommittedDiagnostics
 GenericEulerHdgCpuSession::diagnostics() const noexcept
 {
   return diagnostics_;
+}
+
+generic::HdgEulerCommittedResidualAudit
+GenericEulerHdgCpuSession::committed_residual_audit() const noexcept
+{
+  return core_ ? core_->CommittedBorrowedEulerResidualAudit()
+               : generic::HdgEulerCommittedResidualAudit{};
 }
 
 generic::HdgEulerCommittedObservables

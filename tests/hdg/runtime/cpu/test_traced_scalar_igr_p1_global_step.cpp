@@ -58,6 +58,11 @@ bool SameBits(const mfem::Vector& left, const mfem::Vector& right)
       static_cast<std::size_t>(left.Size()) * sizeof(double)) == 0;
 }
 
+bool SameBits(const double left, const double right)
+{
+  return std::memcmp(&left, &right, sizeof(double)) == 0;
+}
+
 bool AllEqual(const mfem::Vector& values, const double expected)
 {
   const double* const data = values.HostRead();
@@ -717,6 +722,81 @@ bool RunScratchSuccess(const MPI_Comm communicator, const Layout& layout,
              &scratch);
 }
 
+bool CheckResidualAuditSeam(
+    const MPI_Comm communicator, const Layout& layout,
+    const std::vector<local::AffineQuad>& quads,
+    const mfem::ParFiniteElementSpace& source_space, const mfem::Vector& source)
+{
+  const mfem::ParFiniteElementSpace* const trace_space = layout.TraceSpace();
+  if (trace_space == nullptr) return false;
+  mfem::Vector current_trace(layout.TraceTrueVSize());
+  mfem::Vector previous_trace(layout.TraceTrueVSize());
+  mfem::Vector current_interior, previous_interior;
+  bool ok = FillTrueTrace(*trace_space, current_trace, 2.0e-5) &&
+      FillTrueTrace(*trace_space, previous_trace, 0.0) &&
+      FillInterior(layout, current_interior, previous_interior);
+  if (!AllRanks(communicator, ok)) return false;
+  local::Parameters parameters{};
+  parameters.dt = 0.05; parameters.alpha = 0.8; parameters.beta = 1.1;
+  parameters.quadrature_order = 12;
+  const detail::TracedScalarIgrP1GlobalStepInput input{
+      communicator, &layout, quads.data(), static_cast<int>(quads.size()), parameters,
+      &current_trace, &previous_trace, &current_interior, &previous_interior,
+      &source_space, &source};
+
+  int rank = 0, ranks = 0;
+  MPI_Comm_rank(communicator, &rank); MPI_Comm_size(communicator, &ranks);
+  if (ranks > 1)
+  {
+    detail::TracedScalarIgrP1ResidualAuditScratch mismatched_quadrature(
+        communicator, layout, rank == 0 ? 34 : 35);
+    ok = !mismatched_quadrature.Initialize(input) &&
+        !mismatched_quadrature.IsReady() &&
+        !mismatched_quadrature.Initialize(input);
+    if (!AllRanks(communicator, ok)) return false;
+  }
+
+  detail::TracedScalarIgrP1Scratch normal(communicator, layout);
+  detail::TracedScalarIgrP1GlobalStepOutput before, after;
+  before.trace_increment.SetSize(layout.TraceTrueVSize());
+  before.interior_increment.SetSize(layout.InteriorLocalVSize());
+  after.trace_increment.SetSize(layout.TraceTrueVSize());
+  after.interior_increment.SetSize(layout.InteriorLocalVSize());
+  ok = normal.Initialize(input) &&
+      detail::ComputeTracedScalarIgrP1GlobalStep(input, before, normal) ==
+          detail::TracedScalarIgrP1GlobalStepResult::success;
+  if (!AllRanks(communicator, ok)) return false;
+
+  // 34 deliberately differs from the production p1 solve order and exceeds
+  // its order-32 local-wrapper ceiling.  The audit invokes shared algebra
+  // with its eagerly copied dynamic tables instead.
+  detail::TracedScalarIgrP1ResidualAuditScratch audit(communicator, layout, 34);
+  double first_norm = -17.25;
+  double repeated_norm = -23.5;
+  ok = audit.Initialize(input) && audit.IsReady() && audit.WorkspaceBytes() > 0 &&
+      detail::ComputeTracedScalarIgrP1ResidualAudit(input, first_norm, audit) &&
+      detail::ComputeTracedScalarIgrP1ResidualAudit(input, repeated_norm, audit) &&
+      std::isfinite(first_norm) && first_norm >= 0.0 &&
+      SameBits(first_norm, repeated_norm);
+  if (!AllRanks(communicator, ok)) return false;
+
+  detail::TracedScalarIgrP1GlobalStepInput invalid = input;
+  invalid.parameters.gamma = 1.0;
+  double preserved_norm = 91.125;
+  ok = !detail::ComputeTracedScalarIgrP1ResidualAudit(invalid, preserved_norm,
+                                                       audit) &&
+      SameBits(preserved_norm, 91.125) && normal.IsReady() &&
+      detail::ComputeTracedScalarIgrP1GlobalStep(input, after, normal) ==
+          detail::TracedScalarIgrP1GlobalStepResult::success &&
+      SameBits(before.trace_increment, after.trace_increment) &&
+      SameBits(before.interior_increment, after.interior_increment) &&
+      SameBits(before.initial_residual_norm, after.initial_residual_norm) &&
+      SameBits(before.reduced_rhs_norm, after.reduced_rhs_norm) &&
+      SameBits(before.linear_residual_norm, after.linear_residual_norm) &&
+      before.linear_iterations == after.linear_iterations;
+  return AllRanks(communicator, ok);
+}
+
 bool Check(const MPI_Comm communicator)
 {
   mfem::ParMesh mesh = MakeMesh(communicator);
@@ -740,6 +820,9 @@ bool Check(const MPI_Comm communicator)
   const double mean_b = mfem::InnerProduct(communicator, source_b, ones);
   ok = std::abs(mean_a - mean_b) < 1.0e-12;
   if (!Require(communicator, ok, "equal source means")) { return false; }
+
+  ok = CheckResidualAuditSeam(communicator, layout, quads, source_space, source_a);
+  if (!Require(communicator, ok, "IGR residual-only audit seam")) { return false; }
 
   detail::TracedScalarIgrP1GlobalStepOutput first, second, changed_dt;
   ok = Run(communicator, layout, quads, source_space, source_a, 0.05, first) &&

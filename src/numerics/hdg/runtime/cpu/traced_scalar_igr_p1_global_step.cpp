@@ -2,6 +2,7 @@
 
 #include "numerics/hdg/core/host_reference.hpp"
 #include "numerics/hdg/generic/contract.hpp"
+#include "numerics/hdg/runtime/common/traced_scalar_igr_p1_local_algebra.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@ namespace dg::hdg::runtime::cpu::detail
 namespace
 {
 namespace local = traced_scalar_igr_p1;
+namespace audit_algebra = common::traced_scalar_igr_p1_local_algebra;
 
 bool Finite(const double value) noexcept { return std::isfinite(value); }
 
@@ -2238,6 +2240,467 @@ bool TracedScalarIgrP1Scratch::IsUsable() const noexcept
   binding.communicator = implementation_->communicator;
   binding.layout = implementation_->layout;
   return implementation_->StorageMatches(binding);
+}
+
+namespace
+{
+bool ValidAuditParameters(const local::Parameters& parameters) noexcept
+{
+  return Finite(parameters.gamma) && parameters.gamma > 1.0 &&
+      Finite(parameters.alpha) && parameters.alpha > 0.0 &&
+      Finite(parameters.beta) && parameters.beta > 0.0 &&
+      Finite(parameters.dt) && parameters.dt > 0.0 &&
+      Finite(parameters.density_floor) && parameters.density_floor > 0.0;
+}
+
+bool ValidAuditInput(const TracedScalarIgrP1GlobalStepInput& input) noexcept
+{
+  if (input.communicator == MPI_COMM_NULL || input.layout == nullptr ||
+      !input.layout->IsUsable() || input.current_true_trace == nullptr ||
+      input.previous_true_trace == nullptr || input.current_interior == nullptr ||
+      input.previous_interior == nullptr ||
+      input.current_interior == input.previous_interior ||
+      input.current_true_trace == input.previous_true_trace ||
+      input.current_true_trace->Size() != input.layout->TraceTrueVSize() ||
+      input.previous_true_trace->Size() != input.layout->TraceTrueVSize() ||
+      input.current_interior->Size() != input.layout->InteriorLocalVSize() ||
+      input.previous_interior->Size() != input.layout->InteriorLocalVSize() ||
+      !AllFinite(*input.current_true_trace) ||
+      !AllFinite(*input.previous_true_trace) || !AllFinite(*input.current_interior) ||
+      !AllFinite(*input.previous_interior) || !ValidAuditParameters(input.parameters) ||
+      input.affine_quad_count != input.layout->LocalElementCount() ||
+      (input.affine_quad_count > 0 && input.affine_quads == nullptr))
+  {
+    return false;
+  }
+  if (SourceIsZero(input)) { return true; }
+  const mfem::ParFiniteElementSpace* const source_space =
+      input.static_euler_rhs_space;
+  const mfem::ParFiniteElementSpace* const interior_space =
+      input.layout->InteriorSpace();
+  const mfem::Vector& source = *input.static_euler_rhs_coefficients;
+  return source_space != nullptr && interior_space != nullptr &&
+      source_space->GetParMesh() == interior_space->GetParMesh() &&
+      source_space->GetVDim() == 4 &&
+      source_space->GetOrdering() == mfem::Ordering::byNODES &&
+      source_space->GetVSize() % 4 == 0 &&
+      source.Size() == source_space->GetVSize() && AllFinite(source);
+}
+
+bool FillAuditElementSource(const mfem::ParFiniteElementSpace* source_space,
+                            const mfem::Vector* source_coefficients,
+                            const int* bound_signed_vdofs,
+                            const int element, const double* volume_xyw,
+                            const int points, double* samples,
+                            mfem::Vector& shape) noexcept
+{
+  if (points <= 0 || samples == nullptr || volume_xyw == nullptr) return false;
+  if (source_coefficients == nullptr || source_coefficients->Size() == 0)
+  {
+    std::fill(samples, samples + static_cast<std::size_t>(points) * 4, 0.0);
+    return true;
+  }
+  if (source_space == nullptr || bound_signed_vdofs == nullptr ||
+      source_space->GetOrdering() != mfem::Ordering::byNODES ||
+      source_space->GetVSize() % 4 != 0 || shape.Size() != 4)
+  {
+    return false;
+  }
+  const mfem::FiniteElement* const finite_element = source_space->GetFE(element);
+  const double* const coefficients = source_coefficients->HostRead();
+  if (finite_element == nullptr || finite_element->GetDof() != 4 ||
+      coefficients == nullptr) return false;
+  for (int point = 0; point < points; ++point)
+  {
+    mfem::IntegrationPoint ip;
+    ip.x = volume_xyw[3 * point]; ip.y = volume_xyw[3 * point + 1];
+    ip.weight = volume_xyw[3 * point + 2];
+    finite_element->CalcShape(ip, shape);
+    for (int component = 0; component < 4; ++component)
+    {
+      double value = 0.0;
+      for (int dof = 0; dof < 4; ++dof)
+      {
+        double sign = 1.0;
+        const int vdof = DecodeSignedVDof(
+            bound_signed_vdofs[component * 4 + dof], sign);
+        if (vdof < 0 || vdof >= source_coefficients->Size()) return false;
+        value += shape[dof] * sign * coefficients[vdof];
+      }
+      if (!Finite(value)) return false;
+      samples[static_cast<std::size_t>(point) * 4 + component] = value;
+    }
+  }
+  return true;
+}
+
+bool CopyAuditQuadrature(const mfem::IntegrationRule& volume,
+                         const mfem::IntegrationRule& segment,
+                         std::vector<double>& volume_xyw,
+                         std::vector<double>& segment_xw) noexcept
+{
+  if (volume.GetNPoints() <= 0 || segment.GetNPoints() <= 0) return false;
+  std::size_t volume_entries = 0, segment_entries = 0;
+  if (!CheckedProduct(static_cast<std::size_t>(volume.GetNPoints()), 3,
+                      volume_entries) ||
+      !CheckedProduct(static_cast<std::size_t>(segment.GetNPoints()), 2,
+                      segment_entries)) return false;
+  try
+  {
+    volume_xyw.resize(volume_entries); segment_xw.resize(segment_entries);
+    for (int point = 0; point < volume.GetNPoints(); ++point)
+    {
+      const mfem::IntegrationPoint& ip = volume.IntPoint(point);
+      volume_xyw[3 * point] = ip.x; volume_xyw[3 * point + 1] = ip.y;
+      volume_xyw[3 * point + 2] = ip.weight;
+    }
+    for (int point = 0; point < segment.GetNPoints(); ++point)
+    {
+      const mfem::IntegrationPoint& ip = segment.IntPoint(point);
+      segment_xw[2 * point] = ip.x; segment_xw[2 * point + 1] = ip.weight;
+    }
+  }
+  catch (const std::exception&) { return false; }
+  return AllFinite(volume_xyw) && AllFinite(segment_xw);
+}
+
+bool ExactAuditQuadratureConsensus(const MPI_Comm communicator,
+                                   const int quadrature_order) noexcept
+{
+  int minimum = 0, maximum = 0;
+  // This is a fixed pair before any MFEM rule lookup or state provisioning.
+  const int minimum_status = MPI_Allreduce(&quadrature_order, &minimum, 1,
+                                           MPI_INT, MPI_MIN, communicator);
+  const int maximum_status = MPI_Allreduce(&quadrature_order, &maximum, 1,
+                                           MPI_INT, MPI_MAX, communicator);
+  return minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS &&
+      minimum == maximum;
+}
+} // namespace
+
+struct TracedScalarIgrP1ResidualAuditScratch::Implementation final
+{
+  MPI_Comm communicator = MPI_COMM_NULL;
+  const BorrowedP1DGInterfaceLayout* layout = nullptr;
+  const mfem::ParFiniteElementSpace* interior_space = nullptr;
+  const mfem::ParFiniteElementSpace* trace_space = nullptr;
+  const mfem::ParMesh* mesh = nullptr;
+  int quadrature_order = 0;
+  int interior_size = -1;
+  int trace_local_size = -1;
+  int trace_true_size = -1;
+  int elements = -1;
+  int volume_points = 0;
+  int segment_points = 0;
+  std::size_t source_sample_stride = 0;
+  const mfem::ParFiniteElementSpace* source_space = nullptr;
+  long source_sequence = -1;
+  std::vector<int> source_element_vdofs;
+  std::vector<int> trace_element_vdofs;
+  std::vector<double> volume_xyw, segment_xw, source_samples;
+  std::vector<double> interior_residual, trace_residual, a, b, c, d, f, g;
+  std::vector<double> broken_residual;
+  mfem::Vector current_local_trace, previous_local_trace;
+  mfem::Vector raw_local_trace, raw_true_trace;
+  mfem::Vector current_element_interior, previous_element_interior;
+  mfem::Vector current_element_trace, previous_element_trace, source_shape;
+  bool initialized = false;
+  bool initialization_attempted = false;
+  bool initialization_poisoned = false;
+
+  bool BindingMatches(const TracedScalarIgrP1GlobalStepInput& input) const noexcept
+  {
+    int comparison = MPI_UNEQUAL;
+    return !initialization_poisoned && communicator != MPI_COMM_NULL &&
+        input.communicator != MPI_COMM_NULL &&
+        MPI_Comm_compare(communicator, input.communicator, &comparison) == MPI_SUCCESS &&
+        (comparison == MPI_IDENT || comparison == MPI_CONGRUENT) &&
+        quadrature_order > 0 && layout == input.layout && layout && layout->IsUsable() &&
+        interior_space == layout->InteriorSpace() && trace_space == layout->TraceSpace() &&
+        interior_space && trace_space && mesh && interior_space->GetParMesh() == mesh &&
+        trace_space->GetParMesh() == mesh && elements >= 0 &&
+        interior_size == layout->InteriorLocalVSize() &&
+        trace_local_size == layout->TraceLocalVSize() &&
+        trace_true_size == layout->TraceTrueVSize() &&
+        interior_space->GetVSize() == interior_size &&
+        trace_space->GetVSize() == trace_local_size &&
+        trace_space->GetTrueVSize() == trace_true_size;
+  }
+
+  bool StorageMatches(const TracedScalarIgrP1GlobalStepInput& input) const noexcept
+  {
+    std::size_t point_entries = 0, source_entries = 0, broken_entries = 0;
+    std::size_t volume_entries = 0, segment_entries = 0;
+    std::size_t trace_vdof_entries = 0, source_vdof_entries = 0;
+    return BindingMatches(input) && volume_points > 0 && segment_points > 0 &&
+        CheckedProduct(static_cast<std::size_t>(volume_points), 4, point_entries) &&
+        CheckedBatchCapacity(elements, point_entries, source_entries) &&
+        CheckedBatchCapacity(elements, 28, broken_entries) &&
+        CheckedBatchCapacity(elements, 40, trace_vdof_entries) &&
+        CheckedBatchCapacity(elements, 16, source_vdof_entries) &&
+        CheckedProduct(static_cast<std::size_t>(volume_points), 3, volume_entries) &&
+        CheckedProduct(static_cast<std::size_t>(segment_points), 2, segment_entries) &&
+        volume_xyw.size() == volume_entries && segment_xw.size() == segment_entries &&
+        source_sample_stride == point_entries &&
+        source_samples.size() == source_entries && broken_residual.size() == broken_entries &&
+        trace_element_vdofs.size() == trace_vdof_entries &&
+        current_local_trace.Size() == trace_local_size &&
+        previous_local_trace.Size() == trace_local_size &&
+        raw_local_trace.Size() == trace_local_size && raw_true_trace.Size() == trace_true_size &&
+        current_element_interior.Size() == 28 && previous_element_interior.Size() == 28 &&
+        current_element_trace.Size() == 40 && previous_element_trace.Size() == 40 &&
+        source_shape.Size() == 4 && interior_residual.size() == 28 &&
+        trace_residual.size() == 40 && a.size() == 28 * 28 && b.size() == 28 * 40 &&
+        c.size() == 40 * 28 && d.size() == 40 * 40 && f.size() == 28 && g.size() == 40 &&
+        (source_space == input.static_euler_rhs_space) &&
+        ((source_space == nullptr && source_element_vdofs.empty()) ||
+         (source_space != nullptr && source_space->GetSequence() == source_sequence &&
+          source_element_vdofs.size() == source_vdof_entries));
+  }
+
+  bool Matches(const TracedScalarIgrP1GlobalStepInput& input) const noexcept
+  { return initialized && StorageMatches(input); }
+};
+
+TracedScalarIgrP1ResidualAuditScratch::TracedScalarIgrP1ResidualAuditScratch(
+    const MPI_Comm communicator, const BorrowedP1DGInterfaceLayout& layout,
+    const int exact_positive_quadrature_order) noexcept
+{
+  try
+  {
+    if (communicator == MPI_COMM_NULL || !layout.IsUsable() ||
+        exact_positive_quadrature_order <= 0) return;
+    const mfem::ParFiniteElementSpace* const interior = layout.InteriorSpace();
+    const mfem::ParFiniteElementSpace* const trace = layout.TraceSpace();
+    const mfem::ParMesh* const mesh = interior ? interior->GetParMesh() : nullptr;
+    if (!interior || !trace || !mesh || trace->GetParMesh() != mesh ||
+        layout.LocalElementCount() < 0 || layout.InteriorLocalVSize() < 0 ||
+        layout.TraceLocalVSize() < 0 || layout.TraceTrueVSize() < 0) return;
+    implementation_ = std::make_unique<Implementation>();
+    Implementation& state = *implementation_;
+    state.communicator = communicator; state.layout = &layout;
+    state.interior_space = interior; state.trace_space = trace; state.mesh = mesh;
+    state.quadrature_order = exact_positive_quadrature_order;
+    state.interior_size = layout.InteriorLocalVSize();
+    state.trace_local_size = layout.TraceLocalVSize();
+    state.trace_true_size = layout.TraceTrueVSize();
+    state.elements = layout.LocalElementCount();
+  }
+  catch (...) { implementation_.reset(); }
+}
+
+TracedScalarIgrP1ResidualAuditScratch::~TracedScalarIgrP1ResidualAuditScratch() = default;
+TracedScalarIgrP1ResidualAuditScratch::TracedScalarIgrP1ResidualAuditScratch(
+    TracedScalarIgrP1ResidualAuditScratch&&) noexcept = default;
+TracedScalarIgrP1ResidualAuditScratch&
+TracedScalarIgrP1ResidualAuditScratch::operator=(
+    TracedScalarIgrP1ResidualAuditScratch&&) noexcept = default;
+
+bool TracedScalarIgrP1ResidualAuditScratch::Initialize(
+    const TracedScalarIgrP1GlobalStepInput& input) noexcept
+{
+  if (input.communicator == MPI_COMM_NULL) return false;
+  const bool local_admission = implementation_ != nullptr &&
+      !implementation_->initialization_attempted &&
+      implementation_->BindingMatches(input) && ValidAuditInput(input);
+  if (!CollectiveAll(input.communicator, local_admission))
+  {
+    if (implementation_) { implementation_->initialization_attempted = true; implementation_->initialization_poisoned = true; }
+    return false;
+  }
+  Implementation& state = *implementation_;
+  state.initialization_attempted = true;
+  if (!ExactAuditQuadratureConsensus(input.communicator, state.quadrature_order))
+  {
+    state.initialization_poisoned = true;
+    return false;
+  }
+  bool local_ok = true;
+  try
+  {
+    const mfem::IntegrationRule& volume = mfem::IntRules.Get(
+        mfem::Geometry::SQUARE, state.quadrature_order);
+    const mfem::IntegrationRule& segment = mfem::IntRules.Get(
+        mfem::Geometry::SEGMENT, state.quadrature_order);
+    state.volume_points = volume.GetNPoints(); state.segment_points = segment.GetNPoints();
+    std::size_t point_entries = 0, source_entries = 0, broken_entries = 0;
+    local_ok = state.volume_points > 0 && state.segment_points > 0 &&
+        CheckedProduct(static_cast<std::size_t>(state.volume_points), 4,
+                       point_entries) &&
+        CheckedBatchCapacity(state.elements, point_entries, source_entries) &&
+        CheckedBatchCapacity(state.elements, 28, broken_entries) &&
+        CopyAuditQuadrature(volume, segment, state.volume_xyw, state.segment_xw);
+    if (local_ok)
+    {
+      state.source_sample_stride = point_entries;
+      state.source_samples.assign(source_entries, 0.0);
+      state.broken_residual.assign(broken_entries, 0.0);
+      state.interior_residual.assign(28, 0.0); state.trace_residual.assign(40, 0.0);
+      state.a.assign(28 * 28, 0.0); state.b.assign(28 * 40, 0.0);
+      state.c.assign(40 * 28, 0.0); state.d.assign(40 * 40, 0.0);
+      state.f.assign(28, 0.0); state.g.assign(40, 0.0);
+      state.current_local_trace.SetSize(state.trace_local_size);
+      state.previous_local_trace.SetSize(state.trace_local_size);
+      state.raw_local_trace.SetSize(state.trace_local_size);
+      state.raw_true_trace.SetSize(state.trace_true_size);
+      state.current_element_interior.SetSize(28); state.previous_element_interior.SetSize(28);
+      state.current_element_trace.SetSize(40); state.previous_element_trace.SetSize(40);
+      state.source_shape.SetSize(4);
+      state.source_space = input.static_euler_rhs_space;
+      state.source_sequence = state.source_space ? state.source_space->GetSequence() : -1;
+      local_ok = CaptureElementVDofs(state.trace_space, state.elements, 40,
+          state.trace_element_vdofs) &&
+          (state.source_space == nullptr || CaptureElementVDofs(
+              state.source_space, state.elements, 16, state.source_element_vdofs));
+    }
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(input.communicator, local_ok))
+  {
+    state.initialization_poisoned = true;
+    return false;
+  }
+  state.initialized = true;
+  if (!CollectiveAll(input.communicator, state.Matches(input)))
+  {
+    state.initialization_poisoned = true; state.initialized = false;
+    return false;
+  }
+  return true;
+}
+
+bool TracedScalarIgrP1ResidualAuditScratch::IsReady() const noexcept
+{
+  if (!implementation_ || !implementation_->initialized ||
+      implementation_->initialization_poisoned) return false;
+  TracedScalarIgrP1GlobalStepInput binding{};
+  binding.communicator = implementation_->communicator;
+  binding.layout = implementation_->layout;
+  binding.static_euler_rhs_space = implementation_->source_space;
+  return implementation_->Matches(binding);
+}
+
+std::size_t TracedScalarIgrP1ResidualAuditScratch::WorkspaceBytes() const noexcept
+{
+  if (!IsReady()) return 0;
+  const Implementation& state = *implementation_;
+  std::size_t total = 0;
+  const auto add = [&total](const std::size_t count, const std::size_t width)
+  {
+    if (width != 0 && count > (std::numeric_limits<std::size_t>::max() - total) / width)
+      return false;
+    total += count * width; return true;
+  };
+  const auto doubles = [&add](const std::vector<double>& values)
+  { return add(values.capacity(), sizeof(double)); };
+  const auto ints = [&add](const std::vector<int>& values)
+  { return add(values.capacity(), sizeof(int)); };
+  const auto vector = [&add](const mfem::Vector& values)
+  { return add(static_cast<std::size_t>(values.Capacity()), sizeof(double)); };
+  const bool ok = add(sizeof(Implementation), 1) && ints(state.source_element_vdofs) &&
+      ints(state.trace_element_vdofs) && doubles(state.volume_xyw) &&
+      doubles(state.segment_xw) && doubles(state.source_samples) &&
+      doubles(state.interior_residual) && doubles(state.trace_residual) &&
+      doubles(state.a) && doubles(state.b) && doubles(state.c) && doubles(state.d) &&
+      doubles(state.f) && doubles(state.g) && doubles(state.broken_residual) &&
+      vector(state.current_local_trace) && vector(state.previous_local_trace) &&
+      vector(state.raw_local_trace) && vector(state.raw_true_trace) &&
+      vector(state.current_element_interior) && vector(state.previous_element_interior) &&
+      vector(state.current_element_trace) && vector(state.previous_element_trace) &&
+      vector(state.source_shape);
+  return ok ? total : 0;
+}
+
+bool ComputeTracedScalarIgrP1ResidualAudit(
+    const TracedScalarIgrP1GlobalStepInput& input, double& norm,
+    TracedScalarIgrP1ResidualAuditScratch& scratch) noexcept
+{
+  if (input.communicator == MPI_COMM_NULL) return false;
+  const bool admitted = scratch.implementation_ &&
+      scratch.implementation_->Matches(input) && ValidAuditInput(input);
+  if (!CollectiveAll(input.communicator, admitted)) return false;
+  TracedScalarIgrP1ResidualAuditScratch::Implementation& state =
+      *scratch.implementation_;
+  const BorrowedP1DGInterfaceLayout& layout = *input.layout;
+  bool local_ok = layout.DistributeTrace(*input.current_true_trace,
+                                         state.current_local_trace) &&
+      layout.DistributeTrace(*input.previous_true_trace, state.previous_local_trace);
+  if (!CollectiveAll(input.communicator, local_ok)) return false;
+
+  std::fill(state.broken_residual.begin(), state.broken_residual.end(), 0.0);
+  state.raw_local_trace = 0.0; state.raw_true_trace = 0.0;
+  try
+  {
+    for (int element = 0; element < state.elements && local_ok; ++element)
+    {
+      local_ok = layout.GatherInteriorElement(element, *input.current_interior,
+          state.current_element_interior) &&
+          layout.GatherInteriorElement(element, *input.previous_interior,
+          state.previous_element_interior) &&
+          layout.GatherTraceElement(element, state.current_local_trace,
+          state.current_element_trace) &&
+          layout.GatherTraceElement(element, state.previous_local_trace,
+          state.previous_element_trace) &&
+          FillAuditElementSource(input.static_euler_rhs_space,
+              input.static_euler_rhs_coefficients,
+              state.source_space == nullptr ? nullptr :
+                  state.source_element_vdofs.data() + static_cast<std::size_t>(element) * 16,
+              element, state.volume_xyw.data(), state.volume_points,
+              state.source_samples.data() + static_cast<std::size_t>(element) *
+                  state.source_sample_stride,
+              state.source_shape);
+      if (!local_ok) break;
+      const audit_algebra::Input assembly_input{
+          input.affine_quads[element].vertices[0].data(),
+          {input.parameters.gamma, input.parameters.alpha, input.parameters.beta,
+           input.parameters.dt, input.parameters.density_floor},
+          state.current_element_interior.HostRead(),
+          state.previous_element_interior.HostRead(),
+          state.current_element_trace.HostRead(), state.previous_element_trace.HostRead(),
+          state.source_samples.data() + static_cast<std::size_t>(element) *
+              state.source_sample_stride,
+          state.volume_points,
+          {state.volume_xyw.data(), state.volume_points, state.segment_xw.data(),
+           state.segment_points}};
+      audit_algebra::Output assembly_output{state.interior_residual.data(),
+          state.trace_residual.data(), state.a.data(), state.b.data(), state.c.data(),
+          state.d.data(), state.f.data(), state.g.data()};
+      local_ok = audit_algebra::Assemble(assembly_input, assembly_output) ==
+          audit_algebra::Status::success && AllFinite(state.interior_residual) &&
+          AllFinite(state.trace_residual) && AllFinite(state.f) && AllFinite(state.g);
+      if (!local_ok) break;
+      std::copy(state.f.begin(), state.f.end(), state.broken_residual.begin() +
+          static_cast<std::size_t>(element) * 28);
+      const int* const vdofs = state.trace_element_vdofs.data() +
+          static_cast<std::size_t>(element) * 40;
+      for (int row = 0; row < 40 && local_ok; ++row)
+      {
+        double sign = 1.0;
+        const int vdof = DecodeSignedVDof(vdofs[row], sign);
+        local_ok = vdof >= 0 && vdof < state.raw_local_trace.Size();
+        if (local_ok)
+        {
+          state.raw_local_trace[vdof] += sign * state.g[static_cast<std::size_t>(row)];
+          local_ok = Finite(state.raw_local_trace[vdof]);
+        }
+      }
+    }
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(input.communicator, local_ok)) return false;
+  try
+  {
+    layout.TraceSpace()->Dof_TrueDof_Matrix()->MultTranspose(
+        state.raw_local_trace, state.raw_true_trace);
+    local_ok = AllFinite(state.raw_true_trace);
+  }
+  catch (const std::exception&) { local_ok = false; }
+  if (!CollectiveAll(input.communicator, local_ok)) return false;
+  double maximum = 0.0, candidate = 0.0;
+  if (!MaxAbsAndNorm(input.communicator, state.broken_residual,
+                     state.raw_true_trace, maximum, candidate)) return false;
+  norm = candidate;
+  return true;
 }
 
 TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(

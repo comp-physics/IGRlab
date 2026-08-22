@@ -140,6 +140,43 @@ private:
 };
 
 /**
+ * Optional, audit-only staging for an independently assembled IGR residual.
+ * It deliberately owns no condensed system, HYPRE object, retained solver
+ * state, or normal-step scratch.  The construction quadrature is exact for
+ * this audit and may exceed the production p1 solve's order-32 limit.
+ * It intentionally need not equal GlobalStepInput::parameters.quadrature_order,
+ * which remains the production-solve quadrature.
+ */
+class TracedScalarIgrP1ResidualAuditScratch final
+{
+public:
+  TracedScalarIgrP1ResidualAuditScratch(
+      MPI_Comm communicator, const BorrowedP1DGInterfaceLayout& layout,
+      int exact_positive_quadrature_order) noexcept;
+  ~TracedScalarIgrP1ResidualAuditScratch();
+  TracedScalarIgrP1ResidualAuditScratch(
+      const TracedScalarIgrP1ResidualAuditScratch&) = delete;
+  TracedScalarIgrP1ResidualAuditScratch& operator=(
+      const TracedScalarIgrP1ResidualAuditScratch&) = delete;
+  TracedScalarIgrP1ResidualAuditScratch(
+      TracedScalarIgrP1ResidualAuditScratch&&) noexcept;
+  TracedScalarIgrP1ResidualAuditScratch& operator=(
+      TracedScalarIgrP1ResidualAuditScratch&&) noexcept;
+
+  /** Collectively bind state/source layout and fully provision audit storage. */
+  bool Initialize(const TracedScalarIgrP1GlobalStepInput& input) noexcept;
+  bool IsReady() const noexcept;
+  std::size_t WorkspaceBytes() const noexcept;
+
+private:
+  struct Implementation;
+  std::unique_ptr<Implementation> implementation_;
+  friend bool ComputeTracedScalarIgrP1ResidualAudit(
+      const TracedScalarIgrP1GlobalStepInput&, double&,
+      TracedScalarIgrP1ResidualAuditScratch&) noexcept;
+};
+
+/**
  * Compute exactly one global Newton linearization.  Unless the result is
  * success, @a output is unchanged.  inadmissible_trial is reserved solely for
  * a local operator inadmissible_state; all structural, nonfinite, exception,
@@ -153,5 +190,15 @@ TracedScalarIgrP1GlobalStepResult ComputeTracedScalarIgrP1GlobalStep(
     const TracedScalarIgrP1GlobalStepInput& input,
     TracedScalarIgrP1GlobalStepOutput& output,
     TracedScalarIgrP1Scratch& scratch) noexcept;
+
+/**
+ * Assemble an audit residual at the scratch's exact quadrature and return the
+ * scale-safe norm of broken U7 and true Uhat5 residuals.  This never
+ * condenses, solves, recovers, or mutates normal-step state.  On failure
+ * @a norm is bitwise unchanged.  All ranks call collectively.
+ */
+bool ComputeTracedScalarIgrP1ResidualAudit(
+    const TracedScalarIgrP1GlobalStepInput& input, double& norm,
+    TracedScalarIgrP1ResidualAuditScratch& scratch) noexcept;
 
 } // namespace dg::hdg::runtime::cpu::detail

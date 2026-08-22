@@ -1752,6 +1752,10 @@ struct detail::CpuNumericsCore::Implementation
   detail::TracedScalarIgrP1GlobalStepOutput igr_linear_output{};
   detail::TracedScalarIgrP1GlobalStepOutput igr_probe_output{};
   std::unique_ptr<detail::TracedScalarIgrP1Scratch> igr_scratch;
+  // Optional audit-only storage.  It is deliberately distinct from the
+  // retained production scratch and may be absent without affecting solves.
+  std::unique_ptr<detail::TracedScalarIgrP1ResidualAuditScratch>
+      igr_residual_audit_scratch;
   // Maps are captured once.  Entries encode direct owned component-slab
   // indices; hot paths only perform fixed-size local copies, never a trace
   // distribution, projection, or MFEM topology query.
@@ -1811,6 +1815,9 @@ struct detail::CpuNumericsCore::Implementation
 
   LocalSystem current_system;
   LocalSystem trial_system;
+  // Separate preallocated audit storage: residual observation must not alter
+  // the primary Newton systems or their bookkeeping.
+  LocalSystem audit_system;
   core::HostReferenceEngine condensation;
   std::vector<double> schur;
   std::vector<double> reduced_rhs;
@@ -1855,6 +1862,10 @@ struct detail::CpuNumericsCore::Implementation
   bool publication_chain_authority = false;
   bool borrowed_prepare_active = false;
   double borrowed_prepared_previous_dt = 0.0;
+  generic::HdgEulerCommittedResidualAudit pending_residual_audit{};
+  std::uint64_t pending_residual_audit_candidate_generation = 0;
+  generic::HdgEulerCommittedResidualAudit committed_residual_audit{};
+  bool conventional_residual_audit_provisioned = false;
 
   bool CollectiveAll(const bool local) const noexcept
   {
@@ -3645,6 +3656,8 @@ struct detail::CpuNumericsCore::Implementation
       if (!current_system.Allocate(mesh->GetNE(), local_interior, local_trace,
                                    allocations) ||
           !trial_system.Allocate(mesh->GetNE(), local_interior, local_trace,
+                                 allocations) ||
+          !audit_system.Allocate(mesh->GetNE(), local_interior, local_trace,
                                  allocations))
       {
         return false;
@@ -3716,6 +3729,31 @@ struct detail::CpuNumericsCore::Implementation
                              config.assembly_quadrature_order).GetNPoints() <= 0)
       {
         return false;
+      }
+      // Audit quadrature is optional.  Warm its two rule tables before the
+      // allocation baseline is sealed, but normalize any unsupported order
+      // to unavailable observational evidence rather than rejecting normal
+      // initialization or allocating during Prepare.
+      conventional_residual_audit_provisioned = false;
+      if (IsBorrowed() && !IsIgr())
+      {
+        bool local_audit_rules_ready = false;
+        try
+        {
+          const int audit_order =
+              borrowed_request->numerical_policy.audit_quadrature_order;
+          local_audit_rules_ready = audit_order > 0 &&
+              mfem::IntRules.Get(mfem::Geometry::SQUARE, audit_order)
+                      .GetNPoints() > 0 &&
+              mfem::IntRules.Get(mfem::Geometry::SEGMENT, audit_order)
+                      .GetNPoints() > 0;
+        }
+        catch (...)
+        {
+          local_audit_rules_ready = false;
+        }
+        conventional_residual_audit_provisioned =
+            CollectiveAll(local_audit_rules_ready);
       }
 
       local_matrix = std::make_unique<mfem::SparseMatrix>(
@@ -3920,7 +3958,9 @@ struct detail::CpuNumericsCore::Implementation
         mfem_bytes(igr_probe_output.trace_increment) + bytes(igr_affine_quads) +
         bytes(igr_public_interior_to_private) + bytes(igr_public_interior_sign) +
         bytes(igr_public_trace_to_private) + bytes(igr_public_trace_sign) +
-        (igr_scratch ? igr_scratch->WorkspaceBytes() : 0);
+        (igr_scratch ? igr_scratch->WorkspaceBytes() : 0) +
+        (igr_residual_audit_scratch
+             ? igr_residual_audit_scratch->WorkspaceBytes() : 0);
     return igr_bytes + bytes(current_system.residual_interior) +
         bytes(current_system.residual_trace) + bytes(current_system.a) +
         bytes(current_system.b) + bytes(current_system.c) +
@@ -3929,7 +3969,11 @@ struct detail::CpuNumericsCore::Implementation
         bytes(trial_system.residual_trace) + bytes(trial_system.a) +
         bytes(trial_system.b) + bytes(trial_system.c) +
         bytes(trial_system.d) + bytes(trial_system.f) +
-        bytes(trial_system.g) + bytes(schur) + bytes(reduced_rhs) +
+        bytes(trial_system.g) + bytes(audit_system.residual_interior) +
+        bytes(audit_system.residual_trace) + bytes(audit_system.a) +
+        bytes(audit_system.b) + bytes(audit_system.c) +
+        bytes(audit_system.d) + bytes(audit_system.f) +
+        bytes(audit_system.g) + bytes(schur) + bytes(reduced_rhs) +
         bytes(local_trace_increment) + bytes(recovered_interior) +
         bytes(grid_interior_increment) + bytes(interior_census) +
         bytes(owned_schur_terms) + bytes(outgoing_schur_terms) +
@@ -3939,7 +3983,8 @@ struct detail::CpuNumericsCore::Implementation
 
   bool Assemble(const mfem::ParGridFunction& current_interior,
                 const mfem::ParGridFunction& current_trace,
-                LocalSystem& system) noexcept
+                LocalSystem& system, const int quadrature_order,
+                const bool consume_internal_test_hooks = true) noexcept
   {
     system.Zero();
     try
@@ -3958,7 +4003,7 @@ struct detail::CpuNumericsCore::Implementation
         const int* interior_vdofs = element_interior_vdofs.data() +
             static_cast<std::size_t>(element) * local_interior;
         const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
-            finite_element->GetGeomType(), config.assembly_quadrature_order);
+            finite_element->GetGeomType(), quadrature_order);
         const std::size_t element_ni =
             static_cast<std::size_t>(element) * local_interior;
         const std::size_t element_a = element_ni * local_interior;
@@ -4068,7 +4113,7 @@ struct detail::CpuNumericsCore::Implementation
           const int* face_trace_vdofs = signed_trace_dofs.data() +
               static_cast<std::size_t>(element) * local_trace + trace_offset;
           const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
-              trace_element->GetGeomType(), config.assembly_quadrature_order);
+              trace_element->GetGeomType(), quadrature_order);
           for (int q = 0; q < face_rule.GetNPoints(); ++q)
           {
             const mfem::IntegrationPoint& face_point = face_rule.IntPoint(q);
@@ -4157,8 +4202,14 @@ struct detail::CpuNumericsCore::Implementation
               // the trace mass matrix. The interior numerical flux remains
               // the ordinary trace-dependent A/B coupling.
               physical_boundary = true;
-              ++generic_boundary_picard_test_state.callbacks;
-              ++generic_boundary_picard_test_state.physical_rows;
+              // An audit deliberately re-invokes the caller's value
+              // callback, but must not perturb internal production test
+              // counters used to certify the primary assembly.
+              if (consume_internal_test_hooks)
+              {
+                ++generic_boundary_picard_test_state.callbacks;
+                ++generic_boundary_picard_test_state.physical_rows;
+              }
             }
             const double weight = face_point.weight * face_measure;
             for (int row = 0; row < scalar_interior_dofs; ++row)
@@ -4302,8 +4353,11 @@ struct detail::CpuNumericsCore::Implementation
                                static_cast<std::size_t>(local_row) *
                                    local_trace + local_row] != 0.0;
                 }
-              if (c_is_zero) { ++generic_boundary_picard_test_state.zero_c_rows; }
-              if (d_is_nonzero)
+              if (consume_internal_test_hooks && c_is_zero)
+              {
+                ++generic_boundary_picard_test_state.zero_c_rows;
+              }
+              if (consume_internal_test_hooks && d_is_nonzero)
               {
                 ++generic_boundary_picard_test_state.nonzero_d_rows;
               }
@@ -4329,7 +4383,8 @@ struct detail::CpuNumericsCore::Implementation
     }
   }
 
-  double ResidualNorm(const LocalSystem& system) noexcept
+  double ResidualNorm(const LocalSystem& system,
+                      const bool consume_internal_test_hooks = true) noexcept
   {
     const double invalid = std::numeric_limits<double>::quiet_NaN();
     double local_interior_squared = 0.0;
@@ -4365,9 +4420,10 @@ struct detail::CpuNumericsCore::Implementation
       local_prepared = local_prepared && Finite(local_trace_residual) &&
           Finite(local_interior_squared) &&
           trace_space && trace_space->Dof_TrueDof_Matrix() &&
-          !ConsumeOwnedCollectiveTestFault(
-              detail::CpuCollectiveTestFault::residual_map_preparation, rank,
-              incarnation);
+          (!consume_internal_test_hooks ||
+           !ConsumeOwnedCollectiveTestFault(
+               detail::CpuCollectiveTestFault::residual_map_preparation, rank,
+               incarnation));
     }
     catch (...)
     {
@@ -5358,6 +5414,13 @@ bool detail::CpuNumericsCore::CommittedBorrowedEulerDiagnostics(
       *committed, maximum_wave_speed, backend_stable_dt);
 }
 
+generic::HdgEulerCommittedResidualAudit
+detail::CpuNumericsCore::CommittedBorrowedEulerResidualAudit() const noexcept
+{
+  return implementation_ ? implementation_->committed_residual_audit
+                         : generic::HdgEulerCommittedResidualAudit{};
+}
+
 bool detail::CpuNumericsCore::ObserveCommittedBorrowedEuler(
     generic::HdgEulerCommittedObservables& observables) noexcept
 {
@@ -5508,11 +5571,91 @@ bool detail::CpuNumericsCore::ObserveCommittedBorrowedEuler(
   return true;
 }
 
+bool detail::CpuNumericsCore::AuditPreparedBorrowedEulerResidual(
+    generic::HdgEulerCommittedResidualAudit& audit) noexcept
+{
+  // The caller has already bound prospective coordinates and generation.
+  // Preserve that binding even when this optional observation cannot run.
+  audit.available = false;
+  audit.formulation = generic::HdgEulerResidualFormulation::unavailable;
+  audit.norm = std::numeric_limits<double>::quiet_NaN();
+  if (!implementation_) { return false; }
+  Implementation& state = *implementation_;
+  const bool base_ready = state.initialized && state.IsBorrowed() &&
+      state.borrowed_prepare_active && state.Candidate() != nullptr &&
+      state.borrowed_request != nullptr && audit.quadrature_order > 0;
+  if (!state.CollectiveAll(base_ready)) { return false; }
+
+  // The conventional audit is a fresh residual-only assembly in storage that
+  // is never condensed, solved, recovered, or counted as normal work.
+  if (!state.IsIgr())
+  {
+    if (!state.conventional_residual_audit_provisioned) { return true; }
+    bool loaded = Assign(*state.iterate_interior, state.Candidate()->interior) &&
+        Assign(state.iterate_true_trace, state.Candidate()->trace) &&
+        state.LoadTrace(state.iterate_true_trace, *state.iterate_trace);
+    if (!state.CollectiveAll(loaded)) { return true; }
+    const bool assembled = state.Assemble(*state.iterate_interior,
+                                          *state.iterate_trace,
+                                          state.audit_system,
+                                          audit.quadrature_order, false);
+    if (!state.CollectiveAll(assembled)) { return true; }
+    const double norm = state.ResidualNorm(state.audit_system, false);
+    if (!state.CollectiveAll(Finite(norm) && norm >= 0.0)) { return true; }
+    audit.available = true;
+    audit.formulation =
+        generic::HdgEulerResidualFormulation::conventional_u4_uhat4;
+    audit.norm = norm;
+    return true;
+  }
+
+  const bool scratch_ready = state.igr_residual_audit_scratch != nullptr &&
+      state.igr_residual_audit_scratch->IsReady();
+  if (!state.CollectiveAll(scratch_ready)) { return true; }
+  traced_scalar_igr_p1::Parameters parameters{};
+  parameters.alpha = state.borrowed_request->numerical_policy.stabilization.alpha;
+  parameters.beta = state.borrowed_request->numerical_policy.stabilization.beta;
+  parameters.dt = state.config.dt;
+  parameters.density_floor = density_gate;
+  // The audit scratch owns its exact audit quadrature.  Keep this input on
+  // the normal solve order so the production policy remains unmodified.
+  parameters.quadrature_order = state.config.assembly_quadrature_order;
+  detail::TracedScalarIgrP1GlobalStepInput input{};
+  input.communicator = state.communicator;
+  input.layout = state.igr_layout.get();
+  input.affine_quads = state.igr_affine_quads.data();
+  input.affine_quad_count = static_cast<int>(state.igr_affine_quads.size());
+  input.parameters = parameters;
+  input.current_true_trace = &state.IgrCandidate().true_trace;
+  input.previous_true_trace = &state.IgrCommitted().true_trace;
+  input.current_interior = &state.IgrCandidate().interior;
+  input.previous_interior = &state.IgrCommitted().interior;
+  input.static_euler_rhs_space = state.interior_space.get();
+  input.static_euler_rhs_coefficients = state.external_source.get();
+  input.maximum_linear_iterations = state.config.maximum_linear_iterations;
+  input.linear_relative_tolerance = state.config.linear_relative_tolerance;
+  input.true_residual_relative_tolerance = state.config.true_residual_tolerance;
+  double norm = std::numeric_limits<double>::quiet_NaN();
+  const bool observed = detail::ComputeTracedScalarIgrP1ResidualAudit(
+      input, norm, *state.igr_residual_audit_scratch);
+  if (!state.CollectiveAll(observed && Finite(norm) && norm >= 0.0))
+  {
+    return true;
+  }
+  audit.available = true;
+  audit.formulation =
+      generic::HdgEulerResidualFormulation::traced_scalar_igr_p1_u7_uhat5;
+  audit.norm = norm;
+  return true;
+}
+
 bool detail::CpuNumericsCore::PrepareBorrowedEuler(
     const double dt, StateCoordinates& coordinates, std::uint64_t& generation) noexcept
 {
   generation = 0;
   Implementation& state = *implementation_;
+  state.pending_residual_audit = {};
+  state.pending_residual_audit_candidate_generation = 0;
   const bool local_coordinates_valid = state.initialized && state.IsBorrowed() &&
       !state.borrowed_prepare_active &&
       state.active_candidate_generation == 0 &&
@@ -5575,6 +5718,19 @@ bool detail::CpuNumericsCore::PrepareBorrowedEuler(
   state.borrowed_prepare_active = true;
   state.borrowed_prepared_previous_dt = previous_dt;
   generation = state.active_candidate_generation;
+  // This record is prospective: it describes the candidate coordinates that
+  // Commit will publish, never the prior committed state.  Audit failure is
+  // represented in the POD and must not alter normal acceptance/evidence.
+  generic::HdgEulerCommittedResidualAudit audit{};
+  audit.coordinates = {coordinates.time + dt, dt, coordinates.step + 1,
+                       coordinates.generation + 1};
+  audit.residual_generation = audit.coordinates.generation;
+  audit.quadrature_order =
+      state.borrowed_request->numerical_policy.audit_quadrature_order;
+  audit.norm = std::numeric_limits<double>::quiet_NaN();
+  static_cast<void>(AuditPreparedBorrowedEulerResidual(audit));
+  state.pending_residual_audit = audit;
+  state.pending_residual_audit_candidate_generation = generation;
   std::uint64_t minimum_generation = 0;
   std::uint64_t maximum_generation = 0;
   const int generation_minimum_status = MPI_Allreduce(
@@ -5593,6 +5749,8 @@ bool detail::CpuNumericsCore::PrepareBorrowedEuler(
         (!state.IsIgr() || state.RestoreIgrCandidate());
     InvalidateCandidateGeneration();
     state.borrowed_prepare_active = false;
+    state.pending_residual_audit = {};
+    state.pending_residual_audit_candidate_generation = 0;
     (void)state.CollectiveAll(reset);
     generation = 0;
     return false;
@@ -5617,6 +5775,22 @@ bool detail::CpuNumericsCore::CommitBorrowedEuler(
       state.communicator);
   const bool generation_consensus = minimum_status == MPI_SUCCESS &&
       maximum_status == MPI_SUCCESS && minimum_generation == maximum_generation;
+  const generic::HdgEulerSessionCoordinates prospective_audit_coordinates{
+      coordinates.time + state.active_evidence.attempt.identity.dt,
+      state.active_evidence.attempt.identity.dt, coordinates.step + 1,
+      coordinates.generation + 1};
+  const bool pending_audit_coherent =
+      generic::IsCoherentHdgEulerCommittedResidualAudit(
+          state.pending_residual_audit) &&
+      state.pending_residual_audit.coordinates.time ==
+          prospective_audit_coordinates.time &&
+      state.pending_residual_audit.coordinates.dt ==
+          prospective_audit_coordinates.dt &&
+      state.pending_residual_audit.coordinates.step ==
+          prospective_audit_coordinates.step &&
+      state.pending_residual_audit.coordinates.generation ==
+          prospective_audit_coordinates.generation &&
+      state.pending_residual_audit_candidate_generation == generation;
   const bool local_valid = state.initialized && state.IsBorrowed() &&
       state.borrowed_prepare_active && CandidateGenerationActive(generation) &&
       ::dg::hdg::runtime::detail::SameCoordinates(
@@ -5624,7 +5798,8 @@ bool detail::CpuNumericsCore::CommitBorrowedEuler(
       CpuStateStoragePolicy::CanPublish(state.committed_slot,
                                         state.candidate_slot) &&
       Finite(state.active_evidence.attempt.maximum_wave_speed) &&
-      state.active_evidence.attempt.maximum_wave_speed >= 0.0;
+      state.active_evidence.attempt.maximum_wave_speed >= 0.0 &&
+      pending_audit_coherent;
   const bool private_preflight = !state.IsIgr() ||
       (state.igr_candidate_hash == state.HashIgrSlot(state.IgrCandidate()) &&
        state.igr_candidate_public_hash == HashPair(HashDoubles(state.Candidate()->interior),
@@ -5674,6 +5849,9 @@ bool detail::CpuNumericsCore::CommitBorrowedEuler(
   ++coordinates.generation;
   coordinates.cursor = attempt.sequence;
   coordinates.dt = attempt.dt;
+  state.committed_residual_audit = state.pending_residual_audit;
+  state.pending_residual_audit = {};
+  state.pending_residual_audit_candidate_generation = 0;
   state.borrowed_prepare_active = false;
   InvalidateCandidateGeneration();
   Complete({RunStatus::committed, FailureReason::none, true, false},
@@ -5710,6 +5888,8 @@ bool detail::CpuNumericsCore::AbortBorrowedEuler(
   if (!state.CollectiveAll(restored)) { return false; }
   state.config.dt = state.borrowed_prepared_previous_dt;
   state.borrowed_prepare_active = false;
+  state.pending_residual_audit = {};
+  state.pending_residual_audit_candidate_generation = 0;
   InvalidateCandidateGeneration();
   Complete({RunStatus::terminal_failure, FailureReason::backend_failure,
             false, false}, coordinates, {});
@@ -6161,6 +6341,37 @@ bool detail::CpuNumericsCore::InitializeInternal(
     const bool scratch_ready = state.igr_scratch->Initialize(input) &&
         state.igr_scratch->IsReady();
     if (!state.CollectiveAll(scratch_ready)) { return false; }
+
+    // Provisioning an audit scratch is intentionally optional and happens
+    // only after the ordinary retained solver is fully ready.  The distinct
+    // object owns dynamic quadrature tables and cannot poison or resize the
+    // production scratch.  Any construction/initialization failure is
+    // normalized collectively to unavailable audit evidence.
+    bool audit_object_ready = false;
+    try
+    {
+      state.igr_residual_audit_scratch =
+          std::make_unique<detail::TracedScalarIgrP1ResidualAuditScratch>(
+              state.communicator, *state.igr_layout,
+              borrowed_request->numerical_policy.audit_quadrature_order);
+      audit_object_ready = state.igr_residual_audit_scratch != nullptr;
+    }
+    catch (...)
+    {
+      audit_object_ready = false;
+    }
+    if (state.CollectiveAll(audit_object_ready))
+    {
+      const bool audit_initialized =
+          state.igr_residual_audit_scratch->Initialize(input) &&
+          state.igr_residual_audit_scratch->IsReady();
+      audit_object_ready = state.CollectiveAll(audit_initialized);
+    }
+    else
+    {
+      audit_object_ready = false;
+    }
+    if (!audit_object_ready) { state.igr_residual_audit_scratch.reset(); }
   }
 
   // Prove the exact storage semantics required by the accepted two-phase
@@ -6516,7 +6727,8 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
                 CpuAttemptStatus::injected_failure);
   }
   bool assembled = state.Assemble(
-      *state.iterate_interior, *state.iterate_trace, state.current_system);
+      *state.iterate_interior, *state.iterate_trace, state.current_system,
+      state.config.assembly_quadrature_order);
   const bool assembly_fault = ConsumeOwnedCollectiveTestFault(
       detail::CpuCollectiveTestFault::assembly_completion, state.rank,
       state.incarnation);
@@ -6684,7 +6896,8 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       if (!state.CollectiveAll(trial_prescreen)) { continue; }
       admissible_trial = true;
       const bool trial_assembled = state.Assemble(
-          *state.trial_interior, *state.trial_trace, state.trial_system);
+          *state.trial_interior, *state.trial_trace, state.trial_system,
+          state.config.assembly_quadrature_order);
       if (!state.CollectiveAll(trial_assembled))
       {
         return fail(CpuFailurePhase::assembly);

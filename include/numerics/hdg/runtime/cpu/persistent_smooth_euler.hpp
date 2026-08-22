@@ -753,6 +753,12 @@ public:
   /** Fresh collective volume-only observables for the committed slot. */
   bool ObserveCommittedBorrowedEuler(
       generic::HdgEulerCommittedObservables&) noexcept;
+  /** Stored committed audit accessor; no collective occurs on access. */
+  generic::HdgEulerCommittedResidualAudit
+  CommittedBorrowedEulerResidualAudit() const noexcept;
+  /** Internal preparation of the core-owned optional candidate audit. */
+  bool AuditPreparedBorrowedEulerResidual(
+      generic::HdgEulerCommittedResidualAudit&) noexcept;
   /** Discard exactly one active prepared candidate. */
   bool AbortBorrowedEuler(std::uint64_t,
                           const StateCoordinates&) noexcept;
