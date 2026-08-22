@@ -22,6 +22,30 @@ namespace dg::hdg::runtime::cuda_w8a::detail
 
 constexpr double qualification_density_gate = 1.0e-8;
 
+struct CudaPreparedIgrConservationCapture
+{
+  int elements = 0;
+  int scalar_interior_dofs = 0;
+  int scalar_face_dofs = 0;
+  int interior_dofs = 0;
+  int trace_dofs = 0;
+  int volume_points = 0;
+  int face_points = 0;
+  int order = 0;
+  int assembly_order = 0;
+  double alpha = 0.0;
+  double beta = 0.0;
+  double dt = 0.0;
+  double lifecycle_maximum_error =
+      std::numeric_limits<double>::infinity();
+  double lifecycle_maximum_relative_error =
+      std::numeric_limits<double>::infinity();
+  std::vector<double> previous_interior{};
+  std::vector<double> current_interior{};
+  std::vector<double> current_local_trace{};
+  std::array<double, 11> production_local{};
+};
+
 // This accessor is defined only in the qualification translation unit.  The
 // production engine and generic facade grant it private friendship but ship no
 // callable test API or test-only device kernel.
@@ -42,14 +66,10 @@ struct CudaQualificationTestAccess
   }
 
   template <typename Engine>
-  static bool VerifyPreparedIgrConservation(
-      Engine& engine, double& maximum_error,
-      double& maximum_relative_error,
-      std::array<double, 3>& oracle_activity) noexcept
+  static bool CapturePreparedIgrConservation(
+      Engine& engine, CudaPreparedIgrConservationCapture& capture) noexcept
   {
-    maximum_error = std::numeric_limits<double>::infinity();
-    maximum_relative_error = std::numeric_limits<double>::infinity();
-    oracle_activity.fill(0.0);
+    capture = {};
     auto& numerics = engine.numerics_;
     const CudaMeshShape& shape = numerics.shape_;
     bool local_valid = engine.initialized_ && engine.pending_.active &&
@@ -61,155 +81,89 @@ struct CudaQualificationTestAccess
         engine.pending_.attempt.dt > 0.0 &&
         numerics.view_.work_interior != nullptr &&
         numerics.view_.old_interior != nullptr &&
-        numerics.view_.static_source != nullptr;
-    std::vector<double> current, previous, source;
+        numerics.view_.current_local_trace != nullptr &&
+        numerics.view_.scalar != nullptr &&
+        shape.interior_components == igr_interior_components &&
+        shape.trace_components == igr_trace_components &&
+        shape.scalar_interior_dofs > 0 && shape.scalar_face_dofs > 0 &&
+        shape.interior_dofs ==
+            shape.scalar_interior_dofs * igr_interior_components &&
+        shape.trace_dofs == faces_per_element * shape.scalar_face_dofs *
+            igr_trace_components;
     try
     {
-      current.resize(static_cast<std::size_t>(shape.interior_count));
-      previous.resize(current.size());
-      source.resize(current.size());
+      capture.current_interior.resize(
+          static_cast<std::size_t>(shape.interior_count));
+      capture.previous_interior.resize(capture.current_interior.size());
+      capture.current_local_trace.resize(
+          static_cast<std::size_t>(shape.elements) * shape.trace_dofs);
     }
     catch (...) { local_valid = false; }
-    const bool copied = local_valid && CudaTransportPolicy::DeviceToHost(
-        current.data(), numerics.view_.work_interior,
-        current.size() * sizeof(double),
+
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+    const bool launched = CudaLaunchIgrConservation(
+            numerics.view_, shape, engine.pending_.attempt.dt,
+            numerics.view_.scalar) &&
+        CudaTransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!numerics.CollectiveContinue(launched)) return false;
+
+    const bool copied = CudaTransportPolicy::DeviceToHost(
+        capture.current_interior.data(), numerics.view_.work_interior,
+        capture.current_interior.size() * sizeof(double),
         CudaTransferCategory::generic_host_bridge,
         CudaTransferSite::generic_host_export) &&
         CudaTransportPolicy::DeviceToHost(
-            previous.data(), numerics.view_.old_interior,
-            previous.size() * sizeof(double),
+            capture.previous_interior.data(), numerics.view_.old_interior,
+            capture.previous_interior.size() * sizeof(double),
             CudaTransferCategory::generic_host_bridge,
             CudaTransferSite::generic_host_export) &&
         CudaTransportPolicy::DeviceToHost(
-            source.data(), numerics.view_.static_source,
-            source.size() * sizeof(double),
+            capture.current_local_trace.data(),
+            numerics.view_.current_local_trace,
+            capture.current_local_trace.size() * sizeof(double),
             CudaTransferCategory::generic_host_bridge,
             CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            capture.production_local.data(), numerics.view_.scalar,
+            capture.production_local.size() * sizeof(double),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
         CudaTransportPolicy::Synchronize(
             CudaTransferSite::generic_host_export);
-    local_valid = local_valid && copied;
+    capture.elements = shape.elements;
+    capture.scalar_interior_dofs = shape.scalar_interior_dofs;
+    capture.scalar_face_dofs = shape.scalar_face_dofs;
+    capture.interior_dofs = shape.interior_dofs;
+    capture.trace_dofs = shape.trace_dofs;
+    capture.volume_points = shape.volume_points;
+    capture.face_points = shape.face_points;
+    capture.order = shape.order;
+    capture.assembly_order = shape.assembly_order;
+    capture.alpha = shape.igr_alpha;
+    capture.beta = shape.igr_beta;
+    capture.dt = engine.pending_.attempt.dt;
+    capture.lifecycle_maximum_error =
+        engine.pending_.numerical.maximum_conservation_error;
+    capture.lifecycle_maximum_relative_error =
+        engine.pending_.numerical.maximum_conservation_relative_error;
+    local_valid = copied && capture.production_local[10] == 1.0 &&
+        std::all_of(capture.production_local.begin(),
+                    capture.production_local.end(),
+                    [](const double value) { return std::isfinite(value); });
+    return numerics.CollectiveContinue(local_valid);
+  }
 
-    std::array<double, 5> local_balance{};
-    std::array<double, 5> local_scale{};
-    std::array<double, 3> local_activity{};
-    const double dt = engine.pending_.attempt.dt;
-    for (int element = 0; local_valid && element < shape.elements; ++element)
-      for (int q = 0; q < shape.volume_points; ++q)
-      {
-        const int qp = element * shape.volume_points + q;
-        const std::size_t interior_offset =
-            static_cast<std::size_t>(element) * shape.interior_dofs;
-        const double weight = numerics.host_volume_weight_[
-            static_cast<std::size_t>(qp)];
-        std::array<double, conserved_components> state{};
-        std::array<double, conserved_components> old{};
-        std::array<double, conserved_components> forcing{};
-        double sigma = 0.0;
-        double gradient[3][dimension] = {};
-        for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
-        {
-          const double phi = numerics.host_volume_shape_[
-              static_cast<std::size_t>(qp) * shape.scalar_interior_dofs +
-              scalar];
-          for (int component = 0; component < conserved_components;
-               ++component)
-          {
-            const std::size_t index = interior_offset + scalar +
-                static_cast<std::size_t>(shape.scalar_interior_dofs) *
-                    component;
-            state[static_cast<std::size_t>(component)] +=
-                phi * current[index];
-            old[static_cast<std::size_t>(component)] +=
-                phi * previous[index];
-            forcing[static_cast<std::size_t>(component)] +=
-                phi * source[index];
-          }
-          sigma += phi * current[interior_offset + scalar +
-              static_cast<std::size_t>(shape.scalar_interior_dofs) * 4];
-          for (int component = 0; component < 3; ++component)
-            for (int direction = 0; direction < dimension; ++direction)
-              gradient[component][direction] +=
-                  numerics.host_volume_derivative_[
-                      (static_cast<std::size_t>(qp) *
-                           shape.scalar_interior_dofs + scalar) * dimension +
-                      direction] * current[interior_offset + scalar +
-                          static_cast<std::size_t>(
-                              shape.scalar_interior_dofs) * component];
-        }
-        local_valid = std::isfinite(weight) && weight > 0.0 &&
-            std::isfinite(sigma) && state[0] > qualification_density_gate;
-        for (int component = 0;
-             local_valid && component < conserved_components; ++component)
-        {
-          const double change = weight *
-              (state[static_cast<std::size_t>(component)] -
-               old[static_cast<std::size_t>(component)]);
-          const double source_change = dt * weight *
-              forcing[static_cast<std::size_t>(component)];
-          local_valid = std::isfinite(change) &&
-              std::isfinite(source_change);
-          local_balance[static_cast<std::size_t>(component)] +=
-              change - source_change;
-          local_scale[static_cast<std::size_t>(component)] +=
-              std::abs(change) + std::abs(source_change);
-          local_activity[0] += std::abs(source_change);
-          local_activity[1] += std::abs(change);
-        }
-        double velocity_gradient[dimension][dimension] = {};
-        for (int velocity = 0; velocity < dimension; ++velocity)
-          for (int direction = 0; direction < dimension; ++direction)
-            velocity_gradient[velocity][direction] =
-                gradient[1 + velocity][direction] / state[0] -
-                state[static_cast<std::size_t>(1 + velocity)] *
-                    gradient[0][direction] / (state[0] * state[0]);
-        const double trace =
-            velocity_gradient[0][0] + velocity_gradient[1][1];
-        const double q_value =
-            velocity_gradient[0][0] * velocity_gradient[0][0] +
-            2.0 * velocity_gradient[0][1] * velocity_gradient[1][0] +
-            velocity_gradient[1][1] * velocity_gradient[1][1] +
-            trace * trace;
-        const double sigma_term = weight * sigma / state[0];
-        const double q_term = weight * shape.igr_alpha * q_value;
-        local_valid = local_valid && std::isfinite(q_value) &&
-            std::isfinite(sigma_term) && std::isfinite(q_term);
-        local_balance[4] += sigma_term - q_term;
-        local_scale[4] += std::abs(sigma_term) + std::abs(q_term);
-        local_activity[2] += std::abs(q_term);
-      }
-
-    std::array<double, 5> global_balance{};
-    std::array<double, 5> global_scale{};
-    std::array<double, 3> global_activity{};
-    const MPI_Comm communicator = engine.config_.borrowed_communicator;
-    const bool reduced = MPI_Allreduce(
-            local_balance.data(), global_balance.data(),
-            static_cast<int>(global_balance.size()), MPI_DOUBLE, MPI_SUM,
-            communicator) == MPI_SUCCESS &&
-        MPI_Allreduce(local_scale.data(), global_scale.data(),
-                      static_cast<int>(global_scale.size()), MPI_DOUBLE,
-                      MPI_SUM, communicator) == MPI_SUCCESS &&
-        MPI_Allreduce(local_activity.data(), global_activity.data(),
-                      static_cast<int>(global_activity.size()), MPI_DOUBLE,
-                      MPI_SUM, communicator) == MPI_SUCCESS;
-    maximum_error = 0.0;
-    maximum_relative_error = 0.0;
-    oracle_activity = global_activity;
-    for (std::size_t component = 0; component < global_balance.size();
-         ++component)
-    {
-      const double error = std::abs(global_balance[component]);
-      maximum_error = std::max(maximum_error, error);
-      maximum_relative_error = std::max(
-          maximum_relative_error, error / (1.0 + global_scale[component]));
-    }
-    return reduced && numerics.CollectiveContinue(
-        local_valid && std::isfinite(maximum_error) &&
-        std::isfinite(maximum_relative_error) &&
-        std::all_of(oracle_activity.begin(), oracle_activity.end(),
-                    [](const double activity)
-                    { return std::isfinite(activity) &&
-                             activity > 1.0e-12; }));
+  static bool CapturePreparedIgrConservation(
+      cuda::GenericEulerHdgCudaSession& session,
+      CudaPreparedIgrConservationCapture& capture) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return CapturePreparedIgrConservation(
+          *session.borrowed_rank1_, capture);
+    if (session.borrowed_rank2_)
+      return CapturePreparedIgrConservation(
+          *session.borrowed_rank2_, capture);
+    return false;
   }
 
   template <typename Engine>
@@ -602,6 +556,8 @@ using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 using dg::hdg::runtime::cuda_w8a::CudaRunEvidence;
 using dg::hdg::runtime::cuda_w8a::CudaStepEvidence;
 using dg::hdg::runtime::cuda_w8a::PersistentCudaSmoothEulerEngine;
+using dg::hdg::runtime::cuda_w8a::detail::
+    CudaPreparedIgrConservationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
 
 constexpr int components = dg::hdg::generic::euler_2d_conserved_components;
@@ -945,6 +901,547 @@ CudaConfig MakeDirectConfig(const EulerHdgRequest& request,
   return config;
 }
 
+struct IndependentIgrConservationResult
+{
+  std::array<double, 5> production_balance{};
+  std::array<double, 5> production_scale{};
+  std::array<double, 5> oracle_balance{};
+  std::array<double, 5> oracle_scale{};
+  // Source components, Euler change, physical Euler flux, sigma/rho,
+  // alpha*Q, and the physical auxiliary flux, respectively.
+  std::array<double, 9> activity{};
+  double maximum_balance_discrepancy =
+      std::numeric_limits<double>::infinity();
+  double maximum_scale_discrepancy =
+      std::numeric_limits<double>::infinity();
+  bool passed = false;
+};
+
+int DecodeSignedDof(const int encoded, double& sign) noexcept
+{
+  sign = encoded >= 0 ? 1.0 : -1.0;
+  return encoded >= 0 ? encoded : -1 - encoded;
+}
+
+bool IndependentRegularizedNormalFlux(
+    const std::array<long double, 5>& trace,
+    const long double normal_x, const long double normal_y,
+    std::array<long double, 4>& flux) noexcept
+{
+  const long double rho = trace[0];
+  const long double momentum_x = trace[1];
+  const long double momentum_y = trace[2];
+  const long double energy = trace[3];
+  const long double sigma_hat = trace[4];
+  if (!(rho > 0.0L)) return false;
+  const long double normal_momentum =
+      momentum_x * normal_x + momentum_y * normal_y;
+  const long double pressure = 0.4L *
+      (energy - 0.5L *
+          (momentum_x * momentum_x + momentum_y * momentum_y) / rho);
+  if (!(pressure > 0.0L) || !std::isfinite(pressure)) return false;
+  const long double normal_velocity = normal_momentum / rho;
+  flux = {{
+      normal_momentum,
+      momentum_x * normal_velocity + pressure * normal_x +
+          sigma_hat * normal_x,
+      momentum_y * normal_velocity + pressure * normal_y +
+          sigma_hat * normal_y,
+      (energy + pressure) * normal_velocity +
+          sigma_hat * normal_velocity}};
+  return std::all_of(flux.begin(), flux.end(),
+                     [](const long double value)
+                     { return std::isfinite(value); });
+}
+
+bool VerifyIndependentIgrConservation(
+    const CudaPreparedIgrConservationCapture& capture,
+    const EulerHdgRequest& request,
+    IndependentIgrConservationResult& result)
+{
+  result = {};
+  const bool locally_admitted = request.mesh != nullptr &&
+      request.source.data != nullptr &&
+      request.source.components == components &&
+      request.source.scalar_count != 0 &&
+      capture.elements >= 0 && capture.scalar_interior_dofs > 0 &&
+      capture.scalar_face_dofs > 0 &&
+      capture.interior_dofs == capture.scalar_interior_dofs * 7 &&
+      capture.trace_dofs == 4 * capture.scalar_face_dofs * 5 &&
+      capture.order == request.polynomial_order &&
+      capture.assembly_order ==
+          request.numerical_policy.igr_assembly_quadrature_order &&
+      capture.alpha == request.numerical_policy.stabilization.alpha &&
+      capture.beta == request.numerical_policy.stabilization.beta &&
+      capture.dt > 0.0 && std::isfinite(capture.dt);
+  if (!All(locally_admitted, request.communicator)) return false;
+
+  mfem::ParMesh& mesh = *const_cast<mfem::ParMesh*>(request.mesh);
+  bool local_valid = capture.elements == mesh.GetNE() &&
+      capture.current_interior.size() ==
+          static_cast<std::size_t>(capture.elements) *
+              capture.interior_dofs &&
+      capture.previous_interior.size() ==
+          capture.current_interior.size() &&
+      capture.current_local_trace.size() ==
+          static_cast<std::size_t>(capture.elements) * capture.trace_dofs;
+  std::array<long double, 5> local_balance{};
+  std::array<long double, 5> local_scale{};
+  std::array<long double, 9> local_activity{};
+  std::array<long double, 4> local_change_integral{};
+  std::array<long double, 4> local_source_integral{};
+  std::array<long double, 4> local_boundary_integral{};
+  std::array<long double, 3> local_auxiliary_integral{};
+
+  try
+  {
+    mfem::L2_FECollection volume_collection(
+        capture.order, 2, mfem::BasisType::GaussLegendre,
+        mfem::FiniteElement::VALUE);
+    mfem::ParFiniteElementSpace source_space(
+        &mesh, &volume_collection, components, mfem::Ordering::byNODES);
+    mfem::DG_Interface_FECollection trace_collection(
+        capture.order, 2, mfem::FiniteElement::VALUE,
+        mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace trace_space(
+        &mesh, &trace_collection, 5, mfem::Ordering::byNODES);
+    local_valid = local_valid &&
+        request.source.scalar_count ==
+            static_cast<std::size_t>(source_space.GetVSize());
+
+    std::vector<unsigned char> shared_faces(
+        static_cast<std::size_t>(mesh.GetNumFaces()), 0);
+    for (int shared = 0; local_valid && shared < mesh.GetNSharedFaces();
+         ++shared)
+    {
+      const int face = mesh.GetSharedFace(shared);
+      local_valid = face >= 0 &&
+          face < static_cast<int>(shared_faces.size());
+      if (local_valid) shared_faces[static_cast<std::size_t>(face)] = 1;
+    }
+
+    for (int element = 0;
+         local_valid && element < capture.elements; ++element)
+    {
+      const mfem::FiniteElement* finite_element =
+          source_space.GetFE(element);
+      mfem::ElementTransformation* transformation =
+          mesh.GetElementTransformation(element);
+      mfem::Array<int> source_vdofs;
+      source_space.GetElementVDofs(element, source_vdofs);
+      local_valid = finite_element != nullptr && transformation != nullptr &&
+          finite_element->GetDof() == capture.scalar_interior_dofs &&
+          source_vdofs.Size() ==
+              capture.scalar_interior_dofs * components;
+      if (!local_valid) break;
+
+      const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), capture.assembly_order);
+      local_valid = volume_rule.GetNPoints() == capture.volume_points;
+      mfem::Vector volume_shape(capture.scalar_interior_dofs);
+      mfem::DenseMatrix volume_derivative(
+          capture.scalar_interior_dofs, 2);
+      const std::size_t interior_offset =
+          static_cast<std::size_t>(element) * capture.interior_dofs;
+      for (int q = 0; local_valid && q < volume_rule.GetNPoints(); ++q)
+      {
+        const mfem::IntegrationPoint& point = volume_rule.IntPoint(q);
+        transformation->SetIntPoint(&point);
+        finite_element->CalcShape(point, volume_shape);
+        finite_element->CalcPhysDShape(*transformation, volume_derivative);
+        const long double weight = static_cast<long double>(
+            point.weight * transformation->Weight());
+        std::array<long double, 4> current{};
+        std::array<long double, 4> previous{};
+        std::array<long double, 4> source{};
+        long double sigma = 0.0L;
+        long double conservative_gradient[3][2] = {};
+        local_valid = weight > 0.0L && std::isfinite(weight);
+        for (int scalar = 0;
+             local_valid && scalar < capture.scalar_interior_dofs; ++scalar)
+        {
+          const long double phi = volume_shape[scalar];
+          for (int component = 0; component < components; ++component)
+          {
+            const std::size_t state_index = interior_offset + scalar +
+                static_cast<std::size_t>(capture.scalar_interior_dofs) *
+                    component;
+            current[static_cast<std::size_t>(component)] +=
+                phi * capture.current_interior[state_index];
+            previous[static_cast<std::size_t>(component)] +=
+                phi * capture.previous_interior[state_index];
+            double sign = 1.0;
+            const int source_dof = DecodeSignedDof(
+                source_vdofs[scalar +
+                    capture.scalar_interior_dofs * component], sign);
+            local_valid = source_dof >= 0 &&
+                static_cast<std::size_t>(source_dof) <
+                    request.source.scalar_count &&
+                std::isfinite(request.source.data[source_dof]);
+            if (!local_valid) break;
+            source[static_cast<std::size_t>(component)] += phi * sign *
+                request.source.data[source_dof];
+          }
+          sigma += phi * capture.current_interior[
+              interior_offset + scalar +
+              static_cast<std::size_t>(capture.scalar_interior_dofs) * 4];
+          for (int component = 0; component < 3; ++component)
+            for (int direction = 0; direction < 2; ++direction)
+              conservative_gradient[component][direction] +=
+                  static_cast<long double>(
+                      volume_derivative(scalar, direction)) *
+                  capture.current_interior[
+                      interior_offset + scalar +
+                      static_cast<std::size_t>(
+                          capture.scalar_interior_dofs) * component];
+        }
+        local_valid = local_valid && current[0] >
+            static_cast<long double>(qualification_density_gate) &&
+            std::isfinite(sigma);
+        for (int component = 0;
+             local_valid && component < components; ++component)
+        {
+          const long double change = weight *
+              (current[static_cast<std::size_t>(component)] -
+               previous[static_cast<std::size_t>(component)]);
+          const long double forcing =
+              static_cast<long double>(capture.dt) * weight *
+              source[static_cast<std::size_t>(component)];
+          local_valid = std::isfinite(change) && std::isfinite(forcing);
+          local_balance[static_cast<std::size_t>(component)] +=
+              change - forcing;
+          local_scale[static_cast<std::size_t>(component)] +=
+              std::abs(change) + std::abs(forcing);
+          local_change_integral[static_cast<std::size_t>(component)] +=
+              change;
+          local_source_integral[static_cast<std::size_t>(component)] +=
+              forcing;
+          local_activity[static_cast<std::size_t>(component)] +=
+              std::abs(forcing);
+          local_activity[4] += std::abs(change);
+        }
+
+        long double velocity_gradient[2][2] = {};
+        for (int velocity = 0; velocity < 2; ++velocity)
+          for (int direction = 0; direction < 2; ++direction)
+            velocity_gradient[velocity][direction] =
+                conservative_gradient[1 + velocity][direction] /
+                    current[0] -
+                current[static_cast<std::size_t>(1 + velocity)] *
+                    conservative_gradient[0][direction] /
+                    (current[0] * current[0]);
+        const long double velocity_trace =
+            velocity_gradient[0][0] + velocity_gradient[1][1];
+        const long double q_value =
+            velocity_gradient[0][0] * velocity_gradient[0][0] +
+            2.0L * velocity_gradient[0][1] * velocity_gradient[1][0] +
+            velocity_gradient[1][1] * velocity_gradient[1][1] +
+            velocity_trace * velocity_trace;
+        const long double sigma_term = weight * sigma / current[0];
+        const long double q_term = weight *
+            static_cast<long double>(capture.alpha) * q_value;
+        local_valid = local_valid && std::isfinite(q_value) &&
+            std::isfinite(sigma_term) && std::isfinite(q_term);
+        local_balance[4] += sigma_term - q_term;
+        local_scale[4] += std::abs(sigma_term) + std::abs(q_term);
+        local_auxiliary_integral[0] += sigma_term;
+        local_auxiliary_integral[1] += q_term;
+        local_activity[6] += std::abs(sigma_term);
+        local_activity[7] += std::abs(q_term);
+      }
+
+      mfem::Array<int> faces;
+      mfem::Array<int> orientations;
+      mesh.GetElementEdges(element, faces, orientations);
+      local_valid = local_valid && faces.Size() == 4;
+      for (int local_face = 0;
+           local_valid && local_face < faces.Size(); ++local_face)
+      {
+        const int face = faces[local_face];
+        mfem::FaceElementTransformations* face_transformation =
+            mesh.GetFaceElementTransformations(face);
+        const mfem::FiniteElement* trace_element =
+            trace_space.GetFaceElement(face);
+        const int boundary_element = face >= 0 &&
+                face < static_cast<int>(shared_faces.size())
+            ? mesh.GetFaceToBdrElMap()[face] : -1;
+        const bool physical = face >= 0 &&
+            face < static_cast<int>(shared_faces.size()) &&
+            shared_faces[static_cast<std::size_t>(face)] == 0 &&
+            face_transformation != nullptr &&
+            face_transformation->Elem2No < 0 && boundary_element >= 0;
+        if (!physical) continue;
+        local_valid = face_transformation->Face != nullptr &&
+            trace_element != nullptr &&
+            trace_element->GetDof() == capture.scalar_face_dofs &&
+            mesh.GetBdrAttribute(boundary_element) >= 1 &&
+            mesh.GetBdrAttribute(boundary_element) <= 7;
+        if (!local_valid) break;
+        const bool element_one =
+            face_transformation->Elem1No == element;
+        local_valid = element_one ||
+            face_transformation->Elem2No == element;
+        if (!local_valid) break;
+
+        const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
+            trace_element->GetGeomType(), capture.assembly_order);
+        local_valid = face_rule.GetNPoints() == capture.face_points;
+        long double face_measure = 0.0L;
+        for (int q = 0; local_valid && q < face_rule.GetNPoints(); ++q)
+        {
+          const mfem::IntegrationPoint& point = face_rule.IntPoint(q);
+          face_transformation->SetAllIntPoints(&point);
+          const long double contribution = point.weight *
+              face_transformation->Face->Weight();
+          local_valid = contribution > 0.0L &&
+              std::isfinite(contribution);
+          face_measure += contribution;
+        }
+        const long double h =
+            static_cast<long double>(mesh.GetElementVolume(element)) /
+            face_measure;
+        local_valid = local_valid && face_measure > 0.0L && h > 0.0L &&
+            std::isfinite(h);
+        mfem::Vector interior_shape(capture.scalar_interior_dofs);
+        mfem::Vector trace_shape(capture.scalar_face_dofs);
+        const std::size_t trace_offset =
+            static_cast<std::size_t>(element) * capture.trace_dofs +
+            static_cast<std::size_t>(local_face) * 5 *
+                capture.scalar_face_dofs;
+        for (int q = 0;
+             local_valid && q < face_rule.GetNPoints(); ++q)
+        {
+          const mfem::IntegrationPoint& point = face_rule.IntPoint(q);
+          face_transformation->SetAllIntPoints(&point);
+          const mfem::IntegrationPoint& element_point = element_one
+              ? face_transformation->GetElement1IntPoint()
+              : face_transformation->GetElement2IntPoint();
+          mfem::Vector scaled_normal(2);
+          mfem::CalcOrtho(
+              face_transformation->Face->Jacobian(), scaled_normal);
+          const long double normal_norm = scaled_normal.Norml2();
+          const long double measure =
+              face_transformation->Face->Weight();
+          local_valid = normal_norm > 0.0L && measure > 0.0L &&
+              std::isfinite(normal_norm) && std::isfinite(measure);
+          if (!local_valid) break;
+          const long double side = element_one ? 1.0L : -1.0L;
+          const long double normal_x =
+              side * scaled_normal[0] / normal_norm;
+          const long double normal_y =
+              side * scaled_normal[1] / normal_norm;
+          finite_element->CalcShape(element_point, interior_shape);
+          trace_element->CalcShape(point, trace_shape);
+          std::array<long double, 7> interior{};
+          std::array<long double, 5> trace{};
+          for (int scalar = 0;
+               scalar < capture.scalar_interior_dofs; ++scalar)
+            for (int component = 0; component < 7; ++component)
+              interior[static_cast<std::size_t>(component)] +=
+                  static_cast<long double>(interior_shape[scalar]) *
+                  capture.current_interior[
+                      interior_offset + scalar +
+                      static_cast<std::size_t>(
+                          capture.scalar_interior_dofs) * component];
+          for (int scalar = 0; scalar < capture.scalar_face_dofs; ++scalar)
+            for (int component = 0; component < 5; ++component)
+              trace[static_cast<std::size_t>(component)] +=
+                  static_cast<long double>(trace_shape[scalar]) *
+                  capture.current_local_trace[
+                      trace_offset + scalar +
+                      static_cast<std::size_t>(capture.scalar_face_dofs) *
+                          component];
+          std::array<long double, 4> flux{};
+          local_valid = IndependentRegularizedNormalFlux(
+              trace, normal_x, normal_y, flux);
+          const long double weight = point.weight * measure;
+          for (int component = 0;
+               local_valid && component < components; ++component)
+          {
+            const long double numerical_flux =
+                flux[static_cast<std::size_t>(component)] +
+                static_cast<long double>(capture.beta) *
+                    (interior[static_cast<std::size_t>(component)] -
+                     trace[static_cast<std::size_t>(component)]);
+            const long double contribution =
+                static_cast<long double>(capture.dt) * weight *
+                numerical_flux;
+            local_valid = std::isfinite(contribution);
+            local_balance[static_cast<std::size_t>(component)] +=
+                contribution;
+            local_scale[static_cast<std::size_t>(component)] +=
+                std::abs(contribution);
+            local_boundary_integral[static_cast<std::size_t>(component)] +=
+                contribution;
+            local_activity[5] += std::abs(contribution);
+          }
+          local_valid = local_valid && trace[0] >
+              static_cast<long double>(qualification_density_gate);
+          const long double degree_scale =
+              static_cast<long double>((capture.order + 1) *
+                                       (capture.order + 1));
+          const long double tau = degree_scale / (trace[0] * h);
+          const long double z_hat_normal =
+              interior[5] * normal_x + interior[6] * normal_y -
+              tau * (interior[4] - trace[4]);
+          const long double auxiliary_contribution =
+              static_cast<long double>(capture.alpha) * weight *
+              z_hat_normal;
+          local_valid = local_valid && tau > 0.0L &&
+              std::isfinite(tau) && std::isfinite(auxiliary_contribution);
+          local_balance[4] -= auxiliary_contribution;
+          local_scale[4] += std::abs(auxiliary_contribution);
+          local_auxiliary_integral[2] += auxiliary_contribution;
+          local_activity[8] += std::abs(auxiliary_contribution);
+        }
+      }
+    }
+  }
+  catch (...) { local_valid = false; }
+
+  if (!All(local_valid, request.communicator)) return false;
+
+  std::array<double, 5> production_local_balance{};
+  std::array<double, 5> production_local_scale{};
+  std::copy_n(capture.production_local.begin(), 5,
+              production_local_balance.begin());
+  std::copy_n(capture.production_local.begin() + 5, 5,
+              production_local_scale.begin());
+  std::array<long double, 5> global_balance{};
+  std::array<long double, 5> global_scale{};
+  std::array<long double, 9> global_activity{};
+  std::array<long double, 4> global_change_integral{};
+  std::array<long double, 4> global_source_integral{};
+  std::array<long double, 4> global_boundary_integral{};
+  std::array<long double, 3> global_auxiliary_integral{};
+  const int production_balance_status = MPI_Allreduce(
+      production_local_balance.data(), result.production_balance.data(), 5,
+      MPI_DOUBLE, MPI_SUM, request.communicator);
+  const int production_scale_status = MPI_Allreduce(
+      production_local_scale.data(), result.production_scale.data(), 5,
+      MPI_DOUBLE, MPI_SUM, request.communicator);
+  const int oracle_balance_status = MPI_Allreduce(
+      local_balance.data(), global_balance.data(), 5, MPI_LONG_DOUBLE,
+      MPI_SUM, request.communicator);
+  const int oracle_scale_status = MPI_Allreduce(
+      local_scale.data(), global_scale.data(), 5, MPI_LONG_DOUBLE,
+      MPI_SUM, request.communicator);
+  const int activity_status = MPI_Allreduce(
+      local_activity.data(), global_activity.data(), 9, MPI_LONG_DOUBLE,
+      MPI_SUM, request.communicator);
+  const int change_status = MPI_Allreduce(
+      local_change_integral.data(), global_change_integral.data(), 4,
+      MPI_LONG_DOUBLE, MPI_SUM, request.communicator);
+  const int source_status = MPI_Allreduce(
+      local_source_integral.data(), global_source_integral.data(), 4,
+      MPI_LONG_DOUBLE, MPI_SUM, request.communicator);
+  const int boundary_status = MPI_Allreduce(
+      local_boundary_integral.data(), global_boundary_integral.data(), 4,
+      MPI_LONG_DOUBLE, MPI_SUM, request.communicator);
+  const int auxiliary_status = MPI_Allreduce(
+      local_auxiliary_integral.data(), global_auxiliary_integral.data(), 3,
+      MPI_LONG_DOUBLE, MPI_SUM, request.communicator);
+  const bool reduced = production_balance_status == MPI_SUCCESS &&
+      production_scale_status == MPI_SUCCESS &&
+      oracle_balance_status == MPI_SUCCESS &&
+      oracle_scale_status == MPI_SUCCESS &&
+      activity_status == MPI_SUCCESS && change_status == MPI_SUCCESS &&
+      source_status == MPI_SUCCESS && boundary_status == MPI_SUCCESS &&
+      auxiliary_status == MPI_SUCCESS;
+  if (!All(reduced, request.communicator)) return false;
+
+  bool parity = true;
+  double production_maximum_error = 0.0;
+  double production_maximum_relative_error = 0.0;
+  result.maximum_balance_discrepancy = 0.0;
+  result.maximum_scale_discrepancy = 0.0;
+  std::array<double, 5> comparison_tolerance{};
+  for (std::size_t component = 0; component < 5; ++component)
+  {
+    result.oracle_balance[component] =
+        static_cast<double>(global_balance[component]);
+    result.oracle_scale[component] =
+        static_cast<double>(global_scale[component]);
+    const double balance_discrepancy = std::abs(
+        result.production_balance[component] -
+        result.oracle_balance[component]);
+    const double scale_discrepancy = std::abs(
+        result.production_scale[component] - result.oracle_scale[component]);
+    comparison_tolerance[component] =
+        2.0e-11 * (1.0 + std::abs(result.oracle_scale[component]));
+    result.maximum_balance_discrepancy = std::max(
+        result.maximum_balance_discrepancy, balance_discrepancy);
+    result.maximum_scale_discrepancy = std::max(
+        result.maximum_scale_discrepancy, scale_discrepancy);
+    parity = parity && std::isfinite(result.production_balance[component]) &&
+        std::isfinite(result.production_scale[component]) &&
+        std::isfinite(result.oracle_balance[component]) &&
+        std::isfinite(result.oracle_scale[component]) &&
+        balance_discrepancy <= comparison_tolerance[component] &&
+        scale_discrepancy <= comparison_tolerance[component] &&
+        result.production_scale[component] > 0.0;
+    const double error = std::abs(result.production_balance[component]);
+    production_maximum_error = std::max(
+        production_maximum_error, error);
+    production_maximum_relative_error = std::max(
+        production_maximum_relative_error,
+        error / (1.0 + result.production_scale[component]));
+  }
+  for (std::size_t index = 0; index < result.activity.size(); ++index)
+    result.activity[index] = static_cast<double>(global_activity[index]);
+
+  const double lifecycle_error_tolerance = 64.0 *
+      std::numeric_limits<double>::epsilon() *
+      (1.0 + production_maximum_error);
+  const double lifecycle_relative_tolerance = 64.0 *
+      std::numeric_limits<double>::epsilon() *
+      (1.0 + production_maximum_relative_error);
+  const bool lifecycle_parity =
+      std::abs(production_maximum_error -
+               capture.lifecycle_maximum_error) <=
+          lifecycle_error_tolerance &&
+      std::abs(production_maximum_relative_error -
+               capture.lifecycle_maximum_relative_error) <=
+          lifecycle_relative_tolerance;
+  const bool active =
+      std::all_of(result.activity.begin(), result.activity.begin() + 4,
+                  [](const double value)
+                  { return std::isfinite(value) && value > 1.0e-12; }) &&
+      result.activity[4] > 1.0e-10 &&
+      result.activity[5] > 1.0e-10 &&
+      result.activity[6] > 1.0e-10 &&
+      result.activity[7] > 1.0e-10 &&
+      result.activity[8] > 1.0e-10;
+  const auto maximum_absolute = [](const auto& values)
+  {
+    long double maximum = 0.0L;
+    for (const long double value : values)
+      maximum = std::max(maximum, std::abs(value));
+    return maximum;
+  };
+  const long double euler_omission_tolerance = 100.0L *
+      *std::max_element(comparison_tolerance.begin(),
+                        comparison_tolerance.begin() + 4);
+  const long double auxiliary_omission_tolerance =
+      100.0L * comparison_tolerance[4];
+  const bool omission_detectable =
+      maximum_absolute(global_change_integral) >
+          euler_omission_tolerance &&
+      maximum_absolute(global_source_integral) >
+          euler_omission_tolerance &&
+      maximum_absolute(global_boundary_integral) >
+          euler_omission_tolerance &&
+      std::abs(global_auxiliary_integral[0]) >
+          auxiliary_omission_tolerance &&
+      std::abs(global_auxiliary_integral[1]) >
+          auxiliary_omission_tolerance &&
+      std::abs(global_auxiliary_integral[2]) >
+          auxiliary_omission_tolerance;
+  result.passed = parity && lifecycle_parity && active &&
+      omission_detectable;
+  return All(result.passed, request.communicator);
+}
+
 template <typename Selection>
 bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
                                  const int ranks,
@@ -975,22 +1472,6 @@ bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
   const bool prepared = engine.PrepareStep(false, dt, snapshot, step);
   const bool prepared_everywhere = All(prepared, request.communicator);
   if (!prepared_everywhere) return false;
-  double conservation_error = std::numeric_limits<double>::infinity();
-  double conservation_relative_error =
-      std::numeric_limits<double>::infinity();
-  std::array<double, 3> conservation_oracle_activity{};
-  const bool conservation_seam =
-      CudaQualificationTestAccess::VerifyPreparedIgrConservation(
-          engine, conservation_error, conservation_relative_error,
-          conservation_oracle_activity);
-  const bool conservation = conservation_seam &&
-      std::isfinite(conservation_error) &&
-      std::isfinite(conservation_relative_error) &&
-      conservation_relative_error <=
-          config.numerical_policy.conservation_relative_tolerance;
-  const bool conservation_everywhere = All(
-      conservation, request.communicator);
-  if (!conservation_everywhere) return false;
 
   CudaPreparedOutputMetadataV1 output{};
   const bool staged = engine.StagePreparedOutputMetadata(output, step);
@@ -1021,14 +1502,6 @@ bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
                 << " jacobian=" << jacobian
                 << " coupling=" << coupled
                 << " prepared=" << prepared
-                << " conservation=" << conservation
-                << " conservation_error=" << conservation_error
-                << " conservation_relative_error="
-                << conservation_relative_error
-                << " conservation_oracle_activity="
-                << conservation_oracle_activity[0] << ' '
-                << conservation_oracle_activity[1] << ' '
-                << conservation_oracle_activity[2]
                 << " jacobian_errors=";
       for (const double error : jacobian_errors) std::cerr << ' ' << error;
       std::cerr << " coupling_norms=" << coupling_norms[0] << ' '
@@ -1160,6 +1633,96 @@ bool CheckAllSevenLoweredBoundaryPolicies(const int order)
                 << order << '\n';
   }
   return All(copied_and_associated, request.communicator);
+}
+
+bool CheckIndependentIgrConservation(const int order)
+{
+  mfem::ParMesh mesh = MakeAllSevenPhysicalMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::nonzero, InitialMode::smooth_periodic);
+  mfem::L2_FECollection source_collection(
+      order, 2, mfem::BasisType::GaussLegendre,
+      mfem::FiniteElement::VALUE);
+  mfem::ParFiniteElementSpace source_space(
+      &mesh, &source_collection, components, mfem::Ordering::byNODES);
+  mfem::ParGridFunction source_field(&source_space);
+  mfem::VectorFunctionCoefficient source_coefficient(
+      components, [](const mfem::Vector& point, mfem::Vector& source)
+      {
+        const double modulation = 1.0 + 0.1 * point[0] - 0.05 * point[1];
+        source.SetSize(components);
+        source[0] = 0.25 * modulation;
+        source[1] = 0.125 * modulation;
+        source[2] = -0.1875 * modulation;
+        source[3] = 0.375 * modulation;
+      });
+  source_field.ProjectCoefficient(source_coefficient);
+  const double* const source_values = source_field.HostRead();
+  fields.source.assign(
+      source_values, source_values + source_space.GetVSize());
+
+  BoundaryContext unused_boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, unused_boundary, false,
+      RegularizationKind::igr);
+  AllSevenBoundaryContext boundary{};
+  ConfigureAllSevenPolicies(boundary);
+  request.boundary.context = &boundary;
+  request.boundary.exterior_state = AllSevenPhysicalEulerExterior;
+  request.boundary.policies = {
+      boundary.policies.data(), boundary.policies.size(), 2, 1.4};
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  GenericEulerHdgCudaSession session;
+  const auto initialization = session.Initialize(request);
+  const bool initialized = All(
+      initialization.status == HdgEulerSessionStatus::initialized,
+      request.communicator);
+  if (!initialized) return false;
+
+  constexpr double dt = 1.0e-5;
+  GenericEulerCudaPreparedStep authority;
+  GenericEulerHdgCudaSession::prepared_output_type output{};
+  const auto prepared_result = session.Prepare(dt, authority, output);
+  const bool prepared = All(
+      prepared_result.status == HdgEulerSessionStatus::prepared,
+      request.communicator);
+  if (!prepared) return false;
+
+  CudaPreparedIgrConservationCapture capture;
+  const bool captured =
+      CudaQualificationTestAccess::CapturePreparedIgrConservation(
+          session, capture);
+  IndependentIgrConservationResult oracle;
+  const bool verified = captured && VerifyIndependentIgrConservation(
+      capture, request, oracle);
+  const auto aborted = session.Abort(std::move(authority), output);
+  const bool aborted_everywhere = All(
+      aborted.status == HdgEulerSessionStatus::aborted,
+      request.communicator);
+  const bool passed = All(
+      captured && verified && aborted_everywhere, request.communicator);
+  if (!passed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA independent IGR conservation oracle failed order="
+                << order << " captured=" << captured
+                << " verified=" << verified
+                << " aborted=" << aborted_everywhere
+                << " balance_discrepancy="
+                << oracle.maximum_balance_discrepancy
+                << " scale_discrepancy="
+                << oracle.maximum_scale_discrepancy << " activity=";
+      for (const double value : oracle.activity) std::cerr << ' ' << value;
+      std::cerr << '\n';
+    }
+  }
+  return passed;
 }
 
 bool CheckIgrAlgebra(const int order, const int ranks)
@@ -1545,6 +2108,8 @@ int main(int argc, char* argv[])
       CheckCopiedInitialTrueTrace(order);
   const bool all_seven_boundary_policies = order > 0 &&
       CheckAllSevenLoweredBoundaryPolicies(order);
+  const bool independent_igr_conservation = order > 0 &&
+      CheckIndependentIgrConservation(order);
   const bool igr_algebra = order > 0 && CheckIgrAlgebra(order, ranks);
   const bool conventional_periodic = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::nonzero,
@@ -1590,7 +2155,7 @@ int main(int argc, char* argv[])
       DifferentValues(igr_periodic_state, igr_physical_state);
   const bool passed = (ranks == 1 || ranks == 2) && All(
       admission && copied_initial_trace && all_seven_boundary_policies &&
-      igr_algebra &&
+      independent_igr_conservation && igr_algebra &&
       conventional_periodic && conventional_physical &&
       igr_periodic && igr_physical && boundary_effect && source_equivalence);
   if (!passed)
@@ -1601,6 +2166,8 @@ int main(int argc, char* argv[])
               << " copied_initial_trace=" << copied_initial_trace
               << " all_seven_boundary_policies="
               << all_seven_boundary_policies
+              << " independent_igr_conservation="
+              << independent_igr_conservation
               << " igr_algebra=" << igr_algebra
               << " conventional_periodic=" << conventional_periodic
               << " conventional_physical=" << conventional_physical
