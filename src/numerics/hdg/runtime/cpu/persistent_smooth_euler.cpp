@@ -2412,8 +2412,12 @@ struct detail::CpuNumericsCore::Implementation
   bool FillBorrowedTrueTrace(mfem::Vector& trace,
                              const generic::EulerFieldView view) const noexcept
   {
-    if (view.components != cpu_conserved_components || view.data == nullptr ||
-        view.scalar_count != static_cast<std::size_t>(trace.Size()))
+    // A globally supplied true trace may have an exactly empty local piece on
+    // a rank which owns no true dofs.  That rank contributes no bytes but must
+    // still take the supplied-trace collective path with its peers.
+    if (view.components != cpu_conserved_components ||
+        view.scalar_count != static_cast<std::size_t>(trace.Size()) ||
+        (trace.Size() != 0 && view.data == nullptr))
     {
       return false;
     }
@@ -6250,25 +6254,38 @@ bool detail::CpuNumericsCore::InitializeInternal(
   local_ok = Copy(*state.old_interior, state.Committed()->interior) &&
       Copy(*state.trial_interior, state.first_iterate_interior);
   if (!state.CollectiveAll(local_ok)) { return false; }
-  const bool supplied_true_trace = generic &&
-      borrowed_request->initial_true_trace.scalar_count != 0;
-  if (supplied_true_trace
-      ? !state.FillBorrowedTrueTrace(state.iterate_true_trace,
-                                     borrowed_request->initial_true_trace)
-      : !state.ProjectTrace(*state.iterate_trace, state.iterate_true_trace,
-                            false))
-  { return false; }
+  // Trace provenance is one collective mode, never a rank-local branch.  The
+  // compatibility empty view selects derived projection only when *every*
+  // participating rank supplied an empty view.  Once any rank supplies a
+  // trace, every rank must provide its exact local true-vector extent (which
+  // can legitimately be zero).  Validate the whole iterate before allowing
+  // any rank into the collective trace distribution below.
+  bool derive_initial_true_trace = !generic;
+  if (generic)
+  {
+    derive_initial_true_trace = state.CollectiveAll(
+        borrowed_request->initial_true_trace.scalar_count == 0);
+  }
+  local_ok = derive_initial_true_trace
+      ? state.ProjectTrace(*state.iterate_trace, state.iterate_true_trace,
+                           false)
+      : state.FillBorrowedTrueTrace(state.iterate_true_trace,
+                                    borrowed_request->initial_true_trace);
+  if (!state.CollectiveAll(local_ok)) { return false; }
   if (!state.LoadTrace(state.iterate_true_trace, *state.iterate_trace))
   {
     return false;
   }
   local_ok = Copy(state.iterate_true_trace, state.Committed()->trace);
   if (!state.CollectiveAll(local_ok)) { return false; }
-  if (supplied_true_trace
-      ? !state.FillBorrowedTrueTrace(state.trial_true_trace,
-                                     borrowed_request->initial_true_trace)
-      : !state.ProjectTrace(*state.trial_trace, state.trial_true_trace, true))
-  { return false; }
+  // Revalidate the independent trial staging vector before its own load.  In
+  // particular, a nonfinite borrowed entry cannot let a peer enter
+  // Distribute while this rank returns locally.
+  local_ok = derive_initial_true_trace
+      ? state.ProjectTrace(*state.trial_trace, state.trial_true_trace, true)
+      : state.FillBorrowedTrueTrace(state.trial_true_trace,
+                                    borrowed_request->initial_true_trace);
+  if (!state.CollectiveAll(local_ok)) { return false; }
   if (!state.LoadTrace(state.trial_true_trace, *state.trial_trace))
   {
     return false;

@@ -1598,6 +1598,85 @@ bool CheckCollectiveMismatchAndAtomicFailure()
   return All(rejected && restart_rejected);
 }
 
+bool CheckCollectiveInitialTraceAdmission()
+{
+  int rank = 0;
+  int ranks = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  // This regression specifically exercises the two-rank split where a
+  // component-aligned external trace has the wrong local extent on one rank.
+  if (ranks != 2) { return true; }
+
+  mfem::ParMesh mesh = MakeBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                        0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{{}};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
+
+  mfem::DG_Interface_FECollection trace_collection(
+      1, 2, mfem::FiniteElement::VALUE, mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace trace_space(
+      &mesh, &trace_collection, 4, mfem::Ordering::byNODES);
+  const std::size_t local_true_size = static_cast<std::size_t>(
+      trace_space.GetTrueVSize());
+  std::vector<double> supplied(local_true_size + (rank == 0 ? 4U : 0U), 0.0);
+  request.initial_true_trace = {
+      supplied.empty() ? nullptr : supplied.data(), supplied.size(), 4};
+
+  GenericEulerHdgCpuSession session;
+  const auto initialization = session.Initialize(request);
+  const auto coordinates = session.coordinates();
+  const bool rejected = initialization.status ==
+          GenericEulerCpuSessionStatus::rejected &&
+      coordinates.step == 0 && coordinates.generation == 0 &&
+      coordinates.time == 0.0 &&
+      session.Advance(0.013).status == GenericEulerCpuSessionStatus::rejected &&
+      SameBorrowedMesh(mesh, before, request.communicator);
+  return All(rejected);
+}
+
+bool CheckSuppliedInitialTraceWithZeroLocalExtent()
+{
+  int ranks = 1;
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  if (ranks != 2) { return true; }
+
+  mfem::ParMesh mesh = MakeRankZeroOwnedBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                        0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{{}};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
+
+  mfem::DG_Interface_FECollection trace_collection(
+      1, 2, mfem::FiniteElement::VALUE, mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace trace_space(
+      &mesh, &trace_collection, 4, mfem::Ordering::byNODES);
+  const std::size_t local_true_size = static_cast<std::size_t>(
+      trace_space.GetTrueVSize());
+  int has_empty_true_trace = local_true_size == 0 ? 1 : 0;
+  if (MPI_Allreduce(MPI_IN_PLACE, &has_empty_true_trace, 1, MPI_INT, MPI_MAX,
+                    mesh.GetComm()) != MPI_SUCCESS ||
+      has_empty_true_trace == 0)
+  {
+    return false;
+  }
+  std::vector<double> supplied(local_true_size, 0.0);
+  request.initial_true_trace = {
+      supplied.empty() ? nullptr : supplied.data(), supplied.size(), 4};
+
+  GenericEulerHdgCpuSession session;
+  const bool initialized = session.Initialize(request).status ==
+      GenericEulerCpuSessionStatus::initialized;
+  return All(initialized && SameBorrowedMesh(mesh, before, request.communicator));
+}
+
 bool CheckAcceptedRequestRankLocalCallbackFailure()
 {
   mfem::ParMesh mesh = MakeBorrowedMesh();
@@ -1649,6 +1728,9 @@ int main(int argc, char* argv[])
   const bool subcommunicator = CheckSubcommunicatorIsolation();
   const bool passive_world = CheckBorrowedSessionDoesNotUseWorldCollectives();
   const bool mismatch = CheckCollectiveMismatchAndAtomicFailure();
+  const bool initial_trace_admission = CheckCollectiveInitialTraceAdmission();
+  const bool initial_trace_zero_local =
+      CheckSuppliedInitialTraceWithZeroLocalExtent();
   const bool callback_failure = CheckAcceptedRequestRankLocalCallbackFailure();
   const bool local = boundary_semantics && trace_restriction && orders &&
       prepared_lifecycle &&
@@ -1661,7 +1743,7 @@ int main(int argc, char* argv[])
       private_igr_numerical_policy &&
       private_igr_initialization && dynamic_tau && boundary_picard &&
       zero_owned && subcommunicator && passive_world && mismatch &&
-      callback_failure;
+      initial_trace_admission && initial_trace_zero_local && callback_failure;
   if (!All(local))
   {
     int rank = 0;
@@ -1690,6 +1772,8 @@ int main(int argc, char* argv[])
               << " passive_world=" << passive_world
               << " subcommunicator=" << subcommunicator
               << " mismatch=" << mismatch
+              << " initial_trace_admission=" << initial_trace_admission
+              << " initial_trace_zero_local=" << initial_trace_zero_local
               << " callback_failure=" << callback_failure << '\n';
     return 1;
   }
