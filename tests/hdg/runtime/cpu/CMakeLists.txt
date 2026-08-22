@@ -62,6 +62,7 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
     "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/cpu"
     "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(dg_igr_hdg_runtime_w8c_cpu_serial_test PRIVATE
+    dg_igr_hdg_generic_cpu
     dg_igr_hdg_sc25_oracle_cpu
     dg_igr_hdg_auxiliary_cpu
     mfem
@@ -91,6 +92,7 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
     "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(
     dg_igr_hdg_runtime_w8c_smooth_transition_cpu_serial_test PRIVATE
+    dg_igr_hdg_generic_cpu
     dg_igr_hdg_sc25_oracle_cpu
     dg_igr_hdg_auxiliary_cpu
     mfem
@@ -139,6 +141,47 @@ if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
       RESOURCE_LOCK hdg_runtime_cpu
       LABELS "hdg;runtime;app;cpu;w8c;smooth-transition;matrix"
       TIMEOUT 21600)
+
+  add_executable(dg_igr_hdg_n8_generic_reference_transfer_test
+    euler_committed_observable_oracle.cpp
+    test_n8_generic_reference_transfer.cpp)
+  target_include_directories(dg_igr_hdg_n8_generic_reference_transfer_test
+    PRIVATE
+      "${PROJECT_SOURCE_DIR}/include"
+      "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/cpu"
+      "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(dg_igr_hdg_n8_generic_reference_transfer_test
+    PRIVATE
+      dg_igr_hdg_generic_cpu
+      dg_igr_hdg_sc25_oracle_cpu
+      dg_igr_hdg_auxiliary_cpu
+      mfem
+      MPI::MPI_CXX)
+  target_compile_options(dg_igr_hdg_n8_generic_reference_transfer_test
+    PRIVATE
+      $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+  set_target_properties(dg_igr_hdg_n8_generic_reference_transfer_test
+    PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF)
+
+  add_test(NAME hdg_n8_generic_reference_transfer_rank1
+    COMMAND dg_igr_hdg_n8_generic_reference_transfer_test)
+  add_test(NAME hdg_n8_generic_reference_transfer_rank2
+    COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
+      ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_hdg_n8_generic_reference_transfer_test>
+      ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(
+    hdg_n8_generic_reference_transfer_rank1
+    hdg_n8_generic_reference_transfer_rank2
+    PROPERTIES
+      LABELS "hdg;generic;sc25;reference-transfer;n8;cpu;igr"
+      RESOURCE_LOCK hdg_reference_transfer_cpu
+      TIMEOUT 21600)
+  set_tests_properties(hdg_n8_generic_reference_transfer_rank2
+    PROPERTIES PROCESSORS 2)
 endif()
 
 add_test(
