@@ -104,8 +104,9 @@ bool CheckNegatives(const int ranks)
 {
   mfem::Mesh valid_serial = PeriodicSquareMesh(functional_elements_per_direction);
   mfem::ParMesh valid(MPI_COMM_WORLD, valid_serial);
-  CudaConfig p3 = BorrowedConfig(valid, ranks, 3,
-                                 functional_elements_per_direction);
+  CudaConfig unsupported_order = BorrowedConfig(
+      valid, ranks, dg::hdg::generic::maximum_polynomial_order + 1,
+      functional_elements_per_direction);
   CudaConfig rank3 = BorrowedConfig(valid, 3, functional_polynomial_order,
                                     functional_elements_per_direction);
   CudaConfig null_communicator = BorrowedConfig(
@@ -151,7 +152,7 @@ bool CheckNegatives(const int ranks)
   mfem::ParMesh nonquad(MPI_COMM_WORLD, triangles);
   CudaConfig geometry = BorrowedConfig(nonquad, ranks, smoke_polynomial_order,
                                        smoke_elements_per_direction);
-  return All(RejectedBeforeDevice<Backend>(p3) &&
+  return All(RejectedBeforeDevice<Backend>(unsupported_order) &&
              RejectedBeforeDevice<Backend>(rank3) &&
              RejectedBeforeDevice<Backend>(null_communicator) &&
              mismatched_communicator_rejected &&

@@ -1047,8 +1047,9 @@ bool CheckNegatives(const int ranks)
   CudaConfig invalid_mesh_n = BorrowedConfig(
       periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction);
   invalid_mesh_n.mesh_n = -1;
-  CudaConfig p3 = BorrowedConfig(
-      periodic, ranks, 3, smoke_elements_per_direction);
+  CudaConfig unsupported_order = BorrowedConfig(
+      periodic, ranks, dg::hdg::generic::maximum_polynomial_order + 1,
+      smoke_elements_per_direction);
   CudaConfig wrong_device = BorrowedConfig(
       periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction);
   wrong_device.requested_device = 1;
@@ -1154,7 +1155,7 @@ bool CheckNegatives(const int ranks)
   GenericEulerHdgCudaSession one, two, three, four, five, six, seven, eight;
   const bool nonperiodic_rejected = Rejected(one, nonperiodic);
   const bool invalid_mesh_n_rejected = Rejected(two, invalid_mesh_n);
-  const bool p3_rejected = Rejected(three, p3);
+  const bool unsupported_order_rejected = Rejected(three, unsupported_order);
   const bool wrong_device_rejected = Rejected(four, wrong_device);
   const bool wrong_ranks_rejected = Rejected(five, wrong_ranks);
   const bool invalid_config_dt_rejected = Rejected(six, invalid_config_dt);
@@ -1202,7 +1203,8 @@ bool CheckNegatives(const int ranks)
       BoundaryPolicyViolationsRejectedBeforeDevice(
           boundary, ranks, functional_polynomial_order,
           smoke_elements_per_direction);
-  bool rejected = nonperiodic_rejected && invalid_mesh_n_rejected && p3_rejected &&
+  bool rejected = nonperiodic_rejected && invalid_mesh_n_rejected &&
+      unsupported_order_rejected &&
       wrong_device_rejected && wrong_ranks_rejected && invalid_config_dt_rejected &&
       capture_oracle_rejected && direct_capture_oracle_rejected &&
       injection_rejected && null_initial_rejected &&
