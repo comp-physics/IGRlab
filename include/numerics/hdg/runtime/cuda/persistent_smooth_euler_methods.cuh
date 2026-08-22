@@ -224,7 +224,7 @@ VerifyStaticBoundaryClosuresForTests(
   const bool reduced = MPI_Allreduce(
       relative_errors.data(), global_errors.data(),
       static_cast<int>(global_errors.size()), MPI_DOUBLE, MPI_MAX,
-      MPI_COMM_WORLD) == MPI_SUCCESS;
+      communicator_) == MPI_SUCCESS;
   if (reduced) relative_errors = global_errors;
   const bool within_tolerance = reduced && local_valid && std::all_of(
       relative_errors.begin(), relative_errors.end(),

@@ -624,18 +624,23 @@ inline bool ExactNumericalPolicyConsensus(
   int maximum_integers[sizeof(integers) / sizeof(*integers)]{};
   std::uint64_t minimum_reals[sizeof(reals) / sizeof(*reals)]{};
   std::uint64_t maximum_reals[sizeof(reals) / sizeof(*reals)]{};
-  return MPI_Allreduce(integers, minimum_integers,
-                       static_cast<int>(sizeof(integers) / sizeof(*integers)),
-                       MPI_INT, MPI_MIN, communicator) == MPI_SUCCESS &&
-      MPI_Allreduce(integers, maximum_integers,
-                    static_cast<int>(sizeof(integers) / sizeof(*integers)),
-                    MPI_INT, MPI_MAX, communicator) == MPI_SUCCESS &&
-      MPI_Allreduce(reals, minimum_reals,
-                    static_cast<int>(sizeof(reals) / sizeof(*reals)),
-                    MPI_UINT64_T, MPI_MIN, communicator) == MPI_SUCCESS &&
-      MPI_Allreduce(reals, maximum_reals,
-                    static_cast<int>(sizeof(reals) / sizeof(*reals)),
-                    MPI_UINT64_T, MPI_MAX, communicator) == MPI_SUCCESS &&
+  const int integer_count =
+      static_cast<int>(sizeof(integers) / sizeof(*integers));
+  const int real_count = static_cast<int>(sizeof(reals) / sizeof(*reals));
+  const bool minimum_integers_ready = MPI_Allreduce(
+      integers, minimum_integers, integer_count, MPI_INT, MPI_MIN,
+      communicator) == MPI_SUCCESS;
+  const bool maximum_integers_ready = MPI_Allreduce(
+      integers, maximum_integers, integer_count, MPI_INT, MPI_MAX,
+      communicator) == MPI_SUCCESS;
+  const bool minimum_reals_ready = MPI_Allreduce(
+      reals, minimum_reals, real_count, MPI_UINT64_T, MPI_MIN,
+      communicator) == MPI_SUCCESS;
+  const bool maximum_reals_ready = MPI_Allreduce(
+      reals, maximum_reals, real_count, MPI_UINT64_T, MPI_MAX,
+      communicator) == MPI_SUCCESS;
+  return minimum_integers_ready && maximum_integers_ready &&
+      minimum_reals_ready && maximum_reals_ready &&
       std::equal(std::begin(minimum_integers), std::end(minimum_integers),
                  std::begin(maximum_integers)) &&
       std::equal(std::begin(minimum_reals), std::end(minimum_reals),

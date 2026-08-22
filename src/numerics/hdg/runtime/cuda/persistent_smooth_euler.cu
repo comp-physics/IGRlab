@@ -242,12 +242,16 @@ bool CollectiveHashConsensus(const std::uint64_t local,
   int size = 0;
   std::uint64_t minimum = local;
   std::uint64_t maximum = local;
-  if (communicator == MPI_COMM_NULL ||
-      MPI_Comm_size(communicator, &size) != MPI_SUCCESS || size <= 0 ||
-      MPI_Allreduce(&local, &minimum, 1, MPI_UINT64_T, MPI_MIN,
-                    communicator) != MPI_SUCCESS ||
-      MPI_Allreduce(&local, &maximum, 1, MPI_UINT64_T, MPI_MAX,
-                    communicator) != MPI_SUCCESS)
+  if (communicator == MPI_COMM_NULL) return false;
+  const bool size_ready =
+      MPI_Comm_size(communicator, &size) == MPI_SUCCESS;
+  const bool minimum_ready = MPI_Allreduce(
+      &local, &minimum, 1, MPI_UINT64_T, MPI_MIN,
+      communicator) == MPI_SUCCESS;
+  const bool maximum_ready = MPI_Allreduce(
+      &local, &maximum, 1, MPI_UINT64_T, MPI_MAX,
+      communicator) == MPI_SUCCESS;
+  if (!size_ready || !minimum_ready || !maximum_ready || size <= 0)
     return false;
   participating = static_cast<std::uint32_t>(size);
   return participating == expected && minimum == maximum;
