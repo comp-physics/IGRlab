@@ -200,15 +200,19 @@ FrozenBoundaryPlan FreezeBoundaryPlan(const EulerBoundaryPlan& source)
       {
         AppendDouble(key, state(component));
       }
-      if (entry.inlet_model == EulerInletModel::Supersonic)
+      switch (entry.inlet_model)
       {
+      case EulerInletModel::Supersonic:
         frozen.plan.AddSupersonicInlet(
             std::move(marker), [state] { return state; });
-      }
-      else
-      {
+        break;
+      case EulerInletModel::Subsonic:
         frozen.plan.AddSubsonicInlet(
             std::move(marker), [state] { return state; });
+        break;
+      default:
+        throw std::invalid_argument(
+            "HDG boundary plan has an unsupported inlet model");
       }
       break;
     }

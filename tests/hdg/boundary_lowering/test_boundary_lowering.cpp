@@ -205,6 +205,19 @@ bool CheckCharacteristicSlipAndMarkers()
   {
     return false;
   }
+  dg_sim::EulerBoundaryPlan unsupported_inlet;
+  unsupported_inlet.AddSupersonicInlet(
+      Marker(1), [reference] { return reference; });
+  auto& unsupported_entry =
+      const_cast<dg_sim::EulerBoundaryPlanEntry&>(
+          unsupported_inlet.Entries().front());
+  unsupported_entry.inlet_model =
+      static_cast<dg_sim::EulerInletModel>(255);
+  if (!Rejects(unsupported_inlet,
+               "HDG boundary lowering has an unsupported inlet model."))
+  {
+    return false;
+  }
   dg_sim::EulerBoundaryPlan invalid;
   mfem::Array<int> marker(kAttributes);
   marker = 0;

@@ -5,7 +5,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -151,15 +150,19 @@ FrozenBoundaryPlan FreezeBoundaryPlan(const EulerBoundaryPlan& source)
       {
         AppendDouble(key, state(component));
       }
-      if (entry.inlet_model == EulerInletModel::Supersonic)
+      switch (entry.inlet_model)
       {
+      case EulerInletModel::Supersonic:
         frozen.plan.AddSupersonicInlet(
             std::move(marker), [state] { return state; });
-      }
-      else
-      {
+        break;
+      case EulerInletModel::Subsonic:
         frozen.plan.AddSubsonicInlet(
             std::move(marker), [state] { return state; });
+        break;
+      default:
+        throw std::invalid_argument(
+            "HDG boundary plan has an unsupported inlet model");
       }
       break;
     }
@@ -271,31 +274,32 @@ std::string ConsensusText(const HdgEulerMainRequest& request,
                           const RegularizationSelection regularization)
 {
   std::ostringstream stream;
-  stream << std::setprecision(std::numeric_limits<double>::max_digits10)
-         << request.case_config.case_name << '\n'
-         << mesh_path << '\n'
-         << ToLowerCopy(request.options.device) << '\n'
-         << request.options.order << '\n'
-         << request.options.ser_ref_levels << '\n'
-         << request.options.par_ref_levels << '\n'
-         << request.options.dt << '\n'
-         << request.options.t_final << '\n'
-         << request.options.dt_save << '\n'
-         << request.options.vtk_save << '\n'
-         << request.options.glvis << '\n'
-         << request.options.restart_vtk << '\n'
-         << request.options.restart_cycle << '\n'
-         << request.options.restart_step << '\n'
-         << request.options.save_state_files << '\n'
-         << request.options.cfl << '\n'
-         << request.options.dt_min << '\n'
-         << request.case_config.gamma << '\n';
-  stream << static_cast<int>(regularization.kind) << '\n';
+  const mfem::io::VTKOutputConfig vtk = MakeCaseVTKConfig(request.case_config);
+  AppendText(stream, request.case_config.case_name);
+  AppendText(stream, mesh_path);
+  AppendText(stream, ToLowerCopy(request.options.device));
+  AppendText(stream, request.options.restart_vtk);
+  AppendText(stream, vtk.prefix_path);
+  stream << request.options.order << ';'
+         << request.options.ser_ref_levels << ';'
+         << request.options.par_ref_levels << ';'
+         << request.options.restart_cycle << ';'
+         << request.options.restart_step << ';'
+         << request.options.vtk_save << ';'
+         << request.options.glvis << ';'
+         << request.options.save_state_files << ';'
+         << static_cast<int>(vtk.format) << ';'
+         << vtk.high_order_output << ';'
+         << vtk.levels_of_detail << ';';
+  AppendDouble(stream, request.options.dt);
+  AppendDouble(stream, request.options.dt_min);
+  AppendDouble(stream, request.options.cfl);
+  AppendDouble(stream, request.options.t_final);
+  AppendDouble(stream, request.options.dt_save);
+  AppendDouble(stream, request.case_config.gamma);
+  stream << static_cast<int>(regularization.kind) << ';';
   AppendDouble(stream, regularization.alpha);
   AppendDouble(stream, regularization.beta);
-  const mfem::io::VTKOutputConfig vtk = MakeCaseVTKConfig(request.case_config);
-  stream << vtk.prefix_path << '\n' << static_cast<int>(vtk.format) << '\n'
-         << vtk.high_order_output << '\n' << vtk.levels_of_detail << '\n';
   return stream.str();
 }
 
@@ -430,9 +434,25 @@ bool FreshOutputView(mfem::ParGridFunction& published_state,
   destination = {};
   try
   {
-    destination = {published_state.HostWrite(), scalar_count,
+    constexpr std::size_t components =
+        dg::hdg::generic::euler_2d_conserved_components;
+    if (scalar_count > std::numeric_limits<std::size_t>::max() / components ||
+        published_state.Size() < 0 ||
+        static_cast<std::size_t>(published_state.Size()) !=
+            scalar_count * components)
+    {
+      return false;
+    }
+    if (scalar_count == 0)
+    {
+      destination = {nullptr, 0,
+                     dg::hdg::generic::euler_2d_conserved_components};
+      return true;
+    }
+    double* const coefficients = published_state.HostWrite();
+    destination = {coefficients, scalar_count,
                    dg::hdg::generic::euler_2d_conserved_components};
-    return destination.coefficients != nullptr;
+    return coefficients != nullptr;
   }
   catch (...) { return false; }
 }
