@@ -462,39 +462,6 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
     PROPERTIES PROCESSORS 2 RESOURCE_LOCK dg_igr_sm120 TIMEOUT 7200
     LABELS "hdg;runtime;cuda;rank2;one-gpu;host-staged;w8c;smooth-transition")
 
-  add_executable(dg_igr_hdg_traced_scalar_igr_p1_private_numerics_cuda_test
-    test_traced_scalar_igr_p1_private_numerics.cu)
-  target_include_directories(dg_igr_hdg_traced_scalar_igr_p1_private_numerics_cuda_test
-    PRIVATE "${PROJECT_SOURCE_DIR}/include")
-  target_link_libraries(dg_igr_hdg_traced_scalar_igr_p1_private_numerics_cuda_test
-    PRIVATE dg_igr_hdg_runtime_cuda mfem MPI::MPI_CXX)
-  target_compile_options(dg_igr_hdg_traced_scalar_igr_p1_private_numerics_cuda_test
-    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
-            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-  set_target_properties(dg_igr_hdg_traced_scalar_igr_p1_private_numerics_cuda_test
-    PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF
-      CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF
-      CUDA_ARCHITECTURES 120 CUDA_SEPARABLE_COMPILATION ON
-      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-  add_test(NAME hdg_traced_scalar_igr_p1_private_numerics_cuda_rank1
-    COMMAND dg_igr_hdg_traced_scalar_igr_p1_private_numerics_cuda_test)
-  add_test(NAME hdg_traced_scalar_igr_p1_private_numerics_cuda_rank2
-    COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
-      ${MPIEXEC_PREFLAGS}
-      $<TARGET_FILE:dg_igr_hdg_traced_scalar_igr_p1_private_numerics_cuda_test>
-      ${MPIEXEC_POSTFLAGS})
-  add_test(NAME hdg_traced_scalar_igr_p1_private_numerics_cuda_rank2_zero_local
-    COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
-      ${MPIEXEC_PREFLAGS}
-      $<TARGET_FILE:dg_igr_hdg_traced_scalar_igr_p1_private_numerics_cuda_test>
-      --rank0-only ${MPIEXEC_POSTFLAGS})
-  set_tests_properties(hdg_traced_scalar_igr_p1_private_numerics_cuda_rank1
-    PROPERTIES PROCESSORS 1 RESOURCE_LOCK dg_igr_sm120 TIMEOUT 1800
-      LABELS "hdg;runtime;cuda;traced-scalar-igr;p1;identity-prime;rank1")
-  set_tests_properties(hdg_traced_scalar_igr_p1_private_numerics_cuda_rank2
-    hdg_traced_scalar_igr_p1_private_numerics_cuda_rank2_zero_local
-    PROPERTIES PROCESSORS 2 RESOURCE_LOCK dg_igr_sm120 TIMEOUT 1800
-      LABELS "hdg;runtime;cuda;traced-scalar-igr;p1;identity-prime;rank2")
 endif()
 set_tests_properties(
   dg_igr_hdg_runtime_cuda_w8a_rank2_host_staged

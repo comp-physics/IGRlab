@@ -1,4 +1,5 @@
 #include "numerics/hdg/runtime/cuda/persistent_sc25_scalar_igr_rank2_impl.cuh"
+#include "numerics/hdg/runtime/cuda/traced_scalar_igr_p1_private_numerics.cuh"
 #include "numerics/hdg/runtime/sha256.hpp"
 
 #include <HYPRE_krylov.h>
@@ -23,6 +24,9 @@
 
 namespace scalar = dg::hdg::runtime::cuda_w8b::sc25::rank2;
 namespace scalar_detail = dg::hdg::runtime::cuda_w8b::sc25::rank2::detail;
+namespace packed = dg::hdg::runtime::cuda::traced_scalar_igr_p1_private;
+namespace packed_algebra =
+    dg::hdg::runtime::common::traced_scalar_igr_p1_local_algebra;
 
 namespace
 {
@@ -854,508 +858,108 @@ __device__ void ZeroAssembly(scalar_detail::DeviceView& view)
   view.reduction[3] = DBL_MAX;
 }
 
-__device__ void AssembleSystem(scalar_detail::DeviceView& view)
+__device__ bool StrictPackedAdmissible(const double state[4])
 {
-  ZeroAssembly(view);
-  const double* old_state = view.slot_interior[view.committed_slot];
+  double pressure = 0.0;
+  double velocity[2]{};
+  if (!Primitive(state, pressure, velocity) || !(state[0] > 1.0e-8) ||
+      !(pressure > 1.0e-8)) { return false; }
+  const double speed = hypot(velocity[0], velocity[1]);
+  const double sound = sqrt(gamma_value * pressure / state[0]);
+  return DeviceFinite(speed) && DeviceFinite(sound) && speed + sound < 2.5;
+}
+
+__global__ void PackSc25ForPackedAlgebra(scalar_detail::DeviceView view)
+{
+  const int element = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (element >= view.elements) { return; }
+  if (view.volume_quadrature_points != 4 || view.face_quadrature_points != 2 ||
+      view.packed_vertices == nullptr || view.packed_parameters == nullptr ||
+      view.packed_interior == nullptr || view.packed_previous_interior == nullptr ||
+      view.packed_trace == nullptr || view.packed_previous_trace == nullptr)
+  { atomicOr(view.status, scalar_detail::device_invalid_layout); return; }
+  const double* current = CurrentInterior(view);
+  const double* old = view.slot_interior[view.committed_slot];
+  const double* trace = CurrentTrace(view);
   const double* old_trace = view.slot_trace[view.committed_slot];
-  double* current_state = CurrentInterior(view);
-  double* current_trace = CurrentTrace(view);
-  const int global_interior = view.elements * ni;
+  double* packed_current = view.packed_interior +
+      static_cast<std::size_t>(element) * packed_algebra::interior_unknowns;
+  double* packed_old = view.packed_previous_interior +
+      static_cast<std::size_t>(element) * packed_algebra::interior_unknowns;
+  double* packed_trace = view.packed_trace +
+      static_cast<std::size_t>(element) * packed_algebra::trace_unknowns;
+  double* packed_old_trace = view.packed_previous_trace +
+      static_cast<std::size_t>(element) * packed_algebra::trace_unknowns;
+  for (int component = 0; component < 7; ++component)
+    for (int a = 0; a < ns; ++a)
+    {
+      packed_current[component * ns + a] = current[InteriorIndex(element, component, a)];
+      packed_old[component * ns + a] = old[InteriorIndex(element, component, a)];
+    }
+  for (int local = 0; local < nt; ++local)
+  {
+    const int map = element * nt + local;
+    const int true_dof = view.local_trace_to_true[map];
+    const int sign = view.local_trace_sign[map];
+    if (true_dof < 0 || true_dof >= view.true_trace_unknowns ||
+        (sign != -1 && sign != 1))
+    { atomicOr(view.status, scalar_detail::device_invalid_layout); return; }
+    packed_trace[local] = static_cast<double>(sign) * trace[true_dof];
+    packed_old_trace[local] = static_cast<double>(sign) * old_trace[true_dof];
+  }
+  for (int a = 0; a < ns; ++a)
+  {
+    double now[4]{}, before[4]{};
+    for (int component = 0; component < 4; ++component)
+    { now[component] = packed_current[component * ns + a]; before[component] = packed_old[component * ns + a]; }
+    if (!StrictPackedAdmissible(now) || !StrictPackedAdmissible(before))
+    { atomicOr(view.status, scalar_detail::device_admissibility); return; }
+  }
+  for (int local = 0; local < 4 * face_nodes; ++local)
+  {
+    double now[4]{}, before[4]{};
+    for (int component = 0; component < 4; ++component)
+    { now[component] = packed_trace[component * nf + local]; before[component] = packed_old_trace[component * nf + local]; }
+    if (!StrictPackedAdmissible(now) || !StrictPackedAdmissible(before))
+    { atomicOr(view.status, scalar_detail::device_admissibility); return; }
+  }
+  constexpr double qa = 0.21132486540518711775;
+  constexpr double qb = 0.78867513459481288225;
+  const double* node_x = view.volume_node_x + element * ns;
+  const double* node_y = view.volume_node_y + element * ns;
+  const double denominator = qb - qa;
+  const double x0 = (qb * node_x[0] - qa * node_x[1]) / denominator;
+  const double x1 = (qb * node_x[1] - qa * node_x[0]) / denominator;
+  const double y0 = (qb * node_y[0] - qa * node_y[2]) / denominator;
+  const double y1 = (qb * node_y[2] - qa * node_y[0]) / denominator;
+  double* vertices = view.packed_vertices + static_cast<std::size_t>(element) * 8;
+  vertices[0] = x0; vertices[1] = y0; vertices[2] = x1; vertices[3] = y0;
+  vertices[4] = x1; vertices[5] = y1; vertices[6] = x0; vertices[7] = y1;
+}
+
+__global__ void CanonicalizePackedAssembly(scalar_detail::DeviceView view)
+{
+  if (blockIdx.x != 0 || threadIdx.x != 0) { return; }
+  RecordArchitecture(view);
+  for (int i = 0; i < view.full_unknowns; ++i) { view.full_residual[i] = 0.0; }
+  for (int i = 0; i < 16; ++i) { view.reduction[i] = 0.0; }
+  view.reduction[1] = DBL_MAX; view.reduction[2] = DBL_MAX; view.reduction[3] = DBL_MAX;
+  if (*view.status != scalar_detail::device_success) { return; }
   for (int element = 0; element < view.elements; ++element)
   {
-    double* block_a = view.a + static_cast<std::size_t>(element) * ni * ni;
-    double* block_b = view.b + static_cast<std::size_t>(element) * ni * nt;
-    double* block_c = view.c + static_cast<std::size_t>(element) * nt * ni;
-    double* block_d = view.d + static_cast<std::size_t>(element) * nt * nt;
-    double* local_r = view.local_residual + element * ni;
-    double* trace_r = view.trace_residual + element * nt;
-    for (int qpoint = 0; qpoint < view.volume_quadrature_points; ++qpoint)
+    const auto status = static_cast<packed_algebra::Status>(view.packed_status[element]);
+    if (status != packed_algebra::Status::success)
     {
-      const int qindex = element * view.volume_quadrature_points + qpoint;
-      const double* shape = view.volume_shape + qindex * ns;
-      const double* derivative =
-          view.volume_derivative + qindex * ns * scalar::dimension;
-      double conservative[4]{};
-      double previous[4]{};
-      double conservative_derivative[4][2]{};
-      for (int component = 0; component < 4; ++component)
-      {
-        conservative[component] = EvaluateInterior(
-            current_state, element, component, shape);
-        previous[component] = EvaluateInterior(
-            old_state, element, component, shape);
-        for (int direction = 0; direction < 2; ++direction)
-        {
-          conservative_derivative[component][direction] = EvaluateDerivative(
-              current_state, element, component, derivative, direction);
-        }
-      }
-      if (!FiniteConservativeState(conservative) ||
-          !FiniteConservativeState(previous))
-      {
-        *view.status |= scalar_detail::device_nonfinite;
-        return;
-      }
-      if (!Admissible(conservative) || !Admissible(previous))
-      {
-        *view.status |= scalar_detail::device_admissibility;
-        return;
-      }
-      const double sigma = EvaluateInterior(
-          current_state, element, 4, shape);
-      const double z[2]{EvaluateInterior(current_state, element, 5, shape),
-                        EvaluateInterior(current_state, element, 6, shape)};
-      double flux[2][4]{};
-      double flux_jacobian[2][4][5]{};
-      const double nx[2]{1.0, 0.0};
-      const double ny[2]{0.0, 1.0};
-      if (!EulerSigmaFlux(conservative, sigma, nx, flux[0],
-                          flux_jacobian[0]) ||
-          !EulerSigmaFlux(conservative, sigma, ny, flux[1],
-                          flux_jacobian[1]))
-      {
-        *view.status |= scalar_detail::device_nonfinite;
-        return;
-      }
-      const double rho = conservative[0];
-      const double mx = conservative[1];
-      const double my = conservative[2];
-      double velocity_gradient[2][2]{};
-      for (int direction = 0; direction < 2; ++direction)
-      {
-        velocity_gradient[0][direction] =
-            conservative_derivative[1][direction] / rho -
-            mx * conservative_derivative[0][direction] / (rho * rho);
-        velocity_gradient[1][direction] =
-            conservative_derivative[2][direction] / rho -
-            my * conservative_derivative[0][direction] / (rho * rho);
-      }
-      const double trace_gradient =
-          velocity_gradient[0][0] + velocity_gradient[1][1];
-      const double invariant =
-          velocity_gradient[0][0] * velocity_gradient[0][0] +
-          2.0 * velocity_gradient[0][1] * velocity_gradient[1][0] +
-          velocity_gradient[1][1] * velocity_gradient[1][1] +
-          trace_gradient * trace_gradient;
-      double dq_dgradient[2][2]{};
-      for (int velocity = 0; velocity < 2; ++velocity)
-        for (int direction = 0; direction < 2; ++direction)
-        {
-          dq_dgradient[velocity][direction] =
-              2.0 * velocity_gradient[direction][velocity] +
-              (velocity == direction ? 2.0 * trace_gradient : 0.0);
-        }
-      const double weight = view.volume_weight[qindex];
-      if (!DeviceFinite(weight) || !(weight > 0.0))
-      {
-        *view.status |= scalar_detail::device_nonfinite;
-        return;
-      }
-      for (int row_scalar = 0; row_scalar < ns; ++row_scalar)
-      {
-        for (int equation = 0; equation < 4; ++equation)
-        {
-          const int row = LocalIndex(equation, row_scalar);
-          local_r[row] += weight *
-              (shape[row_scalar] *
-                   (conservative[equation] - previous[equation]) / view.dt -
-               derivative[row_scalar * 2] * flux[0][equation] -
-               derivative[row_scalar * 2 + 1] * flux[1][equation]);
-          for (int column_scalar = 0; column_scalar < ns; ++column_scalar)
-            for (int variable = 0; variable < 5; ++variable)
-            {
-              const int column = LocalIndex(variable, column_scalar);
-              double value = variable == equation ?
-                  shape[row_scalar] * shape[column_scalar] / view.dt : 0.0;
-              value -= derivative[row_scalar * 2] *
-                  flux_jacobian[0][equation][variable] *
-                  shape[column_scalar];
-              value -= derivative[row_scalar * 2 + 1] *
-                  flux_jacobian[1][equation][variable] *
-                  shape[column_scalar];
-              block_a[row * ni + column] += weight * value;
-            }
-        }
-        for (int direction = 0; direction < 2; ++direction)
-        {
-          const int row = LocalIndex(4 + direction, row_scalar);
-          local_r[row] += weight *
-              (shape[row_scalar] * rho * z[direction] +
-               derivative[row_scalar * 2 + direction] * sigma);
-          for (int column_scalar = 0; column_scalar < ns; ++column_scalar)
-          {
-            block_a[row * ni + LocalIndex(0, column_scalar)] +=
-                weight * shape[row_scalar] * z[direction] *
-                shape[column_scalar];
-            block_a[row * ni + LocalIndex(4, column_scalar)] +=
-                weight * derivative[row_scalar * 2 + direction] *
-                shape[column_scalar];
-            block_a[row * ni + LocalIndex(5 + direction, column_scalar)] +=
-                weight * shape[row_scalar] * rho * shape[column_scalar];
-          }
-        }
-        const int row_sigma = LocalIndex(6, row_scalar);
-        local_r[row_sigma] += weight *
-            (shape[row_scalar] * sigma / rho +
-             alpha_value * derivative[row_scalar * 2] * z[0] +
-             alpha_value * derivative[row_scalar * 2 + 1] * z[1] -
-             alpha_value * shape[row_scalar] * invariant);
-        for (int column_scalar = 0; column_scalar < ns; ++column_scalar)
-        {
-          block_a[row_sigma * ni + LocalIndex(4, column_scalar)] +=
-              weight * shape[row_scalar] * shape[column_scalar] / rho;
-          for (int direction = 0; direction < 2; ++direction)
-          {
-            block_a[row_sigma * ni +
-                    LocalIndex(5 + direction, column_scalar)] +=
-                alpha_value * weight *
-                derivative[row_scalar * 2 + direction] *
-                shape[column_scalar];
-          }
-          for (int variable = 0; variable < 4; ++variable)
-          {
-            double dq = 0.0;
-            if (variable < 3)
-            {
-              for (int velocity = 0; velocity < 2; ++velocity)
-                for (int direction = 0; direction < 2; ++direction)
-                {
-                  const double delta_rho =
-                      variable == 0 ? shape[column_scalar] : 0.0;
-                  const double delta_drho = variable == 0 ?
-                      derivative[column_scalar * 2 + direction] : 0.0;
-                  const double delta_m = variable == 1 + velocity ?
-                      shape[column_scalar] : 0.0;
-                  const double delta_dm = variable == 1 + velocity ?
-                      derivative[column_scalar * 2 + direction] : 0.0;
-                  const double momentum = velocity == 0 ? mx : my;
-                  const double momentum_derivative =
-                      conservative_derivative[1 + velocity][direction];
-                  const double rho_derivative =
-                      conservative_derivative[0][direction];
-                  const double delta_gradient =
-                      delta_dm / rho -
-                      momentum_derivative * delta_rho / (rho * rho) -
-                      delta_m * rho_derivative / (rho * rho) -
-                      momentum * delta_drho / (rho * rho) +
-                      2.0 * momentum * rho_derivative * delta_rho /
-                          (rho * rho * rho);
-                  dq += dq_dgradient[velocity][direction] * delta_gradient;
-                }
-            }
-            double value = -alpha_value * shape[row_scalar] * dq;
-            if (variable == 0)
-            {
-              value -= shape[row_scalar] * sigma * shape[column_scalar] /
-                  (rho * rho);
-            }
-            block_a[row_sigma * ni + LocalIndex(variable, column_scalar)] +=
-                weight * value;
-          }
-        }
-      }
+      *view.status |= status == packed_algebra::Status::inadmissible_state ?
+          scalar_detail::device_admissibility :
+          (status == packed_algebra::Status::nonfinite_result ?
+              scalar_detail::device_nonfinite : scalar_detail::device_invalid_layout);
+      return;
     }
-
-    for (int local_face = 0; local_face < 4; ++local_face)
-      for (int qpoint = 0; qpoint < view.face_quadrature_points; ++qpoint)
-      {
-        const int qindex =
-            (element * 4 + local_face) * view.face_quadrature_points + qpoint;
-        const double* interior_shape =
-            view.face_interior_shape + qindex * ns;
-        const double* oriented_shape =
-            view.face_oriented_shape + qindex * face_nodes;
-        const double* normal = view.face_normal + qindex * 2;
-        double conservative[4]{};
-        double previous[4]{};
-        double trace_state[4]{};
-        double previous_trace[4]{};
-        for (int component = 0; component < 4; ++component)
-        {
-          conservative[component] = EvaluateInterior(
-              current_state, element, component, interior_shape);
-          previous[component] = EvaluateInterior(
-              old_state, element, component, interior_shape);
-          for (int a = 0; a < face_nodes; ++a)
-          {
-            const int local_row = TraceIndex(
-                component, local_face * face_nodes + a);
-            trace_state[component] += TraceValue(
-                view, current_trace, element, local_row) * oriented_shape[a];
-            previous_trace[component] += TraceValue(
-                view, old_trace, element, local_row) * oriented_shape[a];
-          }
-        }
-        if (!FiniteConservativeState(conservative) ||
-            !FiniteConservativeState(previous) ||
-            !FiniteConservativeState(trace_state) ||
-            !FiniteConservativeState(previous_trace))
-        {
-          *view.status |= scalar_detail::device_nonfinite;
-          return;
-        }
-        if (!Admissible(conservative) || !Admissible(previous) ||
-            !Admissible(trace_state) || !Admissible(previous_trace))
-        {
-          *view.status |= scalar_detail::device_admissibility;
-          return;
-        }
-        const double sigma = EvaluateInterior(
-            current_state, element, 4, interior_shape);
-        const double z[2]{
-            EvaluateInterior(current_state, element, 5, interior_shape),
-            EvaluateInterior(current_state, element, 6, interior_shape)};
-        double sigmahat = 0.0;
-        for (int a = 0; a < face_nodes; ++a)
-        {
-          sigmahat += TraceValue(view, current_trace, element,
-              TraceIndex(4, local_face * face_nodes + a)) * oriented_shape[a];
-        }
-        double physical_flux[4]{};
-        double physical_jacobian[4][5]{};
-        if (!EulerSigmaFlux(trace_state, sigmahat, normal, physical_flux,
-                            physical_jacobian))
-        {
-          *view.status |= scalar_detail::device_nonfinite;
-          return;
-        }
-        double numerical_flux[4]{};
-        for (int equation = 0; equation < 4; ++equation)
-        {
-          numerical_flux[equation] = physical_flux[equation] +
-              state_tau * (conservative[equation] - trace_state[equation]);
-        }
-        const double rhohat = trace_state[0];
-        const double tau = 4.0 /
-            (rhohat * view.face_height[element * 4 + local_face]);
-        const double jump = sigma - sigmahat;
-        const double auxiliary_flux = z[0] * normal[0] + z[1] * normal[1] -
-            tau * jump;
-        const double weight = view.face_weight[qindex];
-        if (!(tau > 0.0) || !DeviceFinite(tau) || !DeviceFinite(weight) ||
-            !(weight > 0.0))
-        {
-          *view.status |= scalar_detail::device_nonfinite;
-          return;
-        }
-        for (int row_scalar = 0; row_scalar < ns; ++row_scalar)
-        {
-          for (int equation = 0; equation < 4; ++equation)
-          {
-            const int row = LocalIndex(equation, row_scalar);
-            local_r[row] += weight * interior_shape[row_scalar] *
-                numerical_flux[equation];
-            for (int column_scalar = 0; column_scalar < ns; ++column_scalar)
-            {
-              block_a[row * ni + LocalIndex(equation, column_scalar)] +=
-                  weight * interior_shape[row_scalar] * state_tau *
-                  interior_shape[column_scalar];
-            }
-            for (int trace_variable = 0; trace_variable < 5;
-                 ++trace_variable)
-              for (int column_scalar = 0; column_scalar < face_nodes;
-                   ++column_scalar)
-              {
-                const int column = TraceIndex(
-                    trace_variable, local_face * face_nodes + column_scalar);
-                const double derivative_value =
-                    physical_jacobian[equation][trace_variable] -
-                    (trace_variable == equation ? state_tau : 0.0);
-                block_b[row * nt + column] += weight *
-                    interior_shape[row_scalar] * derivative_value *
-                    oriented_shape[column_scalar];
-              }
-          }
-          for (int direction = 0; direction < 2; ++direction)
-          {
-            const int row = LocalIndex(4 + direction, row_scalar);
-            local_r[row] -= weight * interior_shape[row_scalar] *
-                normal[direction] * sigmahat;
-            for (int column_scalar = 0; column_scalar < face_nodes;
-                 ++column_scalar)
-            {
-              const int column = TraceIndex(
-                  4, local_face * face_nodes + column_scalar);
-              block_b[row * nt + column] -= weight *
-                  interior_shape[row_scalar] * normal[direction] *
-                  oriented_shape[column_scalar];
-            }
-          }
-          const int row_sigma = LocalIndex(6, row_scalar);
-          local_r[row_sigma] -= alpha_value * weight *
-              interior_shape[row_scalar] * auxiliary_flux;
-          for (int column_scalar = 0; column_scalar < ns; ++column_scalar)
-          {
-            block_a[row_sigma * ni + LocalIndex(4, column_scalar)] +=
-                alpha_value * weight * interior_shape[row_scalar] * tau *
-                interior_shape[column_scalar];
-            for (int direction = 0; direction < 2; ++direction)
-            {
-              block_a[row_sigma * ni +
-                      LocalIndex(5 + direction, column_scalar)] -=
-                  alpha_value * weight * interior_shape[row_scalar] *
-                  normal[direction] * interior_shape[column_scalar];
-            }
-          }
-          for (int column_scalar = 0; column_scalar < face_nodes;
-               ++column_scalar)
-          {
-            block_b[row_sigma * nt + TraceIndex(
-                4, local_face * face_nodes + column_scalar)] -=
-                alpha_value * weight * interior_shape[row_scalar] * tau *
-                oriented_shape[column_scalar];
-            block_b[row_sigma * nt + TraceIndex(
-                0, local_face * face_nodes + column_scalar)] -=
-                alpha_value * weight * interior_shape[row_scalar] * tau *
-                jump / rhohat * oriented_shape[column_scalar];
-          }
-        }
-        for (int row_component = 0; row_component < 5; ++row_component)
-          for (int row_scalar = 0; row_scalar < face_nodes; ++row_scalar)
-          {
-            const int row = TraceIndex(
-                row_component, local_face * face_nodes + row_scalar);
-            if (row_component < 4)
-            {
-              trace_r[row] += weight * oriented_shape[row_scalar] *
-                  numerical_flux[row_component];
-              for (int column_scalar = 0; column_scalar < ns;
-                   ++column_scalar)
-              {
-                block_c[row * ni +
-                        LocalIndex(row_component, column_scalar)] +=
-                    weight * oriented_shape[row_scalar] * state_tau *
-                    interior_shape[column_scalar];
-              }
-              for (int trace_variable = 0; trace_variable < 5;
-                   ++trace_variable)
-                for (int column_scalar = 0; column_scalar < face_nodes;
-                     ++column_scalar)
-                {
-                  const int column = TraceIndex(
-                      trace_variable, local_face * face_nodes + column_scalar);
-                  const double derivative_value =
-                      physical_jacobian[row_component][trace_variable] -
-                      (trace_variable == row_component ? state_tau : 0.0);
-                  block_d[row * nt + column] += weight *
-                      oriented_shape[row_scalar] * derivative_value *
-                      oriented_shape[column_scalar];
-                }
-            }
-            else
-            {
-              trace_r[row] += alpha_value * weight *
-                  oriented_shape[row_scalar] * auxiliary_flux;
-              for (int column_scalar = 0; column_scalar < ns;
-                   ++column_scalar)
-              {
-                block_c[row * ni + LocalIndex(4, column_scalar)] -=
-                    alpha_value * weight * oriented_shape[row_scalar] * tau *
-                    interior_shape[column_scalar];
-                for (int direction = 0; direction < 2; ++direction)
-                {
-                  block_c[row * ni +
-                          LocalIndex(5 + direction, column_scalar)] +=
-                      alpha_value * weight * oriented_shape[row_scalar] *
-                      normal[direction] * interior_shape[column_scalar];
-                }
-              }
-              for (int column_scalar = 0; column_scalar < face_nodes;
-                   ++column_scalar)
-              {
-                block_d[row * nt + TraceIndex(
-                    4, local_face * face_nodes + column_scalar)] +=
-                    alpha_value * weight * oriented_shape[row_scalar] * tau *
-                    oriented_shape[column_scalar];
-                block_d[row * nt + TraceIndex(
-                    0, local_face * face_nodes + column_scalar)] +=
-                    alpha_value * weight * oriented_shape[row_scalar] * tau *
-                    jump / rhohat * oriented_shape[column_scalar];
-              }
-            }
-          }
-      }
-
-    const int local_base = element * ni;
-    for (int row = 0; row < ni; ++row)
-    {
-      view.full_residual[local_base + row] = local_r[row];
-      for (int column = 0;
-           view.assemble_dense_jacobian != 0 && column < ni; ++column)
-      {
-        view.full_jacobian[
-            static_cast<std::size_t>(local_base + row) * view.full_unknowns +
-            local_base + column] = block_a[row * ni + column];
-      }
-      for (int column = 0; column < nt; ++column)
-      {
-        const int map = element * nt + column;
-        const int true_column = global_interior +
-            view.local_trace_to_true[map];
-        if (view.assemble_dense_jacobian != 0)
-        {
-          view.full_jacobian[
-              static_cast<std::size_t>(local_base + row) *
-                  view.full_unknowns + true_column] +=
-              static_cast<double>(view.local_trace_sign[map]) *
-              block_b[row * nt + column];
-        }
-      }
-    }
-    for (int row = 0; row < nt; ++row)
-    {
-      const int row_map = element * nt + row;
-      const int true_row = global_interior +
-          view.local_trace_to_true[row_map];
-      const double row_sign =
-          static_cast<double>(view.local_trace_sign[row_map]);
-      view.full_residual[true_row] += row_sign * trace_r[row];
-      for (int column = 0;
-           view.assemble_dense_jacobian != 0 && column < ni; ++column)
-      {
-        view.full_jacobian[
-            static_cast<std::size_t>(true_row) * view.full_unknowns +
-            local_base + column] += row_sign * block_c[row * ni + column];
-      }
-      for (int column = 0; column < nt; ++column)
-      {
-        const int column_map = element * nt + column;
-        const int true_column = global_interior +
-            view.local_trace_to_true[column_map];
-        if (view.assemble_dense_jacobian != 0)
-        {
-          view.full_jacobian[
-              static_cast<std::size_t>(true_row) * view.full_unknowns +
-              true_column] += row_sign *
-              static_cast<double>(view.local_trace_sign[column_map]) *
-              block_d[row * nt + column];
-        }
-      }
-    }
-  }
-  view.reduction[0] = VectorNorm(view.full_residual, view.full_unknowns);
-  double auxiliary_residual_squared = 0.0;
-  for (int element = 0; element < view.elements; ++element)
-  {
-    const int local_base = element * ni;
-    for (int row = 4 * ns; row < ni; ++row)
-    {
-      const double residual = view.full_residual[local_base + row];
-      auxiliary_residual_squared += residual * residual;
-    }
-  }
-  const int auxiliary_trace_begin = global_interior +
-      scalar::state_components * view.scalar_true_trace_nodes;
-  for (int row = auxiliary_trace_begin; row < view.full_unknowns; ++row)
-  {
-    const double residual = view.full_residual[row];
-    auxiliary_residual_squared += residual * residual;
-  }
-  view.reduction[5] = sqrt(auxiliary_residual_squared);
-  if (!DeviceFinite(view.reduction[0]) || !DeviceFinite(view.reduction[5]))
-  {
-    *view.status |= scalar_detail::device_nonfinite;
+    const std::size_t local_base = static_cast<std::size_t>(element) * ni;
+    const std::size_t trace_base = static_cast<std::size_t>(element) * nt;
+    for (int i = 0; i < ni; ++i) view.local_residual[local_base + i] = -view.packed_f[local_base + i];
+    for (int i = 0; i < nt; ++i) view.trace_residual[trace_base + i] = -view.packed_g[trace_base + i];
   }
 }
 
@@ -2093,7 +1697,9 @@ extern "C" __global__ void HdgSc25Rank2AssembleLocalFp64Kernel(
   }
   else if (operation == scalar_detail::KernelOperation::assemble)
   {
-    AssembleSystem(view);
+    // Assembly is host-routed through the packed borrowing ABI. Rejecting a
+    // direct request keeps rank-two from acquiring a second numerical path.
+    *view.status |= scalar_detail::device_invalid_layout;
   }
   else if (operation == scalar_detail::KernelOperation::auxiliary_identity_rows)
   {
@@ -2446,6 +2052,9 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
   std::vector<double> projection_face_oriented_shape;
   std::vector<double> projection_face_x;
   std::vector<double> trace_node_coordinate;
+  std::vector<packed_algebra::Parameters> packed_parameters;
+  std::vector<double> packed_volume_xyw;
+  std::vector<double> packed_segment_xw;
 
   void* double_arena = nullptr;
   void* integer_arena = nullptr;
@@ -3291,6 +2900,15 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
 
   bool BindPersistentArenas() noexcept
   {
+    const auto& packed_plan =
+        dg::hdg::runtime::cuda::traced_scalar_igr_p1_private_numerics::
+            ReferencePlan();
+    packed_parameters.assign(static_cast<std::size_t>(elements),
+        {gamma_value, alpha_value, state_tau, time_step(), 1.0e-8});
+    packed_volume_xyw.assign(packed_plan.volume_xyw.begin(),
+                             packed_plan.volume_xyw.end());
+    packed_segment_xw.assign(packed_plan.segment_xw.begin(),
+                             packed_plan.segment_xw.end());
     topology_reference_hash = HashArrays(
         local_trace_to_true, local_trace_sign, local_trace_owner,
         matrix_owned_source, matrix_owned_section, matrix_owned_target,
@@ -3343,6 +2961,18 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     reserve_double(vector_send_host.size());
     reserve_double(vector_receive_host.size());
     reserve_double(10 * 32 / sizeof(double));
+    reserve_double(element_count * 8);
+    reserve_double(element_count * packed_algebra::interior_unknowns);
+    reserve_double(element_count * packed_algebra::interior_unknowns);
+    reserve_double(element_count * packed_algebra::trace_unknowns);
+    reserve_double(element_count * packed_algebra::trace_unknowns);
+    reserve_double(element_count * packed_algebra::interior_unknowns);
+    reserve_double(element_count * packed_algebra::trace_unknowns);
+    reserve_double((element_count + sizeof(double) - 1) / sizeof(double));
+    reserve_double(packed_volume_xyw.size());
+    reserve_double(packed_segment_xw.size());
+    reserve_double(packed_parameters.size() *
+                   sizeof(packed_algebra::Parameters) / sizeof(double));
     std::size_t quadrature_double_count = 0;
     const auto reserve_vector = [&](const auto& values)
     {
@@ -3505,6 +3135,20 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     view.remote_vector_receive = take_double(vector_receive_host.size());
     view.state_hash_bytes = reinterpret_cast<std::uint8_t*>(
         take_double(10 * 32 / sizeof(double)));
+    view.packed_vertices = take_double(element_count * 8);
+    view.packed_parameters = reinterpret_cast<packed_algebra::Parameters*>(
+        take_double(packed_parameters.size() *
+                    sizeof(packed_algebra::Parameters) / sizeof(double)));
+    view.packed_interior = take_double(element_count * packed_algebra::interior_unknowns);
+    view.packed_previous_interior = take_double(element_count * packed_algebra::interior_unknowns);
+    view.packed_trace = take_double(element_count * packed_algebra::trace_unknowns);
+    view.packed_previous_trace = take_double(element_count * packed_algebra::trace_unknowns);
+    view.packed_f = take_double(element_count * packed_algebra::interior_unknowns);
+    view.packed_g = take_double(element_count * packed_algebra::trace_unknowns);
+    view.packed_status = reinterpret_cast<std::uint8_t*>(
+        take_double((element_count + sizeof(double) - 1) / sizeof(double)));
+    view.packed_volume_xyw = take_double(packed_volume_xyw.size());
+    view.packed_segment_xw = take_double(packed_segment_xw.size());
     view.volume_weight = take_double(volume_weight.size());
     view.volume_shape = take_double(volume_shape.size());
     view.volume_derivative = take_double(volume_derivative.size());
@@ -3636,6 +3280,12 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     upload(view.projection_face_x, projection_face_x,
            cuda_w8a::CudaTransferSite::quadrature_upload);
     upload(view.trace_node_coordinate, trace_node_coordinate,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.packed_parameters, packed_parameters,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.packed_volume_xyw, packed_volume_xyw,
+           cuda_w8a::CudaTransferSite::quadrature_upload);
+    upload(view.packed_segment_xw, packed_segment_xw,
            cuda_w8a::CudaTransferSite::quadrature_upload);
     const bool uploads_synchronized =
         cuda_w8a::CudaTransportPolicy::Synchronize(
@@ -3820,9 +3470,37 @@ struct PersistentSc25ScalarIgrCudaRank2::Implementation final
     view.operation = static_cast<int>(operation);
     const bool prepared = PrepareKernelStatus(phase);
     if (!CollectiveAll(communicator.value, prepared)) { return false; }
-    HdgSc25Rank2AssembleLocalFp64Kernel<<<1, 1>>>(view);
+    bool kernel_launched = false;
+    if (operation == detail::KernelOperation::assemble)
+    {
+      constexpr unsigned int threads = 128;
+      const unsigned int blocks =
+          (static_cast<unsigned int>(view.elements) + threads - 1) / threads;
+      PackSc25ForPackedAlgebra<<<blocks, threads>>>(view);
+      kernel_launched = cudaGetLastError() == cudaSuccess;
+      const packed::BatchInput input{
+          view.elements, view.packed_vertices, view.packed_parameters,
+          view.packed_interior, view.packed_previous_interior,
+          view.packed_trace, view.packed_previous_trace, nullptr, nullptr,
+          view.packed_volume_xyw, 4, view.packed_segment_xw, 2};
+      const packed::BatchOutput output{
+          reinterpret_cast<packed_algebra::Status*>(view.packed_status),
+          view.local_residual, view.trace_residual, view.a, view.b, view.c,
+          view.d, view.packed_f, view.packed_g};
+      kernel_launched = packed::Launch(input, output) == cudaSuccess &&
+          kernel_launched;
+      if (kernel_launched)
+      {
+        CanonicalizePackedAssembly<<<1, 1>>>(view);
+        kernel_launched = cudaGetLastError() == cudaSuccess;
+      }
+    }
+    else
+    {
+      HdgSc25Rank2AssembleLocalFp64Kernel<<<1, 1>>>(view);
+      kernel_launched = cudaGetLastError() == cudaSuccess;
+    }
     ++evidence.launches.assemble_launches;
-    const bool kernel_launched = cudaGetLastError() == cudaSuccess;
     const bool status_read = ReadKernelStatus();
     if (!ReconcileKernelOutcome(kernel_launched && status_read)) return false;
     if (operation == detail::KernelOperation::assemble)
