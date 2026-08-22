@@ -2043,23 +2043,27 @@ struct detail::CpuNumericsCore::Implementation
   {
     maximum_error = 0.0;
     maximum_relative_error = 0.0;
-    if (!ValidIgrSlot(previous) || !ValidIgrSlot(current) ||
-        !external_source || !Finite(dt) || !(dt > 0.0) ||
-        igr_component_integral_weights.size() !=
-            static_cast<std::size_t>(current.interior.Size())) return false;
+    const bool structural_ready = ValidIgrSlot(previous) &&
+        ValidIgrSlot(current) && external_source && Finite(dt) && dt > 0.0 &&
+        igr_component_integral_weights.size() ==
+            static_cast<std::size_t>(current.interior.Size());
+    if (!CollectiveAll(structural_ready)) return false;
     const int private_scalar = current.interior.Size() / 7;
     const int public_scalar = external_source->Size() / 4;
-    if (private_scalar <= 0 || public_scalar <= 0 ||
-        static_cast<std::size_t>(4 * private_scalar) >
-            igr_component_integral_weights.size() ||
-        igr_public_interior_to_private.size() !=
-            static_cast<std::size_t>(external_source->Size())) return false;
+    const bool layout_ready = private_scalar > 0 && public_scalar > 0 &&
+        static_cast<std::size_t>(4 * private_scalar) <=
+            igr_component_integral_weights.size() &&
+        igr_public_interior_to_private.size() ==
+            static_cast<std::size_t>(external_source->Size());
+    if (!CollectiveAll(layout_ready)) return false;
     const double* const old_values = previous.interior.HostRead();
     const double* const new_values = current.interior.HostRead();
     const double* const source_values = external_source->HostRead();
-    if (!old_values || !new_values || !source_values) return false;
+    if (!CollectiveAll(old_values != nullptr && new_values != nullptr &&
+                       source_values != nullptr)) return false;
     std::array<double, 12> local{};
     std::array<double, 12> global{};
+    bool local_valid = true;
     for (int component = 0; component < 4; ++component)
     {
       for (int scalar = 0; scalar < private_scalar; ++scalar)
@@ -2074,16 +2078,23 @@ struct detail::CpuNumericsCore::Implementation
         const std::size_t public_index =
             static_cast<std::size_t>(component * public_scalar + scalar);
         const int private_index = igr_public_interior_to_private[public_index];
-        if (private_index < 0 || private_index >= current.interior.Size()) return false;
-        local[static_cast<std::size_t>(8 + component)] +=
-            igr_component_integral_weights[static_cast<std::size_t>(private_index)] *
-            source_values[public_index];
+        if (private_index < 0 || private_index >= current.interior.Size())
+        {
+          local_valid = false;
+        }
+        else
+        {
+          local[static_cast<std::size_t>(8 + component)] +=
+              igr_component_integral_weights[static_cast<std::size_t>(private_index)] *
+              source_values[public_index];
+        }
       }
     }
-    if (!Finite(local) || MPI_Allreduce(local.data(), global.data(),
-                                        static_cast<int>(global.size()),
-                                        MPI_DOUBLE, MPI_SUM, communicator) != MPI_SUCCESS ||
-        !Finite(global)) return false;
+    if (!CollectiveAll(local_valid && Finite(local))) return false;
+    const bool reduced = MPI_Allreduce(local.data(), global.data(),
+                                       static_cast<int>(global.size()),
+                                       MPI_DOUBLE, MPI_SUM, communicator) == MPI_SUCCESS;
+    if (!CollectiveAll(reduced && Finite(global))) return false;
     for (int component = 0; component < 4; ++component)
     {
       const double old_integral = global[static_cast<std::size_t>(component)];
