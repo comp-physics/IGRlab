@@ -237,6 +237,11 @@ struct CpuAttemptEvidence
   double initial_nonlinear_residual = 0.0;
   double final_nonlinear_residual = 0.0;
   double maximum_true_relative_residual = 0.0;
+  // Periodic IGR attempts publish only after the conservative p1 update is
+  // balanced against the integrated static source over the accepted step.
+  // These are compact terminal scalars, not per-iteration history.
+  double maximum_conservation_error = 0.0;
+  double maximum_conservation_relative_error = 0.0;
   double minimum_density = 0.0;
   double minimum_pressure = 0.0;
   double maximum_wave_speed = 0.0;
@@ -254,6 +259,7 @@ struct CpuAttemptEvidence
   bool recovery_gate = false;
   bool nonlinear_gate = false;
   bool true_residual_gate = false;
+  bool conservation_gate = false;
   bool rollback_byte_equal = false;
   bool committed = false;
 };

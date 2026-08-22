@@ -1747,6 +1747,10 @@ struct detail::CpuNumericsCore::Implementation
   std::vector<double> igr_public_interior_sign;
   std::vector<int> igr_public_trace_to_private;
   std::vector<double> igr_public_trace_sign;
+  // Exact p1 L2 component weights on the validated affine mesh.  They are
+  // constructed with the layout once and make the periodic source-balance
+  // gate allocation-free during a prepared attempt.
+  std::vector<double> igr_component_integral_weights;
   StateHash igr_committed_hash{};
   StateHash igr_candidate_hash{};
   StateHash igr_candidate_public_hash{};
@@ -1984,6 +1988,35 @@ struct detail::CpuNumericsCore::Implementation
       for (int component = 0; component < 4; ++component)
         for (int scalar = 0; scalar < private_trace_scalar; ++scalar)
           if (trace_covered[static_cast<std::size_t>(component * private_trace_scalar + scalar)] != 1) return false;
+
+      igr_component_integral_weights.assign(
+          static_cast<std::size_t>(private_interior->GetVSize()), 0.0);
+      for (int element = 0; element < mesh->GetNE(); ++element)
+      {
+        mfem::Array<int> vdofs;
+        private_interior->GetElementVDofs(element, vdofs);
+        if (vdofs.Size() != 28) return false;
+        const auto& quad = igr_affine_quads[static_cast<std::size_t>(element)].vertices;
+        const double measure = (quad[1][0] - quad[0][0]) *
+                                   (quad[3][1] - quad[0][1]) -
+                               (quad[1][1] - quad[0][1]) *
+                                   (quad[3][0] - quad[0][0]);
+        if (!(measure > 0.0) || !Finite(measure)) return false;
+        // The p1 Gauss-Legendre tensor basis integrates to 1/4 per scalar
+        // element dof on [0,1]^2.  Only U's first four components enter the
+        // Euler conservation balance; the private IGR auxiliaries do not.
+        for (int component = 0; component < 4; ++component)
+          for (int scalar = 0; scalar < 4; ++scalar)
+          {
+            double sign = 1.0;
+            const int index = mfem::FiniteElementSpace::DecodeDof(
+                vdofs[component * 4 + scalar], sign);
+            if (index < 0 || index >= private_interior->GetVSize()) return false;
+            igr_component_integral_weights[static_cast<std::size_t>(index)] +=
+                sign * 0.25 * measure;
+          }
+      }
+      if (!Finite(igr_component_integral_weights)) return false;
     }
     catch (...) { return false; }
     return true;
@@ -2022,11 +2055,79 @@ struct detail::CpuNumericsCore::Implementation
     catch (...) { return false; }
   }
 
+  bool IgrSourceBalancedConservation(const IgrSlot& previous,
+                                     const IgrSlot& current,
+                                     const double dt,
+                                     double& maximum_error,
+                                     double& maximum_relative_error) const noexcept
+  {
+    maximum_error = 0.0;
+    maximum_relative_error = 0.0;
+    if (!ValidIgrSlot(previous) || !ValidIgrSlot(current) ||
+        !external_source || !Finite(dt) || !(dt > 0.0) ||
+        igr_component_integral_weights.size() !=
+            static_cast<std::size_t>(current.interior.Size())) return false;
+    const int private_scalar = current.interior.Size() / 7;
+    const int public_scalar = external_source->Size() / 4;
+    if (private_scalar <= 0 || public_scalar <= 0 ||
+        static_cast<std::size_t>(4 * private_scalar) >
+            igr_component_integral_weights.size() ||
+        igr_public_interior_to_private.size() !=
+            static_cast<std::size_t>(external_source->Size())) return false;
+    const double* const old_values = previous.interior.HostRead();
+    const double* const new_values = current.interior.HostRead();
+    const double* const source_values = external_source->HostRead();
+    if (!old_values || !new_values || !source_values) return false;
+    std::array<double, 12> local{};
+    std::array<double, 12> global{};
+    for (int component = 0; component < 4; ++component)
+    {
+      for (int scalar = 0; scalar < private_scalar; ++scalar)
+      {
+        const std::size_t index = static_cast<std::size_t>(component * private_scalar + scalar);
+        const double weight = igr_component_integral_weights[index];
+        local[static_cast<std::size_t>(component)] += weight * old_values[index];
+        local[static_cast<std::size_t>(4 + component)] += weight * new_values[index];
+      }
+      for (int scalar = 0; scalar < public_scalar; ++scalar)
+      {
+        const std::size_t public_index =
+            static_cast<std::size_t>(component * public_scalar + scalar);
+        const int private_index = igr_public_interior_to_private[public_index];
+        if (private_index < 0 || private_index >= current.interior.Size()) return false;
+        local[static_cast<std::size_t>(8 + component)] +=
+            igr_component_integral_weights[static_cast<std::size_t>(private_index)] *
+            source_values[public_index];
+      }
+    }
+    if (!Finite(local) || MPI_Allreduce(local.data(), global.data(),
+                                        static_cast<int>(global.size()),
+                                        MPI_DOUBLE, MPI_SUM, communicator) != MPI_SUCCESS ||
+        !Finite(global)) return false;
+    for (int component = 0; component < 4; ++component)
+    {
+      const double old_integral = global[static_cast<std::size_t>(component)];
+      const double new_integral = global[static_cast<std::size_t>(4 + component)];
+      const double source_integral = global[static_cast<std::size_t>(8 + component)];
+      const double balance = new_integral - old_integral - dt * source_integral;
+      const double scale = 1.0 + std::abs(old_integral) + std::abs(new_integral) +
+          std::abs(dt * source_integral);
+      if (!Finite(balance) || !Finite(scale) || !(scale > 0.0)) return false;
+      maximum_error = std::max(maximum_error, std::abs(balance));
+      maximum_relative_error = std::max(maximum_relative_error,
+                                        std::abs(balance) / scale);
+    }
+    return Finite(maximum_error) && Finite(maximum_relative_error);
+  }
+
   CpuNumericalResult ExecuteIgrBorrowedStep(
       const AttemptIdentity& attempt, const StateCoordinates& coordinates) noexcept
   {
     CpuNumericalResult result{};
     active_evidence = {};
+    active_candidate_generation = 0;
+    active_candidate_state_hash = {};
+    publication_chain_authority = false;
     CpuAttemptEvidence& evidence = active_evidence.attempt;
     evidence.identity = attempt; evidence.entry_coordinates = coordinates;
     evidence.candidate_cursor = attempt.sequence; evidence.rank = rank; evidence.ranks = ranks;
@@ -2042,6 +2143,7 @@ struct detail::CpuNumericsCore::Implementation
       evidence.status = CpuAttemptStatus::runtime_failure; evidence.failure_phase = phase;
       evidence.finite_gate = evidence.admissibility_gate = evidence.recovery_gate = false;
       evidence.nonlinear_gate = evidence.true_residual_gate = false;
+      evidence.conservation_gate = false;
       evidence.transfers.allocation_events = allocations.EventsAfterBaseline();
       result.evidence = evidence; result.gates = {false, false, false, false, true, false};
       result.originating_failure = FailureReason::backend_failure; return result;
@@ -2061,48 +2163,118 @@ struct detail::CpuNumericsCore::Implementation
       input.previous_interior = &IgrCommitted().interior; input.static_euler_rhs_space = interior_space.get();
       input.static_euler_rhs_coefficients = external_source.get(); return input;
     };
-    const auto initial = detail::ComputeTracedScalarIgrP1GlobalStep(
-        input_for(IgrCandidate()), igr_linear_output, *igr_scratch);
-    switch (initial)
+    // The traced-scalar helper owns exactly one refreshed linearization.  Its
+    // caller owns the nonlinear lifecycle: never publish a one-update probe.
+    // Every successful helper call has a rebuilt true trace residual, which
+    // is independently checked before its direction or probe is used.
+    const auto accept_linear_residual =
+        [&](const detail::TracedScalarIgrP1GlobalStepOutput& output,
+            double& maximum_relative) noexcept {
+          const double denominator = std::max(output.reduced_rhs_norm, 1.0e-300);
+          const double relative = output.linear_residual_norm / denominator;
+          const bool valid = Finite(output.initial_residual_norm) &&
+              output.initial_residual_norm >= 0.0 &&
+              Finite(output.reduced_rhs_norm) && output.reduced_rhs_norm >= 0.0 &&
+              Finite(output.linear_residual_norm) && output.linear_residual_norm >= 0.0 &&
+              Finite(relative) && relative <= config.true_residual_tolerance;
+          if (valid) { maximum_relative = std::max(maximum_relative, relative); }
+          return valid;
+        };
+
+    double residual = 0.0;
+    double maximum_true_residual = 0.0;
+    int updates = 0;
+    bool recovered = false;
+    bool have_initial_residual = false;
+    while (updates < config.maximum_newton_updates)
     {
-      case detail::TracedScalarIgrP1GlobalStepResult::success: break;
-      case detail::TracedScalarIgrP1GlobalStepResult::inadmissible_trial:
-      case detail::TracedScalarIgrP1GlobalStepResult::failure:
-        return fail(CpuFailurePhase::assembly);
+      if (have_initial_residual && updates > 0 &&
+          residual <= config.nonlinear_tolerance *
+              (1.0 + evidence.initial_nonlinear_residual))
+      {
+        break;
+      }
+      const auto linearization = detail::ComputeTracedScalarIgrP1GlobalStep(
+          input_for(IgrCandidate()), igr_linear_output, *igr_scratch);
+      if (linearization != detail::TracedScalarIgrP1GlobalStepResult::success ||
+          !CollectiveAll(accept_linear_residual(igr_linear_output,
+                                                maximum_true_residual)))
+      {
+        return fail(CpuFailurePhase::trace_solve);
+      }
+      ++evidence.work.complete_assemblies;
+      ++evidence.work.complete_condensations;
+      ++evidence.work.complete_factor_setups;
+      ++evidence.work.complete_trace_solves;
+      ++evidence.work.complete_recoveries;
+      residual = igr_linear_output.initial_residual_norm;
+      if (!have_initial_residual)
+      {
+        evidence.initial_nonlinear_residual = residual;
+        have_initial_residual = true;
+      }
+
+      bool accepted = false;
+      bool admissible_trial = false;
+      for (int backtrack = 0;
+           backtrack < config.maximum_line_search_trials && !accepted;
+           ++backtrack)
+      {
+        const double scale = std::ldexp(1.0, -backtrack);
+        for (int i = 0; i < igr_trial.interior.Size(); ++i)
+          igr_trial.interior[i] = IgrCandidate().interior[i] +
+              scale * igr_linear_output.interior_increment[i];
+        for (int i = 0; i < igr_trial.true_trace.Size(); ++i)
+          igr_trial.true_trace[i] = IgrCandidate().true_trace[i] +
+              scale * igr_linear_output.trace_increment[i];
+        if (!CollectiveAll(ValidIgrSlot(igr_trial))) { continue; }
+        admissible_trial = true;
+        const auto probe = detail::ComputeTracedScalarIgrP1GlobalStep(
+            input_for(igr_trial), igr_probe_output, *igr_scratch);
+        if (probe == detail::TracedScalarIgrP1GlobalStepResult::inadmissible_trial)
+        {
+          continue;
+        }
+        if (probe != detail::TracedScalarIgrP1GlobalStepResult::success ||
+            !CollectiveAll(accept_linear_residual(igr_probe_output,
+                                                  maximum_true_residual)))
+        {
+          return fail(CpuFailurePhase::trace_solve);
+        }
+        ++evidence.work.complete_assemblies;
+        ++evidence.work.trial_reassemblies;
+        ++evidence.work.complete_condensations;
+        ++evidence.work.complete_factor_setups;
+        ++evidence.work.complete_trace_solves;
+        ++evidence.work.complete_recoveries;
+        const double armijo = (1.0 - config.armijo_constant * scale) * residual;
+        if (igr_probe_output.initial_residual_norm <= armijo)
+        {
+          if (!CollectiveAll(CopyIgrSlot(igr_trial, IgrCandidate())))
+          {
+            return fail(CpuFailurePhase::recovery);
+          }
+          residual = igr_probe_output.initial_residual_norm;
+          accepted = true;
+          evidence.final_line_search_trials = backtrack + 1;
+        }
+      }
+      if (!CollectiveAll(accepted))
+      {
+        return fail(admissible_trial ? CpuFailurePhase::recovery
+                                     : CpuFailurePhase::assembly);
+      }
+      ++updates;
+      ++evidence.work.accepted_newton_updates;
+      recovered = true;
     }
-    double residual = igr_linear_output.initial_residual_norm;
-    if (!CollectiveAll(Finite(residual) && residual >= 0.0)) return fail(CpuFailurePhase::assembly);
-    evidence.initial_nonlinear_residual = residual;
-    bool accepted = false;
-    for (int backtrack = 0;
-         backtrack < config.maximum_line_search_trials && !accepted;
-         ++backtrack)
+    const bool nonlinear_converged = have_initial_residual && updates > 0 &&
+        residual <= config.nonlinear_tolerance *
+            (1.0 + evidence.initial_nonlinear_residual);
+    if (!CollectiveAll(nonlinear_converged && recovered))
     {
-      const double scale = std::ldexp(1.0, -backtrack);
-      for (int i = 0; i < igr_trial.interior.Size(); ++i)
-        igr_trial.interior[i] = IgrCandidate().interior[i] + scale * igr_linear_output.interior_increment[i];
-      for (int i = 0; i < igr_trial.true_trace.Size(); ++i)
-        igr_trial.true_trace[i] = IgrCandidate().true_trace[i] + scale * igr_linear_output.trace_increment[i];
-      if (!CollectiveAll(ValidIgrSlot(igr_trial))) continue;
-      const auto probe = detail::ComputeTracedScalarIgrP1GlobalStep(
-          input_for(igr_trial), igr_probe_output, *igr_scratch);
-      switch (probe)
-      {
-        case detail::TracedScalarIgrP1GlobalStepResult::inadmissible_trial: continue;
-        case detail::TracedScalarIgrP1GlobalStepResult::failure: return fail(CpuFailurePhase::assembly);
-        case detail::TracedScalarIgrP1GlobalStepResult::success: break;
-      }
-      if (!CollectiveAll(Finite(igr_probe_output.initial_residual_norm) &&
-                         igr_probe_output.initial_residual_norm >= 0.0)) return fail(CpuFailurePhase::assembly);
-      const double armijo = (1.0 - config.armijo_constant * scale) * residual;
-      if (igr_probe_output.initial_residual_norm <= armijo)
-      {
-        if (!CollectiveAll(CopyIgrSlot(igr_trial, IgrCandidate()))) return fail(CpuFailurePhase::recovery);
-        residual = igr_probe_output.initial_residual_norm; accepted = true;
-        evidence.final_line_search_trials = backtrack + 1;
-      }
+      return fail(CpuFailurePhase::recovery);
     }
-    if (!CollectiveAll(accepted)) return fail(CpuFailurePhase::recovery);
     const bool mapped = MapIgrToPublic(IgrCandidate());
     if (!CollectiveAll(mapped)) return fail(CpuFailurePhase::recovery);
     const bool copied = Copy(igr_public_interior, Candidate()->interior) &&
@@ -2112,12 +2284,40 @@ struct detail::CpuNumericsCore::Implementation
     igr_candidate_public_hash = HashPair(HashDoubles(Candidate()->interior), HashDoubles(Candidate()->trace));
     if (!CollectiveAll(igr_candidate_hash == HashIgrSlot(IgrCandidate()) &&
                        igr_candidate_public_hash == HashPair(HashDoubles(Candidate()->interior), HashDoubles(Candidate()->trace)))) return fail(CpuFailurePhase::recovery);
-    evidence.final_nonlinear_residual = residual; evidence.nonlinear_updates = 1;
+    double conservation_error = 0.0;
+    double conservation_relative_error = 0.0;
+    const bool source_balanced = IgrSourceBalancedConservation(
+        IgrCommitted(), IgrCandidate(), attempt.dt, conservation_error,
+        conservation_relative_error);
+    evidence.maximum_conservation_error = conservation_error;
+    evidence.maximum_conservation_relative_error = conservation_relative_error;
+    evidence.conservation_gate = source_balanced &&
+        conservation_relative_error <= config.nonlinear_tolerance;
+    if (!CollectiveAll(evidence.conservation_gate))
+    {
+      return fail(CpuFailurePhase::diagnostics);
+    }
+    evidence.final_nonlinear_residual = residual;
+    evidence.nonlinear_updates = updates;
+    evidence.maximum_true_relative_residual = maximum_true_residual;
     evidence.minimum_density = density_gate; evidence.minimum_pressure = pressure_gate;
     evidence.maximum_wave_speed = 0.0; evidence.committed_interior_after = HashDoubles(Candidate()->interior);
     evidence.committed_trace_after = HashDoubles(Candidate()->trace);
-    evidence.finite_gate = evidence.admissibility_gate = evidence.recovery_gate = true;
-    evidence.nonlinear_gate = evidence.true_residual_gate = true; evidence.status = CpuAttemptStatus::success;
+    evidence.finite_gate = Finite(residual) && Finite(maximum_true_residual) &&
+        Finite(conservation_error) && Finite(conservation_relative_error) &&
+        Finite(Candidate()->interior) && Finite(Candidate()->trace);
+    evidence.admissibility_gate = true;
+    evidence.recovery_gate = recovered && evidence.conservation_gate;
+    evidence.nonlinear_gate = nonlinear_converged;
+    evidence.true_residual_gate = maximum_true_residual <=
+        config.true_residual_tolerance;
+    evidence.status = CpuAttemptStatus::success;
+    if (!CollectiveAll(evidence.finite_gate && evidence.admissibility_gate &&
+                       evidence.recovery_gate && evidence.nonlinear_gate &&
+                       evidence.true_residual_gate && evidence.conservation_gate))
+    {
+      return fail(CpuFailurePhase::terminal_evidence);
+    }
     active_candidate_generation = next_candidate_generation++;
     active_candidate_state_hash = igr_candidate_public_hash; publication_chain_authority = true;
     active_evidence.current_newton.candidate_generation = active_candidate_generation;
@@ -2128,7 +2328,10 @@ struct detail::CpuNumericsCore::Implementation
     active_evidence.current_newton.retained_for_publication = true;
     evidence.candidate_generation = active_candidate_generation;
     evidence.transfers.allocation_events = allocations.EventsAfterBaseline();
-    result.evidence = evidence; result.gates = {true, true, true, true, true, true};
+    result.evidence = evidence;
+    result.gates = {evidence.finite_gate, evidence.admissibility_gate,
+                    evidence.recovery_gate, evidence.true_residual_gate,
+                    true, evidence.nonlinear_gate};
     result.originating_failure = FailureReason::none; return result;
   }
 

@@ -706,6 +706,45 @@ bool CheckPrivateTracedScalarIgrLifecycle()
       second.status == GenericEulerCpuSessionStatus::advanced && boundary.calls == 0;
 }
 
+bool CheckPrivateTracedScalarIgrConvergenceEvidence()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  // A nonzero static source exercises the conservative source balance rather
+  // than merely accepting the homogeneous periodic special case.
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request)) return false;
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  std::uint64_t generation = 0;
+  if (!core.PrepareBorrowedEuler(0.001, coordinates, generation)) return false;
+  double maximum_wave_speed = 0.0;
+  double stable_dt = 0.0;
+  if (!core.CommitBorrowedEuler(generation, coordinates, maximum_wave_speed,
+                                stable_dt)) return false;
+  const auto& attempt = core.evidence().last_attempt;
+  return attempt.committed && attempt.nonlinear_updates > 1 &&
+      attempt.finite_gate && attempt.admissibility_gate &&
+      attempt.recovery_gate && attempt.nonlinear_gate &&
+      attempt.true_residual_gate && attempt.conservation_gate &&
+      attempt.work.accepted_newton_updates ==
+          static_cast<std::uint64_t>(attempt.nonlinear_updates) &&
+      attempt.work.complete_factor_setups == attempt.work.complete_trace_solves &&
+      attempt.work.complete_trace_solves == attempt.work.complete_recoveries &&
+      attempt.final_nonlinear_residual <= attempt.initial_nonlinear_residual &&
+      std::isfinite(attempt.maximum_true_relative_residual) &&
+      attempt.maximum_true_relative_residual <= 1.0e-10 &&
+      std::isfinite(attempt.maximum_conservation_error) &&
+      std::isfinite(attempt.maximum_conservation_relative_error) &&
+      attempt.maximum_conservation_relative_error <= 1.0e-10 &&
+      boundary.calls == 0;
+}
+
 bool CheckPrivateTracedScalarIgrZeroLocal()
 {
   int ranks = 1;
@@ -977,6 +1016,8 @@ int main(int argc, char* argv[])
   const bool prepared_lifecycle = CheckPreparedSessionLifecycle();
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
   const bool private_igr = CheckPrivateTracedScalarIgrLifecycle();
+  const bool private_igr_convergence =
+      CheckPrivateTracedScalarIgrConvergenceEvidence();
   const bool private_igr_zero_local = CheckPrivateTracedScalarIgrZeroLocal();
   const bool private_igr_initialization =
       CheckPrivateTracedScalarIgrInitializationDeterminism();
@@ -990,6 +1031,7 @@ int main(int argc, char* argv[])
   const bool local = boundary_semantics && trace_restriction && orders &&
       prepared_lifecycle &&
       periodic && private_igr && private_igr_zero_local &&
+      private_igr_convergence &&
       private_igr_initialization && dynamic_tau && boundary_picard &&
       zero_owned && subcommunicator && passive_world && mismatch &&
       callback_failure;
@@ -1002,6 +1044,7 @@ int main(int argc, char* argv[])
               << " trace_restriction=" << trace_restriction
               << " orders=" << orders << " periodic=" << periodic
               << " private_igr=" << private_igr
+              << " private_igr_convergence=" << private_igr_convergence
               << " private_igr_zero_local=" << private_igr_zero_local
               << " private_igr_initialization=" << private_igr_initialization
               << " prepared_lifecycle=" << prepared_lifecycle
