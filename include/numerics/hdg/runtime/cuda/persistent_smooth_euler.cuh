@@ -39,6 +39,11 @@
 namespace dg::hdg::runtime::cuda_w8a
 {
 
+namespace detail
+{
+struct CudaQualificationTestAccess;
+}
+
 /** Production W8-owned allocator. All explicit device allocation is routed here. */
 struct UmpireDeviceAllocatorPolicy
 {
@@ -1074,53 +1079,6 @@ public:
     return initialized_ && committed_diagnostics_valid_;
   }
 
-  /** Narrow runtime-test seam over the production post-candidate IGR gate. */
-  bool VerifyPreparedIgrConservationForTests(
-      double& maximum_error, double& maximum_relative_error) noexcept
-  {
-    maximum_error = std::numeric_limits<double>::infinity();
-    maximum_relative_error = std::numeric_limits<double>::infinity();
-    return initialized_ && pending_.active && pending_.staging &&
-        config_.use_generic_numerical_policy &&
-        config_.numerical_policy.stabilization.kind ==
-            generic::RegularizationKind::igr &&
-        numerics_.IgrConservationBalance(
-            pending_.attempt.dt, maximum_error, maximum_relative_error);
-  }
-
-  /** Detail-only central-difference check of the production CUDA assembler. */
-  bool VerifyBorrowedEulerAssemblerJacobianForTests(
-      const double relative_tolerance,
-      std::array<double, 6>& relative_errors) noexcept
-  {
-    relative_errors.fill(std::numeric_limits<double>::infinity());
-    return initialized_ && !pending_.active &&
-        config_.use_generic_numerical_policy &&
-        config_.numerical_policy.stabilization.kind ==
-            generic::RegularizationKind::igr &&
-        numerics_.VerifyBorrowedEulerAssemblerJacobianForTests(
-            relative_tolerance, relative_errors);
-  }
-
-  /** Detail-only audit that borrowed true-trace data is an owned copy. */
-  bool VerifyBorrowedInitialTrueTraceForTests(
-      const CudaBorrowedHostL2Input expected) noexcept
-  {
-    return initialized_ && !pending_.active &&
-        numerics_.VerifyBorrowedInitialTrueTraceForTests(expected);
-  }
-
-  /** Detail-only host/device parity check for every admitted static closure. */
-  bool VerifyStaticBoundaryClosuresForTests(
-      const double relative_tolerance,
-      std::array<double, 7>& relative_errors) noexcept
-  {
-    relative_errors.fill(std::numeric_limits<double>::infinity());
-    return initialized_ && !pending_.active &&
-        numerics_.VerifyStaticBoundaryClosuresForTests(
-            relative_tolerance, relative_errors);
-  }
-
   /** Export only the currently staged candidate; no logical publication occurs. */
   bool ExportPreparedInterior(CudaMutableHostL2Output destination) noexcept
   {
@@ -1153,6 +1111,8 @@ public:
   }
 
 private:
+  friend struct detail::CudaQualificationTestAccess;
+
   void ForgetBorrowedHostInputPointers() noexcept
   {
     config_.borrowed_initial.coefficients = nullptr;

@@ -607,6 +607,8 @@ public:
   { return diagnostics_; }
 
 private:
+  friend struct cuda_w8a::detail::CudaQualificationTestAccess;
+
   enum class operation_tag : int
   {
     initialize = 1,

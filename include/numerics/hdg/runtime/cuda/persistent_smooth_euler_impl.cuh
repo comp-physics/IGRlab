@@ -776,20 +776,6 @@ bool CudaLaunchIgrConservation(const CudaDeviceView& view,
                                const CudaMeshShape& shape,
                                double dt, double* result) noexcept;
 
-/** Fixed-size input used only by the all-closure CUDA qualification seam. */
-struct CudaStaticBoundaryClosureCaseForTests
-{
-  int kind = 0;
-  double reference[conserved_components]{};
-  double pressure_out = 0.0;
-  double gamma = 1.4;
-  double interior[conserved_components]{};
-  double normal[dimension]{};
-};
-
-bool CudaLaunchStaticBoundaryClosureForTests(
-    const CudaStaticBoundaryClosureCaseForTests& input,
-    double* result) noexcept;
 bool CudaLaunchHash(const double* values, int count,
                     std::uint64_t* words) noexcept;
 
@@ -1332,12 +1318,13 @@ public:
     return DistributeCurrentTrace(workspace.trace.coefficients);
   }
 
+private:
   /**
-   * Test-only central-difference audit of the production device assembler.
-   * It stages no output and publishes no slot; the reusable workspace is
-   * restored to the unperturbed test linearization before returning.
+   * Central-difference audit of the live device assembler.  This private
+   * implementation stages no output and publishes no slot; the qualification
+   * TU reaches it only through the private friend accessor.
    */
-  bool VerifyBorrowedEulerAssemblerJacobianForTests(
+  bool AuditBorrowedEulerAssemblerJacobian(
       const double relative_tolerance,
       std::array<double, 6>& relative_errors) noexcept
   {
@@ -1674,15 +1661,7 @@ public:
     return restored && CollectiveContinue(within_tolerance);
   }
 
-  /** Verify the caller-supplied public trace was copied into owned storage. */
-  bool VerifyBorrowedInitialTrueTraceForTests(
-      CudaBorrowedHostL2Input expected) noexcept;
-
-  /** Direct host/device parity audit of all seven admitted static closures. */
-  bool VerifyStaticBoundaryClosuresForTests(
-      double relative_tolerance,
-      std::array<double, 7>& relative_errors) noexcept;
-
+public:
   bool IgrConservationBalance(const double dt, double& maximum_error,
                               double& maximum_relative_error) noexcept
   {
@@ -2137,6 +2116,8 @@ public:
                       CudaMutableHostL2Output destination) noexcept;
 
 private:
+  friend struct CudaQualificationTestAccess;
+
   static bool IgrActive(const CudaConfig& config) noexcept
   {
     return config.use_generic_numerical_policy &&
@@ -2755,7 +2736,7 @@ private:
       layout.local_trace = local_trace;
       layout.true_trace = true_trace;
       layout.element_faces = element_faces;
-      layout.face_h = element_faces;
+      layout.face_h = shape_.igr_active ? element_faces : 0;
       valid = valid && checked_product(element_faces, conserved_components,
                                        layout.boundary_reference);
       layout.boundary_pressure = element_faces;
@@ -2793,7 +2774,8 @@ private:
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points, 0.0);
       host_face_normal_.assign(generic ? layout.face_normal :
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension, 0.0);
-      host_face_h_.assign(generic ? layout.face_h : 0, 1.0);
+      host_face_h_.assign(generic && shape_.igr_active ? layout.face_h : 0,
+                          1.0);
       host_boundary_reference_.assign(generic &&
           shape_.borrowed_static_boundary_policies ? layout.boundary_reference : 0,
           0.0);
@@ -2860,7 +2842,7 @@ private:
           checked_add(doubles, layout.volume_weight) && checked_add(doubles, layout.volume_position) &&
           checked_add(doubles, layout.face_interior) && checked_add(doubles, layout.face_trace) &&
           checked_add(doubles, layout.face_weight) && checked_add(doubles, layout.face_normal) &&
-          checked_add(doubles, layout.face_h) &&
+          (!shape_.igr_active || checked_add(doubles, layout.face_h)) &&
           checked_add(doubles, elements) && checked_add(doubles, 11) &&
           checked_add(doubles, layout.face_weight) &&
           (!shape_.borrowed_static_boundary_policies ||

@@ -9,12 +9,572 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace dg::hdg::runtime::cuda_w8a::detail
+{
+
+// This accessor is defined only in the qualification translation unit.  The
+// production engine and generic facade grant it private friendship but ship no
+// callable test API or test-only device kernel.
+struct CudaQualificationTestAccess
+{
+  template <typename Engine>
+  static bool VerifyAssemblerJacobian(
+      Engine& engine, const double relative_tolerance,
+      std::array<double, 6>& relative_errors) noexcept
+  {
+    relative_errors.fill(std::numeric_limits<double>::infinity());
+    return engine.initialized_ && !engine.pending_.active &&
+        engine.config_.use_generic_numerical_policy &&
+        engine.config_.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::igr &&
+        engine.numerics_.AuditBorrowedEulerAssemblerJacobian(
+            relative_tolerance, relative_errors);
+  }
+
+  template <typename Engine>
+  static bool VerifyPreparedIgrConservation(
+      Engine& engine, double& maximum_error,
+      double& maximum_relative_error,
+      std::array<double, 3>& oracle_activity) noexcept
+  {
+    maximum_error = std::numeric_limits<double>::infinity();
+    maximum_relative_error = std::numeric_limits<double>::infinity();
+    oracle_activity.fill(0.0);
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    bool local_valid = engine.initialized_ && engine.pending_.active &&
+        engine.pending_.staging &&
+        engine.config_.use_generic_numerical_policy &&
+        engine.config_.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::igr && shape.igr_active &&
+        std::isfinite(engine.pending_.attempt.dt) &&
+        engine.pending_.attempt.dt > 0.0 &&
+        numerics.view_.work_interior != nullptr &&
+        numerics.view_.old_interior != nullptr &&
+        numerics.view_.static_source != nullptr;
+    std::vector<double> current, previous, source;
+    try
+    {
+      current.resize(static_cast<std::size_t>(shape.interior_count));
+      previous.resize(current.size());
+      source.resize(current.size());
+    }
+    catch (...) { local_valid = false; }
+    const bool copied = local_valid && CudaTransportPolicy::DeviceToHost(
+        current.data(), numerics.view_.work_interior,
+        current.size() * sizeof(double),
+        CudaTransferCategory::generic_host_bridge,
+        CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            previous.data(), numerics.view_.old_interior,
+            previous.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            source.data(), numerics.view_.static_source,
+            source.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    local_valid = local_valid && copied;
+
+    std::array<double, 5> local_balance{};
+    std::array<double, 5> local_scale{};
+    std::array<double, 3> local_activity{};
+    const double dt = engine.pending_.attempt.dt;
+    for (int element = 0; local_valid && element < shape.elements; ++element)
+      for (int q = 0; q < shape.volume_points; ++q)
+      {
+        const int qp = element * shape.volume_points + q;
+        const std::size_t interior_offset =
+            static_cast<std::size_t>(element) * shape.interior_dofs;
+        const double weight = numerics.host_volume_weight_[
+            static_cast<std::size_t>(qp)];
+        std::array<double, conserved_components> state{};
+        std::array<double, conserved_components> old{};
+        std::array<double, conserved_components> forcing{};
+        double sigma = 0.0;
+        double gradient[3][dimension] = {};
+        for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
+        {
+          const double phi = numerics.host_volume_shape_[
+              static_cast<std::size_t>(qp) * shape.scalar_interior_dofs +
+              scalar];
+          for (int component = 0; component < conserved_components;
+               ++component)
+          {
+            const std::size_t index = interior_offset + scalar +
+                static_cast<std::size_t>(shape.scalar_interior_dofs) *
+                    component;
+            state[static_cast<std::size_t>(component)] +=
+                phi * current[index];
+            old[static_cast<std::size_t>(component)] +=
+                phi * previous[index];
+            forcing[static_cast<std::size_t>(component)] +=
+                phi * source[index];
+          }
+          sigma += phi * current[interior_offset + scalar +
+              static_cast<std::size_t>(shape.scalar_interior_dofs) * 4];
+          for (int component = 0; component < 3; ++component)
+            for (int direction = 0; direction < dimension; ++direction)
+              gradient[component][direction] +=
+                  numerics.host_volume_derivative_[
+                      (static_cast<std::size_t>(qp) *
+                           shape.scalar_interior_dofs + scalar) * dimension +
+                      direction] * current[interior_offset + scalar +
+                          static_cast<std::size_t>(
+                              shape.scalar_interior_dofs) * component];
+        }
+        local_valid = std::isfinite(weight) && weight > 0.0 &&
+            std::isfinite(sigma) && state[0] > cuda_density_gate;
+        for (int component = 0;
+             local_valid && component < conserved_components; ++component)
+        {
+          const double change = weight *
+              (state[static_cast<std::size_t>(component)] -
+               old[static_cast<std::size_t>(component)]);
+          const double source_change = dt * weight *
+              forcing[static_cast<std::size_t>(component)];
+          local_valid = std::isfinite(change) &&
+              std::isfinite(source_change);
+          local_balance[static_cast<std::size_t>(component)] +=
+              change - source_change;
+          local_scale[static_cast<std::size_t>(component)] +=
+              std::abs(change) + std::abs(source_change);
+          local_activity[0] += std::abs(source_change);
+          local_activity[1] += std::abs(change);
+        }
+        double velocity_gradient[dimension][dimension] = {};
+        for (int velocity = 0; velocity < dimension; ++velocity)
+          for (int direction = 0; direction < dimension; ++direction)
+            velocity_gradient[velocity][direction] =
+                gradient[1 + velocity][direction] / state[0] -
+                state[static_cast<std::size_t>(1 + velocity)] *
+                    gradient[0][direction] / (state[0] * state[0]);
+        const double trace =
+            velocity_gradient[0][0] + velocity_gradient[1][1];
+        const double q_value =
+            velocity_gradient[0][0] * velocity_gradient[0][0] +
+            2.0 * velocity_gradient[0][1] * velocity_gradient[1][0] +
+            velocity_gradient[1][1] * velocity_gradient[1][1] +
+            trace * trace;
+        const double sigma_term = weight * sigma / state[0];
+        const double q_term = weight * shape.igr_alpha * q_value;
+        local_valid = local_valid && std::isfinite(q_value) &&
+            std::isfinite(sigma_term) && std::isfinite(q_term);
+        local_balance[4] += sigma_term - q_term;
+        local_scale[4] += std::abs(sigma_term) + std::abs(q_term);
+        local_activity[2] += std::abs(q_term);
+      }
+
+    std::array<double, 5> global_balance{};
+    std::array<double, 5> global_scale{};
+    std::array<double, 3> global_activity{};
+    const MPI_Comm communicator = engine.config_.borrowed_communicator;
+    const bool reduced = MPI_Allreduce(
+            local_balance.data(), global_balance.data(),
+            static_cast<int>(global_balance.size()), MPI_DOUBLE, MPI_SUM,
+            communicator) == MPI_SUCCESS &&
+        MPI_Allreduce(local_scale.data(), global_scale.data(),
+                      static_cast<int>(global_scale.size()), MPI_DOUBLE,
+                      MPI_SUM, communicator) == MPI_SUCCESS &&
+        MPI_Allreduce(local_activity.data(), global_activity.data(),
+                      static_cast<int>(global_activity.size()), MPI_DOUBLE,
+                      MPI_SUM, communicator) == MPI_SUCCESS;
+    maximum_error = 0.0;
+    maximum_relative_error = 0.0;
+    oracle_activity = global_activity;
+    for (std::size_t component = 0; component < global_balance.size();
+         ++component)
+    {
+      const double error = std::abs(global_balance[component]);
+      maximum_error = std::max(maximum_error, error);
+      maximum_relative_error = std::max(
+          maximum_relative_error, error / (1.0 + global_scale[component]));
+    }
+    return reduced && numerics.CollectiveContinue(
+        local_valid && std::isfinite(maximum_error) &&
+        std::isfinite(maximum_relative_error) &&
+        std::all_of(oracle_activity.begin(), oracle_activity.end(),
+                    [](const double activity)
+                    { return std::isfinite(activity) &&
+                             activity > 1.0e-12; }));
+  }
+
+  template <typename Engine>
+  static bool VerifyIgrCouplingBlocks(
+      Engine& engine, std::array<double, 2>& relative_norms) noexcept
+  {
+    relative_norms.fill(0.0);
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const std::size_t a_count = static_cast<std::size_t>(shape.elements) *
+        static_cast<std::size_t>(shape.interior_dofs) *
+        static_cast<std::size_t>(shape.interior_dofs);
+    const std::size_t b_count = static_cast<std::size_t>(shape.elements) *
+        static_cast<std::size_t>(shape.interior_dofs) *
+        static_cast<std::size_t>(shape.trace_dofs);
+    bool local_valid = engine.initialized_ && !engine.pending_.active &&
+        shape.igr_active &&
+        shape.interior_components == igr_interior_components &&
+        shape.trace_components == igr_trace_components &&
+        shape.scalar_interior_dofs > 0 && shape.scalar_face_dofs > 0 &&
+        numerics.view_.a != nullptr && numerics.view_.b != nullptr;
+    std::vector<double> a, b;
+    try
+    {
+      a.resize(a_count);
+      b.resize(b_count);
+    }
+    catch (...) { local_valid = false; }
+    const bool copied = local_valid &&
+        CudaTransportPolicy::DeviceToHost(
+            a.data(), numerics.view_.a, a.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            b.data(), numerics.view_.b, b.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    local_valid = local_valid && copied;
+
+    // Norm 0 is the production Euler residual's sensitivity to IGR unknowns;
+    // norm 1 is the auxiliary residual's sensitivity to Euler unknowns.  Both
+    // directions must survive the live 7x5 assembler, independently of any
+    // nonlinear-solver stopping tolerance.
+    std::array<double, 3> local{};
+    for (int element = 0; local_valid && element < shape.elements; ++element)
+    {
+      const std::size_t a_offset = static_cast<std::size_t>(element) *
+          static_cast<std::size_t>(shape.interior_dofs) *
+          static_cast<std::size_t>(shape.interior_dofs);
+      for (int row = 0; row < shape.interior_dofs; ++row)
+        for (int column = 0; column < shape.interior_dofs; ++column)
+        {
+          const double value = a[a_offset +
+              static_cast<std::size_t>(row) * shape.interior_dofs + column];
+          local_valid = std::isfinite(value);
+          local[2] += value * value;
+          const int row_component = row / shape.scalar_interior_dofs;
+          const int column_component = column /
+              shape.scalar_interior_dofs;
+          if (row_component < conserved_components &&
+              column_component >= conserved_components)
+            local[0] += value * value;
+          if (row_component >= conserved_components &&
+              column_component < conserved_components)
+            local[1] += value * value;
+        }
+
+      const std::size_t b_offset = static_cast<std::size_t>(element) *
+          static_cast<std::size_t>(shape.interior_dofs) *
+          static_cast<std::size_t>(shape.trace_dofs);
+      for (int row = 0; row < shape.interior_dofs; ++row)
+        for (int column = 0; column < shape.trace_dofs; ++column)
+        {
+          const double value = b[b_offset +
+              static_cast<std::size_t>(row) * shape.trace_dofs + column];
+          local_valid = std::isfinite(value);
+          local[2] += value * value;
+          const int row_component = row / shape.scalar_interior_dofs;
+          const int face_column = column %
+              (shape.trace_components * shape.scalar_face_dofs);
+          const int column_component = face_column /
+              shape.scalar_face_dofs;
+          if (row_component < conserved_components &&
+              column_component >= conserved_components)
+            local[0] += value * value;
+          if (row_component >= conserved_components &&
+              column_component < conserved_components)
+            local[1] += value * value;
+        }
+    }
+    std::array<double, 3> global{};
+    const bool reduced = MPI_Allreduce(
+        local.data(), global.data(), static_cast<int>(global.size()),
+        MPI_DOUBLE, MPI_SUM, engine.config_.borrowed_communicator) ==
+        MPI_SUCCESS;
+    const double denominator = reduced && global[2] > 0.0
+        ? std::sqrt(global[2]) : 0.0;
+    if (denominator > 0.0)
+    {
+      relative_norms[0] = std::sqrt(global[0]) / denominator;
+      relative_norms[1] = std::sqrt(global[1]) / denominator;
+    }
+    return reduced && numerics.CollectiveContinue(
+        local_valid && std::isfinite(relative_norms[0]) &&
+        std::isfinite(relative_norms[1]) && relative_norms[0] > 1.0e-12 &&
+        relative_norms[1] > 1.0e-12);
+  }
+
+  template <typename Engine>
+  static bool VerifyBorrowedInitialTrueTrace(
+      Engine& engine, const CudaBorrowedHostL2Input expected) noexcept
+  {
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const bool shape_valid = shape.trace_components >= conserved_components &&
+        shape.true_trace_count >= 0 && shape.trace_components != 0 &&
+        shape.true_trace_count % shape.trace_components == 0;
+    const std::size_t scalar_count = shape_valid
+        ? static_cast<std::size_t>(shape.true_trace_count /
+                                   shape.trace_components)
+        : 0;
+    bool local_valid = engine.initialized_ && !engine.pending_.active &&
+        numerics.initialized_ && numerics.borrowed_host_inputs_ &&
+        shape_valid && expected.coefficients != nullptr &&
+        expected.scalar_count == scalar_count &&
+        expected.components == conserved_components &&
+        numerics.host_exact_true_trace_.size() ==
+            static_cast<std::size_t>(shape.true_trace_count) &&
+        numerics.committed_slot_.trace.coefficients != nullptr &&
+        numerics.committed_slot_.trace.count ==
+            static_cast<std::size_t>(shape.true_trace_count);
+    std::vector<double> observed;
+    try
+    {
+      observed.resize(static_cast<std::size_t>(shape.true_trace_count));
+    }
+    catch (...) { local_valid = false; }
+    const bool copied = local_valid && CudaTransportPolicy::DeviceToHost(
+        observed.data(), numerics.committed_slot_.trace.coefficients,
+        observed.size() * sizeof(double),
+        CudaTransferCategory::generic_host_bridge,
+        CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    local_valid = local_valid && copied;
+    for (int component = 0;
+         local_valid && component < conserved_components; ++component)
+      for (std::size_t scalar = 0; scalar < scalar_count; ++scalar)
+      {
+        const std::size_t index = scalar_count *
+            static_cast<std::size_t>(component) + scalar;
+        local_valid = std::isfinite(expected.coefficients[index]) &&
+            numerics.host_exact_true_trace_[index] ==
+                expected.coefficients[index] &&
+            observed[index] == expected.coefficients[index];
+      }
+    for (int component = conserved_components;
+         local_valid && component < shape.trace_components; ++component)
+      for (std::size_t scalar = 0; scalar < scalar_count; ++scalar)
+      {
+        const std::size_t index = scalar_count *
+            static_cast<std::size_t>(component) + scalar;
+        const double host_value = numerics.host_exact_true_trace_[index];
+        const double device_value = observed[index];
+        local_valid = host_value == 0.0 && !std::signbit(host_value) &&
+            device_value == 0.0 && !std::signbit(device_value);
+      }
+    return numerics.CollectiveContinue(local_valid);
+  }
+
+  static int LoweredBoundaryKind(
+      const generic::EulerBoundaryPolicyKind kind) noexcept
+  {
+    switch (kind)
+    {
+    case generic::EulerBoundaryPolicyKind::supersonic_inlet:
+      return static_cast<int>(CudaStaticBoundaryPolicyKind::supersonic_inlet);
+    case generic::EulerBoundaryPolicyKind::subsonic_inlet:
+      return static_cast<int>(CudaStaticBoundaryPolicyKind::subsonic_inlet);
+    case generic::EulerBoundaryPolicyKind::supersonic_outlet:
+      return static_cast<int>(CudaStaticBoundaryPolicyKind::supersonic_outlet);
+    case generic::EulerBoundaryPolicyKind::subsonic_outlet_pressure:
+      return static_cast<int>(
+          CudaStaticBoundaryPolicyKind::subsonic_outlet_pressure);
+    case generic::EulerBoundaryPolicyKind::far_field:
+      return static_cast<int>(CudaStaticBoundaryPolicyKind::far_field);
+    case generic::EulerBoundaryPolicyKind::nonreflecting_outlet:
+      return static_cast<int>(
+          CudaStaticBoundaryPolicyKind::nonreflecting_outlet);
+    case generic::EulerBoundaryPolicyKind::slip_wall:
+      return static_cast<int>(CudaStaticBoundaryPolicyKind::slip_wall);
+    case generic::EulerBoundaryPolicyKind::periodic_topology:
+      return 0;
+    }
+    return -1;
+  }
+
+  static bool SameDouble(const double left, const double right) noexcept
+  {
+    return std::memcmp(&left, &right, sizeof(double)) == 0;
+  }
+
+  template <typename Engine>
+  static bool VerifyBoundaryPolicyTable(
+      Engine& engine, const generic::EulerBoundaryPolicy* const expected,
+      const std::size_t expected_count, const double expected_gamma) noexcept
+  {
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const std::size_t face_count = static_cast<std::size_t>(shape.elements) *
+        static_cast<std::size_t>(faces_per_element);
+    bool local_valid = engine.initialized_ && !engine.pending_.active &&
+        numerics.initialized_ && numerics.mesh_ != nullptr &&
+        shape.borrowed_static_boundary_policies && expected != nullptr &&
+        expected_count == 7 && SameDouble(shape.boundary_gamma,
+                                           expected_gamma) &&
+        numerics.host_boundary_policy_kind_.size() == face_count &&
+        numerics.host_boundary_pressure_.size() == face_count &&
+        numerics.host_boundary_reference_.size() ==
+            face_count * conserved_components &&
+        numerics.view_.boundary_policy_kind != nullptr &&
+        numerics.view_.boundary_pressure != nullptr &&
+        numerics.view_.boundary_reference != nullptr;
+    std::vector<int> device_kinds;
+    std::vector<double> device_pressures, device_references;
+    try
+    {
+      device_kinds.resize(face_count);
+      device_pressures.resize(face_count);
+      device_references.resize(face_count * conserved_components);
+    }
+    catch (...) { local_valid = false; }
+    const bool copied = local_valid && CudaTransportPolicy::DeviceToHost(
+        device_kinds.data(), numerics.view_.boundary_policy_kind,
+        device_kinds.size() * sizeof(int),
+        CudaTransferCategory::generic_host_bridge,
+        CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            device_pressures.data(), numerics.view_.boundary_pressure,
+            device_pressures.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            device_references.data(), numerics.view_.boundary_reference,
+            device_references.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    local_valid = local_valid && copied;
+
+    std::array<long long, 7> local_uses{};
+    std::vector<unsigned char> shared;
+    try
+    {
+      shared.resize(static_cast<std::size_t>(
+          numerics.mesh_->GetNumFaces()), 0);
+      for (int index = 0; index < numerics.mesh_->GetNSharedFaces(); ++index)
+      {
+        const int face = numerics.mesh_->GetSharedFace(index);
+        if (face < 0 || face >= static_cast<int>(shared.size()))
+          local_valid = false;
+        else
+          shared[static_cast<std::size_t>(face)] = 1;
+      }
+      for (int element = 0; local_valid && element < shape.elements; ++element)
+      {
+        mfem::Array<int> faces, orientations;
+        numerics.mesh_->GetElementEdges(element, faces, orientations);
+        local_valid = faces.Size() == faces_per_element;
+        for (int local_face = 0;
+             local_valid && local_face < faces.Size(); ++local_face)
+        {
+          const int face = faces[local_face];
+          mfem::FaceElementTransformations* transformations =
+              numerics.mesh_->GetFaceElementTransformations(face);
+          const int boundary_element = face >= 0 &&
+                  face < static_cast<int>(shared.size())
+              ? numerics.mesh_->GetFaceToBdrElMap()[face] : -1;
+          const bool physical = transformations != nullptr &&
+              shared[static_cast<std::size_t>(face)] == 0 &&
+              transformations->Elem2No < 0 && boundary_element >= 0;
+          const std::size_t face_index = static_cast<std::size_t>(element) *
+              faces_per_element + local_face;
+          int expected_kind = 0;
+          double expected_pressure = 0.0;
+          std::array<double, conserved_components> expected_reference{};
+          if (physical)
+          {
+            const int attribute =
+                numerics.mesh_->GetBdrAttribute(boundary_element);
+            local_valid = attribute >= 1 &&
+                static_cast<std::size_t>(attribute) <= expected_count;
+            if (!local_valid) break;
+            const generic::EulerBoundaryPolicy& policy =
+                expected[static_cast<std::size_t>(attribute - 1)];
+            expected_kind = LoweredBoundaryKind(policy.kind);
+            expected_pressure = policy.pressure_out;
+            expected_reference = policy.reference_state;
+            ++local_uses[static_cast<std::size_t>(attribute - 1)];
+          }
+          local_valid = expected_kind >= 0 &&
+              numerics.host_boundary_policy_kind_[face_index] ==
+                  expected_kind &&
+              device_kinds[face_index] == expected_kind &&
+              SameDouble(numerics.host_boundary_pressure_[face_index],
+                         expected_pressure) &&
+              SameDouble(device_pressures[face_index], expected_pressure);
+          for (int component = 0;
+               local_valid && component < conserved_components; ++component)
+          {
+            const std::size_t index = face_index * conserved_components +
+                static_cast<std::size_t>(component);
+            local_valid = SameDouble(
+                    numerics.host_boundary_reference_[index],
+                    expected_reference[static_cast<std::size_t>(component)]) &&
+                SameDouble(
+                    device_references[index],
+                    expected_reference[static_cast<std::size_t>(component)]);
+          }
+        }
+      }
+    }
+    catch (...) { local_valid = false; }
+
+    std::array<long long, 7> global_uses{};
+    const bool reduced = MPI_Allreduce(
+        local_uses.data(), global_uses.data(),
+        static_cast<int>(global_uses.size()), MPI_LONG_LONG_INT, MPI_SUM,
+        engine.config_.borrowed_communicator) == MPI_SUCCESS;
+    const bool all_used = reduced && std::all_of(
+        global_uses.begin(), global_uses.end(),
+        [](const long long uses) { return uses > 0; });
+    return numerics.CollectiveContinue(local_valid && all_used);
+  }
+
+  static bool VerifyBorrowedInitialTrueTrace(
+      cuda::GenericEulerHdgCudaSession& session,
+      const CudaBorrowedHostL2Input expected) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyBorrowedInitialTrueTrace(
+          *session.borrowed_rank1_, expected);
+    if (session.borrowed_rank2_)
+      return VerifyBorrowedInitialTrueTrace(
+          *session.borrowed_rank2_, expected);
+    return false;
+  }
+
+  static bool VerifyBoundaryPolicyTable(
+      cuda::GenericEulerHdgCudaSession& session,
+      const generic::EulerBoundaryPolicy* const expected,
+      const std::size_t expected_count, const double expected_gamma) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyBoundaryPolicyTable(
+          *session.borrowed_rank1_, expected, expected_count, expected_gamma);
+    if (session.borrowed_rank2_)
+      return VerifyBoundaryPolicyTable(
+          *session.borrowed_rank2_, expected, expected_count, expected_gamma);
+    return false;
+  }
+};
+
+} // namespace dg::hdg::runtime::cuda_w8a::detail
 
 namespace
 {
@@ -40,6 +600,7 @@ using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 using dg::hdg::runtime::cuda_w8a::CudaRunEvidence;
 using dg::hdg::runtime::cuda_w8a::CudaStepEvidence;
 using dg::hdg::runtime::cuda_w8a::PersistentCudaSmoothEulerEngine;
+using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
 
 constexpr int components = dg::hdg::generic::euler_2d_conserved_components;
 constexpr std::uint32_t cuda_capabilities =
@@ -78,11 +639,64 @@ mfem::ParMesh MakePhysicalMesh()
   return mfem::ParMesh(MPI_COMM_WORLD, serial);
 }
 
+mfem::ParMesh MakeAllSevenPhysicalMesh()
+{
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+      4, 3, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  for (int boundary = 0; boundary < serial.GetNBE(); ++boundary)
+    serial.SetBdrAttribute(boundary, 1 + boundary % 7);
+  serial.SetAttributes(false, true);
+  return mfem::ParMesh(MPI_COMM_WORLD, serial);
+}
+
 struct BoundaryContext
 {
   std::array<int, 4> calls{};
   std::array<EulerBoundaryPolicy, 4> policies{};
 };
+
+struct AllSevenBoundaryContext
+{
+  std::array<int, 7> calls{};
+  std::array<EulerBoundaryPolicy, 7> policies{};
+};
+
+void ConfigureAllSevenPolicies(AllSevenBoundaryContext& context)
+{
+  const std::array<double, components> inlet{{
+      1.0, 0.20, -0.05, 2.52125}};
+  const std::array<double, components> subsonic_inlet{{
+      0.95, 0.095, 0.019, 2.3812}};
+  const std::array<double, components> far_field{{
+      1.05, -0.105, 0.0525, 2.5078125}};
+  const std::array<double, components> nonreflecting{{
+      0.98, 0.049, -0.0294, 2.4522}};
+  const std::array<double, components> unused{};
+  context.policies = {{
+      {EulerBoundaryPolicyKind::supersonic_inlet, inlet, 0.0},
+      {EulerBoundaryPolicyKind::subsonic_inlet, subsonic_inlet, 0.0},
+      {EulerBoundaryPolicyKind::supersonic_outlet, unused, 0.0},
+      {EulerBoundaryPolicyKind::subsonic_outlet_pressure, unused, 0.93},
+      {EulerBoundaryPolicyKind::far_field, far_field, 0.0},
+      {EulerBoundaryPolicyKind::nonreflecting_outlet, nonreflecting, 0.0},
+      {EulerBoundaryPolicyKind::slip_wall, unused, 0.0}}};
+}
+
+bool AllSevenPhysicalEulerExterior(
+    const void* opaque, const dg::hdg::generic::BoundaryPointView& point,
+    const double* interior, double* exterior) noexcept
+{
+  auto* const context = static_cast<AllSevenBoundaryContext*>(
+      const_cast<void*>(opaque));
+  if (context == nullptr || point.space_dimension != 2 ||
+      point.boundary_attribute < 1 || point.boundary_attribute > 7 ||
+      interior == nullptr || exterior == nullptr)
+    return false;
+  ++context->calls[static_cast<std::size_t>(point.boundary_attribute - 1)];
+  // Explicit initial_true_trace must bypass compatibility projection and this
+  // deliberately failing callback.
+  return false;
+}
 
 void ConfigurePolicies(BoundaryContext& context, const bool physical)
 {
@@ -228,10 +842,12 @@ BorrowedFields MakeBorrowedFields(
   {
     if (source_mode == SourceMode::nonzero)
     {
-      fields.source[scalar] = 1.0e-3;
-      fields.source[fields.volume_scalar_count + scalar] = 2.0e-4;
-      fields.source[2 * fields.volume_scalar_count + scalar] = -3.0e-4;
-      fields.source[3 * fields.volume_scalar_count + scalar] = 2.5e-3;
+      // Keep dt*S far above the nonlinear stopping floor so this checks the
+      // source coefficient quantitatively, not merely its sign.
+      fields.source[scalar] = 0.25;
+      fields.source[fields.volume_scalar_count + scalar] = 0.125;
+      fields.source[2 * fields.volume_scalar_count + scalar] = -0.1875;
+      fields.source[3 * fields.volume_scalar_count + scalar] = 0.375;
     }
   }
 
@@ -337,15 +953,19 @@ bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
   PersistentCudaSmoothEulerEngine<Selection> engine(config);
   CudaRunEvidence initialization{};
   std::array<double, 6> jacobian_errors{};
+  std::array<double, 2> coupling_norms{};
   constexpr double jacobian_tolerance = 5.0e-5;
   const bool initialized = engine.Initialize(initialization);
   const bool initialized_everywhere = All(initialized, request.communicator);
   if (!initialized_everywhere) return false;
-  const bool jacobian =
-      engine.VerifyBorrowedEulerAssemblerJacobianForTests(
-          jacobian_tolerance, jacobian_errors);
+  const bool jacobian = CudaQualificationTestAccess::VerifyAssemblerJacobian(
+      engine, jacobian_tolerance, jacobian_errors);
   const bool jacobian_everywhere = All(jacobian, request.communicator);
   if (!jacobian_everywhere) return false;
+  const bool coupled = CudaQualificationTestAccess::VerifyIgrCouplingBlocks(
+      engine, coupling_norms);
+  const bool coupled_everywhere = All(coupled, request.communicator);
+  if (!coupled_everywhere) return false;
 
   CudaPrecommitSnapshot snapshot{};
   CudaStepEvidence step{};
@@ -356,9 +976,11 @@ bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
   double conservation_error = std::numeric_limits<double>::infinity();
   double conservation_relative_error =
       std::numeric_limits<double>::infinity();
+  std::array<double, 3> conservation_oracle_activity{};
   const bool conservation_seam =
-      engine.VerifyPreparedIgrConservationForTests(
-          conservation_error, conservation_relative_error);
+      CudaQualificationTestAccess::VerifyPreparedIgrConservation(
+          engine, conservation_error, conservation_relative_error,
+          conservation_oracle_activity);
   const bool conservation = conservation_seam &&
       std::isfinite(conservation_error) &&
       std::isfinite(conservation_relative_error) &&
@@ -395,62 +1017,63 @@ bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
       std::cerr << "CUDA IGR algebra qualification failed order=" << order
                 << " initialized=" << initialized
                 << " jacobian=" << jacobian
+                << " coupling=" << coupled
                 << " prepared=" << prepared
                 << " conservation=" << conservation
                 << " conservation_error=" << conservation_error
                 << " conservation_relative_error="
-                << conservation_relative_error << " jacobian_errors=";
+                << conservation_relative_error
+                << " conservation_oracle_activity="
+                << conservation_oracle_activity[0] << ' '
+                << conservation_oracle_activity[1] << ' '
+                << conservation_oracle_activity[2]
+                << " jacobian_errors=";
       for (const double error : jacobian_errors) std::cerr << ' ' << error;
+      std::cerr << " coupling_norms=" << coupling_norms[0] << ' '
+                << coupling_norms[1];
       std::cerr << '\n';
     }
   }
   return All(passed, request.communicator);
 }
 
-template <typename Selection>
-bool CheckCopiedTraceAndBoundaryClosuresForSelection(
+bool CheckCopiedTraceForGenericSession(
     const EulerHdgRequest& request, BorrowedFields& fields,
-    const std::vector<double>& expected_trace, const int ranks,
-    const int order)
+    const std::vector<double>& expected_trace, const int order)
 {
-  CudaConfig config = MakeDirectConfig(request, ranks, order);
-  PersistentCudaSmoothEulerEngine<Selection> engine(config);
-  CudaRunEvidence initialization{};
-  const bool initialized = engine.Initialize(initialization);
-  const bool initialized_everywhere = All(initialized, request.communicator);
+  GenericEulerHdgCudaSession session;
+  const auto initialization = session.Initialize(request);
+  const bool initialized =
+      initialization.status == HdgEulerSessionStatus::initialized;
+  const bool initialized_everywhere = All(
+      initialized, request.communicator);
   if (!initialized_everywhere) return false;
 
   const double poisoned = std::numeric_limits<double>::quiet_NaN();
   std::fill(fields.initial_true_trace.begin(),
             fields.initial_true_trace.end(), poisoned);
-  const bool copied_trace = engine.VerifyBorrowedInitialTrueTraceForTests(
+  const bool copied_trace =
+      CudaQualificationTestAccess::VerifyBorrowedInitialTrueTrace(
+          session,
       CudaBorrowedHostL2Input{
           expected_trace.data(), expected_trace.size() /
               static_cast<std::size_t>(components), components});
-  std::array<double, 7> boundary_errors{};
-  constexpr double boundary_tolerance = 2.0e-12;
-  const bool boundary_parity = engine.VerifyStaticBoundaryClosuresForTests(
-      boundary_tolerance, boundary_errors);
-  const bool passed = initialized && copied_trace && boundary_parity;
+  const bool passed = initialized && copied_trace;
   if (!passed)
   {
     int rank = 0;
     MPI_Comm_rank(request.communicator, &rank);
     if (rank == 0)
     {
-      std::cerr << "CUDA copied-trace/boundary qualification failed order="
+      std::cerr << "CUDA copied-trace qualification failed order="
                 << order << " initialized=" << initialized
-                << " copied_trace=" << copied_trace
-                << " boundary_parity=" << boundary_parity
-                << " boundary_errors=";
-      for (const double error : boundary_errors) std::cerr << ' ' << error;
-      std::cerr << '\n';
+                << " copied_trace=" << copied_trace << '\n';
     }
   }
   return All(passed, request.communicator);
 }
 
-bool CheckCopiedTraceAndBoundaryClosures(const int order, const int ranks)
+bool CheckCopiedInitialTrueTrace(const int order)
 {
   mfem::ParMesh mesh = MakePeriodicMesh();
   BorrowedFields fields = MakeBorrowedFields(
@@ -473,21 +1096,75 @@ bool CheckCopiedTraceAndBoundaryClosures(const int order, const int ranks)
   const EulerHdgRequest request = MakeRequest(
       mesh, order, fields, boundary, false, RegularizationKind::igr);
   const bool intentionally_distinct = restricted_trace != expected_trace;
-  const bool seam = ranks == 1
-      ? CheckCopiedTraceAndBoundaryClosuresForSelection<
-            BorrowedCudaRank1OneGpuRuntimeSelection>(
-                request, fields, expected_trace, ranks, order)
-      : CheckCopiedTraceAndBoundaryClosuresForSelection<
-            BorrowedCudaRank2OneGpuHostStagedRuntimeSelection>(
-                request, fields, expected_trace, ranks, order);
+  const bool seam = CheckCopiedTraceForGenericSession(
+      request, fields, expected_trace, order);
   return All(intentionally_distinct && seam, request.communicator);
+}
+
+bool CheckAllSevenLoweredBoundaryPolicies(const int order)
+{
+  mfem::ParMesh mesh = MakeAllSevenPhysicalMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::empty);
+  BoundaryContext unused_boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, unused_boundary, false,
+      RegularizationKind::igr);
+  AllSevenBoundaryContext boundary{};
+  ConfigureAllSevenPolicies(boundary);
+  const std::array<EulerBoundaryPolicy, 7> expected = boundary.policies;
+  request.boundary.context = &boundary;
+  request.boundary.exterior_state = AllSevenPhysicalEulerExterior;
+  request.boundary.policies = {
+      boundary.policies.data(), boundary.policies.size(), 2, 1.4};
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  GenericEulerHdgCudaSession session;
+  const auto initialization = session.Initialize(request);
+  const bool initialized = All(
+      initialization.status == HdgEulerSessionStatus::initialized,
+      request.communicator);
+  if (!initialized) return false;
+  std::array<int, 7> global_callback_calls{};
+  const bool callback_census = MPI_Allreduce(
+      boundary.calls.data(), global_callback_calls.data(),
+      static_cast<int>(global_callback_calls.size()), MPI_INT, MPI_SUM,
+      request.communicator) == MPI_SUCCESS;
+  const bool callback_bypassed = callback_census && std::all_of(
+      global_callback_calls.begin(), global_callback_calls.end(),
+      [](const int calls) { return calls == 0; });
+
+  // The facade's temporary lowered table and the caller's generic table are
+  // both gone or poisoned before inspection.  The audit therefore observes
+  // the production host-owned per-face map and its uploaded device copy.
+  for (EulerBoundaryPolicy& policy : boundary.policies)
+  {
+    policy.kind = static_cast<EulerBoundaryPolicyKind>(255);
+    policy.reference_state.fill(
+        std::numeric_limits<double>::quiet_NaN());
+    policy.pressure_out = std::numeric_limits<double>::quiet_NaN();
+  }
+  const bool copied_and_associated = callback_bypassed &&
+      CudaQualificationTestAccess::VerifyBoundaryPolicyTable(
+          session, expected.data(), expected.size(), 1.4);
+  if (!copied_and_associated)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+      std::cerr << "CUDA all-seven lowered boundary-table audit failed order="
+                << order << '\n';
+  }
+  return All(copied_and_associated, request.communicator);
 }
 
 bool CheckIgrAlgebra(const int order, const int ranks)
 {
   mfem::ParMesh mesh = MakePeriodicMesh();
   BorrowedFields fields = MakeBorrowedFields(
-      mesh, order, SourceMode::empty);
+      mesh, order, SourceMode::nonzero, InitialMode::smooth_periodic);
   BoundaryContext boundary{};
   const EulerHdgRequest request = MakeRequest(
       mesh, order, fields, boundary, false, RegularizationKind::igr);
@@ -553,43 +1230,18 @@ bool ExpectedPeriodicSourceResponse(
           static_cast<std::size_t>(component) + scalar;
       const double expected_delta = dt * source[index];
       const double actual_delta = candidate[index] - initial[index];
-      const double tolerance = 5.0e-10 + 0.05 * std::abs(expected_delta);
+      const double state_scale = std::max(
+          {1.0, std::abs(initial[index]), std::abs(candidate[index])});
+      const double roundoff_floor = 4096.0 *
+          std::numeric_limits<double>::epsilon() * state_scale;
+      const double tolerance = roundoff_floor +
+          5.0e-5 * std::abs(expected_delta);
       if (!std::isfinite(actual_delta) || expected_delta == 0.0 ||
           std::signbit(actual_delta) != std::signbit(expected_delta) ||
           std::abs(actual_delta - expected_delta) > tolerance)
         return false;
     }
   return true;
-}
-
-bool GlobalRelativeDifference(const std::vector<double>& left,
-                              const std::vector<double>& right,
-                              double& relative_difference,
-                              const MPI_Comm communicator)
-{
-  std::array<double, 3> local{};
-  bool local_valid = left.size() == right.size() && !left.empty();
-  for (std::size_t index = 0; local_valid && index < left.size(); ++index)
-  {
-    const double difference = left[index] - right[index];
-    local_valid = std::isfinite(left[index]) && std::isfinite(right[index]) &&
-        std::isfinite(difference);
-    local[0] += difference * difference;
-    local[1] += left[index] * left[index];
-    local[2] += right[index] * right[index];
-  }
-  if (!local_valid) local.fill(std::numeric_limits<double>::infinity());
-  std::array<double, 3> global{};
-  const bool reduced = MPI_Allreduce(
-      local.data(), global.data(), static_cast<int>(global.size()), MPI_DOUBLE,
-      MPI_SUM, communicator) == MPI_SUCCESS;
-  const double denominator = reduced
-      ? std::max({1.0, std::sqrt(global[1]), std::sqrt(global[2])})
-      : 1.0;
-  relative_difference = reduced ? std::sqrt(global[0]) / denominator
-                                : std::numeric_limits<double>::infinity();
-  return All(reduced && local_valid && std::isfinite(relative_difference),
-             communicator);
 }
 
 bool BoundaryCoverage(const BoundaryContext& context,
@@ -881,10 +1533,10 @@ int main(int argc, char* argv[])
   std::vector<double> conventional_zero_source_state;
   std::vector<double> igr_empty_source_state;
   std::vector<double> igr_zero_source_state;
-  std::vector<double> conventional_nonuniform_state;
-  std::vector<double> igr_nonuniform_state;
-  const bool copied_trace_and_boundaries = order > 0 &&
-      CheckCopiedTraceAndBoundaryClosures(order, ranks);
+  const bool copied_initial_trace = order > 0 &&
+      CheckCopiedInitialTrueTrace(order);
+  const bool all_seven_boundary_policies = order > 0 &&
+      CheckAllSevenLoweredBoundaryPolicies(order);
   const bool igr_algebra = order > 0 && CheckIgrAlgebra(order, ranks);
   const bool conventional_periodic = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::nonzero,
@@ -918,20 +1570,6 @@ int main(int argc, char* argv[])
       order, false, RegularizationKind::igr, SourceMode::explicit_zero,
       InitialMode::constant,
       igr_zero_source_state);
-  const bool conventional_nonuniform = order > 0 && CheckLifecycle(
-      order, false, RegularizationKind::none, SourceMode::empty,
-      InitialMode::smooth_periodic, conventional_nonuniform_state);
-  const bool igr_nonuniform = order > 0 && CheckLifecycle(
-      order, false, RegularizationKind::igr, SourceMode::empty,
-      InitialMode::smooth_periodic, igr_nonuniform_state);
-  double nonuniform_relative_difference =
-      std::numeric_limits<double>::infinity();
-  const bool nonuniform_difference_ready = GlobalRelativeDifference(
-      conventional_nonuniform_state, igr_nonuniform_state,
-      nonuniform_relative_difference, MPI_COMM_WORLD);
-  const bool igr_nonuniform_effect = conventional_nonuniform &&
-      igr_nonuniform && nonuniform_difference_ready &&
-      nonuniform_relative_difference > 1.0e-10;
   const bool source_equivalence = conventional_empty_source &&
       conventional_zero_source && igr_empty_source && igr_zero_source &&
       NearValues(conventional_empty_source_state,
@@ -943,29 +1581,25 @@ int main(int argc, char* argv[])
                       conventional_physical_state) &&
       DifferentValues(igr_periodic_state, igr_physical_state);
   const bool passed = (ranks == 1 || ranks == 2) && All(
-      admission && copied_trace_and_boundaries && igr_algebra &&
+      admission && copied_initial_trace && all_seven_boundary_policies &&
+      igr_algebra &&
       conventional_periodic && conventional_physical &&
-      igr_periodic && igr_physical && boundary_effect && source_equivalence &&
-      igr_nonuniform_effect);
+      igr_periodic && igr_physical && boundary_effect && source_equivalence);
   if (!passed)
   {
     std::cerr << "generic CUDA Euler-extension qualification failed rank="
               << rank << " ranks=" << ranks << " order=" << order
               << " admission=" << admission
-              << " copied_trace_and_boundaries="
-              << copied_trace_and_boundaries
+              << " copied_initial_trace=" << copied_initial_trace
+              << " all_seven_boundary_policies="
+              << all_seven_boundary_policies
               << " igr_algebra=" << igr_algebra
               << " conventional_periodic=" << conventional_periodic
               << " conventional_physical=" << conventional_physical
               << " igr_periodic=" << igr_periodic
               << " igr_physical=" << igr_physical
               << " boundary_effect=" << boundary_effect
-              << " source_equivalence=" << source_equivalence
-              << " conventional_nonuniform=" << conventional_nonuniform
-              << " igr_nonuniform=" << igr_nonuniform
-              << " igr_nonuniform_effect=" << igr_nonuniform_effect
-              << " nonuniform_relative_difference="
-              << nonuniform_relative_difference << '\n';
+              << " source_equivalence=" << source_equivalence << '\n';
     return EXIT_FAILURE;
   }
   return EXIT_SUCCESS;
