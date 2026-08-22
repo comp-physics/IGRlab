@@ -1658,8 +1658,7 @@ bool CheckSuppliedInitialTraceWithZeroLocalExtent()
       1, 2, mfem::FiniteElement::VALUE, mfem::BasisType::GaussLegendre);
   mfem::ParFiniteElementSpace trace_space(
       &mesh, &trace_collection, 4, mfem::Ordering::byNODES);
-  const std::size_t local_true_size = static_cast<std::size_t>(
-      trace_space.GetTrueVSize());
+  const int local_true_size = trace_space.GetTrueVSize();
   int has_empty_true_trace = local_true_size == 0 ? 1 : 0;
   if (MPI_Allreduce(MPI_IN_PLACE, &has_empty_true_trace, 1, MPI_INT, MPI_MAX,
                     mesh.GetComm()) != MPI_SUCCESS ||
@@ -1667,7 +1666,87 @@ bool CheckSuppliedInitialTraceWithZeroLocalExtent()
   {
     return false;
   }
-  std::vector<double> supplied(local_true_size, 0.0);
+
+  // An external trace must be the same trace restriction used by the derived
+  // compatibility path.  A finite all-zero Uhat is shape-valid, but it is not
+  // admissible for this uniform positive Euler state.
+  mfem::L2_FECollection interior_collection(
+      1, 2, mfem::BasisType::GaussLegendre, mfem::FiniteElement::VALUE);
+  mfem::ParFiniteElementSpace interior_space(
+      &mesh, &interior_collection, 4, mfem::Ordering::byNODES);
+  mfem::ParGridFunction local_interior(&interior_space);
+  if (local_interior.Size() != static_cast<int>(fields.initial.size()))
+  {
+    return false;
+  }
+  for (int index = 0; index < local_interior.Size(); ++index)
+  {
+    local_interior[index] = fields.initial[static_cast<std::size_t>(index)];
+  }
+  mfem::ParGridFunction local_trace(&trace_space);
+  mfem::Vector projected_true_trace(local_true_size);
+  local_trace = 0.0;
+  for (int face = 0; face < mesh.GetNumFaces(); ++face)
+  {
+    mfem::FaceElementTransformations* const transformations =
+        mesh.GetFaceElementTransformations(face);
+    const mfem::FiniteElement* const trace_element =
+        trace_space.GetFaceElement(face);
+    if (!transformations || !trace_element || transformations->Elem1No < 0 ||
+        transformations->Elem1No >= mesh.GetNE())
+    {
+      return false;
+    }
+    const mfem::FiniteElement* const interior_element =
+        interior_space.GetFE(transformations->Elem1No);
+    mfem::Array<int> interior_vdofs;
+    mfem::Array<int> trace_vdofs;
+    interior_space.GetElementVDofs(transformations->Elem1No, interior_vdofs);
+    trace_space.GetFaceVDofs(face, trace_vdofs);
+    if (!interior_element ||
+        interior_vdofs.Size() != 4 * interior_element->GetDof() ||
+        trace_vdofs.Size() != 4 * trace_element->GetDof())
+    {
+      return false;
+    }
+    mfem::Vector shape(interior_element->GetDof());
+    const mfem::IntegrationRule& nodes = trace_element->GetNodes();
+    for (int scalar = 0; scalar < trace_element->GetDof(); ++scalar)
+    {
+      const mfem::IntegrationPoint& point = nodes.IntPoint(scalar);
+      transformations->SetAllIntPoints(&point);
+      interior_element->CalcShape(transformations->GetElement1IntPoint(), shape);
+      for (int component = 0; component < 4; ++component)
+      {
+        double restricted = 0.0;
+        for (int interior_scalar = 0;
+             interior_scalar < interior_element->GetDof(); ++interior_scalar)
+        {
+          double sign = 1.0;
+          const int dof = mfem::FiniteElementSpace::DecodeDof(
+              interior_vdofs[ByNodes(interior_scalar,
+                                     interior_element->GetDof(), component)],
+              sign);
+          if (dof < 0 || dof >= local_interior.Size()) return false;
+          restricted += shape[interior_scalar] * sign * local_interior[dof];
+        }
+        double sign = 1.0;
+        const int dof = mfem::FiniteElementSpace::DecodeDof(
+            trace_vdofs[ByNodes(scalar, trace_element->GetDof(), component)],
+            sign);
+        if (dof < 0 || dof >= local_trace.Size()) return false;
+        local_trace[dof] = sign * restricted;
+      }
+    }
+  }
+  local_trace.ParallelProject(projected_true_trace);
+  const double* const projected = projected_true_trace.HostRead();
+  if (projected == nullptr && projected_true_trace.Size() != 0) return false;
+  std::vector<double> supplied;
+  if (projected_true_trace.Size() != 0)
+  {
+    supplied.assign(projected, projected + projected_true_trace.Size());
+  }
   request.initial_true_trace = {
       supplied.empty() ? nullptr : supplied.data(), supplied.size(), 4};
 
