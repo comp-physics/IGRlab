@@ -1,4 +1,5 @@
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh"
+#include "physics/bc/detail/euler_boundary_state.hpp"
 
 #include <HYPRE_krylov.h>
 #include <HYPRE_utilities.h>
@@ -1240,114 +1241,38 @@ __device__ bool LocalLlfSpeed(const double* state, const double nx,
   return isfinite(sound) && isfinite(speed) && speed > 0.0;
 }
 
-struct CudaPrimitiveNormalState
+__device__ bool MapStaticBoundaryKind(
+    const int kind, mfem::detail::EulerBoundaryStateKind& mapped)
 {
-  double rho, pressure, normal_velocity, tangential_velocity, sound_speed;
-};
-
-__device__ CudaPrimitiveNormalState ToPrimitiveNormal(
-    const double* state, const double gamma, const double nx, const double ny,
-    const double tx, const double ty)
-{
-  const double rho = fmax(state[0], 1.0e-12);
-  const double ux = state[1] / rho;
-  const double uy = state[2] / rho;
-  const double pressure = fmax((gamma - 1.0) *
-      (state[3] - 0.5 * rho * (ux * ux + uy * uy)), 1.0e-12);
-  return {rho, pressure, ux * nx + uy * ny, ux * tx + uy * ty,
-          sqrt(fmax(gamma * pressure / rho, 0.0))};
-}
-
-__device__ void FromPrimitiveNormal(
-    const CudaPrimitiveNormalState& primitive, const double gamma,
-    const double nx, const double ny, const double tx, const double ty,
-    double* state)
-{
-  const double ux = primitive.normal_velocity * nx +
-      primitive.tangential_velocity * tx;
-  const double uy = primitive.normal_velocity * ny +
-      primitive.tangential_velocity * ty;
-  state[0] = primitive.rho;
-  state[1] = primitive.rho * ux;
-  state[2] = primitive.rho * uy;
-  state[3] = primitive.pressure / (gamma - 1.0) +
-      0.5 * primitive.rho * (ux * ux + uy * uy);
-}
-
-__device__ double EntropyLike(const CudaPrimitiveNormalState& state,
-                              const double gamma)
-{ return state.pressure / pow(fmax(state.rho, 1.0e-12), gamma); }
-
-__device__ CudaPrimitiveNormalState PressureOutletClosure(
-    const CudaPrimitiveNormalState& inner, const double gamma,
-    const double pressure_out)
-{
-  CudaPrimitiveNormalState result = inner;
-  if (inner.normal_velocity >= inner.sound_speed ||
-      inner.normal_velocity <= -inner.sound_speed)
-    return result;
-  const double gm1 = gamma - 1.0;
-  const double entropy = EntropyLike(inner, gamma);
-  const double pressure = fmax(pressure_out, 1.0e-12);
-  const double rho = pow(pressure / entropy, 1.0 / gamma);
-  const double sound = sqrt(fmax(gamma * pressure / rho, 0.0));
-  const double invariant =
-      inner.normal_velocity + 2.0 * inner.sound_speed / gm1;
-  result.rho = fmax(rho, 1.0e-12);
-  result.pressure = pressure;
-  result.sound_speed = sound;
-  result.normal_velocity = invariant - 2.0 * sound / gm1;
-  return result;
-}
-
-__device__ CudaPrimitiveNormalState NonreflectingClosure(
-    const CudaPrimitiveNormalState& inner,
-    const CudaPrimitiveNormalState& reference, const double gamma)
-{
-  CudaPrimitiveNormalState result = inner;
-  if (inner.normal_velocity >= inner.sound_speed ||
-      inner.normal_velocity <= -inner.sound_speed)
-    return result;
-  const double gm1 = gamma - 1.0;
-  const double plus = inner.normal_velocity + 2.0 * inner.sound_speed / gm1;
-  const double minus = reference.normal_velocity -
-      2.0 * reference.sound_speed / gm1;
-  const double normal_velocity = 0.5 * (plus + minus);
-  const double sound = 0.25 * gm1 * (plus - minus);
-  if (!(sound > 0.0)) return result;
-  const double entropy = EntropyLike(reference, gamma);
-  const double rho = pow((sound * sound) /
-      fmax(gamma * entropy, 1.0e-12), 1.0 / gm1);
-  result.rho = fmax(rho, 1.0e-12);
-  result.pressure = fmax(entropy * pow(result.rho, gamma), 1.0e-12);
-  result.sound_speed = sound;
-  result.normal_velocity = normal_velocity;
-  result.tangential_velocity = inner.tangential_velocity;
-  return result;
-}
-
-__device__ CudaPrimitiveNormalState SubsonicInletClosure(
-    const CudaPrimitiveNormalState& inner,
-    const CudaPrimitiveNormalState& target, const double gamma)
-{
-  if (inner.normal_velocity <= -inner.sound_speed) return target;
-  if (inner.normal_velocity >= inner.sound_speed) return inner;
-  CudaPrimitiveNormalState result = target;
-  const double gm1 = gamma - 1.0;
-  const double plus = inner.normal_velocity + 2.0 * inner.sound_speed / gm1;
-  const double minus =
-      target.normal_velocity - 2.0 * target.sound_speed / gm1;
-  const double normal_velocity = 0.5 * (plus + minus);
-  const double sound = 0.25 * gm1 * (plus - minus);
-  if (!(sound > 0.0)) return target;
-  const double entropy = EntropyLike(target, gamma);
-  const double rho = pow((sound * sound) /
-      fmax(gamma * entropy, 1.0e-12), 1.0 / gm1);
-  result.rho = fmax(rho, 1.0e-12);
-  result.pressure = fmax(entropy * pow(result.rho, gamma), 1.0e-12);
-  result.sound_speed = sound;
-  result.normal_velocity = normal_velocity;
-  return result;
+  switch (static_cast<CudaStaticBoundaryPolicyKind>(kind))
+  {
+  case CudaStaticBoundaryPolicyKind::supersonic_inlet:
+    mapped = mfem::detail::EulerBoundaryStateKind::supersonic_inlet;
+    return true;
+  case CudaStaticBoundaryPolicyKind::supersonic_outlet:
+    mapped = mfem::detail::EulerBoundaryStateKind::supersonic_outlet;
+    return true;
+  case CudaStaticBoundaryPolicyKind::slip_wall:
+    mapped = mfem::detail::EulerBoundaryStateKind::slip_wall;
+    return true;
+  case CudaStaticBoundaryPolicyKind::subsonic_inlet:
+    mapped = mfem::detail::EulerBoundaryStateKind::subsonic_inlet;
+    return true;
+  case CudaStaticBoundaryPolicyKind::subsonic_outlet_pressure:
+    mapped = mfem::detail::EulerBoundaryStateKind::subsonic_outlet_pressure;
+    return true;
+  case CudaStaticBoundaryPolicyKind::far_field:
+    mapped = mfem::detail::EulerBoundaryStateKind::far_field;
+    return true;
+  case CudaStaticBoundaryPolicyKind::nonreflecting_outlet:
+    mapped = mfem::detail::EulerBoundaryStateKind::nonreflecting_outlet;
+    return true;
+  case CudaStaticBoundaryPolicyKind::none:
+  case CudaStaticBoundaryPolicyKind::subsonic_outlet:
+  case CudaStaticBoundaryPolicyKind::nonreflecting:
+    return false;
+  }
+  return false;
 }
 
 __device__ bool StaticBoundaryExterior(
@@ -1359,82 +1284,26 @@ __device__ bool StaticBoundaryExterior(
       !isfinite(normal_y) || !(gamma > 1.0) || !isfinite(gamma))
     return false;
   const double normal_norm = sqrt(normal_x * normal_x + normal_y * normal_y);
-  if (!(normal_norm > 0.0) || !isfinite(normal_norm)) return false;
-  const double nx = normal_x / normal_norm;
-  const double ny = normal_y / normal_norm;
-  const double tx = -ny;
-  const double ty = nx;
-  if (kind == static_cast<int>(CudaStaticBoundaryPolicyKind::supersonic_inlet))
-  {
-    if (!reference || !PhysicallyAdmissible(reference)) return false;
-    for (int component = 0; component < conserved_components; ++component)
-      exterior[component] = reference[component];
-    return true;
-  }
-  if (kind == static_cast<int>(CudaStaticBoundaryPolicyKind::supersonic_outlet))
-  {
-    for (int component = 0; component < conserved_components; ++component)
-      exterior[component] = interior[component];
-    return true;
-  }
-  if (kind == static_cast<int>(CudaStaticBoundaryPolicyKind::slip_wall))
-  {
-    const double normal_squared = nx * nx + ny * ny;
-    if (!(normal_squared > 0.0) || !isfinite(normal_squared)) return false;
-    const double rho = fmax(interior[0], 1.0e-12);
-    const double ux = interior[1] / rho;
-    const double uy = interior[2] / rho;
-    const double normal_velocity = ux * nx + uy * ny;
-    exterior[0] = interior[0];
-    exterior[1] = rho * (ux - 2.0 * normal_velocity * nx / normal_squared);
-    exterior[2] = rho * (uy - 2.0 * normal_velocity * ny / normal_squared);
-    exterior[3] = interior[3];
-    return PhysicallyAdmissible(exterior);
-  }
-  const CudaPrimitiveNormalState inner =
-      ToPrimitiveNormal(interior, gamma, nx, ny, tx, ty);
-  CudaPrimitiveNormalState boundary = inner;
-  if (kind == static_cast<int>(
-          CudaStaticBoundaryPolicyKind::subsonic_outlet_pressure))
-    boundary = PressureOutletClosure(inner, gamma, pressure_out);
-  else if (kind == static_cast<int>(
-               CudaStaticBoundaryPolicyKind::nonreflecting_outlet))
-  {
-    if (!reference || !PhysicallyAdmissible(reference)) return false;
-    boundary = NonreflectingClosure(
-        inner, ToPrimitiveNormal(reference, gamma, nx, ny, tx, ty), gamma);
-  }
-  else if (kind == static_cast<int>(
-               CudaStaticBoundaryPolicyKind::subsonic_inlet))
-  {
-    if (!reference || !PhysicallyAdmissible(reference)) return false;
-    boundary = SubsonicInletClosure(
-        inner, ToPrimitiveNormal(reference, gamma, nx, ny, tx, ty), gamma);
-  }
-  else if (kind == static_cast<int>(CudaStaticBoundaryPolicyKind::far_field))
-  {
-    if (!reference || !PhysicallyAdmissible(reference)) return false;
-    const CudaPrimitiveNormalState far =
-        ToPrimitiveNormal(reference, gamma, nx, ny, tx, ty);
-    if (inner.normal_velocity <= -inner.sound_speed)
-    {
-      for (int component = 0; component < conserved_components; ++component)
-        exterior[component] = reference[component];
-      return true;
-    }
-    if (inner.normal_velocity >= inner.sound_speed)
-    {
-      for (int component = 0; component < conserved_components; ++component)
-        exterior[component] = interior[component];
-      return true;
-    }
-    boundary = inner.normal_velocity < 0.0
-        ? SubsonicInletClosure(inner, far, gamma)
-        : NonreflectingClosure(inner, far, gamma);
-  }
-  else
+  if (!(normal_norm > 0.0) || !isfinite(normal_norm))
     return false;
-  FromPrimitiveNormal(boundary, gamma, nx, ny, tx, ty, exterior);
+
+  mfem::detail::EulerBoundaryStateKind mapped{};
+  if (!MapStaticBoundaryKind(kind, mapped))
+    return false;
+  const bool reference_required =
+      mapped == mfem::detail::EulerBoundaryStateKind::supersonic_inlet ||
+      mapped == mfem::detail::EulerBoundaryStateKind::subsonic_inlet ||
+      mapped == mfem::detail::EulerBoundaryStateKind::far_field ||
+      mapped == mfem::detail::EulerBoundaryStateKind::nonreflecting_outlet;
+  if (reference_required &&
+      (reference == nullptr || !PhysicallyAdmissible(reference)))
+    return false;
+
+  const double normal[dimension] = {normal_x, normal_y};
+  if (!mfem::detail::EvaluateEulerBoundaryState(
+          mapped, dimension, conserved_components, gamma, pressure_out,
+          reference, normal, interior, exterior))
+    return false;
   return PhysicallyAdmissible(exterior);
 }
 
