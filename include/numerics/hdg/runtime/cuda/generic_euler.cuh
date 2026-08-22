@@ -1136,6 +1136,11 @@ private:
           !config.borrowed_mesh->Nonconforming() &&
           config.borrowed_mesh->Dimension() == cuda_w8a::dimension &&
           config.borrowed_mesh->SpaceDimension() == cuda_w8a::dimension &&
+          // The current rank1/rank2 CUDA trace/HYPRE construction dereferences
+          // a local element FE during topology setup.  Until an empty local
+          // space is represented end to end, reject any zero-owned rank here,
+          // collectively and before device selection/allocation.  The shared
+          // generic contract remains broader; this backend returns `rejected`.
           config.borrowed_mesh->GetNE() > 0;
       for (int element = 0; local && element < config.borrowed_mesh->GetNE();
            ++element)

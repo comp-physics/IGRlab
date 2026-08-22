@@ -1315,6 +1315,348 @@ public:
     return DistributeCurrentTrace(workspace.trace.coefficients);
   }
 
+  /**
+   * Test-only central-difference audit of the production device assembler.
+   * It stages no output and publishes no slot; the reusable workspace is
+   * restored to the unperturbed test linearization before returning.
+   */
+  bool VerifyBorrowedEulerAssemblerJacobianForTests(
+      const double relative_tolerance,
+      std::array<double, 6>& relative_errors) noexcept
+  {
+    relative_errors.fill(std::numeric_limits<double>::infinity());
+    const bool admitted = initialized_ && shape_.borrowed_host_inputs &&
+        shape_.igr_active && shape_.interior_components ==
+            igr_interior_components &&
+        shape_.trace_components == igr_trace_components &&
+        std::isfinite(relative_tolerance) && relative_tolerance > 0.0;
+    if (!CollectiveContinue(admitted)) return false;
+
+    std::vector<double> base_interior, base_true_trace;
+    std::vector<double> interior_direction, true_trace_direction;
+    std::vector<double> element_trace_direction;
+    std::vector<double> matrix_a, matrix_b, matrix_c, matrix_d;
+    std::vector<double> a_direction, b_direction, c_direction, d_direction;
+    bool local_valid = true;
+    try
+    {
+      base_interior.resize(static_cast<std::size_t>(shape_.interior_count));
+      base_true_trace.resize(static_cast<std::size_t>(shape_.true_trace_count));
+      interior_direction.resize(base_interior.size());
+      true_trace_direction.resize(base_true_trace.size());
+      element_trace_direction.resize(static_cast<std::size_t>(shape_.elements) *
+                                     shape_.trace_dofs);
+      matrix_a.resize(static_cast<std::size_t>(shape_.elements) *
+                      shape_.interior_dofs * shape_.interior_dofs);
+      matrix_b.resize(static_cast<std::size_t>(shape_.elements) *
+                      shape_.interior_dofs * shape_.trace_dofs);
+      matrix_c.resize(static_cast<std::size_t>(shape_.elements) *
+                      shape_.trace_dofs * shape_.interior_dofs);
+      matrix_d.resize(static_cast<std::size_t>(shape_.elements) *
+                      shape_.trace_dofs * shape_.trace_dofs);
+      a_direction.assign(base_interior.size(), 0.0);
+      b_direction.assign(base_interior.size(), 0.0);
+      c_direction.assign(element_trace_direction.size(), 0.0);
+      d_direction.assign(element_trace_direction.size(), 0.0);
+    }
+    catch (...) { local_valid = false; }
+    if (!CollectiveContinue(local_valid)) return false;
+
+    const auto d2h = [](double* destination, const double* source,
+                        const std::size_t count) noexcept
+    {
+      return TransportPolicy::DeviceToHost(
+          destination, source, count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    };
+    const auto h2d = [](double* destination, const double* source,
+                        const std::size_t count) noexcept
+    {
+      return TransportPolicy::HostToDevice(
+          destination, source, count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    };
+    local_valid = d2h(base_interior.data(),
+                      committed_slot_.interior.coefficients,
+                      base_interior.size()) &&
+        d2h(base_true_trace.data(), committed_slot_.trace.coefficients,
+            base_true_trace.size()) &&
+        TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+    if (!CollectiveContinue(local_valid)) return false;
+
+    const auto deterministic_unit = [](const std::size_t index,
+                                       const std::uint64_t salt) noexcept
+    {
+      std::uint64_t value =
+          (static_cast<std::uint64_t>(index) + 1U) *
+              11400714819323198485ULL +
+          salt * 7046029254386353131ULL;
+      value ^= value >> 29U;
+      const double magnitude = 0.25 + 0.75 *
+          static_cast<double>((value >> 8U) % 29U) / 28.0;
+      return (value & 1U) == 0U ? magnitude : -magnitude;
+    };
+    for (int element = 0; element < shape_.elements; ++element)
+      for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
+      {
+        const std::size_t base = static_cast<std::size_t>(element) *
+            shape_.interior_dofs;
+        const std::size_t ordinal = static_cast<std::size_t>(element) *
+            shape_.scalar_interior_dofs + scalar;
+        base_interior[base + scalar +
+            4 * shape_.scalar_interior_dofs] =
+            0.035 * deterministic_unit(ordinal, 11U);
+        base_interior[base + scalar +
+            5 * shape_.scalar_interior_dofs] =
+            0.025 * deterministic_unit(ordinal, 17U);
+        base_interior[base + scalar +
+            6 * shape_.scalar_interior_dofs] =
+            0.025 * deterministic_unit(ordinal, 23U);
+      }
+    const int true_trace_scalar = shape_.true_trace_count /
+        shape_.trace_components;
+    local_valid = true_trace_scalar * shape_.trace_components ==
+        shape_.true_trace_count;
+    for (int scalar = 0; local_valid && scalar < true_trace_scalar; ++scalar)
+      base_true_trace[static_cast<std::size_t>(4 * true_trace_scalar + scalar)] =
+          0.02 * deterministic_unit(static_cast<std::size_t>(scalar), 31U);
+    for (std::size_t index = 0; index < base_interior.size(); ++index)
+      interior_direction[index] = deterministic_unit(index, 41U) *
+          std::max(1.0, std::abs(base_interior[index]));
+    for (std::size_t index = 0; index < base_true_trace.size(); ++index)
+      true_trace_direction[index] = deterministic_unit(index, 47U) *
+          std::max(1.0, std::abs(base_true_trace[index]));
+    if (!CollectiveContinue(local_valid)) return false;
+
+    const auto install_state = [&](const std::vector<double>& interior,
+                                   const std::vector<double>& trace) noexcept
+    {
+      const bool uploaded = h2d(view_.work_interior, interior.data(),
+                                interior.size()) &&
+          h2d(view_.work_true_trace, trace.data(), trace.size()) &&
+          TransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      if (!CollectiveContinue(uploaded)) return false;
+      return DistributeCurrentTrace(view_.work_true_trace);
+    };
+    const auto assemble = [&](const std::vector<double>& interior,
+                              const std::vector<double>& trace,
+                              std::vector<double>* residual_interior,
+                              std::vector<double>* residual_trace) noexcept
+    {
+      if (!install_state(interior, trace)) return false;
+      TransportPolicy::SetPhase(CudaFailurePhase::assembly,
+                                current_generation_);
+      const bool assembled = CudaLaunchAssembly(
+              view_, shape_, fixed_dt) &&
+          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+          StatusPassed();
+      if (!CollectiveContinue(assembled)) return false;
+      if (residual_interior == nullptr || residual_trace == nullptr)
+        return true;
+      bool copied = true;
+      try
+      {
+        residual_interior->resize(
+            static_cast<std::size_t>(shape_.interior_count));
+        residual_trace->resize(static_cast<std::size_t>(shape_.elements) *
+                               shape_.trace_dofs);
+      }
+      catch (...) { copied = false; }
+      if (!CollectiveContinue(copied)) return false;
+      copied = d2h(residual_interior->data(), view_.residual_r,
+                   residual_interior->size()) &&
+          d2h(residual_trace->data(), view_.residual_g,
+              residual_trace->size()) &&
+          TransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      return CollectiveContinue(copied);
+    };
+
+    local_valid = h2d(view_.old_interior, base_interior.data(),
+                      base_interior.size()) &&
+        TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+    if (!CollectiveContinue(local_valid) ||
+        !assemble(base_interior, base_true_trace, nullptr, nullptr))
+      return false;
+    local_valid = d2h(matrix_a.data(), view_.a, matrix_a.size()) &&
+        d2h(matrix_b.data(), view_.b, matrix_b.size()) &&
+        d2h(matrix_c.data(), view_.c, matrix_c.size()) &&
+        d2h(matrix_d.data(), view_.d, matrix_d.size()) &&
+        TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+    if (!CollectiveContinue(local_valid)) return false;
+
+    // Use the production owner/ghost distribution to obtain the exact signed
+    // element-local trace direction consumed by B and D.
+    local_valid = h2d(view_.work_true_trace, true_trace_direction.data(),
+                      true_trace_direction.size()) &&
+        TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+    if (!CollectiveContinue(local_valid) ||
+        !DistributeCurrentTrace(view_.work_true_trace))
+      return false;
+    local_valid = d2h(element_trace_direction.data(),
+                      view_.current_local_trace,
+                      element_trace_direction.size()) &&
+        TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+    if (!CollectiveContinue(local_valid)) return false;
+
+    for (int element = 0; element < shape_.elements; ++element)
+    {
+      const std::size_t interior_offset =
+          static_cast<std::size_t>(element) * shape_.interior_dofs;
+      const std::size_t trace_offset =
+          static_cast<std::size_t>(element) * shape_.trace_dofs;
+      const std::size_t a_offset = interior_offset * shape_.interior_dofs;
+      const std::size_t b_offset = static_cast<std::size_t>(element) *
+          shape_.interior_dofs * shape_.trace_dofs;
+      const std::size_t c_offset = static_cast<std::size_t>(element) *
+          shape_.trace_dofs * shape_.interior_dofs;
+      const std::size_t d_offset = trace_offset * shape_.trace_dofs;
+      for (int row = 0; row < shape_.interior_dofs; ++row)
+      {
+        for (int column = 0; column < shape_.interior_dofs; ++column)
+          a_direction[interior_offset + row] += matrix_a[
+              a_offset + static_cast<std::size_t>(row) *
+                  shape_.interior_dofs + column] *
+              interior_direction[interior_offset + column];
+        for (int column = 0; column < shape_.trace_dofs; ++column)
+          b_direction[interior_offset + row] += matrix_b[
+              b_offset + static_cast<std::size_t>(row) *
+                  shape_.trace_dofs + column] *
+              element_trace_direction[trace_offset + column];
+      }
+      for (int row = 0; row < shape_.trace_dofs; ++row)
+      {
+        for (int column = 0; column < shape_.interior_dofs; ++column)
+          c_direction[trace_offset + row] += matrix_c[
+              c_offset + static_cast<std::size_t>(row) *
+                  shape_.interior_dofs + column] *
+              interior_direction[interior_offset + column];
+        for (int column = 0; column < shape_.trace_dofs; ++column)
+          d_direction[trace_offset + row] += matrix_d[
+              d_offset + static_cast<std::size_t>(row) *
+                  shape_.trace_dofs + column] *
+              element_trace_direction[trace_offset + column];
+      }
+    }
+
+    const double difference_step =
+        std::cbrt(std::numeric_limits<double>::epsilon());
+    const auto central_difference = [&](const bool perturb_interior,
+                                        const bool perturb_trace,
+                                        std::vector<double>& difference_r,
+                                        std::vector<double>& difference_g)
+        noexcept
+    {
+      std::vector<double> plus_interior, minus_interior;
+      std::vector<double> plus_trace, minus_trace;
+      std::vector<double> plus_r, plus_g, minus_r, minus_g;
+      bool ready = true;
+      try
+      {
+        plus_interior = base_interior;
+        minus_interior = base_interior;
+        plus_trace = base_true_trace;
+        minus_trace = base_true_trace;
+        if (perturb_interior)
+          for (std::size_t index = 0; index < base_interior.size(); ++index)
+          {
+            plus_interior[index] += difference_step *
+                interior_direction[index];
+            minus_interior[index] -= difference_step *
+                interior_direction[index];
+          }
+        if (perturb_trace)
+          for (std::size_t index = 0; index < base_true_trace.size(); ++index)
+          {
+            plus_trace[index] += difference_step * true_trace_direction[index];
+            minus_trace[index] -= difference_step * true_trace_direction[index];
+          }
+      }
+      catch (...) { ready = false; }
+      if (!CollectiveContinue(ready) ||
+          !assemble(plus_interior, plus_trace, &plus_r, &plus_g) ||
+          !assemble(minus_interior, minus_trace, &minus_r, &minus_g))
+        return false;
+      try
+      {
+        difference_r.resize(plus_r.size());
+        difference_g.resize(plus_g.size());
+        const double inverse_width = 0.5 / difference_step;
+        for (std::size_t index = 0; index < difference_r.size(); ++index)
+          difference_r[index] = inverse_width *
+              (plus_r[index] - minus_r[index]);
+        for (std::size_t index = 0; index < difference_g.size(); ++index)
+          difference_g[index] = inverse_width *
+              (plus_g[index] - minus_g[index]);
+      }
+      catch (...) { return CollectiveContinue(false); }
+      return CollectiveContinue(true);
+    };
+
+    std::vector<double> difference_a, difference_c;
+    std::vector<double> difference_b, difference_d;
+    std::vector<double> difference_combined_r, difference_combined_g;
+    if (!central_difference(true, false, difference_a, difference_c) ||
+        !central_difference(false, true, difference_b, difference_d) ||
+        !central_difference(true, true, difference_combined_r,
+                            difference_combined_g))
+      return false;
+    std::vector<double> combined_r(a_direction.size(), 0.0);
+    std::vector<double> combined_g(c_direction.size(), 0.0);
+    for (std::size_t index = 0; index < combined_r.size(); ++index)
+      combined_r[index] = a_direction[index] + b_direction[index];
+    for (std::size_t index = 0; index < combined_g.size(); ++index)
+      combined_g[index] = c_direction[index] + d_direction[index];
+
+    const auto relative_error = [&](const std::vector<double>& difference,
+                                    const std::vector<double>& linearized,
+                                    double& error) noexcept
+    {
+      if (!CollectiveContinue(difference.size() == linearized.size()))
+        return false;
+      std::array<double, 4> local{};
+      for (std::size_t index = 0; index < difference.size(); ++index)
+      {
+        const double delta = difference[index] - linearized[index];
+        local[0] += delta * delta;
+        local[1] += difference[index] * difference[index];
+        local[2] += linearized[index] * linearized[index];
+      }
+      local[3] = static_cast<double>(difference.size());
+      std::array<double, 4> global{};
+      const bool reduced = MPI_Allreduce(
+          local.data(), global.data(), static_cast<int>(global.size()),
+          MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+      if (!CollectiveContinue(reduced)) return false;
+      const double denominator = std::max({
+          std::sqrt(global[1]), std::sqrt(global[2]),
+          difference_step * std::sqrt(std::max(1.0, global[3]))});
+      error = std::sqrt(global[0]) / denominator;
+      return CollectiveContinue(std::isfinite(error));
+    };
+    local_valid = relative_error(difference_a, a_direction,
+                                 relative_errors[0]) &&
+        relative_error(difference_b, b_direction, relative_errors[1]) &&
+        relative_error(difference_c, c_direction, relative_errors[2]) &&
+        relative_error(difference_d, d_direction, relative_errors[3]) &&
+        relative_error(difference_combined_r, combined_r,
+                       relative_errors[4]) &&
+        relative_error(difference_combined_g, combined_g,
+                       relative_errors[5]);
+    if (!local_valid) return false;
+
+    const bool restored = assemble(
+        base_interior, base_true_trace, nullptr, nullptr);
+    const bool within_tolerance = std::all_of(
+        relative_errors.begin(), relative_errors.end(),
+        [relative_tolerance](const double error)
+        { return std::isfinite(error) && error <= relative_tolerance; });
+    return restored && CollectiveContinue(within_tolerance);
+  }
+
   bool IgrConservationBalance(const double dt, double& maximum_error,
                               double& maximum_relative_error) noexcept
   {

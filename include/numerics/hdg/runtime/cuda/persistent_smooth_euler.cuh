@@ -1074,6 +1074,20 @@ public:
             pending_.attempt.dt, maximum_error, maximum_relative_error);
   }
 
+  /** Detail-only central-difference check of the production CUDA assembler. */
+  bool VerifyBorrowedEulerAssemblerJacobianForTests(
+      const double relative_tolerance,
+      std::array<double, 6>& relative_errors) noexcept
+  {
+    relative_errors.fill(std::numeric_limits<double>::infinity());
+    return initialized_ && !pending_.active &&
+        config_.use_generic_numerical_policy &&
+        config_.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::igr &&
+        numerics_.VerifyBorrowedEulerAssemblerJacobianForTests(
+            relative_tolerance, relative_errors);
+  }
+
   /** Export only the currently staged candidate; no logical publication occurs. */
   bool ExportPreparedInterior(CudaMutableHostL2Output destination) noexcept
   {
