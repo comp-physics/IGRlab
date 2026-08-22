@@ -1,6 +1,7 @@
 #pragma once
 
 #include "numerics/hdg/generic/contract.hpp"
+#include "numerics/hdg/generic/session_contract.hpp"
 
 /**
  * @file numerics/hdg/runtime/cpu/persistent_smooth_euler.hpp
