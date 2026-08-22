@@ -7,6 +7,11 @@ if(NOT MFEM_USE_CUDA)
 if(NOT TARGET dg_igr_hdg_main_backend_cpu)
   message(FATAL_ERROR "The generic CPU HDG main backend is required.")
 endif()
+if(NOT TARGET dgsem_smooth_advection OR
+   NOT TARGET hdg_smooth_transition_research)
+  message(FATAL_ERROR
+    "The physical-boundary and smooth-transition research cases are required.")
+endif()
 foreach(_ranks IN ITEMS 1 2)
   add_test(NAME dg_igr_hdg_main_backend_smooth_advection_cpu_rank${_ranks}
     COMMAND "${CMAKE_COMMAND}"
@@ -55,6 +60,37 @@ set_tests_properties(
     LABELS "hdg;main-backend;cpu;compatibility;dgsem;process"
     RESOURCE_LOCK hdg_generic_euler_cpu
     TIMEOUT 300)
+
+add_test(NAME dg_igr_hdg_main_backend_representative_cases_cpu_serial
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_PERIODIC_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+    "-DHDG_NONPERIODIC_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection>"
+    "-DHDG_REPRESENTATIVE_WORK=${CMAKE_CURRENT_BINARY_DIR}/representative-cases"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_representative_case_process.cmake")
+set_tests_properties(
+  dg_igr_hdg_main_backend_representative_cases_cpu_serial PROPERTIES
+    LABELS "hdg;main-backend;cpu;source;boundary;igr;process"
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    TIMEOUT 1200)
+
+foreach(_ranks IN ITEMS 1 2)
+  add_test(NAME dg_igr_hdg_main_backend_w8c_research_cpu_rank${_ranks}
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_W8C_EXECUTABLE=$<TARGET_FILE:hdg_smooth_transition_research>"
+      "-DHDG_W8C_WORK=${CMAKE_CURRENT_BINARY_DIR}/w8c-smooth-transition-rank${_ranks}"
+      "-DHDG_W8C_RANKS=${_ranks}"
+      "-DHDG_W8C_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_W8C_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      "-DHDG_W8C_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+      "-DHDG_W8C_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_smooth_transition_research_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_w8c_research_cpu_rank${_ranks} PROPERTIES
+      LABELS "hdg;main-backend;cpu;igr;w8c;research;process;periodic;n8;smoke"
+      PROCESSORS ${_ranks}
+      RESOURCE_LOCK hdg_generic_euler_cpu
+      TIMEOUT 1200)
+endforeach()
 endif()
 
 if(MFEM_USE_CUDA)

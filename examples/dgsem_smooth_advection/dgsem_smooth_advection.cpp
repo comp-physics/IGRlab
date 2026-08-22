@@ -1,6 +1,7 @@
 #include "mfem.hpp"
 
 #include <cmath>
+#include <initializer_list>
 #include <memory>
 #include <string>
 
@@ -14,6 +15,75 @@ struct SmoothAdvectionOptions
 {
   std::string bc_mode = "inlet-outlet";
 };
+
+std::unique_ptr<mfem::VectorCoefficient>
+MakeSmoothAdvectionInitialCondition(const double gamma)
+{
+  const double rho0 = 1.0;
+  const double u0 = 2.0;
+  const double v0 = 0.0;
+  const double p0 = 1.0;
+  const double amp = 0.1;
+  const double sigma = 0.12;
+
+  auto ic_fun = [=](const mfem::Vector& x, mfem::Vector& U)
+  {
+    const double dx = x(0) - 0.5;
+    const double dy = x(1) - 0.5;
+    const double r2 = dx * dx + dy * dy;
+    const double rho = rho0 + amp * std::exp(-r2 / (sigma * sigma));
+
+    mfem::Vector prim(4);
+    prim(0) = rho;
+    prim(1) = u0;
+    prim(2) = v0;
+    prim(3) = p0;
+    mfem::EulerPrimToConservative(prim, /*dim=*/2, gamma, U);
+  };
+
+  return dg_sim::MakeVectorFunctionIC(4, ic_fun);
+}
+
+mfem::Vector MakeInletState(const double gamma)
+{
+  mfem::Vector prim(4);
+  prim(0) = 1.0;
+  prim(1) = 2.0;
+  prim(2) = 0.0;
+  prim(3) = 1.0;
+
+  mfem::Vector inlet_state(4);
+  mfem::EulerPrimToConservative(prim, /*dim=*/2, gamma, inlet_state);
+  return inlet_state;
+}
+
+mfem::Array<int>
+MarkerForAttributes(const mfem::ParMesh& mesh,
+                    const std::initializer_list<int> attributes)
+{
+  const int maximum_attribute =
+    mesh.bdr_attributes.Size() == 0 ? 0 : mesh.bdr_attributes.Max();
+  mfem::Array<int> marker(maximum_attribute);
+  marker = 0;
+  for (const int attribute : attributes)
+  {
+    MFEM_VERIFY(attribute > 0 && attribute <= maximum_attribute,
+                "Smooth-advection mesh is missing boundary attribute "
+                  << attribute << '.');
+    marker[attribute - 1] = 1;
+  }
+  return marker;
+}
+
+dg_sim::BoundaryMarkerMap
+BuildSmoothAdvectionMarkers(const mfem::ParMesh& mesh)
+{
+  dg_sim::BoundaryMarkerMap markers;
+  markers.Add(dg_sim::BoundaryRole::Inlet, MarkerForAttributes(mesh, {4}));
+  markers.Add(dg_sim::BoundaryRole::Outlet, MarkerForAttributes(mesh, {2}));
+  markers.Add(dg_sim::BoundaryRole::Slip, MarkerForAttributes(mesh, {1, 3}));
+  return markers;
+}
 
 } // namespace
 
@@ -54,37 +124,12 @@ int main(int argc, char* argv[])
                     const dg_sim::ExampleContext&,
                     double gamma)
   {
-    const double rho0 = 1.0;
-    const double u0 = 2.0;
-    const double v0 = 0.0;
-    const double p0 = 1.0;
-    const double amp = 0.1;
-    const double sigma = 0.12;
-
-    auto ic_fun = [=](const mfem::Vector& x, mfem::Vector& U)
-    {
-      const double dx = x(0) - 0.5;
-      const double dy = x(1) - 0.5;
-      const double r2 = dx * dx + dy * dy;
-      const double rho = rho0 + amp * std::exp(-r2 / (sigma * sigma));
-
-      mfem::Vector prim(4);
-      prim(0) = rho;
-      prim(1) = u0;
-      prim(2) = v0;
-      prim(3) = p0;
-      mfem::EulerPrimToConservative(prim, /*dim=*/2, gamma, U);
-    };
-
-    return dg_sim::MakeVectorFunctionIC(4, ic_fun);
+    return MakeSmoothAdvectionInitialCondition(gamma);
   };
 
   spec.build_markers = [](dg_sim::ExampleContext& ctx)
   {
-    return dg_sim::BuildBoundaryMarkers(ctx.Mesh(),
-                                        {{dg_sim::BoundaryRole::Inlet, {4}},
-                                         {dg_sim::BoundaryRole::Outlet, {2}},
-                                         {dg_sim::BoundaryRole::Slip, {1, 3}}});
+    return BuildSmoothAdvectionMarkers(ctx.Mesh());
   };
 
   spec.apply_bc = [](const SmoothAdvectionOptions& opts,
@@ -92,20 +137,7 @@ int main(int argc, char* argv[])
                      auto& bc,
                      const auto& markers)
   {
-    const double gamma = 1.4;
-    const double rho0 = 1.0;
-    const double u0 = 2.0;
-    const double v0 = 0.0;
-    const double p0 = 1.0;
-
-    mfem::Vector prim(4);
-    prim(0) = rho0;
-    prim(1) = u0;
-    prim(2) = v0;
-    prim(3) = p0;
-
-    mfem::Vector Uin(4);
-    mfem::EulerPrimToConservative(prim, /*dim=*/2, gamma, Uin);
+    const mfem::Vector Uin = MakeInletState(1.4);
 
     const std::string mode = dg_sim::ToLowerCopy(opts.bc_mode);
     if (mode == "inlet-outlet")
@@ -134,6 +166,53 @@ int main(int argc, char* argv[])
                   << opts.bc_mode
                   << "'. Use inlet-outlet | all-outlet | all-slip.");
   };
+
+#if DG_IGR_HAS_HDG_MAIN_BACKEND
+  spec.make_hdg_case_data = [](const SmoothAdvectionOptions& opts,
+                                const dg_sim::CaseConfig& case_config,
+                                const dg_sim::CommonOptions&,
+                                const dg_sim::CaseContext& context)
+  {
+    dg_sim::hdg::HdgEulerCaseData case_data;
+    case_data.initial_condition =
+      MakeSmoothAdvectionInitialCondition(case_config.gamma);
+    const auto markers = BuildSmoothAdvectionMarkers(context.Mesh());
+    const std::string mode = dg_sim::ToLowerCopy(opts.bc_mode);
+    if (mode == "inlet-outlet")
+    {
+      const mfem::Vector inlet_state = MakeInletState(case_config.gamma);
+      case_data.boundary_plan.AddSupersonicInlet(
+        markers.At(dg_sim::BoundaryRole::Inlet),
+        [inlet_state] { return inlet_state; });
+      case_data.boundary_plan.AddSupersonicOutlet(
+        markers.At(dg_sim::BoundaryRole::Outlet));
+      case_data.boundary_plan.AddSlipWall(markers.At(dg_sim::BoundaryRole::Slip));
+      return case_data;
+    }
+    if (mode == "all-outlet")
+    {
+      case_data.boundary_plan.AddSupersonicOutlet(
+        markers.At(dg_sim::BoundaryRole::Inlet));
+      case_data.boundary_plan.AddSupersonicOutlet(
+        markers.At(dg_sim::BoundaryRole::Outlet));
+      case_data.boundary_plan.AddSupersonicOutlet(
+        markers.At(dg_sim::BoundaryRole::Slip));
+      return case_data;
+    }
+    if (mode == "all-slip")
+    {
+      case_data.boundary_plan.AddSlipWall(markers.At(dg_sim::BoundaryRole::Inlet));
+      case_data.boundary_plan.AddSlipWall(markers.At(dg_sim::BoundaryRole::Outlet));
+      case_data.boundary_plan.AddSlipWall(markers.At(dg_sim::BoundaryRole::Slip));
+      return case_data;
+    }
+    MFEM_VERIFY(false,
+                "Unknown bc-mode '"
+                  << opts.bc_mode
+                  << "'. Use inlet-outlet | all-outlet | all-slip.");
+    return case_data;
+  };
+#endif
 
   return dg_sim::Solver::solve(spec, argc, argv);
 }

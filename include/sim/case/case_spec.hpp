@@ -14,6 +14,7 @@
 
 #include "sim/config/case_config.hpp"
 #include "sim/context/example_context.hpp"
+#include "sim/hdg/main_backend.hpp"
 #include "sim/state/euler_state_bundle.hpp"
 #include "sim/wiring/bc_wiring.hpp"
 #include "sim/time/time_callbacks.hpp"
@@ -94,16 +95,15 @@ template <typename CaseOptions, typename NumericalFlux> struct CaseSpec
                      const BoundaryMarkerMap&)>
     apply_bc;
   /**
-   * Optional main-application HDG entry for cases that explicitly support it.
-   *
-   * The callback receives only parsed case/configuration data.  It owns the
-   * HDG-specific mesh, state, boundary lowering, and time-driver wiring, so
-   * the existing DG/DGSEM ExampleContext and operator path remain untouched.
+   * Optional physics-only HDG factory.  The generic HDG main adapter owns
+   * mesh construction, field projection, boundary lowering, and time-driver
+   * wiring; this callback supplies only case physics after that mesh exists.
    */
-  std::function<int(const CaseOptions&,
-                    const CaseConfig&,
-                    const CommonOptions&)>
-    run_hdg;
+  std::function<hdg::HdgEulerCaseData(const CaseOptions&,
+                                      const CaseConfig&,
+                                      const CommonOptions&,
+                                      const CaseContext&)>
+    make_hdg_case_data;
   std::function<void(const CaseOptions&, ExampleContext&, EulerStateBundle&)>
     after_init;
   std::function<int(const CaseOptions&,

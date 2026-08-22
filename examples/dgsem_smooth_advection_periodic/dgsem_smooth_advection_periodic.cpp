@@ -19,6 +19,9 @@ namespace
 
 struct SmoothAdvectionOptions
 {
+  // This is deliberately HDG-only: DG/DGSEM retain their established
+  // source-free trajectory regardless of this option.
+  double hdg_static_source = 0.0;
 };
 
 std::string EnsurePeriodicMeshFile()
@@ -78,6 +81,18 @@ MakeSmoothAdvectionInitialCondition(const double gamma)
   return dg_sim::MakeVectorFunctionIC(4, ic_fun);
 }
 
+std::unique_ptr<mfem::VectorCoefficient>
+MakeSmoothAdvectionStaticSource(const double density_source)
+{
+  auto source_fun = [density_source](const mfem::Vector&, mfem::Vector& S)
+  {
+    S.SetSize(4);
+    S = 0.0;
+    S(0) = density_source;
+  };
+  return dg_sim::MakeVectorFunctionIC(4, source_fun);
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -112,6 +127,14 @@ int main(int argc, char* argv[])
     return MakeSmoothAdvectionInitialCondition(gamma);
   };
 
+  spec.add_options = [](mfem::OptionsParser& args, SmoothAdvectionOptions& opts)
+  {
+    args.AddOption(&opts.hdg_static_source,
+                   "-hss",
+                   "--hdg-static-source",
+                   "HDG-only uniform mass-component source; ignored by DG/DGSEM.");
+  };
+
   spec.build_markers = [](dg_sim::ExampleContext&)
   {
     return dg_sim::BoundaryMarkerMap{};
@@ -124,18 +147,31 @@ int main(int argc, char* argv[])
   };
 
 #if DG_IGR_HAS_HDG_MAIN_BACKEND
-  spec.run_hdg = [](const SmoothAdvectionOptions&,
-                    const dg_sim::CaseConfig& case_config,
-                    const dg_sim::CommonOptions& options)
+  spec.make_hdg_case_data = [](const SmoothAdvectionOptions& opts,
+                                const dg_sim::CaseConfig& case_config,
+                                const dg_sim::CommonOptions&,
+                                const dg_sim::CaseContext& context)
   {
-    auto initial_condition =
+    MFEM_VERIFY(std::isfinite(opts.hdg_static_source),
+                "--hdg-static-source must be finite.");
+    dg_sim::hdg::HdgEulerCaseData case_data;
+    case_data.initial_condition =
       MakeSmoothAdvectionInitialCondition(case_config.gamma);
-    dg_sim::EulerBoundaryPlan boundary_plan;
-    mfem::Array<int> periodic_marker(4);
-    periodic_marker = 1;
-    boundary_plan.AddPeriodic(std::move(periodic_marker));
-    return dg_sim::hdg::RunEulerMainBackend(
-      {case_config, options, *initial_condition, boundary_plan});
+    if (opts.hdg_static_source != 0.0)
+    {
+      case_data.static_source =
+        MakeSmoothAdvectionStaticSource(opts.hdg_static_source);
+    }
+    const int boundary_attributes = context.Mesh().bdr_attributes.Size() == 0
+      ? 0
+      : context.Mesh().bdr_attributes.Max();
+    if (boundary_attributes > 0)
+    {
+      mfem::Array<int> periodic_marker(boundary_attributes);
+      periodic_marker = 1;
+      case_data.boundary_plan.AddPeriodic(std::move(periodic_marker));
+    }
+    return case_data;
   };
 #endif
 

@@ -18,6 +18,7 @@
 #include "numerics/hdg/runtime/cpu/generic_euler.hpp"
 #include "sim/context/case_context.hpp"
 #include "sim/hdg/parallel_vtk.hpp"
+#include "sim/hdg/resolved_euler_case.hpp"
 #include "sim/hdg/state_io.hpp"
 #include "sim/hdg/transactional_time_adapter.hpp"
 #include "sim/io/vtk_helpers.hpp"
@@ -276,7 +277,6 @@ std::string CanonicalMainRequest(
     const HdgEulerMainRequest& request,
     const std::string& mesh_path,
     const mfem::io::VTKOutputConfig& vtk,
-    const std::string& boundary_key,
     const RegularizationSelection regularization)
 {
   std::ostringstream stream;
@@ -304,8 +304,6 @@ std::string CanonicalMainRequest(
   stream << static_cast<int>(regularization.kind) << ';';
   AppendDouble(stream, regularization.alpha);
   AppendDouble(stream, regularization.beta);
-  stream << request.initial_condition.GetVDim() << ';';
-  AppendText(stream, boundary_key);
   return stream.str();
 }
 
@@ -346,6 +344,10 @@ std::string Validate(const HdgEulerMainRequest& request,
       MPI_Finalized(&finalized) != MPI_SUCCESS || finalized)
   {
     return "invalid MPI communicator or lifecycle";
+  }
+  if (!request.make_case_data)
+  {
+    return "HDG case physics factory is empty";
   }
   if (ToLowerCopy(request.options.device) != "cpu")
   {
@@ -402,11 +404,6 @@ std::string Validate(const HdgEulerMainRequest& request,
        request.options.dt_save <= 0.0))
   {
     return "HDG ParaView output requires a positive --time-step-save";
-  }
-  if (request.initial_condition.GetVDim() !=
-      dg::hdg::generic::euler_2d_conserved_components)
-  {
-    return "HDG Euler initial condition must have four components";
   }
   if (!std::isfinite(request.case_config.gamma) ||
       request.case_config.gamma != mfem::dg_igr::EulerDefaults::kGamma)
@@ -478,7 +475,6 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     MeshBuildRequest mesh_request;
     mfem::io::VTKOutputConfig vtk;
     std::string canonical_request;
-    std::optional<FrozenBoundaryPlan> frozen_boundary;
     try
     {
       mesh_request.mesh_path =
@@ -489,10 +485,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         ? MeshPathPrecedence::CaseDefault
         : MeshPathPrecedence::CommandLineOverride;
       vtk = MakeCaseVTKConfig(request.case_config);
-      frozen_boundary.emplace(FreezeBoundaryPlan(request.boundary_plan));
       canonical_request = CanonicalMainRequest(
-          request, mesh_request.mesh_path, vtk,
-          frozen_boundary->consensus_key, regularization);
+          request, mesh_request.mesh_path, vtk, regularization);
       local_ok = true;
     }
     catch (...)
@@ -571,9 +565,64 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
                     "HDG parallel mesh construction failed on at least one rank");
     }
 
+    // Case physics is deliberately resolved only after the generic adapter
+    // has constructed the backend-neutral mesh.  The factory owns analytic
+    // coefficients; this adapter borrows them solely for the projections
+    // below, while the semantic boundary plan is frozen before lowering.
+    std::optional<HdgEulerCaseData> case_data;
+    std::optional<FrozenBoundaryPlan> frozen_boundary;
+    std::string canonical_case_data;
+    try
+    {
+      case_data.emplace(request.make_case_data(*context));
+      if (!case_data->initial_condition)
+      {
+        throw std::invalid_argument("HDG case data is missing an initial condition");
+      }
+      if (case_data->initial_condition->GetVDim() !=
+          dg::hdg::generic::euler_2d_conserved_components)
+      {
+        throw std::invalid_argument(
+            "HDG Euler initial condition must have four components");
+      }
+      if (case_data->static_source &&
+          case_data->static_source->GetVDim() !=
+            dg::hdg::generic::euler_2d_conserved_components)
+      {
+        throw std::invalid_argument(
+            "HDG Euler static source must have four components");
+      }
+      frozen_boundary.emplace(FreezeBoundaryPlan(case_data->boundary_plan));
+      std::ostringstream case_data_key;
+      case_data_key << case_data->initial_condition->GetVDim() << ';'
+                    << (case_data->static_source ? 1 : 0) << ';';
+      if (case_data->static_source)
+      {
+        case_data_key << case_data->static_source->GetVDim() << ';';
+      }
+      AppendText(case_data_key, frozen_boundary->consensus_key);
+      canonical_case_data = case_data_key.str();
+      local_ok = true;
+    }
+    catch (...)
+    {
+      local_ok = false;
+    }
+    if (!CollectiveAll(request.communicator, local_ok))
+    {
+      return Reject(request,
+                    "HDG case-data factory failed on at least one rank");
+    }
+    if (!ExactTextConsensus(request.communicator, canonical_case_data))
+    {
+      return Reject(request,
+                    "HDG case data differs between MPI ranks");
+    }
+
     std::unique_ptr<mfem::L2_FECollection> collection;
     std::unique_ptr<mfem::ParFiniteElementSpace> volume_space;
     std::unique_ptr<mfem::ParGridFunction> initial_state;
+    std::unique_ptr<mfem::ParGridFunction> source_state;
     std::unique_ptr<mfem::ParGridFunction> published_state;
     std::unique_ptr<HdgStateIo> state_io;
     std::optional<dg::hdg::generic::EulerBoundaryContext> boundary;
@@ -594,7 +643,15 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       state_io = std::make_unique<HdgStateIo>(
           context->Mesh(), *volume_space, *initial_state);
       state_io->ProjectBorrowedInitialConditionOnce(
-          request.initial_condition);
+          *case_data->initial_condition);
+      if (case_data->static_source)
+      {
+        source_state =
+          std::make_unique<mfem::ParGridFunction>(volume_space.get());
+        source_state->ProjectCoefficient(*case_data->static_source);
+        MFEM_VERIFY(source_state->CheckFinite() == 0,
+                    "HDG state I/O refuses non-finite static-source coordinates.");
+      }
       const int boundary_attributes =
           context->Mesh().bdr_attributes.Size() == 0
           ? 0
@@ -615,14 +672,21 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     }
 
     const BackendSelection backend{BackendKind::cpu, -1};
-    const EulerHdgRequest engine_request{
+    ResolvedHdgEulerCasePlan resolved_plan{};
+    resolved_plan.request = EulerHdgRequest{
       &context->Mesh(),
       context->Comm(),
       request.options.order,
       backend,
       dg::hdg::generic::RequiredCapabilities(backend),
       state_io->ImportPublishedInitialState(),
-      {nullptr, 0, dg::hdg::generic::euler_2d_conserved_components},
+      source_state
+        ? dg::hdg::generic::EulerFieldView{
+            source_state->HostRead(),
+            static_cast<std::size_t>(source_state->Size()),
+            dg::hdg::generic::euler_2d_conserved_components}
+        : dg::hdg::generic::EulerFieldView{
+            nullptr, 0, dg::hdg::generic::euler_2d_conserved_components},
       boundary->View(),
       regularization};
 
@@ -641,7 +705,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       return Reject(request,
                     "generic CPU session construction failed on at least one rank");
     }
-    local_ok = session->Initialize(engine_request).status ==
+    local_ok = session->Initialize(resolved_plan.request).status ==
         GenericEulerCpuSessionStatus::initialized;
     if (!CollectiveAll(request.communicator, local_ok))
     {
@@ -656,7 +720,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     std::unique_ptr<HdgTransactionalTimeAdapter> time_driver;
     try
     {
-      const auto output_schedule = request.options.vtk_save
+      resolved_plan.output_schedule = request.options.vtk_save
         ? HdgTransactionalTimeAdapter::OutputSchedule::FixedInterval(
             request.options.dt_save,
             time::backend::InitialOutputPolicy::Emit,
@@ -665,13 +729,19 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
             time::backend::InitialOutputPolicy::Suppress,
             time::backend::FinalOutputPolicy::Suppress);
       const bool cfl_control = request.options.dt <= 0.0;
-      const auto control = cfl_control
+      resolved_plan.time_control = cfl_control
           ? HdgTransactionalTimeAdapter::TimeControl::CFL(
                 0.0, request.options.t_final, request.options.cfl)
           : HdgTransactionalTimeAdapter::TimeControl::Fixed(
                 0.0, request.options.t_final, request.options.dt);
+      resolved_plan.time_mode = cfl_control
+          ? HdgEulerTimeMode::CFLBackwardEuler
+          : HdgEulerTimeMode::FixedBackwardEuler;
+      resolved_plan.output = {request.options.vtk_save,
+                              vtk.prefix_path,
+                              CollectionName(request)};
       time_driver = std::make_unique<HdgTransactionalTimeAdapter>(
-          control, output_schedule,
+          resolved_plan.time_control, resolved_plan.output_schedule,
           cfl_control ? HdgTimeControlMode::CFLBackwardEuler
                       : HdgTimeControlMode::FixedBackwardEuler);
       local_ok = true;
@@ -697,7 +767,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         const HDGParaViewRequest output_request{
           context->Mesh(),
           {{"conservative", *published_state}},
-          {vtk.prefix_path, CollectionName(request), vtk.format, levels,
+          {resolved_plan.output.prefix_path,
+           resolved_plan.output.collection_name, vtk.format, levels,
            vtk.high_order_output}};
         output = std::make_unique<HDGParaViewSeries>(output_request);
         local_ok = true;
