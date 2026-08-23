@@ -1329,10 +1329,13 @@ private:
       std::array<double, 6>& relative_errors) noexcept
   {
     relative_errors.fill(std::numeric_limits<double>::infinity());
+    const bool component_layout = shape_.igr_active
+        ? shape_.interior_components == igr_interior_components &&
+            shape_.trace_components == igr_trace_components
+        : shape_.interior_components == conserved_components &&
+            shape_.trace_components == conserved_components;
     const bool admitted = initialized_ && shape_.borrowed_host_inputs &&
-        shape_.igr_active && shape_.interior_components ==
-            igr_interior_components &&
-        shape_.trace_components == igr_trace_components &&
+        component_layout &&
         std::isfinite(relative_tolerance) && relative_tolerance > 0.0;
     if (!CollectiveContinue(admitted)) return false;
 
@@ -1402,30 +1405,35 @@ private:
           static_cast<double>((value >> 8U) % 29U) / 28.0;
       return (value & 1U) == 0U ? magnitude : -magnitude;
     };
-    for (int element = 0; element < shape_.elements; ++element)
-      for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
-      {
-        const std::size_t base = static_cast<std::size_t>(element) *
-            shape_.interior_dofs;
-        const std::size_t ordinal = static_cast<std::size_t>(element) *
-            shape_.scalar_interior_dofs + scalar;
-        base_interior[base + scalar +
-            4 * shape_.scalar_interior_dofs] =
-            0.035 * deterministic_unit(ordinal, 11U);
-        base_interior[base + scalar +
-            5 * shape_.scalar_interior_dofs] =
-            0.025 * deterministic_unit(ordinal, 17U);
-        base_interior[base + scalar +
-            6 * shape_.scalar_interior_dofs] =
-            0.025 * deterministic_unit(ordinal, 23U);
-      }
+    if (shape_.igr_active)
+      for (int element = 0; element < shape_.elements; ++element)
+        for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
+        {
+          const std::size_t base = static_cast<std::size_t>(element) *
+              shape_.interior_dofs;
+          const std::size_t ordinal = static_cast<std::size_t>(element) *
+              shape_.scalar_interior_dofs + scalar;
+          base_interior[base + scalar +
+              4 * shape_.scalar_interior_dofs] =
+              0.035 * deterministic_unit(ordinal, 11U);
+          base_interior[base + scalar +
+              5 * shape_.scalar_interior_dofs] =
+              0.025 * deterministic_unit(ordinal, 17U);
+          base_interior[base + scalar +
+              6 * shape_.scalar_interior_dofs] =
+              0.025 * deterministic_unit(ordinal, 23U);
+        }
     const int true_trace_scalar = shape_.true_trace_count /
         shape_.trace_components;
     local_valid = true_trace_scalar * shape_.trace_components ==
         shape_.true_trace_count;
-    for (int scalar = 0; local_valid && scalar < true_trace_scalar; ++scalar)
-      base_true_trace[static_cast<std::size_t>(4 * true_trace_scalar + scalar)] =
-          0.02 * deterministic_unit(static_cast<std::size_t>(scalar), 31U);
+    if (shape_.igr_active)
+      for (int scalar = 0;
+           local_valid && scalar < true_trace_scalar; ++scalar)
+        base_true_trace[
+            static_cast<std::size_t>(4 * true_trace_scalar + scalar)] =
+            0.02 * deterministic_unit(
+                static_cast<std::size_t>(scalar), 31U);
     for (std::size_t index = 0; index < base_interior.size(); ++index)
       interior_direction[index] = deterministic_unit(index, 41U) *
           std::max(1.0, std::abs(base_interior[index]));
@@ -1483,7 +1491,21 @@ private:
                       base_interior.size()) &&
         TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
     if (!CollectiveContinue(local_valid) ||
-        !assemble(base_interior, base_true_trace, nullptr, nullptr))
+        !install_state(base_interior, base_true_trace))
+      return false;
+    // Match the production conventional-Euler prepare sequence exactly:
+    // seed one lagged LLF stabilization field from the committed state, then
+    // hold it fixed through every nonlinear/Jacobian reassembly.  IGR owns no
+    // such conventional face field and continues directly to assembly.
+    if (!shape_.igr_active)
+    {
+      const bool tau_seeded = CudaLaunchSeedBorrowedLaggedLlfTau(
+              view_, shape_) &&
+          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+          StatusPassed();
+      if (!CollectiveContinue(tau_seeded)) return false;
+    }
+    if (!assemble(base_interior, base_true_trace, nullptr, nullptr))
       return false;
     local_valid = d2h(matrix_a.data(), view_.a, matrix_a.size()) &&
         d2h(matrix_b.data(), view_.b, matrix_b.size()) &&
@@ -1639,7 +1661,11 @@ private:
           std::sqrt(global[1]), std::sqrt(global[2]),
           difference_step * std::sqrt(std::max(1.0, global[3]))});
       error = std::sqrt(global[0]) / denominator;
-      return CollectiveContinue(std::isfinite(error));
+      const double activity_floor = 1.0e-12 *
+          std::sqrt(std::max(1.0, global[3]));
+      return CollectiveContinue(std::isfinite(error) &&
+          std::sqrt(global[1]) > activity_floor &&
+          std::sqrt(global[2]) > activity_floor);
     };
     local_valid = relative_error(difference_a, a_direction,
                                  relative_errors[0]) &&

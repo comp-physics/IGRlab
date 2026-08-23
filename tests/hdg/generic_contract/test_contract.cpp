@@ -52,13 +52,27 @@ mfem::ParMesh MakeSquareMesh()
 mfem::ParMesh MakePeriodicSquareMesh(const MPI_Comm communicator = MPI_COMM_WORLD)
 {
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
-      3, 3, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      3, 3, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
   std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+  translations[0] = 0.0;
+  translations[1] = 0.0;
   translations[0][0] = 1.0;
   translations[1][1] = 1.0;
   mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
       serial, serial.CreatePeriodicVertexMapping(translations));
   return mfem::ParMesh(communicator, periodic);
+}
+
+mfem::ParMesh MakeMixedPeriodicSquareMesh()
+{
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+      3, 3, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+  std::vector<mfem::Vector> translations(1, mfem::Vector(2));
+  translations[0] = 0.0;
+  translations[0][0] = 1.0;
+  mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
+      serial, serial.CreatePeriodicVertexMapping(translations));
+  return mfem::ParMesh(MPI_COMM_WORLD, periodic);
 }
 
 mfem::ParMesh MakeRankZeroOwnedParallelMesh(const mfem::Element::Type type)
@@ -175,7 +189,7 @@ bool CheckAcceptAndReject()
     return false;
   }
   request = ValidRequest(mesh, initial);
-  request.numerical_policy.audit_quadrature_order = 0;
+  request.numerical_policy.conventional_assembly_quadrature_order = 0;
   if (ValidateEulerHdgRequest(request) != ContractStatus::invalid_numerical_policy)
   {
     return false;
@@ -295,6 +309,60 @@ bool CheckBoundaryPolicyCollectiveMismatch()
       maximum_result == MPI_SUCCESS && minimum == maximum;
 }
 
+bool CheckMixedBoundaryPolicyAdmission()
+{
+  mfem::ParMesh mesh = MakeMixedPeriodicSquareMesh();
+  const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  const int retained_attributes = mesh.bdr_attributes.Size() == 0
+      ? 0 : mesh.bdr_attributes.Max();
+  int physical_attribute_count = 0;
+  int collective_retained_attributes = 0;
+  std::vector<unsigned char> physical_attribute_mask;
+  const bool topology_ready =
+      dg::hdg::generic::GlobalPhysicalBoundaryAttributeCount(
+          mesh, mesh.GetComm(), physical_attribute_count,
+          collective_retained_attributes, physical_attribute_mask);
+  const std::vector<unsigned char> expected_physical_mask{1, 0, 1, 0};
+  if (!topology_ready || retained_attributes != 4 ||
+      physical_attribute_count != retained_attributes ||
+      collective_retained_attributes != retained_attributes ||
+      physical_attribute_mask != expected_physical_mask)
+    return false;
+  std::vector<EulerBoundaryPolicy> policies(
+      static_cast<std::size_t>(retained_attributes));
+  for (EulerBoundaryPolicy& policy : policies)
+    policy.kind = EulerBoundaryPolicyKind::slip_wall;
+  // A one-direction periodic mesh retains annotations for the identified
+  // sides while the orthogonal sides remain physical.  The exact retained
+  // table must therefore permit both semantic entries.
+  policies[1].kind = EulerBoundaryPolicyKind::periodic_topology;
+  policies[3].kind = EulerBoundaryPolicyKind::periodic_topology;
+  EulerHdgRequest request = ValidRequest(mesh, initial);
+  AttachPolicyTable(request, policies);
+  const ContractStatus mixed = ValidateEulerHdgRequest(request);
+
+  std::vector<EulerBoundaryPolicy> physical_marked_periodic = policies;
+  physical_marked_periodic[0].kind =
+      EulerBoundaryPolicyKind::periodic_topology;
+  AttachPolicyTable(request, physical_marked_periodic);
+  const ContractStatus wrong_physical_kind =
+      ValidateEulerHdgRequest(request);
+
+  std::vector<EulerBoundaryPolicy> periodic_marked_physical = policies;
+  periodic_marked_physical[1].kind = EulerBoundaryPolicyKind::slip_wall;
+  AttachPolicyTable(request, periodic_marked_physical);
+  const ContractStatus wrong_periodic_kind =
+      ValidateEulerHdgRequest(request);
+
+  policies.pop_back();
+  AttachPolicyTable(request, policies);
+  const ContractStatus short_table = ValidateEulerHdgRequest(request);
+  return mixed == ContractStatus::accepted &&
+      wrong_physical_kind == ContractStatus::invalid_boundary_operator &&
+      wrong_periodic_kind == ContractStatus::invalid_boundary_operator &&
+      short_table == ContractStatus::invalid_boundary_operator;
+}
+
 bool CheckIgrSelectionAdmission()
 {
   mfem::ParMesh mesh = MakePeriodicSquareMesh();
@@ -314,6 +382,49 @@ bool CheckIgrSelectionAdmission()
   const ContractStatus periodic_p1 = admit_igr(mesh, 1);
   const ContractStatus periodic_p2 = admit_igr(mesh, 2);
   const ContractStatus periodic_p3 = admit_igr(mesh, 3);
+
+  EulerHdgRequest present_empty_periodic = ValidRequest(mesh, initial);
+  present_empty_periodic.boundary.policies = {nullptr, 0, 2, 1.4};
+  const ContractStatus present_empty_periodic_status =
+      ValidateEulerHdgRequest(present_empty_periodic);
+
+  const int retained_attributes = mesh.bdr_attributes.Size() == 0
+      ? 0 : mesh.bdr_attributes.Max();
+  std::vector<EulerBoundaryPolicy> retained_periodic_policies(
+      static_cast<std::size_t>(retained_attributes));
+  for (EulerBoundaryPolicy& policy : retained_periodic_policies)
+    policy.kind = EulerBoundaryPolicyKind::periodic_topology;
+  EulerHdgRequest retained_periodic = ValidRequest(mesh, initial);
+  AttachPolicyTable(retained_periodic, retained_periodic_policies);
+  const ContractStatus retained_periodic_status =
+      ValidateEulerHdgRequest(retained_periodic);
+
+  std::vector<EulerBoundaryPolicy> short_retained_periodic_policies =
+      retained_periodic_policies;
+  if (!short_retained_periodic_policies.empty())
+    short_retained_periodic_policies.pop_back();
+  EulerHdgRequest short_retained_periodic = ValidRequest(mesh, initial);
+  AttachPolicyTable(
+      short_retained_periodic, short_retained_periodic_policies);
+  const ContractStatus short_retained_periodic_status =
+      ValidateEulerHdgRequest(short_retained_periodic);
+
+  std::vector<EulerBoundaryPolicy> extra_retained_periodic_policies =
+      retained_periodic_policies;
+  extra_retained_periodic_policies.push_back(EulerBoundaryPolicy{});
+  extra_retained_periodic_policies.back().kind =
+      EulerBoundaryPolicyKind::periodic_topology;
+  EulerHdgRequest extra_retained_periodic = ValidRequest(mesh, initial);
+  AttachPolicyTable(
+      extra_retained_periodic, extra_retained_periodic_policies);
+  const ContractStatus extra_retained_periodic_status =
+      ValidateEulerHdgRequest(extra_retained_periodic);
+
+  if (!retained_periodic_policies.empty())
+    retained_periodic_policies.front().kind =
+        EulerBoundaryPolicyKind::slip_wall;
+  const ContractStatus retained_physical_status =
+      ValidateEulerHdgRequest(retained_periodic);
   const ContractStatus physical_p1 = admit_igr(physical_mesh, 1);
   const ContractStatus physical_p2 = admit_igr(physical_mesh, 2);
   const ContractStatus physical_p3 = admit_igr(physical_mesh, 3);
@@ -341,6 +452,14 @@ bool CheckIgrSelectionAdmission()
   return periodic_p1 == ContractStatus::accepted &&
       periodic_p2 == ContractStatus::accepted &&
       periodic_p3 == ContractStatus::accepted &&
+      present_empty_periodic_status == ContractStatus::accepted &&
+      !retained_periodic_policies.empty() &&
+      retained_periodic_status == ContractStatus::accepted &&
+      short_retained_periodic_status ==
+          ContractStatus::invalid_boundary_operator &&
+      extra_retained_periodic_status ==
+          ContractStatus::invalid_boundary_operator &&
+      retained_physical_status == ContractStatus::invalid_boundary_operator &&
       physical_p1 == ContractStatus::accepted &&
       physical_p2 == ContractStatus::accepted &&
       physical_p3 == ContractStatus::accepted &&
@@ -465,6 +584,55 @@ bool CheckCollectiveGeometryConvergence()
       minimum_status == local_status && maximum_status == local_status;
 }
 
+bool CheckPhysicalPolicyWithZeroOwnedRank()
+{
+  int ranks = 0;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS || ranks < 2)
+  {
+    return true;
+  }
+  mfem::ParMesh mesh =
+      MakeRankZeroOwnedParallelMesh(mfem::Element::QUADRILATERAL);
+  const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  EulerHdgRequest request = ValidRequest(mesh, initial);
+  if (mesh.GetNE() == 0)
+  {
+    request.initial_state = {nullptr, 0, 4};
+    request.initial_true_trace = {nullptr, 0, 4};
+  }
+  const int local_attributes = mesh.bdr_attributes.Size() == 0
+      ? 0 : mesh.bdr_attributes.Max();
+  int global_attributes = 0;
+  if (MPI_Allreduce(&local_attributes, &global_attributes, 1, MPI_INT,
+                    MPI_MAX, MPI_COMM_WORLD) != MPI_SUCCESS ||
+      global_attributes <= 0)
+    return false;
+  std::vector<EulerBoundaryPolicy> policies(
+      static_cast<std::size_t>(global_attributes));
+  for (EulerBoundaryPolicy& policy : policies)
+    policy.kind = EulerBoundaryPolicyKind::slip_wall;
+  AttachPolicyTable(request, policies);
+  const int accepted_status = static_cast<int>(
+      ValidateEulerHdgRequest(request));
+  policies.front().kind = EulerBoundaryPolicyKind::periodic_topology;
+  const int rejected_status = static_cast<int>(
+      ValidateEulerHdgRequest(request));
+  int minimum_status = rejected_status;
+  int maximum_status = rejected_status;
+  if (MPI_Allreduce(&rejected_status, &minimum_status, 1, MPI_INT, MPI_MIN,
+                    MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Allreduce(&rejected_status, &maximum_status, 1, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  return !policies.empty() &&
+      accepted_status == static_cast<int>(ContractStatus::accepted) &&
+      rejected_status ==
+          static_cast<int>(ContractStatus::invalid_boundary_operator) &&
+      minimum_status == rejected_status && maximum_status == rejected_status;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[])
@@ -475,12 +643,15 @@ int main(int argc, char* argv[])
   const bool triangle = CheckTriangleRejection();
   const bool boundary = CheckBoundaryPolicyAdmission();
   const bool boundary_mismatch = CheckBoundaryPolicyCollectiveMismatch();
+  const bool mixed_boundary = CheckMixedBoundaryPolicyAdmission();
   const bool igr = CheckIgrSelectionAdmission();
   const bool empty = CheckZeroOwnedElementAdmission();
+  const bool physical_empty = CheckPhysicalPolicyWithZeroOwnedRank();
   const bool asymmetric_null = CheckAsymmetricNullMeshConvergence();
   const bool mismatch = CheckCollectiveFailureConvergence();
   const bool geometry = CheckCollectiveGeometryConvergence();
-  ok = ok && basic && triangle && boundary && boundary_mismatch && igr && empty &&
-      asymmetric_null && mismatch && geometry;
+  ok = ok && basic && triangle && boundary && boundary_mismatch &&
+      mixed_boundary && igr && empty && physical_empty && asymmetric_null &&
+      mismatch && geometry;
   return ok ? 0 : 1;
 }

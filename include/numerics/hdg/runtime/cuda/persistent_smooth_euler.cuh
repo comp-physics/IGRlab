@@ -1449,10 +1449,6 @@ private:
         AppendConfigValue(descriptor, cursor, complete,
                           policy.igr_assembly_quadrature_order);
         AppendConfigValue(descriptor, cursor, complete,
-                          policy.audit_quadrature_order);
-        AppendConfigValue(descriptor, cursor, complete,
-                          policy.observable_quadrature_order);
-        AppendConfigValue(descriptor, cursor, complete,
                           policy.maximum_nonlinear_updates);
         AppendConfigValue(descriptor, cursor, complete,
                           policy.maximum_linear_iterations);

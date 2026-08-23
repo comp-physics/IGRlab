@@ -261,8 +261,6 @@ std::string CanonicalNumericalPolicy(
          << policy.true_trace_projection_quadrature_order << ';'
          << policy.conventional_assembly_quadrature_order << ';'
          << policy.igr_assembly_quadrature_order << ';'
-         << policy.audit_quadrature_order << ';'
-         << policy.observable_quadrature_order << ';'
          << policy.maximum_nonlinear_updates << ';'
          << policy.maximum_linear_iterations << ';'
          << policy.maximum_line_search_trials << ';'

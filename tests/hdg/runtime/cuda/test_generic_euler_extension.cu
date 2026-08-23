@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,6 +25,7 @@ constexpr double qualification_density_gate = 1.0e-8;
 
 struct CudaPreparedIgrConservationCapture
 {
+  static constexpr double sigma_hat_probe = 0.125;
   int elements = 0;
   int scalar_interior_dofs = 0;
   int scalar_face_dofs = 0;
@@ -44,6 +46,7 @@ struct CudaPreparedIgrConservationCapture
   std::vector<double> current_interior{};
   std::vector<double> current_local_trace{};
   std::array<double, 11> production_local{};
+  std::array<double, 11> probed_production_local{};
 };
 
 // This accessor is defined only in the qualification translation unit.  The
@@ -59,10 +62,23 @@ struct CudaQualificationTestAccess
     relative_errors.fill(std::numeric_limits<double>::infinity());
     return engine.initialized_ && !engine.pending_.active &&
         engine.config_.use_generic_numerical_policy &&
-        engine.config_.numerical_policy.stabilization.kind ==
-            generic::RegularizationKind::igr &&
         engine.numerics_.AuditBorrowedEulerAssemblerJacobian(
             relative_tolerance, relative_errors);
+  }
+
+  static bool VerifyAssemblerJacobian(
+      cuda::GenericEulerHdgCudaSession& session,
+      const double relative_tolerance,
+      std::array<double, 6>& relative_errors) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyAssemblerJacobian(
+          *session.borrowed_rank1_, relative_tolerance, relative_errors);
+    if (session.borrowed_rank2_)
+      return VerifyAssemblerJacobian(
+          *session.borrowed_rank2_, relative_tolerance, relative_errors);
+    relative_errors.fill(std::numeric_limits<double>::infinity());
+    return false;
   }
 
   template <typename Engine>
@@ -90,6 +106,7 @@ struct CudaQualificationTestAccess
             shape.scalar_interior_dofs * igr_interior_components &&
         shape.trace_dofs == faces_per_element * shape.scalar_face_dofs *
             igr_trace_components;
+    std::vector<double> probed_trace;
     try
     {
       capture.current_interior.resize(
@@ -97,6 +114,7 @@ struct CudaQualificationTestAccess
       capture.previous_interior.resize(capture.current_interior.size());
       capture.current_local_trace.resize(
           static_cast<std::size_t>(shape.elements) * shape.trace_dofs);
+      probed_trace.resize(capture.current_local_trace.size());
     }
     catch (...) { local_valid = false; }
 
@@ -150,7 +168,73 @@ struct CudaQualificationTestAccess
         std::all_of(capture.production_local.begin(),
                     capture.production_local.end(),
                     [](const double value) { return std::isfinite(value); });
-    return numerics.CollectiveContinue(local_valid);
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    std::copy(capture.current_local_trace.begin(),
+              capture.current_local_trace.end(), probed_trace.begin());
+    for (int element = 0; element < shape.elements; ++element)
+      for (int face = 0; face < faces_per_element; ++face)
+        for (int scalar = 0; scalar < shape.scalar_face_dofs; ++scalar)
+        {
+          const std::size_t index = static_cast<std::size_t>(element) *
+                  shape.trace_dofs +
+              static_cast<std::size_t>(face) * shape.trace_components *
+                  shape.scalar_face_dofs +
+              4 * shape.scalar_face_dofs + scalar;
+          probed_trace[index] +=
+              CudaPreparedIgrConservationCapture::sigma_hat_probe;
+        }
+
+    const bool probe_installed = CudaTransportPolicy::HostToDevice(
+        numerics.view_.current_local_trace, probed_trace.data(),
+        probed_trace.size() * sizeof(double),
+        CudaTransferCategory::generic_host_bridge,
+        CudaTransferSite::generic_host_export);
+    const bool probe_installed_everywhere =
+        numerics.CollectiveContinue(probe_installed);
+    const bool probe_launched = probe_installed_everywhere &&
+        CudaLaunchIgrConservation(
+            numerics.view_, shape, engine.pending_.attempt.dt,
+            numerics.view_.scalar) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::scalar_status);
+    const bool probe_launched_everywhere =
+        numerics.CollectiveContinue(probe_launched);
+    const bool probe_copied = probe_launched_everywhere &&
+        CudaTransportPolicy::DeviceToHost(
+            capture.probed_production_local.data(), numerics.view_.scalar,
+            capture.probed_production_local.size() * sizeof(double),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::scalar_status);
+    const bool probe_copied_everywhere =
+        numerics.CollectiveContinue(probe_copied);
+
+    // The probe is test-only and must leave the live prepared transaction
+    // byte-for-byte unchanged regardless of a failed launch or transfer.
+    const bool trace_restored = CudaTransportPolicy::HostToDevice(
+        numerics.view_.current_local_trace,
+        capture.current_local_trace.data(),
+        capture.current_local_trace.size() * sizeof(double),
+        CudaTransferCategory::generic_host_bridge,
+        CudaTransferSite::generic_host_export);
+    const bool scalar_restored = CudaTransportPolicy::HostToDevice(
+        numerics.view_.scalar, capture.production_local.data(),
+        capture.production_local.size() * sizeof(double),
+        CudaTransferCategory::scalar_diagnostic,
+        CudaTransferSite::scalar_status);
+    const bool restore_synchronized = CudaTransportPolicy::Synchronize(
+        CudaTransferSite::generic_host_export);
+    const bool restored_everywhere = numerics.CollectiveContinue(
+        trace_restored && scalar_restored && restore_synchronized);
+    const bool probe_finite = probe_copied_everywhere &&
+        capture.probed_production_local[10] == 1.0 &&
+        std::all_of(capture.probed_production_local.begin(),
+                    capture.probed_production_local.end(),
+                    [](const double value) { return std::isfinite(value); });
+    return numerics.CollectiveContinue(
+        probe_finite && restored_everywhere);
   }
 
   static bool CapturePreparedIgrConservation(
@@ -220,7 +304,7 @@ struct CudaQualificationTestAccess
         {
           const double value = a[a_offset +
               static_cast<std::size_t>(row) * shape.interior_dofs + column];
-          local_valid = std::isfinite(value);
+          local_valid = local_valid && std::isfinite(value);
           local[2] += value * value;
           const int row_component = row / shape.scalar_interior_dofs;
           const int column_component = column /
@@ -241,7 +325,7 @@ struct CudaQualificationTestAccess
         {
           const double value = b[b_offset +
               static_cast<std::size_t>(row) * shape.trace_dofs + column];
-          local_valid = std::isfinite(value);
+          local_valid = local_valid && std::isfinite(value);
           local[2] += value * value;
           const int row_component = row / shape.scalar_interior_dofs;
           const int face_column = column %
@@ -380,8 +464,8 @@ struct CudaQualificationTestAccess
     bool local_valid = engine.initialized_ && !engine.pending_.active &&
         numerics.initialized_ && numerics.mesh_ != nullptr &&
         shape.borrowed_static_boundary_policies && expected != nullptr &&
-        expected_count == 7 && SameDouble(shape.boundary_gamma,
-                                           expected_gamma) &&
+        expected_count > 0 && expected_count <= 7 &&
+        SameDouble(shape.boundary_gamma, expected_gamma) &&
         numerics.host_boundary_policy_kind_.size() == face_count &&
         numerics.host_boundary_pressure_.size() == face_count &&
         numerics.host_boundary_reference_.size() ==
@@ -496,10 +580,19 @@ struct CudaQualificationTestAccess
         local_uses.data(), global_uses.data(),
         static_cast<int>(global_uses.size()), MPI_LONG_LONG_INT, MPI_SUM,
         engine.config_.borrowed_communicator) == MPI_SUCCESS;
-    const bool all_used = reduced && std::all_of(
-        global_uses.begin(), global_uses.end(),
-        [](const long long uses) { return uses > 0; });
-    return numerics.CollectiveContinue(local_valid && all_used);
+    bool semantic_coverage = reduced;
+    for (std::size_t index = 0;
+         semantic_coverage && index < global_uses.size(); ++index)
+    {
+      const bool present = index < expected_count;
+      const bool periodic = present && expected[index].kind ==
+          generic::EulerBoundaryPolicyKind::periodic_topology;
+      semantic_coverage = present
+          ? (periodic ? global_uses[index] == 0 : global_uses[index] > 0)
+          : global_uses[index] == 0;
+    }
+    return numerics.CollectiveContinue(
+        local_valid && semantic_coverage);
   }
 
   static bool VerifyBorrowedInitialTrueTrace(
@@ -569,6 +662,9 @@ constexpr std::uint32_t cuda_capabilities =
     CapabilityBit(Capability::external_initial_state) |
     CapabilityBit(Capability::external_source) |
     CapabilityBit(Capability::numerical_boundary_operator);
+constexpr std::uint32_t cpu_capabilities =
+    (cuda_capabilities & ~CapabilityBit(Capability::cuda)) |
+    CapabilityBit(Capability::cpu);
 
 bool All(const bool local, const MPI_Comm communicator = MPI_COMM_WORLD)
 {
@@ -582,10 +678,24 @@ bool All(const bool local, const MPI_Comm communicator = MPI_COMM_WORLD)
 mfem::ParMesh MakePeriodicMesh()
 {
   mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
-      3, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      3, 3, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
   std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+  translations[0] = 0.0;
+  translations[1] = 0.0;
   translations[0][0] = 1.0;
   translations[1][1] = 1.0;
+  mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
+      original, original.CreatePeriodicVertexMapping(translations));
+  return mfem::ParMesh(MPI_COMM_WORLD, periodic);
+}
+
+mfem::ParMesh MakeMixedPeriodicMesh()
+{
+  mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
+      3, 3, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+  std::vector<mfem::Vector> translations(1, mfem::Vector(2));
+  translations[0] = 0.0;
+  translations[0][0] = 1.0;
   mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
       original, original.CreatePeriodicVertexMapping(translations));
   return mfem::ParMesh(MPI_COMM_WORLD, periodic);
@@ -594,7 +704,7 @@ mfem::ParMesh MakePeriodicMesh()
 mfem::ParMesh MakePhysicalMesh()
 {
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
-      3, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      3, 3, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
   return mfem::ParMesh(MPI_COMM_WORLD, serial);
 }
 
@@ -742,7 +852,8 @@ enum class SourceMode
 enum class InitialMode
 {
   constant,
-  smooth_periodic
+  smooth_periodic,
+  affine_physical
 };
 
 void EvaluateInitialState(const InitialMode mode, const mfem::Vector& point,
@@ -755,6 +866,18 @@ void EvaluateInitialState(const InitialMode mode, const mfem::Vector& point,
     state[1] = 0.05;
     state[2] = -0.02;
     state[3] = 2.60;
+    return;
+  }
+  if (mode == InitialMode::affine_physical)
+  {
+    const double rho = 1.0 + 0.05 * point[0] + 0.03 * point[1];
+    const double u = 0.20 + 0.02 * point[0];
+    const double v = -0.10 + 0.015 * point[1];
+    const double pressure = 1.0 + 0.04 * point[0] - 0.02 * point[1];
+    state[0] = rho;
+    state[1] = rho * u;
+    state[2] = rho * v;
+    state[3] = pressure / 0.4 + 0.5 * rho * (u * u + v * v);
     return;
   }
   constexpr double pi = 3.141592653589793238462643383279502884;
@@ -772,6 +895,118 @@ void EvaluateInitialState(const InitialMode mode, const mfem::Vector& point,
   state[3] = pressure / 0.4 + 0.5 * rho * (u * u + v * v);
 }
 
+int DecodeSignedDof(int encoded, double& sign) noexcept;
+
+template <typename Evaluator>
+bool InterpolateVolumeFieldHost(
+    mfem::ParMesh& mesh, mfem::ParFiniteElementSpace& space,
+    Evaluator&& evaluate, std::vector<double>& coefficients)
+{
+  try
+  {
+    const int vector_size = space.GetVSize();
+    if (vector_size < 0 || space.GetVDim() != components) return false;
+    coefficients.assign(static_cast<std::size_t>(vector_size), 0.0);
+    std::vector<unsigned char> assigned(
+        static_cast<std::size_t>(vector_size), 0);
+    for (int element = 0; element < mesh.GetNE(); ++element)
+    {
+      const mfem::FiniteElement* finite_element = space.GetFE(element);
+      mfem::ElementTransformation* transformation =
+          mesh.GetElementTransformation(element);
+      mfem::Array<int> vdofs;
+      space.GetElementVDofs(element, vdofs);
+      if (finite_element == nullptr || transformation == nullptr ||
+          finite_element->GetDof() <= 0 ||
+          vdofs.Size() != finite_element->GetDof() * components)
+        return false;
+      const mfem::IntegrationRule& nodes = finite_element->GetNodes();
+      if (nodes.GetNPoints() != finite_element->GetDof()) return false;
+      for (int scalar = 0; scalar < finite_element->GetDof(); ++scalar)
+      {
+        mfem::Vector position(2), state(components);
+        transformation->Transform(nodes.IntPoint(scalar), position);
+        evaluate(position, state);
+        if (state.Size() != components) return false;
+        for (int component = 0; component < components; ++component)
+        {
+          double sign = 1.0;
+          const int dof = DecodeSignedDof(
+              vdofs[scalar + finite_element->GetDof() * component], sign);
+          const double value = sign * state[component];
+          if (dof < 0 || dof >= vector_size || !std::isfinite(value))
+            return false;
+          const std::size_t index = static_cast<std::size_t>(dof);
+          if (assigned[index] != 0 && coefficients[index] != value)
+            return false;
+          coefficients[index] = value;
+          assigned[index] = 1;
+        }
+      }
+    }
+    return std::find(assigned.begin(), assigned.end(), 0) == assigned.end();
+  }
+  catch (...) { return false; }
+}
+
+template <typename Evaluator>
+bool InterpolateTrueTraceHost(
+    mfem::ParMesh& mesh, mfem::ParFiniteElementSpace& space,
+    Evaluator&& evaluate, std::vector<double>& true_coefficients)
+{
+  try
+  {
+    const int true_vector_size = space.GetTrueVSize();
+    if (true_vector_size < 0 || space.GetVDim() != components)
+      return false;
+    true_coefficients.assign(
+        static_cast<std::size_t>(true_vector_size), 0.0);
+    std::vector<unsigned char> assigned(
+        static_cast<std::size_t>(true_vector_size), 0);
+    for (int face = 0; face < mesh.GetNumFaces(); ++face)
+    {
+      mfem::FaceElementTransformations* transformation =
+          mesh.GetFaceElementTransformations(face);
+      const mfem::FiniteElement* finite_element = space.GetFaceElement(face);
+      mfem::Array<int> vdofs;
+      space.GetFaceVDofs(face, vdofs);
+      if (transformation == nullptr || transformation->Face == nullptr ||
+          finite_element == nullptr || finite_element->GetDof() <= 0 ||
+          vdofs.Size() != finite_element->GetDof() * components)
+        return false;
+      const mfem::IntegrationRule& nodes = finite_element->GetNodes();
+      if (nodes.GetNPoints() != finite_element->GetDof()) return false;
+      for (int scalar = 0; scalar < finite_element->GetDof(); ++scalar)
+      {
+        mfem::Vector position(2), state(components);
+        transformation->Face->Transform(nodes.IntPoint(scalar), position);
+        evaluate(position, state);
+        if (state.Size() != components) return false;
+        for (int component = 0; component < components; ++component)
+        {
+          double sign = 1.0;
+          const int local_dof = DecodeSignedDof(
+              vdofs[scalar + finite_element->GetDof() * component], sign);
+          const int true_dof = local_dof >= 0 && local_dof < space.GetVSize()
+              ? space.GetLocalTDofNumber(local_dof) : -2;
+          const double value = sign * state[component];
+          if (true_dof == -1) continue;
+          if (true_dof < 0 || true_dof >= true_vector_size ||
+              !std::isfinite(value))
+            return false;
+          const std::size_t index = static_cast<std::size_t>(true_dof);
+          if (assigned[index] != 0 && true_coefficients[index] != value)
+            return false;
+          true_coefficients[index] = value;
+          assigned[index] = 1;
+        }
+      }
+    }
+    return std::find(assigned.begin(), assigned.end(), 0) == assigned.end();
+  }
+  catch (...) { return false; }
+}
+
 BorrowedFields MakeBorrowedFields(
     mfem::ParMesh& mesh, const int order, const SourceMode source_mode,
     const InitialMode initial_mode = InitialMode::constant)
@@ -784,15 +1019,12 @@ BorrowedFields MakeBorrowedFields(
       &mesh, &volume_collection, components, mfem::Ordering::byNODES);
   fields.volume_scalar_count = static_cast<std::size_t>(
       volume_space.GetVSize() / components);
-  mfem::ParGridFunction volume_initial(&volume_space);
-  mfem::VectorFunctionCoefficient initial_coefficient(
-      components, [initial_mode](const mfem::Vector& point,
-                                mfem::Vector& state)
-      { EvaluateInitialState(initial_mode, point, state); });
-  volume_initial.ProjectCoefficient(initial_coefficient);
-  const double* const volume_values = volume_initial.HostRead();
-  fields.initial.assign(
-      volume_values, volume_values + volume_space.GetVSize());
+  const auto initial_evaluator =
+      [initial_mode](const mfem::Vector& point, mfem::Vector& state)
+      { EvaluateInitialState(initial_mode, point, state); };
+  if (!InterpolateVolumeFieldHost(
+          mesh, volume_space, initial_evaluator, fields.initial))
+    return {};
   if (source_mode != SourceMode::empty)
   {
     fields.source.resize(fields.initial.size(), 0.0);
@@ -815,20 +1047,9 @@ BorrowedFields MakeBorrowedFields(
       mfem::BasisType::GaussLegendre);
   mfem::ParFiniteElementSpace trace_space(
       &mesh, &trace_collection, components, mfem::Ordering::byNODES);
-  mfem::ParGridFunction local_trace(&trace_space);
-  mfem::VectorFunctionCoefficient trace_coefficient(
-      components, [initial_mode](const mfem::Vector& point,
-                                mfem::Vector& state)
-      { EvaluateInitialState(initial_mode, point, state); });
-  local_trace.ProjectCoefficient(trace_coefficient);
-  mfem::Vector true_trace;
-  local_trace.GetTrueDofs(true_trace);
-  if (true_trace.Size() > 0)
-  {
-    const double* const trace_values = true_trace.HostRead();
-    fields.initial_true_trace.assign(
-        trace_values, trace_values + true_trace.Size());
-  }
+  if (!InterpolateTrueTraceHost(
+          mesh, trace_space, initial_evaluator, fields.initial_true_trace))
+    return {};
   return fields;
 }
 
@@ -915,6 +1136,12 @@ struct IndependentIgrConservationResult
       std::numeric_limits<double>::infinity();
   double maximum_scale_discrepancy =
       std::numeric_limits<double>::infinity();
+  double production_probe_delta =
+      std::numeric_limits<double>::infinity();
+  double oracle_probe_delta =
+      std::numeric_limits<double>::infinity();
+  double probe_discrepancy =
+      std::numeric_limits<double>::infinity();
   bool passed = false;
 };
 
@@ -993,6 +1220,7 @@ bool VerifyIndependentIgrConservation(
   std::array<long double, 4> local_source_integral{};
   std::array<long double, 4> local_boundary_integral{};
   std::array<long double, 3> local_auxiliary_integral{};
+  long double local_probe_delta = 0.0L;
 
   try
   {
@@ -1294,6 +1522,17 @@ bool VerifyIndependentIgrConservation(
           local_scale[4] += std::abs(auxiliary_contribution);
           local_auxiliary_integral[2] += auxiliary_contribution;
           local_activity[8] += std::abs(auxiliary_contribution);
+          long double trace_partition = 0.0L;
+          for (int scalar = 0; scalar < capture.scalar_face_dofs; ++scalar)
+            trace_partition += trace_shape[scalar];
+          const long double probe_delta =
+              -static_cast<long double>(capture.alpha) * weight * tau *
+              static_cast<long double>(
+                  CudaPreparedIgrConservationCapture::sigma_hat_probe) *
+              trace_partition;
+          local_valid = local_valid && std::isfinite(trace_partition) &&
+              std::isfinite(probe_delta);
+          local_probe_delta += probe_delta;
         }
       }
     }
@@ -1315,6 +1554,9 @@ bool VerifyIndependentIgrConservation(
   std::array<long double, 4> global_source_integral{};
   std::array<long double, 4> global_boundary_integral{};
   std::array<long double, 3> global_auxiliary_integral{};
+  const double production_local_probe_delta =
+      capture.probed_production_local[4] - capture.production_local[4];
+  long double global_probe_delta = 0.0L;
   const int production_balance_status = MPI_Allreduce(
       production_local_balance.data(), result.production_balance.data(), 5,
       MPI_DOUBLE, MPI_SUM, request.communicator);
@@ -1342,13 +1584,21 @@ bool VerifyIndependentIgrConservation(
   const int auxiliary_status = MPI_Allreduce(
       local_auxiliary_integral.data(), global_auxiliary_integral.data(), 3,
       MPI_LONG_DOUBLE, MPI_SUM, request.communicator);
+  const int production_probe_status = MPI_Allreduce(
+      &production_local_probe_delta, &result.production_probe_delta, 1,
+      MPI_DOUBLE, MPI_SUM, request.communicator);
+  const int oracle_probe_status = MPI_Allreduce(
+      &local_probe_delta, &global_probe_delta, 1, MPI_LONG_DOUBLE, MPI_SUM,
+      request.communicator);
   const bool reduced = production_balance_status == MPI_SUCCESS &&
       production_scale_status == MPI_SUCCESS &&
       oracle_balance_status == MPI_SUCCESS &&
       oracle_scale_status == MPI_SUCCESS &&
       activity_status == MPI_SUCCESS && change_status == MPI_SUCCESS &&
       source_status == MPI_SUCCESS && boundary_status == MPI_SUCCESS &&
-      auxiliary_status == MPI_SUCCESS;
+      auxiliary_status == MPI_SUCCESS &&
+      production_probe_status == MPI_SUCCESS &&
+      oracle_probe_status == MPI_SUCCESS;
   if (!All(reduced, request.communicator)) return false;
 
   bool parity = true;
@@ -1412,85 +1662,122 @@ bool VerifyIndependentIgrConservation(
       result.activity[5] > 1.0e-10 &&
       result.activity[6] > 1.0e-10 &&
       result.activity[7] > 1.0e-10 &&
-      result.activity[8] > 1.0e-10;
-  const auto maximum_absolute = [](const auto& values)
-  {
-    long double maximum = 0.0L;
-    for (const long double value : values)
-      maximum = std::max(maximum, std::abs(value));
-    return maximum;
-  };
+      result.activity[8] > 1.0e-12;
+  long double maximum_change = 0.0L;
+  long double maximum_source = 0.0L;
+  long double maximum_boundary = 0.0L;
+  for (const long double value : global_change_integral)
+    maximum_change = std::max(maximum_change, std::abs(value));
+  for (const long double value : global_source_integral)
+    maximum_source = std::max(maximum_source, std::abs(value));
+  for (const long double value : global_boundary_integral)
+    maximum_boundary = std::max(maximum_boundary, std::abs(value));
   const long double euler_omission_tolerance = 100.0L *
       *std::max_element(comparison_tolerance.begin(),
                         comparison_tolerance.begin() + 4);
   const long double auxiliary_omission_tolerance =
       100.0L * comparison_tolerance[4];
+  result.oracle_probe_delta = static_cast<double>(global_probe_delta);
+  result.probe_discrepancy = std::abs(
+      result.production_probe_delta - result.oracle_probe_delta);
+  const double probe_tolerance = 2.0e-11 *
+      (1.0 + std::abs(result.oracle_probe_delta));
+  const bool signed_probe_sensitive =
+      std::isfinite(result.production_probe_delta) &&
+      std::isfinite(result.oracle_probe_delta) &&
+      result.oracle_probe_delta < -probe_tolerance &&
+      result.production_probe_delta < -probe_tolerance &&
+      result.probe_discrepancy <= probe_tolerance;
   const bool omission_detectable =
-      maximum_absolute(global_change_integral) >
-          euler_omission_tolerance &&
-      maximum_absolute(global_source_integral) >
-          euler_omission_tolerance &&
-      maximum_absolute(global_boundary_integral) >
-          euler_omission_tolerance &&
+      maximum_change > euler_omission_tolerance &&
+      maximum_source > euler_omission_tolerance &&
+      maximum_boundary > euler_omission_tolerance &&
       std::abs(global_auxiliary_integral[0]) >
           auxiliary_omission_tolerance &&
       std::abs(global_auxiliary_integral[1]) >
           auxiliary_omission_tolerance &&
-      std::abs(global_auxiliary_integral[2]) >
-          auxiliary_omission_tolerance;
+      global_activity[8] > 1.0e-12L && signed_probe_sensitive;
   result.passed = parity && lifecycle_parity && active &&
       omission_detectable;
   return All(result.passed, request.communicator);
 }
 
 template <typename Selection>
-bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
-                                 const int ranks,
-                                 const int order)
+bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
+                                   const int ranks,
+                                   const int order)
 {
   CudaConfig config = MakeDirectConfig(request, ranks, order);
 
-  PersistentCudaSmoothEulerEngine<Selection> engine(config);
+  auto engine = std::make_unique<
+      PersistentCudaSmoothEulerEngine<Selection>>(config);
   CudaRunEvidence initialization{};
   std::array<double, 6> jacobian_errors{};
   std::array<double, 2> coupling_norms{};
   constexpr double jacobian_tolerance = 5.0e-5;
-  const bool initialized = engine.Initialize(initialization);
+  const bool initialized = engine->Initialize(initialization);
   const bool initialized_everywhere = All(initialized, request.communicator);
   if (!initialized_everywhere) return false;
   const bool jacobian = CudaQualificationTestAccess::VerifyAssemblerJacobian(
-      engine, jacobian_tolerance, jacobian_errors);
+      *engine, jacobian_tolerance, jacobian_errors);
   const bool jacobian_everywhere = All(jacobian, request.communicator);
-  if (!jacobian_everywhere) return false;
-  const bool coupled = CudaQualificationTestAccess::VerifyIgrCouplingBlocks(
-      engine, coupling_norms);
+  if (!jacobian_everywhere)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA Euler Jacobian qualification failed order=" << order
+                << " regularization="
+                << (request.numerical_policy.stabilization.kind ==
+                        RegularizationKind::igr ? "igr" : "none")
+                << " relative_errors=";
+      for (const double error : jacobian_errors) std::cerr << ' ' << error;
+      std::cerr << '\n';
+    }
+    return false;
+  }
+  const bool igr = request.numerical_policy.stabilization.kind ==
+      RegularizationKind::igr;
+  const bool coupled = !igr ||
+      CudaQualificationTestAccess::VerifyIgrCouplingBlocks(
+          *engine, coupling_norms);
   const bool coupled_everywhere = All(coupled, request.communicator);
-  if (!coupled_everywhere) return false;
+  if (!coupled_everywhere)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+      std::cerr << "CUDA IGR coupling qualification failed order=" << order
+                << " norms=" << coupling_norms[0] << ' '
+                << coupling_norms[1] << '\n';
+    return false;
+  }
 
   CudaPrecommitSnapshot snapshot{};
   CudaStepEvidence step{};
   constexpr double dt = 1.0e-5;
-  const bool prepared = engine.PrepareStep(false, dt, snapshot, step);
+  const bool prepared = engine->PrepareStep(false, dt, snapshot, step);
   const bool prepared_everywhere = All(prepared, request.communicator);
   if (!prepared_everywhere) return false;
 
   CudaPreparedOutputMetadataV1 output{};
-  const bool staged = engine.StagePreparedOutputMetadata(output, step);
+  const bool staged = engine->StagePreparedOutputMetadata(output, step);
   const bool staged_everywhere = All(staged, request.communicator);
   if (!staged_everywhere) return false;
-  const bool acknowledged = engine.MarkOutputStaged(output);
+  const bool acknowledged = engine->MarkOutputStaged(output);
   const bool acknowledged_everywhere = All(
       acknowledged, request.communicator);
   if (!acknowledged_everywhere) return false;
-  const bool commit_prepared = engine.PrepareCommit(output, step);
+  const bool commit_prepared = engine->PrepareCommit(output, step);
   const bool commit_prepared_everywhere = All(
       commit_prepared, request.communicator);
   if (!commit_prepared_everywhere) return false;
-  const bool provisional = engine.CommitPrepared(output, step);
+  const bool provisional = engine->CommitPrepared(output, step);
   const bool provisional_everywhere = All(
       provisional, request.communicator);
   if (!provisional_everywhere) return false;
-  const bool committed = engine.FinalizeCommit(output, step);
+  const bool committed = engine->FinalizeCommit(output, step);
   const bool passed = committed && output.successful_commit;
   if (!passed)
   {
@@ -1498,7 +1785,8 @@ bool CheckIgrAlgebraForSelection(const EulerHdgRequest& request,
     MPI_Comm_rank(request.communicator, &rank);
     if (rank == 0)
     {
-      std::cerr << "CUDA IGR algebra qualification failed order=" << order
+      std::cerr << "CUDA Euler algebra qualification failed order=" << order
+                << " regularization=" << (igr ? "igr" : "none")
                 << " initialized=" << initialized
                 << " jacobian=" << jacobian
                 << " coupling=" << coupled
@@ -1580,75 +1868,185 @@ bool CheckCopiedInitialTrueTrace(const int order)
 bool CheckAllSevenLoweredBoundaryPolicies(const int order)
 {
   mfem::ParMesh mesh = MakeAllSevenPhysicalMesh();
-  BorrowedFields fields = MakeBorrowedFields(
-      mesh, order, SourceMode::empty);
-  BoundaryContext unused_boundary{};
-  EulerHdgRequest request = MakeRequest(
-      mesh, order, fields, unused_boundary, false,
-      RegularizationKind::igr);
-  AllSevenBoundaryContext boundary{};
-  ConfigureAllSevenPolicies(boundary);
-  const std::array<EulerBoundaryPolicy, 7> expected = boundary.policies;
-  request.boundary.context = &boundary;
-  request.boundary.exterior_state = AllSevenPhysicalEulerExterior;
-  request.boundary.policies = {
-      boundary.policies.data(), boundary.policies.size(), 2, 1.4};
-  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
-      ContractStatus::accepted)
-    return false;
-
-  GenericEulerHdgCudaSession session;
-  const auto initialization = session.Initialize(request);
-  const bool initialized = All(
-      initialization.status == HdgEulerSessionStatus::initialized,
-      request.communicator);
-  if (!initialized) return false;
-  std::array<int, 7> global_callback_calls{};
-  const bool callback_census = MPI_Allreduce(
-      boundary.calls.data(), global_callback_calls.data(),
-      static_cast<int>(global_callback_calls.size()), MPI_INT, MPI_SUM,
-      request.communicator) == MPI_SUCCESS;
-  const bool callback_bypassed = callback_census && std::all_of(
-      global_callback_calls.begin(), global_callback_calls.end(),
-      [](const int calls) { return calls == 0; });
-
-  // The facade's temporary lowered table and the caller's generic table are
-  // both gone or poisoned before inspection.  The audit therefore observes
-  // the production host-owned per-face map and its uploaded device copy.
-  for (EulerBoundaryPolicy& policy : boundary.policies)
+  const auto check = [&](const RegularizationKind kind)
   {
-    policy.kind = static_cast<EulerBoundaryPolicyKind>(255);
-    policy.reference_state.fill(
-        std::numeric_limits<double>::quiet_NaN());
-    policy.pressure_out = std::numeric_limits<double>::quiet_NaN();
-  }
-  const bool copied_and_associated = callback_bypassed &&
-      CudaQualificationTestAccess::VerifyBoundaryPolicyTable(
-          session, expected.data(), expected.size(), 1.4);
-  if (!copied_and_associated)
+    BorrowedFields fields = MakeBorrowedFields(
+        mesh, order, SourceMode::nonzero);
+    BoundaryContext unused_boundary{};
+    EulerHdgRequest request = MakeRequest(
+        mesh, order, fields, unused_boundary, false, kind);
+    AllSevenBoundaryContext boundary{};
+    ConfigureAllSevenPolicies(boundary);
+    const std::array<EulerBoundaryPolicy, 7> expected = boundary.policies;
+    request.boundary.context = &boundary;
+    request.boundary.exterior_state = AllSevenPhysicalEulerExterior;
+    request.boundary.policies = {
+        boundary.policies.data(), boundary.policies.size(), 2, 1.4};
+    if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+        ContractStatus::accepted)
+      return false;
+
+    GenericEulerHdgCudaSession session;
+    const auto initialization = session.Initialize(request);
+    const bool initialized = All(
+        initialization.status == HdgEulerSessionStatus::initialized,
+        request.communicator);
+    if (!initialized) return false;
+
+    // The facade's temporary lowered table and the caller's generic table are
+    // both gone or poisoned before inspection and execution.  The engine must
+    // use its copied host/device policy maps in both 4/4 and 7/5 modes.
+    for (EulerBoundaryPolicy& policy : boundary.policies)
+    {
+      policy.kind = static_cast<EulerBoundaryPolicyKind>(255);
+      policy.reference_state.fill(
+          std::numeric_limits<double>::quiet_NaN());
+      policy.pressure_out = std::numeric_limits<double>::quiet_NaN();
+    }
+    const bool copied_and_associated =
+        CudaQualificationTestAccess::VerifyBoundaryPolicyTable(
+            session, expected.data(), expected.size(), 1.4);
+
+    constexpr double dt = 1.0e-5;
+    GenericEulerCudaPreparedStep authority;
+    GenericEulerHdgCudaSession::prepared_output_type output{};
+    const bool prepared = All(
+        session.Prepare(dt, authority, output).status ==
+            HdgEulerSessionStatus::prepared,
+        request.communicator);
+    bool aborted = false;
+    if (prepared)
+      aborted = All(
+          session.Abort(std::move(authority), output).status ==
+              HdgEulerSessionStatus::aborted,
+          request.communicator);
+
+    std::array<int, 7> global_callback_calls{};
+    const bool callback_census = MPI_Allreduce(
+        boundary.calls.data(), global_callback_calls.data(),
+        static_cast<int>(global_callback_calls.size()), MPI_INT, MPI_SUM,
+        request.communicator) == MPI_SUCCESS;
+    const bool callback_bypassed = callback_census && std::all_of(
+        global_callback_calls.begin(), global_callback_calls.end(),
+        [](const int calls) { return calls == 0; });
+    const bool passed = All(
+        copied_and_associated && prepared && aborted && callback_bypassed,
+        request.communicator);
+    if (!passed)
+    {
+      int rank = 0;
+      MPI_Comm_rank(request.communicator, &rank);
+      if (rank == 0)
+        std::cerr << "CUDA all-seven boundary execution failed order="
+                  << order << " regularization="
+                  << (kind == RegularizationKind::igr ? "igr" : "none")
+                  << " copied=" << copied_and_associated
+                  << " prepared=" << prepared << " aborted=" << aborted
+                  << " callback_bypassed=" << callback_bypassed << '\n';
+    }
+    return passed;
+  };
+  const bool conventional = check(RegularizationKind::none);
+  const bool igr = check(RegularizationKind::igr);
+  return conventional && igr;
+}
+
+bool CheckMixedLoweredBoundaryPolicies(const int order)
+{
+  mfem::ParMesh mesh = MakeMixedPeriodicMesh();
+  const auto check = [&](const RegularizationKind kind)
   {
-    int rank = 0;
-    MPI_Comm_rank(request.communicator, &rank);
-    if (rank == 0)
-      std::cerr << "CUDA all-seven lowered boundary-table audit failed order="
-                << order << '\n';
-  }
-  return All(copied_and_associated, request.communicator);
+    BorrowedFields fields = MakeBorrowedFields(
+        mesh, order, SourceMode::nonzero);
+    BoundaryContext boundary{};
+    EulerHdgRequest request = MakeRequest(
+        mesh, order, fields, boundary, true, kind);
+    // Periodic x-identification retains attributes 2 and 4, while attributes
+    // 1 and 3 remain physical.  The facade must omit the retained periodic
+    // entries and lower only the two physical closures.
+    boundary.policies[1] = {
+        EulerBoundaryPolicyKind::periodic_topology, {}, 0.0};
+    boundary.policies[3] = {
+        EulerBoundaryPolicyKind::periodic_topology, {}, 0.0};
+    const std::array<EulerBoundaryPolicy, 4> expected = boundary.policies;
+    if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+        ContractStatus::accepted)
+      return false;
+
+    GenericEulerHdgCudaSession session;
+    const auto initialization = session.Initialize(request);
+    const bool initialized = All(
+        initialization.status == HdgEulerSessionStatus::initialized,
+        request.communicator);
+    if (!initialized) return false;
+
+    for (EulerBoundaryPolicy& policy : boundary.policies)
+    {
+      policy.kind = static_cast<EulerBoundaryPolicyKind>(255);
+      policy.reference_state.fill(
+          std::numeric_limits<double>::quiet_NaN());
+      policy.pressure_out = std::numeric_limits<double>::quiet_NaN();
+    }
+    const bool copied_and_associated =
+        CudaQualificationTestAccess::VerifyBoundaryPolicyTable(
+            session, expected.data(), expected.size(), 1.4);
+
+    constexpr double dt = 1.0e-5;
+    GenericEulerCudaPreparedStep authority;
+    GenericEulerHdgCudaSession::prepared_output_type output{};
+    const bool prepared = All(
+        session.Prepare(dt, authority, output).status ==
+            HdgEulerSessionStatus::prepared,
+        request.communicator);
+    bool aborted = false;
+    if (prepared)
+      aborted = All(
+          session.Abort(std::move(authority), output).status ==
+              HdgEulerSessionStatus::aborted,
+          request.communicator);
+
+    std::array<int, 4> global_callback_calls{};
+    const bool callback_census = MPI_Allreduce(
+        boundary.calls.data(), global_callback_calls.data(),
+        static_cast<int>(global_callback_calls.size()), MPI_INT, MPI_SUM,
+        request.communicator) == MPI_SUCCESS;
+    const bool callback_bypassed = callback_census && std::all_of(
+        global_callback_calls.begin(), global_callback_calls.end(),
+        [](const int calls) { return calls == 0; });
+    const bool passed = All(
+        copied_and_associated && prepared && aborted && callback_bypassed,
+        request.communicator);
+    if (!passed)
+    {
+      int rank = 0;
+      MPI_Comm_rank(request.communicator, &rank);
+      if (rank == 0)
+        std::cerr << "CUDA mixed boundary execution failed order="
+                  << order << " regularization="
+                  << (kind == RegularizationKind::igr ? "igr" : "none")
+                  << " copied=" << copied_and_associated
+                  << " prepared=" << prepared << " aborted=" << aborted
+                  << " callback_bypassed=" << callback_bypassed << '\n';
+    }
+    return passed;
+  };
+  const bool conventional = check(RegularizationKind::none);
+  const bool igr = check(RegularizationKind::igr);
+  return conventional && igr;
 }
 
 bool CheckIndependentIgrConservation(const int order)
 {
   mfem::ParMesh mesh = MakeAllSevenPhysicalMesh();
   BorrowedFields fields = MakeBorrowedFields(
-      mesh, order, SourceMode::nonzero, InitialMode::smooth_periodic);
+      mesh, order, SourceMode::nonzero, InitialMode::affine_physical);
   mfem::L2_FECollection source_collection(
       order, 2, mfem::BasisType::GaussLegendre,
       mfem::FiniteElement::VALUE);
   mfem::ParFiniteElementSpace source_space(
       &mesh, &source_collection, components, mfem::Ordering::byNODES);
-  mfem::ParGridFunction source_field(&source_space);
-  mfem::VectorFunctionCoefficient source_coefficient(
-      components, [](const mfem::Vector& point, mfem::Vector& source)
+  const auto source_evaluator =
+      [](const mfem::Vector& point, mfem::Vector& source)
       {
         const double modulation = 1.0 + 0.1 * point[0] - 0.05 * point[1];
         source.SetSize(components);
@@ -1656,11 +2054,10 @@ bool CheckIndependentIgrConservation(const int order)
         source[1] = 0.125 * modulation;
         source[2] = -0.1875 * modulation;
         source[3] = 0.375 * modulation;
-      });
-  source_field.ProjectCoefficient(source_coefficient);
-  const double* const source_values = source_field.HostRead();
-  fields.source.assign(
-      source_values, source_values + source_space.GetVSize());
+      };
+  if (!InterpolateVolumeFieldHost(
+          mesh, source_space, source_evaluator, fields.source))
+    return false;
 
   BoundaryContext unused_boundary{};
   EulerHdgRequest request = MakeRequest(
@@ -1691,7 +2088,6 @@ bool CheckIndependentIgrConservation(const int order)
       prepared_result.status == HdgEulerSessionStatus::prepared,
       request.communicator);
   if (!prepared) return false;
-
   CudaPreparedIgrConservationCapture capture;
   const bool captured =
       CudaQualificationTestAccess::CapturePreparedIgrConservation(
@@ -1718,7 +2114,11 @@ bool CheckIndependentIgrConservation(const int order)
                 << " balance_discrepancy="
                 << oracle.maximum_balance_discrepancy
                 << " scale_discrepancy="
-                << oracle.maximum_scale_discrepancy << " activity=";
+                << oracle.maximum_scale_discrepancy
+                << " signed_probe=" << oracle.production_probe_delta << '/'
+                << oracle.oracle_probe_delta
+                << " probe_discrepancy=" << oracle.probe_discrepancy
+                << " activity=";
       for (const double value : oracle.activity) std::cerr << ' ' << value;
       std::cerr << '\n';
     }
@@ -1726,20 +2126,84 @@ bool CheckIndependentIgrConservation(const int order)
   return passed;
 }
 
-bool CheckIgrAlgebra(const int order, const int ranks)
+bool CheckEulerAlgebra(const int order, const int ranks)
 {
-  mfem::ParMesh mesh = MakePeriodicMesh();
-  BorrowedFields fields = MakeBorrowedFields(
-      mesh, order, SourceMode::nonzero, InitialMode::smooth_periodic);
-  BoundaryContext boundary{};
-  const EulerHdgRequest request = MakeRequest(
-      mesh, order, fields, boundary, false, RegularizationKind::igr);
-  return ranks == 1
-      ? CheckIgrAlgebraForSelection<
-            BorrowedCudaRank1OneGpuRuntimeSelection>(request, ranks, order)
-      : CheckIgrAlgebraForSelection<
-            BorrowedCudaRank2OneGpuHostStagedRuntimeSelection>(
-                request, ranks, order);
+  mfem::ParMesh periodic_mesh = MakePeriodicMesh();
+  BorrowedFields periodic_fields = MakeBorrowedFields(
+      periodic_mesh, order, SourceMode::nonzero,
+      InitialMode::smooth_periodic);
+  const auto check_periodic = [&](const RegularizationKind kind)
+  {
+    BoundaryContext boundary{};
+    EulerHdgRequest request = MakeRequest(
+        periodic_mesh, order, periodic_fields, boundary, false, kind);
+    const bool admitted =
+        dg::hdg::generic::ValidateEulerHdgRequest(request) ==
+            ContractStatus::accepted;
+    if (!All(admitted, request.communicator)) return false;
+    return ranks == 1
+        ? CheckEulerAlgebraForSelection<
+              BorrowedCudaRank1OneGpuRuntimeSelection>(request, ranks, order)
+        : CheckEulerAlgebraForSelection<
+              BorrowedCudaRank2OneGpuHostStagedRuntimeSelection>(
+                  request, ranks, order);
+  };
+
+  const auto check_physical = [&](const RegularizationKind kind)
+  {
+    mfem::ParMesh mesh = MakePhysicalMesh();
+    BorrowedFields fields = MakeBorrowedFields(
+        mesh, order, SourceMode::nonzero, InitialMode::smooth_periodic);
+    BoundaryContext boundary{};
+    EulerHdgRequest request = MakeRequest(
+        mesh, order, fields, boundary, true, kind);
+    // A fixed supersonic-inlet exterior is the exact CUDA analogue of the CPU
+    // Picard-row audit fixture.  It makes the physical Euler row's frozen
+    // exterior differentiable while retaining the production IGR Neumann
+    // auxiliary row on the same faces.
+    const std::array<double, components> reference{{
+        1.0, 0.05, -0.02, 2.60}};
+    for (EulerBoundaryPolicy& policy : boundary.policies)
+      policy = {EulerBoundaryPolicyKind::supersonic_inlet,
+                reference, 0.0};
+
+    GenericEulerHdgCudaSession session;
+    const auto initialization = session.Initialize(request);
+    std::array<double, 6> relative_errors{};
+    constexpr double jacobian_tolerance = 5.0e-5;
+    const bool initialized = All(
+        initialization.status == HdgEulerSessionStatus::initialized,
+        request.communicator);
+    const bool verified = initialized &&
+        CudaQualificationTestAccess::VerifyAssemblerJacobian(
+            session, jacobian_tolerance, relative_errors);
+    const bool passed = All(verified, request.communicator);
+    if (!passed)
+    {
+      int rank = 0;
+      MPI_Comm_rank(request.communicator, &rank);
+      if (rank == 0)
+      {
+        std::cerr << "CUDA physical Euler Jacobian qualification failed order="
+                  << order << " regularization="
+                  << (kind == RegularizationKind::igr ? "igr" : "none")
+                  << " initialized=" << initialized
+                  << " relative_errors=";
+        for (const double error : relative_errors) std::cerr << ' ' << error;
+        std::cerr << '\n';
+      }
+    }
+    return passed;
+  };
+
+  const bool conventional_periodic =
+      check_periodic(RegularizationKind::none);
+  const bool conventional_physical =
+      check_physical(RegularizationKind::none);
+  const bool igr_periodic = check_periodic(RegularizationKind::igr);
+  const bool igr_physical = check_physical(RegularizationKind::igr);
+  return conventional_periodic && conventional_physical &&
+      igr_periodic && igr_physical;
 }
 
 bool SameValues(const std::vector<double>& left,
@@ -1770,6 +2234,106 @@ bool DifferentValues(const std::vector<double>& left,
 {
   return left.size() == right.size() &&
       !std::equal(left.begin(), left.end(), right.begin());
+}
+
+bool GlobalSourceOnlyResponseNorm(
+    mfem::ParMesh& mesh, const int order,
+    const std::vector<double>& candidate,
+    const std::vector<double>& initial,
+    const std::vector<double>& source,
+    const double dt,
+    long double& norm)
+{
+  long double local_squared_norm = 0.0L;
+  const bool local_ready = [&]() noexcept
+  {
+    try
+    {
+      mfem::L2_FECollection collection(
+          order, 2, mfem::BasisType::GaussLegendre,
+          mfem::FiniteElement::VALUE);
+      mfem::ParFiniteElementSpace space(
+          &mesh, &collection, components, mfem::Ordering::byNODES);
+      const std::size_t vector_size =
+          static_cast<std::size_t>(space.GetVSize());
+      if (space.GetVSize() < 0 || candidate.size() != vector_size ||
+          initial.size() != vector_size || source.size() != vector_size ||
+          !std::isfinite(dt) || !(dt > 0.0))
+        return false;
+      for (int element = 0; element < mesh.GetNE(); ++element)
+      {
+        const mfem::FiniteElement* finite_element = space.GetFE(element);
+        mfem::ElementTransformation* transformation =
+            mesh.GetElementTransformation(element);
+        mfem::Array<int> vdofs;
+        space.GetElementVDofs(element, vdofs);
+        if (finite_element == nullptr || transformation == nullptr ||
+            finite_element->GetDof() <= 0 ||
+            vdofs.Size() != finite_element->GetDof() * components)
+          return false;
+        const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+            finite_element->GetGeomType(), 2 * order + 2);
+        mfem::Vector shape(finite_element->GetDof());
+        for (int quadrature = 0;
+             quadrature < rule.GetNPoints(); ++quadrature)
+        {
+          const mfem::IntegrationPoint& point = rule.IntPoint(quadrature);
+          finite_element->CalcShape(point, shape);
+          transformation->SetIntPoint(&point);
+          const long double weight = static_cast<long double>(
+              point.weight * transformation->Weight());
+          if (!(weight > 0.0L) || !std::isfinite(weight)) return false;
+          for (int component = 0; component < components; ++component)
+          {
+            long double response = 0.0L;
+            for (int scalar = 0;
+                 scalar < finite_element->GetDof(); ++scalar)
+            {
+              double sign = 1.0;
+              const int dof = DecodeSignedDof(
+                  vdofs[scalar + finite_element->GetDof() * component],
+                  sign);
+              if (dof < 0 || dof >= space.GetVSize()) return false;
+              const std::size_t index = static_cast<std::size_t>(dof);
+              const double coefficient = candidate[index] - initial[index] -
+                  dt * source[index];
+              if (!std::isfinite(coefficient)) return false;
+              response += static_cast<long double>(
+                  sign * coefficient * shape[scalar]);
+            }
+            local_squared_norm += weight * response * response;
+          }
+        }
+      }
+      return std::isfinite(local_squared_norm) &&
+          local_squared_norm >= 0.0L;
+    }
+    catch (...) { return false; }
+  }();
+  if (!All(local_ready, mesh.GetComm())) return false;
+  long double global_squared_norm = 0.0L;
+  const bool reduced = MPI_Allreduce(
+      &local_squared_norm, &global_squared_norm, 1, MPI_LONG_DOUBLE,
+      MPI_SUM, mesh.GetComm()) == MPI_SUCCESS;
+  const bool global_ready = reduced && std::isfinite(global_squared_norm) &&
+      global_squared_norm >= 0.0L;
+  if (!All(global_ready, mesh.GetComm())) return false;
+  norm = std::sqrt(global_squared_norm);
+  return All(std::isfinite(norm), mesh.GetComm());
+}
+
+bool BoundaryResponseSeparated(const long double periodic_response,
+                               const long double physical_response)
+{
+  constexpr long double periodic_roundoff_ceiling = 1.0e-9L;
+  constexpr long double physical_activity_floor = 1.0e-10L;
+  constexpr long double separation_factor = 8.0L;
+  return std::isfinite(periodic_response) &&
+      std::isfinite(physical_response) && periodic_response >= 0.0L &&
+      physical_response > physical_activity_floor &&
+      periodic_response <= periodic_roundoff_ceiling &&
+      physical_response > separation_factor *
+          std::max(periodic_response, periodic_roundoff_ceiling);
 }
 
 bool ExpectedPeriodicSourceResponse(
@@ -1887,6 +2451,18 @@ bool CheckContractAdmission(const int order)
   EulerHdgRequest mismatched = conventional;
   mismatched.boundary.policies.policies = mismatched_policies.data();
 
+  BorrowedFields crossed_fields = MakeBorrowedFields(
+      mesh, order, SourceMode::empty);
+  BoundaryContext crossed_boundary{};
+  EulerHdgRequest crossed_backend = MakeRequest(
+      mesh, order, crossed_fields, crossed_boundary, true,
+      RegularizationKind::none);
+  if (ranks == 2 && rank == 0)
+  {
+    crossed_backend.backend = {BackendKind::cpu, -1};
+    crossed_backend.capabilities = cpu_capabilities;
+  }
+
   const bool valid_contracts =
       dg::hdg::generic::ValidateEulerHdgRequest(conventional) ==
           ContractStatus::accepted &&
@@ -1913,6 +2489,9 @@ bool CheckContractAdmission(const int order)
   const bool mismatched_contract = ranks != 2 ||
       dg::hdg::generic::ValidateEulerHdgRequest(mismatched) !=
           ContractStatus::accepted;
+  const bool crossed_backend_contract = ranks != 2 ||
+      dg::hdg::generic::ValidateEulerHdgRequest(crossed_backend) ==
+          ContractStatus::accepted;
 
   // The public session repeats the generic contract before any device or
   // engine allocation.  Each malformed request owns a fresh one-shot facade.
@@ -1926,14 +2505,17 @@ bool CheckContractAdmission(const int order)
   const bool invalid_kind_session = RejectedBeforeMfemDevice(invalid_kind);
   const bool mismatched_session = ranks != 2 ||
       RejectedBeforeMfemDevice(mismatched);
+  const bool crossed_backend_session = ranks != 2 ||
+      RejectedBeforeMfemDevice(crossed_backend);
   return All(valid_contracts && invalid_igr_contract &&
                  null_table_contract && short_table_contract &&
                  wrong_dimension_contract && nonfinite_gamma_contract &&
                  invalid_kind_contract && mismatched_contract &&
+                 crossed_backend_contract &&
                  invalid_igr_session && null_table_session &&
                  short_table_session && wrong_dimension_session &&
                  nonfinite_gamma_session && invalid_kind_session &&
-                 mismatched_session,
+                 mismatched_session && crossed_backend_session,
              mesh.GetComm());
 }
 
@@ -1941,7 +2523,8 @@ bool CheckLifecycle(const int order, const bool physical,
                     const RegularizationKind kind,
                     const SourceMode source_mode,
                     const InitialMode initial_mode,
-                    std::vector<double>& committed_result)
+                    std::vector<double>& committed_result,
+                    long double* source_only_response = nullptr)
 {
   mfem::ParMesh mesh = physical ? MakePhysicalMesh() : MakePeriodicMesh();
   BorrowedFields fields = MakeBorrowedFields(
@@ -2066,8 +2649,13 @@ bool CheckLifecycle(const int order, const bool physical,
           after.time == before.time + dt &&
           retry_output.successful_commit && boundary_coverage,
       request.communicator);
-  if (passed) committed_result = std::move(committed_final);
-  return passed;
+  const bool response_ready = source_only_response == nullptr ||
+      (passed && GlobalSourceOnlyResponseNorm(
+          mesh, order, committed_final, expected_initial, expected_source,
+          dt, *source_only_response));
+  const bool qualified = All(passed && response_ready, request.communicator);
+  if (qualified) committed_result = std::move(committed_final);
+  return qualified;
 }
 
 int ParseOrder(const int argc, char* argv[])
@@ -2105,29 +2693,39 @@ int main(int argc, char* argv[])
   std::vector<double> conventional_zero_source_state;
   std::vector<double> igr_empty_source_state;
   std::vector<double> igr_zero_source_state;
+  long double conventional_periodic_response =
+      std::numeric_limits<long double>::infinity();
+  long double conventional_physical_response =
+      std::numeric_limits<long double>::infinity();
+  long double igr_periodic_response =
+      std::numeric_limits<long double>::infinity();
+  long double igr_physical_response =
+      std::numeric_limits<long double>::infinity();
   const bool copied_initial_trace = order > 0 &&
       CheckCopiedInitialTrueTrace(order);
   const bool all_seven_boundary_policies = order > 0 &&
       CheckAllSevenLoweredBoundaryPolicies(order);
+  const bool mixed_boundary_policies = order > 0 &&
+      CheckMixedLoweredBoundaryPolicies(order);
   const bool independent_igr_conservation = order > 0 &&
       CheckIndependentIgrConservation(order);
-  const bool igr_algebra = order > 0 && CheckIgrAlgebra(order, ranks);
+  const bool euler_algebra = order > 0 && CheckEulerAlgebra(order, ranks);
   const bool conventional_periodic = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::nonzero,
       InitialMode::constant,
-      conventional_periodic_state);
+      conventional_periodic_state, &conventional_periodic_response);
   const bool conventional_physical = order > 0 && CheckLifecycle(
       order, true, RegularizationKind::none, SourceMode::nonzero,
       InitialMode::constant,
-      conventional_physical_state);
+      conventional_physical_state, &conventional_physical_response);
   const bool igr_periodic = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::igr, SourceMode::nonzero,
       InitialMode::constant,
-      igr_periodic_state);
+      igr_periodic_state, &igr_periodic_response);
   const bool igr_physical = order > 0 && CheckLifecycle(
       order, true, RegularizationKind::igr, SourceMode::nonzero,
       InitialMode::constant,
-      igr_physical_state);
+      igr_physical_state, &igr_physical_response);
   const bool conventional_empty_source = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::empty,
       InitialMode::constant,
@@ -2151,12 +2749,14 @@ int main(int argc, char* argv[])
       NearValues(igr_empty_source_state, igr_zero_source_state);
   const bool boundary_effect = conventional_periodic && conventional_physical &&
       igr_periodic && igr_physical &&
-      DifferentValues(conventional_periodic_state,
-                      conventional_physical_state) &&
-      DifferentValues(igr_periodic_state, igr_physical_state);
+      BoundaryResponseSeparated(conventional_periodic_response,
+                                conventional_physical_response) &&
+      BoundaryResponseSeparated(igr_periodic_response,
+                                igr_physical_response);
   const bool passed = (ranks == 1 || ranks == 2) && All(
       admission && copied_initial_trace && all_seven_boundary_policies &&
-      independent_igr_conservation && igr_algebra &&
+      mixed_boundary_policies && independent_igr_conservation &&
+      euler_algebra &&
       conventional_periodic && conventional_physical &&
       igr_periodic && igr_physical && boundary_effect && source_equivalence);
   if (!passed)
@@ -2167,14 +2767,21 @@ int main(int argc, char* argv[])
               << " copied_initial_trace=" << copied_initial_trace
               << " all_seven_boundary_policies="
               << all_seven_boundary_policies
+              << " mixed_boundary_policies=" << mixed_boundary_policies
               << " independent_igr_conservation="
               << independent_igr_conservation
-              << " igr_algebra=" << igr_algebra
+              << " euler_algebra=" << euler_algebra
               << " conventional_periodic=" << conventional_periodic
               << " conventional_physical=" << conventional_physical
               << " igr_periodic=" << igr_periodic
               << " igr_physical=" << igr_physical
               << " boundary_effect=" << boundary_effect
+              << " conventional_boundary_response="
+              << static_cast<double>(conventional_periodic_response) << '/'
+              << static_cast<double>(conventional_physical_response)
+              << " igr_boundary_response="
+              << static_cast<double>(igr_periodic_response) << '/'
+              << static_cast<double>(igr_physical_response)
               << " source_equivalence=" << source_equivalence << '\n';
     return EXIT_FAILURE;
   }

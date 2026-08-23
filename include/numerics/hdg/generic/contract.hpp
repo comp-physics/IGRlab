@@ -61,8 +61,6 @@ struct EulerHdgNumericalPolicy
   int true_trace_projection_quadrature_order;
   int conventional_assembly_quadrature_order;
   int igr_assembly_quadrature_order;
-  int audit_quadrature_order;
-  int observable_quadrature_order;
   int maximum_nonlinear_updates;
   // Zero selects the legacy adaptive cap: max(100, global true-trace size).
   // A positive value is an exact per-solve iteration cap.
@@ -83,8 +81,8 @@ constexpr EulerHdgNumericalPolicy DefaultEulerHdgNumericalPolicy(
   const int quadrature = 2 * p + 2;
   // Keep the inactive default IGR quadrature field stable for conventional
   // requests; the order-general extension deliberately overintegrates at 12.
-  return {quadrature, quadrature, quadrature, 12, quadrature,
-          quadrature, 80, 0, 13, 1.0e-10, 1.0e-12, 1.0e-10,
+  return {quadrature, quadrature, quadrature, 12, 80, 0, 13,
+          1.0e-10, 1.0e-12, 1.0e-10,
           1.0e-10, 1.0e-4, {RegularizationKind::none, 0.0, 0.0}};
 }
 
@@ -313,15 +311,28 @@ inline bool IsAbsentEulerBoundaryPolicyTable(
 inline bool IsValidEulerBoundaryPolicyTable(
     const EulerBoundaryPolicyTableView& table,
     const int expected_space_dimension,
-    const int expected_attribute_count) noexcept
+    const int expected_attribute_count,
+    const int retained_attribute_count,
+    const std::vector<unsigned char>& physical_attribute_mask) noexcept
 {
   // Preserve the original callback-only generic contract.  CUDA application
   // requests supply the table; a backend that needs device lowering may reject
   // this compatibility spelling during its own admission.
   if (IsAbsentEulerBoundaryPolicyTable(table)) return true;
+  const bool physical_boundary_present = std::any_of(
+      physical_attribute_mask.begin(), physical_attribute_mask.end(),
+      [](const unsigned char value) { return value != 0; });
+  const bool empty_periodic_table = !physical_boundary_present &&
+      table.count == 0;
+  const bool exact_retained_table = table.count ==
+      static_cast<std::size_t>(retained_attribute_count);
   if (expected_space_dimension != 2 || table.space_dimension != 2 ||
-      expected_attribute_count < 0 ||
-      table.count != static_cast<std::size_t>(expected_attribute_count) ||
+      expected_attribute_count < 0 || retained_attribute_count < 0 ||
+      physical_attribute_mask.size() !=
+          static_cast<std::size_t>(retained_attribute_count) ||
+      expected_attribute_count != (physical_boundary_present
+          ? retained_attribute_count : 0) ||
+      (!empty_periodic_table && !exact_retained_table) ||
       !std::isfinite(table.gamma) || table.gamma <= 1.0)
   {
     return false;
@@ -331,7 +342,11 @@ inline bool IsValidEulerBoundaryPolicyTable(
   for (std::size_t index = 0; index < table.count; ++index)
   {
     const EulerBoundaryPolicy& policy = table.policies[index];
+    const bool physical_attribute = physical_attribute_mask[index] != 0;
+    const bool periodic_policy =
+        policy.kind == EulerBoundaryPolicyKind::periodic_topology;
     if (!IsKnownEulerBoundaryPolicyKind(policy.kind) ||
+        physical_attribute == periodic_policy ||
         !std::isfinite(policy.pressure_out))
     {
       return false;
@@ -452,8 +467,6 @@ inline bool ValidEulerHdgNumericalPolicy(
       policy.true_trace_projection_quadrature_order,
       policy.conventional_assembly_quadrature_order,
       policy.igr_assembly_quadrature_order,
-      policy.audit_quadrature_order,
-      policy.observable_quadrature_order,
       policy.maximum_nonlinear_updates,
       policy.maximum_line_search_trials};
   for (const int value : positive_integers)
@@ -480,41 +493,140 @@ inline bool ValidEulerHdgNumericalPolicy(
  * helper distinguishes those annotations from a true physical boundary face
  * rather than using GetNBE() directly.
  */
-inline bool HasPhysicalBoundaryFace(const mfem::ParMesh& mesh) noexcept
+inline bool LocalPhysicalBoundaryAttributeMask(
+    const mfem::ParMesh& mesh, int& retained_attribute_count,
+    std::vector<int>& physical_attribute_mask) noexcept
 {
+  retained_attribute_count = 0;
+  physical_attribute_mask.clear();
   try
   {
     const int faces = mesh.GetNumFaces();
-    if (faces < 0) { return true; }
-    std::vector<bool> shared(static_cast<std::size_t>(faces), false);
+    const int boundary_elements = mesh.GetNBE();
     const int shared_faces = mesh.GetNSharedFaces();
-    if (shared_faces < 0) { return true; }
+    if (faces < 0 || boundary_elements < 0 || shared_faces < 0)
+      return false;
+    retained_attribute_count = mesh.bdr_attributes.Size() == 0
+        ? 0 : mesh.bdr_attributes.Max();
+    if (retained_attribute_count < 0) return false;
+
+    std::vector<unsigned char> shared(
+        static_cast<std::size_t>(faces), 0);
+    std::vector<int> face_to_boundary(
+        static_cast<std::size_t>(faces), -1);
+    physical_attribute_mask.assign(
+        static_cast<std::size_t>(retained_attribute_count), 0);
     for (int shared_face = 0; shared_face < shared_faces; ++shared_face)
     {
       const int face = mesh.GetSharedFace(shared_face);
-      if (face < 0 || face >= faces) { return true; }
-      shared[static_cast<std::size_t>(face)] = true;
+      if (face < 0 || face >= faces) return false;
+      shared[static_cast<std::size_t>(face)] = 1;
     }
-    for (int boundary = 0; boundary < mesh.GetNBE(); ++boundary)
+    for (int boundary = 0; boundary < boundary_elements; ++boundary)
     {
       const int face = mesh.GetBdrElementFaceIndex(boundary);
-      if (face < 0 || face >= faces) { return true; }
+      const int attribute = mesh.GetBdrAttribute(boundary);
+      if (face < 0 || face >= faces || attribute <= 0 ||
+          attribute > retained_attribute_count)
+        return false;
+      face_to_boundary[static_cast<std::size_t>(face)] = boundary;
     }
-
     for (int face = 0; face < faces; ++face)
     {
-      if (!mesh.FaceIsInterior(face) &&
-          !shared[static_cast<std::size_t>(face)])
-      {
-        return true;
-      }
+      const bool physical = !mesh.FaceIsInterior(face) &&
+          shared[static_cast<std::size_t>(face)] == 0;
+      if (!physical) continue;
+      const int boundary =
+          face_to_boundary[static_cast<std::size_t>(face)];
+      if (boundary < 0 || boundary >= boundary_elements) return false;
+      const int attribute = mesh.GetBdrAttribute(boundary);
+      if (attribute <= 0 || attribute > retained_attribute_count)
+        return false;
+      physical_attribute_mask[
+          static_cast<std::size_t>(attribute - 1)] = 1;
     }
-    return false;
-  }
-  catch (...)
-  {
     return true;
   }
+  catch (...) { return false; }
+}
+
+/**
+ * Resolve the attribute-table extent for physical faces collectively.
+ *
+ * MFEM preserves the original boundary attributes after periodic vertex
+ * identification, so bdr_attributes.Max() alone cannot distinguish a fully
+ * periodic mesh from a physical-boundary mesh.  Conversely, an MPI rank may
+ * own no physical face even though another rank does.  Use the request
+ * communicator to make both decisions global before validating the shared
+ * attribute-indexed policy table.
+ */
+inline bool GlobalPhysicalBoundaryAttributeCount(
+    const mfem::ParMesh& mesh, const MPI_Comm communicator,
+    int& attribute_count, int& retained_attribute_count,
+    std::vector<unsigned char>& physical_attribute_mask) noexcept
+{
+  if (communicator == MPI_COMM_NULL) return false;
+  attribute_count = 0;
+  retained_attribute_count = 0;
+  physical_attribute_mask.clear();
+  int local_maximum = 0;
+  std::vector<int> local_physical_attributes;
+  const int local_topology_ready = LocalPhysicalBoundaryAttributeMask(
+      mesh, local_maximum, local_physical_attributes) ? 1 : 0;
+  int global_topology_ready = 0;
+  int global_maximum = 0;
+  const bool topology_ready = MPI_Allreduce(
+      &local_topology_ready, &global_topology_ready, 1, MPI_INT, MPI_MIN,
+      communicator) == MPI_SUCCESS;
+  const bool maximum_ready = MPI_Allreduce(
+      &local_maximum, &global_maximum, 1, MPI_INT, MPI_MAX,
+      communicator) == MPI_SUCCESS;
+  if (!topology_ready || !maximum_ready || global_topology_ready != 1 ||
+      global_maximum < 0)
+  {
+    return false;
+  }
+
+  int local_storage_ready = 1;
+  std::vector<int> global_physical_attributes;
+  try
+  {
+    local_physical_attributes.resize(
+        static_cast<std::size_t>(global_maximum), 0);
+    global_physical_attributes.assign(
+        static_cast<std::size_t>(global_maximum), 0);
+    physical_attribute_mask.assign(
+        static_cast<std::size_t>(global_maximum), 0);
+  }
+  catch (...) { local_storage_ready = 0; }
+  int global_storage_ready = 0;
+  if (MPI_Allreduce(&local_storage_ready, &global_storage_ready, 1, MPI_INT,
+                    MPI_MIN, communicator) != MPI_SUCCESS ||
+      global_storage_ready != 1)
+    return false;
+
+  int dummy_send = 0;
+  int dummy_receive = 0;
+  const int mask_status = MPI_Allreduce(
+      global_maximum == 0 ? &dummy_send : local_physical_attributes.data(),
+      global_maximum == 0 ? &dummy_receive
+                          : global_physical_attributes.data(),
+      global_maximum, MPI_INT, MPI_MAX, communicator);
+  if (mask_status != MPI_SUCCESS) return false;
+  bool physical_boundary_present = false;
+  for (int attribute = 0; attribute < global_maximum; ++attribute)
+  {
+    const int value = global_physical_attributes[
+        static_cast<std::size_t>(attribute)];
+    if (value < 0 || value > 1) return false;
+    physical_attribute_mask[static_cast<std::size_t>(attribute)] =
+        static_cast<unsigned char>(value);
+    physical_boundary_present = physical_boundary_present || value != 0;
+  }
+  if (physical_boundary_present && global_maximum == 0) return false;
+  attribute_count = physical_boundary_present ? global_maximum : 0;
+  retained_attribute_count = global_maximum;
+  return true;
 }
 
 constexpr std::uint32_t RequiredCapabilities(
@@ -606,8 +718,6 @@ inline bool ExactNumericalPolicyConsensus(
       policy.true_trace_projection_quadrature_order,
       policy.conventional_assembly_quadrature_order,
       policy.igr_assembly_quadrature_order,
-      policy.audit_quadrature_order,
-      policy.observable_quadrature_order,
       policy.maximum_nonlinear_updates,
       policy.maximum_linear_iterations,
       policy.maximum_line_search_trials,
@@ -750,10 +860,14 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     RecordFailure(local_status, ContractStatus::invalid_source);
   }
-  const int boundary_attribute_count =
-      request.mesh->bdr_attributes.Size() == 0
-          ? 0
-          : request.mesh->bdr_attributes.Max();
+  int boundary_attribute_count = 0;
+  int retained_boundary_attribute_count = 0;
+  std::vector<unsigned char> physical_boundary_attribute_mask;
+  const bool boundary_attribute_count_ready =
+      GlobalPhysicalBoundaryAttributeCount(
+          *request.mesh, request.communicator, boundary_attribute_count,
+          retained_boundary_attribute_count,
+          physical_boundary_attribute_mask);
   // Do not short-circuit this collective on a rank-local malformed table.
   // Every mesh rank enters the same metadata/payload sequence and receives the
   // same invalid-boundary disposition for unequal policy bits.
@@ -761,8 +875,10 @@ inline ContractStatus ValidateEulerHdgRequest(
       request.communicator, request.boundary.policies);
   const bool valid_boundary_policy = IsValidEulerBoundaryPolicyTable(
       request.boundary.policies, request.mesh->SpaceDimension(),
-      boundary_attribute_count);
-  if (request.boundary.exterior_state == nullptr ||
+      boundary_attribute_count, retained_boundary_attribute_count,
+      physical_boundary_attribute_mask);
+  if (!boundary_attribute_count_ready ||
+      request.boundary.exterior_state == nullptr ||
       !exact_boundary_policy || !valid_boundary_policy)
   {
     RecordFailure(local_status, ContractStatus::invalid_boundary_operator);

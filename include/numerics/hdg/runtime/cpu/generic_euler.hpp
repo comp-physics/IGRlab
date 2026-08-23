@@ -130,8 +130,6 @@ public:
   std::uint32_t capabilities() const noexcept;
   /** Trace-inclusive diagnostics for the generation-bound committed state. */
   generic::HdgEulerCommittedDiagnostics diagnostics() const noexcept;
-  /** Fresh collective summary of committed volume coefficients only. */
-  generic::HdgEulerCommittedObservables ObserveCommitted() noexcept;
 
   /** Copy only the committed physical interior; trace values are never output. */
   bool ExportCommittedInterior(GenericEulerCpuInteriorBuffer) const noexcept;

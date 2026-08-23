@@ -169,18 +169,18 @@ public:
         MPI_Comm_size(communicator_, &ranks) == MPI_SUCCESS &&
         (ranks == 1 || ranks == 2);
     int boundary_attributes = 0;
-    if (request.mesh != nullptr)
-    {
-      try
-      {
-        boundary_attributes = request.mesh->bdr_attributes.Size() == 0
-            ? 0 : request.mesh->bdr_attributes.Max();
-      }
-      catch (...) { lowered = false; }
-    }
+    int retained_boundary_attributes = 0;
+    std::vector<unsigned char> physical_boundary_attribute_mask;
+    const bool boundary_attributes_ready =
+        generic::GlobalPhysicalBoundaryAttributeCount(
+            *request.mesh, communicator_, boundary_attributes,
+            retained_boundary_attributes,
+            physical_boundary_attribute_mask);
+    lowered = lowered && boundary_attributes_ready;
     lowered = lowered && generic::IsValidEulerBoundaryPolicyTable(
         request.boundary.policies, cuda_w8a::dimension,
-        boundary_attributes) &&
+        boundary_attributes, retained_boundary_attributes,
+        physical_boundary_attribute_mask) &&
         generic::DoubleBits(request.boundary.policies.gamma) ==
             generic::DoubleBits(1.4) &&
         request.boundary.policies.count <=
@@ -891,10 +891,6 @@ private:
                           policy.conventional_assembly_quadrature_order);
         AppendConfigValue(local, cursor, complete,
                           policy.igr_assembly_quadrature_order);
-        AppendConfigValue(local, cursor, complete,
-                          policy.audit_quadrature_order);
-        AppendConfigValue(local, cursor, complete,
-                          policy.observable_quadrature_order);
         AppendConfigValue(local, cursor, complete,
                           policy.maximum_nonlinear_updates);
         AppendConfigValue(local, cursor, complete,

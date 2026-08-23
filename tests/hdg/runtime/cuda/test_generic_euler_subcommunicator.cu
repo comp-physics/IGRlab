@@ -1,5 +1,6 @@
 #include "numerics/hdg/generic/contract.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
+#include "sim/hdg/state_io.hpp"
 
 #include <mfem.hpp>
 #include <mpi.h>
@@ -57,8 +58,10 @@ bool ExteriorState(const void*,
 mfem::Mesh PeriodicMesh()
 {
   mfem::Mesh original = mfem::Mesh::MakeCartesian2D(
-      3, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      3, 3, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
   std::vector<mfem::Vector> translations(2, mfem::Vector(2));
+  translations[0] = 0.0;
+  translations[1] = 0.0;
   translations[0][0] = 1.0;
   translations[1][1] = 1.0;
   return mfem::Mesh::MakePeriodic(
@@ -106,9 +109,14 @@ BorrowedFields MakeFields(mfem::ParMesh& mesh)
         state[2] = -0.02;
         state[3] = 2.60;
       });
-  local_trace.ProjectCoefficient(coefficient);
   mfem::Vector true_trace;
-  local_trace.GetTrueDofs(true_trace);
+  const auto policy = dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
+  if (!dg_sim::hdg::ProjectEulerTrueTraceCoefficientL2(
+          trace_space, local_trace, true_trace, coefficient,
+          policy.true_trace_projection_quadrature_order))
+  {
+    return {};
+  }
   if (true_trace.Size() > 0)
   {
     const double* const values = true_trace.HostRead();
@@ -156,6 +164,7 @@ bool CheckActiveSubcommunicator(const MPI_Comm communicator,
   mfem::Mesh serial = PeriodicMesh();
   mfem::ParMesh mesh(communicator, serial);
   BorrowedFields fields = MakeFields(mesh);
+  if (!All(communicator, HYPRE_GetError() == 0)) return false;
   EulerHdgRequest request = MakeRequest(mesh, fields);
 
   if (ranks == 2)
@@ -190,6 +199,8 @@ bool CheckActiveSubcommunicator(const MPI_Comm communicator,
 int main(int argc, char* argv[])
 {
   mfem::MPI_Session mpi(argc, argv);
+  mfem::Device device("cuda");
+  (void)device;
   int active_ranks = 0;
   if (argc == 3 && std::string_view(argv[1]) == "--active-ranks")
     active_ranks = std::atoi(argv[2]);
