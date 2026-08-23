@@ -566,6 +566,25 @@ struct CudaQualificationTestAccess
         maximum_ready && minimum == maximum);
   }
 
+  static bool VerifyPreparedWorkAccounting(
+      cuda::GenericEulerHdgCudaSession& session,
+      const bool require_linear_activity,
+      std::array<int, 6>& counts) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyPreparedWorkAccounting(
+          *session.borrowed_rank1_,
+          session.borrowed_rank1_->pending_.evidence,
+          require_linear_activity, counts);
+    if (session.borrowed_rank2_)
+      return VerifyPreparedWorkAccounting(
+          *session.borrowed_rank2_,
+          session.borrowed_rank2_->pending_.evidence,
+          require_linear_activity, counts);
+    counts.fill(-1);
+    return false;
+  }
+
   template <typename Engine>
   static bool VerifyZeroUpdateFinalReconstruction(Engine& engine) noexcept
   {
@@ -3546,6 +3565,270 @@ bool CheckLifecycle(const int order, const bool physical,
   return qualified;
 }
 
+bool CheckRejectedArmijoRollback(const int order, const int ranks)
+{
+  // The direct-to-workspace trial kernel is shared by every generic order and
+  // rank count.  Exercise its rejected-trial restoration once, without
+  // duplicating the existing p1-p3/rank1-rank2 lifecycle matrix.
+  if (order != 1 || ranks != 1) return true;
+
+  constexpr double dt = 0.2;
+  constexpr double control_armijo_constant = 1.0e-4;
+  constexpr double strict_armijo_constant = 0.99;
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::nonzero, InitialMode::smooth_periodic);
+  const std::vector<double> expected_initial = fields.initial;
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  request.numerical_policy.armijo_constant = control_armijo_constant;
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  std::array<int, 6> control_work{};
+  {
+    GenericEulerHdgCudaSession control;
+    const auto initialized = control.Initialize(request);
+    if (!All(initialized.status == HdgEulerSessionStatus::initialized,
+             request.communicator))
+      return false;
+
+    GenericEulerCudaPreparedStep authority;
+    GenericEulerHdgCudaSession::prepared_output_type output{};
+    const auto prepared = control.Prepare(dt, authority, output);
+    if (!All(prepared.status == HdgEulerSessionStatus::prepared,
+             request.communicator))
+    {
+      std::cerr << "CUDA rejected-Armijo control prepare status="
+                << static_cast<int>(prepared.status) << '\n';
+      return false;
+    }
+    const bool accounted =
+        CudaQualificationTestAccess::VerifyPreparedWorkAccounting(
+            control, true, control_work);
+    const auto aborted = control.Abort(std::move(authority), output);
+    if (!All(accounted && control_work[0] > 0 && control_work[2] > 0 &&
+                 control_work[3] == control_work[0] &&
+                 control_work[4] == 0 &&
+                 aborted.status == HdgEulerSessionStatus::aborted,
+             request.communicator))
+    {
+      std::cerr << "CUDA rejected-Armijo control work="
+                << control_work[0] << '/' << control_work[1] << '/'
+                << control_work[2] << '/' << control_work[3] << '/'
+                << control_work[4] << '/' << control_work[5]
+                << " accounted=" << accounted << " abort="
+                << static_cast<int>(aborted.status) << '\n';
+      return false;
+    }
+  }
+
+  // The control and strict runs are otherwise identical.  Therefore their
+  // first differing line-search decision is an Armijo decision: candidate
+  // admissibility does not depend on this coefficient.
+  request.numerical_policy.armijo_constant = strict_armijo_constant;
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  GenericEulerHdgCudaSession session;
+  const auto initialized = session.Initialize(request);
+  if (!All(initialized.status == HdgEulerSessionStatus::initialized,
+           request.communicator))
+    return false;
+
+  std::vector<double> committed_initial(expected_initial.size(), -1.0);
+  const bool initial_export = session.ExportCommittedInterior(
+      CudaMutableHostL2Output{committed_initial.data(),
+                              fields.volume_scalar_count, components});
+  if (!All(initial_export && SameValues(committed_initial, expected_initial),
+           request.communicator))
+    return false;
+
+  const auto before = session.coordinates();
+  GenericEulerCudaPreparedStep first_authority;
+  GenericEulerHdgCudaSession::prepared_output_type first_output{};
+  const auto first_prepared = session.Prepare(
+      dt, first_authority, first_output);
+  if (!All(first_prepared.status == HdgEulerSessionStatus::prepared,
+           request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo strict prepare status="
+              << static_cast<int>(first_prepared.status) << '\n';
+    return false;
+  }
+
+  std::array<int, 6> first_work{};
+  const bool first_work_accounted =
+      CudaQualificationTestAccess::VerifyPreparedWorkAccounting(
+          session, true, first_work);
+  std::vector<double> first_candidate(expected_initial.size(), -2.0);
+  const bool first_export = session.ExportPreparedInterior(
+      first_authority, first_output,
+      CudaMutableHostL2Output{first_candidate.data(),
+                              fields.volume_scalar_count, components});
+  const auto first_descriptor = first_output.descriptor;
+  const auto first_local_interior_hash = first_output.local_interior_hash;
+  const auto first_local_trace_hash = first_output.local_trace_hash;
+  const dg::hdg::runtime::StateHash empty_hash{};
+  const bool rejected_armijo = first_work_accounted &&
+      first_work[0] > 0 && first_work[2] > 0 && first_work[4] > 0 &&
+      first_work[3] == first_work[0] + first_work[4] &&
+      first_work[1] == first_work[0] + 1;
+  const bool first_identity = first_export &&
+      first_output.candidate_frozen && first_output.checkpoint_staged &&
+      first_output.staging_range.complete &&
+      !first_output.output_staged && !first_output.successful_commit &&
+      first_descriptor.successful_commit &&
+      first_descriptor.interior_hash != empty_hash &&
+      first_descriptor.trace_hash != empty_hash &&
+      first_local_interior_hash != empty_hash &&
+      first_local_trace_hash != empty_hash;
+  const auto aborted = session.Abort(
+      std::move(first_authority), first_output);
+  if (!All(rejected_armijo && first_identity &&
+               aborted.status == HdgEulerSessionStatus::aborted,
+           request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo strict work="
+              << first_work[0] << '/' << first_work[1] << '/'
+              << first_work[2] << '/' << first_work[3] << '/'
+              << first_work[4] << '/' << first_work[5]
+              << " accounted=" << first_work_accounted
+              << " identity=" << first_identity << " abort="
+              << static_cast<int>(aborted.status) << '\n';
+    return false;
+  }
+
+  std::vector<double> after_abort(expected_initial.size(), -3.0);
+  const bool abort_export = session.ExportCommittedInterior(
+      CudaMutableHostL2Output{after_abort.data(),
+                              fields.volume_scalar_count, components});
+  const auto after_abort_coordinates = session.coordinates();
+  if (!All(abort_export && SameValues(after_abort, committed_initial) &&
+               after_abort_coordinates.time == before.time &&
+               after_abort_coordinates.dt == before.dt &&
+               after_abort_coordinates.step == before.step &&
+               after_abort_coordinates.generation == before.generation,
+           request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo abort rollback=" << abort_export
+              << '/' << SameValues(after_abort, committed_initial) << ' '
+              << after_abort_coordinates.time << '/'
+              << after_abort_coordinates.dt << '/'
+              << after_abort_coordinates.step << '/'
+              << after_abort_coordinates.generation << " expected="
+              << before.time << '/' << before.dt << '/' << before.step
+              << '/' << before.generation << '\n';
+    return false;
+  }
+
+  GenericEulerCudaPreparedStep retry_authority;
+  GenericEulerHdgCudaSession::prepared_output_type retry_output{};
+  const auto retry_prepared = session.Prepare(
+      dt, retry_authority, retry_output);
+  if (!All(retry_prepared.status == HdgEulerSessionStatus::prepared,
+           request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo retry prepare status="
+              << static_cast<int>(retry_prepared.status) << '\n';
+    return false;
+  }
+
+  std::array<int, 6> retry_work{};
+  const bool retry_work_accounted =
+      CudaQualificationTestAccess::VerifyPreparedWorkAccounting(
+          session, true, retry_work);
+  std::vector<double> retry_candidate(expected_initial.size(), -4.0);
+  const bool retry_export = session.ExportPreparedInterior(
+      retry_authority, retry_output,
+      CudaMutableHostL2Output{retry_candidate.data(),
+                              fields.volume_scalar_count, components});
+  auto normalized_retry_descriptor = retry_output.descriptor;
+  normalized_retry_descriptor.cursor = first_descriptor.cursor;
+  normalized_retry_descriptor.coordinates.cursor =
+      first_descriptor.coordinates.cursor;
+  normalized_retry_descriptor.coordinate_fingerprint =
+      first_descriptor.coordinate_fingerprint;
+  const bool expected_retry_identity =
+      first_output.attempt.retry_index == 0 &&
+      retry_output.attempt.retry_index == 1 &&
+      retry_output.attempt.sequence == first_output.attempt.sequence + 1 &&
+      retry_output.attempt.committed_step ==
+          first_output.attempt.committed_step &&
+      retry_output.attempt.committed_generation ==
+          first_output.attempt.committed_generation &&
+      dg::hdg::runtime::detail::DoubleBits(retry_output.attempt.dt) ==
+          dg::hdg::runtime::detail::DoubleBits(first_output.attempt.dt) &&
+      first_descriptor.cursor == first_output.attempt.sequence &&
+      first_descriptor.coordinates.cursor == first_output.attempt.sequence &&
+      retry_output.descriptor.cursor == retry_output.attempt.sequence &&
+      retry_output.descriptor.coordinates.cursor ==
+          retry_output.attempt.sequence;
+  const bool retry_identity = retry_work_accounted &&
+      retry_work == first_work && retry_export &&
+      SameValues(retry_candidate, first_candidate) &&
+      expected_retry_identity &&
+      dg::hdg::runtime::detail::SameCheckpoint(
+          normalized_retry_descriptor, first_descriptor) &&
+      retry_output.local_interior_hash == first_local_interior_hash &&
+      retry_output.local_trace_hash == first_local_trace_hash;
+  if (!All(retry_identity, request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo retry identity="
+              << retry_work_accounted << '/' << (retry_work == first_work)
+              << '/' << retry_export << '/'
+              << SameValues(retry_candidate, first_candidate) << '/'
+              << expected_retry_identity << '/'
+              << dg::hdg::runtime::detail::SameCheckpoint(
+                     normalized_retry_descriptor, first_descriptor)
+              << '/' << (retry_output.local_interior_hash ==
+                          first_local_interior_hash)
+              << '/' << (retry_output.local_trace_hash ==
+                          first_local_trace_hash) << '\n';
+    (void)session.Abort(std::move(retry_authority), retry_output);
+    return false;
+  }
+
+  const bool acknowledged = session.AcknowledgePreparedOutput(
+      retry_authority, retry_output);
+  if (!All(acknowledged, request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo retry acknowledge failed\n";
+    (void)session.Abort(std::move(retry_authority), retry_output);
+    return false;
+  }
+  const auto committed = session.Commit(
+      std::move(retry_authority), retry_output);
+  if (!All(committed.status == HdgEulerSessionStatus::committed,
+           request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo commit status="
+              << static_cast<int>(committed.status) << '\n';
+    return false;
+  }
+
+  std::vector<double> committed_final(expected_initial.size(), -5.0);
+  const bool final_export = session.ExportCommittedInterior(
+      CudaMutableHostL2Output{committed_final.data(),
+                              fields.volume_scalar_count, components});
+  const auto after = session.coordinates();
+  const bool final_ready = final_export &&
+      SameValues(committed_final, retry_candidate) &&
+      retry_output.successful_commit && after.step == before.step + 1 &&
+      after.generation == before.generation + 1 &&
+      after.time == before.time + dt && after.dt == dt;
+  if (!All(final_ready, request.communicator))
+    std::cerr << "CUDA rejected-Armijo final=" << final_export << '/'
+              << SameValues(committed_final, retry_candidate) << '/'
+              << retry_output.successful_commit << ' ' << after.time << '/'
+              << after.dt << '/' << after.step << '/' << after.generation
+              << '\n';
+  return All(final_ready, request.communicator);
+}
+
 int ParseOrder(const int argc, char* argv[])
 {
   if (argc != 3 || std::string(argv[1]) != "--order") return -1;
@@ -3602,6 +3885,8 @@ int main(int argc, char* argv[])
   const bool euler_algebra = order > 0 && CheckEulerAlgebra(order, ranks);
   const bool zero_update_final_reconstruction = order > 0 &&
       CheckZeroUpdateFinalReconstruction(order);
+  const bool rejected_armijo_rollback = order > 0 &&
+      CheckRejectedArmijoRollback(order, ranks);
   const bool conventional_periodic = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::nonzero,
       InitialMode::constant,
@@ -3650,6 +3935,7 @@ int main(int argc, char* argv[])
       mixed_boundary_policies && independent_igr_conservation &&
       conventional_conservation_rollback &&
       euler_algebra && zero_update_final_reconstruction &&
+      rejected_armijo_rollback &&
       conventional_periodic && conventional_physical &&
       igr_periodic && igr_physical && boundary_effect && source_equivalence);
   if (!passed)
@@ -3668,6 +3954,8 @@ int main(int argc, char* argv[])
               << " euler_algebra=" << euler_algebra
               << " zero_update_final_reconstruction="
               << zero_update_final_reconstruction
+              << " rejected_armijo_rollback="
+              << rejected_armijo_rollback
               << " conventional_periodic=" << conventional_periodic
               << " conventional_physical=" << conventional_physical
               << " igr_periodic=" << igr_periodic
