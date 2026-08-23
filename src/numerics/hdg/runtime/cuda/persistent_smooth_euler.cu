@@ -2034,7 +2034,7 @@ __global__ void RecoverKernel(CudaDeviceView v,CudaMeshShape s)
   v.status[e]=1;
 }
 __global__ void TrialKernel(CudaDeviceView v,CudaMeshShape s,double alpha)
-{const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<s.interior_count)v.trial_interior[i]=v.base_interior[i]+alpha*v.recovered_interior[i];if(i<s.true_trace_count)v.trial_true_trace[i]=v.base_true_trace[i]+alpha*v.true_solution[i];}
+{const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<s.interior_count)v.work_interior[i]=v.base_interior[i]+alpha*v.recovered_interior[i];if(i<s.true_trace_count)v.work_true_trace[i]=v.base_true_trace[i]+alpha*v.true_solution[i];}
 __global__ void NormKernel(const double* a,int an,const double* b,int bn,double* out)
 {if(blockIdx.x||threadIdx.x)return;double sum=0;for(int i=0;i<an;++i)sum+=a[i]*a[i];for(int i=0;i<bn;++i)sum+=b[i]*b[i];out[0]=sum;}
 __device__ double EulerWave(const double rho,const double mx,const double my,
@@ -2042,10 +2042,27 @@ __device__ double EulerWave(const double rho,const double mx,const double my,
 {if(!(rho>0.0)||!isfinite(rho)||!isfinite(mx)||!isfinite(my)||!isfinite(energy))return nan("");const double u=mx/rho,v=my/rho;const double p=0.4*(energy-0.5*(mx*mx+my*my)/rho);return p>0.0&&isfinite(p)?sqrt(u*u+v*v)+sqrt(1.4*p/rho):nan("");}
 __device__ void ObserveEulerWave(const double* state,double& maximum,bool& valid)
 {const double wave=EulerWave(state[0],state[1],state[2],state[3]);valid=valid&&isfinite(wave);if(valid&&wave>maximum)maximum=wave;}
-__global__ void MaximumWaveKernel(CudaDeviceView v,CudaMeshShape s,
-                                  const double* interior,
-                                  const double* trace,double* out)
-{if(blockIdx.x||threadIdx.x)return;double maximum=0.0;bool valid=true;for(int e=0;e<s.elements;++e){const int ib=e*s.interior_dofs,tb=e*s.trace_dofs;for(int q=0;q<s.volume_points;++q){const int qp=e*s.volume_points+q;double state[4]={};for(int a=0;a<s.scalar_interior_dofs;++a)for(int k=0;k<4;++k)state[k]+=v.volume_shape[qp*s.scalar_interior_dofs+a]*interior[ib+ByNodes(a,s.scalar_interior_dofs,k)];ObserveEulerWave(state,maximum,valid);}for(int f=0;f<faces_per_element;++f)for(int q=0;q<s.face_points;++q){const int qp=(e*faces_per_element+f)*s.face_points+q,fo=f*s.trace_components*s.scalar_face_dofs;double volume_state[4]={},trace_state[4]={};for(int a=0;a<s.scalar_interior_dofs;++a)for(int k=0;k<4;++k)volume_state[k]+=v.face_interior_shape[qp*s.scalar_interior_dofs+a]*interior[ib+ByNodes(a,s.scalar_interior_dofs,k)];for(int a=0;a<s.scalar_face_dofs;++a)for(int k=0;k<4;++k)trace_state[k]+=v.face_trace_shape[qp*s.scalar_face_dofs+a]*trace[tb+fo+ByNodes(a,s.scalar_face_dofs,k)];ObserveEulerWave(volume_state,maximum,valid);ObserveEulerWave(trace_state,maximum,valid);}}out[0]=maximum;out[1]=valid?1.0:0.0;}
+__global__ void MaximumWaveElementsKernel(CudaDeviceView v,CudaMeshShape s,
+                                          const double* interior,
+                                          const double* trace)
+{
+  const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;
+  double maximum=0.0;bool valid=true;
+  const int ib=e*s.interior_dofs,tb=e*s.trace_dofs;
+  for(int q=0;q<s.volume_points;++q){const int qp=e*s.volume_points+q;double state[4]={};for(int a=0;a<s.scalar_interior_dofs;++a)for(int k=0;k<4;++k)state[k]+=v.volume_shape[qp*s.scalar_interior_dofs+a]*interior[ib+ByNodes(a,s.scalar_interior_dofs,k)];ObserveEulerWave(state,maximum,valid);}
+  for(int f=0;f<faces_per_element;++f)for(int q=0;q<s.face_points;++q){const int qp=(e*faces_per_element+f)*s.face_points+q,fo=f*s.trace_components*s.scalar_face_dofs;double volume_state[4]={},trace_state[4]={};for(int a=0;a<s.scalar_interior_dofs;++a)for(int k=0;k<4;++k)volume_state[k]+=v.face_interior_shape[qp*s.scalar_interior_dofs+a]*interior[ib+ByNodes(a,s.scalar_interior_dofs,k)];for(int a=0;a<s.scalar_face_dofs;++a)for(int k=0;k<4;++k)trace_state[k]+=v.face_trace_shape[qp*s.scalar_face_dofs+a]*trace[tb+fo+ByNodes(a,s.scalar_face_dofs,k)];ObserveEulerWave(volume_state,maximum,valid);ObserveEulerWave(trace_state,maximum,valid);}
+  // Valid Euler wave speeds are nonnegative, so -1 is an unambiguous finite
+  // sentinel and avoids relying on NaN behavior in the ordered reducer.
+  v.status[e]=valid?maximum:-1.0;
+}
+__global__ void MaximumWaveReduceKernel(const double* element_maxima,
+                                        int elements,double* out)
+{
+  if(blockIdx.x||threadIdx.x)return;
+  double maximum=0.0;bool valid=true;
+  for(int e=0;e<elements;++e){const double value=element_maxima[e];valid=valid&&isfinite(value)&&value>=0.0;if(valid&&value>maximum)maximum=value;}
+  out[0]=maximum;out[1]=valid?1.0:0.0;
+}
 
 // Compact post-candidate balance used by the production borrowed-Euler
 // lifecycle.  IGR contributes its auxiliary balance and regularized physical
@@ -2249,7 +2266,7 @@ __global__ void EulerConservationKernel(CudaDeviceView v, CudaMeshShape s,
   out[euler_conservation_result_scalars - 1] = valid ? 1.0 : 0.0;
 }
 __global__ void HashKernel(const double* values,int count,std::uint64_t* out)
-{if(blockIdx.x||threadIdx.x)return;std::uint64_t h[4]={1469598103934665603ULL,1099511628211ULL^0x9e3779b97f4a7c15ULL,1469598103934665603ULL^0xd6e8feb86659fd93ULL,1099511628211ULL^0xa0761d6478bd642fULL};const unsigned char* bytes=reinterpret_cast<const unsigned char*>(values);for(int i=0;i<count*static_cast<int>(sizeof(double));++i)for(int lane=0;lane<4;++lane){h[lane]^=static_cast<std::uint64_t>(bytes[i]+17U*lane);h[lane]*=1099511628211ULL+2ULL*lane;}for(int lane=0;lane<4;++lane)out[lane]=h[lane];}
+{const int lane=threadIdx.x;if(blockIdx.x||lane>=4)return;const std::uint64_t seeds[4]={1469598103934665603ULL,1099511628211ULL^0x9e3779b97f4a7c15ULL,1469598103934665603ULL^0xd6e8feb86659fd93ULL,1099511628211ULL^0xa0761d6478bd642fULL};std::uint64_t h=seeds[lane];const unsigned char* bytes=reinterpret_cast<const unsigned char*>(values);for(int i=0;i<count*static_cast<int>(sizeof(double));++i){h^=static_cast<std::uint64_t>(bytes[i]+17U*lane);h*=1099511628211ULL+2ULL*lane;}out[lane]=h;}
 
 bool LaunchOk() noexcept { return cudaPeekAtLastError() == cudaSuccess; }
 int Blocks(const int n) noexcept { return (n + 127) / 128; }
@@ -2295,13 +2312,13 @@ bool CudaLaunchLocalSquaredNorm(const double* a,int an,const double* b,int bn,do
 bool CudaLaunchMaximumWave(const CudaDeviceView& v,const CudaMeshShape& s,
                            const double* interior,const double* trace,
                            double* out) noexcept
-{MaximumWaveKernel<<<1,1>>>(v,s,interior,trace,out);return LaunchOk();}
+{MaximumWaveElementsKernel<<<Blocks(s.elements),128>>>(v,s,interior,trace);if(!LaunchOk())return false;MaximumWaveReduceKernel<<<1,1>>>(v.status,s.elements,out);return LaunchOk();}
 bool CudaLaunchEulerConservation(const CudaDeviceView& v,
                                  const CudaMeshShape& s,
                                  const double dt, double* out) noexcept
 {EulerConservationKernel<<<1,1>>>(v,s,dt,out);return LaunchOk();}
 bool CudaLaunchHash(const double* values,int count,std::uint64_t* words) noexcept
-{HashKernel<<<1,1>>>(values,count,words);return LaunchOk();}
+{HashKernel<<<1,4>>>(values,count,words);return LaunchOk();}
 
 } // namespace detail
 } // namespace dg::hdg::runtime::cuda_w8a

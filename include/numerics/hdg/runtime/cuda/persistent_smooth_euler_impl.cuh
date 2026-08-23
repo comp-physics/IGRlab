@@ -1958,9 +1958,12 @@ public:
           return result;
         }
         const double alpha = std::ldexp(1.0, -trial);
+        // TrialKernel writes the candidate directly into the persistent
+        // workspace.  The base snapshot remains immutable, so a rejected
+        // trial is still restored transactionally without the former pair of
+        // full-state device-to-device copies.
         const bool trial_ready = CudaLaunchTrial(view_, shape_, alpha) &&
-            TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-            SwapTrialIntoWorkspace(workspace);
+            TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
         if (!CollectiveContinue(trial_ready))
         {
           if (!CollectiveContinue(RestoreBase(workspace)))
@@ -3129,7 +3132,6 @@ private:
                        double& norm) noexcept;
   bool CopyBase(state_slot& workspace) noexcept;
   bool RestoreBase(state_slot& workspace) noexcept;
-  bool SwapTrialIntoWorkspace(state_slot& workspace) noexcept;
   bool UpdateStateHashes(state_slot& workspace) noexcept;
   bool HashState(const double* values, int count, StateHash& hash) noexcept;
   bool AggregateHash(const StateHash& local, StateHash& aggregate) const

@@ -864,17 +864,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     if (session.Commit(std::move(authority), native_export).status !=
         HdgEulerSessionStatus::committed)
       return Reject(request, "generic CUDA prepared commit failed");
-    // Publication remains post-commit: replace the staged physical candidate
-    // with the engine's committed bytes before finalizing time/output.
-    if (!CollectiveAll(request.communicator,
-                       FreshOutputView(*published_state, scalar_count,
-                                       destination)))
-      return Reject(request,
-                    "CUDA committed-state output view failed after commit");
-    local_ok = session.ExportCommittedInterior(destination);
-    if (!CollectiveAll(request.communicator, local_ok))
-      return Reject(request,
-                    "CUDA committed-state export failed after commit");
+    // Publication remains post-commit.  ExportPreparedInterior copied the
+    // frozen candidate into this private host view, acknowledgement bound that
+    // export to the affine authority, and a successful Commit published that
+    // exact candidate without mutating the host bytes.  Keep those bytes for
+    // finalization/output instead of repeating the full device-to-host export.
 
     std::optional<HdgTransactionalTimeAdapter::OutputEvent> finalized;
     try { finalized = time_driver->FinalizeSuccess(); local_ok = true; }

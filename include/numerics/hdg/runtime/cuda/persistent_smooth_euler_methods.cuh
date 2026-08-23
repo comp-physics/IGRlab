@@ -1815,25 +1815,6 @@ RestoreBase(state_slot& workspace) noexcept
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
-SwapTrialIntoWorkspace(state_slot& workspace) noexcept
-{
-  const bool interior = TransportPolicy::DeviceToDevice(
-      workspace.interior.coefficients, view_.trial_interior,
-      workspace.interior.count * sizeof(double),
-      CudaTransferCategory::attempt_history,
-      CudaTransferSite::nonlinear_accept_interior);
-  const bool trace = TransportPolicy::DeviceToDevice(
-      workspace.trace.coefficients, view_.trial_true_trace,
-      workspace.trace.count * sizeof(double),
-      CudaTransferCategory::attempt_history,
-      CudaTransferSite::nonlinear_accept_trace);
-  const bool synchronized =
-      TransportPolicy::Synchronize(CudaTransferSite::nonlinear_accept_trace);
-  return interior && trace && synchronized;
-}
-
-template <typename AllocatorPolicy, typename TransportPolicy>
-bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 HashState(const double* values, const int count, StateHash& hash) noexcept
 {
   if (!CudaLaunchHash(values, count, view_.hash_words) ||

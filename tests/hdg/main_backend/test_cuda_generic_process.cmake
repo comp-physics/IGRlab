@@ -1,7 +1,16 @@
 if(NOT DEFINED HDG_MAIN_EXECUTABLE OR NOT DEFINED HDG_MAIN_OUTPUT OR
    NOT DEFINED HDG_MAIN_MESH OR NOT DEFINED HDG_MAIN_RANKS OR
    NOT DEFINED HDG_MAIN_MPIEXEC OR NOT DEFINED HDG_MAIN_NUMPROC_FLAG)
-  message(FATAL_ERROR "CUDA main executable, output, mesh, ranks, and MPI launcher are required.")
+  message(FATAL_ERROR "Main executable, output, mesh, ranks, and MPI launcher are required.")
+endif()
+
+if(NOT DEFINED HDG_MAIN_DEVICE)
+  set(HDG_MAIN_DEVICE cuda)
+endif()
+if(NOT HDG_MAIN_DEVICE STREQUAL "cpu" AND
+   NOT HDG_MAIN_DEVICE STREQUAL "cuda")
+  message(FATAL_ERROR
+    "HDG main device must be cpu or cuda, got '${HDG_MAIN_DEVICE}'.")
 endif()
 
 if(NOT DEFINED HDG_MAIN_ORDER)
@@ -39,12 +48,12 @@ if(NOT DEFINED HDG_MAIN_PARALLEL_REFINE)
 endif()
 if(HDG_MAIN_N LESS 1 OR HDG_MAIN_N GREATER 100000 OR
    HDG_MAIN_SERIAL_REFINE LESS 0 OR HDG_MAIN_PARALLEL_REFINE LESS 0)
-  message(FATAL_ERROR "CUDA HDG cell census requires bounded nonnegative mesh/refinement inputs.")
+  message(FATAL_ERROR "HDG cell census requires bounded nonnegative mesh/refinement inputs.")
 endif()
 math(EXPR _refinement_levels
   "${HDG_MAIN_SERIAL_REFINE} + ${HDG_MAIN_PARALLEL_REFINE}")
 if(_refinement_levels GREATER 10)
-  message(FATAL_ERROR "CUDA HDG cell census refinement depth exceeds checked process-test bounds.")
+  message(FATAL_ERROR "HDG cell census refinement depth exceeds checked process-test bounds.")
 endif()
 math(EXPR _expected_global_cells "${HDG_MAIN_N} * ${HDG_MAIN_N}")
 if(_refinement_levels GREATER 0)
@@ -56,7 +65,7 @@ endif()
 file(REMOVE_RECURSE "${HDG_MAIN_OUTPUT}")
 set(_arguments
   --discretization hdg
-  --device cuda
+  --device "${HDG_MAIN_DEVICE}"
   --mesh "${HDG_MAIN_MESH}"
   --order "${HDG_MAIN_ORDER}"
   --serial-refine "${HDG_MAIN_SERIAL_REFINE}"
@@ -94,7 +103,26 @@ if(NOT _status EQUAL 0 OR
    NOT _stdout MATCHES "\\[hdg-main\\] status=Success.*step=${HDG_MAIN_EXPECTED_STEPS}.*time=${HDG_MAIN_EXPECTED_FINAL_TIME}" OR
    NOT _stderr STREQUAL "")
   message(FATAL_ERROR
-    "generic CUDA HDG main execution failed: ${_status}\n${_stdout}\n${_stderr}")
+    "generic HDG main execution failed: ${_status}\n${_stdout}\n${_stderr}")
+endif()
+
+if(HDG_MAIN_VERIFY_REPEATABLE_OUTPUT AND NOT HDG_MAIN_NO_VTK)
+  set(_repeat_output "${HDG_MAIN_OUTPUT}-exact-repeat")
+  file(REMOVE_RECURSE "${_repeat_output}")
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E env
+      "DG_IGR_VTK_PREFIX_PATH=${_repeat_output}"
+      "${HDG_MAIN_EXECUTABLE}" ${_arguments}
+    RESULT_VARIABLE _repeat_status
+    OUTPUT_VARIABLE _repeat_stdout
+    ERROR_VARIABLE _repeat_stderr)
+  if(NOT _repeat_status EQUAL 0 OR
+     NOT _repeat_stdout MATCHES
+       "\\[hdg-main\\] status=Success.*step=${HDG_MAIN_EXPECTED_STEPS}.*time=${HDG_MAIN_EXPECTED_FINAL_TIME}" OR
+     NOT _repeat_stderr STREQUAL "")
+    message(FATAL_ERROR
+      "repeated HDG main execution failed: ${_repeat_status}\n${_repeat_stdout}\n${_repeat_stderr}")
+  endif()
 endif()
 
 set(_collection
@@ -104,7 +132,7 @@ if(HDG_MAIN_NO_VTK)
   file(GLOB_RECURSE _artifacts LIST_DIRECTORIES FALSE
     "${HDG_MAIN_OUTPUT}/*")
   if(_artifacts)
-    message(FATAL_ERROR "CUDA HDG published output after --no-vtk_save: ${_artifacts}")
+    message(FATAL_ERROR "HDG published output after --no-vtk_save: ${_artifacts}")
   endif()
   return()
 endif()
@@ -188,4 +216,25 @@ string(REGEX MATCHALL "Cycle[0-9][0-9][0-9][0-9][0-9][0-9]/data.pvtu"
 list(LENGTH _pvd_entries _count)
 if(NOT _count EQUAL _cycle_count)
   message(FATAL_ERROR "CUDA HDG PVD has ${_count} publications; expected ${_cycle_count}")
+endif()
+
+if(HDG_MAIN_VERIFY_REPEATABLE_OUTPUT)
+  file(GLOB_RECURSE _artifacts RELATIVE "${HDG_MAIN_OUTPUT}"
+    LIST_DIRECTORIES FALSE "${HDG_MAIN_OUTPUT}/*")
+  file(GLOB_RECURSE _repeat_artifacts RELATIVE "${_repeat_output}"
+    LIST_DIRECTORIES FALSE "${_repeat_output}/*")
+  list(SORT _artifacts)
+  list(SORT _repeat_artifacts)
+  if(NOT "${_artifacts}" STREQUAL "${_repeat_artifacts}")
+    message(FATAL_ERROR
+      "repeated CUDA HDG publication set differs:\n${_artifacts}\n${_repeat_artifacts}")
+  endif()
+  foreach(_artifact IN LISTS _artifacts)
+    file(SHA256 "${HDG_MAIN_OUTPUT}/${_artifact}" _hash)
+    file(SHA256 "${_repeat_output}/${_artifact}" _repeat_hash)
+    if(NOT _hash STREQUAL _repeat_hash)
+      message(FATAL_ERROR
+        "repeated CUDA HDG output is not byte-identical: ${_artifact}")
+    endif()
+  endforeach()
 endif()
